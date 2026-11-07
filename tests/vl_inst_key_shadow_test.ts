@@ -18,10 +18,6 @@ const MERGES: Record<string, string[]> = {
   "tests/cases/generics/instance-call-of-literal-union-field-function.vl": [
     "F$m1294891004",
   ],
-  "tests/cases/generics/type-param-write-literal-union-at-pin.vl": [
-    "elem",
-    "glob",
-  ],
 };
 // Controls: instances the key must keep apart (callback specialization; one nested generic per
 // enclosing call frame; one helper handed two tagged sets of one signature).
