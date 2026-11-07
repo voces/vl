@@ -2138,6 +2138,13 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   new disagreement. The 31 left, the pushed-list and stored-slot ones and one call through a list
   of one lambda, are the calls the `monoFlowReads` rewrite repoints, which the cad lane records
   after B2; then `monoLitReachesNoCall`, `monoValsReachNoCall` and `monoValsInert` go.
+  `monoInertParamStubPin` stays, measured on 2026-11-07. Over 23,384 programs, 10 reach its
+  inert check. Its input, `vrInertFor("mono", …)`, agrees with `vrValueInert` on all 10: 8 not
+  inert and 2 inert. A compiler that never takes the pin builds the 8 byte-identically, and moves
+  the 2 inert ones from runs to a loud `monomorphize: unsupported argument type for \`f\``:
+  `closures/uncalled-hole-fn-inert-uses.vl` and D6910. Those two programs are what the pin
+  carries. Switching its input deletes nothing, because `monoPrimeInert` and `monoReachIndex`
+  also call `vrInertFor("mono", …)`.
 
 The unbound default, which every program reaches through `monoElabDefaultsPrime`, is the reach
 lane's. The cad lane takes slot deliveries, then node type, then slot type.
