@@ -95,7 +95,7 @@ import {
   strListIndexOf,
 } from "./listutil"
 import { identArmNote, identDeclOf, identIsArm, nodeSrc } from "./symbols"
-import { nodeTyIxOf } from "./check_node_tys"
+import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
 import { hdBase, hdRowOf } from "./check_hole_pins"
 import { mintReset, rsVoidSplit } from "./check_mint"
 import { elabFnSetTy, fnTagged, fvaListCopyReset } from "./check_fn_tag_facts"
@@ -1375,6 +1375,8 @@ export function elabSlotJoinTy(recv: i32, t: i32): i32 {
   const bd = identDeclOf(r)
   if bd < 0 || !(nodeAt(bd) is LetDecl) { return t }
   const tf = T.tys[t]
+  // A record a map's slot holds joins each function field with every function written there.
+  if tf is TyObj && !el { return elabSlotRecJoinTy(bd, t) }
   if !(tf is TyFunc) { return t }
   const s = elabFnSetTy[t] ?? -1
   if s < 0 || i32ListHas(fnLetVeto, bd) { return t }
@@ -1398,6 +1400,102 @@ export function elabSlotJoinTy(recv: i32, t: i32): i32 {
   fnJoinMemo[key] = fresh
   if !i32ListHas(fnSlotWidened, bd) { fnSlotWidened.push(bd) }
   fresh
+}
+
+// Grows record literal `v`, written into a map slot of joined record `slot`, to that record: each
+// function field whose set the slot's widens takes the slot's, a parameter read excepted (D15455).
+export function elabSlotRecLitGrow(v: i32, slot: i32) {
+  const lx = parenPeelIx(v)
+  if lx < 0 || lx >= P.nodes.length || slot < 0 || slot >= T.tys.length {
+    return 0
+  }
+  const ln = nodeAt(lx)
+  const so = T.tys[slot]
+  if !(ln is ObjLit) || !(so is TyObj) { return 0 }
+  let grew = false
+  for fx in ln.objFields {
+    const f = nodeAt(fx)
+    const j = if f is FieldInit { strListIndexOf(so.objFieldNames, f.fiName) } else { -1 }
+    const fv = if f is FieldInit { parenPeelIx(f.fiValue) } else { -1 }
+    const st = if j >= 0 { so.objFieldTypes[j] } else { -1 }
+    const ss = if st >= 0 { elabFnSetTy[st] ?? -1 } else { -1 }
+    const vt = if fv >= 0 { nodeTyIxOf(fv) } else { -1 }
+    const vs = if vt >= 0 { elabFnSetTy[vt] ?? -1 } else { -1 }
+    const fd = if fv >= 0 && nodeAt(fv) is Ident { identDeclOf(fv) } else { -1 }
+    const paramRead = fd >= 0 && fd < P.nodes.length && nodeAt(fd) is Param
+    const within = vs >= 0 && vs != ss && fnSetIntern(fnSetUnion(vs, ss)) == ss
+    if ss >= 0 && !paramRead && within {
+      nodeTySetGrow(fv, st)
+      grew = true
+    }
+  }
+  if grew { nodeTySetGrow(lx, slot) }
+  0
+}
+
+// Record `t` pinned into map binding `bd`'s slots, each function field's set joined with every
+// function the binding's scope writes at that field of a slot, as a list literal's records join
+// (D15493). Each record literal written into a slot is re-typed at the joined record; `t` when no
+// field widens.
+function elabSlotRecJoinTy(bd: i32, t: i32): i32 {
+  const to = T.tys[t]
+  if !(to is TyObj) || i32ListHas(fnLetVeto, bd) { return t }
+  const names: string[] = []
+  const tys: i32[] = []
+  let changed = false
+  let i = 0
+  while i < to.objFieldNames.length {
+    const nm = to.objFieldNames[i]
+    let ft = to.objFieldTypes[i]
+    const fa = if ft >= 0 && ft < T.tys.length { T.tys[ft] } else { null }
+    const fs = if fa is TyFunc { elabFnSetTy[ft] ?? -1 } else { -1 }
+    const w = if fs >= 0 { fnPathSetOf(bd, ["[]", nm]) } else { -1 }
+    const u = if w >= 0 { fnSetIntern(fnSetUnion(fs, w)) } else { fs }
+    if fa is TyFunc && u != fs {
+      const key = "slotrec:" + i32ToStr(bd) + "/" + nm + "," + i32ToStr(ft)
+      let fresh = fnJoinMemo[key] ?? -1
+      if fresh < 0 || fresh >= T.tys.length {
+        const ps: i32[] = []
+        for p in fa.fnParamTypes { ps.push(p) }
+        const g: Ty = { fnParamTypes: ps, fnRet: fa.fnRet }
+        T.tys.push(g)
+        fresh = T.tys.length - 1
+        elabFnSetTy[fresh] = u
+        fnJoinMemo[key] = fresh
+      }
+      ft = fresh
+      changed = true
+    }
+    names.push(nm)
+    tys.push(ft)
+    i = i + 1
+  }
+  if !changed { return t }
+  const nt = mkObjTy(names, tys)
+  // Each literal written into a slot holds the joined field, its named functions' leaves included.
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwKeyOfDecl(bd), ["[]"], vals, ats) >= 0 {
+    for v in vals {
+      const vn = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
+      if vn is ObjLit {
+        for fx in vn.objFields {
+          const f = nodeAt(fx)
+          const j = if f is FieldInit { strListIndexOf(names, f.fiName) } else { -1 }
+          const fv = if f is FieldInit { parenPeelIx(f.fiValue) } else { -1 }
+          const fd = if fv >= 0 && nodeAt(fv) is Ident { identDeclOf(fv) } else { -1 }
+          const paramRead = fd >= 0
+            && fd < P.nodes.length
+            && nodeAt(fd) is Param
+          if j >= 0 && fv >= 0 && !paramRead && tys[j] != to.objFieldTypes[j] {
+            nodeTySetGrow(fv, tys[j])
+          }
+        }
+        nodeTySetGrow(v, nt)
+      }
+    }
+  }
+  nt
 }
 
 // The type the field at `steps` (outermost first) of binding `bd`, inferred `t`, gives its reads,

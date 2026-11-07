@@ -1763,14 +1763,15 @@ G2's write through a parameter (D15492) lands in the caller's map with its set; 
 was the store into the parameter's slot, which the tag rule now takes when every call hands a
 holder of the set or a wider one decided with it (`ftParamHolderHolds`), and only for a written
 value naming a declared function, whose set no call changes. Bucket 1 is 32 parameters in 16
-programs. The map pin (`r5_rt`, the argument's checked type) still answers 13: 5 in D9480's
+programs. The map pin (`r5_rt`, the argument's checked type) answered 13 at #6530: 5 in D9480's
 fixture, whose map holding a non-generic keeps the set untagged, 3 written as a record `{f: id}`,
 3 an uncalled set (G5), and 2 outside bucket 1. The 3 record-written hits are all in
 `closures/hole-fn-generic-map-stored-through-parameter.vl`, whose `{id}` set three maps keep on
-mono, each alone: `c`, written only directly (served since D15532); `b`, a map of records
-a helper widens to two generics (D15493); and `h`, a map of functions a helper widens to two
-generics (served since D15531: the helper's write is the member's leaf, `fnTagMapWriteLeavesOf`).
-They move only when `b` is served too.
+mono, each alone: `c`, written only directly (served since D15532); `b`, a map of records a helper
+widens to two generics (served since D15493: a map slot's record joins each function field with every
+function written there, `elabSlotRecJoinTy`); and `h`, a map of functions a helper widens to two
+generics (served since D15531: the helper's write is the member's leaf, `fnTagMapWriteLeavesOf`,
+whether or not the member has another). All three are served, and the file now tags.
 
 Two of the 13 are residuals with a named blocker, not a missing admission:
 
@@ -1793,8 +1794,8 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   intern, and without it the helper's store refuses. An entry read through `?.` is not a holder:
   `drwOptGuard`'s call gets no id member call, so
   `closures/generic-record-written-into-map-through-param-read-through-optional.vl` runs on mono as
-  on master (a decline, not a refusal). Two different generics in one map of records still refuse
-  loudly (D15493).
+  on master (a decline, not a refusal). Two different generics in one map of records join field-wise
+  and run (D15493); written by `.set`, a record literal is not admitted, so that spelling refuses.
 
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
