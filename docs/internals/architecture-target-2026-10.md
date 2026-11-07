@@ -2062,6 +2062,38 @@ The same answers also spell the same. What each of the 15 comes to:
   elaboration.
 - **Parked:** `monoReachLitTys`, with `monoReachSlotTy`.
 
+**Written-let gate and type, measured** (2026-11-07, 23,456 programs).
+
+The gate, `monoWrittenGenLetFrame`, was shadowed against `elabBindingFnSet(d)`, read before the
+walk retypes the values the set is read from. Its first reading (109 of 112) was taken after the
+walk and is void. On split-dep's #6631 head, every one of 112 decisions agrees:
+
+| mono | elaboration | decisions | files |
+|---|---|---|---|
+| needs instancing | every member a named `monoIsGenericDecl` function | 40 | 10 |
+| no | empty, a lambda, or a non-generic member | 72 | 29 |
+
+- **Switched in #6631:** the gate reads one snapshot of that set, taken before the walk. Hole
+  functions count, as `monoIsGenericDecl` admits them. `monoArmWrittenLetSeed` reads the
+  switched gate.
+- **Deleted:** `monoLetSeedGenFe`, `monoListElemGenFe` and `monoValueNamesGenOrInst`.
+
+The type, `monoCoerceWrittenLetTys`, was shadowed against the per-read fact `elabSlotDeliveries`.
+The slot fact is the wrong reference: a written `let` of generics has no one closed type.
+
+| site | agree | parameters agree, result differs | no elaboration answer |
+|---|---|---|---|
+| delivery (115) | 85, + 15 one of two | 14 | 1 |
+| by call (51) | 25 | 0 | 26 |
+
+- **Result-only differences are not a defect.** The by-call site spells the binding's signature
+  with an unpinned `void` result and takes the call's own result. Its parameters come from
+  `monoDeclPathPins` and agree.
+- **Blocked on Fn#d's scoping note** (the concrete rep of a function-holding value at a site): the
+  27 with no answer. Each signature takes a hole function as a parameter, which no closed delivery
+  carries; D5841 and D6480 are among them. Once that fact exists, all four callers that pass
+  `tname` switch together.
+
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
 read. A decision is a pin a function returns, a type it returns or records, or a gate choosing
@@ -3015,6 +3047,23 @@ read (`slotOfRead`) of a different holder with a closed `elabSlotTyAtKey` fact a
 the common case being `const f = m.get("k")` out of a closed map. A read of an open holder
 declines, which leaves generic functions stored in maps to D15494. A delivered bundle (reach) is the
 next source, so the elaboration gets no second composer for the same binding.
+
+**A binding's function set has one reader too: `elabBindingFnSet(d)`.** It is the set-valued twin of
+`elabBindingWholeTy`. The checker's `elabFnSetTy` is filled only from reads, and a `let`'s storage
+type is its initialiser read's type, so no write ever joins a binding's set (D4307). The fold
+takes every value written to the binding and unions their sets, and an `if` value contributes its
+arms' joined set. It answers `[]` ("any") as soon as one value carries no set: a closed lambda, a
+parameter, a call result. **A value's own identity narrows its set.** Structurally equal values
+share a type index and therefore a set, so every `(_) => void` hole lambda in a program shares one.
+The fold therefore narrows a name or a function literal to the one function it is (an instance's
+clone read as its source). Three written values are read through to what they stand for:
+- a loop's or labelled block's value carrier (`$lv`), minted after the write index, is written
+  the loop's exits (`lvExitLoops`);
+- the checker's adapter lambda (D4892) is the function it adapts;
+- a name of a declared generic is that function, even where its read was minted without a set.
+
+An instance-clone binding is read at its source binding (#6633). The consumer is the written-let
+gate (`monoWrittenGenLetFrame`).
 
 **The second source, built from bundles: `elabWrittenBuiltTy`** (2026-11-07). It covers four
 kinds of value:
