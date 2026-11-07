@@ -2508,12 +2508,22 @@ by program).
 - **`monoRenameInitAt` is class (c).** It is reached by 15 programs: 11 already hold an instance at
   the pin and 4 instance one, and its refusal fires in none. Its pin is the elaboration's
   (`monoDeclPathPins`); what it does is instancing and renaming.
-- **`monoPinStoredRecords`, `monoPinFieldValue` and `monoLetWritesAt` disagree with
-  `elabSlotTyAt` nowhere.** `monoPinStoredRecords`: 8 agree and 0 differ. Its 2 mono-only programs
-  are D15494 maps, and in its 4 elab-only programs mono declines. `monoPinFieldValue`: 6 agree and
-  0 differ. Its 1 mono-only program is D15190, a refused program, and it has 57 elab-only, all with
-  mono declining. `monoLetWritesAt` is reached past its `const` arm by 1 program, which agrees.
-  These are graded together next.
+- **Switched: the record-field family takes its type from `elabSlotTyAt`.** That covers
+  `monoPinStoredRecords`, `monoPinFieldValue`, `monoPinObjFields` and `monoPinFieldContainer`. The
+  fact confirms and does not enumerate: mono's gate still decides whether a field is typed, and the
+  slot fact is the type it gets. In cad's shadow over 23,456 programs:
+
+  | function | agree | differ | mono-only | elab-only |
+  |---|---|---|---|---|
+  | `monoPinFieldContainer` | 6 | 0 | 2 | 80 |
+  | `monoPinObjFields` | 6 | 0 | 0 | 171 |
+  | `monoPinStoredRecords` | 14 | 0 | 7 | 3 |
+
+  The 254 elab-only cells are left as mono's gate leaves them. The mono-only cells keep mono's
+  type, and that fallback is the **D15494 residue**: a record, map or container whose generic is
+  called at two signatures has no single slot fact (an owner question). One of them is D15190,
+  refused at the write. Over 19,316 programs no byte moves. `monoLetWritesAt`'s `t` is already the
+  slot fact, so cad trims it to its fresh-`Map()` recording.
 - **A binding's call signatures were only ever asked whether one exists.** After the join went,
   `monoBindCallSigs` had one reader, `monoWritesCoercedFirstCall`, and it asks only whether any
   call has gone through the binding yet. The table is now a set of called bindings
