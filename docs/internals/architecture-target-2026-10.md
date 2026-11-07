@@ -2585,8 +2585,9 @@ So identity typing is not the prerequisite for this population; one fact is.
   That type is closed only after mono's walk re-records it: at elaboration every one of the 234
   initialisers carries the binding's own open type, `(T) => T` or `((_) => _) | null`. A fourth
   `elabWrittenValueTy` leaf reading it was built and measured as a no-op (234 of 234 unchanged), and
-  was not landed. 82 of the 234 already close at elaboration. The other 130, by the initialiser's
-  shape:
+  was not landed. Fourteen of the 234 are no adopt decision: a bundle-record initialiser under a
+  binding typed `(_) => _`, which `monoSameTyCtor` refuses, so mono never adopts them. Of the other
+  220, 82 already close at elaboration. The other 116, by the initialiser's shape:
 
   | decisions | initialiser | source that closes it | lane |
   |---|---|---|---|
@@ -2597,7 +2598,6 @@ So identity typing is not the prerequisite for this population; one fact is.
   | 3 | `??` over a map read | the map-value or held fact, joined with the default | lane F |
   | 12 | a call returning a generic function value | the call-instance signature (`elabValueInstKey`) | Fn#d |
   | 6 | a record literal of generic or hole function fields | the call-instance signature per field | Fn#d |
-  | 14 | a field or element read of a holder whose slot fact is closed | none missing: the binding is not visited. 11 are emit-minted after `elabSlotFacts`, 3 are record-typed outside its gate | reach (`elabSlotBundleFacts`) |
 
   The deliveries row keeps two controls declining: `closures/hole-fn-if-to-hole-param.vl`'s `x`,
   handed on and never called, and the D10384 shape. A named generic held as a map value stays
