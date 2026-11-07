@@ -1941,6 +1941,19 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 - [ ] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, ~~`monoReachSlotPins` 546~~, ~~`monoDeclPathPinsOrReach` 173~~, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, ~~`monoReachSlotPinsAt` 78~~.
 - [ ] **node type** (29): `monoCloseRetFnTy` 9,592, `monoInitHeldTy` 6,742, `monoArgClosedTyIn` 5,475, `monoPinBin` 4,320, `monoPinnedOperandTy` 3,781, `monoSubstLetType` 3,348, `monoCloneLetDecl` 3,020, `monoCoerceListCbArg` 2,889, `monoPinReturnedObj` 1,945, `monoCbFnListRowSpell` 1,107, `monoDeadNullTest` 882, `monoCgcTplTy` 668, `monoRetFnListTy` 608, `monoPinnedAnnTyAt` 509, `monoLeafParamPin` 420, `monoBoundFnListElemsTy` 352, `monoPinnedReadTy` 341, `monoClosedObjLitTy` 174, `monoLetAnnTyOf` 66, `monoHoleFnPinTy` 33, `monoLetWriteRhsTyRec` 15, `monoPinnedListElemPin` 14, `monoLetWritesRecord` 6, `monoModuleDupPin` 3, `monoArgOpenValueTy` 1, `monoModuleLetPin` 0, `monoClosedFieldValTy` 0, `monoLetWriteRhsTy` 0, `monoPinnedListAnnTy` 0.
 - [ ] **slot type** (27): `monoBindingAdoptInit` 9,578, `monoHoleGenFnPin` 7,952, `monoListSrcElemTy` 7,925, `monoReachLitTys` 6,959, `monoReachSlotTy` 6,938, `monoPinMapValues` 6,754, `monoPinFieldContainers` 798, `monoPinRecordFields` 733, `monoLetWritesClosed` 703, `monoPinObjFields` 695, `monoRetypeLamCells` 565, `monoPinRecordField` 466, `monoWritesCoercedFirstCall` 454, `monoPinNestedListElems` 315, `monoPinFieldContainer` 112, `monoPinMapSlot` 66, `monoLetWritesAt` 57, `monoNoteBindCall` 28, `monoPinFieldValue` 25, `monoPinJoin` 22, `monoPinStoredRecords` 20, `monoRenameInitAt` 12, `monoSigJoin` 3, `monoPinnedElemAnnTy` 2, `monoHandWrittenLet` 2, `monoPinMapNestedFnLists` 0, `monoWrittenLetRetsDisagree` 0.
+  The slot pins against `elabSlotTyAt` (2026-11-07, 23,384 programs): map values (the fallback
+  where the slot fact declines) agree 32, differ 0, mono only 15; a record's whole type agrees 6,
+  differs 0, is mono only 1 and elaboration only 89; a record's function field agrees 15, differs
+  0, is mono only 41 and elaboration only 1, with mono pinning nothing in 407. The mono-only side
+  is no missing fact: a slot fact is recorded only for a value holding an open function, and the
+  41 fields are closed in the checker, whose type is the fact. All 57 mono-only programs build the
+  same bytes without mono's pin. The pin itself is not neutral: dropping the record-field pin
+  outright moves 5 programs, 3 to a refusal, all records of generic functions, so it is load-bearing
+  where the elaboration has a fact (`objects/records-of-generics-at-two-types-into-one-narrower-param.vl`,
+  `objects/record-generic-field-called-and-read-under-is.vl`,
+  `objects/const-record-field-of-generic-called-direct-and-read-under-is.vl`, D6702, D15447). The
+  pins' helpers (`monoDeclPathPins`, `monoPinFnParamTys`, `monoValueAtAnnTy`) are shared, so moving
+  the decision deletes nothing; the family's deletions come from its single-caller tail.
 - [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, ~~`monoLamReachParamTy` 124~~, ~~`monoRecvParamElem` 41~~, `monoDeliverLamLit` 6, ~~`monoLamInstSigs` 2~~.
   The hub is `monoLamParamPinAnn`: an un-annotated lambda parameter's pin is the checked type
   substituted at the instance binding. Shadowed (2026-11-07, 23,384 programs, 748 reaching it)
@@ -2036,6 +2049,16 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   (`exactBindWalk`, `monoTyIsOpenUnion`) is deleted. It agrees in 938 programs and differs in none,
   and the 2 it alone answered build the same bytes without it:
   `objects/record-literal-arg-generic-field-read-under-is.vl`, D6701.
+  The family is closed as far as it goes. What moved: the hub binding, the two pre-binds, the bare
+  arena binding, D2816's clash pin, a minted instance's parameter types and the exact binding all
+  read the elaboration's key, and five helpers and three clone columns are deleted. What stays:
+  `monoPinnedTyParamCanon`, the pin-implied dedup of the key text, which decides instance identity
+  and waits on the canonical instance key (measured there); `monoPinTyParamComposite` and
+  `monoPinAnnotatedParam`, which are Fn#d's call-param hub; and the class (c) mechanics that make,
+  key, register and clone instances (`monoMakeInstanceGo`, `monoInstantiateCallIn`, `monoBindCols`,
+  `monoMakeInstanceLetTyCol`, `monoCadNoteInstance`, `monoSlotParamPins`, `monoSlotSig`,
+  `monoSubstAnnNode`, `monoSubstTyArgNodes`, `monoLayoutConstOf`, `monoSeedCallSigTys`,
+  `monoBindEnclosingPins`).
   The per-argument pins are a separate fact (the argument's representation, per union arm) and
   wait for the producers.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
