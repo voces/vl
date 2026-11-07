@@ -2505,6 +2505,20 @@ roots, which deletes `monoFlowReadElem`. The alias-write walk (D9651, D9440) sta
 syntax. Each step graded alone against master's fixpoint: 0 moved, after the two fixes the first
 cut needed (a push blamed on its value, not its call; a map's inert site lost to its root).
 
+**B2b, part 2b, and what stays in mono** (2026-11-07). `monoFlowLetLeaf` and `monoFlowLetMapLeaf`
+read a `let`'s initialiser and writes from `cwBindingWrittenValues` (0 moved each). That ends B2's
+value derivations. What stays is class (c), and why:
+- `mfrPlannedRoots` (was `mfrVals`) is planner state: `monoFlowDeclVals` fills it from the
+  elaboration, and the root sweep and tie bookkeeping read only planned bindings, so it is not a cache
+  of every binding's roots.
+- `monoFlowAliasReadVals`, `monoFlowRetLocalLists` and `monoFlowRetUse` classify a use by syntax over
+  elaboration values; `monoFlowElemsGen` reads elements and the write index and keeps the spread
+  ties (D9482).
+- `mfrCand` and `mfrGen` are decided by syntax, plus one elaboration fact (`fnTagListTy`, a tagged
+  set's id list is no candidate); no member is added on mono's own type judgement.
+- The inert walk's as-written map site stays only as long as the inert walk, which leaves with the
+  inertness change to `elabSlotUncalled`.
+
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
 move no output. These are the reads the gate does not answer: an argument handed on, a loop over a
