@@ -3,22 +3,50 @@
 // a lambda is `{d}`, a written `let` the union of its writes, a value `if` or `match` the union of
 // its tails, and anything else (a parameter, a field, a call result) is open.
 
-import { FuncDecl, Ident, IfStmt, LetDecl, MatchExpr, P, nodeAt } from "./ast"
+import {
+  Call,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  LetDecl,
+  MatchExpr,
+  P,
+  Param,
+  i32ToStr,
+  nodeAt,
+} from "./ast"
 import { T, TyFunc } from "./check_types"
 import { tyHasTyVar } from "./tyquery"
 import { identDeclOf, nodeSrc } from "./symbols"
 import { wrDstDecl } from "./check_decl_scan"
 import { valueTailSplit } from "./check_num_adopt"
-import { elabFnSetTy } from "./check_fn_tag_facts"
-import { elabFnSetTyMint } from "./check_elab_cap"
+import { elabFnSetTy, fnTagged } from "./check_fn_tag_facts"
+import { elabFnSetOf, elabFnSetTyMint } from "./check_elab_cap"
 import { parenPeelIx } from "./check_places"
-import { elabIdentityTy } from "./emit_elab"
+import {
+  elabCalleeFnsOf,
+  elabIdentityTy,
+  elabSpecBaseOf,
+  elabSpecChildCount,
+  elabSpecDeclAt,
+  elabSpecDeclsOf,
+  elabSpecInst,
+  elabSpecMintedCount,
+  elabSpecParamsOf,
+} from "./emit_elab"
+import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 
 // Each `let` node's written values, built once per compile from `wrDstDecl`.
 let idWrites: {[i32]: i32[]} = Map()
 let idWritesBuilt = false
 let idLetMemo: {[i32]: i32[]} = Map()
 const idLetBusy: {[i32]: boolean} = Map()
+// Each specialization decision's call and the argument-keyed instance it reached (-1 for none).
+let idSpecCalls: i32[] = []
+let idSpecKeys: i32[] = []
+let idSpecGroups: string[] = []
+// The instance the latest decision reached, which the bake that follows it rewrites.
+let idSpecLast = -1
 
 // The first source node of the copies `x` descends from; `x` itself when it is no copy.
 export function idCanon(x: i32): i32 {
@@ -173,4 +201,190 @@ export function elabIdentityFnTy(x: i32, fnIx: i32): i32 {
   const s = idSetOf(x, 0)
   if s.length == 0 { return t }
   elabFnSetTyMint(t, s)
+}
+
+// Forgets the specialization decisions, at the start of a compile's elaboration.
+export function elabSpecReset() {
+  idSpecCalls = []
+  idSpecKeys = []
+  idSpecGroups = []
+  idSpecLast = -1
+  0
+}
+
+// The declaration specialized argument `ax` is in frame `fnIx`, from its identity type: -1 where
+// that type carries no singleton. A tagged set is never specialized (D15010), so it is -2.
+export function elabSpecArgDecl(ax: i32, fnIx: i32): i32 {
+  const t = elabIdentityFnTy(ax, fnIx)
+  if t < 0 { return -1 }
+  const sid = elabFnSetTy[t] ?? -1
+  if sid >= 0 && (fnTagged[sid] ?? false) { return -2 }
+  if tyHasTyVar(t) { return -1 }
+  const s = elabFnSetOf(t)
+  if s.length != 1 { return -1 }
+  idCanon(s[0])
+}
+
+// Mono's callback specialization at call `call` of declaration `decl` in frame `fnIx`: `names[p]`
+// is the function it bakes for argument `args[p]` ("" for none). Keys and checks the elaboration's
+// instance at those arguments' identities, and answers the decision's index.
+export function elabSpecDemand(
+  call: i32,
+  fnIx: i32,
+  decl: i32,
+  args: i32[],
+  names: string[],
+): i32 {
+  const ps: i32[] = []
+  const ds: i32[] = []
+  let why = ""
+  let p = 0
+  while p < args.length && p < names.length {
+    if names[p] != "" {
+      const d = elabSpecArgDecl(args[p], fnIx)
+      if d == -2 { why = "tagged" }
+      if d == -1 && why == "" { why = "open" }
+      if d >= 0 && why == "" && !idDeclNamed(d, names[p]) { why = "other" }
+      ps.push(p)
+      ds.push(d)
+    }
+    p = p + 1
+  }
+  const base = if why == "" { elabSpecBaseOf(call, fnIx, decl) } else { -2 }
+  if why == "" && base < -1 { why = "nobase" }
+  const k = if why == "" { elabSpecInst(decl, base, fnIx, ps, ds) } else { -1 }
+  if why == "" && k < 0 { why = "nokey" }
+  idSpecLast = k
+  idShadowRow("speckey " + (if why == "" { "keyed" } else { why }))
+  idSpecCalls.push(call)
+  idSpecKeys.push(k)
+  idSpecGroups.push("")
+  idSpecCalls.length - 1
+}
+
+// Names the instance mono gave decision `i` (`elabSpecDemand`'s answer): its registry key or slot.
+export function elabSpecMonoGroup(i: i32, g: string) {
+  if i >= 0 && i < idSpecGroups.length { idSpecGroups[i] = g }
+  0
+}
+
+// Whether declaration `d` is the function mono names `name`.
+function idDeclNamed(d: i32, name: string): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  n is FuncDecl && n.fnName == name
+}
+
+// One `specgroup` row once mono has run: its distinct instances over the keyed decisions, the
+// elaboration's, and the distinct pairs; the grouping agrees exactly when all three are equal.
+export function elabSpecGroupRow() {
+  if idShadowModeOf() == 0 { return 0 }
+  const mono: {[string]: boolean} = Map()
+  const elab: {[i32]: boolean} = Map()
+  const pairs: {[string]: boolean} = Map()
+  let nm = 0
+  let ne = 0
+  let np = 0
+  let i = 0
+  while i < idSpecGroups.length && i < idSpecKeys.length {
+    const k = idSpecKeys[i]
+    if k >= 0 {
+      const m = idSpecGroups[i]
+      if !(mono[m] ?? false) {
+        mono[m] = true
+        nm = nm + 1
+      }
+      if !(elab[k] ?? false) {
+        elab[k] = true
+        ne = ne + 1
+      }
+      const pk = m + "#" + i32ToStr(k)
+      if !(pairs[pk] ?? false) {
+        pairs[pk] = true
+        np = np + 1
+      }
+    }
+    i = i + 1
+  }
+  idShadowRow(
+    "specgroup mono="
+      + i32ToStr(nm)
+      + " elab="
+      + i32ToStr(ne)
+      + " pairs="
+      + i32ToStr(np)
+      + " minted="
+      + i32ToStr(elabSpecMintedCount())
+      + " children="
+      + i32ToStr(elabSpecChildCount()),
+  )
+  0
+}
+
+// The functions call `c`'s callee can be inside instance `k`: in an argument-keyed instance, a
+// call through a specialized parameter is a call of the declaration its key names; otherwise
+// `elabCalleeFnsOf`.
+export function elabCalleeFnsAt(c: i32, k: i32): i32[] {
+  const d = elabSpecDeclAt(k)
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if d < 0 || !(cn is Call) { return elabCalleeFnsOf(c) }
+  const cf = parenPeelIx(cn.callFn)
+  let pd = if cf >= 0 { identDeclOf(cf) } else { -1 }
+  if pd < 0 && cf >= 0 { pd = identDeclOf(idCanon(cf)) }
+  if pd >= 0 && pd < P.nodes.length && nodeAt(pd) is LetDecl {
+    pd = idParamAliased(pd, 0)
+  }
+  const dn = nodeAt(d)
+  if pd < 0 || !(dn is FuncDecl) || !(nodeAt(pd) is Param) {
+    return elabCalleeFnsOf(c)
+  }
+  const ps = elabSpecParamsOf(k)
+  const ds = elabSpecDeclsOf(k)
+  let j = 0
+  while j < ps.length && j < ds.length {
+    const p = ps[j]
+    if p < dn.fnParams.length && idCanon(dn.fnParams[p]) == idCanon(pd) {
+      const one: i32[] = [ds[j]]
+      return one
+    }
+    j = j + 1
+  }
+  elabCalleeFnsOf(c)
+}
+
+// The parameter every value written to binding `bd` reads, through bindings that only ever hold
+// one another, or -1: a binding only ever holding a parameter is that parameter.
+function idParamAliased(bd: i32, depth: i32): i32 {
+  if depth > 16 { return -1 }
+  let out = -1
+  for w in idWritesOf(bd) {
+    const x = parenPeelIx(w)
+    let pd = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+    if pd >= 0 && pd < P.nodes.length && nodeAt(pd) is LetDecl {
+      pd = idParamAliased(pd, depth + 1)
+    }
+    if pd < 0 || !(nodeAt(pd) is Param) || (out >= 0 && pd != out) { return -1 }
+    out = pd
+  }
+  out
+}
+
+// The class of callee set `fs` against the function mono bakes, `name`.
+function idBakeClass(fs: i32[], name: string): string {
+  if fs.length == 0 { return "none" }
+  if fs.length > 1 { return "several" }
+  if idDeclNamed(fs[0], name) { return "agree" }
+  "differ"
+}
+
+// One `specbake` row where mono rewrites call `call` through a specialized parameter into a
+// direct call of `name`: the elaboration's callee inside the latest decision's instance, and
+// its answer without the key.
+export function elabSpecBakeNote(call: i32, name: string) {
+  if idShadowModeOf() == 0 { return 0 }
+  const c = idCanon(call)
+  const was = idBakeClass(elabCalleeFnsOf(c), name)
+  const now = if idSpecLast >= 0 { idBakeClass(elabCalleeFnsAt(c, idSpecLast), name) } else { "nokey" }
+  idShadowRow("specbake " + now + " was=" + was)
+  0
 }

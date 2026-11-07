@@ -8,6 +8,11 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-07-step7-post-mono-cols-from-recorded](2026-11-07-step7-post-mono-cols-from-recorded.md): Post-mono return columns read off the recorded result for 2,897 of 2,994 functions; the walk runs only for named missing-fact classes (#6716).
+- [2026-11-07-elab-stub-args](2026-11-07-elab-stub-args.md): The elaboration's own stub keys for uncalled hole-function arguments (D15494), shadowed 104 of 104 against mono's (#6715).
+- [2026-11-07-slot-climb-calls](2026-11-07-slot-climb-calls.md): The calls a literal slot's climb reaches, as an elaboration fact; mono no longer reads `vrCalls` (#6712).
+- [2026-11-07-pin-type-column](2026-11-07-pin-type-column.md): `pinOwn`, each pin's substituted annotation type, carried to `monoKeyPinSeg`; its row class differs from the name's in 90 programs (#6713).
+- [2026-11-07-heldval-consumers](2026-11-07-heldval-consumers.md): The function-holding consumers read `elabHeldValTy`; the classes that need a rep change (#6711).
 - [2026-11-07-lane-f-map-values](2026-11-07-lane-f-map-values.md): Lane F: `monoFlowMapReadVals` deleted, `monoFlowAliasMaps` (c), `monoReachSlotTy`/`monoReachLitTys` blocked on the per-call slot type (#6708).
 - [2026-11-07-step7-classifier-batch-1](2026-11-07-step7-classifier-batch-1.md): Five type-blind classifiers deleted at 0 disagreements; the rest graded and parked with witnesses (#6709).
 - [2026-11-07-pin-spelling-hole-params](2026-11-07-pin-spelling-hole-params.md): The naming rule names an un-annotated parameter's pin; why the scope stops there (the pin-type column) (#6706).
@@ -16,6 +21,8 @@ Newest first:
 - [2026-11-07-pin-decisions-off-spelling](2026-11-07-pin-decisions-off-spelling.md): Every decision that read an instance pin's spelling (`=>`, `isNumRecvBaseName`) reads its type; sweep byte-identical.
 - [2026-11-07-forin-struct-row-shadow](2026-11-07-forin-struct-row-shadow.md): `forInVarStructIdx` against `repSlotOfKind`: 284 of 286 agree, both misses function-valued fields (step 3); `repSlotOfTy` not widened.
 - [2026-11-07-classifier-phase-census](2026-11-07-classifier-phase-census.md): The classifier phase census committed (`$VL_CLS_CENSUS`, `scripts/classifier-census.vl`), and its reading on master.
+- [2026-11-07-argument-keyed-callee](2026-11-07-argument-keyed-callee.md): Identity typing (A) slice 3: the callee through a specialized parameter at the key, shadowed; 1,172 of 1,172 keyed rewrites agree with mono's bake.
+- [2026-11-07-argument-keyed-instances](2026-11-07-argument-keyed-instances.md): Identity typing (A) slice 2b: instances keyed by the specialized arguments' identities; 1,416 instances group exactly as mono's, byte-identical.
 - [2026-11-07-identity-typing-fact](2026-11-07-identity-typing-fact.md): Identity typing (A) slice 2a: the fact in the elaboration; 1,505 of 1,505 concrete specialization decisions read mono's declaration, byte-identical; the checker-type variant refused (16 runs lost).
 - [2026-11-07-step7-void-from-recorded](2026-11-07-step7-void-from-recorded.md): Step 7: voidness read from the recorded result, `computeVoidFns` retired.
 - [2026-11-07-fn-holding-facts](2026-11-07-fn-holding-facts.md): `elabHeldValTy`, the closed type of a function-holding value, shadowed against four mono functions: 0 differ, 2 old-only (D4515).

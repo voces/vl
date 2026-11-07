@@ -1,5 +1,10 @@
 import { idShadowSpec } from "./emit_id_shadow"
-import { elabIdentityFnTy } from "./elab_fn_id"
+import {
+  elabIdentityFnTy,
+  elabSpecBakeNote,
+  elabSpecDemand,
+  elabSpecMonoGroup,
+} from "./elab_fn_id"
 import { idShadowModeOf } from "./id_shadow_state"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
 import { recEnclosingFn } from "./check_fit_rules"
@@ -417,7 +422,8 @@ import {
 import { callBindShadowNote } from "./call_bind_shadow"
 import {
   monoPinOwnClose,
-  monoPinOwnRowNote,
+  monoPinOwnOfSpelled,
+  monoPinOwnTvAtRep,
   monoPinRespell,
   monoPinSpellNote,
 } from "./pin_spell"
@@ -609,13 +615,7 @@ import {
   bundleReset,
   bundleRetParamNote,
 } from "./emit_bundle"
-import {
-  repCanonId,
-  repElemTyOfName,
-  repRowId,
-  repRowOfTyStruct,
-  repShadowOn,
-} from "./emit_rep"
+import { repCanonId, repRowId, repRowOfTyStruct, repShadowOn } from "./emit_rep"
 import {
   instKeyCallTime,
   instKeyCanon,
@@ -5201,6 +5201,7 @@ function monoBakeCallback(
             if cbFnNames[bk] != "" && pname == cbParamNames[bk] {
               newCallee = mkIdent(cbFnNames[bk], callee.pos)
               identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[bk]))
+              elabSpecBakeNote(ix, cbFnNames[bk])
             }
             bk = bk + 1
           }
@@ -8450,10 +8451,9 @@ function monoKeyPinSeg(
     // under the key's bindings, which already fix it; the argument's exact type and its
     // literal-union rep add nothing (D15109).
     const unionPin = pk < bound.length && bound[pk]
-    // A pin built around records is keyed by its row class (`typeRowClassOf`): pins whose records
-    // share a row build one instance, whatever their names or spellings (D15262).
-    const rowCls = typeRowClassOf(repElemTyOfName(pinned[pk]))
-    monoPinOwnRowNote(rowCls, pinOwn[pk])
+    // A pin built around records is keyed by its own type's row class (`typeRowClassOf`): pins
+    // whose records share a row build one instance, whatever their names or spellings (D15262).
+    const rowCls = typeRowClassOf(pinOwn[pk])
     if rowCls != "" {
       seg = seg
         + "#row"
@@ -17185,8 +17185,17 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   }
   const qs: i32[] = [lt.aElem]
   // A generic or hole function named as the callback takes the signature of the instance the
-  // elaboration made for it at the element; else its result is derived here.
-  const et = elabCbArgSig(a)
+  // elaboration made for it at the element, else its closed identity type; else its result is
+  // derived here.
+  let et = elabCbArgSig(a)
+  if et < 0 {
+    const it = elabIdentityFnTy(ax, ctx)
+    const closed = it >= 0
+      && it < T.tys.length
+      && !tyHasTyVar(it)
+      && elabTyClosed(it, 0)
+    if closed && tyAt(it) is TyFunc { et = it }
+  }
   const ef = if et >= 0 { tyAt(et) } else { tyAt(0) }
   let r = TY_BOOL
   if ef is TyFunc { r = ef.fnRet }
@@ -19726,6 +19735,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         )
         ci = ci + 1
       }
+      const specAt = if monoAnyBakedCallback(cbFnNames) { elabSpecDemand(callIx, ctx, monoOrigNode[origFe], args, cbFnNames) } else { -1 }
       monoBindSeededTyParams(
         fn,
         monoOrigNode[origFe],
@@ -19796,6 +19806,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       monoMakeCallIx = callIx
       monoOpenLamOwner = callIx
       monoOpenLamDefer = -1
+      const specKeys0 = monoKeys.length
       const made = monoMakeInstance(
         origFe,
         pinned,
@@ -19808,6 +19819,8 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         false,
         cbFnNames,
       )
+      const specFe = if monoKeys.length > specKeys0 { monoInstFe[specKeys0] } else { monoLastInstFe }
+      elabSpecMonoGroup(specAt, i32ToStr(specFe))
       return made
     }
   }
@@ -20808,13 +20821,20 @@ function monoPinAnnotatedParam(
         i,
         monoDeclParamTysOf(decl, params.length),
       )
-      pinOwn.push(monoClosedSlotTyAt(lpat, topFnOwnerOf(decl), tvN, tvT))
+      pinOwn.push(
+        monoClosedSlotTyAt(
+          lpat,
+          topFnOwnerOf(decl),
+          tvN,
+          monoPinOwnTvAtRep(tvN, tvV, tvT),
+        ),
+      )
     } else {
       // A `T` an earlier parameter bound pins this one at that binding's type, not the argument's.
       const bt = if bind == b { monoBindTyOf(tvN, tvT, tp) } else { -1 }
       pinned.push(bind)
       pinTys.push(if bt >= 0 { bt } else { an2Ty })
-      pinOwn.push(if bt >= 0 { bt } else { an2Ty })
+      pinOwn.push(if bt >= 0 { bt } else { monoPinOwnOfSpelled(bind, an2Ty) })
     }
   }
   0
@@ -21333,7 +21353,9 @@ function monoPinTyParamComposite(
   // under the typed bindings, when that closes.
   if pinCTy < 0 && annIsFn { pinCTy = monoClosedSlotTyAt(patTy, own, tvN, tvT) }
   pinTys.push(pinCTy)
-  pinOwn.push(monoClosedSlotTyAt(patTy, own, tvN, tvT))
+  pinOwn.push(
+    monoClosedSlotTyAt(patTy, own, tvN, monoPinOwnTvAtRep(tvN, tvV, tvT)),
+  )
   0
 }
 
@@ -21472,6 +21494,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         i = i + 1
       }
       if !monoAnyBakedCallback(cbFnNames) { return 0 }
+      const specAt = elabSpecDemand(callIx, ctx, fnDeclIx, args, cbFnNames)
       // Key on the callee plus each baked callback identity, so `reduce(xs, add, …)` and
       // `reduce(xs, mul, …)` get distinct specializations. The `C` prefix keeps these out
       // of the generic keyspace, which always carries a `#`.
@@ -21481,6 +21504,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         if cbFnNames[kc] != "" { key = key + "@" + cbFnNames[kc] }
         kc = kc + 1
       }
+      elabSpecMonoGroup(specAt, key)
       // Registry hit: a prior call already specialized this (callee, callback-set) — reuse it.
       let r = 0
       while r < monoKeys.length {
