@@ -6,10 +6,13 @@ import { primTyOfName } from "./check_decl_scan"
 import { cwIxCoveredLen, cwIxCovers } from "./check_write_scan"
 import { recFieldTyOf } from "./emit_rec_field_codes"
 import {
+  monoAnnHasTyParam,
   monoIsGenericDecl,
-  monoParamsMention,
-  monoTyParamReachesSpelling,
+  monoNodeNamesTyParam,
+  narrowRegionReads,
+  unwrapParen,
 } from "./emit_base"
+import { isVarTyIxOf } from "./check_list_union"
 import { identFnDeclOf, tyParamIsBareOnly } from "./check_scopes"
 import {
   elabHoleRowCut,
@@ -1088,14 +1091,14 @@ export const ELAB_TP_DEFAULT = "i32"
 export const ELAB_EMPTY_LIST_ELEM_DEFAULT = "i32"
 
 // The type parameters of each declaration an inferred call that leaves them unbound defaults, and
-// the type they default to; primed by the monomorphizer before the worklist runs.
+// the type they default to; primed when the elaboration starts (`elabTpDefaultsPrime`).
 export let elabTpDefaults: {[i32]: string[]} = Map()
 export let elabTpDefaultTy = -1
 
 // Records the type parameters of declaration `d` an inferred call that leaves them unbound
 // defaults to `ELAB_TP_DEFAULT`: each no parameter annotation names and whose binding reaches no
-// spelling the default would answer (`monoTyParamReachesSpelling`).
-export function elabTpDefaultsNote(d: i32) {
+// spelling the default would answer (`elabTyParamReachesSpelling`).
+function elabTpDefaultsNote(d: i32) {
   const fn = nodeAt(d)
   if !(fn is FuncDecl) || fn.fnTyParams.length == 0 { return 0 }
   const out: string[] = []
@@ -1103,14 +1106,132 @@ export function elabTpDefaultsNote(d: i32) {
     const one: string[] = [tp]
     const seen: i32[] = []
     if (
-      !monoParamsMention(fn.fnParams, one)
-      && !monoTyParamReachesSpelling(fn.fnBody, one, seen)
+      !elabParamsMention(fn.fnParams, one)
+      && !elabTyParamReachesSpelling(fn.fnBody, one, seen)
     ) {
       out.push(tp)
     }
   }
   if out.length > 0 { elabTpDefaultsSet(d, out, primTyOfName(ELAB_TP_DEFAULT)) }
   0
+}
+
+// Whether a binding of `names` could reach an `is` check type or a `T.field` layout constant,
+// in the subtree at `ix` or in a generic it calls with a type argument naming them or an
+// argument whose type has a type variable. Those spellings would answer the default, so a
+// parameter that reaches one stays unbound. `seen` holds the callees already walked.
+export function elabTyParamReachesSpelling(
+  ix: i32,
+  names: string[],
+  seen: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if monoNodeNamesTyParam(ix, names) { return true }
+  if elabListIsUnhandable(ix, names, ix) { return true }
+  elabTyParamCallReaches(ix, names, seen)
+}
+
+// Whether an `is K[]` under `ix` tests a receiver whose type names one of `names` and whose arm
+// reads it where it cannot be handed an empty `K[]` in place of the default's (D4911): a field,
+// whose region reads it through another place of the same name.
+export function elabListIsUnhandable(
+  ix: i32,
+  names: string[],
+  body: i32,
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is IsExpr {
+    const kTy = isVarTyIxOf(ix)
+    const rTy = nodeTyIxOf(n.isObj)
+    if (
+      kTy >= 0
+      && kTy < T.tys.length
+      && tyAt(kTy) is TyArray
+      && rTy >= 0
+      && rTy < T.tys.length
+      && monoAnnHasTyParam(-1, rTy, names)
+    ) {
+      const r = nodeAt(unwrapParen(n.isObj))
+      if r is Member && narrowRegionReads(body, ix, r.memProp, true) == 2 {
+        return true
+      }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if elabListIsUnhandable(k, names, body) { return true }
+  }
+  false
+}
+
+// `elabTyParamReachesSpelling`'s walk over the generic calls in the subtree at `ix`.
+export function elabTyParamCallReaches(
+  ix: i32,
+  names: string[],
+  seen: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is Call && n.callFn >= 0 {
+    const cf = nodeAt(n.callFn)
+    // The callee resolves through the checker's scopes, so the walk answers before the emit
+    // tables exist, when the elaboration primes its defaults.
+    const gd = if cf is Ident { identFnDeclOf(n.callFn) } else { -1 }
+    if gd >= 0 && !i32ListHas(seen, gd) {
+      const g = nodeAt(gd)
+      if g is FuncDecl {
+        if g.fnTyParams.length > 0 && elabCallMayBind(ix, n.callArgs, names) {
+          seen.push(gd)
+          if elabTyParamReachesSpelling(g.fnBody, g.fnTyParams, seen) {
+            return true
+          }
+        }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if elabTyParamCallReaches(kids[i], names, seen) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Whether the call `callIx` can hand a binding of `names` to its callee: a written type
+// argument naming one, or an argument whose type is unknown or has a type variable.
+export function elabCallMayBind(
+  callIx: i32,
+  args: i32[],
+  names: string[],
+): boolean {
+  for ta in callTyArgsOf(callIx) {
+    if monoAnnHasTyParam(ta, -1, names) { return true }
+  }
+  for a in args {
+    const at = nodeTyIxOf(a)
+    if at < 0 || tyHasTyVar(at) { return true }
+  }
+  false
+}
+
+// Whether any parameter annotation in `params` names one of `typarams`.
+export function elabParamsMention(params: i32[], typarams: string[]): boolean {
+  let i = 0
+  while i < params.length {
+    const p = nodeAt(params[i])
+    if p is Param {
+      if p.parType >= 0 {
+        if monoAnnHasTyParam(p.parType, -1, typarams) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Whether the declaration owning body `body` defaults its type parameter `tp`.
@@ -1132,7 +1253,7 @@ export function elabTpDefaultsSet(d: i32, names: string[], t: i32) {
 // Each source declaration by its body, so an emitted rebuild finds the declaration it copies.
 let elabBodyDecl: {[i32]: i32} = Map()
 
-export function elabBodyDeclNote(d: i32, body: i32) {
+function elabBodyDeclNote(d: i32, body: i32) {
   if body >= 0 { elabBodyDecl[body] = d }
   0
 }
@@ -1146,10 +1267,27 @@ export function elabStubArgSet(ix: i32, k: i32, t: i32) {
   0
 }
 
-export function elabTpDefaultsReset() {
+export function elabStubArgReset() {
   elabStubArg = Map()
+  0
+}
+
+// Notes each declaration by its body and the type parameters an inferred call that leaves them
+// unbound defaults (`elabTpDefaultsNote`). Only a body local can name such a parameter and it
+// holds no value of it, so no read tells (D4911; DECISIONS.md §"An unbound type parameter
+// defaults at the call").
+function elabTpDefaultsPrime() {
   elabTpDefaults = Map()
   elabBodyDecl = Map()
+  let d = 0
+  while d < P.nodes.length {
+    const fn = nodeAt(d)
+    if fn is FuncDecl {
+      elabBodyDeclNote(d, fn.fnBody)
+      elabTpDefaultsNote(d)
+    }
+    d = d + 1
+  }
   0
 }
 
@@ -8369,6 +8507,7 @@ function elabArmHandsSet(a: i32, ad: i32): boolean {
 // Runs the worklist from the generic pass's closed calls.
 export function elabRun() {
   elabRunDone = false
+  elabTpDefaultsPrime()
   elabLateNames = []
   elabPinsClosedSet(false)
   elabCbRepKeys = Map()
