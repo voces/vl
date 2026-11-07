@@ -351,6 +351,7 @@ import {
   structNameOfTy,
   tyAt,
   tyEq,
+  tyFieldTyOf,
   tyHasHole,
   tyHasInferHole,
   tyHasLitLeaf,
@@ -11143,11 +11144,27 @@ function elabSlotTyAtKey(holder: i32, path: string[], ik: i32): i32 {
   t
 }
 
+// The program-level holders `elabSlotFacts` left without a fact, for `elabSlotBundleFacts`.
+let elabSlotUnfacted: i32[] = []
+
+// Re-reads `elabBindingWholeTy` for each program-level holder `elabSlotFacts` left without a fact,
+// once the reach rows exist: a value built from a delivered bundle has its type only then.
+export function elabSlotBundleFacts() {
+  for ix in elabSlotUnfacted {
+    if !elabSlotTys.has(elabSlotKey(ix, -1)) {
+      const fr = elabBindingWholeTy(ix, nodeTyIxOf(ix), -1)
+      if fr >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = fr }
+    }
+  }
+  0
+}
+
 // Closes every `let` binding outside a generic whose value holds an open function leaf, and every
 // such function's returned list literals, at the type `elabHeldClosedTyAt` gives the values its
 // slots are written, for `elabSlotTyAt`.
 function elabSlotFacts() {
   const n0 = ekDecl.length
+  elabSlotUnfacted = []
   const inst: i32[] = []
   const instFn: i32[] = []
   let ix = 0
@@ -11166,7 +11183,11 @@ function elabSlotFacts() {
         } else {
           const fr = elabBindingWholeTy(ix, t, -1)
           const ft = if fr >= 0 { fr } else if elabSlotWholeFn(t) { elabSlotCloseWhole(ix, t, -1) } else { elabSlotClose(ix, t, [n.letInit], -1) }
-          if ft >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = ft }
+          if ft >= 0 {
+            elabSlotTys[elabSlotKey(ix, -1)] = ft
+          } else {
+            elabSlotUnfacted.push(ix)
+          }
         }
       }
     }
@@ -11370,7 +11391,8 @@ function elabBindingWholeTy(d: i32, t: i32, k: i32): i32 {
 }
 
 // The closed type value node `x` written to binding `d` carries at instance `k`, or -1. A value
-// that reads another holder's slot takes that slot's closed fact; a call returning a list of
+// that reads another holder's slot takes that slot's closed fact; a call, a literal or a read
+// built from bundles takes the type `elabWrittenBuiltTy` builds; a call returning a list of
 // functions takes the type its returned literals are delivered at.
 function elabWrittenValueTy(d: i32, x: i32, k: i32): i32 {
   const path: string[] = []
@@ -11379,10 +11401,88 @@ function elabWrittenValueTy(d: i32, x: i32, k: i32): i32 {
   if st >= 0 && st < T.tys.length && elabTyClosed(st, 0) && !tyHasTyVar(st) {
     return st
   }
+  const bt = elabWrittenBuiltTy(d, x, k, 0)
+  if bt >= 0 { return bt }
   if x >= 0 && x < P.nodes.length && nodeAt(x) is Call {
     return elabCallRetFnListTy(x, k)
   }
   -1
+}
+
+// The type value `x` written to `d` is built at from the bundles its calls hand back: a call's
+// `elabCallBundleRet`, a record of its fields' (each other field at its closed checked type), a
+// list of its elements' agreed one, a field or list element of such a value, or the value an
+// un-annotated binding written once holds. -1 where no bundle is reached or a part does not close.
+function elabWrittenBuiltTy(d: i32, x0: i32, k: i32, depth: i32): i32 {
+  const x = parenPeelIx(x0)
+  if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
+  const n = nodeAt(x)
+  if n is Ident {
+    const b = identDeclOf(x)
+    if b < 0 || b >= P.nodes.length || b == d { return -1 }
+    const bn = nodeAt(b)
+    if !(bn is LetDecl) || bn.letType >= 0 || bn.letInit < 0 { return -1 }
+    if cwBindingWrittenValues(b).length != 1 { return -1 }
+    return elabWrittenBuiltTy(b, bn.letInit, k, depth + 1)
+  }
+  if n is ObjLit {
+    const names: string[] = []
+    const tys: i32[] = []
+    let any = false
+    for fi in n.objFields {
+      const f = nodeAt(fi)
+      if !(f is FieldInit) { return -1 }
+      let t = elabWrittenBuiltTy(d, f.fiValue, k, depth + 1)
+      if t >= 0 {
+        any = true
+      } else {
+        t = nodeTyIxOf(f.fiValue)
+        if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyHasHole(t) {
+          return -1
+        }
+      }
+      names.push(f.fiName)
+      tys.push(t)
+    }
+    if !any { return -1 }
+    return mkObjTy(names, tys)
+  }
+  if n is ArrayLit {
+    let t = -1
+    for e in n.arrElems {
+      const et = elabWrittenBuiltTy(d, e, k, depth + 1)
+      if et < 0 || (t >= 0 && !tySame(t, et)) { return -1 }
+      t = et
+    }
+    if t < 0 { return -1 }
+    return mkArrayTy(t)
+  }
+  if n is Member {
+    const ot = elabWrittenBuiltTy(d, n.memObj, k, depth + 1)
+    if ot < 0 { return -1 }
+    return tyFieldTyOf(ot, n.memProp)
+  }
+  if n is Index {
+    const at = elabWrittenBuiltTy(d, n.idxArr, k, depth + 1)
+    if at < 0 || at >= T.tys.length { return -1 }
+    const a = tyAt(at)
+    return if a is TyArray { a.aElem } else { -1 }
+  }
+  // Any other node hands back a bundle only as a call.
+  elabCallBundleRet(x, k)
+}
+
+// The bundle record call `x` at instance `k` (-1 for the program) hands back: its instance returns
+// the parameter `elabRetParamOf` names, delivered as a bundle (`elabDeliveredBundleSigs`). Else -1.
+export function elabCallBundleRet(x: i32, k: i32): i32 {
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Call) { return -1 }
+  const ck = elabCallInstFrom(x, k)
+  if ck < 0 || ck >= ekDecl.length { return -1 }
+  const p = elabRetParamOf(ekDecl[ck])
+  if p < 0 { return -1 }
+  const rep = elabCallArgRep(x, ck, k, p)
+  if rep < 0 || elabDeliveredBundleSigs(rep).length == 0 { return -1 }
+  rep
 }
 
 // The closed type of call `x` in instance `k` whose callee returns list literals of functions, or
