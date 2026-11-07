@@ -2689,6 +2689,11 @@ So identity typing is not the prerequisite for this population; one fact is.
 - **(ii):** `closures/listed-hole-fn-escaping-list.vl`. A generic held in a list by identity is called
   at two types, so the list's one concrete rep is mono's choice. It is D15010's signature twin, parked
   in this section.
+- **(ii), deliveries:** one name read delivered at two function types, so the elaboration instances it
+  at both and `elabValueInstSig` names neither. D12234 (`deliver()`'s `l` into an `i32` and a
+  `string` binding) runs; `closures/error-hole-lambda-returned-into-bindings-of-two-types.vl`
+  refuses with its message. Both stay on mono's path under the same question: keying them by the
+  delivering site would decide it.
 - **Not reached (2):** neither decision gets to a probed site.
   - D6480 refuses first, at `monoWalkIdentCall`'s `monoGenArgAtOpenParam` gate. A call through
     the alias `k` of a written `let` holding a hole lambda has no lambda for `monoAliasLetLamFe`
