@@ -11437,11 +11437,96 @@ let elabSlotUnfacted: i32[] = []
 export function elabSlotBundleFacts() {
   for ix in elabSlotUnfacted {
     if !elabSlotTys.has(elabSlotKey(ix, -1)) {
-      const fr = elabBindingWholeTy(ix, nodeTyIxOf(ix), -1)
-      if fr >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = fr }
+      const t = nodeTyIxOf(ix)
+      const fr = elabBindingWholeTy(ix, t, -1)
+      // Where nothing closes the holder, a slot called at one closed signature is closed at it.
+      const ft = if fr >= 0 { fr } else { elabSlotFromDeliveries(ix, t, [], 0) }
+      if ft >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = ft }
     }
   }
   0
+}
+
+// Holder `h`'s type `t` with each open function slot at `path` replaced by the one closed signature
+// its calls deliver it at (`elabSlotDeliveries`); -1 where a slot has none or several.
+function elabSlotFromDeliveries(
+  h: i32,
+  t: i32,
+  path: string[],
+  depth: i32,
+): i32 {
+  if t < 0 || t >= T.tys.length || depth > 64 { return -1 }
+  if !tyHasTyVar(t) { return t }
+  const o = tyAt(t)
+  match o {
+    TyFunc => {
+      // A bare function value is not a slot: its calls pin it, and a generic one is instanced elsewhere.
+      if path.length == 0 { return -1 }
+      let one = -1
+      for c in elabSlotDeliveries(h, path, -1) {
+        if c < 0 || tyHasTyVar(c) || (one >= 0 && !tySame(one, c)) { return -1 }
+        one = c
+      }
+      // The calls name the signature; every function the slot holds must return its result there.
+      const sig = if one >= 0 { tyAt(one) } else { null }
+      if !(sig is TyFunc) { return -1 }
+      const ms = fnTagMembers(fnTagSetOfTy(t))
+      if ms.length == 0 { return -1 }
+      // Only an instance the run already holds answers; the check mints none.
+      const noNames: string[] = []
+      const noTys: i32[] = []
+      for m in ms {
+        const mk = elabKeyAtPins(
+          elabSrcDecl(m),
+          noNames,
+          noTys,
+          sig.fnParamTypes,
+          -1,
+        )
+        if mk < 0 || !tySame(elabResultOf(mk), sig.fnRet) { return -1 }
+      }
+      return one
+    }
+    TyArray => {
+      if o.aRead != 0 { return -1 }
+      const e = elabSlotFromDeliveries(
+        h,
+        o.aElem,
+        elabPathPlus(path, "e"),
+        depth + 1,
+      )
+      return if e < 0 { -1 } else { mkArrayTy(e) }
+    }
+    TyMap => {
+      if tyHasTyVar(o.mKey) { return -1 }
+      const v = elabSlotFromDeliveries(
+        h,
+        o.mVal,
+        elabPathPlus(path, "v"),
+        depth + 1,
+      )
+      return if v < 0 { -1 } else { mkMapTy(o.mKey, v, o.mSet) }
+    }
+    TyObj => {
+      const fs: i32[] = []
+      let i = 0
+      while i < o.objFieldNames.length && i < o.objFieldTypes.length {
+        const f = elabSlotFromDeliveries(
+          h,
+          o.objFieldTypes[i],
+          elabPathPlus(path, "f." + o.objFieldNames[i]),
+          depth + 1,
+        )
+        if f < 0 { return -1 }
+        fs.push(f)
+        i = i + 1
+      }
+      return mkObjTy(o.objFieldNames, fs)
+    }
+    TyPrim | TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return -1
+    }
+  }
 }
 
 // Closes every `let` binding outside a generic whose value holds an open function leaf, and every
