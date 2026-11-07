@@ -640,7 +640,6 @@ import { rlSlotOfTy, sFieldIndex } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
   elabClosedTyAt,
-  exactBindWalk,
   holeNulStringPinTyOf,
   tyCanonKey,
   tySameSet,
@@ -775,7 +774,6 @@ import {
   isNullTy,
   nonNullTy,
   primNameOf,
-  tyEmitPrimOf,
   tyExcludesNull,
   tyHasTyVar,
   tyHasTyVarWasCapped,
@@ -8795,30 +8793,12 @@ function monoRegisterValuePin(name: string, ty: i32): i32 {
   monoRegisterPinUnion(name, ty)
 }
 
-// Whether `ty` is a union with a type-parameter member and a concrete member besides `null`,
-// the shape the checker's binding walk passes over (`monoDeclIsOpenUnion`, which also names the
-// member).
-function monoTyIsOpenUnion(ty: i32): boolean {
-  const ms: i32[] = []
-  flattenVariantsInto(ty, ms)
-  if ms.length < 2 { return false }
-  let i = 0
-  while i < ms.length {
-    if ms[i] >= 0 && !tyHasTyVar(ms[i]) && tyEmitPrimOf(ms[i]) != "null" {
-      return true
-    }
-    i = i + 1
-  }
-  false
-}
-
-// Binds the type parameters of `fn` to the exact types this instance is pinned at into `outN`
-// / `outT`: the explicit type arguments first, then each parameter's pin. False, and nothing
-// bound, when some parameter's pin is unknown or still names a type variable.
+// Binds `typarams` into `outN` / `outT`: the explicit type arguments first, then each other one
+// at the elaboration's binding for call key `callKey`. False, and nothing bound, when the call has
+// no key or one of them stays open there.
 function monoExactBind(
-  params: i32[],
+  callKey: i32,
   typarams: string[],
-  pinTys: i32[],
   exBN: string[],
   exBT: i32[],
   outN: string[],
@@ -8830,42 +8810,19 @@ function monoExactBind(
     outT.push(exBT[e])
     e = e + 1
   }
-  // Two passes, a union annotation's last: its type-parameter member binds only what no other
-  // parameter binds, as the pin's spelling does (`monoPreBindPastUnionRest`).
-  let pass = 0
-  while pass < 2 {
-    let j = 0
-    while j < params.length && j < pinTys.length {
-      const p = nodeAt(params[j])
-      if p is Param {
-        if p.parType >= 0 {
-          const gt = nodeTyIxOf(p.parType)
-          if (
-            gt >= 0
-            && tyHasTyVar(gt)
-            && (monoTyIsOpenUnion(gt) == (pass == 1))
-          ) {
-            if pinTys[j] < 0 || tyHasTyVar(pinTys[j]) {
-              return monoExactClear(outN, outT)
-            }
-            exactBindWalk(gt, pinTys[j], outN, outT)
-          }
-        }
-      }
-      j = j + 1
-    }
-    pass = pass + 1
+  if callKey < 0 || callKey >= ekNames.length || callKey >= ekTys.length {
+    return monoExactClear(outN, outT)
   }
-  let k = 0
-  while k < typarams.length {
-    let bound = false
-    let b = 0
-    while b < outN.length {
-      if outN[b] == typarams[k] { bound = true }
-      b = b + 1
+  for tp in typarams {
+    if !strListHas(outN, tp) {
+      const at = strListIndexOf(ekNames[callKey], tp)
+      const t = if at >= 0 && at < ekTys[callKey].length { ekTys[callKey][at] } else { -1 }
+      if t < 0 || t >= T.tys.length || tyHasTyVar(t) {
+        return monoExactClear(outN, outT)
+      }
+      outN.push(tp)
+      outT.push(t)
     }
-    if !bound { return monoExactClear(outN, outT) }
-    k = k + 1
   }
   true
 }
@@ -9118,8 +9075,7 @@ function monoUnionTyParamPins(fn: FuncDecl): boolean[] {
 function monoMakeInstanceKey(
   key: string,
   origFe: i32,
-  params: i32[],
-  pinTys: i32[],
+  callKey: i32,
   tps: string[],
   exBN: string[],
   exBT: i32[],
@@ -9130,7 +9086,7 @@ function monoMakeInstanceKey(
   // A body testing a value of a type parameter is keyed by the exact types, which a pin's
   // spelling can merge (a Set and its boolean map), so each instance binds them to one.
   if elabTestsTyVar(monoOrigNode[origFe]) {
-    if (monoExactBind(params, tps, pinTys, exBN, exBT, exSubN, exSubT)) {
+    if (monoExactBind(callKey, tps, exBN, exBT, exSubN, exSubT)) {
       monoShAliasBind(origFe, exSubN, exSubT)
       let xk = 0
       while xk < exSubN.length {
@@ -10018,6 +9974,7 @@ function monoMakeInstanceKeyOf(
   fn: FuncDecl,
   origFe: i32,
   callFrame: i32,
+  callKey: i32,
   pinned: string[],
   pinTys: i32[],
   tvN: string[],
@@ -10058,8 +10015,7 @@ function monoMakeInstanceKeyOf(
   key = monoMakeInstanceKey(
     key,
     origFe,
-    fn.fnParams,
-    pinTys,
+    callKey,
     tps,
     exBN,
     exBT,
@@ -10392,10 +10348,16 @@ function monoMakeInstanceGo(
   const fn = nodeAt(monoOrigNode[origFe])
   if fn is FuncDecl {
     const params = fn.fnParams
+    const tplCall = if makeCall >= 0 { monoCallTplOf(makeCall) } else { -1 }
+    // A call's instance is keyed by the elaboration's key for that call plus the pinned reps, not
+    // by the pins' spelling (architecture-target §3.4, the call half).
+    const valueHalf = elabDeclIsValue(monoOrigNode[origFe])
+    const callKey = if tplCall >= 0 && !valueHalf { elabWalkKeyOf(tplCall, true, monoOrigNode[origFe]) } else { -1 }
     const k = monoMakeInstanceKeyOf(
       fn,
       origFe,
       callFrame,
+      callKey,
       pinned,
       pinTys,
       tvN,
@@ -10403,13 +10365,8 @@ function monoMakeInstanceGo(
       cbFnNames,
     )
     if retWiden != "" { k.key = k.key + "=>" + retWidenKey }
-    const tplCall = if makeCall >= 0 { monoCallTplOf(makeCall) } else { -1 }
     // Mono's own spelling, which the typed fallback below slices at `k`'s recorded offsets.
     const spelledKey = k.key
-    // A call's instance is keyed by the elaboration's key for that call plus the pinned reps, not
-    // by the pins' spelling (architecture-target §3.4, the call half).
-    const valueHalf = elabDeclIsValue(monoOrigNode[origFe])
-    const callKey = if tplCall >= 0 && !valueHalf { elabWalkKeyOf(tplCall, true, monoOrigNode[origFe]) } else { -1 }
     // A lambda's instance is keyed by the instance it is nested in and its own pinned reps
     // (architecture-target §3.4, the lambda key); one made outside any instance keeps mono's key.
     const lamTop = if callKey < 0 && monoCadIsLam(monoOrigNode[origFe]) { elabWalkTop() } else { -1 }
