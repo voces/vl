@@ -54,3 +54,12 @@ does not. The largest buckets are `K|null ~ "a"|"b"|null` (837 + 607), `K ~ "a"|
 - **The `=>` readers decide from spelling.** `monoPinIsFnSig(an)` and `monoHoleFnPinTyOf` read the
   `=>` prefix, so they must read the pin type before the 826 fn-sig pins can change spelling.
   `isNumRecvBaseName` (wasmEmit) also decides from `monoArgTyName`'s text (`i32`/`i64`/`f64`).
+
+## Rulings (orchestrator, 2026-11-07), for slice 2
+
+1. A literal union spells by its rep key (`litUnionAliasNameOfTy`). A literal union's type carries
+   its rep (the ruled one literal-union rep), so the rep key is the canonical spelling. A numeric
+   literal union spells as its base scalar: this keeps P11, and erasing it splits instances.
+2. A record that is a union member and has no `sNames` row falls back to its `uVariants` row.
+3. Names may move. A name reaches only the name section and backtraces, and output must hold. Two
+   declared names over one row spell as the first in declaration order, not collect order.
