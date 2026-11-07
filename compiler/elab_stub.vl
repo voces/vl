@@ -1,0 +1,213 @@
+// `elab_stub.vl` — the elaboration's stub keys: an argument made only of hole functions no call
+// reaches is keyed at the `() => void` stub, since a hole function nothing calls has no instance.
+
+import {
+  ArrayLit,
+  BreakStmt,
+  Call,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  LetDecl,
+  P,
+  WhileStmt,
+  i32ToStr,
+  nodeAt,
+  nodeChildren,
+} from "./ast"
+import { collectRetValues } from "./check_nj_join"
+import { tyToStr } from "./check_types"
+import { tailValueLeaves } from "./check_unconsumed"
+import { monoIsGenericDecl, unwrapParen } from "./emit_base"
+import { elabStubArgAt, elabStubArgKeys } from "./emit_elab"
+import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
+import { identDeclOf } from "./symbols"
+import {
+  vrIndex,
+  vrInertFor,
+  vrResetFor,
+  vrStash,
+  vrUnstash,
+} from "./value_reach"
+
+// The elaboration's own stub keys, shadowing `elabStubArg` until the reader switches (D15494).
+let elabStubArgOwn: {[string]: i32} = Map()
+let elabStubArgOwnKeys: string[] = []
+
+// Records, per `<call>:<argument>`, the stub an argument of only uncalled hole functions is keyed
+// at: a hole function nothing calls has no instance and takes `() => void` (D4551, D15494). Runs
+// only under the identity shadow's report mode, and reports against the monomorphizer's keys.
+export function elabStubArgsPrime(stmts: i32[]) {
+  if idShadowModeOf() != 1 { return 0 }
+  elabStubArgOwn = Map()
+  elabStubArgOwnKeys = []
+  elabStubStmts = stmts
+  elabStubIndexed = false
+  let d = 0
+  while d < P.nodes.length {
+    const fn = nodeAt(d)
+    if fn is Call {
+      let k = 0
+      while k < fn.callArgs.length {
+        const st = elabInertStubTy(fn.callArgs[k])
+        if st >= 0 {
+          const key = i32ToStr(d) + ":" + i32ToStr(k)
+          elabStubArgOwn[key] = st
+          elabStubArgOwnKeys.push(key)
+        }
+        k = k + 1
+      }
+    }
+    d = d + 1
+  }
+  if elabStubIndexed { vrUnstash() }
+  elabStubIndexed = false
+  elabStubStmts = []
+  idShadowRow(
+    "stub-shadow keys "
+      + i32ToStr(elabStubArgOwnKeys.length)
+      + " "
+      + i32ToStr(elabStubArgKeys().length),
+  )
+  elabStubArgShadowReport()
+  0
+}
+
+// Under the identity shadow's report mode, one `stub-shadow` row per key either table holds.
+function elabStubArgShadowReport() {
+  for key in elabStubArgOwnKeys {
+    const a = elabStubArgOwn[key] ?? -1
+    const b = elabStubArgAt(key)
+    const verdict = if b < 0 { "new-only" } else if elabStubSpelling(a) == tyToStr(b) { "agree" } else { "differ" }
+    idShadowRow(
+      "stub-shadow " + verdict + " " + key + " " + elabStubSpelling(a),
+    )
+  }
+  for key in elabStubArgKeys() {
+    if !elabStubArgOwn.has(key) {
+      idShadowRow(
+        "stub-shadow old-only " + key + " " + tyToStr(elabStubArgAt(key)),
+      )
+    }
+  }
+  0
+}
+
+// The program the stub keys are primed over, and whether its value reach is indexed yet.
+let elabStubStmts: i32[] = []
+let elabStubIndexed = false
+
+// Whether read `x` reaches no call, over the program as checked (`vrInertFor`).
+function elabStubInert(x: i32): boolean {
+  if !elabStubIndexed {
+    vrStash()
+    vrResetFor("elab", elabStubStmts, true, false)
+    const cands: i32[] = []
+    vrIndex(elabStubStmts, cands)
+    elabStubIndexed = true
+  }
+  vrInertFor("elab", x, "")
+}
+
+// The stub shape argument `a` is delivered at when it holds only hole functions no call reaches:
+// 0 for `() => void`, 1 for a list literal of them, 2 for a list of list literals; -1 otherwise.
+function elabInertStubTy(a: i32): i32 {
+  const ax = unwrapParen(a)
+  if ax < 0 || ax >= P.nodes.length { return -1 }
+  const al = nodeAt(ax)
+  if !(al is ArrayLit) { return if elabInertFnsAt(ax, 0) { 0 } else { -1 } }
+  if al.arrElems.length == 0 { return -1 }
+  const rows = nodeAt(unwrapParen(al.arrElems[0])) is ArrayLit
+  for e in al.arrElems {
+    const ex = unwrapParen(e)
+    if ex < 0 { return -1 }
+    const il = nodeAt(ex)
+    if rows && il is ArrayLit {
+      if il.arrElems.length == 0 { return -1 }
+      for ie in il.arrElems {
+        if !elabInertFnsAt(unwrapParen(ie), 0) { return -1 }
+      }
+    } else if rows || !elabInertFnsAt(ex, 0) {
+      return -1
+    }
+  }
+  if rows { 2 } else { 1 }
+}
+
+// The spelling of stub shape `c`: `() => void` at 0, a list of it at 1, a list of lists at 2.
+function elabStubSpelling(c: i32): string {
+  if c == 0 { return "() => void" }
+  if c == 1 { return "(() => void)[]" }
+  "(() => void)[][]"
+}
+
+// Whether a `break` in `body` leaves the labelled block `label` names.
+function elabBreaksTo(body: i32, label: string): boolean {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const b = nodeAt(ix)
+      if b is BreakStmt && b.brkLabel == label { return true }
+      for ch in nodeChildren(ix) { todo.push(ch) }
+    }
+  }
+  false
+}
+
+// Whether value `x` can only be hole functions, each read at a name no call reaches: a name of
+// one, an un-annotated `const` binding of one, an `if` choosing between them, a labelled block
+// no `break` leaves (D14780), or a call returning one (D6911).
+function elabInertFnsAt(x: i32, depth: i32): boolean {
+  if x < 0 || x >= P.nodes.length || depth > 8 { return false }
+  const n = nodeAt(x)
+  if n is WhileStmt {
+    if n.whileBlk != 1 || elabBreaksTo(n.whileBody, n.whileLabel) {
+      return false
+    }
+    const vs: i32[] = []
+    tailValueLeaves(n.whileBody, vs)
+    if vs.length == 0 { return false }
+    for v in vs {
+      if !elabInertFnsAt(unwrapParen(v), depth + 1) { return false }
+    }
+    return true
+  }
+  if n is IfStmt {
+    if n.ifElse < 0 { return false }
+    const arms: i32[] = []
+    tailValueLeaves(x, arms)
+    if arms.length < 2 { return false }
+    for a in arms {
+      if !elabInertFnsAt(unwrapParen(a), depth + 1) { return false }
+    }
+    return true
+  }
+  if n is Call {
+    const cd = identDeclOf(unwrapParen(n.callFn))
+    if cd < 0 || cd >= P.nodes.length { return false }
+    const cf = nodeAt(cd)
+    if !(cf is FuncDecl) || cf.fnBody < 0 { return false }
+    const rv: i32[] = []
+    collectRetValues(cf.fnBody, rv)
+    if rv.length == 0 { return false }
+    for v in rv {
+      if !elabInertFnsAt(unwrapParen(v), depth + 1) { return false }
+    }
+    return true
+  }
+  if !(n is Ident) { return false }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  if dn is FuncDecl { return monoIsGenericDecl(d) && elabStubInert(x) }
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit < 0
+  ) {
+    return false
+  }
+  elabInertFnsAt(unwrapParen(dn.letInit), depth + 1)
+}
