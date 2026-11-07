@@ -1934,13 +1934,12 @@ shadow. Per family, by status, each with its reach:
 - **unbound default**:
   - blocked: `monoElabDefaultsPrime` 17,747 (reach: the unbound default), `monoDefaultUnboundTyParams` 8,897 (reach: the unbound default).
   - parked: `monoDefaultTyParamsOnlyGenFns` 8,601 (per-call rule no elaboration fact states (10 sites)).
-  - unassessed: `monoHoleFnPinTyOf` 13.
-  - switched: `monoArgClosedPin` 5,405, `monoUncalledSlotFnTy` 272, `monoUncalledListElems` 198, `monoUncalledNestedListElems` 11.
+  - switched: `monoHoleFnPinTyOf` 13, `monoArgClosedPin` 5,405, `monoUncalledSlotFnTy` 272, `monoUncalledListElems` 198, `monoUncalledNestedListElems` 11.
   - (c): `monoChoiceArmFlowTy` 7,824.
 - **slot held fns**:
   - blocked: `monoWrittenGenLetFrame` 9,451 (split-dep: written-let slot fact (initialiser-fallback fix) + D4307 set join), `monoCoerceWrittenLetTys` 5,748 (split-dep: written-let per-instance signature), `monoArmWrittenLetSeed` 1,620 (split-dep: as monoWrittenGenLetFrame), `monoLetSeedGenFe` 0 (split-dep: as monoWrittenGenLetFrame).
   - parked: `monoWalkIdentCall` 9,452 ((S3): derivation waits on argument-keyed instances / reverse map; call_ref policy is mono), `monoCellCall` 255 (callee choice is call_ref policy (16/16 agree); coercion half waits on split-dep).
-  - unassessed: `monoFlowMapReadVals` 286, `monoFlowAliasMaps` 225.
+  - parked: `monoFlowMapReadVals` 286, `monoFlowAliasMaps` 225 (lane F: the map-value facts, beside the six `Map()` bundle reads).
   - switched: `monoFlowDeclVals` 7,946, `monoFlowLetLeaf` 656, `monoFlowKeptIndexElem` 516, `monoFlowValsOf` 81, `monoFlowLetMapLeaf` 75.
   - (c): `monoFlowReadsAll` 9,453, `monoFlowReadsRound` 9,453, `monoFlowReplanPending` 9,453, `monoFlowLetCalls` 7,932, `monoFlowUsePlanAt` 2,907, `monoFlowUsePlan` 2,907, `monoFlowAliasReadVals` 1,182, `monoFlowMapVals` 373, `monoFlowElemsGen` 131, `monoFlowRetLocalLists` 89.
 - **slot deliveries**:
@@ -1976,10 +1975,28 @@ shadow. Per family, by status, each with its reach:
   - (c): `monoExprRebuild` 7,378, `monoPinRetype` 7,262, `monoPinFnValueTy` 4,889, `monoPinRecvName` 3,392, `monoPinRecvLit` 3,390, `monoPinMemberCall` 1,226, `monoNumUnionOpPin` 797, `monoHoleCoalUnion` 329, `monoTpJoinObjTy` 53, `monoSubstIsExpr` 52, `monoNumUnionCompoundPin` 1.
 - **call param**:
   - blocked: `monoArgPinTyIx` 5,570 (needs a pin fact of its own after holes-close), `monoArgTyName` 5,405 (split-dep: one producer (cascade serves three facts)), `monoArgPinName` 5,354 (rep cascade, mono-derived rung), `monoCallIfValue` 2,836 (call param: inline if with no binding), `monoArgTyNameCascade` 312 (split-dep: as monoArgTyName), `monoArgTyNameProjected` 211 (split-dep: as monoArgTyName), `monoArgTyNameRep` 208 (split-dep: as monoArgTyName (scalar tail unreached, D23)).
-  - unassessed: `monoBindSeededTyParams` 8,594, `monoArgTyNameBound` 309, `monoPreBindArgName` 193, `monoPreBindArgTy` 192, `monoSpelledRecordLeavesRow` 188.
-  - switched: `monoPinHoleParam` 3,667.
+  - unassessed: `monoBindSeededTyParams` 8,594, `monoArgTyNameBound` 309.
+  - switched: `monoPinHoleParam` 3,667, `monoPreBindArgName` 193, `monoPreBindArgTy` 192.
+  - deleted: `monoSpelledRecordLeavesRow` 188.
 - **uncalled slot**:
   - (c): `monoInertReach` 9,453, `monoInertParamStubPin` 4,682.
+
+**Six of the unassessed, measured** (2026-11-07, 23,103 programs, each against its elaboration fact
+at the decision site):
+- **`monoSpelledRecordLeavesRow` is deleted.** Against `elabParamTyOwnAt` at the instance's own key,
+  it decided 125 times in 79 programs and never chose the argument, D10520's witness included: 64
+  rows agreed with the elaboration's row, 56 named the argument and 5 named neither. A named floor in
+  its arm moved no program over the population, so the arm was unreached. The 56 where the
+  elaboration names the argument are served after it, since #6586 makes a minted instance's
+  parameter types the elaboration's at its key.
+- **`monoHoleFnPinTyOf` was already switched.** Of 31 calls, the 6 with an open type read
+  `elabHoleFnClosed`, which answers all 6. The 25 with a closed type pass the call-param pin through.
+- **`monoPreBindArgName` and `monoPreBindArgTy` read the checked type.** Their one rule types a bare
+  `null` argument, whose checked type is `null` at all 86 decisions. They read `nodeTyIxOf` instead
+  of restating it. Every other argument is the call-param hub's pin.
+- **`monoFlowMapReadVals` and `monoFlowAliasMaps` are parked on lane F.** They gather the values a
+  map read or a map-holding alias can give, which no elaboration fact enumerates yet. Lane F's
+  map-value facts hold them, beside the six `Map()` bundle reads.
 
 **What the open boxes need.** Three boxes can be ticked:
 - **uncalled slot:** the four decision functions are deleted, and the two left are (c), `monoInertReach`'s index and `monoInertParamStubPin`;
@@ -2149,12 +2166,13 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
       1,622 of 1,622. What stays is a (c) gate: a re-made clone node in a hole instance whose
       recorded type is open.
     - `monoHoleFnPinTy`, which reads the elaboration's default fill.
-    - `monoClosedFieldValTy`. Its 8 answers agree with the checker's closed type where the
-      elaboration declines, so it answers that, with its literal and read derivations as the
-      fallback and its recording kept. It still declines wherever they decline.
   - Deleted: `monoLetAnnTyOf`. Built answering as a loud refusal, a fixpoint sweep moved no
     program and every filed witness graded as filed.
   - Blocked:
+    - `monoClosedFieldValTy`, records of functions. Its switch (#6636) read the checker's type
+      after mono's walk had re-recorded it closed. Before the walk all 8 of its decisions are open
+      to both the elaboration and the checker, so the "8 of 8" was mono's answer read back. It is
+      mono's own derivation again, and waits on the function-holding fact below.
     - `monoLetWriteRhsTyRec`, with `monoLetWriteRhsTy` and `monoLetWritesRecord`. All 18
       decisions are records holding hole functions written into a `let`, the fact
       `monoClosedObjLitTy` waits on.
@@ -2512,6 +2530,46 @@ wrapped every such mono decision and asked what the elaboration can say there to
 | (ii) needs identity typing | 1 |
 | (iii) other | 6 |
 | not reached by the probe (D6480, `hole-lambda-forwarded-to-unread-hole-param`) | 2 |
+
+**Re-measured before mono's walk** (2026-11-07, master `7836b63a`). The table above read
+`nodeTyIxOf` at mono's decision sites, after the walk had re-recorded many of those nodes closed at
+mono's own answer, so its node-type column compared mono with itself. The re-run copies the
+node-type column at the end of emit prep (after the elaboration's tag rounds, before
+`monomorphize`) and swaps that copy in while every reader is asked, so each reader's own fallback to
+`nodeTyIxOf` is pre-walk too. Only mono's held type, the answer being graded, is read after the
+walk. Each decision is classed by the first source that agrees with mono, in this order:
+
+| class | decisions |
+|---|---|
+| not blocked: the elaboration's or the checker's node type agrees | 621 |
+| (i) the slot fact answers | 70 |
+| (i) the written-value leaf answers | 27 |
+| (i) the value key already noted for arguments and callbacks (`elabValueKeys`) answers | 72 |
+| (i) the value-call note (`elabValueInstKey`, shadow) answers | 19 |
+| (i) every member already has the instance; the site is not linked to it | 283 |
+| open: a member lacks the instance | 23 |
+| open: no member and no fact | 90 |
+| **total** | **1,205** |
+
+The two tables do not share a classifier, so they are compared by total only. All 234 adopted
+bindings move out of "not blocked"; they are the family table below. The value-call note answers
+44 decisions, 26 of which no earlier note answers, and disagrees with mono at none. Two more, in
+`generics/hole-call-of-generic-at-its-own-instance.vl`, carry two signatures where mono holds one:
+the value is called at two types, so the consumer picks by the call the read reaches. Of the 283
+unlinked, 94 are lane F's instance bindings, mostly a record or list of functions handed to a
+parameter and called as `p.f(x)` or `xs[0](x)`; the note does not yet follow a field or element
+callee off an open parameter. The 90 "open: nothing", by family:
+- 53 adopted bindings, in the family table below.
+- 19 list callbacks. 11 are `generics/generic-fn-as-list-callback-result.vl`, 4 an `if` choice of
+  functions as the callback, 3 a hole-function list's callback through a loop alias or a returned
+  list, and 1 is D9020's relay, the (iii) row.
+- 14 arguments: 12 in `generics/typaram-binding-seeded-in-cloned-call.vl` and 2 in
+  `generic-arena-bind-map-and-alias.vl`.
+- 3 returned lists, `closures/hole-fn-list-returned-inline-call.vl`.
+- 1 instance binding, the (ii) row.
+
+Most of the callbacks and arguments are nodes mono minted, so the pre-walk column has no entry
+for them by construction; their fact is read through the node they copy (`nodeSrc`).
 
 So identity typing is not the prerequisite for this population; one fact is.
 - **The fact:** `elabValueInstKey(x, k)`, the member instance or instances the elaboration made for
