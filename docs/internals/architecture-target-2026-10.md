@@ -2062,6 +2062,38 @@ The same answers also spell the same. What each of the 15 comes to:
   elaboration.
 - **Parked:** `monoReachLitTys`, with `monoReachSlotTy`.
 
+**Written-let gate and type, measured** (2026-11-07, 23,456 programs).
+
+The gate, `monoWrittenGenLetFrame`, was shadowed against `elabBindingFnSet(d)`, read before the
+walk retypes the values the set is read from. Its first reading (109 of 112) was taken after the
+walk and is void. On split-dep's #6631 head, every one of 112 decisions agrees:
+
+| mono | elaboration | decisions | files |
+|---|---|---|---|
+| needs instancing | every member a named `monoIsGenericDecl` function | 40 | 10 |
+| no | empty, a lambda, or a non-generic member | 72 | 29 |
+
+- **Switched in #6631:** the gate reads one snapshot of that set, taken before the walk. Hole
+  functions count, as `monoIsGenericDecl` admits them. `monoArmWrittenLetSeed` reads the
+  switched gate.
+- **Deleted:** `monoLetSeedGenFe`, `monoListElemGenFe` and `monoValueNamesGenOrInst`.
+
+The type, `monoCoerceWrittenLetTys`, was shadowed against the per-read fact `elabSlotDeliveries`.
+The slot fact is the wrong reference: a written `let` of generics has no one closed type.
+
+| site | agree | parameters agree, result differs | no elaboration answer |
+|---|---|---|---|
+| delivery (115) | 85, + 15 one of two | 14 | 1 |
+| by call (51) | 25 | 0 | 26 |
+
+- **Result-only differences are not a defect.** The by-call site spells the binding's signature
+  with an unpinned `void` result and takes the call's own result. Its parameters come from
+  `monoDeclPathPins` and agree.
+- **Blocked on Fn#d's scoping note** (the concrete rep of a function-holding value at a site): the
+  27 with no answer. Each signature takes a hole function as a parameter, which no closed delivery
+  carries; D5841 and D6480 are among them. Once that fact exists, all four callers that pass
+  `tname` switch together.
+
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
 read. A decision is a pin a function returns, a type it returns or records, or a gate choosing
