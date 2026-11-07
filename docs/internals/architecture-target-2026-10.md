@@ -2458,6 +2458,54 @@ every function value its singleton `Fn#d`, but the checker gives one only to the
 tracks. Argument-keyed instances are its first client: 1,500 of 1,573 specialized arguments have no
 set (measured under the canonical instance key below).
 
+**The function-holding fact, scoped** (2026-11-07, Fn#d, master `72b31030`, the full population).
+The concrete rep a function-holding value takes at a site blocks four queues: node type's holders
+(Fn#d's 8 and `monoLetWriteRhsTyRec`), lane F's instance bindings, `monoBindSeededTyParams`, and the
+written-let call signatures with a hole-function argument (`monoCoerceWrittenLetTys`). One probe
+wrapped every such mono decision and asked what the elaboration can say there today:
+- the checker's closed node type (#6556);
+- `elabNodeTyAt`;
+- the slot fact;
+- the written-value leaf;
+- whether every member of the value's `Fn#d` set already has an instance at mono's signature.
+
+| class | decisions |
+|---|---|
+| not blocked: the elaboration's node type, or the checker's closed type, agrees | 734 |
+| (i) the slot fact answers | 40 |
+| (i) the returned-literal reader answers (`elabRetFnListLitTy`) | 3 |
+| (i) every member already has the instance; the site is not linked to it | 201 |
+| (i) one member, several instances; the link is by the call the read reaches | 11 |
+| (i) an adopted binding whose initialiser's checked type is closed | 234 |
+| (ii) needs identity typing | 1 |
+| (iii) other | 6 |
+| not reached by the probe (D6480, `hole-lambda-forwarded-to-unread-hole-param`) | 2 |
+
+So identity typing is not the prerequisite for this population; one fact is.
+- **The fact:** `elabValueInstKey(x, k)`, the member instance or instances the elaboration made for
+  function-holding value `x` read under instance `k`. Its closed signature is the concrete rep.
+- **Key:** the value node and the instance key it is read under.
+- **Readers:** `elabWalkKeyOf(x, false, decl)` already reads the table it extends.
+- **Producer:** `elabValueKeyNote`, which today notes function-value arguments and named list
+  callbacks. It is written where the elaboration itself instances a member through the value: a call
+  through a binding, element or field (`elabValCalls`), the callee's calls of a hole-function
+  argument, a list element called. It is never written by searching for an instance whose signature
+  matches mono's, which would derive the fact from mono.
+- **The adopted bindings** need a fourth leaf of `elabWrittenValueTy`: the written value's closed
+  checked type. 87 of the 234 are bundle records, where the slot fact or the bundle source reads
+  another form. The bundle lane settles those before the leaf answers them.
+- **(ii):** `closures/listed-hole-fn-escaping-list.vl`. A generic held in a list by identity is called
+  at two types, so the list's one concrete rep is mono's choice. It is D15010's signature twin, parked
+  in this section.
+- **(iii):**
+  - five uncalled members, the inert-stub (c) cells `monoInertParamStubPin` carries (D6910 and its
+    pair) and two uncalled list members;
+  - D9020's relay of an un-annotated function's `i32` at an `f64` function type. In
+    `[1, 2, 3].map(f)`, with `f` annotated `(a: i32) => f64`, the checker's type and the slot fact
+    both differ from the callback signature mono derives (`monoValueRetAt`'s `(i32) => i32`). The
+    program runs because the value converts at its annotated binding. The outlier is mono's own
+    derivation, not a reader.
+
 **The unbound default, measured** (2026-11-07, master `75101d46`). The D4551 default is the
 elaboration's: `ELAB_TP_DEFAULT` and `elabTpDefaulted` (#6569), after its call reach was made to
 see into callees before collect runs (#6563). The uncalled slots already read it
