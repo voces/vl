@@ -2167,8 +2167,9 @@ mono-only decision left after the omission. Where neither answers, `monoStoredSl
 loudly (`monoSlotNoDeliveryFail`, reached by no program), and `monoPinListElems` leaves the list as
 checked, as it did: an open generic's delivery is no answer
 (`functions/exported-generic-reached-through-lambda-field-or-list-called.vl`). Two gates stay,
-because a delivery is the slot's type, not each value's: a stored value or a list element whose own
-result at the pin is not the delivered one declines or refuses. Without them D15353 and a list read
+because a delivery is the slot's type, not each value's: `monoStoredSlotFnTy` declines a stored
+value whose own result at the pin is not the delivered one, and `monoPinListElems` refuses such an
+element (and keeps `monoListStoresAgree`). Without them D15353 and a list read
 before a helper writes a function of another result
 (`closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`) build check-clean and
 trap at the call (`indirect call type mismatch`). `monoCallWrittenLet` instances its writes at the delivery's pin, and
