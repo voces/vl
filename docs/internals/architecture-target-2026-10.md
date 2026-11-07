@@ -1797,6 +1797,12 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   on master (a decline, not a refusal). Two different generics in one map of records join field-wise
   and run (D15493); written by `.set`, a record literal is not admitted, so that spelling refuses.
 
+The `r5_rt` rung itself is deleted. Re-measured after D15531 it fired 15 times over `tests/cases`
+(11 function-holding pins in D9480's fixture, G5's, the stored-through-parameter file and the `?.`
+decline; 4 `i32` pins of un-annotated helpers), and in every one `monoArgPinName` answers the same
+pin: without the rung every fixture and the compiler's own build are byte-identical, the corpus and
+the filed witnesses do not move. The residuals above stay where they are, served by that fallback.
+
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
 not deleted. It already reads the elaboration (`elabSlotDeliveries`), and switching it to the
