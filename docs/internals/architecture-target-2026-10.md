@@ -2055,8 +2055,23 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   of one lambda, are the calls the `monoFlowReads` rewrite repoints, which the cad lane records
   after B2; then `monoLitReachesNoCall`, `monoValsReachNoCall` and `monoValsInert` go.
 
-The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
-with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
+The unbound default, which every program reaches through `monoElabDefaultsPrime`, is the reach
+lane's. The cad lane takes slot deliveries, then node type, then slot type.
+
+**The unbound default, measured** (2026-11-07, master `75101d46`). The D4551 default is the
+elaboration's: `ELAB_TP_DEFAULT` and `elabTpDefaulted` (#6569), after its call reach was made to
+see into callees before collect runs (#6563). The uncalled slots already read it
+(`elabUncalledSlotTy`). Two parts stay in mono, for different reasons:
+
+- `monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy` answer a narrower question than the
+  elaboration's parameter binding `elabCallParamTyFrom`: the instance a hole generic's slot delivery
+  fixes. Shadowed at `monoHoleGenFnPin` over 23,103 programs, 38 agree, 0 differ and 2 answer where
+  the elaboration has none, but at 1,308 more pins mono leaves the type open while
+  `elabCallParamTyFrom` is closed. The replacement is a fact of that narrower question, which must
+  decline at all 1,308, with the D6542 empty-list `i32` a named default beside `ELAB_TP_DEFAULT`.
+- `monoDefaultTyParamsOnlyGenFns` is a per-call rule (a type parameter named only by function slots
+  handed generic values) that no elaboration fact states. It fires at 10 calls in 4 files; the
+  call binding `elabCallBindTy` is the default at 8 and absent at 2 inside a generic body.
 
 **Slot type, map values switched** (2026-11-06). `monoPinMapValues` takes the map's type from
 `elabSlotTyAt` wherever it closes; `monoPinMapSlot` only instances the stored values at it, and a
