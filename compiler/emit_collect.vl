@@ -78,7 +78,16 @@ import { inferJoinCount, inferJoinTyAt } from "./check_inline_lit_union"
 import { inferRetRowByNode, inferRetRowOf } from "./check_infer_ret"
 import { isTransparentAlias } from "./check_alias_transparent"
 import { letNullHoleFilledTy } from "./check_null_holes"
-import { fnRecordedRetTy } from "./fn_ret_shadow"
+import {
+  fnRecordedRetCols,
+  fnRecordedRetTy,
+  frcAtom,
+  frcBool,
+  frcElem,
+  frcKind,
+  frcRow,
+  frcSlot,
+} from "./fn_ret_shadow"
 import { retValueRootCall } from "./check_store_rep"
 import { refViewSrcTys } from "./check_ref_list_view"
 import { widenRetagToHas } from "./check_retag_rows"
@@ -2844,7 +2853,39 @@ export function criAfterMonoSet(v: boolean) {
   0
 }
 
+// Per `fnStmts` position: whether this run wrote the function's columns from its recorded
+// result (`criColsFromRecorded`), so the body walk below skips it.
+let criFromRec: boolean[] = []
+
+// After mono, write every un-annotated valued function's return columns from its recorded
+// result where that names all five (`fnRecordedRetCols`); a missing fact leaves it to the walk.
+function criColsFromRecorded() {
+  criFromRec = []
+  let i = 0
+  while i < fnStmts.length {
+    let took = false
+    const fn = nodeAt(fnStmts[i])
+    if criAfterMono && i < fRetKind.length {
+      if fn is FuncDecl {
+        if fn.fnRet < 0 && fRetVoid[i] == 0 && fnRecordedRetCols(i) == "" {
+          fRetKind[i] = frcKind
+          fRetStructIdx[i] = frcSlot
+          fRetRArrElem[i] = frcElem
+          fRetBool[i] = frcBool
+          fRetRListRow[i] = if frcKind == "reflist" { frcRow } else { -1 }
+          fRetLitAtom[i] = frcAtom
+          took = true
+        }
+      }
+    }
+    criFromRec.push(took)
+    i = i + 1
+  }
+  0
+}
+
 export function computeRetInference() {
+  criColsFromRecorded()
   let changed = true
   while changed {
     changed = false
@@ -2852,7 +2893,7 @@ export function computeRetInference() {
     while i < fnStmts.length {
       const fn = nodeAt(fnStmts[i])
       if fn is FuncDecl {
-        if fn.fnRet < 0 && fRetVoid[i] == 0 {
+        if fn.fnRet < 0 && fRetVoid[i] == 0 && !criFromRec[i] {
           // Classify over every valued return, tail value first, not just the first: a function
           // whose first return is unclassifiable still types from its others, since the checker
           // proved all returns agree.
@@ -2904,8 +2945,10 @@ export function computeRetInference() {
     const nnFn = nodeAt(fnStmts[nn])
     if nnFn is FuncDecl {
       if nnFn.fnRet < 0 && fRetVoid[nn] == 0 {
-        criSettleNonNullRecordRet(nn)
         if criAfterMono && criRecordRowCheck(nn) < 0 { return -1 }
+      }
+      if nnFn.fnRet < 0 && fRetVoid[nn] == 0 && !criFromRec[nn] {
+        criSettleNonNullRecordRet(nn)
         if fRetKind[nn] == "reflist" {
           fnRetRefListDemand(nn)
           fRetRListRow[nn] = fnRetRefListRowJoin(nn)
@@ -2926,7 +2969,12 @@ export function computeRetInference() {
       // function whose returns join an atom with a string settles at `"str"` and widens the atom
       // at its own return, while `fnRetExprOf` picks only one return, possibly the atom arm.
       // The kind is the settled answer for all returns; the expression test separates the atom.
-      if laFn.fnRet < 0 && fRetVoid[la] == 0 && fRetKind[la] == "i32" {
+      if (
+        laFn.fnRet < 0
+        && fRetVoid[la] == 0
+        && fRetKind[la] == "i32"
+        && !criFromRec[la]
+      ) {
         const laRx = fnRetExprOf(fnStmts[la])
         if laRx >= 0 {
           if exprIsLitAtom(laRx, fnStmts[la]) || fnInferredRetLitAtom(la) {
