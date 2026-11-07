@@ -2072,6 +2072,28 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
     the binding's set is the fold of its written values' sets, "any" once one carries none.
 - [x] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, ~~`monoReachSlotPins` 546~~, ~~`monoDeclPathPinsOrReach` 173~~, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, ~~`monoReachSlotPinsAt` 78~~ — switched (below): each reads `elabSlotDeliveries`, and what is left is mechanics.
 - [ ] **node type** (29): `monoCloseRetFnTy` 9,592, `monoInitHeldTy` 6,742, `monoArgClosedTyIn` 5,475, `monoPinBin` 4,320, `monoPinnedOperandTy` 3,781, `monoSubstLetType` 3,348, `monoCloneLetDecl` 3,020, `monoCoerceListCbArg` 2,889, `monoPinReturnedObj` 1,945, `monoCbFnListRowSpell` 1,107, `monoDeadNullTest` 882, `monoCgcTplTy` 668, `monoRetFnListTy` 608, `monoPinnedAnnTyAt` 509, `monoLeafParamPin` 420, `monoBoundFnListElemsTy` 352, `monoPinnedReadTy` 341, `monoClosedObjLitTy` 174, `monoLetAnnTyOf` 66, `monoHoleFnPinTy` 33, `monoLetWriteRhsTyRec` 15, `monoPinnedListElemPin` 14, `monoLetWritesRecord` 6, `monoModuleDupPin` 3, `monoArgOpenValueTy` 1, `monoModuleLetPin` 0, `monoClosedFieldValTy` 0, `monoLetWriteRhsTy` 0, `monoPinnedListAnnTy` 0.
+  **The ten the re-census left unassessed** (2026-11-07, the full population, against the
+  elaboration's node type at the instance, else the checker's):
+  - Switched:
+    - `monoCgcTplTy`. Its hole read is `monoHoleNodeTy`, which is `elabWalkTy`; it agrees in
+      1,622 of 1,622. What stays is a (c) gate: a re-made clone node in a hole instance whose
+      recorded type is open.
+    - `monoHoleFnPinTy`, which reads the elaboration's default fill.
+    - `monoClosedFieldValTy`. Its 8 answers agree with the checker's closed type where the
+      elaboration declines, so it answers that, with its literal and read derivations as the
+      fallback and its recording kept. It still declines wherever they decline.
+  - Deleted: `monoLetAnnTyOf`. Built answering as a loud refusal, a fixpoint sweep moved no
+    program and every filed witness graded as filed.
+  - Blocked:
+    - `monoLetWriteRhsTyRec`, with `monoLetWriteRhsTy` and `monoLetWritesRecord`. All 18
+      decisions are records holding hole functions written into a `let`, the fact
+      `monoClosedObjLitTy` waits on.
+    - `monoCbFnListRowSpell`. Its receiver is a nested list of hole functions, open to both the
+      elaboration and the checker. That is the holder fact `monoBoundFnListElemsTy` waits on.
+    - `monoModuleDupPin` and `monoModuleLetPin`. They spell module bindings by their registry
+      names, which waits on the owner's naming-rule question.
+  - `monoBindSeededTyParams` (call param) also stays. In its 5 open decisions a generic function
+    value is closed by the calls made on it inside the instance, the identity-typing question.
 - [ ] **slot type** (27): `monoBindingAdoptInit` 9,578, `monoHoleGenFnPin` 7,952, `monoListSrcElemTy` 7,925, `monoReachLitTys` 6,959, `monoReachSlotTy` 6,938, `monoPinMapValues` 6,754, `monoPinFieldContainers` 798, `monoPinRecordFields` 733, `monoLetWritesClosed` 703, `monoPinObjFields` 695, `monoRetypeLamCells` 565, `monoPinRecordField` 466, `monoWritesCoercedFirstCall` 454, `monoPinNestedListElems` 315, `monoPinFieldContainer` 112, `monoPinMapSlot` 66, `monoLetWritesAt` 57, `monoNoteBindCall` 28, `monoPinFieldValue` 25, `monoPinJoin` 22, `monoPinStoredRecords` 20, `monoRenameInitAt` 12, `monoSigJoin` 3, `monoPinnedElemAnnTy` 2, `monoHandWrittenLet` 2, `monoPinMapNestedFnLists` 0, `monoWrittenLetRetsDisagree` 0.
   The slot pins against `elabSlotTyAt` (2026-11-07, 23,384 programs): map values (the fallback
   where the slot fact declines) agree 32, differ 0, mono only 15; a record's whole type agrees 6,
