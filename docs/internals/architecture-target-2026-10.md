@@ -2200,6 +2200,13 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
     and a switch would rekey the instance. Its literal returns are rep names, not defaults: the
     scalar and list floors (`"string"`, `"f64[]"`, `"i32[]"`, …) name the rep an `expr*` test
     found, and the `i32[]` list floor is reached by no program.
+  - `monoBindSeededTyParams` makes 21 decisions over the population where `elabCallSeedBind`
+    answers. 1 agrees, 15 are open on both sides, and 0 differ. In 5, mono closes the type (for
+    example `(string) => string`) where the elaboration's seed binding is the seed parameter's own
+    `(T) => T`, because mono substitutes the binding that parameter got at the instance.
+  - `monoCallIfValue` makes no decision over the population: every entry returns at its gate.
+  - `monoPreBindArgName`, `monoPreBindArgTy`, `monoArgPinName` and `monoArgPinTyIx` wrap the pin
+    measured above. `monoSpelledRecordLeavesRow` is a row-layout test, in the row-key family.
 - [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
   The type an uncalled slot holds its functions at is the elaboration's (`elabUncalledSlotTy`,
   from `elabSlotHeldFns`), read by `monoUncalledSlotFnTy`. Shadowed over 23,381 programs, 507
