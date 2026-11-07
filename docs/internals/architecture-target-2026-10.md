@@ -1898,6 +1898,132 @@ parameter's instance (§3.4 fallback)", which no corpus program reaches.
   a list literal, a `for` variable or an `if`. The callee's per-instance type is already the
   elaboration's (`monoHoleNodeTy`), and no elaboration fact owns the choice to copy the node.
 
+**Exit checklist, re-census of 2026-11-07** (master `7a471b8c`, 990 `emit_mono` functions). The 225
+(d) functions of the 2026-11-06 census, rechecked. 60 are deleted, and 165 remain. Reach is the number of
+programs, of 23,456, that enter the function, from a function-entry probe. It is not the arm count
+used on 2026-11-06, so the two are not comparable digit for digit. Status comes from this section's
+own records:
+- **switched:** the decision reads the elaboration, and what is left is mechanics;
+- **(c):** mono's own transformation or policy, named;
+- **blocked:** waits on a named fact;
+- **parked:** waits on a named design question;
+- **unassessed:** no shadow recorded since 2026-11-06.
+
+| family | listed | deleted | switched | (c) | blocked | parked | unassessed |
+|---|---|---|---|---|---|---|---|
+| unbound default | 12 | 3 | 4 | 1 | 2 | 1 | 1 |
+| slot held fns | 29 | 6 | 5 | 10 | 4 | 2 | 2 |
+| slot deliveries | 9 | 3 | 6 | 0 | 0 | 0 | 0 |
+| node type | 29 | 4 | 2 | 5 | 8 | 0 | 10 |
+| slot type | 27 | 3 | 7 | 0 | 1 | 1 | 15 |
+| lambda sigs | 11 | 4 | 0 | 3 | 4 | 0 | 0 |
+| instance binding | 34 | 3 | 5 | 11 | 2 | 1 | 12 |
+| literal arm row | 5 | 5 | 0 | 0 | 0 | 0 | 0 |
+| value returns | 7 | 2 | 1 | 3 | 1 | 0 | 0 |
+| instance result | 10 | 9 | 1 | 0 | 0 | 0 | 0 |
+| walk type | 33 | 14 | 6 | 11 | 2 | 0 | 0 |
+| call param | 13 | 0 | 1 | 0 | 7 | 0 | 5 |
+| uncalled slot | 6 | 4 | 0 | 2 | 0 | 0 | 0 |
+| **all** | **225** | **60** | **38** | **46** | **31** | **5** | **45** |
+
+The endpoint is every (d) function switched, deleted or named (c). Two lists stand between here
+and there: the 36 blocked or parked functions, which wait on the facts and questions
+below, and the 45 unassessed ones, which are lane work that needs no new fact before its
+shadow. Per family, by status, each with its reach:
+
+- **unbound default**:
+  - blocked: `monoElabDefaultsPrime` 17,747 (reach: the unbound default), `monoDefaultUnboundTyParams` 8,897 (reach: the unbound default).
+  - parked: `monoDefaultTyParamsOnlyGenFns` 8,601 (per-call rule no elaboration fact states (10 sites)).
+  - unassessed: `monoHoleFnPinTyOf` 13.
+  - switched: `monoArgClosedPin` 5,405, `monoUncalledSlotFnTy` 272, `monoUncalledListElems` 198, `monoUncalledNestedListElems` 11.
+  - (c): `monoChoiceArmFlowTy` 7,824.
+- **slot held fns**:
+  - blocked: `monoWrittenGenLetFrame` 9,451 (split-dep: written-let slot fact (initialiser-fallback fix) + D4307 set join), `monoCoerceWrittenLetTys` 5,748 (split-dep: written-let per-instance signature), `monoArmWrittenLetSeed` 1,620 (split-dep: as monoWrittenGenLetFrame), `monoLetSeedGenFe` 0 (split-dep: as monoWrittenGenLetFrame).
+  - parked: `monoWalkIdentCall` 9,452 ((S3): derivation waits on argument-keyed instances / reverse map; call_ref policy is mono), `monoCellCall` 255 (callee choice is call_ref policy (16/16 agree); coercion half waits on split-dep).
+  - unassessed: `monoFlowMapReadVals` 286, `monoFlowAliasMaps` 225.
+  - switched: `monoFlowDeclVals` 7,946, `monoFlowLetLeaf` 656, `monoFlowKeptIndexElem` 516, `monoFlowValsOf` 81, `monoFlowLetMapLeaf` 75.
+  - (c): `monoFlowReadsAll` 9,453, `monoFlowReadsRound` 9,453, `monoFlowReplanPending` 9,453, `monoFlowLetCalls` 7,932, `monoFlowUsePlanAt` 2,907, `monoFlowUsePlan` 2,907, `monoFlowAliasReadVals` 1,182, `monoFlowMapVals` 373, `monoFlowElemsGen` 131, `monoFlowRetLocalLists` 89.
+- **slot deliveries**:
+  - switched: `monoCallIfBound` 9,451, `monoCallWrittenLet` 9,450, `monoPinListElems` 6,715, `monoCoerceWrittenCell` 919, `monoStoredSlotFnTy` 113, `monoRetLitElemTy` 65.
+- **node type**:
+  - blocked: `monoInitHeldTy` 6,662 (Fn#d: adopt-init's mono-only holders), `monoArgClosedTyIn` 5,458 (Fn#d: hole-function arguments outside an instance), `monoCoerceListCbArg` 2,840 (both halves must read the elaboration), `monoPinReturnedObj` 1,973 (Fn#d: d3125 lambdas returning records), `monoRetFnListTy` 581 (Fn#d: returned lists of hole lambdas), `monoBoundFnListElemsTy` 322 (Fn#d: nested lists of hole lambdas), `monoClosedObjLitTy` 163 (Fn#d: records holding functions), `monoCloseRetFnTy` 1 (Fn#d: elaboration declines function-holding types).
+  - unassessed: `monoCgcTplTy` 1,725, `monoCbFnListRowSpell` 1,105, `monoLetAnnTyOf` 46, `monoHoleFnPinTy` 23, `monoLetWriteRhsTyRec` 13, `monoLetWriteRhsTy` 13, `monoLetWritesRecord` 5, `monoClosedFieldValTy` 4, `monoModuleDupPin` 2, `monoModuleLetPin` 0.
+  - switched: `monoPinnedListAnnTy` 789, `monoPinnedAnnTyAt` 2.
+  - (c): `monoPinnedOperandTy` 4,789, `monoPinBin` 4,269, `monoSubstLetType` 3,320, `monoCloneLetDecl` 3,302, `monoDeadNullTest` 879.
+- **slot type**:
+  - blocked: `monoHandWrittenLet` 2 (split-dep: written-let signature).
+  - parked: `monoReachSlotTy` 6,855 (parked: 13 lane F, 2 reach).
+  - unassessed: `monoReachLitTys` 9,453, `monoNoteBindCall` 8,602, `monoListSrcElemTy` 7,828, `monoPinFieldContainers` 789, `monoLetWritesClosed` 729, `monoPinObjFields` 685, `monoRetypeLamCells` 558, `monoWritesCoercedFirstCall` 437, `monoPinFieldContainer` 112, `monoPinFieldValue` 110, `monoLetWritesAt` 31, `monoPinJoin` 24, `monoSigJoin` 24, `monoPinStoredRecords` 14, `monoRenameInitAt` 13.
+  - switched: `monoBindingAdoptInit` 9,453, `monoHoleGenFnPin` 7,850, `monoPinMapValues` 6,658, `monoPinRecordFields` 728, `monoPinRecordField` 461, `monoPinNestedListElems` 281, `monoPinMapSlot` 48.
+- **lambda sigs**:
+  - blocked: `monoPinMapLambdas` 8,903 (lane F: waits), `monoNoteBindDeliveryCall` 7,123 (lane F: waits), `monoLamSubstParams` 1,175 (lane F), `monoLamParamPinAnn` 795 (split-dep holder fact (c2) + per-instance identity residual (4b-i)).
+  - (c): `monoPinBodyLambdasRaw` 8,887, `monoDeliverLamLit` 6,133, `monoCloneLambdaSubst` 1,244.
+- **instance binding**:
+  - blocked: `monoPinTyParamComposite` 396 (Fn#d call-param hub), `monoSeedCallSigTys` 0 (call param: monoCallIfValue (inline if, no binding)).
+  - parked: `monoPinnedTyParamCanon` 981 (waits on the key settling names).
+  - unassessed: `monoHoleBinding` 8,896, `monoNicheNulParamsCheck` 8,890, `monoBindBareUnionArm` 8,875, `monoBindNullArm` 8,856, `monoBindInnerUnionArms` 8,853, `monoPreBindPastUnionRest` 8,599, `monoLetTyParamMisfit` 8,583, `monoExactPinTyOf` 8,557, `monoNicheNulListCheck` 5,671, `monoParamPinnedNull` 5,538, `monoPoisonSharedPins` 2,666, `monoLetSeedMisfits` 1,239.
+  - switched: `monoPreBindPastEmptyLit` 8,595, `monoPinAnnotatedParam` 5,687, `monoExactBind` 1,260, `monoInstParamPinTys` 438, `monoPreBindNonArrowArgs` 45.
+  - (c): `monoCadNoteInstance` 8,903, `monoBindCols` 8,884, `monoMakeInstanceLetTyCol` 8,876, `monoBindEnclosingPins` 8,871, `monoMakeInstanceGo` 8,844, `monoSlotParamPins` 8,615, `monoSlotSig` 8,611, `monoInstantiateCallIn` 8,598, `monoSubstAnnNode` 1,214, `monoSubstTyArgNodes` 46, `monoLayoutConstOf` 4.
+- **literal arm row**:
+- **value returns**:
+  - blocked: `monoDeliverCallRets` 1,019 (reach: a reach fact for a returned literal (D6522)).
+  - switched: `monoIfBoundRetAtPin` 24.
+  - (c): `monoFlowConstCallArgs` 7,932, `monoFlowCallLeafAt` 176, `monoFlowCallLeaf` 176.
+- **instance result**:
+  - switched: `monoPinnedRetAnnTy` 1.
+- **walk type**:
+  - blocked: `monoPinnedTyOf` 7,280 (lambda bodies need an elaboration instance (D3616)), `monoLamCallTy` 528 (lambda bodies need an elaboration instance (D3616)).
+  - switched: `monoPinCoalJoin` 2,679, `monoIfChainRebuildPinned` 2,635, `monoLamPinRetAnn` 1,101, `monoPinCoalListDefault` 776, `monoHoleNodeTy` 668, `monoNumOperandPinTy` 241.
+  - (c): `monoExprRebuild` 7,378, `monoPinRetype` 7,262, `monoPinFnValueTy` 4,889, `monoPinRecvName` 3,392, `monoPinRecvLit` 3,390, `monoPinMemberCall` 1,226, `monoNumUnionOpPin` 797, `monoHoleCoalUnion` 329, `monoTpJoinObjTy` 53, `monoSubstIsExpr` 52, `monoNumUnionCompoundPin` 1.
+- **call param**:
+  - blocked: `monoArgPinTyIx` 5,570 (needs a pin fact of its own after holes-close), `monoArgTyName` 5,405 (split-dep: one producer (cascade serves three facts)), `monoArgPinName` 5,354 (rep cascade, mono-derived rung), `monoCallIfValue` 2,836 (call param: inline if with no binding), `monoArgTyNameCascade` 312 (split-dep: as monoArgTyName), `monoArgTyNameProjected` 211 (split-dep: as monoArgTyName), `monoArgTyNameRep` 208 (split-dep: as monoArgTyName (scalar tail unreached, D23)).
+  - unassessed: `monoBindSeededTyParams` 8,594, `monoArgTyNameBound` 309, `monoPreBindArgName` 193, `monoPreBindArgTy` 192, `monoSpelledRecordLeavesRow` 188.
+  - switched: `monoPinHoleParam` 3,667.
+- **uncalled slot**:
+  - (c): `monoInertReach` 9,453, `monoInertParamStubPin` 4,682.
+
+**What the open boxes need.** Three boxes can be ticked:
+- **uncalled slot:** the four decision functions are deleted, and the two left are (c), `monoInertReach`'s index and `monoInertParamStubPin`;
+- **instance result** and **literal arm row**, as already ticked.
+
+The rest wait on these facts and questions, grouped by who holds them:
+- **Fn#d, the elaboration declining a type that holds a function (8, node type):**
+  `monoCloseRetFnTy`, `monoInitHeldTy`, `monoArgClosedTyIn`, `monoPinReturnedObj`, `monoRetFnListTy`,
+  `monoBoundFnListElemsTy` and `monoClosedObjLitTy`. Also `monoCoerceListCbArg`, once both of its halves
+  read the elaboration.
+- **split-dep:**
+  - the written-let per-instance signature, after the initialiser-fallback fix, plus the set-valued
+    fold over a let's writes (D4307): `monoWrittenGenLetFrame`, `monoCoerceWrittenLetTys`,
+    `monoArmWrittenLetSeed`, `monoLetSeedGenFe` and `monoHandWrittenLet`;
+  - the holder fact (c2): `monoLamParamPinAnn`;
+  - one producer behind `monoArgTyName`'s cascade: `monoArgTyName`, `monoArgTyNameCascade`,
+    `monoArgTyNameRep` and `monoArgTyNameProjected`.
+- **lane F:** `monoPinMapLambdas`, `monoNoteBindDeliveryCall` and `monoLamSubstParams`.
+- **reach:**
+  - the unbound default: `monoElabDefaultsPrime` and `monoDefaultUnboundTyParams`;
+  - a reach fact for a returned literal: `monoDeliverCallRets`.
+- **A lambda body as an elaboration instance (D3616):** `monoPinnedTyOf` and `monoLamCallTy`.
+- **The call-param family's own facts:**
+  - an inline `if` with no binding: `monoCallIfValue` and `monoSeedCallSigTys`;
+  - a pin fact after holes-close: `monoArgPinTyIx`;
+  - the rep cascade: `monoArgPinName`;
+  - Fn#d's call-param hub: `monoPinTyParamComposite`.
+- **Parked on design questions (5):**
+  - argument-keyed instances, behind identity typing for concrete function values:
+    `monoWalkIdentCall`;
+  - mono's `call_ref` policy plus the written-cell signature: `monoCellCall`;
+  - `monoReachSlotTy`, with 13 decisions for lane F and 2 for reach;
+  - the key settling names: `monoPinnedTyParamCanon`;
+  - a per-call rule no fact states: `monoDefaultTyParamsOnlyGenFns`.
+
+The 45 unassessed functions need no new fact before their shadow. They are the next lane work,
+largest first:
+- slot type, 15: the record and map field pins and the written-let tails;
+- instance binding, 12: the union-arm and null binds;
+- node type, 10: the let-write and module pins;
+- call param, 5;
+- slot held fns, unbound default and others, 3.
+
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
 read. A decision is a pin a function returns, a type it returns or records, or a gate choosing
@@ -1938,6 +2064,12 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   (`elabArgBuiltTy`: the callee's parameter at that instance's bindings), which `monoArgClosedPin`
   reads where mono's own default rung was: 12 decisions in 6 programs, all byte-identical.
 - [ ] **slot held fns** (29): `monoWalkIdentCall` 9,604, `monoWrittenGenLetFrame` 9,601, `monoFlowReadsAll` 9,597, `monoFlowLetCalls` 8,067, `monoFlowLetVals` 7,770, `monoFlowParamVals` 7,769, `monoFlowDeclVals` 7,740, `monoFlowValsOf` 7,511, `monoCoerceWrittenLetTys` 5,811, `monoFlowReadsRound` 2,993, `monoFlowUsePlanAt` 2,921, `monoArmWrittenLetSeed` 1,627, `monoFlowAliasReadVals` 1,174, `monoFlowLetLeaf` 655, `monoFlowRetLocalLists` 581, `monoFlowKeptIndexElem` 511, `monoFlowMapVals` 384, `monoFlowDirectSet` 186, `monoFlowAliasMaps` 170, `monoFlowElemsGen` 105, `monoFlowLetMapLeaf` 75, `monoFlowReadElemAt` 72, `monoFlowMapReadVals` 50, `monoFlowLoopVarVals` 26, `monoFlowReplanPending` 18, `monoLetSeedGenFe` 5, `monoCellCall` 5, `monoFlowReadElem` 0, `monoFlowUsePlan` 0.
+  - A write never joins a binding's function set. `elabFnSetTy` is filled only by a read typed at
+    a function type (`elabFnValNote`), and a `let`'s storage type is its initialiser's read's type,
+    whose set it shares. So `let f = other` written `f = if c { inner } else { (n: i32) => … }`
+    reads `{other}` at the let and at every read of it, though the written `if` carries no set
+    (one arm is a closed lambda). D4307's program is the witness. The fix is the binding reader's:
+    the binding's set is the fold of its written values' sets, "any" once one carries none.
 - [x] **slot deliveries** (9): `monoCallIfBound` 9,601, `monoCallWrittenLet` 9,597, `monoPinListElems` 6,819, `monoCoerceWrittenCell` 913, ~~`monoReachSlotPins` 546~~, ~~`monoDeclPathPinsOrReach` 173~~, `monoStoredSlotFnTy` 152, `monoRetLitElemTy` 81, ~~`monoReachSlotPinsAt` 78~~ — switched (below): each reads `elabSlotDeliveries`, and what is left is mechanics.
 - [ ] **node type** (29): `monoCloseRetFnTy` 9,592, `monoInitHeldTy` 6,742, `monoArgClosedTyIn` 5,475, `monoPinBin` 4,320, `monoPinnedOperandTy` 3,781, `monoSubstLetType` 3,348, `monoCloneLetDecl` 3,020, `monoCoerceListCbArg` 2,889, `monoPinReturnedObj` 1,945, `monoCbFnListRowSpell` 1,107, `monoDeadNullTest` 882, `monoCgcTplTy` 668, `monoRetFnListTy` 608, `monoPinnedAnnTyAt` 509, `monoLeafParamPin` 420, `monoBoundFnListElemsTy` 352, `monoPinnedReadTy` 341, `monoClosedObjLitTy` 174, `monoLetAnnTyOf` 66, `monoHoleFnPinTy` 33, `monoLetWriteRhsTyRec` 15, `monoPinnedListElemPin` 14, `monoLetWritesRecord` 6, `monoModuleDupPin` 3, `monoArgOpenValueTy` 1, `monoModuleLetPin` 0, `monoClosedFieldValTy` 0, `monoLetWriteRhsTy` 0, `monoPinnedListAnnTy` 0.
 - [ ] **slot type** (27): `monoBindingAdoptInit` 9,578, `monoHoleGenFnPin` 7,952, `monoListSrcElemTy` 7,925, `monoReachLitTys` 6,959, `monoReachSlotTy` 6,938, `monoPinMapValues` 6,754, `monoPinFieldContainers` 798, `monoPinRecordFields` 733, `monoLetWritesClosed` 703, `monoPinObjFields` 695, `monoRetypeLamCells` 565, `monoPinRecordField` 466, `monoWritesCoercedFirstCall` 454, `monoPinNestedListElems` 315, `monoPinFieldContainer` 112, `monoPinMapSlot` 66, `monoLetWritesAt` 57, `monoNoteBindCall` 28, `monoPinFieldValue` 25, `monoPinJoin` 22, `monoPinStoredRecords` 20, `monoRenameInitAt` 12, `monoSigJoin` 3, `monoPinnedElemAnnTy` 2, `monoHandWrittenLet` 2, `monoPinMapNestedFnLists` 0, `monoWrittenLetRetsDisagree` 0.
@@ -2168,7 +2300,46 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   `monoSubstIsExpr`, `monoHoleCoalUnion`) remake syntax and consume a type: class (c) once their
   type reads the elaboration, which through the hub it now does where the pin closes.
 - [ ] **call param** (13): `monoBindSeededTyParams` 5,624, `monoArgTyName` 5,220, `monoPinHoleParam` 3,734, `monoCallIfValue` 2,887, `monoArgPinTyIx` 404, `monoArgTyNameCascade` 360, `monoArgTyNameRep` 215, `monoArgTyNameBound` 177, `monoSpelledRecordLeavesRow` 127, `monoPreBindArgName` 63, `monoPreBindArgTy` 63, `monoArgPinName` 61, `monoArgTyNameProjected` 9.
-- [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
+  **`monoArgTyName`, shadowed** (2026-11-07, master `1cebe3ff`, the full population, 14,974
+  decisions). Each is graded against the argument's own type at the instance: `elabNodeTyAt`,
+  else the root walk's, else the checker's. Agreement is `tySame`; spelling is a column of its own.
+  - The closed rung (`monoArgClosedPin`, 14,394) already pins at that type.
+    - 12,893 agree, 11,384 of them through the checker's type where the elaboration declines at
+      the root.
+    - 1,403 bank the template's `T` beside a name that is already the closed type's spelling.
+    - 82 differ by design. 80 are records built wider at delivery, which pin at the build
+      (`elabArgBuiltRep`, `recCopyTyOf`; D15181, D15183). 2 are a hole call of a generic at its own
+      instance, where the elaboration's `f64` is right.
+    - What mono owns is the spelling: 328 registry names (`P` for `{x: i32}`, `#anon0`).
+  - The cascade (580) is type = elaboration; spelling = row key; waits on row identity. In a
+    generic clone the elaboration gives a declared record argument its structural type, and the
+    closed rung's spelling declines a record spelled by its fields, so it matches 3 of the 580.
+    Its rungs, by answers:
+
+    | rung | reads | answers | nominal spelling eq / ne / open |
+    |---|---|---|---|
+    | `monoArgTyNameRep`, struct row (`sNames`) | the row name | 167 | 25 / 127 / 15 |
+    | `monoArgTyNameBound`, a module global's annotation | the annotation | 109 | 103 / 2 / 4 |
+    | `monoArgTyNameRep`, list literal (`arrLitElemName`) | the element | 108 | 31 / 51 / 26 |
+    | `monoArgTyNameBound`, a parameter's annotation | the annotation | 49 | 22 / 18 / 9 |
+    | `monoArgTyNameBound`, a generic application's inner | the annotation | 47 | 13 / 32 / 2 |
+    | `monoArgTyNameRep`, a union variant (`litRetArmRow`) | the variant | 28 | 19 / 9 / 0 |
+    | the cascade's function value and `""` floor | the signature key | 19 | open |
+    | `monoArgTyNameRep`'s tail, `ELAB_TP_DEFAULT` by name (D23) | the default | 11 | open |
+    | the rest | | 42 | |
+
+    No rung goes through `monoPinNominalSpelling`: each big one has rows it spells otherwise,
+    and a switch would rekey the instance. Its literal returns are rep names, not defaults: the
+    scalar and list floors (`"string"`, `"f64[]"`, `"i32[]"`, …) name the rep an `expr*` test
+    found, and the `i32[]` list floor is reached by no program.
+  - `monoBindSeededTyParams` makes 21 decisions over the population where `elabCallSeedBind`
+    answers. 1 agrees, 15 are open on both sides, and 0 differ. In 5, mono closes the type (for
+    example `(string) => string`) where the elaboration's seed binding is the seed parameter's own
+    `(T) => T`, because mono substitutes the binding that parameter got at the instance.
+  - `monoCallIfValue` makes no decision over the population: every entry returns at its gate.
+  - `monoPreBindArgName`, `monoPreBindArgTy`, `monoArgPinName` and `monoArgPinTyIx` wrap the pin
+    measured above. `monoSpelledRecordLeavesRow` is a row-layout test, in the row-key family.
+- [x] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
   The type an uncalled slot holds its functions at is the elaboration's (`elabUncalledSlotTy`,
   from `elabSlotHeldFns`), read by `monoUncalledSlotFnTy`. Shadowed over 23,381 programs, 507
   decisions in 318 programs: 105 agree, 401 decline on both sides, 0 disagree. In one, D12218,
@@ -2215,6 +2386,11 @@ parameter. This is the root of both populations the instance-choice comparison l
 - the 2,079 elab-only calls declined under ruling (a).
 
 Like D15494, it waits on a design answer, not a lane.
+
+**Open design question: identity typing for concrete function values** (owner level). §2.2 gives
+every function value its singleton `Fn#d`, but the checker gives one only to the values whose sets it
+tracks. Argument-keyed instances are its first client: 1,500 of 1,573 specialized arguments have no
+set (measured under the canonical instance key below).
 
 **The unbound default, measured** (2026-11-07, master `75101d46`). The D4551 default is the
 elaboration's: `ELAB_TP_DEFAULT` and `elabTpDefaulted` (#6569), after its call reach was made to
@@ -2309,6 +2485,36 @@ is now a loud refusal and the helper is deleted. The climb itself stays: declini
 closing programs from runs to an emit refusal (`ref valtype with no interned shape`, `call to
 unknown function`). Over 19,316 programs no byte moves.
 
+**A re-pointed `let` handed to a function parameter takes the elaboration's parameter type**
+(2026-11-07). `monoHandWrittenLet` instances every function the binding holds at the pin. That pin is
+now `elabCallParamTy` at the call, and no longer mono's substitution of the callee's annotation.
+Shadowed over 23,384 programs, 2 programs reach it with 4 decisions
+(`closures/alias-of-written-let-handed-to-generic-fn-param.vl` and
+`closures/written-let-of-hole-fns-to-generic-fn-param.vl`). The elaboration closes all 4, at
+mono's pin. `monoWrittenLetRetsDisagree`'s refusal fired in none: the checker refuses that program
+first (D9003, `holeLetWritesDisagree`). So it is deleted, with `monoBoundTys` and
+`monoArrowParamTysAt`, which only it called. A missing elaborated type is a loud refusal. Over
+19,316 programs no byte moves.
+
+**The rest of the slot-type tail, measured** (2026-11-07, one probe over 23,384 programs, counted
+by program).
+
+- **`monoSigJoin` / `monoPinJoin` never join.** A quiet call signature joined another entry of a
+  binding's signature list at a widened pin (a string literal union with `string`). No program
+  joins two distinct signatures. `monoSigListAdd` now adds a signature once and never joins, and
+  `monoSigJoin`, `monoPinJoin`, `monoPinCarriesString` and `monoPinWidened` are deleted. The
+  vacated position's floor is the existing `MONO_BIND_SIG` refusal: a binding called at two
+  signatures is refused loudly. Over 19,316 programs no byte moves.
+- **`monoRenameInitAt` is class (c).** It is reached by 15 programs: 11 already hold an instance at
+  the pin and 4 instance one, and its refusal fires in none. Its pin is the elaboration's
+  (`monoDeclPathPins`); what it does is instancing and renaming.
+- **`monoPinStoredRecords`, `monoPinFieldValue` and `monoLetWritesAt` disagree with
+  `elabSlotTyAt` nowhere.** `monoPinStoredRecords`: 8 agree and 0 differ. Its 2 mono-only programs
+  are D15494 maps, and in its 4 elab-only programs mono declines. `monoPinFieldValue`: 6 agree and
+  0 differ. Its 1 mono-only program is D15190, a refused program, and it has 57 elab-only, all with
+  mono declining. `monoLetWritesAt` is reached past its `const` arm by 1 program, which agrees.
+  These are graded together next.
+
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
 and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
@@ -2384,7 +2590,11 @@ mechanism message at the call. The fixture adds one late demand, pre-existing on
 counted by `closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`. It is D15136's
 `put` at the argument's own type, demanded by the root call `put(xs)`. `hand` is never built: its
 second call of `put` makes `fnWriteOnlyInto` decline, so the elaboration delivers `xs` at `half`'s type.
-It exists only on that refusing build, and it goes with D15136's own fix. `monoCallWrittenLet` instances its writes at the delivery's pin, and
+It exists only on that refusing build, and it goes with D15136's own fix. The baseline's other entry,
+`closures/listed-hole-fn-escaping-list.vl`, is `use` minted at `((i32) => i32)[]` inside `take`'s
+instance. It is the signature twin of an instance the elaboration holds by identity
+(`((T) => T)[]`), and the twin's signature is mono's choice, so it is parked in Fn#d's identity
+territory, not foreseen. `monoCallWrittenLet` instances its writes at the delivery's pin, and
 `monoCallIfBound` no longer falls back to the seed. Mono's result derivation then decides nothing
 in the population, so `monoListSlotPinnedFnTy`, `monoPathSlotPinnedFnTy` and `monoHeldSrcsFnTy` are
 deleted. `monoSeedCallSigTys` stays for `monoCallIfValue`, an inline
@@ -2550,6 +2760,30 @@ answer: mono's `i32` was re-widened downstream. `monoNumOperandPinTy` and the tw
 default whose left side has no closed walk type refuses loudly where the hole-binding substitution
 was; no program reaches it. The first three helpers already read the elaboration and stay.
 
+**Value returns, against `elabValueReturnsFrom`** (2026-11-07, 19,338 programs, master
+`a0562c8b`). `monoFlowRetVals` was already gone, and `monoFlowConstCallArgs` is the flow rewrite's
+own transformation around the leaf decision (class (c), cad lane).
+
+| decision | decisions (programs) | reading |
+|---|---|---|
+| `monoFlowCallLeaf`: call `c` always returns generic `g` | 386 (101) | 53 answered, all 53 confirmed; 333 declined |
+| `monoFlowAnnLits`: the literals an annotated binding's call initializer may return | 75 (28) | 16 confirmed; 59 are literal nodes, which the fact does not follow |
+| `monoDeliverCallRets`' gate: the function returns a hole lambda | 802 (593) | 796 both no; 6 (3 programs) mono yes, fact no, again a returned literal |
+
+- **`monoFlowCallLeaf`: the fact confirms, it does not enumerate.** Asked of mono's answer it
+  agrees every time, but it names no candidate `g`, so it cannot answer the 333 declines. The leaf
+  stays the planner's decision, and its two consumers, the repoint and the rets share of
+  `mfrInertValues`, are cad's.
+- **`monoFlowAnnLits` is deleted.** Banking nothing moves no byte over the 29 programs it banked
+  for, so its consumer (each banked literal coerced at the binding's annotation, under
+  `monoInstanceExactRet`) is gone too, along with that flag.
+- **`monoDeliverCallRets` stays: blocked on a reach fact for a returned literal.** Forced off, its
+  gate lets `closures/error-hole-lambda-returned-into-bindings-of-two-types.vl` (D6522) build and
+  print a wrong answer, and makes `closures/hole-lambda-returned-into-binding-of-another-type.vl`
+  trap. Those two are its acceptance cells.
+- **`monoIfBoundRetAtPin`** reads `monoSlotPinNameTys`, the elaboration's deliveries, with no
+  fallback: class (a).
+
 **Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
 elaboration has no type of its own for the node, and every caller composes its own narrowing with
 it. A fallback to the checker's closed type (#6556, closed) broke four `runs` cells:
@@ -2602,6 +2836,30 @@ read (`slotOfRead`) of a different holder with a closed `elabSlotTyAtKey` fact a
 the common case being `const f = m.get("k")` out of a closed map. A read of an open holder
 declines, which leaves generic functions stored in maps to D15494. A delivered bundle (reach) is the
 next source, so the elaboration gets no second composer for the same binding.
+
+**The second source, built from bundles: `elabWrittenBuiltTy`** (2026-11-07). It covers four
+kinds of value:
+- a call, through `elabCallBundleRet`, which answers with the bundle record the call's returned
+  parameter (`elabRetParamOf`) is delivered as (`elabCallArgRep`, `elabDeliveredBundleSigs`), or,
+  where the callee hands back no parameter, with the values it returns, built the same way at the
+  call's own instance;
+- a record of its fields' answers, each other field at its closed checked type;
+- a list of its elements' agreed answer;
+- a field or list element of such a value, or an un-annotated `let` written once.
+
+The reach rows holding the bundles are written by `elabReachRows`, after `elabRun`'s `elabSlotFacts`.
+So `elabSlotBundleFacts` re-runs the same reader there, for program-level holders still without a
+fact, and never overwrites one. That timing is why the binding reader runs twice. The bundle source
+cannot answer in `elabSlotFacts`, so folding the two runs into one loses all 15.
+
+Over master `fd7ef721`'s 21 `monoBindingAdoptInit` decisions holding a bundle record, all at program
+level in seven programs (the five `closures/bundle-record-*.vl` tests, D15323 and D15324),
+`elabNodeTy` agrees at 15, differs at none, and leaves to mono six reads of an un-annotated `Map()`
+whose value comes from its writes, which wait for lane F's map-value facts. The fifteenth is
+`{ f: gen("s", 3), n: 3 }`, where the generic hands back a `let` rather than a parameter.
+
+A holder inside an instance written from a bundle still declines, because the late pass is
+program-level only, so 15 of 21 does not mean that bundles close at every instance.
 
 A captured cell (`let d = c` re-written by a lambda) gets no fact this way yet. Its written lambdas
 are nested and capture, so `elabHeldAtArgs` declines, and `elabHeldFnTy` returns that decline
@@ -3011,6 +3269,27 @@ slot. The canonical-instance-key work is the expected provider. Moving it today 
 two functions (`monoRespellLamFe` and `monoCapturedLamFe` become predicates), so it waits for that
 map.
 
+**`monoCellCall`'s callee choice is parked on the same terms** (2026-11-07). The function a
+capture-cell call instances can be the cell's lambda, a generic seed or a hole-lambda seed. Over
+23,456 programs, `elabCalleeFnsOf` agrees on all 16 calls where mono picks one. In 366 calls only
+the elaboration has a callee, and those stay `call_ref` under ruling (a). So the choice is mono's
+`call_ref` policy and deletes nothing. Its other half, coercing the cell's writes at the instance's
+signature, waits on the per-instance signature of a written binding, as the written lets do.
+
+**The written-let decisions wait on the binding reader** (2026-11-07). Over 23,456 programs:
+- `monoWrittenGenLetFrame`'s gate (every value names a declared generic) is not yet measured.
+  The first shadow read the binding's set after the walk had retyped the node, so its 109 of 112
+  is void. It reruns reading the set before the walk, once split-dep's set-valued fold over a
+  let's writes lands (D4307).
+- The type `monoCoerceWrittenLetTys` coerces at agrees with `elabSlotTyAt` on 18 of 166
+  decisions. In 53 the slot fact is a wrong one: the initialiser fallback in `elabSlotInstFacts`
+  stores a polymorphic identity, such as `other<V>`'s `(V) => void`, as the per-instance fact.
+  split-dep is fixing that store so these become declines. In 95 it answers nothing.
+
+`monoWrittenGenLetFrame`, `monoCoerceWrittenLetTys`, `monoArmWrittenLetSeed` and `monoLetSeedGenFe`
+wait on both. `monoFlowKeptIndexElem`'s gate agreed on all 78 decisions and reads the indexed
+read's identity set (`elabFnSetOf`).
+
 **Mono-owned: callback specialization's direct calls** (2026-11-07). `monoWalkIdentCall`'s
 instance choice was compared with the elaboration over 23,456 programs: 122,691 decisions agree.
 2,079 are elab-only and stay `call_ref` under ruling (a). 1,052 are mono-only: 698 concrete and 354
@@ -3275,6 +3554,24 @@ Each slice is graded on the byte sweep.
 - **A tagged set is never specialized (D15010).** This is an assertion in slice 1's predicate.
 - **Each slice comes back for a ruling before the next.** Slice 1 is approved: fold the gates
   byte-identically, then record and grade the key.
+
+**Slice 1, measured: the identity this needs does not exist yet** (2026-11-07, 23,456 programs).
+The gates are already one predicate on master, so there was nothing to fold. At each of mono's
+1,573 specialization decisions, the specialized argument's identity set, read at the call's key or
+else from its checked type, came out as:
+- 70: a singleton naming mono's `@name`;
+- **1,500: a type with no `Fn#d` set;**
+- 3: no type at all;
+- 0: a tagged set, so D15010 holds as an invariant.
+
+The callbacks mono specializes are known, non-capturing, non-generic functions and lambdas. Today
+`elabFnSetTy` holds sets only for the function values the elaboration tracks: generics, hole
+functions and written slots. A plain concrete function value keeps its structural type.
+**Prerequisite:** argument-keyed instances need identity typing for concrete function values
+first, which is option (A), §2.2 applied to every function value. That changes every function
+value's type in the checker, so it is an owner-level design item, and it joins the open
+questions. Keying on the argument's declaration directly (B) is declined: it moves spelling, not a
+decision. Slices 2 and 3 wait on (A).
 
 #### The call half and the value half (2026-11-06)
 
