@@ -1,10 +1,13 @@
 import { idShadowSpec } from "./emit_id_shadow"
 import {
   elabIdentityFnTy,
+  elabSpecDeclFor,
   elabSpecDemand,
   elabSpecKeyOf,
   elabSpecMonoGroup,
+  elabSpecMonoSlot,
   elabSpecParamCalledAt,
+  elabSpecSlotOfKey,
   idCanon,
 } from "./elab_fn_id"
 import { idShadowModeOf } from "./id_shadow_state"
@@ -713,6 +716,8 @@ import {
   elabSlotRecDeclAt,
   elabSlotSetCalls,
   elabSlotTyAt,
+  elabSpecBindOf,
+  elabSpecHoleBind,
   elabSrcDecl,
   elabStampAt,
   elabTestsTyVar,
@@ -5070,6 +5075,10 @@ function monoPinMapLambdas(ix: i32, pNames: string[]) {
 // bake reads; -1 outside one.
 let monoBakeSpecK = -1
 
+// The key of the keyed decision whose `monoMakeInstance` comes next, which `monoMakeInstanceGo`
+// takes and clears; -1 for any other build.
+let monoSpecGoK = -1
+
 // Extend the name→index map over the instances minted since the last call, which the walk
 // resolves by name before collection runs.
 function monoRegisterInstance() {
@@ -5237,7 +5246,7 @@ function monoBakeCallback(
         && callee is Ident
       ) {
         newCallee = mkIdent(cbFnNames[kp], callee.pos)
-        identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[kp]))
+        identFromDecl(newCallee, elabSpecDeclFor(specK, kp))
       } else if specK < 0 && callee is Ident {
         // A call through a never-written `const` alias of the parameter is a call of it too (D12216).
         let pname = monoBakeAliasParam(n.callFn, fnDeclIx)
@@ -6380,6 +6389,7 @@ function monoBindSeededTyParams(
   tvN: string[],
   tvV: string[],
   tvT: i32[],
+  specK: i32,
 ) {
   for tp in fn.fnTyParams {
     // A call in a cloned body answers from the template call the elaboration keyed (D15495).
@@ -6396,6 +6406,9 @@ function monoBindSeededTyParams(
       nm = if j < pinned.length { pinned[j] } else { "" }
       t = if j < pinTys.length { pinTys[j] } else { -1 }
     }
+    // At an argument-keyed instance the type is its base instance's binding; mono keeps the spelling.
+    const kt = if nm != "" && specK >= 0 { elabSpecBindOf(specK, tp) } else { -1 }
+    if kt >= 0 { t = kt }
     if nm != "" {
       tvN.push(tp)
       tvV.push(nm)
@@ -9670,6 +9683,8 @@ function monoMakeInstanceGo(
 ) {
   const callFrame = monoCallFrameSlot
   monoCallFrameSlot = -1
+  const specK = monoSpecGoK
+  monoSpecGoK = -1
   // The delivery this build answers, read in the instance being walked before this one's.
   const cadDel = cadDelivery
   cadDelivery = -1
@@ -9754,7 +9769,18 @@ function monoMakeInstanceGo(
     }
     monoPinKindsNoteFnVal(pinKinds)
     // Registry hit: point this call site at the existing instance.
-    if (monoMakeInstanceHit(k.key, origFe, pinned, calleeIx, annotateI32)) {
+    // A keyed decision reuses the instance the (S1) map holds for its key.
+    const sSlot = elabSpecSlotOfKey(specK)
+    let hitAt = k.key
+    let rs = 0
+    while sSlot >= 0 && rs < monoKeys.length && rs < monoInstFe.length {
+      if monoInstFe[rs] == sSlot {
+        hitAt = monoKeys[rs]
+        break
+      }
+      rs = rs + 1
+    }
+    if (monoMakeInstanceHit(hitAt, origFe, pinned, calleeIx, annotateI32)) {
       return monoCadNoteInstance(
         origFe,
         monoLastInstFe,
@@ -9871,7 +9897,10 @@ function monoMakeInstanceGo(
     }
     monoShAliasBind(origFe, letBN, letBT)
     monoShPendFlush(shAt)
-    if !fromKey {
+    if (
+      !fromKey
+      && !elabSpecHoleBind(monoOrigNode[origFe], params, specK, holeN, holeT)
+    ) {
       monoHoleBinding(origFe, params, letTyCol, holeN, holeT, tplCall)
     }
     // The worklist instance this one is: demanded here, its body checked once at this binding.
@@ -19707,6 +19736,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         tvN,
         tvV,
         tvT,
+        elabSpecKeyOf(specAt),
       )
       monoDefaultUnboundTyParams(
         fn.fnTyParams,
@@ -19771,6 +19801,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       const specKeys0 = monoKeys.length
       const specKWas = monoBakeSpecK
       monoBakeSpecK = elabSpecKeyOf(specAt)
+      monoSpecGoK = monoBakeSpecK
       const made = monoMakeInstance(
         origFe,
         pinned,
@@ -19784,8 +19815,10 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         cbFnNames,
       )
       monoBakeSpecK = specKWas
+      monoSpecGoK = -1
       const specFe = if monoKeys.length > specKeys0 { monoInstFe[specKeys0] } else { monoLastInstFe }
       elabSpecMonoGroup(specAt, i32ToStr(specFe))
+      elabSpecMonoSlot(specAt, specFe)
       return made
     }
   }
@@ -21475,9 +21508,11 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       }
       elabSpecMonoGroup(specAt, key)
       // Registry hit: a prior call already specialized this (callee, callback-set) — reuse it.
+      // A keyed decision reuses the instance the (S1) map holds for its key; others match `key`.
+      const slot = elabSpecSlotOfKey(elabSpecKeyOf(specAt))
       let r = 0
       while r < monoKeys.length {
-        if monoKeys[r] == key {
+        if if slot >= 0 { monoInstFe[r] == slot } else { monoKeys[r] == key } {
           const cal = nodeAt(c.callFn)
           // R4 writer 7 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
           if cal is Ident {
@@ -21485,6 +21520,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
             monoNoteRenamed(c.callFn, monoInstFe[r])
             sidNoteNodeName(c.callFn, fnStmts[monoInstFe[r]])
           }
+          elabSpecMonoSlot(specAt, monoInstFe[r])
           return 0
         }
         r = r + 1
@@ -21550,6 +21586,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       monoInstOrig.push(fe)
       monoInstName.push(specName)
       monoInstFe.push(instFe)
+      elabSpecMonoSlot(specAt, instFe)
       if monoRegisterInstance() < 0 { return -1 }
       // Walk the ORIGINAL body under this specialization's context so a nested generic call it
       // contains instantiates (idempotent via the registry — the main loop also walks the original).
@@ -25382,6 +25419,7 @@ export function monomorphize(stmts: i32[]) {
   monoArmCall = -1
   monoArmCtx = -1
   monoBakeSpecK = -1
+  monoSpecGoK = -1
   monoAliasCallDecl = Map()
   monoRetWidenFns = Map()
   monoWrittenLetHanded = Map()
