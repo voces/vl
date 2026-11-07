@@ -49,6 +49,9 @@ vl run scripts/sweep.vl -- record --compiler <seed.wasm> --shard 3/8 --out base-
 vl run scripts/sweep.vl -- merge --out base.jsonl base-*.jsonl   # refuses a gap or an overlap
 
 vl run scripts/sweep.vl -- diff base.jsonl cand.jsonl
+
+# the population itself, `<key>\t<file>\t<run>` per program, witnesses written (for another grader)
+vl run scripts/sweep.vl -- list [--population P] [--shard K/N]
 ```
 
 `--std` is the `std/` the programs compile against (default `./std`). `--vl` is the host binary
