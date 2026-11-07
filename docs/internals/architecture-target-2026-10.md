@@ -57,7 +57,10 @@ both from blocked), so master reads 65 switched, 51 (c), 14 blocked, 12 parked a
   `monoArgTyNameCascade`, `monoArgTyNameBound`, `monoArgTyNameProjected` and `monoArgTyNameRep`
   (split-dep's one-producer redesign; the kept arms wait on the naming rule). No decision reads an
   instance pin's spelling any more (naming-rule slice 2a: `monoPinIsFnSig` deleted, `isNumRecvBaseName`
-  reads the pin type), so slice 2b can switch the names to `monoPinSpellOf`.
+  reads the pin type). Slice 2b names an un-annotated parameter's pin by `monoPinSpellOf` when it
+  holds no record, map or non-literal union; the rest waits on a pin-type column (an annotated
+  parameter's pin is its annotation, not the argument's type `pinTys` holds) and on the emit readers
+  that resolve a record or union pin by name (2026-11-07-pin-spelling-hole-params.md).
 
 **Parked at the census (12; 12 on master), each on a named question:**
 - `monoElabStubArgsPrime`: the stub half waits on D15494 (owner);
