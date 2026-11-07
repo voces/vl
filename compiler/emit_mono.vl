@@ -3,6 +3,8 @@ import { recEnclosingFn } from "./check_fit_rules"
 import {
   mfrChainFns,
   mfrElabNames,
+  mfrLitsDirectFn,
+  mfrLitsExprOf,
   mfrLitsOf,
   mfrShadowNote,
 } from "./mfr_shadow"
@@ -136,7 +138,7 @@ import {
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
-import { cwFnValueDeclOf, cwIxBuild } from "./check_write_scan"
+import { cwFnValueDeclOf, cwIxBuild, cwIxCoveredLen } from "./check_write_scan"
 import { tyLeavesDisjoint } from "./check_type_shape"
 import {
   callArgRepTy,
@@ -587,7 +589,6 @@ import { tyReachesFuncD } from "./emit_obj_lit_fits"
 import {
   bundleHandMemberNote,
   bundleParamNote,
-  bundleRecordNote,
   bundleReset,
   bundleRetParamNote,
 } from "./emit_bundle"
@@ -3915,31 +3916,19 @@ function monoCloneIfChain(
   )
 }
 
-// The element type of `recvIx` when it is (a paren around) a parameter reference whose
-// pinned type is an array — looked up in the instance's (pNames → pElems) map; "" for
-// anything else. Pins a `.map`/`.filter` callback's element from this instance's receiver.
-function monoRecvParamElem(
-  recvIx: i32,
-  pNames: string[],
-  pElems: string[],
-  pElemTys: i32[],
-  outTy: i32[],
-) {
-  const r = nodeAt(unwrapParen(recvIx))
-  if r is Ident {
-    let i = 0
-    while i < pNames.length {
-      if pNames[i] == r.identName {
-        // The element row rides out beside the element name, from the column built
-        // parallel to `pElems`, so the caller never has to recover the row by re-parsing
-        // the name this returns.
-        if i < pElemTys.length { outTy.push(pElemTys[i]) }
-        return pElems[i]
-      }
-      i = i + 1
-    }
-  }
-  ""
+// The closed element type the elaboration gives receiver `recvIx` at the instance being walked,
+// where the receiver is (a paren around) a reference to one of the parameters `pNames`; -1 for any
+// other receiver or an open element.
+function monoRecvParamElemTy(recvIx: i32, pNames: string[]): i32 {
+  const r0 = unwrapParen(recvIx)
+  if r0 < 0 || r0 >= P.nodes.length { return -1 }
+  const r = nodeAt(r0)
+  if !(r is Ident) || !strListHas(pNames, r.identName) { return -1 }
+  const t = elabNodeTy(r0, elabWalkTop())
+  if t < 0 || t >= T.tys.length { return -1 }
+  const a = tyAt(t)
+  if !(a is TyArray) || a.aElem < 0 || tyHasTyVar(a.aElem) { return -1 }
+  a.aElem
 }
 
 // The element an `is K[]` arm reads its receiver `recvIx` at, when the instance pinned that
@@ -3982,10 +3971,6 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
             p0.pos,
           )
           identFrom(np, a.fnParams[0])
-          // The pinned element row is handed over rather than re-parsed out of the
-          // element name: `pElemTys` is built beside `pElems` from the same pin, so the
-          // row reaches this mint without the name being turned back into a type.
-
           const nm = "__lambda_" + i32ToStr(lambdaCtr)
           lambdaCtr = lambdaCtr + 1
           const noTP: string[] = []
@@ -5428,12 +5413,7 @@ function monoLamFrameInstantiated(fe: i32) {
 // un-annotated param defaults to i32 at emit, correct only for the i32 shape, so when
 // this instance pins the receiver param to a non-i32 element the callback is cloned with
 // its param pinned to that element and the call rebuilt to reference the clone.
-function monoPinMapLambdas(
-  ix: i32,
-  pNames: string[],
-  pElems: string[],
-  pElemTys: i32[],
-) {
+function monoPinMapLambdas(ix: i32, pNames: string[]) {
   if ix < 0 { return ix }
   const n = nodeAt(ix)
   match n {
@@ -5442,7 +5422,7 @@ function monoPinMapLambdas(
       let changed = false
       let i = 0
       while i < n.blkStmts.length {
-        const cs = monoPinMapLambdas(n.blkStmts[i], pNames, pElems, pElemTys)
+        const cs = monoPinMapLambdas(n.blkStmts[i], pNames)
         ns.push(cs)
         if cs != n.blkStmts[i] { changed = true }
         i = i + 1
@@ -5451,17 +5431,17 @@ function monoPinMapLambdas(
       return mkBlock(ns, n.pos)
     }
     RetStmt => {
-      const ca = monoPinMapLambdas(n.retArg, pNames, pElems, pElemTys)
+      const ca = monoPinMapLambdas(n.retArg, pNames)
       if ca == n.retArg { return ix }
       return mkReturn(ca, n.pos)
     }
     LetDecl => {
-      const ci = monoPinMapLambdas(n.letInit, pNames, pElems, pElemTys)
+      const ci = monoPinMapLambdas(n.letInit, pNames)
       if ci == n.letInit { return ix }
       return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
     }
     WhileStmt => {
-      const cb = monoPinMapLambdas(n.whileBody, pNames, pElems, pElemTys)
+      const cb = monoPinMapLambdas(n.whileBody, pNames)
       if cb == n.whileBody { return ix }
       return mkWhileAs(n, n.whileCond, cb)
     }
@@ -5475,7 +5455,7 @@ function monoPinMapLambdas(
         const c = nodeAt(links[k])
         if c is IfStmt {
           ccs.push(c.ifCond)
-          cts.push(monoPinMapLambdas(c.ifThen, pNames, pElems, pElemTys))
+          cts.push(monoPinMapLambdas(c.ifThen, pNames))
         }
         k = k + 1
       }
@@ -5483,11 +5463,11 @@ function monoPinMapLambdas(
         links,
         ccs,
         cts,
-        monoPinMapLambdas(monoIfChainElse(links), pNames, pElems, pElemTys),
+        monoPinMapLambdas(monoIfChainElse(links), pNames),
       )
     }
     ForRange => {
-      const cb = monoPinMapLambdas(n.frBody, pNames, pElems, pElemTys)
+      const cb = monoPinMapLambdas(n.frBody, pNames)
       if cb == n.frBody { return ix }
       return mkForRange(
         n.frVar,
@@ -5501,12 +5481,12 @@ function monoPinMapLambdas(
       )
     }
     ForIn => {
-      const cb = monoPinMapLambdas(n.fiBody, pNames, pElems, pElemTys)
+      const cb = monoPinMapLambdas(n.fiBody, pNames)
       if cb == n.fiBody { return ix }
       return mkForInCopy(n, n.fiIter, cb)
     }
     Paren => {
-      const ci = monoPinMapLambdas(n.parInner, pNames, pElems, pElemTys)
+      const ci = monoPinMapLambdas(n.parInner, pNames)
       if ci == n.parInner { return ix }
       return mkParen(ci, n.pos)
     }
@@ -5517,7 +5497,7 @@ function monoPinMapLambdas(
       let echanged = false
       let ei = 0
       while ei < n.arrElems.length {
-        const ce = monoPinMapLambdas(n.arrElems[ei], pNames, pElems, pElemTys)
+        const ce = monoPinMapLambdas(n.arrElems[ei], pNames)
         es.push(ce)
         if ce != n.arrElems[ei] { echanged = true }
         ei = ei + 1
@@ -5526,7 +5506,7 @@ function monoPinMapLambdas(
       return monoRemakeListLitTpl(ix, es, n.pos)
     }
     Spread => {
-      const sa = monoPinMapLambdas(n.spdArg, pNames, pElems, pElemTys)
+      const sa = monoPinMapLambdas(n.spdArg, pNames)
       if sa == n.spdArg { return ix }
       return mkSpread(sa, n.pos)
     }
@@ -5536,27 +5516,14 @@ function monoPinMapLambdas(
       const callee = nodeAt(n.callFn)
       // A `<paramRecv>.map/.filter(<lambda>)` over a concrete non-i32 element: pin the callback.
       if callee is Member {
-        const recvNew = monoPinMapLambdas(
-          callee.memObj,
-          pNames,
-          pElems,
-          pElemTys,
-        )
+        const recvNew = monoPinMapLambdas(callee.memObj, pNames)
         if recvNew != callee.memObj {
           newCallee = mkMember(recvNew, callee.memProp, callee.pos)
         }
         if callee.memProp == "map" || callee.memProp == "filter" {
           if n.callArgs.length == 1 {
-            const elemTyOut: i32[] = []
-            let elem = monoRecvParamElem(
-              callee.memObj,
-              pNames,
-              pElems,
-              pElemTys,
-              elemTyOut,
-            )
-            let elemTy = -1
-            if elemTyOut.length > 0 { elemTy = elemTyOut[0] }
+            let elemTy = monoRecvParamElemTy(callee.memObj, pNames)
+            let elem = if elemTy >= 0 { monoPinAnnSpelling(elemTy) } else { "" }
             const armEl = monoFitArmElem(callee.memObj, elemTy)
             const armName = monoFitArmElemName(armEl)
             if armName != "" {
@@ -5577,7 +5544,7 @@ function monoPinMapLambdas(
       let changed = newCallee != n.callFn
       let ai = 0
       while ai < n.callArgs.length {
-        const cca = monoPinMapLambdas(n.callArgs[ai], pNames, pElems, pElemTys)
+        const cca = monoPinMapLambdas(n.callArgs[ai], pNames)
         nargs.push(cca)
         if cca != n.callArgs[ai] { changed = true }
         ai = ai + 1
@@ -7008,7 +6975,8 @@ function monoBindSeededTyParams(
   tvT: i32[],
 ) {
   for tp in fn.fnTyParams {
-    const et = if monoBindOf(tvN, tvV, tp) == "" { elabCallSeedBind(decl, callIx, tp) } else { -1 }
+    // A call in a cloned body answers from the template call the elaboration keyed (D15495).
+    const et = if monoBindOf(tvN, tvV, tp) == "" { elabCallSeedBind(decl, monoCallTplOf(callIx), tp) } else { -1 }
     const pd = if et >= 0 { elabTyParamSeedParam(fn, tp) } else { -1 }
     const j = i32ListIndexOf(fn.fnParams, pd)
     let nm = ""
@@ -9603,7 +9571,6 @@ function monoMakeInstanceBodyRewrite(
   instBody0L: i32,
   origFe: i32,
   params: i32[],
-  pinned: string[],
   pinTys: i32[],
   pinnedTyIx: i32[],
   cbFnNames: string[],
@@ -9615,16 +9582,10 @@ function monoMakeInstanceBodyRewrite(
   letBN: string[],
   letBT: i32[],
 ) {
-  // Pin any `.map`/`.filter` callback lambda whose receiver param this instance bound to
-  // a non-i32 element: the shared body's un-annotated lambda would otherwise emit as i32.
-  // Build the param→element map from the pinned param names, then clone and pin per
-  // instance; i32 shapes are left as they are.
+  // Pin any `.map`/`.filter` callback lambda whose receiver param the elaboration types at a
+  // non-i32 element in this instance: the shared body's un-annotated lambda would otherwise
+  // emit as i32. i32 shapes are left as they are.
   const pElemNames: string[] = []
-  const pElemTypes: string[] = []
-  // The element row column, parallel to `pElemTypes`. `listElemNameOf` cuts the element
-  // out of the pin's spelling; this reads it off the pin's type, so the callback's pinned
-  // annotation is minted from a row. -1 where the pin is not a recorded array.
-  const pElemTys: i32[] = []
   let pe = 0
   while pe < params.length {
     const pep = nodeAt(params[pe])
@@ -9633,21 +9594,9 @@ function monoMakeInstanceBodyRewrite(
     } else {
       pElemNames.push("")
     }
-    pElemTypes.push(listElemNameOf(pinned[pe]))
-    let peTy = -1
-    if pinTys[pe] >= 0 {
-      const pet = tyAt(pinTys[pe])
-      if pet is TyArray { peTy = pet.aElem }
-    }
-    pElemTys.push(peTy)
     pe = pe + 1
   }
-  const instBody1 = monoPinMapLambdas(
-    instBody0L,
-    pElemNames,
-    pElemTypes,
-    pElemTys,
-  )
+  const instBody1 = monoPinMapLambdas(instBody0L, pElemNames)
   // Bake any non-capturing concrete callback into a direct call (`pElemNames` already
   // holds the per-position param names, parallel to `cbFnNames`). No baked callback → no
   // rewrite → the body is the same node `monoPinMapLambdas` produced.
@@ -10751,7 +10700,6 @@ function monoMakeInstanceGo(
       instBody0L,
       origFe,
       params,
-      pinned,
       pinTys,
       pinnedTyIx,
       cbFnNames,
@@ -12359,45 +12307,6 @@ function monoFlowReads(stmts: i32[]): i32 {
     monoFlowLetCalls(d)
     monoFlowConstCallArgs(d)
   }
-  // Shadow (architecture-target §3.4, B2): each planned binding's elaboration literal roots
-  // against the walkers', each value read as its literal or the generic it names.
-  if repShadowOn {
-    for d in lets {
-      const ev: i32[] = []
-      const eok = mfrLitsOf(d, ev)
-      const pair = [monoFlowDeclVals(d), ev]
-      const canon: i32[][] = [[], []]
-      let side = 0
-      while side < 2 {
-        for v in pair[side] {
-          const vn = nodeAt(v)
-          let c = v
-          if !(vn is ArrayLit || vn is ObjLit || monoFlowMapOwner(v) >= 0) {
-            const g = monoFlowLeafGen(v)
-            c = if g >= 0 { P.nodes.length + g } else { -1 }
-          }
-          if !i32ListHas(canon[side], c) { canon[side].push(c) }
-        }
-        side = side + 1
-      }
-      let o = "agree"
-      if canon[0].length == 0 && !eok {
-        o = "both-unknown"
-      } else if canon[0].length == 0 {
-        o = "elab-only"
-      } else if !eok {
-        o = "walker-only"
-      } else {
-        for x in canon[0] {
-          if !i32ListHas(canon[1], x) { o = "differ" }
-        }
-        for x in canon[1] {
-          if !i32ListHas(canon[0], x) { o = "differ" }
-        }
-      }
-      repABNote("mfrlits", o, if nodeAt(d) is Param { "param" } else { "let" })
-    }
-  }
   for d in lets { monoFlowMapNoteAliasWrites(d) }
   for a in mfrAnnLets { monoFlowAnnLits(a) }
   monoFlowAdmitChain(calls)
@@ -13343,116 +13252,45 @@ function monoFlowLoopVarVals(d: i32, out: i32[]): boolean {
   true
 }
 
-// The literals candidate binding `d` may hold, from its initializer and every whole `=` to it,
-// or that function `d` returns; empty when it may be anything else or depends on itself.
+// The elaboration's roots of binding or function `d` (`mfrLitsOf`): empty when unknown, or when
+// a root is no container and `d` reached a function other than through a map read. A `.slice()`
+// copy mono rewrote to a minted spread literal holds that literal in place of its receiver's roots.
 function monoFlowDeclVals(d: i32): i32[] {
   const st = mfrValsState[d] ?? 0
   if st == 2 { return mfrVals[d] ?? [] }
   if st != 0 { return [] }
-  mfrValsState[d] = 1
-  const out: i32[] = []
-  const ok = monoFlowRetVals(d, out)
-    || monoFlowLetVals(d, out)
-    || monoFlowParamVals(d, out)
-  if !ok {
-    mfrValsState[d] = 3
-    return []
+  mfrValsState[d] = 3
+  let ev: i32[] = []
+  if !mfrLitsOf(d, ev) { return [] }
+  const dn = nodeAt(d)
+  if dn is LetDecl {
+    const iv = unwrapParen(dn.letInit)
+    const il = if iv >= 0 { nodeAt(iv) } else { null }
+    if (
+      il is ArrayLit
+      && il.arrElems.length == 1
+      && il.arrElems[0] >= cwIxCoveredLen()
+    ) {
+      const sp = nodeAt(il.arrElems[0])
+      if sp is Spread {
+        const rv: i32[] = []
+        if !mfrLitsExprOf(sp.spdArg, rv) { return [] }
+        const kept: i32[] = [iv]
+        for v in ev {
+          if !i32ListHas(rv, v) && !i32ListHas(kept, v) { kept.push(v) }
+        }
+        ev = kept
+      }
+    }
   }
-  mfrVals[d] = out
+  for v in ev {
+    if !monoFlowIsLit(v) && monoFlowMapOwner(v) < 0 && mfrLitsDirectFn(d) {
+      return []
+    }
+  }
+  mfrVals[d] = ev
   mfrValsState[d] = 2
-  out
-}
-
-// Appends to `out` the literals binding `d` holds, from its initializer and every whole `=` to
-// it; false when `d` is no `let` or `const`, or any of them may be anything else.
-function monoFlowLetVals(d: i32, out: i32[]): boolean {
-  const dn = nodeAt(d)
-  if !(dn is LetDecl) || !monoFlowValsOf(dn.letInit, out) { return false }
-  for u in mfrUses[d] ?? [] {
-    const w = monoFlowWholeWrite(u)
-    if w >= 0 && !monoFlowValsOf(w, out) { return false }
-  }
-  true
-}
-
-// Appends to `out` the literals un-annotated parameter `d` holds, from the argument every call
-// of its function passes there and every whole `=` to it; false when the function is reached
-// other than by a direct positional call this pass sees, or any of them may be anything else.
-function monoFlowParamVals(d: i32, out: i32[]): boolean {
-  if !(nodeAt(d) is Param) { return false }
-  const fx = mfrParentOf(d)
-  if fx < 0 { return false }
-  const fn = nodeAt(fx)
-  if !(fn is FuncDecl) || fn.fnName == "" || monoNameIsExported(fn.fnName) {
-    return false
-  }
-  let k = 0 - 1
-  let i = 0
-  while i < fn.fnParams.length {
-    if fn.fnParams[i] == d { k = i }
-    i = i + 1
-  }
-  // A `self` first parameter admits a method spelling, whose callee is no name read.
-  const p0 = nodeAt(fn.fnParams[0])
-  if k < 0 || (p0 is Param && p0.parName == "self") { return false }
-  const calls = mfrUses[fx] ?? []
-  if calls.length == 0 { return false }
-  for u in calls {
-    const c = mfrParentOf(u)
-    if c < 0 { return false }
-    const cn = nodeAt(c)
-    if !(cn is Call) || cn.callFn != u || hasNamedArgs(cn.callArgNames) {
-      return false
-    }
-    if cn.callArgs.length != fn.fnParams.length { return false }
-    for a in cn.callArgs {
-      if nodeAt(a) is Spread { return false }
-    }
-    if !monoFlowValsOf(cn.callArgs[k], out) { return false }
-  }
-  for u in mfrUses[d] ?? [] {
-    const w = monoFlowWholeWrite(u)
-    if w >= 0 && !monoFlowValsOf(w, out) { return false }
-  }
-  true
-}
-
-// Appends to `out` the literals function `d` returns, when every `return` in its body, outside
-// nested functions, returns a list or record literal and its last statement is one of them or a
-// literal; false otherwise.
-function monoFlowRetVals(d: i32, out: i32[]): boolean {
-  const dn = nodeAt(d)
-  if !(dn is FuncDecl) { return false }
-  const body = dn.fnBody
-  if body < 0 { return false }
-  const b = nodeAt(body)
-  if !(b is Block) || b.blkStmts.length == 0 { return false }
-  const last = unwrapParen(b.blkStmts[b.blkStmts.length - 1])
-  if monoFlowIsLit(last) {
-    if !monoFlowValsOf(last, out) { return false }
-  } else if last < 0 || !(nodeAt(last) is RetStmt) {
-    return false
-  }
-  const stack: i32[] = [body]
-  while stack.length > 0 {
-    const x = stack.pop()
-    const xn = nodeAt(x)
-    if xn is RetStmt {
-      if xn.retArg < 0 { return false }
-      const a = unwrapParen(xn.retArg)
-      // A returned local list binding returns the literals it holds (D9763).
-      if monoFlowIsLit(a) {
-        if !monoFlowValsOf(a, out) { return false }
-      } else if !monoFlowRetLocalLists(d, a, out) {
-        return false
-      }
-    } else if !(xn is FuncDecl) {
-      for k in nodeChildren(x) {
-        if k >= 0 { stack.push(k) }
-      }
-    }
-  }
-  true
+  ev
 }
 
 // The outermost literal whose tree holds literal `v`, or the `Map()` a write stores that tree in.
@@ -15836,7 +15674,7 @@ function monoPinSlotRecords(d: LetDecl, at: i32, ctx: i32): i32 {
         k = k + 1
       }
       if sigs.length >= 2 && k < tys.length {
-        const bt = monoBundleRecordAt(bundleRecordTyOf(sigs), sigs, f.fiValue)
+        const bt = monoBundleRecordAt(bundleRecordTyOf(sigs), f.fiValue)
         if bt < 0 { return -1 }
         nodeTyRecord(unwrapParen(f.fiValue), bt)
         monoRetypeSlotReads(ctx, at, "f." + f.fiName, bt)
@@ -15866,7 +15704,7 @@ function monoPinSlotRecordList(
 ): i32 {
   const sigs = elabSlotFieldRecord(at, "[]")
   if sigs.length < 2 { return 0 }
-  const bt = monoBundleRecordAt(bundleRecordTyOf(sigs), sigs, lx)
+  const bt = monoBundleRecordAt(bundleRecordTyOf(sigs), lx)
   if bt < 0 { return -1 }
   const row = bundleRecordRowOfTy(bt)
   if row < 0 || row >= sNames.length { return 0 }
@@ -15886,7 +15724,7 @@ function monoPinSlotRecordMap(d: LetDecl, lx: i32, at: i32, ctx: i32): i32 {
   if sigs.length < 2 || ot < 0 || ot >= T.tys.length { return 0 }
   const om = tyAt(ot)
   if !(om is TyMap) { return 0 }
-  const bt = monoBundleRecordAt(bundleRecordTyOf(sigs), sigs, lx)
+  const bt = monoBundleRecordAt(bundleRecordTyOf(sigs), lx)
   if bt < 0 { return -1 }
   const mt = mkMapTy(om.mKey, bt, 0)
   const nm = monoPinAnnSpelling(mt)
@@ -21805,7 +21643,7 @@ function monoBundlePinArg(
   // A call returning a record at these signatures hands it whole (D15144).
   const ar = elabCallArgRecordSigs(monoCallTplOf(callIx), i)
   if ar.length > 0 && monoSigsSame(ar, sigs) {
-    if monoBundleRecordAt(bt, sigs, arg) < 0 { return -1 }
+    if monoBundleRecordAt(bt, arg) < 0 { return -1 }
     const brow = bundleRecordRowOfTy(bt)
     if brow < 0 || brow >= sNames.length { return -1 }
     pinned.push(sNames[brow])
@@ -21858,7 +21696,6 @@ function monoBundlePinArg(
       x,
     )
   }
-  bundleRecordNote(bt, sigs)
   pinned.push(sNames[row])
   pinTys.push(bt)
   0
@@ -21921,7 +21758,7 @@ function monoBundleNamedPin(
       )
     }
   }
-  if monoBundleRecordAt(bt, sigs, x) < 0 { return -1 }
+  if monoBundleRecordAt(bt, x) < 0 { return -1 }
   const row = bundleRecordRowOfTy(bt)
   if row < 0 || row >= sNames.length { return -1 }
   // The read stays the generic, so each signature instances it afresh.
@@ -21936,9 +21773,8 @@ function monoBundleNamedPin(
   0
 }
 
-// Registers `bt`, the bundle record of `sigs`, with its row and as a bundle type; `bt`, or -1 where
-// no row is minted for it.
-function monoBundleRecordAt(bt: i32, sigs: i32[], at: i32): i32 {
+// Gives bundle record `bt` its row; `bt`, or -1 where no row is minted for it.
+function monoBundleRecordAt(bt: i32, at: i32): i32 {
   monoClosedRecordOwnRow(bt)
   const row = bundleRecordRowOfTy(bt)
   if row < 0 || row >= sNames.length {
@@ -21948,7 +21784,6 @@ function monoBundleRecordAt(bt: i32, sigs: i32[], at: i32): i32 {
     )
     return -1
   }
-  bundleRecordNote(bt, sigs)
   bt
 }
 
@@ -21990,7 +21825,7 @@ function monoClosureBundlePin(
   const ft = elabCallArgRep(monoCallTplOf(callIx), -1, elabWalkTop(), i)
   const f = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
   if !(f is TyFunc) || f.fnParamTypes.length != 1 { return 1 }
-  if monoBundleRecordAt(f.fnParamTypes[0], sigs, arg) < 0 { return -1 }
+  if monoBundleRecordAt(f.fnParamTypes[0], arg) < 0 { return -1 }
   const tyOut: i32[] = [0 - 1]
   const an = monoFnPinAt(arg, ctx, ft, -1, tyOut)
   if an == "" {
