@@ -7,6 +7,11 @@ re-shadowed against what the elaboration answers now: `elabIdentityFnTy`, `elabV
 instrumented seed of master `30d4bfd2`, over the sweep population (23,610 programs, `vl build`
 each). Columns: agree / differ / mono only (no fact) / elaboration only.
 
+Re-run after merging slice 2b (`98f8879a`) over the 133 programs that reach `monoCoerceListCbArg`'s
+fallbacks or `monoLamParamPinAnn`'s pin: same counts. Argument-keyed instances add no reader for a
+list callback or a lambda parameter inside a body. `monoArgClosedTyIn` was not re-run: it is
+blocked on a rep fact, which slice 2b does not touch.
+
 ## `monoCoerceListCbArg`: callback half switched, function stays
 
 The 88 callback signatures mono derives (elaboration made no instance, 34 programs):
