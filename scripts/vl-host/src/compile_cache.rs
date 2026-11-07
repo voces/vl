@@ -52,7 +52,8 @@ const INERT: &[&str] = &[
 /// store would key a result on an observation. `VL_REP_SHADOW` prints a report the guest
 /// computes during the compile, so it is one too, as is `VL_CHECK_STATS` (read off the
 /// instances after a check). `VL_CHECK_KEEP_MODULES` writes files a hit would not write, and
-/// `VL_LATE_DEMANDS` prints the elaboration work the compile asked for after the run.
+/// `VL_LATE_DEMANDS` prints the elaboration work the compile asked for after the run, and
+/// `VL_ID_SHADOW` prints the identity shadow's rows (its mode 2 also moves the output).
 fn is_bypass(k: &str) -> bool {
     matches!(
         k,
@@ -65,6 +66,7 @@ fn is_bypass(k: &str) -> bool {
             | "VL_CHECK_STATS"
             | "VL_CHECK_KEEP_MODULES"
             | "VL_LATE_DEMANDS"
+            | "VL_ID_SHADOW"
     ) || k.starts_with("VL_PROFILE")
         || k.ends_with("_DUMP")
         || k.ends_with("_EXPLAIN")
