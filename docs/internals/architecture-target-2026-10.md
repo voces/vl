@@ -1987,8 +1987,8 @@ with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node t
 disagreement is a loud refusal. Two fact fixes came first: a non-generic slot member answers from
 its own signature (#6536), and a slot handed to an open function parameter declines (#6539); the
 refusal found the second on D10311, D10383, D10401 and D14400. Where the elaboration declines, an
-untagged map whose generic is called at two signatures, mono's one-signature spelling stays: it is
-a rep spelling, not a type, and waits on a holder bundle fact (D15494). Over 19,318 programs with
+untagged map whose generic is called at two signatures, mono's spelling stays: it is a rep
+spelling, not a type, and is the unbound default (D15494). Over 19,318 programs with
 fixpoint seeds no byte moves, and 4,601 filed witnesses grade as filed.
 
 **Slot type, record fields** (2026-11-06). `monoPinRecordField`'s 10 mono-only decisions were
@@ -2443,9 +2443,9 @@ and `bundleRecordOfSigs` are deleted; the readers ask `elabBundleRecordOf`. 25 r
 record before, where the elaboration holds a bundle mono never built, now find one; the byte sweep
 against master's fixpoint is 23,103 identical, so none of them reaches emitted code.
 
-**Open: D15494's two-signature maps have no fact.** A map whose generic is called at two types is
-annotated with one signature, a rep the elaboration does not record: a closure called at
-signatures S1..Sn, per holder node, the held form of the bundle above.
+**D15494 is no bundle.** Its two-signature maps hold uniform closure structs and each call site
+reaches its own closure signature; the map's `(i32) => i32` spelling is the unbound default, which
+slots no call reads take too. It belongs to the unbound-default family.
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
 instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
