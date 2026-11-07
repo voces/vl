@@ -1797,6 +1797,12 @@ Two of the 13 are residuals with a named blocker, not a missing admission:
   on master (a decline, not a refusal). Two different generics in one map of records join field-wise
   and run (D15493); written by `.set`, a record literal is not admitted, so that spelling refuses.
 
+The `r5_rt` rung itself is deleted. Re-measured after D15531 it fired 15 times over `tests/cases`
+(11 function-holding pins in D9480's fixture, G5's, the stored-through-parameter file and the `?.`
+decline; 4 `i32` pins of un-annotated helpers), and in every one `monoArgPinName` answers the same
+pin: without the rung every fixture and the compiler's own build are byte-identical, the corpus and
+the filed witnesses do not move. The residuals above stay where they are, served by that fallback.
+
 `monoHoleGenFnPin`'s flow sub-rung (`monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy`) pinned 33
 parameters on master: G1's 7, and 26 whose instance already agrees with the elaboration's. It is
 not deleted. It already reads the elaboration (`elabSlotDeliveries`), and switching it to the
@@ -2038,6 +2044,26 @@ types) join its grading list. The last two (`inRecord`: a written `let` of neste
 instance) need a nested member read from its instances under the key; that admits the fact but mints
 late demands for the lambdas, so it waits until the run foresees them. No byte moves over 19,318
 programs.
+
+**Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
+binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
+and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
+an instance clone's nodes postdate the write index, whose parent table traps on them. The shadow
+read 21 agree, 0 disagree and 156 mono-only. A capture cell `E[]` agrees with a value fact `E`, and
+mono's cell is kept (#6573).
+
+**Slot type, a named generic handed through a set** (2026-11-07). In `for f in fs { f(snd) }` the
+holder's member `apply2(g)` has an instance whose `g` holds `snd`'s identity, `((_, _) => _)`, and the
+pushed lambda `(g) => print(g("z", k))` is not top-level, so the holder declined. A call through a
+set now records the generic declaration an open argument names (`fnSetCallGenAt`). A member's open
+parameter closes to that generic's instance at the calls the member makes of it. A lambda member
+reads those calls under each instance key of the function holding it. The parameter must be read
+only as a callee and every call must agree, else it declines. The 8 list holders of D12940's
+family now agree with mono, with no byte moves over 19,318 programs. Not closed by this:
+`functions/exported-generic-reached-through-lambda-field-or-list-called.vl`, whose element returns
+the generic (`(() => ((T) => T))[]`), and the 2 holders of
+`closures/hole-fn-generic-pushed-list-spread.vl`. There the generic itself is the member, called
+at two types, so they go to the reach lane's bundle fact.
 
 **Slot deliveries, the reach rung deleted** (2026-11-06). `monoDeclPathPinsOrReach` and
 `monoStoredSlotFnTy` fell back to value reach (`vrCalleeTy`) where the elaboration's slot pins were
