@@ -8,6 +8,47 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **Maps of generic records and slot deliveries, rowintern (architecture-target §3.4):** eight PRs
+  make a map of records holding generic functions tag and run, and move the slot-delivery family's
+  decisions onto the elaboration; each code change is graded by a fixpoint byte sweep against
+  master, the corpus and the filed witnesses.
+  - *Map of records:* a record literal stamped into a held map is built at the binding's record row,
+    not a twin of its own (#6530); collectA interns a held map's record rep and mv slot, so a map
+    written only directly has one (D15532, #6538); a call's set-bound instance answers mono's held
+    pin, and late demands fall from 7 to 1 running program (#6544).
+  - *Writes through helpers:* a member written through a helper into a held map of its set has that
+    write as its leaf, the map twin of D14648 (D15531, #6549); a map slot's record joins each function
+    field with every function written there, which closes D15493 and D9440 (#6557); the `.set`
+    spelling is filed with its four layers (D15533, #6567).
+  - *Hole parameters:* `monoPinHoleParam`'s rung pinning at the argument's checked type is deleted;
+    it fired 15 times and the fallback answered each with the same pin (#6575). D15534 and D15535
+    are filed from its measurement.
+  - *Slot deliveries:* `monoStoredSlotFnTy`, `monoPinListElems` and `monoCoerceWrittenCell` take a
+    slot's type from the one type the elaboration delivers it at, and the written and `if`-bound
+    `let` calls no longer instance the seed at the call. Values agreeing on another result keep
+    theirs, so a write of the delivered type still refuses with the contract message rather than
+    trapping (D15353, D15190). `monoListSlotPinnedFnTy`, `monoPathSlotPinnedFnTy`, `monoHeldSrcsFnTy`,
+    `slotCallArgsInto` and `fnSlotCallArgsInto` go (#6589).
+- **Pin helpers onto elaboration facts, Fn#d (architecture-target §3.4):** twelve PRs move mono
+  decisions onto the elaboration or delete the guess they stood on, each graded by a shadow against
+  it, a byte sweep of the corpus against a master fixpoint, and the filed witnesses.
+  - *Slot facts:* a record slot in an instance closes from its instance, and a closed non-generic
+    member from its own signature (#6547); a program-level slot read takes its holder's closed fact
+    (#6550); a nested lambda's instances are read inside an instance without noting a hole pin, so no
+    late demand is minted (#6553).
+  - *Call parameters:* a seeded type parameter binds at a cloned call's template (D15495, #6560); an
+    un-annotated parameter's pin type is the elaboration's where it closes (#6565), and the
+    elaboration now answers first, a parameter the checker solved from its uses included, with loud
+    refusals where the rungs it replaced stood (#6585); `monoArgOpenValueTy` goes (#6587).
+  - *Bindings:* an open binding takes the elaboration's closed type, keyed by a walk of every body
+    because an instance clone's nodes postdate the write index (#6570), and a captured binding's cell
+    agrees with its value type (#6573); a named generic handed through a function set closes to the
+    instance its members' calls demand (#6576).
+  - *D23:* the pin cascade has no `i32` catch-all. A bare type variable or a list of one takes the
+    elaboration's unbound default, and anything else refuses at the pinning call, so three error
+    fixtures refuse earlier and D15040 moves from invalid wasm to a loud refusal (#6591).
+  - *Lambda signatures:* an annotated lambda parameter takes the elaboration's type, spelled
+    nominally; the rest of the family is recorded as gated on the holder fact (#6594).
 - **Pin helpers onto elaboration facts, lane F (architecture-target §3.4):** fifteen PRs move mono
   decisions onto the elaboration, each graded by a shadow against it, a byte sweep of the corpus
   against a master fixpoint, and the filed witnesses; `emit_mono` went from 1,040 to 1,000 functions
