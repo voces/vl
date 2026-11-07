@@ -45,14 +45,16 @@ import {
   elabCbArgSig,
   elabDeclFnOf,
   elabDeclIsValue,
+  elabFnDeclRetAt,
+  elabFnDeclRetAtUnder,
+  elabFnTyRetAt,
   elabInstNodeTy,
   elabKeySig,
   elabLamDeliveredParams,
   elabLamParamTy,
-  elabLitSlotCallRet,
-  elabLitSlotCallTys,
-  elabLitSlotClimbCalls,
+  elabLitSlotCallTy,
   elabNodeTy,
+  elabOpenFnArgDecl,
   elabReturnedClosedTy,
   elabSlotAnnRets,
   elabSlotDeliveries,
@@ -140,7 +142,6 @@ import {
   bindGenWalk,
   bindGenWalkFull,
   holeFnArgRetAtParams,
-  holeLamRetAt,
   nameToTy,
   substTyDeep,
   substTyDeepOf,
@@ -150,7 +151,6 @@ import { ovPickFor } from "./check_demands"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
 import {
   cwBindingWrittenValues,
-  cwFnValueDeclOf,
   cwIxBuild,
   cwIxCoveredLen,
   cwKeyOfDecl,
@@ -432,7 +432,6 @@ import {
   vrIndex,
   vrIndexed,
   vrInertFor,
-  vrLits,
   vrNoteGenericCand,
   vrReadsInert,
   vrResetFor,
@@ -704,7 +703,6 @@ import {
   elabParamTyOwnAt,
   elabParamsMention,
   elabPinIsBundleOf,
-  elabResultAtParams,
   elabRetOf,
   elabRetParamOf,
   elabSigTyClosed,
@@ -14428,12 +14426,12 @@ function monoValueRetAt(v: i32, qs: i32[], depth: i32): i32 {
   if x < 0 || x >= P.nodes.length || depth > MONO_ALIAS_CHAIN_MAX { return -1 }
   const n = nodeAt(x)
   if !(n is IfStmt) {
-    const lx = monoOpenFnArgDecl(x)
-    if lx >= 0 { return monoFnDeclRetAt(lx, qs) }
+    const lx = elabOpenFnArgDecl(x)
+    if lx >= 0 { return elabFnDeclRetAt(monoLamTypedTemplate(lx), qs) }
     // A re-pointed `let` of un-annotated functions gives the result they all agree on (D9001).
     const hr = holeFnArgRetAtParams(x, qs)
     if hr >= 0 { return hr }
-    return monoFnTyRetAt(nodeTyIxOf(x), qs)
+    return elabFnTyRetAt(nodeTyIxOf(x), qs)
   }
   if n.ifElse < 0 { return -1 }
   let r = -1
@@ -16257,54 +16255,6 @@ function monoInertReach(stmts: i32[]) {
   monoReachIndex(roots)
 }
 
-// Records, at each call reaching a list or record literal's open function element or field, the
-// one call type the slot is called at (`monoReachSlotTy`) (D7103). The literal's own type is the
-// elaboration's.
-function monoReachLitTys() {
-  for a in vrLits {
-    const at = nodeTyIxOf(a)
-    const t = if at >= 0 && at < T.tys.length { tyAt(at) } else { null }
-    if t is TyArray && !monoIsBundleTy(t.aElem) {
-      monoReachSlotTy(a, t.aElem, "e")
-    } else if t is TyObj {
-      let i = 0
-      while i < t.objFieldTypes.length {
-        const ft = t.objFieldTypes[i]
-        if !monoIsBundleTy(ft) {
-          monoReachSlotTy(a, ft, "f." + t.objFieldNames[i])
-        }
-        i = i + 1
-      }
-    }
-  }
-  0
-}
-
-// The call type slot `step` (`e`, `f.<name>`) of literal `a`, of open function type `st`, is
-// pinned at, recorded on each reached callee still open; -1 for a tagged set or no one call type.
-// The climb's agreed tuple (`elabLitSlotCallTys`) answers.
-function monoReachSlotTy(a: i32, st: i32, step: string): i32 {
-  if st < 0 || st >= T.tys.length || !(tyAt(st) is TyFunc) { return -1 }
-  if fnTagTyIsTagged(st) { return -1 }
-  if !tyHasTyVar(st) { return -1 }
-  const ct = monoLitSlotCallTy(a, step, 0)
-  if ct < 0 { return -1 }
-  const qs: i32[] = []
-  const calls: i32[] = []
-  elabLitSlotClimbCalls(a, step, qs, calls)
-  for c in calls {
-    if c < 0 || c >= P.nodes.length { continue }
-    const cn = nodeAt(c)
-    if cn is Call {
-      const ft = nodeTyIxOf(cn.callFn)
-      if ft >= 0 && (tyHasTyVar(ft) || tyReachesHole(ft, 16)) {
-        nodeTyRecord(cn.callFn, ct)
-      }
-    }
-  }
-  ct
-}
-
 // Adds to `monoInertReach`'s index the subtrees under `roots` not yet in it, such as an
 // instance's body the walk is about to enter, and notes which of their reads name a generic
 // function, for `vrValueInert` (D6930).
@@ -17390,7 +17340,7 @@ function monoPinnedRetAnnTy(x: i32, c: Call): i32 {
     if r >= 0 && !(nodeAt(r) is RetStmt) {
       const rx = monoRetListLitOf(r)
       if rx < 0 { return -1 }
-      const st = monoLitSlotCallTy(rx, "e", 0)
+      const st = elabLitSlotCallTy(rx, "e", 0)
       let lt = if st >= 0 { mkArrayTy(st) } else { -1 }
       let et = nodeTyIxOf(rx)
       while et >= 0 && et < T.tys.length && tyAt(et) is TyArray {
@@ -17403,47 +17353,6 @@ function monoPinnedRetAnnTy(x: i32, c: Call): i32 {
     }
   }
   t
-}
-
-// The type the values in slot `step` of literal `a` close at from the calls they reach: for list
-// literal rows, the list of their own element type, which must agree; for functions, the one type
-// they take at the argument tuple every reached call agrees on (`elabLitSlotCallTys`), each result
-// read at those parameters; -1 where calls or results disagree or one has no such result.
-function monoLitSlotCallTy(a: i32, step: string, depth: i32): i32 {
-  const n = nodeAt(a)
-  if step == "e" && n is ArrayLit && n.arrElems.length > 0 && depth <= 6 {
-    let rows = true
-    for e in n.arrElems {
-      if !(nodeAt(unwrapParen(e)) is ArrayLit) { rows = false }
-    }
-    if rows {
-      let it = -1
-      for e in n.arrElems {
-        const et = monoLitSlotCallTy(unwrapParen(e), "e", depth + 1)
-        if et < 0 || (it >= 0 && !tyEq(it, et)) { return -1 }
-        it = et
-      }
-      return mkArrayTy(it)
-    }
-  }
-  const qs: i32[] = []
-  const vals: i32[] = []
-  if !elabLitSlotCallTys(a, step, qs, vals) { return -1 }
-  let ft = -1
-  let vi = 0
-  for v in vals {
-    const ex = monoOpenFnArgDecl(v)
-    let r = if ex >= 0 { monoFnDeclRetAt(ex, qs) } else { monoFnTyRetAt(nodeTyIxOf(v), qs) }
-    if r < 0 && ex >= 0 { r = elabResultAtParams(ex, qs) }
-    // A result still open takes the one closed type the value's calls agree on.
-    if r < 0 || tyHasTyVar(r) { r = elabLitSlotCallRet(vi) }
-    vi = vi + 1
-    if r < 0 { return -1 }
-    const et = mkFuncTy(qs, r)
-    if ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft) { return -1 }
-    ft = et
-  }
-  ft
 }
 
 // A stored call `ix` of an un-annotated function whose open type holds a function records its
@@ -17812,7 +17721,7 @@ let monoElemTakenSig: {[i32]: string} = Map()
 
 // The declaration of the function element `el` names in frame `ctx`: the generic itself when an
 // earlier call through the same join already instanced the element (D7842), else
-// `monoOpenFnArgDecl`'s.
+// `elabOpenFnArgDecl`'s.
 function monoElemFnDecl(el: i32, ctx: i32): i32 {
   const x = unwrapParen(el)
   if x >= 0 && x < P.nodes.length {
@@ -17827,7 +17736,7 @@ function monoElemFnDecl(el: i32, ctx: i32): i32 {
       }
     }
   }
-  monoOpenFnArgDecl(el)
+  elabOpenFnArgDecl(el)
 }
 
 // The closed parameter types the named function `el` takes called with `args` at instance `ctx`,
@@ -17884,7 +17793,7 @@ function monoElemParamTys(
         // Every function a parameter can hold is taken at the one instance the pins give.
         let one = true
         for ax in axs {
-          const r = monoFnDeclRetAt(ax, qs)
+          const r = elabFnDeclRetAt(monoLamTypedTemplate(ax), qs)
           const at = if r >= 0 { mkFuncTy(qs, r) } else { -1 }
           if at < 0 || (pt >= 0 && sigKeyOfTy(at) != sigKeyOfTy(pt)) {
             one = false
@@ -18042,7 +17951,7 @@ function monoOneInstHoleBinds(bNames: string[], bTys: i32[]): i32 {
 // parameter: what an un-annotated parameter holds, or the generic or hole lambda it names; empty
 // for a value argument.
 function monoElemArgFns(a: i32, ctx: i32): i32[] {
-  if monoElemArgNamesFn(a, ctx) { return [monoOpenFnArgDecl(a)] }
+  if monoElemArgNamesFn(a, ctx) { return [elabOpenFnArgDecl(a)] }
   []
 }
 
@@ -18153,7 +18062,7 @@ function monoIsHoleLamArg(a: i32): boolean {
   d >= 0
     && d < P.nodes.length
     && nodeAt(d) is LetDecl
-    && monoOpenFnArgDecl(x) >= 0
+    && elabOpenFnArgDecl(x) >= 0
 }
 
 // The refusal for a call `monoGenArgAtOpenParam` names, at node `ix` (D3956, D7183).
@@ -19120,7 +19029,7 @@ function monoPinOpenCallLams(d: i32, bt: i32) {
       nm != ""
       && ax >= 0
       && nodeAt(ax) is Ident
-      && monoOpenFnArgDecl(ax) >= 0
+      && elabOpenFnArgDecl(ax) >= 0
     ) {
       monoCoerceFnValueName(ax, nm, fn0, bf.fnParamTypes[j])
     } else if nm != "" {
@@ -19165,15 +19074,6 @@ function monoHoleGenFnFlowDecl(argIx: i32, ctx: i32): i32[] {
   out
 }
 
-// The closed result of function declaration `lx` called at the closed parameter types `qs`: its
-// body's result for an un-annotated return, its declared return under the parameters' binding
-// otherwise; -1 when either stays open.
-function monoFnDeclRetAt(lx: i32, qs: i32[]): i32 {
-  const noN: string[] = []
-  const noT: i32[] = []
-  monoFnDeclRetAtUnder(lx, qs, noN, noT)
-}
-
 // The lambda an instance cloned as `lx` at a type still open, which carries no type of its own;
 // `lx` itself otherwise.
 function monoLamTypedTemplate(lx: i32): i32 {
@@ -19181,74 +19081,20 @@ function monoLamTypedTemplate(lx: i32): i32 {
   monoLamCloneTmpl.get(lx) ?? lx
 }
 
-// `monoFnDeclRetAt` with the enclosing holes `bN` bound to `bT`.
+// `elabFnDeclRetAtUnder` of the lambda `lx0` an instance cloned, read at its template.
 function monoFnDeclRetAtUnder(
   lx0: i32,
   qs: i32[],
   bN: string[],
   bT: i32[],
 ): i32 {
-  const lx = monoLamTypedTemplate(lx0)
-  const r = holeLamRetAt(lx, mkFuncTy(qs, i32TyIx()), bN, bT)
-  if r >= 0 { return r }
-  const dr = monoFnTyRetAt(nodeTyIxOf(lx), qs)
-  if dr >= 0 { return dr }
-  // A tagged set argument is called member by member, so the instance the elaboration
-  // checked at it answers, whatever the enclosing holes are bound to.
-  for q in qs {
-    if fnTagTyIsTagged(q) { return elabResultAtParams(lx, qs) }
-  }
-  -1
-}
-
-// The closed result of function type `lt` called at the closed parameter types `qs`, its
-// declared result under the parameters' binding; -1 when it stays open or `lt` is no function.
-function monoFnTyRetAt(lt: i32, qs: i32[]): i32 {
-  if lt < 0 || lt >= T.tys.length { return -1 }
-  const lf = tyAt(lt)
-  if !(lf is TyFunc) || lf.fnParamTypes.length != qs.length || lf.fnRet < 0 {
-    return -1
-  }
-  const hN: string[] = []
-  const hT: i32[] = []
-  let k = 0
-  while k < qs.length {
-    bindGenWalk(lf.fnParamTypes[k], qs[k], hN, hT)
-    k = k + 1
-  }
-  const dr = substTyDeep(lf.fnRet, hN, hT)
-  if dr < 0 || tyHasTyVar(dr) { return -1 }
-  dr
-}
-
-// The function declaration an open function argument `a` names: an un-annotated lambda, or an
-// identifier naming a hole function, or a `const` or once-bound `let` holding one; -1 for anything
-// else.
-function monoOpenFnArgDecl(a: i32): i32 {
-  let x = unwrapParen(a)
-  let hops = 0
-  while x >= 0 && x < P.nodes.length && hops <= MONO_ALIAS_CHAIN_MAX {
-    const n = nodeAt(x)
-    if n is FuncDecl { return x }
-    if !(n is Ident) { return -1 }
-    const d = identDeclOf(x)
-    if d < 0 || d >= P.nodes.length { return -1 }
-    const dn = nodeAt(d)
-    if dn is FuncDecl { return d }
-    if !(dn is LetDecl) { return -1 }
-    // A `let` bound once and never re-pointed holds its initialiser; a `const` alias of
-    // another name is followed to what that name holds (D8981).
-    if dn.letKw != "const" { return cwFnValueDeclOf(x) }
-    x = unwrapParen(dn.letInit)
-    hops = hops + 1
-  }
-  -1
+  elabFnDeclRetAtUnder(monoLamTypedTemplate(lx0), qs, bN, bT)
 }
 
 // Whether argument `a` names an un-annotated function value whose type still holds a hole.
 function monoArgIsOpenFnValue(a: i32): boolean {
   const x = unwrapParen(a)
-  if x < 0 || !(nodeAt(x) is Ident) || monoOpenFnArgDecl(x) < 0 { return false }
+  if x < 0 || !(nodeAt(x) is Ident) || elabOpenFnArgDecl(x) < 0 { return false }
   tyHasTyVar(nodeTyIxOf(x))
 }
 
@@ -25636,7 +25482,6 @@ export function monomorphize(stmts: i32[]) {
     }
     fe3 = fe3 + 1
   }
-  monoReachLitTys()
   const prc = monoPruneTemplates(nDecl)
   if prc < 0 { return prc }
   // Each un-annotated binding the walk left open takes the closed type the elaboration or its
