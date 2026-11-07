@@ -1,0 +1,173 @@
+--- a/compiler/emit_elab.vl
++++ b/compiler/emit_elab.vl
+@@ -1579,6 +1579,26 @@
+ // How many keys the elaboration minted after `elabRun` returned, and the name of the `i`th.
+ export function elabLateCount(): i32 { elabLateNames.length }
+ 
++// fn-fact-shadow probe (scripts/fn-fact-shadow): a line printed by `$VL_LATE_DEMANDS=1`.
++export function elabShadowNote(s: string): i32 {
++  elabLateNames.push(s)
++  0
++}
++
++// The number of late names the last `elabShadowFnFact` added.
++export let elabShadowLate = 0
++
++// Which rule of `elabHeldValTy` answered last.
++export let elabHeldValRule = ""
++
++export function elabShadowFnFact(x: i32, fnIx: i32): i32 {
++  const n0 = elabLateNames.length
++  elabHeldValRule = "-"
++  const t = elabHeldValTy(x, fnIx)
++  elabShadowLate = elabLateNames.length - n0
++  t
++}
++
+ export function elabLateLen(i: i32): i32 { elabLateNames[i].length }
+ 
+ export function elabLateAt(i: i32, j: i32): i32 { elabLateNames[i][j] }
+@@ -15244,19 +15264,28 @@
+   if x < 0 || x >= P.nodes.length { return -1 }
+   const id = elabIdentityTy(x, fnIx)
+   if id < 0 || id >= T.tys.length { return -1 }
+-  if elabTyClosed(id, 0) && !tyHasTyVar(id) { return id }
++  if elabTyClosed(id, 0) && !tyHasTyVar(id) {
++    elabHeldValRule = "identity"
++    return id
++  }
+   const path: string[] = []
+   const onRet = fnIx >= 0 && elabRetPathOf(x, fnIx, path)
+   if onRet {
+     const st = elabSlotTyAt(fnIx, path, fnIx)
+-    if st >= 0 { return st }
++    if st >= 0 {
++      elabHeldValRule = "retslot"
++      return st
++    }
+   }
+   const xn = nodeAt(x)
+   if xn is Call {
+     const cf = xn.callFn
+     const cd = if cf >= 0 && cf < P.nodes.length && nodeAt(cf) is Ident { identFnDeclOf(cf) } else { -1 }
+     const ct = if cd >= 0 { elabSlotTyAt(cd, [], -1) } else { -1 }
+-    if ct >= 0 { return ct }
++    if ct >= 0 {
++      elabHeldValRule = "calleeslot"
++      return ct
++    }
+     return -1
+   }
+   const k = if fnIx >= 0 { elabKeyAt(fnIx) } else { -1 }
+@@ -15264,15 +15293,23 @@
+   // A value no instance reaches is built at the one closed type every call of `fnIx` delivers it to.
+   if k == -1 && onRet {
+     const dt = elabTyAtPath(elabRetDstTy(fnIx), path)
+-    if dt >= 0 && elabTyClosed(dt, 0) && !tyHasTyVar(dt) { return dt }
++    if dt >= 0 && elabTyClosed(dt, 0) && !tyHasTyVar(dt) {
++      elabHeldValRule = "calldst"
++      return dt
++    }
+   }
+   const none: string[] = []
+   let t = elabHeldClosedTyAt(id, [x], 0, -1, none, k)
++  elabHeldValRule = "heldset"
+   // An instance whose functions are instanced outside it reads them at the program's instances.
+   if (t < 0 || tyHasTyVar(t)) && k >= 0 {
+     t = elabHeldClosedTyAt(id, [x], 0, -1, none, -1)
++    elabHeldValRule = "heldsetprog"
++  }
++  if (t < 0 || tyHasTyVar(t)) && k >= 0 {
++    t = elabHeldIdTy(x, fnIx, 0)
++    elabHeldValRule = "leafid"
+   }
+-  if (t < 0 || tyHasTyVar(t)) && k >= 0 { t = elabHeldIdTy(x, fnIx, 0) }
+   if t < 0 || tyHasTyVar(t) { -1 } else { t }
+ }
+ 
+--- a/compiler/emit_mono.vl
++++ b/compiler/emit_mono.vl
+@@ -1,5 +1,6 @@
+ import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
+ import { recEnclosingFn } from "./check_fit_rules"
++import { nodeLineOf } from "./check_capture_loss"
+ import {
+   mfrChainFns,
+   mfrElabNames,
+@@ -676,6 +677,10 @@
+   elabHoleGenFlowTy,
+   elabHoleMapClosed,
+   elabIdentityTy,
++  elabShadowNote,
++  elabShadowFnFact,
++  elabShadowLate,
++  elabHeldValRule,
+   elabInstSlotAt,
+   elabInstSpelling,
+   elabInstTyAt,
+@@ -14808,12 +14813,32 @@
+ // Types the record literal `rx` an un-annotated function returns in frame `ctx` at the closed
+ // types of the bindings its open fields read, nested record literals included, so the inferred
+ // result is that record and not the checker's open one (D9181).
++let ffTop = false
++
++function ffTs(t: i32): string {
++  if t < 0 || t >= T.tys.length { return "-" }
++  tyToStr(t)
++}
++
++// fn-fact-shadow probe: one line per decision, mono's closed type `mono` (-1 for none) for value
++// `x` in frame `ctx` against `elabHeldValTy`'s (scripts/fn-fact-shadow/README.md).
++function ffNote(tag: string, x: i32, ctx: i32, mono: i32) {
++  const e = elabShadowFnFact(x, ctx)
++  const id = elabIdentityTy(x, ctx)
++  const c = if mono < 0 && e < 0 { "none" } else if mono < 0 && id >= 0 && tySame(e, id) { "closed" } else if mono < 0 { "new-only" } else if e < 0 { "old-only" } else if tySame(mono, e) { "agree" } else { "differ" }
++  elabShadowNote(
++    "@@FF " + tag + " " + c + " L" + i32ToStr(nodeLineOf(x)) + " gen=" + (if monoFrameIsGenericInstance(ctx) { "1" } else { "0" }) + " late=" + i32ToStr(elabShadowLate) + " rule=" + elabHeldValRule + " m=" + ffTs(mono) + " e=" + ffTs(e) + " id=" + ffTs(id),
++  )
++  0
++}
++
+ function monoPinReturnedObj(rx: i32, ctx: i32) {
+   if rx < 0 { return 0 }
+   const lx = unwrapParen(rx)
+   if lx < 0 || !(nodeAt(lx) is ObjLit) || monoFrameIsGenericInstance(ctx) {
+     return 0
+   }
++  ffTop = true
+   monoClosedObjLitTy(lx, ctx, true)
+   0
+ }
+@@ -14857,6 +14882,16 @@
+ // The type record literal `lx` in frame `ctx` takes from the closed bindings its open fields read,
+ // nested literals included, recorded on it (and on them) when `rec`; -1 when no field reads one.
+ function monoClosedObjLitTy(lx: i32, ctx: i32, rec: boolean): i32 {
++  const top = ffTop
++  ffTop = false
++  const r = monoClosedObjLitTy0(lx, ctx, rec)
++  if nodeAt(lx) is ObjLit {
++    ffNote(if top { "retobj" } else { "objlit" }, lx, ctx, r)
++  }
++  r
++}
++
++function monoClosedObjLitTy0(lx: i32, ctx: i32, rec: boolean): i32 {
+   const lit = nodeAt(lx)
+   if !(lit is ObjLit) { return -1 }
+   const ot = nodeTyIxOf(lx)
+@@ -17459,6 +17494,7 @@
+   if !monoTyOpen(t0) || !tyMayHoldFn(t0, 0) { return 0 }
+   if !(nodeAt(ix) is Call) || monoRetSlotsSplit(ix) { return 0 }
+   const t = monoPinnedAnnTyAt(ix, 0)
++  ffNote("retcall", ix, ctx, if t >= 0 && !monoTyOpen(t) { t } else { -1 })
+   if t >= 0 && !monoTyOpen(t) { monoRecordOpen(ix, t, ctx) }
+   0
+ }
+@@ -24408,6 +24444,7 @@
+   if !(l is ArrayLit) || !monoTyOpen(nodeTyIxOf(x)) { return -1 }
+   const lits: i32[] = [x]
+   const et = monoRetLitElemTy(x, lits, ["e"], ctx, 0)
++  ffNote(if et == -2 { "retlistR" } else { "retlist" }, x, ctx, if et >= 0 { mkArrayTy(et) } else { -1 })
+   if et < 0 { return et }
+   monoRecordInstOpen(x, mkArrayTy(et), ctx)
+   et
