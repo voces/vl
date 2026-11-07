@@ -2892,6 +2892,16 @@ programs, counted by program).
     prerequisite (A), identity typing for concrete function values.
   - **23 sites are open on one side only.** In 11 the identity is concrete and mono is open
     (`{f: (i32) => i32}` against `{f: (T) => T}`). In 12 it is the other way round.
+- **Switched: an instance's parameter maps come from the elaboration, and the shared-pin poison is
+  deleted.** `instancePinnedMaps` reads each parameter's type as the instance's elaboration closes
+  it, and falls back to the pin its call supplied only where the elaboration leaves it open.
+  `monoPoisonSharedPins` had marked a parameter `-2` when a second call reached the same instance
+  with another map. Over 23,384 programs, the two readers of those maps (the niche test and the
+  soft-twin test) decide the same from either source wherever the elaboration answers: 116 sites,
+  0 differ. No decision read the mark. The one shape that reached it, a literal-union map and its
+  plain twin through one instance, is still refused, and now by the soft-twin test whose message
+  names the fix. Both call orders are fixtures (`error-literal-union-map-twin-through-one-instance*`).
+  Over 19,316 programs no byte moves.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
