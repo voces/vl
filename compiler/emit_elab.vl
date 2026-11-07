@@ -13,7 +13,7 @@ import { identFnDeclOf, tyParamIsBareOnly } from "./check_scopes"
 import {
   elabHoleRowCut,
   elabHoleRowMark,
-  fnSlotCalled,
+  fnSlotThroughCalls,
   fnTagCallSetOf,
   fnTagCalls,
 } from "./check_elab_cap"
@@ -10552,7 +10552,7 @@ function elabHeldClosedTyAt(
       }
       const closed: i32[] = []
       for v in vals {
-        if !elabHeldValFns(parenPeelIx(v), ds, closed) { return -1 }
+        if !elabHeldValFns(parenPeelIx(v), ds, closed, k >= 0) { return -1 }
       }
       if ds.length == 0 && closed.length > 0 {
         return elabHeldClosedAgree(closed[0], closed)
@@ -10637,7 +10637,12 @@ function elabHeldClosedTyAt(
 // Adds the functions stored value `x` holds to `ds`: a declaration, or one a name reads; any other
 // value at its own checked type, a closed function type pushed onto `closed`, an open one adding
 // the top-level functions its set names. False where `x` has neither, or its set a lambda.
-function elabHeldValFns(x: i32, ds: i32[], closed: i32[]): boolean {
+function elabHeldValFns(
+  x: i32,
+  ds: i32[],
+  closed: i32[],
+  inst: boolean,
+): boolean {
   const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
   let d = -1
   if xn is FuncDecl { d = x }
@@ -10654,7 +10659,8 @@ function elabHeldValFns(x: i32, ds: i32[], closed: i32[]): boolean {
   }
   const ms = elabFnSetOf(vt)
   for m in ms {
-    if !elabTopFn(m) { return false }
+    // In an instance a nested member is read from the instances already enumerated under it.
+    if !inst && !elabTopFn(m) { return false }
     if !i32ListHas(ds, m) { ds.push(m) }
   }
   ms.length > 0
@@ -10841,7 +10847,10 @@ function elabHeldFnTyIn(ds: i32[], holder: i32, path: string[], k: i32): i32 {
     let ds1 = -1
     for kd in elabKidsAt(d, k) {
       if !(elabGuessKeys.get(kd) ?? false) {
+        // A read: substituting a nested member's type under its key notes no hole pin.
+        const held = holePinHeldSet(true)
         const st = elabSubstClosed(nodeTyIxOf(d), kd)
+        holePinHeldSet(held)
         const so = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
         if (
           so is TyFunc
@@ -11000,7 +11009,7 @@ function elabSlotFromSources(d: i32, t: i32): i32 {
   const ds: i32[] = []
   const closed: i32[] = []
   for v in own {
-    if !elabHeldValFns(parenPeelIx(v), ds, closed) { return -1 }
+    if !elabHeldValFns(parenPeelIx(v), ds, closed, false) { return -1 }
   }
   const r = if ds.length > 0 { elabHeldAtArgs(ds, ef.fnParamTypes) } else { et }
   if elabHeldClosedAgree(r, closed) < 0 || !tySame(r, et) { return -1 }
@@ -13422,14 +13431,28 @@ export function elabDeclFnOf(d: i32): i32 {
 // carries, no closed delivery, and none of the functions it holds escapes to a call the program
 // does not declare (architecture-target §3.3).
 export function elabSlotUncalled(d: i32, path: string[]): boolean {
-  if d < 0 || fnSlotCalled(d, path) || elabSlotSetCalls(d, path).length > 0 {
-    return false
+  if d < 0 { return false }
+  for c in fnSlotThroughCalls(d, path) {
+    if !elabCallNamesOne(c) { return false }
+  }
+  for c in elabSlotSetCalls(d, path) {
+    if !elabCallNamesOne(c) { return false }
   }
   if elabSlotDeliveries(d, path, -1).length > 0 { return false }
   for f in elabSlotHeldFns(d, path) {
     if fnEscapes(f) { return false }
   }
   true
+}
+
+// Whether call `c` reaches one function whatever its slot holds: its callee names a function, or is
+// a const element read naming one.
+function elabCallNamesOne(c: i32): boolean {
+  if c < 0 || c >= P.nodes.length { return false }
+  const n = nodeAt(c)
+  if !(n is Call) { return false }
+  if constListFnElemDecl(n.callFn) >= 0 { return true }
+  identFnDeclOf(parenPeelIx(n.callFn)) >= 0
 }
 
 // The type slot `path` of binding declaration `d`, which nothing calls, holds its functions at:
