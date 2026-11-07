@@ -8,10 +8,10 @@ Population: the 23,450 programs, `$VL_ID_SHADOW=1`.
 
 ## Consumer 2: the (S1) map, from a key to mono's instance
 
-`monoSpecSlotOf` maps each argument-keyed instance key (`elabSpecInst`) to the slot of mono's
-instance for it. The slot is recorded at each keyed decision, where `elabSpecMonoGroup` records the
-same pair. At a keyed decision whose key already has a slot, the registry reuses it through the map
-(`monoSpecRegOf`), in both paths: `monoSpecializeConcrete` and `monoMakeInstanceGo`. Mono's
+The map sits on the elaboration's spec-group rows. `elabSpecMonoSlot` records the slot of mono's
+instance at each decision, beside `elabSpecMonoGroup`. `elabSpecSlotOfKey(k)` answers the slot for
+argument-keyed instance `k` (`elabSpecInst`). At a keyed decision whose key already has a slot, the
+registry reuses that slot, in both paths: `monoSpecializeConcrete` and `monoMakeInstanceGo`. Mono's
 `@name` string key still serves the declined decisions and every other instance.
 
 | at a keyed decision | decisions |
@@ -25,7 +25,7 @@ same pair. At a keyed decision whose key already has a slot, the registry reuses
 to mono's instance slot. Measured, that never happens at a keyed bake: at all 1,175 rewritten calls,
 `monoFnDeclNamed(cbFnNames[p])` is the declaration the key names for `p` (`elabSpecDeclsOf`).
 A generic callback is declined as `open`, so it never has a key. The keyed bake now takes
-`identFromDecl` from the key (`monoSpecDeclOf`). Mono's name path runs only at unkeyed bakes.
+`identFromDecl` from the key (`elabSpecDeclFor`). Mono's name path runs only at unkeyed bakes.
 
 **Not dead:** `monoInstDeclOf` and `monoFnDeclNamed`. Five other sites still resolve minted names
 through them: the unkeyed bake, the alias-init rename, two operator and push callees, and the
@@ -35,7 +35,7 @@ lambda-by-name call.
 
 - **`monoHoleBinding`** runs where the call key does not bind the instance. That is every keyed
   decision, since a baked callback is a function-holding parameter. At a keyed decision,
-  `monoHoleBindingAt` now binds each hole parameter to its type in the key's base instance
+  `elabSpecHoleBind` now binds each hole parameter to its type in the key's base instance
   (`elabSpecBindOf`). Shadow: 1,036 hole names all `same`, and 1,265 of 1,265 keyed builds give the
   same whole binding list (names, order and types). It falls back to mono's derivation only where
   the base leaves a hole unbound or the hole is not a bare type variable. Neither case occurred.
@@ -50,4 +50,5 @@ callback-specialized.
 
 Fixpoint seeds on both sides. Base: master `fa202cbb` (#6726 merged). `scripts/sweep.vl` diff:
 23,613 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new traps. The switch is
-byte-identical on every program. Seed: 6,473,613 → 6,475,981 bytes (+2,368, +0.04%).
+byte-identical on every program. Seed: 6,473,613 → 6,476,019 bytes (+2,406, +0.04%). The pin-helper budget holds at 931: the new
+facts are elaboration functions, and mono's two lookups are inlined.
