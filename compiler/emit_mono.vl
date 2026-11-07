@@ -4263,7 +4263,7 @@ function monoCloneLambdaSubst(
     const nbodyL = monoPinBodyLambdas(nbodyF, typarams, tvN, tvV, bN, bT)
     // A generic call in the body is instantiated by rewriting its callee in place, so each
     // clone takes its own copy, as an instance body does (D2553).
-    const nbody = monoLamCloneGenericCalls(nbodyL, typarams, tvN, tvV, bN, bT)
+    const nbody = monoLamCloneGenericCalls(nbodyL, typarams, tvN, tvV)
     // The lambda twin of the named clone's rule: a bare `return` in the body is void, so the
     // return-expression pin above must not give this instance a result (D1600).
     let cloneRet = nret
@@ -4281,15 +4281,13 @@ function monoCloneLambdaSubst(
 }
 
 // `monoCloneLambdaSubst`'s body step: copies the direct generic calls in `nbodyL` for this
-// instance (`typarams`/`tvN`/`tvV`, binding `bN`/`bT`), then restores the enclosing copy's
+// instance (`typarams`/`tvN`/`tvV`), then restores the enclosing copy's
 // state. Returns the copied body, or `nbodyL` when it makes no generic call.
 function monoLamCloneGenericCalls(
   nbodyL: i32,
   typarams: string[],
   tvN: string[],
   tvV: string[],
-  bN: string[],
-  bT: i32[],
 ) {
   const svCgcP = monoCgcTyParams
   const svCgcN = monoCgcTvN
@@ -4297,13 +4295,7 @@ function monoLamCloneGenericCalls(
   monoCgcTyParams = typarams
   monoCgcTvN = tvN
   monoCgcTvV = tvV
-  const svCgcBN = monoCgcBN
-  const svCgcBT = monoCgcBT
-  monoCgcBN = bN
-  monoCgcBT = bT
   const nbody = monoCloneGenericCalls(nbodyL)
-  monoCgcBN = svCgcBN
-  monoCgcBT = svCgcBT
   monoCgcTyParams = svCgcP
   monoCgcTvN = svCgcN
   monoCgcTvV = svCgcV
@@ -5902,9 +5894,6 @@ export function monoIsClashLit(ix: i32): boolean {
 }
 // The instance's exact bindings when it is keyed by its exact pins, so a type argument naming a
 // type parameter records the exact pinned type rather than its spelling; empty otherwise.
-// The instance's type-parameter bindings as arena types, read by the D2816 clash rung.
-let monoCgcBN: string[] = []
-let monoCgcBT: i32[] = []
 let monoCgcSubN: string[] = []
 let monoCgcSubT: i32[] = []
 // The lambda bindings whose calls the instance body copies (`monoInstLamNames`): a call
@@ -7022,38 +7011,22 @@ function monoBindTyParamElab(
   tvV: string[],
   tvT: i32[],
 ) {
-  const eb = if callIx >= 0 { elabCallBindTy(monoCallTplOf(callIx), tp) } else { -1 }
+  const eb0 = if callIx >= 0 { elabCallBindTy(monoCallTplOf(callIx), tp) } else { -1 }
   const dt = primTyOfName(ELAB_TP_DEFAULT)
-  const sp = if eb == TY_NEVER { "never" } else if eb >= 0 && !tySame(eb, dt) { monoPinAnnSpelling(eb) } else { "" }
-  if sp == "" { return monoBindTyParamDefault(tp, tvN, tvV, tvT) }
+  const sp0 = if eb0 == TY_NEVER { "never" } else if eb0 >= 0 && !tySame(eb0, dt) { monoPinAnnSpelling(eb0) } else { "" }
+  // Where the elaboration binds nothing, or binds the default itself, the default binds.
+  const eb = if sp0 == "" { dt } else { eb0 }
+  const sp = if sp0 == "" { ELAB_TP_DEFAULT } else { sp0 }
   tvN.push(tp)
   // `never` resolves in a result position alone, so an instance's annotations spell the
   // default where it binds, whose rep `never` takes inside a list or record (D15530).
   tvV.push(if eb == TY_NEVER { ELAB_TP_DEFAULT } else { sp })
   monoTvTyLast(tvN, tvT, eb)
-  if !strListHas(monoExplicitBN, tp) {
+  if eb >= 0 && !strListHas(monoExplicitBN, tp) {
     monoExplicitBN.push(tp)
     monoExplicitBT.push(eb)
   }
   monoKeyExtra = monoKeyExtra + tp + "=" + sp + ";"
-  0
-}
-
-function monoBindTyParamDefault(
-  tp: string,
-  tvN: string[],
-  tvV: string[],
-  tvT: i32[],
-) {
-  const dt = primTyOfName(ELAB_TP_DEFAULT)
-  tvN.push(tp)
-  tvV.push(ELAB_TP_DEFAULT)
-  monoTvTyLast(tvN, tvT, dt)
-  if dt >= 0 && !strListHas(monoExplicitBN, tp) {
-    monoExplicitBN.push(tp)
-    monoExplicitBT.push(dt)
-  }
-  monoKeyExtra = monoKeyExtra + tp + "=" + ELAB_TP_DEFAULT + ";"
   0
 }
 
@@ -7124,7 +7097,11 @@ function monoCgcTplTy(ix: i32): i32 {
 // builds as `T`'s pinned list: a boolean default where `T` is a number, or the reverse (D2816).
 // Such a literal stays untyped, as before D2849, and the emitter refuses it.
 function monoLitReachesPinDefaultClash(tpl: i32, nx: i32): boolean {
-  const b = monoLitElemPin(nodeTyIxOf(tpl))
+  // The pin of `X` where the elaboration types the template `X[][]` at the instance being walked.
+  const lt = elabNodeTy(tpl, elabWalkTop())
+  const o = if lt >= 0 && lt < T.tys.length && !tyHasTyVar(lt) { tyAt(lt) } else { null }
+  const m = if o is TyArray && o.aElem >= 0 { tyAt(o.aElem) } else { null }
+  const b = if m is TyArray && m.aElem >= 0 { tyPrimNameOf(m.aElem) ?? "" } else { "" }
   if b == "" { return false }
   const a = nodeAt(nx)
   if !(a is ArrayLit) { return false }
@@ -7137,36 +7114,6 @@ function monoLitReachesPinDefaultClash(tpl: i32, nx: i32): boolean {
     i = i + 1
   }
   false
-}
-
-// The pin of `X` where `lt` is `X[][]`: `X` itself when a primitive (the instance already
-// substituted it), else its binding when a type parameter of the instance being copied, or "".
-function monoLitElemPin(lt: i32): string {
-  if lt < 0 || lt >= T.tys.length { return "" }
-  const o = tyAt(lt)
-  if !(o is TyArray) || o.aElem < 0 { return "" }
-  const m = tyAt(o.aElem)
-  if !(m is TyArray) || m.aElem < 0 { return "" }
-  // Already substituted by the instance's retype: the pin is the element itself.
-  const mp = tyPrimNameOf(m.aElem)
-  if mp != null { return mp }
-  const v = tyAt(m.aElem)
-  if !(v is TyVar) { return "" }
-  let j = 0
-  while j < monoCgcBN.length && j < monoCgcBT.length {
-    if monoCgcBN[j] == v.tvName {
-      const bp = tyPrimNameOf(monoCgcBT[j])
-      if bp != null { return bp }
-      return ""
-    }
-    j = j + 1
-  }
-  let i = 0
-  while i < monoCgcTvN.length && i < monoCgcTvV.length {
-    if monoCgcTvN[i] == v.tvName { return monoCgcTvV[i] }
-    i = i + 1
-  }
-  ""
 }
 
 // Whether value `ix` is a `??` whose default clashes with pin `b`, or a call to a generic whose
@@ -9082,7 +9029,7 @@ function monoMakeInstance(
 }
 
 // The owner key of the template `monoMakeInstance` is instantiating: its bindings (`letBN`,
-// `exSubN`, the clone's `monoCgcBN`) substitute only that generic's own type variables.
+// `exSubN`) substitute only that generic's own type variables.
 let monoInstOwn = ""
 
 // `substTyDeep` of an instance binding of the template being instantiated (D9190).
@@ -9582,8 +9529,6 @@ function monoMakeInstanceBodyRewrite(
   tvV: string[],
   exSubN: string[],
   exSubT: i32[],
-  letBN: string[],
-  letBT: i32[],
 ) {
   // Pin any `.map`/`.filter` callback lambda whose receiver param the elaboration types at a
   // non-i32 element in this instance: the shared body's un-annotated lambda would otherwise
@@ -9618,15 +9563,11 @@ function monoMakeInstanceBodyRewrite(
   monoCgcTvV = tvV
   monoCgcSubN = exSubN
   monoCgcSubT = exSubT
-  monoCgcBN = letBN
-  monoCgcBT = letBT
   const instBody3 = monoCloneGenericCalls(instBody2)
   monoCgcLamNames = []
   monoCgcLamDeclX = []
   monoCgcHoleN = []
   monoCgcHoleT = []
-  monoCgcBN = []
-  monoCgcBT = []
   monoCgcTyParams = []
   monoCgcTvN = []
   monoCgcTvV = []
@@ -10711,8 +10652,6 @@ function monoMakeInstanceGo(
       tvV,
       k.exSubN,
       k.exSubT,
-      letBN,
-      letBT,
     )
     const nfn = monoMakeInstanceFunc(fn, origFe, nretW, instBody, instName, nps)
     if retWiden != "" { monoRetWidenFns[nfn] = true }
@@ -19512,6 +19451,8 @@ let monoUnionRestPin: string[] = []
 // type parameter nothing else binds, as the checker's inference does (D2734). `decl` holds the
 // generic's declared parameter types (`monoDeclParamTys`).
 function monoPreBindPastUnionRest(
+  origFe: i32,
+  callIx: i32,
   params: i32[],
   args: i32[],
   typarams: string[],
@@ -19626,36 +19567,24 @@ function monoPreBindPastUnionRest(
     }
     k = k + 1
   }
-  monoBindBareArenaPins(params, args, typarams, ctx)
-  0
-}
-
-// Adds to the call's arena bindings (`monoExplicitBN`/`monoExplicitBT`) each type parameter a
-// bare `T` parameter binds from its argument's type, so a union parameter over `T` is minted at
-// the bound type exactly as an explicit type argument mints it (D2734).
-function monoBindBareArenaPins(
-  params: i32[],
-  args: i32[],
-  typarams: string[],
-  ctx: i32,
-) {
-  let i = 0
-  while i < params.length && i < args.length {
-    const p = nodeAt(params[i])
-    if p is Param {
-      if p.parType >= 0 {
-        const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
-        const tp = monoTyParamOf(ann, typarams)
-        if tp != "" && tp == ann && !strListHas(monoExplicitBN, tp) {
-          const at = monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx)
-          if at >= 0 && !tyHasTyVar(at) {
-            monoExplicitBN.push(tp)
-            monoExplicitBT.push(at)
-          }
+  // Each type parameter a bare `T` parameter binds joins the call's arena bindings at the
+  // elaboration's binding, so a union parameter over `T` is minted there as an explicit type
+  // argument mints it (D2734).
+  let b = 0
+  while b < params.length && b < args.length {
+    const bp = nodeAt(params[b])
+    if bp is Param && bp.parType >= 0 {
+      const ann = monoDeclAnnName(bp.parType, tyNameOf(bp.parType), typarams)
+      const tp = monoTyParamOf(ann, typarams)
+      if tp != "" && tp == ann && !strListHas(monoExplicitBN, tp) {
+        const et = monoElabBindTy(origFe, callIx, tp)
+        if et >= 0 {
+          monoExplicitBN.push(tp)
+          monoExplicitBT.push(et)
         }
       }
     }
-    i = i + 1
+    b = b + 1
   }
   0
 }
@@ -20998,6 +20927,8 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       )
       if monoTwoListArgFail(fn, params, args, ctx) < 0 { return -1 }
       monoPreBindPastUnionRest(
+        origFe,
+        callIx,
         params,
         args,
         fn.fnTyParams,
