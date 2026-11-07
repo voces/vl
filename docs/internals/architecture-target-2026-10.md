@@ -2369,6 +2369,29 @@ Each A helper was wrapped, with the walk depth recorded.
 - **`monoInitHeldTy`.** Probed where `monoBindingAdoptInit` acts on it, there are 36 decisions in
   18 programs. Every one is a container of hole lambdas that the elaboration leaves `(_) => _`.
 
+**Node type, what the returned-literal pins still carry** (2026-11-07, 23,103 programs, master
+`58198479` fixpoint). Re-read against `elabNodeTyAt` at the instance, each helper's effect then
+removed in a fixpoint candidate and compared by exit code, bytes and failure text:
+
+| function | sites | agree | both decline | mono only | elaboration only | builds lost without it |
+|---|---|---|---|---|---|---|
+| `monoCloseRetFnTy` | 962 | 0 | 917 | 28 | 17 | 1 |
+| `monoPinReturnedObj` | 384 | 0 | 110 | 2 | 272 | 2 |
+
+- **`monoCloseRetFnTy` keeps one caller, the stored call.** Its other four callers (a record field's
+  call, an open call with and without a generic callee, a list literal of calls) are reached and
+  pin nothing a build reads, so they are deleted. A sweep of the narrowed fixpoint against master's
+  moves no program.
+- **Three programs are what the two helpers carry:** `closures/hole-fn-list-returned-reread.vl`
+  sections 4 and 5 (`m["k"] = deliver()`), `named/d15203_run_uncalled_record.vl` and
+  `named/d15207_rec_ret.vl` (`return { fs: [inc0] }`, `inc0` never called). Without the pin each
+  fails `ref valtype with no interned shape`.
+- **The elaboration leaves all three open**, because a hole function in a returned literal that no
+  call fixes has no instance. That is D15494's design question, an uncalled hole function's default
+  instance, and is parked with it; it is not lane work.
+- **`monoPinReturnedObj`'s 272 elaboration-only sites** are d3125 lambdas returning `{ q: 0 }`,
+  already closed, where mono has nothing to retype.
+
 **Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
 elaboration has no type of its own for the node, and every caller composes its own narrowing with
 it. A fallback to the checker's closed type (#6556, closed) broke four `runs` cells:
