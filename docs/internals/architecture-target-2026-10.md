@@ -2392,6 +2392,35 @@ removed in a fixpoint candidate and compared by exit code, bytes and failure tex
 - **`monoPinReturnedObj`'s 272 elaboration-only sites** are d3125 lambdas returning `{ q: 0 }`,
   already closed, where mono has nothing to retype.
 
+**Node type, the pin tuple's readers** (2026-11-07, 23,103 programs, master `58198479`
+fixpoint). `monoPinnedOperandTy` is a lookup by name into the instance's pin tuple (`pinnedTyIx`)
+inside `monoMakeInstanceGo`'s body rewrite, and `monoPinBin` folds over its answer. Neither decides
+a type, so both are class (c). Shadowed against `elabNodeTy` at the instance's own key, with a copy
+read at its source (every site was the template's own node):
+
+| cell | sites | programs |
+|---|---|---|
+| agree | 5,878 | 2,346 |
+| agree on signature only | 78 | 43 |
+| mono only | 108 | 35 |
+| differ | 0 | 0 |
+
+The 186 that do not agree, by pin and elaboration type:
+- **The same type with holes (about 63).** For example, `((_) => _)[]` on both sides, which the
+  shadow's closed filter dropped.
+- **Pin `i32[]`, elaboration `((_) => _)[]` (35).** These are the hole-function list tests: the rep
+  spelling of a function list against its identity type.
+- **Pin nullable, elaboration narrowed (about 33).** For example, `string[] | null` against
+  `string[]`. The elaboration answers the read's flow-narrowed type and the pin the argument's rep
+  per arm. That is lane F's measurement that the pin is the argument's arm (a `Set<i32>` pin for a
+  `Set<i32> | null` parameter), and #6585 already makes `monoPinHoleParam` ask the elaboration
+  first. So comparing the tuple with the substituted parameter type disagrees by design, and it is
+  not to be re-shadowed.
+- **The elaboration has no answer (26).** The d492 and d511 number-union type-parameter cells, and
+  generic value slots (D12212, D15032 to D15035).
+- **The elaboration is wider or open (about 20).** These are D3178 (`never` against `null`), an
+  overload's `V` against a record, and `(T) => T` against `(i32) => i32`.
+
 **Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
 elaboration has no type of its own for the node, and every caller composes its own narrowing with
 it. A fallback to the checker's closed type (#6556, closed) broke four `runs` cells:
