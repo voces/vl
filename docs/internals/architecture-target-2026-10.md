@@ -2064,10 +2064,12 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
       Re-graded against the checker's own closed type, 424 of those decisions read the checker
       and owe nothing. What is left is 166 receivers (122 function-list holders, the holder fact's)
       and 63 callback signatures. A named generic or hole callback now takes the signature of the
-      instance the elaboration made for it at the element (`elabCbSigAt`, noted against the
-      argument). That covers 32 of the 63 with 0 DIFF and builds all 19,337 programs
-      byte-identical. The other 31 are aliases (`const inc = (a) => a + 1`) and choices of
-      functions, which the checker enqueues no instance for.
+      instance the elaboration made for it at the element (`elabCbArgSig`, noted against the
+      argument). So does one a binding holds (`const inc = (a) => a + 1`, which the checker now
+      instances through `cwFnValueDeclOf`) and a choice of functions whose arms agree. That
+      covers 44 of the 63 with 0 DIFF and builds all 19,337 programs byte-identical. The other
+      19 are hole-lambda lists left open on both sides, a binding written more than once, and a
+      choice inside a generic instance.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
   The hub is the binding `monoInstantiateCallIn` hands `monoMakeInstance` (`tvN` / `tvV` / `tvT`),
   against `ekTys` at the key the elaboration made for the call (`elabWalkKeyOf`, which already
