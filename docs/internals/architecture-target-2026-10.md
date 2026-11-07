@@ -2057,6 +2057,38 @@ witnesses. Four helpers move to the instance-binding family: `monoPinBin`, `mono
 `monoPinnedReadTy` and `monoDeadNullTest` read only the instance's own pin column, in
 `monoMakeInstanceGo`'s body rewrite.
 
+**Node type, second reading** (2026-11-07, a seeded 2,500-program sample of the reaching programs).
+Each A helper was wrapped, with the walk depth recorded.
+- **`monoArgClosedTyIn`.** Its `ctx` is a function index at all four callers. Inside an instance
+  (`elabKeyAt(ctx) >= 0`) the elaboration answers all 1,387 calls. Outside one, it has no answer at
+  7,443 calls, and there the checker's own type equals mono's at 7,361.
+- **The 57 "differs".** These are generic calls whose type parameter the destination binds:
+  `idn({ r: 4 })` into `J | string` passes `{r: i32}` at `T := J`. That is a different type, not a
+  spelling, so the helper's switch reads the callee instance's parameter type (`elabCallInstFrom`).
+- **`monoInitHeldTy`.** Probed where `monoBindingAdoptInit` acts on it, there are 36 decisions in
+  18 programs. Every one is a container of hole lambdas that the elaboration leaves `(_) => _`.
+
+**Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
+elaboration has no type of its own for the node, and every caller composes its own narrowing with
+it. A fallback to the checker's closed type (#6556, closed) broke four `runs` cells:
+- D3786;
+- `functions/tail-assign-nullable-i64-if`;
+- `expressions/assign-value-keeps-evaluation-order`;
+- `literals/hex-width-through-assignment-value`.
+
+The cause is in `readAtomAgreed`, which compares `asgReReadPinAt`'s narrowed `i64` with the answer
+and refuses on a mismatch. The fallback answered with the cell's declared `i64 | null`.
+
+**Hole-lambda holders, one fact.** `elabSlotTys`, written by `elabSlotFacts` and
+`elabSlotInstFacts`, is the closed type of a holder whose function leaves stay open. Fn#d's
+adopt-init switch and lane F's `.map` callback parameter both read it. It is a type only; the rep
+comes from the tag layer. Three steps:
+- (a) `elabNodeTy` answers it for the binding and for an un-narrowed read of the binding;
+- (b) `elabSlotClose` gains the sources it declines today, at 42 of the 47 acted adopt decisions
+  over the union population;
+- (c) a hole parameter is closed per instance from its callers' arguments, and declines where two
+  callers at one key pass different types.
+
 **Slot type, first reading: `monoReachSlotTy`** (2026-11-06). Value reach (`vrCalleeTy`) against
 the climb's agreed tuple (`elabLitSlotCallTys`), each computed on its own:
 
