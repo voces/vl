@@ -8,7 +8,6 @@ also updates the target doc's status section.
 
 Newest first:
 
-- [2026-11-07-step7-classifier-batch-1](2026-11-07-step7-classifier-batch-1.md): Step 7: five type-blind classifiers deleted onto typed readers after a 0-disagreement shadow; seven others shadowed and kept, with why.
 - [2026-11-07-step6-write-back-census](2026-11-07-step6-write-back-census.md): Step 6's sixteen `synth*Ann*` write-backs graded by ablation; ten deleted (#6703), the rest parked on step 7, and `criWalkBlock` is now step 7's.
 - [2026-11-07-pin-decisions-off-spelling](2026-11-07-pin-decisions-off-spelling.md): Every decision that read an instance pin's spelling (`=>`, `isNumRecvBaseName`) reads its type; sweep byte-identical.
 - [2026-11-07-forin-struct-row-shadow](2026-11-07-forin-struct-row-shadow.md): `forInVarStructIdx` against `repSlotOfKind`: 284 of 286 agree, both misses function-valued fields (step 3); `repSlotOfTy` not widened.
