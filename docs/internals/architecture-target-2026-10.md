@@ -2563,6 +2563,15 @@ writes (`cwBindingWrittenValues`), under two rules:
   fact. Regression cell: D9850. There `v` holds `g(f: ((x: T) => T) | null, x: T)`, and the slot-call
   tuple built `((i32) => i32, i32) => i32`, dropping the declared `| null`.
 
+**A binding's whole-write type has one reader: `elabBindingWholeTy(d, t, k)`.** It runs before the
+two closers. It folds `elabWrittenValueTy(d, x, k)` over every non-null value written to the
+binding. The answers must agree and share a constructor with the binding's own type, and a nullable
+binding wraps the answer. `elabWrittenValueTy` is where each value-level source goes. The first is a
+read (`slotOfRead`) of a different holder with a closed `elabSlotTyAtKey` fact at the same instance,
+the common case being `const f = m.get("k")` out of a closed map. A read of an open holder
+declines, which leaves generic functions stored in maps to D15494. A delivered bundle (reach) is the
+next source, so the elaboration gets no second composer for the same binding.
+
 A captured cell (`let d = c` re-written by a lambda) gets no fact this way yet. Its written lambdas
 are nested and capture, so `elabHeldAtArgs` declines, and `elabHeldFnTy` returns that decline
 instead of trying the instance enumeration.
