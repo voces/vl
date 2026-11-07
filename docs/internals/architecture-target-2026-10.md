@@ -2004,6 +2004,11 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   happens in 6 programs, the same literals-at-two-types the hub's regression cells name, and its
   refusal is reached by none. It is class (c) mechanics over mono's own instance registry, and
   goes with that registry, not with a fact.
+  **Grading a shadow.** A row agrees only when the two types are `tySame`. The spelling goes in
+  a column of its own. Two types can print alike and still differ (a record built at one row and
+  bound at another, as in D14426), and the same type can be spelled two ways (union row order, a
+  structural twin's name). Grading by spelling once hid D14426's runs→not-runs inside an
+  "agrees" count. Check a switch with a byte sweep on fixpoint seeds before believing either column.
   **The six non-hub helpers, shadowed (2026-11-07, Fn#d, 19,337 programs).** Each decision was read
   against the lambda's parameters in `elabNodeTy(lam, elabWalkTop())`, and the bind site also
   against the delivered name's slot fact and `elabLamDeliveredParams`.
