@@ -51,7 +51,7 @@ iterable's rep, so it also covers a string list the spelling never named.
   `letIsNulString`: 1, `generics/value-join-at-the-pin.vl` (old `false`, typed `nulstr`),
   the D3290 join. `letIsStruct` and `letIsUnion` were counted, not examined.
 
-**Proof.** Fixpoint seed (two refreshes, byte-identical), 6,450,420 → 6,449,661 bytes.
+**Proof.** Fixpoint seeds against master `409a3a79`: 6,451,370 → 6,450,611 bytes.
 Sweep base vs candidate over 23,610 programs: 23,610 same, 0 bytes-only, 0 output movers,
 0 `runs → not-runs`. Census: 112 → 107 probed classifiers (pre-only 4 → 2, both 102 → 99,
 post-only 6). `emit_classify.vl` is 16,155 → 16,086 lines.
