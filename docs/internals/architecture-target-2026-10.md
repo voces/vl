@@ -2018,6 +2018,10 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   D14582, D6541. `monoBindEnclosingPins` decides nothing: the enclosing pins it registers come from
   `monoEnclosingPinRow`, which reads the enclosing instance's key (`ekNames` / `ekTys`), so it is
   class (c).
+  `monoLitElemPin` is deleted: D2816's clash rung names the pinned element of a template list
+  literal typed `X[][]` from `elabNodeTy` at the instance being walked, which agrees in all 4
+  programs that reach it. The clone-time columns it alone read (`monoCgcBN` / `monoCgcBT`) go
+  with it.
   The per-argument pins are a separate fact (the argument's representation, per union arm) and
   wait for the producers.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
