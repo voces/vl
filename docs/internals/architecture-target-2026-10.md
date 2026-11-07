@@ -3268,6 +3268,14 @@ Slice 2 makes the elaboration enqueue and re-check instances at those keys. Slic
 `elabCalleeFnsOf` inside them, which retires mono's derivation for the 1,052 and gives (S1) its map.
 Each slice is graded on the byte sweep.
 
+**Ruling** (coordinator, 2026-11-07). The design is approved, on three conditions:
+- **The instance count is a graded number.** The proposed key groups exactly as mono's `@name`
+  suffix does, no more instances and no fewer. Every slice reports the instance-count delta, and
+  any growth stops the work.
+- **A tagged set is never specialized (D15010).** This is an assertion in slice 1's predicate.
+- **Each slice comes back for a ruling before the next.** Slice 1 is approved: fold the gates
+  byte-identically, then record and grade the key.
+
 #### The call half and the value half (2026-11-06)
 
 **A function delivered as a value has all its instances in the value half; a function only ever
