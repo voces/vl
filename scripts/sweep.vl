@@ -1,0 +1,906 @@
+// The proof sweep: record what one seed does with every program of a population, then
+// compare two recordings program by program (scripts/sweep.md).
+//
+//     vl run scripts/sweep.vl -- record --compiler <seed> --out <file.jsonl>
+//         [--shard K/N] [--population all|cases|distilled|inventory] [--std <dir>] [--vl <bin>]
+//     vl run scripts/sweep.vl -- merge --out <file.jsonl> [--population P] <shard.jsonl>...
+//     vl run scripts/sweep.vl -- diff <base.jsonl> <cand.jsonl>
+//
+// Run from the checkout root: the population is read from the working tree. `record` grades
+// `$JOBS` chunks at a time (default 4). `diff` exits 1 when a program that ran stopped
+// running or a compiler trap appeared, 2 on a usage error; `record` and `merge` exit 1
+// when the recording does not cover the population exactly once.
+
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import { join, lastIndexOf, replaceAll, split, startsWith } from "std:str"
+import { Json } from "std:json"
+import {
+  JsonMap,
+  Proc,
+  die,
+  envOr,
+  exists,
+  fanOutArgv,
+  lstripWs,
+  splitLines,
+  univNl,
+} from "./lib/common"
+import {
+  anyIn,
+  cellsIn,
+  cwd,
+  dumpCells,
+  loadCells,
+  makeTempDir,
+  numField,
+  padLeft,
+  padRight,
+  parseOrDie,
+  readText,
+  sortStrings,
+  spawn,
+  strField,
+  writeText,
+} from "./lib/corpus"
+import { jobsFromEnv, norm } from "./lib/census-grade"
+import {
+  contains,
+  isWordByte,
+  parseRows,
+  resolve,
+  splitFiles,
+} from "./lib/inventory"
+
+const SELF = "scripts/sweep.vl"
+const CASES = "tests/cases"
+const DISTILLED = "scripts/silent-sweep/distilled"
+const INVENTORIES = ["docs/internals/inventory", "docs/internals/inventory-2"]
+const CHUNK = 100
+// Where witnesses are written: a fixed path inside the checkout, because a module records
+// the path of a file outside any project root, and a temporary one differs every run.
+const WITNESSES = "build/sweep/witnesses"
+
+// ── the population ─────────────────────────────────────────────────────────────────
+
+// One program: its key in a recording, the file compiled, whether it is run or only
+// checked, and for a witness the source to write to `file` before it is graded.
+type Prog = { key: string, file: string, run: boolean, src: string }
+
+// The text after `//` and `@` of every directive-shaped line (`^\s*//\s*@`) of `src`.
+function directiveTails(src: string): string[] {
+  const out: string[] = []
+  for l in splitLines(src) {
+    const t = lstripWs(l)
+    if !startsWith(t, "//") { continue }
+    const u = lstripWs(t.slice(2, t.length))
+    if startsWith(u, "@") { out.push(u.slice(1, u.length)) }
+  }
+  out
+}
+
+// Whether a directive tail is `name` followed by a regex word boundary.
+function names(tails: string[], name: string): boolean {
+  for t in tails {
+    if (
+      startsWith(t, name)
+      && (t.length == name.length || !isWordByte(t[name.length]))
+    ) {
+      return true
+    }
+  }
+  false
+}
+
+// How a `tests/cases` file is graded, by the tiers `tests/selfhost_native_align_test.ts`
+// reads from its directives: "run" for the run and trap tiers, "check" for the reject,
+// emit-reject and accept tiers, "" for a file that claims none (a module part).
+function caseTier(src: string): string {
+  const ds = directiveTails(src)
+  let log = false
+  for t in ds {
+    if startsWith(t, "log ") { log = true }
+  }
+  if names(ds, "run") || log || names(ds, "trap") { return "run" }
+  for d in ["emit-error", "error", "no-instantiate", "check", "warning", "hint", "info"] {
+    if names(ds, d) { return "check" }
+  }
+  ""
+}
+
+function casesPop(out: Prog[]) {
+  const f = spawn("find", [CASES, "-type", "f", "-name", "*.vl"])
+  if f.code != 0 { die("sweep: cannot list \{CASES}: " + f.err, 1) }
+  const files: string[] = []
+  for l in splitLines(f.out) {
+    if l != "" { files.push(l) }
+  }
+  for p in sortStrings(files) {
+    const tier = caseTier(readText(p))
+    if tier != "" { out.push({ key: p, file: p, run: tier == "run", src: "" }) }
+  }
+}
+
+function distilledPop(out: Prog[]) {
+  for part in ["cells", "named"] {
+    const dir = DISTILLED + "/" + part
+    for n in sortStrings(cellsIn(dir)) {
+      const p = dir + "/" + n + ".vl"
+      out.push({ key: p, file: p, run: true, src: "" })
+    }
+  }
+}
+
+// Every row's witness that is one file naming no relative import and no `@@repeat`, keyed
+// `<row file>#<id>` and written to `<wdir>/<inventory>/<id>.vl` when graded. Witnesses are
+// run, as `scripts/check-filed-witnesses.vl` runs them.
+function inventoryPop(out: Prog[], wdir: string) {
+  for dir in INVENTORIES {
+    const inv = dir.slice(dir.lastIndexOf("/") + 1, dir.length)
+    for doc in resolve(dir) {
+      for r in parseRows(doc, splitLines(univNl(readText(doc)))) {
+        if r.repro == "" || contains(r.repro, "@@repeat(") { continue }
+        const fs = splitFiles(r.repro)
+        if fs.length != 2 { continue }
+        if contains(fs[1], "\"./") || contains(fs[1], "\"../") { continue }
+        out.push(
+          {
+            key: doc + "#" + r.id,
+            file: "\{wdir}/\{inv}/\{r.id}.vl",
+            run: true,
+            src: fs[1],
+          },
+        )
+      }
+    }
+  }
+}
+
+// The population `name` names, sorted by key; exits 1 on a key that appears twice.
+function population(name: string, wdir: string): Prog[] {
+  const all: Prog[] = []
+  if name == "all" || name == "cases" { casesPop(all) }
+  if name == "all" || name == "distilled" { distilledPop(all) }
+  if name == "all" || name == "inventory" { inventoryPop(all, wdir) }
+  if (
+    name != "all"
+    && name != "cases"
+    && name != "distilled"
+    && name != "inventory"
+  ) {
+    die(
+      "sweep: unknown population \{name} (all, cases, distilled, inventory)",
+      2,
+    )
+  }
+  const byKey: Map<string, Prog> = Map()
+  for p in all {
+    if byKey[p.key] != null {
+      die("sweep: the population holds \{p.key} twice", 1)
+    }
+    byKey[p.key] = p
+  }
+  const out: Prog[] = []
+  for k in sortStrings(byKey.keys()) {
+    const p = byKey[k]
+    if p != null { out.push(p) }
+  }
+  out
+}
+
+// ── grading one chunk: `--grade-chunk <file>` ──────────────────────────────────────
+
+// What one program did: the outcome, the exit code of the last stage that ran, the first
+// message normalised, and the files whose bytes are its stdout and its module ("" for none).
+type Got = {
+  outcome: string,
+  code: i32,
+  msg: string,
+  stdout: string,
+  module: string,
+}
+
+// What a chunk worker needs: the binary, the seed, `std/`, the scratch root whose path is
+// hidden in messages, and the chunk's own scratch directory.
+type Ctx = { vl: string, seed: string, std: string, root: string, tmp: string }
+
+const INVALID = [
+  "Invalid input WebAssembly code", "WebAssembly translation error",
+  "wasm validation", "failed to parse",
+]
+const TRAP = [
+  "wasm trap", "unreachable", "out of bounds", "divide by zero",
+  "null reference", "cast failure", "integer overflow",
+]
+const COMPILER_TRAPPED = "the compiler itself trapped"
+
+function message(c: Ctx, text: string): string {
+  norm(replaceAll(text, c.root, "<w>"))
+}
+
+// `vl` under the chunk's std, bounded at `secs`.
+function vlRun(c: Ctx, secs: string, args: string[]): Proc {
+  const full = ["VL_STD=" + c.std, "timeout", secs, c.vl]
+  for a in args { full.push(a) }
+  spawn("env", full)
+}
+
+// The grade of one `vl check --batch --json --codegen` record; `kept` is where the check
+// wrote the program's module, if it wrote one. A front-end error outranks a lowering one.
+function fromCheck(c: Ctx, r: JsonMap, kept: string): Got {
+  const code = numField(r, "exit") as! i32
+  let front = ""
+  let lower = ""
+  let stage = ""
+  const ds = r["diagnostics"]
+  if ds is Json[] {
+    for d in ds {
+      if d is JsonMap {
+        if strField(d, "severity") != "error" { continue }
+        const s = strField(d, "stage")
+        if s == "emit" || s == "validate" {
+          if lower == "" {
+            lower = strField(d, "message")
+            stage = s
+          }
+        } else if front == "" {
+          front = strField(d, "message")
+        }
+      }
+    }
+  }
+  let module = ""
+  if exists(kept) { module = kept }
+  if code == 70 {
+    return checked("compiler_trap", code, message(c, cause(front + lower)), "")
+  }
+  if front != "" { return checked("check_reject", code, message(c, front), "") }
+  if stage == "emit" {
+    return checked("emit_reject", code, message(c, lower), "")
+  }
+  if stage == "validate" {
+    return checked("invalid_wasm", code, message(c, lower), module)
+  }
+  if code != 0 {
+    return checked("check_reject", code, "exit " + toString(code), "")
+  }
+  checked("check_clean", 0, "", module)
+}
+
+// A grade the check settled: nothing ran, so there is no stdout.
+function checked(outcome: string, code: i32, msg: string, module: string): Got {
+  { outcome: outcome, code: code, msg: msg, stdout: "", module: module }
+}
+
+// `vl check --batch --json --codegen` over `files`, keeping modules under `kd`: the record
+// of every file it answered, by path.
+function checkBatch(
+  c: Ctx,
+  files: string[],
+  kd: string,
+  secs: string,
+): Map<string, JsonMap> {
+  const got: Map<string, JsonMap> = Map()
+  if files.length == 0 { return got }
+  const args = [
+    "VL_STD=" + c.std,
+    "VL_CHECK_KEEP_MODULES=" + kd,
+    "timeout",
+    secs,
+    c.vl,
+    "check",
+    "--batch",
+    "--json",
+    "--codegen",
+  ]
+  for f in files { args.push(f) }
+  args.push("--compiler")
+  args.push(c.seed)
+  const p = spawn("env", args)
+  for l in splitLines(p.out) {
+    if !startsWith(l, "{") { continue }
+    const j = parseOrDie(l, "a `vl check --batch --json` line")
+    if j is JsonMap { got[strField(j, "file")] = j }
+  }
+  got
+}
+
+function base(p: string): string { p.slice(p.lastIndexOf("/") + 1, p.length) }
+
+// The part of a failed run's text that names what failed: the first line under `Caused
+// by:` when there is one, else the first non-blank line. A backtrace is left out, since
+// its frames name functions by their mangled symbols, which move with any emitter change.
+function cause(text: string): string {
+  const ls = splitLines(text)
+  let i = 0
+  while i < ls.length {
+    if startsWith(lstripWs(ls[i]), "Caused by:") {
+      let j = i + 1
+      while j < ls.length && lstripWs(ls[j]) == "" { j = j + 1 }
+      if j < ls.length { return lstripWs(ls[j]) }
+    }
+    i = i + 1
+  }
+  for l in ls {
+    if lstripWs(l) != "" { return l }
+  }
+  ""
+}
+
+// The grade of a run that failed with `text` and exit `code`.
+function runFailed(
+  c: Ctx,
+  code: i32,
+  text: string,
+  out: string,
+  module: string,
+): Got {
+  let outcome = "run_error"
+  if code == 124 { outcome = "timeout" }
+  else if contains(text, COMPILER_TRAPPED) { outcome = "compiler_trap" }
+  else if anyIn(text, INVALID) { outcome = "invalid_wasm" }
+  else if anyIn(text, TRAP) { outcome = "trap" }
+  {
+    outcome: outcome,
+    code: code,
+    msg: message(c, cause(text)),
+    stdout: out,
+    module: module,
+  }
+}
+
+// Run one check-clean program alone, from its module when there is one, else its source.
+function runSolo(c: Ctx, f: string, module: string, sd: string): Got {
+  let what = f
+  if module != "" { what = module }
+  const r = vlRun(c, "120", ["run", what, "--compiler", c.seed])
+  const out = sd + "/" + base(what) + ".solo.out"
+  writeText(out, r.out)
+  if r.code == 0 {
+    return { outcome: "runs", code: 0, msg: "", stdout: out, module: module }
+  }
+  runFailed(c, r.code, r.err + r.out, out, module)
+}
+
+// Grade `progs`, whose base names differ, into `res`. One codegen check of them all, one
+// batch run of the modules it kept; a program either leaves unanswered is graded alone.
+function gradeGroup(c: Ctx, progs: Prog[], sub: string, res: Map<string, Got>) {
+  const kd = sub + "/keep"
+  const files: string[] = []
+  for p in progs { files.push(p.file) }
+  const recs = checkBatch(c, files, kd, "900")
+  const chk: Map<string, Got> = Map()
+  for p in progs {
+    let r = recs[p.file]
+    if r == null {
+      const one = checkBatch(c, [p.file], kd, "300")
+      r = one[p.file]
+    }
+    const kept = kd + "/" + base(p.file) + ".wasm"
+    if r == null {
+      const t = vlRun(c, "300", ["check", p.file, "--compiler", c.seed])
+      if t.code == 124 {
+        res[p.key] = {
+          outcome: "timeout",
+          code: 124,
+          msg: "check timeout",
+          stdout: "",
+          module: "",
+        }
+      } else {
+        res[p.key] = {
+          outcome: "compiler_trap",
+          code: t.code,
+          msg: message(c, cause(t.err + t.out)),
+          stdout: "",
+          module: "",
+        }
+      }
+    } else {
+      chk[p.key] = fromCheck(c, r, kept)
+    }
+  }
+  const torun: Prog[] = []
+  for p in progs {
+    const g = chk[p.key]
+    if g == null { continue }
+    if p.run && g.outcome == "check_clean" {
+      torun.push(p)
+    } else {
+      res[p.key] = g
+    }
+  }
+  const od = sub + "/run"
+  spawn("mkdir", ["-p", od])
+  const wasms: string[] = []
+  const wkeys: string[] = []
+  for p in torun {
+    const g = chk[p.key]
+    if g != null && g.module != "" {
+      wasms.push(g.module)
+      wkeys.push(p.key)
+    }
+  }
+  if wasms.length > 0 {
+    const args = ["run", "--batch", "--out-dir", od]
+    for w in wasms { args.push(w) }
+    args.push("--compiler")
+    args.push(c.seed)
+    const b = vlRun(c, "900", args)
+    // A case's `.err` is settled before the next case starts, so an answer is whole once a
+    // later case has one or the batch exited 0; a program that calls `exit` ends the batch.
+    let later = b.code == 0
+    let i = wasms.length - 1
+    while i >= 0 {
+      const o = od + "/" + base(wasms[i]) + ".out"
+      const e = od + "/" + base(wasms[i]) + ".err"
+      const have = exists(o)
+      if have && later {
+        if exists(e) {
+          res[wkeys[i]] = runFailed(c, 1, "Error: " + readText(e), o, wasms[i])
+        } else {
+          res[wkeys[i]] = {
+            outcome: "runs",
+            code: 0,
+            msg: "",
+            stdout: o,
+            module: wasms[i],
+          }
+        }
+      }
+      if have { later = true }
+      i = i - 1
+    }
+  }
+  for p in torun {
+    if res[p.key] != null { continue }
+    const g = chk[p.key]
+    let m = ""
+    if g != null { m = g.module }
+    res[p.key] = runSolo(c, p.file, m, od)
+  }
+}
+
+// The first 16 hex digits of the sha256 of each file, by path.
+function hashes(files: string[]): Map<string, string> {
+  const out: Map<string, string> = Map()
+  if files.length == 0 { return out }
+  const p = spawn("sha256sum", files)
+  if p.code != 0 { die("sweep: sha256sum failed: " + p.err, 1) }
+  for l in splitLines(p.out) {
+    const sp = l.indexOf("  ")
+    if sp == 64 { out[l.slice(66, l.length)] = l.slice(0, 16) }
+  }
+  out
+}
+
+// A chunk file is five header lines (vl, seed, std, scratch root, chunk scratch) and then
+// one `key\tfile\trun` line per program. The answer goes to `<file>.out`, one
+// `key\toutcome\texit\tstdout\tmodule\tmsg` line per program.
+function gradeChunk(file: string) {
+  const lines = readText(file).split("\n")
+  const c: Ctx = {
+    vl: lines[0],
+    seed: lines[1],
+    std: lines[2],
+    root: lines[3],
+    tmp: lines[4],
+  }
+  const progs: Prog[] = []
+  let k = 5
+  while k < lines.length {
+    if lines[k] != "" {
+      const f = lines[k].split("\t")
+      progs.push({ key: f[0], file: f[1], run: f[2] == "1", src: "" })
+    }
+    k = k + 1
+  }
+  // `vl check` keeps a module and `vl run --batch` its answer by base name alone, so the
+  // n-th program of each base name goes in group n.
+  const seen: Map<string, i32> = Map()
+  const groups: Prog[][] = []
+  for p in progs {
+    const n = seen[base(p.file)] ?? 0
+    seen[base(p.file)] = n + 1
+    while groups.length <= n { groups.push([]) }
+    groups[n].push(p)
+  }
+  const res: Map<string, Got> = Map()
+  let g = 0
+  while g < groups.length {
+    gradeGroup(c, groups[g], c.tmp + "/g" + toString(g), res)
+    g = g + 1
+  }
+  const files: string[] = []
+  for p in progs {
+    const r = res[p.key]
+    if r != null {
+      if r.stdout != "" { files.push(r.stdout) }
+      if r.module != "" { files.push(r.module) }
+    }
+  }
+  const h = hashes(files)
+  const out: string[] = []
+  for p in progs {
+    const r = res[p.key]
+      ?? { outcome: "", code: 0, msg: "", stdout: "", module: "" }
+    let so = ""
+    if r.stdout != "" { so = h[r.stdout] ?? "?" }
+    let mo = ""
+    if r.module != "" { mo = h[r.module] ?? "?" }
+    out.push(
+      "\{p.key}\t\{r.outcome}\t\{toString(r.code)}\t\{so}\t\{mo}\t\{r.msg}\n",
+    )
+  }
+  writeText(file + ".out", join(out, ""))
+}
+
+// ── record ─────────────────────────────────────────────────────────────────────────
+
+// The value after `flag` in `args`, or `dflt` when the flag is absent.
+function flagArg(args: string[], flag: string, dflt: string): string {
+  let k = 0
+  while k < args.length {
+    if args[k] == flag {
+      if k + 1 >= args.length { die("sweep: \{flag} needs a value", 2) }
+      return args[k + 1]
+    }
+    k = k + 1
+  }
+  dflt
+}
+
+function absolute(abs: string, p: string): string {
+  if startsWith(p, "/") { return p }
+  abs + "/" + p
+}
+
+// `K/N` as two integers, 1 <= K <= N; exits 2 otherwise.
+function shardOf(s: string): i32[] {
+  const parts = s.split("/")
+  if parts.length == 2 {
+    const k = parseI32(parts[0])
+    const n = parseI32(parts[1])
+    if k != null && n != null && k >= 1 && k <= n { return [k, n] }
+  }
+  die("sweep: --shard needs K/N with 1 <= K <= N, not \{s}", 2)
+  [1, 1]
+}
+
+// One recording line's fields from a chunk answer line.
+function recordOf(f: string[]): JsonMap {
+  const rec: JsonMap = Map()
+  rec["outcome"] = f[1]
+  rec["exit"] = (parseI32(f[2]) ?? 0) as f64
+  rec["stdout"] = f[3]
+  rec["module"] = f[4]
+  rec["msg"] = f[5]
+  rec
+}
+
+function record(args: string[]): i32 {
+  const seed = flagArg(args, "--compiler", "")
+  const outFile = flagArg(args, "--out", "")
+  if seed == "" || outFile == "" {
+    print(USAGE)
+    return 2
+  }
+  if !exists(seed) { die("sweep: no seed at \{seed}", 2) }
+  const sh = shardOf(flagArg(args, "--shard", "1/1"))
+  const pop = flagArg(args, "--population", "all")
+  const abs = cwd()
+  const vl = absolute(
+    abs,
+    flagArg(
+      args,
+      "--vl",
+      envOr("VL", "scripts/vl-host/target/release/vl"),
+    ),
+  )
+  const std = absolute(abs, flagArg(args, "--std", "std"))
+  const root = makeTempDir()
+  const wdir = WITNESSES
+  const all = population(pop, wdir)
+  const mine: Prog[] = []
+  let i = 0
+  while i < all.length {
+    if i % sh[1] == sh[0] - 1 { mine.push(all[i]) }
+    i = i + 1
+  }
+  const dirs: string[] = ["-p", wdir + "/inventory", wdir + "/inventory-2"]
+  const chunks: string[] = []
+  let at = 0
+  while at < mine.length {
+    const tmp = root + "/c" + toString(chunks.length)
+    dirs.push(tmp)
+    const body = [vl, absolute(abs, seed), std, root, tmp]
+    let k = 0
+    while k < CHUNK && at < mine.length {
+      const p = mine[at]
+      let r = "0"
+      if p.run { r = "1" }
+      body.push("\{p.key}\t\{p.file}\t\{r}")
+      at = at + 1
+      k = k + 1
+    }
+    chunks.push(tmp + "/chunk")
+    chunks.push(join(body, "\n") + "\n")
+  }
+  spawn("mkdir", dirs)
+  for p in mine {
+    if p.src != "" && !(exists(p.file) && readText(p.file) == p.src) {
+      writeText(p.file, p.src)
+    }
+  }
+  let k = 0
+  const list: string[] = []
+  while k < chunks.length {
+    writeText(chunks[k], chunks[k + 1])
+    list.push(chunks[k])
+    k = k + 2
+  }
+  const tool = root + "/sweep.wasm"
+  const toolSeed = envOr("SWEEP_TOOL_COMPILER", "build/vl-compiler.wasm")
+  const toolVl = envOr("VL", "scripts/vl-host/target/release/vl")
+  const b = spawn(toolVl, ["build", SELF, "--compiler", toolSeed, "-o", tool])
+  if b.code != 0 {
+    spawn("rm", ["-rf", root])
+    die("sweep: cannot build \{SELF}:\n" + b.out + b.err, 1)
+  }
+  writeText(root + "/chunks", join(list, "\n") + "\n")
+  const cmd = [
+    "env",
+    "RAYON_NUM_THREADS=" + envOr("RAYON_NUM_THREADS", "1"),
+    toolVl,
+    "run",
+    tool,
+    "--",
+    "--grade-chunk",
+  ]
+  const jobs = jobsFromEnv(4)
+  const x = spawn("sh", fanOutArgv(root + "/chunks", toString(jobs), cmd))
+  const recs: Map<string, JsonMap> = Map()
+  for ch in list {
+    if !exists(ch + ".out") {
+      spawn("rm", ["-rf", root])
+      die(
+        "sweep: chunk \{ch} did not answer (fan-out rc=\{toString(x.code)})\n"
+          + x.out
+          + x.err,
+        1,
+      )
+    }
+    for l in readText(ch + ".out").split("\n") {
+      if l == "" { continue }
+      const f = l.split("\t")
+      recs[f[0]] = recordOf(f)
+    }
+  }
+  spawn("rm", ["-rf", root])
+  if recs.length != mine.length {
+    die(
+      "sweep: \{toString(recs.length)} records for \{toString(mine.length)} programs",
+      1,
+    )
+  }
+  for p in mine {
+    if recs[p.key] == null { die("sweep: no record for \{p.key}", 1) }
+  }
+  dumpCells(outFile, recs)
+  print(
+    "sweep: recorded \{toString(mine.length)} of \{toString(all.length)} \{pop} programs (shard \{toString(sh[0])}/\{toString(sh[1])}) to \{outFile}",
+  )
+  0
+}
+
+// ── merge ──────────────────────────────────────────────────────────────────────────
+
+function merge(args: string[]): i32 {
+  const outFile = flagArg(args, "--out", "")
+  const pop = flagArg(args, "--population", "all")
+  const ins: string[] = []
+  let k = 0
+  while k < args.length {
+    if args[k] == "--out" || args[k] == "--population" {
+      k = k + 2
+      continue
+    }
+    ins.push(args[k])
+    k = k + 1
+  }
+  if outFile == "" || ins.length == 0 {
+    print(USAGE)
+    return 2
+  }
+  const recs: Map<string, JsonMap> = Map()
+  for f in ins {
+    for c, r in loadCells(f) {
+      if recs[c] != null {
+        die("sweep: \{c} is recorded twice (again in \{f})", 1)
+      }
+      recs[c] = r
+    }
+  }
+  const want = population(pop, "")
+  let missing = 0
+  for p in want {
+    if recs[p.key] == null {
+      if missing < 20 { print("  missing: \{p.key}") }
+      missing = missing + 1
+    }
+  }
+  if missing > 0 || recs.length != want.length {
+    die(
+      "sweep: the shards hold \{toString(recs.length)} records, the \{pop} population \{toString(want.length)} programs, \{toString(missing)} missing",
+      1,
+    )
+  }
+  dumpCells(outFile, recs)
+  print(
+    "sweep: merged \{toString(ins.length)} shards, \{toString(recs.length)} records, to \{outFile}",
+  )
+  0
+}
+
+// ── diff ───────────────────────────────────────────────────────────────────────────
+
+const FIELDS = ["outcome", "exit", "stdout", "msg"]
+
+function field(r: JsonMap, f: string): string {
+  if f == "exit" { return toString(numField(r, f) as! i32) }
+  strField(r, f)
+}
+
+// The fields that differ between `a` and `b`, as one line.
+function changes(a: JsonMap, b: JsonMap): string {
+  const parts: string[] = []
+  for f in FIELDS {
+    const x = field(a, f)
+    const y = field(b, f)
+    if x == y { continue }
+    if f == "msg" {
+      parts.push("msg \{jsonOf(x)} -> \{jsonOf(y)}")
+    } else {
+      parts.push("\{f} \{x} -> \{y}")
+    }
+  }
+  join(parts, "; ")
+}
+
+function jsonOf(s: string): string {
+  if s.length > 120 { return "\"" + s.slice(0, 117) + "...\"" }
+  "\"" + s + "\""
+}
+
+// The population a key belongs to.
+function popOf(key: string): string {
+  if startsWith(key, CASES + "/") { return "cases" }
+  if startsWith(key, DISTILLED + "/") { return "distilled" }
+  "inventory"
+}
+
+function isTrap(r: JsonMap): boolean {
+  strField(r, "outcome") == "compiler_trap"
+}
+
+function count(title: string, n: i32) {
+  print("  \{padRight(title, 30)} \{padLeft(toString(n), 6)}")
+}
+
+// The first 20 of `keys` under `title`, when there are any.
+function listFirst(title: string, keys: string[]) {
+  if keys.length == 0 { return }
+  print("\n\{title} (first 20 of \{toString(keys.length)}):")
+  let i = 0
+  while i < keys.length && i < 20 {
+    print("    " + keys[i])
+    i = i + 1
+  }
+}
+
+function diff(args: string[]): i32 {
+  if args.length != 2 {
+    print(USAGE)
+    return 2
+  }
+  const a = loadCells(args[0])
+  const b = loadCells(args[1])
+  let same = 0
+  const bytes: string[] = []
+  const movers: string[] = []
+  const lost: string[] = []
+  const traps: string[] = []
+  const onlyA: string[] = []
+  const onlyB: string[] = []
+  const bytesBy: Map<string, i32> = Map()
+  for c in sortStrings(a.keys()) {
+    const x = a[c]
+    const y = b[c]
+    if x == null { continue }
+    if y == null {
+      onlyA.push(c)
+      continue
+    }
+    const ch = changes(x, y)
+    const xo = strField(x, "outcome")
+    const yo = strField(y, "outcome")
+    if xo == "runs" && yo != "runs" { lost.push("    \{c}  \{ch}") }
+    if isTrap(y) && !isTrap(x) { traps.push("    \{c}  \{ch}") }
+    if ch != "" {
+      movers.push("    \{c}  \{ch}")
+    } else if strField(x, "module") != strField(y, "module") {
+      bytes.push(c)
+      bytesBy[popOf(c)] = (bytesBy[popOf(c)] ?? 0) + 1
+    } else {
+      same = same + 1
+    }
+  }
+  for c in sortStrings(b.keys()) {
+    if a[c] == null { onlyB.push(c) }
+  }
+  print(
+    "sweep diff: base \{args[0]} (\{toString(a.length)}) vs candidate \{args[1]} (\{toString(b.length)})",
+  )
+  count("same", same)
+  count("bytes-only movers", bytes.length)
+  for p in ["cases", "distilled", "inventory"] {
+    const n = bytesBy[p] ?? 0
+    if n > 0 { count("  of them " + p, n) }
+  }
+  count("output movers", movers.length)
+  count("runs -> not-runs  (blocking)", lost.length)
+  count("new compiler traps  (blocking)", traps.length)
+  count("only in base", onlyA.length)
+  count("only in candidate", onlyB.length)
+  if lost.length > 0 {
+    print("\nruns -> not-runs:")
+    for l in lost { print(l) }
+  }
+  if traps.length > 0 {
+    print("\nnew compiler traps:")
+    for l in traps { print(l) }
+  }
+  if movers.length > 0 {
+    print("\noutput movers:")
+    for l in movers { print(l) }
+  }
+  listFirst("bytes-only movers", bytes)
+  listFirst("only in base", onlyA)
+  listFirst("only in candidate", onlyB)
+  if lost.length > 0 || traps.length > 0 {
+    print(
+      "\nsweep: REGRESSION — \{toString(lost.length)} program(s) stopped running, \{toString(traps.length)} new compiler trap(s)",
+    )
+    return 1
+  }
+  print("\nsweep: no runs lost, no new compiler traps")
+  0
+}
+
+const USAGE = "usage: vl run scripts/sweep.vl -- record --compiler <seed> --out <file.jsonl> [--shard K/N]\n           [--population all|cases|distilled|inventory] [--std <dir>] [--vl <bin>]\n       vl run scripts/sweep.vl -- merge --out <file.jsonl> [--population P] <shard.jsonl>...\n       vl run scripts/sweep.vl -- diff <base.jsonl> <cand.jsonl>\nRun from the checkout root (scripts/sweep.md)."
+
+function main(args: string[]): i32 {
+  if args.length == 2 && args[0] == "--grade-chunk" {
+    gradeChunk(args[1])
+    return 0
+  }
+  if args.length == 0 {
+    print(USAGE)
+    return 2
+  }
+  const rest = args.slice(1, args.length)
+  if args[0] == "record" { return record(rest) }
+  if args[0] == "merge" { return merge(rest) }
+  if args[0] == "diff" { return diff(rest) }
+  print(USAGE)
+  2
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("sweep: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
