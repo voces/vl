@@ -38,7 +38,7 @@ import {
   elabArmFeOf,
   elabCallHoleParamTy,
   elabCallParamBoundTy,
-  elabCbSigAt,
+  elabCbArgSig,
   elabDeclFnOf,
   elabDeclIsValue,
   elabLamDeliveredParams,
@@ -59,6 +59,11 @@ import {
   elabValueAgreedCallTys,
   elabValueOnlyCall,
   elabValueReturnsFrom,
+  elabValueSlotCopy,
+  elabValueSlotNote,
+  elabValueSlotOmitSet,
+  elabValueSlotReset,
+  elabValueSlotUncalled,
   elabWalkKeyOf,
   elabWalkTop,
 } from "./emit_elab"
@@ -474,7 +479,9 @@ import {
   lambdaCtr,
   lfNoteClone,
   lfNoteMinted,
+  mfrInertValues,
   monoAnonParamPinTy,
+  monoArgInert,
   monoArgInstFe,
   monoCloCoerceFe,
   monoFieldReadTyIn,
@@ -484,8 +491,8 @@ import {
   monoGradualObjList,
   monoGradualObjLits,
   monoGradualRetPinned,
+  monoHeldInert,
   monoInertCalled,
-  monoInertValues,
   monoInstFe,
   monoInstName,
   monoInstOrig,
@@ -804,7 +811,6 @@ import {
 } from "./check_tp_join"
 import { binArithOp, numUnionMinted, tyIsNumUnion } from "./check_union_mint"
 import {
-  elabCalleeTargets,
   elabFnListClosedLit,
   elabMakerCallSig,
   elabMakerOpen,
@@ -7483,7 +7489,10 @@ function monoCloneGenericCallsRaw(ix: i32) {
         lfNoteMinted(vi, ix)
         monoCopyOf(ix, vi)
         // A value nothing calls stays one in each instance's copy (D9590).
-        if i32ListHas(monoInertValues, ix) { monoInertValues.push(vi) }
+        if i32ListHas(mfrInertValues, ix) { mfrInertValues.push(vi) }
+        if i32ListHas(monoHeldInert, ix) { monoHeldInert.push(vi) }
+        if i32ListHas(monoArgInert, ix) { monoArgInert.push(vi) }
+        elabValueSlotCopy(ix, vi)
         vrGenericCandCopy(ix, vi)
         if i32ListHas(monoInertCalled, ix) { monoInertCalled.push(vi) }
         const vt = monoLamCallTy(ix, nodeTyIxOf(ix))
@@ -12185,6 +12194,7 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrSliced = []
   mfrSetCalls = []
   mfrRepointed = []
+  elabValueSlotOmitSet(mfrRepointed)
   mfrPending = []
   mfrLetBusy = Map()
   mfrLetDepth = 0
@@ -14437,7 +14447,7 @@ function monoFlowNoteInertLeaf(x: i32) {
   if !(nodeAt(x) is Ident) { return 0 }
   const g = monoFlowLeafGen(x)
   if g >= 0 && monoFlowGenCalled(g) && !i32ListHas(monoInertCalled, x) {
-    if !i32ListHas(monoInertValues, x) { monoInertValues.push(x) }
+    if !i32ListHas(mfrInertValues, x) { mfrInertValues.push(x) }
     monoInertCalled.push(x)
     monoFlowNoteInertRets(x)
   }
@@ -14476,7 +14486,7 @@ function monoFlowNoteCallRets(r: i32) {
   const fnd = nodeAt(fd)
   if !(fnd is FuncDecl) { return 0 }
   for a in monoFlowRetOperands(fnd.fnBody) {
-    if !i32ListHas(monoInertValues, a) { monoInertValues.push(a) }
+    if !i32ListHas(mfrInertValues, a) { mfrInertValues.push(a) }
     if !i32ListHas(monoInertCalled, a) { monoInertCalled.push(a) }
     // A returned call's own returns are what reaches the caller (D10381).
     if nodeAt(a) is Call { monoFlowNoteCallRets(a) }
@@ -14914,7 +14924,10 @@ function monoHeldValueAt(
     if monoCoerceFnValueTys(x, monoPinAnnSpelling(t), wf, -1, dTys) < 0 {
       return -1
     }
-    if n is Ident { monoReachNote(x, true) }
+    if n is Ident {
+      if !i32ListHas(monoHeldInert, x) { monoHeldInert.push(x) }
+      monoReachNote(x, true)
+    }
     monoRecordOpen(x, t, wf)
     return 0
   }
@@ -15036,8 +15049,13 @@ function monoSpreadHostInert(at: i32, lit: ArrayLit): boolean {
   }
   let spreads = 0
   for e in lit.arrElems {
-    if nodeAt(e) is Spread { spreads = spreads + 1 }
-    else if !vrValueInert(unwrapParen(e)) { return false }
+    if nodeAt(e) is Spread {
+      spreads = spreads + 1
+    } else if (
+      !(vrValueInert(unwrapParen(e)) || elabValueSlotUncalled(unwrapParen(e)))
+    ) {
+      return false
+    }
   }
   spreads > 0
 }
@@ -15145,23 +15163,6 @@ function monoValsOwnFnTy(vals: i32[][], ann: string): i32 {
     if r >= 0 { own = r }
   }
   own
-}
-
-// The function type a hole lambda typed `et` takes when instanced at the parameters `ann` spells:
-// those parameters and `et`'s own result, or -1 when that result is still open.
-function monoHoleLamAtAnnTy(et: i32, ann: string): i32 {
-  if et < 0 || et >= T.tys.length { return -1 }
-  const f = tyAt(et)
-  if !(f is TyFunc) || f.fnRet < 0 || tyHasTyVar(f.fnRet) { return -1 }
-  const at = nameToTy(ann)
-  if at < 0 || at >= T.tys.length { return -1 }
-  const a = tyAt(at)
-  if !(a is TyFunc) || a.fnParamTypes.length != f.fnParamTypes.length {
-    return -1
-  }
-  const ft = mkFuncTy(a.fnParamTypes, f.fnRet)
-  if !monoTyConcreteFn(ft) { return -1 }
-  ft
 }
 
 // The function type value `v` takes at the parameters `ann` spells, when `v` is a function or an
@@ -15488,19 +15489,12 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
   const dTys = monoPinFnParamTys(at, path, pins[0])
   monoLastInstFe = -1
   const holeLam = monoListElemHoleLamFe(val, ctx) >= 0
-  const vt0 = nodeTyIxOf(val)
   if monoCoerceFnValueTys(val, ann, ctx, -1, dTys) < 0 { return -1 }
   if holeLam && monoLastInstFe < 0 {
     if monoNoteBindDeliveryAt(val, ann, ctx) < 0 { return -1 }
   }
-  let ft = -1
-  if monoLastInstFe >= 0 {
-    ft = monoNodeTyAt(val, fnStmts[monoLastInstFe])
-    if !monoTyConcreteFn(ft) && holeLam { ft = monoHoleLamAtAnnTy(vt0, ann) }
-  }
-  // A value naming no one instance (a `let` written twice) takes the result its functions
-  // agree on at the pin's parameters, as a list element does (D9010).
-  if !monoTyConcreteFn(ft) { ft = monoValueAtAnnTy(val, ann) }
+  // The field's type is the elaboration's slot fact; a field it has none for is left as checked.
+  const ft = elabSlotTyAt(at, path, ctx)
   if !monoTyConcreteFn(ft) { return 0 }
   const vt = nodeTyIxOf(val)
   // A generic's instances share `val`, so its type stays open there (D5079).
@@ -15907,21 +15901,20 @@ function monoPinMapValues(d: LetDecl, at: i32, ctx: i32): i32 {
   if d.letInit < 0 || monoOpenMapValTy(d.letInit) < 0 { return 0 }
   if !monoLetWritesClosed(d, at, ctx) { return 0 }
   const spell: string[] = []
-  // The map's type is the elaboration's slot fact. `monoPinMapSlot` instances the stored values
-  // at it; a map whose generic is called at two signatures has no fact and keeps that spelling
-  // (D15494).
+  // `monoPinMapSlot` instances the stored values and types the map and its reads; the binding's
+  // annotation is the elaboration's slot fact, and a map it has none for keeps none.
   const et = elabSlotTyAt(at, [], ctx)
   const nt = monoPinMapSlot(d.letInit, at, ctx, "", spell)
   if nt < 0 { return monoStoredSlotDecline(nt) }
-  if et >= 0 && !tyEq(et, nt) {
+  if et < 0 { return 0 }
+  if !tyEq(et, nt) {
     emitFail(
       "monoPinMapValues: the map's stored functions close at another type than its slot fact",
     )
     return -1
   }
-  const mt = if et >= 0 { et } else { nt }
-  if !monoLetWritesAt(d, at, ctx, mt) { return 0 }
-  d.letType = synthTypeRefTy(spell[0], -1, mt)
+  if !monoLetWritesAt(d, at, ctx, et) { return 0 }
+  d.letType = synthTypeRefTy(spell[0], -1, et)
   0
 }
 
@@ -16473,6 +16466,7 @@ function monoUncalledSlotFnTy(
   for vw in vals {
     const x = unwrapParen(vw[0])
     if x >= 0 && nodeAt(x) is Ident && !monoTyClosedFn(nodeTyIxOf(x)) {
+      elabValueSlotNote(x, at, path)
       monoReachNote(x, true)
     }
   }
@@ -17054,7 +17048,6 @@ function monoReachIndex(roots: i32[]) {
 // Notes value `x` inert, and with `kept` served by its function's own closure, which nothing
 // here calls (D6660, D6931).
 function monoReachNote(x: i32, kept: boolean) {
-  if !i32ListHas(monoInertValues, x) { monoInertValues.push(x) }
   if kept && !i32ListHas(monoInertCalled, x) { monoInertCalled.push(x) }
   monoFlowNoteInertLeaf(x)
 }
@@ -17974,7 +17967,7 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   const qs: i32[] = [lt.aElem]
   // A generic or hole function named as the callback takes the signature of the instance the
   // elaboration made for it at the element; else its result is derived here.
-  const et = monoCbElabSig(a, ax)
+  const et = elabCbArgSig(a)
   const ef = if et >= 0 { tyAt(et) } else { tyAt(0) }
   let r = TY_BOOL
   if ef is TyFunc { r = ef.fnRet }
@@ -18005,38 +17998,6 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     nodeTyRecord(a, ft)
   }
   0
-}
-
-// The closed signature the elaboration gave the function a list method's callback argument `a`
-// names, through a binding that holds it, or every function a choice there may be when they
-// agree; -1 for none.
-function monoCbElabSig(a: i32, ax: i32): i32 {
-  const ds: i32[] = []
-  const an = nodeAt(ax)
-  if an is Ident {
-    const fd = identFnDeclOf(ax)
-    ds.push(if fd >= 0 { fd } else { cwFnValueDeclOf(ax) })
-  } else if an is IfStmt || an is MatchExpr {
-    for m in elabCalleeTargets(ax) { ds.push(m) }
-  }
-  let t = -1
-  for d in ds {
-    const dt = monoCbElabSigOf(a, ax, d)
-    if dt < 0 || t >= 0 && !tySame(t, dt) { return -1 }
-    t = dt
-  }
-  t
-}
-
-// `monoCbElabSig` for one declaration `d`, read at the argument, its unwrapped form, or the node
-// a clone copied.
-function monoCbElabSigOf(a: i32, ax: i32, d: i32): i32 {
-  if d < 0 { return -1 }
-  const t = elabCbSigAt(a, d)
-  if t >= 0 { return t }
-  const tx = if ax != a { elabCbSigAt(ax, d) } else { -1 }
-  if tx >= 0 { return tx }
-  elabCbSigAt(nodeSrc[a] ?? -1, d)
 }
 
 // The type of the annotation a pin gave the un-annotated binding the `Ident` at `recv` names,
@@ -20478,6 +20439,7 @@ function monoInertParamStubPin(oDecl: i32, argIx: i32, tyOut: i32[]): string {
   if nm == "" { return "" }
   j = 0
   while j < fes.length {
+    if !i32ListHas(monoArgInert, at[j]) { monoArgInert.push(at[j]) }
     monoReachNote(at[j], kept[j])
     if !kept[j] {
       monoInertArgAt.push(at[j])
@@ -24475,7 +24437,9 @@ function monoNamesUsedAsValue(names: string[], cmpCalls: boolean): i32[] {
         while m < names.length {
           if names[m] == idn.identName && hit[m] != 1 {
             let mark = 1
-            if isCallee[k] == 2 || vrValueInert(k) { mark = 2 }
+            if isCallee[k] == 2 || vrValueInert(k) || elabValueSlotUncalled(k) {
+              mark = 2
+            }
             // A template body no slot emits holds no use (D6930); built on the first such read.
             if mark == 1 && dead.length == 0 { dead = monoUnemittedNodes() }
             if mark == 1 && dead[k] == 1 { mark = hit[m] }
@@ -26418,7 +26382,10 @@ export function monomorphize(stmts: i32[]) {
   monoDeliveredArgs = []
   monoStubSlots = []
   monoRetCopyReads = []
-  monoInertValues = []
+  mfrInertValues = []
+  monoHeldInert = []
+  monoArgInert = []
+  elabValueSlotReset()
   vrGenericCandClear()
   monoReachStmts = []
   monoReachRoots = []
