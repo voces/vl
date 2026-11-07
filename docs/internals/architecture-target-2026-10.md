@@ -2613,24 +2613,25 @@ So identity typing is not the prerequisite for this population; one fact is.
       hole-function maps `m` and `f` in `closures/coalesce-default-hole-function-over-map-read.vl`
       then close at the call's types.
     - #6649 closes 7. A written join closes through the functions it holds (`elabBindingFnSet`): a
-      labelled block's or an `if`'s value under the unchanged hole-only and called-directly rules.
-  - **Declining by rule, 7.**
-    - 6 hold a named generic, the D15494 list above.
-    - `closures/fn-choice-bound-as-callback.vl`'s `h5` has no call.
-  - **Waiting on another lane, 48.**
-    - 26 `Map()` rows hold a named generic (D15494).
-    - The `Map()` element writes of the rest go to reach's map element-write source, built inside
-      the same fold.
-    - 7 capture cells are also written with a named generic (D3950). The instance at the delivery
-      is a call-instance signature, so they are Fn#d's.
-    - 10 are lists of hole lambdas whose elements are handed on or returned, never called on path
-      `e`, also Fn#d's.
-    - 2 are uncalled cells (`peerPinned`'s `d2`, `hole-lambda-peer-through-cell-read.vl`'s `d1`)
-      and decline by rule.
+      labelled block's or an `if`'s value, under the unchanged hole-only and called-directly rules.
+  - **Declining by rule, 6.**
+    - 3 `if` choices with no call: `closures/fn-choice-bound-as-callback.vl`'s `h5`,
+      `closures/hole-fn-if-to-hole-param.vl`'s `x`, and one `x` in
+      `closures/hole-fn-labelled-block-loop-capture.vl`.
+    - 2 uncalled capture cells: `peerPinned`'s `d2` and `hole-lambda-peer-through-cell-read.vl`'s `d1`.
+    - `closures/delivered-alias-function-scope.vl`'s `localLambdas` `d`, below.
+  - **D15494, 30.** A named generic held in the map (26) or list (4); listed above.
+  - **Reach, 2.** The two remaining hole-function `Map()` rows close through the map
+    element-write source, built inside the same fold.
+  - **Fn#d, 17.**
+    - 7 capture cells are also written with a named generic (D3950); the instance at the delivery
+      is a call-instance signature.
+    - 10 lists of hole lambdas have elements that are handed on or returned, never called on
+      path `e`.
   - **No cell-path closer.** The capture rewrite runs after `elabSlotFacts`, so a captured `let` is
     closed as the function binding it is, at path `[]`.
-    - `closures/delivered-alias-function-scope.vl`'s `localLambdas` `d` declines. Its two members
-      are local hole lambdas, and one is also called directly at `string`.
+    - `localLambdas`' `d` declines. Its two members are local hole lambdas, and one is also called
+      directly at `string`.
     - Its siblings that do close answer the function type against mono's cell list
       `((i32) => i32)[]`. That is the cell-form difference already in the 22, so closing it would
       add a 23rd.
