@@ -7,6 +7,7 @@ with a line in this index; the PR that moves a step also updates the target doc'
 
 Newest first:
 
+- [2026-11-07-pin-decisions-off-spelling](2026-11-07-pin-decisions-off-spelling.md): Every decision that read an instance pin's spelling (`=>`, `isNumRecvBaseName`) reads its type; sweep byte-identical.
 - [2026-11-07-forin-struct-row-shadow](2026-11-07-forin-struct-row-shadow.md): `forInVarStructIdx` against `repSlotOfKind`: 284 of 286 agree, both misses function-valued fields (step 3); `repSlotOfTy` not widened.
 - [2026-11-07-classifier-phase-census](2026-11-07-classifier-phase-census.md): The classifier phase census committed (`$VL_CLS_CENSUS`, `scripts/classifier-census.vl`), and its reading on master.
 - [2026-11-07-identity-typing-fact](2026-11-07-identity-typing-fact.md): Identity typing (A) slice 2a: the fact in the elaboration; 1,505 of 1,505 concrete specialization decisions read mono's declaration, byte-identical; the checker-type variant refused (16 runs lost).
