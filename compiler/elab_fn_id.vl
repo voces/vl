@@ -4,19 +4,29 @@
 // its tails, and anything else (a parameter, a field, a call result) is open.
 
 import {
+  ArrayLit,
+  BinExpr,
   Call,
+  FieldInit,
   FuncDecl,
   Ident,
   IfStmt,
+  Index,
   LetDecl,
   MatchExpr,
+  Member,
+  ObjLit,
   P,
   Param,
+  Spread,
   i32ToStr,
   nodeAt,
 } from "./ast"
 import { i32ListIndexOf } from "./listutil"
-import { T, TyFunc } from "./check_types"
+import { T, TyArray, TyFunc, TyMap, TyNullable, TyObj } from "./check_types"
+import { nodeTyFrozenOf } from "./check_node_tys"
+import { cwIxBuild, cwSlotPath } from "./check_write_scan"
+import { recEnclosingFn } from "./check_fit_rules"
 import { tyHasTyVar } from "./tyquery"
 import { identDeclOf, nodeSrc } from "./symbols"
 import { wrDstDecl } from "./check_decl_scan"
@@ -25,7 +35,9 @@ import { elabFnSetTy, fnTagged } from "./check_fn_tag_facts"
 import { elabFnSetOf, elabFnSetTyMint } from "./check_elab_cap"
 import { parenPeelIx } from "./check_places"
 import {
+  elabHeldValTy,
   elabIdentityTy,
+  elabSlotTyAt,
   elabSpecBaseOf,
   elabSpecChildCount,
   elabSpecDeclAt,
@@ -172,7 +184,248 @@ export function elabFnIdReset() {
   idWritesBuilt = false
   idWrites = Map()
   idLetMemo = Map()
+  idSlotsBuilt = false
+  idSlotW = []
+  idSlotWKey = []
+  idSlotWTy = []
+  idSlotWPos = []
+  idSlotWTop = []
+  idSlotWHolder = []
+  idSlotWSteps = []
+  idSlotSets = Map()
+  idSlotOpen = Map()
   0
+}
+
+// Each function-typed write into a slot (a list element, a record field, a map value): the value
+// node, its slot's key, the slot's checked type and the write's position kind.
+let idSlotsBuilt = false
+let idSlotW: i32[] = []
+let idSlotWKey: string[] = []
+let idSlotWTy: i32[] = []
+let idSlotWPos: string[] = []
+// Per write: the outermost node above it (a literal or the value itself), its binding (-1 for
+// none) and the steps from that node down to the write.
+let idSlotWTop: i32[] = []
+let idSlotWHolder: i32[] = []
+let idSlotWSteps: string[][] = []
+// Per slot key, the union of its writes' sets, and whether some write may be any function.
+let idSlotSets: {[string]: i32[]} = Map()
+let idSlotOpen: {[string]: boolean} = Map()
+// Per value node inside a list or record literal: the literal and the step to it.
+let idLitUp: {[i32]: i32} = Map()
+let idLitStep: {[i32]: string} = Map()
+// Per node written by a `let` initializer, `.push`, `.set` or `=`: the place it lands at.
+let idTopHolder: {[i32]: i32} = Map()
+let idTopPath: {[i32]: string[]} = Map()
+
+function idFnTy(t: i32): boolean {
+  let c = t
+  while c >= 0 && c < T.tys.length && T.tys[c] is TyNullable {
+    const n = T.tys[c]
+    c = if n is TyNullable { n.nInner } else { -1 }
+  }
+  c >= 0 && c < T.tys.length && T.tys[c] is TyFunc
+}
+
+// The type one step `st` (a field name, or "[]" for an element or map value) below type `t`.
+function idStepTy(t0: i32, st: string): i32 {
+  let t = t0
+  while t >= 0 && t < T.tys.length && T.tys[t] is TyNullable {
+    const n = T.tys[t]
+    t = if n is TyNullable { n.nInner } else { -1 }
+  }
+  if t < 0 || t >= T.tys.length { return -1 }
+  const o = T.tys[t]
+  if st == "[]" && o is TyArray { return o.aElem }
+  if st == "[]" && o is TyMap { return o.mVal }
+  if o is TyObj {
+    let j = 0
+    while j < o.objFieldNames.length && j < o.objFieldTypes.length {
+      if o.objFieldNames[j] == st { return o.objFieldTypes[j] }
+      j = j + 1
+    }
+  }
+  -1
+}
+
+function idSlotAdd(w: i32, ty: i32, pos: string) {
+  if !idFnTy(ty) { return 0 }
+  idSlotW.push(w)
+  idSlotWTy.push(ty)
+  idSlotWPos.push(pos)
+  idSlotWKey.push("")
+  idSlotWTop.push(-1)
+  idSlotWHolder.push(-1)
+  const none: string[] = []
+  idSlotWSteps.push(none)
+  0
+}
+
+// Notes `v`, written by a binding's initializer or into the place `place` reaches through
+// `extra` (a "[]" step, or none), as landing at that place.
+function idTopNote(v: i32, place: i32, extra: string) {
+  const path: string[] = []
+  const r = cwSlotPath(place, path)
+  if r < 0 { return 0 }
+  const d = identDeclOf(r)
+  if d < 0 { return 0 }
+  if extra != "" { path.push(extra) }
+  idTopHolder[v] = d
+  idTopPath[v] = path
+  0
+}
+
+// The key of the slot write `i` lands in: a named binding's place (`B<decl>/<steps>`) when the
+// literals around it are written to one, else the outermost literal's (`L<node>/<steps>`).
+function idSlotKeyOfWrite(i: i32): string {
+  const w = idSlotW[i]
+  const rev: string[] = []
+  let u = w
+  let guard = 0
+  while idLitUp.has(u) && guard < 32 {
+    rev.push(idLitStep[u] ?? "")
+    u = idLitUp[u] ?? -1
+    guard = guard + 1
+  }
+  let k = ""
+  const steps: string[] = []
+  const d = idTopHolder[u] ?? -1
+  if d >= 0 {
+    k = "B" + i32ToStr(idCanon(d))
+    for st in idTopPath[u] ?? [] {
+      k = k + "/" + st
+      steps.push(st)
+    }
+  } else {
+    k = "L" + i32ToStr(u)
+  }
+  let j = rev.length - 1
+  while j >= 0 {
+    k = k + "/" + rev[j]
+    steps.push(rev[j])
+    j = j - 1
+  }
+  idSlotWTop[i] = u
+  idSlotWHolder[i] = d
+  idSlotWSteps[i] = steps
+  k
+}
+
+// Builds every slot write and each slot's set, once per compile.
+export function idSlotsBuild() {
+  if idSlotsBuilt { return 0 }
+  idSlotsBuilt = true
+  idLitUp = Map()
+  idLitStep = Map()
+  idTopHolder = Map()
+  idTopPath = Map()
+  cwIxBuild()
+  const end = P.nodes.length
+  let ix = 0
+  while ix < end {
+    const n = nodeAt(ix)
+    if n is ArrayLit {
+      const lt = nodeTyFrozenOf(ix)
+      const et = idStepTy(lt, "[]")
+      for e in n.arrElems {
+        if e < 0 || e >= end { continue }
+        idLitUp[e] = ix
+        idLitStep[e] = "[]"
+        idSlotAdd(e, et, "list")
+      }
+    } else if n is ObjLit {
+      const ot = nodeTyFrozenOf(ix)
+      for f in n.objFields {
+        const fi = if f >= 0 && f < end { nodeAt(f) } else { null }
+        if fi is FieldInit && fi.fiValue >= 0 {
+          idLitUp[fi.fiValue] = ix
+          idLitStep[fi.fiValue] = fi.fiName
+          idSlotAdd(fi.fiValue, idStepTy(ot, fi.fiName), "field")
+        }
+      }
+    } else if n is LetDecl && n.letInit >= 0 {
+      idTopHolder[n.letInit] = idCanon(ix)
+      const none: string[] = []
+      idTopPath[n.letInit] = none
+    } else if n is Call {
+      const f = nodeAt(parenPeelIx(n.callFn))
+      if f is Member && (f.memProp == "push" || f.memProp == "set") {
+        const at = if f.memProp == "push" { 0 } else { 1 }
+        if at < n.callArgs.length {
+          const v = n.callArgs[at]
+          idTopNote(v, f.memObj, "[]")
+          const pos = if f.memProp == "push" { "push" } else { "set" }
+          idSlotAdd(v, idStepTy(nodeTyFrozenOf(f.memObj), "[]"), pos)
+        }
+      }
+    } else if n is BinExpr && n.binOp == "=" && n.binCompound == "" {
+      const l = nodeAt(parenPeelIx(n.binLeft))
+      if !(l is Ident) {
+        idTopNote(n.binRight, n.binLeft, "")
+        let lt = -1
+        if l is Index { lt = idStepTy(nodeTyFrozenOf(l.idxArr), "[]") }
+        if l is Member { lt = idStepTy(nodeTyFrozenOf(l.memObj), l.memProp) }
+        if lt < 0 { lt = nodeTyFrozenOf(n.binLeft) }
+        idSlotAdd(n.binRight, lt, "store")
+      }
+    }
+    ix = ix + 1
+  }
+  let i = 0
+  while i < idSlotW.length {
+    const key = idSlotKeyOfWrite(i)
+    idSlotWKey[i] = key
+    const w = idSlotW[i]
+    const none: i32[] = []
+    const s = if nodeAt(w) is Spread { none } else { idSetOf(w, 0) }
+    if s.length == 0 { idSlotOpen[key] = true }
+    idSlotSets[key] = idUnion(idSlotSets[key] ?? [], s)
+    i = i + 1
+  }
+  0
+}
+
+export function idSlotWriteCount(): i32 {
+  idSlotsBuild()
+  idSlotW.length
+}
+
+// The value node, slot key, slot type and position kind of slot write `i`.
+export function idSlotWriteAt(i: i32): i32 { idSlotW[i] }
+export function idSlotWriteKey(i: i32): string { idSlotWKey[i] }
+export function idSlotWriteTy(i: i32): i32 { idSlotWTy[i] }
+export function idSlotWritePos(i: i32): string { idSlotWPos[i] }
+
+// The closed type the slot of write `i` is held at in its enclosing function's frame: the binding's
+// slot fact, or the held type of the outermost literal, walked down the steps; -1 for none.
+export function idSlotWriteHeldTy(i: i32): i32 {
+  const w = idSlotW[i]
+  const f = recEnclosingFn(w)
+  const d = idSlotWHolder[i]
+  const steps = idSlotWSteps[i]
+  let t = -1
+  if d >= 0 {
+    t = elabSlotTyAt(d, [], f)
+  } else {
+    const u = idSlotWTop[i]
+    if u == w { return -1 }
+    t = elabHeldValTy(u, f)
+  }
+  let j = 0
+  while j < steps.length && t >= 0 {
+    t = idStepTy(t, steps[j])
+    j = j + 1
+  }
+  t
+}
+
+// The functions slot `key` may hold, ascending: the union of its writes' sets; [] where some
+// write may be any function (a parameter, a call result, a spread).
+export function idSlotSetOf(key: string): i32[] {
+  idSlotsBuild()
+  if idSlotOpen[key] ?? false { return [] }
+  idSlotSets[key] ?? []
 }
 
 // The values written to `let` node `bd`, its initialiser included.
