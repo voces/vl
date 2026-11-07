@@ -1,3 +1,4 @@
+import { elabCovNote } from "./emit_state"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
 import { recEnclosingFn } from "./check_fit_rules"
 import {
@@ -669,6 +670,10 @@ import {
   elabCallHandMember,
   elabCallHandOwner,
   elabCallKeyBinding,
+  elabValueInstKey,
+  elabKeySig,
+  elabIdentityTy,
+  elabWalkTop,
   elabCallParamKey,
   elabCallParamRowTy,
   elabCallParamTy,
@@ -685,6 +690,7 @@ import {
   elabHoleGenFlowHolder,
   elabHoleGenFlowTy,
   elabHoleMapClosed,
+  elabIdentityTy,
   elabInstSlotAt,
   elabInstSpelling,
   elabInstTyAt,
@@ -2382,44 +2388,27 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
 // The pin argument `ix` binds its parameter at, at instance `fnIx`: its closed type's, else
 // the cascade's for a type that does not decide it.
 export function monoArgTyName(ix: i32, fnIx: i32) {
-  const tr = monoArgClosedPinTy(ix, fnIx)
-  const t = tr[0]
-  const rec = tr[1] == 1
-  if t >= 0 {
-    // A value union nothing spells gets its row here, which the instance's boxes read tags from.
-    if (
-      !rec
-      && !tyMayHoldFn(t, 0)
-      && !(tyAt(t) is TyUnion && numLitUnionBaseName(t) != "")
-      && tyIsUnionish(t)
-      && unRowOfCanonFolded(t) < 0
-    ) {
-      monoRegisterValueUnion(t)
-    }
-    const tp = if rec { monoRecordNominalPin(t) } else { monoPinOfClosedTy(t) }
-    if tp != "" { return tp }
-  }
+  const tp = monoArgClosedPin(ix, fnIx)
+  if tp != "" { return tp }
   monoArgTyNameCascade(ix, fnIx)
 }
 
-// `[type, record]`: the closed type argument `ix` is pinned from at instance `fnIx`, and 1 where it
-// is pinned as a record (`monoRecordNominalPin`); `[-1, 0]` where its type does not decide the pin.
-// A record read narrowed below its place, or any read the instance alone narrows, is pinned from
-// the type its place holds.
-function monoArgClosedPinTy(ix: i32, fnIx: i32): i32[] {
-  const none: i32[] = [0 - 1, 0]
+// The pin of argument `ix` read from its closed type at instance `fnIx`, or "" where the type
+// does not decide it, which the decline tests by the type's kind.
+function monoArgClosedPin(ix: i32, fnIx: i32): string {
   const cax = unwrapParen(ix)
-  if cax < 0 || cax >= P.nodes.length { return none }
+  if cax < 0 || cax >= P.nodes.length { return "" }
   let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
   if t < 0 { t = elabArgBuiltTy(cax) }
-  if t < 0 || t >= T.tys.length { return none }
-  // A record is handed as the reference it is stored as: a narrowed record read takes the type its
-  // place holds; a structural record waits on its build row (a4cf's row-key fact).
+  if t < 0 || t >= T.tys.length { return "" }
+  // A record type pins at its nominal spelling, and a narrowed record read at the one its place
+  // holds, since a record is handed as the reference it is stored as; a structural record
+  // waits on its build row (a4cf's row-key fact).
   if tyHoldsObj(t, 8) {
-    if !monoReadIsNarrowed(cax, fnIx) { return [t, 1] }
+    if !monoReadIsNarrowed(cax, fnIx) { return monoRecordNominalPin(t) }
     const rh = monoPlaceHeldTy(cax, fnIx)
-    if rh < 0 || rh >= T.tys.length || tyHasTyVar(rh) { return none }
-    return [rh, 1]
+    if rh < 0 || rh >= T.tys.length || tyHasTyVar(rh) { return "" }
+    return monoRecordNominalPin(rh)
   }
   // A read the checker narrowed converts at the read and pins at its own type; one only the
   // instance types narrower than its place is handed the place's held type.
@@ -2431,11 +2420,19 @@ function monoArgClosedPinTy(ix: i32, fnIx: i32): i32[] {
       || tyHasTyVar(held)
       || tyHoldsObj(held, 8)
     ) {
-      return none
+      return ""
     }
-    return [held, 0]
+    t = held
   }
-  [t, 0]
+  if tyMayHoldFn(t, 0) { return monoFnTyPin(t) }
+  // A union of numeric literals is its base scalar, which is how its values are stored.
+  if tyAt(t) is TyUnion {
+    const nb = numLitUnionBaseName(t)
+    if nb != "" { return nb }
+  }
+  // A value union nothing spells gets its row here, which the instance's boxes read tags from.
+  if tyIsUnionish(t) && unRowOfCanonFolded(t) < 0 { monoRegisterValueUnion(t) }
+  monoClosedTyPin(t)
 }
 
 // The pin of closed record-bearing type `ty` by its declared names: a declared record or a generic
@@ -4208,6 +4205,8 @@ function monoLamSubstParams(
       const tn = if p.parType >= 0 && p.parType < P.nodes.length { nodeAt(p.parType) } else { null }
       const tpos = if tn is TypeRef { tn.pos } else { p.pos }
       const nt = if etShut { synthTypeRefTy(sp, tpos, et) } else { nt0 }
+      if nt0 >= 0 && !etShut { zlGrade("lsp-subst", nodeTyIxOf(nt0), fnIx, i) }
+      if nt0 >= 0 && etShut { elabCovNote("zl lsp-elab") }
       if etShut && sp != tyNameOf(nt0) {
         return emitFailAt(
           "emitProgram: internal: parameter `"
@@ -4234,6 +4233,7 @@ function monoLamSubstParams(
         // An un-annotated parameter the checker inferred at the type parameter (a `.filter`
         // callback over a `T[]`) is annotated at this pin, since nothing else lowers it.
         const ipn = monoLamParamPinAnn(fnIx, i, p.parType, bN, bT)
+        if ipn >= 0 { zlGrade("lsp-ann", nodeTyIxOf(ipn), fnIx, i) } else { elabCovNote("zl lsp-ann none") }
         if ipn >= 0 {
           ps.push(
             monoCopyOf(
@@ -5406,6 +5406,7 @@ function monoPinMapLambdas(ix: i32, pNames: string[]) {
               elem = armName
               elemTy = armEl
             }
+            if elem != "" && elem != "i32" { zlGrade("pml", elemTy, n.callArgs[0], 0) } else { elabCovNote("zl pml inert") }
             if elem != "" && elem != "i32" {
               const cloned = monoCloneLambdaPinned(n.callArgs[0], elem, elemTy)
               if cloned >= 0 {
@@ -8521,6 +8522,51 @@ function monoTyHoldsLitUnionArm(ty: i32): boolean {
   false
 }
 
+// A registry hit serves this call's pins from an instance built for others: a parameter whose
+// recorded pin is a different type is marked -2, so no test answers from either (D2684).
+function monoPoisonSharedPins(instFe: i32, pinTys: i32[]) {
+  if instFe < 0 || instFe >= fnStmts.length { return 0 }
+  const fd = nodeAt(fnStmts[instFe])
+  if fd is FuncDecl {
+    let j = 0
+    while j < fd.fnParams.length && j < pinTys.length {
+      const pn = nodeAt(fd.fnParams[j])
+      if pn is Param {
+        if pn.parType >= 0 && pinTys[j] >= 0 {
+          // Only two different MAP pins conflict: a `null` argument holds no map, so a map pin
+          // arriving after one takes its place.
+          const was = monoParamPinTy.get(pn.parType) ?? -1
+          if was >= 0 && monoTyHoldsMap(pinTys[j]) && !tyEq(was, pinTys[j]) {
+            if monoTyHoldsMap(was) {
+              monoParamPinTy.set(pn.parType, -2)
+            } else {
+              monoParamPinTy.set(pn.parType, pinTys[j])
+            }
+          }
+        }
+      }
+      j = j + 1
+    }
+  }
+  0
+}
+
+// Whether the union or nullable `ty` has a map among its members.
+function monoTyHoldsMap(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const flat: i32[] = []
+  flattenVariantsInto(ty, flat)
+  let i = 0
+  while i < flat.length {
+    const m = flat[i]
+    if m >= 0 && m < T.tys.length {
+      if tyAt(m) is TyMap { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // Whether the union or nullable `ty` has a map or a record among its members: the arms a
 // union box holds under a registered row, where a value atom's tag needs none.
 function monoTyHoldsRefArm(ty: i32): boolean {
@@ -8917,6 +8963,7 @@ function monoMakeInstanceHit(
   key: string,
   origFe: i32,
   pinned: string[],
+  pinTys: i32[],
   calleeIx: i32,
   annotateI32: boolean,
 ) {
@@ -8926,6 +8973,7 @@ function monoMakeInstanceHit(
       monoLastInstFe = monoInstFe[k]
       monoArmRowNote(calleeIx, monoInstFe[k])
       monoNoteOpenArgs(calleeIx, monoInstFe[k])
+      monoPoisonSharedPins(monoInstFe[k], pinTys)
       const cal = nodeAt(calleeIx)
       if cal is Ident {
         // A registry hit on a capturing lambda in the binding's own slot must stay a
@@ -10197,7 +10245,9 @@ function monoMakeInstanceGo(
     }
     monoPinKindsNoteFnVal(pinKinds)
     // Registry hit: point this call site at the existing instance.
-    if (monoMakeInstanceHit(k.key, origFe, pinned, calleeIx, annotateI32)) {
+    if (
+      monoMakeInstanceHit(k.key, origFe, pinned, pinTys, calleeIx, annotateI32)
+    ) {
       return monoCadNoteInstance(
         origFe,
         monoLastInstFe,
@@ -10260,7 +10310,14 @@ function monoMakeInstanceGo(
     ) {
       monoShPendFlush(shAt)
       if (
-        monoMakeInstanceHit(typedHit, origFe, pinned, calleeIx, annotateI32)
+        monoMakeInstanceHit(
+          typedHit,
+          origFe,
+          pinned,
+          pinTys,
+          calleeIx,
+          annotateI32,
+        )
       ) {
         return monoCadNoteInstance(
           origFe,
@@ -10289,10 +10346,9 @@ function monoMakeInstanceGo(
     const holeT: i32[] = []
     // The binding is the call key's (`elabCallKeyBinding`). The rebuild below is the residue: a
     // function-holding parameter, whose concrete rep the call key does not name (Fn#d's
-    // value-instance fact).
+    // value-instance fact), and a literal or record binding (rowintern's row key, #6629).
     const fromKey = elabCallKeyBinding(
       callKey,
-      tplCall,
       monoOrigNode[origFe],
       params,
       k.tps,
@@ -15637,7 +15693,8 @@ function monoLetWriteRhsTyRec(w: i32, ctx: i32, rec: boolean): i32 {
   if nodeAt(rx) is ObjLit {
     const lt = monoClosedObjLitTy(rx, monoStoreFrame(w, ctx), rec)
     if lt >= 0 { return lt }
-    return nodeTyIxOf(rx)
+    const it = elabIdentityTy(rx, monoStoreFrame(w, ctx))
+    return if it >= 0 { it } else { nodeTyIxOf(rx) }
   }
   if !(nodeAt(rx) is Ident) { return -1 }
   const bd = monoReadLetFrame(rx, monoStoreFrame(w, ctx))[1]
@@ -17491,7 +17548,8 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   if ax < 0 || (!(nodeAt(ax) is Ident) && !choice && !lam) { return 0 }
   // Inside a generic instance the receiver is read at that instance's binding. An open receiver
   // takes the closed type the elaboration gives the value, where it gives one.
-  let rt = monoNodeTyAt(m.memObj, ctx)
+  let rt = elabIdentityTy(m.memObj, ctx)
+  if rt < 0 { rt = monoNodeTyAt(m.memObj, ctx) }
   if rt < 0 || monoTyOpen(rt) {
     const ew = elabWrittenValueTy(0 - 1, m.memObj, elabWalkTop())
     if ew >= 0 { rt = ew }
@@ -23890,6 +23948,15 @@ function monoNoteBindDeliveryCall(at: i32, ann: string, ctx: i32, callIx: i32) {
   // A hole lambda the name reaches that nothing has pinned yet takes the signature in place,
   // as its own contextual type would pin it (D3852).
   const fe = monoLamValueFe(at, ctx)
+  {
+    const zps = monoSigPins(sig + ";")
+    const zacts = fe >= 0 && fe < monoGen.length && monoGen[fe] == 1 && (!monoInstantiatedAny(fe) || monoSlotSig(fe) != sig + ";")
+    if !zacts { elabCovNote("zl nbd inert") } else {
+      let zi = 0
+      while zi < zps.length { zlGradeS("nbd", zps[zi], at, zi)
+        zi = zi + 1 }
+    }
+  }
   if (
     fe >= 0
     && fe < monoGen.length
@@ -26713,4 +26780,55 @@ function monoRetListRowName(ty: i32): string {
   const rn = monoRetRowName(t)
   if rn == "" { return "" }
   rn + suffix
+}
+
+// PROBE helpers
+function zlSame(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  tySame(a, b) || repCanonId(a) == repCanonId(b)
+}
+// param i of the one signature value x's keys give, -2 none, -3 several, -4 open
+function zlSigParam(x: i32, i: i32): i32 {
+  let ks = elabValueInstKey(x, elabWalkTop())
+  if ks.length == 0 { ks = elabValueInstKey(x, -1) }
+  if ks.length == 0 { return -2 }
+  let sig = -1
+  for kk in ks {
+    const sg = elabKeySig(kk)
+    if sg < 0 { return -4 }
+    if sig >= 0 && !tySame(sig, sg) { return -3 }
+    sig = sg
+  }
+  const ft = tyAt(sig)
+  if ft is TyFunc { if i < ft.fnParamTypes.length { return ft.fnParamTypes[i] } }
+  -4
+}
+function zlIdParam(x: i32, i: i32): i32 {
+  const t = elabIdentityTy(x, -1)
+  if t < 0 || t >= T.tys.length { return -2 }
+  const ft = tyAt(t)
+  if ft is TyFunc { if i < ft.fnParamTypes.length { const r = ft.fnParamTypes[i]
+    if tyHasTyVar(r) || tyReachesHole(r, 16) { return -4 }
+    return r } }
+  -2
+}
+function zlGrade(tag: string, mono: i32, x: i32, i: i32) {
+  const sg = zlSigParam(x, i)
+  const id = zlIdParam(x, i)
+  const gs = if sg == -2 { "none" } else if sg == -3 { "multi" } else if sg == -4 { "open" } else if zlSame(sg, mono) { "agree" } else { "differ" }
+  const gi = if id == -2 { "none" } else if id == -4 { "open" } else if zlSame(id, mono) { "agree" } else { "differ" }
+  elabCovNote("zl " + tag + " sig=" + gs + " id=" + gi)
+  if gs == "differ" { elabCovNote("zl " + tag + " sigdiff " + tyToStr(mono) + " | " + tyToStr(sg)) }
+  if gi == "differ" { elabCovNote("zl " + tag + " iddiff " + tyToStr(mono) + " | " + tyToStr(id)) }
+}
+function zlGradeS(tag: string, mono: string, x: i32, i: i32) {
+  const sg = zlSigParam(x, i)
+  const id = zlIdParam(x, i)
+  const ss = if sg >= 0 { monoPinAnnSpelling(sg) } else { "" }
+  const is2 = if id >= 0 { monoPinAnnSpelling(id) } else { "" }
+  const gs = if sg == -2 { "none" } else if sg == -3 { "multi" } else if sg == -4 { "open" } else if ss == mono { "agree" } else { "differ" }
+  const gi = if id == -2 { "none" } else if id == -4 { "open" } else if is2 == mono { "agree" } else { "differ" }
+  elabCovNote("zl " + tag + " sig=" + gs + " id=" + gi)
+  if gs == "differ" { elabCovNote("zl " + tag + " sigdiff " + mono + " | " + ss) }
+  if gi == "differ" { elabCovNote("zl " + tag + " iddiff " + mono + " | " + is2) }
 }
