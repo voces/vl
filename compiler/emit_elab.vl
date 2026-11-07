@@ -268,6 +268,7 @@ import {
 import { cstrOwnerStack, curFnDeclIx, quietDepth } from "./check_cursor"
 import { monoRecheckEnd } from "./check_demands"
 import { callDstTyOf, cbExpMark, cbExpTruncate } from "./check_expected"
+import { rcwCallSites } from "./check_record_writes"
 import { RB_ALL, checkMark, checkRollback } from "./check_rollback"
 import { argIsLitAggregate, bindOf, i32TyIx } from "./check_leaf_steps"
 import { holePinHeldSet } from "./check_hole_pins"
@@ -11429,7 +11430,14 @@ function elabSlotTyAtKey(holder: i32, path: string[], ik: i32): i32 {
   const hs = nodeSrc[holder] ?? -1
   const src = if hs >= 0 { hs } else { holder }
   const own = if ik >= 0 { elabSlotTys[elabSlotKey(src, ik)] ?? -1 } else { -1 }
-  let t = if own >= 0 { own } else { elabSlotTys[elabSlotKey(holder, -1)] ?? -1 }
+  const t = if own >= 0 { own } else { elabSlotTys[elabSlotKey(holder, -1)] ?? -1 }
+  elabTyAtPath(t, path)
+}
+
+// The type slot `path` of type `t0` holds (`e`, `v`, `f.<name>`, outermost first); -1 where `t0`
+// has no such slot.
+function elabTyAtPath(t0: i32, path: string[]): i32 {
+  let t = t0
   for p in path {
     if t < 0 || t >= T.tys.length { return -1 }
     const o = tyAt(t)
@@ -15225,6 +15233,149 @@ export function elabIdentityTy(x: i32, fnIx: i32): i32 {
   const f = nodeTyFrozenOf(x)
   if f >= 0 { return f }
   nodeTyFrozenOf(nodeSrc[x] ?? -1)
+}
+
+// The closed type value `x`, a literal or call holding a function, is built at in emitted function
+// `fnIx`'s frame: its identity type where closed; else, for a value `fnIx` returns or a literal
+// nested in one, `fnIx`'s return slot fact at that path; else a call's callee's; else each open
+// function leaf at the signature its functions are instanced at. -1 where none closes.
+export function elabHeldValTy(x0: i32, fnIx: i32): i32 {
+  const x = parenPeelIx(x0)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const id = elabIdentityTy(x, fnIx)
+  if id < 0 || id >= T.tys.length { return -1 }
+  if elabTyClosed(id, 0) && !tyHasTyVar(id) { return id }
+  const path: string[] = []
+  const onRet = fnIx >= 0 && elabRetPathOf(x, fnIx, path)
+  if onRet {
+    const st = elabSlotTyAt(fnIx, path, fnIx)
+    if st >= 0 { return st }
+  }
+  const xn = nodeAt(x)
+  if xn is Call {
+    const cf = xn.callFn
+    const cd = if cf >= 0 && cf < P.nodes.length && nodeAt(cf) is Ident { identFnDeclOf(cf) } else { -1 }
+    const ct = if cd >= 0 { elabSlotTyAt(cd, [], -1) } else { -1 }
+    if ct >= 0 { return ct }
+    return -1
+  }
+  const k = if fnIx >= 0 { elabKeyAt(fnIx) } else { -1 }
+  if k < -1 { return -1 }
+  // A value no instance reaches is built at the one closed type every call of `fnIx` delivers it to.
+  if k == -1 && onRet {
+    const dt = elabTyAtPath(elabRetDstTy(fnIx), path)
+    if dt >= 0 && elabTyClosed(dt, 0) && !tyHasTyVar(dt) { return dt }
+  }
+  const none: string[] = []
+  let t = elabHeldClosedTyAt(id, [x], 0, -1, none, k)
+  // An instance whose functions are instanced outside it reads them at the program's instances.
+  if (t < 0 || tyHasTyVar(t)) && k >= 0 {
+    t = elabHeldClosedTyAt(id, [x], 0, -1, none, -1)
+  }
+  if (t < 0 || tyHasTyVar(t)) && k >= 0 { t = elabHeldIdTy(x, fnIx, 0) }
+  if t < 0 || tyHasTyVar(t) { -1 } else { t }
+}
+
+// The closed type literal `x` has in instance frame `fnIx` from its leaves' identity types: a
+// function leaf whose set names functions at the one signature the program instances them at.
+// -1 where a leaf is neither closed nor such a function, or two elements differ.
+function elabHeldIdTy(x0: i32, fnIx: i32, depth: i32): i32 {
+  const x = parenPeelIx(x0)
+  if x < 0 || x >= P.nodes.length || depth > 32 { return -1 }
+  const id = elabIdentityTy(x, fnIx)
+  if id < 0 || id >= T.tys.length { return -1 }
+  if elabTyClosed(id, 0) && !tyHasTyVar(id) { return id }
+  const n = nodeAt(x)
+  const o = tyAt(id)
+  if n is ArrayLit {
+    let et = -1
+    for e in n.arrElems {
+      const t = elabHeldIdTy(e, fnIx, depth + 1)
+      if t < 0 || (et >= 0 && !tySame(et, t)) { return -1 }
+      et = t
+    }
+    return if et < 0 { -1 } else { mkArrayTy(et) }
+  }
+  if n is ObjLit {
+    if !(o is TyObj) { return -1 }
+    const tys: i32[] = []
+    for nm in o.objFieldNames {
+      let ft = -1
+      for fi in n.objFields {
+        const f = nodeAt(fi)
+        if f is FieldInit && f.fiName == nm {
+          ft = elabHeldIdTy(f.fiValue, fnIx, depth + 1)
+        }
+      }
+      if ft < 0 { return -1 }
+      tys.push(ft)
+    }
+    return mkObjTy(o.objFieldNames, tys)
+  }
+  if !(o is TyFunc) { return -1 }
+  const ds = elabFnSetOf(id)
+  if ds.length == 0 { return -1 }
+  const none: string[] = []
+  elabHeldFnTy(id, ds, -1, none)
+}
+
+// The one closed type every call of the function `fnIx` is delivered to: its destination
+// (`callDstTyOf`), else the slot fact of the `let` it initialises; -1 where a call is not
+// enumerable, a method spelling, has neither, or two differ.
+function elabRetDstTy(fnIx: i32): i32 {
+  const cs: i32[] = []
+  if rcwCallSites(fnIx, cs) >= 0 || cs.length == 0 { return -1 }
+  let t = -1
+  for c2 in cs {
+    if c2 % 2 != 0 { return -1 }
+    const c = c2 / 2
+    let dt = callDstTyOf(c)
+    // A call an un-annotated `let` binds is delivered at that binding's slot fact.
+    if dt < 0 && cwIxCovers(c) && cwIxUpKind[c] == CW_UP_LETINIT {
+      dt = elabSlotTys[elabSlotKey(cwIxUp[c], -1)] ?? -1
+    }
+    if dt < 0 || dt >= T.tys.length || tyHasTyVar(dt) { return -1 }
+    if t >= 0 && !tySame(t, dt) { return -1 }
+    t = dt
+  }
+  t
+}
+
+// Whether `x` is a value function `fnIx` returns, or a list or record literal nested in one, its
+// slot path from the returned value (`e`, `f.<name>`, outermost first) appended to `out`.
+function elabRetPathOf(x: i32, fnIx: i32, out: string[]): boolean {
+  const fd = nodeAt(fnIx)
+  if !(fd is FuncDecl) || fd.fnBody < 0 { return false }
+  const vs: i32[] = []
+  collectRetValues(fd.fnBody, vs)
+  for v in vs {
+    if elabPathTo(parenPeelIx(v), x, out, 0) { return true }
+  }
+  false
+}
+
+// Whether `x` is `at` or nested in it through list elements and record fields, the steps onto `out`.
+function elabPathTo(at: i32, x: i32, out: string[], depth: i32): boolean {
+  if at < 0 || at >= P.nodes.length || depth > 32 { return false }
+  if at == x { return true }
+  const n = nodeAt(at)
+  if n is ArrayLit {
+    for e in n.arrElems {
+      out.push("e")
+      if elabPathTo(parenPeelIx(e), x, out, depth + 1) { return true }
+      out.pop()
+    }
+  } else if n is ObjLit {
+    for fi in n.objFields {
+      const f = nodeAt(fi)
+      if f is FieldInit {
+        out.push("f." + f.fiName)
+        if elabPathTo(parenPeelIx(f.fiValue), x, out, depth + 1) { return true }
+        out.pop()
+      }
+    }
+  }
+  false
 }
 
 // The result of the instance call `ix` reaches from the root; -1 for any other node.
