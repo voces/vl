@@ -2007,23 +2007,25 @@ Reach is the number of programs that enter the function.
 | slot deliveries | 6 | 6 | 0 | 0 | 0 | 0 | 0 |
 | node type | 25 | 4 | 5 | 13 | 2 | 0 | 1 |
 | slot type | 24 | 12 | 4 | 2 | 2 | 0 | 4 |
-| lambda sigs | 7 | 1 | 3 | 3 | 0 | 0 | 0 |
-| instance binding | 31 | 10 | 11 | 1 | 2 | 0 | 7 |
+| lambda sigs | 7 | 3 | 3 | 1 | 0 | 0 | 0 |
+| instance binding | 31 | 7 | 11 | 1 | 2 | 0 | 10 |
 | value returns | 5 | 1 | 4 | 0 | 0 | 0 | 0 |
 | instance result | 1 | 1 | 0 | 0 | 0 | 0 | 0 |
 | walk type | 19 | 6 | 11 | 2 | 0 | 0 | 0 |
 | call param | 13 | 3 | 1 | 8 | 0 | 0 | 1 |
 | uncalled slot | 2 | 0 | 2 | 0 | 0 | 0 | 0 |
-| **all** | **165** | **56** | **52** | **31** | **11** | **0** | **15** |
+| **all** | **165** | **55** | **52** | **29** | **11** | **0** | **18** |
 
-Switched, (c) or deleted: **123 of 165**, against 84 in the morning's table (38 switched and 46
+Switched, (c) or deleted: **125 of 165**, against 84 in the morning's table (38 switched and 46
 (c)). What stands between master and the endpoint is
-31 blocked and 11 parked functions, and none unassessed. Per family, with reach:
+29 blocked and 11 parked functions, and none unassessed. Per family, with reach:
 
 - **unbound default**:
   - switched: `monoUncalledSlotFnTy` 293, `monoUncalledListElems` 209, `monoHoleFnPinTyOf` 19, `monoUncalledNestedListElems` 15.
   - (c): `monoChoiceArmFlowTy` 7,920.
   - blocked: `monoElabDefaultsPrime` 18,172 (reach: the unbound default), `monoDefaultUnboundTyParams` 9,004 (reach: the unbound default).
+    Since 2026-11-07 the defaults half of the prime is the elaboration's own (`elabTpDefaultsPrime`, run by `elabRun`, with the rule's predicates moved to `emit_elab`). Mono keeps the stub half, `monoElabStubArgsPrime`: an argument of only uncalled hole functions keyed at the `() => void` stub, which fires in at least 55 of 23,103 programs and is D15494's (owner). `monoDefaultUnboundTyParams` is live: deleting it turned `generics/unbound-type-param-defaults-at-call.vl` into invalid wasm, and on that fixture its 5 bindings equal the call key's.
+    Probe note: a build reports only its first `emitFail`, so a probe that emits one row per site shows the first row alone; collect the rows into one message and flush it once after `emitProgramRun`.
   - parked: `monoDefaultTyParamsOnlyGenFns` 8,697 (per-call rule no elaboration fact states (10 calls, 4 files)).
   - deleted: `monoArgClosedPin`.
 - **slot held fns**:
@@ -2046,15 +2048,15 @@ Switched, (c) or deleted: **123 of 165**, against 84 in the morning's table (38 
   - parked: `monoReachLitTys` 9,560 (parked with monoReachSlotTy), `monoReachSlotTy` 6,935 (13 lane F, 2 reach).
   - deleted: `monoNoteBindCall`, `monoListSrcElemTy`, `monoPinJoin`, `monoSigJoin`.
 - **lambda sigs**:
-  - switched: `monoLamSubstParams` 1,188.
+  - switched: `monoLamSubstParams` 1,188, `monoPinMapLambdas` 9,004 (the callback's parameter at the instance, `elabInstNodeTy` under the walk key, else `elabValueInstSig`, else the receiver's element; #6670), `monoNoteBindDeliveryCall` 7,181 (`elabValueInstSig`, the one signature the delivered read's instances share; a read instanced at several (D12234) or at none keeps the destination's spelling, which is prerequisite (A)'s; #6665).
   - (c): `monoPinBodyLambdasRaw` 9,004, `monoDeliverLamLit` 6,170, `monoCloneLambdaSubst` 1,258.
-  - blocked: `monoPinMapLambdas` 9,004 (lane F: needs callback parameter read per instance; today: Fn#d's per-instance callback signature (program list handed over)), `monoNoteBindDeliveryCall` 7,181 (lane F: delivered-signature fact for named hole lambdas; today: Fn#d's delivery note at a name (first slice in progress)), `monoLamParamPinAnn` 801 (split-dep holder fact (c2) + per-instance identity residual (4b-i); its pin now used only where elaboration open (#6662)).
+  - blocked: `monoLamParamPinAnn` 801 (split-dep holder fact (c2) + per-instance identity residual (4b-i); its pin now used only where elaboration open (#6662)).
 - **instance binding**:
-  - switched: `monoPreBindPastEmptyLit` 8,697, `monoPinAnnotatedParam` 5,744, `monoParamPinnedNull` 5,585, `monoExactBind` 1,261, `monoInstParamPinTys` 441, `monoPreBindNonArrowArgs` 46, `monoPreBindPastUnionRest` 8,697, `monoBindInnerUnionArms` 3,516, `monoBindBareUnionArm` 3,421, `monoBindNullArm` 3,389 (the call's elaboration binding, `elabCallBindTy`: 45 of 45 decisions).
+  - switched: `monoPreBindPastEmptyLit` 8,697, `monoPinAnnotatedParam` 5,744, `monoParamPinnedNull` 5,585, `monoExactBind` 1,261, `monoInstParamPinTys` 441, `monoPreBindNonArrowArgs` 46, `monoPreBindPastUnionRest` 8,697 (the call's elaboration binding, `elabCallBindTy`: 26 of 26 decisions).
   - (c): `monoCadNoteInstance` 9,004, `monoMakeInstanceLetTyCol` 9,004, `monoBindEnclosingPins` 9,004, `monoMakeInstanceGo` 9,004, `monoSlotParamPins` 8,698, `monoInstantiateCallIn` 8,697, `monoSlotSig` 8,694, `monoBindCols` 3,421, `monoSubstAnnNode` 1,227, `monoSubstTyArgNodes` 47, `monoLayoutConstOf` 4.
   - blocked: `monoPinTyParamComposite` 391 (Fn#d call-param hub).
   - parked: `monoHoleBinding` 3,421 (function-holding residue stays on the rebuild: argument identity typing (A, owner-level, 689 programs) and bind-type-not-rep (56 sites); keyless lambda/value instances are the argument-keyed design (owner)), `monoPinnedTyParamCanon` 988 (waits on the key settling names (canonical instance key)).
-  - deleted: `monoSeedCallSigTys`, `monoNicheNulParamsCheck`, `monoLetTyParamMisfit`, `monoExactPinTyOf`, `monoNicheNulListCheck`, `monoPoisonSharedPins`, `monoLetSeedMisfits`.
+  - deleted: `monoSeedCallSigTys`, `monoNicheNulParamsCheck`, `monoLetTyParamMisfit`, `monoExactPinTyOf`, `monoNicheNulListCheck`, `monoPoisonSharedPins`, `monoLetSeedMisfits`, `monoBindBareUnionArm`, `monoBindNullArm`, `monoBindInnerUnionArms` (their arms bind from `elabCallBindTy` through `elabBindUnionArmsFromCall`).
 - **value returns**:
   - switched: `monoIfBoundRetAtPin` 24.
   - (c): `monoFlowConstCallArgs` 8,049, `monoDeliverCallRets` 1,009, `monoFlowCallLeafAt` 179, `monoFlowCallLeaf` 179.
@@ -3045,8 +3047,12 @@ programs, counted by program).
   arm binds. The type each binding takes is now `elabCallBindTy` at the call, where it is closed.
   Shadowed over the 9,013 programs that enter them, they decide 45 times, and the elaboration
   answers all 45 and agrees with every one. `monoBindCols`' own call of `monoBindInnerUnionArms`
-  never bound anything and is deleted. The helpers stay, because the inner walk still reaches the
-  bare arm at depth. Over 19,316 programs no byte moves.
+  never bound anything and is deleted. Then the binders went: `elabBindUnionArmsFromCall` binds
+  each type parameter that stands as a union member or nullable inner of a parameter type, at any
+  depth and through function results, at `elabCallBindTy`, behind the callers' own gates (a closed
+  argument type, a known argument pin). `monoBindBareUnionArm`, `monoBindNullArm`,
+  `monoBindInnerUnionArms`, `monoFnRetIsUnion` and `monoFnRetEnd` are deleted (`emit_mono` 967 → 962).
+  Over 19,316 programs no byte moves, at each step.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
