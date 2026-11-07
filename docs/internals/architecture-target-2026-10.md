@@ -4218,32 +4218,40 @@ The redesign must preserve P6, B12 and B13. B12 off traps the compiler, so do no
 **Never answers: 20 returns, handed to split-dep's one-producer redesign.** None of them
 answers in any of the 23,828 programs, and none is reached by its own filed witness. Turning all
 20 off together moves no output, and a 400-program sample is byte-identical wherever it builds.
-That is not enough to delete them: no program shows the fallback (the cascade's tail, then
-`monoArgTyNameBound`, `monoArgTyNameProjected` and `monoArgTyNameRep`) answering identically. The
-redesign states each one's fate: folded into the producer, or a named refusal.
 
-| return | what it reads | row |
-|---|---|---|
-| C1 | `holeLitPinOf`, a literal retyped at a hole parameter | D5840 |
-| C2 | `holeOperandI32PinTyOf`, a shared node at a boolean or literal-union hole | D2919, D2942 |
-| C3 | `argNichePinTyOf`, an `i32` niche or nullable literal union | D2998, D2985 |
-| C4 | `holeNulStringPinTyOf`, a `string \| null` hole | D3016 |
-| C5 | `loopVarArgPinTyOf`, a for-in loop variable | D3015 |
-| C6 | `litAtomPinElemTyOf`, a list literal of atoms | — |
-| C7 | a generic-application parameter annotation | D941 |
-| C8 | a fallible numeric `as?` | D1041 |
-| C10 | a function value's own signature key | — |
-| C11 | a forwarder's own closure pin | D1795 |
-| C13 | an if-arm's prelude local | D2821 |
-| B3 | the callee's inferred return | — |
-| B5 | `monoDestListPinName` of a local | — |
-| B7 | an empty-literal local | D764 |
-| B9 | a local initializer's `""` floor | — |
-| B10 | `monoCapturedDestListPin` | — |
-| B11 | `monoCapturedParamPin` | — |
-| B14 | `monoDestListPinName` of a global | — |
-| B15 | an empty-literal global | D764 |
-| B18 | `monoModuleDupPin` | — |
+**18 are deleted.** Each of them returns only a non-empty pin. Where it never answers, the
+code below it already produced every result, so deleting it changes nothing on this population.
+The fixpoint byte+output sweep is the check, and it also covers side effects.
+
+**2 stay:**
+- C13 recurses into `monoArgTyName`, so it can return the `""` refusal. The probe logged only
+  non-empty C answers, so a zero count does not show it is unreached.
+- B9 is a `""` floor, B8's twin, and moves with it.
+
+C12, the closure arm's `""` floor, is not in the table and is unchanged.
+
+| return | what it reads | row | fate |
+|---|---|---|---|
+| C1 | `holeLitPinOf`, a literal retyped at a hole parameter | D5840 | deleted |
+| C2 | `holeOperandI32PinTyOf`, a shared node at a boolean or literal-union hole | D2919, D2942 | deleted, with its helper |
+| C3 | `argNichePinTyOf`, an `i32` niche or nullable literal union | D2998, D2985 | deleted, with its helper |
+| C4 | `holeNulStringPinTyOf`, a `string \| null` hole | D3016 | deleted, with its helper |
+| C5 | `loopVarArgPinTyOf`, a for-in loop variable | D3015 | deleted, with its helper |
+| C6 | `litAtomPinElemTyOf`, a list literal of atoms | — | deleted, with its helper |
+| C7 | a generic-application parameter annotation | D941 | deleted |
+| C8 | a fallible numeric `as?` | D1041 | deleted |
+| C10 | a function value's own signature key | — | deleted |
+| C11 | a forwarder's own closure pin | D1795 | deleted |
+| C13 | an if-arm's prelude local | D2821 | kept: can answer `""` |
+| B3 | the callee's inferred return | — | deleted |
+| B5 | `monoDestListPinName` of a local | — | deleted with B14, and the helper |
+| B7 | an empty-literal local | D764 | deleted with B15 |
+| B9 | a local initializer's `""` floor | — | kept: moves with B8 |
+| B10 | `monoCapturedDestListPin` | — | deleted, with its helper |
+| B11 | `monoCapturedParamPin` | — | deleted, with its helper |
+| B14 | `monoDestListPinName` of a global | — | deleted with B5 |
+| B15 | an empty-literal global | D764 | deleted with B7 |
+| B18 | `monoModuleDupPin` | — | deleted, with its helper |
 
 #### A function list's hole binding: the type is right, a callback lambda shares (2026-11-07)
 
