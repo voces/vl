@@ -113,6 +113,7 @@ import {
   cwBindingWrittenValues,
   cwCalleeArgOff,
   cwCalleeDeclOf,
+  cwDeclAssigned,
   cwFnCalls,
   cwFnValueDeclOf,
   cwFrameOfDecl,
@@ -280,7 +281,9 @@ import { adoptRetLits } from "./check_inferred_return"
 import {
   assignable,
   bindGenWalk,
+  genFnHoleBodyRet,
   holeFnArgDecl,
+  holeLamRetAt,
   holeSlotCallRets,
   joinTys,
   substTyDeep,
@@ -349,6 +352,7 @@ import {
   tyHasInferHole,
   tyHasLitLeaf,
   tyIsLitUnion,
+  tyIsParamHole,
   tyMentionsErr,
   tyMentionsTyVarNamed,
   tySame,
@@ -1068,6 +1072,10 @@ function elabRowClosedOrSet(tys: i32[]): boolean {
 
 // The type an inferred call's type parameter takes when nothing binds it (D4551).
 export const ELAB_TP_DEFAULT = "i32"
+
+// The element type a hole generic's empty-list parameter takes when its delivery binds nothing
+// (D6542).
+export const ELAB_EMPTY_LIST_ELEM_DEFAULT = "i32"
 
 // The type parameters of each declaration an inferred call that leaves them unbound defaults, and
 // the type they default to; primed by the monomorphizer before the worklist runs.
@@ -8828,6 +8836,233 @@ function elabCallsHandGenerics(x: i32, par: i32): boolean {
   true
 }
 
+// The binding a read `argIx` of a generic function names, or the read itself where it names no
+// `let`; -1 where it names no generic.
+export function elabHoleGenFlowHolder(argIx: i32): i32 {
+  const ax = parenPeelIx(argIx)
+  if ax < 0 || ax >= P.nodes.length || !(nodeAt(ax) is Ident) { return -1 }
+  const fd = identFnDeclOf(ax)
+  const fdn = if fd >= 0 { nodeAt(fd) } else { null }
+  const named = fdn is FuncDecl && fdn.fnName != "" && monoIsGenericDecl(fd)
+  if !named && elabAliasGenFn(ax) < 0 { return -1 }
+  const e = identDeclOf(ax)
+  if e >= 0 && e < P.nodes.length && nodeAt(e) is LetDecl { e } else { ax }
+}
+
+// The generic function read `at` names through un-annotated `const` aliases, or a `let` bound once
+// and held in no cell; -1 for none.
+function elabAliasGenFn(at: i32): i32 {
+  let d = cboxDeclKey(identDeclOf(at))
+  let hops = 0
+  while d >= 0 && d < P.nodes.length && hops < 64 {
+    const n = nodeAt(d)
+    if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return -1 }
+    if (
+      n.letKw != "const"
+      && ((cboxCellDecls[d] ?? 0) == 1 || cwDeclAssigned(d))
+    ) {
+      return -1
+    }
+    if !(nodeAt(n.letInit) is Ident) { return -1 }
+    const nd = identDeclOf(n.letInit)
+    if nd < 0 || nd >= P.nodes.length { return -1 }
+    if nodeAt(nd) is FuncDecl {
+      return if monoIsGenericDecl(nd) { nd } else { -1 }
+    }
+    d = cboxDeclKey(nd)
+    hops = hops + 1
+  }
+  -1
+}
+
+// The closed signature generic read `argIx` takes where slot `holder` delivers it: the one closed
+// delivery's parameters, else its one call's, with an empty list's element at
+// `ELAB_EMPTY_LIST_ELEM_DEFAULT` and that call's lambda and open function arguments at what the rest
+// bind, and the result its body gives there. -1 for none, two deliveries, or a type left open.
+export function elabHoleGenFlowTy(argIx: i32, holder: i32): i32 {
+  if holder < 0 { return -1 }
+  const path: string[] = []
+  const vt = nodeTyIxOf(parenPeelIx(argIx))
+  const vf = if vt >= 0 && vt < T.tys.length { tyAt(vt) } else { null }
+  if !(vf is TyFunc) || !tyHasTyVar(vt) { return -1 }
+  const dl: i32[] = []
+  for t in elabSlotDeliveries(holder, path, -1) {
+    const ft = tyAt(t)
+    if ft is TyFunc && ft.fnParamTypes.length == vf.fnParamTypes.length {
+      dl.push(t)
+    }
+  }
+  let ps: i32[] = []
+  let cx = -1
+  if dl.length == 1 {
+    const ft = tyAt(dl[0])
+    if ft is TyFunc { ps = ft.fnParamTypes }
+  } else if dl.length == 0 {
+    cx = elabSlotOnlyCall(holder, path, ps)
+    if cx < 0 { return -1 }
+  } else {
+    return -1
+  }
+  if ps.length == 0 || vf.fnParamTypes.length != ps.length { return -1 }
+  const gN: string[] = []
+  const gT: i32[] = []
+  let j = 0
+  while j < ps.length {
+    if !tyHasTyVar(ps[j]) { bindGenWalk(vf.fnParamTypes[j], ps[j], gN, gT) }
+    j = j + 1
+  }
+  j = 0
+  while j < ps.length {
+    const pa = tyAt(vf.fnParamTypes[j])
+    if pa is TyArray && elabEmptyListHole(ps[j]) && pa.aElem >= 0 {
+      const pe = tyAt(pa.aElem)
+      if pe is TyVar && bindOf(gN, gT, pe.tvName) < 0 {
+        gN.push(pe.tvName)
+        gT.push(primTyOfName(ELAB_EMPTY_LIST_ELEM_DEFAULT))
+      }
+    }
+    j = j + 1
+  }
+  if cx >= 0 {
+    elabHoleGenBindLamArgs(vf, cx, ps, gN, gT)
+    elabHoleGenBindFnArgs(argIx, vf, cx, ps, gN, gT)
+  }
+  j = 0
+  while j < ps.length {
+    if tyHasTyVar(ps[j]) { bindGenWalk(vf.fnParamTypes[j], ps[j], gN, gT) }
+    j = j + 1
+  }
+  const inst = substTyDeep(vt, gN, gT)
+  if (
+    inst < 0
+    || inst >= T.tys.length
+    || tyHasTyVar(inst)
+    || !(tyAt(inst) is TyFunc)
+  ) {
+    return -1
+  }
+  genFnHoleBodyRet(vt, inst)
+}
+
+// Whether `t` is an empty list's type, its element a hole.
+function elabEmptyListHole(t: i32): boolean {
+  const a = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if a is TyArray { a.aElem < 0 || tyIsParamHole(a.aElem) } else { false }
+}
+
+// Binds, into `gN`/`gT`, each un-annotated lambda argument of call `cx` at the result its body
+// gives where the rest bind.
+function elabHoleGenBindLamArgs(
+  vf: TyFunc,
+  cx: i32,
+  ps: i32[],
+  gN: string[],
+  gT: i32[],
+) {
+  const c = nodeAt(cx)
+  if !(c is Call) || c.callArgs.length != ps.length { return 0 }
+  let j = 0
+  while j < ps.length {
+    const lx = parenPeelIx(c.callArgs[j])
+    const p = vf.fnParamTypes[j]
+    const pf = tyAt(p)
+    if lx >= 0 && nodeAt(lx) is FuncDecl && pf is TyFunc && tyHasTyVar(ps[j]) {
+      const noN: string[] = []
+      const noT: i32[] = []
+      const r = holeLamRetAt(lx, substTyDeep(p, gN, gT), noN, noT)
+      if r >= 0 { bindGenWalk(pf.fnRet, r, gN, gT) }
+    }
+    j = j + 1
+  }
+  0
+}
+
+// Binds, into `gN`/`gT`, each parameter of hole function `argIx` that call `cx` hands an open
+// function at the type its own body calls it with (D6532).
+function elabHoleGenBindFnArgs(
+  argIx: i32,
+  vf: TyFunc,
+  cx: i32,
+  ps: i32[],
+  gN: string[],
+  gT: i32[],
+) {
+  const c = nodeAt(cx)
+  const ax = parenPeelIx(argIx)
+  if !(c is Call) || c.callArgs.length != ps.length || ax < 0 { return 0 }
+  if !(nodeAt(ax) is Ident) { return 0 }
+  const dx = elabOpenFnArgDecl(ax)
+  if dx < 0 { return 0 }
+  const fd = nodeAt(dx)
+  if !(fd is FuncDecl) || fd.fnParams.length != ps.length { return 0 }
+  let j = 0
+  while j < ps.length {
+    const pv = vf.fnParamTypes[j]
+    const lx = elabOpenFnArgDecl(c.callArgs[j])
+    if lx >= 0 && tyHasTyVar(ps[j]) && tyHasTyVar(substTyDeep(pv, gN, gT)) {
+      const qs: i32[] = []
+      let closed = elabValueAgreedCallTys(fd.fnParams[j], [], qs)
+      for q in qs {
+        if tyHasTyVar(q) { closed = false }
+      }
+      if closed {
+        const r = elabFnDeclRetAt(lx, qs)
+        if r >= 0 { bindGenWalk(pv, mkFuncTy(qs, r), gN, gT) }
+      }
+    }
+    j = j + 1
+  }
+  0
+}
+
+// The function declaration open function argument `a` names: an un-annotated lambda, a hole
+// function, or a `const` or once-bound `let` holding one; -1 for anything else.
+function elabOpenFnArgDecl(a: i32): i32 {
+  let x = parenPeelIx(a)
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops <= 64 {
+    const n = nodeAt(x)
+    if n is FuncDecl { return x }
+    if !(n is Ident) { return -1 }
+    const d = identDeclOf(x)
+    if d < 0 || d >= P.nodes.length { return -1 }
+    const dn = nodeAt(d)
+    if dn is FuncDecl { return d }
+    if !(dn is LetDecl) { return -1 }
+    if dn.letKw != "const" { return cwFnValueDeclOf(x) }
+    x = parenPeelIx(dn.letInit)
+    hops = hops + 1
+  }
+  -1
+}
+
+// The closed result of function declaration `lx0` called at the closed parameter types `qs`; -1
+// when it stays open.
+function elabFnDeclRetAt(lx0: i32, qs: i32[]): i32 {
+  const lx = if lx0 >= 0 && nodeTyIxOf(lx0) < 0 { nodeSrc[lx0] ?? lx0 } else { lx0 }
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(lx, mkFuncTy(qs, i32TyIx()), noN, noT)
+  if r >= 0 { return r }
+  const lt = nodeTyIxOf(lx)
+  const lf = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+  if lf is TyFunc && lf.fnParamTypes.length == qs.length && lf.fnRet >= 0 {
+    const hN: string[] = []
+    const hT: i32[] = []
+    let k = 0
+    while k < qs.length {
+      bindGenWalk(lf.fnParamTypes[k], qs[k], hN, hT)
+      k = k + 1
+    }
+    const dr = substTyDeep(lf.fnRet, hN, hT)
+    if dr >= 0 && !tyHasTyVar(dr) { return dr }
+  }
+  for q in qs {
+    if fnTagTyIsTagged(q) { return elabResultAtParams(lx, qs) }
+  }
+  -1
+}
+
 // The reach rows' bundle-family slots: closures taking a bundle in the thousands, bundle records in
 // the units; read by `tests/vl_elab_arg_rep_test.ts`.
 export function elabArgBundleKindProbe(): i32 {
@@ -11643,8 +11878,8 @@ function elabReachClosure(k: i32): {[i32]: boolean} {
   got
 }
 
-// `elabSlotDeliveries` leaving out what calls `omit` deliver: their arguments' and result's types
-// and the stamp of the read each calls through.
+// `elabSlotDeliveries` leaving out what calls `omit` deliver (their arguments' and result's types
+// and the stamp of the read each calls through), and what each read in `omit` delivers.
 export function elabSlotDeliveriesOmitting(
   d: i32,
   path: string[],
@@ -12269,6 +12504,8 @@ function elabElemMethod(m: string): boolean {
 
 // Adds to `out` the closed function types read `r` is delivered at, and follows its value on.
 function elabReadDeliveries(r: i32, out: i32[], seen: i32[]) {
+  // A read left out is the generic itself now, so what it delivers goes through no slot.
+  if elabDlvOmit.length > 0 && i32ListHas(elabDlvOmit, r) { return 0 }
   // A value given to a binding or returned from a function with no written type is stamped with
   // what that destination infers.
   if (
@@ -13661,6 +13898,25 @@ export function elabSlotUncalled(d: i32, path: string[]): boolean {
     if fnEscapes(f) { return false }
   }
   true
+}
+
+// `elabSlotUncalled` of this slot alone, where each call in `omit` reaches one function and each
+// read in it delivers nothing, each repointed at the generic the slot holds. A held function's
+// escape elsewhere does not count: a value leaves this slot only through a read of it, and a
+// read not in `omit` is followed by the delivery walk.
+export function elabSlotUncalledOmitting(
+  d: i32,
+  path: string[],
+  omit: i32[],
+): boolean {
+  if d < 0 { return false }
+  for c in fnSlotThroughCalls(d, path) {
+    if !i32ListHas(omit, c) && !elabCallNamesOne(c) { return false }
+  }
+  for c in elabSlotSetCalls(d, path) {
+    if !i32ListHas(omit, c) && !elabCallNamesOne(c) { return false }
+  }
+  elabSlotDeliveriesOmitting(d, path, -1, omit).length == 0
 }
 
 // Whether call `c` reaches one function whatever its slot holds: its callee names a function, or is
@@ -15450,10 +15706,17 @@ function elabTysSame(a: i32[], b: i32[]): boolean {
   true
 }
 
-// The closed type un-annotated parameter `i` of template call `tpl` takes, at the rep its argument
-// is built at; -1 where the elaboration leaves it open.
-export function elabCallHoleParamTy(tpl: i32, i: i32): i32 {
-  const pt = elabCallParamTy(tpl, i)
+// The closed type un-annotated parameter `i` (node `par`) of template call `tpl` takes, at the rep
+// its argument is built at; -1 where the elaboration leaves it open.
+export function elabCallHoleParamTy(tpl: i32, i: i32, par: i32): i32 {
+  const pt0 = elabCallParamTy(tpl, i)
+  // A parameter the checker solved closed from its uses holds that type where no instance answers.
+  const own = if par >= 0 && par < P.nodes.length { nodeTyIxOf(par) } else { -1 }
+  const shut = own >= 0
+    && own < T.tys.length
+    && !tyHasTyVar(own)
+    && !tyReachesHole(own, 16)
+  const pt = if pt0 >= 0 { pt0 } else if shut { own } else { -1 }
   if pt < 0 { return -1 }
   const rt = callArgRepTy(tpl, i, pt)
   if rt < 0 || rt >= T.tys.length || tyHasTyVar(rt) || tyReachesHole(rt, 16) {
