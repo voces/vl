@@ -2575,6 +2575,31 @@ callee off an open parameter. The 90 "open: nothing", by family:
 Most of the callbacks and arguments are nodes mono minted, so the pre-walk column has no entry
 for them by construction; their fact is read through the node they copy (`nodeSrc`).
 
+**Signature sites and identity sites** (re-graded the same day). Two corrections to the table:
+- **Instance bindings are not graded in it.** Their column compared the elaboration's own
+  instance parameter type with itself, so the 94 unlinked and the note's answers there say nothing
+  about mono. Mono binds a function-holding type parameter at the argument's identity, one instance
+  per function, and lane F grades that against the argument's identity type.
+- **The table holds only signature sites.** The probe recorded a decision only where mono's held
+  type is closed. The 189 where mono holds an open function type are identity sites, and are graded
+  against `elabIdentityTy`, the elaboration's node type, else the checker's type as the elaboration
+  left it (#6656):
+
+  | consumer | decisions | agrees | source |
+  |---|---|---|---|
+  | receiver of a `.map` / `.filter` callback | 147 | 147 | elaboration 34, checker 113 |
+  | record literal written to a `let` | 12 | 12 | checker |
+  | seeded type parameter | 15 | 15 | checker |
+  | instance binding | 3 | 3 | checker (lane F's) |
+  | list callback | 8 | 0 | a signature site, below |
+  | record of hole-function lists | 4 | 0 | the same spelling over different holes; no defect |
+
+  The receiver and the record literal read `elabIdentityTy`. The seeded type parameter binds from
+  mono's pin of the argument it seeds, so it waits on that argument's `elabIdentityTy` replacing the
+  pin. The 8 list callbacks hold the callback's signature at a hole-function element
+  (`((_) => _) => i32`), not the callback's identity, so they belong to `elabCbArgSig` and
+  `elabValueInstKey` with the signature sites.
+
 So identity typing is not the prerequisite for this population; one fact is.
 - **The fact:** `elabValueInstKey(x, k)`, the member instance or instances the elaboration made for
   function-holding value `x` read under instance `k`. Its closed signature is the concrete rep.
@@ -2814,8 +2839,8 @@ programs, counted by program).
   `monoCallKeyBinding` takes the instance's binding from `ekNames`/`ekTys` at the call's own key.
   It splits the binding as the rebuild did: type parameters onto the let binding, the holes of
   un-annotated parameters onto the hole binding. The gate is decided before any rebuild: every
-  parameter at the call key is closed, holds no hole and no function, and the binding holds no
-  literal and no record. Otherwise `monoBindCols` and `monoHoleBinding` rebuild it, and that is
+  parameter at the call key is closed and holds no hole and no function (a literal-or-record cut
+  stood here until D15537 closed; the counts below are from before). Otherwise `monoBindCols` and `monoHoleBinding` rebuild it, and that is
   the residue. Counted by program over 23,384, an instance takes:
 
   | branch | programs |
@@ -2831,6 +2856,20 @@ programs, counted by program).
   `ckb-callkey-binding-price`, and D15537 is the trap's witness. The key binds the argument's
   type where the rebuild pins the row the argument is built at. With the cut, over 19,316
   programs no byte moves.
+- **The cut is gone (D15537, closed).** The key is right as a type and the rebuild right as a
+  row, and the checker records both: `callBindTysAt` and `callBindRepTysAt`. `elabCallKeyBinding`
+  now binds each type parameter at the rep row where the checker records one, and the call key
+  keeps typing the call. A probe at every call where the two bindings differ found the rep row
+  equal to the rebuild's in all 23 record decisions. The numeric literal unions (`NK` against
+  `i32`) have no rep row and take the key's own binding; the one that could not lower was D3540,
+  closed by #6651. Widening the producer instead (`elabRowTys` reading the rep row without
+  `callBindRepKeyedAt`) breaks three of the four `ckb-callkey-binding-price` cells, because that
+  guard keeps the call's own rows at the type wherever a parameter does more than hand its value
+  on. So the row fact has one producer, the checker, and two readers asking different questions:
+  how the call is typed, and what the instance's argument is built at. Graded by output over
+  23,828 programs, 0 move. Over 19,346, two programs move bytes and not output: one instance
+  splits where the key binds `T := K` at one call and `i32` at another
+  (`numeric-litunion-beside-type-param-joins-one-set`), and one reorders.
 - **Two of the guards are deleted.** Each was graded by a hand-written probe of the plainest
   program its sentence forbids, built with the guard on and off, because the corpus reaches
   neither. Counted from the emitted message, attributed by site, against a control that refuses.
@@ -2862,6 +2901,16 @@ programs, counted by program).
     prerequisite (A), identity typing for concrete function values.
   - **23 sites are open on one side only.** In 11 the identity is concrete and mono is open
     (`{f: (i32) => i32}` against `{f: (T) => T}`). In 12 it is the other way round.
+- **Switched: an instance's parameter maps come from the elaboration, and the shared-pin poison is
+  deleted.** `instancePinnedMaps` reads each parameter's type as the instance's elaboration closes
+  it, and falls back to the pin its call supplied only where the elaboration leaves it open.
+  `monoPoisonSharedPins` had marked a parameter `-2` when a second call reached the same instance
+  with another map. Over 23,384 programs, the two readers of those maps (the niche test and the
+  soft-twin test) decide the same from either source wherever the elaboration answers: 116 sites,
+  0 differ. No decision read the mark. The one shape that reached it, a literal-union map and its
+  plain twin through one instance, is still refused, and now by the soft-twin test whose message
+  names the fix. Both call orders are fixtures (`error-literal-union-map-twin-through-one-instance*`).
+  Over 19,316 programs no byte moves.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)

@@ -268,7 +268,12 @@ import { argIsLitAggregate, bindOf, i32TyIx } from "./check_leaf_steps"
 import { holePinHeldSet } from "./check_hole_pins"
 import { a20RetWalk } from "./check_nj_gate"
 import { collectRetValues, njFnIx, njFnIxSet } from "./check_nj_join"
-import { narrowedFromTyOf, nodeTyIxOf } from "./check_node_tys"
+import {
+  narrowedFromTyOf,
+  nodeTyFreeze,
+  nodeTyFrozenOf,
+  nodeTyIxOf,
+} from "./check_node_tys"
 import {
   fvaBuilt,
   nodeCtxTyIxOf,
@@ -355,7 +360,6 @@ import {
   tyHasHole,
   tyHasInferHole,
   tyHasLitLeaf,
-  tyHoldsObj,
   tyIsLitUnion,
   tyIsParamHole,
   tyMayHoldFn,
@@ -14688,6 +14692,21 @@ export function elabNodeTyAt(ix: i32, fnIx: i32): i32 {
   -1
 }
 
+// Freezes the checker's node types as they stand when the elaboration finishes, before any emit
+// pass re-records one (`nodeTyFreeze`).
+export function elabIdentitySnap() { nodeTyFreeze() }
+
+// The type value `x` holds by its identity in frame `fnIx`: the elaboration's node type, else
+// the checker's as the elaboration left it. A node minted later reads the node it copies; -1
+// for a minted node with none.
+export function elabIdentityTy(x: i32, fnIx: i32): i32 {
+  const t = elabNodeTyAt(x, fnIx)
+  if t >= 0 || x < 0 { return t }
+  const f = nodeTyFrozenOf(x)
+  if f >= 0 { return f }
+  nodeTyFrozenOf(nodeSrc[x] ?? -1)
+}
+
 // The result of the instance call `ix` reaches from the root; -1 for any other node.
 function elabRootCallTy(ix: i32): i32 {
   if ix < 0 || !(nodeAt(ix) is Call) { return -1 }
@@ -16215,12 +16234,13 @@ export function elabCallHoleParamTy(tpl: i32, i: i32, par: i32): i32 {
   }
 }
 
-// Call key `callKey`'s binding, split as mono's rebuild splits it: type parameters of `tps` onto
-// `bN`/`bT`, holes of `decl`'s un-annotated parameters onto `hN`/`hT`. False, binding nothing,
-// unless every parameter is closed with no hole or function and the binding holds no literal or
-// record, a row the key may name apart from the one the argument is built at (D15537).
+// Call key `callKey`'s binding for call `call`, split as mono's rebuild splits it: type parameters
+// of `tps` onto `bN`/`bT`, holes of `decl`'s un-annotated parameters onto `hN`/`hT`, each at the
+// checker's rep row where it records one (D15537). False, binding nothing, unless every parameter
+// is closed with no hole or function.
 export function elabCallKeyBinding(
   callKey: i32,
+  call: i32,
   decl: i32,
   params: i32[],
   tps: string[],
@@ -16245,14 +16265,24 @@ export function elabCallKeyBinding(
     }
   }
   for t in ekTys[callKey] {
-    if t < 0 || elabTyHasLit(t, 8) || tyHoldsObj(t, 9) { return false }
+    if t < 0 { return false }
   }
+  // An argument is built at the checker's rep row where it records one, a wider or nominal record
+  // than the key's type; the instance reads it there (D15537).
+  const row = if call >= 0 { callBindRowOf(call) } else { -1 }
+  const repN = if row >= 0 { callBindNamesAt(row) } else { [] }
+  const repT = if row >= 0 { callBindRepTysAt(row) } else { [] }
   const ftIx = if decl >= 0 && decl < P.nodes.length { nodeTyIxOf(decl) } else { -1 }
   const ft = if ftIx >= 0 && ftIx < T.tys.length { tyAt(ftIx) } else { tyAt(0) }
   let i = 0
   while i < ekNames[callKey].length && i < ekTys[callKey].length {
     const nm = ekNames[callKey][i]
-    const t = ekTys[callKey][i]
+    let t = ekTys[callKey][i]
+    let r = 0
+    while r < repN.length && r < repT.length {
+      if repN[r] == nm && repT[r] >= 0 { t = repT[r] }
+      r = r + 1
+    }
     if strListHas(tps, nm) {
       if !strListHas(bN, nm) {
         bN.push(nm)
@@ -16281,38 +16311,4 @@ export function elabCallKeyBinding(
     i = i + 1
   }
   true
-}
-
-// Whether a literal type sits in `t` outside a record or function: a union member, a nullable's
-// inner, a list's element, a map's key or value. Past `depth`, true. Twin of `tyHasLitDeep`
-// (emit_anon_fields.vl), which also reads a record's fields.
-function elabTyHasLit(t: i32, depth: i32): boolean {
-  if t < 0 || t >= T.tys.length { return false }
-  if depth <= 0 { return true }
-  const a = tyAt(t)
-  match a {
-    TyLit => {
-      return true
-    }
-    TyNullable => {
-      return elabTyHasLit(a.nInner, depth - 1)
-    }
-    TyArray => {
-      return elabTyHasLit(a.aElem, depth - 1)
-    }
-    TyMap => {
-      return elabTyHasLit(a.mKey, depth - 1) || elabTyHasLit(a.mVal, depth - 1)
-    }
-    TyUnion => {
-      for m in a.uMembers {
-        if elabTyHasLit(m, depth - 1) { return true }
-      }
-      return false
-    }
-    // A record answers through `tyHoldsObj`, which refuses it whole; a function's own literals
-    // are its signature's, not a row the binding holds.
-    TyObj | TyFunc | TyPrim | TyErr | TyVar | TyNeg => {
-      return false
-    }
-  }
 }
