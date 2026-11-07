@@ -4295,7 +4295,9 @@ closers decline a holder whose members are hole functions with open own types. R
 | fact exists, mono said open | 6 | `monoLetWritesClosed` reads the fact: open to closed, output unchanged |
 
 The three that decline (`q`, D15354 and D15355 `m2`) hold `inc0`, which returns `i32`, in a slot
-called at `(i32) => f64`. Closing them needs an instance that widens the result, not a fact. The
+called at `(i32) => f64`. Closing them needs an instance that widens the result, not a fact.
+On master `q` runs; D15354 and D15355 refuse at emit after `vl check` passes (clause 2), and are
+parked here as the result-widening gap, beside the 70 below. The
 fifth, `r5`, holds the closed `m`, so the open-slot gate never admits it; its writes are closed
 already.
 
