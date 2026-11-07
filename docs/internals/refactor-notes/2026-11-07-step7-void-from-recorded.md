@@ -33,7 +33,7 @@ lambdas in generic bodies whose result stays open; all are valued.
 result (`fnRecordedRetTy`) is `void`, it has a bare `return`, or no caller consumes its result.
 Anything else, an open result included, is valued. The fixpoint's body derivation and the
 helpers only it used (`cvfRecordedValue`, `blockTailMemberValue`, `tailIfNullableIsReal`,
-`inferRetBearsNullByNode`, `tailSelfFnIx` with `tailCallsSelf`'s guard in `emit_classify.vl`) are
+`inferRetBearsNullByNode`, `ifArmsAllValues`, `inferNullFallsThrough`, `tailSelfFnIx` with `tailCallsSelf`'s guard in `emit_classify.vl`) are
 deleted.
 
 ## Proof
@@ -41,7 +41,7 @@ deleted.
 | check | result |
 |---|---|
 | fixpoint | two `refresh-compiler.sh` runs byte-identical |
-| seed size | 6,425,129 → 6,424,553 (−576) |
+| seed size | 6,425,129 → 6,424,530 (−599) |
 | byte sweep, 19,355 files | 14,507 byte-identical, 0 moved; 4,848 rejected identically |
 
 ## The kind shadow on master (`fnKindShadowArm`), for the next PR
