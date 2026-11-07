@@ -2095,6 +2095,30 @@ see into callees before collect runs (#6563). The uncalled slots already read it
   the elaboration has none, but at 1,308 more pins mono leaves the type open while
   `elabCallParamTyFrom` is closed. The replacement is a fact of that narrower question, which must
   decline at all 1,308, with the D6542 empty-list `i32` a named default beside `ELAB_TP_DEFAULT`.
+
+**The flow instance is the elaboration's** (2026-11-07). `elabHoleGenFlowTy` and
+`elabHoleGenFlowHolder` answer it, with `ELAB_EMPTY_LIST_ELEM_DEFAULT` (D6542); `monoHoleGenFnFlowTy`,
+`monoHoleGenBindLamArgs`, `monoHoleGenBindFnArgs`, `monoPinIsEmptyListHole` and `monoTyLeftOpen` are
+deleted. Shadowed over 23,103 programs against mono's flow: 34 agree, 0 differ, 0 new-only at all
+1,308 open pins, and 3 old-only, all in `closures/written-let-of-hole-fns-results-agree-at-hole-arg.vl`
+(a re-pointed `let` of hole functions, which mono's gate reads as a generic and the elaboration's does
+not), which the byte sweep shows reach no emitted code. Per read, the two gates name the same binding
+at 78 reads and part at 34, none of which yields a flow type on either side but those three. Mono
+counts a lambda as generic by `monoGen` of its own lambda state, which varies by frame; a
+"generic lambda" rule in the elaboration turned 2 of those into new-only answers
+(`generics/hole-fn-arg-through-hole-callee.vl`), so the elaboration's gate stays conservative.
+
+Two of the 34 are mono's gate being wrong: it resolves a read by NAME, so in
+`closures/param-named-like-outer-fn-generic-arg.vl` and D3910 the parameter `f` of `b(f: i32)` reads
+as the top-level generic `f<U>`. The elaboration resolves by declaration.
+
+Plumbing with a twin in the elaboration, kept for its other callers: `monoReadLetFrame`,
+`monoHoleGenFnFlowDecl` (still `monoHoleGenFnPin`'s `[frame, decl]`), `monoOpenFnArgDecl`
+(`elabOpenFnArgDecl`), `monoFnDeclRetAt` (`elabFnDeclRetAt`), `monoArmTailValue`,
+`monoNamesDeclaredGeneric`, `monoReadGenFnFe` (`elabAliasGenFn`) and `monoCalleeIsGeneric`. The lane
+that empties their other callers deletes them. `monoChoiceArmFlowTy` stays too: its arm walk reads
+mono's `monoValueNamesGenerics` and `monoArmEndsNever`, and each arm's instance is now the
+elaboration's.
 - `monoDefaultTyParamsOnlyGenFns` is a per-call rule (a type parameter named only by function slots
   handed generic values) that no elaboration fact states. It fires at 10 calls in 4 files; the
   call binding `elabCallBindTy` is the default at 8 and absent at 2 inside a generic body.
