@@ -12,9 +12,10 @@ passes it through `monoBakeSpecK`, which is saved and restored around `monoMakeI
   block-shadow guard, `monoReadsOwnParam`) does not run.
 - **An unkeyed bake** (one of the 105 declined decisions): mono's derivation, unchanged.
 
-`elabSpecParamCalledAt` and `elabCalleeFnsAt` share one walk (`idSpecSlotAt`). Slice 3's
-`specbake` shadow row (`elabSpecBakeNote`, `idBakeClass`, `idSpecLast`) is deleted. The bake no
-longer reads the latest decision as ambient state.
+`elabSpecParamCalledAt` is slice 3's walk, answering the parameter rather than the declaration.
+Deleted as dead: `elabCalleeFnsAt`, whose only reader was the shadow, and slice 3's `specbake` row
+(`elabSpecBakeNote`, `idBakeClass`, `idSpecLast`). The bake no longer reads the latest decision as
+ambient state.
 
 **Graded before the switch.** Population: the 23,450 programs of the shadow note, at
 `$VL_ID_SHADOW=1`, with a temporary row at each keyed bake comparing the two answers in both
@@ -40,4 +41,4 @@ output does not.
 
 **Sweep**, with fixpoint seeds on both sides: `scripts/sweep.vl` diff against master `c631be4a`
 reads 23,608 same, 3 bytes-only, 0 output movers and 0 `runs → not-runs`. The 3 bytes-only movers
-are the 3 programs above. Seed: 6,478,310 → 6,478,169 bytes (−141).
+are the 3 programs above. Seed: 6,478,310 → 6,478,160 bytes (−150).
