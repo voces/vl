@@ -21,7 +21,7 @@ byte-identical (5,244 programs, base seed against the fixpoint).
 
 ## Shadow
 
-`scripts/fn-fact-shadow/run.sh`, one line per decision over 23,450 programs (tests/cases, the
+`scripts/fn-fact-shadow/run.sh` (retired with the consumer switch, `2026-11-07-heldval-consumers.md`), one line per decision over 23,450 programs (tests/cases, the
 distilled corpus, both inventories' witnesses):
 
 | tag | agree | differ | old-only | new-only | closed | none |
