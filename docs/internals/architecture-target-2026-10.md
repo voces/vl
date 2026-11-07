@@ -2374,7 +2374,11 @@ mechanism message at the call. The fixture adds one late demand, pre-existing on
 counted by `closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`. It is D15136's
 `put` at the argument's own type, demanded by the root call `put(xs)`. `hand` is never built: its
 second call of `put` makes `fnWriteOnlyInto` decline, so the elaboration delivers `xs` at `half`'s type.
-It exists only on that refusing build, and it goes with D15136's own fix. `monoCallWrittenLet` instances its writes at the delivery's pin, and
+It exists only on that refusing build, and it goes with D15136's own fix. The baseline's other entry,
+`closures/listed-hole-fn-escaping-list.vl`, is `use` minted at `((i32) => i32)[]` inside `take`'s
+instance. It is the signature twin of an instance the elaboration holds by identity
+(`((T) => T)[]`), and the twin's signature is mono's choice, so it is parked in Fn#d's identity
+territory, not foreseen. `monoCallWrittenLet` instances its writes at the delivery's pin, and
 `monoCallIfBound` no longer falls back to the seed. Mono's result derivation then decides nothing
 in the population, so `monoListSlotPinnedFnTy`, `monoPathSlotPinnedFnTy` and `monoHeldSrcsFnTy` are
 deleted. `monoSeedCallSigTys` stays for `monoCallIfValue`, an inline
@@ -2571,6 +2575,29 @@ read (`slotOfRead`) of a different holder with a closed `elabSlotTyAtKey` fact a
 the common case being `const f = m.get("k")` out of a closed map. A read of an open holder
 declines, which leaves generic functions stored in maps to D15494. A delivered bundle (reach) is the
 next source, so the elaboration gets no second composer for the same binding.
+
+**The second source, built from bundles: `elabWrittenBuiltTy`** (2026-11-07). It covers four
+kinds of value:
+- a call, through `elabCallBundleRet`, which answers with the bundle record the call's returned
+  parameter (`elabRetParamOf`) is delivered as (`elabCallArgRep`, `elabDeliveredBundleSigs`);
+- a record of its fields' answers, each other field at its closed checked type;
+- a list of its elements' agreed answer;
+- a field or list element of such a value, or an un-annotated `let` written once.
+
+The reach rows holding the bundles are written by `elabReachRows`, after `elabRun`'s `elabSlotFacts`.
+So `elabSlotBundleFacts` re-runs the same reader there, for program-level holders still without a
+fact, and never overwrites one.
+
+Over master `fd7ef721`'s 21 `monoBindingAdoptInit` decisions holding a bundle record, all at program
+level in seven programs (the five `closures/bundle-record-*.vl` tests, D15323 and D15324),
+`elabNodeTy` agrees at 14, differs at none, and leaves 7 to mono:
+- six reads of an un-annotated `Map()` whose value comes from its writes, which wait for lane F's
+  map-value facts;
+- `{ f: gen("s", 3), n: 3 }`, where the generic hands back a `let` and not a parameter. That needs
+  `elabRetOf` through a returned binding, its own item.
+
+A holder inside an instance written from a bundle still declines, because the late pass is
+program-level only, so 14 of 21 does not mean that bundles close at every instance.
 
 A captured cell (`let d = c` re-written by a lambda) gets no fact this way yet. Its written lambdas
 are nested and capture, so `elabHeldAtArgs` declines, and `elabHeldFnTy` returns that decline

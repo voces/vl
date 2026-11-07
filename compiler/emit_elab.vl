@@ -344,7 +344,6 @@ import {
   TyVar,
   genAppRowOf,
   mkArrayTy,
-  tyFieldTyOf,
   mkFuncTy,
   mkMapTy,
   mkNullableTy,
@@ -352,6 +351,7 @@ import {
   structNameOfTy,
   tyAt,
   tyEq,
+  tyFieldTyOf,
   tyHasHole,
   tyHasInferHole,
   tyHasLitLeaf,
@@ -11144,22 +11144,17 @@ function elabSlotTyAtKey(holder: i32, path: string[], ik: i32): i32 {
   t
 }
 
+// The program-level holders `elabSlotFacts` left without a fact, for `elabSlotBundleFacts`.
+let elabSlotUnfacted: i32[] = []
+
 // Re-reads `elabBindingWholeTy` for each program-level holder `elabSlotFacts` left without a fact,
 // once the reach rows exist: a value built from a delivered bundle has its type only then.
 export function elabSlotBundleFacts() {
-  let ix = 0
-  while ix < P.nodes.length {
-    const n = nodeAt(ix)
-    if n is LetDecl && n.letType < 0 && n.letInit >= 0 && !elabSlotTys.has(elabSlotKey(ix, -1)) {
-      const t = nodeTyIxOf(ix)
-      const fd = recEnclosingFn(ix)
-      const fdn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
-      if (elabSlotOpenFn(t) || elabSlotWholeFn(t)) && !(fdn is FuncDecl && elabFnInstanced(fdn)) {
-        const fr = elabBindingWholeTy(ix, t, -1)
-        if fr >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = fr }
-      }
+  for ix in elabSlotUnfacted {
+    if !elabSlotTys.has(elabSlotKey(ix, -1)) {
+      const fr = elabBindingWholeTy(ix, nodeTyIxOf(ix), -1)
+      if fr >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = fr }
     }
-    ix = ix + 1
   }
   0
 }
@@ -11169,6 +11164,7 @@ export function elabSlotBundleFacts() {
 // slots are written, for `elabSlotTyAt`.
 function elabSlotFacts() {
   const n0 = ekDecl.length
+  elabSlotUnfacted = []
   const inst: i32[] = []
   const instFn: i32[] = []
   let ix = 0
@@ -11187,7 +11183,11 @@ function elabSlotFacts() {
         } else {
           const fr = elabBindingWholeTy(ix, t, -1)
           const ft = if fr >= 0 { fr } else if elabSlotWholeFn(t) { elabSlotCloseWhole(ix, t, -1) } else { elabSlotClose(ix, t, [n.letInit], -1) }
-          if ft >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = ft }
+          if ft >= 0 {
+            elabSlotTys[elabSlotKey(ix, -1)] = ft
+          } else {
+            elabSlotUnfacted.push(ix)
+          }
         }
       }
     }
@@ -11413,7 +11413,6 @@ function elabWrittenBuiltTy(d: i32, x0: i32, k: i32, depth: i32): i32 {
   const x = parenPeelIx(x0)
   if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
   const n = nodeAt(x)
-  if n is Call { return elabCallBundleRet(x, k) }
   if n is Ident {
     const b = identDeclOf(x)
     if b < 0 || b >= P.nodes.length || b == d { return -1 }
@@ -11434,7 +11433,9 @@ function elabWrittenBuiltTy(d: i32, x0: i32, k: i32, depth: i32): i32 {
         any = true
       } else {
         t = nodeTyIxOf(f.fiValue)
-        if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyHasHole(t) { return -1 }
+        if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyHasHole(t) {
+          return -1
+        }
       }
       names.push(f.fiName)
       tys.push(t)
@@ -11461,14 +11462,16 @@ function elabWrittenBuiltTy(d: i32, x0: i32, k: i32, depth: i32): i32 {
     const at = elabWrittenBuiltTy(d, n.idxArr, k, depth + 1)
     if at < 0 || at >= T.tys.length { return -1 }
     const a = tyAt(at)
-    if a is TyArray { return a.aElem }
+    return if a is TyArray { a.aElem } else { -1 }
   }
-  -1
+  // Any other node hands back a bundle only as a call.
+  elabCallBundleRet(x, k)
 }
 
 // The bundle record call `x` at instance `k` (-1 for the program) hands back: its instance returns
 // the parameter `elabRetParamOf` names, delivered as a bundle (`elabDeliveredBundleSigs`). Else -1.
 export function elabCallBundleRet(x: i32, k: i32): i32 {
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Call) { return -1 }
   const ck = elabCallInstFrom(x, k)
   if ck < 0 || ck >= ekDecl.length { return -1 }
   const p = elabRetParamOf(ekDecl[ck])
