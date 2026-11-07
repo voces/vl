@@ -2792,6 +2792,13 @@ against master's fixpoint is 23,103 identical, so none of them reaches emitted c
 reaches its own closure signature; the map's `(i32) => i32` spelling is the unbound default, which
 slots no call reads take too. It belongs to the unbound-default family.
 
+A captured cell nothing reads is the same question. In
+`closures/hole-lambda-cell-takes-instance-type.vl`'s `peerPinned`, `let d2 = e` is re-written by a
+lambda to `c` and never read or called. Closing `d2` needs an instance for `e`, a hole function no
+call reaches. That is the default-instance question for an uncalled hole function, so the holder
+closure leaves the cell open and builds no default. D3851 records that such a lambda, written only
+into bindings nothing reads, is not lowered at all.
+
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
 instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for
 a record built wider, which is why 34 of the 74 pairs close under `callArgRepTy`. Each remaining kind
