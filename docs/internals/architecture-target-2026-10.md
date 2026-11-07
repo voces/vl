@@ -3627,7 +3627,9 @@ Where output held, bytes were compared too. The split with split-dep: these thre
 this lane's, and the one-producer redesign, `monoArgTyNameProjected` and `monoArgTyNameRep` are
 split-dep's.
 
-**Deleted: output- and byte-identical.** In each, the fallback answers the same pin.
+**Deleted: output- and byte-identical.** In each, the fallback answers the same pin. Byte
+identity covers the step-7 scans too: a scan reading a different name would move bytes. B1, B2
+and B4 rest on one program each, named, so a regression in that spelling points at the arm.
 
 | arm | what it read | programs reaching it | case |
 |---|---|---|---|
@@ -3635,9 +3637,9 @@ split-dep's.
 | P3 | `elabArgBuiltRep` → nominal | 32 | fallback answers identically |
 | P4 | `recCopyTyOf` → nominal (D15183) | 8 | fallback answers identically |
 | P10 | function-holding closed type → `monoFnTyPin` | 65 | fallback answers identically |
-| B1 | `monoBuildTyPin` | 1 | fallback answers identically |
-| B2 | the callee's concrete return annotation | 1 | fallback answers identically |
-| B4 | an annotated local's annotation | 1 | fallback answers identically |
+| B1 | `monoBuildTyPin` | 1 (`soundness/covariant-record-field-read-only-runs`) | fallback answers identically |
+| B2 | the callee's concrete return annotation | 1 (`generics/nested-generic-call`) | fallback answers identically |
+| B4 | an annotated local's annotation | 1 (`structs/inline-shape-local-beside-declared-twin`) | fallback answers identically |
 | B8 | an un-annotated local's initializer, when not `i32` | 3 | fallback answers identically |
 | B17 | an un-annotated global's `""` floor | 5 | ends in the same named refusal: all 5 are rejects, with the same message |
 
