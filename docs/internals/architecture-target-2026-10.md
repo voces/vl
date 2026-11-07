@@ -2040,6 +2040,22 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 
     Each is a function-valued holder whose closed signature comes from its own calls, which the held
     slot's fallthrough does not reach.
+  - **The let and list-callback node types** (2026-11-07, master `18d3d488`, the full population).
+    - `monoSubstLetType` (and `monoCloneLetDecl`, which only wraps it) stays. Its substituted type
+      against `elabWalkTy`: 1,022 of 1,058 agree, 31 are open on both sides, and 5 are not the same
+      type though they print alike. One of the 5 is D14426's witness
+      (`hole-instance-typed-at-binding-stored-at-build`). There the binding takes the checker's
+      instance binding and the elaboration gives the build. Switching the type to the elaboration
+      turns that program from running into a loud emit reject. One agreement also gains `readonly`,
+      which moves bytes but not output. The SPELLING cannot switch either. In 104 of the agreements
+      (74 files) the elaboration's nominal spelling differs from the substituted name: union row
+      order, `Dot$mN` for `Circle$mN`, `{x: i32}` for `P`, `#anon1` for a record. That name is the
+      union registry's key (D2676).
+    - `monoCoerceListCbArg` stays. The elaboration never contradicts it, but is absent for 515 of
+      1,691 receivers (`elabNodeTyAt(memObj)`) and for 92 of 122 callback signatures, and open
+      (`(T) => T` where mono closes the instance) for 18 more. That is the second acceptance list:
+      a receiver fact for list methods called on a list of hole lambdas, and a delivered-signature
+      fact for a lambda or function value handed to a list method as its callback.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
   The hub is the binding `monoInstantiateCallIn` hands `monoMakeInstance` (`tvN` / `tvV` / `tvT`),
   against `ekTys` at the key the elaboration made for the call (`elabWalkKeyOf`, which already
