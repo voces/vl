@@ -2063,8 +2063,23 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   of one lambda, are the calls the `monoFlowReads` rewrite repoints, which the cad lane records
   after B2; then `monoLitReachesNoCall`, `monoValsReachNoCall` and `monoValsInert` go.
 
-The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
-with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
+The unbound default, which every program reaches through `monoElabDefaultsPrime`, is the reach
+lane's. The cad lane takes slot deliveries, then node type, then slot type.
+
+**The unbound default, measured** (2026-11-07, master `75101d46`). The D4551 default is the
+elaboration's: `ELAB_TP_DEFAULT` and `elabTpDefaulted` (#6569), after its call reach was made to
+see into callees before collect runs (#6563). The uncalled slots already read it
+(`elabUncalledSlotTy`). Two parts stay in mono, for different reasons:
+
+- `monoHoleGenFnFlowTy` and `monoChoiceArmFlowTy` answer a narrower question than the
+  elaboration's parameter binding `elabCallParamTyFrom`: the instance a hole generic's slot delivery
+  fixes. Shadowed at `monoHoleGenFnPin` over 23,103 programs, 38 agree, 0 differ and 2 answer where
+  the elaboration has none, but at 1,308 more pins mono leaves the type open while
+  `elabCallParamTyFrom` is closed. The replacement is a fact of that narrower question, which must
+  decline at all 1,308, with the D6542 empty-list `i32` a named default beside `ELAB_TP_DEFAULT`.
+- `monoDefaultTyParamsOnlyGenFns` is a per-call rule (a type parameter named only by function slots
+  handed generic values) that no elaboration fact states. It fires at 10 calls in 4 files; the
+  call binding `elabCallBindTy` is the default at 8 and absent at 2 inside a generic body.
 
 **Slot type, map values switched** (2026-11-06). `monoPinMapValues` takes the map's type from
 `elabSlotTyAt` wherever it closes; `monoPinMapSlot` only instances the stored values at it, and a
@@ -2512,6 +2527,20 @@ since the inert walk marks the site that writes the generic, and anything else a
 roots, which deletes `monoFlowReadElem`. The alias-write walk (D9651, D9440) stays in mono as
 syntax. Each step graded alone against master's fixpoint: 0 moved, after the two fixes the first
 cut needed (a push blamed on its value, not its call; a map's inert site lost to its root).
+
+**B2b, part 2b, and what stays in mono** (2026-11-07). `monoFlowLetLeaf` and `monoFlowLetMapLeaf`
+read a `let`'s initialiser and writes from `cwBindingWrittenValues` (0 moved each). That ends B2's
+value derivations. What stays is class (c), and why:
+- `mfrPlannedRoots` (was `mfrVals`) is planner state: `monoFlowDeclVals` fills it from the
+  elaboration, and the root sweep and tie bookkeeping read only planned bindings, so it is not a cache
+  of every binding's roots.
+- `monoFlowAliasReadVals`, `monoFlowRetLocalLists` and `monoFlowRetUse` classify a use by syntax over
+  elaboration values; `monoFlowElemsGen` reads elements and the write index and keeps the spread
+  ties (D9482).
+- `mfrCand` and `mfrGen` are decided by syntax, plus one elaboration fact (`fnTagListTy`, a tagged
+  set's id list is no candidate); no member is added on mono's own type judgement.
+- The inert walk's as-written map site stays only as long as the inert walk, which leaves with the
+  inertness change to `elabSlotUncalled`.
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and

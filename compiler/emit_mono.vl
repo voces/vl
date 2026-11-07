@@ -140,6 +140,7 @@ import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
 import {
+  cwBindingWrittenValues,
   cwFnValueDeclOf,
   cwIxBuild,
   cwIxCoveredLen,
@@ -12211,8 +12212,10 @@ let mfrUses: {[i32]: i32[]} = Map()
 let mfrNameCount: {[string]: i32} = Map()
 let mfrGen: {[i32]: boolean} = Map()
 let mfrCand: {[i32]: boolean} = Map()
-let mfrVals: {[i32]: i32[]} = Map()
-let mfrValsState: {[i32]: i32} = Map()
+// The roots of each binding the planner asked about, filled only by `monoFlowDeclVals` from the
+// elaboration's values; the root sweep and tie bookkeeping read it for planned bindings alone.
+let mfrPlannedRoots: {[i32]: i32[]} = Map()
+let mfrPlannedRootsState: {[i32]: i32} = Map()
 let mfrDirty: {[i32]: boolean} = Map()
 let mfrAnnLits: {[i32]: i32[]} = Map()
 let mfrAnnLets: i32[] = []
@@ -12252,8 +12255,8 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrNameCount = Map()
   mfrGen = Map()
   mfrCand = Map()
-  mfrVals = Map()
-  mfrValsState = Map()
+  mfrPlannedRoots = Map()
+  mfrPlannedRootsState = Map()
   mfrDirty = Map()
   mfrAnnLits = Map()
   mfrAnnLets = []
@@ -12391,21 +12394,16 @@ function monoFlowLetCalls(d: i32) {
   0
 }
 
-// The one generic written `let` `d` holds when its initializer and every whole `=` to it is a
+// The one generic written `let` `d` holds when its initializer and every write to it is a
 // read, narrowed non-null, of an un-annotated `const` bound to a map read whose stored values all
 // name it, so every read of `d` names it too (D10384), with those values pushed onto `stored`;
 // -1 otherwise.
 function monoFlowLetMapLeaf(d: i32, stored: i32[]): i32 {
   const dn = nodeAt(d)
   if !(dn is LetDecl) { return -1 }
-  const srcs: i32[] = [unwrapParen(dn.letInit)]
-  for u in mfrUses[d] ?? [] {
-    if monoFlowIsWrite(u) {
-      const w = monoFlowWholeWrite(u)
-      if w < 0 { return -1 }
-      srcs.push(unwrapParen(w))
-    }
-  }
+  const srcs: i32[] = []
+  for w in cwBindingWrittenValues(cwKeyOfDecl(d)) { srcs.push(unwrapParen(w)) }
+  if srcs.length == 0 { return -1 }
   let g = -1
   for s in srcs {
     if s < 0 || !(nodeAt(s) is Ident) { return -1 }
@@ -12814,9 +12812,9 @@ function monoFlowLeafGen(v: i32): i32 {
   -1
 }
 
-// The generic un-annotated `let` `d` holds when its initializer and every write to it, each a
-// whole `=`, name that one generic, so any read of it names it too (D9791); -1 otherwise. Inside a
-// cycle of such writes a `let` already being resolved answers -3, which agrees with any generic.
+// The generic un-annotated `let` `d` holds when its initializer and every write to it
+// (`cwBindingWrittenValues`) name that one generic, so any read of it names it too (D9791); -1
+// otherwise. Inside a cycle of such writes a `let` already being resolved answers -3.
 function monoFlowLetLeaf(d: i32): i32 {
   const dn = nodeAt(d)
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
@@ -12824,10 +12822,9 @@ function monoFlowLetLeaf(d: i32): i32 {
   mfrLetBusy[d] = true
   mfrLetDepth = mfrLetDepth + 1
   let g = monoFlowLeafGen(unwrapParen(dn.letInit))
-  for u in mfrUses[d] ?? [] {
-    if g != -1 && monoFlowIsWrite(u) {
-      const w = monoFlowWholeWrite(u)
-      const wg = if w < 0 { -1 } else { monoFlowLeafGen(unwrapParen(w)) }
+  for w in cwBindingWrittenValues(cwKeyOfDecl(d)) {
+    if g != -1 && w != dn.letInit {
+      const wg = monoFlowLeafGen(unwrapParen(w))
       if g == -3 { g = wg }
       else if wg != -3 && wg != g { g = -1 }
     }
@@ -13105,10 +13102,10 @@ function monoFlowValsOf(x: i32, out: i32[]): boolean {
 // a root is no container and `d` reached a function other than through a map read. A `.slice()`
 // copy mono rewrote to a minted spread literal holds that literal in place of its receiver's roots.
 function monoFlowDeclVals(d: i32): i32[] {
-  const st = mfrValsState[d] ?? 0
-  if st == 2 { return mfrVals[d] ?? [] }
+  const st = mfrPlannedRootsState[d] ?? 0
+  if st == 2 { return mfrPlannedRoots[d] ?? [] }
   if st != 0 { return [] }
-  mfrValsState[d] = 3
+  mfrPlannedRootsState[d] = 3
   let ev: i32[] = []
   if !mfrLitsOf(d, ev) { return [] }
   const dn = nodeAt(d)
@@ -13137,8 +13134,8 @@ function monoFlowDeclVals(d: i32): i32[] {
       return []
     }
   }
-  mfrVals[d] = ev
-  mfrValsState[d] = 2
+  mfrPlannedRoots[d] = ev
+  mfrPlannedRootsState[d] = 2
   ev
 }
 
@@ -13172,7 +13169,7 @@ function monoFlowReadsAll(lets: i32[]) {
   const again: i32[] = []
   for d in lets {
     let holds = false
-    for v in mfrVals[d] ?? [] {
+    for v in mfrPlannedRoots[d] ?? [] {
       const r = monoFlowLitRoot(v)
       for h in hosts {
         if h == r { holds = true }
@@ -13370,7 +13367,7 @@ function monoFlowTagPairs(out: i32[], d: i32, pairs: i32[]) {
 
 // Whether every literal tree binding `d` may hold is clear of a decline by another binding.
 function monoFlowDeclClean(d: i32): boolean {
-  for v in mfrVals[d] ?? [] {
+  for v in mfrPlannedRoots[d] ?? [] {
     if mfrDirty[monoFlowLitRoot(v)] ?? false { return false }
   }
   true
@@ -14438,11 +14435,11 @@ function monoFlowNoteInert(planned: i32[], through: i32[], copied: i32[]) {
   const kept: i32[] = []
   for r in copied { kept.push(r) }
   for d in through {
-    for v in mfrVals[d] ?? [] { kept.push(monoFlowLitRoot(v)) }
+    for v in mfrPlannedRoots[d] ?? [] { kept.push(monoFlowLitRoot(v)) }
   }
   for d in planned {
     if monoFlowDeclClean(d) {
-      for v in mfrVals[d] ?? [] {
+      for v in mfrPlannedRoots[d] ?? [] {
         if !i32ListHas(kept, monoFlowLitRoot(v)) { monoFlowNoteInertIn(v, 0) }
       }
     }
