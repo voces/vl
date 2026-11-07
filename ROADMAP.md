@@ -40,8 +40,10 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 ## Next, in order
 
 1. **The architecture migration**, in [target §3](docs/internals/architecture-target-2026-10.md)
-   order. The forward items after the latest landings are in §3.1, "Open after #5115". Status is in
-   [the plan](docs/internals/architecture-refactor-plan.md).
+   order. Per-step status is the target's status section; the dated measurements are in
+   [`refactor-notes/`](docs/internals/refactor-notes/README.md), and the forward items after the first
+   landings in [§3.1's notes](docs/internals/refactor-notes/2026-10-25-first-landings-findings.md),
+   "Open after #5115". The lane table is in [the plan](docs/internals/architecture-refactor-plan.md).
 2. **Clause-1 defects:** run `ls.vl -- --status open` and grep for `clause 1`.
 3. **Initialization order** (DECISIONS.md, "Initialization order"). Make init-before-read a compile
    error and reorder initializers.

@@ -5474,12 +5474,6 @@ function monoNameOnlyCalled(ix: i32, name: string, inLam: boolean): boolean {
   true
 }
 
-// Node `ix`'s type at the hole instance being built: the elaboration's, else its recorded type `t`.
-function monoHoleNodeTy(ix: i32, t: i32): i32 {
-  const e = elabWalkTy(ix)
-  if e >= 0 { e } else { t }
-}
-
 // Binds, into `hN`/`hT`, each hole parameter of the generic at `origFe` to its column in
 // `tyCol`: the one hole binding an instance makes, read by its return rungs and body clone.
 function monoHoleBinding(
@@ -6577,23 +6571,15 @@ function monoCloneGenericCalls(ix: i32) {
     return nx
   }
   // A re-made node answers the type its template did, which a later pin substitutes, unless
-  // its re-make recorded its own: a list literal's rep is read off that type (D2849).
+  // its re-make recorded its own: a list literal's rep is read off that type (D2849). At a hole
+  // instance an open type is the elaboration's where that closes it, as no pin substitutes a hole's.
   if nodeTyIxOf(nx) < 0 {
-    const t = monoCgcTplTy(ix)
-    if t >= 0 { nodeTyRecord(nx, t) }
+    const t = nodeTyIxOf(ix)
+    const e = if t >= 0 && tyHasTyVar(t) && monoCgcHoleN.length > 0 { elabWalkTy(ix) } else { -1 }
+    if e >= 0 && !tyHasTyVar(e) { nodeTyRecord(nx, e) }
+    else if t >= 0 { nodeTyRecord(nx, t) }
   }
   nx
-}
-
-// Template node `ix`'s recorded type, with the instance's holes read where that leaves no type
-// variable, since no later pin substitutes a hole's. -1 where `ix` records none.
-function monoCgcTplTy(ix: i32): i32 {
-  const t = nodeTyIxOf(ix)
-  if t >= 0 && tyHasTyVar(t) && monoCgcHoleN.length > 0 {
-    const ht = monoHoleNodeTy(ix, t)
-    if ht >= 0 && !tyHasTyVar(ht) { return ht }
-  }
-  t
 }
 
 // Whether re-made list literal `nx`, whose template is `tpl` and typed `T[][]`, holds a generic
@@ -6735,10 +6721,12 @@ function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
       monoLamCallCallees.push(newCallee)
       lamCall = true
     } else if monoCalleeElems(n.callFn, -1).length > 0 {
-      // A call through list elements records its callee's type per instance (D12702).
+      // A call through list elements records its callee's type per instance (D12702): the
+      // elaboration's at the hole instance being built, else the template's.
       newCallee = monoCopyOf(n.callFn, mkIdent(callee.identName, callee.pos))
       lfNoteMinted(newCallee, n.callFn)
-      nodeTyRecord(newCallee, monoHoleNodeTy(n.callFn, nodeTyIxOf(n.callFn)))
+      const ce = elabWalkTy(n.callFn)
+      nodeTyRecord(newCallee, if ce >= 0 { ce } else { nodeTyIxOf(n.callFn) })
     }
   } else {
     newCallee = monoCloneGenericCalls(n.callFn)
@@ -13965,7 +13953,19 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
     ) {
       return 0
     }
-    return monoUncalledNestedListElems(d, at, inner, held)
+    // It is annotated at the type `monoUncalledSlotFnTy` gives the functions it holds.
+    const sp: string[] = []
+    const uft = monoUncalledSlotFnTy(at, ["e", "e"], held, sp)
+    if uft < 0 { return 0 }
+    const uit = mkArrayTy(uft)
+    const ult = mkArrayTy(uit)
+    d.letType = synthTypeRefTy("(" + sp[0] + ")[][]", -1, ult)
+    nodeTyRecord(d.letInit, ult)
+    for x in inner { nodeTyRecord(x, uit) }
+    for vw in held {
+      if !monoTyClosedFn(nodeTyIxOf(vw[0])) { nodeTyRecord(vw[0], uft) }
+    }
+    return 1
   }
   const ann = monoSigFnTyName(pins[0] + ";")
   const dTys: i32[] = []
@@ -13986,28 +13986,6 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
   for v in vals {
     const et = nodeTyIxOf(v)
     if et < 0 || tyHasTyVar(et) { nodeTyRecord(v, ft) }
-  }
-  1
-}
-
-// Annotates the list `d` of the list literals `inner`, holding the functions `held`, whose inner
-// slot nothing calls, at the type `monoUncalledSlotFnTy` gives them: 1 when annotated, else 0.
-function monoUncalledNestedListElems(
-  d: LetDecl,
-  at: i32,
-  inner: i32[],
-  held: i32[][],
-): i32 {
-  const sp: string[] = []
-  const ft = monoUncalledSlotFnTy(at, ["e", "e"], held, sp)
-  if ft < 0 { return 0 }
-  const it = mkArrayTy(ft)
-  const lt = mkArrayTy(it)
-  d.letType = synthTypeRefTy("(" + sp[0] + ")[][]", -1, lt)
-  nodeTyRecord(d.letInit, lt)
-  for x in inner { nodeTyRecord(x, it) }
-  for vw in held {
-    if !monoTyClosedFn(nodeTyIxOf(vw[0])) { nodeTyRecord(vw[0], ft) }
   }
   1
 }
@@ -14765,7 +14743,16 @@ function monoPinFieldContainers(d: LetDecl, at: i32, ctx: i32): i32 {
   const rt = monoPinObjFields(d.letInit, at, ctx, "", pinned, recs, recTys)
   if rt == -2 { return -1 }
   if rt < 0 || !monoLetWritesAt(d, at, ctx, rt) { return 0 }
-  monoLetWritesRecord(d, at, ctx)
+  // Each record literal a write stores takes the slot fact `monoLetWritesAt` compared.
+  if d.letKw != "const" {
+    const st = elabSlotTyAt(at, [], ctx)
+    for w in monoLetWholeWrites(at) {
+      const wb = nodeAt(w)
+      if wb is BinExpr && wb.binOp == "=" {
+        monoRecordObjLitAt(unwrapParen(wb.binRight), st, ctx)
+      }
+    }
+  }
   monoSupersededObjTys.push(nodeTyIxOf(d.letInit))
   nodeTyRecord(d.letInit, rt)
   monoGradualObjList.push(d.letInit)
@@ -14852,23 +14839,6 @@ function monoClosedReadTy(vx: i32, ctx: i32, rec: boolean): i32 {
   if bt < 0 || bt >= T.tys.length || monoTyOpen(bt) { return -1 }
   if rec { nodeTyRecord(vx, bt) }
   bt
-}
-
-// The closed type value `v` of a record field takes in frame `ctx`, where a literal's closed
-// bindings or the closed binding it reads close it (those reads recorded when `rec`), -1
-// otherwise. Mono's own derivation: no elaboration fact answers it yet (architecture §3.4).
-function monoClosedFieldValTy(v: i32, ctx: i32, rec: boolean): i32 {
-  if v < 0 { return -1 }
-  const vx = unwrapParen(v)
-  if vx < 0 || vx >= P.nodes.length { return -1 }
-  if nodeAt(vx) is ObjLit {
-    const lt = monoClosedObjLitTy(vx, ctx, rec)
-    if lt >= 0 { return lt }
-    const ot = nodeTyIxOf(vx)
-    if monoTyOpen(ot) { return -1 }
-    return ot
-  }
-  monoClosedReadTy(vx, ctx, rec)
 }
 
 // The type record literal `lx` in frame `ctx` takes from the closed bindings its open fields read,
@@ -15250,20 +15220,6 @@ function monoLetWriteFreshMap(w: i32): i32 {
   rx
 }
 
-// Records on each record literal a write of the `let` declared at `at` stores the binding's slot
-// fact, which `monoLetWritesAt` compared, once the binding is pinned.
-function monoLetWritesRecord(d: LetDecl, at: i32, ctx: i32) {
-  if d.letKw == "const" { return 0 }
-  const t = elabSlotTyAt(at, [], ctx)
-  for w in monoLetWholeWrites(at) {
-    const wb = nodeAt(w)
-    if wb is BinExpr && wb.binOp == "=" {
-      monoRecordObjLitAt(unwrapParen(wb.binRight), t, ctx)
-    }
-  }
-  0
-}
-
 // Records closed type `t` on record literal `lx` in frame `ctx`, and on each open field its field
 // type: a nested literal in turn, a read of a binding as read at it, an inline list by its pin.
 function monoRecordObjLitAt(lx: i32, t: i32, ctx: i32) {
@@ -15476,16 +15432,49 @@ function monoPinStoredRecords(
       && fty < T.tys.length
       && !(tyAt(fty) is TyFunc)
     ) {
-      // A field reading a closed binding, or a record literal of them, takes its type (D9183).
+      // A field the elaboration closes takes its slot fact, recorded on each stored value (D9183).
       const fvals = monoMapStoredFields(stored, name)
       if fvals.length != stored.length { return -1 }
-      fty = -1
+      const fpath: string[] = []
+      for p in path { fpath.push(p) }
+      fpath.push("f." + name)
+      fty = elabSlotTyAt(lf[1], fpath, lf[0])
+      if fty < 0 || fty >= T.tys.length || monoTyOpen(fty) { return -1 }
       for fv in fvals {
-        const t = monoClosedFieldValTy(fv[0], fv[1], false)
-        if t < 0 || (fty >= 0 && !tyEq(fty, t)) { return -1 }
-        fty = t
+        // Walk state: a value reading a binding whose rep is not yet closed at this point of the
+        // walk waits for it; the fact names the type, not the binding's rep (D9183).
+        const vx = unwrapParen(fv[0])
+        const reads: i32[] = []
+        if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is Ident {
+          reads.push(vx)
+        }
+        const vl = if vx >= 0 && vx < P.nodes.length { nodeAt(vx) } else { null }
+        if vl is ObjLit {
+          for fi in vl.objFields {
+            const f = nodeAt(fi)
+            const fx = if f is FieldInit { unwrapParen(f.fiValue) } else { -1 }
+            if fx >= 0 && fx < P.nodes.length && nodeAt(fx) is ObjLit {
+              return -1
+            }
+            if fx >= 0 && fx < P.nodes.length && nodeAt(fx) is Ident {
+              reads.push(fx)
+            }
+          }
+        }
+        for rx in reads {
+          const bd = monoReadLetFrame(rx, fv[1])[1]
+          const b = if bd >= 0 { nodeAt(bd) } else { null }
+          if (
+            b is LetDecl
+            && monoTyOpen(
+              nodeTyIxOf(if b.letType >= 0 { b.letType } else { b.letInit }),
+            )
+          ) {
+            return -1
+          }
+        }
+        recVals.push([fv[0], fv[1], fty])
       }
-      for fv in fvals { recVals.push(fv) }
     } else if monoTyOpen(fty) {
       if fty < 0 || fty >= T.tys.length { return -1 }
       const fvals = monoMapStoredFields(stored, name)
@@ -15505,7 +15494,14 @@ function monoPinStoredRecords(
     k = k + 1
   }
   spell.push(vs + "}")
-  for fv in recVals { monoClosedFieldValTy(fv[0], fv[1], true) }
+  for fv in recVals {
+    const vx = unwrapParen(fv[0])
+    if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is ObjLit {
+      monoRecordObjLitAt(vx, fv[2], fv[1])
+    } else if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is Ident {
+      nodeTyRecord(vx, fv[2])
+    }
+  }
   for ll in listLits { monoRecordOpen(ll[0], ll[1], ll[2]) }
   // The record's type is the elaboration's slot fact; a map whose generic is called at two
   // signatures has none, and keeps the type its fields give (D15494).
@@ -17193,7 +17189,9 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   // the annotation the pin gave it (D9093), as is one handed a named function its parameter the
   // flow linked to it (D9761).
   const open = rt < 0 || tyHasTyVar(rt) && !fnTagListTy(rt)
-  if (lam || nodeAt(ax) is Ident) && open { rt = monoPinnedListAnnTy(m.memObj) }
+  if (lam || nodeAt(ax) is Ident) && open {
+    rt = monoPinnedAnnTyAt(m.memObj, 0)
+  }
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = tyAt(rt)
   // A tagged set element is closed: the callback's instance takes the set, as a direct call's does.
@@ -17250,11 +17248,6 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   0
 }
 
-// The type of the annotation a pin gave the un-annotated binding the `Ident` at `recv` names,
-// read through a binding initialised from another, a list element, a map value or a record
-// field, every value written there agreeing (D9173, D9502); -1 when none is found.
-function monoPinnedListAnnTy(recv: i32): i32 { monoPinnedAnnTyAt(recv, 0) }
-
 // Records the pinned list type `t` on a receiver read `recv` and on each un-annotated binding it
 // reads through, where the checker left them open, so a binding holds the type it is called at.
 function monoRecordPinnedRecv(recv: i32, t: i32, wf: i32, depth: i32) {
@@ -17275,6 +17268,9 @@ function monoRecordPinnedRecv(recv: i32, t: i32, wf: i32, depth: i32) {
   monoRecordPinnedRecv(d.letInit, t, wf, depth + 1)
 }
 
+// The type of the annotation a pin gave the un-annotated binding the `Ident` at `recv` names,
+// read through a binding initialised from another, a list element, a map value or a record
+// field, every value written there agreeing (D9173, D9502); -1 when none is found.
 function monoPinnedAnnTyAt(recv: i32, depth: i32): i32 {
   const x = unwrapParen(recv)
   if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
@@ -18528,9 +18524,10 @@ function monoPreBindPastUnionRest(
     // renders the whole argument type, which a wide type makes dear.
     if ann != "" && isUnion {
       if i < decl.length { dt = decl[i] }
-      act = monoPreBindArgName(args[i], ctx)
+      const pa: i32[] = [at]
+      act = monoPreBindArg(args[i], ctx, pa)
       if act != "" {
-        at = monoPreBindArgTy(args[i], ctx)
+        at = pa[0]
         if monoPinDefers(dt, at, typarams) { any = true }
       }
     }
@@ -18544,8 +18541,9 @@ function monoPreBindPastUnionRest(
   let a = 0
   while a < anns.length {
     if anns[a] != "" && acts[a] == "" {
-      acts[a] = monoPreBindArgName(args[a], ctx)
-      if acts[a] != "" { ats[a] = monoPreBindArgTy(args[a], ctx) }
+      const pa: i32[] = [ats[a]]
+      acts[a] = monoPreBindArg(args[a], ctx, pa)
+      ats[a] = pa[0]
     }
     a = a + 1
   }
@@ -18626,24 +18624,18 @@ function monoPreBindPastUnionRest(
   0
 }
 
-// The pin name of argument `ax` for the pre-bind: a bare `null` names its checked type, which no
-// parameter could bind from, whatever its default pin.
-function monoPreBindArgName(ax: i32, ctx: i32): string {
+// The pin name of argument `ax` for the pre-bind, read inside function `ctx`, with its pinned type
+// written to `ty[0]` when the name is not "". A bare `null` is its checked type, which no
+// parameter could bind from, whatever its recorded pin.
+function monoPreBindArg(ax: i32, ctx: i32, ty: i32[]): string {
   const x = unwrapParen(ax)
   if x >= 0 && x < P.nodes.length && nodeAt(x) is NullLit {
-    return tyToStr(nodeTyIxOf(x))
+    ty[0] = nodeTyIxOf(x)
+    return tyToStr(ty[0])
   }
-  monoArgPinName(ax, ctx)
-}
-
-// The pinned type of argument `ax` for the pre-bind, read inside function `ctx`: a bare `null`
-// is its checked type, whatever its recorded pin.
-function monoPreBindArgTy(ax: i32, ctx: i32): i32 {
-  const x = unwrapParen(ax)
-  if x >= 0 && x < P.nodes.length && nodeAt(x) is NullLit {
-    return nodeTyIxOf(x)
-  }
-  monoPinSubTyOf(monoArgPinTyIx(ax, ctx), ctx)
+  const nm = monoArgPinName(ax, ctx)
+  if nm != "" { ty[0] = monoPinSubTyOf(monoArgPinTyIx(ax, ctx), ctx) }
+  nm
 }
 
 // Whether every atom of union spelling `inner` is an atom of `outer`.
@@ -19662,14 +19654,6 @@ function monoInertArgsStubbed(): i32 {
   0
 }
 
-// The closed function type the `=>` pin `pin` of hole-function argument `ax` in frame `fnIx`
-// keys: the elaboration's default fill of the argument's type; -1 when the type is closed or the
-// fill does not key as `pin`.
-function monoHoleFnPinTy(ax: i32, fnIx: i32, pin: string): i32 {
-  if !monoPinIsFnSig(pin) { return -1 }
-  monoHoleFnPinTyOf(monoArgPinTyIx(ax, fnIx), pin)
-}
-
 // The closed function type the `=>` pin `pin` keys for the function type `vt`: `vt` itself when
 // closed, else the elaboration's default fill (`elabHoleFnClosed`); -1 when neither keys as `pin`.
 function monoHoleFnPinTyOf(vt: i32, pin: string): i32 {
@@ -20644,7 +20628,9 @@ function monoPinHoleParam(
         }
       }
       // A hole function's `=>` pin is typed at the closed signature its rep key names.
-      if anTy < 0 { anTy = monoHoleFnPinTy(args[i], ctx, an) }
+      if anTy < 0 && monoPinIsFnSig(an) {
+        anTy = monoHoleFnPinTyOf(monoArgPinTyIx(args[i], ctx), an)
+      }
     }
     // An argument open in this frame at a call no instance elaborates at a closed type: no
     // instance is demanded here.
