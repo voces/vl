@@ -2260,6 +2260,24 @@ instance) need a nested member read from its instances under the key; that admit
 late demands for the lambdas, so it waits until the run foresees them. No byte moves over 19,318
 programs.
 
+**Slot type, field and map value read the fact alone** (2026-11-07, after #6589). The record-field
+pin types the field at `elabSlotTyAt` and leaves a field the elaboration has no fact for as
+checked. Its own derivation from the instance it took (`monoNodeTyAt`, `monoHoleLamAtAnnTy`,
+`monoValueAtAnnTy`) goes, and `monoHoleLamAtAnnTy` with it. `monoPinMapValues` annotates a map
+only at its slot fact. `monoPinMapSlot` still instances the stored values and types the map's
+reads, and refuses a disagreement. Shadowed over 23,384 programs, counted by program:
+
+| pin | agree | differ | mono only | elab only | neither |
+|---|---|---|---|---|---|
+| record field | 15 | 0 | 41 | 1 | 21 |
+| map value | 32 | 0 | 15 | 4 | 13 |
+
+The mono-only cells are fields and maps the checker already closed, and the D15494 maps whose
+generic is called at two signatures. Dropping mono's answer there moves no byte. The one elab-only
+field program, `generics/nested-capture-per-pin-binding.vl`, now takes the fact at its two fields
+with the same bytes. The four elab-only maps are ones where `monoPinMapSlot` declines first, so nothing
+changes. Over 19,316 programs no byte moves, and 4,605 filed witnesses grade as filed.
+
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
 and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
