@@ -11396,6 +11396,107 @@ function elabBindingWholeTy(d: i32, t: i32, k: i32): i32 {
   if o is TyNullable && !(fo is TyNullable) { mkNullableTy(f) } else { f }
 }
 
+// The functions binding `d` may hold, ascending: the union of the sets every value written to it
+// carries (`cwBindingWrittenValues`, initialiser included), as an `if`'s arms join theirs. [] where
+// one value may be any function (a closed lambda, a parameter, a call result) or none is written.
+// A loop's value carrier, minted after the write index, is written the loop's exits.
+export function elabBindingFnSet(d: i32): i32[] {
+  const none: i32[] = []
+  cwIxWant()
+  const lv = if d >= 0 { lvCarrierLoopOf(d) } else { -1 }
+  const vals = if lv >= 0 { elabLoopExits(lv) } else { cwBindingWrittenValues(d) }
+  let acc: i32[] = []
+  for v in vals {
+    const x = parenPeelIx(v)
+    if x < 0 || x >= P.nodes.length { return none }
+    if !(nodeAt(x) is NullLit) {
+      const s = elabValueFnSet(x, 0)
+      if s.length == 0 { return none }
+      acc = elabFnIdsUnion(acc, s)
+    }
+  }
+  acc
+}
+
+// The values the loop or labelled block `lv` hands out (`lvExitLoops`).
+function elabLoopExits(lv: i32): i32[] {
+  const out: i32[] = []
+  for v in lvExitLoops.keys() {
+    if (lvExitLoops[v] ?? -1) == lv { out.push(v) }
+  }
+  out
+}
+
+// The functions value `x` may be: the set its type carries (an `if`'s arms join theirs there),
+// narrowed to the one function a name or a function literal is, since structurally equal values
+// share a type and so its set. The checker's adapter of a function is that function. [] where it
+// may be any function.
+function elabValueFnSet(x: i32, depth: i32): i32[] {
+  const ac = elabAdapterCallee(x)
+  if ac >= 0 && depth < 4 { return elabValueFnSet(parenPeelIx(ac), depth + 1) }
+  const n = nodeAt(x)
+  const id0 = if n is FuncDecl { x } else if n is Ident { identDeclOf(x) } else { -1 }
+  // An instance's clone of a function is in the set as its source declaration (`nodeSrc`).
+  const src = if id0 >= 0 { nodeSrc[id0] ?? -1 } else { -1 }
+  const id = if src >= 0 { src } else { id0 }
+  // A name of a declared generic is that function, even where its read carries no set.
+  const idn = if id >= 0 && id < P.nodes.length { nodeAt(id) } else { n }
+  if n is Ident && idn is FuncDecl && idn.fnTyParams.length > 0 { return [id] }
+  const s = elabFnSetOf(nodeTyIxOf(x))
+  if s.length == 0 { return s }
+  if (
+    id >= 0
+    && id < P.nodes.length
+    && nodeAt(id) is FuncDecl
+    && i32ListHas(s, id)
+  ) {
+    return [id]
+  }
+  s
+}
+
+// The callee of the checker's adapter lambda `x`, one whose `$fp` parameters are handed on, in
+// order, to a single call (D4892); -1 for any other node.
+function elabAdapterCallee(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const f = nodeAt(x)
+  if !(f is FuncDecl) || f.fnParams.length == 0 || f.fnBody < 0 { return -1 }
+  const b = nodeAt(f.fnBody)
+  if !(b is Block) || b.blkStmts.length != 1 { return -1 }
+  const c = nodeAt(b.blkStmts[0])
+  if !(c is Call) || c.callArgs.length != f.fnParams.length { return -1 }
+  let i = 0
+  while i < f.fnParams.length {
+    const p = nodeAt(f.fnParams[i])
+    const a = nodeAt(parenPeelIx(c.callArgs[i]))
+    if !(p is Param) || p.parName.slice(0, 3) != "$fp" { return -1 }
+    if !(a is Ident) || a.identName != p.parName { return -1 }
+    i = i + 1
+  }
+  c.callFn
+}
+
+// The ascending union of ascending function-id lists `a` and `b`.
+function elabFnIdsUnion(a: i32[], b: i32[]): i32[] {
+  const out: i32[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if j >= b.length || i < a.length && a[i] < b[j] {
+      out.push(a[i])
+      i = i + 1
+    } else if i >= a.length || b[j] < a[i] {
+      out.push(b[j])
+      j = j + 1
+    } else {
+      out.push(a[i])
+      i = i + 1
+      j = j + 1
+    }
+  }
+  out
+}
+
 // The closed type value node `x` written to binding `d` carries at instance `k`, or -1. A value
 // that reads another holder's slot takes that slot's closed fact; a call, a literal or a read
 // built from bundles takes the type `elabWrittenBuiltTy` builds; a call returning a list of
