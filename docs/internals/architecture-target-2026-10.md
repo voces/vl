@@ -1966,9 +1966,8 @@ shadow. Per family, by status, each with its reach:
   - (c): `monoCadNoteInstance` 8,903, `monoBindCols` 8,884, `monoMakeInstanceLetTyCol` 8,876, `monoBindEnclosingPins` 8,871, `monoMakeInstanceGo` 8,844, `monoSlotParamPins` 8,615, `monoSlotSig` 8,611, `monoInstantiateCallIn` 8,598, `monoSubstAnnNode` 1,214, `monoSubstTyArgNodes` 46, `monoLayoutConstOf` 4.
 - **literal arm row**:
 - **value returns**:
-  - blocked: `monoDeliverCallRets` 1,019 (reach: a reach fact for a returned literal (D6522)).
   - switched: `monoIfBoundRetAtPin` 24.
-  - (c): `monoFlowConstCallArgs` 7,932, `monoFlowCallLeafAt` 176, `monoFlowCallLeaf` 176.
+  - (c): `monoDeliverCallRets` 1,019 (its gate's recursion is walk state), `monoFlowConstCallArgs` 7,932, `monoFlowCallLeafAt` 176, `monoFlowCallLeaf` 176.
 - **instance result**:
   - switched: `monoPinnedRetAnnTy` 1.
 - **walk type**:
@@ -2000,8 +1999,7 @@ The rest wait on these facts and questions, grouped by who holds them:
     `monoArgTyNameRep` and `monoArgTyNameProjected`.
 - **lane F:** `monoPinMapLambdas`, `monoNoteBindDeliveryCall` and `monoLamSubstParams`.
 - **reach:**
-  - the unbound default: `monoElabDefaultsPrime` and `monoDefaultUnboundTyParams`;
-  - a reach fact for a returned literal: `monoDeliverCallRets`.
+  - the unbound default: `monoElabDefaultsPrime` and `monoDefaultUnboundTyParams`.
 - **A lambda body as an elaboration instance (D3616):** `monoPinnedTyOf` and `monoLamCallTy`.
 - **The call-param family's own facts:**
   - an inline `if` with no binding: `monoCallIfValue` and `monoSeedCallSigTys`;
@@ -2829,7 +2827,7 @@ own transformation around the leaf decision (class (c), cad lane).
 |---|---|---|
 | `monoFlowCallLeaf`: call `c` always returns generic `g` | 386 (101) | 53 answered, all 53 confirmed; 333 declined |
 | `monoFlowAnnLits`: the literals an annotated binding's call initializer may return | 75 (28) | 16 confirmed; 59 are literal nodes, which the fact does not follow |
-| `monoDeliverCallRets`' gate: the function returns a hole lambda | 802 (593) | 796 both no; 6 (3 programs) mono yes, fact no, again a returned literal |
+| `monoDeliverCallRets`' gate: the function returns a hole lambda | 802 (593) | 796 both no; 6 (3 programs) mono yes, fact no, the fact asked only of a returned literal node (corrected below) |
 
 - **`monoFlowCallLeaf`: the fact confirms, it does not enumerate.** Asked of mono's answer it
   agrees every time, but it names no candidate `g`, so it cannot answer the 333 declines. The leaf
@@ -2838,10 +2836,34 @@ own transformation around the leaf decision (class (c), cad lane).
 - **`monoFlowAnnLits` is deleted.** Banking nothing moves no byte over the 29 programs it banked
   for, so its consumer (each banked literal coerced at the binding's annotation, under
   `monoInstanceExactRet`) is gone too, along with that flag.
-- **`monoDeliverCallRets` stays: blocked on a reach fact for a returned literal.** Forced off, its
+- **`monoDeliverCallRets` stays, and its gate is walk state, not a missing fact.** Forced off, the
   gate lets `closures/error-hole-lambda-returned-into-bindings-of-two-types.vl` (D6522) build and
   print a wrong answer, and makes `closures/hole-lambda-returned-into-binding-of-another-type.vl`
   trap. Those two are its acceptance cells.
+
+  The six rows above asked `elabValueReturnsFrom` only of a return operand that is itself a lambda
+  literal. All six return a binding (`return h`). Re-asked of every hole lambda literal and every
+  `let` holding one (master `a5ce5b99`, 23,103 programs), the counts are per gate call:
+
+  | mono's gate | the fact | gate calls |
+  |---|---|---|
+  | yes | yes | 5 |
+  | no | yes | 11 |
+  | no | no | 879 |
+  | yes | no | 0 |
+
+  So the fact sees every return mono's gate sees. The 11 where only the fact says yes are each a
+  second or later delivery. Mono's gate asks two things at once:
+  - **(a) Does the function hand back a hole lambda?** That is static, and the fact answers it.
+  - **(b) Has that lambda's delivery been instanced yet?** That is mono's own bookkeeping. It is
+    keyed by the returned READ: `monoLamValueFe` first asks `identClosureFeOfRead`, and the first
+    delivery re-points that read to the instance it builds. So the gate turns false after the first
+    delivery, while the lambda's own slot (`fnStmtsPosOf`) stays a template.
+
+  The recursion through calls is how (b) reaches each function's own returned read, so reading (a)
+  from the fact would only re-derive the walk. The gate is class (c). Reading it from the fact alone
+  refused two programs that run, and that measured D15536: the second-delivery check compared two
+  function types by index, which the time-varying gate had hidden. It now compares with `tySame`.
 - **`monoIfBoundRetAtPin`** reads `monoSlotPinNameTys`, the elaboration's deliveries, with no
   fallback: class (a).
 
