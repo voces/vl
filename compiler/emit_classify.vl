@@ -1975,62 +1975,6 @@ export function fnRetExprOf(fnIx: i32) {
   -1
 }
 
-// The map shape of a return expression, resolved from annotations only, so it is valid at
-// the type-section emit before locals are collected and from a different function. -1, the
-// mono map, for anything no rung claims. `fe` is the enclosing function's `fnStmts`
-// position, not its arena index, which is what the capture arm below needs.
-export function mapRetExprShape(rx: i32, fe: i32) {
-  const fnIx = fnStmts[fe]
-  let u = rx
-  let done = false
-  while !done {
-    const node = nodeAt(u)
-    if node is Paren { u = node.parInner } else { done = true }
-  }
-  const e = nodeAt(u)
-  if e is Ident {
-    // The `let` in scope at the read, which shadows a same-named parameter (D3295).
-    let li = -1
-    const fn = nodeAt(fnIx)
-    if fn is FuncDecl { li = bodyLetOfRead(fn.fnBody, u) }
-    if (li < 0 && paramMap(fnIx, u)) { return paramMapShape(fnIx, e.identName) }
-    if li >= 0 {
-      const d = nodeAt(li)
-      if d is LetDecl {
-        if d.letType >= 0 { return mapAnnShape(d.letType) }
-      }
-    }
-  }
-  if e is Call {
-    if e.callFn < 0 { return -1 }
-    const callee = nodeAt(e.callFn)
-    if callee is Ident {
-      // A bare `Map()` or `Set()`, and a call through a function-typed parameter or local
-      // (D2867), name no declaration's map, so they take the recorded ladder at the bottom
-      // rather than the string-keyed mono sentinel; `-1` and `-4` are two structs.
-      const csid = sidOfNode(e.callFn)
-      if (
-        callee.identName != "Map"
-        && callee.identName != "Set"
-        && fnIndexOfNode(e.callFn) >= 0
-      ) {
-        return fnRetMapShapeAt(csid, u)
-      }
-    }
-  }
-  // A captured map return: the ident is neither a param nor a local of this function, so the
-  // arms above miss it. Resolve its shape from the capture, the same `captureValStructIdx`
-  // the env field uses, so the functype result heap type matches the field and the value.
-  const cap = retCapturedMapShape(fe, rx)
-  if cap != -3 { return cap }
-  // Fallback: the map type the checker recorded on the returned expression. Every rung above
-  // reads a spelling and an inferred map has none. The mint side reads this same recorded
-  // type, so the slot found here is the one the type section interned, which keeps the
-  // functype result valtype and the caller's receiver shape naming one struct.
-  if nodeTyIsMap(u) { return mapFindShapeOfNodeTy(u) }
-  -1
-}
-
 // The map shape of a return expression that is a captured map variable, as the mv slot
 // (mono is -1), or -3 when the return is not a captured map. `captureNamesOf` is the source
 // of truth, so a same-named local or param shadowing a capture stays with the local arms.
@@ -3125,16 +3069,18 @@ export function inferredRetMapSlot(ti: i32) {
 
 function inferredRetMapSlotCore(ti: i32) {
   if ti < 0 { return -1 }
-  // A closed checked result type names the map's shape; the tail expression answers where
-  // the type is open or names none.
+  // A closed checked result type names the map's shape; where it is open or names none, the
+  // tail expression's type at this instance does.
   const crt = fnCheckedRetTy(ti)
   if crt >= 0 && !tyHasTyVar(crt) {
     const csh = mapShapeOfTyPeeled(crt)
     if csh != -3 { return csh }
   }
   const mrx = fnRetExprOf(fnStmts[ti])
-  if mrx >= 0 { return mapRetExprShape(mrx, ti) }
-  -1
+  if mrx < 0 { return -1 }
+  const sh = mapShapeOfTyPeeled(nodeTyAt(mrx, fnStmts[ti]))
+  if sh == -3 { return -1 }
+  sh
 }
 
 // The member type the value of assignment `asgIx` reads back at when its target is a name
