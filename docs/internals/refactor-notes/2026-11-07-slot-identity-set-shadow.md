@@ -77,3 +77,10 @@ served by a converting write.
 The shadow reads the checked tree and the program's frame. A generic template's held type is `-`,
 and mono's instance copies do not exist yet when the snapshot is taken. So "per instance" is not
 measured here. `d15293_called_two`'s two instances read as one row.
+
+## Proof
+
+Both seeds are fixpoints (each refreshed twice to byte-identical). With the flag off,
+`scripts/sweep.vl -- diff` of master `a2dd4b66` against this head reads 23,611 same, 0 bytes-only,
+0 output movers and 0 `runs → not-runs`. Seed size: 6,476,435 → 6,486,042 bytes (+9,607, +0.15%).
+After merging master: the fixpoint is 6,484,727 bytes and `scripts/gate.sh` passes 23 of 23 rows.
