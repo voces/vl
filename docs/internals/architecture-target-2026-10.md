@@ -2018,6 +2018,10 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   D14582, D6541. `monoBindEnclosingPins` decides nothing: the enclosing pins it registers come from
   `monoEnclosingPinRow`, which reads the enclosing instance's key (`ekNames` / `ekTys`), so it is
   class (c).
+  `monoLitElemPin` is deleted: D2816's clash rung names the pinned element of a template list
+  literal typed `X[][]` from `elabNodeTy` at the instance being walked, which agrees in all 4
+  programs that reach it. The clone-time columns it alone read (`monoCgcBN` / `monoCgcBT`) go
+  with it.
   The per-argument pins are a separate fact (the argument's representation, per union arm) and
   wait for the producers.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
@@ -2559,6 +2563,18 @@ value derivations. What stays is class (c), and why:
   set's id list is no candidate); no member is added on mono's own type judgement.
 - The inert walk's as-written map site stays only as long as the inert walk, which leaves with the
   inertness change to `elabSlotUncalled`.
+
+**Inertness is the elaboration's, per slot** (2026-11-07). A slot `monoFlowReads` repointed is asked
+`elabSlotUncalledOmitting(at, path, mfrRepointed)`: each read `monoFlowReadSet` rewrote and each call
+through one is left out, a left-out read delivers nothing (`elabReadDeliveries`), and a slot is
+called only when a read or call through it that was not left out reaches a call or an escape. A
+held function's escape elsewhere (`fnEscapes`, a fact about the function) does not count: in
+`closures/hole-fn-generic-map-stored-through-parameter.vl`, `id` stored into the annotated map `e`
+must not make map `a`'s record slot called. Plain `elabSlotUncalled` is unchanged. This replaces
+`monoValsInert` at the pushed list (D9441), the nested list (D9711) and the stored slot, and with it
+the as-written inert map site no longer decides a slot. `monoInertValues` remains a writer-only
+record for its other readers: `monoNamesUsedAsValue`, `monoSpreadHostInert`, `monoStubValueOk`
+(emit_state), `emitIdentNonLocalRead` and `stmtIsBareFnName` (wasmEmit).
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
