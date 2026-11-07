@@ -3210,6 +3210,129 @@ function elabArgRows(ix: i32, d: i32, names: string[], tys: i32[], from: i32) {
   0
 }
 
+// `elabArgRows` for call `c` of a declared function with no type parameters that no row keyed:
+// each argument delivered at a closed parameter type.
+function elabPlainCallArgRows(c: i32) {
+  const cn = nodeAt(c)
+  if !(cn is Call) || elabCallInstFrom(c, -1) >= 0 { return 0 }
+  const d = identDeclOf(parenPeelIx(cn.callFn))
+  if d < 0 || d >= P.nodes.length { return 0 }
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) || dn.fnTyParams.length > 0 { return 0 }
+  const none: string[] = []
+  const noTys: i32[] = []
+  elabArgRows(c, d, none, noTys, -1)
+}
+
+// Whether node `g` delivers a value to a function type it can be instanced at: a `let`
+// initialiser, a whole write to a `let`, or a function with a return annotation and no type
+// parameters.
+function elabAnnotatedDelivery(g: i32) {
+  elabLetDelivery(g) || elabWriteDelivery(g) || elabReturnDelivery(g)
+}
+
+// Whether node `g` is a `let` with an initialiser.
+function elabLetDelivery(g: i32) {
+  const n = nodeAt(g)
+  n is LetDecl && n.letInit >= 0
+}
+
+// Whether node `g` writes a value whole to a `let`.
+function elabWriteDelivery(g: i32) {
+  const n = nodeAt(g)
+  n is BinExpr && n.binOp == "=" && elabWrittenLet(n.binLeft) >= 0
+}
+
+// Whether node `g` is a function with a return annotation and no type parameters.
+function elabReturnDelivery(g: i32) {
+  const n = nodeAt(g)
+  n is FuncDecl && n.fnRet >= 0 && n.fnTyParams.length == 0
+}
+
+// The `let` that write target `x`, a bare name, writes whole; -1 for any other target.
+function elabWrittenLet(x: i32) {
+  const t = parenPeelIx(x)
+  if t < 0 || t >= P.nodes.length || !(nodeAt(t) is Ident) { return -1 }
+  const d = identDeclOf(t)
+  if d >= 0 && d < P.nodes.length && nodeAt(d) is LetDecl { d } else { -1 }
+}
+
+// The one closed argument tuple every call through binding `d` passes, empty for none.
+function elabBindingCallArgs(d: i32): i32[] {
+  const none: string[] = []
+  const args = fnSlotCallArgsOf(d, none)
+  for a in args {
+    if a < 0 || a >= T.tys.length || !elabTyClosed(a, 0) || tyHasTyVar(a) {
+      return []
+    }
+  }
+  args
+}
+
+// A function value that annotated delivery `g` hands to a closed function type, its `let`
+// initialiser or a value its function returns, is instanced there as an argument is.
+function elabAnnotatedDeliveryRows(g: i32) {
+  const n = nodeAt(g)
+  if n is LetDecl {
+    const t = nodeTyIxOf(g)
+    if n.letType >= 0 {
+      if elabClosedFnTy(t) { elabDeliverAt(n.letInit, t, 0) }
+    } else {
+      const args = elabBindingCallArgs(g)
+      if args.length > 0 { elabDeliverParams(n.letInit, args, 0) }
+    }
+  } else if n is BinExpr {
+    const args = elabBindingCallArgs(elabWrittenLet(n.binLeft))
+    if args.length > 0 { elabDeliverParams(n.binRight, args, 0) }
+  } else if n is FuncDecl {
+    const s = nodeTyIxOf(g)
+    const f = if s >= 0 && s < T.tys.length { tyAt(s) } else { tyAt(0) }
+    if f is TyFunc && elabClosedFnTy(f.fnRet) {
+      const rets: i32[] = []
+      a20RetWalk(n.fnBody, true, rets)
+      for r in rets { elabDeliverAt(r, f.fnRet, 0) }
+    }
+  }
+  0
+}
+
+// `elabArgValueRows` for value `v` delivered at closed type `t`, through the values a call of a
+// function with no type parameters returns, `depth` calls in.
+function elabDeliverAt(v: i32, t: i32, depth: i32) {
+  const f = tyAt(t)
+  if f is TyFunc { elabDeliverParams(v, f.fnParamTypes, depth) } else { 0 }
+}
+
+// `elabDeliverAt` for a function value called at parameter types `pts`.
+function elabDeliverParams(v: i32, pts: i32[], depth: i32) {
+  const p = parenPeelIx(v)
+  if p < 0 || p >= P.nodes.length || depth > ELAB_DELIVER_CALL_MAX { return 0 }
+  const pn = nodeAt(p)
+  if pn is Call {
+    const d = identDeclOf(parenPeelIx(pn.callFn))
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { pn }
+    if dn is FuncDecl && dn.fnTyParams.length == 0 {
+      const rets: i32[] = []
+      a20RetWalk(dn.fnBody, true, rets)
+      for r in rets { elabDeliverParams(r, pts, depth + 1) }
+    }
+    return 0
+  }
+  elabValueRowsAtParams(p, pts, -1)
+}
+
+// How many calls `elabDeliverAt` follows into the values they return.
+const ELAB_DELIVER_CALL_MAX = 8
+
+// Whether `t` is a function type with no hole or type variable left.
+function elabClosedFnTy(t: i32) {
+  t >= 0
+    && t < T.tys.length
+    && tyAt(t) is TyFunc
+    && elabTyClosed(t, 0)
+    && !tyHasTyVar(t)
+}
+
 // `elabArgRows` for one argument `a` delivered at closed type `dt`.
 function elabArgValueRows(a: i32, dt: i32, from: i32) {
   const p = parenPeelIx(a)
@@ -3223,6 +3346,13 @@ function elabArgValueRows(a: i32, dt: i32, from: i32) {
     return 0
   }
   if !(d is TyFunc) { return 0 }
+  elabValueRowsAtParams(p, d.fnParamTypes, from)
+}
+
+// Instances each generic or hole function value `p` may hold at parameter types `pts`, noting
+// the instance on `p` under `from`.
+function elabValueRowsAtParams(p: i32, pts: i32[], from: i32) {
+  const pn = nodeAt(p)
   for m in elabCalleeTargets(p) {
     const ms = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { pn }
     const sig = if m >= 0 && m < P.nodes.length { nodeTyIxOf(m) } else { -1 }
@@ -3234,12 +3364,12 @@ function elabArgValueRows(a: i32, dt: i32, from: i32) {
       && sig < T.tys.length
     ) {
       const sf = tyAt(sig)
-      if sf is TyFunc && sf.fnParamTypes.length == d.fnParamTypes.length {
+      if sf is TyFunc && sf.fnParamTypes.length == pts.length {
         const mn: string[] = []
         const mt: i32[] = []
         let j = 0
         while j < sf.fnParamTypes.length {
-          bindGenWalk(sf.fnParamTypes[j], d.fnParamTypes[j], mn, mt)
+          bindGenWalk(sf.fnParamTypes[j], pts[j], mn, mt)
           j = j + 1
         }
         if mn.length > 0 {
@@ -8450,12 +8580,14 @@ export function elabRun() {
   elabDeadKs = Map()
   let g = 0
   const setLams: i32[] = []
+  const annDelivs: i32[] = []
   elabCalls = []
   elabResultScanReset()
   while g < P.nodes.length {
     elabGenTy.push(nodeTyIxOf(g))
     if elabLamTakesSet(g) { setLams.push(g) }
     if nodeAt(g) is Call { elabCalls.push(g) }
+    if elabAnnotatedDelivery(g) { annDelivs.push(g) }
     elabResultScanAt(g)
     g = g + 1
   }
@@ -8570,6 +8702,10 @@ export function elabRun() {
     }
     cb = cb + 1
   }
+  // A function value handed to a parameter of a declared function with no type parameters is
+  // instanced at that parameter's closed function type, as a generic callee's row instances it.
+  for c in elabCalls { elabPlainCallArgRows(c) }
+  for ad in annDelivs { elabAnnotatedDeliveryRows(ad) }
   // A nested declaration typed from its context, with nothing to bind, whose body calls a
   // generic is checked as an instance of its own: the call is typed there.
   for nd in elabEncl.keys() {
@@ -15608,6 +15744,20 @@ export function elabValueInstKey(x: i32, k: i32): i32[] {
   elabValueInstFrom(elabValueInstKeys[x] ?? [], k, out)
   elabValueInstFrom(elabValueKeys[x] ?? [], k, out)
   out
+}
+
+// The one closed signature every instance `elabValueInstKey(x, k)` names shares, trying the
+// instance being walked and then the program; -1 where it names none, several or an open one.
+export function elabValueInstSig(x: i32) {
+  let ks = elabValueInstKey(x, elabWalkTop())
+  if ks.length == 0 { ks = elabValueInstKey(x, -1) }
+  let one = -1
+  for k in ks {
+    const sg = elabKeySig(k)
+    if sg < 0 || one >= 0 && !tySame(one, sg) { return -1 }
+    one = sg
+  }
+  one
 }
 
 // Appends to `out` each key of the [from, key, ...] pairs `vs` noted under instance `k`.
