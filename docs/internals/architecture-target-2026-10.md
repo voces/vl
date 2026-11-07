@@ -14,7 +14,7 @@ this section from each PR's report; a PR does not edit it (it conflicted on near
 |---|---|---|
 | 1. Per-instance node types | done | Nothing: `nodeTyInDerived`'s rungs and the `monoOrigNode` scan are gone (landed with 2–3 as one mechanism). |
 | 2. The checker owns the instance set | in progress, the live front (§3.4) | 16 blocked and 8 parked `emit_mono` decision functions, below; `recordedParamPinName` and 178 `mono*Pin*` functions stand. |
-| 3. Singleton function types | in progress | fn_split and the `genFnHole*` family are gone. Left: the Fn#d function-holding fact (7 blocked node-type functions) and identity typing for concrete function values: slice 2a puts it in the elaboration (`elabIdentityFnTy`, [notes](refactor-notes/2026-11-07-identity-typing-fact.md)), slice 2b keys instances by each specialized argument's identity set (#6707: 1,472 decisions, a 1,416-to-1,416 bijection with mono's instances, 25,038 instances unchanged), and slice 3 is next. `judgeFnArgHoleCalls` stands; its split arm was not re-checked here. |
+| 3. Singleton function types | in progress | fn_split and the `genFnHole*` family are gone. Left: the Fn#d function-holding fact (7 blocked node-type functions) and identity typing for concrete function values: slice 2a puts it in the elaboration (`elabIdentityFnTy`, [notes](refactor-notes/2026-11-07-identity-typing-fact.md)), slice 2b keys instances by each specialized argument's identity set (#6707: 1,472 decisions, a 1,416-to-1,416 bijection with mono's instances, 25,038 instances unchanged); slice 3 shadowed the callee through a specialized parameter (#6717), and `monoBakeCallback` reads it at the 1,472 keyed decisions (#6726, [notes](refactor-notes/2026-11-07-bake-reads-keyed-callee.md)). Left: `monoWalkIdentCall` (the S1 map), `monoHoleBinding` and `monoBindSeededTyParams`, and the 105 declined decisions (77 open on type variables, 28 with no base instance). `judgeFnArgHoleCalls` stands; its split arm was not re-checked here. |
 | 4. Finite function sets | deletions done | fn_split.vl, fn_flow_shadow.vl, the FS loop, `holeChoice*` and the list and capture pinners are gone, and the flow table is retired (§3.3). The residue is step 2's blocked list. |
 | 5. Contextual type and coercion records | deletions done | ExpCtx and the `emit*WidenSite` calls are gone. The one `lowerCoerce(srcRep, dstRep)` table is not built. |
 | 6. Narrowing produced once | in progress | `emit_narrow_slots.vl`, `pushNarrow*` and `capNarrowBuild` are gone. `criWalkBlock` replays no narrowing; it is `computeRetInference`'s return walk and goes with it in step 7. Ten of the sixteen `synth*Ann*` functions are gone (eight write-backs and two of their helpers), with three passes. Five write-backs and the helper `synthAnnOfTy` stand; the five are parked on a reader that reads the recorded type (`refactor-notes/2026-11-07-step6-write-back-census.md`). |
@@ -47,15 +47,17 @@ map-value facts then deleted `monoFlowMapReadVals`, moved `monoFlowAliasMaps` to
 8 parked and 24 deleted ([notes](refactor-notes/2026-11-07-lane-f-map-values.md)).
 
 **Blocked at the census (16; 16 on master), each on a named fact:**
-- node type: `monoArgClosedTyIn` (the delivery signature of an argument forwarded through a generic to a
-  hole function; D5930's `hole-leaf-literal-through-forwarder` rules out `elabInstNodeTy`),
-  `monoCoerceListCbArg` (a callback signature over a list element with no elaboration instance),
+- node type: `monoArgClosedTyIn` (a REP fact: the converting delivery, an argument built at the
+  instance parameter's rep, D5930 and D2459's joins; [notes](refactor-notes/2026-11-07-blocked-three-vs-identity.md)),
+  `monoCoerceListCbArg` (narrowed by #6719: 20 decisions in 8 programs need element instances for tagged
+  hole-function sets and generic choices, D9761),
   and the function-holding four: `monoPinReturnedObj`, `monoCloseRetFnTy` and `monoRetFnListTy` read
   `elabHeldValTy` (#6711) and `monoClosedObjLitTy` is deleted; mono's path stays only behind three guards
   that need a rep change, not a type read (a record field reading a function or an open binding; a list
   of literals in a generic instance; a list closed only by its identity type) and for D4515
   ([notes](refactor-notes/2026-11-07-heldval-consumers.md));
-- lambda sigs: `monoLamParamPinAnn` (split-dep's holder fact (c2) and the per-instance identity residual);
+- lambda sigs: `monoLamParamPinAnn` (two TYPE facts: a hole lambda called in an instance body keeps its parameter
+  open, D13660; a lambda written into a `let` holding a generic function has no node type, D14501);
 - call param: `monoBindSeededTyParams` (identity typing for function values, A), `monoArgPinTyIx` (a
   pin fact of its own after holes-close), `monoArgPinName` (the rep cascade), and `monoArgTyName`,
   `monoArgTyNameCascade`, `monoArgTyNameBound`, `monoArgTyNameProjected` and `monoArgTyNameRep`
@@ -65,12 +67,13 @@ map-value facts then deleted `monoFlowMapReadVals`, moved `monoFlowAliasMaps` to
   holds no record, map or non-literal union; the rest waits on a pin-type column (an annotated
   parameter's pin is its annotation, not the argument's type `pinTys` holds) and on the emit readers
   that resolve a record or union pin by name (2026-11-07-pin-spelling-hole-params.md);
-- per-call slot type: `monoReachSlotTy` and `monoReachLitTys`. The calls half is the elaboration's (`elabLitSlotClimbCalls`, #6712); they remain only as the driver that writes the callee types, which the elaboration is taking over (the call nodes a literal slot's climb
-  reaches, so each callee read is typed at the agreed tuple; the climb records the tuple, not the calls).
+- per-call slot type: done. `monoReachSlotTy`, `monoReachLitTys` and their helpers are deleted; the elaboration
+  records the callee types a literal slot's climb reaches (`elabLitSlotClimbCalls` #6712, `elabLitSlotCallees` #6725,
+  [notes](refactor-notes/2026-11-07-slot-climb-callee-types.md)).
 
 **Parked at the census (12; 8 on master), each on a named question:**
-- `monoElabStubArgsPrime`: the stub half, D15494. Ruled 2026-11-07 (internal): the elaboration owns the
-  default stub signature of an uncalled hole-function argument, and mono stops minting it;
+- `monoElabStubArgsPrime`: deleted (#6718). The elaboration owns the uncalled-argument stub (`elabStubArgsPrime`,
+  D15494, [notes](refactor-notes/2026-11-07-elab-stub-args.md));
 - `monoDefaultTyParamsOnlyGenFns`: switched by #6689 after the census;
 - `monoWalkIdentCall` and `monoHoleBinding`: argument-keyed instances. Identity typing (A) is ruled and
   built in the elaboration (#6694 shadow, #6699 slice 2a); slice 2b keys the instances (#6707) and slice 3
