@@ -2382,6 +2382,15 @@ and `generic-list-sliced-called-at-two-types` (`fs`) are class-3 container widen
 expression walker `monoFlowValsOf`, the map and alias planners, `monoFlowElemsGen` and loop-variable
 rows (D9981, which the elaboration does not derive) are B2b.
 
+**B2b, part 1: expressions, loops and map reads** (2026-11-07). A `for … in` element variable has
+literal roots: a literal iterable's elements, or every value a `let`-bound list's element slot is
+written (`cwSlotWrittenValues`), pushes included. `monoFlowValsOf` reads a candidate's or loop
+variable's `monoFlowDeclVals` and otherwise the elaboration's roots, with the same function rule;
+`monoFlowLoopVarVals` is gone. A map read's values are the elaboration's stored roots
+(`mfrLitsMapStored`). Each step graded alone on the 7,538 sweep programs against master's fixpoint:
+0 moved, three times. `monoFlowMapVals` stays while it records an alias's writes (D9651), and
+`monoFlowElemsGen` while its walk ties a spread to the pushed list it copies (D9482).
+
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
 move no output. These are the reads the gate does not answer: an argument handed on, a loop over a
