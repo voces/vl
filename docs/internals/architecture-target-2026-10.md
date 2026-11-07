@@ -1201,8 +1201,8 @@ happen where no fact can see them, so the slot has to be treated as called.
    Each family is measured alone by its own cut before it is scheduled.
 
 **The uncalled family, landed** (2026-11-06). `elabSlotUncalled(d, path)` answers it from the
-elaboration: no call reads its callee from the slot (`fnSlotCalled`, the checker's per-slot call
-index), no call goes through the set its type carries (`elabSlotSetCalls`), no closed delivery
+elaboration: no call reads its callee from the slot as the slot (`fnSlotThroughCalls`, the
+checker's per-slot call index, where a const element read naming one function does not count), no call goes through the set its type carries (`elabSlotSetCalls`), no closed delivery
 (`elabSlotDeliveries`), and no function it holds escapes (`fnEscapes`). Shadowed against the
 table at its three mono readers, it agreed at 159 of 165 site-hits until two gaps closed: a call
 through a one-member set reads its callee from the slot but the set records no call, and a `for`
