@@ -2411,10 +2411,22 @@ bundle, not a bundle record, and it now records the closure whatever the callee'
 count. Shadowed over 23,103 programs: 295 bundle sites and 12 closure sites agree, none differs or
 is new-only. The byte sweep against master's fixpoint is 23,103 identical.
 
-`monoBundleTys` and emit_bundle's `bundleTys` and `bundleRecs` still answer "is this type a bundle".
-A type-shaped answer from the fact agrees at 586 of 587 reads and is wrong at the other:
-`closures/hole-lambda-bundle-positions.vl` writes `type B = { c0: …, c1: … }` by hand, a bundle's
-shape that keeps its own fields. Their replacement has to ask per call, not per type.
+**The delivered bundles answer "is this a bundle"** (2026-11-06). `elabDeliveredBundleSigs` keys a
+bundle record by its own index: one a reach row delivers, as a slot's rep or as the parameter of a
+closure rep. `monoBundleTys`, emit_bundle's `bundleTys` and `bundleTyNote` are deleted, and their six
+readers (the instance parameter note, `monoCoerceBundleArgs`, `monoIsBundleTy`, `monoBundleHandOnPin`,
+`bundleCallArgSigs`, now in wasmEmit, and the bundle-key parameter scan) read it. The index is the
+test because records do not intern: `closures/hole-lambda-bundle-positions.vl` writes
+`type B = { c0: …, c1: … }` by hand, a bundle's shape that keeps its own fields, and a shape test
+called it a bundle where the index does not (`tests/vl_elab_arg_rep_test.ts` holds that control).
+Shadowed over 23,103 programs, the five shadowed reads agree everywhere;
+`monoBundleHandOnPin`'s is graded by the byte sweep alone.
+
+**Open: a held bundle has no fact.** `bundleRecs` (`bundleRecordOfSigs`, read in emit_classify and
+wasmEmit) still serves the bundles mono mints for a record field, a list or map element or a holder
+literal: 695 of its reads return a record no reach row delivers, and a lookup by signatures cannot
+tell two such bundles apart. The holder bundle D15494's two-signature maps wait on (above) is the
+same fact: a closure called at signatures S1..Sn, per holder node. Both close with it.
 
 DECISIONS.md, "An instance's type and its rep are separate facts", gives the elaboration the
 instance's type and gives mono the parameter's rep. `callBindAdoptReps` already records that rep for

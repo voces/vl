@@ -8555,6 +8555,10 @@ let erArgRep: i32[] = []
 // Beside each slot of `erArgRep`, the record the argument is built at where the call's bind row
 // keys or pins it at its rep, against the argument's own type; -1 otherwise.
 let erArgBuilt: i32[] = []
+// Each bundle record a reach row delivers, as a slot's rep or a closure rep's one parameter, and
+// its signatures in field order.
+let erBundles: i32[] = []
+let erBundleSigs: {[i32]: i32[]} = Map()
 let erRowAt: {[i32]: i32} = Map()
 
 // `elabCallArgRep`'s answer where the run recorded no reach of the call from that instance.
@@ -8569,6 +8573,8 @@ export function elabReachRows() {
   erArgAt = []
   erArgRep = []
   erArgBuilt = []
+  erBundles = []
+  erBundleSigs = Map()
   erRowAt = Map()
   for ix in elabCallKeys.keys() {
     if ix < 0 || ix >= P.nodes.length { continue }
@@ -8593,8 +8599,52 @@ export function elabReachRows() {
     }
   }
   elabReachBuilt()
+  elabReachBundles()
   0
 }
+
+// Fills `erBundles` from the reach rows' reps: a record whose fields `c0..c<n>` are function types
+// is a bundle, whole or as the parameter of a closure rep taking one.
+function elabReachBundles() {
+  for rep in erArgRep {
+    const f = if rep >= 0 && rep < T.tys.length { tyAt(rep) } else { null }
+    const r = if f is TyFunc && f.fnParamTypes.length == 1 { f.fnParamTypes[0] } else { rep }
+    const sigs = elabRecFieldTys(r)
+    if sigs.length >= 2 && elabPinIsBundleOf(r, sigs) && !erBundleSigs.has(r) {
+      erBundles.push(r)
+      erBundleSigs[r] = sigs
+    }
+  }
+  0
+}
+
+// The signatures of bundle record `t` where a reach row delivers it, in field order; none for any
+// other type. Keyed by the record's own index, so a record written with a bundle's shape is none.
+export function elabDeliveredBundleSigs(t: i32): i32[] {
+  const none: i32[] = []
+  erBundleSigs.get(t) ?? none
+}
+
+// Records with a delivered bundle's shape that no reach row delivers, in the thousands, and the
+// delivered bundles in the units; read by `tests/vl_elab_arg_rep_test.ts`.
+export function elabBundleTwinProbe(): i32 {
+  let twins = 0
+  let t = 0
+  while t < T.tys.length {
+    if !erBundleSigs.has(t) {
+      let shaped = false
+      for b in erBundles {
+        if tySame(t, b) { shaped = true }
+      }
+      if shaped { twins = twins + 1 }
+    }
+    t = t + 1
+  }
+  twins * 1000 + erBundles.length
+}
+
+// Every bundle record a reach row delivers, in row order.
+export function elabDeliveredBundles(): i32[] { erBundles }
 
 // Fills `erArgBuilt` for each argument the write index places at a recorded call, by the
 // parameter position it takes there.
@@ -13534,7 +13584,40 @@ export function elabNodeTy(ix: i32, k: i32): i32 {
     // A part still unknown (an empty literal its later writes type) reads the generic type.
     if open { raw = t }
   }
-  elabSubstClosed(raw, k)
+  const sub = elabSubstClosed(raw, k)
+  if sub >= 0 || k >= 0 { return sub }
+  elabSlotReadTy(ix, raw)
+}
+
+// A program-level read of a holder's slot whose checked type `raw` stays open: the holder's
+// closed slot fact, under the read's own nullable when the read can miss; -1 otherwise.
+function elabSlotReadTy(ix: i32, raw: i32): i32 {
+  if raw < 0 || raw >= T.tys.length || ix < 0 || ix >= P.nodes.length {
+    return -1
+  }
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length || nodeAt(x) is Ident { return -1 }
+  const path: string[] = []
+  const h = slotOfRead(x, path)
+  if h < 0 || path.length == 0 { return -1 }
+  const st = elabSlotTyAt(h, path, -1)
+  if st < 0 || st >= T.tys.length || !elabTyClosed(st, 0) { return -1 }
+  const ro = tyAt(raw)
+  if ro is TyNullable {
+    return if elabSameCtor(ro.nInner, st) { mkNullableTy(st) } else { -1 }
+  }
+  if elabSameCtor(raw, st) { st } else { -1 }
+}
+
+// Whether types `a` and `b` have the same outermost constructor.
+function elabSameCtor(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
+  const x = tyAt(a)
+  const y = tyAt(b)
+  (x is TyArray && y is TyArray)
+    || (x is TyFunc && y is TyFunc)
+    || (x is TyMap && y is TyMap)
+    || (x is TyObj && y is TyObj)
 }
 
 // Type `t` under instance `k`'s binding, or -1 where that does not close.
