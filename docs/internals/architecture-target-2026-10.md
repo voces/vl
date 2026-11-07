@@ -2137,6 +2137,24 @@ fixtures plus D7381, D9600 and D9660. A reader that needs the signature asks `el
 shadow that sees identity on one side and a signature on the other has found two facts, not a
 disagreement.
 
+**A bare function binding closes only when called directly and holding only hole functions.**
+`checkCallNode` notes a call through a bare binding (`fnSlotCallNote` at path `[]`).
+`elabSlotCloseWhole` then closes a function binding, or a nullable holder, from its whole-binding
+writes (`cwBindingWrittenValues`), under two rules:
+- **Called directly.** A function binding that no call reads directly is handed on or uncalled, and
+  stays open. Closing it at one instance is wrong, and the adopt-init switch refuses it. Regression
+  cells:
+  - `closures/hole-fn-if-to-hole-param.vl`'s `const x`, never called;
+  - D10384 and D14400, a re-pointed `let` of generic `id` handed through `runAll` at two types.
+- **Only hole functions.** Arguments stand in for parameters only for a hole function, one with no
+  type parameter and no annotated parameter. A declared or generic signature is the named-generic
+  fact. Regression cell: D9850. There `v` holds `g(f: ((x: T) => T) | null, x: T)`, and the slot-call
+  tuple built `((i32) => i32, i32) => i32`, dropping the declared `| null`.
+
+A captured cell (`let d = c` re-written by a lambda) gets no fact this way yet. Its written lambdas
+are nested and capture, so `elabHeldAtArgs` declines, and `elabHeldFnTy` returns that decline
+instead of trying the instance enumeration.
+
 **Slot type, first reading: `monoReachSlotTy`** (2026-11-06). Value reach (`vrCalleeTy`) against
 the climb's agreed tuple (`elabLitSlotCallTys`), each computed on its own:
 
