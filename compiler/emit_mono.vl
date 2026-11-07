@@ -694,6 +694,7 @@ import {
   elabNodeTyAgreed,
   elabNodeTyAt,
   elabNodeTys,
+  elabParamTyOwnAt,
   elabPinIsBundleOf,
   elabResultAtParams,
   elabRetOf,
@@ -10270,9 +10271,6 @@ let monoTypedKeys: {[string]: string} = Map()
 let monoKeyEk: {[string]: i32} = Map()
 let monoKeyPins: {[string]: i32[]} = Map()
 
-// Instance fe → its parameters' types as the clone resolved them (`monoMakeInstanceLetTyCol`).
-let monoInstParamTyCol: {[i32]: i32[]} = Map()
-
 // Binds each enclosing pin that has a spelling, and returns the key text naming them.
 function monoBindEnclosingPins(
   outerN: string[],
@@ -10672,7 +10670,6 @@ function monoMakeInstanceGo(
       first,
     )
     if instFe < 0 { return monoBuildPop() - 1 }
-    monoInstParamTyCol.set(instFe, letTyCol)
     // REGISTER before walking the body, so a recursive self-call at the same
     // shape resolves here instead of recursing (the host's discipline).
     if !monoTypedKeys.has(typedKey) { monoTypedKeys.set(typedKey, k.key) }
@@ -21782,14 +21779,33 @@ function monoPinHoleParam(
           args[i],
         )
       }
-      // The rep cascade's `i32` floor is a guess for a value the checker left open: it pins at
-      // the type this frame's instance closes it to, or the elaboration's, or not at all.
-      const openTy = if an == "i32" { monoArgOpenValueTy(args[i], ctx, et) } else { 0 - 2 }
-      if openTy > -2 {
-        an = ""
-        if openTy >= 0 { an = monoI32AtomPinName(openTy) }
-        guessed = an == ""
-        if an != "" { anTy = openTy }
+      // The rep cascade's `i32` floor is a guess for a value the checker left open and that holds
+      // no function: no instance is demanded here. The rung above spells a frame type that closes
+      // it, so such a type reaching here is refused.
+      const ox = unwrapParen(args[i])
+      const oxTy = if ox >= 0 { nodeTyIxOf(ox) } else { -1 }
+      if (
+        an == "i32"
+        && ox >= 0
+        && !(nodeAt(ox) is FuncDecl)
+        && monoTyOpen(oxTy)
+        && !tyMayHoldFn(oxTy, 0)
+      ) {
+        const ct = monoArgClosedTyIn(args[i], ctx, -1)
+        if ct >= 0 && !tyMayHoldFn(ct, 0) {
+          return emitFailAt(
+            "emitProgram: internal: parameter `"
+              + p.parName
+              + "` of `"
+              + fn.fnName
+              + "` takes a value this frame closes that no pin spells",
+            args[i],
+          )
+        }
+        if ct < 0 {
+          an = ""
+          guessed = true
+        }
       }
       // A hole function's `=>` pin is typed at the closed signature its rep key names.
       if anTy < 0 { anTy = monoHoleFnPinTy(args[i], ctx, an) }
@@ -21809,20 +21825,6 @@ function monoPinHoleParam(
     return monoHoleManyPinsFail(p.parName, fn.fnName)
   }
   0
-}
-
-// For argument `ax` the checker typed open and holding no function: the closed type frame `ctx`
-// reads it at, else `et` where closed, else -1. -2 for any other argument. Both reads are needed:
-// inside a generic instance its pins close an argument the callee's elaboration leaves open.
-function monoArgOpenValueTy(ax: i32, ctx: i32, et: i32): i32 {
-  const x = unwrapParen(ax)
-  if x < 0 || nodeAt(x) is FuncDecl { return 0 - 2 }
-  const own = nodeTyIxOf(x)
-  if !monoTyOpen(own) || tyMayHoldFn(own, 0) { return 0 - 2 }
-  let ct = monoArgClosedTyIn(ax, ctx, -1)
-  if ct < 0 && et >= 0 && et < T.tys.length && !tyHasTyVar(et) { ct = et }
-  if ct >= 0 && tyMayHoldFn(ct, 0) { return 0 - 2 }
-  ct
 }
 
 // The closed type of argument `ax` inside function `ctx`: `pinTy`, its pin type, where that is
@@ -25246,28 +25248,23 @@ function monoPinFnParamTys(d: i32, path: string[], sig: string): i32[] {
   tys
 }
 
-// The types instance `fe`'s parameters are pinned at, when each has one and every function
-// type among them has no hole; empty otherwise. An instance this pass minted answers from the
-// column its clone resolved (`monoInstParamTyCol`), where an `i32` pin has no annotation node.
+// The types the elaboration gives instance `fe`'s parameters at its key, when each closes and every
+// function type among them has no hole; empty otherwise.
 function monoInstParamPinTys(fe: i32): i32[] {
   const none: i32[] = []
   if fe < 0 || fe >= fnStmts.length { return none }
   const fd = nodeAt(fnStmts[fe])
   if !(fd is FuncDecl) { return none }
-  const col = monoInstParamTyCol.get(fe) ?? none
+  const k = elabKeyAt(fnStmts[fe])
+  if k < 0 { return none }
   const out: i32[] = []
-  let pj = 0
-  for pi in fd.fnParams {
-    const p = nodeAt(pi)
-    if !(p is Param) { return none }
-    let t = if pj < col.length { col[pj] } else { -1 }
-    if t < 0 && p.parType >= 0 {
-      t = monoParamPinTy.get(p.parType) ?? nodeTyIxOf(p.parType)
-    }
-    if t < 0 || t >= T.tys.length { return none }
+  let i = 0
+  while i < fd.fnParams.length {
+    const t = elabParamTyOwnAt(k, i)
+    if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return none }
     if tyAt(t) is TyFunc && !monoTyClosedFn(t) { return none }
     out.push(t)
-    pj = pj + 1
+    i = i + 1
   }
   out
 }
@@ -26645,7 +26642,6 @@ export function monomorphize(stmts: i32[]) {
   monoKeyEk = Map()
   instKeyReset()
   monoKeyPins = Map()
-  monoInstParamTyCol = Map()
   monoInstOrig = []
   monoInstName = []
   monoInstFe = []
