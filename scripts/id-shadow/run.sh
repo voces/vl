@@ -3,6 +3,7 @@
 #
 #   scripts/id-shadow/run.sh --identity SEED_A SEED_B LIST OUT
 #   scripts/id-shadow/run.sh --shadow SEED LIST OUT
+#   scripts/id-shadow/run.sh --rows SEED LIST OUT
 #
 # --identity builds every file in LIST with each seed, `$VL_ID_SHADOW` unset, and writes one
 # line per file to OUT: `same`, `DIFF` or `rcdiff`, then the path. Two failed builds with the
@@ -10,6 +11,7 @@
 # --shadow builds every file with SEED at `$VL_ID_SHADOW=1` and `=2`, and writes OUT.rows (the
 # mode-1 rows, `<path> <row>`), OUT.insts (`<path> <mode-1 insts> <mode-2 insts>`) and
 # OUT.bytes (`same`/`DIFF`/`rcdiff` of mode 2 against mode 1, then the path).
+# --rows builds every file once at `$VL_ID_SHADOW=1` and writes OUT.rows alone.
 # Run from the checkout root; JOBS (default 4) builds run at once.
 set -euo pipefail
 
@@ -88,8 +90,24 @@ case "$1" in
     awk '{n[$1]++} END {for (k in n) print "bytes", k, n[k]}' "$OUT.bytes"
     awk '$2 != $3 {print "insts-moved", $0}' "$OUT.insts" | head -20
     ;;
+  --rows)
+    S="$2" LIST="$3" OUT="$4"
+    export S
+    one() {
+      local o
+      o="$(mktemp -d "$T/o.XXXXXX")"
+      bld "$S" 1 "$1" "$o/m1"
+      grep -F '[id-shadow]' "$o/m1.err" | sed "s|^\[id-shadow\] [^:]*: |$1 |" > "$o/rows" || true
+      { flock 9; cat "$o/rows" >> "$T/rows"; } 9> "$T/lock"
+      rm -rf "$o"
+    }
+    export -f one
+    : > "$T/rows"
+    xargs -a "$LIST" -P "$JOBS" -I{} bash -c 'one "$1"' _ {}
+    cp "$T/rows" "$OUT.rows"
+    ;;
   *)
-    echo "usage: run.sh --identity SEED_A SEED_B LIST OUT | --shadow SEED LIST OUT" >&2
+    echo "usage: run.sh --identity SEED_A SEED_B LIST OUT | --shadow|--rows SEED LIST OUT" >&2
     exit 2
     ;;
 esac
