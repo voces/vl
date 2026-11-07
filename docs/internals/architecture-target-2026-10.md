@@ -2413,6 +2413,34 @@ removed in a fixpoint candidate and compared by exit code, bytes and failure tex
 - **`monoPinReturnedObj`'s 272 elaboration-only sites** are d3125 lambdas returning `{ q: 0 }`,
   already closed, where mono has nothing to retype.
 
+**Node type, the reach trio** (2026-11-07, 19,338 programs, master `3e9ce417`). 831 decisions,
+each against the walk type (`elabNodeTy` at the walk top), `elabNodeTyAt` and `elabSlotTyAt`. No
+pair differs where both answer.
+
+| helper | decisions (programs) | agree | mono only | elab only | neither |
+|---|---|---|---|---|---|
+| `monoPinnedReadTy`, `monoPinBin`'s `??` fold | 424 (324) | 47 | 0 | 370 | 7 |
+| `monoPinnedAnnTyAt`, a `.map`/`.filter` receiver | 25 (8) | 23 | 2 | 0 | 0 |
+| `monoPinnedAnnTyAt`, a stored call (`monoCloseRetFnTy`) | 2 (1) | 0 | 2 | 0 | 0 |
+| `monoClosedObjLitTy`, a returned literal | 362 (144) | 0 | 2 | 272 | 88 |
+| `monoClosedObjLitTy`, a `let` write | 18 (6) | 0 | 6 | 0 | 12 |
+
+- **`monoPinnedReadTy` is switched and deleted.** `monoPinBin`'s fold asks a gate,
+  `monoPinnedReadGate`: an element-and-field read chain ending at a pinned parameter, each element
+  read over a list (D9915). The type comes from the walk type. **Mono's decline is a soundness gate,
+  not a missing fact.** Taking the elaboration's answer where the gate declines folds `??` in 18
+  more decisions. Six of those programs build other bytes with the same output, and
+  `generics/type-param-write-cell-reads-at-pin.vl` traps the compiler (`tyAt` from `binNumWidth`):
+  the folded read leaves a node with no type.
+- **`monoPinnedAnnTyAt`.** A `.map`/`.filter` receiver takes the walk type first. Mono's walk answers
+  only where the walk type is open: `closures/fn-list-mapped-to-functions.vl` and
+  `closures/hole-fn-list-returned-reread.vl`, whose stored-call pair is the other caller.
+- **`monoClosedObjLitTy` is not switched.** Its 8 answers are records holding functions, which the
+  elaboration declines (node type, blocked above). They are `named/d15203_run_uncalled_record` and
+  `named/d15207_rec_ret`, parked with D15494, and six writes in
+  `closures/hole-fn-map-record-let-rewritten.vl` (D15534's fixture). Filling the 272 elab-only
+  literals moves no byte.
+
 **Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
 elaboration has no type of its own for the node, and every caller composes its own narrowing with
 it. A fallback to the checker's closed type (#6556, closed) broke four `runs` cells:
