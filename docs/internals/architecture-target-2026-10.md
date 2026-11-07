@@ -1758,6 +1758,10 @@ fell from 7 to 1 running program; the two refusing fixtures that guard a helper 
 different sets count one each. The one left, `use` in `closures/listed-hole-fn-escaping-list.vl`,
 is the closure-list rep of D15010, which mono should read from the elaboration. One helper instance
 serves holders of different sets, since a tagged id is its member's declaration index in every set.
+#6650 raised the count from 2 to 4 by deleting mono's niche guard. That guard had refused two
+programs that run: a generic whose `T` binds to a function through `(T | null)[]` is instanced
+late at the concrete signature. This is D15539, held by Fn#d's value-instance key (#6645), and it
+is a different mechanism from `use`.
 
 G2's write through a parameter (D15492) lands in the caller's map with its set; what refused it
 was the store into the parameter's slot, which the tag rule now takes when every call hands a
@@ -2585,8 +2589,9 @@ So identity typing is not the prerequisite for this population; one fact is.
   That type is closed only after mono's walk re-records it: at elaboration every one of the 234
   initialisers carries the binding's own open type, `(T) => T` or `((_) => _) | null`. A fourth
   `elabWrittenValueTy` leaf reading it was built and measured as a no-op (234 of 234 unchanged), and
-  was not landed. 82 of the 234 already close at elaboration. The other 130, by the initialiser's
-  shape:
+  was not landed. Fourteen of the 234 are no adopt decision: a bundle-record initialiser under a
+  binding typed `(_) => _`, which `monoSameTyCtor` refuses, so mono never adopts them. Of the other
+  220, 82 already close at elaboration. The other 116, by the initialiser's shape:
 
   | decisions | initialiser | source that closes it | lane |
   |---|---|---|---|
@@ -2597,11 +2602,39 @@ So identity typing is not the prerequisite for this population; one fact is.
   | 3 | `??` over a map read | the map-value or held fact, joined with the default | lane F |
   | 12 | a call returning a generic function value | the call-instance signature (`elabValueInstKey`) | Fn#d |
   | 6 | a record literal of generic or hole function fields | the call-instance signature per field | Fn#d |
-  | 14 | a field or element read of a holder whose slot fact is closed | none missing: the binding is not visited. 11 are emit-minted after `elabSlotFacts`, 3 are record-typed outside its gate | reach (`elabSlotBundleFacts`) |
 
   The deliveries row keeps two controls declining: `closures/hole-fn-if-to-hole-param.vl`'s `x`,
   handed on and never called, and the D10384 shape. A named generic held as a map value stays
   D15494's.
+
+  **The split-dep rows, measured row by row.** Of the 64:
+  - **Closed, 9.**
+    - #6647 closes 2. A call through a `??` or value `if` callee notes each operand's slot. The
+      hole-function maps `m` and `f` in `closures/coalesce-default-hole-function-over-map-read.vl`
+      then close at the call's types.
+    - #6649 closes 7. A written join closes through the functions it holds (`elabBindingFnSet`): a
+      labelled block's or an `if`'s value, under the unchanged hole-only and called-directly rules.
+  - **Declining by rule, 6.**
+    - 3 `if` choices with no call: `closures/fn-choice-bound-as-callback.vl`'s `h5`,
+      `closures/hole-fn-if-to-hole-param.vl`'s `x`, and one `x` in
+      `closures/hole-fn-labelled-block-loop-capture.vl`.
+    - 2 uncalled capture cells: `peerPinned`'s `d2` and `hole-lambda-peer-through-cell-read.vl`'s `d1`.
+    - `closures/delivered-alias-function-scope.vl`'s `localLambdas` `d`, below.
+  - **D15494, 30.** A named generic held in the map (26) or list (4); listed above.
+  - **Reach, 2.** The two remaining hole-function `Map()` rows close through the map
+    element-write source, built inside the same fold.
+  - **Fn#d, 17.**
+    - 7 capture cells are also written with a named generic (D3950); the instance at the delivery
+      is a call-instance signature.
+    - 10 lists of hole lambdas have elements that are handed on or returned, never called on
+      path `e`.
+  - **No cell-path closer.** The capture rewrite runs after `elabSlotFacts`, so a captured `let` is
+    closed as the function binding it is, at path `[]`.
+    - `localLambdas`' `d` declines. Its two members are local hole lambdas, and one is also called
+      directly at `string`.
+    - Its siblings that do close answer the function type against mono's cell list
+      `((i32) => i32)[]`. That is the cell-form difference already in the 22, so closing it would
+      add a 23rd.
 - **(ii):** `closures/listed-hole-fn-escaping-list.vl`. A generic held in a list by identity is called
   at two types, so the list's one concrete rep is mono's choice. It is D15010's signature twin, parked
   in this section.
@@ -2790,7 +2823,7 @@ programs, counted by program).
   | the call key | 4,047 |
   | rebuild, no call key (lambda and value instances) | 3,001 |
   | rebuild, a literal or record in the binding (rowintern's row key, #6629) | 2,418 |
-  | rebuild, a function-holding parameter (Fn#d's value-instance key, #6645) | 1,258 |
+  | rebuild, a function-holding parameter (see the residue bullet below) | 1,258 |
   | rebuild, a parameter open at the key | 3 |
 
   The literal-or-record cut was forced. The candidate without it moved 4 programs out of `runs`:
@@ -2798,6 +2831,37 @@ programs, counted by program).
   `ckb-callkey-binding-price`, and D15537 is the trap's witness. The key binds the argument's
   type where the rebuild pins the row the argument is built at. With the cut, over 19,316
   programs no byte moves.
+- **Two of the guards are deleted.** Each was graded by a hand-written probe of the plainest
+  program its sentence forbids, built with the guard on and off, because the corpus reaches
+  neither. Counted from the emitted message, attributed by site, against a control that refuses.
+  - **The niche check** (`monoNicheNulListCheck`, "a nullable-X list element has no rep") refused
+    working programs. A `(T | null)[]` whose `T` binds to a function, inferred or annotated, and
+    a generic record's `(P | null)[]` read through a lambda all build and print the right value
+    without it. The position matrix (`nullable-fn-list-through-generic-{explicit,inferred}`) goes
+    from refused at every position to 48 of 48 graded cells running in both templates, with 0
+    silent. D2525's boundary fixture is refused one step later, at shape interning, and is
+    unaffected. The two un-annotated probes each mint one late demand (D15539: `first` at a function
+    element), which is recorded as their price.
+  - **The seeded-binding check** (`monoLetTyParamMisfit`) is unreachable. The one probe of the
+    shape it forbids is refused first, with "a generic function taken as a value reaches no call
+    that fixes its type", in both states. That probe is now that refusal's witness.
+- **The function-holding residue stays on the rebuild: mono's binding carries reps, and some
+  arguments have no type.** Over the 2,470 programs whose instance takes the rebuild path, each
+  function-holding parameter was bound in a shadow from the argument's identity
+  (`elabNodeTy(arg)` at the call, then `elabNodeTyAt`) and compared with mono's binding. 129 agree.
+  The value-instance key (#6645) is a signature fact and is not the source here. It splits
+  per-identity instances into per-signature ones, which is the argument-keyed design and waits on
+  the owner. The rest is the target, not a switch:
+  - **Bind the type, not the rep (56 sites).** In 32 sites mono binds a bundle record
+    (`{c0: (f64) => f64, c1: (i32) => i32}`) where the identity is `(_) => _`. In 24 it binds the
+    table-index rep (`i32[]` for `((i32) => i32)[]`). The binding should hold the type and let the
+    rep layer pick the bundle or the table index. This is the type-versus-rep conflation that
+    `monoSameTyCtor` shows for adopted bundles.
+  - **Type the argument (689 programs).** A named function or a lambda literal passed as a value
+    has no elaboration type at the argument node, for example `[0, 1].mapIndexed(base)`. That is
+    prerequisite (A), identity typing for concrete function values.
+  - **23 sites are open on one side only.** In 11 the identity is concrete and mono is open
+    (`{f: (i32) => i32}` against `{f: (T) => T}`). In 12 it is the other way round.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
