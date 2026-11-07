@@ -1292,6 +1292,15 @@ export function elabStubArgReset() {
   0
 }
 
+// The stub `elabStubArg` holds at `key` (`<call>:<argument>`), -1 for none; and every key it holds.
+export function elabStubArgAt(key: string): i32 { elabStubArg.get(key) ?? -1 }
+
+export function elabStubArgKeys(): string[] {
+  const out: string[] = []
+  for k in elabStubArg.keys() { out.push(k) }
+  out
+}
+
 // Notes each declaration by its body and the type parameters an inferred call that leaves them
 // unbound defaults (`elabTpDefaultsNote`). Only a body local can name such a parameter and it
 // holds no value of it, so no read tells (D4911; DECISIONS.md §"An unbound type parameter
@@ -1571,6 +1580,8 @@ let elabRepStubbed = false
 
 // Whether `elabRun` has returned in this compile; a key minted after it is a late demand.
 let elabRunDone = false
+// Whether an argument-keyed instance's body is being checked: what it keys is not a late demand.
+let elabSpecChecking = false
 // How many keys `elabRun` had minted when it returned; -1 before it does.
 let elabRunKeyEnd = -1
 // The declaration name of each key minted after `elabRun` returned (`$VL_LATE_DEMANDS`).
@@ -1630,7 +1641,7 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   const kids = ekKids[kk] ?? []
   kids.push(k)
   ekKids[kk] = kids
-  if elabRunDone { elabLateNames.push(elabLateName(decl)) }
+  if elabRunDone && !elabSpecChecking { elabLateNames.push(elabLateName(decl)) }
   ekByDeclNote(decl, k)
   ekDecl.push(decl)
   ekNames.push(fn)
@@ -1843,7 +1854,9 @@ function elabWideTwin(k: i32, w: i32, from: i32): i32 {
   if elabGuessKeys[k] ?? false { elabGuessKeys[k2] = true }
   if elabReprKeys[k] ?? false { elabReprKeys[k2] = true }
   if elabSigAltKeys[k] ?? false { elabSigAltKeys[k2] = true }
-  if elabRunDone { elabLateNames.push(elabLateName(ekDecl[k])) }
+  if elabRunDone && !elabSpecChecking {
+    elabLateNames.push(elabLateName(ekDecl[k]))
+  }
   ekByDeclNote(ekDecl[k], k2)
   ekDecl.push(ekDecl[k])
   ekNames.push(ekNames[k])
@@ -1856,6 +1869,86 @@ function elabWideTwin(k: i32, w: i32, from: i32): i32 {
   elabReachNote(from, k2, -1)
   elabOne(k2)
   elabSettle(n0)
+  k2
+}
+
+// The argument-keyed instances (architecture-target §3.4): each one's base instance, and for each
+// parameter callback specialization bakes, its index and the declaration its argument is.
+let ekSpecBase: {[i32]: i32} = Map()
+let ekSpecPs: {[i32]: i32[]} = Map()
+let ekSpecDs: {[i32]: i32[]} = Map()
+let elabSpecMinted = 0
+let elabSpecChildren = 0
+
+// How many argument-keyed instances this compile minted.
+export function elabSpecMintedCount(): i32 { elabSpecMinted }
+
+// How many other instances checking the argument-keyed ones minted.
+export function elabSpecChildCount(): i32 { elabSpecChildren }
+
+// The instance call `call` reaches from frame `fnIx` (an emitted function's declaration, -1 at the
+// root): -1 for the root's own typing, -2 where the frame or the call has no key.
+export function elabSpecBaseOf(call: i32, fnIx: i32, decl: i32): i32 {
+  const from = if fnIx >= 0 { elabKeyAt(fnIx) } else { -1 }
+  if from < -1 { return -2 }
+  const k = elabCallInstFrom(call, from)
+  if k >= 0 { return if ekDecl[k] == elabSrcDecl(decl) { k } else { -2 } }
+  if elabBindsNothing(elabSrcDecl(decl)) { -1 } else { -2 }
+}
+
+// Declaration `decl0`'s instance at base `base` (the root's typing when -1) keyed also by the
+// declaration `ds[i]` each specialized parameter `ps[i]` receives, its body checked there; -1
+// where no key is left. Two calls with one base and one set of declarations share it.
+export function elabSpecInst(
+  decl0: i32,
+  base: i32,
+  fnIx: i32,
+  ps: i32[],
+  ds: i32[],
+): i32 {
+  const decl = elabSrcDecl(decl0)
+  if decl < 0 || !(nodeAt(decl) is FuncDecl) || ps.length == 0 { return -1 }
+  const from = if fnIx >= 0 { elabKeyAt(fnIx) } else { -1 }
+  const parent = if base >= 0 { ekParent[base] } else { elabParentFor(decl, from) }
+  if parent < -1 { return -1 }
+  let key = "S" + i32ToStr(parent) + "^" + i32ToStr(decl) + "|" + i32ToStr(base)
+  let i = 0
+  while i < ps.length && i < ds.length {
+    key = key + "|" + i32ToStr(ps[i]) + "=" + i32ToStr(ds[i])
+    i = i + 1
+  }
+  const have = ekIndex[key] ?? -1
+  if have >= 0 { return have }
+  if ekDecl.length >= ELAB_MAX_KEYS { return -1 }
+  const k2 = ekDecl.length
+  ekIndex[key] = k2
+  ekSpecBase[k2] = base
+  ekSpecPs[k2] = ps
+  ekSpecDs[k2] = ds
+  elabSpecMinted = elabSpecMinted + 1
+  const names: string[] = []
+  const tys: i32[] = []
+  if base >= 0 {
+    i = 0
+    while i < ekNames[base].length && i < ekTys[base].length {
+      names.push(ekNames[base][i])
+      tys.push(ekTys[base][i])
+      i = i + 1
+    }
+  }
+  ekDecl.push(decl)
+  ekNames.push(names)
+  ekTys.push(tys)
+  ekParent.push(parent)
+  ekDone.push(false)
+  ekReach.push([])
+  const n0 = ekDecl.length
+  const was = elabSpecChecking
+  elabSpecChecking = true
+  elabOne(k2)
+  elabSettle(n0)
+  elabSpecChecking = was
+  elabSpecChildren = elabSpecChildren + ekDecl.length - n0
   k2
 }
 
@@ -2905,6 +2998,7 @@ function elabOneAt(k: i32) {
     T.diags.length - ed0 > elabCapDeadDiags
     && !(elabReprKeys[k] ?? false)
     && !(elabCandKeys[k] ?? false)
+    && !ekSpecBase.has(k)
   ) {
     elabErrorNote(T.diags[ed0])
   }
@@ -8553,6 +8647,11 @@ export function elabRun() {
   ekDecl = []
   ekNames = []
   ekTys = []
+  ekSpecBase = Map()
+  ekSpecPs = Map()
+  ekSpecDs = Map()
+  elabSpecMinted = 0
+  elabSpecChildren = 0
   ekByDecl = Map()
   elabFnHoldingMemo = Map()
   ekIndex = Map()

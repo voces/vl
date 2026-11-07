@@ -1,5 +1,9 @@
 import { idShadowSpec } from "./emit_id_shadow"
-import { elabIdentityFnTy } from "./elab_fn_id"
+import {
+  elabIdentityFnTy,
+  elabSpecDemand,
+  elabSpecMonoGroup,
+} from "./elab_fn_id"
 import { idShadowModeOf } from "./id_shadow_state"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
 import { recEnclosingFn } from "./check_fit_rules"
@@ -415,7 +419,12 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { callBindShadowNote } from "./call_bind_shadow"
-import { monoPinRespell, monoPinSpellNote } from "./pin_spell"
+import {
+  monoPinOwnClose,
+  monoPinOwnRowNote,
+  monoPinRespell,
+  monoPinSpellNote,
+} from "./pin_spell"
 import {
   monoCalleeDeclOf,
   monoFrameInstTmpl,
@@ -8221,6 +8230,7 @@ function monoMakeInstance(
   pinned: string[],
   pinKinds: i32[],
   pinTys: i32[],
+  pinOwn: i32[],
   tvN: string[],
   tvV: string[],
   calleeIx: i32,
@@ -8241,6 +8251,7 @@ function monoMakeInstance(
     pinned,
     pinKinds,
     pinTys,
+    pinOwn,
     tvN,
     tvV,
     calleeIx,
@@ -8271,11 +8282,13 @@ function monoTemplateOwner(origFe: i32): string {
 }
 
 // The pin segment of an instance key: per pin, `heads[pk]` and the argument type's
-// discriminators. `heads` is the pin spelling, or for the typed key the pin's resolved type.
+// discriminators. `heads` is the pin spelling, or for the typed key the pin's resolved type;
+// `pinOwn` is each pin's own type, the parameter's substituted annotation.
 function monoKeyPinSeg(
   heads: string[],
   pinned: string[],
   pinTys: i32[],
+  pinOwn: i32[],
   bound: boolean[],
   exact: boolean,
 ): string {
@@ -8289,6 +8302,7 @@ function monoKeyPinSeg(
     // A pin built around records is keyed by its row class (`typeRowClassOf`): pins whose records
     // share a row build one instance, whatever their names or spellings (D15262).
     const rowCls = typeRowClassOf(repElemTyOfName(pinned[pk]))
+    monoPinOwnRowNote(rowCls, pinOwn[pk])
     if rowCls != "" {
       seg = seg
         + "#row"
@@ -9237,6 +9251,7 @@ function monoMakeInstanceKeyOf(
   callKey: i32,
   pinned: string[],
   pinTys: i32[],
+  pinOwn: i32[],
   tvN: string[],
   tvV: string[],
   cbFnNames: string[],
@@ -9267,6 +9282,7 @@ function monoMakeInstanceKeyOf(
     pinned,
     pinned,
     pinTys,
+    pinOwn,
     monoUnionTyParamPins(fn),
     elabTestsTyVar(monoOrigNode[origFe]),
   )
@@ -9307,6 +9323,7 @@ function monoTypedInstKey(
   pinned: string[],
   pinKinds: i32[],
   pinTys: i32[],
+  pinOwn: i32[],
   pinnedTyIx: i32[],
 ): string {
   const heads: string[] = []
@@ -9337,6 +9354,7 @@ function monoTypedInstKey(
     heads,
     pinned,
     pinTys,
+    pinOwn,
     if fd is FuncDecl { monoUnionTyParamPins(fd) } else { none },
     elabTestsTyVar(monoOrigNode[origFe]),
   )
@@ -9551,12 +9569,16 @@ function monoMakeInstanceInstall(
 }
 
 // Refuses a pin type column not parallel to the pins: -1, else 0.
-function monoPinColsMisalignedFail(pinned: string[], pinTys: i32[]): i32 {
+function monoPinColsMisalignedFail(
+  pinned: string[],
+  pinTys: i32[],
+  pinOwn: i32[],
+): i32 {
   // The pin columns are positional and nothing downstream can tell a misaligned one from a
   // correct one — param j would silently read param k's type. Checked once, loudly, here
   // rather than bounds-guarding each read: a guard turns misalignment into a silently wrong
   // type, and a short-but-nonempty column is exactly what a bounds guard cannot see.
-  if pinTys.length != pinned.length {
+  if pinTys.length != pinned.length || pinOwn.length != pinned.length {
     return emitFail(
       "emitProgram: monomorphize: pin type column is not parallel to the pins",
     )
@@ -9570,6 +9592,7 @@ function monoMakeInstanceGo(
   pinned: string[],
   pinKinds: i32[],
   pinTys: i32[],
+  pinOwn: i32[],
   tvN: string[],
   tvV: string[],
   calleeIx: i32,
@@ -9590,7 +9613,7 @@ function monoMakeInstanceGo(
   monoInstRetWidenKey = ""
   monoInstRetWidenName = ""
   monoInstRetWidenTy = 0 - 1
-  if monoPinColsMisalignedFail(pinned, pinTys) < 0 { return -1 }
+  if monoPinColsMisalignedFail(pinned, pinTys, pinOwn) < 0 { return -1 }
   // Every caller bounds `origFe` by `monoGen`, which `monoOrigNode` stays parallel to.
   if origFe < 0 || origFe >= monoOrigNode.length {
     return emitFail(
@@ -9612,6 +9635,7 @@ function monoMakeInstanceGo(
       callKey,
       pinned,
       pinTys,
+      pinOwn,
       tvN,
       tvV,
       cbFnNames,
@@ -9708,6 +9732,7 @@ function monoMakeInstanceGo(
       pinned,
       pinKinds,
       pinTys,
+      pinOwn,
       pinnedTyIx,
     )
     k.key = instKey
@@ -10167,6 +10192,24 @@ function monoInstanceFor(
     const pinKinds: i32[] = []
     monoBuildPinCol(pinned, pinKinds)
     monoPinRespell(pinned, pinTys, params)
+    // Each pin's own type: a concrete annotation's, else the boundary's, which a type parameter's
+    // substituted annotation is checked against above.
+    const pinOwn: i32[] = []
+    let oj = 0
+    while oj < params.length {
+      const po = nodeAt(params[oj])
+      let ot = pinTys[oj]
+      if po is Param {
+        if (
+          po.parType >= 0
+          && !monoAnnHasTyParam(po.parType, -1, fn.fnTyParams)
+        ) {
+          ot = nodeTyIxOf(po.parType)
+        }
+      }
+      pinOwn.push(ot)
+      oj = oj + 1
+    }
     cadDelivery = if cadDeliveryAt >= 0 { cadDeliveryAt } else { letInitIx }
     instKeyDstSet(expTy, deliveryTys)
     const made = monoMakeInstance(
@@ -10174,6 +10217,7 @@ function monoInstanceFor(
       pinned,
       pinKinds,
       pinTys,
+      pinOwn,
       tvN,
       tvV,
       letInitIx,
@@ -19579,6 +19623,9 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       // argument's recorded type and consumed only as a fallback where the pinned name
       // does not resolve. -1 = nothing known.
       const pinTys: i32[] = []
+      // Each pin's own type, the parameter's substituted annotation, parallel to `pinned`; -2 at an
+      // un-annotated parameter until `monoPinOwnClose` fills it from `pinTys`.
+      const pinOwn: i32[] = []
       // Pre-bind from the value arguments, and only when a generic function value is on
       // its way into an arrow parameter riding these type parameters (D58): the main
       // loop binds at first use, and `hof<U, R>(g: (U, U) => R, …)` uses `U` first at `g`.
@@ -19646,6 +19693,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
             )
             if hr < 0 { return hr }
             if hr > 0 { return 0 }
+            while pinOwn.length < pinned.length { pinOwn.push(-2) }
           } else {
             const pr = monoPinAnnotatedParam(
               p,
@@ -19660,6 +19708,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
               tvT,
               pinned,
               pinTys,
+              pinOwn,
               oDecl,
             )
             if pr < 0 { return pr }
@@ -19678,6 +19727,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         )
         ci = ci + 1
       }
+      const specAt = if monoAnyBakedCallback(cbFnNames) { elabSpecDemand(callIx, ctx, monoOrigNode[origFe], args, cbFnNames) } else { -1 }
       monoBindSeededTyParams(
         fn,
         monoOrigNode[origFe],
@@ -19722,6 +19772,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         }
       }
       monoExactPinTys(pinTys, ctx)
+      monoPinOwnClose(pinOwn, pinTys, ctx)
       if repShadowOn {
         let pk = 0
         while pk < pinned.length && pk < pinTys.length {
@@ -19747,17 +19798,21 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       monoMakeCallIx = callIx
       monoOpenLamOwner = callIx
       monoOpenLamDefer = -1
+      const specKeys0 = monoKeys.length
       const made = monoMakeInstance(
         origFe,
         pinned,
         pinKinds,
         pinTys,
+        pinOwn,
         tvN,
         tvV,
         c.callFn,
         false,
         cbFnNames,
       )
+      const specFe = if monoKeys.length > specKeys0 { monoInstFe[specKeys0] } else { monoLastInstFe }
+      elabSpecMonoGroup(specAt, i32ToStr(specFe))
       return made
     }
   }
@@ -20518,9 +20573,9 @@ function monoTyIsArrayShaped(closedTy: i32, openTy: i32): boolean {
 }
 
 // `monoInstantiateCall`'s pin for the annotated parameter `p`, the `i`th of `fn`'s, given
-// argument `args[i]`: binds the type parameters the annotation rides into `tvN`/`tvV` and pushes
-// the parameter's pin onto `pinned` and its arena type onto `pinTys`, `decl` the declaration whose
-// body is read for a literal argument's demand. Returns 0, or the failure.
+// argument `args[i]`: binds the annotation's type parameters into `tvN`/`tvV`, pushes the pin onto
+// `pinned`, the argument's type onto `pinTys` and the pin's own type onto `pinOwn`. `decl` is the
+// declaration whose body is read for a literal argument's demand. Returns 0, or the failure.
 function monoPinAnnotatedParam(
   p: Param,
   fn: FuncDecl,
@@ -20534,6 +20589,7 @@ function monoPinAnnotatedParam(
   tvT: i32[],
   pinned: string[],
   pinTys: i32[],
+  pinOwn: i32[],
   decl: i32,
 ) {
   // The declared spelling where the annotation is a type parameter, the
@@ -20552,6 +20608,7 @@ function monoPinAnnotatedParam(
       if mpn != "" {
         pinned.push(mpn)
         pinTys.push(mpt)
+        pinOwn.push(mpt)
         return 0
       }
     }
@@ -20573,6 +20630,7 @@ function monoPinAnnotatedParam(
       )
       pinned.push(en)
       pinTys.push(ept)
+      pinOwn.push(ept)
     } else if monoAnnHasTyParam(p.parType, -1, fn.fnTyParams) {
       const cr = monoPinTyParamComposite(
         p,
@@ -20588,6 +20646,7 @@ function monoPinAnnotatedParam(
         tvT,
         pinned,
         pinTys,
+        pinOwn,
         decl,
       )
       if cr < 0 { return cr }
@@ -20598,9 +20657,11 @@ function monoPinAnnotatedParam(
       if arp != "" {
         pinned.push(arp)
         pinTys.push(ar)
+        pinOwn.push(ar)
       } else {
         pinned.push(ann)
         pinTys.push(monoArgPinTyIx(args[i], ctx))
+        pinOwn.push(nodeTyIxOf(p.parType))
       }
     }
   } else {
@@ -20613,6 +20674,7 @@ function monoPinAnnotatedParam(
     if setTy >= 0 {
       pinned.push(tyToStr(setTy))
       pinTys.push(setTy)
+      pinOwn.push(setTy)
       return 0
     }
     // A list of a tagged set's ids handed to `T[]` is pinned at the i32 list it is stored as.
@@ -20620,6 +20682,7 @@ function monoPinAnnotatedParam(
     if listSet >= 0 && fnTagListTy(listSet) && fnTagListRepName(listSet) != "" {
       pinned.push(fnTagListRepName(listSet))
       pinTys.push(listSet)
+      pinOwn.push(listSet)
       return 0
     }
     let an2 = ""
@@ -20745,11 +20808,18 @@ function monoPinAnnotatedParam(
     if ann != tp {
       pinned.push(arrElemSuffixed(bind))
       pinTys.push(monoArgPinTyIx(args[i], ctx))
+      const lpat = monoParamPatTy(
+        params,
+        i,
+        monoDeclParamTysOf(decl, params.length),
+      )
+      pinOwn.push(monoClosedSlotTyAt(lpat, topFnOwnerOf(decl), tvN, tvT))
     } else {
       // A `T` an earlier parameter bound pins this one at that binding's type, not the argument's.
       const bt = if bind == b { monoBindTyOf(tvN, tvT, tp) } else { -1 }
       pinned.push(bind)
       pinTys.push(if bt >= 0 { bt } else { an2Ty })
+      pinOwn.push(if bt >= 0 { bt } else { an2Ty })
     }
   }
   0
@@ -21106,6 +21176,7 @@ function monoPinTyParamComposite(
   tvT: i32[],
   pinned: string[],
   pinTys: i32[],
+  pinOwn: i32[],
   decl: i32,
 ): i32 {
   const patTy = monoParamPatTy(
@@ -21267,6 +21338,7 @@ function monoPinTyParamComposite(
   // under the typed bindings, when that closes.
   if pinCTy < 0 && annIsFn { pinCTy = monoClosedSlotTyAt(patTy, own, tvN, tvT) }
   pinTys.push(pinCTy)
+  pinOwn.push(monoClosedSlotTyAt(patTy, own, tvN, tvT))
   0
 }
 
@@ -21405,6 +21477,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         i = i + 1
       }
       if !monoAnyBakedCallback(cbFnNames) { return 0 }
+      const specAt = elabSpecDemand(callIx, ctx, fnDeclIx, args, cbFnNames)
       // Key on the callee plus each baked callback identity, so `reduce(xs, add, …)` and
       // `reduce(xs, mul, …)` get distinct specializations. The `C` prefix keeps these out
       // of the generic keyspace, which always carries a `#`.
@@ -21414,6 +21487,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         if cbFnNames[kc] != "" { key = key + "@" + cbFnNames[kc] }
         kc = kc + 1
       }
+      elabSpecMonoGroup(specAt, key)
       // Registry hit: a prior call already specialized this (callee, callback-set) — reuse it.
       let r = 0
       while r < monoKeys.length {
