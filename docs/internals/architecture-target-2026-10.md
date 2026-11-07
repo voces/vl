@@ -2024,6 +2024,8 @@ Switched, (c) or deleted: **119 of 165**, against 84 in the morning's table (38 
   - switched: `monoUncalledSlotFnTy` 293, `monoUncalledListElems` 209, `monoHoleFnPinTyOf` 19, `monoUncalledNestedListElems` 15.
   - (c): `monoChoiceArmFlowTy` 7,920.
   - blocked: `monoElabDefaultsPrime` 18,172 (reach: the unbound default), `monoDefaultUnboundTyParams` 9,004 (reach: the unbound default).
+    Since 2026-11-07 the defaults half of the prime is the elaboration's own (`elabTpDefaultsPrime`, run by `elabRun`, with the rule's predicates moved to `emit_elab`). Mono keeps the stub half, `monoElabStubArgsPrime`: an argument of only uncalled hole functions keyed at the `() => void` stub, which fires in 55 of 23,103 programs and is D15494's (owner). `monoDefaultUnboundTyParams` is live: deleting it turned `generics/unbound-type-param-defaults-at-call.vl` into invalid wasm, and on that fixture its 5 bindings equal the call key's.
+    Probe note: a build reports only its first `emitFail`, so a probe that emits one row per site shows the first row alone; collect the rows into one message and flush it once after `emitProgramRun`.
   - parked: `monoDefaultTyParamsOnlyGenFns` 8,697 (per-call rule no elaboration fact states (10 calls, 4 files)).
   - deleted: `monoArgClosedPin`.
 - **slot held fns**:
