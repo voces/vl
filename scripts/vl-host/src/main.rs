@@ -8201,8 +8201,13 @@ fn check_root_workers(roots: usize) -> usize {
 /// The memory this process may still take, in bytes: the smaller of the system's
 /// `MemAvailable` and its cgroup v2 headroom (`memory.max` minus `memory.current`, when
 /// `memory.max` is not `max`), so a container's limit counts as much as the machine's.
-/// `None` when neither can be read.
+/// `None` when neither can be read. `$VL_TEST_HEADROOM_GIB` replaces the reading, so a
+/// test that asserts on a pool's size grades the scheduler rather than the box's load.
 fn memory_headroom() -> Option<u64> {
+    let pinned = std::env::var("VL_TEST_HEADROOM_GIB").ok();
+    if let Some(gib) = pinned.and_then(|v| v.parse::<u64>().ok()) {
+        return Some(gib << 30);
+    }
     let available = (|| {
         let info = std::fs::read_to_string("/proc/meminfo").ok()?;
         let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;

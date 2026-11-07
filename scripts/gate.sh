@@ -99,18 +99,59 @@ if [ "${1:-}" != "--no-build" ]; then
   grep -E 'refreshed|bytes' "$LOGS/build.log" | tail -1
 fi
 
-NAMES=(); PIDS=(); STARTS=()
+NAMES=(); PIDS=(); STARTS=(); MEMS=(); CMDS=()
 # WALL is each gate's OWN elapsed, which is why the subshell stamps its finish into
 # `$LOGS/<i>.t`: the report loop `wait`s in index order and a job that already exited
 # returns instantly, so an elapsed computed there is the loop's clock. No stamp falls back
 # to that reading. CPU is the same subshell's `times`, whose second line is its reaped
 # children's user+sys — the whole row's process tree, which the box cannot inflate.
-# `GATE_MAX_PAR` caps how many rows run at once (unset or 0: all at once), for a box shared
-# with a foreground user. A row's WALL starts when it launches, not while it queues.
-# On Windows the default is 6, where running every row at once loses to contention (README,
-# "Developing on Windows").
+# `GATE_MAX_PAR` caps how many rows run at once (0: no cap), for a box shared with a
+# foreground user. A row's WALL starts when it launches, not while it queues. The default is
+# twice the core count, which is every row on a 24-thread box; on Windows it is 6, where
+# running every row at once loses to contention (README, "Developing on Windows").
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) : "${GATE_MAX_PAR:=6}" ;; esac
-GATE_MAX_PAR="${GATE_MAX_PAR:-0}"; GATE_MAX_PAR="${GATE_MAX_PAR//[!0-9]/}"; GATE_MAX_PAR="${GATE_MAX_PAR:-0}"
+NPROC=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)
+GATE_MAX_PAR="${GATE_MAX_PAR:-$((2 * NPROC))}"; GATE_MAX_PAR="${GATE_MAX_PAR//[!0-9]/}"; GATE_MAX_PAR="${GATE_MAX_PAR:-0}"
+# THE MEMORY BUDGET. Rows are admitted while the peak-RSS estimates (`row_mem`, MiB) of the
+# rows running fit in what the box had free at launch, less earlyoom's 10% and 1 GiB. A row
+# that alone exceeds the budget still runs once nothing else does. On a 15 GiB box all at
+# once peaked past 20 GiB in estimates and OOM-killed `self-compile pair` (2026-11-07); a
+# box with the memory for every row launches every row, as before. `GATE_MEM_BUDGET_MB`
+# overrides the budget, and 0 turns it off. No reading (macOS, Windows) is no budget.
+mem_budget_mb() {
+  local avail total cg
+  avail=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null)
+  total=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null)
+  [ -n "$avail" ] && [ -n "$total" ] || { echo 0; return; }
+  if [ -r /sys/fs/cgroup/memory.max ] && cg=$(cat /sys/fs/cgroup/memory.max) && [ "$cg" != max ]; then
+    cg=$(( (cg - $(cat /sys/fs/cgroup/memory.current)) / 1048576 )); [ "$cg" -lt "$avail" ] && avail=$cg
+  fi
+  local b=$(( avail - total / 10 - 1024 )); [ "$b" -gt 0 ] || b=1
+  echo "$b"
+}
+# Peak RSS of each row's whole process tree, measured 2026-11-07 on 4 cores and 15 GiB with
+# the gate fanned out (the worst of two runs, rounded up). `filed witnesses` is a cold run;
+# `self-compile pair` builds two self-compiles at ~4 GiB each unless the build handed it one.
+row_mem() {
+  case "$1" in
+    "filed witnesses") echo 8000 ;;
+    "ci-native") echo 4000 ;;
+    "self-compile pair") [ -n "${SELF_COMPILE_PAIR:-}" ] && echo 1400 || echo 4700 ;;
+    "lint-self + fmt") echo 2400 ;;
+    "distilled corpus") echo 1700 ;;
+    "rep-fuzz") echo 1600 ;;
+    "deno task test"|"plumb-shape cost") echo 1400 ;;
+    "lsp suites (ci list)") echo 1100 ;;
+    "scaling shape") echo 900 ;;
+    "capability probes"|"kind-ladder sets") echo 800 ;;
+    "dead-export budget"|"render-parse budget") echo 600 ;;
+    "late demands") echo 500 ;;
+    "lsp typecheck"|"inventory refs") echo 400 ;;
+    *) echo 200 ;;
+  esac
+}
+GATE_MEM_BUDGET_MB="${GATE_MEM_BUDGET_MB:-$(mem_budget_mb)}"; GATE_MEM_BUDGET_MB="${GATE_MEM_BUDGET_MB//[!0-9]/}"
+GATE_MEM_BUDGET_MB="${GATE_MEM_BUDGET_MB:-0}"
 # `--fast`: a local pre-push check, NOT the merge gate. It skips the rows whose cost is the
 # slow tail of the gate (whole-corpus grades, timing measurements, the fixpoints, the full
 # native suite) and ends with a line no merge tooling reads as a pass.
@@ -130,22 +171,35 @@ if [ -n "${GATE_CI_PROOF:-}" ]; then
   cat "$LOGS/ci-proof.err"
 fi
 CI_SKIPPED=()
-# bash 3.2 (macOS's /bin/bash) has no `wait -n`; there a queued row polls once a second.
-if [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; }; then
-  wait_any() { wait -n 2>/dev/null || true; }
-else
-  wait_any() { sleep 1; }
-fi
+# A queued row polls the finish stamps rather than `wait -n`, which bash 3.2 (macOS) lacks and
+# which, on bash 5.2, blocks for the NEXT exit when a row exited between the scan and the call.
+wait_any() { sleep 0.5; }
 # A BSD `date` older than macOS 26 prints `%N` literally; perl's clock stands in there.
 if [ "$(date +%N)" != N ]; then now() { date +%s.%N; }
 else now() { perl -MTime::HiRes=time -e 'printf "%.6f\n", time'; }; fi
 run() { if [ "$FAST" = 1 ] && [[ "$SLOW_ROWS" == *"|$1|"* ]]; then SKIPPED+=("$1"); return 0; fi
         if [[ "$CI_PROVEN" == *"|$1|"* ]]; then CI_SKIPPED+=("$1"); return 0; fi
-        if [ "$GATE_MAX_PAR" -gt 0 ]; then
-          while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait_any; done
-        fi
-        local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(now)"); shift
-        ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; now > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) & PIDS+=($!); }
+        NAMES+=("$1"); MEMS+=("$(row_mem "$1")"); shift; CMDS+=("$(printf '%q ' "$@")"); }
+# Launch the queued rows in order: the next one starts when a slot is free and its estimate
+# fits beside the running rows', so a large row waits for room rather than being passed.
+launch() { local i=$1
+           STARTS[$i]=$(now)
+           ( eval "${CMDS[$i]}" > "$LOGS/$i.log" 2>&1; rc=$?; now > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) &
+           PIDS[$i]=$!; }
+dispatch() { local i j live used
+             for i in "${!CMDS[@]}"; do
+               while :; do
+                 live=0; used=0
+                 for ((j = 0; j < i; j++)); do
+                   [ -e "$LOGS/$j.t" ] || { live=$((live + 1)); used=$((used + MEMS[j])); }
+                 done
+                 [ "$live" = 0 ] && break
+                 { [ "$GATE_MAX_PAR" = 0 ] || [ "$live" -lt "$GATE_MAX_PAR" ]; } &&
+                   { [ "$GATE_MEM_BUDGET_MB" = 0 ] || [ $((used + MEMS[i])) -le "$GATE_MEM_BUDGET_MB" ]; } && break
+                 wait_any
+               done
+               launch "$i"
+             done; }
 # `times` prints `<m>m<s>s <m>m<s>s`; sum both into seconds.
 cpusec() { local tot=0 p m x
            for p in "$@"; do m=${p%%m*}; x=${p#*m}; x=${x%s}; tot=$(awk -v t="$tot" -v m="$m" -v x="$x" 'BEGIN { print t + m * 60 + x }'); done
@@ -338,6 +392,9 @@ if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
 else
   run "distilled corpus"       "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm
 fi
+
+echo "== $((${#CMDS[@]})) rows, at most $([ "$GATE_MAX_PAR" = 0 ] && echo all || echo "$GATE_MAX_PAR") at once, memory budget $([ "$GATE_MEM_BUDGET_MB" = 0 ] && echo none || echo "${GATE_MEM_BUDGET_MB} MiB") =="
+dispatch
 
 FAIL=0
 # WALL is contended — every row is measured with all its siblings on the box, so it reads
