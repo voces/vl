@@ -2031,6 +2031,11 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   `closures/lambda-called-directly-with-generic-at-two-signatures-beside-one-signature-consumer.vl`,
   `closures/closure-result-nullable-closure-array.vl`, `functions/hole-call-let-lambda-at-two-instances.vl`,
   D14824.
+  `monoExactBind` (the exact binding a type-testing body keys its instance by) takes `ekTys` at the
+  call's key, which `monoMakeInstanceGo` now computes before the registry key; the walk it replaced
+  (`exactBindWalk`, `monoTyIsOpenUnion`) is deleted. It agrees in 938 programs and differs in none,
+  and the 2 it alone answered build the same bytes without it:
+  `objects/record-literal-arg-generic-field-read-under-is.vl`, D6701.
   The per-argument pins are a separate fact (the argument's representation, per union arm) and
   wait for the producers.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
