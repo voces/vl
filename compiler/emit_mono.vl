@@ -3221,37 +3221,10 @@ function monoPinUnionBoxed(j: i32, refArm: boolean): i32 {
   j
 }
 
-// `ty` at the binding `bN`/`bT` widened by the parameters' union-arm bindings, a member no
-// argument bound dropped; -1 when a type parameter remains.
-function monoPinArmSubst(ty: i32, bN: string[], bT: i32[]): i32 {
-  let p = monoSubstInst(ty, bN, bT)
-  if p >= 0 && tyHasTyVar(p) { p = monoDropUnboundMembers(p) }
-  if p < 0 || tyHasTyVar(p) { return -1 }
-  p
-}
-
-// A union whose open members are declared type parameters this instance left unbound, which no
-// argument supplied and so no value holds (`U` of `u: U | string` at a `string`): its other
-// members joined. -1 for any other type still naming a parameter.
-function monoDropUnboundMembers(ty: i32): i32 {
-  const u = tyAt(ty)
-  if !(u is TyUnion) { return -1 }
-  const rest: i32[] = []
-  let i = 0
-  while i < u.uMembers.length {
-    const m = u.uMembers[i]
-    if m < 0 || m >= T.tys.length { return -1 }
-    const mt = tyAt(m)
-    if mt is TyVar {
-      if mt.tvName.length == 0 || mt.tvName[0] == "?"[0] { return -1 }
-    } else if tyHasTyVar(m) {
-      return -1
-    } else {
-      rest.push(m)
-    }
-    i = i + 1
-  }
-  joinPinnedArmTys(rest)
+// The walk type of node `ix` at the instance, where it closes; -1 otherwise.
+function monoClosedWalkTy(ix: i32): i32 {
+  const w = elabWalkTy(ix)
+  if w >= 0 && w < T.tys.length && !tyHasTyVar(w) { w } else { -1 }
 }
 
 // The operand children of expression `ix` a copy-on-write rewrite descends into, in the
@@ -4730,49 +4703,32 @@ function monoPinBodyLambdasRaw(
   if n is BinExpr && n.binOp == "??" && monoPinHoleN.length > 0 {
     monoHoleCoalUnion(ix)
   }
-  if n is BinExpr && n.binOp == "??" {
-    rb = monoPinCoalListDefault(ix, rb, bN, bT)
-  }
+  if n is BinExpr && n.binOp == "??" { rb = monoPinCoalListDefault(ix, rb) }
   // A `??` the checker kept apart is read at the pin wherever it goes, as its `if` is (D2846).
-  if sink || (tpIfJoinAt.get(ix) ?? -1) >= 0 {
-    rb = monoPinCoalJoin(ix, rb, bN, bT)
-  }
-  if numUnionMinted { rb = monoNumUnionOpPin(ix, rb, bN, bT) }
+  if sink || (tpIfJoinAt.get(ix) ?? -1) >= 0 { rb = monoPinCoalJoin(ix, rb) }
+  if numUnionMinted { rb = monoNumUnionOpPin(ix, rb) }
   rb
 }
 
-// An operator operand's type at the pin: its pinned type, or, for a name typed at a hole the
-// parameters' binding leaves open, the elaboration's closed type of it at the instance. An operator
-// reaches a nullable number only past the check that excluded its `null`. A derived hole is left
-// as pinned.
-function monoNumOperandPinTy(ix: i32, bN: string[], bT: i32[]): i32 {
-  const p = monoPinnedTyOf(ix, bN, bT)
-  if p < 0 || p >= T.tys.length || !tyHasTyVar(p) { return p }
-  if !(nodeAt(unwrapParen(ix)) is Ident) { return p }
-  const t = tyAt(p)
-  if !(t is TyVar) { return p }
-  if t.tvName.length > 1 && t.tvName[1] == "#"[0] { return p }
-  const nt = elabWalkNarrowedTy(ix)
-  const wt = elabWalkTy(ix)
-  let e = if nt >= 0 && nt < T.tys.length && !tyHasTyVar(nt) { nt } else { -1 }
-  if e < 0 && wt >= 0 && wt < T.tys.length && !tyHasTyVar(wt) { e = wt }
-  if e < 0 { return p }
-  if tyIsNumericBox(e) && tyBearsNull(e) { nonNullTy(e) } else { e }
+// An operator operand's type at the instance: the walk type, narrowed where the walk narrows it,
+// else -1. An operator reaches a nullable number only past the check that excluded its `null`.
+function monoNumOperandPinTy(ix: i32): i32 {
+  const n = elabWalkNarrowedTy(ix)
+  const w = if n >= 0 && n < T.tys.length && !tyHasTyVar(n) { n } else { elabWalkTy(ix) }
+  if w < 0 || w >= T.tys.length || tyHasTyVar(w) || tyReachesHole(w, 16) {
+    return -1
+  }
+  if tyIsNumericBox(w) && tyBearsNull(w) { nonNullTy(w) } else { w }
 }
 
 // `monoNumUnionOpPin` for a compound assignment `rb` rebuilt from `ix`: its operator node.
-function monoNumUnionCompoundPin(
-  ix: i32,
-  rb: i32,
-  bN: string[],
-  bT: i32[],
-): i32 {
+function monoNumUnionCompoundPin(ix: i32, rb: i32): i32 {
   const n = nodeAt(rb)
   if !(n is BinExpr) { return rb }
   const inner = nodeAt(n.binRight)
   if !(inner is BinExpr) { return rb }
-  const lt = monoNumOperandPinTy(inner.binLeft, bN, bT)
-  const rt = monoNumOperandPinTy(inner.binRight, bN, bT)
+  const lt = monoNumOperandPinTy(inner.binLeft)
+  const rt = monoNumOperandPinTy(inner.binRight)
   if !tyIsNumUnion(lt) && !tyIsNumUnion(rt) { return rb }
   const nu = numUnionResultTy(inner, lt, rt)
   if nu < 0 || nu == nodeTyIxOf(n.binRight) { return rb }
@@ -4790,7 +4746,7 @@ function monoNumUnionCompoundPin(
 
 // An operator whose operand this instance types as a numeric union answers the union of its
 // member results (`numUnionResultTy`), which the template, typed at a parameter, cannot name.
-function monoNumUnionOpPin(ix: i32, rb: i32, bN: string[], bT: i32[]): i32 {
+function monoNumUnionOpPin(ix: i32, rb: i32): i32 {
   if rb < 0 || rb >= P.nodes.length { return rb }
   const n = nodeAt(rb)
   let nu = -1
@@ -4802,18 +4758,18 @@ function monoNumUnionOpPin(ix: i32, rb: i32, bN: string[], bT: i32[]): i32 {
       && n.binCompound != "++"
       && n.binCompound != "--"
     ) {
-      return monoNumUnionCompoundPin(ix, rb, bN, bT)
+      return monoNumUnionCompoundPin(ix, rb)
     }
     if n.binOp == "=" || n.binOp == "??" || n.binOp == "&&" || n.binOp == "||" {
       return rb
     }
-    const lt = monoNumOperandPinTy(n.binLeft, bN, bT)
-    const rt = monoNumOperandPinTy(n.binRight, bN, bT)
+    const lt = monoNumOperandPinTy(n.binLeft)
+    const rt = monoNumOperandPinTy(n.binRight)
     if !tyIsNumUnion(lt) && !tyIsNumUnion(rt) { return rb }
     nu = numUnionResultTy(n, lt, rt)
   } else if n is Unary {
     if n.unOp != "-" { return rb }
-    const at = monoNumOperandPinTy(n.unArg, bN, bT)
+    const at = monoNumOperandPinTy(n.unArg)
     if !tyIsNumUnion(at) { return rb }
     nu = at
   } else {
@@ -4900,12 +4856,7 @@ function monoHoleCoalUnion(ix: i32) {
 // A `??` at `ix`, rebuilt as `rb`, whose default is an open list literal: a copy whose default
 // is built at the pinned operand's non-null list type, so both arms are one list row. `rb`
 // unchanged where the operand's pinned type is not a closed list.
-function monoPinCoalListDefault(
-  ix: i32,
-  rb: i32,
-  bN: string[],
-  bT: i32[],
-): i32 {
+function monoPinCoalListDefault(ix: i32, rb: i32): i32 {
   const n = nodeAt(ix)
   const r = nodeAt(rb)
   if !(n is BinExpr) || !(r is BinExpr) { return rb }
@@ -4916,13 +4867,13 @@ function monoPinCoalListDefault(
   }
   const lt = nodeTyIxOf(n.binLeft)
   if lt < 0 || lt >= T.tys.length { return rb }
-  let pl = monoPinArmSubst(lt, bN, bT)
+  const pl = monoClosedWalkTy(n.binLeft)
   if pl < 0 && monoPinHoleN.length > 0 {
-    // An operand typed at the instance's holes, which `bN` does not name.
-    const jN: string[] = []
-    const jT: i32[] = []
-    monoJoinBinding(bN, bT, monoPinHoleN, monoPinHoleT, jN, jT)
-    pl = monoSubstInst(lt, jN, jT)
+    emitFailAt(
+      "emitProgram: internal: the left operand of a `??` with a list default has no closed type in this hole instance",
+      n.binLeft,
+    )
+    return rb
   }
   if pl < 0 || pl >= T.tys.length || tyHasTyVar(pl) { return rb }
   const pnn = nonNullTy(pl)
@@ -4939,7 +4890,7 @@ function monoPinCoalListDefault(
 // For a `??` at `ix`, rebuilt as `rb`: where its sides' pinned types join to other than the
 // template's recorded join (`t ?? 5` at a `string | null` pin), a node answering that join. `rb`
 // unchanged otherwise.
-function monoPinCoalJoin(ix: i32, rb: i32, bN: string[], bT: i32[]): i32 {
+function monoPinCoalJoin(ix: i32, rb: i32): i32 {
   const n = nodeAt(ix)
   if !(n is BinExpr) { return rb }
   if n.binOp != "??" || n.binCompound != "" { return rb }
@@ -4949,8 +4900,8 @@ function monoPinCoalJoin(ix: i32, rb: i32, bN: string[], bT: i32[]): i32 {
   const rt = nodeTyIxOf(n.binRight)
   if lt < 0 || rt < 0 || lt >= T.tys.length || rt >= T.tys.length { return rb }
   if !tyHasTyVar(raw) && !tyHasTyVar(lt) && !tyHasTyVar(rt) { return rb }
-  const pl = monoPinArmSubst(lt, bN, bT)
-  const pr = monoPinArmSubst(rt, bN, bT)
+  const pl = monoClosedWalkTy(n.binLeft)
+  const pr = monoClosedWalkTy(n.binRight)
   if pl < 0 || pr < 0 { return rb }
   // A literal default that is a member of the pinned literal-union operand keeps that union,
   // as the concrete `??` types it, so the result stays the operand's atom (D3423).

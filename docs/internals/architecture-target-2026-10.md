@@ -2519,6 +2519,27 @@ pair differs where both answer.
   `closures/hole-fn-map-record-let-rewritten.vl` (D15534's fixture). Filling the 272 elab-only
   literals moves no byte.
 
+**Walk type, what the helpers still derived** (2026-11-07, 19,338 programs, master `1b3572f1`).
+Six of the family's eleven helpers were already gone. The other five, against the walk type
+(`elabWalkNarrowedTy`, else `elabWalkTy`), 4,395 decisions:
+
+| helper | decisions (programs) | reading |
+|---|---|---|
+| `monoLamPinRetAnn` | 1,260 (637) | every annotation it writes is the elaboration's (`monoLamElabRet`) |
+| `monoHoleNodeTy` | 17 (9) | the elaboration first; its fallback, the recorded type, is open in all 17 |
+| `monoLamCallTy` | 782 (164) | the elaboration first; its fallback, the recorded type, is open in all 782 |
+| `monoNumOperandPinTy` | 1,577 (211) | the walk type agrees 1,484; both open 65; elab only 6; differ 22 |
+| `monoPinArmSubst` | 759 (243) | the walk type agrees 546; elab only 203; differ 10 |
+
+Every difference is a numeric literal operand. Mono typed the literal at its own `i32`, and the walk
+type gives the width its context widens it to (`i64`, `f64`, `f32`). Taking the walk type alone
+moves no byte over the 431 programs reaching the last two, so the widened width is the honest
+answer: mono's `i32` was re-widened downstream. `monoNumOperandPinTy` and the two `??` rebuilds
+(`monoPinCoalJoin`, `monoPinCoalListDefault`) now read the walk type (`monoClosedWalkTy`).
+`monoPinArmSubst` and `monoDropUnboundMembers` are deleted, and a hole instance's `??` with a list
+default whose left side has no closed walk type refuses loudly where the hole-binding substitution
+was; no program reaches it. The first three helpers already read the elaboration and stay.
+
 **Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
 elaboration has no type of its own for the node, and every caller composes its own narrowing with
 it. A fallback to the checker's closed type (#6556, closed) broke four `runs` cells:
