@@ -4270,7 +4270,9 @@ its target rows it runs. Over the corpus it moves 5: two invalid modules and thr
 So moving these rows needs two things beyond the binding:
 
 - a set type with the members' result, which `fnTagSetTy` does not give;
-- a callback lambda keyed by its element's set, not its spelling.
+- a callback lambda keyed by its element's set, not its spelling. This is the same problem as
+  the pin text the argument-pin arms carry (previous subsection: P10, B1 and B4 wait on the
+  naming rule): a spelling used as a key cannot carry what tells two values apart.
 
 #### Argument-keyed instances: design note (2026-11-07, for a ruling; nothing built)
 
