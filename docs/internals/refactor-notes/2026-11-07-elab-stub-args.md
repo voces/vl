@@ -53,7 +53,7 @@ helpers (`monoPrimeInert`, `monoInertStubTy`, `monoStubFnTy`, `monoBreaksTo`, `m
 and the shadow. That takes emit_mono from 943 to 937 functions; the pin-helper baseline is 937.
 Measured on master `b055cc92` (which includes PR 1) plus this change:
 
-- Seed: 6,476,942 bytes for the master fixpoint, 6,470,935 for the candidate (−6,007; the
+- Seed: 6,476,942 bytes for the master fixpoint, 6,472,375 for the candidate (−4,567; the
   shadow's code leaves with mono's copy).
 - Sweep: 23,610 same. No output movers, no bytes-only movers, 0 `runs → not-runs`.
 - D15494's witness (a refutation pin) grades `runs`, as filed.
