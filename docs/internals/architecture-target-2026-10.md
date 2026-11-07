@@ -2837,6 +2837,18 @@ the common case being `const f = m.get("k")` out of a closed map. A read of an o
 declines, which leaves generic functions stored in maps to D15494. A delivered bundle (reach) is the
 next source, so the elaboration gets no second composer for the same binding.
 
+**A binding's function set has one reader too: `elabBindingFnSet(d)`.** It is the set-valued twin of
+`elabBindingWholeTy`. The checker's `elabFnSetTy` is filled only from reads, and a `let`'s storage
+type is its initialiser read's type, so no write ever joins a binding's set (D4307). The fold
+takes every value written to the binding and unions their sets, and an `if` value contributes its
+arms' joined set. It answers `[]` ("any") as soon as one value carries no set: a closed lambda, a
+parameter, a call result. **A value's own identity narrows its set.** Structurally equal values
+share a type index and therefore a set, so every `(_) => void` hole lambda in a program shares one.
+The fold therefore narrows a name or a function literal to the one function it is (an instance's
+clone read as its source). An instance-clone binding is read at its source binding, because the
+write index is keyed at the generic's own body. The consumer is the written-let gate
+(`monoWrittenGenLetFrame`).
+
 **The second source, built from bundles: `elabWrittenBuiltTy`** (2026-11-07). It covers four
 kinds of value:
 - a call, through `elabCallBundleRet`, which answers with the bundle record the call's returned
