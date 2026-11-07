@@ -8,6 +8,12 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-07-slot-climb-callee-types](2026-11-07-slot-climb-callee-types.md): The elaboration records the callee types a literal slot's climb reaches; `monoReachSlotTy`/`monoReachLitTys` deleted (#6725).
+- [2026-11-07-bake-reads-keyed-callee](2026-11-07-bake-reads-keyed-callee.md): Identity typing consumer 1: `monoBakeCallback` reads the keyed callee at 1,472 decisions (#6726).
+- [2026-11-07-rep-facts-behind-mono-guards](2026-11-07-rep-facts-behind-mono-guards.md): The type is right, the rep disagrees: function-holding slots, and a lambda shared by instances (#6721).
+- [2026-11-07-pin-key-reads-column](2026-11-07-pin-key-reads-column.md): `monoKeyPinSeg` reads the pin-type column; the 4 type disagreements were the column's (#6722).
+- [2026-11-07-blocked-three-vs-identity](2026-11-07-blocked-three-vs-identity.md): Three blocked mono functions re-graded against identity typing; each named as a TYPE or REP fact (#6719).
+- [2026-11-07-step7-letinitcellkind](2026-11-07-step7-letinitcellkind.md): `letIsClosure` and `letIsUnion` deleted; `letIsStruct` waited on D15543 (#6714).
 - [2026-11-07-step7-post-mono-cols-from-recorded](2026-11-07-step7-post-mono-cols-from-recorded.md): Post-mono return columns read off the recorded result for 2,897 of 2,994 functions; the walk runs only for named missing-fact classes (#6716).
 - [2026-11-07-elab-stub-args](2026-11-07-elab-stub-args.md): The elaboration's own stub keys for uncalled hole-function arguments (D15494), shadowed 104 of 104 against mono's (#6715).
 - [2026-11-07-slot-climb-calls](2026-11-07-slot-climb-calls.md): The calls a literal slot's climb reaches, as an elaboration fact; mono no longer reads `vrCalls` (#6712).
