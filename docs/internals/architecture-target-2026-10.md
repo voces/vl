@@ -2906,9 +2906,14 @@ arms' joined set. It answers `[]` ("any") as soon as one value carries no set: a
 parameter, a call result. **A value's own identity narrows its set.** Structurally equal values
 share a type index and therefore a set, so every `(_) => void` hole lambda in a program shares one.
 The fold therefore narrows a name or a function literal to the one function it is (an instance's
-clone read as its source). An instance-clone binding is read at its source binding, because the
-write index is keyed at the generic's own body. The consumer is the written-let gate
-(`monoWrittenGenLetFrame`).
+clone read as its source). Three written values are read through to what they stand for:
+- a loop's or labelled block's value carrier (`$lv`), minted after the write index, is written
+  the loop's exits (`lvExitLoops`);
+- the checker's adapter lambda (D4892) is the function it adapts;
+- a name of a declared generic is that function, even where its read was minted without a set.
+
+An instance-clone binding is read at its source binding (#6633). The consumer is the written-let
+gate (`monoWrittenGenLetFrame`).
 
 **The second source, built from bundles: `elabWrittenBuiltTy`** (2026-11-07). It covers four
 kinds of value:
