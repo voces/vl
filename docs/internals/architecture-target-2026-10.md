@@ -55,7 +55,9 @@ both from blocked), so master reads 65 switched, 51 (c), 14 blocked, 12 parked a
 - call param: `monoBindSeededTyParams` (identity typing for function values, A), `monoArgPinTyIx` (a
   pin fact of its own after holes-close), `monoArgPinName` (the rep cascade), and `monoArgTyName`,
   `monoArgTyNameCascade`, `monoArgTyNameBound`, `monoArgTyNameProjected` and `monoArgTyNameRep`
-  (split-dep's one-producer redesign; the kept arms wait on the naming rule).
+  (split-dep's one-producer redesign; the kept arms wait on the naming rule). No decision reads an
+  instance pin's spelling any more (naming-rule slice 2a: `monoPinIsFnSig` deleted, `isNumRecvBaseName`
+  reads the pin type), so slice 2b can switch the names to `monoPinSpellOf`.
 
 **Parked at the census (12; 12 on master), each on a named question:**
 - `monoElabStubArgsPrime`: the stub half waits on D15494 (owner);
