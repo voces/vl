@@ -2339,9 +2339,9 @@ widening, sweep-proven with every mover named; a subclass that moves output is d
 
 **B2a: the planner's binding roots are the elaboration's** (2026-11-07). `monoFlowDeclVals` reads
 `mfrLitsOf`, and the let, parameter and return walkers are gone. A set holding anything but a
-container is unknown, except a function the binding's own walk reached through a map read
-(`mfrLitsDirectFn`): that is the value the walkers' map read gave, and dropping it lost six named
-programs. A `.slice()` copy mono rewrote holds its minted spread literal. Over the 7,538 sweep
+container is unknown, and **function roots are admitted only when the declaration's own walk reached
+them through a map read** (`mfrLitsDirectFn`): that is the value the walkers' map read gave, and
+dropping it lost six named programs, while a per-node mark admitted an alias of a stored function. A `.slice()` copy mono rewrote holds its minted spread literal. Over the 7,538 sweep
 programs against master's fixpoint: 0 runs lost, 0 outputs moved, 16 of 16 named programs run, and
 three move bytes with the same output. `hole-fn-record-relayed-to-param-field-call` (parameter `a`)
 and `generic-list-sliced-called-at-two-types` (`fs`) are class-3 container widenings, and
