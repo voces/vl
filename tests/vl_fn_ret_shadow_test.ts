@@ -644,7 +644,6 @@ const COL_REC = `function mk(n: i32) { { a: n, b: 2 } }
 print(mk(3).a)
 `;
 
-const COL_NO_ROW = "slot struct: recorded names no row, column does | mk=1";
 
 Deno.test({
   name: "fn-ret shadow: return columns",
@@ -663,8 +662,9 @@ Deno.test({
       COL_REC,
       DROP_NONE,
       true,
-      `post seed: kind struct vs i32 | mk=1; post settled: ${COL_NO_ROW}; ` +
-        `pre seed: kind struct vs i32 | mk=1; pre settled: ${COL_NO_ROW}`,
+      "post moved: moved: agree struct | mk=1; post seed: kind struct vs i32 | mk=1; " +
+        "post settled: agree struct | mk=1; pre seed: kind struct vs i32 | mk=1; " +
+        "pre settled: agree struct | mk=1",
       "col",
     );
     expectRows(
@@ -672,7 +672,8 @@ Deno.test({
       COL_REC,
       DROP_NOTHING,
       false,
-      "post seed: no result recorded=1; post settled: no result recorded=1; " +
+      "post moved: moved: no result recorded=1; " +
+        "post seed: no result recorded=1; post settled: no result recorded=1; " +
         "pre seed: no result recorded=1; pre settled: no result recorded=1",
       "col",
     );
@@ -681,7 +682,8 @@ Deno.test({
       COL_REC,
       DROP_AS_VOID,
       false,
-      "post seed: recorded void or never=1; post settled: recorded void or never=1; " +
+      "post moved: moved: recorded void or never=1; " +
+        "post seed: recorded void or never=1; post settled: recorded void or never=1; " +
         "pre seed: recorded void or never=1; pre settled: recorded void or never=1",
       "col",
     );
