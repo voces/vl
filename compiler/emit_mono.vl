@@ -671,6 +671,7 @@ import {
   elabCallBundleSigs,
   elabCallHandMember,
   elabCallHandOwner,
+  elabCallKeyBinding,
   elabCallParamKey,
   elabCallParamRowTy,
   elabCallParamTy,
@@ -2236,10 +2237,8 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
 function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
   const bp = monoBuildTyPin(cax)
   if bp != "" { return bp }
-  // A call argument whose callee has a concrete return annotation takes that annotation.
-  // Needed for a generic call used as an argument (`box(box(7))`): `buildFnMap` is
-  // post-mono, so `exprStruct` cannot classify the inner call and the type param would
-  // default to i32. The instance's already-substituted return annotation resolves it.
+  // A call argument whose callee has no return annotation takes the checker's inferred return:
+  // `buildFnMap` is post-mono, so nothing else classifies the inner call.
   const argN = nodeAt(unwrapParen(ix))
   if argN is Call && argN.callFn >= 0 {
     const argCallee = nodeAt(argN.callFn)
@@ -2256,22 +2255,7 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
       if acfe >= 0 {
         const acfn = nodeAt(fnStmts[acfe])
         if acfn is FuncDecl {
-          if acfn.fnRet >= 0 {
-            // The declared spelling again — this arm tells a concrete return from a
-            // parametric one, and a shadowed parameter reads as concrete once canon
-            // has resolved it.
-            const arn = monoDeclAnnName(
-              acfn.fnRet,
-              tyNameOf(acfn.fnRet),
-              acfn.fnTyParams,
-            )
-            if (
-              arn != ""
-              && !monoAnnHasTyParam(acfn.fnRet, -1, acfn.fnTyParams)
-            ) {
-              return arn
-            }
-          } else {
+          if acfn.fnRet < 0 {
             // An inferred return is as good a pin as an annotated one:
             // `inferRetNameOf` is the checker's own record, routed through
             // `monoAnnPinName` so the pin is one that ladder claims.
@@ -2412,18 +2396,6 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
 function monoArgClosedPin(ix: i32, fnIx: i32): string {
   const cax = unwrapParen(ix)
   if cax < 0 || cax >= P.nodes.length { return "" }
-  // A list or record literal the record solve built at another record pins at that build (D15181).
-  const lb = monoLitBuiltTy(cax)
-  if lb >= 0 { return monoRecordNominalPin(lb) }
-  // An argument its call's rep row binds at another record pins there, as elaboration keys it.
-  const rr = elabArgBuiltRep(cax, elabWalkTop())
-  if rr >= 0 { return monoRecordNominalPin(rr) }
-  // A call copied where it is delivered pins at the declared record its copy lands in (D15183).
-  const cpy = recCopyTyOf(cax)
-  if cpy >= 0 && cpy < T.tys.length {
-    const cn = monoRecordNominalPin(cpy)
-    if cn != "" { return cn }
-  }
   let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
   if t < 0 { t = elabArgBuiltTy(cax) }
   if t < 0 || t >= T.tys.length { return "" }
@@ -8338,20 +8310,6 @@ function monoConcreteObjTy(ty: i32): boolean {
   tyAt(ty) is TyObj && !tyHasTyVar(ty)
 }
 
-// Whether a record pin spelled by its fields binds argument type `arg` rather than `row`, the
-// first row of its layout: a layout keys a map field by its rep, so a later call's `Set<i32>`
-// field would read the first call's `{[i32]:i32}` from the row (D10520).
-function monoSpelledRecordLeavesRow(
-  spelling: string,
-  arg: i32,
-  row: i32,
-): boolean {
-  if spelling == "" || spelling[0] == "#"[0] || !monoConcreteObjTy(arg) {
-    return false
-  }
-  !tyHasTyVar(row) && !tySame(arg, row)
-}
-
 // A record type an instance binds in place of its anonymous row's own (see
 // `monoObjDiffersInFnFieldsOnly`), to the row's handle, so a pin spelled from it names that row.
 let monoFnFieldTwinRow: {[i32]: string} = Map()
@@ -9327,11 +9285,6 @@ function monoMakeInstanceParams(
       ) {
         pinTy = pinTys[pj]
         monoFnFieldTwinRow.set(pinTy, pinned[pj])
-      } else if (
-        anonTy >= 0
-        && monoSpelledRecordLeavesRow(pinned[pj], pinTys[pj], anonTy)
-      ) {
-        pinTy = pinTys[pj]
       }
       let isLit = pj < argLit.length && argLit[pj]
       const agree = anonRowKindsAgree(pinned[pj], pinTys[pj])
@@ -10470,20 +10423,35 @@ function monoMakeInstanceGo(
     )
     const letBN: string[] = k.exBN
     const letBT: i32[] = k.exBT
-    monoBindCols(
-      params,
-      monoDeclParamTys(origFe, params.length),
-      letTyCol,
-      letBN,
-      letBT,
-    )
-    monoNicheNulParamsCheck(params, pinned, k.tps, tvN, tvV, letBN, letBT)
-    monoShAliasBind(origFe, letBN, letBT)
-    monoShPendFlush(shAt)
     // The hole binding, made once: the return rungs, the body clone and the registry read it.
     const holeN: string[] = []
     const holeT: i32[] = []
-    monoHoleBinding(origFe, params, letTyCol, holeN, holeT)
+    // The binding is the call key's (`elabCallKeyBinding`). The rebuild below is the residue: a
+    // function-holding parameter, whose concrete rep the call key does not name (Fn#d's
+    // value-instance fact), and a literal or record binding (rowintern's row key, #6629).
+    const fromKey = elabCallKeyBinding(
+      callKey,
+      monoOrigNode[origFe],
+      params,
+      k.tps,
+      letBN,
+      letBT,
+      holeN,
+      holeT,
+    )
+    if !fromKey {
+      monoBindCols(
+        params,
+        monoDeclParamTys(origFe, params.length),
+        letTyCol,
+        letBN,
+        letBT,
+      )
+    }
+    monoNicheNulParamsCheck(params, pinned, k.tps, tvN, tvV, letBN, letBT)
+    monoShAliasBind(origFe, letBN, letBT)
+    monoShPendFlush(shAt)
+    if !fromKey { monoHoleBinding(origFe, params, letTyCol, holeN, holeT) }
     // The worklist instance this one is: demanded here, its body checked once at this binding.
     const ekN0: string[] = []
     const ekT0: i32[] = []
@@ -15405,26 +15373,20 @@ function monoClosedReadTy(vx: i32, ctx: i32, rec: boolean): i32 {
 }
 
 // The closed type value `v` of a record field takes in frame `ctx`, where a literal's closed
-// bindings or the closed binding it reads close it (those reads recorded when `rec`): the
-// elaboration's type, else the checker's, where it closes, else that derivation's. -1 otherwise.
+// bindings or the closed binding it reads close it (those reads recorded when `rec`), -1
+// otherwise. Mono's own derivation: no elaboration fact answers it yet (architecture §3.4).
 function monoClosedFieldValTy(v: i32, ctx: i32, rec: boolean): i32 {
   if v < 0 { return -1 }
   const vx = unwrapParen(v)
   if vx < 0 || vx >= P.nodes.length { return -1 }
-  let r = -1
   if nodeAt(vx) is ObjLit {
-    r = monoClosedObjLitTy(vx, ctx, rec)
-    if r < 0 {
-      const ot = nodeTyIxOf(vx)
-      r = if monoTyOpen(ot) { -1 } else { ot }
-    }
-  } else {
-    r = monoClosedReadTy(vx, ctx, rec)
+    const lt = monoClosedObjLitTy(vx, ctx, rec)
+    if lt >= 0 { return lt }
+    const ot = nodeTyIxOf(vx)
+    if monoTyOpen(ot) { return -1 }
+    return ot
   }
-  if r < 0 { return -1 }
-  const ea = elabNodeTyAt(vx, ctx)
-  const et = if ea >= 0 { ea } else { nodeTyIxOf(vx) }
-  if et >= 0 && et < T.tys.length && !monoTyOpen(et) { et } else { r }
+  monoClosedReadTy(vx, ctx, rec)
 }
 
 // The type record literal `lx` in frame `ctx` takes from the closed bindings its open fields read,
@@ -19211,17 +19173,23 @@ function monoPreBindPastUnionRest(
   0
 }
 
-// The pin name of argument `ax` for the pre-bind: a bare `null` names no type a parameter could
-// bind from, whatever its default pin.
+// The pin name of argument `ax` for the pre-bind: a bare `null` names its checked type, which no
+// parameter could bind from, whatever its default pin.
 function monoPreBindArgName(ax: i32, ctx: i32): string {
-  if nodeAt(unwrapParen(ax)) is NullLit { return "null" }
+  const x = unwrapParen(ax)
+  if x >= 0 && x < P.nodes.length && nodeAt(x) is NullLit {
+    return tyToStr(nodeTyIxOf(x))
+  }
   monoArgPinName(ax, ctx)
 }
 
 // The pinned type of argument `ax` for the pre-bind, read inside function `ctx`: a bare `null`
-// is the null type, whatever its recorded pin.
+// is its checked type, whatever its recorded pin.
 function monoPreBindArgTy(ax: i32, ctx: i32): i32 {
-  if nodeAt(unwrapParen(ax)) is NullLit { return TY_NULL }
+  const x = unwrapParen(ax)
+  if x >= 0 && x < P.nodes.length && nodeAt(x) is NullLit {
+    return nodeTyIxOf(x)
+  }
   monoPinSubTyOf(monoArgPinTyIx(ax, ctx), ctx)
 }
 
