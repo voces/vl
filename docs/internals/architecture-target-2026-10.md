@@ -2617,7 +2617,8 @@ kinds of value:
 
 The reach rows holding the bundles are written by `elabReachRows`, after `elabRun`'s `elabSlotFacts`.
 So `elabSlotBundleFacts` re-runs the same reader there, for program-level holders still without a
-fact, and never overwrites one.
+fact, and never overwrites one. That timing is why the binding reader runs twice. The bundle source
+cannot answer in `elabSlotFacts`, so folding the two runs into one loses all 14.
 
 Over master `fd7ef721`'s 21 `monoBindingAdoptInit` decisions holding a bundle record, all at program
 level in seven programs (the five `closures/bundle-record-*.vl` tests, D15323 and D15324),
