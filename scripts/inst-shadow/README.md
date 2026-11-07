@@ -5,7 +5,7 @@ holds, at every call `monoInstantiateCallIn` instances. For each call it compare
 types of the instance the call made or hit (`monoInstParamPinTys`) with
 `callArgRepTy(ix, i, elabCallParamTy(ix, i))`. A call that `monoWalkIdentCall` did not hand on is
 marked `*` after its line number. This is the instrument the instance choice is graded with
-(architecture-target-2026-10.md §3.4): the order of elaboration sources mono reads, then the named
+(docs/internals/refactor-notes/2026-11-06-emit-mono-queue-shadows.md): the order of elaboration sources mono reads, then the named
 fallback tail, then a loud refusal no corpus program reaches.
 
 ```sh

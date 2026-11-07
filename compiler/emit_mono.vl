@@ -14841,23 +14841,6 @@ function monoClosedReadTy(vx: i32, ctx: i32, rec: boolean): i32 {
   bt
 }
 
-// The closed type value `v` of a record field takes in frame `ctx`, where a literal's closed
-// bindings or the closed binding it reads close it (those reads recorded when `rec`), -1
-// otherwise. Mono's own derivation: no elaboration fact answers it yet (architecture §3.4).
-function monoClosedFieldValTy(v: i32, ctx: i32, rec: boolean): i32 {
-  if v < 0 { return -1 }
-  const vx = unwrapParen(v)
-  if vx < 0 || vx >= P.nodes.length { return -1 }
-  if nodeAt(vx) is ObjLit {
-    const lt = monoClosedObjLitTy(vx, ctx, rec)
-    if lt >= 0 { return lt }
-    const ot = nodeTyIxOf(vx)
-    if monoTyOpen(ot) { return -1 }
-    return ot
-  }
-  monoClosedReadTy(vx, ctx, rec)
-}
-
 // The type record literal `lx` in frame `ctx` takes from the closed bindings its open fields read,
 // nested literals included, recorded on it (and on them) when `rec`; -1 when no field reads one.
 function monoClosedObjLitTy(lx: i32, ctx: i32, rec: boolean): i32 {
@@ -15449,16 +15432,49 @@ function monoPinStoredRecords(
       && fty < T.tys.length
       && !(tyAt(fty) is TyFunc)
     ) {
-      // A field reading a closed binding, or a record literal of them, takes its type (D9183).
+      // A field the elaboration closes takes its slot fact, recorded on each stored value (D9183).
       const fvals = monoMapStoredFields(stored, name)
       if fvals.length != stored.length { return -1 }
-      fty = -1
+      const fpath: string[] = []
+      for p in path { fpath.push(p) }
+      fpath.push("f." + name)
+      fty = elabSlotTyAt(lf[1], fpath, lf[0])
+      if fty < 0 || fty >= T.tys.length || monoTyOpen(fty) { return -1 }
       for fv in fvals {
-        const t = monoClosedFieldValTy(fv[0], fv[1], false)
-        if t < 0 || (fty >= 0 && !tyEq(fty, t)) { return -1 }
-        fty = t
+        // Walk state: a value reading a binding whose rep is not yet closed at this point of the
+        // walk waits for it; the fact names the type, not the binding's rep (D9183).
+        const vx = unwrapParen(fv[0])
+        const reads: i32[] = []
+        if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is Ident {
+          reads.push(vx)
+        }
+        const vl = if vx >= 0 && vx < P.nodes.length { nodeAt(vx) } else { null }
+        if vl is ObjLit {
+          for fi in vl.objFields {
+            const f = nodeAt(fi)
+            const fx = if f is FieldInit { unwrapParen(f.fiValue) } else { -1 }
+            if fx >= 0 && fx < P.nodes.length && nodeAt(fx) is ObjLit {
+              return -1
+            }
+            if fx >= 0 && fx < P.nodes.length && nodeAt(fx) is Ident {
+              reads.push(fx)
+            }
+          }
+        }
+        for rx in reads {
+          const bd = monoReadLetFrame(rx, fv[1])[1]
+          const b = if bd >= 0 { nodeAt(bd) } else { null }
+          if (
+            b is LetDecl
+            && monoTyOpen(
+              nodeTyIxOf(if b.letType >= 0 { b.letType } else { b.letInit }),
+            )
+          ) {
+            return -1
+          }
+        }
+        recVals.push([fv[0], fv[1], fty])
       }
-      for fv in fvals { recVals.push(fv) }
     } else if monoTyOpen(fty) {
       if fty < 0 || fty >= T.tys.length { return -1 }
       const fvals = monoMapStoredFields(stored, name)
@@ -15478,7 +15494,14 @@ function monoPinStoredRecords(
     k = k + 1
   }
   spell.push(vs + "}")
-  for fv in recVals { monoClosedFieldValTy(fv[0], fv[1], true) }
+  for fv in recVals {
+    const vx = unwrapParen(fv[0])
+    if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is ObjLit {
+      monoRecordObjLitAt(vx, fv[2], fv[1])
+    } else if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is Ident {
+      nodeTyRecord(vx, fv[2])
+    }
+  }
   for ll in listLits { monoRecordOpen(ll[0], ll[1], ll[2]) }
   // The record's type is the elaboration's slot fact; a map whose generic is called at two
   // signatures has none, and keeps the type its fields give (D15494).
