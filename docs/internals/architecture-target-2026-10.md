@@ -2278,6 +2278,14 @@ field program, `generics/nested-capture-per-pin-binding.vl`, now takes the fact 
 with the same bytes. The four elab-only maps are ones where `monoPinMapSlot` declines first, so nothing
 changes. Over 19,316 programs no byte moves, and 4,605 filed witnesses grade as filed.
 
+**Slot type, a map of nested function lists** (2026-11-07). `monoPinMapNestedFnLists` was held by
+one program, its own fixture `closures/hole-fn-nested-list-map-value.vl`. There the elaboration
+already has the map's whole fact, `{[string]: ((i32) => i32)[][]}`, and the leaf fact agrees with
+mono's pin. `monoPinMapSlot` now types a list of lists of functions from the whole fact and records
+the inner literals at it. A map of that shape without a closed fact is a loud refusal, which no
+program reaches. The stored values need no instancing of their own here, because their deliveries
+already instance them. The fixture prints the same, and over 19,316 programs no byte moves.
+
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
 and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
