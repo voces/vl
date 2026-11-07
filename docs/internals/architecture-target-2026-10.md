@@ -2062,6 +2062,38 @@ The same answers also spell the same. What each of the 15 comes to:
   elaboration.
 - **Parked:** `monoReachLitTys`, with `monoReachSlotTy`.
 
+**Written-let gate and type, measured** (2026-11-07, 23,456 programs).
+
+The gate, `monoWrittenGenLetFrame`, was shadowed against `elabBindingFnSet(d)`, read before the
+walk retypes the values the set is read from. Its first reading (109 of 112) was taken after the
+walk and is void. On split-dep's #6631 head, every one of 112 decisions agrees:
+
+| mono | elaboration | decisions | files |
+|---|---|---|---|
+| needs instancing | every member a named `monoIsGenericDecl` function | 40 | 10 |
+| no | empty, a lambda, or a non-generic member | 72 | 29 |
+
+- **Switched in #6631:** the gate reads one snapshot of that set, taken before the walk. Hole
+  functions count, as `monoIsGenericDecl` admits them. `monoArmWrittenLetSeed` reads the
+  switched gate.
+- **Deleted:** `monoLetSeedGenFe`, `monoListElemGenFe` and `monoValueNamesGenOrInst`.
+
+The type, `monoCoerceWrittenLetTys`, was shadowed against the per-read fact `elabSlotDeliveries`.
+The slot fact is the wrong reference: a written `let` of generics has no one closed type.
+
+| site | agree | parameters agree, result differs | no elaboration answer |
+|---|---|---|---|
+| delivery (115) | 85, + 15 one of two | 14 | 1 |
+| by call (51) | 25 | 0 | 26 |
+
+- **Result-only differences are not a defect.** The by-call site spells the binding's signature
+  with an unpinned `void` result and takes the call's own result. Its parameters come from
+  `monoDeclPathPins` and agree.
+- **Blocked on Fn#d's scoping note** (the concrete rep of a function-holding value at a site): the
+  27 with no answer. Each signature takes a hole function as a parameter, which no closed delivery
+  carries; D5841 and D6480 are among them. Once that fact exists, all four callers that pass
+  `tname` switch together.
+
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
 read. A decision is a pin a function returns, a type it returns or records, or a gate choosing
@@ -2457,6 +2489,80 @@ Like D15494, it waits on a design answer, not a lane.
 every function value its singleton `Fn#d`, but the checker gives one only to the values whose sets it
 tracks. Argument-keyed instances are its first client: 1,500 of 1,573 specialized arguments have no
 set (measured under the canonical instance key below).
+
+**The function-holding fact, scoped** (2026-11-07, Fn#d, master `72b31030`, the full population).
+The concrete rep a function-holding value takes at a site blocks four queues: node type's holders
+(Fn#d's 8 and `monoLetWriteRhsTyRec`), lane F's instance bindings, `monoBindSeededTyParams`, and the
+written-let call signatures with a hole-function argument (`monoCoerceWrittenLetTys`). One probe
+wrapped every such mono decision and asked what the elaboration can say there today:
+- the checker's closed node type (#6556);
+- `elabNodeTyAt`;
+- the slot fact;
+- the written-value leaf;
+- whether every member of the value's `Fn#d` set already has an instance at mono's signature.
+
+| class | decisions |
+|---|---|
+| not blocked: the elaboration's node type, or the checker's closed type, agrees | 734 |
+| (i) the slot fact answers | 40 |
+| (i) the returned-literal reader answers (`elabRetFnListLitTy`) | 3 |
+| (i) every member already has the instance; the site is not linked to it | 201 |
+| (i) one member, several instances; the link is by the call the read reaches | 11 |
+| (i) an adopted binding (`monoBindingAdoptInit`): see the family table below | 234 |
+| (ii) needs identity typing | 1 |
+| (iii) other | 6 |
+| not reached by the probe (D6480, `hole-lambda-forwarded-to-unread-hole-param`) | 2 |
+
+So identity typing is not the prerequisite for this population; one fact is.
+- **The fact:** `elabValueInstKey(x, k)`, the member instance or instances the elaboration made for
+  function-holding value `x` read under instance `k`. Its closed signature is the concrete rep.
+- **Key:** the value node and the instance key it is read under.
+- **Readers:** `elabWalkKeyOf(x, false, decl)` already reads the table it extends.
+- **Producer:** `elabValueKeyNote`, which today notes function-value arguments and named list
+  callbacks. It is written where the elaboration itself instances a member through the value: a call
+  through a binding, element or field (`elabValCalls`), the callee's calls of a hole-function
+  argument, a list element called. It is never written by searching for an instance whose signature
+  matches mono's, which would derive the fact from mono.
+- **The adopted bindings close through four sources, none of them the initialiser's checked type.**
+  That type is closed only after mono's walk re-records it: at elaboration every one of the 234
+  initialisers carries the binding's own open type, `(T) => T` or `((_) => _) | null`. A fourth
+  `elabWrittenValueTy` leaf reading it was built and measured as a no-op (234 of 234 unchanged), and
+  was not landed. 82 of the 234 already close at elaboration. The other 130, by the initialiser's
+  shape:
+
+  | decisions | initialiser | source that closes it | lane |
+  |---|---|---|---|
+  | 30 | `Map()` filled later by `.set` | deliveries into the element path (`elabSlotDeliveries(d, ["v"])`) | split-dep |
+  | 24 | a list literal, mostly a captured cell `[λ]` | deliveries to the element: the calls through the cell | split-dep |
+  | 10 | an `if` choice of hole functions | the binding's own slot calls | split-dep |
+  | 31 | a map read, its value path open | the map-value or held fact | lane F |
+  | 3 | `??` over a map read | the map-value or held fact, joined with the default | lane F |
+  | 12 | a call returning a generic function value | the call-instance signature (`elabValueInstKey`) | Fn#d |
+  | 6 | a record literal of generic or hole function fields | the call-instance signature per field | Fn#d |
+  | 14 | a field or element read of a holder whose slot fact is closed | none missing: the binding is not visited. 11 are emit-minted after `elabSlotFacts`, 3 are record-typed outside its gate | reach (`elabSlotBundleFacts`) |
+
+  The deliveries row keeps two controls declining: `closures/hole-fn-if-to-hole-param.vl`'s `x`,
+  handed on and never called, and the D10384 shape. A named generic held as a map value stays
+  D15494's.
+- **(ii):** `closures/listed-hole-fn-escaping-list.vl`. A generic held in a list by identity is called
+  at two types, so the list's one concrete rep is mono's choice. It is D15010's signature twin, parked
+  in this section.
+- **Not reached (2):** neither decision gets to a probed site.
+  - D6480 refuses first, at `monoWalkIdentCall`'s `monoGenArgAtOpenParam` gate. A call through
+    the alias `k` of a written `let` holding a hole lambda has no lambda for `monoAliasLetLamFe`
+    to return. That gate is the hook that would see it, and it reads the same fact through the
+    alias.
+  - `functions/hole-lambda-forwarded-to-unread-hole-param.vl` takes the unread parameter's
+    default (`holeParamUnreadIn`, D6191). No call instances the lambda, so no producer writes the
+    fact, and the default stays the checker's.
+- **(iii):**
+  - five uncalled members, the inert-stub (c) cells `monoInertParamStubPin` carries (D6910 and its
+    pair) and two uncalled list members;
+  - D9020's relay of an un-annotated function's `i32` at an `f64` function type. In
+    `[1, 2, 3].map(f)`, with `f` annotated `(a: i32) => f64`, the checker's type and the slot fact
+    both differ from the callback signature mono derives (`monoValueRetAt`'s `(i32) => i32`). The
+    program runs because the value converts at its annotated binding. The outlier is mono's own
+    derivation, not a reader.
 
 **The unbound default, measured** (2026-11-07, master `75101d46`). The D4551 default is the
 elaboration's: `ELAB_TP_DEFAULT` and `elabTpDefaulted` (#6569), after its call reach was made to
@@ -2959,6 +3065,23 @@ read (`slotOfRead`) of a different holder with a closed `elabSlotTyAtKey` fact a
 the common case being `const f = m.get("k")` out of a closed map. A read of an open holder
 declines, which leaves generic functions stored in maps to D15494. A delivered bundle (reach) is the
 next source, so the elaboration gets no second composer for the same binding.
+
+**A binding's function set has one reader too: `elabBindingFnSet(d)`.** It is the set-valued twin of
+`elabBindingWholeTy`. The checker's `elabFnSetTy` is filled only from reads, and a `let`'s storage
+type is its initialiser read's type, so no write ever joins a binding's set (D4307). The fold
+takes every value written to the binding and unions their sets, and an `if` value contributes its
+arms' joined set. It answers `[]` ("any") as soon as one value carries no set: a closed lambda, a
+parameter, a call result. **A value's own identity narrows its set.** Structurally equal values
+share a type index and therefore a set, so every `(_) => void` hole lambda in a program shares one.
+The fold therefore narrows a name or a function literal to the one function it is (an instance's
+clone read as its source). Three written values are read through to what they stand for:
+- a loop's or labelled block's value carrier (`$lv`), minted after the write index, is written
+  the loop's exits (`lvExitLoops`);
+- the checker's adapter lambda (D4892) is the function it adapts;
+- a name of a declared generic is that function, even where its read was minted without a set.
+
+An instance-clone binding is read at its source binding (#6633). The consumer is the written-let
+gate (`monoWrittenGenLetFrame`).
 
 **The second source, built from bundles: `elabWrittenBuiltTy`** (2026-11-07). It covers four
 kinds of value:
