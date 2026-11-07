@@ -1,4 +1,4 @@
-// The architecture's pin and position layer (architecture-target-2026-10.md §4.1, the
+// The architecture's pin and position layer (architecture-target-2026-10.md §4, the
 // "special-case helpers (a)" row) is meant to shrink to nothing as the elaboration
 // takes over. Between 2026-10-25 and 2026-11-04 it grew from 1,516 to 1,571 functions
 // while its replacement was built beside it, because nothing graded it. This holds the
