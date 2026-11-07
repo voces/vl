@@ -5963,6 +5963,75 @@ function monoHoleNodeTy(ix: i32, t: i32): i32 {
   if e >= 0 { e } else { t }
 }
 
+// Whether call key `callKey` types every parameter of `params` closed, holding no function.
+function monoCallKeyTypesParams(callKey: i32, params: i32[]): boolean {
+  if callKey < 0 || callKey >= ekNames.length || callKey >= ekTys.length {
+    return false
+  }
+  for p in params {
+    const t = elabNodeTy(p, callKey)
+    if (
+      t < 0
+      || t >= T.tys.length
+      || tyHasTyVar(t)
+      || tyReachesHole(t, 16)
+      || tyMayHoldFn(t, 0)
+    ) {
+      return false
+    }
+  }
+  true
+}
+
+// Call key `callKey`'s binding split as the rebuild splits it: a type parameter of `tps` not
+// already in `bN` onto `bN`/`bT`, and a hole an un-annotated parameter of the generic at
+// `origFe` names onto `hN`/`hT`.
+function monoCallKeyBinding(
+  callKey: i32,
+  origFe: i32,
+  params: i32[],
+  tps: string[],
+  bN: string[],
+  bT: i32[],
+  hN: string[],
+  hT: i32[],
+) {
+  const ftIx = if origFe >= 0 && origFe < monoOrigNode.length { nodeTyIxOf(monoOrigNode[origFe]) } else { -1 }
+  const ft = if ftIx >= 0 && ftIx < T.tys.length { tyAt(ftIx) } else { tyAt(0) }
+  let i = 0
+  while i < ekNames[callKey].length && i < ekTys[callKey].length {
+    const nm = ekNames[callKey][i]
+    const t = ekTys[callKey][i]
+    if strListHas(tps, nm) {
+      if !strListHas(bN, nm) {
+        bN.push(nm)
+        bT.push(t)
+      }
+    } else if ft is TyFunc && !strListHas(hN, nm) {
+      let j = 0
+      let holed = false
+      while j < params.length && j < ft.fnParamTypes.length {
+        const pp = nodeAt(params[j])
+        if pp is Param {
+          if (
+            pp.parType < 0
+            && tyMentionsTyVarNamed(ft.fnParamTypes[j], nm, 16)
+          ) {
+            holed = true
+          }
+        }
+        j = j + 1
+      }
+      if holed {
+        hN.push(nm)
+        hT.push(t)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Binds, into `hN`/`hT`, each hole parameter of the generic at `origFe` to its column in
 // `tyCol`: the one hole binding an instance makes, read by its return rungs and body clone.
 function monoHoleBinding(
@@ -10469,20 +10538,37 @@ function monoMakeInstanceGo(
     )
     const letBN: string[] = k.exBN
     const letBT: i32[] = k.exBT
-    monoBindCols(
-      params,
-      monoDeclParamTys(origFe, params.length),
-      letTyCol,
-      letBN,
-      letBT,
-    )
-    monoNicheNulParamsCheck(params, pinned, k.tps, tvN, tvV, letBN, letBT)
-    monoShAliasBind(origFe, letBN, letBT)
-    monoShPendFlush(shAt)
     // The hole binding, made once: the return rungs, the body clone and the registry read it.
     const holeN: string[] = []
     const holeT: i32[] = []
-    monoHoleBinding(origFe, params, letTyCol, holeN, holeT)
+    // The binding is the call key's where it types every parameter closed and holds no function;
+    // a function-holding parameter keeps the rebuild, which picks its concrete rep (Fn#d's
+    // value-instance question).
+    const fromKey = monoCallKeyTypesParams(callKey, params)
+    if fromKey {
+      monoCallKeyBinding(
+        callKey,
+        origFe,
+        params,
+        k.tps,
+        letBN,
+        letBT,
+        holeN,
+        holeT,
+      )
+    } else {
+      monoBindCols(
+        params,
+        monoDeclParamTys(origFe, params.length),
+        letTyCol,
+        letBN,
+        letBT,
+      )
+    }
+    monoNicheNulParamsCheck(params, pinned, k.tps, tvN, tvV, letBN, letBT)
+    monoShAliasBind(origFe, letBN, letBT)
+    monoShPendFlush(shAt)
+    if !fromKey { monoHoleBinding(origFe, params, letTyCol, holeN, holeT) }
     // The worklist instance this one is: demanded here, its body checked once at this binding.
     const ekN0: string[] = []
     const ekT0: i32[] = []
