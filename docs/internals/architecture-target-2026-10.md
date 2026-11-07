@@ -2173,6 +2173,15 @@ and each call site reaches its own signature, so their one-signature spelling is
 default supplies. Both run today, and both wait on a design answer, not a lane: what the elaboration
 says for an open slot called at two signatures.
 
+**Open design question beside it: argument-keyed instances.** The elaboration keys an instance by
+its closed type arguments. Mono also specializes a function per function value it is handed. The
+elaboration has no key for such an instance, so it can resolve no call through that function's
+parameter. This is the root of both populations the instance-choice comparison leaves to one side:
+- the 1,052 mono-only calls (mono-owned callback specialization, below);
+- the 2,079 elab-only calls declined under ruling (a).
+
+Like D15494, it waits on a design answer, not a lane.
+
 **The unbound default, measured** (2026-11-07, master `75101d46`). The D4551 default is the
 elaboration's: `ELAB_TP_DEFAULT` and `elabTpDefaulted` (#6569), after its call reach was made to
 see into callees before collect runs (#6563). The uncalled slots already read it
@@ -2699,13 +2708,11 @@ held function's escape elsewhere (`fnEscapes`, a fact about the function) does n
 `closures/hole-fn-generic-map-stored-through-parameter.vl`, `id` stored into the annotated map `e`
 must not make map `a`'s record slot called. Plain `elabSlotUncalled` is unchanged. This replaces
 `monoValsInert` at the pushed list (D9441), the nested list (D9711) and the stored slot, and with it
-the as-written inert map site no longer decides a slot. `monoInertValues` remains a writer-only
-record for its other readers: `monoNamesUsedAsValue`, `monoSpreadHostInert`, `monoStubValueOk`
-(emit_state), `emitIdentNonLocalRead` and `stmtIsBareFnName` (wasmEmit).
+the as-written inert map site no longer decides a slot.
 
 **The reach index's inert answer is asked at query time** (2026-11-07). The five readers ask
-`vrValueInert`, which is `monoInertValues` or `vrInert(x, "")` against the "mono" index. The
-second half covers a read the index holds that the monomorphizer took as naming a generic
+`vrValueInert` (or `elabValueSlotUncalled`, below), and its index half is `vrInert(x, "")`
+against the "mono" index. That half covers a read the index holds that the monomorphizer took as naming a generic
 function when it indexed it (`vrNoteGenericCand`), and a clone copy takes its original's note.
 Two facts are read as the index saw them, because a later rewrite changes them in place. A
 binding's annotation is read that way: the monomorphizer annotates un-annotated bindings, and
@@ -2729,19 +2736,39 @@ next fact that needs an elaboration twin. It is not `elabSlotUncalled`. "Reaches
 half of it. The other half, "nothing observes its signature", is something `value_reach` answers
 and the elaboration does not.
 
-The other shares of `monoInertValues` are listed below with their sources:
-- the flow leaf (`monoFlowNoteInertLeaf`, 316 decisions) and the uncalled list slot
-  (`monoUncalledSlotFnTy`, 23) move to a node → (binding, path) map and
-  `elabSlotUncalledOmitting`;
-- the call returns (`monoFlowNoteCallRets`, 8) move to the function's return slot;
-- the held-value coerce (`monoHeldValueAt`, 50, stub only) keeps its source in the coerced pin.
-  That pin closes the value, so the value is live to `value_reach` in all 50, and it is not
-  forced into `value_reach`.
+**`monoInertValues` is deleted; each share answers from its own source** (2026-11-07). A per-writer
+census over 23,456 programs found the leaf mark is per value and the slot fact per slot. 40 leaf
+values sit in a slot that is called, such as D10024's spread copy, and 105 sit in no binding slot.
+So the shares split by where the fact comes from. The five readers ask
+`vrValueInert(x) || elabValueSlotUncalled(x)`. The sources:
+- **Uncalled slot (67 decisions).** `monoUncalledSlotFnTy` runs only under an `elabSlotUncalled`
+  answer. It notes each value it builds with its slot (`elabValueSlotNote`), and
+  `elabValueSlotUncalled` asks `elabSlotUncalledOmitting` of that slot when read. There is no copy
+  in mono.
+- **The flow rewrite's own output (leaf 440, call returns 8): `mfrInertValues`.** These are the
+  values every delivering read of which `monoFlowReads` redirected to their generic. That is a fact
+  about mono's own transformation, which the elaboration does not see. It is read only for
+  inertness. A reader that used it to choose a type would be a decision leaking back into mono.
+- **A pin that closes the value: `monoHeldInert` and `monoArgInert`.** `monoHeldValueAt` coerces a
+  held value at its pin (89 decisions, stub only), and an inert parameter's argument is pinned at
+  its stub (6). The pin is the source, and `value_reach` reads these values as live.
+
+A clone copy takes its original's entry in each of them.
 
 **Clone to source is `elabSrcDecl`.** Mono's instance choice is compared with the elaboration's
 after mapping each lambda clone through `elabSrcDecl`. That mapping brings D3928's 21 differing
 decisions to agree. `nodeSrc`, `declOrigOf` and `lfOriginOf` do not link an instance body's lambda
 copies.
+
+**Mono-owned: callback specialization's direct calls** (2026-11-07). `monoWalkIdentCall`'s
+instance choice was compared with the elaboration over 23,456 programs: 122,691 decisions agree.
+2,079 are elab-only and stay `call_ref` under ruling (a). 1,052 are mono-only: 698 concrete and 354
+generic. In every mono-only call the callee is a parameter or a parameter's element (D10163's `f()`,
+D10320's `a[1](z, 2)`), which mono makes direct by specializing the enclosing function per argument.
+The checker resolves none of them. The identity type `elabFnSetOf(elabNodeTyAt(callee, ctx))` names
+mono's callee in 4. In 940 the call sits in a callback-specialized instance that has no elaboration
+key, because the elaboration keys instances by types, not argument values. So this choice is mono's
+own, a class (c) fact. An elaboration twin would need argument-keyed instances.
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
