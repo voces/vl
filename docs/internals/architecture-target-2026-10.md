@@ -2369,6 +2369,9 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   happens in 6 programs, the same literals-at-two-types the hub's regression cells name, and its
   refusal is reached by none. It is class (c) mechanics over mono's own instance registry, and
   goes with that registry, not with a fact.
+  The signature it pins at is the elaboration's (#6678), and it keeps the destination's spelling
+  wherever the parameter types agree, because the registry keys a literal's instances by spelling:
+  respelling `(f64)=>f64` as `(f64) => f64` split one literal into two instances (8 outputs, 1 build).
   **Grading a shadow.** A row agrees only when the two types are `tySame`. The spelling goes in
   a column of its own. Two types can print alike and still differ (a record built at one row and
   bound at another, as in D14426), and the same type can be spelled two ways (union row order, a
