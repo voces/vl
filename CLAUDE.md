@@ -3,6 +3,9 @@
 Repo-wide instructions. Subsystem detail lives in `docs/internals/`; `ROADMAP.md` owns the
 forward plan, `CHANGELOG.md` the shipped work, `DECISIONS.md` the non-obvious rationale.
 
+A refactor measurement goes in a new dated file under `docs/internals/refactor-notes/`, never into
+`architecture-target-2026-10.md`; the PR that moves a migration step updates that doc's status section.
+
 ## `std:*` changes get a second pass — required
 
 **Any change that adds or alters an export in `std/*.vl` MUST be reviewed by the
@@ -88,6 +91,8 @@ each row's contended elapsed, CPU is its own user+sys, so a row that is slow and
 merely starved (WALL >> CPU) can be told apart. A merge gate that takes longer than a coffee
 stops being run, so treat ~90 s as the budget it has to keep — if a gate is added that pushes
 the wall past a couple of minutes, the gate is what needs rethinking, not the budget.
+
+**The proof sweep is `scripts/sweep.vl`; CI runs it on the `sweep` label** (`scripts/sweep.md`).
 
 The parts, and what each is for:
 

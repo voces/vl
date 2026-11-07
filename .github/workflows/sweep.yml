@@ -1,0 +1,250 @@
+# The proof sweep (scripts/sweep.md): build the fixpoint seed of a BASE and a HEAD commit,
+# record what each does with every program of the population across a matrix of runners,
+# and diff the two recordings. The population, and the sweep tool itself, come from HEAD;
+# each side compiles with its own host binary, seed and `std/`.
+#
+# Run it by adding the `sweep` label to a pull request (it re-runs on every push while the
+# label is on, against the merge-base with the PR's base branch), or by hand:
+#   gh workflow run sweep.yml -f base_ref=master -f head_ref=<branch or sha>
+name: Sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Base commit, branch or tag (compared as given)"
+        default: master
+        required: true
+      head_ref:
+        description: "Candidate commit, branch or tag"
+        required: true
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sweep-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+# The same pinned feature level as ci.yml, so a seed sidecar cached there loads here.
+env:
+  VL_ISA: x86-64-v3
+
+jobs:
+  plan:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'sweep')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      base: ${{ steps.refs.outputs.base }}
+      head: ${{ steps.refs.outputs.head }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Resolve the two commits
+        id: refs
+        run: |
+          sha() { git rev-parse --verify -q "origin/$1^{commit}" || git rev-parse --verify "$1^{commit}"; }
+          if [ "$EVENT" = pull_request ]; then
+            head=$PR_HEAD
+            base=$(git merge-base "origin/$PR_BASE" "$head")
+          else
+            head=$(sha "$HEAD_REF")
+            base=$(sha "$BASE_REF")
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "sweep: base $base, head $head"
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ inputs.head_ref }}
+          BASE_REF: ${{ inputs.base_ref }}
+
+  # One side's toolchain: the host binary, the proven fixpoint seed with its sidecars, and
+  # `std/`, packed as artifact `sweep-side-<side>`. Keys and caches are ci.yml's `seed` job's,
+  # so a commit CI already built restores both and proves out in one self-compile.
+  seed:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [base, head]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.side == 'base' && needs.plan.outputs.base || needs.plan.outputs.head }}
+
+      - name: Cache keys
+        id: keys
+        run: |
+          echo "bin=vl-bin-${{ runner.os }}-$(rustc -V | tr ' ' '_')-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**', 'compiler/check_intrinsics.vl') }}" >> "$GITHUB_OUTPUT"
+          echo "seed=vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/src/**', 'scripts/warm-seed.sh') }}" >> "$GITHUB_OUTPUT"
+          echo "rustc=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache vl-host binary
+        id: vlbin
+        uses: actions/cache@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ steps.keys.outputs.bin }}
+
+      - name: Cache cargo + vl-host target
+        if: steps.vlbin.outputs.cache-hit != 'true'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            scripts/vl-host/target
+          key: cargo-${{ runner.os }}-${{ steps.keys.outputs.rustc }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ steps.keys.outputs.rustc }}-
+            cargo-${{ runner.os }}-
+
+      - name: Build vl-host (native tool)
+        if: steps.vlbin.outputs.cache-hit != 'true'
+        run: cargo build --release
+        working-directory: scripts/vl-host
+
+      - name: Cache seed compiler wasm
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            build/vl-compiler.wasm.*.cwasm
+          key: ${{ steps.keys.outputs.seed }}
+          restore-keys: |
+            vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
+            vl-seed4-${{ runner.os }}-
+
+      - name: Refresh seed + native fixpoint
+        run: ./scripts/refresh-compiler.sh --prove-fixpoint --no-fuel-sidecars
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Pack the side
+        run: |
+          mkdir -p side
+          cp scripts/vl-host/target/release/vl side/vl
+          cp build/vl-compiler.wasm build/vl-compiler.wasm.*.cwasm side/ 2>/dev/null || cp build/vl-compiler.wasm side/
+          cp -r std side/std
+          git rev-parse HEAD > side/commit
+          tar -I 'zstd -T0 -3' -cf side.tar.zst side
+          ls -l side side.tar.zst
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: sweep-side-${{ matrix.side }}
+          path: side.tar.zst
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
+  # Each runner records one shard of one side. HEAD's toolchain runs the sweep tool; the
+  # side's own compiles the programs.
+  record:
+    needs: [plan, seed]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [base, head]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.head }}
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: sweep-side-*
+
+      - name: Install the toolchains
+        run: |
+          for s in base head; do mkdir -p "sides/$s" && tar -I zstd -xf "sweep-side-$s/side.tar.zst" -C "sides/$s" --strip-components=1; done
+          mkdir -p scripts/vl-host/target/release build
+          cp sides/head/vl scripts/vl-host/target/release/vl
+          cp sides/head/vl-compiler.wasm sides/head/vl-compiler.wasm.*.cwasm build/ 2>/dev/null || cp sides/head/vl-compiler.wasm build/
+
+      - name: Record shard ${{ matrix.shard }}/8 of ${{ matrix.side }}
+        run: |
+          nproc
+          s=sides/${{ matrix.side }}
+          time scripts/vl-host/target/release/vl run scripts/sweep.vl -- record \
+            --compiler "$s/vl-compiler.wasm" --std "$s/std" --vl "$s/vl" \
+            --shard ${{ matrix.shard }}/8 --out rec-${{ matrix.side }}-${{ matrix.shard }}.jsonl
+        env:
+          JOBS: "4"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: sweep-rec-${{ matrix.side }}-${{ matrix.shard }}
+          path: rec-${{ matrix.side }}-${{ matrix.shard }}.jsonl
+          retention-days: 7
+          if-no-files-found: error
+
+  diff:
+    needs: [plan, record]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.head }}
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: sweep-side-head
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: sweep-rec-*
+          path: recs
+          merge-multiple: true
+
+      - name: Merge and diff
+        run: |
+          mkdir -p sides/head scripts/vl-host/target/release build
+          tar -I zstd -xf side.tar.zst -C sides/head --strip-components=1
+          cp sides/head/vl scripts/vl-host/target/release/vl
+          cp sides/head/vl-compiler.wasm sides/head/vl-compiler.wasm.*.cwasm build/ 2>/dev/null || cp sides/head/vl-compiler.wasm build/
+          vl=scripts/vl-host/target/release/vl
+          mkdir -p out
+          $vl run scripts/sweep.vl -- merge --out out/base.jsonl recs/rec-base-*.jsonl
+          $vl run scripts/sweep.vl -- merge --out out/head.jsonl recs/rec-head-*.jsonl
+          set +e
+          $vl run scripts/sweep.vl -- diff out/base.jsonl out/head.jsonl > out/summary.txt
+          rc=$?
+          set -e
+          cat out/summary.txt
+          {
+            echo "## Sweep: base \`${BASE:0:12}\` vs head \`${HEAD:0:12}\` (exit $rc)"
+            echo
+            echo '```'
+            head -c 900000 out/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$rc" > out/exit
+        env:
+          BASE: ${{ needs.plan.outputs.base }}
+          HEAD: ${{ needs.plan.outputs.head }}
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: sweep-result
+          path: out/
+          retention-days: 14
+
+      - name: Verdict
+        run: exit "$(cat out/exit)"

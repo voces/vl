@@ -1,5 +1,6 @@
-// The canonical instance key (architecture-target §3.4) partitions mono's instances exactly as
-// mono's own key does, except where two of mono's keys spell one instance: those it merges. The
+// The canonical instance key (docs/internals/refactor-notes/2026-11-05-canonical-instance-key.md)
+// partitions mono's instances exactly as mono's own key does, except where two of mono's keys
+// spell one instance: those it merges. The
 // key is computed under `$VL_REP_SHADOW` beside mono's (`instKeyNote`, emit_inst_key.vl), and each
 // merge reports as `instKey merge -> <template>`. Want: the merges below and no other. A merge
 // anywhere else is a template the switch would change. `VL_INST_KEY_FULL=1` sweeps all of
