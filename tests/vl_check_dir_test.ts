@@ -183,7 +183,9 @@ Deno.test({
           args: ["check", ...args, "--compiler", COMPILER],
           stdout: "piped",
           stderr: "piped",
-          env: nativeEnv({ NO_COLOR: "1", VL_JOBS: jobs, VL_TEST_TRACE: "1" }),
+          // The headroom is pinned: the pool sizes itself from free memory, and a loaded
+          // box (the gate's fan-out) would otherwise read a pool of one and fail the control.
+          env: nativeEnv({ NO_COLOR: "1", VL_JOBS: jobs, VL_TEST_TRACE: "1", VL_TEST_HEADROOM_GIB: "16" }),
         }).output();
         const err = new TextDecoder().decode(r.stderr).split("\n");
         const trace = err.filter((l) => l.startsWith("vl-test-trace workers phase=check"));
@@ -197,8 +199,8 @@ Deno.test({
       for (const args of shapes) {
         const serial = await run(args, "1");
         const pooled = await run(args, "4");
-        // The control: a pool of two or more actually ran (memory may cap it below
-        // four), so the comparison below is not vacuous.
+        // The control: a pool of two or more actually ran, so the comparison below is not
+        // vacuous.
         if (!/n=([2-9]|\d\d)/.test(pooled.trace)) {
           throw new Error(`${args.join(" ")}: want a pool of 2+ workers, got ${JSON.stringify(pooled.trace)}`);
         }
@@ -243,7 +245,13 @@ Deno.test({
           args: ["check", dir, "--compiler", COMPILER],
           stdout: "piped",
           stderr: "piped",
-          env: nativeEnv({ NO_COLOR: "1", VL_JOBS: jobs, VL_TEST_TRACE: "1", VL_CHECK_STATS: "1" }),
+          env: nativeEnv({
+            NO_COLOR: "1",
+            VL_JOBS: jobs,
+            VL_TEST_TRACE: "1",
+            VL_CHECK_STATS: "1",
+            VL_TEST_HEADROOM_GIB: "16",
+          }),
         }).output();
         return { code: r.code, err: new TextDecoder().decode(r.stderr) };
       };

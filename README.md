@@ -232,7 +232,9 @@ Everything above runs natively on Windows, with Git for Windows supplying the sh
   the gate about 10–15% of its wall time.
 - `bash scripts/gate.sh --fast` is a local check to run before pushing: every row except the slow
   ten. It takes about a minute on Windows and is not the merge gate.
-- `gate.sh` runs at most 6 rows at a time on Windows unless `GATE_MAX_PAR` says otherwise.
+- `gate.sh` runs at most 6 rows at a time on Windows unless `GATE_MAX_PAR` says otherwise
+  (elsewhere the default is twice the core count, and on Linux a row also waits until its
+  memory estimate fits; `GATE_MEM_BUDGET_MB=0` turns that off).
   Measured on a 24-thread box, 2026-10-12: every row at once 501 s; 12 at a time 342 s;
   8, 332 s; 6, 306 s; 4, 333 s.
 - Set `VL_BINARYEN` to a directory of binaryen's native release (the version in
