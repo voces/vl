@@ -3,7 +3,7 @@
 //
 // `fnRecordedRetTy` answers each emitted function's result from the elaboration or the checker.
 // Nothing reads it to decide anything yet; the shadow counts each emitted function by how that
-// answer meets the emitter's own voidness (`fRetVoid`, from `computeVoidFns`), so the pass can be
+// answer meets the emitter's own voidness (`fRetVoid`, from `recordedVoidFns`), so the pass can be
 // replaced by the column only where they agree.
 //
 // TWO HALVES, each needed for the other to mean anything:
@@ -81,6 +81,21 @@ const expectRows = (
 const PLAIN = `function f(x: i32) { print(x) }
 function g(x: i32) { x + 1 }
 f(g(2))
+`;
+
+// An annotated `never` function, and two un-annotated ones that never return through it.
+const NEVER = `function fail(m: string): never {
+  print(m)
+  __trap__()
+}
+function stop(m: string) { fail(m) }
+function spin(n: i32) {
+  while true {
+    if n > 0 { fail("s") }
+  }
+}
+print(1)
+stop("x")
 `;
 
 // Two instances of one function, and a lambda inside another generic's instance: an instance
@@ -175,7 +190,7 @@ print(keep(1))
 `;
 
 // An annotated lambda: its annotation seeds the emitter's voidness, so a missing recorded
-// result there is no gap `computeVoidFns` has to fill.
+// result there is no gap `recordedVoidFns` has to fill.
 const ANNOT = `const f = (x: i32): i32 => x + 1
 print(f(2))
 `;
@@ -199,6 +214,15 @@ Deno.test({
   ignore,
   fn() {
     expectRows("plain", PLAIN, DROP_NONE, true, "agree | f=1; agree | g=1");
+    // Only an annotated function records `never` (lowered void from its annotation); one that
+    // calls it or loops forever records `void`, so `recordedVoidFns` needs no `never` arm.
+    expectRows(
+      "never",
+      NEVER,
+      DROP_NONE,
+      true,
+      "agree | spin=1; agree | stop=1; never, emitter void | fail=1",
+    );
     expectRows(
       "generic",
       GENERIC,
@@ -269,14 +293,14 @@ Deno.test({
       DROP_NOTHING,
       false,
       // The valued function is pinned from its column before the shadow drops it.
-      "no result recorded, annotated=1; no result recorded=1",
+      "no result recorded, annotated, emitter value=1; no result recorded, emitter void=1",
     );
     expectRows(
       "annotated, nothing",
       ANNOT,
       DROP_NOTHING,
       false,
-      "no result recorded, annotated=1",
+      "no result recorded, annotated, emitter value=1",
     );
     expectRows(
       "plain, all void",

@@ -1,0 +1,172 @@
+// The naming rule's one producer: the spelling an instance's pin takes from its canonical type
+// alone (architecture-target-2026-10.md §3.4), and, under `$VL_REP_SHADOW`, its shadow against the
+// spelling mono's cascade chose. Nothing decides from the producer yet.
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyAt,
+  tyHoldsObj,
+} from "./check_types"
+import { tyIsUnionish } from "./check_node_tys"
+import { repRowOfTyStruct, repShadowOn } from "./emit_rep"
+import { repABNote } from "./emit_nullable_rets"
+import { sNames } from "./emit_state"
+import { strContains } from "./strutil"
+import { tyHasTyVar } from "./tyquery"
+
+// The pin spelling of closed type `ty` under the naming rule: a record by its row's registered
+// name, every other type by its structural spelling with union members sorted and records inside
+// by row name. "" for an open type or a part no annotation can spell.
+export function monoPinSpellOf(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return "" }
+  const t = tyAt(ty)
+  match t {
+    TyObj => {
+      const r = repRowOfTyStruct(ty, sNames.length)
+      if r < 0 || r >= sNames.length { return "" }
+      return sNames[r]
+    }
+    TyPrim => {
+      return t.primName
+    }
+    TyLit => {
+      if t.litKind == "str" { return "\"" + t.litText + "\"" }
+      return t.litText
+    }
+    TyArray => {
+      const e = monoPinSpellOf(t.aElem)
+      if e == "" { return "" }
+      const ro = if t.aRead != 0 { "readonly " } else { "" }
+      return ro + monoPinSpellAtom(t.aElem, e) + "[]"
+    }
+    TyNullable => {
+      const inner = monoPinSpellOf(t.nInner)
+      if inner == "" { return "" }
+      return monoPinSpellAtom(t.nInner, inner) + "|null"
+    }
+    TyUnion => {
+      const ms: string[] = []
+      for m in t.uMembers {
+        const s = monoPinSpellOf(m)
+        if s == "" { return "" }
+        const a = if tyIsUnionish(m) { s } else { monoPinSpellFnAtom(m, s) }
+        let j = ms.length
+        ms.push(a)
+        while j > 0 && ms[j - 1] > a {
+          ms[j] = ms[j - 1]
+          j = j - 1
+        }
+        ms[j] = a
+      }
+      return monoPinSpellJoin(ms, "|")
+    }
+    TyMap => {
+      const k = monoPinSpellOf(t.mKey)
+      if k == "" { return "" }
+      if t.mSet != 0 { return "Set<" + k + ">" }
+      const v = monoPinSpellOf(t.mVal)
+      if v == "" { return "" }
+      return "{[" + k + "]:" + v + "}"
+    }
+    TyFunc => {
+      const ps: string[] = []
+      for p in t.fnParamTypes {
+        const s = monoPinSpellOf(p)
+        if s == "" { return "" }
+        ps.push(s)
+      }
+      const r = monoPinSpellOf(t.fnRet)
+      if r == "" { return "" }
+      return "("
+        + monoPinSpellJoin(ps, ",")
+        + ")=>"
+        + monoPinSpellFnAtom(t.fnRet, r)
+    }
+    TyErr | TyVar | TyNeg => {}
+  }
+  ""
+}
+
+// `s`, the spelling of `ty`, as one atom where a suffix follows it: parenthesized when `ty` is a
+// union, a nullable or a function.
+function monoPinSpellAtom(ty: i32, s: string): string {
+  if tyIsUnionish(ty) { return "(" + s + ")" }
+  monoPinSpellFnAtom(ty, s)
+}
+
+// `s`, the spelling of `ty`, parenthesized when `ty` is a function.
+function monoPinSpellFnAtom(ty: i32, s: string): string {
+  if tyAt(ty) is TyFunc { "(" + s + ")" } else { s }
+}
+
+function monoPinSpellJoin(xs: string[], sep: string): string {
+  let r = ""
+  let i = 0
+  while i < xs.length {
+    if i > 0 { r = r + sep }
+    r = r + xs[i]
+    i = i + 1
+  }
+  r
+}
+
+// Shadow only: notes, under `$VL_REP_SHADOW`, how pin name `an` of an instance's parameter or type
+// parameter (`site`) compares with `monoPinSpellOf` of its pin type `ty`, by class.
+export function monoPinSpellNote(site: string, an: string, ty: i32) {
+  if !repShadowOn { return 0 }
+  const sp = monoPinSpellOf(ty)
+  const cls = monoPinSpellClass(an, ty, sp)
+  const d = if cls == "agree" || cls == "open pin type" { "" } else { an + " ~ " + sp }
+  repABNote("pinSpell", site + "/" + cls, d)
+}
+
+function monoPinSpellClass(an: string, ty: i32, sp: string): string {
+  if ty < 0 || ty >= T.tys.length { return "no pin type" }
+  if tyHasTyVar(ty) { return "open pin type" }
+  if an == sp { return "agree" }
+  if sp == "" { return "producer has no spelling" }
+  if an == "" { return "no name" }
+  if an.slice(0, 2) == "=>" { return "fn sig key" }
+  if tyAt(ty) is TyObj { return "record, another name" }
+  if strContains(an, "#anon") || strContains(sp, "#anon") { return "anon row" }
+  if monoPinSpellArms(an) == monoPinSpellArms(sp) {
+    return "union order or parens"
+  }
+  if tyHoldsObj(ty, 8) { return "record inside, another name" }
+  "differ"
+}
+
+// `s` without spaces and parentheses, its `|` arms sorted: two spellings of one union in
+// different orders or groupings read alike.
+function monoPinSpellArms(s: string): string {
+  const arms: string[] = []
+  let cur = ""
+  let i = 0
+  while i <= s.length {
+    const c = if i < s.length { s.slice(i, i + 1) } else { "|" }
+    if c == "|" {
+      let j = arms.length
+      arms.push(cur)
+      while j > 0 && arms[j - 1] > cur {
+        arms[j] = arms[j - 1]
+        j = j - 1
+      }
+      arms[j] = cur
+      cur = ""
+    } else if c != " " && c != "(" && c != ")" {
+      cur = cur + c
+    }
+    i = i + 1
+  }
+  monoPinSpellJoin(arms, "|")
+}
