@@ -4513,6 +4513,15 @@ fn compile_vl_instance(
             set.call(&mut store, 1)?;
         }
     }
+    // Identity shadow ($VL_ID_SHADOW=1 records and reports, =2 also keys callback
+    // specialization by it): armed before the compile, read back after it. A seed
+    // without `setIdShadow` ignores it.
+    let id_shadow = id_shadow_mode();
+    if id_shadow > 0 {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setIdShadow") {
+            set.call(&mut store, id_shadow)?;
+        }
+    }
 
     from_compiler(phase!(
         "stage_program",
@@ -4529,6 +4538,9 @@ fn compile_vl_instance(
     report_guest_fuel(store);
     report_guest_alloc(resident0);
     report_late_demands(inst, store, source_path);
+    if id_shadow > 0 {
+        report_id_shadow(inst, store, source_path);
+    }
     if rc != 0 {
         let stage = match rc {
             1 => "parse",
@@ -4543,6 +4555,37 @@ fn compile_vl_instance(
         from_compiler(report_rep_shadow(inst, &mut store, source_path))?;
     }
     Ok(bytes)
+}
+
+/// The mode `$VL_ID_SHADOW` asks the identity shadow for: 0 off, 1 report, 2 report and key.
+fn id_shadow_mode() -> i32 {
+    match std::env::var("VL_ID_SHADOW").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// Under `$VL_ID_SHADOW`, print one `[id-shadow] <path>: <row>` line to stderr per row the
+/// guest's identity shadow recorded. A seed without `idShadowCount` prints nothing.
+fn report_id_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
+    let (Ok(count), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "idShadowCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "idShadowLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "idShadowAt"),
+    ) else {
+        return;
+    };
+    let n = count.call(&mut *store, ()).unwrap_or(0);
+    let mut rows = String::new();
+    for i in 0..n {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let row: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        rows.push_str(&format!("[id-shadow] {path}: {row}\n"));
+    }
+    eprint!("{rows}");
 }
 
 /// Whether `$VL_LATE_DEMANDS=1` asked for each compile's late elaboration demands.
