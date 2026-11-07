@@ -2519,6 +2519,18 @@ value derivations. What stays is class (c), and why:
 - The inert walk's as-written map site stays only as long as the inert walk, which leaves with the
   inertness change to `elabSlotUncalled`.
 
+**Inertness is the elaboration's, per slot** (2026-11-07). A slot `monoFlowReads` repointed is asked
+`elabSlotUncalledOmitting(at, path, mfrRepointed)`: each read `monoFlowReadSet` rewrote and each call
+through one is left out, a left-out read delivers nothing (`elabReadDeliveries`), and a slot is
+called only when a read or call through it that was not left out reaches a call or an escape. A
+held function's escape elsewhere (`fnEscapes`, a fact about the function) does not count: in
+`closures/hole-fn-generic-map-stored-through-parameter.vl`, `id` stored into the annotated map `e`
+must not make map `a`'s record slot called. Plain `elabSlotUncalled` is unchanged. This replaces
+`monoValsInert` at the pushed list (D9441), the nested list (D9711) and the stored slot, and with it
+the as-written inert map site no longer decides a slot. `monoInertValues` remains a writer-only
+record for its other readers: `monoNamesUsedAsValue`, `monoSpreadHostInert`, `monoStubValueOk`
+(emit_state), `emitIdentNonLocalRead` and `stmtIsBareFnName` (wasmEmit).
+
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
 move no output. These are the reads the gate does not answer: an argument handed on, a loop over a
