@@ -1758,6 +1758,10 @@ fell from 7 to 1 running program; the two refusing fixtures that guard a helper 
 different sets count one each. The one left, `use` in `closures/listed-hole-fn-escaping-list.vl`,
 is the closure-list rep of D15010, which mono should read from the elaboration. One helper instance
 serves holders of different sets, since a tagged id is its member's declaration index in every set.
+#6650 raised the count from 2 to 4 by deleting mono's niche guard. That guard had refused two
+programs that run: a generic whose `T` binds to a function through `(T | null)[]` is instanced
+late at the concrete signature. This is D15539, held by Fn#d's value-instance key (#6645), and it
+is a different mechanism from `use`.
 
 G2's write through a parameter (D15492) lands in the caller's map with its set; what refused it
 was the store into the parameter's slot, which the tag rule now takes when every call hands a
@@ -2798,6 +2802,20 @@ programs, counted by program).
   `ckb-callkey-binding-price`, and D15537 is the trap's witness. The key binds the argument's
   type where the rebuild pins the row the argument is built at. With the cut, over 19,316
   programs no byte moves.
+- **Two of the guards are deleted.** Each was graded by a hand-written probe of the plainest
+  program its sentence forbids, built with the guard on and off, because the corpus reaches
+  neither. Counted from the emitted message, attributed by site, against a control that refuses.
+  - **The niche check** (`monoNicheNulListCheck`, "a nullable-X list element has no rep") refused
+    working programs. A `(T | null)[]` whose `T` binds to a function, inferred or annotated, and
+    a generic record's `(P | null)[]` read through a lambda all build and print the right value
+    without it. The position matrix (`nullable-fn-list-through-generic-{explicit,inferred}`) goes
+    from refused at every position to 48 of 48 graded cells running in both templates, with 0
+    silent. D2525's boundary fixture is refused one step later, at shape interning, and is
+    unaffected. The two un-annotated probes each mint one late demand (D15539: `first` at a function
+    element), which is recorded as their price.
+  - **The seeded-binding check** (`monoLetTyParamMisfit`) is unreachable. The one probe of the
+    shape it forbids is refused first, with "a generic function taken as a value reaches no call
+    that fixes its type", in both states. That probe is now that refusal's witness.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
