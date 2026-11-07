@@ -43,6 +43,8 @@ const probe = (src: string) => {
     built: exp.elabArgBuiltProbe(),
     closures: Math.floor(exp.elabArgBundleKindProbe() / 1000),
     records: exp.elabArgBundleKindProbe() % 1000,
+    twins: Math.floor(exp.elabBundleTwinProbe() / 1000),
+    delivered: exp.elabBundleTwinProbe() % 1000,
   };
 };
 
@@ -87,6 +89,23 @@ function dup(a) { return a }
 function use(k) { print(k(id)); return k(dup) }
 const lap = (g) => { print(g(1) + 1); return g("s") }
 print(use(lap))
+`;
+
+// A record written with a bundle's shape is no bundle: the delivered-bundle fact keys a record by
+// its own index. This holds only while records do not intern by structure.
+const BUNDLE_SHAPED = `type B = { c0: (n: i32) => i32, c1: (n: f64) => f64 }
+function lap(f) {
+  print(f(3))
+  print(f(2.5))
+}
+function useB(r: B) {
+  print(r.c0(20))
+  print(r.c1(1.5))
+}
+function inFn(k: i32) { lap((a) => a + k) }
+inFn(1)
+const nb: B = { c0: (n: i32) => n * 2, c1: (n: f64) => n * 2.0 }
+useB(nb)
 `;
 
 const PLAIN = `function id<T>(x: T): T { x }
@@ -156,6 +175,18 @@ Deno.test({
     const got = probe(CLOSURE_BUNDLE);
     if (got.bad !== 0 || got.closures !== 1 || got.records !== 2) {
       throw new Error(`want a closure rep and no bundle record, got ${JSON.stringify(got)}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "elab-arg-rep: a record written with a bundle's shape is not a delivered bundle",
+  ignore,
+  fn() {
+    const got = probe(BUNDLE_SHAPED);
+    // Records interning by structure would fold `B` into the bundle and read twins 0.
+    if (got.bad !== 0 || got.delivered < 1 || got.twins < 1) {
+      throw new Error(`want a delivered bundle and an undelivered twin, got ${JSON.stringify(got)}`);
     }
   },
 });

@@ -1664,6 +1664,83 @@ export function fnTagWriteLeavesOf(d: i32, s: i32, out: i32[]): i32 {
   et
 }
 
+// Appends to `out` each value a slot write into a map binding of `held` whose value carries set `s`
+// stores that names member `d`, a write a callee makes through a parameter included, and returns
+// that map's value type; -1 when no such write lands only in maps of `s` (D15531).
+export function fnTagMapWriteLeavesOf(
+  d: i32,
+  s: i32,
+  held: i32[],
+  out: i32[],
+): i32 {
+  let vt = -1
+  for hb in held {
+    const mt = fnMapBindValTy(hb)
+    if mt >= 0 && fnTagSetOfTy(mt) == s {
+      const vals: i32[] = []
+      const ats: i32[] = []
+      if cwSlotWrittenValues(cwKeyOfDecl(hb), ["[]"], vals, ats) >= 0 {
+        for v in vals {
+          if cwFnValueDeclOf(v) == d && !i32ListHas(out, v) {
+            if !fnWriteOnlyIntoMap(v, s) { return -1 }
+            out.push(v)
+            vt = mt
+          }
+        }
+      }
+    }
+  }
+  vt
+}
+
+// The value type of map binding `hb`, a `let` whose initialiser or own type is a map; -1 otherwise.
+function fnMapBindValTy(hb: i32): i32 {
+  if hb < 0 || hb >= P.nodes.length { return -1 }
+  const n = nodeAt(hb)
+  if !(n is LetDecl) { return -1 }
+  const t = if n.letInit >= 0 { nodeTyIxOf(n.letInit) } else { nodeTyIxOf(hb) }
+  const m = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  if m is TyMap { m.mVal } else { -1 }
+}
+
+// Whether the store of write value `v` lands only in maps whose value carries set `s`: its target
+// roots at one, or at a parameter every call hands only such maps or such parameters.
+function fnWriteOnlyIntoMap(v: i32, s: i32): boolean {
+  if v < 0 || !cwIxCovers(v) { return false }
+  const p = cwIxUp[v]
+  if p < 0 { return false }
+  const pn = nodeAt(p)
+  let tgt = -1
+  if pn is BinExpr && pn.binOp == "=" && parenPeelIx(pn.binRight) == v {
+    tgt = pn.binLeft
+  } else if pn is Call {
+    const f = nodeAt(parenPeelIx(pn.callFn))
+    if f is Member && f.memProp == "set" { tgt = f.memObj }
+  }
+  if tgt < 0 { return false }
+  const path: string[] = []
+  const root = cwSlotPath(tgt, path)
+  if root < 0 || !(nodeAt(root) is Ident) { return false }
+  fnMapArgOnlyOf(identDeclOf(root), s, 0)
+}
+
+// Whether declaration `d` is a map binding whose value carries set `s`, or a parameter every call
+// hands only such bindings through such parameters.
+function fnMapArgOnlyOf(d: i32, s: i32, depth: i32): boolean {
+  if d < 0 || d >= P.nodes.length || depth > 8 { return false }
+  const mt = fnMapBindValTy(d)
+  if mt >= 0 { return fnTagSetOfTy(mt) == s }
+  if !(nodeAt(d) is Param) { return false }
+  const args: i32[] = []
+  if !cwParamArgs(d, args) || args.length == 0 { return false }
+  for a in args {
+    const ap = parenPeelIx(a)
+    if ap < 0 || !(nodeAt(ap) is Ident) { return false }
+    if !fnMapArgOnlyOf(identDeclOf(ap), s, depth + 1) { return false }
+  }
+  true
+}
+
 // Whether the store of write value `v` lands only in lists widened to `bd`'s set: its target
 // roots at one, or at a parameter every call hands one or another such parameter. The leaf then emits its id at
 // every instance of the writing function.
@@ -2145,6 +2222,9 @@ let fnSetOpenCallee = false
 // argument tuple (-1 for an open argument).
 let fnSlotCallAt: {[string]: i32} = Map()
 let fnSlotCallArgs: i32[][][] = []
+// Each slot's calls that read their callee from it as the slot: not a const element read that
+// names one function.
+let fnSlotThrough: {[string]: i32[]} = Map()
 // "holder|path" of each binding slot a read hands as an argument to a parameter annotated with a
 // closed function type, beside each such annotation.
 let fnSlotAnnTys: {[string]: i32[]} = Map()
@@ -2207,9 +2287,19 @@ export function fnSetCallArgsOf(ds: i32[]): i32[] {
 // Whether lists `a` and `b` name the same types in order.
 // Notes a call whose callee is read from slot `path` of binding `holder`, with its arguments'
 // types `args`, for `fnSlotCallArgsOf`.
-export function fnSlotCallNote(holder: i32, path: string[], args: i32[]) {
+export function fnSlotCallNote(
+  holder: i32,
+  path: string[],
+  args: i32[],
+  through: i32,
+) {
   if holder < 0 { return 0 }
   const key = fnSlotKey(holder, path)
+  if through >= 0 {
+    const cs = fnSlotThrough[key] ?? []
+    if !i32ListHas(cs, through) { cs.push(through) }
+    fnSlotThrough[key] = cs
+  }
   let at = fnSlotCallAt[key] ?? -1
   if at < 0 {
     fnSlotCallArgs.push([])
@@ -2278,9 +2368,10 @@ function fnSlotKey(holder: i32, path: string[]): string {
   k
 }
 
-// Whether some call reads its callee from slot `path` of `holder`.
-export function fnSlotCalled(holder: i32, path: string[]): boolean {
-  fnSlotCallAt.has(fnSlotKey(holder, path))
+// The calls reading their callee through slot `path` of `holder` as the slot, not as a const
+// element read that names one function.
+export function fnSlotThroughCalls(holder: i32, path: string[]): i32[] {
+  fnSlotThrough[fnSlotKey(holder, path)] ?? []
 }
 
 // The one tuple of closed argument types every call reading its callee from slot `path` of
@@ -3284,6 +3375,7 @@ export function elabCapReset() {
   fnSetOpenCallee = false
   fnSlotCallAt = Map()
   fnSlotCallArgs = []
+  fnSlotThrough = Map()
   fnSlotAnnTys = Map()
   fnSlotOpenHands = Map()
   fnTagCallIxs = []

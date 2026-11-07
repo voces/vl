@@ -591,7 +591,6 @@ import {
   bundleRecordNote,
   bundleReset,
   bundleRetParamNote,
-  bundleTyNote,
 } from "./emit_bundle"
 import {
   repElemTyOfName,
@@ -662,6 +661,8 @@ import {
   elabCallSetIn,
   elabCopyTyOwn,
   elabDeclOnePin,
+  elabDeliveredBundleSigs,
+  elabDeliveredBundles,
   elabDemand,
   elabHoleFnClosed,
   elabHoleMapClosed,
@@ -4719,95 +4720,22 @@ function monoPinBodyLambdasRaw(
 }
 
 // An operator operand's type at the pin: its pinned type, or, for a name typed at a hole the
-// parameters' binding leaves open, the hole instance's own binding of it. A derived hole is
-// left as pinned.
+// parameters' binding leaves open, the elaboration's closed type of it at the instance. An operator
+// reaches a nullable number only past the check that excluded its `null`. A derived hole is left
+// as pinned.
 function monoNumOperandPinTy(ix: i32, bN: string[], bT: i32[]): i32 {
   const p = monoPinnedTyOf(ix, bN, bT)
   if p < 0 || p >= T.tys.length || !tyHasTyVar(p) { return p }
-  const id = nodeAt(unwrapParen(ix))
-  if !(id is Ident) { return p }
+  if !(nodeAt(unwrapParen(ix)) is Ident) { return p }
   const t = tyAt(p)
   if !(t is TyVar) { return p }
   if t.tvName.length > 1 && t.tvName[1] == "#"[0] { return p }
-  // The binding read directly, not substituted: re-joining a pinned union mints rows.
-  const b = monoHoleBindingOf(t.tvName)
-  // An operator reaches a nullable number only past the check that excluded its `null`.
-  if b >= 0 && tyIsNumericBox(b) { return nonNullTy(b) }
-  if b >= 0 { return b }
-  // A parameter read past its `null` test is typed at the narrowing's own hole: the
-  // parameter's hole answers for it, and for an un-annotated local it initialises.
-  const pb = monoHoleBindingOf(
-    monoParamHoleName(monoAliasedParam(id.identName)),
-  )
-  if pb >= 0 && tyIsNumericBox(pb) && tyBearsNull(pb) { return nonNullTy(pb) }
-  p
-}
-
-// The hole binding of the instance being built for hole `name`, -1 for none.
-function monoHoleBindingOf(name: string): i32 {
-  if name == "" { return -1 }
-  let i = 0
-  while i < monoPinHoleN.length && i < monoPinHoleT.length {
-    if monoPinHoleN[i] == name { return monoPinHoleT[i] }
-    i = i + 1
-  }
-  -1
-}
-
-// The name an un-annotated local `name` of the instance being built is initialised from, when
-// that initialiser is a bare name, followed to a name no such local declares; `name` otherwise.
-function monoAliasedParam(name: string): string {
-  let cur = name
-  let hops = 0
-  while hops < 4 {
-    const nx = monoLocalInitName(monoInstBody, cur)
-    if nx == "" { return cur }
-    cur = nx
-    hops = hops + 1
-  }
-  cur
-}
-
-// The bare name the un-annotated `let`/`const` `name` under `ix` is initialised from, or "".
-function monoLocalInitName(ix: i32, name: string): string {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      const n = nodeAt(at)
-      if n is LetDecl {
-        if n.letName == name && n.letType < 0 && n.letInit >= 0 {
-          const iv = nodeAt(unwrapParen(n.letInit))
-          if iv is Ident { return iv.identName }
-          return ""
-        }
-      }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
-      }
-    }
-  }
-  ""
-}
-
-// The hole an un-annotated parameter `name` of the instance being built is typed at, or "".
-function monoParamHoleName(name: string): string {
-  let i = 0
-  while i < monoInstParams.length {
-    const pn = nodeAt(monoInstParams[i])
-    if pn is Param {
-      if pn.parName == name {
-        if pn.parType >= 0 { return "" }
-        const pt = nodeTyIxOf(monoInstParams[i])
-        if pt < 0 || pt >= T.tys.length { return "" }
-        const ptv = tyAt(pt)
-        if ptv is TyVar { return ptv.tvName }
-        return ""
-      }
-    }
-    i = i + 1
-  }
-  ""
+  const nt = elabWalkNarrowedTy(ix)
+  const wt = elabWalkTy(ix)
+  let e = if nt >= 0 && nt < T.tys.length && !tyHasTyVar(nt) { nt } else { -1 }
+  if e < 0 && wt >= 0 && wt < T.tys.length && !tyHasTyVar(wt) { e = wt }
+  if e < 0 { return p }
+  if tyIsNumericBox(e) && tyBearsNull(e) { nonNullTy(e) } else { e }
 }
 
 // `monoNumUnionOpPin` for a compound assignment `rb` rebuilt from `ix`: its operator node.
@@ -5111,10 +5039,6 @@ let monoPinRetBox = false
 
 // The hole binding of the instance whose body `monoPinBodyLambdas` walks; empty outside it.
 let monoPinHoleN: string[] = []
-// The parameters of the instance being built (`monoParamHoleName`).
-let monoInstParams: i32[] = []
-// The template body of the instance being built (`monoAliasedParam`).
-let monoInstBody = -1
 let monoPinHoleT: i32[] = []
 
 // Records in `monoPinUnsafeNames` every name read under `ix` outside a sink.
@@ -9088,9 +9012,7 @@ export function monoStateReset() {
   monoElemTakenSig = Map()
   monoElemAtSet = Map()
   monoTopStmts = []
-  monoInstBody = -1
   monoInstIsFirst = false
-  monoInstParams = []
   monoInstRetWidenTy = 0 - 1
   monoLastInstFe = 0 - 1
   monoMakeCallIx = 0 - 1
@@ -9492,8 +9414,8 @@ function monoMakeInstanceParams(
         synthed = true
       }
       // A bundle's parameter is known by its pin type; a same-shaped record can share its row.
-      const bi = i32ListIndexOf(monoBundleTys, pinTys[pj])
-      if nt >= 0 && bi >= 0 { bundleParamNote(nt, monoBundleTySigs[bi]) }
+      const bs = elabDeliveredBundleSigs(pinTys[pj])
+      if nt >= 0 && bs.length > 0 { bundleParamNote(nt, bs) }
       // The pinned concrete param type is recorded on the instance's annotation node,
       // and `pinTy` is that index. A synthesized node already carries it; the original
       // declaration's node carries the checker's generic-frame resolution instead.
@@ -9607,7 +9529,6 @@ function monoMakeInstanceBodyPinned(
   origFe: i32,
   first: boolean,
   nret: i32,
-  params: i32[],
   tps: string[],
   tvN: string[],
   tvV: string[],
@@ -9661,10 +9582,6 @@ function monoMakeInstanceBodyPinned(
   const svHoleT = monoPinHoleT
   monoPinHoleN = instHoleN
   monoPinHoleT = instHoleT
-  const svParams = monoInstParams
-  monoInstParams = params
-  const svBody = monoInstBody
-  monoInstBody = fn.fnBody
   const instBody0L = monoPinBodyLambdas(
     instBody0,
     tps,
@@ -9674,8 +9591,6 @@ function monoMakeInstanceBodyPinned(
     bodyBT,
   )
   monoPinHoleN = svHoleN
-  monoInstParams = svParams
-  monoInstBody = svBody
   njSetPinFn(svPinFn)
   monoPinHoleT = svHoleT
   instBody0L
@@ -9943,7 +9858,7 @@ function monoInstanceRet(
 function monoIsBundleTy(t: i32): boolean {
   const r = bundleRecordRowOfTy(t)
   if r < 0 { return false }
-  for b in monoBundleTys {
+  for b in elabDeliveredBundles() {
     if bundleRecordRowOfTy(b) == r { return true }
   }
   false
@@ -10823,7 +10738,6 @@ function monoMakeInstanceGo(
       origFe,
       first,
       nret,
-      params,
       k.tps,
       tvN,
       tvV,
@@ -18338,16 +18252,18 @@ function monoAliasLetLamFe(ix: i32, ctx: i32): i32 {
 function monoCoerceBundleArgs(n: Call, ctx: i32): i32 {
   const an = monoCalleeAnnNode(n.callFn, ctx)
   const at = if an >= 0 { nodeTyIxOf(an) } else { -1 }
-  if at < 0 || at >= T.tys.length || monoBundleTys.length == 0 { return 0 }
+  if at < 0 || at >= T.tys.length || elabDeliveredBundles().length == 0 {
+    return 0
+  }
   const f = tyAt(at)
   if !(f is TyFunc) { return 0 }
   let i = 0
   while i < n.callArgs.length && i < f.fnParamTypes.length {
-    const bi = i32ListIndexOf(monoBundleTys, f.fnParamTypes[i])
-    if bi >= 0 && nodeAt(unwrapParen(n.callArgs[i])) is Ident {
+    const bs = elabDeliveredBundleSigs(f.fnParamTypes[i])
+    if bs.length > 0 && nodeAt(unwrapParen(n.callArgs[i])) is Ident {
       // The read stays the generic, so each signature instances it afresh.
       monoNoRename.push(unwrapParen(n.callArgs[i]))
-      for sg in monoBundleTySigs[bi] {
+      for sg in bs {
         if (
           monoCoerceFnValueName(n.callArgs[i], monoPinAnnSpelling(sg), ctx, sg)
           < 0
@@ -21833,10 +21749,6 @@ function monoBundlePinArg(
       x,
     )
   }
-  if !i32ListHas(monoBundleTys, bt) {
-    monoBundleTys.push(bt)
-    monoBundleTySigs.push(sigs)
-  }
   bundleRecordNote(bt, sigs)
   pinned.push(sNames[row])
   pinTys.push(bt)
@@ -21855,14 +21767,8 @@ function monoBundleHandOnPin(
 ): i32 {
   const owner = elabCallHandOwner(monoCallTplOf(callIx), i)
   const bt = if owner >= 0 { monoBundleKeyTys.get(owner) ?? -1 } else { -1 }
-  const bi = i32ListIndexOf(monoBundleTys, bt)
-  if (
-    bi < 0
-    || bi >= monoBundleTySigs.length
-    || !monoSigsSame(monoBundleTySigs[bi], sigs)
-  ) {
-    return 1
-  }
+  const bs = elabDeliveredBundleSigs(bt)
+  if bs.length == 0 || !monoSigsSame(bs, sigs) { return 1 }
   const pr = bundleRecordRowOfTy(bt)
   if pr < 0 || pr >= sNames.length { return 1 }
   pinned.push(sNames[pr])
@@ -21933,11 +21839,6 @@ function monoBundleRecordAt(bt: i32, sigs: i32[], at: i32): i32 {
     )
     return -1
   }
-  if !i32ListHas(monoBundleTys, bt) {
-    monoBundleTys.push(bt)
-    monoBundleTySigs.push(sigs)
-  }
-  bundleTyNote(bt, sigs)
   bundleRecordNote(bt, sigs)
   bt
 }
@@ -26755,12 +26656,8 @@ let cadInBaked = false
 let cadWalkFn: i32[] = []
 let cadPendRows: i32[] = []
 let cadPendClones: i32[] = []
-// Each bundle record type, and beside it the closed signatures its fields hold, field `c<k>` the
-// closure at the `k`th (D14841). A record of the same shape written by hand is no bundle.
-let monoBundleTys: i32[] = []
 // The record type each elaboration parameter key is pinned at.
 let monoBundleKeyTys: {[i32]: i32} = Map()
-let monoBundleTySigs: i32[][] = []
 
 // The row's size, its conflicting writes and its unkeyed writes, for a self-check.
 export function cadRowCount(): i32 { cadFe.length }
@@ -26788,9 +26685,7 @@ function cadRowReset() {
   cadWalkFn = []
   cadPendRows = []
   cadPendClones = []
-  monoBundleTys = []
   monoBundleKeyTys = Map()
-  monoBundleTySigs = []
   bundleReset()
   0
 }
