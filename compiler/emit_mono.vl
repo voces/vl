@@ -10677,9 +10677,7 @@ function monoFnTyParamTys(t: i32): i32[] {
   none
 }
 
-// Set while a literal is delivered at an annotation with no adapter between them; the return
-// type `monoInstanceFor` must then reproduce, or "" for any return.
-let monoInstanceExactRet = false
+// The return type `monoInstanceFor` must reproduce for a widened return, or "" for any return.
 let monoInstanceRetName = ""
 // The instances built returning a result their template's only converts to (D9282): a generic
 // value they return is built at that result too.
@@ -10855,19 +10853,7 @@ function monoInstanceFor(
       }
       v = v + 1
     }
-    if monoInstanceExactRet {
-      if fn.fnRet < 0 || monoInstanceRetName == "" { return 0 }
-      if (
-        normTypeAtom(monoInstanceSubstRet(fn, tvN, tvV))
-        != monoInstanceRetName
-      ) {
-        return 0
-      }
-    } else if (
-      monoInstanceWidenRet
-      && fn.fnRet >= 0
-      && monoInstanceRetName != ""
-    ) {
+    if (monoInstanceWidenRet && fn.fnRet >= 0 && monoInstanceRetName != "") {
       // A result that only converts to the slot's own result is returned at it (D9282).
       const rs = monoInstanceSubstRet(fn, tvN, tvV)
       if normTypeAtom(rs) != monoInstanceRetName {
@@ -11115,7 +11101,7 @@ function monoCoerceFnValueTys(
             // A capturing nested generic's value is this frame's instance, as a call is (D3902).
             monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
             monoInstanceRetName = ""
-            if monoInstanceExactRet || monoInstanceWidenRet {
+            if monoInstanceWidenRet {
               monoInstanceRetName = normTypeAtom(
                 annRetNameOf(peelGroupParens(tname)),
               )
@@ -11756,7 +11742,7 @@ function monoSigFnTyName(sig: string): string {
   monoSigFnTyNameRet(sig, "void")
 }
 
-// `monoSigFnTyName` returning `ret`, for an exact-return instance (`monoInstanceExactRet`).
+// `monoSigFnTyName` returning `ret`.
 function monoSigFnTyNameRet(sig: string, ret: string): string {
   if sig == "" { return "" }
   let out = "("
@@ -12081,8 +12067,6 @@ let mfrCand: {[i32]: boolean} = Map()
 let mfrPlannedRoots: {[i32]: i32[]} = Map()
 let mfrPlannedRootsState: {[i32]: i32} = Map()
 let mfrDirty: {[i32]: boolean} = Map()
-let mfrAnnLits: {[i32]: i32[]} = Map()
-let mfrAnnLets: i32[] = []
 let mfrCalled: i32[] = []
 let mfrKeptIndex: i32[] = []
 let mfrKeptTop: i32[] = []
@@ -12124,8 +12108,6 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrPlannedRoots = Map()
   mfrPlannedRootsState = Map()
   mfrDirty = Map()
-  mfrAnnLits = Map()
-  mfrAnnLets = []
   mfrCalled = []
   mfrKeptIndex = []
   mfrKeptTop = []
@@ -12174,7 +12156,6 @@ function monoFlowReads(stmts: i32[]): i32 {
     monoFlowConstCallArgs(d)
   }
   for d in lets { monoFlowMapNoteAliasWrites(d) }
-  for a in mfrAnnLets { monoFlowAnnLits(a) }
   monoFlowAdmitChain(calls)
   0
 }
@@ -12428,45 +12409,6 @@ function monoFlowCopyHanded(u: i32, calls: i32[]): boolean {
   true
 }
 
-// Banks for annotated binding `a` the literals its initializer may be: a call of a concrete
-// function returning only literals, when every call of it initializes a binding annotated
-// alike, so each literal is delivered at that one type and its generics can be pinned there.
-function monoFlowAnnLits(a: i32) {
-  const an = nodeAt(a)
-  if !(an is LetDecl) || an.letType < 0 { return 0 }
-  const c = unwrapParen(an.letInit)
-  if c < 0 { return 0 }
-  const cn = nodeAt(c)
-  if !(cn is Call) { return 0 }
-  const f = unwrapParen(cn.callFn)
-  if f < 0 || !(nodeAt(f) is Ident) { return 0 }
-  const fd = identDeclOf(f)
-  if fd < 0 { return 0 }
-  const fn = nodeAt(fd)
-  if !(fn is FuncDecl) || fn.fnTyParams.length > 0 { return 0 }
-  const want = tyNameOf(an.letType)
-  for u in mfrUses[fd] ?? [] {
-    const uc = mfrParentOf(u)
-    if uc < 0 { return 0 }
-    const ucn = nodeAt(uc)
-    if !(ucn is Call) || ucn.callFn != u { return 0 }
-    let h = mfrParentOf(uc)
-    while h >= 0 && nodeAt(h) is Paren { h = mfrParentOf(h) }
-    if h < 0 { return 0 }
-    const hn = nodeAt(h)
-    if !(hn is LetDecl) || hn.letType < 0 || tyNameOf(hn.letType) != want {
-      return 0
-    }
-    if unwrapParen(hn.letInit) != uc { return 0 }
-  }
-  const vals = monoFlowDeclVals(fd)
-  if vals.length > 0 { mfrAnnLits[a] = vals }
-  0
-}
-
-// The literals `monoFlowAnnLits` banked for the annotated binding declared at `a`.
-function monoFlowAnnLitsOf(a: i32): i32[] { mfrAnnLits[a] ?? [] }
-
 // Whether `s` declares a named function whose value has no one signature: type parameters, or an
 // un-annotated parameter (a hole function, D6603).
 function monoFlowTyParamGen(s: i32): boolean {
@@ -12603,8 +12545,6 @@ function monoFlowReadsNote(ix: i32, lets: i32[], calls: i32[]) {
     if n.letType < 0 && n.letInit >= 0 && !fnTagListTy(nodeTyIxOf(n.letInit)) {
       mfrCand[ix] = true
       lets.push(ix)
-    } else if n.letInit >= 0 {
-      mfrAnnLets.push(ix)
     }
   } else if n is FuncDecl {
     monoFlowReadsName(n.fnName)
@@ -23606,16 +23546,6 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
   // carries that concrete type independent of any call — it may escape where call-driven
   // monomorphization cannot reach.
   if monoCoerceFnValue(n.letInit, n.letType, ctx) < 0 { return -1 }
-  // So is each literal a call in the initializer returns (`monoFlowAnnLits`).
-  // Each instance there must return the slot's own type, since nothing adapts it on the way.
-  monoInstanceExactRet = true
-  for lit in monoFlowAnnLitsOf(ix) {
-    if monoCoerceFnValue(lit, n.letType, monoTopFrameOf(lit)) < 0 {
-      monoInstanceExactRet = false
-      return -1
-    }
-  }
-  monoInstanceExactRet = false
   if monoNoteBindDelivery(n.letInit, n.letType, ctx, -1) < 0 { return -1 }
   if monoWalk(n.letInit, ctx) < 0 { return -1 }
   monoCloseListCbBindReads(n, ix, ctx)

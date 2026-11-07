@@ -2565,6 +2565,30 @@ answer: mono's `i32` was re-widened downstream. `monoNumOperandPinTy` and the tw
 default whose left side has no closed walk type refuses loudly where the hole-binding substitution
 was; no program reaches it. The first three helpers already read the elaboration and stay.
 
+**Value returns, against `elabValueReturnsFrom`** (2026-11-07, 19,338 programs, master
+`a0562c8b`). `monoFlowRetVals` was already gone, and `monoFlowConstCallArgs` is the flow rewrite's
+own transformation around the leaf decision (class (c), cad lane).
+
+| decision | decisions (programs) | reading |
+|---|---|---|
+| `monoFlowCallLeaf`: call `c` always returns generic `g` | 386 (101) | 53 answered, all 53 confirmed; 333 declined |
+| `monoFlowAnnLits`: the literals an annotated binding's call initializer may return | 75 (28) | 16 confirmed; 59 are literal nodes, which the fact does not follow |
+| `monoDeliverCallRets`' gate: the function returns a hole lambda | 802 (593) | 796 both no; 6 (3 programs) mono yes, fact no, again a returned literal |
+
+- **`monoFlowCallLeaf`: the fact confirms, it does not enumerate.** Asked of mono's answer it
+  agrees every time, but it names no candidate `g`, so it cannot answer the 333 declines. The leaf
+  stays the planner's decision, and its two consumers, the repoint and the rets share of
+  `mfrInertValues`, are cad's.
+- **`monoFlowAnnLits` is deleted.** Banking nothing moves no byte over the 29 programs it banked
+  for, so its consumer (each banked literal coerced at the binding's annotation, under
+  `monoInstanceExactRet`) is gone too, along with that flag.
+- **`monoDeliverCallRets` stays: blocked on a reach fact for a returned literal.** Forced off, its
+  gate lets `closures/error-hole-lambda-returned-into-bindings-of-two-types.vl` (D6522) build and
+  print a wrong answer, and makes `closures/hole-lambda-returned-into-binding-of-another-type.vl`
+  trap. Those two are its acceptance cells.
+- **`monoIfBoundRetAtPin`** reads `monoSlotPinNameTys`, the elaboration's deliveries, with no
+  fallback: class (a).
+
 **Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
 elaboration has no type of its own for the node, and every caller composes its own narrowing with
 it. A fallback to the checker's closed type (#6556, closed) broke four `runs` cells:
