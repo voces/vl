@@ -7,7 +7,7 @@ import {
   elabSpecParamCalledAt,
   idCanon,
 } from "./elab_fn_id"
-import { idShadowModeOf } from "./id_shadow_state"
+import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
 import { recEnclosingFn } from "./check_fit_rules"
 import {
@@ -681,6 +681,9 @@ import {
   elabCallParamTyFrom,
   elabCallParamTyOwn,
   elabCallSeedBind,
+  elabSpecBindOf,
+  elabSpecDeclsOf,
+  elabSpecParamsOf,
   elabCallSetIn,
   elabCopyTyOwn,
   elabDeclOnePin,
@@ -5075,6 +5078,70 @@ function monoPinMapLambdas(ix: i32, pNames: string[]) {
 // bake reads; -1 outside one.
 let monoBakeSpecK = -1
 
+// The (S1) map: each argument-keyed instance key to the slot of mono's instance for it.
+let monoSpecSlotOf: {[i32]: i32} = Map()
+
+// The key of the keyed decision whose `monoMakeInstance` comes next, which `monoMakeInstanceGo`
+// takes and clears; -1 for any other build.
+let monoSpecGoK = -1
+
+// The registry entry keyed decision `k` reuses: the first one of its slot in the (S1) map; for a
+// key the map has no slot for, the entry mono's own `key` names ("" for none). -1 for none.
+function monoSpecRegOf(k: i32, key: string): i32 {
+  const slot = if k >= 0 { monoSpecSlotOf[k] ?? -1 } else { -1 }
+  let r = 0
+  while r < monoKeys.length && r < monoInstFe.length {
+    if slot >= 0 && monoInstFe[r] == slot { return r }
+    if slot < 0 && key != "" && monoKeys[r] == key { return r }
+    r = r + 1
+  }
+  -1
+}
+
+// One `s1` shadow row: what the map holds for key `k` against mono's own answer `got`, the slot
+// its registry reused (`fresh` false) or minted; then records `got` as the key's slot.
+function monoSpecSlotNote(k: i32, got: i32, fresh: boolean) {
+  if k < 0 { return 0 }
+  const had = monoSpecSlotOf[k] ?? -1
+  if idShadowModeOf() > 0 {
+    const c = if had < 0 && fresh { "fresh" } else if had < 0 { "mono-only" } else if fresh { "map-only" } else if had == got { "same" } else { "differ" }
+    idShadowRow("s1 " + c)
+  }
+  if had < 0 && got >= 0 { monoSpecSlotOf[k] = got }
+  0
+}
+
+// One `bakecallee` shadow row: the declaration mono's name resolves to at keyed instance `k`'s
+// parameter `p`, against the one the key names there.
+function monoBakeCalleeNote(k: i32, p: i32, md: i32) {
+  if idShadowModeOf() == 0 { return 0 }
+  const ps = elabSpecParamsOf(k)
+  const ds = elabSpecDeclsOf(k)
+  const j = i32ListIndexOf(ps, p)
+  const d = if j >= 0 && j < ds.length { ds[j] } else { -1 }
+  const slot = if md >= 0 { fnStmtsPosOf(md) } else { -1 }
+  const orig = if slot >= 0 && slot < monoOrigNode.length { elabSrcDecl(monoOrigNode[slot]) } else { -1 }
+  const c = if d < 0 { "nokey" } else if md == d { "source" } else if orig == d { "slot" } else if md >= 0 && elabSrcDecl(md) == d { "src" } else { "differ" }
+  idShadowRow("bakecallee " + c)
+  0
+}
+
+// One shadow row per name `ns[i]` mono binds to `ts[i]` at keyed instance `k`, against the
+// binding of its base instance: `same`, `rep` (one rep, another type), `differ` or `none`.
+function monoSpecBindNote(what: string, k: i32, ns: string[], ts: i32[]) {
+  if k < 0 || idShadowModeOf() == 0 { return 0 }
+  let i = 0
+  while i < ns.length && i < ts.length {
+    const e = elabSpecBindOf(k, ns[i])
+    const m = ts[i]
+    const ok = m >= 0 && m < T.tys.length && e >= 0 && e < T.tys.length
+    const c = if !ok { if e < 0 { "none" } else { "mono-none" } } else if tySame(m, e) { "same" } else if repCanonId(m) == repCanonId(e) { "rep" } else { "differ" }
+    idShadowRow(what + " " + c)
+    i = i + 1
+  }
+  0
+}
+
 // Extend the name→index map over the instances minted since the last call, which the walk
 // resolves by name before collection runs.
 function monoRegisterInstance() {
@@ -5243,6 +5310,7 @@ function monoBakeCallback(
       ) {
         newCallee = mkIdent(cbFnNames[kp], callee.pos)
         identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[kp]))
+        monoBakeCalleeNote(specK, kp, monoFnDeclNamed(cbFnNames[kp]))
       } else if specK < 0 && callee is Ident {
         // A call through a never-written `const` alias of the parameter is a call of it too (D12216).
         let pname = monoBakeAliasParam(n.callFn, fnDeclIx)
@@ -6538,6 +6606,7 @@ function monoBindSeededTyParams(
   tvN: string[],
   tvV: string[],
   tvT: i32[],
+  specK: i32,
 ) {
   for tp in fn.fnTyParams {
     // A call in a cloned body answers from the template call the elaboration keyed (D15495).
@@ -6563,6 +6632,7 @@ function monoBindSeededTyParams(
         monoExplicitBT.push(t)
       }
       monoKeyExtra = monoKeyExtra + tp + "=" + nm + ";"
+      monoSpecBindNote("seedbind", specK, [tp], [t])
     }
   }
   0
@@ -9829,6 +9899,8 @@ function monoMakeInstanceGo(
 ) {
   const callFrame = monoCallFrameSlot
   monoCallFrameSlot = -1
+  const specK = monoSpecGoK
+  monoSpecGoK = -1
   // The delivery this build answers, read in the instance being walked before this one's.
   const cadDel = cadDelivery
   cadDelivery = -1
@@ -9913,7 +9985,9 @@ function monoMakeInstanceGo(
     }
     monoPinKindsNoteFnVal(pinKinds)
     // Registry hit: point this call site at the existing instance.
-    if (monoMakeInstanceHit(k.key, origFe, pinned, calleeIx, annotateI32)) {
+    const rSpec = monoSpecRegOf(specK, "")
+    const hitAt = if rSpec >= 0 { monoKeys[rSpec] } else { k.key }
+    if (monoMakeInstanceHit(hitAt, origFe, pinned, calleeIx, annotateI32)) {
       return monoCadNoteInstance(
         origFe,
         monoLastInstFe,
@@ -10032,6 +10106,9 @@ function monoMakeInstanceGo(
     monoShPendFlush(shAt)
     if !fromKey {
       monoHoleBinding(origFe, params, letTyCol, holeN, holeT, tplCall)
+      monoSpecBindNote("holebind", specK, holeN, holeT)
+    } else if specK >= 0 {
+      idShadowRow("holebind fromkey")
     }
     // The worklist instance this one is: demanded here, its body checked once at this binding.
     const ekN0: string[] = []
@@ -19974,6 +20051,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         tvN,
         tvV,
         tvT,
+        elabSpecKeyOf(specAt),
       )
       monoDefaultUnboundTyParams(
         fn.fnTyParams,
@@ -20038,6 +20116,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       const specKeys0 = monoKeys.length
       const specKWas = monoBakeSpecK
       monoBakeSpecK = elabSpecKeyOf(specAt)
+      monoSpecGoK = monoBakeSpecK
       const made = monoMakeInstance(
         origFe,
         pinned,
@@ -20051,8 +20130,11 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         cbFnNames,
       )
       monoBakeSpecK = specKWas
-      const specFe = if monoKeys.length > specKeys0 { monoInstFe[specKeys0] } else { monoLastInstFe }
+      monoSpecGoK = -1
+      const specFresh = monoKeys.length > specKeys0
+      const specFe = if specFresh { monoInstFe[specKeys0] } else { monoLastInstFe }
       elabSpecMonoGroup(specAt, i32ToStr(specFe))
+      monoSpecSlotNote(elabSpecKeyOf(specAt), specFe, specFresh)
       return made
     }
   }
@@ -21729,9 +21811,10 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       }
       elabSpecMonoGroup(specAt, key)
       // Registry hit: a prior call already specialized this (callee, callback-set) — reuse it.
+      const rHit = monoSpecRegOf(elabSpecKeyOf(specAt), key)
       let r = 0
       while r < monoKeys.length {
-        if monoKeys[r] == key {
+        if r == rHit {
           const cal = nodeAt(c.callFn)
           // R4 writer 7 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
           if cal is Ident {
@@ -21739,6 +21822,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
             monoNoteRenamed(c.callFn, monoInstFe[r])
             sidNoteNodeName(c.callFn, fnStmts[monoInstFe[r]])
           }
+          monoSpecSlotNote(elabSpecKeyOf(specAt), monoInstFe[r], false)
           return 0
         }
         r = r + 1
@@ -21804,6 +21888,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       monoInstOrig.push(fe)
       monoInstName.push(specName)
       monoInstFe.push(instFe)
+      monoSpecSlotNote(elabSpecKeyOf(specAt), instFe, true)
       if monoRegisterInstance() < 0 { return -1 }
       // Walk the ORIGINAL body under this specialization's context so a nested generic call it
       // contains instantiates (idempotent via the registry — the main loop also walks the original).
@@ -25610,6 +25695,8 @@ export function monomorphize(stmts: i32[]) {
   monoArmCall = -1
   monoArmCtx = -1
   monoBakeSpecK = -1
+  monoSpecSlotOf = Map()
+  monoSpecGoK = -1
   monoAliasCallDecl = Map()
   monoRetWidenFns = Map()
   monoWrittenLetHanded = Map()
