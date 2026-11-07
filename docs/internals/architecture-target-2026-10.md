@@ -2603,6 +2603,40 @@ the as-written inert map site no longer decides a slot. `monoInertValues` remain
 record for its other readers: `monoNamesUsedAsValue`, `monoSpreadHostInert`, `monoStubValueOk`
 (emit_state), `emitIdentNonLocalRead` and `stmtIsBareFnName` (wasmEmit).
 
+**The reach index's inert answer is `value_reach`'s own record, and it is order-dependent**
+(2026-11-07). `monoReachIndex` asks `vrNoteInertAtIndex` of each candidate as each instance body is
+indexed, and `vrInertAtIndex` returns the answer it got then. A clone takes its original's answer at
+copy time (`vrInertAtIndexCopy`). The five readers ask `vrValueInert`, which is that record or
+`monoInertValues`. Asked at query time instead, against the finished index, 62 decisions over 23,456
+programs read live where the record reads inert: stub 33 + 6 clone, closure 11 + 4 clone, names 7 + 1
+clone. No call reaches any of them. Every one is lost at a single step, from a list literal to the
+un-annotated binding it initializes, and lost there because the monomorphizer annotated that
+binding after the record was taken (`LetDecl` is followed only while `letType < 0`). With the step
+reading the binding as written, all 62 read inert at query time, 0 differ. D10251 is one:
+`const xs = [id]`, and the instance's annotation of `xs` hides `xs`'s reads. The order dependence
+is real and this record contains it, but it is the rewrite racing the question, not a later body
+reaching a call. Before the query-time answer can replace the record, the `LetDecl` step needs to
+read the source annotation.
+
+`value_reach` is therefore still a live fact source for these readers, and its inert answer is the
+next fact that needs an elaboration twin. It is not `elabSlotUncalled`. "Reaches no call" is one
+half of it. The other half, "nothing observes its signature", is something `value_reach` answers
+and the elaboration does not.
+
+The other shares of `monoInertValues` are listed below with their sources:
+- the flow leaf (`monoFlowNoteInertLeaf`, 316 decisions) and the uncalled list slot
+  (`monoUncalledSlotFnTy`, 23) move to a node → (binding, path) map and
+  `elabSlotUncalledOmitting`;
+- the call returns (`monoFlowNoteCallRets`, 8) move to the function's return slot;
+- the held-value coerce (`monoHeldValueAt`, 50, stub only) keeps its source in the coerced pin.
+  That pin closes the value, so the value is live to `value_reach` in all 50, and it is not
+  forced into `value_reach`.
+
+**Clone to source is `elabSrcDecl`.** Mono's instance choice is compared with the elaboration's
+after mapping each lambda clone through `elabSrcDecl`. That mapping brings D3928's 21 differing
+decisions to agree. `nodeSrc`, `declOrigOf` and `lfOriginOf` do not link an instance body's lambda
+copies.
+
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
 move no output. These are the reads the gate does not answer: an argument handed on, a loop over a
