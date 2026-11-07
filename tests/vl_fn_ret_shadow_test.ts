@@ -1,5 +1,5 @@
-// THE EMITTED-FUNCTION RESULT SHADOW (`compiler/fn_ret_shadow.vl`, architecture target §4, the
-// emitter pass rows that re-derive).
+// THE EMITTED-FUNCTION RESULT SHADOW (`compiler/fn_ret_shadow.vl`; the emitter pass rows that
+// re-derive, docs/internals/refactor-notes/2026-10-25-scoreboard-baselines.md).
 //
 // `fnRecordedRetTy` answers each emitted function's result from the elaboration or the checker.
 // Nothing reads it to decide anything yet; the shadow counts each emitted function by how that

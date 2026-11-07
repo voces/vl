@@ -3,6 +3,9 @@
 Repo-wide instructions. Subsystem detail lives in `docs/internals/`; `ROADMAP.md` owns the
 forward plan, `CHANGELOG.md` the shipped work, `DECISIONS.md` the non-obvious rationale.
 
+A refactor measurement goes in a new dated file under `docs/internals/refactor-notes/`, never into
+`architecture-target-2026-10.md`; the PR that moves a migration step updates that doc's status section.
+
 ## `std:*` changes get a second pass — required
 
 **Any change that adds or alters an export in `std/*.vl` MUST be reviewed by the
