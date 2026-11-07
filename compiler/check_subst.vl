@@ -612,9 +612,9 @@ export function tyFirstVarOwner(ty: i32, depth: i32): string {
 }
 
 // Whether every type variable in `ty` is the own scheme of a function type it sits in: that
-// function type's variables are all one generic's parameters, and that generic is none of
-// `encl`, the functions enclosing the site. Such a variable binds afresh at each call; one
-// outside any function type, or of an enclosing generic, is open. A too-deep type answers false.
+// function type's variables all belong to one function, a generic's parameters or holes of its
+// un-annotated parameters, and it is none of `encl`, the functions enclosing the site. Any other
+// variable is open in the enclosing instance. A too-deep type answers false.
 export function tyVarsOwnScheme(ty: i32, encl: i32[]): boolean {
   tyVarsOwnSchemeGo(ty, encl, 64)
 }
@@ -647,15 +647,102 @@ function tyVarsOwnSchemeGo(ty: i32, encl: i32[], depth: i32): boolean {
     }
     TyFunc => {
       if !tyHasTyVarGo(ty, depth) { return true }
-      const owner = tyFirstVarOwner(ty, depth)
-      const d = if owner == "" { -1 } else { fnDeclIx[owner] ?? -1 }
-      if d < 0 || d >= P.nodes.length || i32ListHas(encl, d) { return false }
-      const fd = nodeAt(d)
-      if !(fd is FuncDecl) || fd.fnTyParams.length == 0 { return false }
-      tyVarsOwnedBy(ty, owner, [], depth)
+      const d = tyFuncSchemeDecl(ty, -1, depth)
+      d >= 0 && !i32ListHas(encl, d)
     }
     TyPrim | TyLit | TyErr => true
   }
+}
+
+// The function declaring every type variable of `ty` when `want` is -1 or that function, else -1:
+// a generic's own parameter, or a hole of one of its un-annotated parameters.
+function tyFuncSchemeDecl(ty: i32, want: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return want }
+  if depth <= 0 { return -1 }
+  const t = tyAt(ty)
+  let tys: i32[] = []
+  match t {
+    TyVar => {
+      const d = tyVarSchemeDecl(ty)
+      if d < 0 || (want >= 0 && d != want) { return -1 }
+      return d
+    }
+    TyArray => {
+      tys = [t.aElem]
+    }
+    TyNullable => {
+      tys = [t.nInner]
+    }
+    TyNeg => {
+      tys = [t.negTy]
+    }
+    TyMap => {
+      tys = [t.mKey, t.mVal]
+    }
+    TyObj => {
+      tys = t.objFieldTypes
+    }
+    TyUnion => {
+      tys = t.uMembers
+    }
+    TyFunc => {
+      tys = t.fnParamTypes.slice(0, t.fnParamTypes.length)
+      tys.push(t.fnRet)
+    }
+    TyPrim | TyLit | TyErr => {}
+  }
+  let w = want
+  for c in tys {
+    w = tyFuncSchemeDecl(c, w, depth - 1)
+    if w == -1 && want >= 0 { return -1 }
+    if w == -1 && tyHasTyVarGo(c, depth) { return -1 }
+  }
+  w
+}
+
+// The function declaration type variable `tv` is a parameter of, or -1: its recorded owner where
+// that names a generic declaring it, else the function a parameter hole's name (`?f.0`,
+// `?f@12.0`) names, its own or its owner's (an operator hole is owned by the parameter's).
+function tyVarSchemeDecl(tv: i32): i32 {
+  const t = tyAt(tv)
+  if !(t is TyVar) { return -1 }
+  const owner = tyVarOwnerOf(tv)
+  const d = if owner == "" { -1 } else { fnDeclIx[owner] ?? -1 }
+  if d >= 0 && d < P.nodes.length {
+    const fd = nodeAt(d)
+    if fd is FuncDecl && strListHas(fd.fnTyParams, t.tvName) { return d }
+  }
+  if !tyIsHole(tv) { return -1 }
+  const h = paramHoleDecl(t.tvName)
+  if h >= 0 { return h }
+  paramHoleDecl(owner)
+}
+
+// The function declaration parameter hole name `nm` (`?f.0`, `?f@12.0`) names, or -1.
+function paramHoleDecl(nm: string): i32 {
+  if nm.length < 4 || nm.slice(0, 1) != "?" || nm.slice(1, 2) == "#" {
+    return -1
+  }
+  let dot = nm.length - 1
+  while dot >= 0 && nm.charCodeAt(dot) != 46 { dot = dot - 1 }
+  if dot < 2 { return -1 }
+  const head = nm.slice(1, dot)
+  const at = head.indexOf("@")
+  let h = -1
+  if at < 0 {
+    h = fnDeclIx[head] ?? -1
+  } else {
+    h = 0
+    let i = at + 1
+    while i < head.length {
+      const c = head.charCodeAt(i)
+      if c < 48 || c > 57 { return -1 }
+      h = h * 10 + c - 48
+      i = i + 1
+    }
+  }
+  if h < 0 || h >= P.nodes.length || !(nodeAt(h) is FuncDecl) { return -1 }
+  h
 }
 
 // `tyFirstVarOwner` over `tys`, in order.

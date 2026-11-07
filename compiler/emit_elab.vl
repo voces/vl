@@ -21,7 +21,7 @@ import {
   fnTagCallSetOf,
   fnTagCalls,
 } from "./check_elab_cap"
-import { tyArrayElemIx } from "./check_types"
+import { tyArrayElemIx, tyHoldsObj } from "./check_types"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { paramHoleName } from "./check_tp_join"
 import { decDigitsOf } from "./strutil"
@@ -75,6 +75,7 @@ import {
   arenaEpochNow,
   callTyArgsOf,
   elseIfLink,
+  fnTpBoundOf,
   hasNamedArgs,
   hasSpreadItem,
   i32ToStr,
@@ -1882,6 +1883,57 @@ export function elabSpecDeclsOf(k: i32): i32[] { ekSpecDs[k] ?? [] }
 // The declaration argument-keyed instance `k` instances; -1 for any other key.
 export function elabSpecDeclAt(k: i32): i32 {
   if ekSpecBase.has(k) { ekDecl[k] } else { -1 }
+}
+
+// The type argument-keyed instance `k`'s base instance binds name `tp` to; -1 where it binds
+// none, and for a key that is not argument-keyed or whose base is the root's typing.
+export function elabSpecBindOf(k: i32, tp: string): i32 {
+  const b = ekSpecBase[k] ?? -1
+  if b < 0 || b >= ekDecl.length {
+    -1
+  } else {
+    bindOf(ekNames[b], ekTys[b], tp)
+  }
+}
+
+// At argument-keyed instance `k`, binds into `hN`/`hT` each hole parameter of generic
+// declaration `decl` as `k`'s base instance binds it. False, binding nothing, for any other `k` and where
+// the base binds some hole to no type.
+export function elabSpecHoleBind(
+  decl: i32,
+  params: i32[],
+  k: i32,
+  hN: string[],
+  hT: i32[],
+): boolean {
+  if k < 0 || decl < 0 || decl >= P.nodes.length { return false }
+  const ftIx = nodeTyIxOf(decl)
+  if ftIx < 0 || ftIx >= T.tys.length { return false }
+  const ft = tyAt(ftIx)
+  if !(ft is TyFunc) { return false }
+  const ns: string[] = []
+  const ts: i32[] = []
+  let i = 0
+  while i < params.length && i < ft.fnParamTypes.length {
+    const pp = nodeAt(params[i])
+    if pp is Param && pp.parType < 0 {
+      const pt = ft.fnParamTypes[i]
+      const pv = if pt >= 0 && pt < T.tys.length { tyAt(pt) } else { tyAt(TY_NEVER) }
+      if !(pv is TyVar) { return false }
+      const t = elabSpecBindOf(k, pv.tvName)
+      if t < 0 { return false }
+      ns.push(pv.tvName)
+      ts.push(t)
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < ns.length {
+    hN.push(ns[i])
+    hT.push(ts[i])
+    i = i + 1
+  }
+  true
 }
 
 // How many other instances checking the argument-keyed ones minted.
@@ -9013,6 +9065,9 @@ let erArgRep: i32[] = []
 // Beside each slot of `erArgRep`, the record the argument is built at where the call's bind row
 // keys or pins it at its rep, against the argument's own type; -1 otherwise.
 let erArgBuilt: i32[] = []
+// Beside each slot, the type a list or record literal argument is built at where that is the
+// instance parameter's type and not the literal's own (a converting delivery); -1 otherwise.
+let erArgConv: i32[] = []
 // Each bundle record a reach row delivers, as a slot's rep or a closure rep's one parameter, and
 // its signatures in field order.
 let erBundles: i32[] = []
@@ -9032,6 +9087,7 @@ export function elabReachRows() {
   erArgAt = []
   erArgRep = []
   erArgBuilt = []
+  erArgConv = []
   erBundles = []
   erBundleSigs = Map()
   erRowAt = Map()
@@ -9052,12 +9108,14 @@ export function elabReachRows() {
       while i < np {
         erArgRep.push(elabArgRepFrom(ix, i, ks[j]))
         erArgBuilt.push(-1)
+        erArgConv.push(-1)
         i = i + 1
       }
       j = j + 2
     }
   }
   elabReachBuilt()
+  elabReachConv()
   elabReachBundles()
   0
 }
@@ -9233,6 +9291,182 @@ export function elabArgBuiltProbe(): i32 {
     if b >= 0 { n = n + 1 }
   }
   n
+}
+
+// Fills `erArgConv` for each list or record literal the write index places at a recorded call.
+function elabReachConv() {
+  cwIxWant()
+  let r = 0
+  while r < erCall.length {
+    const cn = nodeAt(erCall[r])
+    if cn is Call {
+      const end = if r + 1 < erArgAt.length { erArgAt[r + 1] } else { erArgRep.length }
+      for a0 in cn.callArgs {
+        const a = parenPeelIx(a0)
+        if (
+          a >= 0
+          && a < cwIxCoveredLen()
+          && cwIxUpKind[a] == CW_UP_ARG
+          && cwIxUp[a] == erCall[r]
+        ) {
+          const p = elabArgParamOf(erCall[r], erKey[r], a, cwIxUpAux[a])
+          const at = erArgAt[r] + p
+          if at < end {
+            erArgConv[at] = elabArgConvOf(erCall[r], p, a, erFrom[r])
+          }
+        }
+      }
+    }
+    r = r + 1
+  }
+  0
+}
+
+// The parameter of instance `k` that argument `a`, written as argument `j` of call `ix`, takes: its
+// place among the call's arguments now, where a rewrite put the receiver first, and one further on
+// for a method call whose receiver the instance takes first as `self`.
+function elabArgParamOf(ix: i32, k: i32, a: i32, j: i32): i32 {
+  const cn = nodeAt(ix)
+  if !(cn is Call) || k < 0 || k >= ekDecl.length { return j }
+  let q = 0
+  while q < cn.callArgs.length && parenPeelIx(cn.callArgs[q]) != a { q = q + 1 }
+  if q >= cn.callArgs.length { q = j }
+  const cf = if cn.callFn >= 0 { nodeAt(cn.callFn) } else { null }
+  const dn = nodeAt(ekDecl[k])
+  if (
+    !(cf is Member)
+    || !(dn is FuncDecl)
+    || dn.fnParams.length <= cn.callArgs.length
+  ) {
+    return q
+  }
+  const p0 = nodeAt(dn.fnParams[0])
+  if p0 is Param && p0.parName == "self" { q + 1 } else { q }
+}
+
+// The instance parameter type list or record literal `a` (parameter `i` of call `ix`, reached from
+// `from`) is built at, where that closed type has the literal's shape and admits the literal's own
+// type without being it: a list of literals widened (`[v]` at `f64[]`) or of records built wider.
+// -1 for any other argument, and where the parameter is a union.
+function elabArgConvOf(ix: i32, i: i32, a: i32, from: i32): i32 {
+  const n = nodeAt(a)
+  if !(n is ArrayLit || n is ObjLit) { return -1 }
+  const pt = elabCallParamTyFrom(ix, i, from)
+  if pt < 0 || pt >= T.tys.length || tyHasTyVar(pt) || !elabTyClosed(pt, 0) {
+    return -1
+  }
+  // A nullable parameter takes the literal built at it only where the declaration's parameter is
+  // a bare type variable; under a declared `| null` the literal is built at its own type and boxed.
+  let shape = pt
+  const pv = tyAt(pt)
+  if pv is TyNullable {
+    if !elabDeclParamIsTyVar(ix, i, from) { return -1 }
+    shape = pv.nInner
+  }
+  if shape < 0 || shape >= T.tys.length { return -1 }
+  if n is ArrayLit && !(tyAt(shape) is TyArray) { return -1 }
+  if n is ObjLit && !(tyAt(shape) is TyObj) { return -1 }
+  const kt = if from >= 0 { elabNodeTy(a, from) } else { -1 }
+  const own = if kt >= 0 { kt } else { nodeTyIxOf(a) }
+  if own < 0 || own >= T.tys.length || tyHasTyVar(own) || tySame(own, pt) {
+    return -1
+  }
+  if !assignable(own, pt) { return -1 }
+  // Built at the parameter: a literal the checker left open, or one holding records. A closed
+  // literal of other values converts at the delivery instead.
+  const ct = nodeTyIxOf(a)
+  if ct < 0 || tyHasTyVar(ct) || tyReachesHole(ct, 16) { return pt }
+  if tyHoldsObj(pt, 8) { pt } else { -1 }
+}
+
+// Whether parameter `i` of the declaration call `ix` reaches from `from` is written as a bare type
+// variable.
+function elabDeclParamIsTyVar(ix: i32, i: i32, from: i32): boolean {
+  const k = elabCallInstFrom(ix, from)
+  if k < 0 || k >= ekDecl.length { return false }
+  const dn = nodeAt(ekDecl[k])
+  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return false }
+  const t = nodeTyIxOf(dn.fnParams[i])
+  t >= 0 && t < T.tys.length && tyAt(t) is TyVar
+}
+
+// Whether the instance call `ix` reaches from `from` is of a declaration with a bounded type
+// parameter: a parameter's rep widened to a bound is the parameter's, the argument keeping its record.
+function elabCalleeBounded(ix: i32, from: i32): boolean {
+  const k = elabCallInstFrom(ix, from)
+  if k < 0 || k >= ekDecl.length { return false }
+  const d = ekDecl[k]
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) { return false }
+  let j = 0
+  while j < dn.fnTyParams.length {
+    if fnTpBoundOf(d, j) >= 0 { return true }
+    j = j + 1
+  }
+  false
+}
+
+// The type argument `a` is delivered at by the call it is handed to, reached from instance `from`,
+// where that is not its own: the record the call builds it at (`erArgBuilt`), the wider record its
+// parameter's rep is where no bound widened it (`erArgRep`), or the parameter's type a literal is
+// built at (`erArgConv`). -1 where it is delivered at its own type or at no recorded call.
+export function elabArgDeliveredTy(a: i32, from: i32): i32 {
+  cwIxWant()
+  if a < 0 || a >= cwIxCoveredLen() || cwIxUpKind[a] != CW_UP_ARG { return -1 }
+  const ix = cwIxUp[a]
+  const r0 = erRowAt[ix] ?? -1
+  if r0 < 0 { return -1 }
+  let r = r0
+  let hit = -1
+  while r < erCall.length && erCall[r] == ix {
+    if erFrom[r] == from { hit = r }
+    r = r + 1
+  }
+  if hit < 0 { return -1 }
+  const end = if hit + 1 < erArgAt.length { erArgAt[hit + 1] } else { erArgRep.length }
+  // `erArgBuilt` is placed by argument position, the other two columns by parameter.
+  const bt = erArgAt[hit] + cwIxUpAux[a]
+  if bt < end && erArgBuilt[bt] >= 0 { return erArgBuilt[bt] }
+  const i = elabArgParamOf(ix, erKey[hit], a, cwIxUpAux[a])
+  const at = erArgAt[hit] + i
+  if at >= end { return -1 }
+  if erArgConv[at] >= 0 { return erArgConv[at] }
+  const rep = erArgRep[at]
+  const pt = elabCallParamTyFrom(ix, i, from)
+  if (
+    rep >= 0
+    && pt >= 0
+    && !elabCalleeBounded(ix, from)
+    && elabCallBundleSigsFrom(ix, i, from).length < 2
+    && (recRepWidens(pt, rep) || recListRepWidens(pt, rep))
+  ) {
+    return rep
+  }
+  -1
+}
+
+// How many argument slots the reach rows record a converting delivery at (`erArgConv`), in the
+// units, and in the thousands each one whose parameter is not the instance's; read by
+// `tests/vl_elab_arg_rep_test.ts`.
+export function elabArgConvProbe(): i32 {
+  let n = 0
+  let bad = 0
+  let r = 0
+  while r < erCall.length {
+    const end = if r + 1 < erArgAt.length { erArgAt[r + 1] } else { erArgRep.length }
+    let at = erArgAt[r]
+    while at < end {
+      const c = erArgConv[at]
+      if c >= 0 {
+        n = n + 1
+        const pt = elabCallParamTyFrom(erCall[r], at - erArgAt[r], erFrom[r])
+        if pt < 0 || !tySame(pt, c) { bad = bad + 1 }
+      }
+      at = at + 1
+    }
+    r = r + 1
+  }
+  bad * 1000 + n
 }
 
 // Whether every call through parameter `par` under node `x` hands one argument, a read naming a
@@ -13450,6 +13684,45 @@ function elabReadStamps(r: i32, out: i32[]) {
 // The calls the value of `d` reaches as their callee, recorded while `elabValueOnlyCall` climbs.
 let elabCallRec = false
 let elabCallsSeen: i32[] = []
+
+// The closed type of parameter `i` of instance `k`, a hole parameter's read from its hole name;
+// -1 where it stays open.
+function elabKeyParamTy(k: i32, i: i32): i32 {
+  if k < 0 || k >= ekDecl.length { return -1 }
+  const d = ekDecl[k]
+  const sig = if d >= 0 && d < P.nodes.length { nodeTyIxOf(d) } else { -1 }
+  if sig < 0 || sig >= T.tys.length { return -1 }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || i < 0 || i >= f.fnParamTypes.length { return -1 }
+  const fd = nodeAt(d)
+  const nm = if fd is FuncDecl { fd.fnName } else { "" }
+  let st = substTyDeep(f.fnParamTypes[i], ekNames[k], ekTys[k])
+  if st >= 0 && tyHasHole(st) {
+    const at = strListIndexOf(ekNames[k], paramHoleName(nm, d, i))
+    st = if at >= 0 && at < ekTys[k].length { ekTys[k][at] } else { -1 }
+  }
+  if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
+  st
+}
+
+// The closed type of parameter `pi` of lambda `lam` (with `n` parameters) in the instance being
+// walked: the one its instances keyed under that instance agree on, else the one the calls inside
+// it close (`elabLamParamTy`); -1 outside an instance or where neither closes.
+export function elabLamInstParamTy(lam: i32, pi: i32, n: i32): i32 {
+  const top = elabWalkTop()
+  if top < 0 || lam < 0 { return -1 }
+  let r = -1
+  for k in elabKidsAt(elabSrcDecl(lam), top) {
+    const t = elabKeyParamTy(k, pi)
+    if t < 0 || (r >= 0 && !tySame(r, t)) {
+      r = -2
+      break
+    }
+    r = t
+  }
+  if r >= 0 { return r }
+  elabLamParamTy(lam, pi, n)
+}
 
 // The closed type of parameter `pi` of lambda `lam` (with `n` parameters) at the one function type
 // of the calls its value reaches as callee in the instance being walked, or in an instance that

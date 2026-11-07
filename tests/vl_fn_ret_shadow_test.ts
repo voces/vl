@@ -644,6 +644,19 @@ const COL_REC = `function mk(n: i32) { { a: n, b: 2 } }
 print(mk(3).a)
 `;
 
+// A function returning an assignment reads its value off the recorded result where the target
+// cell's rep agrees (`setN`); a module literal-union cell holds the atom while the recorded value
+// is the string literal, so `setK` is left to the walk.
+const COL_ASSIGN = `type K = "a" | "b"
+let k: K = "a"
+function setK() { return (k = "b") }
+let n = 0
+function setN() { return (n = 3) }
+setK()
+print(setN())
+print(k)
+`;
+
 Deno.test({
   name: "fn-ret shadow: return columns",
   ignore,
@@ -663,6 +676,16 @@ Deno.test({
       true,
       "post moved: moved: agree struct | mk=1; post seed: kind struct vs i32 | mk=1; " +
         "post settled: agree struct | mk=1",
+      "col",
+    );
+    expectRows(
+      "col assignment",
+      COL_ASSIGN,
+      DROP_NONE,
+      true,
+      "post moved: unmoved: assignment target's rep differs | setK=1; " +
+        "post seed: assignment target's rep differs | setK=1; " +
+        "post settled: assignment target's rep differs | setK=1",
       "col",
     );
     expectRows(
