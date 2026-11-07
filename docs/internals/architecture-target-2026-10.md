@@ -3086,6 +3086,11 @@ programs, counted by program).
   corpus cells, 26 in `generics` and 12 elsewhere. At 2 of those, `listed-hole-fn-written-param-reject`
   and D15011's witness, the value-instance signature differs from mono, and mono keeps them.
   Over 19,316 programs no byte moves.
+- **Switched: a nested list of hole functions reads its binding's slot fact.**
+  `monoCbFnListRowSpell` spells a callback's row from the element of `elabSlotTyAt` on the binding,
+  and `monoBoundFnListElemsTy` takes the const's slot fact as the list type, each where the fact
+  is a closed list; mono's annotation spelling and bound type answer where it is not. The fact
+  agrees at 4 of 4 and 1 of 1 decisions. Over 19,316 programs no byte moves.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
