@@ -1,6 +1,6 @@
 # Step 7: voidness read from the recorded result (`computeVoidFns` retired)
 
-Measured 2026-11-07 on master `ac6882d5`, 4-core box.
+Measured 2026-11-07 on master `ac6882d5`, 4-core box; the proof rows re-read after merging master `f92d874b`.
 
 ## The population
 
@@ -40,8 +40,8 @@ deleted.
 
 | check | result |
 |---|---|
-| fixpoint | two `refresh-compiler.sh` runs byte-identical |
-| seed size | 6,425,129 → 6,424,530 (−599) |
+| fixpoint | two `refresh-compiler.sh` runs byte-identical, and master's own fixpoint as the base |
+| seed size | 6,436,623 → 6,434,772 (−1,851), both fixpoints |
 | byte sweep, 19,355 files | 14,507 byte-identical, 0 moved; 4,848 rejected identically |
 
 ## The kind shadow on master (`fnKindShadowArm`), for the next PR
