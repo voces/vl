@@ -2010,6 +2010,14 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   `monoBindFromLaterArg` is deleted. Their shadows: the empty-literal pre-bind agrees in all 3
   programs that reach it, and the non-arrow pre-bind agrees in 40 of 46, binds nothing in 5, and is
   mono only in 1 (`closures/fn-value-generic-nullable-fn-param.vl`), which prints the same without it.
+  `monoBindBareArenaPins` is deleted: a bare type parameter's arena binding (D2734) reads the same
+  key. It adds a binding in 23 programs; 19 agree, none differ, and 5 are mono only, a generic handed
+  as a value whose call key declines. Those 5 build the same bytes without mono's pin and join the
+  cells above: `generics/declared-generic-to-two-hole-params-null-at-each.vl`,
+  `generics/hole-call-of-generic-at-its-own-instance.vl`, `closures/fn-value-generic-nullable-fn-param.vl`,
+  D14582, D6541. `monoBindEnclosingPins` decides nothing: the enclosing pins it registers come from
+  `monoEnclosingPinRow`, which reads the enclosing instance's key (`ekNames` / `ekTys`), so it is
+  class (c).
   The per-argument pins are a separate fact (the argument's representation, per union arm) and
   wait for the producers.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
