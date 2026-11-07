@@ -2911,6 +2911,16 @@ programs, counted by program).
   plain twin through one instance, is still refused, and now by the soft-twin test whose message
   names the fix. Both call orders are fixtures (`error-literal-union-map-twin-through-one-instance*`).
   Over 19,316 programs no byte moves.
+- **Switched: a cloned lambda's parameter takes the elaboration's type at the instance.**
+  `monoLamSubstParams` already read the lambda's elaborated type (`elabNodeTy` at the walk key)
+  for an annotation that rides a type parameter. Its un-annotated arm now reads it too: where
+  `monoLamParamPinAnn` pins a parameter, the elaboration's closed type is used, and mono's pin
+  only where that type is open. Shadowed over 23,384 programs, the arm acts in 690. The
+  elaboration agrees in 602 and differs in none, and is open in 89, which stay on mono's pin. In 74 more the elaboration
+  closes a parameter mono leaves bare (69 `i32`). Those keep mono's answer and are priced
+  separately. The substitution arm never ran with the elaboration open, so that branch is now a
+  loud internal refusal. About 140 programs reach the arm with the type closed and keep running.
+  Over 19,316 programs no byte moves.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
