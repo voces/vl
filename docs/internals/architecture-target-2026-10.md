@@ -2337,6 +2337,18 @@ reads, and the chain gate (`mfrChainFns`) owns them, so **B2's consumer takes co
 and a second consumer of a function-only set is not added. The 232 container roots are B2's
 widening, sweep-proven with every mover named; a subclass that moves output is declined.
 
+**B2a: the planner's binding roots are the elaboration's** (2026-11-07). `monoFlowDeclVals` reads
+`mfrLitsOf`, and the let, parameter and return walkers are gone. A set holding anything but a
+container is unknown, and **function roots are admitted only when the declaration's own walk reached
+them through a map read** (`mfrLitsDirectFn`): that is the value the walkers' map read gave, and
+dropping it lost six named programs, while a per-node mark admitted an alias of a stored function. A `.slice()` copy mono rewrote holds its minted spread literal. Over the 7,538 sweep
+programs against master's fixpoint: 0 runs lost, 0 outputs moved, 16 of 16 named programs run, and
+three move bytes with the same output. `hole-fn-record-relayed-to-param-field-call` (parameter `a`)
+and `generic-list-sliced-called-at-two-types` (`fs`) are class-3 container widenings, and
+`generic-fn-param-in-un-annotated-container` names its map-read generic by another node. The
+expression walker `monoFlowValsOf`, the map and alias planners, `monoFlowElemsGen` and loop-variable
+rows (D9981, which the elaboration does not derive) are B2b.
+
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
 move no output. These are the reads the gate does not answer: an argument handed on, a loop over a

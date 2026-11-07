@@ -651,6 +651,11 @@ let mfrLitState: i32[] = []
 let mfrLitStart: i32[] = []
 let mfrLitNodes: i32[] = []
 let mfrLitMapDecl: i32[] = []
+// 1 at a binding whose roots hold a function its own walk reached other than through a map read.
+let mfrLitDirectFn: i32[] = []
+// The walk's nesting inside map reads, and whether it pushed a function outside one.
+let mfrLitStoredDepth = 0
+let mfrLitDirect = false
 
 // Fills the literal roots of every binding, its links gated as the chain walk's are.
 export function mfrLitsRun() {
@@ -678,18 +683,26 @@ export function mfrLitsRun() {
   mfrLitStart = __array_new__(len, -1)
   mfrLitNodes = []
   mfrLitMapDecl = __array_new__(len, -1)
+  mfrLitDirectFn = __array_new__(len, 0)
   let i = 0
   while i < len {
     const n = nodeAt(i)
-    if n is LetDecl || n is Param { mfrLitsDecl(i) }
+    if n is LetDecl || n is Param || n is FuncDecl { mfrLitsDecl(i) }
     i = i + 1
   }
   0
 }
 
+// The literal roots expression `x` can evaluate to, onto `out`; false when they are unknown or
+// `x` is a node minted after the elaboration.
+export function mfrLitsExprOf(x: i32, out: i32[]): boolean {
+  mfrLitsVal(x, out)
+}
+
 // The literal roots binding or function `d` can hold, onto `out`; false when they are unknown.
 function mfrLitsAt(d: i32, out: i32[]): boolean {
   if d < 0 || d >= mfrLitState.length || mfrLitState[d] != 2 { return false }
+  if mfrLitStoredDepth == 0 && mfrLitDirectFn[d] == 1 { mfrLitDirect = true }
   let k = mfrLitStart[d]
   while k >= 0 && k < mfrLitNodes.length && mfrLitNodes[k] >= 0 {
     out.push(mfrLitNodes[k])
@@ -724,7 +737,15 @@ function mfrLitsDecl(d: i32): boolean {
   if st != 0 { return st == 2 }
   mfrLitState[d] = 1
   const out: i32[] = []
-  if !mfrLitsDeclVals(d, out) || out.length == 0 {
+  const was = mfrLitDirect
+  const depth = mfrLitStoredDepth
+  mfrLitDirect = false
+  mfrLitStoredDepth = 0
+  const ok = mfrLitsDeclVals(d, out)
+  if mfrLitDirect && d < mfrLitDirectFn.length { mfrLitDirectFn[d] = 1 }
+  mfrLitDirect = was
+  mfrLitStoredDepth = depth
+  if !ok || out.length == 0 {
     mfrLitState[d] = 3
     return false
   }
@@ -790,6 +811,15 @@ function mfrLitIsMapNew(x: i32): boolean {
 }
 
 function mfrLitPush(out: i32[], x: i32) {
+  const xn = nodeAt(x)
+  if (
+    mfrLitStoredDepth == 0
+    && !(xn is ArrayLit
+      || xn is ObjLit
+      || x < mfrLitMapDecl.length && mfrLitMapDecl[x] >= 0)
+  ) {
+    mfrLitDirect = true
+  }
   if !i32ListHas(out, x) { out.push(x) }
   0
 }
@@ -936,11 +966,21 @@ function mfrLitsStored(base: i32[], out: i32[]): boolean {
     if cwSlotWrittenValues(cwKeyOfDecl(ow), ["[]"], sv, ats) < 0 {
       return false
     }
+    mfrLitStoredDepth = mfrLitStoredDepth + 1
+    let ok = true
     for w in sv {
-      if !mfrLitsVal(w, out) { return false }
+      if ok && !mfrLitsVal(w, out) { ok = false }
     }
+    mfrLitStoredDepth = mfrLitStoredDepth - 1
+    if !ok { return false }
   }
   true
+}
+
+// Whether binding `d` may hold a function its walk reached other than through a map read; true
+// for a binding minted after the elaboration.
+export function mfrLitsDirectFn(d: i32): boolean {
+  d < 0 || d >= mfrLitDirectFn.length || mfrLitDirectFn[d] == 1
 }
 
 // The function the checker resolved member or operator call `ix` to (`elabCallDeclOf`); -1 when

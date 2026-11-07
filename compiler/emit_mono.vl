@@ -3,6 +3,8 @@ import { recEnclosingFn } from "./check_fit_rules"
 import {
   mfrChainFns,
   mfrElabNames,
+  mfrLitsDirectFn,
+  mfrLitsExprOf,
   mfrLitsOf,
   mfrShadowNote,
 } from "./mfr_shadow"
@@ -135,7 +137,7 @@ import {
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
-import { cwFnValueDeclOf, cwIxBuild } from "./check_write_scan"
+import { cwFnValueDeclOf, cwIxBuild, cwIxCoveredLen } from "./check_write_scan"
 import { tyLeavesDisjoint } from "./check_type_shape"
 import {
   callArgRepTy,
@@ -12358,45 +12360,6 @@ function monoFlowReads(stmts: i32[]): i32 {
     monoFlowLetCalls(d)
     monoFlowConstCallArgs(d)
   }
-  // Shadow (architecture-target §3.4, B2): each planned binding's elaboration literal roots
-  // against the walkers', each value read as its literal or the generic it names.
-  if repShadowOn {
-    for d in lets {
-      const ev: i32[] = []
-      const eok = mfrLitsOf(d, ev)
-      const pair = [monoFlowDeclVals(d), ev]
-      const canon: i32[][] = [[], []]
-      let side = 0
-      while side < 2 {
-        for v in pair[side] {
-          const vn = nodeAt(v)
-          let c = v
-          if !(vn is ArrayLit || vn is ObjLit || monoFlowMapOwner(v) >= 0) {
-            const g = monoFlowLeafGen(v)
-            c = if g >= 0 { P.nodes.length + g } else { -1 }
-          }
-          if !i32ListHas(canon[side], c) { canon[side].push(c) }
-        }
-        side = side + 1
-      }
-      let o = "agree"
-      if canon[0].length == 0 && !eok {
-        o = "both-unknown"
-      } else if canon[0].length == 0 {
-        o = "elab-only"
-      } else if !eok {
-        o = "walker-only"
-      } else {
-        for x in canon[0] {
-          if !i32ListHas(canon[1], x) { o = "differ" }
-        }
-        for x in canon[1] {
-          if !i32ListHas(canon[0], x) { o = "differ" }
-        }
-      }
-      repABNote("mfrlits", o, if nodeAt(d) is Param { "param" } else { "let" })
-    }
-  }
   for d in lets { monoFlowMapNoteAliasWrites(d) }
   for a in mfrAnnLets { monoFlowAnnLits(a) }
   monoFlowAdmitChain(calls)
@@ -13342,116 +13305,45 @@ function monoFlowLoopVarVals(d: i32, out: i32[]): boolean {
   true
 }
 
-// The literals candidate binding `d` may hold, from its initializer and every whole `=` to it,
-// or that function `d` returns; empty when it may be anything else or depends on itself.
+// The elaboration's roots of binding or function `d` (`mfrLitsOf`): empty when unknown, or when
+// a root is no container and `d` reached a function other than through a map read. A `.slice()`
+// copy mono rewrote to a minted spread literal holds that literal in place of its receiver's roots.
 function monoFlowDeclVals(d: i32): i32[] {
   const st = mfrValsState[d] ?? 0
   if st == 2 { return mfrVals[d] ?? [] }
   if st != 0 { return [] }
-  mfrValsState[d] = 1
-  const out: i32[] = []
-  const ok = monoFlowRetVals(d, out)
-    || monoFlowLetVals(d, out)
-    || monoFlowParamVals(d, out)
-  if !ok {
-    mfrValsState[d] = 3
-    return []
+  mfrValsState[d] = 3
+  let ev: i32[] = []
+  if !mfrLitsOf(d, ev) { return [] }
+  const dn = nodeAt(d)
+  if dn is LetDecl {
+    const iv = unwrapParen(dn.letInit)
+    const il = if iv >= 0 { nodeAt(iv) } else { null }
+    if (
+      il is ArrayLit
+      && il.arrElems.length == 1
+      && il.arrElems[0] >= cwIxCoveredLen()
+    ) {
+      const sp = nodeAt(il.arrElems[0])
+      if sp is Spread {
+        const rv: i32[] = []
+        if !mfrLitsExprOf(sp.spdArg, rv) { return [] }
+        const kept: i32[] = [iv]
+        for v in ev {
+          if !i32ListHas(rv, v) && !i32ListHas(kept, v) { kept.push(v) }
+        }
+        ev = kept
+      }
+    }
   }
-  mfrVals[d] = out
+  for v in ev {
+    if !monoFlowIsLit(v) && monoFlowMapOwner(v) < 0 && mfrLitsDirectFn(d) {
+      return []
+    }
+  }
+  mfrVals[d] = ev
   mfrValsState[d] = 2
-  out
-}
-
-// Appends to `out` the literals binding `d` holds, from its initializer and every whole `=` to
-// it; false when `d` is no `let` or `const`, or any of them may be anything else.
-function monoFlowLetVals(d: i32, out: i32[]): boolean {
-  const dn = nodeAt(d)
-  if !(dn is LetDecl) || !monoFlowValsOf(dn.letInit, out) { return false }
-  for u in mfrUses[d] ?? [] {
-    const w = monoFlowWholeWrite(u)
-    if w >= 0 && !monoFlowValsOf(w, out) { return false }
-  }
-  true
-}
-
-// Appends to `out` the literals un-annotated parameter `d` holds, from the argument every call
-// of its function passes there and every whole `=` to it; false when the function is reached
-// other than by a direct positional call this pass sees, or any of them may be anything else.
-function monoFlowParamVals(d: i32, out: i32[]): boolean {
-  if !(nodeAt(d) is Param) { return false }
-  const fx = mfrParentOf(d)
-  if fx < 0 { return false }
-  const fn = nodeAt(fx)
-  if !(fn is FuncDecl) || fn.fnName == "" || monoNameIsExported(fn.fnName) {
-    return false
-  }
-  let k = 0 - 1
-  let i = 0
-  while i < fn.fnParams.length {
-    if fn.fnParams[i] == d { k = i }
-    i = i + 1
-  }
-  // A `self` first parameter admits a method spelling, whose callee is no name read.
-  const p0 = nodeAt(fn.fnParams[0])
-  if k < 0 || (p0 is Param && p0.parName == "self") { return false }
-  const calls = mfrUses[fx] ?? []
-  if calls.length == 0 { return false }
-  for u in calls {
-    const c = mfrParentOf(u)
-    if c < 0 { return false }
-    const cn = nodeAt(c)
-    if !(cn is Call) || cn.callFn != u || hasNamedArgs(cn.callArgNames) {
-      return false
-    }
-    if cn.callArgs.length != fn.fnParams.length { return false }
-    for a in cn.callArgs {
-      if nodeAt(a) is Spread { return false }
-    }
-    if !monoFlowValsOf(cn.callArgs[k], out) { return false }
-  }
-  for u in mfrUses[d] ?? [] {
-    const w = monoFlowWholeWrite(u)
-    if w >= 0 && !monoFlowValsOf(w, out) { return false }
-  }
-  true
-}
-
-// Appends to `out` the literals function `d` returns, when every `return` in its body, outside
-// nested functions, returns a list or record literal and its last statement is one of them or a
-// literal; false otherwise.
-function monoFlowRetVals(d: i32, out: i32[]): boolean {
-  const dn = nodeAt(d)
-  if !(dn is FuncDecl) { return false }
-  const body = dn.fnBody
-  if body < 0 { return false }
-  const b = nodeAt(body)
-  if !(b is Block) || b.blkStmts.length == 0 { return false }
-  const last = unwrapParen(b.blkStmts[b.blkStmts.length - 1])
-  if monoFlowIsLit(last) {
-    if !monoFlowValsOf(last, out) { return false }
-  } else if last < 0 || !(nodeAt(last) is RetStmt) {
-    return false
-  }
-  const stack: i32[] = [body]
-  while stack.length > 0 {
-    const x = stack.pop()
-    const xn = nodeAt(x)
-    if xn is RetStmt {
-      if xn.retArg < 0 { return false }
-      const a = unwrapParen(xn.retArg)
-      // A returned local list binding returns the literals it holds (D9763).
-      if monoFlowIsLit(a) {
-        if !monoFlowValsOf(a, out) { return false }
-      } else if !monoFlowRetLocalLists(d, a, out) {
-        return false
-      }
-    } else if !(xn is FuncDecl) {
-      for k in nodeChildren(x) {
-        if k >= 0 { stack.push(k) }
-      }
-    }
-  }
-  true
+  ev
 }
 
 // The outermost literal whose tree holds literal `v`, or the `Map()` a write stores that tree in.
