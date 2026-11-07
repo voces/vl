@@ -71,4 +71,4 @@ box is built at). A table entry converts a value already built at its own rep.
 
 `monoArgClosedTyIn` at a closed pin now answers `elabArgDeliveredTy`, else the pin for a number
 literal, else the closed hole-free identity type (`elabIdentityFnTy`), else the pin. Fixpoint seed
-6,488,554 bytes (+1,647 against master `922a64e1`'s). Sweep: 23,613 same, 0 bytes-only.
+6,488,529 bytes (+1,622 against master `922a64e1`'s). Sweep: 23,613 same, 0 bytes-only.
