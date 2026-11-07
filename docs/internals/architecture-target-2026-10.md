@@ -2024,6 +2024,46 @@ largest first:
 - call param, 5;
 - slot held fns, unbound default and others, 3.
 
+**Slot type's 15 unassessed, measured** (2026-11-07, 23,456 programs, master `7a471b8c`).
+
+Each function's answer was compared with the stored slot fact `elabSlotTyAt(holder, path, frame)`,
+by type (`tySame`) and by spelling:
+
+| function | same | differ | mono only | elab only | both none |
+|---|---|---|---|---|---|
+| `monoPinFieldContainer` | 6 | 0 | 2 | 80 | 113 |
+| `monoPinObjFields` | 6 | 0 | 0 | 171 | 856 |
+| `monoPinStoredRecords` | 14 | 0 | 7 | 3 | 1 |
+| `monoLetWritesAt` | 77 | 0 | 0 | 0 | 0 |
+
+The same answers also spell the same. What each of the 15 comes to:
+
+- **Deleted here:**
+  - `monoListSrcElemTy`, its arm and `mfrListSrc`. It answered nothing in 23,456 programs: the map
+    was keyed by the original `Index` read, and its one caller passes the read the flow rewrite
+    minted.
+  - `monoLetWritesAt`'s per-write type walk. A `let` now passes where its slot fact is `t`, and the
+    elaboration closes that fact only where every write agrees. It keeps recording a fresh `Map()`
+    write at `t`.
+- **Lane F's switch:** the record-field trio (`monoPinFieldContainer`, `monoPinObjFields`,
+  `monoPinStoredRecords`), with `monoPinFieldValue` delegating. Mono's gate decides whether to
+  pin, and the slot fact gives the type. The 254 elab-only decisions are not acted on, and the
+  D15494 cells are a named fallback.
+- **(c):**
+  - `monoWritesCoercedFirstCall`, a walk-order gate ("no call has given it a signature yet"). It
+    reads the call-signature table that lane F's c89 rewrites, so it is rechecked against that.
+  - `monoRetypeLamCells`, which retypes capture cells the capture rewrite generates. The
+    elaboration has no node for them.
+  - The two delegators, `monoPinFieldValue` and `monoPinFieldContainers`.
+- **Already settled:**
+  - `monoSigJoin` and `monoPinJoin`, deleted by #6626.
+  - `monoRenameInitAt`, recorded as (c) there.
+  - `monoNoteBindCall`, inlined by c89.
+- **Blocked:** `monoLetWritesClosed`, on split-dep's written-value reader. Its gate is that each
+  write reads a binding already closed. 5 decisions (D9182) are no for mono and closed for the
+  elaboration.
+- **Parked:** `monoReachLitTys`, with `monoReachSlotTy`.
+
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
 read. A decision is a pin a function returns, a type it returns or records, or a gate choosing
@@ -2536,12 +2576,22 @@ by program).
 - **`monoRenameInitAt` is class (c).** It is reached by 15 programs: 11 already hold an instance at
   the pin and 4 instance one, and its refusal fires in none. Its pin is the elaboration's
   (`monoDeclPathPins`); what it does is instancing and renaming.
-- **`monoPinStoredRecords`, `monoPinFieldValue` and `monoLetWritesAt` disagree with
-  `elabSlotTyAt` nowhere.** `monoPinStoredRecords`: 8 agree and 0 differ. Its 2 mono-only programs
-  are D15494 maps, and in its 4 elab-only programs mono declines. `monoPinFieldValue`: 6 agree and
-  0 differ. Its 1 mono-only program is D15190, a refused program, and it has 57 elab-only, all with
-  mono declining. `monoLetWritesAt` is reached past its `const` arm by 1 program, which agrees.
-  These are graded together next.
+- **Switched: the record-field family takes its type from `elabSlotTyAt`.** That covers
+  `monoPinStoredRecords`, `monoPinFieldValue`, `monoPinObjFields` and `monoPinFieldContainer`. The
+  fact confirms and does not enumerate: mono's gate still decides whether a field is typed, and the
+  slot fact is the type it gets. In cad's shadow over 23,456 programs:
+
+  | function | agree | differ | mono-only | elab-only |
+  |---|---|---|---|---|
+  | `monoPinFieldContainer` | 6 | 0 | 2 | 80 |
+  | `monoPinObjFields` | 6 | 0 | 0 | 171 |
+  | `monoPinStoredRecords` | 14 | 0 | 7 | 3 |
+
+  The 254 elab-only cells are left as mono's gate leaves them. The mono-only cells keep mono's
+  type, and that fallback is the **D15494 residue**: a record, map or container whose generic is
+  called at two signatures has no single slot fact (an owner question). One of them is D15190,
+  refused at the write. Over 19,316 programs no byte moves. `monoLetWritesAt`'s `t` is already the
+  slot fact, so cad trims it to its fresh-`Map()` recording.
 - **A binding's call signatures were only ever asked whether one exists.** After the join went,
   `monoBindCallSigs` had one reader, `monoWritesCoercedFirstCall`, and it asks only whether any
   call has gone through the binding yet. The table is now a set of called bindings
