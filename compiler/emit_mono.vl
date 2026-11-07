@@ -637,6 +637,7 @@ import {
 } from "./emit_ty_canon"
 import {
   ELAB_REP_NO_ROW,
+  ELAB_TP_DEFAULT,
   bundleRecordTyOf,
   ekNames,
   ekTys,
@@ -697,6 +698,7 @@ import {
   elabStampAt,
   elabStubArgSet,
   elabTestsTyVar,
+  elabTpDefaulted,
   elabTpDefaultsNote,
   elabTpDefaultsReset,
   elabTyParamSeedParam,
@@ -6715,7 +6717,6 @@ function monoPreBindNumJoin(
 // type argument is written. Only a body local can name such a parameter and it holds no value
 // of it, and an `is` arm reading it at another type reads an empty list, so no read tells (D4911;
 // DECISIONS.md §"An unbound type parameter defaults at the call").
-const MONO_UNBOUND_TY_PARAM_DEFAULT = "i32"
 
 // Records, for the elaboration, each generic declaration's type parameters an inferred call that
 // leaves them unbound defaults, by `monoDefaultUnboundTyParams`'s rule (D4551).
@@ -6723,13 +6724,12 @@ export function monoElabDefaultsPrime(stmts: i32[]) {
   elabTpDefaultsReset()
   monoPrimeStmts = stmts
   monoPrimeIndexed = false
-  const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
   let d = 0
   while d < P.nodes.length {
     const fn = nodeAt(d)
     if fn is FuncDecl {
       elabBodyDeclNote(d, fn.fnBody)
-      elabTpDefaultsNote(d, dt)
+      elabTpDefaultsNote(d)
     }
     // An argument of only uncalled hole functions is keyed at the stub it is delivered at.
     if fn is Call {
@@ -6875,13 +6875,12 @@ function monoInertFnsAt(x: i32, depth: i32): boolean {
   monoInertFnsAt(unwrapParen(dn.letInit), depth + 1)
 }
 
-// Binds each of `typarams` that is still unbound in `tvN`, that no annotation in `params` names
-// and that reaches no spelling the default would answer (`monoTyParamReachesSpelling`) to the
-// default, in the pin columns and the arena bindings, and keys the instance on it as an
-// explicit type argument would, so `opT(a)` and `opT<i32, i32>(a)` share one instance.
+// Binds each of `typarams` that is still unbound in `tvN` and that the declaration owning `body`
+// defaults (`elabTpDefaulted`) to the default, in the pin columns and the arena bindings, and keys
+// the instance on it as an explicit type argument would, so `opT(a)` and `opT<i32, i32>(a)` share
+// one instance.
 function monoDefaultUnboundTyParams(
   typarams: string[],
-  params: i32[],
   tvN: string[],
   tvV: string[],
   tvT: i32[],
@@ -6889,13 +6888,7 @@ function monoDefaultUnboundTyParams(
   callIx: i32,
 ) {
   for tp in typarams {
-    const one: string[] = [tp]
-    const seen: i32[] = []
-    if (
-      monoBindOf(tvN, tvV, tp) == ""
-      && !monoParamsMention(params, one)
-      && !monoTyParamReachesSpelling(body, one, seen)
-    ) {
+    if monoBindOf(tvN, tvV, tp) == "" && elabTpDefaulted(body, tp) {
       monoBindTyParamElab(callIx, tp, tvN, tvV, tvT)
     }
   }
@@ -7021,13 +7014,13 @@ function monoBindTyParamElab(
   tvT: i32[],
 ) {
   const eb = if callIx >= 0 { elabCallBindTy(monoCallTplOf(callIx), tp) } else { -1 }
-  const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
+  const dt = primTyOfName(ELAB_TP_DEFAULT)
   const sp = if eb == TY_NEVER { "never" } else if eb >= 0 && !tySame(eb, dt) { monoPinAnnSpelling(eb) } else { "" }
   if sp == "" { return monoBindTyParamDefault(tp, tvN, tvV, tvT) }
   tvN.push(tp)
   // `never` resolves in a result position alone, so an instance's annotations spell the
   // default where it binds, whose rep `never` takes inside a list or record (D15530).
-  tvV.push(if eb == TY_NEVER { MONO_UNBOUND_TY_PARAM_DEFAULT } else { sp })
+  tvV.push(if eb == TY_NEVER { ELAB_TP_DEFAULT } else { sp })
   monoTvTyLast(tvN, tvT, eb)
   if !strListHas(monoExplicitBN, tp) {
     monoExplicitBN.push(tp)
@@ -7043,15 +7036,15 @@ function monoBindTyParamDefault(
   tvV: string[],
   tvT: i32[],
 ) {
-  const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
+  const dt = primTyOfName(ELAB_TP_DEFAULT)
   tvN.push(tp)
-  tvV.push(MONO_UNBOUND_TY_PARAM_DEFAULT)
+  tvV.push(ELAB_TP_DEFAULT)
   monoTvTyLast(tvN, tvT, dt)
   if dt >= 0 && !strListHas(monoExplicitBN, tp) {
     monoExplicitBN.push(tp)
     monoExplicitBT.push(dt)
   }
-  monoKeyExtra = monoKeyExtra + tp + "=" + MONO_UNBOUND_TY_PARAM_DEFAULT + ";"
+  monoKeyExtra = monoKeyExtra + tp + "=" + ELAB_TP_DEFAULT + ";"
   0
 }
 
@@ -11004,15 +10997,7 @@ function monoInstanceFor(
     }
     // A type parameter the boundary binds nothing defaults as at an inferred call, so the
     // binding's instance is the direct call's.
-    monoDefaultUnboundTyParams(
-      fn.fnTyParams,
-      params,
-      tvN,
-      tvV,
-      tvT,
-      fn.fnBody,
-      -1,
-    )
+    monoDefaultUnboundTyParams(fn.fnTyParams, tvN, tvV, tvT, fn.fnBody, -1)
     const pinned: string[] = []
     let pj = 0
     for pn in pinnedNames {
@@ -19515,7 +19500,7 @@ function monoLetSeedMisfits(
       return false
     }
     const bt = monoBindTyOf(tvN, tvT, tn.tyName)
-    return monoBindOf(tvN, tvV, tn.tyName) == MONO_UNBOUND_TY_PARAM_DEFAULT
+    return monoBindOf(tvN, tvV, tn.tyName) == ELAB_TP_DEFAULT
       || bt >= 0 && pinTy >= 0 && !tySame(bt, pinTy)
   }
   const pt = nodeAt(pn.parType)
@@ -21249,7 +21234,6 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       )
       monoDefaultUnboundTyParams(
         fn.fnTyParams,
-        fn.fnParams,
         tvN,
         tvV,
         tvT,
@@ -21997,7 +21981,7 @@ function monoArgClosedTyIn(ax: i32, ctx: i32, pinTy: i32): i32 {
 // Pin `name` of argument `ax`, or, where `name` is the unbound default because the argument's
 // own type stays open, the pin of the closed type `ct` it is read at.
 function monoOpenArgDefaultPin(name: string, ax: i32, ct: i32): string {
-  if name != MONO_UNBOUND_TY_PARAM_DEFAULT || ax < 0 { return name }
+  if name != ELAB_TP_DEFAULT || ax < 0 { return name }
   const own = nodeTyIxOf(unwrapParen(ax))
   if own < 0 || own >= T.tys.length || !tyHasTyVar(own) { return name }
   if ct < 0 || ct >= T.tys.length || tyHasTyVar(ct) || tySame(ct, i32TyIx()) {
