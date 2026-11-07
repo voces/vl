@@ -2381,6 +2381,13 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   The signature it pins at is the elaboration's (#6678), and it keeps the destination's spelling
   wherever the parameter types agree, because the registry keys a literal's instances by spelling:
   respelling `(f64)=>f64` as `(f64) => f64` split one literal into two instances (8 outputs, 1 build).
+  A literal neither closes, written into a binding's slot, takes its parameters from that slot's
+  fact (`elabWrittenSlotTy`, the write noted in `elabRun`): 10 decisions in 6 programs, 10 agree.
+  In 9 of them the destination's result is `void` and the slot's is the lambda's own. A `void`
+  destination discards the result, so the delivery signature's result is the destination's: a
+  signature-versus-identity difference, not a defect, and the switch keeps it. The 6 written
+  literals with no slot fact are per-instance (a `let` or record of lambdas in a generic body
+  instanced at two types) and stay with the per-instance identity residual above.
   **Grading a shadow.** A row agrees only when the two types are `tySame`. The spelling goes in
   a column of its own. Two types can print alike and still differ (a record built at one row and
   bound at another, as in D14426), and the same type can be spelled two ways (union row order, a
