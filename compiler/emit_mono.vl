@@ -60,6 +60,7 @@ import {
   elabUncalledSlotTy,
   elabValueAgreedCallTys,
   elabValueInstKey,
+  elabValueInstSig,
   elabValueOnlyCall,
   elabValueReturnsFrom,
   elabValueSlotCopy,
@@ -5591,6 +5592,7 @@ function monoHoleBinding(
   tyCol: i32[],
   hN: string[],
   hT: i32[],
+  call: i32,
 ) {
   if origFe < 0 || origFe >= monoOrigNode.length { return 0 }
   const ftIx = nodeTyIxOf(monoOrigNode[origFe])
@@ -5601,7 +5603,18 @@ function monoHoleBinding(
     while i < params.length && i < ft.fnParamTypes.length && i < tyCol.length {
       const pp = nodeAt(params[i])
       if pp is Param {
-        if pp.parType < 0 { bindGenWalk(ft.fnParamTypes[i], tyCol[i], hN, hT) }
+        if pp.parType < 0 {
+          // A pin that is the argument's bundle record is its rep, not its type: the hole binds
+          // at the argument's own type, and the bundle lowers through the delivery path.
+          let at = tyCol[i]
+          const cn = if call >= 0 { nodeAt(call) } else { nodeAt(0) }
+          if cn is Call && i < cn.callArgs.length && monoIsBundleTy(at) {
+            let id = elabNodeTy(cn.callArgs[i], elabWalkTop())
+            if id < 0 { id = elabNodeTy(cn.callArgs[i], -1) }
+            if id >= 0 && id < T.tys.length && tyMayHoldFn(id, 0) { at = id }
+          }
+          bindGenWalk(ft.fnParamTypes[i], at, hN, hT)
+        }
       }
       i = i + 1
     }
@@ -10040,7 +10053,9 @@ function monoMakeInstanceGo(
     }
     monoShAliasBind(origFe, letBN, letBT)
     monoShPendFlush(shAt)
-    if !fromKey { monoHoleBinding(origFe, params, letTyCol, holeN, holeT) }
+    if !fromKey {
+      monoHoleBinding(origFe, params, letTyCol, holeN, holeT, tplCall)
+    }
     // The worklist instance this one is: demanded here, its body checked once at this binding.
     const ekN0: string[] = []
     const ekT0: i32[] = []
@@ -23633,6 +23648,18 @@ function monoNoteBindDeliveryCall(at: i32, ann: string, ctx: i32, callIx: i32) {
   for pt in parts {
     if pt == "" { return 0 }
     sig = sig + pt + ","
+  }
+  // The instance the elaboration made for the delivered value names its signature, where it made
+  // one; a value it instanced at several stays at the destination's (D12234).
+  const vt = elabValueInstSig(at)
+  const vf = if vt >= 0 { tyAt(vt) } else { tyAt(0) }
+  if vf is TyFunc && vf.fnParamTypes.length == parts.length {
+    let es = ""
+    for p in vf.fnParamTypes {
+      const n = monoPinAnnSpelling(p)
+      es = if n == "" || es == "-" { "-" } else { es + n + "," }
+    }
+    if es != "-" { sig = es }
   }
   monoDeliveredArgs.push(monoReadNameNode(at))
   // A hole lambda the name reaches that nothing has pinned yet takes the signature in place,
