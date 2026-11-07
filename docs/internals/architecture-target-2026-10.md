@@ -2212,8 +2212,8 @@ The slot fact is the wrong reference: a written `let` of generics has no one clo
 - **The fallback is deleted.** The 9 with no key read the written `let` in an alias's initializer
   (`const k = lap`, then `k(...)`), and the call's own callee read carries the key; all 9 agree. The
   call reads the binding's keys, else the callee's, inside `monoCoerceWrittenLetTys` after its gates,
-  so only a call it coerces asks. Of the 1,917 calls that reach the site, 977 pass the gates, and all
-  of those have one closed signature.
+  so only a call it coerces asks. Of the 1,917 calls that reach the site, the 51 the gates pass all
+  have one closed signature: 42 from the binding's keys, 9 from the callee's.
 - **The delivery path stays mono's.** `elabValueInstKey` reads none at 99 of its 115 decisions: a
   delivered read is not a callee read, so no member key is noted on it.
 - **The hole-function argument is not switched: it replaces nothing.** Its read agrees at 59, differs
