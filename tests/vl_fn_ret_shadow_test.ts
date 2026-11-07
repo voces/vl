@@ -636,9 +636,9 @@ Deno.test({
 });
 
 // THE RETURN-COLUMN SHADOW (`fnColShadowRun`): each un-annotated valued function, graded on every
-// return column against the rep of its recorded result, before and after each
-// `computeRetInference` run. `g` is annotated by the time the second run starts, so it grades
-// twice; a structural record names no row in the rep, while the column takes the one its value
+// return column against the rep of its recorded result, before and after the
+// `computeRetInference` run after monomorphize. `g` is annotated by then, so it grades nowhere;
+// a structural record names no row in the rep, while the column takes the one its value
 // is built at.
 const COL_REC = `function mk(n: i32) { { a: n, b: 2 } }
 print(mk(3).a)
@@ -672,7 +672,7 @@ Deno.test({
       PLAIN,
       DROP_NONE,
       true,
-      "pre seed: agree i32 | g=1; pre settled: agree i32 | g=1",
+      "",
       "col",
     );
     expectRows(
@@ -681,8 +681,7 @@ Deno.test({
       DROP_NONE,
       true,
       "post moved: moved: agree struct | mk=1; post seed: kind struct vs i32 | mk=1; " +
-        "post settled: agree struct | mk=1; pre seed: kind struct vs i32 | mk=1; " +
-        "pre settled: agree struct | mk=1",
+        "post settled: agree struct | mk=1",
       "col",
     );
     expectRows(
@@ -692,10 +691,7 @@ Deno.test({
       true,
       "post moved: moved: agree str | __lambda_0=1; post moved: moved: agree str | setK=1; " +
         "post seed: kind str vs i32 | __lambda_0=1; post seed: kind str vs i32 | setK=1; " +
-        "post settled: agree str | __lambda_0=1; post settled: agree str | setK=1; " +
-        "pre seed: agree i32 | setN=1; pre seed: kind str vs i32 | __lambda_0=1; " +
-        "pre seed: kind str vs i32 | setK=1; pre settled: agree i32 | setN=1; " +
-        "pre settled: kind str vs i32 | __lambda_0=1; pre settled: kind str vs i32 | setK=1",
+        "post settled: agree str | __lambda_0=1; post settled: agree str | setK=1",
       "col",
     );
     expectRows(
@@ -704,8 +700,7 @@ Deno.test({
       DROP_NOTHING,
       false,
       "post moved: moved: no result recorded=1; " +
-        "post seed: no result recorded=1; post settled: no result recorded=1; " +
-        "pre seed: no result recorded=1; pre settled: no result recorded=1",
+        "post seed: no result recorded=1; post settled: no result recorded=1",
       "col",
     );
     expectRows(
@@ -714,8 +709,7 @@ Deno.test({
       DROP_AS_VOID,
       false,
       "post moved: moved: recorded void or never=1; " +
-        "post seed: recorded void or never=1; post settled: recorded void or never=1; " +
-        "pre seed: recorded void or never=1; pre settled: recorded void or never=1",
+        "post seed: recorded void or never=1; post settled: recorded void or never=1",
       "col",
     );
   },
