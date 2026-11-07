@@ -2079,6 +2079,18 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 The unbound default, which every program reaches through `monoElabDefaultsPrime`, is the reach
 lane's. The cad lane takes slot deliveries, then node type, then slot type.
 
+**The unbound default family, closing state** (2026-11-07, master `254c6ee2`). What the
+elaboration can own, it owns: the D4551 default (`ELAB_TP_DEFAULT`, `elabTpDefaulted`; #6563, #6569),
+the uncalled slots (`elabUncalledSlotTy`) and a hole generic's flow instance (`elabHoleGenFlowTy`,
+`ELAB_EMPTY_LIST_ELEM_DEFAULT` for D6542; #6583), with `monoBindTyParamDefault` folded away (#6580).
+What stays in mono is named: `monoDefaultTyParamsOnlyGenFns`, a per-call rule at 10 sites no
+elaboration fact states; `monoChoiceArmFlowTy`'s arm walk; and the frame plumbing listed below as
+having a twin in the elaboration. The maps and lists whose slot is called at two signatures (D15494,
+`closures/hole-fn-generic-pushed-list-spread.vl`) are no bundle: they hold uniform closure structs
+and each call site reaches its own signature, so their one-signature spelling is a rep spelling the
+default supplies. Both run today, and both wait on a design answer, not a lane: what the elaboration
+says for an open slot called at two signatures.
+
 **The unbound default, measured** (2026-11-07, master `75101d46`). The D4551 default is the
 elaboration's: `ELAB_TP_DEFAULT` and `elabTpDefaulted` (#6569), after its call reach was made to
 see into callees before collect runs (#6563). The uncalled slots already read it
@@ -2090,6 +2102,30 @@ see into callees before collect runs (#6563). The uncalled slots already read it
   the elaboration has none, but at 1,308 more pins mono leaves the type open while
   `elabCallParamTyFrom` is closed. The replacement is a fact of that narrower question, which must
   decline at all 1,308, with the D6542 empty-list `i32` a named default beside `ELAB_TP_DEFAULT`.
+
+**The flow instance is the elaboration's** (2026-11-07). `elabHoleGenFlowTy` and
+`elabHoleGenFlowHolder` answer it, with `ELAB_EMPTY_LIST_ELEM_DEFAULT` (D6542); `monoHoleGenFnFlowTy`,
+`monoHoleGenBindLamArgs`, `monoHoleGenBindFnArgs`, `monoPinIsEmptyListHole` and `monoTyLeftOpen` are
+deleted. Shadowed over 23,103 programs against mono's flow: 34 agree, 0 differ, 0 new-only at all
+1,308 open pins, and 3 old-only, all in `closures/written-let-of-hole-fns-results-agree-at-hole-arg.vl`
+(a re-pointed `let` of hole functions, which mono's gate reads as a generic and the elaboration's does
+not), which the byte sweep shows reach no emitted code. Per read, the two gates name the same binding
+at 78 reads and part at 34, none of which yields a flow type on either side but those three. Mono
+counts a lambda as generic by `monoGen` of its own lambda state, which varies by frame; a
+"generic lambda" rule in the elaboration turned 2 of those into new-only answers
+(`generics/hole-fn-arg-through-hole-callee.vl`), so the elaboration's gate stays conservative.
+
+Two of the 34 are mono's gate being wrong: it resolves a read by NAME, so in
+`closures/param-named-like-outer-fn-generic-arg.vl` and D3910 the parameter `f` of `b(f: i32)` reads
+as the top-level generic `f<U>`. The elaboration resolves by declaration.
+
+Plumbing with a twin in the elaboration, kept for its other callers: `monoReadLetFrame`,
+`monoHoleGenFnFlowDecl` (still `monoHoleGenFnPin`'s `[frame, decl]`), `monoOpenFnArgDecl`
+(`elabOpenFnArgDecl`), `monoFnDeclRetAt` (`elabFnDeclRetAt`), `monoArmTailValue`,
+`monoNamesDeclaredGeneric`, `monoReadGenFnFe` (`elabAliasGenFn`) and `monoCalleeIsGeneric`. The lane
+that empties their other callers deletes them. `monoChoiceArmFlowTy` stays too: its arm walk reads
+mono's `monoValueNamesGenerics` and `monoArmEndsNever`, and each arm's instance is now the
+elaboration's.
 - `monoDefaultTyParamsOnlyGenFns` is a per-call rule (a type parameter named only by function slots
   handed generic values) that no elaboration fact states. It fires at 10 calls in 4 files; the
   call binding `elabCallBindTy` is the default at 8 and absent at 2 inside a generic body.
