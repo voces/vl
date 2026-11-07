@@ -2022,6 +2022,15 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   literal typed `X[][]` from `elabNodeTy` at the instance being walked, which agrees in all 4
   programs that reach it. The clone-time columns it alone read (`monoCgcBN` / `monoCgcBT`) go
   with it.
+  `monoInstParamPinTys` (the parameter types of a minted instance, for the written-cell coercion)
+  reads `elabParamTyOwnAt` at the instance's own key, and the clone column it read
+  (`monoInstParamTyCol`) is deleted. It agrees in 436 programs and differs in none. In the 7 it alone
+  answered, the instance builds the same bytes without it, and they join the cells above:
+  `unions/function-arm-reassign-after-narrow.vl`, `inference/unannotated-param-solved-composite-and-nested.vl`,
+  `lists/unannotated-list-fn-value-dest.vl`,
+  `closures/lambda-called-directly-with-generic-at-two-signatures-beside-one-signature-consumer.vl`,
+  `closures/closure-result-nullable-closure-array.vl`, `functions/hole-call-let-lambda-at-two-instances.vl`,
+  D14824.
   The per-argument pins are a separate fact (the argument's representation, per union arm) and
   wait for the producers.
 - [x] **literal arm row** (5): `monoNoteLitDest` 8,956, `monoNoteLitDestIn` 4,887, `monoNoteListLitDests` 16, `monoVariantRowAmong` 3, `monoArgOwnVariant` 0 — deleted; the elaboration records the union a call hands a literal back into (`litRetUnionIx`, read by `litRetArmRow`).
@@ -2752,6 +2761,15 @@ The condition: one predicate decides "specialize this call on this value". Today
 instance key (`monoMakeInstance`'s `cbFnNames`, suffix `@name,`) skips a callee read through a
 written binding (`viaWritten`). The non-generic specialization (key `C<fe>@name`) has its own
 assignment check (`monoReadIsAssigned`). Those gates move into the one predicate before the switch.
+
+**The pin-implied canonical binding against the key's binding** (2026-11-07, 23,384 programs).
+`monoPinnedTyParamCanon` names the binding the pins already imply, so an explicit type argument
+that repeats it is dropped from the key text. Against `tyCanonKey` of `ekTys` at the call's key:
+agree 4,752 programs, differ 231, mono only 101, elaboration only 144. The differences are names,
+not values: an alias or a literal union against its base (`i32` against `Id`, `i32` against
+`(0|1|2)`) and a structure against its record (`{r: i32 | null}` against `J`, `{y, x}` against
+`V`). `tyCanonKey` keeps those apart, so switching the dedup would merge or split instances; it is
+an input to the key above, not a value decision, and stays mono's until the key settles names.
 
 #### The call half and the value half (2026-11-06)
 
