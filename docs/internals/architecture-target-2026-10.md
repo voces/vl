@@ -2168,6 +2168,45 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   `monoSubstIsExpr`, `monoHoleCoalUnion`) remake syntax and consume a type: class (c) once their
   type reads the elaboration, which through the hub it now does where the pin closes.
 - [ ] **call param** (13): `monoBindSeededTyParams` 5,624, `monoArgTyName` 5,220, `monoPinHoleParam` 3,734, `monoCallIfValue` 2,887, `monoArgPinTyIx` 404, `monoArgTyNameCascade` 360, `monoArgTyNameRep` 215, `monoArgTyNameBound` 177, `monoSpelledRecordLeavesRow` 127, `monoPreBindArgName` 63, `monoPreBindArgTy` 63, `monoArgPinName` 61, `monoArgTyNameProjected` 9.
+  **`monoArgTyName`, shadowed** (2026-11-07, master `1cebe3ff`, the full population, 14,974
+  decisions). Each is graded against the argument's own type at the instance: `elabNodeTyAt`,
+  else the root walk's, else the checker's. Agreement is `tySame`; spelling is a column of its own.
+  - The closed rung (`monoArgClosedPin`, 14,394) already pins at that type.
+    - 12,893 agree, 11,384 of them through the checker's type where the elaboration declines at
+      the root.
+    - 1,403 bank the template's `T` beside a name that is already the closed type's spelling.
+    - 82 differ by design. 80 are records built wider at delivery, which pin at the build
+      (`elabArgBuiltRep`, `recCopyTyOf`; D15181, D15183). 2 are a hole call of a generic at its own
+      instance, where the elaboration's `f64` is right.
+    - What mono owns is the spelling: 328 registry names (`P` for `{x: i32}`, `#anon0`).
+  - The cascade (580) is type = elaboration; spelling = row key; waits on row identity. In a
+    generic clone the elaboration gives a declared record argument its structural type, and the
+    closed rung's spelling declines a record spelled by its fields, so it matches 3 of the 580.
+    Its rungs, by answers:
+
+    | rung | reads | answers | nominal spelling eq / ne / open |
+    |---|---|---|---|
+    | `monoArgTyNameRep`, struct row (`sNames`) | the row name | 167 | 25 / 127 / 15 |
+    | `monoArgTyNameBound`, a module global's annotation | the annotation | 109 | 103 / 2 / 4 |
+    | `monoArgTyNameRep`, list literal (`arrLitElemName`) | the element | 108 | 31 / 51 / 26 |
+    | `monoArgTyNameBound`, a parameter's annotation | the annotation | 49 | 22 / 18 / 9 |
+    | `monoArgTyNameBound`, a generic application's inner | the annotation | 47 | 13 / 32 / 2 |
+    | `monoArgTyNameRep`, a union variant (`litRetArmRow`) | the variant | 28 | 19 / 9 / 0 |
+    | the cascade's function value and `""` floor | the signature key | 19 | open |
+    | `monoArgTyNameRep`'s tail, `ELAB_TP_DEFAULT` by name (D23) | the default | 11 | open |
+    | the rest | | 42 | |
+
+    No rung goes through `monoPinNominalSpelling`: each big one has rows it spells otherwise,
+    and a switch would rekey the instance. Its literal returns are rep names, not defaults: the
+    scalar and list floors (`"string"`, `"f64[]"`, `"i32[]"`, …) name the rep an `expr*` test
+    found, and the `i32[]` list floor is reached by no program.
+  - `monoBindSeededTyParams` makes 21 decisions over the population where `elabCallSeedBind`
+    answers. 1 agrees, 15 are open on both sides, and 0 differ. In 5, mono closes the type (for
+    example `(string) => string`) where the elaboration's seed binding is the seed parameter's own
+    `(T) => T`, because mono substitutes the binding that parameter got at the instance.
+  - `monoCallIfValue` makes no decision over the population: every entry returns at its gate.
+  - `monoPreBindArgName`, `monoPreBindArgTy`, `monoArgPinName` and `monoArgPinTyIx` wrap the pin
+    measured above. `monoSpelledRecordLeavesRow` is a row-layout test, in the row-key family.
 - [ ] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
   The type an uncalled slot holds its functions at is the elaboration's (`elabUncalledSlotTy`,
   from `elabSlotHeldFns`), read by `monoUncalledSlotFnTy`. Shadowed over 23,381 programs, 507
@@ -2299,6 +2338,27 @@ the inner literals at it. A map of that shape without a closed fact is a loud re
 program reaches. The stored values need no instancing of their own here, because their deliveries
 already instance them. The fixture prints the same, and over 19,316 programs no byte moves.
 
+**`monoPinnedElemAnnTy` was unreached** (2026-11-07). It is the element-read arm of the pinned
+receiver climb (`monoPinnedListAnnTy`), which a `.map` / `.filter` callback asks only where the
+elaboration's walk type for the receiver is open. Over 23,384 programs that climb is entered by 3 and
+closes in 2 (`closures/fn-list-mapped-to-functions.vl`, `closures/hole-fn-list-returned-reread.vl`),
+both through a binding. The element arm is reached by none: since the tail table was measured the
+walk type answers its fixture first. A probe at the call site fires there as the control. The arm
+is now a loud refusal and the helper is deleted. The climb itself stays: declining it moves both
+closing programs from runs to an emit refusal (`ref valtype with no interned shape`, `call to
+unknown function`). Over 19,316 programs no byte moves.
+
+**A re-pointed `let` handed to a function parameter takes the elaboration's parameter type**
+(2026-11-07). `monoHandWrittenLet` instances every function the binding holds at the pin. That pin is
+now `elabCallParamTy` at the call, and no longer mono's substitution of the callee's annotation.
+Shadowed over 23,384 programs, 2 programs reach it with 4 decisions
+(`closures/alias-of-written-let-handed-to-generic-fn-param.vl` and
+`closures/written-let-of-hole-fns-to-generic-fn-param.vl`). The elaboration closes all 4, at
+mono's pin. `monoWrittenLetRetsDisagree`'s refusal fired in none: the checker refuses that program
+first (D9003, `holeLetWritesDisagree`). So it is deleted, with `monoBoundTys` and
+`monoArrowParamTysAt`, which only it called. A missing elaborated type is a loud refusal. Over
+19,316 programs no byte moves.
+
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
 and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
@@ -2374,7 +2434,11 @@ mechanism message at the call. The fixture adds one late demand, pre-existing on
 counted by `closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`. It is D15136's
 `put` at the argument's own type, demanded by the root call `put(xs)`. `hand` is never built: its
 second call of `put` makes `fnWriteOnlyInto` decline, so the elaboration delivers `xs` at `half`'s type.
-It exists only on that refusing build, and it goes with D15136's own fix. `monoCallWrittenLet` instances its writes at the delivery's pin, and
+It exists only on that refusing build, and it goes with D15136's own fix. The baseline's other entry,
+`closures/listed-hole-fn-escaping-list.vl`, is `use` minted at `((i32) => i32)[]` inside `take`'s
+instance. It is the signature twin of an instance the elaboration holds by identity
+(`((T) => T)[]`), and the twin's signature is mono's choice, so it is parked in Fn#d's identity
+territory, not foreseen. `monoCallWrittenLet` instances its writes at the delivery's pin, and
 `monoCallIfBound` no longer falls back to the seed. Mono's result derivation then decides nothing
 in the population, so `monoListSlotPinnedFnTy`, `monoPathSlotPinnedFnTy` and `monoHeldSrcsFnTy` are
 deleted. `monoSeedCallSigTys` stays for `monoCallIfValue`, an inline
@@ -2540,6 +2604,30 @@ answer: mono's `i32` was re-widened downstream. `monoNumOperandPinTy` and the tw
 default whose left side has no closed walk type refuses loudly where the hole-binding substitution
 was; no program reaches it. The first three helpers already read the elaboration and stay.
 
+**Value returns, against `elabValueReturnsFrom`** (2026-11-07, 19,338 programs, master
+`a0562c8b`). `monoFlowRetVals` was already gone, and `monoFlowConstCallArgs` is the flow rewrite's
+own transformation around the leaf decision (class (c), cad lane).
+
+| decision | decisions (programs) | reading |
+|---|---|---|
+| `monoFlowCallLeaf`: call `c` always returns generic `g` | 386 (101) | 53 answered, all 53 confirmed; 333 declined |
+| `monoFlowAnnLits`: the literals an annotated binding's call initializer may return | 75 (28) | 16 confirmed; 59 are literal nodes, which the fact does not follow |
+| `monoDeliverCallRets`' gate: the function returns a hole lambda | 802 (593) | 796 both no; 6 (3 programs) mono yes, fact no, again a returned literal |
+
+- **`monoFlowCallLeaf`: the fact confirms, it does not enumerate.** Asked of mono's answer it
+  agrees every time, but it names no candidate `g`, so it cannot answer the 333 declines. The leaf
+  stays the planner's decision, and its two consumers, the repoint and the rets share of
+  `mfrInertValues`, are cad's.
+- **`monoFlowAnnLits` is deleted.** Banking nothing moves no byte over the 29 programs it banked
+  for, so its consumer (each banked literal coerced at the binding's annotation, under
+  `monoInstanceExactRet`) is gone too, along with that flag.
+- **`monoDeliverCallRets` stays: blocked on a reach fact for a returned literal.** Forced off, its
+  gate lets `closures/error-hole-lambda-returned-into-bindings-of-two-types.vl` (D6522) build and
+  print a wrong answer, and makes `closures/hole-lambda-returned-into-binding-of-another-type.vl`
+  trap. Those two are its acceptance cells.
+- **`monoIfBoundRetAtPin`** reads `monoSlotPinNameTys`, the elaboration's deliveries, with no
+  fallback: class (a).
+
 **Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
 elaboration has no type of its own for the node, and every caller composes its own narrowing with
 it. A fallback to the checker's closed type (#6556, closed) broke four `runs` cells:
@@ -2592,6 +2680,30 @@ read (`slotOfRead`) of a different holder with a closed `elabSlotTyAtKey` fact a
 the common case being `const f = m.get("k")` out of a closed map. A read of an open holder
 declines, which leaves generic functions stored in maps to D15494. A delivered bundle (reach) is the
 next source, so the elaboration gets no second composer for the same binding.
+
+**The second source, built from bundles: `elabWrittenBuiltTy`** (2026-11-07). It covers four
+kinds of value:
+- a call, through `elabCallBundleRet`, which answers with the bundle record the call's returned
+  parameter (`elabRetParamOf`) is delivered as (`elabCallArgRep`, `elabDeliveredBundleSigs`);
+- a record of its fields' answers, each other field at its closed checked type;
+- a list of its elements' agreed answer;
+- a field or list element of such a value, or an un-annotated `let` written once.
+
+The reach rows holding the bundles are written by `elabReachRows`, after `elabRun`'s `elabSlotFacts`.
+So `elabSlotBundleFacts` re-runs the same reader there, for program-level holders still without a
+fact, and never overwrites one. That timing is why the binding reader runs twice. The bundle source
+cannot answer in `elabSlotFacts`, so folding the two runs into one loses all 14.
+
+Over master `fd7ef721`'s 21 `monoBindingAdoptInit` decisions holding a bundle record, all at program
+level in seven programs (the five `closures/bundle-record-*.vl` tests, D15323 and D15324),
+`elabNodeTy` agrees at 14, differs at none, and leaves 7 to mono:
+- six reads of an un-annotated `Map()` whose value comes from its writes, which wait for lane F's
+  map-value facts;
+- `{ f: gen("s", 3), n: 3 }`, where the generic hands back a `let` and not a parameter. That needs
+  `elabRetOf` through a returned binding, its own item.
+
+A holder inside an instance written from a bundle still declines, because the late pass is
+program-level only, so 14 of 21 does not mean that bundles close at every instance.
 
 A captured cell (`let d = c` re-written by a lambda) gets no fact this way yet. Its written lambdas
 are nested and capture, so `elabHeldAtArgs` declines, and `elabHeldFnTy` returns that decline
@@ -2982,6 +3094,25 @@ after mapping each lambda clone through `elabSrcDecl`. That mapping brings D3928
 decisions to agree. `nodeSrc`, `declOrigOf` and `lfOriginOf` do not link an instance body's lambda
 copies.
 
+**The hub's callee choice is parked: its derivation duplicates an elaboration fact, and its policy
+is mono's** (2026-11-07). `monoWalkIdentCall` picks a callee through eight rungs: arm, respell,
+closure, the instance-origin hop, captured, readgen, alias-lambda and alias-let end. That choice
+agrees with the elaboration's (`elabCalleeFnsOf`, with a lambda clone mapped by `elabSrcDecl`) on
+**122,691 of the 122,722 decisions both sides answer**. The remaining 31 are the D5841 several-sets,
+over 23,456 programs. Two things in the hub are mono's own:
+- **The `call_ref` policy**, which calls may be made direct. Whether a rung fires is what keeps the
+  2,079 elab-only calls `call_ref` (ruling (a); (S2), making a subset direct, stays declined), and
+  the rungs' `monoNoRename` and written-let frame side effects are that policy.
+- **Callback specialization**, recorded below.
+
+What duplicates the elaboration is the rungs' derivation of which function is called. That
+derivation is the endgame to move (S1). The rung would become a firing predicate, and the callee the
+elaboration's single member. The move is blocked on a cheap reverse map from a source declaration to
+its clone in an instance, because the elaboration names the source and mono needs the instance's
+slot. The canonical-instance-key work is the expected provider. Moving it today would delete about
+two functions (`monoRespellLamFe` and `monoCapturedLamFe` become predicates), so it waits for that
+map.
+
 **Mono-owned: callback specialization's direct calls** (2026-11-07). `monoWalkIdentCall`'s
 instance choice was compared with the elaboration over 23,456 programs: 122,691 decisions agree.
 2,079 are elab-only and stay `call_ref` under ruling (a). 1,052 are mono-only: 698 concrete and 354
@@ -3178,6 +3309,74 @@ not values: an alias or a literal union against its base (`i32` against `Id`, `i
 `(0|1|2)`) and a structure against its record (`{r: i32 | null}` against `J`, `{y, x}` against
 `V`). `tyCanonKey` keeps those apart, so switching the dedup would merge or split instances; it is
 an input to the key above, not a value decision, and stays mono's until the key settles names.
+
+#### Argument-keyed instances: design note (2026-11-07, for a ruling; nothing built)
+
+Five parked items share one missing fact. An instance key that says which function a function-typed
+argument is:
+
+| item | count | what is missing |
+|---|---|---|
+| callback specialization's direct calls | 1,052 calls (23,456 programs) | in 940 the call sits in an instance the elaboration has no key for, and in 108 more the callee read has a type but no `Fn#d` set |
+| keyless generic instantiations, the hub's `gen\|nokey` rows | 5,256 agree, 249 mono-only, 4 several | the elaboration answers the callee but cannot key the instance; one known part is the 96 specialization groups below |
+| the hub's (S1) | 122,691 agreeing decisions | a reverse map from a source declaration to its clone in an instance |
+| `monoPinnedTyParamCanon` | 231 differ, 101 mono-only, 144 elab-only (programs) | **not this.** The differences are names (alias or literal union against its base), not values |
+| reach's escaping-list helper, D15010's `use` | 1 program | **a constraint, not a client.** One helper instance has to serve holders of different sets |
+
+**The key already exists in the types.** §2.2 gives a function value its identity, a singleton
+`Fn#d` or a finite set. The elaboration keys an instance by `(decl, closed type arguments)` and
+erases a function-typed argument to its structural signature, so `len<i32>(() => 4)` and
+`len<i32>(() => 5)` share a key. The proposed key keeps that component as the argument's identity
+set where specialization applies:
+
+  `(decl, closed type arguments, for each specialized parameter p: the Fn#d set p's argument carries)`
+
+Inside such an instance, a call through `p` is a call on a singleton, which §2.2 already types as a
+direct call. That is mono's callback specialization, stated as the elaboration's rule.
+
+**Mono keeps the policy.** By the 2026-11-05 ruling, specialization is mono's component of the key:
+it changes no meaning, only how the code is built. So the split is:
+- *which* parameters are specialized is decided by one mono predicate, the unified
+  `monoSpecializableCallbackName`, with its two callers' gates (`viaWritten`, `monoReadIsAssigned`)
+  folded in first, as that ruling required;
+- *what* the component holds, the argument's identity set at the call's key, comes from the
+  elaboration (`elabFnSetOf(elabNodeTy(arg, k))`).
+
+A tagged set is never specialized. That is D15010's constraint: a tagged id is its member's
+declaration index in every set, so one helper serves every holder, and keying it by set would
+split it.
+
+**What it unblocks, with counts:**
+- **The 1,052 mono-only calls**, directly. Each sits in an instance that would now have a key, so
+  `elabCalleeFnsOf` answers it. The upper bound is the 940 untyped calls plus whichever of the 108
+  untyped-set calls are specialized arguments.
+- **The specialization share of the 5,256 keyless generic rows**, which is at least the 96 groups
+  measured on 2026-11-05. The rest (a template's only instance, a lambda, a hole function solved
+  closed) are already keyed by their declaration and are untouched.
+- **The hub's (S1) reverse map.** A clone in an instance becomes the pair (instance key, source
+  declaration), the elaboration's own name for it. Mono's table from that pair to its slot is the
+  map (S1) waits on.
+- **Not unblocked:** `monoPinnedTyParamCanon`, which waits on the key settling names, a separate
+  question.
+
+**Smallest first slice: a shadow, no behaviour.**
+1. Fold the two gates into the one predicate, byte-identical.
+2. At each instance mono specializes, record the proposed key, using the elaboration's identity set
+   for each specialized argument.
+3. Grade 1:1 against mono's specialized instances: every specialized argument has a singleton set,
+   and the proposed key groups mono's instances the way mono's `@name` suffix does (the 96 groups).
+
+Slice 2 makes the elaboration enqueue and re-check instances at those keys. Slice 3 switches
+`elabCalleeFnsOf` inside them, which retires mono's derivation for the 1,052 and gives (S1) its map.
+Each slice is graded on the byte sweep.
+
+**Ruling** (coordinator, 2026-11-07). The design is approved, on three conditions:
+- **The instance count is a graded number.** The proposed key groups exactly as mono's `@name`
+  suffix does, no more instances and no fewer. Every slice reports the instance-count delta, and
+  any growth stops the work.
+- **A tagged set is never specialized (D15010).** This is an assertion in slice 1's predicate.
+- **Each slice comes back for a ruling before the next.** Slice 1 is approved: fold the gates
+  byte-identically, then record and grade the key.
 
 #### The call half and the value half (2026-11-06)
 
