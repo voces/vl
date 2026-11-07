@@ -22691,7 +22691,9 @@ function monoCellCall(
   if !viaAlias && cfe >= 0 && cfe < monoGen.length && monoGen[cfe] == 1 {
     monoLastInstFe = -1
     const rc = monoInstantiate(cfe, ix, ctx)
-    monoNoteBindCall(at, cctx)
+    if monoLastInstFe >= 0 {
+      monoNoteBindSig(at, cctx, monoSlotSig(monoLastInstFe))
+    }
     if rc < 0 { return -1 }
     return 1
   }
@@ -22726,7 +22728,9 @@ function monoCellCall(
   ) {
     monoLastInstFe = -1
     if monoInstantiate(lfe, ix, ctx) < 0 { return -1 }
-    monoNoteBindCall(at, cctx)
+    if monoLastInstFe >= 0 {
+      monoNoteBindSig(at, cctx, monoSlotSig(monoLastInstFe))
+    }
     ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
     ctnTys = monoInstParamPinTys(monoLastInstFe)
   }
@@ -22748,13 +22752,13 @@ function monoCellCall(
 let monoWriteCoercedCall = -1
 
 // Whether the `let` (`key` `n:`) or capture cell (`c:`) read at `at` in frame `ctx` is written
-// and no call has given it a signature yet: its writes then take this call's.
+// and no call has gone through it yet (`monoBindCalled`): its writes then take this call's.
 function monoWritesCoercedFirstCall(key: string, at: i32, ctx: i32): boolean {
   const lf = monoReadLetFrame(at, ctx)
   if lf[1] < 0 || monoWritesOf(key, lf[1]).length == 0 { return false }
   // A write of another binding of the name does not make this one written (D4016).
   if key == "n:" && !monoLetWrittenIn(lf) { return false }
-  (monoBindCallSigs.get(lf[1]) ?? "") == ""
+  !(monoBindCalled.get(lf[1]) ?? false)
 }
 
 // The longest alias chain a walk here follows before refusing, as long as the flow table's.
@@ -23674,7 +23678,9 @@ function monoWalkIdentCall(
       const ri = monoInstantiate(fe, ix, ctx)
       monoWriteCoercedCall = -1
       monoArmCall = -1
-      monoNoteBindCall(n.callFn, ctx)
+      if monoLastInstFe >= 0 {
+        monoNoteBindSig(n.callFn, ctx, monoSlotSig(monoLastInstFe))
+      }
       // The call keeps its `call_ref` through a written `let`, so each generic written to it
       // takes the instance's signature, as a delivery of the binding does (D3961).
       if ri >= 0 && !direct && monoLastInstFe >= 0 {
@@ -24213,16 +24219,8 @@ function monoPinLamFromFlow(fe: i32): i32 {
 
 // The instance the last `monoMakeInstance` minted or hit; -1 before one.
 let monoLastInstFe = 0 - 1
-// Per binding node a call goes through, the `;`-joined signatures the calls take.
-let monoBindCallSigs: {[i32]: string} = Map()
-
-// Records the signature of the call just lowered through the binding read at `at` in frame
-// `ctx`, on that binding and on every binding its initializer chain names.
-function monoNoteBindCall(at: i32, ctx: i32) {
-  if monoLastInstFe < 0 { return 0 }
-  monoNoteBindSig(at, ctx, monoSlotSig(monoLastInstFe))
-  0
-}
+// The binding nodes a call has gone through.
+let monoBindCalled: {[i32]: boolean} = Map()
 
 // A binding read at `at` in frame `ctx` and delivered where annotation `tyNode` is a function
 // type with concrete parameters is called at that signature by whoever receives it (D3862).
@@ -24716,8 +24714,8 @@ function monoNameShadowedAt(name: string, at: i32, ctx: i32): boolean {
 // The name nodes `monoNoteBindDelivery` recorded: each is a call of what it reads.
 let monoDeliveredArgs: i32[] = []
 
-// Records signature `sig` on the binding read at `at` (a name or a capture cell's `d[0]`) in
-// frame `ctx`, and on every binding its initializer chain names.
+// Marks the binding read at `at` (a name or a capture cell's `d[0]`) in frame `ctx`, and every
+// binding its initializer chain names, as called, when the call has signature `sig`.
 function monoNoteBindSig(at: i32, ctx: i32, sig: string) {
   if sig == "" { return 0 }
   let ax = at
@@ -24732,8 +24730,7 @@ function monoNoteBindSig(at: i32, ctx: i32, sig: string) {
     // A module-scope binding's call in an unnamed module-scope function still counts: that
     // function is lowered, and with it the call (D3868).
     if hops == 0 && lf[0] >= 0 && monoWriteFrameDead(ctx, lf[0]) { return 0 }
-    const had = monoBindCallSigs.get(lf[1]) ?? ""
-    monoBindCallSigs.set(lf[1], monoSigListAdd(had, sig))
+    monoBindCalled.set(lf[1], true)
     if d.letInit < 0 { return 0 }
     let iv = d.letInit
     const ce = monoGeneratedCellElem(iv)
@@ -25404,20 +25401,6 @@ function monoSigPins(sig: string): string[] {
   out
 }
 
-// Signature list `all` with `one` added, once.
-function monoSigListAdd(all: string, one: string): string {
-  let st = 0
-  let i = 0
-  while i < all.length {
-    if all[i] == ";"[0] {
-      if all.slice(st, i + 1) == one { return all }
-      st = i + 1
-    }
-    i = i + 1
-  }
-  all + one
-}
-
 // The refusal of a `let` whose values are called at two signatures; the binding's name goes
 // between the two halves.
 const MONO_BIND_SIG_PRE = "emitProgram: the reassigned function binding `"
@@ -26012,7 +25995,7 @@ export function monomorphize(stmts: i32[]) {
   monoParamPinTy = Map()
   monoAnonParamPinTy = Map()
   monoFramedPushes = Map()
-  monoBindCallSigs = Map()
+  monoBindCalled = Map()
   monoRetDeliveredAt = Map()
   monoCellCoercedSig = Map()
   monoSigCallRet = -2
