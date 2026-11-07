@@ -18,21 +18,24 @@ Each candidate was built from the base fixpoint and swept (23,610 programs):
 | C | pins holding no record, map or non-literal union | 78 | 41 |
 | D | C, at un-annotated parameters only | 1 | 0 |
 | E | D, a union of string and numeric literals excluded | 0 | 0 |
+| G | D, a literal union only where it spells by its rep (alias or base) | 0 | 0 |
 
 B and C fail for one reason: `pinTys` holds the **argument's** type, and an annotated parameter's
 pin is its substituted annotation. `len<T>(t: T[] | i32)` called with `[1, 2]` pins `i32[]|i32`
 while `pinTys` holds `i32[]`, so its spelling drops the union (D10131, then `is` refuses). Only at
 an un-annotated parameter are the pin and the argument's type the same thing. D's one loss was
 `AB | N12` (`d3127_…_i32_call_hole`), a union of string and numeric literals that has no single
-rep to spell. E's one bytes-only mover was a lone literal, `catLit(one[0])` at `"red"`, which mono
-pins as the literal union's `i32` atom and the structural spelling turned into a string ref, so a
-lone literal keeps mono's spelling too.
+rep to spell. E's one bytes-only mover was `catLit(one[0])` at the one-member union `"red"`, which has no
+alias: mono pins it at the literal union's `i32` atom, and its structural spelling made the
+parameter a string ref. So a literal union is respelled only where the producer spells it by its
+rep (G), and a lone literal keeps mono's spelling.
 
 ## What is still mono's, and why
 
-- **Records, maps and non-literal unions**, even at a hole: C's 78 losses are emit readers that
-  resolve the pin's text by name (`is` against a declared union, `{[i32]:boolean}` against
-  `Set<i32>`, the struct-or-union element arrays). Each one needs the pin's type handed to it first.
+- **Records, maps and non-literal unions**: the 90 programs B loses beyond C carry them, and their
+  refusals are emit readers that resolve the pin's text by name (`is` against a declared union,
+  `{[i32]:boolean}` against `Set<i32>`, the struct-or-union element arrays). Each needs the pin's
+  type handed to it first; B ran at every parameter, so the share at holes alone is not measured.
 - **Annotated parameters**: they need a column holding the pin type, the parameter's own substituted
   annotation type, which neither maker builds yet (`pinTys` is the argument's).
 - **Type-parameter bindings (`tvV`)**: not switched in this slice.
@@ -50,6 +53,12 @@ byte-identical), against the master fixpoint:
 
 | | |
 |---|---|
-| sweep | SEE_SWEEP |
-| seed | 6,444,894 → SEE_SEED bytes |
+| sweep | 23,610 of 23,610 same (0 bytes-only, 0 output movers) |
+| seed | 6,444,894 → 6,446,230 bytes (+1,336) |
 | pin-helper budget (`emit_mono.vl`) | 944 → 944 (the helpers live in `pin_spell.vl`) |
+
+## Slice 3
+
+Not started. No `monoArgTyName*` function loses a caller: the cascade still runs for every pin, and
+at a respelled hole pin its answer is overwritten afterwards. Which arms now only answer pins that
+are overwritten needs the per-arm grading of "The argument pin's arms", rerun on this tree.
