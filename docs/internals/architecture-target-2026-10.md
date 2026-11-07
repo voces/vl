@@ -2061,6 +2061,19 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
       (`(T) => T` where mono closes the instance) for 18 more. That is the second acceptance list:
       a receiver fact for list methods called on a list of hole lambdas, and a delivered-signature
       fact for a lambda or function value handed to a list method as its callback.
+      Re-graded against the checker's own closed type, 424 of those decisions read the checker
+      and owe nothing. What is left is 166 receivers (122 function-list holders, the holder fact's)
+      and 63 callback signatures. A named generic or hole callback now takes the signature of the
+      instance the elaboration made for it at the element (`elabCbArgSig`, noted against the
+      argument). So does one a binding holds (`const inc = (a) => a + 1`, which the checker now
+      instances through `cwFnValueDeclOf`) and a choice of functions whose arms agree. That
+      covers 44 of the 63 with 0 DIFF and builds all 19,337 programs byte-identical. The other
+      19 are hole-lambda lists left open on both sides, a binding written more than once, and a
+      choice inside a generic instance.
+      `monoCoerceListCbArg` is deleted only when both its halves read the elaboration. Its
+      receiver half (166 decisions, every one a list of hole functions closed by its own calls,
+      returned, held or nested) waits on the holder fact. Its callback half waits on what that
+      fact and the binding reader leave of the 19.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
   The hub is the binding `monoInstantiateCallIn` hands `monoMakeInstance` (`tvN` / `tvV` / `tvT`),
   against `ekTys` at the key the elaboration made for the call (`elabWalkKeyOf`, which already
@@ -2277,6 +2290,14 @@ generic is called at two signatures. Dropping mono's answer there moves no byte.
 field program, `generics/nested-capture-per-pin-binding.vl`, now takes the fact at its two fields
 with the same bytes. The four elab-only maps are ones where `monoPinMapSlot` declines first, so nothing
 changes. Over 19,316 programs no byte moves, and 4,605 filed witnesses grade as filed.
+
+**Slot type, a map of nested function lists** (2026-11-07). `monoPinMapNestedFnLists` was held by
+one program, its own fixture `closures/hole-fn-nested-list-map-value.vl`. There the elaboration
+already has the map's whole fact, `{[string]: ((i32) => i32)[][]}`, and the leaf fact agrees with
+mono's pin. `monoPinMapSlot` now types a list of lists of functions from the whole fact and records
+the inner literals at it. A map of that shape without a closed fact is a loud refusal, which no
+program reaches. The stored values need no instancing of their own here, because their deliveries
+already instance them. The fixture prints the same, and over 19,316 programs no byte moves.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
