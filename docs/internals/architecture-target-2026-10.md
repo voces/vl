@@ -2684,20 +2684,26 @@ the as-written inert map site no longer decides a slot. `monoInertValues` remain
 record for its other readers: `monoNamesUsedAsValue`, `monoSpreadHostInert`, `monoStubValueOk`
 (emit_state), `emitIdentNonLocalRead` and `stmtIsBareFnName` (wasmEmit).
 
-**The reach index's inert answer is `value_reach`'s own record, and it is order-dependent**
-(2026-11-07). `monoReachIndex` asks `vrNoteInertAtIndex` of each candidate as each instance body is
-indexed, and `vrInertAtIndex` returns the answer it got then. A clone takes its original's answer at
-copy time (`vrInertAtIndexCopy`). The five readers ask `vrValueInert`, which is that record or
-`monoInertValues`. Asked at query time instead, against the finished index, 62 decisions over 23,456
-programs read live where the record reads inert: stub 33 + 6 clone, closure 11 + 4 clone, names 7 + 1
-clone. No call reaches any of them. Every one is lost at a single step, from a list literal to the
-un-annotated binding it initializes, and lost there because the monomorphizer annotated that
-binding after the record was taken (`LetDecl` is followed only while `letType < 0`). With the step
-reading the binding as written, all 62 read inert at query time, 0 differ. D10251 is one:
-`const xs = [id]`, and the instance's annotation of `xs` hides `xs`'s reads. The order dependence
-is real and this record contains it, but it is the rewrite racing the question, not a later body
-reaching a call. Before the query-time answer can replace the record, the `LetDecl` step needs to
-read the source annotation.
+**The reach index's inert answer is asked at query time** (2026-11-07). The five readers ask
+`vrValueInert`, which is `monoInertValues` or `vrInert(x, "")` against the "mono" index. The
+second half covers a read the index holds that the monomorphizer took as naming a generic
+function when it indexed it (`vrNoteGenericCand`), and a clone copy takes its original's note.
+Two facts are read as the index saw them, because a later rewrite changes them in place. A
+binding's annotation is read that way: the monomorphizer annotates un-annotated bindings, and
+`LetDecl` is followed only while unannotated. A template's type parameters are read that way
+too: the monomorphizer strips a nested generic's type parameters, so `monoIsGenericDecl` reads
+false afterwards. The monomorphizer's function slots (`monoGen`, `fnIndexOfNode`) are renumbered
+once the walk ends, so they cannot be read at query time either. Before this, the answer was a
+record taken at index time. Asked at query time without the annotation snapshot, 62 decisions
+over 23,456 programs read lost (D10251 is one: `const xs = [id]`). With the snapshot and the
+generic note, the query-time answer and the old record differ in 0 decisions.
+
+**Standing hazard: the monomorphizer mutates the checked tree in place.** It annotates
+un-annotated bindings, strips a nested generic's `fnTyParams`, and renumbers its function slots
+(`monoGen`, `fnStmts`). So any fact asked after the walk can see the walk's mutation. A per-node
+fact taken before the walk reads the tree the program wrote. An answer computed after the walk
+can differ from it with nothing in the reader saying so. When a query-time answer disagrees with
+an earlier one, look for a field the walk rewrote before looking for a missing edge.
 
 `value_reach` is therefore still a live fact source for these readers, and its inert answer is the
 next fact that needs an elaboration twin. It is not `elabSlotUncalled`. "Reaches no call" is one
