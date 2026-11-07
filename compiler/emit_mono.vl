@@ -21683,14 +21683,53 @@ function monoPinHoleParam(
     }
   }
   const pt0 = nodeTyIxOf(params[i])
-  const ept = elabCallParamTy(monoCallTplOf(callIx), i)
-  const dt = if ept >= 0 { ept } else { pt0 }
-  let an = if pt0 >= 0 && !tyHasTyVar(pt0) && dt >= 0 { monoClosedTyPin(dt) } else { "" }
+  // The parameter's type at this call is the elaboration's where it closes: mono's rungs below only
+  // spell it, and a spelling of another type is refused. Where it does not close, mono's own rungs
+  // answer.
+  const elTy = elabCallHoleParamTy(monoCallTplOf(callIx), i, params[i])
+  const et = callArgRepTy(
+    monoCallTplOf(callIx),
+    i,
+    elabCallParamTy(monoCallTplOf(callIx), i),
+  )
+  let an = ""
   let anTy = -1
-  // A literal handed to a parameter the body's own annotation decides delivers its open
-  // functions at the slots the flow table pins, as at an annotated parameter (D9610).
-  if an != "" && monoFlowIsLit(unwrapParen(args[i])) {
-    if monoCoerceFnValueName(args[i], an, ctx, -1) < 0 { return -1 }
+  let guessed = false
+  if elTy >= 0 {
+    const ept = elabCallParamTy(monoCallTplOf(callIx), i)
+    const dt = if ept >= 0 { ept } else { pt0 }
+    if pt0 >= 0 && !tyHasTyVar(pt0) && dt >= 0 {
+      an = monoClosedTyPin(dt)
+      if an != "" { anTy = dt }
+    }
+    // A literal handed to a parameter the body's own annotation decides delivers its open
+    // functions at the slots the flow table pins, as at an annotated parameter (D9610).
+    if an != "" && monoFlowIsLit(unwrapParen(args[i])) {
+      if monoCoerceFnValueName(args[i], an, ctx, -1) < 0 { return -1 }
+    }
+  } else {
+    // The elaboration closes every parameter the checker typed closed, so a closed type here is
+    // one its fact lost, not one to pin from.
+    if et >= 0 && et < T.tys.length && !tyHasTyVar(et) {
+      return emitFailAt(
+        "emitProgram: internal: parameter `"
+          + p.parName
+          + "` of `"
+          + fn.fnName
+          + "` has a closed type the elaboration does not answer at this call",
+        args[i],
+      )
+    }
+    if pt0 >= 0 && !tyHasTyVar(pt0) && !tyReachesHole(pt0, 16) {
+      return emitFailAt(
+        "emitProgram: internal: parameter `"
+          + p.parName
+          + "` of `"
+          + fn.fnName
+          + "` is typed closed but the elaboration does not answer it at this call",
+        args[i],
+      )
+    }
   }
   if an == "" {
     const pinTy: i32[] = [0 - 1]
@@ -21700,96 +21739,28 @@ function monoPinHoleParam(
       return monoHoleTwoPinsFail(args[i], p.parName, fn.fnName)
     }
   }
-  // The elaboration's answer for the parameter at the call's template, where it closes.
-  const et = callArgRepTy(
-    monoCallTplOf(callIx),
-    i,
-    elabCallParamTy(monoCallTplOf(callIx), i),
-  )
-  if an == "" {
-    an = monoElabPin(callIx, args, i, et, ctx)
-    if an != "" { anTy = et }
-  }
-  let guessed = false
-  // A parameter the elaboration closes at a type holding no record is pinned at that type,
-  // spelled as mono keys it.
-  if (
-    an == ""
-    && et >= 0
-    && et < T.tys.length
-    && !tyHasTyVar(et)
-    && !tyHoldsObj(et, 8)
-  ) {
-    an = monoPinOfClosedTy(et)
-    if an != "" { anTy = et }
-  }
-  // A record argument is pinned at the row the checker recorded it built at, else the row its
-  // literal is stamped at, else the elaboration's type (D14532, D14739, D14754, D14720).
-  if an == "" && et >= 0 && et < T.tys.length && !tyHasTyVar(et) {
-    const bt = monoArgBuildTy(unwrapParen(args[i]), ctx)
-    const rt = if bt >= 0 { bt } else { et }
-    an = monoRecordRowPin(rt)
-    if an != "" { anTy = rt }
-  }
-  // A record the elaboration leaves open is pinned at the row its own type is built at.
-  if an == "" && et < 0 {
-    const rt = nodeTyIxOf(unwrapParen(args[i]))
-    if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyObj {
-      const si = structRowRecordingTy(rt)
-      if si >= 0 && si < sNames.length {
-        an = sNames[si]
-        anTy = rt
-      }
-    }
-  }
-  // An argument the elaboration closes in this frame's instance, at a call it keys no parameter
-  // type for (a set member's dispatch arm, a hole function handed on), pins at that type.
-  if an == "" {
-    const it = elabNodeTyAt(unwrapParen(args[i]), ctx)
-    if it >= 0 && it < T.tys.length && !tyHasTyVar(it) {
-      an = if tyHoldsObj(it, 8) { monoRecordRowPin(it) } else { monoPinOfClosedTy(it) }
-      if an != "" { anTy = it }
-    }
-  }
-  if an == "" {
-    // Kept for an argument the elaboration leaves open at this call.
-    an = monoArgPinName(args[i], ctx)
-    // The rep cascade's `i32` floor is not a pin for a hole the elaboration binds to another
-    // closed type: that demand would key an instance no call has.
-    if an == "i32" && monoFloorDisagrees(setTy) {
-      return emitFailAt(
-        "emitProgram: internal: parameter `"
-          + p.parName
-          + "` of `"
-          + fn.fnName
-          + "` would be pinned at the `i32` floor, but the elaboration binds it to "
-          + tyToStr(setTy),
-        args[i],
-      )
-    }
-    // The rep cascade's `i32` floor is a guess for a value the checker left open: it pins at
-    // the type this frame's instance closes it to, or the elaboration's, or not at all.
-    const openTy = if an == "i32" { monoArgOpenValueTy(args[i], ctx, et) } else { 0 - 2 }
-    if openTy > -2 {
-      an = ""
-      if openTy >= 0 { an = monoI32AtomPinName(openTy) }
-      guessed = an == ""
-      if an != "" { anTy = openTy }
-    }
-    // A hole function's `=>` pin is typed at the closed signature its rep key names.
-    if anTy < 0 { anTy = monoHoleFnPinTy(args[i], ctx, an) }
-  }
-  // An argument open in this frame at a call no instance elaborates at a closed type: no
-  // instance is demanded here.
-  if an == "" && guessed { return 1 }
-  if an == "" { return monoArgTyFail(p.parName, fn.fnName) }
-  if anTy < 0 { anTy = monoArgPinTyIx(args[i], ctx) }
-  // The parameter's type at this call is the elaboration's where it closes; mono's own rungs
-  // answer only where it does not, and a disagreement is refused, never picked silently.
-  const elTy = elabCallHoleParamTy(monoCallTplOf(callIx), i)
   if elTy >= 0 {
+    if an == "" {
+      an = monoElabPin(callIx, args, i, et, ctx)
+      if an != "" { anTy = et }
+    }
+    // A closed type holding no record is spelled as mono keys it; a record argument at the row
+    // the checker recorded it built at, else its literal's stamp, else the type (D14532, D14739,
+    // D14754, D14720).
+    const etShut = et >= 0 && et < T.tys.length && !tyHasTyVar(et)
+    if an == "" && etShut && !tyHoldsObj(et, 8) {
+      an = monoPinOfClosedTy(et)
+      if an != "" { anTy = et }
+    }
+    if an == "" && etShut {
+      const bt = monoArgBuildTy(unwrapParen(args[i]), ctx)
+      const rt = if bt >= 0 { bt } else { et }
+      an = monoRecordRowPin(rt)
+      if an != "" { anTy = rt }
+    }
+    if anTy < 0 { anTy = monoArgPinTyIx(args[i], ctx) }
     const elPin = if tyHoldsObj(elTy, 8) { monoRecordRowPin(elTy) } else { monoPinOfClosedTy(elTy) }
-    if elPin != an && !(anTy >= 0 && tySame(anTy, elTy)) {
+    if an == "" || (elPin != an && !(anTy >= 0 && tySame(anTy, elTy))) {
       return emitFailAt(
         "emitProgram: internal: parameter `"
           + p.parName
@@ -21800,6 +21771,60 @@ function monoPinHoleParam(
       )
     }
     anTy = elTy
+  } else {
+    // A record the elaboration leaves open is pinned at the row its own type is built at.
+    if an == "" && et < 0 {
+      const rt = nodeTyIxOf(unwrapParen(args[i]))
+      if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyObj {
+        const si = structRowRecordingTy(rt)
+        if si >= 0 && si < sNames.length {
+          an = sNames[si]
+          anTy = rt
+        }
+      }
+    }
+    // An argument the elaboration closes in this frame's instance, at a call it keys no parameter
+    // type for (a set member's dispatch arm, a hole function handed on), pins at that type.
+    if an == "" {
+      const it = elabNodeTyAt(unwrapParen(args[i]), ctx)
+      if it >= 0 && it < T.tys.length && !tyHasTyVar(it) {
+        an = if tyHoldsObj(it, 8) { monoRecordRowPin(it) } else { monoPinOfClosedTy(it) }
+        if an != "" { anTy = it }
+      }
+    }
+    if an == "" {
+      // Kept for an argument the elaboration leaves open at this call.
+      an = monoArgPinName(args[i], ctx)
+      // The rep cascade's `i32` floor is not a pin for a hole the elaboration binds to another
+      // closed type: that demand would key an instance no call has.
+      if an == "i32" && monoFloorDisagrees(setTy) {
+        return emitFailAt(
+          "emitProgram: internal: parameter `"
+            + p.parName
+            + "` of `"
+            + fn.fnName
+            + "` would be pinned at the `i32` floor, but the elaboration binds it to "
+            + tyToStr(setTy),
+          args[i],
+        )
+      }
+      // The rep cascade's `i32` floor is a guess for a value the checker left open: it pins at
+      // the type this frame's instance closes it to, or the elaboration's, or not at all.
+      const openTy = if an == "i32" { monoArgOpenValueTy(args[i], ctx, et) } else { 0 - 2 }
+      if openTy > -2 {
+        an = ""
+        if openTy >= 0 { an = monoI32AtomPinName(openTy) }
+        guessed = an == ""
+        if an != "" { anTy = openTy }
+      }
+      // A hole function's `=>` pin is typed at the closed signature its rep key names.
+      if anTy < 0 { anTy = monoHoleFnPinTy(args[i], ctx, an) }
+    }
+    // An argument open in this frame at a call no instance elaborates at a closed type: no
+    // instance is demanded here.
+    if an == "" && guessed { return 1 }
+    if an == "" { return monoArgTyFail(p.parName, fn.fnName) }
+    if anTy < 0 { anTy = monoArgPinTyIx(args[i], ctx) }
   }
   pinned.push(an)
   pinTys.push(anTy)
