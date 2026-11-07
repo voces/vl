@@ -2090,6 +2090,15 @@ comes from the tag layer. Three steps:
 - (c) a hole parameter is closed per instance from its callers' arguments, and declines where two
   callers at one key pass different types.
 
+**Identity and signature are two facts.** `elabTyClosed` accepts a function type that a known set
+closes by identity (Fn#d), while its signature still holds its members' own holes, e.g.
+`((_) => _)[]`. `elabNodeTy` answers that identity-closed type, and rep readers dispatch on its
+set. `elabSlotTyAt` answers the closed signature (`((i32) => i32)[]`). Answering the signature from
+`elabNodeTy` in place of the identity drops the set. #6566 (closed) tried it and broke 16 oracle
+fixtures plus D7381, D9600 and D9660. A reader that needs the signature asks `elabSlotTyAt`. A
+shadow that sees identity on one side and a signature on the other has found two facts, not a
+disagreement.
+
 **Slot type, first reading: `monoReachSlotTy`** (2026-11-06). Value reach (`vrCalleeTy`) against
 the climb's agreed tuple (`elabLitSlotCallTys`), each computed on its own:
 
