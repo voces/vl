@@ -2024,6 +2024,46 @@ largest first:
 - call param, 5;
 - slot held fns, unbound default and others, 3.
 
+**Slot type's 15 unassessed, measured** (2026-11-07, 23,456 programs, master `7a471b8c`).
+
+Each function's answer was compared with the stored slot fact `elabSlotTyAt(holder, path, frame)`,
+by type (`tySame`) and by spelling:
+
+| function | same | differ | mono only | elab only | both none |
+|---|---|---|---|---|---|
+| `monoPinFieldContainer` | 6 | 0 | 2 | 80 | 113 |
+| `monoPinObjFields` | 6 | 0 | 0 | 171 | 856 |
+| `monoPinStoredRecords` | 14 | 0 | 7 | 3 | 1 |
+| `monoLetWritesAt` | 77 | 0 | 0 | 0 | 0 |
+
+The same answers also spell the same. What each of the 15 comes to:
+
+- **Deleted here:**
+  - `monoListSrcElemTy`, its arm and `mfrListSrc`. It answered nothing in 23,456 programs: the map
+    was keyed by the original `Index` read, and its one caller passes the read the flow rewrite
+    minted.
+  - `monoLetWritesAt`'s per-write type walk. A `let` now passes where its slot fact is `t`, and the
+    elaboration closes that fact only where every write agrees. It keeps recording a fresh `Map()`
+    write at `t`.
+- **Lane F's switch:** the record-field trio (`monoPinFieldContainer`, `monoPinObjFields`,
+  `monoPinStoredRecords`), with `monoPinFieldValue` delegating. Mono's gate decides whether to
+  pin, and the slot fact gives the type. The 254 elab-only decisions are not acted on, and the
+  D15494 cells are a named fallback.
+- **(c):**
+  - `monoWritesCoercedFirstCall`, a walk-order gate ("no call has given it a signature yet"). It
+    reads the call-signature table that lane F's c89 rewrites, so it is rechecked against that.
+  - `monoRetypeLamCells`, which retypes capture cells the capture rewrite generates. The
+    elaboration has no node for them.
+  - The two delegators, `monoPinFieldValue` and `monoPinFieldContainers`.
+- **Already settled:**
+  - `monoSigJoin` and `monoPinJoin`, deleted by #6626.
+  - `monoRenameInitAt`, recorded as (c) there.
+  - `monoNoteBindCall`, inlined by c89.
+- **Blocked:** `monoLetWritesClosed`, on split-dep's written-value reader. Its gate is that each
+  write reads a binding already closed. 5 decisions (D9182) are no for mono and closed for the
+  elaboration.
+- **Parked:** `monoReachLitTys`, with `monoReachSlotTy`.
+
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
 read. A decision is a pin a function returns, a type it returns or records, or a gate choosing
@@ -2337,6 +2377,12 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
     example `(string) => string`) where the elaboration's seed binding is the seed parameter's own
     `(T) => T`, because mono substitutes the binding that parameter got at the instance.
   - `monoCallIfValue` makes no decision over the population: every entry returns at its gate.
+    Built with its signature step as a loud refusal, a fixpoint sweep moved no program and every
+    filed witness graded as filed, so the step is deleted. With it go `monoSeedCallSigTys`,
+    `monoInstFnPinTys` and the `monoWrittenLetSigCall` flag. What stays is class (c): a gate that
+    recognises a call through an `if` naming generic functions in every arm, and refuses it with
+    "a call through an `if` naming generic functions in every arm has no signature to instance
+    them at".
   - `monoPreBindArgName`, `monoPreBindArgTy`, `monoArgPinName` and `monoArgPinTyIx` wrap the pin
     measured above. `monoSpelledRecordLeavesRow` is a row-layout test, in the row-key family.
 - [x] **uncalled slot** (6): `monoInertParamStubPin` 4,712, `monoValsInert` 12, `monoCallRetsInert` 12, `monoValsReachNoCall` 8, `monoLitReachesNoCall` 0, `monoInertReach` 0.
@@ -2612,8 +2658,8 @@ instance. It is the signature twin of an instance the elaboration holds by ident
 territory, not foreseen. `monoCallWrittenLet` instances its writes at the delivery's pin, and
 `monoCallIfBound` no longer falls back to the seed. Mono's result derivation then decides nothing
 in the population, so `monoListSlotPinnedFnTy`, `monoPathSlotPinnedFnTy` and `monoHeldSrcsFnTy` are
-deleted. `monoSeedCallSigTys` stays for `monoCallIfValue`, an inline
-`if` with no binding, which is the call-param family's.
+deleted. `monoSeedCallSigTys` stayed for `monoCallIfValue`, an inline
+`if` with no binding; it went with that function's signature step, which no program reaches.
 
 **Node type, first reading** (2026-11-06, the same population, against `elabNodeTyAt` at the
 instance):
