@@ -18,7 +18,6 @@ set class and three reps (`id` = a tagged set's member id, `clo` = a closure):
   walked down the steps. This is the type #6711's guards protect.
 
 No pass reads the fact, and with the flag off the output is byte-identical (§ Proof).
-
 **Population.** These are the 23,611 programs of `scripts/sweep.vl -- list`, filtered by a source
 regex to 4,114 that write a lambda or a declared function's name into a literal, `.push`, `.set` or a
 store. On an 80-program random sample the filter missed 0 of the 8 programs with rows. 2,416
@@ -36,13 +35,9 @@ programs have at least one row, and they hold 6,153 writes in all. To rerun:
 | `id-uncovered` | **13** | **built as an id of a tagged set that lacks a member of the slot's set** |
 
 **The held column is where the guards live: 782 writes in 336 programs** are built as an id where
-the held type says closure:
-- 408 `static`, 361 `tag` and 13 `id-uncovered`;
-- by position: 561 list, 70 field, 110 store, 28 set and 13 push;
-- it includes the guard witnesses `d15221_opt_dbl` (field `s.f`), `hole-fn-map-record-returned`
-  (store `hm["k"]`) and `d15293_called` (list `[inc0]`).
-
-The no-token class (`d15207_bound_twin`, `d15203_run_uncalled_local_returned`) and
+the held type says closure (408 `static`, 361 `tag`, 13 `id-uncovered`; 561 list, 70 field, 110
+store, 28 set, 13 push). They include the guard witnesses `d15221_opt_dbl` (field `s.f`),
+`hole-fn-map-record-returned` (store `hm["k"]`) and `d15293_called` (list `[inc0]`). The no-token class (`d15207_bound_twin`, `d15203_run_uncalled_local_returned`) and
 `d15293_called_two` read `clo-single`: a singleton built as a closure.
 
 **`id-uncovered` is the "index for a set" class, named.** It covers 13 writes in 13 programs, all of
@@ -72,9 +67,7 @@ served by a converting write.
 - `id-uncovered` needs the slot's set tagged as one set. That means the tag decision is made per
   slot key and not per call, which is a `check_fn_tag.vl` change outside this lane's files.
 
-## Not covered: instances
-
-The shadow reads the checked tree and the program's frame. A generic template's held type is `-`,
+**Not covered: instances.** The shadow reads the checked tree and the program's frame. A generic template's held type is `-`,
 and mono's instance copies do not exist yet when the snapshot is taken. So "per instance" is not
 measured here. `d15293_called_two`'s two instances read as one row.
 
