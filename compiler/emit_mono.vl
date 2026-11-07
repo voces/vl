@@ -15,7 +15,6 @@ import {
   lamChainOf,
   lamRespellOf,
 } from "./check_lam_chain"
-import { slotAnnFnTyOf, slotCallArgsInto } from "./check_calls"
 import { typeRowClassOf } from "./record_rows"
 
 // `emit_mono.vl` — the emitter's per-callsite monomorphizer: the eager pre-pass that
@@ -11448,12 +11447,8 @@ function monoCallIfBound(ix: i32, ctx: i32): i32 {
   const gfe = if g0 >= 0 { monoFnFeOfIdent(g0, monoIdentNameOf(g0), lf[0]) } else if k0 >= 0 { monoChoiceBindGen[k0] } else { -1 }
   if gfe < 0 { return 0 }
   const dTys: i32[] = []
-  let ct = monoSlotPinNameTys(lf[1], [], lf[0], dTys)
-  if ct == "" {
-    ct = monoSeedCallSigTys(gfe, ix, ctx, dTys)
-    if ct == "!" { return -1 }
-    if ct == "" { return 0 }
-  }
+  const ct = monoSlotPinNameTys(lf[1], [], lf[0], dTys)
+  if ct == "" { return 0 }
   // The binding holds one value, so a call at another type is refused and split (D9120).
   const et = nameToTy(ct)
   const seen = monoChoiceBindNote(
@@ -11757,16 +11752,12 @@ function monoCallWrittenLet(ix: i32, ctx: i32): i32 {
   if !(d is LetDecl) { return 0 }
   const g0 = monoFirstArmGenName(d.letInit, lf[0], 0)
   const dTys: i32[] = []
-  // The call takes the instance its arguments make of the seed; the call is never renamed to it,
-  // since a write may have replaced the value.
-  const ct = monoSeedCallSigTys(
-    monoLetSeedGenFe(d.letInit, lf[0]),
-    ix,
-    ctx,
-    dTys,
-  )
-  if ct == "!" { return -1 }
-  if ct == "" { return 0 }
+  // The binding's writes are instanced at the one signature the elaboration delivers it at, its
+  // result unpinned.
+  const pins = monoDeclPathPins(lf, [])
+  if pins.length != 1 { return 0 }
+  for t in monoPinFnParamTys(lf[1], [], pins[0]) { dTys.push(t) }
+  const ct = monoSlotPinAnn(lf, [], pins[0], "void")
   const prev = monoSigCallRet
   monoSigCallRet = nodeTyIxOf(ix)
   monoCellSigByCall = true
@@ -11810,14 +11801,10 @@ function monoCoerceWrittenCell(
   const took = monoCellValueTake(seed, tname, lf[0], tys)
   if took == 1 { emitFail(MONO_BIND_SIG_PRE + name + MONO_BIND_SIG_POST) }
   if took == 2 { monoCellValueFail(name) }
+  // The cell takes the one closed type the elaboration delivers the binding at.
   if monoLastInstFe >= 0 && monoLastInstFe < fnStmts.length {
-    const it = monoPinSubTyOf(
-      monoCellElemTyOf(d.letInit, seed),
-      fnStmts[monoLastInstFe],
-    )
-    if monoTyConcreteFn(it) {
-      monoRetypeCell(lf[1], seed, it, monoCellReadsIn(lf[0], lf[1]))
-    }
+    const it = monoSlotDeliveryTy(lf, [], false)
+    if it >= 0 { monoRetypeCell(lf[1], seed, it, monoCellReadsIn(lf[0], lf[1])) }
   }
   for i in monoWritesOf("c:", lf[1]) {
     const nd = nodeAt(i)
@@ -14641,7 +14628,9 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   const repoints = monoLetRepointLits(d, lf)
   if repoints.length == 1 && repoints[0] < 0 { return 0 }
   if monoPinListRecords(d, lf, repoints) < 0 { return -1 }
-  const rt = nodeTyIxOf(d.letInit)
+  // A list this instance closes needs no pin: the elaboration's type here, else the checker's.
+  const rtE = elabNodeTyAt(d.letInit, ctx)
+  const rt = if rtE >= 0 && rtE < T.tys.length && tyAt(rtE) is TyArray && !tyHasTyVar(rtE) { rtE } else { nodeTyIxOf(d.letInit) }
   if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyArray && !tyHasTyVar(rt) {
     return 0
   }
@@ -14652,6 +14641,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   const path: string[] = ["e"]
   const rawPins = monoDeclPathPins(lf, path)
   let pins = rawPins
+  let omit = false
   if pins.length > 1 {
     // Pushed functions whose every read now names its generic are called through no slot (D9441).
     const pushed = monoMethodStoredArgs(at, lf, "push", 1, "")
@@ -14675,6 +14665,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     if !sliced && monoFlowHeldOneGen(at, path) { return 0 }
     if live.length != 1 { return monoGenericListFail(d.letInit) }
     pins = live
+    omit = true
   }
   if (
     pins.length == 0
@@ -14691,38 +14682,22 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     && monoDeclPathPinsPerInstance(at, path)
   const ann = monoSigFnTyName(pins[0] + ";")
   const dTys: i32[] = []
-  if !monoListStoresAgree(lit, repoints, at, ann) { return 0 }
-  let ft = -1
+  // The element type is the one the elaboration delivers the slot at, else its slot type here.
+  let ft = monoSlotDeliveryTy(lf, path, omit)
+  if ft < 0 {
+    const st = elabSlotTyAt(at, path, ctx)
+    if monoTyClosedFn(st) { ft = st }
+  }
   for e in lit.arrElems {
     monoLastInstFe = -1
     const holeLam = monoListElemHoleLamFe(e, ctx) >= 0
-    const et0 = nodeTyIxOf(e)
-    let armFt = -1
-    if shared && ft < 0 { armFt = monoValueAtAnnTy(e, ann) }
     if monoCoerceFnValueTys(e, ann, ctx, -1, dTys) < 0 { return -1 }
     if holeLam && monoLastInstFe < 0 {
       if monoNoteBindDeliveryAt(e, ann, ctx) < 0 { return -1 }
     }
-    // A pin read at the element type's parameters fixes only an element instanced here: a value
-    // reaching the element from elsewhere is instanced at the slot's own pins.
-    if ft < 0 && monoLastInstFe >= 0 {
-      const st = monoNodeTyAt(e, fnStmts[monoLastInstFe])
-      if monoTyClosedFn(st) { ft = st }
-    }
-    const et = nodeTyIxOf(e)
-    if ft < 0 && monoTyClosedFn(et) { ft = et }
-    // An instance whose pins bind none of the holes its recorded type names: read `ann`'s
-    // parameters, as a shared list's hole functions do at this instance's own pin.
-    if ft < 0 && (holeLam || shared) { ft = monoHoleLamAtAnnTy(et0, ann) }
-    // An element joining hole functions has no one instance: each arm's result at `ann` (D7840).
-    if ft < 0 { ft = armFt }
   }
-  // A pin that is itself a function value names only a wasm signature, so a hole function's
-  // instance there keeps its hole: the slot's pinned parameter types and the element's result
-  // at them give the type, as a list literal handed to the parameter gets it (D6886).
-  if ft < 0 { ft = monoListSlotPinnedFnTy(at, lit.arrElems) }
-  // An empty literal that `push` fills takes the one type its pushed functions agree on.
-  if !monoTyClosedFn(ft) && lit.arrElems.length == 0 && !shared {
+  // An empty literal that `push` fills is instanced where its pushed functions are.
+  if lit.arrElems.length == 0 && !shared {
     const pushed = monoMethodStoredArgs(at, lf, "push", 1, "")
     if pushed.length > 0 {
       const sp: string[] = []
@@ -14732,7 +14707,10 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
       monoRetypeMethodReads(ctx, at, "pop", mkNullableTy(ft))
     }
   }
-  if !monoTyClosedFn(ft) { return 0 }
+  if !monoTyClosedFn(ft) {
+    monoSlotNoDeliveryFail(d.letInit)
+    return -1
+  }
   const fty = tyAt(ft)
   if !(fty is TyFunc) { return 0 }
   if shared {
@@ -14775,38 +14753,6 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     }
   }
   0
-}
-
-// Whether the functions list literal `lit`, the list literals of `repoints` and the element writes
-// of the binding declared at `at` store give one result at the parameters `ann` spells, where
-// they close there.
-function monoListStoresAgree(
-  lit: ArrayLit,
-  repoints: i32[],
-  at: i32,
-  ann: string,
-): boolean {
-  const vals: i32[] = []
-  for e in lit.arrElems { vals.push(e) }
-  let ri = 0
-  while ri + 1 < repoints.length {
-    const rl = nodeAt(repoints[ri])
-    if rl is ArrayLit {
-      for e in rl.arrElems { vals.push(e) }
-    }
-    ri = ri + 2
-  }
-  for w in monoWritesOf("e:", at) {
-    const wb = nodeAt(w)
-    if wb is BinExpr { vals.push(wb.binRight) }
-  }
-  let pre = -1
-  for v in vals {
-    const r = monoValueAtAnnTy(v, ann)
-    if r >= 0 && pre >= 0 && sigKeyOfTy(r) != sigKeyOfTy(pre) { return false }
-    if r >= 0 { pre = r }
-  }
-  true
 }
 
 // Gives the un-annotated list `d` (`lf`) of list literals of functions, written nowhere, the
@@ -15201,47 +15147,39 @@ function monoTyClosedFn(t: i32): boolean {
   monoTyConcreteFn(t) && !tyReachesHole(t, 16)
 }
 
-// The function type every element of `elems` takes at the closed parameter types slot `e` of
-// declaration `at` is called at, or handed to an annotated parameter at, with the elements' one
-// result there; -1 when those, an element or the results do not close or agree.
-function monoListSlotPinnedFnTy(at: i32, elems: i32[]): i32 {
-  const ePath: string[] = ["e"]
-  monoPathSlotPinnedFnTy(at, ePath, elems)
+// The one closed function type the elaboration delivers slot `path` of binding frame `lf` at,
+// leaving out the calls the flow rewrite repointed when `omit`; -1 for none, two, or an open one.
+function monoSlotDeliveryTy(lf: i32[], path: string[], omit: boolean): i32 {
+  let k = -1
+  if !omit && elabSlotPerInstance(lf[1], path) {
+    const it = monoFrameInstTmpl(lf[0])
+    k = if it[0] >= 0 { elabKeyAt(it[0]) } else { -1 }
+    if k < 0 { return -1 }
+  }
+  const ts = if omit {
+    elabSlotDeliveriesOmitting(lf[1], path, -1, mfrSetCalls)
+  } else {
+    elabSlotDeliveries(lf[1], path, k)
+  }
+  let one = -1
+  for t in ts {
+    if tyAt(t) is TyFunc {
+      if one >= 0 && !tySame(one, t) { return -1 }
+      one = t
+    }
+  }
+  if !monoTyClosedFn(one) { return -1 }
+  one
 }
 
-// `monoListSlotPinnedFnTy` at slot `path` of declaration `at`.
-function monoPathSlotPinnedFnTy(at: i32, path: string[], elems: i32[]): i32 {
-  const qs: i32[] = []
-  // An annotated parameter the slot is handed to gives its parameters, and its result must be
-  // each element's.
-  let annRet = -1
-  if !slotCallArgsInto(at, path, qs) {
-    const af = slotAnnFnTyOf(at, path)
-    const aft = if af >= 0 { tyAt(af) } else { null }
-    if !(aft is TyFunc) { return -1 }
-    for t in aft.fnParamTypes { qs.push(t) }
-    annRet = aft.fnRet
-    if annRet < 0 || tyHasTyVar(annRet) { return -1 }
-  }
-  for q in qs {
-    if tyHasTyVar(q) { return -1 }
-  }
-  let ft = if annRet >= 0 { mkFuncTy(qs, annRet) } else { -1 }
-  for el in elems {
-    // An element naming no one declaration (a `let` written twice) has its own type's result.
-    const ex = monoOpenFnArgDecl(el)
-    let r = -1
-    if ex >= 0 {
-      r = monoFnDeclRetAt(ex, qs)
-    } else {
-      r = monoFnTyRetAt(nodeTyIxOf(el), qs)
-    }
-    if r < 0 { return -1 }
-    const et = mkFuncTy(qs, r)
-    if ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft) { return -1 }
-    ft = et
-  }
-  ft
+// Refuses a function slot at `at` pinned at one signature that the elaboration delivers at no
+// one closed function type; -2, the refused answer.
+function monoSlotNoDeliveryFail(at: i32): i32 {
+  emitFailAt(
+    "emitProgram: internal: a function slot pinned at one signature has no one closed type the elaboration delivers it at",
+    at,
+  )
+  -2
 }
 
 // The function type a hole lambda typed `et` takes when instanced at the parameters `ann` spells:
@@ -16507,55 +16445,31 @@ function monoStoredSlotFnTy(
   if pins.length > 1 && monoValsInert(vals) {
     return monoUncalledSlotFnTy(at, path, vals, spell)
   }
+  let omit = false
   if pins.length > 1 {
     const live = monoFlowSlotPins(at, path)
-    if live.length == 1 { pins = live }
+    if live.length == 1 {
+      pins = live
+      omit = true
+    }
   }
   if pins.length != 1 { return -1 }
   const ann = monoSlotPinAnn(lf, path, pins[0], "void")
+  // The slot's type is the one the elaboration delivers it at; each value is instanced there.
+  const ft = monoSlotDeliveryTy(lf, path, omit)
+  if ft < 0 { return monoSlotNoDeliveryFail(at) }
   const dTys: i32[] = []
-  // Functions whose results at the pin disagree have no one slot type; asked before any instance
-  // is taken, since an instance's own type can read as the slot's.
-  let pre = -1
-  for vw in vals {
-    const r = monoValueAtAnnTy(vw[0], ann)
-    if r >= 0 && pre >= 0 && sigKeyOfTy(r) != sigKeyOfTy(pre) { return -1 }
-    if r >= 0 { pre = r }
-  }
-  let ft = -1
   for vw in vals {
     const val = vw[0]
     const wf = vw[1]
     monoLastInstFe = -1
     const holeLam = monoListElemHoleLamFe(val, wf) >= 0
-    const vt0 = nodeTyIxOf(val)
     if monoPinWrittenLam(val, ann, wf) < 0 { return -2 }
     if monoCoerceFnValueTys(val, ann, wf, -1, dTys) < 0 { return -2 }
     if holeLam && monoLastInstFe < 0 {
       if monoNoteBindDeliveryAt(val, ann, wf) < 0 { return -2 }
     }
-    let vft = -1
-    if monoLastInstFe >= 0 {
-      vft = monoNodeTyAt(val, fnStmts[monoLastInstFe])
-      if !monoTyClosedFn(vft) && holeLam { vft = monoHoleLamAtAnnTy(vt0, ann) }
-    }
-    // The instance's hole binding carries the result the checker guessed at a call it could not
-    // see through; the function's own result at the pin is the one its instance returns (D9064).
-    const aft = monoValueAtAnnTy(val, ann)
-    if (
-      !monoTyClosedFn(vft)
-      || (monoTyClosedFn(aft) && sigKeyOfTy(aft) != sigKeyOfTy(vft))
-    ) {
-      vft = aft
-    }
-    if !monoTyClosedFn(vft) { return -1 }
-    if ft >= 0 && sigKeyOfTy(vft) != sigKeyOfTy(ft) { return -1 }
-    ft = vft
   }
-  // A map no write here reaches, such as one a call returns, takes the result every function
-  // its slot can hold agrees on at the pinned parameters.
-  if vals.length == 0 { ft = monoHeldSrcsFnTy(at, path) }
-  if ft < 0 { return -1 }
   const fty = tyAt(ft)
   if !(fty is TyFunc) { return -1 }
   for vw in vals { monoRecordOpen(vw[0], ft, vw[1]) }
@@ -17063,29 +16977,6 @@ function monoMapValueUnpinnedCall(
     }
   }
   false
-}
-
-// The function type every function slot `path` of declaration `at` can hold takes at the closed
-// parameter types the flow table pins the slot at; -1 when the pins, a result or the sources do
-// not close or agree.
-function monoHeldSrcsFnTy(at: i32, path: string[]): i32 {
-  const qs: i32[] = []
-  if !slotCallArgsInto(at, path, qs) { return -1 }
-  for q in qs {
-    if tyHasTyVar(q) { return -1 }
-  }
-  const srcs = elabSlotHeldFns(at, path)
-  if srcs.length == 0 { return -1 }
-  let r = -1
-  for s in srcs {
-    const sr = monoFnDeclRetAt(s, qs)
-    if sr < 0 { return -1 }
-    if r >= 0 && !tySameSpelled(sr, r, TY_WALK_DEPTH) { return -1 }
-    r = sr
-  }
-  const ft = mkFuncTy(qs, r)
-  if !monoTyClosedFn(ft) { return -1 }
-  ft
 }
 
 // Each value stored into the map declared at `lf`'s declaration, with the frame its write is
