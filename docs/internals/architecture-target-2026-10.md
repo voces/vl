@@ -3763,8 +3763,8 @@ that spelling points at the arm.
 | arm | what it reads | programs | off |
 |---|---|---|---|
 | P10 | function-holding closed type → `monoFnTyPin`, the wasm signature | 65 | the pin spells the full type; `vl_call_bind_shadow_test`'s FNV witness, the "agree at the wasm signature" class, reads `agree` |
-| B1 | `monoBuildTyPin` | 1 (`soundness/covariant-record-field-read-only-runs`) | `W$m…` becomes `{x:i32\|string}` |
-| B4 | an annotated local's annotation | 1 (`structs/inline-shape-local-beside-declared-twin`) | `Circle` becomes `{r:i32}` |
+| B1 | `monoBuildTyPin` | 1 (`soundness/covariant-record-field-read-only-runs`) | `{x:i32\|string}` becomes `W$m…` |
+| B4 | an annotated local's annotation | 1 (`structs/inline-shape-local-beside-declared-twin`) | `{r:i32}` becomes `Circle` |
 
 **Kept: identical, but one half of a twin.** B8 (a local's initializer, when not `i32`, 3
 programs) and B17 (a global's `""` floor, 5 programs, all rejects) are each output- and
