@@ -7,8 +7,8 @@ tables it cites were scratch files and are not kept; re-run a witness from the t
 ## Status (2026-11-07, master `a7f27705`)
 
 Each step is graded by whether its **Deletes** list below is still in `compiler/`, and §3.4's front by
-the evening census ([notes](refactor-notes/2026-11-07-exit-census-evening.md)). The PR that moves a step
-updates this section. Dated measurements live in [`refactor-notes/`](refactor-notes/README.md).
+the evening census ([notes](refactor-notes/2026-11-07-exit-census-evening.md)). The orchestrator updates
+this section from each PR's report; a PR does not edit it (it conflicted on nearly every merge). Dated measurements live in [`refactor-notes/`](refactor-notes/README.md).
 
 | Step | State | What is left |
 |---|---|---|
@@ -18,7 +18,7 @@ updates this section. Dated measurements live in [`refactor-notes/`](refactor-no
 | 4. Finite function sets | deletions done | fn_split.vl, fn_flow_shadow.vl, the FS loop, `holeChoice*` and the list and capture pinners are gone, and the flow table is retired (§3.3). The residue is step 2's blocked list. |
 | 5. Contextual type and coercion records | deletions done | ExpCtx and the `emit*WidenSite` calls are gone. The one `lowerCoerce(srcRep, dstRep)` table is not built. |
 | 6. Narrowing produced once | in progress | `emit_narrow_slots.vl`, `pushNarrow*` and `capNarrowBuild` are gone. `criWalkBlock` replays no narrowing; it is `computeRetInference`'s return walk and goes with it in step 7. Ten of the sixteen `synth*Ann*` functions are gone (eight write-backs and two of their helpers), with three passes. Five write-backs and the helper `synthAnnOfTy` stand; the five are parked on a reader that reads the recorded type (`refactor-notes/2026-11-07-step6-write-back-census.md`). |
-| 7. `repOf(ty)`, one row per type | in progress | `computeVoidFns` is gone: `recordedVoidFns` reads the recorded result ([notes](refactor-notes/2026-11-07-step7-void-from-recorded.md)). `computeRetInference`, `buildFnMap`'s return-kind columns, `rlSlotByNameTwin` and `letInitDeliversRow` stand; the kind shadow has 82 functions outside its agree classes. The column shadow: post-mono 2,348 of 2,994 un-annotated functions agree on every return column; pre-mono 6,902 of 18,111 record an open result, so the first run cannot read it ([notes](refactor-notes/2026-11-07-step7-ret-columns-shadow.md)). The type-blind classifiers' phase census is `scripts/classifier-census.vl` (`$VL_CLS_CENSUS`): 6 post-only, 4 pre-only, 102 both. |
+| 7. `repOf(ty)`, one row per type | in progress | `computeVoidFns` is gone: `recordedVoidFns` reads the recorded result ([notes](refactor-notes/2026-11-07-step7-void-from-recorded.md)). `computeRetInference`, `buildFnMap`'s return-kind columns, `rlSlotByNameTwin` and `letInitDeliversRow` stand; the kind shadow has 82 functions outside its agree classes. The column shadow: post-mono 2,348 of 2,994 un-annotated functions agree on every return column; pre-mono 6,902 of 18,111 record an open result, so the first run cannot read it ([notes](refactor-notes/2026-11-07-step7-ret-columns-shadow.md)). The type-blind classifiers' phase census is `scripts/classifier-census.vl` (`$VL_CLS_CENSUS`): 6 post-only, 2 pre-only, 99 both, after five were deleted onto typed readers ([notes](refactor-notes/2026-11-07-step7-classifier-batch-1.md)). |
 
 **§3.4, the evening census of 2026-11-07** (master `3401b65f2`): the 165 `emit_mono` functions the morning
 census left.
@@ -63,19 +63,23 @@ map-value facts then deleted `monoFlowMapReadVals`, moved `monoFlowAliasMaps` to
   reads the pin type). Slice 2b names an un-annotated parameter's pin by `monoPinSpellOf` when it
   holds no record, map or non-literal union; the rest waits on a pin-type column (an annotated
   parameter's pin is its annotation, not the argument's type `pinTys` holds) and on the emit readers
-  that resolve a record or union pin by name (2026-11-07-pin-spelling-hole-params.md).
+  that resolve a record or union pin by name (2026-11-07-pin-spelling-hole-params.md);
 - per-call slot type: `monoReachSlotTy` and `monoReachLitTys` (the call nodes a literal slot's climb
   reaches, so each callee read is typed at the agreed tuple; the climb records the tuple, not the calls).
 
 **Parked at the census (12; 8 on master), each on a named question:**
-- `monoElabStubArgsPrime`: the stub half waits on D15494 (owner);
+- `monoElabStubArgsPrime`: the stub half, D15494. Ruled 2026-11-07 (internal): the elaboration owns the
+  default stub signature of an uncalled hole-function argument, and mono stops minting it;
 - `monoDefaultTyParamsOnlyGenFns`: switched by #6689 after the census;
-- `monoWalkIdentCall` and `monoHoleBinding`: argument-keyed instances, behind identity typing for
-  concrete function values (A, owner);
+- `monoWalkIdentCall` and `monoHoleBinding`: argument-keyed instances. Identity typing (A) is ruled and
+  built in the elaboration (#6694 shadow, #6699 slice 2a); slice 2b keys the instances (#6707) and slice 3
+  shadows the callee answer these two read;
 - `monoCellCall`: mono's `call_ref` policy and the capture rewrite's per-instance cell signature (#6676);
 - `monoInitHeldTy`: a named hole function stored in a map has no member-instance key;
-- `monoPinTyParamComposite`: the naming rule (owner item 4);
-- `monoPinnedTyParamCanon`: the canonical instance key settling names.
+- `monoPinTyParamComposite`: the naming rule, ruled 2026-11-07 (internal; [notes](refactor-notes/2026-11-07-pin-spelling-shadow.md)),
+  waits on the pin-type column;
+- `monoPinnedTyParamCanon`: the canonical instance key settling names, which the naming rule now settles
+  (the name derives from the canonical type); waits on the pin-type column.
 
 ---
 
