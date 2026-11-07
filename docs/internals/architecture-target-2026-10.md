@@ -2309,6 +2309,17 @@ is now a loud refusal and the helper is deleted. The climb itself stays: declini
 closing programs from runs to an emit refusal (`ref valtype with no interned shape`, `call to
 unknown function`). Over 19,316 programs no byte moves.
 
+**A re-pointed `let` handed to a function parameter takes the elaboration's parameter type**
+(2026-11-07). `monoHandWrittenLet` instances every function the binding holds at the pin. That pin is
+now `elabCallParamTy` at the call, and no longer mono's substitution of the callee's annotation.
+Shadowed over 23,384 programs, 2 programs reach it with 4 decisions
+(`closures/alias-of-written-let-handed-to-generic-fn-param.vl` and
+`closures/written-let-of-hole-fns-to-generic-fn-param.vl`). The elaboration closes all 4, at
+mono's pin. `monoWrittenLetRetsDisagree`'s refusal fired in none: the checker refuses that program
+first (D9003, `holeLetWritesDisagree`). So it is deleted, with `monoBoundTys` and
+`monoArrowParamTysAt`, which only it called. A missing elaborated type is a loud refusal. Over
+19,316 programs no byte moves.
+
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
 and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
