@@ -2007,18 +2007,18 @@ Reach is the number of programs that enter the function.
 | slot deliveries | 6 | 6 | 0 | 0 | 0 | 0 | 0 |
 | node type | 25 | 4 | 5 | 13 | 2 | 0 | 1 |
 | slot type | 24 | 12 | 4 | 2 | 2 | 0 | 4 |
-| lambda sigs | 7 | 1 | 3 | 3 | 0 | 0 | 0 |
+| lambda sigs | 7 | 3 | 3 | 1 | 0 | 0 | 0 |
 | instance binding | 31 | 7 | 11 | 1 | 2 | 0 | 10 |
 | value returns | 5 | 1 | 4 | 0 | 0 | 0 | 0 |
 | instance result | 1 | 1 | 0 | 0 | 0 | 0 | 0 |
 | walk type | 19 | 6 | 11 | 2 | 0 | 0 | 0 |
 | call param | 13 | 3 | 1 | 8 | 0 | 0 | 1 |
 | uncalled slot | 2 | 0 | 2 | 0 | 0 | 0 | 0 |
-| **all** | **165** | **53** | **52** | **31** | **11** | **0** | **18** |
+| **all** | **165** | **55** | **52** | **29** | **11** | **0** | **18** |
 
-Switched, (c) or deleted: **123 of 165**, against 84 in the morning's table (38 switched and 46
+Switched, (c) or deleted: **125 of 165**, against 84 in the morning's table (38 switched and 46
 (c)). What stands between master and the endpoint is
-31 blocked and 11 parked functions, and none unassessed. Per family, with reach:
+29 blocked and 11 parked functions, and none unassessed. Per family, with reach:
 
 - **unbound default**:
   - switched: `monoUncalledSlotFnTy` 293, `monoUncalledListElems` 209, `monoHoleFnPinTyOf` 19, `monoUncalledNestedListElems` 15.
@@ -2048,9 +2048,9 @@ Switched, (c) or deleted: **123 of 165**, against 84 in the morning's table (38 
   - parked: `monoReachLitTys` 9,560 (parked with monoReachSlotTy), `monoReachSlotTy` 6,935 (13 lane F, 2 reach).
   - deleted: `monoNoteBindCall`, `monoListSrcElemTy`, `monoPinJoin`, `monoSigJoin`.
 - **lambda sigs**:
-  - switched: `monoLamSubstParams` 1,188.
+  - switched: `monoLamSubstParams` 1,188, `monoPinMapLambdas` 9,004 (the callback's parameter at the instance, `elabInstNodeTy` under the walk key, else `elabValueInstSig`, else the receiver's element; #6670), `monoNoteBindDeliveryCall` 7,181 (`elabValueInstSig`, the one signature the delivered read's instances share; a read instanced at several (D12234) or at none keeps the destination's spelling, which is prerequisite (A)'s; #6665).
   - (c): `monoPinBodyLambdasRaw` 9,004, `monoDeliverLamLit` 6,170, `monoCloneLambdaSubst` 1,258.
-  - blocked: `monoPinMapLambdas` 9,004 (lane F: needs callback parameter read per instance; today: Fn#d's per-instance callback signature (program list handed over)), `monoNoteBindDeliveryCall` 7,181 (lane F: delivered-signature fact for named hole lambdas; today: Fn#d's delivery note at a name (first slice in progress)), `monoLamParamPinAnn` 801 (split-dep holder fact (c2) + per-instance identity residual (4b-i); its pin now used only where elaboration open (#6662)).
+  - blocked: `monoLamParamPinAnn` 801 (split-dep holder fact (c2) + per-instance identity residual (4b-i); its pin now used only where elaboration open (#6662)).
 - **instance binding**:
   - switched: `monoPreBindPastEmptyLit` 8,697, `monoPinAnnotatedParam` 5,744, `monoParamPinnedNull` 5,585, `monoExactBind` 1,261, `monoInstParamPinTys` 441, `monoPreBindNonArrowArgs` 46, `monoPreBindPastUnionRest` 8,697 (the call's elaboration binding, `elabCallBindTy`: 26 of 26 decisions).
   - (c): `monoCadNoteInstance` 9,004, `monoMakeInstanceLetTyCol` 9,004, `monoBindEnclosingPins` 9,004, `monoMakeInstanceGo` 9,004, `monoSlotParamPins` 8,698, `monoInstantiateCallIn` 8,697, `monoSlotSig` 8,694, `monoBindCols` 3,421, `monoSubstAnnNode` 1,227, `monoSubstTyArgNodes` 47, `monoLayoutConstOf` 4.
@@ -4287,6 +4287,53 @@ So moving these rows needs two things beyond the binding:
 - a callback lambda keyed by its element's set, not its spelling. This is the same problem as
   the pin text the argument-pin arms carry (previous subsection: P10, B1 and B4 wait on the
   naming rule): a spelling used as a key cannot carry what tells two values apart.
+
+#### A function-holding let's slot fact, from its calls (2026-11-07)
+
+`monoLetWritesClosed` asks whether every write to an un-annotated `let` holding functions is
+closed. Over 23,828 programs, 89 decisions in 73 programs. 75 had no slot fact, because the
+closers decline a holder whose members are hole functions with open own types. Read pre-walk
+(`nodeTyFrozenOf`), every row answers as it does post-walk.
+
+| holder's function slots | decisions | outcome on #6673 |
+|---|---|---|
+| one closed call signature each | 5 | 1 takes a fact; 3 hold a member returning another result; 1 is outside the gate |
+| a slot called at two or more signatures | 53 + 17 | parked, below |
+| a nested slot never called | 1 | no fact |
+| fact exists, mono said open | 6 | `monoLetWritesClosed` reads the fact: open to closed, output unchanged |
+
+The three that decline (`q`, D15354 and D15355 `m2`) hold `inc0`, which returns `i32`, in a slot
+called at `(i32) => f64`. Closing them needs an instance that widens the result, not a fact.
+On master `q` runs; D15354 and D15355 refuse at emit after `vl check` passes (clause 2), and are
+parked here as the result-widening gap, beside the 70 below. The
+fifth, `r5`, holds the closed `m`, so the open-slot gate never admits it; its writes are closed
+already.
+
+**The fact.** `elabSlotBundleFacts` rebuilds a holder no closer closes from
+`elabSlotDeliveries`, one leaf at a time, through lists, maps and records. A leaf takes the
+signature its calls deliver when all of the following hold:
+
+- every call agrees on it;
+- the slot carries a tagged set;
+- every member of the set returns the signature's result at its parameters
+  (`elabResultAtParams`).
+
+A bare function value and a nullable holder take no fact. `monoLetWritesClosed` returns true on a
+closed fact and otherwise keeps its write derivation.
+
+**The member check is not optional.** Calls name a signature; writes put functions in the slot.
+`{ xs: [inc0] }` written `half` through a parameter and called once at `(i32) => f64` took that
+signature. `inc0` then sat in an `f64` slot, and the program trapped check-clean, where master
+refuses at emit. Two fixtures pin it (`closures/error-record-fn-list-field-*.vl`). D15190 is the
+same program, and it graded `runs` without the check. A bare generic value is the other
+exclusion. D9850's `const v = __deliver()` took its call signature and lost the instance
+`monoRetGenWidePins` takes at the declared `| null` parameter.
+
+**Parked: the 70 polymorphic slots (53 + 17), prerequisite A.** A slot called at two or more
+signatures holds one function identity instanced at several. The missing fact is "slot holds
+set S, instanced at these signatures". Witnesses are the d15117/d15119 family. They stay on
+`monoLetWritesClosed`'s write derivation until argument-keyed instances (the note below) are
+ruled on, beside D12234 and D15010.
 
 #### Argument-keyed instances: design note (2026-11-07, for a ruling; nothing built)
 
