@@ -17,8 +17,8 @@ import {
   nodeAt,
 } from "./ast"
 import { T, TyArray, TyFunc } from "./check_types"
-import { identDeclOf, nodeSrc } from "./symbols"
-import { fnDeclParent, wrDstDecl } from "./check_decl_scan"
+import { identDeclOf } from "./symbols"
+import { fnDeclParent } from "./check_decl_scan"
 import { nodeTyFrozenOf } from "./check_node_tys"
 import { valueTailSplit } from "./check_num_adopt"
 import { elabFnSetTy, fnTagged } from "./check_fn_tag_facts"
@@ -26,137 +26,19 @@ import { elabFnSetOf } from "./check_elab_cap"
 import { parenPeelIx } from "./check_places"
 import { fnStmts, fnStmtsPosOf } from "./emit_state"
 import {
+  elabFnIdReset,
+  idCanon,
+  idLetSet,
+  idSetOf,
+  idUnion,
+  idWritesOf,
+  idWrittenLets,
+} from "./elab_fn_id"
+import {
   idShadowModeOf,
   idShadowReadNodes,
   idShadowRow,
 } from "./id_shadow_state"
-
-// Each `let` node's written values, built once per compile from `wrDstDecl`.
-let idWrites: {[i32]: i32[]} = Map()
-let idWritesBuilt = false
-let idLetMemo: {[i32]: i32[]} = Map()
-const idLetBusy: {[i32]: boolean} = Map()
-
-// The first source node of the copies `x` descends from; `x` itself when it is no copy.
-function idCanon(x: i32): i32 {
-  let at = x
-  let n = 0
-  while n < 64 {
-    const s = nodeSrc[at] ?? -1
-    if s < 0 || s == at { return at }
-    at = s
-    n = n + 1
-  }
-  at
-}
-
-function idWritesBuild() {
-  if idWritesBuilt { return 0 }
-  idWritesBuilt = true
-  for rhs in wrDstDecl.keys() {
-    const bd = wrDstDecl[rhs] ?? -1
-    if bd < 0 { continue }
-    const have = idWrites[bd] ?? []
-    have.push(rhs)
-    idWrites[bd] = have
-  }
-  0
-}
-
-// The union of ascending sets `a` and `b`.
-function idUnion(a: i32[], b: i32[]): i32[] {
-  const out: i32[] = []
-  let i = 0
-  let j = 0
-  while i < a.length || j < b.length {
-    if j >= b.length || (i < a.length && a[i] < b[j]) {
-      out.push(a[i])
-      i = i + 1
-    } else if i >= a.length || b[j] < a[i] {
-      out.push(b[j])
-      j = j + 1
-    } else {
-      out.push(a[i])
-      i = i + 1
-      j = j + 1
-    }
-  }
-  out
-}
-
-// The functions value node `ix0` may be, ascending: [d] for a read of declaration or lambda
-// `d`, the union of every written value for a read of a `let`, and of every tail for a value
-// `if` or `match`; [] when some part may be any function (a parameter, a field, a call).
-export function idSetOf(ix0: i32, depth: i32): i32[] {
-  const none: i32[] = []
-  if depth > 32 { return none }
-  const ix = parenPeelIx(ix0)
-  if ix < 0 || ix >= P.nodes.length { return none }
-  const n = nodeAt(ix)
-  if n is FuncDecl {
-    const one: i32[] = [idCanon(ix)]
-    return one
-  }
-  if n is Ident {
-    let d = identDeclOf(ix)
-    if d < 0 { d = identDeclOf(idCanon(ix)) }
-    if d < 0 || d >= P.nodes.length { return none }
-    const dn = nodeAt(d)
-    if dn is FuncDecl {
-      const one: i32[] = [idCanon(d)]
-      return one
-    }
-    if dn is LetDecl { return idLetSet(d, depth + 1) }
-    return none
-  }
-  if n is IfStmt || n is MatchExpr { return idTailsSet(ix, depth) }
-  idAnyFunction(ix)
-}
-
-// Every other value node (a call, a field, an index, a parameter's read) may be any function
-// of its type, so it carries no set.
-function idAnyFunction(_ix: i32): i32[] {
-  const none: i32[] = []
-  none
-}
-
-function idTailsSet(ix: i32, depth: i32): i32[] {
-  const none: i32[] = []
-  const spine: i32[] = []
-  const leaves: i32[] = []
-  valueTailSplit(ix, spine, leaves)
-  if leaves.length == 0 { return none }
-  let acc: i32[] = []
-  for l in leaves {
-    const s = idSetOf(l, depth + 1)
-    if s.length == 0 { return none }
-    acc = idUnion(acc, s)
-  }
-  acc
-}
-
-function idLetSet(bd: i32, depth: i32): i32[] {
-  const none: i32[] = []
-  const memo = idLetMemo[bd] ?? none
-  if memo.length > 0 { return memo }
-  if idLetBusy[bd] ?? false { return none }
-  idWritesBuild()
-  const ws = idWrites[bd] ?? none
-  if ws.length == 0 { return none }
-  idLetBusy[bd] = true
-  let acc: i32[] = []
-  for w in ws {
-    const s = idSetOf(w, depth + 1)
-    if s.length == 0 {
-      idLetBusy[bd] = false
-      return none
-    }
-    acc = idUnion(acc, s)
-  }
-  idLetBusy[bd] = false
-  idLetMemo[bd] = acc
-  acc
-}
 
 // The set the checked type of node `ix` carries today, or -1.
 function idTodaySetId(t: i32): i32 {
@@ -207,9 +89,7 @@ function idOtherKind(_d: i32): string { "other" }
 // the checked type carries a set today.
 export function idShadowSnap() {
   if idShadowModeOf() == 0 { return 0 }
-  idWritesBuilt = false
-  idWrites = Map()
-  idLetMemo = Map()
+  elabFnIdReset()
   const kinds = ["lambda", "decl", "nested", "binding", "param", "other"]
   const nAll: i32[] = [0, 0, 0, 0, 0, 0]
   const nSingle: i32[] = [0, 0, 0, 0, 0, 0]
@@ -297,9 +177,8 @@ function idJoinRows() {
       idJoinRow("arms", idSetOf(c, 0), nodeTyFrozenOf(c))
     }
   }
-  idWritesBuild()
-  for bd in idWrites.keys() {
-    const ws = idWrites[bd] ?? []
+  for bd in idWrittenLets() {
+    const ws = idWritesOf(bd)
     if ws.length < 2 || bd >= end || !(nodeAt(bd) is LetDecl) { continue }
     let fnAll = true
     for w in ws {
