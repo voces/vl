@@ -1953,7 +1953,18 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   `objects/record-generic-field-called-and-read-under-is.vl`,
   `objects/const-record-field-of-generic-called-direct-and-read-under-is.vl`, D6702, D15447). The
   pins' helpers (`monoDeclPathPins`, `monoPinFnParamTys`, `monoValueAtAnnTy`) are shared, so moving
-  the decision deletes nothing; the family's deletions come from its single-caller tail.
+  the decision deletes nothing.
+  The tail is not easy either. Reach on master: `monoNoteBindCall` 8,697 programs,
+  `monoPinFieldValue` 115, `monoLetWritesAt` 49, `monoSigJoin` and `monoPinJoin` 24 each,
+  `monoPinStoredRecords` 16, `monoRenameInitAt` 13, `monoHandWrittenLet` and
+  `monoWrittenLetRetsDisagree` 2 each, `monoPinnedElemAnnTy` and `monoPinMapNestedFnLists` 1 each;
+  none is zero-hit. Made to decline, the four smallest each refuse the fixture written for them:
+  `monoPinnedElemAnnTy` (`closures/hole-fn-list-reached-through-alias-called-in-callback.vl`,
+  `call to unknown function`), `monoHandWrittenLet` with `monoWrittenLetRetsDisagree`
+  (`closures/alias-of-written-let-handed-to-generic-fn-param.vl` and
+  `closures/written-let-of-hole-fns-to-generic-fn-param.vl`, `unsupported argument type`), and
+  `monoPinMapNestedFnLists` (`closures/hole-fn-nested-list-map-value.vl`, `unsupported map value
+  type`). Each goes only with an elaboration fact for its shape.
 - [ ] **lambda sigs** (11): `monoPinBodyLambdasRaw` 9,023, `monoPinMapLambdas` 9,016, `monoNoteBindDeliveryCall` 6,903, `monoCloneLambdaSubst` 1,259, `monoPinLamFromCheckedTy` 1,111, `monoLamSubstParams` 931, `monoLamParamPinAnn` 797, ~~`monoLamReachParamTy` 124~~, ~~`monoRecvParamElem` 41~~, `monoDeliverLamLit` 6, ~~`monoLamInstSigs` 2~~.
   The hub is `monoLamParamPinAnn`: an un-annotated lambda parameter's pin is the checked type
   substituted at the instance binding. Shadowed (2026-11-07, 23,384 programs, 748 reaching it)
