@@ -2508,7 +2508,7 @@ wrapped every such mono decision and asked what the elaboration can say there to
 | (i) the returned-literal reader answers (`elabRetFnListLitTy`) | 3 |
 | (i) every member already has the instance; the site is not linked to it | 201 |
 | (i) one member, several instances; the link is by the call the read reaches | 11 |
-| (i) an adopted binding whose initialiser's checked type is closed | 234 |
+| (i) an adopted binding (`monoBindingAdoptInit`): see the family table below | 234 |
 | (ii) needs identity typing | 1 |
 | (iii) other | 6 |
 | not reached by the probe (D6480, `hole-lambda-forwarded-to-unread-hole-param`) | 2 |
@@ -2523,9 +2523,27 @@ So identity typing is not the prerequisite for this population; one fact is.
   through a binding, element or field (`elabValCalls`), the callee's calls of a hole-function
   argument, a list element called. It is never written by searching for an instance whose signature
   matches mono's, which would derive the fact from mono.
-- **The adopted bindings** need a fourth leaf of `elabWrittenValueTy`: the written value's closed
-  checked type. 87 of the 234 are bundle records, where the slot fact or the bundle source reads
-  another form. The bundle lane settles those before the leaf answers them.
+- **The adopted bindings close through four sources, none of them the initialiser's checked type.**
+  That type is closed only after mono's walk re-records it: at elaboration every one of the 234
+  initialisers carries the binding's own open type, `(T) => T` or `((_) => _) | null`. A fourth
+  `elabWrittenValueTy` leaf reading it was built and measured as a no-op (234 of 234 unchanged), and
+  was not landed. 82 of the 234 already close at elaboration. The other 130, by the initialiser's
+  shape:
+
+  | decisions | initialiser | source that closes it | lane |
+  |---|---|---|---|
+  | 30 | `Map()` filled later by `.set` | deliveries into the element path (`elabSlotDeliveries(d, ["v"])`) | split-dep |
+  | 24 | a list literal, mostly a captured cell `[λ]` | deliveries to the element: the calls through the cell | split-dep |
+  | 10 | an `if` choice of hole functions | the binding's own slot calls | split-dep |
+  | 31 | a map read, its value path open | the map-value or held fact | lane F |
+  | 3 | `??` over a map read | the map-value or held fact, joined with the default | lane F |
+  | 12 | a call returning a generic function value | the call-instance signature (`elabValueInstKey`) | Fn#d |
+  | 6 | a record literal of generic or hole function fields | the call-instance signature per field | Fn#d |
+  | 14 | a field or element read of a holder whose slot fact is closed | none missing: the binding is not visited. 11 are emit-minted after `elabSlotFacts`, 3 are record-typed outside its gate | reach (`elabSlotBundleFacts`) |
+
+  The deliveries row keeps two controls declining: `closures/hole-fn-if-to-hole-param.vl`'s `x`,
+  handed on and never called, and the D10384 shape. A named generic held as a map value stays
+  D15494's.
 - **(ii):** `closures/listed-hole-fn-escaping-list.vl`. A generic held in a list by identity is called
   at two types, so the list's one concrete rep is mono's choice. It is D15010's signature twin, parked
   in this section.
