@@ -1996,14 +1996,14 @@ shadow. Per family, by status, each with its reach:
   - (c): `monoInertReach` 9,453, `monoInertParamStubPin` 4,682.
 
 **Exit checklist, re-census of 2026-11-07, evening** (master `3401b65f2`, 967 `emit_mono` functions;
-#6645 is not landed). The 165 functions the morning census left, each graded by the record that
+#6645 graded from its merge, `6cad6cae4`). The 165 functions the morning census left, each graded by the record that
 moved it since (§3.4, #6626 to #6662) and by a fresh function-entry probe over 23,384 programs.
 Reach is the number of programs that enter the function.
 
 | family | listed | switched | (c) | blocked | parked | unassessed | deleted |
 |---|---|---|---|---|---|---|---|
 | unbound default | 9 | 4 | 1 | 2 | 1 | 0 | 1 |
-| slot held fns | 23 | 7 | 10 | 1 | 4 | 0 | 1 |
+| slot held fns | 23 | 8 | 10 | 0 | 4 | 0 | 1 |
 | slot deliveries | 6 | 6 | 0 | 0 | 0 | 0 | 0 |
 | node type | 25 | 4 | 5 | 13 | 2 | 0 | 1 |
 | slot type | 24 | 12 | 4 | 2 | 2 | 0 | 4 |
@@ -2014,11 +2014,11 @@ Reach is the number of programs that enter the function.
 | walk type | 19 | 6 | 11 | 2 | 0 | 0 | 0 |
 | call param | 13 | 3 | 1 | 8 | 0 | 0 | 1 |
 | uncalled slot | 2 | 0 | 2 | 0 | 0 | 0 | 0 |
-| **all** | **165** | **51** | **52** | **32** | **11** | **4** | **15** |
+| **all** | **165** | **52** | **52** | **31** | **11** | **4** | **15** |
 
-Switched, (c) or deleted: **118 of 165**, against 84 in the morning's table (38 switched and 46
+Switched, (c) or deleted: **119 of 165**, against 84 in the morning's table (38 switched and 46
 (c)). What stands between master and the endpoint is
-32 blocked, 11 parked and 4 unassessed functions. Per family, with reach:
+31 blocked, 11 parked and 4 unassessed functions. Per family, with reach:
 
 - **unbound default**:
   - switched: `monoUncalledSlotFnTy` 293, `monoUncalledListElems` 209, `monoHoleFnPinTyOf` 19, `monoUncalledNestedListElems` 15.
@@ -2027,9 +2027,8 @@ Switched, (c) or deleted: **118 of 165**, against 84 in the morning's table (38 
   - parked: `monoDefaultTyParamsOnlyGenFns` 8,697 (per-call rule no elaboration fact states (10 calls, 4 files)).
   - deleted: `monoArgClosedPin`.
 - **slot held fns**:
-  - switched: `monoWrittenGenLetFrame` 9,585, `monoFlowDeclVals` 8,049, `monoArmWrittenLetSeed` 1,613, `monoFlowLetLeaf` 642, `monoFlowKeptIndexElem` 523, `monoFlowValsOf` 83, `monoFlowLetMapLeaf` 75.
+  - switched: `monoWrittenGenLetFrame` 9,585, `monoFlowDeclVals` 8,049, `monoCoerceWrittenLetTys` 5,799 (at the by-call site, on `elabValueInstKey`, #6645 at `6cad6cae4`; the 9 alias and copy rows with no key wait on Fn#d's delivery arm, and the delivery path is mono's by design), `monoArmWrittenLetSeed` 1,613, `monoFlowLetLeaf` 642, `monoFlowKeptIndexElem` 523, `monoFlowValsOf` 83, `monoFlowLetMapLeaf` 75.
   - (c): `monoFlowReadsAll` 9,585, `monoFlowReadsRound` 9,585, `monoFlowReplanPending` 9,585, `monoFlowLetCalls` 8,049, `monoFlowUsePlanAt` 2,938, `monoFlowUsePlan` 2,938, `monoFlowAliasReadVals` 1,186, `monoFlowMapVals` 384, `monoFlowRetLocalLists` 91, `monoFlowElemsGen` 87.
-  - blocked: `monoCoerceWrittenLetTys` 5,799 (Fn#d scoping note: concrete rep of a function-holding value at a site (27 by-call sigs taking a hole fn; D5841, D6480); four tname callers switch together; today: elabValueInstKey (#6645) is its holder; #6645 has not landed).
   - parked: `monoWalkIdentCall` 9,585 ((S1) reverse map source decl -> instance clone; argument-keyed instances wait on identity typing (A), owner-level; call_ref policy is mono), `monoFlowMapReadVals` 291 (lane F map-value facts (beside the six Map() bundle reads)), `monoCellCall` 260 (callee choice is call_ref policy (16/16 agree); coercion half waits on per-instance signature of a written binding), `monoFlowAliasMaps` 230 (lane F map-value facts (beside the six Map() bundle reads)).
   - deleted: `monoLetSeedGenFe`.
 - **slot deliveries**:
@@ -2037,13 +2036,13 @@ Switched, (c) or deleted: **118 of 165**, against 84 in the morning's table (38 
 - **node type**:
   - switched: `monoCgcTplTy` 1,757, `monoHoleFnPinTy` 39, `monoPinnedListAnnTy` 3, `monoPinnedAnnTyAt` 3.
   - (c): `monoPinnedOperandTy` 4,844, `monoPinBin` 4,310, `monoSubstLetType` 3,342, `monoCloneLetDecl` 3,326, `monoDeadNullTest` 869.
-  - blocked: `monoInitHeldTy` 6,723 (Fn#d holder fact: adopt-init mono-only holders), `monoArgClosedTyIn` 5,504 (Fn#d: hole-function arguments outside an instance (63 in holder acceptance list; no record since census)), `monoCoerceListCbArg` 2,877 (both halves must read the elaboration: receiver half on holder fact (166), callback half on what holder fact + binding reader leave of 19; since census #6656 the receiver read takes elabIdentityTy first (147/147 identity receivers); today: elabIdentityTy (#6656) serves the receiver half (147 of 147); the callback half still waits), `monoPinReturnedObj` 2,000 (Fn#d: d3125 lambdas returning records), `monoCbFnListRowSpell` 1,111 (holder fact for nested list of hole functions (as monoBoundFnListElemsTy)), `monoRetFnListTy` 608 (Fn#d: returned lists of hole lambdas), `monoBoundFnListElemsTy` 344 (Fn#d: nested lists of hole lambdas), `monoClosedObjLitTy` 170 (Fn#d: records holding functions), `monoLetWriteRhsTyRec` 20 (records holding hole functions written into a let: the fact monoClosedObjLitTy waits on (Fn#d); its record-literal identity read switched to elabIdentityTy (#6656, 12/12); today: elabIdentityTy (#6656) serves its record-literal read (12 of 12); the hole functions still wait), `monoLetWriteRhsTy` 20 (with monoLetWriteRhsTyRec: records holding hole functions written into a let (Fn#d)), `monoLetWritesRecord` 7 (with monoLetWriteRhsTyRec: records holding hole functions written into a let (Fn#d)), `monoClosedFieldValTy` 4 (records of functions: switched by #6636, re-blocked by #6644 (8/8 was mono read back post-walk); waits on function-holding fact), `monoCloseRetFnTy` 1 (Fn#d: elaboration declines function-holding types).
+  - blocked: `monoInitHeldTy` 6,723 (Fn#d holder fact: adopt-init mono-only holders), `monoArgClosedTyIn` 5,504 (Fn#d: hole-function arguments outside an instance (63 in holder acceptance list; no record since census)), `monoCoerceListCbArg` 2,877 (both halves must read the elaboration: receiver half on holder fact (166), callback half on what holder fact + binding reader leave of 19; since census #6656 the receiver read takes elabIdentityTy first (147/147 identity receivers); today: elabIdentityTy (#6656) serves the receiver half (147 of 147); the callback half still waits), `monoPinReturnedObj` 2,000 (Fn#d: d3125 lambdas returning records), `monoCbFnListRowSpell` 1,111 (holder fact for nested list of hole functions (as monoBoundFnListElemsTy)), `monoRetFnListTy` 608 (Fn#d: returned lists of hole lambdas), `monoBoundFnListElemsTy` 344 (Fn#d: nested lists of hole lambdas), `monoClosedObjLitTy` 170 (Fn#d: records holding functions), `monoLetWriteRhsTyRec` 20 (records holding hole functions written into a let: the fact monoClosedObjLitTy waits on (Fn#d); its record-literal identity read switched to elabIdentityTy (#6656, 12/12); today: elabIdentityTy (#6656) serves its record-literal read (12 of 12); the hole functions still wait), `monoLetWriteRhsTy` 20 (with monoLetWriteRhsTyRec: records holding hole functions written into a let (Fn#d; the same holder as `monoLetWritesClosed`)), `monoLetWritesRecord` 7 (with monoLetWriteRhsTyRec: records holding hole functions written into a let (Fn#d)), `monoClosedFieldValTy` 4 (records of functions: switched by #6636, re-blocked by #6644 (8/8 was mono read back post-walk); waits on function-holding fact), `monoCloseRetFnTy` 1 (Fn#d: elaboration declines function-holding types).
   - parked: `monoModuleDupPin` 3 (owner naming-rule question (record lists it under Blocked); also B18 of the 20 never-answering returns handed to split-dep one-producer redesign), `monoModuleLetPin` (owner naming-rule question (record lists it under Blocked)).
   - deleted: `monoLetAnnTyOf`.
 - **slot type**:
   - switched: `monoBindingAdoptInit` 9,557, `monoHoleGenFnPin` 7,939, `monoPinMapValues` 6,746, `monoPinRecordFields` 732, `monoPinObjFields` 694, `monoPinRecordField` 465, `monoPinNestedListElems` 296, `monoPinFieldContainer` 118, `monoPinFieldValue` 115, `monoPinMapSlot` 59, `monoLetWritesAt` 37, `monoPinStoredRecords` 16.
   - (c): `monoPinFieldContainers` 797, `monoRetypeLamCells` 564, `monoWritesCoercedFirstCall` 441, `monoRenameInitAt` 13.
-  - blocked: `monoLetWritesClosed` 747 (measured, not unblocked: of 72 programs that decide a `let`, the binding's slot fact is absent in 55 where mono says closed, and closes a function-holding record in 6 where mono says open; today: no: the written-value fold leaves these bindings with no slot fact), `monoHandWrittenLet` 2 (split-dep: written-let signature).
+  - blocked: `monoLetWritesClosed` 747 (the slot fact for function-holding lets, one holder with `monoLetWriteRhsTy`'s records of functions; measured, the written-value fold does not close it: of 72 programs that decide a `let`, 16 agree, 55 have no slot fact where mono says closed, and 6 close a record of functions where mono says open), `monoHandWrittenLet` 2 (split-dep: written-let signature).
   - parked: `monoReachLitTys` 9,560 (parked with monoReachSlotTy), `monoReachSlotTy` 6,935 (13 lane F, 2 reach).
   - deleted: `monoNoteBindCall`, `monoListSrcElemTy`, `monoPinJoin`, `monoSigJoin`.
 - **lambda sigs**:
