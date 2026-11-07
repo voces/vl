@@ -2024,10 +2024,11 @@ Switched, (c) or deleted: **127 of 165**, against 84 in the morning's table (38 
   - switched: `monoUncalledSlotFnTy` 293, `monoUncalledListElems` 209, `monoHoleFnPinTyOf` 19, `monoUncalledNestedListElems` 15.
   - (c): `monoChoiceArmFlowTy` 7,920.
   - blocked: `monoElabDefaultsPrime` 18,172 (reach: the unbound default), `monoDefaultUnboundTyParams` 9,004 (reach: the unbound default).
-    Since 2026-11-07 the defaults half of the prime is the elaboration's own (`elabTpDefaultsPrime`, run by `elabRun`, with the rule's predicates moved to `emit_elab`). Mono keeps the stub half, `monoElabStubArgsPrime`: an argument of only uncalled hole functions keyed at the `() => void` stub, which fires in at least 55 of 23,103 programs and is D15494's (owner). `monoDefaultUnboundTyParams` is live: deleting it turned `generics/unbound-type-param-defaults-at-call.vl` into invalid wasm, and on that fixture its 5 bindings equal the call key's.
+    Since 2026-11-07 the defaults half of the prime is the elaboration's own (`elabTpDefaultsPrime`, run by `elabRun`, with the rule's predicates moved to `emit_elab`). Mono keeps the stub half, `monoElabStubArgsPrime`: an argument of only uncalled hole functions keyed at the `() => void` stub, which is parked under D15494 (owner): shadowed pre-walk, 102 stubs in 54 of 23,103 programs, every argument still open at the checker (`(_, _) => _` 40, `(_) => string` 18, `(_) => _` 15, `(_) => void` 11, `(T) => T` 10, a list of stubs 5, `(_) => i32` 3), so no closed fact answers one. `monoDefaultUnboundTyParams` is live: deleting it turned `generics/unbound-type-param-defaults-at-call.vl` into invalid wasm, and on that fixture its 5 bindings equal the call key's.
     `monoDefaultUnboundTyParams` is switched: the type it binds is the elaboration's `elabUnboundTpTy`, the closed binding of the call's instance key (`elabCallBindTy`) else the default, over the elaboration's own defaults table (`elabTpDefaulted`). Shadowed pre-walk over 23,103 programs it bound 35 times in 20 programs: 30 equal to the key's binding, 0 different, and 5 with no key to compare. Those 5 are the residue the reader's default answers: D4126 and the stub-signature fixture `closures/list-of-generic-element-called-at-its-stub-signature.vl` (a call mono mints when it rewrites a literal slot's read to a direct call, after the elaboration ran, so it has no key; the parameter is body-only and the default is what a key would hold; the stub-signature file is D15494's), and `closures/generic-fn-as-list-callback-result.vl` at a binding boundary with no call.
     Two more mono sites still name the unbound default and are open decision sites: `monoArgTyNameRep`'s last rung (an argument typed a bare type variable, or a list of one, that no instance closes, pins at `ELAB_TP_DEFAULT`) and `monoOpenArgDefaultPin` (a pin that is the default because the argument's own type stays open takes the closed type it is read at instead).
-    Probe note: a build reports only its first `emitFail`, so a probe that emits one row per site shows the first row alone; collect the rows into one message and flush it once after `emitProgramRun`. Clear the collection at the start of `elabPrepare`, not of `emitProgram`: the elaboration and mono's prime run there, at the end of check and before emit, so a clear at emit wipes every row they raised.
+    Probe note: a build reports only its first `emitFail`, so a probe that emits one row per site shows the first row alone; collect the rows into one message and flush it once after `emitProgramRun`. Clear the collection at the start of `elabPrepare`, not of `emitProgram`: the elaboration and mono's prime run there, at the end of check and before emit, so a clear at emit wipes every row they raised. Grade a pin's type against the argument's frozen type, not the parameter's: mono's pin-type column holds the type the argument is delivered at (`monoArgPinTyIx`), which differs from a union parameter's by design.
+    Probe note: a note channel that drops a note already seen in the build counts program × outcome rows, not decisions, so a function deciding twenty times in one program reads as one row. The classification it gives (agree, differ, none) holds; the magnitude is a floor. Count decisions with a counter. Lane F's tables of 2026-11-07 (#6658, #6662, #6668, #6674, #6679) were taken that way and are reworded below.
   - parked: `monoDefaultTyParamsOnlyGenFns` 8,697 (per-call rule no elaboration fact states (10 calls, 4 files)).
   - deleted: `monoArgClosedPin`.
 - **slot held fns**:
@@ -2054,9 +2055,9 @@ Switched, (c) or deleted: **127 of 165**, against 84 in the morning's table (38 
   - (c): `monoPinBodyLambdasRaw` 9,004, `monoDeliverLamLit` 6,170, `monoCloneLambdaSubst` 1,258.
   - blocked: `monoLamParamPinAnn` 801 (split-dep holder fact (c2) + per-instance identity residual (4b-i); its pin now used only where elaboration open (#6662)).
 - **instance binding**:
-  - switched: `monoPreBindPastEmptyLit` 8,697, `monoPinAnnotatedParam` 5,744, `monoParamPinnedNull` 5,585, `monoExactBind` 1,261, `monoInstParamPinTys` 441, `monoPreBindNonArrowArgs` 46, `monoPreBindPastUnionRest` 8,697 (the call's elaboration binding, `elabCallBindTy`: 26 of 26 decisions).
+  - switched: `monoPreBindPastEmptyLit` 8,697, `monoPinAnnotatedParam` 5,744, `monoParamPinnedNull` 5,585, `monoExactBind` 1,261, `monoInstParamPinTys` 441, `monoPreBindNonArrowArgs` 46, `monoPreBindPastUnionRest` 8,697 (the call's elaboration binding, `elabCallBindTy`: 26 of 26 program-outcome rows).
   - (c): `monoCadNoteInstance` 9,004, `monoMakeInstanceLetTyCol` 9,004, `monoBindEnclosingPins` 9,004, `monoMakeInstanceGo` 9,004, `monoSlotParamPins` 8,698, `monoInstantiateCallIn` 8,697, `monoSlotSig` 8,694, `monoBindCols` 3,421, `monoSubstAnnNode` 1,227, `monoSubstTyArgNodes` 47, `monoLayoutConstOf` 4.
-  - blocked: `monoPinTyParamComposite` 391 (Fn#d call-param hub).
+  - parked on the naming rule (owner item 4): `monoPinTyParamComposite` 391. Shadowed pre-walk (2026-11-07, 23,103 programs) over the 1,345 calls `monoElabCompositeTy` declines (864 function-typed annotations, 356 bodies testing a type variable, 125 others): the type is `elabCallParamTy`'s in 1,340. What mono still decides is the spelling, 201 calls that keep a declared or alias name (`Circle`, `Rows<Node>`, `AB`) for type tests and layout reads where the type renders structurally. 5 calls in 2 programs have no closed `elabCallParamTy` (`generics/open-generics-into-fn-typed-params-in-generic-body.vl`, `closures/generic-returned-fn-param.vl`), function-annotated parameters in a generic body, a producer question for Fn#d.
   - parked: `monoHoleBinding` 3,421 (function-holding residue stays on the rebuild: argument identity typing (A, owner-level, 689 programs) and bind-type-not-rep (56 sites); keyless lambda/value instances are the argument-keyed design (owner)), `monoPinnedTyParamCanon` 988 (waits on the key settling names (canonical instance key)).
   - deleted: `monoSeedCallSigTys`, `monoNicheNulParamsCheck`, `monoLetTyParamMisfit`, `monoExactPinTyOf`, `monoNicheNulListCheck`, `monoPoisonSharedPins`, `monoLetSeedMisfits`, `monoBindBareUnionArm`, `monoBindNullArm`, `monoBindInnerUnionArms` (their arms bind from `elabCallBindTy` through `elabBindUnionArmsFromCall`).
 - **value returns**:
@@ -2222,6 +2223,16 @@ The slot fact is the wrong reference: a written `let` of generics has no one clo
 - **The hole-function argument is not switched: it replaces nothing.** Its read agrees at 59, differs
   at 0 and is none at 49. But the by-call signature already comes from the binding or callee keys,
   so no mono derivation is left for it to replace.
+- **Parked: `monoCellCall`, the capture-cell call.** It makes 10 type decisions, all at its
+  named-generic seed: D12213 ×2, `closures/captured-cell-shared-writer-hole-lambda-alias` ×4 and
+  `closures/nested-generic-written-into-capture-cell-at-two-instances` ×4. No elaboration fact
+  answers them. The call reads the cell `cell[0]` that the capture rewrite generates, and that read
+  has no source node. Neither the original captured read nor the binding's function set carries a
+  key. The missing fact is a per-instance signature for the cell read, keyed through the captured
+  binding's declaration at the capture frame's key, which the elaboration would have to mint.
+  `monoInstParamPinTys` stays for this site.
+- **Deleted: the cell's hole-lambda seed arm**, with `monoCellSeedLamFe`. It never fired: under a
+  loud floor, no program in the 23,456-program census reached it, and 0 programs moved.
 
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
@@ -3025,8 +3036,8 @@ programs, counted by program).
   it, and falls back to the pin its call supplied only where the elaboration leaves it open.
   `monoPoisonSharedPins` had marked a parameter `-2` when a second call reached the same instance
   with another map. Over 23,384 programs, the two readers of those maps (the niche test and the
-  soft-twin test) decide the same from either source wherever the elaboration answers: 116 sites,
-  0 differ. No decision read the mark. The one shape that reached it, a literal-union map and its
+  soft-twin test) decide the same from either source wherever the elaboration answers: 116
+  program-outcome rows, 0 differ. No decision read the mark. The one shape that reached it, a literal-union map and its
   plain twin through one instance, is still refused, and now by the soft-twin test whose message
   names the fix. Both call orders are fixtures (`error-literal-union-map-twin-through-one-instance*`).
   Over 19,316 programs no byte moves.
@@ -3034,8 +3045,8 @@ programs, counted by program).
   `monoLamSubstParams` already read the lambda's elaborated type (`elabNodeTy` at the walk key)
   for an annotation that rides a type parameter. Its un-annotated arm now reads it too: where
   `monoLamParamPinAnn` pins a parameter, the elaboration's closed type is used, and mono's pin
-  only where that type is open. Shadowed over 23,384 programs, the arm acts in 690. The
-  elaboration agrees in 602 and differs in none, and is open in 89, which stay on mono's pin. In 74 more the elaboration
+  only where that type is open. Shadowed over 23,384 programs, the arm acts in 690 programs. The
+  elaboration agrees in 602 of them and differs in none, and is open in 89, which stay on mono's pin. In 74 more the elaboration
   closes a parameter mono leaves bare (69 `i32`). Those keep mono's answer: taking the closed
   type there too leaves 66 byte-identical and makes 5 invalid wasm, because one lambda literal
   serving instances at two types gets pinned at the walk key's type for both. The 5 are the
@@ -3047,8 +3058,8 @@ programs, counted by program).
   `monoBindBareUnionArm` (with `monoBindNullArm`), `monoPreBindPastUnionRest` and the
   argument pre-bind through `monoBindInnerUnionArms` still decide which type parameter a union
   arm binds. The type each binding takes is now `elabCallBindTy` at the call, where it is closed.
-  Shadowed over the 9,013 programs that enter them, they decide 45 times, and the elaboration
-  answers all 45 and agrees with every one. `monoBindCols`' own call of `monoBindInnerUnionArms`
+  Shadowed over the 9,013 programs that enter them, 45 program-outcome rows decide, and the
+  elaboration answers all 45 and agrees with every one. `monoBindCols`' own call of `monoBindInnerUnionArms`
   never bound anything and is deleted. Then the binders went: `elabBindUnionArmsFromCall` binds
   each type parameter that stands as a union member or nullable inner of a parameter type, at any
   depth and through function results, at `elabCallBindTy`, behind the callers' own gates (a closed
