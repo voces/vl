@@ -355,8 +355,10 @@ import {
   tyHasHole,
   tyHasInferHole,
   tyHasLitLeaf,
+  tyHoldsObj,
   tyIsLitUnion,
   tyIsParamHole,
+  tyMayHoldFn,
   tyMentionsErr,
   tyMentionsTyVarNamed,
   tySame,
@@ -16188,5 +16190,107 @@ export function elabCallHoleParamTy(tpl: i32, i: i32, par: i32): i32 {
     -1
   } else {
     rt
+  }
+}
+
+// Call key `callKey`'s binding, split as mono's rebuild splits it: type parameters of `tps` onto
+// `bN`/`bT`, holes of `decl`'s un-annotated parameters onto `hN`/`hT`. False, binding nothing,
+// unless every parameter is closed with no hole or function and the binding holds no literal or
+// record, a row the key may name apart from the one the argument is built at (D15537).
+export function elabCallKeyBinding(
+  callKey: i32,
+  decl: i32,
+  params: i32[],
+  tps: string[],
+  bN: string[],
+  bT: i32[],
+  hN: string[],
+  hT: i32[],
+): boolean {
+  if callKey < 0 || callKey >= ekNames.length || callKey >= ekTys.length {
+    return false
+  }
+  for p in params {
+    const t = elabNodeTy(p, callKey)
+    if (
+      t < 0
+      || t >= T.tys.length
+      || tyHasTyVar(t)
+      || tyReachesHole(t, 16)
+      || tyMayHoldFn(t, 0)
+    ) {
+      return false
+    }
+  }
+  for t in ekTys[callKey] {
+    if t < 0 || elabTyHasLit(t, 8) || tyHoldsObj(t, 9) { return false }
+  }
+  const ftIx = if decl >= 0 && decl < P.nodes.length { nodeTyIxOf(decl) } else { -1 }
+  const ft = if ftIx >= 0 && ftIx < T.tys.length { tyAt(ftIx) } else { tyAt(0) }
+  let i = 0
+  while i < ekNames[callKey].length && i < ekTys[callKey].length {
+    const nm = ekNames[callKey][i]
+    const t = ekTys[callKey][i]
+    if strListHas(tps, nm) {
+      if !strListHas(bN, nm) {
+        bN.push(nm)
+        bT.push(t)
+      }
+    } else if ft is TyFunc && !strListHas(hN, nm) {
+      let j = 0
+      let holed = false
+      while j < params.length && j < ft.fnParamTypes.length {
+        const pp = nodeAt(params[j])
+        if pp is Param {
+          if (
+            pp.parType < 0
+            && tyMentionsTyVarNamed(ft.fnParamTypes[j], nm, 16)
+          ) {
+            holed = true
+          }
+        }
+        j = j + 1
+      }
+      if holed {
+        hN.push(nm)
+        hT.push(t)
+      }
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether a literal type sits in `t` outside a record or function: a union member, a nullable's
+// inner, a list's element, a map's key or value. Past `depth`, true. Twin of `tyHasLitDeep`
+// (emit_anon_fields.vl), which also reads a record's fields.
+function elabTyHasLit(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  if depth <= 0 { return true }
+  const a = tyAt(t)
+  match a {
+    TyLit => {
+      return true
+    }
+    TyNullable => {
+      return elabTyHasLit(a.nInner, depth - 1)
+    }
+    TyArray => {
+      return elabTyHasLit(a.aElem, depth - 1)
+    }
+    TyMap => {
+      return elabTyHasLit(a.mKey, depth - 1) || elabTyHasLit(a.mVal, depth - 1)
+    }
+    TyUnion => {
+      for m in a.uMembers {
+        if elabTyHasLit(m, depth - 1) { return true }
+      }
+      return false
+    }
+    // A record answers through `tyHoldsObj`, which refuses it whole; a function's own literals
+    // are its signature's, not a row the binding holds.
+    TyObj | TyFunc | TyPrim | TyErr | TyVar | TyNeg => {
+      return false
+    }
   }
 }

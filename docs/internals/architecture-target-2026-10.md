@@ -2777,6 +2777,27 @@ programs, counted by program).
   the elaboration minted the concrete instance, and no fact maps the call to it. In 13 a closed
   parameter differs by name, not value: an alias, literal union or narrower structure against
   its base (`NK` against `i32`, `{r: null}[]` against `Circle[]`), which is rowintern's row key.
+- **Switched: the instance binding comes from the call key where the key settles it.**
+  `monoCallKeyBinding` takes the instance's binding from `ekNames`/`ekTys` at the call's own key.
+  It splits the binding as the rebuild did: type parameters onto the let binding, the holes of
+  un-annotated parameters onto the hole binding. The gate is decided before any rebuild: every
+  parameter at the call key is closed, holds no hole and no function, and the binding holds no
+  literal and no record. Otherwise `monoBindCols` and `monoHoleBinding` rebuild it, and that is
+  the residue. Counted by program over 23,384, an instance takes:
+
+  | branch | programs |
+  |---|---|
+  | the call key | 4,047 |
+  | rebuild, no call key (lambda and value instances) | 3,001 |
+  | rebuild, a literal or record in the binding (rowintern's row key, #6629) | 2,418 |
+  | rebuild, a function-holding parameter (Fn#d's value-instance key, #6645) | 1,258 |
+  | rebuild, a parameter open at the key | 3 |
+
+  The literal-or-record cut was forced. The candidate without it moved 4 programs out of `runs`:
+  2 into invalid wasm and 2 into an emit refusal. They are the named set
+  `ckb-callkey-binding-price`, and D15537 is the trap's witness. The key binds the argument's
+  type where the rebuild pins the row the argument is built at. With the cut, over 19,316
+  programs no byte moves.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
