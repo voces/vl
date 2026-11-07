@@ -4513,6 +4513,7 @@ fn compile_vl_instance(
             set.call(&mut store, 1)?;
         }
     }
+    arm_cls_census(inst, &mut store);
     // Identity shadow ($VL_ID_SHADOW=1 records and reports, =2 also keys callback
     // specialization by it): armed before the compile, read back after it. A seed
     // without `setIdShadow` ignores it.
@@ -4538,6 +4539,7 @@ fn compile_vl_instance(
     report_guest_fuel(store);
     report_guest_alloc(resident0);
     report_late_demands(inst, store, source_path);
+    report_cls_census(inst, store, source_path);
     if id_shadow > 0 {
         report_id_shadow(inst, store, source_path);
     }
@@ -4584,6 +4586,47 @@ fn report_id_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
             .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
             .collect();
         rows.push_str(&format!("[id-shadow] {path}: {row}\n"));
+    }
+    eprint!("{rows}");
+}
+
+/// Whether `$VL_CLS_CENSUS=1` asked for each compile's classifier phase census.
+fn cls_census_on() -> bool {
+    std::env::var("VL_CLS_CENSUS").ok().as_deref() == Some("1")
+}
+
+/// Under `$VL_CLS_CENSUS=1`, arm the guest's classifier census. A seed without
+/// `setClsCensus` ignores it.
+fn arm_cls_census(inst: &Instance, store: &mut Store<()>) {
+    if !cls_census_on() {
+        return;
+    }
+    if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut *store, "setClsCensus") {
+        let _ = set.call(&mut *store, 1);
+    }
+}
+
+/// Under `$VL_CLS_CENSUS=1`, print one `[cls] <path>: <fn>\t<site>\t<phase>\t<n>` line to
+/// stderr per row the census counted. A seed without `clsCensusCount` prints nothing.
+fn report_cls_census(inst: &Instance, store: &mut Store<()>, path: &str) {
+    if !cls_census_on() {
+        return;
+    }
+    let (Ok(count), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "clsCensusCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "clsCensusLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "clsCensusAt"),
+    ) else {
+        return;
+    };
+    let n = count.call(&mut *store, ()).unwrap_or(0);
+    let mut rows = String::new();
+    for i in 0..n {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let row: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        rows.push_str(&format!("[cls] {path}: {row}\n"));
     }
     eprint!("{rows}");
 }
@@ -9635,6 +9678,7 @@ fn pump_session(
 
     stage_vl_root_and_cwd(&mut store, &inst)?;
     let keep_dir = keep_modules_dir(&mut store, &inst)?;
+    arm_cls_census(&inst, &mut store);
     // `vl test`'s compile pool. A seed without the export compiles every test file in
     // this one instance, as before the pool existed.
     if compile_pool_allowed() {
@@ -9980,6 +10024,10 @@ fn pump_session(
                 if late_demands_on() {
                     let p = cmd_path.read(&mut store)?;
                     report_late_demands(&inst, &mut store, &p);
+                }
+                if cls_census_on() {
+                    let p = cmd_path.read(&mut store)?;
+                    report_cls_census(&inst, &mut store, &p);
                 }
                 let mut bytes = BytesOut::probe(&mut store, &inst, "rbyte")?.read(&mut store)?;
                 // THE SEAM. Between the emitter's bytes and the engine's verdict,
