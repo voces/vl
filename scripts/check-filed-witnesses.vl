@@ -38,7 +38,6 @@ import {
   fanOutArgv,
   findFrom,
   firstLine,
-  isDigit,
   jsonStr,
   rstripWs,
   splitLines,
@@ -49,22 +48,19 @@ import {
 import {
   IdKey,
   OUTCOMES_SORTED,
+  Row,
   contains,
   declaredOutcome,
-  headOf,
-  isAnyHead,
   isRowHead,
   isWordByte,
-  leadWord,
   matchSec,
   negatedBefore,
   padTo,
+  parseRows,
   resolve,
   rstripByte,
-  skipWs,
   sortKeys,
-  statusJoinContinues,
-  stripByte,
+  splitFiles,
 } from "./lib/inventory"
 import { numField, strField } from "./lib/corpus"
 import {
@@ -80,21 +76,7 @@ const VL = "./scripts/vl-host/target/release/vl"
 const COMPILER = "build/vl-compiler.wasm"
 const SELF = "scripts/check-filed-witnesses.vl"
 const SIDECAR = "build/vl-compiler.wasm.src"
-const REPEAT_MAX: i64 = 50000000
 const CHUNK = 64
-
-// A section of an inventory doc: one `### <ID> — <title>` row and what it filed.
-type Row = {
-  id: string,
-  title: string,
-  hasStatus: boolean,
-  status: string,
-  repro: string,
-  wantLabels: i32,
-  want: string,
-  doc: string,
-  line: i32,
-}
 
 // What the compiler did with one witness: the outcome, a 200-code-point detail, and the
 // run's whole stdout when it ran.
@@ -110,66 +92,6 @@ type Graded = {
 }
 
 // ── text helpers ─────────────────────────────────────────────────────────────────────
-
-// The `<name>.vl` of a `// file: <name>.vl` marker line, or "".
-function fileMark(ln: string): string {
-  if !startsWith(ln, "// file: ") { return "" }
-  let i = 9
-  while i < ln.length && wsLen(ln, i) == 0 { i = i + 1 }
-  const name = ln.slice(9, i)
-  if skipWs(ln, i) != ln.length { return "" }
-  if name.length < 4 || !endsWith(name, ".vl") { return "" }
-  name
-}
-
-// `src` with every `@@repeat(N, "text")@@` replaced by N copies of `text`.
-function expandRepeats(src: string): string {
-  const open = "@@repeat("
-  let out = ""
-  let from = 0
-  let at = findFrom(src, open, 0)
-  while at >= 0 {
-    let i = at + open.length
-    const d0 = i
-    while i < src.length && isDigit(src[i]) { i = i + 1 }
-    let ok = i > d0 && startsWith(src.slice(i, src.length), ", \"")
-    let t0 = 0
-    let t1 = 0
-    if ok {
-      t0 = i + 3
-      t1 = findFrom(src, "\"", t0)
-      ok = t1 >= 0 && startsWith(src.slice(t1, src.length), "\")@@")
-    }
-    if !ok {
-      at = findFrom(src, open, at + 1)
-      continue
-    }
-    let n: i64 = 0
-    let k = d0
-    while k < i {
-      n = n * 10 + ((src[k] - 48) as i64)
-      k = k + 1
-    }
-    if n > REPEAT_MAX {
-      die(
-        "check-filed-witnesses: @@repeat count \{toString(n)} is over the \{toString(REPEAT_MAX)} cap",
-        1,
-      )
-    }
-    const text = src.slice(t0, t1)
-    out = out + src.slice(from, at)
-    let c: i64 = 0
-    const parts: string[] = []
-    while c < n {
-      parts.push(text)
-      c = c + 1
-    }
-    out = out + join(parts, "")
-    from = t1 + 4
-    at = findFrom(src, open, from)
-  }
-  out + src.slice(from, src.length)
-}
 
 // ── JSON: a string escaped to ASCII, `\uXXXX` beyond it ──────────────────────────────
 
@@ -293,32 +215,6 @@ function makeTempDir(): string {
 }
 
 // ── witnesses: write each to its own directory, then classify what `vl` does ───────
-
-// The `// file:` sections of a witness as alternating name and source; one unnamed
-// section is `w.vl`. The last name is the entry the three channels run.
-function splitFiles(src0: string): string[] {
-  const src = expandRepeats(src0)
-  const out: string[] = []
-  let name = ""
-  let body: string[] = []
-  for ln in splitLines(src) {
-    const m = fileMark(ln)
-    if m != "" {
-      if name != "" {
-        out.push(name)
-        out.push(rstripWs(join(body, "\n")) + "\n")
-      }
-      name = m
-      body = []
-    } else {
-      body.push(ln)
-    }
-  }
-  if name == "" { return ["w.vl", src] }
-  out.push(name)
-  out.push(rstripWs(join(body, "\n")) + "\n")
-  out
-}
 
 // A witness written out: its entry's path, and its source when it is one file that names
 // no relative path (so a copy under another name compiles the same program), else "".
@@ -922,132 +818,10 @@ function runAll(srcs: string[], jobs: i32, useCache: boolean): Ran[] {
 
 // ── reading a doc ───────────────────────────────────────────────────────────────
 
-function blankRow(doc: string): Row {
-  {
-    id: "",
-    title: "",
-    hasStatus: false,
-    status: "",
-    repro: "",
-    wantLabels: 0,
-    want: "",
-    doc: doc,
-    line: 0,
-  }
-}
-
-// The indented program the `Repro` lead-in at `lines[i]` introduces, or "".
-function blockAt(lines: string[], i: i32): string {
-  const body: string[] = []
-  let j = i + 1
-  let scanned = 0
-  while j < lines.length && scanned < 6 && !startsWith(lines[j], "    ") {
-    if stripWs(lines[j]) != "" && headOf(lines[j], 2, 4) { break }
-    j = j + 1
-    scanned = scanned + 1
-  }
-  while (
-    j < lines.length
-    && (startsWith(lines[j], "    ") || stripWs(lines[j]) == "")
-  ) {
-    if startsWith(lines[j], "    ") {
-      body.push(lines[j].slice(4, lines[j].length))
-    } else {
-      body.push("")
-    }
-    j = j + 1
-  }
-  const src = rstripWs(join(body, "\n"))
-  if stripWs(src) == "" { return "" }
-  src + "\n"
-}
-
-// The indented block directly under the `Want` lead-in at `lines[i]`, or "".
-function wantBlock(lines: string[], i: i32): string {
-  let j = i + 1
-  while j < lines.length && stripWs(lines[j]) == "" { j = j + 1 }
-  if j >= lines.length || !startsWith(lines[j], "    ") { return "" }
-  const body: string[] = []
-  while (
-    j < lines.length
-    && (startsWith(lines[j], "    ") || stripWs(lines[j]) == "")
-  ) {
-    if startsWith(lines[j], "    ") {
-      body.push(lines[j].slice(4, lines[j].length))
-    } else {
-      body.push("")
-    }
-    j = j + 1
-  }
-  rstripWs(join(body, "\n")) + "\n"
-}
-
 function docLines(doc: string): string[] { splitLines(univNl(readText(doc))) }
 
 // Every row section of `doc`, in order.
-function parseDoc(doc: string): Row[] {
-  const lines = docLines(doc)
-  const rows: Row[] = []
-  let cur = blankRow(doc)
-  let open = false
-  let i = 0
-  while i < lines.length {
-    const ln = lines[i]
-    const m = matchSec(ln)
-    if m.id != "" {
-      if open { rows.push(cur) }
-      cur = blankRow(doc)
-      cur.id = m.id
-      cur.title = m.title
-      cur.line = i + 1
-      open = true
-      i = i + 1
-      continue
-    }
-    if isAnyHead(ln) {
-      if open { rows.push(cur) }
-      open = false
-      i = i + 1
-      continue
-    }
-    if !open {
-      i = i + 1
-      continue
-    }
-    if !cur.hasStatus && startsWith(ln, "**") {
-      const r = rstripWs(ln)
-      if endsWith(r, "**") && r.length > 2 {
-        cur.status = stripWs(stripByte(ln, 42))
-        cur.hasStatus = true
-      } else {
-        const parts = [ln]
-        let k = i + 1
-        while k < lines.length {
-          if !statusJoinContinues(lines[k]) { break }
-          parts.push(lines[k])
-          if endsWith(rstripWs(lines[k]), "**") {
-            cur.status = stripWs(stripByte(join(parts, " "), 42))
-            cur.hasStatus = true
-            break
-          }
-          k = k + 1
-        }
-      }
-    }
-    if leadWord(ln, "Want") {
-      cur.wantLabels = cur.wantLabels + 1
-      if cur.wantLabels == 1 { cur.want = wantBlock(lines, i) }
-      i = i + 1
-      continue
-    }
-    if cur.repro == "" && leadWord(ln, "Repro") {
-      cur.repro = blockAt(lines, i)
-    }
-    i = i + 1
-  }
-  if open { rows.push(cur) }
-  rows
-}
+function parseDoc(doc: string): Row[] { parseRows(doc, docLines(doc)) }
 
 // Row-shaped headings `matchSec` did not parse, as alternating line number and heading.
 function unparsedRowHeads(doc: string): string[] {

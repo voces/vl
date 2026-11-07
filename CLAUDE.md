@@ -92,6 +92,8 @@ merely starved (WALL >> CPU) can be told apart. A merge gate that takes longer t
 stops being run, so treat ~90 s as the budget it has to keep — if a gate is added that pushes
 the wall past a couple of minutes, the gate is what needs rethinking, not the budget.
 
+**The proof sweep is `scripts/sweep.vl`; CI runs it on the `sweep` label** (`scripts/sweep.md`).
+
 The parts, and what each is for:
 
 1. `deno task test`
