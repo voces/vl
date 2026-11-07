@@ -2004,6 +2004,11 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   happens in 6 programs, the same literals-at-two-types the hub's regression cells name, and its
   refusal is reached by none. It is class (c) mechanics over mono's own instance registry, and
   goes with that registry, not with a fact.
+  **Grading a shadow.** A row agrees only when the two types are `tySame`. The spelling goes in
+  a column of its own. Two types can print alike and still differ (a record built at one row and
+  bound at another, as in D14426), and the same type can be spelled two ways (union row order, a
+  structural twin's name). Grading by spelling once hid D14426's runs→not-runs inside an
+  "agrees" count. Check a switch with a byte sweep on fixpoint seeds before believing either column.
   **The six non-hub helpers, shadowed (2026-11-07, Fn#d, 19,337 programs).** Each decision was read
   against the lambda's parameters in `elabNodeTy(lam, elabWalkTop())`, and the bind site also
   against the delivered name's slot fact and `elabLamDeliveredParams`.
@@ -2040,6 +2045,22 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
 
     Each is a function-valued holder whose closed signature comes from its own calls, which the held
     slot's fallthrough does not reach.
+  - **The let and list-callback node types** (2026-11-07, master `18d3d488`, the full population).
+    - `monoSubstLetType` (and `monoCloneLetDecl`, which only wraps it) stays. Its substituted type
+      against `elabWalkTy`: 1,022 of 1,058 agree, 31 are open on both sides, and 5 are not the same
+      type though they print alike. One of the 5 is D14426's witness
+      (`hole-instance-typed-at-binding-stored-at-build`). There the binding takes the checker's
+      instance binding and the elaboration gives the build. Switching the type to the elaboration
+      turns that program from running into a loud emit reject. One agreement also gains `readonly`,
+      which moves bytes but not output. The SPELLING cannot switch either. In 104 of the agreements
+      (74 files) the elaboration's nominal spelling differs from the substituted name: union row
+      order, `Dot$mN` for `Circle$mN`, `{x: i32}` for `P`, `#anon1` for a record. That name is the
+      union registry's key (D2676).
+    - `monoCoerceListCbArg` stays. The elaboration never contradicts it, but is absent for 515 of
+      1,691 receivers (`elabNodeTyAt(memObj)`) and for 92 of 122 callback signatures, and open
+      (`(T) => T` where mono closes the instance) for 18 more. That is the second acceptance list:
+      a receiver fact for list methods called on a list of hole lambdas, and a delivered-signature
+      fact for a lambda or function value handed to a list method as its callback.
 - [ ] **instance binding** (34): `monoHoleBinding` 9,023, `monoMakeInstanceGo` 9,023, `monoBindCols` 9,020, `monoMakeInstanceLetTyCol` 9,020, `monoCadNoteInstance` 9,017, `monoNicheNulParamsCheck` 9,013, `monoBindBareUnionArm` 8,993, `monoBindNullArm` 8,980, `monoSlotParamPins` 8,714, `monoPreBindPastUnionRest` 8,710, `monoInstantiateCallIn` 8,710, `monoLetTyParamMisfit` 8,701, `monoExactPinTyOf` 8,679, `monoPinAnnotatedParam` 5,749, `monoNicheNulListCheck` 5,704, `monoParamPinnedNull` 5,486, `monoPreBindPastEmptyLit` 5,305, `monoPoisonSharedPins` 2,705, `monoBindInnerUnionArms` 1,804, `monoExactBind` 1,275, `monoLetSeedMisfits` 1,250, `monoSubstAnnNode` 1,223, `monoPinnedTyParamCanon` 1,001, `monoInstParamPinTys` 472, `monoPinTyParamComposite` 427, `monoLitElemPin` 238, `monoBindEnclosingPins` 138, `monoBindBareArenaPins` 104, `monoSubstTyArgNodes` 47, `monoPreBindNonArrowArgs` 46, `monoBindFromLaterArg` 3, `monoLayoutConstOf` 0, `monoSeedCallSigTys` 0, `monoSlotSig` 0.
   The hub is the binding `monoInstantiateCallIn` hands `monoMakeInstance` (`tvN` / `tvV` / `tvT`),
   against `ekTys` at the key the elaboration made for the call (`elabWalkKeyOf`, which already
@@ -2301,10 +2322,11 @@ delivered one, so a write of another result is refused where it is made, with th
 Without them D15353 and a list read before a helper writes a function of another result
 (`closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`) build check-clean and
 trap at the call (`indirect call type mismatch`), and D15190's refusal moves from the write to a
-mechanism message at the call. The fixture adds one late demand: +1 = D15136's uncalled-body `put`
-(`hand`'s body at the unbound default), pre-existing on master, newly counted by
-`closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`; foreseen by the
-uncalled-body minting slice, when the baseline drops back. `monoCallWrittenLet` instances its writes at the delivery's pin, and
+mechanism message at the call. The fixture adds one late demand, pre-existing on master and newly
+counted by `closures/error-fn-list-element-returns-other-than-a-write-through-param.vl`. It is D15136's
+`put` at the argument's own type, demanded by the root call `put(xs)`. `hand` is never built: its
+second call of `put` makes `fnWriteOnlyInto` decline, so the elaboration delivers `xs` at `half`'s type.
+It exists only on that refusing build, and it goes with D15136's own fix. `monoCallWrittenLet` instances its writes at the delivery's pin, and
 `monoCallIfBound` no longer falls back to the seed. Mono's result derivation then decides nothing
 in the population, so `monoListSlotPinnedFnTy`, `monoPathSlotPinnedFnTy` and `monoHeldSrcsFnTy` are
 deleted. `monoSeedCallSigTys` stays for `monoCallIfValue`, an inline
@@ -2391,6 +2413,35 @@ removed in a fixpoint candidate and compared by exit code, bytes and failure tex
   instance, and is parked with it; it is not lane work.
 - **`monoPinReturnedObj`'s 272 elaboration-only sites** are d3125 lambdas returning `{ q: 0 }`,
   already closed, where mono has nothing to retype.
+
+**Node type, the pin tuple's readers** (2026-11-07, 23,103 programs, master `58198479`
+fixpoint). `monoPinnedOperandTy` is a lookup by name into the instance's pin tuple (`pinnedTyIx`)
+inside `monoMakeInstanceGo`'s body rewrite, and `monoPinBin` folds over its answer. Neither decides
+a type, so both are class (c). Shadowed against `elabNodeTy` at the instance's own key, with a copy
+read at its source (every site was the template's own node):
+
+| cell | sites | programs |
+|---|---|---|
+| agree | 5,878 | 2,346 |
+| agree on signature only | 78 | 43 |
+| mono only | 108 | 35 |
+| differ | 0 | 0 |
+
+The 186 that do not agree, by pin and elaboration type:
+- **The same type with holes (about 63).** For example, `((_) => _)[]` on both sides, which the
+  shadow's closed filter dropped.
+- **Pin `i32[]`, elaboration `((_) => _)[]` (35).** These are the hole-function list tests: the rep
+  spelling of a function list against its identity type.
+- **Pin nullable, elaboration narrowed (about 33).** For example, `string[] | null` against
+  `string[]`. The elaboration answers the read's flow-narrowed type and the pin the argument's rep
+  per arm. That is lane F's measurement that the pin is the argument's arm (a `Set<i32>` pin for a
+  `Set<i32> | null` parameter), and #6585 already makes `monoPinHoleParam` ask the elaboration
+  first. So comparing the tuple with the substituted parameter type disagrees by design, and it is
+  not to be re-shadowed.
+- **The elaboration has no answer (26).** The d492 and d511 number-union type-parameter cells, and
+  generic value slots (D12212, D15032 to D15035).
+- **The elaboration is wider or open (about 20).** These are D3178 (`never` against `null`), an
+  overload's `V` against a record, and `(T) => T` against `(i32) => i32`.
 
 **Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
 elaboration has no type of its own for the node, and every caller composes its own narrowing with
