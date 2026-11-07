@@ -60,7 +60,9 @@ both from blocked), so master reads 65 switched, 51 (c), 14 blocked, 12 parked a
   reads the pin type). Slice 2b names an un-annotated parameter's pin by `monoPinSpellOf` when it
   holds no record, map or non-literal union; the rest waits on a pin-type column (an annotated
   parameter's pin is its annotation, not the argument's type `pinTys` holds) and on the emit readers
-  that resolve a record or union pin by name (2026-11-07-pin-spelling-hole-params.md).
+  that resolve a record or union pin by name (2026-11-07-pin-spelling-hole-params.md). The makers
+  now carry that column, `pinOwn`, to `monoKeyPinSeg`; nothing reads it for a decision yet, and its
+  row class differs from the name's in 90 programs (2026-11-07-pin-type-column.md).
 
 **Parked at the census (12; 12 on master), each on a named question:**
 - `monoElabStubArgsPrime`: the stub half waits on D15494 (owner);
