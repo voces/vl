@@ -80,7 +80,6 @@ import { fieldNameOrder } from "./check_obj_shape"
 import { inferJoinCount, inferJoinTyAt } from "./check_inline_lit_union"
 import {
   inferRetBearsNull,
-  inferRetBearsNullByNode,
   inferRetRowByNode,
   inferRetRowOf,
 } from "./check_infer_ret"
@@ -716,7 +715,6 @@ import {
 import {
   binEqStructRow,
   binOperandsAreScalar,
-  blockTailIsValue,
   callIsMemberPopKind,
   callIsPushKind,
   catListKindOfBin,
@@ -727,7 +725,6 @@ import {
   eqgListKindOfExpr,
   listOpKindOfBin,
   listOpSlotOfBin,
-  tailIfNullableIsReal,
   xrepEmitPair,
 } from "./emit_fn_scans"
 import { initJoinsWiderRecord } from "./emit_join_records"
@@ -788,7 +785,6 @@ import {
   retVariantFlag,
   structRowOfTy,
   synthTypeRefTy,
-  tailSelfFnSet,
   tyAnnRefListSlot,
 } from "./emit_nullable_rets"
 import {
@@ -2623,7 +2619,7 @@ function buildFnMapResumable(): boolean {
 }
 
 // Write the cached seed back over the prefix rows. This is what makes the resume exact rather
-// than merely cheap: `computeVoidFns` and `computeRetInference` refine these five columns in
+// than merely cheap: `recordedVoidFns` and `computeRetInference` refine these five columns in
 // place after every call, so a resume that kept them would hand the next round a refined value
 // where a full re-mint hands it the annotation's own. `fRetLitAtom` seeds 0 for every row.
 function buildFnMapReseedPrefix() {
@@ -2707,7 +2703,7 @@ function buildFnMapBankPrefix() {
 // the row: the annotation's facts first, then the checker's inferred return when unannotated.
 function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
   // A declared `: void` return seeds the void classification directly: the fixpoint below
-  // (`computeVoidFns`) covers only the un-annotated half, and an unseeded annotation leaves
+  // (`recordedVoidFns`) covers only the un-annotated half, and an unseeded annotation leaves
   // every `: void` function emitting `(result i32)`.
   const rv = retVoidAnnFlag(s.fnRet)
   // The polymorphic slot takes the namespace its `fRetKind` selects, which is the gate
@@ -2913,17 +2909,6 @@ export function buildFnMap(_stmts: i32[]) {
   fnStmts.length
 }
 
-// The body block's last statement is a value-yielding member call — D1240's veto input.
-function blockTailMemberValue(blockIx: i32): boolean {
-  const b = nodeAt(blockIx)
-  if b is Block {
-    const n = b.blkStmts.length
-    if n == 0 { return false }
-    return memberCallYieldsValue(b.blkStmts[n - 1])
-  }
-  false
-}
-
 // Whether no caller reads the result of the function at position `i`, or of the generic
 // declaration it is an instance of: the checker took that declaration as `: void` (D2631).
 function fnPosResultUnconsumed(i: i32): boolean {
@@ -2932,16 +2917,6 @@ function fnPosResultUnconsumed(i: i32): boolean {
   if i < fnInstOrigin.length && fnInstOrigin[i] >= 0 { o = fnInstOrigin[i] }
   if o < monoOrigNode.length { return fnResultUnconsumed(monoOrigNode[o]) }
   false
-}
-
-// Whether function `i`'s recorded result is a value its lowering must return: neither `void`
-// nor `never`, with no bare `return` and a result some caller consumes.
-function cvfRecordedValue(i: i32, fn: FuncDecl): boolean {
-  const r = fnRecordedRetTy(i)
-  if r < 0 || r == TY_VOID || r == TY_NEVER { return false }
-  // A nullable map has no value an `else`-less tail delivers yet (D2498).
-  if tyBearsNull(r) && tyAt(nonNullTy(r)) is TyMap { return false }
-  !blockHasBareReturn(fn.fnBody) && !fnPosResultUnconsumed(i)
 }
 
 // Pin each un-annotated function's result to its recorded type where that is a value keyed with
@@ -3004,67 +2979,28 @@ function srrNamesShape(r: i32): boolean {
   false
 }
 
-// Classify each function's voidness as a monotone fixed point: a candidate with no return
-// annotation is void when its body has no valued `return` and no tail value. `stmtIsTailValue`
-// consults `fRetVoid` for tail calls, so marking a callee void can make its callers' tails
-// non-values — iterate until stable. The void set only grows, bounded by the function count.
-export function computeVoidFns() {
-  let changed = true
-  while changed {
-    changed = false
-    let i = 0
-    while i < fnStmts.length {
-      if fRetVoid[i] == 0 {
-        const fn = nodeAt(fnStmts[i])
-        if fn is FuncDecl {
-          if fn.fnRet < 0 && !cvfRecordedValue(i, fn) {
-            // A bare `return` pins this function void whatever its tail yields; the checker
-            // reads the same predicate, so the functype and the caller's type agree (D1600).
-            // So does a recorded `void` result, which a build-time fold cannot undo (D14790).
-            if (
-              blockHasBareReturn(fn.fnBody)
-              || fnPosResultUnconsumed(i)
-              || fnRecordedRetTy(i) == TY_VOID
-            ) {
-              fRetVoid[i] = 1
-              changed = true
-            } else if !blockHasValuedReturn(fn.fnBody) {
-              // An else-less tail `if` makes the return `T | null`, but `blockTailIsValue`
-              // deliberately ignores else-less ifs, since they feed this fixpoint. So also
-              // consult the checker: a nullable inferred return is non-void. One rule replacing
-              // three vetoes — an empty arm is the author saying there is no value here.
-              const d34Void = !tailIfNullableIsReal(fn.fnBody, fnStmts[i])
-              // An anonymous lambda's inferred row is keyed by its node, not its lifted name.
-              let bearsNull = inferRetBearsNull(
-                inferRetFnKey(fnStmts[i], fn.fnName),
-              )
-              if !bearsNull { bearsNull = inferRetBearsNullByNode(fnStmts[i]) }
-              tailSelfFnSet(fnStmts[i])
-              const tailValue = blockTailIsValue(fn.fnBody, fnStmts[i])
-              tailSelfFnSet(-1)
-              if (
-                !tailValue
-                && !blockTailMemberValue(fn.fnBody)
-                && (d34Void || !bearsNull)
-                && !fnReturnsClosure(i)
-              ) {
-                // D1240 — a tail member call the checker typed non-void keeps this function
-                // non-void. `stmtIsTailValue` declines every member call, since it feeds this
-                // fixpoint and a tail `.push` has no value lowering, so an un-annotated
-                // `function f(xs) { xs.slice(0, 2) }` classified void while the checker did not.
-
-                // A function whose tail is a function value (`(a) => (b) => …`) returns a
-                // closure, not void: `blockTailIsValue` ignores a bare lambda tail, so guard it
-                // here, else `f`'s functype is `()->()` and `f(4)` reads as a void result.
-                fRetVoid[i] = 1
-                changed = true
-              }
-            }
+// Mark each un-annotated function void that lowers with no result: its recorded result is
+// `void`, it has a bare `return` (D1600), or no caller consumes its result. A recorded value, or
+// an open result no instance closes, lowers with one.
+export function recordedVoidFns() {
+  let i = 0
+  while i < fnStmts.length {
+    if fRetVoid[i] == 0 {
+      const fn = nodeAt(fnStmts[i])
+      if fn is FuncDecl {
+        if fn.fnRet < 0 {
+          const r = fnRecordedRetTy(i)
+          if (
+            r == TY_VOID
+            || blockHasBareReturn(fn.fnBody)
+            || fnPosResultUnconsumed(i)
+          ) {
+            fRetVoid[i] = 1
           }
         }
       }
-      i = i + 1
     }
+    i = i + 1
   }
   0
 }
@@ -3348,7 +3284,7 @@ export function computeRetInference() {
                   const fbs = fb.blkStmts
                   if fbs.length > 0 {
                     const tailIx = fbs[fbs.length - 1]
-                    // A value-yielding member call (`xs.map(…)`) is the tail `computeVoidFns` kept
+                    // A value-yielding member call (`xs.map(…)`) is the tail `recordedVoidFns` kept
                     // non-void, so it types the result as `return xs.map(…)` would (D2566).
                     if (
                       stmtIsTailValue(tailIx, fnStmts[i])

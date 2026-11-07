@@ -1065,7 +1065,7 @@ axis(
 
 // S4 of incremental-compilation-design.md: 100 instances beside 200 inferred-return functions.
 // Fuel reads 1.23 (0.614G / 0.498G); master `7fe51e77c` read 3.59 (1.791G), from
-// `monoRegisterInstance` re-running `computeVoidFns` and `computeRetInference` after every instance.
+// `monoRegisterInstance` re-running `recordedVoidFns` and `computeRetInference` after every instance.
 axis(
   "generic instances beside inferred returns",
   2.5,
