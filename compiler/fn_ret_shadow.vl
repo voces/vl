@@ -14,6 +14,7 @@ import {
   Member,
   ObjLit,
   P,
+  i32ToStr,
   nodeAt,
 } from "./ast"
 import { nodeRepTyIxOf } from "./check_core_state"
@@ -68,6 +69,7 @@ import {
   fRetKind,
   fRetLitAtom,
   fRetRArrElem,
+  fRetRListRow,
   fRetStructIdx,
   fRetVoid,
   fnParent,
@@ -630,19 +632,57 @@ export function fnRetShadowRowN(i: i32) { frsRowN[i] }
 // just run.
 export function fnColShadowRun(at: string) {
   if !frsColArmed { return 0 }
+  if at == "post seed" { frsColSnap() }
   let fe = 0
   while fe < fnStmts.length && fe < fRetVoid.length && fe < fRetKind.length {
     const fn = nodeAt(fnStmts[fe])
     if fn is FuncDecl {
       if fRetVoid[fe] == 0 && fn.fnRet < 0 {
-        let key = at + ": " + frsColClass(fe)
+        const cls = frsColClass(fe)
+        let key = at + ": " + cls
         if frsNamed { key = key + " | " + fn.fnName }
         frsCount(key)
+        // Whether the run just ended moved the columns `buildFnMap#2` seeded, by class.
+        if at == "post settled" && fe < frsSnapKind.length {
+          const mv = if frsColMoved(fe) { "moved" } else { "unmoved" }
+          let mk = "post moved: " + mv + ": " + cls
+          if frsNamed { mk = mk + " | " + fn.fnName }
+          frsCount(mk)
+        }
       }
     }
     fe = fe + 1
   }
   0
+}
+
+let frsSnapKind: VKind[] = []
+let frsSnapSlot: i32[] = []
+let frsSnapElem: string[] = []
+let frsSnapBool: i32[] = []
+
+// Snapshot the return columns, for `frsColMoved`.
+function frsColSnap() {
+  frsSnapKind = []
+  frsSnapSlot = []
+  frsSnapElem = []
+  frsSnapBool = []
+  let fe = 0
+  while fe < fRetKind.length {
+    frsSnapKind.push(fRetKind[fe])
+    frsSnapSlot.push(fRetStructIdx[fe])
+    frsSnapElem.push(if fe < fRetRArrElem.length { fRetRArrElem[fe] } else { "" })
+    frsSnapBool.push(if fe < fRetBool.length { fRetBool[fe] } else { 0 })
+    fe = fe + 1
+  }
+  0
+}
+
+// Whether function `fe`'s kind, slot, element name or boolean flag differs from the snapshot.
+function frsColMoved(fe: i32): boolean {
+  if frsSnapKind[fe] != fRetKind[fe] || frsSnapSlot[fe] != fRetStructIdx[fe] { return true }
+  if fe < fRetRArrElem.length && frsSnapElem[fe] != fRetRArrElem[fe] { return true }
+  fe < fRetBool.length && frsSnapBool[fe] != fRetBool[fe]
 }
 
 // The first return column of valued function `fe` that its recorded result's columns
@@ -653,7 +693,13 @@ function frsColClass(fe: i32): string {
   if frcKind != fRetKind[fe] {
     return "kind " + frcKind + " vs " + fRetKind[fe]
   }
+  if frcKind == "reflist" && fe < fRetRListRow.length && frcRow != fRetRListRow[fe] {
+    return "row reflist: " + i32ToStr(frcRow) + " vs " + i32ToStr(fRetRListRow[fe])
+  }
   if frcSlot != fRetStructIdx[fe] {
+    if frcKind == "map" || frcKind == "nulmap" {
+      return "slot " + frcKind + ": " + i32ToStr(frcRow) + " vs " + i32ToStr(fRetStructIdx[fe])
+    }
     if !repSigTokHasSlot(frcKind) { return "slot " + frcKind + ": no-slot kind, slots differ" }
     if frcSlot < 0 {
       return "slot " + frcKind + ": recorded names no row, column does"
@@ -681,9 +727,15 @@ function frsColClass(fe: i32): string {
 // boolean flag and literal-atom flag.
 export let frcKind: VKind = "i32"
 export let frcSlot = -1
+export let frcRow = -1
 export let frcElem = ""
 export let frcBool = 0
 export let frcAtom = 0
+
+// Whether return kind `k` keeps its table row in `fRetStructIdx`.
+function frsKindHasRow(k: VKind): boolean {
+  k == "struct" || k == "nulstruct" || k == "variant" || k == "nulvariant"
+}
 
 // Read un-annotated valued function `fe`'s five return columns off its recorded result, into
 // `frcKind`..`frcAtom`: the rep's kind (a closure keyed `i32`, as an annotation keys it), the
@@ -700,10 +752,13 @@ export function fnRecordedRetCols(fe: i32): string {
   if d.rdCovered == 0 { return "rep uncovered" }
   if repSigRetTokOfTy(r) == "" { return "recorded result has no token" }
   frcKind = if d.rdKind == "closure" { "i32" } else { d.rdKind }
-  frcSlot = if repSigTokHasSlot(frcKind) { repSlotOfKind(frcKind, r) } else { -1 }
+  // `fRetStructIdx` carries a row only for a record or variant; a ref list's row is
+  // `fRetRListRow`, and a map's shape is read off its type.
+  frcRow = if repSigTokHasSlot(frcKind) { repSlotOfKind(frcKind, r) } else { -1 }
+  frcSlot = if frsKindHasRow(frcKind) { frcRow } else { -1 }
   frcElem = ""
-  if frcKind == "reflist" && frcSlot >= 0 && frcSlot < rlElemName.length {
-    frcElem = rlElemName[frcSlot]
+  if frcKind == "reflist" && frcRow >= 0 && frcRow < rlElemName.length {
+    frcElem = rlElemName[frcRow]
   }
   frcBool = if r == TY_BOOL { 1 } else { 0 }
   frcAtom = d.rdAtom
