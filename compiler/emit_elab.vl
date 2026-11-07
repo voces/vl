@@ -12414,6 +12414,32 @@ function elabTyIn(ix: i32, k: i32): i32 {
   -1
 }
 
+// The type node `x` holds at instance `k`, at `x` or the node it copies: the elaboration's record
+// there, else the checked type as the elaboration left it (`nodeTyFrozenOf`) substituted at `k`.
+// -1 where neither closes; it never reads a type an emit pass re-recorded.
+export function elabInstNodeTy(x: i32, k: i32) {
+  if x < 0 || k < 0 { return -1 }
+  const src = nodeSrc[x] ?? -1
+  let t = elabNodeTyRecAt(x, k)
+  if t < 0 && src >= 0 { t = elabNodeTyRecAt(src, k) }
+  if t >= 0 && elabTyClosed(t, 0) && !tyHasTyVar(t) { return t }
+  let raw = nodeTyFrozenOf(x)
+  if raw < 0 && src >= 0 { raw = nodeTyFrozenOf(src) }
+  if t >= 0 && tyHasTyVar(t) { raw = t }
+  if raw < 0 { -1 } else { elabSubstClosed(raw, k) }
+}
+
+// The type the elaboration recorded for node `x` at instance `k`; -1 for none.
+function elabNodeTyRecAt(x: i32, k: i32) {
+  const ps = elabNodeTys[x] ?? []
+  let i = 0
+  while i + 1 < ps.length {
+    if ps[i] == k { return ps[i + 1] }
+    i = i + 2
+  }
+  -1
+}
+
 // Node `ix`'s checker type; a minted copy the emitter never typed has its source's.
 export function elabCheckedTyOf(ix: i32): i32 {
   const own = nodeTyIxOf(ix)
@@ -16597,6 +16623,83 @@ export function elabCallBindTy(call: i32, tp: string): i32 {
   const ck = elabCallInstFrom(call, top)
   const t = if ck >= 0 { bindOf(ekNames[ck], ekTys[ck], tp) } else if top < 0 { callBindTyOf(call, tp) } else { -1 }
   if t >= 0 && elabTyClosed(t, 0) { t } else { -1 }
+}
+
+// Binds each type parameter that stands as a union member or nullable inner of parameter type
+// `decl`, at any depth and through function results, and that `bN`/`bT` leave unbound, at the
+// call's elaboration binding (`elabCallBindTy`) where that is closed. 0.
+export function elabBindUnionArmsFromCall(
+  call: i32,
+  decl: i32,
+  bN: string[],
+  bT: i32[],
+): i32 {
+  elabUnionArmBinds(call, decl, bN, bT, 0)
+}
+
+function elabUnionArmBinds(
+  call: i32,
+  decl: i32,
+  bN: string[],
+  bT: i32[],
+  depth: i32,
+): i32 {
+  if decl < 0 || decl >= T.tys.length || depth > 16 || !tyHasTyVar(decl) {
+    return 0
+  }
+  const d = tyAt(decl)
+  match d {
+    TyUnion => {
+      for m in d.uMembers {
+        if m >= 0 && m < T.tys.length {
+          const mt = tyAt(m)
+          if mt is TyVar {
+            elabBindOneFromCall(call, mt.tvName, bN, bT)
+          } else {
+            elabUnionArmBinds(call, m, bN, bT, depth + 1)
+          }
+        }
+      }
+    }
+    TyNullable => {
+      const it = if d.nInner >= 0 && d.nInner < T.tys.length { tyAt(d.nInner) } else { null }
+      if it is TyVar {
+        elabBindOneFromCall(call, it.tvName, bN, bT)
+      } else {
+        elabUnionArmBinds(call, d.nInner, bN, bT, depth + 1)
+      }
+    }
+    TyArray => {
+      elabUnionArmBinds(call, d.aElem, bN, bT, depth + 1)
+    }
+    TyObj => {
+      for f in d.objFieldTypes { elabUnionArmBinds(call, f, bN, bT, depth + 1) }
+    }
+    TyMap => {
+      elabUnionArmBinds(call, d.mVal, bN, bT, depth + 1)
+    }
+    TyFunc => {
+      elabUnionArmBinds(call, d.fnRet, bN, bT, depth + 1)
+    }
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {}
+  }
+  0
+}
+
+function elabBindOneFromCall(
+  call: i32,
+  tp: string,
+  bN: string[],
+  bT: i32[],
+): i32 {
+  if bindOf(bN, bT, tp) >= 0 { return 0 }
+  const et = elabCallBindTy(call, tp)
+  if et < 0 || et >= T.tys.length || tyHasTyVar(et) || tyReachesHole(et, 16) {
+    return 0
+  }
+  bN.push(tp)
+  bT.push(et)
+  0
 }
 
 // The type instance `k` builds literal `ix` (or the node it copies) at: the stamp its
