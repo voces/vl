@@ -2575,6 +2575,31 @@ callee off an open parameter. The 90 "open: nothing", by family:
 Most of the callbacks and arguments are nodes mono minted, so the pre-walk column has no entry
 for them by construction; their fact is read through the node they copy (`nodeSrc`).
 
+**Signature sites and identity sites** (re-graded the same day). Two corrections to the table:
+- **Instance bindings are not graded in it.** Their column compared the elaboration's own
+  instance parameter type with itself, so the 94 unlinked and the note's answers there say nothing
+  about mono. Mono binds a function-holding type parameter at the argument's identity, one instance
+  per function, and lane F grades that against the argument's identity type.
+- **The table holds only signature sites.** The probe recorded a decision only where mono's held
+  type is closed. The 189 where mono holds an open function type are identity sites, and are graded
+  against `elabIdentityTy`, the elaboration's node type, else the checker's type as the elaboration
+  left it (#6656):
+
+  | consumer | decisions | agrees | source |
+  |---|---|---|---|
+  | receiver of a `.map` / `.filter` callback | 147 | 147 | elaboration 34, checker 113 |
+  | record literal written to a `let` | 12 | 12 | checker |
+  | seeded type parameter | 15 | 15 | checker |
+  | instance binding | 3 | 3 | checker (lane F's) |
+  | list callback | 8 | 0 | a signature site, below |
+  | record of hole-function lists | 4 | 0 | the same spelling over different holes; no defect |
+
+  The receiver and the record literal read `elabIdentityTy`. The seeded type parameter binds from
+  mono's pin of the argument it seeds, so it waits on that argument's `elabIdentityTy` replacing the
+  pin. The 8 list callbacks hold the callback's signature at a hole-function element
+  (`((_) => _) => i32`), not the callback's identity, so they belong to `elabCbArgSig` and
+  `elabValueInstKey` with the signature sites.
+
 So identity typing is not the prerequisite for this population; one fact is.
 - **The fact:** `elabValueInstKey(x, k)`, the member instance or instances the elaboration made for
   function-holding value `x` read under instance `k`. Its closed signature is the concrete rep.
