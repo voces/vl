@@ -117,6 +117,7 @@ import {
   cwCalleeArgOff,
   cwCalleeDeclOf,
   cwDeclAssigned,
+  cwFieldNameOf,
   cwFnCalls,
   cwFnValueDeclOf,
   cwFrameOfDecl,
@@ -14718,6 +14719,74 @@ export function elabSlotUncalledOmitting(
 let elabValueSlotAt: {[i32]: i32} = Map()
 let elabValueSlotPath: {[i32]: string[]} = Map()
 let elabValueSlotOmit: i32[] = []
+
+// The closed type the slot a value `x` is written into is built at in frame `fnIx`: a list or
+// record literal element of a `let` initializer, `d = x`, `xs[i] = x`, `o.f = x`, `xs.push(x)` or
+// `m.set(k, x)`; -1 where `x` is not written into a named binding, or the binding has no fact.
+export function elabWrittenSlotTy(x: i32, fnIx: i32): i32 {
+  const inner: string[] = []
+  const steps: string[] = []
+  let u = parenPeelIx(x)
+  let holder = -1
+  let guard = 0
+  while holder < 0 && u >= 0 && cwIxCovers(u) && guard < 16 {
+    const k = cwIxUpKind[u]
+    const p = cwIxUp[u]
+    const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+    if k == CW_UP_ELEM && pn is ArrayLit {
+      inner.push("[]")
+      u = p
+    } else if k == CW_UP_FIELD && pn is ObjLit {
+      const nm = cwFieldNameOf(cwIxUpAux[u])
+      if nm == "" { return -1 }
+      inner.push(nm)
+      u = p
+    } else if k == CW_UP_LETINIT && pn is LetDecl {
+      holder = p
+    } else if k == CW_UP_ASG_RHS && pn is BinExpr && pn.binOp == "=" {
+      const r = cwSlotPath(pn.binLeft, steps)
+      holder = if r < 0 { -2 } else { identDeclOf(r) }
+    } else if k == CW_UP_ARG && pn is Call {
+      const f = nodeAt(parenPeelIx(pn.callFn))
+      if !(f is Member) { return -1 }
+      const want = if f.memProp == "push" { 0 } else if f.memProp == "set" { 1 } else { -1 }
+      if want < 0 || cwIxUpAux[u] != want { return -1 }
+      const r = cwSlotPath(f.memObj, steps)
+      steps.push("[]")
+      holder = if r < 0 { -2 } else { identDeclOf(r) }
+    } else {
+      return -1
+    }
+    guard = guard + 1
+  }
+  if holder < 0 { return -1 }
+  let i = inner.length - 1
+  while i >= 0 {
+    steps.push(inner[i])
+    i = i - 1
+  }
+  let t = elabSlotTyAt(holder, [], fnIx)
+  for st in steps {
+    if t < 0 || t >= T.tys.length { return -1 }
+    const o = tyAt(t)
+    if st == "[]" && o is TyArray {
+      t = o.aElem
+    } else if st == "[]" && o is TyMap {
+      t = o.mVal
+    } else if st != "[]" && o is TyObj {
+      let next = -1
+      let j = 0
+      while j < o.objFieldNames.length && j < o.objFieldTypes.length {
+        if o.objFieldNames[j] == st { next = o.objFieldTypes[j] }
+        j = j + 1
+      }
+      t = next
+    } else {
+      return -1
+    }
+  }
+  t
+}
 
 // Notes value `x` as held by slot `path` of binding `d`.
 export function elabValueSlotNote(x: i32, d: i32, path: string[]) {
