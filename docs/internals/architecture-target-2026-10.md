@@ -2514,6 +2514,11 @@ by program).
   0 differ. Its 1 mono-only program is D15190, a refused program, and it has 57 elab-only, all with
   mono declining. `monoLetWritesAt` is reached past its `const` arm by 1 program, which agrees.
   These are graded together next.
+- **A binding's call signatures were only ever asked whether one exists.** After the join went,
+  `monoBindCallSigs` had one reader, `monoWritesCoercedFirstCall`, and it asks only whether any
+  call has gone through the binding yet. The table is now a set of called bindings
+  (`monoBindCalled`). `monoSigListAdd` is deleted, and `monoNoteBindCall`, a two-line forwarder,
+  is inlined into its three callers. Over 19,316 programs no byte moves.
 
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
