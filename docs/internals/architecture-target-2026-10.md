@@ -50,11 +50,10 @@ map-value facts then deleted `monoFlowMapReadVals`, moved `monoFlowAliasMaps` to
 - node type: `monoArgClosedTyIn` (the delivery signature of an argument forwarded through a generic to a
   hole function; D5930's `hole-leaf-literal-through-forwarder` rules out `elabInstNodeTy`),
   `monoCoerceListCbArg` (a callback signature over a list element with no elaboration instance),
-  `monoClosedFieldValTy` (deleted by #6684); `monoPinReturnedObj`, `monoCloseRetFnTy` and
-  `monoRetFnListTy` now read `elabHeldValTy` (#6695's producer) and `monoClosedObjLitTy` is deleted
-  (`refactor-notes/2026-11-07-heldval-consumers.md`); `monoRetFnListTy` keeps mono's derivation where
-  the reader declines or only restates the identity (D4515's per-read instance), and in a generic
-  instance holding nested literals;
+  `monoPinReturnedObj`, `monoRetFnListTy` and `monoClosedObjLitTy` (Fn#d: lambdas returning records,
+  returned lists of hole lambdas, records holding functions; #6684 parked `monoPinReturnedObj` on a
+  returned record of hole-function lists), `monoClosedFieldValTy` (deleted by #6684),
+  `monoCloseRetFnTy` (no fact for a stored call returning a list of functions);
 - lambda sigs: `monoLamParamPinAnn` (split-dep's holder fact (c2) and the per-instance identity residual);
 - call param: `monoBindSeededTyParams` (identity typing for function values, A), `monoArgPinTyIx` (a
   pin fact of its own after holes-close), `monoArgPinName` (the rep cascade), and `monoArgTyName`,
