@@ -2207,13 +2207,17 @@ The slot fact is the wrong reference: a written `let` of generics has no one clo
 - **Switched in #6645, the by-call site** (the call through the binding that takes the chosen
   instance's signature). `tname` is `elabKeySig` of the member keys `elabValueInstKey` gives the
   binding's read. By `sigKeyOfTy` against mono's signature, 42 decisions agree, 0 differ and 9 have
-  no key; those 9 keep the instance's own signature as the named fallback. The 28 that differ in
-  spelling are a hole parameter written as its pin (`=>i>i` against `(i32)=>i32`) or bracketed.
+  no key. The 28 that differ in spelling are a hole parameter written as its pin (`=>i>i` against
+  `(i32)=>i32`) or bracketed.
+- **The fallback is deleted.** The 9 with no key read the written `let` in an alias's initializer
+  (`const k = lap`, then `k(...)`), and the call's own callee read carries the key; all 9 agree. The
+  call reads the binding's keys, else the callee's. A call where neither has one closed signature is
+  never a written-let coercion: `monoCoerceWrittenLetTys` refuses all 940 such calls.
 - **The delivery path stays mono's.** `elabValueInstKey` reads none at 99 of its 115 decisions: a
   delivered read is not a callee read, so no member key is noted on it.
-- **Next, the hole-function argument.** 59 agree, 0 differ and 49 read none. Most of the 49 are
-  non-generic annotated functions, which have no instance, so their signature is the argument's own
-  type (`elabIdentityTy`).
+- **The hole-function argument is not switched: it replaces nothing.** Its read agrees at 59, differs
+  at 0 and is none at 49. But the by-call signature already comes from the binding or callee keys,
+  so no mono derivation is left for it to replace.
 
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
