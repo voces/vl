@@ -3119,6 +3119,25 @@ slot. The canonical-instance-key work is the expected provider. Moving it today 
 two functions (`monoRespellLamFe` and `monoCapturedLamFe` become predicates), so it waits for that
 map.
 
+**`monoCellCall`'s callee choice is parked on the same terms** (2026-11-07). The function a
+capture-cell call instances can be the cell's lambda, a generic seed or a hole-lambda seed. Over
+23,456 programs, `elabCalleeFnsOf` agrees on all 16 calls where mono picks one. In 366 calls only
+the elaboration has a callee, and those stay `call_ref` under ruling (a). So the choice is mono's
+`call_ref` policy and deletes nothing. Its other half, coercing the cell's writes at the instance's
+signature, waits on the per-instance signature of a written binding, as the written lets do.
+
+**The written-let decisions wait on the binding reader** (2026-11-07). Over 23,456 programs:
+- `monoWrittenGenLetFrame`'s gate (every value names a declared generic) agrees with the binding's
+  `Fn#d` set on 109 of 112 decisions. The 3 are an if-arm lambda the set does not join (D4307).
+- The type `monoCoerceWrittenLetTys` coerces at agrees with `elabSlotTyAt` on 18 of 166
+  decisions. In 53 the slot fact is a wrong one: the initialiser fallback in `elabSlotInstFacts`
+  stores a polymorphic identity, such as `other<V>`'s `(V) => void`, as the per-instance fact.
+  split-dep is fixing that store so these become declines. In 95 it answers nothing.
+
+`monoWrittenGenLetFrame`, `monoCoerceWrittenLetTys`, `monoArmWrittenLetSeed` and `monoLetSeedGenFe`
+wait on both. `monoFlowKeptIndexElem`'s gate agreed on all 78 decisions and reads the indexed
+read's identity set (`elabFnSetOf`).
+
 **Mono-owned: callback specialization's direct calls** (2026-11-07). `monoWalkIdentCall`'s
 instance choice was compared with the elaboration over 23,456 programs: 122,691 decisions agree.
 2,079 are elab-only and stay `call_ref` under ruling (a). 1,052 are mono-only: 698 concrete and 354
