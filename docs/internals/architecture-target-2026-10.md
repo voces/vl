@@ -2260,6 +2260,24 @@ instance) need a nested member read from its instances under the key; that admit
 late demands for the lambdas, so it waits until the run foresees them. No byte moves over 19,318
 programs.
 
+**Slot type, field and map value read the fact alone** (2026-11-07, after #6589). The record-field
+pin types the field at `elabSlotTyAt` and leaves a field the elaboration has no fact for as
+checked. Its own derivation from the instance it took (`monoNodeTyAt`, `monoHoleLamAtAnnTy`,
+`monoValueAtAnnTy`) goes, and `monoHoleLamAtAnnTy` with it. `monoPinMapValues` annotates a map
+only at its slot fact. `monoPinMapSlot` still instances the stored values and types the map's
+reads, and refuses a disagreement. Shadowed over 23,384 programs, counted by program:
+
+| pin | agree | differ | mono only | elab only | neither |
+|---|---|---|---|---|---|
+| record field | 15 | 0 | 41 | 1 | 21 |
+| map value | 32 | 0 | 15 | 4 | 13 |
+
+The mono-only cells are fields and maps the checker already closed, and the D15494 maps whose
+generic is called at two signatures. Dropping mono's answer there moves no byte. The one elab-only
+field program, `generics/nested-capture-per-pin-binding.vl`, now takes the fact at its two fields
+with the same bytes. The four elab-only maps are ones where `monoPinMapSlot` declines first, so nothing
+changes. Over 19,316 programs no byte moves, and 4,605 filed witnesses grade as filed.
+
 **Binding type, adopt-init switched** (2026-11-07). `monoBindingAdoptInit` gives an open
 binding the elaboration's closed type (`elabNodeTy` at the key of the function whose body holds it)
 and refuses a disagreement. Each binding's key comes from a walk of every body in `monomorphize`:
@@ -2451,6 +2469,34 @@ The 186 that do not agree, by pin and elaboration type:
   generic value slots (D12212, D15032 to D15035).
 - **The elaboration is wider or open (about 20).** These are D3178 (`never` against `null`), an
   overload's `V` against a record, and `(T) => T` against `(i32) => i32`.
+
+**Node type, the reach trio** (2026-11-07, 19,338 programs, master `3e9ce417`). 831 decisions,
+each against the walk type (`elabNodeTy` at the walk top), `elabNodeTyAt` and `elabSlotTyAt`. No
+pair differs where both answer.
+
+| helper | decisions (programs) | agree | mono only | elab only | neither |
+|---|---|---|---|---|---|
+| `monoPinnedReadTy`, `monoPinBin`'s `??` fold | 424 (324) | 47 | 0 | 370 | 7 |
+| `monoPinnedAnnTyAt`, a `.map`/`.filter` receiver | 25 (8) | 23 | 2 | 0 | 0 |
+| `monoPinnedAnnTyAt`, a stored call (`monoCloseRetFnTy`) | 2 (1) | 0 | 2 | 0 | 0 |
+| `monoClosedObjLitTy`, a returned literal | 362 (144) | 0 | 2 | 272 | 88 |
+| `monoClosedObjLitTy`, a `let` write | 18 (6) | 0 | 6 | 0 | 12 |
+
+- **`monoPinnedReadTy` is switched and deleted.** `monoPinBin`'s fold asks a gate,
+  `monoPinnedReadGate`: an element-and-field read chain ending at a pinned parameter, each element
+  read over a list (D9915). The type comes from the walk type. **Mono's decline is a soundness gate,
+  not a missing fact.** Taking the elaboration's answer where the gate declines folds `??` in 18
+  more decisions. Six of those programs build other bytes with the same output, and
+  `generics/type-param-write-cell-reads-at-pin.vl` traps the compiler (`tyAt` from `binNumWidth`):
+  the folded read leaves a node with no type.
+- **`monoPinnedAnnTyAt`.** A `.map`/`.filter` receiver takes the walk type first. Mono's walk answers
+  only where the walk type is open: `closures/fn-list-mapped-to-functions.vl` and
+  `closures/hole-fn-list-returned-reread.vl`, whose stored-call pair is the other caller.
+- **`monoClosedObjLitTy` is not switched.** Its 8 answers are records holding functions, which the
+  elaboration declines (node type, blocked above). They are `named/d15203_run_uncalled_record` and
+  `named/d15207_rec_ret`, parked with D15494, and six writes in
+  `closures/hole-fn-map-record-let-rewritten.vl` (D15534's fixture). Filling the 272 elab-only
+  literals moves no byte.
 
 **Contract: outside every instance, `elabNodeTyAt` answers -1 for a non-call.** That -1 means the
 elaboration has no type of its own for the node, and every caller composes its own narrowing with
