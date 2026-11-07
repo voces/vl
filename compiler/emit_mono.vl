@@ -79,6 +79,7 @@ import {
   nodeTyArrayElemIsBoolPrim,
   nodeTyArrayElemIsNullable,
   nodeTyCarry,
+  nodeTyFrozenOf,
   nodeTyIsFunc,
   nodeTyIsNulFunc,
   nodeTyIsNullType,
@@ -15166,7 +15167,24 @@ function monoLetWritesClosed(d: LetDecl, at: i32, ctx: i32): boolean {
   const sf = elabSlotTyAt(at, [], ctx)
   if sf >= 0 && sf < T.tys.length && !monoTyOpen(sf) { return true }
   for w in monoLetWholeWrites(at) {
-    const t = monoLetWriteRhsTy(w, ctx)
+    // The type each write stores is the elaboration's: a record literal's identity type, or the
+    // pre-walk type of the binding a read names.
+    const wb = nodeAt(w)
+    let t = -1
+    if wb is BinExpr && wb.binOp == "=" {
+      const rx = unwrapParen(wb.binRight)
+      const fr = monoStoreFrame(w, ctx)
+      if rx >= 0 && rx < P.nodes.length && nodeAt(rx) is ObjLit {
+        t = elabIdentityTy(rx, fr)
+        if t < 0 { t = nodeTyFrozenOf(rx) }
+      } else if rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Ident {
+        const bd = monoReadLetFrame(rx, fr)[1]
+        const b = if bd >= 0 { nodeAt(bd) } else { null }
+        if b is LetDecl {
+          t = nodeTyFrozenOf(if b.letType >= 0 { b.letType } else { b.letInit })
+        }
+      }
+    }
     if (
       monoLetWriteFreshMap(w) < 0
       && !monoLetWriteHasListLit(w)
@@ -15229,11 +15247,53 @@ function monoLetWriteFreshMap(w: i32): i32 {
   rx
 }
 
-// Records on each record literal a write of the `let` declared at `at` stores the type
-// `monoLetWritesAt` compared, once the binding is pinned.
+// Records on each record literal a write of the `let` declared at `at` stores the binding's slot
+// fact, which `monoLetWritesAt` compared, once the binding is pinned.
 function monoLetWritesRecord(d: LetDecl, at: i32, ctx: i32) {
   if d.letKw == "const" { return 0 }
-  for w in monoLetWholeWrites(at) { monoLetWriteRhsTyRec(w, ctx, true) }
+  const t = elabSlotTyAt(at, [], ctx)
+  for w in monoLetWholeWrites(at) {
+    const wb = nodeAt(w)
+    if wb is BinExpr && wb.binOp == "=" {
+      monoRecordObjLitAt(unwrapParen(wb.binRight), t, ctx)
+    }
+  }
+  0
+}
+
+// Records closed type `t` on record literal `lx` in frame `ctx`, and on each open field its field
+// type: a nested literal in turn, a read of a binding as read at it, an inline list by its pin.
+function monoRecordObjLitAt(lx: i32, t: i32, ctx: i32) {
+  if lx < 0 || lx >= P.nodes.length || t < 0 || t >= T.tys.length { return 0 }
+  const lit = nodeAt(lx)
+  const ot = nodeTyIxOf(lx)
+  if !(lit is ObjLit) || ot < 0 || ot >= T.tys.length || !monoTyOpen(ot) {
+    return 0
+  }
+  const o = tyAt(ot)
+  const ct = tyAt(t)
+  if !(o is TyObj) || !(ct is TyObj) { return 0 }
+  for fi in lit.objFields {
+    const f = nodeAt(fi)
+    const k = if f is FieldInit { strListIndexOf(o.objFieldNames, f.fiName) } else { -1 }
+    const ck = if f is FieldInit { strListIndexOf(ct.objFieldNames, f.fiName) } else { -1 }
+    if f is FieldInit && k >= 0 && ck >= 0 && monoTyOpen(o.objFieldTypes[k]) {
+      const vx = unwrapParen(f.fiValue)
+      const ft = ct.objFieldTypes[ck]
+      if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is ObjLit {
+        monoRecordObjLitAt(vx, ft, ctx)
+      } else if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is ArrayLit {
+        if monoTyOpen(nodeTyIxOf(vx)) {
+          monoPinFieldContainer(lx, ctx, f.fiName, vx)
+        }
+      } else if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is Ident {
+        nodeTyRecord(vx, ft)
+      }
+    }
+  }
+  monoSupersededObjTys.push(ot)
+  nodeTyRecord(lx, t)
+  monoGradualObjList.push(lx)
   0
 }
 
@@ -15243,32 +15303,6 @@ function monoLetWholeWrites(at: i32): i32[] {
   for w in monoWritesOf("n:", at) { out.push(w) }
   for w in monoWritesOf("c:", at) { out.push(w) }
   out
-}
-
-// The type write `w` stores: the type the binding its right side reads holds, or a record
-// literal's at the closed bindings its fields read (D9182), recorded when `rec`; -1 for a write
-// that is no `=` or stores anything else.
-function monoLetWriteRhsTy(w: i32, ctx: i32): i32 {
-  monoLetWriteRhsTyRec(w, ctx, false)
-}
-
-function monoLetWriteRhsTyRec(w: i32, ctx: i32, rec: boolean): i32 {
-  const wb = nodeAt(w)
-  if !(wb is BinExpr) || wb.binOp != "=" { return -1 }
-  const rx = unwrapParen(wb.binRight)
-  if rx < 0 || rx >= P.nodes.length { return -1 }
-  if nodeAt(rx) is ObjLit {
-    const lt = monoClosedObjLitTy(rx, monoStoreFrame(w, ctx), rec)
-    if lt >= 0 { return lt }
-    const it = elabIdentityTy(rx, monoStoreFrame(w, ctx))
-    return if it >= 0 { it } else { nodeTyIxOf(rx) }
-  }
-  if !(nodeAt(rx) is Ident) { return -1 }
-  const bd = monoReadLetFrame(rx, monoStoreFrame(w, ctx))[1]
-  if bd < 0 { return -1 }
-  const b = nodeAt(bd)
-  if !(b is LetDecl) { return -1 }
-  monoLetTyIx(b)
 }
 
 // The value type of the map (no set) the expression `mx` takes, when that type is open; -1
