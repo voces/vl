@@ -2982,6 +2982,25 @@ after mapping each lambda clone through `elabSrcDecl`. That mapping brings D3928
 decisions to agree. `nodeSrc`, `declOrigOf` and `lfOriginOf` do not link an instance body's lambda
 copies.
 
+**The hub's callee choice is parked: its derivation duplicates an elaboration fact, and its policy
+is mono's** (2026-11-07). `monoWalkIdentCall` picks a callee through eight rungs: arm, respell,
+closure, the instance-origin hop, captured, readgen, alias-lambda and alias-let end. That choice
+agrees with the elaboration's (`elabCalleeFnsOf`, with a lambda clone mapped by `elabSrcDecl`) on
+**122,691 of the 122,722 decisions both sides answer**. The remaining 31 are the D5841 several-sets,
+over 23,456 programs. Two things in the hub are mono's own:
+- **The `call_ref` policy**, which calls may be made direct. Whether a rung fires is what keeps the
+  2,079 elab-only calls `call_ref` (ruling (a); (S2), making a subset direct, stays declined), and
+  the rungs' `monoNoRename` and written-let frame side effects are that policy.
+- **Callback specialization**, recorded below.
+
+What duplicates the elaboration is the rungs' derivation of which function is called. That
+derivation is the endgame to move (S1). The rung would become a firing predicate, and the callee the
+elaboration's single member. The move is blocked on a cheap reverse map from a source declaration to
+its clone in an instance, because the elaboration names the source and mono needs the instance's
+slot. The canonical-instance-key work is the expected provider. Moving it today would delete about
+two functions (`monoRespellLamFe` and `monoCapturedLamFe` become predicates), so it waits for that
+map.
+
 **Mono-owned: callback specialization's direct calls** (2026-11-07). `monoWalkIdentCall`'s
 instance choice was compared with the elaboration over 23,456 programs: 122,691 decisions agree.
 2,079 are elab-only and stay `call_ref` under ruling (a). 1,052 are mono-only: 698 concrete and 354
