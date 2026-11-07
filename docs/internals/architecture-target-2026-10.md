@@ -2541,7 +2541,18 @@ bindings move out of "not blocked"; they are the family table below. The value-c
 the value is called at two types, so the consumer picks by the call the read reaches. Of the 283
 unlinked, 94 are lane F's instance bindings, mostly a record or list of functions handed to a
 parameter and called as `p.f(x)` or `xs[0](x)`; the note does not yet follow a field or element
-callee off an open parameter.
+callee off an open parameter. The 90 "open: nothing", by family:
+- 53 adopted bindings, in the family table below.
+- 19 list callbacks. 11 are `generics/generic-fn-as-list-callback-result.vl`, 4 an `if` choice of
+  functions as the callback, 3 a hole-function list's callback through a loop alias or a returned
+  list, and 1 is D9020's relay, the (iii) row.
+- 14 arguments: 12 in `generics/typaram-binding-seeded-in-cloned-call.vl` and 2 in
+  `generic-arena-bind-map-and-alias.vl`.
+- 3 returned lists, `closures/hole-fn-list-returned-inline-call.vl`.
+- 1 instance binding, the (ii) row.
+
+Most of the callbacks and arguments are nodes mono minted, so the pre-walk column has no entry
+for them by construction; their fact is read through the node they copy (`nodeSrc`).
 
 So identity typing is not the prerequisite for this population; one fact is.
 - **The fact:** `elabValueInstKey(x, k)`, the member instance or instances the elaboration made for
