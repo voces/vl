@@ -16,6 +16,10 @@ echo
 echo "== (c) joins of function values: position x shadow class x today"
 awk '$2 == "join" { n[$3 " " $4 " " $5]++ } END { for (k in n) printf "%7d  %s\n", n[k], k }' "$OUT.rows" | sort -rn
 echo
+echo "== (e) function-typed slot writes: position x slot set x value/slot/held rep x verdict"
+awk '$2 == "slot" { n[$3 " " $4 " " $5 " " $6]++ } END { for (k in n) printf "%7d  %s\n", n[k], k }' "$OUT.rows" | sort -rn
+echo
+[ -f "$OUT.insts" ] || exit 0
 echo "== (d) instance count, mode 1 against mode 2"
 awk '{ a += $2; b += $3; if ($2 != $3) { m++; if ($3 > $2) g++; else f++ } } END {
   printf "programs %d  insts mode1 %d  mode2 %d  delta %+d  programs moved %d (grew %d, fell %d)\n", NR, a, b, b - a, m, g, f
