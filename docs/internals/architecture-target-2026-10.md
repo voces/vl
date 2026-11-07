@@ -2088,7 +2088,8 @@ elaboration fact states; `monoChoiceArmFlowTy`'s arm walk; and the frame plumbin
 having a twin in the elaboration. The maps and lists whose slot is called at two signatures (D15494,
 `closures/hole-fn-generic-pushed-list-spread.vl`) are no bundle: they hold uniform closure structs
 and each call site reaches its own signature, so their one-signature spelling is a rep spelling the
-default supplies, and no fact is missing.
+default supplies. Both run today, and both wait on a design answer, not a lane: what the elaboration
+says for an open slot called at two signatures.
 
 **The unbound default, measured** (2026-11-07, master `75101d46`). The D4551 default is the
 elaboration's: `ELAB_TP_DEFAULT` and `elabTpDefaulted` (#6569), after its call reach was made to
