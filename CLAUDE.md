@@ -81,7 +81,10 @@ while it catches a breakage nothing else catches, measured by the kill matrix
 worktree (`.claude/worktrees/`, override `GATE_IN_WORKTREE=1`): the merge queue gates every PR on
 the merged tree, and builders running it as well spent 66 full runs in one day. Every gate below is
 independent once the seed is built, so it fans them out and reports a per-gate table of wall
-time, CPU seconds and exit code. Thirty gates on master; measured 2026-10-12 at 3c2e2227a, back
+time, CPU seconds and exit code. The fan-out is sized to the box: at most 2 × `nproc` rows at
+once (`GATE_MAX_PAR`), each admitted only while the rows' peak-RSS estimates (`row_mem`) fit in
+the memory free at launch (`GATE_MEM_BUDGET_MB`), so a 4-core, 15 GiB container queues the
+heavy rows where all-at-once OOM-killed one; a box with room for every row still runs them all. Thirty gates on master; measured 2026-10-12 at 3c2e2227a, back
 to back on one 24-thread box: **173 s** under WSL (every row at once) and **263 s** on Windows
 (at most 6 at once), set by `ci-native` and `filed witnesses`/`scaling shape` behind it. That is
 past the budget below; the September reading (79.8 s, 25 gates) was a smaller gate. The
