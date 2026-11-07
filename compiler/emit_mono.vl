@@ -12570,6 +12570,69 @@ function monoFlowMapHandOn(x: i32): i32 {
   -1
 }
 
+let monoShAcc = ""
+let monoShSeen: {[i32]: boolean} = Map()
+// The write a cw blame `at` stores through, as the binding its target names; -1 when none.
+function monoShBlameBase(at: i32): i32 {
+  if at < 0 || at >= P.nodes.length { return -2 }
+  const n = nodeAt(at)
+  let b = -1
+  if n is BinExpr && n.binOp == "=" {
+    const l = nodeAt(unwrapParen(n.binLeft))
+    if l is Index { b = unwrapParen(l.idxArr) } else { return -3 }
+  } else if n is Call {
+    const f = nodeAt(unwrapParen(n.callFn))
+    if f is Member { b = unwrapParen(f.memObj) } else { return -4 }
+  } else { return -5 }
+  if b < 0 || !(nodeAt(b) is Ident) { return -6 }
+  identDeclOf(b)
+}
+function monoShAlias(d: i32, old: i32[], oldOk: boolean) {
+  if monoShSeen.has(d) { return 0 }
+  monoShSeen[d] = true
+  const vals: i32[] = []
+  const ats: i32[] = []
+  const r = cwSlotWrittenValues(cwKeyOfDecl(d), ["[]"], vals, ats)
+  const nw: i32[] = []
+  let odd = 0
+  if r >= 0 {
+    let i = 0
+    while i < vals.length {
+      let bb = if i < ats.length { monoShBlameBase(ats[i]) } else { -7 }
+      if bb < -1 {
+        let x = vals[i]
+        while mfrParentOf(x) >= 0 && nodeAt(mfrParentOf(x)) is Paren { x = mfrParentOf(x) }
+        const q = mfrParentOf(x)
+        if q >= 0 {
+          const qn = nodeAt(q)
+          if qn is BinExpr && qn.binOp == "=" && qn.binRight == x { bb = monoShBlameBase(q) }
+          else if qn is Call && qn.callArgs.length == 2 && qn.callArgs[1] == x { bb = monoShBlameBase(q) }
+        }
+      }
+      if bb < -1 { odd = odd + 1 }
+      else if bb != d { nw.push(unwrapParen(vals[i])) }
+      i = i + 1
+    }
+  }
+  let oNotN = 0
+  let nNotO = 0
+  for o in old { if !i32ListHas(nw, unwrapParen(o)) { oNotN = oNotN + 1 } }
+  for v in nw {
+    let hit = false
+    for o in old { if unwrapParen(o) == v { hit = true } }
+    if !hit { nNotO = nNotO + 1 }
+  }
+  let cell = ""
+  if !oldOk && r < 0 { cell = "BOTHFAIL" }
+  else if !oldOk { cell = "OLDFAIL[n" + i32ToStr(nw.length) + "]" }
+  else if r < 0 { cell = "CWFAIL[o" + i32ToStr(old.length) + "]" }
+  else if oNotN == 0 && nNotO == 0 { cell = if old.length == 0 { "EMPTY" } else { "AGREE" } }
+  else { cell = "DIFFER[o" + i32ToStr(old.length) + ",n" + i32ToStr(nw.length) + ",oNotN" + i32ToStr(oNotN) + ",nNotO" + i32ToStr(nNotO) + "]" }
+  if odd > 0 { cell = cell + "[odd" + i32ToStr(odd) + "]" }
+  monoShAcc = monoShAcc + " PROBE-MAW-" + cell + "[" + i32ToStr(d) + "]"
+  0
+}
+
 // Appends to `out` the value each write into map `mv` (`monoFlowMapOwner`) stores: a literal or
 // a read naming a generic as written, anything else as its elaboration roots; false when one is
 // unknown. Notes the writes through the parameters and `const`s it is handed to
@@ -12592,13 +12655,14 @@ function monoFlowMapVals(mv: i32, out: i32[]): boolean {
       } else {
         const h = monoFlowMapHandOn(x)
         if h >= 0 && !i32ListHas(via, h) {
-          if !i32ListHas(monoFlowAliasMaps(h), mv) { return false }
+          if !i32ListHas(monoFlowAliasMaps(h), mv) { monoShAlias(d, writes, false); return false }
           via.push(h)
         }
       }
     }
     i = i + 1
   }
+  monoShAlias(d, writes, true)
   mfrAliasWrites[d] = writes
   const vals: i32[] = []
   const ats: i32[] = []
@@ -25866,6 +25930,9 @@ export function monomorphize(stmts: i32[]) {
     if monoBindingAdoptInit(ai, bodyKeys[ai]) < 0 { return -1 }
     ai = ai + 1
   }
+  if monoShAcc != "" { emitFail(monoShAcc) }
+  monoShAcc = ""
+  monoShSeen = Map()
   prc
 }
 
