@@ -1201,8 +1201,8 @@ happen where no fact can see them, so the slot has to be treated as called.
    Each family is measured alone by its own cut before it is scheduled.
 
 **The uncalled family, landed** (2026-11-06). `elabSlotUncalled(d, path)` answers it from the
-elaboration: no call reads its callee from the slot (`fnSlotCalled`, the checker's per-slot call
-index), no call goes through the set its type carries (`elabSlotSetCalls`), no closed delivery
+elaboration: no call reads its callee from the slot as the slot (`fnSlotThroughCalls`, the
+checker's per-slot call index, where a const element read naming one function does not count), no call goes through the set its type carries (`elabSlotSetCalls`), no closed delivery
 (`elabSlotDeliveries`), and no function it holds escapes (`fnEscapes`). Shadowed against the
 table at its three mono readers, it agreed at 159 of 165 site-hits until two gaps closed: a call
 through a one-member set reads its callee from the slot but the set records no call, and a `for`
@@ -1970,7 +1970,14 @@ not a hit count for one decision. 209 of the 225 have an arm reached; 16 have no
   type keeps it declining. What is left mono-derived is the gate deciding the slot is uncalled.
   Before #6503 gated the stored slot on `elabSlotUncalled` alone, 59 of the 105 reach the default through `monoValsInert`, `monoValsReachNoCall` or
   `monoLitReachesNoCall` while `elabSlotUncalled` says the slot is called. That calledness
-  disagreement is this family's next item.
+  disagreement, shadowed at the four gate sites on 2026-11-06, is 53 decisions in about 31
+  programs where mono says uncalled and the elaboration says called: 23 at the flat list with no
+  pins (`monoLitReachesNoCall`), 28 at the stored slot and 2 at the pushed list (`monoValsInert`).
+  `elabSlotUncalled` now counts no call whose callee names a function or is a const element read
+  naming one (`fnSlotThroughCalls`, `elabCallNamesOne`), which moves 22 of the 23 to agree with no
+  new disagreement. The 31 left, the pushed-list and stored-slot ones and one call through a list
+  of one lambda, are the calls the `monoFlowReads` rewrite repoints, which the cad lane records
+  after B2; then `monoLitReachesNoCall`, `monoValsReachNoCall` and `monoValsInert` go.
 
 The unbound default, which every program reaches through `monoElabDefaultsPrime`, is split-dep's,
 with the rest of the §3.4 tail. The cad lane takes slot deliveries, then node type, then slot type.
@@ -2329,6 +2336,18 @@ function and no container (`let v = id`, `const g = r.f`, a parameter handed one
 reads, and the chain gate (`mfrChainFns`) owns them, so **B2's consumer takes container roots only**
 and a second consumer of a function-only set is not added. The 232 container roots are B2's
 widening, sweep-proven with every mover named; a subclass that moves output is declined.
+
+**B2a: the planner's binding roots are the elaboration's** (2026-11-07). `monoFlowDeclVals` reads
+`mfrLitsOf`, and the let, parameter and return walkers are gone. A set holding anything but a
+container is unknown, and **function roots are admitted only when the declaration's own walk reached
+them through a map read** (`mfrLitsDirectFn`): that is the value the walkers' map read gave, and
+dropping it lost six named programs, while a per-node mark admitted an alias of a stored function. A `.slice()` copy mono rewrote holds its minted spread literal. Over the 7,538 sweep
+programs against master's fixpoint: 0 runs lost, 0 outputs moved, 16 of 16 named programs run, and
+three move bytes with the same output. `hole-fn-record-relayed-to-param-field-call` (parameter `a`)
+and `generic-list-sliced-called-at-two-types` (`fs`) are class-3 container widenings, and
+`generic-fn-param-in-un-annotated-container` names its map-read generic by another node. The
+expression walker `monoFlowValsOf`, the map and alias planners, `monoFlowElemsGen` and loop-variable
+rows (D9981, which the elaboration does not derive) are B2b.
 
 **B2's named bar: 16 programs the walkers' literal mechanics carry.** With the whole walker planner
 off and the chain gate admitting callee reads, 7,538 sweep programs at fixpoint lose 16 runs and
