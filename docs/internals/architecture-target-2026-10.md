@@ -2223,6 +2223,16 @@ The slot fact is the wrong reference: a written `let` of generics has no one clo
 - **The hole-function argument is not switched: it replaces nothing.** Its read agrees at 59, differs
   at 0 and is none at 49. But the by-call signature already comes from the binding or callee keys,
   so no mono derivation is left for it to replace.
+- **Parked: `monoCellCall`, the capture-cell call.** It makes 10 type decisions, all at its
+  named-generic seed: D12213 ×2, `closures/captured-cell-shared-writer-hole-lambda-alias` ×4 and
+  `closures/nested-generic-written-into-capture-cell-at-two-instances` ×4. No elaboration fact
+  answers them. The call reads the cell `cell[0]` that the capture rewrite generates, and that read
+  has no source node. Neither the original captured read nor the binding's function set carries a
+  key. The missing fact is a per-instance signature for the cell read, keyed through the captured
+  binding's declaration at the capture frame's key, which the elaboration would have to mint.
+  `monoInstParamPinTys` stays for this site.
+- **Deleted: the cell's hole-lambda seed arm**, with `monoCellSeedLamFe`. It never fired: under a
+  loud floor, no program in the 23,456-program census reached it, and 0 programs moved.
 
 **Exit checklist: the pin helpers, census of 2026-11-06** (master `d0f6b7722`, 1,090 functions,
 then #6491: 1,088). Every function the pin-helper budget counts is classified by what its decisions
