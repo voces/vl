@@ -38,5 +38,6 @@ output does not.
 
 **Decisions, unchanged:** 1,577 = 1,472 keyed + 105 declined (77 `open`, 28 `nobase`, 0 tagged).
 
-**Flags off**, with fixpoint seeds on both sides: see the PR for the `scripts/sweep.vl` diff
-against master.
+**Sweep**, with fixpoint seeds on both sides: `scripts/sweep.vl` diff against master `c631be4a`
+reads 23,608 same, 3 bytes-only, 0 output movers and 0 `runs → not-runs`. The 3 bytes-only movers
+are the 3 programs above. Seed: 6,478,310 → 6,478,169 bytes (−141).
