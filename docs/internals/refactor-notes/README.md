@@ -8,6 +8,13 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step7-run2-holes](2026-11-08-step7-run2-holes.md): Step 7: run #2 declined 17 → 3 (#6778).
+- [2026-11-08-returned-record-held-type](2026-11-08-returned-record-held-type.md): A generic instance's returned record takes its held type; D15297 closed (#6777).
+- [2026-11-08-step7-bundle-type-fact](2026-11-08-step7-bundle-type-fact.md): Step 7: a closure bundle is the elaboration's fact; mono's bundle-return ledger deleted (#6775).
+- [2026-11-08-step6-synth-ret-readers](2026-11-08-step6-synth-ret-readers.md): Step 6: `synthRetAnnots` narrowed to four pins (#6774).
+- [2026-11-08-step6-synth-param-annots](2026-11-08-step6-synth-param-annots.md): Step 6: `synthParamAnnots` deleted (#6773).
+- [2026-11-08-naming-last-readers](2026-11-08-naming-last-readers.md): The naming rule's last readers (#6772).
+- [2026-11-08-step7-classifier-r7](2026-11-08-step7-classifier-r7.md): Step 7 classifier round 7 (#6770).
 - [2026-11-08-unionbox-write-order-variant-fields](2026-11-08-unionbox-write-order-variant-fields.md): The box record's write order, graded; variant fields read it (#6769).
 - [2026-11-08-call-key-every-instance-shadow](2026-11-08-call-key-every-instance-shadow.md): Step 2: does the call key bind every instance mono builds; the value class switched (#6767).
 - [2026-11-08-state-audit-const-containers](2026-11-08-state-audit-const-containers.md): The state audit reads written `const` containers; two more leaks fixed (#6766).
