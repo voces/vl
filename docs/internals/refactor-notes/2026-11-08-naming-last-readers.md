@@ -1,76 +1,54 @@
-# The naming rule's last readers (2026-11-08)
+# The last readers of a name: naming rule slice 4 (2026-11-08)
 
-Follows [2026-11-08-pin-step4-types.md](2026-11-08-pin-step4-types.md), which left three emit readers
-in `check_emit_queries.vl` resolving a pin by name. The rule: a spelling derives from the canonical
-type and is never parsed back into one.
+Follows [2026-11-08-naming-pin-readers.md](2026-11-08-naming-pin-readers.md) (#6798).
 
-## What changed
+## What landed
 
-| reader | before | now |
+Two checker reads that took a spelling the canon pass had already rewritten now resolve the
+parser's spelling tree:
+
+- `holeGuardDeadAt` (`check_relate_core.vl`) read `nameToTy(ie.isVariant)`. It now uses
+  `annotResolve(ie.isVariant, annTsOf(c))`, the tree route `isTypeTy` takes for the same node.
+- `canonBankTyOf` (`check_program.vl`) re-parsed the pre-canon spelling. Its caller now passes the
+  root it read before `clearAnnTs`, and resolves through `annotResolve`.
+
+## The emit-side sites, probed
+
+There was one probe build, with an `emitFail` at each site that reads a name. A sweep counts only
+the first message per program, so each count is a floor:
+
+| site | programs | at the instance key (`ekTys[elabWalkTop()]`) |
 |---|---|---|
-| `recordClonedNodeTyKnown` | `tyIn < 0` parsed the name | records `tyIn`, else the pin kind's placeholder; takes no name |
-| `recordClonedNodeTy`, `synthTypeRef` | name only | deleted |
-| `monoMakeInstanceHit`'s hole parameter | `synthTypeRef(pin)` | `monoSynthPinRef(pin, pinTys[i])`, as the clone arm |
-| `monoMakeInstanceParams`' written-annotation arm | `recordClonedNodeTy(pin)` | `pinOwn`, else `pinTys` |
-| void returns (`$voidtw`, a rewritten `fnRet`) | `"void"` parsed | `TY_VOID` |
-| `$extv` wrappers | the link row's spellings parsed | `externLinkTyAt(k)`, the type `checkExternDecls` resolved |
-| `$eqc` cores | the row's name parsed | `slotRowTyOf(row)` |
-| void twins | the slot's parameter spellings parsed | the slot's function type, carried on `voidTwinSeamNote` |
-| `monoPinnedTyParamCanon` | `tyName == tp` / `tp + "[]"` | the annotation's type: a `TyVar` named `tp`, a list of one, else `bindGenWalk` |
+| S1 `monoSynthPinRef`, open pin | 112 | 0 close |
+| S2 `monoSubstLetType`, registered-union arm | 128 | not tried; the arm reads the registry's spelling on purpose (D2676) |
+| S3 `monoSubstAnnNode`, `sty < 0` | 40 | 40 close |
+| S4 `monoSubstIsExpr`, `recordClonedIsVarTy` | 18 | 18 close |
+
+Closing S3 and S4 at that column cost **12 `runs → not-runs`** and 4 more output movers.
+`is-type-parameter-itself.vl` (D951) prints different `is T` answers, so the column is the
+wrong binding, not a different rep. During the body rewrite, `elabWalkTop()` is the key the
+build pushed for the instance. That key includes `elabLamInheritedOwn` and the exact-binding
+join, so it is not the column the instance's pins spell. The change was reverted. The full
+column has to come from the instance-binding derivation, which belongs to lane w90.
 
 ## Measured
 
-Probe method as in #6762: a probe build failed loudly (`emitFail`, one tag per site) wherever the
-name's type and the handed type disagreed (`tySame`), over the sweep population (23,615). A first
-build tagged every `synthTypeRefTy` call that handed `-1` and still resolved a name (`K`): 850
-programs fired, at nine sites, before any type was handed.
-
-| site | programs disagreeing once handed a type | outcome |
-|---|---|---|
-| hole parameter, cloned parameter, void, `$extv`, `$eqc`, void twin | 0 | switched |
-| `monoPinnedTyParamCanon` | 2 | switched; both are the control below |
-| `monoSynthPinRef` (`recordClonedNodeTyFb`) | 513 | kept, name first |
-| `monoSubstAnnNode`, `monoSubstLetType`'s union arm | 42 + 2 | kept, name only where no closed substitution |
-| `monoSubstIsExpr` (`recordClonedIsVarTy`) | 10 | kept |
-
-The `monoPinnedTyParamCanon` probe's two programs are `type-param-name-shadows-builtin*.vl`: a type
-parameter named `i32`, whose `v: i32` the checker resolves to the builtin. The spelling test bound
-it by the coincidence of names; the type does not, which is the checker's ruling.
-
-Both seeds built to a fixpoint (a third `refresh-compiler.sh` byte-identical). Base is master
-`82072a24`; candidate is this branch with it merged.
-
 | | |
 |---|---|
-| sweep | 23,625: 23,625 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs` |
-| seed | 6,505,157 → 6,506,010 bytes (+853, 0.01%) |
-| pin-helper budget (`emit_mono.vl`) | 930 → 930 |
+| sweep (fixpoint seeds, base = master + #6798) | 23,656: 23,656 same, 0 bytes-only, 0 movers, 0 `runs → not-runs` |
+| reach of the two checker sites (trap probe) | 240 programs (control: D3109's `hole-dead-guard-*` fires) |
+| S3+S4 at the walk key (reverted) | 12 `runs → not-runs` |
 
-## What still reads a name, and why
+## `nameToTy` callers in `check_relate_core.vl`
 
-- **`recordClonedNodeTyFb`** (`monoSynthPinRef`, and the two substitution sites with no closed
-  type). Against `pinTys` it disagrees in 513 programs, against `pinOwn` in 364. Four kinds: a pin
-  spelled by its rep (a function-hole list pinned `i32[]` while its type is `((_) => _)[]`, 72); a
-  literal pin spelled widened (`string` while the type is the alias `K`); `Set<K>` against its map;
-  an `#anonN` row, which resolves to no type and takes the placeholder where the type is the record.
-  Each is a pin spelling that is not `monoPinSpellOf(type)`, so it waits on slice 2 of the naming
-  rule (the spelling's producer), not on a reader.
-- **`recordClonedIsVarTy`** and the 44 substitution programs: a body rewrite holds only the exact
-  bindings (`exSubN`/`exSubT`); a type parameter bound by the ladder closes only in the text
-  bindings (`tvV`). They need the instance's typed bindings carried to the body rewrite.
+- Annotation entry, allowed: `annotResolve`'s name fallback, `nameToTyAt` at call type
+  arguments, and `nameToTyAnn` at struct fields.
+- Resolver-internal recursion, allowed (each one takes its entry's class):
+  `applyGenAliasArgs`, `nameIsectOperandTy` (×2), `builtinCollAppTy`, `nameToTyReal` (×7),
+  `retNameToTy`, and the inline-record field.
+- Round trip, fixed: `holeGuardDeadAt`.
 
-## `nameToTy` under `compiler/` after this
-
-`check_emit_queries.vl` holds two calls, `recordClonedNodeTyFb` and `recordClonedIsVarTy`, the two
-readers above. `check_program.vl`'s canonical-name helpers parse a spelling back six times
-(`unionMemberGenAppShape`, `canonEmitNameOfTy`, `canonBankTyOf` twice, `canonEmitUnionName`,
-`canonSameShapeRecord`): these are emit-facing, not annotation resolution. The rest is check-side
-annotation and name resolution (`check_relate_core.vl`, `check_operators.vl`, `check_statements.vl`,
-`check_top_level.vl`).
-
-## §3.4
-
-- `monoPinnedTyParamCanon`: switched, reads the type.
-- `monoPinTyParamComposite`: calls no `nameToTy`. Its pin is `monoSubstAnn` over the text bindings,
-  while `pinOwn` already holds the type, so it waits on slice 2 (`monoPinSpellOf` as producer), not
-  on the pin-type column.
+`check_program.vl` has three left, and all three re-parse canon's own output (`c`, `name`,
+`all`): `canonBankTyOf`'s `nameToTy(c)`, the `recDup` arm and `canonSameShapeRecord`.
+`unionMemberGenAppShape` also reads a canon'd member. These close only once `canonEmitName`
+returns a type next to its text.
