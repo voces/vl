@@ -65,10 +65,8 @@ import {
   elabLamDeliveredParams,
   elabLamInstParamTy,
   elabLamParamTy,
-  elabLitSlotCallTy,
   elabNodeTy,
   elabOpenFnArgDecl,
-  elabReturnedClosedTy,
   elabSlotAnnRets,
   elabSlotDeliveries,
   elabSlotDeliveriesOmitting,
@@ -4373,29 +4371,6 @@ function monoNumOperandPinTy(ix: i32): i32 {
   if tyIsNumericBox(w) && tyBearsNull(w) { nonNullTy(w) } else { w }
 }
 
-// `monoNumUnionOpPin` for a compound assignment `rb` rebuilt from `ix`: its operator node.
-function monoNumUnionCompoundPin(ix: i32, rb: i32): i32 {
-  const n = nodeAt(rb)
-  if !(n is BinExpr) { return rb }
-  const inner = nodeAt(n.binRight)
-  if !(inner is BinExpr) { return rb }
-  const lt = monoNumOperandPinTy(inner.binLeft)
-  const rt = monoNumOperandPinTy(inner.binRight)
-  if !tyIsNumUnion(lt) && !tyIsNumUnion(rt) { return rb }
-  const nu = numUnionResultTy(inner, lt, rt)
-  if nu < 0 || nu == nodeTyIxOf(n.binRight) { return rb }
-  let nx = rb
-  if nx == ix { nx = monoExprRemake(ix, monoExprKids(ix)) }
-  const nn = nodeAt(nx)
-  if !(nn is BinExpr) { return rb }
-  monoPinRecordTy(nn.binRight, nu)
-  if tyIsNumUnion(nu) {
-    const vn = valueUnionRetName(nu)
-    if vn != "" { monoRegisterPinUnion(vn, nu) }
-  }
-  nx
-}
-
 // An operator whose operand this instance types as a numeric union answers the union of its
 // member results (`numUnionResultTy`), which the template, typed at a parameter, cannot name.
 function monoNumUnionOpPin(ix: i32, rb: i32): i32 {
@@ -4403,15 +4378,6 @@ function monoNumUnionOpPin(ix: i32, rb: i32): i32 {
   const n = nodeAt(rb)
   let nu = -1
   if n is BinExpr {
-    // A compound assignment's operator node is not a kid: it is re-typed inside the rebuild.
-    if (
-      n.binOp == "="
-      && n.binCompound != ""
-      && n.binCompound != "++"
-      && n.binCompound != "--"
-    ) {
-      return monoNumUnionCompoundPin(ix, rb)
-    }
     if n.binOp == "=" || n.binOp == "??" || n.binOp == "&&" || n.binOp == "||" {
       return rb
     }
@@ -17303,13 +17269,6 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const ew = elabWrittenValueTy(0 - 1, m.memObj, elabWalkTop())
     if ew >= 0 { rt = ew }
   }
-  // A list of a tagged set is closed. Another open list of functions the flow pinned is read at
-  // the annotation the pin gave it (D9093), as is one handed a named function its parameter the
-  // flow linked to it (D9761).
-  const open = rt < 0 || tyHasTyVar(rt) && !fnTagListTy(rt)
-  if (lam || nodeAt(ax) is Ident) && open {
-    rt = monoPinnedAnnTyAt(m.memObj, 0)
-  }
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = tyAt(rt)
   // A tagged set element is closed: the callback's instance takes the set, as a direct call's does.
@@ -17393,122 +17352,6 @@ function monoRecordPinnedRecv(recv: i32, t: i32, wf: i32, depth: i32) {
   if x != recv { monoRecordOpen(recv, t, wf) }
   monoRecordOpen(dl, t, wf)
   monoRecordPinnedRecv(d.letInit, t, wf, depth + 1)
-}
-
-// The type of the annotation a pin gave the un-annotated binding the `Ident` at `recv` names,
-// read through a binding initialised from another, a list element, a map value or a record
-// field, every value written there agreeing (D9173, D9502); -1 when none is found.
-function monoPinnedAnnTyAt(recv: i32, depth: i32): i32 {
-  const x = unwrapParen(recv)
-  if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
-  if depth > 0 && !monoTyOpen(nodeTyIxOf(x)) { return nodeTyIxOf(x) }
-  const xn = nodeAt(x)
-  // An element or map-value read is typed by the elaboration's walk before this climb is asked.
-  if xn is Index {
-    emitFailAt(
-      "emitProgram: internal: a callback's receiver read through an element has no elaborated type",
-      x,
-    )
-    return -1
-  }
-  if xn is Member {
-    return tyFieldTyOf(monoPinnedAnnTyAt(xn.memObj, depth + 1), xn.memProp)
-  }
-  if xn is Call { return monoPinnedRetAnnTy(x, xn) }
-  if xn is ArrayLit {
-    let t = -1
-    for e in xn.arrElems {
-      if nodeAt(unwrapParen(e)) is Spread { return -1 }
-      t = monoPinnedAgree(t, monoPinnedAnnTyAt(e, depth + 1))
-      if t < 0 { return -1 }
-    }
-    if t < 0 { return -1 }
-    return mkArrayTy(t)
-  }
-  // A `??` whose fallback is an empty list reads at its left side.
-  if xn is BinExpr && xn.binOp == "??" {
-    const rx = unwrapParen(xn.binRight)
-    const lt = monoPinnedAnnTyAt(xn.binLeft, depth + 1)
-    if lt < 0 || rx < 0 { return -1 }
-    const rn = nodeAt(rx)
-    if rn is ArrayLit && rn.arrElems.length == 0 { return lt }
-    return monoPinnedAgree(lt, monoPinnedAnnTyAt(rx, depth + 1))
-  }
-  if !(xn is Ident) { return -1 }
-  const d = identDeclOf(x)
-  if d < 0 || d >= P.nodes.length { return -1 }
-  const dn = nodeAt(d)
-  if !(dn is LetDecl) { return -1 }
-  if dn.letType >= 0 { return nodeTyIxOf(dn.letType) }
-  if dn.letInit < 0 { return -1 }
-  let t = monoPinnedAnnTyAt(dn.letInit, depth + 1)
-  for w in monoWritesOf("n:", d) {
-    const wn = nodeAt(w)
-    if t < 0 || !(wn is BinExpr) { return -1 }
-    t = monoPinnedAgree(t, monoPinnedAnnTyAt(wn.binRight, depth + 1))
-  }
-  t
-}
-
-// The one type two pinned reads agree on, where `a` is -1 before the first; -1 when either has
-// none or they differ.
-function monoPinnedAgree(a: i32, b: i32): i32 {
-  if b < 0 { return -1 }
-  if a >= 0 && !tyEq(a, b) { return -1 }
-  b
-}
-
-// `monoPinnedAnnTyAt` for call `c` (node `x`) of an un-annotated declared function: the one type
-// each returned list literal closes at, from the calls its functions reach (the climb), else as
-// the elaboration closes a held literal, where the callee is a generic's instance or the list holds
-// no record; -1 when they differ or one does not close.
-function monoPinnedRetAnnTy(x: i32, c: Call): i32 {
-  const fd = monoCalleeDeclOf(c)
-  if fd < 0 { return -1 }
-  const fn = nodeAt(fd)
-  if !(fn is FuncDecl) { return -1 }
-  if fn.fnRet >= 0 {
-    // An instance's closed list-of-functions return annotation would be the answer here, and no
-    // program reaches one (§3.4), so it refuses rather than read an unchecked rule.
-    const it = monoFrameInstTmpl(fd)
-    const at = nodeTyIxOf(fn.fnRet)
-    if (
-      it[0] == fd
-      && it[1] >= 0
-      && it[1] != fd
-      && at >= 0
-      && at < T.tys.length
-      && tyAt(at) is TyArray
-      && !monoTyOpen(at)
-      && tyMayHoldFn(at, 0)
-    ) {
-      return emitFail(
-        "emitProgram: monomorphize: an instance's closed list-of-functions return annotation is not read for its call's type",
-      )
-    }
-    return -1
-  }
-  const itp = monoFrameInstTmpl(fd)
-  const gen = fn.fnTyParams.length > 0
-    || (itp[0] == fd && itp[1] >= 0 && itp[1] != fd)
-  let t = -1
-  for r in monoFnRetArgs(fn) {
-    if r >= 0 && !(nodeAt(r) is RetStmt) {
-      const rx = monoRetListLitOf(r)
-      if rx < 0 { return -1 }
-      const st = elabLitSlotCallTy(rx, "e", 0)
-      let lt = if st >= 0 { mkArrayTy(st) } else { -1 }
-      let et = nodeTyIxOf(rx)
-      while et >= 0 && et < T.tys.length && tyAt(et) is TyArray {
-        et = tyArrayElemIx(et)
-      }
-      const rec = et >= 0 && et < T.tys.length && tyAt(et) is TyObj
-      if lt < 0 && (gen || !rec) { lt = elabReturnedClosedTy(rx, x) }
-      if lt < 0 || (t >= 0 && !tyEq(t, lt)) { return -1 }
-      t = lt
-    }
-  }
-  t
 }
 
 // A stored call `ix` of an un-annotated function whose open type holds a function records its
@@ -25236,28 +25079,7 @@ function monoLamPinName(ty: i32, depth: i32): string {
   // A generic record's instance by its application (`Box<A>`), which names its arguments.
   const ga = genAppNameOfTy(ty)
   if ga != "" { return ga }
-  const ir = monoInlineRecPinName(ty, depth)
-  if ir != "" { return ir }
   tyToEmitName(ty)
-}
-
-// An inline record whose fields name declared records, spelled as its row is interned (`{v:A}`),
-// which the render (`{v:{x:i32}}`) does not reach; "" for any other type or no such row (D3875).
-function monoInlineRecPinName(ty: i32, depth: i32): string {
-  const t = tyAt(ty)
-  if !(t is TyObj) { return "" }
-  let sp = "{"
-  let i = 0
-  while i < t.objFieldNames.length && i < t.objFieldTypes.length {
-    const fp = monoLamPinName(t.objFieldTypes[i], depth - 1)
-    if fp == "" { return "" }
-    if i > 0 { sp = sp + "," }
-    sp = sp + t.objFieldNames[i] + ":" + fp
-    i = i + 1
-  }
-  sp = sp + "}"
-  if structIndexByName(sp) < 0 { return "" }
-  sp
 }
 
 // Whether `ty` is a primitive, a record, or a list of those: the types whose name alone is
