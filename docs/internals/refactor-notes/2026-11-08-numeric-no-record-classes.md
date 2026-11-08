@@ -8,8 +8,7 @@ deliveries with no record at 18 positions, `emitFnTagDispatch`'s 474 aside.
 `probe.sh`'s shadow, with each row also naming its node's kind, type and ctx record, over the 124
 sweep files that carry one. Each (file, site pair, position) was delta-debugged to a minimal
 witness by greedy line removal, keeping a removal only while `vl check` stays clean and the row
-stands. Each class was then ablated one ingredient at a time. A class is what its witness
-needs, never its position.
+stands; each class was then ablated one ingredient at a time. A class is what its witness needs.
 
 ## This PR's records
 
@@ -59,7 +58,19 @@ Two more moved with them: a type-param `==` and a generic join exit, both at the
 
 ## Shadow and floors (`run.sh`, sweep population, fixpoint seeds)
 
-SHADOW_TABLE
+| | master `ac705a4c` | this PR |
+|---|---|---|
+| num no record, all positions | 727 | 697 |
+| of which outside `emitFnTagDispatch` | 253 at 18 positions | 223 at 16 |
+| num `floor: never returns` | 0 | 8 |
+| num table | 334,180 | 334,202 |
+| num src differs / dst differs | 20,346 / 2 | same |
+| atom floor / atom table, arm table | 2 / 1,261, 33 | same |
+| `floors.tsv` rows | 56 | 55 |
+
+Two rows leave `floors.tsv` (`emitUnionEqOther` and `emitAssignIdent`, no record) and
+`emitBlockValueAsGo  num floor: never returns` joins. The sweep shows all 23,705 programs
+byte-identical: a record serves a delivery only where it names the pair the site already lowers.
 
 ## Step 5 against its done criterion
 
