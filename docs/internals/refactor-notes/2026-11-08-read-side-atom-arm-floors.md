@@ -48,7 +48,8 @@ unlisted. Both are gone. Sixteen rows leave `floors.tsv`: 14 atom, the arm row, 
   un-annotated (`coalesce-join-tag-in-instance.vl`, 2); one return in
   `captured-litunion-assign.vl` that floors only beside the file's earlier closures (1).
 - **Numeric no record, 1,171.** `emitFnTagDispatch` 474 (hole-function-set arms: the call's
-  joined result is a hole at the check). `emitCoerceAtomPayload` 385. `emitBinOperandAs` 26, of
+  joined result is a hole at the check). A step-2 dependency: the set is known only once the
+  instance binds the hole, so it is re-measured after `monoHoleBinding` is deleted. `emitCoerceAtomPayload` 385. `emitBinOperandAs` 26, of
   which 22 are `xs[i] += v` over a list a later `push` pins (`D1603.vl`,
   `compound-index-assign-pins-element.vl`).
 - **dst differs, 2.** `3.0 as i64` (site `i64>i64`) and an `f32` literal tail of a value `if`
