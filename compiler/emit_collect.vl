@@ -93,7 +93,7 @@ import {
   frcRow,
   frcSlot,
 } from "./fn_ret_shadow"
-import { retValueRootCall } from "./check_store_rep"
+
 import { refViewSrcTys } from "./check_ref_list_view"
 import { widenRetagToHas } from "./check_retag_rows"
 import {
@@ -350,7 +350,6 @@ import {
   cloSigWalkRoots,
   cloStructIdx,
   collectByNode,
-  criChanged,
   declSlotByNode,
   emitCurStmtIx,
   emitFailed,
@@ -604,7 +603,7 @@ import {
   sTyIxOfName,
   structCanonIxReset,
 } from "./emit_rep"
-import { repSigSlotTyOf, repSlotOfKind } from "./emit_rep_slot"
+import { repSigRetTokOfTy } from "./emit_rep_slot"
 import { RS_TAG, relSkew } from "./emit_reloc"
 import {
   anonFieldElemKeyKind,
@@ -615,7 +614,6 @@ import {
   sScanLim,
   sioMemoReset,
   structFieldNameIxReset,
-  structIndexOfTy,
   structNameIxReset,
   structTyIxReset,
 } from "./emit_atom_kinds"
@@ -674,16 +672,13 @@ import {
   placeReadIsNarrowed,
   refListElemNameOfExpr,
   refListSlotOfExpr,
-  stmtIsTailValue,
   structIndexOfObj,
   structIndexOfObjCtx,
   unionNameOfExpr,
 } from "./emit_classify"
 import { bcOpen, bcSpineEnter, bcSpineLeave } from "./emit_closure_callee"
 import {
-  criClassify,
   criRecordRowCheck,
-  criWalkBlock,
   exprIsBareFnName,
   mfCbResultIsStrList,
 } from "./emit_closure_sites"
@@ -771,7 +766,6 @@ import {
   variantIndexOf,
 } from "./emit_local_slots"
 import {
-  memberCallYieldsValue,
   nulScalarListKindOfNode,
   retRefArrElemName,
   retStructIndex,
@@ -2403,8 +2397,8 @@ function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
     if retPrim == "null" {
       // D1567 — the `null` type, from the rung the checker banks for it. Its rep is
       // `nullref`, the bottom of the GC hierarchy: one value, assignable to every nullable
-      // ref destination with no coercion, and `retKindPri` gives it the top tier so
-      // `criClassify`'s expression facts cannot lower it.
+      // ref destination with no coercion, and `retKindPri` gives it the top tier so no
+      // later return-kind write can lower it.
       fRetKind[li] = "nulnone"
     } else if retPrim == "string" {
       fRetKind[li] = "str"
@@ -2427,9 +2421,8 @@ function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
     } else if retElem == "f32" {
       fRetKind[li] = "f32list"
     } else if retTyIsI32Map(retTyIx) {
-      // A mono `{[string]: i32}` map inferred return. `criClassify`'s `exprMap` can miss it,
-      // since a returned local's kind is not collected during the global return pass, so set
-      // it from the type the checker banked with the inferred return.
+      // A mono `{[string]: i32}` map inferred return, set from the type the checker banked
+      // with the inferred return.
       fRetKind[li] = "map"
     } else if tyIsNulStringRep(retTyIx) {
       // A `string | null` niche inferred return drives the kind-16 result valtype, the same
@@ -2677,28 +2670,6 @@ function criNulUnionFunc(ty: i32): boolean {
   (tyIxIsFunc(a) && b == TY_NULL) || (tyIxIsFunc(b) && a == TY_NULL)
 }
 
-// The struct row of the result the checker gave function `i`, for a function the expression
-// walk left at the `i32` default. The walk classifies a returned local by a kind no global
-// pass has collected yet, so an `if` joining two struct locals declared an i32 result over a
-// body yielding the struct (D2170). Only the default is filled; a kind the walk found stands.
-function criStructByFnTy(i: i32) {
-  if fRetKind[i] != "i32" { return 0 }
-  const ft = nodeTyIxOf(fnStmts[i])
-  if ft < 0 { return 0 }
-  const f = tyAt(ft)
-  if f is TyFunc {
-    let si = structIndexOfTy(f.fnRet)
-    if si < 0 { si = structRowOfTy(f.fnRet) }
-    // An object literal's own type names no row of its own; the row it is stored at does.
-    if si < 0 { si = structRowOfRecordTy(f.fnRet) }
-    if si < 0 { return 0 }
-    fRetKind[i] = "struct"
-    fRetStructIdx[i] = si
-    criChanged = true
-  }
-  0
-}
-
 // Interns the ref-list row of function `i`'s inferred ref-list result from its checked element
 // type when its element name keys no slot and the type is closed, before any type index is
 // allocated, so `fnRetRefListSlot` finds it at every reader.
@@ -2842,55 +2813,34 @@ function tyFnSetSig(t: i32, depth: i32): string {
   }
 }
 
-// The record row of un-annotated function `i` read from the rep stamp of every value it returns,
-// where its recorded result is a record, variant or nullable record and each stamp names one
-// row; a value stamped open, or built by a call, reads its function's recorded row. True if set.
-function criRowByStamp(i: i32): boolean {
-  if i >= fRecRetTy.length { return false }
-  const rk = repSigKindOfTy(fRecRetTy[i])
-  if rk != "struct" && rk != "nulstruct" && rk != "variant" { return false }
-  const fn = nodeAt(fnStmts[i])
-  if !(fn is FuncDecl) { return false }
-  const vals: i32[] = []
-  collectRetValues(fn.fnBody, vals)
-  if vals.length == 0 { return false }
-  // A value stamped open is built at the row its function's recorded result names (D14900); a
-  // call-built one at its root call's stamp; every other value at its own stamp's row.
-  const recSlot = repSlotOfKind(rk, repSigSlotTyOf(fRecRetTy[i]))
-  let kind: VKind | null = null
-  let slot = -1
-  let v = 0
-  while v < vals.length {
-    // A call-built value's row is the one its root call is stamped at.
-    const root = retValueRootCall(vals[v])
-    const sty = nodeRepTyIxOf(if root >= 0 { root } else { vals[v] })
-    let k: VKind | null = rk
-    let sl = recSlot
-    if sty >= 0 && !tyHasTyVar(sty) {
-      k = repSigKindOfTy(sty)
-      sl = repSlotOfKind(k, repSigSlotTyOf(sty))
-    }
-    if k != rk { return false }
-    if sl < 0 || (v > 0 && sl != slot) { return false }
-    kind = k
-    slot = sl
-    v = v + 1
+// Interns the ref-list row of un-annotated function `i`'s recorded list result from its closed
+// element type where none holds it yet, so the recorded result names its row.
+function criRecordedRefListDemand(i: i32) {
+  if i >= fRecRetTy.length { return 0 }
+  const r = fRecRetTy[i]
+  if r < 0 || r >= T.tys.length || repSigRetTokOfTy(r) != "" { return 0 }
+  const t = tyAt(r)
+  if !(t is TyArray) { return 0 }
+  const et = t.aElem
+  if (
+    et < 0
+    || tyHasTyVar(et)
+    || tyHasInferHole(et, 0)
+    || rlSlotOfRowTy(et) >= 0
+  ) {
+    return 0
   }
-  if kind == null { return false }
-  if fRetKind[i] == kind && fRetStructIdx[i] == slot { return true }
-  fRetKind[i] = kind
-  fRetStructIdx[i] = slot
-  criChanged = true
-  true
+  if repOfTy(r).rdKind != "reflist" { return 0 }
+  rlInternOfTy(et)
+  0
 }
 
 // Per `fnStmts` position: whether this run wrote the function's columns from its recorded
-// result (`criColsFromRecorded`), so the body walk below skips it.
+// result (`criColsFromRecorded`); a function it did not keeps the columns `buildFnMap` seeded.
 let criFromRec: boolean[] = []
 
-// Write un-annotated valued function `i`'s return columns from its recorded
-// result where that names all five (`fnRecordedRetCols`) and no value's stamp names the record's
-// row (`criRowByStamp`, which writes that row itself). True when written; else the walk owes it.
+// Write un-annotated valued function `i`'s return columns from its recorded result where that
+// names all five (`fnRecordedRetCols`). True when written.
 function criColsFromRecorded(i: i32): boolean {
   if i >= fRetKind.length { return false }
   const fn = nodeAt(fnStmts[i])
@@ -2898,7 +2848,6 @@ function criColsFromRecorded(i: i32): boolean {
   if fn.fnRet >= 0 || fRetVoid[i] != 0 || fnRecordedRetCols(i) != "" {
     return false
   }
-  if criRowByStamp(i) { return false }
   fRetKind[i] = frcKind
   fRetStructIdx[i] = frcSlot
   fRetRArrElem[i] = frcElem
@@ -2909,68 +2858,27 @@ function criColsFromRecorded(i: i32): boolean {
 }
 
 // The un-annotated return columns, after monomorphize (`computeRetInference#2`): from the
-// recorded result where it names them, else by a fixpoint walk of the function's returns.
+// recorded result where it names them, then the checks and rows that read the settled columns.
 export function computeRetInference() {
   criFromRec = []
   let ri = 0
   while ri < fnStmts.length {
+    criRecordedRefListDemand(ri)
     criFromRec.push(fnRetRowLowersAsAnn(ri) || criColsFromRecorded(ri))
     ri = ri + 1
   }
-  let changed = true
-  while changed {
-    changed = false
-    let i = 0
-    while i < fnStmts.length {
-      const fn = nodeAt(fnStmts[i])
-      if fn is FuncDecl {
-        if fn.fnRet < 0 && fRetVoid[i] == 0 && !criFromRec[i] {
-          // Classify over every valued return, tail value first, not just the first: a function
-          // whose first return is unclassifiable still types from its others, since the checker
-          // proved all returns agree.
-          criChanged = false
-          const fnb = nodeAt(fnStmts[i])
-          if fnb is FuncDecl {
-            if !criRowByStamp(i) {
-              if fnb.fnBody >= 0 {
-                const fb = nodeAt(fnb.fnBody)
-                if fb is Block {
-                  const fbs = fb.blkStmts
-                  if fbs.length > 0 {
-                    const tailIx = fbs[fbs.length - 1]
-                    // A value-yielding member call (`xs.map(…)`) is the tail `recordedVoidFns` kept
-                    // non-void, so it types the result as `return xs.map(…)` would (D2566).
-                    if (
-                      stmtIsTailValue(tailIx, fnStmts[i])
-                      || memberCallYieldsValue(tailIx)
-                    ) {
-                      criClassify(tailIx, i)
-                    } else {
-                      // A tail value-`if` is not a `stmtIsTailValue` — that predicate has no
-                      // `IfStmt` case — so a named function's inferred struct return through an
-                      // if-join went unclassified. Classify the whole `if` here; `exprStruct` and
-                      // `exprString` see through it and pick up the join's ref.
-                      const tn = nodeAt(tailIx)
-                      if tn is IfStmt {
-                        if tn.ifElse >= 0 { criClassify(tailIx, i) }
-                      }
-                    }
-                  }
-                }
-              }
-              criWalkBlock(fnb.fnBody, i, true)
-              criStructByFnTy(i)
-            }
-            criNulCloByRecorded(i)
-          }
-          if criChanged { changed = true }
-        }
+  let i = 0
+  while i < fnStmts.length {
+    const fn = nodeAt(fnStmts[i])
+    if fn is FuncDecl {
+      if fn.fnRet < 0 && fRetVoid[i] == 0 && !criFromRec[i] {
+        criNulCloByRecorded(i)
       }
-      i = i + 1
     }
+    i = i + 1
   }
-  // After the fixpoint, so a caller relaying this function's result still classified it at
-  // the slot's nullable rep, which the settled non-null result subtypes.
+  // After every function's columns are written, so a caller relaying this function's result
+  // still classified it at the slot's nullable rep, which the settled non-null result subtypes.
   let nn = 0
   while nn < fnStmts.length {
     const nnFn = nodeAt(fnStmts[nn])
@@ -2990,10 +2898,8 @@ export function computeRetInference() {
     }
     nn = nn + 1
   }
-  // The literal-union atom return, recorded once the kinds have settled. A separate pass and
-  // not an arm inside `criClassify`: that classifier runs to a fixpoint and its arms feed each
-  // other, so a question asked inside it is not free of the loop. It needs no narrowing replay,
-  // and it is a flag rather than an `fRetKind` because both reps are i32 (`fRetLitAtom`).
+  // The literal-union atom return, recorded once the kinds have settled. It needs no narrowing
+  // replay, and it is a flag rather than an `fRetKind` because both reps are i32 (`fRetLitAtom`).
   let la = 0
   while la < fnStmts.length {
     const laFn = nodeAt(fnStmts[la])
