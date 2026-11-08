@@ -8,6 +8,13 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step3-what-stands](2026-11-08-step3-what-stands.md): Step 3: what stands; noSplit deleted, the genFnHole* family is still on master (#6867).
+- [2026-11-08-prebind-generic-fn-instance](2026-11-08-prebind-generic-fn-instance.md): Step 2: monoPreBindArg pins at the call instance's parameter type (#6866).
+- [2026-11-08-payload-compound-residue-records](2026-11-08-payload-compound-residue-records.md): Step 5: payload, ??, break, ?. and compound-assignment records (#6865).
+- [2026-11-08-row-key-fn-set-group](2026-11-08-row-key-fn-set-group.md): A tagged function position keys its row by its set group (#6860, #6864).
+- [2026-11-08-generic-fn-value-pin-reads](2026-11-08-generic-fn-value-pin-reads.md): Step 2: the pin cascade reads the closed signature first (#6863).
+- [2026-11-08-read-side-atom-arm-floors](2026-11-08-read-side-atom-arm-floors.md): Step 5: read-side atom and arm floors on the table (#6861).
+- [2026-11-08-call-key-pin-matched-instance](2026-11-08-call-key-pin-matched-instance.md): Step 2: a build nothing keys binds at its pin-matched instance, hole-mono 46 → 12 (#6859).
 - [2026-11-08-call-key-stored-hole-default](2026-11-08-call-key-stored-hole-default.md): Step 2: a stored hole function's default instance is keyed; hole-mono 112 → 46 (#6857).
 - [2026-11-08-instance-cast-payload-records](2026-11-08-instance-cast-payload-records.md): Step 5: instance operands, casts, payloads and fn-tag arms carry records (#6856).
 - [2026-11-08-step7-classifier-r19](2026-11-08-step7-classifier-r19.md): Step 7 classifier round 19, 68/0/5 (#6854).
