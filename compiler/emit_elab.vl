@@ -129,6 +129,7 @@ import {
   cwFnCalls,
   cwFnValueDeclOf,
   cwFrameOfDecl,
+  cwFramedNode,
   cwIxBuild,
   cwIxKind,
   cwIxNode,
@@ -138,6 +139,7 @@ import {
   cwIxUpKind,
   cwIxWant,
   cwKeyOfDecl,
+  cwKeyOfRoot,
   cwLetUnwritten,
   cwLetWrittenInClosure,
   cwMethodCalls,
@@ -3409,6 +3411,8 @@ function elabSetCallRows(
       i = i + 1
     }
   }
+  // A member instanced here is made where its value is stored, so that value holds the key too.
+  const stored = if byValue && from < 0 { elabCalleeStoredValues(cn.callFn) } else { [] }
   for m in ms {
     const sig = if m >= 0 && m < P.nodes.length { nodeTyIxOf(m) } else { -1 }
     if sig < 0 || sig >= T.tys.length { continue }
@@ -3425,6 +3429,9 @@ function elabSetCallRows(
       const mk = elabEnqueue(m, mn, mt, from)
       elabReachNote(from, mk, -1)
       elabValCallNote(from, ix, mk)
+      for v in stored {
+        if cwFnValueDeclOf(v) == m { elabValueKeyNoteOnce(v, from, mk) }
+      }
       elabValueInstCall(from, ix, mk, openParam)
       elabValueInstViaNote(mk, from, ix)
       elabArgRows(ix, m, mn, mt, from)
@@ -3548,6 +3555,65 @@ function elabPlainCallArgRows(c: i32) {
   const none: string[] = []
   const noTys: i32[] = []
   elabArgRows(c, d, none, noTys, -1)
+}
+
+// A call through a value of closed function type that no row binds, such as an element read
+// of an annotated container, instances each generic or hole function the value may hold at that
+// type's parameters.
+function elabClosedValueCallRows(c: i32) {
+  const cn = nodeAt(c)
+  if !(cn is Call) || elabCallDeclOf(c) >= 0 { return 0 }
+  if !elabClosedFnTy(nodeTyIxOf(cn.callFn)) { return 0 }
+  let open = false
+  for m in elabCalleeTargets(cn.callFn) {
+    const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { cn }
+    if (
+      mn is FuncDecl
+      && mn.fnName != ""
+      && (mn.fnTyParams.length > 0 || elabIsHoleFn(m))
+    ) {
+      open = true
+    }
+  }
+  if !open { return 0 }
+  const none: string[] = []
+  const noTys: i32[] = []
+  elabSetCallRows(c, none, noTys, -1, -1)
+}
+
+// The values stored at the slot callee node `callFn` reads (a field or element of a binding), as
+// the write scan places them; empty where it reads no such slot or a write is not placed.
+function elabCalleeStoredValues(callFn: i32): i32[] {
+  const path: string[] = []
+  const root = cwSlotPath(parenPeelIx(callFn), path)
+  if (
+    root < 0
+    || path.length == 0
+    || !cwFramedNode(root)
+    || cwKeyOfRoot(root) < 0
+  ) {
+    return []
+  }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwBindingOf(root), path, vals, ats) < 0 { return [] }
+  const out: i32[] = []
+  for v in vals {
+    const pv = parenPeelIx(v)
+    if pv >= 0 && pv < P.nodes.length { out.push(pv) }
+  }
+  out
+}
+
+// `elabValueKeyNote` unless value `x` already holds key `k` under `from`.
+function elabValueKeyNoteOnce(x: i32, from: i32, k: i32) {
+  const vs = elabValueKeys[x] ?? []
+  let j = 0
+  while j + 1 < vs.length {
+    if vs[j] == from && vs[j + 1] == k { return 0 }
+    j = j + 2
+  }
+  elabValueKeyNote(x, from, k)
 }
 
 // Whether node `g` delivers a value to a function type it can be instanced at: a `let`
@@ -8960,8 +9026,10 @@ export function elabRun() {
   }
   let r = 0
   const n = callBindCount()
+  const rowed: {[i32]: boolean} = Map()
   while r < n {
     const ix = callBindIxAt(r)
+    rowed[ix] = true
     const tys = elabSetArgBind(ix, callBindNamesAt(r), elabRowTys(r))
     elabSetCallRows(ix, callBindNamesAt(r), tys, -1, -1)
     if elabRowClosedOrSet(tys) {
@@ -9045,6 +9113,9 @@ export function elabRun() {
   // instanced at that parameter's closed function type, as a generic callee's row instances it.
   for c in elabCalls { elabPlainCallArgRows(c) }
   for ad in annDelivs { elabAnnotatedDeliveryRows(ad) }
+  for c in elabCalls {
+    if rowed.get(c) == null { elabClosedValueCallRows(c) }
+  }
   // A nested declaration typed from its context, with nothing to bind, whose body calls a
   // generic is checked as an instance of its own: the call is typed there.
   for nd in elabEncl.keys() {
