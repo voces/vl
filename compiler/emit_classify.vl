@@ -263,7 +263,6 @@ import {
   callMemProp,
   callOriginOf,
   capIsBound,
-  fnLetOfRead,
   isBuiltinFnName,
   litLexIsMember,
   mapShapeFoldSet,
@@ -487,7 +486,6 @@ import {
   variantIndexOf,
 } from "./emit_local_slots"
 import {
-  annIsNulStrListDeep,
   annValtypeSlotOf,
   asgValueIsFunc,
   assignTargetSpills,
@@ -826,7 +824,6 @@ import {
   rlElemTyIxAt,
   rlSlotOfTy,
   sFieldIndex,
-  tyScalarBackedListKind,
 } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
@@ -852,6 +849,7 @@ import {
   nodeRepIn,
   nodeTyInOf,
   pinnedParamTyAt,
+  refListElemKind,
   tyIsNulPrim,
   tySameSet,
   valueJoinArmValues,
@@ -9379,15 +9377,26 @@ function capturedStructIndex(fnIx: i32, name: string) {
   capturedCompanionSlot(fnIx, name)
 }
 
-// The ref-list table slot of a captured ref-array variable, or -1 — `capturedStructIndex`'s
-// sibling on the other index space the companion slot ranges over. The kind gate keeps a
-// ref-list slot out of `sFieldStart` and a struct row out of `rlElemName`, so a captured
-// `S[]` read resolves the same wrapper the env field is typed with.
+// The ref-list table slot of a captured ref-array variable `name` of `fnIx`, a nullable one
+// included, read off the type its parent frame's binding holds; -1 for any other capture and for
+// a captured loop variable.
 export function capturedRefListSlot(fnIx: i32, name: string) {
-  if clsCensusOn { clsCensusEnter("capturedRefListSlot") }
-  const ck = capturedKindOf(fnIx, name)
-  if ck != "reflist" && ck != "nulreflist" { return -1 }
-  capturedCompanionSlot(fnIx, name)
+  if fnIx < 0 { return -1 }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return -1 }
+  const b = parentBindingOf(fe, name)
+  if b < 0 { return -1 }
+  const pf = parentBindingFrameArenaOf(fe, name)
+  const bn = nodeAt(b)
+  let ty = -1
+  if bn is Param {
+    if bn.parType >= 0 { ty = nodeTyInOf(bn.parType, pf) }
+  } else if bn is LetDecl {
+    ty = letBindTy(b, pf)
+  }
+  const k = repSigKindOfTy(ty)
+  if k != "reflist" && k != "nulreflist" { return -1 }
+  repSlotOfKind(k, ty)
 }
 
 // The map shape of a captured nullable-map cell, or -1 when `name` is not such a capture.
@@ -10220,11 +10229,6 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
 
 // True if an index read `e` yields the union box: a union-element ref list's cell or a
 // union-valued map's value. False when the read unboxes a narrowed atom or container.
-// The rep of an element of the list `arr` (in frame `fnIx`), read from its type at this instance.
-export function refListElemKind(arr: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("refListElemKind") }
-  repSigKindOfTy(tyArrayElemIx(nodeTyInOf(arr, fnIx)))
-}
 
 // Whether the elements of the list `arr` (in frame `fnIx`) are value-union boxes, read from its
 // type at this instance.
@@ -12446,29 +12450,19 @@ function refListKeptSlotOfIdent(e: Ident, exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The ref-list ELEMENT type-NAME a ref-list `LetDecl` binds: from its `S[]`/`N[]`
-// annotation if present, else inferred from its initializer (`refListElemNameOfExpr`).
-// "" if not a ref-list local.
+// The element type name of the ref list, a nullable one included, that binding `letIx` holds at
+// `fnIx`, read off its row; "" when it holds no ref list.
 export function letRefListElemName(letIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("letRefListElemName") }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      const lt = nodeAt(d.letType)
-      if lt is TypeRef {
-        // The one site whose else-branch is the initializer path rather than "": an annotation
-        // whose element has no row yet falls through to the initializer's row.
-        const en = annBareRefArrElemName(d.letType)
-        if en != "" { return en }
-      }
-    }
-    return refListElemNameOfExpr(d.letInit, fnIx)
-  }
-  ""
+  const ty = letBindTy(letIx, fnIx)
+  const k = repSigKindOfTy(ty)
+  if k != "reflist" && k != "nulreflist" { return "" }
+  const sl = repSlotOfKind(k, ty)
+  if sl < 0 || sl >= rlElemName.length { return "" }
+  rlElemName[sl]
 }
 
-// The arena element type of the name `letRefListElemName` returns, read from the same source:
-// the annotation's element where that names one, else the initializer's at `fnIx`. -1 else.
+// The arena element type of the ref list binding `letIx` declares: the annotation's element where
+// that names a row, else the initializer's at `fnIx`. -1 else.
 export function letRefListElemTy(letIx: i32, fnIx: i32): i32 {
   if letIx < 0 { return -1 }
   const d = nodeAt(letIx)
@@ -12769,69 +12763,14 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
   exprListRep(exprIx, fnIx) == "strlist"
 }
 
-// True if the expression at `exprIx` produces a `(string | null)[]` — the string-ref niche
-// list, whose backing is a plain string list but whose element read stays `(ref null)`
-// instead of recovering non-null. Recognizes the receiver by its recorded array element
-// type or a param/local annotation. Drives the dedicated read arm, checked before `exprStringArray`.
+// True if `exprIx` at instance `fnIx` is a list of `string | null`, a nullable list included: the
+// string list whose element read stays `(ref null)` rather than recovering non-null. Checked
+// before `exprStringArray`.
 export function exprNulStrArray(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("exprNulStrArray") }
   if exprIx < 0 { return false }
-  if arrElemIsNulStrAt(exprIx, fnIx) { return true }
-  // A list whose recorded element is a hole's variable holds what the instance `fnIx` pins it
-  // to, and at `string | null` a read that recovers non-null traps on the null (D3089).
-  const pe = nodeArrayElemTyIx(exprIx)
-  if pe >= 0 && tyHasTyVar(pe) {
-    if tyIsNulPrim(iterElemPinTy(exprIx, fnIx), "string") { return true }
-  }
-  const e = nodeAt(exprIx)
-  match e {
-    Paren => {
-      return exprNulStrArray(e.parInner, fnIx)
-    }
-    Ident => {
-      const pt = paramTypeNodeOfRead(fnIx, exprIx)
-      if pt >= 0 {
-        // `…Deep` also admits a `(string | null)[] | null` param narrowed with `!= null`: the
-        // narrowed value stays `(ref null)`, since the plain-string arm's recover traps on null.
-        return annIsNulStrListDeep(pt)
-      }
-      // A union binding narrowed to the `(string | null)[]` arm reads unboxed as the
-      // string list whose ELEMENT stays `(ref null)` — the same nullable read discipline.
-      if tyScalarBackedListKind(readNarrowedTyAt(exprIx, fnIx)) == "strlist" {
-        return true
-      }
-      // A local, param or global binding typed
-      // `(string | null)[]` — or `(string | null)[] | null`, narrowed via `t0 != null`.
-      if identBindingNulStrList(exprIx, fnIx) { return true }
-    }
-    // No other expression is a nullable-string list.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  false
-}
-
-// The `exprNulStrArray` binding resolver: whether the binding the read `readIx` names (a
-// `let` of the frame, a parameter, else a module global) is typed a `(string | null)[]` list,
-// directly or under an outer `| null`.
-function identBindingNulStrList(readIx: i32, fnIx: i32): boolean {
-  let bt = -1
-  const li = fnLetOfRead(fnIx, readIx)
-  if li >= 0 {
-    bt = nodeTyAt(li, fnIx)
-  } else {
-    const pt = paramTypeNodeOfRead(fnIx, readIx)
-    if pt >= 0 {
-      bt = nodeTyAt(pt, fnIx)
-    } else {
-      const gl = globalLetOfRead(fnIx, readIx)
-      if gl >= 0 { bt = nodeTyAt(gl, -1) }
-    }
-  }
-  if bt < 0 || bt >= T.tys.length { return false }
-  const et = tyArrayElemIx(nonNullTy(bt))
-  if et < 0 { return false }
-  const rd = repOfTy(et)
-  rd.rdCovered == 1 && rd.rdKind == "nulstr"
+  const ty = nodeTyAt(exprIx, fnIx)
+  if ty < 0 || ty >= T.tys.length { return false }
+  tyIsNulPrim(tyArrayElemIx(nonNullTy(ty)), "string")
 }
 
 // True if `exprIx` evaluates to an `f64[]`: a projection of `exprListRep`.
