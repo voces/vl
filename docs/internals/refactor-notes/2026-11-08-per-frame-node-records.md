@@ -26,8 +26,8 @@ early in `k<f64>`'s clone. The clone was built as invalid wasm.
   `nodeTyRecord` on an overlaid node updates that frame's entry too.
 - Mono sets the frame in `monoWalkFnBody`. The emitter sets it in `emitFuncCode` and clears it for
   the start and init bodies.
-- `monoRecordOpen` records per frame when `monoFrameSharesBody(wf)` (`value_reach.vl`): `wf` is no generic instance,
-  and an ancestor in `fnParent` is a generic (`monoGen`) or a generic instance (`fnInstOrigin`).
+- `monoRecordOpen` records per frame when `monoFrameSharesBody(wf)` (`value_reach.vl`): `wf` is
+  no generic instance, and an ancestor in `fnParent` is a generic (`monoGen`) or a generic instance (`fnInstOrigin`).
 
 The key is the frame (the emitted `FuncDecl`), not the enclosing instance. A lambda clone's
 `fnParent` is the template's (`monoLamParentOf`), so `monoFrameInstTmpl` finds no instance above
@@ -39,7 +39,7 @@ before. Guard (b)'s generic half (PR 3) moves that.
 ## Measured
 
 Base: `claude/slot-rep-identity-3` (`841e82d3`), a fixpoint at 6,496,234 bytes. Candidate: a
-fixpoint at 6,498,633 bytes (+2,399, +0.037%). `scripts/sweep.vl -- diff`: 23,613 same, 0
+fixpoint at 6,498,641 bytes (+2,407, +0.037%). `scripts/sweep.vl -- diff`: 23,613 same, 0
 bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new traps.
 
 With guard (b)'s identity test also removed (PR 2), `lambda-list-join-type-param-pin.vl` runs
