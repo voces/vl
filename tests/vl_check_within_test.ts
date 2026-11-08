@@ -272,7 +272,9 @@ const CASES: Case[] = [
     name: "an importer's push decides an empty list binding's element type",
     graph: {
       "main.vl": 'import { xs } from "./lib"\nxs.push("a")\nprint(xs.length)\n',
-      "lib.vl": "export let xs = []\n",
+      // The read keeps lib's own check refusing the open element, so a check of lib alone
+      // differs from the graph's, where main's push fixes it.
+      "lib.vl": "export let xs = []\nexport function first() { xs[0] }\n",
     },
     target: "lib.vl",
     want: "demand",
