@@ -30,8 +30,9 @@ for f in wasmEmit.vl emit_sections.vl; do
     s/\b(emitUnionBoxArg|emitUnionCoerce|emitUnionBoxAtRecord|emitUnionBoxOwed)\(/$1P("$fn:$.", /g
       unless /function emit(?:UnionBoxArg|UnionCoerce|UnionBoxAtRecord|UnionBoxOwed)\(/;' "$C/$f"
 done
-# A floor (`emitUnionBoxOwed` boxing at the site, the record owing no box) is tagged `floor@<pos>`.
-perl -0 -i -pe 's/(\n  if boxOwedAt\(valIx, fnIx\) \{ return emitDelivered\(body, valIx, fnIx\) \}\n)  (emitUnionBoxArgP\("[^"]*", body, siteNm, siteTy, valIx, fnIx\))\n/$1  const fo = bdsPosEnter("")\n  bdsPosLeave("floor@" + fo)\n  const fr = $2\n  bdsPosLeave(fo)\n  fr\n/' "$C/wasmEmit.vl"
+# A floor (`emitUnionBoxOwed` boxing at the site, the record owing no box) is tagged `floor@<pos>`;
+# its class names why (`boxFloorWhy`), and a table delivery's class is `table`.
+perl -0 -i -pe 's/(\n  if boxOwedAt\(valIx, fnIx\) \{ return emitDelivered\(body, valIx, fnIx\) \}\n  if boxDstShadowArmed\(\) \{ boxDstShadowAs\(boxFloorWhy\(valIx, fnIx\)\) \}\n)  (emitUnionBoxArgP\("[^"]*", body, siteNm, siteTy, valIx, fnIx\))\n/$1  const fo = bdsPosEnter("")\n  bdsPosLeave("floor@" + fo)\n  const fr = $2\n  bdsPosLeave(fo)\n  fr\n/' "$C/wasmEmit.vl"
 W="$C/wasmEmit.vl"
 awk '!done && /^} from "\.\/box_dst_shadow"$/ { print "  bdsPosEnter,"; print "  bdsPosLeave,"; done = 1 } { print }' \
   "$W" > "$W.t" && mv "$W.t" "$W"
@@ -119,7 +120,7 @@ perl -0 -i -pe 's/(\n  nodeBoxTyIx = \[\]\n)/$1  bxwHist = Map()\n/' "$CS"
 perl -0 -i -pe 's/(export function elabCapBegin\(depth: i32\) \{\n)/$1  bxwCap = Map()\n/' "$K"
 F="$C/check_fit_rules.vl"
 perl -0 -i -pe 's/(\n  nodeBoxTyIx,\n)/\n  bxwNoteProg,\n  bxwRole,\n  bxwRoleSet,\n  nodeBoxTyIx,\n/; s/(\} from "\.\/check_elab_cap"\n)/  bxwNote,\n$1/;
-  s/(function boxTyStampOne\(ix: i32, t: i32\): i32 \{\n  if elabCapLive\(\) \{\n    if boxTyKeeps\(elabCapBox\[ix\] \?\? -1, t\) \{ return 1 \}\n    elabCapBox\[ix\] = t\n)/$1    bxwNote(ix, t * 4 + bxwRole, true)\n/;
+  s/(\n    elabCapBox\[ix\] = t\n    elabCapBoxJoin\[ix\] = boxJoinWrite\n)/$1    bxwNote(ix, t * 4 + bxwRole, true)\n/;
   s/(  nodeBoxTyIx\[ix\] = t\n)/$1  bxwNoteProg(ix, t * 4 + bxwRole)\n/;
   s/(  const spine: i32\[\] = \[\]\n  const leaves: i32\[\] = \[\]\n  valueTailSplit\(ix, spine, leaves\)\n  boxTyStamp\(ix, t\)\n  for j in spine \{ boxTyStamp\(j, t\) \}\n  for l in leaves \{ boxTyStamp\(l, t\) \}\n)/  const bxo = bxwRoleSet(1)\n$1  bxwRoleSet(bxo)\n/;
   s/(function boxExitsStamp\(ix: i32, t: i32\): i32 \{\n)(.*?\n)(  0\n\})/$1  const bxo = bxwRoleSet(2)\n$2  bxwRoleSet(bxo)\n$3/s' "$F"
