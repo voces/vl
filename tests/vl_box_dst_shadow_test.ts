@@ -40,7 +40,7 @@ const DROP_READ = 1;
 const DROP_AS_OTHER = 2;
 
 /** Compile `src` on a fresh instance with the shadow armed; the rows by class, summed. */
-const shadow = (src: string, drop: number) => {
+const shadow = (src: string, drop: number, nums = false) => {
   const exp = new WebAssembly.Instance(compiled!, {})
     .exports as unknown as Exports;
   exp.boxDstShadowArm(1);
@@ -54,6 +54,8 @@ const shadow = (src: string, drop: number) => {
     const b = new Uint8Array(exp.boxDstShadowRowLen(i));
     for (let j = 0; j < b.length; j++) b[j] = exp.boxDstShadowRowAt(i, j);
     const k = new TextDecoder().decode(b);
+    // The numeric widenings are graded by their own case below, not in the union tallies.
+    if (k.startsWith("num ") !== nums) continue;
     rows.set(k, (rows.get(k) ?? 0) + exp.boxDstShadowRowN(i));
   }
   return { rc, rows };
@@ -640,3 +642,51 @@ for (const [what, src, want] of NULL_HOLE_LIST_LITS) {
     fn: () => expectRows("nullholelist", src, DROP_NONE, want),
   });
 }
+
+// A numeric widening at an argument and the identity pair at the return: the table serves both at the checker's pair, and both controls
+// turn it into the site's own floor.
+const NUM_SRC = `function w(x: i64): i64 { x }
+const a: i32 = 3
+print(w(a))
+`;
+for (
+  const [drop, want] of [
+    [DROP_NONE, "num table=2"],
+    [DROP_READ, "num floor: no record=2"],
+    [DROP_AS_OTHER, "num floor: dst differs=2"],
+  ] as const
+) {
+  Deno.test({
+    name: `box-dst shadow: an i32 argument widened to i64 (drop ${drop})`,
+    ignore,
+    fn: () => {
+      const { rows } = shadow(NUM_SRC, drop, true);
+      const got = show(rows);
+      if (got !== want) {
+        throw new Error(`num (drop ${drop}):\n  want: ${want}\n  got:  ${got}`);
+      }
+    },
+  });
+}
+
+// An `f64` element of a list literal delivered at an `i32 | f64` row: a later stamp at the union
+// must not hide the element's one-kind pair, so the table still serves it.
+const NUM_HIDDEN = `function g() {
+  const c: (i32 | f64)[][] = [[1, 2.5]]
+  c[0]
+}
+print(g().length)
+`;
+Deno.test({
+  name: "box-dst shadow: a one-kind numeric pair a later union stamp would hide",
+  ignore,
+  fn: () => {
+    const { rc, rows } = shadow(NUM_HIDDEN, DROP_NONE, true);
+    if (rc !== 0) throw new Error(`num hidden: want compileSrc rc 0, got ${rc}`);
+    const got = show(rows);
+    const want = "num table=1";
+    if (got !== want) {
+      throw new Error(`num hidden:\n  want: ${want}\n  got:  ${got}`);
+    }
+  },
+});

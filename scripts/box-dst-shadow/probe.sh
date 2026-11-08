@@ -8,15 +8,27 @@ C="$1"
 B="$C/box_dst_shadow.vl"
 sed -i 's|^import { tyHasTyVar } from "./tyquery"$|&\nimport { elabShadowNote } from "./emit_elab"|;
   s|^let bdsArmed = false$|let bdsArmed = true|;
-  s|^let bdsNamed = false$|let bdsNamed = true\nlet bdsPos = ""|' "$B"
+  s|^let bdsNamed = false$|let bdsNamed = true\nlet bdsPos = ""\nlet bdsNumPos = ""|' "$B"
 awk '/^  bdsCount\(key\)$/ { print; print "  elabShadowNote(\"bds \" + key + \" | pos \" + bdsPos)"; next } { print }' \
   "$B" > "$B.t" && mv "$B.t" "$B"
+perl -0 -i -pe 's/(export function numPairShadowNote.*?\n)(  bdsCount\(key\)\n  elabShadowNote[^\n]*\n)/$1  const npo = bdsPos\n  bdsPos = bdsNumPos\n$2  bdsPos = npo\n/s' "$B"
 cat >> "$B" <<'X'
 
 export function bdsPosEnter(p: string): string {
   const o = bdsPos
   if o == "" { bdsPos = p }
   o
+}
+
+export function bdsPosAt(p: string): string {
+  const o = bdsNumPos
+  bdsNumPos = p
+  o
+}
+
+export function bdsNumPosLeave(o: string) {
+  bdsNumPos = o
+  0
 }
 
 export function bdsPosLeave(o: string) {
@@ -30,11 +42,17 @@ for f in wasmEmit.vl emit_sections.vl; do
     s/\b(emitUnionBoxArg|emitUnionCoerce|emitUnionBoxAtRecord|emitUnionBoxOwed|emitAtomToStr|emitNarrowedArmUnboxTo|armClose)\(/$1P("$fn:$.", /g
       unless /function (?:emit(?:UnionBoxArg|UnionCoerce|UnionBoxAtRecord|UnionBoxOwed|AtomToStr|NarrowedArmUnboxTo)|armClose)\(/;' "$C/$f"
 done
+# The numeric widenings, tagged at the innermost call (a widening's operand widens at its own site).
+for f in wasmEmit.vl emit_sections.vl; do
+  perl -i -pe '
+    $fn = $1 if /^\s*(?:export )?function (\w+)/;
+    s/\b(emitExprAs(?:I64|F64|F32|Kind))\(/$1P("$fn:$.", /g unless /function emitExprAs(?:I64|F64|F32|Kind)\(/ || $fn eq "emitExprAsKind";' "$C/$f"
+done
 # A floor (`emitUnionBoxOwed` boxing at the site, the record owing no box) is tagged `floor@<pos>`;
 # its class names why (`boxFloorWhy`), and a table delivery's class is `table`.
 perl -0 -i -pe 's/(\n  if boxOwedAt\(valIx, fnIx\) \{ return emitDelivered\(body, valIx, fnIx\) \}\n  if boxDstShadowArmed\(\) \{ boxDstShadowAs\(boxFloorWhy\(valIx, fnIx\)\) \}\n)  (emitUnionBoxArgP\("[^"]*", body, siteNm, siteTy, valIx, fnIx\))\n/$1  const fo = bdsPosEnter("")\n  bdsPosLeave("floor@" + fo)\n  const fr = $2\n  bdsPosLeave(fo)\n  fr\n/' "$C/wasmEmit.vl"
 W="$C/wasmEmit.vl"
-awk '!done && /^} from "\.\/box_dst_shadow"$/ { print "  bdsPosEnter,"; print "  bdsPosLeave,"; done = 1 } { print }' \
+awk '!done && /^} from "\.\/box_dst_shadow"$/ { print "  bdsNumPosLeave,"; print "  bdsPosAt,"; print "  bdsPosEnter,"; print "  bdsPosLeave,"; done = 1 } { print }' \
   "$W" > "$W.t" && mv "$W.t" "$W"
 for h in emitUnionBoxArg emitUnionCoerce emitUnionBoxAtRecord emitUnionBoxOwed; do
   cat >> "$W" <<X
@@ -47,6 +65,26 @@ export function ${h}P(pos: string, body: u8[], a: string, b: i32, c: i32, d: i32
 }
 X
 done
+for h in emitExprAsI64 emitExprAsF64 emitExprAsF32; do
+  cat >> "$W" <<X
+
+export function ${h}P(pos: string, body: u8[], a: i32, b: i32): i32 {
+  const o = bdsPosAt(pos)
+  const r = ${h}(body, a, b)
+  bdsNumPosLeave(o)
+  r
+}
+X
+done
+cat >> "$W" <<X
+
+function emitExprAsKindP(pos: string, body: u8[], a: i32, k: i32, b: i32): i32 {
+  const o = bdsPosAt(pos)
+  const r = emitExprAsKind(body, a, k, b)
+  bdsNumPosLeave(o)
+  r
+}
+X
 # The read side: an atom-to-string decode and a narrowed-arm unbox, tagged the same way, graded by
 # `atomSrcShadowNote` / `armSrcShadowNote` against the source and arm records.
 cat >> "$W" <<X
@@ -77,6 +115,8 @@ awk '!done && /^  emitUnionBoxOwed,$/ { print; print "  emitUnionBoxOwedP,"; don
   "$E" > "$E.t" && mv "$E.t" "$E"
 awk '!done && /^  emitAtomToStr,$/ { print; print "  emitAtomToStrP,"; done = 1; next } { print }' \
   "$E" > "$E.t" && mv "$E.t" "$E"
+awk '!done && /^  emitExprAsI64,$/ { print; print "  emitExprAsF32P,"; print "  emitExprAsF64P,"; print "  emitExprAsI64P,"; done = 1; next } { print }' \
+  "$E" > "$E.t" && mv "$E.t" "$E"
 need() { grep -qF -- "$2" "$C/$1" || { echo "probe.sh: anchor for \`$2\` not found in $1; re-anchor" >&2; exit 1; }; }
 need box_dst_shadow.vl 'elabShadowNote("bds '
 need box_dst_shadow.vl 'let bdsArmed = true'
@@ -89,6 +129,10 @@ need emit_sections.vl '  emitAtomToStrP,'
 need wasmEmit.vl 'emitNarrowedArmUnboxToP("'
 need wasmEmit.vl 'emitAtomToStrP("'
 need wasmEmit.vl 'armCloseP("'
+need wasmEmit.vl 'emitExprAsF64P("'
+need box_dst_shadow.vl '  bdsPos = bdsNumPos'
+need emit_sections.vl 'emitExprAsI64P("'
+need emit_sections.vl '  emitExprAsI64P,'
 need emit_sections.vl 'emitUnionBoxOwedP("'
 # --- overwrite history (appended to probe.sh) ---
 K="$C/check_elab_cap.vl"
