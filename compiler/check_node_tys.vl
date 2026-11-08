@@ -98,6 +98,89 @@ export function nodeTyFreeze() {
 export function nodeTyUnfreeze() {
   nodeTyFrozenLen = -1
   nodeTyFrozenOld = Map()
+  nodeTyInst = Map()
+  nodeTyInstOrig = Map()
+  nodeTyInstFrames = Map()
+  nodeTyInstKey = -1
+  nodeTyInstAny = false
+  0
+}
+
+// Types recorded per frame on a node frames share, such as the body of a lambda cloned for each
+// generic instance: node to `[frame, type, ...]`, the node's type before the first such record,
+// and the frames that share nodes. The column keeps the first frame's record.
+let nodeTyInst: {[i32]: i32[]} = Map()
+let nodeTyInstOrig: {[i32]: i32} = Map()
+let nodeTyInstFrames: {[i32]: boolean} = Map()
+let nodeTyInstAny = false
+
+// The frame whose body is being walked or emitted, or -1; `nodeTyIxOf` reads at it.
+let nodeTyInstKey = -1
+
+// Makes `fx` the frame node types are read at, -1 for none; returns the previous one.
+export function nodeTyInstEnter(fx: i32): i32 {
+  const was = nodeTyInstKey
+  nodeTyInstKey = fx
+  was
+}
+
+// Notes frame `fx` as one whose body shares nodes with other frames.
+export function nodeTyInstFrameNote(fx: i32) {
+  if fx >= 0 { nodeTyInstFrames[fx] = true }
+  0
+}
+
+// Whether `fx` is a frame `nodeTyInstFrameNote` noted.
+function nodeTyInstFrameIs(fx: i32): boolean {
+  nodeTyInstFrames.get(fx) ?? false
+}
+
+// Node `ix`'s type in frame `fx`: that frame's record, else, in a sharing frame, the type before
+// any frame recorded one, else the column.
+export function nodeTyIxIn(ix: i32, fx: i32): i32 {
+  if fx >= 0 && ix >= 0 {
+    const rs = nodeTyInst.get(ix) ?? []
+    if rs.length > 0 {
+      let i = 0
+      while i + 1 < rs.length {
+        if rs[i] == fx { return rs[i + 1] }
+        i = i + 2
+      }
+      if nodeTyInstFrameIs(fx) {
+        return nodeTyInstOrig.get(ix) ?? colAt(nodeTyIx, ix)
+      }
+    }
+  }
+  colAt(nodeTyIx, ix)
+}
+
+// Records `ty` as node `ix`'s type in frame `fx`; the column takes it when `fx` is the first frame
+// to record one.
+export function nodeTyRecordIn(fx: i32, ix: i32, ty: i32) {
+  if fx < 0 { return nodeTyRecord(ix, ty) }
+  if ix < 0 || ty < 0 { return 0 }
+  if !nodeTyInstOrig.has(ix) { nodeTyInstOrig[ix] = colAt(nodeTyIx, ix) }
+  nodeTyInstPut(fx, ix, ty)
+  const rs = nodeTyInst.get(ix) ?? []
+  if rs[0] == fx { nodeTyColRecord(ix, ty) }
+  0
+}
+
+// Sets frame `fx`'s entry of node `ix` to `ty`.
+function nodeTyInstPut(fx: i32, ix: i32, ty: i32) {
+  const rs = nodeTyInst.get(ix) ?? []
+  let i = 0
+  while i + 1 < rs.length {
+    if rs[i] == fx {
+      rs[i + 1] = ty
+      return 0
+    }
+    i = i + 2
+  }
+  rs.push(fx)
+  rs.push(ty)
+  nodeTyInst[ix] = rs
+  nodeTyInstAny = true
   0
 }
 
@@ -218,6 +301,15 @@ export function tyCarrySrcReset() {
 // boxed capture's cell is. A negative `ty` records nothing.
 export function nodeTyRecord(dst: i32, ty: i32) {
   if dst < 0 || ty < 0 { return 0 }
+  // A node some frame recorded its own type on takes the record in the frame being read too.
+  if nodeTyInstKey >= 0 && nodeTyInstAny && nodeTyInst.has(dst) {
+    nodeTyInstPut(nodeTyInstKey, dst, ty)
+  }
+  nodeTyColRecord(dst, ty)
+}
+
+// `nodeTyRecord` into the column alone.
+function nodeTyColRecord(dst: i32, ty: i32) {
   while nodeTyIx.length <= dst { nodeTyIx.push(-1) }
   nodeTySet(dst, ty)
   0
@@ -240,7 +332,12 @@ export function colAt(col: i32[], i: i32): i32 {
 // The resolved type-arena index the checker recorded for AST node `ix`, or -1 if none (an
 // emitter-synthesized node, or a node never checked). The emitter reads the `Ty` at this
 // index to lower the node by its checked type rather than re-deriving it syntactically.
-export function nodeTyIxOf(ix: i32) { colAt(nodeTyIx, ix) }
+export function nodeTyIxOf(ix: i32) {
+  if nodeTyInstKey >= 0 && nodeTyInstAny {
+    return nodeTyIxIn(ix, nodeTyInstKey)
+  }
+  colAt(nodeTyIx, ix)
+}
 
 // The primitive-type name the checker recorded for node `ix` — `T.tys[nodeTyIx[ix]]`'s
 // `primName` when it resolved to a `TyPrim`, else "". A structural query over the `Ty` arena,
