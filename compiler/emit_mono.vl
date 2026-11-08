@@ -590,7 +590,6 @@ import {
   fnIndexOfAt,
   fnIndexOfNode,
   fnRetExprOfChecked,
-  fnSigKeyOf,
   globalLetOfRead,
   identClosureFeOfRead,
   identFnTypeAnnNameOfRead,
@@ -600,7 +599,7 @@ import {
   litRetArmRow,
   spreadLitSrcRowName,
 } from "./emit_classify"
-import { cloRetTypeName, exprIsBool } from "./emit_closure_sites"
+import { exprIsBool } from "./emit_closure_sites"
 import {
   bodyLetReadAtSid,
   listUnionSharedRep,
@@ -957,8 +956,12 @@ function monoArgFnTypeName(argIx: i32, fnIx: i32) {
       }
       i = i + 1
     }
-    const rn = cloRetTypeName(fe)
+    // Only a declared result names the instance's; an inferred kind is the template's.
+    if fn.fnRet < 0 { return "" }
+    let rn = tyNameOf(fn.fnRet)
     if rn == "" { return "" }
+    // A declared `never` result lowers as `void` (D1972).
+    if rn == "never" { rn = "void" }
     return nm + ")=>" + rn
   }
   ""
@@ -2499,20 +2502,28 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32, tyOut: i32[]) {
     cloArg = exprIsClosure(ix, fnIx)
   }
   if cloArg || nodeTyIsFunc(cax) || cloPinTy >= 0 {
-    // A function-value argument pins its param as a closure (kind 14). The pinned name
-    // carries the callee's `$fnsig` key so the instance's value-call ref-casts to the
-    // exact signature.
-    if cax >= 0 && !valRead {
-      const ce = nodeAt(cax)
-      if ce is Ident {
-        // Scope-aware: a per-pin clone shares its template's NAME, so the flat map answers the
-        // template's signature in every instance and one pin key serves them all (D1795).
-        let cfe = fnIndexOfInScopeAt(sidOfNode(cax), ce.identName, fnIx, cax)
-        if cfe < 0 { cfe = fnIndexOfAt(sidOfNode(cax), fnIx, cax) }
-        if cfe >= 0 {
-          const ck = fnSigKeyOf(cfe)
-          if ck != "" { return "=>" + ck }
-        }
+    // A function-value argument pins its param as a closure (kind 14) at a named function's
+    // declared `$fnsig` key, so the instance's value-call ref-casts to the exact signature. A
+    // generic one has no one signature the call fixes, so it is refused at the read.
+    const ce = if cax >= 0 && !valRead { nodeAt(cax) } else { nodeAt(0) }
+    if cax >= 0 && !valRead && ce is Ident {
+      let cfe = fnIndexOfInScopeAt(sidOfNode(cax), ce.identName, fnIx, cax)
+      if cfe < 0 { cfe = fnIndexOfAt(sidOfNode(cax), fnIx, cax) }
+      const dt = if cfe >= 0 && cfe < fnStmts.length { nodeTyIxOf(fnStmts[cfe]) } else { -1 }
+      if (
+        cfe >= 0
+        && (cfe < monoGen.length && monoGen[cfe] == 1 || dt < 0 || tyHasTyVar(dt))
+      ) {
+        emitFailAt(
+          "emitProgram: a generic function taken as a value reaches no call that fixes its type "
+            + "— annotate the destination's function type",
+          cax,
+        )
+        return ""
+      }
+      if dt >= 0 && tyAt(dt) is TyFunc {
+        const k = sigKeyOfTy(dt)
+        if k != "" { return "=>" + k }
       }
     }
     // Any other function value is the loud floor: it must not fall through to the i32 catch-all.
@@ -21466,6 +21477,11 @@ function monoPinTyParamComposite(
   // The argument's own function-type name, where the slot's binding above names none: a generic
   // function value takes the type the call binds, not its template's.
   if annIsFn && anC == "" { anC = monoArgFnTypeName(args[i], ctx) }
+  // Else the closed parameter type the call key binds; a list read takes it in the arm below.
+  if annIsFn && anC == "" && !(nodeAt(unwrapParen(args[i])) is Index) {
+    const kpt = elabCallParamTy(monoCallTplOf(callIx), i)
+    if monoTyClosedFn(kpt) { anC = monoPinAnnSpelling(kpt) }
+  }
   if !annIsFn && anC == "" {
     anC = monoArgPinName(args[i], ctx, [0 - 1])
     // An anonymous row's `#anonN` has no fields to match the pattern against;
