@@ -76,6 +76,8 @@ import {
   CW_OCC_USE,
   CW_UP_ARG,
   cwBindingWrittenValues,
+  cwCalleeDeclOf,
+  cwFnCalls,
   cwIxBuild,
   cwIxCovers,
   cwIxKind,
@@ -97,7 +99,7 @@ import {
 import { valueTailSplit } from "./check_num_adopt"
 import { collectRetValues } from "./check_nj_join"
 import { rcwInferredRetTy } from "./check_rcw"
-import { tErr, widenLitTy } from "./check_relate_core"
+import { holeSlotCallRets, tErr, widenLitTy } from "./check_relate_core"
 import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
 import {
   T,
@@ -564,6 +566,43 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     const t = recAsgFnWidenedTy(l)
     if t >= 0 { recLitFnFieldsRestamp(l, t) }
   }
+  // A record literal a call returns into a whole holder is built at the holder's rep (D15562).
+  let w = 0
+  while w < ftWrittenRets.length {
+    const d = ftWrittenRetDst[w]
+    const held = fnTagHeldRepOf(d)
+    recLitFnFieldsRestamp(
+      ftWrittenRets[w],
+      if held >= 0 { held } else { nodeTyIxOf(d) },
+    )
+    w = w + 1
+  }
+  0
+}
+
+// Notes the record literals call `v` returns as written whole into the binding `x` reads,
+// where `v` is the callee's only call, so no other caller reads them at their own record.
+function ftWrittenCallNote(x: i32, v: i32) {
+  const d = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+  const c = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
+  if d < 0 || !(nodeAt(d) is LetDecl) || !(c is Call) { return 0 }
+  const fx = cwCalleeDeclOf(c.callFn)
+  const calls: i32[] = []
+  if fx >= 0 { cwFnCalls(fx, calls) }
+  const rv: i32[] = []
+  if calls.length != 1 || !holeSlotCallRets(c, rv) { return 0 }
+  for r in rv {
+    const l = parenPeelIx(r)
+    if (
+      l >= 0
+      && l < P.nodes.length
+      && nodeAt(l) is ObjLit
+      && !i32ListHas(ftWrittenRets, l)
+    ) {
+      ftWrittenRets.push(l)
+      ftWrittenRetDst.push(d)
+    }
+  }
   0
 }
 
@@ -596,9 +635,14 @@ let ftPlHeld: i32[][] = []
 let ftHeldCur: i32[] = []
 // The record literals the plans write into a holder's slot or push onto one.
 let ftWrittenLits: i32[] = []
+// The record literals a call returns into a whole holder, and each holder's declaration.
+let ftWrittenRets: i32[] = []
+let ftWrittenRetDst: i32[] = []
 
 function ftPlReset() {
   ftWrittenLits = []
+  ftWrittenRets = []
+  ftWrittenRetDst = []
   ftPlS = []
   ftPlLeaves = []
   ftPlIds = []
@@ -1471,6 +1515,7 @@ function ftScan(
       }
       if ftHolds(x, s) && rw is BinExpr && ftIsStore(rw) && rw.binLeft == x {
         ftWrittenNote(parenPeelIx(rw.binRight))
+        ftWrittenCallNote(x, parenPeelIx(rw.binRight))
       }
       // A written slot of a holder of the set's ids stores an id of it, whatever type the slot
       // read had before the holder's first write pinned it.
@@ -4184,6 +4229,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         || ftFnBodyTail(p, x, fn) && rcwInferredRetTy(fn) == tx
         || ftFnBodyTail(p, x, fn) && ftRetVoid(fn)
         || ftArmTail(p, x, g) && ftHoldsDecided(g, s)
+        || ftLoopBodyStmt(p, x, g)
     }
     // A container slot of the holder's type is a holder of holders, which `ftHoldKind` names.
     ArrayLit => {
@@ -4425,21 +4471,45 @@ function ftSetDecidedWith(o: i32, s: i32): boolean {
   o >= 0 && i32ListHas(ftAssume, o) && ftSetWithin(s, o)
 }
 
-// Whether `a` and `b` are lists nested to one depth, `b`'s function leaf carrying set `s` and
-// `a`'s that set or one decided with it, or whose records store alike and hold a decided set.
+// Whether set `o` is a set other than `s` within it, noting it for the decision in progress.
+function ftSubsetNote(o: i32, s: i32): boolean {
+  if o < 0 || o == s || !ftSetWithin(o, s) { return false }
+  if !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
+  true
+}
+
+// Notes each set within `s` other than it that a function inside type `t` carries, as
+// `ftSubsetNote` does; true, so it can close a test.
+function ftSubsetsNoteIn(t: i32, s: i32, depth: i32): boolean {
+  const o = if t >= 0 && t < T.tys.length && depth > 0 { T.tys[t] } else { null }
+  if o is TyFunc { ftSubsetNote(fnTagSetOfTy(t), s) }
+  if o is TyArray { ftSubsetsNoteIn(o.aElem, s, depth - 1) }
+  if o is TyObj {
+    for f in o.objFieldTypes { ftSubsetsNoteIn(f, s, depth - 1) }
+  }
+  true
+}
+
+// Whether `a` and `b` are lists nested to one depth whose function leaves store alike: `b`'s
+// carrying set `s` and `a`'s that set or one decided with it, or `a`'s carrying `s` and `b`'s a
+// set within it, which is then decided with `s`; or whose records store alike and hold a decided set.
 function ftListLeavesOfSet(a: i32, b: i32, s: i32, depth: i32): boolean {
   const ao = if a >= 0 && a < T.tys.length { T.tys[a] } else { null }
   const bo = if b >= 0 && b < T.tys.length { T.tys[b] } else { null }
   if !(ao is TyArray) || !(bo is TyArray) || depth <= 0 { return false }
   const ae = if ao.aElem >= 0 && ao.aElem < T.tys.length { T.tys[ao.aElem] } else { null }
   const be = if bo.aElem >= 0 && bo.aElem < T.tys.length { T.tys[bo.aElem] } else { null }
+  // A flat list of functions is its own type's or a decided set's (`ftHoldsDecided`).
   if ae is TyFunc && be is TyFunc {
-    return fnTagSetOfTy(bo.aElem) == s
-      && ftSetDecidedWith(fnTagSetOfTy(ao.aElem), s)
+    if depth == FT_HOLD_DEPTH { return false }
+    const as = fnTagSetOfTy(ao.aElem)
+    const bs = fnTagSetOfTy(bo.aElem)
+    return bs == s && ftSetDecidedWith(as, s) || as == s && ftSubsetNote(bs, s)
   }
   if ae is TyObj && be is TyObj {
     return fieldStorageEq(ao.aElem, bo.aElem, REC_STORE_DEPTH)
       && ftTyHoldsDecided(ao.aElem, s)
+      && ftSubsetsNoteIn(bo.aElem, s, FT_HOLD_DEPTH)
   }
   ftListLeavesOfSet(ao.aElem, bo.aElem, s, depth - 1)
 }
@@ -4451,6 +4521,17 @@ function ftStmtDiscarded(b: i32, x: i32): boolean {
     && bn.blkStmts.length > 0
     && bn.blkStmts[bn.blkStmts.length - 1] != x
     && i32ListHas(bn.blkStmts, x)
+}
+
+// Whether `x` is a statement of block `b`, the body of loop `g`, whose value is discarded.
+function ftLoopBodyStmt(b: i32, x: i32, g: i32): boolean {
+  const bn = nodeAt(b)
+  const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { null }
+  bn is Block
+    && i32ListHas(bn.blkStmts, x)
+    && (gn is ForIn && gn.fiBody == b
+    || gn is ForRange && gn.frBody == b
+    || gn is WhileStmt && gn.whileBlk == 0 && gn.whileBody == b)
 }
 
 // Whether `x` is the last statement of block `b`, an arm of the `if` or `match` `g`.
