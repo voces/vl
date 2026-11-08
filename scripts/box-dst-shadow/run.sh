@@ -1,7 +1,7 @@
 #!/bin/bash
 # The box-destination shadow over the sweep population (box_dst_shadow.vl).
 #
-#   scripts/box-dst-shadow/run.sh [--seed S] [--out F]
+#   scripts/box-dst-shadow/run.sh [--seed S] [--out F] [--read]
 #
 # Builds a probe compiler from a copy of compiler/ (probe.sh: the shadow armed, every
 # emitUnionBoxArg / emitUnionCoerce / emitUnionBoxAtRecord call tagged with its function and line),
@@ -13,9 +13,10 @@
 # checkout root.
 set -euo pipefail
 R="$PWD"; VL="${VL:-$R/scripts/vl-host/target/release/vl}"; SEED="$R/build/vl-compiler.wasm"
-OUT=box-dst-shadow.tsv; JOBS="${JOBS:-4}"
+OUT=box-dst-shadow.tsv; JOBS="${JOBS:-4}"; READ=""
 while [ $# -gt 0 ]; do
-  case "$1" in --seed) SEED="$2"; shift 2 ;; --out) OUT="$2"; shift 2 ;; *) echo "usage: $0 [--seed S] [--out F]"; exit 2 ;; esac
+  case "$1" in --seed) SEED="$2"; shift 2 ;; --out) OUT="$2"; shift 2 ;; --read) READ=1; shift ;;
+    *) echo "usage: $0 [--seed S] [--out F] [--read]"; exit 2 ;; esac
 done
 T="$(mktemp -d "${TMPDIR:-/tmp}/box-dst-shadow.XXXXXX")"
 trap 'rm -rf "${T:?}"' EXIT
@@ -37,10 +38,16 @@ ls "$T"/c.* | xargs -P "$JOBS" -I{} sh -c 'VL_LATE_DEMANDS=1 VL_STD="$R/std" tim
   | grep "demand bds" > {}.out || true'
 cat "$T"/c.*.out | sed 's/^\[late\] //; s/: demand bds /\t/' > "$OUT"
 echo "$(wc -l < "$OUT") deliveries in $OUT"
-awk -F'\t' '$2 !~ /^nested/ && $2 !~ /^(agree|value already|value never|table|floor:)/ {
+awk -F'\t' '$2 !~ /^nested/ && $2 !~ /^(agree|value already|value never|table|floor:|atom |arm )/ {
   n = split($2, a, " [|] "); p = a[n]; sub(/^pos /, "", p)
   k = a[1] " | " p " | " a[3] " | " a[4]; c[k]++; if (!(k in w)) w[k] = $1 }
   END { for (k in c) print c[k] "\t" k "\t" w[k] }' "$OUT" | sort -t$'\t' -k2
+# The read side: each atom-to-string decode and narrowed-arm unbox against its source or arm
+# record, by family, class and position, with a witness; `--read` prints the unions or heaps too.
+awk -F'\t' -v D="$READ" '$2 ~ /^(atom|arm) / {
+  n = split($2, a, " [|] "); p = a[n]; sub(/^pos /, "", p)
+  k = a[1] " | " p; if (D != "") k = k " | " a[2] " | " a[3]; c[k]++; if (!(k in w)) w[k] = $1 }
+  END { for (k in c) print "read\t" c[k] "\t" k "\t" w[k] }' "$OUT" | sort -t$'\t' -k3
 # A position the table serves (`emitUnionBoxOwed`) is graded by the sweep, not here: its rows are
 # `table` or a named floor, and a floor that floors.tsv does not list for its position fails.
 awk -F'\t' -v L="$R/scripts/box-dst-shadow/floors.tsv" '
