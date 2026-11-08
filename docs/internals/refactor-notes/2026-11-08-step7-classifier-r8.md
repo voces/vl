@@ -57,6 +57,6 @@ at about ten sites in five files (`sFieldTypes`/`armStageTypes`), so recording a
 there is its own PR.
 
 **Proof.** Both seeds are fixpoints. On master `2150af91` the base is 6,509,473 bytes and the
-candidate 6,507,662 (−1,811). The sweep compared them over 23,628 programs: 23,628 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new
-traps.
-Export budget: 0 dead exports.
+candidate 6,507,662 (−1,811). The sweep compared them over 23,628 programs:
+23,628 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new traps. Export budget:
+0 dead exports.
