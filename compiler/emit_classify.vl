@@ -9320,17 +9320,6 @@ export function capturedKindOf(fnIx: i32, name: string): VKind | null {
   null
 }
 
-// Whether the lifted function `fnIx` captures `name`.
-function fnCapturesName(fnIx: i32, name: string): boolean {
-  if fnIx < 0 || !fnNestUsed { return false }
-  const fe = fnStmtsPosOf(fnIx)
-  if fe < 0 { return false }
-  for c in captureNamesOf(fe) {
-    if c == name { return true }
-  }
-  false
-}
-
 // The union member-set NAME of a CAPTURED union-box variable `name` (kind 4) of the capturing
 // function `fnIx` — resolved from the PARENT frame's binding annotation / init, so `a is Cat`
 // narrows a captured `a: Cat | Dog`. "" when `name` is not a captured union. The union-name
@@ -14096,14 +14085,23 @@ export function letIsF64(letIx: i32, fnIx: i32) {
   false
 }
 
-// Does the read `readIx` denote a live binding holding a closure in frame `fnIx` — a narrowed arm, a
-// closure-typed param, a nullable one, a CAPTURE, or a `let`/`const` whose cell is a
-// closure? The rungs of `exprIsClosure`'s `Ident` arm that read a binding, asked without
-// the module-function rung above them, so a call site can let the binding win (D1602).
+// Does the read `readIx` denote a live binding holding a closure in frame `fnIx`? The binding
+// rungs of `exprIsClosure`'s `Ident` arm, without its module-function rung (D1602). Before mono,
+// the read's checked type at the binding it denotes, where no inference hole is left open.
 export function identIsBoundClosure(readIx: i32, fnIx: i32): boolean {
-  if clsCensusOn { clsCensusEnter("identIsBoundClosure") }
   if readIx < 0 { return false }
   if narrowedFnTyOf(readIx, fnIx) >= 0 { return true }
+  if !emitPhaseReached("monomorphized") {
+    if identBindingOfRead(fnIx, readIx) < 0 { return false }
+    const t = nodeTyInOf(readIx, fnIx)
+    return tyIsFuncOrNulFunc(t) && !tyHasInferHole(t, 0)
+  }
+  identIsBoundClosureGo(readIx, fnIx)
+}
+
+// `identIsBoundClosure` after mono, from the frame's locals and captures.
+function identIsBoundClosureGo(readIx: i32, fnIx: i32): boolean {
+  if clsCensusOn { clsCensusEnter("identIsBoundClosure") }
   const rn = nodeAt(readIx)
   const name = if rn is Ident { rn.identName } else { "" }
   if paramIsClosure(fnIx, readIx) { return true }
@@ -14116,14 +14114,8 @@ export function identIsBoundClosure(readIx: i32, fnIx: i32): boolean {
   // closure binding like any other, and `captureValKind` — which typed that env field — is
   // what says so, the channel `exprNulClosure` already asks for the nullable half. Below
   // the local rungs, so a same-named local of the frame still shadows it (D1608).
-  if !emitPhaseReached("monomorphized") {
-    if fnCapturesName(fnIx, name) {
-      return tyIsFuncOrNulFunc(nodeTyAt(readIx, fnIx))
-    }
-  } else {
-    const capK = capturedKindOf(fnIx, name)
-    if capK != null { return capK == "closure" || capK == "nulclosure" }
-  }
+  const capK = capturedKindOf(fnIx, name)
+  if capK != null { return capK == "closure" || capK == "nulclosure" }
   // The arena rung, for a pass that runs before `buildLocals` fills the registry — a binding
   // declared directly in the frame body covers every call in it, a nested-block one does not.
   if fnIx < 0 || fnIndexOf(name) < 0 { return false }
