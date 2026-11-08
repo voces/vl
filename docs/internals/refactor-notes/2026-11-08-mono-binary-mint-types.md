@@ -8,7 +8,7 @@ and recorded nothing.
 
 ## Change
 
-The three sites now share `monoRemintBin`, which re-makes the node and then calls
+The three sites now re-make the node and then call
 `nodeSrcNote` and `nodeTyCarry` from the node it replaces. This is the pattern the
 neighbouring mints already use (`monoRemintCompound`, `monoRemakeListLitTpl`). The copy keeps
 the operator, so it has the same checked type. `exprIsStrConcat` now reads only
@@ -54,6 +54,6 @@ template's. The rest spread over about ten sites, some of them in the hole-bindi
 ## Proof
 
 Both seeds are fixpoints. Base (master `2ec34b26`) is 6,531,436 bytes and the candidate is
-6,531,283 (−153). The sweep over 23,679 programs: 23,679 same, 0 bytes-only, 0 output movers,
+6,531,318 (−118). The sweep over 23,679 programs: 23,679 same, 0 bytes-only, 0 output movers,
 0 `runs → not-runs`, 0 new traps. The export budget is at or below its baseline. No column was
 added.
