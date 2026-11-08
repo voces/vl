@@ -150,15 +150,15 @@ Deno.test({
   },
 });
 
-// A refusal raised while a hole parameter's instance is lowered (D15567, D15010's witness plus a
-// slot write, since D15010's spelling and D15529's push run): the instance's body is rebuilt into nodes minted after
-// parsing, and the anchor is the line they were rebuilt from, line 7 inside `take`, in the module
-// that declares it (D15155, D15157). The same shapes with `use` generic.
+// A refusal raised while a hole parameter's instance is lowered (D15568, D15010's witness plus a
+// slot write of a second parameter, since D15529's push and D15567's own-parameter write run): the
+// instance's body is rebuilt into nodes minted after parsing, and the anchor is the line they were
+// rebuilt from, line 7 inside `take`, in the module that declares it (D15155, D15157). The same shapes with `use` generic.
 const INSTANCE_WITNESS = `function id<T>(x: T): T { x }
 function use(ys) { print(ys.length) }
-function take(a) {
+function take(a, b) {
   const xs = [a]
-  xs[0] = a
+  xs[0] = b
   use(xs)
   print(xs[0]("abc").length + xs[0](2))
 }
@@ -174,25 +174,31 @@ Deno.test({
       "function use<T>(ys: T[])",
     );
     const shapes: { name: string; lib: string; main: string | null }[] = [
-      { name: "one file", lib: INSTANCE_WITNESS + "take(id)\n", main: null },
+      {
+        name: "one file",
+        lib: INSTANCE_WITNESS + "take(id, id)\n",
+        main: null,
+      },
       {
         name: "a function after it",
-        lib: INSTANCE_WITNESS + "take(id)\nexport function one(): i32 { 1 }\n",
+        lib: INSTANCE_WITNESS +
+          "take(id, id)\nexport function one(): i32 { 1 }\n",
         main: null,
       },
       {
         name: "a wrapper call",
-        lib: INSTANCE_WITNESS + "function run() { take(id) }\nrun()\n",
+        lib: INSTANCE_WITNESS + "function run() { take(id, id) }\nrun()\n",
         main: null,
       },
       {
         name: "imported, at the module's top level",
-        lib: INSTANCE_WITNESS + "take(id)\nexport function one(): i32 { 1 }\n",
+        lib: INSTANCE_WITNESS +
+          "take(id, id)\nexport function one(): i32 { 1 }\n",
         main: 'import { one } from "./lib"\nprint(one())\n',
       },
       {
         name: "imported, a generic instance",
-        lib: generic + "export function run() { take(id) }\n",
+        lib: generic + "export function run() { take(id, id) }\n",
         main: 'import { run } from "./lib"\nrun()\n',
       },
     ];
@@ -208,7 +214,7 @@ Deno.test({
         if (!r.out.includes("emit error")) {
           throw new Error(
             `${s.name}: the instance witness no longer reaches an emit refusal, so this guard ` +
-              `is measuring nothing — replace INSTANCE_WITNESS (D15567 closed?).\n${r.out}`,
+              `is measuring nothing — replace INSTANCE_WITNESS (D15568 closed?).\n${r.out}`,
           );
         }
         const blk = errorBlock(r.out);
@@ -225,18 +231,26 @@ Deno.test({
 });
 
 // A refusal raised before any body is lowered (D15154): a `monomorphize:` refusal is anchored at
-// the call being instantiated, line 8. The collect phase has no known check-clean refusal left
-// (D15150, the last, now runs); add the next one found here, anchored at its declaration. The
-// instance case above is the restore's control: `take(id)` is instantiated before `take`'s body
-// refuses, and a cursor left armed would name the call instead of `take`.
-const MONO_WITNESS = `function id<T>(x: T): T { x }
-function use<T>(ys: T[]) { print(ys.length) }
-function take<T>(a: T) {
-  const xs = [a]
-  use(xs)
-  print(xs[0]("abc").length + xs[0](2))
+// the call being instantiated, line 10 (D14843's witness, since a generic `use<T>(ys: T[])` handed
+// the list runs). The collect phase has no known check-clean refusal left (D15150, the last, now
+// runs); add the next one found here, anchored at its declaration. The instance case above is the
+// restore's control: `take(id, id)` is instantiated before `take`'s body refuses, and a cursor left
+// armed would name the call instead of `take`.
+const MONO_WITNESS = `function add(a, b) { return a + b }
+function mul(a, b) { return a * b }
+function apply2(g) {
+  print(g(1, 2))
+  print(g(1.5, 2.5))
 }
-take(id)
+function run(h) {
+  let hh = h
+  function inner() {
+    for f in [apply2] { f(hh) }
+  }
+  inner()
+}
+run(add)
+run(mul)
 `;
 
 Deno.test({
@@ -245,7 +259,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const cases: { name: string; src: string; line: number }[] = [
-      { name: "monomorphize", src: MONO_WITNESS, line: 8 },
+      { name: "monomorphize", src: MONO_WITNESS, line: 10 },
     ];
     for (const c of cases) {
       const dir = await Deno.makeTempDir({ prefix: "vl_emit_early_" });
