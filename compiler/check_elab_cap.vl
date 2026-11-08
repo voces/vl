@@ -1258,7 +1258,7 @@ function elabListLeafIsFn(t: i32, depth: i32): boolean {
 }
 
 // `elabFnJoinDeepTy` at `j`, `shape` saying what holds it: 0 nothing, 1 a list, 2 a record in
-// a list.
+// a list, 3 a list in a record in a list.
 function elabFnJoinDeepAt(j: i32, a: i32, b: i32, depth: i32, shape: i32): i32 {
   if (
     depth > 6
@@ -1279,17 +1279,24 @@ function elabFnJoinDeepAt(j: i32, a: i32, b: i32, depth: i32, shape: i32): i32 {
       return elabFnJoinTy(j, a, b)
     }
     TyArray => {
-      if !(at is TyArray) || !(bt is TyArray) || shape == 2 { return j }
-      const ne = elabFnJoinDeepAt(jt.aElem, at.aElem, bt.aElem, depth + 1, 1)
+      if !(at is TyArray) || !(bt is TyArray) || shape == 3 { return j }
+      const ne = elabFnJoinDeepAt(
+        jt.aElem,
+        at.aElem,
+        bt.aElem,
+        depth + 1,
+        if shape == 2 { 3 } else { 1 },
+      )
       return if ne == jt.aElem { j } else { mkArrayTy(ne) }
     }
     TyObj => {
-      if !(at is TyObj) || !(bt is TyObj) { return j }
+      if !(at is TyObj) || !(bt is TyObj) || shape == 3 { return j }
       const n = jt.objFieldNames.length
       if at.objFieldNames.length != n || bt.objFieldNames.length != n {
         return j
       }
       const tys: i32[] = []
+      const fs = if shape < 1 { 0 } else { 2 }
       let changed = false
       let i = 0
       while i < n {
@@ -1301,7 +1308,7 @@ function elabFnJoinDeepAt(j: i32, a: i32, b: i32, depth: i32, shape: i32): i32 {
           at.objFieldTypes[i],
           bt.objFieldTypes[i],
           depth + 1,
-          if shape >= 1 { 2 } else { 0 },
+          fs,
         )
         if w != f { changed = true }
         tys.push(w)
@@ -3484,6 +3491,25 @@ export function fnTagMark(s: i32, leaves: i32[], ids: i32[]) {
   0
 }
 
+// Marks `ix`, a read of member declaration `d`, as a leaf of the tagged set function type `t`
+// carries, so a literal built at a joined result emits `d`'s id there (D15226); false when `t`
+// is untagged or `d` is no member.
+export function fnTagLeafJoin(ix: i32, d: i32, t: i32): boolean {
+  const s = if t >= 0 { elabFnSetTy[t] ?? -1 } else { -1 }
+  if (
+    ix < 0
+    || d < 0
+    || s < 0
+    || !(fnTagged[s] ?? false)
+    || !i32ListHas(fnTagMembers(s), d)
+  ) {
+    return false
+  }
+  fnTagLeaf[ix] = d
+  fnTagLeafSet[ix] = s
+  true
+}
+
 // Gives `copy`, a lifted instance of the lambda at `orig`, the id leaf `orig` emits.
 export function fnTagLeafCarry(copy: i32, orig: i32) {
   const id = fnTagLeafId(orig)
@@ -3531,9 +3557,19 @@ export function fnTagUndecide() {
   0
 }
 
+// The literals a joined result's build moved to another rep, so collect mints each one's row
+// from the literal (D15226).
+let elabRestamped: {[i32]: boolean} = Map()
+
+export function elabRestampNote(x: i32) { elabRestamped[x] = true }
+
+// Whether the joined result's build moved literal `x` (`elabRestampNote`).
+export function elabRestampedAt(x: i32): boolean { elabRestamped[x] ?? false }
+
 // Clears every per-program elaboration table; a compile's rounds each start from none.
 export function elabCapReset() {
   elabCapOn = false
+  elabRestamped = Map()
   fvaListCopyReset()
   etcMemo = Map()
   etcN = 0

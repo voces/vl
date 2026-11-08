@@ -8,6 +8,9 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-read-side-table-kinds](2026-11-08-read-side-table-kinds.md): The read side reads the table: `unbox` and `atomstr` kinds (#6819).
+- [2026-11-08-step7-field-index-mint-slots](2026-11-08-step7-field-index-mint-slots.md): Step 7: field, index and list-literal reads take their storage row (#6818).
+- [2026-11-08-step7-classifier-r12](2026-11-08-step7-classifier-r12.md): Step 7 classifier round 12, the post-only shadows (#6817).
 - [2026-11-08-step7-cloret-slot-typed](2026-11-08-step7-cloret-slot-typed.md): Step 7: `cloRetValSlot` one typed reader (#6814).
 - [2026-11-08-call-key-held-generics-landed](2026-11-08-call-key-held-generics-landed.md): Step 2: held generics keyed, lambdas through a held member keyed (#6813).
 - [2026-11-08-step7-lit-call-row-slots](2026-11-08-step7-lit-call-row-slots.md): Step 7: list literal and call reads take their rungs' row slot (#6812).

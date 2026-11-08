@@ -1,5 +1,5 @@
 import { unRowOfTyKey } from "./emit_union_tykey"
-import { constBindsLitSet } from "./check_leaf_steps"
+import { constBindsLitSet, forInBindTy } from "./check_leaf_steps"
 import { bundleCallSig } from "./emit_bundle"
 import { clsCensusEnter, clsCensusOn, clsCensusReset } from "./emit_cls_census"
 
@@ -625,7 +625,6 @@ import {
   mapFindShapeOfNodeTy,
   mapNodeValKindLowerable,
   mvInnerMapShape,
-  mvSlotNullable,
   mvSlotOfMapNameTy,
   mvValStructIdxOf,
   mvValVariantOf,
@@ -639,7 +638,6 @@ import {
   rlElemVariantRow,
   rlRowTyOfElem,
   rlSlotByName,
-  rlSlotByNameTwin,
   rlSlotOfRowTy,
   rlSlotOfTyOrTwin,
   sFieldMapShape,
@@ -671,7 +669,6 @@ import {
   identBindingOfRead,
   identFnTypeAnnNodeOfRead,
   letAnnIsUnion,
-  mvNulListValKind,
   outerFrameBinds,
   paramStructIndex,
   readPosIn,
@@ -852,6 +849,7 @@ import {
   nodeRepIn,
   nodeTyInOf,
   pinnedParamTyAt,
+  readContainerTyAt,
   refListElemKind,
   tyIsNulPrim,
   tySameSet,
@@ -5893,71 +5891,21 @@ export function forInMapValsSlot(iterIx: i32, fnIx: i32) {
   sl
 }
 
-// The kind a map's VALUE binds at, for both spellings that walk one: `for v in m.values()`
-// and the second name of `for k, v in m`. ONE ladder, or the two spellings agree about the
-// value's type and disagree about its rep, which is invalid wasm rather than a diagnostic.
+// The kind a map's VALUE binds at, for `for v in m.values()` and the second name of
+// `for k, v in m`: the rep of the value type the map's storage holds (`readContainerTyAt`), so
+// a map narrowed by a value test binds its stored, possibly nullable, value. `i32` off a map.
 export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("mapValElemKind") }
-  const vsl = mapShapeOfExpr(mapObjIx, fnIx)
-  if vsl >= 0 {
-    if mvValKind[vsl] == MVK_STR {
-      // A nullable string value (`{[string]: string | null}`) rides the same kind-3
-      // vals list as its non-null twin (the element slot is nullable either way), so
-      // only the loop var differs: the `string | null` niche, exactly as `const v =
-      // m[k]` binds — the non-null `"str"` var would trap on a stored null.
-      if mvSlotNullable(vsl) { return "nulstr" }
-      return "str" // string value
-    }
-    if mvValKind[vsl] == MVK_F64 {
-      return "f64" // f64 value (scalar local)
-    }
-    if mvValKind[vsl] == MVK_I64 {
-      return "i64" // i64 value (scalar local)
-    }
-    if mvValKind[vsl] == MVK_F32 {
-      return "f32" // f32 value (scalar local)
-    }
-    if mvValKind[vsl] == MVK_CLOSURE {
-      return "closure" // closure value (`{[string]: (i32) => i32}` — loop var calls each)
-    }
-    // A list value (`{[string]: i32[]}` / `S[]` …): the loop var binds the inner
-    // value list's own rep (`mvListValKind`), exactly as a nested-array `for row in
-    // g` does. A nullable list value rides the same vals list as its non-null twin,
-    // so only the loop var differs — the niche kind, mirroring `nulstr`/`nulstruct`.
-    if mvValKind[vsl] == MVK_REF {
-      // A nested-map value (`{[K]: {[K2]: V}}`) rides the same kind-6 vals list with a map
-      // element, and binds the map local its own `m[k]` read binds (D2515).
-      if mvValIsMap(vsl) {
-        if mvSlotNullable(vsl) { return "nulmap" }
-        return "map"
-      }
-      if mvSlotNullable(vsl) { return mvNulListValKind(vsl) }
-      return mvListValKind(vsl)
-    }
-    // A union-box value (`{[string]: i32 | null}`, `{[string]: C | S}`): the vals
-    // element IS `$uBox`, so the loop var binds as a kind-4 union-box local.
-    if mvValKind[vsl] == MVK_UNION { return "union" }
-    // A nullable-struct value (`{[string]: S | null}`) rides the same kind-1 vals
-    // list as its non-null twin; the loop var is the kind-9 niche instead.
-    if mvSlotNullable(vsl) { return "nulstruct" }
-    // A union-arm value (`{[string]: Circle}` where `Circle` is a declared union
-    // member): the loop var is the kind-8 variant local, not struct — the arm's
-    // layout lives in `variantHeap`, since `collectS` skips a union member (D50).
-    if mvValVariantOf(vsl) >= 0 { return "variant" }
-    return "struct" // struct value
-  }
-  // A `null`-valued map rides the mono map; its value is the `null` cell, never read.
-  if mapTyValIsNullUnit(mapRecvTyIn(mapObjIx, fnIx)) { return "nulnone" }
-  return "i32"
+  const v = tyMapValOf(tyMapHeld(readContainerTyAt(mapObjIx, fnIx)))
+  if v < 0 { return "i32" }
+  repSigKindOfTy(v)
 }
 
-// The kind a `for`'s SECOND name binds at. A sequence's companion is its INDEX (an i32
-// counter of body executions), a map's is the VALUE at the key just bound. A set is a
-// sequence here, not a map: its `vals` holds membership booleans nobody wrote.
+// The kind a `for`'s SECOND name binds at: a sequence's index (`i32`), or the value a map's
+// storage holds at the key just bound; null where the iterable binds no second name.
 export function forInPairElemKind(iterIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("forInPairElemKind") }
-  if !forInPairIsMapVal(iterIx, fnIx) { return "i32" }
-  mapValElemKind(iterIx, fnIx)
+  const b = forInBindTy(readContainerTyAt(iterIx, fnIx), true)
+  if b < 0 || tyAt(b) is TyErr { return null }
+  repSigKindOfTy(b)
 }
 
 // Whether a `for`'s SECOND name binds a map VALUE rather than a sequence index. One
@@ -12310,13 +12258,13 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST {
     return refListElemNameOfNodeTy(exprIx)
   }
-  // The outer row's own inner row first: a structural name can key a same-layout record
+  // The receiver row's own inner row first: a structural name can key a same-layout record
   // declared earlier than the one the items are built at (D6731). Otherwise a receiver whose
   // element is itself a ref list — raw, `| null`, or at this instance's pins — yields the
   // read's own typed row; any other receiver yields no ref-list element.
   const outer = refListElemNameOfExpr(e.idxArr, fnIx)
   if outer == "" { return "" }
-  const os = rlSlotByNameTwin(outer, tyRefArrElemOf(nodeTyInOf(e.idxArr, fnIx)))
+  const os = refListSlotOfExpr(e.idxArr, fnIx)
   if rlSlotIsKindList(os, RLK_REF_LIST) {
     const ins = rlElemInnerSlot(os)
     if ins >= 0 && ins < rlElemName.length {
@@ -12383,8 +12331,8 @@ function keptOrName(s: i32): i32 {
 }
 
 // The ref-list table slot the expression at `exprIx` produces, or -1 when none resolves: its
-// rep's row, else its binding's kept slot, else (an identifier) its type's row, else (a literal,
-// call, field or index read) its rungs' row, else a literal's minted row, else its name's.
+// rep's row, else its binding's kept slot, else (an identifier) its type's row, else its kind's
+// rungs' row (a literal's minted one, a call's result, a paren's or if's), else its type's row.
 // Slot 0 is a real row, so a caller tests the result before indexing a backing table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   const rs0 = listRowOfExpr(exprIx, fnIx)
@@ -12403,6 +12351,27 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   if pe is Call {
     const cs = refListKeptSlotOfCall(pe, exprIx, fnIx)
     if cs != -2 { return cs }
+    // A named function's call its function's joined result row.
+    if pe.callFn >= 0 {
+      const ce = nodeAt(pe.callFn)
+      if ce is Ident {
+        const fe = fnIndexOfInScopeAt(
+          sidOfNode(pe.callFn),
+          ce.identName,
+          fnIx,
+          pe.callFn,
+        )
+        const js = fnRetRefListSlot(fe)
+        if js >= 0 && js < rlElemName.length { return js }
+      }
+    }
+  }
+  if pe is Paren { return refListSlotOfExpr(pe.parInner, fnIx) }
+  if pe is IfStmt {
+    if ifExprRefKind(exprIx, fnIx) != "reflist" { return -1 }
+    const ifs = ifExprRefSlot(exprIx, fnIx, "reflist", -1)
+    if ifs >= 0 && ifs < rlElemName.length { return ifs }
+    return -1
   }
   if pe is Member {
     const ms = refListKeptSlotOfMember(pe, exprIx, fnIx)
@@ -12417,8 +12386,8 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
     const mint = arrLitRlSlotAt(exprIx)
     if mint >= 0 && mint < rlElemName.length { return mint }
   }
-  const nm = refListElemNameOfExpr(exprIx, fnIx)
-  const s = rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
+  // Every other read takes the row its element type keys.
+  const s = rlSlotOfTyOrTwin(tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
   if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "call") }
   if s < 0 {
     if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "CLAMPED") }
@@ -12611,9 +12580,9 @@ export function letInitUnionListTy(letIx: i32, fnIx: i32): i32 {
   lt
 }
 
-// The row a `let` with no destination binds: for an un-annotated one, the initializer's
-// delivered row where the element type does not decide it (`letInitDeliversRow`), else a list
-// literal's own row; otherwise the row keyed by the element type. -1 for none.
+// The row a `let` with no destination binds: for an un-annotated one, a list literal's own
+// row, or the row any other initializer delivers (`refListSlotOfExpr`); otherwise, and where
+// that resolves none, the row keyed by the element type. -1 for none.
 function letTailRowSlot(letIx: i32, fnIx: i32): i32 {
   if clsCensusOn { clsCensusEnter("letTailRowSlot") }
   const et = letRefListElemTy(letIx, fnIx)
@@ -12622,33 +12591,15 @@ function letTailRowSlot(letIx: i32, fnIx: i32): i32 {
     if d.letInit >= 0 && d.letType < 0 {
       const ai = unwrapParen(d.letInit)
       if ai < 0 { return -1 }
-      if letInitDeliversRow(ai, et, fnIx) { return refListSlotOfExpr(ai, fnIx) }
-      if nodeAt(ai) is ArrayLit && !arrLitHasSpread(ai) {
-        return arrLitRowSlotIn(ai, fnIx)
+      if nodeAt(ai) is ArrayLit {
+        if !arrLitHasSpread(ai) { return arrLitRowSlotIn(ai, fnIx) }
+      } else {
+        const dr = refListSlotOfExpr(ai, fnIx)
+        if dr >= 0 { return dr }
       }
     }
   }
   rlSlotOfRowTy(rlRowTyOfElem(et))
-}
-
-// Whether initializer `ai`, of element type `et`, binds the row its value already has rather
-// than the row its element type keys: a named function's call its callee's result (none when
-// that is no ref list), and a closure whose signature holds a type variable its bound one.
-function letInitDeliversRow(ai: i32, et: i32, fnIx: i32): boolean {
-  const ini = nodeAt(ai)
-  if ini is Call {
-    if ini.callFn >= 0 {
-      const ce = nodeAt(ini.callFn)
-      if ce is Ident {
-        const sid = sidOfNode(ini.callFn)
-        if fnIndexOfInScopeAt(sid, ce.identName, fnIx, ini.callFn) >= 0 {
-          return true
-        }
-      }
-    }
-  }
-  if et < 0 || et >= T.tys.length { return false }
-  tyAt(et) is TyFunc && tyHasTyVar(et)
 }
 
 // The struct row an un-annotated binding of the object literal at `objIx` is built at, or -1
