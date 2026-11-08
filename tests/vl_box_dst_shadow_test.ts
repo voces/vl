@@ -668,3 +668,25 @@ for (
     },
   });
 }
+
+// An `f64` element of a list literal delivered at an `i32 | f64` row: a later stamp at the union
+// must not hide the element's one-kind pair, so the table still serves it.
+const NUM_HIDDEN = `function g() {
+  const c: (i32 | f64)[][] = [[1, 2.5]]
+  c[0]
+}
+print(g().length)
+`;
+Deno.test({
+  name: "box-dst shadow: a one-kind numeric pair a later union stamp would hide",
+  ignore,
+  fn: () => {
+    const { rc, rows } = shadow(NUM_HIDDEN, DROP_NONE, true);
+    if (rc !== 0) throw new Error(`num hidden: want compileSrc rc 0, got ${rc}`);
+    const got = show(rows);
+    const want = "num table=1";
+    if (got !== want) {
+      throw new Error(`num hidden:\n  want: ${want}\n  got:  ${got}`);
+    }
+  },
+});
