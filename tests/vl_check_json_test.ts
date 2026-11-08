@@ -350,16 +350,17 @@ Deno.test({
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
       // A live emit-side refusal (`scripts/capability-probes/length-of-slot-written-list-holding-a-generic-function.vl`):
-      // `vl check` accepts it and the emitter refuses the generic argument (D15574). It is D15010's witness plus
-      // a slot write of a second parameter, bound at one call to one generic and at another to two;
-      // each call alone runs.
+      // `vl check` accepts it and the emitter refuses the generic argument (D15577). It is D15010's witness plus
+      // a slot write of a second parameter, the listed one bound to a different generic at each of two
+      // calls; each call alone runs.
       await Deno.writeTextFile(
         file,
         "function id<T>(x: T): T { x }\nfunction id2<U>(x: U): U { x }\n" +
+          "function id3<V>(x: V): V { x }\n" +
           "function use(ys) { print(ys.length) }\n" +
           "function take(a, b) {\n  const xs = [a]\n  xs[0] = b\n  use(xs)\n" +
           '  print(xs[0]("abc").length + xs[0](2))\n}\n' +
-          "take(id, id)\ntake(id, id2)\n",
+          "take(id, id2)\ntake(id3, id2)\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);
