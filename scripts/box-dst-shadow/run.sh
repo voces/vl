@@ -8,7 +8,9 @@
 # runs `vl check --batch --codegen` over `sweep.vl list` with `$VL_LATE_DEMANDS=1`, and writes one
 # `<file>\t<class> | <helper> | site <union> | record <union> | pos <fn>:<line>` row per delivery
 # to F (default box-dst-shadow.tsv). Prints the top-level rows that are not an agreement, by
-# class, position and both unions, with a witness and a count. Run from the checkout root.
+# class, position and both unions, with a witness and a count. A position the table serves prints
+# its `table` count and its floors; a floor floors.tsv does not list fails the run. Run from the
+# checkout root.
 set -euo pipefail
 R="$PWD"; VL="${VL:-$R/scripts/vl-host/target/release/vl}"; SEED="$R/build/vl-compiler.wasm"
 OUT=box-dst-shadow.tsv; JOBS="${JOBS:-4}"
@@ -35,7 +37,20 @@ ls "$T"/c.* | xargs -P "$JOBS" -I{} sh -c 'VL_LATE_DEMANDS=1 VL_STD="$R/std" tim
   | grep "demand bds" > {}.out || true'
 cat "$T"/c.*.out | sed 's/^\[late\] //; s/: demand bds /\t/' > "$OUT"
 echo "$(wc -l < "$OUT") deliveries in $OUT"
-awk -F'\t' '$2 !~ /^nested/ && $2 !~ /^(agree|value already|value never)/ {
+awk -F'\t' '$2 !~ /^nested/ && $2 !~ /^(agree|value already|value never|table|floor:)/ {
   n = split($2, a, " [|] "); p = a[n]; sub(/^pos /, "", p)
   k = a[1] " | " p " | " a[3] " | " a[4]; c[k]++; if (!(k in w)) w[k] = $1 }
   END { for (k in c) print c[k] "\t" k "\t" w[k] }' "$OUT" | sort -t$'\t' -k2
+# A position the table serves (`emitUnionBoxOwed`) is graded by the sweep, not here: its rows are
+# `table` or a named floor, and a floor that floors.tsv does not list for its position fails.
+awk -F'\t' -v L="$R/scripts/box-dst-shadow/floors.tsv" '
+  BEGIN { while ((getline l < L) > 0) if (l !~ /^#/ && l != "") ok[l] = 1 }
+  $2 ~ /^(table|floor:)/ {
+    n = split($2, a, " [|] "); p = a[n]; sub(/^pos (floor@)?/, "", p); sub(/:[0-9]+$/, "", p)
+    if (a[1] == "table") { t[p]++; next }
+    k = p "\t" a[1]; f[k]++; if (!(k in w)) w[k] = $1 }
+  END {
+    for (p in t) print "table\t" t[p] "\t" p
+    for (k in f) { seen[k] = 1; print (k in ok ? "floor" : "UNLISTED") "\t" f[k] "\t" k "\t" w[k]; if (!(k in ok)) bad = 1 }
+    for (k in ok) if (!(k in seen)) print "unseen floor\t0\t" k
+    exit bad }' "$OUT" | sort -t$'\t' -k3

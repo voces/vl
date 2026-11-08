@@ -840,6 +840,7 @@ import {
   columnListRepAt,
   elabClosedTyAt,
   fnInPinnedInstance,
+  forInWalksMapValues,
   holeOperandTyOf,
   identNameOrEmpty,
   instanceBindsNothingClosed,
@@ -3996,14 +3997,12 @@ export function captureValStructIdx(fe: i32, name: string) {
       if bn.letInit >= 0 {
         // The owning frame as an arena index — the same conversion `captureValKind`'s
         // un-annotated arm makes, and for the same reason: `letIsMap`, `letIsNulRef` and
-        // `letIsRefArray` all forward `pf` to `P.nodes[pf]`.
+        // `letBindRepKind` all forward `pf` to `P.nodes[pf]`.
         const pf = parentBindingFrameArenaOf(fe, name)
         // The slot beside each ref cell kind the binding can take. A kind without
         // its slot is a loud reject and not a fallback: `fbValtype`'s bounds guard turns a -1
         // on any ref kind into `ref valtype with no interned shape` (D21).
-        if letIsRefArray(b, pf) && letBindRepKind(b, pf) != "union" {
-          return letRefListSlot(b, pf)
-        }
+        if letBindRepKind(b, pf) == "reflist" { return letRefListSlot(b, pf) }
         const sk = letBindRepKind(b, pf)
         if sk == "struct" || sk == "variant" {
           const csi = structIndexOfLet(b, pf)
@@ -5863,33 +5862,11 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   return null
 }
 
-// True when a `for v in <iter>` walks a map's ordered vals list (field 1) rather than its
-// keys list (field 0) — a `.values()` call on a map that isn't a set (a set's `.values()`
-// yields its elements, in the keys list instead). Paired with `forInMapRecv`, so the field
-// a walk reads and the type its loop var binds can never disagree.
-
-export function forInMapWalksVals(iterIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("forInMapWalksVals") }
-  const e = nodeAt(iterIx)
-  if e is Call {
-    if e.callFn < 0 { return false }
-    const callee = nodeAt(e.callFn)
-    if callee is Member {
-      if callee.memProp == "values" {
-        if exprMap(callee.memObj, fnIx) {
-          return !mapIsSetExpr(callee.memObj, fnIx)
-        }
-      }
-    }
-  }
-  false
-}
-
 // The mv slot of a `for v in m.values()` walk over a ref-valued map, or -1 (not a
 // map walk / a mono map / a set). The values walk then types its loop var + list
 // temp off the slot's value type instead of a ref-array's element.
 export function forInMapValsSlot(iterIx: i32, fnIx: i32) {
-  if !forInMapWalksVals(iterIx, fnIx) { return -1 }
+  if !forInWalksMapValues(iterIx, fnIx) { return -1 }
   // A MONO-value map interns no slot — its shape is one of the negative sentinels
   // (`-1` mono, `-4` i32-keyed mono), and every one of them answers "no slot" here.
   const sl = mapShapeOfExpr(forInMapRecv(iterIx, fnIx), fnIx)
@@ -8212,7 +8189,7 @@ function holeRecvAtomFieldTexts(
 // The element type of receiver `arrIx`, recorded open, at instance `fnIx`'s elaboration; -1 for
 // a closed receiver, and for a list literal built as strings, whose elements are no atom niche.
 function holeNulLitElemTy(arrIx: i32, fnIx: i32): i32 {
-  if idxRecvIsStrList(arrIx, fnIx) { return -1 }
+  if fnIx >= 0 && nodeRepIs(arrIx, "strlist", fnIx) { return -1 }
   const ax = unwrapParen(arrIx)
   if ax < 0 || !tyHasTyVar(nodeTyIxOf(ax)) { return -1 }
   const rt = elabClosedTyAt(ax, fnIx)
@@ -8353,29 +8330,6 @@ function declLitUnionTyAt(
     }
   }
   0 - 1
-}
-
-// Does index receiver `arrIx` denote a local bound to a list LITERAL whose elements lower as
-// string refs? An annotated binding is not this question — its annotation fixed the rep — and
-// neither is a parameter or a global, both of which reach their elements by another route.
-export function idxRecvIsStrList(arrIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("idxRecvIsStrList") }
-  if fnIx < 0 { return false }
-  // An instance's string-list parameter narrowed to a literal-union list by `is` (D4916).
-  if exprListRep(arrIx, fnIx) == "strlist" { return true }
-  const n = nodeAt(unwrapParen(arrIx))
-  if n is Ident {
-    const d = bindingDeclInScope(unwrapParen(arrIx))
-    if d < 0 { return false }
-    const dn = nodeAt(d)
-    if dn is LetDecl {
-      if dn.letType >= 0 { return false }
-      if dn.letInit < 0 { return false }
-      const iv = nodeAt(unwrapParen(dn.letInit))
-      if iv is ArrayLit { return arrLitIsStr(dn.letInit, fnIx) }
-    }
-  }
-  false
 }
 
 // True if `exprIx` is a literal-union atom value (an i32 id) — a litunion-flagged local or a
@@ -12357,8 +12311,8 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
 
 // The per-element-type ref-list table SLOT the expression at `exprIx` produces, or -1 when
 // the element type does not resolve: its rep's row, else the slot its binding keeps, else (an
-// identifier) its type's row, else (a list literal or call) its rungs' row, else its name's. Slot 0 is a real row, so every caller
-// tests the result before indexing a backing/wrapper/element table.
+// identifier) its type's row, else (a list literal or call) its rungs' row, else its name's.
+// Slot 0 is a real row, so every caller tests the result before indexing a backing table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   const rs0 = listRowOfExpr(exprIx, fnIx)
   if rs0 >= 0 { return rs0 }
@@ -12473,36 +12427,6 @@ function refListKeptSlotOfIdent(e: Ident, exprIx: i32, fnIx: i32): i32 {
   const nrs = recordListSlotOfNode(exprIx, fnIx)
   if nrs >= 0 && nrs < rlElemName.length { return nrs }
   -1
-}
-
-// True if the `LetDecl` at `letIx` declares a ref-list local: its annotation is a ref
-// array (`S[]`/`N[]`), OR its initializer produces a ref list. Picks the local's valtype
-// (`(ref $rlTypeIdx)`) and the code-`5` flag in `collectLocals`.
-export function letIsRefArray(letIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("letIsRefArray") }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      const lt = nodeAt(d.letType)
-      if lt is TypeRef {
-        // A union annotation (even `S[] | i64`) is a union-box local, not a reflist local —
-        // return false so a ref-array init below doesn't mis-pick the reflist valtype.
-        if isUNameAnnAB(5, d.letType) { return false }
-        // Arena-first: the arena's `"reflist"` arm covers the settled base cases; the
-        // spellings it declines (nested arrays, niches, union/map elements) keep the name walk.
-        const k = annRepKindOf(d.letType)
-        if k != null {
-          if k == "reflist" { return true }
-        } else {
-          // Where the arena declines the element (nested arrays, niche/union-box/map
-          // elements) the reflist layer's own row still answers, off the recorded type.
-          if annBareRefArrSlot(d.letType) >= 0 { return true }
-        }
-      }
-    }
-    return exprRefArray(d.letInit, fnIx)
-  }
-  false
 }
 
 // The ref-list ELEMENT type-NAME a ref-list `LetDecl` binds: from its `S[]`/`N[]`
@@ -15694,7 +15618,7 @@ function idxReadIsLitAtom(e: Index, exprIx: i32, fnIx: i32): boolean {
   // built over a parameter pinned at the softened `string` holds string refs while its
   // element type is the same union an atom list has. The receiver's own literal is the rep,
   // and claiming an atom over it emits an i32 consumer for a `(ref $type)` (D1740).
-  if idxRecvIsStrList(e.idxArr, fnIx) { return false }
+  if fnIx >= 0 && nodeRepIs(e.idxArr, "strlist", fnIx) { return false }
   // `xs[i]` over a literal-union array yields an atom element, through the declaration
   // fallback: a monomorphized instance's receiver records the generic's `T[]`, so the
   // direct probe answers false for an array it should claim. Without it, a generic

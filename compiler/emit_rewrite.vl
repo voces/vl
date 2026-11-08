@@ -2,7 +2,7 @@
 // that run before collection and lowering — self-method / operator / index-trap
 // dispatch rewriting (`dispatchRewrite`), captured-mutation boxing
 // (`captureBoxRewrite`), and the synthesized return/param annotations
-// (`synthRetAnnots`) that pin checker-inferred types onto
+// (`synthNulListRetAnns`) that pin checker-inferred types onto
 // declarations for later phases. Consults the classifiers (`emit_classify.vl`);
 // writes no bytes.
 
@@ -69,12 +69,7 @@ import {
   loopValTailOf,
   loopValTyOf,
 } from "./check_null_holes"
-import {
-  inferRetNameByNode,
-  inferRetNameOf,
-  inferRetTyIxByNode,
-  inferRetTyIxOf,
-} from "./check_infer_ret"
+import { inferRetNameOf, inferRetTyIxOf } from "./check_infer_ret"
 import { isIdentNamed } from "./check_call_retire"
 import { refViewCarry } from "./check_ref_list_view"
 import { strLitRecvTy } from "./check_builtin_methods"
@@ -1787,6 +1782,14 @@ function drwFieldRowOf(recv: i32, ctx: i32, name: string): i32 {
   structIndexOfExpr(recv, ctx)
 }
 
+// Whether `recv`'s checked type has a field `name` of function type, gated on some record
+// declaring a field of that name, as `drwFieldRowOf` is.
+function drwRecvFieldIsFn(recv: i32, name: string): boolean {
+  if !structFieldNameUsed(name) { return false }
+  const ft = tyFieldTyOf(nodeTyIxOf(recv), name)
+  ft >= 0 && tyAt(ft) is TyFunc
+}
+
 // `drwWalk`'s index arm for `n` at `ix`: walks both operands, then answers a free `"[]"`
 // operator's call, a `"[]"` closure field's call on a struct receiver, or `ix` itself.
 function drwWalkIndex(ix: i32, n: Index, ctx: i32): i32 {
@@ -1802,7 +1805,7 @@ function drwWalkIndex(ix: i32, n: Index, ctx: i32): i32 {
     return drwOpCall(mkCall(drwDeclRef(rOp), roargs, -1), ix)
   }
   // The index read trap: a struct receiver carrying a "[]" closure field.
-  if drwFieldClosure(drwFieldRowOf(n.idxArr, ctx, "[]"), "[]") {
+  if drwRecvFieldIsFn(n.idxArr, "[]") {
     const targs: i32[] = []
     targs.push(n.idxIndex)
     return drwOpCall(mkCall(mkMember(n.idxArr, "[]", -1), targs, -1), ix)
@@ -2112,7 +2115,7 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
         woargs.push(n.binRight)
         return drwOpCall(mkCall(drwDeclRef(wOp), woargs, -1), ix)
       }
-      if drwFieldClosure(drwFieldRowOf(tgt.idxArr, ctx, "[]="), "[]=") {
+      if drwRecvFieldIsFn(tgt.idxArr, "[]=") {
         const wargs: i32[] = []
         wargs.push(tgt.idxIndex)
         wargs.push(n.binRight)
@@ -2643,9 +2646,7 @@ function cpReReadable(ix: i32, ctx: i32): boolean {
   const e = nodeAt(u)
   if e is Index {
     if opDeclAtNode(u) >= 0 { return false }
-    if drwFieldClosure(drwFieldRowOf(e.idxArr, ctx, "[]"), "[]") {
-      return false
-    }
+    if drwRecvFieldIsFn(e.idxArr, "[]") { return false }
     return cpReReadable(e.idxArr, ctx) && cpReReadable(e.idxIndex, ctx)
   }
   cpRecvReReadable(u, ctx)
@@ -3151,27 +3152,6 @@ export function assignValueSpill(stmts: i32[]) {
     i = i + 1
   }
   asvList(stmts, true)
-  0
-}
-
-// Pins an un-annotated lambda whose own inferred-return row is a literal union to that type,
-// so it lowers as the i32 atom: its recorded result is the widened `string`, which
-// `synthRecordedRetAnnots` would otherwise pin. Every other lambda's readers take its row.
-export function synthRetAnnots() {
-  if !fnValUsed { return 0 }
-  let fe = 0
-  while fe < fnStmts.length {
-    const lamIx = fnStmts[fe]
-    const fn = nodeAt(lamIx)
-    if fn is FuncDecl {
-      const ctxTy = inferRetTyIxByNode(lamIx)
-      if fn.fnRet < 0 && tyIsLitUnion(ctxTy) {
-        const ctx = inferRetNameByNode(lamIx)
-        if ctx != "" { fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy) }
-      }
-    }
-    fe = fe + 1
-  }
   0
 }
 
