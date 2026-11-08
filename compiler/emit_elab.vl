@@ -15,6 +15,7 @@ import {
 import { isVarTyIxOf } from "./check_list_union"
 import { identFnDeclOf, tyParamIsBareOnly } from "./check_scopes"
 import {
+  elabFnSetTyMint,
   elabHoleRowCut,
   elabHoleRowMark,
   fnSlotThroughCalls,
@@ -9950,17 +9951,12 @@ function elabHeldListFacts() {
       const t = ps[i + 1]
       const lt = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
       const et = if lt is TyArray { lt.aElem } else { -1 }
-      // A stored set a call reaches is left to the instance (D15296).
-      const ds: i32[] = []
-      elabFnIdsIn(et, ds, 0)
-      if (
-        et >= 0
-        && et < T.tys.length
-        && tyAt(et) is TyObj
-        && tyHasTyVar(et)
-        && !fnSetCalledWithAny(ds)
-      ) {
-        const nv = elabHeldClosedTy(et, lit.arrElems, 0)
+      if (et >= 0 && et < T.tys.length && tyAt(et) is TyObj && tyHasTyVar(et)) {
+        const nv = elabHeldKeepSets(
+          elabHeldClosedTy(et, lit.arrElems, 0),
+          et,
+          0,
+        )
         if nv >= 0 && !tyHasTyVar(nv) {
           fills.push(ix)
           fills.push(ps[i])
@@ -15904,7 +15900,57 @@ export function elabHeldValTy(x0: i32, fnIx: i32): i32 {
     t = elabHeldClosedTyAt(id, [x], 0, -1, none, -1)
   }
   if (t < 0 || tyHasTyVar(t)) && k >= 0 { t = elabHeldIdTy(x, fnIx, 0) }
-  if t < 0 || tyHasTyVar(t) { -1 } else { t }
+  if t < 0 || tyHasTyVar(t) { -1 } else { elabHeldKeepSets(t, id, 0) }
+}
+
+// Closed type `t` with each function leaf that carries no set taking the set its leaf in identity
+// type `id` carries, so a stored set a call reaches keeps the id rep it is built at (D15296).
+function elabHeldKeepSets(t: i32, id: i32, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length || id < 0 || id >= T.tys.length || depth > 16 {
+    return t
+  }
+  const o = tyAt(t)
+  const p = tyAt(id)
+  match o {
+    TyFunc => {
+      if !(p is TyFunc) || elabFnSetOf(t).length > 0 { return t }
+      return elabFnSetTyMint(t, elabFnSetOf(id))
+    }
+    TyNullable => {
+      if !(p is TyNullable) { return t }
+      const r = elabHeldKeepSets(o.nInner, p.nInner, depth + 1)
+      return if r == o.nInner { t } else { mkNullableTy(r) }
+    }
+    TyArray => {
+      if !(p is TyArray) { return t }
+      const r = elabHeldKeepSets(o.aElem, p.aElem, depth + 1)
+      return if r == o.aElem { t } else { mkArrayTy(r) }
+    }
+    TyMap => {
+      if !(p is TyMap) { return t }
+      const r = elabHeldKeepSets(o.mVal, p.mVal, depth + 1)
+      return if r == o.mVal { t } else { mkMapTy(o.mKey, r, o.mSet) }
+    }
+    TyObj => {
+      if !(p is TyObj) { return t }
+      const fts: i32[] = []
+      let moved = false
+      let k = 0
+      while k < o.objFieldNames.length && k < o.objFieldTypes.length {
+        const pk = strListIndexOf(p.objFieldNames, o.objFieldNames[k])
+        const f = o.objFieldTypes[k]
+        const r = if pk >= 0 { elabHeldKeepSets(f, p.objFieldTypes[pk], depth + 1) } else { f }
+        if r != f { moved = true }
+        fts.push(r)
+        k = k + 1
+      }
+      return if moved { mkObjTy(o.objFieldNames, fts) } else { t }
+    }
+    // No other kind holds a function leaf.
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => {
+      return t
+    }
+  }
 }
 
 // The closed type literal `x` has in instance frame `fnIx` from its leaves' identity types: a
