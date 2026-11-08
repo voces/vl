@@ -7632,8 +7632,8 @@ function numPairStamp(ix: i32, t: i32): i32 {
   const has = if live { elabCapNumPair.has(ix) } else { nodeNumPair.has(ix) }
   const dk = numKindOfTy(t)
   if dk < 3 || dk > 5 {
-    // A wide number boxed into a union that holds it is boxed as itself.
-    const uk = numUnionIdentityOf(
+    // A number boxed into a union is boxed at the arm that holds it (`numUnionPairOf`).
+    const uk = numUnionPairOf(
       if live { elabCapTy[ix] ?? nodeTyIxOf(ix) } else { nodeTyIxOf(ix) },
       t,
     )
@@ -7714,19 +7714,56 @@ export function numCastStamp(
   numCodeStamp(ix, sk * 8 + dk)
 }
 
-// The identity pair of a value of type `src` boxed into union `t`, where `src` is a wide number
-// (`i64`, `f64`, `f32`) and `t` a union or nullable with that member; else 0.
-function numUnionIdentityOf(src: i32, t: i32): i32 {
-  const sk = numKindOfTy(src)
-  if sk < 3 || sk > 5 || t < 0 || t >= T.tys.length { return 0 }
-  const n = tyAt(t)
-  if n is TyNullable {
-    return if numKindOfTy(n.nInner) == sk { sk * 9 } else { 0 }
+// The pair a number of type `src` is boxed at into union `t`: its own kind where `t` holds it (an
+// alias member's included), else the union's promotion, an integer to `i64`, `f64` then `f32` and
+// a float to the other float; 0 where nothing wide is boxed.
+function numUnionPairOf(src: i32, t: i32): i32 {
+  const sk = numBaseKindOfTy(src)
+  if sk == 0 || sk == 6 || !tyIsUnionDst(t) { return 0 }
+  const ms: i32[] = []
+  flattenVariantsInto(t, ms)
+  let has = 0
+  for m in ms {
+    const mk = numBaseKindOfTy(m)
+    if mk > 0 && mk < 6 { has = has | (1 << mk) }
   }
-  if !(n is TyUnion) { return 0 }
-  for m in n.uMembers {
-    if numKindOfTy(m) == sk { return sk * 9 }
+  const own = if sk == 2 { 1 } else { sk }
+  if (has & (1 << own)) != 0 || (sk == 2 && (has & 4) != 0) {
+    return if sk >= 3 { sk * 9 } else { 0 }
   }
+  let dk = 0
+  if sk <= 3 {
+    if sk < 3 && (has & 8) != 0 { dk = 3 }
+    else if (has & 16) != 0 { dk = 4 }
+    else if (has & 32) != 0 { dk = 5 }
+  } else if sk == 4 && (has & 32) != 0 {
+    dk = 5
+  } else if sk == 5 && (has & 16) != 0 {
+    dk = 4
+  }
+  if dk == 0 { 0 } else { sk * 8 + dk }
+}
+
+// Records the numeric pair a `??`'s left operand `ix` is boxed at on a hit, its non-null value `hit`
+// entering the join `t`. Outside an instance, only the final check's. Returns 1 where recorded.
+export function numHitStamp(ix: i32, hit: i32, t: i32): i32 {
+  if ix < 0 || (inferQuiet && !elabCapLive()) { return 0 }
+  const code = numUnionPairOf(hit, t)
+  if code <= 0 { return 0 }
+  numCodeStamp(ix, code)
+}
+
+// `numKindOfTy` of `t`, a literal or a union of literals over one base read as that base.
+function numBaseKindOfTy(t: i32): i32 {
+  const k = numKindOfTy(t)
+  if k != 0 { return k }
+  const p = tyScalarBasePrim(t)
+  if p == null { return 0 }
+  if p == "i32" { return 1 }
+  if p == "u8" { return 2 }
+  if p == "i64" { return 3 }
+  if p == "f64" { return 4 }
+  if p == "f32" { return 5 }
   0
 }
 
