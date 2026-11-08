@@ -8,6 +8,9 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step7-classifier-r18](2026-11-08-step7-classifier-r18.md): Step 7 classifier round 18, 55/0/19 (#6851).
+- [2026-11-08-step7-cloret-type-token](2026-11-08-step7-cloret-type-token.md): Step 7: every cloRet* key is the result type's token; per-kind path deleted (#6849).
+- [2026-11-08-step7-classifier-r17](2026-11-08-step7-classifier-r17.md): Step 7 classifier round 17: six hubs typed before mono, 54/0/21 (#6848).
 - [2026-11-08-step7-cloret-remnants](2026-11-08-step7-cloret-remnants.md): Step 7: mfStructResultRowName deleted; cloRetKeySuffix's ladder gone (#6844).
 - [2026-11-08-mono-binary-mint-types](2026-11-08-mono-binary-mint-types.md): Step 7: the monomorphizer's re-made `+` carries its type (#6839).
 - [2026-11-08-step6-nul-list-ret-pin-deleted](2026-11-08-step6-nul-list-ret-pin-deleted.md): Step 6 done: synthNulListRetAnns and inferRetRung deleted (#6837).
