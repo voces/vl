@@ -30,7 +30,6 @@ import {
   NumLit,
   ObjLit,
   OptMember,
-  P,
   Param,
   Paren,
   Program,
@@ -52,7 +51,6 @@ import {
 } from "./emit_elab"
 import {
   narrowedFromTyOf,
-  nodeTyIsMap,
   nodeTyIsNullable,
   nodeTyIxOf,
 } from "./check_node_tys"
@@ -87,7 +85,7 @@ import {
   numLitWidth,
 } from "./emit_capture_frames"
 import { fnHasParamSid } from "./emit_fn_ret_kinds"
-import { bodyLetOfRead } from "./emit_base"
+
 import { frameChainBindsName } from "./emit_list_rep"
 import { isStructOfTy } from "./emit_mv_slots"
 import { nulVariantIndexOf } from "./emit_nullable_rets"
@@ -98,7 +96,7 @@ import {
   repDescRet,
   repVariantShapeRowOf,
 } from "./emit_rep"
-import { emptyArrLitIxOf, mapNodeValKindLowerable } from "./emit_shape_rows"
+
 import {
   emitRootIx,
   fRetKind,
@@ -192,109 +190,6 @@ export function asNulStructRow(asIx: i32): i32 {
   const tn = tyAt(t)
   if tn is TyNullable { return structIndexOfTy(tn.nInner) }
   -1
-}
-
-// True if `rx` returns a body-declared map local whose value type the mv layer can lower.
-// The local's kind is not collected during the global return pass, so neither `exprMap` nor
-// any Ident classifier can see it; this reads the declaration instead, and it is what puts
-// `"map"` in `fRetKind`.
-export function retIsMapLocal(rx: i32, fnIx: i32) {
-  let u = rx
-  let done = false
-  while !done {
-    const node = nodeAt(u)
-    if node is Paren { u = node.parInner } else { done = true }
-  }
-  const e = nodeAt(u)
-  if e is Ident {
-    const fn = nodeAt(fnIx)
-    if fn is FuncDecl {
-      const li = bodyLetOfRead(fn.fnBody, u)
-      if li >= 0 {
-        const d = nodeAt(li)
-        if d is LetDecl {
-          if d.letType >= 0 {
-            const lt = nodeAt(d.letType)
-            if lt is TypeRef {
-              // The arena: a `TyMap` annotation, never the union box a map-first spelling
-              // can fool `nameIsMap` into claiming.
-              if nodeTyIsMap(d.letType) {
-                // A supported map value type, asked of the arena — the same call the
-                // un-annotated leg makes. The return's shape is recovered at the
-                // functype-result site through `mapShapeOfExpr` over this same local.
-                return mapNodeValKindLowerable(d.letType)
-              }
-            }
-            return false
-          }
-          // An un-annotated map local has no annotation for the rung above to read: the
-          // checker's recorded type on the returned ident is the only spelling of it.
-          // Unclassified, the functype result stays at the `"i32"` default over a body that
-          // returns a map ref, while the caller resolves the same recorded type.
-          if nodeTyIsMap(u) { return mapNodeValKindLowerable(u) }
-        }
-      }
-    }
-  }
-  false
-}
-
-// The parent-`let` arena index a returned bare ident names in the body at `bodyIx`, or -1.
-// The alias hop is part of the lookup because this pass is global: an init that is itself a
-// bare local ident is the same miss one hop in (D41). Only an un-annotated link is followed,
-// since an annotation pins the cell's rep. One home, so its callers cannot drift apart.
-export function retLocalLetOfBlock(bodyIx: i32, rx: i32) {
-  const u = unwrapParen(rx)
-  if u < 0 || u >= P.nodes.length { return -1 }
-  const e = nodeAt(u)
-  if e is Ident {
-    let li = bodyLetOfRead(bodyIx, u)
-    let hops = 0
-    while li >= 0 && hops < 8 {
-      const d = nodeAt(li)
-      if d is LetDecl {
-        if d.letType >= 0 { return li }
-        const ivx = unwrapParen(d.letInit)
-        if ivx < 0 { return li }
-        const iv = nodeAt(ivx)
-        if iv is Ident {
-          const nx = bodyLetOfRead(bodyIx, ivx)
-          if nx < 0 { return li }
-          if nx == li { return li }
-          li = nx
-          hops = hops + 1
-        } else {
-          return li
-        }
-      } else {
-        return li
-      }
-    }
-    return li
-  }
-  -1
-}
-
-export function criRetLocalLet(rx: i32, i: i32) {
-  const fn = nodeAt(fnStmts[i])
-  if fn is FuncDecl { return retLocalLetOfBlock(fn.fnBody, rx) }
-  -1
-}
-
-// The node an empty-`[]` hole must be read off for return `rx` of function `i` — the return
-// expression when that is the literal, else the initializer of the local it names (D626).
-// It routes through `retLocalLetOfBlock`, which hops un-annotated alias chains and stops at
-// an annotated binding, whose annotation has already decided the cell's rep.
-export function criRetHoleNode(rx: i32, i: i32) {
-  if emptyArrLitIxOf(rx) >= 0 { return rx }
-  const rll = criRetLocalLet(rx, i)
-  if rll < 0 { return rx }
-  const d = nodeAt(rll)
-  if d is LetDecl {
-    if d.letType >= 0 { return rx }
-    return d.letInit
-  }
-  rx
 }
 
 // Whether the initializer is a nested-struct FIELD read — the one projection shape whose slot
