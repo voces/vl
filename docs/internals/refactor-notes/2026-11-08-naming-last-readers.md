@@ -37,6 +37,15 @@ The `monoPinnedTyParamCanon` probe's two programs are `type-param-name-shadows-b
 parameter named `i32`, whose `v: i32` the checker resolves to the builtin. The spelling test bound
 it by the coincidence of names; the type does not, which is the checker's ruling.
 
+Both seeds built to a fixpoint (a third `refresh-compiler.sh` byte-identical). Base is master
+`82072a24`; candidate is this branch with it merged.
+
+| | |
+|---|---|
+| sweep | 23,625: 23,625 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs` |
+| seed | 6,505,157 → 6,506,010 bytes (+853, 0.01%) |
+| pin-helper budget (`emit_mono.vl`) | 930 → 930 |
+
 ## What still reads a name, and why
 
 - **`recordClonedNodeTyFb`** (`monoSynthPinRef`, and the two substitution sites with no closed
