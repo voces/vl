@@ -43,4 +43,12 @@ candidate is this change, both fixpoint seeds.
 |---|---|---|
 | census both-phase classifiers | 5 | 5 |
 | `fnSigKeyOf` / `cloRetKindOf` pre-mono | 18 / 18 | 16 / 16 |
+| `cloRetValKind` pre-mono | 20 | 18 |
+| `blockTailIsClosure` / `exprIsClosureNoLocal` pre-mono | 23 / 23 | 22 / 22 |
+| ckey class table (47 classes; `hole-mono` root lambda / root named) | 11 / 1 | identical |
+| pin-helper budget (`emit_mono.vl`) | 927 | 927 |
 | fixpoint seed bytes | 6,570,293 | 6,570,581 (+288) |
+
+`scripts/sweep.vl` diff, base fixpoint against candidate fixpoint: 23,704 same, 0 bytes-only
+movers, 0 output movers, 0 `runs → not-runs`, 0 new traps. Every program builds byte-identical,
+so the instance count is unchanged. `scripts/gate.sh`: all 23 rows pass.
