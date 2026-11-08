@@ -20,15 +20,7 @@ import { inferRetTyIxAt } from "./check_infer_rows"
 import { nodeTyIsNullType, nodeTyIxOf, nodeTyPrimName } from "./check_node_tys"
 
 import { inferRetFnKey } from "./check_side_rows"
-import {
-  T,
-  TyArray,
-  TyFunc,
-  TyUnion,
-  litUnionAliasNameOfTy,
-  tyAt,
-  tyIsRecord,
-} from "./check_types"
+import { T, TyArray, TyFunc, TyUnion, tyAt } from "./check_types"
 import {
   PL_READ_UNPLACED,
   bodyLetOfRead,
@@ -74,7 +66,6 @@ import {
   emitCurFnIx,
   emitRootIx,
   fRetKind,
-  fRetStructIdx,
   fnParent,
   fnStmts,
   globalIndexBySid,
@@ -139,111 +130,6 @@ export function cloRetIsString(fe: i32) {
   false
 }
 
-// The override priority of a stored return kind: `criSetRetKind` lands a write only when
-// the new kind outranks the current one, so eager per-fact writes resolve to one kind
-// however they are ordered. Kinds that are mutually exclusive facts about a single return
-// share a tier, since neither may overwrite the other.
-function retKindPri(k: VKind) {
-  // Exhaustive over `VKind` and `_`-less: tier 0 is a real tier, not a fall-through, so a new
-  // kind has to choose one rather than inherit the cheap-fallback rank by omission.
-  match k {
-    "str" => {
-      return 1
-    }
-    "list" => {
-      return 2
-    }
-    "union" => {
-      return 3
-    }
-    "struct" => {
-      return 4
-    }
-    "variant" => {
-      // The concrete variant shares `struct`'s tier: a return is a plain struct or a union
-      // arm, never both (`collectS` skips a `TypeDecl` that `variantIndexOf` claims), so
-      // neither fact may overwrite the other and the strict `>` in `criSetRetKind` is that
-      // refusal. An annotated `: Cat` stays `"i32"` with its index in `fRetStructIdx`.
-      return 4
-    }
-    "nulstruct" => {
-      return 5
-    }
-    "nulvariant" => {
-      // D1562 — the nullable variant shares `nulstruct`'s tier, for the reason the concrete
-      // variant shares `struct`'s: the two are mutually exclusive facts about one return. At
-      // tier 0 `exprNullableStruct`'s cheap fallback, which cannot tell a union arm from a
-      // standalone struct, wins and leaves the pair (`"nulstruct"`, -1).
-      return 5
-    }
-    "reflist" => {
-      return 6
-    }
-    "strlist" => {
-      return 7
-    }
-    "f64list" => {
-      return 8
-    }
-    "i64list" => {
-      return 9
-    }
-    "f32list" => {
-      return 10
-    }
-    "u8list" => {
-      // The packed byte list shares `f32list`'s tier: the two are mutually exclusive facts
-      // about one return, so neither needs to outrank the other.
-      return 10
-    }
-    "map" => {
-      return 11
-    }
-    "nulmap" => {
-      // D937 — the nullable map ranks above `map`, which is not mutually exclusive with it:
-      // the name ladder records `nulmap`, then a later write records the non-null `map` fact
-      // about the same return, and at tier 0 that later write wins — result valtype
-      // `(ref $mapStruct)`, and a bare `return null` reaching `emitNullLitNode` with no context.
-      return 12
-    }
-    "nulstr" => {
-      return 12
-    }
-    "nulclosure" => {
-      // D1622 — the nullable CLOSURE shares the nullable-niche tier with the two above. It
-      // outranks the non-null and struct-ish arms for `nulmap`'s reason (a later cheap write
-      // must not lower a niche the name ladder settled), and shares rather than outranks its
-      // tier-mates for `nulvariant`'s: a return is one nullable niche, never two.
-      return 12
-    }
-    "i64" => {
-      return 13
-    }
-    "f64" => {
-      return 13
-    }
-    "f32" => {
-      return 13
-    }
-    "v128" => {
-      // The SIMD scalar shares the scalar tier: a return is a v128 or something else, never
-      // both, exactly as the i64/f64/f32 arms above.
-      return 13
-    }
-    "nulnone" => {
-      // D1567 — the `null` type shares the top tier: a return whose every value is a bare
-      // `null` is the `null` type or something else, never both. The strict `>` is what stops
-      // an expression fact lowering a kind the checker already settled.
-      return 13
-    }
-    "i32" | "closure" | "nullist" | "nulbool" | "nulreflist" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" => {
-      // Tier 0, the cheap-fallback rank every eager per-fact write starts from: these are
-      // the kinds no rung outranks, and naming them is what makes a 32nd kind a compile error.
-      return 0
-    }
-  }
-}
-
 // The arena type the checker inferred for un-annotated function `i`'s return, or -1.
 function fnInferredRetTy(i: i32): i32 {
   if i < 0 || i >= fnStmts.length { return -1 }
@@ -280,18 +166,6 @@ export function fnCheckedRetTy(i: i32): i32 {
   const t = fnInferredRetTy(i)
   if t >= 0 { return t }
   lambdaCheckedRetTy(i)
-}
-
-// Settle un-annotated function `i`'s `nulstruct` result at `struct` when the checker typed
-// its return a non-null record: a field read classifies at the field's `(ref null $S)` slot,
-// and a call through the function's type expects `(ref $S)` exactly (D3682). The return
-// boundary then owes, and `retNeedsNonNullRecover` emits, the `ref.as_non_null`.
-export function criSettleNonNullRecordRet(i: i32) {
-  if i < 0 || i >= fRetKind.length || i >= fRetStructIdx.length { return 0 }
-  if fRetKind[i] != "nulstruct" || fRetStructIdx[i] < 0 { return 0 }
-  const t = fnCheckedRetTy(i)
-  if tyIsRecord(t) { fRetKind[i] = "struct" }
-  0
 }
 
 // The checker's refusal of `prop` (`OP_INDEX_GET` for an index) on the receiver `recvIx` when
@@ -351,32 +225,6 @@ export function listUnionSharedRep(ty: i32): i32 {
   t.uMembers[0]
 }
 
-// Whether un-annotated function `i`'s checker-inferred return has a registered literal union's
-// member set, asked by set as the return's narrowing asks it: a string-repped member read it
-// returns narrows at the return, so the signature must not follow that read's own rep (D2153).
-export function fnInferredRetLitAtom(i: i32): boolean {
-  if i < 0 || i >= fnStmts.length { return false }
-  const fn = nodeAt(fnStmts[i])
-  if fn is FuncDecl {
-    if fn.fnRet >= 0 { return false }
-    let row = inferRetRowOf(inferRetFnKey(fnStmts[i], fn.fnName))
-    if row < 0 { row = inferRetRowByNode(fnStmts[i]) }
-    if row < 0 { return false }
-    return litUnionAliasNameOfTy(inferRetTyIxAt(row)) != ""
-  }
-  false
-}
-
-// Store an inferred return-kind fact for function `i`: the write happens only when it
-// outranks the current kind (`retKindPri`). Returns true exactly when it does.
-export function criSetRetKind(i: i32, k: VKind) {
-  if retKindPri(k) > retKindPri(fRetKind[i]) {
-    fRetKind[i] = k
-    return true
-  }
-  false
-}
-
 // The stored return kind of an annotated return-type node `tyIx` — the flag producers in
 // last-match order, which is what `buildFnMap` seeds `fRetKind` from. An i64 or f32 list
 // annotation is deliberately not flagged here (an annotated `i64[]` return rides the typed
@@ -408,7 +256,7 @@ export function retAnnKindChain(tyIx: i32): VKind {
 }
 
 // The result valtype kind of a function's return — the stored `fRetKind` slot, seeded by
-// `buildFnMap` and refined by `computeRetInference`'s eager writes.
+// `buildFnMap` and refined by `fnRetColsFromRecorded`'s eager writes.
 export function inferredRetKindCore(ti: i32): VKind { fRetKind[ti] }
 
 // Whether function `fnIx` is a generic's instance or is lifted inside one.
