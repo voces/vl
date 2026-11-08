@@ -1,6 +1,7 @@
 import { isTestAnswer } from "./check_narrow_flow"
 import {
   boxDstShadowArmed,
+  boxDstShadowAs,
   boxDstShadowEnter,
   boxDstShadowLeave,
   boxDstShadowNote,
@@ -1442,6 +1443,7 @@ import {
   unionRefArrayArmSlotForMapElem,
   unionRefArrayArmSlotForNestedElem,
   unionSetHasAtom,
+  unionSpellingOfTy,
   valueUnionKeyTextOfTy,
   valueUnionNameOfTy,
 } from "./emit_union_atoms"
@@ -2882,7 +2884,19 @@ export function emitUnionBoxOwed(
   fnIx: i32,
 ): i32 {
   if boxOwedAt(valIx, fnIx) { return emitDelivered(body, valIx, fnIx) }
+  if boxDstShadowArmed() { boxDstShadowAs(boxFloorWhy(valIx, fnIx)) }
   emitUnionBoxArg(body, siteNm, siteTy, valIx, fnIx)
+}
+
+// Why a position the table serves boxes `valIx` at its own union, for the box shadow.
+function boxFloorWhy(valIx: i32, fnIx: i32): string {
+  if exprUnion(valIx, fnIx) { return "floor: already a box" }
+  if callIsNever(unwrapParen(valIx)) { return "floor: never returns" }
+  const r = boxRecordTyAt(valIx, fnIx)
+  if r < 0 { return "floor: no record" }
+  const k = repOfTy(r).rdKind
+  if k != "union" { return "floor: rep " + k }
+  "floor: no row"
 }
 
 function emitScalarFieldStoreVal(body: u8[], valIx: i32, fnIx: i32, code: i32) {
@@ -7931,7 +7945,7 @@ function emitNulMapArmBox(
   fbEnd()
   fbDrop()
   if defIx >= 0 {
-    if emitUnionBoxArg(body, unionName, unionTy, defIx, fnIx) < 0 { return -1 }
+    if emitUnionBoxOwed(body, unionName, unionTy, defIx, fnIx) < 0 { return -1 }
   } else {
     fbI32Rel(RS_TAG, nullBoxTag())
     fbRefNullNone()
@@ -8039,11 +8053,17 @@ function boxRecordTyAt(ix: i32, fnIx: i32): i32 {
   instTyOrSelf(r, fnIx)
 }
 
-// The registered name of the union row recorded type `ty` names (`unRowOfRecordTy`), or "".
+// The registered name of the union row recorded type `ty` names (`unRowOfRecordTy`); for a value
+// union no row registered, its spelling, since its box is tagged by its members alone, and for a
+// nullable function set, whose value is its member tag, `i32|null`; else "".
 function boxRecordNameOf(ty: i32): string {
   const r = unRowOfRecordTy(ty)
-  if r < 0 || r >= unNames.length { return "" }
-  unNames[r]
+  if r >= 0 && r < unNames.length { return unNames[r] }
+  const d = tyAt(ty)
+  if d is TyNullable && d.nInner >= 0 && tyAt(d.nInner) is TyFunc {
+    if repOfTy(d.nInner).rdKind == "i32" { return "i32|null" }
+  }
+  unionSpellingOfTy(ty, 8)
 }
 
 // `emitUnionBoxArg` into the union the checker records `valIx` delivered into, where a registry
@@ -14189,7 +14209,7 @@ function emitMapGetOrUnionBox(
   fbI32Rel(RS_TAG, nullBoxTag())
   fbI32Bin(70)            // 0x46 i32.eq → null?
   fbIf(64)
-  if emitUnionBoxArg(body, uvn, mvValTyIxAt(mslot), defIx, fnIx) < 0 {
+  if emitUnionBoxOwed(body, uvn, mvValTyIxAt(mslot), defIx, fnIx) < 0 {
     return -1
   }
   fbLocalSet(stashL)
@@ -14458,7 +14478,13 @@ function emitMapGetOrScalarBox(body: u8[], ak: i32, defIx: i32, fnIx: i32) {
   fbStructNew(uBoxIdx)
   fbElse()
   if (
-    emitUnionCoerce(body, scalarAtomNameOfKind(ak) + " | null", -1, defIx, fnIx)
+    emitUnionBoxOwed(
+      body,
+      scalarAtomNameOfKind(ak) + " | null",
+      -1,
+      defIx,
+      fnIx,
+    )
     < 0
   ) {
     return -1
@@ -15106,7 +15132,7 @@ function emitMapSetValExpr(
   if mslot >= 0 && mvValKind[mslot] == MVK_UNION {
     // A UNION-valued map: box the stored value into the shared union box (a concrete
     // VARIANT value boxes via `emitUnionBoxArg`, like a call arg / return).
-    return emitUnionBoxArg(
+    return emitUnionBoxOwed(
       body,
       mvValName[mslot],
       mvValTyIxAt(mslot),
@@ -21944,7 +21970,7 @@ function emitNulArmToLocal(
     // kind-8 `(ref $variant)`) must be boxed to match, exactly as `emitUnionIfArm` and a
     // variant return do. `emitUnionBoxArg` boxes a variant ref and defers every other shape
     // to `emitUnionCoerce` — plain `emitUnionCoerce` alone would store the raw variant ref, invalid wasm.
-    if emitUnionBoxArg(body, unionName, unionTy, valIx, fnIx) < 0 { return -1 }
+    if emitUnionBoxOwed(body, unionName, unionTy, valIx, fnIx) < 0 { return -1 }
   } else if rep == 1 {
     // rep 1: a `string | null` arm — a non-null string passes through, a bare `null`
     // lowers as `ref.null $sTypeIdx`. A literal-union atom arm is the one non-null value
@@ -26904,7 +26930,7 @@ function emitAssignIdent(
     } else {
       const cNm = if recNm != "" { recNm } else { aUNm }
       const cTy = if recNm != "" { recTy } else { nodeTyIxOf(lhsIx) }
-      if emitUnionCoerce(body, cNm, cTy, a.binRight, fnIx) < 0 { return -1 }
+      if emitUnionBoxOwed(body, cNm, cTy, a.binRight, fnIx) < 0 { return -1 }
     }
   } else if exprNulLitUnion(lhsIx, fnIx) {
     // a `K | null` niche target: the i32 cell holds an atom id or sentinel `-1`. Seeded
@@ -29603,6 +29629,7 @@ function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
     const bt = boxRecordTyAt(exprIx, fnIx)
     const seat = boxSeat
     boxSeat = -1
+    if boxDstShadowArmed() { boxDstShadowAs("table") }
     const rb = emitUnionBoxArg(body, boxRecordNameOf(bt), bt, exprIx, fnIx)
     boxSeat = seat
     return rb
@@ -31774,7 +31801,7 @@ function emitLetInitValue(
       if letArmBoxed < 0 { return -1 }
     }
     if letArmBoxed == 0 {
-      if emitUnionCoerce(body, letUNm, letUTy, s.letInit, fnIx) < 0 {
+      if emitUnionBoxOwed(body, letUNm, letUTy, s.letInit, fnIx) < 0 {
         return -1
       }
     }
@@ -35318,7 +35345,7 @@ function emitPrintValueUnion(body: u8[], argIx: i32, kinds: i32[], fnIx: i32) {
   if puIf is IfStmt {
     const puNm = unionNameOfExpr(argIx, fnIx)
     if puNm != "" {
-      if emitUnionCoerce(body, puNm, nodeTyIxOf(argIx), argIx, fnIx) < 0 {
+      if emitUnionBoxOwed(body, puNm, nodeTyIxOf(argIx), argIx, fnIx) < 0 {
         return -1
       }
       puDone = true
@@ -36753,7 +36780,7 @@ function njStash(
     if exprUnion(ix, fnIx) {
       sr = emitExpr(body, ix, fnIx)
     } else {
-      sr = emitUnionCoerce(
+      sr = emitUnionBoxOwed(
         body,
         valueUnionKeyTextOfTy(nodeTyIxOf(ix)),
         nodeTyIxOf(ix),
@@ -38231,7 +38258,7 @@ function emitDirectArgValue(
   } else if cUNm != "" && !boxOwedAt(arg, fnIx) {
     // `cUNm` is set only for a kind-4 union-BOX param (see above). The floor: an argument with
     // no usable record (one still naming an open type parameter) boxes at the parameter's union.
-    if emitUnionBoxArg(body, cUNm, sd.cUTy, arg, fnIx) < 0 { return -1 }
+    if emitUnionBoxOwed(body, cUNm, sd.cUTy, arg, fnIx) < 0 { return -1 }
   } else if cUNm != "" {
     if emitDelivered(body, arg, fnIx) < 0 { return -1 }
   } else {
@@ -38482,7 +38509,7 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
       // one with no usable record at the parameter's union.
       if emitDelivered(body, cargs[cai], fnIx) < 0 { return -1 }
     } else if cuNm != "" {
-      if emitUnionBoxArg(body, cuNm, cuTy, cargs[cai], fnIx) < 0 { return -1 }
+      if emitUnionBoxOwed(body, cuNm, cuTy, cargs[cai], fnIx) < 0 { return -1 }
     } else if cpKind == "i64" {
       if emitExprAsI64(body, cargs[cai], fnIx) < 0 { return -1 }
     } else if cpKind == "f64" {
@@ -39444,7 +39471,7 @@ function emitCoalesceBoxRuntime(
   fbLocalGet(bSlot)
   fbRefAsNonNull()
   fbElse()
-  if emitUnionBoxArg(body, bNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0 {
+  if emitUnionBoxOwed(body, bNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0 {
     return -1
   }
   fbEnd()
@@ -39492,7 +39519,7 @@ function emitOptCoalesceBoxLeaf(
     if emitCoalesceScalarDefault(body, e.binRight, bk, fnIx) < 0 { return -1 }
   } else {
     fbIfRef(uBoxIdx)
-    if (emitUnionBoxArg(body, bNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
+    if (emitUnionBoxOwed(body, bNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
       return -1
     }
   }
@@ -40121,7 +40148,7 @@ function emitCoalesceValUnionIdent(
     // Through `emitUnionCoerce`, not `emitExpr` (D801): the block type is the box, so a bare
     // `null` default, which has no rep of its own, arrives as the null-tagged box the coerce's
     // `NullLit` arm builds; every non-null default passes through unchanged.
-    if emitUnionCoerce(body, cCoerceN, cCoerceTy, e.binRight, fnIx) < 0 {
+    if emitUnionBoxOwed(body, cCoerceN, cCoerceTy, e.binRight, fnIx) < 0 {
       return -1 // d, its own box
     }
     fbElse() // 0x05 else — present → the LHS box, re-read
@@ -40280,7 +40307,7 @@ function emitCoalesceCallStash(
           // so a `T | null` if-expression came back as a bare i32; the coerce's own `IfStmt`
           // arm (`emitUnionIfValue`) makes the blocktype the box, with a missing else as the null-tagged arm.
           if (
-            emitUnionCoerce(body, kunm, nodeTyIxOf(lhsIx), e.binLeft, fnIx)
+            emitUnionBoxOwed(body, kunm, nodeTyIxOf(lhsIx), e.binLeft, fnIx)
             < 0
           ) {
             return -1 // the box, evaluated ONCE
@@ -40313,7 +40340,7 @@ function emitCoalesceCallStash(
             // decision: one lowering over one rep, so a bare `null` default must box
             // identically at both spellings.
             if (
-              emitUnionCoerce(body, kCoerceN, kCoerceTy, e.binRight, fnIx)
+              emitUnionBoxOwed(body, kCoerceN, kCoerceTy, e.binRight, fnIx)
               < 0
             ) {
               return -1 // d, its own box
@@ -40496,7 +40523,7 @@ function emitCoalesceUnionField(
             // THROUGH `emitUnionCoerce` — the D801 seed, the third of the three
             // boxed-union `??` spellings that share this lowering.
             if (
-              emitUnionCoerce(body, mCoerceN, mCoerceTy, e.binRight, fnIx)
+              emitUnionBoxOwed(body, mCoerceN, mCoerceTy, e.binRight, fnIx)
               < 0
             ) {
               return -1 // d, its own box
@@ -40920,7 +40947,7 @@ function emitCoalesceNullableRefs(
       fbRefAsNonNull() // the stash cell is nullable, the block type is not
       fbElse()
       if (
-        emitUnionBoxArg(body, coNm, nodeTyIxOf(exprIx), e.binRight, fnIx)
+        emitUnionBoxOwed(body, coNm, nodeTyIxOf(exprIx), e.binRight, fnIx)
         < 0
       ) {
         return -1
