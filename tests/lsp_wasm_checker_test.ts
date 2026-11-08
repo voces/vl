@@ -391,9 +391,8 @@ Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its st
   // pass and `emitReturnValue` the arms the annotated path already had. Any still-open
   // capability gap serves; what this asserts is the CHANNEL, not the gap.
   // D956 CLOSED THE STRING-KEYED MAP ENTIRELY, so the witness moved a FOURTH time — to
-  // `i64[] | null`. D1062 then closed the nullable LIST at every element type (the pin
-  // `synthNulListRetAnns` gives a named function's inferred `T[] | null` return the
-  // annotation the user did not write), which is why it has moved a FIFTH. What still floors
+  // `i64[] | null`. D1062 then closed the nullable LIST at every element type, which is why
+  // it has moved a FIFTH. What still floors
   // on this channel is the i32-KEYED map: `nullableRetName`'s map arm requires a `string`
   // key. The annotated twin runs, so it is a capability gap and the witness will move again.
   // `scripts/capability-probes/inferred-nullable-container-return.vl` and
