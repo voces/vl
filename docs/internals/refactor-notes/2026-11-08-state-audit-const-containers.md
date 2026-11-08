@@ -24,14 +24,14 @@ is safe when one of these holds, and `--check` refuses the rest:
 A list entry naming no written container, or one a rule already covers, stops the audit, so the
 reviewed lists cannot go stale silently.
 
-## Counts, on this tree (master `4d0f7cf4` plus this PR)
+## Counts, on this tree (master `eb1683ea` plus this PR)
 
 256 container `const`s, 157 written: 3 prologue, 2 inner, 31 balanced, 44 stamped, 37 scoped,
 40 instance, **0 NEVER**. Before the fixes, 5 were NEVER:
 
 | container | module | verdict | fix |
 | --- | --- | --- | --- |
-| `lpExits` | check_if_value | leak, witnessed by #6759 | #6759's own fix, carried identically |
+| `lpExits` | check_if_value | leak, witnessed by #6759 | #6759 (this audit names it on #6759's parent) |
 | `scWrPlaces`, `scWrTys` | check_narrow_flow | node-keyed, nothing resets | `let`, `scWrReset()` in `checkProgramPass` |
 | `idShadowReads`, `idShadowRows` | id_shadow_state | node-keyed / report rows accumulate | `let`, emptied in `setIdShadow` |
 
@@ -54,5 +54,5 @@ container rule gates every PR. `gate.sh` has no row by design: the test above ho
 
 ## Open
 
-The `let` half still reads only the emitter modules (plus `check_if_value.vl` once #6759 lands). The checker
+The `let` half still reads only the emitter modules (plus #6759's `check_if_value.vl`). The checker
 and front-end `let`s are the same hazard and have no audit.
