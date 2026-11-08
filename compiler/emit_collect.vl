@@ -42,6 +42,7 @@ import {
   fnTagHoldsTy,
   fnTagSetIsTagged,
   fnTagSetOfTy,
+  fnWidenedSourceSets,
 } from "./check_elab_cap"
 import {
   annGenAppSpanEnds,
@@ -2381,21 +2382,94 @@ function fnRetRefListRowJoin(i: i32): i32 {
   const vals: i32[] = []
   collectRetValues(fn.fnBody, vals)
   let row = -1
-  let sig = ""
+  const sigs: string[] = []
   for v in vals {
     // An empty list literal holds no element, so it is built at whatever row the others join.
     const ev = unwrapParen(v)
     const evn = if ev >= 0 { nodeAt(ev) } else { null }
     if evn is ArrayLit && evn.arrElems.length == 0 { continue }
     const vs = retListValueSig(v)
-    if vs == "!" || (sig != "" && vs != sig) { return -2 }
-    sig = vs
+    if vs == "!" { return -2 }
+    sigs.push(vs)
     const r = retListValueRow(v, i)
     if r < 0 { return -1 }
     if row >= 0 && r != row { return -2 }
     row = r
   }
+  // A value holding a set another's widened from holds its ids, so one row builds both.
+  let top = false
+  for t in sigs {
+    let all = true
+    for vs in sigs {
+      if all && vs != t && retListSigWiden(t, vs) != 1 { all = false }
+    }
+    if all { top = true }
+  }
+  if sigs.length > 0 && !top { return -2 }
   if row >= 0 { row } else { -1 }
+}
+
+// How fingerprints `a` and `b` (`retListValueSig`) differ: 1 when each set `b` names where `a`
+// names another is one widened into `a`'s, 2 the other way round, 0 when equal, -1 otherwise.
+function retListSigWiden(a: string, b: string): i32 {
+  let dir = 0
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if i < a.length && j < b.length && a[i] == b[j] && !retSigSetAt(a, i) {
+      i = i + 1
+      j = j + 1
+      continue
+    }
+    if !retSigSetAt(a, i) || !retSigSetAt(b, j) { return -1 }
+    const ea = retSigNumEnd(a, i + 1)
+    const eb = retSigNumEnd(b, j + 1)
+    const sa = retSigNum(a, i + 1, ea)
+    const sb = retSigNum(b, j + 1, eb)
+    if sa != sb {
+      const d = if sa >= 0 && i32ListHas(fnWidenedSourceSets(sa), sb) {
+        1
+      } else if sb >= 0 && i32ListHas(fnWidenedSourceSets(sb), sa) {
+        2
+      } else {
+        -1
+      }
+      if d < 0 || (dir != 0 && dir != d) { return -1 }
+      dir = d
+    }
+    i = ea
+    j = eb
+  }
+  dir
+}
+
+// Whether a set id `s<n>` starts at `i` of fingerprint `s`, after a value position's opener.
+function retSigSetAt(s: string, i: i32): boolean {
+  if i >= s.length || s[i] != 's' || i + 1 >= s.length { return false }
+  if !(s[i + 1] == '-' || (s[i + 1] >= '0' && s[i + 1] <= '9')) { return false }
+  if i > 0 && s[i - 1] != ':' && s[i - 1] != '[' && s[i - 1] != ',' { return false }
+  const e = retSigNumEnd(s, i + 1)
+  e >= s.length || s[e] != ':'
+}
+
+// The end of the set number starting at `i` of `s`.
+function retSigNumEnd(s: string, i: i32): i32 {
+  let e = i
+  if e < s.length && s[e] == '-' { e = e + 1 }
+  while e < s.length && s[e] >= '0' && s[e] <= '9' { e = e + 1 }
+  e
+}
+
+// The set number spelled in `s` from `i` to `e`; -1 for a negative one.
+function retSigNum(s: string, i: i32, e: i32): i32 {
+  if i < e && s[i] == '-' { return -1 }
+  let v = 0
+  let k = i
+  while k < e {
+    v = v * 10 + (s[k] - '0')
+    k = k + 1
+  }
+  v
 }
 
 // The ref-list row returned value `v` of function `i` is built at: its stamp's row, else a list
