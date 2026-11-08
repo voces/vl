@@ -8,7 +8,7 @@
 | where | change |
 | --- | --- |
 | `check_fn_decl.vl` `solveUnannotParams` | a hole that flows into two different function types is left unsolved (`holeFlowsToTwoFns`). The call then binds it per call as `Fn#id` (#6893's binding). |
-| `emit_mono.vl` `monoPinTyParamComposite` | `monoArgIsHeldGeneric`: an un-annotated parameter that the instance binds to a set of named generics takes the type the value arguments bind, as a bare generic name does. That gives `U`. |
+| `emit_mono.vl` `monoPinTyParamComposite` | `monoArgIsOpenFnValue` also accepts an un-annotated parameter that the instance binds to a set of named generics takes the type the value arguments bind, as a bare generic name does. That gives `U`. |
 | same | the elaboration's hand member (`elabCallHandMember`) is noted for a function-typed parameter too, not only for a hole parameter, so the bundle `a` hands the member at `(i32) => i32` and `(string) => string`. |
 
 An earlier try made only the checker change. That moved the row to an emit reject
@@ -20,7 +20,8 @@ above. Neither one is in `monoArgTyNameCascade`.
 | instrument | base (fixpoint of master `0b10a9ff` + `b3df267c`) | candidate |
 | --- | --- | --- |
 | canonical sweep, 23,736 programs | | 1 output mover, D10382 `check_reject -> runs`. 0 runs -> not-runs, 0 new traps, 0 bytes-only movers |
-| seed | 6,579,801 | 6,580,634 (+833) |
+| seed | 6,579,801 | 6,580,531 (+730), +2.9% of the seed-size baseline |
+| pin-helper budget | 921 | 921 (the new arm is folded into `monoArgIsOpenFnValue`) |
 
 ## Neighbours
 
