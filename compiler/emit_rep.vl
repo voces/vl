@@ -108,7 +108,7 @@ import { nodeTyIsUnionAlias, primTyOfName } from "./check_decl_scan"
 import { nodeHoleElemOf } from "./check_side_rows"
 import { canonUnionKeyOfTy } from "./check_nj_join"
 import { boxRowMembersInto } from "./check_program"
-import { fnTagHoldsTy, fnTagTyIsTagged } from "./check_elab_cap"
+import { fnSetGroupRep, fnTagHoldsTy, fnTagSetOfTy, fnTagTyIsTagged } from "./check_elab_cap"
 import {
   PrimName,
   T,
@@ -1393,6 +1393,7 @@ const HC_RLI32 = 14 // `"$rlI32L"` — elem key only
 const HC_RLSTR = 15 // `"$rlStrL"` — elem key only
 const HC_NAME = 16 // the unresolvable-spelling key `"name:<nm>"`, arg = the name's sid
 const HC_FIELDSET = 17 // a shape row's (field name sid, field code) multiset, name-sorted
+const HC_FNGRP = 18 // a tagged function position in a row's field, arg = its set group's representative
 
 let hcTag: i32[] = []
 let hcArgStart: i32[] = []
@@ -1847,13 +1848,57 @@ function hcCanonObjId(t: TyObj, mode: RepKeyMode): i32 {
     const ft = hcRowFieldTy(repCanonFieldTy(t.objFieldTypes[fx]), mode)
     const asSet = repFieldLitAsSet(ft)
     const fm = hcRowFieldMode(ft, mode)
-    const c = if asSet.length > 0 { hcUnionId(asSet, fm) } else { repIdOf(ft, fm) }
+    const c = if asSet.length > 0 { hcUnionId(asSet, fm) } else if mode == "row" { hcRowHeldId(ft, fm) } else { repIdOf(ft, fm) }
     a.push(sortedSid[i])
     a.push(c)
     len = len + t.objFieldNames[fx].length + 1 + hcLenOf(c) + 1
     i = i + 1
   }
   hcIntern(HC_OBJ, a, len)
+}
+
+// A row field's id where the field is a list (or nullable list) whose leaf is a tagged function:
+// the leaf keys as its set group, since the sets of one group share one row (D15560). Any other
+// field is `repIdOf` in `fm`.
+function hcRowHeldId(ft: i32, fm: RepKeyMode): i32 {
+  if ft < 0 || ft >= T.tys.length || !hcHoldsTaggedLeaf(ft) { return repIdOf(ft, fm) }
+  const t = tyAt(ft)
+  if t is TyFunc {
+    const a: i32[] = []
+    const g = fnSetGroupRep(fnTagSetOfTy(ft))
+    a.push(g)
+    return hcIntern(HC_FNGRP, a, 3 + hcDigits(g))
+  }
+  if t is TyArray {
+    const c = hcRowHeldId(t.aElem, fm)
+    const a: i32[] = []
+    a.push(c)
+    return hcIntern(HC_ARRAY, a, hcLenOf(c) + 2)
+  }
+  if t is TyNullable {
+    const c = hcRowHeldId(t.nInner, fm)
+    const a: i32[] = []
+    a.push(c)
+    return hcIntern(HC_NUL, a, hcLenOf(c) + 1)
+  }
+  repIdOf(ft, fm)
+}
+
+// Whether `ft` is a tagged function type under list and non-union nullable layers.
+function hcHoldsTaggedLeaf(ft: i32): boolean {
+  let c = ft
+  while c >= 0 && c < T.tys.length {
+    const t = tyAt(c)
+    if t is TyFunc { return fnTagTyIsTagged(c) && fnTagSetOfTy(c) >= 0 }
+    if t is TyArray {
+      c = t.aElem
+    } else if t is TyNullable && t.nInner >= 0 && !(tyAt(t.nInner) is TyUnion) {
+      c = t.nInner
+    } else {
+      return false
+    }
+  }
+  false
 }
 
 // The type a record field is keyed by: a row keys a nullable record field as the record, since
