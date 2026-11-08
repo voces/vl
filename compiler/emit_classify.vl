@@ -157,7 +157,11 @@ import {
 } from "./check_elab_cap"
 import { mapStoredTyOf } from "./check_fn_tag_facts"
 import { canonUnionMembersInto } from "./check_program"
-import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
+import {
+  inferRetFnKey,
+  mapDeliveryRecorded,
+  nodeHoleElemOf,
+} from "./check_side_rows"
 import { tyVarsOwnScheme } from "./check_subst"
 import {
   MAP_KEY_I32,
@@ -358,7 +362,6 @@ import {
   calleeRetIsNulLitUnion,
   cloArrSlotSigKey,
   cloCallCalleeFnTy,
-  cloCallResultLitUnion,
   exprIsFloatLit,
   fnHasParamNamed,
   sigTakesParams,
@@ -848,7 +851,6 @@ import {
   mapRecvTyIn,
   mapTyPeel,
   nodeIsValueJoin,
-  nodeRepIn,
   nodeTyInOf,
   pinnedParamTyAt,
   readContainerTyAt,
@@ -908,6 +910,7 @@ import {
   memoMoved,
   memoMoved3,
   memoPassMoved,
+  tyRegWrites,
 } from "./memo"
 import {
   declOrigOf,
@@ -1732,10 +1735,50 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32): boolean {
 // The rep kind of the type binding `letIx` holds inside `fnIx` (`letBindTy`), or null where that
 // type has no covered rep, an open one at a generic's template included.
 export function letBindRepKind(letIx: i32, fnIx: i32): VKind | null {
-  const rd = repOfTy(letBindTy(letIx, fnIx))
-  if rd.rdCovered != 1 { return null }
-  rd.rdKind
+  repKindOfTyMemo(letBindTy(letIx, fnIx))
 }
+
+// `repOfTy(ty)`'s kind, or null where it is uncovered, memoised per arena type within one pass
+// and one type-registry generation, so a classifier reading a column per node builds no
+// descriptor per read.
+function repKindOfTyMemo(ty: i32): VKind | null {
+  if ty < 0 { return null }
+  if ty < rkMemoGen.length {
+    if (
+      rkMemoGen[ty] == rkGen.at
+      && rkMemoPass[ty] == emitPassGen
+      && rkMemoReg[ty] == tyRegWrites
+    ) {
+      if rkMemoNul[ty] == 1 { return null }
+      return rkMemoKind[ty]
+    }
+  }
+  const rd = repOfTy(ty)
+  while rkMemoGen.length <= ty {
+    rkMemoGen.push(-1)
+    rkMemoPass.push(-1)
+    rkMemoReg.push(-1)
+    rkMemoKind.push("list")
+    rkMemoNul.push(1)
+  }
+  rkMemoGen[ty] = rkGen.at
+  rkMemoPass[ty] = emitPassGen
+  rkMemoReg[ty] = tyRegWrites
+  if rd.rdCovered == 1 {
+    rkMemoKind[ty] = rd.rdKind
+    rkMemoNul[ty] = 0
+    return rd.rdKind
+  }
+  rkMemoNul[ty] = 1
+  null
+}
+
+const rkGen = memoGenNew(0)
+const rkMemoGen: i32[] = []
+const rkMemoPass: i32[] = []
+const rkMemoReg: i32[] = []
+const rkMemoKind: VKind[] = []
+const rkMemoNul: i32[] = []
 
 // The nullable distinct-backing list kind (`nulstrlist`, `nulf64list`, …) of the value at
 // `exprIx`, or null for any other value, a narrowed one included.
@@ -5394,7 +5437,6 @@ export function exprScalarWidth(exprIx: i32, fnIx: i32): string {
 
 // `k` where it names a scalar width, else "".
 function scalarKindWidth(k: string): string {
-  if clsCensusOn { clsCensusEnter("scalarKindWidth") }
   if k == "i32" || k == "i64" || k == "f32" || k == "f64" || k == "v128" {
     k
   } else {
@@ -5922,7 +5964,6 @@ export function instanceOperandTyOf(exprIx: i32, fnIx: i32): i32 {
 // The kind a `for`'s loop variable binds at in `fnIx`: the rep of the element its iterable's type
 // yields there (a map's key, a string's code unit). Null where the iterable binds no element.
 export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("forInElemKind") }
   repSigKindOfTy(forInBindTy(forInIterTyAt(iterIx, fnIx), false))
 }
 
@@ -8962,10 +9003,20 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
   // join is a genuine `T | null` and the niche paths own it. An else-less `if` used as a value
   // is `T | null`, and here `T` is already `null`.
   if e is IfStmt {
-    if !armIsNulNone(ifArmValueExpr(e.ifThen), fnIx) { return false }
+    const tv = ifArmValueExpr(e.ifThen)
+    if (
+      tv < 0
+      || !(exprIsNullLit(tv) || callIsNever(tv) || nodeRepIs(tv, "nulnone", fnIx))
+    ) {
+      return false
+    }
     if e.ifElse < 0 { return true }
     if nodeAt(e.ifElse) is IfStmt { return exprIsNulNone(e.ifElse, fnIx) }
-    return armIsNulNone(ifArmValueExpr(e.ifElse), fnIx)
+    const ev = ifArmValueExpr(e.ifElse)
+    return ev >= 0
+      && (exprIsNullLit(ev)
+      || callIsNever(ev)
+      || nodeRepIs(ev, "nulnone", fnIx))
   }
   // A struct field of the `null` unit type reads its `nullref` slot (D4671).
   if e is Member { return memberFieldCode(exprIx, fnIx) == FC_NUL_NONE }
@@ -9022,14 +9073,6 @@ function methodCallIsNulNone(cfx: i32, fnIx: i32): boolean {
       && mapTyValIsNullUnit(mapRecvTyIn(cf.memObj, fnIx))
   }
   arrElemIsNullUnitAt(cf.memObj, fnIx)
-}
-
-// Does the if-arm tail value `v` add nothing but `null` to the join? A bare `null`, a `null`-typed
-// value, or the `never` tail of an arm that always exits, which hands no value over (D3355).
-function armIsNulNone(v: i32, fnIx: i32): boolean {
-  if clsCensusOn { clsCensusEnter("armIsNulNone") }
-  if v < 0 { return false }
-  exprIsNullLit(v) || callIsNever(v) || exprIsNulNone(v, fnIx)
 }
 
 // D1576 — `x ?? d` where `x` is the `null` type is exactly `d`, so a classifier asked about
@@ -12892,7 +12935,6 @@ const READ_LIST_TO: VKind[] = [
 
 // The list kind a read of read rep `r` reads, or null for a read of anything else.
 function readListKindOf(r: string): VKind | null {
-  if clsCensusOn { clsCensusEnter("readListKindOf") }
   let i = 0
   while i < READ_LIST_FROM.length {
     if READ_LIST_FROM[i] == r { return READ_LIST_TO[i] }
@@ -12906,7 +12948,25 @@ function readListKindOf(r: string): VKind | null {
 // compared with one kind, so no two of them can claim one expression (D2275).
 export function exprListRep(exprIx: i32, fnIx: i32): VKind | null {
   if exprIx < 0 || tyIsNoListHead(nodeTyIxOf(exprIx)) { return null }
-  listOfColumn(listColumnDesc(exprIx, fnIx))
+  // The checked-rep column at its instance's type, or at its receiver's list for a read an
+  // `is K[]` narrowed (D4916). Only a node's own type read through its hole asks the node.
+  const nrt = listNarrowRecvTyOf(exprIx, fnIx)
+  const ty = if nrt >= 0 { nrt } else { nodeTyInOf(exprIx, fnIx) }
+  if nodeHoleElemOf(exprIx) >= 0 && ty == nodeTyIxOf(exprIx) {
+    const d = repOfNodeAt(exprIx, ty)
+    return if d.rdCovered == 1 { listOfKind(d.rdKind) } else { null }
+  }
+  const k = repKindOfTyMemo(ty)
+  if k == null { return null }
+  listOfKind(k)
+}
+
+// The non-null list kind `k` names, a nullable list's being its list's, or null.
+function listOfKind(k: VKind): VKind | null {
+  const c = vkListClass(k)
+  if c == 1 { return k }
+  if c == 2 { return nulListBase(k) }
+  null
 }
 
 // Whether a node recorded at `ty` is no list at any instance, read off the head alone, so the
@@ -12915,23 +12975,6 @@ function tyIsNoListHead(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
   t is TyPrim || t is TyObj || t is TyFunc || t is TyMap || t is TyLit
-}
-
-// The checked-rep column at the node `exprIx` in `fnIx`: its rep at its instance's type, or at
-// its receiver's list for a read an `is K[]` narrowed (D4916).
-function listColumnDesc(exprIx: i32, fnIx: i32): RepDesc {
-  const nrt = listNarrowRecvTyOf(exprIx, fnIx)
-  if nrt >= 0 { return repOfNodeAt(exprIx, nrt) }
-  nodeRepIn(exprIx, fnIx)
-}
-
-// The non-null list a covered column `d` names, a nullable list's being its list's, or null.
-function listOfColumn(d: RepDesc): VKind | null {
-  if d.rdCovered != 1 { return null }
-  const c = vkListClass(d.rdKind)
-  if c == 1 { return d.rdKind }
-  if c == 2 { return nulListBase(d.rdKind) }
-  null
 }
 
 // Whether a node recorded at `raw` can be a union at some instance, read off the head alone;
@@ -15158,7 +15201,6 @@ function readNulVKind(k: string): VKind | null {
 
 // Whether `k` is a nullable rep kind.
 function readKindIsNul(k: string): boolean {
-  if clsCensusOn { clsCensusEnter("readKindIsNul") }
   k == "nulmap"
     || k == "nullitatom"
     || k == "nulstruct"
@@ -15334,51 +15376,6 @@ function idxReadIsLitAtom(e: Index, exprIx: i32, fnIx: i32): boolean {
   return false
 }
 
-// True if a call `e` returns a literal-union atom: a registered literal-union result type,
-// a function value's aliased result, or a callee whose annotated or inferred return is one.
-function callResultIsLitAtom(e: Call, exprIx: i32, fnIx: i32): boolean {
-  if clsCensusOn { clsCensusEnter("callResultIsLitAtom") }
-  // Any call whose checked result type is a registered litunion holds an i32 atom, widened
-  // at print. Covers a closure value call, a struct-field closure call, and an
-  // indexed-closure call, none of which the callee-Ident named arm below can reach. A
-  // generic call whose result a pin minted is excluded: its instance may return a string.
-  if nodeTyIsLitUnionAlias(unwrapParen(exprIx)) { return true }
-  // A function-value call whose callee's annotated result is an aliased litunion — the arm
-  // above cannot reach inside a monomorphized instance, where the call node is shared with
-  // the generic and still records the type variable. `cloCallResultLitUnion` asks the
-  // callee's own substituted annotation instead.
-  if cloCallResultLitUnion(unwrapParen(exprIx), fnIx) { return true }
-  if e.callFn < 0 { return false }
-  const callee = nodeAt(e.callFn)
-  if callee is Ident {
-    // A CLOSURE call, whose result rep is what the lifted body yields and not what a
-    // spelling renders — so the alias arms above miss an INLINE member set. `fRetLitAtom`
-    // is the banked answer the named rung below reads, asked of the lambda (D1768).
-    const cloFe = identClosureFeOfRead(e.callFn, fnIx)
-    if cloFe >= 0 && cloFe < fRetLitAtom.length {
-      if fRetLitAtom[cloFe] == 1 { return true }
-    }
-    const target = fnIndexOfNode(e.callFn)
-    if target >= 0 {
-      const cf = nodeAt(fnStmts[target])
-      if cf is FuncDecl {
-        if cf.fnRet >= 0 {
-          const r = nodeTyIsLitUnionAlias(cf.fnRet)
-          return r
-        }
-        // An un-annotated callee, from the flag its own classification recorded: an
-        // inferred return has neither a type node nor an annotation, so the signature's
-        // result kind is classified from the returned expression, and this reads that
-        // banked answer. Without it, a named-litunion tag printed its raw atom id.
-        if target < fRetLitAtom.length {
-          if fRetLitAtom[target] == 1 { return true }
-        }
-      }
-    }
-  }
-  false
-}
-
 // Whether call `rx` returns the `K | null` niche: its result reps as one and its callee's
 // signature does not box it.
 function callResultIsNulLitAtom(rx: i32, fnIx: i32): boolean {
@@ -15393,74 +15390,11 @@ function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
   if clsCensusOn { clsCensusEnter("readCallStoreKind") }
   if callResultIsNulLitAtom(rx, fnIx) { return "nullitatom" }
   if callStoreIsLitAtom(e, rx, fnIx) { return "litatom" }
-  const lk = callStoreListKind(e, rx, fnIx)
-  if lk != null { return lk }
+  const ld = repOfNode(rx, fnIx)
+  if ld.rdCovered == 1 && vkListClass(ld.rdKind) != 0 { return ld.rdKind }
   if callIsNulNone(e, rx, fnIx) { return "nulnone" }
   if exprUnionCall(e, rx, fnIx) { return "union" }
   ""
-}
-
-// The list kind call `rx` hands back, nullable or not, where its callee's lowering names one;
-// null for any other result or a lowering not yet known.
-function callStoreListKind(e: Call, rx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("callStoreListKind") }
-  const k = callLoweredKind(e, rx, fnIx)
-  if k != null && vkListClass(k) != 0 { return k }
-  null
-}
-
-// `fnLoweredKind` remembered per function, stamped with the pass and type arena that asked.
-const flkGen = memoGenNew(0)
-const flkKey = memoKeyNew(3)
-const flkStamp: i32[] = []
-const flkVal: VKind[] = []
-
-// The result kind function `fe` lowers, once return kinds are final: its closed recorded result's
-// rep, else its result kind; null for a void result. Exact for a list kind; for a record or variant
-// the type's rep can differ from the lowered valtype (D14655).
-function fnLoweredKind(fe: i32): VKind | null {
-  if fe >= fRetKind.length || fe >= fRetVoid.length || fRetVoid[fe] != 0 {
-    return null
-  }
-  if memoMoved3(flkKey, emitPassGen, tyMutEpoch, fRetKind.length) {
-    memoGenAdvance(flkGen)
-  }
-  if fe < flkStamp.length && flkStamp[fe] == flkGen.at { return flkVal[fe] }
-  let k: VKind = fRetKind[fe]
-  if fe < fRecRetTy.length {
-    const r = fRecRetTy[fe]
-    if r >= 0 && r < T.tys.length && !tyHasTyVar(r) && !tyHasInferHole(r, 0) {
-      const d = repOfTy(r)
-      if d.rdCovered == 1 { k = d.rdKind }
-    }
-  }
-  while flkStamp.length <= fe {
-    flkStamp.push(-1)
-    flkVal.push("i32")
-  }
-  flkStamp[fe] = flkGen.at
-  flkVal[fe] = k
-  k
-}
-
-// The result kind call `rx`'s callee lowers, once return kinds are final: a named function's
-// closed recorded result, else its result kind, else a function value's `$fnsig` result token.
-// Null for a void, unresolved or unkeyed result, and for a generic function value, which is
-// instanced per call so its `$fnsig` is not the instance's (D4242).
-function callLoweredKind(e: Call, rx: i32, fnIx: i32): VKind | null {
-  if !emitPhaseReached("capsCached") { return null }
-  const fe = callNamedFe(e, fnIx)
-  if fe >= 0 { return fnLoweredKind(fe) }
-  // A method of a list, map or string is no function value and has no `$fnsig` of its own.
-  const cfx = unwrapParen(e.callFn)
-  if cfx < 0 { return null }
-  const cf = nodeAt(cfx)
-  if cf is Member && !memberIsClosure(cf.memObj, cf.memProp, fnIx) {
-    return null
-  }
-  const ct = nodeTyAt(cfx, fnIx)
-  if ct < 0 || ct >= T.tys.length || tyHasTyVar(ct) { return null }
-  sigKeyRetKind(cloCallSigKey(rx, fnIx))
 }
 
 // Whether call `rx` hands back an interned literal-union id. The callee's lowered result decides:
@@ -15481,7 +15415,7 @@ function callStoreIsLitAtom(e: Call, rx: i32, fnIx: i32): boolean {
     const sk = cloCallSigKey(rx, fnIx)
     if sk != "" && sigKeyRetKind(sk) != "i32" { return false }
   }
-  callResultIsLitAtom(e, rx, fnIx)
+  nodeRepIsAtom(unwrapParen(rx), fnIx)
 }
 
 // The function a call names directly, as the frame `fnIx` resolves its callee; -1 for a call
