@@ -1,7 +1,7 @@
 // Where is the emitter's module-scope mutable state CLEARED, and the ratchet on what is not.
 //
 //     vl run scripts/emitter-state-audit.vl [-- --names]
-//     vl run scripts/emitter-state-audit.vl -- --check [--without-reset NAME]
+//     vl run scripts/emitter-state-audit.vl -- --check [--without-reset NAME] [--dir DIR]
 //
 // Every `let` at column 0 in an emitter module survives a compile, and one wasm instance
 // runs many compiles (the LSP, `tests/cases_wasm_test.ts`). For each one this finds every
@@ -17,8 +17,9 @@
 //
 // `--check` is an invariant, not a ratchet: it exits 1 naming every NEVER row, and every
 // inner integer register holding a per-program id (D11770) that GUARDED does not cover.
-// `--without-reset NAME` ignores one function's clears, so the test's control can make it
-// red. Run from the checkout root: paths are relative to the working directory.
+// It also refuses a written module `const` container nothing empties, in any module.
+// `--without-reset NAME` ignores one function's clears and `--dir` audits another tree, so the
+// tests' controls can make it red. Run from the checkout root: paths are relative to it.
 
 import { IoError, listDir, readTextFile } from "std:fs"
 import { programArgs } from "std:args"
@@ -29,7 +30,8 @@ import { endsWith, join, padEnd, padStart, split, startsWith } from "std:str"
 import { sort } from "std:array"
 import { die, findFrom, hasFlag, lstripWs, stripWs } from "./lib/common"
 
-const CDIR = "compiler"
+// The compiler sources audited: `compiler`, or the tree `--dir` names (the tests' controls).
+let cdir = "compiler"
 
 // The emitter's own modules. The checker and the front end have the same hazard and their
 // own reset homes; this audit is scoped to the emitter, where the filed rows live.
@@ -224,7 +226,7 @@ function spansOf(lines: string[]): Span[] {
 }
 
 function loadSrc(file: string): Src {
-  const lines = split(readSrc(CDIR + "/" + file), "\n")
+  const lines = split(readSrc(cdir + "/" + file), "\n")
   const spans = spansOf(lines)
   const lineFn: string[] = []
   let i = 0
@@ -588,9 +590,9 @@ function writesIn(
 
 // The compiler's sources, sorted by name.
 function compilerFiles(): string[] {
-  const ents = listDir(CDIR)
+  const ents = listDir(cdir)
   if ents is IoError {
-    die("emitter-state-audit: cannot list \{CDIR} (\{ents.msg})", 1)
+    die("emitter-state-audit: cannot list \{cdir} (\{ents.msg})", 1)
     return []
   }
   const out: string[] = []
@@ -611,6 +613,7 @@ type Audit = {
   sides: string[][],
   index: boolean[],
   guards: string[],
+  cont: CAudit,
 }
 
 function addUnique(xs: string[], x: string) {
@@ -774,7 +777,558 @@ function audit(without: string): Audit {
     sides: sides,
     index: index,
     guards: guards,
+    cont: contAudit(srcs, without, prologue, pass, frame),
   }
+}
+
+// A written module `const` list, map or set has a lifetime like a `let` (#6759); these are read
+// from every compiler module. Safe: emptied by a function (its home's kind), written only at
+// module scope (`init`), every push popped in its own function with no exit between
+// (`balanced`), or named below. Anything else is NEVER, and `--check` refuses it.
+
+// `container:guard`: a `memoGenNew` generation, a `let` only ever bumped by one, or a STAMPED
+// companion in the same module. The guard must be compared in the container's module or on a
+// line naming the container; a stale or unprovable entry stops the audit.
+const STAMPED = [
+  // check_types: `tyMutEpoch` advances at every program's checker init and every in-place pin.
+  "hhStamp:tyMutEpoch", "hhTrueAt:hhStamp", "hhFalseAt:hhStamp",
+  "tdStamp:tyMutEpoch", "tdHeight:tdStamp",
+  "emitNameMemoGen:emitNameGen", "emitNameMemoVal:emitNameMemoGen",
+  "tyHasTyVarFreeEpoch:tyMutEpoch", "tyHasTyVarFreeGen:tyHasTyVarFreeEpoch",
+  // emit_classify / emit_list_rep: per-compile memo generations.
+  "flkStamp:flkGen", "flkVal:flkStamp",
+  "lrTvStamp:lrTvGen", "lrTvAns:lrTvStamp",
+  "mvrStamp:mvrGen", "mvrFn:mvrStamp", "mvrVal:mvrStamp",
+  "pslStamp:pslGen", "pslFn:pslStamp", "pslVal:pslStamp",
+  "rrStamp:rrGen", "rrFn:rrStamp", "rrVal:rrStamp",
+  "rtvStamp:rtvGen", "rtvFn:rtvStamp", "rtvVal:rtvStamp", "rtvRaw:rtvStamp",
+  "rtvDeclRaw:rtvStamp",
+  "lrMemoGen:lrGen", "lrMemoFn:lrMemoGen", "lrMemoKind:lrMemoGen", "lrMemoNul:lrMemoGen",
+  "rvsAnsAt:rvsAnsGen", "rvsAnsRow:rvsAnsAt",
+  "fnPosFsStamp:fnPosEpoch", "fnPosFs:fnPosFsStamp", "fnPosMoStamp:fnPosEpoch",
+  "fnPosMo:fnPosMoStamp",
+  // opt_multivalue: `foGen` advances at every function the pass scans.
+  "foCand:foGen", "foSeen:foCand", "foChk:foCand", "foBad:foCand", "candN:foCand",
+  "candT:foCand", "live:foCand",
+]
+
+// Reviewed: stacks, trails, logs and scratch a program leaves nothing in that a later one
+// reads. Each group says what holds it.
+const SCOPED = [
+  // enter/leave pairs whose every caller leaves on every path it entered on
+  "crAskOpen", "neFns", "neKeys", "neLive", "neUsedBy", "scWrOpen", "elabArmStageAt",
+  "elabArmStageFe", "idLetBusy",
+  // trails read and trimmed only above a height taken at frame entry
+  "capTrailName", "shrTrailName", "shrTrailPrev", "shrTrailPrevDepth", "irhExprs", "irhTys",
+  "irwExprs", "irwTys",
+  // frame marks pushed at a body's entry and popped by its flush
+  "irhMarks", "irhConcrete", "irwMarks",
+  // a pending queue the same call flushes
+  "monoShPendName", "monoShPendNode", "monoShPendTag",
+  // reads validated against the live scope stack (D2181)
+  "scopePrevSame", "scopeTopOf",
+  // scratch written only below a height the call itself counts from zero
+  "bcFound", "bcStack",
+  // a log undone where it was written: the outermost intern, `modRenameClear`
+  "iisMemoTy", "modRenameFirstBySid", "modRenameLastBySid",
+  // per-depth caches revalidated against the walk's root and `crwGen` before any read
+  "ccLevels",
+  // sid stamps against `daCurGen` (minted per check from `daGenSeq`) and a token from `daHitSeq`,
+  // sequences that only rise
+  "daPos", "daGen", "daHitTok",
+  // read only where the log's own `iisMemoTy` row matched
+  "iisMemoRow",
+  // read only below `ownLen` and above `sBase`, both rewritten by each scan
+  "owner",
+  // a shared empty argument whose one call (`fnBoundNames`) adds nothing to it
+  "weNoNames",
+]
+
+// Containers whose lifetime is the instance by design.
+const CINSTANCE = [
+  // tables built on first use from constants
+  "atomicAlign", "atomicI64", "atomicNames", "atomicOps", "atomicRowOf", "atomicSigs",
+  "simdLaneMax", "simdNames", "simdOps", "simdRowOf", "simdSigs", "arTabs", "plainAr",
+  "mimpStdHead", "mimpStdNext",
+  // text interns and pure functions of their text key
+  "cukIds", "cukTexts", "utkIds", "utkTexts", "emitKeyIds", "indentCache", "ieeeMemoBytes",
+  "ieeeMemoOver",
+  // per-module caches kept with the source they read, or a file's root
+  "ilGlobFns", "ilGlobMaps", "ilGlobSrc", "ilHoleSet", "ilHoleSrc", "ilScanSlot", "ilScanSrc",
+  "siScDirect", "siScFrom", "siScNames", "siScOpenFn", "siScOpenName", "siScSrc", "siScTo",
+  "modRootOfKey",
+  // the registries `memoCompileReset` walks
+  "memoGens", "memoKeys",
+]
+
+// One module-scope container `const`.
+type CDecl = { name: string, file: string, line: i32, exported: boolean }
+
+// One write of a container: which, in which function of which source, at which 0-based line,
+// and its shape: "push", "pop", "clear", "store" (an index store or any other method), "arg".
+type CWrite = { ix: i32, src: i32, fn: string, line: i32, op: string }
+
+// `^(export )?const NAME [: TYPE] = INIT` with INIT a list literal or `Map(`/`Set(`.
+function contDeclOf(ln: string, file: string, line: i32): CDecl | null {
+  let i = 0
+  const exported = startsWith(ln, "export ")
+  if exported { i = 7 }
+  if !startsWith(ln.slice(i, ln.length), "const ") { return null }
+  i = i + 6
+  const name = identAt(ln, i)
+  if name.length == 0 { return null }
+  const eq = findFrom(ln, "=", i)
+  if eq < 0 { return null }
+  const init = stripWs(ln.slice(eq + 1, ln.length))
+  if (
+    !(startsWith(init, "[")
+      || startsWith(init, "Map(")
+      || startsWith(init, "Map<")
+      || startsWith(init, "Set(")
+      || startsWith(init, "Set<"))
+  ) {
+    return null
+  }
+  { name: name, file: file, line: line, exported: exported }
+}
+
+// The container a name at source `si` denotes: the module's own, else the one export of it.
+function contResolve(
+  name: string,
+  si: i32,
+  srcs: Src[],
+  own: Map<string, i32>,
+  exp: Map<string, i32>,
+): i32 {
+  const o = own[srcs[si].file + ":" + name]
+  if o != null { return o }
+  exp[name] ?? -1
+}
+
+// The shape of the use of a container whose name ends at `j` of `s`, or "" for a read.
+function contOpAt(s: string, j: i32): string {
+  let k = nextAt(s, j)
+  if k < s.length && s[k] == 46 {
+    const m = identAt(s, k + 1)
+    const after = k + 1 + m.length
+    if after >= s.length || s[after] != 40 { return "" }
+    if m == "push" { return "push" }
+    if m == "pop" { return "pop" }
+    if m == "clear" { return "clear" }
+    if m == "set" || m == "delete" || m == "unshift" { return "store" }
+    return ""
+  }
+  while k < s.length && s[k] == 91 {
+    let d = 0
+    while k < s.length {
+      if s[k] == 91 { d = d + 1 }
+      if s[k] == 93 {
+        d = d - 1
+        if d == 0 { break }
+      }
+      k = k + 1
+    }
+    k = nextAt(s, k + 1)
+  }
+  if (
+    k > j
+    && k < s.length
+    && s[k] == 61
+    && !(k + 1 < s.length && s[k + 1] == 61)
+  ) {
+    return "store"
+  }
+  ""
+}
+
+// The callee of the call whose argument list holds byte `i` of `s` at depth one, or "".
+function calleeAround(s: string, i: i32): string {
+  let k = i - 1
+  let d = 0
+  while k >= 0 {
+    if s[k] == 41 || s[k] == 93 { d = d + 1 }
+    if s[k] == 40 || s[k] == 91 {
+      if d == 0 {
+        if s[k] == 91 { return "" }
+        let e = k
+        while e > 0 && isSp(s[e - 1]) { e = e - 1 }
+        let b = e
+        while b > 0 && isIdChar(s[b - 1]) { b = b - 1 }
+        return s.slice(b, e)
+      }
+      d = d - 1
+    }
+    k = k - 1
+  }
+  ""
+}
+
+// The 0-based argument position byte `i` of `s` sits at, in the call `calleeAround` names.
+function argIndexAround(s: string, i: i32): i32 {
+  let k = i - 1
+  let d = 0
+  let n = 0
+  while k >= 0 {
+    if s[k] == 41 || s[k] == 93 || s[k] == 125 { d = d + 1 }
+    if s[k] == 40 || s[k] == 91 || s[k] == 123 {
+      if d == 0 { return n }
+      d = d - 1
+    }
+    if d == 0 && s[k] == 44 { n = n + 1 }
+    k = k - 1
+  }
+  n
+}
+
+// Whether `s` passes the name at `[i, j)` as a whole argument: `(` or `,` before, `,` or `)` after.
+function bareArgAt(s: string, i: i32, j: i32): boolean {
+  const pb = prevByte(s, i)
+  const n = nextAt(s, j)
+  (pb == 40 || pb == 44) && n < s.length && (s[n] == 44 || s[n] == 41)
+}
+
+// The parameter names of the function whose header starts at 0-based line `h` of `lines`.
+function paramsOf(lines: string[], h: i32): string[] {
+  let txt = ""
+  let k = h
+  while k < lines.length && k < h + 12 {
+    txt = txt + lines[k] + " "
+    if endsWith(rstripLine(lines[k]), "{") { break }
+    k = k + 1
+  }
+  const out: string[] = []
+  let i = txt.indexOf("(")
+  if i < 0 { return out }
+  i = i + 1
+  let d = 1
+  let expect = true
+  while i < txt.length && d > 0 {
+    const c = txt[i]
+    if c == 40 || c == 91 || c == 123 || c == 60 { d = d + 1 }
+    if c == 41 || c == 93 || c == 125 || c == 62 { d = d - 1 }
+    if d == 1 && c == 44 { expect = true }
+    if d == 1 && expect && isIdStart(c) {
+      const id = identAt(txt, i)
+      out.push(id)
+      expect = false
+      i = i + id.length
+      continue
+    }
+    i = i + 1
+  }
+  out
+}
+
+function rstripLine(s: string): string {
+  let e = s.length
+  while e > 0 && isSp(s[e - 1]) { e = e - 1 }
+  s.slice(0, e)
+}
+
+// A line with its `//` comment cut, or "" for a comment or declaration line.
+function codeOf(raw: string): string {
+  if startsWith(lstripWs(raw), "//") || declLead(raw) { return "" }
+  const cut = raw.indexOf("//")
+  if cut >= 0 { return raw.slice(0, cut) }
+  raw
+}
+
+// `function:position` for every parameter a function mutates in place: a call handing a
+// container to one of these at that position writes it.
+function mutatingHelpers(srcs: Src[]): Map<string, boolean> {
+  const out = Map<string, boolean>()
+  for s in srcs {
+    for sp in s.spans {
+      const ps = paramsOf(s.lines, sp.a - 1)
+      if ps.length == 0 { continue }
+      let k = sp.a
+      while k < sp.b && k < s.lines.length {
+        const t = codeOf(s.lines[k])
+        let pi = -1
+        for p in ps {
+          pi = pi + 1
+          let at = t.indexOf(p)
+          while at >= 0 {
+            const e = at + p.length
+            const okL = at == 0 || (!isIdChar(t[at - 1]) && t[at - 1] != 46)
+            if (
+              okL
+              && (e >= t.length || !isIdChar(t[e]))
+              && contOpAt(t, e) != ""
+            ) {
+              out[sp.name + ":" + toString(pi)] = true
+            }
+            at = findFrom(t, p, at + 1)
+          }
+        }
+        k = k + 1
+      }
+    }
+  }
+  out
+}
+
+// The container audit's result.
+type CAudit = {
+  decls: CDecl[],
+  kinds: string[],
+  homes: string[][],
+  writes: i32[],
+}
+
+// Whether `w`, a push, is followed in its own function by a pop of the same container with no
+// exit between.
+function pushBalanced(w: CWrite, ws: CWrite[], srcs: Src[]): boolean {
+  let pop = -1
+  for x in ws {
+    if (
+      x.ix == w.ix
+      && x.src == w.src
+      && x.fn == w.fn
+      && x.op == "pop"
+      && x.line > w.line
+    ) {
+      if pop < 0 || x.line < pop { pop = x.line }
+    }
+  }
+  if pop < 0 { return false }
+  const s = srcs[w.src]
+  let k = w.line + 1
+  while k < pop {
+    const t = codeOf(s.lines[k])
+    if hasWord(t, "return") || hasWord(t, "break") || hasWord(t, "continue") {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+// Whether `g` is a generation: a `memoGenNew` const, or a `let` only ever bumped by one.
+function isGeneration(g: string, srcs: Src[]): boolean {
+  let decl = false
+  for s in srcs {
+    for raw in s.lines {
+      const d = declOf(raw, s.file, 0)
+      if d != null && d.name == g {
+        if isMemoInit(d.init) { return true }
+        decl = true
+      }
+    }
+  }
+  if !decl { return false }
+  for s in srcs {
+    for raw in s.lines {
+      const t = codeOf(raw)
+      let at = t.indexOf(g)
+      while at >= 0 {
+        const e = at + g.length
+        const okL = at == 0 || (!isIdChar(t[at - 1]) && t[at - 1] != 46)
+        if okL && (e >= t.length || !isIdChar(t[e])) {
+          const n = nextAt(t, e)
+          if (
+            n < t.length
+            && t[n] == 61
+            && !(n + 1 < t.length && t[n + 1] == 61)
+          ) {
+            if stripWs(t.slice(n + 1, t.length)) != g + " + 1" { return false }
+          }
+        }
+        at = findFrom(t, g, at + 1)
+      }
+    }
+  }
+  true
+}
+
+function contAudit(
+  srcs: Src[],
+  without: string,
+  prologue: string[],
+  pass: string[],
+  frame: string[],
+): CAudit {
+  const decls: CDecl[] = []
+  const own = Map<string, i32>()
+  const exp = Map<string, i32>()
+  for s in srcs {
+    let i = 0
+    while i < s.lines.length {
+      const d = contDeclOf(s.lines[i], s.file, i + 1)
+      if d != null {
+        own[s.file + ":" + d.name] = decls.length
+        if d.exported { exp[d.name] = decls.length }
+        decls.push(d)
+      }
+      i = i + 1
+    }
+  }
+  const helpers = mutatingHelpers(srcs)
+  const ws: CWrite[] = []
+  let si = 0
+  while si < srcs.length {
+    const s = srcs[si]
+    let li = 0
+    while li < s.lines.length {
+      const t = codeOf(s.lines[li])
+      let i = 0
+      while i < t.length {
+        if !isIdChar(t[i]) {
+          i = i + 1
+          continue
+        }
+        let j = i
+        while j < t.length && isIdChar(t[j]) { j = j + 1 }
+        if isIdStart(t[i]) && (i == 0 || t[i - 1] != 46) {
+          const ix = contResolve(t.slice(i, j), si, srcs, own, exp)
+          if ix >= 0 {
+            let op = contOpAt(t, j)
+            const site = calleeAround(t, i)
+              + ":"
+              + toString(argIndexAround(t, i))
+            if op == "" && bareArgAt(t, i, j) && (helpers[site] ?? false) {
+              op = "arg"
+            }
+            if op == "" && t.indexOf("while ") >= 0 {
+              const e = nextAt(t, j)
+              if startsWith(t.slice(e, t.length), ".length > 0") {
+                op = "clear"
+              }
+            }
+            if op != "" {
+              ws.push(
+                { ix: ix, src: si, fn: s.lineFn[li + 1], line: li, op: op },
+              )
+            }
+          }
+        }
+        i = j
+      }
+      li = li + 1
+    }
+    si = si + 1
+  }
+
+  const kinds: string[] = []
+  const homes: string[][] = []
+  const writes: i32[] = []
+  for _d in decls {
+    kinds.push("")
+    homes.push([])
+    writes.push(0)
+  }
+  const atModule: boolean[] = []
+  const stackOnly: boolean[] = []
+  for _d in decls {
+    atModule.push(true)
+    stackOnly.push(true)
+  }
+  for w in ws {
+    if w.op != "clear" { writes[w.ix] = writes[w.ix] + 1 }
+    if w.fn != "<module>" { atModule[w.ix] = false }
+    if w.op == "clear" && w.fn != without { addUnique(homes[w.ix], w.fn) }
+    if w.op != "push" && w.op != "pop" && w.op != "clear" {
+      stackOnly[w.ix] = false
+    }
+    if w.op == "push" && !pushBalanced(w, ws, srcs) { stackOnly[w.ix] = false }
+  }
+  const ixOfName = Map<string, i32>()
+  let k = 0
+  while k < decls.length {
+    ixOfName[decls[k].name] = k
+    k = k + 1
+  }
+  k = 0
+  while k < decls.length {
+    const h = homes[k]
+    sort(h, strLess)
+    let kind = ""
+    if writes[k] == 0 {
+      kind = "unwritten"
+    } else if atModule[k] {
+      kind = "init"
+    } else if h.length > 0 {
+      kind = "inner"
+      if anyIn(h, frame) { kind = "frame" }
+      if anyIn(h, pass) { kind = "pass" }
+      if anyIn(h, prologue) { kind = "prologue" }
+    } else if stackOnly[k] {
+      kind = "balanced"
+    }
+    kinds[k] = kind
+    k = k + 1
+  }
+  // The reviewed lists: each entry must name a written container nothing above already covers.
+  const lists = [SCOPED, CINSTANCE]
+  const listKinds = ["scoped", "instance"]
+  let li = 0
+  while li < lists.length {
+    for nm in lists[li] {
+      const at = ixOfName[nm]
+      if at == null {
+        die("\{listKinds[li]} names no written container const: " + nm, 2)
+        continue
+      }
+      if kinds[at] != "" {
+        die("\{listKinds[li]} entry \{nm} is already \{kinds[at]}; drop it", 2)
+      }
+      kinds[at] = listKinds[li]
+    }
+    li = li + 1
+  }
+  for g in STAMPED {
+    const parts = split(g, ":")
+    const at = ixOfName[parts[0]]
+    if at == null {
+      die("STAMPED names no written container const: " + parts[0], 2)
+      continue
+    }
+    if kinds[at] != "" {
+      die("STAMPED entry \{parts[0]} is already \{kinds[at]}; drop it", 2)
+    }
+    const comp = ixOfName[parts[1]]
+    let ok = false
+    if comp != null {
+      ok = decls[comp].file == decls[at].file
+        && inList(STAMPED, parts[1] + ":" + stampOf(parts[1]))
+    } else if isGeneration(parts[1], srcs) {
+      for s in srcs {
+        const home = s.file == decls[at].file
+        for raw in s.lines {
+          const t = codeOf(raw)
+          if (
+            hasWord(t, parts[1])
+            && (home || hasWord(t, parts[0]))
+            && (t.indexOf("==") >= 0 || t.indexOf("!=") >= 0)
+          ) {
+            ok = true
+          }
+        }
+      }
+    }
+    if !ok {
+      die(
+        "STAMPED \{g}: no comparison of \{parts[0]} against generation \{parts[1]}",
+        2,
+      )
+    }
+    kinds[at] = "stamped"
+  }
+  k = 0
+  while k < decls.length {
+    if kinds[k] == "" { kinds[k] = "NEVER" }
+    k = k + 1
+  }
+  { decls: decls, kinds: kinds, homes: homes, writes: writes }
+}
+
+// The guard STAMPED names for container `c`, or "".
+function stampOf(c: string): string {
+  for g in STAMPED {
+    const parts = split(g, ":")
+    if parts[0] == c { return parts[1] }
+  }
+  ""
 }
 
 // `^(export )?(let|const)\s`: the line is a declaration, so its `=` is no write.
@@ -819,6 +1373,29 @@ function unguarded(a: Audit): i32[] {
 function yesNo(b: boolean): string {
   if b { return "yes" }
   "NO"
+}
+
+// The written containers no rule or reviewed list covers, by file then line.
+function contNever(a: Audit): i32[] {
+  const out: i32[] = []
+  let i = 0
+  while i < a.cont.decls.length {
+    if a.cont.kinds[i] == "NEVER" { out.push(i) }
+    i = i + 1
+  }
+  out
+}
+
+function contCount(a: Audit, kind: string): i32 {
+  let n = 0
+  for k in a.cont.kinds {
+    if k == kind { n = n + 1 }
+  }
+  n
+}
+
+function contWritten(a: Audit): i32 {
+  a.cont.decls.length - contCount(a, "unwritten")
 }
 
 function report(a: Audit, names: boolean) {
@@ -897,6 +1474,25 @@ function report(a: Audit, names: boolean) {
     print("  \{nm} \{d.file}:\{d.line} \{g}")
   }
 
+  const cn = contNever(a)
+  print(
+    "\nMODULE-SCOPE CONST CONTAINERS, every compiler module: \{a.cont.decls.length}, \{contWritten(a)} written",
+  )
+  for k in [
+    "prologue", "pass", "frame", "inner", "init", "balanced", "stamped",
+    "scoped", "instance", "NEVER",
+  ] {
+    print(
+      "  " + padEnd(k, 9, " ") + " " + padStart(toString(contCount(a, k)), 4, " "),
+    )
+  }
+  for i in cn {
+    const d = a.cont.decls[i]
+    print(
+      "  NEVER \{padEnd(d.name, 24, " ")} \{d.file}:\{d.line} writes=\{a.cont.writes[i]}",
+    )
+  }
+
   if names {
     print("\nEVERY MUTABLE, with its clear sites")
     const all = sortedIx(a, (_i: i32): boolean => true)
@@ -914,6 +1510,18 @@ function report(a: Audit, names: boolean) {
       const nm = padEnd(d.name, 26, " ")
       const ln = padEnd(toString(d.line), 6, " ")
       print("  \{k} \{nm} \{d.file}:\{ln} \{hs}")
+    }
+    print("\nEVERY WRITTEN CONST CONTAINER, with its clear sites")
+    let ci = 0
+    while ci < a.cont.decls.length {
+      const d = a.cont.decls[ci]
+      if a.cont.kinds[ci] != "unwritten" {
+        let hs = join(a.cont.homes[ci], ", ")
+        if hs.length == 0 { hs = "-" }
+        const k = padEnd(a.cont.kinds[ci], 9, " ")
+        print("  \{k} \{padEnd(d.name, 26, " ")} \{d.file}:\{d.line} \{hs}")
+      }
+      ci = ci + 1
     }
   }
   0
@@ -933,6 +1541,7 @@ function flagValue(
 }
 
 function main(args: readonly string[]) {
+  cdir = flagValue(args, "--dir", cdir)
   const a = audit(flagValue(args, "--without-reset", ""))
   if hasFlag(args, "--check") {
     const never = sortedIx(a, (i: i32): boolean => a.kinds[i] == "NEVER")
@@ -959,11 +1568,23 @@ function main(args: readonly string[]) {
         print("  \{d.name} \{d.file}:\{d.line}")
       }
     }
-    if never.length > 0 || open.length > 0 {
+    const cn = contNever(a)
+    const cline = "never-cleared const containers \{cn.length} of \{contWritten(a)} written"
+    if cn.length > 0 {
+      print("compiler state invariant BROKEN: " + cline)
+      print(
+        "A module-scope `const` list or map that is written and that nothing empties keeps the last program's entries on a shared instance (#6759).\nMake it a `let` reset in its module's per-program reset, or name it in STAMPED, SCOPED or CINSTANCE with its reason:",
+      )
+      for i in cn {
+        const d = a.cont.decls[i]
+        print("  \{d.name} \{d.file}:\{d.line}")
+      }
+    }
+    if never.length > 0 || open.length > 0 || cn.length > 0 {
       exit(1)
       return 0
     }
-    print(line + "; " + iline)
+    print(line + "; " + iline + "; " + cline)
     return 0
   }
   report(a, hasFlag(args, "--names"))
