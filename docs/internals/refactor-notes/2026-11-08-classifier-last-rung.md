@@ -40,8 +40,8 @@ before.
 | | base | candidate |
 |---|---|---|
 | `classifier-census --callers` | pre-only 0 · both 5 | **pre-only 0 · both 0** (post-only 73) |
-| sweep | | SWEEP |
-| seed (fixpoint) | 6,577,862 | 6,577,862 (±0 bytes; the modules differ) |
+| sweep, 23,713 programs | | 23,703 same · 0 bytes-only · 10 output movers (message only) · 0 `runs → not-runs` · 0 new traps |
+| seed (fixpoint) | 6,577,862 | 6,577,925 (+63) |
 
 The 13 programs keep their outcome (`emit_reject`), and their message and position move to the
 argument. Two `tests/cases/closures` headers quote the new text. The eight inventory rows among the
