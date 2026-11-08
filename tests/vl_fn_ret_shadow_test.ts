@@ -702,6 +702,26 @@ function r(h, n) {
 print(r(inc0, 2))
 `;
 
+// Instances whose value is a call of a hole lambda, and lambdas no instance elaborates: the
+// callee's recorded result, and the value's closed checker type, record them.
+const COL_CALLEE = `function id(a) { return a }
+const lap = (g) => {
+  print(g(1) + 1)
+  return g("s")
+}
+function w<T>(_t: T) { return lap(id) }
+print(w(1))
+print(w("x"))
+function id2<T>(x: T): T { x }
+const ks = [id2]
+function both<T>(t: T) {
+  ks[0] = (x) => x + x
+  print(ks[0](7))
+  print(t)
+}
+both(8)
+`;
+
 Deno.test({
   name: "fn-ret shadow: return columns",
   ignore,
@@ -752,16 +772,21 @@ Deno.test({
       "col",
     );
     expectRows(
+      "col callee",
+      COL_CALLEE,
+      DROP_NONE,
+      true,
+      "",
+      "col",
+    );
+    expectRows(
       "col variant",
       COL_VARIANT,
       DROP_NONE,
       true,
-      "post moved: moved: agree variant | mk2=1; " +
-        "post moved: moved: recorded variant, own result a record | mk1=1; " +
-        "post seed: kind variant vs i32 | mk2=1; " +
-        "post seed: recorded variant, own result a record | mk1=1; " +
-        "post settled: agree variant | mk2=1; " +
-        "post settled: recorded variant, own result a record | mk1=1",
+      "post moved: moved: agree struct | mk1=1; post moved: moved: agree variant | mk2=1; " +
+        "post seed: kind struct vs i32 | mk1=1; post seed: kind variant vs i32 | mk2=1; " +
+        "post settled: agree struct | mk1=1; post settled: agree variant | mk2=1",
       "col",
     );
     expectRows(
