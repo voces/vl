@@ -644,17 +644,40 @@ const COL_REC = `function mk(n: i32) { { a: n, b: 2 } }
 print(mk(3).a)
 `;
 
-// A function returning an assignment reads its value off the recorded result where the target
-// cell's rep agrees (`setN`); a module literal-union cell holds the atom while the recorded value
-// is the string literal, so `setK` is left to the walk.
+// A function returning an assignment reads its value off the recorded result, whatever the
+// target cell's rep: a module literal-union cell (\`setK\`) and a captured one (\`set\`) both
+// lower the string the result records, parenthesized or not.
 const COL_ASSIGN = `type K = "a" | "b"
 let k: K = "a"
 function setK() { return (k = "b") }
 let n = 0
 function setN() { return (n = 3) }
+function outer() {
+  let c: K = "a"
+  const set = () => { return (c = "b") }
+  print(set())
+}
 setK()
 print(setN())
 print(k)
+outer()
+`;
+
+// A record a delivery widened to a variant row reads the variant where every call delivers into a
+// destination (`mk2`, two arguments); where one call binds the result as built (`e1`), the
+// function keeps its own record, and `mk1` is left to the walk.
+const COL_VARIANT = `type R = { v: f64 }
+function mk1(k: i32) { { v: k } }
+const d1: R | string = mk1(7)
+const e1 = mk1(3)
+if d1 is R { print(d1.v / 2) }
+print(e1.v / 2)
+function mk2(k: i32) { { v: k } }
+function take(d: R | string) {
+  if d is R { print(d.v / 2) }
+}
+take(mk2(7))
+take(mk2(3))
 `;
 
 Deno.test({
@@ -683,9 +706,22 @@ Deno.test({
       COL_ASSIGN,
       DROP_NONE,
       true,
-      "post moved: unmoved: assignment target's rep differs | setK=1; " +
-        "post seed: assignment target's rep differs | setK=1; " +
-        "post settled: assignment target's rep differs | setK=1",
+      "post moved: moved: agree str | __lambda_0=1; post moved: moved: agree str | setK=1; " +
+        "post seed: kind str vs i32 | __lambda_0=1; post seed: kind str vs i32 | setK=1; " +
+        "post settled: agree str | __lambda_0=1; post settled: agree str | setK=1",
+      "col",
+    );
+    expectRows(
+      "col variant",
+      COL_VARIANT,
+      DROP_NONE,
+      true,
+      "post moved: moved: agree variant | mk2=1; " +
+        "post moved: moved: recorded variant, own result a record | mk1=1; " +
+        "post seed: kind variant vs i32 | mk2=1; " +
+        "post seed: recorded variant, own result a record | mk1=1; " +
+        "post settled: agree variant | mk2=1; " +
+        "post settled: recorded variant, own result a record | mk1=1",
       "col",
     );
     expectRows(

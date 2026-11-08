@@ -11,6 +11,7 @@ import {
   FuncDecl,
   Ident,
   Index,
+  LetDecl,
   Member,
   ObjLit,
   P,
@@ -26,8 +27,15 @@ import { recBuildTable, recBuildTyIn, recKeptFnDstOf } from "./check_rec_rows"
 import { recPassThroughArg } from "./check_record_origins"
 import { identBoundFnDeclOf } from "./check_scopes"
 import {
+  CW_UP_ARG,
+  CW_UP_ELEM,
+  CW_UP_LETINIT,
+  CW_UP_RET,
   cwBindingOf,
   cwFramedNode,
+  cwIxCoveredLen,
+  cwIxParent,
+  cwIxUpKind,
   cwIxWant,
   cwKeyOfRoot,
   cwPeel,
@@ -44,6 +52,7 @@ import {
   TyFunc,
   TyNullable,
   TyObj,
+  TyVar,
   mkArrayTy,
   mkNullableTy,
   tyAt,
@@ -56,6 +65,7 @@ import {
   elabResultOf,
   elabSrcDecl,
   elabSubstClosed,
+  elabUnboundTpTy,
 } from "./emit_elab"
 import { unwrapParen } from "./emit_base"
 import { scopeTyAt } from "./emit_capture_frames"
@@ -66,7 +76,7 @@ import {
   calleeReturnsRecord,
   cloSigKeyExt,
 } from "./emit_classify"
-import { RepDesc, repOfTy, repSigKindOfTy, repSigTokHasSlot } from "./emit_rep"
+import { repOfTy, repSigKindOfTy, repSigTokHasSlot } from "./emit_rep"
 import { repSigRetTokOfTy, repSlotOfKind } from "./emit_rep_slot"
 import {
   VKind,
@@ -781,47 +791,42 @@ function frsBundleRetRow(fe: i32): i32 {
   if row >= 0 { row } else { -2 }
 }
 
-// Whether the cell each assignment value function `fx` returns writes has the rep `d` of its
-// recorded result: the emitter hands back a captured cell's value but a module cell's atom, so
-// where a target's rep differs the result alone does not say which.
-function frsAssignTargetsAgree(fx: i32, d: RepDesc): boolean {
-  const fn = nodeAt(fx)
-  if !(fn is FuncDecl) || fn.fnBody < 0 { return true }
-  const vals: i32[] = []
-  collectRetValues(fn.fnBody, vals)
-  const b = nodeAt(fn.fnBody)
-  if b is Block && b.blkStmts.length > 0 {
-    vals.push(b.blkStmts[b.blkStmts.length - 1])
-  }
-  for v in vals {
-    const u = unwrapParen(v)
-    if u >= 0 && u < P.nodes.length {
-      const n = nodeAt(u)
-      if n is BinExpr {
-        if n.binOp == "=" {
-          const lt = scopeTyAt(n.binLeft, fx)
-          if lt < 0 || lt >= T.tys.length { return false }
-          const ld = repOfTy(lt)
-          if (
-            ld.rdCovered == 0
-            || ld.rdKind != d.rdKind
-            || ld.rdAtom != d.rdAtom
-          ) {
-            return false
-          }
-        }
-      }
-    }
-  }
-  true
-}
-
 // Whether recorded kind `k` of function `fe` is a variant while its own checker result is a
-// record: a delivery widened the result to a union, and the function builds the record.
+// record that some call consumes as built (`frsCallsDeliverWider` false): the function builds
+// the record, and a delivery widened only the other calls' results.
 function frsOwnRecordAtVariant(fe: i32, k: VKind): boolean {
   if k != "variant" && k != "nulvariant" { return false }
   const own = repSigKindOfTy(frsFnRet(elabCheckedTyOf(fnStmts[fe])))
-  own == "struct" || own == "nulstruct"
+  if own != "struct" && own != "nulstruct" { return false }
+  !frsCallsDeliverWider(fnStmts[fe])
+}
+
+// Whether function `fx` has calls and each hands its result to a destination with a type of its
+// own: an argument, a list element, a return, or a binding that is annotated or that the record
+// rows build at a record (`recBuildTyIn`). Any other consumer, a member read or an un-annotated
+// binding holding the value as built among them, takes the function's own record.
+function frsCallsDeliverWider(fx: i32): boolean {
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) { return false }
+  const cs = callsOfCallee(fn.fnName)
+  if cs.length == 0 { return false }
+  cwIxWant()
+  for c in cs {
+    if c < 0 || c >= cwIxCoveredLen() { return false }
+    const up = cwIxUpKind[c]
+    if up == CW_UP_LETINIT {
+      const d = cwIxParent[c]
+      if d < 0 || d >= P.nodes.length { return false }
+      const ld = nodeAt(d)
+      if !(ld is LetDecl) { return false }
+      if ld.letType < 0 && recBuildTyIn(recBuildTable(), d, false) < 0 {
+        return false
+      }
+    } else if up != CW_UP_ARG && up != CW_UP_ELEM && up != CW_UP_RET {
+      return false
+    }
+  }
+  true
 }
 
 // Whether return kind `k` keeps its table row in `fRetStructIdx`.
@@ -836,16 +841,17 @@ export function fnRecordedRetCols(fe: i32): string {
   frsColsOfTy(fe, fnRecordedRetTy(fe))
 }
 
-// `fnRecordedRetCols` of function `fe` over result `r`.
-function frsColsOfTy(fe: i32, r: i32): string {
-  if r == TY_VOID || r == TY_NEVER { return "recorded void or never" }
-  if r < 0 || r >= T.tys.length { return "no result recorded" }
+// `fnRecordedRetCols` of function `fe` over result `r`; after `monomorphize`, a type variable
+// nothing bound is read at the type it takes unbound (`elabUnboundTpTy`), as the emitter lowers it.
+function frsColsOfTy(fe: i32, r0: i32): string {
+  if r0 == TY_VOID || r0 == TY_NEVER { return "recorded void or never" }
+  if r0 < 0 || r0 >= T.tys.length { return "no result recorded" }
+  const tv = tyAt(r0)
+  const open = tv is TyVar && emitPhaseReached("monomorphized")
+  const r = if open && tv is TyVar { elabUnboundTpTy(-1, fnStmts[fe], tv.tvName) } else { r0 }
   const d = repOfTy(r)
   if d.rdCovered == 0 { return "rep uncovered" }
   if repSigRetTokOfTy(r) == "" { return "recorded result has no token" }
-  if !frsAssignTargetsAgree(fnStmts[fe], d) {
-    return "assignment target's rep differs"
-  }
   frcKind = if d.rdKind == "closure" { "i32" } else { d.rdKind }
   // A variant row a delivery widened a function's own record to is not where it builds it.
   if frsOwnRecordAtVariant(fe, frcKind) {

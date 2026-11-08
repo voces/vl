@@ -23,7 +23,24 @@ import {
   nodeAt,
 } from "./ast"
 import { i32ListIndexOf } from "./listutil"
-import { T, TyArray, TyFunc, TyMap, TyNullable, TyObj } from "./check_types"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  mkArrayTy,
+  mkMapTy,
+  mkNullableTy,
+  mkObjTy,
+} from "./check_types"
 import { nodeTyFrozenOf } from "./check_node_tys"
 import { cwIxBuild, cwSlotPath } from "./check_write_scan"
 import { recEnclosingFn } from "./check_fit_rules"
@@ -428,6 +445,82 @@ export function idSlotSetOf(key: string): i32[] {
   idSlotSets[key] ?? []
 }
 
+// Type `t`, the closed type value `x` is held at in slot `key` (`L<node>` or `B<decl>`, then its
+// steps), with each function leaf carrying its slot's set (`idSlotSetOf`), so a read through the
+// slot takes the rep its writes are built at. A field reading a binding continues at the
+// binding's slot; a leaf whose slot is open keeps its type.
+export function idSlotHeldTy(x: i32, t: i32, key: string): i32 {
+  idSlotHeldTyIn(x, t, key, 0)
+}
+
+function idSlotHeldTyIn(x0: i32, t: i32, key0: string, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length || depth > 16 { return t }
+  const x = if x0 >= 0 && x0 < P.nodes.length { parenPeelIx(x0) } else { -1 }
+  let key = key0
+  if x >= 0 && nodeAt(x) is Ident {
+    const d = identDeclOf(x)
+    if d >= 0 && nodeAt(d) is LetDecl { key = "B" + i32ToStr(idCanon(d)) }
+  }
+  const o = T.tys[t]
+  match o {
+    TyFunc => {
+      return elabFnSetTyMint(t, idSlotSetOf(key))
+    }
+    TyNullable => {
+      const r = idSlotHeldTyIn(x, o.nInner, key, depth + 1)
+      return if r == o.nInner { t } else { mkNullableTy(r) }
+    }
+    TyArray => {
+      const r = idSlotHeldTyIn(-1, o.aElem, key + "/[]", depth + 1)
+      return if r == o.aElem { t } else { mkArrayTy(r) }
+    }
+    TyMap => {
+      const r = idSlotHeldTyIn(-1, o.mVal, key + "/[]", depth + 1)
+      return if r == o.mVal { t } else { mkMapTy(o.mKey, r, o.mSet) }
+    }
+    TyObj => {
+      return idSlotHeldObjTy(x, t, o, key, depth)
+    }
+    // No other kind holds a function in a slot.
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => {
+      return t
+    }
+  }
+}
+
+// `idSlotHeldTyIn` of record type `t` (`o`): each field at `key/<name>`, beside its value in
+// record literal `x` when `x` is one.
+function idSlotHeldObjTy(
+  x: i32,
+  t: i32,
+  o: TyObj,
+  key: string,
+  depth: i32,
+): i32 {
+  const lit = if x >= 0 { nodeAt(x) } else { null }
+  const fts: i32[] = []
+  let moved = false
+  let j = 0
+  while j < o.objFieldNames.length && j < o.objFieldTypes.length {
+    const nm = o.objFieldNames[j]
+    let vx = -1
+    if lit is ObjLit {
+      for f in lit.objFields {
+        const fi = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+        if fi is FieldInit && fi.fiName == nm { vx = fi.fiValue }
+      }
+    }
+    const r = idSlotHeldTyIn(vx, o.objFieldTypes[j], key + "/" + nm, depth + 1)
+    if r != o.objFieldTypes[j] { moved = true }
+    fts.push(r)
+    j = j + 1
+  }
+  if !moved { return t }
+  const names: string[] = []
+  for nm in o.objFieldNames { names.push(nm) }
+  mkObjTy(names, fts)
+}
+
 // The values written to `let` node `bd`, its initialiser included.
 export function idWritesOf(bd: i32): i32[] {
   idWritesBuild()
@@ -463,15 +556,16 @@ export function elabSpecReset() {
   0
 }
 
-// The declaration specialized argument `ax` is in frame `fnIx`, from its identity type: -1 where
-// that type carries no singleton. A tagged set is never specialized (D15010), so it is -2.
+// The declaration specialized argument `ax` is in frame `fnIx`: the singleton its identity type
+// carries, or where that type has type variables or none, the declaration `ax` reads or is (a
+// generic set is the generic machinery's); -1 for no singleton. A tagged set is -2 (D15010).
 export function elabSpecArgDecl(ax: i32, fnIx: i32): i32 {
   const t = elabIdentityFnTy(ax, fnIx)
-  if t < 0 { return -1 }
-  const sid = elabFnSetTy[t] ?? -1
-  if sid >= 0 && (fnTagged[sid] ?? false) { return -2 }
-  if tyHasTyVar(t) { return -1 }
-  const s = elabFnSetOf(t)
+  if t >= 0 {
+    const sid = elabFnSetTy[t] ?? -1
+    if sid >= 0 && (fnTagged[sid] ?? false) { return -2 }
+  }
+  const s = if t < 0 || tyHasTyVar(t) { idSetOf(ax, 0) } else { elabFnSetOf(t) }
   if s.length != 1 { return -1 }
   idCanon(s[0])
 }
