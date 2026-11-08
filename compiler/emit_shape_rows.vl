@@ -382,7 +382,7 @@ import {
   variantSig,
   variantTagKey,
 } from "./emit_variant_sig"
-import { i32ListHas, strListHas } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import { recordRowClassOf } from "./record_rows"
 import {
   memoKeyClear,
@@ -4003,12 +4003,57 @@ export function rlSlotOfRowTy(et: i32): i32 {
   if s >= 0 { return s }
   let i = 0
   while i < rlElemTyIx.length {
-    if tySame(rlElemTyIx[i], et) || tyEq(rlElemTyIx[i], et) { return i }
+    const ri = rlElemTyIx[i]
+    if tySame(ri, et) || tyEq(ri, et) && fnTagRepAgree(ri, et, 8) { return i }
     i = i + 1
   }
   // A mixed-width integer literal union is stored at the row of its members' bases (D6460).
   const bases = intLitUnionBasesOf(et)
   if bases.length > 1 { rlSlotOfUnionMembers(bases) } else { -1 }
+}
+
+// Whether types `a` and `b`, equal but for their function sets, agree at every function position
+// on whether it holds a tagged set's id or a closure, so one row's rep stores both (D15563).
+function fnTagRepAgree(a: i32, b: i32, depth: i32): boolean {
+  if depth <= 0 || a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length {
+    return true
+  }
+  const x = tyAt(a)
+  const y = tyAt(b)
+  match x {
+    TyFunc => {
+      return fnTagTyIsTagged(a) == fnTagTyIsTagged(b)
+    }
+    TyArray => {
+      return y is TyArray && fnTagRepAgree(x.aElem, y.aElem, depth - 1)
+    }
+    TyNullable => {
+      return y is TyNullable && fnTagRepAgree(x.nInner, y.nInner, depth - 1)
+    }
+    TyMap => {
+      return y is TyMap && fnTagRepAgree(x.mVal, y.mVal, depth - 1)
+    }
+    TyObj => {
+      if !(y is TyObj) { return true }
+      let k = 0
+      while k < x.objFieldNames.length && k < x.objFieldTypes.length {
+        const j = strListIndexOf(y.objFieldNames, x.objFieldNames[k])
+        if (
+          j >= 0
+          && j < y.objFieldTypes.length
+          && !fnTagRepAgree(x.objFieldTypes[k], y.objFieldTypes[j], depth - 1)
+        ) {
+          return false
+        }
+        k = k + 1
+      }
+      return true
+    }
+    // A scalar, union or open type holds no set position this compares.
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => {
+      return true
+    }
+  }
 }
 
 // Element type `et` at the type its ref-list row is minted under: a closure at its row's
