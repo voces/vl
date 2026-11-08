@@ -72,4 +72,4 @@ already gets. The row asks for a ruling first, and it recommends the wrapper.
 ## Is step 3 done apart from w149's rows?
 
 No. Besides the blocked rows (`pass(h)` x06/y03, D10382, D12218, D14883, D14888, D15014,
-D15566, filed by #6870; unfiled: D15566), the `genFnHole*` family stands, with the three items above between it and deletion.
+D15566), the `genFnHole*` family stands, with the three items above between it and deletion.
