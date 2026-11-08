@@ -360,10 +360,11 @@ import {
   fRetRListRow,
   fRetStructIdx,
   fRetVoid,
+  fa32Ty,
   fa32TypeIdx,
-  fa32Used,
   fa64TypeIdx,
   fa64Used,
+  fl32Ty,
   fl32TypeIdx,
   fl64TypeIdx,
   fmResumeArmed,
@@ -425,6 +426,7 @@ import {
   localDeclIx,
   mAllocKind,
   mAllocSlot,
+  mAllocType,
   mI32Used,
   mI64Used,
   mIntMonoArmUsed,
@@ -4250,18 +4252,9 @@ function mResetTypeIntern() {
   mNextType = 0
   mAllocKind = []
   mAllocSlot = []
+  fa32TypeIdx = -1
+  fl32TypeIdx = -1
   0
-}
-
-// Allocate the next heap-type index (interning in emit order): return the current
-// counter, then advance it by one, recording which family and row it is for
-// `emitTypeSection`. This is the single place a type index is minted.
-function mAllocType(kind: i32, slot: i32) {
-  const idx = mNextType
-  mNextType = mNextType + 1
-  mAllocKind.push(kind)
-  mAllocSlot.push(slot)
-  idx
 }
 
 // The mv slot a map-element ref-list slot's value occupies, the element-heap resolver's twin of
@@ -4390,7 +4383,7 @@ export function mAssignTypeIndices(_n: i32) {
     } else if rlElemKindAt(rsfix) == RLK_F64_LIST {
       rlElemHeap[rsfix] = fl64TypeIdx
     } else if rlElemKindAt(rsfix) == RLK_F32_LIST {
-      rlElemHeap[rsfix] = fl32TypeIdx
+      rlElemHeap[rsfix] = fl32Ty()
     } else if rlElemKindAt(rsfix) == RLK_I64_LIST {
       rlElemHeap[rsfix] = il64TypeIdx
     } else if rlElemKindAt(rsfix) == RLK_U8_LIST {
@@ -4727,16 +4720,8 @@ function mAssignScalarListPairs() {
     ia64TypeIdx = mNextType
     il64TypeIdx = mNextType + 1
   }
-  // The f32-list pair, immediately after the i64 pair (same "interned late" discipline): the
-  // `(array (mut f32))` backing then its `{backing,len,cap}` wrapper. Present only when
-  // `fa32Used`; aliases its slots otherwise (zero types minted).
-  if fa32Used {
-    fa32TypeIdx = mAllocType(TSK_F32_ARRAY, 0)
-    fl32TypeIdx = mAllocType(TSK_F32_LIST, 0)
-  } else {
-    fa32TypeIdx = mNextType
-    fl32TypeIdx = mNextType + 1
-  }
+  // The f32-list pair mints on first read (`fa32Ty`); a scalar view over it needs it first.
+  if svPairOn(2) { fa32Ty() }
   // The `u8[]` pair, immediately after the f32 pair and under the same "interned late"
   // discipline: the PACKED `(array (mut i8))` backing then its `{backing,len,cap}`
   // wrapper. Present only when `ba8Used`; aliases its slots otherwise, so a program with
@@ -4847,7 +4832,7 @@ function forceAnnLeafReps(a: string): i32 {
   } else if nameIsI64Array(a) {
     ia64Used = true
   } else if nameIsF32Array(a) {
-    fa32Used = true
+    // The f32 pair mints on first read (`fa32Ty`).
   } else if nameIsBareMap(a) {
     mUsed = true
     lUsed = true
@@ -4874,7 +4859,7 @@ function forceAnnLeafReps(a: string): i32 {
         ia64Used = true
       }
       "nulf32list" => {
-        fa32Used = true
+        // The f32 pair mints on first read (`fa32Ty`).
       }
       "nulu8list" => {
         // The packed-byte backing a `u8[] | null` cell's value needs. Its three siblings mark
@@ -4918,7 +4903,7 @@ function forceListLeafRepsOfTy(kTy: i32): i32 {
       ia64Used = true
     }
     "f32" => {
-      fa32Used = true
+      // The f32 pair mints on first read (`fa32Ty`).
     }
     "i32" | "boolean" => {
       lUsed = true
@@ -5012,7 +4997,7 @@ function forceAnnLeafRepsOfTy(t: i32): i32 {
         ia64Used = true
       }
       "f32" => {
-        fa32Used = true
+        // The f32 pair mints on first read (`fa32Ty`).
       }
       "i32" | "boolean" => {
         lUsed = true
@@ -5054,7 +5039,7 @@ function forceAnnLeafRepsOfTy(t: i32): i32 {
       ia64Used = true
     }
     "f32" => {
-      fa32Used = true
+      // The f32 pair mints on first read (`fa32Ty`).
     }
     "u8" => {
       ba8Used = true
@@ -5170,7 +5155,7 @@ function collectArrNewScalarPair(ank: ArrNewKind) {
       ba8Used = true // D1470 — `__array_new_default__` over a `u8[]` destination
     }
     "f32list" => {
-      fa32Used = true // D1470 — …and over an `f32[]` one
+      // D1470: the f32 pair mints on first read (`fa32Ty`).
     }
     "strlist" => {
       // String fill → the string list (wrapper/backing shared with `string[]`).
@@ -5331,7 +5316,7 @@ function arrNewFrameWalk(ix: i32, fnIx: i32) {
       } else if nk == ALK_I64 {
         ia64Used = true
       } else if arrLitIsF32(ix, fnIx) {
-        fa32Used = true
+        // The f32 pair mints on first read (`fa32Ty`).
       } else {
         lUsed = true
         aUsed = true
@@ -5378,7 +5363,7 @@ function collectArrLitScalar(ix: i32) {
   } else if nk == ALK_I64 {
     ia64Used = true
   } else if arrLitIsF32(ix, -1) {
-    fa32Used = true
+    // The f32 pair mints on first read (`fa32Ty`).
   } else {
     lUsed = true
     aUsed = true
@@ -5483,11 +5468,9 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
         }
         if nestKind == RLK_F64_LIST { fa64Used = true }
         if nestKind == RLK_I64_LIST { ia64Used = true }
-        // The two leaf kinds this arm never had a flag for: an f32 inner list (10) rides
-        // `$fl32TypeIdx`, and a map inner element (3) rides the map struct plus the i32 list
-        // and array its `index` and `vals` fields use. Same flags as the `arrLitIsRef` arm.
-        if nestKind == RLK_F32_LIST { fa32Used = true }
         if nestKind == RLK_U8_LIST { ba8Used = true }
+        // A map inner element (3) rides the map struct plus the i32 list and array its
+        // `index` and `vals` fields use. Same flags as the `arrLitIsRef` arm.
         if nestKind == RLK_MAP {
           mUsed = true
           lUsed = true
@@ -5565,10 +5548,6 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
         lUsed = true
         aUsed = true
       }
-      // The f32 inner list (kind 10), the leaf the old allow-list could not admit — its
-      // element is the `$fl32TypeIdx` wrapper, so force that pair exactly as 6/7/8 above
-      // force theirs. Beside kind 3 for the same reason: both are now reachable here.
-      if kAfter == RLK_F32_LIST { fa32Used = true }
       if kAfter == RLK_U8_LIST { ba8Used = true }
     }
   } else if arrLitIsStr(i, -1) {
@@ -5674,7 +5653,6 @@ function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
     aUsed = true
   }
   if raKind == RLK_F64_LIST { fa64Used = true }
-  if raKind == RLK_F32_LIST { fa32Used = true }
   if raKind == RLK_U8_LIST { ba8Used = true }
   if raKind == RLK_I64_LIST { ia64Used = true }
   // A map element (`{[K]: V}[]`, `({[K]: V} | null)[]`) forces the map machinery — the
@@ -5804,9 +5782,7 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     // documented second opinion. Both answers are strongly represented and agree, so the
     // arena never widens here — which matters in a minting chain where an over-answering rung
     // suppresses every rung below it. The name stays for the families the arena cannot name.
-
-    // An `f32[]` annotation forces the f32 array + wrapper pair (`fa32`/`fl32`).
-    fa32Used = true
+    // The f32 pair itself mints on first read (`fa32Ty`).
   } else if (nodeTyArrayElemRepName(i) == "u8" || nameIsU8Array(nd.tyName)) {
     // A `u8[]` annotation forces the PACKED byte array + wrapper pair
     // (`ba8`/`bl8`). Arena first then the name, exactly as the three scalar rungs
@@ -5851,7 +5827,6 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     }
     if nsk == "nulf64list" { fa64Used = true }
     if nsk == "nuli64list" { ia64Used = true }
-    if nsk == "nulf32list" { fa32Used = true }
     if nsk == "nulu8list" { ba8Used = true }
   } else if nodeTyIsLitUnionAlias(i) || nodeTyIsNulLitUnion(i) {
     // A literal-union annotation (`: K`): an atom widens to its member `string`, so force the
@@ -9980,7 +9955,7 @@ export function collectMapFilterUse() {
                 } else if rvk == "i64" {
                   ia64Used = true
                 } else if rvk == "f32" {
-                  fa32Used = true
+                  // The f32 pair mints on first read (`fa32Ty`).
                 } else {
                   aUsed = true
                   lUsed = true
