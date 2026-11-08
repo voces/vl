@@ -6,9 +6,10 @@ measures the fourth caller (`fnRetRefListDemand` / `fnRetRefListRowJoin`), which
 
 ## Change (emit_classify.vl)
 
-* `refListSlotOfExpr`'s last rung is `refListTypedSlotOfExpr`: a named function call's joined
-  result row (`fnRetRefListSlot`), a parenthesised read's inner row, an if-expression's join
-  row (`ifExprRefSlot`), else the row the element type keys (`rlSlotOfTyOrTwin`).
+* `refListSlotOfExpr`'s name rung is gone. A named function call reads its function's joined
+  result row (`fnRetRefListSlot`), a paren its inner read's row and an if-expression its join
+  row (`ifExprRefSlot`). Every other read takes the row its element type keys
+  (`rlSlotOfTyOrTwin`).
 * `refListElemNameOfIndex` reads the receiver's row from `refListSlotOfExpr`, not from its name.
 * `letTailRowSlot` no longer asks `letInitDeliversRow`. A literal with no spread keeps its own
   row. Any other initializer binds the row it delivers, falling back to the element type's row.
@@ -41,10 +42,11 @@ hole-function call. The Paren, if and call rungs above close all 3. At C, the 7 
 differ pairs are reads that `refListSlotOfExpr` already answered, and they still return that
 answer. At C', all 21 movers are literals, which is why a literal keeps `arrLitRowSlotIn`.
 
-## Sweep (fixpoint seeds, base = master `28406f9c` + #6818, candidate)
+## Sweep (fixpoint seeds, base = master `dfc71a0a`, candidate)
 
 23,670 of 23,670 records identical (module bytes and stdout), 0 runs → not-runs. Seed
-6,522,798 → 6,522,890 bytes (+92). rep-fuzz-check exact.
+6,525,260 → 6,525,307 bytes (+47). rep-fuzz-check exact. The same held before the master
+merge, against `28406f9c` + #6818.
 
 ## Callers of the name path, files reached
 
