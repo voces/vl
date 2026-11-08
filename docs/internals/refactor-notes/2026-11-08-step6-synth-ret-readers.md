@@ -1,7 +1,8 @@
-# Step 6: `synthRetAnnots` narrowed to three pins, its readers on the lambda's own row
+# Step 6: `synthRetAnnots` narrowed to four pins, its readers on the lambda's own row
 
-Measured on 2026-11-08 at `fd652e7b` (master `cbc9406c` with #6758 merged) over the sweep
-population (23,615 programs). Base and candidate are fixpoint seeds.
+Ablation measured on 2026-11-08 at `fd652e7b` (master `cbc9406c` with #6758 merged) over
+the sweep population (23,615 programs). The final sweep is on master `38d86e63`. Base and
+candidate are fixpoint seeds.
 
 ## The mechanism, by ablation
 
@@ -36,6 +37,7 @@ node 57 while the row was under node 42. Every slot write goes through
 | void-adopted lambda | 1 | `cloRetKindOf` (`fRetVoid`), on a mono clone pushed to a new slot |
 | element-value-union list (`inferRetRungIsParenUnionElemList`) | 1 | element seeding of the box list |
 | union-field struct (`tyIsStructWithUnionField`) | 1 | the boxed field slot of the body's `ObjLit` |
+| literal-union result (`tyIsLitUnion`) | 1 on `38d86e63`, 0 on `cbc9406c` | the i32 atom result (`closures/closure-result-map-union.vl`) |
 
 The void pin's clone has no `nodeSrc` link that `lambdaVoidAdoptedAt` could follow (tried:
 following `nodeSrc` and the slot carry moved nothing). It needs mono to record the clone's
@@ -49,11 +51,15 @@ called it: eight `inferRetRung*` predicates, `lambdaCtxRetAdoptedAt` with
 
 ## Sweep
 
-| | count |
-|---|---|
-| runs → not-runs | 0 |
-| output movers | 0 |
-| bytes-only | 9 (6 cases, 3 inventory) |
+| | at `fd652e7b` | at `38d86e63` |
+|---|---|---|
+| runs → not-runs | 0 | 0 |
+| output movers | 0 | 0 |
+| bytes-only | 9 | 2 |
+
+The bytes-only movers print the same output. Two of them differ only in local declarations.
+`closures/closure-generic-call-narrowed-literal.vl` (at `fd652e7b`) lowers its lambda through
+the inferred-return row instead of the pin, which costs 102 bytes.
 
 `synthAnnOfTy` stays: `synthRecordedRetAnnots` calls it, and this pass never did.
 
@@ -61,4 +67,5 @@ called it: eight `inferRetRung*` predicates, `lambdaCtxRetAdoptedAt` with
 
 | measure | base | this change |
 |---|---|---|
-| seed bytes (fixpoint) | 6,499,042 | 6,497,823 (−1,219) |
+| seed bytes (fixpoint), `fd652e7b` | 6,499,042 | 6,497,823 (−1,219) |
+| seed bytes (fixpoint), `38d86e63` | 6,510,411 | 6,509,203 (−1,208) |
