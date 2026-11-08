@@ -35,12 +35,19 @@ variable at the check and a number only at the pin: an un-annotated parameter gi
 value call (`d15206_f64.vl`), a generic `T` instanced at `i64` (D2712). That is a missing
 record, not a legitimate floor.
 
+## Memory
+
+`numOperandTy` runs once per operand. A version that mapped the scalar base by looping over an
+array literal (`for s in [TY_I32, ...]`) allocated that array on every call and read plumb-shape
+main peak RSS 454 MB (+43%), at fuel +0.1%. Compared in a line each, it reads 319.3 MB. A fresh
+literal on a per-node path is priced in peak memory, not fuel.
+
 ## Proof
 
 | | |
 |---|---|
 | sweep, 23,679 programs, master fixpoint vs candidate | identical records: 0 `runs → not-runs`, 0 movers |
-| plumb-shape main | fuel −0.1%, peak RSS 319.3 MB (+0.4%) against the baseline |
+| plumb-shape main | fuel +0.1%, peak RSS 319.3 MB (+0.4%) against the baseline |
 | plumb-shape tail | fuel −1.2%, peak RSS 319.0 MB (+0.4%) |
-| fixpoint seed | 6,531,155 bytes (+549 against master's fixpoint) |
+| seed | 6,541,373 bytes (+5,441 against a two-step master build; +2.3% against the size baseline) |
 | `vl_box_dst_shadow_test` | 42/42, with a new operand case under both controls |
