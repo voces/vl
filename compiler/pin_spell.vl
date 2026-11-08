@@ -4,7 +4,9 @@
 // closes each pin's own type, the column the instance key reads its row class from.
 import {
   T,
+  TY_BOOL,
   TY_NEVER,
+  TY_STR,
   TyArray,
   TyErr,
   TyFunc,
@@ -18,18 +20,26 @@ import {
   TyVar,
   litUnionAliasNameOfTy,
   litUnionAliasOfLitTexts,
+  mkArrayTy,
+  mkMapTy,
+  mkNullableTy,
+  mkObjTy,
+  numLitUnionBaseName,
   numLitUnionBaseTy,
+  structNameOfTy,
   tyAt,
-  tyEq,
   tyHoldsObj,
+  tyIsLitUnion,
+  tyIsOneStrLit,
 } from "./check_types"
 import { Param, nodeAt } from "./ast"
 import { tyIsUnionish } from "./check_node_tys"
 import { repRowOfTyStruct, repShadowOn, repVariantShapeRowOf } from "./emit_rep"
 import { repABNote } from "./emit_nullable_rets"
-import { nameToTy } from "./check_relate_core"
+import { nomErasedTyIx } from "./check_ty_rep"
+import { mkUnionTy } from "./check_union_mint"
 import { elabInstTyAt, elabUnboundTpTy } from "./emit_elab"
-import { sNames, uVariants } from "./emit_state"
+import { sNames, sTyIx, uVariants } from "./emit_state"
 import { strContains } from "./strutil"
 import { tyHasTyVar } from "./tyquery"
 
@@ -290,12 +300,90 @@ export function monoPinOwnTvAtRep(
   out
 }
 
-// The own type of a bare type-parameter pin spelled `name` from an argument typed `ty`: `ty`,
-// unless the spelling names another closed type, the rep a narrowed or flow-widened argument is
-// read at (`monoArgPinName`), which the instance is built at.
-export function monoPinOwnOfSpelled(name: string, ty: i32): i32 {
-  if ty < 0 || ty >= T.tys.length { return ty }
-  const nt = nameToTy(name)
-  if nt < 0 || tyHasTyVar(nt) || tyEq(nt, ty) { return ty }
-  nt
+// The type a pin over closed type `ty` denotes once its rep collapses, as `monoAnnPinName` and the
+// canon spelling collapse a name: a newtype brand is its base, a `readonly` list the list, a
+// `Set<K>` the map `{[K]: boolean}`, a union of numeric literals its base scalar, at every depth.
+// `ty` itself where nothing collapses.
+export function monoAnnPinTy(ty: i32): i32 { monoAnnPinTyAt(ty, 0) }
+
+function monoAnnPinTyAt(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth > 64 { return ty }
+  const b = nomErasedTyIx(ty)
+  if b != ty { return monoAnnPinTyAt(b, depth + 1) }
+  const t = tyAt(ty)
+  match t {
+    TyArray => {
+      const e = monoAnnPinTyAt(t.aElem, depth + 1)
+      if e == t.aElem && t.aRead == 0 { return ty }
+      return mkArrayTy(e)
+    }
+    TyNullable => {
+      const inner = monoAnnPinTyAt(t.nInner, depth + 1)
+      if inner == t.nInner { return ty }
+      return mkNullableTy(inner)
+    }
+    TyMap => {
+      const k = monoAnnPinTyAt(t.mKey, depth + 1)
+      if t.mSet != 0 { return mkMapTy(k, TY_BOOL, 0) }
+      const v = monoAnnPinTyAt(t.mVal, depth + 1)
+      if k == t.mKey && v == t.mVal { return ty }
+      return mkMapTy(k, v, 0)
+    }
+    TyObj => {
+      const fs: i32[] = []
+      let changed = false
+      for f in t.objFieldTypes {
+        const c = monoAnnPinTyAt(f, depth + 1)
+        if c != f { changed = true }
+        fs.push(c)
+      }
+      if changed { return mkObjTy(t.objFieldNames, fs) }
+    }
+    TyUnion => {
+      if numLitUnionBaseName(ty) != "" { return numLitUnionBaseTy(ty) }
+      const ms: i32[] = []
+      let changed = false
+      for m in t.uMembers {
+        const c = monoAnnPinTyAt(m, depth + 1)
+        if c != m { changed = true }
+        ms.push(c)
+      }
+      if changed { return mkUnionTy(ms) }
+    }
+    TyPrim | TyLit | TyFunc | TyErr | TyVar | TyNeg => {}
+  }
+  ty
+}
+
+// The type closed argument type `t` pins at (`monoArgTyName`'s first rung; `rec` where it is
+// pinned as a record): a record by its declared row's type, a union of numeric literals by its
+// base scalar, one string literal by `string`; `t` otherwise.
+export function monoClosedPinOwnTy(t: i32, rec: boolean): i32 {
+  if t < 0 || t >= T.tys.length { return t }
+  if rec {
+    if tyAt(t) is TyObj && structNameOfTy(t) != "" {
+      const rr = repRowOfTyStruct(t, sNames.length)
+      if (
+        rr >= 0
+        && rr < sNames.length
+        && rr < sTyIx.length
+        && structNameOfTy(sTyIx[rr]) == sNames[rr]
+      ) {
+        return sTyIx[rr]
+      }
+    }
+    return t
+  }
+  if tyAt(t) is TyUnion && numLitUnionBaseName(t) != "" {
+    return numLitUnionBaseTy(t)
+  }
+  if tyIsOneStrLit(t) && !tyIsLitUnion(t) && litUnionAliasNameOfTy(t) == "" {
+    return TY_STR
+  }
+  t
+}
+
+// `ty` where it is a closed type, else -1.
+export function monoPinClosedOrNone(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { -1 } else { ty }
 }
