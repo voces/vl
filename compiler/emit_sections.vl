@@ -842,9 +842,9 @@ import {
   collectS,
   collectTyParamNames,
   collectU,
-  computeRetInference,
   declareForInLocals,
   declareForRangeLocals,
+  fnRetColsFromRecorded,
   gaeDeclsReset,
   leqNoteStructRowFields,
   leqScanBlock,
@@ -6635,7 +6635,6 @@ type EmitPass = "deadTailDrop"
   | "synthRecEqCores"
   | "buildFnMap#2"
   | "recordedVoidFns#2"
-  | "computeRetInference#2"
   | "collectMapFilterUse"
   | "collectFnValUse"
   | "collectCloSigs"
@@ -7309,8 +7308,7 @@ function scanPrintCallIntrinsic(name: string, nArgs: i32) {
 function passKeepsCaptures(name: string): boolean {
   if name == "dispatchRewrite" { return true }
   if name == "monomorphize" { return true }
-  if name == "computeRetInference#2" { return true }
-  // Writes only `fRetVoid`, which no `capScan` path reads.
+  // Writes only `fRetVoid` and the return columns, which no `capScan` path reads.
   name == "recordedVoidFns" || name == "recordedVoidFns#2"
 }
 
@@ -7407,13 +7405,12 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
       return buildFnMap(stmts)
     }
     "recordedVoidFns#2" => {
+      // Voidness first, then every un-annotated valued function's columns from its recorded result.
       const cv = recordedVoidFns()
       fnRetShadowRun()
-      return cv
-    }
-    "computeRetInference#2" => {
+      if cv < 0 { return cv }
       fnColShadowRun("post seed")
-      const cr = computeRetInference()
+      const cr = fnRetColsFromRecorded()
       fnColShadowRun("post settled")
       fnKindShadowRun()
       return cr
@@ -7708,16 +7705,12 @@ function emitPassTable(): PassRow[] {
       needs: ["buildFnMap#2"],
     },
     {
-      pass: "computeRetInference#2",
+      pass: "collectMapFilterUse",
       needs: ["recordedVoidFns#2"],
     },
     {
-      pass: "collectMapFilterUse",
-      needs: ["computeRetInference#2"],
-    },
-    {
       pass: "collectFnValUse",
-      needs: ["computeRetInference#2"],
+      needs: ["recordedVoidFns#2"],
     },
     {
       pass: "collectCloSigs",
@@ -8186,7 +8179,7 @@ function emitOneFuncType(ti: i32) {
       wU8(1 + nRetCaps)
       fbValtype("closure", -1)
     } else if fn.fnRet < 0 {
-      // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
+      // UN-ANNOTATED return: the INFERRED kind (fnRetColsFromRecorded set the same
       // stored `fRetKind` slot the annotation path fills). i32 when nothing matched.
       wU8(1 + nRetCaps) // 1 result
       // The inferred result kind from the single shared mapping (`inferredRetKindCore`), so this
