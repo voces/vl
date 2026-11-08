@@ -20,6 +20,7 @@ import {
 } from "./ast"
 import { nodeRepTyIxOf } from "./check_core_state"
 import { nodeTyIxOf } from "./check_node_tys"
+import { inferRetTyIxByNode } from "./check_infer_ret"
 import { retValueRootCall } from "./check_store_rep"
 import { collectRetValues } from "./check_nj_join"
 import { recHoleIdentityArg } from "./check_fit_rules"
@@ -47,6 +48,7 @@ import {
   T,
   TY_BOOL,
   TY_NEVER,
+  TY_STR,
   TY_VOID,
   TyArray,
   TyErr,
@@ -62,6 +64,7 @@ import {
   mkArrayTy,
   mkNullableTy,
   tyAt,
+  tyIsLitUnion,
   tySame,
 } from "./check_types"
 import {
@@ -138,7 +141,7 @@ export function fnRetShadowArm(on: i32) {
 }
 
 // Arm (1) or disarm (0) the result-kind shadow for the compiles that follow; 2 also names each
-// function. It counts beside the voidness rows, once `computeRetInference` has settled.
+// function. It counts beside the voidness rows, once `fnRetColsFromRecorded` has settled.
 export function fnKindShadowArm(on: i32) {
   frsKindArmed = on != 0
   frsNamed = on == 2
@@ -165,6 +168,23 @@ export function fnRetShadowDropSet(d: i32) {
 // result. -1 where none is recorded or it is still open.
 export function fnRecordedRetTy(fe: i32): i32 {
   if fe < 0 || fe >= fnStmts.length { return -1 }
+  frsLitUnionRet(fnStmts[fe], frsRecordedRetCore(fe))
+}
+
+// Recorded result `r` of the lambda at node `fx`, or the literal union its context typed the
+// lambda's result at where `r` is a string or a string literal: the lambda returns the atom. A
+// lambda the elaboration rebuilt is typed at the declaration it copies.
+function frsLitUnionRet(fx: i32, r: i32): i32 {
+  if r < 0 || r >= T.tys.length { return r }
+  const rt = tyAt(r)
+  if r != TY_STR && !(rt is TyLit && rt.litKind == "str") { return r }
+  const src = if emitPhaseReached("monomorphized") { elabSrcDecl(fx) } else { fx }
+  const lu = inferRetTyIxByNode(if src >= 0 { src } else { fx })
+  if tyIsLitUnion(lu) { lu } else { r }
+}
+
+// `fnRecordedRetTy` before a lambda's literal-union result is read (`frsLitUnionRet`).
+function frsRecordedRetCore(fe: i32): i32 {
   const fx = fnStmts[fe]
   // The stub and elaboration ledgers are this compile's only once `monomorphize` has run; before,
   // they hold the previous program's, so only the checker's own type answers.
@@ -523,7 +543,8 @@ function frsValuesBuiltRow(fx: i32): i32 {
   let row = -1
   for v in vals {
     const root = retValueRootCall(v)
-    const at = if root >= 0 && frsHandBackLeaf(root, 0) >= 0 { root } else { frsHeldRead(v) }
+    let at = if root >= 0 && frsHandBackLeaf(root, 0) >= 0 { root } else { frsHeldRead(v) }
+    if at < 0 { at = frsConstLitRead(v) }
     if at < 0 { return -1 }
     const st = nodeRepTyIxOf(at)
     if st < 0 || st >= T.tys.length || !(tyAt(st) is TyObj) || tyHasTyVar(st) {
@@ -533,6 +554,18 @@ function frsValuesBuiltRow(fx: i32): i32 {
     row = st
   }
   row
+}
+
+// The record literal returned value `v` reads where `v` names a `const` bound to one, which the
+// lowering builds at the literal's own stamp; else -1.
+function frsConstLitRead(v: i32): i32 {
+  const u = unwrapParen(v)
+  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is Ident) { return -1 }
+  const d = identDeclOf(u)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return -1 }
+  const init = unwrapParen(dn.letInit)
+  if init >= 0 && nodeAt(init) is ObjLit { init } else { -1 }
 }
 
 // Returned value `v` when it is a read the checker's store column stamped at another record than
@@ -798,7 +831,7 @@ function frsTailCallsVoid(fx: i32): boolean {
 }
 
 // Count every function the emitter lowers valued by how the kind of its recorded result meets
-// `fRetKind`. Run once the kinds have settled (after `computeRetInference#2`).
+// `fRetKind`. Run once the kinds have settled (after `fnRetColsFromRecorded`).
 export function fnKindShadowRun() {
   if !frsKindArmed { return 0 }
   if frsArmed == false {
