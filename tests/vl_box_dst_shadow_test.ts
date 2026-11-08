@@ -313,7 +313,7 @@ Deno.test({
       "arm",
       ARM,
       DROP_NONE,
-      "agree=2; nested value already a box=1; value already a box=1",
+      "agree=2; nested agree=2; nested value already a box=1; value already a box=1",
     ),
 });
 
@@ -380,7 +380,7 @@ Deno.test({
       "omit",
       OMIT,
       DROP_NONE,
-      "agree=3; nested agree=7; nested value already a box=1; value already a box=1",
+      "agree=3; nested agree=9; nested value already a box=1; value already a box=1",
     ),
 });
 

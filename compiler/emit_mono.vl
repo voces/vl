@@ -1,3 +1,4 @@
+import { voidCtxLambdaCarry } from "./check_side_rows"
 import { idShadowSpec } from "./emit_id_shadow"
 import {
   elabIdentityFnTy,
@@ -510,6 +511,7 @@ import {
   monoFieldReadTys,
   monoGen,
   monoGradualAsScalar,
+  monoGradualObjFrame,
   monoGradualObjList,
   monoGradualObjLits,
   monoGradualRetPinned,
@@ -3559,6 +3561,7 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
           const clone = mkFunc(nm, noTP, ps, a.fnRet, a.fnBody, a.pos)
           recordClonedCallRetire(unwrapParen(argIx), clone)
           fnTagLeafCarry(clone, unwrapParen(argIx))
+          voidCtxLambdaCarry(clone, unwrapParen(argIx))
           fnStmts.push(clone)
           fnParent.push(-1)
           // The row records the callback at the signature its element type closes, in the
@@ -4050,6 +4053,7 @@ let monoLamRetFromBinding = false
 function monoLamInstallClone(a: FuncDecl, fnIx: i32, clone: i32, mark: i32) {
   // A lambda member of a tagged set is its id wherever an instance of it is read.
   fnTagLeafCarry(clone, fnIx)
+  voidCtxLambdaCarry(clone, fnIx)
   // D1046 — the first instance of a named nested function replaces the template's slot
   // rather than pushing beside it: the by-name lookup takes the first child of the
   // frame, so two same-named children mean the call answers the unsubstituted template.
@@ -8540,9 +8544,9 @@ function monoMakeInstanceHit(
   false
 }
 
-// The parameter annotation for pin `name`, typed by `ty`, the type the pin denotes. Only an open
-// `ty` reads the name: a list of a literal's `#anon` row takes the row's list (D4710), and any
-// other closes in the spelling.
+// The parameter annotation for pin `name`, typed by `ty`, the type the pin denotes. A closed `ty`
+// spells the node itself (`monoPinSpellOf`). Only an open `ty` reads the name: a list of a
+// literal's `#anon` row takes the row's list (D4710), and any other closes in the spelling.
 function monoSynthPinRef(name: string, ty: i32): i32 {
   if ty >= 0 && !tyHasTyVar(ty) {
     const sp = monoPinSpellOf(ty)
@@ -8954,6 +8958,7 @@ function monoMakeInstanceLater(
   }
   if origFe >= 0 && origFe < monoOrigNode.length {
     fnTagLeafCarry(nfn, monoOrigNode[origFe])
+    voidCtxLambdaCarry(nfn, monoOrigNode[origFe])
   }
   fnStmts.push(nfn)
   // A nested template's later instance keeps the template's frame, so its captures
@@ -9289,6 +9294,7 @@ function monoMakeInstanceFirst(
 ) {
   buildFnMapNoteFnStmtWrite(origFe, nfn)
   fnTagLeafCarry(nfn, monoOrigNode[origFe])
+  voidCtxLambdaCarry(nfn, monoOrigNode[origFe])
   fnStmts[origFe] = nfn
   monoLamCallByName(calleeIx, origFe, instName)
   0
@@ -9894,6 +9900,7 @@ function monoMakeInstanceGo(
       tplCall,
       monoOrigNode[origFe],
       params,
+      letTyCol,
       k.tps,
       letBN,
       letBT,
@@ -15318,12 +15325,18 @@ function monoRecordObjLitAt(lx: i32, t: i32, ctx: i32) {
           monoPinFieldContainer(lx, ctx, f.fiName, vx)
         }
       } else if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is Ident {
-        nodeTyRecord(vx, ft)
+        // A read the instance shares with the other copies takes the type in this frame only.
+        if monoNodeOwnedBy(vx, ctx) {
+          nodeTyRecord(vx, ft)
+        } else {
+          nodeTyRecordIn(ctx, vx, ft)
+        }
       }
     }
   }
   monoSupersededObjTys.push(ot)
   nodeTyRecord(lx, t)
+  if monoFrameIsGenericInstance(ctx) { monoGradualObjFrame[lx] = ctx }
   monoGradualObjList.push(lx)
   0
 }
@@ -15718,14 +15731,21 @@ function monoMapStoredFields(stored: i32[][], name: string): i32[][] {
 // pushed onto `spell`; -1 when the slot is pinned at none or two or a function does not close or
 // agree, -2 when instancing one is refused.
 function monoStoredSlotFnTy(
-  lf: i32[],
+  lf0: i32[],
   path: string[],
   vals: i32[][],
   spell: string[],
 ): i32 {
-  const at = lf[1]
+  let lf = lf0
   let pinFts: i32[] = []
   let pins = monoDeclPathKeys(lf, path, false, pinFts)
+  // A generic instance's copy of a literal keys no slot of its own: its template's slots do.
+  const src = nodeSrc[lf0[1]] ?? -1
+  if pins.length == 0 && src >= 0 {
+    lf = [lf0[0], src]
+    pins = monoDeclPathKeys(lf, path, false, pinFts)
+  }
+  const at = lf[1]
   if pins.length == 0 && elabSlotUncalled(at, path) {
     return monoUncalledSlotFnTy(at, path, vals, spell)
   }
@@ -25554,6 +25574,7 @@ export function monomorphize(stmts: i32[]) {
   monoSubTablesReset()
   monoGradualObjLits = Map()
   monoGradualObjList = []
+  monoGradualObjFrame = Map()
   monoSupersededObjTys = []
   monoGradualAsScalar = Map()
   monoGradualRetPinned = false
