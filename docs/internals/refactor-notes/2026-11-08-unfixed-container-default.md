@@ -18,16 +18,15 @@ at any type. Such programs now run instead of refusing with `cannot infer a type
   `xs[0] + 1`), and the default would then be wrong. D1462's witness stays a check reject.
 * At an inner scope the default waits for the program's end, so a later delivery (an inferred
   return handed to a typed parameter) still fixes the type first.
-* New checker-side lint row `container-element-type-unfixed` (`warning`, the `rcoal` channel
-  that `deep-record-compare` uses): `the element type of 'r.f' is never fixed by any write…`.
+* No lint rule (owner, 2026-11-08): a generic never-used family is a separate lane.
 
 ## Refusal sites
 
 | site | before | after |
 | --- | --- | --- |
-| `flushUninferred`, top-level hole | `cannot infer a type for 'x'` | default + warning, unless read |
-| `flushUninferred`, `recOpenHolePath` (was maps only, now lists too) | `cannot infer a type for 'x.f'` | default + warning, unless read |
-| `flushOpenArgMaps`, inline argument | `cannot infer a type for this argument` | default + warning, unless read |
+| `flushUninferred`, top-level hole | `cannot infer a type for 'x'` | default, unless read |
+| `flushUninferred`, `recOpenHolePath` (maps, and lists in lists) | `cannot infer a type for 'x.f'` | default, unless read |
+| `flushOpenArgMaps`, inline argument | `cannot infer a type for this argument` | default, unless read |
 
 Untouched: un-annotated parameter refusals (`check_calls`, `check_fn_decl`) and
 `refuseEmptyListCalledArg` (the callee calls the element: a function type, not a container).
