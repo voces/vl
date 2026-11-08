@@ -8,6 +8,14 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step3-genfnhole-deleted](2026-11-08-step3-genfnhole-deleted.md): Step 3: genFnHole* deleted; the per-call Fn#d binding answers all 18 sites (#6893).
+- [2026-11-08-list-holder-two-generic-join](2026-11-08-list-holder-two-generic-join.md): Step 4: a list holder bound to two generics joins their sets (#6894).
+- [2026-11-08-step7-vtkindoftype-floors](2026-11-08-step7-vtkindoftype-floors.md): Step 7: vtKindOfType's floors closed; it is the annotation's rep kind (#6891).
+- [2026-11-08-step2-live-pin-shadows](2026-11-08-step2-live-pin-shadows.md): Step 2: the live pins in 10 families, shadowed against the elaboration (#6890).
+- [2026-11-08-step2-pin-census-deletions](2026-11-08-step2-pin-census-deletions.md): Step 2: mono*Pin* census; 11 dead pins deleted (#6889).
+- [2026-11-08-step7-buildfnmap-bank-and-columns](2026-11-08-step7-buildfnmap-bank-and-columns.md): Step 7: buildFnMap's resume bank and name/index maps deleted (#6888).
+- [2026-11-08-list-holder-two-param-join](2026-11-08-list-holder-two-param-join.md): Step 2: a list holder written from a second parameter keeps its set (#6887).
+- [2026-11-08-classifier-last-rung](2026-11-08-classifier-last-rung.md): Steps 2/7: the last classifier rung; census 0 both (#6882).
 - [2026-11-08-step3-forwarded-fnd-pin](2026-11-08-step3-forwarded-fnd-pin.md): Step 3: a plain-pinned hole parameter handed a Fn#d takes the tagged-set pin (#6883).
 - [2026-11-08-step3-apply2-rep](2026-11-08-step3-apply2-rep.md): Step 3: why the binding switch emitted invalid wasm (#6881).
 - [2026-11-08-step3-binding-switch-ablation](2026-11-08-step3-binding-switch-ablation.md): Step 3: the per-call binding switch ablated (#6877).
