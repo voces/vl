@@ -298,8 +298,7 @@ Deno.test({
       PLAIN,
       DROP_NOTHING,
       false,
-      // The valued function is pinned from its column before the shadow drops it.
-      "no result recorded, annotated, emitter value=1; no result recorded, emitter void=1",
+      "no result recorded, emitter value=1; no result recorded, emitter void=1",
     );
     expectRows(
       "annotated, nothing",
@@ -731,7 +730,7 @@ Deno.test({
       PLAIN,
       DROP_NONE,
       true,
-      "",
+      "post moved: unmoved: agree i32 | g=1; post seed: agree i32 | g=1; post settled: agree i32 | g=1",
       "col",
     );
     expectRows(
@@ -749,7 +748,9 @@ Deno.test({
       DROP_NONE,
       true,
       "post moved: moved: agree str | __lambda_0=1; post moved: moved: agree str | setK=1; " +
+        "post moved: unmoved: agree i32 | setN=1; post seed: agree i32 | setN=1; " +
         "post seed: kind str vs i32 | __lambda_0=1; post seed: kind str vs i32 | setK=1; " +
+        "post settled: agree i32 | setN=1; " +
         "post settled: agree str | __lambda_0=1; post settled: agree str | setK=1",
       "col",
     );
@@ -768,7 +769,7 @@ Deno.test({
       COL_SELF,
       DROP_NONE,
       true,
-      "",
+      "post moved: unmoved: agree i32 | r=1; post seed: agree i32 | r=1; post settled: agree i32 | r=1",
       "col",
     );
     expectRows(
@@ -776,7 +777,7 @@ Deno.test({
       COL_CALLEE,
       DROP_NONE,
       true,
-      "",
+      "post moved: moved: agree str | w$1=1; post moved: moved: agree str | w=1; post moved: unmoved: agree i32 | __lambda_0=1; post seed: agree i32 | __lambda_0=1; post seed: kind str vs i32 | w$1=1; post seed: kind str vs i32 | w=1; post settled: agree i32 | __lambda_0=1; post settled: agree str | w$1=1; post settled: agree str | w=1",
       "col",
     );
     expectRows(
