@@ -95,7 +95,11 @@ import {
 } from "./ast"
 import { curFnDeclIx, inferQuiet, quietDepth } from "./check_cursor"
 import { litPinN } from "./check_literals"
-import { restoreSlot, scopeVisibleSnapshot } from "./check_scopes"
+import {
+  identFnDeclOf,
+  restoreSlot,
+  scopeVisibleSnapshot,
+} from "./check_scopes"
 import { tyHasTyVar } from "./tyquery"
 import {
   i32ListHas,
@@ -4410,4 +4414,121 @@ export function elabRetRecLitGrow(lit: i32, t: i32) {
   }
   nodeTySetGrow(lx, t)
   0
+}
+
+// The parameter of `fn` every element of the list literal bound at `d` reads, `d` a `const` or a
+// `let` nothing re-points, where each read of `d` in `fn`'s own body is an element called in place
+// (`d[i](...)`) or a push of that parameter's reads; else -1.
+export function elabListParamSource(d: i32, fn: FuncDecl): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const ln = nodeAt(d)
+  if !(ln is LetDecl) || ln.letType >= 0 { return -1 }
+  if ln.letKw != "const" && !cwLetUnwritten(d) { return -1 }
+  const li = parenPeelIx(ln.letInit)
+  if li < 0 || li >= P.nodes.length { return -1 }
+  const al = nodeAt(li)
+  if !(al is ArrayLit) || al.arrElems.length == 0 { return -1 }
+  let pd = -1
+  for e in al.arrElems {
+    const ex = parenPeelIx(e)
+    if ex < 0 || ex >= P.nodes.length || !(nodeAt(ex) is Ident) { return -1 }
+    const src0 = identDeclOf(ex)
+    const src = if i32ListHas(fn.fnParams, src0) { src0 } else { elabParamCopyOf(src0, fn) }
+    if src < 0 || pd >= 0 && src != pd { return -1 }
+    pd = src
+  }
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  const gpar: i32[] = [-1]
+  const deep: boolean[] = [false]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    const g = gpar.pop() ?? -1
+    const nested = deep.pop() ?? false
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Ident && identDeclOf(x) == d {
+        if nested || p < 0 || g < 0 { return -1 }
+        const pn = nodeAt(p)
+        const gn = nodeAt(g)
+        const kept = elabListPushOfParam(p, g, x, pd, fn)
+          || elabListHandedWhole(p, x)
+        if !kept && (!(pn is Index) || pn.idxArr != x) { return -1 }
+        if !kept && (!(gn is Call) || parenPeelIx(gn.callFn) != p) { return -1 }
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+        gpar.push(p)
+        deep.push(nested || xn is FuncDecl)
+      }
+    }
+  }
+  pd
+}
+
+// Whether list read `x` is a positional argument of call `p` to a named function whose parameter
+// there is un-annotated, so the callee's instance takes the list at its holder's type.
+function elabListHandedWhole(p: i32, x: i32): boolean {
+  const c = nodeAt(p)
+  if !(c is Call) { return false }
+  const i = i32ListIndexOf(c.callArgs, x)
+  const cf = parenPeelIx(c.callFn)
+  if i < 0 || i < c.callArgNames.length && c.callArgNames[i] != "" {
+    return false
+  }
+  if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return false }
+  const fd = identFnDeclOf(cf)
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { c }
+  if !(f is FuncDecl) || i >= f.fnParams.length { return false }
+  const q = nodeAt(f.fnParams[i])
+  q is Param && q.parType < 0
+}
+
+// Whether the member at `p` read off list read `x`, called at `g`, pushes only reads of
+// parameter `pd` of `fn` or of its copies, so the list still holds that parameter's values alone.
+function elabListPushOfParam(
+  p: i32,
+  g: i32,
+  x: i32,
+  pd: i32,
+  fn: FuncDecl,
+): boolean {
+  const pn = nodeAt(p)
+  const gn = nodeAt(g)
+  if !(pn is Member) || pn.memObj != x || pn.memProp != "push" { return false }
+  if !(gn is Call) || parenPeelIx(gn.callFn) != p || gn.callArgs.length == 0 {
+    return false
+  }
+  for a in gn.callArgs {
+    const ax = parenPeelIx(a)
+    if ax < 0 || ax >= P.nodes.length || !(nodeAt(ax) is Ident) { return false }
+    const src0 = identDeclOf(ax)
+    const src = if i32ListHas(fn.fnParams, src0) { src0 } else { elabParamCopyOf(src0, fn) }
+    if src != pd { return false }
+  }
+  true
+}
+
+// The parameter of `fn` that binding `d` copies: an un-annotated `const`, or a `let` nothing
+// re-points (`cwLetUnwritten`), initialised by a read of it or of such a copy, at most 8 deep;
+// -1 otherwise.
+export function elabParamCopyOf(d: i32, fn: FuncDecl): i32 {
+  let cur = d
+  let hops = 0
+  while hops < 8 {
+    if cur < 0 || cur >= P.nodes.length { return -1 }
+    const ln = nodeAt(cur)
+    if !(ln is LetDecl) || ln.letType >= 0 { return -1 }
+    if ln.letKw != "const" && !cwLetUnwritten(cur) { return -1 }
+    const v = parenPeelIx(ln.letInit)
+    if v < 0 || !(nodeAt(v) is Ident) { return -1 }
+    const src = identDeclOf(v)
+    if i32ListHas(fn.fnParams, src) { return src }
+    // A copy of a copy reads the parameter too (D15051).
+    cur = src
+    hops = hops + 1
+  }
+  -1
 }
