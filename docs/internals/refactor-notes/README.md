@@ -8,6 +8,9 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-call-key-stored-hole-default](2026-11-08-call-key-stored-hole-default.md): Step 2: a stored hole function's default instance is keyed; hole-mono 112 → 46 (#6857).
+- [2026-11-08-instance-cast-payload-records](2026-11-08-instance-cast-payload-records.md): Step 5: instance operands, casts, payloads and fn-tag arms carry records (#6856).
+- [2026-11-08-step7-classifier-r19](2026-11-08-step7-classifier-r19.md): Step 7 classifier round 19, 68/0/5 (#6854).
 - [2026-11-08-step7-classifier-r18](2026-11-08-step7-classifier-r18.md): Step 7 classifier round 18, 55/0/19 (#6851).
 - [2026-11-08-step7-cloret-type-token](2026-11-08-step7-cloret-type-token.md): Step 7: every cloRet* key is the result type's token; per-kind path deleted (#6849).
 - [2026-11-08-step7-classifier-r17](2026-11-08-step7-classifier-r17.md): Step 7 classifier round 17: six hubs typed before mono, 54/0/21 (#6848).
