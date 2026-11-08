@@ -700,9 +700,6 @@ import { nameIsWholeSpanShape } from "./emit_field_codes"
 import { fieldStoreTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import {
   cloSigPosOfKey,
-  criSetRetKind,
-  criSettleNonNullRecordRet,
-  fnInferredRetLitAtom,
   retAnnKindChain,
 } from "./emit_fn_ret_kinds"
 import {
@@ -2646,30 +2643,6 @@ function inferNulVariantRow(rt: i32): i32 {
   variantRowOfShapeTy(inferNulInnerTy(rt))
 }
 
-// The nullable-closure niche of function `i` read from its recorded result, where no return the
-// walk reached named it: an `else`-less tail `if`, whose value the walk does not classify, and a
-// clone whose return carries no type of its own (an instance's lambda).
-function criNulCloByRecorded(i: i32) {
-  if fRetKind[i] != "i32" || fRetBool[i] != 0 || i >= fRecRetTy.length {
-    return 0
-  }
-  const r = fRecRetTy[i]
-  if tyIxIsFunc(tyNulInnerTy(r)) || criNulUnionFunc(r) {
-    criSetRetKind(i, "nulclosure")
-  }
-  0
-}
-
-// Whether `ty` is a two-member union of a function type and `null`.
-function criNulUnionFunc(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  const u = tyAt(ty)
-  if !(u is TyUnion) || u.uMembers.length != 2 { return false }
-  const a = u.uMembers[0]
-  const b = u.uMembers[1]
-  (tyIxIsFunc(a) && b == TY_NULL) || (tyIxIsFunc(b) && a == TY_NULL)
-}
-
 // Interns the ref-list row of function `i`'s inferred ref-list result from its checked element
 // type when its element name keys no slot and the type is closed, before any type index is
 // allocated, so `fnRetRefListSlot` finds it at every reader.
@@ -2835,10 +2808,6 @@ function criRecordedRefListDemand(i: i32) {
   0
 }
 
-// Per `fnStmts` position: whether this run wrote the function's columns from its recorded
-// result (`criColsFromRecorded`); a function it did not keeps the columns `buildFnMap` seeded.
-let criFromRec: boolean[] = []
-
 // Write un-annotated valued function `i`'s return columns from its recorded result where that
 // names all five (`fnRecordedRetCols`). True when written.
 function criColsFromRecorded(i: i32): boolean {
@@ -2858,71 +2827,21 @@ function criColsFromRecorded(i: i32): boolean {
 }
 
 // The un-annotated return columns, after monomorphize (`computeRetInference#2`): from the
-// recorded result where it names them, then the checks and rows that read the settled columns.
+// recorded result where it names them, then the record-row check and the ref-list row join.
 export function computeRetInference() {
-  criFromRec = []
-  let ri = 0
-  while ri < fnStmts.length {
-    criRecordedRefListDemand(ri)
-    criFromRec.push(fnRetRowLowersAsAnn(ri) || criColsFromRecorded(ri))
-    ri = ri + 1
-  }
   let i = 0
   while i < fnStmts.length {
+    criRecordedRefListDemand(i)
+    if !fnRetRowLowersAsAnn(i) { criColsFromRecorded(i) }
     const fn = nodeAt(fnStmts[i])
-    if fn is FuncDecl {
-      if fn.fnRet < 0 && fRetVoid[i] == 0 && !criFromRec[i] {
-        criNulCloByRecorded(i)
+    if fn is FuncDecl && fn.fnRet < 0 && fRetVoid[i] == 0 {
+      if criRecordRowCheck(i) < 0 { return -1 }
+      if fRetKind[i] == "reflist" {
+        fnRetRefListDemand(i)
+        fRetRListRow[i] = fnRetRefListRowJoin(i)
       }
     }
     i = i + 1
-  }
-  // After every function's columns are written, so a caller relaying this function's result
-  // still classified it at the slot's nullable rep, which the settled non-null result subtypes.
-  let nn = 0
-  while nn < fnStmts.length {
-    const nnFn = nodeAt(fnStmts[nn])
-    if nnFn is FuncDecl {
-      if nnFn.fnRet < 0 && fRetVoid[nn] == 0 {
-        if criRecordRowCheck(nn) < 0 { return -1 }
-      }
-      if nnFn.fnRet < 0 && fRetVoid[nn] == 0 && !criFromRec[nn] {
-        criSettleNonNullRecordRet(nn)
-      }
-      if nnFn.fnRet < 0 && fRetVoid[nn] == 0 {
-        if fRetKind[nn] == "reflist" {
-          fnRetRefListDemand(nn)
-          fRetRListRow[nn] = fnRetRefListRowJoin(nn)
-        }
-      }
-    }
-    nn = nn + 1
-  }
-  // The literal-union atom return, recorded once the kinds have settled. It needs no narrowing
-  // replay, and it is a flag rather than an `fRetKind` because both reps are i32 (`fRetLitAtom`).
-  let la = 0
-  while la < fnStmts.length {
-    const laFn = nodeAt(fnStmts[la])
-    if laFn is FuncDecl {
-      // Gated on the settled kind being `i32`, which is what an atom return leaves it at. A
-      // function whose returns join an atom with a string settles at `"str"` and widens the atom
-      // at its own return, while `fnRetExprOf` picks only one return, possibly the atom arm.
-      // The kind is the settled answer for all returns; the expression test separates the atom.
-      if (
-        laFn.fnRet < 0
-        && fRetVoid[la] == 0
-        && fRetKind[la] == "i32"
-        && !criFromRec[la]
-      ) {
-        const laRx = fnRetExprOf(fnStmts[la])
-        if laRx >= 0 {
-          if exprIsLitAtom(laRx, fnStmts[la]) || fnInferredRetLitAtom(la) {
-            if la < fRetLitAtom.length { fRetLitAtom[la] = 1 }
-          }
-        }
-      }
-    }
-    la = la + 1
   }
   0
 }
