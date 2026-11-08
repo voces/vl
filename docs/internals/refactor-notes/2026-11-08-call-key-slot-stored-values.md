@@ -57,4 +57,4 @@ on the 392 programs that carry one (an ungated build of this change, 516 left; t
 - Fixpoint seed: 6,526,937 bytes, against the base's 6,525,260 (+1,677, +0.026%).
 - `scripts/sweep.vl` diff, base fixpoint vs candidate fixpoint: 23,670 same, 0 bytes-only, 0
   output movers, 0 `runs → not-runs`, 0 new traps. The change moves keys only.
-- `scripts/gate.sh`: GATE.
+- `scripts/gate.sh` on the final tree: all 23 rows green (seed size, late demands, dead-export budget and `scaling shape` among them).
