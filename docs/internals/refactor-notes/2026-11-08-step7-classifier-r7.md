@@ -9,16 +9,22 @@ over the 23,615-program census population.
 
 | tree | post-only | pre-only | both | probed |
 | --- | --- | --- | --- | --- |
-| master `eb1683ea` | 18 | 1 | 74 | 93 |
-| this PR | CENSUS_AFTER |
+| master `4d0f7cf4` + r6 (has #6754) | 23 | 1 | 69 | 93 |
+| this PR, merged with master `eb1683ea` | 21 | 1 | 69 | 91 |
+
+#6754 moved five classifiers from both to post-only, so this round starts at 23, not r6's 18.
 
 **`ifExprRefKindOf` is the join's rep.** The classifier answered the join's HEAP kind, never a
 nullable one, because `emitIfExprRef` derives null itself. It is now `repOfNode(if)`, with
 `nulstr` projected to `str` and every other niche projected through `vkNonNullRefTwin`. A scalar,
 atom, box or uncovered rep answers null. Shadowed over the population: 1,308 of 1,311 calls
 agree. The three that disagree are `struct` → `variant`, in `if-arm-nested-join.vl`,
-`if-expression-nullable-ref-arms.vl` and `D4644.vl`, and SWEEP_MOVERS. The 70-line ladder is
-deleted, and with it `ifJoinIsMapUnion`, whose only caller it was. (r6 counted 324
+`if-expression-nullable-ref-arms.vl` and `D4644.vl`. In the first two the sweep caught a loss
+(`runs → emit_reject`, `ref valtype with no interned shape`). A record with the same shape as a
+union member (`P = { a: i32 }` beside `A = { a: i32 }` in `U = A | B`) reps as that member's
+variant, but it is built as its own record. So a `variant` rep answers `variant` only when
+`ifExprRefSlot`'s variant row resolves, and `struct` otherwise. All three then print as on
+master. The 70-line ladder is deleted, and with it `ifJoinIsMapUnion`, whose only caller it was. (r6 counted 324
 disagreements at a different shadow point. Here the scalar and tagged short-circuits in
 `ifExprRefKind` run first, so they never reach the reader.)
 
@@ -43,4 +49,8 @@ is not changed. The other 250 calls disagree only in the slot: `repOfTy` carries
 **`arrLitRefListRow` is not dead.** Its asker `anonFieldElemName` still makes 99 pre-mono asks
 on a tree that already has #6754.
 
-**Proof.** PROOF
+**Proof.** Both seeds are fixpoints. On master `eb1683ea`, base is 6,503,061 bytes and the
+candidate 6,502,128 (−933). The sweep compared them over 23,618 programs: 23,618 same, 0
+bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new traps. `scripts/gate.sh` passed every
+row but `lint-self + fmt`, which read one `vl fmt` drift in `wasmEmit.vl`'s import order. The
+formatted tree builds a byte-identical seed, and `lint-self.sh` then read clean.
