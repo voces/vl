@@ -8,6 +8,10 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-numeric-step5-last-records](2026-11-08-numeric-step5-last-records.md): Step 5's last 117 records; step 5 done apart from step 2's classes (#6872).
+- [2026-11-08-listed-generic-fn-set](2026-11-08-listed-generic-fn-set.md): Step 2: a generic function held in a list is a tagged singleton set (#6871).
+- [2026-11-08-step3-genfnhole-live](2026-11-08-step3-genfnhole-live.md): Step 3: the genFnHole* family is live and waits on the per-call Fn#d binding (#6870).
+- [2026-11-08-numeric-no-record-classes](2026-11-08-numeric-no-record-classes.md): Step 5: the 253 unnamed deliveries classed by ablation (#6869).
 - [2026-11-08-step3-what-stands](2026-11-08-step3-what-stands.md): Step 3: what stands; noSplit deleted, the genFnHole* family is still on master (#6867).
 - [2026-11-08-prebind-generic-fn-instance](2026-11-08-prebind-generic-fn-instance.md): Step 2: monoPreBindArg pins at the call instance's parameter type (#6866).
 - [2026-11-08-payload-compound-residue-records](2026-11-08-payload-compound-residue-records.md): Step 5: payload, ??, break, ?. and compound-assignment records (#6865).
