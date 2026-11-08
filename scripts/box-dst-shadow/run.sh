@@ -38,7 +38,7 @@ ls "$T"/c.* | xargs -P "$JOBS" -I{} sh -c 'VL_LATE_DEMANDS=1 VL_STD="$R/std" tim
   | grep "demand bds" > {}.out || true'
 cat "$T"/c.*.out | sed 's/^\[late\] //; s/: demand bds /\t/' > "$OUT"
 echo "$(wc -l < "$OUT") deliveries in $OUT"
-awk -F'\t' '$2 !~ /^nested/ && $2 !~ /^(agree|value already|value never|table|floor:|atom |arm )/ {
+awk -F'\t' '$2 !~ /^nested/ && $2 !~ /^(agree|value already|value never|table|floor:|atom |arm |num )/ {
   n = split($2, a, " [|] "); p = a[n]; sub(/^pos /, "", p)
   k = a[1] " | " p " | " a[3] " | " a[4]; c[k]++; if (!(k in w)) w[k] = $1 }
   END { for (k in c) print c[k] "\t" k "\t" w[k] }' "$OUT" | sort -t$'\t' -k2
@@ -48,13 +48,19 @@ awk -F'\t' -v D="$READ" '$2 ~ /^(atom|arm) / {
   n = split($2, a, " [|] "); p = a[n]; sub(/^pos /, "", p)
   k = a[1] " | " p; if (D != "") k = k " | " a[2] " | " a[3]; c[k]++; if (!(k in w)) w[k] = $1 }
   END { for (k in c) print "read\t" c[k] "\t" k "\t" w[k] }' "$OUT" | sort -t$'\t' -k3
+# The numeric widenings: each `emitExprAs*` lowering against the checker's numeric pair, by class
+# and position (`--read` adds both pairs), with a witness.
+awk -F'\t' -v D="$READ" '$2 ~ /^num / {
+  n = split($2, a, " [|] "); p = a[n]; sub(/^pos /, "", p); sub(/:[0-9]+$/, "", p)
+  k = a[1] " | " p; if (D != "") k = k " | " a[2] " | " a[3]; c[k]++; if (!(k in w)) w[k] = $1 }
+  END { for (k in c) print "num\t" c[k] "\t" k "\t" w[k] }' "$OUT" | sort -t$'\t' -k3
 # A position the table serves (`emitUnionBoxOwed`, `armClose`) is graded by the sweep, not here: its
 # rows are `table` or a named floor, and a floor that floors.tsv does not list for its position fails.
 awk -F'\t' -v L="$R/scripts/box-dst-shadow/floors.tsv" '
   BEGIN { while ((getline l < L) > 0) if (l !~ /^#/ && l != "") ok[l] = 1 }
-  $2 ~ /^(arm |atom )?(table|floor:)/ {
+  $2 ~ /^(arm |atom |num )?(table|floor:)/ {
     n = split($2, a, " [|] "); p = a[n]; sub(/^pos (floor@)?/, "", p); sub(/:[0-9]+$/, "", p)
-    if (a[1] ~ /table/) { t[p (a[1] ~ /^(arm|atom)/ ? " (" substr(a[1], 1, index(a[1], " ") - 1) ")" : "")]++; next }
+    if (a[1] ~ /table/) { t[p (a[1] ~ /^(arm|atom|num)/ ? " (" substr(a[1], 1, index(a[1], " ") - 1) ")" : "")]++; next }
     k = p "\t" a[1]; f[k]++; if (!(k in w)) w[k] = $1 }
   END {
     for (p in t) print "table\t" t[p] "\t" p
