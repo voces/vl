@@ -652,8 +652,9 @@ import {
   mapValsBase,
   markFnAddrTaken,
   mfScratchBase,
-  mkArrIdx,
-  mkListIdx,
+  mkArrTy,
+  isMkListTy,
+  mkListTy,
   monoCloCoerceFe,
   monoGradualAsScalar,
   monoInertCalled,
@@ -695,7 +696,6 @@ import {
   sSuperAt,
   sTwin,
   sTypeIdx,
-  slUsed,
   startStmts,
   strCatSlotIx,
   strPushScratchBase,
@@ -1734,7 +1734,7 @@ export function capCacheBuild() {
 // i32 wrapper, and anything else to its interned ref-list wrapper (`rlWrapIdx`).
 export function mvValsWrapOf(slot: i32) {
   if slot < 0 { return lTy() }
-  if mvValKind[slot] == MVK_STR { return mkListIdx }
+  if mvValKind[slot] == MVK_STR { return mkListTy() }
   if mvValKind[slot] == MVK_F64 { return fl64Ty() }
   if mvValKind[slot] == MVK_F32 { return fl32Ty() }
   if mvValKind[slot] == MVK_I64 { return il64Ty() }
@@ -1774,7 +1774,7 @@ function scalarListWrap(elemKind: VKind) {
   if elemKind == "i64" { return il64Ty() }
   if elemKind == "f32" { return fl32Ty() }
   // The string list's wrapper is the map's keys-list type, which any `string[]` shares.
-  if elemKind == "str" { return mkListIdx }
+  if elemKind == "str" { return mkListTy() }
   if elemKind == "i32" { return lTy() }
   scalarListKindUnlisted(lTy())
 }
@@ -1785,7 +1785,7 @@ function scalarListBack(elemKind: VKind) {
   if elemKind == "f64" { return fa64Ty() }
   if elemKind == "i64" { return ia64Ty() }
   if elemKind == "f32" { return fa32Ty() }
-  if elemKind == "str" { return mkArrIdx }
+  if elemKind == "str" { return mkArrTy() }
   if elemKind == "i32" { return aTypeIdx }
   scalarListKindUnlisted(aTypeIdx)
 }
@@ -1828,9 +1828,9 @@ function scalarListUsed(elemKind: VKind) {
     "f32" => {
       return true
     }
-    // The string-ref list is minted for any `string[]` field and for the map's keys list.
+    // The string and i32 lists mint on first read too.
     "str" => {
-      return slUsed || mUsed
+      return true
     }
     "i32" => {
       return true
@@ -4799,7 +4799,7 @@ function listFitCaptureStandIn(
   if ck == null { return -1 }
   if ck == "reflist" { return if kind == "ref" { -1 } else { heaps[2] } }
   if ck == "strlist" {
-    return if heaps[2] == mkListIdx { -1 } else { heaps[2] }
+    return if isMkListTy(heaps[2]) { -1 } else { heaps[2] }
   }
   const se = scalarListElemOfListKind(ck)
   if se == null || scalarListWrap(se) == heaps[2] { return -1 }
@@ -5107,7 +5107,7 @@ function emitListLenOnStack(kind: MfKind, slot: i32) {
     return 0
   }
   if kind == "str" {
-    fbStructGet(mkListIdx, 1)
+    fbStructGet(mkListTy(), 1)
     return 0
   }
   if kind == "i32" {
@@ -7039,7 +7039,7 @@ function emitOptChainValue(body: u8[], exprIx: i32, fnIx: i32) {
 function optChainLeafRefHeap(code: i32, si: i32, fi: i32): i32 {
   // The nullable atom list (18) shares the i32 list's wrapper, as its field storage does.
   if code == FC_I32_LIST || code == FC_NUL_I32_LIST { return lTy() }
-  if code == FC_STR_LIST { return mkListIdx }
+  if code == FC_STR_LIST { return mkListTy() }
   if code == FC_F64_LIST { return fl64Ty() }
   if code == FC_I64_LIST { return il64Ty() }
   if code == FC_F32_LIST { return fl32Ty() }
@@ -7403,7 +7403,7 @@ function listWrapHeapOfKind(k: i32) {
     return lTy()
   }
   if k == 8 { return fl64Ty() }
-  if k == 9 { return mkListIdx }
+  if k == 9 { return mkListTy() }
   if k == 10 { return il64Ty() }
   if k == 12 { return fl32Ty() }
   // The packed byte list rides the box's anyref as its own `{backing, len, cap}` wrapper like
@@ -12339,7 +12339,7 @@ function spreadWrapIdx(k: MfKind, row: i32) {
       return -1
     }
     "str" => {
-      return mkListIdx
+      return mkListTy()
     }
     "ref" => {
       if row < 0 || row >= rlWrapIdx.length { return -1 }
@@ -12370,7 +12370,7 @@ function spreadBackIdx(k: MfKind, row: i32) {
       return -1
     }
     "str" => {
-      return mkArrIdx
+      return mkArrTy()
     }
     "ref" => {
       if row < 0 || row >= rlBackIdx.length { return -1 }
@@ -13080,17 +13080,12 @@ function emitArrI64(body: u8[], elems: i32[], fnIx: i32) {
 // The string-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on
 // failure.
 function emitArrStr(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
-  if !slUsed {
-    return emitFail(
-      "emitProgram: string array literal but string list type not collected",
-    )
-  }
-  const hStr = forLitHoist(arrIx, elems, fnIx, ALD_STR, mkArrIdx, mkListIdx)
+  const hStr = forLitHoist(arrIx, elems, fnIx, ALD_STR, mkArrTy(), mkListTy())
   if hStr != 0 { return if hStr < 0 { -1 } else { 0 } }
   let dstStr = -1
   let coffStr = 0
   if elems.length > allocLitChunk() {
-    dstStr = arrLitChunkStart("str", 0, mkArrIdx, elems.length, false)
+    dstStr = arrLitChunkStart("str", 0, mkArrTy(), elems.length, false)
   }
   let i = 0
   while i < elems.length {
@@ -13119,11 +13114,11 @@ function emitArrStr(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
     fbLocalGet(dstStr)
     fbRefAsNonNull() // the chunk-built string-ref backing
   } else {
-    fbBacking(mkArrIdx, elems.length) // 0xfb 0x08; builds the string-ref backing
+    fbBacking(mkArrTy(), elems.length) // 0xfb 0x08; builds the string-ref backing
   }
   fbI32Const(elems.length) // 0x41 i32.const (len)
   fbI32Const(elems.length) // 0x41 i32.const (cap)
-  fbStructNew(mkListIdx)   // 0xfb 0x00 <string-list wrapper struct type index>
+  fbStructNew(mkListTy())   // 0xfb 0x00 <string-list wrapper struct type index>
   return 0
 }
 
@@ -13627,13 +13622,13 @@ function cmKeysWrap() {
   const k = cmKeyKind()
   if k == MAP_KEY_I32 { return lTy() }
   if k == MAP_KEY_I64 { return il64Ty() }
-  mkListIdx
+  mkListTy()
 }
 function cmKeysBack() {
   const k = cmKeyKind()
   if k == MAP_KEY_I32 { return aTypeIdx }
   if k == MAP_KEY_I64 { return ia64Ty() }
-  mkArrIdx
+  mkArrTy()
 }
 // The current op's target-key scratch local: the string frame's slot 1, a `(ref $sTypeIdx)`
 // string, or an integer frame's slot 0, the raw key.
@@ -14844,14 +14839,11 @@ function emitMapKeys(body: u8[], recvIx: i32, fnIx: i32) {
   // `cmKeyKind` asks. A `{[i32]: string}`'s `.keys()` is an `i32[]` even though its shape
   // is an mv slot, so this cannot key off the sentinel alone.
   const keyK = mapShapeKeyKind(shape)
-  if keyK == MAP_KEY_STR && !slUsed {
-    return emitFail("emitProgram: .keys() but string list type not collected")
-  }
   const mapTy = mapTypeIdxOf(shape)
   // The KEY rep's list wrapper / backing, and — since the builder's frame slots are
   // typed per rep — an integer frame's own out/src slots for an integer-keyed map.
-  let keysWrap = mkListIdx
-  let keysBack = mkArrIdx
+  let keysWrap = mkListTy()
+  let keysBack = mkArrTy()
   let outBackL = mapKeysBase + 0
   let keysBackL = mapKeysBase + 1
   if keyK == MAP_KEY_I32 {
@@ -16148,7 +16140,7 @@ function listBackOfWrap(w: i32): i32 {
   if isFl64Ty(w) { return fa64TypeIdx }
   if isIl64Ty(w) { return ia64TypeIdx }
   if isFl32Ty(w) { return fa32TypeIdx }
-  if slUsed && w == mkListIdx { return mkArrIdx }
+  if isMkListTy(w) { return mkArrTy() }
   if aUsed && isLTy(w) { return aTypeIdx }
   -1
 }
@@ -16943,7 +16935,6 @@ function hoistRowOfRecv(recvIx: i32, d: i32, prop: string, fnIx: i32) {
     return listHoistRow(d, prop, "ref", refListSlotOfExpr(recvIx, fnIx))
   }
   if exprNulStrArray(recvIx, fnIx) || exprStringArray(recvIx, fnIx) {
-    if !slUsed { return 0 - 1 }
     return listHoistRow(d, prop, "str", 0)
   }
   const ek = scalarListElemKind(recvIx, fnIx)
@@ -16969,7 +16960,7 @@ function hoistRowOfRecv(recvIx: i32, d: i32, prop: string, fnIx: i32) {
 function hoistWrapTyOfRow(row: i32) {
   const k = lhKind[row]
   if k == "ref" { return rlWrapIdx[lhSlot[row]] }
-  if k == "str" { return mkListIdx }
+  if k == "str" { return mkListTy() }
   if k == "f64" { return scalarListWrap("f64") }
   if k == "i64" { return scalarListWrap("i64") }
   if k == "f32" { return scalarListWrap("f32") }
@@ -17253,8 +17244,8 @@ function emitIndexNulScalarList(
   fbRefAsNonNull() // (the `!= null` guard makes this safe)
   if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
   if nsk == "nulstrlist" {
-    emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
-    fbArrayGet(mkArrIdx) // 0xfb 0x0b string backing
+    emitListIdxGuard(listIdxWrapSlot("str", 0), mkListTy())
+    fbArrayGet(mkArrTy()) // 0xfb 0x0b string backing
     // A nullable-element inner list (`(string | null)[] | null`, narrowed): the
     // element legitimately holds null, so the read stays `(ref null $aTypeIdx)` — an
     // unconditional non-null recover here is correct only for `string[] | null` (whose
@@ -17343,11 +17334,6 @@ function emitIndexRefList(body: u8[], nd: Index, idxIx: i32, fnIx: i32): i32 {
 // index, the `i u< len` guard and the `array.get` of the string backing, leaving the element
 // `(ref null $sTypeIdx)` for the caller to recover or keep. Returns 0, or -1 on a refusal.
 function emitIndexStrListRead(body: u8[], nd: Index, fnIx: i32): i32 {
-  if !slUsed {
-    return emitFail(
-      "emitProgram: string index access but string list type not collected",
-    )
-  }
   const slHz = liveHoistRow(nd.idxArr, "str", 0)
   if slHz < 0 {
     if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
@@ -17356,9 +17342,9 @@ function emitIndexStrListRead(body: u8[], nd: Index, fnIx: i32): i32 {
   if slHz >= 0 {
     emitListIdxGuardHoisted(slHz, nd.idxIndex)
   } else {
-    emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
+    emitListIdxGuard(listIdxWrapSlot("str", 0), mkListTy())
   }
-  fbArrayGet(mkArrIdx) // 0xfb 0x0b <string backing array type index>
+  fbArrayGet(mkArrTy()) // 0xfb 0x0b <string backing array type index>
   0
 }
 
@@ -17430,7 +17416,7 @@ function emitArrLen(body: u8[], memIx: i32, fnIx: i32) {
     // A STRING list's `.length` is its wrapper's `len` field (`struct.get $mkListIdx 1`).
     if exprStringArray(m.memObj, fnIx) {
       if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(mkListIdx, 1) // 0xfb 0x02 <string-list wrapper> field 1: len
+      fbStructGet(mkListTy(), 1) // 0xfb 0x02 <string-list wrapper> field 1: len
       return 0
     }
     // A SCALAR list's `.length` is its wrapper's `len` field (`struct.get <wrap> 1`) — an
@@ -18750,14 +18736,14 @@ function emitListEqICore(_body: u8[]) {
 // Pushes whether element `i` of the staged list A, then of B, in the LEQS frame at `bA`, is null.
 function leqSElemNullTest(bA: i32) {
   fbLocalGet(bA + 0)
-  fbStructGet(mkListIdx, 0)
+  fbStructGet(mkListTy(), 0)
   fbLocalGet(bA + 3)
-  fbArrayGet(mkArrIdx)
+  fbArrayGet(mkArrTy())
   fbRefIsNull()
   fbLocalGet(bA + 1)
-  fbStructGet(mkListIdx, 0)
+  fbStructGet(mkListTy(), 0)
   fbLocalGet(bA + 3)
-  fbArrayGet(mkArrIdx)
+  fbArrayGet(mkArrTy())
   fbRefIsNull()
   0
 }
@@ -18771,11 +18757,11 @@ function emitListEqSCore(body: u8[]) {
   fbLocalSet(bA + 0)        // A
   fbBlock(127)              // block i32
   fbLocalGet(bA + 0)
-  fbStructGet(mkListIdx, 1) // lenA
+  fbStructGet(mkListTy(), 1) // lenA
   fbLocalSet(bA + 2)        // n
   fbLocalGet(bA + 2)
   fbLocalGet(bA + 1)
-  fbStructGet(mkListIdx, 1)
+  fbStructGet(mkListTy(), 1)
   fbI32Bin(71)              // i32.ne
   fbIf(64)
   fbI32Const(0)
@@ -18797,14 +18783,14 @@ function emitListEqSCore(body: u8[]) {
   fbElse()
   // push elem A, elem B (non-null string refs), compare via the string core
   fbLocalGet(bA + 0)
-  fbStructGet(mkListIdx, 0)
+  fbStructGet(mkListTy(), 0)
   fbLocalGet(bA + 3)
-  fbArrayGet(mkArrIdx)
+  fbArrayGet(mkArrTy())
   fbRefAsNonNull()
   fbLocalGet(bA + 1)
-  fbStructGet(mkListIdx, 0)
+  fbStructGet(mkListTy(), 0)
   fbLocalGet(bA + 3)
-  fbArrayGet(mkArrIdx)
+  fbArrayGet(mkArrTy())
   fbRefAsNonNull()
   if emitStrEqCore(body) < 0 { return -1 }
   fbEnd()
@@ -27186,13 +27172,8 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
     // a string list `xs[i] = s`: unwrap to its `(ref null $sTypeIdx)` backing and
     // store the string ref, mirroring `emitIndex`'s string path — else it falls into
     // the i32-list case and `struct.get`s the wrong wrapper type.
-    if !slUsed {
-      return emitFail(
-        "emitProgram: string indexed assignment but string list type not collected",
-      )
-    }
-    st.lTy = mkListIdx
-    st.aTy = mkArrIdx
+    st.lTy = mkListTy()
+    st.aTy = mkArrTy()
     st.mfKind = "str"
   } else if st.isF64 {
     st.lTy = fl64Ty()
@@ -27993,12 +27974,8 @@ function pushSlotOf(
     ps.destKind = pushDestVKind(rslot)
     if rlElemNullable[rslot] == 1 { pv.pushNestSlot = rslot }
   } else if pv.isStr {
-    if !slUsed {
-      emitFail("emitProgram: string .push but string list type not collected")
-      return null
-    }
-    ps.lTy = mkListIdx
-    ps.aTy = mkArrIdx
+    ps.lTy = mkListTy()
+    ps.aTy = mkArrTy()
     ps.base = strPushScratchBase
     // A `(string | null)[]` keeps its nullable slot and stays `null` here.
     if !pv.isNsArr { ps.destKind = "str" }
@@ -28492,15 +28469,8 @@ function emitPopGo(
         aTy = scalarListBack(popEk)
         base = scalarPushScratchBaseOf(popEk)
       } else if isStr {
-        if !slUsed {
-          return emitFail(
-            "emitProgram: string "
-              + opNm
-              + " but string list type not collected",
-          )
-        }
-        lTy = mkListIdx
-        aTy = mkArrIdx
+        lTy = mkListTy()
+        aTy = mkArrTy()
         base = strPushScratchBase
         elemIsRef = true
       }
@@ -28727,12 +28697,7 @@ function emitClear(body: u8[], callIx: i32, fnIx: i32) {
         lTy = scalarListWrap(clearEk)
         base = scalarPushScratchBaseOf(clearEk)
       } else if isStr {
-        if !slUsed {
-          return emitFail(
-            "emitProgram: string .clear but string list type not collected",
-          )
-        }
-        lTy = mkListIdx
+        lTy = mkListTy()
         base = strPushScratchBase
       }
       const lIdx = listOpRecvLocal(
@@ -28894,13 +28859,8 @@ function mfSrcTysOf(recvK: MfKind, recvIx: i32, fnIx: i32, src: MfSrcTys) {
     // refs). The element is itself a ref (an `array i32` of code points), so it needs
     // `ref.as_non_null` after `array.get`, exactly like a ref-list element — unless the
     // element is the `(string | null)[]` niche, which keeps the nullable read.
-    if !slUsed {
-      return emitFail(
-        "emitProgram: .map/.filter over string[] but string list type not collected",
-      )
-    }
-    src.srcWrap = mkListIdx
-    src.srcBack = mkArrIdx
+    src.srcWrap = mkListTy()
+    src.srcBack = mkArrTy()
     src.srcElemRef = !srcElemNul
   } else if recvK == "u8" {
     // the packed byte source, from `mfRecvKindOf`'s `"u8"` rung (D1141). No
@@ -29171,13 +29131,8 @@ function mfDstTysOf(resK: MfKind, dstSlot: i32, callIx: i32, dst: MfDstTys) {
     // A STRING-list result: a `.filter` over a string list, or a `.map` whose callback
     // returns a string. The backing `$mkArrIdx` holds string refs; `array.set` stores
     // the callback's (non-null) string result directly.
-    if !slUsed {
-      return emitFail(
-        "emitProgram: .map/.filter result is string[] but string list type not collected",
-      )
-    }
-    dst.dstWrap = mkListIdx
-    dst.dstBack = mkArrIdx
+    dst.dstWrap = mkListTy()
+    dst.dstBack = mkArrTy()
   } else if resK == "ref" {
     // A REF-list result (a `.filter` over a struct/union array preserves the element type):
     // the result is the SAME ref list as the source, so its wrapper/backing come from the
@@ -30285,13 +30240,8 @@ function emitArrSlice(body: u8[], callIx: i32, fnIx: i32) {
         wrap = rlWrapIdx[srcSlot]
         back = rlBackIdx[srcSlot]
       } else if recvK == "str" {
-        if !slUsed {
-          return emitFail(
-            "emitProgram: .slice over string[] but string list type not collected",
-          )
-        }
-        wrap = mkListIdx
-        back = mkArrIdx
+        wrap = mkListTy()
+        back = mkArrTy()
       } else if recvK == "u8" {
         // the packed byte list (D1141): a `(array (mut i8))` backing under the `$bl8`
         // wrapper, the arm this ladder needs since `mfRecvKindOf` would otherwise answer
@@ -34116,8 +34066,8 @@ function forInBackingOf(
     // element slot is nullable either way) and differ ONLY in the loop var: `str` recovers
     // each element non-null below, `nulstr` keeps the raw `(ref null $aTypeIdx)` so a null
     // element is a value the body can test rather than a trap.
-    fb.wrapTy = mkListIdx
-    fb.backTy = mkArrIdx
+    fb.wrapTy = mkListTy()
+    fb.backTy = mkArrTy()
     fb.hKind = "str"
   } else if (
     ek == "struct"
@@ -38780,13 +38730,8 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
         "strlist" => {
           // STRING fill → the string list (`array.new` of the shared string-ref
           // backing; a non-null string ref stores into the nullable slot directly).
-          if !slUsed {
-            return emitFail(
-              "emitProgram: __array_new__ string fill but string list types not collected",
-            )
-          }
-          anBack = mkArrIdx
-          anWrap = mkListIdx
+          anBack = mkArrTy()
+          anWrap = mkListTy()
         }
         "reflist" => {
           // STRUCT fill → the ref list of the element struct (its interned slot).
