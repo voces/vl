@@ -12,7 +12,7 @@ shape type-checks or refuses as the annotated twin does, and is never a compiler
   an index read that is no store target and no method or field-store receiver, or a `for … in`
   iterable. Any write, re-point, argument, return, alias or other use is false.
 * `letDeclInferredBound` gives such a binding's open element or map value the default at the
-  DECLARATION (`defaultReadOnlyContainer`, `check_narrow_flow.vl`), with the round-1 warning.
+  DECLARATION (`defaultReadOnlyContainer`, `check_narrow_flow.vl`).
   Every later read is then checked at `i32`, so no read sees the `-1` hole.
 * An open map or set key stays open until its first key read (`pinReadKey` at `m[k]`,
   `get`/`has`/`delete`), which fixes it to the read key's widened type, as round 1's flush did. A
