@@ -8,6 +8,11 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-07-slot-field-read-identity-type](2026-11-07-slot-field-read-identity-type.md): A returned record's function fields take their slot's identity type; guard (a) deleted (#6743).
+- [2026-11-07-step7-assign-target-and-unbound-result](2026-11-07-step7-assign-target-and-unbound-result.md): Step 7: the assignment-target and rep-uncovered declines retired, 79 → 66 (#6742).
+- [2026-11-07-step7-premono-askers](2026-11-07-step7-premono-askers.md): Step 7: the pre-monomorphize askers, and the first `computeRetInference` run deleted (#6741).
+- [2026-11-07-pin-spelling-no-parse](2026-11-07-pin-spelling-no-parse.md): No pin spelling is parsed back into a type in `monoInstanceFor`; `nameToTy` fallback deleted (#6740).
+- [2026-11-07-step7-letinitcellkind-deleted](2026-11-07-step7-letinitcellkind-deleted.md): Step 7: `letInitCellKind` deleted onto `letBindRepKind` (#6738).
 - [2026-11-07-lowercoerce-scope](2026-11-07-lowercoerce-scope.md): What one `lowerCoerce` table would collapse; union boxing first, then a numeric recorder (#6737).
 - [2026-11-07-identity-consumers-2-3](2026-11-07-identity-consumers-2-3.md): Identity typing consumers 2 and 3: the S1 map and the keyed bindings (#6736).
 - [2026-11-07-slot-set-literal-join](2026-11-07-slot-set-literal-join.md): A list literal's record elements join their function sets; 10 loud rejects run (#6735).
