@@ -27,12 +27,16 @@ recorded result is `string` or a string literal and that row is a literal union,
 the result. `srrNamesShape` keeps `synthRecordedRetAnnots` from pinning it, so the columns come
 from the recorded read (`i32`, atom).
 
-The 7 bytes-only movers all print the same as before:
+The 7 bytes-only movers print what they printed before. They fall into two groups, and every
+module was diffed:
 
-* 6 literal-union lambdas declare two unused scratch locals (`i32`, `anyref`), because the
-  un-annotated return path reserves them.
-* In `closure-generic-call-narrowed-literal.vl`, `h() == "a"` calls `__str_eq__` against the
-  interned literal where it was an inline one-byte compare.
+* 3 programs with a literal-union lambda gain two unused scratch locals (`i32`, `anyref`).
+  The un-annotated return path reserves them. The 3 are `fn-value-lambda-adopts-string-litunion`,
+  `inferred-return-joins-one-literal-types` and `call-arg-rep-belongs-to-the-callee`.
+* 4 programs compare a lambda's result with a one-character string literal (`h() == "a"`). They
+  now call `__str_eq__` against the interned literal where they had an inline one-byte compare.
+  The 4 are `closure-generic-call-narrowed-literal`, `two-litunion-join-unannotated-tail`,
+  D2219 and D3160.
 
 ## D: b000378 `mkcall`
 
@@ -44,9 +48,11 @@ un-annotated `const`, and the probe reads `{r: i32}`. No program moved, because 
 already took the stamp row (`frsValuesStampSlot`). The fix is for the typed `cloRet*` reader
 (`84e735f5`), which reads the type itself. That shadow has not been re-run here.
 
-## Seed
+## Proof on the merged tree (master `266e085f`)
 
-| | bytes |
-| --- | --- |
-| base (#6791 + master `3ede28b4`) | 6,500,289 |
-| E | 6,497,673 (−2,616) |
+| check | master | this branch |
+| --- | --- | --- |
+| fixpoint seed | 6,501,408 | 6,498,828 (−2,580) |
+| L2 self-compile guest fuel | 76,188,663,293 | 76,160,977,045 (−0.04%) |
+| sweep, 23,656 programs | | 23,649 same, 7 bytes-only (the C movers), 0 output movers |
+| `scripts/gate.sh` | | 23 rows pass. `lint-self` failed at first (unused imports, a scan outside a listed pass) and was fixed. It and the ladder sets were re-run alone and pass. |
