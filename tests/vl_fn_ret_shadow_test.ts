@@ -692,6 +692,16 @@ take(mk2(7))
 take(mk2(3))
 `;
 
+// An instance whose values are its own recursive call and a call through its hole parameter
+// records the second's type, so it is annotated before the walk and grades nowhere.
+const COL_SELF = `function inc0(a) { return a + 1 }
+function r(h, n) {
+  if n > 0 { return r(h, n - 1) }
+  return h(3)
+}
+print(r(inc0, 2))
+`;
+
 Deno.test({
   name: "fn-ret shadow: return columns",
   ignore,
@@ -731,6 +741,14 @@ Deno.test({
       "post moved: moved: agree struct | g=1; post moved: moved: agree struct | mk1=1; " +
         "post seed: kind struct vs i32 | g=1; post seed: kind struct vs i32 | mk1=1; " +
         "post settled: agree struct | g=1; post settled: agree struct | mk1=1",
+      "col",
+    );
+    expectRows(
+      "col self call",
+      COL_SELF,
+      DROP_NONE,
+      true,
+      "",
       "col",
     );
     expectRows(
