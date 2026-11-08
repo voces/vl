@@ -1,0 +1,114 @@
+// An intrinsic named as a value, not called (`const f = __load_i32__`, `xs.map(sqrt)`), is
+// rewritten before checking into a lambda that calls it, so the value is an ordinary function
+// value. A float intrinsic takes `f64` and an integer one `i32` there, the types its literals
+// default to. A name a declaration shadows is left alone.
+import {
+  Call,
+  Ident,
+  P,
+  arenaSetNode,
+  i32ToStr,
+  mkBlock,
+  mkCall,
+  mkFunc,
+  mkIdent,
+  mkParam,
+  mkTypeRef,
+  nodeAt,
+} from "./ast"
+import { bindProgram } from "./bind"
+import { floatIntrArity, intIntrArity, nameIsDunder } from "./check_intrinsics"
+import { ambientTyOf } from "./check_scopes"
+import { TyFunc, TyPrim, tyAt, tyToStr } from "./check_types"
+import { IDENT_BUILTIN, identDeclOf } from "./symbols"
+
+// Rewrites every value-position read of an unshadowed intrinsic in the arena under `rootIx`
+// into a call-forwarding lambda; mints nodes, so it runs before the checker sizes its tables.
+export function intrinsicValuesWrap(rootIx: i32) {
+  const end = P.nodes.length
+  const callee: boolean[] = []
+  let any = false
+  let i = 0
+  while i < end {
+    callee.push(false)
+    i = i + 1
+  }
+  i = 0
+  while i < end {
+    const n = nodeAt(i)
+    if n is Call && n.callFn >= 0 && n.callFn < end { callee[n.callFn] = true }
+    if n is Ident && ivIsName(n.identName) { any = true }
+    i = i + 1
+  }
+  if !any { return 0 }
+  bindProgram(rootIx)
+  i = 0
+  while i < end {
+    const n = nodeAt(i)
+    if (
+      n is Ident
+      && !callee[i]
+      && ivIsName(n.identName)
+      && identDeclOf(i) == IDENT_BUILTIN
+    ) {
+      ivWrap(i, n)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether `name` is an intrinsic `ivParamTys` can give a value's parameter types for.
+function ivIsName(name: string): boolean {
+  if floatIntrArity(name) > 0 || intIntrArity(name) > 0 { return true }
+  if !nameIsDunder(name) { return false }
+  const t = ambientTyOf(name)
+  if t < 0 { return false }
+  const f = tyAt(t)
+  if !(f is TyFunc) { return false }
+  for p in f.fnParamTypes {
+    if !(tyAt(p) is TyPrim) { return false }
+  }
+  true
+}
+
+// The parameter type names the value of intrinsic `name` takes, in order.
+function ivParamTys(name: string): string[] {
+  const out: string[] = []
+  const fa = floatIntrArity(name)
+  const ia = intIntrArity(name)
+  if fa > 0 || ia > 0 {
+    const tn = if fa > 0 { "f64" } else { "i32" }
+    let j = 0
+    while j < fa + ia {
+      out.push(tn)
+      j = j + 1
+    }
+    return out
+  }
+  const t = ambientTyOf(name)
+  if t < 0 { return out }
+  const f = tyAt(t)
+  if f is TyFunc {
+    for p in f.fnParamTypes { out.push(tyToStr(p)) }
+  }
+  out
+}
+
+// Node `ix`, the read `n`, becomes `(x0: T0, …) => name(x0, …)`, keeping its index and position.
+function ivWrap(ix: i32, n: Ident) {
+  const params: i32[] = []
+  const args: i32[] = []
+  let j = 0
+  for tn in ivParamTys(n.identName) {
+    const pn = "x" + i32ToStr(j)
+    params.push(mkParam(pn, mkTypeRef(tn, -1), -1, 0, 0, -1))
+    args.push(mkIdent(pn, n.pos))
+    j = j + 1
+  }
+  const call = mkCall(mkIdent(n.identName, n.pos), args, n.pos)
+  const noTyParams: string[] = []
+  const lam = mkFunc("", noTyParams, params, -1, mkBlock([call], n.pos), n.pos)
+  arenaSetNode(ix, { parInner: lam, pos: n.pos })
+  0
+}
