@@ -242,7 +242,12 @@ import {
   sidOf,
   sidOfNode,
 } from "./symbols"
-import { exprIsIfStmt, ifArmValueExpr, nliScanStmts } from "./emit_query"
+import {
+  exprIsIfStmt,
+  ifArmValueExpr,
+  nliScanStmts,
+  tyHasFnDeep,
+} from "./emit_query"
 import {
   FC_CLOSURE,
   FC_I32,
@@ -814,7 +819,6 @@ import {
   rlElemInnerSlot,
   rlElemStructRow,
   rlSlotByName,
-  rlSlotByNameTwin,
   rlSlotOfRowTy,
   sFieldRefSlot,
   shapeFieldElemName,
@@ -2354,32 +2358,36 @@ export function recordedVoidFns() {
 }
 
 // Interns the ref-list row of function `i`'s inferred ref-list result from its checked element
-// type when its element name keys no slot and the type is closed, before any type index is
-// allocated, so `fnRetRefListSlot` finds it at every reader.
-function fnRetRefListDemand(i: i32) {
-  if i < fRetRArrElem.length && rlSlotByNameTwin(fRetRArrElem[i], -1) >= 0 {
-    return 0
-  }
+// type when `rec`, the row its recorded result keys, is -1 and the type is closed, before any
+// type index is allocated, so `fnRetRefListSlot` finds it at every reader.
+function fnRetRefListDemand(i: i32, rec: i32) {
+  if rec >= 0 { return 0 }
   const et = fnRetRArrElemTy(i)
   if et < 0 || tyHasTyVar(et) || rlSlotOfRowTy(et) >= 0 { return 0 }
   rlInternOfTy(et)
   0
 }
 
-// The ref-list row inferred list result `i` is built at: the row its element name keys or its
-// closed element type has, else the row every returned value is built at. -2 when the returned
-// values' rows or the function sets their elements hold disagree, which no one row can build; -1
-// when none is found (D15203).
-function fnRetRefListRowJoin(i: i32): i32 {
-  if i < 0 || i >= fnStmts.length || i >= fRetRArrElem.length { return -1 }
-  const byName = rlSlotByNameTwin(fRetRArrElem[i], -1)
-  if byName >= 0 { return byName }
+// The ref-list row inferred list result `i` is built at: `rec` (its recorded result's row), else
+// its closed element type's, else the row every returned value is built at. -2 when the values'
+// rows or the function sets their elements hold disagree, which no one row can build; -1 when
+// none is found (D15203).
+function fnRetRefListRowJoin(i: i32, rec: i32): i32 {
+  if i < 0 || i >= fnStmts.length { return -1 }
+  const fn = nodeAt(fnStmts[i])
+  const vals: i32[] = []
+  if fn is FuncDecl { collectRetValues(fn.fnBody, vals) }
+  // A recorded row holds one function set per function position, so a literal whose own
+  // elements hold different sets there cannot be built at it.
+  if rec >= 0 {
+    if tyHasFnDeep(fnRecordedRetTy(i), 0) && retListLitSetsSplit(vals) {
+      return -2
+    }
+    return rec
+  }
   const et = fnRetRArrElemTy(i)
   if et >= 0 && !tyHasTyVar(et) { return rlSlotOfRowTy(et) }
-  const fn = nodeAt(fnStmts[i])
   if !(fn is FuncDecl) { return -1 }
-  const vals: i32[] = []
-  collectRetValues(fn.fnBody, vals)
   let row = -1
   let sig = ""
   for v in vals {
@@ -2396,6 +2404,14 @@ function fnRetRefListRowJoin(i: i32): i32 {
     row = r
   }
   if row >= 0 { row } else { -1 }
+}
+
+// Whether a returned list literal in `vals` holds elements whose function sets differ.
+function retListLitSetsSplit(vals: i32[]): boolean {
+  for v in vals {
+    if retListValueSig(v) == "!" { return true }
+  }
+  false
 }
 
 // The ref-list row returned value `v` of function `i` is built at: its stamp's row, else a list
@@ -2550,13 +2566,14 @@ export function fnRetColsFromRecorded() {
   let i = 0
   while i < fnStmts.length {
     criRecordedRefListDemand(i)
-    criColsFromRecorded(i)
+    // The ref-list row the recorded result's columns name, or -1 when they name none.
+    const rec = if criColsFromRecorded(i) && frcKind == "reflist" { frcRow } else { -1 }
     const fn = nodeAt(fnStmts[i])
     if fn is FuncDecl && fn.fnRet < 0 && fRetVoid[i] == 0 {
       if criRecordRowCheck(i) < 0 { return -1 }
       if fRetKind[i] == "reflist" {
-        fnRetRefListDemand(i)
-        fRetRListRow[i] = fnRetRefListRowJoin(i)
+        fnRetRefListDemand(i, rec)
+        fRetRListRow[i] = fnRetRefListRowJoin(i, rec)
       }
     }
     i = i + 1
