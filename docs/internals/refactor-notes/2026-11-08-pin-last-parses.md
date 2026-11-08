@@ -15,7 +15,7 @@ spelling is derived from a type and is never parsed back into one.
 | `monoCallIfBound`, the choice binding's call-site twin | `ct` | `dFt[0]`, the slot type `monoSlotPinNameTys` hands back |
 | the maker delivered at a closed function type (`monoCoerceFnValueTys`) | `tname` | `tnameTy` |
 
-`monoCoerceChoiceBinding` was reached from `monoPinTyParamComposite` with no type. That caller
+`monoInstanceRetTy` is cleared with `monoInstanceRetName` in the per-program reset. `monoCoerceChoiceBinding` was reached from `monoPinTyParamComposite` with no type. That caller
 now hands the parameter type substituted through the bindings (`substTyDeepOf`) whenever `pinC`
 is still the plain substituted spelling. When a rest-union or row pin replaced the spelling, it
 hands -1.
@@ -37,7 +37,7 @@ Both seeds were built to a fixpoint (a second `refresh-compiler.sh` was byte-ide
 | | |
 |---|---|
 | sweep | 23,613 of 23,613 same (0 bytes-only, 0 output movers, 0 `runs → not-runs`) |
-| seed | 6,485,865 → 6,486,042 bytes (+177) |
+| seed | 6,485,865 → 6,486,052 bytes (+187) |
 | pin-helper budget | no function added or removed |
 
 ## Parked: step 4, the argument ladder's own type
