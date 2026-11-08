@@ -10,7 +10,7 @@ over the 23,615-program census population.
 | tree | post-only | pre-only | both | probed |
 | --- | --- | --- | --- | --- |
 | master `691fde26` | 24 | 1 | 74 | 99 |
-| this PR | 19 | 1 | 73 | 93 |
+| this PR, merged with master `be09b8cb` | 18 | 1 | 74 | 93 |
 
 `vkNonNullRefTwin` leaves the probe set: it is a `VKind → VKind` table, not a classifier.
 
@@ -64,3 +64,10 @@ Why the kept ones stay, by the program each disagreement needs:
   vals slot is nullable (`mvSlotNullable`) while its value type is not. The storage is right.
 
 Not reached in this lane: `moduleCopySigKey` and `letIsNulString` (D3290).
+
+**Proof.** Both seeds are fixpoints. On master `be09b8cb`, base is 6,500,366 bytes and the merged
+candidate 6,500,028 (−338). The sweep compared them over 23,615 programs: 23,615 same, 0
+bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new traps; the pre-merge pair read the same
+(6,497,621 → 6,497,252). `scripts/gate.sh` passed every row but `lint-self`, whose one
+`sentinel-index-unguarded` finding the bound test in `retCapturedMapShape` closed, and
+`lint-self.sh` then read clean.
