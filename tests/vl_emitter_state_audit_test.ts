@@ -168,3 +168,52 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "emitter-state-audit: --check holds on const containers and reds when their clear is ignored",
+  ignore: !ENABLED,
+  fn: async () => {
+    const held = await audit(["--check"]);
+    if (held.code !== 0 || !/never-cleared const containers 0 of \d+ written/.test(held.out)) {
+      throw new Error(`--check on the tree: want exit 0 and 0 const containers, got ${held.code}\n${held.out}`);
+    }
+    // ast.vl's brace tables are `const` lists that only `dgLosslessReset` empties.
+    const red = await audit(["--check", "--without-reset", "dgLosslessReset"]);
+    if (
+      red.code !== 1 || !red.out.includes("never-cleared const containers") ||
+      !["stmtBraceNodes", "stmtBraceTails", "braceNameStmts"].every((n) => red.out.includes(`  ${n} `))
+    ) {
+      throw new Error(`--check --without-reset dgLosslessReset: want exit 1 naming the brace tables, got ${red.code}\n${red.out}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "emitter-state-audit: --check names #6759's lpExits when its reset is reverted",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The leak #6759 fixed, rebuilt in a copy of compiler/: a module `const` map nothing resets.
+    const dir = await Deno.makeTempDir({ prefix: "vl-state-audit-" });
+    try {
+      await Deno.mkdir(`${dir}/compiler`);
+      for (const e of Deno.readDirSync(`${ROOT}/compiler`)) {
+        if (e.isFile && e.name.endsWith(".vl")) {
+          await Deno.copyFile(`${ROOT}/compiler/${e.name}`, `${dir}/compiler/${e.name}`);
+        }
+      }
+      const f = `${dir}/compiler/check_if_value.vl`;
+      const src = Deno.readTextFileSync(f);
+      const reverted = src.replace(/^let lpExits(.*)$/m, "const lpExits$1").replace("\n  lpExits = Map()\n", "\n");
+      if (reverted === src || !/^const lpExits/m.test(reverted)) {
+        throw new Error("the control's anchor moved: no `let lpExits` and its reset in check_if_value.vl");
+      }
+      Deno.writeTextFileSync(f, reverted);
+      const red = await audit(["--check", "--dir", `${dir}/compiler`]);
+      if (red.code !== 1 || !red.out.includes("  lpExits check_if_value.vl:")) {
+        throw new Error(`--check on the reverted tree: want exit 1 naming lpExits, got ${red.code}\n${red.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
