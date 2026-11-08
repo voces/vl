@@ -341,7 +341,7 @@ import {
   placeKeyOf,
 } from "./check_places"
 import {
-  GEN_FN_HOLE_UNCALLED,
+  HOLE_BIND_UNCALLED,
   argMismatchErr,
   assignable,
   bgCallArgSet,
@@ -358,13 +358,13 @@ import {
   bindParamUnionOwn,
   bindParamUnionsLate,
   directHoleBodyRet,
-  genFnHoleCallInsts,
-  genFnHoleCalled,
-  genFnHoleInstance,
-  genFnHoleMovedInsts,
-  genFnHoleOpenInsts,
-  genFnHoleSoleInst,
   genericDeclRetMisfit,
+  holeBindCalled,
+  holeBindHeld,
+  holeBindHeldSet,
+  holeBindInstance,
+  holeBindInsts,
+  holeBindOpenInsts,
   holeChoiceArms,
   holeChoiceWaits,
   holeFnArgDecls,
@@ -2423,6 +2423,13 @@ function callFtyPinCstrs(
     const cs = fnTagSetOfTy(nodeTyIxOf(parenPeelIx(n.callFn)))
     if cs >= 0 && csNamedMembers(cs) { cstrSetOwnersSet(fnTagMembers(cs)) }
   }
+  // A call through a re-pointed `let` binds a hole in each function it may hold.
+  const heldWas = holeBindHeld
+  holeBindHeldSet(noOwners)
+  if cstrCallee == CSTR_NODECL && cfn is Ident {
+    const hs = holeFnArgDecls(n.callFn)
+    if hs.length > 1 { holeBindHeldSet(hs) }
+  }
   // The direct spelling has no receiver, so every parameter is an argument (`selfOff` 0)
   // and `params`/`args` are already 1:1 (named arguments reordered, defaults padded).
   const dhNames: string[] = []
@@ -2689,6 +2696,7 @@ function callFtyPinCstrs(
     validateTpIfJoins(vNames, vTys, pinTys, retTy, ix, cstrCallee)
   }
   cstrSetOwnersSet(ownersWas)
+  holeBindHeldSet(heldWas)
   retTy
 }
 
@@ -2775,7 +2783,7 @@ function fsbGenFnHolePins(
   while k < vNames.length {
     const vt = vTys[k]
     if !tyIsForeignGenericSig(vt) && tyIsHoleGenericSig(vt) {
-      const own = genFnHoleInstance(vNames, vTys, k, vt, calleeFn)
+      const own = holeBindInstance(vNames, vTys, k, vt, calleeFn)
       if own >= 0 { vTys[k] = own }
     }
     k = k + 1
@@ -2800,7 +2808,7 @@ function holeParamUse(
   if decl < 0 && cfn is Ident { decl = identFnAliasOf(cfnIx) }
   let scope = CSTR_NODECL
   if owner >= 0 { scope = owner }
-  if genFnHoleCalled(hv.tvName, scope) { return 0 }
+  if holeBindCalled(hv.tvName, scope) { return 0 }
   if decl < 0 || decl >= P.nodes.length { return -1 }
   const dn = nodeAt(decl)
   if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return -1 }
@@ -2888,7 +2896,7 @@ function holeOpenCallsWait(
   calleeFn: i32,
 ) {
   const oinsts: i32[] = []
-  genFnHoleOpenInsts(vNames, wTys, k, vt, calleeFn, oinsts)
+  holeBindOpenInsts(vNames, wTys, k, vt, calleeFn, oinsts)
   for oi in oinsts {
     const of = tyAt(oi)
     if of is TyFunc { holeChoiceWaits(a, of.fnParamTypes) }
@@ -2931,10 +2939,7 @@ function judgeFnArgHoleCalls(
           instGenFnHolePins(vNames, wTys, calleeFn)
         }
         const linsts: i32[] = []
-        genFnHoleCallInsts(vNames, wTys, k, vTys[k], calleeFn, linsts)
-        // Calls moved out of a forwarding call are judged at the one instance they all ask.
-        const sole = genFnHoleSoleInst(vNames, wTys, k, vTys[k], calleeFn)
-        if sole >= 0 { linsts.push(sole) }
+        holeBindInsts(vNames, wTys, k, vTys[k], calleeFn, linsts)
         for li in linsts {
           const lf = tyAt(li)
           if lf is TyFunc && holeLetWritesDisagree(a, lf.fnParamTypes) {
@@ -2984,19 +2989,19 @@ function judgeFnArgHoleCalls(
             instGenFnHolePins(vNames, wTys, calleeFn)
           }
           const insts: i32[] = []
-          genFnHoleCallInsts(vNames, wTys, k, vTys[k], calleeFn, insts)
+          holeBindInsts(vNames, wTys, k, vTys[k], calleeFn, insts)
           if insts.length > 1 { judgeHoleCallOps(opFn, vNames, wTys, a) }
-          // A call moved out of a forwarding callee asks its own instance too, judged without a
-          // split, as the direct spelling's call is (D13201).
-          const judged: i32[] = []
-          for inst in insts { judged.push(inst) }
-          genFnHoleMovedInsts(vNames, wTys, k, vTys[k], calleeFn, judged)
           const d0 = T.diags.length
-          for inst in judged {
+          for inst in insts {
             if T.diags.length == d0 { genFnValueCstrs(a, nodeTyOf(a), inst) }
             if T.diags.length == d0 { holeDeclCstrsAt(a, d, nodeTyOf(a), inst) }
           }
-          if insts.length > 1 && fnValue != "" && T.diags.length == d0 {
+          if (
+            insts.length > 1
+            && fnValue != ""
+            && T.diags.length == d0
+            && vNames[k].slice(0, 3) == "?#L"
+          ) {
             reassignedFnValueErr(fnVia, fnValue, gName, a)
           }
         }
@@ -3416,8 +3421,7 @@ function judgeHoleFieldCalls(
       for t in wTys { tys.push(t) }
       tys.push(vt)
       const insts: i32[] = []
-      genFnHoleCallInsts(names, tys, vNames.length, vt, calleeFn, insts)
-      genFnHoleMovedInsts(names, tys, vNames.length, vt, calleeFn, insts)
+      holeBindInsts(names, tys, vNames.length, vt, calleeFn, insts)
       for inst in insts {
         if T.diags.length == d0 { holeDeclCstrsAt(v, d, vt, inst) }
       }
@@ -3509,14 +3513,15 @@ function pinHoleLambdaVals(
   let k = 0
   while k < vNames.length {
     const vt = vTys[k]
-    const lx = holeLambdaNodeOf(vt)
+    // A declared type parameter bound to a lambda is no hole the callee calls (`use<T>(ys: T[])`).
+    const lx = if vNames[k].slice(0, 1) == "?" { holeLambdaNodeOf(vt) } else { -1 }
     if lx >= 0 {
       const how = holeArgLambdaHowOf(lx)
-      let inst = genFnHoleInstance(vNames, vTys, k, vt, calleeFn)
+      let inst = holeBindInstance(vNames, vTys, k, vt, calleeFn)
       // One the body never reads is never called, so the default is unobservable (D5934),
       // whether it arrives as a literal or by name (D6112).
       const unread = how == 1 || (how < 0 && holeArgNamedAt(ix, lx))
-      const dflt = inst == GEN_FN_HOLE_UNCALLED && unread
+      const dflt = inst == HOLE_BIND_UNCALLED && unread
       if dflt {
         inst = holeLambdaDefault(vt, vNames, vTys, ix)
       } else if inst >= 0 {
@@ -3534,7 +3539,7 @@ function pinHoleLambdaVals(
         }
       } else {
         const insts: i32[] = []
-        genFnHoleCallInsts(vNames, vTys, k, vt, calleeFn, insts)
+        holeBindInsts(vNames, vTys, k, vt, calleeFn, insts)
         if insts.length > 1 { judgeHoleCallOps(opFn, vNames, vTys, ix) }
       }
     }
@@ -3556,7 +3561,7 @@ function holeLambdaAtEachInst(
   if opFn < 0 || k < 0 || k >= vTys.length { return false }
   const vt = vTys[k]
   const insts: i32[] = []
-  genFnHoleCallInsts(vNames, vTys, k, vt, calleeFn, insts)
+  holeBindInsts(vNames, vTys, k, vt, calleeFn, insts)
   if insts.length < 2 { return false }
   const d0 = T.diags.length
   judgeHoleCallOps(opFn, vNames, vTys, ix)
