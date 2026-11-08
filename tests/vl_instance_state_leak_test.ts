@@ -252,6 +252,20 @@ const PROGRAMS: Program[] = [
   { id: "field-writers-main", family: "mono program tables (D4942)", src: fieldWriters("main", "set") },
   { id: "field-writers-mn", family: "mono program tables (D4942)", src: fieldWriters("mn", "put") },
 
+  // ── the checker's loop-exit log (`lpExits`): a labelled block's exits, keyed by node, outlived
+  // its program, so the next program's box record stamped an argument with an unrelated union
+  // (`boxExitsStamp`). Listed in the order that leaked; the argument reads that record.
+  {
+    id: "labelled-block-exits",
+    family: "lpExits (box record)",
+    path: "closures/hole-fn-labelled-block-left-by-break.vl",
+  },
+  {
+    id: "nul-scalar-list-arm-arg",
+    family: "lpExits (box record)",
+    path: "closures/nul-scalar-list-arm-closure-result.vl",
+  },
+
   // ── the NON-MINTERS: the second half of D986's shape ────────────────────────────────
   // A program whose own type section and start-function frame are decided entirely by what
   // it contains. If a predecessor's flag survives, these are where it shows: the flag mints
