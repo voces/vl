@@ -48,13 +48,13 @@ awk -F'\t' -v D="$READ" '$2 ~ /^(atom|arm) / {
   n = split($2, a, " [|] "); p = a[n]; sub(/^pos /, "", p)
   k = a[1] " | " p; if (D != "") k = k " | " a[2] " | " a[3]; c[k]++; if (!(k in w)) w[k] = $1 }
   END { for (k in c) print "read\t" c[k] "\t" k "\t" w[k] }' "$OUT" | sort -t$'\t' -k3
-# A position the table serves (`emitUnionBoxOwed`) is graded by the sweep, not here: its rows are
-# `table` or a named floor, and a floor that floors.tsv does not list for its position fails.
+# A position the table serves (`emitUnionBoxOwed`, `armClose`) is graded by the sweep, not here: its
+# rows are `table` or a named floor, and a floor that floors.tsv does not list for its position fails.
 awk -F'\t' -v L="$R/scripts/box-dst-shadow/floors.tsv" '
   BEGIN { while ((getline l < L) > 0) if (l !~ /^#/ && l != "") ok[l] = 1 }
-  $2 ~ /^(table|floor:)/ {
+  $2 ~ /^(arm |atom )?(table|floor:)/ {
     n = split($2, a, " [|] "); p = a[n]; sub(/^pos (floor@)?/, "", p); sub(/:[0-9]+$/, "", p)
-    if (a[1] == "table") { t[p]++; next }
+    if (a[1] ~ /table/) { t[p (a[1] ~ /^(arm|atom)/ ? " (" substr(a[1], 1, index(a[1], " ") - 1) ")" : "")]++; next }
     k = p "\t" a[1]; f[k]++; if (!(k in w)) w[k] = $1 }
   END {
     for (p in t) print "table\t" t[p] "\t" p
