@@ -488,7 +488,6 @@ import {
   annIsNulStrListDeep,
   annValtypeSlotOf,
   annVariantRowOf,
-  arrNewFillAnnKind,
   asgValueIsFunc,
   assignTargetSpills,
   gckDrop,
@@ -563,7 +562,6 @@ import {
 import {
   TK_STR,
   arenaListRep,
-  arrNewDestKind,
   letAnnVariantIdx,
   listBuildOfTy,
   rlSlotIsKindList,
@@ -815,6 +813,7 @@ import {
 import {
   ArrNewKind,
   arrNewDefaultKind,
+  arrNewKindOfListVKind,
   bindingDeclInScope,
   declaredKind,
   declaredSlotOf,
@@ -1710,7 +1709,7 @@ function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
       const callee = nodeAt(e.callFn)
       if callee is Member {
         if callee.memProp == "pop" || callee.memProp == "get" {
-          if exprRefArray(callee.memObj, fnIx) {
+          if nodeRepIs(callee.memObj, "reflist", fnIx) {
             return refListSlotOfExpr(callee.memObj, fnIx)
           }
         }
@@ -4193,7 +4192,7 @@ export function arrNewIntrKind(callIx: i32, fnIx: i32): ArrNewKind {
     const callee = nodeAt(c.callFn)
     if callee is Ident {
       if callee.identName == "__array_new__" {
-        const ank = arrNewNamedKind(callIx, fnIx)
+        const ank = arrNewRepKind(callIx, fnIx)
         if ank != "none" { return ank }
         // Nothing named it, so `"list"` here is a guess. Every consumer of this classifier
         // keeps reading it; the emitter asks `arrNewKindNamed` and refuses instead (D1630).
@@ -4207,47 +4206,12 @@ export function arrNewIntrKind(callIx: i32, fnIx: i32): ArrNewKind {
   "none"
 }
 
-// The `__array_new__` element kind some source NAMES, or `"none"` where none does. Three
-// sources, asked in that order: the fill's own rep, the destination's recorded type, and —
-// inside a monomorphized body, where that type is still the unpinned `T[]` — the instance's
-// substituted parameter annotation.
-export function arrNewNamedKind(callIx: i32, fnIx: i32): ArrNewKind {
-  if clsCensusOn { clsCensusEnter("arrNewNamedKind") }
-  const c = nodeAt(callIx)
-  if c is Call {
-    if c.callArgs.length == 2 {
-      if exprIsF64(c.callArgs[1], fnIx) { return "f64list" }
-      // D963 — the i64 fill: `ia64TypeIdx` and `il64TypeIdx` are interned like the f64
-      // pair above and `i64[]` lists lower and run. Ahead of the string and struct arms
-      // for the same reason f64 is: a scalar fill cannot be either. An f32 fill needs no
-      // arm here — a float literal types f64, so the two channels below name it (D1673).
-      if exprIsI64(c.callArgs[1], fnIx) { return "i64list" }
-      // A string fill builds the string list; a struct or object-literal fill builds the
-      // ref list for that element struct.
-      if exprString(c.callArgs[1], fnIx) { return "strlist" }
-      const anf = nodeAt(c.callArgs[1])
-      if anf is ObjLit { return "reflist" }
-      if exprStruct(c.callArgs[1], fnIx) { return "reflist" }
-      if exprIsClosure(c.callArgs[1], fnIx) { return "reflist" }
-      if exprArray(c.callArgs[1], fnIx) { return "reflist" }
-      if exprRefArray(c.callArgs[1], fnIx) { return "reflist" }
-      if exprStringArray(c.callArgs[1], fnIx) { return "reflist" }
-      if exprMap(c.callArgs[1], fnIx) { return "reflist" }
-      // A wide-scalar list fill is a ref-list element like every other list. The three arms
-      // above claim one only where it is a module global; an `f64[]`/`i64[]`/`u8[]`/`f32[]`
-      // parameter or local reaches here (D1631).
-      if exprF64Array(c.callArgs[1], fnIx) { return "reflist" }
-      if exprI64Array(c.callArgs[1], fnIx) { return "reflist" }
-      if exprU8Array(c.callArgs[1], fnIx) { return "reflist" }
-      if exprF32Array(c.callArgs[1], fnIx) { return "reflist" }
-      // The fill named no kind, so the DESTINATION's rep decides. A union-typed fill answers
-      // none of the questions above (D1630).
-      const anDest = arrNewDestKind(callIx)
-      if anDest != "none" { return anDest }
-      return arrNewFillAnnKind(callIx, fnIx)
-    }
-  }
-  "none"
+// The list rep an `__array_new__` call allocates: the call's own recorded rep, or `"none"` where
+// that rep is no list backing the intrinsic builds.
+export function arrNewRepKind(callIx: i32, fnIx: i32): ArrNewKind {
+  const d = repOfNode(callIx, fnIx)
+  if d.rdCovered != 1 { return "none" }
+  arrNewKindOfListVKind(d.rdKind)
 }
 
 // The wasm local index of the declared-local position `pos` in function `fnIx`, or -1 when
@@ -13585,13 +13549,14 @@ function compositionMapReadSlot(exprIx: i32, fnIx: i32): i32 {
   // List-of-maps element read: the element name is the map type; its value picks the slot.
   const e = nodeAt(unwrapParen(exprIx))
   if e is Index {
-    if exprRefArray(e.idxArr, fnIx) {
+    if nodeRepIs(e.idxArr, "reflist", fnIx) {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      const ck = refListElemKind(e.idxArr, fnIx)
+      const ck = repOfNode(exprIx, fnIx)
       if (
         slot >= 0
         && slot < rlElemTyIx.length
-        && (ck == "map" || ck == "nulmap")
+        && ck.rdCovered == 1
+        && (ck.rdKind == "map" || ck.rdKind == "nulmap")
       ) {
         // A NULLABLE map element strips to its inner map for the value-slot resolve.
         return rlElemNulMapValMvSlot(slot)
