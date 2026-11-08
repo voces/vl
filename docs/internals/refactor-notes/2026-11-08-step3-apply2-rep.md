@@ -2,14 +2,14 @@
 
 Lane "fix the representation behind the per-call binding". Base: master `957c647d`, built to a
 fixpoint. Probe builds re-apply `4ab6fc60` and turn its shadow into a switch. This PR changes no
-compiler source. It adds [D15569](../inventory/D15569.md), a refutation pin that runs today.
+compiler source. It adds [D15570](../inventory/D15570.md), a refutation pin that runs today.
 
 ## The direct spelling does not break on master
 
 D13102's direct spelling (`apply2(h, k)` in `inner(k, h)`) runs on master at f64 and at i32. It
-breaks only under the switch. Minimal witness (D15569): `inner(h) { apply2(h, 1) }`, `inner(add)`.
+breaks only under the switch. Minimal witness (D15570): `inner(h) { apply2(h, 1) }`, `inner(add)`.
 
-| build | D15569 | D13102 direct, f64 | the same, i32 |
+| build | D15570 | D13102 direct, f64 | the same, i32 |
 |---|---|---|---|
 | master | `2` | `1` | `2` |
 | switch both `CallInsts` and `Instance` | invalid wasm | invalid wasm | invalid wasm |
@@ -52,7 +52,7 @@ parameter kind. That is `emit_elab` or `emit_mono`'s hole-binding family (`monoP
 
 ## What stands
 
-1. The fix above: a decision for w155 or the orchestrator. Its grading list is D15569's.
+1. The fix above: a decision for w155 or the orchestrator. Its grading list is D15570's.
 2. Re-measure the switch after it lands (126 runs lost and 86 traps on `41df34b8`). Not done here.
 3. The 17 `reassignedFnValueErr` cells and the 16 argument-misfit cells: not reached.
 
