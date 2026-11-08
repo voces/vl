@@ -529,6 +529,7 @@ import {
   pendNulListTysSet,
   pendTys,
   pendTysSet,
+  readOnlyKeyRows,
   recordArmJoin,
 } from "./check_side_rows"
 import { symEnabled, symMemGetter, symMemGetterDecl } from "./check_state"
@@ -1233,6 +1234,46 @@ function defaultUnfixed(ty: i32): boolean {
   defaultOpenHoles(ty, 8, true)
   true
 }
+
+// Default the open element or value of `ty`, the container a `let` binds and only ever reads
+// (`cwBindingOnlyRead`), now, so every read is checked as at the annotated default. False,
+// changing nothing, when `ty` is no open container.
+export function defaultReadOnlyContainer(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || calleeWrittenElem(ty) >= 0 { return false }
+  // A `__array_new_default__(n)` list holds values; its own default is `arrDefHoleToI32`'s.
+  if arrDefRowIsCall(ty) { return false }
+  const t = tyAt(ty)
+  if t is TyArray {
+    if t.aElem >= 0 { return false }
+    t.aElem = unboundDefaultTy()
+  } else if t is TyMap {
+    if t.mKey >= 0 && t.mVal >= 0 { return false }
+    if t.mVal < 0 { t.mVal = unboundDefaultTy() }
+    if t.mKey < 0 { readOnlyKeyRows.push(ty) }
+  } else {
+    return false
+  }
+  tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+  true
+}
+
+// A key read of type `kt` on map row `row` that `defaultReadOnlyContainer` left key-open
+// fixes the key to `kt` now, as the program's end would.
+export function pinReadKey(row: i32, kt: i32) {
+  if kt < 0 || kt >= T.tys.length || !i32ListHas(readOnlyKeyRows, row) {
+    return 0
+  }
+  const t = tyAt(row)
+  if t is TyMap && t.mKey < 0 {
+    t.mKey = kt
+    tyMutEpoch = tyMutEpoch + 1 // in-place key pin — canonical keys change
+  }
+  0
+}
+
+// A `for … in` over map row `row` that `defaultReadOnlyContainer` left key-open, before any key
+// read fixed it, takes the unbound default key.
+export function pinIterKey(row: i32) { pinReadKey(row, unboundDefaultTy()) }
 
 // Before a caller's write of `got` pins open list row `ty`, give the row an earlier hole callee's
 // element when `got`'s element cannot hold that callee's write: the first write decides, as at
