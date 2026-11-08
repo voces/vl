@@ -6245,7 +6245,13 @@ function emitModule(_stmts: i32[]) {
 
   const nPrintTypes = printFnTypeCount()
 
-  emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
+  // The two facts the bodies read that the type section's rows decide: each struct row's
+  // supertype, and the `$fnsig` pool's twins. The section itself is written after the bodies.
+  buildStructSupers()
+  cloSigTwinsBuild()
+  // A dry render reports the section's refusals ahead of the bodies', as before the split.
+  emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers, false)
+  gTypeRopeAt = W.chunks.length
 
   emitImportSection(n, typeOffset, hasStart)
 
@@ -6278,6 +6284,10 @@ function emitModule(_stmts: i32[]) {
   // placing it does not move the chunk the function section is placed before.
   frameGlobalSection()
   frameFunctionSection()
+  // Placed last of the three, at the lowest chunk, so the other two places do not move.
+  if !emitFailed {
+    emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers, true)
+  }
 
   if fnValUsed { emitElementSection(n) }
 
@@ -8369,8 +8379,8 @@ function armSuperOf(c: i32, bestLen: i32): i32 {
 // The rec-group entries `emitTypeSection` has written so far; entry k is heap type k.
 let tsEmitted = 0
 
-// The closure-signature pool's entry offsets and lengths in the section buffer, for the twin
-// column `tsCloSig` fills.
+// The closure-signature pool's entry offsets and lengths in `cloSigTwinsBuild`'s scratch
+// buffer, for the twin column it fills.
 let tsPoolStart: i32[] = []
 let tsPoolBytes: i32[] = []
 
@@ -8667,27 +8677,46 @@ function tsCloCell() {
   0
 }
 
-// One env-leading `$fnsig` functype per distinct eligible signature, in `cloSigKeys` order,
-// and — as each is written — the pool's twin column: the smallest earlier entry with
-// identical bytes (D351). Compared over the section buffer just rendered into, so every
-// entry renders exactly once and emitted bytes are unchanged — a duplicate functype is still emitted at its own index, it simply stops being referenced.
+// One env-leading `$fnsig` functype per distinct eligible signature, in `cloSigKeys` order. A
+// duplicate is still emitted at its own index; `cloSigTwinsBuild` stops it being referenced.
 function tsCloSig(sai: i32) {
-  const start = wLen()
   tsEntryAt(cloSigBase + sai, "closure signature")
   emitCloSigFunctype(sai)
-  const nb = wLen() - start
-  let twin = sai
-  let pj = 0
-  while pj < sai {
-    if tsPoolBytes[pj] == nb && wRangeEq(tsPoolStart[pj], start, nb) {
-      twin = pj
-      pj = sai // stop at the first (smallest) twin
+  0
+}
+
+// The pool's twin column, the smallest earlier entry with identical bytes (D351), before any
+// body reads it: each `$fnsig` is rendered into a scratch buffer, so the type section itself
+// is written after the bodies.
+function cloSigTwinsBuild() {
+  cloSigTwin = []
+  tsPoolStart = []
+  tsPoolBytes = []
+  if !fnValUsed { return 0 }
+  const scratch: u8[] = []
+  const prev = wTarget(scratch)
+  let sai = 0
+  while sai < cloSigKeys.length {
+    const start = wLen()
+    emitCloSigFunctype(sai)
+    const nb = wLen() - start
+    let twin = sai
+    let pj = 0
+    while pj < sai {
+      if tsPoolBytes[pj] == nb && wRangeEq(tsPoolStart[pj], start, nb) {
+        twin = pj
+        pj = sai // stop at the first (smallest) twin
+      }
+      pj = pj + 1
     }
-    pj = pj + 1
+    cloSigTwin.push(twin)
+    tsPoolStart.push(start)
+    tsPoolBytes.push(nb)
+    sai = sai + 1
   }
-  cloSigTwin.push(twin)
-  tsPoolStart.push(start)
-  tsPoolBytes.push(nb)
+  wTarget(prev)
+  tsPoolStart = []
+  tsPoolBytes = []
   0
 }
 
@@ -8794,11 +8823,9 @@ function emitTypeSection(
   memFn: i32,
   nPrintTypes: i32,
   nHelpers: i32,
+  place: boolean,
 ) {
   tsEmitted = 0
-  cloSigTwin = []
-  tsPoolStart = []
-  tsPoolBytes = []
   const typePayload: u8[] = []
   // Bind the writer at `typePayload` for the WHOLE type-section payload build, so the
   // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
@@ -8824,7 +8851,6 @@ function emitTypeSection(
     wU8(78)           // 0x4e rec group
     wULEB(typeOffset) // the heap types and the closure-signature pool
   }
-  buildStructSupers()
   let ei = 0
   while ei < mAllocKind.length {
     tsEmitEntry(mAllocKind[ei], mAllocSlot[ei])
@@ -8903,9 +8929,12 @@ function emitTypeSection(
   // The shared runtime helpers, in helper-index order.
   tsEmitHelperFuncTypes()
   wTarget(tyPrev)
-  wSection(1, typePayload)
+  if place { wSectionPartsAt(gTypeRopeAt, 1, [typePayload]) }
   0
 }
+
+// The module rope chunk the type section is placed before: it is written after the bodies.
+let gTypeRopeAt = 0
 
 // Writes one functype per used fs slot, in slot order, to the type-section payload
 // `emitTypeSection` has bound. A slot with no arity records a failure and writes `() -> i32`.
