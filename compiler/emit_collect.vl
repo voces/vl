@@ -22,6 +22,7 @@ import {
 } from "./emit_elab"
 import {
   nodeTyArrayElemRepName,
+  nodeTyInstEnter,
   nodeTyIsLitUnionAlias,
   nodeTyIsNulClosure,
   nodeTyIsNulI32List,
@@ -64,7 +65,11 @@ import { canonEmitNameOfTy } from "./check_program"
 import { assignable, substTyDeep } from "./check_relate_core"
 import { isVarTyIxOf } from "./check_list_union"
 import { listDisjointDepth } from "./check_type_shape"
-import { inferRetFnKey, inferRetNodeCarryNote } from "./check_side_rows"
+import {
+  inferRetFnKey,
+  inferRetNodeCarryNote,
+  lambdaVoidAdoptedAt,
+} from "./check_side_rows"
 import {
   optCallRetCount,
   optCallRetNameAt,
@@ -228,6 +233,7 @@ import {
   shapeInnerFieldSplit,
   strLess,
   tyIsFuncType,
+  tyIsStructWithUnionField,
   tyNameOf,
   unionStructAliasShape,
   unwrapParen,
@@ -450,6 +456,7 @@ import {
   mUsed,
   mkArrIdx,
   mkListIdx,
+  monoGradualObjFrame,
   monoGradualObjList,
   monoGradualObjLits,
   monoGradualRetPinned,
@@ -965,7 +972,11 @@ import {
   tyIsValueUnionBox,
   valueAtomKind,
 } from "./check_ty_rep"
-import { inferRetRungIsValueUnion, valueUnionRetName } from "./check_ret_names"
+import {
+  inferRetRungIsParenUnionElemList,
+  inferRetRungIsValueUnion,
+  valueUnionRetName,
+} from "./check_ret_names"
 import {
   inferLetCount,
   inferLetIxAt,
@@ -2269,6 +2280,42 @@ function buildFnMapBankPrefix() {
   0
 }
 
+// Whether un-annotated function `i` is a lambda whose own inferred-return row classifies its
+// return columns as that type's annotation would: an element-value-union list, whose elements
+// are boxed, or a struct with a union field, whose built row a value's stamp can disagree with.
+// `computeRetInference` leaves such a row's columns as written.
+function fnRetRowLowersAsAnn(i: i32): boolean {
+  const fn = nodeAt(fnStmts[i])
+  if !(fn is FuncDecl) { return false }
+  if fn.fnRet >= 0 || i >= fRetVoid.length || fRetVoid[i] != 0 { return false }
+  const k = inferRetFnKey(fnStmts[i], fn.fnName)
+  if k == fn.fnName { return false }
+  const row = inferRetRowOf(k)
+  if row < 0 { return false }
+  inferRetRungIsParenUnionElemList(row)
+    || tyIsStructWithUnionField(inferRetTyIxAt(row))
+}
+
+// Classify row `li` from the annotation node `ann` and bank it, as an annotated return is.
+function buildFnMapRowOfRetAnn(li: i32, ann: i32) {
+  const rsk = retAnnKindChain(ann)
+  let sidx = 0
+  if rsk == "struct" || rsk == "nulstruct" {
+    sidx = retStructRowIndex(ann)
+  } else {
+    sidx = retStructIndex(ann)
+  }
+  buildFnMapPutRow(
+    li,
+    retVoidAnnFlag(ann),
+    sidx,
+    retRefArrElemName(ann),
+    retBoolFlag(ann),
+    rsk,
+  )
+  buildFnMapBankRow(li)
+}
+
 // Classify the return of `s`, the declaration at `fnStmts` slot `i`, into row `li` and bank
 // the row: the annotation's facts first, then the checker's inferred return when unannotated.
 function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
@@ -2316,6 +2363,9 @@ function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
     // `typecheck.vl` — widen that gate and these arms fire where the name arms did not.
     let retTyIx = -1
     if inRow >= 0 { retTyIx = inferRetTyIxAt(inRow) }
+    if fnRetRowLowersAsAnn(i) {
+      return buildFnMapRowOfRetAnn(li, synthTypeRefTy(inm, -1, retTyIx))
+    }
     let retPrim = ""
     if retTyIx >= 0 {
       const rpt = tyAt(retTyIx)
@@ -2561,6 +2611,7 @@ export function recordedVoidFns() {
           const r = fnRecordedRetTy(i)
           if (
             r == TY_VOID
+            || lambdaVoidAdoptedAt(fnStmts[i])
             || blockHasBareReturn(fn.fnBody)
             || fnPosResultUnconsumed(i)
           ) {
@@ -2810,7 +2861,7 @@ export function computeRetInference() {
   let ri = 0
   while ri < fnStmts.length {
     criRecordedRefListDemand(ri)
-    criFromRec.push(criColsFromRecorded(ri))
+    criFromRec.push(fnRetRowLowersAsAnn(ri) || criColsFromRecorded(ri))
     ri = ri + 1
   }
   let i = 0
@@ -6704,7 +6755,11 @@ function mintGradualObjLitRows() {
     if lt >= 0 && lt < T.tys.length {
       // A tagged set has no spelling for its id, so a record holding one mints from its literal.
       if fnTagHoldsTy(lt, 4) {
-        if structIndexOfObj(ox) < 0 { anonMintRowFor(ox, -1) }
+        if structIndexOfObj(ox) < 0 {
+          const was = nodeTyInstEnter(monoGradualObjFrame.get(ox) ?? -1)
+          anonMintRowFor(ox, -1)
+          nodeTyInstEnter(was)
+        }
       } else {
         internShapeDeepOfTy(lt)
       }
