@@ -663,6 +663,18 @@ print(k)
 outer()
 `;
 
+// A result whose recorded record names no row (a container read a \`??\` defaults, its values built
+// wider) reads its value's stamp, the row it is built at.
+const COL_STAMP = `type J = { f: i32 | null }
+function mk1() { { f: 4 } }
+const m = Map()
+m.set("a", mk1())
+const wm: {[string]: J} = Map()
+wm.set("a", mk1())
+function g() { m.get("a") ?? { f: 1 } }
+print(g().f ?? 0)
+`;
+
 // A record a delivery widened to a variant row reads the variant where every call delivers into a
 // destination (`mk2`, two arguments); where one call binds the result as built (`e1`), the
 // function keeps its own record, and `mk1` is left to the walk.
@@ -678,6 +690,16 @@ function take(d: R | string) {
 }
 take(mk2(7))
 take(mk2(3))
+`;
+
+// An instance whose values are its own recursive call and a call through its hole parameter
+// records the second's type, so it is annotated before the walk and grades nowhere.
+const COL_SELF = `function inc0(a) { return a + 1 }
+function r(h, n) {
+  if n > 0 { return r(h, n - 1) }
+  return h(3)
+}
+print(r(inc0, 2))
 `;
 
 Deno.test({
@@ -709,6 +731,24 @@ Deno.test({
       "post moved: moved: agree str | __lambda_0=1; post moved: moved: agree str | setK=1; " +
         "post seed: kind str vs i32 | __lambda_0=1; post seed: kind str vs i32 | setK=1; " +
         "post settled: agree str | __lambda_0=1; post settled: agree str | setK=1",
+      "col",
+    );
+    expectRows(
+      "col stamp",
+      COL_STAMP,
+      DROP_NONE,
+      true,
+      "post moved: moved: agree struct | g=1; post moved: moved: agree struct | mk1=1; " +
+        "post seed: kind struct vs i32 | g=1; post seed: kind struct vs i32 | mk1=1; " +
+        "post settled: agree struct | g=1; post settled: agree struct | mk1=1",
+      "col",
+    );
+    expectRows(
+      "col self call",
+      COL_SELF,
+      DROP_NONE,
+      true,
+      "",
       "col",
     );
     expectRows(
