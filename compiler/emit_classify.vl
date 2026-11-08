@@ -202,7 +202,6 @@ import {
   tyIsFuncArena,
   tyIsLitUnion,
   tyIsLitUnionAlias,
-  tyIsLitUnionArray,
   tyIsMap,
   tyIsNewtypeBrand,
   tyIsNulValueUnionBox,
@@ -327,6 +326,7 @@ import {
   elabHolderRecordAt,
   elabHoldsRecordAnywhere,
   elabKeyAtPos,
+  elabNarrowedFromAt,
   elabNodeTyAt,
   elabPlaceRecordAt,
   elabPlainReturnsRecord,
@@ -341,11 +341,9 @@ import {
 } from "./emit_elab"
 import {
   BC_LEAF,
-  BC_STR,
   bcGet,
   bcOpen,
   bcPut,
-  bcPutB,
   bcSpineLeave,
   calleeRetIsNulLitUnion,
   cloArrSlotSigKey,
@@ -842,7 +840,6 @@ import {
   instanceBindsNothingClosed,
   instanceTyOf,
   mapArmShapeOfTy,
-  mapKeyElemVKind,
   mapRecvTyIn,
   mapTyPeel,
   nodeIsValueJoin,
@@ -4056,25 +4053,32 @@ function coalTyIsStr(ix: i32, fnIx: i32): boolean {
   tyKindOf(t) == TK_STR || tyIsBareStrLit(t)
 }
 
-// True if `binIx` is a `+` whose operands are strings (string concatenation).
+// True if `binIx` is a `+` whose type in `fnIx` is a string (string concatenation).
 export function exprIsStrConcat(binIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("exprIsStrConcat") }
   const e = nodeAt(binIx)
   if e is BinExpr {
-    if e.binOp == "+" {
-      const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(binIx, fnIx, BC_STR) } else { -2 }
-      if m >= 0 { return m == 1 }
-      // A literal-union atom is a `string` subtype, so `"x" + k` and `k + "y"` concatenate —
-      // the atom operand widens to its member string in `emitStrConcat`.
-      const r = exprString(e.binLeft, fnIx)
-        || exprIsLitAtom(e.binLeft, fnIx)
-        || exprString(e.binRight, fnIx)
-        || exprIsLitAtom(e.binRight, fnIx)
-      if m != -2 { bcPutB(m, binIx, fnIx, BC_STR, r) }
-      return r
-    }
+    if e.binOp != "+" { return false }
+    const t = nodeTyInOf(binIx, fnIx)
+    if t >= 0 && t < T.tys.length && !tyHasTyVar(t) { return tyIsConcatStr(t) }
+    // A `+` minted after check has no type of its own: the checker's rule over its operands.
+    return concatOperandIsStr(e.binLeft, fnIx)
+      || concatOperandIsStr(e.binRight, fnIx)
   }
   false
+}
+
+// Whether operand `ix` of a `+` is a string in `fnIx`; an untyped `+` asks its own operands.
+function concatOperandIsStr(ix: i32, fnIx: i32): boolean {
+  const t = nodeTyInOf(ix, fnIx)
+  if t >= 0 && t < T.tys.length && !tyHasTyVar(t) { return tyIsConcatStr(t) }
+  if nodeAt(ix) is BinExpr { return exprIsStrConcat(ix, fnIx) }
+  tyIsConcatStr(t)
+}
+
+// Whether type `t` is a string a `+` concatenates: `string`, a string literal, or a union of them.
+function tyIsConcatStr(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  tyKindOf(t) == TK_STR || tyIsBareStrLit(t) || tyIsLitUnion(t)
 }
 
 // The one ladder `listOpKindOf` and `catListKindOfExpr` run, so the two cannot classify one
@@ -5786,94 +5790,19 @@ export function instanceOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   elabClosedTyAt(ax, fnIx)
 }
 
+// The kind a `for`'s loop variable binds at in `fnIx`: the rep of the element its iterable's type
+// yields there (a map's key, a string's code unit). Null where the iterable binds no element.
 export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("forInElemKind") }
-  // A narrowed union arm iterates the arm's elements, not the literal's own values: for
-  // `type K = string | K[]`, `if c is K[]` narrows to a list of boxes, while the plain
-  // classifiers would type the temp as a string list (check-clean invalid wasm, D1015).
-  if nodeAt(iterIx) is Ident {
-    const fiNt = readNarrowedTyAt(iterIx, fnIx)
-    // A literal union's element is an atom, never a box (D4907).
-    const fiEl = tyStepElem(fiNt)
-    if fiEl >= 0 && !tyIsLitUnionArray(fiNt) && unRowOfKey(fiEl) >= 0 {
-      return "union"
-    }
-  }
-  const e = nodeAt(iterIx)
-  if e is Call {
-    if e.callFn < 0 { return null }
-    const callee = nodeAt(e.callFn)
-    if callee is Member {
-      if exprMap(callee.memObj, fnIx) {
-        // A map's keys bind at the key's kind: string for the string-keyed rep, i32 or i64
-        // for the integer-keyed ones. A Set's `.values()` yields its elements, asking the same
-        // question — the two `"str"` answers below are the string-keyed half of a triple.
-        const kk = mapShapeOfExpr(callee.memObj, fnIx)
-        if callee.memProp == "keys" { return mapKeyElemVKind(kk) }
-        if callee.memProp == "values" {
-          if kk == -5 { return "i32" }
-          if kk == -7 { return "i64" }
-          // A set's `.values()` yields its elements — the string keys (kind 3), not the
-          // i32 membership booleans. A map's yields its values: i32 for the mono map, the
-          // value's kind for a ref-valued map.
-          if mapIsSetExpr(callee.memObj, fnIx) { return "str" }
-          return mapValElemKind(callee.memObj, fnIx)
-        }
-      }
-    }
-  }
-  // A bare map iterable (`for k in m`) iterates its keys — like `m.keys()`: string for
-  // the string-keyed rep (kind 3), i32 for the i32-keyed one.
-  if exprMap(iterIx, fnIx) {
-    return mapKeyElemVKind(mapShapeOfExpr(iterIx, fnIx))
-  }
-  // A `(string | null)[]` — the string-ref niche list. Its backing is a plain string list,
-  // but the element slot is nullable, so the loop var binds the nullable string (kind 16),
-  // exactly as `const e = xs[i]` does. Checked before `exprStringArray`, which would claim
-  // the same backing for a non-null element and trap on a stored null.
-  if exprNulStrArray(iterIx, fnIx) { return "nulstr" }
-  // …and so does a list whose recorded element is a type parameter pinned there (D3015).
-  if tyIsNulPrim(iterElemPinTy(iterIx, fnIx), "string") { return "nulstr" }
-  if exprStringArray(iterIx, fnIx) { return "str" }
-  // A struct-element ref list (`S[]`): the element is a struct ref, so bind the loop var
-  // as a code-1 struct local. (Union-box (2) / map-array ref lists aren't wired here yet.)
-  // A ref list's loop var binds its element's rep, read from the iterable's type at this instance:
-  // a struct, variant, union box, inner list, closure or map, nullable where the slot is.
-  if exprRefArray(iterIx, fnIx) {
-    return repSigKindOfTy(tyArrayElemIx(nodeTyInOf(iterIx, fnIx)))
-  }
-  // An f64 element list (`f64[]`): the loop var binds as a scalar f64 local (code 11), and
-  // the `#l` temp is the f64-list (code 12), recognized through `exprF64Array` so an
-  // `f64[]`-returning call iterates too. An f32 element list (`f32[]`) binds a scalar f32
-  // local (code 13). Both checked before the i32 default.
-  if exprF32Array(iterIx, fnIx) { return "f32" }
-  if exprF64Array(iterIx, fnIx) { return "f64" }
-  // An i64 element list (`i64[]`): the loop var binds as a scalar i64 local (code 10), and
-  // the `#l` temp is the i64-list (code 20).
-  if exprI64Array(iterIx, fnIx) { return "i64" }
-  // A packed byte list (`u8[]`): each element reads as an i32 (`array.get_u` zero-
-  // extends), so the loop var is the plain i32 code — the one-byte storage lives entirely
-  // in the `#l` temp (`forInU8Src`). Asked explicitly rather than left to the i32 default,
-  // since `exprArray` claims a `u8[]` in only some storage classes.
-  if exprU8Array(iterIx, fnIx) { return "i32" }
-  // A STRING iterable (`for ch in s`): each code unit is an i32 (loop-var code 0, same as an
-  // `i32[]`), but the source is the RAW i32 array — the `#l` temp is the string itself (code 3),
-  // and the length/element reads skip the list-wrapper `struct.get`. `forInStringSrc` flags it
-  // at the temp-kind and emit sites. Checked before `exprArray` (a string is not an i32 list).
-  if exprString(iterIx, fnIx) { return "i32" }
-  if exprArray(iterIx, fnIx) {
-    // A `null[]` walks the i32 list, but its loop var is the `null` unit cell, never written.
-    if arrElemIsNullUnitAt(iterIx, fnIx) { return "nulnone" }
-    // A `boolean | null` element binds the niche its type names; the cell is an i32 either way.
-    if (
-      repSigKindOfTy(forInBindTy(readContainerTyAt(iterIx, fnIx), false))
-      == "nulbool"
-    ) {
-      return "nulbool"
-    }
-    return "i32"
-  }
-  return null
+  repSigKindOfTy(forInBindTy(forInIterTyAt(iterIx, fnIx), false))
+}
+
+// The type the iterable `iterIx` holds in `fnIx`: the type its instance re-checked it at where
+// that instance reads it unnarrowed, else the storage `readContainerTyAt` reads.
+function forInIterTyAt(iterIx: i32, fnIx: i32): i32 {
+  const r = unwrapParen(iterIx)
+  const el = elabClosedTyAt(r, fnIx)
+  if el >= 0 && elabNarrowedFromAt(r, fnIx) == -1 { return el }
+  readContainerTyAt(iterIx, fnIx)
 }
 
 // The mv slot of a `for v in m.values()` walk over a ref-valued map, or -1 (not a
@@ -5886,15 +5815,6 @@ export function forInMapValsSlot(iterIx: i32, fnIx: i32) {
   const sl = mapShapeOfExpr(forInMapRecv(iterIx, fnIx), fnIx)
   if sl < 0 { return -1 }
   sl
-}
-
-// The kind a map's VALUE binds at, for `for v in m.values()` and the second name of
-// `for k, v in m`: the rep of the value type the map's storage holds (`readContainerTyAt`), so
-// a map narrowed by a value test binds its stored, possibly nullable, value. `i32` off a map.
-export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
-  const v = tyMapValOf(tyMapHeld(readContainerTyAt(mapObjIx, fnIx)))
-  if v < 0 { return "i32" }
-  repSigKindOfTy(v)
 }
 
 // The kind a `for`'s SECOND name binds at: a sequence's index (`i32`), or the value a map's
