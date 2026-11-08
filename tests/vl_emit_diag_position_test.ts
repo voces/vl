@@ -212,15 +212,9 @@ Deno.test({
           );
         }
         const blk = errorBlock(r.out);
-        // The generic `use<T>` is bound to the held generic at its key, so the refusal is
-        // raised inside `use`'s own instance, at line 2 (D15555); still inside `lib.vl`.
-        const line = s.name === "imported, a generic instance" ? 2 : 7;
-        const where = line === 2
-          ? "the refused read in `use`'s instance"
-          : "the refused read in `take`";
-        if (!new RegExp(`at \\S*lib\\.vl:${line}:\\d+`).test(blk)) {
+        if (!/at \S*lib\.vl:7:\d+/.test(blk)) {
           throw new Error(
-            `${s.name}: want the anchor at lib.vl:${line} (${where}), got:\n${blk}`,
+            `${s.name}: want the anchor at lib.vl:7 (the refused read in \`take\`), got:\n${blk}`,
           );
         }
       } finally {
