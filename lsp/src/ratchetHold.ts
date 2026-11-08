@@ -73,6 +73,14 @@ export const RATCHET_CODES: ReadonlyMap<string, RatchetScope> = new Map([
     baseline: "scripts/comment-budget-baseline.json",
     trees: COMPILER_ONLY,
   }],
+  ["unused-container", {
+    baseline: "scripts/unused-budget-baseline.json",
+    trees: ["compiler/", "std/"],
+  }],
+  ["unused-field", {
+    baseline: "scripts/unused-budget-baseline.json",
+    trees: ["compiler/", "std/"],
+  }],
   ["dead-export", {
     baseline: "scripts/export-budget-baseline.json",
     trees: COMPILER_ONLY,
