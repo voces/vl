@@ -42,5 +42,5 @@ record, not a legitimate floor.
 | sweep, 23,679 programs, master fixpoint vs candidate | identical records: 0 `runs → not-runs`, 0 movers |
 | plumb-shape main | fuel −0.1%, peak RSS 319.3 MB (+0.4%) against the baseline |
 | plumb-shape tail | fuel −1.2%, peak RSS 319.0 MB (+0.4%) |
-| fixpoint seed | 6,531,136 bytes (+530 against master's fixpoint) |
+| fixpoint seed | 6,531,155 bytes (+549 against master's fixpoint) |
 | `vl_box_dst_shadow_test` | 42/42, with a new operand case under both controls |
