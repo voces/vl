@@ -8,6 +8,12 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step3-forwarded-fnd-pin](2026-11-08-step3-forwarded-fnd-pin.md): Step 3: a plain-pinned hole parameter handed a Fn#d takes the tagged-set pin (#6883).
+- [2026-11-08-step3-apply2-rep](2026-11-08-step3-apply2-rep.md): Step 3: why the binding switch emitted invalid wasm (#6881).
+- [2026-11-08-step3-binding-switch-ablation](2026-11-08-step3-binding-switch-ablation.md): Step 3: the per-call binding switch ablated (#6877).
+- [2026-11-08-step3-per-call-binding](2026-11-08-step3-per-call-binding.md): Step 3: the per-call Fn#d binding and genFnHole*'s 18 call sites (#6874).
+- [2026-11-08-mono-hole-binding-deleted](2026-11-08-mono-hole-binding-deleted.md): Step 2: monoHoleBinding deleted (#6879).
+- [2026-11-08-listed-generic-slot-write-generic-hand](2026-11-08-listed-generic-slot-write-generic-hand.md): Step 2: slot writes and a hand to a generic parameter run (#6875).
 - [2026-11-08-numeric-step5-last-records](2026-11-08-numeric-step5-last-records.md): Step 5's last 117 records; step 5 done apart from step 2's classes (#6872).
 - [2026-11-08-listed-generic-fn-set](2026-11-08-listed-generic-fn-set.md): Step 2: a generic function held in a list is a tagged singleton set (#6871).
 - [2026-11-08-step3-genfnhole-live](2026-11-08-step3-genfnhole-live.md): Step 3: the genFnHole* family is live and waits on the per-call Fn#d binding (#6870).
