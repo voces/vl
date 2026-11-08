@@ -8,6 +8,12 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-pin-step4-types](2026-11-08-pin-step4-types.md): Pin step 4: a type-level `monoAnnPinTy`; emit_mono.vl parses no pin spelling (#6762).
+- [2026-11-08-step7-classifier-batch2-r6](2026-11-08-step7-classifier-batch2-r6.md): Step 7 classifier batch 2: five onto typed readers; the disagreement mechanisms (#6760).
+- [2026-11-08-unionbox-record-leak-arguments](2026-11-08-unionbox-record-leak-arguments.md): The box record's batch leak (`lpExits`); the argument family on the table (#6759).
+- [2026-11-08-step6-parked-write-backs](2026-11-08-step6-parked-write-backs.md): Step 6: `synthNullHoleAnn` deleted, `synthNulListRetAnns` narrowed (#6758).
+- [2026-11-08-step7-missing-facts](2026-11-08-step7-missing-facts.md): Step 7: run #2's no-token and no-result classes, declined 49 → 25 (#6757).
+- [2026-11-08-guard-b-identity-test-deleted](2026-11-08-guard-b-identity-test-deleted.md): Guard (b)'s identity-only test deleted; class (c) runs (#6756).
 - [2026-11-08-per-frame-node-records](2026-11-08-per-frame-node-records.md): Node types recorded per instance frame where frames share a body (#6753).
 - [2026-11-08-step7-premono-collecta](2026-11-08-step7-premono-collecta.md): Step 7: the pre-mono collectA run deleted; pre-mono asks 154,489 → 18,995 (#6754).
 - [2026-11-08-identity-bake-unkeyed-deleted](2026-11-08-identity-bake-unkeyed-deleted.md): Identity typing: the last 2 decisions keyed, mono's unkeyed bake deleted (#6752).
