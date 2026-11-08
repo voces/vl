@@ -40,7 +40,10 @@ because neither body carries a token from `rep-classifier-census.vl`'s ARENA lis
 | tree | post-only | pre-only | both | probed |
 | --- | --- | --- | --- | --- |
 | master `3ede28b4` | 20 | 0 | 70 | 90 |
-| this PR | CENSUS_AFTER |
+| this PR | 21 | 0 | 66 | 87 |
+
+Three classifiers are deleted. `callResultIsLitAtom` becomes post-only: all four of its pre-mono
+calls came through `drwWalkIndex`'s struct row, which now reads the checked field type.
 
 **`readCellKind`'s code ladder (item 2) is parked.** Its 879 fallback calls have no storage type
 it can use. A type-variable row's field could be read at the instance from the receiver's type
@@ -48,5 +51,5 @@ it can use. A type-variable row's field could be read at the instance from the r
 own shadow. The `nulnone` hole rows would need the hole's record, and that is not recorded yet.
 
 **Proof.** Both seeds are fixpoints: base (master `3ede28b4`) 6,515,515 bytes, candidate
-6,514,987 (−528). Sweep over 23,650 programs: 23,650 same, 0 bytes-only, 0 output movers,
+6,514,987 (−528). `scripts/gate.sh` on the final tree: all gates pass. Sweep over 23,650 programs: 23,650 same, 0 bytes-only, 0 output movers,
 0 `runs → not-runs`, 0 new traps.
