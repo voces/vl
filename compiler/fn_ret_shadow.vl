@@ -50,6 +50,7 @@ import {
   TY_VOID,
   TyArray,
   TyFunc,
+  TyMap,
   TyNullable,
   TyObj,
   TyVar,
@@ -62,6 +63,7 @@ import {
   elabCheckedTyOf,
   elabDeliveredRowOf,
   elabKeyAtPos,
+  elabNestedResultOf,
   elabResultOf,
   elabSrcDecl,
   elabSubstClosed,
@@ -98,7 +100,9 @@ import {
   rlElemName,
 } from "./emit_state"
 import { i32ListHas } from "./listutil"
-import { identDeclOf } from "./symbols"
+import { elabTyClosed } from "./check_elab_cap"
+import { fnIndexOfInScopeAt } from "./emit_local_scope"
+import { identDeclOf, sidOfNode } from "./symbols"
 import { nonNullTy, tyHasTyVar } from "./tyquery"
 
 let frsArmed = false
@@ -169,16 +173,82 @@ export function fnRecordedRetTy(fe: i32): i32 {
       const vr = if r < T.tys.length && tyAt(r) is TyObj { frsValuesBuiltRow(fx) } else { -1 }
       const cr = if vr >= 0 { vr } else { frsCallsBuiltRow(fx, r) }
       if cr >= 0 { r = cr }
-      // A record or list with no row of its own is built only at its values' stamps (D14901
-      // class D).
-      if r < T.tys.length && repSigRetTokOfTy(r) == "" {
-        const sr = frsValuesStampRow(fx, r)
-        if sr >= 0 { r = sr }
+    }
+  }
+  // A record, list or map with no row of its own is built only at its values' stamps (D14901
+  // class D).
+  if r >= 0 && r < T.tys.length && repSigRetTokOfTy(r) == "" {
+    const sr = frsValuesStampRow(fx, r, frsIsPlainFn(fx))
+    if sr >= 0 { r = sr }
+  }
+  if r >= 0 { return frsClosedHoleRet(fx, r) }
+  const tr = frsTemplateRet(fe, nested, k)
+  if tr >= 0 { return tr }
+  // A function nested in an instance whose template leaves its result open takes the type the
+  // instance gives its values.
+  const nr = if nested && k >= 0 { elabNestedResultOf(fx, k) } else { -1 }
+  if nr >= 0 { return frsClosedHoleRet(fx, nr) }
+  const vr = frsValuesRet(fe)
+  if vr >= 0 { frsClosedHoleRet(fx, vr) } else { -1 }
+}
+
+let frsValuesDepth = 0
+
+// Where nothing elaborates function `fe`'s values: the one type they agree on, each a call of a
+// named function at the result recorded for the function it lowers to, else its own closed checker
+// type; a call of `fe` itself skipped, -1 where one is a write, open, or they disagree.
+function frsValuesRet(fe: i32): i32 {
+  const fn = nodeAt(fnStmts[fe])
+  if !(fn is FuncDecl) || fn.fnBody < 0 || frsValuesDepth >= 8 { return -1 }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  frsValuesDepth = frsValuesDepth + 1
+  let t = -1
+  let i = 0
+  while i < vals.length && t != -2 {
+    const vt = frsValueRet(unwrapParen(vals[i]), fe)
+    if vt != -3 {
+      t = if vt < 0 || (t >= 0 && !tySame(t, vt)) { -2 } else { vt }
+    }
+    i = i + 1
+  }
+  frsValuesDepth = frsValuesDepth - 1
+  if t >= 0 { t } else { -1 }
+}
+
+// `frsValuesRet`'s answer for one value `v` of function `fe`: -3 for a call of `fe` itself.
+function frsValueRet(v: i32, fe: i32): i32 {
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const n = nodeAt(v)
+  if n is BinExpr {
+    const op = n.binOp
+    if op.length >= 1 && op.slice(op.length - 1, op.length) == "=" {
+      if op != "==" && op != "!=" && op != "<=" && op != ">=" { return -1 }
+    }
+  }
+  if n is Call && n.callFn >= 0 {
+    const c = nodeAt(n.callFn)
+    if c is Ident {
+      const ce = fnIndexOfInScopeAt(
+        sidOfNode(n.callFn),
+        c.identName,
+        fe,
+        n.callFn,
+      )
+      if ce == fe { return -3 }
+      if ce >= 0 && ce < fnStmts.length {
+        const cr = fnRecordedRetTy(ce)
+        if cr >= 0 && cr < T.tys.length && elabTyClosed(cr, 0) { return cr }
+        return -1
       }
     }
   }
-  if r >= 0 { return frsClosedHoleRet(fx, r) }
-  frsTemplateRet(fe, nested, k)
+  const ct = elabCheckedTyOf(v)
+  if ct >= 0 && ct < T.tys.length && ct != TY_VOID && elabTyClosed(ct, 0) {
+    ct
+  } else {
+    -1
+  }
 }
 
 // The record every call of plain function `fx` is stamped at, when its result `r` is a record and
@@ -320,12 +390,12 @@ function frsValueBuiltAt(v: i32): i32 {
   nodeRepTyIxOf(v)
 }
 
-// The record or list every value function `fx` returns is stamped at, a literal at its own stamp
-// and a call-built value at its root call's, when they agree on one closed type of `r`'s shape
-// that has a row; else -1. The lowering builds such a value at that stamp (`criRowByStamp`).
-function frsValuesStampRow(fx: i32, r: i32): i32 {
-  const isObj = tyAt(r) is TyObj
-  if !isObj && !(tyAt(r) is TyArray) { return -1 }
+// The record, list or map every value function `fx` returns is stamped at, a literal at its own
+// stamp, a call-built value at its root call's and, where `reads` (a plain function's own nodes),
+// any other value at its own, when they agree on one closed type of `r`'s shape that has a row;
+// else -1. The lowering builds such a value at that stamp (`criRowByStamp`).
+function frsValuesStampRow(fx: i32, r: i32, reads: boolean): i32 {
+  if !frsSameShape(r, r) { return -1 }
   if fx < 0 || fx >= P.nodes.length { return -1 }
   const fn = nodeAt(fx)
   if !(fn is FuncDecl) || fn.fnBody < 0 { return -1 }
@@ -336,24 +406,28 @@ function frsValuesStampRow(fx: i32, r: i32): i32 {
   for v in vals {
     const root = retValueRootCall(v)
     const pv = unwrapParen(v)
-    if (
-      root < 0
-      && (pv < 0
-        || pv >= P.nodes.length
-        || !(nodeAt(pv) is ObjLit || nodeAt(pv) is ArrayLit))
-    ) {
+    if pv < 0 || pv >= P.nodes.length { return -1 }
+    if root < 0 && !reads && !(nodeAt(pv) is ObjLit || nodeAt(pv) is ArrayLit) {
       return -1
     }
     const st = nodeRepTyIxOf(if root >= 0 { root } else { pv })
     if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
-    if (if isObj { !(tyAt(st) is TyObj) } else { !(tyAt(st) is TyArray) }) {
-      return -1
-    }
+    if !frsSameShape(st, r) { return -1 }
     if repSigRetTokOfTy(st) == "" { return -1 }
     if row >= 0 && !tySame(row, st) { return -1 }
     row = st
   }
   row
+}
+
+// Whether types `a` and `b` are both records, both lists or both maps.
+function frsSameShape(a: i32, b: i32): boolean {
+  if a < 0 || a >= T.tys.length || b < 0 || b >= T.tys.length { return false }
+  const x = tyAt(a)
+  const y = tyAt(b)
+  x is TyObj && y is TyObj
+    || x is TyArray && y is TyArray
+    || x is TyMap && y is TyMap
 }
 
 // The call of a plain, non-generic function that call `c` is, or hands back through generic
@@ -853,9 +927,14 @@ function frsColsOfTy(fe: i32, r0: i32): string {
   if d.rdCovered == 0 { return "rep uncovered" }
   if repSigRetTokOfTy(r) == "" { return "recorded result has no token" }
   frcKind = if d.rdKind == "closure" { "i32" } else { d.rdKind }
-  // A variant row a delivery widened a function's own record to is not where it builds it.
+  // A variant row a delivery widened a function's own record to is not where it builds it: a
+  // call that takes the value as built makes it build its own record.
   if frsOwnRecordAtVariant(fe, frcKind) {
-    return "recorded variant, own result a record"
+    const own = frsFnRet(elabCheckedTyOf(fnStmts[fe]))
+    if own < 0 || tySame(own, r) {
+      return "recorded variant, own result a record"
+    }
+    return frsColsOfTy(fe, own)
   }
   // A closure result mono lowered as its bundle's record: the record of members a call returns,
   // or the bundle parameter the instance hands back.
