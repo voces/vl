@@ -54,8 +54,10 @@ replaces it.
 `emit_classify`. `emit_classify` therefore reads it through `fnRecordedRetTyFn`. `emitProgram`
 installs it beside `elabDeliveredRowClassFn`, and a read before that traps.
 
-**Proof.** Both seeds are fixpoints (two refreshes, byte-identical). Master `756faab3` is
-6,492,294 bytes and the candidate is 6,492,242 (−52). The sweep compared base with candidate
-over 23,613 programs: 23,613 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new
-traps. `emit_classify.vl` went from 15,949 to 15,906 lines (+32 / −75). Across the four files
-it is +37 / −83.
+**Proof.** Both seeds are fixpoints (two refreshes, byte-identical). On master `45817891`, base
+is 6,497,485 bytes and the merged candidate is 6,497,434 (−51). The sweep compared them over
+23,615 programs: 23,615 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new traps.
+`scripts/gate.sh` passes on the merged tree. The `letInfStrListByUseV` whole-arena loop is gone,
+so the arena-scan baseline falls 26 → 25. The emitter-state audit lists `fnRecordedRetTyFn`
+under INSTANCE. Before merging master, the pre-merge tree read 6,492,294 → 6,492,242 with
+23,613 programs the same. `emit_classify.vl` is 32 lines added and 75 deleted.
