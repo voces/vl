@@ -13341,12 +13341,17 @@ function emitArrRefElem(
 // The element row of ref-list slot `rslot` where element `e` is a record literal built at another
 // row of the same layout, as a literal holding a widened set's ids is; -1 to build it as it is.
 function arrRefElemTwinRow(e: i32, fnIx: i32, rslot: i32): i32 {
+  objLitTwinRow(e, fnIx, rlElemStructRow(rslot))
+}
+
+// Struct row `er` where `e` is a record literal built at another row of `er`'s layout; -1 to
+// build it as it is.
+function objLitTwinRow(e: i32, fnIx: i32, er: i32): i32 {
   const x = unwrapParen(e)
   if x < 0 || !(nodeAt(x) is ObjLit) || objLitBuildVariantRow(x, fnIx) >= 0 {
     return -1
   }
   const own = structIndexOfObjCtx(x, fnIx)
-  const er = rlElemStructRow(rslot)
   if own < 0 || er < 0 || own >= sHeapIdx.length || er >= sHeapIdx.length {
     return -1
   }
@@ -30828,7 +30833,12 @@ function emitReturnPlainValue(
       return -1
     }
   } else {
-    if emitExpr(body, retArg, fnIx) < 0 { return -1 }
+    const twin = if fnPos >= 0 && fRetKind[fnPos] == "struct" { objLitTwinRow(retArg, fnIx, fRetStructIdx[fnPos]) } else { -1 }
+    if twin >= 0 {
+      if emitObj(body, unwrapParen(retArg), fnIx, twin) < 0 { return -1 }
+    } else if emitExpr(body, retArg, fnIx) < 0 {
+      return -1
+    }
   }
   if retBoxToNulStr { emitBoxToNulStr() }
   // a return is a kind-9 use site that never grew the recover: a nullable-struct/variant
@@ -31555,6 +31565,23 @@ function emitUnionRetIfArm(body: u8[], blockIx: i32, fnIx: i32) {
   emitFail("emitProgram: union if-expression arm is not a block")
 }
 
+// The heap of the `ref.null` un-annotated function `fe`'s stored nullable result kind names: a
+// map's, the shared list's, a struct's or ref list's row, else a nullable scalar list's, or -1.
+function fRetNulHeapOf(fe: i32): i32 {
+  if fe < 0 || fe >= fRetKind.length || fe >= fRetStructIdx.length { return -1 }
+  const k = fRetKind[fe]
+  const si = fRetStructIdx[fe]
+  if k == "nulmap" { return mapTypeIdxOf(inferredRetMapSlot(fe)) }
+  if k == "nullist" { return lTypeIdx }
+  if k == "nulstruct" {
+    return if si >= 0 && si < sHeapIdx.length { sHeapIdx[si] } else { -1 }
+  }
+  if k == "nulreflist" {
+    return if si >= 0 && si < rlWrapIdx.length { rlWrapIdx[si] } else { -1 }
+  }
+  nulScalarListWrapHeap(k)
+}
+
 // Emit the `null` value of function `fnIx`'s nullable return rep, leaving it on the
 // stack as the function's result (the fall-through path's implicit `return null`). Each
 // arm mirrors the `NullLit` lowering for that rep; an unsupported rep fails loudly.
@@ -31651,11 +31678,12 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
     fbStructNew(uBoxIdx)
     return 0
   }
-  // An inferred nullable map: the `ref.null` of the map its result is minted at (D2498).
+  // An inferred nullable map, list or struct: the `ref.null` of the heap its stored kind and
+  // slot name (D2498, D1062, D1220).
   if r < 0 {
-    const mfe = fnStmtsPosOf(fnIx)
-    if mfe >= 0 && mfe < fRetKind.length && fRetKind[mfe] == "nulmap" {
-      fbRefNull(mapTypeIdxOf(inferredRetMapSlot(mfe)))
+    const nh = fRetNulHeapOf(fnStmtsPosOf(fnIx))
+    if nh >= 0 {
+      fbRefNull(nh)
       return 0
     }
   }

@@ -588,15 +588,22 @@ import {
   repShadowOn,
   repSigKindOfTy,
   repSigSlotTokOfKind,
+  repSigTokHasSlot,
   repSigTokOfKind,
   repVariantShapeRowOf,
   rlElemKindAt,
   sFieldElemTyIxAt,
+  structFieldCodesEq,
   tyIsNulScalarBox,
   tyMapKeyKind,
   unRowOfKey,
 } from "./emit_rep"
-import { repSigSlotTyOf, repSlotOfKind } from "./emit_rep_slot"
+import { valueTailLeaves } from "./check_num_adopt"
+import {
+  repSigRetTokOfTy,
+  repSigSlotTyOf,
+  repSlotOfKind,
+} from "./emit_rep_slot"
 import { nameFieldCodeTy } from "./emit_shape_intern"
 import {
   ALK_F64,
@@ -800,6 +807,7 @@ import {
   sFieldStart,
   sFieldStoreTy,
   sFieldTypes,
+  sHeapIdx,
   sIsRefRow,
   sLitIdRow,
   sLitMintFn,
@@ -932,6 +940,7 @@ import {
   tyHasTyVar,
   tyIsArray,
   tyIsF32ArrayTy,
+  tyIsFnArmUnion,
   tyIsU8ArrayTy,
   tyMapHeld,
   tyMapValOf,
@@ -939,6 +948,7 @@ import {
   tyNulLitUnionMemberTexts,
   tyPeelNul,
   tyStepElem,
+  tyStepRet,
 } from "./tyquery"
 
 // The interning key for lifted function `fe`'s env-leading `$fnsig`, or "" when the
@@ -1185,43 +1195,22 @@ export function cloRetValSlot(fe: i32): i32 {
 
 // The `>X` result suffix of `fe`'s extended `$fnsig` key — one token per distinct result
 // functype shape, so two functions share a sig exactly when their params and result
-// byte-match. "" for a kind outside the value ABI; the caller key-builds a void result as
-// `>v` before consulting this.
+// byte-match. A slot-free result is its type's token; a struct, variant, ref-list or map one is
+// keyed by the row its values are built at (`cloRetValSlot`). "" outside the value ABI.
 export function cloRetKeySuffix(fe: i32) {
   if clsCensusOn { clsCensusEnter("cloRetKeySuffix") }
   const k = cloRetValKind(fe)
-  // The slot-carrying result kinds: a struct or nullable-struct result keyed by its struct
-  // index, a concrete variant by its variant index, so two callbacks share a sig only when
-  // they return the same shape.
-  if k == "variant" { return ">" + repSigVariantTok(cloRetValSlot(fe)) }
-  if k == "nulvariant" {
-    const nrs = cloRetValSlot(fe)
-    if nrs < 0 { return "" }
-    return ">" + repSigNulVariantTok(nrs)
+  if !repSigTokHasSlot(k) {
+    if fe < 0 || fe >= fnStmts.length { return "" }
+    return repSigRetTokOfTy(cloRetResultTy(fe))
   }
-  if k == "struct" || k == "nulstruct" {
-    return ">" + repSigSlotTokOfKind(k, cloRetValSlot(fe))
-  }
-  // A map result carries its map shape slot, so two map-returning closures share a
-  // `$fnsig` exactly when their value types match and the result `(ref $mapStruct)` is the
-  // heap type the returned map and the closure's env field both carry.
-  if k == "map" || k == "nulmap" {
-    return ">" + repSigSlotTokOfKind(k, cloRetValSlot(fe))
-  }
-  // A ref-list result: the `$fnsig` result is the ref-list wrapper ref, recovered non-null
-  // at the value-call site like every other ref result — the dual of the `r<idx>;` param
-  // token. No resolved slot means no sig.
-  if k == "reflist" || k == "nulreflist" {
-    const rs = cloRetValSlot(fe)
-    if rs >= 0 { return ">" + repSigSlotTokOfKind(k, rs) }
+  const s = cloRetValSlot(fe)
+  if s < 0 && (k == "nulvariant" || k == "reflist" || k == "nulreflist") {
     return ""
   }
-  // Every slot-free kind reads the shared canonical token table in `emit_rep`, a closure
-  // result included, so a curried lambda lowers as a callable value. "" for a kind outside
-  // the value ABI, and for the void or unresolved result the caller key-builds as `>v`.
-  const t = repSigTokOfKind(k)
-  if t == "" { return "" }
-  ">" + t
+  if k == "variant" { return ">" + repSigVariantTok(s) }
+  if k == "nulvariant" { return ">" + repSigNulVariantTok(s) }
+  ">" + repSigSlotTokOfKind(k, s)
 }
 
 // The extended `$fnsig` key of lifted function `fe`: `fnSigKeyOf`'s key when the sig is
@@ -2401,6 +2390,8 @@ function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
   }
   // A function value whose own type's set is tagged is held as that set's id (D15039).
   if fnTagTyIsTagged(own) { return own }
+  // A returned record binding is held at its function's result (`retBoundRecRow`).
+  if retBoundRecRow(letIx, fnIx) >= 0 { return fRecRetTy[fnStmtsPosOf(fnIx)] }
   // The checker's record solve builds the binding at another record's storage.
   const rb = recBuildTyOf(letIx)
   if rb >= 0 { return rb }
@@ -4079,21 +4070,9 @@ export function exprIsStrConcat(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
     if e.binOp != "+" { return false }
-    const t = nodeTyInOf(binIx, fnIx)
-    if t >= 0 && t < T.tys.length && !tyHasTyVar(t) { return tyIsConcatStr(t) }
-    // A `+` minted after check has no type of its own: the checker's rule over its operands.
-    return concatOperandIsStr(e.binLeft, fnIx)
-      || concatOperandIsStr(e.binRight, fnIx)
+    return tyIsConcatStr(nodeTyInOf(binIx, fnIx))
   }
   false
-}
-
-// Whether operand `ix` of a `+` is a string in `fnIx`; an untyped `+` asks its own operands.
-function concatOperandIsStr(ix: i32, fnIx: i32): boolean {
-  const t = nodeTyInOf(ix, fnIx)
-  if t >= 0 && t < T.tys.length && !tyHasTyVar(t) { return tyIsConcatStr(t) }
-  if nodeAt(ix) is BinExpr { return exprIsStrConcat(ix, fnIx) }
-  tyIsConcatStr(t)
 }
 
 // Whether type `t` is a string a `+` concatenates: `string`, a string literal, or a union of them.
@@ -12019,7 +11998,7 @@ function refListElemNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
     if nrt >= 0 { return rlMintNameOfTy(nrt) }
     const ms = mfResultSlotOf(exprIx, fnIx)
     if ms >= 0 && ms < rlElemName.length { return rlElemName[ms] }
-    const mrn = mfStructResultRowName(exprIx, fnIx)
+    const mrn = mfRecordElemRowName(exprIx, fnIx)
     if mrn != "" { return mrn }
     // A list-returning `.map` named before `collectMapFilterUse` interns its row.
     const mln = mfListResultElemName(exprIx, fnIx)
@@ -12081,7 +12060,7 @@ function refListKeptSlotOfCall(e: Call, exprIx: i32, fnIx: i32): i32 {
     if mfNulRecMapElemTy(exprIx, fnIx) >= 0 { return -2 }
     const ms = mfResultSlotOf(exprIx, fnIx)
     if ms >= 0 && ms < rlElemName.length { return ms }
-    if mfStructResultRowName(exprIx, fnIx) != "" { return -2 }
+    if mfRecordElemRowName(exprIx, fnIx) != "" { return -2 }
     if mfListResultElemName(exprIx, fnIx) != "" { return -2 }
   }
   const mk2 = cloCallSigKey(exprIx, fnIx)
@@ -12571,6 +12550,8 @@ function letTailRowSlot(letIx: i32, fnIx: i32): i32 {
 // literal's own record would reach it unconverted (D2933). Memoised per literal in `rsRecRow`.
 export function objLitBindDestRow(objIx: i32, own: i32): i32 {
   if own < 0 || objIx < 0 || !emitPhaseReached("arenaFinal") { return -1 }
+  const rb = retBoundRecRowOfLit(objIx)
+  if rb >= 0 { return rb }
   if rsRecVer != sNames.length {
     rsRecRowClear()
     rsRecVer = sNames.length
@@ -12626,6 +12607,78 @@ export function recBuildRowOf(objIx: i32): i32 {
   const t = recBuildTyOf(li)
   if t < 0 { return -1 }
   structIdxOfElemTy(t)
+}
+
+// The result row of un-annotated function `fnIx` where it returns the `const` binding `letIx` of a
+// record literal built at a sibling row with the same field codes, so the binding is held, and
+// its literal built, at the result; -1 otherwise.
+export function retBoundRecRow(letIx: i32, fnIx: i32): i32 {
+  const d = if letIx >= 0 && letIx < P.nodes.length { nodeAt(letIx) } else { null }
+  if !(d is LetDecl) || d.letKw != "const" || d.letType >= 0 || d.letInit < 0 {
+    return -1
+  }
+  const init = unwrapParen(d.letInit)
+  const fn = if fnIx >= 0 && fnIx < P.nodes.length { nodeAt(fnIx) } else { null }
+  if (
+    init < 0
+    || !(nodeAt(init) is ObjLit)
+    || !(fn is FuncDecl)
+    || fn.fnRet >= 0
+  ) {
+    return -1
+  }
+  const pos = fnStmtsPosOf(fnIx)
+  if (
+    pos < 0
+    || pos >= fRetKind.length
+    || pos >= fRecRetTy.length
+    || fRetKind[pos] != "struct"
+  ) {
+    return -1
+  }
+  const r = fRetStructIdx[pos]
+  if r < 0 || r >= sHeapIdx.length || fRecRetTy[pos] < 0 { return -1 }
+  const own = structIndexOfObjCtxMemo(init, fnIx)
+  if own < 0 || own >= sHeapIdx.length || sHeapIdx[own] == sHeapIdx[r] {
+    return -1
+  }
+  if (
+    structFieldCodesEq(own, r) != 1
+    || fnReturnedLetOfInit(fn, fnIx, init) != letIx
+  ) {
+    return -1
+  }
+  r
+}
+
+// The binding a value function `fn` (at `fnIx`) returns, or a leaf of a returned value join
+// reads, whose initializer is `init`; -1 when none is.
+function fnReturnedLetOfInit(fn: FuncDecl, fnIx: i32, init: i32): i32 {
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  for v in vals {
+    for t in valueTailLeaves(v) {
+      const x = unwrapParen(t)
+      const li = if x >= 0 && nodeAt(x) is Ident { identLetOfRead(x, fnIx) } else { -1 }
+      const ln = if li >= 0 { nodeAt(li) } else { null }
+      if ln is LetDecl && ln.letInit >= 0 && unwrapParen(ln.letInit) == init {
+        return li
+      }
+    }
+  }
+  -1
+}
+
+// `retBoundRecRow` of the binding whose initializer is the record literal `objIx`, in the
+// function being lowered.
+function retBoundRecRowOfLit(objIx: i32): i32 {
+  const fn = if emitCurFnIx >= 0 { nodeAt(emitCurFnIx) } else { null }
+  if !(fn is FuncDecl) || fn.fnRet >= 0 || emitCurFnPos < 0 { return -1 }
+  if emitCurFnPos >= fRetKind.length || fRetKind[emitCurFnPos] != "struct" {
+    return -1
+  }
+  const li = fnReturnedLetOfInit(fn, emitCurFnIx, objIx)
+  if li < 0 { -1 } else { retBoundRecRow(li, emitCurFnIx) }
 }
 
 function rsRecRowPut(objIx: i32, r: i32) {
@@ -14741,6 +14794,10 @@ export function fnReturnsClosure(t: i32) {
       const rt = nodeTyIxOf(fn.fnRet)
       if rt >= 0 && !tyHasTyVar(rt) { return false }
     }
+    // Nor is an inferred union with a function arm, which lowers as its annotated spelling (D4349).
+    if fn.fnRet < 0 && tyIsFnArmUnion(tyStepRet(nodeTyIxOf(fnStmts[t]))) {
+      return false
+    }
     return blockTailIsClosure(fn.fnBody, fnStmts[t])
   }
   false
@@ -15080,34 +15137,15 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32): i32 {
   rlSlotOfTyOrTwin(tyArrayElemIx(nodeTyInOf(callIx, fnIx)))
 }
 
-// The element name of a struct- or variant-returning `.map`'s result row, or "". `collectMapFilterUse`
-// interns that row after return inference, which still has to name it in the result valtype.
-function mfStructResultRowName(callIx: i32, fnIx: i32): string {
-  if clsCensusOn { clsCensusEnter("mfStructResultRowName") }
-  const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return "" }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      if callee.memProp != "map" || c.callArgs.length != 1 { return "" }
-      const fe = mfCallbackFe(c.callArgs[0], fnIx)
-      if fe < 0 {
-        const ck = mfCallbackCloKey(c.callArgs[0], fnIx)
-        if ck != "" && sigKeyRetKind(ck) == "struct" {
-          const csi = sigKeyRetSlot(ck)
-          if csi >= 0 && csi < sNames.length { return sNames[csi] }
-        }
-        return ""
-      }
-      const si = cloRetValSlot(fe)
-      if fnRetIsRecordRow(fe) && si >= 0 && si < sNames.length {
-        return sNames[si]
-      }
-      if cloRetValKind(fe) == "variant" && si >= 0 && si < uVariants.length {
-        return uVariants[si]
-      }
-    }
-  }
+// The element name of a struct- or variant-returning `.map`'s result row, read off the call's
+// element type, or "". `collectMapFilterUse` interns that row after return inference, which
+// still has to name it in the result valtype.
+function mfRecordElemRowName(callIx: i32, fnIx: i32): string {
+  const et = tyArrayElemIx(nodeTyInOf(callIx, fnIx))
+  const si = structRowOfRecordTy(et)
+  if si >= 0 && si < sNames.length { return sNames[si] }
+  const vi = variantIndexOf(structNameOfTy(et))
+  if vi >= 0 && vi < uVariants.length { return uVariants[vi] }
   ""
 }
 

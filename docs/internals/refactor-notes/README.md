@@ -8,6 +8,13 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step7-cloret-remnants](2026-11-08-step7-cloret-remnants.md): Step 7: mfStructResultRowName deleted; cloRetKeySuffix's ladder gone (#6844).
+- [2026-11-08-mono-binary-mint-types](2026-11-08-mono-binary-mint-types.md): Step 7: the monomorphizer's re-made `+` carries its type (#6839).
+- [2026-11-08-step6-nul-list-ret-pin-deleted](2026-11-08-step6-nul-list-ret-pin-deleted.md): Step 6 done: synthNulListRetAnns and inferRetRung deleted (#6837).
+- [2026-11-08-step7-classifier-r16](2026-11-08-step7-classifier-r16.md): Step 7 classifier round 16: structIndexOfExpr has no pre-mono caller (#6838).
+- [2026-11-08-call-key-sole-hole-instance](2026-11-08-call-key-sole-hole-instance.md): Step 2: a hole function instanced once is keyed at its value reads, spelled 393 → 253 (#6841).
+- [2026-11-08-numeric-operand-records](2026-11-08-numeric-operand-records.md): Step 5: an operator's operands carry a numeric record (#6840).
+- [2026-11-08-step7-mono-asker-mapshape](2026-11-08-step7-mono-asker-mapshape.md): Step 7 classifier round 15: mono's record-row asker and letCellSlot's map shape typed (#6835).
 - [2026-11-08-step7-instance-recheck-classifiers](2026-11-08-step7-instance-recheck-classifiers.md): Step 7: exprIsStrConcat and forInElemKind read the instance's typed facts (#6833).
 - [2026-11-08-call-key-maker-twin-solved-hole](2026-11-08-call-key-maker-twin-solved-hole.md): Step 2: maker wide twins and solved-hole direct calls keyed, spelled 527 → 393 (#6832).
 - [2026-11-08-step7-fnret-recorded-row](2026-11-08-step7-fnret-recorded-row.md): Step 7: the inferred list result reads its recorded row; rlSlotByNameTwin deleted (#6830).
