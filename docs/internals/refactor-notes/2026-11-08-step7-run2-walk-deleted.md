@@ -1,6 +1,6 @@
 # Step 7: run #2's return walk deleted
 
-Measured 2026-11-08 on master `9d7215a3` (fixpoint 6,512,612 bytes), 4-core box, with
+Measured 2026-11-08 on master `67f200b7` (fixpoint 6,512,594 bytes), 4-core box, with
 `scripts/col-shadow/run.sh` (19,371 files, 13,538 graded) and the sweep over 23,649 programs.
 
 ## What the walk still decided, and who was right
@@ -36,7 +36,7 @@ row check, the non-null settle, the ref-list row join and the literal-atom flag.
 | check | result |
 |---|---|
 | fixpoint | two `refresh-compiler.sh` runs byte-identical |
-| seed size | 6,512,612 → 6,497,368 (−15,244, −0.23%), both fixpoints on `9d7215a3` |
+| seed size | 6,512,594 → 6,497,368 (−15,226, −0.23%), both fixpoints on `67f200b7` |
 | L2 self-compile guest fuel | 76,056,556,211 → 76,080,740,303 (+0.03%) |
 | `scripts/gate.sh` | all 23 rows pass on the final merged tree |
 | `scripts/sweep.vl` diff, 23,649 cells | 23,649 same: 0 bytes-only movers, 0 output movers |
