@@ -44,7 +44,19 @@ non-null Set. Both codes build the same layout, so no program prints differently
 `letCellSlot`'s nulmap arm now reads `letMapShapeOfTy`. `nulMapShapeOf` keeps its two
 `mapShapeOfExpr` callers.
 
+**Census** (`classifier-census.vl --callers`, 75 probed):
+
+| tree | post-only | pre-only | both | uncalled | `structIndexOfExpr` pre-mono |
+| --- | --- | --- | --- | --- | --- |
+| master `098a4c3c` | 34 | 0 | 41 | 0 | 24 |
+| this PR, same base | 35 | 0 | 40 | 0 | 0 |
+
+`memberUnionFieldName` (10) and `memberIsClosure` (7) stay "both". Mono still asks them, through
+`memberUnionFieldNameRead` and `exprIsClosure`, but before mono their row rung now reads the
+checked type.
+
 **Proof.** Both sides are fixpoint seeds: base `098a4c3c` is 6,531,632 bytes, this PR 6,531,678
 (+46). The sweep over 23,679 programs: 23,677 same, 2 bytes-only (D93 and
 `nested-arm-valued-map-beside-layout-twin.vl`, the two slot numberings above), 0 output movers,
-0 `runs → not-runs`, 0 new traps.
+0 `runs → not-runs`, 0 new traps. Merged with master `2fce5a50`, it is 6,535,999 bytes, also a
+fixpoint.
