@@ -965,7 +965,6 @@ import {
   isValueUnionName,
   isValueUnionTyOr,
   nameIsLitUnionArmValueUnion,
-  nulNumLitUnionBaseName,
   nulNumScalarUnionName,
   nulNumScalarUnionRowTy,
   oneListUnionAliasName,
@@ -1291,23 +1290,6 @@ function synthAnnOfTy(ty: i32, recTy: i32): i32 {
   const nm = tyToEmitName(ty)
   if nm == "" { return -1 }
   synthTypeRefTy(nm, -1, recTy)
-}
-
-// Synthesize the annotation of a `let x = null` whose hole a later write filled, from the type
-// the checker filled it with, so the binding takes its annotated twin's `T | null` cell (D2597).
-// Before the union registration reads `letType`, which then mints a box the type needs.
-export function synthNullHoleAnn(letIx: i32) {
-  const s = nodeAt(letIx)
-  if s is LetDecl {
-    if s.letType >= 0 || s.letInit < 0 { return 0 }
-    if !(nodeAt(unwrapParen(s.letInit)) is NullLit) { return 0 }
-    const hty = letNullHoleFilledTy(letIx)
-    if hty < 0 { return 0 }
-    let synTyIx = hty
-    if nulNumLitUnionBaseName(hty) != "" { synTyIx = -1 }
-    s.letType = synthAnnOfTy(hty, synTyIx)
-  }
-  0
 }
 
 // The value type at the bottom of a chain of map types — `Circle` for both `{[string]: Circle}`
@@ -6551,7 +6533,7 @@ function collectAArmFieldNeeds(ufi: i32) {
 
 // Scan the arena for every use of a collection heap type, setting the presence flags and
 // minting the ref-list, map-value and annotation-node rows keyed against them; an unclaimed
-// array annotation fails loudly. Runs over the whole arena each time. Returns 0, or -1.
+// array annotation fails loudly. Runs once, after monomorphization. Returns 0, or -1.
 export function collectA(_stmts: i32[]) {
   collectTyParamNames()
   // The read-only-covariance write memo is keyed by slot number, which a re-mint and a
@@ -6624,9 +6606,7 @@ export function collectA(_stmts: i32[]) {
             cf.identName == "__array_new__"
             || cf.identName == "__array_new_default__"
           ) {
-            if !emitPhaseReached("monomorphized") || !arrNewCallInFn(i) {
-              collectArrNewIntr(i, -1)
-            }
+            if !arrNewCallInFn(i) { collectArrNewIntr(i, -1) }
           }
         }
       }
@@ -7304,6 +7284,7 @@ function anonHolderAwaitsElemRow(
     if f is FieldInit {
       const v = unwrapParen(f.fiValue)
       if anonEmptyRecordListLit(v, unminted) { return true }
+      if anonRecordValuedMap(v, unminted) { return true }
       if anonHolderAwaitsElemRow(v, depth + 1, unminted) { return true }
     }
   }
@@ -7323,6 +7304,17 @@ function anonEmptyRecordListLit(ix: i32, unminted: boolean): boolean {
     return repRowOfTyStruct(tyRefArrElemOf(nodeTyIxOf(ix)), sScanLim()) < 0
   }
   false
+}
+
+// Whether node `ix` is a map whose value is a record type, the map twin of
+// `anonEmptyRecordListLit`: a later store can be the first literal of that record, so its row
+// may not exist yet. With `unminted`, one no struct row holds yet.
+function anonRecordValuedMap(ix: i32, unminted: boolean): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const mv = tyMapValOf(nonNullTy(nodeTyIxOf(ix)))
+  if mv < 0 || mv >= T.tys.length || !(tyAt(mv) is TyObj) { return false }
+  if !unminted { return true }
+  repRowOfTyStruct(mv, sScanLim()) < 0
 }
 
 // Whether list type `ty` has a record element.
@@ -8854,12 +8846,12 @@ function registerRefArrayArmUnions(
 // time and registered per `LetDecl` so every later classifier sees the union.
 
 // Infer + register the null hole of the un-annotated `let x = null` at `walk[i]`, scanning the
-// rest of `walk` for the filling assignment. `synthNullHoleAnn` has already annotated every let
-// whose hole the checker filled, so this runs with no type to hand over (A/B site 66, no-ty).
+// rest of `walk` for the filling assignment. A hole the checker filled holds its type instead,
+// so this runs only where there is no type to hand over (A/B site 66, no-ty).
 function nliInferLet(walk: i32[], i: i32) {
   const s = nodeAt(walk[i])
   if s is LetDecl {
-    if s.letType < 0 && s.letInit >= 0 {
+    if s.letType < 0 && s.letInit >= 0 && letNullHoleFilledTy(walk[i]) < 0 {
       const ini = nodeAt(s.letInit)
       if ini is NullLit {
         const atom = nliScanStmts(walk, i + 1, s.letName)
@@ -9464,10 +9456,14 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       }
       if collectInlineUnionsBlock(stmts, fnBody) < 0 { return -1 }
     } else if s is LetDecl {
-      synthNullHoleAnn(walk[i])
       const letTy = s.letType
       if collectTyReachRegister(stmts, nodeTyIxOf(letTy), 16, false) < 0 {
         return -1
+      }
+      // A `let x = null` whose hole a later write filled holds the checker's `T | null`.
+      if letTy < 0 {
+        const hty = letNullHoleFilledTy(walk[i])
+        if collectTyReachRegister(stmts, hty, 16, false) < 0 { return -1 }
       }
       annAdoptRegisteredName(letTy)
       // An unannotated binding still has a type that can be a union (`const v = m["k"]` infers

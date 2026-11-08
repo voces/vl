@@ -1049,6 +1049,7 @@ import {
   letNulMapReadUnionBox,
   letNulScalarBoxName,
   letUnionNameOf,
+  listElemRepIsRow,
   listIsRecvTyOf,
   litArmRowOf,
   localIndexOf,
@@ -1086,7 +1087,6 @@ import {
   readOfOpenBinding,
   readOwesNonNullRecover,
   recBuildRowOf,
-  refListElemIsRow,
   refListElemIsUnion,
   refListSlotOfExpr,
   rlUnionNameOfTy,
@@ -8042,9 +8042,7 @@ function emitUnionBoxAtRecord(
   valIx: i32,
   fnIx: i32,
 ) {
-  const recTy = boxRecordTyAt(valIx, fnIx)
-  const recNm = boxRecordNameOf(recTy)
-  if recNm != "" { return emitUnionBoxArg(body, recNm, recTy, valIx, fnIx) }
+  if boxOwedAt(valIx, fnIx) { return emitDelivered(body, valIx, fnIx) }
   // A value already of its destination's union is no coercion, so the checker records none: it is
   // delivered as its own union, and `boxRetagNeeded` decides any retag from that.
   if exprUnion(valIx, fnIx) {
@@ -8059,11 +8057,7 @@ function emitUnionBoxAtRecord(
 // Whether `valIx` is boxed into a union at its delivery: its record is stored as a box and reaches
 // a registry row, or it is already a box of its own union (`emitUnionBoxAtRecord`'s rungs).
 function boxOwedAtRecord(valIx: i32, fnIx: i32): boolean {
-  const r = boxRecordTyAt(valIx, fnIx)
-  // A literal set or a nullable niche is no box, whatever row its union keys.
-  if r >= 0 && repOfTy(r).rdKind == "union" && boxRecordNameOf(r) != "" {
-    return true
-  }
+  if boxOwedAt(valIx, fnIx) { return true }
   // An already-boxed value is delivered as its own union only where no other coercion is
   // recorded at it: a union of maps read as its one map unboxes (`mapUnbox`).
   exprUnion(valIx, fnIx)
@@ -26999,7 +26993,7 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
     st.aTy = rlBackIdx[rslot]
     st.mfKind = "ref"
     st.slot = rslot
-    if refListElemIsRow(arrIx, fnIx) {
+    if listElemRepIsRow(arrIx, fnIx) {
       st.structIdx = rlElemStructRow(rslot)
       // ...and where that declines, the element is an ARM, at `variantHeap(vi)`.
       if st.structIdx < 0 {
@@ -29529,18 +29523,21 @@ function listCopyAtNode(ix: i32): i32 {
 
 // The coercion a delivery's checker record owes at its node: a list copy into another
 // element's list, a tagged one-member set's closure at a declared function type, a union of maps
-// read as its one map, a union box retagged for a union lacking a member, or a record copied
-// into another row.
+// read as its one map, a union box retagged for a union lacking a member, a record copied
+// into another row, or a value boxed into the union the checker records it delivered into.
 type CoerceKind = "none"
   | "listCopy"
   | "fnClo"
   | "mapUnbox"
   | "mapRetag"
   | "recCopy"
+  | "box"
 
-// The coercion recorded at `ix` in instance `fnIx`. Each record is of one value type (a list, a
-// function, a union box, a record), so at most one holds; a union of maps is read before retagged.
+// The coercion recorded at `ix` in instance `fnIx`. A box is the outer one: any other record
+// at the node converts the value inside it. Otherwise each record is of one value type (a list,
+// a function, a union box, a record), so at most one holds; a union of maps is read first.
 function coerceKindAt(ix: i32, fnIx: i32): CoerceKind {
+  if boxAtTable(ix, fnIx) { return "box" }
   if listCopyAtNode(ix) >= 0 { return "listCopy" }
   if fnCloCoerceAtNode(ix) >= 0 { return "fnClo" }
   if mapDeliveryRecorded {
@@ -29554,10 +29551,45 @@ function coerceKindAt(ix: i32, fnIx: i32): CoerceKind {
 // The node `emitCoerced` is emitting before its conversion, or -1.
 let coerceHeld = -1
 
+// The node a delivery position hands the table (`emitDelivered`), or -1. A box is owed only
+// there: a node beneath it, or one a position emits for its own lowering, is emitted as built.
+let boxSeat = -1
+
+// The value of `ix` delivered at its position: the table converts it by its records, a box
+// included (`boxOwedAt`). Returns 0, or -1 failed.
+function emitDelivered(body: u8[], ix: i32, fnIx: i32): i32 {
+  const seat = boxSeat
+  boxSeat = ix
+  const r = emitExpr(body, ix, fnIx)
+  boxSeat = seat
+  r
+}
+
+// Whether the table boxes `ix`: it is the delivery seat and its record owes a box.
+function boxAtTable(ix: i32, fnIx: i32): boolean {
+  boxSeat >= 0 && ix == boxSeat && boxOwedAt(ix, fnIx)
+}
+
+// Whether the checker records `ix` delivered into a union box a registry row names.
+function boxOwedAt(ix: i32, fnIx: i32): boolean {
+  // A literal set or a nullable niche is no box, whatever row its union keys.
+  const r = boxRecordTyAt(ix, fnIx)
+  r >= 0 && repOfTy(r).rdKind == "union" && boxRecordNameOf(r) != ""
+}
+
 // `emitExpr` for a value whose delivery the checker recorded a coercion of kind `ck` at: the
 // value as built, then the one conversion for its kind. Every delivery position lowers it
 // here. Returns 0, or -1 failed.
 function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
+  if ck == "box" {
+    // The seat is spent, so the value inside the box, and any conversion recorded beside it, runs.
+    const bt = boxRecordTyAt(exprIx, fnIx)
+    const seat = boxSeat
+    boxSeat = -1
+    const rb = emitUnionBoxArg(body, boxRecordNameOf(bt), bt, exprIx, fnIx)
+    boxSeat = seat
+    return rb
+  }
   let fe = -1
   if ck == "fnClo" {
     fe = monoCloCoerceFe.get(exprIx) ?? -1
@@ -34995,6 +35027,7 @@ function initBitOf(gi: i32): i32 {
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
   coerceHeld = -1
+  boxSeat = -1
   arrNewFillDepth = 0
   eqStashL = -1
   eqStashR = -1
@@ -38178,10 +38211,12 @@ function emitDirectArgValue(
     // with a null permitted and a widened member string non-null. A `null` argument is not a
     // lit atom and lowers below at its delivery's type.
     if emitAtomToStr(body, arg, fnIx) < 0 { return -1 }
-  } else if cUNm != "" {
-    // `cUNm` is set only for a kind-4 union-BOX param (see above), so a concrete
-    // variant ARGUMENT (`area(s)` where `s: S`, param `C | S`) is boxed here.
+  } else if cUNm != "" && !boxOwedAt(arg, fnIx) {
+    // `cUNm` is set only for a kind-4 union-BOX param (see above). The floor: an argument with
+    // no usable record (one still naming an open type parameter) boxes at the parameter's union.
     if emitUnionBoxArg(body, cUNm, sd.cUTy, arg, fnIx) < 0 { return -1 }
+  } else if cUNm != "" {
+    if emitDelivered(body, arg, fnIx) < 0 { return -1 }
   } else {
     const argBoxToNulStr = cParamNulString && boxIsNulStrUnion(arg, fnIx)
     if emitExpr(body, arg, fnIx) < 0 { return -1 }
@@ -38424,7 +38459,11 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
         if nodeTyIsNulLitUnion(cpn.parType) { cpLit = true }
       }
     }
-    if cuNm != "" {
+    if cuNm != "" && boxOwedAt(cargs[cai], fnIx) {
+      // The table boxes an argument whose union the checker records; the floor, below, boxes
+      // one with no usable record at the parameter's union.
+      if emitDelivered(body, cargs[cai], fnIx) < 0 { return -1 }
+    } else if cuNm != "" {
       if emitUnionBoxArg(body, cuNm, cuTy, cargs[cai], fnIx) < 0 { return -1 }
     } else if cpKind == "i64" {
       if emitExprAsI64(body, cargs[cai], fnIx) < 0 { return -1 }

@@ -98,6 +98,8 @@ import {
   nodeTyArrayElemIsNullable,
   nodeTyCarry,
   nodeTyFrozenOf,
+  nodeTyInstEnter,
+  nodeTyInstFrameNote,
   nodeTyIsFunc,
   nodeTyIsNulFunc,
   nodeTyIsNullType,
@@ -105,11 +107,13 @@ import {
   nodeTyIsNullableStruct,
   nodeTyIsStringPrim,
   nodeTyIsUnionish,
+  nodeTyIxIn,
   nodeTyIxOf,
   nodeTyMapName,
   nodeTyName,
   nodeTyNestedElemIsBoolPrim,
   nodeTyRecord,
+  nodeTyRecordIn,
   tyIsUnionish,
 } from "./check_node_tys"
 import { nodePos, trimWs } from "./fmt_util"
@@ -154,7 +158,6 @@ import {
   bindGenWalk,
   bindGenWalkFull,
   holeFnArgRetAtParams,
-  nameToTy,
   substTyDeep,
   substTyDeepOf,
   tyProvesNonNull,
@@ -429,8 +432,10 @@ import {
 } from "./emit_base"
 import { callBindShadowNote } from "./call_bind_shadow"
 import {
+  monoAnnPinTy,
+  monoClosedPinOwnTy,
+  monoPinClosedOrNone,
   monoPinOwnClose,
-  monoPinOwnOfSpelled,
   monoPinOwnTvAtRep,
   monoPinRespell,
   monoPinSpellNote,
@@ -438,6 +443,7 @@ import {
 import {
   monoCalleeDeclOf,
   monoFrameInstTmpl,
+  monoFrameSharesBody,
   monoNameIsExported,
   monoParamBareTyParam,
   vrFrameOf,
@@ -1499,24 +1505,31 @@ function monoAnonArgSoftens(argIx: i32, ty: i32): boolean {
 // checker recorded for this node where that is one of the annotation's own members.
 // Separate from `monoArgTyName` because `wasmEmit`'s `monoStaticIsResult` also asks that
 // one and const-folds on it; narrowing there would fold a guard this pass cannot decide.
-function monoArgPinName(ix: i32, fnIx: i32) {
-  const w = monoArgTyName(ix, fnIx)
+function monoArgPinName(ix: i32, fnIx: i32, tyOut: i32[]) {
+  const w = monoArgTyName(ix, fnIx, tyOut)
   // A bare `null` typed by its destination (DV-402) pins the declared record's nullable name,
   // as a binding annotated with it does; its structural render would intern another row.
   if nodeAt(unwrapParen(ix)) is NullLit {
     const nn = nulRecNominalName(nodeTyIxOf(unwrapParen(ix)))
-    if nn != "" { return nn }
+    if nn != "" {
+      tyOut[0] = nodeTyIxOf(unwrapParen(ix))
+      return nn
+    }
   }
   // An argument the checker typed the `null` unit type pins it, the `nulnone` cell, whether a
   // bare `null` or a `null`-typed read; a `null[]` pins its own spelling, not the i32 list (D4687).
   if (
     nodeTyIsNullType(unwrapParen(ix))
     || monoReadsUnfilledNull(unwrapParen(ix))
+    || monoParamPinnedNull(unwrapParen(ix), fnIx)
   ) {
+    // An instance's own parameter pinned at `null`, handed on: the node still records `T` (D8280).
+    tyOut[0] = TY_NULL
     return "null"
   }
-  // An instance's own parameter pinned at `null`, handed on: the node still records `T` (D8280).
-  if monoParamPinnedNull(unwrapParen(ix), fnIx) { return "null" }
+  // The rungs below rename the ladder's answer, so the type it handed back is not theirs.
+  const wTy = tyOut[0]
+  tyOut[0] = -1
   if nodeArrayElemIsNullUnit(unwrapParen(ix)) { return "null[]" }
   const n = monoNarrowedPinName(unwrapParen(ix), fnIx, w)
   if n != "" { return n }
@@ -1527,6 +1540,7 @@ function monoArgPinName(ix: i32, fnIx: i32) {
   if nrl != "" { return nrl }
   const drl = monoDeclRecListPinName(unwrapParen(ix), w)
   if drl != "" { return drl }
+  tyOut[0] = wTy
   w
 }
 
@@ -1700,13 +1714,15 @@ function monoAnnPinNameOfTy(ty: i32): string {
 
 // The pin of a read of an un-annotated literal binding the record solve builds at another
 // record (`recBuildTyOf`): the instance is the one its storage is, else "".
-function monoBuildTyPin(cax: i32): string {
+function monoBuildTyPin(cax: i32, tyOut: i32[]): string {
   if cax < 0 || !(nodeAt(cax) is Ident) { return "" }
   const d = recFreshDeclOf(cax)
   if d < 0 { return "" }
   const bt = recBuildTyOf(d)
   if bt < 0 { return "" }
-  monoClosedTyPin(bt)
+  const p = monoClosedTyPin(bt)
+  if p != "" { tyOut[0] = bt }
+  p
 }
 
 // The pin of closed checker type `ty`, its alias and nominal identity kept: a litunion by
@@ -1782,7 +1798,7 @@ function monoHoleMapPinName(t: i32): string {
 // The rep rungs of `monoArgTyName`, after every binding and projection arm declined: the
 // argument's own recorded type, then the collection, union, record and scalar cascades.
 // `cax` is `ix` with its grouping parens peeled. "" is the loud floor.
-function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
+function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32, tyOut: i32[]): string {
   const lup = monoArgLitUnionPin(ix, fnIx)
   if lup != "" { return lup }
   // An empty list literal has no element for the collection arms to read; the body's pushes
@@ -1793,7 +1809,10 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
     if ealN.arrElems.length == 0 && !tyHasTyVar(nodeTyIxOf(cax)) {
       const ealTy = nodeTyIxOf(cax)
       const ealPin = monoAnnPinNameOfTy(ealTy)
-      if ealPin != "" { return ealPin }
+      if ealPin != "" {
+        tyOut[0] = ealTy
+        return ealPin
+      }
       if tyRefArrElemOf(ealTy) >= 0 { return "" }
     }
   }
@@ -1804,7 +1823,10 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   const mnArm = nodeMapArmNominalName(unwrapParen(ix), fnIx)
   if mnArm != "" { return mnArm }
   const hm = monoHoleMapPinName(nodeTyIxOf(unwrapParen(ix)))
-  if hm != "" { return hm }
+  if hm != "" {
+    tyOut[0] = elabHoleMapClosed(nodeTyIxOf(unwrapParen(ix)))
+    return hm
+  }
   const mn = nodeTyMapName(unwrapParen(ix))
   if mn != "" { return mn }
   // The string twin of the arm above, blind in the same place for the same reason:
@@ -1920,7 +1942,10 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
       const own = internOwnShapeOfTy(nodeTyIxOf(cax))
       if own != "" { return own }
     }
-    if si >= 0 { return sNames[si] }
+    if si >= 0 {
+      tyOut[0] = if si < sTyIx.length { sTyIx[si] } else { -1 }
+      return sNames[si]
+    }
     // No `sNames` row, but a good spelling — the checker's recorded shape, routed through
     // the one pin membership list, which claims a bare inline object shape (D703). The row
     // goes missing because `collectS` skips a `type X = {…}` that is a union member. At the
@@ -1948,7 +1973,10 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   const oe = if oo is TyArray && oo.aElem >= 0 && oo.aElem < T.tys.length { tyAt(oo.aElem) } else { null }
   const v = if oo is TyVar { oo.tvName } else if oe is TyVar { oe.tvName } else { "" }
   if v == "" { return "" }
-  monoPinAnnSpelling(elabUnboundTpTy(-1, fnIx, v))
+  const ut = elabUnboundTpTy(-1, fnIx, v)
+  const up = monoPinAnnSpelling(ut)
+  if up != "" { tyOut[0] = ut }
+  up
 }
 
 // Whether row `si` boxes, as a union or nullable, a field record type `ty` holds as a bare
@@ -2039,7 +2067,12 @@ function monoProjectedUnionRowPin(cax: i32, fnIx: i32): string {
 
 // The projection rungs of `monoArgTyName`: an indexed element and a record field, named
 // from the pin of what they project. Falls to `monoArgTyNameRep` where neither answers.
-function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
+function monoArgTyNameProjected(
+  ix: i32,
+  fnIx: i32,
+  cax: i32,
+  tyOut: i32[],
+): string {
   const argN = nodeAt(unwrapParen(ix))
   // An indexed element argument (`id(xs[0])`): the array's own name resolves above through
   // the annotation arms, and the element is that name minus one `[]`. The element goes
@@ -2053,11 +2086,15 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
     // atom's raw width. The element's own recorded type is exact, so it is left to the litunion
     // rungs below, which spell an alias and an inline set apart (D1756).
     if !tyIsLitUnion(nodeTyIxOf(unwrapParen(ix))) {
-      const arrTy = monoArgTyName(argN.idxArr, fnIx)
+      const arrOut: i32[] = [0 - 1]
+      const arrTy = monoArgTyName(argN.idxArr, fnIx, arrOut)
       const an = arrTy.length
       if an >= 3 && nameIsArray(arrTy) {
         const r = monoAnnPinName(listElemNameOf(arrTy))
-        if r != "" { return r }
+        if r != "" {
+          tyOut[0] = if arrOut[0] >= 0 { tyArrayElemIx(arrOut[0]) } else { -1 }
+          return r
+        }
       }
     }
   }
@@ -2066,7 +2103,7 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
   // nested-struct field is code 15, whose `sFieldElemName` is its target struct name).
   // `structIndexOfExpr(o.inner)` would default to i32, the locals table being unbuilt.
   if argN is Member {
-    const recvTy = monoArgTyName(argN.memObj, fnIx)
+    const recvTy = monoArgTyName(argN.memObj, fnIx, [0 - 1])
     let rsi = structIndexByName(recvTy)
     // A nullable receiver is read only where it is narrowed, so its record is the row of its
     // recorded type's non-null part, at the enclosing instance's pin when it names a parameter.
@@ -2093,21 +2130,30 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
         ) {
           return monoAnnPinName(fnm + "|null")
         }
-        if isSName(fnm) { return fnm }
+        if isSName(fnm) {
+          const fr = structIndexByName(fnm)
+          tyOut[0] = if fr >= 0 && fr < sTyIx.length { sTyIx[fr] } else { -1 }
+          return fnm
+        }
       }
     }
     // A union-valued field, whose companion column is a member set rather than a struct name.
     const fur = monoProjectedUnionRowPin(cax, fnIx)
     if fur != "" { return fur }
   }
-  monoArgTyNameRep(ix, fnIx, cax)
+  monoArgTyNameRep(ix, fnIx, cax, tyOut)
 }
 
 // The binding rungs of `monoArgTyName`: a build row's pin, then an `Ident` argument's local,
 // parameter or module binding. "" refuses; falls to
 // `monoArgTyNameProjected` where none answers.
-function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
-  const bp = monoBuildTyPin(cax)
+function monoArgTyNameBound(
+  ix: i32,
+  fnIx: i32,
+  cax: i32,
+  tyOut: i32[],
+): string {
+  const bp = monoBuildTyPin(cax, tyOut)
   if bp != "" { return bp }
   const argN = nodeAt(unwrapParen(ix))
   // An Ident argument bound to a generic-call result (`const inner = box(7); box(inner)`):
@@ -2129,15 +2175,24 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
               // among the spellings `monoAnnPinName` claims: the cascade below either
               // declines it or answers one dimension short.
               const r = monoAnnPinName(tyNameOf(ld.letType))
-              if r != "" { return r }
+              if r != "" {
+                tyOut[0] = monoPinClosedOrNone(
+                  monoPinSubTyOf(nodeTyIxOf(ld.letType), fnIx),
+                )
+                return r
+              }
             }
             if ld.letType < 0 && ld.letInit >= 0 {
               // A binding pins at the closed type its cell holds, the type its rep is read from; the
               // initializer answers only where that type names no pin (D14440).
               const lrp = monoClosedTyPin(letBindTy(li, fnIx))
-              if lrp != "" { return lrp }
-              const innerTy = monoArgTyName(ld.letInit, fnIx)
+              if lrp != "" {
+                tyOut[0] = letBindTy(li, fnIx)
+                return lrp
+              }
+              const innerTy = monoArgTyName(ld.letInit, fnIx, tyOut)
               if innerTy != "" && innerTy != "i32" { return innerTy }
+              tyOut[0] = -1
               // A refusal propagates: `""` here is one of this ladder's explicit
               // floors, and falling through hands the question back to a cascade that
               // is post-mono blind for a local and answers `"i32"`.
@@ -2156,7 +2211,12 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
           // `xs: i32[][]` / `boolean[]` / `P` parameter on to a second generic call, the
           // shape a generic forwarder has. One home, so the two cannot drift.
           const r = monoAnnPinName(pt.tyName)
-          if r != "" { return r }
+          if r != "" {
+            tyOut[0] = monoPinClosedOrNone(
+              monoPinSubTyOf(nodeTyIxOf(ptn), fnIx),
+            )
+            return r
+          }
         }
       }
     }
@@ -2173,25 +2233,32 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
           // call the annotated-local and param arms make, so a generic call pins its
           // instance identically wherever its argument's binding lives.
           const rg = monoAnnPinName(tyNameOf(gd.letType))
-          if rg != "" { return rg }
+          if rg != "" {
+            tyOut[0] = monoPinClosedOrNone(
+              monoPinSubTyOf(nodeTyIxOf(gd.letType), fnIx),
+            )
+            return rg
+          }
         }
         // The un-annotated global, the other half of the local arm's pair, whose type
         // only its initializer knows. The recursion is the local arm's verbatim,
         // including its two rules on an `"i32"` answer and on a `""` refusal.
         if gd.letType < 0 && gd.letInit >= 0 {
-          const ginner = monoArgTyName(gd.letInit, fnIx)
+          const ginner = monoArgTyName(gd.letInit, fnIx, tyOut)
           if ginner != "" && ginner != "i32" { return ginner }
+          tyOut[0] = -1
           if ginner == "" { return "" }
         }
       }
     }
   }
-  monoArgTyNameProjected(ix, fnIx, cax)
+  monoArgTyNameProjected(ix, fnIx, cax, tyOut)
 }
 
 // The pin argument `ix` binds its parameter at, at instance `fnIx`: its closed type's, else
 // the cascade's for a type that does not decide it.
-export function monoArgTyName(ix: i32, fnIx: i32) {
+export function monoArgTyName(ix: i32, fnIx: i32, tyOut: i32[]) {
+  tyOut[0] = -1
   const tr = monoArgClosedPinTy(ix, fnIx)
   const t = tr[0]
   const rec = tr[1] == 1
@@ -2207,9 +2274,12 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
       monoRegisterValueUnion(t)
     }
     const tp = if rec { monoRecordNominalPin(t) } else { monoPinOfClosedTy(t) }
-    if tp != "" { return tp }
+    if tp != "" {
+      tyOut[0] = monoClosedPinOwnTy(t, rec)
+      return tp
+    }
   }
-  monoArgTyNameCascade(ix, fnIx)
+  monoArgTyNameCascade(ix, fnIx, tyOut)
 }
 
 // `[type, record]`: the closed type argument `ix` is pinned from at instance `fnIx`, and 1 where it
@@ -2372,7 +2442,7 @@ function monoElemPlaceHeldTy(ix: i32, fnIx: i32): i32 {
 }
 
 // The binding, projection and rep rungs, for an argument whose type does not decide its pin.
-function monoArgTyNameCascade(ix: i32, fnIx: i32) {
+function monoArgTyNameCascade(ix: i32, fnIx: i32, tyOut: i32[]) {
   const cax = unwrapParen(ix)
   // An instance's own `x: T` parameter or `const y: T = x` local carries a function pin as its
   // annotation, which neither gate below can see: a generic forwarder hands it its inner call.
@@ -2413,8 +2483,8 @@ function monoArgTyNameCascade(ix: i32, fnIx: i32) {
   // local of that arm's own prelude pins at that local's initializer: mid-mono no locals
   // table exists, so no other channel resolves the arm's value (D2821).
   const armInit = monoArmTailLocalInit(cax)
-  if armInit >= 0 { return monoArgTyName(armInit, fnIx) }
-  monoArgTyNameBound(ix, fnIx, cax)
+  if armInit >= 0 { return monoArgTyName(armInit, fnIx, tyOut) }
+  monoArgTyNameBound(ix, fnIx, cax, tyOut)
 }
 
 // `aN`/`aT` then each binding of `hN`/`hT` whose name `aN` lacks, into `outN`/`outT`.
@@ -2567,7 +2637,7 @@ function monoSubstLetType(
             if !tyHasTyVar(s2) { sty = s2 }
           }
         }
-        const subC = monoPinMintedUnion(sub, sty, unTyKeyTagLet())
+        const subC = monoPinMintedUnion(sub, sty, sty, unTyKeyTagLet())
         // A union takes the type its registered spelling names, the one an assignment's
         // `letUnionNameOf` resolves against the registry, not the substitution's own row (D2676).
         const subAtoms: string[] = []
@@ -7871,11 +7941,16 @@ function monoNameIsGroupedList(name: string): boolean {
   e != "" && peelGroupParens(e) != e
 }
 
-// The spelling a parameter or local annotation of type `ty` takes when a pin substitutes into a
-// union holding a map or a record (`V | {[K]: i32}` at `V := {[K]: boolean}`), registered under
-// the canon key a direct spelling reuses (D2657). One that collapses at the pin is spelled as
-// its survivor (D7044). `shTag` names the shadow root.
-function monoPinMintedUnion(name: string, ty: i32, shTag: i32): string {
+// The spelling an annotation pinned at `ty` takes when a pin substitutes into a union holding a
+// map or a record (`V | {[K]: i32}` at `V := {[K]: boolean}`), registered under the canon key a
+// direct spelling reuses (D2657) and typed by `own`, the whole annotation (-1: `ty`). One that
+// collapses at the pin is spelled as its survivor (D7044). `shTag` names the shadow root.
+function monoPinMintedUnion(
+  name: string,
+  ty: i32,
+  own: i32,
+  shTag: i32,
+): string {
   const pun = parenUnionArrElemName(name)
   let pc = ""
   if pun != "" {
@@ -7890,9 +7965,9 @@ function monoPinMintedUnion(name: string, ty: i32, shTag: i32): string {
   // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
   if pun != "" {
     monoShStage(unTyKeyTagParamList(), tyStepElem(ty))
-    if monoRegisterPinUnion(pc, monoPinSpellTy(pc, tyStepElem(ty))) < 0 {
-      return name
-    }
+    // The registered type is the whole annotation's (`own`) at the rep its spelling collapses to.
+    const elemTy = if own >= 0 { monoAnnPinTy(tyStepElem(own)) } else { tyStepElem(ty) }
+    if monoRegisterPinUnion(pc, elemTy) < 0 { return name }
     return "(" + pc + ")[]"
   }
   const atoms: string[] = []
@@ -7900,16 +7975,13 @@ function monoPinMintedUnion(name: string, ty: i32, shTag: i32): string {
   if atoms.length < 2 { return name }
   const c = monoPinUnionName(name)
   monoShStage(shTag, ty)
-  if monoRegisterPinUnion(c, monoPinSpellTy(c, ty)) < 0 { return name }
+  if (
+    monoRegisterPinUnion(c, if own >= 0 { monoAnnPinTy(own) } else { ty })
+    < 0
+  ) {
+    return name
+  }
   c
-}
-
-// The arena type a pin's minted spelling `c` names: its parse, the type the annotation node
-// synthesized from `c` carries, else the pinned type `ty` when the spelling does not parse.
-function monoPinSpellTy(c: string, ty: i32): i32 {
-  const t = nameToTy(c)
-  if t >= 0 { return t }
-  ty
 }
 
 // Whether union spelling `name` names one atom once canon'd, as `T | string` does at `T := K`.
@@ -8480,6 +8552,7 @@ function monoMakeInstanceParams(
   pinned: string[],
   pinKinds: i32[],
   pinTys: i32[],
+  pinOwn: i32[],
   exBN: string[],
   exBT: i32[],
   annotateI32: boolean,
@@ -8518,6 +8591,7 @@ function monoMakeInstanceParams(
           const pinName = monoPinMintedUnion(
             pinned[pj],
             gateTy,
+            if pj < pinOwn.length { pinOwn[pj] } else { -1 },
             unTyKeyTagParam(),
           )
           nt = monoSynthPinRef(pinName, pinTys[pj])
@@ -9722,6 +9796,7 @@ function monoMakeInstanceGo(
       pinned,
       pinKinds,
       pinTys,
+      pinOwn,
       k.exBN,
       k.exBT,
       annotateI32,
@@ -12790,14 +12865,17 @@ function monoFlowAliasSrcElem(
 
 // The closed function types slot `path` of `d` is delivered at, as pin keys, leaving out the
 // calls whose callee read `monoFlowReadSet` points at a generic; empty when it points at none.
-function monoFlowSlotPins(d: i32, path: string[]): string[] {
+function monoFlowSlotPins(d: i32, path: string[], fts: i32[]): string[] {
   const out: string[] = []
   if mfrSetCalls.length == 0 { return out }
   for t in elabSlotDeliveriesOmitting(d, path, -1, mfrSetCalls) {
     const ft = tyAt(t)
     if ft is TyFunc {
       const sg = pinSigOf(ft.fnParamTypes)
-      if !strListHas(out, sg) { out.push(sg) }
+      if !strListHas(out, sg) {
+        out.push(sg)
+        fts.push(t)
+      }
     }
   }
   out
@@ -13780,7 +13858,8 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     if nr != 0 { return if nr < 0 { -1 } else { 0 } }
   }
   const path: string[] = ["e"]
-  const rawPins = monoDeclPathPins(lf, path)
+  let pinFts: i32[] = []
+  const rawPins = monoDeclPathKeys(lf, path, false, pinFts)
   let pins = rawPins
   let omit = false
   if pins.length > 1 {
@@ -13797,11 +13876,13 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     if i32ListHas(mfrSpreadDone, at) { return 0 }
     // Calls whose read the flow pass pointed at its generic go through no slot (D9595), and a
     // sliced list's copies reach its literal through the calls left (D10082).
-    const live = monoFlowSlotPins(at, path)
+    const liveFts: i32[] = []
+    const live = monoFlowSlotPins(at, path, liveFts)
     const sliced = live.length > 0 && i32ListHas(mfrSliced, at)
     if !sliced && monoFlowHeldOneGen(at, path) { return 0 }
     if live.length != 1 { return monoGenericListFail(d.letInit) }
     pins = live
+    pinFts = liveFts
     omit = true
   }
   if (
@@ -13820,7 +13901,8 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   const ann = monoSigFnTyName(pins[0] + ";")
   const dTys: i32[] = []
   // Stores whose results at the pin disagree share no element rep.
-  if !monoListStoresAgree(lit, repoints, at, ann) { return 0 }
+  const pinFt = if pinFts.length == 1 { pinFts[0] } else { -1 }
+  if !monoListStoresAgree(lit, repoints, at, pinFt) { return 0 }
   // The element type is the one the elaboration delivers the slot at, else its slot type here.
   let ft = monoSlotDeliveryTy(lf, path, omit)
   if ft < 0 {
@@ -13831,7 +13913,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   // delivered type is refused where it is made.
   const elemVals: i32[][] = []
   for e in lit.arrElems { elemVals.push([e, ctx]) }
-  const own = monoValsOwnFnTy(elemVals, ann)
+  const own = monoValsOwnFnTy(elemVals, pinFt)
   if ft >= 0 && own >= 0 && sigKeyOfTy(own) != sigKeyOfTy(ft) { ft = own }
   for e in lit.arrElems {
     monoLastInstFe = -1
@@ -14315,13 +14397,13 @@ function monoSlotDeliveryTy(lf: i32[], path: string[], omit: boolean): i32 {
 }
 
 // Whether the functions list literal `lit`, the list literals of `repoints` and the element writes
-// of the binding declared at `at` store give one result at the parameters `ann` spells, where
-// they close there.
+// of the binding declared at `at` store give one result at the parameters of the slot's pinned
+// function type `pinFt`, where they close there.
 function monoListStoresAgree(
   lit: ArrayLit,
   repoints: i32[],
   at: i32,
-  ann: string,
+  pinFt: i32,
 ): boolean {
   const vals: i32[] = []
   for e in lit.arrElems { vals.push(e) }
@@ -14339,29 +14421,28 @@ function monoListStoresAgree(
   }
   let pre = -1
   for v in vals {
-    const r = monoValueAtAnnTy(v, ann)
+    const r = monoValueAtAnnTy(v, pinFt)
     if r >= 0 && pre >= 0 && sigKeyOfTy(r) != sigKeyOfTy(pre) { return false }
     if r >= 0 { pre = r }
   }
   true
 }
 
-// The one function type the values of `vals` take at the parameters `ann` spells, where their
-// results close: -1 when none closes, -2 when two disagree.
-function monoValsOwnFnTy(vals: i32[][], ann: string): i32 {
+// The one function type the values of `vals` take at the parameters of pinned function type
+// `pinFt`, where their results close: -1 when none closes, -2 when two disagree.
+function monoValsOwnFnTy(vals: i32[][], pinFt: i32): i32 {
   let own = -1
   for vw in vals {
-    const r = monoValueAtAnnTy(vw[0], ann)
+    const r = monoValueAtAnnTy(vw[0], pinFt)
     if r >= 0 && own >= 0 && sigKeyOfTy(r) != sigKeyOfTy(own) { return -2 }
     if r >= 0 { own = r }
   }
   own
 }
 
-// The function type value `v` takes at the parameters `ann` spells, when `v` is a function or an
+// The function type value `v` takes at the parameters of function type `at`, when `v` is a function or an
 // `if` joining functions whose results there are closed and agree; -1 otherwise.
-function monoValueAtAnnTy(v: i32, ann: string): i32 {
-  const at = nameToTy(ann)
+function monoValueAtAnnTy(v: i32, at: i32): i32 {
   if at < 0 || at >= T.tys.length { return -1 }
   const a = tyAt(at)
   if !(a is TyFunc) || tyHasTyVar(at) { return -1 }
@@ -15563,8 +15644,13 @@ function monoTyOpenUntagged(t: i32, depth: i32): boolean {
 }
 
 // Records `t` as the type of node `x` where the checker left it open, outside a generic's
-// instances, which share the node (D5079).
+// instances, which share the node (D5079). A function nested in a generic shares its body with
+// its copies in the other instances, so the record is this frame's own.
 function monoRecordOpen(x: i32, t: i32, wf: i32) {
+  if x >= 0 && monoFrameSharesBody(wf) {
+    if monoTyOpen(nodeTyIxIn(x, wf)) { nodeTyRecordIn(wf, x, t) }
+    return 0
+  }
   if x >= 0 && monoTyOpen(nodeTyIxOf(x)) && monoNodeOwnedBy(x, wf) {
     nodeTyRecord(x, t)
   }
@@ -15624,7 +15710,8 @@ function monoStoredSlotFnTy(
   spell: string[],
 ): i32 {
   const at = lf[1]
-  let pins = monoDeclPathPins(lf, path)
+  let pinFts: i32[] = []
+  let pins = monoDeclPathKeys(lf, path, false, pinFts)
   if pins.length == 0 && elabSlotUncalled(at, path) {
     return monoUncalledSlotFnTy(at, path, vals, spell)
   }
@@ -15634,9 +15721,11 @@ function monoStoredSlotFnTy(
   }
   let omit = false
   if pins.length > 1 {
-    const live = monoFlowSlotPins(at, path)
+    const liveFts: i32[] = []
+    const live = monoFlowSlotPins(at, path, liveFts)
     if live.length == 1 {
       pins = live
+      pinFts = liveFts
       omit = true
     }
   }
@@ -15654,7 +15743,10 @@ function monoStoredSlotFnTy(
   // The delivery is the slot's type, not each value's: values whose results at the pin disagree
   // share no rep, and values agreeing on another result than the delivered one keep theirs, so a
   // write of the delivered type is refused where it is made.
-  const own = monoValsOwnFnTy(vals, ann)
+  const own = monoValsOwnFnTy(
+    vals,
+    if pinFts.length == 1 { pinFts[0] } else { -1 },
+  )
   if own == -2 { return -1 }
   if own >= 0 && sigKeyOfTy(own) != sigKeyOfTy(ft) { ft = own }
   const dTys: i32[] = []
@@ -18553,7 +18645,7 @@ function monoPreBindArg(ax: i32, ctx: i32, ty: i32[]): string {
     ty[0] = nodeTyIxOf(x)
     return tyToStr(ty[0])
   }
-  const nm = monoArgPinName(ax, ctx)
+  const nm = monoArgPinName(ax, ctx, [0 - 1])
   if nm != "" { ty[0] = monoPinSubTyOf(monoArgPinTyIx(ax, ctx), ctx) }
   nm
 }
@@ -18882,7 +18974,7 @@ function monoElabLitCopy(
   for cp in cps {
     const pt = holeLitPinOf(cp)
     if pt >= 0 && tySameSpelled(pt, t, TY_WALK_DEPTH) {
-      const nm = monoArgPinName(cp, ctx)
+      const nm = monoArgPinName(cp, ctx, [0 - 1])
       if nm == "" { return "" }
       c.callArgs[k] = cp
       args[i] = cp
@@ -20467,7 +20559,7 @@ function monoPinHoleParam(
     }
     if an == "" {
       // Kept for an argument the elaboration leaves open at this call.
-      an = monoArgPinName(args[i], ctx)
+      an = monoArgPinName(args[i], ctx, [0 - 1])
       // The rep cascade's `i32` floor is not a pin for a hole the elaboration binds to another
       // closed type: that demand would key an instance no call has.
       if an == "i32" && monoFloorDisagrees(setTy) {
@@ -20705,6 +20797,8 @@ function monoPinAnnotatedParam(
     }
     let an2 = ""
     let an2Ty = -1
+    // The type the argument ladder spelled `an2` from, where it is not `an2Ty`'s default.
+    const an2Own: i32[] = [0 - 1]
     let genPin = false
     if ann == tp {
       const pinTy: i32[] = [0 - 1]
@@ -20758,7 +20852,7 @@ function monoPinAnnotatedParam(
         if an2 != "" { an2Ty = lrt }
       }
     }
-    if an2 == "" { an2 = monoArgPinName(args[i], ctx) }
+    if an2 == "" { an2 = monoArgPinName(args[i], ctx, an2Own) }
     // A function the call hands back to a closed function type: the elaboration binds it there.
     if an2 == "" && ann == tp {
       const eft = elabCallParamTy(monoCallTplOf(callIx), i)
@@ -20773,7 +20867,11 @@ function monoPinAnnotatedParam(
       }
     }
     if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
-    if ann == tp { an2 = monoOpenArgDefaultPin(an2, args[i], ctx) }
+    if ann == tp {
+      const od = monoOpenArgDefaultPin(an2, args[i], ctx)
+      if od != an2 { an2Own[0] = -1 }
+      an2 = od
+    }
     if an2 == "" { return monoArgTyFail(p.parName, fn.fnName) }
     if ann == tp && monoFwdFnPinMisfits(fn, params[i], args[i], an2Ty) {
       return monoFwdFnPinFail(p.parName, fn.fnName)
@@ -20844,7 +20942,9 @@ function monoPinAnnotatedParam(
       const bt = if bind == b { monoBindTyOf(tvN, tvT, tp) } else { -1 }
       pinned.push(bind)
       pinTys.push(if bt >= 0 { bt } else { an2Ty })
-      pinOwn.push(if bt >= 0 { bt } else { monoPinOwnOfSpelled(bind, an2Ty) })
+      // The type the ladder spelled the pin from, at the rep its spelling collapses to.
+      const ownAt = if bind == an2 && an2Own[0] >= 0 { an2Own[0] } else { an2Ty }
+      pinOwn.push(if bt >= 0 { bt } else { monoAnnPinTy(ownAt) })
     }
   }
   0
@@ -21261,7 +21361,7 @@ function monoPinTyParamComposite(
     }
   }
   if !annIsFn && anC == "" {
-    anC = monoArgPinName(args[i], ctx)
+    anC = monoArgPinName(args[i], ctx, [0 - 1])
     // An anonymous row's `#anonN` has no fields to match the pattern against;
     // the checker's spelled shape does, unless the render softens a literal (D3123).
     const anTy = nodeTyIxOf(unwrapParen(args[i]))
@@ -22492,7 +22592,7 @@ function monoWalk(ix: i32, ctx: i32) {
           // A function whose result there is not the element's is refused, not stored (D9093),
           // whether the element's own closed type or a pin names the signature (D15190).
           const ent = nodeTyIxOf(n.binLeft)
-          const vt = if sn == "" || monoConcreteFnTyName(ent) == "" { -1 } else { monoValueAtAnnTy(n.binRight, sn) }
+          const vt = if sn == "" || monoConcreteFnTyName(ent) == "" { -1 } else { monoValueAtAnnTy(n.binRight, snt) }
           if vt >= 0 && sigKeyOfTy(vt) != sigKeyOfTy(ent) {
             return emitFailAt(
               "emitProgram: the function written to this element returns another type than "
@@ -22931,7 +23031,10 @@ function monoWalkFnBody(fnIx: i32) {
   // What the body demands is demanded under the instance it is.
   elabWalkPush(elabKeyAt(fnIx))
   cadWalkFn.push(monoCadInstOf(fnIx))
+  if monoFrameSharesBody(fnIx) { nodeTyInstFrameNote(fnIx) }
+  const was = nodeTyInstEnter(fnIx)
   const r = monoWalkFnBodyIn(fnIx)
+  nodeTyInstEnter(was)
   monoBuildPop()
   r
 }
@@ -24335,9 +24438,8 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
 function monoRetFnListTy(x: i32, ctx: i32): i32 {
   const l = nodeAt(x)
   if !(l is ArrayLit) || !monoTyOpen(nodeTyIxOf(x)) { return -1 }
-  // A list the elaboration only closes by its identity is left to the slot pins.
   const ht = elabHeldValTy(x, ctx)
-  const het = if tySame(ht, elabIdentityTy(x, ctx)) { -1 } else { monoListElemTy(ht) }
+  const het = monoListElemTy(ht)
   // In a generic instance a list holding literals keeps mono's path: its literals share the
   // template's nodes.
   let holdsLit = false
