@@ -8,6 +8,14 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-naming-slice4-readers](2026-11-08-naming-slice4-readers.md): Naming rule slice 4: the last readers of a name, measured (#6806).
+- [2026-11-08-step7-ret-residue](2026-11-08-step7-ret-residue.md): Step 7: `computeRetInference` gone as a pass; `synthRetAnnots` deleted (#6804).
+- [2026-11-08-call-key-held-generics-and-lambdas](2026-11-08-call-key-held-generics-and-lambdas.md): Step 2: the call key binds lambdas built in an instance (#6803).
+- [2026-11-08-held-list-rep-and-deep-set-join](2026-11-08-held-list-rep-and-deep-set-join.md): A held list's rep row; D15552 closed; the set join one level deeper (#6801).
+- [2026-11-08-unionbox-delivery-records-floors](2026-11-08-unionbox-delivery-records-floors.md): A `??` join yields to a delivery's record; named floors (#6800).
+- [2026-11-08-step7-classifier-r10](2026-11-08-step7-classifier-r10.md): Step 7 classifier round 10 (#6799).
+- [2026-11-08-naming-pin-readers](2026-11-08-naming-pin-readers.md): Naming rule slice 3: the pin's text from its type (#6798).
+- [2026-11-08-unfixed-container-default](2026-11-08-unfixed-container-default.md): A container no write fixes runs at the unbound default (#6797, #6802).
 - [2026-11-08-step7-kept-row-slot](2026-11-08-step7-kept-row-slot.md): Step 7: a read's kept row slot before its element name; D15301 closed (#6795).
 - [2026-11-08-generic-copy-shared-list-field](2026-11-08-generic-copy-shared-list-field.md): A generic copy's shared list field takes its type in the instance's frame; D15551 closed (#6794).
 - [2026-11-08-step7-classifier-r9](2026-11-08-step7-classifier-r9.md): Step 7 classifier round 9: the field storage type as a recorded fact (#6793).
