@@ -690,3 +690,29 @@ Deno.test({
     }
   },
 });
+
+// An operator's operands, widened to its operand type: the checker records each operand's pair
+// at the pair rule's answer, so the table serves both, and both controls turn them into floors.
+const NUM_OPERAND = `function mul(a: i64, b: i32): i64 { a * b }
+print(mul(3, 4))
+`;
+for (
+  const [drop, want] of [
+    [DROP_NONE, "num table=4"],
+    [DROP_READ, "num floor: no record=4"],
+    [DROP_AS_OTHER, "num floor: dst differs=4"],
+  ] as const
+) {
+  Deno.test({
+    name: `box-dst shadow: an operator's operands widened at its operand type (drop ${drop})`,
+    ignore,
+    fn: () => {
+      const { rc, rows } = shadow(NUM_OPERAND, drop, true);
+      if (rc !== 0) throw new Error(`num operand: want compileSrc rc 0, got ${rc}`);
+      const got = show(rows);
+      if (got !== want) {
+        throw new Error(`num operand (drop ${drop}):\n  want: ${want}\n  got:  ${got}`);
+      }
+    },
+  });
+}
