@@ -8,6 +8,13 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step7-cloret-slot-typed](2026-11-08-step7-cloret-slot-typed.md): Step 7: `cloRetValSlot` one typed reader (#6814).
+- [2026-11-08-call-key-held-generics-landed](2026-11-08-call-key-held-generics-landed.md): Step 2: held generics keyed, lambdas through a held member keyed (#6813).
+- [2026-11-08-step7-lit-call-row-slots](2026-11-08-step7-lit-call-row-slots.md): Step 7: list literal and call reads take their rungs' row slot (#6812).
+- [2026-11-08-read-side-source-records](2026-11-08-read-side-source-records.md): The read side's records: an atom's source set and a narrowed read's arm; D4028 closed (#6811).
+- [2026-11-08-set-join-shape3-build-split](2026-11-08-set-join-shape3-build-split.md): The set join at shape 3: two builds of one set (#6810).
+- [2026-11-08-step7-classifier-r11](2026-11-08-step7-classifier-r11.md): Step 7 classifier round 11: the pre-mono askers (#6809).
+- [2026-11-08-unfixed-container-reads](2026-11-08-unfixed-container-reads.md): Reads of a container no write fixes check at the default (#6807).
 - [2026-11-08-naming-slice4-readers](2026-11-08-naming-slice4-readers.md): Naming rule slice 4: the last readers of a name, measured (#6806).
 - [2026-11-08-step7-ret-residue](2026-11-08-step7-ret-residue.md): Step 7: `computeRetInference` gone as a pass; `synthRetAnnots` deleted (#6804).
 - [2026-11-08-call-key-held-generics-and-lambdas](2026-11-08-call-key-held-generics-and-lambdas.md): Step 2: the call key binds lambdas built in an instance (#6803).
