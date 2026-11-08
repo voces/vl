@@ -679,6 +679,7 @@ import {
   elabCallHandMember,
   elabCallHandOwner,
   elabCallKeyBinding,
+  elabCallKeyDecline,
   elabCallParamKey,
   elabCallParamRowTy,
   elabCallParamTy,
@@ -697,6 +698,7 @@ import {
   elabHoleGenFlowTy,
   elabHoleMapClosed,
   elabIdentityTy,
+  elabInstShadow,
   elabInstSlotAt,
   elabInstSpelling,
   elabInstTyAt,
@@ -717,6 +719,7 @@ import {
   elabPinIsBundleOf,
   elabRetOf,
   elabRetParamOf,
+  elabSeedShadow,
   elabSigTyClosed,
   elabSlotFieldRecord,
   elabSlotNote,
@@ -6386,6 +6389,9 @@ function monoBindSeededTyParams(
     const kt = if nm != "" && specK >= 0 { elabSpecBindOf(specK, tp) } else { -1 }
     if kt >= 0 { t = kt }
     if nm != "" {
+      if idShadowModeOf() > 0 {
+        elabSeedShadow(monoCallTplOf(callIx), decl, tp, t)
+      }
       tvN.push(tp)
       tvV.push(nm)
       monoTvTyLast(tvN, tvT, t)
@@ -9705,6 +9711,7 @@ function monoMakeInstanceGo(
     // A function delivered as a value is keyed, call and value alike, by the elaboration's key for
     // the instance (architecture-target §3.4, the value half); one with none keeps mono's spelling.
     const valueKey = if callKey < 0 && lamTop < 0 && (valueHalf || tplCall < 0) { instKeyValueTime(tplCall, calleeIx, monoOrigNode[origFe], pinTys) } else { -1 }
+    const shPath = if callKey >= 0 { "call" } else if lamTop >= 0 { "lam" } else if valueKey >= 0 { "value" } else { "spelled" }
     if callKey >= 0 {
       const pinSets: string[] = []
       for pt in pinTys { pinSets.push(monoSetPinDiscrim(pt)) }
@@ -9753,6 +9760,17 @@ function monoMakeInstanceGo(
       rs = rs + 1
     }
     if (monoMakeInstanceHit(hitAt, origFe, pinned, calleeIx, annotateI32)) {
+      if idShadowModeOf() > 0 {
+        elabInstShadow(
+          "hit",
+          shPath,
+          callKey,
+          valueKey,
+          tplCall,
+          monoOrigNode[origFe],
+          monoKeyEk[hitAt] ?? -1,
+        )
+      }
       return monoCadNoteInstance(
         origFe,
         monoLastInstFe,
@@ -9819,6 +9837,17 @@ function monoMakeInstanceGo(
       if (
         monoMakeInstanceHit(typedHit, origFe, pinned, calleeIx, annotateI32)
       ) {
+        if idShadowModeOf() > 0 {
+          elabInstShadow(
+            "typedhit",
+            shPath,
+            callKey,
+            valueKey,
+            tplCall,
+            monoOrigNode[origFe],
+            hitKey,
+          )
+        }
         return monoCadNoteInstance(
           origFe,
           monoLastInstFe,
@@ -9844,11 +9873,11 @@ function monoMakeInstanceGo(
     // The hole binding, made once: the return rungs, the body clone and the registry read it.
     const holeN: string[] = []
     const holeT: i32[] = []
-    // The binding is the call key's (`elabCallKeyBinding`). The rebuild below is the residue: a
-    // function-holding parameter, whose concrete rep the call key does not name (Fn#d's
-    // value-instance fact).
+    // The binding is the call or value key's (`elabCallKeyBinding`). The rebuild below is the
+    // residue: no key, or a function-holding parameter, whose concrete rep the key does not name
+    // (Fn#d's value-instance fact).
     const fromKey = elabCallKeyBinding(
-      callKey,
+      if callKey >= 0 { callKey } else { valueKey },
       tplCall,
       monoOrigNode[origFe],
       params,
@@ -9870,11 +9899,16 @@ function monoMakeInstanceGo(
     }
     monoShAliasBind(origFe, letBN, letBT)
     monoShPendFlush(shAt)
+    let shHole = if fromKey { "key" } else { "none" }
     if (
       !fromKey
       && !elabSpecHoleBind(monoOrigNode[origFe], params, specK, holeN, holeT)
     ) {
+      const hn0 = holeN.length
       monoHoleBinding(origFe, params, letTyCol, holeN, holeT, tplCall)
+      if holeN.length > hn0 { shHole = "mono" }
+    } else if !fromKey {
+      shHole = "spec"
     }
     // The worklist instance this one is: demanded here, its body checked once at this binding.
     const ekN0: string[] = []
@@ -9903,6 +9937,22 @@ function monoMakeInstanceGo(
       retWidenTy,
     )
     const ek = ekDemand
+    if idShadowModeOf() > 0 {
+      elabInstShadow(
+        "build",
+        shPath
+          + "/"
+          + (if fromKey { "keyed" } else { "unkeyed-"
+          + elabCallKeyDecline(if callKey >= 0 { callKey } else { valueKey }, params) })
+          + "/hole-"
+          + shHole,
+        callKey,
+        valueKey,
+        tplCall,
+        monoOrigNode[origFe],
+        ek,
+      )
+    }
     // The parameter the body hands back whole, and the rep its call delivers it at (`-1` the type).
     const retParam = elabRetParamOf(monoOrigNode[origFe])
     const retRep = if retParam >= 0 && tplCall >= 0 { elabCallArgRep(tplCall, ek, elabWalkTop(), retParam) } else { -1 }
@@ -24390,20 +24440,7 @@ function monoRetFnListTy(x: i32, ctx: i32): i32 {
   if !(l is ArrayLit) || !monoTyOpen(nodeTyIxOf(x)) { return -1 }
   const ht = elabHeldValTy(x, ctx)
   const het = monoListElemTy(ht)
-  // In a generic instance a list holding literals keeps mono's path: its literals share the
-  // template's nodes.
-  let holdsLit = false
-  for e in l.arrElems {
-    const ex = unwrapParen(e)
-    if (
-      ex >= 0
-      && ex < P.nodes.length
-      && (nodeAt(ex) is ObjLit || nodeAt(ex) is ArrayLit)
-    ) {
-      holdsLit = true
-    }
-  }
-  if het >= 0 && !(monoFrameIsGenericInstance(ctx) && holdsLit) {
+  if het >= 0 {
     // The type goes down the literal: each nested list or record literal, and each element left
     // open, takes its element type.
     const work: i32[][] = [[x, ht]]
