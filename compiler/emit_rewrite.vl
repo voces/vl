@@ -86,6 +86,7 @@ import {
   TY_I32,
   TY_I64,
   TY_NULL,
+  TY_VOID,
   TyArray,
   TyFunc,
   TyNullable,
@@ -264,8 +265,9 @@ import {
 import { nameIsWholeSpanShape } from "./emit_field_codes"
 import { fnRetJoinsWiderRecord, tyIsListUnion } from "./emit_join_records"
 import { asgValueNode } from "./emit_local_scope"
-import { repTyHasArmShape } from "./emit_rep"
+import { repTyHasArmShape, slotRowTyOf } from "./emit_rep"
 import { inferRetNulPinned, synthTypeRefTy } from "./emit_nullable_rets"
+import { externLinkTyAt } from "./check_program"
 import { exprReReadable } from "./emit_obj_lit_fits"
 import { shapeNominalOfTy, tyStructHasMapField } from "./emit_shape_rows"
 import {
@@ -3191,7 +3193,7 @@ export function synthRetAnnots() {
         // `void` TypeRef and `fRetVoid` is set now, ahead of `buildFnMap#2`'s rebuild.
         // Claimed first: a void-adopted lambda records no inferred-return row of its own.
         if lambdaVoidAdoptedAt(lamIx) {
-          fn.fnRet = synthTypeRefTy("void", -1, -1)
+          fn.fnRet = synthTypeRefTy("void", -1, TY_VOID)
           if fe < fRetVoid.length { fRetVoid[fe] = 1 }
           fe = fe + 1
           continue
@@ -4222,6 +4224,7 @@ export function rewriteCountersReset() {
   voidTwinSeamAt = []
   voidTwinSeamFe = []
   voidTwinSeamTy = []
+  voidTwinSeamFt = []
   drwOpOrigin = Map()
   0
 }
@@ -5160,12 +5163,14 @@ export function voidTwinForNode(nodeIx: i32, fe: i32) {
 let voidTwinSeamAt: i32[] = []
 let voidTwinSeamFe: i32[] = []
 let voidTwinSeamTy: string[] = []
+let voidTwinSeamFt: i32[] = []
 
-export function voidTwinSeamNote(ix: i32, fe: i32, tname: string) {
+export function voidTwinSeamNote(ix: i32, fe: i32, tname: string, ft: i32) {
   if !voidTwinSeamHas(ix, fe) {
     voidTwinSeamAt.push(ix)
     voidTwinSeamFe.push(fe)
     voidTwinSeamTy.push(tname)
+    voidTwinSeamFt.push(ft)
   }
   0
 }
@@ -5211,7 +5216,7 @@ export function synthVoidTwins(_stmts: i32[]) {
       const tfn = nodeAt(fnStmts[target])
       const none: string[] = []
       if tfn is FuncDecl && tfn.fnTyParams.length == 0 {
-        voidTwinMint(target, name, none)
+        voidTwinMint(target, name, none, -1)
       }
     }
     i = i + 1
@@ -5225,7 +5230,7 @@ export function synthVoidTwins(_stmts: i32[]) {
       const pts: string[] = []
       annFnDecompose(voidTwinSeamTy[j], pts)
       if ifn is FuncDecl && pts.length == ifn.fnParams.length {
-        voidTwinMint(fe, ifn.fnName, pts)
+        voidTwinMint(fe, ifn.fnName, pts, voidTwinSeamFt[j])
       }
     }
     j = j + 1
@@ -5236,7 +5241,8 @@ export function synthVoidTwins(_stmts: i32[]) {
 // Mints the capture-free void twin of function `target`, called `name`, which calls it and drops
 // its result, its parameters typed `ptys` when given, else as the target's; none where a
 // parameter has no type, and the closure stays at the call.
-function voidTwinMint(target: i32, name: string, ptys: string[]) {
+function voidTwinMint(target: i32, name: string, ptys: string[], ft: i32) {
+  const sf = if ft >= 0 { tyAt(ft) } else { null }
   const tfn = nodeAt(fnStmts[target])
   if !(tfn is FuncDecl) { return 0 }
   const nps: i32[] = []
@@ -5247,7 +5253,15 @@ function voidTwinMint(target: i32, name: string, ptys: string[]) {
     if !(pn is Param) { return 0 }
     // Fresh Param nodes sharing the original's annotation node, so the twin's param valtypes
     // and its `$fnsig` param tokens byte-match the original's; only the result differs (`>v`).
-    const pt = if pj < ptys.length { synthTypeRefTy(ptys[pj], -1, -1) } else { pn.parType }
+    let pty = -1
+    if (
+      sf is TyFunc
+      && sf.fnParamTypes.length == ptys.length
+      && pj < ptys.length
+    ) {
+      pty = sf.fnParamTypes[pj]
+    }
+    const pt = if pj < ptys.length { synthTypeRefTy(ptys[pj], -1, pty) } else { pn.parType }
     if pt < 0 { return 0 }
     const np = mkParam(pn.parName, pt, -1, 0, pn.parRest, pn.pos)
     identFrom(np, tfn.fnParams[pj])
@@ -5269,7 +5283,7 @@ function voidTwinMint(target: i32, name: string, ptys: string[]) {
     name + "$voidtw",
     noTyParams,
     nps,
-    synthTypeRefTy("void", -1, -1),
+    synthTypeRefTy("void", -1, TY_VOID),
     bodyIx,
     tfn.pos,
   )
@@ -5357,6 +5371,16 @@ function extvRespellIn(ix: i32, fnIx: i32) {
   0
 }
 
+// The type parameter `i` of extern link row `k` resolved at, or -1.
+function externParamTyAt(k: i32, i: i32): i32 {
+  const lt = externLinkTyAt(k)
+  const lf = if lt >= 0 { tyAt(lt) } else { null }
+  if lf is TyFunc && i >= 0 && i < lf.fnParamTypes.length {
+    return lf.fnParamTypes[i]
+  }
+  -1
+}
+
 // Mint `function <name>$extv(a0: P0, …): R { name(a0, …) }` for the extern `name` at link row
 // `k`, from that row's own parameter and result spellings.
 function synthExternValueFn(name: string, k: i32, pos: i32) {
@@ -5367,7 +5391,7 @@ function synthExternValueFn(name: string, k: i32, pos: i32) {
   let i = 0
   while i < n {
     const pn = "__a" + i32ToStr(i)
-    const pty = synthTypeRefTy(externParamAt(k, i), pos, -1)
+    const pty = synthTypeRefTy(externParamAt(k, i), pos, externParamTyAt(k, i))
     const par = mkParam(pn, pty, -1, 0, 0, pos)
     ps.push(par)
     const arg = mkIdent(pn, pos)
@@ -5378,7 +5402,10 @@ function synthExternValueFn(name: string, k: i32, pos: i32) {
   }
   let ret = externRetAt(k)
   if ret == "" || ret == "never" { ret = "void" }
-  const rty = synthTypeRefTy(ret, pos, -1)
+  const lt = externLinkTyAt(k)
+  const lf = if lt >= 0 { tyAt(lt) } else { null }
+  const rt = if ret == "void" { TY_VOID } else if lf is TyFunc { lf.fnRet } else { -1 }
+  const rty = synthTypeRefTy(ret, pos, rt)
   const noTyParams: string[] = []
   // The minted nodes postdate the checker, so each carries the type its annotation names.
   const host = mkIdent(name, -1)
@@ -5479,7 +5506,7 @@ function synthRecEqCoreFn(row: i32, pos: i32) {
   const pnames = ["a", "b"]
   let i = 0
   while i < 2 {
-    const pty = synthTypeRefTy(nm, pos, -1)
+    const pty = synthTypeRefTy(nm, pos, slotRowTyOf(row))
     const par = mkParam(pnames[i], pty, -1, 0, 0, pos)
     ps.push(par)
     const arg = mkIdent(pnames[i], pos)
