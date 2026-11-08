@@ -1,10 +1,7 @@
 // `emit_rewrite.vl` — the emitter's pre-emit AST rewrites: in-place arena mutations
 // that run before collection and lowering — self-method / operator / index-trap
-// dispatch rewriting (`dispatchRewrite`), captured-mutation boxing
-// (`captureBoxRewrite`), and the synthesized return/param annotations
-// (`synthNulListRetAnns`) that pin checker-inferred types onto
-// declarations for later phases. Consults the classifiers (`emit_classify.vl`);
-// writes no bytes.
+// dispatch rewriting (`dispatchRewrite`) and captured-mutation boxing
+// (`captureBoxRewrite`). Consults the classifiers (`emit_classify.vl`); writes no bytes.
 
 import { cwDeclAssigned } from "./check_write_scan"
 import { deliveryRetagMove } from "./check_retag_rows"
@@ -45,7 +42,6 @@ import {
 import { annUnionAtomsOf, primTyIxOfName } from "./check_decl_scan"
 import { recordRepTyAdopt } from "./check_fit_rules"
 import {
-  inferRetFnKey,
   joinHeadOf,
   joinRowDecl,
   joinRowName,
@@ -69,7 +65,6 @@ import {
   loopValTailOf,
   loopValTyOf,
 } from "./check_null_holes"
-import { inferRetNameOf, inferRetTyIxOf } from "./check_infer_ret"
 import { isIdentNamed } from "./check_call_retire"
 import { refViewCarry } from "./check_ref_list_view"
 import { strLitRecvTy } from "./check_builtin_methods"
@@ -250,7 +245,7 @@ import { exprIsClosure, fnIndexOf, readOfOpenBinding } from "./emit_classify"
 import { tyIsListUnion } from "./emit_join_records"
 import { asgValueNode } from "./emit_local_scope"
 import { repTyHasArmShape, slotRowTyOf } from "./emit_rep"
-import { inferRetNulPinned, synthTypeRefTy } from "./emit_nullable_rets"
+import { synthTypeRefTy } from "./emit_nullable_rets"
 import { externLinkTyAt } from "./check_program"
 import { exprReReadable } from "./emit_obj_lit_fits"
 import { shapeNominalOfTy } from "./emit_shape_rows"
@@ -3140,56 +3135,31 @@ export function assignValueSpill(stmts: i32[]) {
   0
 }
 
-// D1062 — pins an inferred nullable-list return on a named function, so it lowers through
-// the annotation the user did not write: `if n == 0 { return [1, 2] }; return null` infers
-// `i32[] | null`, but the inferred spelling has no nullable-list arm in the `fRetKind`
-// cascade. A pin rather than cascade arms, since the annotated spelling is served at four sites.
-
-export function synthNulListRetAnns() {
+// Registers the union an un-annotated function's return joins to, when its returned lists of
+// different storage or a function arm make one, as an annotated spelling registers it in
+// `collectU` (D2768, D4349).
+export function registerRetJoinUnions() {
+  if emitRootIx < 0 { return 0 }
+  const root = nodeAt(emitRootIx)
+  if !(root is Program) { return 0 }
   let i = 0
   while i < fnStmts.length {
     const fn = nodeAt(fnStmts[i])
-    if fn is FuncDecl {
-      if fn.fnRet < 0 && fn.fnName != "" {
-        // D1220 — the nullable-struct return is the same pin, one type family over:
-        // `function set(y: C) { if y.v > 0 { g = y } }` infers `C | null`, and un-pinned
-        // it declared a `(ref null $C)` result over a body with no `ref.null` fallback —
-        // a trap at `vl check` rc 0. `fnRetNullBearing`/`emitNullForRet` both read `fn.fnRet`.
-        const irk = inferRetFnKey(fnStmts[i], fn.fnName)
-        if inferRetNulPinned(irk) {
-          const nm = inferRetNameOf(irk)
-          if nm != "" { fn.fnRet = synthTypeRefTy(nm, -1, inferRetTyIxOf(irk)) }
-        } else {
-          // A return set joining lists of different storage is built as the union box, and a
-          // union with a function member, un-pinned, lowered as a bare closure (D4349).
-          const jty = tyStepRet(nodeTyIxOf(fnStmts[i]))
-          if tyIsListUnion(jty) {
-            if synthUnionRet(fn, jty, listUnionEmitName(jty)) < 0 { return -1 }
-          } else if tyIsFnArmUnion(jty) {
-            if synthUnionRet(fn, jty, tyToEmitName(jty)) < 0 { return -1 }
-          }
+    if fn is FuncDecl && fn.fnRet < 0 && fn.fnName != "" {
+      const jty = tyStepRet(nodeTyIxOf(fnStmts[i]))
+      let jnm = ""
+      if tyIsListUnion(jty) { jnm = listUnionEmitName(jty) }
+      else if tyIsFnArmUnion(jty) { jnm = tyToEmitName(jty) }
+      if jnm != "" {
+        const before = uVariants.length
+        if registerInlineUnionOfTy(root.progStmts, jnm, jty) < 0 { return -1 }
+        if uVariants.length != before {
+          if assignTags() < 0 { return -1 }
         }
       }
     }
     i = i + 1
   }
-  0
-}
-
-// Pins `fn`'s return to the union `jty` spelled `jnm`, registering the union a record list arm
-// or a function arm needs after `collectU` has run, as an annotated spelling registers it there
-// (D2768, D4349). No pin when `jnm` is "".
-function synthUnionRet(fn: FuncDecl, jty: i32, jnm: string): i32 {
-  if jnm == "" || emitRootIx < 0 { return 0 }
-  const root = nodeAt(emitRootIx)
-  if root is Program {
-    const before = uVariants.length
-    if registerInlineUnionOfTy(root.progStmts, jnm, jty) < 0 { return -1 }
-    if uVariants.length != before {
-      if assignTags() < 0 { return -1 }
-    }
-  }
-  fn.fnRet = synthTypeRefTy(jnm, -1, jty)
   0
 }
 
