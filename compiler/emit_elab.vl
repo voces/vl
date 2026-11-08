@@ -23,9 +23,11 @@ import {
   elabFnSetTyMint,
   elabHoleRowCut,
   elabHoleRowMark,
+  elabRestampNote,
   fnSlotThroughCalls,
   fnTagCallSetOf,
   fnTagCalls,
+  fnTagHoldsTy,
 } from "./check_elab_cap"
 import { Ty, tyArrayElemIx, tyChildrenOf, tyHoldsObj } from "./check_types"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
@@ -15971,6 +15973,67 @@ export function elabHeldValTy(x0: i32, fnIx: i32): i32 {
   if t < 0 || tyHasTyVar(t) { -1 } else { elabHeldKeepSets(t, id, 0) }
 }
 
+// The type function `fnIx`'s joined result holds at returned literal `x`'s path when that holds a
+// tagged set, the one rep every literal the result returns is built at; -1 otherwise (D15226).
+// In a generic's instance `fnIx` of template `tmpl`, the result is the closed held type with the
+// template's joined tagged leaves.
+export function elabRetTaggedJoinTy(x: i32, fnIx: i32, tmpl: i32): i32 {
+  const path: string[] = []
+  if fnIx < 0 || !elabRetPathOf(parenPeelIx(x), fnIx, path) { return -1 }
+  const own = elabRetTaggedJoinAt(fnIx, path)
+  if own >= 0 || tmpl < 0 { return own }
+  const jt = elabRetTaggedJoinAt(tmpl, path)
+  const ht = if jt >= 0 { elabHeldValTy(x, fnIx) } else { -1 }
+  const r = if ht >= 0 { elabTaggedLeavesInto(ht, jt, 0) } else { -1 }
+  if r == ht { -1 } else { r }
+}
+
+// Closed type `h` with each function leaf taking the tagged leaf `j` holds at the same place.
+function elabTaggedLeavesInto(h: i32, j: i32, depth: i32): i32 {
+  if h < 0 || h >= T.tys.length || j < 0 || j >= T.tys.length || depth > 16 {
+    return h
+  }
+  const ho = tyAt(h)
+  const jo = tyAt(j)
+  if ho is TyFunc {
+    const s = if fnTagTyIsTagged(j) { fnTagSetOfTy(j) } else { -1 }
+    return if s >= 0 && fnTagMembers(s).length >= 2 { j } else { h }
+  }
+  if ho is TyArray && jo is TyArray {
+    const r = elabTaggedLeavesInto(ho.aElem, jo.aElem, depth + 1)
+    return if r == ho.aElem { h } else { mkArrayTy(r) }
+  }
+  if ho is TyObj && jo is TyObj {
+    const tys: i32[] = []
+    let moved = false
+    let k = 0
+    while k < ho.objFieldNames.length && k < ho.objFieldTypes.length {
+      const jk = strListIndexOf(jo.objFieldNames, ho.objFieldNames[k])
+      const f = ho.objFieldTypes[k]
+      const r = if jk >= 0 { elabTaggedLeavesInto(f, jo.objFieldTypes[jk], depth + 1) } else { f }
+      if r != f { moved = true }
+      tys.push(r)
+      k = k + 1
+    }
+    if !moved { return h }
+    const names: string[] = []
+    for nm in ho.objFieldNames { names.push(nm) }
+    return mkObjTy(names, tys)
+  }
+  h
+}
+
+// `elabRetTaggedJoinTy` at return path `path`.
+function elabRetTaggedJoinAt(fnIx: i32, path: string[]): i32 {
+  const ft = nodeTyIxOf(fnIx)
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const f = tyAt(ft)
+  if !(f is TyFunc) { return -1 }
+  const jt = elabTyAtPath(f.fnRet, path)
+  if jt < 0 || !(fnTagTyIsTagged(jt) || fnTagHoldsTy(jt, 6)) { return -1 }
+  jt
+}
+
 // Closed type `t` with each function leaf that carries no set taking the set its leaf in identity
 // type `id` carries, so a stored set a call reaches keeps the id rep it is built at (D15296).
 function elabHeldKeepSets(t: i32, id: i32, depth: i32): i32 {
@@ -16377,6 +16440,16 @@ function litBuildStampStore(x: i32, bt: Map<i32, i32>): i32 {
 function indexBaseOf(x: i32): i32 {
   const l = nodeAt(x)
   if l is Index { l.idxArr } else { -1 }
+}
+
+// Moves the rep stamp of node `x`, when it has one, to `t`, the joined result a returned literal
+// is built at (D15226).
+export function elabRepRestamp(x: i32, t: i32) {
+  if x >= 0 && t >= 0 && nodeRepStamped(x) {
+    repStampNode(x, t)
+    elabRestampNote(x)
+  }
+  0
 }
 
 // Records `t` as the type node `x` is built at; 1.
