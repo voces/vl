@@ -465,6 +465,7 @@ import {
   annNulRefArrSlot,
   arrLitCommitAnnAt,
   arrLitCommitNameAt,
+  arrLitRlSlotAt,
   mvUnionIsScalarNull,
   mvValInnerRlSlotAt,
   nonNulBaseOf,
@@ -642,6 +643,7 @@ import {
   rlSlotOfRowTy,
   rlSlotOfTyOrTwin,
   sFieldMapShape,
+  sFieldRefSlot,
   structIndexOfNullPartTy,
   structRowOfAnnTy,
   structRowOfNameOrTy,
@@ -653,6 +655,7 @@ import {
   uFieldMapShape,
   uFieldTgtStructIdx,
   unionOfVariant,
+  variantFieldRefSlot,
   variantIndexOfTypeName,
 } from "./emit_shape_rows"
 import {
@@ -12330,10 +12333,59 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   ""
 }
 
-// The per-element-type ref-list table SLOT the expression at `exprIx` produces, or -1 when
-// the element type does not resolve: its rep's row, else the slot its binding keeps, else (an
-// identifier) its type's row, else (a list literal or call) its rungs' row, else its name's.
-// Slot 0 is a real row, so every caller tests the result before indexing a backing table.
+// `refListElemNameOfMember`'s rungs as slots, in its order: the field's storage row, -1 where
+// the field holds no ref list, -2 at a rung that has only a name.
+function refListKeptSlotOfMember(e: Member, exprIx: i32, fnIx: i32): i32 {
+  if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST { return -2 }
+  const vi = memNarrowVariantIndex(exprIx, fnIx)
+  if vi >= 0 {
+    const vfi = variantFieldIndex(vi, e.memProp)
+    if vfi < 0 || variantFieldElemName(vi, vfi) == "" { return -1 }
+    return keptOrName(variantFieldRefSlot(vi, vfi))
+  }
+  const avi = memRecvArmVariantIndex(e.memObj, fnIx)
+  if avi >= 0 {
+    const afi = variantFieldIndex(avi, e.memProp)
+    if afi >= 0 && variantFieldElemName(avi, afi) != "" {
+      return keptOrName(variantFieldRefSlot(avi, afi))
+    }
+  }
+  const si = structIndexOfExpr(e.memObj, fnIx)
+  if si >= 0 {
+    const fi = sFieldIndex(si, e.memProp)
+    if fi >= 0 {
+      if sFieldElemNameAt(si, fi) == "" { return -1 }
+      return keptOrName(sFieldRefSlot(si, fi))
+    }
+  }
+  -2
+}
+
+// `refListElemNameOfIndex`'s rungs as slots, in its order: the receiver row's inner row, -2
+// at a rung that has only a name.
+function refListKeptSlotOfIndex(e: Index, exprIx: i32, fnIx: i32): i32 {
+  if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST { return -2 }
+  const os = refListSlotOfExpr(e.idxArr, fnIx)
+  if os < 0 { return -2 }
+  if rlSlotIsKindList(os, RLK_REF_LIST) {
+    const ins = rlElemInnerSlot(os)
+    if ins >= 0 && ins < rlElemName.length {
+      if rlSlotOfTyOrTwin(rlElemTyIxAt(ins)) == ins { return ins }
+    }
+  }
+  -2
+}
+
+// A rung's slot, or -2 (the name answers) where the rung has none.
+function keptOrName(s: i32): i32 {
+  if s >= 0 && s < rlElemName.length { return s }
+  -2
+}
+
+// The ref-list table slot the expression at `exprIx` produces, or -1 when none resolves: its
+// rep's row, else its binding's kept slot, else (an identifier) its type's row, else (a literal,
+// call, field or index read) its rungs' row, else a literal's minted row, else its name's.
+// Slot 0 is a real row, so a caller tests the result before indexing a backing table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   const rs0 = listRowOfExpr(exprIx, fnIx)
   if rs0 >= 0 { return rs0 }
@@ -12351,6 +12403,19 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   if pe is Call {
     const cs = refListKeptSlotOfCall(pe, exprIx, fnIx)
     if cs != -2 { return cs }
+  }
+  if pe is Member {
+    const ms = refListKeptSlotOfMember(pe, exprIx, fnIx)
+    if ms != -2 { return ms }
+  }
+  if pe is Index {
+    const xs = refListKeptSlotOfIndex(pe, exprIx, fnIx)
+    if xs != -2 { return xs }
+  }
+  // A literal the rungs leave to its name reads the row the intern pass minted it at.
+  if pe is ArrayLit {
+    const mint = arrLitRlSlotAt(exprIx)
+    if mint >= 0 && mint < rlElemName.length { return mint }
   }
   const nm = refListElemNameOfExpr(exprIx, fnIx)
   const s = rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
