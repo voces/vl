@@ -29,13 +29,25 @@ the direct spelling.
 
 D13102 also runs under switch + fix. Both seeds are fixpoints.
 
-## What the 40 are
+## Two binding arms, probed (commit `c766168f`, reverted next)
+
+The 40 are 17 `cannot pass the generic function … through …`, 18 argument misfits, 2 `cannot
+infer`, and 3 invalid wasm or unknown function. Two arms, measured together on a fixpoint
+against master + this PR:
+
+| arm | reading | cells |
+|---|---|---|
+| `reassignedFnValueErr` only at a lambda's hole (`?#L`) | the extra instance is real: `f` holds a `Fn#d` set, and the family saw none through a value (`calleeFn` -1). "One signature" is true only of a closure | all 17 run; both refusal tests keep their errors |
+| `holeBindSelfForward`: a self-recursive call handing the hole to another own parameter binds it there | the family's answer had the forwarded instance (`mid(b, a, …)` swaps `F`/`G`), and the binding stopped at `g == owner` | D15406, D6202 and the swapped-recursion cases run |
+
+Result: **15 runs lost, 2 traps** (from 40 and 2).
+
+## What stands
 
 | message | cells | reading |
 |---|---|---|
-| `cannot pass the generic function … through …` | 17 | `f` holds a `Fn#d` set. The binding finds `apply2`'s two real instances, while the family found none for a call through a value. The refusal's premise ("one signature") holds only for a lambda's hole |
-| `argument N: expected …, got …` | 18 | not yet ablated |
-| `cannot infer a type for parameter` | 2 | not yet ablated |
-| invalid wasm / `call to unknown function` | 3 | not yet ablated |
+| `argument N: expected …, got f64` | 10 | `for f in [apply4, apply5] { f(h, k) }` (D13520, D12702, D13661, D14428, D15068's `forin`). `f`'s type carries `apply4`'s holes, so `apply4`'s instance is pinned and judged against `apply5`'s body. Forwarding into each element moves the error into `apply5`, so the pin of a joined element type is the owner, not the walk |
+| `cannot infer a type for parameter a` | 2 | not ablated |
+| invalid wasm in a lambda, `call to unknown function` | 3 | not ablated |
 
 `genFnHole*` stands. Step 3 is not done.
