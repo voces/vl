@@ -9039,6 +9039,7 @@ export function elabRun() {
   elabValCalls = Map()
   elabValueKeys = Map()
   elabSoleHoleKeys = Map()
+  elabHoleDeclKeys = Map()
   elabValueInstKeys = Map()
   elabValueInstVia = Map()
   elabHoleMapMemo = Map()
@@ -9390,6 +9391,7 @@ export function elabRun() {
   // An un-annotated function the elaboration instanced once, at the root, is that instance
   // wherever its value is read: mono builds it there, with no call to key it.
   const keyOf: {[i32]: i32} = Map()
+  const allOf: {[i32]: i32[]} = Map()
   let sk0 = 0
   while sk0 < ekDecl.length && sk0 < ekParent.length {
     const d = ekDecl[sk0]
@@ -9398,10 +9400,14 @@ export function elabRun() {
       if dn.fnTyParams.length == 0 {
         const prev = keyOf.get(d) ?? sk0
         keyOf[d] = if prev == sk0 && ekParent[sk0] < 0 { sk0 } else { 0 - 2 }
+        const ks = allOf.get(d) ?? []
+        ks.push(sk0)
+        allOf[d] = ks
       }
     }
     sk0 = sk0 + 1
   }
+  elabHoleDeclKeys = allOf
   elabSoleHoleKeys = Map()
   for sd in keyOf.keys() {
     const sk1 = keyOf.get(sd) ?? -1
@@ -17163,6 +17169,49 @@ let elabValueDecls: {[i32]: boolean} = Map()
 // Each un-annotated function's one instance, made at the root, filled at the end of `elabRun`.
 let elabSoleHoleKeys: {[i32]: i32} = Map()
 
+// Whether instances `a` and `b` of `d` bind each un-annotated parameter of `d` alike.
+function elabKeysBindHolesAlike(a: i32, b: i32, d: i32): boolean {
+  const fd = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
+  if !(fd is FuncDecl) { return false }
+  let i = 0
+  while i < fd.fnParams.length {
+    const pp = nodeAt(fd.fnParams[i])
+    if pp is Param && pp.parType < 0 {
+      const ta = elabKeyParamTy(a, i)
+      const tb = elabKeyParamTy(b, i)
+      if ta < 0 || tb < 0 || !tySame(ta, tb) { return false }
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Each un-annotated function's instances, under any parent, filled at the end of `elabRun`.
+let elabHoleDeclKeys: {[i32]: i32[]} = Map()
+
+// The instance of un-annotated function `decl` whose closed parameter types are `pTys`, under any
+// parent: the instance a read receives where no call or walk key names it. -1 for none, or for two
+// such instances that bind its holes differently.
+export function elabHoleKeyAtPins(decl: i32, pTys: i32[]): i32 {
+  const d = elabSrcDecl(decl)
+  const sig = if d >= 0 && d < P.nodes.length { nodeTyIxOf(d) } else { -1 }
+  if sig < 0 || sig >= T.tys.length { return -1 }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || f.fnParamTypes.length != pTys.length { return -1 }
+  const top = elabWalkTop()
+  let r = -1
+  let under = -1
+  for k in elabHoleDeclKeys.get(d) ?? [] {
+    if elabKeyBindsParams(k, d, f, pTys) {
+      if r >= 0 && !elabKeysBindHolesAlike(r, k, d) { return -1 }
+      if r < 0 { r = k }
+      if under < 0 && top >= 0 && elabReaches(top, k) { under = k }
+    }
+  }
+  // Among instances that bind alike, the one the instance being walked reaches is the read's.
+  if under >= 0 { under } else { r }
+}
+
 // Whether named function `decl` is ever delivered as a value: read by name anywhere other than
 // as the callee of a call. Its instances are keyed by the value half (architecture-target §3.4).
 export function elabDeclIsValue(decl: i32): boolean {
@@ -18388,8 +18437,10 @@ export function elabCallKeyDecline(callKey: i32, params: i32[]): string {
   if callKey < 0 || callKey >= ekNames.length || callKey >= ekTys.length {
     return "nokey"
   }
-  for p in params {
-    const t = elabNodeTy(p, callKey)
+  let pi = 0
+  while pi < params.length {
+    const t = elabKeyParamNodeTy(callKey, params[pi], pi)
+    pi = pi + 1
     if t < 0 || t >= T.tys.length { return "untyped" }
     if elabKeyGenericFnTy(t) { continue }
     if tyHasTyVar(t) { return "open" }
@@ -18399,6 +18450,15 @@ export function elabCallKeyDecline(callKey: i32, params: i32[]): string {
     if t < 0 { return "unbound" }
   }
   ""
+}
+
+// Parameter `p`, the `i`th, at instance `k`: its recorded type there, else the type `k` binds it
+// to by its signature (a hole parameter's by its hole name); -1 for neither.
+function elabKeyParamNodeTy(k: i32, p: i32, i: i32): i32 {
+  const t = elabNodeTy(p, k)
+  if t >= 0 { return t }
+  const pp = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { nodeAt(0) }
+  if pp is Param && pp.parType < 0 { elabKeyParamTy(k, i) } else { -1 }
 }
 
 // Whether `t`, a parameter's type at a call key, is open only beneath a function type: a generic
@@ -18486,8 +18546,9 @@ export function elabCallKeyBinding(
   if callKey < 0 || callKey >= ekNames.length || callKey >= ekTys.length {
     return false
   }
-  for p in params {
-    const t = elabNodeTy(p, callKey)
+  let pi = 0
+  while pi < params.length {
+    const t = elabKeyParamNodeTy(callKey, params[pi], pi)
     if (
       t < 0
       || t >= T.tys.length
@@ -18495,6 +18556,7 @@ export function elabCallKeyBinding(
     ) {
       return false
     }
+    pi = pi + 1
   }
   for t in ekTys[callKey] {
     if t < 0 { return false }
