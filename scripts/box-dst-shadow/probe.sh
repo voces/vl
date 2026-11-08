@@ -27,8 +27,8 @@ X
 for f in wasmEmit.vl emit_sections.vl; do
   perl -i -pe '
     $fn = $1 if /^\s*(?:export )?function (\w+)/;
-    s/\b(emitUnionBoxArg|emitUnionCoerce|emitUnionBoxAtRecord|emitUnionBoxOwed|emitAtomToStr|emitNarrowedArmUnboxTo)\(/$1P("$fn:$.", /g
-      unless /function emit(?:UnionBoxArg|UnionCoerce|UnionBoxAtRecord|UnionBoxOwed|AtomToStr|NarrowedArmUnboxTo)\(/;' "$C/$f"
+    s/\b(emitUnionBoxArg|emitUnionCoerce|emitUnionBoxAtRecord|emitUnionBoxOwed|emitAtomToStr|emitNarrowedArmUnboxTo|armClose)\(/$1P("$fn:$.", /g
+      unless /function (?:emit(?:UnionBoxArg|UnionCoerce|UnionBoxAtRecord|UnionBoxOwed|AtomToStr|NarrowedArmUnboxTo)|armClose)\(/;' "$C/$f"
 done
 # A floor (`emitUnionBoxOwed` boxing at the site, the record owing no box) is tagged `floor@<pos>`;
 # its class names why (`boxFloorWhy`), and a table delivery's class is `table`.
@@ -64,6 +64,13 @@ function emitNarrowedArmUnboxToP(pos: string, h: i32, a: i32, b: i32): i32 {
   bdsPosLeave(o)
   r
 }
+
+function armCloseP(pos: string, p: i32, w: boolean, h: i32, a: i32, b: i32): i32 {
+  const o = bdsPosEnter(pos)
+  const r = armClose(p, w, h, a, b)
+  bdsPosLeave(o)
+  r
+}
 X
 E="$C/emit_sections.vl"
 awk '!done && /^  emitUnionBoxOwed,$/ { print; print "  emitUnionBoxOwedP,"; done = 1; next } { print }' \
@@ -81,6 +88,7 @@ need emit_sections.vl '  emitUnionBoxOwedP,'
 need emit_sections.vl '  emitAtomToStrP,'
 need wasmEmit.vl 'emitNarrowedArmUnboxToP("'
 need wasmEmit.vl 'emitAtomToStrP("'
+need wasmEmit.vl 'armCloseP("'
 need emit_sections.vl 'emitUnionBoxOwedP("'
 # --- overwrite history (appended to probe.sh) ---
 K="$C/check_elab_cap.vl"
