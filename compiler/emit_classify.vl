@@ -392,10 +392,8 @@ import {
   exprIsNullLit,
   ifElseValueIx,
   ifIsChainHeadIn,
-  ifJoinIsMapUnion,
   ifJoinIsNulString,
   ifJoinIsScalarPrim,
-  ifListArmValueIx,
   ifRepArmValueIx,
   ifThenValueIx,
   joinedRecordRowOf,
@@ -565,7 +563,6 @@ import {
   TK_STR,
   arenaListRep,
   arrNewDestKind,
-  emptyArrHoleKind,
   letAnnVariantIdx,
   listBuildOfTy,
   rlSlotIsKindList,
@@ -5073,88 +5070,31 @@ let irkMemoFn: i32[] = []
 let irkMemoKind: VKind[] = []
 let irkMemoNul: i32[] = []
 
+// The heap kind of join `ifIx`'s recorded rep, with its nullable niche projected to the
+// non-null twin: `emitIfExprRef` derives the join's null itself (`ifLinkYieldsNull`). Null for a
+// scalar, atom, box or uncovered join, which has no ref blocktype of its own.
 function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("ifExprRefKindOf") }
-  const tv = ifListArmValueIx(ifIx)
-  if tv < 0 { return null }
-  // A join of two maps the checker kept apart is their union box, not the then arm's map (D2666).
-  if ifJoinIsMapUnion(ifIx, fnIx) { return null }
-  // A closure join (kind 14, `(ref $cloStruct)`) checked first: a bare lambda arm is a
-  // function value, not a string/array/struct.
-  if exprIsClosure(tv, fnIx) { return "closure" }
-  // An empty `[]` arm with no non-empty sibling to decide (an `else if` chain follows it): the
-  // join pinned its element, so its recorded type is the join's rep (D2209).
-  const hk = emptyArrHoleKind(tv)
-  if (
-    hk == "strlist"
-    || hk == "f32list"
-    || hk == "f64list"
-    || hk == "i64list"
-    || hk == "u8list"
-    || hk == "reflist"
-  ) {
-    return hk
+  const d = repOfNode(ifIx, fnIx)
+  if d.rdCovered != 1 { return null }
+  const k = d.rdKind
+  if k == "nulstr" { return "str" }
+  const tw0 = vkNonNullRefTwin(k)
+  const tw = if tw0 == null { k } else { tw0 }
+  // A record the shape of a union member reps as that variant; with no variant row behind the
+  // arm it is built as its own record (D4644).
+  if tw == "variant" {
+    if ifExprRefSlot(ifIx, fnIx, "variant", -1) >= 0 { return "variant" }
+    return "struct"
   }
-  // The join's checked type is the arm-order-independent string signal: a `string`-typed
-  // join (an atom + a string/member-literal arm, either order) is the string ref kind even
-  // when the then arm alone doesn't classify stringy; the atom arm widens later.
-  if tyKindOf(nodeTyAt(ifIx, fnIx)) == TK_STR { return "str" }
-  if nodeRepIs(ifIx, "nulstr", fnIx) { return "str" }
-  // The same signal read off the ARMS, for the body where the rung above is blind: a hole
-  // arm absorbs the join, so the `if` records that arm's type. Both arms are asked, so a join
-  // of two atoms keeps the i32 rep its own rungs give it (D1728).
-  if ifJoinAtomMeetsString(ifIx, fnIx) { return "str" }
-  // The join's checked type decides a wide scalar list: `[2]` beside `[1.5]` is an `f64[]`,
-  // which the then arm alone reads as `i32[]` (D2716).
-  const jlk = tyPrimLeafListKind(nodeTyAt(ifIx, fnIx))
-  if jlk == "f64list" || jlk == "i64list" || jlk == "f32list" { return jlk }
-  if exprString(tv, fnIx) { return "str" }
-  if exprStringArray(tv, fnIx) { return "strlist" }
-  // The packed byte list before every other list rung, which would claim its i32 elements (D2246).
-  if exprU8Array(tv, fnIx) { return "u8list" }
-  // Scalar lists in `scalarListElemKind`'s own order — f32 before f64, since
-  // `exprF64Array`'s typed-IR fast path would otherwise claim an `f32[]` join too.
-  if exprF32Array(tv, fnIx) { return "f32list" }
-  if exprF64Array(tv, fnIx) { return "f64list" }
-  if exprI64Array(tv, fnIx) { return "i64list" }
-  if exprRefArray(tv, fnIx) { return "reflist" }
-  if exprArray(tv, fnIx) { return "list" }
-  // A map join's blocktype selects this value-shape's `$mapStruct`, so the slot is the
-  // map shape (`ifExprRefSlot`'s map arm), not a struct-table index.
-  if exprMap(tv, fnIx) { return "map" }
-  // A concrete union ARM join: its heap type is `variantHeap`, which the struct rung cannot
-  // name. A program that also declares the union classifies the arm value as a variant, so
-  // `structIndexOfExpr` answers -1 and the ladder fell through to the numeric blocktype over
-  // a ref value (D1668). Ahead of the struct rung for the reason the nullable half says.
-  if exprVariantIndex(tv, fnIx) >= 0 { return "variant" }
-  if structIndexOfExpr(tv, fnIx) >= 0 { return "struct" }
-  // A join whose deciding arm is itself nullable (D1560): every predicate above is
-  // non-null, so a `T | null`-returning arm answers no to all of them and would otherwise
-  // fall to the scalar path. Same kind order as the ladder above.
-  const nlv = nulIfArmNullableValueIx(ifIx)
-  if nlv >= 0 {
-    if exprNullableString(nlv, fnIx) { return "str" }
-    const nsk = exprNulScalarListKind(nlv, fnIx)
-    if nsk == "nulstrlist" { return "strlist" }
-    if nsk == "nulu8list" { return "u8list" }
-    if nsk == "nulf32list" { return "f32list" }
-    if nsk == "nulf64list" { return "f64list" }
-    if nsk == "nuli64list" { return "i64list" }
-    if exprNullableRefArray(nlv, fnIx) { return "reflist" }
-    if exprNullableList(nlv, fnIx) { return "list" }
-    if exprNullableMap(nlv, fnIx) { return "map" }
-    // The variant arm goes ahead of the struct one: a union member's heap is `variantHeap`,
-    // and the struct fallback below would claim it with a row `sHeapIdx` doesn't have.
-    if exprNullableVariant(nlv, fnIx) { return "variant" }
-    if exprNullableStruct(nlv, fnIx) { return "struct" }
+  if tw0 != null { return tw0 }
+  match k {
+    "struct" | "variant" | "list" | "reflist" | "map" | "strlist" | "f64list" | "closure" | "i64list" | "f32list" | "u8list" | "str" => {
+      return k
+    }
+    "nulbool" | "nulnone" | "i32" | "union" | "i64" | "f64" | "f32" | "v128" | "nulvariant" | "nulstruct" | "nullist" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" => {
+      return null
+    }
   }
-  // A narrowed `X | null` arm (`b` inside `b != null`) keeps its niche cell, which the
-  // non-null variant rung above does not answer for; the arm recovers to the join's rep (D3593).
-  if exprNullableVariant(tv, fnIx) { return "variant" }
-  // A nullable-struct join whose then arm is `null` (no rep of its own): the struct index
-  // resolves from the checker's inner struct in `ifExprRefSlot` instead.
-  if nodeRepIs(ifIx, "nulstruct", fnIx) { return "struct" }
-  null
 }
 
 // The `fbValtype` slot (second arg) for a ref-typed if-expression join of `kind`: the
@@ -15724,26 +15664,6 @@ function fnLoweredKind(fe: i32): VKind | null {
   flkStamp[fe] = flkGen.at
   flkVal[fe] = k
   k
-}
-
-// The result kind call `rx` lowers (`callLoweredKind`), `rx` being the call or a `const` bound
-// to it; null where it names no call or the callee's kind is not known.
-export function callLoweredKindOf(rx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("callLoweredKindOf") }
-  let u = unwrapParen(rx)
-  if u < 0 || u >= P.nodes.length { return null }
-  const id = nodeAt(u)
-  if id is Ident {
-    const d = identDeclOf(u)
-    if d < 0 || d >= P.nodes.length { return null }
-    const dn = nodeAt(d)
-    if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return null }
-    u = unwrapParen(dn.letInit)
-    if u < 0 || u >= P.nodes.length { return null }
-  }
-  const e = nodeAt(u)
-  if !(e is Call) { return null }
-  callLoweredKind(e, u, fnIx)
 }
 
 // The result kind call `rx`'s callee lowers, once return kinds are final: a named function's
