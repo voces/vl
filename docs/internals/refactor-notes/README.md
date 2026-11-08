@@ -8,6 +8,9 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step7-fnret-recorded-row](2026-11-08-step7-fnret-recorded-row.md): Step 7: the inferred list result reads its recorded row; rlSlotByNameTwin deleted (#6830).
+- [2026-11-08-numeric-pair-table-kind](2026-11-08-numeric-pair-table-kind.md): Step 5: numeric widening reads the table through a (src, dst) recorder (#6822).
+- [2026-11-08-step67-buildfnmap-cascade-and-pin](2026-11-08-step67-buildfnmap-cascade-and-pin.md): Steps 6/7: buildFnMap's un-annotated cascade, synthRecordedRetAnnots and synthAnnOfTy deleted (#6824, #6828).
 - [2026-11-08-step7-classifier-r14](2026-11-08-step7-classifier-r14.md): Step 7 classifier round 14, the last pre-mono callers (#6827).
 - [2026-11-08-call-key-slot-stored-values](2026-11-08-call-key-slot-stored-values.md): Step 2: a value call's member is keyed on the value its slot stores (#6826).
 - [2026-11-08-step7-name-twin-classify](2026-11-08-step7-name-twin-classify.md): Step 7: the classifier's name-twin lookups go (#6825).
