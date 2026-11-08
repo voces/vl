@@ -97,6 +97,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  binderNameAt,
   extGNames,
   extGTys,
   isExprKid,
@@ -375,6 +376,12 @@ import {
 import { checkNotIntrinsicImportLocal } from "./check_emit_queries"
 import { esDumpText, esTextOfDecl } from "./check_program"
 import { checkNotIntrinsicName } from "./check_node_rules"
+import {
+  ifvFlush,
+  ifvIsValueIntrinsic,
+  ifvReset,
+  ifvWrapperFor,
+} from "./intr_fn_value"
 import { tErr, tErrBuiltinTyDecl } from "./check_relate_core"
 import { jwSiteNode } from "./check_side_rows"
 import { declIsExportedFn } from "./check_exp_obs"
@@ -1073,11 +1080,26 @@ function vcEpReplay(src: string): i32 {
 // renamed to `name$m0` by `ambientRenameSingle`.
 let ambTopRenamed: string[] = []
 
-// Whether any node of the program binds an ambient function's name.
+// Whether any node of the program binds an ambient function's name, or reads a wrappable
+// intrinsic outside callee position. A callee precedes its call in the arena.
 function progBindsAmbientName(): boolean {
+  const vals: {[i32]: boolean} = Map()
+  let open = 0
   let i = 0
   while i < P.nodes.length {
     const n = nodeAt(i)
+    if n is Ident {
+      if ifvIsValueIntrinsic(n.identName) {
+        vals[i] = true
+        open = open + 1
+      }
+    }
+    if n is Call {
+      if vals[n.callFn] ?? false {
+        vals[n.callFn] = false
+        open = open - 1
+      }
+    }
     let nm = ""
     if n is FuncDecl { nm = n.fnName }
     if n is LetDecl { nm = n.letName }
@@ -1090,7 +1112,7 @@ function progBindsAmbientName(): boolean {
     if nm != "" && isAmbientFnName(nm) { return true }
     i = i + 1
   }
-  false
+  open > 0
 }
 
 // The single-source half of the module merge's ambient rename: a binding named like an ambient
@@ -1098,6 +1120,7 @@ function progBindsAmbientName(): boolean {
 // that binds one is walked once with only those rows. A program that binds none is untouched.
 function ambientRenameSingle(root: i32): i32 {
   ambTopRenamed = []
+  ifvReset()
   if !progBindsAmbientName() { return 0 }
   modRenameClear()
   modSelfFnReset()
@@ -1127,7 +1150,9 @@ function ambientRenameSingle(root: i32): i32 {
   modTyShadow = []
   modRwMod = -1
   modAmbMod = 0
+  modIfvTopOf(root)
   modRwStmt(root)
+  ifvFlush(root)
   modSelfFnReset()
   0
 }
@@ -4982,6 +5007,7 @@ function modRewriteAll(roots: i32[]) {
   modBuiltinTyTargets = []
   modCanonTo = Map()
   modCollectSelfFns(roots)
+  ifvReset()
   let o2 = 0
   while o2 < modOrder.length {
     modRenameReplay(o2)
@@ -4996,7 +5022,9 @@ function modRewriteAll(roots: i32[]) {
     modTyShadow = []
     modRwMod = modOrder[o2]
     modAmbMod = modOrder[o2]
+    modIfvTopOf(roots[o2])
     modRwStmt(roots[o2])
+    ifvFlush(roots[o2])
     o2 = o2 + 1
   }
   modRwMod = -1
@@ -8515,6 +8543,30 @@ function modRenamed(name: string): string {
   if row < 0 { return name }
   modRenameTo[row]
 }
+// The top-level names the module being rewritten declares, which an intrinsic read never means.
+let modIfvTop: string[] = []
+
+// Whether a read of `name` here is something other than a wrappable intrinsic: a non-intrinsic
+// spelling, or a name a binding in scope, the module's top level, or the merge's renames claim.
+function modIfvBound(name: string): boolean {
+  if !ifvIsValueIntrinsic(name) { return true }
+  if strListHas(modShadow, name) || strListHas(modIfvTop, name) { return true }
+  sidArrGet(modRenameFirstBySid, sidLookup(name)) >= 0
+}
+
+// Records the top-level names of program `root` for `modIfvBound`.
+function modIfvTopOf(root: i32) {
+  modIfvTop = []
+  const r = nodeAt(root)
+  if r is Program {
+    for sx in r.progStmts {
+      const nm = binderNameAt(sx)
+      if nm != "" { modIfvTop.push(nm) }
+    }
+  }
+  0
+}
+
 // Whether `name` is one of the ambient functions a program reaches with no import. A binding of
 // one shadows it (spec Q11): the rewrite renames the binding and its references apart, so a bare
 // `print` that survives the rewrite is always the builtin.
@@ -8928,7 +8980,18 @@ function modRwExpr(ix: i32): i32 {
   const n = nodeAt(ix)
   match n {
     Ident => {
-      if modRwCalleeIx != ix { modOvNoteUse(ix, -1, n.identName) }
+      if modRwCalleeIx != ix {
+        modOvNoteUse(ix, -1, n.identName)
+        if modIfvBound(n.identName) == false {
+          const sfx = if modRwMod >= 0 { modSuffixOf(modRwMod) } else { "" }
+          const wn = ifvWrapperFor(n.identName, sfx, ix)
+          if wn != "" {
+            n.identName = wn
+            sidNoteNodeName(ix, -1)
+            return 0
+          }
+        }
+      }
       n.identName = modRenamed(n.identName)
       // R4: the in-place name write the self-compile exercises hardest — the merge
       // renames every colliding top-level reference in every compiler module. The checker,

@@ -1,0 +1,145 @@
+// An intrinsic named as a value (`const f = __load_i32__`, `xs.map(sqrt)`) reads a wrapper: an
+// ordinary top-level function of the intrinsic's signature whose body calls it, built once per
+// intrinsic per module and appended to that module's program before the checker runs. The
+// width-generic numeric intrinsics take their family's default width as a value: f64, or i32.
+import {
+  Program,
+  TS_NAME,
+  adoptNodeTok,
+  arenaSetNode,
+  i32ToStr,
+  mkBlock,
+  mkCall,
+  mkFunc,
+  mkIdent,
+  mkParam,
+  mkReturn,
+  mkTypeRef,
+  nodeAt,
+  setAnnTs,
+  tsLeaf,
+  tsToName,
+} from "./ast"
+import { nodePos } from "./fmt_util"
+import {
+  floatIntrArity,
+  intIntrArity,
+  intIntrIsCompare,
+} from "./check_intrinsics"
+import { ambientTyOf } from "./check_scopes"
+import { luTs } from "./check_annot_resolve"
+import { TY_BOOL, TY_F64, TY_I32, TY_NEVER, TyFunc, tyAt } from "./check_types"
+import { isVoidTy, tyHasTyVar } from "./tyquery"
+
+// The wrappers built for the module being rewritten: the intrinsic each wraps, its name, and the
+// declarations `ifvFlush` has yet to append.
+let ifvIntr: string[] = []
+let ifvName: string[] = []
+let ifvPending: i32[] = []
+
+// Forgets every wrapper; called once per program, before any module is rewritten.
+export function ifvReset() {
+  ifvIntr = []
+  ifvName = []
+  ifvPending = []
+  0
+}
+
+// Whether `name`, unbound by the program, is an intrinsic a value read must wrap.
+export function ifvIsValueIntrinsic(name: string): boolean {
+  if floatIntrArity(name) > 0 || intIntrArity(name) > 0 { return true }
+  if name.length < 4 || name[0] != 95 || name[1] != 95 { return false }
+  const t = ambientTyOf(name)
+  if t < 0 { return false }
+  const ft = tyAt(t)
+  if ft is TyFunc { return !tyHasTyVar(t) }
+  false
+}
+
+// The wrapper of intrinsic `name` for the module whose top-level names carry `suffix`, built at
+// its first read `site`. Answers "" when the signature has no spelling, leaving the read as is.
+export function ifvWrapperFor(name: string, suffix: string, site: i32): string {
+  let k = 0
+  while k < ifvIntr.length {
+    if ifvIntr[k] == name { return ifvName[k] }
+    k = k + 1
+  }
+  const ps: i32[] = []
+  let ret = -1
+  const fa = floatIntrArity(name)
+  const ia = intIntrArity(name)
+  if fa > 0 || ia > 0 {
+    const w = if fa > 0 { TY_F64 } else { TY_I32 }
+    const n = if fa > 0 { fa } else { ia }
+    while ps.length < n { ps.push(w) }
+    ret = if fa == 0 && intIntrIsCompare(name) { TY_BOOL } else { w }
+  } else {
+    const ft = tyAt(ambientTyOf(name))
+    if ft is TyFunc {
+      for p in ft.fnParamTypes { ps.push(p) }
+      ret = ft.fnRet
+    }
+  }
+  if ret < 0 { return "" }
+  const pos = nodePos(site)
+  const params: i32[] = []
+  const args: i32[] = []
+  let i = 0
+  while i < ps.length {
+    const ann = ifvAnnot(ps[i], site, pos)
+    if ann < 0 { return "" }
+    const pn = "$a" + i32ToStr(i)
+    params.push(ifvAt(mkParam(pn, ann, -1, 0, 0, pos), site))
+    args.push(ifvAt(mkIdent(pn, pos), site))
+    i = i + 1
+  }
+  const rAnn = ifvAnnot(ret, site, pos)
+  if rAnn < 0 { return "" }
+  const call = ifvAt(mkCall(ifvAt(mkIdent(name, pos), site), args, pos), site)
+  const stmts: i32[] = []
+  if isVoidTy(ret) || ret == TY_NEVER {
+    stmts.push(call)
+  } else {
+    stmts.push(ifvAt(mkReturn(call, pos), site))
+  }
+  const body = ifvAt(mkBlock(stmts, pos), site)
+  const wn = name + "$fv" + suffix
+  const tps: string[] = []
+  ifvPending.push(ifvAt(mkFunc(wn, tps, params, rAnn, body, pos), site))
+  ifvIntr.push(name)
+  ifvName.push(wn)
+  wn
+}
+
+// Appends the wrappers built since the last flush to the program `root`, and starts the next
+// module's set empty.
+export function ifvFlush(root: i32) {
+  if ifvPending.length > 0 {
+    const r = nodeAt(root)
+    if r is Program {
+      const stmts: i32[] = []
+      for s in r.progStmts { stmts.push(s) }
+      for d in ifvPending { stmts.push(d) }
+      const np: Program = { progStmts: stmts, pos: r.pos }
+      arenaSetNode(root, np)
+    }
+  }
+  ifvReset()
+}
+
+function ifvAt(n: i32, site: i32): i32 {
+  adoptNodeTok(n, site)
+  n
+}
+
+// An annotation node spelling `ty`, or -1 when it has none.
+function ifvAnnot(ty: i32, site: i32, pos: i32): i32 {
+  let root = -1
+  if isVoidTy(ty) { root = tsLeaf(TS_NAME, "void") }
+  else if ty == TY_NEVER { root = tsLeaf(TS_NAME, "never") }
+  else { root = luTs(ty) }
+  if root < 0 { return -1 }
+  const tr = ifvAt(mkTypeRef(tsToName(root), pos), site)
+  setAnnTs(tr, root)
+  tr
+}
