@@ -947,6 +947,8 @@ function elabHoleRowBindKey(r: i32, from: i32): string {
 // instance count each has been enqueued up to.
 let elabHoleDeferred: i32[] = []
 let elabHoleDeferredAt: i32[] = []
+// By deferred row, whether it is a lambda's template row that waits for each instance's own walk.
+let elabHoleDeferredOwn: boolean[] = []
 
 // Enqueues the hole-pin rows recorded since the last drain. A root row of a declaration that
 // reads an enclosing declaration's open types is enqueued under each instance of that
@@ -963,6 +965,8 @@ function elabDrainHoleRows() {
       if from < 0 && elabParentFor(d, -1) == -2 {
         elabHoleDeferred.push(r)
         elabHoleDeferredAt.push(0)
+        elabHoleDeferredOwn.push(elabLamPerEncl(d))
+        elabHolePending.push([])
       } else {
         // An instance only a D4551 default asks for is a guess, as the default instance is.
         elabGuessing = from < 0 && elabDefaultRowHas(d, elabHoleRowT[r])
@@ -986,6 +990,8 @@ function elabDrainHoleRows() {
         if from < 0 && elabLamPerEncl(d) && elabEncl.has(d) {
           elabHoleDeferred.push(r)
           elabHoleDeferredAt.push(0)
+          elabHoleDeferredOwn.push(true)
+          elabHolePending.push([])
         }
       }
     }
@@ -1017,25 +1023,33 @@ function elabDrainHoleRows() {
     const r = elabHoleDeferred[i]
     const d = elabHoleRowDecl[r]
     const e = elabEncl.get(d) ?? -1
+    // A template row of a lambda keyed per encloser instance fills only an instance whose own
+    // walk pinned it nowhere: an instance that did holds its own pins (D15112). So it waits, in
+    // the row's pending list, until the instance's walk has finished.
+    const own = elabHoleDeferredOwn[i]
+    const pend = elabHolePending[i]
     let a = elabHoleDeferredAt[i]
     elabHoleDeferredAt[i] = ekDecl.length
     while a < ekDecl.length {
-      if ekDecl[a] == e {
-        // A template row of a lambda keyed per encloser instance fills only an instance whose own
-        // walk pinned it nowhere: an instance that did holds its own pins (D15112).
-        if (
-          !(elabLamPerEncl(d)
-            && elabHoleRowFrom[r] < 0
-            && (elabOwnHoleRows[i32ToStr(a) + "^" + i32ToStr(d)] ?? false))
+      if ekDecl[a] == e { pend.push(a) }
+      a = a + 1
+    }
+    if pend.length > 0 {
+      const still: i32[] = []
+      for b in pend {
+        if own && !(b < elabWalkedKeys.length && elabWalkedKeys[b]) {
+          still.push(b)
+        } else if (
+          !(own && (elabOwnHoleRows[i32ToStr(b) + "^" + i32ToStr(d)] ?? false))
         ) {
           elabReachNote(
-            a,
-            elabEnqueue(d, elabHoleRowN[r], elabHoleRowT[r], a),
+            b,
+            elabEnqueue(d, elabHoleRowN[r], elabHoleRowT[r], b),
             -1,
           )
         }
       }
-      a = a + 1
+      elabHolePending[i] = still
     }
     i = i + 1
   }
@@ -1044,6 +1058,10 @@ function elabDrainHoleRows() {
 
 // Each `instance^declaration` whose own walk banked a hole-pin row, marked as the rows drain.
 let elabOwnHoleRows: {[string]: boolean} = Map()
+// The instances whose body walk has finished, and by deferred row, the encloser instances it
+// waits to fill.
+let elabWalkedKeys: boolean[] = []
+let elabHolePending: i32[][] = []
 
 // Builds each delivered value whose result only converts to its destination's as that result,
 // beside the instance at its own (D9282).
@@ -2983,6 +3001,8 @@ function elabOne(k: i32) {
   const was = elabWalkNowSet(k)
   const r = elabOneAt(k)
   elabWalkNowSet(was)
+  while elabWalkedKeys.length <= k { elabWalkedKeys.push(false) }
+  elabWalkedKeys[k] = true
   r
 }
 
@@ -8752,7 +8772,10 @@ export function elabRun() {
   elabWideCur = 0
   elabHoleDeferred = []
   elabOwnHoleRows = Map()
+  elabWalkedKeys = []
+  elabHolePending = []
   elabHoleDeferredAt = []
+  elabHoleDeferredOwn = []
   ekDone = []
   elabWalkKeys = []
   elabSlotKeys = Map()
