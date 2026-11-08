@@ -2,7 +2,7 @@
 
 Step 5, union boxing round 5. Follows `2026-11-08-unionbox-last-write-positions.md` (#6779).
 
-## The instance `??` join: D15551, closed here
+## The instance `??` join: D15553, closed here
 
 `D<A, B>(d: i32, v: A | B | null) { print(v ?? d) }` at `A = f64` recorded every box under the
 `??` (`d`, `v`, the print argument) at `f64|string`. The ruling: an instance equals its direct
