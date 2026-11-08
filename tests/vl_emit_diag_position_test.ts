@@ -230,9 +230,9 @@ Deno.test({
   },
 });
 
-// A refusal raised before any body is lowered (D15154): a `monomorphize:` refusal is anchored at
-// the call being instantiated, line 10 (D14843's witness, since a generic `use<T>(ys: T[])` handed
-// the list runs). The collect phase has no known check-clean refusal left (D15150, the last, now
+// A refusal raised before any body is lowered (D15154): a refusal mono raises while it pins a call
+// is anchored there, at the generic argument of `run(add)` on line 14 (D14843's witness, since a
+// generic `use<T>(ys: T[])` handed the list runs). The collect phase has no known check-clean refusal left (D15150, the last, now
 // runs); add the next one found here, anchored at its declaration. The instance case above is the
 // restore's control: `take(id, id)` is instantiated before `take`'s body refuses, and a cursor left
 // armed would name the call instead of `take`.
@@ -259,7 +259,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const cases: { name: string; src: string; line: number }[] = [
-      { name: "monomorphize", src: MONO_WITNESS, line: 10 },
+      { name: "monomorphize", src: MONO_WITNESS, line: 14 },
     ];
     for (const c of cases) {
       const dir = await Deno.makeTempDir({ prefix: "vl_emit_early_" });

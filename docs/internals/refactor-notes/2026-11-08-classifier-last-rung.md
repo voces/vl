@@ -41,7 +41,8 @@ before.
 |---|---|---|
 | `classifier-census --callers` | pre-only 0 · both 5 | **pre-only 0 · both 0** (post-only 73) |
 | sweep, 23,713 programs | | 23,703 same · 0 bytes-only · 10 output movers (message only) · 0 `runs → not-runs` · 0 new traps |
-| seed (fixpoint) | 6,577,862 | 6,577,925 (+63) |
+| seed (fixpoint) | 6,577,862 | 6,577,874 (+12) |
+| pin-helper budget (`emit_mono.vl`) | 926 | 926 (the pin is inlined; `cloRetTypeName` is deleted) |
 
 The 13 programs keep their outcome (`emit_reject`), and their message and position move to the
 argument. Two `tests/cases/closures` headers quote the new text. The eight inventory rows among the
@@ -56,3 +57,7 @@ argument. Two `tests/cases/closures` headers quote the new text. The eight inven
 * D15568's join: `elabListParamSource` returns one parameter. Two parameters writing one list need
   it to return the set of parameters, and the tag plan (`check_fn_tag.vl`) must type the slots at
   the union of their sets.
+* `vl_emit_diag_position_test`'s instance guard is red. Its fixture is D15568's program, which
+  now refuses at the argument instead of on `take`'s line 7, so it needs another check-clean
+  refusal raised inside a hole parameter's instance. The `monomorphize` guard reads the new
+  anchor, `run(add)` on line 14. The live-sites row quotes the new literal.
