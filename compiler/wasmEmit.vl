@@ -8,6 +8,7 @@ import {
   boxDstShadowEnter,
   boxDstShadowLeave,
   boxDstShadowNote,
+  numPairShadowNote,
 } from "./box_dst_shadow"
 import { repSlotOfKind } from "./emit_rep_slot"
 import {
@@ -900,6 +901,7 @@ import {
 } from "./emit_atom_kinds"
 import {
   atomSrcTyAt,
+  numPairAt,
   boxDstTyAt,
   ctxTyAt,
   fnEnvIdxOf,
@@ -22427,30 +22429,125 @@ function emitInstLitAs(exprIx: i32, w: string, fnIx: i32): i32 {
   emitSignedNumLitAt(unwrapParen(exprIx), w)
 }
 
+// The node whose next emission the table widens at its recorded numeric pair, or -1.
+let numSeat = -1
+
+// The numeric pair (`numPairCode`) the checker recorded for `ix` at instance `fnIx`, at the node,
+// its unparenthesised form or the node it stands in for; -1 for none.
+function numRecordAt(ix: i32, fnIx: i32): i32 {
+  let r = numPairAt(ix, fnIx)
+  if r < 0 { r = numPairAt(unwrapParen(ix), fnIx) }
+  if r < 0 { r = numPairAt(nodeSrc[ix] ?? -1, fnIx) }
+  r
+}
+
+// The source kind of numeric pair `r`, a `u8` read as the `i32` it is stored in.
+function numPairSrc(r: i32): i32 {
+  const s = r / 8
+  if s == 2 { 1 } else { s }
+}
+
+// Why the site widens `ix` from kind `src` to `dst` itself, or "" where the record serves: the
+// node is not held by another conversion and its record names the same pair.
+function numFloorWhy(src: i32, dst: i32, ix: i32, fnIx: i32): string {
+  if ix == coerceHeld { return "floor: held" }
+  const r = numRecordAt(ix, fnIx)
+  if r < 0 { return "floor: no record" }
+  if r % 8 != dst { return "floor: dst differs" }
+  if numPairSrc(r) != src { return "floor: src differs" }
+  ""
+}
+
+// The one instruction that takes a value of kind `src` to kind `dst`: none for the same kind.
+// Returns 0, or -1 for a pair no lowering widens.
+function emitNumOpOf(src: i32, dst: i32): i32 {
+  if src == dst { return 0 }
+  if src == 1 && dst == 3 {
+    fbI64ExtendI32S()
+    return 0
+  }
+  if src == 1 && dst == 4 {
+    fbF64ConvertI32S()
+    return 0
+  }
+  if src == 3 && dst == 4 {
+    fbF64ConvertI64S()
+    return 0
+  }
+  if src == 5 && dst == 4 {
+    fbF64PromoteF32()
+    return 0
+  }
+  if src == 1 && dst == 5 {
+    fbF32ConvertI32S()
+    return 0
+  }
+  emitFail("emitProgram: a numeric delivery records a pair no widening converts")
+}
+
+// The widening of recorded numeric pair `r`.
+function emitNumPairOp(r: i32): i32 { emitNumOpOf(numPairSrc(r), r % 8) }
+
+// A value of plain kind `src` the site derived, delivered at kind `dst`: the table widens it at the
+// checker's numeric pair where that names the same pair, else the site widens it, a named floor.
+// Returns 0, or -1 failed.
+function emitNumPlain(body: u8[], src: i32, dst: i32, exprIx: i32, fnIx: i32): i32 {
+  const why = numFloorWhy(src, dst, exprIx, fnIx)
+  if boxDstShadowArmed() {
+    boxDstShadowAs(if why == "" { "table" } else { why })
+    numPairShadowNote(src, dst, exprIx, fnIx)
+  }
+  if why == "" {
+    const seat = numSeat
+    numSeat = exprIx
+    const r = emitExpr(body, exprIx, fnIx)
+    numSeat = seat
+    return r
+  }
+  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  emitNumOpOf(src, dst)
+}
+
+// The numeric shadow's note for a site lowering `exprIx` from kind `src` to `dst` (-1: built at
+// `dst`), where the shadow is armed.
+function numNote(src: i32, dst: i32, exprIx: i32, fnIx: i32) {
+  if boxDstShadowArmed() { numPairShadowNote(src, dst, exprIx, fnIx) }
+  0
+}
+
+// `numNote` after a build that returned `r`, handing `r` back.
+function numNoted(r: i32, src: i32, dst: i32, exprIx: i32, fnIx: i32): i32 {
+  if r >= 0 { numNote(src, dst, exprIx, fnIx) }
+  r
+}
+
 // Emit the expression at `exprIx` as an i64 value: an expression that already yields i64 emits
 // as-is, and any other i32 source is emitted then sign-extended (`i64.extend_i32_s`).
 export function emitExprAsI64(body: u8[], exprIx: i32, fnIx: i32) {
   const lit = emitInstLitAs(exprIx, "i64", fnIx)
-  if lit != -2 { return lit }
+  if lit != -2 { return numNoted(lit, -1, 3, exprIx, fnIx) }
   const asgLit = emitAsgLitAs(body, exprIx, "i64", fnIx)
-  if asgLit != -2 { return asgLit }
+  if asgLit != -2 { return numNoted(asgLit, -1, 3, exprIx, fnIx) }
   const inner = unwrapParen(exprIx)
   const rw64 = asgRadixWidePrim(inner, fnIx)
-  if rw64 != "" { return emitAsgRadixAs(body, inner, rw64, "i64", fnIx) }
+  if rw64 != "" {
+    numNote(-1, 3, exprIx, fnIx)
+    return emitAsgRadixAs(body, inner, rw64, "i64", fnIx)
+  }
   if exprIsI64(widenClassifyExpr(exprIx, fnIx), fnIx) {
     // A join whose wide arm claims `i64` can still be a box of numbers (D3517).
     if njBoxWidens(exprIx, fnIx) {
+      numNote(6, 3, exprIx, fnIx)
       return emitNumUnionConvert(body, exprIx, 3, fnIx)
     }
-    return emitExpr(body, exprIx, fnIx)
+    return emitNumPlain(body, 3, 3, exprIx, fnIx)
   }
   // A numeric union converts at the member it holds; anything else is an i32, sign-extended.
   if njWidensOut(exprIx, fnIx) {
+    numNote(6, 3, exprIx, fnIx)
     return emitNumUnionConvert(body, exprIx, 3, fnIx)
   }
-  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-  fbI64ExtendI32S()
-  0
+  emitNumPlain(body, 1, 3, exprIx, fnIx)
 }
 
 // Emit the expression at `exprIx` as an f64 value: already-f64 emits as-is, otherwise a
@@ -22463,37 +22560,38 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32) {
   // via its float literal — without this check the f64 fast-path would emit f32 into an f64
   // slot and trap. A pure-f64 expression is not `exprIsF32`, so it still takes the fast path.
   const asgLit = emitAsgLitAs(body, exprIx, "f64", fnIx)
-  if asgLit != -2 { return asgLit }
+  if asgLit != -2 { return numNoted(asgLit, -1, 4, exprIx, fnIx) }
   const rw64f = asgRadixWidePrim(unwrapParen(exprIx), fnIx)
-  if rw64f != "" { return emitAsgRadixAs(body, exprIx, rw64f, "f64", fnIx) }
+  if rw64f != "" {
+    numNote(-1, 4, exprIx, fnIx)
+    return emitAsgRadixAs(body, exprIx, rw64f, "f64", fnIx)
+  }
   const f64Cls = widenClassifyExpr(exprIx, fnIx)
   if exprIsF32(f64Cls, fnIx) {
-    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-    fbF64PromoteF32()
-    return 0
+    return emitNumPlain(body, 5, 4, exprIx, fnIx)
   }
   if exprIsF64(f64Cls, fnIx) || exprIsI64(f64Cls, fnIx) {
     if njBoxWidens(exprIx, fnIx) {
+      numNote(6, 4, exprIx, fnIx)
       return emitNumUnionConvert(body, exprIx, 4, fnIx)
     }
   }
-  if exprIsF64(f64Cls, fnIx) { return emitExpr(body, exprIx, fnIx) }
+  if exprIsF64(f64Cls, fnIx) {
+    return emitNumPlain(body, 4, 4, exprIx, fnIx)
+  }
   const lit = emitInstLitAs(exprIx, "f64", fnIx)
-  if lit != -2 { return lit }
+  if lit != -2 { return numNoted(lit, -1, 4, exprIx, fnIx) }
   // An i64 source converts (signed) to f64.
   if exprIsI64(f64Cls, fnIx) {
-    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-    fbF64ConvertI64S()
-    return 0
+    return emitNumPlain(body, 3, 4, exprIx, fnIx)
   }
   // A numeric union converts at the member it holds.
   if njWidensOut(exprIx, fnIx) {
+    numNote(6, 4, exprIx, fnIx)
     return emitNumUnionConvert(body, exprIx, 4, fnIx)
   }
   // Otherwise an i32 expression (or integer literal): convert (signed) to f64.
-  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-  fbF64ConvertI32S()
-  0
+  emitNumPlain(body, 1, 4, exprIx, fnIx)
 }
 
 // Emit the expression at `exprIx` as an f32 value: already-f32 emits as-is; otherwise an i32
@@ -22501,32 +22599,36 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32) {
 // (lossy above 2^24), so only an exactness-gated literal takes the convert.
 export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32) {
   const lit = emitInstLitAs(exprIx, "f32", fnIx)
-  if lit != -2 { return lit }
+  if lit != -2 { return numNoted(lit, -1, 5, exprIx, fnIx) }
   // A float literal tail of a join typed `f32` re-encodes at single precision, as the join's
   // hoisted twin builds it (owner ruling, D3657).
   if cexLitPeel(exprIx) >= 0 && isFloatLitExpr(unwrapParen(exprIx)) {
+    numNote(-1, 5, exprIx, fnIx)
     return emitSignedNumLitAt(unwrapParen(exprIx), "f32")
   }
   const asgLit = emitAsgLitAs(body, exprIx, "f32", fnIx)
-  if asgLit != -2 { return asgLit }
+  if asgLit != -2 { return numNoted(asgLit, -1, 5, exprIx, fnIx) }
   const rw32f = asgRadixWidePrim(unwrapParen(exprIx), fnIx)
-  if rw32f != "" { return emitAsgRadixAs(body, exprIx, rw32f, "f32", fnIx) }
+  if rw32f != "" {
+    numNote(-1, 5, exprIx, fnIx)
+    return emitAsgRadixAs(body, exprIx, rw32f, "f32", fnIx)
+  }
   // An already-f32-valued expression (a variable, an f32 arithmetic / call result) emits
   // directly. An assignment classifies by its target cell (`widenClassifyExpr`), as the
   // i64/f64 widenings do.
   if exprIsF32(widenClassifyExpr(exprIx, fnIx), fnIx) {
     if njBoxWidens(exprIx, fnIx) {
+      numNote(6, 5, exprIx, fnIx)
       return emitNumUnionConvert(body, exprIx, 5, fnIx)
     }
-    return emitExpr(body, exprIx, fnIx)
+    return emitNumPlain(body, 5, 5, exprIx, fnIx)
   }
   // A numeric union converts at the member it holds; anything else is an i32, converted.
   if njWidensOut(exprIx, fnIx) {
+    numNote(6, 5, exprIx, fnIx)
     return emitNumUnionConvert(body, exprIx, 5, fnIx)
   }
-  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-  fbF32ConvertI32S()
-  0
+  emitNumPlain(body, 1, 5, exprIx, fnIx)
 }
 
 // Lower `exprIx` in the rep of a value atom of kind `k` — the emit half of
@@ -29623,6 +29725,7 @@ type CoerceKind = "none"
   | "box"
   | "unbox"
   | "atomstr"
+  | "numeric"
 
 // The coercion recorded at `ix` in instance `fnIx`. A box is the outer one: any other record
 // at the node converts the value inside it. Otherwise each record is of one value type (a list,
@@ -29631,6 +29734,7 @@ function coerceKindAt(ix: i32, fnIx: i32): CoerceKind {
   if boxAtTable(ix, fnIx) { return "box" }
   if armSeat >= 0 && ix == armSeat { return "unbox" }
   if atomSeat >= 0 && ix == atomSeat { return "atomstr" }
+  if numSeat >= 0 && ix == numSeat { return "numeric" }
   if listCopyAtNode(ix) >= 0 { return "listCopy" }
   if fnCloCoerceAtNode(ix) >= 0 { return "fnClo" }
   if mapDeliveryRecorded {
@@ -29685,6 +29789,11 @@ function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
     return rb
   }
   if ck == "atomstr" { return emitAtomStrAtRecord(body, exprIx, fnIx) }
+  if ck == "numeric" {
+    numSeat = -1
+    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+    return emitNumPairOp(numRecordAt(exprIx, fnIx))
+  }
   if ck == "unbox" {
     // The seat is spent, so any other record at the node converts the value before the cast.
     armSeat = -1
@@ -35123,6 +35232,7 @@ export function wasmEmitStateReset() {
   armSeat = -1
   armServed = -1
   atomSeat = -1
+  numSeat = -1
   arrNewFillDepth = 0
   eqStashL = -1
   eqStashR = -1
