@@ -51,4 +51,5 @@ as r16 said.
 
 **Proof.** `scripts/gate.sh` on the final tree: all 23 rows pass. Both sides are fixpoint seeds: base 6,541,414 bytes, this PR 6,541,878 (+464).
 The sweep over 23,688 programs: 23,688 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs`,
-0 new traps. The seed reads +2.3% against the size baseline, under the +3% bar.
+0 new traps. Merged with master `07eeefc8`, it is 6,543,942 bytes, also a fixpoint, +2.3% against the
+size baseline (under the +3% bar).
