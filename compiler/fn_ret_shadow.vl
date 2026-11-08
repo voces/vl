@@ -49,10 +49,15 @@ import {
   TY_NEVER,
   TY_VOID,
   TyArray,
+  TyErr,
   TyFunc,
+  TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
+  TyPrim,
+  TyUnion,
   TyVar,
   mkArrayTy,
   mkNullableTy,
@@ -62,9 +67,12 @@ import {
 import {
   elabCheckedTyOf,
   elabDeliveredRowOf,
+  elabHeldValTy,
+  elabHoleFnClosed,
   elabKeyAtPos,
   elabNestedResultOf,
   elabResultOf,
+  elabSlotTyAt,
   elabSrcDecl,
   elabSubstClosed,
   elabUnboundTpTy,
@@ -100,7 +108,12 @@ import {
   rlElemName,
 } from "./emit_state"
 import { i32ListHas } from "./listutil"
-import { elabTyClosed } from "./check_elab_cap"
+import {
+  elabTyClosed,
+  fnTagCallSetOf,
+  fnTagCalls,
+  fnTagMembers,
+} from "./check_elab_cap"
 import { fnIndexOfInScopeAt } from "./emit_local_scope"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { nonNullTy, tyHasTyVar } from "./tyquery"
@@ -181,6 +194,10 @@ export function fnRecordedRetTy(fe: i32): i32 {
     const sr = frsValuesStampRow(fx, r, frsIsPlainFn(fx))
     if sr >= 0 { r = sr }
   }
+  if r >= 0 && r < T.tys.length && repSigRetTokOfTy(r) == "" {
+    const br = frsValuesBuiltTy(fe, r)
+    if br >= 0 { r = br }
+  }
   if r >= 0 { return frsClosedHoleRet(fx, r) }
   const tr = frsTemplateRet(fe, nested, k)
   if tr >= 0 { return tr }
@@ -189,7 +206,185 @@ export function fnRecordedRetTy(fe: i32): i32 {
   const nr = if nested && k >= 0 { elabNestedResultOf(fx, k) } else { -1 }
   if nr >= 0 { return frsClosedHoleRet(fx, nr) }
   const vr = frsValuesRet(fe)
-  if vr >= 0 { frsClosedHoleRet(fx, vr) } else { -1 }
+  if vr >= 0 { return frsClosedHoleRet(fx, vr) }
+  frsHoleLambdaRet(fe)
+}
+
+// Where result `r` of function `fe` has no token: the one type with a token every returned value
+// is built at, as the elaboration and the record rows record it (`frsValueBuiltTy`), a record at
+// any record and any other result where it closes `r`'s holes and keeps the rest; else -1.
+function frsValuesBuiltTy(fe: i32, r: i32): i32 {
+  if r < 0 || r >= T.tys.length || fe < 0 || fe >= fnStmts.length { return -1 }
+  const fn = nodeAt(fnStmts[fe])
+  if !(fn is FuncDecl) || fn.fnBody < 0 || frsValuesDepth >= 8 { return -1 }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  if vals.length == 0 { return -1 }
+  const rec = tyAt(r) is TyObj && !tyHasTyVar(r)
+  frsValuesDepth = frsValuesDepth + 1
+  let t = -1
+  for v in vals {
+    const bt = frsValueBuiltTy(unwrapParen(v), fe)
+    const ok = bt >= 0
+      && bt < T.tys.length
+      && repSigRetTokOfTy(bt) != ""
+      && (if rec { tyAt(bt) is TyObj } else { frsClosesHoles(r, bt, 0) })
+    if !ok || (t >= 0 && !tySame(t, bt)) {
+      frsValuesDepth = frsValuesDepth - 1
+      return -1
+    }
+    t = bt
+  }
+  frsValuesDepth = frsValuesDepth - 1
+  t
+}
+
+// The type returned value `v` of function `fe` is built at: an assignment's at its target's build;
+// a call of another function at its recorded result; a binding at its build, slot fact or a
+// `const`'s initializer's held type, the first with a token; else `elabHeldValTy`. -1 for none.
+function frsValueBuiltTy(v: i32, fe: i32): i32 {
+  if v < 0 || v >= P.nodes.length || fe < 0 || fe >= fnStmts.length {
+    return -1
+  }
+  const fx = fnStmts[fe]
+  const n = nodeAt(v)
+  if n is BinExpr && n.binOp == "=" {
+    const l = unwrapParen(n.binLeft)
+    const d = if l >= 0 && nodeAt(l) is Ident { identDeclOf(l) } else { -1 }
+    return if d >= 0 { recBuildTyIn(recBuildTable(), d, false) } else { -1 }
+  }
+  const root = retValueRootCall(v)
+  const rn = if root >= 0 { nodeAt(root) } else { null }
+  if rn is Call && rn.callFn >= 0 && root == v {
+    const cd = identBoundFnDeclOf(rn.callFn)
+    const ce = if cd >= 0 { fnStmtsPosOf(cd) } else { -1 }
+    if ce >= 0 && ce != fe { return fnRecordedRetTy(ce) }
+  }
+  if n is Ident {
+    const d = identDeclOf(v)
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if !(dn is LetDecl) { return -1 }
+    const b = recBuildTyIn(recBuildTable(), d, false)
+    if frsHasTok(b) { return b }
+    const st = elabSlotTyAt(d, [], fx)
+    if frsHasTok(st) { return st }
+    // A `let` the body may reassign is not built at its initializer.
+    const init = if dn.letKw == "const" { dn.letInit } else { -1 }
+    const it = if init >= 0 { elabHeldValTy(init, fx) } else { -1 }
+    return if frsHasTok(it) { it } else { -1 }
+  }
+  elabHeldValTy(v, fx)
+}
+
+// Whether type `t` is one whose result has a token.
+function frsHasTok(t: i32): boolean {
+  t >= 0 && t < T.tys.length && repSigRetTokOfTy(t) != ""
+}
+
+// Whether closed type `c` is open type `r` with each hole closed: equal wherever `r` is closed.
+function frsClosesHoles(r: i32, c: i32, depth: i32): boolean {
+  if r < 0 { return true }
+  if c < 0 || r >= T.tys.length || c >= T.tys.length || depth > 32 {
+    return false
+  }
+  if tySame(r, c) { return true }
+  const a = tyAt(r)
+  const b = tyAt(c)
+  if a is TyVar { return true }
+  if a is TyArray && b is TyArray {
+    return frsClosesHoles(a.aElem, b.aElem, depth + 1)
+  }
+  if a is TyNullable && b is TyNullable {
+    return frsClosesHoles(a.nInner, b.nInner, depth + 1)
+  }
+  if a is TyMap && b is TyMap {
+    return a.mSet == b.mSet
+      && frsClosesHoles(a.mKey, b.mKey, depth + 1)
+      && frsClosesHoles(a.mVal, b.mVal, depth + 1)
+  }
+  if a is TyFunc && b is TyFunc {
+    if a.fnParamTypes.length != b.fnParamTypes.length { return false }
+    let i = 0
+    while i < a.fnParamTypes.length {
+      if !frsClosesHoles(a.fnParamTypes[i], b.fnParamTypes[i], depth + 1) {
+        return false
+      }
+      i = i + 1
+    }
+    return frsClosesHoles(a.fnRet, b.fnRet, depth + 1)
+  }
+  if a is TyObj && b is TyObj {
+    if a.objFieldNames.length != b.objFieldNames.length { return false }
+    let i = 0
+    while i < a.objFieldNames.length {
+      if a.objFieldNames[i] != b.objFieldNames[i] { return false }
+      if !frsClosesHoles(a.objFieldTypes[i], b.objFieldTypes[i], depth + 1) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  // A scalar, union, literal, negation or error closes no hole: only the same type matches it.
+  if a is TyPrim { return false }
+  if a is TyUnion { return false }
+  if a is TyLit { return false }
+  if a is TyNeg { return false }
+  if a is TyErr { return false }
+  false
+}
+
+// The result of function `fe` whose every returned value is still open, a hole or a function
+// with one: the one type the elaboration holds them at, else the one type every call reaching
+// `fe` is checked at, else a hole value at its unbound default (`elabUnboundTpTy`) and an open
+// function at its uncalled default (`elabHoleFnClosed`); -1 where a value is closed or they differ.
+function frsHoleLambdaRet(fe: i32): i32 {
+  const fx = fnStmts[fe]
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) || fn.fnBody < 0 { return -1 }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  if vals.length == 0 { return -1 }
+  let held = -1
+  let dflt = -1
+  for v0 in vals {
+    const v = unwrapParen(v0)
+    const ct = elabCheckedTyOf(v)
+    if ct < 0 || ct >= T.tys.length || !tyHasTyVar(ct) { return -1 }
+    const h = elabHeldValTy(v, fx)
+    held = if h < 0 || (held != -1 && (held == -2 || !tySame(held, h))) { -2 } else { h }
+    const c = tyAt(ct)
+    const d = if c is TyVar { elabUnboundTpTy(-1, fx, c.tvName) } else { elabHoleFnClosed(ct) }
+    dflt = if d < 0 || (dflt != -1 && (dflt == -2 || !tySame(dflt, d))) { -2 } else { d }
+  }
+  if held >= 0 { return held }
+  const ct = frsCallsCheckedTy(fx)
+  if ct != -1 { return if ct >= 0 { ct } else { -1 } }
+  if dflt >= 0 { dflt } else { -1 }
+}
+
+// The one closed type every call whose callee's set holds function `fx` is checked at; -1 where
+// no call reaches it, -2 where one is open or two differ.
+function frsCallsCheckedTy(fx: i32): i32 {
+  const src = elabSrcDecl(fx)
+  let t = -1
+  for c in fnTagCalls() {
+    const ms = fnTagMembers(fnTagCallSetOf(c))
+    if i32ListHas(ms, fx) || i32ListHas(ms, src) {
+      const ct = nodeTyIxOf(c)
+      if (
+        ct < 0
+        || ct >= T.tys.length
+        || !elabTyClosed(ct, 0)
+        || tyHasTyVar(ct)
+      ) {
+        return -2
+      }
+      if t >= 0 && !tySame(t, ct) { return -2 }
+      t = ct
+    }
+  }
+  t
 }
 
 let frsValuesDepth = 0

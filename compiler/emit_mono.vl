@@ -143,7 +143,7 @@ import {
   nulRecNominalName,
   opSelfFnNameForRecv,
   recordClonedIsVarTy,
-  recordClonedNodeTy,
+  recordClonedNodeTyKnown,
   tpIfJoinPinName,
 } from "./check_emit_queries"
 import { i32TyIx, tyIsGradualUnion } from "./check_leaf_steps"
@@ -616,7 +616,6 @@ import {
   pinKindOfName,
   repABNote,
   sigKeyPinPayload,
-  synthTypeRef,
   synthTypeRefFb,
   synthTypeRefTy,
 } from "./emit_nullable_rets"
@@ -625,7 +624,6 @@ import {
   bundleHandMemberNote,
   bundleParamNote,
   bundleReset,
-  bundleRetParamNote,
 } from "./emit_bundle"
 import { repCanonId, repRowId, repRowOfTyStruct, repShadowOn } from "./emit_rep"
 import {
@@ -702,6 +700,7 @@ import {
   elabInstSlotAt,
   elabInstSpelling,
   elabInstTyAt,
+  elabIsBundleTy,
   elabKeyAt,
   elabKeyAtPos,
   elabLamInheritedOwn,
@@ -2642,7 +2641,11 @@ function monoSubstLetType(
         // `letUnionNameOf` resolves against the registry, not the substitution's own row (D2676).
         const subAtoms: string[] = []
         unionSetAtomsOf(subC, subAtoms)
-        if subAtoms.length >= 2 { return synthTypeRefTy(subC, tn.pos, -1) }
+        if subAtoms.length >= 2 {
+          // Typed by the spelling: the substitution's own type can keep a union the registered
+          // row collapses (`f64[] | i32[]` against `f64[]`).
+          return synthTypeRefFb(subC, tn.pos, -1)
+        }
         return synthTypeRefTy(subC, tn.pos, sty)
       }
     }
@@ -3623,6 +3626,9 @@ function monoSubstAnnNode(
           if !tyHasTyVar(s2) { sty = s2 }
         }
       }
+      // A body rewrite holds only the exact bindings, so a type parameter bound otherwise closes
+      // only in the spelling, which `recordClonedNodeTyFb` resolves.
+      if sty < 0 { return synthTypeRefFb(sub, tn.pos, -1) }
       return synthTypeRefTy(sub, tn.pos, sty)
     }
   }
@@ -5560,7 +5566,7 @@ function monoHoleBinding(
           // at the argument's own type, and the bundle lowers through the delivery path.
           let at = tyCol[i]
           const cn = if call >= 0 { nodeAt(call) } else { nodeAt(0) }
-          if cn is Call && i < cn.callArgs.length && monoIsBundleTy(at) {
+          if cn is Call && i < cn.callArgs.length && elabIsBundleTy(at) {
             let id = elabNodeTy(cn.callArgs[i], elabWalkTop())
             if id < 0 { id = elabNodeTy(cn.callArgs[i], -1) }
             if id >= 0 && id < T.tys.length && tyMayHoldFn(id, 0) { at = id }
@@ -8462,6 +8468,7 @@ function monoMakeInstanceHit(
   key: string,
   origFe: i32,
   pinned: string[],
+  pinTys: i32[],
   calleeIx: i32,
   annotateI32: boolean,
 ) {
@@ -8512,10 +8519,11 @@ function monoMakeInstanceHit(
               const hpp = nodeAt(hps[hp])
               if hpp is Param {
                 if hpp.parType < 0 {
-                  // The synthesis is the whole write: `synthTypeRef` records
-                  // the type under the same pin this column holds. Equivalent
-                  // to the clone arm only while this caller's column is all -1.
-                  hpp.parType = synthTypeRef(pinned[hp], -1)
+                  // The synthesis is the whole write, typed by the pin's own type as the
+                  // clone arm types it. Equivalent to the clone arm only while this
+                  // caller's column is all -1.
+                  const hty = if hp < pinTys.length { pinTys[hp] } else { -1 }
+                  hpp.parType = monoSynthPinRef(pinned[hp], hty)
                 }
               }
               hp = hp + 1
@@ -8649,7 +8657,9 @@ function monoMakeInstanceParams(
           if already >= 0 && !tyHasTyVar(already) {
             pinTy = already
           } else {
-            pinTy = recordClonedNodeTy(nt, pinned[pj], pinKinds[pj])
+            const own = if pj < pinOwn.length { pinOwn[pj] } else { -1 }
+            const rty = if own >= 0 && !tyHasTyVar(own) { own } else { pinTys[pj] }
+            pinTy = recordClonedNodeTyKnown(nt, pinKinds[pj], rty)
           }
         }
       } else {
@@ -9010,7 +9020,7 @@ function monoInstanceRet(
     )
   }
   // A parameter delivered as a bundle's record and returned whole is returned as that record.
-  if fn.fnRet < 0 && retRep >= 0 && monoIsBundleTy(retRep) {
+  if fn.fnRet < 0 && retRep >= 0 && elabIsBundleTy(retRep) {
     const brow = bundleRecordRowOfTy(retRep)
     if brow >= 0 && brow < sNames.length {
       return synthTypeRefTy(sNames[brow], -1, retRep)
@@ -9036,16 +9046,6 @@ function monoInstanceRet(
   // A literal union spelled by its alias carries the alias's row, whose rep the name promises.
   const at = if tyIsLitUnion(r) { litUnionAliasTyOfLitTexts(tyLitMemberTexts(r)) } else { -1 }
   synthTypeRefTy(nm, -1, if at >= 0 { at } else { r })
-}
-
-// Whether pin `t` is a bundle's record, matched by row since a pin is spelled afresh.
-function monoIsBundleTy(t: i32): boolean {
-  const r = bundleRecordRowOfTy(t)
-  if r < 0 { return false }
-  for b in elabDeliveredBundles() {
-    if bundleRecordRowOfTy(b) == r { return true }
-  }
-  false
 }
 
 // The source node of argument `a`, peeled: an instance copy's argument maps to its template's,
@@ -9428,8 +9428,8 @@ function monoTypedInstKey(
     + monoTypedTail(k, fd, pinnedTyIx)
 }
 
-// The canonical type a pinned parameter whose annotation names `tp` resolves `tp` to, else "":
-// the binding the pins already name.
+// The canonical type a pinned parameter whose annotation's type mentions `tp` binds it to, else "":
+// the binding the pins already name. Read off the annotation's type, never its spelling.
 function monoPinnedTyParamCanon(
   fd: FuncDecl,
   tp: string,
@@ -9438,25 +9438,24 @@ function monoPinnedTyParamCanon(
   let i = 0
   while i < fd.fnParams.length && i < pinnedTyIx.length {
     const p = nodeAt(fd.fnParams[i])
-    if p is Param && p.parType >= 0 && pinnedTyIx[i] >= 0 {
-      const tn = nodeAt(p.parType)
-      if tn is TypeRef && tn.tyName == tp {
-        return tyCanonKey(pinnedTyIx[i], TY_WALK_DEPTH)
-      }
-      if (
-        tn is TypeRef
-        && tn.tyName == tp + "[]"
-        && tyAt(pinnedTyIx[i]) is TyArray
-      ) {
-        return tyCanonKey(tyArrayElemIx(pinnedTyIx[i]), TY_WALK_DEPTH)
+    const pt = pinnedTyIx[i]
+    if p is Param && p.parType >= 0 && pt >= 0 {
+      const at = nodeTyIxOf(p.parType)
+      const a = if at >= 0 && at < T.tys.length { tyAt(at) } else { null }
+      if a is TyVar && a.tvName == tp { return tyCanonKey(pt, TY_WALK_DEPTH) }
+      if a is TyArray && tyAt(pt) is TyArray {
+        const ae = tyArrayElemIx(at)
+        const e = if ae >= 0 { tyAt(ae) } else { null }
+        if e is TyVar && e.tvName == tp {
+          return tyCanonKey(tyArrayElemIx(pt), TY_WALK_DEPTH)
+        }
       }
       // An annotation naming `tp` inside another type (`CN<T> | null`) binds it by the checker's
       // walk of the annotation against the pin.
-      const at = nodeTyIxOf(p.parType)
-      if at >= 0 && at < T.tys.length && tyHasTyVar(at) {
+      if a != null && tyHasTyVar(at) {
         const bn: string[] = []
         const bt: i32[] = []
-        bindGenWalk(at, pinnedTyIx[i], bn, bt)
+        bindGenWalk(at, pt, bn, bt)
         let j = 0
         while j < bn.length && j < bt.length {
           if bn[j] == tp && bt[j] >= 0 && !tyHasTyVar(bt[j]) {
@@ -9759,7 +9758,9 @@ function monoMakeInstanceGo(
       }
       rs = rs + 1
     }
-    if (monoMakeInstanceHit(hitAt, origFe, pinned, calleeIx, annotateI32)) {
+    if (
+      monoMakeInstanceHit(hitAt, origFe, pinned, pinTys, calleeIx, annotateI32)
+    ) {
       if idShadowModeOf() > 0 {
         elabInstShadow(
           "hit",
@@ -9835,7 +9836,14 @@ function monoMakeInstanceGo(
     ) {
       monoShPendFlush(shAt)
       if (
-        monoMakeInstanceHit(typedHit, origFe, pinned, calleeIx, annotateI32)
+        monoMakeInstanceHit(
+          typedHit,
+          origFe,
+          pinned,
+          pinTys,
+          calleeIx,
+          annotateI32,
+        )
       ) {
         if idShadowModeOf() > 0 {
           elabInstShadow(
@@ -10018,9 +10026,6 @@ function monoMakeInstanceGo(
     )
     const nfn = monoMakeInstanceFunc(fn, origFe, nretW, instBody, instName, nps)
     if retWiden != "" { monoRetWidenFns[nfn] = true }
-    if fn.fnRet < 0 && retRep >= 0 && monoIsBundleTy(retRep) {
-      bundleRetParamNote(nfn, retParam)
-    }
     cadWalkFn[cadWalkFn.length - 1] = nfn
     cadPatchPending(nfn)
     const instFe = monoMakeInstanceInstall(
@@ -14867,13 +14872,17 @@ function monoPinFieldContainers(d: LetDecl, at: i32, ctx: i32): i32 {
 // Types the record literal `rx` an un-annotated function returns in frame `ctx` at its closed type
 // at the instance (`elabHeldValTy`) with each function field's slot set (`idSlotHeldTy`), nested
 // record literals included, so the inferred result is that record and not the checker's open one.
+// A generic instance's copy takes the held type alone: no slot is keyed by the copy (D15297).
 function monoPinReturnedObj(rx: i32, ctx: i32) {
   if rx < 0 { return 0 }
   const lx = unwrapParen(rx)
-  if lx < 0 || !(nodeAt(lx) is ObjLit) || monoFrameIsGenericInstance(ctx) {
+  if lx < 0 || !(nodeAt(lx) is ObjLit) { return 0 }
+  const ht = elabHeldValTy(lx, ctx)
+  if monoFrameIsGenericInstance(ctx) {
+    if ht >= 0 && monoNodeOwnedBy(lx, ctx) { monoRecordObjLitAt(lx, ht, ctx) }
     return 0
   }
-  const rt = idSlotHeldTy(lx, elabHeldValTy(lx, ctx), "L" + i32ToStr(lx))
+  const rt = idSlotHeldTy(lx, ht, "L" + i32ToStr(lx))
   if rt >= 0 { return monoRecordObjLitAt(lx, rt, ctx) }
   monoObjLitFieldsPin(lx, ctx)
   0
@@ -16460,13 +16469,13 @@ function monoCoerceWrittenLetTys(
   const sf = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
   const holes = sf is TyFunc && sf.fnRet == TY_VOID
   monoCoerceNamedGenericTys(d.letInit, tname, lf[0], delTys, tnameTy)
-  monoNoteVoidTwin(d.letInit, tname, lf[0], holes)
+  monoNoteVoidTwin(d.letInit, tname, tnameTy, lf[0], holes)
   for i in monoWritesOf("n:", lf[1]) {
     const nd = nodeAt(i)
     const wf = monoLetWriteFrame(lf, i)
     if nd is BinExpr && wf.length == 1 {
       monoCoerceNamedGenericTys(nd.binRight, tname, wf[0], delTys, tnameTy)
-      monoNoteVoidTwin(nd.binRight, tname, wf[0], holes)
+      monoNoteVoidTwin(nd.binRight, tname, tnameTy, wf[0], holes)
       // The binding's own call is the type a hole lambda literal written to it is called at.
       if byCall {
         monoLamLitTakeTys(nd.binRight, tname, wf[0], delTys, tnameTy)
@@ -16481,7 +16490,13 @@ function monoCoerceWrittenLetTys(
 // generic's instance that returns a value and the slot it is delivered to, the binding's own call
 // or a write's pin at type `tname`, returns nothing (D3969, D14785); a hole function's too when
 // `holes`, the binding being seeded with a function that returns nothing.
-function monoNoteVoidTwin(v: i32, tname: string, ctx: i32, holes: boolean) {
+function monoNoteVoidTwin(
+  v: i32,
+  tname: string,
+  ft: i32,
+  ctx: i32,
+  holes: boolean,
+) {
   const x = unwrapParen(v)
   if x < 0 || !monoSigRetVoid(tname) { return 0 }
   if !monoNamesGenericInstance(x, ctx) && !monoNamesDeclaredGeneric(x, ctx) {
@@ -16497,7 +16512,7 @@ function monoNoteVoidTwin(v: i32, tname: string, ctx: i32, holes: boolean) {
   const on = if o >= 0 && o < monoOrigNode.length { monoOrigNode[o] } else { -1 }
   const od = if on >= 0 && on < P.nodes.length { nodeAt(on) } else { n }
   if !(od is FuncDecl) || (od.fnTyParams.length == 0 && !holes) { return 0 }
-  voidTwinSeamNote(x, fe, tname)
+  voidTwinSeamNote(x, fe, tname, ft)
 }
 
 // The closed pins the written `let` `lf` is delivered at, at the slot `path` derives from it.
@@ -22557,7 +22572,7 @@ function monoWalk(ix: i32, ctx: i32) {
             if byPin {
               monoLamLitTake(n.binRight, atn, ctx, att)
               // A generic returning a value, written where its stamp returns nothing, is twinned.
-              if byStamp { monoNoteVoidTwin(n.binRight, atn, ctx, false) }
+              if byStamp { monoNoteVoidTwin(n.binRight, atn, att, ctx, false) }
             }
             if !byPin && monoDeliverCallAt(n.binRight, atn, att) < 0 {
               return -1
