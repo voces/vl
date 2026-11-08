@@ -8,6 +8,15 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step7-name-twin-shadow](2026-11-08-step7-name-twin-shadow.md): Step 7: the name-twin family shadowed per caller; 7 → 4 callers (#6787).
+- [2026-11-08-step7-cloret-bundle-arm](2026-11-08-step7-cloret-bundle-arm.md): Step 7: the cloRet* family through a bundle arm; 570 → 0 bundle disagreements (#6788).
+- [2026-11-08-naming-pin-producer](2026-11-08-naming-pin-producer.md): Naming rule slice 2: the pin's type from its type (#6786).
+- [2026-11-08-generic-copy-frames-and-slots](2026-11-08-generic-copy-frames-and-slots.md): A generic copy reads shared fields in its frame and slots at the template; D15549, D15548 closed (#6785).
+- [2026-11-08-step6-synth-ret-pins](2026-11-08-step6-synth-ret-pins.md): Step 6: three of `synthRetAnnots`' four pins deleted (#6784).
+- [2026-11-08-step7-classifier-r8](2026-11-08-step7-classifier-r8.md): Step 7 classifier round 8 (#6783).
+- [2026-11-08-call-key-fn-holding-params](2026-11-08-call-key-fn-holding-params.md): Step 2: the call key binds instances whose parameters hold functions (#6782).
+- [2026-11-08-state-audit-lets-everywhere](2026-11-08-state-audit-lets-everywhere.md): The state audit's `let` half reads every compiler module (#6781).
+- [2026-11-08-unionbox-last-write-positions](2026-11-08-unionbox-last-write-positions.md): The box record is the last write; four positions read it (#6779).
 - [2026-11-08-step7-run2-holes](2026-11-08-step7-run2-holes.md): Step 7: run #2 declined 17 → 3 (#6778).
 - [2026-11-08-returned-record-held-type](2026-11-08-returned-record-held-type.md): A generic instance's returned record takes its held type; D15297 closed (#6777).
 - [2026-11-08-step7-bundle-type-fact](2026-11-08-step7-bundle-type-fact.md): Step 7: a closure bundle is the elaboration's fact; mono's bundle-return ledger deleted (#6775).
