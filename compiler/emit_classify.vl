@@ -4353,7 +4353,19 @@ export function identNameIsUserBound(ix: i32, fnIx: i32): boolean {
   const n = nodeAt(ix)
   const name = if n is Ident { n.identName } else { "" }
   if paramIndexOf(fnIx, name) >= 0 { return true }
+  if !emitPhaseReached("monomorphized") { return fnCapturesName(fnIx, name) }
   capturedKindOf(fnIx, name) != null
+}
+
+// Whether the lifted function `fnIx` captures `name`.
+function fnCapturesName(fnIx: i32, name: string): boolean {
+  if fnIx < 0 || !fnNestUsed { return false }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return false }
+  for c in captureNamesOf(fe) {
+    if c == name { return true }
+  }
+  false
 }
 
 // `identNameIsUserBound` asked of the read at node `atIx`, from the arena rather than the emit
@@ -4366,7 +4378,11 @@ export function identNameIsBoundAt(
 ): boolean {
   if !identNameIsUserBound(atIx, fnIx) { return false }
   if paramIndexOf(fnIx, name) >= 0 { return true }
-  if capturedKindOf(fnIx, name) != null { return true }
+  if !emitPhaseReached("monomorphized") {
+    if fnCapturesName(fnIx, name) { return true }
+  } else if capturedKindOf(fnIx, name) != null {
+    return true
+  }
   if fnIx < 0 || atIx < 0 { return true }
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
@@ -8850,9 +8866,13 @@ function asgCellOf(ix: i32, fnIx: i32): i32 {
 }
 
 // Expression `exprIx` is a nullable union variant: it holds a `(ref null $variantHeap(vi))`
-// niche, which is `nulVariantIdxOfExpr` naming its row. Strict beside `exprNullableStruct`,
-// since the two kinds index different heap tables; a null test wants `exprNullableRefNiche`.
+// niche, which is `nulVariantIdxOfExpr` naming its row (before mono, its checked rep). Strict
+// beside `exprNullableStruct`, since the two kinds index different heap tables; a null test
+// wants `exprNullableRefNiche`.
 export function exprNullableVariant(exprIx: i32, fnIx: i32): boolean {
+  if !emitPhaseReached("monomorphized") {
+    return nodeRepIs(exprIx, "nulvariant", fnIx)
+  }
   nulVariantIdxOfExpr(exprIx, fnIx) >= 0
 }
 
@@ -9086,9 +9106,14 @@ export function letObjLitVariantIdx(letIx: i32, fnIx: i32) {
 
 // The union-variant table index an expression at `exprIx` yields a CONCRETE variant
 // struct ref for (a variant-typed param reference, or a parenthesized one), or -1. The
-// receiver shape for a gap-#2 field read `o.field` where `o: TyObj`.
+// receiver shape for a gap-#2 field read `o.field` where `o: TyObj`. Before mono, the variant
+// row of its checked type when that is a variant rep.
 export function exprVariantIndex(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
+  if !emitPhaseReached("monomorphized") {
+    if !nodeRepIs(exprIx, "variant", fnIx) { return -1 }
+    return variantIndexOf(structNameOfTy(nodeTyInOf(exprIx, fnIx)))
+  }
   const e = nodeAt(exprIx)
   match e {
     Paren => {
@@ -14183,6 +14208,11 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
       // A place (`h.f`) narrowed to a union's bare-closure arm reads back the closure
       // unboxed, as a narrowed binding does (D4346).
       if narrowedFnTyOf(exprIx, fnIx) >= 0 { return true }
+      // Before mono, the read's checked type, where no inference hole is left open.
+      if !emitPhaseReached("monomorphized") {
+        const mt = nodeTyInOf(exprIx, fnIx)
+        return tyIsFuncOrNulFunc(mt) && !tyHasInferHole(mt, 0)
+      }
       // A field read the checker narrowed to a function arm at a receiver no narrowing key
       // reaches (`hs[0].f`), which the read site unboxes to the closure.
       if memReadUnboxAtomKind(exprIx, fnIx) == 11 { return true }
