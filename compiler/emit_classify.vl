@@ -157,7 +157,11 @@ import {
 } from "./check_elab_cap"
 import { mapStoredTyOf } from "./check_fn_tag_facts"
 import { canonUnionMembersInto } from "./check_program"
-import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
+import {
+  inferRetFnKey,
+  mapDeliveryRecorded,
+  nodeHoleElemOf,
+} from "./check_side_rows"
 import { tyVarsOwnScheme } from "./check_subst"
 import {
   MAP_KEY_I32,
@@ -848,7 +852,6 @@ import {
   mapRecvTyIn,
   mapTyPeel,
   nodeIsValueJoin,
-  nodeRepIn,
   nodeTyInOf,
   pinnedParamTyAt,
   readContainerTyAt,
@@ -908,6 +911,7 @@ import {
   memoMoved,
   memoMoved3,
   memoPassMoved,
+  tyRegWrites,
 } from "./memo"
 import {
   declOrigOf,
@@ -1732,10 +1736,50 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32): boolean {
 // The rep kind of the type binding `letIx` holds inside `fnIx` (`letBindTy`), or null where that
 // type has no covered rep, an open one at a generic's template included.
 export function letBindRepKind(letIx: i32, fnIx: i32): VKind | null {
-  const rd = repOfTy(letBindTy(letIx, fnIx))
-  if rd.rdCovered != 1 { return null }
-  rd.rdKind
+  repKindOfTyMemo(letBindTy(letIx, fnIx))
 }
+
+// `repOfTy(ty)`'s kind, or null where it is uncovered, memoised per arena type within one pass
+// and one type-registry generation, so a classifier reading a column per node builds no
+// descriptor per read.
+function repKindOfTyMemo(ty: i32): VKind | null {
+  if ty < 0 { return null }
+  if ty < rkMemoGen.length {
+    if (
+      rkMemoGen[ty] == rkGen.at
+      && rkMemoPass[ty] == emitPassGen
+      && rkMemoReg[ty] == tyRegWrites
+    ) {
+      if rkMemoNul[ty] == 1 { return null }
+      return rkMemoKind[ty]
+    }
+  }
+  const rd = repOfTy(ty)
+  while rkMemoGen.length <= ty {
+    rkMemoGen.push(-1)
+    rkMemoPass.push(-1)
+    rkMemoReg.push(-1)
+    rkMemoKind.push("list")
+    rkMemoNul.push(1)
+  }
+  rkMemoGen[ty] = rkGen.at
+  rkMemoPass[ty] = emitPassGen
+  rkMemoReg[ty] = tyRegWrites
+  if rd.rdCovered == 1 {
+    rkMemoKind[ty] = rd.rdKind
+    rkMemoNul[ty] = 0
+    return rd.rdKind
+  }
+  rkMemoNul[ty] = 1
+  null
+}
+
+const rkGen = memoGenNew(0)
+const rkMemoGen: i32[] = []
+const rkMemoPass: i32[] = []
+const rkMemoReg: i32[] = []
+const rkMemoKind: VKind[] = []
+const rkMemoNul: i32[] = []
 
 // The nullable distinct-backing list kind (`nulstrlist`, `nulf64list`, …) of the value at
 // `exprIx`, or null for any other value, a narrowed one included.
@@ -12895,23 +12939,24 @@ function readListKindOf(r: string): VKind | null {
 // compared with one kind, so no two of them can claim one expression (D2275).
 export function exprListRep(exprIx: i32, fnIx: i32): VKind | null {
   if exprIx < 0 { return null }
-  listOfColumn(listColumnDesc(exprIx, fnIx))
-}
-
-// The checked-rep column at the node `exprIx` in `fnIx`: its rep at its instance's type, or at
-// its receiver's list for a read an `is K[]` narrowed (D4916).
-function listColumnDesc(exprIx: i32, fnIx: i32): RepDesc {
+  // The checked-rep column at its instance's type, or at its receiver's list for a read an
+  // `is K[]` narrowed (D4916). Only a node's own type read through its hole asks the node.
   const nrt = listNarrowRecvTyOf(exprIx, fnIx)
-  if nrt >= 0 { return repOfNodeAt(exprIx, nrt) }
-  nodeRepIn(exprIx, fnIx)
+  const ty = if nrt >= 0 { nrt } else { nodeTyInOf(exprIx, fnIx) }
+  if nodeHoleElemOf(exprIx) >= 0 && ty == nodeTyIxOf(exprIx) {
+    const d = repOfNodeAt(exprIx, ty)
+    return if d.rdCovered == 1 { listOfKind(d.rdKind) } else { null }
+  }
+  const k = repKindOfTyMemo(ty)
+  if k == null { return null }
+  listOfKind(k)
 }
 
-// The non-null list a covered column `d` names, a nullable list's being its list's, or null.
-function listOfColumn(d: RepDesc): VKind | null {
-  if d.rdCovered != 1 { return null }
-  const c = vkListClass(d.rdKind)
-  if c == 1 { return d.rdKind }
-  if c == 2 { return nulListBase(d.rdKind) }
+// The non-null list kind `k` names, a nullable list's being its list's, or null.
+function listOfKind(k: VKind): VKind | null {
+  const c = vkListClass(k)
+  if c == 1 { return k }
+  if c == 2 { return nulListBase(k) }
   null
 }
 
