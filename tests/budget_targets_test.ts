@@ -63,11 +63,12 @@ Deno.test("budget targets: the graph-counted baselines target compiler/entry.vl"
   }
 });
 
-// arena-scan and interp are counted with `--findings` over lint-self.sh's joined reports:
+// arena-scan, unused-state and interp are counted with `--findings` over lint-self.sh's joined reports:
 // the compiler graph, `std/`, and (interp only) `scripts/` linted with the baseline's own
 // `exclude` globs, which lint-self reads from the baseline's one-line `"exclude"` key.
 const JOINED: Record<string, string[]> = {
   "scripts/scan-budget-baseline.json": ["compiler/entry.vl", "std"],
+  "scripts/unused-budget-baseline.json": ["compiler/entry.vl", "std"],
   "scripts/interp-budget-baseline.json": [
     "compiler/entry.vl",
     "std",

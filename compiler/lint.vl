@@ -211,6 +211,8 @@ export function lint(progRoot: i32) {
     unusedImports()
     duplicateImports(stmts)
     unusedFunctions(stmts)
+    unusedContainers()
+    unusedFields(stmts)
     preferConst()
     vecReportScanned()
     // One walk offers every node to every structural rule; the regroup restores
@@ -2811,6 +2813,8 @@ const LN_GETTER = 2
 const LN_PROP = 4
 const LN_TYPE = 8
 const LN_BUILTIN = 16
+// A type a union, an `is` or a `match` arm discriminates on, by its fields (`unused-field`).
+const LN_SHAPE = 32
 
 // Empty the ids, then mint the builtins' so `shadowed-function` reads a bit for them.
 function lnReset() {
@@ -2901,7 +2905,10 @@ function typeNamesHas(name: string) { lnHas(name, LN_TYPE) }
 // name to the type-name set: `Box<Point>` → Box, Point; `i32[]` → i32;
 // `{[string]: Tok}` → string, Tok; `A | B` → A, B. Segment-wise because the
 // parser folds compound annotations into a single synthetic name string.
-function typeNamesAddSegments(name: string) {
+function typeNamesAddSegments(name: string) { nameSegmentsMark(name, LN_TYPE) }
+
+// Mark every maximal identifier run of `name` with name-map bit `bit`.
+function nameSegmentsMark(name: string, bit: i32) {
   let start = 0
   let i = 0
   while i <= name.length {
@@ -2914,7 +2921,7 @@ function typeNamesAddSegments(name: string) {
       if c == '_' { isIdent = true }
     }
     if !isIdent {
-      if i > start { lnMark(lnId(name.slice(start, i)), LN_TYPE) }
+      if i > start { lnMark(lnId(name.slice(start, i)), bit) }
       start = i + 1
     }
     i = i + 1
@@ -2932,14 +2939,17 @@ function collectTypeNameRefs() {
     const n = nodeAt(i)
     if n is TypeRef {
       typeNamesAddSegments(n.tyName)
+      if nuHasBar(n.tyName) { nameSegmentsMark(n.tyName, LN_SHAPE) }
     } else if n is IsExpr {
       typeNamesAddSegments(n.isVariant)
+      nameSegmentsMark(n.isVariant, LN_SHAPE)
     } else if n is AsExpr {
       typeNamesAddSegments(n.asTy)
     } else if n is UnionDecl {
       let v = 0
       while v < n.udVariants.length {
         typeNamesAddSegments(n.udVariants[v])
+        nameSegmentsMark(n.udVariants[v], LN_SHAPE)
         v = v + 1
       }
     }
@@ -2961,6 +2971,10 @@ function collectTypeNameRefs() {
 // reported binding; and a function name is not a scope entry at all.
 let declUsed: i32[] = []
 let declWritten: i32[] = []
+// Per declaration: some occurrence READ it (not a write or a mutator receiver), and some
+// occurrence was anything other than the object of a `.f` access (`unused-field`).
+let declRead: i32[] = []
+let declEscaped: i32[] = []
 
 // The lexical scope stack: parallel (name id, declNodes-index) entries; `-1` marks
 // a shadowing-only entry (a loop variable). Innermost binding = highest index.
@@ -3015,6 +3029,8 @@ function bindPushId(nid: i32, name: string, ix: i32, kind: i32, tok: i32) {
   declToks.push(tok)
   declUsed.push(0)
   declWritten.push(0)
+  declRead.push(0)
+  declEscaped.push(0)
   let at = tok
   if at < 0 { at = declNameTokOf(ix) }
   visPushId(nid, declNodes.length - 1, at)
@@ -3073,6 +3089,7 @@ function nameVisit(ix: i32) {
       if fn is Ident {
         refNamesAdd(fn.identName)
       } else if fn is Member {
+        nuNoteCallee(n.callFn, fn)
         refNamesAdd(fn.memProp)
         // A UFCS property reads the binding its spelling names by lexical scope, as an
         // identifier does; the import-use side channel records it too.
@@ -3081,6 +3098,7 @@ function nameVisit(ix: i32) {
       } else if fn is OptMember {
         // `p?.m(…)` dispatches to the same function `p.m(…)` does, so the property
         // names it here too or the declaration reads as unused (D1814).
+        nuCallee[n.callFn] = true
         refNamesAdd(fn.omProp)
         propNamesAdd(fn.omProp)
         bindMark(fn.omProp, 0)
@@ -3095,6 +3113,7 @@ function nameVisit(ix: i32) {
     vecNoteUse(ix, nid)
     vecNoteFnRef(ix, nid)
     bindMarkId(nid, 0)
+    nuNoteIdent(ix, nid)
   } else if n is Unary {
     // The name is recorded although there is no unary operator dispatch: `n.unOp` is
     // `"-"`, `"!"`, `"p+"` or `"p-"`, none of which can name a declaration this linter
@@ -3110,8 +3129,10 @@ function nameVisit(ix: i32) {
   } else if n is Member {
     // A property read may be a getter's use, recorded as `.p` (`refNamesHas`).
     lnMark(lnId(n.memProp), LN_GETTER)
+    nuNoteMember(ix, n.memObj, n.memProp)
   } else if n is OptMember {
     lnMark(lnId(n.omProp), LN_GETTER)
+    nuNoteMember(ix, n.omObj, n.omProp)
   } else if n is BinExpr {
     // An assignment `x = e` (the parser desugars `x += e` / `x++` to this shape)
     // whose LHS is a bare name marks that BINDING written — prefer-const
@@ -3120,13 +3141,19 @@ function nameVisit(ix: i32) {
       const lhsIx = lintUnwrapParen(n.binLeft)
       if lhsIx >= 0 && lhsIx < P.nodes.length {
         const lhs = nodeAt(lhsIx)
-        if lhs is Ident { bindMark(lhs.identName, 1) }
+        if lhs is Ident {
+          bindMark(lhs.identName, 1)
+          nuSink[lhsIx] = true
+        }
         if lhs is Index {
           lintSawIndexWrite = true
           vecNoteIndexWrite(lhsIx)
+          nuSink[lintUnwrapParen(lhs.idxArr)] = true
         }
+        if lhs is Member { nuLhs[lhsIx] = true }
       }
     } else {
+      if n.binOp == "==" || n.binOp == "!=" { nuNoteEquality(n) }
       shiftMaskVisit(n)
       // An operator (`a + b` → `function +(self, b)`) dispatches by operator
       // name; the TS reference walk records it as a `FunctionCall` callee.
@@ -3645,6 +3672,9 @@ function collectBindingsAndRefs(progRoot: i32) {
   declToks = []
   declUsed = []
   declWritten = []
+  declRead = []
+  declEscaped = []
+  nuReset(progRoot)
   visNames = []
   visIds = []
   visPrev = []
@@ -3975,6 +4005,261 @@ function unusedFunctions(stmts: i32[]) {
       }
     }
     i = i + 1
+  }
+  0
+}
+
+// ── unused-container + unused-field ──────────────────────────────────────────
+
+// Two more members of the unused family, both fed by the binding scan. A container is a
+// `let`/`const` initialised by `[…]`, `Map()` or `Set()` whose every occurrence writes it:
+// assignment, an index write, or the receiver of a mutator `nuIsMutator` names. A field is a
+// record field no `.f` or `?.f` in the module reads; matching by name alone keeps it a floor.
+
+// The Ident nodes in write position, the Member nodes on an assignment's left, the Member
+// nodes that are a call's callee, and the Ident nodes that are a `.f` access's object.
+let nuSink: {[i32]: boolean} = Map()
+let nuLhs: {[i32]: boolean} = Map()
+let nuCallee: {[i32]: boolean} = Map()
+let nuMemObj: {[i32]: boolean} = Map()
+// The property names some `.f` / `?.f` reads, and the module's own function and import names.
+let nuRead: {[string]: boolean} = Map()
+let nuUserFns: {[string]: boolean} = Map()
+// A `==` / `!=` between two non-literals compares a record's fields without naming them.
+let nuEqSeen = false
+
+function nuIsMutator(m: string) {
+  m == "push" || m == "set" || m == "add" || m == "unshift" || m == "clear"
+}
+
+function nuReset(root: i32) {
+  nuSink = Map()
+  nuLhs = Map()
+  nuCallee = Map()
+  nuMemObj = Map()
+  nuRead = Map()
+  nuUserFns = Map()
+  nuEqSeen = false
+  if root < 0 || root >= P.nodes.length { return 0 }
+  const r = nodeAt(root)
+  if r is Program {
+    let i = 0
+    while i < r.progStmts.length {
+      const six = r.progStmts[i]
+      if six >= 0 && six < P.nodes.length {
+        const st = nodeAt(six)
+        if st is FuncDecl { nuUserFns[st.fnName] = true }
+        if st is ImportDecl {
+          let q = 0
+          while q < st.impLocals.length {
+            nuUserFns[st.impLocals[q]] = true
+            q = q + 1
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// A `x.m(…)` callee: `x` passes to `m`, so it escapes, and is only written when `m` is a
+// builtin mutator this module does not redefine.
+function nuNoteCallee(calleeIx: i32, fn: Member) {
+  nuCallee[calleeIx] = true
+  if nuIsMutator(fn.memProp) && !nuUserFns.has(fn.memProp) {
+    nuSink[lintUnwrapParen(fn.memObj)] = true
+  }
+  0
+}
+
+function nuNoteMember(ix: i32, obj: i32, prop: string) {
+  if !nuLhs.has(ix) { nuRead[prop] = true }
+  if !nuCallee.has(ix) { nuMemObj[lintUnwrapParen(obj)] = true }
+  0
+}
+
+// Whether a rendered annotation spells a union anywhere in it.
+function nuHasBar(t: string) {
+  let i = 0
+  while i < t.length {
+    if t[i] == '|' { return true }
+    i = i + 1
+  }
+  false
+}
+
+function nuIsLiteral(ix: i32) {
+  const u = lintUnwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = nodeAt(u)
+  n is NumLit || n is StrLit || n is CharLit || n is BoolLit || n is NullLit
+}
+
+function nuNoteEquality(n: BinExpr) {
+  if !nuIsLiteral(n.binLeft) && !nuIsLiteral(n.binRight) { nuEqSeen = true }
+  0
+}
+
+// An `Ident` occurrence of the name `nid` at node `ix`, resolved as `bindMarkId` does.
+function nuNoteIdent(ix: i32, nid: i32) {
+  if nid < 0 { return 0 }
+  const i = lnHead[nid]
+  if i < 0 { return 0 }
+  const id = visIds[i]
+  if id < 0 { return 0 }
+  if !nuSink.has(ix) { declRead[id] = 1 }
+  if !nuMemObj.has(ix) { declEscaped[id] = 1 }
+  0
+}
+
+// Whether node `ix` builds an empty-or-not list, a `Map()` or a `Set()`.
+function nuIsContainerInit(ix: i32) {
+  const u = lintUnwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = nodeAt(u)
+  if n is ArrayLit { return true }
+  if n is Call {
+    if n.callFn < 0 || n.callFn >= P.nodes.length { return false }
+    const fn = nodeAt(n.callFn)
+    if fn is Ident {
+      const nm = fn.identName
+      return (nm == "Map" || nm == "Set") && !nuUserFns.has(nm)
+    }
+  }
+  false
+}
+
+// The `let`/`const` at declaration `i` the author wrote, outside any export or extern.
+function nuPlainLocal(i: i32) {
+  const ix = declNodes[i]
+  declKinds[i] == 0
+    && !declMinted(ix, 0)
+    && !startsUnderscore(declNameOf(ix, 0))
+    && !declIsExported(ix)
+    && externGlobalLinkOfNode(ix) < 0
+}
+
+// unused-container: a container that is written but never read. A binding with no
+// occurrence at all is unused-variable's.
+function unusedContainers() {
+  let i = 0
+  while i < declNodes.length {
+    if declUsed[i] != 0 && declRead[i] == 0 && nuPlainLocal(i) {
+      const n = nodeAt(declNodes[i])
+      if n is LetDecl {
+        if nuIsContainerInit(n.letInit) {
+          lintEmitAtTok(
+            "unused-container",
+            "Container `" + n.letName + "` is written but never read (remove it)",
+            "warning",
+            declNameTokOf(declNodes[i]),
+          )
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// unused-field: a field of a module-private record type, or of an object literal bound to
+// a local that is only ever the object of a `.f` access, that nothing reads. A module
+// with an export or a non-literal equality spares its declared types, and a type a union
+// or an `is` discriminates on is read by its shape.
+function unusedFields(stmts: i32[]) {
+  let exports = false
+  let i = 0
+  while i < stmts.length {
+    if stmts[i] >= 0 && stmts[i] < P.nodes.length && declIsExported(stmts[i]) {
+      exports = true
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < stmts.length && !exports && !nuEqSeen {
+    const ix = stmts[i]
+    if ix >= 0 && ix < P.nodes.length {
+      const s = nodeAt(ix)
+      // A type nothing names is dead whole; its fields would be noise.
+      if s is TypeDecl {
+        // A `flat` type's fields are its layout, which `T.size` reads without naming one.
+        if typeNamesHas(s.tdName) && !lnHas(s.tdName, LN_SHAPE) && s.tdFlat == 0 {
+          nuReportFields(s.tdName, s.tdFields)
+        }
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < declNodes.length {
+    if declUsed[i] != 0 && declEscaped[i] == 0 && nuPlainLocal(i) {
+      const n = nodeAt(declNodes[i])
+      if n is LetDecl {
+        const init = lintUnwrapParen(n.letInit)
+        if n.letType < 0 && init >= 0 && init < P.nodes.length {
+          const o = nodeAt(init)
+          if o is ObjLit { nuReportInits(n.letName, o.objFields) }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The `name` token of the `name: …` the field node at `fix` opens; its node anchor is the
+// value or type after the colon. Falls back to that anchor.
+function nuFieldNameTok(fix: i32, name: string) {
+  const tk = lintAnchorTok(fix)
+  let k = tk - 1
+  while k >= 0 && k > tk - 64 {
+    if P.toks[k].text == name && P.toks[k + 1].text == ":" { return k }
+    k = k - 1
+  }
+  tk
+}
+
+function nuReportFields(owner: string, fields: i32[]) {
+  let k = 0
+  while k < fields.length {
+    const fix = fields[k]
+    if fix >= 0 && fix < P.nodes.length {
+      const f = nodeAt(fix)
+      if f is FieldDef {
+        if !nuRead.has(f.fdName) && !startsUnderscore(f.fdName) {
+          lintEmitAtTok(
+            "unused-field",
+            "Field `" + owner + "." + f.fdName + "` is never read (remove it)",
+            "warning",
+            nuFieldNameTok(fix, f.fdName),
+          )
+        }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+function nuReportInits(owner: string, fields: i32[]) {
+  let k = 0
+  while k < fields.length {
+    const fix = fields[k]
+    if fix >= 0 && fix < P.nodes.length {
+      const f = nodeAt(fix)
+      if f is FieldInit {
+        if !nuRead.has(f.fiName) && !startsUnderscore(f.fiName) {
+          lintEmitAtTok(
+            "unused-field",
+            "Field `" + owner + "." + f.fiName + "` is never read (remove it)",
+            "warning",
+            nuFieldNameTok(fix, f.fiName),
+          )
+        }
+      }
+    }
+    k = k + 1
   }
   0
 }
