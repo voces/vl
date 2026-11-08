@@ -782,7 +782,6 @@ import {
   fnParent,
   fnStmts,
   fnValUsed,
-  gStrInfLet,
   globalIndexBySid,
   lfBlockOf,
   listIsIdentNames,
@@ -1101,12 +1100,19 @@ export function cloRetValKind(fe: i32): VKind | null {
   null
 }
 
-// Does `fe` return a struct row, bare or nullable? A `C | null` element lives in the same
-// ref list as a `C` one (the backing is already nullable), so `.map` builds both alike.
-export function cloRetIsStructRow(fe: i32): boolean {
-  if clsCensusOn { clsCensusEnter("cloRetIsStructRow") }
-  const k = cloRetValKind(fe)
-  k == "struct" || k == "nulstruct"
+// The result type function `fe` returns as recorded (`fnRecordedRetTy`), installed by the emitter
+// before the collect passes, since the reader's module sits above this one in the import graph; a
+// read before that traps.
+function fnRecordedRetTyUnset(_fe: i32): i32 { __trap__() }
+export let fnRecordedRetTyFn: (fe: i32) => i32 = fnRecordedRetTyUnset
+
+// Whether `fe`'s recorded result is a record, bare or nullable. A `C | null` element lives in the
+// same ref list as a `C` one (the backing is already nullable), so `.map` builds both alike.
+export function fnRetIsRecordRow(fe: i32): boolean {
+  const rt = fnRecordedRetTyFn(fe)
+  if rt < 0 { return false }
+  const rd = repOfTy(rt)
+  rd.rdCovered == 1 && (rd.rdKind == "struct" || rd.rdKind == "nulstruct")
 }
 
 // The variant row of the `(ref null $variantHeap(vi))` niche a call of `fe` returns, or -1.
@@ -2814,7 +2820,7 @@ function loopVarCellGo(d: i32, fnIx: i32): BindCellGo {
       atom = forInPairVarIsLitAtom(it, fnIx)
       nul = atom && nodeTyMapValIsNulLitUnion(it)
     } else {
-      atom = forInVarIsLitAtom(it, fnIx, forInElemKind(it, fnIx))
+      atom = forInVarRepIsAtom(it, fnIx)
       nul = atom
         && (nodeArrayElemIsNulLitUnion(it)
         || tyIsNulLitUnionNiche(iterElemPinTy(it, fnIx)))
@@ -8073,22 +8079,20 @@ function capturedLoopVarName(fe: i32, name: string, b: i32): string {
   captureLoopCopySrc(fe, name)
 }
 
-// Whether a `for-in` variable over `iterIx`, walked in frame `fnIx`, holds an interned atom:
-// a literal-union element or its niche, a literal-union map key, or an element that is one only
-// at the instance's pin. `ek` is the iterable's `forInElemKind`. The loop variable's storage
-// cell (`loopVarCellGo`) is its one reader.
-function forInVarIsLitAtom(iterIx: i32, fnIx: i32, ek: VKind | null): boolean {
-  if clsCensusOn { clsCensusEnter("forInVarIsLitAtom") }
-  // A string list holds refs whatever literal-union list an `is` narrowed it to (D4916).
-  if exprListRep(iterIx, fnIx) == "strlist" { return false }
-  if nodeArrayElemIsLitUnion(iterIx) || nodeArrayElemIsNulLitUnion(iterIx) {
-    return true
+// Whether a `for-in` variable over iterable `iterIx` holds a literal-union atom, its niche included:
+// the rep of the iterated element type (a list's element, a map's key) says so. The loop variable's
+// storage cell (`loopVarCellGo`) is its one reader.
+function forInVarRepIsAtom(iterIx: i32, fnIx: i32): boolean {
+  const it = nodeTyAt(iterIx, fnIx)
+  if it < 0 { return false }
+  let et = tyStepElem(it)
+  if et < 0 {
+    const mt = tyAt(it)
+    if mt is TyMap { et = mt.mKey }
   }
-  if nodeTyMapKeyIsLitUnion(iterIx) { return true }
-  if ek != "i32" { return false }
-  const hp = iterElemPinTy(iterIx, fnIx)
-  if hp >= 0 { return tyIsLitUnion(hp) || tyIsNulLitUnionNiche(hp) }
-  false
+  if et < 0 { return false }
+  const rd = repOfTy(et)
+  rd.rdCovered == 1 && rd.rdAtom == 1
 }
 
 // The second name's twin: a map walk's literal-union value (D2656).
@@ -12822,52 +12826,6 @@ function identBindingNulStrList(readIx: i32, fnIx: i32, depth: i32): boolean {
   false
 }
 
-// Usage-driven element inference for an un-annotated empty `[]` local: a push of any
-// string-typed expression makes a build-loop accumulator classify as `string[]`.
-// `gStrInfLet` guards against the `out.push(out[0])` self-reference cycle.
-export function letInfStrListByUseV(letIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("letInfStrListByUseV") }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return false }
-    if d.letInit < 0 { return false }
-    const ini = nodeAt(unwrapParen(d.letInit))
-    if ini is ArrayLit {
-      if ini.arrElems.length != 0 { return false }
-      if gStrInfLet == letIx { return false }
-      const saved = gStrInfLet
-      gStrInfLet = letIx
-      let found = false
-      let i = 0
-      while i < P.nodes.length {
-        const nd = nodeAt(i)
-        if nd is Call && nd.callFn >= 0 {
-          const callee = nodeAt(nd.callFn)
-          if callee is Member {
-            if callee.memProp == "push" {
-              const recv = nodeAt(callee.memObj)
-              if recv is Ident {
-                if recv.identName == d.letName && nd.callArgs.length == 1 {
-                  const argN = nodeAt(unwrapParen(nd.callArgs[0]))
-                  if argN is StrLit {
-                    found = true
-                  } else if fnIx >= 0 && exprString(nd.callArgs[0], fnIx) {
-                    found = true
-                  }
-                }
-              }
-            }
-          }
-        }
-        i = i + 1
-      }
-      gStrInfLet = saved
-      return found
-    }
-  }
-  false
-}
-
 // True if `exprIx` evaluates to an `f64[]`: a projection of `exprListRep`.
 export function exprF64Array(exprIx: i32, fnIx: i32) {
   exprListRep(exprIx, fnIx) == "f64list"
@@ -14994,11 +14952,10 @@ export function structListPopGetElem(exprIx: i32, fnIx: i32) {
 
 // ── `.map` / `.filter` classification (Slices 3–4) ─────────────────────────────
 
-// True if the expression at `exprIx` is a `.map`/`.filter` HOF call over a LIST
-// receiver (one callback argument). A member call named `map`/`filter` over a
-// NON-list receiver (e.g. a function-valued struct field) is NOT a HOF site.
+// True if the expression at `exprIx` is a `.map`/`.filter` HOF call over a receiver typed as a
+// list (one callback argument). A member call named `map`/`filter` over a NON-list receiver (e.g.
+// a function-valued struct field) is NOT a HOF site.
 export function callIsMapFilter(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("callIsMapFilter") }
   if exprIx < 0 { return false }
   const e = nodeAt(exprIx)
   if e is Call {
@@ -15007,7 +14964,7 @@ export function callIsMapFilter(exprIx: i32, fnIx: i32) {
     if callee is Member {
       if callee.memProp == "map" || callee.memProp == "filter" {
         if e.callArgs.length == 1 {
-          return mfRecvKindOf(callee.memObj, fnIx) != null
+          return tyIsArray(nodeTyAt(callee.memObj, fnIx))
         }
       }
     }
@@ -15173,7 +15130,7 @@ function mfStructResultRowName(callIx: i32, fnIx: i32): string {
         return ""
       }
       const si = cloRetValSlot(fe)
-      if cloRetIsStructRow(fe) && si >= 0 && si < sNames.length {
+      if fnRetIsRecordRow(fe) && si >= 0 && si < sNames.length {
         return sNames[si]
       }
       if cloRetValKind(fe) == "variant" && si >= 0 && si < uVariants.length {
