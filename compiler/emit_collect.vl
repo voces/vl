@@ -81,7 +81,7 @@ import { collectRetValues, unionAliasMembers } from "./check_nj_join"
 import { declAnnRawTyName, declAnnTyOf } from "./check_gen_alias_anns"
 import { fieldNameOrder } from "./check_obj_shape"
 import { inferJoinCount, inferJoinTyAt } from "./check_inline_lit_union"
-import { inferRetRowByNode, inferRetRowOf } from "./check_infer_ret"
+import { inferRetRowOf } from "./check_infer_ret"
 import { isTransparentAlias } from "./check_alias_transparent"
 import { letNullHoleFilledTy } from "./check_null_holes"
 import {
@@ -115,10 +115,8 @@ import {
   TyVar,
   cUserTypes,
   genAppNameOfTy,
-  litUnionAliasNameOfTy,
   litUnionAliasOfLitTexts,
   litUnionInlineNameOfTy,
-  primNameStr,
   structNameOfTy,
   tyArrayElemIx,
   tyArrayElemPrim,
@@ -130,7 +128,6 @@ import {
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsMap,
-  tyIsNulStringRep,
   tyIsOneStrLit,
   tyLitMemberTexts,
   tyMembersDistinctRecords,
@@ -598,6 +595,7 @@ import {
   repRowOfTyStruct,
   repSigKindOfTy,
   repSigTokHasSlot,
+  repSlotOfTy,
   repTyHasArmShape,
   repVariantShapeRowOf,
   rlElemKindAt,
@@ -857,7 +855,6 @@ import {
   forRangeStepIsConst,
   holeOperandTyOf,
   mapTyScalarBoxKind,
-  variantRowOfShapeTy,
 } from "./emit_ty_canon"
 import {
   annRowOfNode,
@@ -906,7 +903,6 @@ import {
 } from "./emit_union_tykey"
 import {
   isUNameAB,
-  isUNameDeclAB,
   isUNameKeyAB,
   softKeyOrNameKey,
   softKeyProbeNoTy,
@@ -945,9 +941,7 @@ import {
   flattenVariantsInto,
   isNullTy,
   nonNullTy,
-  nullableInnerOrNone,
   primNameOf,
-  tyEmitPrimOf,
   tyHasTyVar,
   tyIsArray,
   tyIsLitSet,
@@ -970,11 +964,7 @@ import {
   tyIsValueUnionBox,
   valueAtomKind,
 } from "./check_ty_rep"
-import {
-  inferRetRungIsParenUnionElemList,
-  inferRetRungIsValueUnion,
-  valueUnionRetName,
-} from "./check_ret_names"
+import { valueUnionRetName } from "./check_ret_names"
 import {
   inferLetCount,
   inferLetIxAt,
@@ -1012,66 +1002,6 @@ function markInferredJoinAtoms(ty: i32) {
   if nm == "" { return 0 }
   uDeclared = true
   markValueUnionAtoms(nm, ty)
-}
-
-// The value-union half, read from the rung `recordInferRet` banked rather than re-derived
-// from the name it rendered: three of the adoption ladder's rungs are value-union
-// producers.
-function inferRetIsValueUnionAt(inRow: i32, inm: string): boolean {
-  // No entry means no name, so do not scan the registry for one: `inm` is "" exactly when
-  // `inRow < 0`, and the union registry never holds an empty name.
-  if inm == "" { return false }
-  if inRow < 0 { return isValueUnionName(inm) }
-  inferRetRungIsValueUnion(inRow)
-}
-
-// The registry-membership half, off the same row. A spelling scan of `unNames` compares
-// strings; `unRowOfCanonFolded` compares interned structural ids, the index that agrees.
-function inferRetIsUnionAt(inRow: i32, inm: string): boolean {
-  // The same empty-name short-circuit as `inferRetIsValueUnionAt`.
-  if inm == "" { return false }
-  if inRow < 0 { return isUNameDeclAB(70, inm) }
-  const row = inferRetTyIxAt(inRow)
-  if row < 0 { return isUNameDeclAB(71, inm) }
-  unRowOfCanonFolded(row) >= 0
-}
-
-// The litunion half of the inferred-return kind decision, asked of the arena row the table
-// entry records rather than of the rendered name, which canon softening makes the lowering
-// while the row is the precise type. `tyIsLitUnion` is structural, since the arena is not
-// hash-consed. An entry with no row is not a litunion.
-function inferRetIsLitUnionAt(inRow: i32): boolean {
-  const row = inferRetTyIxAt(inRow)
-  row >= 0 && tyIsLitUnion(row)
-}
-
-// Is inferred-return row `ty` a bare map whose value spells `i32`? The arena form of a recorded
-// name that is a whole map spelling with an `i32` value; false for a hole, a list or a union.
-function retTyIsI32Map(ty: i32): boolean {
-  if ty < 0 { return false }
-  const t = tyAt(ty)
-  if t is TyMap { return tyEmitPrimOf(t.mVal) == "i32" }
-  false
-}
-
-// Is inferred-return row `ty` a map or null: a nullable over a bare map, or the two-member
-// union of the two, which renders the same `{[K]: V}|null`. False for a hole.
-function retTyIsNulMap(ty: i32): boolean {
-  const inner = tyPeelNul(ty)
-  if inner != ty { return tyIsMap(inner) }
-  retTyIsMapNullPair(ty)
-}
-
-// The two-member-union half of `retTyIsNulMap`: a map and the `null` type, in either order.
-function retTyIsMapNullPair(ty: i32): boolean {
-  if ty < 0 { return false }
-  const t = tyAt(ty)
-  if !(t is TyUnion) { return false }
-  if t.uMembers.length != 2 { return false }
-  const a = t.uMembers[0]
-  const b = t.uMembers[1]
-  if isNullTy(a) { return tyIsMap(b) }
-  isNullTy(b) && tyIsMap(a)
 }
 
 // Could this functype's result be a mixed scalar-plus-composite union? `false` is a definite
@@ -2278,23 +2208,25 @@ function buildFnMapBankPrefix() {
   0
 }
 
-// Whether un-annotated function `i` is a lambda whose own inferred-return row classifies its
-// return columns as that type's annotation would: an element-value-union list, whose elements
-// are boxed, or a struct with a union field, whose built row a value's stamp can disagree with.
-// `fnRetColsFromRecorded` leaves such a row's columns as written.
-function fnRetRowLowersAsAnn(i: i32): boolean {
+// The struct row un-annotated lambda `i`'s own inferred-return row names, when that row is a
+// record with a union field (`() => ({})` delivered to `() => Cfg`), else -1. The values'
+// stamp can name another row of the same shape, and the closure's signature takes this one.
+function criLambdaRecordRow(i: i32): i32 {
+  if i < 0 || i >= fnStmts.length { return -1 }
   const fn = nodeAt(fnStmts[i])
-  if !(fn is FuncDecl) { return false }
-  if fn.fnRet >= 0 || i >= fRetVoid.length || fRetVoid[i] != 0 { return false }
+  if !(fn is FuncDecl) { return -1 }
   const k = inferRetFnKey(fnStmts[i], fn.fnName)
-  if k == fn.fnName { return false }
+  if k == fn.fnName { return -1 }
   const row = inferRetRowOf(k)
-  if row < 0 { return false }
-  inferRetRungIsParenUnionElemList(row)
-    || tyIsStructWithUnionField(inferRetTyIxAt(row))
+  if row < 0 { return -1 }
+  const t = inferRetTyIxAt(row)
+  if !tyIsStructWithUnionField(t) { return -1 }
+  repSlotOfTy(t)
 }
 
-// Classify row `li` from the annotation node `ann` and bank it, as an annotated return is.
+// Classify row `li` from return annotation `ann` (-1 for none) and bank it. A declared `: void`
+// seeds the void column here, since `recordedVoidFns` covers only the un-annotated half. An
+// un-annotated row's columns are written after mono from its recorded result.
 function buildFnMapRowOfRetAnn(li: i32, ann: i32) {
   const rsk = retAnnKindChain(ann)
   let sidx = 0
@@ -2314,152 +2246,10 @@ function buildFnMapRowOfRetAnn(li: i32, ann: i32) {
   buildFnMapBankRow(li)
 }
 
-// Classify the return of `s`, the declaration at `fnStmts` slot `i`, into row `li` and bank
-// the row: the annotation's facts first, then the checker's inferred return when unannotated.
-function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
-  // A declared `: void` return seeds the void classification directly: the fixpoint below
-  // (`recordedVoidFns`) covers only the un-annotated half, and an unseeded annotation leaves
-  // every `: void` function emitting `(result i32)`.
-  const rv = retVoidAnnFlag(s.fnRet)
-  // The polymorphic slot takes the namespace its `fRetKind` selects, which is the gate
-  // every reader of it already applies: a struct kind takes a struct-TABLE row and
-  // nothing else, since a variant's index in that channel reads as another row (D1737).
-  const rsk = retAnnKindChain(s.fnRet)
-  let sidx = 0
-  if rsk == "struct" || rsk == "nulstruct" {
-    sidx = retStructRowIndex(s.fnRet)
-  } else {
-    sidx = retStructIndex(s.fnRet)
-  }
-  const rae = retRefArrElemName(s.fnRet)
-  const rb = retBoolFlag(s.fnRet)
-  // The stored return kind: one `VKind` slot per function, seeded from the annotation via
-  // `retAnnKindChain`. `fnRetColsFromRecorded` writes the un-annotated facts into the same
-  // slot, so `inferredRetKindCore` is a plain read.
-  buildFnMapPutRow(li, rv, sidx, rae, rb, retAnnKindChain(s.fnRet))
-  // An un-annotated scalar, string or array return is set directly from the checker's
-  // inferred return name: the expression-based fallback below misses a return that is a
-  // plain variable. No AST node is synthesized, so `fmt` is untouched; `i32` needs nothing,
-  // and `string[]` stores `"strlist"`, the module-global string-list wrapper.
-  if s.fnRet < 0 {
-    // An anonymous lambda's inferred return is keyed by node index, since the lambda has no
-    // name the checker saw; fall back to that when the name-keyed lookup misses. One row
-    // lookup, two columns, so the name arms and the arena arms read the same row by
-    // construction rather than by two readers agreeing.
-    let inRow = inferRetRowOf(inferRetFnKey(fnStmts[i], s.fnName))
-    if inRow < 0 { inRow = inferRetRowByNode(fnStmts[i]) }
-    let inm = ""
-    if inRow >= 0 { inm = inferRetTyAt(inRow) }
-    // The five list arms take the array grammar's one cut plus a leaf name rather than
-    // matching a whole spelling. The `i32` and `string` arms compare the leaf directly,
-    // because their sibling homes (`nameIsI32Array` / `nameIsStringArray`) are rep-wide and
-    // also accept `boolean[]`, a litunion `K[]` and the nullable forms.
-
-    // The five scalar arms ask the arena, not the render: `inferRetTyIx` banks the type
-    // beside the name at the one recorder. What makes this sound is the transparency
-    // collapse in `declaredTyOfName` and `isClassifiableRetName`'s admitted set in
-    // `typecheck.vl` — widen that gate and these arms fire where the name arms did not.
-    let retTyIx = -1
-    if inRow >= 0 { retTyIx = inferRetTyIxAt(inRow) }
-    if fnRetRowLowersAsAnn(i) {
-      return buildFnMapRowOfRetAnn(li, synthTypeRefTy(inm, -1, retTyIx))
-    }
-    let retPrim = ""
-    if retTyIx >= 0 {
-      const rpt = tyAt(retTyIx)
-      if rpt is TyPrim { retPrim = rpt.primName }
-      // An inferred return whose join is an un-named literal union reps as a string ref,
-      // the same rep its annotated twin gets. A named alias is deliberately excluded: it
-      // reps as the interned i32 atom, and forcing it to `"str"` would put a string-ref
-      // result on a function returning an id. Same seam as `retLitUnionInline`.
-      if retPrim == "" && tyIsLitUnion(retTyIx) {
-        if litUnionAliasNameOfTy(retTyIx) == "" { retPrim = "string" }
-      }
-    }
-    // The five array arms, likewise from the arena, with the recorded array type read off
-    // the same row the name came from. Narrow by construction: exactly the five element
-    // names the cut admits, never the rep-wide helpers, because a `boolean` element is a
-    // `TyArray` of `TyPrim` an arena test would claim while the cascade gives it no arm.
-    let retElem = ""
-    // Five atom compares; the one widening happens only where the name is stored.
-    const raePrim = tyArrayElemPrim(retTyIx)
-    const raeOk = raePrim == "i32"
-      || raePrim == "string"
-      || raePrim == "f64"
-      || raePrim == "i64"
-      || raePrim == "f32"
-    if raeOk { retElem = primNameStr(raePrim) }
-    if retPrim == "null" {
-      // D1567 — the `null` type, from the rung the checker banks for it. Its rep is
-      // `nullref`, the bottom of the GC hierarchy: one value, assignable to every nullable
-      // ref destination with no coercion.
-      fRetKind[li] = "nulnone"
-    } else if retPrim == "string" {
-      fRetKind[li] = "str"
-    } else if retPrim == "i64" {
-      fRetKind[li] = "i64"
-    } else if retPrim == "f64" {
-      fRetKind[li] = "f64"
-    } else if retPrim == "f32" {
-      fRetKind[li] = "f32"
-    } else if retPrim == "boolean" {
-      fRetBool[li] = 1
-    } else if retElem == "i32" {
-      fRetKind[li] = "list"
-    } else if retElem == "string" {
-      fRetKind[li] = "strlist"
-    } else if retElem == "f64" {
-      fRetKind[li] = "f64list"
-    } else if retElem == "i64" {
-      fRetKind[li] = "i64list"
-    } else if retElem == "f32" {
-      fRetKind[li] = "f32list"
-    } else if retTyIsI32Map(retTyIx) {
-      // A mono `{[string]: i32}` map inferred return, set from the type the checker banked
-      // with the inferred return.
-      fRetKind[li] = "map"
-    } else if tyIsNulStringRep(retTyIx) {
-      // A `string | null` niche inferred return drives the kind-16 result valtype, the same
-      // kind the annotated path stores. The `boolean | null` niche stores nothing: its
-      // result valtype is plain i32, so it falls through to the default.
-      fRetKind[li] = "nulstr"
-    } else if retTyIsNulMap(retTyIx) {
-      // D937 — the nullable map inferred return, the sibling of the mono-map arm above.
-      // Same pair the annotated path stores (`retNulMapFlag` -> `"nulmap"`), read off the
-      // type the checker banked. Any string-keyed map, not just the i32-valued one, and
-      // ahead of `inferNulStructRow`, which would otherwise resolve a map as a struct row.
-      fRetKind[li] = "nulmap"
-    } else if inferNulVariantRow(retTyIx) >= 0 {
-      // D1562 — a nullable union-variant inferred return, the twin the `nulstruct` arm below
-      // never had. Ahead of `nulstruct`, which is the annotated ladder's order:
-      // `retAnnKindChain` is last-match-wins and puts the variant after the ref, and this
-      // chain is first-match-wins, so mirroring that precedence means going first.
-      fRetKind[li] = "nulvariant"
-      fRetStructIdx[li] = inferNulVariantRow(retTyIx)
-    } else if inferNulStructRow(retTyIx) >= 0 {
-      // D887 — a nullable-struct inferred return, the same pair the annotated path stores
-      // (`retNulRefFlag` -> `"nulstruct"` + `retStructIndex`), read off the name the checker
-      // recorded, so all four owners of a return row read one answer. Ahead of the two union
-      // arms below because the row is a nullable; both decline anyway.
-      fRetKind[li] = "nulstruct"
-      fRetStructIdx[li] = inferNulStructRow(retTyIx)
-    } else if inferRetIsValueUnionAt(inRow, inm) {
-      fRetKind[li] = "union"
-    } else if (inferRetIsUnionAt(inRow, inm) && !inferRetIsLitUnionAt(inRow)) {
-      // A registered struct-union inferred return: the variant-boxed rep rides the same
-      // union result valtype as a value union, so store `"union"`. A registered litunion
-      // alias has a union row too, but its rep is the interned i32 atom and so the default
-      // kind; the annotation side excludes it at the same seam.
-      fRetKind[li] = "union"
-    }
-  }
-  buildFnMapBankRow(li)
-}
-
-// Map each function name to its wasm function index — its position in `fnStmts` — and record
-// its return facts (voidness, struct index, ref-array element, boolean, kind). Built over all
-// top-level functions before any body is emitted, so forward references and recursion resolve
-// for free. Two parallel arrays: `fnNames[i]`'s index is `fnIndices[i]`. Returns the count.
+// Map each function name to its wasm function index, its position in `fnStmts`, and record its
+// annotated return facts; `fnRetColsFromRecorded` writes an un-annotated row's after mono. Built
+// before any body is emitted, so forward references resolve. `fnNames[i]`'s index is
+// `fnIndices[i]`. Returns the count.
 export function buildFnMap(_stmts: i32[]) {
   const resume = buildFnMapResumable()
   let start = fmSeenFns
@@ -2472,7 +2262,7 @@ export function buildFnMap(_stmts: i32[]) {
     while d < fmDirtySlots.length {
       const ds = fmDirtySlots[d]
       const dn = nodeAt(fnStmts[ds])
-      if dn is FuncDecl { buildFnMapClassifyRow(ds, dn, ds) }
+      if dn is FuncDecl { buildFnMapRowOfRetAnn(ds, dn.fnRet) }
       d = d + 1
     }
   } else {
@@ -2513,7 +2303,7 @@ export function buildFnMap(_stmts: i32[]) {
         sidArrPut(nestedNameBySid, fsid, 1)
       }
       fnIndices.push(i)
-      buildFnMapClassifyRow(i, s, fRetKind.length)
+      buildFnMapRowOfRetAnn(fRetKind.length, s.fnRet)
     }
     i = i + 1
   }
@@ -2620,24 +2410,6 @@ export function recordedVoidFns() {
     i = i + 1
   }
   0
-}
-
-// The non-null part of inferred return type `rt` when it is nullable, else -1.
-function inferNulInnerTy(rt: i32): i32 {
-  if nullableInnerOrNone(rt) < 0 { return -1 }
-  nonNullTy(rt)
-}
-
-// D887 — the struct row the non-null part of inferred return type `rt` occupies, or -1: the
-// type's own row, else the first row of the same type, which is the row the annotated spelling
-// keys. -1 for a non-nullable return and for a part with no row.
-function inferNulStructRow(rt: i32): i32 { structRowOfTy(inferNulInnerTy(rt)) }
-
-// D1562 — the variant row the non-null part of `rt` occupies, or -1: the twin of
-// `inferNulStructRow` one index space over. `collectS` gives a union arm no struct row, so the
-// struct twin answers -1 for every `Circle | null`; a record an arm adopted names that arm.
-function inferNulVariantRow(rt: i32): i32 {
-  variantRowOfShapeTy(inferNulInnerTy(rt))
 }
 
 // Interns the ref-list row of function `i`'s inferred ref-list result from its checked element
@@ -2815,6 +2587,13 @@ function criColsFromRecorded(i: i32): boolean {
   if fn.fnRet >= 0 || fRetVoid[i] != 0 || fnRecordedRetCols(i) != "" {
     return false
   }
+  if frcKind == "struct" {
+    const lr = criLambdaRecordRow(i)
+    if lr >= 0 {
+      frcSlot = lr
+      frcRow = lr
+    }
+  }
   fRetKind[i] = frcKind
   fRetStructIdx[i] = frcSlot
   fRetRArrElem[i] = frcElem
@@ -2830,7 +2609,7 @@ export function fnRetColsFromRecorded() {
   let i = 0
   while i < fnStmts.length {
     criRecordedRefListDemand(i)
-    if !fnRetRowLowersAsAnn(i) { criColsFromRecorded(i) }
+    criColsFromRecorded(i)
     const fn = nodeAt(fnStmts[i])
     if fn is FuncDecl && fn.fnRet < 0 && fRetVoid[i] == 0 {
       if criRecordRowCheck(i) < 0 { return -1 }
