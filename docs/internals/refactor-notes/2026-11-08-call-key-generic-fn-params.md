@@ -54,3 +54,6 @@ Their bytes are unchanged.
 - Fixpoint seed: 6,513,213 bytes, against master's 6,512,640 (+573).
 - `scripts/sweep.vl` diff, base vs candidate: 23,634 same, 0 bytes-only, 0 output movers,
   0 `runs → not-runs`, 0 new traps.
+- Merged with master `65816a85`, both sides at their fixpoint: 23,649 same, 0 movers. The seed is
+  6,513,167 bytes, against master's 6,512,594 (+573).
+- `scripts/gate.sh`: 23 of 23 rows pass. The pin-helper budget stays at 927.
