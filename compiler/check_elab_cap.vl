@@ -1173,6 +1173,10 @@ export function elabFnRetJoinNote(j: i32, a: i32, b: i32) {
 
 // Whether the join note in progress is a return's, whose records' lists are noted too.
 let elabFnJoinRecLists = false
+// Whether the record the join note enters next is a returned list's element.
+let elabFnJoinListRec = false
+// Whether the join note is under such a record.
+let elabFnJoinUnderListRec = false
 
 function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
   if (
@@ -1193,6 +1197,15 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
     TyFunc => {
       const u = elabFnSetTy[j] ?? -1
       if !inRec || u < 0 { return 0 }
+      // Under a returned list's record, only sides of different results are noted.
+      if (
+        elabFnJoinUnderListRec
+        && at is TyFunc
+        && bt is TyFunc
+        && at.fnRet == bt.fnRet
+      ) {
+        return 0
+      }
       for sd in [elabFnSetTy[a] ?? -1, elabFnSetTy[b] ?? -1] {
         if sd >= 0 && sd != u {
           fnWidenSrcTo.push(u)
@@ -1202,14 +1215,20 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
       return 0
     }
     // A list's elements are built at their own row: a join of lists of two sets is not noted.
+    // A returned list's record notes only the lists it holds, not a function field (D15229).
     TyObj => {
+      const listsOnly = elabFnJoinListRec
+      elabFnJoinListRec = false
       if !(at is TyObj) || !(bt is TyObj) { return 0 }
       let i = 0
       while i < jt.objFieldNames.length {
         const nm = jt.objFieldNames[i]
         const ia = strListIndexOf(at.objFieldNames, nm)
         const ib = strListIndexOf(bt.objFieldNames, nm)
-        if ia >= 0 && ib >= 0 {
+        const ft = jt.objFieldTypes[i]
+        const skip = listsOnly
+          && !(ft >= 0 && ft < T.tys.length && T.tys[ft] is TyArray)
+        if ia >= 0 && ib >= 0 && !skip {
           elabFnArmJoinAt(
             jt.objFieldTypes[i],
             at.objFieldTypes[ia],
@@ -1224,26 +1243,49 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
     }
     // A list of functions, at any depth of lists, holds each side's ids at the join's set, as a
     // record field does (D15227). One an arm's record holds, and a list of records, is built at
-    // that record's own row and is not noted (D15290, D15303); a returned one is (D15366).
+    // that record's own row and is not noted (D15290, D15303); a returned one is (D15366, D15510).
     TyArray => {
       if (
         inRec && !elabFnJoinRecLists
         || !(at is TyArray)
         || !(bt is TyArray)
-        || !elabListLeafIsFn(j, 6)
+        || !elabListLeafIsFn(j, 6) && !(elabFnJoinRecLists && elabListLeafIsObj(j))
       ) {
         return 0
       }
       const inner = jt.aElem >= 0
         && jt.aElem < T.tys.length
         && T.tys[jt.aElem] is TyFunc
+      const listRec = !elabListLeafIsFn(j, 6)
+      // A generic's instance builds from the template's tagged leaves, which a note would split.
+      if listRec && elabCurFnGeneric() { return 0 }
+      const wasUnder = elabFnJoinUnderListRec
+      elabFnJoinListRec = listRec
+      if listRec { elabFnJoinUnderListRec = true }
       elabFnArmJoinAt(jt.aElem, at.aElem, bt.aElem, depth + 1, inner)
+      elabFnJoinListRec = false
+      elabFnJoinUnderListRec = wasUnder
       return 0
     }
     TyPrim | TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg | TyMap => {
       return 0
     }
   }
+}
+
+// Whether the function whose body is being checked declares type parameters.
+function elabCurFnGeneric(): boolean {
+  const d = if curFnDeclIx >= 0 && curFnDeclIx < P.nodes.length { nodeAt(curFnDeclIx) } else { null }
+  d is FuncDecl && d.fnTyParams.length > 0
+}
+
+// Whether list type `t`'s elements are records.
+function elabListLeafIsObj(t: i32): boolean {
+  const tt = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  if !(tt is TyArray) || tt.aElem < 0 || tt.aElem >= T.tys.length {
+    return false
+  }
+  T.tys[tt.aElem] is TyObj
 }
 
 // Whether list type `t`'s elements, through at most `depth` nested lists, are functions.
