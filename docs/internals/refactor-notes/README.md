@@ -8,6 +8,12 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step7-kept-row-slot](2026-11-08-step7-kept-row-slot.md): Step 7: a read's kept row slot before its element name; D15301 closed (#6795).
+- [2026-11-08-generic-copy-shared-list-field](2026-11-08-generic-copy-shared-list-field.md): A generic copy's shared list field takes its type in the instance's frame; D15551 closed (#6794).
+- [2026-11-08-step7-classifier-r9](2026-11-08-step7-classifier-r9.md): Step 7 classifier round 9: the field storage type as a recorded fact (#6793).
+- [2026-11-08-call-key-generic-fn-params](2026-11-08-call-key-generic-fn-params.md): Step 2: the call key binds parameters handed a generic function (#6792).
+- [2026-11-08-step7-run2-walk-deleted](2026-11-08-step7-run2-walk-deleted.md): Step 7: run #2's return walk deleted (#6791).
+- [2026-11-08-unionbox-instance-coalesce-join](2026-11-08-unionbox-instance-coalesce-join.md): An instance's `??` joins as its direct spelling; seven more positions read the table (#6790).
 - [2026-11-08-step7-name-twin-shadow](2026-11-08-step7-name-twin-shadow.md): Step 7: the name-twin family shadowed per caller; 7 → 4 callers (#6787).
 - [2026-11-08-step7-cloret-bundle-arm](2026-11-08-step7-cloret-bundle-arm.md): Step 7: the cloRet* family through a bundle arm; 570 → 0 bundle disagreements (#6788).
 - [2026-11-08-naming-pin-producer](2026-11-08-naming-pin-producer.md): Naming rule slice 2: the pin's type from its type (#6786).
