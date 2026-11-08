@@ -367,33 +367,19 @@ import {
   fl32TypeIdx,
   fl64TypeIdx,
   fmResumeArmed,
-  fmSeedBool,
-  fmSeedKind,
-  fmSeedRArrElem,
-  fmSeedStructIdx,
-  fmSeedVoid,
   fmSeenFns,
-  fmSeenSFields,
-  fmSeenSNames,
-  fmSeenTyParams,
-  fmSeenUFields,
-  fmSeenUnNames,
-  fmSeenUnSets,
-  fmSeenVariants,
   fnAddrTaken,
   fnChildHead,
   fnChildNext,
   fnDispNames,
   fnEnvIdx,
   fnIndexBySid,
-  fnIndices,
   fnInstOrigin,
   fnListCatKinds,
   fnListCatSlots,
   fnListEqGKinds,
   fnListEqGSlots,
   fnListEqRSlots,
-  fnNames,
   fnNestUsed,
   fnParent,
   fnPosIndexDrop,
@@ -2085,71 +2071,24 @@ export function buildFnMapNoteFnStmtWrite(slot: i32, node: i32) {
     return 0
   }
   const nd = nodeAt(node)
-  if slot >= 0 && slot < fnIndices.length && fnIndices[slot] == slot {
-    if nd is FuncDecl {
-      if nd.fnName == fnNames[slot] {
-        fmDirtySlots.push(slot)
-        fnPosIndexDrop()
-        return 0
-      }
+  const od = if slot >= 0 && slot < fnStmts.length { nodeAt(fnStmts[slot]) } else { nd }
+  if slot >= 0 && slot < fRetKind.length && nd is FuncDecl && od is FuncDecl {
+    if nd.fnName == od.fnName {
+      fmDirtySlots.push(slot)
+      fnPosIndexDrop()
+      return 0
     }
   }
   buildFnMapNoteFnSlotWrite()
 }
 
-// Can this call re-seed the covered prefix from the row cache instead of re-classifying it?
-// Only with a prefix banked and every registry the return classifiers consult unmoved:
-// `retStructIndex` reads the struct table and the variant rows, `retAnnKindChain` the union
-// names, and a row added to any of them re-classifies an annotation already seen.
+// Can this call keep the covered prefix's rows and classify only the suffix and dirty slots?
+// Only an armed call with a prefix banked: mono's own rounds. `buildFnMap#2` is unarmed and
+// re-classifies every row, so no prefix row a resume kept reaches the emitter.
 function buildFnMapResumable(): boolean {
   if !fmResumeArmed { return false }
   if fmSeenFns < 0 { return false }
-  if fmSeenFns > fnStmts.length { return false }
-  if fmSeedKind.length > fRetKind.length { return false }
-  if fmSeenUnSets != unMemberSet.length { return false }
-  if fmSeenUnNames != unNames.length { return false }
-  if fmSeenVariants != uVariants.length { return false }
-  if fmSeenSNames != sNames.length { return false }
-  if fmSeenSFields != sFieldTypes.length { return false }
-  if fmSeenUFields != sFieldTypes.length { return false }
-  fmSeenTyParams == genTyParamNames.length
-}
-
-// Write the cached seed back over the prefix rows. This is what makes the resume exact rather
-// than merely cheap: `recordedVoidFns` and `fnRetColsFromRecorded` refine these five columns in
-// place after every call, so a resume that kept them would hand the next round a refined value
-// where a full re-mint hands it the annotation's own. `fRetLitAtom` seeds 0 for every row.
-function buildFnMapReseedPrefix() {
-  let r = 0
-  while r < fmSeedKind.length {
-    fRetVoid[r] = fmSeedVoid[r]
-    fRetStructIdx[r] = fmSeedStructIdx[r]
-    fRetRArrElem[r] = fmSeedRArrElem[r]
-    fRetBool[r] = fmSeedBool[r]
-    fRetKind[r] = fmSeedKind[r]
-    fRetLitAtom[r] = 0
-    r = r + 1
-  }
-  0
-}
-
-// Bank row `li` AFTER the inferred-return arms have refined it — the seed a full re-mint would
-// leave, not the annotation chain's first answer. A new row appends; a re-classified one is set.
-function buildFnMapBankRow(li: i32) {
-  if li < fmSeedKind.length {
-    fmSeedVoid[li] = fRetVoid[li]
-    fmSeedStructIdx[li] = fRetStructIdx[li]
-    fmSeedRArrElem[li] = fRetRArrElem[li]
-    fmSeedBool[li] = fRetBool[li]
-    fmSeedKind[li] = fRetKind[li]
-    return 0
-  }
-  fmSeedVoid.push(fRetVoid[li])
-  fmSeedStructIdx.push(fRetStructIdx[li])
-  fmSeedRArrElem.push(fRetRArrElem[li])
-  fmSeedBool.push(fRetBool[li])
-  fmSeedKind.push(fRetKind[li])
-  0
+  fmSeenFns <= fnStmts.length
 }
 
 // Write the annotation's return facts to row `li`: appended when it is the next row, else set.
@@ -2181,17 +2120,10 @@ function buildFnMapPutRow(
   0
 }
 
-// Bank the `fnStmts` prefix this run's rows cover, with the registry lengths that classify it.
-// Only an armed run banks, so no prefix crosses a pass that edits the arena in place.
+// Bank the `fnStmts` prefix this run's rows cover. Only an armed run banks, so no prefix
+// crosses a pass that edits the arena in place.
 function buildFnMapBankPrefix() {
   if !fmResumeArmed { return 0 }
-  fmSeenUnSets = unMemberSet.length
-  fmSeenUnNames = unNames.length
-  fmSeenVariants = uVariants.length
-  fmSeenSNames = sNames.length
-  fmSeenSFields = sFieldTypes.length
-  fmSeenUFields = sFieldTypes.length
-  fmSeenTyParams = genTyParamNames.length
   fmSeenFns = fnStmts.length
   0
 }
@@ -2215,13 +2147,11 @@ function buildFnMapRowOfRetAnn(li: i32, ann: i32) {
     retBoolFlag(ann),
     rsk,
   )
-  buildFnMapBankRow(li)
 }
 
-// Map each function name to its wasm function index, its position in `fnStmts`, and record its
+// Map each function name to its position in `fnStmts`, and record its
 // annotated return facts; `fnRetColsFromRecorded` writes an un-annotated row's after mono. Built
-// before any body is emitted, so forward references resolve. `fnNames[i]`'s index is
-// `fnIndices[i]`. Returns the count.
+// before any body is emitted, so forward references resolve. Returns the count.
 export function buildFnMap(_stmts: i32[]) {
   const resume = buildFnMapResumable()
   let start = fmSeenFns
@@ -2229,7 +2159,6 @@ export function buildFnMap(_stmts: i32[]) {
   // call must re-classify rather than resume from a prefix that never finished.
   fmSeenFns = -1
   if resume {
-    buildFnMapReseedPrefix()
     let d = 0
     while d < fmDirtySlots.length {
       const ds = fmDirtySlots[d]
@@ -2239,10 +2168,8 @@ export function buildFnMap(_stmts: i32[]) {
     }
   } else {
     start = 0
-    fnNames = []
     fnIndexBySid = []
     nestedNameBySid = []
-    fnIndices = []
     fRetVoid = []
     fRetStructIdx = []
     fRetRArrElem = []
@@ -2252,18 +2179,12 @@ export function buildFnMap(_stmts: i32[]) {
     // Round 1 drops the previous program's recorded column; round 2 keeps the one just banked.
     if !emitPhaseReached("monomorphized") { fRecRetTy = [] }
     fRetLitAtom = []
-    fmSeedVoid = []
-    fmSeedStructIdx = []
-    fmSeedRArrElem = []
-    fmSeedBool = []
-    fmSeedKind = []
   }
   fmDirtySlots = []
   let i = start
   while i < fnStmts.length {
     const s = nodeAt(fnStmts[i])
     if s is FuncDecl {
-      fnNames.push(s.fnName)
       // The build point for `fnIndexBySid` and `nestedNameBySid` — see `collectFns`' global row
       // for the exactness the interning-as-we-build gives.
       const fsid = sidOfNode(fnStmts[i])
@@ -2274,7 +2195,6 @@ export function buildFnMap(_stmts: i32[]) {
       if (i < fnParent.length && fnParent[i] >= 0) || lfBlockOf(i) >= 0 {
         sidArrPut(nestedNameBySid, fsid, 1)
       }
-      fnIndices.push(i)
       buildFnMapRowOfRetAnn(fRetKind.length, s.fnRet)
     }
     i = i + 1
