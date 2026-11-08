@@ -29623,6 +29623,7 @@ type CoerceKind = "none"
   | "recCopy"
   | "box"
   | "unbox"
+  | "atomstr"
 
 // The coercion recorded at `ix` in instance `fnIx`. A box is the outer one: any other record
 // at the node converts the value inside it. Otherwise each record is of one value type (a list,
@@ -29630,6 +29631,7 @@ type CoerceKind = "none"
 function coerceKindAt(ix: i32, fnIx: i32): CoerceKind {
   if boxAtTable(ix, fnIx) { return "box" }
   if armSeat >= 0 && ix == armSeat { return "unbox" }
+  if atomSeat >= 0 && ix == atomSeat { return "atomstr" }
   if listCopyAtNode(ix) >= 0 { return "listCopy" }
   if fnCloCoerceAtNode(ix) >= 0 { return "fnClo" }
   if mapDeliveryRecorded {
@@ -29683,6 +29685,7 @@ function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
     boxSeat = seat
     return rb
   }
+  if ck == "atomstr" { return emitAtomStrAtRecord(body, exprIx, fnIx) }
   if ck == "unbox" {
     // The seat is spent, so any other record at the node converts the value before the cast.
     armSeat = -1
@@ -35456,18 +35459,87 @@ function emitPrintStrFromScratch(body: u8[]) {
 // member. The string-subtype analogue of the numeric i32→f64 widening.
 export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32) {
   // `litAtomWidenTexts` is the ladder, shared with `print`'s atom arm: the node's own union
-  // members, the DECLARATION fallback for an operand whose recorded type is the GENERIC's,
-  // then the bare one-member set. Two consumers ask the same question and both need every
-  // rung — the classifier decides WHETHER to widen, this one needs the members to widen WITH.
+  // members, the declaration fallback for an operand whose recorded type is the generic's,
+  // then the bare one-member set. The table decodes at the recorded set where that covers it.
   const nulTexts = nulAtomWidenTexts(atomIx, fnIx)
-  if nulTexts.length > 0 {
-    atomSrcShadowNote(nulTexts, true, atomIx, fnIx)
-    return emitNulAtomToStr(body, atomIx, nulTexts, fnIx)
+  const siteNul = nulTexts.length > 0
+  let texts = if siteNul { nulTexts } else { litAtomWidenTexts(atomIx, fnIx) }
+  const why = atomFloorWhy(texts, siteNul, atomIx, fnIx)
+  if boxDstShadowArmed() {
+    boxDstShadowAs(if why == "" { "table" } else { why })
   }
-  let texts = litAtomWidenTexts(atomIx, fnIx)
-  atomSrcShadowNote(texts, false, atomIx, fnIx)
+  atomSrcShadowNote(texts, siteNul, atomIx, fnIx)
+  if why == "" {
+    const seat = atomSeat
+    atomSeat = atomIx
+    const rt = emitExpr(body, atomIx, fnIx)
+    atomSeat = seat
+    return rt
+  }
+  if siteNul { return emitNulAtomToStr(body, atomIx, nulTexts, fnIx) }
   // Where the node's own type names no member, the set its delivery recorded does (D4028).
-  if texts.length == 0 { texts = tyLitMemberTexts(atomSrcTyAt(atomIx, fnIx)) }
+  if texts.length == 0 { texts = tyLitMemberTexts(atomRecordAt(atomIx, fnIx)) }
+  emitAtomToStrTower(body, atomIx, texts, fnIx)
+}
+
+// The node whose next emission the table decodes to a string at its recorded set, or -1.
+let atomSeat = -1
+
+// The literal set the checker recorded for the atom `ix` at instance `fnIx`, at the node, its
+// unparenthesised form or the node it stands in for; -1 for none.
+function atomRecordAt(ix: i32, fnIx: i32): i32 {
+  let r = atomSrcTyAt(ix, fnIx)
+  if r < 0 { r = atomSrcTyAt(unwrapParen(ix), fnIx) }
+  if r < 0 { r = atomSrcTyAt(nodeSrc[ix] ?? -1, fnIx) }
+  instTyOrSelf(r, fnIx)
+}
+
+// Why the site decodes `ix` at its own members `texts` (`nul` mapping `-1` to null), or "" where
+// the record serves: it holds members, agrees on null, and names none outside the site's set.
+function atomFloorWhy(
+  texts: string[],
+  nul: boolean,
+  ix: i32,
+  fnIx: i32,
+): string {
+  if ix == coerceHeld { return "floor: held" }
+  const r = atomRecordAt(ix, fnIx)
+  if r < 0 { return "floor: no record" }
+  const rn = tyNulLitUnionMemberTexts(r)
+  const rt = if rn.length > 0 { rn } else { tyLitMemberTexts(r) }
+  if rt.length == 0 { return "floor: record holds no member" }
+  if (rn.length > 0) != nul { return "floor: null differs" }
+  for x in rt {
+    if texts.length > 0 && !textsHave(texts, x) { return "floor: record wider" }
+  }
+  ""
+}
+
+// Whether `xs` holds `x`.
+function textsHave(xs: string[], x: string): boolean {
+  for y in xs {
+    if y == x { return true }
+  }
+  false
+}
+
+// The table's decode of a seated atom: the tower over its recorded set, `-1` to null where the
+// set holds `null`. Returns 0, or -1 failed.
+function emitAtomStrAtRecord(body: u8[], ix: i32, fnIx: i32): i32 {
+  atomSeat = -1
+  const r = atomRecordAt(ix, fnIx)
+  const rn = tyNulLitUnionMemberTexts(r)
+  if rn.length > 0 { return emitNulAtomToStr(body, ix, rn, fnIx) }
+  emitAtomToStrTower(body, ix, tyLitMemberTexts(r), fnIx)
+}
+
+// The `select` tower over `texts` for the atom `atomIx`, its id evaluated once.
+function emitAtomToStrTower(
+  body: u8[],
+  atomIx: i32,
+  texts: string[],
+  fnIx: i32,
+): i32 {
   if texts.length == 0 {
     return emitFail(
       "emitProgram: literal-union string widening with no members",
@@ -35479,8 +35551,7 @@ export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32) {
     )
   }
   if emitStashAtomId(body, atomIx, fnIx) < 0 { return -1 }
-  const r = emitAtomToStrChain(body, texts, 0, strScratchBase + 3)
-  r
+  emitAtomToStrChain(body, texts, 0, strScratchBase + 3)
 }
 
 // Widen a `K | null` atom to a `string | null`: `-1` is `ref.null`, any other id takes the

@@ -52,9 +52,9 @@ awk -F'\t' -v D="$READ" '$2 ~ /^(atom|arm) / {
 # rows are `table` or a named floor, and a floor that floors.tsv does not list for its position fails.
 awk -F'\t' -v L="$R/scripts/box-dst-shadow/floors.tsv" '
   BEGIN { while ((getline l < L) > 0) if (l !~ /^#/ && l != "") ok[l] = 1 }
-  $2 ~ /^(arm )?(table|floor:)/ {
+  $2 ~ /^(arm |atom )?(table|floor:)/ {
     n = split($2, a, " [|] "); p = a[n]; sub(/^pos (floor@)?/, "", p); sub(/:[0-9]+$/, "", p)
-    if (a[1] ~ /table$/) { t[p (a[1] ~ /^arm/ ? " (arm)" : "")]++; next }
+    if (a[1] ~ /table/) { t[p (a[1] ~ /^(arm|atom)/ ? " (" substr(a[1], 1, index(a[1], " ") - 1) ")" : "")]++; next }
     k = p "\t" a[1]; f[k]++; if (!(k in w)) w[k] = $1 }
   END {
     for (p in t) print "table\t" t[p] "\t" p
