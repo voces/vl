@@ -99,7 +99,7 @@ import {
   nodeTyMapValIsNulLitUnion,
 } from "./check_hole_pins"
 import { inferRetNameOf, inferRetTyIxOf } from "./check_infer_ret"
-import { isInferLetNulBool, isInferLetNulStr } from "./check_infer_rows"
+import { isInferLetNulBool } from "./check_infer_rows"
 import {
   atomicIntrinsicIsVoid,
   fsIntrinsicSlot,
@@ -638,7 +638,6 @@ import {
   rlElemVariantRow,
   rlRowTyOfElem,
   rlSlotByName,
-  rlSlotByNameTwin,
   rlSlotOfRowTy,
   rlSlotOfTyOrTwin,
   sFieldMapShape,
@@ -1754,29 +1753,9 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
   null
 }
 
+// Whether the binding `letIx` holds a `string | null` niche inside `fnIx`.
 export function letIsNulString(letIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("letIsNulString") }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      if nodeRepIs(d.letType, "nulstr", fnIx) { return true }
-      // A generic instance's binding carries the re-check's type, which can drop a null its
-      // `if` still yields at the pin; the cell holds what the join builds (D3290).
-      if d.letInit >= 0 && fnInPinnedInstance(fnIx) {
-        if nodeAt(unwrapParen(d.letInit)) is IfStmt {
-          return exprNullableString(d.letInit, fnIx)
-        }
-      }
-    }
-    if d.letType < 0 {
-      // An un-annotated `const x = if c then "hi" else null` infers `string | null`, a niche
-      // the emitter cannot derive from the if-expression arms. The checker typed it and
-      // exported the binding by node index, so consult that before the init-shape probe.
-      if isInferLetNulStr(letIx) { return true }
-      return exprNullableString(d.letInit, fnIx)
-    }
-  }
-  false
+  repSigKindOfTy(letBindTy(letIx, fnIx)) == "nulstr"
 }
 
 // The nullable rep kind of the value at `exprIx` (`nulstr`, `nulbool`, …), or null for a value
@@ -2036,7 +2015,9 @@ export function identReadAtomKindAt(ix: i32, fnIx: i32): i32 {
   if !uDeclared { return -1 }
   const rx = unwrapParen(ix)
   if rx < 0 || isStorageRead(rx) { return -1 }
-  if identStoreClaimed(rx, fnIx) != "union" { return -1 }
+  // Before monomorphize no cell is classified yet; the read's storage type names its rep.
+  const sk = if emitPhaseReached("monomorphized") { identStoreClaimed(rx, fnIx) } else { repSigKindOfTy(readNarrowedStoreAt(rx, fnIx)) }
+  if sk != "union" { return -1 }
   const pt = asgReReadPinAt(rx, fnIx)
   if pt >= 0 { readAtomAgreed(rx, pt, fnIx) } else { readTypeVerdict(rx, fnIx) }
 }
@@ -4067,6 +4048,14 @@ export function identIsEnvCapture(fnIx: i32, name: string): boolean {
 // `==` or `.slice` anywhere in an expression, so the walk below descends every expression
 // position, not only statement receivers. `exprString` reads the already-built local columns.
 
+// Whether the closed checked type of `ix` in `fnIx` is a plain string, a literal-union alias
+// excluded.
+function coalTyIsStr(ix: i32, fnIx: i32): boolean {
+  if nodeTyIsLitUnionAlias(ix) { return false }
+  const t = nodeTyInOf(ix, fnIx)
+  tyKindOf(t) == TK_STR || tyIsBareStrLit(t)
+}
+
 // True if `binIx` is a `+` whose operands are strings (string concatenation).
 export function exprIsStrConcat(binIx: i32, fnIx: i32) {
   if clsCensusOn { clsCensusEnter("exprIsStrConcat") }
@@ -5875,6 +5864,13 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   if exprArray(iterIx, fnIx) {
     // A `null[]` walks the i32 list, but its loop var is the `null` unit cell, never written.
     if arrElemIsNullUnitAt(iterIx, fnIx) { return "nulnone" }
+    // A `boolean | null` element binds the niche its type names; the cell is an i32 either way.
+    if (
+      repSigKindOfTy(forInBindTy(readContainerTyAt(iterIx, fnIx), false))
+      == "nulbool"
+    ) {
+      return "nulbool"
+    }
     return "i32"
   }
   return null
@@ -10298,6 +10294,10 @@ function exprUnionBin(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
   // an un-annotated binding inferred the residual scalar cell and its `!= null` found no
   // nullable rep to test. Delegated to the name-typed mirror so the two cannot disagree.
   if e.binOp == "??" {
+    // Before monomorphize a closed `??` is the union its checked type names.
+    if !emitPhaseReached("monomorphized") && callTyClosedIn(exprIx, fnIx) {
+      return coalesceResultUnionName(exprIx, fnIx) != ""
+    }
     // Over a `null`-typed LHS the value is the default, at the default's rep (D4550).
     const cnnU = coalesceNulNoneDefaultIx(exprIx, fnIx)
     if cnnU >= 0 { return exprUnion(cnnU, fnIx) }
@@ -12259,13 +12259,13 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST {
     return refListElemNameOfNodeTy(exprIx)
   }
-  // The outer row's own inner row first: a structural name can key a same-layout record
+  // The receiver row's own inner row first: a structural name can key a same-layout record
   // declared earlier than the one the items are built at (D6731). Otherwise a receiver whose
   // element is itself a ref list — raw, `| null`, or at this instance's pins — yields the
   // read's own typed row; any other receiver yields no ref-list element.
   const outer = refListElemNameOfExpr(e.idxArr, fnIx)
   if outer == "" { return "" }
-  const os = rlSlotByNameTwin(outer, tyRefArrElemOf(nodeTyInOf(e.idxArr, fnIx)))
+  const os = refListSlotOfExpr(e.idxArr, fnIx)
   if rlSlotIsKindList(os, RLK_REF_LIST) {
     const ins = rlElemInnerSlot(os)
     if ins >= 0 && ins < rlElemName.length {
@@ -12332,8 +12332,8 @@ function keptOrName(s: i32): i32 {
 }
 
 // The ref-list table slot the expression at `exprIx` produces, or -1 when none resolves: its
-// rep's row, else its binding's kept slot, else (an identifier) its type's row, else (a literal,
-// call, field or index read) its rungs' row, else a literal's minted row, else its name's.
+// rep's row, else its binding's kept slot, else (an identifier) its type's row, else its kind's
+// rungs' row (a literal's minted one, a call's result, a paren's or if's), else its type's row.
 // Slot 0 is a real row, so a caller tests the result before indexing a backing table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   const rs0 = listRowOfExpr(exprIx, fnIx)
@@ -12352,6 +12352,27 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   if pe is Call {
     const cs = refListKeptSlotOfCall(pe, exprIx, fnIx)
     if cs != -2 { return cs }
+    // A named function's call its function's joined result row.
+    if pe.callFn >= 0 {
+      const ce = nodeAt(pe.callFn)
+      if ce is Ident {
+        const fe = fnIndexOfInScopeAt(
+          sidOfNode(pe.callFn),
+          ce.identName,
+          fnIx,
+          pe.callFn,
+        )
+        const js = fnRetRefListSlot(fe)
+        if js >= 0 && js < rlElemName.length { return js }
+      }
+    }
+  }
+  if pe is Paren { return refListSlotOfExpr(pe.parInner, fnIx) }
+  if pe is IfStmt {
+    if ifExprRefKind(exprIx, fnIx) != "reflist" { return -1 }
+    const ifs = ifExprRefSlot(exprIx, fnIx, "reflist", -1)
+    if ifs >= 0 && ifs < rlElemName.length { return ifs }
+    return -1
   }
   if pe is Member {
     const ms = refListKeptSlotOfMember(pe, exprIx, fnIx)
@@ -12366,8 +12387,8 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
     const mint = arrLitRlSlotAt(exprIx)
     if mint >= 0 && mint < rlElemName.length { return mint }
   }
-  const nm = refListElemNameOfExpr(exprIx, fnIx)
-  const s = rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
+  // Every other read takes the row its element type keys.
+  const s = rlSlotOfTyOrTwin(tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
   if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "call") }
   if s < 0 {
     if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "CLAMPED") }
@@ -12560,9 +12581,9 @@ export function letInitUnionListTy(letIx: i32, fnIx: i32): i32 {
   lt
 }
 
-// The row a `let` with no destination binds: for an un-annotated one, the initializer's
-// delivered row where the element type does not decide it (`letInitDeliversRow`), else a list
-// literal's own row; otherwise the row keyed by the element type. -1 for none.
+// The row a `let` with no destination binds: for an un-annotated one, a list literal's own
+// row, or the row any other initializer delivers (`refListSlotOfExpr`); otherwise, and where
+// that resolves none, the row keyed by the element type. -1 for none.
 function letTailRowSlot(letIx: i32, fnIx: i32): i32 {
   if clsCensusOn { clsCensusEnter("letTailRowSlot") }
   const et = letRefListElemTy(letIx, fnIx)
@@ -12571,33 +12592,15 @@ function letTailRowSlot(letIx: i32, fnIx: i32): i32 {
     if d.letInit >= 0 && d.letType < 0 {
       const ai = unwrapParen(d.letInit)
       if ai < 0 { return -1 }
-      if letInitDeliversRow(ai, et, fnIx) { return refListSlotOfExpr(ai, fnIx) }
-      if nodeAt(ai) is ArrayLit && !arrLitHasSpread(ai) {
-        return arrLitRowSlotIn(ai, fnIx)
+      if nodeAt(ai) is ArrayLit {
+        if !arrLitHasSpread(ai) { return arrLitRowSlotIn(ai, fnIx) }
+      } else {
+        const dr = refListSlotOfExpr(ai, fnIx)
+        if dr >= 0 { return dr }
       }
     }
   }
   rlSlotOfRowTy(rlRowTyOfElem(et))
-}
-
-// Whether initializer `ai`, of element type `et`, binds the row its value already has rather
-// than the row its element type keys: a named function's call its callee's result (none when
-// that is no ref list), and a closure whose signature holds a type variable its bound one.
-function letInitDeliversRow(ai: i32, et: i32, fnIx: i32): boolean {
-  const ini = nodeAt(ai)
-  if ini is Call {
-    if ini.callFn >= 0 {
-      const ce = nodeAt(ini.callFn)
-      if ce is Ident {
-        const sid = sidOfNode(ini.callFn)
-        if fnIndexOfInScopeAt(sid, ce.identName, fnIx, ini.callFn) >= 0 {
-          return true
-        }
-      }
-    }
-  }
-  if et < 0 || et >= T.tys.length { return false }
-  tyAt(et) is TyFunc && tyHasTyVar(et)
 }
 
 // The struct row an un-annotated binding of the object literal at `objIx` is built at, or -1
@@ -13912,6 +13915,10 @@ export function exprString(exprIx: i32, fnIx: i32) {
       // `r ?? d` over a `string | null` LHS yields a (non-null) string — the coalesce
       // recovers the non-null array ref, so `.length`/`+`/etc. on the result work.
       if e.binOp == "??" {
+        // Before monomorphize no cell is classified yet, so a closed `??` is its checked type.
+        if !emitPhaseReached("monomorphized") && callTyClosedIn(exprIx, fnIx) {
+          return coalTyIsStr(exprIx, fnIx)
+        }
         if exprNullableString(e.binLeft, fnIx) { return true }
         if coalesceNulAtomToStr(exprIx, fnIx) { return true }
         if coalesceRetypedAtomToStr(exprIx, fnIx) { return true }
@@ -14159,11 +14166,8 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
       // An index `xs[i]` into an ARRAY OF FUNCTIONS (`((i32) => i32)[]`, ref-list element
       // kind 5) reads back a closure fat-pointer — callable via `call_ref`.
       if exprRefArray(e.idxArr, fnIx) {
-        const slot = refListSlotOfExpr(e.idxArr, fnIx)
-        if slot >= 0 && slot < rlElemTyIx.length {
-          const fk = refListElemKind(e.idxArr, fnIx)
-          return fk == "closure" || fk == "nulclosure"
-        }
+        const fk = refListElemKind(e.idxArr, fnIx)
+        if fk != null { return fk == "closure" || fk == "nulclosure" }
       }
       // A bare `m[k]` over a FUNCTION-valued map (`{[string]: (i32) => i32}`, mv kind 14) reads
       // back the closure (nullable — narrow with `if f != null`).
@@ -14667,10 +14671,9 @@ function calleeRetKindOfRead(atIx: i32, fnIx: i32): VKind | null {
 }
 
 // The result kind of a call through a function value reached by an index, a record field, a
-// returned function or a parenthesised lambda, off its `$fnsig` key's result token; `null`
+// returned function or a parenthesised lambda: the rep of the call's type at `fnIx`; `null`
 // for any other callee, an `Ident` among them (those resolve through `calleeRetKindOfRead`).
 function cloValueCallRetKind(callIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("cloValueCallRetKind") }
   const c = nodeAt(callIx)
   if c is Call {
     const cfx = unwrapParen(c.callFn)
@@ -14681,7 +14684,7 @@ function cloValueCallRetKind(callIx: i32, fnIx: i32): VKind | null {
     } else if !(cre is Index || cre is Call || cre is FuncDecl) {
       return null
     }
-    return sigKeyRetKind(cloCallSigKey(callIx, fnIx))
+    return repSigKindOfTy(nodeTyAt(callIx, fnIx))
   }
   null
 }
