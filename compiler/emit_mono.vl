@@ -9,6 +9,7 @@ import {
   elabSpecParamCalledAt,
   elabSpecSlotOfKey,
   idCanon,
+  idSlotHeldTy,
 } from "./elab_fn_id"
 import { idShadowModeOf } from "./id_shadow_state"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
@@ -14835,19 +14836,17 @@ function monoPinFieldContainers(d: LetDecl, at: i32, ctx: i32): i32 {
 }
 
 // Types the record literal `rx` an un-annotated function returns in frame `ctx` at its closed type
-// at the instance (`elabHeldValTy`), nested record literals included, so the inferred result is
-// that record and not the checker's open one (D9181).
+// at the instance (`elabHeldValTy`) with each function field's slot set (`idSlotHeldTy`), nested
+// record literals included, so the inferred result is that record and not the checker's open one.
 function monoPinReturnedObj(rx: i32, ctx: i32) {
   if rx < 0 { return 0 }
   const lx = unwrapParen(rx)
   if lx < 0 || !(nodeAt(lx) is ObjLit) || monoFrameIsGenericInstance(ctx) {
     return 0
   }
-  const rt = elabHeldValTy(lx, ctx)
-  if rt >= 0 && monoObjLitFieldsTake(lx, ctx, false) {
-    return monoRecordObjLitAt(lx, rt, ctx)
-  }
-  monoObjLitFieldsTake(lx, ctx, true)
+  const rt = idSlotHeldTy(lx, elabHeldValTy(lx, ctx), "L" + i32ToStr(lx))
+  if rt >= 0 { return monoRecordObjLitAt(lx, rt, ctx) }
+  monoObjLitFieldsPin(lx, ctx)
   0
 }
 
@@ -14887,17 +14886,15 @@ function monoClosedReadTy(vx: i32, ctx: i32, rec: boolean): i32 {
   bt
 }
 
-// Whether record literal `lx` in frame `ctx` can take a closed type from outside: each open field
-// is a literal that can in turn, or reads a closed binding (a function or binding read whose rep
-// stays open would disagree with the record's). When `rec`, a closed read is recorded on the read
-// and an open inline list of functions takes its element slot's pin (D9254, D9301).
-function monoObjLitFieldsTake(lx: i32, ctx: i32, rec: boolean): boolean {
+// Pins the open fields of record literal `lx` in frame `ctx`, which took no closed type: a
+// field reading a closed binding is recorded at it, an open inline list of functions takes its
+// element slot's pin (D9254, D9301), and a nested record literal is walked in turn.
+function monoObjLitFieldsPin(lx: i32, ctx: i32) {
   const lit = nodeAt(lx)
   const ot = nodeTyIxOf(lx)
-  if !(lit is ObjLit) || ot < 0 || ot >= T.tys.length { return false }
+  if !(lit is ObjLit) || ot < 0 || ot >= T.tys.length { return 0 }
   const o = tyAt(ot)
-  if !(o is TyObj) { return false }
-  let ok = true
+  if !(o is TyObj) { return 0 }
   for fi in lit.objFields {
     const f = nodeAt(fi)
     const k = if f is FieldInit { strListIndexOf(o.objFieldNames, f.fiName) } else { -1 }
@@ -14909,19 +14906,19 @@ function monoObjLitFieldsTake(lx: i32, ctx: i32, rec: boolean): boolean {
     ) {
       const vx = unwrapParen(f.fiValue)
       if vx < 0 || vx >= P.nodes.length {
-        ok = false
+        continue
       } else if nodeAt(vx) is ObjLit {
-        if !monoObjLitFieldsTake(vx, ctx, rec) { ok = false }
+        monoObjLitFieldsPin(vx, ctx)
       } else if nodeAt(vx) is ArrayLit {
-        if rec && monoTyOpen(nodeTyIxOf(vx)) {
+        if monoTyOpen(nodeTyIxOf(vx)) {
           monoPinFieldContainer(lx, ctx, f.fiName, vx)
         }
-      } else if monoClosedReadTy(vx, ctx, rec) < 0 {
-        ok = false
+      } else {
+        monoClosedReadTy(vx, ctx, true)
       }
     }
   }
-  ok
+  0
 }
 
 // The record type literal `lx` takes at dotted path `pre` of the record declared at `at`: open
