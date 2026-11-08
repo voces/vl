@@ -5,6 +5,12 @@
 import { cwIxCovers } from "./check_write_scan"
 import { decDigitsOf } from "./strutil"
 import { parenPeelIx } from "./check_places"
+import { a20RetWalk } from "./check_nj_gate"
+import {
+  tailPushBlockTail,
+  tailPushIfArms,
+  tailPushMatchArms,
+} from "./check_unconsumed"
 import {
   CW_OCC_USE,
   CW_UP_ELEM,
@@ -24,6 +30,7 @@ import {
   cwLetFnTargets,
   cwLetRepointFnTargets,
   cwLetSlotFnTargets,
+  cwLetUnwritten,
   cwListElemFnTargets,
   cwListElemWriteFnTargets,
   cwOccNext,
@@ -909,6 +916,8 @@ let fnValGenerics: i32[] = []
 let fnJoinMemo: {[string]: i32} = Map()
 // The type each widened `let` node's reads take this pass (`elabFnLetTy`).
 let fnLetReadTy: {[i32]: i32} = Map()
+// By function declaration: its returned leaves (`elabRetLeavesOf`).
+let fnRetLeaves: {[i32]: i32[]} = Map()
 
 // The type the reads of `let` node `bd` take when they read the set of every function written
 // to it; -1 when they read the initialiser's type.
@@ -3015,6 +3024,7 @@ export function fnTyFactsReset() {
   fnTagCallMsgAt = Map()
   fnJoinMemo = Map()
   fnLetReadTy = Map()
+  fnRetLeaves = Map()
   fnLetWide = []
   fnLetWideAt = []
   fnLetOpenHands = []
@@ -3662,6 +3672,7 @@ export function elabCapReset() {
   fnSetByKey = Map()
   fnJoinMemo = Map()
   fnLetReadTy = Map()
+  fnRetLeaves = Map()
   fnLetSet = Map()
   fnSlotSet = Map()
   fnSetCallees = []
@@ -4111,4 +4122,220 @@ export function fnTagSharedArgDecl(a: i32): i32 {
     hops = hops + 1
   }
   -1
+}
+
+// The type `x` (a `let` node, or a record or list-of-records literal) of type `t` takes as a
+// returned leaf of the un-annotated function being checked: each list-of-functions field of the
+// record carries every leaf's named functions there, so each leaf and the result read one type
+// (D15559). `t` when a leaf's functions cannot be read from the source.
+export function elabRetRecTy(x: i32, t: i32): i32 {
+  const fx = curFnDeclIx
+  const fn = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+  if (
+    !(fn is FuncDecl)
+    || fn.fnRet >= 0
+    || fn.fnTyParams.length > 0
+    || t < 0
+    || t >= T.tys.length
+    || !stampsStand()
+  ) {
+    return t
+  }
+  const tl = T.tys[t]
+  const listRec = tl is TyArray
+  const rt = if tl is TyArray { tl.aElem } else { t }
+  const to = if rt >= 0 && rt < T.tys.length { T.tys[rt] } else { null }
+  if !(to is TyObj) || !elabRecHoldsFnList(to) { return t }
+  const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if xn is LetDecl && xn.letKw != "const" && !cwLetUnwritten(x) { return t }
+  const leaves = elabRetLeavesOf(fx, fn)
+  let mine = false
+  for lf in leaves {
+    const p = parenPeelIx(lf)
+    if p == x || p >= 0 && nodeAt(p) is Ident && identDeclOf(p) == x {
+      mine = true
+    }
+  }
+  if !mine || leaves.length < 2 { return t }
+  const names: string[] = []
+  const tys: i32[] = []
+  let changed = false
+  let i = 0
+  while i < to.objFieldNames.length {
+    const nm = to.objFieldNames[i]
+    const ft = to.objFieldTypes[i]
+    const fa = if ft >= 0 && ft < T.tys.length { T.tys[ft] } else { null }
+    const lt = if fa is TyArray { fa.aElem } else { -1 }
+    const la = if lt >= 0 && lt < T.tys.length { T.tys[lt] } else { null }
+    const s = if la is TyFunc { elabFnSetTy[lt] ?? -1 } else { -1 }
+    let nt = ft
+    // A function field is joined by the return's notes (D15290); only a list of them is grown.
+    if la is TyFunc && s >= 0 {
+      const ms: i32[] = []
+      for m in fnSets[s] { ms.push(m) }
+      for lf in leaves {
+        if !elabRetRecLeafFns(parenPeelIx(lf), x, nm, listRec, ms, 0) {
+          return t
+        }
+      }
+      for m in ms {
+        if !elabFnIsNamedPlain(m) { return t }
+      }
+      // Every leaf takes one index, so two leaves of one set read one type too.
+      const u = fnSetIntern(fnSetSorted(ms))
+      const key = "retrec:" + i32ToStr(fx) + "/" + nm + "," + i32ToStr(u)
+      let fresh = fnJoinMemo[key] ?? -1
+      if fresh >= 0 && fresh < T.tys.length {
+        const mf = T.tys[fresh]
+        if (
+          !(mf is TyFunc)
+          || mf.fnParamTypes.length != la.fnParamTypes.length
+          || (!tyHasTyVar(fresh)
+            && !tyHasTyVar(lt)
+            && (mf.fnRet != la.fnRet || mf.fnParamTypes != la.fnParamTypes))
+        ) {
+          return t
+        }
+      } else {
+        const ps: i32[] = []
+        for p in la.fnParamTypes { ps.push(p) }
+        const g: Ty = { fnParamTypes: ps, fnRet: la.fnRet }
+        T.tys.push(g)
+        fresh = T.tys.length - 1
+        elabFnSetTy[fresh] = u
+        fnJoinMemo[key] = fresh
+      }
+      nt = mkArrayTy(fresh)
+      changed = changed || fresh != lt
+    }
+    names.push(nm)
+    tys.push(nt)
+    i = i + 1
+  }
+  if !changed { return t }
+  const rec = mkObjTy(names, tys)
+  if listRec { mkArrayTy(rec) } else { rec }
+}
+
+// Whether declaration `m` is a named function declaring no type parameters.
+function elabFnIsNamedPlain(m: i32): boolean {
+  const d = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+  d is FuncDecl && d.fnName != "" && d.fnTyParams.length == 0
+}
+
+// Whether record `to` has a list-of-functions field.
+function elabRecHoldsFnList(to: TyObj): boolean {
+  for ft in to.objFieldTypes {
+    const fa = if ft >= 0 && ft < T.tys.length { T.tys[ft] } else { null }
+    const lt = if fa is TyArray { fa.aElem } else { -1 }
+    if lt >= 0 && lt < T.tys.length && T.tys[lt] is TyFunc { return true }
+  }
+  false
+}
+
+// Each value function `fn` (at `fx`) hands back, every tail of a value `if`, `match` or block
+// taken apart. Memoised per function for the pass.
+function elabRetLeavesOf(fx: i32, fn: FuncDecl): i32[] {
+  const have = fnRetLeaves.get(fx)
+  if have != null { return have }
+  const rets: i32[] = []
+  a20RetWalk(fn.fnBody, true, rets)
+  const leaves: i32[] = []
+  for r in rets {
+    const todo: i32[] = [r]
+    while todo.length > 0 {
+      const at = parenPeelIx(todo.pop())
+      if (
+        at >= 0
+        && at < P.nodes.length
+        && !tailPushIfArms(at, todo)
+        && !tailPushMatchArms(at, todo)
+        && !tailPushBlockTail(at, todo)
+      ) {
+        leaves.push(at)
+      }
+    }
+  }
+  fnRetLeaves[fx] = leaves
+  leaves
+}
+
+// Adds to `ms` the named functions returned leaf `lf` holds in list field `nm` (of each element,
+// with `listRec`), reading a binding through its initialiser; false when they cannot be read. A
+// leaf reading `self` adds nothing, since its own type's set is already in `ms`.
+function elabRetRecLeafFns(
+  lf: i32,
+  self: i32,
+  nm: string,
+  listRec: boolean,
+  ms: i32[],
+  depth: i32,
+): boolean {
+  if lf < 0 || lf >= P.nodes.length || depth > 4 { return false }
+  if lf == self { return true }
+  const n = nodeAt(lf)
+  if n is Ident {
+    const d = identDeclOf(lf)
+    if d == self { return true }
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if (
+      !(dn is LetDecl)
+      || dn.letType >= 0
+      || dn.letInit < 0
+      || dn.letKw != "const" && !cwLetUnwritten(d)
+    ) {
+      return false
+    }
+    const init = parenPeelIx(dn.letInit)
+    return elabRetRecLeafFns(init, self, nm, listRec, ms, depth + 1)
+  }
+  if !listRec { return n is ObjLit && elabRecLitListFns(n, nm, ms) }
+  if !(n is ArrayLit) { return false }
+  for e in n.arrElems {
+    const en = nodeAt(parenPeelIx(e))
+    if !(en is ObjLit) || !elabRecLitListFns(en, nm, ms) { return false }
+  }
+  true
+}
+
+// Adds to `ms` the named functions record literal `o`'s list field `nm` holds; false when it
+// holds another value.
+function elabRecLitListFns(o: ObjLit, nm: string, ms: i32[]): boolean {
+  for fx in o.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit && f.fiName == nm {
+      const v = parenPeelIx(f.fiValue)
+      const vn = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
+      if !(vn is ArrayLit) { return false }
+      for e in vn.arrElems {
+        const d = cwFnValueDeclOf(e)
+        if d < 0 { return false }
+        ms.push(d)
+      }
+      return true
+    }
+  }
+  false
+}
+
+// Grows literal `lit` to `t` (`elabRetRecTy`): a record literal and its fields, or a list
+// literal and each record literal it holds.
+export function elabRetRecLitGrow(lit: i32, t: i32) {
+  const lx = parenPeelIx(lit)
+  const ln = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
+  const tt = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  if ln is ArrayLit && tt is TyArray {
+    for e in ln.arrElems { elabRetRecLitGrow(e, tt.aElem) }
+    nodeTySetGrow(lx, t)
+    return 0
+  }
+  if !(ln is ObjLit) || !(tt is TyObj) { return 0 }
+  for fx in ln.objFields {
+    const f = nodeAt(fx)
+    const j = if f is FieldInit { strListIndexOf(tt.objFieldNames, f.fiName) } else { -1 }
+    const v = if f is FieldInit { parenPeelIx(f.fiValue) } else { -1 }
+    if j >= 0 && v >= 0 { nodeTySetGrow(v, tt.objFieldTypes[j]) }
+  }
+  nodeTySetGrow(lx, t)
+  0
 }
