@@ -8246,6 +8246,8 @@ export function monoStateReset() {
   monoTopStmts = []
   monoInstIsFirst = false
   monoInstRetWidenTy = 0 - 1
+  monoInstanceRetName = ""
+  monoInstanceRetTy = 0 - 1
   monoLastInstFe = 0 - 1
   monoMakeCallIx = 0 - 1
   monoOpenLamD = []
@@ -10085,6 +10087,8 @@ function monoFnTyParamTys(t: i32): i32[] {
 
 // The return type `monoInstanceFor` must reproduce for a widened return, or "" for any return.
 let monoInstanceRetName = ""
+// The type `monoInstanceRetName` is spelled from, or -1.
+let monoInstanceRetTy = 0 - 1
 // The instances built returning a result their template's only converts to (D9282): a generic
 // value they return is built at that result too.
 let monoRetWidenFns: {[i32]: boolean} = Map()
@@ -10144,10 +10148,9 @@ function monoFnTyRet(t: i32): i32 {
 
 // Whether boundary spelling `nm` names the closed type `ty`, compared on the arena, so a record
 // spelled by its shape matches the alias a parameter declares it by.
-function monoPinNamesTy(nm: string, ty: i32): boolean {
+function monoPinNamesTy(pty: i32, ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return false }
-  const at = nameToTy(nm)
-  at >= 0 && tyEq(at, ty)
+  pty >= 0 && pty < T.tys.length && tyEq(pty, ty)
 }
 
 // Materialize or reuse the instance of generic `origFe` for a function-typed binding at pins
@@ -10232,7 +10235,7 @@ function monoInstanceFor(
             )
           } else if (
             normTypeAtom(ann) != normTypeAtom(pinnedNames[i])
-            && !monoPinNamesTy(pinnedNames[i], nodeTyIxOf(p.parType))
+            && !monoPinNamesTy(pinTys[i], nodeTyIxOf(p.parType))
           ) {
             return 0
           }
@@ -10264,8 +10267,9 @@ function monoInstanceFor(
       const rs = monoInstanceSubstRet(fn, tvN, tvV)
       if normTypeAtom(rs) != monoInstanceRetName {
         let want = monoFnTyRet(expTy)
-        if want < 0 { want = nameToTy(monoInstanceRetName) }
-        if elabWidenedRet(nameToTy(rs), want) >= 0 {
+        if want < 0 { want = monoInstanceRetTy }
+        const rsTy = substTyDeepOf(nodeTyIxOf(fn.fnRet), tvN, tvT, own)
+        if rsTy >= 0 && want >= 0 && elabWidenedRet(rsTy, want) >= 0 {
           monoInstRetWidenName = monoInstanceRetName
           monoInstRetWidenTy = want
         }
@@ -10543,7 +10547,7 @@ function monoCoerceFnValueTys(
       }
       // A maker delivered at a closed function type is its instance at that type's result.
       if monoIsMakerFe(gfe) {
-        const dt = if expTy >= 0 { expTy } else { nameToTy(tname) }
+        const dt = if expTy >= 0 { expTy } else { tnameTy }
         return monoMakerTwin(gfe, exprIx, monoFnTyRet(dt), delTys, ctx)
       }
       if gfe >= 0 && gfe < monoGen.length {
@@ -10559,6 +10563,7 @@ function monoCoerceFnValueTys(
             // A capturing nested generic's value is this frame's instance, as a call is (D3902).
             monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
             monoInstanceRetName = ""
+            monoInstanceRetTy = monoFnTyRet(tnameTy)
             if monoInstanceWidenRet {
               monoInstanceRetName = normTypeAtom(
                 annRetNameOf(peelGroupParens(tname)),
@@ -10773,7 +10778,7 @@ function monoCallIfBound(ix: i32, ctx: i32): i32 {
   const ct = monoSlotPinNameTys(lf[1], [], lf[0], dTys, dFt)
   if ct == "" { return 0 }
   // The binding holds one value, so a call at another type is refused and split (D9120).
-  const et = nameToTy(ct)
+  const et = if dFt.length == 1 { dFt[0] } else { -1 }
   const seen = monoChoiceBindNote(
     lf,
     if monoTyConcreteFn(et) { tyToStr(et) } else { ct },
@@ -10926,7 +10931,7 @@ function monoCoerceChoiceBinding(
   if fnTagTyIsTagged(nodeTyIxOf(d.letInit)) { return 0 }
   const ct = tname
   const xt = expTy
-  const et = if monoTyConcreteFn(expTy) { expTy } else { nameToTy(tname) }
+  const et = if monoTyConcreteFn(expTy) { expTy } else { tnameTy }
   const pTys = delTys
   const iv = unwrapParen(d.letInit)
   const g0 = monoFirstArmGenName(iv, lf[0], 0)
@@ -21386,6 +21391,7 @@ function monoPinTyParamComposite(
     )
   }
   let pinC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+  const pinPlain = pinC
   if i < monoUnionRestPin.length && monoUnionRestPin[i] != "" {
     pinC = monoUnionRestPin[i]
   }
@@ -21399,7 +21405,10 @@ function monoPinTyParamComposite(
   // spelling, the concrete function type that parameter takes.
   if annFnSlot || nameIsClosureArray(pinC) {
     const delTys = monoSlotParamTysAt(patTy, own, tvN, tvT)
-    if monoCoerceFnValueTys(args[i], pinC, ctx, -1, delTys, -1) < 0 {
+    // The parameter's type substituted, which `pinC` spells unless a rest or row pin replaced it.
+    const pinCTy = if pinC == pinPlain { substTyDeepOf(patTy, tvN, tvT, own) } else { -1 }
+    const pinCFt = if pinCTy >= 0 && !tyHasTyVar(pinCTy) { pinCTy } else { -1 }
+    if monoCoerceFnValueTys(args[i], pinC, ctx, -1, delTys, pinCFt) < 0 {
       return -1
     }
   }
@@ -23121,7 +23130,7 @@ function monoDeliverCallRets(at: i32, ann: string, fd: i32, annTy: i32): i32 {
       if pn.parType < 0 { return 0 }
     }
   }
-  const at2 = nameToTy(ann)
+  const at2 = annTy
   if at2 < 0 { return 0 }
   if !monoRetsReachHoleLam(fd, []) { return 0 }
   const rets = monoFnRetArgs(fn)
