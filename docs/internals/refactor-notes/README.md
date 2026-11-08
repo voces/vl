@@ -8,6 +8,11 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-unionbox-write-order-variant-fields](2026-11-08-unionbox-write-order-variant-fields.md): The box record's write order, graded; variant fields read it (#6769).
+- [2026-11-08-call-key-every-instance-shadow](2026-11-08-call-key-every-instance-shadow.md): Step 2: does the call key bind every instance mono builds; the value class switched (#6767).
+- [2026-11-08-state-audit-const-containers](2026-11-08-state-audit-const-containers.md): The state audit reads written `const` containers; two more leaks fixed (#6766).
+- [2026-11-08-held-type-keeps-fn-sets](2026-11-08-held-type-keeps-fn-sets.md): The held type keeps its function sets; D15296 fixed, guard (b) gone (#6765).
+- [2026-11-08-step7-run2-last](2026-11-08-step7-run2-last.md): Step 7: run #2 declined 25 → 17 (#6764).
 - [2026-11-08-pin-step4-types](2026-11-08-pin-step4-types.md): Pin step 4: a type-level `monoAnnPinTy`; emit_mono.vl parses no pin spelling (#6762).
 - [2026-11-08-step7-classifier-batch2-r6](2026-11-08-step7-classifier-batch2-r6.md): Step 7 classifier batch 2: five onto typed readers; the disagreement mechanisms (#6760).
 - [2026-11-08-unionbox-record-leak-arguments](2026-11-08-unionbox-record-leak-arguments.md): The box record's batch leak (`lpExits`); the argument family on the table (#6759).
