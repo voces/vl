@@ -7272,9 +7272,35 @@ export function arrLitElemName(arrIx: i32, fnIx: i32): string {
   if ae >= 0 { return rlRowNameOfTy(ae, false) }
   const ft = arrLitFrameRefTy(arrIx, fnIx)
   if ft >= 0 { return rlRowNameOfTy(tyArrayElemIx(ft), false) }
+  if !emitPhaseReached("monomorphized") { return arrLitElemNameTy(arrIx, fnIx) }
   const inst = arrLitInstElemRow(arrIx, fnIx)
   if inst >= 0 { return sNames[inst] }
   arrLitElemNameTpl(arrIx)
+}
+
+// `arrLitElemName` before mono, from what the checker and the record solve recorded: a closure
+// element's function-type key, the lead element's committed annotation, the row a lead object
+// literal builds at, the nominal row of a recorded record element, else the recorded element's row.
+function arrLitElemNameTy(arrIx: i32, fnIx: i32): string {
+  if arrElemIsClosureTy(arrIx) { return arrLitElemRender(arrIx) }
+  const acn = arrLitCommitNameAt(arrIx)
+  if acn != "" { return acn }
+  const a = nodeAt(arrIx)
+  if a is ArrayLit {
+    if (
+      a.arrElems.length >= 1
+      && nodeAt(a.arrElems[0]) is ObjLit
+      && !arrLitHasNullElem(a)
+    ) {
+      const si = structIndexOfObjCtx(a.arrElems[0], fnIx)
+      if si >= 0 { return sNames[si] }
+    }
+  }
+  const ann = arrLitNominalElemName(arrIx)
+  if ann != "" { return ann }
+  const t = litRepTyAt(arrIx, fnIx)
+  if t < 0 { return "" }
+  rlRowNameOfTy(tyArrayElemIx(t), false)
 }
 
 // The record a record list literal `arrIx` holds as its element, read off the arena; -1 where
@@ -7586,24 +7612,28 @@ function anonCodeAdmitsValue(c: i32, valIx: i32) {
   false
 }
 
-// The struct row a ref list literal's elements name: the first element's, when every other
-// element is an object literal of that row or `null` (a `ref null` slot holds it), else -1.
-// A mixed `[{ x: 1 }, "t"]` is a union list, which the arena names instead (D4688).
-function arrLitRefListRow(a: ArrayLit): i32 {
-  if clsCensusOn { clsCensusEnter("arrLitRefListRow") }
-  if a.arrElems.length < 1 { return -1 }
-  const si = structIndexOfObj(a.arrElems[0])
-  if si < 0 { return -1 }
-  let j = 1
-  while j < a.arrElems.length {
-    const aej = nodeAt(a.arrElems[j])
-    if !(aej is NullLit) {
-      if !(aej is ObjLit) { return -1 }
-      if structIndexOfObj(a.arrElems[j]) != si { return -1 }
+// The row key of a struct-ref-list field value `valIx`: a record element (or its `| null`)
+// whose list leads with an object literal names the row that literal builds at, `|null` kept
+// in the key (D4721); else the recorded list type's element key.
+function anonRefListFieldKey(valIx: i32): string {
+  const at = nodeTyIxOf(valIx)
+  const e = tyArrayElemIx(at)
+  const av = nodeAt(valIx)
+  if e >= 0 && e < T.tys.length && av is ArrayLit && av.arrElems.length >= 1 {
+    const et = tyAt(e)
+    const inner = if et is TyNullable { et.nInner } else { e }
+    if (
+      inner >= 0
+      && inner < T.tys.length
+      && tyAt(inner) is TyObj
+      && nodeAt(av.arrElems[0]) is ObjLit
+    ) {
+      const si = structIndexOfObjCtx(av.arrElems[0], -1)
+      if si >= 0 && et is TyNullable { return sNames[si] + "|null" }
+      if si >= 0 { return sNames[si] }
     }
-    j = j + 1
   }
-  si
+  anonRefListElemKeyOfTy(at)
 }
 
 // The syntax half of `anonFieldCode` — the field value's own literal form. Kept separate
@@ -7751,21 +7781,7 @@ export function anonFieldElemName(valIx: i32, code: i32) {
   // A struct-ref-list field (code 5) records its element row's name — the companion the
   // emitter resolves the list's element heap type through, the same bargain code 16
   // struck (D1443).
-  if code == FC_REF_LIST {
-    const av = nodeAt(valIx)
-    if av is ArrayLit {
-      const esi = arrLitRefListRow(av)
-      // A `null` element keeps its niche in the key, the spelling the arena route gives
-      // `[p, null]`, so the element read is classified nullable (D4721).
-      if esi >= 0 && arrLitHasNullElem(av) { return sNames[esi] + "|null" }
-      if esi >= 0 { return sNames[esi] }
-    }
-    // D1515/D1688 — the arena, once the literal route has declined: a list produced by
-    // anything but an array literal of object literals has no element node, so the recorded
-    // element type names the row, or, for an element no row names, its own nominal key. An
-    // empty literal is one of those: a later push pinned its element in place.
-    return anonRefListElemKeyOfTy(nodeTyIxOf(valIx))
-  }
+  if code == FC_REF_LIST { return anonRefListFieldKey(valIx) }
   // A nullable ref-list field (code 28) records its ELEMENT's key, read off the type rather
   // than the `| null` spelling the literal does not carry — the same ladder code 5 uses, on
   // the peeled inner array, so one element type is one key at both codes (D1627, D1663).
