@@ -32,7 +32,7 @@ no difference. `genFnHoleBodyRet` stays as the direct call's body rule, renamed 
 | `take((x) => x)` handing `[a]` to `use<T>(ys: T[])` | check reject | runs (pin: `hole-lambda-listed-handed-to-generic-list-param.vl`) |
 | seed (fixpoint) | 6,576,217 | 6,574,351 (−1,866; +2.8% of the seed-size baseline) |
 | pin-helper budget (`emit_mono.vl`) | 921 | 921 (untouched) |
-| late demands | 5 | 4: the `use<T>` pin mints `use` after `elabRun` (+1, recorded), two `listed`/`untagged-records` cases fell (−2) |
+| late demands | 3 | 4: the `use<T>` pin mints `use` after `elabRun` (+1, recorded) |
 
 The 12 bytes-only movers are the programs the per-call binding instances differently. Their output
 is unchanged.

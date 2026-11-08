@@ -1,14 +1,19 @@
 // An intrinsic named as a value, not called (`const f = __load_i32__`, `xs.map(sqrt)`), is
 // rewritten before checking into a lambda that calls it, so the value is an ordinary function
 // value. A numeric intrinsic takes the width its destination's function type names, else `f64`
-// (float) or `i32` (integer), the types its literals default to. A SIMD row whose lane is a
-// wasm immediate refuses. A name a declaration shadows is left alone.
+// (float) or `i32` (integer), the types its literals default to. `__array_new__` and
+// `__array_copy__` read a generic module-level forwarder instead. A SIMD row whose lane is a
+// wasm immediate refuses, and so does `__array_new_default__`, whose element type no parameter
+// binds. A name a declaration shadows is left alone.
 import {
+  Block,
   Call,
   FuncDecl,
   Ident,
   P,
   Param,
+  Program,
+  TS_NAME,
   arenaSetNode,
   i32ToStr,
   mkBlock,
@@ -18,6 +23,9 @@ import {
   mkParam,
   mkTypeRef,
   nodeAt,
+  setAnnTs,
+  tsLeaf,
+  tsListOf,
 } from "./ast"
 import { bindProgram } from "./bind"
 import {
@@ -28,7 +36,7 @@ import {
   simdRowLaneMax,
 } from "./check_intrinsics"
 import { ambientTyOf } from "./check_scopes"
-import { TyFunc, TyPrim, tyAt, tyToStr } from "./check_types"
+import { TyArray, TyFunc, TyPrim, tyAt, tyToStr } from "./check_types"
 import { IDENT_BUILTIN, identDeclOf } from "./symbols"
 
 // Rewrites every value-position read of an unshadowed intrinsic in the arena under `rootIx`
@@ -50,11 +58,18 @@ export function intrinsicValuesWrap(rootIx: i32) {
   while i < end {
     const n = nodeAt(i)
     if n is Call && n.callFn >= 0 && n.callFn < end { callee[n.callFn] = true }
-    if n is Ident && ivIsName(n.identName) { any = true }
+    i = i + 1
+  }
+  i = 0
+  while i < end && !any {
+    const n = nodeAt(i)
+    if n is Ident && !callee[i] && ivIsName(n.identName) { any = true }
     i = i + 1
   }
   if !any { return 0 }
   bindProgram(rootIx)
+  ivHoisted = []
+  let rebind = false
   i = 0
   while i < end {
     const n = nodeAt(i)
@@ -64,10 +79,18 @@ export function intrinsicValuesWrap(rootIx: i32) {
       && ivIsName(n.identName)
       && identDeclOf(i) == IDENT_BUILTIN
     ) {
-      if ivLaneRow(n.identName) { ivLaneReads.push(i) } else { ivWrap(i, n) }
+      if ivLaneRow(n.identName) {
+        ivLaneReads.push(i)
+      } else if ivIsGeneric(n.identName) {
+        ivHoist(rootIx, i, n)
+        rebind = true
+      } else {
+        ivWrap(i, n)
+      }
     }
     i = i + 1
   }
+  if rebind { bindProgram(rootIx) }
   0
 }
 
@@ -78,6 +101,15 @@ let ivLamNames: string[] = []
 // The reads `intrinsicValuesWrap` left unwrapped because their intrinsic is a lane row; the
 // checker refuses each with `intrinsicLaneValueMsg`.
 export let ivLaneReads: i32[] = []
+
+// The refusal for an undeclared read of `name` when it is an intrinsic that has no value, else "".
+export function intrinsicNoValueMsg(name: string): string {
+  if name != "__array_new_default__" { return "" }
+  name
+    + " cannot be named as a value: its element type comes only from the destination of each"
+    + " call, and a value has no parameter to bind it from — call it directly where the array"
+    + " is wanted"
+}
 
 // The refusal for lane-row read `ix`: its lane index is an immediate, so it has no value.
 export function intrinsicLaneValueMsg(ix: i32): string {
@@ -106,6 +138,15 @@ function ivLaneRow(name: string): boolean {
   row >= 0 && simdRowLaneMax(row) >= 0
 }
 
+// The parameter types of a checker-special intrinsic's value, `T` its element type, or empty.
+function ivSpecialTys(name: string): string[] {
+  if name == "__str_from_bytes__" { return ["u8[]", "i32", "i32"] }
+  if name == "__trap__" { return ["string"] }
+  if name == "__array_new__" { return ["i32", "T"] }
+  if name == "__array_copy__" { return ["T[]", "i32", "T[]", "i32", "i32"] }
+  []
+}
+
 // A destination of function type with parameter types `want` re-widths the minted lambda `lam`
 // of a numeric intrinsic, when every one is the same width the intrinsic computes at (f32/f64
 // for a float one, i32/i64 for an integer one, all four for `min`/`max`/`abs`). Called before
@@ -115,6 +156,7 @@ export function ivSeedWidth(lam: i32, want: i32[]) {
   while k < ivLams.length && ivLams[k] != lam { k = k + 1 }
   if k >= ivLams.length { return 0 }
   const name = ivLamNames[k]
+  if name == "__trap__" && want.length == 0 { return ivTrapBare(lam) }
   const fa = floatIntrArity(name)
   const ia = intIntrArity(name)
   if fa + ia == 0 || want.length != fa + ia { return 0 }
@@ -142,15 +184,25 @@ export function ivSeedWidth(lam: i32, want: i32[]) {
 // Whether `name` is an intrinsic `ivParamTys` can give a value's parameter types for.
 function ivIsName(name: string): boolean {
   if floatIntrArity(name) > 0 || intIntrArity(name) > 0 { return true }
+  if (name == "__str_from_bytes__" || name == "__trap__" || ivIsGeneric(name)) {
+    return true
+  }
   if !nameIsDunder(name) { return false }
   const t = ambientTyOf(name)
   if t < 0 { return false }
   const f = tyAt(t)
   if !(f is TyFunc) { return false }
   for p in f.fnParamTypes {
-    if !(tyAt(p) is TyPrim) { return false }
+    if !ivSpellable(p) { return false }
   }
   true
+}
+
+// Whether parameter type `p` is a primitive or a list of one, which a type name can spell.
+function ivSpellable(p: i32): boolean {
+  const pt = tyAt(p)
+  const leaf = if pt is TyArray { pt.aElem } else { p }
+  leaf >= 0 && tyAt(leaf) is TyPrim
 }
 
 // The parameter type names the value of intrinsic `name` takes, in order.
@@ -167,6 +219,8 @@ function ivParamTys(name: string): string[] {
     }
     return out
   }
+  const sp = ivSpecialTys(name)
+  if sp.length > 0 { return sp }
   const t = ambientTyOf(name)
   if t < 0 { return out }
   const f = tyAt(t)
@@ -193,5 +247,88 @@ function ivWrap(ix: i32, n: Ident) {
   arenaSetNode(ix, { parInner: lam, pos: n.pos })
   ivLams.push(lam)
   ivLamNames.push(n.identName)
+  0
+}
+
+// Whether intrinsic `name`'s value is generic in the element type `T` a parameter binds.
+function ivIsGeneric(name: string): boolean {
+  name == "__array_new__" || name == "__array_copy__"
+}
+
+// The generic forwarders `ivHoist` minted this compile, by intrinsic name.
+let ivHoisted: string[] = []
+
+// Read `ix`, the read `n` of generic intrinsic `name`, becomes a read of the module-level
+// `$iv$name<T>(x0: T0, …) { name(x0, …) }`, minted once and appended to root `rootIx`; a generic
+// declaration is a value, which an anonymous lambda cannot be.
+function ivHoist(rootIx: i32, ix: i32, n: Ident) {
+  const fwd = "$iv$" + n.identName
+  let have = false
+  for h in ivHoisted {
+    if h == n.identName { have = true }
+  }
+  if !have {
+    ivHoisted.push(n.identName)
+    const params: i32[] = []
+    const args: i32[] = []
+    let j = 0
+    for tn in ivParamTys(n.identName) {
+      const pn = "x" + i32ToStr(j)
+      params.push(mkParam(pn, ivSpelledRef(tn, n.pos), -1, 0, 0, -1))
+      args.push(mkIdent(pn, n.pos))
+      j = j + 1
+    }
+    const call = mkCall(mkIdent(n.identName, n.pos), args, n.pos)
+    const fe = mkFunc(fwd, ["T"], params, -1, mkBlock([call], n.pos), n.pos)
+    const root = nodeAt(rootIx)
+    if root is Program {
+      const stmts: i32[] = []
+      for st in root.progStmts { stmts.push(st) }
+      stmts.push(fe)
+      arenaSetNode(rootIx, { progStmts: stmts, pos: root.pos })
+    }
+  }
+  arenaSetNode(ix, { identName: fwd, pos: n.pos })
+  0
+}
+
+// A `TypeRef` naming `tn` (`T`, or `T[]`), with the spelling the parser would bank for it,
+// so a rule reading the annotation's spelling sees the type parameter it names.
+function ivSpelledRef(tn: string, pos: i32): i32 {
+  const r = mkTypeRef(tn, pos)
+  const isList = tn.length > 2 && tn.slice(tn.length - 2, tn.length) == "[]"
+  const leaf = tsLeaf(
+    TS_NAME,
+    if isList { tn.slice(0, tn.length - 2) } else { tn },
+  )
+  setAnnTs(r, if isList { tsListOf(leaf) } else { leaf })
+  r
+}
+
+// Minted `__trap__` lambda `lam` loses its message parameter, for a destination that takes none.
+function ivTrapBare(lam: i32) {
+  const ln = nodeAt(lam)
+  if !(ln is FuncDecl) || ln.fnBody < 0 { return 0 }
+  const body = nodeAt(ln.fnBody)
+  if !(body is Block) || body.blkStmts.length != 1 { return 0 }
+  const call = nodeAt(body.blkStmts[0])
+  if !(call is Call) { return 0 }
+  const none: i32[] = []
+  const noNames: string[] = []
+  arenaSetNode(
+    body.blkStmts[0],
+    { callFn: call.callFn, callArgs: none, callArgNames: noNames, pos: call.pos },
+  )
+  arenaSetNode(
+    lam,
+    {
+      fnName: ln.fnName,
+      fnTyParams: ln.fnTyParams,
+      fnParams: none,
+      fnRet: ln.fnRet,
+      fnBody: ln.fnBody,
+      pos: ln.pos,
+    },
+  )
   0
 }
