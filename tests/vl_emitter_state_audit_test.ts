@@ -130,8 +130,8 @@ Deno.test({
     if (held.code !== 0) {
       throw new Error(`--check on the tree: want exit 0, got ${held.code}\n${held.out}`);
     }
-    if (!/never-cleared emitter state 0 of \d+ mutables/.test(held.out)) {
-      throw new Error(`no "never-cleared emitter state 0 of N" line in:\n${held.out}`);
+    if (!/never-cleared module state 0 of \d+ mutables/.test(held.out)) {
+      throw new Error(`no "never-cleared module state 0 of N" line in:\n${held.out}`);
     }
     const red = await audit(["--check", "--without-reset", CONTROL_RESET]);
     if (
@@ -211,6 +211,41 @@ Deno.test({
       const red = await audit(["--check", "--dir", `${dir}/compiler`]);
       if (red.code !== 1 || !red.out.includes("  lpExits check_if_value.vl:")) {
         throw new Error(`--check on the reverted tree: want exit 1 naming lpExits, got ${red.code}\n${red.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "emitter-state-audit: the let half reads the checker and reds when a checker reset is dropped",
+  ignore: !ENABLED,
+  fn: async () => {
+    // `initChecker` is the checker's per-program reset; ignoring it must leave its lets uncleared.
+    const red = await audit(["--check", "--without-reset", "initChecker"]);
+    if (red.code !== 1 || !red.out.includes("never-cleared module state") || !red.out.includes("  TY_I32 check_types.vl:")) {
+      throw new Error(`--check --without-reset initChecker: want exit 1 naming TY_I32, got ${red.code}\n${red.out}`);
+    }
+    // A checker `let` whose one clear is in `crReset`, rebuilt in a copy of compiler/ without it.
+    const dir = await Deno.makeTempDir({ prefix: "vl-state-audit-let-" });
+    try {
+      await Deno.mkdir(`${dir}/compiler`);
+      for (const e of Deno.readDirSync(`${ROOT}/compiler`)) {
+        if (e.isFile && e.name.endsWith(".vl")) {
+          await Deno.copyFile(`${ROOT}/compiler/${e.name}`, `${dir}/compiler/${e.name}`);
+        }
+      }
+      const f = `${dir}/compiler/check_capture_rows.vl`;
+      const src = Deno.readTextFileSync(f);
+      const dropped = src.replace("\n  crCapLossAny = false\n", "\n");
+      if (dropped === src) {
+        throw new Error("the control's anchor moved: no `crCapLossAny = false` reset in check_capture_rows.vl");
+      }
+      Deno.writeTextFileSync(f, dropped);
+      const cut = await audit(["--check", "--dir", `${dir}/compiler`]);
+      if (cut.code !== 1 || !cut.out.includes("  crCapLossAny check_capture_rows.vl:")) {
+        throw new Error(`--check with crCapLossAny's reset dropped: want exit 1 naming it, got ${cut.code}\n${cut.out}`);
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
