@@ -128,7 +128,7 @@ const PROGRAMS: Program[] = [
   },
   { id: "u8-for-in", family: "ba8Used", path: "arrays/u8-for-in.vl" },
   { id: "utf8-bytes", family: "ba8Used via scanPrintUse", path: "strings/utf8-bytes.vl" },
-  // ── wide scalars: `fa64Used`/`fl64TypeIdx`, `ia64Used`/`il64TypeIdx`, `fa32Used` ──
+  // ── wide scalars: `fa64Used`/`fl64TypeIdx`, `ia64Used`/`il64TypeIdx`, `fa32TypeIdx` ──
   { id: "f64-elems", family: "fa64Used", path: "arrays/f64-elems.vl" },
   {
     id: "f64-inferred-return",
@@ -137,12 +137,12 @@ const PROGRAMS: Program[] = [
   },
   {
     id: "f32-self-classifies",
-    family: "fa32Used",
+    family: "fa32TypeIdx (minted on read)",
     path: "arrays/f32-array-literal-self-classifies.vl",
   },
   {
     id: "f32-global-push",
-    family: "fa32Used + f32PushScratchBase",
+    family: "fa32TypeIdx + f32PushScratchBase",
     path: "arrays/global-f32-push.vl",
   },
   { id: "i64-array", family: "ia64Used", path: "arrays/i64-array.vl" },
