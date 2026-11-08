@@ -32,12 +32,12 @@ type and the handed type disagreed (`tySame`), over the sweep population (23,628
 | composite pins spelled from `pinOwn` | 104 respelled | 0 movers |
 
 Rows above graded one-level builds against the base. The final graded fixpoint seeds (a third
-`refresh-compiler.sh` byte-identical). Base is master `2150af91` with #6772 merged:
+`refresh-compiler.sh` byte-identical). Base is master `e97619e8`; candidate is this branch with it merged:
 
 | | |
 |---|---|
-| sweep | 23,628: 23,507 same, 121 bytes-only, 0 output movers, 0 `runs → not-runs` |
-| seed | 6,510,326 → 6,510,973 bytes (+647, 0.01%) |
+| sweep | 23,634: 23,513 same, 121 bytes-only, 0 output movers, 0 `runs → not-runs` |
+| seed | 6,512,640 → 6,513,287 bytes (+647, 0.01%) |
 | pin-helper budget (`emit_mono.vl`) | 927 → 927 |
 
 So the annotated kind was never the name being right and the type wrong: `pinTys` is the
