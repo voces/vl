@@ -192,7 +192,11 @@ import {
   crStmtHolding,
 } from "./check_cr_walk"
 import { inferQuiet } from "./check_cursor"
-import { cellRemovingMethod, pathHitsAny } from "./check_decl_scan"
+import {
+  cellRemovingMethod,
+  pathHitsAny,
+  unboundDefaultTy,
+} from "./check_decl_scan"
 import { daIsUnassignedSid, daLive, daMarkAssignedSid } from "./check_definite"
 import {
   TY_ARG_READ_HINT,
@@ -293,7 +297,7 @@ import {
   noteKillSure,
   pushElemReadFact,
   pushNarrowFact,
-  recOpenMapPath,
+  recOpenHolePath,
   shapeAdaptMapShared,
   shapeAdaptMapSharedSet,
   shapeAdaptNestedCopy,
@@ -497,6 +501,7 @@ import {
   slotVisibleOf,
 } from "./check_scopes"
 import {
+  deferredDefaultAts,
   narDefChain,
   narDefChainPop,
   narDefKey,
@@ -506,6 +511,9 @@ import {
   narDefTy,
   narDefTyPop,
   narDeferJoin,
+  openKeyReadIx,
+  openKeyTyAt,
+  openReadHas,
   pendArgMapAts,
   pendArgMapInline,
   pendArgMapTys,
@@ -1166,6 +1174,66 @@ function calleeWritePin(ty: i32): boolean {
   false
 }
 
+// Give every open list element and map or set key or value `ty` holds, through records, lists,
+// map values, function results and `| null`, the unbound default (a read's key, for a key): no
+// write fixes it, so no value of it exists. With `apply` false, only whether a read reached one.
+function defaultOpenHoles(ty: i32, depth: i32, apply: boolean): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyArray => {
+      if t.aElem >= 0 { return defaultOpenHoles(t.aElem, depth - 1, apply) }
+      if openReadHas(ty) { return true }
+      if apply {
+        t.aElem = unboundDefaultTy()
+        tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+      }
+      false
+    }
+    TyMap => {
+      if t.mKey < 0 || t.mVal < 0 {
+        if openReadHas(ty) { return true }
+        if apply {
+          if t.mKey < 0 {
+            const rk = openKeyReadIx(ty)
+            t.mKey = if rk >= 0 { openKeyTyAt(rk) } else { unboundDefaultTy() }
+          }
+          if t.mVal < 0 { t.mVal = unboundDefaultTy() }
+          tyMutEpoch = tyMutEpoch + 1 // in-place key/value pin — canonical keys change
+        }
+      }
+      defaultOpenHoles(t.mVal, depth - 1, apply)
+    }
+    TyObj => {
+      let read = false
+      for f in t.objFieldTypes {
+        if defaultOpenHoles(f, depth - 1, apply) { read = true }
+      }
+      read
+    }
+    TyNullable => defaultOpenHoles(t.nInner, depth - 1, apply)
+    TyFunc => defaultOpenHoles(t.fnRet, depth - 1, apply)
+    // A union or scalar holds no container a literal left open.
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => false
+  }
+}
+
+// Whether `ty` holds an open container no read reached, which the program's end may default.
+function holdsDefaultableHole(ty: i32): boolean {
+  if calleeWrittenElem(ty) >= 0 { return false }
+  const om: i32[] = [-1]
+  if !unresolvedHole(ty) && recOpenHolePath(ty, 8, om) == "" { return false }
+  !defaultOpenHoles(ty, 8, false)
+}
+
+// Default the open containers `ty` holds; false, changing nothing, when a read reached one of
+// them, which leaves the caller's refusal standing.
+function defaultUnfixed(ty: i32): boolean {
+  if defaultOpenHoles(ty, 8, false) { return false }
+  defaultOpenHoles(ty, 8, true)
+  true
+}
+
 // Before a caller's write of `got` pins open list row `ty`, give the row an earlier hole callee's
 // element when `got`'s element cannot hold that callee's write: the first write decides, as at
 // the direct spelling, and the caller's write is checked against it. A callee write it can hold
@@ -1289,10 +1357,12 @@ export function flushOpenArgMaps() {
   while i < pendArgMapTys.length {
     pinCalleeWrittenLists(pendArgMapTys[i], 8)
     if pendArgMapInline[i] && tyHoldsOpenMap(pendArgMapTys[i], 8) {
-      tErr(
-        "cannot infer a type for this argument — an empty Map it holds has no key or value type until it is used; use it where its type is known, or annotate the parameter it is passed to",
-        pendArgMapAts[i],
-      )
+      if (!defaultUnfixed(pendArgMapTys[i])) {
+        tErr(
+          "cannot infer a type for this argument — an empty Map it holds has no key or value type until it is used; use it where its type is known, or annotate the parameter it is passed to",
+          pendArgMapAts[i],
+        )
+      }
     }
     i = i + 1
   }
@@ -1320,29 +1390,48 @@ export function flushUninferred(depth: i32) {
   const keepD: i32[] = []
   let i = 0
   while i < pendNames.length {
-    if pendDepths[i] == depth {
+    if (
+      pendDepths[i] == depth
+      && depth > 0
+      && holdsDefaultableHole(pendTys[i])
+      && !arrDefRowIsCall(pendTys[i])
+    ) {
+      // A later call can still fix a container that leaves its scope, so its default waits for
+      // the program's end.
+      keepN.push(pendNames[i])
+      keepT.push(pendTys[i])
+      keepA.push(pendAts[i])
+      keepD.push(0)
+      deferredDefaultAts.push(pendAts[i])
+    } else if (
+      pendDepths[i] == depth
+      && i32ListHas(deferredDefaultAts, pendAts[i])
+    ) {
+      if holdsDefaultableHole(pendTys[i]) { defaultUnfixed(pendTys[i]) }
+    } else if pendDepths[i] == depth {
       if unresolvedHole(pendTys[i]) {
         if !arrDefHoleToI32(pendTys[i]) && !calleeWritePin(pendTys[i]) {
-          tErr(
-            "cannot infer a type for '"
-              + pendNames[i]
-              + "' — "
-              + uninferredFixText(pendNames[i], pendTys[i]),
-            pendAts[i],
-          )
+          if !defaultUnfixed(pendTys[i]) {
+            tErr(
+              "cannot infer a type for '"
+                + pendNames[i]
+                + "' — "
+                + uninferredFixText(pendNames[i], pendTys[i]),
+              pendAts[i],
+            )
+          }
         }
       } else {
         const om: i32[] = [-1]
-        const path = recOpenMapPath(pendTys[i], 8, om)
+        const path = recOpenHolePath(pendTys[i], 8, om)
         if path != "" {
-          tErr(
-            "cannot infer a type for '"
-              + pendNames[i]
-              + path
-              + "' — "
-              + fieldMapFixText(om[0]),
-            pendAts[i],
-          )
+          const what = "'" + pendNames[i] + path + "'"
+          if !defaultUnfixed(pendTys[i]) {
+            tErr(
+              "cannot infer a type for " + what + " — " + fieldMapFixText(om[0]),
+              pendAts[i],
+            )
+          }
         }
       }
     } else {

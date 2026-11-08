@@ -18,6 +18,8 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  cStructNames,
+  cStructTyIxs,
   litBaseTy,
   litUnionAliasNameOfTy,
   litUnionAliasOfLitTexts,
@@ -32,10 +34,16 @@ import {
   tyHoldsObj,
   tyIsLitUnion,
   tyIsOneStrLit,
+  unionAliasDeclNameOfTy,
 } from "./check_types"
 import { Param, nodeAt } from "./ast"
 import { tyIsUnionish } from "./check_node_tys"
-import { repRowOfTyStruct, repShadowOn, repVariantShapeRowOf } from "./emit_rep"
+import {
+  repRowId,
+  repRowOfTyStruct,
+  repShadowOn,
+  repVariantShapeRowOf,
+} from "./emit_rep"
 import { repABNote } from "./emit_nullable_rets"
 import { nomErasedTyIx } from "./check_ty_rep"
 import { mkUnionTy } from "./check_union_mint"
@@ -43,6 +51,7 @@ import { joinTys } from "./check_relate_core"
 import { elabInstTyAt, elabUnboundTpTy } from "./emit_elab"
 import { sNames, sTyIx, uVariants } from "./emit_state"
 import { strContains } from "./strutil"
+
 import { tyHasTyVar } from "./tyquery"
 
 // The pin spelling of closed type `ty` under the naming rule: a record by its row's registered
@@ -54,8 +63,13 @@ export function monoPinSpellOf(ty: i32): string {
   match t {
     TyObj => {
       const r = repRowOfTyStruct(ty, sNames.length)
-      if r >= 0 && r < sNames.length { return sNames[r] }
-      // A union member's record has no struct row; it spells as its variant row.
+      if r >= 0 && r < sNames.length { return monoPinSpellRowName(ty, r) }
+      // A union member's record has no struct row; it spells as its declared name, else its
+      // variant row.
+      const an = monoPinFirstDeclOfRow(repRowId(ty))
+      if an != "" { return an }
+      const sn = structNameOfTy(ty)
+      if sn != "" { return sn }
       const vr = repVariantShapeRowOf(ty)
       if vr >= 0 && vr < uVariants.length { return uVariants[vr] }
       return ""
@@ -70,17 +84,24 @@ export function monoPinSpellOf(ty: i32): string {
     TyArray => {
       const e = monoPinSpellOf(t.aElem)
       if e == "" { return "" }
-      const ro = if t.aRead != 0 { "readonly " } else { "" }
-      return ro + monoPinSpellAtom(t.aElem, e) + "[]"
+      // A readonly view spells as its list: the view is the node's type, not its rep.
+      return monoPinSpellAtom(t.aElem, e) + "[]"
     }
     TyNullable => {
       const inner = monoPinSpellOf(t.nInner)
       if inner == "" { return "" }
+      // A union's members and `null` spell as one flat union.
+      if t.nInner < T.tys.length && tyAt(t.nInner) is TyUnion {
+        return inner + "|null"
+      }
       return monoPinSpellAtom(t.nInner, inner) + "|null"
     }
     TyUnion => {
       const lu = monoPinSpellLitUnion(ty, t.uMembers)
       if lu != "" { return lu }
+      // A declared union spells as its name.
+      const ud = unionAliasDeclNameOfTy(ty)
+      if ud != "" { return ud }
       const ms: string[] = []
       for m in t.uMembers {
         const s = monoPinSpellOf(m)
@@ -99,7 +120,7 @@ export function monoPinSpellOf(ty: i32): string {
     TyMap => {
       const k = monoPinSpellOf(t.mKey)
       if k == "" { return "" }
-      if t.mSet != 0 { return "Set<" + k + ">" }
+      // A set spells as the map it is stored as.
       const v = monoPinSpellOf(t.mVal)
       if v == "" { return "" }
       return "{[" + k + "]:" + v + "}"
@@ -119,6 +140,26 @@ export function monoPinSpellOf(ty: i32): string {
         + monoPinSpellFnAtom(t.fnRet, r)
     }
     TyErr | TyVar | TyNeg => {}
+  }
+  ""
+}
+
+// Row `r`'s spelling for record `ty`: the first declared name whose record has `ty`'s row
+// identity (ruling 3), else the row's own name, so the order emit registered rows in does not
+// decide it.
+function monoPinSpellRowName(ty: i32, r: i32): string {
+  if r < 0 || r >= sNames.length { return "" }
+  const dn = monoPinFirstDeclOfRow(repRowId(ty))
+  if dn != "" { dn } else { sNames[r] }
+}
+
+// The first declared record name (`cStructNames` order) whose type has row identity `k`, or "".
+function monoPinFirstDeclOfRow(k: i32): string {
+  if k < 0 { return "" }
+  let i = 0
+  while i < cStructNames.length && i < cStructTyIxs.length {
+    if repRowId(cStructTyIxs[i]) == k { return cStructNames[i] }
+    i = i + 1
   }
   ""
 }
@@ -227,9 +268,9 @@ function monoPinSpellLitUnion(ty: i32, ms: i32[]): string {
 }
 
 // `s`, the spelling of `ty`, as one atom where a suffix follows it: parenthesized when `ty` is a
-// union, a nullable or a function.
+// union or a nullable spelled with `|`, or a function.
 function monoPinSpellAtom(ty: i32, s: string): string {
-  if tyIsUnionish(ty) { return "(" + s + ")" }
+  if tyIsUnionish(ty) && strContains(s, "|") { return "(" + s + ")" }
   monoPinSpellFnAtom(ty, s)
 }
 
