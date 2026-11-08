@@ -47,6 +47,17 @@ The 8 are `is-narrower-map-tests-values.vl`: `for v in w.values()` with `w` narr
 the sweep's single bytes-only mover. `mapValElemKind`, `mapKeyElemVKind`, `bcPutB` and `BC_STR`
 lost their last readers and are deleted.
 
+## Census
+
+`classifier-census.vl`, each tree with its own probe list:
+
+| tree | post-only | pre-only | both | uncalled | probed |
+| --- | --- | --- | --- | --- | --- |
+| master `55fd14c4` | 30 | 0 | 47 | 0 | 77 |
+| this PR, same base | 28 | 0 | 47 | 0 | 75 |
+
+Both were already post-only on master (r14). They leave the probe set with typed bodies.
+
 ## Proof
 
 Both seeds are fixpoints: base (master `55fd14c4`) 6,526,607 bytes, candidate 6,525,943 (−664).
