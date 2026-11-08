@@ -1,6 +1,11 @@
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { constBindsLitSet, forInBindTy } from "./check_leaf_steps"
-import { bundleCallSig } from "./emit_bundle"
+import {
+  bundleCallSig,
+  bundleRetParamOf,
+  bundleSigsOfParam,
+} from "./emit_bundle"
+import { retValueRootCall } from "./check_store_rep"
 import { clsCensusEnter, clsCensusOn, clsCensusReset } from "./emit_cls_census"
 
 // `emit_classify.vl` — the emitter's type classifiers and their supporting state: the
@@ -98,8 +103,12 @@ import {
   nodeTyMapValIsLitUnion,
   nodeTyMapValIsNulLitUnion,
 } from "./check_hole_pins"
-import { inferRetNameOf, inferRetTyIxOf } from "./check_infer_ret"
-import { isInferLetNulBool } from "./check_infer_rows"
+import {
+  inferRetNameOf,
+  inferRetRowOf,
+  inferRetTyIxOf,
+} from "./check_infer_ret"
+import { inferRetTyIxAt, isInferLetNulBool } from "./check_infer_rows"
 import {
   atomicIntrinsicIsVoid,
   fsIntrinsicSlot,
@@ -277,6 +286,7 @@ import {
   retV128Flag,
   setShapeOfTy,
   tyIsFuncType,
+  tyIsStructWithUnionField,
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
@@ -588,8 +598,8 @@ import {
   repShadowOn,
   repSigKindOfTy,
   repSigSlotTokOfKind,
-  repSigTokHasSlot,
   repSigTokOfKind,
+  repSlotOfTy,
   repVariantShapeRowOf,
   rlElemKindAt,
   sFieldElemTyIxAt,
@@ -636,8 +646,6 @@ import {
   mvValStructIdxOf,
   mvValVariantOf,
   refListElemKindOfTy,
-  repSigNulVariantTok,
-  repSigVariantTok,
   rlElemInnerSlot,
   rlElemMapValMvSlot,
   rlElemNulMapValMvSlot,
@@ -1193,24 +1201,34 @@ export function cloRetValSlot(fe: i32): i32 {
   repSlotOfKind(k, repSigSlotTyOf(t))
 }
 
-// The `>X` result suffix of `fe`'s extended `$fnsig` key — one token per distinct result
-// functype shape, so two functions share a sig exactly when their params and result
-// byte-match. A slot-free result is its type's token; a struct, variant, ref-list or map one is
-// keyed by the row its values are built at (`cloRetValSlot`). "" outside the value ABI.
-export function cloRetKeySuffix(fe: i32) {
-  if clsCensusOn { clsCensusEnter("cloRetKeySuffix") }
-  const k = cloRetValKind(fe)
-  if !repSigTokHasSlot(k) {
-    if fe < 0 || fe >= fnStmts.length { return "" }
-    return repSigRetTokOfTy(cloRetResultTy(fe))
+// The `>X` result suffix of `fe`'s extended `$fnsig` key, read from its result type, so two
+// functions share a sig exactly when their params and result byte-match. A closure result mono
+// lowered as its bundle's record keys that record's row, an un-annotated record or variant the
+// row its values' rep stamps name. "" outside the value ABI, or where no row holds the result.
+export function cloRetKeySuffix(fe: i32): string {
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  const rt = cloRetResultTy(fe)
+  if rt >= 0 && repOfTy(rt).rdKind == "closure" {
+    const br = fnBundleRetRow(fe)
+    if br == -2 { return "" }
+    if br >= 0 { return ">" + repSigSlotTokOfKind("struct", br) }
   }
-  const s = cloRetValSlot(fe)
-  if s < 0 && (k == "nulvariant" || k == "reflist" || k == "nulreflist") {
-    return ""
+  const fd = nodeAt(fnStmts[fe])
+  const sk = repSigKindOfTy(rt)
+  if (
+    fd is FuncDecl
+    && fd.fnRet < 0
+    && sk != null
+    && (sk == "struct" || sk == "nulstruct" || sk == "variant")
+  ) {
+    const lr = if sk == "struct" { fnLambdaRecordRow(fe) } else { -1 }
+    if lr >= 0 { return ">" + repSigSlotTokOfKind(sk, lr) }
+    const ss = fnValuesStampSlot(fe, sk, repSlotOfKind(sk, repSigSlotTyOf(rt)))
+    if ss >= 0 { return ">" + repSigSlotTokOfKind(sk, ss) }
   }
-  if k == "variant" { return ">" + repSigVariantTok(s) }
-  if k == "nulvariant" { return ">" + repSigNulVariantTok(s) }
-  ">" + repSigSlotTokOfKind(k, s)
+  // A list whose returned values join at no one row (D15221) has no row to key.
+  if sk == "reflist" && fnRetRefListSlot(fe) == -2 { return "" }
+  repSigRetTokOfTy(rt)
 }
 
 // The extended `$fnsig` key of lifted function `fe`: `fnSigKeyOf`'s key when the sig is
@@ -2847,6 +2865,66 @@ export function bundleRecordRowOfSigs(sigs: i32[]): i32 {
   bundleRecordRowOfTy(
     if sigs.length > 0 { elabBundleRecordOf(sigs) } else { -1 },
   )
+}
+
+// The struct row of the bundle record emitted function `fe` returns where its result is one:
+// the record of members its value's call returns, else its handed-back bundle parameter's; -2
+// where mono minted no row for it, -1 where the result is no bundle.
+export function fnBundleRetRow(fe: i32): i32 {
+  const fx = fnStmts[fe]
+  const rec = calleeReturnsRecord(fx)
+  if rec.length >= 2 {
+    const row = bundleRecordRowOfSigs(rec)
+    return if row >= 0 { row } else { -2 }
+  }
+  const bp = bundleRetParamOf(fx)
+  const fn = nodeAt(fx)
+  if bp < 0 || !(fn is FuncDecl) || bp >= fn.fnParams.length { return -1 }
+  const sigs = bundleSigsOfParam(fn.fnParams[bp])
+  if sigs.length < 2 { return -1 }
+  const row = bundleRecordRowOfSigs(sigs)
+  if row >= 0 { row } else { -2 }
+}
+
+// The row every value function `fe` returns is built at, where each one's rep stamp (a call-built
+// value's root call's) names a row of kind `k`; a value stamped open is built at `recSlot`, the
+// recorded result's row (D14900). -1 where a stamp names another kind or the rows differ.
+export function fnValuesStampSlot(fe: i32, k: VKind, recSlot: i32): i32 {
+  const fn = nodeAt(fnStmts[fe])
+  if !(fn is FuncDecl) { return -1 }
+  const vals: i32[] = []
+  collectRetValues(fn.fnBody, vals)
+  let slot = -1
+  let v = 0
+  while v < vals.length {
+    const root = retValueRootCall(vals[v])
+    const sty = nodeRepTyIxOf(if root >= 0 { root } else { vals[v] })
+    let sl = recSlot
+    if sty >= 0 && !tyHasTyVar(sty) {
+      if repSigKindOfTy(sty) != k { return -1 }
+      sl = repSlotOfKind(k, repSigSlotTyOf(sty))
+    }
+    if sl < 0 || (v > 0 && sl != slot) { return -1 }
+    slot = sl
+    v = v + 1
+  }
+  slot
+}
+
+// The struct row un-annotated lambda `i`'s own inferred-return row names, when that row is a
+// record with a union field (`() => ({})` delivered to `() => Cfg`), else -1. The values'
+// stamp can name another row of the same shape, and the closure's signature takes this one.
+export function fnLambdaRecordRow(i: i32): i32 {
+  if i < 0 || i >= fnStmts.length { return -1 }
+  const fn = nodeAt(fnStmts[i])
+  if !(fn is FuncDecl) { return -1 }
+  const k = inferRetFnKey(fnStmts[i], fn.fnName)
+  if k == fn.fnName { return -1 }
+  const row = inferRetRowOf(k)
+  if row < 0 { return -1 }
+  const t = inferRetTyIxAt(row)
+  if !tyIsStructWithUnionField(t) { return -1 }
+  repSlotOfTy(t)
 }
 
 // The struct row bundle record type `bt` is stored at, or -1: its own, else the row it shares
