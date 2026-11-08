@@ -60,9 +60,10 @@ now keys its `$fnsig` the way the closure's own key does. So the two share one t
 
 ## What is left
 
-* Bundle results: `fnRecordedRetTy` records the template's function type, not the bundle
-  record (`elabBundleRecordOf`). Once it records the record, rerun the shadow. The slotted branch
-  can then read the type for kind `struct`.
+* Bundle results: the token reader needs a bundle arm. For a `(_) => _` result where
+  `elabIsBundleTy` holds, it gives the bundle record's token, from `cloRetValSlot`'s bundle arm
+  or an equivalent. `fnRecordedRetTy` stays the type (ruling). Rerun the shadow after; the 60
+  bundle calls should then agree.
 * A map of un-annotated function values: `repMapSlotOfTy` answers -3 where `mapArmShapeOfTy`
   answers the key's mono shape (`mvSlotOfValTyK` returns -1). The two readers must agree before
   map results can read the type.
