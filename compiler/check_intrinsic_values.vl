@@ -1,11 +1,14 @@
 // An intrinsic named as a value, not called (`const f = __load_i32__`, `xs.map(sqrt)`), is
 // rewritten before checking into a lambda that calls it, so the value is an ordinary function
-// value. A float intrinsic takes `f64` and an integer one `i32` there, the types its literals
-// default to. A name a declaration shadows is left alone.
+// value. A numeric intrinsic takes the width its destination's function type names, else `f64`
+// (float) or `i32` (integer), the types its literals default to. A SIMD row whose lane is a
+// wasm immediate refuses. A name a declaration shadows is left alone.
 import {
   Call,
+  FuncDecl,
   Ident,
   P,
+  Param,
   arenaSetNode,
   i32ToStr,
   mkBlock,
@@ -17,7 +20,13 @@ import {
   nodeAt,
 } from "./ast"
 import { bindProgram } from "./bind"
-import { floatIntrArity, intIntrArity, nameIsDunder } from "./check_intrinsics"
+import {
+  floatIntrArity,
+  intIntrArity,
+  nameIsDunder,
+  simdRow,
+  simdRowLaneMax,
+} from "./check_intrinsics"
 import { ambientTyOf } from "./check_scopes"
 import { TyFunc, TyPrim, tyAt, tyToStr } from "./check_types"
 import { IDENT_BUILTIN, identDeclOf } from "./symbols"
@@ -25,6 +34,10 @@ import { IDENT_BUILTIN, identDeclOf } from "./symbols"
 // Rewrites every value-position read of an unshadowed intrinsic in the arena under `rootIx`
 // into a call-forwarding lambda; mints nodes, so it runs before the checker sizes its tables.
 export function intrinsicValuesWrap(rootIx: i32) {
+  ivLams = []
+  ivLamNames = []
+  ivLaneReads = []
+  ivOffDefault = []
   const end = P.nodes.length
   const callee: boolean[] = []
   let any = false
@@ -51,9 +64,77 @@ export function intrinsicValuesWrap(rootIx: i32) {
       && ivIsName(n.identName)
       && identDeclOf(i) == IDENT_BUILTIN
     ) {
-      ivWrap(i, n)
+      if ivLaneRow(n.identName) { ivLaneReads.push(i) } else { ivWrap(i, n) }
     }
     i = i + 1
+  }
+  0
+}
+
+// The forwarding lambdas this compile minted, beside the intrinsic each one calls.
+let ivLams: i32[] = []
+let ivLamNames: string[] = []
+
+// The reads `intrinsicValuesWrap` left unwrapped because their intrinsic is a lane row; the
+// checker refuses each with `intrinsicLaneValueMsg`.
+export let ivLaneReads: i32[] = []
+
+// The refusal for lane-row read `ix`: its lane index is an immediate, so it has no value.
+export function intrinsicLaneValueMsg(ix: i32): string {
+  const n = nodeAt(ix)
+  const name = if n is Ident { n.identName } else { "this intrinsic" }
+  name
+    + " takes its lane index as a wasm immediate, which must be a literal at the call,"
+    + " so it cannot be named as a value — call it directly"
+}
+
+// The minted lambdas `ivSeedWidth` moved off the default width.
+let ivOffDefault: i32[] = []
+
+// Whether a destination moved lambda `lam` off its default width, so that destination's
+// annotation is load-bearing and not redundant.
+export function ivSeedMovedWidth(lam: i32): boolean {
+  for l in ivOffDefault {
+    if l == lam { return true }
+  }
+  false
+}
+
+// Whether `name` is a SIMD row whose lane index (or shuffle lanes) is a wasm immediate.
+function ivLaneRow(name: string): boolean {
+  const row = simdRow(name)
+  row >= 0 && simdRowLaneMax(row) >= 0
+}
+
+// A destination of function type with parameter types `want` re-widths the minted lambda `lam`
+// of a numeric intrinsic, when every one is the same width the intrinsic computes at (f32/f64
+// for a float one, i32/i64 for an integer one, all four for `min`/`max`/`abs`). Called before
+// `lam` is checked; any other lambda or destination is left as it is.
+export function ivSeedWidth(lam: i32, want: i32[]) {
+  let k = 0
+  while k < ivLams.length && ivLams[k] != lam { k = k + 1 }
+  if k >= ivLams.length { return 0 }
+  const name = ivLamNames[k]
+  const fa = floatIntrArity(name)
+  const ia = intIntrArity(name)
+  if fa + ia == 0 || want.length != fa + ia { return 0 }
+  const w = tyToStr(want[0])
+  for t in want {
+    if tyToStr(t) != w { return 0 }
+  }
+  const isFloatW = w == "f32" || w == "f64"
+  const isIntW = w == "i32" || w == "i64"
+  const intOk = ia > 0 || name == "min" || name == "max" || name == "abs"
+  if !(isFloatW && fa > 0) && !(isIntW && intOk) { return 0 }
+  if w != ivParamTys(name)[0] { ivOffDefault.push(lam) }
+  const ln = nodeAt(lam)
+  if ln is FuncDecl {
+    for p in ln.fnParams {
+      const pn = nodeAt(p)
+      if pn is Param && pn.parType >= 0 {
+        arenaSetNode(pn.parType, { tyName: w, pos: -1 })
+      }
+    }
   }
   0
 }
@@ -110,5 +191,7 @@ function ivWrap(ix: i32, n: Ident) {
   const noTyParams: string[] = []
   const lam = mkFunc("", noTyParams, params, -1, mkBlock([call], n.pos), n.pos)
   arenaSetNode(ix, { parInner: lam, pos: n.pos })
+  ivLams.push(lam)
+  ivLamNames.push(n.identName)
   0
 }
