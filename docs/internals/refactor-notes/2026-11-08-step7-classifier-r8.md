@@ -56,7 +56,8 @@ read). So the vocabulary needs a decision before the fact is recorded. Field cod
 at about ten sites in five files (`sFieldTypes`/`armStageTypes`), so recording a storage type
 there is its own PR.
 
-**Proof.** Both seeds are fixpoints. On master `2150af91` the base is 6,509,473 bytes and the
-candidate 6,507,662 (−1,811). The sweep compared them over 23,628 programs:
-23,628 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new traps. Export budget:
-0 dead exports.
+**Proof.** Both seeds are fixpoints. On master `453f4957` the base is 6,508,775 bytes and the
+merged candidate 6,506,964 (−1,811). The sweep compared them over 23,633 programs: 23,633 same,
+0 bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new traps. The pre-merge pair, on
+`2150af91`, read the same (6,509,473 → 6,507,662). `scripts/gate.sh` passes all 23 rows on the
+merged tree, export budget included.
