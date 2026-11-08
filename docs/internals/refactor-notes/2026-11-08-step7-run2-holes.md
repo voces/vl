@@ -45,9 +45,10 @@ The default arm is reached by none of the 4. All 4 record a closed scalar, so
 | check | result |
 |---|---|
 | fixpoint | two `refresh-compiler.sh` runs byte-identical |
-| seed size | 6,504,349 → 6,507,456 (+3,107, +0.05%), both fixpoints |
-| `scripts/sweep.vl` diff, 23,618 cells | 0 `runs → not-runs`, 0 traps, 1 output mover (below) |
+| seed size | 6,509,473 → 6,512,745 (+3,272, +0.05%), both fixpoints on master `2150af91` |
+| `scripts/sweep.vl` diff, 23,628 cells | 0 `runs → not-runs`, 0 traps, 1 output mover (below) |
 | run #2 declined, post settled | 17 → 3 |
+| `scripts/gate.sh` | all 23 rows pass on the final merged tree |
 
 The mover: D14782, a loud emit reject before and after. `deliverNested`'s recorded result is now
 `((i32) => i32)[][]`, the type of both its writes, so the emitter refuses at the nested list
