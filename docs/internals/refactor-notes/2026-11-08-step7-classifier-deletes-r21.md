@@ -63,3 +63,17 @@ The missing fact is the same in both: a call's recorded result at its callee's p
 * `exprIsClosureNoLocal`: the 56 are closures held by a local, which this classifier excludes on purpose.
 * Still not shadowed: the 40 other probed classifiers. Most take a binding name or a function slot,
   not a node, so their twin needs a binding's rep, not `repOfNode`.
+
+## The ci-cost RSS regression #6892 carried (main unit 450 MB against 318 MB)
+
+Not a retained table: every seed's tenth collection grows the copying heap to 512 MiB, and
+master ends the compile before an eleventh copies into the new semispace. #6892's column
+read built a `RepDesc` per `exprListRep` and `letBindRepKind` call, which added ~42 MB of total
+allocation (null collector: 1,033 MB against master's 991 MB) and so forced the eleventh
+collection, which committed the extra 130 MB. `repKindOfTyMemo` caches the kind per arena type
+(stamped on the compile generation, `emitPassGen` and `tyRegWrites`). After that, main reads
+318.1 MB and fuel 8.90 G (head before the fix: 9.20 G). The self-build and the plumb unit are
+byte-identical. Master is close to the same edge, so a later +40 MB of garbage in the late
+phases will fail this row the same way.
+`tyIsNoListHead` (#6892's last commit) avoids the eleventh collection by itself too: 318.4 MB and
+8.85 G fuel without the memo, 318.3 MB and 8.81 G with it.

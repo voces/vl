@@ -254,6 +254,7 @@ import {
   fnTagHeldRepOf,
   fnTagJoinFromNote,
   fnTagLeafSetOf,
+  fnTagListJoinSet,
   fnTagListTy,
   fnTagMembers,
   fnTagOwnTyParamJoins,
@@ -315,7 +316,7 @@ import { adoptRetLits } from "./check_inferred_return"
 import {
   assignable,
   bindGenWalk,
-  genFnHoleBodyRet,
+  holeBodyRet,
   holeFnArgDecl,
   holeLamRetAt,
   holeSlotCallRets,
@@ -4795,10 +4796,23 @@ function elabListJoinAt(d: i32, fn: FuncDecl, k: i32): i32 {
     }
   }
   let s = -1
+  let diff = false
   for r in reads {
     const rs = if r >= 0 { fnTagSetOfTy(elabNodeTy(r, k)) } else { -1 }
-    if rs < 0 || s >= 0 && rs != s { return -1 }
+    if rs < 0 { return -1 }
+    if s >= 0 && rs != s { diff = true }
     s = rs
+  }
+  if !diff { return jp }
+  // Different sets join where the call binding them joins them, at the list's element set.
+  const lt = elabNodeTy(d, k)
+  const la = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+  const ws = if la is TyArray { fnTagSetOfTy(la.aElem) } else { -1 }
+  if ws < 0 { return -1 }
+  for r in reads {
+    for m in fnTagMembers(fnTagSetOfTy(elabNodeTy(r, k))) {
+      if !i32ListHas(fnTagMembers(ws), m) { return -1 }
+    }
   }
   jp
 }
@@ -10063,7 +10077,7 @@ export function elabHoleGenFlowTy(argIx: i32, holder: i32): i32 {
   ) {
     return -1
   }
-  genFnHoleBodyRet(vt, inst)
+  holeBodyRet(vt, inst)
 }
 
 // Whether `t` is an empty list's type, its element a hole.
@@ -13069,7 +13083,7 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
     // An argument of only uncalled hole functions binds the stub it is delivered at (D6881),
     // unless it is a tagged set's id.
     const stub = elabStubArg.get(i32ToStr(ix) + ":" + i32ToStr(i)) ?? -1
-    const js = if pn is Param && pn.parType >= 0 { fnTagSharedJoinSet(f, i, cn.callArgs) } else { -1 }
+    const js = if pn is Param && pn.parType >= 0 { fnTagSharedJoinSet(f, i, cn.callArgs) } else if pn is Param && !named { fnTagListJoinSet(f, i, cn.callArgs) } else { -1 }
     // An open map the call binds a type parameter to is that parameter's closed map (D1887).
     const hmTv = if pn is Param { elabParamTyVarName(f, i) } else { "" }
     let j0 = 0
@@ -13105,13 +13119,14 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[]): i32[] {
       }
     } else if !named && pn is Param && js >= 0 && js != fnTagSetOfTy(st) {
       // Two generic functions a type parameter shares bind it to their union, tagged or not, so
-      // the instance's facts are the union's.
+      // the instance's facts are the union's; so do two a list of hole parameters joins.
       fnTagJoinFromNote(js, fnTagSetOfTy(st))
       fnTagCallJoinNote(ix, i, js)
-      const tn = nodeAt(pn.parType)
+      const tn = if pn.parType >= 0 { nodeAt(pn.parType) } else { nodeAt(f.fnParams[i]) }
+      const hn = if tn is TypeRef { tn.tyName } else { elabHoleRootName(nodeTyIxOf(f.fnParams[i])) }
       let j = 0
-      while tn is TypeRef && j < names.length && j < out.length {
-        if names[j] == tn.tyName {
+      while hn != "" && j < names.length && j < out.length {
+        if names[j] == hn {
           if !copied {
             out = tys.slice(0, tys.length)
             copied = true
@@ -16192,6 +16207,21 @@ export function elabNodeTyAt(ix: i32, fnIx: i32): i32 {
     return elabNodeTyAt(parenPeelIx(n.letInit), fnIx)
   }
   -1
+}
+
+// Node `ix`'s type in frame `fnIx`: the elaboration's type for it at the instance there
+// (`elabNodeTyAt`), else its checked type where that is closed, which is the answer outside every
+// instance; -1 where both stay open.
+export function elabNodeTyOrChecked(ix: i32, fnIx: i32): i32 {
+  const x = parenPeelIx(ix)
+  const e = elabNodeTyAt(x, fnIx)
+  if e >= 0 || x < 0 || x >= P.nodes.length { return e }
+  const ck = nodeTyIxOf(x)
+  if ck >= 0 && ck < T.tys.length && elabTyClosed(ck, 0) && !tyHasTyVar(ck) {
+    ck
+  } else {
+    -1
+  }
 }
 
 // Freezes the checker's node types as they stand when the elaboration finishes, before any emit

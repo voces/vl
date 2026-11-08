@@ -61,15 +61,3 @@ recursive call's recorded type is not the `i32 | f64` box its function returns, 
 **Proof.** Both sides are fixpoint seeds: base 6,580,497 bytes, this PR 6,571,256 (−9,241). The
 sweep over 23,720 programs: 23,720 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs`,
 0 new traps. `rep-fuzz-check.sh`: exact, 0 failures.
-
-## The ci-cost RSS regression (main unit 450 MB against 318 MB)
-
-Not a retained table: every seed's tenth collection grows the copying heap to 512 MiB, and
-master ends the compile before an eleventh copies into the new semispace. This round's column
-read built a `RepDesc` per `exprListRep` and `letBindRepKind` call, which added ~42 MB of total
-allocation (null collector: 1,033 MB against master's 991 MB) and so forced the eleventh
-collection, which committed the extra 130 MB. `repKindOfTyMemo` caches the kind per arena type
-(stamped on the compile generation, `emitPassGen` and `tyRegWrites`). After that, main reads
-318.1 MB and fuel 8.90 G (head before the fix: 9.20 G). The self-build and the plumb unit are
-byte-identical. Master is close to the same edge, so a later +40 MB of garbage in the late
-phases will fail this row the same way.
