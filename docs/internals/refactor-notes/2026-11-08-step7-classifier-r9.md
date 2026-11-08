@@ -50,6 +50,6 @@ and the classifier is the recorded type. Its spread rung and per-element
 `exprIsF32` walk are gone. Empty `f32[]` literals stop reserving the i32 list pair they never build:
 8 f32 programs shrink (`f32-array-push.vl` 1,584 → 1,482 bytes), outputs unchanged.
 
-**Proof.** Both seeds are fixpoints. Base 6,512,640 bytes, candidate 6,514,849 (+2,209). Sweep over
+**Proof.** Both seeds are fixpoints. Base 6,512,640 bytes, candidate 6,514,923 (+2,283) on the tree merged with master `65816a85`. Sweep over
 23,634 programs: 23,528 same, 106 bytes-only (98 the variant recover, 8 the f32 pair), 0 output
 movers, 0 `runs → not-runs`, 0 new traps.
