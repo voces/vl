@@ -23,16 +23,15 @@ Of those 513 (`ctx>ctx` means two contextual stamps in a row):
 | `ctx>ctx` (or longer) | 470 |
 | involve a `join` | 22 |
 | last write agrees with the site | 469 |
-| last write misses the site | 44 |
+| last write misses the site | 43 |
 
 When the last write misses, the earlier write is usually the one that agrees:
-- **30**: a later write names an open type parameter and renders empty, after a closed one
+- **27**: a later write names an open type parameter and renders empty, after a closed one
   (`generics/union-list-literal-to-generic-union-param`, `list-param-union-with-type-param-length`).
-- **9**: an inline literal union spelled through its alias (`string|i32` against `K|i32`,
-  `D6950`).
-- **6**: a `??` join after a contextual stamp, at values that are already a box (never boxed).
-- **1**: a real member conflict, `f64|null` then `i32|null`
-  (`lists/list-literal-eq-across-element-storages`).
+- **7**: values already a box, so never boxed (6 a `??` join after a contextual stamp).
+- **9** disagree: 8 an inline literal union spelled through its alias (`string|i32` against
+  `K|i32`, `D6950`) or a closed union after an empty write; 1 a real member conflict, `f64|null`
+  then `i32|null` (`lists/list-literal-eq-across-element-storages`).
 
 First-write fails about 300 of the 469 deliveries where the last write agrees, and a join about
 280: the later write is a refinement (`i32|string` then `i64|string`, `string|i32` then `K|i32`).
@@ -41,9 +40,8 @@ record does not separate the conflicts, because 470 of 513 are the same recorder
 re-checks, not two roles.
 
 Decision needed (not made here): make the record "the final check's", which is what last-write
-already computes for every refinement row. That still needs a rule for the 31 misses that are
-not spelling: a write naming an open type parameter must not replace a closed record (30), and
-the `f64|null` conflict needs its own ablation.
+already computes for every refinement row. That still needs a rule for the misses: a write naming an open type parameter must not replace
+a closed record (27), and the `f64|null` conflict needs its own ablation.
 
 ## Which positions are affected
 
