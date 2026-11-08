@@ -34,8 +34,8 @@ function (`(_) => _`):
 | record holding such a list | 1 | `>s3;` | `>s2;` |
 
 **Ablation.** A seed whose `cloRetKeySuffix` was the type token and nothing else. All 26
-programs behind the 71 calls kept their exit code and output (22 run, 4 are filed refusals),
-and all 26 changed bytes. So no program tells the two keys apart. The type is still wrong for
+programs behind the 71 calls kept their exit code and output (22 run, 4 are filed refusals).
+13 of the 22 changed bytes, 9 did not. So no program tells the two keys apart. The type is still wrong for
 the bundle class: the type of a function that returns a bundle is the template's function type,
 and its `>c` names a closure result that the lowering does not build. Adopting it would rest on
 no two such functions ever sharing a parameter spine with a real closure. It was not adopted.
@@ -52,7 +52,11 @@ assembles one slotted token.
 | check | master `2fce5a50` | this branch |
 | --- | --- | --- |
 | fixpoint seed | 6,535,932 | 6,535,406 (−526) |
-| sweep | | SWEEP |
+| sweep, 23,688 programs | | 23,679 same, 9 bytes-only, 0 output movers |
+
+All 9 bytes-only movers use a `Set` (D7, D2755 and 7 cases). A function type that mentions a set
+now keys its `$fnsig` the way the closure's own key does. So the two share one type:
+`pin-exact-key-function-value.vl` has 27 types against 26, and 1,019 bytes against 1,010.
 
 ## What is left
 
