@@ -187,6 +187,7 @@ import {
   elabCapKeySet,
   elabCapNarrowArm,
   elabCapNarrowed,
+  elabCapNumPair,
   elabCapRep,
   elabCapRepUnion,
   elabCapTy,
@@ -449,6 +450,8 @@ let elabNodeNarrowed: {[i32]: i32[]} = Map()
 let elabNodeNarrowArms: {[i32]: i32[]} = Map()
 // Delivered node → [key, literal set, ...], from `elabCapAtomSrc`.
 let elabNodeAtomSrcs: {[i32]: i32[]} = Map()
+// Delivered node → [key, numeric pair, ...], from `elabCapNumPair`.
+let elabNodeNumPairs: {[i32]: i32[]} = Map()
 // The type the checker left on each node, taken before the emitter's passes rewrite any body; a
 // node the emitter has since retyped, or minted, reads none.
 let elabGenTy: i32[] = []
@@ -3251,6 +3254,12 @@ function elabOneAt(k: i32) {
     ss.push(k)
     ss.push(elabCapAtomSrc[ix] ?? -1)
     elabNodeAtomSrcs[ix] = ss
+  }
+  for ix in elabCapNumPair.keys() {
+    const ps = elabNodeNumPairs[ix] ?? []
+    ps.push(k)
+    ps.push(elabCapNumPair[ix] ?? -1)
+    elabNodeNumPairs[ix] = ps
   }
   for ix in elabCapDeadIx.keys() {
     const ds = elabDeadKs[ix] ?? []
@@ -8865,6 +8874,52 @@ function elabHoleCallAt(a: i32, ad: i32) {
   elabReachNote(-1, elabDemandFrom(ad, none, noTys, pTys, -1, a), a)
 }
 
+// Demands at the root the instance a direct call `c` of an un-annotated function reaches when the
+// checker solved every parameter closed from its uses: no row binds it, and the call is keyed at
+// its signature's parameters.
+function elabSolvedHoleCallAt(c: i32) {
+  const cn = nodeAt(c)
+  if !(cn is Call) { return 0 }
+  const ad = identDeclOf(parenPeelIx(cn.callFn))
+  if ad < 0 || ad >= P.nodes.length { return 0 }
+  const f = nodeAt(ad)
+  if !(f is FuncDecl) || f.fnName == "" || f.fnTyParams.length > 0 { return 0 }
+  let hole = false
+  for p in f.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { hole = true }
+  }
+  const sig = nodeTyIxOf(ad)
+  if (
+    !hole
+    || sig < 0
+    || sig >= T.tys.length
+    || tyHasTyVar(sig)
+    || tyReachesHole(sig, 16)
+  ) {
+    return 0
+  }
+  const st = tyAt(sig)
+  if !(st is TyFunc) || st.fnParamTypes.length != cn.callArgs.length {
+    return 0
+  }
+  if !tysClosed(st.fnParamTypes) { return 0 }
+  // A binding read as an argument keeps the root's typing of what it holds; the walk would retype it.
+  for a in cn.callArgs {
+    const ap = parenPeelIx(a)
+    const atd = if ap >= 0 && nodeAt(ap) is Ident { identDeclOf(ap) } else { -1 }
+    if atd >= 0 && atd < P.nodes.length && nodeAt(atd) is LetDecl { return 0 }
+  }
+  const none: string[] = []
+  const noTys: i32[] = []
+  const n0 = ekDecl.length
+  const k = elabEnqueue(ad, none, noTys, -1)
+  if k < 0 { return 0 }
+  elabReachNote(-1, k, c)
+  if !ekDone[k] { elabOne(k) }
+  elabSettle(n0)
+}
+
 // The module-level un-annotated function call `c` reaches through a `const` initialized with its
 // name, or -1. A nested function's free names need its enclosing instance, which the root lacks.
 function elabSoleCalleeHole(c: i32): i32 {
@@ -8999,6 +9054,7 @@ export function elabRun() {
   elabNodeNarrowed = Map()
   elabNodeNarrowArms = Map()
   elabNodeAtomSrcs = Map()
+  elabNodeNumPairs = Map()
   elabGenTy = []
   elabArmAltTys = Map()
   elabDeadKs = Map()
@@ -9115,6 +9171,9 @@ export function elabRun() {
       }
     }
     if elabCallInstFrom(c, -1) < 0 { elabHoleCallAt(c, elabSoleCalleeHole(c)) }
+    if elabCallInstFrom(c, -1) < 0 && rowed.get(c) == null {
+      elabSolvedHoleCallAt(c)
+    }
   }
   // A call of a module binding above its declaration, at its arguments' own types.
   for ec in elabEarlyCalls { elabEarlyCallRows(ec) }
@@ -17056,7 +17115,38 @@ export function elabMemberKeyAtFnTy(t: i32, decl: i32): i32 {
   if t < 0 || t >= T.tys.length { return -1 }
   const f = tyAt(t)
   if !(f is TyFunc) { return -1 }
+  if f.fnParamTypes.length == 0 {
+    return elabMakerTwinKey(elabSrcDecl(decl), f.fnRet)
+  }
   elabMemberKeyAtTys(f.fnParamTypes, decl)
+}
+
+// The wide twin the elaboration built of maker `d` at closed result `ret`: the one under the
+// instance being walked, else the only one; -1 for none or an ambiguous choice.
+function elabMakerTwinKey(d: i32, ret: i32): i32 {
+  if d < 0 || ret < 0 || ret >= T.tys.length || tyHasTyVar(ret) { return -1 }
+  const top = elabWalkTop()
+  let one = -1
+  let n = 0
+  let under = -1
+  let nu = 0
+  for k in ekRetWide.keys() {
+    if (
+      k >= 0
+      && k < ekDecl.length
+      && ekDecl[k] == d
+      && tySame(ekRetWide[k] ?? -1, ret)
+    ) {
+      one = k
+      n = n + 1
+      if top >= 0 && top < ekReach.length && i32ListHas(ekReach[top], k) {
+        under = k
+        nu = nu + 1
+      }
+    }
+  }
+  if nu == 1 { return under }
+  if n == 1 { one } else { -1 }
 }
 
 // `elabMemberKeyAt` at closed parameter types `tys`, preferring an instance nested under the
@@ -18047,6 +18137,12 @@ export function elabNarrowArmAt(ix: i32, fnIx: i32): i32 {
 export function elabNodeAtomSrcAt(ix: i32, fnIx: i32): i32 {
   if ix < 0 || fnIx < 0 || !elabBankHolds(elabNodeAtomSrcs, ix) { return -1 }
   elabPairIn(elabNodeAtomSrcs, ix, elabKeyAt(fnIx))
+}
+
+// The numeric pair delivered node `ix` is fitted at in emitted function `fnIx`'s instance, or -1.
+export function elabNodeNumPairAt(ix: i32, fnIx: i32): i32 {
+  if ix < 0 || fnIx < 0 || !elabBankHolds(elabNodeNumPairs, ix) { return -1 }
+  elabPairIn(elabNodeNumPairs, ix, elabKeyAt(fnIx))
 }
 
 // The storage type the read `ix` is narrowed out of in emitted function `fnIx`'s instance, -1 where
