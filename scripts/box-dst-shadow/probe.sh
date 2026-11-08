@@ -27,13 +27,15 @@ X
 for f in wasmEmit.vl emit_sections.vl; do
   perl -i -pe '
     $fn = $1 if /^\s*(?:export )?function (\w+)/;
-    s/\b(emitUnionBoxArg|emitUnionCoerce|emitUnionBoxAtRecord)\(/$1P("$fn:$.", /g
-      unless /function emit(?:UnionBoxArg|UnionCoerce|UnionBoxAtRecord)\(/;' "$C/$f"
+    s/\b(emitUnionBoxArg|emitUnionCoerce|emitUnionBoxAtRecord|emitUnionBoxOwed)\(/$1P("$fn:$.", /g
+      unless /function emit(?:UnionBoxArg|UnionCoerce|UnionBoxAtRecord|UnionBoxOwed)\(/;' "$C/$f"
 done
+# A floor (`emitUnionBoxOwed` boxing at the site, the record owing no box) is tagged `floor@<pos>`.
+perl -0 -i -pe 's/(\n  if boxOwedAt\(valIx, fnIx\) \{ return emitDelivered\(body, valIx, fnIx\) \}\n)  (emitUnionBoxArgP\("[^"]*", body, siteNm, siteTy, valIx, fnIx\))\n/$1  const fo = bdsPosEnter("")\n  bdsPosLeave("floor@" + fo)\n  const fr = $2\n  bdsPosLeave(fo)\n  fr\n/' "$C/wasmEmit.vl"
 W="$C/wasmEmit.vl"
 awk '!done && /^} from "\.\/box_dst_shadow"$/ { print "  bdsPosEnter,"; print "  bdsPosLeave,"; done = 1 } { print }' \
   "$W" > "$W.t" && mv "$W.t" "$W"
-for h in emitUnionBoxArg emitUnionCoerce emitUnionBoxAtRecord; do
+for h in emitUnionBoxArg emitUnionCoerce emitUnionBoxAtRecord emitUnionBoxOwed; do
   cat >> "$W" <<X
 
 export function ${h}P(pos: string, body: u8[], a: string, b: i32, c: i32, d: i32): i32 {
@@ -53,6 +55,7 @@ need box_dst_shadow.vl 'let bdsArmed = true'
 need box_dst_shadow.vl 'import { elabShadowNote }'
 need wasmEmit.vl 'emitUnionBoxArgP("'
 need wasmEmit.vl '  bdsPosEnter,'
+need wasmEmit.vl 'bdsPosLeave("floor@" + fo)'
 need emit_sections.vl '  emitUnionBoxArgP,'
 need emit_sections.vl 'emitUnionCoerceP("'
 # --- overwrite history (appended to probe.sh) ---
@@ -116,8 +119,7 @@ perl -0 -i -pe 's/(\n  nodeBoxTyIx = \[\]\n)/$1  bxwHist = Map()\n/' "$CS"
 perl -0 -i -pe 's/(export function elabCapBegin\(depth: i32\) \{\n)/$1  bxwCap = Map()\n/' "$K"
 F="$C/check_fit_rules.vl"
 perl -0 -i -pe 's/(\n  nodeBoxTyIx,\n)/\n  bxwNoteProg,\n  bxwRole,\n  bxwRoleSet,\n  nodeBoxTyIx,\n/; s/(\} from "\.\/check_elab_cap"\n)/  bxwNote,\n$1/;
-  s/(    if isBox \{ elabCapBox\[ix\] = t \})/    if isBox {\n      elabCapBox[ix] = t\n      bxwNote(ix, t * 4 + bxwRole, true)\n    }/;
-  s/(function boxTyStampOne\(ix: i32, t: i32\): i32 \{\n  if elabCapLive\(\) \{\n    elabCapBox\[ix\] = t\n)/$1    bxwNote(ix, t * 4 + bxwRole, true)\n/;
+  s/(function boxTyStampOne\(ix: i32, t: i32\): i32 \{\n  if elabCapLive\(\) \{\n    if boxTyKeeps\(elabCapBox\[ix\] \?\? -1, t\) \{ return 1 \}\n    elabCapBox\[ix\] = t\n)/$1    bxwNote(ix, t * 4 + bxwRole, true)\n/;
   s/(  nodeBoxTyIx\[ix\] = t\n)/$1  bxwNoteProg(ix, t * 4 + bxwRole)\n/;
   s/(  const spine: i32\[\] = \[\]\n  const leaves: i32\[\] = \[\]\n  valueTailSplit\(ix, spine, leaves\)\n  boxTyStamp\(ix, t\)\n  for j in spine \{ boxTyStamp\(j, t\) \}\n  for l in leaves \{ boxTyStamp\(l, t\) \}\n)/  const bxo = bxwRoleSet(1)\n$1  bxwRoleSet(bxo)\n/;
   s/(function boxExitsStamp\(ix: i32, t: i32\): i32 \{\n)(.*?\n)(  0\n\})/$1  const bxo = bxwRoleSet(2)\n$2  bxwRoleSet(bxo)\n$3/s' "$F"
@@ -127,7 +129,6 @@ perl -0 -i -pe 's/(\} from "\.\/check_elab_cap"\n)/  bxwBank,\n  bxwReset,\n$1/;
 need check_fit_rules.vl 'bxwNoteProg(ix, t * 4 + bxwRole)'
 need check_fit_rules.vl '  const bxo = bxwRoleSet(1)'
 need check_fit_rules.vl '  const bxo = bxwRoleSet(2)'
-need check_fit_rules.vl '      bxwNote(ix, t * 4 + bxwRole, true)'
 need check_fit_rules.vl '    bxwNote(ix, t * 4 + bxwRole, true)'
 need emit_elab.vl '  bxwBank(k)'
 need emit_elab.vl '  bxwReset()'

@@ -1,23 +1,20 @@
-// Where is the emitter's module-scope mutable state CLEARED, and the ratchet on what is not.
+// Where is the compiler's module-scope mutable state CLEARED, and the invariant on what is not.
 //
 //     vl run scripts/emitter-state-audit.vl [-- --names]
 //     vl run scripts/emitter-state-audit.vl -- --check [--without-reset NAME] [--dir DIR]
 //
-// Every `let` at column 0 in an emitter module survives a compile, and one wasm instance
-// runs many compiles (the LSP, `tests/cases_wasm_test.ts`). For each one this finds every
-// assignment in `compiler/*.vl`, splits out the CLEARS (the declaration's initial value
-// written back) and classifies the variable by the function that clears it: the compile
-// prologue, a pass, a frame builder, some inner function, or NEVER.
+// Every `let` at column 0 in a compiler module survives a program, and one wasm instance runs
+// many (`vl check --batch`, the LSP, `tests/cases_wasm_test.ts`). For each one this finds every
+// write in `compiler/*.vl` (a one-line setter's calls count as writes in the caller) and
+// classifies the variable by the function that CLEARS it — writes its initial value back, or
+// overwrites it at top level without reading it: the compile prologue, a pass, a frame
+// builder, some inner function. A `let` none clears is safe by shape (`letShape`), by a
+// reviewed list (LSTAMPED, LSCOPED, LINSTANCE), or NEVER. The frame-builder table lists the
+// `fnUses*` flags one of the two frame builders resets and the other does not (D1006/D1007).
 //
-// "Cleared" is textual: a variable rewritten unconditionally every compile reads as NEVER
-// and is fine. So NEVER is a list of things to ask about, not a defect list; the witness
-// that settles a row is `tests/vl_instance_state_leak_test.ts`. The frame-builder table
-// lists the `fnUses*` flags one of the two frame builders resets and the other does not
-// (D1006/D1007), pinned by `tests/vl_emitter_state_audit_test.ts`.
-//
-// `--check` is an invariant, not a ratchet: it exits 1 naming every NEVER row, and every
-// inner integer register holding a per-program id (D11770) that GUARDED does not cover.
-// It also refuses a written module `const` container nothing empties, in any module.
+// `--check` is an invariant, not a ratchet: it exits 1 naming every NEVER row, every emitter
+// inner integer register holding a per-program id (D11770) that GUARDED does not cover, and
+// every written module container (`const`, or a `let` mutated in place) nothing empties.
 // `--without-reset NAME` ignores one function's clears and `--dir` audits another tree, so the
 // tests' controls can make it red. Run from the checkout root: paths are relative to it.
 
@@ -26,15 +23,23 @@ import { programArgs } from "std:args"
 import { exit } from "std:process"
 import { Utf8Error } from "std:utf8"
 import { toString } from "std:fmt"
-import { endsWith, join, padEnd, padStart, split, startsWith } from "std:str"
+import {
+  endsWith,
+  join,
+  lastIndexOf,
+  padEnd,
+  padStart,
+  split,
+  startsWith,
+} from "std:str"
 import { sort } from "std:array"
 import { die, findFrom, hasFlag, lstripWs, stripWs } from "./lib/common"
 
 // The compiler sources audited: `compiler`, or the tree `--dir` names (the tests' controls).
 let cdir = "compiler"
 
-// The emitter's own modules. The checker and the front end have the same hazard and their
-// own reset homes; this audit is scoped to the emitter, where the filed rows live.
+// The emitter's own modules, where the index-register rule (GUARDED, D11770) applies. The
+// never-cleared rule reads every compiler module.
 const EMIT = [
   "emit_state.vl", "emit_classify.vl", "emit_collect.vl", "emit_sections.vl",
   "emit_base.vl", "emit_rep.vl", "emit_bytes.vl", "emit_query.vl",
@@ -72,19 +77,6 @@ const PROLOGUE = [
   "classifyStateReset", "emitProgramReset", "ifValueReset",
 ]
 
-// State that lives across compiles by design, so it is no NEVER row: the host options a
-// `set*` export stages before a compile, and the atom intern, whose ids are text identities
-// with no arena content, and `uVarTyIxResets`, `rvsBuilds`, `rvsAnsGen` and `localFrameGen`,
-// generations that only rise and are only compared with a stored copy, and `fnRecordedRetTyFn`, a reader
-// `emitProgram` installs with the same function every compile. A name here that no emitter module
-// declares stops the audit.
-const INSTANCE = [
-  "gSharedMemPages", "gInitialMemPages", "gMaxMemPages", "gLowMemUnused",
-  "gHeapBase", "gHeapLimit", "repShadowOn", "msAtomTexts", "msAtomIds",
-  "uVarTyIxResets", "rvsBuilds", "rvsAnsGen", "localFrameGen",
-  "fnRecordedRetTyFn",
-]
-
 // `emitProgram`'s ordered pass table (`runEmitPass`): once per compile, but after the
 // prologue, so a pass-cleared column is stale for anything an earlier pass reads.
 const PASS = [
@@ -92,10 +84,46 @@ const PASS = [
   "passCheckTopLevel", "buildFnMap", "recordedVoidFns", "computeRetInference",
   "dispatchRewrite", "captureBoxRewrite", "synthRetAnnots", "scanArrLitCommit",
   "monomorphize", "collectGenAliasShapes", "collectAnnShapes", "synthVoidTwins",
-  "synthExternValues", "synthParamAnnots", "collectMapFilterUse",
-  "collectFnValUse", "collectCloSigs", "scanPrintUse", "capCacheBuild",
-  "collectInlineUnions", "computeGlobalPromotion", "mAssignTypeIndices",
-  "collectStartLocals", "gaeCollectDecls", "emitGlobalSection",
+  "synthExternValues", "collectMapFilterUse", "collectFnValUse",
+  "collectCloSigs", "scanPrintUse", "capCacheBuild", "collectInlineUnions",
+  "computeGlobalPromotion", "mAssignTypeIndices", "collectStartLocals",
+  "gaeCollectDecls", "emitGlobalSection",
+]
+
+// Reviewed `let`s outside the emitter that no reset clears and no shape rule (`letShape`)
+// proves. Each list's entries must be otherwise NEVER, or the audit stops, so none goes stale.
+// `name:guard`: a memo key compared with a rising generation or a validity flag that is reset;
+// the guard must appear in a function of the key's module that names the key.
+const LSTAMPED = [
+  // `memberMoves` and `arenaEpoch` only rise.
+  "cwIxMMoves:memberMovesNow", "elabDlvMemoEpoch:arenaEpochNow",
+  "elabReadIxEpoch:arenaEpochNow", "elabReadIxLen:elabReadIxEpoch",
+  // `shMemoStampSame` compares all five; `tyMutEpoch` advances at every checker init.
+  "shMemoEpoch:tyMutEpoch", "shMemoArena:tys", "shMemoDecl:substNestDecl",
+  "shMemoMode:substNestMode", "shMemoQuiet:inferQuiet",
+  // driver: `vcDiagMemoReset` clears `vcDiagsBufValid` and `vcDiagMsgBufI`.
+  "vcDiagsBuf:vcDiagsBufValid", "vcDiagMsgBuf:vcDiagMsgBufI",
+  // lint: the scan slot is reused only while `siScSrc[slot]` is this source.
+  "siScratchSlot:siScanLines",
+]
+
+// Call-scoped: written in the same call before every read (a result register a caller reads
+// after a `true`, a budget or cursor set just before the walk that spends it, a Begin/End pair).
+const LSCOPED = [
+  "canonTwinText", "cwLexMet", "ftCheckLen", "imBtV", "imC", "imD",
+  "jwArrSpell", "jwMapSpell", "jwRecvTy", "mvValid", "nlDefaultAnn", "nlFnBind",
+  "nlFnDecl", "nlFnLits", "nlFnName", "nlFnTy", "nlFnWant", "nlLeafWant",
+  "nluAtoms", "ownLen", "pgrBudget", "sBase", "sDepth", "sK", "sReach",
+  "sSegLo", "skPlainDecl", "stepMoves", "urcName", "wiRowsWhy",
+  "monoRecheckDepth", "cuTy",
+]
+
+// Live across programs by design: `T`, whose fields `initChecker` resets; the CLI's parsed
+// options; `tyWideUnionMinted`, only ever set, a gate that can only enable work; and the
+// watch server's ownership of the interface hash.
+const LINSTANCE = [
+  "T", "cliBudget", "cliBudgetAct", "cliBudgetFindings", "cliBudgetPath",
+  "tyWideUnionMinted", "wiOwnsIh",
 ]
 
 // The two per-function frame builders; each stands for itself plus the same-module helpers
@@ -540,17 +568,309 @@ function guardHolds(
   false
 }
 
+// For each 0-based line of `s`: 2 for a top-level statement of its function's unconditional
+// prefix (`endsPrefix`), which runs whenever the function does; 1 for a top-level statement
+// after that prefix, which runs whenever the call gets that far; 0 otherwise.
+function prefixLines(s: Src): i32[] {
+  const out: i32[] = []
+  for _l in s.lines { out.push(0) }
+  for sp in s.spans {
+    let level = 2
+    let k = sp.a
+    while k < sp.b && k < s.lines.length {
+      let ln = s.lines[k]
+      const cut = ln.indexOf("//")
+      if cut >= 0 { ln = ln.slice(0, cut) }
+      if endsPrefix(ln) { level = 1 }
+      if ln.length > 2 && ln[0] == 32 && ln[1] == 32 && isIdStart(ln[2]) {
+        out[k] = level
+      }
+      k = k + 1
+    }
+  }
+  out
+}
+
+// A one-line setter `function S(p: T) { NAME = p }` writes NAME on another module's behalf, so
+// each call `S(arg)` is a write of NAME in the CALLER, graded as `writesIn` grades `NAME = arg`.
+function setterWrites(
+  srcs: Src[],
+  lx: Map<string, i32>,
+  decls: Decl[],
+  out: Write[],
+): Map<string, i32> {
+  const target = Map<string, i32>()
+  for s in srcs {
+    for sp in s.spans {
+      if sp.a < 1 { continue }
+      const h = rstripLine(s.lines[sp.a - 1])
+      const ps = paramsOf(s.lines, sp.a - 1)
+      if ps.length != 1 || !endsWith(h, " }") { continue }
+      const ob = h.lastIndexOf("{ ")
+      if ob < 0 { continue }
+      const body = h.slice(ob + 2, h.length - 2)
+      const eq = body.indexOf(" = ")
+      if eq < 0 || body.slice(eq + 3, body.length) != ps[0] { continue }
+      const ix = lx[s.file + ":" + body.slice(0, eq)]
+      if ix != null { target[sp.name] = ix }
+    }
+  }
+  let si = -1
+  for s in srcs {
+    si = si + 1
+    const tops = prefixLines(s)
+    let i = 0
+    while i < s.lines.length {
+      let ln = s.lines[i]
+      const cut = ln.indexOf("//")
+      if cut >= 0 { ln = ln.slice(0, cut) }
+      if (
+        startsWith(lstripWs(ln), "export function ")
+        || startsWith(lstripWs(ln), "function ")
+      ) {
+        i = i + 1
+        continue
+      }
+      let a = 0
+      while a < ln.length {
+        if (
+          !isIdStart(ln[a])
+          || (a > 0 && (isIdChar(ln[a - 1]) || ln[a - 1] == 46))
+        ) {
+          a = a + 1
+          continue
+        }
+        const id = identAt(ln, a)
+        const e = a + id.length
+        const ix = target[id]
+        if ix != null && e < ln.length && ln[e] == 40 {
+          let d = 1
+          let t = e + 1
+          while t < ln.length && d > 0 {
+            if ln[t] == 40 || ln[t] == 91 || ln[t] == 123 { d = d + 1 }
+            if ln[t] == 41 || ln[t] == 93 || ln[t] == 125 { d = d - 1 }
+            t = t + 1
+          }
+          const arg = stripWs(ln.slice(e + 1, t - 1))
+          const set = tops[i] > 0 && a == 2 && !hasWord(arg, decls[ix].name)
+          const clear = (set && tops[i] == 2) || arg == decls[ix].init
+          const fn = s.lineFn[i + 1]
+          out.push(
+            {
+              ix: ix,
+              fn: fn,
+              clear: clear,
+              late: set && !clear,
+              rhs: arg,
+              src: si,
+              line: i,
+            },
+          )
+        }
+        a = e
+      }
+      i = i + 1
+    }
+  }
+  target
+}
+
+function entryName(e: string): string { split(e, ":")[0] }
+
+// The reviewed class of a `let`, or "NEVER" when no list names it.
+function reviewedKind(name: string): string {
+  for e in LSTAMPED {
+    if entryName(e) == name { return "stamped" }
+  }
+  if inList(LSCOPED, name) { return "scoped" }
+  if inList(LINSTANCE, name) { return "linstance" }
+  "NEVER"
+}
+
+// Stops the audit on a reviewed entry naming no declaration, one a rule already covers, or a
+// stamp whose guard no function of the key's module names beside the key.
+function checkReviewed(
+  decls: Decl[],
+  kinds: string[],
+  ixOf: Map<string, i32>,
+  srcs: Src[],
+) {
+  const all: string[] = []
+  for e in LSTAMPED { all.push(e) }
+  for e in LSCOPED { all.push(e) }
+  for e in LINSTANCE { all.push(e) }
+  for e in all {
+    const nm = entryName(e)
+    const ix = ixOf[nm]
+    if ix == null {
+      die("a reviewed let list names no compiler declaration: " + nm, 2)
+      return 0
+    }
+    const k = kinds[ix]
+    if k != "stamped" && k != "scoped" && k != "linstance" {
+      die(
+        "a reviewed let list names a let a rule already covers (\{k}): " + nm,
+        2,
+      )
+    }
+    const parts = split(e, ":")
+    if parts.length == 2 {
+      let held = false
+      for s in srcs {
+        if s.file != decls[ix].file { continue }
+        for sp in s.spans {
+          let key = false
+          let guard = false
+          let li = sp.a
+          while li < sp.b && li < s.lines.length {
+            const t = codeOf(s.lines[li])
+            if hasWord(t, nm) { key = true }
+            if hasWord(t, parts[1]) { guard = true }
+            li = li + 1
+          }
+          if key && guard { held = true }
+        }
+      }
+      if !held {
+        die(
+          "LSTAMPED \{nm}: no function of compiler/\{decls[ix].file} names \{parts[1]}",
+          2,
+        )
+      }
+    }
+  }
+  0
+}
+
+// Whether no `return`, `break` or `continue` stands in `s` strictly between 0-based lines `a`, `b`.
+function noExitBetween(s: Src, a: i32, b: i32): boolean {
+  let k = a + 1
+  while k < b {
+    const t = codeOf(s.lines[k])
+    if hasWord(t, "return") || hasWord(t, "break") || hasWord(t, "continue") {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+// Whether function `fn` of `s` binds a local to the variable's value: `const W = NAME`
+// (or `let`); the local names returned, empty when none.
+function savesOf(s: Src, fn: string, name: string): string[] {
+  const out: string[] = []
+  for sp in s.spans {
+    if sp.name != fn { continue }
+    let k = sp.a
+    while k < sp.b && k < s.lines.length {
+      const t = stripWs(codeOf(s.lines[k]))
+      let i = -1
+      if startsWith(t, "const ") { i = 6 }
+      else if startsWith(t, "let ") { i = 4 }
+      if i > 0 {
+        const w = identAt(t, i)
+        const e = t.indexOf(" = ")
+        if w.length > 0 && e > 0 && stripWs(t.slice(e + 3, t.length)) == name {
+          out.push(w)
+        }
+      }
+      k = k + 1
+    }
+  }
+  out
+}
+
+// The safe shape of a `let` no reset clears, or "NEVER": `init` (written only at module
+// scope), `rises` (every write `g = g + 1`: a generation, never equal to a stamp from an
+// earlier program), `balanced` (every write `d = d + 1` or `d = d - 1`, each rise undone in its
+// own function with no exit between) or `restored` (every writing function saves the value to
+// a local first and writes that local back).
+function letShape(
+  ix: i32,
+  name: string,
+  ws: Write[],
+  srcs: Src[],
+  setters: Map<string, i32>,
+): string {
+  // A setter's own `NAME = p` is accounted at its call sites.
+  const mine: Write[] = []
+  for w in ws {
+    if w.ix == ix && setters[w.fn] != ix { mine.push(w) }
+  }
+  let onlyModule = true
+  let allRise = true
+  let allStep = true
+  for w in mine {
+    if w.fn != "<module>" { onlyModule = false }
+    if w.rhs != name + " + 1" { allRise = false }
+    if w.rhs != name + " + 1" && w.rhs != name + " - 1" { allStep = false }
+  }
+  if onlyModule { return "init" }
+  if allRise { return "rises" }
+  if allStep {
+    let ok = true
+    for w in mine {
+      if w.rhs != name + " + 1" { continue }
+      let fall = -1
+      for x in mine {
+        if (
+          x.src == w.src
+          && x.fn == w.fn
+          && x.rhs == name + " - 1"
+          && x.line > w.line
+        ) {
+          if fall < 0 || x.line < fall { fall = x.line }
+        }
+      }
+      if fall < 0 || !noExitBetween(srcs[w.src], w.line, fall) { ok = false }
+    }
+    if ok { return "balanced" }
+  }
+  let restored = true
+  for w in mine {
+    const saves = savesOf(srcs[w.src], w.fn, name)
+    let back = false
+    for x in mine {
+      if x.src == w.src && x.fn == w.fn && inList(saves, x.rhs) { back = true }
+    }
+    if !back { restored = false }
+  }
+  if restored { return "restored" }
+  "NEVER"
+}
+
+// The `let` a name written in module `file` denotes: the module's own, else an export of it.
+function letIxIn(lx: Map<string, i32>, file: string, name: string): i32 | null {
+  const own = lx[file + ":" + name]
+  if own != null { return own }
+  lx[":" + name]
+}
+
 // One assignment the scan found: which declaration, which function, and whether it clears.
-type Write = { ix: i32, fn: string, clear: boolean }
+// `late`: a top-level overwrite after the function's first exit, a home that counts only as
+// `inner` (shown as `~fn`).
+type Write = {
+  ix: i32,
+  fn: string,
+  clear: boolean,
+  late: boolean,
+  rhs: string,
+  src: i32,
+  line: i32,
+}
 
 // Every `NAME = RHS` in `text` (a line with its comment cut) whose NAME is declared: NAME not
 // preceded by an identifier character or `.`, `=` not followed by `=`, and RHS running to the
 // first `}` or the end of the line.
 function writesIn(
   text: string,
-  ixOf: Map<string, i32>,
+  lx: Map<string, i32>,
+  file: string,
   decls: Decl[],
   fn: string,
+  top: i32,
+  si: i32,
+  line: i32,
   out: Write[],
 ) {
   let i = 0
@@ -564,7 +884,7 @@ function writesIn(
     const before = i == 0 || text[i - 1] != 46
     let next = j
     if before && isIdStart(text[i]) {
-      const ix = ixOf[text.slice(i, j)]
+      const ix = letIxIn(lx, file, text.slice(i, j))
       if ix != null {
         let k = j
         while k < text.length && isSp(text[k]) { k = k + 1 }
@@ -579,7 +899,20 @@ function writesIn(
             let e = rhs.length
             while e > 0 && rhs[e - 1] == 125 { e = e - 1 }
             rhs = stripWs(rhs.slice(0, e))
-            out.push({ ix: ix, fn: fn, clear: rhs == decls[ix].init })
+            // An unconditional overwrite that does not read the old value re-establishes it.
+            const set = top > 0 && i == 2 && !hasWord(rhs, decls[ix].name)
+            const clear = (set && top == 2) || rhs == decls[ix].init
+            out.push(
+              {
+                ix: ix,
+                fn: fn,
+                clear: clear,
+                late: set && !clear,
+                rhs: rhs,
+                src: si,
+                line: line,
+              },
+            )
             next = t + 1
           }
         }
@@ -630,9 +963,10 @@ function audit(without: string): Audit {
   for f in files { srcs.push(loadSrc(f)) }
 
   const decls: Decl[] = []
+  // `ixOf`: a name's first declaration, for the lists; `lx`: how a write resolves (`letIxIn`).
   const ixOf = Map<string, i32>()
-  for f in EMIT {
-    if !inList(files, f) { continue }
+  const lx = Map<string, i32>()
+  for f in files {
     let s = srcs[0]
     for x in srcs {
       if x.file == f { s = x }
@@ -644,11 +978,15 @@ function audit(without: string): Audit {
     while i < n {
       const d = declOf(s.lines[i], f, i + 1)
       if d != null {
-        const at = ixOf[d.name]
+        const at = lx[f + ":" + d.name]
         if at != null {
           decls[at] = d
         } else {
-          ixOf[d.name] = decls.length
+          if ixOf[d.name] == null { ixOf[d.name] = decls.length }
+          lx[f + ":" + d.name] = decls.length
+          if startsWith(s.lines[i], "export ") {
+            lx[":" + d.name] = decls.length
+          }
           decls.push(d)
         }
       }
@@ -671,7 +1009,10 @@ function audit(without: string): Audit {
   }
 
   const ws: Write[] = []
+  let wsi = -1
   for s in srcs {
+    wsi = wsi + 1
+    const tops = prefixLines(s)
     let n = s.lines.length
     if n > 0 && s.lines[n - 1].length == 0 { n = n - 1 }
     let i = 0
@@ -682,11 +1023,13 @@ function audit(without: string): Audit {
         let text = ln
         const cut = text.indexOf("//")
         if cut >= 0 { text = text.slice(0, cut) }
-        writesIn(text, ixOf, decls, s.lineFn[i + 1], ws)
+        writesIn(text, lx, s.file, decls, s.lineFn[i + 1], tops[i], wsi, i, ws)
       }
       i = i + 1
     }
   }
+
+  const setters = setterWrites(srcs, lx, decls, ws)
 
   const writes: i32[] = []
   const homes: string[][] = []
@@ -700,18 +1043,13 @@ function audit(without: string): Audit {
     writes[w.ix] = writes[w.ix] + 1
     addUnique(assigned[w.ix], w.fn)
     if w.clear && w.fn != without { addUnique(homes[w.ix], w.fn) }
+    if w.late && w.fn != without { addUnique(homes[w.ix], "~" + w.fn) }
   }
   // Memo keys and generations are registered, and `memoCompileReset` resets them all.
   let di = 0
   while di < decls.length {
     if isMemoInit(decls[di].init) { addUnique(homes[di], "memoCompileReset") }
     di = di + 1
-  }
-
-  for nm in INSTANCE {
-    if ixOf[nm] == null {
-      die("INSTANCE names no emitter declaration: " + nm, 2)
-    }
   }
 
   const frame: string[] = []
@@ -733,8 +1071,18 @@ function audit(without: string): Audit {
     if anyIn(h, frame) { kind = "frame" }
     if anyIn(h, pass) { kind = "pass" }
     if anyIn(h, prologue) { kind = "prologue" }
-    if kind == "NEVER" && inList(INSTANCE, decls[k].name) { kind = "instance" }
+    if kind == "NEVER" { kind = letShape(k, decls[k].name, ws, srcs, setters) }
+    if kind == "NEVER" { kind = reviewedKind(decls[k].name) }
     kinds.push(kind)
+    k = k + 1
+  }
+  checkReviewed(decls, kinds, ixOf, srcs)
+  const letHomes = Map<string, string[]>()
+  const letKinds = Map<string, string>()
+  k = 0
+  while k < decls.length {
+    letHomes[decls[k].file + ":" + decls[k].name] = homes[k]
+    letKinds[decls[k].file + ":" + decls[k].name] = kinds[k]
     k = k + 1
   }
   // An index-shaped register: an inner integer whose init is negative or that some line reads
@@ -742,7 +1090,8 @@ function audit(without: string): Audit {
   const intRow: boolean[] = []
   k = 0
   while k < decls.length {
-    intRow.push(kinds[k] == "inner" && intInit(decls[k].init, false))
+    const emitMod = inList(EMIT, decls[k].file)
+    intRow.push(emitMod && kinds[k] == "inner" && intInit(decls[k].init, false))
     k = k + 1
   }
   const idRead = idReadRows(srcs, ixOf, intRow)
@@ -779,7 +1128,7 @@ function audit(without: string): Audit {
     sides: sides,
     index: index,
     guards: guards,
-    cont: contAudit(srcs, without, prologue, pass, frame),
+    cont: contAudit(srcs, without, prologue, pass, frame, letHomes, letKinds),
   }
 }
 
@@ -861,10 +1210,22 @@ const CINSTANCE = [
   "modRootOfKey",
   // the registries `memoCompileReset` walks
   "memoGens", "memoKeys",
+  // the atom intern: ids are text identities with no arena content
+  "msAtomTexts", "msAtomIds",
+  // std_receivers: rows of std's receivers and exports, filled once from constants.
+  "stdRecvName", "stdRecvSpec", "stdRecvSelf", "stdRecvTparams", "stdRecvMin", "stdRecvMax",
+  "stdExpName", "stdExpSpec",
 ]
 
 // One module-scope container `const`.
-type CDecl = { name: string, file: string, line: i32, exported: boolean }
+// `isLet`: a `let` container, whose reassignments the `let` half grades and adds as homes.
+type CDecl = {
+  name: string,
+  file: string,
+  line: i32,
+  exported: boolean,
+  isLet: boolean,
+}
 
 // One write of a container: which, in which function of which source, at which 0-based line,
 // and its shape: "push", "pop", "clear", "store" (an index store or any other method), "arg".
@@ -875,8 +1236,9 @@ function contDeclOf(ln: string, file: string, line: i32): CDecl | null {
   let i = 0
   const exported = startsWith(ln, "export ")
   if exported { i = 7 }
-  if !startsWith(ln.slice(i, ln.length), "const ") { return null }
-  i = i + 6
+  const isLet = startsWith(ln.slice(i, ln.length), "let ")
+  if !isLet && !startsWith(ln.slice(i, ln.length), "const ") { return null }
+  if isLet { i = i + 4 } else { i = i + 6 }
   const name = identAt(ln, i)
   if name.length == 0 { return null }
   const eq = findFrom(ln, "=", i)
@@ -891,7 +1253,7 @@ function contDeclOf(ln: string, file: string, line: i32): CDecl | null {
   ) {
     return null
   }
-  { name: name, file: file, line: line, exported: exported }
+  { name: name, file: file, line: line, exported: exported, isLet: isLet }
 }
 
 // The container a name at source `si` denotes: the module's own, else the one export of it.
@@ -1149,6 +1511,8 @@ function contAudit(
   prologue: string[],
   pass: string[],
   frame: string[],
+  letHomes: Map<string, string[]>,
+  letKinds: Map<string, string>,
 ): CAudit {
   const decls: CDecl[] = []
   const own = Map<string, i32>()
@@ -1242,6 +1606,14 @@ function contAudit(
   }
   k = 0
   while k < decls.length {
+    const lh = letHomes[decls[k].file + ":" + decls[k].name]
+    if decls[k].isLet && lh != null {
+      for x in lh { addUnique(homes[k], x) }
+    }
+    k = k + 1
+  }
+  k = 0
+  while k < decls.length {
     const h = homes[k]
     sort(h, strLess)
     let kind = ""
@@ -1257,6 +1629,10 @@ function contAudit(
     } else if stackOnly[k] {
       kind = "balanced"
     }
+    // A `let` container a reviewed `let` list names keeps that class here.
+    const lk = letKinds[decls[k].file + ":" + decls[k].name] ?? ""
+    const reviewed = lk == "scoped" || lk == "linstance" || lk == "stamped"
+    if kind == "" && decls[k].isLet && reviewed { kind = lk }
     kinds[k] = kind
     k = k + 1
   }
@@ -1401,8 +1777,13 @@ function contWritten(a: Audit): i32 {
 }
 
 function report(a: Audit, names: boolean) {
-  print("module-scope mutables in the emitter: " + toString(a.decls.length))
-  for k in ["prologue", "pass", "frame", "inner", "instance", "NEVER"] {
+  print(
+    "module-scope mutables, every compiler module: " + toString(a.decls.length),
+  )
+  for k in [
+    "prologue", "pass", "frame", "inner", "init", "rises", "balanced",
+    "restored", "stamped", "scoped", "linstance", "NEVER",
+  ] {
     print(
       "  " + padEnd(k, 9, " ") + " " + padStart(toString(countKind(a, k)), 4, " "),
     )
@@ -1460,7 +1841,8 @@ function report(a: Audit, names: boolean) {
     const nm = padEnd(d.name, 24, " ")
     const ln = padEnd(toString(d.line), 6, " ")
     const ini = padEnd(d.init, 8, " ")
-    print("  \{nm} \{d.file}:\{ln} init=\{ini} writes=\{a.writes[i]}")
+    const by = join(a.assigned[i], ",")
+    print("  \{nm} \{d.file}:\{ln} init=\{ini} writes=\{a.writes[i]} by=\{by}")
   }
 
   const idx = sortedIx(a, (i: i32): boolean => a.index[i])
@@ -1548,12 +1930,12 @@ function main(args: readonly string[]) {
   if hasFlag(args, "--check") {
     const never = sortedIx(a, (i: i32): boolean => a.kinds[i] == "NEVER")
     const open = unguarded(a)
-    const line = "never-cleared emitter state \{never.length} of \{a.decls.length} mutables"
+    const line = "never-cleared module state \{never.length} of \{a.decls.length} mutables"
     const iline = "unguarded inner index registers \{open.length}"
     if never.length > 0 {
       print("emitter state invariant BROKEN: " + line)
       print(
-        "A module-scope `let` in an emitter module that no reset clears survives into the next compile on the same instance.\nClear it in `emitProgram`'s prologue, a pass or a frame builder, derive it per call, or name it in INSTANCE with its reason:",
+        "A module-scope `let` that no reset clears survives into the next program on the same instance (`vl check --batch`, the LSP).\nClear it in its module's per-program reset, a pass or a frame builder, derive it per call, or name it in LSTAMPED, LSCOPED or LINSTANCE with its reason:",
       )
       for i in never {
         const d = a.decls[i]
