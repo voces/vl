@@ -62,3 +62,4 @@ dead. The one pre-only classifier, `arrLitRefListRow` (99 pre asks), was pre-onl
 | `scripts/sweep.vl` diff, 23,615 cells | 23,615 same, 0 bytes-only, 0 movers, 0 `runs → not-runs` |
 | guest fuel, `vl check --codegen compiler/entry.vl` | 99,487,522,322 → 98,860,546,224 (−0.63%) |
 | guest fuel, `vl check compiler/entry.vl` | 60,440,682,992 → 60,440,651,278 |
+| after merging master `cfc2f27c` | seed 6,497,819 → 6,497,725 (−94), both fixpoints; sweep 23,615 same; export budget ok |
