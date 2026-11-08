@@ -50,7 +50,7 @@ Fixpoint seeds on both sides (a third `refresh-compiler.sh` byte-identical). Bas
 |---|---|
 | sweep | 23,650: 23,650 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs` |
 | the text switch alone, one-level, before the spelling fixes | 41 `runs → not-runs`, 13 new compiler traps |
-| seed | 6,513,186 → 6,513,506 bytes (+320, 0.005%) |
+| seed | 6,513,186 → 6,513,532 bytes (+346, 0.005%) |
 | pin-helper budget (`emit_mono.vl`) | 927 → 927 |
 
 Not one module byte moved, so in the sweep population every reader of a synthesized pin's text
