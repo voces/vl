@@ -4,7 +4,7 @@ Measured at origin/master 76a3eb8fd (2026-10-25), read and measure only. The wit
 tables it cites were scratch files and are not kept; re-run a witness from the text before quoting it.
 
 
-## Status (2026-11-07, master `a7f27705`)
+## Status (2026-11-08, master `15c3aca0`)
 
 Each step is graded by whether its **Deletes** list below is still in `compiler/`, and §3.4's front by
 the evening census ([notes](refactor-notes/2026-11-07-exit-census-evening.md)). The orchestrator updates
@@ -14,11 +14,11 @@ this section from each PR's report; a PR does not edit it (it conflicted on near
 |---|---|---|
 | 1. Per-instance node types | done | Nothing: `nodeTyInDerived`'s rungs and the `monoOrigNode` scan are gone (landed with 2–3 as one mechanism). |
 | 2. The checker owns the instance set | in progress, the live front (§3.4) | 16 blocked and 8 parked `emit_mono` decision functions, below; `recordedParamPinName` and 178 `mono*Pin*` functions stand. |
-| 3. Singleton function types | in progress | fn_split and the `genFnHole*` family are gone. Left: the Fn#d function-holding fact (7 blocked node-type functions) and identity typing for concrete function values: slice 2a puts it in the elaboration (`elabIdentityFnTy`, [notes](refactor-notes/2026-11-07-identity-typing-fact.md)), slice 2b keys instances by each specialized argument's identity set (#6707: 1,472 decisions, a 1,416-to-1,416 bijection with mono's instances, 25,038 instances unchanged); slice 3 shadowed the callee through a specialized parameter (#6717), and `monoBakeCallback` reads it at the 1,472 keyed decisions (#6726, [notes](refactor-notes/2026-11-07-bake-reads-keyed-callee.md)). Left: `monoWalkIdentCall` (the S1 map), `monoHoleBinding` and `monoBindSeededTyParams`, and the 105 declined decisions (77 open on type variables, 28 with no base instance). `judgeFnArgHoleCalls` stands; its split arm was not re-checked here. |
+| 3. Singleton function types | in progress | fn_split and the `genFnHole*` family are gone. Left: the Fn#d function-holding fact (7 blocked node-type functions) and identity typing for concrete function values: slice 2a puts it in the elaboration (`elabIdentityFnTy`, [notes](refactor-notes/2026-11-07-identity-typing-fact.md)), slice 2b keys instances by each specialized argument's identity set (#6707: 1,472 decisions, a 1,416-to-1,416 bijection with mono's instances, 25,038 instances unchanged); slice 3 shadowed the callee through a specialized parameter (#6717), and `monoBakeCallback` reads it at the 1,472 keyed decisions (#6726, [notes](refactor-notes/2026-11-07-bake-reads-keyed-callee.md)). The consumers read the elaboration at every keyed decision: the S1 map, `monoHoleBinding` and `monoBindSeededTyParams` (#6736). Left: the 105 declined decisions (77 open on type variables, 28 with no base instance). `judgeFnArgHoleCalls` stands; its split arm was not re-checked here. |
 | 4. Finite function sets | deletions done | fn_split.vl, fn_flow_shadow.vl, the FS loop, `holeChoice*` and the list and capture pinners are gone, and the flow table is retired (§3.3). The residue is step 2's blocked list. |
-| 5. Contextual type and coercion records | deletions done | ExpCtx and the `emit*WidenSite` calls are gone. The one `lowerCoerce(srcRep, dstRep)` table is not built. |
+| 5. Contextual type and coercion records | deletions done | ExpCtx and the `emit*WidenSite` calls are gone. The converting delivery is recorded (`erArgConv`, `elabArgDeliveredTy`, #6731) and `monoArgClosedTyIn` reads it (#6737). The one `lowerCoerce(srcRep, dstRep)` table is partial (`coerceKindAt`/`emitCoerced`); union boxing collapses into it next, then a numeric (src, dst) recorder ([notes](refactor-notes/2026-11-07-lowercoerce-scope.md)). |
 | 6. Narrowing produced once | in progress | `emit_narrow_slots.vl`, `pushNarrow*` and `capNarrowBuild` are gone. `criWalkBlock` replays no narrowing; it is `computeRetInference`'s return walk and goes with it in step 7. Ten of the sixteen `synth*Ann*` functions are gone (eight write-backs and two of their helpers), with three passes. Five write-backs and the helper `synthAnnOfTy` stand; the five are parked on a reader that reads the recorded type (`refactor-notes/2026-11-07-step6-write-back-census.md`). |
-| 7. `repOf(ty)`, one row per type | in progress | `computeVoidFns` is gone: `recordedVoidFns` reads the recorded result ([notes](refactor-notes/2026-11-07-step7-void-from-recorded.md)). `computeRetInference`, `buildFnMap`'s return-kind columns, `rlSlotByNameTwin` and `letInitDeliversRow` stand; the kind shadow has 82 functions outside its agree classes. The column shadow: post-mono 2,348 of 2,994 un-annotated functions agree on every return column; pre-mono 6,902 of 18,111 record an open result, so the first run cannot read it ([notes](refactor-notes/2026-11-07-step7-ret-columns-shadow.md)). Post-mono, the columns of 2,897 of 2,994 un-annotated functions are read off the recorded result (#6716); the second walk runs only for named missing-fact classes (no result recorded, no token, rep uncovered, a variant over the function's own record, an assignment's value) ([notes](refactor-notes/2026-11-07-step7-post-mono-cols-from-recorded.md)). The type-blind classifiers' phase census is `scripts/classifier-census.vl` (`$VL_CLS_CENSUS`): 6 post-only, 1 pre-only, 98 both (105), after five were deleted onto typed readers ([notes](refactor-notes/2026-11-07-step7-classifier-batch-1.md)) and `letIsClosure` and `letIsUnion` onto the binding's typed rep; `letIsStruct` waits on D15543, so `letInitCellKind` stands ([notes](refactor-notes/2026-11-07-step7-letinitcellkind.md)). |
+| 7. `repOf(ty)`, one row per type | in progress | `computeVoidFns` is gone: `recordedVoidFns` reads the recorded result ([notes](refactor-notes/2026-11-07-step7-void-from-recorded.md)). `computeRetInference`, `buildFnMap`'s return-kind columns, `rlSlotByNameTwin` and `letInitDeliversRow` stand; the kind shadow has 82 functions outside its agree classes. The column shadow: post-mono 2,348 of 2,994 un-annotated functions agree on every return column; pre-mono 6,902 of 18,111 record an open result, so the first run cannot read it ([notes](refactor-notes/2026-11-07-step7-ret-columns-shadow.md)). Post-mono, the columns of 2,897 of 2,994 un-annotated functions are read off the recorded result (#6716); the second walk runs only for named missing-fact classes (no result recorded, no token, rep uncovered, a variant over the function's own record, an assignment's value) ([notes](refactor-notes/2026-11-07-step7-post-mono-cols-from-recorded.md)). The type-blind classifiers' phase census is `scripts/classifier-census.vl` (`$VL_CLS_CENSUS`): 6 post-only, 1 pre-only, 98 both (105), after five were deleted onto typed readers ([notes](refactor-notes/2026-11-07-step7-classifier-batch-1.md)) and `letIsClosure` and `letIsUnion` onto the binding's typed rep; `letIsStruct` is deleted after D15543's own-scheme fix (#6724, #6733), and `letInitCellKind` is deleted onto `letBindRepKind` (#6738: census 103, arena-scan budget 26, [notes](refactor-notes/2026-11-07-step7-letinitcellkind-deleted.md)). The pre-monomorphize `computeRetInference` run is deleted: its askers read the elaboration, and pre-mono asks fall 62% (#6741, [notes](refactor-notes/2026-11-07-step7-premono-askers.md)). Post-mono run #2 retired the assignment-target and rep-uncovered classes: 79 → 66 declined (#6742, [notes](refactor-notes/2026-11-07-step7-assign-target-and-unbound-result.md)). |
 
 **§3.4, the evening census of 2026-11-07** (master `3401b65f2`): the 165 `emit_mono` functions the morning
 census left.
@@ -47,26 +47,27 @@ map-value facts then deleted `monoFlowMapReadVals`, moved `monoFlowAliasMaps` to
 8 parked and 24 deleted ([notes](refactor-notes/2026-11-07-lane-f-map-values.md)).
 
 **Blocked at the census (16; 16 on master), each on a named fact:**
-- node type: `monoArgClosedTyIn` (a REP fact: the converting delivery, an argument built at the
-  instance parameter's rep, D5930 and D2459's joins; [notes](refactor-notes/2026-11-07-blocked-three-vs-identity.md)),
+- node type: `monoArgClosedTyIn` reads the converting delivery and the identity type (#6731, #6737); the pin stays as a
+  named fallback for 124 decisions whose identity is not closed,
   `monoCoerceListCbArg` (narrowed by #6719: 20 decisions in 8 programs need element instances for tagged
   hole-function sets and generic choices, D9761),
   and the function-holding four: `monoPinReturnedObj`, `monoCloseRetFnTy` and `monoRetFnListTy` read
-  `elabHeldValTy` (#6711) and `monoClosedObjLitTy` is deleted; mono's path stays only behind three guards
-  that need a rep change, not a type read (a record field reading a function or an open binding; a list
-  of literals in a generic instance; a list closed only by its identity type) and for D4515
+  `elabHeldValTy` (#6711) and `monoClosedObjLitTy` is deleted; mono's path stays only behind two guards
+  that need a rep change, not a type read (a list of literals in a generic instance; a list closed only
+  by its identity type) and for D4515. The record-field guard is gone: a returned record's function
+  fields take their slot's identity type (#6743, [notes](refactor-notes/2026-11-07-slot-field-read-identity-type.md))
   ([notes](refactor-notes/2026-11-07-heldval-consumers.md));
-- lambda sigs: `monoLamParamPinAnn` (two TYPE facts: a hole lambda called in an instance body keeps its parameter
-  open, D13660; a lambda written into a `let` holding a generic function has no node type, D14501);
+- lambda sigs: `monoLamParamPinAnn` reads the lambda's own instances where the binding pins (215 of 261, #6732); it stays
+  for 46 tagged-set index pins and for parameters the binding leaves open (D14501's holder fact is not reached);
 - call param: `monoBindSeededTyParams` (identity typing for function values, A), `monoArgPinTyIx` (a
   pin fact of its own after holes-close), `monoArgPinName` (the rep cascade), and `monoArgTyName`,
   `monoArgTyNameCascade`, `monoArgTyNameBound`, `monoArgTyNameProjected` and `monoArgTyNameRep`
   (split-dep's one-producer redesign; the kept arms wait on the naming rule). No decision reads an
   instance pin's spelling any more (naming-rule slice 2a: `monoPinIsFnSig` deleted, `isNumRecvBaseName`
   reads the pin type). Slice 2b names an un-annotated parameter's pin by `monoPinSpellOf` when it
-  holds no record, map or non-literal union; the rest waits on a pin-type column (an annotated
-  parameter's pin is its annotation, not the argument's type `pinTys` holds) and on the emit readers
-  that resolve a record or union pin by name (2026-11-07-pin-spelling-hole-params.md);
+  holds no record, map or non-literal union; the pin-type column now reaches every `monoInstanceFor` caller and its `nameToTy` fallback is
+  deleted (#6740, [notes](refactor-notes/2026-11-07-pin-spelling-no-parse.md)). Left: `nameToTy` of a pin's
+  text outside `monoInstanceFor` (`monoPinNamesTy` and the emit readers that resolve a pin by name);
 - per-call slot type: done. `monoReachSlotTy`, `monoReachLitTys` and their helpers are deleted; the elaboration
   records the callee types a literal slot's climb reaches (`elabLitSlotClimbCalls` #6712, `elabLitSlotCallees` #6725,
   [notes](refactor-notes/2026-11-07-slot-climb-callee-types.md)).

@@ -36,13 +36,13 @@ unrelated reasons; they are subtracted.
 
 At each step the probe sweep also showed 0 movers among the programs that did not trap.
 
-Both seeds were built to a fixpoint (two `refresh-compiler.sh` runs, byte-identical): base
-`claude/pin-type-column-3` with master `dea6eb8b` merged, candidate that tree with this change.
+Both seeds were built to a fixpoint (two `refresh-compiler.sh` runs, byte-identical): base master
+`0b44c48f` (slice 1 merged), candidate that tree with this change.
 
 | | |
 |---|---|
 | sweep | 23,613 of 23,613 same (0 bytes-only, 0 output movers, 0 `runs → not-runs`) |
-| seed | 6,483,777 → 6,485,865 bytes (+2,088) |
+| seed | 6,494,526 → 6,496,614 bytes (+2,088) |
 | pin-helper budget (`emit_mono.vl`) | 931 → 931 |
 
 ## Still parsed elsewhere

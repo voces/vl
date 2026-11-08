@@ -1,11 +1,15 @@
 import { idShadowSpec } from "./emit_id_shadow"
 import {
   elabIdentityFnTy,
+  elabSpecDeclFor,
   elabSpecDemand,
   elabSpecKeyOf,
   elabSpecMonoGroup,
+  elabSpecMonoSlot,
   elabSpecParamCalledAt,
+  elabSpecSlotOfKey,
   idCanon,
+  idSlotHeldTy,
 } from "./elab_fn_id"
 import { idShadowModeOf } from "./id_shadow_state"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
@@ -58,6 +62,7 @@ import {
   elabInstNodeTy,
   elabKeySig,
   elabLamDeliveredParams,
+  elabLamInstParamTy,
   elabLamParamTy,
   elabLitSlotCallTy,
   elabNodeTy,
@@ -236,6 +241,7 @@ import {
   tyBearsNull,
   tyEq,
   tyFieldTyOf,
+  tyHasHole,
   tyHasLitLeaf,
   tyHoldsObj,
   tyIsLitUnion,
@@ -656,6 +662,7 @@ import {
   elabAliasNote,
   elabArgBuiltRep,
   elabArgBuiltTy,
+  elabArgDeliveredTy,
   elabArmSigAt,
   elabBindUnionArmsFromCall,
   elabBindingCalls,
@@ -712,6 +719,8 @@ import {
   elabSlotRecDeclAt,
   elabSlotSetCalls,
   elabSlotTyAt,
+  elabSpecBindOf,
+  elabSpecHoleBind,
   elabSrcDecl,
   elabStampAt,
   elabTestsTyVar,
@@ -3612,6 +3621,11 @@ function monoLamParamPinAnn(
     // pinned by the elaboration's typing of the lambda in this instance (D7181).
     if st >= 0 && tyHasTyVar(st) {
       st = elabLamParamTy(fnIx, pi, lt.fnParamTypes.length)
+    } else if st >= 0 {
+      // Where the binding pins it, the elaboration's type for the parameter at this instance;
+      // the binding's only where it has none (a hole function of a tagged set, at its index).
+      const et = elabLamInstParamTy(fnIx, pi, lt.fnParamTypes.length)
+      if et >= 0 { st = et }
     }
     if st < 0 || tyHasTyVar(st) { return -1 }
     const nm = monoPinAnnSpelling(st)
@@ -5064,6 +5078,10 @@ function monoPinMapLambdas(ix: i32, pNames: string[]) {
 // bake reads; -1 outside one.
 let monoBakeSpecK = -1
 
+// The key of the keyed decision whose `monoMakeInstance` comes next, which `monoMakeInstanceGo`
+// takes and clears; -1 for any other build.
+let monoSpecGoK = -1
+
 // Extend the name→index map over the instances minted since the last call, which the walk
 // resolves by name before collection runs.
 function monoRegisterInstance() {
@@ -5231,7 +5249,7 @@ function monoBakeCallback(
         && callee is Ident
       ) {
         newCallee = mkIdent(cbFnNames[kp], callee.pos)
-        identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[kp]))
+        identFromDecl(newCallee, elabSpecDeclFor(specK, kp))
       } else if specK < 0 && callee is Ident {
         // A call through a never-written `const` alias of the parameter is a call of it too (D12216).
         let pname = monoBakeAliasParam(n.callFn, fnDeclIx)
@@ -6374,6 +6392,7 @@ function monoBindSeededTyParams(
   tvN: string[],
   tvV: string[],
   tvT: i32[],
+  specK: i32,
 ) {
   for tp in fn.fnTyParams {
     // A call in a cloned body answers from the template call the elaboration keyed (D15495).
@@ -6390,6 +6409,9 @@ function monoBindSeededTyParams(
       nm = if j < pinned.length { pinned[j] } else { "" }
       t = if j < pinTys.length { pinTys[j] } else { -1 }
     }
+    // At an argument-keyed instance the type is its base instance's binding; mono keeps the spelling.
+    const kt = if nm != "" && specK >= 0 { elabSpecBindOf(specK, tp) } else { -1 }
+    if kt >= 0 { t = kt }
     if nm != "" {
       tvN.push(tp)
       tvV.push(nm)
@@ -9666,6 +9688,8 @@ function monoMakeInstanceGo(
 ) {
   const callFrame = monoCallFrameSlot
   monoCallFrameSlot = -1
+  const specK = monoSpecGoK
+  monoSpecGoK = -1
   // The delivery this build answers, read in the instance being walked before this one's.
   const cadDel = cadDelivery
   cadDelivery = -1
@@ -9750,7 +9774,18 @@ function monoMakeInstanceGo(
     }
     monoPinKindsNoteFnVal(pinKinds)
     // Registry hit: point this call site at the existing instance.
-    if (monoMakeInstanceHit(k.key, origFe, pinned, calleeIx, annotateI32)) {
+    // A keyed decision reuses the instance the (S1) map holds for its key.
+    const sSlot = elabSpecSlotOfKey(specK)
+    let hitAt = k.key
+    let rs = 0
+    while sSlot >= 0 && rs < monoKeys.length && rs < monoInstFe.length {
+      if monoInstFe[rs] == sSlot {
+        hitAt = monoKeys[rs]
+        break
+      }
+      rs = rs + 1
+    }
+    if (monoMakeInstanceHit(hitAt, origFe, pinned, calleeIx, annotateI32)) {
       return monoCadNoteInstance(
         origFe,
         monoLastInstFe,
@@ -9867,7 +9902,10 @@ function monoMakeInstanceGo(
     }
     monoShAliasBind(origFe, letBN, letBT)
     monoShPendFlush(shAt)
-    if !fromKey {
+    if (
+      !fromKey
+      && !elabSpecHoleBind(monoOrigNode[origFe], params, specK, holeN, holeT)
+    ) {
       monoHoleBinding(origFe, params, letTyCol, holeN, holeT, tplCall)
     }
     // The worklist instance this one is: demanded here, its body checked once at this binding.
@@ -14803,19 +14841,17 @@ function monoPinFieldContainers(d: LetDecl, at: i32, ctx: i32): i32 {
 }
 
 // Types the record literal `rx` an un-annotated function returns in frame `ctx` at its closed type
-// at the instance (`elabHeldValTy`), nested record literals included, so the inferred result is
-// that record and not the checker's open one (D9181).
+// at the instance (`elabHeldValTy`) with each function field's slot set (`idSlotHeldTy`), nested
+// record literals included, so the inferred result is that record and not the checker's open one.
 function monoPinReturnedObj(rx: i32, ctx: i32) {
   if rx < 0 { return 0 }
   const lx = unwrapParen(rx)
   if lx < 0 || !(nodeAt(lx) is ObjLit) || monoFrameIsGenericInstance(ctx) {
     return 0
   }
-  const rt = elabHeldValTy(lx, ctx)
-  if rt >= 0 && monoObjLitFieldsTake(lx, ctx, false) {
-    return monoRecordObjLitAt(lx, rt, ctx)
-  }
-  monoObjLitFieldsTake(lx, ctx, true)
+  const rt = idSlotHeldTy(lx, elabHeldValTy(lx, ctx), "L" + i32ToStr(lx))
+  if rt >= 0 { return monoRecordObjLitAt(lx, rt, ctx) }
+  monoObjLitFieldsPin(lx, ctx)
   0
 }
 
@@ -14855,17 +14891,15 @@ function monoClosedReadTy(vx: i32, ctx: i32, rec: boolean): i32 {
   bt
 }
 
-// Whether record literal `lx` in frame `ctx` can take a closed type from outside: each open field
-// is a literal that can in turn, or reads a closed binding (a function or binding read whose rep
-// stays open would disagree with the record's). When `rec`, a closed read is recorded on the read
-// and an open inline list of functions takes its element slot's pin (D9254, D9301).
-function monoObjLitFieldsTake(lx: i32, ctx: i32, rec: boolean): boolean {
+// Pins the open fields of record literal `lx` in frame `ctx`, which took no closed type: a
+// field reading a closed binding is recorded at it, an open inline list of functions takes its
+// element slot's pin (D9254, D9301), and a nested record literal is walked in turn.
+function monoObjLitFieldsPin(lx: i32, ctx: i32) {
   const lit = nodeAt(lx)
   const ot = nodeTyIxOf(lx)
-  if !(lit is ObjLit) || ot < 0 || ot >= T.tys.length { return false }
+  if !(lit is ObjLit) || ot < 0 || ot >= T.tys.length { return 0 }
   const o = tyAt(ot)
-  if !(o is TyObj) { return false }
-  let ok = true
+  if !(o is TyObj) { return 0 }
   for fi in lit.objFields {
     const f = nodeAt(fi)
     const k = if f is FieldInit { strListIndexOf(o.objFieldNames, f.fiName) } else { -1 }
@@ -14877,19 +14911,19 @@ function monoObjLitFieldsTake(lx: i32, ctx: i32, rec: boolean): boolean {
     ) {
       const vx = unwrapParen(f.fiValue)
       if vx < 0 || vx >= P.nodes.length {
-        ok = false
+        continue
       } else if nodeAt(vx) is ObjLit {
-        if !monoObjLitFieldsTake(vx, ctx, rec) { ok = false }
+        monoObjLitFieldsPin(vx, ctx)
       } else if nodeAt(vx) is ArrayLit {
-        if rec && monoTyOpen(nodeTyIxOf(vx)) {
+        if monoTyOpen(nodeTyIxOf(vx)) {
           monoPinFieldContainer(lx, ctx, f.fiName, vx)
         }
-      } else if monoClosedReadTy(vx, ctx, rec) < 0 {
-        ok = false
+      } else {
+        monoClosedReadTy(vx, ctx, true)
       }
     }
   }
-  ok
+  0
 }
 
 // The record type literal `lx` takes at dotted path `pre` of the record declared at `at`: open
@@ -19750,6 +19784,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         tvN,
         tvV,
         tvT,
+        elabSpecKeyOf(specAt),
       )
       monoDefaultUnboundTyParams(
         fn.fnTyParams,
@@ -19814,6 +19849,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       const specKeys0 = monoKeys.length
       const specKWas = monoBakeSpecK
       monoBakeSpecK = elabSpecKeyOf(specAt)
+      monoSpecGoK = monoBakeSpecK
       const made = monoMakeInstance(
         origFe,
         pinned,
@@ -19827,8 +19863,10 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         cbFnNames,
       )
       monoBakeSpecK = specKWas
+      monoSpecGoK = -1
       const specFe = if monoKeys.length > specKeys0 { monoInstFe[specKeys0] } else { monoLastInstFe }
       elabSpecMonoGroup(specAt, i32ToStr(specFe))
+      elabSpecMonoSlot(specAt, specFe)
       return made
     }
   }
@@ -20555,11 +20593,30 @@ function monoPinHoleParam(
   0
 }
 
-// The closed type of argument `ax` inside function `ctx`: `pinTy`, its pin type, where that is
-// closed, else the elaboration's type for it at the instance `ctx`. -1 where neither closes it.
+// The closed type of argument `ax` inside function `ctx`. Where its pin type `pinTy` is closed:
+// the type its call delivers it at (`elabArgDeliveredTy`), else the pin for a number literal, else
+// its identity type where that is closed, else the pin. Otherwise the elaboration's type for it at
+// the instance `ctx`; -1 where neither closes it.
 function monoArgClosedTyIn(ax: i32, ctx: i32, pinTy: i32): i32 {
-  if pinTy >= 0 && pinTy < T.tys.length && !tyHasTyVar(pinTy) { return pinTy }
-  const t = elabNodeTyAt(unwrapParen(ax), ctx)
+  const x = unwrapParen(ax)
+  if pinTy >= 0 && pinTy < T.tys.length && !tyHasTyVar(pinTy) {
+    let src = x
+    let guard = 0
+    while src >= cwIxCoveredLen() && guard < 64 {
+      src = nodeSrc[src] ?? -1
+      guard = guard + 1
+    }
+    const from = if ctx >= 0 { elabKeyAt(ctx) } else { elabWalkTop() }
+    const dt = if src >= 0 { elabArgDeliveredTy(src, from) } else { -1 }
+    if dt >= 0 { return dt }
+    if x < 0 || nodeAt(x) is NumLit { return pinTy }
+    const it = elabIdentityFnTy(x, ctx)
+    if it >= 0 && it < T.tys.length && !tyHasTyVar(it) && !tyHasHole(it) {
+      return it
+    }
+    return pinTy
+  }
+  const t = elabNodeTyAt(x, ctx)
   if t >= 0 && t < T.tys.length && !tyHasTyVar(t) { return t }
   -1
 }
@@ -21523,9 +21580,11 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       }
       elabSpecMonoGroup(specAt, key)
       // Registry hit: a prior call already specialized this (callee, callback-set) — reuse it.
+      // A keyed decision reuses the instance the (S1) map holds for its key; others match `key`.
+      const slot = elabSpecSlotOfKey(elabSpecKeyOf(specAt))
       let r = 0
       while r < monoKeys.length {
-        if monoKeys[r] == key {
+        if if slot >= 0 { monoInstFe[r] == slot } else { monoKeys[r] == key } {
           const cal = nodeAt(c.callFn)
           // R4 writer 7 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
           if cal is Ident {
@@ -21533,6 +21592,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
             monoNoteRenamed(c.callFn, monoInstFe[r])
             sidNoteNodeName(c.callFn, fnStmts[monoInstFe[r]])
           }
+          elabSpecMonoSlot(specAt, monoInstFe[r])
           return 0
         }
         r = r + 1
@@ -21598,6 +21658,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       monoInstOrig.push(fe)
       monoInstName.push(specName)
       monoInstFe.push(instFe)
+      elabSpecMonoSlot(specAt, instFe)
       if monoRegisterInstance() < 0 { return -1 }
       // Walk the ORIGINAL body under this specialization's context so a nested generic call it
       // contains instantiates (idempotent via the registry — the main loop also walks the original).
@@ -25520,6 +25581,7 @@ export function monomorphize(stmts: i32[]) {
   monoArmCall = -1
   monoArmCtx = -1
   monoBakeSpecK = -1
+  monoSpecGoK = -1
   monoAliasCallDecl = Map()
   monoRetWidenFns = Map()
   monoWrittenLetHanded = Map()

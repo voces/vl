@@ -8,6 +8,21 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-07-slot-field-read-identity-type](2026-11-07-slot-field-read-identity-type.md): A returned record's function fields take their slot's identity type; guard (a) deleted (#6743).
+- [2026-11-07-step7-assign-target-and-unbound-result](2026-11-07-step7-assign-target-and-unbound-result.md): Step 7: the assignment-target and rep-uncovered declines retired, 79 → 66 (#6742).
+- [2026-11-07-step7-premono-askers](2026-11-07-step7-premono-askers.md): Step 7: the pre-monomorphize askers, and the first `computeRetInference` run deleted (#6741).
+- [2026-11-07-pin-spelling-no-parse](2026-11-07-pin-spelling-no-parse.md): No pin spelling is parsed back into a type in `monoInstanceFor`; `nameToTy` fallback deleted (#6740).
+- [2026-11-07-step7-letinitcellkind-deleted](2026-11-07-step7-letinitcellkind-deleted.md): Step 7: `letInitCellKind` deleted onto `letBindRepKind` (#6738).
+- [2026-11-07-lowercoerce-scope](2026-11-07-lowercoerce-scope.md): What one `lowerCoerce` table would collapse; union boxing first, then a numeric recorder (#6737).
+- [2026-11-07-identity-consumers-2-3](2026-11-07-identity-consumers-2-3.md): Identity typing consumers 2 and 3: the S1 map and the keyed bindings (#6736).
+- [2026-11-07-slot-set-literal-join](2026-11-07-slot-set-literal-join.md): A list literal's record elements join their function sets; 10 loud rejects run (#6735).
+- [2026-11-07-step7-u8-value-rep](2026-11-07-step7-u8-value-rep.md): A u8 value has a rep; "rep uncovered" 13 to 1 (#6734).
+- [2026-11-07-step7-letisstruct](2026-11-07-step7-letisstruct.md): `letIsStruct` deleted onto the binding's typed rep (#6733).
+- [2026-11-07-per-instance-lambda-param](2026-11-07-per-instance-lambda-param.md): A lambda's parameter type at the instance it is nested in; 215 of 261 (#6732).
+- [2026-11-07-converting-delivery](2026-11-07-converting-delivery.md): The converting delivery as a reach-row fact; 0 of 338 differ from mono's pin (#6731).
+- [2026-11-07-step7-assign-value-from-recorded](2026-11-07-step7-assign-value-from-recorded.md): An assignment's returned value read off the recorded result; post-mono declines 232 to 91 (#6730).
+- [2026-11-07-pin-type-column-callers](2026-11-07-pin-type-column-callers.md): `monoInstanceFor`'s callers hand the pin's type; the name fallback 246 to 115 programs (#6729).
+- [2026-11-07-slot-identity-set-shadow](2026-11-07-slot-identity-set-shadow.md): A function-holding slot's identity set, shadowed over 6,153 writes (#6727).
 - [2026-11-07-slot-climb-callee-types](2026-11-07-slot-climb-callee-types.md): The elaboration records the callee types a literal slot's climb reaches; `monoReachSlotTy`/`monoReachLitTys` deleted (#6725).
 - [2026-11-07-bake-reads-keyed-callee](2026-11-07-bake-reads-keyed-callee.md): Identity typing consumer 1: `monoBakeCallback` reads the keyed callee at 1,472 decisions (#6726).
 - [2026-11-07-rep-facts-behind-mono-guards](2026-11-07-rep-facts-behind-mono-guards.md): The type is right, the rep disagrees: function-holding slots, and a lambda shared by instances (#6721).
