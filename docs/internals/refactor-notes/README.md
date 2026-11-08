@@ -8,6 +8,10 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step7-fa32-minted-on-read](2026-11-08-step7-fa32-minted-on-read.md): Step 7: the f32 list pair minted on first read; fa32Used deleted (#6909).
+- [2026-11-08-step7-entry-lists-late](2026-11-08-step7-entry-lists-late.md): Step 7: import and function entries written after the bodies (#6908).
+- [2026-11-08-step2-lambda-ret-hole-param](2026-11-08-step2-lambda-ret-hole-param.md): Step 2: the lambda-return pin reads kid instances; monoPinHoleParam on monoArgPinTyAt (#6907).
+- [2026-11-08-forwarded-list-join](2026-11-08-forwarded-list-join.md): Step 4: a hole forwarded into a list join binds at the joined set, D15573 (#6906).
 - [2026-11-08-step7-classifier-deletes-r21](2026-11-08-step7-classifier-deletes-r21.md): Step 7: classifier round 21, three deletes onto typed readers (#6896).
 - [2026-11-08-step7-type-section-last](2026-11-08-step7-type-section-last.md): Step 7: the type section is written after the bodies (#6904).
 - [2026-11-08-step2-lambda-delivery-shadows](2026-11-08-step2-lambda-delivery-shadows.md): Step 2: lambda-return and delivery pins against the elaboration; neither switches (#6903).
