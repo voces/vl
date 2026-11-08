@@ -518,6 +518,7 @@ import {
   atomNarrowOp,
   boxNarrowAtomFor,
   declaredRefArrayName,
+  declaredRefArraySlot,
   emptyArrHoleElemSlot,
   exprReReadable,
   fnRetNulRefArrayNameSid,
@@ -1995,27 +1996,6 @@ export function fnRetExprOf(fnIx: i32) {
     return firstValuedReturn(fn.fnBody)
   }
   -1
-}
-
-// The map shape of a return expression that is a captured map variable, as its rep's slot
-// (mono is -1), or -3 when the return is not a captured map. `captureNamesOf` is the source
-// of truth, so a same-named local or param shadowing a capture stays with the local arms.
-export function retCapturedMapShape(fe: i32, rx: i32): i32 {
-  const u = unwrapParen(rx)
-  if u < 0 || u >= P.nodes.length { return -3 }
-  const e = nodeAt(u)
-  if e is Ident {
-    if fe >= 0 && parentBindingOf(fe, e.identName) >= 0 {
-      for c in captureNamesOf(fe) {
-        if c == e.identName {
-          const rd = repOfNode(u, fe)
-          if rd.rdCovered == 1 && rd.rdKind == "map" { return rd.rdSlot }
-          return -3
-        }
-      }
-    }
-  }
-  -3
 }
 
 // The predicate half of that pair, gated on the init being the union box: without the gate a
@@ -12271,11 +12251,18 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
 }
 
 // The per-element-type ref-list table SLOT the expression at `exprIx` produces, or -1 when
-// the element type does not resolve. Slot 0 is a real row, so an unresolved read must not
-// borrow it: every caller tests the result before indexing a backing/wrapper/element table.
+// the element type does not resolve: its rep's row, else the slot its binding keeps, else (an
+// identifier) its type's row, else its element name's. Slot 0 is a real row, so every caller
+// tests the result before indexing a backing/wrapper/element table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   const rs0 = listRowOfExpr(exprIx, fnIx)
   if rs0 >= 0 { return rs0 }
+  const kept = refListKeptSlotOfExpr(exprIx, fnIx)
+  if kept != -2 { return kept }
+  // An identifier whose rung has only a name reads the row its own type keys.
+  if exprIx >= 0 && exprIx < P.nodes.length && nodeAt(exprIx) is Ident {
+    return rlSlotOfTyOrTwin(tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
+  }
   const nm = refListElemNameOfExpr(exprIx, fnIx)
   const s = rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
   if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "call") }
@@ -12284,6 +12271,67 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
     return -1
   }
   s
+}
+
+// The ref-list slot a read at `exprIx` already holds, without its element name: the row its
+// binding, narrowed arm or capture is stored at. -1 for no ref list, -2 where only the element
+// name answers (`refListElemNameOfExpr`).
+function refListKeptSlotOfExpr(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const e = nodeAt(exprIx)
+  if e is Paren {
+    const rs = listRowOfExpr(e.parInner, fnIx)
+    if rs >= 0 && rs < rlElemName.length { return rs }
+    return refListKeptSlotOfExpr(e.parInner, fnIx)
+  }
+  if !(e is Ident) { return -2 }
+  const slsMv = mapReadStructListMvSlot(exprIx, fnIx)
+  if slsMv >= 0 {
+    const mvRs = mvValInnerRlSlotAt(slsMv)
+    if mvRs >= 0 && mvRs < rlElemName.length { return mvRs }
+    return -1
+  }
+  refListKeptSlotOfIdent(e, exprIx, fnIx)
+}
+
+// `refListElemNameOfIdent`'s rungs as slots, in its order: -2 at a rung that has only a name.
+function refListKeptSlotOfIdent(e: Ident, exprIx: i32, fnIx: i32): i32 {
+  const fat = listFitArmTyOf(exprIx, fnIx)
+  if fat >= 0 {
+    const fa = tyAt(fat)
+    const fsl = if fa is TyArray { rlSlotOfTy(fa.aElem) } else { -1 }
+    if fsl >= 0 && fsl < rlElemName.length { return fsl }
+  }
+  if identReadContainerAt(exprIx, fnIx) == RC_REF_LIST { return -2 }
+  const rdg = identReadsGlobal(exprIx)
+  if !rdg && declaredKind(exprIx) == "nulreflist" {
+    const sl18 = declaredSlotOf(exprIx)
+    if sl18 >= 0 {
+      const is18 = localStructIdx[sl18]
+      if is18 >= 0 && is18 < rlElemName.length { return is18 }
+    }
+  }
+  if (paramNulRefArray(fnIx, exprIx)) {
+    const pn18 = paramTypeNodeOfRead(fnIx, exprIx)
+    if annNulRefArrSlot(pn18) >= 0 { return -2 }
+  }
+  const pn = paramRefArrayName(fnIx, e.identName)
+  if pn != "" && paramReadAt(fnIx, exprIx) { return -2 }
+  const dsl = if rdg { -1 } else { declaredRefArraySlot(exprIx) }
+  if dsl >= 0 { return dsl }
+  const cn = capturedRefListSlot(fnIx, e.identName)
+  if cn >= 0 && cn < rlElemName.length { return cn }
+  const grl = globalLetOfRead(fnIx, exprIx)
+  if grl >= 0 {
+    if globalCellKind(grl) == "reflist" {
+      const grs = letRefListSlot(grl, -1)
+      if grs >= 0 && grs < rlElemName.length { return grs }
+    }
+    if letRefListElemName(grl, -1) != "" { return -2 }
+  }
+  const nrs = recordListSlotOfNode(exprIx, fnIx)
+  if nrs >= 0 && nrs < rlElemName.length { return nrs }
+  -1
 }
 
 // The ref-list ELEMENT type-NAME a ref-list `LetDecl` binds: from its `S[]`/`N[]`
