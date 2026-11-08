@@ -3,7 +3,12 @@
 // host arms it; armed, it counts each delivery by class, so the record can replace the sites'
 // own unions only where they agree (architecture-target-2026-10.md, step 5's record line). A
 // position the table serves counts its deliveries as `table` or a named floor, never graded.
-import { boxDstTyAt } from "./emit_capture_frames"
+import { atomSrcTyAt, boxDstTyAt } from "./emit_capture_frames"
+import { narrowedArmTyAt } from "./emit_local_scope"
+import { sHeapIdx, uBoxIdx, variantHeap } from "./emit_state"
+import { structIndexOfTy } from "./emit_atom_kinds"
+import { variantRowOfShapeTy } from "./emit_ty_canon"
+import { tyLitMemberTexts, tyToEmitName } from "./check_types"
 import {
   canonUnionKeyOfName,
   canonUnionKeyOfTy,
@@ -11,10 +16,11 @@ import {
 } from "./check_nj_join"
 import { canonUnionKeyTextOfTy } from "./check_inline_lit_union"
 import { splitUnionAtoms } from "./tyname"
-import { tyToEmitName } from "./check_types"
 import { nodeSrc } from "./symbols"
+import { i32ToStr } from "./ast"
 import { unwrapParen } from "./emit_base"
 import { elabInstTyAt } from "./emit_elab"
+import { tyNulLitUnionMemberTexts, tyPeelNul } from "./tyquery"
 import { tyHasTyVar } from "./tyquery"
 
 let bdsArmed = false
@@ -183,3 +189,124 @@ export function boxDstShadowRowAt(i: i32, j: i32) { bdsRowKey[i][j] }
 export function boxDstShadowRowN(i: i32) { bdsRowN[i] }
 
 export function boxDstShadowArmed(): boolean { bdsArmed }
+
+// A record read at `fnIx`, its type parameters closed by the instance.
+function bdsInst(r: i32, fnIx: i32): i32 {
+  if r < 0 || !tyHasTyVar(r) { return r }
+  const it = elabInstTyAt(r, fnIx)
+  if it >= 0 { it } else { r }
+}
+
+// Note an atom-to-string decode of `ix` against member texts `texts` the site derived, `nul` when
+// the site maps `-1` to null: graded against the literal set the checker recorded at the delivery.
+export function atomSrcShadowNote(
+  texts: string[],
+  nul: boolean,
+  ix: i32,
+  fnIx: i32,
+) {
+  if !bdsArmed { return 0 }
+  let r = atomSrcTyAt(ix, fnIx)
+  if r < 0 { r = atomSrcTyAt(unwrapParen(ix), fnIx) }
+  if r < 0 { r = atomSrcTyAt(nodeSrc[ix] ?? -1, fnIx) }
+  r = bdsInst(r, fnIx)
+  if bdsDrop == 1 { r = -1 }
+  let cls = "no record"
+  let rt: string[] = []
+  if r >= 0 {
+    const rn = tyNulLitUnionMemberTexts(r)
+    rt = if rn.length > 0 { rn } else { tyLitMemberTexts(r) }
+    if bdsDrop == 2 { rt = ["<drop>"] }
+    if rt.length == 0 {
+      cls = "record holds no member"
+    } else if bdsSameTexts(texts, rt) {
+      cls = if (rn.length > 0) == nul { "agree" } else { "agree up to null" }
+    } else if texts.length == 0 {
+      cls = "site has no member"
+    } else if bdsSubTexts(rt, texts) {
+      cls = "record narrower"
+    } else {
+      cls = "disagree"
+    }
+  }
+  let key = "atom " + cls
+  if bdsNamed {
+    key = key
+      + " | site "
+      + bdsJoin(texts, nul)
+      + " | record "
+      + bdsJoin(rt, r >= 0 && tyNulLitUnionMemberTexts(r).length > 0)
+  }
+  bdsCount(key)
+  0
+}
+
+// Note a narrowed-arm unbox of `ix` to heap `heap` the site derived: graded against the heap of the
+// arm the checker recorded for the narrowed read.
+export function armSrcShadowNote(heap: i32, ix: i32, fnIx: i32) {
+  if !bdsArmed { return 0 }
+  const a = bdsInst(narrowedArmTyAt(ix, fnIx), fnIx)
+  let rh = -1
+  if a >= 0 && bdsDrop != 1 { rh = bdsArmHeap(a) }
+  let cls = "disagree"
+  if heap < 0 { cls = "site has no heap" }
+  else if heap == uBoxIdx { cls = "site takes the box" }
+  else if a < 0 || bdsDrop == 1 { cls = "no record" }
+  else if rh < 0 { cls = "record has no heap" }
+  else if bdsDrop != 2 && rh == heap { cls = "agree" }
+  let key = "arm " + cls
+  if bdsNamed {
+    const an = if a >= 0 { tyToEmitName(a) } else { "-" }
+    key = key
+      + " | site "
+      + i32ToStr(heap)
+      + " | record "
+      + i32ToStr(rh)
+      + " "
+      + an
+  }
+  bdsCount(key)
+  0
+}
+
+// The heap a narrowed arm of type `a` is cast to: its variant row's, else its record's; -1 for none.
+function bdsArmHeap(a: i32): i32 {
+  const x = tyPeelNul(a)
+  const vi = variantRowOfShapeTy(x)
+  if vi >= 0 { return variantHeap(vi) }
+  const si = structIndexOfTy(x)
+  if si >= 0 && si < sHeapIdx.length { return sHeapIdx[si] }
+  -1
+}
+
+// Whether every text of `a` is one of `b`'s.
+function bdsSubTexts(a: string[], b: string[]): boolean {
+  for x in a {
+    let hit = false
+    for y in b {
+      if y == x { hit = true }
+    }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether `a` and `b` hold the same texts, in any order.
+function bdsSameTexts(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  for x in a {
+    let hit = false
+    for y in b {
+      if y == x { hit = true }
+    }
+    if !hit { return false }
+  }
+  true
+}
+
+function bdsJoin(xs: string[], nul: boolean): string {
+  let o = ""
+  for x in xs { o = if o == "" { x } else { o + "|" + x } }
+  if nul { o = o + "|null" }
+  o
+}

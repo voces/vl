@@ -27,8 +27,8 @@ X
 for f in wasmEmit.vl emit_sections.vl; do
   perl -i -pe '
     $fn = $1 if /^\s*(?:export )?function (\w+)/;
-    s/\b(emitUnionBoxArg|emitUnionCoerce|emitUnionBoxAtRecord|emitUnionBoxOwed)\(/$1P("$fn:$.", /g
-      unless /function emit(?:UnionBoxArg|UnionCoerce|UnionBoxAtRecord|UnionBoxOwed)\(/;' "$C/$f"
+    s/\b(emitUnionBoxArg|emitUnionCoerce|emitUnionBoxAtRecord|emitUnionBoxOwed|emitAtomToStr|emitNarrowedArmUnboxTo)\(/$1P("$fn:$.", /g
+      unless /function emit(?:UnionBoxArg|UnionCoerce|UnionBoxAtRecord|UnionBoxOwed|AtomToStr|NarrowedArmUnboxTo)\(/;' "$C/$f"
 done
 # A floor (`emitUnionBoxOwed` boxing at the site, the record owing no box) is tagged `floor@<pos>`;
 # its class names why (`boxFloorWhy`), and a table delivery's class is `table`.
@@ -47,8 +47,28 @@ export function ${h}P(pos: string, body: u8[], a: string, b: i32, c: i32, d: i32
 }
 X
 done
+# The read side: an atom-to-string decode and a narrowed-arm unbox, tagged the same way, graded by
+# `atomSrcShadowNote` / `armSrcShadowNote` against the source and arm records.
+cat >> "$W" <<X
+
+export function emitAtomToStrP(pos: string, body: u8[], a: i32, b: i32): i32 {
+  const o = bdsPosEnter(pos)
+  const r = emitAtomToStr(body, a, b)
+  bdsPosLeave(o)
+  r
+}
+
+function emitNarrowedArmUnboxToP(pos: string, h: i32, a: i32, b: i32): i32 {
+  const o = bdsPosEnter(pos)
+  const r = emitNarrowedArmUnboxTo(h, a, b)
+  bdsPosLeave(o)
+  r
+}
+X
 E="$C/emit_sections.vl"
 awk '!done && /^  emitUnionBoxOwed,$/ { print; print "  emitUnionBoxOwedP,"; done = 1; next } { print }' \
+  "$E" > "$E.t" && mv "$E.t" "$E"
+awk '!done && /^  emitAtomToStr,$/ { print; print "  emitAtomToStrP,"; done = 1; next } { print }' \
   "$E" > "$E.t" && mv "$E.t" "$E"
 need() { grep -qF -- "$2" "$C/$1" || { echo "probe.sh: anchor for \`$2\` not found in $1; re-anchor" >&2; exit 1; }; }
 need box_dst_shadow.vl 'elabShadowNote("bds '
@@ -58,6 +78,9 @@ need wasmEmit.vl 'emitUnionBoxArgP("'
 need wasmEmit.vl '  bdsPosEnter,'
 need wasmEmit.vl 'bdsPosLeave("floor@" + fo)'
 need emit_sections.vl '  emitUnionBoxOwedP,'
+need emit_sections.vl '  emitAtomToStrP,'
+need wasmEmit.vl 'emitNarrowedArmUnboxToP("'
+need wasmEmit.vl 'emitAtomToStrP("'
 need emit_sections.vl 'emitUnionBoxOwedP("'
 # --- overwrite history (appended to probe.sh) ---
 K="$C/check_elab_cap.vl"
