@@ -52,7 +52,7 @@ the sweep's 100-program chunks. All 13 new programs run: 9 `named/` cells and 4 
 
 ## Still refusing
 
-- [D15550](../inventory/D15550.md): `[mk(1)]` with the set called at a literal, `ref valtype with
+- [D15552](../inventory/D15552.md): `[mk(1)]` with the set called at a literal, `ref valtype with
   no interned shape`. The non-generic twin runs. The family is grouped by message and not yet
   ablated.
 - A third field `y: [x]` beside the set refuses (`object literal but no struct type declared`)

@@ -22,7 +22,7 @@ import {
   nodeTySetGrow,
 } from "./check_node_tys"
 import { cexLitPeel } from "./check_num_lits"
-import { nameIsSpaceFree, tyTopIndexOf } from "./tyname"
+import { tyTopIndexOf } from "./tyname"
 import {
   deadTailBlks,
   externValueSeen,
@@ -51,7 +51,6 @@ import {
   joinRowName,
   joinRowNext,
   joinRowRename,
-  lambdaCtxRetAdoptedAt,
   lambdaVoidAdoptedAt,
   voidCoerceValAt,
   voidCoerceValCount,
@@ -224,8 +223,6 @@ import {
   nodeIsTypeDecl,
   noteCallOrigin,
   plCacheBust,
-  tyIsStructListWithUnionField,
-  tyIsStructWithLitUnionField,
   tyIsStructWithUnionField,
   unwrapParen,
 } from "./emit_base"
@@ -262,19 +259,14 @@ import {
   readOfOpenBinding,
   structIndexOfExpr,
 } from "./emit_classify"
-import { nameIsWholeSpanShape } from "./emit_field_codes"
-import { fnRetJoinsWiderRecord, tyIsListUnion } from "./emit_join_records"
+import { tyIsListUnion } from "./emit_join_records"
 import { asgValueNode } from "./emit_local_scope"
 import { repTyHasArmShape, slotRowTyOf } from "./emit_rep"
 import { inferRetNulPinned, synthTypeRefTy } from "./emit_nullable_rets"
 import { externLinkTyAt } from "./check_program"
 import { exprReReadable } from "./emit_obj_lit_fits"
-import { shapeNominalOfTy, tyStructHasMapField } from "./emit_shape_rows"
-import {
-  drwFieldClosure,
-  listUnionEmitName,
-  shapeNominalOr,
-} from "./emit_sig_tokens"
+import { shapeNominalOfTy } from "./emit_shape_rows"
+import { drwFieldClosure, listUnionEmitName } from "./emit_sig_tokens"
 import { structFieldNameUsed } from "./emit_atom_kinds"
 import { eqgCoreAdd, eqgCoresReset, eqgRowIsCyclic } from "./emit_eq_rows"
 import { nliForgetLet } from "./emit_union_atoms"
@@ -308,18 +300,7 @@ import {
   tyIsFnArmUnion,
   tyStepRet,
 } from "./tyquery"
-import {
-  inferRetRungIsBoxedUnion,
-  inferRetRungIsLitUnionElemList,
-  inferRetRungIsMapElemList,
-  inferRetRungIsNestedElemUnionList,
-  inferRetRungIsNestedLeafList,
-  inferRetRungIsNulListRet,
-  inferRetRungIsNullable,
-  inferRetRungIsParenUnionElemList,
-  inferRetRungIsScalarListRet,
-  inferRetRungIsStructElemList,
-} from "./check_ret_names"
+import { inferRetRungIsParenUnionElemList } from "./check_ret_names"
 import {
   HD_FLD,
   nodeTyMapValExcludesNull,
@@ -3176,10 +3157,9 @@ export function assignValueSpill(stmts: i32[]) {
   0
 }
 
-// Pins every un-annotated lambda that returns a union to that union, consuming the
-// contextual return type the checker already computed. A body-inferred return for a
-// union join (`if … { aCat } else { aDog }`) collapses to one arm, so without the pin
-// the lambda's functype and `$fnsig` key disagree with the call site's, un-interning it.
+// Pins the un-annotated lambdas whose result a reader still takes from `fnRet`'s syntax: a
+// void-adopted lambda, an element-value-union list, a union-field struct and a literal union.
+// Every other lambda's readers take its own inferred-return row (`inferRetFnKey`).
 export function synthRetAnnots() {
   if !fnValUsed { return 0 }
   let fe = 0
@@ -3188,138 +3168,25 @@ export function synthRetAnnots() {
     const fn = nodeAt(lamIx)
     if fn is FuncDecl {
       if fn.fnRet < 0 {
-        // Void-context lambda (`lambdaVoidAdoptedAt`): checked against an expected
-        // `(…) => void` and adopted the void return, so `fnRet` pins to a synthesized
-        // `void` TypeRef and `fRetVoid` is set now, ahead of `buildFnMap#2`'s rebuild.
-        // Claimed first: a void-adopted lambda records no inferred-return row of its own.
+        // Checked against an expected `(…) => void`: `fRetVoid` is set now, ahead of
+        // `buildFnMap#2`'s rebuild, and a clone keeps the `void` result.
         if lambdaVoidAdoptedAt(lamIx) {
           fn.fnRet = synthTypeRefTy("void", -1, TY_VOID)
           if fe < fRetVoid.length { fRetVoid[fe] = 1 }
-          fe = fe + 1
-          continue
-        }
-        // A lambda returning a join of records wider than its tails takes the join (D2731), as
-        // a named function does, so its signature and its built value name one row.
-        const ljt = tyStepRet(nodeTyIxOf(lamIx))
-        if fnRetJoinsWiderRecord(lamIx, ljt) {
-          const ljn = tyToEmitName(ljt)
-          if ljn != "" {
-            fn.fnRet = synthTypeRefTy(ljn, -1, ljt)
-            fe = fe + 1
-            continue
-          }
-        }
-        const ctx = inferRetNameByNode(lamIx)
-        if ctx != "" {
+        } else {
+          const ctx = inferRetNameByNode(lamIx)
           const ctxTy = inferRetTyIxByNode(lamIx)
-          // The row lets this ladder ask which producer answered, instead of
-          // re-deriving the answer from the name that producer built.
-          const ctxRow = inferRetRowByNode(lamIx)
-          // Asked of the rung, not the name: a name test here depended on a later pass
-          // having already filled the union registry (`registerInlineUnion`), a
-          // cross-pass dependence asking the recording producer removes entirely — see
-          // `inferRetRungIsBoxedUnion` for which producers this rung covers.
-          if inferRetRungIsBoxedUnion(ctxRow) {
-            // A litunion-alias return (`(i32) => K = (x) => "b"`): pins `fnRet` to the
-            // alias so the lambda's `$fnsig` result keys the i32 atom matching the value
-            // call, and `emitReturnValue` encodes the member literal as its atom id.
+          // An element-value-union list (`(i64|string)[]`) seeds each element through the box
+          // list rep, a union-field struct (`{f: boolean | {w: i32}}`) boxes the field, and a
+          // literal-union result is the i32 atom; each reads the pin.
+          if (
+            ctx != ""
+            && (inferRetRungIsParenUnionElemList(inferRetRowByNode(lamIx))
+              || tyIsStructWithUnionField(ctxTy)
+              || tyIsLitUnion(ctxTy))
+          ) {
             fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if inferRetRungIsNullable(ctxRow) {
-            // A nullable-ref return (`P | null`, `string | null`) the checker proved at
-            // the lambda's boundary: pins so the `$fnsig` result keys the nullable token,
-            // matching the value call. A value union with a `null` member does not come
-            // here — that is `valueUnionRetName`'s, claimed by the union arm above.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-            // No separate map-member-union arm: it would pin the identical body the boxed-
-            // union arm above already reaches, and keeping it would silently mask a gap in
-            // that arm's rung set instead of surfacing an un-pinned row.
-          } else if inferRetRungIsNulListRet(ctxRow) {
-            // A nullable list at a distinct-backing element (`string[] | null`): pins as the
-            // named function's pin does, so the result declares the nullable wrapper (D2399).
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if inferRetRungIsParenUnionElemList(ctxRow) {
-            // An element-value-union list return (`(f64|null)[]`, `(i64|boolean)[]`): each
-            // element seeds through the value-union-box list rep (`refArrElemKind == 2`),
-            // whose box element `parenUnionArrElemName` extracts — the shape's distinguishing
-            // mark, and this rung's own gate.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if inferRetRungIsNestedElemUnionList(ctxRow) {
-            // A nested (2-D+) union-element array return (`(i64 | boolean)[][]`): pins so
-            // `emitReturnValue`'s `tyAnnRefListSlot` thread the outer
-            // ref-list slot into the body's nested literal. Un-pinned, the outer array
-            // self-classified `i32[][]` from its first leaf — invalid wasm.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if inferRetRungIsNestedLeafList(ctxRow) {
-            // A nested scalar/string-leaf array return (`() => i64[][]`): pins so the body
-            // literal builds under the return-position seed instead of self-classifying an
-            // i32 default, and the `$fnsig` result keys the same reflist slot the
-            // annotation side resolves — the two producers must byte-match.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if inferRetRungIsLitUnionElemList(ctxRow) {
-            // A litunion-alias-element array return (`(i32) => K0[] = (q0) => (["4664"])`):
-            // pins so the body's member literals build the i32 atom list under the
-            // annotated threading; un-pinned they self-classify a string list into the
-            // i32-list functype result — invalid wasm.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if inferRetRungIsMapElemList(ctxRow) {
-            // A map-element array return (`(i32) => {[string]: f32}[] = (q1) => ([h0])`):
-            // pins so the `$fnsig` result keys the same reflist slot the annotation side
-            // resolves. Un-pinned, the literal-side element spelling diverged and the
-            // value call found no interned signature.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if inferRetRungIsScalarListRet(ctxRow) {
-            // A distinct-backing scalar-leaf list return (`() => i64[] = () => ([5])`): the
-            // pin collects the leaf wrapper's list types, which the value-call index read
-            // requires; un-pinned it fails "list type not collected". Agrees with the
-            // litunion-alias arm above only by ladder position — reorder-sensitive.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if tyIsStructWithLitUnionField(ctxTy) {
-            // A struct-with-litunion-field return (`{f:K0}`): pins so the body literal
-            // builds the i32-atom struct and the `$fnsig` result keys the same struct every
-            // annotated consumer codes. Reached only where no annotation threads into the
-            // lambda; the direct-arg spelling already builds it via the param-annotation seed.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if tyIsStructListWithUnionField(ctxTy) {
-            // A union-field-struct-element list return (`{f:{f:f64}|boolean}[]`): pins so
-            // the body array literal builds boxed-field elements under the same reflist slot
-            // the annotated spelling resolves; un-pinned the self-inferred plain-element
-            // list stored a struct ref into the boxed field's tag slot — invalid wasm.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if inferRetRungIsStructElemList(ctxRow) {
-            // A plain-struct-element list return (`{a:i64,f:f64,z:{…}}[]`): pins, nominal-
-            // resolved, so element literals build under the annotated threading and the
-            // `$fnsig` keys the annotation side's ref-list slot. Un-pinned, a same-fieldset
-            // twin row fieldset-matched the wrong row and boxed the list — invalid wasm.
-            fn.fnRet = synthTypeRefTy(shapeNominalOr(ctxTy, ctx), -1, ctxTy)
-          } else if tyIsStructWithUnionField(ctxTy) {
-            // A struct-with-union/nullable-field return (`{f: boolean | {w: i32}}`): pins so
-            // the `$fnsig` result is the union-field struct and `emitReturnValue` coerces the
-            // body `ObjLit` into the boxed field slot. Un-pinned, the plain body-inferred
-            // struct made the value call mis-recover the boxed field — a mismatch or invalid wasm.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if tyStructHasMapField(ctxTy, 0) {
-            // A map-carrying struct return (`{a:string,f:{f:{[string]:{f:i64}}},z:f32}`):
-            // pins so the body `ObjLit`'s nested literals thread the annotation's per-field
-            // struct indices. Un-pinned, a nested literal resolved by first-field-name-set
-            // match onto the map's own value struct and minted a wrong-layout twin — invalid wasm.
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-            // Deliberately stays on the name rather than a rung test: a struct whose field
-            // is a literal union can render the same brace spelling at a different rung, so
-            // a rung test here would be narrower and could miss a row that needs this pin —
-            // narrowing a pin that exists to stop invalid wasm is the dangerous direction.
-          } else if nameIsWholeSpanShape(ctx) && nameIsSpaceFree(ctx) {
-            // A plain struct return recorded canonically (`structPlainRetName` — `{f:f32}`):
-            // pins, nominal-resolved, so the body literal builds under the annotated
-            // threading. Un-pinned, a same-fieldset twin row fieldset-matched the wrong row
-            // — invalid wasm. The space guard excludes a legacy spaced record's un-pinned route.
-            fn.fnRet = synthTypeRefTy(shapeNominalOr(ctxTy, ctx), -1, ctxTy)
           }
-        }
-        // A lambda the checker's general rung adopted onto its contextual result pins to
-        // it when no rung above did, so it builds as the annotated spelling builds.
-        if fn.fnRet < 0 && lambdaCtxRetAdoptedAt(lamIx) {
-          const cty = tyStepRet(nodeTyIxOf(lamIx))
-          if cty >= 0 { fn.fnRet = synthTypeRefOfTy(cty, -1) }
         }
       }
     }
