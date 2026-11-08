@@ -150,17 +150,18 @@ Deno.test({
   },
 });
 
-// A refusal raised while a hole parameter's instance is lowered (D15568, D15010's witness plus a
-// slot write of a second parameter, since D15529's push and D15567's own-parameter write run): the
-// instance's body is rebuilt into nodes minted after parsing, and the anchor is the line they were
-// rebuilt from, line 7 inside `take`, in the module that declares it (D15155, D15157). The same shapes with `use` generic.
-const INSTANCE_WITNESS = `function id<T>(x: T): T { x }
-function use(ys) { print(ys.length) }
-function take(a, b) {
-  const xs = [a]
-  xs[0] = b
-  use(xs)
-  print(xs[0]("abc").length + xs[0](2))
+// A refusal raised while a hole parameter's instance is lowered (D15569, a field read off a union
+// of records through an un-annotated parameter): the instance's body is rebuilt into nodes minted
+// after parsing, and the anchor is the line they were rebuilt from, line 7 inside `take`, in the
+// module that declares it (D15155, D15157). The last shape reaches the instance through a generic.
+const INSTANCE_WITNESS = `type K = { h: i32 }
+type J = { h: i32, z: i32 }
+const k: K = { h: 4 }
+const u: K | J = k
+function take(a) {
+  print(1)
+  const n = a.h
+  print(n)
 }
 `;
 
@@ -169,36 +170,33 @@ Deno.test({
     "vl-emit-diag-position: a refusal inside a parameter's instance names its body line, in its own module",
   ignore: !ENABLED,
   fn: async () => {
-    const generic = INSTANCE_WITNESS.replace(
-      "function use(ys)",
-      "function use<T>(ys: T[])",
-    );
     const shapes: { name: string; lib: string; main: string | null }[] = [
       {
         name: "one file",
-        lib: INSTANCE_WITNESS + "take(id, id)\n",
+        lib: INSTANCE_WITNESS + "take(u)\n",
         main: null,
       },
       {
         name: "a function after it",
         lib: INSTANCE_WITNESS +
-          "take(id, id)\nexport function one(): i32 { 1 }\n",
+          "take(u)\nexport function one(): i32 { 1 }\n",
         main: null,
       },
       {
         name: "a wrapper call",
-        lib: INSTANCE_WITNESS + "function run() { take(id, id) }\nrun()\n",
+        lib: INSTANCE_WITNESS + "function run() { take(u) }\nrun()\n",
         main: null,
       },
       {
         name: "imported, at the module's top level",
         lib: INSTANCE_WITNESS +
-          "take(id, id)\nexport function one(): i32 { 1 }\n",
+          "take(u)\nexport function one(): i32 { 1 }\n",
         main: 'import { one } from "./lib"\nprint(one())\n',
       },
       {
         name: "imported, a generic instance",
-        lib: generic + "export function run() { take(id, id) }\n",
+        lib: INSTANCE_WITNESS +
+          "function pass<T>(x: T): T { x }\nexport function run() { take(pass(u)) }\n",
         main: 'import { run } from "./lib"\nrun()\n',
       },
     ];
@@ -214,13 +212,13 @@ Deno.test({
         if (!r.out.includes("emit error")) {
           throw new Error(
             `${s.name}: the instance witness no longer reaches an emit refusal, so this guard ` +
-              `is measuring nothing — replace INSTANCE_WITNESS (D15568 closed?).\n${r.out}`,
+              `is measuring nothing — replace INSTANCE_WITNESS (D15569 closed?).\n${r.out}`,
           );
         }
         const blk = errorBlock(r.out);
         if (!/at \S*lib\.vl:7:\d+/.test(blk)) {
           throw new Error(
-            `${s.name}: want the anchor at lib.vl:7 (the refused read in \`take\`), got:\n${blk}`,
+            `${s.name}: want the anchor at lib.vl:7 (the refused field read in \`take\`), got:\n${blk}`,
           );
         }
       } finally {
@@ -234,7 +232,7 @@ Deno.test({
 // is anchored there, at the generic argument of `run(add)` on line 14 (D14843's witness, since a
 // generic `use<T>(ys: T[])` handed the list runs). The collect phase has no known check-clean refusal left (D15150, the last, now
 // runs); add the next one found here, anchored at its declaration. The instance case above is the
-// restore's control: `take(id, id)` is instantiated before `take`'s body refuses, and a cursor left
+// restore's control: `take(u)` is instantiated before `take`'s body refuses, and a cursor left
 // armed would name the call instead of `take`.
 const MONO_WITNESS = `function add(a, b) { return a + b }
 function mul(a, b) { return a * b }
