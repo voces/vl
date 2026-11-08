@@ -47,7 +47,7 @@ export function ${h}P(pos: string, body: u8[], a: string, b: i32, c: i32, d: i32
 X
 done
 E="$C/emit_sections.vl"
-awk '!done && /^  emitUnionBoxArg,$/ { print; print "  emitUnionBoxArgP,"; print "  emitUnionCoerceP,"; done = 1; next } { print }' \
+awk '!done && /^  emitUnionBoxOwed,$/ { print; print "  emitUnionBoxOwedP,"; done = 1; next } { print }' \
   "$E" > "$E.t" && mv "$E.t" "$E"
 need() { grep -qF -- "$2" "$C/$1" || { echo "probe.sh: anchor for \`$2\` not found in $1; re-anchor" >&2; exit 1; }; }
 need box_dst_shadow.vl 'elabShadowNote("bds '
@@ -56,8 +56,8 @@ need box_dst_shadow.vl 'import { elabShadowNote }'
 need wasmEmit.vl 'emitUnionBoxArgP("'
 need wasmEmit.vl '  bdsPosEnter,'
 need wasmEmit.vl 'bdsPosLeave("floor@" + fo)'
-need emit_sections.vl '  emitUnionBoxArgP,'
-need emit_sections.vl 'emitUnionCoerceP("'
+need emit_sections.vl '  emitUnionBoxOwedP,'
+need emit_sections.vl 'emitUnionBoxOwedP("'
 # --- overwrite history (appended to probe.sh) ---
 K="$C/check_elab_cap.vl"
 cat >> "$K" <<'Y'
