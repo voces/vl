@@ -54,3 +54,7 @@ builds keyed on both seeds.
 ## Proof
 
 - Fixpoint seed: 6,552,622 bytes against the base's 6,551,572 (+1,050, +0.016%).
+- `scripts/sweep.vl` diff, base fixpoint vs candidate fixpoint: 23,696 same, 0 bytes-only, 0 output
+  movers, 0 `runs → not-runs`, 0 new traps.
+- `scripts/gate.sh` on the tree merged with master `d64abc49` (fixpoint 6,555,194 bytes): 23 of 23
+  rows green. Seed size +2.5% of its +3% bar; export budget 0; pin-helper budget 927, unchanged.
