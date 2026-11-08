@@ -1167,37 +1167,49 @@ export function monoArgPinTyIx(ix: i32, fnIx: i32) {
   }
   const pt = monoCloPinTyOf(ax, fnIx)
   if pt >= 0 { return pt }
-  // The variant `monoArgTyNameRep` pinned an unadopted literal at banks that variant's type.
+  const rr = monoArgRowArmTy(ax)
+  if rr >= 0 { rr } else { own }
+}
+
+// The type argument `ix` is pinned at in frame `fnIx`: `null` or the row it is built at where the
+// pin names a row (`monoArgRowArmTy`), else its type (`elabNodeTyOrChecked`), else its open checked type.
+export function monoArgPinTyAt(ix: i32, fnIx: i32): i32 {
+  const ax = unwrapParen(ix)
+  if ax < 0 || ax >= P.nodes.length { return -1 }
+  if monoReadsUnfilledNull(ax) || monoParamPinnedNull(ax, fnIx) {
+    return TY_NULL
+  }
+  const rr = monoArgRowArmTy(ax)
+  if rr >= 0 { return rr }
+  const t = elabNodeTyOrChecked(ax, fnIx)
+  if t >= 0 { t } else { nodeTyIxOf(ax) }
+}
+
+// The row a literal or copy argument `ax` is built at where that is not its type: the variant pinned
+// for an unadopted literal, the record the record solve built a list or record literal at
+// (D15181), or a record copy's; -1.
+function monoArgRowArmTy(ax: i32): i32 {
+  if ax < 0 || ax >= P.nodes.length { return -1 }
   const ov = litRetArmRow(ax)
   if ov >= 0 && ov < uVarTyIx.length { return uVarTyIx[ov] }
-  // A literal the record solve built at another record banks that build, as its pin names it.
-  const lb = monoLitBuiltTy(ax)
-  if lb >= 0 { return lb }
+  const n = nodeAt(ax)
+  const brt = if n is ArrayLit || n is ObjLit { nodeRepTyIxOf(ax) } else { 0 - 1 }
+  if (
+    brt >= 0
+    && brt < T.tys.length
+    && !tySame(brt, nodeTyIxOf(ax))
+    && tyHoldsObj(brt, 8)
+  ) {
+    return brt
+  }
   const rr = elabArgBuiltRep(ax, elabWalkTop())
   if rr >= 0 { return rr }
   const cpy = recCopyTyOf(ax)
   if cpy >= 0 && cpy < T.tys.length && monoRecordNominalPin(cpy) != "" {
-    return cpy
+    cpy
+  } else {
+    -1
   }
-  own
-}
-
-// The record the record solve built list or record literal `ax` at, where that is not its own
-// type, or -1 (D15181).
-export function monoLitBuiltTy(ax: i32): i32 {
-  if ax < 0 || ax >= P.nodes.length { return -1 }
-  const n = nodeAt(ax)
-  if !(n is ArrayLit || n is ObjLit) { return -1 }
-  const brt = nodeRepTyIxOf(ax)
-  if (
-    brt < 0
-    || brt >= T.tys.length
-    || tySame(brt, nodeTyIxOf(ax))
-    || !tyHoldsObj(brt, 8)
-  ) {
-    return -1
-  }
-  brt
 }
 
 // True when the spelling `narrow` is a top-level member of the union or nullable spelling
@@ -2331,7 +2343,7 @@ export function monoArgClosedPinTy(ix: i32, fnIx: i32): i32[] {
   const none: i32[] = [0 - 1, 0]
   const cax = unwrapParen(ix)
   if cax < 0 || cax >= P.nodes.length { return none }
-  let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyIx(cax, fnIx))
+  let t = monoArgClosedTyIn(cax, fnIx, monoArgPinTyAt(cax, fnIx))
   if t < 0 { t = elabArgBuiltTy(cax) }
   if t < 0 || t >= T.tys.length { return none }
   // A record is handed as the reference it is stored as: a narrowed record read takes the type its
@@ -20642,13 +20654,6 @@ function monoOpenArgDefaultPin(name: string, ax: i32, ctx: i32): string {
   if cn == "" { name } else { cn }
 }
 
-// Whether an argument is a list by its type: `closedTy` where `monoArgClosedTyIn` closed it, else
-// the shape of its open pin type `openTy` (an empty `[]` stays `T[]` at every instance).
-function monoTyIsArrayShaped(closedTy: i32, openTy: i32): boolean {
-  const t = if closedTy >= 0 { closedTy } else { openTy }
-  t >= 0 && t < T.tys.length && tyAt(t) is TyArray
-}
-
 // `monoInstantiateCall`'s pin for the annotated parameter `p`, the `i`th of `fn`'s, given
 // argument `args[i]`: binds the annotation's type parameters into `tvN`/`tvV`, pushes the pin onto
 // `pinned`, the argument's type onto `pinTys` and the pin's own type onto `pinOwn`. `decl` is the
@@ -20737,7 +20742,7 @@ function monoPinAnnotatedParam(
         pinOwn.push(ar)
       } else {
         pinned.push(ann)
-        pinTys.push(monoArgPinTyIx(args[i], ctx))
+        pinTys.push(monoArgPinTyAt(args[i], ctx))
         pinOwn.push(nodeTyIxOf(p.parType))
       }
     }
@@ -20837,7 +20842,7 @@ function monoPinAnnotatedParam(
       an2 = monoElabPin(callIx, args, i, eft, ctx)
       if an2 != "" { an2Ty = eft }
     }
-    if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
+    if an2Ty < 0 { an2Ty = monoArgPinTyAt(args[i], ctx) }
     if ann == tp {
       const od = monoOpenArgDefaultPin(an2, args[i], ctx)
       if od != an2 { an2Own[0] = -1 }
@@ -20860,7 +20865,9 @@ function monoPinAnnotatedParam(
     if ann != tp {
       // `T[]` param: the argument is a list by its type and its UNGROUPED element binds `T`,
       // regrouped by `arrElemSuffixed` (D1896); an empty `[]` (its literal default) stays open too.
-      if !monoTyIsArrayShaped(bindTy, an2Ty) {
+      // A list by its closed type, else by its open pin type's shape (an empty `[]` stays `T[]`).
+      const lt = if bindTy >= 0 { bindTy } else { an2Ty }
+      if lt < 0 || lt >= T.tys.length || !(tyAt(lt) is TyArray) {
         return emitFail(
           "emitProgram: monomorphize: expected an array argument for `"
             + p.parName
@@ -20894,7 +20901,7 @@ function monoPinAnnotatedParam(
     }
     if ann != tp {
       pinned.push(arrElemSuffixed(bind))
-      pinTys.push(monoArgPinTyIx(args[i], ctx))
+      pinTys.push(monoArgPinTyAt(args[i], ctx))
       const lpat = monoParamPatTy(
         params,
         i,

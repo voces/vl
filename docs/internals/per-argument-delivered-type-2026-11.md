@@ -22,7 +22,7 @@ argument is delivered as `i32`. The 1,332 elab-wider calls in the survey are thi
    where the caller is not generic and that type is closed;
 2. then that type's rep where the rep column built the value elsewhere. Today these are separate
    mono rungs:
-   - a literal the record solve built (`monoLitBuiltTy`);
+   - a literal the record solve built (`monoArgRowArmTy`);
    - a call copied back (`recCopyTyOf`, and since #6242 the call's stamp `nodeRepStamped`);
    - an adopted variant (`litRetArmRow`);
    - the closure-pin annotation (`monoCloPinAnnNodeOfExpr`).
