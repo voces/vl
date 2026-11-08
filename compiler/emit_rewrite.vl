@@ -40,7 +40,12 @@ import {
   recordNodeTyFrom,
 } from "./check_leaf_steps"
 import { annUnionAtomsOf, primTyIxOfName } from "./check_decl_scan"
-import { recordRepTyAdopt } from "./check_fit_rules"
+import {
+  numCastStamp,
+  numDeliverStamp,
+  numSlotStamp,
+  recordRepTyAdopt,
+} from "./check_fit_rules"
 import {
   joinHeadOf,
   joinRowDecl,
@@ -455,6 +460,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
     if prim != null {
       if prim == "f64" || prim == "f32" { init = mkNumTyped("0.0", pos, cty) }
       if prim == "i64" { init = mkNumTyped("0", pos, cty) }
+      if init >= 0 { numDeliverStamp(init, cty, cty) }
     }
     if init < 0 && fns.length == 0 {
       const sr = lvOpenFnSeedRead(x, ty)
@@ -1270,6 +1276,8 @@ function nssRewrite(
   valueIfAdd(def)
   const co = mkBinary("??", d.letInit, def, pos)
   nodeTyRecord(co, s)
+  // Each value the rewrite mints is delivered at `S`, the binding's own width.
+  for v in [missSt[1], otherSt[0], def, co] { numDeliverStamp(v, s, s) }
   const nvDecl = mkLet("const", nv, synthTypeRefOfTy(s, pos), co, pos)
   nodeTyRecord(nvDecl, s)
   const old = b.blkStmts
@@ -1305,6 +1313,7 @@ function nssRewrite(
       const cv = mkIdent(nv, -1)
       identFromDecl(cv, nvDecl)
       nodeTyRecord(cv, s)
+      numDeliverStamp(cv, s, ty)
       const thenSt: i32[] = [cv]
       const thenB = mkBlock(thenSt, -1)
       nodeTyRecord(thenB, ty)
@@ -1679,6 +1688,23 @@ function drwOptGuard(
 // the block's value.
 let drwAtStmt = false
 
+// A direct call of operator declaration `d` on `args`, each argument's numeric pair recorded at
+// the parameter it is delivered to.
+function drwOpDeclCall(d: i32, args: i32[]): i32 {
+  const fn = nodeAt(d)
+  if fn is FuncDecl {
+    let i = 0
+    while i < args.length && i < fn.fnParams.length {
+      const pp = nodeAt(fn.fnParams[i])
+      if pp is Param {
+        numSlotStamp(args[i], nodeTyIxOf(args[i]), nodeTyIxOf(pp.parType))
+      }
+      i = i + 1
+    }
+  }
+  mkCall(drwDeclRef(d), args, -1)
+}
+
 // A user operator's call `call`, standing for the operator expression `opIx`: it carries the
 // checked type, so a reader of the rewritten node (a walk's element, a print) sees the result.
 function drwOpCall(call: i32, opIx: i32): i32 {
@@ -1785,7 +1811,7 @@ function drwWalkIndex(ix: i32, n: Index, ctx: i32): i32 {
     const roargs: i32[] = []
     roargs.push(n.idxArr)
     roargs.push(n.idxIndex)
-    return drwOpCall(mkCall(drwDeclRef(rOp), roargs, -1), ix)
+    return drwOpCall(drwOpDeclCall(rOp, roargs), ix)
   }
   // The index read trap: a struct receiver carrying a "[]" closure field.
   if drwRecvFieldIsFn(n.idxArr, "[]") {
@@ -2099,7 +2125,7 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
         woargs.push(tgt.idxArr)
         woargs.push(tgt.idxIndex)
         woargs.push(n.binRight)
-        return drwOpCall(mkCall(drwDeclRef(wOp), woargs, -1), ix)
+        return drwOpCall(drwOpDeclCall(wOp, woargs), ix)
       }
       if drwRecvFieldIsFn(tgt.idxArr, "[]=") {
         const wargs: i32[] = []
@@ -2232,7 +2258,7 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
       const oargs: i32[] = []
       oargs.push(n.binLeft)
       oargs.push(n.binRight)
-      return drwOpCall(mkCall(drwDeclRef(opFn), oargs, -1), ix)
+      return drwOpCall(drwOpDeclCall(opFn, oargs), ix)
     }
     if drwRecvFieldIsFn(n.binLeft, n.binOp) {
       const fargs: i32[] = []
@@ -2562,7 +2588,9 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
     if rv >= 0 && nodeTyIxOf(asgIx) >= 0 {
       const rn = nodeAt(rv)
       if rn is NumLit {
-        return mkNumTyped(rn.numText, rn.pos, nodeTyIxOf(asgIx))
+        const yn = mkNumTyped(rn.numText, rn.pos, nodeTyIxOf(asgIx))
+        rwNumOwn(yn)
+        return yn
       }
     }
     const val = spillLocal(a.binRight, asgIx, "v", out, a.pos)
@@ -3737,6 +3765,7 @@ function cboxYieldTail(blockIx: i32, boxed: i32[]) {
   const lit = cboxLitCopy(tn.binRight)
   if lit >= 0 {
     nodeTyRecord(lit, valTy)
+    rwNumOwn(lit)
     st.push(lit)
     plCacheBust()
     return 0
@@ -3753,10 +3782,12 @@ function cboxYieldTail(blockIx: i32, boxed: i32[]) {
   const store = mkIdent(tname, -1)
   identFromDecl(store, tlet)
   nodeTyRecord(store, heldTy)
+  numDeliverStamp(store, heldTy, elemTy)
   tn.binRight = store
   const yielded = mkIdent(tname, -1)
   identFromDecl(yielded, tlet)
   nodeTyRecord(yielded, heldTy)
+  numDeliverStamp(yielded, heldTy, valTy)
   st[st.length - 1] = tlet
   st.push(tx)
   st.push(cboxYieldAs(yielded, heldTy, valTy))
@@ -3774,12 +3805,22 @@ function cboxYieldAs(rd: i32, heldTy: i32, valTy: i32): i32 {
   if held == "f64" {
     wide = mkAsExpr(rd, "i64", "trap", -1)
     nodeTyRecord(wide, TY_I64)
+    numCastStamp(rd, TY_I64, false, false)
   } else if held != "i64" {
     return rd
   }
   const w = mkAsExpr(wide, "i32", "wrap", -1)
   nodeTyRecord(w, valTy)
+  numCastStamp(wide, valTy, true, false)
   w
+}
+
+// Records the identity numeric pair of minted node `ix` at its own recorded type, where that is a
+// wide number: a value the rewrite builds at the width it delivers. Returns 0.
+function rwNumOwn(ix: i32): i32 {
+  const t = nodeTyIxOf(ix)
+  numDeliverStamp(ix, t, t)
+  0
 }
 
 // A fresh copy of the literal at `ix` (string, number, char, boolean), or -1 for any other node.
@@ -5194,6 +5235,8 @@ function synthExternValueFn(name: string, k: i32, pos: i32) {
   identFromDecl(host, IDENT_BUILTIN)
   const call = mkCall(host, args, pos)
   recordNodeTyFrom(call, rty)
+  // The call is the body's value, returned at the extern's own result type.
+  numDeliverStamp(call, rt, rt)
   const fe = mkFunc(
     name + "$extv",
     noTyParams,
