@@ -11,7 +11,9 @@ Follows [held generics keyed](2026-11-08-call-key-held-generics-landed.md) (#681
   literal, with no template call), so its first request found no key and the build fell back to
   mono's spelling. A later typed request reached the same instance as `typedhit value agree`. The
   member's key is now also noted on each value the write scan places at the callee's slot
-  (`elabCalleeStoredValues`, `cwSlotWrittenValues`), at the root only.
+  (`elabCalleeStoredValues`, `cwSlotWrittenValues`), at the root only, for a field or element read of
+  a `let`, and only when some generic or hole function is read as a value. Without that gate
+  `scaling shape`'s record-parameter axis read 40x (bar 5.1): a parameter's slot asks every caller.
 - **A call through a closed function type gets rows.** `v.fs[0](3)` with
   `const v: { fs: ((x: i32) => i32)[] } = r` has a callee type that is already closed, so the
   checker files no call-bind row and the elaboration never ran `elabSetCallRows` for it
@@ -21,26 +23,26 @@ Follows [held generics keyed](2026-11-08-call-key-held-generics-landed.md) (#681
 ## The `ckey` classes, before and after
 
 Population: the 23,670 programs of `scripts/sweep.vl -- list`, `scripts/id-shadow/run.sh
---rows`. Before is #6813 merged onto master `28406f9c`, after is this tree. Both are fixpoint
+--rows`. Before is #6813 merged onto master `dfc71a0a`, after is this tree. Both are fixpoint
 seeds. The counts are instance builds.
 
 | class | before | after |
 |---|---|---|
 | keyed `call` (agree / refines / differ-bind) | 15,574 / 183 / 6 | 15,574 / 183 / 6 |
-| keyed `value` (agree / refines / differ-bind) | 8,622 / 12 / 1 | **8,664** / 12 / 1 |
+| keyed `value` (agree / refines / differ-bind) | 8,622 / 12 / 1 | **8,661** / 12 / 1 |
 | keyed `lam` (agree) | 50 | 50 |
 | declined `hole` | 1 | 1 |
-| no key, `spelled` (hole-none / hole-mono) | 299 / 259 | **289 / 227** |
+| no key, `spelled` (hole-none / hole-mono) | 299 / 259 | **289 / 230** |
 | no key, `lam` | 90 | 90 |
 | `monoBindSeededTyParams` (agree / differ) | 25 / 3 | 25 / 3 |
 | instances (summed `insts` rows) | 25,257 | 25,257 |
 
-All 42 builds that left `spelled` are now `value agree`.
+All 39 builds that left `spelled` are now `value agree`.
 
 ## What is left in `spelled`, by where mono builds it
 
 Read with a temporary row printing mono's template call and walk top beside each `spelled` build,
-on the 392 programs that carry one (the counts after this change; the five largest buckets, 514 of 516):
+on the 392 programs that carry one (an ungated build of this change, 516 left; the five largest buckets, 514 of them):
 
 | bucket | builds | shape |
 |---|---|---|
@@ -52,7 +54,7 @@ on the 392 programs that carry one (the counts after this change; the five large
 
 ## Proof
 
-- Fixpoint seed: 6,523,211 bytes, against the base's 6,521,831 (+1,380, +0.021%).
+- Fixpoint seed: 6,526,937 bytes, against the base's 6,525,260 (+1,677, +0.026%).
 - `scripts/sweep.vl` diff, base fixpoint vs candidate fixpoint: 23,670 same, 0 bytes-only, 0
   output movers, 0 `runs → not-runs`, 0 new traps. The change moves keys only.
 - `scripts/gate.sh`: GATE.
