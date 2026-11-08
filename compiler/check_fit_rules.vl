@@ -595,6 +595,7 @@ import { nodeLastTok } from "./fmt_util"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import { nameIsBareIdent, nameIsQuotedLeaf } from "./tyname"
 import {
+  arrElemValueTy,
   flattenVariantsInto,
   isNullTy,
   nonNulTyOf,
@@ -7568,7 +7569,17 @@ export function atomSrcStamp(ix: i32): i32 {
   if nodeAtomSrcHeld.has(ix) { return 0 }
   let src = if live { elabCapTy[ix] ?? nodeTyIxOf(ix) } else { nodeTyIxOf(ix) }
   if !tyIsAtomSet(src) { src = constLitSetReadTy(ix) }
+  if !tyIsAtomSet(src) { src = asgValueSetTy(ix) }
   atomSrcStampAs(ix, src)
+}
+
+// The set an assignment `ix` yields when its target holds a literal set, whatever its right side
+// reads as; -1 for any other node.
+function asgValueSetTy(ix: i32): i32 {
+  const e = nodeAt(ix)
+  if !(e is BinExpr) || e.binOp != "=" { return -1 }
+  const t = if elabCapLive() { elabCapTy[e.binLeft] ?? nodeTyIxOf(e.binLeft) } else { nodeTyIxOf(e.binLeft) }
+  if tyIsAtomSet(t) { t } else { -1 }
 }
 
 // Records a `??`'s left operand `ix` as decoding the set `t` its hit holds, and holds that record
@@ -7632,8 +7643,8 @@ function numPairStamp(ix: i32, t: i32): i32 {
   const has = if live { elabCapNumPair.has(ix) } else { nodeNumPair.has(ix) }
   const dk = numKindOfTy(t)
   if dk < 3 || dk > 5 {
-    // A wide number boxed into a union that holds it is boxed as itself.
-    const uk = numUnionIdentityOf(
+    // A number boxed into a union is boxed at the arm that holds it (`numUnionPairOf`).
+    const uk = numUnionPairOf(
       if live { elabCapTy[ix] ?? nodeTyIxOf(ix) } else { nodeTyIxOf(ix) },
       t,
     )
@@ -7660,7 +7671,13 @@ function numPairStamp(ix: i32, t: i32): i32 {
 // The scalar type operand `ix` is checked at, a literal or literal union peeled to its base: the
 // instance's where an elaboration re-checks it, else the program's; -1 where it has none.
 export function numOperandTy(ix: i32): i32 {
-  const t = if elabCapLive() { elabCapTy[ix] ?? nodeTyIxOf(ix) } else { nodeTyIxOf(ix) }
+  numScalarTyOf(
+    if elabCapLive() { elabCapTy[ix] ?? nodeTyIxOf(ix) } else { nodeTyIxOf(ix) },
+  )
+}
+
+// Type `t`, a literal or literal union peeled to its scalar base; -1 for a hole.
+function numScalarTyOf(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return -1 }
   const p = tyScalarBasePrim(t)
   if p == null { return t }
@@ -7675,22 +7692,45 @@ export function numOperandTy(ix: i32): i32 {
 // number and the operand's own type is a number. An operand is delivered at no position and has no
 // ctx record, so its one-kind pair is stored too.
 export function numOperandStamp(ix: i32, dt: i32): i32 {
+  numOperandStampAs(ix, numOperandTy(ix), dt)
+}
+
+// `numOperandStamp` for operand `ix` of scalar type `st`.
+function numOperandStampAs(ix: i32, st: i32, dt: i32): i32 {
   const dk = numKindOfTy(dt)
   if dk < 3 || dk > 5 { return 0 }
-  const sk = numKindOfTy(numOperandTy(ix))
+  const sk = numKindOfTy(st)
   if sk == 0 { return 0 }
   numCodeStamp(ix, sk * 8 + dk)
+}
+
+// `numOperandTy` of operand `ix`, or, for an element read its open list leaves untyped, the element
+// the list is pinned to by now; -1 where neither is known.
+function numOperandTyOrRow(ix: i32): i32 {
+  const t = numOperandTy(ix)
+  if t >= 0 || elabCapLive() { return t }
+  const p = parenPeelIx(ix)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const e = nodeAt(p)
+  if !(e is Index) { return -1 }
+  const at = nodeTyIxOf(e.idxArr)
+  if at < 0 || at >= T.tys.length { return -1 }
+  const a = tyAt(at)
+  if a is TyArray {
+    if a.aElem >= 0 { return arrElemValueTy(a.aElem) }
+  }
+  -1
 }
 
 // Records both operands' numeric pairs of the binary `n` at its pair rule's operand type, where
 // each operand's own type is a number. Returns 0.
 export function binOperandsStamp(n: BinExpr): i32 {
-  const olt = numOperandTy(n.binLeft)
-  const ort = numOperandTy(n.binRight)
+  const olt = numOperandTyOrRow(n.binLeft)
+  const ort = numOperandTyOrRow(n.binRight)
   if olt < 0 || ort < 0 { return 0 }
   const ot = numPairOpTy(n, olt, ort)
-  numOperandStamp(n.binLeft, ot)
-  numOperandStamp(n.binRight, ot)
+  numOperandStampAs(n.binLeft, olt, ot)
+  numOperandStampAs(n.binRight, ort, ot)
   0
 }
 
@@ -7714,20 +7754,50 @@ export function numCastStamp(
   numCodeStamp(ix, sk * 8 + dk)
 }
 
-// The identity pair of a value of type `src` boxed into union `t`, where `src` is a wide number
-// (`i64`, `f64`, `f32`) and `t` a union or nullable with that member; else 0.
-function numUnionIdentityOf(src: i32, t: i32): i32 {
-  const sk = numKindOfTy(src)
-  if sk < 3 || sk > 5 || t < 0 || t >= T.tys.length { return 0 }
-  const n = tyAt(t)
-  if n is TyNullable {
-    return if numKindOfTy(n.nInner) == sk { sk * 9 } else { 0 }
+// The pair a number of type `src` is boxed at into union `t`: its own kind where `t` holds it (an
+// alias member's included), else the union's promotion, an integer to `i64`, `f64` then `f32` and
+// a float to the other float; 0 where nothing wide is boxed.
+function numUnionPairOf(src: i32, t: i32): i32 {
+  const sk = numBaseKindOfTy(src)
+  if sk == 0 || sk == 6 || !tyIsUnionDst(t) { return 0 }
+  const ms: i32[] = []
+  flattenVariantsInto(t, ms)
+  let has = 0
+  for m in ms {
+    const mk = numBaseKindOfTy(m)
+    if mk > 0 && mk < 6 { has = has | (1 << mk) }
   }
-  if !(n is TyUnion) { return 0 }
-  for m in n.uMembers {
-    if numKindOfTy(m) == sk { return sk * 9 }
+  const own = if sk == 2 { 1 } else { sk }
+  if (has & (1 << own)) != 0 || (sk == 2 && (has & 4) != 0) {
+    return if sk >= 3 { sk * 9 } else { 0 }
   }
-  0
+  let dk = 0
+  if sk <= 3 {
+    if sk < 3 && (has & 8) != 0 { dk = 3 }
+    else if (has & 16) != 0 { dk = 4 }
+    else if (has & 32) != 0 { dk = 5 }
+  } else if sk == 4 && (has & 32) != 0 {
+    dk = 5
+  } else if sk == 5 && (has & 16) != 0 {
+    dk = 4
+  }
+  if dk == 0 { 0 } else { sk * 8 + dk }
+}
+
+// Records the numeric pair node `ix` is boxed at when it holds a value of type `hit` entering union
+// `t`: a `??`'s left operand on a hit, or a `?.` read's minted non-null part. Outside an instance,
+// only the final check's. Returns 1 where recorded.
+export function numBoxedStamp(ix: i32, hit: i32, t: i32): i32 {
+  if ix < 0 || (inferQuiet && !elabCapLive()) { return 0 }
+  const code = numUnionPairOf(hit, t)
+  if code <= 0 { return 0 }
+  numCodeStamp(ix, code)
+}
+
+// `numKindOfTy` of `t`, a literal or a union of literals over one base read as that base.
+function numBaseKindOfTy(t: i32): i32 {
+  const k = numKindOfTy(t)
+  if k != 0 { k } else { numKindOfTy(numScalarTyOf(t)) }
 }
 
 // Records node `ix`'s numeric pair from type `src` to `dst`, where `dst` is a wide number and
@@ -7827,6 +7897,7 @@ function boxExitsStamp(ix: i32, t: i32): i32 {
     const x = todo.pop() ?? -1
     if x < 0 { continue }
     boxTyStamp(x, t)
+    numBoxStamp(x, t)
     for y in lpExitsOf(x) { todo.push(y) }
     const spine: i32[] = []
     const leaves: i32[] = []
@@ -7839,6 +7910,15 @@ function boxExitsStamp(ix: i32, t: i32): i32 {
     }
   }
   0
+}
+
+// Records the numeric pair a number `ix` is boxed at into union `t` (`numUnionPairOf`), the
+// instance's where an elaboration re-checks it. Returns 1 where recorded.
+function numBoxStamp(ix: i32, t: i32): i32 {
+  const src = if elabCapLive() { elabCapTy[ix] ?? nodeTyIxOf(ix) } else { nodeTyIxOf(ix) }
+  const code = numUnionPairOf(src, t)
+  if code <= 0 { return 0 }
+  numCodeStamp(ix, code)
 }
 
 // Whether `t` is a union or a nullable type: a destination a value may be boxed into.
