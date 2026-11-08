@@ -18,6 +18,7 @@ import { callBindTyOf } from "./check_bind_rows"
 import { cwFieldNameOf } from "./check_write_scan"
 import { holeLinkSiteSet } from "./check_hole_links"
 import { decDigitsOf } from "./strutil"
+import { identDeclOf } from "./symbols"
 import {
   ArrayLit,
   AsExpr,
@@ -102,6 +103,7 @@ import {
   listCopyTyIx,
   litRetUnionIx,
   mapUnboxTyIx,
+  nodeAtomSrcHeld,
   nodeAtomSrcTyIx,
   nodeBoxJoin,
   nodeBoxTyIx,
@@ -183,6 +185,7 @@ import {
 import { cTyIxSetAdd } from "./check_inline_lit_union"
 import {
   LIT_MEET_NONE,
+  constBindsLitSet,
   containerCopyGapWhy,
   ctorExprOf,
   f32JoinRetypesRunning,
@@ -257,6 +260,7 @@ import {
   floatLitTails,
   litTreeAdoptDst,
   numLitAdoptDst,
+  numPairOpTy,
   valueJoinAt,
   valueTailLeaves,
   valueTailSplit,
@@ -7561,15 +7565,48 @@ function ctxTyStampOne(ix: i32, t: i32): i32 {
 // type where an elaboration re-checks it, else the program's. The final check's write stands.
 export function atomSrcStamp(ix: i32): i32 {
   const live = elabCapLive()
-  const src = if live { elabCapTy[ix] ?? nodeTyIxOf(ix) } else { nodeTyIxOf(ix) }
+  if nodeAtomSrcHeld.has(ix) { return 0 }
+  let src = if live { elabCapTy[ix] ?? nodeTyIxOf(ix) } else { nodeTyIxOf(ix) }
+  if !tyIsAtomSet(src) { src = constLitSetReadTy(ix) }
+  atomSrcStampAs(ix, src)
+}
+
+// Records a `??`'s left operand `ix` as decoding the set `t` its hit holds, and holds that record
+// against a later delivery's restamp at the operand's own nullable type. Returns 1 where recorded.
+export function atomHitStamp(ix: i32, t: i32): i32 {
+  if (inferQuiet && !elabCapLive()) || atomSrcStampAs(ix, t) == 0 { return 0 }
+  nodeAtomSrcHeld[ix] = true
+  1
+}
+
+// `atomSrcStamp` at the given type `src`, for a node the checker mints but never types.
+export function atomSrcStampAs(ix: i32, src: i32): i32 {
   if !tyIsAtomSet(src) { return 0 }
-  if live {
+  if elabCapLive() {
     elabCapAtomSrc[ix] = src
     return 1
   }
   while nodeAtomSrcTyIx.length <= ix { nodeAtomSrcTyIx.push(-1) }
   nodeAtomSrcTyIx[ix] = src
   1
+}
+
+// `atomSrcStamp` for a read that decodes to a string where it stands rather than at a delivery: an
+// operand, a template hole, a `.length` receiver. Outside an instance, only the final check's.
+export function atomReadStamp(ix: i32): i32 {
+  if inferQuiet && !elabCapLive() { return 0 }
+  atomSrcStamp(ix)
+}
+
+// The set a read of an un-annotated `const` bound to a join of literal consts holds, which the
+// read's own type widens to `string` (`constBindsLitSet`); -1 for any other node.
+function constLitSetReadTy(ix: i32): i32 {
+  const e = nodeAt(ix)
+  if !(e is Ident) { return -1 }
+  const d = identDeclOf(ix)
+  if d < 0 || d >= P.nodes.length || !constBindsLitSet(d) { return -1 }
+  const dn = nodeAt(d)
+  if dn is LetDecl { nodeCtxTyIxOf(dn.letInit) } else { -1 }
 }
 
 // The numeric kind of type `t`: 1 `i32`, 2 `u8`, 3 `i64`, 4 `f64`, 5 `f32`, 6 a union of numbers,
@@ -7643,6 +7680,18 @@ export function numOperandStamp(ix: i32, dt: i32): i32 {
   const sk = numKindOfTy(numOperandTy(ix))
   if sk == 0 { return 0 }
   numCodeStamp(ix, sk * 8 + dk)
+}
+
+// Records both operands' numeric pairs of the binary `n` at its pair rule's operand type, where
+// each operand's own type is a number. Returns 0.
+export function binOperandsStamp(n: BinExpr): i32 {
+  const olt = numOperandTy(n.binLeft)
+  const ort = numOperandTy(n.binRight)
+  if olt < 0 || ort < 0 { return 0 }
+  const ot = numPairOpTy(n, olt, ort)
+  numOperandStamp(n.binLeft, ot)
+  numOperandStamp(n.binRight, ot)
+  0
 }
 
 // Records cast operand `ix`'s numeric pair at the kind the cast to `tt` stages it in: `as%` at

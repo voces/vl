@@ -15,6 +15,7 @@ import {
   Index,
   IsExpr,
   Member,
+  NullLit,
   OP_INDEX_GET,
   OP_INDEX_SET,
   ObjLit,
@@ -132,7 +133,9 @@ import {
 import { seedExpected } from "./check_expected"
 import {
   adoptLitAt,
-  atomSrcStamp,
+  atomHitStamp,
+  atomReadStamp,
+  binOperandsStamp,
   coalJoinApart,
   constLitNeverMeets,
   constrainEmptyExpr,
@@ -142,8 +145,6 @@ import {
   litSetMeetTy,
   markFieldValue,
   numCastStamp,
-  numOperandStamp,
-  numOperandTy,
   radixLitAdoptPeer64,
   recContainerReadFresh,
   recFitMeetTy,
@@ -254,7 +255,6 @@ import {
   numLitAdoptDeep,
   numLitAdoptDst,
   numLitAdoptTails,
-  numPairOpTy,
   valueJoinAt,
   valueTailLeaves,
 } from "./check_num_adopt"
@@ -546,22 +546,12 @@ export function checkBinExprNode(n: BinExpr, ix: i32) {
 
 // `checkBinExprNode`'s answer from the operator rules' type `bTy` and their `ltOut`.
 function binRetTy(n: BinExpr, ix: i32, bTy: i32, ltOut: i32[]) {
-  if !inferQuiet {
-    // An operand decodes an atom to a string (a concat, a string compare) at the set it reads.
-    atomSrcStamp(n.binLeft)
-    atomSrcStamp(n.binRight)
-  }
-  // A numeric operator's operands are widened to its operand type, at the pair rule's answer: an
+  // An operand decodes an atom to a string (a concat, a string compare) at the set it reads, and a
+  // numeric operator's operands are widened to its operand type, at the pair rule's answer: an
   // instance's re-check runs quiet, and its operands are typed only there.
-  if !inferQuiet || elabCapLive() {
-    const olt = numOperandTy(n.binLeft)
-    const ort = numOperandTy(n.binRight)
-    if olt >= 0 && ort >= 0 {
-      const ot = numPairOpTy(n, olt, ort)
-      numOperandStamp(n.binLeft, ot)
-      numOperandStamp(n.binRight, ot)
-    }
-  }
+  atomReadStamp(n.binLeft)
+  atomReadStamp(n.binRight)
+  if !inferQuiet || elabCapLive() { binOperandsStamp(n) }
   if ltOut.length == 0 { return bTy }
   if bTy < 0 && oerIsPending(ix) { return -1 }
   if n.binOp == "+" && !inferQuiet { plusLinkRecord(ix, ltOut[0]) }
@@ -1010,21 +1000,34 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
 // type (`nonNullTy`), not one layer: a stored null in a nullable-valued map read is a double
 // nullable, just like a miss. Answers the result type.
 // The value type of the map the read `x` indexes (`m[k]` or `m.get(k)`), else -1.
-function coalMapReadValTy(x: i32): i32 {
+function coalMapReadValTy(x: i32): i32 { coalMapValTyAt(x, false) }
+
+// `coalMapReadValTy` at the map's type in the running instance where `live`, else the check's.
+function coalMapValTyAt(x: i32, live: boolean): i32 {
   const u = parenPeelIx(x)
   const n = if u >= 0 { nodeAt(u) } else { null }
-  if n is Index { return tyMapValOfHeld(nodeTyIxOf(parenPeelIx(n.idxArr))) }
+  let m = -1
+  if n is Index { m = parenPeelIx(n.idxArr) }
   if n is Call && n.callArgs.length == 1 && n.callFn >= 0 {
     const f = nodeAt(n.callFn)
-    if f is Member && f.memProp == "get" {
-      return tyMapValOfHeld(nodeTyIxOf(parenPeelIx(f.memObj)))
-    }
+    if f is Member && f.memProp == "get" { m = parenPeelIx(f.memObj) }
   }
-  coalNotMapRead(u)
+  if m < 0 { return coalNotMapRead(u) }
+  tyMapValOfHeld(if live { elabLiveTyOf(m) } else { nodeTyIxOf(m) })
 }
 
 // Every other read indexes no map.
 function coalNotMapRead(_ix: i32): i32 { -1 }
+
+// Records the set a `??` hit decodes left operand `x` at: the non-null value a map read finds
+// stored, or the operand's own. A left `??` hands over its default on the same hit. Returns 0.
+function coalHitStamp(x: i32): i32 {
+  const u = parenPeelIx(x)
+  const c = if u >= 0 { nodeAt(u) } else { null }
+  if c is BinExpr && c.binOp == "??" { coalHitStamp(c.binRight) }
+  const hvt = coalMapValTyAt(x, true)
+  atomHitStamp(x, nonNullTy(if hvt >= 0 { hvt } else { elabLiveTyOf(x) }))
+}
 
 function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   // A `??` whose left operand can never be null has a dead default — recorded (a lint), not
@@ -1874,6 +1877,9 @@ function binTyOfSides(n: BinExpr, ix: i32, lt0: i32, rt0: i32, ltOut: i32[]) {
     }
     recordCtxTy(n.binRight, dct)
     recordJoinBoxTy(n.binLeft, ct)
+    // The left operand is decoded only on a hit: the non-null value a map read finds stored, or
+    // the operand's own. A `null` default folds the `??` away, leaving the read as it is.
+    if !(nodeAt(parenPeelIx(n.binRight)) is NullLit) { coalHitStamp(n.binLeft) }
     // A map read whose default fits the map's values is one fused read, built where the map
     // stores them whatever narrows the read; any other default joins at the result.
     const mvt = coalMapReadValTy(n.binLeft)
