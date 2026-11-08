@@ -65,7 +65,11 @@ import { canonEmitNameOfTy } from "./check_program"
 import { assignable, substTyDeep } from "./check_relate_core"
 import { isVarTyIxOf } from "./check_list_union"
 import { listDisjointDepth } from "./check_type_shape"
-import { inferRetFnKey, inferRetNodeCarryNote } from "./check_side_rows"
+import {
+  inferRetFnKey,
+  inferRetNodeCarryNote,
+  lambdaVoidAdoptedAt,
+} from "./check_side_rows"
 import {
   optCallRetCount,
   optCallRetNameAt,
@@ -229,6 +233,7 @@ import {
   shapeInnerFieldSplit,
   strLess,
   tyIsFuncType,
+  tyIsStructWithUnionField,
   tyNameOf,
   unionStructAliasShape,
   unwrapParen,
@@ -324,6 +329,7 @@ import {
   armStageElemTyIx,
   armStageLitTyIx,
   armStageNames,
+  armStageStoreTy,
   armStageTyText,
   armStageTypes,
   armsAdopted,
@@ -505,6 +511,7 @@ import {
   sFieldLitTyIx,
   sFieldNames,
   sFieldStart,
+  sFieldStoreTy,
   sFieldTyText,
   sFieldTypes,
   sHeapIdx,
@@ -523,6 +530,7 @@ import {
   slUsed,
   startStmtOrd,
   startStmts,
+  storeTyPut,
   svPairOn,
   svViewTy,
   topFnNodes,
@@ -694,7 +702,7 @@ import {
   nulFieldInnerCode,
 } from "./emit_eq_rows"
 import { nameIsWholeSpanShape } from "./emit_field_codes"
-import { recFieldTyOf } from "./emit_rec_field_codes"
+import { fieldStoreTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import {
   cloSigPosOfKey,
   criSetRetKind,
@@ -973,7 +981,11 @@ import {
   tyIsValueUnionBox,
   valueAtomKind,
 } from "./check_ty_rep"
-import { inferRetRungIsValueUnion, valueUnionRetName } from "./check_ret_names"
+import {
+  inferRetRungIsParenUnionElemList,
+  inferRetRungIsValueUnion,
+  valueUnionRetName,
+} from "./check_ret_names"
 import {
   inferLetCount,
   inferLetIxAt,
@@ -2277,6 +2289,42 @@ function buildFnMapBankPrefix() {
   0
 }
 
+// Whether un-annotated function `i` is a lambda whose own inferred-return row classifies its
+// return columns as that type's annotation would: an element-value-union list, whose elements
+// are boxed, or a struct with a union field, whose built row a value's stamp can disagree with.
+// `computeRetInference` leaves such a row's columns as written.
+function fnRetRowLowersAsAnn(i: i32): boolean {
+  const fn = nodeAt(fnStmts[i])
+  if !(fn is FuncDecl) { return false }
+  if fn.fnRet >= 0 || i >= fRetVoid.length || fRetVoid[i] != 0 { return false }
+  const k = inferRetFnKey(fnStmts[i], fn.fnName)
+  if k == fn.fnName { return false }
+  const row = inferRetRowOf(k)
+  if row < 0 { return false }
+  inferRetRungIsParenUnionElemList(row)
+    || tyIsStructWithUnionField(inferRetTyIxAt(row))
+}
+
+// Classify row `li` from the annotation node `ann` and bank it, as an annotated return is.
+function buildFnMapRowOfRetAnn(li: i32, ann: i32) {
+  const rsk = retAnnKindChain(ann)
+  let sidx = 0
+  if rsk == "struct" || rsk == "nulstruct" {
+    sidx = retStructRowIndex(ann)
+  } else {
+    sidx = retStructIndex(ann)
+  }
+  buildFnMapPutRow(
+    li,
+    retVoidAnnFlag(ann),
+    sidx,
+    retRefArrElemName(ann),
+    retBoolFlag(ann),
+    rsk,
+  )
+  buildFnMapBankRow(li)
+}
+
 // Classify the return of `s`, the declaration at `fnStmts` slot `i`, into row `li` and bank
 // the row: the annotation's facts first, then the checker's inferred return when unannotated.
 function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
@@ -2324,6 +2372,9 @@ function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
     // `typecheck.vl` — widen that gate and these arms fire where the name arms did not.
     let retTyIx = -1
     if inRow >= 0 { retTyIx = inferRetTyIxAt(inRow) }
+    if fnRetRowLowersAsAnn(i) {
+      return buildFnMapRowOfRetAnn(li, synthTypeRefTy(inm, -1, retTyIx))
+    }
     let retPrim = ""
     if retTyIx >= 0 {
       const rpt = tyAt(retTyIx)
@@ -2570,6 +2621,7 @@ export function recordedVoidFns() {
           const r = fnRecordedRetTy(i)
           if (
             r == TY_VOID
+            || lambdaVoidAdoptedAt(fnStmts[i])
             || blockHasBareReturn(fn.fnBody)
             || fnPosResultUnconsumed(i)
           ) {
@@ -2862,7 +2914,7 @@ export function computeRetInference() {
   criFromRec = []
   let ri = 0
   while ri < fnStmts.length {
-    criFromRec.push(criColsFromRecorded(ri))
+    criFromRec.push(fnRetRowLowersAsAnn(ri) || criColsFromRecorded(ri))
     ri = ri + 1
   }
   let changed = true
@@ -7397,6 +7449,11 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
       let pj = 0
       while pj < codes.length {
         const pi = aOrd[pj]
+        storeTyPut(
+          sFieldStoreTy,
+          sFieldNames.length,
+          fieldStoreTyOf(codes[pi], recFieldTyOf(anonRowTyIx(ai), names[pi])),
+        )
         sFieldNames.push(names[pi])
         sFieldTypes.push(codes[pi])
         // An anonymous literal's field has no annotation text to key a closure signature
@@ -7719,6 +7776,11 @@ function pushFieldRow(
   cloSig: string,
 ) {
   if toVariant {
+    storeTyPut(
+      armStageStoreTy,
+      armStageNames.length,
+      fieldStoreTyOf(code, litTyIx),
+    )
     armStageTypes.push(code)
     armStageTyText.push(tyText)
     // D1023 — the discriminant column: the field's own arena type when it is a literal set, -1
@@ -7728,6 +7790,7 @@ function pushFieldRow(
     recordUFieldElemRowTy(elemNm, keyK, elemTyHint) // D5 + B6b
     armStageNames.push(fName)
   } else {
+    storeTyPut(sFieldStoreTy, sFieldNames.length, fieldStoreTyOf(code, litTyIx))
     sFieldTypes.push(code)
     sFieldElemName.push(elemNm)
     sFieldCloSig.push(cloSig)
@@ -7813,6 +7876,7 @@ function structTableReset() {
   sFieldElemKeyKind = []
   sFieldTyText = []
   sFieldLitTyIx = []
+  sFieldStoreTy = []
   famRelayReset()
   0
 }
@@ -9900,6 +9964,7 @@ function collectUReset() {
   armStageTypes = []
   armStageTyText = []
   armStageLitTyIx = []
+  armStageStoreTy = []
   armStageElemName = []
   armStageElemTyIx = []
   armStageElemKeyKind = []
