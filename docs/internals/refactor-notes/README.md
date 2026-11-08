@@ -8,6 +8,12 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step7-classifier-deletes-r21](2026-11-08-step7-classifier-deletes-r21.md): Step 7: classifier round 21, three deletes onto typed readers (#6896).
+- [2026-11-08-step7-type-section-last](2026-11-08-step7-type-section-last.md): Step 7: the type section is written after the bodies (#6904).
+- [2026-11-08-step2-lambda-delivery-shadows](2026-11-08-step2-lambda-delivery-shadows.md): Step 2: lambda-return and delivery pins against the elaboration; neither switches (#6903).
+- [2026-11-08-step2-arg-pin-split](2026-11-08-step2-arg-pin-split.md): Step 2: the argument pin splits into row arms and the elaboration's reader (#6902).
+- [2026-11-08-step7-collecta2-ref-list-flags](2026-11-08-step7-collecta2-ref-list-flags.md): Step 7: collectA#2's ref-list flags deleted (#6901).
+- [2026-11-08-step7-annotated-ret-kind](2026-11-08-step7-annotated-ret-kind.md): Step 7: the annotated return kind off the descriptor (#6901).
 - [2026-11-08-step3-d10382-hole-at-two-fn-types](2026-11-08-step3-d10382-hole-at-two-fn-types.md): Step 3 done: a hole handed on at two function types is bound per call (#6899).
 - [2026-11-08-step2-arg-coverage](2026-11-08-step2-arg-coverage.md): Step 2: argument coverage; no recording gap, elabNodeTyOrChecked (#6897).
 - [2026-11-08-step7-classifier-deletes-r20](2026-11-08-step7-classifier-deletes-r20.md): Step 7 classifier round 20; exprListRep reads the checked column (#6892).

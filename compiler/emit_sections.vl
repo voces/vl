@@ -283,10 +283,11 @@ import {
   externIdxAt,
   fRetStructIdx,
   fRetVoid,
+  fa32Ty,
   fa32TypeIdx,
-  fa32Used,
   fa64TypeIdx,
   fa64Used,
+  fl32Ty,
   fl32TypeIdx,
   fl64TypeIdx,
   fmResumeArmed,
@@ -465,6 +466,7 @@ import {
   mAllocSlot,
   mI32Used,
   mI64Used,
+  mNextType,
   mStructI32Idx,
   mStructI64Idx,
   mStructIdx,
@@ -4679,9 +4681,8 @@ function svReserve() {
   svPairs = 0
   if lUsed && ia64Used && (scalarViewPairs & 1) != 0 { svPairs = svPairs + 1 }
   if lUsed && fa64Used && (scalarViewPairs & 2) != 0 { svPairs = svPairs + 2 }
-  if fa32Used && fa64Used && (scalarViewPairs & 4) != 0 {
-    svPairs = svPairs + 4
-  }
+  // The f32 pair mints with the view (`mAssignScalarListPairs`), so only its destination is asked.
+  if fa64Used && (scalarViewPairs & 4) != 0 { svPairs = svPairs + 4 }
   0
 }
 
@@ -4691,12 +4692,12 @@ function svDstOf(p: i32): i32 {
 }
 
 function svSrcWrap(p: i32): i32 {
-  if p == 2 { return fl32TypeIdx }
+  if p == 2 { return fl32Ty() }
   lTypeIdx
 }
 
 function svSrcBack(p: i32): i32 {
-  if p == 2 { return fa32TypeIdx }
+  if p == 2 { return fa32Ty() }
   aTypeIdx
 }
 
@@ -6245,11 +6246,15 @@ function emitModule(_stmts: i32[]) {
 
   const nPrintTypes = printFnTypeCount()
 
-  emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
+  // The two facts the bodies read that the type section's rows decide: each struct row's
+  // supertype, and the `$fnsig` pool's twins. The section itself is written after the bodies.
+  buildStructSupers()
+  cloSigTwinsBuild()
+  // A dry render reports the section's refusals ahead of the bodies', as before the split.
+  emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers, false)
+  gTypeRopeAt = W.chunks.length
 
-  emitImportSection(n, typeOffset, hasStart)
-
-  emitFunctionSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
+  fnSectionCounts(n, hasStart, memFn, nHelpers)
 
   if fnValUsed { emitTableSection(n) }
 
@@ -6277,7 +6282,30 @@ function emitModule(_stmts: i32[]) {
   // The global section is framed first: it sits after the function section in the rope, so
   // placing it does not move the chunk the function section is placed before.
   frameGlobalSection()
-  frameFunctionSection()
+  // The functype base is read again here: every section that names a functype is written now.
+  const lateTypeOffset = mNextType
+  frameFunctionSection(
+    n,
+    lateTypeOffset,
+    hasStart,
+    memFn,
+    nPrintTypes,
+    nHelpers,
+  )
+  // The type, import and function sections share one chunk; the type section is placed last,
+  // so it lands first, and the global section, framed above, does not move.
+  emitImportSection(n, lateTypeOffset, hasStart)
+  if !emitFailed {
+    emitTypeSection(
+      n,
+      lateTypeOffset,
+      hasStart,
+      memFn,
+      nPrintTypes,
+      nHelpers,
+      true,
+    )
+  }
 
   if fnValUsed { emitElementSection(n) }
 
@@ -6286,7 +6314,7 @@ function emitModule(_stmts: i32[]) {
   emitDataSection()
   relPlaceSections()
   // Every section that names a type is written, so the first group can take its final order.
-  if !emitFailed { typeOrderRun(typeOffset, typeSeeds(typeOffset)) }
+  if !emitFailed { typeOrderRun(lateTypeOffset, typeSeeds(lateTypeOffset)) }
 
   // Custom "name" section LAST (after the code section, where it conventionally
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
@@ -7486,7 +7514,6 @@ function emitProgramReset(rootIx: i32) {
   // single-compile process never disagrees — but the LSP and the wasm test harness drive many
   // compiles through one instance, where the flag survives from an earlier program while the indices do not. Its siblings (`aUsed`, `fa64Used`, …) share the shape and are not reset; only this one has a witness.
   ba8Used = false
-  fa32Used = false
   fa64Used = false
   ia64Used = false
   // Same per-compile rule as `ba8Used` above, and the same failure if it is skipped: the
@@ -7498,7 +7525,6 @@ function emitProgramReset(rootIx: i32) {
   gNeedsStrFromBytes = false
   mapDeleteReset()
   gFuncFixedN = 0
-  gFuncEntries = []
   gFuncRopeAt = 0
   gGlobalFixedN = 0
   gGlobalRopeAt = 0
@@ -8369,8 +8395,8 @@ function armSuperOf(c: i32, bestLen: i32): i32 {
 // The rec-group entries `emitTypeSection` has written so far; entry k is heap type k.
 let tsEmitted = 0
 
-// The closure-signature pool's entry offsets and lengths in the section buffer, for the twin
-// column `tsCloSig` fills.
+// The closure-signature pool's entry offsets and lengths in `cloSigTwinsBuild`'s scratch
+// buffer, for the twin column it fills.
 let tsPoolStart: i32[] = []
 let tsPoolBytes: i32[] = []
 
@@ -8667,27 +8693,46 @@ function tsCloCell() {
   0
 }
 
-// One env-leading `$fnsig` functype per distinct eligible signature, in `cloSigKeys` order,
-// and — as each is written — the pool's twin column: the smallest earlier entry with
-// identical bytes (D351). Compared over the section buffer just rendered into, so every
-// entry renders exactly once and emitted bytes are unchanged — a duplicate functype is still emitted at its own index, it simply stops being referenced.
+// One env-leading `$fnsig` functype per distinct eligible signature, in `cloSigKeys` order. A
+// duplicate is still emitted at its own index; `cloSigTwinsBuild` stops it being referenced.
 function tsCloSig(sai: i32) {
-  const start = wLen()
   tsEntryAt(cloSigBase + sai, "closure signature")
   emitCloSigFunctype(sai)
-  const nb = wLen() - start
-  let twin = sai
-  let pj = 0
-  while pj < sai {
-    if tsPoolBytes[pj] == nb && wRangeEq(tsPoolStart[pj], start, nb) {
-      twin = pj
-      pj = sai // stop at the first (smallest) twin
+  0
+}
+
+// The pool's twin column, the smallest earlier entry with identical bytes (D351), before any
+// body reads it: each `$fnsig` is rendered into a scratch buffer, so the type section itself
+// is written after the bodies.
+function cloSigTwinsBuild() {
+  cloSigTwin = []
+  tsPoolStart = []
+  tsPoolBytes = []
+  if !fnValUsed { return 0 }
+  const scratch: u8[] = []
+  const prev = wTarget(scratch)
+  let sai = 0
+  while sai < cloSigKeys.length {
+    const start = wLen()
+    emitCloSigFunctype(sai)
+    const nb = wLen() - start
+    let twin = sai
+    let pj = 0
+    while pj < sai {
+      if tsPoolBytes[pj] == nb && wRangeEq(tsPoolStart[pj], start, nb) {
+        twin = pj
+        pj = sai // stop at the first (smallest) twin
+      }
+      pj = pj + 1
     }
-    pj = pj + 1
+    cloSigTwin.push(twin)
+    tsPoolStart.push(start)
+    tsPoolBytes.push(nb)
+    sai = sai + 1
   }
-  cloSigTwin.push(twin)
-  tsPoolStart.push(start)
-  tsPoolBytes.push(nb)
+  wTarget(prev)
+  tsPoolStart = []
+  tsPoolBytes = []
   0
 }
 
@@ -8794,11 +8839,9 @@ function emitTypeSection(
   memFn: i32,
   nPrintTypes: i32,
   nHelpers: i32,
+  place: boolean,
 ) {
   tsEmitted = 0
-  cloSigTwin = []
-  tsPoolStart = []
-  tsPoolBytes = []
   const typePayload: u8[] = []
   // Bind the writer at `typePayload` for the WHOLE type-section payload build, so the
   // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
@@ -8824,7 +8867,6 @@ function emitTypeSection(
     wU8(78)           // 0x4e rec group
     wULEB(typeOffset) // the heap types and the closure-signature pool
   }
-  buildStructSupers()
   let ei = 0
   while ei < mAllocKind.length {
     tsEmitEntry(mAllocKind[ei], mAllocSlot[ei])
@@ -8833,8 +8875,12 @@ function emitTypeSection(
   // The functype param/result valtypes (`fbValtype`) stream to `curBuf == typePayload`,
   // interleaved identically with the surrounding raw framing bytes (the `wTarget` bind
   // covering this whole payload build is established above).
-  // The rec group is complete: its entry count is the functype base `mAssignTypeIndices` returned.
-  if tsEmitted != typeOffset {
+
+  // The rec group is complete. A dry render may mint a type its rows read first (`fa32Ty`),
+  // so it counts against the counter; the placed one must match the functype base it framed.
+  let tsWant = typeOffset
+  if !place { tsWant = mNextType }
+  if tsEmitted != tsWant {
     emitFail(
       "emitProgram: the type section wrote "
         + i32ToStr(tsEmitted)
@@ -8903,9 +8949,12 @@ function emitTypeSection(
   // The shared runtime helpers, in helper-index order.
   tsEmitHelperFuncTypes()
   wTarget(tyPrev)
-  wSection(1, typePayload)
+  if place { wSectionPartsAt(gTypeRopeAt, 1, [typePayload]) }
   0
 }
+
+// The module rope chunk the type section is placed before: it is written after the bodies.
+let gTypeRopeAt = 0
 
 // Writes one functype per used fs slot, in slot order, to the type-section payload
 // `emitTypeSection` has bound. A slot with no arity records a failure and writes `() -> i32`.
@@ -9101,7 +9150,7 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
       emitGlobalImportEntries()
       if memImported() { emitMemoryImportEntry() }
       wTarget(moPrev)
-      wSection(2, memOnlyPayload)
+      wSectionPartsAt(gTypeRopeAt, 2, [memOnlyPayload])
     }
     return 0
   }
@@ -9220,7 +9269,7 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
     emitGlobalImportEntries()
     if memImported() { emitMemoryImportEntry() }
     wTarget(imPrev)
-    wSection(2, importPayload)
+    wSectionPartsAt(gTypeRopeAt, 2, [importPayload])
   }
   0
 }
@@ -9272,68 +9321,18 @@ function emitMemoryLimits() {
   0
 }
 
-function emitFunctionSection(
-  n: i32,
-  typeOffset: i32,
-  hasStart: i32,
-  memFn: i32,
-  nPrintTypes: i32,
-  nHelpers: i32,
-) {
-  // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
-  // synthetic start function (if any) is the LAST entry — function index `n` — using
-  // the `()->()` functype at index `typeOffset + n`.
-  // Framed by `frameFunctionSection` once the bodies have decided the thunks it ends with.
-  const funcPayload: u8[] = []
-  const fnPrev = wTarget(funcPayload)
+// The function section's counts, which the bodies read: `gFuncFixedN` and the first tail
+// function's index. Its entries are written by `frameFunctionSection`, after the bodies.
+function fnSectionCounts(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   gFuncFixedN = n + hasStart + gInitMods.length + memFn + nHelpers
-  let fi = 0
-  while fi < n {
-    // A function carrying the env param whose signature matches an interned `$fnsig` is
-    // declared with that `$fnsig` functype, so a `call_indirect $fnsig` reaching it passes
-    // the engine's signature check. Others keep their own functype.
-    if fnHasEnvParam(fi) && fnSigIsClosure(fi) && !cloLifted(fi) {
-      wULEB(fnSigIdxOfFn(fi))
-    } else {
-      wULEB(typeOffset + fi) // functype index
-    }
-    fi = fi + 1
-  }
-  if hasStart == 1 {
-    wULEB(typeOffset + n) // start fn functype index
-  }
-  // Each init function shares the start's `()->()` functype.
-  let ii = 0
-  while ii < gInitMods.length {
-    wULEB(typeOffset + n)
-    ii = ii + 1
-  }
-  if memLogUsed {
-    // The synthetic `__log__` decoder uses the standalone `(i32,i32)->()` functype
-    // emitted after the print functypes.
-    wULEB(typeOffset + n + hasStart + nPrintTypes)
-  }
-  // The shared runtime helpers, each on its own standalone functype (emitted after
-  // the `__log__` functype in the SAME helper order, so functype k belongs to
-  // helper k).
-  const helpTyBase = typeOffset + n + hasStart + nPrintTypes + memFn
-  let hi = 0
-  while hi < nHelpers {
-    wULEB(helpTyBase + hi)
-    hi = hi + 1
-  }
-  gMapSetTyBase = helpTyBase + nHelpers
   gMapSetFnBase = gImports + gFuncFixedN
-  wTarget(fnPrev)
-  gFuncEntries = funcPayload
   gFuncRopeAt = W.chunks.length
   0
 }
 
-// What `emitFunctionSection` leaves for `frameFunctionSection`: the count and entries of every
-// function but the thunks, and the module rope chunk the section is framed before.
+// What `fnSectionCounts` leaves for `frameFunctionSection`: the count of every function but
+// the tail rows and the thunks, and the module rope chunk the section is framed before.
 let gFuncFixedN = 0
-let gFuncEntries: u8[] = []
 let gFuncRopeAt = 0
 
 // The thunks, after every other function so no index shifts: one per address-taken function
@@ -9374,12 +9373,48 @@ function tableEntryFnIdx(fe: i32): i32 {
   gImports + fe
 }
 
-// Function section (id 3), placed before the table section it precedes in the module.
-function frameFunctionSection() {
+// Function section (id 3): function `fi` uses functype `typeOffset + fi`, or its `$fnsig` when
+// a closure call reaches it. The start, init, `__log__` and helper functions follow on the tail
+// functypes, then the tail rows and the thunks the bodies decided.
+function frameFunctionSection(
+  n: i32,
+  typeOffset: i32,
+  hasStart: i32,
+  memFn: i32,
+  nPrintTypes: i32,
+  nHelpers: i32,
+) {
   const countBuf: u8[] = []
+  const entryBuf: u8[] = []
   const thunkBuf: u8[] = []
   const prev = wTarget(countBuf)
   wULEB(gFuncFixedN + gTailFnRows.length + cloThunkFes.length)
+  wTarget(entryBuf)
+  let fi = 0
+  while fi < n {
+    if fnHasEnvParam(fi) && fnSigIsClosure(fi) && !cloLifted(fi) {
+      wULEB(fnSigIdxOfFn(fi))
+    } else {
+      wULEB(typeOffset + fi)
+    }
+    fi = fi + 1
+  }
+  // The start and each init function share the `()->()` functype.
+  let ii = 0
+  while ii < hasStart + gInitMods.length {
+    wULEB(typeOffset + n)
+    ii = ii + 1
+  }
+  // `__log__` takes the `(i32,i32)->()` functype after the print functypes.
+  if memLogUsed { wULEB(typeOffset + n + hasStart + nPrintTypes) }
+  // Helper k takes functype `helpTyBase + k`, emitted in the same helper order.
+  const helpTyBase = typeOffset + n + hasStart + nPrintTypes + memFn
+  let hi = 0
+  while hi < nHelpers {
+    wULEB(helpTyBase + hi)
+    hi = hi + 1
+  }
+  gMapSetTyBase = helpTyBase + nHelpers
   wTarget(thunkBuf)
   for row in gTailFnRows {
     if row >= 0 {
@@ -9394,7 +9429,7 @@ function frameFunctionSection() {
     k = k + 1
   }
   wTarget(prev)
-  wSectionPartsAt(gFuncRopeAt, 3, [countBuf, gFuncEntries, thunkBuf])
+  wSectionPartsAt(gFuncRopeAt, 3, [countBuf, entryBuf, thunkBuf])
 }
 
 // A thunk body: drop the env, forward the declared params, tail-call the target, so a
