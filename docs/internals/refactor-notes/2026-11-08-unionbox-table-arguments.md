@@ -1,14 +1,12 @@
-# Union boxing joins the `lowerCoerce` table: arguments (2026-11-08)
+# Union boxing joins the `lowerCoerce` table (2026-11-08)
 
-Step 5's first union-box collapse, per `2026-11-07-lowercoerce-scope.md`. Measured at master
+Step 5's first union-box collapse, per `2026-11-07-lowercoerce-scope.md`. Shadow measured at master
 `d1a2c321` (fixpoint seed 6,490,499 bytes).
 
 ## The shadow over the population
 
-`scripts/box-dst-shadow/run.sh` builds a probe from a copy of `compiler/` (the shadow armed, each
-box-helper call tagged with its function and line) and runs it over `sweep.vl list`, 23,613
-programs, in about a minute. 111,374 deliveries, 56,702 of them top-level (the rest are a box
-helper's own nested call). Top-level, by class:
+`scripts/box-dst-shadow/run.sh` runs the shadow, each box call tagged with its position, over
+`sweep.vl list` (23,613 programs) in about a minute: 111,374 deliveries, 56,702 top-level:
 
 | class | deliveries |
 |---|---|
@@ -25,11 +23,9 @@ record, `D4892` and `type-param-coalesce-folded-interpolation-hole`); 182 are an
 global init (`D14432`) and 117 an `i32 | null` let (`D15163`). The other `no record` rows are a
 `v128 | null` element (`simd/captured-reassigned-vector-cell`, `D2826`) and `D9564`.
 
-**Disagreements** (87) are all at positions this PR does not touch. Every one is an order or alias
-spelling the shadow's canonical key does not equate (`i64|i32` / `i32|i64` in `D9561`, `Shape` /
-`{r:i32}|{s:i32}` in `D2697`, `string|i32` / `K|i32` in `capture-walk-variable-box-list-literal`),
-or a nullable site union whose record dropped `null` or a member (`d3127_*` named cells,
-`emitUnionIfArm`; `nullable-value-map`, `emitMapGetOrUnionBox`). Argument positions: 0.
+**Disagreements** (87) are order or alias spellings the shadow's key does not equate (`i64|i32` /
+`i32|i64` in `D9561`, `Shape` / `{r:i32}|{s:i32}` in `D2697`), or a nullable site union whose
+record dropped a member (`d3127_*` named cells). None is at a position this PR changes.
 
 ## Why the box kind is seat-scoped
 
@@ -48,26 +44,35 @@ built, so a list copy or retag recorded at the same node still runs inside it.
 ## This PR
 
 - `CoerceKind` gains `box`; `emitCoerced` boxes at the record's union.
-- Argument positions read the table: `emitDirectArgValue` and `emitCapturedCall` hand a recorded
-  argument to the table and keep the parameter's union only as the floor; `emitCallRefArg` (and
-  the six other `emitUnionBoxAtRecord` positions) reach it through that helper, whose record arm
-  is now the table.
-- 8,081 top-level deliveries are now boxed by the table (`emitCoerced` in the shadow).
+- `emitUnionBoxAtRecord`'s record arm is the table, so its seven positions (`emitCallRefArg`,
+  index store, push, global assignment, two `??` joins, `getOr` join) are boxed by it. The
+  helper keeps its own-union and site arms for a delivery with no usable record.
 
-Sites deleted: the record arm of `emitUnionBoxAtRecord` (its `emitUnionBoxArg` at the record's
-union). The parameter-union `emitUnionBoxArg` at the two direct positions stays, as the floor for
-the 141 generic argument deliveries and 16 `no record` ones.
+Site deleted: that record arm's `emitUnionBoxArg`. The direct and captured argument positions are
+**parked**, see below.
+
+## The record is order-dependent on a shared instance
+
+Switching `emitDirectArgValue` to the table was byte-identical in the sweep (fresh instance per
+chunk order) and failed `cases_wasm_0`: after `closures/hole-fn-labelled-block-left-by-break.vl`
+on the same instance, `closures/nul-scalar-list-arm-closure-result.vl` builds invalid wasm. The
+checker stamps the argument `useIt(...)`'s node twice more with `mk`'s return union
+`(i64 | null)[] | {w: i32}` after its parameter's union (`boxTyStampOne`, last writer wins), and
+only when the other program compiled first. Reproduce: `vl check --batch --codegen` of the two
+files in that order. Until that recorder leak is found, a position that boxed by its own union
+cannot read the record; positions already reading it are unaffected.
 
 ## Proof
 
-Fixpoint seed 6,490,864 bytes (+365). Sweep against master's fixpoint: 23,613 same, 0
-bytes-only, 0 `runs → not-runs`.
+Fixpoint seed 6,492,492 bytes (+198 against master `756faab3`'s 6,492,294). Sweep against
+master's fixpoint: 23,613 same, 0 bytes-only, 0 `runs → not-runs`.
 
 ## What is left
 
-- **Positions with no floor in the population**: variant fields (1,093), struct-field store, map
-  default, assignment (`emitAssignIdent`, `emitAssignGlobal`), fn-tag dispatch, const-cell init.
-  Each can drop its site union for `emitDelivered` outright; the next PRs, one family each.
+- **The recorder leak above**, first: it blocks every position whose site union is replaced.
+- **Then positions with no floor in the population**: variant fields (1,093), struct-field store,
+  map default, assignment (`emitAssignIdent`), fn-tag dispatch, const-cell init. Each can drop its
+  site union for `emitDelivered` outright, one family per PR. Arguments follow with a floor.
 - **Returns** (29,604 top-level): 5 floor rows, `D2174` and `D10211`, both generic.
 - **Let and global init**: the `i32 | null` floor above, a nullable niche whose record is missing,
   not a box mismatch; to be recorded first.

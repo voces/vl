@@ -3,7 +3,7 @@
 #
 #   scripts/box-dst-shadow/run.sh [--seed S] [--out F]
 #
-# Builds a probe compiler from a copy of compiler/ (probe.py: the shadow armed, every
+# Builds a probe compiler from a copy of compiler/ (probe.sh: the shadow armed, every
 # emitUnionBoxArg / emitUnionCoerce / emitUnionBoxAtRecord call tagged with its function and line),
 # runs `vl check --batch --codegen` over `sweep.vl list` with `$VL_LATE_DEMANDS=1`, and writes one
 # `<file>\t<class> | <helper> | site <union> | record <union> | pos <fn>:<line>` row per delivery
@@ -25,7 +25,7 @@ export function elabShadowNote(s: string): i32 {
   0
 }
 X
-python3 "$R/scripts/box-dst-shadow/probe.py" "$T/tree/compiler"
+"$R/scripts/box-dst-shadow/probe.sh" "$T/tree/compiler"
 (cd "$T/tree" && VL_STD="$R/std" timeout 900 "$VL" build compiler/entry.vl --compiler "$SEED" \
   -o "$T/probe.wasm" > /dev/null)
 "$VL" run scripts/sweep.vl -- list | cut -f2 | split -l 100 - "$T/c."
