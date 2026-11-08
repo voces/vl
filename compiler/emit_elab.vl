@@ -20,9 +20,11 @@ import {
 import { isVarTyIxOf } from "./check_list_union"
 import { identFnDeclOf, tyParamIsBareOnly } from "./check_scopes"
 import {
+  elabAssignedParamOf,
   elabFnSetTyMint,
   elabHoleRowCut,
   elabHoleRowMark,
+  elabListJoinSource,
   elabListParamSource,
   elabParamCopyOf,
   elabRestampNote,
@@ -4763,7 +4765,59 @@ function elabCalleeParam(root: i32, decl: i32, k: i32): i32 {
   if ap >= 0 { return ap }
   const lp = elabHolderParamSource(d, dn)
   if lp >= 0 { return lp }
+  const jp = elabListJoinAt(d, dn, k)
+  if jp >= 0 { return jp }
   elabWrittenParamAlias(d, dn)
+}
+
+// The parameter `elabListJoinSource` takes list binding `d` of `fn` as, when instance `k` binds
+// it and every other parameter slot-written into the list to one and the same set; else -1.
+function elabListJoinAt(d: i32, fn: FuncDecl, k: i32): i32 {
+  const jp = elabListJoinSource(d, fn)
+  if jp < 0 || elabListParamSource(d, fn) == jp || d >= P.nodes.length {
+    return -1
+  }
+  const ln = nodeAt(d)
+  const li = if ln is LetDecl { parenPeelIx(ln.letInit) } else { -1 }
+  const al = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { null }
+  if !(al is ArrayLit) { return -1 }
+  const reads: i32[] = []
+  for e in al.arrElems { reads.push(parenPeelIx(e)) }
+  const todo: i32[] = [fn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is BinExpr && elabSlotWriteList(x) == d {
+        reads.push(parenPeelIx(xn.binRight))
+      }
+      for c in nodeChildren(x) { todo.push(c) }
+    }
+  }
+  let s = -1
+  for r in reads {
+    const rs = if r >= 0 { fnTagSetOfTy(elabNodeTy(r, k)) } else { -1 }
+    if rs < 0 || s >= 0 && rs != s { return -1 }
+    s = rs
+  }
+  jp
+}
+
+// The parameters of `fn` other than `pd` that slot writes into list binding `d` read.
+function elabListJoinWriters(d: i32, fn: FuncDecl, pd: i32): i32[] {
+  const out: i32[] = []
+  const todo: i32[] = [fn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if elabSlotWriteList(x) == d {
+        const w = elabAssignedParamOf(x, fn)
+        if w >= 0 && w != pd && !i32ListHas(out, w) { out.push(w) }
+      }
+      for c in nodeChildren(x) { todo.push(c) }
+    }
+  }
+  out
 }
 
 // `elabListParamSource`, or else `elabRecParamSource`.
@@ -4905,6 +4959,23 @@ function elabPushOntoParamList(p: i32, fn: FuncDecl, pd: i32): boolean {
     && o < P.nodes.length
     && nodeAt(o) is Ident
     && elabListParamSource(identDeclOf(o), fn) == pd
+}
+
+// Whether list literal `lit` initialises a binding in `fn`'s body that `elabListJoinAt` takes as
+// parameter `pd` at instance `k`.
+function elabListLitJoinedAt(lit: i32, fn: FuncDecl, pd: i32, k: i32): boolean {
+  const todo: i32[] = [fn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is LetDecl && parenPeelIx(xn.letInit) == lit {
+        return elabListJoinAt(x, fn, k) == pd
+      }
+      for c in nodeChildren(x) { todo.push(c) }
+    }
+  }
+  false
 }
 
 // Whether list literal `lit` initialises a binding in `fn`'s body that `elabListParamSource`
@@ -5601,6 +5672,10 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       if (p >= 0 && nodeAt(p) is ArrayLit && elabListLitOfParam(p, dn, pd)) {
         return 0
       }
+      // So does one joined, at this instance, with other parameters of the same set (D15568).
+      if p >= 0 && nodeAt(p) is ArrayLit && elabListLitJoinedAt(p, dn, pd, k) {
+        return 0
+      }
       // So does a push of it onto such a list.
       if elabPushOntoParamList(p, dn, pd) { return 0 }
       // So does a slot write of it into such a list.
@@ -5609,6 +5684,17 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
         && elabSlotWriteList(p) >= 0
         && elabListParamSource(elabSlotWriteList(p), dn) == pd
       ) {
+        return 0
+      }
+      if (
+        p >= 0
+        && elabSlotWriteList(p) >= 0
+        && elabListJoinAt(elabSlotWriteList(p), dn, k) >= 0
+      ) {
+        const ss = fnTagSetOfTy(elabNodeTy(ix, k))
+        if ss >= 0 {
+          mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), ss)
+        }
         return 0
       }
       // So does one a copy reads element by element into a closed holder, whose adapter calls
@@ -8388,6 +8474,14 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   if root != cf && elabHolderParamSource(identDeclOf(root), dn) == pd {
     mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
   }
+  // A list joined from several parameters holds each one's value, so its call goes through
+  // each one's set.
+  if root != cf && elabListJoinAt(identDeclOf(root), dn, k) == pd {
+    mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
+    for w in elabListJoinWriters(identDeclOf(root), dn, pd) {
+      mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, w), fnTagSetOfTy(st))
+    }
+  }
   if root == cf {
     mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
     if !split {
@@ -8409,6 +8503,7 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
   const held = root != cf
     && !own
     && elabHolderParamSource(identDeclOf(root), dn) != pd
+    && elabListJoinAt(identDeclOf(root), dn, k) != pd
   if (
     was != fnTagSetOfTy(st)
     && (held
@@ -15315,7 +15410,7 @@ function elabLitSlotCalleesAt(a: i32, st: i32, step: string) {
 // literal rows, the list of their own element type, which must agree; for functions, the one type
 // they take at the argument tuple every reached call agrees on (`elabLitSlotCallTys`), each result
 // read at those parameters; -1 where calls or results disagree or one has no such result.
-export function elabLitSlotCallTy(a: i32, step: string, depth: i32): i32 {
+function elabLitSlotCallTy(a: i32, step: string, depth: i32): i32 {
   const n = nodeAt(a)
   if step == "e" && n is ArrayLit && n.arrElems.length > 0 && depth <= 6 {
     let rows = true
@@ -16023,20 +16118,6 @@ function elabSubstOpen(t: i32, k: i32): i32 {
   const s = substTyDeepOf(t, names, tys, elabOwnerOf(k))
   if s < 0 || s >= T.tys.length || s == TY_ERR { return -1 }
   s
-}
-
-// The type returned literal `rx` is built at in the instance module-scope call `callIx` reaches:
-// its type there, each open function leaf closed as a held literal's is (`elabHeldClosedTyAt`: the
-// one signature its instances agree on, else the uncalled default); -1 where a leaf does not close.
-export function elabReturnedClosedTy(rx: i32, callIx: i32): i32 {
-  if rx < 0 || rx >= P.nodes.length { return -1 }
-  const k = if callIx >= 0 { elabCallInstFrom(callIx, -1) } else { -1 }
-  const t0 = nodeTyIxOf(rx)
-  const s0 = if k >= 0 { elabSubstOpen(t0, k) } else { t0 }
-  const none: string[] = []
-  const d = elabHeldClosedTyAt(s0, [rx], 0, -1, none, k)
-  if d < 0 || !elabTyClosed(d, 0) { return -1 }
-  d
 }
 
 // The record every call reaching instance `k` is built at, as the checker stamped each call's
