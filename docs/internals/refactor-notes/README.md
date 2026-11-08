@@ -8,6 +8,10 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step7-classifier-r14](2026-11-08-step7-classifier-r14.md): Step 7 classifier round 14, the last pre-mono callers (#6827).
+- [2026-11-08-call-key-slot-stored-values](2026-11-08-call-key-slot-stored-values.md): Step 2: a value call's member is keyed on the value its slot stores (#6826).
+- [2026-11-08-step7-name-twin-classify](2026-11-08-step7-name-twin-classify.md): Step 7: the classifier's name-twin lookups go (#6825).
+- [2026-11-08-step7-classifier-r13](2026-11-08-step7-classifier-r13.md): Step 7 classifier round 13, the map-value readers (#6820).
 - [2026-11-08-read-side-table-kinds](2026-11-08-read-side-table-kinds.md): The read side reads the table: `unbox` and `atomstr` kinds (#6819).
 - [2026-11-08-step7-field-index-mint-slots](2026-11-08-step7-field-index-mint-slots.md): Step 7: field, index and list-literal reads take their storage row (#6818).
 - [2026-11-08-step7-classifier-r12](2026-11-08-step7-classifier-r12.md): Step 7 classifier round 12, the post-only shadows (#6817).
