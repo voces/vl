@@ -55,3 +55,87 @@ need wasmEmit.vl 'emitUnionBoxArgP("'
 need wasmEmit.vl '  bdsPosEnter,'
 need emit_sections.vl '  emitUnionBoxArgP,'
 need emit_sections.vl 'emitUnionCoerceP("'
+# --- overwrite history (appended to probe.sh) ---
+K="$C/check_elab_cap.vl"
+cat >> "$K" <<'Y'
+
+// Probe only: every union a node's box record was written with, in order, per scope.
+export let bxwCap: {[i32]: i32[]} = Map()
+export let bxwInst: {[string]: i32[]} = Map()
+
+export function bxwReset() {
+  bxwInst = Map()
+  0
+}
+
+export function bxwNote(ix: i32, t: i32, inst: boolean) {
+  const h = bxwCap[ix] ?? []
+  h.push(t)
+  bxwCap[ix] = h
+  0
+}
+
+export function bxwBank(k: i32) {
+  for ix in bxwCap.keys() {
+    bxwInst[i32ToStr(ix) + ":" + i32ToStr(k)] = bxwCap[ix] ?? []
+  }
+  bxwCap = Map()
+  0
+}
+
+
+export function bxwInstOf(ix: i32, k: i32): i32[] {
+  bxwInst[i32ToStr(ix) + ":" + i32ToStr(k)] ?? []
+}
+Y
+CS="$C/check_core_state.vl"
+cat >> "$CS" <<'Y'
+
+// Probe only: every union node ix's program box record was written with, in order.
+export let bxwHist: {[i32]: i32[]} = Map()
+
+export function bxwNoteProg(ix: i32, t: i32) {
+  const h = bxwHist[ix] ?? []
+  h.push(t)
+  bxwHist[ix] = h
+  0
+}
+
+export function bxwHistOf(ix: i32): i32[] { bxwHist[ix] ?? [] }
+
+// The recorder writing now: 0 a contextual stamp, 1 a `??` join (`recordBoxTy`), 2 loop exits.
+export let bxwRole = 0
+
+export function bxwRoleSet(r: i32): i32 {
+  const o = bxwRole
+  bxwRole = r
+  o
+}
+Y
+perl -0 -i -pe 's/(\n  nodeBoxTyIx = \[\]\n)/$1  bxwHist = Map()\n/' "$CS"
+perl -0 -i -pe 's/(export function elabCapBegin\(depth: i32\) \{\n)/$1  bxwCap = Map()\n/' "$K"
+F="$C/check_fit_rules.vl"
+perl -0 -i -pe 's/(\n  nodeBoxTyIx,\n)/\n  bxwNoteProg,\n  bxwRole,\n  bxwRoleSet,\n  nodeBoxTyIx,\n/; s/(\} from "\.\/check_elab_cap"\n)/  bxwNote,\n$1/;
+  s/(    if isBox \{ elabCapBox\[ix\] = t \})/    if isBox {\n      elabCapBox[ix] = t\n      bxwNote(ix, t * 4 + bxwRole, true)\n    }/;
+  s/(function boxTyStampOne\(ix: i32, t: i32\): i32 \{\n  if elabCapLive\(\) \{\n    elabCapBox\[ix\] = t\n)/$1    bxwNote(ix, t * 4 + bxwRole, true)\n/;
+  s/(  nodeBoxTyIx\[ix\] = t\n)/$1  bxwNoteProg(ix, t * 4 + bxwRole)\n/;
+  s/(  const spine: i32\[\] = \[\]\n  const leaves: i32\[\] = \[\]\n  valueTailSplit\(ix, spine, leaves\)\n  boxTyStamp\(ix, t\)\n  for j in spine \{ boxTyStamp\(j, t\) \}\n  for l in leaves \{ boxTyStamp\(l, t\) \}\n)/  const bxo = bxwRoleSet(1)\n$1  bxwRoleSet(bxo)\n/;
+  s/(function boxExitsStamp\(ix: i32, t: i32\): i32 \{\n)(.*?\n)(  0\n\})/$1  const bxo = bxwRoleSet(2)\n$2  bxwRoleSet(bxo)\n$3/s' "$F"
+EL="$C/emit_elab.vl"
+perl -0 -i -pe 's/(\} from "\.\/check_elab_cap"\n)/  bxwBank,\n  bxwReset,\n$1/;
+  s/(  for ix in elabCapBox\.keys\(\) \{\n)/  bxwBank(k)\n$1/; s/(\n  elabNodeBoxs = Map\(\)\n)/$1  bxwReset()\n/' "$EL"
+need check_fit_rules.vl 'bxwNoteProg(ix, t * 4 + bxwRole)'
+need check_fit_rules.vl '  const bxo = bxwRoleSet(1)'
+need check_fit_rules.vl '  const bxo = bxwRoleSet(2)'
+need check_fit_rules.vl '      bxwNote(ix, t * 4 + bxwRole, true)'
+need check_fit_rules.vl '    bxwNote(ix, t * 4 + bxwRole, true)'
+need emit_elab.vl '  bxwBank(k)'
+need emit_elab.vl '  bxwReset()'
+need check_elab_cap.vl '  bxwCap = Map()'
+need check_core_state.vl '  bxwHist = Map()'
+B="$C/box_dst_shadow.vl"
+perl -0 -i -pe 's/(" \| record " \+ col)/$1 + bdsHist(unionName, unionTy, ix, fnIx)/;
+  s/^(import \{ tyHasTyVar \} from "\.\/tyquery"\n)/$1import { bxwHistOf, nodeBoxTyIxOf } from ".\/check_core_state"\nimport { bxwInstOf } from ".\/check_elab_cap"\nimport { elabKeyAt, elabNodeBoxAt } from ".\/emit_elab"\nimport { tyCarrySrcOf } from ".\/check_node_tys"\n/m' "$B"
+cat "$(dirname "$0")/hist.vl.in" >> "$B"
+need box_dst_shadow.vl 'bdsHist(unionName, unionTy, ix, fnIx)'
+need box_dst_shadow.vl 'import { bxwInstOf }'

@@ -30,9 +30,9 @@ ran.
 | --- | --- | --- |
 | the record bound to a `const` inside `mk<T>`, then returned | loud, no interned shape | none: `monoPinFieldContainers` declines a generic instance (instance-binding lane) |
 | `[mk(1), mk(2)]`, a set called through the list | loud, no interned signature | D15548 |
-| `return [{ fs: [inc0], x: x }]` with two instances, a set called | **check-clean invalid wasm**, on master too | D15547 |
+| `return [{ fs: [inc0], x: x }]` with two instances, a set called | **check-clean invalid wasm**, on master too | D15549 |
 
-D15547 is clause 1. Each instance's copy carries the right closed type: the string copy has
+D15549 is clause 1. Each instance's copy carries the right closed type: the string copy has
 `{fs: ((i32) => i32)[], x: string}`. But both rows read `{ref $fs, i32}`. The row of a record
 whose set a call reaches is keyed without the instance.
 
