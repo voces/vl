@@ -1,17 +1,18 @@
 // THE BOX-DESTINATION SHADOW (`compiler/box_dst_shadow.vl`, architecture-target-2026-10.md,
 // step 5's record line).
 //
-// The checker records the union each node is delivered into (`boxDstTyAt`, per instance). Nothing
-// reads it to decide anything yet; the shadow compares it with the union each `emitUnionBoxArg` /
-// `emitUnionCoerce` call site names, and counts each delivery by class.
+// The checker records the union each node is delivered into (`boxDstTyAt`, per instance). The
+// shadow compares it with the union each `emitUnionBoxArg` / `emitUnionCoerce` call site names,
+// and counts each delivery by class. A delivery the table boxes at its record counts as `table`,
+// ungraded (the sweep grades those positions); the box's own lowering inside it is still graded.
 //
 // TWO HALVES, each needed for the other to mean anything:
 //
 //   classes — witnesses whose deliveries land in each class, with exact counts. A delivery a
 //             site boxes inside its own lowering counts as `nested <class>`. `brk` reaches
 //             the record through the loop's exits; its minted `__trap__()` tail never returns.
-//   fires   — `boxDstDropSet(1)` reads no record, so every agreement becomes a missing row;
-//             `boxDstDropSet(2)` reads a type no site names, so every agreement disagrees.
+//   fires   — `boxDstDropSet(1)` reads no record, so every graded agreement becomes a missing
+//             row; `boxDstDropSet(2)` reads a type no site names, so every one disagrees.
 //             Without these a shadow that stopped reading the record would pass.
 //
 // Loads the real seed (`build/vl-compiler.wasm`); absent, the suite self-ignores.
@@ -301,7 +302,7 @@ print(wideJ.f ?? 0)
 Deno.test({
   name: "box-dst shadow: an argument at a union parameter agrees",
   ignore,
-  fn: () => expectRows("arg", ARG, DROP_NONE, "agree=2; nested agree=2"),
+  fn: () => expectRows("arg", ARG, DROP_NONE, "nested agree=2; table=2"),
 });
 
 Deno.test({
@@ -313,14 +314,14 @@ Deno.test({
       "arm",
       ARM,
       DROP_NONE,
-      "agree=2; nested agree=2; nested value already a box=1; value already a box=1",
+      "nested agree=2; nested value already a box=1; table=3",
     ),
 });
 
 Deno.test({
   name: "box-dst shadow: an inferred union element agrees",
   ignore,
-  fn: () => expectRows("elem", ELEM, DROP_NONE, "agree=4; nested agree=4"),
+  fn: () => expectRows("elem", ELEM, DROP_NONE, "nested agree=4; table=4"),
 });
 
 Deno.test({
@@ -331,7 +332,7 @@ Deno.test({
       "coal",
       COAL,
       DROP_NONE,
-      "agree=4; nested agree=8; nested value already a box=1; value already a box=1",
+      "nested agree=6; nested table=2; nested value already a box=1; table=5",
     ),
 });
 
@@ -339,7 +340,7 @@ Deno.test({
   name: "box-dst shadow: a set member's call takes the call's joined union",
   ignore,
   fn: () =>
-    expectRows("setcall", SETCALL, DROP_NONE, "agree=2; nested agree=2"),
+    expectRows("setcall", SETCALL, DROP_NONE, "nested agree=2; table=2"),
 });
 
 Deno.test({
@@ -350,14 +351,14 @@ Deno.test({
       "brk",
       BRK,
       DROP_NONE,
-      "agree=2; nested agree=2; nested value already a box=2; nested value never returns=1; value already a box=2; value never returns=1",
+      "floor: never returns=1; nested agree=2; nested value already a box=2; nested value never returns=1; table=4",
     ),
 });
 
 Deno.test({
   name: "box-dst shadow: a minted map read takes its call's record",
   ignore,
-  fn: () => expectRows("mapget", MAPGET, DROP_NONE, "agree=2; nested agree=2"),
+  fn: () => expectRows("mapget", MAPGET, DROP_NONE, "nested agree=2; table=2"),
 });
 
 Deno.test({
@@ -368,7 +369,7 @@ Deno.test({
       "as",
       AS,
       DROP_NONE,
-      "agree=5; nested agree=11; value already a box=5",
+      "floor: already a box=5; nested agree=8; nested table=3; nested value already a box=5; table=5",
     ),
 });
 
@@ -380,14 +381,14 @@ Deno.test({
       "omit",
       OMIT,
       DROP_NONE,
-      "agree=3; nested agree=9; nested value already a box=1; value already a box=1",
+      "nested agree=6; nested table=3; nested value already a box=1; table=4",
     ),
 });
 
 Deno.test({
   name: "box-dst shadow: a captured binding's cell read takes the read's record",
   ignore,
-  fn: () => expectRows("cap", CAP, DROP_NONE, "agree=3; nested agree=3"),
+  fn: () => expectRows("cap", CAP, DROP_NONE, "nested agree=3; table=3"),
 });
 
 Deno.test({
@@ -398,7 +399,7 @@ Deno.test({
       "opt",
       OPT,
       DROP_NONE,
-      "agree=2; nested agree=14; nested value already a box=2; value already a box=3",
+      "floor: already a box=1; nested agree=8; nested table=6; nested value already a box=3; table=4",
     ),
 });
 
@@ -410,7 +411,7 @@ Deno.test({
       "optcall",
       OPTCALL,
       DROP_NONE,
-      "nested agree=8; nested value already a box=1; value already a box=2",
+      "nested agree=4; nested table=4; nested value already a box=2; table=2",
     ),
 });
 
@@ -422,7 +423,7 @@ Deno.test({
       "tail",
       TAIL,
       DROP_NONE,
-      "agree=3; nested agree=4; nested value already a box=1; nested value never returns=2; value already a box=4",
+      "floor: already a box=3; nested agree=4; nested floor: never returns=1; nested table=1; nested value already a box=4; nested value never returns=1; table=4",
     ),
 });
 
@@ -430,42 +431,42 @@ Deno.test({
   name: "box-dst shadow: an element beside a spread takes the list's element union",
   ignore,
   fn: () =>
-    expectRows("spread", SPREAD, DROP_NONE, "agree=2; nested agree=2"),
+    expectRows("spread", SPREAD, DROP_NONE, "nested agree=2; table=2"),
 });
 
 Deno.test({
   name: "box-dst shadow: a tail `if` and a loop's exits take their own join",
   ignore,
   fn: () =>
-    expectRows("ownjoin", OWNJOIN, DROP_NONE, "agree=8; nested agree=7"),
+    expectRows("ownjoin", OWNJOIN, DROP_NONE, "nested agree=8; table=8"),
 });
 
 Deno.test({
   name: "box-dst shadow: an annotated tail `if` takes the declared result",
   ignore,
   fn: () =>
-    expectRows("anntail", ANNTAIL, DROP_NONE, "agree=1; nested agree=1"),
+    expectRows("anntail", ANNTAIL, DROP_NONE, "nested agree=1; table=1"),
 });
 
 Deno.test({
   name: "box-dst shadow: a field write takes the receiver's storage",
   ignore,
   fn: () =>
-    expectRows("storewrite", STOREWRITE, DROP_NONE, "agree=2; nested agree=2"),
+    expectRows("storewrite", STOREWRITE, DROP_NONE, "nested agree=2; table=2"),
 });
 
 Deno.test({
   name: "box-dst shadow: a parameter's field write takes its calls' storage",
   ignore,
   fn: () =>
-    expectRows("paramwrite", PARAMWRITE, DROP_NONE, "agree=3; nested agree=3"),
+    expectRows("paramwrite", PARAMWRITE, DROP_NONE, "nested agree=3; table=3"),
 });
 
 Deno.test({
   name: "box-dst shadow: a stored literal's field takes the container's build",
   ignore,
   fn: () =>
-    expectRows("storelit", STORELIT, DROP_NONE, "agree=2; nested agree=2"),
+    expectRows("storelit", STORELIT, DROP_NONE, "nested agree=2; table=2"),
 });
 
 Deno.test({
@@ -473,7 +474,7 @@ Deno.test({
     "box-dst shadow: reading no record turns every agreement into a missing row",
   ignore,
   fn: () =>
-    expectRows("arg", ARG, DROP_READ, "nested no record=2; no record=2"),
+    expectRows("arg", ARG, DROP_READ, "nested no record=2; table=2"),
 });
 
 Deno.test({
@@ -481,7 +482,7 @@ Deno.test({
     "box-dst shadow: reading another type turns every agreement into a disagreement",
   ignore,
   fn: () =>
-    expectRows("arg", ARG, DROP_AS_OTHER, "disagree=2; nested disagree=2"),
+    expectRows("arg", ARG, DROP_AS_OTHER, "nested disagree=2; table=2"),
 });
 
 // A generic `a ?? 5` at a list pin is the join `i32[] | i32` (D10600): the instance boxes its
@@ -500,7 +501,7 @@ Deno.test({
       "coalpin",
       COALPIN,
       DROP_NONE,
-      "agree=1; nested agree=1; nested value already a box=1; value already a box=1",
+      "nested agree=1; nested value already a box=1; table=2",
     ),
 });
 
@@ -527,7 +528,7 @@ Deno.test({
       "mapread",
       MAPREAD,
       DROP_NONE,
-      "agree=3; nested agree=3; nested value already a box=1; value already a box=1",
+      "nested agree=3; nested value already a box=1; table=4",
     ),
 });
 
@@ -545,13 +546,13 @@ function mk() {
 }
 const xs: Circle[] = mk()
 print(xs[0].r ?? 5)
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
   ["an annotated binding", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
 const xs: Circle[] = [{ r: null }]
 print(xs[0].r ?? 5)
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
   ["a function-local binding", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
@@ -560,7 +561,7 @@ function mk(): i32 {
   return lv1[0].r ?? 5
 }
 print(mk())
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
   ["a declared list return", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
@@ -568,14 +569,14 @@ function mk(): Circle[] {
   return [{ r: null }]
 }
 print(mk()[0].r ?? 5)
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
   ["a list re-delivered from a binding", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
 const lv1: Circle[] = [{ r: null }]
 const xs: Circle[] = lv1
 print(xs[0].r ?? 5)
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
   ["a map value", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
@@ -583,14 +584,14 @@ type GL = { g: Circle[] }
 const m: Map<string, Circle[]> = Map()
 m.set("a", [{ r: null }])
 print((m.get("a") ?? [])[0].r ?? 5)
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
   ["a nested list", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
 type GL = { g: Circle[] }
 const xs: Circle[][] = [[{ r: null }]]
 print(xs[0][0].r ?? 5)
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
   ["an assigned let", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
@@ -598,14 +599,14 @@ type GL = { g: Circle[] }
 let xs: Circle[] = []
 xs = [{ r: null }]
 print(xs[0].r ?? 5)
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
   ["an argument", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
 type GL = { g: Circle[] }
 function f(xs: Circle[]): i32 { xs[0].r ?? 5 }
 print(f([{ r: null }]))
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
   ["a union-element list", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
@@ -613,14 +614,14 @@ type GL = { g: Circle[] }
 const xs: Shape[] = [{ r: null }]
 const c = xs[0]
 if c is Circle { print(c.r ?? 5) }
-`, "agree=1; nested agree=3; nested value already a box=1; value already a box=1"],
+`, "nested agree=2; nested table=1; nested value already a box=1; table=2"],
   ["a record field", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
 type GL = { g: Circle[] }
 const q: GL = { g: [{ r: null }] }
 print(q.g[0].r ?? 5)
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
   ["a bare record binding", `type Shape = Circle | Sq
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
@@ -629,7 +630,7 @@ function mk(): Circle {
   return c
 }
 print(mk().r ?? 5)
-`, "agree=1; nested agree=1"],
+`, "nested agree=1; table=1"],
 ];
 
 for (const [what, src, want] of NULL_HOLE_LIST_LITS) {
