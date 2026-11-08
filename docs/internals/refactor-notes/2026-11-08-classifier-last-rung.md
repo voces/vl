@@ -57,7 +57,8 @@ argument. Two `tests/cases/closures` headers quote the new text. The eight inven
 * D15568's join: `elabListParamSource` returns one parameter. Two parameters writing one list need
   it to return the set of parameters, and the tag plan (`check_fn_tag.vl`) must type the slots at
   the union of their sets.
-* `vl_emit_diag_position_test`'s instance guard is red. Its fixture is D15568's program, which
-  now refuses at the argument instead of on `take`'s line 7, so it needs another check-clean
-  refusal raised inside a hole parameter's instance. The `monomorphize` guard reads the new
-  anchor, `run(add)` on line 14. The live-sites row quotes the new literal.
+* `vl_emit_diag_position_test`'s instance guard read D15568, which now refuses at the argument
+  instead of on `take`'s line 7. It now reads D15571, a field read off a union of records through an
+  un-annotated parameter, which still refuses inside `take`'s instance (on master too), and all
+  five shapes anchor at `lib.vl:7`. The `monomorphize` guard reads the new anchor, `run(add)` on
+  line 14. The live-sites row quotes the new literal.
