@@ -33,7 +33,13 @@ why the base here is 156 files, not #6812's 142.
 The 4 literal differs are D15301, D9482, `if-choice-of-hole-fn-records-in-list` and
 `hole-fn-generic-pushed-list-spread`, all lists of records holding hole functions. Two of them
 miss at the name (D15301's `a ref list's element row does not resolve` family) and two hit
-another row. All four print the same output on both seeds (see the sweep below).
+another row. All four print the same output on both seeds.
+
+## Sweep (fixpoint seeds, master `756273a1` and candidate)
+
+23,663 same, 1 bytes-only mover (`hole-fn-generic-pushed-list-spread`, one of the 4 differs;
+same output), 0 output movers, 0 runs → not-runs, 0 new compiler traps. Seed 6,515,832 →
+6,516,799 bytes (+0.015%).
 
 ## Files reaching `rlSlotByNameTwin` in `refListSlotOfExpr`
 
