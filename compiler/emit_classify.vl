@@ -1,5 +1,5 @@
 import { unRowOfTyKey } from "./emit_union_tykey"
-import { constBindsLitSet } from "./check_leaf_steps"
+import { constBindsLitSet, forInBindTy } from "./check_leaf_steps"
 import { bundleCallSig } from "./emit_bundle"
 import { clsCensusEnter, clsCensusOn, clsCensusReset } from "./emit_cls_census"
 
@@ -263,7 +263,6 @@ import {
   callMemProp,
   callOriginOf,
   capIsBound,
-  fnLetOfRead,
   isBuiltinFnName,
   litLexIsMember,
   mapShapeFoldSet,
@@ -466,6 +465,7 @@ import {
   annNulRefArrSlot,
   arrLitCommitAnnAt,
   arrLitCommitNameAt,
+  arrLitRlSlotAt,
   mvUnionIsScalarNull,
   mvValInnerRlSlotAt,
   nonNulBaseOf,
@@ -487,7 +487,6 @@ import {
   variantIndexOf,
 } from "./emit_local_slots"
 import {
-  annIsNulStrListDeep,
   annValtypeSlotOf,
   asgValueIsFunc,
   assignTargetSpills,
@@ -626,7 +625,6 @@ import {
   mapFindShapeOfNodeTy,
   mapNodeValKindLowerable,
   mvInnerMapShape,
-  mvSlotNullable,
   mvSlotOfMapNameTy,
   mvValStructIdxOf,
   mvValVariantOf,
@@ -644,6 +642,7 @@ import {
   rlSlotOfRowTy,
   rlSlotOfTyOrTwin,
   sFieldMapShape,
+  sFieldRefSlot,
   structIndexOfNullPartTy,
   structRowOfAnnTy,
   structRowOfNameOrTy,
@@ -655,6 +654,7 @@ import {
   uFieldMapShape,
   uFieldTgtStructIdx,
   unionOfVariant,
+  variantFieldRefSlot,
   variantIndexOfTypeName,
 } from "./emit_shape_rows"
 import {
@@ -670,7 +670,6 @@ import {
   identBindingOfRead,
   identFnTypeAnnNodeOfRead,
   letAnnIsUnion,
-  mvNulListValKind,
   outerFrameBinds,
   paramStructIndex,
   readPosIn,
@@ -826,7 +825,6 @@ import {
   rlElemTyIxAt,
   rlSlotOfTy,
   sFieldIndex,
-  tyScalarBackedListKind,
 } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
@@ -852,6 +850,8 @@ import {
   nodeRepIn,
   nodeTyInOf,
   pinnedParamTyAt,
+  readContainerTyAt,
+  refListElemKind,
   tyIsNulPrim,
   tySameSet,
   valueJoinArmValues,
@@ -5892,71 +5892,21 @@ export function forInMapValsSlot(iterIx: i32, fnIx: i32) {
   sl
 }
 
-// The kind a map's VALUE binds at, for both spellings that walk one: `for v in m.values()`
-// and the second name of `for k, v in m`. ONE ladder, or the two spellings agree about the
-// value's type and disagree about its rep, which is invalid wasm rather than a diagnostic.
+// The kind a map's VALUE binds at, for `for v in m.values()` and the second name of
+// `for k, v in m`: the rep of the value type the map's storage holds (`readContainerTyAt`), so
+// a map narrowed by a value test binds its stored, possibly nullable, value. `i32` off a map.
 export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("mapValElemKind") }
-  const vsl = mapShapeOfExpr(mapObjIx, fnIx)
-  if vsl >= 0 {
-    if mvValKind[vsl] == MVK_STR {
-      // A nullable string value (`{[string]: string | null}`) rides the same kind-3
-      // vals list as its non-null twin (the element slot is nullable either way), so
-      // only the loop var differs: the `string | null` niche, exactly as `const v =
-      // m[k]` binds — the non-null `"str"` var would trap on a stored null.
-      if mvSlotNullable(vsl) { return "nulstr" }
-      return "str" // string value
-    }
-    if mvValKind[vsl] == MVK_F64 {
-      return "f64" // f64 value (scalar local)
-    }
-    if mvValKind[vsl] == MVK_I64 {
-      return "i64" // i64 value (scalar local)
-    }
-    if mvValKind[vsl] == MVK_F32 {
-      return "f32" // f32 value (scalar local)
-    }
-    if mvValKind[vsl] == MVK_CLOSURE {
-      return "closure" // closure value (`{[string]: (i32) => i32}` — loop var calls each)
-    }
-    // A list value (`{[string]: i32[]}` / `S[]` …): the loop var binds the inner
-    // value list's own rep (`mvListValKind`), exactly as a nested-array `for row in
-    // g` does. A nullable list value rides the same vals list as its non-null twin,
-    // so only the loop var differs — the niche kind, mirroring `nulstr`/`nulstruct`.
-    if mvValKind[vsl] == MVK_REF {
-      // A nested-map value (`{[K]: {[K2]: V}}`) rides the same kind-6 vals list with a map
-      // element, and binds the map local its own `m[k]` read binds (D2515).
-      if mvValIsMap(vsl) {
-        if mvSlotNullable(vsl) { return "nulmap" }
-        return "map"
-      }
-      if mvSlotNullable(vsl) { return mvNulListValKind(vsl) }
-      return mvListValKind(vsl)
-    }
-    // A union-box value (`{[string]: i32 | null}`, `{[string]: C | S}`): the vals
-    // element IS `$uBox`, so the loop var binds as a kind-4 union-box local.
-    if mvValKind[vsl] == MVK_UNION { return "union" }
-    // A nullable-struct value (`{[string]: S | null}`) rides the same kind-1 vals
-    // list as its non-null twin; the loop var is the kind-9 niche instead.
-    if mvSlotNullable(vsl) { return "nulstruct" }
-    // A union-arm value (`{[string]: Circle}` where `Circle` is a declared union
-    // member): the loop var is the kind-8 variant local, not struct — the arm's
-    // layout lives in `variantHeap`, since `collectS` skips a union member (D50).
-    if mvValVariantOf(vsl) >= 0 { return "variant" }
-    return "struct" // struct value
-  }
-  // A `null`-valued map rides the mono map; its value is the `null` cell, never read.
-  if mapTyValIsNullUnit(mapRecvTyIn(mapObjIx, fnIx)) { return "nulnone" }
-  return "i32"
+  const v = tyMapValOf(tyMapHeld(readContainerTyAt(mapObjIx, fnIx)))
+  if v < 0 { return "i32" }
+  repSigKindOfTy(v)
 }
 
-// The kind a `for`'s SECOND name binds at. A sequence's companion is its INDEX (an i32
-// counter of body executions), a map's is the VALUE at the key just bound. A set is a
-// sequence here, not a map: its `vals` holds membership booleans nobody wrote.
+// The kind a `for`'s SECOND name binds at: a sequence's index (`i32`), or the value a map's
+// storage holds at the key just bound; null where the iterable binds no second name.
 export function forInPairElemKind(iterIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("forInPairElemKind") }
-  if !forInPairIsMapVal(iterIx, fnIx) { return "i32" }
-  mapValElemKind(iterIx, fnIx)
+  const b = forInBindTy(readContainerTyAt(iterIx, fnIx), true)
+  if b < 0 || tyAt(b) is TyErr { return null }
+  repSigKindOfTy(b)
 }
 
 // Whether a `for`'s SECOND name binds a map VALUE rather than a sequence index. One
@@ -9379,15 +9329,26 @@ function capturedStructIndex(fnIx: i32, name: string) {
   capturedCompanionSlot(fnIx, name)
 }
 
-// The ref-list table slot of a captured ref-array variable, or -1 — `capturedStructIndex`'s
-// sibling on the other index space the companion slot ranges over. The kind gate keeps a
-// ref-list slot out of `sFieldStart` and a struct row out of `rlElemName`, so a captured
-// `S[]` read resolves the same wrapper the env field is typed with.
+// The ref-list table slot of a captured ref-array variable `name` of `fnIx`, a nullable one
+// included, read off the type its parent frame's binding holds; -1 for any other capture and for
+// a captured loop variable.
 export function capturedRefListSlot(fnIx: i32, name: string) {
-  if clsCensusOn { clsCensusEnter("capturedRefListSlot") }
-  const ck = capturedKindOf(fnIx, name)
-  if ck != "reflist" && ck != "nulreflist" { return -1 }
-  capturedCompanionSlot(fnIx, name)
+  if fnIx < 0 { return -1 }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return -1 }
+  const b = parentBindingOf(fe, name)
+  if b < 0 { return -1 }
+  const pf = parentBindingFrameArenaOf(fe, name)
+  const bn = nodeAt(b)
+  let ty = -1
+  if bn is Param {
+    if bn.parType >= 0 { ty = nodeTyInOf(bn.parType, pf) }
+  } else if bn is LetDecl {
+    ty = letBindTy(b, pf)
+  }
+  const k = repSigKindOfTy(ty)
+  if k != "reflist" && k != "nulreflist" { return -1 }
+  repSlotOfKind(k, ty)
 }
 
 // The map shape of a captured nullable-map cell, or -1 when `name` is not such a capture.
@@ -10220,11 +10181,6 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
 
 // True if an index read `e` yields the union box: a union-element ref list's cell or a
 // union-valued map's value. False when the read unboxes a narrowed atom or container.
-// The rep of an element of the list `arr` (in frame `fnIx`), read from its type at this instance.
-export function refListElemKind(arr: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("refListElemKind") }
-  repSigKindOfTy(tyArrayElemIx(nodeTyInOf(arr, fnIx)))
-}
 
 // Whether the elements of the list `arr` (in frame `fnIx`) are value-union boxes, read from its
 // type at this instance.
@@ -12326,10 +12282,59 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   ""
 }
 
-// The per-element-type ref-list table SLOT the expression at `exprIx` produces, or -1 when
-// the element type does not resolve: its rep's row, else the slot its binding keeps, else (an
-// identifier) its type's row, else (a list literal or call) its rungs' row, else its name's.
-// Slot 0 is a real row, so every caller tests the result before indexing a backing table.
+// `refListElemNameOfMember`'s rungs as slots, in its order: the field's storage row, -1 where
+// the field holds no ref list, -2 at a rung that has only a name.
+function refListKeptSlotOfMember(e: Member, exprIx: i32, fnIx: i32): i32 {
+  if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST { return -2 }
+  const vi = memNarrowVariantIndex(exprIx, fnIx)
+  if vi >= 0 {
+    const vfi = variantFieldIndex(vi, e.memProp)
+    if vfi < 0 || variantFieldElemName(vi, vfi) == "" { return -1 }
+    return keptOrName(variantFieldRefSlot(vi, vfi))
+  }
+  const avi = memRecvArmVariantIndex(e.memObj, fnIx)
+  if avi >= 0 {
+    const afi = variantFieldIndex(avi, e.memProp)
+    if afi >= 0 && variantFieldElemName(avi, afi) != "" {
+      return keptOrName(variantFieldRefSlot(avi, afi))
+    }
+  }
+  const si = structIndexOfExpr(e.memObj, fnIx)
+  if si >= 0 {
+    const fi = sFieldIndex(si, e.memProp)
+    if fi >= 0 {
+      if sFieldElemNameAt(si, fi) == "" { return -1 }
+      return keptOrName(sFieldRefSlot(si, fi))
+    }
+  }
+  -2
+}
+
+// `refListElemNameOfIndex`'s rungs as slots, in its order: the receiver row's inner row, -2
+// at a rung that has only a name.
+function refListKeptSlotOfIndex(e: Index, exprIx: i32, fnIx: i32): i32 {
+  if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST { return -2 }
+  const os = refListSlotOfExpr(e.idxArr, fnIx)
+  if os < 0 { return -2 }
+  if rlSlotIsKindList(os, RLK_REF_LIST) {
+    const ins = rlElemInnerSlot(os)
+    if ins >= 0 && ins < rlElemName.length {
+      if rlSlotOfTyOrTwin(rlElemTyIxAt(ins)) == ins { return ins }
+    }
+  }
+  -2
+}
+
+// A rung's slot, or -2 (the name answers) where the rung has none.
+function keptOrName(s: i32): i32 {
+  if s >= 0 && s < rlElemName.length { return s }
+  -2
+}
+
+// The ref-list table slot the expression at `exprIx` produces, or -1 when none resolves: its
+// rep's row, else its binding's kept slot, else (an identifier) its type's row, else (a literal,
+// call, field or index read) its rungs' row, else a literal's minted row, else its name's.
+// Slot 0 is a real row, so a caller tests the result before indexing a backing table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   const rs0 = listRowOfExpr(exprIx, fnIx)
   if rs0 >= 0 { return rs0 }
@@ -12347,6 +12352,19 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   if pe is Call {
     const cs = refListKeptSlotOfCall(pe, exprIx, fnIx)
     if cs != -2 { return cs }
+  }
+  if pe is Member {
+    const ms = refListKeptSlotOfMember(pe, exprIx, fnIx)
+    if ms != -2 { return ms }
+  }
+  if pe is Index {
+    const xs = refListKeptSlotOfIndex(pe, exprIx, fnIx)
+    if xs != -2 { return xs }
+  }
+  // A literal the rungs leave to its name reads the row the intern pass minted it at.
+  if pe is ArrayLit {
+    const mint = arrLitRlSlotAt(exprIx)
+    if mint >= 0 && mint < rlElemName.length { return mint }
   }
   const nm = refListElemNameOfExpr(exprIx, fnIx)
   const s = rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
@@ -12446,29 +12464,19 @@ function refListKeptSlotOfIdent(e: Ident, exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The ref-list ELEMENT type-NAME a ref-list `LetDecl` binds: from its `S[]`/`N[]`
-// annotation if present, else inferred from its initializer (`refListElemNameOfExpr`).
-// "" if not a ref-list local.
+// The element type name of the ref list, a nullable one included, that binding `letIx` holds at
+// `fnIx`, read off its row; "" when it holds no ref list.
 export function letRefListElemName(letIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("letRefListElemName") }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      const lt = nodeAt(d.letType)
-      if lt is TypeRef {
-        // The one site whose else-branch is the initializer path rather than "": an annotation
-        // whose element has no row yet falls through to the initializer's row.
-        const en = annBareRefArrElemName(d.letType)
-        if en != "" { return en }
-      }
-    }
-    return refListElemNameOfExpr(d.letInit, fnIx)
-  }
-  ""
+  const ty = letBindTy(letIx, fnIx)
+  const k = repSigKindOfTy(ty)
+  if k != "reflist" && k != "nulreflist" { return "" }
+  const sl = repSlotOfKind(k, ty)
+  if sl < 0 || sl >= rlElemName.length { return "" }
+  rlElemName[sl]
 }
 
-// The arena element type of the name `letRefListElemName` returns, read from the same source:
-// the annotation's element where that names one, else the initializer's at `fnIx`. -1 else.
+// The arena element type of the ref list binding `letIx` declares: the annotation's element where
+// that names a row, else the initializer's at `fnIx`. -1 else.
 export function letRefListElemTy(letIx: i32, fnIx: i32): i32 {
   if letIx < 0 { return -1 }
   const d = nodeAt(letIx)
@@ -12769,69 +12777,14 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
   exprListRep(exprIx, fnIx) == "strlist"
 }
 
-// True if the expression at `exprIx` produces a `(string | null)[]` — the string-ref niche
-// list, whose backing is a plain string list but whose element read stays `(ref null)`
-// instead of recovering non-null. Recognizes the receiver by its recorded array element
-// type or a param/local annotation. Drives the dedicated read arm, checked before `exprStringArray`.
+// True if `exprIx` at instance `fnIx` is a list of `string | null`, a nullable list included: the
+// string list whose element read stays `(ref null)` rather than recovering non-null. Checked
+// before `exprStringArray`.
 export function exprNulStrArray(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("exprNulStrArray") }
   if exprIx < 0 { return false }
-  if arrElemIsNulStrAt(exprIx, fnIx) { return true }
-  // A list whose recorded element is a hole's variable holds what the instance `fnIx` pins it
-  // to, and at `string | null` a read that recovers non-null traps on the null (D3089).
-  const pe = nodeArrayElemTyIx(exprIx)
-  if pe >= 0 && tyHasTyVar(pe) {
-    if tyIsNulPrim(iterElemPinTy(exprIx, fnIx), "string") { return true }
-  }
-  const e = nodeAt(exprIx)
-  match e {
-    Paren => {
-      return exprNulStrArray(e.parInner, fnIx)
-    }
-    Ident => {
-      const pt = paramTypeNodeOfRead(fnIx, exprIx)
-      if pt >= 0 {
-        // `…Deep` also admits a `(string | null)[] | null` param narrowed with `!= null`: the
-        // narrowed value stays `(ref null)`, since the plain-string arm's recover traps on null.
-        return annIsNulStrListDeep(pt)
-      }
-      // A union binding narrowed to the `(string | null)[]` arm reads unboxed as the
-      // string list whose ELEMENT stays `(ref null)` — the same nullable read discipline.
-      if tyScalarBackedListKind(readNarrowedTyAt(exprIx, fnIx)) == "strlist" {
-        return true
-      }
-      // A local, param or global binding typed
-      // `(string | null)[]` — or `(string | null)[] | null`, narrowed via `t0 != null`.
-      if identBindingNulStrList(exprIx, fnIx) { return true }
-    }
-    // No other expression is a nullable-string list.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  false
-}
-
-// The `exprNulStrArray` binding resolver: whether the binding the read `readIx` names (a
-// `let` of the frame, a parameter, else a module global) is typed a `(string | null)[]` list,
-// directly or under an outer `| null`.
-function identBindingNulStrList(readIx: i32, fnIx: i32): boolean {
-  let bt = -1
-  const li = fnLetOfRead(fnIx, readIx)
-  if li >= 0 {
-    bt = nodeTyAt(li, fnIx)
-  } else {
-    const pt = paramTypeNodeOfRead(fnIx, readIx)
-    if pt >= 0 {
-      bt = nodeTyAt(pt, fnIx)
-    } else {
-      const gl = globalLetOfRead(fnIx, readIx)
-      if gl >= 0 { bt = nodeTyAt(gl, -1) }
-    }
-  }
-  if bt < 0 || bt >= T.tys.length { return false }
-  const et = tyArrayElemIx(nonNullTy(bt))
-  if et < 0 { return false }
-  const rd = repOfTy(et)
-  rd.rdCovered == 1 && rd.rdKind == "nulstr"
+  const ty = nodeTyAt(exprIx, fnIx)
+  if ty < 0 || ty >= T.tys.length { return false }
+  tyIsNulPrim(tyArrayElemIx(nonNullTy(ty)), "string")
 }
 
 // True if `exprIx` evaluates to an `f64[]`: a projection of `exprListRep`.

@@ -15,7 +15,12 @@ import {
   Param,
   nodeAt,
 } from "./ast"
-import { elabInstTyAt, elabKeyAt, elabNodeTyAt } from "./emit_elab"
+import {
+  elabInstTyAt,
+  elabKeyAt,
+  elabNodeTyAt,
+  readNarrowedStoreAt,
+} from "./emit_elab"
 import { fusedMapReadRecvIx } from "./check_leaf_steps"
 import { nodeTyIsNullable, nodeTyIxOf } from "./check_node_tys"
 import { cexLitPeel } from "./check_num_lits"
@@ -35,9 +40,11 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  litBaseTy,
   nomNameOfTy,
   numLitUnionBaseName,
   primNameStr,
+  tyArrayElemIx,
   tyAt,
   tyEq,
   tyIsLitUnion,
@@ -63,6 +70,7 @@ import {
   nulScalarBoxAtomOf,
   repOfNodeAt,
   repOfTy,
+  repSigKindOfTy,
   repVariantShapeRowOf,
   tyMapKeyKind,
 } from "./emit_rep"
@@ -83,12 +91,15 @@ import {
 } from "./emit_state"
 import { unMemIsMap, unMemPeelAliasWrapper } from "./emit_union_registry"
 import { i32ListHas } from "./listutil"
-import { tyProvesNonNull } from "./check_relate_core"
+import { assignable, tyProvesNonNull } from "./check_relate_core"
 import {
   flattenVariantsInto,
   tyEmitPrimOf,
   tyHasTyVar,
+  tyMapHeld,
   tyMapValOf,
+  tyPeelNul,
+  tyStepElem,
 } from "./tyquery"
 
 // `ty` at the pin of the instance `fnIx` is, or is lifted inside: its type parameters or holes
@@ -96,6 +107,29 @@ import {
 export function instanceTyOf(ty: i32, fnIx: i32): i32 {
   if ty < 0 || !tyHasTyVar(ty) { return ty }
   elabInstTyAt(ty, fnIx)
+}
+
+// The type the read `ix` delivers inside `fnIx`: a map or list narrowed to a subtype of its
+// storage (a value test, which converts nothing) is the storage's container, a literal is its
+// base scalar, and any other read is its own type.
+export function readContainerTyAt(ix: i32, fnIx: i32): i32 {
+  if ix < 0 { return -1 }
+  const t = nodeTyInOf(unwrapParen(ix), fnIx)
+  if t < 0 || t >= T.tys.length { return t }
+  const tl = tyAt(t)
+  if tl is TyLit { return litBaseTy(tl) }
+  const st = readNarrowedStoreAt(ix, fnIx)
+  if st < 0 || st >= T.tys.length { return t }
+  const sm = tyMapHeld(st)
+  const tm = tyMapHeld(t)
+  if sm >= 0 && tm >= 0 {
+    if assignable(tyMapValOf(tm), tyMapValOf(sm)) { return sm }
+    return t
+  }
+  const se = tyStepElem(tyPeelNul(st))
+  const te = tyStepElem(tyPeelNul(t))
+  if se >= 0 && te >= 0 && assignable(te, se) { return tyPeelNul(st) }
+  t
 }
 
 // Whether a `for` range's step is a constant the emitter FOLDS — absent (the implicit `+1`),
@@ -1011,6 +1045,12 @@ export function mapTyPeel(ty: i32): i32 {
   if t is TyNullable { return mapTyPeel(t.nInner) }
   if unMemIsMap(ty) { return unMemPeelAliasWrapper(ty) }
   -1
+}
+
+// The rep of an element of the list `arr` at instance `fnIx`, read from its type there; null
+// when `arr` is no list or its element has no rep.
+export function refListElemKind(arr: i32, fnIx: i32): VKind | null {
+  repSigKindOfTy(tyArrayElemIx(nodeTyInOf(arr, fnIx)))
 }
 
 // Whether the for-in iterable `iterIx` is `m.values()` over a receiver typed as a map, a
