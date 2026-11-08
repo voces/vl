@@ -716,3 +716,36 @@ for (
     },
   });
 }
+
+// An instance's operand (typed only at its pin), a cast's operand and a wide number boxed into a
+// union that holds it: each carries its pair, so the table serves all three, and both controls
+// turn them into floors.
+const NUM_INSTANCE_CAST_BOX = `function inc(a) { a * 2 }
+print(inc(2.5))
+const x: i32 = 3
+const y: i64 = 4
+print(x as f64)
+print(y as% i32)
+const u: f64 | string = 1.5 * 2.0
+print(u)
+`;
+for (
+  const [drop, want] of [
+    [DROP_NONE, "num table=8"],
+    [DROP_READ, "num floor: no record=8"],
+    [DROP_AS_OTHER, "num floor: dst differs=8"],
+  ] as const
+) {
+  Deno.test({
+    name: `box-dst shadow: instance, cast and box operands carry their pair (drop ${drop})`,
+    ignore,
+    fn: () => {
+      const { rc, rows } = shadow(NUM_INSTANCE_CAST_BOX, drop, true);
+      if (rc !== 0) throw new Error(`num instance/cast/box: want compileSrc rc 0, got ${rc}`);
+      const got = show(rows);
+      if (got !== want) {
+        throw new Error(`num instance/cast/box (drop ${drop}):\n  want: ${want}\n  got:  ${got}`);
+      }
+    },
+  });
+}

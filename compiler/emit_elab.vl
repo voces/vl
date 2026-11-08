@@ -1682,6 +1682,25 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   k
 }
 
+// Enqueues at the root the default instance (each parameter hole at `i32`) of each hole function
+// whose value is read and that no instance reaches, so a build where that value is stored has a key.
+function elabStoredHoleDefaults() {
+  let grew = false
+  for d in elabValueDecls.keys() {
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
+    if dn is FuncDecl && elabIsHoleFn(d) && !elabHasInstance(d) {
+      const pts: i32[] = []
+      for _p in dn.fnParams { pts.push(TY_I32) }
+      elabGuessing = true
+      elabEnqueueAtParams(d, pts)
+      elabGuessing = false
+      grew = true
+    }
+  }
+  if grew { elabSettle(0) }
+  0
+}
+
 // Whether each instance's body has been checked.
 let ekDone: boolean[] = []
 // The instances whose bodies the monomorphizer is walking, innermost last.
@@ -9019,6 +9038,7 @@ export function elabRun() {
   erRowAt = Map()
   elabValCalls = Map()
   elabValueKeys = Map()
+  elabSoleHoleKeys = Map()
   elabValueInstKeys = Map()
   elabValueInstVia = Map()
   elabHoleMapMemo = Map()
@@ -9353,6 +9373,7 @@ export function elabRun() {
   elabListMemberSigs()
   elabClosedLamRootKeys()
   elabReturnCredits()
+  elabStoredHoleDefaults()
   let lr = 0
   while lr < elabListSigRows.length {
     elabListSigRow(
@@ -9380,6 +9401,11 @@ export function elabRun() {
       }
     }
     sk0 = sk0 + 1
+  }
+  elabSoleHoleKeys = Map()
+  for sd in keyOf.keys() {
+    const sk1 = keyOf.get(sd) ?? -1
+    if sk1 >= 0 { elabSoleHoleKeys[sd] = sk1 }
   }
   let sg = if keyOf.keys().length > 0 { 0 } else { P.nodes.length }
   while sg < P.nodes.length {
@@ -17115,7 +17141,9 @@ export function elabValueKeyAt(x: i32, decl: i32, pTys: i32[]): i32 {
       if elabKeyBindsParams(k, d, f, pTys) { return k }
     }
   }
-  first
+  if first >= 0 || cwFnValueDeclOf(x) != d { return first }
+  // A hole function's one root instance is that instance at every read, a clone's included.
+  elabSoleHoleKeys.get(d) ?? -1
 }
 
 // The instance of `decl` a function value at `x` delivered to a typed slot is: the one the
@@ -17131,6 +17159,9 @@ export function elabDeliveryKeyOf(x: i32, decl: i32): i32 {
 // The source declarations of the named functions some node reads as a value rather than as a
 // call's callee, filled by `elabRun`.
 let elabValueDecls: {[i32]: boolean} = Map()
+
+// Each un-annotated function's one instance, made at the root, filled at the end of `elabRun`.
+let elabSoleHoleKeys: {[i32]: i32} = Map()
 
 // Whether named function `decl` is ever delivered as a value: read by name anywhere other than
 // as the callee of a call. Its instances are keyed by the value half (architecture-target §3.4).
@@ -18276,14 +18307,17 @@ export function elabCallHoleParamTy(tpl: i32, i: i32, par: i32): i32 {
 }
 
 // The instance the elaboration keyed lambda `decl` at, in the instance being walked or the call's
-// own instance that one refines (the lambda literal sits there); -1 for none.
+// own instance that one refines (the lambda literal sits there), else its one root instance; -1
+// for none.
 export function elabLamKeyOf(decl: i32): i32 {
   const top = elabWalkTop()
   const k = elabLamKeyUnder(decl, top)
   if k >= 0 || top < 0 { return k }
   const r = elabKeyRefines.get(top) ?? -1
-  if r < 0 { return -1 }
-  elabLamKeyUnder(decl, r)
+  const rk = if r >= 0 { elabLamKeyUnder(decl, r) } else { -1 }
+  if rk >= 0 { return rk }
+  // A lambda instanced once, at the root, is that instance inside every instance that reads it.
+  elabSoleHoleKeys.get(elabSrcDecl(decl)) ?? -1
 }
 
 // Lambda `decl`'s value key under instance `top`; -1 for none or two.
