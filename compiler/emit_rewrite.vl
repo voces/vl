@@ -2,7 +2,7 @@
 // that run before collection and lowering — self-method / operator / index-trap
 // dispatch rewriting (`dispatchRewrite`), captured-mutation boxing
 // (`captureBoxRewrite`), and the synthesized return/param annotations
-// (`synthRetAnnots`/`synthParamAnnots`) that pin checker-inferred types onto
+// (`synthRetAnnots`) that pin checker-inferred types onto
 // declarations for later phases. Consults the classifiers (`emit_classify.vl`);
 // writes no bytes.
 
@@ -15,13 +15,9 @@ import {
   narrowedFromTyCopy,
   nodeTyCarry,
   nodeTyExcludesNull,
-  nodeTyIsLitUnionAlias,
   nodeTyIsMap,
   nodeTyIsNullable,
-  nodeTyIsUnion,
   nodeTyIxOf,
-  nodeTyMapName,
-  nodeTyName,
   nodeTyRecord,
   nodeTySetGrow,
 } from "./check_node_tys"
@@ -38,7 +34,6 @@ import {
   optCallCalleeOf,
   optReadParts,
 } from "./check_core_state"
-import { nulRecListNominalName } from "./check_emit_queries"
 import {
   forInBindTy,
   lvTyBool,
@@ -99,7 +94,6 @@ import {
   litUnionAliasNameOfTy,
   mkArrayTy,
   mkNullableTyOf,
-  numLitUnionBaseName,
   tyArrayElemIx,
   tyAt,
   tyBearsNull,
@@ -255,8 +249,6 @@ import {
   sNames,
   startStmts,
   uVariants,
-  unNames,
-  unTyIx,
 } from "./emit_state"
 import { capMemoNoteEdit } from "./emit_capture_frames"
 import { fnLetReadTyOf, fnTagTyIsTagged } from "./check_elab_cap"
@@ -276,7 +268,6 @@ import { drwFieldClosure, listUnionEmitName } from "./emit_sig_tokens"
 import { structFieldNameUsed } from "./emit_atom_kinds"
 import { eqgCoreAdd, eqgCoresReset, eqgRowIsCyclic } from "./emit_eq_rows"
 import { nliForgetLet } from "./emit_union_atoms"
-import { unRowOfTyKey } from "./emit_union_tykey"
 import { fnIndexOfInScopeChainAt } from "./emit_value_sites"
 import {
   IDENT_BUILTIN,
@@ -303,7 +294,6 @@ import { memoKeyNew, memoMoved } from "./memo"
 import {
   flattenVariantsInto,
   nonNullTy,
-  numLitUnionHasBase,
   tyHasTyVar,
   tyIsFnArmUnion,
   tyStepRet,
@@ -3253,121 +3243,6 @@ function synthUnionRet(fn: FuncDecl, jty: i32, jnm: string): i32 {
     }
   }
   fn.fnRet = synthTypeRefTy(jnm, -1, jty)
-  0
-}
-
-// The pin an un-annotated union param takes, chosen by the param's own union rep, never
-// by `unNames` declaration order — a boxed union shares `$uBox` so any boxed alias works,
-// but a litunion's atom ids are its own member strings, so it must pin the param's own
-// rendered type. "" means no pin: a boxed param with no boxed alias registered at all.
-function unionParamPinName(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if tyIsLitUnion(ty) {
-    // A litunion param's rep follows the spelling its context is written in: a declared alias
-    // (`(K) => i32`) reps as the i32 atom, an inline member spelling (`("a"|"b") => i32`)
-    // softens to `string`. `nodeTyIsLitUnionAlias` is what separates them — the alias's
-    // own arena index, not a member-set match an inline spelling would also satisfy.
-    if nodeTyIsLitUnionAlias(ix) {
-      const al = litUnionAliasNameOfTy(ty)
-      if al != "" { return al }
-    }
-    // An inline spelling softens to `string`, the name every all-string literal union
-    // renders to at the root.
-    return "string"
-  }
-  // A numeric literal union (`0 | 1`, `1.5 | 2.5`) reps as its base scalar, not the boxed
-  // loop below: `tyIsLitUnion` rejects any member whose `litKind != "str"`, so a numeric
-  // litunion needs its own rung (`numLitUnionBaseName`). No spelling split, unlike the
-  // string half: an alias and an inline spelling soften to the same base scalar.
-  const nb = numLitUnionBaseName(ty)
-  if nb != "" { return nb }
-  // The param's own row first: the pin's spelling is what an `is` in the body is decided
-  // against, so another union's alias folds a test on a member it lacks (D3039).
-  const own = unRowOfTyKey(ty)
-  if own >= 0 { return unNames[own] }
-  let u = 0
-  while u < unNames.length {
-    const nm = unNames[u]
-    // A literal union, string or numeric, reps as its atom or base scalar, never as the box, so
-    // its row is no pin for an unrelated union. Tested off the row's own type (`unTyIx`); a row
-    // with no type is passed over, since nothing says what it reps as.
-    const row = unTyIx[u]
-    let skip = true
-    if row >= 0 { skip = tyIsLitUnion(row) || numLitUnionHasBase(row) }
-    if !skip { return nm }
-    u = u + 1
-  }
-  ""
-}
-
-// The name an un-annotated parameter's recorded type pins to — "what its annotation would
-// have said" — or "" when the checker recorded no usable type (a `TyVar`, the still-open
-// inference hole). Nullable cannot share the union arm's "pin any declared alias" shortcut:
-// `i32|null` boxes, `string|null` niches, `boolean|null` is an i32 sentinel — each pins its own.
-export function recordedParamPinName(pIx: i32) {
-  if nodeTyIsUnion(pIx) { return unionParamPinName(pIx) }
-  if nodeTyIsNullable(pIx) {
-    const nty = tyToEmitName(nodeTyIxOf(pIx))
-    if nty == "" { return "" }
-    // Resolves the shape under the null on the arena, the rule the general arm applies below;
-    // the render stays as the fall-through and as the inference-hole gate.
-    const nnom = shapeNominalOfTy(nonNullTy(nodeTyIxOf(pIx)))
-    if nnom != "" { return nnom + "|null" }
-    return nty
-  }
-  // A map typed only by its context pins its own spelling, so its reads are a map receiver's
-  // (D9990); an open hole in it still pins nothing.
-  if nodeTyIsMap(pIx) {
-    if tyHasTyVar(nodeTyIxOf(pIx)) { return "" }
-    return nodeTyMapName(pIx)
-  }
-  const tn = nodeTyName(pIx)
-  if tn == "" { return "" }
-  // A list of nullable records pins the declared struct's row, as its own binding does.
-  const nrl = nulRecListNominalName(nodeTyIxOf(pIx))
-  if nrl != "" { return nrl }
-  // The shape-to-nominal decision moves onto the arena (`shapeNominalOfTy`), but the render
-  // (`tn`) stays: it is the artefact `synthParamAnnots` mints from, and its emptiness is the
-  // inference-hole gate (a `TyVar` renders ""). The gate order is deliberately unchanged —
-  // hoisting the arena rung above the render would make the hole gate conditional.
-  const nom = shapeNominalOfTy(nodeTyIxOf(pIx))
-  if nom != "" { return nom }
-  tn
-}
-
-export function synthParamAnnots() {
-  let fe = 0
-  while fe < fnStmts.length {
-    const fn = nodeAt(fnStmts[fe])
-    if fn is FuncDecl {
-      const ps = fn.fnParams
-      let pi = 0
-      while pi < ps.length {
-        const p = nodeAt(ps[pi])
-        if p is Param {
-          if p.parType < 0 {
-            const upin = recordedParamPinName(ps[pi])
-            if upin != "" {
-              // `recordNodeTyFrom` is kept rather than deleted, which is what makes passing
-              // `srcTy` here exactly equivalent to the old code path rather than nearly so:
-              // it rewrites the same value when `srcTy >= 0`, and at -1 (argued unreachable
-              // above) the copy still overwrites the placeholder with -1 as it did before.
-              const srcTy = nodeTyIxOf(ps[pi])
-              const un = synthTypeRefTy(upin, -1, srcTy)
-              // Carries the parameter's recorded arena type onto the synthesized annotation,
-              // so a consumer classifies the pin structurally instead of re-deriving it from
-              // the name. Without it a litunion param's wasm slot and its annotation type
-              // disagreed — invalid wasm, and a bare `print` on the raw atom id.
-              recordNodeTyFrom(un, ps[pi])
-              p.parType = un
-            }
-          }
-        }
-        pi = pi + 1
-      }
-    }
-    fe = fe + 1
-  }
   0
 }
 
