@@ -4418,7 +4418,8 @@ export function elabRetRecLitGrow(lit: i32, t: i32) {
 
 // The parameter of `fn` every element of the list literal bound at `d` reads, `d` a `const` or a
 // `let` nothing re-points, where each read of `d` in `fn`'s own body is an element called in place
-// (`d[i](...)`) or a push of that parameter's reads; else -1.
+// (`d[i](...)`), a push or slot write (`d[i] = a`) of that parameter's reads, or a hand whole to
+// a named function's un-annotated parameter; else -1.
 export function elabListParamSource(d: i32, fn: FuncDecl): i32 {
   if d < 0 || d >= P.nodes.length { return -1 }
   const ln = nodeAt(d)
@@ -4454,6 +4455,8 @@ export function elabListParamSource(d: i32, fn: FuncDecl): i32 {
         const gn = nodeAt(g)
         const kept = elabListPushOfParam(p, g, x, pd, fn)
           || elabListHandedWhole(p, x)
+          || elabSlotWriteList(g) == d
+          && elabAssignedParamOf(g, fn) == pd
         if !kept && (!(pn is Index) || pn.idxArr != x) { return -1 }
         if !kept && (!(gn is Call) || parenPeelIx(gn.callFn) != p) { return -1 }
       }
@@ -4468,8 +4471,34 @@ export function elabListParamSource(d: i32, fn: FuncDecl): i32 {
   pd
 }
 
+// The binding whose slot assignment `g` (`d[i] = v`, not compound) writes; -1 for another node.
+export function elabSlotWriteList(g: i32): i32 {
+  if g < 0 || g >= P.nodes.length { return -1 }
+  const b = nodeAt(g)
+  if !(b is BinExpr) || b.binOp != "=" || b.binCompound != "" { return -1 }
+  const t = parenPeelIx(b.binLeft)
+  const tn = if t >= 0 && t < P.nodes.length { nodeAt(t) } else { b }
+  if !(tn is Index) { return -1 }
+  const o = parenPeelIx(tn.idxArr)
+  if o < 0 || o >= P.nodes.length || !(nodeAt(o) is Ident) { return -1 }
+  identDeclOf(o)
+}
+
+// The parameter of `fn` the value assigned at `g` reads, directly or through a copy; -1 for
+// another node or value.
+function elabAssignedParamOf(g: i32, fn: FuncDecl): i32 {
+  if g < 0 || g >= P.nodes.length { return -1 }
+  const n = nodeAt(g)
+  if !(n is BinExpr) { return -1 }
+  const v = parenPeelIx(n.binRight)
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return -1 }
+  const src = identDeclOf(v)
+  if i32ListHas(fn.fnParams, src) { src } else { elabParamCopyOf(src, fn) }
+}
+
 // Whether list read `x` is a positional argument of call `p` to a named function whose parameter
-// there is un-annotated, so the callee's instance takes the list at its holder's type.
+// there is un-annotated or a list of one of its type parameters, so the callee's instance takes
+// the list at its holder's type.
 function elabListHandedWhole(p: i32, x: i32): boolean {
   const c = nodeAt(p)
   if !(c is Call) { return false }
@@ -4483,7 +4512,15 @@ function elabListHandedWhole(p: i32, x: i32): boolean {
   const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { c }
   if !(f is FuncDecl) || i >= f.fnParams.length { return false }
   const q = nodeAt(f.fnParams[i])
-  q is Param && q.parType < 0
+  if !(q is Param) { return false }
+  if q.parType < 0 { return true }
+  // A list of one of the callee's own type parameters (`ys: T[]`) binds it to the holder's element.
+  const qt = nodeAt(q.parType)
+  if !(qt is TypeRef) { return false }
+  for tp in f.fnTyParams {
+    if qt.tyName == tp + "[]" { return true }
+  }
+  false
 }
 
 // Whether the member at `p` read off list read `x`, called at `g`, pushes only reads of
