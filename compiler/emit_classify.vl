@@ -518,6 +518,7 @@ import {
   atomNarrowOp,
   boxNarrowAtomFor,
   declaredRefArrayName,
+  declaredRefArraySlot,
   emptyArrHoleElemSlot,
   exprReReadable,
   fnRetNulRefArrayNameSid,
@@ -752,6 +753,7 @@ import {
   VKind,
   armFieldElemName,
   armFieldNames,
+  armFieldStoreTy,
   armFieldTypes,
   capCountTbl,
   capNamesFlat,
@@ -795,6 +797,9 @@ import {
   rlElemNullable,
   rlElemTyIx,
   sFieldCount,
+  sFieldStart,
+  sFieldStoreTy,
+  sFieldTypes,
   sIsRefRow,
   sLitIdRow,
   sLitMintFn,
@@ -1818,14 +1823,36 @@ function nulNoneReadCellKind(exprIx: i32, fnIx: i32): VKind {
   "nulnone"
 }
 
-// The kind of the cell a read takes its value from: a name's cell, or a field's storage. A
-// code-15 field is stored nullable whether it is declared `S` or `S | null`. Null for a node
-// that names no cell, or a field whose storage is not a nullable niche.
+// The kind of the cell a read takes its value from: a name's cell, or the rep of a field's storage
+// type. Null for a node that names no cell, or a field whose storage is not a nullable niche.
 function readCellKind(exprIx: i32, fnIx: i32): VKind | null {
   if clsCensusOn { clsCensusEnter("readCellKind") }
   const ck = identCellVKind(exprIx, fnIx)
   if ck != null { return ck }
-  const fc = memberFieldCode(unwrapParen(exprIx), fnIx)
+  const mx = unwrapParen(exprIx)
+  if mx < 0 || !(nodeAt(mx) is Member) { return null }
+  const st = memberFieldStoreTy(mx, fnIx)
+  if st >= 0 {
+    const d = repOfTy(st)
+    // `nulnone` is the storage of a field whose type names no record yet (an inference hole).
+    if d.rdCovered == 1 && d.rdKind != "nulnone" {
+      return nulNicheOrNull(d.rdKind)
+    }
+  }
+  fieldCodeCellKind(mx, fnIx)
+}
+
+// `k` when it is a nullable niche a cell can hold, else null.
+function nulNicheOrNull(k: VKind): VKind | null {
+  if k == "nulstr" || k == "nulbool" { return k }
+  if vkNonNullRefTwin(k) != null { return k }
+  null
+}
+
+// The cell kind of a field read whose storage type is unknown, uncovered or names no record, from
+// its code: code 15 is a nullable struct ref, whatever it declares.
+function fieldCodeCellKind(memIx: i32, fnIx: i32): VKind | null {
+  const fc = memberFieldCode(memIx, fnIx)
   if fc == FC_NUL_STR { return "nulstr" }
   if fc == FC_NUL_BOOL { return "nulbool" }
   if fc == FC_STRUCT { return "nulstruct" }
@@ -1968,27 +1995,6 @@ export function fnRetExprOf(fnIx: i32) {
     return firstValuedReturn(fn.fnBody)
   }
   -1
-}
-
-// The map shape of a return expression that is a captured map variable, as its rep's slot
-// (mono is -1), or -3 when the return is not a captured map. `captureNamesOf` is the source
-// of truth, so a same-named local or param shadowing a capture stays with the local arms.
-export function retCapturedMapShape(fe: i32, rx: i32): i32 {
-  const u = unwrapParen(rx)
-  if u < 0 || u >= P.nodes.length { return -3 }
-  const e = nodeAt(u)
-  if e is Ident {
-    if fe >= 0 && parentBindingOf(fe, e.identName) >= 0 {
-      for c in captureNamesOf(fe) {
-        if c == e.identName {
-          const rd = repOfNode(u, fe)
-          if rd.rdCovered == 1 && rd.rdKind == "map" { return rd.rdSlot }
-          return -3
-        }
-      }
-    }
-  }
-  -3
 }
 
 // The predicate half of that pair, gated on the init being the union box: without the gate a
@@ -12291,11 +12297,18 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
 }
 
 // The per-element-type ref-list table SLOT the expression at `exprIx` produces, or -1 when
-// the element type does not resolve. Slot 0 is a real row, so an unresolved read must not
-// borrow it: every caller tests the result before indexing a backing/wrapper/element table.
+// the element type does not resolve: its rep's row, else the slot its binding keeps, else (an
+// identifier) its type's row, else its element name's. Slot 0 is a real row, so every caller
+// tests the result before indexing a backing/wrapper/element table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   const rs0 = listRowOfExpr(exprIx, fnIx)
   if rs0 >= 0 { return rs0 }
+  const kept = refListKeptSlotOfExpr(exprIx, fnIx)
+  if kept != -2 { return kept }
+  // An identifier whose rung has only a name reads the row its own type keys.
+  if exprIx >= 0 && exprIx < P.nodes.length && nodeAt(exprIx) is Ident {
+    return rlSlotOfTyOrTwin(tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
+  }
   const nm = refListElemNameOfExpr(exprIx, fnIx)
   const s = rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
   if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "call") }
@@ -12304,6 +12317,67 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
     return -1
   }
   s
+}
+
+// The ref-list slot a read at `exprIx` already holds, without its element name: the row its
+// binding, narrowed arm or capture is stored at. -1 for no ref list, -2 where only the element
+// name answers (`refListElemNameOfExpr`).
+function refListKeptSlotOfExpr(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const e = nodeAt(exprIx)
+  if e is Paren {
+    const rs = listRowOfExpr(e.parInner, fnIx)
+    if rs >= 0 && rs < rlElemName.length { return rs }
+    return refListKeptSlotOfExpr(e.parInner, fnIx)
+  }
+  if !(e is Ident) { return -2 }
+  const slsMv = mapReadStructListMvSlot(exprIx, fnIx)
+  if slsMv >= 0 {
+    const mvRs = mvValInnerRlSlotAt(slsMv)
+    if mvRs >= 0 && mvRs < rlElemName.length { return mvRs }
+    return -1
+  }
+  refListKeptSlotOfIdent(e, exprIx, fnIx)
+}
+
+// `refListElemNameOfIdent`'s rungs as slots, in its order: -2 at a rung that has only a name.
+function refListKeptSlotOfIdent(e: Ident, exprIx: i32, fnIx: i32): i32 {
+  const fat = listFitArmTyOf(exprIx, fnIx)
+  if fat >= 0 {
+    const fa = tyAt(fat)
+    const fsl = if fa is TyArray { rlSlotOfTy(fa.aElem) } else { -1 }
+    if fsl >= 0 && fsl < rlElemName.length { return fsl }
+  }
+  if identReadContainerAt(exprIx, fnIx) == RC_REF_LIST { return -2 }
+  const rdg = identReadsGlobal(exprIx)
+  if !rdg && declaredKind(exprIx) == "nulreflist" {
+    const sl18 = declaredSlotOf(exprIx)
+    if sl18 >= 0 {
+      const is18 = localStructIdx[sl18]
+      if is18 >= 0 && is18 < rlElemName.length { return is18 }
+    }
+  }
+  if (paramNulRefArray(fnIx, exprIx)) {
+    const pn18 = paramTypeNodeOfRead(fnIx, exprIx)
+    if annNulRefArrSlot(pn18) >= 0 { return -2 }
+  }
+  const pn = paramRefArrayName(fnIx, e.identName)
+  if pn != "" && paramReadAt(fnIx, exprIx) { return -2 }
+  const dsl = if rdg { -1 } else { declaredRefArraySlot(exprIx) }
+  if dsl >= 0 { return dsl }
+  const cn = capturedRefListSlot(fnIx, e.identName)
+  if cn >= 0 && cn < rlElemName.length { return cn }
+  const grl = globalLetOfRead(fnIx, exprIx)
+  if grl >= 0 {
+    if globalCellKind(grl) == "reflist" {
+      const grs = letRefListSlot(grl, -1)
+      if grs >= 0 && grs < rlElemName.length { return grs }
+    }
+    if letRefListElemName(grl, -1) != "" { return -2 }
+  }
+  const nrs = recordListSlotOfNode(exprIx, fnIx)
+  if nrs >= 0 && nrs < rlElemName.length { return nrs }
+  -1
 }
 
 // True if the `LetDecl` at `letIx` declares a ref-list local: its annotation is a ref
@@ -12731,30 +12805,12 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
 
 // ── f32-array typedness (the f32 sibling of the f64-array family, rep code 21) ───
 
-// f32 is the checker's weak spot (a float literal types f64), so a recorded `f64[]` yields to
-// the syntactic f32 rungs in `exprListRep`. A bare `[1.5]` literal stays f64; a value is f32[]
-// only when a declared type or an f32 element says so.
-
-// True if the array literal at `arrIx` has f32 elements — every element must be `exprIsF32`,
-// unlike its f64/i64 siblings, which claim on any element. A mixed literal (`[fv, 1]`) is a
-// checker-level union, not an f32 list, and an annotated `f32[]` binding routes through the
-// annotation instead. A bare `[1.5]` stays f64: a float literal is deliberately not `exprIsF32`.
+// True if the array literal at `arrIx` builds an f32 list: its recorded type is `f32[]`. The
+// checker records an f32 destination's type on a literal whose elements it admitted at f32.
 export function arrLitIsF32(arrIx: i32, fnIx: i32) {
   if clsCensusOn { clsCensusEnter("arrLitIsF32") }
-  const a = nodeAt(arrIx)
-  if a is ArrayLit {
-    if a.arrElems.length < 1 { return false }
-    if hasSpreadItem(a.arrElems) { return spreadDestKind(arrIx, fnIx) == "f32" }
-    // The checker types an f32 element beside literal ones `f32[]`; the literals adopt it.
-    if tyIsF32ArrayTy(nodeTyAt(arrIx, fnIx)) { return true }
-    let i = 0
-    while i < a.arrElems.length {
-      if !exprIsF32(a.arrElems[i], fnIx) { return false }
-      i = i + 1
-    }
-    return true
-  }
-  false
+  if !(nodeAt(arrIx) is ArrayLit) { return false }
+  tyIsF32ArrayTy(nodeTyAt(arrIx, fnIx))
 }
 
 // True if `exprIx` evaluates to a `u8[]`: a projection of `exprListRep`.
@@ -13591,38 +13647,13 @@ function fnRetStringSid(sid: i32, name: string, fnIx: i32, at: i32) {
 // field-bearing shapes — a narrowed union local, a variant-typed value, or a plain struct —
 // or -1 otherwise. The one place `exprString`/`exprStruct`/`exprArray`/`exprMap` consult.
 export function memberFieldCode(memIx: i32, fnIx: i32) {
+  const p = memberFieldPos(memIx, fnIx)
+  if p != FPOS_SHARED { return fieldPosCode(p) }
+  if memIx < 0 || memIx >= P.nodes.length { return -1 }
+  // The fourth receiver shape: an un-narrowed struct union whose members all carry the
+  // field at one code (`(A | B).tag`) — without it, a shared read classified as i32.
   const e = nodeAt(memIx)
   if e is Member {
-    // Only a narrowing that names a VARIANT re-homes the field onto the variant tables; one
-    // that does not leaves the receiver at its own shape, so it falls through to the rungs
-    // below rather than answering -1. A place narrowed to a plain struct is that case, and
-    // its `string` field read then classified as an i32 at `print` (D1735).
-    const vi = memNarrowVariantIndex(memIx, fnIx)
-    if vi >= 0 {
-      const vfi = variantFieldIndex(vi, e.memProp)
-      if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
-      return -1
-    }
-    const pvi = exprVariantIndex(e.memObj, fnIx)
-    if pvi >= 0 {
-      const pvfi = variantFieldIndex(pvi, e.memProp)
-      if pvfi >= 0 { return variantFieldTypeAt(pvi, pvfi) }
-      return -1
-    }
-    // The fifth receiver shape, in lock-step with the twin above.
-    const nvi5 = memRecvNulVariantIndex(e.memObj, fnIx)
-    if nvi5 >= 0 {
-      const nvfi5 = variantFieldIndex(nvi5, e.memProp)
-      if nvfi5 >= 0 { return variantFieldTypeAt(nvi5, nvfi5) }
-      return -1
-    }
-    const si = structIndexOfExpr(e.memObj, fnIx)
-    if si >= 0 {
-      const fi = sFieldIndex(si, e.memProp)
-      if fi >= 0 { return sFieldTypeAt(si, fi) }
-    }
-    // The fourth receiver shape: an un-narrowed struct union whose members all carry the
-    // field at one code (`(A | B).tag`) — without it, a shared read classified as i32.
     const uvis: i32[] = []
     const ufis: i32[] = []
     const ucode = sharedUnionFieldPlan(
@@ -13636,6 +13667,86 @@ export function memberFieldCode(memIx: i32, fnIx: i32) {
     if ucode >= 0 { return ucode }
   }
   -1
+}
+
+// `memberFieldPos`'s answer for a read whose receiver shape names no one row: the members of an
+// un-narrowed struct union are asked instead. A struct-table row is `>= 0`, an arm-table row
+// `-3 - r`, and no field -1.
+const FPOS_SHARED = -2
+
+// The field row a `Member` read resolves to through the receiver shapes `memberFieldCode` names:
+// a narrowed union local, a variant-typed value, a nullable variant, or a plain struct.
+function memberFieldPos(memIx: i32, fnIx: i32): i32 {
+  if memIx < 0 || memIx >= P.nodes.length { return -1 }
+  const e = nodeAt(memIx)
+  if !(e is Member) { return -1 }
+  // Only a narrowing that names a VARIANT re-homes the field onto the variant tables; one
+  // that does not leaves the receiver at its own shape, so it falls through to the rungs
+  // below rather than answering -1. A place narrowed to a plain struct is that case, and
+  // its `string` field read then classified as an i32 at `print` (D1735).
+  const vi = memNarrowVariantIndex(memIx, fnIx)
+  if vi >= 0 { return armFieldPos(vi, variantFieldIndex(vi, e.memProp)) }
+  const pvi = exprVariantIndex(e.memObj, fnIx)
+  if pvi >= 0 { return armFieldPos(pvi, variantFieldIndex(pvi, e.memProp)) }
+  const nvi5 = memRecvNulVariantIndex(e.memObj, fnIx)
+  if nvi5 >= 0 { return armFieldPos(nvi5, variantFieldIndex(nvi5, e.memProp)) }
+  const si = structIndexOfExpr(e.memObj, fnIx)
+  if si >= 0 {
+    const fi = sFieldIndex(si, e.memProp)
+    if fi >= 0 { return sFieldStart[si] + fi }
+  }
+  FPOS_SHARED
+}
+
+// Variant `vi`'s field `fi` as a `memberFieldPos` row, or -1 when it has no such field.
+function armFieldPos(vi: i32, fi: i32): i32 {
+  if fi < 0 || vi < 0 || vi >= uFieldStart.length { return -1 }
+  -3 - (uFieldStart[vi] + fi)
+}
+
+// The field code at a `memberFieldPos` row, or -1 for none.
+function fieldPosCode(p: i32): i32 {
+  if p >= 0 { return sFieldTypes[p] }
+  if p <= -3 { return armFieldTypes()[-3 - p] }
+  -1
+}
+
+// The storage type at a `memberFieldPos` row, or -1 for none or an unrecorded one.
+function fieldPosStoreTy(p: i32): i32 {
+  if p >= 0 {
+    return if p < sFieldStoreTy.length { sFieldStoreTy[p] } else { -1 }
+  }
+  if p <= -3 {
+    const col = armFieldStoreTy()
+    const r = -3 - p
+    return if r < col.length { col[r] } else { -1 }
+  }
+  -1
+}
+
+// The storage type of the field a `Member` read reads, or -1 when it names no field or the field's
+// type is unknown. Over an un-narrowed struct union, the members' one storage type.
+export function memberFieldStoreTy(memIx: i32, fnIx: i32): i32 {
+  const p = memberFieldPos(memIx, fnIx)
+  if p != FPOS_SHARED { return fieldPosStoreTy(p) }
+  if memIx < 0 || memIx >= P.nodes.length { return -1 }
+  const e = nodeAt(memIx)
+  if !(e is Member) { return -1 }
+  const uvis: i32[] = []
+  const ufis: i32[] = []
+  if sharedUnionFieldPlan(e.memObj, e.memProp, memIx, fnIx, uvis, ufis) < 0 {
+    return -1
+  }
+  let st = -1
+  let k = 0
+  while k < uvis.length {
+    const t = fieldPosStoreTy(armFieldPos(uvis[k], ufis[k]))
+    if t < 0 { return -1 }
+    if st >= 0 && !tySame(st, t) { return -1 }
+    st = t
+    k = k + 1
+  }
+  st
 }
 
 // The read kinds that are the `null` unit: a cell of it, or a field of its code (FC_NUL_NONE).
