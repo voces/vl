@@ -181,6 +181,7 @@ import { ArrNewKind, arrNewKindOfElemVKind } from "./emit_struct_order"
 import { i32ListHas } from "./listutil"
 import { emitPassGen, memoKeyNew, memoMoved, memoPassMoved } from "./memo"
 import { nonNullTy } from "./tyquery"
+import { parTyNode } from "./emit_query"
 
 // The `__array_new__` element kind named by an annotated-PARAMETER fill: the list a value of
 // the parameter's declared `VKind` is an element of. The one channel a monomorphized instance
@@ -611,7 +612,18 @@ export function retStructRowIndex(tyIx: i32) {
     if ar >= 0 { return ar }
     return nulBaseStructRow(tyIx)
   }
-  -1
+  paramRecordedStructRow(tyIx)
+}
+
+// The struct row of an un-annotated parameter node, read off its recorded type alone, or -1
+// for any node that is not a `Param`.
+function paramRecordedStructRow(tyIx: i32): i32 {
+  if !(nodeAt(tyIx) is Param) { return -1 }
+  const rr = repRowOfTyStruct(nodeRepTyIxOf(tyIx), sScanLim())
+  if rr >= 0 { return rr }
+  const ar = structIndexOfTy(nodeRepTyIxOf(tyIx))
+  if ar >= 0 { return ar }
+  nulBaseStructRow(tyIx)
 }
 
 // The struct table index named by the type-annotation node at `tyIx`, or -1 if it
@@ -750,31 +762,24 @@ export function retRefArrElemName(tyIx: i32) {
 }
 
 // An emitter-synthesized type-annotation node (a mono clone, an inferred-list synthesis, a
-// contextual return/param pin). Records the concrete type on the new node so the
-// structural classifiers cover it (`recordClonedNodeTy`), uniformly across every synthesis
-// site. The returned node carries its resolved type, so a caller reads it off the node.
-export function synthTypeRef(name: string, pos: i32) {
-  synthTypeRefTy(name, pos, -1)
-}
-
-// `synthTypeRef` with a FALLBACK type: the name is resolved first and wins, and `tyFb` is
-// used only where it does not resolve — where `synthTypeRef` records a coarse placeholder.
-// See `recordClonedNodeTyFb` for the measurement that fixes this precedence.
-export function synthTypeRefFb(name: string, pos: i32, tyFb: i32) {
-  const n = mkTypeRef(name, pos)
-  recordClonedNodeTyFb(n, name, pinKindOfName(name), tyFb)
-  n
-}
-
-// `synthTypeRef` with the type handed over instead of parsed back out of `name`. See
-// `recordClonedNodeTyKnown`. `tyIx` of -1 is exactly `synthTypeRef`.
+// contextual return/param pin) spelled `name` and typed `tyIx`, the type the caller holds. The
+// spelling derives from the type and is never parsed back: where `tyIx` is -1 the node records
+// only the placeholder `name`'s provenance names (`pinKindOfName`).
 export function synthTypeRefTy(name: string, pos: i32, tyIx: i32) {
   const n = mkTypeRef(name, pos)
   const root = tyTsExact(tyIx)
   if root >= 0 { setAnnTs(n, root) }
   // A pin kind is read only where the type is unknown.
   const pin = if tyIx >= 0 { PIN_NONE } else { pinKindOfName(name) }
-  recordClonedNodeTyKnown(n, name, pin, tyIx)
+  recordClonedNodeTyKnown(n, pin, tyIx)
+  n
+}
+
+// `synthTypeRefTy` resolving `name` first, with `tyFb` only where the name does not resolve.
+// For a caller holding no type the pin denotes; see `recordClonedNodeTyFb`.
+export function synthTypeRefFb(name: string, pos: i32, tyFb: i32) {
+  const n = mkTypeRef(name, pos)
+  recordClonedNodeTyFb(n, name, pinKindOfName(name), tyFb)
   n
 }
 
@@ -900,7 +905,7 @@ export function vtKindOfType(tyIx: i32): VKind {
 export function retMapFlag(tyIx: i32) {
   if tyIx >= 0 {
     const ty = nodeAt(tyIx)
-    if ty is TypeRef {
+    if ty is TypeRef || ty is Param {
       // A string-keyed map crosses a call boundary as kind 6 (`(ref $mapStruct)`), gated by
       // the same classifier the local path interns with (`mvValKindOfName`). A map-member
       // union (`{[string]: V} | X`) also starts with `{[`, but the arena distinguishes a
@@ -923,7 +928,7 @@ export function retMapFlag(tyIx: i32) {
 export function retNulMapFlag(tyIx: i32) {
   if tyIx >= 0 {
     const ty = nodeAt(tyIx)
-    if ty is TypeRef {
+    if ty is TypeRef || ty is Param {
       if tyIsNulBareMap(tyIx) {
         if mapTyValKindLowerable(nonNullTy(nodeTyIxOf(tyIx))) { return 1 }
       }
@@ -939,41 +944,46 @@ export function retNulMapFlag(tyIx: i32) {
 export function mapAnnShape(tyIx: i32) {
   if tyIx >= 0 {
     const ty = nodeAt(tyIx)
+    // A NULLABLE map annotation (`{[string]: V} | null`) resolves its shape from the BARE inner
+    // map — its `(ref null $mapStruct)` cell selects the SAME `$mapStruct` its non-null twin does.
+    // An un-annotated parameter has no spelling, so its recorded type alone decides.
+    let mn = ""
+    let isMap = false
     if ty is TypeRef {
-      // A NULLABLE map annotation (`{[string]: V} | null`) resolves its shape from the BARE inner
-      // map — its `(ref null $mapStruct)` cell selects the SAME `$mapStruct` its non-null twin does.
-      let mn = ty.tyName
+      mn = ty.tyName
       const nim = nulMapInnerName(mn)
       if nim != "" { mn = nim }
-      if nameIsMap(mn) {
-        // The key selects which map struct family the annotation names — the param/
-        // return/nulmap valtype and the body shape must agree. The arena answers where it
-        // covers the node (`nodeTyMapKeyKindSpan`, recursing `TyNullable` so the folded
-        // nulmap spelling is covered too); an uncovered node keeps the name bridge.
-        let kAn = mapNameKeyKind(mn)
-        if nodeTyIxOf(tyIx) >= 0 { kAn = nodeTyMapKeyKindSpan(tyIx) }
-        // The value is the node's banked type (D-MAPNODETY), named as the mint names it; an
-        // uncovered node has no value to name and resolves by key alone below.
-        const vtAn = nodeMapValTyIx(tyIx)
-        const vn = mvDeclNameOfValTy(vtAn)
-        // A mono value rides the shared struct of its own key rep: the `-1`/`-4` pair.
-        if vn == "i32" || vn == "boolean" { return mapMonoShapeOfKey(kAn) }
-        if vn != "" {
-          // The slot's key and arm hint come off this node exactly as the mint computes them
-          // (D48): `vn` alone cannot tell an arm from its layout twin, and a find that keys
-          // differently from the mint mints a second slot whose map struct is never filled in.
-          const vnA = mvArmKeyName(vn, vtAn)
-          const armAn = mvArmHintOfShapeTy(vtAn)
-          let aAn = mvSlotOfTyKArm(vtAn, kAn, armAn)
-          if aAn < 0 { aAn = mvSlotOfValNameTyKArm(vnA, kAn, armAn) }
-          if aAn >= 0 { return aAn }
-          const nmAn = mvSlotByValNameKArm(vnA, kAn, armAn)
-          if nmAn >= 0 { return nmAn }
-        }
-        // A mono-repped value spelling the two scans above never intern (a literal-union
-        // atom, a nullable atom) still resolves by KEY alone.
-        if kAn != MAP_KEY_STR { return mapMonoShapeOfKey(kAn) }
+      isMap = nameIsMap(mn)
+    }
+    if ty is Param { isMap = nodeTyIsMap(tyIx) || tyIsNulBareMap(tyIx) }
+    if isMap {
+      // The key selects which map struct family the annotation names — the param/
+      // return/nulmap valtype and the body shape must agree. The arena answers where it
+      // covers the node (`nodeTyMapKeyKindSpan`, recursing `TyNullable` so the folded
+      // nulmap spelling is covered too); an uncovered node keeps the name bridge.
+      let kAn = if mn != "" { mapNameKeyKind(mn) } else { MAP_KEY_STR }
+      if nodeTyIxOf(tyIx) >= 0 { kAn = nodeTyMapKeyKindSpan(tyIx) }
+      // The value is the node's banked type (D-MAPNODETY), named as the mint names it; an
+      // uncovered node has no value to name and resolves by key alone below.
+      const vtAn = nodeMapValTyIx(tyIx)
+      const vn = mvDeclNameOfValTy(vtAn)
+      // A mono value rides the shared struct of its own key rep: the `-1`/`-4` pair.
+      if vn == "i32" || vn == "boolean" { return mapMonoShapeOfKey(kAn) }
+      if vn != "" {
+        // The slot's key and arm hint come off this node exactly as the mint computes them
+        // (D48): `vn` alone cannot tell an arm from its layout twin, and a find that keys
+        // differently from the mint mints a second slot whose map struct is never filled in.
+        const vnA = mvArmKeyName(vn, vtAn)
+        const armAn = mvArmHintOfShapeTy(vtAn)
+        let aAn = mvSlotOfTyKArm(vtAn, kAn, armAn)
+        if aAn < 0 { aAn = mvSlotOfValNameTyKArm(vnA, kAn, armAn) }
+        if aAn >= 0 { return aAn }
+        const nmAn = mvSlotByValNameKArm(vnA, kAn, armAn)
+        if nmAn >= 0 { return nmAn }
       }
+      // A mono-repped value spelling the two scans above never intern (a literal-union
+      // atom, a nullable atom) still resolves by KEY alone.
+      if kAn != MAP_KEY_STR { return mapMonoShapeOfKey(kAn) }
     }
   }
   -1
@@ -990,7 +1000,7 @@ export function paramMapShape(fnIx: i32, name: string) {
     while i < params.length {
       const p = nodeAt(params[i])
       if p is Param {
-        if p.parName == name { return mapAnnShape(p.parType) }
+        if p.parName == name { return mapAnnShape(parTyNode(params[i])) }
       }
       i = i + 1
     }
@@ -1051,7 +1061,7 @@ export function retUnionFlag(tyIx: i32) {
 // that is not a `Param`.
 export function vtKindOfParam(paramIx: i32): VKind {
   const p = nodeAt(paramIx)
-  if p is Param { return vtKindOfType(p.parType) }
+  if p is Param { return vtKindOfType(parTyNode(paramIx)) }
   "i32"
 }
 
@@ -1061,7 +1071,7 @@ export function vtKindOfParam(paramIx: i32): VKind {
 // param-shaped question; every kind-to-table pairing lives in the one home.
 export function paramStructIdxOf(paramIx: i32) {
   const p = nodeAt(paramIx)
-  if p is Param { return annValtypeSlotOf(p.parType) }
+  if p is Param { return annValtypeSlotOf(parTyNode(paramIx)) }
   -1
 }
 
@@ -1081,7 +1091,8 @@ export function annValtypeSlotOf(tyIx: i32) {
   // The variant kind is `annRepKindOf`'s where it answers, so the slot follows it to a twin.
   const variant = retVariantFlag(tyIx) == 1 || annRepKindOf(tyIx) == "variant"
   if variant && tyIx >= 0 && tyIx < P.nodes.length {
-    if nodeAt(tyIx) is TypeRef { return annVariantRowOf(tyIx) }
+    const vn = nodeAt(tyIx)
+    if vn is TypeRef || vn is Param { return annVariantRowOf(tyIx) }
   }
   // `Circle | null` — the variant index under the null, the slot `fbValtype`'s
   // `nulvariant` arm indexes `variantHeap` with. The struct rung below cannot answer it:

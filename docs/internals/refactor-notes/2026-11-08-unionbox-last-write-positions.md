@@ -9,7 +9,7 @@ names an open type parameter over a closed union (`boxTyKeeps`). Every other wri
 so the record is the final check's write. The elaboration path of `ctxTyStampOne` used to write
 `elabCapBox` directly; it now goes through `boxTyStampOne`, so one rule covers both scopes.
 
-## The `f64|null` conflict is a checker defect: D15547, closed here
+## The `f64|null` conflict is a checker defect: D15550, closed here
 
 `n == [1.0, null]` with `n: (i32|null)[]`: `eqLitDeliver` (D15091) tried the literal at the
 other operand's type with a stamping `assignableExpr`. The `null` element fit `i32|null` and its
@@ -20,7 +20,7 @@ first, then stamping only a delivery that holds.
 
 ## Shadow re-run (history graded before any position switched)
 
-| last-write misses | #6769 | policy | policy + D15547 |
+| last-write misses | #6769 | policy | policy + D15550 |
 |---|---|---|---|
 | open type parameter after a closed union | 27 | 0 | 0 |
 | value already a box (6 a `??` join) | 7 | 7 | 7 |
