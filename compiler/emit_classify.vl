@@ -136,7 +136,6 @@ import {
   nodeTyIsMap,
   nodeTyIsNulBool,
   nodeTyIsNulLitUnion,
-  nodeTyIsNullType,
   nodeTyIsNullable,
   nodeTyIsObj,
   nodeTyIsPureLitUnion,
@@ -157,10 +156,9 @@ import {
   fnTagTyIsTagged,
 } from "./check_elab_cap"
 import { mapStoredTyOf } from "./check_fn_tag_facts"
-import { letNullHoleFilledTy, letNullHoleUnfilled } from "./check_null_holes"
 import { canonUnionMembersInto } from "./check_program"
 import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
-import { tyVarRowsMinted, tyVarsOwnScheme } from "./check_subst"
+import { tyVarsOwnScheme } from "./check_subst"
 import {
   MAP_KEY_I32,
   MAP_KEY_I64,
@@ -418,7 +416,6 @@ import {
 } from "./emit_if_arm_values"
 import { numBoxExpr } from "./emit_join_records"
 import {
-  arenaRepOf,
   arrLitHasSpread,
   declaredMap,
   declaredNulMap,
@@ -426,11 +423,6 @@ import {
   letMapKeyKind,
   listRepOfFieldCode,
   listRepOfMf,
-  lrGen,
-  lrMemoFn,
-  lrMemoGen,
-  lrMemoKind,
-  lrMemoNul,
   nulListBase,
   paramString,
   popRecvOf,
@@ -571,7 +563,6 @@ import {
 } from "./emit_query"
 import {
   TK_STR,
-  arenaListRep,
   letAnnVariantIdx,
   listBuildOfTy,
   rlSlotIsKindList,
@@ -581,7 +572,6 @@ import {
   rsSameRow,
   rsTyIsRecord,
   tyKindOf,
-  tyPrimLeafListKind,
 } from "./emit_ref_list_kinds"
 import {
   RepDesc,
@@ -848,14 +838,11 @@ import {
   coalesceNicheLhs,
   coalesceRetypedAtomToStr,
   coalesceStaysNullable,
-  columnListRep,
-  columnListRepAt,
   elabClosedTyAt,
   fnInPinnedInstance,
   forInWalksMapValues,
   holeOperandTyOf,
   identNameOrEmpty,
-  instanceBindsNothingClosed,
   instanceTyOf,
   mapArmShapeOfTy,
   mapRecvTyIn,
@@ -873,7 +860,6 @@ import {
 } from "./emit_ty_canon"
 import {
   annRowOfNode,
-  isUNameAnnAB,
   mapShapeOfTyPeeled,
   mvShapeOfMapHeldTy,
   nliNameOf,
@@ -9049,25 +9035,11 @@ function coalesceNulNoneDefaultIx(exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The binding half of `exprIsNulNone`: is the LetDecl at `letIx` a binding whose only value
-// is `null`? Two producers, matching the expression side: a never-filled infer-null hole
-// (D1576), and an un-annotated binding to a call returning `null` always. An annotation
-// lands here only when it names `null` itself; `C | null = null` is `nulstruct`.
+// Whether binding `letIx` holds the `null` unit in `fnIx`: the type it holds there reps as
+// `nulnone` (a never-filled `null`, or a binding a call returning `null` always initializes).
 export function letIsNulNone(letIx: i32, fnIx: i32): boolean {
-  if clsCensusOn { clsCensusEnter("letIsNulNone") }
   if letIx < 0 { return false }
-  const s = nodeAt(letIx)
-  if s is LetDecl {
-    // An annotation naming the `null` unit type pins the same cell (D4550).
-    if s.letType >= 0 { return nodeTyIsNullType(s.letType) }
-    if s.letInit < 0 { return false }
-    const ini = nodeAt(unwrapParen(s.letInit))
-    if ini is NullLit { return letNullHoleUnfilled(letIx) }
-    // A `null`-typed initializer a later write filled is that write's `T | null` (D3355).
-    if letNullHoleFilledTy(letIx) >= 0 { return false }
-    return exprIsNulNone(s.letInit, fnIx)
-  }
-  false
+  letBindRepKind(letIx, fnIx) == "nulnone"
 }
 
 // Whether the value at `exprIx` is a function value `fn | null` the checker has not narrowed
@@ -12918,118 +12890,20 @@ function readListKindOf(r: string): VKind | null {
   null
 }
 
-// Whether recorded type `ty` reads as no list wherever it is read: a primitive, record, function,
-// map or literal. A type variable, union or list may.
-function lrTyIsNoList(ty: i32): boolean {
+// The non-null list rep the expression at `exprIx` produces, a nullable list's being its list's,
+// or null when its checked column names no list. Each `expr*Array` predicate is this answer
+// compared with one kind, so no two of them can claim one expression (D2275).
+export function exprListRep(exprIx: i32, fnIx: i32): VKind | null {
+  if exprIx < 0 || tyIsNoListHead(nodeTyIxOf(exprIx)) { return null }
+  listOfColumn(listColumnDesc(exprIx, fnIx))
+}
+
+// Whether a node recorded at `ty` is no list at any instance, read off the head alone, so the
+// column is not built for it.
+function tyIsNoListHead(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
   t is TyPrim || t is TyObj || t is TyFunc || t is TyMap || t is TyLit
-}
-
-// `placeStoreListKind` remembered per read and asking function, for the pass and tables it read.
-const pslGen = memoGenNew(0)
-const pslKey = memoKeyNew(5)
-const pslStamp: i32[] = []
-const pslFn: i32[] = []
-const pslVal: string[] = []
-// The list a field or element read `rx` reads, by its cell: the cell's list, a nullable one's base,
-// the list arm a narrowed read's own type names, or the list a box or map-value cell's read rep
-// converts to. "-" for a cell that reads as no list, "" for a read with no cell.
-function placeStoreListKind(rx: i32, fnIx: i32): string {
-  let moved = memoMoved3(pslKey, emitPassGen, tyMutEpoch, P.nodes.length)
-  moved = memoMoved(pslKey, 3, sFieldCount.length) || moved
-  moved = memoMoved(pslKey, 4, ekDecl.length) || moved
-  if moved { memoGenAdvance(pslGen) }
-  if rx < pslStamp.length && pslStamp[rx] == pslGen.at && pslFn[rx] == fnIx {
-    return pslVal[rx]
-  }
-  const v = placeStoreListKindGo(rx, fnIx)
-  while pslStamp.length <= rx {
-    pslStamp.push(-1)
-    pslFn.push(-1)
-    pslVal.push("")
-  }
-  pslStamp[rx] = pslGen.at
-  pslFn[rx] = fnIx
-  pslVal[rx] = v
-  v
-}
-
-function placeStoreListKindGo(rx: i32, fnIx: i32): string {
-  const st = readStoreOf(rx, fnIx)
-  if st == "" { return "" }
-  const k = readListKindOf(st)
-  if k == null {
-    // Only a box or a map value converts to a list at its read; the read rep names which.
-    if st != "union" && !(st.length > 2 && st.slice(0, 2) == "mv") {
-      return "-"
-    }
-    const rk = readListKindOf(readRepOf(rx, fnIx).rrRead)
-    return if rk == null { "-" } else { rk }
-  }
-  if readNarrowedStoreAt(rx, fnIx) >= 0 {
-    const ld = repOfNode(rx, fnIx)
-    if ld.rdCovered == 1 && vkListClass(ld.rdKind) == 1 { return ld.rdKind }
-  }
-  k
-}
-
-// The non-null list rep the expression at `exprIx` produces, or null when this cannot name one.
-// The recorded type answers first, then the expression's shape. Each `expr*Array` predicate is
-// this answer compared with one kind, so no two of them can claim one expression (D2275).
-export function exprListRep(exprIx: i32, fnIx: i32): VKind | null {
-  if exprIx < 0 { return null }
-  // Before mono, the checked column; one it does not cover names no list.
-  if !emitPhaseReached("monomorphized") {
-    const pd = listColumnDesc(exprIx, fnIx)
-    return if pd.rdCovered == 1 { listOfColumn(pd) } else { null }
-  }
-  if clsCensusOn { clsCensusEnter("exprListRep") }
-  if lrDepth == 0 { memoGenAdvance(lrGen) }
-  if exprIx < lrMemoGen.length {
-    if lrMemoGen[exprIx] == lrGen.at && lrMemoFn[exprIx] == fnIx {
-      if lrMemoNul[exprIx] == 1 { return null }
-      return lrMemoKind[exprIx]
-    }
-  }
-  lrDepth = lrDepth + 1
-  const k = exprListRepOf(exprIx, fnIx)
-  lrDepth = lrDepth - 1
-  if repShadowOn { repABNoteListRep(exprIx, fnIx, k) }
-  while lrMemoGen.length <= exprIx {
-    lrMemoGen.push(-1)
-    lrMemoFn.push(-1)
-    lrMemoKind.push("list")
-    lrMemoNul.push(1)
-  }
-  lrMemoGen[exprIx] = lrGen.at
-  lrMemoFn[exprIx] = fnIx
-  if k == null {
-    lrMemoNul[exprIx] = 1
-  } else {
-    lrMemoKind[exprIx] = k
-    lrMemoNul[exprIx] = 0
-  }
-  k
-}
-
-// The oracle at this surface: the ladder's list rep against the pin-aware column (a nullable
-// list's being its list's), noted only where they disagree; `unc` is a column the descriptor
-// does not cover. The measurement is §13.10 of docs/internals/rep-descriptor-campaign.md.
-function repABNoteListRep(exprIx: i32, fnIx: i32, k: VKind | null) {
-  let lw = "none"
-  if k != null { lw = k }
-  const d = listColumnDesc(exprIx, fnIx)
-  let cw = "unc"
-  if d.rdCovered == 1 {
-    cw = "none"
-    const ck = listOfColumn(d)
-    if ck != null { cw = ck }
-  }
-  if lw == cw || (lw == "none" && cw == "unc") { return 0 }
-  const fam = listRepFamilyOf(exprIx, fnIx)
-  if fam == "" { return 0 }
-  repABNote(fam, lw, cw)
 }
 
 // The checked-rep column at the node `exprIx` in `fnIx`: its rep at its instance's type, or at
@@ -13049,236 +12923,6 @@ function listOfColumn(d: RepDesc): VKind | null {
   null
 }
 
-// The family a `listRep` disagreement is noted under: `listRep` where both sides answer the same
-// question, else why they cannot. `/open` is a type no instance binds, `/scope` a local read
-// with no live slot (§13.13). "" while instances are still being chosen: an open type then has
-// no binding to read, since the ladder's answer is what picks one.
-function listRepFamilyOf(exprIx: i32, fnIx: i32) {
-  const ty = nodeTyInOf(exprIx, fnIx)
-  if ty >= 0 && ty < T.tys.length && tyHasTyVar(ty) {
-    if !emitPhaseReached("monomorphized") { return "" }
-    if instanceBindsNothingClosed(ty, fnIx) { return "" }
-    return "listRep/open"
-  }
-  if identReadOutOfScope(exprIx, fnIx) { return "listRep/scope" }
-  "listRep"
-}
-
-// Whether `exprIx` reads a name that is no parameter, capture or module global of `fnIx` and
-// has no live declared slot: a local asked about from outside its own emission.
-function identReadOutOfScope(exprIx: i32, fnIx: i32) {
-  const e = nodeAt(exprIx)
-  if !(e is Ident) { return false }
-  const n = e.identName
-  if declaredSlotOf(exprIx) >= 0 || paramIndexOf(fnIx, n) >= 0 { return false }
-  if capturedKindOf(fnIx, n) != null { return false }
-  globalLetOfRead(fnIx, exprIx) < 0
-}
-
-// `exprListRep`'s answers during one outermost query, indexed by expression and stamped with
-// that query's generation, so an answer never outlives the query that computed it. A global's
-// initializer is asked once per list kind its declaration is tested for; without the memo a
-// chain of global aliases costs that many times more per link. `lrMemoNul` 1 marks a null.
-let lrDepth = 0
-
-// `exprListRep` unmemoised. A recorded scalar, object, function or map type is no list, a call
-// included: its record is this call's result. A recorded array over a primitive is
-// its list unless a float literal or spread built another; a recorded `f64[]` yields to an f32
-// shape, and the unpinned `i32[]` to any shape.
-function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
-  // A call's list is what its callee lowers, asked first; the ladder below answers a call whose
-  // lowering is not known, a builtin's or a method's among them.
-  const ce = nodeAt(exprIx)
-  // A name read is what its storage reads as there, once every instance has its own cells; a
-  // template's read before then holds its open parameter's default, and a read with no cell
-  // there has none, so the ladder answers both.
-  if (
-    ce is Ident
-    && emitPhaseReached("monomorphized")
-    && !lrTyIsNoList(nodeTyIxOf(exprIx))
-  ) {
-    const rr = readRepOf(exprIx, fnIx)
-    if rr.rrStore != "" { return readListKindOf(rr.rrRead) }
-  }
-  // A field or element read is what its cell reads as there, the same way.
-  if (
-    (ce is Member || ce is Index)
-    && emitPhaseReached("monomorphized")
-    && !lrTyIsNoList(nodeTyIxOf(exprIx))
-  ) {
-    const pk = placeStoreListKind(exprIx, fnIx)
-    if pk != "" { return readListKindOf(pk) }
-  }
-  if ce is Call {
-    const ck = callStoreListKind(ce, exprIx, fnIx)
-    if ck != null {
-      if vkListClass(ck) == 2 { return nulListBase(ck) }
-      return ck
-    }
-  }
-  // A node recorded at a type variable has the column's rep at its instance's bindings. Before
-  // `monomorphize` binds one, a node still open there has no rep.
-  const xraw = nodeTyIxOf(exprIx)
-  let xty = xraw
-  if (
-    tyVarRowsMinted > 0
-    && xraw >= 0
-    && xraw < T.tys.length
-    && lrRawHasTyVar(xraw)
-  ) {
-    xty = nodeTyInOf(exprIx, fnIx)
-    const od = repOfNodeAt(exprIx, xty)
-    if od.rdCovered == 1 && vkListClass(od.rdKind) == 1 { return od.rdKind }
-    const open = xty < 0 || xty >= T.tys.length || tyHasTyVar(xty)
-    if open && !emitPhaseReached("monomorphizing") { return null }
-  }
-  if exprIx >= 0 && xty >= 0 && xty < T.tys.length {
-    const xt = tyAt(xty)
-    // A nullable map is no list, whatever its binding's declaration spells.
-    if xt is TyNullable {
-      const inner = xt.nInner
-      if inner >= 0 && inner < T.tys.length && tyAt(inner) is TyMap {
-        return null
-      }
-    }
-    // A nullable list is stored in its list's wrapper, so its rep is that list's, read off the
-    // type at its instance whatever the read's spelling or slot.
-    if xt is TyNullable || xt is TyUnion {
-      const nd = repOfNodeAt(exprIx, xty)
-      if nd.rdCovered == 1 && vkListClass(nd.rdKind) == 2 {
-        return nulListBase(nd.rdKind)
-      }
-    }
-  }
-  // An `is K[]` arm reading an empty list of another element reads the arm's `K[]` (D4993).
-  const fat = listFitArmTyOf(exprIx, fnIx)
-  if fat >= 0 {
-    const fd = repOfTy(fat)
-    if fd.rdCovered == 1 && vkListClass(fd.rdKind) == 1 { return fd.rdKind }
-  }
-  // A read an `is K[]` narrowed keeps its receiver's list (D4916).
-  const nrt = listNarrowRecvTyOf(exprIx, fnIx)
-  if nrt >= 0 {
-    const nd = repOfNodeAt(exprIx, nrt)
-    if nd.rdCovered == 1 && vkListClass(nd.rdKind) == 1 { return nd.rdKind }
-  }
-  const pin = nodeTyInOf(exprIx, fnIx)
-  const raw = nodeTyIxOf(exprIx)
-  const e = nodeAt(exprIx)
-  if pin >= 0 && pin == raw {
-    const t = tyAt(pin)
-    if t is TyPrim || t is TyObj || t is TyFunc || t is TyMap || t is TyLit {
-      return null
-    }
-    // A union or nullable type the column holds as no list at its instance (a box, a nullable
-    // scalar or struct) is no list, whatever its declaration, initializer or arms spell.
-    if t is TyUnion || t is TyNullable {
-      const ud = repOfTy(nodeTyInOf(exprIx, fnIx))
-      if ud.rdCovered == 1 && vkListClass(ud.rdKind) == 0 { return null }
-    }
-  }
-  const pk = tyPrimLeafListKind(pin)
-  if pk == "strlist" || pk == "i64list" || pk == "u8list" { return pk }
-  if pk == "f32list" {
-    if !(e is ArrayLit || e is Index) { return pk }
-  }
-  if pk == "list" && pin == raw && !arrLitHasSpread(exprIx) { return pk }
-  const rd = arenaRepOf(pin)
-  // A union whose every member spells one list is that list (D4745).
-  if pin >= 0 && oneListUnionRender(pin) != "" {
-    if rd.rdCovered == 1 && vkListClass(rd.rdKind) == 1 { return rd.rdKind }
-  }
-  if rd.rdCovered == 1 && rd.rdKind == "f32list" {
-    if !(e is ArrayLit || e is Index) { return "f32list" }
-  }
-  const a = arenaListRep(exprIx, pin, rd, fnIx)
-  if a != null && a != "f64list" && a != "list" { return a }
-  // A concat's recorded list is its rep, a ref list's included; its operands are not asked, so
-  // a chain stays linear (D2275).
-  if e is BinExpr {
-    if e.binOp == "+" {
-      if a != null { return a }
-      if rd.rdCovered == 1 && rd.rdKind == "reflist" { return "reflist" }
-    }
-  }
-  if valueUnionBoxList(exprIx, fnIx) { return "reflist" }
-  // The column answers every node it covers at a type an instance binds; at an open type it
-  // is asked again below, after the arena's own answer.
-  const cd = listColumnDesc(exprIx, fnIx)
-  if cd.rdCovered == 1 && listRepFamilyOf(exprIx, fnIx) != "" {
-    return listOfColumn(cd)
-  }
-  const s = columnListRepOfRead(exprIx, fnIx)
-  match a {
-    "f64list" => {
-      if s != "f32list" { return a }
-    }
-    "list" => {
-      if s == null { return a }
-    }
-    // Every other arena answer is returned above; a null one takes the column's.
-    "i32" | "struct" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {}
-  }
-  s
-}
-
-// `tyHasTyVar` of arena type `ty`, kept while the arena neither grows nor is written in place.
-// `exprListRepOf` asks it of every node it is asked about, most of them the same few types.
-function lrRawHasTyVar(ty: i32): boolean {
-  let moved = memoMoved(lrTvKey, 0, tyMutEpoch)
-  moved = memoMoved(lrTvKey, 1, T.tys.length) || moved
-  if moved { memoGenAdvance(lrTvGen) }
-  if ty < lrTvStamp.length && lrTvStamp[ty] == lrTvGen.at {
-    return lrTvAns[ty] == 1
-  }
-  const r = tyHasTyVar(ty)
-  while lrTvStamp.length <= ty {
-    lrTvStamp.push(-1)
-    lrTvAns.push(0)
-  }
-  lrTvStamp[ty] = lrTvGen.at
-  lrTvAns[ty] = 0
-  if r { lrTvAns[ty] = 1 }
-  r
-}
-
-const lrTvKey = memoKeyNew(2)
-
-const lrTvGen = memoGenNew(0)
-
-const lrTvStamp: i32[] = []
-
-const lrTvAns: i32[] = []
-
-// Whether the node at `exprIx` is a list whose element type at its instance is a union the
-// checked-rep column boxes. Every element is then a box, so the list is the ref list whatever
-// its first element or its callee spells.
-function valueUnionBoxList(exprIx: i32, fnIx: i32): boolean {
-  if !tyMayInstUnionList(nodeTyIxOf(exprIx)) { return false }
-  const ty = nodeTyInOf(exprIx, fnIx)
-  const el = tyArrayElemIx(ty)
-  if el < 0 || !(tyAt(el) is TyUnion) { return false }
-  columnListRepAt(exprIx, ty) == "reflist"
-}
-
-// Whether a node recorded at `raw` can be a list of unions at some instance, read off its head
-// (D5065): binding a type variable keeps a record, function, map or nullable head, and a
-// union is kept, since its members can collapse onto one list.
-function tyMayInstUnionList(raw: i32): boolean {
-  if raw < 0 || raw >= T.tys.length { return false }
-  const t = tyAt(raw)
-  match t {
-    TyArray => {
-      const el = t.aElem
-      if el < 0 || el >= T.tys.length { return false }
-      const et = tyAt(el)
-      et is TyUnion || et is TyVar
-    }
-    TyVar | TyUnion | TyNeg => true
-    TyPrim | TyErr | TyObj | TyFunc | TyMap | TyLit | TyNullable => false
-  }
-}
-
 // Whether a node recorded at `raw` can be a union at some instance, read off the head alone;
 // true where nothing is recorded.
 function tyMayInstUnion(raw: i32): boolean {
@@ -13288,25 +12932,6 @@ function tyMayInstUnion(raw: i32): boolean {
     TyVar | TyUnion | TyNullable | TyNeg | TyErr | TyObj => true
     TyPrim | TyFunc | TyMap | TyLit | TyArray => false
   }
-}
-
-// `exprListRep`'s last rung: the column at the node, a grouped read's through its parens, for a
-// node the earlier rungs leave. Every list-bearing expression reads it, so a list rep is always
-// its type's; any other node has none.
-function columnListRepOfRead(exprIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("columnListRepOfRead") }
-  const e = nodeAt(exprIx)
-  match e {
-    Paren => {
-      return exprListRep(e.parInner, fnIx) ?? columnListRep(exprIx, fnIx)
-    }
-    ArrayLit | Ident | Member | IfStmt | Call | Index | BinExpr | OptMember => {
-      return columnListRep(exprIx, fnIx)
-    }
-    // Every other expression answers no list here.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  null
 }
 
 // True if `exprIx` evaluates to an `f32[]`: a projection of `exprListRep`.
@@ -13359,34 +12984,10 @@ export function exprMap(exprIx: i32, fnIx: i32) {
   rd.rdCovered == 1 && rd.rdKind == "map"
 }
 
-// True if the `LetDecl` at `letIx` declares a map-typed local: its annotation is a map
-// type (`{[string]: i32}`), OR its initializer produces a map (`Map()`). Picks the
-// local's valtype (`(ref $mStructIdx)`) and the code-`6` flag in `collectLocals`.
-export function letIsMap(letIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("letIsMap") }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 {
-      const lt = nodeAt(d.letType)
-      if lt is TypeRef {
-        // Arena-first: a `TyMap` is a map however it renders, subsuming both `nameIsMap` and
-        // its map-member-union exclusion, without splitting the name into top-level atoms.
-        const k = annRepKindOf(d.letType)
-        if k != null {
-          if k == "map" { return true }
-        } else if nodeTyIsMap(d.letType) {
-          // The rep is uncovered but the type is not: `nodeTyIsMap` answers the strictly
-          // weaker "is this annotation a map at all", the arena fallback one variant tag down.
-          return true
-        }
-        // Any registered union annotation carrying a bare map arm is a union-box local whose
-        // init is that arm — authoritative, so the map fall-through can't reclaim it as bare.
-        if isUNameAnnAB(6, d.letType) { return false }
-      }
-    }
-    return exprMap(d.letInit, fnIx)
-  }
-  false
+// Whether binding `letIx` holds a map in `fnIx`: the type it holds there reps as one.
+export function letIsMap(letIx: i32, fnIx: i32): boolean {
+  if letIx < 0 { return false }
+  letBindRepKind(letIx, fnIx) == "map"
 }
 
 // True if the `LetDecl` at `letIx` declares a NULLABLE map local (`{[string]: V} | null`,
@@ -15302,7 +14903,6 @@ export function classifyStateReset() {
   bindCellReset()
   lckReset()
   irkDepth = 0
-  lrDepth = 0
   asgReReadIx = -1
   storageReadLeave(-1)
   objLitSlotsReset()

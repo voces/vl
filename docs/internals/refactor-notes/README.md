@@ -8,6 +8,9 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-08-step3-d10382-hole-at-two-fn-types](2026-11-08-step3-d10382-hole-at-two-fn-types.md): Step 3 done: a hole handed on at two function types is bound per call (#6899).
+- [2026-11-08-step2-arg-coverage](2026-11-08-step2-arg-coverage.md): Step 2: argument coverage; no recording gap, elabNodeTyOrChecked (#6897).
+- [2026-11-08-step7-classifier-deletes-r20](2026-11-08-step7-classifier-deletes-r20.md): Step 7 classifier round 20; exprListRep reads the checked column (#6892).
 - [2026-11-08-step3-genfnhole-deleted](2026-11-08-step3-genfnhole-deleted.md): Step 3: genFnHole* deleted; the per-call Fn#d binding answers all 18 sites (#6893).
 - [2026-11-08-list-holder-two-generic-join](2026-11-08-list-holder-two-generic-join.md): Step 4: a list holder bound to two generics joins their sets (#6894).
 - [2026-11-08-step7-vtkindoftype-floors](2026-11-08-step7-vtkindoftype-floors.md): Step 7: vtKindOfType's floors closed; it is the annotation's rep kind (#6891).
