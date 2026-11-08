@@ -47,5 +47,5 @@ longer reach `monoArgPinTyIx`.
 ## Graded
 
 Sweep, base against candidate: 23,736 of 23,736 the same, 0 bytes-only movers, 0 output movers.
-Fixpoint: a second refresh is byte-identical. Seed 6,579,943 → 6,580,021 bytes (+78). Pin-helper
+Fixpoint: a second refresh is byte-identical. Seed 6,579,943 → 6,580,052 bytes (+109). Pin-helper
 budget 921 → 921 (two added, two deleted).
