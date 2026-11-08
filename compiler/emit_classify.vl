@@ -147,6 +147,7 @@ import {
   fnTagRetIsTagged,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
+import { mapStoredTyOf } from "./check_fn_tag_facts"
 import { letNullHoleFilledTy, letNullHoleUnfilled } from "./check_null_holes"
 import { canonUnionMembersInto } from "./check_program"
 import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
@@ -189,6 +190,7 @@ import {
   mkNullableTy,
   numLitUnionBaseTy,
   oneListUnionRender,
+  structNameOfTy,
   tyArrayElemIx,
   tyArrayElemPrimName,
   tyAt,
@@ -487,7 +489,6 @@ import {
 import {
   annIsNulStrListDeep,
   annValtypeSlotOf,
-  annVariantRowOf,
   asgValueIsFunc,
   assignTargetSpills,
   gckDrop,
@@ -511,7 +512,6 @@ import {
   retNulRefIndex,
   retStructRowIndex,
   structIdxOfElemNameTy,
-  tyAnnRefListSlot,
   vtKindOfType,
 } from "./emit_nullable_rets"
 import {
@@ -598,7 +598,7 @@ import {
   tyIsNulScalarBox,
   unRowOfKey,
 } from "./emit_rep"
-import { repSlotOfKind } from "./emit_rep_slot"
+import { repSigSlotTyOf, repSlotOfKind } from "./emit_rep_slot"
 import { nameFieldCodeTy } from "./emit_shape_intern"
 import {
   ALK_F64,
@@ -611,6 +611,7 @@ import {
   arrLitArenaElemRow,
   arrLitBoxElem,
   arrLitBoxElemName,
+  arrLitClosureRowTy,
   arrLitElemRender,
   arrLitLeadInner,
   arrLitLeadIsList,
@@ -1135,62 +1136,52 @@ function cloRetNulVariantRow(fe: i32): i32 {
   -1
 }
 
-// The struct-table slot for `fe`'s result valtype — a real index only for the kinds that
-// carry one (struct, nullable struct, variant, ref list, map), `-1` otherwise.
-export function cloRetValSlot(fe: i32) {
+// `fe`'s result type: a declared one at its annotation's type, else the recorded one.
+function cloRetResultTy(fe: i32): i32 {
+  const fd = nodeAt(fnStmts[fe])
+  const at = if fd is FuncDecl && fd.fnRet >= 0 { nodeRepTyIxOf(fd.fnRet) } else { -1 }
+  if at >= 0 { at } else { fnRecordedRetTyFn(fe) }
+}
+
+// The row `fe`'s result valtype names at `cloRetValKind`'s kind: a map's shape, an un-annotated
+// result's recorded row, a declared one's annotation row, else its type's slot (-1 for none).
+export function cloRetValSlot(fe: i32): i32 {
   if clsCensusOn { clsCensusEnter("cloRetValSlot") }
   if fe < 0 || fe >= fnStmts.length { return -1 }
-  const fn = nodeAt(fnStmts[fe])
-  if fn is FuncDecl {
-    if fn.fnRet >= 0 {
-      const k = vtKindOfType(fn.fnRet)
-      if k == "struct" || k == "nulstruct" {
-        return retStructRowIndex(fn.fnRet)
-      }
-      // A `: Cat` annotated variant result — the slot is the variant index.
-      if k == "variant" { return annVariantRowOf(fn.fnRet) }
-      // A `: Circle | null` annotated result — the slot is the variant index under the
-      // null, since `retStructIndex` has no row for a variant.
-      if k == "nulvariant" { return nulVariantIndexOf(fn.fnRet) }
-      // A `: S[]` or `: ((i32) => i32)[]` annotated ref-list result — the slot is the
-      // `rlWrapIdx`-bearing ref-list slot, the dual of a `cloParamTok` ref-list param's.
-      if k == "reflist" || k == "nulreflist" {
-        return tyAnnRefListSlot(fn.fnRet)
-      }
-      // A `: {[string]: V}` annotated map result — the slot is the map shape (-1 when mono,
-      // else the value type's mv slot), so the `$fnsig` result selects this map's struct.
-      if k == "map" || k == "nulmap" { return mapAnnShape(fn.fnRet) }
-      return -1
-    }
-    // A collapsed-to-one-variant inferred result — the variant index.
-    const cvi = cbRetVariantIdx(fe)
-    if cvi >= 0 { return cvi }
-    const srk = fRetKind[fe]
-    match srk {
-      "struct" | "nulstruct" => {
-        return fRetStructIdx[fe]
-      }
-      // The inferred concrete-variant result, from the same companion column — the twin of
-      // `emitOneFuncType`'s inferred `variant` arm — and its nullable twin (D1562): every
-      // caller reads the kind and this slot as a pair, and (`"nulvariant"`, -1) trips
-      // `fbValtype`'s bounds guard with `ref valtype with no interned shape`.
-      "variant" | "nulvariant" => {
-        return fRetStructIdx[fe]
-      }
-      // An inferred map or nullable-map return — the slot the function's own functype result reads.
-      "map" | "nulmap" => {
-        return inferredRetMapSlot(fe)
-      }
-      // An inferred ref-list return — its element name (`fRetRArrElem`, set by the
-      // return-classify scan) resolves the ref-list slot.
-      "reflist" => {
-        return fnRetRefListSlot(fe)
-      }
-      // Every other inferred kind carries no slot.
-      "i32" | "list" | "str" | "union" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulnone" | "u8list" | "v128" => {}
-    }
+  const k = cloRetValKind(fe)
+  const t = cloRetResultTy(fe)
+  if t < 0 { return -1 }
+  // A map result is keyed by its map shape, -1 where its type names none.
+  if k == "map" || k == "nulmap" {
+    const ms = mapShapeOfTyPeeled(t)
+    return if ms == -3 { -1 } else { ms }
   }
-  -1
+  const fd = nodeAt(fnStmts[fe])
+  if !(fd is FuncDecl) || fd.fnRet < 0 {
+    // An un-annotated result is built at the row its recorded read wrote
+    // (`fnRetColsFromRecorded`): a record's or variant's, a ref list's values' joined row.
+    if k == "reflist" { return fnRetRefListSlot(fe) }
+    if (
+      k == "struct"
+      || k == "nulstruct"
+      || k == "variant"
+      || k == "nulvariant"
+    ) {
+      return if fe < fRetStructIdx.length { fRetStructIdx[fe] } else { -1 }
+    }
+    return repSlotOfKind(k, repSigSlotTyOf(t))
+  }
+  // A declared record takes the row its annotation names, ahead of the first row of its shape.
+  if k == "struct" || k == "nulstruct" {
+    const ds = retStructRowIndex(fd.fnRet)
+    if ds >= 0 { return ds }
+  }
+  // A declared variant takes its name's row.
+  if k == "variant" {
+    const vi = variantIndexOf(structNameOfTy(t))
+    if vi >= 0 { return vi }
+  }
+  repSlotOfKind(k, repSigSlotTyOf(t))
 }
 
 // The `>X` result suffix of `fe`'s extended `$fnsig` key — one token per distinct result
@@ -12125,6 +12116,63 @@ function refListElemNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
   return ""
 }
 
+// `refListElemNameOfCall`'s rungs as slots, in its order: the row each rung already holds, -2
+// at a rung that has only a name (an annotated or record fill, a result with no typed row).
+function refListKeptSlotOfCall(e: Call, exprIx: i32, fnIx: i32): i32 {
+  if arrNewIntrKind(exprIx, fnIx) == "reflist" {
+    const ds = rlSlotOfTy(
+      tyRefArrElemOf(instanceTyOf(nodeTyIxOf(exprIx), fnIx)),
+    )
+    if ds >= 0 && ds < rlElemName.length { return ds }
+    return -2
+  }
+  if e.callFn < 0 { return -1 }
+  const callee = nodeAt(e.callFn)
+  if callee is Ident {
+    const asl = calleeAnnRetRefListSlot(callee.identName, e.callFn, fnIx)
+    if asl >= 0 && asl < rlElemName.length { return asl }
+    const sid = sidOfNode(e.callFn)
+    // A function's recorded result: the row its element is minted under at this instance.
+    if fnRetRefArrayNameSid(sid, callee.identName, fnIx, e.callFn) != "" {
+      const ws = rlSlotOfRowTy(
+        rlRowTyOfElem(tyRefArrElemOf(nodeTyInOf(exprIx, fnIx))),
+      )
+      return if ws >= 0 { ws } else { -2 }
+    }
+    if fnRetNulRefArrayNameSid(sid, callee.identName, fnIx, e.callFn) != "" {
+      return -2
+    }
+    const ck = calleeCloSigKeyOfRead(e.callFn, fnIx)
+    if sigKeyRetKind(ck) == "reflist" || sigKeyRetKind(ck) == "nulreflist" {
+      const rs = sigKeyRetSlot(ck)
+      if rs >= 0 && rs < rlElemName.length { return rs }
+    }
+    const nk = cloCallSigKey(exprIx, fnIx)
+    if sigKeyRetKind(nk) == "reflist" || sigKeyRetKind(nk) == "nulreflist" {
+      const nrs = sigKeyRetSlot(nk)
+      if nrs >= 0 && nrs < rlElemName.length { return nrs }
+    }
+    return -1
+  }
+  if callee is Member {
+    if callee.memProp == "values" && exprMap(callee.memObj, fnIx) {
+      const vsh = mapShapeOfExpr(callee.memObj, fnIx)
+      if vsh >= 0 && mvRlSlot[vsh] >= 0 { return mvRlSlot[vsh] }
+    }
+    if mfNulRecMapElemTy(exprIx, fnIx) >= 0 { return -2 }
+    const ms = mfResultSlotOf(exprIx, fnIx)
+    if ms >= 0 && ms < rlElemName.length { return ms }
+    if mfStructResultRowName(exprIx, fnIx) != "" { return -2 }
+    if mfListResultElemName(exprIx, fnIx) != "" { return -2 }
+  }
+  const mk2 = cloCallSigKey(exprIx, fnIx)
+  if sigKeyRetKind(mk2) == "reflist" || sigKeyRetKind(mk2) == "nulreflist" {
+    const mrs2 = sigKeyRetSlot(mk2)
+    if mrs2 >= 0 && mrs2 < rlElemName.length { return mrs2 }
+  }
+  -1
+}
+
 // The ref-list element name a name read `e` holds: a narrowed arm, a param, a local, a
 // capture or a global, nullable ref arrays answering their inner list. "" when the
 // binding is not a ref list.
@@ -12280,8 +12328,8 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
 
 // The per-element-type ref-list table SLOT the expression at `exprIx` produces, or -1 when
 // the element type does not resolve: its rep's row, else the slot its binding keeps, else (an
-// identifier) its type's row, else its element name's. Slot 0 is a real row, so every caller
-// tests the result before indexing a backing/wrapper/element table.
+// identifier) its type's row, else (a list literal or call) its rungs' row, else its name's.
+// Slot 0 is a real row, so every caller tests the result before indexing a backing table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   const rs0 = listRowOfExpr(exprIx, fnIx)
   if rs0 >= 0 { return rs0 }
@@ -12290,6 +12338,15 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   // An identifier whose rung has only a name reads the row its own type keys.
   if exprIx >= 0 && exprIx < P.nodes.length && nodeAt(exprIx) is Ident {
     return rlSlotOfTyOrTwin(tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
+  }
+  const pe = if exprIx < P.nodes.length { nodeAt(exprIx) } else { null }
+  if pe is ArrayLit {
+    const ls = arrLitKeptRowSlot(exprIx, fnIx)
+    if ls != -2 { return ls }
+  }
+  if pe is Call {
+    const cs = refListKeptSlotOfCall(pe, exprIx, fnIx)
+    if cs != -2 { return cs }
   }
   const nm = refListElemNameOfExpr(exprIx, fnIx)
   const s = rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
@@ -12320,6 +12377,33 @@ function refListKeptSlotOfExpr(exprIx: i32, fnIx: i32): i32 {
     return -1
   }
   refListKeptSlotOfIdent(e, exprIx, fnIx)
+}
+
+// `arrLitElemNameIn`'s rungs as slots, in its order: the row of the type each rung renders, -2
+// at a rung that has only a name (a spread's source row, a record or union template element).
+function arrLitKeptRowSlot(arrIx: i32, fnIx: i32): i32 {
+  if spreadLitSrcRowName(arrIx, fnIx) != "" { return -2 }
+  const ae = arrLitArenaRecElem(arrIx)
+  if ae >= 0 { return rlSlotOfTyOrTwin(mapStoredTyOf(ae)) }
+  const ft = arrLitFrameRefTy(arrIx, fnIx)
+  if ft >= 0 {
+    const fe = tyArrayElemIx(ft)
+    if tyIsArray(fe) { return -2 }
+    return rlSlotOfTyOrTwin(mapStoredTyOf(fe))
+  }
+  const inst = arrLitInstElemRow(arrIx, fnIx)
+  if inst >= 0 && inst < sTyIx.length { return rlSlotOfTyOrTwin(sTyIx[inst]) }
+  if arrElemIsClosureTy(arrIx) {
+    const ct = arrLitClosureRowTy(arrIx)
+    return if ct >= 0 { rlSlotOfTyOrTwin(ct) } else { -2 }
+  }
+  // Any other template arm keys the row of the element type it renders; a record's row can
+  // still hold a fact only its name carries (D14533).
+  const el = tyArrayElemIx(nodeTyIxOf(arrIx))
+  if el < 0 || el >= T.tys.length || tyAt(el) is TyObj || tyAt(el) is TyUnion {
+    return -2
+  }
+  arrLitRowSlotIn(arrIx, fnIx)
 }
 
 // `refListElemNameOfIdent`'s rungs as slots, in its order: -2 at a rung that has only a name.
