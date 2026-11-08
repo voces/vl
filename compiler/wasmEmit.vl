@@ -1,5 +1,6 @@
 import { isTestAnswer } from "./check_narrow_flow"
 import {
+  armHeapOfTy,
   armSrcShadowNote,
   atomSrcShadowNote,
   boxDstShadowArmed,
@@ -1247,6 +1248,7 @@ import {
   declaredNulString,
   fnIndexOfInScopeAt,
   memNarrowVariantIndex,
+  narrowedArmTyAt,
   narrowedStructArmVi,
 } from "./emit_local_scope"
 import {
@@ -9572,10 +9574,65 @@ function exprTyIsRecord(exprIx: i32, nullable: boolean, fnIx: i32): boolean {
 // no cast target, and `ref.cast -1` would put a garbage heap index in the module.
 function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32, fnIx: i32) {
   armSrcShadowNote(heapIdx, exprIx, fnIx)
-  emitArmUnboxCast(
-    heapIdx,
-    narrowedNulStructArm(exprIx, fnIx) || exprTyIsRecord(exprIx, true, fnIx),
-  )
+  emitArmUnboxCast(heapIdx, armUnboxNullable(exprIx, fnIx))
+}
+
+// Whether the unbox of `exprIx` casts nullably: it is narrowed to `X | null`.
+function armUnboxNullable(exprIx: i32, fnIx: i32): boolean {
+  narrowedNulStructArm(exprIx, fnIx) || exprTyIsRecord(exprIx, true, fnIx)
+}
+
+// The node whose next emission the table unboxes to its recorded arm (`armOpen`), or -1.
+let armSeat = -1
+
+// The node the table last unboxed, so the position that seated it casts nothing itself.
+let armServed = -1
+
+// The heap of the arm the checker recorded for the narrowed read `ix` at instance `fnIx`, or -1.
+function armRecordHeapAt(ix: i32, fnIx: i32): i32 {
+  const a = instTyOrSelf(narrowedArmTyAt(ix, fnIx), fnIx)
+  if a < 0 { return -1 }
+  armHeapOfTy(a)
+}
+
+// Seat `ix` for the table before a position emits it, where the position owes an arm (`owed`, at
+// its slot's heap `siteHeap`) and the read has an arm record. Returns the seat to restore.
+function armOpen(owed: boolean, siteHeap: i32, ix: i32, fnIx: i32): i32 {
+  const prev = armSeat
+  if (
+    owed
+    && siteHeap >= 0
+    && siteHeap != uBoxIdx
+    && armRecordHeapAt(ix, fnIx) >= 0
+  ) {
+    armSeat = ix
+  }
+  prev
+}
+
+// Close `armOpen`'s seat once the value is on the stack: the table cast it, or the position casts
+// at its own heap (a floor the box shadow names). Returns 0.
+function armClose(prev: i32, owed: boolean, siteHeap: i32, ix: i32, fnIx: i32) {
+  armSeat = prev
+  if armServed == ix && ix >= 0 {
+    armServed = -1
+    if boxDstShadowArmed() {
+      boxDstShadowAs("table")
+      armSrcShadowNote(armRecordHeapAt(ix, fnIx), ix, fnIx)
+    }
+    return 0
+  }
+  if !owed { return 0 }
+  if boxDstShadowArmed() { boxDstShadowAs(armFloorWhy(siteHeap, ix, fnIx)) }
+  emitNarrowedArmUnboxTo(siteHeap, ix, fnIx)
+}
+
+// Why a position casts `ix` at its own heap, for the box shadow.
+function armFloorWhy(siteHeap: i32, ix: i32, fnIx: i32): string {
+  if siteHeap < 0 { return "floor: site has no heap" }
+  if siteHeap == uBoxIdx { return "floor: site takes the box" }
+  if armRecordHeapAt(ix, fnIx) < 0 { return "floor: no record" }
+  "floor: not seated"
 }
 
 // That unbox with its nullability given, for a destination that knows it is a niche. A
@@ -9592,9 +9649,9 @@ function emitArmUnboxCast(heapIdx: i32, nullable: boolean) {
 // the bare arm emits unchanged, so every site can call this in place of its `emitExpr`.
 function emitArmDelivery(body: u8[], exprIx: i32, fnIx: i32, heapIdx: i32) {
   const owed = narrowedArmNeedsUnbox(exprIx, fnIx)
+  const ao = armOpen(owed, heapIdx, exprIx, fnIx)
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-  if owed && heapIdx >= 0 { emitNarrowedArmUnboxTo(heapIdx, exprIx, fnIx) }
-  0
+  armClose(ao, owed, heapIdx, exprIx, fnIx)
 }
 
 // The heap a code-15 struct field's slot names — `(ref null $sHeapIdx[target])`. -1 where the
@@ -26218,14 +26275,11 @@ function emitCallRefArg(
           "emitProgram: value-call nullable union-arm parameter has no variant slot",
         )
       }
+      const cnvOwed = narrowedArmNeedsUnbox(args[i], fnIx)
+      const cnvHeap = armDestHeapOf("nulvariant", cnvSlot)
+      const cnvSeat = armOpen(cnvOwed, cnvHeap, args[i], fnIx)
       if emitExpr(body, args[i], fnIx) < 0 { return -1 }
-      if narrowedArmNeedsUnbox(args[i], fnIx) {
-        emitNarrowedArmUnboxTo(
-          armDestHeapOf("nulvariant", cnvSlot),
-          args[i],
-          fnIx,
-        )
-      }
+      armClose(cnvSeat, cnvOwed, cnvHeap, args[i], fnIx)
     } else if cuBox {
       if emitUnionBoxAtRecord(body, "", -1, args[i], fnIx) < 0 { return -1 }
     } else if (
@@ -26245,16 +26299,12 @@ function emitCallRefArg(
       // The parameter's nullability is assigned from the key, as a direct call assigns it
       // from the declaration: an enclosing position's non-null expectation would otherwise
       // recover a `null` argument into a nullable parameter, a trap (D2552).
+      // A narrowed struct argument is unboxed at the key's slot, as a direct call does (D1723).
+      const pkOwed = pkk != null && narrowedArmNeedsUnbox(args[i], fnIx)
+      const pkHeap = if pkk != null { armDestHeapOf(pkk, sigParamSlotAt(ckey, i)) } else { -1 }
+      const pkSeat = armOpen(pkOwed, pkHeap, args[i], fnIx)
       if emitExpr(body, args[i], fnIx) < 0 { return -1 }
-      // A value narrowed out of a box into a struct parameter is unboxed, as the direct
-      // call unboxes it (D1723); the slot is the key's, so the cast agrees with the bytes.
-      if pkk != null && narrowedArmNeedsUnbox(args[i], fnIx) {
-        emitNarrowedArmUnboxTo(
-          armDestHeapOf(pkk, sigParamSlotAt(ckey, i)),
-          args[i],
-          fnIx,
-        )
-      }
+      armClose(pkSeat, pkOwed, pkHeap, args[i], fnIx)
     } else {
       if emitExpr(body, args[i], fnIx) < 0 { return -1 }
     }
@@ -26800,6 +26850,10 @@ function emitAssignGlobal(body: u8[], a: BinExpr, lhsIx: i32, fnIx: i32) {
     const gaCoerced = gaKind == "variant"
       && gaArmIdx >= 0
       && gaArmIdx < uVarRow.length
+    // The narrowed-arm unbox at the same boundary (D1031): `gv = s` under `if s is Circle`.
+    const gaArmOwed = !gaCoerced && narrowedArmNeedsUnbox(a.binRight, fnIx)
+    const gaArmHeap = if gaArmOwed { armDestHeapOf(gaKind, gaArmIdx) } else { -1 }
+    const gaSeat = armOpen(gaArmOwed, gaArmHeap, a.binRight, fnIx)
     if (
       gUNm != ""
       && !tyIsLitUnion(nodeTyIxOf(lhsIx))
@@ -26847,11 +26901,7 @@ function emitAssignGlobal(body: u8[], a: BinExpr, lhsIx: i32, fnIx: i32) {
       // interned i32 id, which the value hook decides from the recorded destination type.
       if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
     }
-    // the narrowed-arm unbox at the same boundary (D1031) — `gv = s` under `if s is
-    // Circle`, between two module globals; `armDestHeapOf` reads the destination pair.
-    if !gaCoerced && narrowedArmNeedsUnbox(a.binRight, fnIx) {
-      emitNarrowedArmUnboxTo(armDestHeapOf(gaKind, gaArmIdx), a.binRight, fnIx)
-    }
+    armClose(gaSeat, gaArmOwed, gaArmHeap, a.binRight, fnIx)
     // the nullable-niche recover at the same boundary (D1115) — `g = y` under
     // `if y != null`, into a global whose cell is a non-null ref.
     if !gaCoerced && nulNicheRecoverOwed(gaKind, a.binRight, fnIx) {
@@ -27228,27 +27278,18 @@ function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
     if emitExpr(body, target.idxArr, fnIx) < 0 { return -1 }
   }
   if emitExpr(body, target.idxIndex, fnIx) < 0 { return -1 }
-  if emitIdxStoreValue(body, fnIx, a, target.idxArr, st) < 0 { return -1 }
-  // the read-only covariant copy at the indexed-store boundary (D2163)
-  if st.mfKind == "ref" {}
   // the narrowed-arm unbox at the ELEMENT-assignment boundary, the binding boundary's
   // twin one container over: the element's own variant or struct row is where the arm
   // lands, and those two seeds are what the value emits under (D1685).
-  if narrowedArmNeedsUnbox(a.binRight, fnIx) {
-    if st.variantIdx >= 0 {
-      emitNarrowedArmUnboxTo(
-        armDestHeapOf("variant", st.variantIdx),
-        a.binRight,
-        fnIx,
-      )
-    } else if st.structIdx >= 0 {
-      emitNarrowedArmUnboxTo(
-        armDestHeapOf("struct", st.structIdx),
-        a.binRight,
-        fnIx,
-      )
-    }
-  }
+  const iaOwed = narrowedArmNeedsUnbox(a.binRight, fnIx)
+  let iaHeap = -1
+  if st.variantIdx >= 0 { iaHeap = armDestHeapOf("variant", st.variantIdx) }
+  else if st.structIdx >= 0 { iaHeap = armDestHeapOf("struct", st.structIdx) }
+  const iaSeat = armOpen(iaOwed, iaHeap, a.binRight, fnIx)
+  if emitIdxStoreValue(body, fnIx, a, target.idxArr, st) < 0 { return -1 }
+  // the read-only covariant copy at the indexed-store boundary (D2163)
+  if st.mfKind == "ref" {}
+  armClose(iaSeat, iaOwed, iaHeap, a.binRight, fnIx)
   const storeValSlot = listIdxValSlot(st.mfKind, st.slot)
   fbLocalSet(storeValSlot) // 0x21 — park the value under the guard operands
   // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
@@ -27972,13 +28013,14 @@ function emitPushOne(
     if lIdx < 0 { return -1 }
   }
   const valIdx = base
-  const pushArmOwed = narrowedArmNeedsUnbox(argIx, fnIx)
-  // V = x  (an f64-list push coerces/encodes the value as f64)
-  if emitPushValue(body, recvIx, argIx, fnIx, pv) < 0 { return -1 }
   // the narrowed-arm unbox at the `.push` boundary (D1031) — `xs.push(s)` into a
   // `Circle[]` under `if s is Circle`. The element-literal twin is in `emitArr`; both
   // read the same slot heap, so the two spellings of one store cannot disagree.
-  if pushArmOwed { emitNarrowedArmUnboxTo(ps.armHeap, argIx, fnIx) }
+  const pushArmOwed = narrowedArmNeedsUnbox(argIx, fnIx)
+  const pushSeat = armOpen(pushArmOwed, ps.armHeap, argIx, fnIx)
+  // V = x  (an f64-list push coerces/encodes the value as f64)
+  if emitPushValue(body, recvIx, argIx, fnIx, pv) < 0 { return -1 }
+  armClose(pushSeat, pushArmOwed, ps.armHeap, argIx, fnIx)
   // the read-only covariant copy at the `.push` boundary (D2163)
   // D1197 — the non-null recover `.push` OWED. Eight sibling deliveries of the same
   // narrowed value ask `nulNicheRecoverOwed`; this one asked nothing, so `out.push(e)`
@@ -29579,12 +29621,16 @@ type CoerceKind = "none"
   | "mapRetag"
   | "recCopy"
   | "box"
+  | "unbox"
+  | "atomstr"
 
 // The coercion recorded at `ix` in instance `fnIx`. A box is the outer one: any other record
 // at the node converts the value inside it. Otherwise each record is of one value type (a list,
 // a function, a union box, a record), so at most one holds; a union of maps is read first.
 function coerceKindAt(ix: i32, fnIx: i32): CoerceKind {
   if boxAtTable(ix, fnIx) { return "box" }
+  if armSeat >= 0 && ix == armSeat { return "unbox" }
+  if atomSeat >= 0 && ix == atomSeat { return "atomstr" }
   if listCopyAtNode(ix) >= 0 { return "listCopy" }
   if fnCloCoerceAtNode(ix) >= 0 { return "fnClo" }
   if mapDeliveryRecorded {
@@ -29637,6 +29683,17 @@ function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
     const rb = emitUnionBoxArg(body, boxRecordNameOf(bt), bt, exprIx, fnIx)
     boxSeat = seat
     return rb
+  }
+  if ck == "atomstr" { return emitAtomStrAtRecord(body, exprIx, fnIx) }
+  if ck == "unbox" {
+    // The seat is spent, so any other record at the node converts the value before the cast.
+    armSeat = -1
+    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+    armServed = exprIx
+    return emitArmUnboxCast(
+      armRecordHeapAt(exprIx, fnIx),
+      armUnboxNullable(exprIx, fnIx),
+    )
   }
   let fe = -1
   if ck == "fnClo" {
@@ -30724,26 +30781,6 @@ function emitReturnCoercedValue(
   0
 }
 
-// The narrowing at a return boundary, after the value is emitted: the narrowed-arm unbox to
-// `retArmHeap` when no concrete variant (`retVi`) already served it.
-function emitReturnBoundaryWidens(
-  retArg: i32,
-  fnIx: i32,
-  retArmHeap: i32,
-  retVi: i32,
-) {
-  // the narrowed-arm unbox at the return boundary (D1031): the bare `: Circle` result is
-  // already served through `emitVariantCoerce`; the niche results (`Circle | null`, `Dot |
-  // null`) are the ones that took the box into a `(ref null $H)` slot. Read off the same
-  // (kind, slot) pair the result valtype is written from.
-  if retArmHeap >= 0 && retVi < 0 {
-    if narrowedArmNeedsUnbox(retArg, fnIx) {
-      emitNarrowedArmUnboxTo(retArmHeap, retArg, fnIx)
-    }
-  }
-  0
-}
-
 // What a function's result asks of its `return` values: the numeric widens, the variant and
 // union-box targets, the niche and map seeds, and the literal-union atom forms.
 type RetFlags = {
@@ -30908,6 +30945,13 @@ function emitReturnValueTail(
     if seeded < 0 { return seeded }
     retFlagsSeedNiches(fn, retArg, fnIx, fnPos, rf)
   }
+  // the narrowed-arm unbox at the return boundary (D1031): the bare `: Circle` result is
+  // already served through `emitVariantCoerce`; the niche results (`Circle | null`, `Dot |
+  // null`) are the ones that took the box into a `(ref null $H)` slot.
+  const retArmOwed = retArmHeap >= 0
+    && rf.retVi < 0
+    && narrowedArmNeedsUnbox(retArg, fnIx)
+  const retSeat = armOpen(retArmOwed, retArmHeap, retArg, fnIx)
   if (
     rf.retF32
     || rf.retF64
@@ -30951,7 +30995,7 @@ function emitReturnValueTail(
       return -1
     }
   }
-  emitReturnBoundaryWidens(retArg, fnIx, retArmHeap, rf.retVi)
+  armClose(retSeat, retArmOwed, retArmHeap, retArg, fnIx)
   // The caller's context comes back whole: a seed a `return { … }` or `return Map()` leaves
   // unconsumed would otherwise type the next function's `null` (D2564).
   0
@@ -35076,6 +35120,9 @@ function initBitOf(gi: i32): i32 {
 export function wasmEmitStateReset() {
   coerceHeld = -1
   boxSeat = -1
+  armSeat = -1
+  armServed = -1
+  atomSeat = -1
   arrNewFillDepth = 0
   eqStashL = -1
   eqStashR = -1
@@ -35414,18 +35461,87 @@ function emitPrintStrFromScratch(body: u8[]) {
 // member. The string-subtype analogue of the numeric i32→f64 widening.
 export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32) {
   // `litAtomWidenTexts` is the ladder, shared with `print`'s atom arm: the node's own union
-  // members, the DECLARATION fallback for an operand whose recorded type is the GENERIC's,
-  // then the bare one-member set. Two consumers ask the same question and both need every
-  // rung — the classifier decides WHETHER to widen, this one needs the members to widen WITH.
+  // members, the declaration fallback for an operand whose recorded type is the generic's,
+  // then the bare one-member set. The table decodes at the recorded set where that covers it.
   const nulTexts = nulAtomWidenTexts(atomIx, fnIx)
-  if nulTexts.length > 0 {
-    atomSrcShadowNote(nulTexts, true, atomIx, fnIx)
-    return emitNulAtomToStr(body, atomIx, nulTexts, fnIx)
+  const siteNul = nulTexts.length > 0
+  let texts = if siteNul { nulTexts } else { litAtomWidenTexts(atomIx, fnIx) }
+  const why = atomFloorWhy(texts, siteNul, atomIx, fnIx)
+  if boxDstShadowArmed() {
+    boxDstShadowAs(if why == "" { "table" } else { why })
   }
-  let texts = litAtomWidenTexts(atomIx, fnIx)
-  atomSrcShadowNote(texts, false, atomIx, fnIx)
+  atomSrcShadowNote(texts, siteNul, atomIx, fnIx)
+  if why == "" {
+    const seat = atomSeat
+    atomSeat = atomIx
+    const rt = emitExpr(body, atomIx, fnIx)
+    atomSeat = seat
+    return rt
+  }
+  if siteNul { return emitNulAtomToStr(body, atomIx, nulTexts, fnIx) }
   // Where the node's own type names no member, the set its delivery recorded does (D4028).
-  if texts.length == 0 { texts = tyLitMemberTexts(atomSrcTyAt(atomIx, fnIx)) }
+  if texts.length == 0 { texts = tyLitMemberTexts(atomRecordAt(atomIx, fnIx)) }
+  emitAtomToStrTower(body, atomIx, texts, fnIx)
+}
+
+// The node whose next emission the table decodes to a string at its recorded set, or -1.
+let atomSeat = -1
+
+// The literal set the checker recorded for the atom `ix` at instance `fnIx`, at the node, its
+// unparenthesised form or the node it stands in for; -1 for none.
+function atomRecordAt(ix: i32, fnIx: i32): i32 {
+  let r = atomSrcTyAt(ix, fnIx)
+  if r < 0 { r = atomSrcTyAt(unwrapParen(ix), fnIx) }
+  if r < 0 { r = atomSrcTyAt(nodeSrc[ix] ?? -1, fnIx) }
+  instTyOrSelf(r, fnIx)
+}
+
+// Why the site decodes `ix` at its own members `texts` (`nul` mapping `-1` to null), or "" where
+// the record serves: it holds members, agrees on null, and names none outside the site's set.
+function atomFloorWhy(
+  texts: string[],
+  nul: boolean,
+  ix: i32,
+  fnIx: i32,
+): string {
+  if ix == coerceHeld { return "floor: held" }
+  const r = atomRecordAt(ix, fnIx)
+  if r < 0 { return "floor: no record" }
+  const rn = tyNulLitUnionMemberTexts(r)
+  const rt = if rn.length > 0 { rn } else { tyLitMemberTexts(r) }
+  if rt.length == 0 { return "floor: record holds no member" }
+  if (rn.length > 0) != nul { return "floor: null differs" }
+  for x in rt {
+    if texts.length > 0 && !textsHave(texts, x) { return "floor: record wider" }
+  }
+  ""
+}
+
+// Whether `xs` holds `x`.
+function textsHave(xs: string[], x: string): boolean {
+  for y in xs {
+    if y == x { return true }
+  }
+  false
+}
+
+// The table's decode of a seated atom: the tower over its recorded set, `-1` to null where the
+// set holds `null`. Returns 0, or -1 failed.
+function emitAtomStrAtRecord(body: u8[], ix: i32, fnIx: i32): i32 {
+  atomSeat = -1
+  const r = atomRecordAt(ix, fnIx)
+  const rn = tyNulLitUnionMemberTexts(r)
+  if rn.length > 0 { return emitNulAtomToStr(body, ix, rn, fnIx) }
+  emitAtomToStrTower(body, ix, tyLitMemberTexts(r), fnIx)
+}
+
+// The `select` tower over `texts` for the atom `atomIx`, its id evaluated once.
+function emitAtomToStrTower(
+  body: u8[],
+  atomIx: i32,
+  texts: string[],
+  fnIx: i32,
+): i32 {
   if texts.length == 0 {
     return emitFail(
       "emitProgram: literal-union string widening with no members",
@@ -35437,8 +35553,7 @@ export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32) {
     )
   }
   if emitStashAtomId(body, atomIx, fnIx) < 0 { return -1 }
-  const r = emitAtomToStrChain(body, texts, 0, strScratchBase + 3)
-  r
+  emitAtomToStrChain(body, texts, 0, strScratchBase + 3)
 }
 
 // Widen a `K | null` atom to a `string | null`: `-1` is `ref.null`, any other id takes the
@@ -38235,7 +38350,11 @@ function emitDirectCallArgsUnder(
       if emitExprAsI64(body, args[i], fnIx) < 0 { return -1 }
       i = i + 1
     } else {
+      const daOwed = directArgArmOwed(args[i], fnIx, sd)
+      const daHeap = directArgArmHeap(sd)
+      const daSeat = armOpen(daOwed, daHeap, args[i], fnIx)
       if emitDirectArgValue(body, args[i], fnIx, sd) < 0 { return -1 }
+      armClose(daSeat, daOwed, daHeap, args[i], fnIx)
       const ub = emitDirectArgUnbox(args[i], fnIx, sd)
       if ub != 0 { return ub }
       i = i + 1
@@ -38278,27 +38397,10 @@ function emitDirectArgValue(
   0
 }
 
-// `emitDirectCallArgsUnder`'s unbox of a narrowed argument `arg` to the heap its parameter
-// declares, once its value is on the stack: a niche variant, a bare variant, or the
-// parameter's own (kind, slot) — guarded so at most one fires. Returns 0, or a refusal.
+// `emitDirectCallArgsUnder`'s unbox of a narrowed argument `arg` into a bare variant parameter,
+// once its value is on the stack; the other arms are `directArgArmHeap`'s. Returns 0, or a refusal.
 function emitDirectArgUnbox(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
   const cVi = sd.cVi
-  const cParamNulVariantIdx = sd.cParamNulVariantIdx
-  const cArgParamKind = sd.cArgParamKind
-  const cArgParamRow = sd.cArgParamRow
-  // The niche parameter's unbox (D1031) — `g(r)` into `g(x: Circle | null)` under `if r
-  // is Circle`. The bare variant parameter's unbox is the arm below; its `| null` twin
-  // declares the same heap with a nullable slot and never grew one, so the box went in
-  // whole: `vl check` rc 0, invalid wasm. Guarded on `cVi` being absent so the two arms cannot both fire.
-  if cVi < 0 && cParamNulVariantIdx >= 0 {
-    if narrowedArmNeedsUnbox(arg, fnIx) {
-      emitNarrowedArmUnboxTo(
-        armDestHeapOf("nulvariant", cParamNulVariantIdx),
-        arg,
-        fnIx,
-      )
-    }
-  }
   if cVi >= 0 {
     if exprUnion(arg, fnIx) {
       if variantHasCrossTagFits(cVi, arg, fnIx) {
@@ -38308,20 +38410,24 @@ function emitDirectArgUnbox(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
       fbRefCast(variantHeap(cVi)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
     }
   }
-  // The same unbox for a param whose annotation names a plain struct: an inferred
-  // union's arm is no registered member, so `cVi` is -1 and the box went in whole. The
-  // parameter's own (kind, slot) is the destination, as the cell's is at the binding
-  // boundary; guarded so the three arms cannot both fire (D1723).
-  if cVi < 0 && cParamNulVariantIdx < 0 {
-    if narrowedArmNeedsUnbox(arg, fnIx) {
-      emitNarrowedArmUnboxTo(
-        armDestHeapOf(cArgParamKind, cArgParamRow),
-        arg,
-        fnIx,
-      )
-    }
-  }
   0
+}
+
+// Whether a narrowed argument `arg` owes the arm unbox `directArgArmHeap` names: its parameter
+// is no bare variant (`cVi`, whose unbox `emitDirectArgUnbox` owns) and the value arrives boxed.
+function directArgArmOwed(arg: i32, fnIx: i32, sd: DirectArgSeeds): boolean {
+  sd.cVi < 0 && narrowedArmNeedsUnbox(arg, fnIx)
+}
+
+// The heap a direct call's parameter declares for a narrowed argument's arm: the niche
+// variant's (D1031), else the parameter's own (kind, slot) for an annotated plain struct
+// (D1723); -1 for a bare variant parameter or none.
+function directArgArmHeap(sd: DirectArgSeeds): i32 {
+  if sd.cVi >= 0 { return -1 }
+  if sd.cParamNulVariantIdx >= 0 {
+    return armDestHeapOf("nulvariant", sd.cParamNulVariantIdx)
+  }
+  armDestHeapOf(sd.cArgParamKind, sd.cArgParamRow)
 }
 
 // What argument `i` of a direct call to `target` takes from its parameter: the null rep a

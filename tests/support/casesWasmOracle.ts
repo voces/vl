@@ -503,7 +503,13 @@ const assertCase = async (
 };
 
 // ── Lint tier (the .vl lint pass, via the driver's `lintSrc`) ──────────────────
-type LintDiag = { sev: string; line: number; col: number; msg: string };
+type LintDiag = {
+  sev: string;
+  line: number;
+  col: number;
+  msg: string;
+  code?: string;
+};
 
 /**
  * The redundant-annotation findings (`redun*`) as lint diagnostics.
@@ -605,7 +611,11 @@ const readExpInf = (exp: Exports): LintDiag[] => {
   return out;
 };
 
-// No code is filtered here. The repo-policy rules (the comment rubric, the kind-ladder
+// Two codes are graded one way only: `unused-container` and `unused-field` are asserted
+// where a case declares them, and otherwise ignored. The corpus builds records and lists
+// it never reads on purpose (a field is a witness's shape, a list its rep), so holding
+// every case to them would declare one in most files and test nothing. Every other code
+// is held both ways. The repo-policy rules (the comment rubric, the kind-ladder
 // and sentinel-index rules, …) grade only the VL tree's own `compiler/`/`std/`, and a
 // case is linted with no path staged, so they decline by themselves
 // (docs/internals/lint-rule-scope.md); a case that saw one would be that scoping broken.
@@ -631,6 +641,9 @@ const driveLint = (exp: Exports, src: string): LintDiag[] => {
       line: exp.lintLineAt(i),
       col: exp.lintColAt(i),
       msg: readString(exp.lintMsgLen(i), (j) => exp.lintMsgByte(i, j)),
+      code: typeof exp.lintCodeLen === "function"
+        ? readString(exp.lintCodeLen(i), (j) => exp.lintCodeByte(i, j))
+        : undefined,
     });
   }
   return out;
@@ -642,9 +655,16 @@ const driveLint = (exp: Exports, src: string): LintDiag[] => {
  * every diag is declared). Message matching folds case/quote style like the
  * error tier.
  */
+const DECLARED_ONLY = new Set(["unused-container", "unused-field"]);
+
 const assertLint = (d: Directives, lints: LintDiag[]): void => {
+  const declared = [...d.warnings, ...d.infos, ...d.hints];
+  const graded = lints.filter((l) =>
+    !DECLARED_ONLY.has(l.code ?? "") ||
+    declared.some((w) => matches(l.msg, w))
+  );
   const bySev = (s: string): string[] =>
-    lints.filter((l) => l.sev === s).map((l) => l.msg);
+    graded.filter((l) => l.sev === s).map((l) => l.msg);
   const wants: [string[], string, string][] = [
     [d.warnings, "warning", "@warning"],
     [d.infos, "info", "@info"],
