@@ -43,7 +43,7 @@ un-called (struct, list, map, return), plus `global_assign`, which still refuses
 
 ## What stands
 
-* The slot-write spelling `xs[0] = a` is D15566, now the live-sites witness. An index store
+* The slot-write spelling `xs[0] = a` is D15567, now the live-sites witness. An index store
   is not yet a holder read `elabListParamSource` takes.
 * A hand whole to a generic function (`use<T>(ys: T[])`) still refuses: only an un-annotated
   parameter is taken.

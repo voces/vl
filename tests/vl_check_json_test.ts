@@ -350,7 +350,7 @@ Deno.test({
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
       // A live emit-side refusal (`scripts/capability-probes/length-of-slot-written-list-holding-a-generic-function.vl`):
-      // `vl check` accepts it and the emitter refuses the `.length` (D15566). It is D15010's witness plus
+      // `vl check` accepts it and the emitter refuses the `.length` (D15567). It is D15010's witness plus
       // a slot write; D15010's spelling and D15529's push run, and the stage under test is unchanged.
       await Deno.writeTextFile(
         file,
