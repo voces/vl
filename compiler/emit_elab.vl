@@ -23,6 +23,8 @@ import {
   elabFnSetTyMint,
   elabHoleRowCut,
   elabHoleRowMark,
+  elabListParamSource,
+  elabParamCopyOf,
   elabRestampNote,
   fnSlotThroughCalls,
   fnTagCallSetOf,
@@ -4855,78 +4857,6 @@ function elabRecLitOfParam(fi: i32, fn: FuncDecl, pd: i32): boolean {
   false
 }
 
-// The parameter of `fn` every element of the list literal bound at `d` reads, `d` a `const` or a
-// `let` nothing re-points, where each read of `d` in `fn`'s own body is an element called in place
-// (`d[i](...)`); else -1.
-function elabListParamSource(d: i32, fn: FuncDecl): i32 {
-  if d < 0 || d >= P.nodes.length { return -1 }
-  const ln = nodeAt(d)
-  if !(ln is LetDecl) || ln.letType >= 0 { return -1 }
-  if ln.letKw != "const" && !cwLetUnwritten(d) { return -1 }
-  const li = parenPeelIx(ln.letInit)
-  if li < 0 || li >= P.nodes.length { return -1 }
-  const al = nodeAt(li)
-  if !(al is ArrayLit) || al.arrElems.length == 0 { return -1 }
-  let pd = -1
-  for e in al.arrElems {
-    const ex = parenPeelIx(e)
-    if ex < 0 || ex >= P.nodes.length || !(nodeAt(ex) is Ident) { return -1 }
-    const src0 = identDeclOf(ex)
-    const src = if i32ListHas(fn.fnParams, src0) { src0 } else { elabParamCopyOf(src0, fn) }
-    if src < 0 || pd >= 0 && src != pd { return -1 }
-    pd = src
-  }
-  const todo: i32[] = [fn.fnBody]
-  const par: i32[] = [-1]
-  const gpar: i32[] = [-1]
-  const deep: boolean[] = [false]
-  while todo.length > 0 {
-    const x = todo.pop() ?? -1
-    const p = par.pop() ?? -1
-    const g = gpar.pop() ?? -1
-    const nested = deep.pop() ?? false
-    if x >= 0 && x < P.nodes.length {
-      const xn = nodeAt(x)
-      if xn is Ident && identDeclOf(x) == d {
-        if nested || p < 0 || g < 0 { return -1 }
-        const pn = nodeAt(p)
-        const gn = nodeAt(g)
-        if !(pn is Index) || pn.idxArr != x { return -1 }
-        if !(gn is Call) || parenPeelIx(gn.callFn) != p { return -1 }
-      }
-      for c in nodeChildren(x) {
-        todo.push(c)
-        par.push(x)
-        gpar.push(p)
-        deep.push(nested || xn is FuncDecl)
-      }
-    }
-  }
-  pd
-}
-
-// The parameter of `fn` that binding `d` copies: an un-annotated `const`, or a `let` nothing
-// re-points (`cwLetUnwritten`), initialised by a read of it or of such a copy, at most 8 deep;
-// -1 otherwise.
-function elabParamCopyOf(d: i32, fn: FuncDecl): i32 {
-  let cur = d
-  let hops = 0
-  while hops < 8 {
-    if cur < 0 || cur >= P.nodes.length { return -1 }
-    const ln = nodeAt(cur)
-    if !(ln is LetDecl) || ln.letType >= 0 { return -1 }
-    if ln.letKw != "const" && !cwLetUnwritten(cur) { return -1 }
-    const v = parenPeelIx(ln.letInit)
-    if v < 0 || !(nodeAt(v) is Ident) { return -1 }
-    const src = identDeclOf(v)
-    if i32ListHas(fn.fnParams, src) { return src }
-    // A copy of a copy reads the parameter too (D15051).
-    cur = src
-    hops = hops + 1
-  }
-  -1
-}
-
 // Whether the `const` copy `d` of parameter `pd` is read only as an element of list literals
 // `elabListParamSource` takes as `pd`.
 function elabCopyOnlyListed(d: i32, fn: FuncDecl, pd: i32): boolean {
@@ -4959,6 +4889,21 @@ function elabCopyOnlyListed(d: i32, fn: FuncDecl, pd: i32): boolean {
     }
   }
   seen
+}
+
+// Whether call `p` pushes onto a binding of `fn` that `elabListParamSource` takes as `pd`.
+function elabPushOntoParamList(p: i32, fn: FuncDecl, pd: i32): boolean {
+  if p < 0 || p >= P.nodes.length { return false }
+  const c = nodeAt(p)
+  if !(c is Call) { return false }
+  const cf = parenPeelIx(c.callFn)
+  const m = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { c }
+  if !(m is Member) || m.memProp != "push" { return false }
+  const o = parenPeelIx(m.memObj)
+  o >= 0
+    && o < P.nodes.length
+    && nodeAt(o) is Ident
+    && elabListParamSource(identDeclOf(o), fn) == pd
 }
 
 // Whether list literal `lit` initialises a binding in `fn`'s body that `elabListParamSource`
@@ -5655,6 +5600,8 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       if (p >= 0 && nodeAt(p) is ArrayLit && elabListLitOfParam(p, dn, pd)) {
         return 0
       }
+      // So does a push of it onto such a list.
+      if elabPushOntoParamList(p, dn, pd) { return 0 }
       // So does one a copy reads element by element into a closed holder, whose adapter calls
       // each element (D15432).
       if p >= 0 && nodeAt(p) is ArrayLit && ftParamListCopied(dn, pd) {
@@ -11568,7 +11515,7 @@ function elabRowEmptyListDefaults(ix: i32, tys: i32[]): i32[] {
 }
 
 // `t` with each list of an unpinned inference-hole element, under any nullable, at `i32[]`, and a
-// nullable of nothing at `null`.
+// nullable of nothing at `null`. A declaration's own hole is left open: its instance binds it.
 function elabEmptyElemsAtI32(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return t }
   const x = tyAt(t)
@@ -11583,6 +11530,7 @@ function elabEmptyElemsAtI32(t: i32): i32 {
       if x.aElem < T.tys.length {
         const e = tyAt(x.aElem)
         if e is TyVar && (e.tvName.length == 0 || e.tvName[0] == "?"[0]) {
+          if elabHoleDeclOf(e.tvName) >= 0 { return t }
           return mkArrayTy(TY_I32)
         }
       }
