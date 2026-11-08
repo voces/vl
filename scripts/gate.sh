@@ -184,7 +184,7 @@ run() { if [ "$FAST" = 1 ] && [[ "$SLOW_ROWS" == *"|$1|"* ]]; then SKIPPED+=("$1
 # fits beside the running rows', so a large row waits for room rather than being passed.
 launch() { local i=$1
            STARTS[$i]=$(now)
-           ( eval "${CMDS[$i]}" > "$LOGS/$i.log" 2>&1; rc=$?; now > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) &
+           ( eval "${CMDS[$i]}" > "$LOGS/$i.log" 2>&1; rc=$?; echo "$rc" > "$LOGS/$i.rc"; now > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) &
            PIDS[$i]=$!; }
 dispatch() { local i j live used
              for i in "${!CMDS[@]}"; do
@@ -404,8 +404,13 @@ FAIL=0
 echo
 echo "WALL = elapsed once launched   CPU = the row's own user+sys (WALL>>CPU means starved, not slow)"
 printf '%-22s %8s %8s  %s\n' "GATE" "WALL" "CPU" "RESULT"
+# A row's rc is the one its subshell wrote to `$LOGS/<i>.rc`, not `wait`'s: on a 32768-pid
+# box the polling forks wrap the pid space during a long gate, and once a later child takes a
+# finished row's pid, `wait` reports that child (0, or 127 "not a child of this shell").
+# `wait`'s status stands only for a row killed before it could write its file.
 for i in "${!PIDS[@]}"; do
-  wait "${PIDS[$i]}"; rc=$?
+  wait "${PIDS[$i]}" 2>/dev/null; rc=$?
+  [ -s "$LOGS/$i.rc" ] && rc=$(cat "$LOGS/$i.rc")
   fin=$(cat "$LOGS/$i.t" 2>/dev/null)
   [ -n "$fin" ] || fin=$(now)
   el=$(awk -v f="$fin" -v s="${STARTS[$i]}" 'BEGIN { print f - s }')
