@@ -463,6 +463,7 @@ import {
   lvFrameLocal,
   mAllocKind,
   mAllocSlot,
+  mNextType,
   mI32Used,
   mI64Used,
   mStructI32Idx,
@@ -6253,9 +6254,7 @@ function emitModule(_stmts: i32[]) {
   emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers, false)
   gTypeRopeAt = W.chunks.length
 
-  emitImportSection(n, typeOffset, hasStart)
-
-  emitFunctionSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
+  fnSectionCounts(n, hasStart, memFn, nHelpers)
 
   if fnValUsed { emitTableSection(n) }
 
@@ -6283,10 +6282,14 @@ function emitModule(_stmts: i32[]) {
   // The global section is framed first: it sits after the function section in the rope, so
   // placing it does not move the chunk the function section is placed before.
   frameGlobalSection()
-  frameFunctionSection()
-  // Placed last of the three, at the lowest chunk, so the other two places do not move.
+  // The functype base is read again here: every section that names a functype is written now.
+  const lateTypeOffset = mNextType
+  frameFunctionSection(n, lateTypeOffset, hasStart, memFn, nPrintTypes, nHelpers)
+  // The type, import and function sections share one chunk; the type section is placed last,
+  // so it lands first, and the global section, framed above, does not move.
+  emitImportSection(n, lateTypeOffset, hasStart)
   if !emitFailed {
-    emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers, true)
+    emitTypeSection(n, lateTypeOffset, hasStart, memFn, nPrintTypes, nHelpers, true)
   }
 
   if fnValUsed { emitElementSection(n) }
@@ -6296,7 +6299,7 @@ function emitModule(_stmts: i32[]) {
   emitDataSection()
   relPlaceSections()
   // Every section that names a type is written, so the first group can take its final order.
-  if !emitFailed { typeOrderRun(typeOffset, typeSeeds(typeOffset)) }
+  if !emitFailed { typeOrderRun(lateTypeOffset, typeSeeds(lateTypeOffset)) }
 
   // Custom "name" section LAST (after the code section, where it conventionally
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
@@ -7508,7 +7511,6 @@ function emitProgramReset(rootIx: i32) {
   gNeedsStrFromBytes = false
   mapDeleteReset()
   gFuncFixedN = 0
-  gFuncEntries = []
   gFuncRopeAt = 0
   gGlobalFixedN = 0
   gGlobalRopeAt = 0
@@ -9130,7 +9132,7 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
       emitGlobalImportEntries()
       if memImported() { emitMemoryImportEntry() }
       wTarget(moPrev)
-      wSection(2, memOnlyPayload)
+      wSectionPartsAt(gTypeRopeAt, 2, [memOnlyPayload])
     }
     return 0
   }
@@ -9249,7 +9251,7 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
     emitGlobalImportEntries()
     if memImported() { emitMemoryImportEntry() }
     wTarget(imPrev)
-    wSection(2, importPayload)
+    wSectionPartsAt(gTypeRopeAt, 2, [importPayload])
   }
   0
 }
@@ -9301,68 +9303,18 @@ function emitMemoryLimits() {
   0
 }
 
-function emitFunctionSection(
-  n: i32,
-  typeOffset: i32,
-  hasStart: i32,
-  memFn: i32,
-  nPrintTypes: i32,
-  nHelpers: i32,
-) {
-  // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
-  // synthetic start function (if any) is the LAST entry — function index `n` — using
-  // the `()->()` functype at index `typeOffset + n`.
-  // Framed by `frameFunctionSection` once the bodies have decided the thunks it ends with.
-  const funcPayload: u8[] = []
-  const fnPrev = wTarget(funcPayload)
+// The function section's counts, which the bodies read: `gFuncFixedN` and the first tail
+// function's index. Its entries are written by `frameFunctionSection`, after the bodies.
+function fnSectionCounts(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   gFuncFixedN = n + hasStart + gInitMods.length + memFn + nHelpers
-  let fi = 0
-  while fi < n {
-    // A function carrying the env param whose signature matches an interned `$fnsig` is
-    // declared with that `$fnsig` functype, so a `call_indirect $fnsig` reaching it passes
-    // the engine's signature check. Others keep their own functype.
-    if fnHasEnvParam(fi) && fnSigIsClosure(fi) && !cloLifted(fi) {
-      wULEB(fnSigIdxOfFn(fi))
-    } else {
-      wULEB(typeOffset + fi) // functype index
-    }
-    fi = fi + 1
-  }
-  if hasStart == 1 {
-    wULEB(typeOffset + n) // start fn functype index
-  }
-  // Each init function shares the start's `()->()` functype.
-  let ii = 0
-  while ii < gInitMods.length {
-    wULEB(typeOffset + n)
-    ii = ii + 1
-  }
-  if memLogUsed {
-    // The synthetic `__log__` decoder uses the standalone `(i32,i32)->()` functype
-    // emitted after the print functypes.
-    wULEB(typeOffset + n + hasStart + nPrintTypes)
-  }
-  // The shared runtime helpers, each on its own standalone functype (emitted after
-  // the `__log__` functype in the SAME helper order, so functype k belongs to
-  // helper k).
-  const helpTyBase = typeOffset + n + hasStart + nPrintTypes + memFn
-  let hi = 0
-  while hi < nHelpers {
-    wULEB(helpTyBase + hi)
-    hi = hi + 1
-  }
-  gMapSetTyBase = helpTyBase + nHelpers
   gMapSetFnBase = gImports + gFuncFixedN
-  wTarget(fnPrev)
-  gFuncEntries = funcPayload
   gFuncRopeAt = W.chunks.length
   0
 }
 
-// What `emitFunctionSection` leaves for `frameFunctionSection`: the count and entries of every
-// function but the thunks, and the module rope chunk the section is framed before.
+// What `fnSectionCounts` leaves for `frameFunctionSection`: the count of every function but
+// the tail rows and the thunks, and the module rope chunk the section is framed before.
 let gFuncFixedN = 0
-let gFuncEntries: u8[] = []
 let gFuncRopeAt = 0
 
 // The thunks, after every other function so no index shifts: one per address-taken function
@@ -9403,12 +9355,48 @@ function tableEntryFnIdx(fe: i32): i32 {
   gImports + fe
 }
 
-// Function section (id 3), placed before the table section it precedes in the module.
-function frameFunctionSection() {
+// Function section (id 3): function `fi` uses functype `typeOffset + fi`, or its `$fnsig` when
+// a closure call reaches it. The start, init, `__log__` and helper functions follow on the tail
+// functypes, then the tail rows and the thunks the bodies decided.
+function frameFunctionSection(
+  n: i32,
+  typeOffset: i32,
+  hasStart: i32,
+  memFn: i32,
+  nPrintTypes: i32,
+  nHelpers: i32,
+) {
   const countBuf: u8[] = []
+  const entryBuf: u8[] = []
   const thunkBuf: u8[] = []
   const prev = wTarget(countBuf)
   wULEB(gFuncFixedN + gTailFnRows.length + cloThunkFes.length)
+  wTarget(entryBuf)
+  let fi = 0
+  while fi < n {
+    if fnHasEnvParam(fi) && fnSigIsClosure(fi) && !cloLifted(fi) {
+      wULEB(fnSigIdxOfFn(fi))
+    } else {
+      wULEB(typeOffset + fi)
+    }
+    fi = fi + 1
+  }
+  // The start and each init function share the `()->()` functype.
+  let ii = 0
+  while ii < hasStart + gInitMods.length {
+    wULEB(typeOffset + n)
+    ii = ii + 1
+  }
+  // `__log__` takes the `(i32,i32)->()` functype after the print functypes.
+  if memLogUsed { wULEB(typeOffset + n + hasStart + nPrintTypes) }
+  // Helper k takes functype `helpTyBase + k`, emitted in the same helper order.
+  const helpTyBase = typeOffset + n + hasStart + nPrintTypes + memFn
+  let hi = 0
+  while hi < nHelpers {
+    wULEB(helpTyBase + hi)
+    hi = hi + 1
+  }
+  gMapSetTyBase = helpTyBase + nHelpers
   wTarget(thunkBuf)
   for row in gTailFnRows {
     if row >= 0 {
@@ -9423,7 +9411,7 @@ function frameFunctionSection() {
     k = k + 1
   }
   wTarget(prev)
-  wSectionPartsAt(gFuncRopeAt, 3, [countBuf, gFuncEntries, thunkBuf])
+  wSectionPartsAt(gFuncRopeAt, 3, [countBuf, entryBuf, thunkBuf])
 }
 
 // A thunk body: drop the env, forward the declared params, tail-call the target, so a
