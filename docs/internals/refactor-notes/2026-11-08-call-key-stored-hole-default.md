@@ -46,7 +46,7 @@ All 66 builds that left `hole-mono` are `agree`. None is `differ-bind`.
 | 4 | `spelled` root named | a hole function called through a record field or map read whose keys sit under the reading call's instance, not the root (D15331) |
 
 Every one is a function with no single instance, so the read needs the instance it actually
-receives. That is the flow item 2 of the lane names, without #6841's sole-key limit.
+receives: #6841's flow without its single-key limit.
 
 The 8-hop limit in `cwFnValueDeclOf` moved none of them: a 12-alias chain of a stored hole function
 builds keyed on both seeds.
