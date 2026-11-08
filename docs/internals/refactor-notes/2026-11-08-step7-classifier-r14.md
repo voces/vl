@@ -58,4 +58,15 @@ a shape per binding at the elaboration that infers the map would make those answ
 | tree | post-only | pre-only | both | uncalled | probed |
 | --- | --- | --- | --- | --- | --- |
 | master `dfc71a0a` with #6820 | 25 | 0 | 53 | 1 | 79 |
-| this PR | CENSUS_AFTER |
+| this PR, same base | 29 | 0 | 47 | 1 | 77 |
+
+Six moved from "both" to post-only: five of the seven in the brief, plus `capturedStructIndex`.
+Two of the six then got typed bodies and left the probe set. `globalCellKindGo` and
+`letCellKind` keep one pre-mono call each, from
+`inline-shape-local-beside-declared-twin.vl`. That call comes from `monoArgTyNameRep` asking
+`structIndexOfExpr` for an argument's struct row, which is 233 of `structIndexOfExpr`'s 262
+pre-mono calls. That ask belongs to `emit_mono.vl`.
+
+**Proof.** Every candidate is a fixpoint seed: base 6,524,947 bytes, this PR 6,524,657 (−290).
+Merged with master `419f4333`, it is 6,524,933, also a fixpoint. Each sweep over 23,671 programs
+against base: 23,671 same, 0 bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new traps.
