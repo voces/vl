@@ -98,6 +98,8 @@ import {
   nodeTyArrayElemIsNullable,
   nodeTyCarry,
   nodeTyFrozenOf,
+  nodeTyInstEnter,
+  nodeTyInstFrameNote,
   nodeTyIsFunc,
   nodeTyIsNulFunc,
   nodeTyIsNullType,
@@ -105,11 +107,13 @@ import {
   nodeTyIsNullableStruct,
   nodeTyIsStringPrim,
   nodeTyIsUnionish,
+  nodeTyIxIn,
   nodeTyIxOf,
   nodeTyMapName,
   nodeTyName,
   nodeTyNestedElemIsBoolPrim,
   nodeTyRecord,
+  nodeTyRecordIn,
   tyIsUnionish,
 } from "./check_node_tys"
 import { nodePos, trimWs } from "./fmt_util"
@@ -438,6 +442,7 @@ import {
 import {
   monoCalleeDeclOf,
   monoFrameInstTmpl,
+  monoFrameSharesBody,
   monoNameIsExported,
   monoParamBareTyParam,
   vrFrameOf,
@@ -639,7 +644,6 @@ import {
 } from "./emit_shape_rows"
 import {
   PIN_DECLINE,
-  fnBlockShadowsAt,
   nodeMapArmNominalName,
   nominalizeFnTypeOfTy,
   pinSigOf,
@@ -5094,16 +5098,9 @@ function monoRegisterInstance() {
 }
 
 // Callback specialization: rewrite a call through a closure-typed param into a direct call to the
-// function `cbFnNames` bakes for it ("" leaves a `call_ref`). Under the elaboration's instance
-// `specK` its answer alone picks the calls; with -1, mono derives them, and `fnDeclIx` is the
-// original `FuncDecl` the body descends from (-1 for a lambda-pinned clone: no shadow check).
-function monoBakeCallback(
-  ix: i32,
-  cbParamNames: string[],
-  cbFnNames: string[],
-  fnDeclIx: i32,
-  specK: i32,
-) {
+// function `cbFnNames` bakes for it ("" leaves a `call_ref`). The elaboration's argument-keyed
+// instance `specK` alone picks the calls; with -1 nothing is baked and every call keeps its `call_ref`.
+function monoBakeCallback(ix: i32, cbFnNames: string[], specK: i32) {
   if ix < 0 { return ix }
   const n = nodeAt(ix)
   match n {
@@ -5112,13 +5109,7 @@ function monoBakeCallback(
       let changed = false
       let i = 0
       while i < n.blkStmts.length {
-        const cs = monoBakeCallback(
-          n.blkStmts[i],
-          cbParamNames,
-          cbFnNames,
-          fnDeclIx,
-          specK,
-        )
+        const cs = monoBakeCallback(n.blkStmts[i], cbFnNames, specK)
         ns.push(cs)
         if cs != n.blkStmts[i] { changed = true }
         i = i + 1
@@ -5127,35 +5118,17 @@ function monoBakeCallback(
       return mkBlock(ns, n.pos)
     }
     RetStmt => {
-      const ca = monoBakeCallback(
-        n.retArg,
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-        specK,
-      )
+      const ca = monoBakeCallback(n.retArg, cbFnNames, specK)
       if ca == n.retArg { return ix }
       return mkReturn(ca, n.pos)
     }
     LetDecl => {
-      const ci = monoBakeCallback(
-        n.letInit,
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-        specK,
-      )
+      const ci = monoBakeCallback(n.letInit, cbFnNames, specK)
       if ci == n.letInit { return ix }
       return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
     }
     WhileStmt => {
-      const cb = monoBakeCallback(
-        n.whileBody,
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-        specK,
-      )
+      const cb = monoBakeCallback(n.whileBody, cbFnNames, specK)
       if cb == n.whileBody { return ix }
       return mkWhileAs(n, n.whileCond, cb)
     }
@@ -5169,9 +5142,7 @@ function monoBakeCallback(
         const c = nodeAt(links[k])
         if c is IfStmt {
           ccs.push(c.ifCond)
-          cts.push(
-            monoBakeCallback(c.ifThen, cbParamNames, cbFnNames, fnDeclIx, specK),
-          )
+          cts.push(monoBakeCallback(c.ifThen, cbFnNames, specK))
         }
         k = k + 1
       }
@@ -5179,23 +5150,11 @@ function monoBakeCallback(
         links,
         ccs,
         cts,
-        monoBakeCallback(
-          monoIfChainElse(links),
-          cbParamNames,
-          cbFnNames,
-          fnDeclIx,
-          specK,
-        ),
+        monoBakeCallback(monoIfChainElse(links), cbFnNames, specK),
       )
     }
     ForRange => {
-      const cb = monoBakeCallback(
-        n.frBody,
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-        specK,
-      )
+      const cb = monoBakeCallback(n.frBody, cbFnNames, specK)
       if cb == n.frBody { return ix }
       return mkForRange(
         n.frVar,
@@ -5209,24 +5168,12 @@ function monoBakeCallback(
       )
     }
     ForIn => {
-      const cb = monoBakeCallback(
-        n.fiBody,
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-        specK,
-      )
+      const cb = monoBakeCallback(n.fiBody, cbFnNames, specK)
       if cb == n.fiBody { return ix }
       return mkForInCopy(n, n.fiIter, cb)
     }
     Paren => {
-      const ci = monoBakeCallback(
-        n.parInner,
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-        specK,
-      )
+      const ci = monoBakeCallback(n.parInner, cbFnNames, specK)
       if ci == n.parInner { return ix }
       const np = mkParen(ci, n.pos)
       nodeTyCarry(np, ix)
@@ -5234,13 +5181,12 @@ function monoBakeCallback(
     }
     Call => {
       // A call whose callee names a specialized closure param `f(...)` → direct call `cbFn(...)`;
-      // its arguments may themselves contain such calls, so recurse there too. Skipped when a
-      // block still open here shadows the param's name with a different value (D2325).
+      // its arguments may themselves contain such calls, so recurse there too.
       let newCallee = n.callFn
       if n.callFn < 0 { return ix }
       const callee = nodeAt(n.callFn)
       // The elaboration's instance names the parameter a call calls through; a call it does not
-      // answer there is no baked call. Without an instance, mono derives it.
+      // answer there is no baked call.
       const kp = if specK >= 0 { elabSpecParamCalledAt(idCanon(ix), specK) } else { -1 }
       if (
         kp >= 0
@@ -5250,38 +5196,12 @@ function monoBakeCallback(
       ) {
         newCallee = mkIdent(cbFnNames[kp], callee.pos)
         identFromDecl(newCallee, elabSpecDeclFor(specK, kp))
-      } else if specK < 0 && callee is Ident {
-        // A call through a never-written `const` alias of the parameter is a call of it too (D12216).
-        let pname = monoBakeAliasParam(n.callFn, fnDeclIx)
-        if (
-          pname == ""
-          && !fnBlockShadowsAt(fnDeclIx, sidOfNode(n.callFn), n.callFn)
-          && monoReadsOwnParam(fnDeclIx, callee.identName, n.callFn)
-        ) {
-          pname = callee.identName
-        }
-        if pname != "" {
-          let bk = 0
-          while bk < cbParamNames.length {
-            if cbFnNames[bk] != "" && pname == cbParamNames[bk] {
-              newCallee = mkIdent(cbFnNames[bk], callee.pos)
-              identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[bk]))
-            }
-            bk = bk + 1
-          }
-        }
       }
       const nargs: i32[] = []
       let changed = newCallee != n.callFn
       let ai = 0
       while ai < n.callArgs.length {
-        const cca = monoBakeCallback(
-          n.callArgs[ai],
-          cbParamNames,
-          cbFnNames,
-          fnDeclIx,
-          specK,
-        )
+        const cca = monoBakeCallback(n.callArgs[ai], cbFnNames, specK)
         nargs.push(cca)
         if cca != n.callArgs[ai] { changed = true }
         ai = ai + 1
@@ -5295,20 +5215,8 @@ function monoBakeCallback(
       // through `mkBinary` would drop its surface tag, and its call stays a `call_ref`.
       // The copy answers the template's type, which a `??` reads its niche off (D7452).
       if n.binCompound != "" { return ix }
-      const cl = monoBakeCallback(
-        n.binLeft,
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-        specK,
-      )
-      const cr = monoBakeCallback(
-        n.binRight,
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-        specK,
-      )
+      const cl = monoBakeCallback(n.binLeft, cbFnNames, specK)
+      const cr = monoBakeCallback(n.binRight, cbFnNames, specK)
       if cl == n.binLeft && cr == n.binRight { return ix }
       const nb = mkBinary(n.binOp, cl, cr, n.pos)
       nodeTyCarry(nb, ix)
@@ -7220,6 +7128,7 @@ function monoPinMemberCall(
       }
       noteCallOrigin(puFn, ix)
       const puCall = mkCallN(puFn, puArgs, puNames, n.pos)
+      nodeSrcNote(puCall, ix)
       drwFillDefaults(puCall, monoPinCtx)
       nodeTyCarry(puCall, ix)
       return puCall
@@ -8246,6 +8155,8 @@ export function monoStateReset() {
   monoTopStmts = []
   monoInstIsFirst = false
   monoInstRetWidenTy = 0 - 1
+  monoInstanceRetName = ""
+  monoInstanceRetTy = 0 - 1
   monoLastInstFe = 0 - 1
   monoMakeCallIx = 0 - 1
   monoOpenLamD = []
@@ -8856,22 +8767,11 @@ function monoMakeInstanceBodyRewrite(
     pe = pe + 1
   }
   const instBody1 = monoPinMapLambdas(instBody0L, pElemNames)
-  // Bake any non-capturing concrete callback into a direct call (`pElemNames` already
-  // holds the per-position param names, parallel to `cbFnNames`). No baked callback → no
+  // Bake any non-capturing concrete callback into a direct call. No baked callback → no
   // rewrite → the body is the same node `monoPinMapLambdas` produced.
   let instBody2 = instBody1
   if monoAnyBakedCallback(cbFnNames) {
-    // -1: `instBody1` is already a lambda-pinned clone (`monoPinBodyLambdas`/
-    // `monoPinMapLambdas`), not the original `fn.fnBody` — no single root names its
-    // block structure, so the shadow guard cannot be asked here (see the -1 contract
-    // on `monoBakeCallback`, D2325).
-    instBody2 = monoBakeCallback(
-      instBody1,
-      pElemNames,
-      cbFnNames,
-      -1,
-      monoBakeSpecK,
-    )
+    instBody2 = monoBakeCallback(instBody1, cbFnNames, monoBakeSpecK)
   }
   // Per-instance copies of the direct generic calls this body makes, so instantiating
   // them rewrites only this instance's callee `Ident`s. No generic call → the same node.
@@ -10085,6 +9985,8 @@ function monoFnTyParamTys(t: i32): i32[] {
 
 // The return type `monoInstanceFor` must reproduce for a widened return, or "" for any return.
 let monoInstanceRetName = ""
+// The type `monoInstanceRetName` is spelled from, or -1.
+let monoInstanceRetTy = 0 - 1
 // The instances built returning a result their template's only converts to (D9282): a generic
 // value they return is built at that result too.
 let monoRetWidenFns: {[i32]: boolean} = Map()
@@ -10144,10 +10046,9 @@ function monoFnTyRet(t: i32): i32 {
 
 // Whether boundary spelling `nm` names the closed type `ty`, compared on the arena, so a record
 // spelled by its shape matches the alias a parameter declares it by.
-function monoPinNamesTy(nm: string, ty: i32): boolean {
+function monoPinNamesTy(pty: i32, ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return false }
-  const at = nameToTy(nm)
-  at >= 0 && tyEq(at, ty)
+  pty >= 0 && pty < T.tys.length && tyEq(pty, ty)
 }
 
 // Materialize or reuse the instance of generic `origFe` for a function-typed binding at pins
@@ -10232,7 +10133,7 @@ function monoInstanceFor(
             )
           } else if (
             normTypeAtom(ann) != normTypeAtom(pinnedNames[i])
-            && !monoPinNamesTy(pinnedNames[i], nodeTyIxOf(p.parType))
+            && !monoPinNamesTy(pinTys[i], nodeTyIxOf(p.parType))
           ) {
             return 0
           }
@@ -10264,8 +10165,9 @@ function monoInstanceFor(
       const rs = monoInstanceSubstRet(fn, tvN, tvV)
       if normTypeAtom(rs) != monoInstanceRetName {
         let want = monoFnTyRet(expTy)
-        if want < 0 { want = nameToTy(monoInstanceRetName) }
-        if elabWidenedRet(nameToTy(rs), want) >= 0 {
+        if want < 0 { want = monoInstanceRetTy }
+        const rsTy = substTyDeepOf(nodeTyIxOf(fn.fnRet), tvN, tvT, own)
+        if rsTy >= 0 && want >= 0 && elabWidenedRet(rsTy, want) >= 0 {
           monoInstRetWidenName = monoInstanceRetName
           monoInstRetWidenTy = want
         }
@@ -10543,7 +10445,7 @@ function monoCoerceFnValueTys(
       }
       // A maker delivered at a closed function type is its instance at that type's result.
       if monoIsMakerFe(gfe) {
-        const dt = if expTy >= 0 { expTy } else { nameToTy(tname) }
+        const dt = if expTy >= 0 { expTy } else { tnameTy }
         return monoMakerTwin(gfe, exprIx, monoFnTyRet(dt), delTys, ctx)
       }
       if gfe >= 0 && gfe < monoGen.length {
@@ -10559,6 +10461,7 @@ function monoCoerceFnValueTys(
             // A capturing nested generic's value is this frame's instance, as a call is (D3902).
             monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
             monoInstanceRetName = ""
+            monoInstanceRetTy = monoFnTyRet(tnameTy)
             if monoInstanceWidenRet {
               monoInstanceRetName = normTypeAtom(
                 annRetNameOf(peelGroupParens(tname)),
@@ -10773,7 +10676,7 @@ function monoCallIfBound(ix: i32, ctx: i32): i32 {
   const ct = monoSlotPinNameTys(lf[1], [], lf[0], dTys, dFt)
   if ct == "" { return 0 }
   // The binding holds one value, so a call at another type is refused and split (D9120).
-  const et = nameToTy(ct)
+  const et = if dFt.length == 1 { dFt[0] } else { -1 }
   const seen = monoChoiceBindNote(
     lf,
     if monoTyConcreteFn(et) { tyToStr(et) } else { ct },
@@ -10926,7 +10829,7 @@ function monoCoerceChoiceBinding(
   if fnTagTyIsTagged(nodeTyIxOf(d.letInit)) { return 0 }
   const ct = tname
   const xt = expTy
-  const et = if monoTyConcreteFn(expTy) { expTy } else { nameToTy(tname) }
+  const et = if monoTyConcreteFn(expTy) { expTy } else { tnameTy }
   const pTys = delTys
   const iv = unwrapParen(d.letInit)
   const g0 = monoFirstArmGenName(iv, lf[0], 0)
@@ -15615,8 +15518,13 @@ function monoTyOpenUntagged(t: i32, depth: i32): boolean {
 }
 
 // Records `t` as the type of node `x` where the checker left it open, outside a generic's
-// instances, which share the node (D5079).
+// instances, which share the node (D5079). A function nested in a generic shares its body with
+// its copies in the other instances, so the record is this frame's own.
 function monoRecordOpen(x: i32, t: i32, wf: i32) {
+  if x >= 0 && monoFrameSharesBody(wf) {
+    if monoTyOpen(nodeTyIxIn(x, wf)) { nodeTyRecordIn(wf, x, t) }
+    return 0
+  }
   if x >= 0 && monoTyOpen(nodeTyIxOf(x)) && monoNodeOwnedBy(x, wf) {
     nodeTyRecord(x, t)
   }
@@ -21386,6 +21294,7 @@ function monoPinTyParamComposite(
     )
   }
   let pinC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+  const pinPlain = pinC
   if i < monoUnionRestPin.length && monoUnionRestPin[i] != "" {
     pinC = monoUnionRestPin[i]
   }
@@ -21399,7 +21308,10 @@ function monoPinTyParamComposite(
   // spelling, the concrete function type that parameter takes.
   if annFnSlot || nameIsClosureArray(pinC) {
     const delTys = monoSlotParamTysAt(patTy, own, tvN, tvT)
-    if monoCoerceFnValueTys(args[i], pinC, ctx, -1, delTys, -1) < 0 {
+    // The parameter's type substituted, which `pinC` spells unless a rest or row pin replaced it.
+    const pinCTy = if pinC == pinPlain { substTyDeepOf(patTy, tvN, tvT, own) } else { -1 }
+    const pinCFt = if pinCTy >= 0 && !tyHasTyVar(pinCTy) { pinCTy } else { -1 }
+    if monoCoerceFnValueTys(args[i], pinC, ctx, -1, delTys, pinCFt) < 0 {
       return -1
     }
   }
@@ -21541,18 +21453,11 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       // the callback param's call, and baking that re-derives it via a path that does
       // not re-establish a nullable or union rep on the appended function.
       if fn.fnRet < 0 { return 0 }
-      // The baked callback (and its param NAME) per position — "" where the argument is not a
-      // non-capturing concrete function (a capturing lambda / generic / non-closure stays call_ref).
+      // The baked callback per position — "" where the argument is not a non-capturing
+      // concrete function (a capturing lambda / generic / non-closure stays call_ref).
       const cbFnNames: string[] = []
-      const cbParamNames: string[] = []
       let i = 0
       while i < args.length {
-        const p = nodeAt(params[i])
-        if p is Param {
-          cbParamNames.push(p.parName)
-        } else {
-          cbParamNames.push("")
-        }
         cbFnNames.push(
           monoSpecializableCallbackName(callIx, fn.fnName, args[i], ctx),
         )
@@ -21570,12 +21475,14 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         kc = kc + 1
       }
       elabSpecMonoGroup(specAt, key)
-      // Registry hit: a prior call already specialized this (callee, callback-set) — reuse it.
-      // A keyed decision reuses the instance the (S1) map holds for its key; others match `key`.
-      const slot = elabSpecSlotOfKey(elabSpecKeyOf(specAt))
+      // A decision the elaboration declines to key is not specialized: the call keeps its callee.
+      const specK = elabSpecKeyOf(specAt)
+      if specK < 0 { return 0 }
+      // Registry hit: the instance the (S1) map holds for the decision's key.
+      const slot = elabSpecSlotOfKey(specK)
       let r = 0
-      while r < monoKeys.length {
-        if if slot >= 0 { monoInstFe[r] == slot } else { monoKeys[r] == key } {
+      while slot >= 0 && r < monoKeys.length {
+        if monoInstFe[r] == slot {
           const cal = nodeAt(c.callFn)
           // R4 writer 7 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
           if cal is Ident {
@@ -21596,15 +21503,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         if monoInstOrig[kk] == fe { count = count + 1 }
         kk = kk + 1
       }
-      // `fnDeclIx` is the ORIGINAL declaration `fn.fnBody` descends from, so the shadow
-      // guard walks the same tree the position names (D2325).
-      const instBody = monoBakeCallback(
-        fn.fnBody,
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-        elabSpecKeyOf(specAt),
-      )
+      const instBody = monoBakeCallback(fn.fnBody, cbFnNames, specK)
       const nps: i32[] = []
       let pj = 0
       while pj < params.length {
@@ -21749,62 +21648,6 @@ function monoReadDecl(name: string, at: i32): i32 {
     return monoDeclCanon(d)
   }
   -1
-}
-
-// Whether the read of `name` at `at` is a parameter of function `fx`: by the binding the read
-// resolves to, else by name.
-function monoFnBindsParamAt(fx: i32, name: string, at: i32): boolean {
-  const d = monoReadDecl(name, at)
-  if d < 0 { return monoFnBindsParam(fx, name) }
-  const f = nodeAt(fx)
-  if f is FuncDecl {
-    for p in f.fnParams {
-      if monoDeclCanon(p) == d { return true }
-    }
-  }
-  false
-}
-
-// The name of the parameter read `at` reaches through un-annotated `const` bindings each
-// initialised by a read of the one before, at least one of them, a parameter of `fx` when it is
-// not -1; "" for any other read.
-function monoBakeAliasParam(at: i32, fx: i32): string {
-  if at < 0 || at >= P.nodes.length { return "" }
-  const a = nodeAt(at)
-  if !(a is Ident) { return "" }
-  let d = monoReadDecl(a.identName, at)
-  let hops = 0
-  while hops < 8 && d >= 0 && d < P.nodes.length {
-    const ld = nodeAt(d)
-    if ld is LetDecl {
-      if ld.letKw != "const" || ld.letType >= 0 || ld.letInit < 0 { return "" }
-      const iv = unwrapParen(ld.letInit)
-      if iv < 0 { return "" }
-      const ivn = nodeAt(iv)
-      if !(ivn is Ident) { return "" }
-      d = monoReadDecl(ivn.identName, iv)
-      hops = hops + 1
-    } else if ld is Param {
-      if hops == 0 { return "" }
-      if fx >= 0 && fx < P.nodes.length {
-        const f = nodeAt(fx)
-        if !(f is FuncDecl) || !i32ListHas(f.fnParams, d) { return "" }
-      }
-      return ld.parName
-    } else {
-      return ""
-    }
-  }
-  ""
-}
-
-// Whether the read of `name` at `at` can be a parameter of function `fx` (-1: of whichever
-// function is being copied): false only where it resolves to some other binding, such as a loop
-// variable of the name (D2114).
-function monoReadsOwnParam(fx: i32, name: string, at: i32): boolean {
-  if fx >= 0 { return monoFnBindsParamAt(fx, name, at) }
-  const d = monoReadDecl(name, at)
-  d < 0 || nodeAt(d) is Param
 }
 
 // Whether function `fx` declares a parameter named `name`.
@@ -23048,7 +22891,10 @@ function monoWalkFnBody(fnIx: i32) {
   // What the body demands is demanded under the instance it is.
   elabWalkPush(elabKeyAt(fnIx))
   cadWalkFn.push(monoCadInstOf(fnIx))
+  if monoFrameSharesBody(fnIx) { nodeTyInstFrameNote(fnIx) }
+  const was = nodeTyInstEnter(fnIx)
   const r = monoWalkFnBodyIn(fnIx)
+  nodeTyInstEnter(was)
   monoBuildPop()
   r
 }
@@ -23121,7 +22967,7 @@ function monoDeliverCallRets(at: i32, ann: string, fd: i32, annTy: i32): i32 {
       if pn.parType < 0 { return 0 }
     }
   }
-  const at2 = nameToTy(ann)
+  const at2 = annTy
   if at2 < 0 { return 0 }
   if !monoRetsReachHoleLam(fd, []) { return 0 }
   const rets = monoFnRetArgs(fn)
@@ -24452,9 +24298,8 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
 function monoRetFnListTy(x: i32, ctx: i32): i32 {
   const l = nodeAt(x)
   if !(l is ArrayLit) || !monoTyOpen(nodeTyIxOf(x)) { return -1 }
-  // A list the elaboration only closes by its identity is left to the slot pins.
   const ht = elabHeldValTy(x, ctx)
-  const het = if tySame(ht, elabIdentityTy(x, ctx)) { -1 } else { monoListElemTy(ht) }
+  const het = monoListElemTy(ht)
   // In a generic instance a list holding literals keeps mono's path: its literals share the
   // template's nodes.
   let holdsLit = false
