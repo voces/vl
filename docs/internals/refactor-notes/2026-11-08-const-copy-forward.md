@@ -1,8 +1,7 @@
 # Step 4: a hole parameter's `const` copy forwards into a list join (2026-11-08)
 
-Lane "function-value open rows", the capability matrix's `argument` row. Base:
-`claude/fn-value-rows-3` (#6912) at `b3245677`, built to a fixpoint (6,571,865 bytes). The
-candidate is that tree plus this PR, also a fixpoint.
+Lane "function-value open rows", the capability matrix's `argument` row. Base: master `4d6e2fb0`,
+built to a fixpoint (6,570,153 bytes). The candidate is that master plus this PR, also a fixpoint.
 
 ## What refused, and where
 
@@ -35,7 +34,7 @@ Three readers now treat a `const` copy (`fnTagParamCopyOf`) as the parameter it 
 | rep-fuzz | | exact, 0 failures |
 | plumb-shape fuel, main / tail | | −1.8% / −2.8% |
 | peak RSS of the `vl build`, main / tail (VmHWM) | 321,798 / 321,846 kB | 321,828 / 321,838 kB |
-| seed (fixpoint) | 6,571,865 | 6,572,430 (+565) |
+| seed (fixpoint) | 6,570,153 | 6,570,718 (+565; +2.7% of the seed-size baseline) |
 
 ## What stands
 
