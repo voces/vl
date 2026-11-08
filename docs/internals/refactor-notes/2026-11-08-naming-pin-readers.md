@@ -25,11 +25,13 @@ needs them already reads; the text spells the rep, as ruling 1 spells a literal 
 ## Ruling 3
 
 `monoPinSpellOf` named a record by the row `repRowOfTyStruct` found first, the order emit
-registered rows. It now takes `structNameOfTy(ty)`, the name declared first for the type, where
-that name has no row of a different identity. Witness: `type Circle = {r: i32}` (an arm of
-`Shape = Circle | Sq`) declared before `type Dot = {r: i32}`; `app((a, b): Circle => …)` pinned
-`(i32,i32)=>Dot`, now `(i32,i32)=>Circle`. A probe over the sweep before this PR's other changes
-found 15 programs respelled (5 `Dot → Circle`, 9 a shape row `{r:i32} → Circle`, 1 `{a:i32} → R`).
+registered rows. It now takes the first name in declaration order (`cStructNames`) whose record
+has the type's row identity (`repRowId`), and the row's own name only where no declared record
+has it. An arm record with no struct row takes the same name before its variant row.
+Witness: `type Circle = {r: i32}` (an arm of `Shape = Circle | Sq`) declared before
+`type Dot = {r: i32}`; `app((a, b): Circle => …)` pinned `(i32,i32)=>Dot`, now
+`(i32,i32)=>Circle`. With `Dot` declared first, `Circle` still spells `Dot`, which
+`vl_pin_spell_shadow_test.ts` pins as a shadow disagreement with mono's spelling.
 
 ## `canonEmitNameOfTy` without `nameToTy`
 
