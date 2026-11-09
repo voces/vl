@@ -127,6 +127,7 @@ const PROGRAMS: Program[] = [
     path: "arrays/u8-union-tag-band.vl",
   },
   { id: "u8-for-in", family: "ba8Used", path: "arrays/u8-for-in.vl" },
+  { id: "u8-packed-list", family: "fnUsesU8Push (D1006)", path: "arrays/u8-packed-list.vl" },
   { id: "utf8-bytes", family: "ba8Used via scanPrintUse", path: "strings/utf8-bytes.vl" },
   // ── wide scalars: `fa64Used`/`fl64TypeIdx`, `ia64Used`/`il64TypeIdx`, `fa32TypeIdx` ──
   { id: "f64-elems", family: "fa64Used", path: "arrays/f64-elems.vl" },
@@ -215,6 +216,11 @@ const PROGRAMS: Program[] = [
   },
   // ── maps: `mUsed`/`mStructIdx`, `mI32Used`/`mStructI32Idx` ──
   { id: "map-nullable-value", family: "mUsed", path: "maps/nullable-value-map.vl" },
+  {
+    id: "map-values-forin",
+    family: "fnUsesMapVals (D1007)",
+    path: "maps/forin-list-valued-values.vl",
+  },
   {
     id: "map-i32-keyed-refs",
     family: "mI32Used + raUsed",
@@ -323,22 +329,8 @@ type OpenLeak = {
   delta: number;
 };
 
-const OPEN_LEAKS: OpenLeak[] = [
-  {
-    row: "D1006",
-    id: "u8-packed-list",
-    path: "arrays/u8-packed-list.vl",
-    state: "fnUsesU8Push",
-    delta: 10,
-  },
-  {
-    row: "D1007",
-    id: "map-values-forin",
-    path: "maps/forin-list-valued-values.vl",
-    state: "fnUsesMapVals",
-    delta: 15,
-  },
-];
+// D1006 and D1007 closed 2026-11-09: `emitStateReset` clears both flags per compile.
+const OPEN_LEAKS: OpenLeak[] = [];
 
 const sourceOf = (p: Program): string =>
   p.src ?? Deno.readTextFileSync(CASES + p.path!);
