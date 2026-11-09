@@ -14,6 +14,10 @@ Base: master `2544f3ce` (#7006). Both seeds are fixpoints (two self-compiles, by
   `J` instead of folding it, and the two keyed two rows. `tyUnrollsTo` now compares the head codes
   of the peeled bodies (`tyAliasBodyOf`).
 
+* **D4140 runs.** `(null | string | J[])[]` is `J[]` with `J` unfolded once; its element now
+  keys as `J`, so the list takes `J`'s row at a binding, a parameter and a return. The row is
+  closed with a pin, `tests/cases/unions/recursive-alias-unfolded-list-is-alias-list.vl`.
+
 ## Why the bare deletion lost D4153
 
 `D4153`'s pin (`tests/cases/unions/recursive-alias-nested-list-copied-with-map.vl`) refused with
@@ -22,10 +26,6 @@ Base: master `2544f3ce` (#7006). Both seeds are fixpoints (two self-compiles, by
 minted. The only row of that type then was the inner list literal's, minted with the body's
 arena index (`string|J[]|null`), and it keyed apart from `J`. The early read had covered this by
 minting a second row for `J`. With one key for the two spellings, the literal's row is `J`'s row.
-
-* **D4140 runs.** `(null | string | J[])[]` is `J[]` with `J` unfolded once; its element now
-  keys as `J`, so the list takes `J`'s row at a binding, a parameter and a return. The row is
-  closed with a pin, `tests/cases/unions/recursive-alias-unfolded-list-is-alias-list.vl`.
 
 ## Measured
 
