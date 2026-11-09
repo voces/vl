@@ -43,8 +43,7 @@ asks a question cannot also mint.
 
 ## Second session (same day): 59 → 29
 
-Base is master `50fe2c5c`+3 (`b861eb49` merge) at its fixpoint, 6,584,352 bytes. Each row is a
-fixpoint candidate, swept over 23,782 programs.
+Base: master merged at `b861eb49`, fixpoint 6,584,352 bytes. Fixpoint candidates, 23,782 programs.
 
 | step | runs lost | new traps | seed |
 | --- | --- | --- | --- |
@@ -72,8 +71,7 @@ What stands at E8:
 * **4 `a late map list row has no value map struct`**: `const r: {[string]: T}[] = [Map()]` in a
   generic instance at `T = string`. At the refusal, slot 0 has been processed (`mvTwin[0] = 0`)
   and `mvMapTypeIdx[0]` is 0. The non-late pass takes `mvMapTypeIdx[mmv]` with no `> 0` test.
-* 1 each: `covariant list delivery` (D3059), `function-value call has no interned signature`,
-  `type section wrote 15 rec-group entries`.
+* 1 each: D3059's covariant delivery, an uninterned fn-value signature, a rec-group count.
 
 ## Not done
 
