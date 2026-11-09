@@ -72,7 +72,7 @@ import {
   optCallRetNodeAt,
 } from "./check_call_resolve"
 import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
-import { unionAliasMembers } from "./check_nj_join"
+import { collectRetValues, unionAliasMembers } from "./check_nj_join"
 import { declAnnRawTyName, declAnnTyOf } from "./check_gen_alias_anns"
 import { fieldNameOrder } from "./check_obj_shape"
 import { inferJoinCount, inferJoinTyAt } from "./check_inline_lit_union"
@@ -240,6 +240,7 @@ import {
   exprIsIfStmt,
   ifArmValueExpr,
   nliScanStmts,
+  tyHasFnDeep,
 } from "./emit_query"
 import {
   FC_CLOSURE,
@@ -2285,11 +2286,115 @@ function fnRetRefListDemand(i: i32, rec: i32) {
 }
 
 // The ref-list row inferred list result `i` is built at: `rec` (its recorded result's row), else
-// its closed element type's; -1 when neither names one.
+// its closed element type's. -2 when a returned literal's elements hold different function sets,
+// which the one recorded row cannot build; -1 when none is found (D15203).
 function fnRetRefListRowJoin(i: i32, rec: i32): i32 {
-  if rec >= 0 { return rec }
+  if i < 0 || i >= fnStmts.length { return -1 }
+  if rec >= 0 {
+    const fn = nodeAt(fnStmts[i])
+    const vals: i32[] = []
+    if fn is FuncDecl && tyHasFnDeep(fnRecordedRetTy(i), 0) {
+      collectRetValues(fn.fnBody, vals)
+    }
+    return if retListLitSetsSplit(vals) { -2 } else { rec }
+  }
   const et = fnRetRArrElemTy(i)
   if et >= 0 && !tyHasTyVar(et) { rlSlotOfRowTy(et) } else { -1 }
+}
+
+// Whether a returned list literal in `vals` holds elements whose function sets differ.
+function retListLitSetsSplit(vals: i32[]): boolean {
+  for v in vals {
+    if retListValueSig(v) == "!" { return true }
+  }
+  false
+}
+
+// The function sets returned value `v`'s elements hold, as one fingerprint: for a list literal
+// its elements', `!` when two of them differ; else the sets its type holds.
+function retListValueSig(v: i32): string {
+  const av = unwrapParen(v)
+  if av < 0 { return "" }
+  const an = nodeAt(av)
+  // A literal the check built at the function's result holds the result's sets (D15209), and one
+  // built at a tagged rep holds that rep's ids (D15226).
+  const rep = nodeRepTyIxOf(av)
+  if an is ArrayLit && (rep != nodeTyIxOf(av) || fnTagHoldsTy(rep, 6)) {
+    return tyFnSetSig(tyArrayElemIx(rep), 6)
+  }
+  if an is ArrayLit {
+    let sig = ""
+    let first = true
+    for e in an.arrElems {
+      const es = valueFnSig(e, 4)
+      if !first && es != sig { return "!" }
+      sig = es
+      first = false
+    }
+    return sig
+  }
+  tyFnSetSig(tyArrayElemIx(nodeRepTyIxOf(av)), 6)
+}
+
+// The function sets value `v` holds, read from its type: a record literal's by each field's value,
+// a list literal's by each element, anything else by the sets its rep type holds (D15224).
+function valueFnSig(v: i32, depth: i32): string {
+  const x = unwrapParen(v)
+  if x < 0 || depth <= 0 { return "_" }
+  const n = nodeAt(x)
+  match n {
+    ObjLit => {
+      let out = "{"
+      for fx in n.objFields {
+        const f = nodeAt(fx)
+        if f is FieldInit {
+          out = out + f.fiName + ":" + valueFnSig(f.fiValue, depth - 1) + ","
+        }
+      }
+      return out + "}"
+    }
+    ArrayLit => {
+      let out = "["
+      for e in n.arrElems { out = out + valueFnSig(e, depth - 1) + "," }
+      return out + "]"
+    }
+    // Any other value holds the sets its type does.
+    Ident | NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return tyFnSetSig(nodeRepTyIxOf(x), 6)
+    }
+  }
+}
+
+// A fingerprint of the function sets type `t` holds at its function positions, through records
+// and lists, `depth` levels deep.
+function tyFnSetSig(t: i32, depth: i32): string {
+  if t < 0 || t >= T.tys.length || depth <= 0 { return "_" }
+  const a = tyAt(t)
+  match a {
+    TyFunc => {
+      return "s" + i32ToStr(fnTagSetOfTy(t))
+    }
+    TyArray => {
+      return tyFnSetSig(a.aElem, depth - 1) + "[]"
+    }
+    TyObj => {
+      let out = "{"
+      let k = 0
+      while k < a.objFieldNames.length && k < a.objFieldTypes.length {
+        out = out
+          + a.objFieldNames[k]
+          + ":"
+          + tyFnSetSig(a.objFieldTypes[k], depth - 1)
+          + ","
+        k = k + 1
+      }
+      return out + "}"
+    }
+    // A scalar, map, union or open type holds no set this join compares.
+    TyPrim | TyErr | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+      return "_"
+    }
+  }
 }
 
 // Interns the ref-list row of un-annotated function `i`'s recorded list result, nullable or not,
