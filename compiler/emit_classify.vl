@@ -107,7 +107,7 @@ import {
   inferRetRowOf,
   inferRetTyIxOf,
 } from "./check_infer_ret"
-import { inferRetTyIxAt, isInferLetNulBool } from "./check_infer_rows"
+import { inferRetTyIxAt } from "./check_infer_rows"
 import {
   atomicIntrinsicIsVoid,
   fsIntrinsicSlot,
@@ -288,7 +288,6 @@ import {
   parentLoopVarOf,
   placeNarrowKeyOf,
   pushUniqueAtom,
-  retV128Flag,
   setShapeOfTy,
   tyIsFuncType,
   tyIsStructWithUnionField,
@@ -555,7 +554,6 @@ import {
   firstValuedReturn,
   globalHasTypeAnn,
   ifArmValueExpr,
-  letIsNulBoolAnn,
   letIsSet,
   parTyNode,
   paramIndexOf,
@@ -3039,12 +3037,9 @@ let lckVal: VKind[] = []
 let lckGenSeen = 0
 let lckDepth = 0
 
-// The `fbValtype` kind of the cell a `LetDecl` binds inside function `fnIx` — the
-// annotation's kind through the shared annotation ladder, else the initializer's. The local
-// storage class's answer to what `globalCellKind` answers for a module global, kept here
-// because `emit_collect.vl` cannot be imported back into this file.
+// The `fbValtype` kind of the cell `LetDecl` `letIx` binds inside function `fnIx`
+// (`letCellKindGo`), memoised per binding and instance; -1 is the module.
 export function letCellKind(letIx: i32, fnIx: i32): VKind {
-  if clsCensusOn { clsCensusEnter("letCellKind") }
   if letIx < 0 || letIx >= P.nodes.length { return letCellKindGo(letIx, fnIx) }
   if lckDepth == 0 {
     if gckStale() { gckDrop() }
@@ -3085,21 +3080,14 @@ function lckReset() {
   0
 }
 
+// `letCellKind`'s answer: a returned bundle's holder is that record (D15144), then the rep
+// the binding's type claims, the annotation's kind, else the rep kind of the type it holds.
 function letCellKindGo(letIx: i32, fnIx: i32): VKind {
-  if clsCensusOn { clsCensusEnter("letCellKindGo") }
-  // A holder of a returned bundle's whole record is that record (D15144).
   if holderRecordSigs(letIx, fnIx).length > 0 { return "struct" }
   if letBindRepClaims(letIx, fnIx) { return letBindRep(letIx, fnIx).rdKind }
-  // A `boolean | null` cell is the sentinel-2 niche, whatever the annotation's valtype says.
-  if letNulBool(letIx, fnIx) { return "nulbool" }
-  // A map whose type names no rep, in `letLocalSlot`'s order (D14229).
-  if letIsMap(letIx, fnIx) { return "map" }
   const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return vtKindOfType(d.letType) }
-    if d.letInit >= 0 { return letBindRepKind(letIx, fnIx) ?? "i32" }
-  }
-  "i32"
+  if d is LetDecl && d.letType >= 0 { return vtKindOfType(d.letType) }
+  letBindRepKind(letIx, fnIx) ?? "i32"
 }
 
 // The map shape beside an inferred `map` or `nulmap` result valtype: the return expression's,
@@ -4287,13 +4275,12 @@ export function catSameKind(e: BinExpr, lk: i32, rk: i32, fnIx: i32) {
 // intrinsics (`slice`, `charCodeAt`, `cpAt`, `cpLen`, `isCharBoundary`, `bytes`) are each
 // this test with their own method name.
 export function exprIsStrMethod(callIx: i32, fnIx: i32, prop: string) {
-  if clsCensusOn { clsCensusEnter("exprIsStrMethod") }
   const c = nodeAt(callIx)
   if c is Call {
     if c.callFn < 0 { return false }
     const callee = nodeAt(c.callFn)
     if callee is Member {
-      if callee.memProp == prop { return exprString(callee.memObj, fnIx) }
+      if callee.memProp == prop { return nodeRepIs(callee.memObj, "str", fnIx) }
     }
   }
   false
@@ -5316,19 +5303,6 @@ export function letInfersF32(letIx: i32, fnIx: i32) {
 // `exprScalarWidth`).
 export function exprIsV128(exprIx: i32, fnIx: i32) {
   exprScalarWidth(exprIx, fnIx) == "v128"
-}
-
-// True if the `LetDecl` at `letIx` binds a v128 — annotated with `v128` or a brand over it, or
-// un-annotated with an init that yields a vector. The one route a `v128` local is classified through.
-export function letInfersV128(letIx: i32, fnIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    // An annotated binding (`const v: F32x4 = …`): the brand is erased to its `v128` base.
-    if d.letType >= 0 { return retV128Flag(d.letType) == 1 }
-    if d.letInit < 0 { return false }
-    return exprIsV128(d.letInit, fnIx)
-  }
-  false
 }
 
 // The leaf kinds of the arithmetic spine at `exprIx` (parens, unary `-`, `+ - * / %`): bit 1 =
@@ -6630,23 +6604,6 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
   exprNulKind(exprIx, fnIx) == "nulbool"
 }
 
-// A `let`/`const` binding is `boolean | null` if it is so ANNOTATED, or (un-annotated)
-// its initializer is a `boolean | null` value — e.g. `const r = f()` where `f` returns
-// the niche. Mirrors `letUnionNameOf`'s annotation-or-init resolution for value unions.
-export function letNulBool(letIx: i32, fnIx: i32) {
-  if letIx < 0 { return false }
-  if letIsNulBoolAnn(letIx) { return true }
-  // An un-annotated `const x = if c then true else null` infers `boolean | null` (a
-  // niche the emitter can't statically derive from the if-expr arms). The CHECKER
-  // typed it and exported the binding by node index; consult that before the init probe.
-  if isInferLetNulBool(letIx) { return true }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType < 0 { return exprNulBool(d.letInit, fnIx) }
-  }
-  false
-}
-
 // True if `exprIx` is a `K | null` NICHE value (the i32 atom with the spare `-1` = null) — a
 // `K|null`-annotated param / local / global, or a call of a `K|null`-returning function. The
 // litunion dual of `exprNulBool`; consulted at the `== null` compare and the `null`-seed boundaries.
@@ -6775,16 +6732,12 @@ function letSpellsNulAtom(letIx: i32, fnIx: i32): boolean {
 }
 
 // A `K | null` read out of a wider box, as an un-annotated binding's initializer: the binding is
-// the niche and its store converts. Asked of the checker's type and the box, not of the live
-// narrowing, so a capture's classification agrees with the frame's (D3118).
+// the niche and its store converts. Asked of the checker's type and the read's storage, not of
+// the live narrowing, so a capture's classification agrees with the frame's (D3118).
 function letInitIsNulLitBox(init: i32, fnIx: i32): boolean {
-  if clsCensusOn { clsCensusEnter("letInitIsNulLitBox") }
   const ix = unwrapParen(init)
-  if ix < 0 { return false }
-  if !nodeRepIsNulAtom(ix, fnIx) { return false }
-  const e = nodeAt(ix)
-  if !(e is Ident || e is Member || e is Index) { return false }
-  letInitIsBox(ix, fnIx)
+  if ix < 0 || !nodeRepIsNulAtom(ix, fnIx) { return false }
+  repKindOfTyMemo(readNarrowedStoreAt(ix, fnIx)) == "union"
 }
 
 // The map shape a function `name` returns, as seen from the call at `callIx`: its return
@@ -6846,8 +6799,9 @@ function globalReadAsk(sid: i32, letIx: i32, q: i32): boolean {
   v
 }
 
+// The `fbValtype` kind of a module global's cell: a local's cell kind (`letCellKind`), read in
+// no frame, memoised per global on the walk generation.
 export function globalCellKind(letIx: i32): VKind {
-  if clsCensusOn { clsCensusEnter("globalCellKind") }
   if letIx < 0 { return "i32" }
   // Only the TOP of a walk re-stamps: inside one, the columns are what stops the ladder
   // re-deriving the same global once per rung, which is the exponential.
@@ -6858,7 +6812,7 @@ export function globalCellKind(letIx: i32): VKind {
     if gckHave[letIx] == gckGen { return gckVal[letIx] }
   }
   gckDepth = gckDepth + 1
-  const k = globalCellKindGo(letIx)
+  const k: VKind = if nodeAt(letIx) is LetDecl { letCellKind(letIx, -1) } else { "i32" }
   gckDepth = gckDepth - 1
   while gckHave.length <= letIx {
     gckHave.push(0)
@@ -6872,19 +6826,6 @@ export function globalCellKind(letIx: i32): VKind {
     if gckStale() { gckDrop() }
   }
   k
-}
-
-// The `fbValtype` kind of a module global's cell: a local's cell kind (`letCellKind`), read
-// in no frame, after the never-filled `null` (D1576) and the v128 vector, which it does not name.
-function globalCellKindGo(letIx: i32): VKind {
-  if clsCensusOn { clsCensusEnter("globalCellKindGo") }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if letIsNulNone(letIx, -1) { return "nulnone" }
-    if letInfersV128(letIx, -1) { return "v128" }
-    return letCellKind(letIx, -1)
-  }
-  "i32"
 }
 
 // The struct table index for a global cell of kind 1 (struct ref), else -1. When the
@@ -7937,7 +7878,6 @@ export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
 // a declaration site, matching `vtKindOfType`'s slot sizing. `ownerFnIx` is the frame the
 // binding lives in (-1 at module scope), since the un-annotated arm resolves the initializer there.
 export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
-  if clsCensusOn { clsCensusEnter("bindingIsLitAtom") }
   if bindIx < 0 { return false }
   const bn = nodeAt(bindIx)
   match bn {
@@ -14696,7 +14636,6 @@ export function structListPopGetElem(exprIx: i32, fnIx: i32) {
 // list (one callback argument). A member call named `map`/`filter` over a NON-list receiver (e.g.
 // a function-valued struct field) is NOT a HOF site.
 export function callIsMapFilter(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("callIsMapFilter") }
   if exprIx < 0 { return false }
   const e = nodeAt(exprIx)
   if e is Call {
@@ -15371,7 +15310,6 @@ function callResultIsNulLitAtom(rx: i32, fnIx: i32): boolean {
 // What a call's result is stored as: "nullitatom" for the `K | null` niche, "litatom" for an
 // interned literal-union id, its lowered list kind, "nulnone" for the `null` unit, else "".
 function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
-  if clsCensusOn { clsCensusEnter("readCallStoreKind") }
   if callResultIsNulLitAtom(rx, fnIx) { return "nullitatom" }
   if callStoreIsLitAtom(e, rx, fnIx) { return "litatom" }
   const ld = repOfNode(rx, fnIx)
