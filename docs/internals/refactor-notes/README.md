@@ -8,6 +8,7 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step7-struct-row-one](2026-11-09-step7-struct-row-one.md): Step 7: the nominal and structural struct-row readers differ in 2,169 files, all declines or twins; `repOfTy` stops answering a struct row.
 - [2026-11-09-step7-fret-repof](2026-11-09-step7-fret-repof.md): Step 7: the un-annotated `fRet*` columns read off `repOf`; five steps between them deleted, seed −2,088.
 - [2026-11-09-step7-classifier-r22](2026-11-09-step7-classifier-r22.md): Step 7: classifier round 22, `letCellKindGo`, `letInitIsNulLitBox`, `exprIsStrMethod` typed, `globalCellKindGo` deleted; 62 → 53 probed.
 - [2026-11-09-step7-union-arm-rows-minted-on-read](2026-11-09-step7-union-arm-rows-minted-on-read.md): Step 7: a union's ref-array arm row mints at its first read; the union pass's element intern is deleted.
