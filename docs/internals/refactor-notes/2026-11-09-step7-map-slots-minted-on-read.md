@@ -24,9 +24,10 @@ The result is measured against master `8c31c096`, and both seeds are fixpoints.
 
 | | master | candidate |
 | --- | --- | --- |
-| fixpoint seed | 6,589,093 | 6,588,864 (−229) |
+| fixpoint seed | 6,589,093 | 6,588,844 (−249) |
 
-The full sweep covers 23,792 programs:
+The full sweep covers 23,792 programs. It was graded at 6,588,864, before `sFieldElemTyIxRow`, whose
+last reader was the deleted pass, was deleted too:
 
 * 23,631 are unchanged.
 * 0 `runs → not-runs`, 0 new compiler traps and 0 output movers.
