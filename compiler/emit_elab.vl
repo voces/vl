@@ -5798,6 +5798,26 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       ) {
         return 0
       }
+      // So does a list literal of it handed whole to a named function's parameter which forwards it there
+      // as the parameter itself would (D15566).
+      if (
+        p >= 0
+        && nodeAt(p) is ArrayLit
+        && fnTagSetOfTy(elabNodeTy(ix, k)) >= 0
+      ) {
+        const to = elabLitFwdTargets(p, dn.fnBody)
+        let a = 0
+        while a + 1 < to.length {
+          mintParamFwdNote(
+            decl,
+            i32ListIndexOf(dn.fnParams, pd),
+            to[a],
+            to[a + 1],
+          )
+          a = a + 2
+        }
+        if to.length > 0 { return 0 }
+      }
       // So does a `const` list literal of it whose elements are only ever called.
       if (p >= 0 && nodeAt(p) is ArrayLit && elabListLitOfParam(p, dn, pd)) {
         return 0
@@ -5935,6 +5955,47 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
   if p >= 0 { return 0 }
   for kid in nodeChildren(ix) { elabMintHandedNested(kid, ix, decl, k, sc) }
   0
+}
+
+// The `[decl, index, ...]` parameters node `lit` in `body` lands in: those of the call it is a
+// positional argument of, or of every call a `const` it initialises is handed whole to; [] where
+// any read of it goes elsewhere.
+function elabLitFwdTargets(lit: i32, body: i32): i32[] {
+  const none: i32[] = []
+  const out: i32[] = []
+  let bd = -1
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Call && i32ListHas(xn.callArgs, lit) {
+        return elabMintFwdTarget(lit, x)
+      }
+      if xn is LetDecl && xn.letKw == "const" && xn.letInit == lit { bd = x }
+      for c in nodeChildren(x) { todo.push(c) }
+    }
+  }
+  if bd < 0 { return none }
+  todo.push(body)
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == bd {
+        const to = elabMintFwdTarget(x, p)
+        if to.length != 2 { return none }
+        out.push(to[0])
+        out.push(to[1])
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+      }
+    }
+  }
+  out
 }
 
 // The closed function type of the named function's parameter that read `ix`, an argument of call
@@ -8696,6 +8757,10 @@ function elabMintFactAt(c: Call, ix: i32, decl: i32, k: i32, sc: i32): boolean {
     for w in elabListJoinWriters(identDeclOf(root), dn, pd) {
       mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, w), fnTagSetOfTy(st))
     }
+  }
+  // An element of the instance's own list parameter is the value its callers listed (D15566).
+  if root != cf && identDeclOf(root) == pd {
+    mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
   }
   if root == cf {
     mintParamSetNote(decl, i32ListIndexOf(dn.fnParams, pd), fnTagSetOfTy(st))
