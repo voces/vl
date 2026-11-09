@@ -34,6 +34,7 @@ import {
 import {
   elabRestampedAt,
   fnTagCallArms,
+  fnTagHeldNodes,
   fnTagHeldRepOf,
   fnTagHoldsTy,
   fnTagSetIsTagged,
@@ -5538,105 +5539,11 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   0
 }
 
-// `collectA`'s tail after the arena walk: the field tables' needs re-derived, struct table
-// then variant table, since no field type is a `TypeRef` the walk sees. Every intern is idempotent.
-function collectAFieldTables() {
-  // Union-variant nested-struct fields (code 15): intern each field's target shape into the
-  // struct table, the intern `collectShapeVariantFields`'s acceptance deferred because
-  // `collectU` runs before the struct table exists. Idempotent, and a no-op for a declared
-  // target name. Runs before the struct-field pass below, so a fresh shape's fields get slots.
-  let avn = 0
-  while avn < uFieldStart.length && avn < uFieldCount.length {
-    let akn = 0
-    while akn < uFieldCount[avn] {
-      collectAArmFieldShape(uFieldStart[avn] + akn)
-      akn = akn + 1
-    }
-    avn = avn + 1
-  }
-  // Field-table re-derivation, the struct table then the variant table below. Two rules run
-  // through every arm of both loops: a field's own type is never a standalone `TypeRef` the arena
-  // scan above sees, so its needs are re-derived from the field table here; and the field may be
-  // the module's only mention of its rep. Every intern below is idempotent.
-  let sfi = 0
-  while sfi < sFieldTypes.length {
-    if sFieldTypes[sfi] == FC_MAP || sFieldTypes[sfi] == FC_NUL_MAP {
-      // Code 29, the nullable map field, interns its non-null twin's mv slot. The key is threaded
-      // in: a slot's identity is the (key, value) pair, so a `{[i32]: string}` field interns the
-      // i32-keyed slot, and interning against the wrong key is the silent wrong map struct.
-      const sfk = sFieldRowKeyKind(sfi)
-      // …and the row's arena type, the third column of the same push. `recordSFieldElemRow`
-      // computed it by calling `fieldElemTyIxOfName` on the very `sFieldElemName[sfi]` handed
-      // over here, so the intern's lookup rung takes the answer instead of re-deriving it.
-      mvShapeOfValNameRowTy(sFieldElemName[sfi], sfk, sFieldElemTyIxRow(sfi))
-    }
-    // A ref-list field (code 5) and its nullable twin (28): intern the element so
-    // `sFieldRefSlot` resolves.
-    if sFieldTypes[sfi] == FC_REF_LIST || sFieldTypes[sfi] == FC_NUL_REF_LIST {
-      // …with the row's arena type (D-REPELEMTY) — see the variant-table twin above.
-      ensureRefElemTy(sFieldElemName[sfi], sFieldElemTyIxRow(sfi))
-    }
-    // A scalar-list field (f64[], i64[], f32[]; codes 25/26/27): `internInlineShape` forces the
-    // pair at intern time, but this pass's re-run resets the flags, so re-derive from the table.
-    forceScalarListField(sFieldTypes[sfi])
-    sfi = sfi + 1
-  }
-  // The variant-table twins of the same arms (a shape-text variant records its map value name
-  // via `shapeFieldElemName`); a mono map value (i32 / boolean / atom) is a no-op
-  // (`mvShapeOfValNameRowTy` returns -1, no intern).
-  let avi = 0
-  while avi < uFieldStart.length && avi < uFieldCount.length {
-    let aki = 0
-    while aki < uFieldCount[avi] {
-      collectAArmFieldNeeds(uFieldStart[avi] + aki)
-      aki = aki + 1
-    }
-    avi = avi + 1
-  }
-}
-
-// One arm field's code-15 intern and re-key, at flat field index `ufn`.
-function collectAArmFieldShape(ufn: i32) {
-  // …with the row's own arena type: `recordUFieldElemRowTy` records `armFieldElemTyIx` from this
-  // cell, so the index the intern banks for the freshly-minted struct row is the index it
-  // would otherwise re-resolve the spelling to.
-  if sFieldTypes[ufn] == FC_STRUCT {
-    const si15 = internInlineShapeTy(
-      sFieldElemName[ufn],
-      uFieldElemTyIxRow(ufn),
-    )
-    // Re-key the row to the interned row's own name. The intern dedups, and a dedup can land
-    // on a row spelled differently from the text recorded here: `annShapeIndexOf` treats one
-    // wasm code as one layout, so `{b: boolean}` resolves to an existing `{b: i32}` row. The
-    // code-15 consumer looks the element up by name, so a stale spelling would read -1.
-    if si15 >= 0 {
-      sFieldElemName[ufn] = sNames[si15]
-      tyRegNoteWrite()
-    }
-  }
-  // A ref-list variant field (code 5): the variant-table twin of the struct-field pass's
-  // code-5 intern below. The recorded element key may be deferred, since `shapeFieldElemName`
-  // recorded the stripped element text before the struct table existed — so intern an
-  // inline-shape element first, then the element's ref-list slot.
-  if sFieldTypes[ufn] == FC_REF_LIST {
-    const en5 = sFieldElemName[ufn]
-    // The same row's arena type serves BOTH interns on this line and the next
-    // (D-INLINESHAPETY / D-REPELEMTY) — one cell, one recorder, two consumers.
-    if nameIsShapeOpen(en5) { internInlineShapeTy(en5, uFieldElemTyIxRow(ufn)) }
-    // The row's arena type, threaded into the intern. `recordUFieldElemRowTy` records
-    // `armFieldElemTyIx` from this cell's own `armFieldElemName`, so the slot key the intern
-    // computes from it is the key it computes from the spelling, one `resolveAnnot` fewer.
-    ensureRefElemTy(en5, uFieldElemTyIxRow(ufn))
-  }
-  0
-}
-
-// Arm field `ufi`'s map value slot and presence flags, when the field is a map. `collectA` asks
-// for every arm field; `collectS` asks first for the fields of an arm a struct field names, since
-// that field's twin check compares the two rows' map slots before `collectA` runs (D15097).
+// Arm field `ufi`'s map value slot, when the field is a map. `collectS` asks for the fields of
+// an arm a struct field names, since that field's twin check compares the two rows' map slots (D15097).
 function internArmFieldMapSlot(ufi: i32) {
   // Read through the arm accessors, which follow the arm table across its adoption into the
-  // struct table: `collectS` asks before adoption, `collectA` after (D15097).
+  // struct table (D15097).
   const codes = armFieldTypes()
   if ufi < 0 || ufi >= codes.length { return 0 }
   if codes[ufi] == FC_MAP || codes[ufi] == FC_NUL_MAP {
@@ -5668,19 +5575,6 @@ function internArmMapSlotsNamedBy(tyIx: i32) {
     internArmFieldMapSlot(uFieldStart[vi] + k)
     k = k + 1
   }
-  0
-}
-
-// One arm field's presence flags and slot interns, at flat field index `ufi`.
-function collectAArmFieldNeeds(ufi: i32) {
-  forceScalarListField(sFieldTypes[ufi])
-  // A NULLABLE ref-list variant field (code 28): re-intern its element so the field's
-  // storage type + narrowed reads resolve the wrapper slot (`rlSlotByName`).
-  if sFieldTypes[ufi] == FC_NUL_REF_LIST {
-    // …with the row's arena type (D-REPELEMTY) — see the code-5 arm above.
-    ensureRefElemTy(sFieldElemName[ufi], uFieldElemTyIxRow(ufi))
-  }
-  internArmFieldMapSlot(ufi)
   0
 }
 
@@ -5736,14 +5630,11 @@ function collectAIsExpr(i: i32, nd: IsExpr) {
   0
 }
 
-// Scan the arena's annotations and held nodes, setting the presence flags and minting the
-// ref-list, map-value and annotation-node rows keyed against them; an unclaimed array
-// annotation fails loudly. List literals mint at their readers, and `is` tests, joins and
-// intrinsic calls in `preIndexMintTrees`. Runs once, after monomorphization. Returns 0, or -1.
-export function collectA(_stmts: i32[]) {
+// Runs after the post-monomorphization annotation shapes: arms the mint-on-read hooks, then
+// mints the rows each registered union's arms and each held node's rep are read at. Returns 0.
+export function collectUnionAndHeldRows() {
   collectTyParamNames()
   arrLitMintDone = []
-  heldMintDone = []
   arrLitMintOn(nodeMintOnRead)
   rlRowMintOn(rlRowOfTyMinted)
   // The read-only-covariance write memo is keyed by slot number, which a re-mint and a
@@ -5751,12 +5642,56 @@ export function collectA(_stmts: i32[]) {
   rlWrSlots = []
   rlWrAns = []
   collectAUnionRows()
-  let i = 0
-  while i < P.nodes.length {
-    if fnTagHeldRepOf(i) >= 0 { collectAHeldRep(i) }
-    i = i + 1
+  for i in fnTagHeldNodes() { collectAHeldRep(i) }
+  collectFieldMapAndShapeRows()
+}
+
+// The rows the field tables need before any reader: each arm record field's struct row,
+// re-keyed to the interned row's name, then each map field's value slot, since the map slot
+// finder never mints. A ref-list field's row mints on read (`sFieldRefSlot`).
+function collectFieldMapAndShapeRows() {
+  let avn = 0
+  while avn < uFieldStart.length && avn < uFieldCount.length {
+    let k = 0
+    while k < uFieldCount[avn] {
+      const ufn = uFieldStart[avn] + k
+      if sFieldTypes[ufn] == FC_STRUCT {
+        // The intern dedups onto a row that may be spelled differently, and the consumer looks
+        // the element up by name.
+        const si = internInlineShapeTy(
+          sFieldElemName[ufn],
+          uFieldElemTyIxRow(ufn),
+        )
+        if si >= 0 {
+          sFieldElemName[ufn] = sNames[si]
+          tyRegNoteWrite()
+        }
+      }
+      k = k + 1
+    }
+    avn = avn + 1
   }
-  collectAFieldTables()
+  let sfi = 0
+  while sfi < sFieldTypes.length {
+    if sFieldTypes[sfi] == FC_MAP || sFieldTypes[sfi] == FC_NUL_MAP {
+      // A slot's identity is the (key, value) pair, so the key is threaded in.
+      mvShapeOfValNameRowTy(
+        sFieldElemName[sfi],
+        sFieldRowKeyKind(sfi),
+        sFieldElemTyIxRow(sfi),
+      )
+    }
+    sfi = sfi + 1
+  }
+  let avi = 0
+  while avi < uFieldStart.length && avi < uFieldCount.length {
+    let k = 0
+    while k < uFieldCount[avi] {
+      internArmFieldMapSlot(uFieldStart[avi] + k)
+      k = k + 1
+    }
+    avi = avi + 1
+  }
   0
 }
 
@@ -5772,13 +5707,9 @@ function rlRowOfTyMinted(et: i32): i32 {
   rlSlotOfTy(et)
 }
 
-let heldMintDone: boolean[] = []
-// The rows held node `i` is read at, once: a map of a tagged set's records, or a list of flat
+// The rows held node `i` is read at: a map of a tagged set's records, or a list of flat
 // records, held at a rep its own type does not name.
 function collectAHeldRep(i: i32) {
-  while heldMintDone.length <= i { heldMintDone.push(false) }
-  if heldMintDone[i] { return 0 }
-  heldMintDone[i] = true
   // A map binding held as a map of a tagged set's records is read at that rep, so its value row
   // and mv slot are interned here, beside the map's own type's.
   const hr = fnTagHeldRepOf(i)
