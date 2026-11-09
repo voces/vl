@@ -41,22 +41,42 @@ asks a question cannot also mint.
     D15561, D15562). Skipping a bare function element too re-broke `(() => void)[]` globals
     (D1044: `std:test`'s `vltBodies`).
 
-## What stands at E6, by class
+## Second session (same day): 59 → 29
 
-* **12: `field access receiver is not a struct`** (`d223e*`). Ablation: it needs
-  `type Shape = Circle | Sq`, so `Circle` is a variant. The literal
-  `[{ r: { c2: 1 } }, { r: { s2: 1 } }]` mints its row before the annotation
-  `{[string]: Circle[]}` does, and the two rows disagree. Reader #4, "literals reading a later
-  annotation's row", is not closed for a variant twin.
-* **9: `ref valtype with no interned shape`** (a040320, the `sink(_x: Circle[])` cells). An
-  inferred return `{r: string}[]` is read at signature time with no row. This is reader #3,
-  `buildFnMap#2`'s synthesized return annotations. E5's mint fixed it too broadly, so the
-  narrow fix is a mint at that reader.
-* **4: late map list row** (`mty_loc_maparr_*`), and **about 30 single-digit invalid-wasm
-  programs**. They are not ablated.
+Base is master `50fe2c5c`+3 (`b861eb49` merge) at its fixpoint, 6,584,352 bytes. Each row is a
+fixpoint candidate, swept over 23,782 programs.
+
+| step | runs lost | new traps | seed |
+| --- | --- | --- | --- |
+| E6 rebuilt on the merge | 59 | 32 | 6,584,954 |
+| E7 + an un-annotated `Map()` mints its value slot at its value type (`armTy`), not `-1` | 40 | 25 | 6,584,981 |
+| E8 + `mvMapsLate` waits for a slot whose columns are still being pushed | 29 | 13 | 6,584,957 (+605) |
+
+* **E7 closed all 12 `d223e*`.** The note's ablation was wrong: annotation-first fails too
+  (`const c: {[string]: Circle[]} = Map()` before the literal). The `Map()` node's mint
+  (`mvShapeOfMapNodeTy`) passed `armTy = -1`, so its slot disagreed with the one the annotation
+  would mint. A literal-side twin mint (`arrLitDeclRecTy`) was tried, bought nothing, and is not kept.
+* **E8:** `rlInternNameTy` fires `mvLateSlots` at depth 0 while `mvShapeOfValNameArmTyGo` has
+  pushed `mvValName` but not `mvMapTypeIdx`. E7's seed trapped there compiling `scripts/sweep.vl`.
+  The loop is now bounded by `mvMapTypeIdx.length`, the last column pushed.
+
+What stands at E8:
+
+* **13 invalid wasm** (`D2698`, `D956`, `D9716`, `D9764`, `d15207`/`d15293`/`d15294`, five
+  `tests/cases/closures|maps|functions`). Most hold function values (lane w220's rows). Not ablated.
+* **9 `ref valtype with no interned shape`** (`a040320`/`536`/`752` and six cases). Minimal witness:
+  `type Circle = { r: string }`, `type Shape = Circle | Sq`, `function sink(_x: Circle[]) {}`
+  (never called), `mkcall()` returning `[{ r: "seven" }]`, `for zz in mkcall() {}`. The refusal is a
+  LOCAL's valtype (`fbLocalRun`), not the signature. The literal's row is fine (slot 0, shared by
+  `{r: string}` and its twin `Circle`). The loop variable's struct row is what is missing.
+* **4 `a late map list row has no value map struct`**: `const r: {[string]: T}[] = [Map()]` in a
+  generic instance at `T = string`. At the refusal, slot 0 has been processed (`mvTwin[0] = 0`)
+  and `mvMapTypeIdx[0]` is 0. The non-late pass takes `mvMapTypeIdx[mmv]` with no `> 0` test.
+* 1 each: `covariant list delivery` (D3059), `function-value call has no interned signature`,
+  `type section wrote 15 rec-group entries`.
 
 ## Not done
 
 Step 2 (delete collectA#2), step 3 (`collectAFieldTables`, by-name sites onto `identDeclOf`),
-the gates, fixpoint, rep-fuzz and RSS. A PR needs a seed at or below master's, so it can land only
-once the arm is deleted with 0 losses. E6 is still +602 bytes with the walk gone.
+the gates, rep-fuzz and RSS. A PR needs a seed at or below master's, so it can land only once the
+arm is deleted with 0 losses. E8 is +605 bytes with the walk gone.
