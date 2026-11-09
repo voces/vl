@@ -8,6 +8,8 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step7-collecta-typeref-chain](2026-11-09-step7-collecta-typeref-chain.md): Step 7: collectATypeRef's empty rungs fold into two named guards (#6972).
+- [2026-11-09-step7-values-stamp-slot](2026-11-09-step7-values-stamp-slot.md): Step 7: fnValuesStampSlot deleted; record results take the values' agreed stamp (#6970).
 - [2026-11-09-step7-ret-list-row-join-walk](2026-11-09-step7-ret-list-row-join-walk.md): Step 7: fnRetRefListRowJoin's per-value row join deleted, seed −2,049 (#6968).
 - [2026-11-09-step7-is-call-if-arms-minted-before-signature-passes](2026-11-09-step7-is-call-if-arms-minted-before-signature-passes.md): Step 7: collectA#2's IsExpr, Call and IfStmt arms mint in a pre-pass; the rvWanted hazard fixed (#6965).
 - [2026-11-09-capturing-nested-hole-two-types](2026-11-09-capturing-nested-hole-two-types.md): Step 4: a nested hole at two encloser instances joins the bundle, D15596 (#6961).
