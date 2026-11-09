@@ -349,17 +349,14 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // A live emit-side refusal (`scripts/capability-probes/hole-param-read-through-nested-binding-handed-through-a-set.vl`):
-      // `vl check` accepts it and the emitter refuses the generic argument (D14843): a hole parameter
-      // read through a binding by a nested function, called there and handed through a list to a
-      // call at two types.
+      // A live emit-side refusal (D12218): `vl check` accepts it and mono refuses `mid`'s parameter,
+      // called at two function types.
       await Deno.writeTextFile(
         file,
-        "function add(a, b) { return a + b }\nfunction mul(a, b) { return a * b }\n" +
-          "function apply2(g) {\n  print(g(1, 2))\n  print(g(1.5, 2.5))\n}\n" +
-          "function run(h) {\n  const hh = h\n  function inner() {\n" +
-          "    for f in [apply2] { f(hh) }\n    print(hh(10, 20))\n  }\n  inner()\n}\n" +
-          "run(add)\nrun(mul)\n",
+        "function same<T>(k: T): T { k }\n" +
+          'function mid<F>(a: F, b: F, n: i32) {\n  print(a("x"))\n  print(b(n))\n' +
+          "  const fs = [a]\n  print(fs.length)\n  if n > 0 { mid(b, a, n - 1) }\n}\n" +
+          "mid(same, same, 1)\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);
