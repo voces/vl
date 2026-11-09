@@ -34,7 +34,7 @@ keys `g` at the checker's closed join during `elabRun`, and nothing is demanded 
 | sweep, 23,754 programs | | 23,751 same, 0 bytes-only, 3 output movers, 0 `runs → not-runs`, 0 new traps |
 | the 3 movers | 2 emit rejects, 1 check reject | D15331's and D15304's witnesses and the fixture run |
 | late demands | 6 | 6 (the fixture: 0; baseline file as master's) |
-| seed (fixpoint) | 6,577,470 | 6,577,926 (+456; +2.8% of the seed-size baseline) |
+| seed (fixpoint) | 6,577,470 | 6,577,990 (+520; +2.8% of the seed-size baseline) |
 | rep-fuzz | | exact, 0 failures |
 | plumb-shape fuel, main / tail (against its baseline) | | −1.4% / −2.5% |
 | plumb-shape peak RSS, main / tail | | +0.8% / +0.7% |
