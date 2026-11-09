@@ -6,7 +6,7 @@
 // only state is the scratch lists the atom-kind walks fill.
 
 import { i32ToStr } from "./ast"
-import { fnTagTyIsTagged } from "./check_fn_tag_facts"
+import { fnTagTyIsTagged, mapStoredTyOf } from "./check_fn_tag_facts"
 import {
   flattenVariantsInto,
   isNulBoolTy,
@@ -51,6 +51,7 @@ import {
   structNameOfTy,
   tyAt,
   tyDeeperThan,
+  tyEq,
   tyIsLitUnion,
   tyIsNicheNulScalarElem,
   tyIsNullableLitUnion,
@@ -1021,12 +1022,58 @@ export function mixedVariantBoxGate(members: i32[]): boolean {
 
 // A `{tag, value}` value/struct union box: `TyUnion`, 2+ members, not a pure literal union, nor
 // a union of lists that all spell one list (`oneListUnionRender`).
+// Whether two maps (neither a Set) are one box member though not one type: keys that hash
+// alike, and values equal once a numeric literal union is read as its base.
+export function mapTwinPair(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
+  const at = tyAt(a)
+  const bt = tyAt(b)
+  if !(at is TyMap) || !(bt is TyMap) { return false }
+  if at.mSet != 0 || bt.mSet != 0 { return false }
+  if at.mKey < 0 || bt.mKey < 0 || at.mVal < 0 || bt.mVal < 0 { return false }
+  if mapKeyRepTy(at.mKey) != mapKeyRepTy(bt.mKey) { return false }
+  if tyEq(at.mVal, bt.mVal) { return false }
+  tyEq(mapValSoftBase(at.mVal), mapValSoftBase(bt.mVal))
+}
+
+// A map value as its box member reads it: a numeric literal union's base, else itself.
+export function mapValSoftBase(v: i32): i32 {
+  const b = numLitUnionBaseTy(v)
+  if b >= 0 { return b }
+  v
+}
+
+// The first member of union `ty` when it is a map (not a Set) and each other member is that map
+// or its twin (`mapTwinPair`): nothing can tell such members apart, so the union is that map;
+// else -1.
+export function mapTwinUnionMember(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = tyAt(ty)
+  if !(t is TyUnion) || t.uMembers.length < 2 { return -1 }
+  const m0 = t.uMembers[0]
+  if m0 < 0 || m0 >= T.tys.length { return -1 }
+  const t0 = tyAt(m0)
+  if !(t0 is TyMap) || t0.mSet != 0 { return -1 }
+  for m in t.uMembers {
+    if !tyEq(m0, m) && !mapTwinPair(m0, m) { return -1 }
+  }
+  m0
+}
+
+// Type `ty` as it is stored (`mapStoredTyOf`), a union of maps nothing can tell apart as its one map.
+export function storedTyOf(ty: i32): i32 {
+  const tw = mapTwinUnionMember(ty)
+  if tw >= 0 { return mapStoredTyOf(tw) }
+  mapStoredTyOf(ty)
+}
+
 export function isValueUnionBox(tyix: i32) {
   if tyix < 0 { return false }
   const t = tyAt(tyix)
   if t is TyUnion {
     if t.uMembers.length < 2 { return false }
     if oneListUnionRender(tyix) != "" { return false }
+    if mapTwinUnionMember(tyix) >= 0 { return false }
     // A homogeneous literal union (all members of one base scalar) is an interned atom or that
     // scalar, not a box; a mixed-base one (`"x" | 7`, or `1 | 9000000000`) shares no one scalar,
     // so it boxes, as `softenLitTy` declines to soften it (D3491).
@@ -1293,8 +1340,13 @@ export function tyMapKeyKindSpan(ty: i32): i32 {
     TyMap => mapKeyKindOfTy(t.mKey)
     TyNullable => tyMapKeyKindSpan(t.nInner)
     TyArray => tyMapKeyKindSpan(t.aElem)
+    // Maps nothing can tell apart key as their one map.
+    TyUnion => {
+      const mt = mapTwinUnionMember(ty)
+      if mt >= 0 { tyMapKeyKindSpan(mt) } else { MAP_KEY_STR }
+    }
     // No map key below: the string key is the default.
-    TyPrim | TyFunc | TyObj | TyUnion | TyNeg | TyVar | TyLit | TyErr => MAP_KEY_STR
+    TyPrim | TyFunc | TyObj | TyNeg | TyVar | TyLit | TyErr => MAP_KEY_STR
   }
 }
 
