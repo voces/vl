@@ -8847,24 +8847,16 @@ export function exprNullableRefNiche(exprIx: i32, fnIx: i32) {
   exprNullableVariant(exprIx, fnIx)
 }
 
-// The rep kind of the cell an identifier reads, across the four storage classes: parameter
-// annotation, declared local, captured env field, module global. The kind-level
-// generalization of `exprNullableStruct`'s four-arm ladder. Parameter first is not a
-// shadowing bug: `paramTypeNodeOfRead` answers -1 for a read a `let` shadows.
+// The rep kind of the cell an identifier read holds now: `identStoreVKind`'s answer, except null
+// for a `let` of the asking frame that has no slot yet.
 export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("identCellVKind") }
-  if exprIx < 0 { return null }
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is Ident {
-    const pt = paramTypeNodeOfRead(fnIx, unwrapParen(exprIx))
-    if pt >= 0 { return vtKindOfType(pt) }
-    const dk = declaredKind(unwrapParen(exprIx))
-    if dk != null { return dk }
-    const ck = capturedKindOf(fnIx, e.identName)
-    if ck != null { return ck }
-    const gl = globalLetOfRead(fnIx, unwrapParen(exprIx))
-    if gl >= 0 { return globalCellKind(gl) }
-  }
+  const k = identStoreVKind(exprIx, fnIx)
+  if k == null { return null }
+  const rx = unwrapParen(exprIx)
+  const d = identDeclOf(rx)
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return k }
+  if declaredKind(rx) != null || readSlotlessOwnLet(rx, fnIx) < 0 { return k }
+  if globalLetOfRead(fnIx, rx) >= 0 { return k }
   null
 }
 
@@ -15027,15 +15019,39 @@ function readNonNulKind(k: string): string {
   ""
 }
 
-// The cell an identifier read holds: its loaded slot's, or, asked outside the frame declaring
-// it, the cell its binding has there. Null for a read with neither.
+// The rep kind of the cell an identifier read holds, found through the read's declaration: a
+// parameter's annotation, a local's slot, a `let`'s cell in the frame declaring it, a global's
+// cell, a loop variable's slot or capture. Null for a function name, a read with no declaration,
+// and a module-scope read of a function body's `let` (D14910).
 export function identStoreVKind(rx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("identStoreVKind") }
-  const k = identCellVKind(rx, fnIx)
-  if k != null { return k }
-  const d = readSlotlessOwnLet(rx, fnIx)
-  if d < 0 { return null }
-  letCellKind(d, fnIx)
+  const ix = if rx < 0 { -1 } else { unwrapParen(rx) }
+  if ix < 0 || ix >= P.nodes.length { return null }
+  const e = nodeAt(ix)
+  if !(e is Ident) { return null }
+  const d = identDeclOf(ix)
+  if d < 0 || d >= P.nodes.length { return null }
+  const dn = nodeAt(d)
+  if dn is Param {
+    const pt = paramTypeNodeOfRead(fnIx, ix)
+    if pt >= 0 { return vtKindOfType(pt) }
+    return capturedKindOf(fnIx, e.identName)
+  }
+  if dn is LetDecl {
+    const dk = declaredKind(ix)
+    if dk != null { return dk }
+    const o = readDeclOwnerOf(d, fnIx)
+    if o >= 0 { return letCellKind(d, o) }
+    const gl = globalLetOfRead(fnIx, ix)
+    if gl >= 0 { return globalCellKind(gl) }
+    if fnIx < 0 && letInFnBody(d) { return null }
+    return letCellKind(d, -1)
+  }
+  if loopVarLoop(d) >= 0 || dn is ForRange {
+    const lk = declaredKind(ix)
+    if lk != null { return lk }
+    return capturedKindOf(fnIx, e.identName)
+  }
+  null
 }
 
 // `identStoreVKind` where the binding column claims the cell, read without walking an
