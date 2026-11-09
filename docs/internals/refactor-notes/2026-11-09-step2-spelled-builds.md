@@ -37,12 +37,12 @@ elaboration's key.
 `*-wider-*`) whose pins are the declared type, and they are the build at that type. The builds
 merged or split nowhere, and the sweep shows every module byte-identical.
 
-The 40 `spelled` builds that stand:
+The 40 `spelled` builds, after D15580 and D15581 (fixpoint seeds, same population): 25 stand.
 
-- **TYPE, 14**: a list's function set does not hold a lambda that another function pushes onto
-  it (`hole-fn-into-pushed-lambda-*` and two siblings; D12940's shape). `f(snd)` binds `g` at
-  `(string, i32) => i32`, and no instance records that member. Owner: the set (step 3).
-- **TYPE, 1**: `closure-result-map-union`'s `(q0) => "lbbzv"`, typed by its field's union.
+- **TYPE, 14 → 0** (D15580): the call through the list minted only named members. A lambda
+  member is now minted under each encloser instance; its 14 builds are 8 `pins` builds.
+- **TYPE, 1 → 0** (D15581): the lambda's checked type is its field's union; it is now keyed by
+  that union's one function member (`sig`, 39 → 40).
 - **REP, 25**: 17 annotated functions built again at a container's wider rep
   (`built-container-*`). Then 6 at a wider record row (`J`, `V`). Then `z` at its stub signature,
   and the lambda bundle. These are rep twins (step 7).
@@ -67,14 +67,13 @@ The 51 are equivalent, the 27 are rep (step 7), and the 4 have no instance to re
 | argument row arms (`monoArgRowArmTy`) | 1 site | rep | step 7 |
 | closed-type spelling, union registration | 7 + 4 sites | rep | step 7 |
 | `monoElabPin` spelling and delivery | 5 sites | rep | the type is `elabCallParamTy` |
-| `monoKeyPinSeg`, `sig` path | 39 builds | type, the checker's | keyed by the closed signature (§1) |
-| `monoKeyPinSeg`, `spelled`: pushed list members | 14 builds | type | no instance for a pushed member (step 3) |
-| `monoKeyPinSeg`, `spelled`: union-typed lambda | 1 build | type | the checker records the destination's type |
+| `monoKeyPinSeg`, `sig` path | 40 builds | type, the checker's | keyed by the closed signature (§1) |
+| `monoKeyPinSeg`, `pins`: pushed list members | 8 builds | type, the checker's | D15580 |
 | `monoKeyPinSeg`, `spelled`: rep twins and sets | 25 builds | rep | step 7 |
 | `monoKeyPinSeg`, typed dedup | 359 hits at #6928 | rep | step 7 |
 | body reads, pin fallback | 78 + 4 reads | rep / equivalent + type | §2 |
 | instance no-answers | 14 | type + rep | named in #6927 and #6928 |
 | late demands on refused programs | 2 | type | #6928 §2 |
 
-Every TYPE row is at zero or carries a named reason: an instance the elaboration does not yet
-record (15 builds, 4 reads), or a reading the checker declines (2).
+No `spelled` build is TYPE. The TYPE rows left are reads and answers, not builds: 4 reads with
+no instance, the instance no-answers, and 2 readings the checker declines. D15582 is open.
