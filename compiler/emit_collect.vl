@@ -276,9 +276,6 @@ import {
   TSK_CLO_CELL,
   TSK_CLO_ENV,
   TSK_CLO_SIG,
-  TSK_MAP,
-  TSK_MAP_I32,
-  TSK_MAP_I64,
   TSK_MV_MAP,
   TSK_REF_BACK,
   TSK_REF_WRAP,
@@ -419,9 +416,10 @@ import {
   mTwinSettled,
   mTwinShapes,
   mTwinTys,
-  mUsed,
+  mapI32Ty,
+  mapI64Ty,
+  mapTy,
   mkArrIdx,
-  mkArrTy,
   mkListIdx,
   mkListTy,
   monoGradualObjFrame,
@@ -482,7 +480,6 @@ import {
   sRefRow,
   sRowDecl,
   sTwin,
-  sTy,
   sTyIx,
   scopeFrames,
   scopeNames,
@@ -1500,7 +1497,6 @@ function markSigKeyMonoMapsUsed(key: string) {
   let i = 0
   while i < key.length {
     if key[i] == 'M' && i + 1 < key.length && key[i + 1] == '-' {
-      mUsed = true
       const shape = sigSlotAtTok(key, i)
       if shape == -4 || shape == -5 { markMapKeyUsed(MAP_KEY_I32) }
       if shape == -6 || shape == -7 { markMapKeyUsed(MAP_KEY_I64) }
@@ -4254,6 +4250,9 @@ function mResetTypeIntern() {
   mkListIdx = -1
   ba8TypeIdx = -1
   bl8TypeIdx = -1
+  mStructIdx = -1
+  mStructI32Idx = -1
+  mStructI64Idx = -1
   strTrioReset()
   0
 }
@@ -4339,20 +4338,12 @@ export function mAssignTypeIndices(_n: i32) {
   mResetTypeIntern()
   mAssignStructHeaps()
   mAssignUnionHeaps()
-  // The string trio mints on first ask. A map holds string keys, so it mints here, before the
-  // map struct's index is predicted from the counter.
-  if mUsed { sTy() }
-  // An `i32[][]` row keys its twin signature by the i32 wrapper, so it mints here, before the
-  // map struct's index is predicted from the counter; any other reader mints it on first ask.
+  // An `i32[][]` row keys its twin signature by the i32 wrapper, so it mints here; any other
+  // reader mints it on first ask.
   if rlHasKind(RLK_I32_LIST) { lTy() }
-  const rlDistinctPairs = mAssignRefListTwins()
-  // The map struct index is needed below to resolve a map-array ref-list element, yet the map
-  // struct lands after the ref pairs and the string-list. It is computable up front from the
-  // counter: it follows the distinct ref-pair slots, two per emitted pair post-dedup, plus the
-  // two string-list slots.
-  const mStructIdxPre = mNextType + rlDistinctPairs * 2 + 2
-  mAssignRefListPairs(mStructIdxPre)
-  mAssignStrListAndMapStructs(mStructIdxPre)
+  mAssignRefListTwins()
+  mAssignRefListPairs()
+  mAssignIntMapStructs()
   mAssignScalarListPairs()
   // The scalar list views (D3028), after every wrapper they subtype or keep a source of.
   let svk = 0
@@ -4379,7 +4370,7 @@ export function mAssignTypeIndices(_n: i32) {
   if mvFail < 0 { return mvFail }
   // Second pass for the TYPED-value map ref-list elements (kind 3, deferred above): now
   // that `mvMapTypeIdx` is minted, point each such element's heap at its own typed map
-  // struct. A mono / atom map element kept `mStructIdxPre` in the first pass (slot -1).
+  // struct. A mono / atom map element kept its key's map struct in the first pass (slot -1).
   let rmf = 0
   while rmf < rlElemName.length {
     if rlElemKindAt(rmf) == RLK_MAP {
@@ -4503,7 +4494,7 @@ function mAssignRefListTwins() {
       const inner = rlElemInnerSlot(rss)
       if inner >= 0 { sig = "9:" + i32ToStr(rlTwin[inner]) }
     } else if rsk == RLK_MAP {
-      // A map element. A mono map element resolves the shared `mStructIdxPre`; a typed-value
+      // A map element. A mono map element resolves its key's map struct; a typed-value
       // one resolves its value slot's `mvMapTypeIdx`, whose twin decision is knowable here from
       // the canonical value slot (`mvCanonRepOf`). A nullable map element strips to its inner
       // map first, as both heap passes do; un-stripped it twins onto a mono-map-element slot.
@@ -4544,20 +4535,13 @@ function mAssignRefListTwins() {
     rlTwin.push(rep)
     rss = rss + 1
   }
-  // Distinct pairs = slots that are their own representative (each mints 2 heap types).
-  let rlDistinctPairs = 0
-  let rdp = 0
-  while rdp < rlElemName.length {
-    if rlTwin[rdp] == rdp { rlDistinctPairs = rlDistinctPairs + 1 }
-    rdp = rdp + 1
-  }
-  rlDistinctPairs
+  0
 }
 
 // Mint one (backing, wrapper) pair per distinct ref-list slot and fill each slot's element heap
-// that is known by now; `mStructIdxPre` is the mono map struct's precomputed index. The nested
-// scalar-list, closure and typed-map elements are left 0 for the later passes to fill.
-function mAssignRefListPairs(mStructIdxPre: i32) {
+// that is known by now; a mono map element mints its key's map struct. The nested scalar-list,
+// closure and typed-map elements are left 0 for the later passes to fill.
+function mAssignRefListPairs() {
   // One (backing, wrapper) pair per DISTINCT ref-list element type, interleaved; a
   // twin (`rlTwin[rs] < rs`) reuses its representative's pair (no new heap type).
   let rs = 0
@@ -4572,25 +4556,16 @@ function mAssignRefListPairs(mStructIdxPre: i32) {
     if rlElemKindAt(rs) == RLK_UNION {
       rlElemHeap[rs] = uBoxIdx
     } else if rlElemKindAt(rs) == RLK_MAP {
-      // A map-struct element. The mono map (i32, boolean or atom value) is the shared
-      // `mStructIdxPre`; a typed-value map element has its own map struct (`mvMapTypeIdx`,
-      // minted after this loop) and is deferred to the second pass below. This is the
-      // position-independent rep: a map element resolves the same struct a binding does.
+      // A map-struct element. The mono map (i32, boolean or atom value) is the struct of the
+      // element's own key rep; a typed-value map element has its own map struct
+      // (`mvMapTypeIdx`, minted after this loop) and is deferred to the second pass below.
+      // This is the position-independent rep: a map element resolves the same struct a
+      // binding does.
       if rlMapElemValSlot(rs) < 0 {
-        // The MONO map of the element's OWN key rep: the string-keyed struct, or its
-        // i32-keyed twin one index later (`mStructI32Idx`, minted immediately after —
-        // the same "computable up front from the counter" reasoning as `mStructIdxPre`).
         const rk = rlElemMapKeyKind(rs)
-        if rk == MAP_KEY_I32 {
-          rlElemHeap[rs] = mStructIdxPre + 1
-        } else if rk == MAP_KEY_I64 {
-          // The i64-keyed struct follows the i32-keyed one, which is minted only when used.
-          let i64At = mStructIdxPre + 1
-          if mI32Used { i64At = i64At + 1 }
-          rlElemHeap[rs] = i64At
-        } else {
-          rlElemHeap[rs] = mStructIdxPre
-        }
+        if rk == MAP_KEY_I32 { rlElemHeap[rs] = mapI32Ty() }
+        else if rk == MAP_KEY_I64 { rlElemHeap[rs] = mapI64Ty() }
+        else { rlElemHeap[rs] = mapTy() }
       } else {
         rlElemHeap[rs] = 0
       }
@@ -4641,35 +4616,11 @@ function mAssignRefListPairs(mStructIdxPre: i32) {
   0
 }
 
-// Mint the string-ref list pair and the string-, i32- and i64-keyed map structs, each only when
-// used; `mStructIdxPre` is the counter position the map struct lands at, precomputed by the caller.
-function mAssignStrListAndMapStructs(mStructIdxPre: i32) {
-  // The string-ref list pair, which the map's `keys` field holds and the prediction counts. A
-  // `string[]` in a program with no map mints it on first ask.
-  if mUsed { mkArrTy() }
-  // The map struct (present only when `mUsed`); `mStructIdxPre` is this counter
-  // position, precomputed above for the ref-pair loop.
-  if mUsed {
-    mStructIdx = mAllocType(TSK_MAP, 0)
-  } else {
-    mStructIdx = mStructIdxPre
-  }
-  // The i32-KEYED map struct, immediately after its string-keyed twin (present only
-  // when `mI32Used`, so no index moves in a program without one). Identical 7 fields
-  // with `keys` re-typed to the i32 list wrapper — both of whose heap types are
-  // already assigned above, so it needs no forward reference.
-  if mI32Used {
-    mStructI32Idx = mAllocType(TSK_MAP_I32, 0)
-  } else {
-    mStructI32Idx = mStructIdx
-  }
-  // The i64-KEYED map struct, after its i32-keyed twin and gated the same way; its `keys` field
-  // is the i64 list wrapper, whose heap types `ia64Used` mints further down.
-  if mI64Used {
-    mStructI64Idx = mAllocType(TSK_MAP_I64, 0)
-  } else {
-    mStructI64Idx = mStructIdx
-  }
+// Mint the i32- and i64-keyed map structs, each only when used. The string-keyed one mints on
+// first ask (`mapTy`).
+function mAssignIntMapStructs() {
+  if mI32Used { mapI32Ty() }
+  if mI64Used { mapI64Ty() }
   0
 }
 
@@ -4781,7 +4732,7 @@ function forceAnnLeafReps(a: string): i32 {
   } else if nameIsF32Array(a) {
     // The f32 pair mints on first read (`fa32Ty`).
   } else if nameIsBareMap(a) {
-    mUsed = true
+    // The map struct mints on first ask (`mapTy`).
   } else if arrElemIs(a, "i32") || arrElemIs(a, "boolean") {
   } else if nameIsString(a) || nameIsNulString(a) {
   } else if nulScalarListKind(a) != null {
@@ -4898,10 +4849,7 @@ function forceAnnLeafRepsOfTy(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return 0 }
   const k = tyAt(t)
   if k is TyPrim { return 0 }
-  if k is TyMap {
-    if k.mSet == 0 { mUsed = true }
-    return 0
-  }
+  if k is TyMap { return 0 }
   if k is TyArray {
     const e = k.aElem
     if tyElemIsStrListLeaf(e) { return 0 }
@@ -5275,7 +5223,6 @@ function collectAResetTables() {
   rlElemNullable = []
   rlElemMapKey = []
   rlElemMvSlot = []
-  mUsed = false
   mI32Used = false
   mI64Used = false
   mvValName = []
@@ -5339,9 +5286,6 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       } else {
         // Same hint, same provenance; every corpus firing agrees.
         rlInternNameTy(nestElem, nestKind, rlHintElemTy(i))
-        // A map inner element (3) rides the map struct plus the i32 list and array its
-        // `index` and `vals` fields use. Same flags as the `arrLitIsRef` arm.
-        if nestKind == RLK_MAP { mUsed = true }
       }
     }
     // D1511 — the same hole at the shape element kind: `const xs = []` then
@@ -5389,11 +5333,6 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
         )
       }
       if elemKind == RLK_STRUCT { arrLitInstElemRows(nd) }
-      // Asked once more, after the intern above, and read by every flag rung below.
-      const kAfter = arrLitElemKind(i, -1)
-      // A map element (kind 3) forces the map struct, as an annotated map element's `k == 3`
-      // arm in `ensureRefElem` does; a bare literal never reaches that arm.
-      if kAfter == RLK_MAP { mUsed = true }
     }
   } else if arrLitIsStr(i, -1) {
     // A STRING-element literal is a string-ref list — the same wrapper/backing
@@ -5517,11 +5456,9 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     } else if nameIsString(frRet) {
     }
   } else if nameIsBareMap(nd.tyName) && !typeRefIsRecord(i) {
-    // A `{[string]: i32}` annotation is a string-keyed map: the map struct, the keys list
-    // over a string-ref backing, and the i32 vals list.
+    // A `{[string]: i32}` annotation is a string-keyed map, whose struct mints on first ask.
     // Stays on the name here, since this walk sees interior `TypeRef`s the arena does not.
-    mUsed = true
-    // An integer-keyed map additionally forces its own map struct — its `keys` field is the
+    // An integer-keyed map forces its own map struct — its `keys` field is the
     // integer list, not the string-ref list — and its probe helper. The arena where it covers
     // the node, the name where it does not: `nodeTyMapKeyKindSpan` answers the string kind both
     // for a string key and for "no type for this node", and this flag must not under-mint.
@@ -5545,10 +5482,8 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     }
   } else if nulMapInnerName(nd.tyName) != "" {
     // A `{[string]: V} | null` annotation collects the same map types as its non-null inner
-    // map, even when the program never `Map()`-constructs one: `mUsed` must be set so the
-    // `$mapStruct` heap type exists for the `(ref null $mapStruct)` cell and the narrowed map
-    // ops. Interns the inner value's mv slot too.
-    mUsed = true
+    // map, even when the program never `Map()`-constructs one, and interns the inner value's mv
+    // slot too.
     // The arena where it covers the node, the name where it does not, and the coverage test
     // is the point: `nodeTyMapKeyKindSpan` answers the string kind both for a string key and
     // for "no type for this node", while `markMapKeyUsed` sets a minting flag whose under-answer
@@ -5661,7 +5596,6 @@ function collectAFieldTables() {
   while sfi < sFieldTypes.length {
     if sFieldTypes[sfi] == FC_MAP || sFieldTypes[sfi] == FC_NUL_MAP {
       // Code 29, the nullable map field, interns the same mv value slot as its non-null twin.
-      mUsed = true
       // The field row's key, threaded into the intern: an mv slot's identity is the (key, value)
       // pair, so a `{[i32]: string}` field must intern the i32-keyed slot. Interning the
       // string-keyed one and then resolving the i32-keyed one is the loud "map value type has no
@@ -5751,7 +5685,6 @@ function internArmFieldMapSlot(ufi: i32) {
     // collectable from this file's own column, and the flags for a nullable map field on a
     // union arm otherwise arrive only by accident, from an orphaned field `TypeRef` reaching
     // the `nulMapInnerName` rung in the annotation walk.
-    mUsed = true
     // The struct pass's key-and-flag rule, one table over; see its header there. Both writes
     // are jointly, not severally, necessary: either one alone is covered by the struct row an
     // inline union arm must spell to be narrowed. Kept anyway, because that covering row
@@ -5821,11 +5754,9 @@ export function collectA(_stmts: i32[]) {
         const cf = nodeAt(nd.callFn)
         if cf is Ident && collectACallIntrinsic(cf.identName) {
           // `fromCodePoints(xs)` builds a fresh string from an i32 list.
-          // An un-annotated `Map()` (usage-inferred binding) still constructs the map
-          // struct — force the same types a `{[string]: i32}` annotation does. `Set()`
-          // is the same 7-field map struct, so it forces the IDENTICAL types.
+          // An un-annotated `Map()`/`Set()` (usage-inferred binding) still constructs the
+          // map struct, as a `{[string]: i32}` annotation does.
           if cf.identName == "Map" || cf.identName == "Set" {
-            mUsed = true
             // An UN-annotated `Map()`/`Set()` whose key the checker inferred as i32
             // (`const m = Map()` then `m.set(1, 2)`) has no map spelling anywhere in the
             // arena for the `TypeRef` walk below to read, so the KEY comes off the

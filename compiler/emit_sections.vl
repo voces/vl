@@ -418,6 +418,7 @@ import {
   gMapSetTy,
   gMapSetTyBase,
   gMapSetTyN,
+  gMapSetTyRows,
   gMaxMemPages,
   gMemLogIdx,
   gNeedsAsFail,
@@ -485,7 +486,6 @@ import {
   mStructI32Idx,
   mStructI64Idx,
   mStructIdx,
-  mUsed,
   mapDeleteMerge,
   mapDeleteNote,
   mapDeleteReset,
@@ -4222,9 +4222,10 @@ function tsMapStructBody(keysWrap: i32) {
 }
 
 // Whether map shape `sh` (-1, -4, or an mv slot) has every heap type its compaction helper
-// names, asked without recording a failure: a slot no map op resolved gets no helper.
+// names, asked without recording a failure: a slot no map op resolved gets no helper. The
+// string-keyed struct mints on first ask.
 function mapShapeCompactable(sh: i32): boolean {
-  if sh == -1 { return mUsed }
+  if sh == -1 { return true }
   if sh == -4 { return mI32Used }
   if sh == -6 { return mI64Used }
   if sh < 0 || sh >= mvMapTypeIdx.length { return false }
@@ -6494,7 +6495,7 @@ function assignSharedHelperIndices(helpBase: i32) {
   // One compaction helper per map shape, since each names its shape's heap types.
   gHelpMapResync = -1
   gHelpMapCompact = []
-  if gMapDeletes && mUsed {
+  if gMapDeletes {
     let ck = 0
     while ck < mvMapTypeIdx.length + 3 {
       if mapShapeCompactable(mapCompactRowShape(ck)) {
@@ -6564,11 +6565,12 @@ function assignSharedHelperIndices(helpBase: i32) {
     gHelpStrFill = helpBase + nHelpers
     nHelpers = nHelpers + 1
   }
-  // The map store helpers reserve only a functype per shape here. Each takes a function index,
-  // after every helper above and before the thunks, when a set site first calls it, so a shape
-  // no site sets costs a functype and no body. An optimised build reserves none, so every set
-  // stores inline where binaryen can scalarise the map.
+  // The map store helpers reserve a row per shape here (-2). Each takes its functype ordinal and
+  // a function index, after every helper above and before the thunks, when a set site first
+  // calls it, so a shape no site sets costs nothing. An optimised build reserves none, so every
+  // set stores inline where binaryen can scalarise the map.
   gMapSetTy = []
+  gMapSetTyRows = []
   gMapSetFn = []
   gTailFnRows = []
   gTailHelpTyN = 0
@@ -6578,8 +6580,7 @@ function assignSharedHelperIndices(helpBase: i32) {
   let sr = 0
   while sr < mvMapTypeIdx.length + 3 {
     if gOptimized == 0 && mapSetRowable(mapCompactRowShape(sr)) {
-      gMapSetTy.push(gMapSetTyN)
-      gMapSetTyN = gMapSetTyN + 1
+      gMapSetTy.push(-2)
     } else {
       gMapSetTy.push(-1)
     }
@@ -6597,7 +6598,7 @@ function mapSetRowable(sh: i32): boolean {
   const k = mapShapeKeyKind(sh)
   if k == MAP_KEY_I32 { return gHelpMapProbeI32 >= 0 }
   if k == MAP_KEY_I64 { return gHelpMapProbeI64 >= 0 && gHelpMapProbeI32 >= 0 }
-  mUsed
+  true
 }
 
 // ── emitProgram pass manager ──
@@ -8578,7 +8579,7 @@ function tsStrListWrap() {
   tsListWrapBody(mkArrTy())
 }
 
-// The string-keyed map struct — the open-addressing rep documented at `mUsed`, whose field
+// The string-keyed map struct — the open-addressing rep documented at `mStructIdx`, whose field
 // order matches the host's general-purpose rep (`compiler/builtins/maps.ts`).
 function tsMap() {
   tsEntryAt(mStructIdx, "map")
@@ -9040,11 +9041,8 @@ function tsEmitHelperFuncTypes() {
   if gHelpStrFill >= 0 {
     helpFuncType("is", "i") // __str_fill__: (segment offset, pool string) -> next offset
   }
-  let sft = 0
-  while sft < gMapSetTy.length {
-    if gMapSetTy[sft] >= 0 { mapSetFuncType(mapCompactRowShape(sft)) }
-    sft = sft + 1
-  }
+  // In ordinal order, which is the order the set sites first called each row.
+  for sfr in gMapSetTyRows { mapSetFuncType(mapCompactRowShape(sfr)) }
   let eft = 0
   while eft < gEqHelpTy.length {
     if gEqHelpTy[eft] >= 0 { eqHelpFuncType(eft) }
