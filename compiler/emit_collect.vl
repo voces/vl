@@ -447,6 +447,8 @@ import {
   rlElemName,
   rlElemNullable,
   rlElemTyIx,
+  rlLateRowsOff,
+  rlLateRowsOn,
   rlTwin,
   rlWrAns,
   rlWrSlots,
@@ -4329,11 +4331,7 @@ export function mAssignTypeIndices(_n: i32) {
   // mints them), so the index is real here.
   let rsfix = 0
   while rsfix < rlElemName.length {
-    if rlElemKindAt(rsfix) == RLK_STR_LIST { rlElemHeap[rsfix] = mkListTy() }
-    else if rlElemKindAt(rsfix) == RLK_F64_LIST { rlElemHeap[rsfix] = fl64Ty() }
-    else if rlElemKindAt(rsfix) == RLK_F32_LIST { rlElemHeap[rsfix] = fl32Ty() }
-    else if rlElemKindAt(rsfix) == RLK_I64_LIST { rlElemHeap[rsfix] = il64Ty() }
-    else if rlElemKindAt(rsfix) == RLK_U8_LIST { rlElemHeap[rsfix] = bl8Ty() }
+    rlInnerListHeap(rsfix)
     rsfix = rsfix + 1
   }
   mAssignClosureTypes()
@@ -4354,8 +4352,50 @@ export function mAssignTypeIndices(_n: i32) {
     }
     rmf = rmf + 1
   }
+  rlLateRowsOn(rlPairsLate)
+  rlPairsLate(rlElemName.length)
   // The functypes follow; the first lands at the current counter (`typeOffset`).
   mNextType
+}
+
+// A nested scalar-list element's heap: the inner list's wrapper, minted on this ask.
+function rlInnerListHeap(rs: i32) {
+  const k = rlElemKindAt(rs)
+  if k == RLK_STR_LIST { rlElemHeap[rs] = mkListTy() }
+  else if k == RLK_F64_LIST { rlElemHeap[rs] = fl64Ty() }
+  else if k == RLK_F32_LIST { rlElemHeap[rs] = fl32Ty() }
+  else if k == RLK_I64_LIST { rlElemHeap[rs] = il64Ty() }
+  else if k == RLK_U8_LIST { rlElemHeap[rs] = bl8Ty() }
+}
+
+// The rows below `n` that the pair assignment did not cover: each takes its twin and pair, and
+// the element heap the later passes fill, at once. A closure or typed-map element whose struct
+// is not minted fails loudly rather than back onto heap 0.
+function rlPairsLate(n: i32): i32 {
+  while rlTwin.length < n {
+    const rs = rlTwin.length
+    rlTwin.push(rlTwinRepOf(rs))
+    rlPairMint(rs)
+    rlInnerListHeap(rs)
+    const k = rlElemKindAt(rs)
+    if k == RLK_CLOSURE {
+      if fnValUsed {
+        rlElemHeap[rs] = cloStructIdx
+      } else {
+        emitFail("emitProgram: a late closure list row has no closure struct")
+      }
+    } else if k == RLK_MAP {
+      const mmv = rlMapElemValSlot(rs)
+      if mmv >= 0 {
+        if mmv < mvMapTypeIdx.length && mvMapTypeIdx[mmv] > 0 {
+          rlElemHeap[rs] = mvMapTypeIdx[mmv]
+        } else {
+          emitFail("emitProgram: a late map list row has no value map struct")
+        }
+      }
+    }
+  }
+  0
 }
 
 // Mint the standalone struct heap types, in `structEmitOrder`, into `sHeapIdx`; a structural
@@ -4442,145 +4482,162 @@ function mAssignUnionHeaps() {
   0
 }
 
+// Each ref-list slot's twin signature, the column `rlTwinRepOf` matches a slot against.
+let rlTwinSig: string[] = []
+
 // Assign every ref-list slot its twin representative into `rlTwin`, from an element-heap
-// signature knowable before any pair is minted; returns the count of distinct pairs.
+// signature knowable before any pair is minted.
 function mAssignRefListTwins() {
-  // Ref-list slot dedup, the `sTwin` analogue: two slots emit identical (backing, wrapper) pairs
-  // exactly when they resolve to the same element heap, so after struct dedup `A[]` and `B[]`
-  // must share one wrapper. `rlTwin[s]` is `s`'s representative, from a signature knowable up
-  // front; a map-array element and any unresolved element stay unique and are never merged.
   rlTwin = []
-  const rlSig: string[] = []
+  rlTwinSig = []
   let rss = 0
   while rss < rlElemName.length {
-    const rsk = rlElemKindAt(rss)
-    let sig = "u:" + i32ToStr(rss) // default: unique (no dedup)
-    if rsk == RLK_UNION {
-      sig = "h:" + i32ToStr(uBoxIdx)
-    } else if rsk == RLK_I32_LIST {
-      sig = "h:" + i32ToStr(lTy())
-    } else if rsk == RLK_CLOSURE || isScalarBackedListRep(rlElemListRep(rsk)) {
-      sig = "k:" + i32ToStr(rsk)
-    } else if rsk == RLK_REF_LIST {
-      const inner = rlElemInnerSlot(rss)
-      if inner >= 0 { sig = "9:" + i32ToStr(rlTwin[inner]) }
-    } else if rsk == RLK_MAP {
-      // A map element. A mono map element resolves its key's map struct; a typed-value
-      // one resolves its value slot's `mvMapTypeIdx`, whose twin decision is knowable here from
-      // the canonical value slot (`mvCanonRepOf`). A nullable map element strips to its inner
-      // map first, as both heap passes do; un-stripped it twins onto a mono-map-element slot.
-      const mmv = rlMapElemValSlot(rss)
-      if mmv < 0 {
-        // MONO on BOTH key reps, and they are two DIFFERENT structs — so the mono sig
-        // has to name the key or an `{[i32]: i32}` element would twin onto a
-        // `{[string]: i32}` one and take its (string-ref keys) struct.
-        sig = "3:m"
-        const rkk = rlElemMapKeyKind(rss)
-        if rkk == MAP_KEY_I32 { sig = "3:mi32" }
-        if rkk == MAP_KEY_I64 { sig = "3:mi64" }
-      } else {
-        sig = "3:" + i32ToStr(mvCanonRepOf(mmv))
-      }
-    } else {
-      // Struct, nullable-struct or variant element — the `else` heap resolution below.
-      // `rlElemStructRow` peels the `| null` niche off the arena type it resolves, with the
-      // recorded element name as the fall-through, so an inline-shape element spelling keys the
-      // same post-twin heap its declared twin does.
-      const esi = rlElemStructRow(rss)
-      if esi >= 0 {
-        sig = "h:" + i32ToStr(sHeapIdx[esi])
-      } else {
-        // The concrete-variant fall-through — `rlElemVariantHeap`, which is also the heap
-        // pass's, and which carries this leg's note about the name peel.
-        const evh = rlElemVariantHeap(rss)
-        if evh >= 0 { sig = "h:" + i32ToStr(evh) }
-      }
-    }
-    rlSig.push(sig)
-    let rep = rss
-    let sj = 0
-    while sj < rss {
-      if rlSig[sj] == sig { rep = sj; sj = rss }
-      sj = sj + 1
-    }
-    rlTwin.push(rep)
+    rlTwin.push(rlTwinRepOf(rss))
     rss = rss + 1
   }
   0
+}
+
+// The twin representative of slot `rs`: the first earlier slot with its signature, else `rs`.
+// Records the signature, so a slot minted after the pairs finds its twin the same way.
+function rlTwinRepOf(rs: i32): i32 {
+  const sig = rlTwinSigOf(rs)
+  rlTwinSig.push(sig)
+  let sj = 0
+  while sj < rs {
+    if rlTwinSig[sj] == sig { return sj }
+    sj = sj + 1
+  }
+  rs
+}
+
+// Two slots emit identical (backing, wrapper) pairs exactly when they resolve to the same
+// element heap, so the signature names that heap; a map-array element and any unresolved
+// element are unique and never merged.
+function rlTwinSigOf(rs: i32): string {
+  const rsk = rlElemKindAt(rs)
+  let sig = "u:" + i32ToStr(rs)
+  if rsk == RLK_UNION {
+    sig = "h:" + i32ToStr(uBoxIdx)
+  } else if rsk == RLK_I32_LIST {
+    sig = "h:" + i32ToStr(lTy())
+  } else if rsk == RLK_CLOSURE || isScalarBackedListRep(rlElemListRep(rsk)) {
+    sig = "k:" + i32ToStr(rsk)
+  } else if rsk == RLK_REF_LIST {
+    const inner = rlElemInnerSlot(rs)
+    if inner >= 0 { sig = "9:" + i32ToStr(rlTwin[inner]) }
+  } else if rsk == RLK_MAP {
+    // A map element. A mono map element resolves its key's map struct; a typed-value
+    // one resolves its value slot's `mvMapTypeIdx`, whose twin decision is knowable here from
+    // the canonical value slot (`mvCanonRepOf`). A nullable map element strips to its inner
+    // map first, as both heap passes do; un-stripped it twins onto a mono-map-element slot.
+    const mmv = rlMapElemValSlot(rs)
+    if mmv < 0 {
+      // MONO on BOTH key reps, and they are two DIFFERENT structs — so the mono sig
+      // has to name the key or an `{[i32]: i32}` element would twin onto a
+      // `{[string]: i32}` one and take its (string-ref keys) struct.
+      sig = "3:m"
+      const rkk = rlElemMapKeyKind(rs)
+      if rkk == MAP_KEY_I32 { sig = "3:mi32" }
+      if rkk == MAP_KEY_I64 { sig = "3:mi64" }
+    } else {
+      sig = "3:" + i32ToStr(mvCanonRepOf(mmv))
+    }
+  } else {
+    // Struct, nullable-struct or variant element — the `else` heap resolution below.
+    // `rlElemStructRow` peels the `| null` niche off the arena type it resolves, with the
+    // recorded element name as the fall-through, so an inline-shape element spelling keys the
+    // same post-twin heap its declared twin does.
+    const esi = rlElemStructRow(rs)
+    if esi >= 0 {
+      sig = "h:" + i32ToStr(sHeapIdx[esi])
+    } else {
+      // The concrete-variant fall-through — `rlElemVariantHeap`, which is also the heap
+      // pass's, and which carries this leg's note about the name peel.
+      const evh = rlElemVariantHeap(rs)
+      if evh >= 0 { sig = "h:" + i32ToStr(evh) }
+    }
+  }
+  sig
 }
 
 // Mint one (backing, wrapper) pair per distinct ref-list slot and fill each slot's element heap
 // that is known by now; a mono map element mints its key's map struct. The nested scalar-list,
 // closure and typed-map elements are left 0 for the later passes to fill.
 function mAssignRefListPairs() {
-  // One (backing, wrapper) pair per DISTINCT ref-list element type, interleaved; a
-  // twin (`rlTwin[rs] < rs`) reuses its representative's pair (no new heap type).
   let rs = 0
   while rs < rlElemName.length {
-    if rlTwin[rs] < rs {
-      rlBackIdx[rs] = rlBackIdx[rlTwin[rs]]
-      rlWrapIdx[rs] = rlWrapIdx[rlTwin[rs]]
-    } else {
-      rlBackIdx[rs] = mAllocType(TSK_REF_BACK, rs)
-      rlWrapIdx[rs] = mAllocType(TSK_REF_WRAP, rs)
-    }
-    if rlElemKindAt(rs) == RLK_UNION {
-      rlElemHeap[rs] = uBoxIdx
-    } else if rlElemKindAt(rs) == RLK_MAP {
-      // A map-struct element resolves the struct a binding does. A mono map (i32, boolean or atom
-      // value) is its key rep's struct; a typed-value map has its own (`mvMapTypeIdx`, minted
-      // after this loop) and is deferred to the second pass below.
-      if rlMapElemValSlot(rs) < 0 {
-        const rk = rlElemMapKeyKind(rs)
-        if rk == MAP_KEY_I32 { rlElemHeap[rs] = mapI32Ty() }
-        else if rk == MAP_KEY_I64 { rlElemHeap[rs] = mapI64Ty() }
-        else { rlElemHeap[rs] = mapTy() }
-      } else {
-        rlElemHeap[rs] = 0
-      }
-    } else if rlElemKindAt(rs) == RLK_I32_LIST {
-      // An `i32[][]` slot's element is the i32-list WRAPPER, minted above.
-      rlElemHeap[rs] = lTy()
-    } else if (
-      rlElemKindAt(rs) == RLK_STR_LIST
-      || rlElemKindAt(rs) == RLK_F64_LIST
-      || rlElemKindAt(rs) == RLK_I64_LIST
-      || rlElemKindAt(rs) == RLK_F32_LIST
-      || rlElemKindAt(rs) == RLK_U8_LIST
-    ) {
-      // string[][] / f64[][] / i64[][]: the element is the inner list's WRAPPER
-      // (`mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) — but those wrappers are allocated AFTER
-      // this loop, so a second pass (below) fills these heaps once they exist.
-      rlElemHeap[rs] = 0
-    } else if rlElemKindAt(rs) == RLK_REF_LIST {
-      // A struct-LIST value (`S[]`): the element is the inner struct-list WRAPPER, the ref-list
-      // wrapper of the inner `S` slot (interned at a LOWER index, so its `rlWrapIdx` is set).
-      // A slot whose element list left its element open has no inner slot (D9662).
-      const ins = rlElemInnerSlot(rs)
-      if ins < 0 {
-        emitFail(
-          "emitProgram: a list-of-lists element has no inner list shape: "
-            + rlElemName[rs],
-        )
-      } else {
-        rlElemHeap[rs] = rlWrapIdx[ins]
-      }
-    } else {
-      // A NULLABLE-struct element (`(P | null)[]`, slot key "P | null"): the backing is a
-      // `(ref null $P)` over the bare struct — `rlElemStructRow` peels the `| null`
-      // (structurally) to resolve P's heap, and its name fall-through bridges an
-      // inline-shape spelling to its declared twin.
-      const esi = rlElemStructRow(rs)
-      if esi >= 0 {
-        rlElemHeap[rs] = sHeapIdx[esi]
-      } else {
-        // A concrete-VARIANT element (`Cat[]`): the element heap is the variant struct
-        // `variantHeap(vi)` (no standalone `sNames` entry — variants ride the union's structs).
-        const evh = rlElemVariantHeap(rs)
-        if evh >= 0 { rlElemHeap[rs] = evh } else { rlElemHeap[rs] = 0 }
-      }
-    }
+    rlPairMint(rs)
     rs = rs + 1
+  }
+  0
+}
+
+// Slot `rs`'s pair (a twin reuses its representative's) and the element heap known before the
+// inner scalar wrappers, the closure struct and the typed map structs are minted.
+function rlPairMint(rs: i32) {
+  if rlTwin[rs] < rs {
+    rlBackIdx[rs] = rlBackIdx[rlTwin[rs]]
+    rlWrapIdx[rs] = rlWrapIdx[rlTwin[rs]]
+  } else {
+    rlBackIdx[rs] = mAllocType(TSK_REF_BACK, rs)
+    rlWrapIdx[rs] = mAllocType(TSK_REF_WRAP, rs)
+  }
+  if rlElemKindAt(rs) == RLK_UNION {
+    rlElemHeap[rs] = uBoxIdx
+  } else if rlElemKindAt(rs) == RLK_MAP {
+    // A map-struct element resolves the struct a binding does. A mono map (i32, boolean or atom
+    // value) is its key rep's struct; a typed-value map has its own (`mvMapTypeIdx`, minted
+    // after this loop) and is deferred to the second pass below.
+    if rlMapElemValSlot(rs) < 0 {
+      const rk = rlElemMapKeyKind(rs)
+      if rk == MAP_KEY_I32 { rlElemHeap[rs] = mapI32Ty() }
+      else if rk == MAP_KEY_I64 { rlElemHeap[rs] = mapI64Ty() }
+      else { rlElemHeap[rs] = mapTy() }
+    } else {
+      rlElemHeap[rs] = 0
+    }
+  } else if rlElemKindAt(rs) == RLK_I32_LIST {
+    // An `i32[][]` slot's element is the i32-list WRAPPER, minted above.
+    rlElemHeap[rs] = lTy()
+  } else if (
+    rlElemKindAt(rs) == RLK_STR_LIST
+    || rlElemKindAt(rs) == RLK_F64_LIST
+    || rlElemKindAt(rs) == RLK_I64_LIST
+    || rlElemKindAt(rs) == RLK_F32_LIST
+    || rlElemKindAt(rs) == RLK_U8_LIST
+  ) {
+    // string[][] / f64[][] / i64[][]: the element is the inner list's WRAPPER
+    // (`mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) — but those wrappers are allocated AFTER
+    // this loop, so a second pass (below) fills these heaps once they exist.
+    rlElemHeap[rs] = 0
+  } else if rlElemKindAt(rs) == RLK_REF_LIST {
+    // A struct-LIST value (`S[]`): the element is the inner struct-list WRAPPER, the ref-list
+    // wrapper of the inner `S` slot (interned at a LOWER index, so its `rlWrapIdx` is set).
+    // A slot whose element list left its element open has no inner slot (D9662).
+    const ins = rlElemInnerSlot(rs)
+    if ins < 0 {
+      emitFail(
+        "emitProgram: a list-of-lists element has no inner list shape: "
+          + rlElemName[rs],
+      )
+    } else {
+      rlElemHeap[rs] = rlWrapIdx[ins]
+    }
+  } else {
+    // A NULLABLE-struct element (`(P | null)[]`, slot key "P | null"): the backing is a
+    // `(ref null $P)` over the bare struct — `rlElemStructRow` peels the `| null`
+    // (structurally) to resolve P's heap, and its name fall-through bridges an
+    // inline-shape spelling to its declared twin.
+    const esi = rlElemStructRow(rs)
+    if esi >= 0 {
+      rlElemHeap[rs] = sHeapIdx[esi]
+    } else {
+      // A concrete-VARIANT element (`Cat[]`): the element heap is the variant struct
+      // `variantHeap(vi)` (no standalone `sNames` entry — variants ride the union's structs).
+      const evh = rlElemVariantHeap(rs)
+      if evh >= 0 { rlElemHeap[rs] = evh } else { rlElemHeap[rs] = 0 }
+    }
   }
   0
 }
@@ -5167,6 +5224,7 @@ function collectArrLitScalar(ix: i32) {
 // The ref-list and map-value row tables back to empty, once per compile. A row any pass mints
 // after it stands until the module is written.
 export function rlMvTablesReset() {
+  rlLateRowsOff()
   rlElemName = []
   rlElemKey = []
   rlElemTyIx = []
