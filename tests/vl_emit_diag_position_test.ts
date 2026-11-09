@@ -229,27 +229,20 @@ Deno.test({
 });
 
 // A refusal raised before any body is lowered (D15154): a refusal mono raises while it pins a call
-// is anchored there, at the generic argument of `run(add)` on line 15 (D14843's witness, its copy
-// also called in the nested function, since the copy only handed on runs). The collect phase has no known check-clean refusal left (D15150, the last, now
-// runs); add the next one found here, anchored at its declaration. The instance case above is the
-// restore's control: `take(u)` is instantiated before `take`'s body refuses, and a cursor left
-// armed would name the call instead of `take`.
-const MONO_WITNESS = `function add(a, b) { return a + b }
-function mul(a, b) { return a * b }
-function apply2(g) {
-  print(g(1, 2))
-  print(g(1.5, 2.5))
+// is anchored there, at the generic argument of `mid(same, same, 1)` on line 9 (D12218's witness,
+// `mid`'s parameter called at two function types). The collect phase has no known check-clean
+// refusal left (D15150, the last, now runs); add the next one found here, anchored at its
+// declaration. The instance case above is the restore's control: `take(u)` is instantiated before
+// `take`'s body refuses, and a cursor left armed would name the call instead of `take`.
+const MONO_WITNESS = `function same<T>(k: T): T { k }
+function mid<F>(a: F, b: F, n: i32) {
+  print(a("x"))
+  print(b(n))
+  const fs = [a]
+  print(fs.length)
+  if n > 0 { mid(b, a, n - 1) }
 }
-function run(h) {
-  const hh = h
-  function inner() {
-    for f in [apply2] { f(hh) }
-    print(hh(10, 20))
-  }
-  inner()
-}
-run(add)
-run(mul)
+mid(same, same, 1)
 `;
 
 Deno.test({
@@ -258,7 +251,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const cases: { name: string; src: string; line: number }[] = [
-      { name: "monomorphize", src: MONO_WITNESS, line: 15 },
+      { name: "monomorphize", src: MONO_WITNESS, line: 9 },
     ];
     for (const c of cases) {
       const dir = await Deno.makeTempDir({ prefix: "vl_emit_early_" });
