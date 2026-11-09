@@ -59,5 +59,5 @@ row cannot be `rdSlot` until the two struct-row readers agree.
 | --- | --- | --- |
 | fixpoint seed, on `17fc832d` | 6,590,858 | 6,588,786 (−2,072) |
 | sweep, 23,799 programs | | 23,799 same, 0 bytes-only, 0 output movers |
-| fixpoint seed, merged with `18a749a0` | 6,591,066 | 6,588,981 (−2,085) |
+| fixpoint seed, merged with `a7daa10c` | 6,591,293 | 6,589,205 (−2,088) |
 | sweep on the merged tree, 23,800 programs | | 23,800 same, 0 bytes-only, 0 output movers |

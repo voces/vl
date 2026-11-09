@@ -8,7 +8,7 @@ also updates the target doc's status section.
 
 Newest first:
 
-- [2026-11-09-step7-fret-repof](2026-11-09-step7-fret-repof.md): Step 7: the un-annotated `fRet*` columns read off `repOf`; five steps between them deleted, seed −2,085.
+- [2026-11-09-step7-fret-repof](2026-11-09-step7-fret-repof.md): Step 7: the un-annotated `fRet*` columns read off `repOf`; five steps between them deleted, seed −2,088.
 - [2026-11-09-step7-union-arm-rows-minted-on-read](2026-11-09-step7-union-arm-rows-minted-on-read.md): Step 7: a union's ref-array arm row mints at its first read; the union pass's element intern is deleted.
 - [2026-11-09-step7-map-slots-minted-on-read](2026-11-09-step7-map-slots-minted-on-read.md): Step 7: the collectA#2 pass is deleted; map value slots mint on read (#6992).
 - [2026-11-09-step7-typeref-arm-typed-readers-wip](2026-11-09-step7-typeref-arm-typed-readers-wip.md): Step 7: collectA#2's TypeRef arm mints on read; D2273, D4712, D13940 run (#6985).
