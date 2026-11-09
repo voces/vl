@@ -16,6 +16,9 @@ compiler wraps each classifier, runs it and a typed twin, and counts `SH <fn> =`
 | `letInitIsNulLitBox` | `nodeRepIsNulAtom`, and the read's storage reps as `union` | 167,178 | 0 |
 | `identCellVKind` | the read's storage type's rep kind | 4,228,236 | 31,711 |
 | `identStoreVKind` | the same | 515,153 | 4,548 |
+| `globalCellKindGo` | `letCellKind(letIx, -1)` | 48,267 | 0 |
+| `letCellSlot` | the type's slot for a `struct` or `variant` cell | 216,097 | 10 |
+| `cloValueCallRetKind` | a `Member` callee typed as a function | 38,674 | 788 |
 
 The first `letCellKindGo` twin's 162 disagreements fall into three groups. The bundle holder
 (`holderRecordSigs`, D15144) gives 132 `struct/closure` and `struct/nulclosure`. An annotated
@@ -32,6 +35,9 @@ The second twin keeps the bundle and annotation rungs, which are typed, and drop
   union box. It no longer looks at the node's shape.
 * `exprIsStrMethod` asks whether the receiver's rep is `str`. It no longer calls `exprString`'s
   post-mono ladder.
+* `globalCellKindGo` is deleted. `globalCellKind` memoises `letCellKind(letIx, -1)`. Its `nulnone`
+  and `v128` rungs never answered differently. `letInfersV128` and `retV128Flag` have no caller
+  left and are deleted.
 
 **The checker's two niche side tables are deleted.** `inferLetNulStrIx` and `inferLetNulBoolIx`
 recorded un-annotated `string | null` and `boolean | null` if-bindings for the emitter. The string
@@ -39,8 +45,10 @@ one had no reader left, and `letNulBool` was the bool one's only reader. They we
 back. Their truncation, mark fields and `PRB_TABLES` rows go too, and so does `isNulStringTy`,
 whose only caller recorded the string table.
 
-**Census hygiene.** `letBindRepKind`, `listOfKind`, `letCellKindGo` and `exprIsStrMethod` go to
-`NOT_BLIND`. `readCallStoreKind` reads the call's rep, so the census counts it as reading the arena
+**Census hygiene.** `letBindRepKind`, `listOfKind`, `letCellKindGo`, `exprIsStrMethod`,
+`letCellKind` and `globalCellKind` go to `NOT_BLIND`. The last two are memos over typed answers.
+`bindingIsLitAtom` (`nodeRepIsAtom`, `letBindIsAtom`) and `callIsMapFilter` (`nodeTyAt`) already
+read only typed facts. The census's tell list does not name those readers, so they go too. `readCallStoreKind` reads the call's rep, so the census counts it as reading the arena
 and its probe goes. Its literal-atom and union rungs stand. The census prints no consistency
 warnings.
 
@@ -49,13 +57,17 @@ for the CELL, not the read. A read of a function name has no cell (`null/closure
 returned bundle's holder is a record (`struct/closure` 3,059). The 11,632 `null/i32` are reads the
 legacy ladder finds no cell for, not yet ablated. Their twin is the binding's `letBindRepKind`,
 reached through the read's declaration. That is `identDeclOf`, which lane w233 owns.
+`letCellSlot`'s 10 are bindings whose `struct` or `variant` row comes from the initializer
+(`structIndexOfLet`, `letObjLitVariantIdx`) where the type's slot is -1. `cloValueCallRetKind`'s 788
+are mostly `null/i32`, `null/str` and `null/f64`: a field the type calls a function where
+`memberIsClosure` says it is not one.
 
 **Census** (`classifier-census.vl`):
 
 | tree | probed | post-only | pre-only | both | uncalled | warnings |
 | --- | --- | --- | --- | --- | --- | --- |
 | master `d4901c70` | 62 | 62 | 0 | 0 | 0 | 3 |
-| this PR | 58 | 58 | 0 | 0 | 0 | 0 |
+| this PR | 53 | 53 | 0 | 0 | 0 | 0 |
 
 **Proof.** Both sides are fixpoint seeds: base `d4901c70` is 6,589,101 bytes and this PR is
-6,587,787 (−1,314). The sweep is in the PR body.
+6,587,312 (−1,789). The sweep is in the PR body.

@@ -287,7 +287,6 @@ import {
   parentLoopVarOf,
   placeNarrowKeyOf,
   pushUniqueAtom,
-  retV128Flag,
   setShapeOfTy,
   tyIsFuncType,
   tyIsStructWithUnionField,
@@ -3037,12 +3036,9 @@ let lckVal: VKind[] = []
 let lckGenSeen = 0
 let lckDepth = 0
 
-// The `fbValtype` kind of the cell a `LetDecl` binds inside function `fnIx` — the
-// annotation's kind through the shared annotation ladder, else the initializer's. The local
-// storage class's answer to what `globalCellKind` answers for a module global, kept here
-// because `emit_collect.vl` cannot be imported back into this file.
+// The `fbValtype` kind of the cell `LetDecl` `letIx` binds inside function `fnIx`
+// (`letCellKindGo`), memoised per binding and instance; -1 is the module.
 export function letCellKind(letIx: i32, fnIx: i32): VKind {
-  if clsCensusOn { clsCensusEnter("letCellKind") }
   if letIx < 0 || letIx >= P.nodes.length { return letCellKindGo(letIx, fnIx) }
   if lckDepth == 0 {
     if gckStale() { gckDrop() }
@@ -5308,19 +5304,6 @@ export function exprIsV128(exprIx: i32, fnIx: i32) {
   exprScalarWidth(exprIx, fnIx) == "v128"
 }
 
-// True if the `LetDecl` at `letIx` binds a v128 — annotated with `v128` or a brand over it, or
-// un-annotated with an init that yields a vector. The one route a `v128` local is classified through.
-export function letInfersV128(letIx: i32, fnIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    // An annotated binding (`const v: F32x4 = …`): the brand is erased to its `v128` base.
-    if d.letType >= 0 { return retV128Flag(d.letType) == 1 }
-    if d.letInit < 0 { return false }
-    return exprIsV128(d.letInit, fnIx)
-  }
-  false
-}
-
 // The leaf kinds of the arithmetic spine at `exprIx` (parens, unary `-`, `+ - * / %`): bit 1 =
 // an f32 leaf, bit 2 = a genuine f64 leaf. A bare literal is neither, as it re-encodes at the
 // operation's width; an operation over literals alone is a genuine f64, as the checker and
@@ -6816,8 +6799,9 @@ function globalReadAsk(sid: i32, letIx: i32, q: i32): boolean {
   v
 }
 
+// The `fbValtype` kind of a module global's cell: a local's cell kind (`letCellKind`), read in
+// no frame, memoised per global on the walk generation.
 export function globalCellKind(letIx: i32): VKind {
-  if clsCensusOn { clsCensusEnter("globalCellKind") }
   if letIx < 0 { return "i32" }
   // Only the TOP of a walk re-stamps: inside one, the columns are what stops the ladder
   // re-deriving the same global once per rung, which is the exponential.
@@ -6828,7 +6812,7 @@ export function globalCellKind(letIx: i32): VKind {
     if gckHave[letIx] == gckGen { return gckVal[letIx] }
   }
   gckDepth = gckDepth + 1
-  const k = globalCellKindGo(letIx)
+  const k: VKind = if nodeAt(letIx) is LetDecl { letCellKind(letIx, -1) } else { "i32" }
   gckDepth = gckDepth - 1
   while gckHave.length <= letIx {
     gckHave.push(0)
@@ -6842,19 +6826,6 @@ export function globalCellKind(letIx: i32): VKind {
     if gckStale() { gckDrop() }
   }
   k
-}
-
-// The `fbValtype` kind of a module global's cell: a local's cell kind (`letCellKind`), read
-// in no frame, after the never-filled `null` (D1576) and the v128 vector, which it does not name.
-function globalCellKindGo(letIx: i32): VKind {
-  if clsCensusOn { clsCensusEnter("globalCellKindGo") }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if letIsNulNone(letIx, -1) { return "nulnone" }
-    if letInfersV128(letIx, -1) { return "v128" }
-    return letCellKind(letIx, -1)
-  }
-  "i32"
 }
 
 // The struct table index for a global cell of kind 1 (struct ref), else -1. When the
@@ -7907,7 +7878,6 @@ export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
 // a declaration site, matching `vtKindOfType`'s slot sizing. `ownerFnIx` is the frame the
 // binding lives in (-1 at module scope), since the un-annotated arm resolves the initializer there.
 export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
-  if clsCensusOn { clsCensusEnter("bindingIsLitAtom") }
   if bindIx < 0 { return false }
   const bn = nodeAt(bindIx)
   match bn {
@@ -14669,7 +14639,6 @@ export function structListPopGetElem(exprIx: i32, fnIx: i32) {
 // list (one callback argument). A member call named `map`/`filter` over a NON-list receiver (e.g.
 // a function-valued struct field) is NOT a HOF site.
 export function callIsMapFilter(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("callIsMapFilter") }
   if exprIx < 0 { return false }
   const e = nodeAt(exprIx)
   if e is Call {
