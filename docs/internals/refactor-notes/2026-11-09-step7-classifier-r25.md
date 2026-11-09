@@ -69,5 +69,5 @@ prebuilt host binary needs `cargo build --release` in `scripts/vl-host` first (r
 **Proof.** Both sides are fixpoint seeds. Master `ce2bd63b` is 6,596,106 bytes and this PR is
 6,595,446 (−660). On this tree the census reads 45 probed over 23,814 programs
 with no warnings, late demands are 6 (the baseline), and the filed witnesses grade
-4,679 of 4,679 as filed. With master `f1b264da` (#7015) merged in, the fixpoint seed is
-6,595,527 bytes and the same gates hold.
+4,679 of 4,679 as filed. With master `ddf30c4b` (#7015, #7020) merged in, the fixpoint seed is
+6,595,637 bytes and the same gates hold.
