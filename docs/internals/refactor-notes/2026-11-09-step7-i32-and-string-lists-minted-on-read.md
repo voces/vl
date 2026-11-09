@@ -1,14 +1,16 @@
 # Step 7: the i32 list wrapper and the string list pair are minted on first read
 
 Measured 2026-11-09 on a 4-core box, master `4f93c1a4`. Both seeds are fixpoints (two
-`refresh-compiler.sh` runs byte-identical). The population is the sweep's 23,744 programs.
+`refresh-compiler.sh` runs byte-identical). The population is the sweep's 23,744 programs. This box has no `/usr/bin/time`, so peak RSS is
+VmHWM, polled from `/proc` during an unoptimised build of the plumb-shape main unit.
 
 | | base (fixpoint) | candidate (fixpoint) |
 | --- | --- | --- |
 | sweep | | 22,444 same; 1,300 bytes-only, 0 output movers, 0 runs lost, 0 new traps |
 | seed bytes | 6,569,808 | 6,567,753 (−2,055), +2.7% of the +3% bar |
-| plumb-shape main fuel / RSS | PLUMB_MAIN_BASE | PLUMB_MAIN |
-| plumb-shape tail fuel / RSS | PLUMB_TAIL_BASE | PLUMB_TAIL |
+| plumb-shape main fuel | 8,975,636,030 (baseline) | 8,816,736,661 |
+| plumb-shape tail fuel | 6,579,647,243 (baseline) | 6,393,472,751 |
+| main unit build, VmHWM (two runs) | 440.4 / 442.6 MB | 442.9 / 443.5 MB |
 
 ## What moved
 
