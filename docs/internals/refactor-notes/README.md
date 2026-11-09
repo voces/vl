@@ -8,6 +8,8 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step7-ref-list-pairs-after-type-indices](2026-11-09-step7-ref-list-pairs-after-type-indices.md): Step 7: ref-list pairs mintable after mAssignTypeIndices; the reader floors left (#6952).
+- [2026-11-09-step7-collecta2-reset-at-compile-start](2026-11-09-step7-collecta2-reset-at-compile-start.md): Step 7: collectA#2's row tables wiped once per compile (#6950).
 - [2026-11-09-if-arm-join-closed-holder](2026-11-09-if-arm-join-closed-holder.md): Step 4: the checker joins an if-arm function holder at its closed side, D15331 and D15304 (#6948).
 - [2026-11-09-step7-int-map-probes-tail-rows](2026-11-09-step7-int-map-probes-tail-rows.md): Step 7: int-keyed map probes as tail rows; mI32Used and mI64Used deleted (#6947).
 - [2026-11-09-step7-list-is-names-on-read](2026-11-09-step7-list-is-names-on-read.md): Step 7: listIsIdentNames out of collectA#2, read on first ask (#6943).
