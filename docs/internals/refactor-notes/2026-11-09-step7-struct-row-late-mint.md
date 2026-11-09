@@ -42,6 +42,7 @@ Base: #6997's head (`b61c2625`). Both seeds are fixpoints (two self-compiles, by
 | | base | candidate |
 | --- | --- | --- |
 | fixpoint seed | 6,590,849 | 6,591,841 (+992) |
+| merged with master `cf536d88` | 6,587,970 | 6,588,947 (+977) |
 
 The sweep covers 23,799 programs (base vs candidate):
 
