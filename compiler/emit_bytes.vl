@@ -52,8 +52,7 @@ import {
   MfKind,
   VKind,
   W,
-  aTypeIdx,
-  aUsed,
+  aTy,
   arrNewScratchBase,
   atomStageSlot,
   ba8Ty,
@@ -131,6 +130,7 @@ import {
   ia64Ty,
   il64Ty,
   isBa8Ty,
+  isSBackTy,
   lTy,
   lcatBases,
   leqIScratchBase,
@@ -184,12 +184,13 @@ import {
   rlElemHeap,
   rlElemNullable,
   rlWrapIdx,
-  sBackIdx,
+  sBackTy,
   sHeapIdx,
-  sTypeIdx,
+  sTy,
   strCatSlotIx,
   strPushScratchBase,
   strScratchBase,
+  strTrioMinted,
   u8PushScratchBase,
   uBoxIdx,
   uBoxNewEnd,
@@ -1108,28 +1109,28 @@ export function fbStructNew(heapIdx: i32) {
 // len, hash }`. These accessors are the only place the field numbers live — a direct
 // `fbStructGet` elsewhere would be a second writing of the field order.
 export function fbStrBack() {
-  fbStructGet(sTypeIdx, 0)
+  fbStructGet(sTy(), 0)
   0
 }
 export function fbStrStart() {
-  fbStructGet(sTypeIdx, 1)
+  fbStructGet(sTy(), 1)
   0
 }
 export function fbStrLen() {
-  fbStructGet(sTypeIdx, 2)
+  fbStructGet(sTy(), 2)
   0
 }
 // `[string] -> [i32]` — the CACHED hash, or 0 for "not computed yet". Field 3 is the only
 // MUTABLE field in the header; see the type-section comment in `emit_sections.vl` for why a
 // memo does not weaken the immutability the aliasing arguments rest on.
 export function fbStrHash() {
-  fbStructGet(sTypeIdx, 3)
+  fbStructGet(sTy(), 3)
   0
 }
 // `[string, i32] -> []` — write the memo. The ONLY writer is `__str_hash__`'s epilogue, and
 // it stores exactly the value a fresh walk returns.
 export function fbStrSetHash() {
-  fbStructSet(sTypeIdx, 3)
+  fbStructSet(sTy(), 3)
   0
 }
 // `[backing, start, len] -> [string]`. The hash sentinel is pushed here, not at the
@@ -1138,7 +1139,7 @@ export function fbStrSetHash() {
 // a slice cannot inherit its parent's (different bytes → different hash).
 export function fbStrNew() {
   fbI32Const(0) // field 3 hash: the "not computed yet" sentinel
-  fbStructNew(sTypeIdx)
+  fbStructNew(sTy())
   0
 }
 
@@ -1208,7 +1209,7 @@ export function fbArrayInitData(heapIdx: i32, seg: i32) {
 // read routes through here. Keyed on the heap index, which every reader already passes.
 function heapIsPacked(heapIdx: i32) {
   if isBa8Ty(heapIdx) { return true }
-  aUsed && heapIdx == sBackIdx
+  isSBackTy(heapIdx)
 }
 
 export function fbArrayGet(heapIdx: i32) {
@@ -1381,7 +1382,7 @@ export function mapTypeIdxOf(slot: i32) {
   mvMapTypeIdx[slot]
 }
 export function mvValsBackOf(slot: i32) {
-  if slot < 0 { return aTypeIdx }
+  if slot < 0 { return aTy() }
   if mvValKind[slot] == MVK_STR { return mkArrTy() }
   if mvValKind[slot] == MVK_F64 {
     return fa64Ty() // f64-valued map: f64 array backing
@@ -1399,8 +1400,8 @@ export function mvValsBackOf(slot: i32) {
   rlBackIdx[mvRlSlot[slot]]
 }
 export function mvValElemHeapOf(slot: i32) {
-  if slot < 0 { return aTypeIdx }
-  if mvValKind[slot] == MVK_STR { return sTypeIdx }
+  if slot < 0 { return aTy() }
+  if mvValKind[slot] == MVK_STR { return sTy() }
   if mvValKind[slot] == MVK_F64 {
     return fa64Ty() // f64-valued map: f64 array backing
   }
@@ -1468,14 +1469,14 @@ export function catWrapIdxOf(kind: i32, slot: i32) {
 export function catBackIdxOf(kind: i32, slot: i32) {
   if kind == LBK_REF {
     if slot >= 0 && slot < rlBackIdx.length { return rlBackIdx[slot] }
-    return aTypeIdx
+    return aTy()
   }
   if kind == LBK_STR_LIST { return mkArrTy() }
   if kind == LBK_F64_LIST { return fa64Ty() }
   if kind == LBK_I64_LIST { return ia64Ty() }
   if kind == LBK_F32_LIST { return fa32Ty() }
   if kind == LBK_U8_LIST { return ba8Ty() }
-  aTypeIdx
+  aTy()
 }
 // Reserve `n` wasm locals at the current cursor, returning the frame's base index
 // and advancing the cursor past the frame. The single place the cursor moves.
@@ -1900,7 +1901,7 @@ function fbEmitPushFrames() {
   if fnUsesPush {
     fbI32Run()
     fbI32Run()
-    fbRefRun(aTypeIdx)
+    fbRefRun(aTy())
     fbRefRun(lTy())
   }
   fbFrameAt(refPushScratchBase, "ref-push")
@@ -1932,7 +1933,7 @@ function fbEmitPushFrames() {
     // `(string | null)[]` — the niche shares this backing (whose element slot is already
     // nullable), so only the staging local differs. The ref-push frame above makes the same
     // distinction per element slot; here one flag covers the one string backing.
-    if fnUsesNulStrPush { fbRefNullRun(sTypeIdx) } else { fbRefRun(sTypeIdx) }
+    if fnUsesNulStrPush { fbRefNullRun(sTy()) } else { fbRefRun(sTy()) }
     fbI32Run()
     fbRefRun(mkArrTy())
     fbRefRun(mkListTy())
@@ -1976,6 +1977,16 @@ function fbEmitPushFrames() {
     fbRefRun(bl8Ty())
   }
 }
+// One string-op slot: the string header (or, with `back`, its backing), nullable with `nul`. A
+// body that touches no string has minted no string type, and the slot holds an i32 instead.
+function fbStrSlotRun(back: boolean, nul: boolean) {
+  if !strTrioMinted() { return fbI32Run() }
+  let h = sTy()
+  if back { h = sBackTy() }
+  if nul { return fbRefNullRun(h) }
+  fbRefRun(h)
+}
+
 // The string-op frame and the map frames of `fbEmitLocalsVec`: the shared map frame, the i32-
 // and i64-keyed extras and the key-list and value-list builders.
 function fbEmitStrOpMapFrames() {
@@ -1985,19 +1996,19 @@ function fbEmitStrOpMapFrames() {
   // backings/offsets (strScrABk/strScrBBk, strScrAOff/strScrBOff) that keep an element
   // loop at one `array.get` per step — binaryen's LICM does not hoist a GC `struct.get`.
   if fnUsesStrOp {
-    fbRefRun(sTypeIdx)
-    fbRefRun(sTypeIdx)
-    fbRefRun(sBackIdx)
+    fbStrSlotRun(false, false)
+    fbStrSlotRun(false, false)
+    fbStrSlotRun(true, false)
     fbI32Run()
     fbI32Run()
     fbI32Run()
     fbI32Run()
-    fbRefNullRun(sBackIdx)
-    fbRefNullRun(sBackIdx)
+    fbStrSlotRun(true, true)
+    fbStrSlotRun(true, true)
     fbI32Run()
     fbI32Run()
     // strScrEq: live only between a literal equality's length test and its call.
-    fbRefRun(sTypeIdx)
+    fbStrSlotRun(false, false)
   }
   fbFrameAt(mapScratchBase, "map")
   // G8 map scratch frame, in slot order: mapRef, keyRef, curRef, slot, cap, entry,
@@ -2006,19 +2017,19 @@ function fbEmitStrOpMapFrames() {
   // call below, one per slot, in this same order.
   if fnUsesMap {
     fbRefRun(mStructIdx)
-    fbRefRun(sTypeIdx)
-    fbRefRun(sTypeIdx)
+    fbRefRun(sTy())
+    fbRefRun(sTy())
     fbI32Run()
     fbI32Run()
     fbI32Run()
     fbRefRun(mkArrTy())
-    fbRefRun(aTypeIdx)
+    fbRefRun(aTy())
     fbI32Run()
     fbI32Run()
-    fbRefRun(aTypeIdx)
+    fbRefRun(aTy())
     fbI32Run()
-    fbRefRun(aTypeIdx)
-    fbRefRun(aTypeIdx)
+    fbRefRun(aTy())
+    fbRefRun(aTy())
     fbI32Run()
   }
   fbFrameAt(mapKeysBase, "map-keys")
@@ -2027,7 +2038,7 @@ function fbEmitStrOpMapFrames() {
   if fnUsesMapKeys {
     fbRefRun(mkArrTy())
     fbRefRun(mkArrTy())
-    fbRefRun(aTypeIdx)
+    fbRefRun(aTy())
     fbI32Run()
     fbI32Run()
     fbI32Run()
@@ -2036,9 +2047,9 @@ function fbEmitStrOpMapFrames() {
   // `m.values()` value-list builder frame (6 slots): outBack (ref $aTypeIdx), valsBack
   // (ref $aTypeIdx), live (ref $aTypeIdx), i, j, count (3 i32).
   if fnUsesMapVals {
-    fbRefRun(aTypeIdx)
-    fbRefRun(aTypeIdx)
-    fbRefRun(aTypeIdx)
+    fbRefRun(aTy())
+    fbRefRun(aTy())
+    fbRefRun(aTy())
     fbI32Run()
     fbI32Run()
     fbI32Run()
@@ -2081,7 +2092,7 @@ function fbEmitMapFilterFrames() {
       "f32" => fbRefRun(fa32Ty())
       "ref" => fbRefRun(rlBackIdx[mfDstSlots[mfw]])
       "str" => fbRefRun(mkArrTy())
-      "i32" => fbRefRun(aTypeIdx)
+      "i32" => fbRefRun(aTy())
       "u8" => fbRefRun(ba8Ty())
     }
     mfw = mfw + 1
@@ -2105,7 +2116,7 @@ function fbEmitStagingFrames() {
   if fnUsesListEqI {
     fbRefRun(lTy())
     fbRefRun(lTy())
-    fbRefRun(aTypeIdx)
+    fbRefRun(aTy())
     fbI32Run()
     fbI32Run()
   }
@@ -2167,7 +2178,7 @@ function fbEmitStagingFrames() {
   // or the string there, and an unminted index names a type of the previous program (D3995).
   if fnUsesCoalesceCall {
     if uDeclared { fbRefRun(uBoxIdx) } else { fbI32Run() }
-    if aUsed { fbRefNullRun(sTypeIdx) } else { fbI32Run() }
+    if strTrioMinted() { fbRefNullRun(sTy()) } else { fbI32Run() }
     fbI32Run()
   }
   fbFrameAt(variantReboxSlot, "variant-rebox")
@@ -2184,7 +2195,7 @@ function fbEmitStagingFrames() {
   fbFrameAt(atomStageSlot, "atom-narrow staging")
   // The atom-narrow staging slot — likewise non-null, `local.set` before every read.
   if fnUsesAtomStage {
-    if aUsed { fbRefRun(sTypeIdx) } else { fbI32Run() }
+    if strTrioMinted() { fbRefRun(sTy()) } else { fbI32Run() }
   }
   fbFrameAt(optRecvSlot, "`?.` receiver stash")
   // The `?.` receiver stash: any struct row, so the abstract `structref` — nullable,
@@ -2219,7 +2230,7 @@ function fbLazyListKindRun(lk: MfKind, lix: i32) {
       "f32" => fbRefNullRun(fa32Ty())
       "ref" => fbRefNullRun(rlBackIdx[liSlots[lix]])
       "str" => fbRefNullRun(mkArrTy())
-      "i32" => fbRefNullRun(aTypeIdx)
+      "i32" => fbRefNullRun(aTy())
       "u8" => fbRefNullRun(ba8Ty())
     }
   } else if liBack[lix] == 4 {
@@ -2230,7 +2241,7 @@ function fbLazyListKindRun(lk: MfKind, lix: i32) {
       "i64" => fbI64Run()
       "f32" => fbF32Run()
       "ref" => fbRefNullRun(rlElemHeap[liSlots[lix]])
-      "str" => fbRefNullRun(sTypeIdx)
+      "str" => fbRefNullRun(sTy())
       "i32" => fbI32Run()
       "u8" => fbI32Run()
     }
@@ -2261,12 +2272,12 @@ function fbLazyListSlotRun(lix: i32) {
     // `strBack`) — the raw `(ref null $sBackIdx)` element array, not a list backing
     // and not the finished string (the header wraps it once every chunk arrives).
     // `liKinds` reads "i32" here too, so the string backing needs its own code.
-    fbRefNullRun(sBackIdx)
+    fbRefNullRun(sBackTy())
   } else if liBack[lix] == 6 {
     // A string header stash (`strHdrSlot`) — the `(ref null $sTypeIdx)` receiver of an
     // `s[i]`/`s.charCodeAt(i)`, parked so the lowering reads `backing`, `start` and `len`
     // off one evaluation. Like code 5, its own code rather than a kind match.
-    fbRefNullRun(sTypeIdx)
+    fbRefNullRun(sTy())
   } else if liBack[lix] == 7 {
     // The shared-union-field receiver stash (`sharedFieldRecvSlot`) — the
     // `(ref null $uBoxIdx)` box of a per-tag dispatch whose receiver cannot be
@@ -2329,7 +2340,7 @@ function fbLazyListSlotRun(lix: i32) {
       "f64" => fbRefNullRun(fa64Ty())
       "i64" => fbRefNullRun(ia64Ty())
       "f32" => fbRefNullRun(fa32Ty())
-      "i32" => fbRefNullRun(aTypeIdx)
+      "i32" => fbRefNullRun(aTy())
       "u8" => fbRefNullRun(ba8Ty())
       "ref" => fbRefNullRun(rlBackIdx[gb])
       "str" => fbRefNullRun(mkArrTy())
@@ -2356,7 +2367,7 @@ function fbLazyListSlotRun(lix: i32) {
       "f64" => fbRefNullRun(fa64Ty())
       "i64" => fbRefNullRun(ia64Ty())
       "f32" => fbRefNullRun(fa32Ty())
-      "i32" => fbRefNullRun(aTypeIdx)
+      "i32" => fbRefNullRun(aTy())
       "u8" => fbRefNullRun(ba8Ty())
       "ref" => fbRefNullRun(rlBackIdx[liSlots[lix]])
       "str" => fbRefNullRun(mkArrTy())
@@ -2370,7 +2381,7 @@ function fbLazyListSlotRun(lix: i32) {
     // header parked so the fused lowering reads `backing`/`start`/`len` off ONE
     // evaluation of each part. Kind is "i32" for the reason codes 5, 6 and 7 are: the
     // slot type comes from the code, not from a list element kind.
-    fbRefNullRun(sTypeIdx)
+    fbRefNullRun(sTy())
   } else if liBack[lix] == 19 {
     // The nullable-niche box stash (`nulNicheBoxSlot`, D1721) — `anyref`, because the
     // slot holds whichever niche rep the value has and hands it to the box's `anyref`
@@ -2409,7 +2420,7 @@ function fbLazyListSlotRun(lix: i32) {
     const k = liSlots[lix]
     if k == 0 { fbI32Run() }
     else if k == 4 { fbRefRun(mStructI32Idx) }
-    else { fbRefRun(aTypeIdx) }
+    else { fbRefRun(aTy()) }
   } else if liBack[lix] == 39 {
     // The i64-keyed map frame (`mapI64KeyLocal`): the key, three i64 backings, the map.
     const k = liSlots[lix]
@@ -2434,7 +2445,7 @@ function fbLazyListSlotRun(lix: i32) {
     fbRefNullRun(liSlots[lix])
   } else if liBack[lix] == 24 {
     // A string append site's buffer (`strSiteSlot`): the backing it allocated last.
-    fbRefNullRun(sBackIdx)
+    fbRefNullRun(sBackTy())
   } else if liBack[lix] == 25 {
     // The same site's frontier in that buffer.
     fbI32Run()
@@ -2445,7 +2456,7 @@ function fbLazyListSlotRun(lix: i32) {
     // A staged `is` receiver (`isRecvStashSlot`), typed by the rep its key names.
     if liSlots[lix] == 0 { fbRefNullRun(uBoxIdx) }
     else if liSlots[lix] == 1 { fbI32Run() }
-    else { fbRefNullRun(sTypeIdx) }
+    else { fbRefNullRun(sTy()) }
   } else if liBack[lix] == 43 {
     // The member id a call through a tagged function set dispatches on (`fnTagIdSlot`).
     fbI32Run()
@@ -2552,7 +2563,7 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
         && si >= sHeapIdx.length)
       || ((kind == "reflist" || kind == "nulreflist") && si >= rlWrapIdx.length)
     ) {
-      wSLEB(aTypeIdx)
+      wSLEB(aTy())
       return emitFail("emitProgram: ref.null with no interned shape")
     }
   }
@@ -2568,7 +2579,7 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
     }
     "str" | "nulstr" => {
       // `string | null` shares the string heap type; the nullability is in the slot.
-      wSLEB(sTypeIdx)
+      wSLEB(sTy())
     }
     "union" => {
       wSLEB(uBoxIdx)
@@ -2605,7 +2616,7 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
     "i32" | "nulbool" | "i64" | "f64" | "f32" | "v128" => {
       // The scalars, named rather than left to a fall-through: a scalar cell holds no ref to
       // null, so this operand is a placeholder no consumer reads as a heap type.
-      wSLEB(aTypeIdx)
+      wSLEB(aTy())
     }
   }
   0
@@ -2653,7 +2664,7 @@ export function nulScalarListFieldWrapHeap(code: i32): i32 {
 export function pushFieldStorage(code: i32, refSlot: i32) {
   if code == FC_STR {
     wU8(100)
-    wSLEB(sTypeIdx)
+    wSLEB(sTy())
   } else if code == FC_I32_LIST {
     wU8(100)
     wSLEB(lTy())
@@ -2727,7 +2738,7 @@ export function pushFieldStorage(code: i32, refSlot: i32) {
     wSLEB(mapTypeIdxOf(refSlot))
   } else if code == FC_NUL_STR {
     wU8(99)
-    wSLEB(sTypeIdx)
+    wSLEB(sTy())
   } else if code == FC_NUL_CLOSURE {
     wU8(99)
     wSLEB(cloStructIdx)
@@ -2822,11 +2833,11 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
     }
     "str" => {
       wU8(RT_REF_NULL)
-      wSLEB(sTypeIdx)
+      wSLEB(sTy())
     }
     "nulstr" => {
       wU8(RT_REF_NULL) // `string | null`: the nullable raw-array ref
-      wSLEB(sTypeIdx)
+      wSLEB(sTy())
     }
     "union" => {
       wU8(RT_REF_NULL)
@@ -2965,10 +2976,10 @@ export function fbRefNullOfKind(kind: VKind, structIdx: i32) {
       fbRefNull(lTy())
     }
     "str" => {
-      fbRefNull(sTypeIdx)
+      fbRefNull(sTy())
     }
     "nulstr" => {
-      fbRefNull(sTypeIdx)
+      fbRefNull(sTy())
     }
     "union" => {
       fbRefNull(uBoxIdx)
@@ -3094,7 +3105,7 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     }
     "str" => {
       wU8(RT_REF)
-      wSLEB(sTypeIdx)
+      wSLEB(sTy())
     }
     "union" => {
       wU8(RT_REF)
@@ -3142,7 +3153,7 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     }
     "nulstr" => {
       wU8(RT_REF_NULL)
-      wSLEB(sTypeIdx)
+      wSLEB(sTy())
     }
     "nulreflist" => {
       wU8(RT_REF_NULL)
