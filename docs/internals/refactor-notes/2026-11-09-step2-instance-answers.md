@@ -10,7 +10,7 @@ never committed, and graded only programs that compile.
 - **A lambda clone takes its template's type at mint.** `monoCloneLambdaSubst` recorded a type on
   the clone only where the pin closed the template's own type. Where it stays open (`(T) => void`
   handed to a generic whose `T` the enclosing instance binds), the clone now records the closed
-  type the elaboration gives the template under the walked key (`monoLamCloneElabTy`). In all 15,
+  type the elaboration gives the template under the walked key. In all 15,
   that type was `(i32) => void`.
 - **A frame with no instance key reads its call's parameter as the root does.** A non-generic
   function's body is keyed −1. `elabNodeTyAt` already reads that frame's calls as root calls
@@ -43,4 +43,5 @@ never committed, and graded only programs that compile.
 ## Graded
 
 Sweep, base against candidate: 23,747 of 23,747 the same, 0 bytes-only movers, 0 output movers.
-Fixpoint: a second refresh is byte-identical. Seed 6,569,345 → 6,569,473 bytes (+128).
+Fixpoint: a second refresh is byte-identical. Seed 6,569,345 → 6,569,456 bytes (+111, +2.7% of the +3% bar). Self-compile VmHWM 3,953,980 → 3,953,752 kB.
+Late demands stay at 6. Item 3 (the two `@emit-error` `show` demands) and `monoKeyPinSeg` are not attempted here.
