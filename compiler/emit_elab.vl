@@ -2511,6 +2511,10 @@ function elabReadsParamOf(d: i32, e: i32): boolean {
         if pn is Param && pn.parType < 0 && i32ListHas(en.fnParams, pd) {
           return true
         }
+        // So is a read of a copy of one, which holds the parameter's value (D14843).
+        const cp = if pn is LetDecl { elabParamCopyOf(pd, en) } else { -1 }
+        const cn = if cp >= 0 { nodeAt(cp) } else { null }
+        if cn is Param && cn.parType < 0 { return true }
       }
       for c in nodeChildren(ix) { stack.push(c) }
     }
@@ -2518,15 +2522,18 @@ function elabReadsParamOf(d: i32, e: i32): boolean {
   false
 }
 
-// Whether `d` has an instance whose parent is instance `k`.
-function elabHasInstUnder(d: i32, k: i32): boolean {
+// The instance of `d` whose parent is instance `k`, or -1.
+function elabInstUnder(d: i32, k: i32): i32 {
   let a = 0
   while a < ekDecl.length {
-    if ekDecl[a] == d && ekParent[a] == k { return true }
+    if ekDecl[a] == d && ekParent[a] == k { return a }
     a = a + 1
   }
-  false
+  -1
 }
+
+// Whether `d` has an instance whose parent is instance `k`.
+function elabHasInstUnder(d: i32, k: i32): boolean { elabInstUnder(d, k) >= 0 }
 
 // Whether declaration `d`'s body reads a captured value its template types with an open type, so
 // each instance of its encloser types it apart (D4046).
@@ -4471,14 +4478,25 @@ function elabAliasSetFwd(
   const todo: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
   const ins: boolean[] = [false]
+  const inDs: i32[] = [-1]
   while todo.length > 0 {
     const x = todo.pop() ?? -1
     const p = par.pop() ?? -1
     const inFn = ins.pop() ?? false
+    const inD = inDs.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
       if nodeAt(x) is Ident && identDeclOf(x) == d {
-        // A nested function's read is one body for every instance (D14842).
-        if inFn { return false }
+        // A nested function's read is one body for every instance (D14842), unless the nested
+        // function is built per instance of `fn`, where a call through a set forwards it as at
+        // that instance; a hand-on to a named function's parameter forwards it either way.
+        if inFn {
+          const kk = if elabPerEnclDecls[inD] ?? false { elabInstUnder(inD, k) } else { -1 }
+          const nto = if kk >= 0 { elabSetFwdTarget(x, p, kk) } else { [] }
+          const nm = if nto.length == 0 { elabMintFwdTarget(x, p) } else { [] }
+          if nto.length == 0 && nm.length != 2 { return false }
+          tos.push(if nto.length > 0 { nto } else { [nm[1], nm[0]] })
+          continue
+        }
         // An element of a `const` list literal nothing reads hands the set nowhere.
         if elabUnreadConstLit(p, fn) { continue }
         // A `const` copy of `d` forwards it wherever the copy is read.
@@ -4497,10 +4515,12 @@ function elabAliasSetFwd(
         tos.push(if to.length > 0 { to } else { [named[1], named[0]] })
       }
       const deeper = inFn || nodeAt(x) is FuncDecl
+      const nd = if nodeAt(x) is FuncDecl { x } else { inD }
       for c in nodeChildren(x) {
         todo.push(c)
         par.push(x)
         ins.push(deeper)
+        inDs.push(nd)
       }
     }
   }
