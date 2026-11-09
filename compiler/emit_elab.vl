@@ -1601,11 +1601,16 @@ let elabCandKeys: {[i32]: boolean} = Map()
 let elabCandidating = false
 
 // `elabDemandFrom` for a candidate; its key, or -1.
-function elabDemandCandidate(decl: i32, pTys: i32[], call: i32): i32 {
+function elabDemandCandidate(
+  decl: i32,
+  pTys: i32[],
+  from: i32,
+  call: i32,
+): i32 {
   const none: string[] = []
   const noTys: i32[] = []
   elabCandidating = true
-  const k = elabDemandFrom(decl, none, noTys, pTys, -1, call)
+  const k = elabDemandFrom(decl, none, noTys, pTys, from, call)
   elabCandidating = false
   k
 }
@@ -10517,26 +10522,43 @@ function elabListMemberSigs() {
     const s = fnTagSetOfTy(nodeTyIxOf(cf))
     if s < 0 || fnTagSetIsTagged(s) || !fnSetHasCapturingLambda(s) { continue }
     for m in fnTagMembers(s) {
-      const pTys = elabMemberCallSig(m, cn.callArgs)
-      if pTys.length > 0 {
-        const k = elabDemandCandidate(m, pTys, c)
-        elabReachNote(-1, k, c)
+      for ek in elabMemberEnclKeys(m) {
+        const pTys = elabMemberCallSig(m, cn.callArgs, ek)
+        if pTys.length > 0 {
+          const k = elabDemandCandidate(m, pTys, ek, c)
+          if ek < 0 { elabReachNote(-1, k, c) }
+        }
       }
     }
   }
   elabSettle(0)
 }
 
-// The closed parameter types named function `m` takes from a call with `args`: a hole parameter
-// handed a function takes `(p...) => r`, `p` the one set of argument types `m`'s body calls it
-// with and `r` that function's result there; any other takes its argument's type. [] when one
-// stays open.
-function elabMemberCallSig(m: i32, args: i32[]): i32[] {
+// The instances a set member `m` is minted under: each of a lambda's encloser's instances, a
+// lambda pushed into the list from inside that function being a value per instance; else [-1].
+function elabMemberEnclKeys(m: i32): i32[] {
+  const out: i32[] = []
+  const f = nodeAt(m)
+  const e = if f is FuncDecl && f.fnName == "" { elabEncl.get(m) ?? -1 } else { -1 }
+  if e >= 0 {
+    let k = 0
+    while k < ekDecl.length {
+      if ekDecl[k] == e { out.push(k) }
+      k = k + 1
+    }
+  }
+  if out.length == 0 { out.push(-1) }
+  out
+}
+
+// The closed parameter types function `m`, read in its encloser's instance `ek` (-1 for none),
+// takes from a call with `args`: a hole parameter handed a function takes `(p...) => r`, `p` the
+// one set of argument types `m`'s body calls it with and `r` that function's result there; any
+// other takes its argument's type. [] when one stays open.
+function elabMemberCallSig(m: i32, args: i32[], ek: i32): i32[] {
   const none: i32[] = []
   const f = nodeAt(m)
-  if !(f is FuncDecl) || f.fnName == "" || f.fnTyParams.length > 0 {
-    return none
-  }
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return none }
   if f.fnParams.length != args.length { return none }
   const out: i32[] = []
   let fnHole = false
@@ -10546,7 +10568,7 @@ function elabMemberCallSig(m: i32, args: i32[]): i32[] {
     const at = nodeTyIxOf(parenPeelIx(args[i]))
     const ads = elabFnSetOf(at)
     if pn is Param && pn.parType < 0 && ads.length > 0 {
-      const wp = elabParamCallArgTys(f.fnBody, f.fnParams[i])
+      const wp = elabParamCallArgTys(f.fnBody, f.fnParams[i], ek)
       if wp.length == 0 { return none }
       let r = -1
       for d in ads {
@@ -10566,9 +10588,9 @@ function elabMemberCallSig(m: i32, args: i32[]): i32[] {
   out
 }
 
-// The widened, closed argument types every call in `body` through parameter `pd` passes, when
-// they are one list and there is at least one such call; else [].
-function elabParamCallArgTys(body: i32, pd: i32): i32[] {
+// The widened, closed argument types every call in `body` through parameter `pd` passes, typed
+// in instance `ek` where it is one, when they are one list and there is at least one such call.
+function elabParamCallArgTys(body: i32, pd: i32, ek: i32): i32[] {
   const none: i32[] = []
   let got: i32[] = []
   let seen = false
@@ -10583,7 +10605,9 @@ function elabParamCallArgTys(body: i32, pd: i32): i32[] {
       if cf >= 0 && nodeAt(cf) is Ident && identDeclOf(cf) == pd {
         const tys: i32[] = []
         for a in n.callArgs {
-          const at = widenLitTy(nodeTyIxOf(a))
+          const at = widenLitTy(
+            if ek >= 0 { elabNodeTy(a, ek) } else { nodeTyIxOf(a) },
+          )
           if at < 0 || !elabTyClosed(at, 0) { return none }
           tys.push(at)
         }
@@ -13801,9 +13825,10 @@ let elabDlvDepth = 0
 
 // `elabSlotDeliveries` into `out`.
 function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
-  // A parameter holds what each call hands it, so its slot is delivered where the argument's is.
+  // A parameter holds what each call hands it, so its slot is delivered where the argument's is;
+  // one a clone minted after the write index has no calls the index names.
   const pd = nodeAt(d)
-  if pd is Param {
+  if pd is Param && d < cwIxCoveredLen() {
     const fd = recEnclosingFn(d)
     const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
     const pi = if fn is FuncDecl { i32ListIndexOf(fn.fnParams, d) } else { -1 }
@@ -17512,13 +17537,14 @@ export function elabHoleKeyAtPins(decl: i32, pTys: i32[]): i32 {
 
 // The closed signature the checker gave declaration `decl`, which has no type parameter, where
 // every pin type in `pTys` is that signature's parameter at its position; -1 otherwise. Such a
-// declaration has one type, so the elaboration mints it no instance.
+// declaration has one type, so the elaboration mints it no instance. A lambda typed by its
+// destination's union has the one function member of its arity.
 export function elabClosedSigAtPins(decl: i32, pTys: i32[]): i32 {
   const d = elabSrcDecl(decl)
   if d < 0 || d >= P.nodes.length { return -1 }
   const n = nodeAt(d)
   if !(n is FuncDecl) || n.fnTyParams.length > 0 { return -1 }
-  const sig = nodeTyIxOf(d)
+  const sig = elabUnionFnMember(nodeTyIxOf(d), pTys.length)
   if sig < 0 || sig >= T.tys.length || tyHasTyVar(sig) || tyHasHole(sig) {
     return -1
   }
@@ -17536,6 +17562,22 @@ export function elabClosedSigAtPins(decl: i32, pTys: i32[]): i32 {
     i = i + 1
   }
   sig
+}
+
+// `t`, or where `t` is a union, its one function member taking `n` parameters; -1 for none or two.
+function elabUnionFnMember(t: i32, n: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const u = tyAt(t)
+  if !(u is TyUnion) { return t }
+  let one = -1
+  for m in u.uMembers {
+    const mf = if m >= 0 && m < T.tys.length { tyAt(m) } else { null }
+    if mf is TyFunc && mf.fnParamTypes.length == n {
+      if one >= 0 { return -1 }
+      one = m
+    }
+  }
+  one
 }
 
 // Whether named function `decl` is ever delivered as a value: read by name anywhere other than
