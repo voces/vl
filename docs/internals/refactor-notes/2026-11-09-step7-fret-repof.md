@@ -18,7 +18,7 @@ then ran five more steps. A probe compiler counted each step over the whole popu
 | `fnRetRefListRowJoin`'s fallback to the checked element's row | 0 | deleted |
 | `criRecordRowCheck` refusing | 0 | stands, as a guard |
 
-With them go `frsCallsDeliverWider`, `tyIsStructWithUnionField` and `fnRetRArrElemTy`. The
+With them go `frsCallsDeliverWider`, `tyIsStructWithUnionField`, `fnRetRArrElemTy` and `rsFnRetTy`. The
 ref-list row join is now only the set-split check (`retListLitSetsSplit`, D15221), and it runs
 in `criColsFromRecorded`, where the row is written.
 
@@ -55,7 +55,9 @@ row cannot be `rdSlot` until the two struct-row readers agree.
 
 ## Proof
 
-| check | master `17fc832d` | this branch |
+| check | master | this branch |
 | --- | --- | --- |
-| fixpoint seed | 6,590,858 | 6,588,799 (−2,059) |
+| fixpoint seed, on `17fc832d` | 6,590,858 | 6,588,786 (−2,072) |
 | sweep, 23,799 programs | | 23,799 same, 0 bytes-only, 0 output movers |
+| fixpoint seed, merged with `18a749a0` | 6,591,066 | 6,588,981 (−2,085) |
+| sweep on the merged tree, 23,800 programs | | 23,800 same, 0 bytes-only, 0 output movers |
