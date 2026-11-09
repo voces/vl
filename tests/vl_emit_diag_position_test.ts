@@ -150,12 +150,12 @@ Deno.test({
   },
 });
 
-// A refusal raised while a hole parameter's instance is lowered (D15571, a field read off a union
+// A refusal raised while a hole parameter's instance is lowered (D15605, a field read off a union
 // of records through an un-annotated parameter): the instance's body is rebuilt into nodes minted
 // after parsing, and the anchor is the line they were rebuilt from, line 7 inside `take`, in the
 // module that declares it (D15155, D15157). The last shape reaches the instance through a generic.
 const INSTANCE_WITNESS = `type K = { h: i32 }
-type J = { h: i32, z: i32 }
+type J = { h: string, z: i32 }
 const k: K = { h: 4 }
 const u: K | J = k
 function take(a) {
@@ -212,7 +212,7 @@ Deno.test({
         if (!r.out.includes("emit error")) {
           throw new Error(
             `${s.name}: the instance witness no longer reaches an emit refusal, so this guard ` +
-              `is measuring nothing — replace INSTANCE_WITNESS (D15571 closed?).\n${r.out}`,
+              `is measuring nothing — replace INSTANCE_WITNESS (D15605 closed?).\n${r.out}`,
           );
         }
         const blk = errorBlock(r.out);
