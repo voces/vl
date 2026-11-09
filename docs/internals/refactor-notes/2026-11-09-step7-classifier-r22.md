@@ -69,5 +69,7 @@ are mostly `null/i32`, `null/str` and `null/f64`: a field the type calls a funct
 | master `d4901c70` | 62 | 62 | 0 | 0 | 0 | 3 |
 | this PR | 53 | 53 | 0 | 0 | 0 | 0 |
 
-**Proof.** Both sides are fixpoint seeds: base `d4901c70` is 6,589,101 bytes and this PR is
-6,587,312 (−1,789). The sweep is in the PR body.
+**Proof.** Both sides are fixpoint seeds. Master `18a749a0`, merged in, is 6,591,066 bytes and
+this PR is 6,589,264 (−1,802). At `d4901c70` the PR read 6,587,312 against 6,589,101 (−1,789). On
+the merged tree the census reads 53 probed over 23,800 programs, and master reads 62. The sweep
+is in the PR body.
