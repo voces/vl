@@ -61,3 +61,8 @@ Sweep, base against candidate: 23,743 of 23,744 the same, 0 bytes-only movers, 1
 D14887 goes from `emit_reject` (`unsupported argument type for f in a call to fw`) to `runs` and
 prints `1`, its Want. Its row is closed. Fixpoint: a second refresh is byte-identical. Seed
 6,570,153 → 6,569,789 bytes (−364).
+
+Late demands 4 → 6, recorded in the baseline. Two `@emit-error` cases
+(`error-record-field-of-generic-called-under-shadowing-name`,
+`error-written-record-field-of-generic-called-and-read-under-is`) now key `show(r)` at the record's
+held row, which demands `show` after the elaboration has finished. Both are refused as before.
