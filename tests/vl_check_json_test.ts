@@ -349,18 +349,16 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // A live emit-side refusal (`scripts/capability-probes/length-of-slot-written-list-holding-a-generic-function.vl`):
-      // `vl check` accepts it and the emitter refuses the generic argument (D15577). It is D15010's witness plus
-      // a slot write of a second parameter, the listed one bound to a different generic at each of two
-      // calls; each call alone runs.
+      // A live emit-side refusal (`scripts/capability-probes/hole-param-read-through-nested-binding-handed-through-a-set.vl`):
+      // `vl check` accepts it and the emitter refuses the generic argument (D14843): a hole parameter
+      // read through a binding by a nested function and handed through a list to a call at two types.
       await Deno.writeTextFile(
         file,
-        "function id<T>(x: T): T { x }\nfunction id2<U>(x: U): U { x }\n" +
-          "function id3<V>(x: V): V { x }\n" +
-          "function use(ys) { print(ys.length) }\n" +
-          "function take(a, b) {\n  const xs = [a]\n  xs[0] = b\n  use(xs)\n" +
-          '  print(xs[0]("abc").length + xs[0](2))\n}\n' +
-          "take(id, id2)\ntake(id3, id2)\n",
+        "function add(a, b) { return a + b }\nfunction mul(a, b) { return a * b }\n" +
+          "function apply2(g) {\n  print(g(1, 2))\n  print(g(1.5, 2.5))\n}\n" +
+          "function run(h) {\n  let hh = h\n  function inner() {\n" +
+          "    for f in [apply2] { f(hh) }\n  }\n  inner()\n}\n" +
+          "run(add)\nrun(mul)\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);
