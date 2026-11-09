@@ -8,6 +8,8 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step7-ret-list-row-join-walk](2026-11-09-step7-ret-list-row-join-walk.md): Step 7: fnRetRefListRowJoin's per-value row join deleted, seed −2,049 (#6968).
+- [2026-11-09-step7-is-call-if-arms-minted-before-signature-passes](2026-11-09-step7-is-call-if-arms-minted-before-signature-passes.md): Step 7: collectA#2's IsExpr, Call and IfStmt arms mint in a pre-pass; the rvWanted hazard fixed (#6965).
 - [2026-11-09-capturing-nested-hole-two-types](2026-11-09-capturing-nested-hole-two-types.md): Step 4: a nested hole at two encloser instances joins the bundle, D15596 (#6961).
 - [2026-11-09-step7-arraylit-arm-minted-at-first-reader](2026-11-09-step7-arraylit-arm-minted-at-first-reader.md): Step 7: collectA#2's ArrayLit arm deleted; its readers mint at first read (#6960).
 - [2026-11-09-fn-value-rows-two-types-and-pushed-lambda](2026-11-09-fn-value-rows-two-types-and-pushed-lambda.md): Step 4: D15595 and D15582 (#6958).
