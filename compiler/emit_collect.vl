@@ -188,6 +188,7 @@ import {
   isExprKid,
   nodeAt,
   nodeChildren,
+  nodeChildrenPush,
   nodeSpineChildren,
   tsKind,
   valueIfNodes,
@@ -304,6 +305,8 @@ import {
   armStageTyText,
   armStageTypes,
   armsAdopted,
+  arrLitMintOff,
+  arrLitMintOn,
   arrLitRlSlot,
   ba8TypeIdx,
   bl8Ty,
@@ -2201,6 +2204,42 @@ export function recordedVoidFns() {
       }
     }
     i = i + 1
+  }
+  0
+}
+
+let arrLitMintDone: boolean[] = []
+// Runs `collectAArrayLit` for list literal `i` once, on its first read.
+function arrLitMintOnRead(i: i32): i32 {
+  if i < 0 || i >= P.nodes.length { return -1 }
+  while arrLitMintDone.length <= i { arrLitMintDone.push(false) }
+  if arrLitMintDone[i] { return 0 }
+  arrLitMintDone[i] = true
+  const nd = nodeAt(i)
+  // Frameless: a literal an instance shares reads its template's types.
+  const was = nodeTyInstEnter(-1)
+  if nd is ArrayLit { collectAArrayLit(i, nd) }
+  nodeTyInstEnter(was)
+  0
+}
+
+// Mints every list literal under the nodes `roots`, not descending into a nested function
+// declaration below a root unless `intoFns`: the literals an emission reads first.
+export function arrLitMintTrees(roots: i32[], intoFns: boolean) {
+  const todo: i32[] = []
+  for r in roots {
+    if r >= 0 && r < P.nodes.length {
+      if nodeAt(r) is ArrayLit { arrLitMintOnRead(r) }
+      nodeChildrenPush(r, todo)
+    }
+  }
+  while todo.length > 0 {
+    const at = todo.pop()
+    if at >= 0 && at < P.nodes.length {
+      const nd = nodeAt(at)
+      if nd is ArrayLit { arrLitMintOnRead(at) }
+      if intoFns || !(nd is FuncDecl) { nodeChildrenPush(at, todo) }
+    }
   }
   0
 }
@@ -5225,6 +5264,7 @@ function collectArrLitScalar(ix: i32) {
 // after it stands until the module is written.
 export function rlMvTablesReset() {
   rlLateRowsOff()
+  arrLitMintOff()
   rlElemName = []
   rlElemKey = []
   rlElemTyIx = []
@@ -5714,6 +5754,8 @@ function collectAArmFieldNeeds(ufi: i32) {
 // array annotation fails loudly. Runs once, after monomorphization. Returns 0, or -1.
 export function collectA(_stmts: i32[]) {
   collectTyParamNames()
+  arrLitMintDone = []
+  arrLitMintOn(arrLitMintOnRead)
   // The read-only-covariance write memo is keyed by slot number, which a re-mint and a
   // resumed walk's own new rows both move (D791). Ahead of the fork, since both invalidate it.
   rlWrSlots = []
@@ -5722,10 +5764,7 @@ export function collectA(_stmts: i32[]) {
   let i = 0
   while i < P.nodes.length {
     const nd = nodeAt(i)
-    if nd is ArrayLit {
-      collectAArrayLit(i, nd)
-    } else if nd is StrLit {
-    } else if nd is Call {
+    if nd is Call {
       // A dispatch through a tagged function set whose members return different types boxes
       // each member call into the call's union, which nothing else in the program need build.
       if fnTagCallArms(i).length > 0 { markInferredJoinAtoms(nodeTyIxOf(i)) }
@@ -5777,6 +5816,8 @@ export function collectA(_stmts: i32[]) {
     // A map binding held as a map of a tagged set's records is read at that rep, so its value row
     // and mv slot are interned here, beside the map's own type's.
     const hr = fnTagHeldRepOf(i)
+    // The literals the held node is built from mint first, as the rows its held rep twins.
+    if hr >= 0 { arrLitMintTrees([i], false) }
     const hv = if hr >= 0 && hr < T.tys.length && tyAt(hr) is TyMap { tyMapValOf(hr) } else { -1 }
     if hv >= 0 && tyAt(hv) is TyObj {
       internShapeDeepOfTy(hv)
