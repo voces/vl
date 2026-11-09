@@ -8,6 +8,7 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step7-typeref-arm-typed-readers-wip](2026-11-09-step7-typeref-arm-typed-readers-wip.md): Step 7: collectA#2's TypeRef arm mints on read; D2273, D4712, D13940 run (#6985).
 - [2026-11-09-step7-collecta-typeref-chain](2026-11-09-step7-collecta-typeref-chain.md): Step 7: collectATypeRef's empty rungs fold into two named guards (#6972).
 - [2026-11-09-step7-values-stamp-slot](2026-11-09-step7-values-stamp-slot.md): Step 7: fnValuesStampSlot deleted; record results take the values' agreed stamp (#6970).
 - [2026-11-09-step7-ret-list-row-join-walk](2026-11-09-step7-ret-list-row-join-walk.md): Step 7: fnRetRefListRowJoin's per-value row join deleted, seed −2,049 (#6968).
