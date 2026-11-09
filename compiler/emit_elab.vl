@@ -6136,6 +6136,8 @@ function elabBundleForwardsJoin() {
   const up: Map<i32, i32> = Map()
   // Each hand as five entries: the call, its instance, the argument, and both parameter keys.
   const hands: i32[] = []
+  // Keys a function handed to two parameters of one type parameter joined (D15598).
+  const sibs: i32[] = []
   let k = 0
   while k < ekDecl.length {
     const dn = nodeAt(ekDecl[k])
@@ -6161,6 +6163,7 @@ function elabBundleForwardsJoin() {
               }
               i = i + 1
             }
+            if kc >= 0 { elabBundleSiblingsUnite(up, sibs, n, kc) }
           }
           // A nested function's calls are its own instance's.
           if !(n is FuncDecl) {
@@ -6211,6 +6214,17 @@ function elabBundleForwardsJoin() {
     }
     h = h + 5
   }
+  for key in sibs {
+    const r = elabBundleRoot(up, key)
+    const at = i32ListIndexOf(roots, r)
+    if (
+      at >= 0
+      && !i32ListHas(dropped, r)
+      && !elabChainMembersBuilt(up, r, lists[at])
+    ) {
+      dropped.push(r)
+    }
+  }
   for key in up.keys() {
     const r = elabBundleRoot(up, key)
     const at = i32ListIndexOf(roots, r)
@@ -6222,6 +6236,49 @@ function elabBundleForwardsJoin() {
   elabHandMembersNote(hands)
   elabResultMembersNote()
   0
+}
+
+// Unites the keys of call `n`'s parameters in callee instance `kc` that one type parameter alone
+// annotates and the call hands one named function: `F` binds that function once, so both
+// parameters hold one record of every signature either is called at.
+function elabBundleSiblingsUnite(
+  up: Map<i32, i32>,
+  sibs: i32[],
+  n: Call,
+  kc: i32,
+) {
+  const cd = nodeAt(ekDecl[kc])
+  if !(cd is FuncDecl) || cd.fnTyParams.length == 0 { return 0 }
+  let i = 0
+  while i < n.callArgs.length && i < cd.fnParams.length && i < 64 {
+    const ai = parenPeelIx(n.callArgs[i])
+    const di = if ai >= 0 && nodeAt(ai) is Ident { identDeclOf(ai) } else { -1 }
+    const ti = nodeTyIxOf(cd.fnParams[i])
+    if di >= 0 && elabTyVarNameOf(ti) != "" {
+      let j = i + 1
+      while j < n.callArgs.length && j < cd.fnParams.length && j < 64 {
+        const aj = parenPeelIx(n.callArgs[j])
+        const dj = if aj >= 0 && nodeAt(aj) is Ident { identDeclOf(aj) } else { -1 }
+        if (
+          dj == di
+          && elabTyVarNameOf(nodeTyIxOf(cd.fnParams[j])) == elabTyVarNameOf(ti)
+        ) {
+          elabBundleUnite(up, elabBundleKey(kc, i), elabBundleKey(kc, j))
+          sibs.push(elabBundleKey(kc, i))
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The name of type variable `t`, or "" where `t` is none; each annotation mints its own.
+function elabTyVarNameOf(t: i32): string {
+  if t < 0 || t >= T.tys.length { return "" }
+  const v = tyAt(t)
+  if v is TyVar { v.tvName } else { "" }
 }
 
 // What `elabResultMembersNote` reads, banked by the elaboration's one pass over the arena: each
@@ -8322,22 +8379,19 @@ function elabNestedInClosed(d: i32): boolean {
   true
 }
 
-// Whether `d` is a generic nested function whose parameters are all annotated: each encloser
-// instance builds its closure per signature at the hand, as for a closed encloser (D15595).
+// Whether `d` is a nested function with a type parameter or an un-annotated parameter: each
+// encloser instance builds its closure per signature at the hand, as for a closed encloser
+// (D15595, D15596).
 function elabNestedGeneric(d: i32): boolean {
   const n = nodeAt(d)
-  if (
-    (elabEncl.get(d) ?? -1) < 0
-    || !(n is FuncDecl)
-    || n.fnTyParams.length == 0
-  ) {
-    return false
-  }
+  if ((elabEncl.get(d) ?? -1) < 0 || !(n is FuncDecl)) { return false }
+  let hole = false
   for p in n.fnParams {
     const pn = nodeAt(p)
-    if !(pn is Param) || pn.parType < 0 { return false }
+    if !(pn is Param) { return false }
+    if pn.parType < 0 { hole = true }
   }
-  true
+  hole || n.fnTyParams.length > 0
 }
 
 // Notes signature `wp` => `r` for a call instance `k` makes through its parameter `i` bound to
