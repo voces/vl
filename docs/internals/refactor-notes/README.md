@@ -8,6 +8,8 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-hole-param-copy-read-in-nested-fn](2026-11-09-hole-param-copy-read-in-nested-fn.md): Step 4: a nested function reading a copy of its encloser's parameter, D14843 (#6935).
+- [2026-11-09-written-hole-param-join](2026-11-09-written-hole-param-join.md): Step 4: a written hole parameter binds at its hand's set joined with its writes, D15011 (#6934).
 - [2026-11-09-step2-pins-and-body-types](2026-11-09-step2-pins-and-body-types.md): Step 2: the `pins` key arm and body retyping read the elaboration; the closing census (#6932).
 - [2026-11-09-step7-string-trio-minted-on-read](2026-11-09-step7-string-trio-minted-on-read.md): Step 7: the string trio minted on first read; aUsed deleted (#6931).
 - [2026-11-09-list-join-under-a-forwarder](2026-11-09-list-join-under-a-forwarder.md): Step 4: a row under a forwarder instance re-keyed at the joined set, D15578 (#6930).
