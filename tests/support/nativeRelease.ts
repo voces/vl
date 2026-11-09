@@ -741,7 +741,8 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     axis: "array-of-structs field scan",
     // SP-056: a list index's guard branches to an out-of-line trap rather than a
     // `select` to -1, structure unchanged: `-O` 452 -> 473, `-O3` 407 -> 428 bytes.
-    O: { bytes: 473, fns: 1, allocs: 2, indirect: 0 },
+    // The unused string types are no longer emitted: `-O` 473 -> 455.
+    O: { bytes: 455, fns: 1, allocs: 2, indirect: 0 },
     O3: { bytes: 428, fns: 1, allocs: 2, indirect: 0 },
   },
   // THE TIGHT SCALAR LOOP — `LOOP_TABLE`'s `scalar-accum-3` is this kernel, and it is the 2.43x
