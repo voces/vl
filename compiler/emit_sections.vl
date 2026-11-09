@@ -191,7 +191,10 @@ import {
   ByteRope,
   HELP_MAP_COMPACT,
   HELP_MAP_PROBE,
+  HELP_MAP_PROBE_I32,
+  HELP_MAP_PROBE_I64,
   HELP_MAP_RESIZE,
+  HELP_MAP_RESIZE_I32,
   HELP_MAP_RESYNC,
   HELP_STR_BYTES,
   HELP_STR_CONCAT,
@@ -480,8 +483,6 @@ import {
   lvFrameLocal,
   mAllocKind,
   mAllocSlot,
-  mI32Used,
-  mI64Used,
   mNextType,
   mStructI32Idx,
   mStructI64Idx,
@@ -865,6 +866,7 @@ import {
   reconcileVariantFieldSpans,
   recordRetTys,
   recordedVoidFns,
+  rlMvTablesReset,
   scanArrLitCommit,
   scanExprArmLocals,
   stmtArmRoot,
@@ -4222,12 +4224,10 @@ function tsMapStructBody(keysWrap: i32) {
 }
 
 // Whether map shape `sh` (-1, -4, or an mv slot) has every heap type its compaction helper
-// names, asked without recording a failure: a slot no map op resolved gets no helper. The
-// string-keyed struct mints on first ask.
+// and store helper name, asked without recording a failure: a slot no map op resolved gets no
+// helper. The keyed structs and the shared probes mint on first ask.
 function mapShapeCompactable(sh: i32): boolean {
-  if sh == -1 { return true }
-  if sh == -4 { return mI32Used }
-  if sh == -6 { return mI64Used }
+  if sh == -1 || sh == -4 || sh == -6 { return true }
   if sh < 0 || sh >= mvMapTypeIdx.length { return false }
   const k = mvValKind[sh]
   if k == MVK_STR || k == MVK_I64 || k == MVK_F64 || k == MVK_F32 {
@@ -5563,8 +5563,6 @@ function nameMapCount(n: i32): i32 {
   let count = gImports + n
   if startStmts.length > 0 { count = count + 1 }
   count = count + gInitMods.length
-  if gHelpMapProbeI32 >= 0 { count = count + 2 }
-  if gHelpMapProbeI64 >= 0 { count = count + 1 }
   if gHelpF64Rem >= 0 { count = count + 1 }
   if gHelpInitFail >= 0 { count = count + 1 }
   count = count + svHelperCount()
@@ -5679,16 +5677,6 @@ function fnSymName(fi: i32): string {
 
 // The namemap entries of the shared runtime helpers, at their module-tail indices.
 function nameHelpers() {
-  if gHelpMapProbeI32 >= 0 {
-    wULEB(gHelpMapProbeI32)
-    wName("__map_probe_i32__")
-    wULEB(gHelpMapResizeI32)
-    wName("__map_resize_i32__")
-  }
-  if gHelpMapProbeI64 >= 0 {
-    wULEB(gHelpMapProbeI64)
-    wName("__map_probe_i64__")
-  }
   if gHelpF64Rem >= 0 {
     wULEB(gHelpF64Rem)
     wName("__f64_rem__")
@@ -5740,6 +5728,9 @@ function tailHelpFnCode(out: u8[], kind: i32): i32 {
   if kind == HELP_MAP_PROBE { return emitMapProbeFnCode(out) }
   if kind == HELP_MAP_RESIZE { return emitMapResizeFnCode(out) }
   if kind == HELP_MAP_RESYNC { return emitMapResyncFnCode(out) }
+  if kind == HELP_MAP_PROBE_I32 { return emitMapProbeI32FnCode(out) }
+  if kind == HELP_MAP_RESIZE_I32 { return emitMapResizeI32FnCode(out) }
+  if kind == HELP_MAP_PROBE_I64 { return emitMapProbeI64FnCode(out) }
   emitMapCompactFnCode(out, mapCompactRowShape(kind - HELP_MAP_COMPACT))
 }
 
@@ -5755,6 +5746,9 @@ function tailHelpName(kind: i32): string {
   if kind == HELP_MAP_PROBE { return "__map_probe__" }
   if kind == HELP_MAP_RESIZE { return "__map_resize__" }
   if kind == HELP_MAP_RESYNC { return "__map_resync__" }
+  if kind == HELP_MAP_PROBE_I32 { return "__map_probe_i32__" }
+  if kind == HELP_MAP_RESIZE_I32 { return "__map_resize_i32__" }
+  if kind == HELP_MAP_PROBE_I64 { return "__map_probe_i64__" }
   "__map_compact_" + i32ToStr(kind - HELP_MAP_COMPACT) + "__"
 }
 
@@ -6467,22 +6461,9 @@ function assignSharedHelperIndices(helpBase: i32) {
   gHelpMapProbeI32 = -1
   gHelpMapResize = -1
   gHelpMapResizeI32 = -1
+  gHelpMapProbeI64 = -1
   gHelpF64Rem = -1
   let nHelpers = 0
-  // The i32-KEYED probe and resize, LAST so no existing helper index moves in a program
-  // without one: the i32-keyed index is the pair layout, which neither string helper reads.
-  // The i64-keyed rep resizes over the same pairs, so it mints this pair too.
-  if mI32Used || mI64Used {
-    gHelpMapProbeI32 = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpMapResizeI32 = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-  }
-  gHelpMapProbeI64 = -1
-  if mI64Used {
-    gHelpMapProbeI64 = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-  }
   // The float remainder helper (D1586), last for the reason its neighbour above gives: no
   // existing helper index moves in a program without one. It is the first helper gated on
   // neither a string nor a map — a float program touches no string and no map.
@@ -6579,7 +6560,7 @@ function assignSharedHelperIndices(helpBase: i32) {
   gMapSetFnBase = 0
   let sr = 0
   while sr < mvMapTypeIdx.length + 3 {
-    if gOptimized == 0 && mapSetRowable(mapCompactRowShape(sr)) {
+    if gOptimized == 0 && mapShapeCompactable(mapCompactRowShape(sr)) {
       gMapSetTy.push(-2)
     } else {
       gMapSetTy.push(-1)
@@ -6590,15 +6571,6 @@ function assignSharedHelperIndices(helpBase: i32) {
   // The struct compare helpers likewise reserve only a functype per qualifying row here.
   eqHelpReserve()
   nHelpers
-}
-
-// Whether map shape `sh` has every heap type and shared helper its store helper names.
-function mapSetRowable(sh: i32): boolean {
-  if !mapShapeCompactable(sh) { return false }
-  const k = mapShapeKeyKind(sh)
-  if k == MAP_KEY_I32 { return gHelpMapProbeI32 >= 0 }
-  if k == MAP_KEY_I64 { return gHelpMapProbeI64 >= 0 && gHelpMapProbeI32 >= 0 }
-  true
 }
 
 // ── emitProgram pass manager ──
@@ -7463,6 +7435,7 @@ function emitProgramReset(rootIx: i32) {
   memoCompileReset()
   // Every module's per-compile scalars back to their declared values (lane L7).
   emitStateReset()
+  rlMvTablesReset()
   localRegistryReset()
   wasmEmitStateReset()
   nliFnIndexReset()
@@ -9017,13 +8990,6 @@ function tsEmitExternFuncTypes() {
 // Writes the functype of every shared runtime helper in use, in helper-index order, to the
 // type-section payload `emitTypeSection` has bound.
 function tsEmitHelperFuncTypes() {
-  if gHelpMapProbeI32 >= 0 {
-    helpFuncType("ai", "i") // __map_probe_i32__: (index, key i32) -> slot
-    helpFuncType("ai", "a") // __map_resize_i32__: (index, count) -> index'
-  }
-  if gHelpMapProbeI64 >= 0 {
-    helpFuncType("ajk", "i") // __map_probe_i64__: (index, key i64, keysBacking) -> slot
-  }
   if gHelpF64Rem >= 0 {
     helpFuncType("ff", "f") // __f64_rem__: (f64, f64) -> f64
   }
@@ -9068,6 +9034,10 @@ function tailHelpFuncType(kind: i32) {
   if kind == HELP_MAP_PROBE { return helpFuncType("iaaams", "i") }
   if kind == HELP_MAP_RESIZE { return helpFuncType("aaaii", "a") }
   if kind == HELP_MAP_RESYNC { return mapResyncFuncType() }
+  // (index, key i32) -> slot; (index, count) -> index'; (index, key i64, keysBacking) -> slot
+  if kind == HELP_MAP_PROBE_I32 { return helpFuncType("ai", "i") }
+  if kind == HELP_MAP_RESIZE_I32 { return helpFuncType("ai", "a") }
+  if kind == HELP_MAP_PROBE_I64 { return helpFuncType("ajk", "i") }
   mapCompactFuncType(mapCompactRowShape(kind - HELP_MAP_COMPACT))
 }
 
@@ -9999,22 +9969,6 @@ function buildCodePayload(
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__log__")
   }
   // The shared runtime helpers, each banked under the name the name section gives it — one body, one row, so a trace and a validate diagnostic cannot disagree about what to call the same function.
-  if gHelpMapProbeI32 >= 0 {
-    let rows = emitFnSpanStart.length
-    const entry: u8[] = []
-    if emitMapProbeI32FnCode(entry) < 0 { return -1 }
-    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__map_probe_i32__")
-    const resize: u8[] = []
-    rows = emitFnSpanStart.length
-    if emitMapResizeI32FnCode(resize) < 0 { return -1 }
-    placeCodeEntry(codePayload, resize, rows, -1, -1, 3, "__map_resize_i32__")
-  }
-  if gHelpMapProbeI64 >= 0 {
-    const rows = emitFnSpanStart.length
-    const entry: u8[] = []
-    if emitMapProbeI64FnCode(entry) < 0 { return -1 }
-    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__map_probe_i64__")
-  }
   if gHelpF64Rem >= 0 {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
