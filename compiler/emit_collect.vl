@@ -29,7 +29,6 @@ import {
   nodeTyIsNulLitUnion,
   nodeTyIsNulString,
   nodeTyIxOf,
-  nodeTyMapKeyKind,
   nodeTyMapKeyKindSpan,
   nodeTyPrimName,
   nodeTyReachesClosure,
@@ -404,8 +403,6 @@ import {
   mAllocKind,
   mAllocSlot,
   mAllocType,
-  mI32Used,
-  mI64Used,
   mIntMonoArmUsed,
   mNextType,
   mStructI32Idx,
@@ -702,7 +699,6 @@ import {
   tyRefArrElemOf,
 } from "./emit_map_value_slots"
 import {
-  markMapKeyUsed,
   scopeBind,
   scopePop,
   scopePush,
@@ -766,7 +762,6 @@ import {
   fieldTypeRefusalMsg,
   forceScalarListField,
   forceScalarListRep,
-  mapCtorKeyKind,
   mvCanonRepOf,
   nameIsConcreteGenAppDecl,
   nameIsNulRefList,
@@ -794,7 +789,6 @@ import {
 import {
   letAnnIsUninternedShape,
   sigKeyOfTy,
-  sigSlotAtTok,
   unionArmSigKeyTy,
 } from "./emit_sig_tokens"
 import {
@@ -1481,23 +1475,6 @@ function internCloSigKey(key: string, rep: i32) {
   cloSigPosBy[key] = cloSigKeys.length
   cloSigKeys.push(key)
   cloSigRepFn.push(rep)
-  markSigKeyMonoMapsUsed(key)
-  0
-}
-
-// Reserves the mono map struct a nullable-map token of `key` names (`M` with a negative
-// shape), so a signature whose map is spelled only inside a function type, and never
-// constructed, still has its heap type.
-function markSigKeyMonoMapsUsed(key: string) {
-  let i = 0
-  while i < key.length {
-    if key[i] == 'M' && i + 1 < key.length && key[i + 1] == '-' {
-      const shape = sigSlotAtTok(key, i)
-      if shape == -4 || shape == -5 { markMapKeyUsed(MAP_KEY_I32) }
-      if shape == -6 || shape == -7 { markMapKeyUsed(MAP_KEY_I64) }
-    }
-    i = i + 1
-  }
   0
 }
 
@@ -4338,7 +4315,6 @@ export function mAssignTypeIndices(_n: i32) {
   if rlHasKind(RLK_I32_LIST) { lTy() }
   mAssignRefListTwins()
   mAssignRefListPairs()
-  mAssignIntMapStructs()
   mAssignScalarListPairs()
   // The scalar list views (D3028), after every wrapper they subtype or keep a source of.
   let svk = 0
@@ -4606,14 +4582,6 @@ function mAssignRefListPairs() {
     }
     rs = rs + 1
   }
-  0
-}
-
-// Mint the i32- and i64-keyed map structs, each only when used. The string-keyed one mints on
-// first ask (`mapTy`).
-function mAssignIntMapStructs() {
-  if mI32Used { mapI32Ty() }
-  if mI64Used { mapI64Ty() }
   0
 }
 
@@ -5061,7 +5029,6 @@ function collectFrameMapCtor(ix: i32, fnIx: i32) {
   const t = mapCtorOpenInstTy(ix, fnIx)
   if t < 0 { return 0 }
   const m = tyMapHeld(t)
-  markMapKeyUsed(mapCtorKeyKind(ix, t))
   mvShapeOfMapHeldTy("", m, tyMapValOf(m), tyMapValOf(m))
   0
 }
@@ -5215,8 +5182,6 @@ function collectAResetTables() {
   rlElemNullable = []
   rlElemMapKey = []
   rlElemMvSlot = []
-  mI32Used = false
-  mI64Used = false
   mvValName = []
   mvKeyKind = []
   mvValTyIx = []
@@ -5448,16 +5413,7 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     } else if nameIsString(frRet) {
     }
   } else if nameIsBareMap(nd.tyName) && !typeRefIsRecord(i) {
-    // A bare map annotation. An integer key forces its own map struct and probe helper. Stays on
-    // the name, since this walk sees interior `TypeRef`s the arena does not; the arena where it
-    // covers the node, the name where not: `nodeTyMapKeyKindSpan` answers the string kind both
-    // for a string key and for "no type for this node", and this flag must not under-mint.
-    if nodeTyIxOf(i) >= 0 {
-      markMapKeyUsed(nodeTyMapKeyKindSpan(i))
-    } else {
-      markMapKeyUsed(mapNameKeyKind(nd.tyName))
-    }
-    // A ref value type interns a per-(key, value) map slot, its own map struct over a ref
+    // A bare map annotation: a ref value type interns a per-(key, value) map slot, its own map struct over a ref
     // vals list. All mv interning happens here, since collect scans every `TypeRef`, so the
     // type-index assignment sees the full slot set. Not routed onto this node's banked map
     // type at the find rung: the call mints, and an arena answer there would skip the mint.
@@ -5472,20 +5428,15 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     }
   } else if nulMapInnerName(nd.tyName) != "" {
     // A nullable map annotation collects what its non-null inner map does, constructed or not.
-    // The arena where it covers the node, the name where not: `nodeTyMapKeyKindSpan` answers the
-    // string kind for "no type for this node" too, and an under-answer leaves an integer-keyed
-    // struct unminted. The uncovered nodes are `parser.vl`'s orphaned fields.
+    // Only a covered node mints the inner value's slot, as in the bare-map arm above; the
+    // uncovered nodes are `parser.vl`'s orphaned fields.
     if nodeTyIxOf(i) >= 0 {
-      markMapKeyUsed(nodeTyMapKeyKindSpan(i))
-      // Only a covered node mints the inner value's slot, as in the bare-map arm above.
       mvShapeOfMapHeldTy(
         nulMapInnerName(nd.tyName),
         nodeTyIxOf(i),
         -1,
         nodeMapValTyIx(i),
       )
-    } else {
-      markMapKeyUsed(mapNameKeyKind(nd.tyName))
     }
   } else if nameIsStringArray(nd.tyName) {
     // Stays on the name, and the reason is the chain rather than the predicate. The arena
@@ -5590,11 +5541,6 @@ function collectAFieldTables() {
       // computed it by calling `fieldElemTyIxOfName` on the very `sFieldElemName[sfi]` handed
       // over here, so the intern's lookup rung takes the answer instead of re-deriving it.
       mvShapeOfValNameRowTy(sFieldElemName[sfi], sfk, sFieldElemTyIxRow(sfi))
-      // …and the flag. An inline shape (`const s: {m: {[i32]: i32}}`) is one `TypeRef` name, so
-      // the annotation scan's bare-map arm — the site that sets `mI32Used` for every other
-      // position — never sees this map. `mI32Used` gates the i32-keyed map struct, the probe
-      // helper and the per-function i32-key scratch frame, whose absence is invalid wasm.
-      markMapKeyUsed(sfk)
     }
     // A ref-list field (code 5) and its nullable twin (28): intern the element so
     // `sFieldRefSlot` resolves.
@@ -5679,7 +5625,6 @@ function internArmFieldMapSlot(ufi: i32) {
     if ufi < names.length { enm = names[ufi] }
     // The struct pass's row-type thread, one table over.
     mvShapeOfValNameRowTy(enm, ufk, ety)
-    markMapKeyUsed(ufk)
   }
   0
 }
@@ -5738,15 +5683,9 @@ export function collectA(_stmts: i32[]) {
           // An un-annotated `Map()`/`Set()` (usage-inferred binding) still constructs the
           // map struct, as a `{[string]: i32}` annotation does.
           if cf.identName == "Map" || cf.identName == "Set" {
-            // An UN-annotated `Map()`/`Set()` whose key the checker inferred as i32
-            // (`const m = Map()` then `m.set(1, 2)`) has no map spelling anywhere in the
-            // arena for the `TypeRef` walk below to read, so the KEY comes off the
-            // constructor call's own recorded type.
-            markMapKeyUsed(nodeTyMapKeyKind(i))
-            // …and so does the value. The `TypeRef` walk's `mvShapeOfMapHeldTy` is the only other mv
-            // mint, so without this an un-annotated map with a ref or wide value resolves its type
-            // and never mints its rep. Idempotent: an annotated twin interns the same (key, value)
-            // slot. A `Set()` mints nothing, being boolean-valued, but the node type decides that.
+            // An UN-annotated `Map()`/`Set()` has no map spelling for the `TypeRef` walk below, so
+            // its value's mv slot comes off the call's own recorded type, or a ref or wide value
+            // never mints its rep. Idempotent: an annotated twin interns the same slot.
             mvShapeOfMapNodeTy(i)
           }
           // The array-intrinsic allocators construct a list with no literal or annotation in
