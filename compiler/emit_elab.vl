@@ -2511,6 +2511,10 @@ function elabReadsParamOf(d: i32, e: i32): boolean {
         if pn is Param && pn.parType < 0 && i32ListHas(en.fnParams, pd) {
           return true
         }
+        // So is a read of a copy of one, which holds the parameter's value (D14843).
+        const cp = if pn is LetDecl { elabParamCopyOf(pd, en) } else { -1 }
+        const cn = if cp >= 0 { nodeAt(cp) } else { null }
+        if cn is Param && cn.parType < 0 { return true }
       }
       for c in nodeChildren(ix) { stack.push(c) }
     }
@@ -2518,15 +2522,18 @@ function elabReadsParamOf(d: i32, e: i32): boolean {
   false
 }
 
-// Whether `d` has an instance whose parent is instance `k`.
-function elabHasInstUnder(d: i32, k: i32): boolean {
+// The instance of `d` whose parent is instance `k`, or -1.
+function elabInstUnder(d: i32, k: i32): i32 {
   let a = 0
   while a < ekDecl.length {
-    if ekDecl[a] == d && ekParent[a] == k { return true }
+    if ekDecl[a] == d && ekParent[a] == k { return a }
     a = a + 1
   }
-  false
+  -1
 }
+
+// Whether `d` has an instance whose parent is instance `k`.
+function elabHasInstUnder(d: i32, k: i32): boolean { elabInstUnder(d, k) >= 0 }
 
 // Whether declaration `d`'s body reads a captured value its template types with an open type, so
 // each instance of its encloser types it apart (D4046).
@@ -4467,14 +4474,25 @@ function elabAliasSetFwd(
   const todo: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
   const ins: boolean[] = [false]
+  const inDs: i32[] = [-1]
   while todo.length > 0 {
     const x = todo.pop() ?? -1
     const p = par.pop() ?? -1
     const inFn = ins.pop() ?? false
+    const inD = inDs.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
       if nodeAt(x) is Ident && identDeclOf(x) == d {
-        // A nested function's read is one body for every instance (D14842).
-        if inFn { return false }
+        // A nested function's read is one body for every instance (D14842), unless the nested
+        // function is built per instance of `fn`, where a call through a set forwards it as at
+        // that instance; a hand-on to a named function's parameter forwards it either way.
+        if inFn {
+          const kk = if elabPerEnclDecls[inD] ?? false { elabInstUnder(inD, k) } else { -1 }
+          const nto = if kk >= 0 { elabSetFwdTarget(x, p, kk) } else { [] }
+          const nm = if nto.length == 0 { elabMintFwdTarget(x, p) } else { [] }
+          if nto.length == 0 && nm.length != 2 { return false }
+          tos.push(if nto.length > 0 { nto } else { [nm[1], nm[0]] })
+          continue
+        }
         // An element of a `const` list literal nothing reads hands the set nowhere.
         if elabUnreadConstLit(p, fn) { continue }
         // A `const` copy of `d` forwards it wherever the copy is read.
@@ -4493,10 +4511,12 @@ function elabAliasSetFwd(
         tos.push(if to.length > 0 { to } else { [named[1], named[0]] })
       }
       const deeper = inFn || nodeAt(x) is FuncDecl
+      const nd = if nodeAt(x) is FuncDecl { x } else { inD }
       for c in nodeChildren(x) {
         todo.push(c)
         par.push(x)
         ins.push(deeper)
+        inDs.push(nd)
       }
     }
   }
@@ -17490,6 +17510,34 @@ export function elabHoleKeyAtPins(decl: i32, pTys: i32[]): i32 {
   if under >= 0 { under } else { r }
 }
 
+// The closed signature the checker gave declaration `decl`, which has no type parameter, where
+// every pin type in `pTys` is that signature's parameter at its position; -1 otherwise. Such a
+// declaration has one type, so the elaboration mints it no instance.
+export function elabClosedSigAtPins(decl: i32, pTys: i32[]): i32 {
+  const d = elabSrcDecl(decl)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const n = nodeAt(d)
+  if !(n is FuncDecl) || n.fnTyParams.length > 0 { return -1 }
+  const sig = nodeTyIxOf(d)
+  if sig < 0 || sig >= T.tys.length || tyHasTyVar(sig) || tyHasHole(sig) {
+    return -1
+  }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || f.fnParamTypes.length != pTys.length { return -1 }
+  let i = 0
+  while i < pTys.length {
+    if (
+      pTys[i] < 0
+      || pTys[i] >= T.tys.length
+      || !tySame(pTys[i], f.fnParamTypes[i])
+    ) {
+      return -1
+    }
+    i = i + 1
+  }
+  sig
+}
+
 // Whether named function `decl` is ever delivered as a value: read by name anywhere other than
 // as the callee of a call. Its instances are keyed by the value half (architecture-target §3.4).
 export function elabDeclIsValue(decl: i32): boolean {
@@ -18678,8 +18726,25 @@ export function elabInstShadow(
   if idShadowModeOf() == 0 { return 0 }
   let probe = if callKey >= 0 { callKey } else { valueKey }
   if probe < 0 && tplCall >= 0 { probe = elabWalkKeyOf(tplCall, true, decl) }
-  idShadowRow("ckey " + site + " " + path + " " + elabInstVerdict(probe, ek))
+  idShadowRow(
+    "ckey "
+      + site
+      + " "
+      + path
+      + " "
+      + elabInstVerdict(probe, ek)
+      + " "
+      + elabShadowDeclName(decl),
+  )
   0
+}
+
+// Declaration `decl` as a shadow row names it: `name@pos`, a lambda by its minted name.
+function elabShadowDeclName(decl: i32): string {
+  if decl < 0 || decl >= P.nodes.length { return "?" }
+  const n = nodeAt(decl)
+  if n is FuncDecl { return n.fnName + "@" + i32ToStr(n.pos) }
+  "?"
 }
 
 // Whether key `probe` names the instance `ek` does: `agree`, `refines` (mono demanded `ek` at
