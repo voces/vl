@@ -8,6 +8,8 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-if-arm-join-closed-holder](2026-11-09-if-arm-join-closed-holder.md): Step 4: the checker joins an if-arm function holder at its closed side, D15331 and D15304 (#6948).
+- [2026-11-09-step7-int-map-probes-tail-rows](2026-11-09-step7-int-map-probes-tail-rows.md): Step 7: int-keyed map probes as tail rows; mI32Used and mI64Used deleted (#6947).
 - [2026-11-09-step7-list-is-names-on-read](2026-11-09-step7-list-is-names-on-read.md): Step 7: listIsIdentNames out of collectA#2, read on first ask (#6943).
 - [2026-11-09-step2-spelled-builds](2026-11-09-step2-spelled-builds.md): Step 2: signature-keyed builds, spelled 79 → 40; the TYPE rows that stand (#6940).
 - [2026-11-09-capturing-nested-generic-handed-on](2026-11-09-capturing-nested-generic-handed-on.md): Step 4: a capturing nested generic built per encloser instance, D15105 (#6939).
