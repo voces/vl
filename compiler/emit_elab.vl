@@ -3321,7 +3321,11 @@ function elabOneAt(k: i32) {
     const ct = elabSetArgBind(elabCallIx[c], cn, ct0, k)
     if tysClosed(ct) {
       elabRowEntries(elabCallIx[c], elabCallD[c], cn, ct)
-      elabReachNote(k, elabEnqueue(elabCallD[c], cn, ct, k), elabCallIx[c])
+      if elabParentFor(elabCallD[c], k) == 0 - 2 {
+        elabHandedNote(k, elabCallD[c], elabCallIx[c], cn, ct)
+      } else {
+        elabReachNote(k, elabEnqueue(elabCallD[c], cn, ct, k), elabCallIx[c])
+      }
       elabArgRows(elabCallIx[c], elabCallD[c], cn, ct, k)
     }
     const cx = nodeAt(elabCallIx[c])
@@ -9181,6 +9185,12 @@ export function elabRun() {
   ekKids = Map()
   ekParent = []
   ekReach = []
+  elabHandedCalls = Map()
+  elabHandedD = []
+  elabHandedN = []
+  elabHandedT = []
+  elabHandedIx = []
+  elabHandedK = []
   elabReadsMemo = Map()
   elabCallKeys = Map()
   erRowAt = Map()
@@ -17510,6 +17520,34 @@ export function elabHoleKeyAtPins(decl: i32, pTys: i32[]): i32 {
   if under >= 0 { under } else { r }
 }
 
+// The closed signature the checker gave declaration `decl`, which has no type parameter, where
+// every pin type in `pTys` is that signature's parameter at its position; -1 otherwise. Such a
+// declaration has one type, so the elaboration mints it no instance.
+export function elabClosedSigAtPins(decl: i32, pTys: i32[]): i32 {
+  const d = elabSrcDecl(decl)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const n = nodeAt(d)
+  if !(n is FuncDecl) || n.fnTyParams.length > 0 { return -1 }
+  const sig = nodeTyIxOf(d)
+  if sig < 0 || sig >= T.tys.length || tyHasTyVar(sig) || tyHasHole(sig) {
+    return -1
+  }
+  const f = tyAt(sig)
+  if !(f is TyFunc) || f.fnParamTypes.length != pTys.length { return -1 }
+  let i = 0
+  while i < pTys.length {
+    if (
+      pTys[i] < 0
+      || pTys[i] >= T.tys.length
+      || !tySame(pTys[i], f.fnParamTypes[i])
+    ) {
+      return -1
+    }
+    i = i + 1
+  }
+  sig
+}
+
 // Whether named function `decl` is ever delivered as a value: read by name anywhere other than
 // as the callee of a call. Its instances are keyed by the value half (architecture-target §3.4).
 export function elabDeclIsValue(decl: i32): boolean {
@@ -17862,6 +17900,7 @@ function elabReachNote(from: i32, k: i32, ix: i32) {
     elabValueInstReach(from, ix, k)
     if !i32ListHas(cs, ix) { cs.push(ix) }
     elabKeyCalls[k] = cs
+    for h in elabHandedCalls[k] ?? [] { elabHandedAt(h, from, ix) }
     const cn = nodeAt(ix)
     if cn is Call {
       let p = 0
@@ -17872,6 +17911,54 @@ function elabReachNote(from: i32, k: i32, ix: i32) {
         }
         p = p + 1
       }
+    }
+  }
+  0
+}
+
+// The calls of nested declarations an instance's body makes where the declaration's encloser is
+// not on the instance's chain: instance → entries into `elabHandedD`/`N`/`T`/`Ix`/`K` (D15105).
+let elabHandedCalls: {[i32]: i32[]} = Map()
+let elabHandedD: i32[] = []
+let elabHandedN: string[][] = []
+let elabHandedT: i32[][] = []
+let elabHandedIx: i32[] = []
+let elabHandedK: i32[] = []
+
+// Records that instance `k`'s call `ix` runs nested declaration `d` at `names`/`tys`, which is
+// built under each instance whose call hands `k` the value: those reached so far and later ones.
+function elabHandedNote(k: i32, d: i32, ix: i32, names: string[], tys: i32[]) {
+  const h = elabHandedD.length
+  elabHandedD.push(d)
+  elabHandedN.push(names)
+  elabHandedT.push(tys)
+  elabHandedIx.push(ix)
+  elabHandedK.push(k)
+  const hs = elabHandedCalls[k] ?? []
+  hs.push(h)
+  elabHandedCalls[k] = hs
+  for c in elabKeyCalls[k] ?? [] {
+    const ks = elabCallKeys[c] ?? []
+    let j = 0
+    while j + 1 < ks.length {
+      if ks[j + 1] == k { elabHandedAt(h, ks[j], c) }
+      j = j + 2
+    }
+  }
+}
+
+// Builds entry `h` under instance `a`, whose call `c` reached the entry's instance: the value of
+// the declaration that call hands holds the new key.
+function elabHandedAt(h: i32, a: i32, c: i32) {
+  const d = elabHandedD[h]
+  if a < 0 || elabParentFor(d, a) < 0 { return 0 }
+  const mk = elabEnqueue(d, elabHandedN[h], elabHandedT[h], a)
+  if mk < 0 { return 0 }
+  elabReachNote(elabHandedK[h], mk, elabHandedIx[h])
+  const cn = nodeAt(c)
+  if cn is Call {
+    for v in cn.callArgs {
+      if cwFnValueDeclOf(v) == d { elabValueKeyNoteOnce(v, a, mk) }
     }
   }
   0
@@ -17949,6 +18036,44 @@ function elabReachedOf(k: i32, d: i32): i32 {
     }
   }
   found
+}
+
+// An instance of `d` that instance `k` reaches, where every one it reaches binds `d`'s own names
+// alike and they differ only in their encloser's instance (D15105); -2 where two bind them apart.
+function elabReachedAgreedOf(k: i32, d: i32): i32 {
+  let found = -1
+  const seen: {[i32]: boolean} = Map()
+  const work: i32[] = [k]
+  while work.length > 0 {
+    const a = work.pop() ?? -1
+    if a < 0 || a >= ekReach.length || (seen[a] ?? false) { continue }
+    seen[a] = true
+    for r in ekReach[a] {
+      if ekDecl[r] == d {
+        if found >= 0 && !elabOwnBindsAlike(found, r) { return 0 - 2 }
+        if found < 0 { found = r }
+      }
+      work.push(r)
+    }
+  }
+  if found >= 0 { found } else { 0 - 2 }
+}
+
+// Whether instances `a` and `b` bind their own names (those their parents do not) alike.
+function elabOwnBindsAlike(a: i32, b: i32): boolean {
+  const pa = ekParent[a]
+  const pb = ekParent[b]
+  const na = ekNames[a].length - (if pa >= 0 { ekNames[pa].length } else { 0 })
+  const nb = ekNames[b].length - (if pb >= 0 { ekNames[pb].length } else { 0 })
+  if na != nb || na < 0 { return false }
+  let i = 0
+  while i < na {
+    if ekNames[a][i] != ekNames[b][i] || !tySame(ekTys[a][i], ekTys[b][i]) {
+      return false
+    }
+    i = i + 1
+  }
+  true
 }
 
 // The one instance of `d` that parameter `i` of instance `k` carries: called as the callee, or
@@ -18094,8 +18219,10 @@ function elabValCallInst(k: i32, cx: i32, d: i32): i32 {
   let v = 0
   while v + 1 < vc.length {
     if vc[v] == cx && ekDecl[vc[v + 1]] == d {
-      if r >= 0 && r != vc[v + 1] { return -1 }
-      r = vc[v + 1]
+      if r >= 0 && r != vc[v + 1] && !elabOwnBindsAlike(r, vc[v + 1]) {
+        return -1
+      }
+      if r < 0 { r = vc[v + 1] }
     }
     v = v + 2
   }
@@ -18103,8 +18230,10 @@ function elabValCallInst(k: i32, cx: i32, d: i32): i32 {
   let j = 0
   while j + 1 < ks.length {
     if ks[j] == k && ekDecl[ks[j + 1]] == d {
-      if r >= 0 && r != ks[j + 1] { return -1 }
-      r = ks[j + 1]
+      if r >= 0 && r != ks[j + 1] && !elabOwnBindsAlike(r, ks[j + 1]) {
+        return -1
+      }
+      if r < 0 { r = ks[j + 1] }
     }
     j = j + 2
   }
@@ -18224,6 +18353,7 @@ function elabOutTyVia(t: i32, k: i32, via: i32): i32 {
       const so = elabSoleInstOf(d)
       if so >= 0 { r = so }
     }
+    if r == 0 - 2 { r = elabReachedAgreedOf(k, d) }
     if r == -1 { continue }
     if r < 0 { return -1 }
     let i = 0
@@ -18698,8 +18828,25 @@ export function elabInstShadow(
   if idShadowModeOf() == 0 { return 0 }
   let probe = if callKey >= 0 { callKey } else { valueKey }
   if probe < 0 && tplCall >= 0 { probe = elabWalkKeyOf(tplCall, true, decl) }
-  idShadowRow("ckey " + site + " " + path + " " + elabInstVerdict(probe, ek))
+  idShadowRow(
+    "ckey "
+      + site
+      + " "
+      + path
+      + " "
+      + elabInstVerdict(probe, ek)
+      + " "
+      + elabShadowDeclName(decl),
+  )
   0
+}
+
+// Declaration `decl` as a shadow row names it: `name@pos`, a lambda by its minted name.
+function elabShadowDeclName(decl: i32): string {
+  if decl < 0 || decl >= P.nodes.length { return "?" }
+  const n = nodeAt(decl)
+  if n is FuncDecl { return n.fnName + "@" + i32ToStr(n.pos) }
+  "?"
 }
 
 // Whether key `probe` names the instance `ek` does: `agree`, `refines` (mono demanded `ek` at
