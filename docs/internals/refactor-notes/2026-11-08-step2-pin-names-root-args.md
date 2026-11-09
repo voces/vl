@@ -57,6 +57,18 @@ the old pin had no caller left and is deleted. The two pins differ only in order
 banked a function value's own open type ahead of the row arms, and every site closes it through
 `monoPinSubTyOf`), and the sweep moves no module.
 
+## #6890's families after this PR
+
+| family | stands because |
+|---|---|
+| argument pin | switched: every site reads `monoArgPinTyAt`, and the row arms are rep (step 7) |
+| closed-type spelling, record rows, union registration | the spelling or row a type is built at is rep, shadow 1's `differ` rows |
+| body retyping (`monoPinnedOperandTy`) | the declared type, not the narrowed one; a switch folds more and changes modules (#6890) |
+| type-parameter binding and key (`monoKeyPinSeg`) | the instance key is spelled from pins; the call-key replacement is the end state |
+| function values (`monoElabPin`) | its type is already `elabCallParamTy`; mono keeps the spelling and the delivery |
+| lambda pins, delivery and return | switched by #6907 |
+| `monoOpenArgDefaultPin` | fires in 1 program; ablated, that module is byte-identical, so it stays as a rerouting rung |
+
 ## Graded
 
 Sweep, base against candidate: 23,741 of 23,741 the same, 0 bytes-only movers, 0 output movers.
