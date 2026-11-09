@@ -6069,6 +6069,9 @@ let monoMakeCallIx = 0 - 1
 // Callee identifiers resolved through a `let` alias chain: their calls are never re-spelled to
 // the lambda's instance, since the alias may hold another value at run time (D3849).
 let monoNoRename: i32[] = []
+// Reads a bundle hands whole: each signature instances the binding afresh, which no write
+// forces, so they are kept from rename without being taken as a reassigned binding's (D15597).
+let monoBundleReads: i32[] = []
 // Callee identifiers that read a `let`/`const`, keyed to that binding, once renamed to an instance.
 let monoAliasCallDecl: {[i32]: i32} = Map()
 // A re-pointed `let` handed to a generic arrow parameter, keyed `<frame>:<decl>`, to the instance
@@ -8893,7 +8896,8 @@ function monoMakeInstanceLater(
     // A lambda dispatch arm's instances are each frame's row entry, not one binding's.
     const written = monoArmLamFe(calleeIx, cal3) < 0
       && (monoNameWrittenAt(cal3.identName, calleeIx)
-      || i32ListHas(monoNoRename, calleeIx))
+      || i32ListHas(monoNoRename, calleeIx)
+      && !i32ListHas(monoBundleReads, calleeIx))
     if (written && calleeIx != monoWriteCoercedCall) {
       // A frame-keyed instance differs by its enclosing instance, not its argument type.
       if callFrame >= 0 {
@@ -17180,6 +17184,7 @@ function monoCoerceBundleArgs(n: Call, ctx: i32): i32 {
     if bs.length > 0 && nodeAt(unwrapParen(n.callArgs[i])) is Ident {
       // The read stays the generic, so each signature instances it afresh.
       monoNoRename.push(unwrapParen(n.callArgs[i]))
+      monoBundleReads.push(unwrapParen(n.callArgs[i]))
       for sg in bs {
         if (
           monoCoerceFnValueName(n.callArgs[i], monoPinAnnSpelling(sg), ctx, sg)
@@ -20061,7 +20066,18 @@ export function monoBundleFe(x: i32, fnIx: i32, sigs: i32[], k: i32): i32 {
 // The slot built for the function read `x` in function `fnIx` at signature `sig`, as the row
 // records it; -1 where the row holds none.
 export function monoBundleReadFe(x: i32, fnIx: i32, sig: i32): i32 {
-  monoCadRowFe(unwrapParen(x), monoCadInstOf(fnIx), sig)
+  const r = unwrapParen(x)
+  const fe = monoCadRowFe(r, monoCadInstOf(fnIx), sig)
+  if fe >= 0 || r < 0 || !(nodeAt(r) is Ident) { return fe }
+  // A `const` bound to a lambda reads the closure the row keeps at the lambda, under this
+  // instance or, for one lifted out of every instance, under none (D15597).
+  const d = identDeclOf(r)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(r) }
+  if !(dn is LetDecl) || dn.letKw != "const" { return -1 }
+  const v = unwrapParen(dn.letInit)
+  if v < 0 || !(nodeAt(v) is FuncDecl) { return -1 }
+  const own = monoCadRowFe(v, monoCadInstOf(fnIx), sig)
+  if own >= 0 { own } else { monoCadRowFe(v, -1, sig) }
 }
 
 // The delivery token for the function value read `read` in function `fnIx` returns: the closure
@@ -20274,6 +20290,7 @@ function monoBundleNamedPin(
   if row < 0 || row >= sNames.length { return -1 }
   // The read stays the generic, so each signature instances it afresh.
   monoNoRename.push(x)
+  monoBundleReads.push(x)
   for sg in sigs {
     if monoCoerceFnValueName(x, monoPinAnnSpelling(sg), ctx, sg) < 0 {
       return -1
@@ -25630,6 +25647,7 @@ export function monomorphize(stmts: i32[]) {
   monoProgNames = Map()
   monoProgNamesDeep = false
   monoNoRename = []
+  monoBundleReads = []
   monoArmCall = -1
   monoArmCtx = -1
   monoBakeSpecK = -1
