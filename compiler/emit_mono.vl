@@ -712,6 +712,7 @@ import {
   elabLamPinsUnderWalk,
   elabMakerTwinHeld,
   elabMemberKeyAt,
+  elabMemberKeyAtTys,
   elabNarrowedCarry,
   elabNodeRepAt,
   elabNodeTyAgreed,
@@ -6901,10 +6902,10 @@ function monoCloneGenericObjArm(ix: i32, n: ObjLit): i32 {
 // degrade to no on a hole. One rung, and it must live here: the pinned type exists nowhere
 // else. The two arms below are separately load-bearing — do not collapse them.
 
-// The pinned type row of a body expression that reads a monomorphized parameter, or -1.
-// Two gates: the name must match a parameter of the instance, and the checker's recorded
-// type at that node must still carry a type variable. A local that shadows the parameter
-// is typed concretely, so it fails the second gate and the pin is not applied to it.
+// The type of a body read of a monomorphized parameter (the name matches one, and the checked
+// type is still open, so a shadowing local is not one), else -1: the elaboration's type at the
+// read in the instance being walked, else the parameter's pin `pTys[i]`, which stands where that
+// type is open or missing (a hole function list's id rep).
 function monoPinnedOperandTy(ix: i32, pNames: string[], pTys: i32[]) {
   if ix < 0 { return -1 }
   const e = nodeAt(ix)
@@ -6913,6 +6914,17 @@ function monoPinnedOperandTy(ix: i32, pNames: string[], pTys: i32[]) {
     let i = 0
     while i < pNames.length {
       if pNames[i] == e.identName {
+        const top = elabWalkTop()
+        const et = if top >= 0 { elabNodeTy(ix, top) } else { -1 }
+        if (
+          et >= 0
+          && et < T.tys.length
+          && elabTyClosed(et, 0)
+          && !tyHasTyVar(et)
+          && !tyHasHole(et)
+        ) {
+          return et
+        }
         if i < pTys.length { return pTys[i] }
         return -1
       }
@@ -9679,8 +9691,11 @@ function monoMakeInstanceGo(
     const valueKey = if callKey < 0 && lamTop < 0 && (valueHalf || tplCall < 0) { instKeyValueTime(tplCall, calleeIx, monoOrigNode[origFe], pinTys) } else { -1 }
     // A lambda built inside an instance binds at the elaboration's key for it there.
     const lamKey = if lamTop >= 0 { elabLamKeyOf(monoOrigNode[origFe]) } else { -1 }
-    // Where nothing keys the build, the instance whose closed signature its pins are binds it.
-    const pinKey = if callKey < 0 && valueKey < 0 && lamKey < 0 { elabHoleKeyAtPins(monoOrigNode[origFe], pinTys) } else { -1 }
+    // Where nothing keys the build, the instance whose closed signature its pins are binds it: an
+    // un-annotated function's, else a generic's at those parameter types (a value read out of a
+    // container, which no delivery keys).
+    const holePinKey = if callKey < 0 && valueKey < 0 && lamKey < 0 { elabHoleKeyAtPins(monoOrigNode[origFe], pinTys) } else { -1 }
+    const pinKey = if callKey < 0 && valueKey < 0 && lamKey < 0 && holePinKey < 0 { elabMemberKeyAtTys(pinTys, monoOrigNode[origFe]) } else { holePinKey }
     const shValKey = if valueKey >= 0 { valueKey } else if lamKey >= 0 { lamKey } else { pinKey }
     const shPath = if callKey >= 0 { "call" } else if lamTop >= 0 { "lam" } else if valueKey >= 0 { "value" } else if pinKey >= 0 { "pins" } else { "spelled" }
     if callKey >= 0 {
@@ -9708,6 +9723,21 @@ function monoMakeInstanceGo(
         + instKeyCanon(
         origFe,
         valueKey,
+        pinTys,
+        pinSets,
+        callFrame,
+        cbFnNames,
+      )
+        + (if retWiden != "" { "=>" + retWidenKey } else { "" })
+    } else if pinKey >= 0 {
+      // A build nothing else keys binds at the elaboration's instance whose closed signature its
+      // pins are, as a value read of it would.
+      const pinSets: string[] = []
+      for pt in pinTys { pinSets.push(monoSetPinDiscrim(pt)) }
+      k.key = "V"
+        + instKeyCanon(
+        origFe,
+        pinKey,
         pinTys,
         pinSets,
         callFrame,
@@ -9798,7 +9828,7 @@ function monoMakeInstanceGo(
     const typedHit = monoTypedKeys.get(typedKey) ?? ""
     // The instance registered under the typed key serves this request only where the two name the
     // same elaborated instance when both are known: one rep can carry two types whose bodies differ.
-    const reqKey = if callKey >= 0 { callKey } else { valueKey }
+    const reqKey = if callKey >= 0 { callKey } else if valueKey >= 0 { valueKey } else { pinKey }
     const hitKey = if typedHit != "" { monoKeyEk[typedHit] ?? -1 } else { -1 }
     if (
       typedHit != ""
