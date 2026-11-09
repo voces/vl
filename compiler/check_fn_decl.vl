@@ -105,7 +105,14 @@ import {
   guardParamIdxsPush,
   guardThensPush,
 } from "./check_guard"
-import { holeDemandTy, holeFlowDst, holeFlowSrc } from "./check_hole_rows"
+import {
+  holeCallArgs,
+  holeCallName,
+  holeCallTruncate,
+  holeDemandTy,
+  holeFlowDst,
+  holeFlowSrc,
+} from "./check_hole_rows"
 import {
   blockLastStmt,
   clearTailVerdict,
@@ -188,6 +195,7 @@ import { lbiPinnedReads } from "./check_num_lit_state"
 import { inlayHole, joinTypedByWant } from "./check_redundant_annot"
 import { recordRedundantRet } from "./check_redundant_ret"
 import {
+  assignable,
   braceNameNote,
   tErr,
   tErrWant,
@@ -238,6 +246,7 @@ import {
   tyAt,
   tyBearsNull,
   tyEq,
+  tyHasHole,
   tyMutEpoch,
   tyToStr,
 } from "./check_types"
@@ -255,7 +264,7 @@ import {
   identAuditDrop,
   identSet,
 } from "./symbols"
-import { isNeverTy, isVoidTy } from "./tyquery"
+import { isNeverTy, isVoidTy, tyHasTyVar } from "./tyquery"
 
 // Solves every un-annotated parameter of top-level function `fnIx` from its body's usage:
 // probes the body once (diagnostics and symbols suppressed) and records the first concrete
@@ -292,6 +301,7 @@ export function solveUnannotParams(fnIx: i32) {
     symEnabled = 0
     inferQuiet = true
     quietDepth = quietDepth + 1
+    const hc0 = holeCallName.length
     paramSolveProbeSet(true)
     expObsBegin(fd, fnIx)
     checkFuncDeclNode(fd, fnIx)
@@ -306,7 +316,10 @@ export function solveUnannotParams(fnIx: i32) {
       if st is TyVar {
         if (solvedParamTys[st.tvName] ?? -1) < 0 {
           if holeNameIsParamOf(st.tvName, fd.fnName, fnIx, ps.length) {
-            if !holeFlowsToTwoFns(m.holeFlow, st.tvName, holeFlowDst[fi]) {
+            if (
+              !holeFlowsToTwoFns(m.holeFlow, st.tvName, holeFlowDst[fi])
+              && !holeCalledOtherwise(hc0, st.tvName, holeFlowDst[fi])
+            ) {
               solvedParamTysSetAt(st.tvName, holeFlowDst[fi])
             }
           }
@@ -314,6 +327,7 @@ export function solveUnannotParams(fnIx: i32) {
       }
       fi = fi + 1
     }
+    holeCallTruncate(hc0)
     checkRollback(m, RB_SOLVE)
     if prbArmed { prbLeave("solveUnannotParams") }
     // Patches the hoisted `TyFunc` in place, gated on this node being the registered
@@ -353,6 +367,36 @@ function holeFlowsToTwoFns(from: i32, name: string, dst: i32): boolean {
       if s.tvName == name {
         const d = holeFlowDst[i]
         if tyAt(d) is TyFunc && !tyEq(d, dst) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True when hole `name` is called directly, in a row past `from`, with an argument the function
+// type `dst` it flows into does not take: the parameter is then a generic used at two instances,
+// as in `holeFlowsToTwoFns` (D15576).
+function holeCalledOtherwise(from: i32, name: string, dst: i32): boolean {
+  const ft = tyAt(dst)
+  if !(ft is TyFunc) { return false }
+  let i = from
+  while i < holeCallName.length {
+    const args = holeCallArgs[i]
+    if holeCallName[i] == name {
+      if args.length != ft.fnParamTypes.length { return true }
+      let k = 0
+      while k < args.length {
+        const at = args[k]
+        if (
+          at >= 0
+          && !tyHasHole(at)
+          && !tyHasTyVar(at)
+          && !assignable(at, ft.fnParamTypes[k])
+        ) {
+          return true
+        }
+        k = k + 1
       }
     }
     i = i + 1
