@@ -180,6 +180,7 @@ import {
   MAP_KEY_I64,
   MAP_KEY_STR,
   mapKeyKindOfTy,
+  mapTwinUnionMember,
   tyIsValueUnionBox,
   valueAtomKind,
   valueRowKind,
@@ -187,8 +188,8 @@ import {
 
 // One struct per classified type. `rdCovered` is 1 when the rep derives structurally, 0 when
 // the consumer must use its legacy path; `rdKind` is the `VKind` member, `rdNul` how `null` is
-// encoded (ref, boolean/litunion sentinel, or boxed atom tag), `rdSlot` the interned slot (-1 at
-// the arena level), `rdSigTok`/`rdListElem` the `$fnsig` token and list-element vocabulary.
+// encoded (ref, boolean/litunion sentinel, or boxed atom tag), `rdSlot` a table column's slot (-1
+// from `repOfTy`, whose struct row is `repSlotOfKind`'s), `rdSigTok`/`rdListElem` the `$fnsig` token and list-element vocabulary.
 export type RepDesc = {
   rdCovered: i32,
   rdKind: VKind,
@@ -1167,6 +1168,8 @@ export function tyMapKeyKind(ty: i32): i32 {
   if ty < 0 { return MAP_KEY_STR }
   const t = tyAt(ty)
   if t is TyMap { return mapKeyKindOfTy(t.mKey) }
+  const mt = mapTwinUnionMember(ty)
+  if mt >= 0 { return tyMapKeyKind(mt) }
   MAP_KEY_STR
 }
 
@@ -1213,8 +1216,10 @@ function nodeMapTyIx(nodeIx: i32): i32 {
       -1
     }
     TyMap => ty
+    // Maps nothing can tell apart are their one map (D15540).
+    TyUnion => mapTwinUnionMember(ty)
     // Not a map, nullable or bare.
-    TyPrim | TyFunc | TyObj | TyUnion | TyArray | TyNeg | TyVar | TyLit | TyErr => -1
+    TyPrim | TyFunc | TyObj | TyArray | TyNeg | TyVar | TyLit | TyErr => -1
   }
 }
 
@@ -3166,7 +3171,7 @@ export function buildStructTwins() {
 // The descriptor, tree-primary over the flat arms (Stage B wave 1): the recursive
 // Rep tree is authoritative wherever the flat arms claim coverage, so the returned
 // kind/null discipline/list-element vocabulary are the tree's projections. The flat
-// derivation still decides coverage (a shape it cannot name keeps rejecting) and the nominal slot (the tree's hash-cons may surface a twin at a different index).
+// derivation still decides coverage (a shape it cannot name keeps rejecting).
 export function repOfTy(ty: i32): RepDesc {
   const d = repOfTyFlat(ty)
   if d.rdCovered == 0 { return d }
@@ -3174,7 +3179,6 @@ export function repOfTy(ty: i32): RepDesc {
   const tk = repTreeVKind(tix)
   if tk == null { return d }
   const td = repMk(tk, repTreeNulOf(tix), repTreeListElemName(tix))
-  td.rdSlot = d.rdSlot
   td.rdAtom = d.rdAtom
   td
 }
@@ -3484,9 +3488,7 @@ function repOfTyFlat(ty0: i32): RepDesc {
       // variant index, not a struct-table index); any other object shape is a
       // standalone struct ref.
       if repTyIsVariant(ty) { return repMk("variant", 0, "") }
-      const d = repMk("struct", 0, "")
-      d.rdSlot = repSlotOfTy(ty)
-      return d
+      return repMk("struct", 0, "")
     }
     TyUnion => {
       // A string literal union reps as the interned i32 atom, whatever its spelling.
@@ -3516,6 +3518,9 @@ function repOfTyFlat(ty0: i32): RepDesc {
       const nb = numLitUnionBaseTy(ty)
       if nb >= 0 { return repOfTyFlat(nb) }
       if unionHasOpenMember(t.uMembers) { return repUncovered() }
+      // Maps nothing can tell apart are the one map they all represent as (D15540).
+      const mt = mapTwinUnionMember(ty)
+      if mt >= 0 { return repOfTyFlat(mt) }
       // A `{tag, value}` value/struct union box.
       if tyIsValueUnionBox(ty) { return repMk("union", 0, "") }
       return repUncovered()
@@ -3618,6 +3623,9 @@ function repOfNullable(inner: i32): RepDesc {
       // A numeric literal union made nullable is its base scalar made nullable.
       const nb = numLitUnionBaseTy(inner)
       if nb >= 0 { return repOfNullable(nb) }
+      // Maps nothing can tell apart: their one map's nullable.
+      const mt = mapTwinUnionMember(inner)
+      if mt >= 0 { return repOfNullable(mt) }
       // Lists that all spell one list: that list's nullable, as the first covered member reps it.
       if oneListUnionRender(inner) != "" {
         for m in it.uMembers {
@@ -4029,6 +4037,8 @@ function repOfArray(elem: i32): RepDesc {
     }
     // Lists that all spell one list are that list, a reference like `S[][]`'s element.
     if oneListUnionRender(elem) != "" { return repMk("reflist", 0, "list") }
+    // So are maps nothing can tell apart, the element their one map is (D15540).
+    if mapTwinUnionMember(elem) >= 0 { return repMk("reflist", 0, "map") }
     // A value-union BOX element the registry holds a row for — a reference, so a ref list.
     // `tyIsValueUnionBox` is the shape gate (a numeric litunion has a canon row too but reps
     // as its scalar list). The row is found by canon id, else by key, since an arena node
@@ -4413,7 +4423,6 @@ let rtKind: RtKind[] = [] // node kind — see the grammar above
 let rtDisc: i32[] = [] // kind-specific: nul discipline (rdNul's 1/2/3/4) ·
 // struct 1 = union-VARIANT member · closure 1 = declared-void result
 let rtChild: i32[] = [] // list elem / map val / nul inner; else -1
-let rtSlot: i32[] = [] // struct: the interned struct-table slot, else -1
 let rtTy: i32[] = [] // the arena index that BUILT the node — provenance for
 // debugging only, never identity (a hash-cons merge keeps the first builder's)
 let rtReason: string[] = [] // unsup: the policy reason-code, else ""
@@ -4439,14 +4448,13 @@ function repTreeDrop() {
 // Lifetime: generation-stamped on the checker axes of the flat layer's memos
 // (`tyMutEpoch`, `cUserTypesVer`) and the variant shapes (`rvsSync` drops it); any bump drops the whole tree, conservative like
 // the key memo. `sNames.length` is deliberately not an axis, since the authority
-// projections never consult `rtSlot` and slot interning happens constantly during emit. Building is lazy; a returned node index is valid only until the next mutation.
+// projections never consult a table row and slot interning happens constantly during emit. Building is lazy; a returned node index is valid only until the next mutation.
 function rtSync() {
   rvsSync()
   if (rtEpoch == tyMutEpoch && rtUserVer == cUserTypesVer) { return 0 }
   rtKind = []
   rtDisc = []
   rtChild = []
-  rtSlot = []
   rtTy = []
   rtReason = []
   rtKidStart = []
@@ -4468,7 +4476,6 @@ function rtAlloc(
   kind: RtKind,
   ty: i32,
   disc: i32,
-  slot: i32,
   reason: string,
   kidCount: i32,
 ): i32 {
@@ -4476,7 +4483,6 @@ function rtAlloc(
   rtKind.push(kind)
   rtDisc.push(disc)
   rtChild.push(-1)
-  rtSlot.push(slot)
   rtTy.push(ty)
   rtReason.push(reason)
   rtKidStart.push(0)
@@ -4508,7 +4514,7 @@ function rtLeafOf(kind: RtKind, disc: i32, reason: string, ty: i32): i32 {
     if ty >= 0 { rtByTyPut(ty, hit) }
     return hit
   }
-  const ix = rtAlloc(kind, ty, disc, -1, reason, 0)
+  const ix = rtAlloc(kind, ty, disc, reason, 0)
   rtIntern[key] = ix
   if ty >= 0 { rtByTyPut(ty, ix) }
   ix
@@ -4552,13 +4558,11 @@ function rtSetKids(ix: i32, kids: i32[]) {
 
 // Complete node `ix` (children filled): consult the hash-cons table. An existing
 // structurally-identical node wins — `ix` is orphaned (a small, bounded arena leak,
-// at most one per distinct `Ty` per generation) and the `Ty` memo redirects, folding
-// nominal slot knowledge into the survivor. A cycle participant cannot collide (its key contains its own index), so redirecting is always safe.
+// at most one per distinct `Ty` per generation) and the `Ty` memo redirects. A cycle participant cannot collide (its key contains its own index), so redirecting is always safe.
 function rtComplete(ix: i32, ty: i32): i32 {
   const key = rtInternKeyOf(ix)
   const hit = rtIntern[key] ?? -1
   if hit >= 0 && hit != ix {
-    if rtSlot[hit] < 0 && rtSlot[ix] >= 0 { rtSlot[hit] = rtSlot[ix] }
     if ty >= 0 { rtByTyPut(ty, hit) }
     return hit
   }
@@ -4604,7 +4608,7 @@ function rtGo(ty0: i32): i32 {
     }
     TyArray => {
       if t.aElem < 0 { return rtLeafOf("unsup", 0, "list:hole", ty) }
-      const ix = rtAlloc("list", ty, 0, -1, "", -1)
+      const ix = rtAlloc("list", ty, 0, "", -1)
       rtByTyPut(ty, ix)
       return rtCompleteChild(ix, rtGo(t.aElem), ty)
     }
@@ -4660,7 +4664,7 @@ function rtOfFunc(ty: i32, paramTys: i32[], retTy: i32): i32 {
       if rt.primName == "void" { disc = 1 }
     }
   }
-  const ix = rtAlloc("closure", ty, disc, -1, "", -1)
+  const ix = rtAlloc("closure", ty, disc, "", -1)
   rtByTyPut(ty, ix)
   const kids: i32[] = []
   let i = 0
@@ -4686,9 +4690,9 @@ function rtOfObj(ty: i32, fieldTys: i32[]): i32 {
 // The struct-node builder, split from `rtOfObj` so a single-member union can
 // build its member's shape under the union's memo index with variant-ness forced
 // off. `memoTy` keys `rtByTy` (the cycle breaker, so a self-reference through the
-// alias spelling resolves back to it); `objTy` names the fields and claims the slot.
+// alias spelling resolves back to it); `objTy` names the fields.
 function rtOfObjAs(memoTy: i32, objTy: i32, disc: i32, fieldTys: i32[]): i32 {
-  const ix = rtAlloc("struct", objTy, disc, repSlotOfTy(objTy), "", -1)
+  const ix = rtAlloc("struct", objTy, disc, "", -1)
   rtByTyPut(memoTy, ix)
   const kids: i32[] = []
   let fi = 0
@@ -4708,7 +4712,7 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
   // so building it identically here lets the hash-cons fold both spellings into one
   // node. Without this arm the tree answered "union" for a type every reader lowers as the i32 atom niche, giving invalid wasm.
   if tyIsNullableLitUnion(ty) {
-    const nix = rtAlloc("nul", ty, 3, -1, "", -1)
+    const nix = rtAlloc("nul", ty, 3, "", -1)
     rtByTyPut(ty, nix)
     return rtCompleteChild(
       nix,
@@ -4744,7 +4748,7 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
     return rtLeafOf("unsup", 0, "union:open", ty)
   }
   if tyIsValueUnionBox(ty) {
-    const ix = rtAlloc("box", ty, 0, -1, "", -1)
+    const ix = rtAlloc("box", ty, 0, "", -1)
     rtByTyPut(ty, ix)
     const kids: i32[] = []
     let mi = 0
@@ -4812,7 +4816,7 @@ function rtOfNullable(ty: i32, inner: i32): i32 {
   if inner < 0 { return rtLeafOf("unsup", 0, "nul:hole", ty) }
   const disc = rtNulDiscOf(inner)
   if disc == 0 { return rtLeafOf("unsup", 0, "nul:unclassified", ty) }
-  const ix = rtAlloc("nul", ty, disc, -1, "", -1)
+  const ix = rtAlloc("nul", ty, disc, "", -1)
   rtByTyPut(ty, ix)
   rtCompleteChild(ix, rtGo(inner), ty)
 }
@@ -4820,7 +4824,7 @@ function rtOfNullable(ty: i32, inner: i32): i32 {
 function rtOfMap(ty: i32, mVal: i32, mSet: i32): i32 {
   // Every key kind stores in the same `$mapStruct` family; the key list is the slot's.
   if mSet != 1 && mVal < 0 { return rtLeafOf("unsup", 0, "map:val-hole", ty) }
-  const ix = rtAlloc("map", ty, 0, -1, "", -1)
+  const ix = rtAlloc("map", ty, 0, "", -1)
   rtByTyPut(ty, ix)
   // A Set is internally a boolean-valued map — the mono value rep.
   const child = if mSet == 1 { rtLeafOf("bool", 0, "", -1) } else { rtGo(mVal) }
@@ -4833,11 +4837,6 @@ function rtOfMap(ty: i32, mVal: i32, mSet: i32): i32 {
 function repTreeKindOf(ix: i32): string {
   if ix < 0 { return "" }
   rtKind[ix]
-}
-
-function repTreeSlotOf(ix: i32): i32 {
-  if ix < 0 { return -1 }
-  rtSlot[ix]
 }
 
 // The tree's projection onto the flat `VKind` vocabulary — the fact the
@@ -4999,8 +4998,7 @@ function rtNulVKind(ix: i32): VKind | null {
       return "nulclosure"
     }
     "struct" => {
-      // A union arm's niche is decided per arena type; the node's builder decides it, as it
-      // already decides `rtSlot`.
+      // A union arm's niche is decided per arena type, by the node's builder.
       if rtDisc[inner] == 1 { return repNulObjKind(rtTy[inner]) }
       return "nulstruct"
     }
@@ -5411,18 +5409,6 @@ function repShadowCheckTy(ty: i32) {
       ty,
       "flat=" + d.rdSigTok + " tree=" + repSigTokOfKind(tk),
     )
-  }
-  if d.rdSlot >= 0 {
-    const ts = repTreeSlotOf(tix)
-    if ts < 0 {
-      repShadowNote("slot", ty, "flat=" + i32ToStr(d.rdSlot) + " tree=-1")
-    } else if repStructSlotsTwin(d.rdSlot, ts) == 0 {
-      repShadowNote(
-        "slot",
-        ty,
-        "flat=" + i32ToStr(d.rdSlot) + " tree=" + i32ToStr(ts) + " (not twins)",
-      )
-    }
   }
   0
 }
