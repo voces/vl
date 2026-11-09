@@ -3,6 +3,7 @@
 // lives in one, else from the checker; `recordedVoidFns` reads it for voidness, and the
 // shadow grades that column and the result kind against it. Off unless a host arms it; armed, each emitted function is
 // counted by class (`docs/internals/refactor-notes/2026-10-25-scoreboard-baselines.md`, pass rows).
+import { mapTwinUnionMember } from "./check_ty_rep"
 import {
   ArrayLit,
   BinExpr,
@@ -29,15 +30,8 @@ import { recBuildTable, recBuildTyIn, recKeptFnDstOf } from "./check_rec_rows"
 import { recPassThroughArg } from "./check_record_origins"
 import { identBoundFnDeclOf } from "./check_scopes"
 import {
-  CW_UP_ARG,
-  CW_UP_ELEM,
-  CW_UP_LETINIT,
-  CW_UP_RET,
   cwBindingOf,
   cwFramedNode,
-  cwIxCoveredLen,
-  cwIxParent,
-  cwIxUpKind,
   cwIxWant,
   cwKeyOfRoot,
   cwPeel,
@@ -1092,44 +1086,6 @@ export let frcElem = ""
 export let frcBool = 0
 export let frcAtom = 0
 
-// Whether recorded kind `k` of function `fe` is a variant while its own checker result is a
-// record that some call consumes as built (`frsCallsDeliverWider` false): the function builds
-// the record, and a delivery widened only the other calls' results.
-function frsOwnRecordAtVariant(fe: i32, k: VKind): boolean {
-  if k != "variant" && k != "nulvariant" { return false }
-  const own = repSigKindOfTy(frsFnRet(elabCheckedTyOf(fnStmts[fe])))
-  if own != "struct" && own != "nulstruct" { return false }
-  !frsCallsDeliverWider(fnStmts[fe])
-}
-
-// Whether function `fx` has calls and each hands its result to a destination with a type of its
-// own: an argument, a list element, a return, or a binding that is annotated or that the record
-// rows build at a record (`recBuildTyIn`). Any other consumer, a member read or an un-annotated
-// binding holding the value as built among them, takes the function's own record.
-function frsCallsDeliverWider(fx: i32): boolean {
-  const fn = nodeAt(fx)
-  if !(fn is FuncDecl) { return false }
-  const cs = callsOfCallee(fn.fnName)
-  if cs.length == 0 { return false }
-  cwIxWant()
-  for c in cs {
-    if c < 0 || c >= cwIxCoveredLen() { return false }
-    const up = cwIxUpKind[c]
-    if up == CW_UP_LETINIT {
-      const d = cwIxParent[c]
-      if d < 0 || d >= P.nodes.length { return false }
-      const ld = nodeAt(d)
-      if !(ld is LetDecl) { return false }
-      if ld.letType < 0 && recBuildTyIn(recBuildTable(), d, false) < 0 {
-        return false
-      }
-    } else if up != CW_UP_ARG && up != CW_UP_ELEM && up != CW_UP_RET {
-      return false
-    }
-  }
-  true
-}
-
 // Whether return kind `k` keeps its table row in `fRetStructIdx`.
 function frsKindHasRow(k: VKind): boolean {
   k == "struct" || k == "nulstruct" || k == "variant" || k == "nulvariant"
@@ -1149,7 +1105,10 @@ function frsColsOfTy(fe: i32, r0: i32): string {
   if r0 < 0 || r0 >= T.tys.length { return "no result recorded" }
   const tv = tyAt(r0)
   const open = tv is TyVar && emitPhaseReached("monomorphized")
-  const r = if open && tv is TyVar { elabUnboundTpTy(-1, fnStmts[fe], tv.tvName) } else { r0 }
+  const r1 = if open && tv is TyVar { elabUnboundTpTy(-1, fnStmts[fe], tv.tvName) } else { r0 }
+  // Maps nothing can tell apart return as their one map.
+  const tw = mapTwinUnionMember(r1)
+  const r = if tw >= 0 { tw } else { r1 }
   const d = repOfTy(r)
   if d.rdCovered == 0 { return "rep uncovered" }
   // A map's columns name no row, so a map whose value type is still open is a map all the same.
@@ -1159,15 +1118,6 @@ function frsColsOfTy(fe: i32, r0: i32): string {
     return "recorded result has no token"
   }
   frcKind = if d.rdKind == "closure" { "i32" } else { d.rdKind }
-  // A variant row a delivery widened a function's own record to is not where it builds it: a
-  // call that takes the value as built makes it build its own record.
-  if frsOwnRecordAtVariant(fe, frcKind) {
-    const own = frsFnRet(elabCheckedTyOf(fnStmts[fe]))
-    if own < 0 || tySame(own, r) {
-      return "recorded variant, own result a record"
-    }
-    return frsColsOfTy(fe, own)
-  }
   // A closure result mono lowered as its bundle's record: the record of members a call returns,
   // or the bundle parameter the instance hands back.
   if d.rdKind == "closure" {

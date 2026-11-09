@@ -102,12 +102,7 @@ import {
   nodeTyMapValIsLitUnion,
   nodeTyMapValIsNulLitUnion,
 } from "./check_hole_pins"
-import {
-  inferRetNameOf,
-  inferRetRowOf,
-  inferRetTyIxOf,
-} from "./check_infer_ret"
-import { inferRetTyIxAt } from "./check_infer_rows"
+import { inferRetNameOf, inferRetTyIxOf } from "./check_infer_ret"
 import {
   atomicIntrinsicIsVoid,
   fsIntrinsicSlot,
@@ -166,6 +161,7 @@ import {
   MAP_KEY_I32,
   MAP_KEY_I64,
   isValueUnionName,
+  mapTwinUnionMember,
   mapTyValIsLitUnion,
   mapTyValIsNulLitUnion,
   mapTyValIsNullUnit,
@@ -289,7 +285,6 @@ import {
   pushUniqueAtom,
   setShapeOfTy,
   tyIsFuncType,
-  tyIsStructWithUnionField,
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
@@ -568,7 +563,6 @@ import {
   listBuildOfTy,
   rlSlotIsKindList,
   rlWidenTagOf,
-  rsFnRetTy,
   rsLetInitIs,
   rsSameRow,
   rsTyIsRecord,
@@ -592,7 +586,6 @@ import {
   repSigKindOfTy,
   repSigSlotTokOfKind,
   repSigTokOfKind,
-  repSlotOfTy,
   repVariantShapeRowOf,
   rlElemKindAt,
   sFieldElemTyIxAt,
@@ -1190,8 +1183,8 @@ export function cloRetValSlot(fe: i32): i32 {
 
 // The `>X` result suffix of `fe`'s extended `$fnsig` key, read from its result type, so two
 // functions share a sig exactly when their params and result byte-match. A closure result mono
-// lowered as its bundle's record keys that record's row, an un-annotated record or variant the
-// row its values' rep stamps name. "" outside the value ABI, or where no row holds the result.
+// lowered as its bundle's record keys that record's row. "" outside the value ABI, or where no
+// row holds the result.
 export function cloRetKeySuffix(fe: i32): string {
   if fe < 0 || fe >= fnStmts.length { return "" }
   const rt = cloRetResultTy(fe)
@@ -1200,17 +1193,7 @@ export function cloRetKeySuffix(fe: i32): string {
     if br == -2 { return "" }
     if br >= 0 { return ">" + repSigSlotTokOfKind("struct", br) }
   }
-  const fd = nodeAt(fnStmts[fe])
   const sk = repSigKindOfTy(rt)
-  if (
-    fd is FuncDecl
-    && fd.fnRet < 0
-    && sk != null
-    && (sk == "struct" || sk == "nulstruct" || sk == "variant")
-  ) {
-    const lr = if sk == "struct" { fnLambdaRecordRow(fe) } else { -1 }
-    if lr >= 0 { return ">" + repSigSlotTokOfKind(sk, lr) }
-  }
   // A list whose returned values join at no one row (D15221) has no row to key.
   if sk == "reflist" && fnRetRefListSlot(fe) == -2 { return "" }
   repSigRetTokOfTy(rt)
@@ -2906,22 +2889,6 @@ export function fnBundleRetRow(fe: i32): i32 {
   if sigs.length < 2 { return -1 }
   const row = bundleRecordRowOfSigs(sigs)
   if row >= 0 { row } else { -2 }
-}
-
-// The struct row un-annotated lambda `i`'s own inferred-return row names, when that row is a
-// record with a union field (`() => ({})` delivered to `() => Cfg`), else -1. The values'
-// stamp can name another row of the same shape, and the closure's signature takes this one.
-export function fnLambdaRecordRow(i: i32): i32 {
-  if i < 0 || i >= fnStmts.length { return -1 }
-  const fn = nodeAt(fnStmts[i])
-  if !(fn is FuncDecl) { return -1 }
-  const k = inferRetFnKey(fnStmts[i], fn.fnName)
-  if k == fn.fnName { return -1 }
-  const row = inferRetRowOf(k)
-  if row < 0 { return -1 }
-  const t = inferRetTyIxAt(row)
-  if !tyIsStructWithUnionField(t) { return -1 }
-  repSlotOfTy(t)
 }
 
 // The struct row bundle record type `bt` is stored at, or -1: its own, else the row it shares
@@ -10144,6 +10111,8 @@ function exprUnionCall(e: Call, exprIx: i32, fnIx: i32): boolean {
   if nodeTyIsNulScalarBox(exprIx) { return true }
   // A union whose every member spells one list is that list, not a box (D4745).
   if oneListUnionRender(nodeTyAt(exprIx, fnIx)) != "" { return false }
+  // …and a union of one map and its twins is that map (D15540).
+  if mapTwinUnionMember(nodeTyAt(exprIx, fnIx)) >= 0 { return false }
   return nodeTyIsUnion(exprIx)
 }
 
@@ -12536,15 +12505,8 @@ export function letRefListElemTy(letIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The arena element type of function `fe`'s ref-list return, the type beside its
-// `fRetRArrElem` name, or -1.
-export function fnRetRArrElemTy(fe: i32): i32 {
-  if fe < 0 || fe >= fnStmts.length { return -1 }
-  tyRefArrElemOf(rsFnRetTy(fnStmts[fe]))
-}
-
 // The ref-list slot function `fe`'s inferred ref-list result is built under, as
-// `computeRetInference` recorded it (`fRetRListRow`): -1 for none, -2 where the returned values
+// `fnRetColsFromRecorded` recorded it (`fRetRListRow`): -1 for none, -2 where the returned values
 // disagree on one.
 export function fnRetRefListSlot(fe: i32): i32 {
   if fe < 0 || fe >= fRetRListRow.length { return -1 }
