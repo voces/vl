@@ -64,5 +64,6 @@ otherwise the binding's own rep (`letBindRep`). The census prints no consistency
 | this PR | 47 | 47 | 0 | 0 | 0 | 0 |
 
 **Proof.** Both sides are fixpoint seeds. Master `4b938caf` is 6,588,061 bytes and this PR is
-6,587,652 (−409). Late demands are 6, the baseline. The filed witnesses
-grade 4,675 of 4,675 as filed.
+6,587,652 (−409). Master `12d10d41`, merged in, is 6,591,394 and this PR is 6,590,983 (−411). On
+the merged tree the census reads 47 probed over 23,808 programs, late demands are 6 (the
+baseline), and the filed witnesses grade 4,676 of 4,676 as filed.
