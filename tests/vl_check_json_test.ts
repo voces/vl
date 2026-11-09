@@ -351,13 +351,14 @@ Deno.test({
       const file = `${dir}/emit.vl`;
       // A live emit-side refusal (`scripts/capability-probes/hole-param-read-through-nested-binding-handed-through-a-set.vl`):
       // `vl check` accepts it and the emitter refuses the generic argument (D14843): a hole parameter
-      // read through a binding by a nested function and handed through a list to a call at two types.
+      // read through a binding by a nested function, called there and handed through a list to a
+      // call at two types.
       await Deno.writeTextFile(
         file,
         "function add(a, b) { return a + b }\nfunction mul(a, b) { return a * b }\n" +
           "function apply2(g) {\n  print(g(1, 2))\n  print(g(1.5, 2.5))\n}\n" +
-          "function run(h) {\n  let hh = h\n  function inner() {\n" +
-          "    for f in [apply2] { f(hh) }\n  }\n  inner()\n}\n" +
+          "function run(h) {\n  const hh = h\n  function inner() {\n" +
+          "    for f in [apply2] { f(hh) }\n    print(hh(10, 20))\n  }\n  inner()\n}\n" +
           "run(add)\nrun(mul)\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
