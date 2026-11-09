@@ -943,20 +943,19 @@ export let sLitMintFn: {[i32]: i32} = Map()
 export let sLitIdRow: {[i32]: i32} = Map()
 // Array-type table: a single element type (`i32`), so all raw i32 arrays share one
 // WasmGC array heap type — the backing store of a growable `i32[]` list and the map's
-// raw `live`/`index`/`hashes`/mono-`vals` arrays. Emitted whenever the program uses a
-// string or a list, right after the struct type. `aUsed` flags it; `aTypeIdx` is the resolved index.
-export let aUsed = false
-export let aTypeIdx = 0
+// raw `live`/`index`/`hashes`/mono-`vals` arrays. Minted with the string backing and header on
+// first ask (`aTy`), and -1 until then.
+let aTypeIdx = -1
 // String-type table: a `string` value is `(ref $sTypeIdx)`, a slice header `(struct (ref
 // $sBackIdx) i32 i32 (mut i32))` — backing, start, len (bytes of this view), a memoised
 // hash. `.length` is `struct.get $s 2`, not `array.len` (the backing's physical length,
 // which reads a sibling view's bytes); `.slice` allocates a header only, retaining its whole backing.
-export let sTypeIdx = 0
-// The string's backing array heap type, `(array (mut i8))` holding UTF-8 byte data — minted from
-// the same `aUsed` flag, emitted between `aTypeIdx` and the header struct, and
-// deliberately a separate index from `aTypeIdx` even though structurally identical:
-// iso-recursive identity is (rec group, position), so naming the wrong one is invalid wasm.
-export let sBackIdx = 0
+let sTypeIdx = -1
+// The string's backing array heap type, `(array (mut i8))` holding UTF-8 byte data, minted with
+// the i32 array and the header. Deliberately a separate index from `ba8Ty()` even though
+// structurally identical: iso-recursive identity is (rec group, position), so naming the wrong
+// one is invalid wasm.
+let sBackIdx = -1
 // The i32 list wrapper `{ backing: (ref $aTypeIdx), len, cap }`, minted on first ask by `lTy`
 // and -1 until then. At `len == cap`, `.push` allocates a doubled backing, `array.copy`s the
 // live elements in, swaps it in, then writes and bumps `len`. Field order (0/1/2) is fixed.
@@ -1036,7 +1035,7 @@ export let rlWrAns: i32[] = []
 // String-keyed map table (G8): `{[string]: i32}` lowers to an ordered open-addressing
 // hash map, a 7-field struct `{ keys, vals, live, index, count, size, hashes }` at
 // `mStructIdx` — field order and count are the ABI, since every accessor writes a fixed
-// `struct.get`/`struct.set` immediate. Ops linear-probe (`emitMapProbe`); forces `aUsed`.
+// `struct.get`/`struct.set` immediate. Ops linear-probe (`emitMapProbe`).
 export let mUsed = false
 // The string-list pair (backing, wrapper), shared by the map's keys and every `string[]`.
 // Minted on first ask by `mkArrTy`/`mkListTy`; -1 until then.
@@ -1883,10 +1882,60 @@ export function isIl64Ty(w: i32): boolean {
   il64TypeIdx >= 0 && w == il64TypeIdx
 }
 
-// The i32 list's wrapper struct type, minting it on first ask. Its backing is the
-// `aUsed` array, so a module that builds an i32 list has that flag set.
+// The i32 array, the string backing and the string header, minted together on first ask.
+function strTrioMint() {
+  if aTypeIdx < 0 {
+    aTypeIdx = mAllocType(TSK_I32_ARRAY, 0)
+    sBackIdx = mAllocType(TSK_STR_BACK, 0)
+    sTypeIdx = mAllocType(TSK_STR_HEADER, 0)
+  }
+  0
+}
+
+// The raw `(array (mut i32))` type, minting the string trio on first ask.
+export function aTy(): i32 {
+  strTrioMint()
+  aTypeIdx
+}
+
+// The string backing `(array (mut i8))`, minting the string trio on first ask.
+export function sBackTy(): i32 {
+  strTrioMint()
+  sBackIdx
+}
+
+// The string header struct, minting the string trio on first ask.
+export function sTy(): i32 {
+  strTrioMint()
+  sTypeIdx
+}
+
+// Whether the string trio is minted, so a string value can exist in this module.
+export function strTrioMinted(): boolean { aTypeIdx >= 0 }
+
+// Whether heap type `h` is the raw i32 array; false while the trio is unminted.
+export function isATy(h: i32): boolean { aTypeIdx >= 0 && h == aTypeIdx }
+
+// Whether heap type `h` is the string backing; false while the trio is unminted.
+export function isSBackTy(h: i32): boolean { sBackIdx >= 0 && h == sBackIdx }
+
+// Whether heap type `h` is the string header; false while the trio is unminted.
+export function isSTy(h: i32): boolean { sTypeIdx >= 0 && h == sTypeIdx }
+
+// Forget the string trio, as `mResetTypeIntern` forgets every minted pair.
+export function strTrioReset() {
+  aTypeIdx = -1
+  sBackIdx = -1
+  sTypeIdx = -1
+  0
+}
+
+// The i32 list's wrapper struct type, minting it (and the i32 array it holds) on first ask.
 export function lTy(): i32 {
-  if lTypeIdx < 0 { lTypeIdx = mAllocType(TSK_I32_LIST, 0) }
+  if lTypeIdx < 0 {
+    strTrioMint()
+    lTypeIdx = mAllocType(TSK_I32_LIST, 0)
+  }
   lTypeIdx
 }
 
@@ -1896,6 +1945,7 @@ export function isLTy(w: i32): boolean { lTypeIdx >= 0 && w == lTypeIdx }
 // The string list's backing array type, minting the backing and wrapper pair on first ask.
 export function mkArrTy(): i32 {
   if mkArrIdx < 0 {
+    strTrioMint()
     mkArrIdx = mAllocType(TSK_STRLIST_BACK, 0)
     mkListIdx = mAllocType(TSK_STRLIST_WRAP, 0)
   }
