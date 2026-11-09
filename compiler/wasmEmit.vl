@@ -349,6 +349,7 @@ import {
   isRecvStagedSlot,
   isTestedLitLex,
   isTestsNull,
+  listIsTestedName,
   litLexIsMember,
   loopStackFind,
   mapShapeFoldSet,
@@ -575,6 +576,8 @@ import {
   gMapSetFn,
   gMapSetFnBase,
   gMapSetTy,
+  gMapSetTyN,
+  gMapSetTyRows,
   gMemLogIdx,
   gNeedsF32Print,
   gNeedsF64Print,
@@ -634,7 +637,6 @@ import {
   listGetRecvStagedIx,
   listGetRecvStagedSet,
   listIdxScratchBase,
-  listIsIdentNames,
   localByNode,
   localDeclIx,
   localIsRef,
@@ -646,7 +648,6 @@ import {
   lvFrameDepth,
   lvFrameLocal,
   mIntMonoArmUsed,
-  mUsed,
   maFoldScratchBase,
   mapKeysBase,
   mapScratchBase,
@@ -4561,7 +4562,7 @@ function listFitShadowIsRef(recv: i32, fnIx: i32): boolean {
 // when `kTy` is -1), or -1 (D4934). Its local holds `K[]` from the first test that fits on, so
 // that list is the receiver's place: a later test fits it and a `.length` reads it.
 function listFitGrowRow(name: string, kTy: i32, fnIx: i32): i32 {
-  if !strListHas(listIsIdentNames, name) { return -1 }
+  if !listIsTestedName(name) { return -1 }
   if fitGrowFn != fnIx { listFitGrowScan(fnIx) }
   let i = 0
   while i < fitGrowName.length {
@@ -4657,9 +4658,7 @@ function listFitGrowWalk(
   if n is FuncDecl { return 0 }
   if n is IsExpr {
     const r = nodeAt(unwrapParen(n.isObj))
-    if r is Ident && strListHas(listIsIdentNames, r.identName) {
-      isIxs.push(ix)
-    }
+    if r is Ident && listIsTestedName(r.identName) { isIxs.push(ix) }
   } else if n is Call {
     if n.callFn < 0 { return 0 }
     const cf = nodeAt(n.callFn)
@@ -4776,9 +4775,7 @@ function listFitCaptureStandIn(
   fnIx: i32,
   anyPos: boolean,
 ): i32 {
-  if !strListHas(listIsIdentNames, name) || !identIsEnvCapture(fnIx, name) {
-    return -1
-  }
+  if !listIsTestedName(name) || !identIsEnvCapture(fnIx, name) { return -1 }
   if narListReadsDecl(exprIx) { return -1 }
   const heaps: i32[] = []
   let kind = listFitStandInKind(nodeTyIxOf(exprIx), heaps)
@@ -13775,7 +13772,6 @@ function failMapValueType() {
 // Construct an EMPTY map `Map()` onto `body`: two empty lists (each `array.new_fixed`
 // count 0, wrapped `{ backing, len=0, cap=0 }`), boxed into the map struct.
 function emitMapNew(exprIx: i32, fnIx: i32) {
-  if !mUsed { return emitFail("emitProgram: Map() but map type not collected") }
   // The shape of the map type the call is stamped with (D14226), keyed as its receivers key it
   // (D14229): -1/-2 the mono map, an mv slot >= 0 THIS value type's map struct. A call whose
   // type still holds a hole has no stamp, and builds as its binding's receivers read it.
@@ -13836,9 +13832,6 @@ function emitMapNew(exprIx: i32, fnIx: i32) {
 // through the same shared scratch frame, and a value parked in `mapRef` or `keyRef` would be
 // silently clobbered. Values on the wasm operand stack are immune; nested ops touch only locals.
 function emitMapRecvKey(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
-  if !mUsed {
-    return emitFail("emitProgram: map op but map type not collected")
-  }
   if !exprMap(recvIx, fnIx) {
     return emitFail("emitProgram: map op receiver is not a map")
   }
@@ -14977,9 +14970,6 @@ function emitMapResize(body: u8[]) {
 // they can be collected, and the entry counts reset. A never-written map's backings are the
 // shared empty ones; every fill over them has length 0, so none is written.
 function emitMapClear(body: u8[], recvIx: i32, fnIx: i32) {
-  if !mUsed {
-    return emitFail("emitProgram: map op but map type not collected")
-  }
   const mshape0 = mapShapeOfExpr(recvIx, fnIx)
   if mshape0 == -3 { return failMapValueType() }
   if pushMapRecvRef(body, recvIx, fnIx) < 0 { return -1 }
@@ -15257,12 +15247,16 @@ function emitMapSetV(
   emitMapSetStore(body, mslot)
 }
 
-// The function a set over map shape `sh` calls: its row's store helper, given the next index
-// after the helpers already called the first time a site asks; -1 when the row has no functype.
+// The function a set over map shape `sh` calls: its row's store helper, given the next functype
+// ordinal and the next index after the helpers already called the first time a site asks; -1
+// when the row reserved none.
 function mapSetFnOf(sh: i32) {
   const row = mapShapeRow(sh)
-  if row < 0 || row >= gMapSetTy.length || gMapSetTy[row] < 0 { return -1 }
+  if row < 0 || row >= gMapSetTy.length || gMapSetTy[row] == -1 { return -1 }
   if gMapSetFn[row] < 0 {
+    gMapSetTy[row] = gMapSetTyN
+    gMapSetTyN = gMapSetTyN + 1
+    gMapSetTyRows.push(row)
     gMapSetFn[row] = gMapSetFnBase + gTailFnRows.length
     gTailFnRows.push(row)
   }
@@ -34099,7 +34093,7 @@ function emitForInTombstoneSkip(lp: ForInLoop): i32 {
     fbLocalSet(lp.iIdx)
     fbBr(1)           // 0x0c br -> loop header (re-check exit)
     fbEnd()           // 0x0b end (if)
-    if gMapDeletes && mUsed {
+    if gMapDeletes {
       fiSeq = mapSeqSaveSlot()
       fbLocalGet(lp.fiMap)
       fbStructGet(cmMapTy(), 7)

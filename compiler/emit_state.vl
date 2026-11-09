@@ -1032,26 +1032,24 @@ export let rlElemMvSlot: i32[] = []
 // this answers yes. Memoised per slot since the underlying scan is a full arena walk.
 export let rlWrSlots: i32[] = []
 export let rlWrAns: i32[] = []
-// String-keyed map table (G8): `{[string]: i32}` lowers to an ordered open-addressing
-// hash map, a 7-field struct `{ keys, vals, live, index, count, size, hashes }` at
-// `mStructIdx` — field order and count are the ABI, since every accessor writes a fixed
-// `struct.get`/`struct.set` immediate. Ops linear-probe (`emitMapProbe`).
-export let mUsed = false
+// String-keyed map table (G8): an ordered open-addressing hash map, a 7-field struct `{ keys,
+// vals, live, index, count, size, hashes }` minted on first ask by `mapTy` (-1 until then). Field
+// order and count are the ABI: every accessor writes a fixed `struct.get`/`struct.set` immediate.
+export let mStructIdx = -1
 // The string-list pair (backing, wrapper), shared by the map's keys and every `string[]`.
 // Minted on first ask by `mkArrTy`/`mkListTy`; -1 until then.
 export let mkArrIdx = -1
 export let mkListIdx = -1
-export let mStructIdx = 0
 // i32-keyed map table (`{[i32]: V}`, the same 7-field rep, an i32 keys list): re-types
 // one field from the string-keyed map (`keys` becomes the i32 list over `aTypeIdx`);
 // everything else is identical, so only the key hash, key compare (`i32.eq`) and the
 // keys-list type immediates differ. `mI32Used` gates the extra heap type; `mStructI32Idx` is that struct.
 export let mI32Used = false
-export let mStructI32Idx = 0
+export let mStructI32Idx = -1
 // The i64-keyed twin (`{[i64]: V}`): `keys` is the i64 list over `ia64TypeIdx`, and the index
 // is the i32-keyed pair layout with a hash of the key as the pair's tag.
 export let mI64Used = false
-export let mStructI64Idx = 0
+export let mStructI64Idx = -1
 // Ref-valued map table (per-(key,value) parameterization): a `{[string]: V}` whose V is
 // a reference cannot ride the monomorphic i32 `vals` list, so each distinct ref value
 // type interns its own 7-field map struct. Slot `-1` is mono i32-valued, `-2` a Set, `-3`
@@ -1177,11 +1175,12 @@ export let gHelpMapResync = -1 // (live, count, seq) -> cursor: a walk's step af
 // row 1 the i32-keyed one, row `2 + s` mv slot `s`, the last row the i64-keyed one; -1 where
 // the shape has none, -2 where it has one not yet called.
 export let gHelpMapCompact: i32[] = []
-// One store helper per map shape, `(ref <mapTy>, key, value) -> ()`, rowed as above: `gMapSetTy`
-// its functype's ordinal after the shared helpers' or -1, `gMapSetFn` its function index once a
-// set site first calls it or -1, `gTailFnRows` those rows in call order. The two bases are the
-// absolute functype and function index of ordinal 0.
+// One store helper per map shape, `(ref <mapTy>, key, value) -> ()`: `gMapSetTy` its functype
+// ordinal once a set site first calls it (-2 before then, -1 for a row with none), `gMapSetTyRows`
+// the rows in ordinal order, `gMapSetFn` its function index or -1. The two bases are the absolute
+// functype and function index of ordinal 0.
 export let gMapSetTy: i32[] = []
+export let gMapSetTyRows: i32[] = []
 export let gMapSetFn: i32[] = []
 export let gMapSetTyN = 0
 export let gMapSetTyBase = 0
@@ -1787,9 +1786,6 @@ export let fitGrowFn = -1
 export let fitGrowName: string[] = []
 export let fitGrowTy: i32[] = []
 export let fitGrowLocal: i32[] = []
-// Every variable some `is` over a list type tests, by name: a function whose `.length` reads
-// none of them has no pushed-through arm to scan for.
-export let listIsIdentNames: string[] = []
 // The identifier read just emitted as a closure's empty `K[]` stand-in and that list's wrapper,
 // or -1 (D4935): a widening copy after it converts from `K`, not from the capture's own list.
 export let listFitStoodIn = -1
@@ -1963,6 +1959,41 @@ export function isMkListTy(w: i32): boolean { mkListIdx >= 0 && w == mkListIdx }
 
 // Whether heap type `w` is the string list's backing; false while the pair is unminted.
 export function isMkArrTy(w: i32): boolean { mkArrIdx >= 0 && w == mkArrIdx }
+
+// The string-keyed map struct, minting it on first ask after every type its fields name: the
+// keys list, the i32 list and array, and the i64 sequence array in a module that deletes.
+export function mapTy(): i32 {
+  if mStructIdx < 0 {
+    mkArrTy()
+    lTy()
+    if gMapDeletes { ia64Ty() }
+    mStructIdx = mAllocType(TSK_MAP, 0)
+  }
+  mStructIdx
+}
+
+// Whether heap type `h` is the string-keyed map struct; false while it is unminted.
+export function isMapTy(h: i32): boolean { mStructIdx >= 0 && h == mStructIdx }
+
+// The i32-keyed map struct, minting it after the types its fields name on first ask.
+export function mapI32Ty(): i32 {
+  if mStructI32Idx < 0 {
+    lTy()
+    if gMapDeletes { ia64Ty() }
+    mStructI32Idx = mAllocType(TSK_MAP_I32, 0)
+  }
+  mStructI32Idx
+}
+
+// The i64-keyed map struct, minting it after the types its fields name on first ask.
+export function mapI64Ty(): i32 {
+  if mStructI64Idx < 0 {
+    lTy()
+    ia64Ty()
+    mStructI64Idx = mAllocType(TSK_MAP_I64, 0)
+  }
+  mStructI64Idx
+}
 
 // The f32 list's backing array type, minting the backing and wrapper pair on first ask.
 export function fa32Ty(): i32 {
@@ -2449,9 +2480,9 @@ export function emitStateReset() {
   listGetIdxSlot = 0
   listGetRecvSlot = 0
   listIdxScratchBase = 0
-  mStructI32Idx = 0
-  mStructI64Idx = 0
-  mStructIdx = 0
+  mStructI32Idx = -1
+  mStructI64Idx = -1
+  mStructIdx = -1
   maFoldScratchBase = 0
   envCacheBase = 0
   mapKeysBase = 0
