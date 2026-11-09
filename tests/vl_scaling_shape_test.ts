@@ -20,11 +20,11 @@
 
 // A COMPILE BAR IS THE FAMILY DEFAULT 2.5, OR 1.25x THE AXIS'S FUEL RATIO WHERE THAT IS
 // HIGHER; an axis whose bar is deliberately tighter keeps it. A fuel ratio is the same on
-// every run, so the margin pays only for the compiler changing, not for the box. Seven axes
+// every run, so the margin pays only for the compiler changing, not for the box. Eight axes
 // sit above the default because they are super-linear today — `types`, `reads after many
 // closed sibling shadows`, `list concat chain length`, `if joins nested deep`, `diamond
 // record depth`, `diamond record depth under ==`, `diamond record depth under == with a list
-// leaf` —
+// leaf`, `a function list parameter handed down layers of callers` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
 // multiplying. Twelve are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
@@ -778,17 +778,18 @@ const genWalkerCalls = (k: number, rec: boolean): string => {
   o.push("const fs: ((t: i32) => i32)[] = []", `walk(${k + 3}, fs)`, "print(fs.length)");
   return o.join("\n") + "\n";
 };
-const genLayeredPushes = (w: number, l: number, chain: boolean): string => {
+const genLayeredPushes = (w: number, l: number, chain: boolean, fns = false): string => {
   const o: string[] = [];
   genHofGate(o);
+  const ty = fns ? "((t: i32) => i32)[]" : "i32[]";
   for (let i = 0; i < l; i++) {
     for (let j = 0; j < w; j++) {
-      o.push(`function f${i}_${j}(xs: i32[]) {`, "  const ys: i32[] = []", `  xs.push(${j})`);
+      o.push(`function f${i}_${j}(xs: ${ty}) {`, `  const ys: ${ty} = []`, `  xs.push(${fns ? "inc" : j})`);
       if (i + 1 < l) for (let k = 0; k < w; k++) o.push(`  f${i + 1}_${k}(${chain ? "xs" : "ys"})`);
       o.push("}");
     }
   }
-  o.push("const xs: i32[] = []", "f0_0(xs)", "print(xs.length)");
+  o.push(`const xs: ${ty} = []`, "f0_0(xs)", "print(xs.length)");
   return o.join("\n") + "\n";
 };
 axis(
@@ -802,6 +803,14 @@ axis(
   2.5,
   "`elabSlotDeliveries` (compiler/emit_elab.vl) is walking the callers of a slot whose type holds no function (D15630).",
   (d) => twoFiles(d, genLayeredPushes(3, 7, true), genLayeredPushes(3, 7, false)),
+);
+// D15631's pair: the same layers handing down a list of functions, which the type test cannot
+// skip. Fuel reads 2.74 with the nested query's memo, and 61.6 on the D15630 compiler (2.0 G).
+axis(
+  "a function list parameter handed down layers of callers",
+  3.5,
+  "`elabSlotDeliveries` (compiler/emit_elab.vl) is re-walking a nested query per chain of callers; is `elabDlvNest` still answering (D15631)?",
+  (d) => twoFiles(d, genLayeredPushes(3, 7, true, true), genLayeredPushes(3, 7, false, true)),
 );
 
 // Lane HS's second pair: 2,000 calls through a 64-field record signature against a one-field
