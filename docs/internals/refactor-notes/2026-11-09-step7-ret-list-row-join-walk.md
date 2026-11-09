@@ -34,3 +34,11 @@ checker judges a call through a sliced result.
 
 The rest of the population moved nothing, not even bytes, so no program in it reached the
 per-value join.
+
+## Proof
+
+* Sweep diff, base against candidate: 23,775 same, 0 bytes-only movers, 0 output movers.
+* Seed: 6,583,848 bytes against base's 6,585,897 (−2,049).
+* Plumb-shape cost: fuel is identical to base in both units, and peak RSS is 320.5 MB against
+  base's 320.3 MB (main) and 318.2 MB against 318.1 MB (tail).
+* `rep-fuzz-check.sh`: exact.
