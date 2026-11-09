@@ -445,8 +445,8 @@ import {
   ia64TypeIdx,
   il64Ty,
   il64TypeIdx,
+  lTy,
   lTypeIdx,
-  lUsed,
   liftWbEnd,
   localByNode,
   localDeclIx,
@@ -484,8 +484,8 @@ import {
   mfSrcBases,
   mfSrcKinds,
   mfSrcSlots,
-  mkArrIdx,
-  mkListIdx,
+  mkArrTy,
+  mkListTy,
   monoKeys,
   mvKeyKind,
   mvMapTypeIdx,
@@ -3741,19 +3741,19 @@ function emitMapProbeFnCode(out: u8[]) {
     fbI32Bin(71)  // 0x47 i32.ne (live != 0)
     fbI32Bin(113) // 0x71 i32.and
   }
-  fbIf(127)            // if, i32 blocktype — the expensive compare rides it
+  fbIf(127)             // if, i32 blocktype — the expensive compare rides it
   fbLocalGet(4)
   fbLocalGet(8)
   fbI32Const(1)
   fbI32Bin(107)
-  fbArrayGet(mkArrIdx) // keysBack[entry-1] — (ref null $aTypeIdx)
-  fbRefAsNonNull()     // a stored slot is populated
+  fbArrayGet(mkArrTy()) // keysBack[entry-1] — (ref null $aTypeIdx)
+  fbRefAsNonNull()      // a stored slot is populated
   fbLocalGet(5)
   fbCall(gHelpStrEq)
   fbElse()
-  fbI32Const(0)        // hash/live mismatch → not a hit
+  fbI32Const(0)         // hash/live mismatch → not a hit
   fbEnd()
-  fbBrIf(1)            // hit → out of the probe block
+  fbBrIf(1)             // hit → out of the probe block
   // slot = (slot + 1) & mask  (collision OR a dead marker: keep probing)
   fbLocalGet(7)
   fbI32Const(1)
@@ -4191,7 +4191,7 @@ function tsMapStructBody(keysWrap: i32) {
   wSLEB(keysWrap)
   wU8(1)               // mutable
   wU8(100)             // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
-  wSLEB(lTypeIdx)
+  wSLEB(lTy())
   wU8(1)               // mutable
   wU8(100)             // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
   wSLEB(aTypeIdx)
@@ -4261,18 +4261,22 @@ type MapCompactTys = {
 function mapCompactTysOf(sh: i32): MapCompactTys {
   const mapTy = mapTypeIdxOf(sh)
   const keyK = mapShapeKeyKind(sh)
-  let keysWrap = mkListIdx
-  let keysBack = mkArrIdx
+  let keysWrap = -1
+  let keysBack = -1
   if keyK == MAP_KEY_I32 {
-    keysWrap = lTypeIdx
+    keysWrap = lTy()
     keysBack = aTypeIdx
   } else if keyK == MAP_KEY_I64 {
     keysWrap = il64TypeIdx
     keysBack = ia64TypeIdx
+  } else {
+    keysWrap = mkListTy()
+    keysBack = mkArrTy()
   }
-  let valsWrap = lTypeIdx
+  let valsWrap = -1
   let valsBack = aTypeIdx
   let valNull = -1
+  if sh < 0 { valsWrap = lTy() }
   if sh >= 0 {
     valsWrap = mvValsWrapOf(sh)
     valsBack = mvValsBackOf(sh)
@@ -4683,8 +4687,8 @@ function svReserve() {
   svPairs = 0
   // The f64, i64 and f32 pairs mint with the view (`mAssignScalarListPairs`), so only the i32
   // list's flag is asked here.
-  if lUsed && (scalarViewPairs & 1) != 0 { svPairs = svPairs + 1 }
-  if lUsed && (scalarViewPairs & 2) != 0 { svPairs = svPairs + 2 }
+  if (scalarViewPairs & 1) != 0 { svPairs = svPairs + 1 }
+  if (scalarViewPairs & 2) != 0 { svPairs = svPairs + 2 }
   if (scalarViewPairs & 4) != 0 { svPairs = svPairs + 4 }
   0
 }
@@ -4696,7 +4700,7 @@ function svDstOf(p: i32): i32 {
 
 function svSrcWrap(p: i32): i32 {
   if p == 2 { return fl32Ty() }
-  lTypeIdx
+  lTy()
 }
 
 function svSrcBack(p: i32): i32 {
@@ -7984,7 +7988,7 @@ function helpValtype(c: i32) {
   }
   wU8(100) // 0x64 (ref ht) — non-null
   if c == 'm' {
-    wSLEB(mkArrIdx)
+    wSLEB(mkArrTy())
   } else if c == 's' {
     wSLEB(sTypeIdx)
   } else if c == 'b' {
@@ -8609,24 +8613,24 @@ function tsRefWrap(rti: i32) {
 // The string-ref list types, shared by the map's keys list and any `string[]` field. The
 // backing's element is nullable so `array.new_default` defaults spare slots to null.
 function tsStrListBack() {
-  tsRefArray(mkArrIdx, "string-list backing", sTypeIdx)
+  tsRefArray(mkArrTy(), "string-list backing", sTypeIdx)
 }
 
 function tsStrListWrap() {
-  tsEntryAt(mkListIdx, "string-list wrapper")
-  tsListWrapBody(mkArrIdx)
+  tsEntryAt(mkListTy(), "string-list wrapper")
+  tsListWrapBody(mkArrTy())
 }
 
 // The string-keyed map struct — the open-addressing rep documented at `mUsed`, whose field
 // order matches the host's general-purpose rep (`compiler/builtins/maps.ts`).
 function tsMap() {
   tsEntryAt(mStructIdx, "map")
-  tsMapStructBody(mkListIdx)
+  tsMapStructBody(mkListTy())
 }
 
 function tsMapI32() {
   tsEntryAt(mStructI32Idx, "i32-keyed map")
-  tsMapStructBody(lTypeIdx)
+  tsMapStructBody(lTy())
 }
 
 // The i64-keyed twin, the same struct over the i64 list wrapper, minted right after it.
@@ -8765,9 +8769,10 @@ function tsMvMap(mvs: i32) {
   // Field 0's type IS the second half of this slot's identity (`repMapValSlotsTwin`
   // refuses to twin across it), so it is read from the same column the resolvers key
   // on rather than assumed to be the string-ref list.
-  let mvKeysWrap = mkListIdx
-  if mvSlotKeyKind(mvs) == MAP_KEY_I32 { mvKeysWrap = lTypeIdx }
-  if mvSlotKeyKind(mvs) == MAP_KEY_I64 { mvKeysWrap = il64TypeIdx }
+  let mvKeysWrap = -1
+  if mvSlotKeyKind(mvs) == MAP_KEY_I32 { mvKeysWrap = lTy() }
+  else if mvSlotKeyKind(mvs) == MAP_KEY_I64 { mvKeysWrap = il64TypeIdx }
+  else { mvKeysWrap = mkListTy() }
   tsEntryAt(mvMapTypeIdx[mvs], "ref-valued map")
   wU8(95)              // 0x5f struct (ref-valued map)
   wU8(mapFieldCount()) // 7 fields (host-aligned open-addressing hash map), 9 with seqs

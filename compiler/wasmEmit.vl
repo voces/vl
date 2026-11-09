@@ -613,8 +613,9 @@ import {
   isFl32Ty,
   isFl64Ty,
   isIl64Ty,
-  lTypeIdx,
-  lUsed,
+  isLTy,
+  isMkListTy,
+  lTy,
   lcatBases,
   leqIScratchBase,
   leqRBases,
@@ -652,8 +653,8 @@ import {
   mapValsBase,
   markFnAddrTaken,
   mfScratchBase,
-  mkArrIdx,
-  mkListIdx,
+  mkArrTy,
+  mkListTy,
   monoCloCoerceFe,
   monoGradualAsScalar,
   monoInertCalled,
@@ -695,7 +696,6 @@ import {
   sSuperAt,
   sTwin,
   sTypeIdx,
-  slUsed,
   startStmts,
   strCatSlotIx,
   strPushScratchBase,
@@ -1733,8 +1733,8 @@ export function capCacheBuild() {
 // resolves to that scalar's distinct-backing list wrapper, a negative slot to the base
 // i32 wrapper, and anything else to its interned ref-list wrapper (`rlWrapIdx`).
 export function mvValsWrapOf(slot: i32) {
-  if slot < 0 { return lTypeIdx }
-  if mvValKind[slot] == MVK_STR { return mkListIdx }
+  if slot < 0 { return lTy() }
+  if mvValKind[slot] == MVK_STR { return mkListTy() }
   if mvValKind[slot] == MVK_F64 { return fl64Ty() }
   if mvValKind[slot] == MVK_F32 { return fl32Ty() }
   if mvValKind[slot] == MVK_I64 { return il64Ty() }
@@ -1774,9 +1774,9 @@ function scalarListWrap(elemKind: VKind) {
   if elemKind == "i64" { return il64Ty() }
   if elemKind == "f32" { return fl32Ty() }
   // The string list's wrapper is the map's keys-list type, which any `string[]` shares.
-  if elemKind == "str" { return mkListIdx }
-  if elemKind == "i32" { return lTypeIdx }
-  scalarListKindUnlisted(lTypeIdx)
+  if elemKind == "str" { return mkListTy() }
+  if elemKind == "i32" { return lTy() }
+  scalarListKindUnlisted(lTy())
 }
 
 // The backing `(array (mut <elem>))` heap type for a scalar element kind.
@@ -1785,7 +1785,7 @@ function scalarListBack(elemKind: VKind) {
   if elemKind == "f64" { return fa64Ty() }
   if elemKind == "i64" { return ia64Ty() }
   if elemKind == "f32" { return fa32Ty() }
-  if elemKind == "str" { return mkArrIdx }
+  if elemKind == "str" { return mkArrTy() }
   if elemKind == "i32" { return aTypeIdx }
   scalarListKindUnlisted(aTypeIdx)
 }
@@ -1828,12 +1828,12 @@ function scalarListUsed(elemKind: VKind) {
     "f32" => {
       return true
     }
-    // The string-ref list is minted for any `string[]` field and for the map's keys list.
+    // The string and i32 lists mint on first read too.
     "str" => {
-      return slUsed || mUsed
+      return true
     }
     "i32" => {
-      return lUsed
+      return true
     }
     // No other kind is a scalar list element, so its list types are never collected.
     "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {}
@@ -1887,7 +1887,7 @@ function emitOmittedFieldNull(_body: u8[], si: i32, fi: i32, scode: i32) {
     return 0
   }
   if scode == FC_NUL_I32_LIST {
-    fbRefNull(lTypeIdx)
+    fbRefNull(lTy())
     return 0
   }
   if isNulScalarListFieldCode(scode) {
@@ -4798,9 +4798,7 @@ function listFitCaptureStandIn(
   const ck = capturedKindOf(fnIx, name)
   if ck == null { return -1 }
   if ck == "reflist" { return if kind == "ref" { -1 } else { heaps[2] } }
-  if ck == "strlist" {
-    return if heaps[2] == mkListIdx { -1 } else { heaps[2] }
-  }
+  if ck == "strlist" { return if isMkListTy(heaps[2]) { -1 } else { heaps[2] } }
   const se = scalarListElemOfListKind(ck)
   if se == null || scalarListWrap(se) == heaps[2] { return -1 }
   heaps[2]
@@ -4808,7 +4806,7 @@ function listFitCaptureStandIn(
 
 // The scalar element of the stand-in list wrapper `w`, or null for any other list.
 function listFitStoodKind(w: i32): VKind | null {
-  if w == lTypeIdx { return "i32" }
+  if isLTy(w) { return "i32" }
   if isFl64Ty(w) { return "f64" }
   if isIl64Ty(w) { return "i64" }
   if isFl32Ty(w) { return "f32" }
@@ -5107,11 +5105,11 @@ function emitListLenOnStack(kind: MfKind, slot: i32) {
     return 0
   }
   if kind == "str" {
-    fbStructGet(mkListIdx, 1)
+    fbStructGet(mkListTy(), 1)
     return 0
   }
   if kind == "i32" {
-    fbStructGet(lTypeIdx, 1)
+    fbStructGet(lTy(), 1)
     return 0
   }
   const lek: VKind = if kind == "f64" { "f64" } else if kind == "i64" { "i64" } else if kind == "f32" { "f32" } else { "u8list" }
@@ -7038,8 +7036,8 @@ function emitOptChainValue(body: u8[], exprIx: i32, fnIx: i32) {
 // ref — a scalar rides the box instead (`optChainLeafBoxKind`).
 function optChainLeafRefHeap(code: i32, si: i32, fi: i32): i32 {
   // The nullable atom list (18) shares the i32 list's wrapper, as its field storage does.
-  if code == FC_I32_LIST || code == FC_NUL_I32_LIST { return lTypeIdx }
-  if code == FC_STR_LIST { return mkListIdx }
+  if code == FC_I32_LIST || code == FC_NUL_I32_LIST { return lTy() }
+  if code == FC_STR_LIST { return mkListTy() }
   if code == FC_F64_LIST { return fl64Ty() }
   if code == FC_I64_LIST { return il64Ty() }
   if code == FC_F32_LIST { return fl32Ty() }
@@ -7396,14 +7394,14 @@ function emitUnionBoxPush(_body: u8[], ix: i32, fnIx: i32) {
 // niches), kind 9 exactly the string-list backings, and kinds 8 / 10 / 12 arise only from the
 // spellings `f64[]` / `i64[]` / `f32[]`. The caller already needs the kind for its tag.
 function listWrapHeapOfKind(k: i32) {
-  if k == 7 { return lTypeIdx }
+  if k == 7 { return lTy() }
   // A boolean list rides the i32 list; its tag code exists only once a union registered it.
   if k == 17 || k == 18 {
     if vbBoolListTop < 0 { return -1 }
-    return lTypeIdx
+    return lTy()
   }
   if k == 8 { return fl64Ty() }
-  if k == 9 { return mkListIdx }
+  if k == 9 { return mkListTy() }
   if k == 10 { return il64Ty() }
   if k == 12 { return fl32Ty() }
   // The packed byte list rides the box's anyref as its own `{backing, len, cap}` wrapper like
@@ -12339,14 +12337,14 @@ function spreadWrapIdx(k: MfKind, row: i32) {
       return -1
     }
     "str" => {
-      return mkListIdx
+      return mkListTy()
     }
     "ref" => {
       if row < 0 || row >= rlWrapIdx.length { return -1 }
       return rlWrapIdx[row]
     }
     "i32" => {
-      if lUsed && aUsed { return lTypeIdx }
+      if aUsed { return lTy() }
       return -1
     }
   }
@@ -12370,14 +12368,14 @@ function spreadBackIdx(k: MfKind, row: i32) {
       return -1
     }
     "str" => {
-      return mkArrIdx
+      return mkArrTy()
     }
     "ref" => {
       if row < 0 || row >= rlBackIdx.length { return -1 }
       return rlBackIdx[row]
     }
     "i32" => {
-      if lUsed && aUsed { return aTypeIdx }
+      if aUsed { return aTypeIdx }
       return -1
     }
   }
@@ -13080,17 +13078,12 @@ function emitArrI64(body: u8[], elems: i32[], fnIx: i32) {
 // The string-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on
 // failure.
 function emitArrStr(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
-  if !slUsed {
-    return emitFail(
-      "emitProgram: string array literal but string list type not collected",
-    )
-  }
-  const hStr = forLitHoist(arrIx, elems, fnIx, ALD_STR, mkArrIdx, mkListIdx)
+  const hStr = forLitHoist(arrIx, elems, fnIx, ALD_STR, mkArrTy(), mkListTy())
   if hStr != 0 { return if hStr < 0 { -1 } else { 0 } }
   let dstStr = -1
   let coffStr = 0
   if elems.length > allocLitChunk() {
-    dstStr = arrLitChunkStart("str", 0, mkArrIdx, elems.length, false)
+    dstStr = arrLitChunkStart("str", 0, mkArrTy(), elems.length, false)
   }
   let i = 0
   while i < elems.length {
@@ -13107,7 +13100,7 @@ function emitArrStr(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
     if dstStr >= 0 {
       coffStr = arrLitChunkFlushAt(
         dstStr,
-        mkArrIdx,
+        mkArrTy(),
         coffStr,
         i,
         elems.length,
@@ -13119,11 +13112,11 @@ function emitArrStr(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
     fbLocalGet(dstStr)
     fbRefAsNonNull() // the chunk-built string-ref backing
   } else {
-    fbBacking(mkArrIdx, elems.length) // 0xfb 0x08; builds the string-ref backing
+    fbBacking(mkArrTy(), elems.length) // 0xfb 0x08; builds the string-ref backing
   }
   fbI32Const(elems.length) // 0x41 i32.const (len)
   fbI32Const(elems.length) // 0x41 i32.const (cap)
-  fbStructNew(mkListIdx)   // 0xfb 0x00 <string-list wrapper struct type index>
+  fbStructNew(mkListTy())  // 0xfb 0x00 <string-list wrapper struct type index>
   return 0
 }
 
@@ -13324,9 +13317,6 @@ function emitArrI32(
   fnIx: i32,
   lbKind: i32,
 ) {
-  if !lUsed {
-    return emitFail("emitProgram: array literal but list type not collected")
-  }
   // Four element types share the i32 backing but do not lower like i32s, so each seeds the
   // element emits: `K[]` lowers member literals as interned atom ids, `(boolean|null)[]` and
   // `null[]` a `null` as the sentinel 2, and `(K|null)[]` both. The element type comes from the checker's
@@ -13343,7 +13333,7 @@ function emitArrI32(
     || lbKind == LBK_NUL_LIT_UNION_LIST
   ) {
   }
-  const hI32 = forLitHoist(arrIx, elems, fnIx, ALD_I32, aTypeIdx, lTypeIdx)
+  const hI32 = forLitHoist(arrIx, elems, fnIx, ALD_I32, aTypeIdx, lTy())
   if hI32 != 0 { return if hI32 < 0 { -1 } else { 0 } }
   let dstI32 = -1
   let coffI32 = 0
@@ -13351,7 +13341,7 @@ function emitArrI32(
     const dI32 = arrLitDataBuild(body, elems, fnIx, ALD_I32, aTypeIdx)
     if dI32 != 0 {
       if dI32 < 0 { return -1 }
-      return arrLitWrap(elems.length, lTypeIdx)
+      return arrLitWrap(elems.length, lTy())
     }
     dstI32 = arrLitChunkStart("i32", 0, aTypeIdx, elems.length, false)
   }
@@ -13403,7 +13393,7 @@ function emitArrI32(
   // Wrap { backing, len = count, cap = count } via struct.new.
   fbI32Const(elems.length) // 0x41 i32.const (len)
   fbI32Const(elems.length) // 0x41 i32.const (cap)
-  fbStructNew(lTypeIdx)    // 0xfb 0x00 <list wrapper struct type index>
+  fbStructNew(lTy())       // 0xfb 0x00 <list wrapper struct type index>
   return 0
 }
 
@@ -13628,15 +13618,15 @@ function cmIntKeyLocal(k: i32) {
 // string-keyed rep, the i32 or i64 list pair for an integer-keyed one.
 function cmKeysWrap() {
   const k = cmKeyKind()
-  if k == MAP_KEY_I32 { return lTypeIdx }
+  if k == MAP_KEY_I32 { return lTy() }
   if k == MAP_KEY_I64 { return il64Ty() }
-  mkListIdx
+  mkListTy()
 }
 function cmKeysBack() {
   const k = cmKeyKind()
   if k == MAP_KEY_I32 { return aTypeIdx }
   if k == MAP_KEY_I64 { return ia64Ty() }
-  mkArrIdx
+  mkArrTy()
 }
 // The current op's target-key scratch local: the string frame's slot 1, a `(ref $sTypeIdx)`
 // string, or an integer frame's slot 0, the raw key.
@@ -14138,24 +14128,24 @@ function emitMapGetOr(
       }
     }
     // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
-    pushMapScr(body, 5)      // entry
-    fbIf(127)                // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
+    pushMapScr(body, 5)   // entry
+    fbIf(127)             // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
     pushMapVals(body)
-    fbStructGet(lTypeIdx, 0) // struct.get (vals backing), field 0: backing
-    pushMapScr(body, 5)      // entry
+    fbStructGet(lTy(), 0) // struct.get (vals backing), field 0: backing
+    pushMapScr(body, 5)   // entry
     fbI32Const(1)
-    fbI32Bin(107)            // 0x6b i32.sub  (entry - 1)
-    fbArrayGet(aTypeIdx)     // array.get
-    fbElse()                 // else
+    fbI32Bin(107)         // 0x6b i32.sub  (entry - 1)
+    fbArrayGet(aTypeIdx)  // array.get
+    fbElse()              // else
     if emitMonoMapDefault(body, recvIx, defIx, fnIx) < 0 { return -1 }
-    fbEnd()                  // end (if)
+    fbEnd()               // end (if)
     return 0
   }
   // raw = (entry != 0) ? backing[entry-1] : sentinel  — a miss reads as null.
   pushMapScr(body, 5)     // entry
   fbIf(127)               // if (entry != 0 → found), i32 blocktype
   pushMapVals(body)
-  fbStructGet(lTypeIdx, 0)
+  fbStructGet(lTy(), 0)
   pushMapScr(body, 5)
   fbI32Const(1)
   fbI32Bin(107)
@@ -14369,7 +14359,7 @@ function emitMapGetTail(body: u8[], recvIx: i32, fnIx: i32) {
   pushMapScr(body, 5) // entry
   fbIf(127)           // if (entry != 0), i32 blocktype
   pushMapVals(body)
-  fbStructGet(lTypeIdx, 0)
+  fbStructGet(lTy(), 0)
   pushMapScr(body, 5) // entry
   fbI32Const(1)
   fbI32Bin(107)       // i32.sub (entry - 1)
@@ -14497,7 +14487,7 @@ function pushMapScalarHit(body: u8[]) {
   } else {
     // The mono i32 map: the vals array is the shared `aTypeIdx` backing.
     pushMapVals(body)
-    fbStructGet(lTypeIdx, 0)
+    fbStructGet(lTy(), 0)
     pushMapScr(body, 5)
     fbI32Const(1)
     fbI32Bin(107)
@@ -14847,18 +14837,15 @@ function emitMapKeys(body: u8[], recvIx: i32, fnIx: i32) {
   // `cmKeyKind` asks. A `{[i32]: string}`'s `.keys()` is an `i32[]` even though its shape
   // is an mv slot, so this cannot key off the sentinel alone.
   const keyK = mapShapeKeyKind(shape)
-  if keyK == MAP_KEY_STR && !slUsed {
-    return emitFail("emitProgram: .keys() but string list type not collected")
-  }
   const mapTy = mapTypeIdxOf(shape)
   // The KEY rep's list wrapper / backing, and — since the builder's frame slots are
   // typed per rep — an integer frame's own out/src slots for an integer-keyed map.
-  let keysWrap = mkListIdx
-  let keysBack = mkArrIdx
+  let keysWrap = -1
+  let keysBack = -1
   let outBackL = mapKeysBase + 0
   let keysBackL = mapKeysBase + 1
   if keyK == MAP_KEY_I32 {
-    keysWrap = lTypeIdx
+    keysWrap = lTy()
     keysBack = aTypeIdx
     outBackL = mapI32KeyLocal(2)
     keysBackL = mapI32KeyLocal(3)
@@ -14867,6 +14854,9 @@ function emitMapKeys(body: u8[], recvIx: i32, fnIx: i32) {
     keysBack = ia64Ty()
     outBackL = mapI64KeyLocal(2)
     keysBackL = mapI64KeyLocal(3)
+  } else {
+    keysWrap = mkListTy()
+    keysBack = mkArrTy()
   }
   const liveL = mapKeysBase + 2
   const iL = mapKeysBase + 3
@@ -16151,8 +16141,8 @@ function listBackOfWrap(w: i32): i32 {
   if isFl64Ty(w) { return fa64TypeIdx }
   if isIl64Ty(w) { return ia64TypeIdx }
   if isFl32Ty(w) { return fa32TypeIdx }
-  if slUsed && w == mkListIdx { return mkArrIdx }
-  if aUsed && w == lTypeIdx { return aTypeIdx }
+  if isMkListTy(w) { return mkArrTy() }
+  if aUsed && isLTy(w) { return aTypeIdx }
   -1
 }
 
@@ -16946,7 +16936,6 @@ function hoistRowOfRecv(recvIx: i32, d: i32, prop: string, fnIx: i32) {
     return listHoistRow(d, prop, "ref", refListSlotOfExpr(recvIx, fnIx))
   }
   if exprNulStrArray(recvIx, fnIx) || exprStringArray(recvIx, fnIx) {
-    if !slUsed { return 0 - 1 }
     return listHoistRow(d, prop, "str", 0)
   }
   const ek = scalarListElemKind(recvIx, fnIx)
@@ -16972,7 +16961,7 @@ function hoistRowOfRecv(recvIx: i32, d: i32, prop: string, fnIx: i32) {
 function hoistWrapTyOfRow(row: i32) {
   const k = lhKind[row]
   if k == "ref" { return rlWrapIdx[lhSlot[row]] }
-  if k == "str" { return mkListIdx }
+  if k == "str" { return mkListTy() }
   if k == "f64" { return scalarListWrap("f64") }
   if k == "i64" { return scalarListWrap("i64") }
   if k == "f32" { return scalarListWrap("f32") }
@@ -17256,8 +17245,8 @@ function emitIndexNulScalarList(
   fbRefAsNonNull() // (the `!= null` guard makes this safe)
   if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
   if nsk == "nulstrlist" {
-    emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
-    fbArrayGet(mkArrIdx) // 0xfb 0x0b string backing
+    emitListIdxGuard(listIdxWrapSlot("str", 0), mkListTy())
+    fbArrayGet(mkArrTy()) // 0xfb 0x0b string backing
     // A nullable-element inner list (`(string | null)[] | null`, narrowed): the
     // element legitimately holds null, so the read stays `(ref null $aTypeIdx)` — an
     // unconditional non-null recover here is correct only for `string[] | null` (whose
@@ -17346,11 +17335,6 @@ function emitIndexRefList(body: u8[], nd: Index, idxIx: i32, fnIx: i32): i32 {
 // index, the `i u< len` guard and the `array.get` of the string backing, leaving the element
 // `(ref null $sTypeIdx)` for the caller to recover or keep. Returns 0, or -1 on a refusal.
 function emitIndexStrListRead(body: u8[], nd: Index, fnIx: i32): i32 {
-  if !slUsed {
-    return emitFail(
-      "emitProgram: string index access but string list type not collected",
-    )
-  }
   const slHz = liveHoistRow(nd.idxArr, "str", 0)
   if slHz < 0 {
     if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
@@ -17359,9 +17343,9 @@ function emitIndexStrListRead(body: u8[], nd: Index, fnIx: i32): i32 {
   if slHz >= 0 {
     emitListIdxGuardHoisted(slHz, nd.idxIndex)
   } else {
-    emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
+    emitListIdxGuard(listIdxWrapSlot("str", 0), mkListTy())
   }
-  fbArrayGet(mkArrIdx) // 0xfb 0x0b <string backing array type index>
+  fbArrayGet(mkArrTy()) // 0xfb 0x0b <string backing array type index>
   0
 }
 
@@ -17433,7 +17417,7 @@ function emitArrLen(body: u8[], memIx: i32, fnIx: i32) {
     // A STRING list's `.length` is its wrapper's `len` field (`struct.get $mkListIdx 1`).
     if exprStringArray(m.memObj, fnIx) {
       if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(mkListIdx, 1) // 0xfb 0x02 <string-list wrapper> field 1: len
+      fbStructGet(mkListTy(), 1) // 0xfb 0x02 <string-list wrapper> field 1: len
       return 0
     }
     // A SCALAR list's `.length` is its wrapper's `len` field (`struct.get <wrap> 1`) — an
@@ -17472,7 +17456,7 @@ function emitArrLen(body: u8[], memIx: i32, fnIx: i32) {
     }
     if exprArray(m.memObj, fnIx) {
       if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(lTypeIdx, 1) // 0xfb 0x02 <list wrapper struct type index> field 1: len
+      fbStructGet(lTy(), 1) // 0xfb 0x02 <list wrapper struct type index> field 1: len
       return 0
     }
     // A raw string's `.length` is the header's `len` field (`fbStrLen()`), not `array.len`
@@ -18703,64 +18687,64 @@ function emitStrEqLit(body: u8[], litIx: i32, fnIx: i32) {
 // i32-list `==`: length + element compare over the LEQI frame.
 function emitListEqICore(_body: u8[]) {
   const bA = leqIScratchBase
-  fbLocalSet(bA + 1)       // B
-  fbLocalSet(bA + 0)       // A
-  fbBlock(127)             // block i32
+  fbLocalSet(bA + 1)    // B
+  fbLocalSet(bA + 0)    // A
+  fbBlock(127)          // block i32
   fbLocalGet(bA + 0)
-  fbStructGet(lTypeIdx, 1) // lenA
-  fbLocalSet(bA + 3)       // n = lenA
+  fbStructGet(lTy(), 1) // lenA
+  fbLocalSet(bA + 3)    // n = lenA
   fbLocalGet(bA + 3)
   fbLocalGet(bA + 1)
-  fbStructGet(lTypeIdx, 1) // lenB
-  fbI32Bin(71)             // i32.ne
+  fbStructGet(lTy(), 1) // lenB
+  fbI32Bin(71)          // i32.ne
   fbIf(64)
   fbI32Const(0)
   fbBr(1)
   fbEnd()
   fbI32Const(0)
-  fbLocalSet(bA + 4)       // i = 0
+  fbLocalSet(bA + 4)    // i = 0
   fbLoop(64)
   fbLocalGet(bA + 4)
   fbLocalGet(bA + 3)
-  fbI32Bin(78)             // i >= n → done
+  fbI32Bin(78)          // i >= n → done
   fbIf(64)
   fbElse()
   fbLocalGet(bA + 0)
-  fbStructGet(lTypeIdx, 0) // backing A
+  fbStructGet(lTy(), 0) // backing A
   fbLocalGet(bA + 4)
   fbArrayGet(aTypeIdx)
   fbLocalGet(bA + 1)
-  fbStructGet(lTypeIdx, 0) // backing B
+  fbStructGet(lTy(), 0) // backing B
   fbLocalGet(bA + 4)
   fbArrayGet(aTypeIdx)
-  fbI32Bin(71)             // element i32.ne
+  fbI32Bin(71)          // element i32.ne
   fbIf(64)
   fbI32Const(0)
-  fbBr(3)                  // mismatch → 0, exit block
+  fbBr(3)               // mismatch → 0, exit block
   fbEnd()
   fbLocalGet(bA + 4)
   fbI32Const(1)
-  fbI32Bin(106)            // i + 1
+  fbI32Bin(106)         // i + 1
   fbLocalSet(bA + 4)
-  fbBr(1)                  // back to loop
-  fbEnd()                  // end (ge_s if/else)
-  fbEnd()                  // end (loop)
+  fbBr(1)               // back to loop
+  fbEnd()               // end (ge_s if/else)
+  fbEnd()               // end (loop)
   fbI32Const(1)
-  fbEnd()                  // end (block)
+  fbEnd()               // end (block)
   0
 }
 
 // Pushes whether element `i` of the staged list A, then of B, in the LEQS frame at `bA`, is null.
 function leqSElemNullTest(bA: i32) {
   fbLocalGet(bA + 0)
-  fbStructGet(mkListIdx, 0)
+  fbStructGet(mkListTy(), 0)
   fbLocalGet(bA + 3)
-  fbArrayGet(mkArrIdx)
+  fbArrayGet(mkArrTy())
   fbRefIsNull()
   fbLocalGet(bA + 1)
-  fbStructGet(mkListIdx, 0)
+  fbStructGet(mkListTy(), 0)
   fbLocalGet(bA + 3)
-  fbArrayGet(mkArrIdx)
+  fbArrayGet(mkArrTy())
   fbRefIsNull()
   0
 }
@@ -18770,22 +18754,22 @@ function leqSElemNullTest(bA: i32) {
 // null, whatever the list's declared element: two nulls are equal, a null and a string are not.
 function emitListEqSCore(body: u8[]) {
   const bA = leqSScratchBase
-  fbLocalSet(bA + 1)        // B
-  fbLocalSet(bA + 0)        // A
-  fbBlock(127)              // block i32
+  fbLocalSet(bA + 1)         // B
+  fbLocalSet(bA + 0)         // A
+  fbBlock(127)               // block i32
   fbLocalGet(bA + 0)
-  fbStructGet(mkListIdx, 1) // lenA
-  fbLocalSet(bA + 2)        // n
+  fbStructGet(mkListTy(), 1) // lenA
+  fbLocalSet(bA + 2)         // n
   fbLocalGet(bA + 2)
   fbLocalGet(bA + 1)
-  fbStructGet(mkListIdx, 1)
-  fbI32Bin(71)              // i32.ne
+  fbStructGet(mkListTy(), 1)
+  fbI32Bin(71)               // i32.ne
   fbIf(64)
   fbI32Const(0)
   fbBr(1)
   fbEnd()
   fbI32Const(0)
-  fbLocalSet(bA + 3)        // i = 0
+  fbLocalSet(bA + 3)         // i = 0
   fbLoop(64)
   fbLocalGet(bA + 3)
   fbLocalGet(bA + 2)
@@ -18793,21 +18777,21 @@ function emitListEqSCore(body: u8[]) {
   fbIf(64)
   fbElse()
   leqSElemNullTest(bA)
-  fbI32Bin(114)             // i32.or: either element null
+  fbI32Bin(114)              // i32.or: either element null
   fbIf(127)
   leqSElemNullTest(bA)
-  fbI32And()                // equal only when both are
+  fbI32And()                 // equal only when both are
   fbElse()
   // push elem A, elem B (non-null string refs), compare via the string core
   fbLocalGet(bA + 0)
-  fbStructGet(mkListIdx, 0)
+  fbStructGet(mkListTy(), 0)
   fbLocalGet(bA + 3)
-  fbArrayGet(mkArrIdx)
+  fbArrayGet(mkArrTy())
   fbRefAsNonNull()
   fbLocalGet(bA + 1)
-  fbStructGet(mkListIdx, 0)
+  fbStructGet(mkListTy(), 0)
   fbLocalGet(bA + 3)
-  fbArrayGet(mkArrIdx)
+  fbArrayGet(mkArrTy())
   fbRefAsNonNull()
   if emitStrEqCore(body) < 0 { return -1 }
   fbEnd()
@@ -19486,41 +19470,41 @@ function emitListConcatI(body: u8[], leftIx: i32, rightIx: i32, fnIx: i32) {
   if exprNullableList(leftIx, fnIx) { fbRefAsNonNull() }
   if emitExpr(body, rightIx, fnIx) < 0 { return -1 }
   if exprNullableList(rightIx, fnIx) { fbRefAsNonNull() }
-  fbLocalSet(bA + 1)       // B
-  fbLocalSet(bA + 0)       // A
+  fbLocalSet(bA + 1)    // B
+  fbLocalSet(bA + 0)    // A
   fbLocalGet(bA + 0)
-  fbStructGet(lTypeIdx, 1) // lenA
+  fbStructGet(lTy(), 1) // lenA
   fbLocalGet(bA + 1)
-  fbStructGet(lTypeIdx, 1) // lenB
-  fbI32Bin(106)            // i32.add
-  fbLocalSet(bA + 3)       // n = lenA + lenB
+  fbStructGet(lTy(), 1) // lenB
+  fbI32Bin(106)         // i32.add
+  fbLocalSet(bA + 3)    // n = lenA + lenB
   fbLocalGet(bA + 3)
   fbArrayNewDefault(aTypeIdx)
-  fbLocalSet(bA + 2)       // out backing
+  fbLocalSet(bA + 2)    // out backing
   // array.copy out 0 backingA 0 lenA
   fbLocalGet(bA + 2)
   fbI32Const(0)
   fbLocalGet(bA + 0)
-  fbStructGet(lTypeIdx, 0)
+  fbStructGet(lTy(), 0)
   fbI32Const(0)
   fbLocalGet(bA + 0)
-  fbStructGet(lTypeIdx, 1)
+  fbStructGet(lTy(), 1)
   fbArrayCopy(aTypeIdx, aTypeIdx)
   // array.copy out lenA backingB 0 lenB
   fbLocalGet(bA + 2)
   fbLocalGet(bA + 0)
-  fbStructGet(lTypeIdx, 1)
+  fbStructGet(lTy(), 1)
   fbLocalGet(bA + 1)
-  fbStructGet(lTypeIdx, 0)
+  fbStructGet(lTy(), 0)
   fbI32Const(0)
   fbLocalGet(bA + 1)
-  fbStructGet(lTypeIdx, 1)
+  fbStructGet(lTy(), 1)
   fbArrayCopy(aTypeIdx, aTypeIdx)
   // the result wrapper { out, n, n }
   fbLocalGet(bA + 2)
   fbLocalGet(bA + 3)
   fbLocalGet(bA + 3)
-  fbStructNew(lTypeIdx)
+  fbStructNew(lTy())
   0
 }
 
@@ -20475,40 +20459,35 @@ function emitStructEqI32ListField(
   pathFi: i32[],
   fnIx: i32,
 ) {
-  if !lUsed {
-    return emitFail(
-      "emitProgram: i32[] field equality but list type not collected",
-    )
-  }
   // lenL != lenR → 0, else the element loop.
   if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-  fbStructGet(lTypeIdx, 1) // wrapper field 1: len
+  fbStructGet(lTy(), 1) // wrapper field 1: len
   if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-  fbStructGet(lTypeIdx, 1)
-  fbI32Bin(71)             // 0x47 i32.ne
-  fbIf(127)                // 0x04 if, 0x7f i32 blocktype
-  fbI32Const(0)            // length mismatch → 0
-  fbElse()                 // 0x05 else — the element loop, like emitStrEqCore
+  fbStructGet(lTy(), 1)
+  fbI32Bin(71)          // 0x47 i32.ne
+  fbIf(127)             // 0x04 if, 0x7f i32 blocktype
+  fbI32Const(0)         // length mismatch → 0
+  fbElse()              // 0x05 else — the element loop, like emitStrEqCore
   // A = backing(L.f); B = backing(R.f); I0 = len; I1 = 0
   const eqBkA = listBackStashSlot("i32", 0)
   const eqBkB = listBackStashSlot("i32", 0)
   if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-  fbStructGet(lTypeIdx, 0) // backing
+  fbStructGet(lTy(), 0) // backing
   fbLocalSet(eqBkA)
   if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-  fbStructGet(lTypeIdx, 0)
+  fbStructGet(lTy(), 0)
   fbLocalSet(eqBkB)
   if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-  fbStructGet(lTypeIdx, 1) // len
+  fbStructGet(lTy(), 1) // len
   setStrScrI(body, 0)
-  fbBlock(127)             // 0x02 block, 0x7f i32 — yields the 0/1 result
+  fbBlock(127)          // 0x02 block, 0x7f i32 — yields the 0/1 result
   fbI32Const(0)
-  setStrScrI(body, 1)      // I1 = 0
-  fbLoop(64)               // 0x03 loop, void
+  setStrScrI(body, 1)   // I1 = 0
+  fbLoop(64)            // 0x03 loop, void
   pushStrScrI(body, 1)
   pushStrScrI(body, 0)
-  fbI32Bin(78)             // 0x4e i32.ge_s — done?
-  fbIf(64)                 // then: fall through (all matched)
+  fbI32Bin(78)          // 0x4e i32.ge_s — done?
+  fbIf(64)              // then: fall through (all matched)
   fbElse()
   fbLocalGet(eqBkA)
   pushStrScrI(body, 1)
@@ -20516,21 +20495,21 @@ function emitStructEqI32ListField(
   fbLocalGet(eqBkB)
   pushStrScrI(body, 1)
   fbArrayGet(aTypeIdx)
-  fbI32Bin(71)             // 0x47 i32.ne
-  fbIf(64)                 // mismatch → 0, exit the result block
+  fbI32Bin(71)          // 0x47 i32.ne
+  fbIf(64)              // mismatch → 0, exit the result block
   fbI32Const(0)
-  fbBr(3)                  // depths: if(0)·else(1)·loop(2)·block(3)
+  fbBr(3)               // depths: if(0)·else(1)·loop(2)·block(3)
   fbEnd()
   pushStrScrI(body, 1)
   fbI32Const(1)
-  fbI32Bin(106)            // i32.add
+  fbI32Bin(106)         // i32.add
   setStrScrI(body, 1)
-  fbBr(1)                  // continue the loop
-  fbEnd()                  // end (else's if)
-  fbEnd()                  // end (loop)
-  fbI32Const(1)            // every element matched
-  fbEnd()                  // end (result block)
-  fbEnd()                  // end (length if/else)
+  fbBr(1)               // continue the loop
+  fbEnd()               // end (else's if)
+  fbEnd()               // end (loop)
+  fbI32Const(1)         // every element matched
+  fbEnd()               // end (result block)
+  fbEnd()               // end (length if/else)
   0
 }
 
@@ -23027,7 +23006,7 @@ function emitAsMapProbeTrap(body: u8[], amRef: Index, fnIx: i32) {
     fbArrayGet(cmValsBack())
   } else {
     pushMapVals(body)
-    fbStructGet(lTypeIdx, 0)
+    fbStructGet(lTy(), 0)
     pushMapScr(body, 5)
     fbI32Const(1)
     fbI32Bin(107)
@@ -25413,7 +25392,7 @@ function emitCallCoreFromCodePoints(
   c: Call,
   fnIx: i32,
 ) {
-  if !aUsed || !lUsed {
+  if !aUsed {
     return emitFail(
       "emitProgram: fromCodePoints but array/list types not collected",
     )
@@ -25435,18 +25414,18 @@ function emitCallCoreFromCodePoints(
   if callSpillsFcpArg(callIx) {
     if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
     fbLocalTee(fcpSpillStashSlot())
-    fbStructGet(lTypeIdx, 0)
+    fbStructGet(lTy(), 0)
     fbI32Const(0)
     fbLocalGet(fcpSpillStashSlot())
-    fbStructGet(lTypeIdx, 1)
+    fbStructGet(lTy(), 1)
     fbCall(gHelpUtf8Enc)
     return 0
   }
   if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
-  fbStructGet(lTypeIdx, 0)
+  fbStructGet(lTy(), 0)
   fbI32Const(0)
   if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
-  fbStructGet(lTypeIdx, 1)
+  fbStructGet(lTy(), 1)
   fbCall(gHelpUtf8Enc)
   return 0
 }
@@ -27194,13 +27173,8 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
     // a string list `xs[i] = s`: unwrap to its `(ref null $sTypeIdx)` backing and
     // store the string ref, mirroring `emitIndex`'s string path — else it falls into
     // the i32-list case and `struct.get`s the wrong wrapper type.
-    if !slUsed {
-      return emitFail(
-        "emitProgram: string indexed assignment but string list type not collected",
-      )
-    }
-    st.lTy = mkListIdx
-    st.aTy = mkArrIdx
+    st.lTy = mkListTy()
+    st.aTy = mkArrTy()
     st.mfKind = "str"
   } else if st.isF64 {
     st.lTy = fl64Ty()
@@ -27227,14 +27201,10 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
     st.aTy = ba8TypeIdx
     st.mfKind = "u8"
   } else {
-    if !lUsed {
-      return emitFail(
-        "emitProgram: indexed assignment but list type not collected",
-      )
-    }
     if !exprArray(arrIx, fnIx) {
       return emitFail("emitProgram: indexed-assignment target is not an array")
     }
+    st.lTy = lTy()
   }
   0
 }
@@ -27329,7 +27299,7 @@ function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
     isI64: isI64,
     isF32: isF32,
     isU8: isU8,
-    lTy: lTypeIdx,
+    lTy: -1,
     aTy: aTypeIdx,
     mfKind: "i32",
     slot: 0,
@@ -27979,7 +27949,7 @@ function pushSlotOf(
   // A string list runs the identical grow/append sequence over its own wrapper/backing +
   // string-push quad; `array.new_default` zero-inits spare slots to null.
   const ps: PushSlot = {
-    lTy: lTypeIdx,
+    lTy: -1,
     aTy: aTypeIdx,
     base: pushScratchBase,
     armHeap: -1,
@@ -28006,12 +27976,8 @@ function pushSlotOf(
     ps.destKind = pushDestVKind(rslot)
     if rlElemNullable[rslot] == 1 { pv.pushNestSlot = rslot }
   } else if pv.isStr {
-    if !slUsed {
-      emitFail("emitProgram: string .push but string list type not collected")
-      return null
-    }
-    ps.lTy = mkListIdx
-    ps.aTy = mkArrIdx
+    ps.lTy = mkListTy()
+    ps.aTy = mkArrTy()
     ps.base = strPushScratchBase
     // A `(string | null)[]` keeps its nullable slot and stays `null` here.
     if !pv.isNsArr { ps.destKind = "str" }
@@ -28041,9 +28007,8 @@ function pushSlotOf(
     ps.lTy = bl8TypeIdx
     ps.aTy = ba8TypeIdx
     ps.base = u8PushScratchBase
-  } else if !lUsed {
-    emitFail("emitProgram: .push but list type not collected")
-    return null
+  } else {
+    ps.lTy = lTy()
   }
   ps
 }
@@ -28307,10 +28272,10 @@ function scalarListUsedOf(k: VKind): boolean {
     "u8list" => {
       return ba8Used
     }
-    // Every other kind is answered by the i32 list's flag.
+    // Every other kind rides the i32 list, which mints on first read.
     "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {}
   }
-  lUsed
+  true
 }
 
 // the `.pop()` receiver test, lifted out of `emitPop` so the two dispatch sites can ask
@@ -28476,7 +28441,7 @@ function emitPopGo(
       // ref or string list — surface it non-null; an i32 list yields a raw i32. `base` is
       // the scratch frame whose `+3` `recvRef` slot holds a struct-FIELD receiver's wrapper
       // ref (same frame `.push` uses) — used only for a Member receiver.
-      let lTy = lTypeIdx
+      let wrapTy = -1
       let aTy = aTypeIdx
       let base = pushScratchBase
       // The ref-list table slot whose scratch frame a STAGING receiver would use, or -1
@@ -28492,7 +28457,7 @@ function emitPopGo(
         }
         const rslot = refListSlotOfExpr(callee.memObj, fnIx)
         if rslot < 0 { return refListRowRefused(callee.memObj) }
-        lTy = rlWrapIdx[rslot]
+        wrapTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
         popRefSlot = rslot
         elemIsRef = true
@@ -28504,23 +28469,16 @@ function emitPopGo(
             "emitProgram: " + opNm + " but list type not collected",
           )
         }
-        lTy = scalarListWrap(popEk)
+        wrapTy = scalarListWrap(popEk)
         aTy = scalarListBack(popEk)
         base = scalarPushScratchBaseOf(popEk)
       } else if isStr {
-        if !slUsed {
-          return emitFail(
-            "emitProgram: string "
-              + opNm
-              + " but string list type not collected",
-          )
-        }
-        lTy = mkListIdx
-        aTy = mkArrIdx
+        wrapTy = mkListTy()
+        aTy = mkArrTy()
         base = strPushScratchBase
         elemIsRef = true
-      } else if !lUsed {
-        return emitFail("emitProgram: " + opNm + " but list type not collected")
+      } else {
+        wrapTy = lTy()
       }
       // Receiver resolution — `listOpRecvLocal`, shared with `.push`/`.clear`/`.pop() ?? d`.
       const lIdx = listOpRecvLocal(
@@ -28536,7 +28494,7 @@ function emitPopGo(
       // A pop the checker typed as the element itself, under a `.length` test of its receiver
       // (D3558): the list is non-empty, so the element is read unchecked in its own rep.
       if getIdx < 0 && nodeTyExcludesNull(callIx) {
-        if pushTakeElem(body, lIdx, lTy, aTy, getIdx, fnIx) < 0 { return -1 }
+        if pushTakeElem(body, lIdx, wrapTy, aTy, getIdx, fnIx) < 0 { return -1 }
         if elemIsRef {
           fbRefAsNonNull()
           if popUnionBoxElem(popRefSlot) {
@@ -28550,7 +28508,7 @@ function emitPopGo(
         // niche (true=1 / false=0 / null=2), so an empty pop yields the sentinel
         // 2 instead of trapping — mirroring the host's nullable `.pop()` (B6).
         if listElemIsBool(callee.memObj, fnIx) {
-          return emitPopNicheChecked(body, lIdx, lTy, aTy, getIdx, fnIx, 2)
+          return emitPopNicheChecked(body, lIdx, wrapTy, aTy, getIdx, fnIx, 2)
         }
         // the reps with no niche of their own, at a value position (`nulBox`): i32/i64/
         // f64/f32 have no spare bit pattern for absence, so their `T | null` is the
@@ -28560,14 +28518,22 @@ function emitPopGo(
           // A tagged set's member id is an `i32`, boxed as one.
           const pnk = if popNulTagId(nodeTyIxOf(callIx)) { 0 } else { tyNulNumScalarValKind(nodeTyIxOf(callIx)) }
           if pnk >= 0 {
-            return emitPopNulBox(body, lIdx, lTy, aTy, pnk, getIdx, fnIx)
+            return emitPopNulBox(body, lIdx, wrapTy, aTy, pnk, getIdx, fnIx)
           }
         }
         // a `K[]` atom list reads checked too, on the `-1` sentinel below every interned
         // atom id — the boolean arm's shape at the one other niche rep, applying at a
         // statement `.pop()` too since the read itself traps, not the boxing (D1281).
         if tyNulLitUnionInner(nodeTyIxOf(callIx)) {
-          return emitPopNicheChecked(body, lIdx, lTy, aTy, getIdx, fnIx, 0 - 1)
+          return emitPopNicheChecked(
+            body,
+            lIdx,
+            wrapTy,
+            aTy,
+            getIdx,
+            fnIx,
+            0 - 1,
+          )
         }
       }
       if elemIsRef {
@@ -28575,7 +28541,7 @@ function emitPopGo(
           body,
           callIx,
           lIdx,
-          lTy,
+          wrapTy,
           aTy,
           getIdx,
           fnIx,
@@ -28586,15 +28552,15 @@ function emitPopGo(
       // A numeric `.pop` statement has no null cell to answer with, so it pops under the
       // length test and drops the element itself: an empty list is left as it is (D8360).
       if !nulBox && getIdx < 0 {
-        if pushTakeCond(body, lIdx, lTy, getIdx, fnIx) < 0 { return -1 }
+        if pushTakeCond(body, lIdx, wrapTy, getIdx, fnIx) < 0 { return -1 }
         fbIf(64) // 0x40 void
-        if pushTakeElem(body, lIdx, lTy, aTy, getIdx, fnIx) < 0 { return -1 }
+        if pushTakeElem(body, lIdx, wrapTy, aTy, getIdx, fnIx) < 0 { return -1 }
         fbDrop() // 0x1a drop
         fbEnd()  // 0x0b end
         return 1
       }
       // the unchecked tail: the reps with no `T | null` cell of their own.
-      if pushTakeElem(body, lIdx, lTy, aTy, getIdx, fnIx) < 0 { return -1 }
+      if pushTakeElem(body, lIdx, wrapTy, aTy, getIdx, fnIx) < 0 { return -1 }
       return 0
     }
   }
@@ -28722,7 +28688,7 @@ function emitClear(body: u8[], callIx: i32, fnIx: i32) {
       ) {
         return emitFail("emitProgram: .clear receiver is not a list")
       }
-      let lTy = lTypeIdx
+      let wrapTy = -1
       let base = pushScratchBase
       // See `emitPop`'s `popRefSlot`.
       let clearRefSlot = -1
@@ -28734,7 +28700,7 @@ function emitClear(body: u8[], callIx: i32, fnIx: i32) {
         }
         const rslot = refListSlotOfExpr(callee.memObj, fnIx)
         if rslot < 0 { return refListRowRefused(callee.memObj) }
-        lTy = rlWrapIdx[rslot]
+        wrapTy = rlWrapIdx[rslot]
         clearRefSlot = rslot
       } else if clearEk != null {
         // The scalar sibling of the i32 default below, and `emitPop`'s arm minus the
@@ -28742,18 +28708,13 @@ function emitClear(body: u8[], callIx: i32, fnIx: i32) {
         if !scalarListUsedOf(clearEk) {
           return emitFail("emitProgram: .clear but list type not collected")
         }
-        lTy = scalarListWrap(clearEk)
+        wrapTy = scalarListWrap(clearEk)
         base = scalarPushScratchBaseOf(clearEk)
       } else if isStr {
-        if !slUsed {
-          return emitFail(
-            "emitProgram: string .clear but string list type not collected",
-          )
-        }
-        lTy = mkListIdx
+        wrapTy = mkListTy()
         base = strPushScratchBase
-      } else if !lUsed {
-        return emitFail("emitProgram: .clear but list type not collected")
+      } else {
+        wrapTy = lTy()
       }
       const lIdx = listOpRecvLocal(
         body,
@@ -28767,7 +28728,7 @@ function emitClear(body: u8[], callIx: i32, fnIx: i32) {
       // L.len = 0
       fbLocalGet(lIdx)
       fbI32Const(0)
-      fbStructSet(lTy, 1) // 0xfb 0x05 <lTy> field 1: len
+      fbStructSet(wrapTy, 1) // 0xfb 0x05 <wrapTy> field 1: len
       return 0
     }
   }
@@ -28914,13 +28875,8 @@ function mfSrcTysOf(recvK: MfKind, recvIx: i32, fnIx: i32, src: MfSrcTys) {
     // refs). The element is itself a ref (an `array i32` of code points), so it needs
     // `ref.as_non_null` after `array.get`, exactly like a ref-list element — unless the
     // element is the `(string | null)[]` niche, which keeps the nullable read.
-    if !slUsed {
-      return emitFail(
-        "emitProgram: .map/.filter over string[] but string list type not collected",
-      )
-    }
-    src.srcWrap = mkListIdx
-    src.srcBack = mkArrIdx
+    src.srcWrap = mkListTy()
+    src.srcBack = mkArrTy()
     src.srcElemRef = !srcElemNul
   } else if recvK == "u8" {
     // the packed byte source, from `mfRecvKindOf`'s `"u8"` rung (D1141). No
@@ -28934,8 +28890,10 @@ function mfSrcTysOf(recvK: MfKind, recvIx: i32, fnIx: i32, src: MfSrcTys) {
     }
     src.srcWrap = bl8TypeIdx
     src.srcBack = ba8TypeIdx
-  } else if !lUsed || !aUsed {
+  } else if !aUsed {
     return emitFail("emitProgram: .map/.filter but list type not collected")
+  } else {
+    src.srcWrap = lTy()
   }
   0
 }
@@ -29019,7 +28977,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
         )
       }
       const src: MfSrcTys = {
-        srcWrap: lTypeIdx,
+        srcWrap: -1,
         srcBack: aTypeIdx,
         srcElemRef: false,
         srcSlot: -1,
@@ -29030,7 +28988,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       const srcElemRef = src.srcElemRef
       const srcSlot = src.srcSlot
       // The RESULT wrapper/backing heap types.
-      const dst: MfDstTys = { dstWrap: lTypeIdx, dstBack: aTypeIdx }
+      const dst: MfDstTys = { dstWrap: -1, dstBack: aTypeIdx }
       if mfDstTysOf(resK, dstSlot, callIx, dst) < 0 { return -1 }
       const dstWrap = dst.dstWrap
       const dstBack = dst.dstBack
@@ -29191,13 +29149,8 @@ function mfDstTysOf(resK: MfKind, dstSlot: i32, callIx: i32, dst: MfDstTys) {
     // A STRING-list result: a `.filter` over a string list, or a `.map` whose callback
     // returns a string. The backing `$mkArrIdx` holds string refs; `array.set` stores
     // the callback's (non-null) string result directly.
-    if !slUsed {
-      return emitFail(
-        "emitProgram: .map/.filter result is string[] but string list type not collected",
-      )
-    }
-    dst.dstWrap = mkListIdx
-    dst.dstBack = mkArrIdx
+    dst.dstWrap = mkListTy()
+    dst.dstBack = mkArrTy()
   } else if resK == "ref" {
     // A REF-list result (a `.filter` over a struct/union array preserves the element type):
     // the result is the SAME ref list as the source, so its wrapper/backing come from the
@@ -29221,10 +29174,12 @@ function mfDstTysOf(resK: MfKind, dstSlot: i32, callIx: i32, dst: MfDstTys) {
     }
     dst.dstWrap = bl8TypeIdx
     dst.dstBack = ba8TypeIdx
-  } else if !lUsed || !aUsed {
+  } else if !aUsed {
     return emitFail(
       "emitProgram: .map/.filter result but list type not collected",
     )
+  } else {
+    dst.dstWrap = lTy()
   }
   0
 }
@@ -30235,7 +30190,7 @@ function emitClampLocal(_body: u8[], idxL: i32, lenL: i32) {
 // index-needing lowering must decline, but the recover below still claims it); -1 not a
 // nullable collection. One home so a nullable-test and a wrapper consumer cannot disagree.
 function nulCollWrapHeap(exprIx: i32, fnIx: i32) {
-  if exprNullableList(exprIx, fnIx) { return lTypeIdx }
+  if exprNullableList(exprIx, fnIx) { return lTy() }
   const nsk = exprNulScalarListKind(exprIx, fnIx)
   if nsk != null { return nulScalarListWrapHeap(nsk) }
   if exprNullableRefArray(exprIx, fnIx) {
@@ -30284,7 +30239,7 @@ function emitArrSlice(body: u8[], callIx: i32, fnIx: i32) {
       let srcSlot = -1
       if recvK == "ref" { srcSlot = refListSlotOfExpr(callee.memObj, fnIx) }
       // The element kind's wrapper + backing heap types.
-      let wrap = lTypeIdx
+      let wrap = -1
       let back = aTypeIdx
       if recvK == "f64" {
         wrap = fl64Ty()
@@ -30305,13 +30260,8 @@ function emitArrSlice(body: u8[], callIx: i32, fnIx: i32) {
         wrap = rlWrapIdx[srcSlot]
         back = rlBackIdx[srcSlot]
       } else if recvK == "str" {
-        if !slUsed {
-          return emitFail(
-            "emitProgram: .slice over string[] but string list type not collected",
-          )
-        }
-        wrap = mkListIdx
-        back = mkArrIdx
+        wrap = mkListTy()
+        back = mkArrTy()
       } else if recvK == "u8" {
         // the packed byte list (D1141): a `(array (mut i8))` backing under the `$bl8`
         // wrapper, the arm this ladder needs since `mfRecvKindOf` would otherwise answer
@@ -30324,8 +30274,10 @@ function emitArrSlice(body: u8[], callIx: i32, fnIx: i32) {
         }
         wrap = bl8TypeIdx
         back = ba8TypeIdx
-      } else if !lUsed || !aUsed {
+      } else if !aUsed {
         return emitFail("emitProgram: .slice but list type not collected")
+      } else {
+        wrap = lTy()
       }
       const srcL = mfSrcLocalFor(recvK, srcSlot)
       const dstL = mfDstLocalFor(recvK, srcSlot)
@@ -31449,7 +31401,7 @@ function fRetNulHeapOf(fe: i32): i32 {
   const k = fRetKind[fe]
   const si = fRetStructIdx[fe]
   if k == "nulmap" { return mapTypeIdxOf(inferredRetMapSlot(fe)) }
-  if k == "nullist" { return lTypeIdx }
+  if k == "nullist" { return lTy() }
   if k == "nulstruct" {
     return if si >= 0 && si < sHeapIdx.length { sHeapIdx[si] } else { -1 }
   }
@@ -31494,7 +31446,7 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
     }
   }
   if retNulListFlag(r) == 1 {
-    fbRefNull(lTypeIdx)
+    fbRefNull(lTy())
     return 0
   }
   // A distinct-backing nullable scalar list (`i64[] | null`, `string[] | null`): the leaf
@@ -33955,18 +33907,20 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
   // the vals list's when there is one, and the plain i32 list's for a mono-value map.
   const pairValsSlot = forInPairValsSlot(s.fiIter, fnIx)
   const pairIsVal = hasPair && forInPairIsMapVal(s.fiIter, fnIx)
-  let pairWrapTy = lTypeIdx
+  let pairWrapTy = -1
   let pairBackTy = aTypeIdx
   if pairValsSlot >= 0 {
     pairWrapTy = mvValsWrapOf(pairValsSlot)
     pairBackTy = mvValsBackOf(pairValsSlot)
+  } else if pairIsVal {
+    pairWrapTy = lTy()
   }
   // A map pair's value recovers non-null at exactly the element kinds the loop var does, or
   // one spelling recovers and the other traps on a stored null.
   const pairEk = forInPairElemKind(s.fiIter, fnIx)
   const pairRecover = pairIsVal && pairEk != null && forInElemRecovers(pairEk)
   const fb: ForInBacking = {
-    wrapTy: lTypeIdx,
+    wrapTy: -1,
     backTy: aTypeIdx,
     hKind: "i32",
     hSlot: 0,
@@ -34136,8 +34090,8 @@ function forInBackingOf(
     // element slot is nullable either way) and differ ONLY in the loop var: `str` recovers
     // each element non-null below, `nulstr` keeps the raw `(ref null $aTypeIdx)` so a null
     // element is a value the body can test rather than a trap.
-    fb.wrapTy = mkListIdx
-    fb.backTy = mkArrIdx
+    fb.wrapTy = mkListTy()
+    fb.backTy = mkArrTy()
     fb.hKind = "str"
   } else if (
     ek == "struct"
@@ -34193,6 +34147,9 @@ function forInBackingOf(
     fb.wrapTy = scalarListWrap("u8list")
     fb.backTy = scalarListBack("u8list")
     fb.hKind = "u8"
+  } else if !forInStringSrc(s.fiIter, fnIx) {
+    // A string walk reads the string's own array, so only an i32 list needs the wrapper.
+    fb.wrapTy = lTy()
   }
   0
 }
@@ -38766,7 +38723,7 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
         )
       }
       let anBack = aTypeIdx
-      let anWrap = lTypeIdx
+      let anWrap = -1
       const ank = arrNewIntrKind(callIx, fnIx)
       match ank {
         "f64list" => {
@@ -38800,13 +38757,8 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
         "strlist" => {
           // STRING fill → the string list (`array.new` of the shared string-ref
           // backing; a non-null string ref stores into the nullable slot directly).
-          if !slUsed {
-            return emitFail(
-              "emitProgram: __array_new__ string fill but string list types not collected",
-            )
-          }
-          anBack = mkArrIdx
-          anWrap = mkListIdx
+          anBack = mkArrTy()
+          anWrap = mkListTy()
         }
         "reflist" => {
           // STRUCT fill → the ref list of the element struct (its interned slot).
@@ -38829,11 +38781,12 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
           anWrap = rlWrapIdx[anSlot]
         }
         "list" | "none" => {
-          if !aUsed || !lUsed {
+          if !aUsed {
             return emitFail(
               "emitProgram: array intrinsic but list types not collected",
             )
           }
+          anWrap = lTy()
           if anIsNew {
             const anFillObj = nodeAt(c.callArgs[1]) is ObjLit
             if (
@@ -38940,7 +38893,7 @@ function emitArrayCopyIntr(body: u8[], callIx: i32, fnIx: i32) {
         )
       }
       let acBack = aTypeIdx
-      let acWrap = lTypeIdx
+      let acWrap = -1
       if acDstF64 {
         acBack = fa64Ty()
         acWrap = fl64Ty()
@@ -38963,11 +38916,12 @@ function emitArrayCopyIntr(body: u8[], callIx: i32, fnIx: i32) {
             "emitProgram: __array_copy__ expects list (T[]) operands",
           )
         }
-        if !aUsed || !lUsed {
+        if !aUsed {
           return emitFail(
             "emitProgram: array intrinsic but list types not collected",
           )
         }
+        acWrap = lTy()
       }
       if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
       fbStructGet(acWrap, 0)
