@@ -1,8 +1,7 @@
-# Step 7 (WIP): collectA's TypeRef arm off the walk, readers minting by type
+# Step 7: collectA's TypeRef arm off the walk, readers minting by type
 
-Measured 2026-11-09 on a 4-core box. Base is master `50fe2c5c` built to a fixpoint (seed
-6,584,107 bytes). Each candidate is a two-level build off that base. The population is the sweep's
-23,780 programs. This branch is a handoff, not a PR: it still loses runs, and its seed is larger.
+Measured 2026-11-09 on a 4-core box, each session against a master fixpoint and over the sweep's
+~23,780 programs. Sessions one to three were handoffs; the fourth closed the last losses.
 
 ## The experiment
 
@@ -19,10 +18,8 @@ reads. Each later step keeps the one before it.
 | E5 + `repSlotOfKind`'s ref-list arm mints on a miss | 83 | 64 | 6,584,876 |
 | **E6** = E4, with the guard narrowed to records and lists holding a function | **59** | **32** | 6,584,709 |
 
-E5 is reverted. The broad mint did clear the `ref array literal but ref list type not collected`
-and `ref valtype with no interned shape` classes. It also added 36 check-clean invalid-wasm losses
-(D15164, `d15116_*`). That repeats the refused "`rlSlotOfTy` mints on a miss": a slot read that
-asks a question cannot also mint.
+E5 is reverted: it cleared two refusal classes and added 36 invalid-wasm losses (D15164,
+`d15116_*`). A slot read that asks a question cannot also mint.
 
 ## What each mechanism bought
 
@@ -60,8 +57,7 @@ Base: master merged at `b861eb49`, fixpoint 6,584,352 bytes. Fixpoint candidates
   The loop is now bounded by `mvMapTypeIdx.length`, the last column pushed.
 
 ## Third session: 29 → 9
-Base: master `de73ab0c` at fixpoint (6,584,405 bytes); candidate fixpoint +879; 23,783 programs.
-D13940, D2273 and D4712 move from emit reject to `runs`.
+Base: master `de73ab0c` at fixpoint (6,584,405 bytes); candidate +879; 23,783 programs.
 
 * For-in var over a list at an arm's shape: the kind is `variant`, the slot names none, so the
   row is asked by type (`repSlotOfKind`) on a name miss (9 cells).
@@ -70,11 +66,15 @@ D13940, D2273 and D4712 move from emit reject to `runs`.
   `preIndexMintTrees`; a `nulmap` recorded result, like `map`, needs no token. That fixed D3059,
   D2698, D956 and the rec-group count.
 
-What stands (9 runs lost, 8 traps):
+## Fourth session: 9 → 0
+Base: master `6d4b3006` at fixpoint (6,584,516 bytes); candidate fixpoint 6,585,858 (+1,342);
+23,787 programs: 0 runs lost, 0 new traps, D13940/D2273/D4712 gain `runs`, 1,002 bytes-only.
 
-* **8 function-value cells, routed to w223**: D9716, D9764, `d15207`/`d15293`/`d15294`, and three
-  `closures/` cases. A record or list holding a function gets no row (`rlRowOfTyMinted`'s skip),
-  so `frsColsOfTy` returns "no token" and the inferred result is lowered as `i32`.
-* **`record-list-of-lists-element-held-by-binding-runs`**: `listBuildOfTy` mints `{f:i32}` where
-  the destination holds `J`; a destination-first `arrLitBuild` did not fix it.
-* **The seed is +879**: `collectATypeRef`'s forcers still run on read, until typed readers replace them.
+* **The 8 function-value cells were ordering; the E4 skip is not on their path and stands.**
+  Mono pins a hole function's local (`let u: ((i32)=>i32)[]`), and the return-column reader
+  (`recordedVoidFns#2`) read the recorded `((_)=>_)[]` before anything minted that annotation, so
+  the result lowered as `i32`. `criRetBindAnnMint` mints each returned binding's annotation first.
+* **An empty literal mints no row** (`listBuildOfTyHeld`). `[]` delivered to a binding whose
+  rows are a wider record's (D15236) read `{f: i32}[]` from its type and its destination, and
+  minted a second list of `J` beside the binding's. Reading without minting falls to the cell's row.
+* **Bytes-only:** a seeded sample of 30 of the 1,002 is a pure type-index permutation.
