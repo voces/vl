@@ -350,7 +350,7 @@ import {
   isRecvStagedSlot,
   isTestedLitLex,
   isTestsNull,
-  listIsTestedName,
+  listIsTestedIdent,
   litLexIsMember,
   loopStackFind,
   mapShapeFoldSet,
@@ -384,8 +384,8 @@ import {
   ifArmValueExpr,
   letIsF32,
   parTyNode,
-  paramIndexOf,
   paramNulString,
+  paramPosOfRead,
 } from "./emit_query"
 import {
   AS_FAIL_DOMS,
@@ -1420,6 +1420,7 @@ import {
   forRangeStepIsConst,
   holeOperandTyOf,
   holePinProvesNonNull,
+  identNameOrEmpty,
   instancePinnedMaps,
   instanceTyOf,
   mapArmShapeOfTy,
@@ -1865,7 +1866,11 @@ export function sFieldStorageSlot(si: i32, fi: i32): i32 {
   const code = sFieldTypeAt(si, fi)
   if code == FC_STRUCT { return sFieldTgtStructIdx(si, fi) }
   if code == FC_MAP || code == FC_NUL_MAP { return sFieldMapShape(si, fi) }
-  sFieldRefSlot(si, fi)
+  // Only a ref-list field reads a ref-list slot; asking for any other would mint an unused row.
+  if code == FC_REF_LIST || code == FC_NUL_REF_LIST {
+    return sFieldRefSlot(si, fi)
+  }
+  -1
 }
 
 // The null value of an omitted nullable field (`si`/`fi`, field code `scode`) in a
@@ -4294,7 +4299,7 @@ function emitListEmptyFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
     const sh = listFitShadowSet(isIx, recvTy, depth, fnIx)
     if sh < 1 { return sh }
     if sh == 2 && rv is Ident {
-      grow = listFitGrowRow(rv.identName, isVarTyIxOf(isIx), fnIx)
+      grow = listFitGrowRow(unwrapParen(nd.isObj), isVarTyIxOf(isIx), fnIx)
     }
   }
   const slots: i32[] = []
@@ -4516,7 +4521,7 @@ function listFitShadowSet(isIx: i32, recvTy: i32, depth: i32, fnIx: i32): i32 {
   const wrap = heaps[2]
   const recvLoc = localIndexOf(fnIx, unwrapParen(nd.isObj))
   if recvLoc < 0 { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
-  const grow = listFitGrowRow(r.identName, kTy, fnIx)
+  const grow = listFitGrowRow(unwrapParen(nd.isObj), kTy, fnIx)
   let loc = -1
   let i = 0
   while i < fitShName.length {
@@ -4561,11 +4566,12 @@ function listFitShadowIsRef(recv: i32, fnIx: i32): boolean {
   row >= 0 && fitShSlot[row] >= 0 && !listFitGrowHolds(fitShLocal[row])
 }
 
-// The `fitGrow*` row of an `is K[]` arm in `fnIx` that pushes onto receiver `name` (any `K[]`
-// when `kTy` is -1), or -1 (D4934). Its local holds `K[]` from the first test that fits on, so
+// The `fitGrow*` row of an `is K[]` arm in `fnIx` that pushes onto the receiver `Ident` `rIx`
+// reads (any `K[]` when `kTy` is -1), or -1 (D4934). Its local holds `K[]` from the first test that fits on, so
 // that list is the receiver's place: a later test fits it and a `.length` reads it.
-function listFitGrowRow(name: string, kTy: i32, fnIx: i32): i32 {
-  if !listIsTestedName(name) { return -1 }
+function listFitGrowRow(rIx: i32, kTy: i32, fnIx: i32): i32 {
+  if !listIsTestedIdent(rIx) { return -1 }
+  const name = identNameOrEmpty(rIx)
   if fitGrowFn != fnIx { listFitGrowScan(fnIx) }
   let i = 0
   while i < fitGrowName.length {
@@ -4660,8 +4666,7 @@ function listFitGrowWalk(
   const n = nodeAt(ix)
   if n is FuncDecl { return 0 }
   if n is IsExpr {
-    const r = nodeAt(unwrapParen(n.isObj))
-    if r is Ident && listIsTestedName(r.identName) { isIxs.push(ix) }
+    if listIsTestedIdent(unwrapParen(n.isObj)) { isIxs.push(ix) }
   } else if n is Call {
     if n.callFn < 0 { return 0 }
     const cf = nodeAt(n.callFn)
@@ -4749,7 +4754,7 @@ function emitListFitGrowLen(body: u8[], m: Member, memIx: i32, fnIx: i32): i32 {
   const o = nodeAt(m.memObj)
   if !(o is Ident) { return 0 }
   if listFitShadowRead(o.identName, m.memObj, fnIx) >= 0 { return 0 }
-  const g = listFitGrowRow(o.identName, -1, fnIx)
+  const g = listFitGrowRow(m.memObj, -1, fnIx)
   if g < 0 { return 0 }
   const kt = tyAt(fitGrowTy[g])
   if !(kt is TyArray) { return 0 }
@@ -4778,7 +4783,9 @@ function listFitCaptureStandIn(
   fnIx: i32,
   anyPos: boolean,
 ): i32 {
-  if !listIsTestedName(name) || !identIsEnvCapture(fnIx, name) { return -1 }
+  if !listIsTestedIdent(unwrapParen(exprIx)) || !identIsEnvCapture(fnIx, name) {
+    return -1
+  }
   if narListReadsDecl(exprIx) { return -1 }
   const heaps: i32[] = []
   let kind = listFitStandInKind(nodeTyIxOf(exprIx), heaps)
@@ -8311,21 +8318,18 @@ function emitUnionCoerceValueAtom(
       // its function's declared return reads the box at the declaration's rep.
       const nlArg = nodeAt(unwrapParen(exprIx))
       let nlParam = false
-      if (
-        nlArg is Ident
-        && (fnIx < 0 || paramIndexOf(fnIx, nlArg.identName) < 0)
-      ) {
+      if (nlArg is Ident && (fnIx < 0 || paramPosOfRead(fnIx, exprIx) < 0)) {
         nlParam = true
       }
       if nlArg is Ident && fnIx >= 0 {
         const nlFn = nodeAt(fnIx)
         // A pinned instance's parameter holds the atom too: the instance reads it at its own rep.
         if nlFn is FuncDecl && (nlFn.fnRet < 0 || fnInPinnedInstance(fnIx)) {
-          if paramIndexOf(fnIx, nlArg.identName) >= 0 { nlParam = true }
+          if paramPosOfRead(fnIx, exprIx) >= 0 { nlParam = true }
         }
         // A `K | null` niche parameter holds the atom id whatever the function's return (D4041).
         if (
-          paramIndexOf(fnIx, nlArg.identName) >= 0
+          paramPosOfRead(fnIx, exprIx) >= 0
           && exprNulLitUnion(exprIx, fnIx)
         ) {
           nlParam = true
