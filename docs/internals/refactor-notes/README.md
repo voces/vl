@@ -8,6 +8,7 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step7-held-rep-minted-on-read](2026-11-09-step7-held-rep-minted-on-read.md): Step 7: a held node's rows mint at its first read; `collectAHeldRep` leaves collectA.
 - [2026-11-09-step7-struct-row-callers](2026-11-09-step7-struct-row-callers.md): Step 7: twelve of the fifteen `repSlotOfTy` callers read the structural struct row; sweep byte-identical.
 - [2026-11-09-step7-recursive-element-arm](2026-11-09-step7-recursive-element-arm.md): Step 7: a recursive element's arm row mints at its first read.
 - [2026-11-09-step7-struct-row-late-mint](2026-11-09-step7-struct-row-late-mint.md): Step 7: a struct row minted after the type indices takes its twin, heap index and supertype at mint; `collectArmStructRows` and `collectS`'s arm map-slot intern are deleted.
