@@ -321,9 +321,8 @@ import {
   armStageTypes,
   armsAdopted,
   arrLitRlSlot,
-  ba8TypeIdx,
-  ba8Used,
-  bl8TypeIdx,
+  ba8Ty,
+  bl8Ty,
   cloCellIdx,
   cloCellUsed,
   cloLiftCapN,
@@ -550,6 +549,7 @@ import {
   vbI32Used,
   vbI64Idx,
   vbI64Used,
+  vbU8ArmUsed,
   vbV128Idx,
   vbV128Used,
 } from "./emit_state"
@@ -4387,17 +4387,11 @@ export function mAssignTypeIndices(_n: i32) {
   // mints them), so the index is real here.
   let rsfix = 0
   while rsfix < rlElemName.length {
-    if rlElemKindAt(rsfix) == RLK_STR_LIST {
-      rlElemHeap[rsfix] = mkListTy()
-    } else if rlElemKindAt(rsfix) == RLK_F64_LIST {
-      rlElemHeap[rsfix] = fl64Ty()
-    } else if rlElemKindAt(rsfix) == RLK_F32_LIST {
-      rlElemHeap[rsfix] = fl32Ty()
-    } else if rlElemKindAt(rsfix) == RLK_I64_LIST {
-      rlElemHeap[rsfix] = il64Ty()
-    } else if rlElemKindAt(rsfix) == RLK_U8_LIST {
-      rlElemHeap[rsfix] = bl8TypeIdx
-    }
+    if rlElemKindAt(rsfix) == RLK_STR_LIST { rlElemHeap[rsfix] = mkListTy() }
+    else if rlElemKindAt(rsfix) == RLK_F64_LIST { rlElemHeap[rsfix] = fl64Ty() }
+    else if rlElemKindAt(rsfix) == RLK_F32_LIST { rlElemHeap[rsfix] = fl32Ty() }
+    else if rlElemKindAt(rsfix) == RLK_I64_LIST { rlElemHeap[rsfix] = il64Ty() }
+    else if rlElemKindAt(rsfix) == RLK_U8_LIST { rlElemHeap[rsfix] = bl8Ty() }
     rsfix = rsfix + 1
   }
   mAssignClosureTypes()
@@ -4699,8 +4693,8 @@ function mAssignStrListAndMapStructs(mStructIdxPre: i32) {
   0
 }
 
-// Mint the f64, i64, f32 and `u8` (backing, wrapper) list pairs, each only when used; an
-// unused pair aliases the next two counter positions and mints nothing.
+// Mint the scalar list pairs a view needs ahead of the view; every other pair mints on
+// first read.
 function mAssignScalarListPairs() {
   // The f64, i64 and f32 pairs mint on first read (`fa64Ty`, `ia64Ty`, `fa32Ty`). A scalar view
   // subtypes its destination's wrapper and keeps its source's, so it mints both first.
@@ -4708,17 +4702,6 @@ function mAssignScalarListPairs() {
   if svDstOn(0) { ia64Ty() }
   if svPairOn(2) { fa32Ty() }
   if svPairOn(0) || svPairOn(1) { lTy() }
-  // The `u8[]` pair, immediately after the f32 pair and under the same "interned late"
-  // discipline: the PACKED `(array (mut i8))` backing then its `{backing,len,cap}`
-  // wrapper. Present only when `ba8Used`; aliases its slots otherwise, so a program with
-  // no `u8[]` mints nothing and every earlier heap-type index is untouched.
-  if ba8Used {
-    ba8TypeIdx = mAllocType(TSK_U8_ARRAY, 0)
-    bl8TypeIdx = mAllocType(TSK_U8_LIST, 0)
-  } else {
-    ba8TypeIdx = mNextType
-    bl8TypeIdx = mNextType + 1
-  }
   0
 }
 
@@ -4844,10 +4827,7 @@ function forceAnnLeafReps(a: string): i32 {
         // The f32 pair mints on first read (`fa32Ty`).
       }
       "nulu8list" => {
-        // The packed-byte backing a `u8[] | null` cell's value needs. Its three siblings mark
-        // their backings here; without this one the literal path's `!ba8Used` floor refuses a
-        // program whose cell is already typed `nulu8list`.
-        ba8Used = true
+        // The packed byte pair mints on first read (`ba8Ty`).
       }
       "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
         // Not a nullable scalar list, so it marks no backing here.
@@ -5016,9 +4996,7 @@ function forceAnnLeafRepsOfTy(t: i32): i32 {
     "f32" => {
       // The f32 pair mints on first read (`fa32Ty`).
     }
-    "u8" => {
-      ba8Used = true
-    }
+    "u8" => {}
     "string" | "i32" | "boolean" | "void" | "null" | "never" | "v128" => {
       // Taken above, or no backing of its own.
     }
@@ -5126,9 +5104,7 @@ function collectArrNewScalarPair(ank: ArrNewKind) {
     "i64list" => {
       // The i64 pair mints on first read (`ia64Ty`).
     }
-    "u8list" => {
-      ba8Used = true // D1470 — `__array_new_default__` over a `u8[]` destination
-    }
+    "u8list" => {}
     "f32list" => {
       // D1470: the f32 pair mints on first read (`fa32Ty`).
     }
@@ -5426,7 +5402,6 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
         rlInternNameTy(nestElem, nestKind, rlHintElemTy(i))
         if nestKind == RLK_I32_LIST { aUsed = true }
         if nestKind == RLK_STR_LIST { aUsed = true }
-        if nestKind == RLK_U8_LIST { ba8Used = true }
         // A map inner element (3) rides the map struct plus the i32 list and array its
         // `index` and `vals` fields use. Same flags as the `arrLitIsRef` arm.
         if nestKind == RLK_MAP {
@@ -5496,7 +5471,6 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
         mUsed = true
         aUsed = true
       }
-      if kAfter == RLK_U8_LIST { ba8Used = true }
     }
   } else if arrLitIsStr(i, -1) {
     // A STRING-element literal is a string-ref list — the same wrapper/backing
@@ -5593,7 +5567,6 @@ function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
   // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
   // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
   if raKind == RLK_STR_LIST { aUsed = true }
-  if raKind == RLK_U8_LIST { ba8Used = true }
   // A map element (`{[K]: V}[]`, `({[K]: V} | null)[]`) forces the map machinery — the
   // three type flags, the element map's mv value slot and `mI32Used` for an i32 key —
   // inside `ensureRefElem` above, whose `k == 3` arm is the one home of that forcing and
@@ -5713,7 +5686,6 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     // (`ba8`/`bl8`). Arena first then the name, exactly as the three scalar rungs
     // above do and for the same reason: without a forcing rung here the annotation
     // falls into `checkArrName` below and is rejected as a non-i32 element array.
-    ba8Used = true
   } else if annArrOverTyParam(i) {
     // An array over a type parameter (`T[]`, `T[][]`, or a record element with a `T` field) is a
     // generic original's annotation. Its monomorphized instances carry concrete pinned
@@ -5745,7 +5717,6 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     // leads with `annRepKindOf` and falls back to the name ladder, so it cannot under-answer.
     const nsk = nulScalarListKindOfNode(i)
     if nsk == "nulstrlist" { aUsed = true }
-    if nsk == "nulu8list" { ba8Used = true }
   } else if nodeTyIsLitUnionAlias(i) || nodeTyIsNulLitUnion(i) {
     // A literal-union annotation (`: K`): an atom widens to its member `string`, so force the
     // string backing even when the module has no other string literal. The nullable niche
@@ -9322,6 +9293,7 @@ function collectUReset() {
   vbF32Used = false
   vbF64Used = false
   vbV128Used = false
+  vbU8ArmUsed = false
   if widenRetagToHas("i64") { vbI64Used = true }
   if widenRetagToHas("f64") { vbF64Used = true }
   mIntMonoArmUsed = false
