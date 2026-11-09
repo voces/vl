@@ -2538,6 +2538,29 @@ function elabInstUnder(d: i32, k: i32): i32 {
   -1
 }
 
+// The one instance of `d` built under instance `k` through nested enclosers' instances, or -1
+// for none or two.
+function elabInstWithin(d: i32, k: i32): i32 {
+  let r = -1
+  let a = 0
+  while a < ekDecl.length {
+    if ekDecl[a] == d {
+      let p = ekParent[a]
+      let steps = 0
+      while p >= 0 && p < ekParent.length && p != k && steps < 16 {
+        p = ekParent[p]
+        steps = steps + 1
+      }
+      if p == k {
+        if r >= 0 { return -1 }
+        r = a
+      }
+    }
+    a = a + 1
+  }
+  r
+}
+
 // Whether `d` has an instance whose parent is instance `k`.
 function elabHasInstUnder(d: i32, k: i32): boolean { elabInstUnder(d, k) >= 0 }
 
@@ -4495,8 +4518,27 @@ function elabAliasSetFwd(
         // A nested function's read is one body for every instance (D14842), unless the nested
         // function is built per instance of `fn`, where a call through a set forwards it as at
         // that instance; a hand-on to a named function's parameter forwards it either way.
+        // A call through the copy is a call through the parameter (`elabCalleeParam`).
+        const cn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        if (
+          cn is Call
+          && parenPeelIx(cn.callFn) == x
+          && elabAliasSource(d, fn, 8, k) >= 0
+        ) {
+          continue
+        }
         if inFn {
-          const kk = if elabPerEnclDecls[inD] ?? false { elabInstUnder(inD, k) } else { -1 }
+          // A copy made there forwards it wherever the copy is read, as one in `fn` does.
+          const cl = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+          if (
+            cl is LetDecl
+            && parenPeelIx(cl.letInit) == x
+            && elabParamCopyOf(p, fn) >= 0
+          ) {
+            cps.push(p)
+            continue
+          }
+          const kk = if elabPerEnclDecls[inD] ?? false { elabInstWithin(inD, k) } else { -1 }
           const nto = if kk >= 0 { elabSetFwdTarget(x, p, kk) } else { [] }
           const nm = if nto.length == 0 { elabMintFwdTarget(x, p) } else { [] }
           if nto.length == 0 && nm.length != 2 { return false }
@@ -4817,6 +4859,9 @@ function elabCalleeParam(root: i32, decl: i32, k: i32): i32 {
   if nodeAt(d) is Param { return d }
   const ap = elabCallOnlyAlias(d, dn, k)
   if ap >= 0 { return ap }
+  // So does one also handed on, where each hand-on forwards the parameter (`elabAliasSetFwd`).
+  const hp = elabAliasSource(d, dn, 8, k)
+  if hp >= 0 && elabAliasReadsOk(d, dn, 8, k, true) { return hp }
   const lp = elabHolderParamSource(d, dn)
   if lp >= 0 { return lp }
   const jp = elabListJoinAt(d, dn, k)
@@ -5426,7 +5471,7 @@ function elabWrittenAliasReadsOk(d: i32, fn: FuncDecl): boolean {
 // another such binding: the alias hands the set nowhere else and nothing re-points it; else -1.
 function elabCallOnlyAlias(d: i32, fn: FuncDecl, k: i32): i32 {
   const pd = elabAliasSource(d, fn, 8, k)
-  if pd < 0 || !elabAliasReadsOk(d, fn, 8, k) { return -1 }
+  if pd < 0 || !elabAliasReadsOk(d, fn, 8, k, false) { return -1 }
   pd
 }
 
@@ -5642,7 +5687,13 @@ function elabTyParamsAgreeAt(a: string, b: string, k: i32): boolean {
 // Whether every read of binding `d` in `fn`'s body is a call's callee, or the initialiser of a
 // binding (unannotated, or a copy `elabAliasSource` takes) whose own reads are so, within `depth`
 // bindings.
-function elabAliasReadsOk(d: i32, fn: FuncDecl, depth: i32, k: i32): boolean {
+function elabAliasReadsOk(
+  d: i32,
+  fn: FuncDecl,
+  depth: i32,
+  k: i32,
+  handOk: boolean,
+): boolean {
   if depth <= 0 { return false }
   const todo: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
@@ -5657,8 +5708,9 @@ function elabAliasReadsOk(d: i32, fn: FuncDecl, depth: i32, k: i32): boolean {
         const seeds = pn is LetDecl
           && parenPeelIx(pn.letInit) == x
           && (pn.letType < 0 || elabAliasSource(p, fn, depth, k) >= 0)
-          && elabAliasReadsOk(p, fn, depth - 1, k)
-        if !callee && !seeds { return false }
+          && elabAliasReadsOk(p, fn, depth - 1, k, handOk)
+        const handed = handOk && pn is Call && i32ListHas(pn.callArgs, x)
+        if !callee && !seeds && !handed { return false }
       }
       for c in nodeChildren(x) {
         todo.push(c)
