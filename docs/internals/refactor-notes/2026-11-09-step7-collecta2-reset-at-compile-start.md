@@ -1,19 +1,19 @@
 # Step 7: collectA#2 no longer wipes the row tables
 
-Measured 2026-11-09 on a 4-core box. The base is master `9b0686b4`. Both seeds are fixpoints
-(two `refresh-compiler.sh` runs byte-identical). The population is the sweep's 23,756 programs.
+Measured 2026-11-09 on a 4-core box. The base is master `fe659e02` (#6947). Both seeds are
+fixpoints (two `refresh-compiler.sh` runs byte-identical). The population is the sweep's 23,756 programs.
 
 | | base (fixpoint) | candidate (fixpoint) |
 | --- | --- | --- |
 | sweep | | 23,743 same; 13 bytes-only, 0 output movers, 0 runs lost, 0 new traps |
-| seed bytes | 6,578,500 | 6,578,514 (+14) |
+| seed bytes | 6,577,566 | 6,577,580 (+14), +2.8% of the +3% bar |
 
 The cost gate's reading is in the PR.
 
 ## What moved
 
-`collectAResetTables` wiped the ref-list rows, the map-value slots, their per-node sidecars and
-the `mI32Used`/`mI64Used` flags, and then re-minted the union rows at the head of the table.
+`collectAResetTables` wiped the ref-list rows, the map-value slots and their per-node sidecars.
+It then re-minted the union rows at the head of the table.
 It was also the only reset those tables had, so on a shared instance it was what cleared the
 previous compile's rows.
 
@@ -23,8 +23,8 @@ now stands, and the walk finds it instead of minting it again.
 
 ## Probes
 
-Three scratch builds were made one level off the base seed. Each records a fact with
-`emitFail("PROBE …")`, and each was run over the population in `vl check --batch --codegen`.
+Three scratch builds were made one level off the pre-#6947 base seed, where the sweep was also
+run, with the same 13 movers. Each records a fact with `emitFail("PROBE …")`, and each was run over the population in `vl check --batch --codegen`.
 
 * **The tables at the walk's entry.** The first probe kept the wipe and checked that every row
   present at the walk's entry was minted again by the walk. In batch mode it fired 4,498 times,
@@ -33,7 +33,8 @@ Three scratch builds were made one level off the base seed. Each records a fact 
 * **The same check after the move.** The wipe now runs at compile start, so the batch is
   uncontaminated. 6 programs have a row from before the walk that the walk does not mint again:
   D187, D4932, D4966, `array-alias-inline-shape-element`, `array-alias-map-element` and
-  `shape-list-union-return-into-field`. No map-value slot is lost, and neither flag is.
+  `shape-list-union-return-into-field`. No map-value slot is lost. Before #6947, neither
+  integer-key flag was lost either.
 * **The union re-mark.** This probe tested whether `collectAUnionRows` is a no-op now that the
   registration rows stand. It is not: in 52 batch hits it mints rows that the registration-time
   call keyed differently. It stays.
