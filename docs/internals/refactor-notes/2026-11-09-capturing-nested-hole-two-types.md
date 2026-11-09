@@ -54,4 +54,14 @@ Both refuse the same on base and candidate.
 
 ## Measured
 
-MEASURED
+| | base | candidate |
+|---|---|---|
+| sweep, 23,768 programs (base seed `b2389003`) | | 23,762 same, 0 bytes-only, 6 output movers, all emit reject → runs: #6958's four (D15582, D15595, both fixtures) and D15596's witness and fixture; 0 `runs → not-runs`, 0 new traps |
+| rep-fuzz | | exact, 0 failures |
+| plumb-shape fuel, main / tail (against its baseline) | | −1.4% / −2.5% |
+| self-compile peak RSS (ru_maxrss, mean of 2) | 3,850,882 kB | 3,850,880 kB (0.0%) |
+| late demands | 6 | 6 |
+| seed (fixpoint) | 6,581,092 | 6,581,299 (+207, +2.9% of the baseline) |
+
+The cost gate reads no RSS on this box (no `/usr/bin/time`), so RSS is read with `getrusage` over
+one self-compile per seed. Its base is `b2389003`'s fixpoint, without #6958.
