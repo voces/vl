@@ -8,6 +8,8 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-capturing-nested-hole-two-types](2026-11-09-capturing-nested-hole-two-types.md): Step 4: a nested hole at two encloser instances joins the bundle, D15596 (#6961).
+- [2026-11-09-step7-arraylit-arm-minted-at-first-reader](2026-11-09-step7-arraylit-arm-minted-at-first-reader.md): Step 7: collectA#2's ArrayLit arm deleted; its readers mint at first read (#6960).
 - [2026-11-09-fn-value-rows-two-types-and-pushed-lambda](2026-11-09-fn-value-rows-two-types-and-pushed-lambda.md): Step 4: D15595 and D15582 (#6958).
 - [2026-11-09-step7-ref-list-pairs-after-type-indices](2026-11-09-step7-ref-list-pairs-after-type-indices.md): Step 7: ref-list pairs mintable after mAssignTypeIndices; the reader floors left (#6952).
 - [2026-11-09-step7-collecta2-reset-at-compile-start](2026-11-09-step7-collecta2-reset-at-compile-start.md): Step 7: collectA#2's row tables wiped once per compile (#6950).
