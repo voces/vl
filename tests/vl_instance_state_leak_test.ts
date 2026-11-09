@@ -282,6 +282,18 @@ const PROGRAMS: Program[] = [
     family: "NONE",
     src: 'const s = "hi"\nprint(s)\nprint(s.length)\n',
   },
+  // ── the check-time read of `collectGenAliasFieldAnns`' bank, which canon fills after the
+  // check: the first program's generics leave their annotations in it, keyed by node (D15602) ──
+  {
+    id: "generic-annotations-banked",
+    family: "cgpFieldNodes (D15602)",
+    path: "generics/capturing-hole-lambda-called-then-delivered-as-value.vl",
+  },
+  {
+    id: "bare-only-type-parameters-read",
+    family: "tyParamBareOnly via cgpFieldNodes (D15602)",
+    path: "generics/capturing-hole-to-two-params-of-one-type.vl",
+  },
   {
     id: "bare-i32-array",
     family: "NONE (aUsed/lUsed only)",
