@@ -11,7 +11,7 @@ outside any instance frame, as the walk did. `rlMvTablesReset` removes the hook
 (`arrLitMintOff`). The readers that mint a literal first:
 
 * its own emission (`emitArrUnder`) and its row-slot reads (`arrLitRowSlotIn`, `arrLitRlSlotAt`);
-* the function holding it, as that function's code starts (`emitFuncCode`), in node order;
+* the function holding it, as that function's code starts (`emitFuncCode`);
 * the top-level statements' literals, as `emitModule` starts;
 * the literals in a value a function returns, before `frsRecordedRetCore` reads the result's
   token (`recordRetTys` runs at `buildFnMap#2`, ahead of every body);
@@ -44,14 +44,18 @@ the 72 fell to two causes the probe could not see:
 
 ## Proof
 
-* Sweep diff, base against candidate: 23,475 same, **0 runs → not-runs, 0 new traps**, 1 output
-  mover, 285 bytes-only movers.
+* Sweep diff, base against candidate: 23,457 same, **0 runs → not-runs, 0 new traps**, 1 output
+  mover, 303 bytes-only movers.
+* Seed: 6,581,601 bytes against base's 6,581,986 (−385). Plumb-shape cost: main fuel +0.1%,
+  peak RSS 320.5 MB (+0.8%); tail fuel −1.0%, RSS +0.1%. The walks append children onto their
+  own stack (`nodeChildrenPush`). Allocating a list per node put main RSS at +39%. A root list
+  scanned per node was quadratic (scaling shape, module-scope writes, 29×).
 * The output mover is `tests/cases/lists/error-list-literal-two-unions-and-record-list.vl`, an
   `@emit-error` case. Its refusal now names the declared twin `Circle[]` where it named
   `{r:i32}[]`. The directive's substring still matches.
-* All 285 bytes-only movers run with base's output. Each one was rebuilt on both seeds and
+* All 303 bytes-only movers run with base's output. Each one was rebuilt on both seeds and
   disassembled with `wasm-dis`:
-  * **278 reorder rows.** They have the same bytes, and the disassembly is identical once type
+  * **296 reorder rows.** They have the same bytes, and the disassembly is identical once type
     indices are renumbered and lines sorted.
   * **3 reserve no view helpers** (428 → 364 bytes: `list-two-unions-no-elem-read`,
     `d741_w5_no_narrow`, `d853_two_unions_no_elem_read`). `rvWanted` is asked in
