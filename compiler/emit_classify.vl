@@ -107,7 +107,7 @@ import {
   inferRetRowOf,
   inferRetTyIxOf,
 } from "./check_infer_ret"
-import { inferRetTyIxAt, isInferLetNulBool } from "./check_infer_rows"
+import { inferRetTyIxAt } from "./check_infer_rows"
 import {
   atomicIntrinsicIsVoid,
   fsIntrinsicSlot,
@@ -555,7 +555,6 @@ import {
   firstValuedReturn,
   globalHasTypeAnn,
   ifArmValueExpr,
-  letIsNulBoolAnn,
   letIsSet,
   parTyNode,
   paramIndexOf,
@@ -3084,21 +3083,14 @@ function lckReset() {
   0
 }
 
+// `letCellKind`'s answer: a returned bundle's holder is that record (D15144), then the rep
+// the binding's type claims, the annotation's kind, else the rep kind of the type it holds.
 function letCellKindGo(letIx: i32, fnIx: i32): VKind {
-  if clsCensusOn { clsCensusEnter("letCellKindGo") }
-  // A holder of a returned bundle's whole record is that record (D15144).
   if holderRecordSigs(letIx, fnIx).length > 0 { return "struct" }
   if letBindRepClaims(letIx, fnIx) { return letBindRep(letIx, fnIx).rdKind }
-  // A `boolean | null` cell is the sentinel-2 niche, whatever the annotation's valtype says.
-  if letNulBool(letIx, fnIx) { return "nulbool" }
-  // A map whose type names no rep, in `letLocalSlot`'s order (D14229).
-  if letIsMap(letIx, fnIx) { return "map" }
   const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return vtKindOfType(d.letType) }
-    if d.letInit >= 0 { return letBindRepKind(letIx, fnIx) ?? "i32" }
-  }
-  "i32"
+  if d is LetDecl && d.letType >= 0 { return vtKindOfType(d.letType) }
+  letBindRepKind(letIx, fnIx) ?? "i32"
 }
 
 // The map shape beside an inferred `map` or `nulmap` result valtype: the return expression's,
@@ -4286,13 +4278,12 @@ export function catSameKind(e: BinExpr, lk: i32, rk: i32, fnIx: i32) {
 // intrinsics (`slice`, `charCodeAt`, `cpAt`, `cpLen`, `isCharBoundary`, `bytes`) are each
 // this test with their own method name.
 export function exprIsStrMethod(callIx: i32, fnIx: i32, prop: string) {
-  if clsCensusOn { clsCensusEnter("exprIsStrMethod") }
   const c = nodeAt(callIx)
   if c is Call {
     if c.callFn < 0 { return false }
     const callee = nodeAt(c.callFn)
     if callee is Member {
-      if callee.memProp == prop { return exprString(callee.memObj, fnIx) }
+      if callee.memProp == prop { return nodeRepIs(callee.memObj, "str", fnIx) }
     }
   }
   false
@@ -6630,23 +6621,6 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
   exprNulKind(exprIx, fnIx) == "nulbool"
 }
 
-// A `let`/`const` binding is `boolean | null` if it is so ANNOTATED, or (un-annotated)
-// its initializer is a `boolean | null` value — e.g. `const r = f()` where `f` returns
-// the niche. Mirrors `letUnionNameOf`'s annotation-or-init resolution for value unions.
-export function letNulBool(letIx: i32, fnIx: i32) {
-  if letIx < 0 { return false }
-  if letIsNulBoolAnn(letIx) { return true }
-  // An un-annotated `const x = if c then true else null` infers `boolean | null` (a
-  // niche the emitter can't statically derive from the if-expr arms). The CHECKER
-  // typed it and exported the binding by node index; consult that before the init probe.
-  if isInferLetNulBool(letIx) { return true }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType < 0 { return exprNulBool(d.letInit, fnIx) }
-  }
-  false
-}
-
 // True if `exprIx` is a `K | null` NICHE value (the i32 atom with the spare `-1` = null) — a
 // `K|null`-annotated param / local / global, or a call of a `K|null`-returning function. The
 // litunion dual of `exprNulBool`; consulted at the `== null` compare and the `null`-seed boundaries.
@@ -6775,16 +6749,12 @@ function letSpellsNulAtom(letIx: i32, fnIx: i32): boolean {
 }
 
 // A `K | null` read out of a wider box, as an un-annotated binding's initializer: the binding is
-// the niche and its store converts. Asked of the checker's type and the box, not of the live
-// narrowing, so a capture's classification agrees with the frame's (D3118).
+// the niche and its store converts. Asked of the checker's type and the read's storage, not of
+// the live narrowing, so a capture's classification agrees with the frame's (D3118).
 function letInitIsNulLitBox(init: i32, fnIx: i32): boolean {
-  if clsCensusOn { clsCensusEnter("letInitIsNulLitBox") }
   const ix = unwrapParen(init)
-  if ix < 0 { return false }
-  if !nodeRepIsNulAtom(ix, fnIx) { return false }
-  const e = nodeAt(ix)
-  if !(e is Ident || e is Member || e is Index) { return false }
-  letInitIsBox(ix, fnIx)
+  if ix < 0 || !nodeRepIsNulAtom(ix, fnIx) { return false }
+  repKindOfTyMemo(readNarrowedStoreAt(ix, fnIx)) == "union"
 }
 
 // The map shape a function `name` returns, as seen from the call at `callIx`: its return
@@ -15374,7 +15344,6 @@ function callResultIsNulLitAtom(rx: i32, fnIx: i32): boolean {
 // What a call's result is stored as: "nullitatom" for the `K | null` niche, "litatom" for an
 // interned literal-union id, its lowered list kind, "nulnone" for the `null` unit, else "".
 function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
-  if clsCensusOn { clsCensusEnter("readCallStoreKind") }
   if callResultIsNulLitAtom(rx, fnIx) { return "nullitatom" }
   if callStoreIsLitAtom(e, rx, fnIx) { return "litatom" }
   const ld = repOfNode(rx, fnIx)
