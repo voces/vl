@@ -59,8 +59,8 @@ Twenty-three of twenty-five agree. Two do not:
 
 | flag | `emitFuncCode` | `emitStartFnCode` | witness |
 |---|---|---|---|
-| `fnUsesU8Push` | yes (lines 782 **and 783**) | **NO** | **D1006** — 4 phantom locals, +10 bytes |
-| `fnUsesMapVals` | yes (lines 804 **and 805**) | **NO** | **D1007** — 6 phantom locals, +15 bytes |
+| `fnUsesU8Push` | yes (lines 782 **and 783**) | **NO** | **D1006**, closed 2026-11-09: `emitStateReset` clears it per compile |
+| `fnUsesMapVals` | yes (lines 804 **and 805**) | **NO** | **D1007**, closed 2026-11-09: `emitStateReset` clears it per compile |
 
 **The duplicated line is the tell.** `fnUsesU8Push = false` and `fnUsesMapVals = false` each
 appear TWICE IN A ROW inside `emitFuncCode`. The second copy was written for the other
