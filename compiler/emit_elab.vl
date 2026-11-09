@@ -4454,6 +4454,7 @@ function elabAliasSetFwd(
     }
   }
   const tos: i32[][] = []
+  const cps: i32[] = []
   const todo: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
   const ins: boolean[] = [false]
@@ -4467,6 +4468,16 @@ function elabAliasSetFwd(
         if inFn { return false }
         // An element of a `const` list literal nothing reads hands the set nowhere.
         if elabUnreadConstLit(p, fn) { continue }
+        // A `const` copy of `d` forwards it wherever the copy is read.
+        const pl = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        if (
+          pl is LetDecl
+          && parenPeelIx(pl.letInit) == x
+          && fnTagParamCopyOf(fn, p) >= 0
+        ) {
+          cps.push(p)
+          continue
+        }
         const to = elabSetFwdTarget(x, p, k)
         const named = if to.length == 0 { elabMintFwdTarget(x, p) } else { [] }
         if to.length == 0 && named.length != 2 { return false }
@@ -4480,7 +4491,10 @@ function elabAliasSetFwd(
       }
     }
   }
-  if tos.length == 0 { return false }
+  if tos.length == 0 && cps.length == 0 { return false }
+  for c in cps {
+    if !elabAliasSetFwd(decl, i, c, fn, k, st) { return false }
+  }
   for to in tos {
     let a = 1
     while a < to.length {
@@ -16289,7 +16303,8 @@ export function elabNodeTyAt(ix: i32, fnIx: i32): i32 {
 
 // Node `ix`'s type in frame `fnIx`: the elaboration's type for it at the instance there
 // (`elabNodeTyAt`), else its checked type where that is closed, which is the answer outside every
-// instance; -1 where both stay open.
+// instance, else, for an open argument outside every instance, its parameter's type at the instance
+// its call reaches (`elabRootArgParamTy`); -1 where all stay open.
 export function elabNodeTyOrChecked(ix: i32, fnIx: i32): i32 {
   const x = parenPeelIx(ix)
   const e = elabNodeTyAt(x, fnIx)
@@ -16297,9 +16312,34 @@ export function elabNodeTyOrChecked(ix: i32, fnIx: i32): i32 {
   const ck = nodeTyIxOf(x)
   if ck >= 0 && ck < T.tys.length && elabTyClosed(ck, 0) && !tyHasTyVar(ck) {
     ck
+  } else if fnIx < 0 {
+    elabRootArgParamTy(x, ck)
   } else {
     -1
   }
+}
+
+// The closed type parameter `a`'s call binds it to at the instance that call reaches from outside
+// every instance, where it has the shape of `a`'s open type `own` (a generic function value is
+// called at that instance's signature, an empty list at its element); -1 otherwise, and for a
+// record, whose parameter may be wider than the record handed to it.
+function elabRootArgParamTy(a: i32, own: i32): i32 {
+  if own < 0 || own >= T.tys.length { return -1 }
+  cwIxWant()
+  if a < 0 || a >= cwIxCoveredLen() || cwIxUpKind[a] != CW_UP_ARG { return -1 }
+  const ix = cwIxUp[a]
+  const k = elabCallInstFrom(ix, -1)
+  if k < 0 { return -1 }
+  const pt = elabParamTyOf(k, elabArgParamOf(ix, k, a, cwIxUpAux[a]))
+  if pt < 0 || pt >= T.tys.length || !elabTyClosed(pt, 0) || tyHasTyVar(pt) {
+    return -1
+  }
+  const o = tyAt(own)
+  const p = tyAt(pt)
+  const shaped = (o is TyFunc && p is TyFunc)
+    || (o is TyArray && p is TyArray)
+    || (o is TyMap && p is TyMap)
+  if shaped { pt } else { -1 }
 }
 
 // Freezes the checker's node types as they stand when the elaboration finishes, before any emit
