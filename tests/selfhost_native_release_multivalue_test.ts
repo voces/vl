@@ -57,9 +57,11 @@ const allocations = (wat: string): number => {
   return n;
 };
 
-// Functions with more than one result: the twins the step wrote.
-const twinsIn = (wat: string): number =>
-  [...wat.matchAll(/^ \(func .*\(result \S+ \S+/gm)].length;
+// The functions a module defines. The twins the step wrote are the ones its dump has past
+// the plain build's: a twin takes or returns a record's fields, so its result count alone
+// does not find it, and a one-result `(result (ref $t))` reads as two tokens.
+const funcsIn = (wat: string): number =>
+  [...wat.matchAll(/^ \(func /gm)].length;
 
 const run = async (bin: string, args: string[]) => {
   const p = await new Deno.Command(bin, {
@@ -144,7 +146,9 @@ for (const [fx, want] of FIXTURES) {
           }
           let twins = 0;
           try {
-            twins = twinsIn((await run(WASM_DIS, [dump, ...features])).out);
+            Deno.statSync(dump);
+            twins = funcsIn((await run(WASM_DIS, [dump, ...features])).out) -
+              funcsIn((await run(WASM_DIS, [plain, ...features])).out);
           } catch {
             // No dump: the step changed nothing.
           }
