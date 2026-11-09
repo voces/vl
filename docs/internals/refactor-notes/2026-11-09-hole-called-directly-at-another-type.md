@@ -26,7 +26,7 @@ the hole unsolved when a recorded call takes an argument the flow's type does no
 | rep-fuzz | | exact, 0 failures |
 | plumb-shape fuel, main / tail | 8,816,740,582 / 6,393,476,672 | +8 / +8 |
 | peak RSS of the `vl build`, main / tail (VmHWM) | 322,096 / 321,632 kB | 321,736 / 321,708 kB |
-| seed (fixpoint) | 6,570,718 | 6,571,765 (+1,047; +2.7% of the seed-size baseline) |
+| seed (fixpoint) | 6,570,718 | 6,571,791 (+1,073; +2.7% of the seed-size baseline) |
 
 Outside the sweep, recorded in D15576: the direct call first and then the flow runs too. A
 direct call at the flow's type (`a(5)`) still solves. `take(inc)` with `inc(x: i32): i32` still
