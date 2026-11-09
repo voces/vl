@@ -1125,15 +1125,12 @@ export let memLogUsed = false
 // The synthetic `__log__` decoder's wasm function index (the LAST index — after the
 // imports, the user functions, and the start fn), set by `emitModule`.
 export let gMemLogIdx = 0
-// Shared runtime helpers: module-tail functions synthesized once per module (after
-// the start fn and `__log__` decoder, so no user function index shifts) and `call`ed
-// from every lowering site that would otherwise inline them — string hash, equality,
-// concat, map probe/resize. `-1` = not emitted; usage-gated on the same flags as their operand types.
+// Shared runtime helpers: module functions synthesized once per module and `call`ed from every
+// lowering site that would otherwise inline them. `-1` = not emitted. The string, UTF-8, `s.bytes`
+// and string-keyed map helpers are tail rows: each takes its index when a site first calls it.
 export let gHelpStrHash = -1   // (str) -> i32: masked non-negative FNV-1a hash
 export let gHelpStrEq = -1     // (a, b) -> i32: element-wise string equality (0/1)
 export let gHelpStrConcat = -1 // (a, b) -> (ref str): fresh a+b string
-// The UTF-8 codec trio (Stage 2c) — minted from the same `aUsed` flag as
-// `gHelpStrHash`/`gHelpStrEq`/`gHelpStrConcat`, emitted immediately after them so no existing helper index moves.
 export let gHelpUtf8Dec = -1   // (back, i, end) -> i32: (width << 24) | code point
 export let gHelpUtf8Enc = -1   // (back, start, len) -> (ref str): UTF-8-encode code points
 export let gHelpUtf8CpLen = -1 // (str) -> i32: the code-point count of a view, O(n)
@@ -1181,7 +1178,7 @@ export function mapDeleteMerge() {
 export let gHelpMapResync = -1 // (live, count, seq) -> cursor: a walk's step after compaction
 // One compaction helper per map shape, `(ref <mapTy>) -> ()`: row 0 the string-keyed mono map,
 // row 1 the i32-keyed one, row `2 + s` mv slot `s`, the last row the i64-keyed one; -1 where
-// the shape has none.
+// the shape has none, -2 where it has one not yet called.
 export let gHelpMapCompact: i32[] = []
 // One store helper per map shape, `(ref <mapTy>, key, value) -> ()`, rowed as above: `gMapSetTy`
 // its functype's ordinal after the shared helpers' or -1, `gMapSetFn` its function index once a
@@ -1203,8 +1200,83 @@ export let gEqHelpTyN = 0
 // primitive (so not `x != null` or `i == 0`); no compare helper is reserved without one.
 export let gSawEqOp = false
 // The helpers numbered after the fixed functions, in the order a site first called them: a map
-// store helper as its row, a compare helper as `-1 - <struct row>`.
+// store helper as its row, a compare helper as `-1 - <struct row>`, a shared helper as
+// `TAIL_HELP + <kind>` (`HELP_*`, a compaction helper `HELP_MAP_COMPACT + <map row>`).
 export let gTailFnRows: i32[] = []
+// How many shared-helper tail rows there are: each takes the next functype after the compare
+// helpers', in row order.
+export let gTailHelpTyN = 0
+export const TAIL_HELP = 1048576
+export const HELP_STR_HASH = 0
+export const HELP_STR_EQ = 1
+export const HELP_STR_CONCAT = 2
+export const HELP_UTF8_DEC = 3
+export const HELP_UTF8_ENC = 4
+export const HELP_UTF8_CPLEN = 5
+export const HELP_STR_BYTES = 6
+export const HELP_MAP_PROBE = 7
+export const HELP_MAP_RESIZE = 8
+export const HELP_MAP_RESYNC = 9
+export const HELP_MAP_COMPACT = 10
+
+// The function index of shared helper `kind`'s tail row, appended now if it has none.
+function tailHelpPush(kind: i32): i32 {
+  const fi = gMapSetFnBase + gTailFnRows.length
+  gTailFnRows.push(TAIL_HELP + kind)
+  gTailHelpTyN = gTailHelpTyN + 1
+  fi
+}
+
+// Each shared helper's function index, minted on first ask.
+export function helpStrHashFn(): i32 {
+  if gHelpStrHash < 0 { gHelpStrHash = tailHelpPush(HELP_STR_HASH) }
+  gHelpStrHash
+}
+export function helpStrEqFn(): i32 {
+  if gHelpStrEq < 0 { gHelpStrEq = tailHelpPush(HELP_STR_EQ) }
+  gHelpStrEq
+}
+export function helpStrConcatFn(): i32 {
+  if gHelpStrConcat < 0 { gHelpStrConcat = tailHelpPush(HELP_STR_CONCAT) }
+  gHelpStrConcat
+}
+export function helpUtf8DecFn(): i32 {
+  if gHelpUtf8Dec < 0 { gHelpUtf8Dec = tailHelpPush(HELP_UTF8_DEC) }
+  gHelpUtf8Dec
+}
+export function helpUtf8EncFn(): i32 {
+  if gHelpUtf8Enc < 0 { gHelpUtf8Enc = tailHelpPush(HELP_UTF8_ENC) }
+  gHelpUtf8Enc
+}
+export function helpUtf8CpLenFn(): i32 {
+  if gHelpUtf8CpLen < 0 { gHelpUtf8CpLen = tailHelpPush(HELP_UTF8_CPLEN) }
+  gHelpUtf8CpLen
+}
+export function helpStrBytesFn(): i32 {
+  if gHelpStrBytes < 0 { gHelpStrBytes = tailHelpPush(HELP_STR_BYTES) }
+  gHelpStrBytes
+}
+export function helpMapProbeFn(): i32 {
+  if gHelpMapProbe < 0 { gHelpMapProbe = tailHelpPush(HELP_MAP_PROBE) }
+  gHelpMapProbe
+}
+export function helpMapResizeFn(): i32 {
+  if gHelpMapResize < 0 { gHelpMapResize = tailHelpPush(HELP_MAP_RESIZE) }
+  gHelpMapResize
+}
+// Map row `row`'s compaction helper, minted on first ask; -1 where the row reserved none. A
+// reserved row reads -2 until then.
+export function helpMapCompactFn(row: i32): i32 {
+  if row < 0 || row >= gHelpMapCompact.length { return -1 }
+  if gHelpMapCompact[row] == -2 {
+    gHelpMapCompact[row] = tailHelpPush(HELP_MAP_COMPACT + row)
+  }
+  gHelpMapCompact[row]
+}
+export function helpMapResyncFn(): i32 {
+  if gHelpMapResync < 0 { gHelpMapResync = tailHelpPush(HELP_MAP_RESYNC) }
+  gHelpMapResync
+}
 // D2652 — `__init_fail__(g, verb, r)`: prints global `g`'s name and place, the verb and
 // reader `r`, then traps; the one body every guard site calls. Reserved when `gInitAny`; its
 // rows are interned while user bodies emit, before its own body (the last helper) is written.
