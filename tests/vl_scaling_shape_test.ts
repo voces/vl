@@ -20,11 +20,11 @@
 
 // A COMPILE BAR IS THE FAMILY DEFAULT 2.5, OR 1.25x THE AXIS'S FUEL RATIO WHERE THAT IS
 // HIGHER; an axis whose bar is deliberately tighter keeps it. A fuel ratio is the same on
-// every run, so the margin pays only for the compiler changing, not for the box. Seven axes
+// every run, so the margin pays only for the compiler changing, not for the box. Eight axes
 // sit above the default because they are super-linear today — `types`, `reads after many
 // closed sibling shadows`, `list concat chain length`, `if joins nested deep`, `diamond
 // record depth`, `diamond record depth under ==`, `diamond record depth under == with a list
-// leaf` —
+// leaf`, `a function list parameter handed down layers of callers` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
 // multiplying. Twelve are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
@@ -755,6 +755,63 @@ hofAxis("copy", 5.1, "`elabSlotDeliveries` (compiler/emit_elab.vl) is re-walking
 hofAxis("list", 5.1, "`elabCallsReading` (compiler/emit_elab.vl) is scanning every call per slot query (D4942).");
 hofAxis("rewrite", 5.1, "`monoSubtreeHolds` or `monoTopFrameOf` (compiler/emit_mono.vl) is walking the program per write (D4942).");
 hofAxis("global", 5.1, "`monoTopFnUnnamed` (compiler/emit_mono.vl) is walking the program per module-scope function (D4942).");
+
+// D15630's two pairs. A list parameter's delivery query in the mono pass followed each caller's
+// argument back up the call graph, unmemoised, to depth 8: a recursive walker with six self-calls
+// cost 6^8 steps per `push` (fuel 124G against 8M), and an `i32[]` handed down seven layers of
+// three callers cost 3^7 (927M against 20M). Both arms make the same calls; only whether each
+// call hands the caller's own list on differs. Fuel reads 0.91 and 1.0 on the fixed compiler.
+const genHofGate = (o: string[]) =>
+  o.push(
+    "let h: (i32) => i32 = (t: i32) => -9",
+    "function hof(f: (i32) => i32): i32 { f(1) }",
+    "print(hof(h))",
+    "function inc(t: i32): i32 { t + 1 }",
+  );
+const genWalkerCalls = (k: number, rec: boolean): string => {
+  const o: string[] = [];
+  genHofGate(o);
+  o.push("function leaf(n: i32, out: ((t: i32) => i32)[]) {", "  out.push(inc)", "}");
+  o.push("function walk(n: i32, out: ((t: i32) => i32)[]) {", "  out.push(inc)", `  if n > ${k} {`);
+  for (let i = 1; i <= k; i++) o.push(`    ${rec ? "walk" : "leaf"}(n - ${i}, out)`);
+  o.push("  }", "}");
+  o.push("const fs: ((t: i32) => i32)[] = []", `walk(${k + 3}, fs)`, "print(fs.length)");
+  return o.join("\n") + "\n";
+};
+const genLayeredPushes = (w: number, l: number, chain: boolean, fns = false): string => {
+  const o: string[] = [];
+  genHofGate(o);
+  const ty = fns ? "((t: i32) => i32)[]" : "i32[]";
+  for (let i = 0; i < l; i++) {
+    for (let j = 0; j < w; j++) {
+      o.push(`function f${i}_${j}(xs: ${ty}) {`, `  const ys: ${ty} = []`, `  xs.push(${fns ? "inc" : j})`);
+      if (i + 1 < l) for (let k = 0; k < w; k++) o.push(`  f${i + 1}_${k}(${chain ? "xs" : "ys"})`);
+      o.push("}");
+    }
+  }
+  o.push(`const xs: ${ty} = []`, "f0_0(xs)", "print(xs.length)");
+  return o.join("\n") + "\n";
+};
+axis(
+  "recursive walker self-calls handing a function list",
+  2.5,
+  "`elabSlotDeliveries` (compiler/emit_elab.vl) is following a parameter's recursive call back into the query it is already answering (D15630).",
+  (d) => twoFiles(d, genWalkerCalls(6, true), genWalkerCalls(6, false)),
+);
+axis(
+  "a list parameter handed down layers of callers",
+  2.5,
+  "`elabSlotDeliveries` (compiler/emit_elab.vl) is walking the callers of a slot whose type holds no function (D15630).",
+  (d) => twoFiles(d, genLayeredPushes(3, 7, true), genLayeredPushes(3, 7, false)),
+);
+// D15631's pair: the same layers handing down a list of functions, which the type test cannot
+// skip. Fuel reads 2.74 with the nested query's memo, and 61.6 on the D15630 compiler (2.0 G).
+axis(
+  "a function list parameter handed down layers of callers",
+  3.5,
+  "`elabSlotDeliveries` (compiler/emit_elab.vl) is re-walking a nested query per chain of callers; is `elabDlvNest` still answering (D15631)?",
+  (d) => twoFiles(d, genLayeredPushes(3, 7, true, true), genLayeredPushes(3, 7, false, true)),
+);
 
 // Lane HS's second pair: 2,000 calls through a 64-field record signature against a one-field
 // one. Fuel reads 3.38; the #3422 compiler read 6.17, from `sigKeyOfTy` and

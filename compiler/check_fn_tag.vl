@@ -114,6 +114,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  mkArrayTy,
   tyAt,
   tyFieldTyOf,
   tyHasHole,
@@ -148,6 +149,7 @@ import {
   mintParamHeldSets,
   mintParamSetsOf,
   mintParamTakes,
+  mintParamTakesSets,
   mintRetParamsOf,
   mintSeedBindsOf,
   mintSeedHeldOf,
@@ -638,6 +640,8 @@ function ftPlLeafTysFill(): boolean {
           }
           j = j + 1
         }
+        // Else the type a set this decision already tagged gives the member (D15625).
+        if t < 0 { t = ftTaggedLeafTy(ds[i]) }
         if t < 0 { return false }
         lt[i] = t
       }
@@ -646,6 +650,20 @@ function ftPlLeafTysFill(): boolean {
     k = k + 1
   }
   true
+}
+
+// The leaf type of member `d` in some tagged set, or -1.
+function ftTaggedLeafTy(d: i32): i32 {
+  for o in ftLeafTys.keys() {
+    const ms = fnTagMembers(o)
+    const lt = ftLeafTys[o] ?? []
+    let i = 0
+    while i < ms.length && i < lt.length {
+      if ms[i] == d && lt[i] >= 0 && fnTagSetIsTagged(o) { return lt[i] }
+      i = i + 1
+    }
+  }
+  -1
 }
 
 // Tags the set planned in row `k` and builds each call's member calls.
@@ -880,7 +898,9 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   // the smaller sets those hands carry are decided with it (D15610).
   if ftLate {
     for r in mint {
-      if mintFactSetOf(r) == s { ftFwdInSubsets(mintFactCallOf(r), s) }
+      if mintFactSetOf(r) == s {
+        ftFwdInSubsets(mintFactCallOf(r), s, leaves, ids)
+      }
     }
   }
   // The functions written to one `let` must give a call through it one result (D9003), so a
@@ -3517,7 +3537,16 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
     for w in ftAssume {
       if w != s && ftSetWithin(s, w) && mintParamTakes(d, i, w) { return true }
     }
-    return false
+    // So does one whose every wider set holds `s`, each decided with it.
+    const ws = mintParamTakesSets(d, i)
+    if ws.length == 0 { return false }
+    for w in ws {
+      if w == s || !ftSetWithin(s, w) { return false }
+    }
+    for w in ws {
+      if !fnTagSetIsTagged(w) && !i32ListHas(ftSubNeed, w) { ftSubNeed.push(w) }
+    }
+    return true
   }
   if !ftSetWithin(s, j) { return false }
   if !i32ListHas(ftSubNeed, j) { ftSubNeed.push(j) }
@@ -3525,8 +3554,9 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
 }
 
 // Notes for the decision of `s` each smaller set handed to a parameter that is handed on to the
-// parameter call `c` calls through, at any depth.
-function ftFwdInSubsets(c: i32, s: i32) {
+// parameter call `c` calls through, at any depth, and as leaves each member named directly by a
+// list literal handed to the parameter `c` reads its callee off (D15625).
+function ftFwdInSubsets(c: i32, s: i32, leaves: i32[], ids: i32[]) {
   const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
   if !(cn is Call) { return 0 }
   const pd = identDeclOf(ftSlotRoot(parenPeelIx(cn.callFn)))
@@ -3536,8 +3566,29 @@ function ftFwdInSubsets(c: i32, s: i32) {
   const pi = if fn is FuncDecl { i32ListIndexOf(fn.fnParams, pd) } else { -1 }
   if pi < 0 { return 0 }
   const todo: i32[] = [fd, pi]
+  const ds = fnTagMembers(s)
+  const st = fnTagSetTy(s)
+  // Only a list the call reads its callee off is a list of the set's ids.
+  const cf = parenPeelIx(cn.callFn)
+  const lt = if st >= 0 && ftSlotRoot(cf) != cf { mkArrayTy(st) } else { -1 }
   let q = 0
   while q + 1 < todo.length && q < 64 {
+    for a in if q == 0 { fnParamHandArgsOf(fd, pi) } else { [] } {
+      const ax = if a >= 0 && a < P.nodes.length { parenPeelIx(a) } else { -1 }
+      // A literal not every element of which is a leaf keeps none of them.
+      const n0 = leaves.length
+      if (
+        lt >= 0
+        && ax >= 0
+        && nodeAt(ax) is ArrayLit
+        && !ftInnerLeaves(ax, lt, s, ds, leaves, ids)
+      ) {
+        while leaves.length > n0 {
+          leaves.pop()
+          ids.pop()
+        }
+      }
+    }
     const ins = mintParamFwdInsOf(todo[q], todo[q + 1])
     let k = 0
     while k + 1 < ins.length {

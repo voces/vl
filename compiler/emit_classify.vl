@@ -1664,32 +1664,21 @@ export function letNulMapReadUnionBox(letIx: i32, fnIx: i32) {
   false
 }
 
-// The receiver's ref-list slot of a checked read over a nested list, or -1 — the row every
-// question about the read element asks, such as its inner slot in `nulRefArrayInnerSlot`. `.get(i)` counts for the same reason `.pop()` does (D1281): both
-// are `T | null` over the same receiver and both yield the inner list's wrapper.
+// The ref-list slot of the receiver of a checked `.pop()` or `.get(i)` over a nested list, or -1:
+// the receiver's rep row, else the row its element type keys. `.get(i)` counts for the same reason
+// `.pop()` does (D1281): both are `T | null` over the same receiver and yield the inner list.
 function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
-  if clsCensusOn { clsCensusEnter("popRefRecvSlot") }
-  if exprIx < 0 { return -1 }
-  const e = nodeAt(exprIx)
-  match e {
-    Paren => {
-      return popRefRecvSlot(e.parInner, fnIx)
-    }
-    Call => {
-      if e.callFn < 0 { return -1 }
-      const callee = nodeAt(e.callFn)
-      if callee is Member {
-        if callee.memProp == "pop" || callee.memProp == "get" {
-          if nodeRepIs(callee.memObj, "reflist", fnIx) {
-            return refListSlotOfExpr(callee.memObj, fnIx)
-          }
-        }
-      }
-    }
-    // No other expression is a ref-list pop or get.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  -1
+  const r = unwrapParen(exprIx)
+  if r < 0 { return -1 }
+  const c = nodeAt(r)
+  if !(c is Call) || c.callFn < 0 { return -1 }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) { return -1 }
+  if callee.memProp != "pop" && callee.memProp != "get" { return -1 }
+  if !nodeRepIs(callee.memObj, "reflist", fnIx) { return -1 }
+  const lr = listRowOfExpr(callee.memObj, fnIx)
+  if lr >= 0 { return lr }
+  rlSlotOfTyOrTwin(tyRefArrElemOf(nodeTyInOf(callee.memObj, fnIx)))
 }
 
 // The variant row a `.pop()` / `.get(i)` over a union-arm element list yields as its
@@ -10974,53 +10963,16 @@ export function placeNicheAtomKind(exprIx: i32, fnIx: i32): i32 {
   if box { nk } else { -1 }
 }
 
-// The `valueAtomKind` code of the narrowed atom that un-annotated `LetDecl` `letIx`'s bare-ident
-// initializer reads as at the declaration, or -3 (no such let, or that read not narrowed).
-function letInitNarrowedAtomKind(letIx: i32, fnIx: i32): i32 {
-  if clsCensusOn { clsCensusEnter("letInitNarrowedAtomKind") }
-  if letIx < 0 { return -3 }
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType < 0 && d.letInit >= 0 {
-      const ini = nodeAt(d.letInit)
-      if ini is Ident {
-        const a = identReadAtomKindAt(d.letInit, fnIx)
-        if a >= 0 { return a }
-      }
-    }
-  }
-  -3
-}
-
-// The atom kind an ident expression currently reads as, for the scalar/string classifiers:
-// `valueAtomKind`'s code when narrowed to one scalar atom (the read unboxes to it), -2 for
-// a union binding not narrowed to a single atom (still the box ref, whatever its init spelled),
-// or -3 when the expression is not a union-typed ident at all.
+// The atom kind an ident read reads as, for the scalar and string classifiers: `valueAtomKind`'s
+// code when its cell is a union box the checker narrowed to one atom, -2 for a box read not
+// narrowed to one, or -3 when the read's cell is no union box.
 export function unionIdentReadKind(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("unionIdentReadKind") }
-  // No union anywhere in the program means no identifier can denote one — skips
-  // `unionNameOfRead`'s duplicate-chain walk for every OTHER read of a popular name a
-  // non-union program happens to reuse across many sibling blocks. `exprString` (this
-  // function's only caller) asks it of every ident, so this is the hot rung (D2326 perf).
+  // A program that declares no union has no box; `exprString` asks this of every ident (D2326).
   if !uDeclared { return -3 }
-  if exprIx < 0 { return -3 }
-  const e = nodeAt(exprIx)
-  if e is Ident {
-    if unionNameOfRead(exprIx, fnIx) != "" {
-      const a = identReadAtomKindAt(exprIx, fnIx)
-      if a >= 0 { return a }
-      // An un-annotated binding whose init is itself a narrowed ident inherits that one level
-      // of narrowing only (deeper would inherit someone else's), else `exprString` sees a box. D1013.
-      // Only the read's own declaration: a parameter or loop variable inherits nothing.
-      const rd = identDeclOf(exprIx)
-      if rd >= 0 && nodeAt(rd) is LetDecl {
-        const rk = letInitNarrowedAtomKind(rd, fnIx)
-        if rk != -3 { return rk }
-      }
-      return -2
-    }
-  }
-  -3
+  if exprIx < 0 || !(nodeAt(exprIx) is Ident) { return -3 }
+  if identStoreClaimed(exprIx, fnIx) != "union" { return -3 }
+  const a = identReadAtomKindAt(exprIx, fnIx)
+  if a >= 0 { a } else { -2 }
 }
 
 // The member-path dual of `unionIdentReadKind`: the atom kind a union-typed struct-field read
@@ -15057,7 +15009,6 @@ export function identStoreVKind(rx: i32, fnIx: i32): VKind | null {
 // `identStoreVKind` where the binding column claims the cell, read without walking an
 // initializer, so a hot conversion test stays linear in an alias chain; null otherwise.
 function identStoreClaimed(rx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("identStoreClaimed") }
   const k = identCellVKind(rx, fnIx)
   if k != null { return k }
   const d = readSlotlessOwnLet(rx, fnIx)

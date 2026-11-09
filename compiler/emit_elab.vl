@@ -13800,6 +13800,15 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
   // A literal or name an instance minted after the write index has no index facts to read; a
   // binding answers through its source (`declOrigOf`).
   const d = elabCellLitBinding(d0)
+  // A slot whose checked type is closed and holds no function is delivered at none (D15630).
+  if (
+    d >= 0
+    && d < P.nodes.length
+    && elabTyFnFree(elabSlotTyOf(nodeTyIxOf(d), path), 0)
+  ) {
+    const none: i32[] = []
+    return none
+  }
   // A program whose check never asked for the write index builds it here.
   cwIxBuild()
   const late = d >= cwIxCoveredLen()
@@ -13825,11 +13834,32 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
     return lout
   }
   // An outermost plain query is answered once per arena epoch.
-  const memo = elabDlvDepth == 0
-    && elabDlvOmit.length == 0
+  const plain = elabDlvOmit.length == 0
     && !elabCallSinkOn
     && !elabRetSinkOn
     && !elabCallRec
+  const memo = elabDlvDepth == 0 && plain
+  // A nested plain query is answered once per outermost query, keyed by every mode it reads, so a
+  // binding many callers hand on is walked once and not once per chain of callers (D15631).
+  if elabDlvDepth == 0 { elabDlvNest = Map() }
+  const nest = elabDlvDepth > 0 && plain
+  let nk = ""
+  if nest {
+    nk = elabDlvActiveKey(d, path, k)
+      + ":"
+      + i32ToStr(elabDlvDepth)
+      + ":"
+      + i32ToStr(elabNoCallParam)
+      + ":"
+      + i32ToStr(elabGenericRead)
+      + (if elabGenericByValue { ":g" } else { "" })
+    const hit = elabDlvNest.get(nk)
+    if hit != null {
+      const cp: i32[] = []
+      for t in hit { cp.push(t) }
+      return cp
+    }
+  }
   let mk = ""
   if memo {
     if elabDlvMemoEpoch != arenaEpochNow() {
@@ -13873,6 +13903,11 @@ export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
     for t in out { keep.push(t) }
     elabDlvMemo[mk] = keep
   }
+  if nest {
+    const keep: i32[] = []
+    for t in out { keep.push(t) }
+    elabDlvNest[nk] = keep
+  }
   out
 }
 
@@ -13897,6 +13932,49 @@ export function elabSlotAnnRets(d: i32, path: string[], k: i32): i32[] {
 
 // Whether `elabSlotDeliveries` counts only the types written destinations deliver.
 let elabDlvAnnOnly = false
+
+// Whether no value of type `ty` can be or hold a function: false for a missing type, an open one
+// (a type variable, an error, `null` or `never`), and past `depth` 8.
+function elabTyFnFree(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyPrim => {
+      // `null` and `never` can stand for a value the checker has not typed yet.
+      return t.primName != "null" && t.primName != "never"
+    }
+    TyLit | TyNeg => {
+      return true
+    }
+    TyFunc | TyVar | TyErr => {
+      return false
+    }
+    TyArray => {
+      return elabTyFnFree(t.aElem, depth + 1)
+    }
+    TyNullable => {
+      return elabTyFnFree(t.nInner, depth + 1)
+    }
+    TyMap => {
+      return elabTyFnFree(t.mKey, depth + 1) && elabTyFnFree(t.mVal, depth + 1)
+    }
+    TyObj => {
+      for ft in t.objFieldTypes {
+        if !elabTyFnFree(ft, depth + 1) { return false }
+      }
+      return true
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if !elabTyFnFree(m, depth + 1) { return false }
+      }
+      return true
+    }
+  }
+}
+
+// `elabSlotDeliveries`' nested answers within the current outermost query.
+let elabDlvNest: {[string]: i32[]} = Map()
 
 // `elabSlotDeliveries`' answers by query, and the arena epoch that keeps them valid.
 let elabDlvMemo: {[string]: i32[]} = Map()
@@ -14057,9 +14135,28 @@ function elabSlotDeliveriesAt(d: i32, path: string[]): i32[] {
   const out: i32[] = []
   if d < 0 || d >= P.nodes.length || elabDlvDepth > 8 { return out }
   elabDlvDepth = elabDlvDepth + 1
+  elabDlvActive.push(elabDlvActiveKey(d, path, elabDlvKey))
   elabSlotDeliveriesInto(d, path, out)
+  elabDlvActive.pop()
   elabDlvDepth = elabDlvDepth - 1
   out
+}
+
+// The queries `elabSlotDeliveriesAt` is expanding, outermost first. A parameter's call that hands
+// it a binding already on this stack is a cycle: it answers a subset of what the outer query
+// gathers, and following it made a recursive walker's query exponential in its call sites (D15630).
+const elabDlvActive: string[] = []
+
+// The key `elabDlvActive` holds for slot `path` of `d` asked in instance `k`, in the current mode.
+function elabDlvActiveKey(d: i32, path: string[], k: i32): string {
+  let s = i32ToStr(d)
+    + ":"
+    + i32ToStr(k)
+    + ":"
+    + i32ToStr(elabLitSlotDepth)
+    + (if elabDlvAnnOnly { ":a" } else { "" })
+  for st in path { s = s + ":" + st }
+  s
 }
 
 // How deep `elabSlotDeliveries` has followed values into the bindings handing them on.
@@ -14085,6 +14182,7 @@ function elabSlotDeliveriesInto(d: i32, path: string[], out: i32[]) {
           && a < P.nodes.length
           && nodeAt(a) is Ident
           && identDeclOf(a) >= 0
+          && !strListHas(elabDlvActive, elabDlvActiveKey(identDeclOf(a), path, -1))
         ) {
           // The argument is the caller's, read in no instance of this function.
           for t in elabSlotDeliveries(identDeclOf(a), path, -1) {

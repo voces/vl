@@ -9,6 +9,7 @@ also updates the target doc's status section.
 Newest first:
 
 - [2026-11-09-step7-mv-ladder-type-keyed-entry](2026-11-09-step7-mv-ladder-type-keyed-entry.md): Step 7: the mv ladder has a type-keyed entry; the map-twin arm stops rendering its member, render-parse 42 → 41.
+- [2026-11-09-step7-struct-row-callers](2026-11-09-step7-struct-row-callers.md): Step 7: twelve of the fifteen `repSlotOfTy` callers read the structural struct row; sweep byte-identical.
 - [2026-11-09-step7-recursive-element-arm](2026-11-09-step7-recursive-element-arm.md): Step 7: a recursive element's arm row mints at its first read.
 - [2026-11-09-step7-struct-row-late-mint](2026-11-09-step7-struct-row-late-mint.md): Step 7: a struct row minted after the type indices takes its twin, heap index and supertype at mint; `collectArmStructRows` and `collectS`'s arm map-slot intern are deleted.
 - [2026-11-09-step7-union-arm-rows-minted-on-read](2026-11-09-step7-union-arm-rows-minted-on-read.md): Step 7: a union's ref-array arm row mints at its first read; the union pass's element intern is deleted.
@@ -16,6 +17,8 @@ Newest first:
 - [2026-11-09-step7-fret-repof](2026-11-09-step7-fret-repof.md): Step 7: the un-annotated `fRet*` columns read off `repOf`; five steps between them deleted, seed −2,088.
 - [2026-11-09-step7-classifier-r22](2026-11-09-step7-classifier-r22.md): Step 7: classifier round 22, `letCellKindGo`, `letInitIsNulLitBox`, `exprIsStrMethod` typed, `globalCellKindGo` deleted; 62 → 53 probed.
 - [2026-11-09-step7-classifier-r23](2026-11-09-step7-classifier-r23.md): Step 7: classifier round 23, `identCellVKind` and `identStoreVKind` read the declaration's cell; 53 → 51 probed.
+- [2026-11-09-step7-classifier-r24](2026-11-09-step7-classifier-r24.md): Step 7: classifier round 24, `unionIdentReadKind` and `popRefRecvSlot` typed, `letInitNarrowedAtomKind` deleted; 51 → 47 probed.
+- [2026-11-09-step7-union-arm-rows-minted-on-read](2026-11-09-step7-union-arm-rows-minted-on-read.md): Step 7: a union's ref-array arm row mints at its first read; the union pass's element intern is deleted.
 - [2026-11-09-step7-identdeclof-sites](2026-11-09-step7-identdeclof-sites.md): Step 7: parameter and `is K[]` by-name sites read `identDeclOf`; emitter by-name sites 178 → 155 (#6993).
 - [2026-11-09-step7-map-slots-minted-on-read](2026-11-09-step7-map-slots-minted-on-read.md): Step 7: the collectA#2 pass is deleted; map value slots mint on read (#6992).
 - [2026-11-09-step7-typeref-arm-typed-readers-wip](2026-11-09-step7-typeref-arm-typed-readers-wip.md): Step 7: collectA#2's TypeRef arm mints on read; D2273, D4712, D13940 run (#6985).

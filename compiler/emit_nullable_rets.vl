@@ -142,9 +142,10 @@ import {
   repRowOfTyStruct,
   repShadowAddReason,
   repShadowOn,
-  repSlotOfTy,
+  repTyIsVariant,
   repVariantShapeRowOf,
 } from "./emit_rep"
+import { repSlotOfKind } from "./emit_rep_slot"
 import {
   annRepKindOf,
   mapFindShapeOfNodeTy,
@@ -494,13 +495,12 @@ export function nulVariantIndexOf(tyIx: i32) {
 // The base struct table index of a `S | null` annotation at `tyIx`, or -1.
 export function retNulRefIndex(tyIx: i32) {
   if tyIx >= 0 {
-    // Structural-first: the checker's recorded arena type resolves the slot directly
-    // (`repSlotOfTy`, nominal identity plus the structural-declared bridge). Confirms only.
+    // Structural-first: the checker's recorded arena type resolves the base's row directly.
     const rt = nodeRepTyIxOf(tyIx)
     if rt >= 0 {
       const t = tyAt(rt)
       if t is TyNullable {
-        const ds = repSlotOfTy(t.nInner)
+        const ds = recordStructRow(t.nInner)
         if ds >= 0 { return ds }
       }
     }
@@ -511,6 +511,13 @@ export function retNulRefIndex(tyIx: i32) {
     }
   }
   -1
+}
+
+// The struct row of record `ty`, `repSlotOfKind`'s structural answer, or -1 when `ty` is not
+// a record (a nullable or a union is never read as its member's row here).
+function recordStructRow(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyObj) { return -1 }
+  repSlotOfKind("struct", ty)
 }
 
 // The struct row of the base of a nullable-struct annotation (`S | null` -> `S`'s row), or -1.
@@ -554,12 +561,16 @@ function namedRowOfTy(ty: i32): i32 {
 // here and never the twin below (D1737).
 export function retStructRowIndex(tyIx: i32) {
   if tyIx < 0 { return -1 }
-  const ds = repSlotOfTy(nodeRepTyIxOf(tyIx))
-  if ds >= 0 { return ds }
   const ty = nodeAt(tyIx)
+  // An annotation that names a row is that row: an `#anonN` reference names its literal's row,
+  // which a shape row of the same type need not share a layout with.
   if ty is TypeRef {
     const si = structIndexByName(ty.tyName)
     if si >= 0 { return si }
+  }
+  const ds = recordStructRow(nodeRepTyIxOf(tyIx))
+  if ds >= 0 { return ds }
+  if ty is TypeRef {
     // The arena rung the name scan needs: a struct that is also a union VARIANT has its row
     // registered under the structural render, not its declared name, so only a match on the
     // recorded TYPE finds it. Without this the variant-table index answered in its place.
@@ -589,16 +600,19 @@ function paramRecordedStructRow(tyIx: i32): i32 {
 // names no declared struct.
 export function retStructIndex(tyIx: i32) {
   if tyIx >= 0 {
-    // Structural-first (the first arena-keyed row consumer): a struct annotation resolves
-    // its slot off the checker's arena type (`repSlotOfTy`), skipping the name scan. This
-    // includes the structural-declared bridge (an inline `{…}` resolving to its unique
-    // declared twin), byte-safe now that the sig-canon slice renders twin-safe `$fnsig` digits.
-    const ds = repSlotOfTy(nodeRepTyIxOf(tyIx))
-    if ds >= 0 { return ds }
+    // The row the annotation names, else the checker's arena type's row. A union arm is left
+    // to the variant scan, which answers its VARIANT index.
     const ty = nodeAt(tyIx)
     if ty is TypeRef {
       const si = structIndexByName(ty.tyName)
       if si >= 0 { return si }
+    }
+    const rt = nodeRepTyIxOf(tyIx)
+    if rt >= 0 && !repTyIsVariant(rt) {
+      const ds = recordStructRow(rt)
+      if ds >= 0 { return ds }
+    }
+    if ty is TypeRef {
       // A union-variant name carries its VARIANT index here (consumed by `pushVT`'s
       // `kind == 8` variant-struct case); not a standalone struct, so it is -1 above.
       const vi = variantIndexOf(ty.tyName)
@@ -617,16 +631,12 @@ export function retStructIndex(tyIx: i32) {
 // name, not a printed shape (`tyToStructStr` prints `{x: i32}`, which nothing registered);
 // `sNames[si]` is the row's own name, what every name-keyed consumer resolves.
 export function monoRetRowName(ty: i32) {
-  const si = repSlotOfTy(ty)
-  if si >= 0 {
-    if si < sNames.length { return sNames[si] }
-  }
-  // D681 — the anonymous row, by arena identity and nothing else: `repSlotOfTy` covers
-  // declared rows only, so a shape that only appeared as an object literal answers -1
-  // there even though `collectAnonShapes` interned exactly this row, under an `#anonN`
-  // handle. Nominal, not structural — a printed-spelling match can't tell two generic instances apart.
+  // D681 — the anonymous row, by arena identity: `collectAnonShapes` interned this row under
+  // an `#anonN` handle. Not by spelling — a printed shape can't tell two generic instances apart.
   const ai = sAnonRowByTy(ty)
   if ai >= 0 { return sNames[ai] }
+  const si = recordStructRow(ty)
+  if si >= 0 && si < sNames.length { return sNames[si] }
   ""
 }
 

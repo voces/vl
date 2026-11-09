@@ -93,7 +93,18 @@ It runs on the base seed too, so the move is not this branch's.
 
 ## A probe that hung
 
-The first probe put a module-level closure in `emit_rep.vl` (`let srdHook: (i32) => i32`) so that
-`repSlotOfTy` could call into `emit_rep_slot.vl` without an import cycle. The seed did not finish
-building the compiler from that source within 400 s, where a clean build takes 29 s. It was not
-reduced.
+The first probe put a module-level closure in `emit_rep.vl` so that `repSlotOfTy` could call into
+`emit_rep_slot.vl` without an import cycle. With that line the seed did not finish building the
+compiler. Each rung below is one line added to the compiler source, built by the seed, with a
+clean build taking 29 s alone and about 50 s with two builds running at once:
+
+| line added | module | build |
+| --- | --- | --- |
+| `let h: (i32) => i32 = (t: i32) => -9` | `emit_rep.vl` | timed out at 120 s |
+| the same line | `emit_cls_census.vl` (70 lines) | timed out at 150 s |
+| `let h: (i32) => i32 = repSlotOfTyDecl` | `emit_rep.vl` | 30 s |
+| `function set(f: (i32) => i32) { }` | `emit_rep.vl` | 51 s |
+
+The lambda initializer is the ingredient, and the module that holds it does not matter. It does
+not reproduce in a small program: the same line beside 1,600 `(i32) => i32` functions builds in
+143 ms, as it does in a module imported by an entry. It is not reduced further and has no row.
