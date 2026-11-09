@@ -4183,7 +4183,12 @@ function ftMapSetValTy(c: Call, x: i32, s: i32): i32 {
 function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
   const n = nodeAt(x)
   // A declaration's own node is placed by its value's parent; a spelled type never names a set.
-  if n is LetDecl { return n.letType < 0 }
+  // A map it is initialised with of a set within `s` is decided with it (D15535).
+  if n is LetDecl {
+    const it = if n.letInit >= 0 { tyAt(nodeTyIxOf(n.letInit)) } else { null }
+    if n.letType < 0 && it is TyMap { ftDstTakes(nodeTyIxOf(x), n.letInit, s) }
+    return n.letType < 0
+  }
   if n is FieldInit { return ftRecHolds(p, s) }
   if p < 0 { return false }
   const tx = nodeTyIxOf(x)
@@ -4295,6 +4300,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         || ftFnBodyTail(p, x, fn) && rcwInferredRetTy(fn) == tx
         || ftFnBodyTail(p, x, fn) && ftRetVoid(fn)
         || ftArmTail(p, x, g) && ftHoldsDecided(g, s)
+        || ftArmTail(p, x, g) && ftStoreInNoElse(x, g)
         || ftLoopBodyStmt(p, x, g)
     }
     // A container slot of the holder's type is a holder of holders, which `ftHoldKind` names.
@@ -4509,15 +4515,17 @@ function ftDstTakes(dst: i32, x: i32, s: i32): boolean {
   if dst == tx { return true }
   // Two lists nested alike whose function leaves both carry the set store the same ids (D15562).
   if ftListLeavesOfSet(dst, tx, s, FT_HOLD_DEPTH) { return true }
-  // Two maps of one key whose values carry the set have one storage, a map of its ids (D15233).
+  // Two maps of one key whose values carry the set have one storage, a map of its ids (D15233),
+  // as does a map of a set within it, decided with it (D15535).
   const dm = if dst < T.tys.length { tyAt(dst) } else { null }
   const xm = if tx >= 0 && tx < T.tys.length { tyAt(tx) } else { null }
   if (
     dm is TyMap
     && xm is TyMap
     && tySame(dm.mKey, xm.mKey)
-    && fnTagSetOfTy(dm.mVal) == s
-    && fnTagSetOfTy(xm.mVal) == s
+    && (fnTagSetOfTy(dm.mVal) == s
+      && (fnTagSetOfTy(xm.mVal) == s || ftSubsetNote(fnTagSetOfTy(xm.mVal), s))
+      || fnTagSetOfTy(xm.mVal) == s && ftSetDecidedWith(fnTagSetOfTy(dm.mVal), s))
   ) {
     return true
   }
@@ -4607,6 +4615,13 @@ function ftLoopBodyStmt(b: i32, x: i32, g: i32): boolean {
     && (gn is ForIn && gn.fiBody == b
     || gn is ForRange && gn.frBody == b
     || gn is WhileStmt && gn.whileBlk == 0 && gn.whileBody == b)
+}
+
+// Whether `x` is a store ending the arm of `if` `g` with no `else`, whose value no read takes.
+function ftStoreInNoElse(x: i32, g: i32): boolean {
+  const xn = nodeAt(x)
+  const gn = nodeAt(g)
+  xn is BinExpr && ftIsStore(xn) && gn is IfStmt && gn.ifElse < 0
 }
 
 // Whether `x` is the last statement of block `b`, an arm of the `if` or `match` `g`.
