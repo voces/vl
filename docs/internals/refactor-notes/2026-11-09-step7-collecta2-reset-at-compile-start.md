@@ -1,7 +1,8 @@
 # Step 7: collectA#2 no longer wipes the row tables
 
 Measured 2026-11-09 on a 4-core box. The base is master `fe659e02` (#6947). Both seeds are
-fixpoints (two `refresh-compiler.sh` runs byte-identical). The population is the sweep's 23,756 programs.
+fixpoints (two `refresh-compiler.sh` runs byte-identical). The population is the sweep's
+23,756 programs.
 
 | | base (fixpoint) | candidate (fixpoint) |
 | --- | --- | --- |
@@ -24,7 +25,8 @@ now stands, and the walk finds it instead of minting it again.
 ## Probes
 
 Three scratch builds were made one level off the pre-#6947 base seed, where the sweep was also
-run, with the same 13 movers. Each records a fact with `emitFail("PROBE …")`, and each was run over the population in `vl check --batch --codegen`.
+run, with the same 13 movers. Each records a fact with `emitFail("PROBE …")`, and each was
+run over the population in `vl check --batch --codegen`.
 
 * **The tables at the walk's entry.** The first probe kept the wipe and checked that every row
   present at the walk's entry was minted again by the walk. In batch mode it fired 4,498 times,
