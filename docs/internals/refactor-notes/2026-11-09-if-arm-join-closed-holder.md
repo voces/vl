@@ -17,7 +17,11 @@ same `if` refused at the same site. A closed arm that reads a binding
 | producer | change |
 |---|---|
 | `holeFnBesideClosedJoin` (check_relate_core.vl) | also takes the closed side when each side is a record or list type holding a function, and the two are assignable both ways |
-| `monoCoerceIfArms` (emit_mono.vl) | an `if` the checker typed closed, at a record or list holding a function, has each open record or list literal arm delivered at that type (`monoElabDeliver`). It chooses no type |
+| `monoCoerceIfArms`, `monoCoerceListLitElems` (emit_mono.vl) | an `if` (or a list literal's element) the checker typed closed, at a record or list holding a function, has each open record or list literal arm (or element) built at that type by `monoElabDeliver`. Mono chooses no type |
+
+The list half is needed because the same join types a list literal's elements: without it,
+`[{ f: inc7 }, { f: (x: i32): i32 => x * 10 }]` took the closed element type and `inc7` had
+no instance (D9950 and two fixtures went `runs → not-runs` in the first candidate's sweep).
 
 #6944's version decided the type in mono, ahead of the call's pin, so the elaboration had
 already keyed `g` open and five instances were demanded late (6 → 11). Here the elaboration
@@ -27,12 +31,13 @@ keys `g` at the checker's closed join during `elabRun`, and nothing is demanded 
 
 | | base | candidate |
 |---|---|---|
-| sweep | SWEEP_BASE | SWEEP_DIFF |
+| sweep, 23,754 programs | | 23,751 same, 0 bytes-only, 3 output movers, 0 `runs → not-runs`, 0 new traps |
+| the 3 movers | 2 emit rejects, 1 check reject | D15331's and D15304's witnesses and the fixture run |
 | late demands | 6 | 6 (the fixture: 0; baseline file as master's) |
-| seed (fixpoint) | 6,577,470 | 6,577,738 (+268) |
-| SEEDSIZE | | |
-| rep-fuzz | | REPFUZZ |
-| plumb-shape fuel / peak RSS | | PLUMB |
+| seed (fixpoint) | 6,577,470 | 6,577,820 (+350; +2.8% of the seed-size baseline) |
+| rep-fuzz | | exact, 0 failures |
+| plumb-shape fuel, main / tail (against its baseline) | | −1.4% / −2.5% |
+| plumb-shape peak RSS, main / tail | | +0.7% / +0.8% |
 
 ## What stands
 
