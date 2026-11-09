@@ -59,22 +59,22 @@ Base: master merged at `b861eb49`, fixpoint 6,584,352 bytes. Fixpoint candidates
   pushed `mvValName` but not `mvMapTypeIdx`. E7's seed trapped there compiling `scripts/sweep.vl`.
   The loop is now bounded by `mvMapTypeIdx.length`, the last column pushed.
 
-What stands at E8:
+## Third session: 29 → 9
+Base: master `de73ab0c` at fixpoint (6,584,405 bytes); candidate fixpoint +879; 23,783 programs.
+D13940, D2273 and D4712 move from emit reject to `runs`.
 
-* **13 invalid wasm** (`D2698`, `D956`, `D9716`, `D9764`, `d15207`/`d15293`/`d15294`, five
-  `tests/cases/closures|maps|functions`). Most hold function values (lane w220's rows). Not ablated.
-* **9 `ref valtype with no interned shape`** (`a040320`/`536`/`752` and six cases). Minimal witness:
-  `type Circle = { r: string }`, `type Shape = Circle | Sq`, `function sink(_x: Circle[]) {}`
-  (never called), `mkcall()` returning `[{ r: "seven" }]`, `for zz in mkcall() {}`. The refusal is a
-  LOCAL's valtype (`fbLocalRun`), not the signature. The literal's row is fine (slot 0, shared by
-  `{r: string}` and its twin `Circle`). The loop variable's struct row is what is missing.
-* **4 `a late map list row has no value map struct`**: `const r: {[string]: T}[] = [Map()]` in a
-  generic instance at `T = string`. At the refusal, slot 0 has been processed (`mvTwin[0] = 0`)
-  and `mvMapTypeIdx[0]` is 0. The non-late pass takes `mvMapTypeIdx[mmv]` with no `> 0` test.
-* 1 each: D3059's covariant delivery, an uninterned fn-value signature, a rec-group count.
+* For-in var over a list at an arm's shape: the kind is `variant`, the slot names none, so the
+  row is asked by type (`repSlotOfKind`) on a name miss (9 cells).
+* `rlPairsLate` refused map struct type 0, which is a real index (4 cells).
+* A binding's annotation mints on its slot read (`letAnnMint`); a signature's in
+  `preIndexMintTrees`; a `nulmap` recorded result, like `map`, needs no token. That fixed D3059,
+  D2698, D956 and the rec-group count.
 
-## Not done
+What stands (9 runs lost, 8 traps):
 
-Step 2 (delete collectA#2), step 3 (`collectAFieldTables`, by-name sites onto `identDeclOf`),
-the gates, rep-fuzz and RSS. A PR needs a seed at or below master's, so it can land only once the
-arm is deleted with 0 losses. E8 is +605 bytes with the walk gone.
+* **8 function-value cells, routed to w223**: D9716, D9764, `d15207`/`d15293`/`d15294`, and three
+  `closures/` cases. A record or list holding a function gets no row (`rlRowOfTyMinted`'s skip),
+  so `frsColsOfTy` returns "no token" and the inferred result is lowered as `i32`.
+* **`record-list-of-lists-element-held-by-binding-runs`**: `listBuildOfTy` mints `{f:i32}` where
+  the destination holds `J`; a destination-first `arrLitBuild` did not fix it.
+* **The seed is +879**: `collectATypeRef`'s forcers still run on read, until typed readers replace them.
