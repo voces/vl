@@ -8,6 +8,7 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step7-recursive-element-arm](2026-11-09-step7-recursive-element-arm.md): Step 7: a recursive element's arm row mints at its first read.
 - [2026-11-09-step7-struct-row-late-mint](2026-11-09-step7-struct-row-late-mint.md): Step 7: a struct row minted after the type indices takes its twin, heap index and supertype at mint; `collectArmStructRows` and `collectS`'s arm map-slot intern are deleted.
 - [2026-11-09-step7-union-arm-rows-minted-on-read](2026-11-09-step7-union-arm-rows-minted-on-read.md): Step 7: a union's ref-array arm row mints at its first read; the union pass's element intern is deleted.
 - [2026-11-09-step7-fret-repof](2026-11-09-step7-fret-repof.md): Step 7: the un-annotated `fRet*` columns read off `repOf`; five steps between them deleted, seed −2,088.
