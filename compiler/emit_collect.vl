@@ -120,6 +120,7 @@ import {
   tyIsMap,
   tyIsOneStrLit,
   tyLitMemberTexts,
+  tyMayHoldFn,
   tyMembersDistinctRecords,
   tyNomNameCycled,
   tyNulInnerIsPrim,
@@ -426,6 +427,8 @@ import {
   monoInstOrig,
   monoOrigNode,
   mvKeyKind,
+  mvLateSlotsOff,
+  mvLateSlotsOn,
   mvMapTypeIdx,
   mvRlSlot,
   mvTwin,
@@ -448,6 +451,8 @@ import {
   rlElemTyIx,
   rlLateRowsOff,
   rlLateRowsOn,
+  rlRowMintOff,
+  rlRowMintOn,
   rlTwin,
   rlWrAns,
   rlWrSlots,
@@ -772,6 +777,7 @@ import {
   shapeFieldElemName,
   structRowOfNameOrTy,
   structRowOfRecordTy,
+  tyIsFuncOrNulFunc,
   tyIsNulRefArray,
   tyIsRefArray,
   tyRegGenNow,
@@ -788,6 +794,7 @@ import {
 import {
   ArrNewKind,
   arrNewFillTyIx,
+  rlDeclTwinTy,
   rlSlotOfTy,
   sFieldElemTyIxRow,
   sFieldRowKeyKind,
@@ -2214,6 +2221,8 @@ function nodeMintOnRead(i: i32): i32 {
     collectAIsExpr(i, nd)
   } else if nd is Call {
     collectACallMint(i, nd)
+  } else if nd is TypeRef {
+    collectATypeRef(i, nd)
   } else if nd is IfStmt {
     // An if-EXPRESSION whose arms join to a value union the program declares nowhere; the
     // `TyUnion` test is what keeps a `T | null` join out, whose rep is the niche (D1745).
@@ -4313,6 +4322,7 @@ export function mAssignTypeIndices(_n: i32) {
   }
   rlLateRowsOn(rlPairsLate)
   rlPairsLate(rlElemName.length)
+  mvLateSlotsOn(mvMapsLate)
   // The functypes follow; the first lands at the current counter (`typeOffset`).
   mNextType
 }
@@ -4346,6 +4356,7 @@ function rlPairsLate(n: i32): i32 {
     } else if k == RLK_MAP {
       const mmv = rlMapElemValSlot(rs)
       if mmv >= 0 {
+        mvMapsLate(mmv + 1)
         if mmv < mvMapTypeIdx.length && mvMapTypeIdx[mmv] > 0 {
           rlElemHeap[rs] = mvMapTypeIdx[mmv]
         } else {
@@ -4669,8 +4680,14 @@ function mAssignMapValueStructs() {
   // wrapper, so two slots whose value types are layout twins emit the same bytes and must share
   // one heap index. The vals-wrapper interlock makes a predicate or `rlSig` drift loud.
   mvTwin = []
-  let mvi = 0
-  while mvi < mvValName.length {
+  mvMapsLate(mvValName.length)
+}
+
+// The map structs of the map value slots below `n` that have none: each shares its layout
+// twin's, or mints its own. Returns 0, or -1 once two twins resolve different vals wrappers.
+function mvMapsLate(n: i32): i32 {
+  while mvTwin.length < n && mvTwin.length < mvValName.length {
+    const mvi = mvTwin.length
     const mvRep = mvCanonRepOf(mvi)
     mvTwin.push(mvRep)
     if mvRep >= 0 && mvRep < mvi {
@@ -4691,7 +4708,6 @@ function mAssignMapValueStructs() {
     } else {
       mvMapTypeIdx[mvi] = mAllocType(TSK_MV_MAP, mvi)
     }
-    mvi = mvi + 1
   }
   0
 }
@@ -5183,7 +5199,9 @@ function collectArrLitScalar(ix: i32) {
 // The ref-list and map-value row tables back to empty, once per compile. A row any pass mints
 // after it stands until the module is written.
 export function rlMvTablesReset() {
+  rlRowMintOff()
   rlLateRowsOff()
+  mvLateSlotsOff()
   arrLitMintOff()
   rlElemName = []
   rlElemKey = []
@@ -5294,6 +5312,9 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       // has its element's own row and struct row, except the cases `arrLitArenaRecElem` names,
       // which are still spelled by name (D14533).
       const ae = if elemKind == RLK_STRUCT { arrLitArenaRecElem(i) } else { -1 }
+      // A record spelled by shape is built at its declared twin's row, minted first.
+      const tw = if elemKind == RLK_STRUCT { rlDeclTwinTy(arrLitElemHintTy(i)) } else { -1 }
+      if tw >= 0 { rlRowOfTyMinted(tw) }
       if ae >= 0 {
         rlInternNameTy(rlRowNameOfTy(ae, false), RLK_STRUCT, ae)
       } else if elemKind != RLK_STRUCT || !arrLitRepElemRow(i) {
@@ -5697,6 +5718,7 @@ export function collectA(_stmts: i32[]) {
   arrLitMintDone = []
   heldMintDone = []
   arrLitMintOn(nodeMintOnRead)
+  rlRowMintOn(rlRowOfTyMinted)
   // The read-only-covariance write memo is keyed by slot number, which a re-mint and a
   // resumed walk's own new rows both move (D791). Ahead of the fork, since both invalidate it.
   rlWrSlots = []
@@ -5704,15 +5726,23 @@ export function collectA(_stmts: i32[]) {
   collectAUnionRows()
   let i = 0
   while i < P.nodes.length {
-    const nd = nodeAt(i)
-    if nd is TypeRef {
-      if collectATypeRef(i, nd) < 0 { return -1 }
-    }
     if fnTagHeldRepOf(i) >= 0 { collectAHeldRep(i) }
     i = i + 1
   }
   collectAFieldTables()
   0
+}
+
+// The ref-list row of closed element type `et`, minted on a miss; a record spelled by shape
+// mints its declared twin's row, which it shares. -1 for -1, an open type, or a type that may
+// hold a function inside a record or list, whose row its function-value sets decide.
+function rlRowOfTyMinted(et: i32): i32 {
+  const s = rlSlotOfTy(et)
+  if s >= 0 || et < 0 || et >= T.tys.length || tyHasTyVar(et) { return s }
+  if tyMayHoldFn(et, 0) && !tyIsFuncOrNulFunc(et) { return -1 }
+  const tw = rlDeclTwinTy(et)
+  rlInternOfTy(if tw >= 0 { tw } else { et })
+  rlSlotOfTy(et)
 }
 
 let heldMintDone: boolean[] = []
