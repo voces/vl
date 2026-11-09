@@ -8,6 +8,7 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step7-held-rep-minted-on-read](2026-11-09-step7-held-rep-minted-on-read.md): Step 7: a held node's rows mint at its first read; `collectAHeldRep` leaves collectA.
 - [2026-11-09-step7-mv-ladder-type-keyed-entry](2026-11-09-step7-mv-ladder-type-keyed-entry.md): Step 7: the mv ladder has a type-keyed entry; the map-twin arm stops rendering its member, render-parse 42 → 41.
 - [2026-11-09-step7-struct-row-callers](2026-11-09-step7-struct-row-callers.md): Step 7: twelve of the fifteen `repSlotOfTy` callers read the structural struct row; sweep byte-identical.
 - [2026-11-09-step7-recursive-element-arm](2026-11-09-step7-recursive-element-arm.md): Step 7: a recursive element's arm row mints at its first read.
