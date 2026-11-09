@@ -246,19 +246,14 @@ import {
 import {
   FC_CLOSURE,
   FC_I32,
-  FC_I32_LIST,
   FC_MAP,
   FC_NUL_CLOSURE,
-  FC_NUL_I32_LIST,
   FC_NUL_LIT_UNION,
   FC_NUL_MAP,
   FC_NUL_REF_LIST,
-  FC_NUL_STR,
-  FC_NUL_STR_LIST,
   FC_REF_LIST,
   FC_STR,
   FC_STRUCT,
-  FC_STR_LIST,
   FC_UNION,
   LBK_I32_LIST,
   LBK_REF,
@@ -282,7 +277,6 @@ import {
   TSK_CLO_CELL,
   TSK_CLO_ENV,
   TSK_CLO_SIG,
-  TSK_I32_ARRAY,
   TSK_MAP,
   TSK_MAP_I32,
   TSK_MAP_I64,
@@ -291,15 +285,11 @@ import {
   TSK_REF_WRAP,
   TSK_RV_VIEW,
   TSK_STRUCT,
-  TSK_STR_BACK,
-  TSK_STR_HEADER,
   TSK_SV_VIEW,
   TSK_UNION_BOX,
   TSK_VALUE_BOX,
   TSK_VARIANT,
   VKind,
-  aTypeIdx,
-  aUsed,
   annRlNul,
   annRlSlot,
   armFieldElemName,
@@ -473,7 +463,6 @@ import {
   rvUnionSlot,
   rvViewTy,
   sAnonOwnTy,
-  sBackIdx,
   sDeclared,
   sFieldCloSig,
   sFieldCount,
@@ -494,14 +483,15 @@ import {
   sRefRow,
   sRowDecl,
   sTwin,
+  sTy,
   sTyIx,
-  sTypeIdx,
   scopeFrames,
   scopeNames,
   scopeSlots,
   startStmtOrd,
   startStmts,
   storeTyPut,
+  strTrioReset,
   svDstOn,
   svPairOn,
   svViewTy,
@@ -1512,7 +1502,6 @@ function markSigKeyMonoMapsUsed(key: string) {
   while i < key.length {
     if key[i] == 'M' && i + 1 < key.length && key[i + 1] == '-' {
       mUsed = true
-      aUsed = true
       const shape = sigSlotAtTok(key, i)
       if shape == -4 || shape == -5 { markMapKeyUsed(MAP_KEY_I32) }
       if shape == -6 || shape == -7 { markMapKeyUsed(MAP_KEY_I64) }
@@ -4266,6 +4255,7 @@ function mResetTypeIntern() {
   mkListIdx = -1
   ba8TypeIdx = -1
   bl8TypeIdx = -1
+  strTrioReset()
   0
 }
 
@@ -4350,19 +4340,9 @@ export function mAssignTypeIndices(_n: i32) {
   mResetTypeIntern()
   mAssignStructHeaps()
   mAssignUnionHeaps()
-  // The raw i32 array (list and map backing), then `string`'s own backing array, then the string
-  // header struct `{backing, start, len}`, then the i32-list wrapper. All three string-side
-  // indices are minted from the one `aUsed` flag, which string use and list use both force, and
-  // every string lowering already guards on it. The type section emits the triple in this order.
-  if aUsed {
-    aTypeIdx = mAllocType(TSK_I32_ARRAY, 0)
-    sBackIdx = mAllocType(TSK_STR_BACK, 0)
-    sTypeIdx = mAllocType(TSK_STR_HEADER, 0)
-  } else {
-    aTypeIdx = mNextType
-    sBackIdx = mNextType
-    sTypeIdx = mNextType
-  }
+  // The string trio mints on first ask. A map holds string keys, so it mints here, before the
+  // map struct's index is predicted from the counter.
+  if mUsed { sTy() }
   // An `i32[][]` row keys its twin signature by the i32 wrapper, so it mints here, before the
   // map struct's index is predicted from the counter; any other reader mints it on first ask.
   if rlHasKind(RLK_I32_LIST) { lTy() }
@@ -4795,7 +4775,6 @@ function mAssignMapValueStructs() {
 // check-clean invalid wasm rather than a missing feature. Monotone, so a redundant call is inert.
 function forceAnnLeafReps(a: string): i32 {
   if nameIsStringArray(a) {
-    aUsed = true
   } else if nameIsF64Array(a) {
     // The f64 pair mints on first read (`fa64Ty`).
   } else if nameIsI64Array(a) {
@@ -4804,20 +4783,15 @@ function forceAnnLeafReps(a: string): i32 {
     // The f32 pair mints on first read (`fa32Ty`).
   } else if nameIsBareMap(a) {
     mUsed = true
-    aUsed = true
   } else if arrElemIs(a, "i32") || arrElemIs(a, "boolean") {
-    aUsed = true
   } else if nameIsString(a) || nameIsNulString(a) {
-    aUsed = true
   } else if nulScalarListKind(a) != null {
     const nsk = nulScalarListKind(a)
     // Exhaustive over `VKind` and `_`-less, `null` included: each of the five marks its own
     // backing, and a new leaf must say whether it needs one (D1898). The `null` alternative
     // is unreachable under the guard above and is named because the language requires it.
     match nsk {
-      "nulstrlist" => {
-        aUsed = true
-      }
+      "nulstrlist" => {}
       "nulf64list" => {
         // The f64 pair mints on first read (`fa64Ty`).
       }
@@ -4855,9 +4829,7 @@ function forceListLeafRepsOfTy(kTy: i32): i32 {
   }
   if !(e is TyPrim) { return 0 }
   match e.primName {
-    "string" => {
-      aUsed = true
-    }
+    "string" => {}
     "f64" => {
       // The f64 pair mints on first read (`fa64Ty`).
     }
@@ -4867,9 +4839,7 @@ function forceListLeafRepsOfTy(kTy: i32): i32 {
     "f32" => {
       // The f32 pair mints on first read (`fa32Ty`).
     }
-    "i32" | "boolean" => {
-      aUsed = true
-    }
+    "i32" | "boolean" => {}
     "void" | "null" | "never" | "u8" | "v128" => {
       // Not an element `forceAnnLeafReps` reserves a backing for.
     }
@@ -4928,23 +4898,14 @@ function tyElemIsStrListLeaf(e: i32): boolean {
 function forceAnnLeafRepsOfTy(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return 0 }
   const k = tyAt(t)
-  if k is TyPrim {
-    if k.primName == "string" { aUsed = true }
-    return 0
-  }
+  if k is TyPrim { return 0 }
   if k is TyMap {
-    if k.mSet == 0 {
-      mUsed = true
-      aUsed = true
-    }
+    if k.mSet == 0 { mUsed = true }
     return 0
   }
   if k is TyArray {
     const e = k.aElem
-    if tyElemIsStrListLeaf(e) {
-      aUsed = true
-      return 0
-    }
+    if tyElemIsStrListLeaf(e) { return 0 }
     if e < 0 || e >= T.tys.length { return 0 }
     const ek = tyAt(e)
     if !(ek is TyPrim) { return 0 }
@@ -4958,9 +4919,7 @@ function forceAnnLeafRepsOfTy(t: i32): i32 {
       "f32" => {
         // The f32 pair mints on first read (`fa32Ty`).
       }
-      "i32" | "boolean" => {
-        aUsed = true
-      }
+      "i32" | "boolean" => {}
       "string" | "void" | "null" | "never" | "u8" | "v128" => {
         // A string element is taken above; the rest reserve no backing here.
       }
@@ -4970,20 +4929,11 @@ function forceAnnLeafRepsOfTy(t: i32): i32 {
   const ni = tyNulInnerTy(t)
   if ni < 0 { return 0 }
   const nk = tyAt(ni)
-  if nk is TyPrim {
-    if nk.primName == "string" { aUsed = true }
-    return 0
-  }
+  if nk is TyPrim { return 0 }
   if !(nk is TyArray) { return 0 }
   const ne = nk.aElem
-  if tyElemRidesI32List(ne) {
-    aUsed = true
-    return 0
-  }
-  if tyElemIsStrListLeaf(ne) {
-    aUsed = true
-    return 0
-  }
+  if tyElemRidesI32List(ne) { return 0 }
+  if tyElemIsStrListLeaf(ne) { return 0 }
   if ne < 0 || ne >= T.tys.length { return 0 }
   const nek = tyAt(ne)
   if !(nek is TyPrim) { return 0 }
@@ -5111,12 +5061,9 @@ function collectArrNewScalarPair(ank: ArrNewKind) {
     }
     "strlist" => {
       // String fill → the string list (wrapper/backing shared with `string[]`).
-      aUsed = true
     }
     "reflist" => {}
-    "list" | "none" => {
-      aUsed = true
-    }
+    "list" | "none" => {}
   }
   0
 }
@@ -5219,8 +5166,6 @@ function collectFrameLeafRow(ix: i32, fnIx: i32) {
   } else if pn == "i64[]" {
     k = RLK_I64_LIST
     // The i64 pair mints on first read (`ia64Ty`).
-  } else {
-    aUsed = true
   }
   rlInternNameTy(pn, k, -1)
   0
@@ -5254,7 +5199,6 @@ function arrNewFrameWalk(ix: i32, fnIx: i32) {
     // only the frame can see that pin: `collectA` asks this frameless, reserves the i32 pair and
     // leaves `emitArrLit` refusing a rep it can name. Monotone, so a spare pair is inert (D1740).
     if arrLitIsStr(ix, fnIx) {
-      aUsed = true
     } else if n.arrElems.length > 0 && !arrLitIsRef(ix, fnIx) {
       // The frame can also take the string answer away: a local closure's call is not a
       // same-named nested function of another frame, so its scalar pair is reserved (D2386).
@@ -5265,8 +5209,6 @@ function arrNewFrameWalk(ix: i32, fnIx: i32) {
         // The i64 pair mints on first read (`ia64Ty`).
       } else if arrLitIsF32(ix, fnIx) {
         // The f32 pair mints on first read (`fa32Ty`).
-      } else {
-        aUsed = true
       }
       collectHoleElemListPair(n.arrElems[0], fnIx)
     }
@@ -5311,8 +5253,6 @@ function collectArrLitScalar(ix: i32) {
     // The i64 pair mints on first read (`ia64Ty`).
   } else if arrLitIsF32(ix, -1) {
     // The f32 pair mints on first read (`fa32Ty`).
-  } else {
-    aUsed = true
   }
   0
 }
@@ -5320,7 +5260,6 @@ function collectArrLitScalar(ix: i32) {
 // A full `collectA` walk's reset: every presence flag and ref-list / map-value row table back
 // to empty, then the rows the registered value unions force re-minted at the head of the table.
 function collectAResetTables() {
-  aUsed = false
   rlElemName = []
   listIsIdentNames = []
   rlElemKey = []
@@ -5401,14 +5340,9 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       } else {
         // Same hint, same provenance; every corpus firing agrees.
         rlInternNameTy(nestElem, nestKind, rlHintElemTy(i))
-        if nestKind == RLK_I32_LIST { aUsed = true }
-        if nestKind == RLK_STR_LIST { aUsed = true }
         // A map inner element (3) rides the map struct plus the i32 list and array its
         // `index` and `vals` fields use. Same flags as the `arrLitIsRef` arm.
-        if nestKind == RLK_MAP {
-          mUsed = true
-          aUsed = true
-        }
+        if nestKind == RLK_MAP { mUsed = true }
       }
     }
     // D1511 — the same hole at the shape element kind: `const xs = []` then
@@ -5462,21 +5396,15 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       // i32 list + raw array types for them. A string / f64 / i64 leaf (kinds
       // 6/7/8, the self-classified nested literal) forces ITS inner list's
       // wrapper+backing pair, exactly as the `T[][]` annotation branch does.
-      if kAfter == RLK_I32_LIST { aUsed = true }
-      if kAfter == RLK_STR_LIST { aUsed = true }
       // A map element (kind 3) forces the map struct plus the i32 list and array its `index`
       // and `vals` fields ride — the three flags an annotated map element gets from
       // `ensureRefElem`'s `k == 3` arm, which a bare literal never reaches. `mI32Used`, that
       // arm's fourth, is already flipped for this shape by the `Map()` constructor arm.
-      if kAfter == RLK_MAP {
-        mUsed = true
-        aUsed = true
-      }
+      if kAfter == RLK_MAP { mUsed = true }
     }
   } else if arrLitIsStr(i, -1) {
     // A STRING-element literal is a string-ref list — the same wrapper/backing
     // a `string[]` annotation forces.
-    aUsed = true
   } else {
     collectArrLitScalar(i)
   }
@@ -5563,11 +5491,9 @@ function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
   recordAnnRlSlot(i, ensureRefElemTy(ren, renTy), ranNul)
   // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
   // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
-  if raKind == RLK_I32_LIST { aUsed = true }
   // A nested NON-i32 scalar / string 2D array (`string[][]`/`f64[][]`/`i64[][]`, element
   // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
   // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
-  if raKind == RLK_STR_LIST { aUsed = true }
   // A map element (`{[K]: V}[]`, `({[K]: V} | null)[]`) forces the map machinery — the
   // three type flags, the element map's mv value slot and `mI32Used` for an i32 key —
   // inside `ensureRefElem` above, whose `k == 3` arm is the one home of that forcing and
@@ -5599,21 +5525,16 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     // a litunion `K[]` and the nullable forms all ride the i32-list backing): those force
     // their own types further down this same `TypeRef` arm.
     if arrElemIs(frRet, "i32") {
-      aUsed = true
     } else if tyScalarListKind(tyStepRet(nodeTyIxOf(i))) == "strlist" {
-      aUsed = true
     } else if nameIsF64Array(frRet) {
       // The f64 pair mints on first read (`fa64Ty`).
     } else if nameIsString(frRet) {
-      aUsed = true
     }
   } else if nameIsBareMap(nd.tyName) && !typeRefIsRecord(i) {
     // A `{[string]: i32}` annotation is a string-keyed map: the map struct, the keys list
-    // over a string-ref backing, and the i32 vals list. So it forces `aUsed` for the string
-    // and vals backings, alongside the three map types.
+    // over a string-ref backing, and the i32 vals list.
     // Stays on the name here, since this walk sees interior `TypeRef`s the arena does not.
     mUsed = true
-    aUsed = true
     // An integer-keyed map additionally forces its own map struct — its `keys` field is the
     // integer list, not the string-ref list — and its probe helper. The arena where it covers
     // the node, the name where it does not: `nodeTyMapKeyKindSpan` answers the string kind both
@@ -5642,7 +5563,6 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     // `$mapStruct` heap type exists for the `(ref null $mapStruct)` cell and the narrowed map
     // ops. Interns the inner value's mv slot too.
     mUsed = true
-    aUsed = true
     // The arena where it covers the node, the name where it does not, and the coverage test
     // is the point: `nodeTyMapKeyKindSpan` answers the string kind both for a string key and
     // for "no type for this node", while `markMapKeyUsed` sets a minting flag whose under-answer
@@ -5664,7 +5584,6 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     // form is wider — it also answers for a `(string | null)[]` element sharing this backing
     // — and these rungs are an `else if` chain, so an over-answering rung does not merely set
     // its own flags, it suppresses every rung below it. Monotone flags, non-monotone chain.
-    aUsed = true
   } else if gaeParamFieldNodeIs(i) && annSpelledArray(i) {
     // A generic alias's array field over its parameter (`{ g: U }[]`, `I<U>[]`): each
     // application interns its own element through `gaeEnsure`, and a slot minted here from
@@ -5696,34 +5615,24 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     // interns, so it is not validated here.
     if checkArrName(nd.tyName) < 0 { return -1 }
     // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
-    aUsed = true
   } else if nodeTyPrimName(i) == "string" {
-    aUsed = true
     // The arena: `nodeTyIsNulString` reads `T.tys` directly, rather than a
     // `<helper>(x) == <const>` twin whose helper never produces that constant.
   } else if nodeTyIsNulString(i) {
-    // A `string | null` annotation (kind 16) is a `(ref null $aTypeIdx)` slot — it still needs the
-    // string backing forced, exactly like a plain `string`. Without this a bare `string | null = null`
-    // (no other string in the module to force `aUsed`) left `$aTypeIdx` unallocated, so the slot
-    // valtype + `ref.null` referenced a stale type index → invalid wasm at the read.
-    aUsed = true
+    // A `string | null` annotation (kind 16) is a nullable string slot; its read mints the type.
   } else if nodeTyIsNulI32List(i) {
     // An `i32[] | null` annotation still constructs/reads the i32 list — the
     // nullable wrapper changes only the slot's valtype, not the types needed.
-    aUsed = true
   } else if nulScalarListKindOfNode(i) != null {
     // A distinct-backing nullable scalar list annotation (`string[]|null`, `f64[]|null`,
     // `i64[]|null`, `f32[]|null`) constructs and reads the leaf list, so force its wrapper
     // and backing even when the module has no other such list. `nulScalarListKindOfNode`
     // leads with `annRepKindOf` and falls back to the name ladder, so it cannot under-answer.
-    const nsk = nulScalarListKindOfNode(i)
-    if nsk == "nulstrlist" { aUsed = true }
   } else if nodeTyIsLitUnionAlias(i) || nodeTyIsNulLitUnion(i) {
     // A literal-union annotation (`: K`): an atom widens to its member `string`, so force the
     // string backing even when the module has no other string literal. The nullable niche
     // (`: K | null`) widens the same way and cannot lean on the alias arm, because the inline
     // spelling has no alias declaration whose own `TypeRef` would force it.
-    aUsed = true
   }
   // A map reached only as a closure result inside this annotation — a union arm, the
   // nullable-closure niche, or a curried result — is invisible to every branch above, since
@@ -5767,7 +5676,6 @@ function collectAFieldTables() {
     if sFieldTypes[sfi] == FC_MAP || sFieldTypes[sfi] == FC_NUL_MAP {
       // Code 29, the nullable map field, interns the same mv value slot as its non-null twin.
       mUsed = true
-      aUsed = true
       // The field row's key, threaded into the intern: an mv slot's identity is the (key, value)
       // pair, so a `{[i32]: string}` field must intern the i32-keyed slot. Interning the
       // string-keyed one and then resolving the i32-keyed one is the loud "map value type has no
@@ -5788,24 +5696,6 @@ function collectAFieldTables() {
     if sFieldTypes[sfi] == FC_REF_LIST || sFieldTypes[sfi] == FC_NUL_REF_LIST {
       // …with the row's arena type (D-REPELEMTY) — see the variant-table twin above.
       ensureRefElemTy(sFieldElemName[sfi], sFieldElemTyIxRow(sfi))
-    }
-    // A `string | null` field (code 20) and its non-null twin, the plain `string` field (code 3),
-    // are `(ref null $aTypeIdx)` and `(ref $aTypeIdx)` slots, so both force the string backing.
-    // Without it a shape whose only string is this field leaves `$aTypeIdx` unallocated, naming
-    // whatever heap type sits there — invalid wasm at `vl check` rc 0. Flag-only, a separate `if`.
-    if sFieldTypes[sfi] == FC_STR || sFieldTypes[sfi] == FC_NUL_STR {
-      aUsed = true
-    }
-    // An i32/boolean-LIST field (code 4, atom-array elem name or plain) and its NULLABLE twin
-    // (code 18, `i32[] | null`): force the wrapper/backing so the field valtype and any
-    // narrowed read resolve.
-    if sFieldTypes[sfi] == FC_I32_LIST || sFieldTypes[sfi] == FC_NUL_I32_LIST {
-      aUsed = true
-    }
-    // A STRING-list field (code 6) and its NULLABLE twin (31, `string[] | null`), which rides
-    // the SAME `$mkListIdx` wrapper: force that wrapper/backing pair.
-    if sFieldTypes[sfi] == FC_STR_LIST || sFieldTypes[sfi] == FC_NUL_STR_LIST {
-      aUsed = true
     }
     // A scalar-list field (f64[], i64[], f32[]; codes 25/26/27): `internInlineShape` forces the
     // pair at intern time, but this pass's re-run resets the flags, so re-derive from the table.
@@ -5876,7 +5766,6 @@ function internArmFieldMapSlot(ufi: i32) {
     // union arm otherwise arrive only by accident, from an orphaned field `TypeRef` reaching
     // the `nulMapInnerName` rung in the annotation walk.
     mUsed = true
-    aUsed = true
     // The struct pass's key-and-flag rule, one table over; see its header there. Both writes
     // are jointly, not severally, necessary: either one alone is covered by the struct row an
     // inline union arm must spell to be narrowed. Kept anyway, because that covering row
@@ -5911,18 +5800,6 @@ function internArmMapSlotsNamedBy(tyIx: i32) {
 
 // One arm field's presence flags and slot interns, at flat field index `ufi`.
 function collectAArmFieldNeeds(ufi: i32) {
-  if sFieldTypes[ufi] == FC_I32_LIST || sFieldTypes[ufi] == FC_NUL_I32_LIST {
-    aUsed = true
-  }
-  if sFieldTypes[ufi] == FC_STR_LIST || sFieldTypes[ufi] == FC_NUL_STR_LIST {
-    aUsed = true
-  }
-  // The variant-table twin of the struct pass's code-3 / code-20 string-backing arm: a
-  // union VARIANT whose field is a plain `string` (or a `string | null`) is the module's
-  // only mention of the string rep just as often as a struct field is.
-  if sFieldTypes[ufi] == FC_STR || sFieldTypes[ufi] == FC_NUL_STR {
-    aUsed = true
-  }
   forceScalarListField(sFieldTypes[ufi])
   // A NULLABLE ref-list variant field (code 28): re-intern its element so the field's
   // storage type + narrowed reads resolve the wrapper slot (`rlSlotByName`).
@@ -5950,37 +5827,19 @@ export function collectA(_stmts: i32[]) {
     if nd is ArrayLit {
       collectAArrayLit(i, nd)
     } else if nd is StrLit {
-      aUsed = true
     } else if nd is Call {
       // A dispatch through a tagged function set whose members return different types boxes
       // each member call into the call's union, which nothing else in the program need build.
       if fnTagCallArms(i).length > 0 { markInferredJoinAtoms(nodeTyIxOf(i)) }
-      // A `fromCodePoint(code)` call (H2) constructs a length-1 VL string — the shared
-      // `(array i32)` heap type — so it forces `aUsed` just like a string literal, even
-      // in a program with no other string. The callee is a bare `Ident`.
       if nd.callFn >= 0 {
         const cf = nodeAt(nd.callFn)
-        // `m.keys()` builds a fresh STRING list of the map's keys — force the string-list
-        // wrapper/backing (`mkListIdx`/`mkArrIdx`) + the shared `(array i32)`. `.keys()` is
-        // only valid on a map (checker-enforced), so any such call contributes the type.
-        if cf is Member {
-          if cf.memProp == "keys" { aUsed = true }
-          // A set's `.values()` is its keys list too, whatever produced the set.
-          if cf.memProp == "values" {
-            const vss = setShapeOfTy(nodeTyIxOf(cf.memObj))
-            if vss != 0 { aUsed = true }
-          }
-        }
         if cf is Ident && collectACallIntrinsic(cf.identName) {
-          if cf.identName == "fromCodePoint" { aUsed = true }
           // `fromCodePoints(xs)` builds a fresh string from an i32 list.
-          if cf.identName == "fromCodePoints" { aUsed = true }
           // An un-annotated `Map()` (usage-inferred binding) still constructs the map
           // struct — force the same types a `{[string]: i32}` annotation does. `Set()`
           // is the same 7-field map struct, so it forces the IDENTICAL types.
           if cf.identName == "Map" || cf.identName == "Set" {
             mUsed = true
-            aUsed = true
             // An UN-annotated `Map()`/`Set()` whose key the checker inferred as i32
             // (`const m = Map()` then `m.set(1, 2)`) has no map spelling anywhere in the
             // arena for the `TypeRef` walk below to read, so the KEY comes off the
@@ -6836,8 +6695,6 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         if codes[pi] == FC_CLOSURE || codes[pi] == FC_NUL_CLOSURE {
           fnValUsed = true
         }
-        // (A code-4 i32-list field always rides an ArrayLit value, which the
-        // later `collectA` arena scan classifies — `aUsed` set there.)
         pj = pj + 1
       }
       famRelayStructRow(sNames.length - 1)
@@ -9830,8 +9687,6 @@ export function collectMapFilterUse() {
                   // The i64 pair mints on first read (`ia64Ty`).
                 } else if rvk == "f32" {
                   // The f32 pair mints on first read (`fa32Ty`).
-                } else {
-                  aUsed = true
                 }
               }
             }
