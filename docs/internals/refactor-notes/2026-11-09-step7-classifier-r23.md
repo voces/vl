@@ -1,6 +1,6 @@
 # Step 7: classifier round 23, the identifier cell reads its declaration, 2026-11-09
 
-Round 23 starts from round 22's head (`357c3dcd`, master `18a749a0` merged in), where
+Round 23 starts from round 22 (#6998, master `deeca2a1`), where
 `classifier-census.vl` reads 53 probed classifiers, all post-only. It uses round 22's method. A
 scratch compiler wraps each classifier, runs it and a typed twin, and counts `SH <fn> = <tag>` or
 `SH <fn> <legacy>/<typed> <tag>` under `$VL_CLS_CENSUS=1` over the 23,800-program sweep population
@@ -56,8 +56,8 @@ either one.
 
 | tree | probed | post-only | pre-only | both | uncalled | warnings |
 | --- | --- | --- | --- | --- | --- | --- |
-| round 22 `357c3dcd` | 53 | 53 | 0 | 0 | 0 | 0 |
+| master `deeca2a1` | 53 | 53 | 0 | 0 | 0 | 0 |
 | this PR | 51 | 51 | 0 | 0 | 0 | 0 |
 
-**Proof.** Both sides are fixpoint seeds. Round 22 is 6,589,264 bytes and this PR is 6,589,461
+**Proof.** Both sides are fixpoint seeds. Master `deeca2a1` (round 22 merged) is 6,589,488 bytes and this PR is 6,589,685
 (+197).
