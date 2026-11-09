@@ -8,6 +8,10 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step2-root-answers-held](2026-11-09-step2-root-answers-held.md): Step 2: the place's held type answers root arguments, 134 → 52; monoOpenArgDefaultPin deleted (#6920).
+- [2026-11-09-hole-called-directly-at-another-type](2026-11-09-hole-called-directly-at-another-type.md): Step 4: a hole called directly at another type stays unsolved, D15576 (#6919).
+- [2026-11-09-step7-i32-and-string-lists-minted-on-read](2026-11-09-step7-i32-and-string-lists-minted-on-read.md): Step 7: i32 and string lists minted on first read; lUsed and slUsed deleted (#6918).
+- [2026-11-08-const-copy-forward](2026-11-08-const-copy-forward.md): Step 4: a hole parameter's const copy forwards into a list join (#6917).
 - [2026-11-08-step2-pin-names-root-args](2026-11-08-step2-pin-names-root-args.md): Step 2: root arguments read the call-key instance; monoArgPinTyIx deleted; the family table (#6914, #6915).
 - [2026-11-08-step7-f64-i64-minted-on-read](2026-11-08-step7-f64-i64-minted-on-read.md): Step 7: f64 and i64 list pairs minted on first read (#6913).
 - [2026-11-08-list-join-at-element-set](2026-11-08-list-join-at-element-set.md): Step 4: a list join binds at the list's element set, D15574 (#6912).
