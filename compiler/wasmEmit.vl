@@ -27068,6 +27068,7 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
       return emitFail("emitProgram: indexed-assignment target is not an array")
     }
     st.lTy = lTy()
+    st.aTy = aTy()
   }
   0
 }
@@ -27163,7 +27164,7 @@ function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
     isF32: isF32,
     isU8: isU8,
     lTy: -1,
-    aTy: aTy(),
+    aTy: -1,
     mfKind: "i32",
     slot: 0,
     structIdx: -1,
@@ -27813,7 +27814,7 @@ function pushSlotOf(
   // string-push quad; `array.new_default` zero-inits spare slots to null.
   const ps: PushSlot = {
     lTy: -1,
-    aTy: aTy(),
+    aTy: -1,
     base: pushScratchBase,
     armHeap: -1,
     destKind: null,
@@ -27868,6 +27869,7 @@ function pushSlotOf(
     ps.base = u8PushScratchBase
   } else {
     ps.lTy = lTy()
+    ps.aTy = aTy()
   }
   ps
 }
@@ -28301,7 +28303,7 @@ function emitPopGo(
       // the scratch frame whose `+3` `recvRef` slot holds a struct-FIELD receiver's wrapper
       // ref (same frame `.push` uses) — used only for a Member receiver.
       let wrapTy = -1
-      let aTy = aTy()
+      let popBack = -1
       let base = pushScratchBase
       // The ref-list table slot whose scratch frame a STAGING receiver would use, or -1
       // for every other family. Handed to `listOpRecvLocal` so the frame is resolved only
@@ -28317,7 +28319,7 @@ function emitPopGo(
         const rslot = refListSlotOfExpr(callee.memObj, fnIx)
         if rslot < 0 { return refListRowRefused(callee.memObj) }
         wrapTy = rlWrapIdx[rslot]
-        aTy = rlBackIdx[rslot]
+        popBack = rlBackIdx[rslot]
         popRefSlot = rslot
         elemIsRef = true
       } else if popEk != null {
@@ -28329,15 +28331,16 @@ function emitPopGo(
           )
         }
         wrapTy = scalarListWrap(popEk)
-        aTy = scalarListBack(popEk)
+        popBack = scalarListBack(popEk)
         base = scalarPushScratchBaseOf(popEk)
       } else if isStr {
         wrapTy = mkListTy()
-        aTy = mkArrTy()
+        popBack = mkArrTy()
         base = strPushScratchBase
         elemIsRef = true
       } else {
         wrapTy = lTy()
+        popBack = aTy()
       }
       // Receiver resolution — `listOpRecvLocal`, shared with `.push`/`.clear`/`.pop() ?? d`.
       const lIdx = listOpRecvLocal(
@@ -28353,7 +28356,9 @@ function emitPopGo(
       // A pop the checker typed as the element itself, under a `.length` test of its receiver
       // (D3558): the list is non-empty, so the element is read unchecked in its own rep.
       if getIdx < 0 && nodeTyExcludesNull(callIx) {
-        if pushTakeElem(body, lIdx, wrapTy, aTy, getIdx, fnIx) < 0 { return -1 }
+        if pushTakeElem(body, lIdx, wrapTy, popBack, getIdx, fnIx) < 0 {
+          return -1
+        }
         if elemIsRef {
           fbRefAsNonNull()
           if popUnionBoxElem(popRefSlot) {
@@ -28367,7 +28372,15 @@ function emitPopGo(
         // niche (true=1 / false=0 / null=2), so an empty pop yields the sentinel
         // 2 instead of trapping — mirroring the host's nullable `.pop()` (B6).
         if listElemIsBool(callee.memObj, fnIx) {
-          return emitPopNicheChecked(body, lIdx, wrapTy, aTy, getIdx, fnIx, 2)
+          return emitPopNicheChecked(
+            body,
+            lIdx,
+            wrapTy,
+            popBack,
+            getIdx,
+            fnIx,
+            2,
+          )
         }
         // the reps with no niche of their own, at a value position (`nulBox`): i32/i64/
         // f64/f32 have no spare bit pattern for absence, so their `T | null` is the
@@ -28377,7 +28390,7 @@ function emitPopGo(
           // A tagged set's member id is an `i32`, boxed as one.
           const pnk = if popNulTagId(nodeTyIxOf(callIx)) { 0 } else { tyNulNumScalarValKind(nodeTyIxOf(callIx)) }
           if pnk >= 0 {
-            return emitPopNulBox(body, lIdx, wrapTy, aTy, pnk, getIdx, fnIx)
+            return emitPopNulBox(body, lIdx, wrapTy, popBack, pnk, getIdx, fnIx)
           }
         }
         // a `K[]` atom list reads checked too, on the `-1` sentinel below every interned
@@ -28388,7 +28401,7 @@ function emitPopGo(
             body,
             lIdx,
             wrapTy,
-            aTy,
+            popBack,
             getIdx,
             fnIx,
             0 - 1,
@@ -28401,7 +28414,7 @@ function emitPopGo(
           callIx,
           lIdx,
           wrapTy,
-          aTy,
+          popBack,
           getIdx,
           fnIx,
           popRefSlot,
@@ -28413,13 +28426,17 @@ function emitPopGo(
       if !nulBox && getIdx < 0 {
         if pushTakeCond(body, lIdx, wrapTy, getIdx, fnIx) < 0 { return -1 }
         fbIf(64) // 0x40 void
-        if pushTakeElem(body, lIdx, wrapTy, aTy, getIdx, fnIx) < 0 { return -1 }
+        if pushTakeElem(body, lIdx, wrapTy, popBack, getIdx, fnIx) < 0 {
+          return -1
+        }
         fbDrop() // 0x1a drop
         fbEnd()  // 0x0b end
         return 1
       }
       // the unchecked tail: the reps with no `T | null` cell of their own.
-      if pushTakeElem(body, lIdx, wrapTy, aTy, getIdx, fnIx) < 0 { return -1 }
+      if pushTakeElem(body, lIdx, wrapTy, popBack, getIdx, fnIx) < 0 {
+        return -1
+      }
       return 0
     }
   }
@@ -28484,7 +28501,7 @@ function emitPopRefChecked(
   popRefSlot: i32,
   opNm: string,
 ): i32 {
-  let popElemHeap = sTy()
+  let popElemHeap = -1
   if popRefSlot >= 0 {
     if popRefSlot >= rlElemHeap.length {
       return emitFail("emitProgram: ref " + opNm + " element heap not interned")
@@ -28508,6 +28525,7 @@ function emitPopRefChecked(
     fbEnd() // 0x0b end
     return 0
   }
+  if popElemHeap < 0 { popElemHeap = sTy() }
   if pushTakeCond(body, lIdx, lTy, getIdx, fnIx) < 0 { return -1 }
   fbIfRefNul(popElemHeap, true)
   if pushTakeElem(body, lIdx, lTy, aTy, getIdx, fnIx) < 0 { return -1 }
@@ -28746,6 +28764,7 @@ function mfSrcTysOf(recvK: MfKind, recvIx: i32, fnIx: i32, src: MfSrcTys) {
     src.srcBack = ba8Ty()
   } else {
     src.srcWrap = lTy()
+    src.srcBack = aTy()
   }
   0
 }
@@ -28830,7 +28849,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       }
       const src: MfSrcTys = {
         srcWrap: -1,
-        srcBack: aTy(),
+        srcBack: -1,
         srcElemRef: false,
         srcSlot: -1,
       }
@@ -28840,7 +28859,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       const srcElemRef = src.srcElemRef
       const srcSlot = src.srcSlot
       // The RESULT wrapper/backing heap types.
-      const dst: MfDstTys = { dstWrap: -1, dstBack: aTy() }
+      const dst: MfDstTys = { dstWrap: -1, dstBack: -1 }
       if mfDstTysOf(resK, dstSlot, callIx, dst) < 0 { return -1 }
       const dstWrap = dst.dstWrap
       const dstBack = dst.dstBack
@@ -29023,6 +29042,7 @@ function mfDstTysOf(resK: MfKind, dstSlot: i32, callIx: i32, dst: MfDstTys) {
     dst.dstBack = ba8Ty()
   } else {
     dst.dstWrap = lTy()
+    dst.dstBack = aTy()
   }
   0
 }
@@ -30083,7 +30103,7 @@ function emitArrSlice(body: u8[], callIx: i32, fnIx: i32) {
       if recvK == "ref" { srcSlot = refListSlotOfExpr(callee.memObj, fnIx) }
       // The element kind's wrapper + backing heap types.
       let wrap = -1
-      let back = aTy()
+      let back = -1
       if recvK == "f64" {
         wrap = fl64Ty()
         back = fa64Ty()
@@ -30114,6 +30134,7 @@ function emitArrSlice(body: u8[], callIx: i32, fnIx: i32) {
         back = ba8Ty()
       } else {
         wrap = lTy()
+        back = aTy()
       }
       const srcL = mfSrcLocalFor(recvK, srcSlot)
       const dstL = mfDstLocalFor(recvK, srcSlot)
@@ -33737,12 +33758,13 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
   const pairValsSlot = forInPairValsSlot(s.fiIter, fnIx)
   const pairIsVal = hasPair && forInPairIsMapVal(s.fiIter, fnIx)
   let pairWrapTy = -1
-  let pairBackTy = aTy()
+  let pairBackTy = -1
   if pairValsSlot >= 0 {
     pairWrapTy = mvValsWrapOf(pairValsSlot)
     pairBackTy = mvValsBackOf(pairValsSlot)
   } else if pairIsVal {
     pairWrapTy = lTy()
+    pairBackTy = aTy()
   }
   // A map pair's value recovers non-null at exactly the element kinds the loop var does, or
   // one spelling recovers and the other traps on a stored null.
@@ -33750,7 +33772,7 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
   const pairRecover = pairIsVal && pairEk != null && forInElemRecovers(pairEk)
   const fb: ForInBacking = {
     wrapTy: -1,
-    backTy: aTy(),
+    backTy: -1,
     hKind: "i32",
     hSlot: 0,
     hOk: true,
@@ -33905,8 +33927,8 @@ type ForInBacking = {
   hOk: boolean,
 }
 
-// Writes into `fb` the backing of a `for`-in over element kind `ek`; `fb` arrives holding
-// the i32 list's. Returns -1 when a ref list has no row, else 0.
+// Writes into `fb` the backing of a `for`-in over element kind `ek`; `fb` arrives holding -1.
+// Returns -1 when a ref list has no row, else 0.
 function forInBackingOf(
   s: ForIn,
   fnIx: i32,
@@ -33976,9 +33998,10 @@ function forInBackingOf(
     fb.wrapTy = scalarListWrap("u8list")
     fb.backTy = scalarListBack("u8list")
     fb.hKind = "u8"
-  } else if !forInStringSrc(s.fiIter, fnIx) {
+  } else {
+    fb.backTy = aTy()
     // A string walk reads the string's own array, so only an i32 list needs the wrapper.
-    fb.wrapTy = lTy()
+    if !forInStringSrc(s.fiIter, fnIx) { fb.wrapTy = lTy() }
   }
   0
 }
@@ -38531,7 +38554,7 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
             + " reached with the wrong argument count — the checker's arity rule refuses it",
         )
       }
-      let anBack = aTy()
+      let anBack = -1
       let anWrap = -1
       const ank = arrNewIntrKind(callIx, fnIx)
       match ank {
@@ -38586,6 +38609,7 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
         }
         "list" | "none" => {
           anWrap = lTy()
+          anBack = aTy()
           if anIsNew {
             const anFillObj = nodeAt(c.callArgs[1]) is ObjLit
             if (
@@ -38691,7 +38715,7 @@ function emitArrayCopyIntr(body: u8[], callIx: i32, fnIx: i32) {
           "emitProgram: __array_copy__ dst and src must share one element type",
         )
       }
-      let acBack = aTy()
+      let acBack = -1
       let acWrap = -1
       if acDstF64 {
         acBack = fa64Ty()
@@ -38716,6 +38740,7 @@ function emitArrayCopyIntr(body: u8[], callIx: i32, fnIx: i32) {
           )
         }
         acWrap = lTy()
+        acBack = aTy()
       }
       if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
       fbStructGet(acWrap, 0)
