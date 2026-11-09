@@ -189,6 +189,17 @@ import {
   AS_FAIL_DOMS,
   ByteChunk,
   ByteRope,
+  HELP_MAP_COMPACT,
+  HELP_MAP_PROBE,
+  HELP_MAP_RESIZE,
+  HELP_MAP_RESYNC,
+  HELP_STR_BYTES,
+  HELP_STR_CONCAT,
+  HELP_STR_EQ,
+  HELP_STR_HASH,
+  HELP_UTF8_CPLEN,
+  HELP_UTF8_DEC,
+  HELP_UTF8_ENC,
   INIT_REACH_NEVER,
   MVK_F32,
   MVK_F64,
@@ -198,6 +209,7 @@ import {
   SYNTH_CLOSURE,
   SYNTH_CONST_LIST,
   SYNTH_EMPTY_BACKING,
+  TAIL_HELP,
   TSK_CLOSURE,
   TSK_CLO_CELL,
   TSK_CLO_ENV,
@@ -436,11 +448,14 @@ import {
   gSynthInit,
   gSynthKind,
   gTailFnRows,
+  gTailHelpTyN,
   genTyParamNames,
   genTyParamSeen,
   globalIndexBySid,
   globalStmtOrd,
   globalStmts,
+  helpStrEqFn,
+  helpUtf8DecFn,
   ia64Ty,
   ia64TypeIdx,
   il64Ty,
@@ -3514,7 +3529,7 @@ function emitUtf8CpLenFnCode(out: u8[]) {
   wU8(212)      // 0xd4 ref.as_non_null — the hoist slot is nullable; the call is not
   fbLocalGet(2)
   fbLocalGet(3)
-  fbCall(gHelpUtf8Dec)
+  fbCall(helpUtf8DecFn())
   fbI32Const(24)
   fbI32Bin(118) // 0x76 i32.shr_u — the WIDTH, the same stride `for cp in s` takes
   fbI32Bin(106) // i32.add
@@ -3749,7 +3764,7 @@ function emitMapProbeFnCode(out: u8[]) {
   fbArrayGet(mkArrTy()) // keysBack[entry-1] — (ref null $aTypeIdx)
   fbRefAsNonNull()      // a stored slot is populated
   fbLocalGet(5)
-  fbCall(gHelpStrEq)
+  fbCall(helpStrEqFn())
   fbElse()
   fbI32Const(0)         // hash/live mismatch → not a hit
   fbEnd()
@@ -5551,18 +5566,9 @@ function nameMapCount(n: i32): i32 {
   let count = gImports + n
   if startStmts.length > 0 { count = count + 1 }
   count = count + gInitMods.length
-  if gHelpStrHash >= 0 { count = count + 6 }
-  if gHelpStrBytes >= 0 { count = count + 1 }
-  if gHelpMapProbe >= 0 { count = count + 2 }
   if gHelpMapProbeI32 >= 0 { count = count + 2 }
   if gHelpMapProbeI64 >= 0 { count = count + 1 }
   if gHelpF64Rem >= 0 { count = count + 1 }
-  if gHelpMapResync >= 0 { count = count + 1 }
-  let cnk = 0
-  while cnk < gHelpMapCompact.length {
-    if gHelpMapCompact[cnk] >= 0 { count = count + 1 }
-    cnk = cnk + 1
-  }
   if gHelpInitFail >= 0 { count = count + 1 }
   count = count + svHelperCount()
   count = count + rvHelperCount()
@@ -5676,30 +5682,6 @@ function fnSymName(fi: i32): string {
 
 // The namemap entries of the shared runtime helpers, at their module-tail indices.
 function nameHelpers() {
-  if gHelpStrHash >= 0 {
-    wULEB(gHelpStrHash)
-    wName("__str_hash__")
-    wULEB(gHelpStrEq)
-    wName("__str_eq__")
-    wULEB(gHelpStrConcat)
-    wName("__str_concat__")
-    wULEB(gHelpUtf8Dec)
-    wName("__utf8_dec__")
-    wULEB(gHelpUtf8Enc)
-    wName("__utf8_enc__")
-    wULEB(gHelpUtf8CpLen)
-    wName("__utf8_cplen__")
-  }
-  if gHelpStrBytes >= 0 {
-    wULEB(gHelpStrBytes)
-    wName("__str_bytes__")
-  }
-  if gHelpMapProbe >= 0 {
-    wULEB(gHelpMapProbe)
-    wName("__map_probe__")
-    wULEB(gHelpMapResize)
-    wName("__map_resize__")
-  }
   if gHelpMapProbeI32 >= 0 {
     wULEB(gHelpMapProbeI32)
     wName("__map_probe_i32__")
@@ -5713,18 +5695,6 @@ function nameHelpers() {
   if gHelpF64Rem >= 0 {
     wULEB(gHelpF64Rem)
     wName("__f64_rem__")
-  }
-  if gHelpMapResync >= 0 {
-    wULEB(gHelpMapResync)
-    wName("__map_resync__")
-  }
-  let cnw = 0
-  while cnw < gHelpMapCompact.length {
-    if gHelpMapCompact[cnw] >= 0 {
-      wULEB(gHelpMapCompact[cnw])
-      wName("__map_compact_" + i32ToStr(cnw) + "__")
-    }
-    cnw = cnw + 1
   }
   if gHelpInitFail >= 0 {
     wULEB(gHelpInitFail)
@@ -5744,15 +5714,51 @@ function nameHelpers() {
     wULEB(gHelpStrFill)
     wName("__str_fill__")
   }
-  for row in gTailFnRows {
-    if row >= 0 {
+  let tfi = 0
+  while tfi < gTailFnRows.length {
+    const row = gTailFnRows[tfi]
+    if row >= TAIL_HELP {
+      wULEB(gMapSetFnBase + tfi)
+      wName(tailHelpName(row - TAIL_HELP))
+    } else if row >= 0 {
       wULEB(gMapSetFn[row])
       wName(mapSetFnName(row))
     } else {
       wULEB(gEqHelpFn[-1 - row])
       wName(eqHelpFnName(-1 - row))
     }
+    tfi = tfi + 1
   }
+}
+
+// Writes shared helper `kind`'s code entry to `out`; -1 on a refusal.
+function tailHelpFnCode(out: u8[], kind: i32): i32 {
+  if kind == HELP_STR_HASH { return emitStrHashFnCode(out) }
+  if kind == HELP_STR_EQ { return emitStrEqFnCode(out) }
+  if kind == HELP_STR_CONCAT { return emitStrConcatFnCode(out) }
+  if kind == HELP_UTF8_DEC { return emitUtf8DecFnCode(out) }
+  if kind == HELP_UTF8_ENC { return emitUtf8EncFnCode(out) }
+  if kind == HELP_UTF8_CPLEN { return emitUtf8CpLenFnCode(out) }
+  if kind == HELP_STR_BYTES { return emitStrBytesFnCode(out) }
+  if kind == HELP_MAP_PROBE { return emitMapProbeFnCode(out) }
+  if kind == HELP_MAP_RESIZE { return emitMapResizeFnCode(out) }
+  if kind == HELP_MAP_RESYNC { return emitMapResyncFnCode(out) }
+  emitMapCompactFnCode(out, mapCompactRowShape(kind - HELP_MAP_COMPACT))
+}
+
+// The name-section name of shared helper `kind`, a `HELP_*` row.
+function tailHelpName(kind: i32): string {
+  if kind == HELP_STR_HASH { return "__str_hash__" }
+  if kind == HELP_STR_EQ { return "__str_eq__" }
+  if kind == HELP_STR_CONCAT { return "__str_concat__" }
+  if kind == HELP_UTF8_DEC { return "__utf8_dec__" }
+  if kind == HELP_UTF8_ENC { return "__utf8_enc__" }
+  if kind == HELP_UTF8_CPLEN { return "__utf8_cplen__" }
+  if kind == HELP_STR_BYTES { return "__str_bytes__" }
+  if kind == HELP_MAP_PROBE { return "__map_probe__" }
+  if kind == HELP_MAP_RESIZE { return "__map_resize__" }
+  if kind == HELP_MAP_RESYNC { return "__map_resync__" }
+  "__map_compact_" + i32ToStr(kind - HELP_MAP_COMPACT) + "__"
 }
 
 // Emits the wasm "name" custom section (id 0) so a wasmtime trap backtrace shows real
@@ -6467,35 +6473,6 @@ function assignSharedHelperIndices(helpBase: i32) {
   gHelpMapResizeI32 = -1
   gHelpF64Rem = -1
   let nHelpers = 0
-  if aUsed {
-    gHelpStrHash = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpStrEq = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpStrConcat = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    // The UTF-8 codec trio, AFTER the string trio so a program's existing helper indices
-    // are unmoved by Stage 2c. Same `aUsed` gate and same "enabled-but-uncalled costs a
-    // few dozen bytes, never correctness" trade the trio above documents.
-    gHelpUtf8Dec = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpUtf8Enc = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpUtf8CpLen = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    // `s.bytes()` needs the packed pair to exist, so unlike its three neighbours it is gated on
-    // `ba8Used` too — `bl8TypeIdx` is 0 when unminted, and a helper naming it would collide with heap type 0.
-    if ba8Used {
-      gHelpStrBytes = helpBase + nHelpers
-      nHelpers = nHelpers + 1
-    }
-  }
-  if mUsed {
-    gHelpMapProbe = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpMapResize = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-  }
   // The i32-KEYED probe and resize, LAST so no existing helper index moves in a program
   // without one: the i32-keyed index is the pair layout, which neither string helper reads.
   // The i64-keyed rep resizes over the same pairs, so it mints this pair too.
@@ -6523,13 +6500,10 @@ function assignSharedHelperIndices(helpBase: i32) {
   gHelpMapResync = -1
   gHelpMapCompact = []
   if gMapDeletes && mUsed {
-    gHelpMapResync = helpBase + nHelpers
-    nHelpers = nHelpers + 1
     let ck = 0
     while ck < mvMapTypeIdx.length + 3 {
       if mapShapeCompactable(mapCompactRowShape(ck)) {
-        gHelpMapCompact.push(helpBase + nHelpers)
-        nHelpers = nHelpers + 1
+        gHelpMapCompact.push(-2)
       } else {
         gHelpMapCompact.push(-1)
       }
@@ -6602,6 +6576,7 @@ function assignSharedHelperIndices(helpBase: i32) {
   gMapSetTy = []
   gMapSetFn = []
   gTailFnRows = []
+  gTailHelpTyN = 0
   gMapSetTyN = 0
   gMapSetTyBase = 0
   gMapSetFnBase = 0
@@ -6627,7 +6602,7 @@ function mapSetRowable(sh: i32): boolean {
   const k = mapShapeKeyKind(sh)
   if k == MAP_KEY_I32 { return gHelpMapProbeI32 >= 0 }
   if k == MAP_KEY_I64 { return gHelpMapProbeI64 >= 0 && gHelpMapProbeI32 >= 0 }
-  gHelpMapProbe >= 0 && gHelpStrHash >= 0
+  mUsed && aUsed
 }
 
 // ── emitProgram pass manager ──
@@ -8867,7 +8842,8 @@ function emitTypeSection(
       + memFn
       + nHelpers
       + gMapSetTyN
-      + gEqHelpTyN,
+      + gEqHelpTyN
+      + gTailHelpTyN,
   )
   if typeOffset > 0 {
     wU8(78)           // 0x4e rec group
@@ -9058,23 +9034,6 @@ function tsEmitExternFuncTypes() {
 // Writes the functype of every shared runtime helper in use, in helper-index order, to the
 // type-section payload `emitTypeSection` has bound.
 function tsEmitHelperFuncTypes() {
-  if gHelpStrHash >= 0 {
-    helpFuncType("s", "i")   // __str_hash__: (str) -> i32
-    helpFuncType("ss", "i")  // __str_eq__: (str, str) -> i32
-    helpFuncType("ss", "s")  // __str_concat__: (str, str) -> (ref str)
-    helpFuncType("bii", "i") // __utf8_dec__: (strBacking, i, end) -> (width<<24)|cp
-    helpFuncType("aii", "s") // __utf8_enc__: (i32Backing, start, len) -> (ref str)
-    helpFuncType("s", "i")   // __utf8_cplen__: (str) -> i32
-    if ba8Used {
-      helpFuncType("s", "y") // __str_bytes__: (str) -> (ref u8[])
-    }
-  }
-  if gHelpMapProbe >= 0 {
-    // __map_probe__: (keyHash, index, hashes, live, keysBacking, key) -> slot — three 'a'
-    // i32 arrays, the 'm' string-list backing, then the 's' STRING key.
-    helpFuncType("iaaams", "i")
-    helpFuncType("aaaii", "a") // __map_resize__: (index, hashes, live, count, size) -> index'
-  }
   if gHelpMapProbeI32 >= 0 {
     helpFuncType("ai", "i") // __map_probe_i32__: (index, key i32) -> slot
     helpFuncType("ai", "a") // __map_resize_i32__: (index, count) -> index'
@@ -9084,14 +9043,6 @@ function tsEmitHelperFuncTypes() {
   }
   if gHelpF64Rem >= 0 {
     helpFuncType("ff", "f") // __f64_rem__: (f64, f64) -> f64
-  }
-  if gHelpMapResync >= 0 {
-    mapResyncFuncType() // __map_resync__: (seqs, count, seq) -> cursor
-  }
-  let cft = 0
-  while cft < gHelpMapCompact.length {
-    if gHelpMapCompact[cft] >= 0 { mapCompactFuncType(mapCompactRowShape(cft)) }
-    cft = cft + 1
   }
   if gHelpInitFail >= 0 {
     helpFuncType("iii", "") // __init_fail__: (global row, verb, reader row) -> (), never returns
@@ -9117,7 +9068,27 @@ function tsEmitHelperFuncTypes() {
     if gEqHelpTy[eft] >= 0 { eqHelpFuncType(eft) }
     eft = eft + 1
   }
+  for row in gTailFnRows {
+    if row >= TAIL_HELP { tailHelpFuncType(row - TAIL_HELP) }
+  }
   0
+}
+
+// Writes shared helper `kind`'s functype.
+function tailHelpFuncType(kind: i32) {
+  if kind == HELP_STR_HASH { return helpFuncType("s", "i") }
+  if kind == HELP_STR_EQ { return helpFuncType("ss", "i") }
+  if kind == HELP_STR_CONCAT { return helpFuncType("ss", "s") }
+  // (strBacking, i, end) -> (width << 24) | cp
+  if kind == HELP_UTF8_DEC { return helpFuncType("bii", "i") }
+  if kind == HELP_UTF8_ENC { return helpFuncType("aii", "s") }
+  if kind == HELP_UTF8_CPLEN { return helpFuncType("s", "i") }
+  if kind == HELP_STR_BYTES { return helpFuncType("s", "y") }
+  // (keyHash, index, hashes, live, keysBacking, key) -> slot
+  if kind == HELP_MAP_PROBE { return helpFuncType("iaaams", "i") }
+  if kind == HELP_MAP_RESIZE { return helpFuncType("aaaii", "a") }
+  if kind == HELP_MAP_RESYNC { return mapResyncFuncType() }
+  mapCompactFuncType(mapCompactRowShape(kind - HELP_MAP_COMPACT))
 }
 
 // The wasm valtype byte an extern's type spelling writes. The set is the checker's
@@ -9422,8 +9393,12 @@ function frameFunctionSection(
   }
   gMapSetTyBase = helpTyBase + nHelpers
   wTarget(thunkBuf)
+  let helpTy = gMapSetTyBase + gMapSetTyN + gEqHelpTyN
   for row in gTailFnRows {
-    if row >= 0 {
+    if row >= TAIL_HELP {
+      wULEB(helpTy)
+      helpTy = helpTy + 1
+    } else if row >= 0 {
       wULEB(gMapSetTyBase + gMapSetTy[row])
     } else {
       wULEB(gMapSetTyBase + gMapSetTyN + gEqHelpTy[-1 - row])
@@ -10044,48 +10019,6 @@ function buildCodePayload(
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__log__")
   }
   // The shared runtime helpers, each banked under the name the name section gives it — one body, one row, so a trace and a validate diagnostic cannot disagree about what to call the same function.
-  if gHelpStrHash >= 0 {
-    const hash: u8[] = []
-    let rows = emitFnSpanStart.length
-    if emitStrHashFnCode(hash) < 0 { return -1 }
-    placeCodeEntry(codePayload, hash, rows, -1, -1, 3, "__str_hash__")
-    const eq: u8[] = []
-    rows = emitFnSpanStart.length
-    if emitStrEqFnCode(eq) < 0 { return -1 }
-    placeCodeEntry(codePayload, eq, rows, -1, -1, 3, "__str_eq__")
-    const concat: u8[] = []
-    rows = emitFnSpanStart.length
-    if emitStrConcatFnCode(concat) < 0 { return -1 }
-    placeCodeEntry(codePayload, concat, rows, -1, -1, 3, "__str_concat__")
-    const dec: u8[] = []
-    rows = emitFnSpanStart.length
-    if emitUtf8DecFnCode(dec) < 0 { return -1 }
-    placeCodeEntry(codePayload, dec, rows, -1, -1, 3, "__utf8_dec__")
-    const enc: u8[] = []
-    rows = emitFnSpanStart.length
-    if emitUtf8EncFnCode(enc) < 0 { return -1 }
-    placeCodeEntry(codePayload, enc, rows, -1, -1, 3, "__utf8_enc__")
-    const cpLen: u8[] = []
-    rows = emitFnSpanStart.length
-    if emitUtf8CpLenFnCode(cpLen) < 0 { return -1 }
-    placeCodeEntry(codePayload, cpLen, rows, -1, -1, 3, "__utf8_cplen__")
-    if gHelpStrBytes >= 0 {
-      const bytes: u8[] = []
-      rows = emitFnSpanStart.length
-      if emitStrBytesFnCode(bytes) < 0 { return -1 }
-      placeCodeEntry(codePayload, bytes, rows, -1, -1, 3, "__str_bytes__")
-    }
-  }
-  if gHelpMapProbe >= 0 {
-    const probe: u8[] = []
-    let rows = emitFnSpanStart.length
-    if emitMapProbeFnCode(probe) < 0 { return -1 }
-    placeCodeEntry(codePayload, probe, rows, -1, -1, 3, "__map_probe__")
-    const resize: u8[] = []
-    rows = emitFnSpanStart.length
-    if emitMapResizeFnCode(resize) < 0 { return -1 }
-    placeCodeEntry(codePayload, resize, rows, -1, -1, 3, "__map_resize__")
-  }
   if gHelpMapProbeI32 >= 0 {
     let rows = emitFnSpanStart.length
     const entry: u8[] = []
@@ -10107,22 +10040,6 @@ function buildCodePayload(
     const entry: u8[] = []
     if emitF64RemFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__f64_rem__")
-  }
-  if gHelpMapResync >= 0 {
-    const rows = emitFnSpanStart.length
-    const entry: u8[] = []
-    if emitMapResyncFnCode(entry) < 0 { return -1 }
-    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__map_resync__")
-  }
-  let cce = 0
-  while cce < gHelpMapCompact.length {
-    if gHelpMapCompact[cce] >= 0 {
-      const rows = emitFnSpanStart.length
-      const entry: u8[] = []
-      if emitMapCompactFnCode(entry, mapCompactRowShape(cce)) < 0 { return -1 }
-      placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__map_compact__")
-    }
-    cce = cce + 1
   }
   if gHelpInitFail >= 0 {
     const rows = emitFnSpanStart.length
@@ -10157,7 +10074,18 @@ function buildCodePayload(
     const row = gTailFnRows[tfi]
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if row >= 0 {
+    if row >= TAIL_HELP {
+      if tailHelpFnCode(entry, row - TAIL_HELP) < 0 { return -1 }
+      placeCodeEntry(
+        codePayload,
+        entry,
+        rows,
+        -1,
+        -1,
+        3,
+        tailHelpName(row - TAIL_HELP),
+      )
+    } else if row >= 0 {
       helpFrameBody(entry, mapSetFnBody(mapCompactRowShape(row)))
       placeCodeEntry(codePayload, entry, rows, -1, -1, 3, mapSetFnName(row))
     } else {
