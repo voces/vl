@@ -59,5 +59,5 @@ either one.
 | master `deeca2a1` | 53 | 53 | 0 | 0 | 0 | 0 |
 | this PR | 51 | 51 | 0 | 0 | 0 | 0 |
 
-**Proof.** Both sides are fixpoint seeds. Master `deeca2a1` (round 22 merged) is 6,589,488 bytes and this PR is 6,589,685
+**Proof.** Both sides are fixpoint seeds. Master `3a9bab8b` is 6,588,938 bytes and this PR is 6,589,135
 (+197).
