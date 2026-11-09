@@ -8,6 +8,9 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-list-join-at-every-calls-hands](2026-11-09-list-join-at-every-calls-hands.md): Step 4: a list join at the union of every call's hands, D15577 (#6925).
+- [2026-11-09-step7-ba8-minted-on-read](2026-11-09-step7-ba8-minted-on-read.md): Step 7: the packed byte pair minted on first read; ba8Used deleted (#6924).
+- [2026-11-09-step7-shared-helpers-tail-rows](2026-11-09-step7-shared-helpers-tail-rows.md): Step 7: string, UTF-8 and string-keyed map helpers on tail rows (#6922).
 - [2026-11-09-step2-root-answers-held](2026-11-09-step2-root-answers-held.md): Step 2: the place's held type answers root arguments, 134 → 52; monoOpenArgDefaultPin deleted (#6920).
 - [2026-11-09-hole-called-directly-at-another-type](2026-11-09-hole-called-directly-at-another-type.md): Step 4: a hole called directly at another type stays unsolved, D15576 (#6919).
 - [2026-11-09-step7-i32-and-string-lists-minted-on-read](2026-11-09-step7-i32-and-string-lists-minted-on-read.md): Step 7: i32 and string lists minted on first read; lUsed and slUsed deleted (#6918).
