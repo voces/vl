@@ -16,6 +16,7 @@ import {
   CW_UP_ELEM,
   CW_UP_LETINIT,
   cwBindingOf,
+  cwDeclFnWrites,
   cwFnCalls,
   cwFnValueDeclOf,
   cwFnValueTargets,
@@ -3744,6 +3745,7 @@ export function elabCapReset() {
   elabWideRowsKeep(0)
   elabFnSetTy = Map()
   fnSets = []
+  fnParamWriteJoins = Map()
   fnValGenerics = []
   fnSetByKey = Map()
   fnJoinMemo = Map()
@@ -3952,7 +3954,8 @@ export function fnTagSharedJoinSet(f: FuncDecl, i: i32, args: i32[]): i32 {
 // The set un-annotated parameter `i` of `fd` (`f`) binds where a list of its body joins it with
 // other parameters (`elabListJoinSource`, slot writes) and `args`, each argument's type closed at
 // the instance holding the call (D15573), hands them different sets: the union of the sets every
-// call of `fd` hands them; -1 for any other (D15572, D15577).
+// call of `fd` hands them; that or the hand's set joined with each function the body writes to
+// the parameter (D15011); -1 for any other (D15572, D15577).
 export function fnTagListJoinSet(
   fd: i32,
   f: FuncDecl,
@@ -3968,12 +3971,50 @@ export function fnTagListJoinSet(
     if x >= 0 && x < P.nodes.length {
       if nodeAt(x) is LetDecl {
         const js = fnTagListJoinSetOf(x, fd, f, i, args)
-        if js >= 0 { return js }
+        if js >= 0 { return fnTagParamWritesJoin(f.fnParams[i], args[i], js) }
       }
       for c in nodeChildren(x) { todo.push(c) }
     }
   }
-  -1
+  fnTagParamWritesJoin(f.fnParams[i], args[i], -1)
+}
+
+// The written parameters `fnTagParamWritesJoin` bound at each set.
+let fnParamWriteJoins: {[i32]: i32[]} = Map()
+
+// The written parameters bound at the join of their hands and their writes that is set `s`.
+export function fnTagParamWriteJoinsOf(s: i32): i32[] {
+  fnParamWriteJoins[s] ?? []
+}
+
+// `js`, or where it is -1 the set hand type `at` carries, joined with every function written to
+// parameter `p`, whose reads may hold either; `js` when nothing or a non-function is written, and
+// -1 where the join is the hand's own set.
+function fnTagParamWritesJoin(p: i32, at: i32, js: i32): i32 {
+  const ws = cwDeclFnWrites(p)
+  if ws.length == 0 || ws[0] < 0 { return js }
+  const base = if js >= 0 { js } else { fnTagSetOfTy(at) }
+  if base < 0 || at < 0 || at >= T.tys.length || !(T.tys[at] is TyFunc) {
+    return js
+  }
+  const u = fnSetIntern(fnSetUnion(base, fnSetIntern(fnSetSorted(ws))))
+  if js < 0 && u == base { return -1 }
+  const have = fnParamWriteJoins[u] ?? []
+  if !i32ListHas(have, p) {
+    have.push(p)
+    fnParamWriteJoins[u] = have
+  }
+  if fnTagSetTy(u) < 0 {
+    const af = T.tys[at]
+    const ps: i32[] = []
+    if af is TyFunc {
+      for q in af.fnParamTypes { ps.push(q) }
+      const g: Ty = { fnParamTypes: ps, fnRet: af.fnRet }
+      T.tys.push(g)
+      elabFnSetTy[T.tys.length - 1] = u
+    }
+  }
+  u
 }
 
 // `fnTagListJoinSet` of list binding `d`: the union of the sets `args` hands the parameters `d`
