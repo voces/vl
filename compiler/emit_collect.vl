@@ -248,7 +248,6 @@ import {
   FC_MAP,
   FC_NUL_CLOSURE,
   FC_NUL_LIT_UNION,
-  FC_NUL_MAP,
   FC_NUL_REF_LIST,
   FC_REF_LIST,
   FC_STR,
@@ -289,7 +288,6 @@ import {
   annRlNul,
   annRlSlot,
   armFieldElemName,
-  armFieldElemTyIx,
   armFieldNames,
   armFieldTyText,
   armFieldTypes,
@@ -303,6 +301,7 @@ import {
   armStageStoreTy,
   armStageTyText,
   armStageTypes,
+  armStructRowMintOn,
   armsAdopted,
   arrLitMintOff,
   arrLitMintOn,
@@ -481,6 +480,7 @@ import {
   sFieldTyText,
   sFieldTypes,
   sHeapIdx,
+  sLateRowsOff,
   sLitIdRow,
   sLitMintFn,
   sLitMintRow,
@@ -555,6 +555,7 @@ import {
   boxTagOfTy,
   buildStructTwins,
   declTyIxOfName,
+  mvSlotKeyKind,
   nodeMapValTyIx,
   recordSFieldElemRowTy,
   recordSRowDeclOfName,
@@ -806,7 +807,6 @@ import {
   structEmitOrder,
   uFieldElemKeyKindAt,
   uFieldElemTyIxRow,
-  uFieldRowKeyKind,
 } from "./emit_struct_order"
 import {
   forRangeStepIsConst,
@@ -4304,6 +4304,7 @@ export function rvPairOf(s: i32, tag: i32): i32 {
 // `mAllocKind`/`mAllocSlot` record the order for `emitTypeSection`. An absent family mints
 // nothing, and its index globals still take the counter position they would have occupied.
 export function mAssignTypeIndices(_n: i32) {
+  mvKeysAtMint = false
   mResetTypeIntern()
   mAssignStructHeaps()
   mAssignUnionHeaps()
@@ -4350,6 +4351,7 @@ export function mAssignTypeIndices(_n: i32) {
   rlLateRowsOn(rlPairsLate)
   rlPairsLate(rlElemName.length)
   mvLateSlotsOn(mvMapsLate)
+  mvKeysAtMint = true
   // The functypes follow; the first lands at the current counter (`typeOffset`).
   mNextType
 }
@@ -4735,10 +4737,23 @@ function mvMapsLate(n: i32): i32 {
       }
       mvMapTypeIdx[mvi] = mvMapTypeIdx[mvRep]
     } else {
+      if mvKeysAtMint { mvKeysWrapMint(mvi) }
       mvMapTypeIdx[mvi] = mAllocType(TSK_MV_MAP, mvi)
     }
   }
   0
+}
+
+// Whether a map struct minted now is past the type-index assignment, so the keys wrapper its
+// field 0 names must mint with it rather than at the type section's write, past the functype base.
+let mvKeysAtMint = false
+
+// Mints the keys list wrapper of map value slot `mvi`'s struct (`tsMvMap`'s field 0).
+function mvKeysWrapMint(mvi: i32) {
+  const kk = mvSlotKeyKind(mvi)
+  if kk == MAP_KEY_I32 { lTy() }
+  else if kk == MAP_KEY_I64 { il64Ty() }
+  else { mkListTy() }
 }
 
 // The one home of "reserve the backing and wrapper heap types the type name `a` needs". A
@@ -5231,6 +5246,7 @@ export function rlMvTablesReset() {
   rlRowMintOff()
   rlLateRowsOff()
   mvLateSlotsOff()
+  sLateRowsOff()
   arrLitMintOff()
   rlElemName = []
   rlElemKey = []
@@ -5540,45 +5556,6 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   0
 }
 
-// Arm field `ufi`'s map value slot, when the field is a map. `collectS` asks for the fields of
-// an arm a struct field names, since that field's twin check compares the two rows' map slots (D15097).
-function internArmFieldMapSlot(ufi: i32) {
-  // Read through the arm accessors, which follow the arm table across its adoption into the
-  // struct table (D15097).
-  const codes = armFieldTypes()
-  if ufi < 0 || ufi >= codes.length { return 0 }
-  if codes[ufi] == FC_MAP || codes[ufi] == FC_NUL_MAP {
-    // Code 29, the nullable map field, too: a variant row must be collectable from this file's
-    // own column, or a union arm's nullable map field is collected only by an orphaned field
-    // `TypeRef`. The struct pass's key-and-flag rule, one table over; either write alone is
-    // covered by the struct row an inline arm spells, kept because that row is another pass's.
-    const ufk = uFieldRowKeyKind(ufi)
-    const names = armFieldElemName()
-    const tys = armFieldElemTyIx()
-    let ety = -1
-    if ufi < tys.length { ety = tys[ufi] }
-    let enm = ""
-    if ufi < names.length { enm = names[ufi] }
-    // The struct pass's row-type thread, one table over.
-    mvShapeOfValNameRowTy(enm, ufk, ety)
-  }
-  0
-}
-
-// The map value slots of the arm a struct field's type names (`o: A`, `o: A | null`), so the
-// field's code finds them (`internArmFieldMapSlot`). A no-op for any other type.
-function internArmMapSlotsNamedBy(tyIx: i32) {
-  if tyIx < 0 { return 0 }
-  const vi = variantIndexOf(nonNulBaseOf(tyNameOf(tyIx)))
-  if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length { return 0 }
-  let k = 0
-  while k < uFieldCount[vi] {
-    internArmFieldMapSlot(uFieldStart[vi] + k)
-    k = k + 1
-  }
-  0
-}
-
 // What intrinsic call `i` constructs with no literal or annotation in sight: an un-annotated
 // `Map()`/`Set()`'s value slot, and the pair an array allocator outside any function fills.
 function collectACallMint(i: i32, nd: Call) {
@@ -5639,6 +5616,7 @@ export function collectUnionAndHeldRows() {
   arrLitMintOn(nodeMintOnRead)
   rlRowMintOn(rlRowOfTyMinted)
   rlArmRowMintOn(rlRowOfArmTyMinted)
+  armStructRowMintOn(armFieldStructRowMinted)
   rlNameMintOn(rlRowOfNameMinted)
   mvNameMintOn(mvShapeOfValNameRowTy)
   // The read-only-covariance write memo is keyed by slot number, which a re-mint and a
@@ -5647,32 +5625,21 @@ export function collectUnionAndHeldRows() {
   rlWrAns = []
   collectAUnionRows()
   for i in fnTagHeldNodes() { collectAHeldRep(i) }
-  collectArmStructRows()
+  0
 }
 
-// Each arm record field's struct row, re-keyed to the interned row's name, which the field's
-// storage reads by name. A struct row has no late mint, so it cannot wait for that read.
-function collectArmStructRows() {
-  let avn = 0
-  while avn < uFieldStart.length && avn < uFieldCount.length {
-    let k = 0
-    while k < uFieldCount[avn] {
-      const ufn = uFieldStart[avn] + k
-      if sFieldTypes[ufn] == FC_STRUCT {
-        const si = internInlineShapeTy(
-          sFieldElemName[ufn],
-          uFieldElemTyIxRow(ufn),
-        )
-        if si >= 0 {
-          sFieldElemName[ufn] = sNames[si]
-          tyRegNoteWrite()
-        }
-      }
-      k = k + 1
-    }
-    avn = avn + 1
+// The struct row union-variant field row `ufn` stores, interned from the field's spelling and
+// type, and the field re-keyed to the interned row's name. -1 for a field that is no record.
+function armFieldStructRowMinted(ufn: i32): i32 {
+  if ufn < 0 || ufn >= sFieldTypes.length || sFieldTypes[ufn] != FC_STRUCT {
+    return -1
   }
-  0
+  const si = internInlineShapeTy(sFieldElemName[ufn], uFieldElemTyIxRow(ufn))
+  if si >= 0 {
+    sFieldElemName[ufn] = sNames[si]
+    tyRegNoteWrite()
+  }
+  si
 }
 
 // The ref-list row of closed element type `et`, minted on a miss; a record spelled by shape
@@ -6991,7 +6958,6 @@ export function collectS(stmts: i32[]) {
         while fi < fOrder.length {
           const fnode = nodeAt(fOrder[fi])
           if fnode is FieldDef {
-            internArmMapSlotsNamedBy(fnode.fdType)
             const code = nameFieldCodeTy(
               tyNameOf(fnode.fdType),
               recFieldTyOf(sTyIxOfName(s.tdName), fnode.fdName),
