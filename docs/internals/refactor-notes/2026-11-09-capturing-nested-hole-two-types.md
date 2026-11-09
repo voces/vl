@@ -1,8 +1,8 @@
 # A capturing nested hole called at two types is bundled (2026-11-09)
 
-Lane "D15596". Base: master `b2389003` built to a fixpoint (6,580,581 bytes), with #6958 (D15595,
-D15582) on top, since the fix widens that PR's `elabNestedGeneric`. The candidate is also a
-fixpoint.
+Lane "D15596". Base: master `c68eadb9` (#6958 merged), whose compiler is `b2389003`'s plus
+#6958. The fix widens #6958's `elabNestedGeneric`. The candidate is that master plus this PR, built
+to a fixpoint (6,581,299 bytes).
 
 ## What refused, and what the bundle broke
 
