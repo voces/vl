@@ -441,7 +441,6 @@ import {
   fnIndexOfInScopeAt,
   fnIndexOfInScopeSid,
   fnPosOnScopeChain,
-  initIsNestedStructFieldRead,
   letInitTyNulArmRow,
   letInitTyVariantRow,
   lfCloneOnChain,
@@ -680,7 +679,6 @@ import {
   unRowOfFlatMembers,
   vkIsBoxedRefElem,
   vkIsPlainList,
-  vkNulNicheOf,
 } from "./emit_sig_tokens"
 import {
   RC_MAP,
@@ -3927,10 +3925,9 @@ function captureLoopCopySrcAt(fe: i32, name: string, depth: i32): string {
 let capInitAsk = false
 
 // The `fbValtype` kind for a captured variable `name` of lifted function `fe`, resolved
-// against the parent frame's binding — a param's annotation, or a local `let`'s annotation
-// or initializer. Defaults to i32.
+// against the parent frame's binding — a param's annotation, or a local `let`'s cell in the
+// frame declaring it. Defaults to i32.
 export function captureValKind(fe: i32, name: string): VKind {
-  if clsCensusOn { clsCensusEnter("captureValKind") }
   const cps = captureLoopCopySrc(fe, name)
   if cps != "" { return captureValKind(fe, cps) }
   const b = parentBindingOf(fe, name)
@@ -3957,49 +3954,13 @@ export function captureValKind(fe: i32, name: string): VKind {
       return vtKindOfType(parTyNode(b))
     }
     LetDecl => {
-      // The env field is the local's own cell, so it is read where the local's is.
-      const rpf = parentBindingFrameArenaOf(fe, name)
-      if holderRecordSigs(b, rpf).length > 0 { return "struct" }
-      if letBindRepClaims(b, rpf) { return letBindRep(b, rpf).rdKind }
-      if bn.letType >= 0 {
-        const annK = vtKindOfType(bn.letType)
-        // The env field must match the LOCAL's own cell, not re-derive from the annotation:
-        // a narrowed nullable initialiser keeps its niche through the binding, because the
-        // narrowing is type-level and the rep is not. Reading the annotation alone declares a
-        // non-null field over a value that arrives nullable (D1632).
-        if bn.letInit >= 0 {
-          const nicheK = vkNulNicheOf(annK)
-          if nicheK != null {
-            const initK = letBindRepKind(b, parentBindingFrameArenaOf(fe, name))
-            if initK == nicheK { return nicheK }
-            // …and a walk variable over niche elements, whose cell only the loop knows (D3139).
-            if (
-              readLoopElemRepKind(
-                unwrapParen(bn.letInit),
-                parentBindingFrameArenaOf(fe, name),
-              )
-              == nicheK
-            ) {
-              return nicheK
-            }
-            // The rung above reads the frame, and a MODULE-frame block binding has none, so a
-            // field read's nullable slot goes unseen exactly where the ladder cannot ask. This
-            // one is frame-blind: the field's storage decides it, not the scope (D1759).
-            if initIsNestedStructFieldRead(b) { return nicheK }
-          }
-        }
-        return annK
-      }
-      // Un-annotated local: the local's own cell ladder, `letCellKindGo`, in the owning frame, so
-      // a captured map, list, string or struct env field carries the local's ref valtype (D15163).
-      // The frame is an arena index — `parentBindingFrameArenaOf` is that one home.
-      if bn.letInit >= 0 {
-        const askWas = capInitAsk
-        capInitAsk = true
-        const ck = letCellKindGo(b, rpf)
-        capInitAsk = askWas
-        return ck
-      }
+      // The env field is the local's own cell, read in the frame declaring it. An un-annotated
+      // initializer is asked from that frame (`capInitAsk`), so field and cell agree (D15163).
+      const askWas = capInitAsk
+      capInitAsk = true
+      const ck = letCellKindGo(b, parentBindingFrameArenaOf(fe, name))
+      capInitAsk = askWas
+      return ck
     }
     // No other binding has a captured kind.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -4036,30 +3997,13 @@ export function captureValStructIdx(fe: i32, name: string) {
       return annValtypeSlotOf(parTyNode(b))
     }
     LetDecl => {
-      const rpf = parentBindingFrameArenaOf(fe, name)
-      const hrow = holderRecordRow(b, rpf)
-      if hrow >= 0 { return hrow }
-      if letBindRepClaims(b, rpf) { return letBindRepSlot(b, rpf) }
-      if bn.letType >= 0 { return annValtypeSlotOf(bn.letType) }
-      if bn.letInit >= 0 {
-        // The owning frame as an arena index — the same conversion `captureValKind`'s
-        // un-annotated arm makes, and for the same reason: `letIsMap`, `letIsNulRef` and
-        // `letBindRepKind` all forward `pf` to `P.nodes[pf]`.
-        const pf = parentBindingFrameArenaOf(fe, name)
-        // The slot beside each ref cell kind the binding can take. A kind without
-        // its slot is a loud reject and not a fallback: `fbValtype`'s bounds guard turns a -1
-        // on any ref kind into `ref valtype with no interned shape` (D21).
-        if letBindRepKind(b, pf) == "reflist" { return letRefListSlot(b, pf) }
-        const sk = letBindRepKind(b, pf)
-        if sk == "struct" || sk == "variant" {
-          const csi = structIndexOfLet(b, pf)
-          if csi < 0 {
-            const cov = letObjLitVariantIdx(b, pf)
-            if cov >= 0 { return cov }
-          }
-          return csi
-        }
-      }
+      // The env field takes the local's own slot, read in the frame declaring it, beside the
+      // kind `captureValKind` gives it. A map's shape can be negative and is a real answer.
+      return letCellSlot(
+        b,
+        parentBindingFrameArenaOf(fe, name),
+        captureValKind(fe, name),
+      )
     }
     // No other binding has a captured slot.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -9351,7 +9295,6 @@ function capturedCompanionSlot(fnIx: i32, name: string) {
 // `fnEnvIdxOf` guard, since that index is minted after every classification pass and gating
 // on it silently answered `null` for the whole of `computeRetInference` — invalid wasm.
 export function capturedKindOf(fnIx: i32, name: string): VKind | null {
-  if clsCensusOn { clsCensusEnter("capturedKindOf") }
   if fnIx < 0 { return null }
   if !fnNestUsed { return null }
   const fe = fnStmtsPosOf(fnIx)
