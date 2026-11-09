@@ -9,6 +9,7 @@ also updates the target doc's status section.
 Newest first:
 
 - [2026-11-09-step7-classifier-r22](2026-11-09-step7-classifier-r22.md): Step 7: classifier round 22, `letCellKindGo`, `letInitIsNulLitBox`, `exprIsStrMethod` typed, `globalCellKindGo` deleted; 62 → 53 probed.
+- [2026-11-09-step7-classifier-r23](2026-11-09-step7-classifier-r23.md): Step 7: classifier round 23, `identCellVKind` and `identStoreVKind` read the declaration's cell; 53 → 51 probed.
 - [2026-11-09-step7-map-slots-minted-on-read](2026-11-09-step7-map-slots-minted-on-read.md): Step 7: the collectA#2 pass is deleted; map value slots mint on read (#6992).
 - [2026-11-09-step7-typeref-arm-typed-readers-wip](2026-11-09-step7-typeref-arm-typed-readers-wip.md): Step 7: collectA#2's TypeRef arm mints on read; D2273, D4712, D13940 run (#6985).
 - [2026-11-09-step7-collecta-typeref-chain](2026-11-09-step7-collecta-typeref-chain.md): Step 7: collectATypeRef's empty rungs fold into two named guards (#6972).
