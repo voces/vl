@@ -8,6 +8,9 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step2-spelled-builds](2026-11-09-step2-spelled-builds.md): Step 2: signature-keyed builds, spelled 79 → 40; the TYPE rows that stand (#6940).
+- [2026-11-09-capturing-nested-generic-handed-on](2026-11-09-capturing-nested-generic-handed-on.md): Step 4: a capturing nested generic built per encloser instance, D15105 (#6939).
+- [2026-11-09-step7-map-struct-minted-on-read](2026-11-09-step7-map-struct-minted-on-read.md): Step 7: the map struct minted on first read; mUsed deleted (#6938).
 - [2026-11-09-hole-param-copy-read-in-nested-fn](2026-11-09-hole-param-copy-read-in-nested-fn.md): Step 4: a nested function reading a copy of its encloser's parameter, D14843 (#6935).
 - [2026-11-09-written-hole-param-join](2026-11-09-written-hole-param-join.md): Step 4: a written hole parameter binds at its hand's set joined with its writes, D15011 (#6934).
 - [2026-11-09-step2-pins-and-body-types](2026-11-09-step2-pins-and-body-types.md): Step 2: the `pins` key arm and body retyping read the elaboration; the closing census (#6932).
