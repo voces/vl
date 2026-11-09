@@ -17988,9 +17988,11 @@ function monoElemFnPinTys(
   qs: i32[],
 ): boolean {
   const got: i32[] = []
-  const ok = elabValueAgreedCallTys(par, skip, got)
+  // An instance's clone of the element reads its calls at the template's parameter.
+  const p = nodeSrc[par] ?? par
+  const ok = elabValueAgreedCallTys(p, skip, got)
     || (monoElemArgNamesFn(arg, ctx)
-    && monoElemPinTysUnder(par, bNames, bTys, skip, got))
+    && monoElemPinTysUnder(p, bNames, bTys, skip, got))
   if ok {
     for t in got { qs.push(t) }
   }
@@ -22337,7 +22339,29 @@ function monoCoerceListLitElems(ix: i32, es: i32[], ctx: i32): i32 {
   const lt = nodeTyIxOf(ix)
   if lt < 0 || lt >= T.tys.length { return 0 }
   const l = tyAt(lt)
-  if !(l is TyArray) || !monoTyConcreteFn(l.aElem) { return 0 }
+  if !(l is TyArray) { return 0 }
+  // An open record or list literal element beside a closed one holding a function is built at
+  // the element type the checker joined them into (D15331).
+  const et = l.aElem
+  if (
+    et >= 0
+    && et < T.tys.length
+    && !monoTyOpen(et)
+    && !(tyAt(et) is TyFunc)
+    && tyMayHoldFn(et, 0)
+  ) {
+    for e in es {
+      const en = nodeAt(unwrapParen(e))
+      if (
+        (en is ObjLit || en is ArrayLit)
+        && monoElabDeliver(e, et, ctx, false, false)
+      ) {
+        monoElabDeliver(e, et, ctx, false, true)
+      }
+    }
+    return 0
+  }
+  if !monoTyConcreteFn(l.aElem) { return 0 }
   // A literal of generics alone is closed by the functions its binding's writes add.
   let closed = elabFnListClosedLit(ix)
   for e in es {
@@ -22360,10 +22384,33 @@ function monoCoerceIfArms(n: IfStmt, ix: i32, ctx: i32): i32 {
   // Inside an instance the join is its own instance's: a hole parameter's arm is open in the
   // template and the instance's type of the value is closed (D15462).
   const t0 = nodeTyIxOf(ix)
-  const t = if monoTyConcreteFn(t0) { t0 } else { elabWalkTy(ix) }
-  if !monoTyConcreteFn(t) || n.ifElse < 0 { return 0 }
+  if n.ifElse < 0 { return 0 }
   const tv = ifArmValueExpr(n.ifThen)
   const ev = ifArmValueExpr(n.ifElse)
+  // A record or list literal arm the checker left open beside the closed join is built at the
+  // join's type (D15331).
+  if (
+    tv >= 0
+    && ev >= 0
+    && t0 >= 0
+    && t0 < T.tys.length
+    && !monoTyOpen(t0)
+    && !(tyAt(t0) is TyFunc)
+    && tyMayHoldFn(t0, 0)
+  ) {
+    for a in [tv, ev] {
+      const an = nodeAt(unwrapParen(a))
+      if (
+        (an is ObjLit || an is ArrayLit)
+        && monoElabDeliver(a, t0, ctx, false, false)
+      ) {
+        monoElabDeliver(a, t0, ctx, false, true)
+      }
+    }
+    return 0
+  }
+  const t = if monoTyConcreteFn(t0) { t0 } else { elabWalkTy(ix) }
+  if !monoTyConcreteFn(t) { return 0 }
   if monoNamesDeclaredGeneric(tv, ctx) == monoNamesDeclaredGeneric(ev, ctx) {
     return 0
   }
