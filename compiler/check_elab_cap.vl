@@ -3951,9 +3951,15 @@ export function fnTagSharedJoinSet(f: FuncDecl, i: i32, args: i32[]): i32 {
 
 // The set un-annotated parameter `i` of `f` binds where a list binding of `f`'s body joins it with
 // other parameters (`elabListJoinSource` and its slot writes) and `args` hands those parameters
-// different sets: the union of the arguments' sets; -1 for any other (D15572). `args` is each
-// argument's type, closed at the instance holding the call where one is walked (D15573).
-export function fnTagListJoinSet(f: FuncDecl, i: i32, args: i32[]): i32 {
+// different sets: the union of the sets every call of `fd` hands those parameters; -1 for any
+// other (D15572, D15577). `args` is each argument's type, closed at the instance holding the call
+// where one is walked (D15573).
+export function fnTagListJoinSet(
+  fd: i32,
+  f: FuncDecl,
+  i: i32,
+  args: i32[],
+): i32 {
   if i < 0 || i >= f.fnParams.length || i >= args.length { return -1 }
   const pn = nodeAt(f.fnParams[i])
   if !(pn is Param) || pn.parType >= 0 { return -1 }
@@ -3962,7 +3968,7 @@ export function fnTagListJoinSet(f: FuncDecl, i: i32, args: i32[]): i32 {
     const x = todo.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
       if nodeAt(x) is LetDecl {
-        const js = fnTagListJoinSetOf(x, f, i, args)
+        const js = fnTagListJoinSetOf(x, fd, f, i, args)
         if js >= 0 { return js }
       }
       for c in nodeChildren(x) { todo.push(c) }
@@ -3973,7 +3979,13 @@ export function fnTagListJoinSet(f: FuncDecl, i: i32, args: i32[]): i32 {
 
 // `fnTagListJoinSet` of list binding `d`: the union of the sets `args` hands the parameters `d`
 // joins, when parameter `i` is one of them and they are not all one set; else -1.
-function fnTagListJoinSetOf(d: i32, f: FuncDecl, i: i32, args: i32[]): i32 {
+function fnTagListJoinSetOf(
+  d: i32,
+  fd: i32,
+  f: FuncDecl,
+  i: i32,
+  args: i32[],
+): i32 {
   const jp = elabListJoinSource(d, f)
   if jp < 0 { return -1 }
   const ps: i32[] = [i32ListIndexOf(f.fnParams, jp)]
@@ -3999,16 +4011,59 @@ function fnTagListJoinSetOf(d: i32, f: FuncDecl, i: i32, args: i32[]): i32 {
     jt = if jt < 0 { qt } else { fnTagJoinedSetTy(jt, qt) }
     if jt < 0 { return -1 }
   }
-  // The list's element set holds what every call hands it, so a call whose arguments are one set
-  // joins at that wider set too, as the calls through the list are typed (D15574).
+  // Every call joins at the union of what all calls hand the joined parameters, so one instance
+  // types the list for them all (D15574, D15577).
+  const js = fnTagSetOfTy(jt)
+  const hs = fnTagSetOfTy(fnTagHandsJoinTy(fd, ps, 0))
+  if hs >= 0 && fnTagMembersWithin(js, hs) {
+    return if hs != js || diff { hs } else { -1 }
+  }
+  // A call whose hands carry no set reads the list literal's element set instead.
   const ldn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   const lt = if ldn is LetDecl { nodeTyIxOf(parenPeelIx(ldn.letInit)) } else { -1 }
   const la = if lt >= 0 && lt < T.tys.length { T.tys[lt] } else { null }
   const ws = if la is TyArray { fnTagSetOfTy(la.aElem) } else { -1 }
-  const js = fnTagSetOfTy(jt)
   if ws >= 0 && ws != js && fnTagMembersWithin(js, ws) { return ws }
   if !diff { return -1 }
   js
+}
+
+// The function type carrying the union of the sets every direct call of `fd` hands its
+// parameters `ps`, one handed a caller's parameter read at that caller's calls; -1 when some
+// hand carries no set.
+function fnTagHandsJoinTy(fd: i32, ps: i32[], depth: i32): i32 {
+  if depth > 4 { return -1 }
+  let jt = -1
+  for q in ps {
+    const hs = fnParamHandSets(fd, q)
+    const froms = fnParamHandFromsOf(fd, q)
+    const args = fnParamHandArgsOf(fd, q)
+    if hs.length == 0 || froms.length != hs.length || args.length != hs.length {
+      return -1
+    }
+    let k = 0
+    while k < hs.length {
+      const ht = if hs[k] >= 0 { fnTagSetTy(hs[k]) } else { fnTagHandOnJoinTy(froms[k], args[k], depth) }
+      if ht < 0 { return -1 }
+      jt = if jt < 0 { ht } else { fnTagJoinedSetTy(jt, ht) }
+      if jt < 0 { return -1 }
+      k = k + 1
+    }
+  }
+  jt
+}
+
+// `fnTagHandsJoinTy` of the parameter of `fr` that argument `a` reads, or -1 when it reads none.
+function fnTagHandOnJoinTy(fr: i32, a: i32, depth: i32): i32 {
+  const x = parenPeelIx(a)
+  if fr < 0 || fr >= P.nodes.length || x < 0 || x >= P.nodes.length {
+    return -1
+  }
+  const f = nodeAt(fr)
+  if !(f is FuncDecl) || !(nodeAt(x) is Ident) { return -1 }
+  const q = i32ListIndexOf(f.fnParams, identDeclOf(x))
+  if q < 0 { return -1 }
+  fnTagHandsJoinTy(fr, [q], depth + 1)
 }
 
 // Whether every member of set `a` is a member of set `b`.
