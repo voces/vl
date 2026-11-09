@@ -8,6 +8,9 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-09-step2-pins-and-body-types](2026-11-09-step2-pins-and-body-types.md): Step 2: the `pins` key arm and body retyping read the elaboration; the closing census (#6932).
+- [2026-11-09-step7-string-trio-minted-on-read](2026-11-09-step7-string-trio-minted-on-read.md): Step 7: the string trio minted on first read; aUsed deleted (#6931).
+- [2026-11-09-list-join-under-a-forwarder](2026-11-09-list-join-under-a-forwarder.md): Step 4: a row under a forwarder instance re-keyed at the joined set, D15578 (#6930).
 - [2026-11-09-step2-census](2026-11-09-step2-census.md): Step 2 census: what mono still decides, TYPE or REP, and what step 2 still owes (#6928).
 - [2026-11-09-step2-instance-answers](2026-11-09-step2-instance-answers.md): Step 2: lambda clones take their template's elaborated type; instance no-answers 33 → 14 (#6927).
 - [2026-11-09-list-join-at-every-calls-hands](2026-11-09-list-join-at-every-calls-hands.md): Step 4: a list join at the union of every call's hands, D15577 (#6925).
