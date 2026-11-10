@@ -11664,3 +11664,12 @@ error names a copy. A key read still answers `V2 | null`, since a key can be abs
 **The price.** A loop over the values for each such test, paid only where the static types
 cannot answer it.
 
+
+## How step 7's classifier half finishes (orchestrator ruling, 2026-11-10)
+
+Input: `docs/internals/refactor-notes/2026-11-09-step7-classifiers-remaining.md` (42 classifiers, grouped by the fact each would need).
+
+- **A classifier that reads the emitter's own storage stays.** The cell, field code, companion slot or descriptor the emitter wrote the value with *is* the rep the emitter reconciles. The accounting's group 1 (8) moves to `NOT_BLIND` with its reason recorded in the census. It is not a step-7 debt.
+- **A missing EMITTER fact is a rep record kept where the emitter already computes it,** so a typed reader can ask for it. Recording it in the type would be the emitter choosing a type, which it may not. This covers groups 2, 3, 4, 6 and 8. For group 7, a named alias or intersection row is minted where the binding's type is first LOWERED. That is a first-reader mint, so it is allowed; a mint on a miss in a question reader is still excluded.
+- **A missing CHECKER fact is checker work, not an emitter workaround.** Groups 5 and 9: the instance key of a module copy of a generic, and a call site re-recorded at its callee's published join.
+- **Step 7's classifier half is done when every probed classifier either reads a typed fact or is `NOT_BLIND` with a recorded reason.** The probe count reaching zero is the measure. A classifier that is right and blind by design is not counted against it.
