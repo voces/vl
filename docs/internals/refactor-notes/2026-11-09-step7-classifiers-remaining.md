@@ -124,8 +124,8 @@ is the largest group by calls (5.3 M).
 | --- | --- | --- | --- | --- |
 | `exprIsLitAtom` | 1,244,345 (18,523) | 59: `argsHaveAtom` 205,669, `letInitIsLitAtom` 166,051, `emitBinLitEq` 138,568 | `nodeRepIsAtom` or `nodeRepIsNulAtom`, 1,241,201 / 738 (r20) | The read's rep, not the node's. |
 | `exprNulLitUnion` | 1,221,687 (15,527) | 14: `exprIsLitAtom` 906,466, `letSpellsNulAtom` 165,378, `emitAssignIdent` 107,891 | `nodeRepIsNulAtom`, 1,220,010 / 916 (r20) | The same. |
-| `nulVariantIdxOfExpr` | 955,480 (18,406) | 17: `memRecvNulVariantIndex` 563,204, `exprNullableVariant` 134,001, `armFieldUnionName` 122,421 | the `nulvariant` rep's slot, 956,025 / 1,978 (r21) | `rdSlot` in the variant table's numbering. |
-| `exprIsNulNone` | 658,605 (18,483) | 11: `emitExpr` 172,070, `retNullIntoNonNullRef` 152,813, `nulNoneEqSides` 148,081 | `nodeRepIs nulnone`, 973,949 / 23,562 (r20) | The read's rep. Its `Ident`/`Member`/`Index`/`Call` arm already asks `readRepOf`, and the rest is the `if` and `??` joins. |
+| ~~`nulVariantIdxOfExpr`~~ | switched 2026-11-10 | | reads the read rep's storage row (#7029); a value `if` or a non-map `??` is the row of its join's own type when it reps as `nulvariant`; 23,834 of 23,834 byte-identical ([notes](2026-11-10-step7-nulnone-nulvariant-joins.md)) | — |
+| ~~`exprIsNulNone`~~ | switched 2026-11-10 | | reads ask their storage (#7032); a value `if` or a `??` is `nodeRepIs nulnone` of the join; 23,834 of 23,834 byte-identical ([notes](2026-11-10-step7-nulnone-nulvariant-joins.md)) | — |
 | ~~`unionNameOfRead`~~ | switched 2026-11-10 | | the name `regUnionNameOfTy` gives the read's storage type (`readStoreTyAt`), a nullable box with no row of its own at its inner union's, a hole at the instance's binding; 0 `runs → not-runs` in 23,826, D4203 closed ([notes](2026-11-10-step7-union-name-of-read.md)) | The by-name walk stays as `unionNameOfHoleRead` for a hole the instance does not bind: group 2. |
 | `mapReadMvSlot` | 492,182 (12,779) | 14: `mapReadNarrowableSlot` 156,405, `exprString` 47,984, `coalesceMvSlot` 46,934 | the `map`/`nulmap` rep's slot, 462,068 / 39,941 (r21) | `rdSlot` in the mv table's numbering. |
 
