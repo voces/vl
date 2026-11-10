@@ -4,7 +4,7 @@ This is the input for deciding how step 7's classifier half finishes. It covers 
 `classifier-census.vl` probes after round 26 (`2026-11-09-step7-classifier-r26.md`). All 42 are
 post-only.
 
-**After round 27** (`2026-11-10-step7-classifier-r27.md`) 32 are probed. Group 1's eight are
+**After round 27** (`2026-11-10-step7-classifier-r27.md`) 32 are probed, and 31 after #7031 deleted `moduleCopySigKey`. Round 28 (`2026-11-10-step7-classifier-r28.md`) graded `arrLitIsRefTpl` and `arrLitNumKind` at their consumers and switched neither. Group 1's eight are
 `NOT_BLIND` (the census's `STORAGE_READERS`, each with its reason), and group 10's
 `arrLitObjElemBoxVariant` and `arrLitInstElemRow` read the literal's recorded types. The tables
 below keep the eight ruled-out rows for their reasons and mark each change.
@@ -129,12 +129,14 @@ heap type, so a typed answer that names the canonical twin is graded at the cons
 did (2,174 programs byte-identical). What is left is a named alias or intersection row (`type AB =
 A & B`, `type MyCat = Cat`). The structural reader finds no row under that type, and creating one
 would be a mint on a miss in a question reader, which the rulings exclude. **EMITTER**: the
-intersection's row minted where the binding's type is first lowered.
+intersection's row minted where the binding's type is first lowered. **Done 2026-11-10**
+([notes](2026-11-10-step7-named-alias-rows.md)): the alias's row is keyed by its type where the
+declaration is lowered, and both classifiers still disagree on facts of other groups.
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `structIndexOfExpr` | 3,497,141 (13,707) | 50: `structIndexOfMemberExpr` 2,245,964, `memRecvStructRow` 690,308, `binEqStructRow` 171,338 | `structRowOfRecordTy(nonNullTy(nodeTyAt))`, 3,452,888 agree + 3,736 layout twins / 40,517 (r27) | Re-shadowed in r27. 17,111 typed-only calls are union arm values, whose layout is `exprVariantIndex`'s (D34). 16,674 name a record's build row where the type names the declared one (`nested-record-built-wider-beside-own-binding-runs.vl`), and the literal's `litRepTyAt` row covers 431 of them. Missing: the read's built-at row (group 6's read rep). |
-| `letCellSlot` | 224,897 (16,203) | 3: `letLocalSlot` 189,006, `emitGlobalSection` 27,126, `captureValStructIdx` 8,765 | per arm (r16, r23): struct/variant 20 / 10, reflist 11,024 / 35, nulmap switched | The named intersection row (struct arm). A hole element at a generic pin (reflist arm, group 2). An un-annotated `Map()`'s per-binding shape (r14). |
+| `structIndexOfExpr` | 3,497,141 (13,707) | 50: `structIndexOfMemberExpr` 2,245,964, `memRecvStructRow` 690,308, `binEqStructRow` 171,338 | `structRowOfRecordTy(nonNullTy(nodeTyAt))`, 3,452,888 agree + 3,736 layout twins / 40,517 (r27) | Re-shadowed in r27. 17,111 typed-only calls are union arm values, whose layout is `exprVariantIndex`'s (D34). 16,674 name a record's build row where the type names the declared one (`nested-record-built-wider-beside-own-binding-runs.vl`), and the literal's `litRepTyAt` row covers 431 of them. Missing: the read's built-at row (group 6's read rep). Named alias rows are keyed by their type since 2026-11-10, and against `repStructRowOfTy` no disagreement has an alias type (453 calls moved, [notes](2026-11-10-step7-named-alias-rows.md)). |
+| `letCellSlot` | 224,897 (16,203) | 3: `letLocalSlot` 189,006, `emitGlobalSection` 27,126, `captureValStructIdx` 8,765 | struct arm 18 / 19 (2026-11-10); reflist 11,024 / 35 (r23), nulmap switched | The struct arm's one miss is a binding stored at its generic callee's wider row (group 9). A hole element at a generic pin (reflist arm, group 2). An un-annotated `Map()`'s per-binding shape (r14). |
 
 ## 8. A rep rule's row that the type does not key (1)
 
@@ -166,8 +168,8 @@ build row, 14,881 / 0). The four left:
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `arrLitIsRefTpl` | 93,162 (9,205) | 3: `arrLitIsRef` 88,891, itself 3,793, `arrLitFrameRefTy` 478 | `tyIsRefArray(nodeTyIxOf)`, 82,027 / 11,201 (r27) | 4,628 lead with a tagged set's leaf, whose list is the i32 id list (group 3's fact). 6,573 more (maps, records, unions, non-leaf functions) may be the frame half's (`arrLitFrameRefTy`), not graded at `arrLitIsRef`. |
-| `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | the width of `litRepTyAt`'s element, 72,517 / 6,118 (r27) | Not ablated: the rep is `i64[]` or `f64[]` where the element scan reads none (5,713), and a box or niche where it reads a width (399). |
+| `arrLitIsRefTpl` | 93,162 (9,205) | 3: `arrLitIsRef` 88,891, itself 3,793, `arrLitFrameRefTy` 478 | at `arrLitIsRef`'s answer, `tyIsRefArray(nodeTyIxOf)` with a tagged set's function element a list of ids, 88,771 / 188 (r28) | A list at a hole or generic pin, whose stored row the template type does not name (groups 2 and 3). Switched in, it traps 2 programs and refuses 3 more (r28). |
+| `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | the width of `litRepTyAt`'s element, 72,518 / 6,118; switched in, byte-identical in 1,197 of 1,221 files, the same output in the other 23 (r28) | No fact is missing. It needs a ruling: in 23 files the rep's box (a nullable or union element) or its `f64[]` (a nested inner literal) replaces a scalar build. |
 | `refListElemNameOfExprRaw` | 7,595 (454) | 1: `refListElemNameOfExpr` (asked only when `listRowOfExpr` has no row) | `rlRowNameOfTy` of `nodeTyAt`'s element, 3,698 / 3,897, 437 of them one row spelled twice (r27) | The function-value list rows (group 3) and nested niche lists. |
 | `arrLitElemNameTpl` | 7,049 (4,037) | 1: `arrLitElemName` | `rlRowNameOfTy` of `nodeTyIxOf`'s element, 5,365 / 1,682, 398 of them one row spelled twice (r27) | The same. |
 
@@ -187,7 +189,7 @@ build row, 14,881 / 0). The four left:
 | closure bundle, `fRet*` columns | emitter, lane w168 | 3 | 0.98 M | D15142, D15146 |
 | generic instance key | checker | 2 | 0.24 M | D9130, D3868 |
 | read rep in the table's numbering | emitter | 6 | 5.22 M | D2316, D2325 |
-| named intersection row | emitter (mint excluded today) | 2 | 3.72 M | `struct-alias-transparent.vl` |
+| named intersection row | emitter, keyed at the declaration (2026-11-10) | 2 | 3.72 M | `struct-alias-transparent.vl`, D14162 |
 | rep-rule row (`recListRetTakesRep`) | emitter | 1 | 0.01 M | D14813 |
 | callee's published join | checker | 1 | 0.17 M | (the two r21 witnesses) |
 | list-literal classifiers (r27: 2 switched) | emitter, partly lane w254 | 6 → 4 | 0.19 M | tagged id lists |

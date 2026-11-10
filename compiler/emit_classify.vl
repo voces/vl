@@ -738,7 +738,6 @@ import {
   MfKind,
   RLK_CLOSURE,
   RLK_REF_LIST,
-  RLK_STRUCT,
   RLK_UNION,
   VKind,
   armFieldElemName,
@@ -1105,24 +1104,6 @@ export function fnRetIsRecordRow(fe: i32): boolean {
   if rt < 0 { return false }
   const rd = repOfTy(rt)
   rd.rdCovered == 1 && (rd.rdKind == "struct" || rd.rdKind == "nulstruct")
-}
-
-// The variant row of the `(ref null $variantHeap(vi))` niche a call of `fe` returns, or -1.
-// The annotation, or an un-annotated result's recorded return kind, is read first, so a call
-// that is not the niche never runs `cloRetValKind`'s inference.
-function cloRetNulVariantRow(fe: i32): i32 {
-  if fe < 0 || fe >= fnStmts.length { return -1 }
-  const fn = nodeAt(fnStmts[fe])
-  if fn is FuncDecl {
-    if fn.fnRet >= 0 {
-      if nulVariantIndexOf(fn.fnRet) < 0 { return -1 }
-    } else {
-      if fe >= fRetKind.length { return -1 }
-      if fRetKind[fe] != "nulvariant" { return -1 }
-    }
-  }
-  if cloRetValKind(fe) == "nulvariant" { return cloRetValSlot(fe) }
-  -1
 }
 
 // `fe`'s result type: a declared one at its annotation's type, else the recorded one.
@@ -1541,23 +1522,6 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
       if rav == nlv { return nlr }
       return nulVariantIdxOfExpr(rav, fnIx)
     }
-    // A nullable variant-element list read (D851), then a bare `m[k]` over an arm-valued map
-    // (D34).
-    Index => {
-      if exprRefArray(e.idxArr, fnIx) {
-        const irls = refListSlotOfExpr(e.idxArr, fnIx)
-        if irls >= 0 && irls < rlElemTyIx.length {
-          if rlElemKindAt(irls) == RLK_STRUCT {
-            if rlElemIsNulNiche(irls) {
-              const irlv = rlElemVariantRow(irls)
-              if irlv >= 0 { return irlv }
-            }
-          }
-        }
-      }
-      const mri = mapReadMvSlot(exprIx, fnIx)
-      if mri >= 0 { return mvValVariantOf(mri) }
-    }
     BinExpr => {
       // An assignment's value is its target cell (D2603).
       if e.binOp == "=" {
@@ -1579,54 +1543,13 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
     AsExpr => {
       return nulVariantIndexOf(exprIx)
     }
-    // The index half of the nested-shape field arm — same field, same column, one fact
-    // (D1150).
-    Member => {
-      return memberNulVariantRow(exprIx, fnIx)
-    }
-    // A call of a `: Circle | null`-returning function — the callee's own annotation owns the
-    // index, which is what an inferred binding has to read: it has no annotation of its own,
-    // and its slot is declared from this answer.
-    Call => {
-      if e.callFn < 0 { return -1 }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        const cfe = fnIndexOfNode(e.callFn)
-        if cfe >= 0 { return cloRetNulVariantRow(cfe) }
-        // A closure-value callee (`const f = mk; f()`), which `fnIndexOfSid` misses.
-        // `calleeCloSigKeySid` is the key the kind comes from and `sigKeyRetSlot` that same
-        // key's slot digit, so the pair stays one fact.
-        const nvck = calleeCloSigKeyOfRead(e.callFn, fnIx)
-        if sigKeyRetKind(nvck) == "nulvariant" { return sigKeyRetSlot(nvck) }
-        return -1
-      }
-      if callee is Member && !callTyClosedIn(exprIx, fnIx) {
-        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if ffe >= 0 {
-          const fvr = cloRetNulVariantRow(ffe)
-          if fvr >= 0 { return fvr }
-        }
-      }
-      return popArmElemVariantRow(exprIx, fnIx)
-    }
-    // A read: the row of the storage it reads, the type it is narrowed out of, else its own.
-    Ident => {
-      return nulVariantRowOfRead(exprIx, fnIx)
+    // A name, field, element or call read: the row of the storage it reads.
+    Ident | Member | Index | Call => {
+      return readNulVariantRow(readRepOf(exprIx, fnIx))
     }
     // No other expression carries a nullable variant row.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
-  -1
-}
-
-// The variant row of the `(ref null $variantHeap(vi))` niche the read `ix` reads inside `fnIx`: its
-// storage type's, which is the type it is narrowed out of, else its own type; -1 for none.
-function nulVariantRowOfRead(ix: i32, fnIx: i32): i32 {
-  let st = readNarrowedStoreAt(ix, fnIx)
-  if st < 0 { st = nodeTyAt(ix, fnIx) }
-  if st < 0 || st >= T.tys.length { return -1 }
-  const sty = tyAt(st)
-  if sty is TyNullable { return repVariantShapeRowOf(sty.nInner) }
   -1
 }
 
@@ -1671,15 +1594,6 @@ function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
   const lr = listRowOfExpr(callee.memObj, fnIx)
   if lr >= 0 { return lr }
   rlSlotOfTyOrTwin(tyRefArrElemOf(nodeTyInOf(callee.memObj, fnIx)))
-}
-
-// The variant row a `.pop()` / `.get(i)` over a union-arm element list yields as its
-// `Arm | null` niche, or -1 when the read is not one (D4668).
-function popArmElemVariantRow(exprIx: i32, fnIx: i32): i32 {
-  const slot = popRefRecvSlot(exprIx, fnIx)
-  if slot < 0 || slot >= rlElemTyIx.length { return -1 }
-  if rlElemKindAt(slot) != RLK_STRUCT { return -1 }
-  rlElemVariantRow(slot)
 }
 
 // Whether the value at `exprIx` is an `i32[] | null` the checker has not narrowed present.
@@ -4534,26 +4448,6 @@ export function memRecvArmVariantIndex(recvIx: i32, fnIx: i32): i32 {
   const vi = exprVariantIndex(recvIx, fnIx)
   if vi >= 0 { return vi }
   memRecvNulVariantIndex(recvIx, fnIx)
-}
-
-// The variant row a code-15 struct-field read `p.err` targets, or -1 when the field isn't
-// a nested-shape field or its target is a plain struct. A code-15 field stores a ref
-// whether or not it's nullable, and `T` may be a union arm rather than a standalone
-// struct — `collectS` skips a union member, so only the variant table has its layout.
-function memberNulVariantRow(memIx: i32, fnIx: i32) {
-  const m = nodeAt(memIx)
-  if m is Member {
-    if memberFieldCode(memIx, fnIx) != FC_STRUCT { return -1 }
-    // The checker's type on the read node, not the field table's recorded name: the field
-    // table banks canon's softened rendering, which can miss the arm `variantIndexOf` needs.
-    const ty = nodeTyAt(memIx, fnIx)
-    if ty < 0 { return -1 }
-    const t = tyAt(ty)
-    if t is TyNullable { return repVariantShapeRowOf(t.nInner) }
-    repVariantShapeRowOf(ty)
-  } else {
-    -1
-  }
 }
 
 // The struct row a field read's receiver `objIx` is stored at in `fnIx`: before mono, the row
@@ -14476,7 +14370,14 @@ export function classifyStateReset() {
 // What a name, field or element read is stored as (`rrStore`) and what it reads as there
 // (`rrRead`): the storage kind, converted at the read (`rrConv`) to an atom, a niche, a
 // container or a non-null kind where the checker narrowed it; "" when the read has no rep.
-type ReadRep = { rrStore: string, rrRead: string, rrConv: i32 }
+type ReadRep = {
+  rrStore: string,
+  rrRead: string,
+  rrConv: i32,
+  // The storage's type, and a map value read's mv slot; -1 for none.
+  rrStoreTy: i32,
+  rrMv: i32,
+}
 
 // `readRepGo` remembered per read and asking function, within one frame and pass; a read whose
 // type names a type variable answers per instance, which `fnIx` alone does not name.
@@ -14559,20 +14460,56 @@ export function readStoreOf(ix: i32, fnIx: i32): string {
   st
 }
 
+// `readRepKinds` with the storage's type and mv slot beside the kinds, for any name, field,
+// element or call read, whether or not it has a rep.
 function readRepGo(ix: i32, fnIx: i32): ReadRep {
+  const r = readRepKinds(ix, fnIx)
   const rx = unwrapParen(ix)
-  const none: ReadRep = { rrStore: "", rrRead: "", rrConv: 0 }
+  if rx < 0 { return r }
+  const e = nodeAt(rx)
+  if !(e is Ident || e is Member || e is Index || e is Call) { return r }
+  const ns = readNarrowedStoreAt(rx, fnIx)
+  r.rrStoreTy = if ns >= 0 { ns } else { nodeTyAt(rx, fnIx) }
+  if e is Index { r.rrMv = mapReadMvSlot(rx, fnIx) }
+  r
+}
+
+function readRepKinds(ix: i32, fnIx: i32): ReadRep {
+  const rx = unwrapParen(ix)
+  const none: ReadRep = {
+    rrStore: "",
+    rrRead: "",
+    rrConv: 0,
+    rrStoreTy: -1,
+    rrMv: -1,
+  }
   if rx < 0 { return none }
   const e = nodeAt(rx)
   const st = readStoreOf(rx, fnIx)
   if st == "" { return none }
   // A read with no slot yet has no storage to read: it reads at its own type.
   if st == "type" {
-    return { rrStore: "type", rrRead: repOfNode(rx, fnIx).rdKind, rrConv: 7 }
+    return {
+      rrStore: "type",
+      rrRead: repOfNode(rx, fnIx).rdKind,
+      rrConv: 7,
+      rrStoreTy: -1,
+      rrMv: -1,
+    }
   }
   const nk = nicheReadKindAt(rx, fnIx)
-  if nk == 1 { return { rrStore: st, rrRead: "nulbool", rrConv: 2 } }
-  if nk == 2 { return { rrStore: st, rrRead: "nulstr", rrConv: 2 } }
+  if nk == 1 {
+    return {
+      rrStore: st,
+      rrRead: "nulbool",
+      rrConv: 2,
+      rrStoreTy: -1,
+      rrMv: -1,
+    }
+  }
+  if nk == 2 {
+    return { rrStore: st, rrRead: "nulstr", rrConv: 2, rrStoreTy: -1, rrMv: -1 }
+  }
   let ak = -1
   let ck = 0
   if e is Ident {
@@ -14589,30 +14526,64 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
     if ak < 0 && ck == 0 && mapReadNarrowedContainer(rx, fnIx) { ck = RC_MAP }
   }
   if ak >= 0 {
-    return { rrStore: st, rrRead: "atom" + i32ToStr(ak), rrConv: 1 }
+    return {
+      rrStore: st,
+      rrRead: "atom" + i32ToStr(ak),
+      rrConv: 1,
+      rrStoreTy: -1,
+      rrMv: -1,
+    }
   }
-  if ck == RC_MAP { return { rrStore: st, rrRead: "map", rrConv: 3 } }
-  if ck == RC_REF_LIST { return { rrStore: st, rrRead: "reflist", rrConv: 3 } }
+  if ck == RC_MAP {
+    return { rrStore: st, rrRead: "map", rrConv: 3, rrStoreTy: -1, rrMv: -1 }
+  }
+  if ck == RC_REF_LIST {
+    return {
+      rrStore: st,
+      rrRead: "reflist",
+      rrConv: 3,
+      rrStoreTy: -1,
+      rrMv: -1,
+    }
+  }
   // A map value read is the value or null, at the read's own type.
   const mvr = if e is Index { mapReadMvSlot(rx, fnIx) } else { -1 }
   if mvr >= 0 && mvValKind[mvr] == MVK_REF {
     const md = repOfNode(rx, fnIx)
     if md.rdCovered == 1 {
-      return { rrStore: st, rrRead: md.rdKind, rrConv: 4 }
+      return {
+        rrStore: st,
+        rrRead: md.rdKind,
+        rrConv: 4,
+        rrStoreTy: -1,
+        rrMv: -1,
+      }
     }
   }
   // Any other map's value read converts only where a miss makes it a nullable rep.
   if mvr >= 0 || (e is Index && readMapValTyAt(e, fnIx) >= 0) {
     const nd = repOfNode(rx, fnIx)
     if nd.rdCovered == 1 && readKindIsNul(nd.rdKind) {
-      return { rrStore: st, rrRead: nd.rdKind, rrConv: 4 }
+      return {
+        rrStore: st,
+        rrRead: nd.rdKind,
+        rrConv: 4,
+        rrStoreTy: -1,
+        rrMv: -1,
+      }
     }
   }
   // An `i32` cell read typed `boolean | null` holds that niche's sentinel encoding.
   if st == "i32" {
     const bd = repOfNode(rx, fnIx)
     if bd.rdCovered == 1 && bd.rdKind == "nulbool" {
-      return { rrStore: st, rrRead: "nulbool", rrConv: 6 }
+      return {
+        rrStore: st,
+        rrRead: "nulbool",
+        rrConv: 6,
+        rrStoreTy: -1,
+        rrMv: -1,
+      }
     }
   }
   // A read narrowed out of a nullable storage reads its non-null kind: one the checker recorded
@@ -14623,7 +14594,7 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
       if readNarrowedStoreAt(rx, fnIx) >= 0 || nd.rdKind == readNonNulKind(st) {
         // An atom's type reps as the i32 holding its id, so a de-nulled niche names the atom.
         const dk = if st == "nullitatom" { "litatom" } else { nd.rdKind }
-        return { rrStore: st, rrRead: dk, rrConv: 5 }
+        return { rrStore: st, rrRead: dk, rrConv: 5, rrStoreTy: -1, rrMv: -1 }
       }
     }
   }
@@ -14632,10 +14603,28 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
   if readListKindOf(st) != null && readNarrowedStoreAt(rx, fnIx) >= 0 {
     const ld = repOfNode(rx, fnIx)
     if ld.rdCovered == 1 && vkListClass(ld.rdKind) == 1 && ld.rdKind != st {
-      return { rrStore: st, rrRead: ld.rdKind, rrConv: 8 }
+      return {
+        rrStore: st,
+        rrRead: ld.rdKind,
+        rrConv: 8,
+        rrStoreTy: -1,
+        rrMv: -1,
+      }
     }
   }
-  { rrStore: st, rrRead: st, rrConv: 0 }
+  { rrStore: st, rrRead: st, rrConv: 0, rrStoreTy: -1, rrMv: -1 }
+}
+
+// The variant table's row of the nullable variant read `rr`'s storage holds, or -1: a map value's
+// is its mv slot's, which a map built wider than its type keys apart. A read the checker narrowed
+// non-null still names its storage's row.
+function readNulVariantRow(rr: ReadRep): i32 {
+  if rr.rrMv >= 0 { return mvValVariantOf(rr.rrMv) }
+  const st = rr.rrStoreTy
+  if st < 0 || st >= T.tys.length { return -1 }
+  const t = tyAt(st)
+  if t is TyNullable { return repVariantShapeRowOf(t.nInner) }
+  -1
 }
 
 // Each nullable rep kind beside the kind it holds when not null.
