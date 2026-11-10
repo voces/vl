@@ -221,17 +221,41 @@ jobs:
         env:
           SELFHOST_NATIVE_ALIGN: "1"
 
+      # The published seed is binaryen `-O` without inlining (DECISIONS.md §"The published seed
+      # is binaryen `-O` without inlining"): the gated fixpoint above, optimized, and refused unless
+      # it compiles the compiler back to that fixpoint byte for byte. Only the release asset takes
+      # this form; build/ (and so the seed cache this job shares with ci.yml) keeps the fixpoint.
+      - name: Optimize the published seed
+        run: ./scripts/optimize-seed.sh build/vl-compiler.wasm "$RUNNER_TEMP/publish/vl-compiler.wasm"
+
+      # The corpus oracle runs the seed under V8, the engine the playground runs the published
+      # seed in, so this is what refuses an optimized seed that needs more stack than the
+      # fixpoint (an inlined `-O` seed overflows on tests/cases/expressions/long-operator-chain.vl).
+      # The oracle reads build/vl-compiler.wasm, so the optimized seed stands there for this step
+      # and the fixpoint is put back on any exit, before the cache saves build/.
+      - name: Corpus oracle on the published seed
+        run: |
+          keep="$RUNNER_TEMP/fixpoint-build"
+          mkdir -p "$keep" && cp -a build/. "$keep/"
+          trap 'rm -rf build && mkdir build && cp -a "$keep/." build/' EXIT
+          cp "$RUNNER_TEMP/publish/vl-compiler.wasm" build/vl-compiler.wasm
+          rm -f build/vl-compiler.wasm.*.cwasm build/vl-compiler.wasm.key
+          deno test -A --parallel tests/cases_wasm_0_test.ts tests/cases_wasm_1_test.ts tests/cases_wasm_2_test.ts tests/cases_wasm_3_test.ts
+
       # The asset contract (docs/genesis-design.md): the seed, its checksum
       # sidecar (fetch-seed.sh fails closed on mismatch), and a fingerprint over
       # the producing source plus the producing commit SHA for provenance.
+      # `fixpoint-sha256` is the unoptimized fixpoint the published seed compiles the compiler to.
       - name: Assemble release assets
         run: |
-          cd build
+          fix_hash="$(sha256sum build/vl-compiler.wasm | cut -d' ' -f1)"
+          src_hash="$(sha256sum compiler/*.vl | sha256sum | cut -d' ' -f1)"
+          cd "$RUNNER_TEMP/publish"
           sha256sum vl-compiler.wasm > vl-compiler.wasm.sha256
-          src_hash="$(sha256sum ../compiler/*.vl | sha256sum | cut -d' ' -f1)"
           {
-            echo "source-sha256: $src_hash"
-            echo "commit:        $GITHUB_SHA"
+            echo "source-sha256:   $src_hash"
+            echo "fixpoint-sha256: $fix_hash"
+            echo "commit:          $GITHUB_SHA"
           } > seed-fingerprint.txt
 
       # Re-point the rolling `seed-latest` pre-release at the new seed. The tag is
@@ -248,8 +272,8 @@ jobs:
           # tracks the seed it actually published.
           target_commitish: ${{ github.sha }}
           files: |
-            build/vl-compiler.wasm
-            build/vl-compiler.wasm.sha256
-            build/seed-fingerprint.txt
+            ${{ runner.temp }}/publish/vl-compiler.wasm
+            ${{ runner.temp }}/publish/vl-compiler.wasm.sha256
+            ${{ runner.temp }}/publish/seed-fingerprint.txt
         env:
           GITHUB_TOKEN: ${{ github.token }}

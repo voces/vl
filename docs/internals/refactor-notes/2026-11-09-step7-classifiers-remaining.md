@@ -122,8 +122,8 @@ is the largest group by calls (5.3 M).
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `exprIsLitAtom` | 1,244,345 (18,523) | 59: `argsHaveAtom` 205,669, `letInitIsLitAtom` 166,051, `emitBinLitEq` 138,568 | `nodeRepIsAtom` or `nodeRepIsNulAtom`, 1,241,201 / 738 (r20) | The read's rep, not the node's. |
-| `exprNulLitUnion` | 1,221,687 (15,527) | 14: `exprIsLitAtom` 906,466, `letSpellsNulAtom` 165,378, `emitAssignIdent` 107,891 | `nodeRepIsNulAtom`, 1,220,010 / 916 (r20) | The same. |
+| `exprIsLitAtom` | 1,244,345 (18,523) | 59: `argsHaveAtom` 205,669, `letInitIsLitAtom` 166,051, `emitBinLitEq` 138,568 | `nodeRepIsAtom` or `nodeRepIsNulAtom`, 1,241,201 / 738 (r20) | The read's rep, not the node's. A value `if` is `nodeRepIsAtom` of the join since 2026-11-10. What keeps it probed is the `??` arms: the join's rep loses 6 programs ([notes](2026-11-10-step7-lit-atom-joins.md)). |
+| ~~`exprNulLitUnion`~~ | switched 2026-11-10 | | a value `if` and a `??` are `nodeRepIsNulAtom` of the join; a parameter read is its annotation's rep (`paramTypeNodeOfRead`); the rest read storage; 23,836 of 23,836 byte-identical ([notes](2026-11-10-step7-lit-atom-joins.md)) | — |
 | ~~`nulVariantIdxOfExpr`~~ | switched 2026-11-10 | | reads the read rep's storage row (#7029); a value `if` or a non-map `??` is the row of its join's own type when it reps as `nulvariant`; 23,834 of 23,834 byte-identical ([notes](2026-11-10-step7-nulnone-nulvariant-joins.md)) | — |
 | ~~`exprIsNulNone`~~ | switched 2026-11-10 | | reads ask their storage (#7032); a value `if` or a `??` is `nodeRepIs nulnone` of the join; 23,834 of 23,834 byte-identical ([notes](2026-11-10-step7-nulnone-nulvariant-joins.md)) | — |
 | ~~`unionNameOfRead`~~ | switched 2026-11-10 | | the name `regUnionNameOfTy` gives the read's storage type (`readStoreTyAt`), a nullable box with no row of its own at its inner union's, a hole at the instance's binding; 0 `runs → not-runs` in 23,826, D4203 closed ([notes](2026-11-10-step7-union-name-of-read.md)) | The by-name walk stays as `unionNameOfHoleRead` for a hole the instance does not bind: group 2. |
