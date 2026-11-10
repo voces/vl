@@ -73,14 +73,19 @@ canonical key reproduces it:
 
 The instance key is canonical-type keyed on five of the six paths, with the elaboration's
 identity beside the type. There, the canonical type is `tyCanonKey` with records taken by row
-class. Measured that way, mono's partition disagrees with the canonical type in three programs:
+class. Measured that way, the shadow key and mono part in three programs, and none of them is a
+disagreement with the ruling:
 
-- **`literal-unions/generic-pin-nullable-string-atom-arg.vl`.** One instance serves the pins
-  `("a"|"b")` and `null|string`. Under the step 7 ruling (one instance per canonical type), these
-  are two instances. That is a bytes change, so it is not made here.
+- **`literal-unions/generic-pin-nullable-string-atom-arg.vl`.** One instance serves the
+  parameter types `("a"|"b")` and `null|string`. The checker binds `T` to `string | null` at both
+  calls of `pair<T>(a: T, b: T)`, and §3.5 identifies an instance by its binding. Mono is right
+  to build one instance. The shadow key reads a type-parameter parameter at its argument's type,
+  not at the binding.
 - **D5001 and `generics/closure-calls-generic-at-enclosing-explicit-type-arg.vl`.** A request
   with no parameter type (`pinOwn` is -1) reuses the `[i32]` instance by its spelling. The
   partition does not disagree here. The type is missing.
+
+So no program builds an instance set that the step 7 ruling would change.
 
 The pin-type column (#6740) is missing a type in 3 programs: `fn-value-generic-nullable-fn-param.vl`,
 `generic-fn-value-at-enclosing-type-param.vl` and `generic-function-to-generic-callback-parameter.vl`.
@@ -177,8 +182,8 @@ wider than the spelling, so it would be a behaviour change.
 4. **Union rows keyed by type (L6)**: `monoListUnionRowName`, `monoPinUnionNameOfTy` and
    `monoPinUnionBoxed`. The 14 member-order merges agree with the ruling (one row per canonical
    type). The 4 Set/map splits are the D4320 question again, which is the union registry's own.
-5. **The ruling's one instance change**: `generic-pin-nullable-string-atom-arg.vl` built at two
-   instances. It is a bytes mover and needs its own PR with a sweep.
+5. **The two missing parameter types** (D5001 and its case twin): the request that reuses an
+   instance by spelling gets its type from the pin-type column first.
 
 ## Proof
 
