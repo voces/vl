@@ -22,7 +22,7 @@ below keep the eight ruled-out rows for their reasons and mark each change.
 **After the hole-rep round** (`2026-11-10-step7-hole-rep-and-kept-row.md`) 29 are probed.
 `cloValueCallRetKind` reads the callee's type, group 8's fact is provided, and `fieldCodeCellKind`
 reads the emitter's storage, so it joins group 1 in `STORAGE_READERS`.
-Then `2026-11-10-step7-hole-rep-read-key.md`: 27. Both callee-read classifiers read one typed key
+Then `2026-11-10-step7-hole-rep-read-key.md`: 2 fewer (26 on master `cc8c522e`'s tree). Both callee-read classifiers read one typed key
 (`readCloSigKey`) and are deleted, so group 2 is closed.
 
 Grouped by the missing fact. Each group says whose fact it is: a CHECKER fact (the checker owns

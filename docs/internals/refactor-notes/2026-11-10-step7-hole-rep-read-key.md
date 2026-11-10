@@ -1,7 +1,8 @@
 # Step 7: a hole binding's covered rep is its producer's key; group 2 closes, 2026-11-10
 
-This round follows `2026-11-10-step7-hole-rep-and-kept-row.md` (#7036). It starts from master
-`c73fe4c5` (29 probed). It takes the two classifiers left in group 2 of
+This round follows `2026-11-10-step7-hole-rep-and-kept-row.md` (#7036). The shadows ran on master
+`c73fe4c5` (29 probed). The census and proof are on the tree merged with `cc8c522e` (28 probed,
+after #7038 typed `exprUnionCall`). It takes the two classifiers left in group 2 of
 `2026-11-09-step7-classifiers-remaining.md`: `calleeRetKindOfRead` and `calleeReturnsStructIdxOfRead`.
 Both decoded the key `calleeCloSigKeyOfRead` resolves for a function-value callee read. Every count
 below is post-mono calls over the 23,818-program sweep population, under `$VL_CLS_CENSUS=1`.
@@ -42,12 +43,13 @@ its capture-frame rung.
 compiled every program that reaches either of them (10,337 files). I compared each against master's
 fixpoint seed: **10,337 of 10,337 give byte-identical wasm**. The 363 differ in the key, but not in
 the result kind or struct slot the two classifiers decode. I graded the final tree again the same
-way: 10,337 of 10,337.
+way: 10,337 of 10,337. Merged with `cc8c522e`, 8,510 files reach the two classifiers, and all 8,510
+are byte-identical against that master's fixpoint seed.
 
 **Switched and deleted.**
 
 * `readCloSigKey` is B. `calleeRetKindOfRead` and `calleeReturnsStructIdxOfRead` are deleted, and
-  their six call sites decode `readCloSigKey`'s key. The declaration ladder is a `_`-less `match`.
+  their five call sites decode `readCloSigKey`'s key (#7038 removed `exprUnionCall`'s). The declaration ladder is a `_`-less `match`.
 * `calleeCloSigKeyOfRead` stands for its other callers (`refListKeptSlotOfCall`, `cloCallSigKey`
   and others), which are not probed.
 
@@ -55,9 +57,10 @@ way: 10,337 of 10,337.
 
 | tree | probed | post-only | pre-only | both | uncalled | warnings |
 | --- | --- | --- | --- | --- | --- | --- |
-| master `c73fe4c5` | 29 | 29 | 0 | 0 | 0 | 0 |
-| this PR | 27 | 27 | 0 | 0 | 0 | 0 |
+| master `cc8c522e` | 28 | 28 | 0 | 0 | 0 | 0 |
+| this PR | 26 | 26 | 0 | 0 | 0 | 0 |
 
-**Proof.** Both sides are fixpoint seeds: two `refresh-compiler.sh` runs, byte-identical. Master
-`c73fe4c5`'s published seed is 6,598,575 bytes, and this PR's is 6,599,189 (+614). Late demands are 6,
+**Proof.** Both sides are fixpoint seeds: two `refresh-compiler.sh` runs, byte-identical. Before the
+merge, master `c73fe4c5` was 6,598,575 bytes and this PR 6,599,189 (+614). Merged with `cc8c522e`,
+master is 6,598,554 and this PR 6,599,168 (+614). Late demands are 6,
 the baseline.
