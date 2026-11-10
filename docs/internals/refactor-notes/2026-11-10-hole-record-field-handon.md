@@ -20,8 +20,9 @@ split mis-parses once there are two fields. The instance key adds the sets field
 (`monoSetPinDiscrim`), and the parameter is typed at the bound record itself
 (`monoMakeInstanceParams`), so the callee's `r.f(x)` reads the set and calls each member
 directly. A record nested in such a record is not spelled, so it pins as before. No function is
-added to emit_mono.vl: the pin-helper budget stays at 918. A field of such a record handed on (`call1(r.f, x)`) takes the set's id rep,
-as an index of a list of them already does (D15612's arm now admits a `Member`).
+added to emit_mono.vl: the pin-helper budget stays at 918. A field of such a record handed on
+(`call1(r.f, x)`) takes the set's id rep, as an index of a list of them already does (D15612's
+arm now admits a `Member`).
 
 **The row.** A literal built under two instances reuses its first row (`sLitIdRow`), but only the
 first instance's record type denoted it, so the second instance's parameter found no row. The
