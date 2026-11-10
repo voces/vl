@@ -89,6 +89,29 @@ non-null variant field, and the consumer then cast a non-null value non-null. Th
   The missing fact is the binding's atom rep (`RepDesc.rdAtom` of `letBindRep`), recorded on the
   name read's store as `litatom` or `nullitatom`.
 
+## The `diamond record depth` cost row
+
+CI's `ci-cost` failed `scaling shape: diamond record depth` at fuel ratio 4.463 against a bar of 4.45.
+The change is not depth-dependent. Measured on a 12-level diamond and its chain (guest fuel):
+
+| compiler | diamond | chain | ratio |
+| --- | --- | --- | --- |
+| master | 74,678,151 | 17,574,420 | 4.25 |
+| this PR, read rep only | 73,614,747 | 16,494,756 | 4.46 |
+| this PR, with the memo below | 71,747,758 | 16,438,485 | 4.36 |
+
+The read rep saves about 1.07 M on both arms, so the chain's smaller fixed cost lifts the ratio.
+The diamond's own excess predates it and grows with depth: 10.5 M at 8 levels, 57.1 M at 12 and
+196 M at 16. A profile at 16 levels put a third of the samples in `boxTyKeeps`
+(check_fit_rules.vl). It renders a union's whole emit name only to test whether the name is empty.
+`tyToEmitName`'s record memo lasts one top-level render, and a 2^n-long spelling is built again
+on every call. `boxTyNamesNothing` remembers the answer for the last type asked. The memo is keyed
+on the compile generation, `T.tys.length`, `tyMutEpoch` and `cUserTypesVer`. At 16 levels it saves
+27.7 M.
+
+Every `tests/cases` program (7,681) compiles to the same module or refusal with the memo as without
+it. The whole `vl_scaling_shape_test.ts` passes (90 of 90). Seed 6,596,653 bytes, fixpoint.
+
 ## Census (`classifier-census.vl`)
 
 | tree | probed | calls |
