@@ -136,7 +136,6 @@ import {
   tyPrimNameOf,
   tySame,
   tyScalarBasePrim,
-  tyToEmitName,
   tyToNominalName,
   tyToStr,
 } from "./check_types"
@@ -1355,6 +1354,9 @@ export function collectFns(stmts: i32[]) {
   fnPosIndexDrop()
   fnParent = []
   fnInstOrigin = []
+  // Mono refills it; until then a shared instance holds the previous program's, which
+  // `fnPosResultUnconsumed` would read at the first `recordedVoidFns`.
+  monoOrigNode = []
   cloLiftCapN = []
   cloLiftedFes = []
   cloLiftWrReset()
@@ -2041,8 +2043,8 @@ export function buildFnMapNoteFnStmtWrite(slot: i32, node: i32) {
 }
 
 // Can this call keep the covered prefix's rows and classify only the suffix and dirty slots?
-// Only an armed call with a prefix banked: mono's own rounds. `buildFnMap#2` is unarmed and
-// re-classifies every row, so no prefix row a resume kept reaches the emitter.
+// Only an armed call with a prefix banked: mono's own rounds. A kept row stands only until
+// `recordedVoidFns#2`, which re-reads every row once mono is done.
 function buildFnMapResumable(): boolean {
   if !fmResumeArmed { return false }
   if fmSeenFns < 0 { return false }
@@ -2173,6 +2175,24 @@ export function buildFnMap(_stmts: i32[]) {
   fnStmts.length
 }
 
+// Append top-level function node `fn` to `fnStmts` and write its `buildFnMap` row as it lands:
+// its name's position, first occurrence winning, and its annotated return columns. A pass after
+// monomorphization mints it, past the last `buildFnMap` run, so the row is written here or never.
+export function fnStmtsAppendTop(fn: i32) {
+  const li = fnStmts.length
+  fnStmts.push(fn)
+  fnParent.push(-1)
+  fnDispNames.push("")
+  const fsid = sidOfNode(fn)
+  if sidArrGet(fnIndexBySid, fsid) < 0 { sidArrPut(fnIndexBySid, fsid, li) }
+  if lfBlockOf(li) >= 0 { sidArrPut(nestedNameBySid, fsid, 1) }
+  const s = nodeAt(fn)
+  if s is FuncDecl && li == fRetKind.length {
+    buildFnMapRowOfRetAnn(li, s.fnRet)
+  }
+  li
+}
+
 // Whether no caller reads the result of the function at position `i`, or of the generic
 // declaration it is an instance of: the checker took that declaration as `: void` (D2631).
 function fnPosResultUnconsumed(i: i32): boolean {
@@ -2195,12 +2215,16 @@ export function recordRetTys() {
   0
 }
 
-// Mark each un-annotated function void that lowers with no result: its recorded result is
-// `void`, it has a bare `return` (D1600), or no caller consumes its result. A recorded value, or
-// an open result no instance closes, lowers with one.
+// Mark each un-annotated function void that lowers with no result: its recorded result is `void`,
+// it has a bare `return` (D1600), or no caller consumes its result; any other lowers with one.
+// After mono each row is first re-read off its declaration, whose rows the shape passes mint past
+// mono, and voidness is decided again.
 export function recordedVoidFns() {
+  const post = emitPhaseReached("monomorphized")
   let i = 0
   while i < fnStmts.length {
+    const af = nodeAt(fnStmts[i])
+    if post && af is FuncDecl { buildFnMapRowOfRetAnn(i, af.fnRet) }
     if fRetVoid[i] == 0 {
       const fn = nodeAt(fnStmts[i])
       if fn is FuncDecl {
@@ -5855,7 +5879,7 @@ function mintUnionFieldObjRow(ix: i32) {
       if objFieldHoldsUnionBox(ft, 0) {
         if tyHasTyVar(lt) { return 0 }
         if structRowOfRecordTy(lt) < 0 || structIndexOfObj(ix) < 0 {
-          internShapeDeepTy(tyToEmitName(lt), lt)
+          internShapeDeepOfTy(lt)
         }
         return 0
       }
