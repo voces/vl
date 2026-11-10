@@ -132,7 +132,6 @@ import {
   nodeTyIsNulLitUnion,
   nodeTyIsNullable,
   nodeTyIsObj,
-  nodeTyIsPureLitUnion,
   nodeTyIsUnion,
   nodeTyIxOf,
   nodeTyMapKeyKind,
@@ -160,7 +159,6 @@ import {
   MAP_KEY_I32,
   MAP_KEY_I64,
   isValueUnionName,
-  mapTwinUnionMember,
   mapTyValIsLitUnion,
   mapTyValIsNulLitUnion,
   mapTyValIsNullUnit,
@@ -572,7 +570,6 @@ import {
   nodeRepIs,
   nodeRepIsAtom,
   nodeRepIsNulAtom,
-  nodeTyIsNulScalarBox,
   repAtomMk,
   repDescNone,
   repOfNode,
@@ -9699,11 +9696,6 @@ export function structIndexOfLet(letIx: i32, fnIx: i32) {
 // declared union (a boxed value). An object literal's intrinsic type is its variant struct,
 // not the union — boxing happens at a flow boundary, so a bare object literal is not this.
 
-// True if function `name` declares the union as its return type.
-function fnRetUnionSid(sid: i32, name: string, fnIx: i32, at: i32) {
-  repOfNameResult(sid, name, fnIx, at).rdKind == "union"
-}
-
 // The type of the operator at `exprIx` inside function `fnIx`: the instance's pin of a recorded
 // hole, else the recorded type (D9701).
 function opTyIn(exprIx: i32, fnIx: i32): i32 {
@@ -9767,7 +9759,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       return exprUnionAs(e, exprIx, fnIx)
     }
     Call => {
-      return exprUnionCall(e, exprIx, fnIx)
+      return exprUnionCall(exprIx, fnIx)
     }
     Ident => {
       return exprUnionIdent(e, exprIx, fnIx)
@@ -9902,62 +9894,10 @@ function exprUnionAs(e: AsExpr, exprIx: i32, fnIx: i32): boolean {
   return false
 }
 
-// True if a call `e` yields the union box: a union-returning named, closure, field or
-// indexed callee, a list `pop`/`get` box, then the checker's recorded type. False for a
-// pure literal union or a one-list union. The call store's `union` answer and `exprUnion`'s
-// Call arm are this one decision.
-function exprUnionCall(e: Call, exprIx: i32, fnIx: i32): boolean {
-  if clsCensusOn { clsCensusEnter("exprUnionCall") }
-  if e.callFn < 0 { return false }
-  const callee = nodeAt(e.callFn)
-  if callee is Ident {
-    if fnRetUnionSid(sidOfNode(e.callFn), callee.identName, fnIx, e.callFn) {
-      return true
-    }
-    // A union-returning function VALUE (a binding / `(…) => A | B` param callee) — its
-    // result is the union box, `>u`.
-    if calleeRetKindOfRead(e.callFn, fnIx) == "union" { return true }
-    // A miss here is not authoritative: a closure rebound from a composed carrier with no
-    // annotation has no sig the syntactic resolution sees, yet its call_ref yields the
-    // union box — fall through to the checker-typed `nodeTyIsUnion` fallback below, so the
-    // binding classifies as the box instead of a raw i32 slot.
-  }
-  // A union-returning FIELD-closure call.
-  if callee is Member {
-    // `xs.pop()` / `xs.get(i)` over a value-union ref list already yields the box, `null`
-    // riding as its tag, so every box-typed destination must pass it through rather than
-    // box it again — the predicate twin of `unionNameOfExpr`'s own arm (D1881).
-    if popUnionBoxElem(popRefRecvSlot(exprIx, fnIx)) { return true }
-    if !callTyClosedIn(exprIx, fnIx) {
-      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "union" }
-    }
-  }
-  // A union-returning INDEXED closure-element call (`xs[i](1)` over a
-  // `((i32) => A | B)[]`): the element signature's result token is the box (`>u`).
-  // The checker net below can miss it (a union WITH null records nullable-shaped),
-  // so the sig-derived kind is consulted like the other `cloArrCallRetKind` arms.
-  if cloArrCallRetKind(exprIx, fnIx) == "union" { return true }
-  // A lambda literal called in place, or a closure a call hands back (`mk()(x)`): its
-  // `$fnsig` result token decides the rep, and a `string | i32 | null` or `K | null` result
-  // is keyed as the box while the checker's nullable type answers no union below (D2567).
-  const ucx = nodeAt(unwrapParen(e.callFn))
-  if ucx is FuncDecl || ucx is Call {
-    if sigKeyRetKind(cloCallSigKey(exprIx, fnIx)) == "union" { return true }
-  }
-  // A PURE-litunion result (`pick(ks)` → `K`) reps as the i32 atom / string ref,
-  // never the box — the checker-typed net must not claim it as a union value.
-  if nodeTyIsPureLitUnion(exprIx) { return false }
-  // A nullable NUMERIC-scalar result (`f32 | null` from a chained value call
-  // `v(1)()`) is the value-union box (`repOfNullable`'s scalar arm) — the checker-typed
-  // net's TyNullable case. The niche nullables (string/boolean/litunion/struct/closure/
-  // list `| null`) are structurally excluded by the classifier.
-  if nodeTyIsNulScalarBox(exprIx) { return true }
-  // A union whose every member spells one list is that list, not a box (D4745).
-  if oneListUnionRender(nodeTyAt(exprIx, fnIx)) != "" { return false }
-  // …and a union of one map and its twins is that map (D15540).
-  if mapTwinUnionMember(nodeTyAt(exprIx, fnIx)) >= 0 { return false }
-  return nodeTyIsUnion(exprIx)
+// True if a call yields the union box: its recorded type's rep is the union kind. The call
+// store's `union` answer and `exprUnion`'s Call arm are this one decision.
+function exprUnionCall(exprIx: i32, fnIx: i32): boolean {
+  nodeRepIs(exprIx, "union", fnIx)
 }
 
 // True if a name read `e` is a union box: a union param, local, capture or global. False
@@ -14984,7 +14924,7 @@ function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
   const ld = repOfNode(rx, fnIx)
   if ld.rdCovered == 1 && vkListClass(ld.rdKind) != 0 { return ld.rdKind }
   if callIsNulNone(e, rx, fnIx) { return "nulnone" }
-  if exprUnionCall(e, rx, fnIx) { return "union" }
+  if exprUnionCall(rx, fnIx) { return "union" }
   ""
 }
 
