@@ -54,8 +54,8 @@ differently.
 ## 3. Switched
 
 `unionNameOfRead` answers a name read with `regUnionNameOfTy` of its storage type. That function
-is `anonUnionFieldName`'s type half, split out in emit_anon_fields.vl. A record, or a nullable
-one, answers "" before anything renders. It does not ask the read rep, so the memo and its cost
+is `anonUnionFieldName`'s type half, split out in emit_anon_fields.vl. A type that is neither a
+union nor a nullable, and a nullable record, answer "" before anything renders. It does not ask the read rep, so the memo and its cost
 are unchanged. A non-name read answers "", as it already did.
 
 The by-name walk stays, renamed `unionNameOfHoleRead` and probed, for a name read whose type keeps
@@ -68,7 +68,7 @@ an inference hole that `holeOperandTyOf` does not bind. Its families:
 
 The box the binding was stored as is the missing fact, which is group 2's.
 
-**Graded on the fixpoint seed** (6,599,781 bytes, +386) against the base seed:
+**Graded on the fixpoint seed** (6,599,824 bytes, +429) against the base seed:
 
 * 23,824 same, 0 `runs → not-runs`, 0 new traps.
 * 1 output mover: D4203 goes from `emit_reject` to runs, correctly. The walk named the template's
@@ -94,6 +94,23 @@ levels:
 
 `vl_scaling_shape_test.ts` passes, 90 of 90.
 
+## The plumb-shape peak RSS row
+
+CI's `ci-cost` failed main peak RSS at 458.6 MB against 318.0 MB, with fuel +2.1%. Nothing is
+retained: `$VL_GC_STATS` reads the same peak live heap after a collection (120,338 KiB on the
+base seed, 119,961 KiB). The unit has no unions, and every `i32` or `i64` name read rendered its
+type's key text (`regUnionNameOfTy`) and threw it away. The garbage between collections grew the
+heap. The gate on a union or a nullable stops the renders. `plumb-shape-cost.vl -- --check`
+under `VL_ISA=x86-64-v3`, with GNU `time`:
+
+| seed | main fuel | main peak RSS |
+| --- | --- | --- |
+| baseline | 8,975,636,030 | 318.0 MB |
+| without the gate | 9,169,428,690 (+2.2%) | 454.0 MB (+42.8%) |
+| this PR | 9,049,572,166 (+0.8%) | 319.4 MB (+0.4%) |
+
+The sweep is unchanged by the gate (23,824 same, 0 `runs → not-runs`).
+
 ## Census (`classifier-census.vl`)
 
 | tree | probed | calls |
@@ -115,7 +132,7 @@ in 877 files. The walk's own askers fall:
 * `lint-self.sh`: clean.
 * `seed-size --check`: +0.2%.
 * `late-demands --check`: 6, the baseline.
-* `plumb-shape-cost --check`: ok.
+* `plumb-shape-cost --check`: ok, RSS graded (above).
 * `cases_wasm` shards 0–3: 7,396 passed.
 * The inventory rows and refs tests pass.
 * `check-filed-witnesses --strict`: 4,683 as filed, 0 output mismatches.
