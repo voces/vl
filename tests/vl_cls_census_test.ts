@@ -61,9 +61,9 @@ Deno.test({
         if (!ok) throw new Error(`want <fn>\\t-1\\t<phase>\\t<n>, got ${row}`);
         names.add(f[0]);
       }
-      if (!names.has("forInVarStructIdx")) {
+      if (!names.has("structIndexOfExpr")) {
         throw new Error(
-          `want a forInVarStructIdx row, got ${[...names].join(", ")}`,
+          `want a structIndexOfExpr row, got ${[...names].join(", ")}`,
         );
       }
     } finally {
