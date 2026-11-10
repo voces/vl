@@ -75,5 +75,6 @@ byte-identical, and the one-level candidate equals the fixpoint.
 * `check-filed-witnesses --strict`: 4,689 as filed, 0 output mismatches.
 
 `vl_cls_census_test.ts` wanted an `exprIsLitAtom` row by name, and every lane that removes a probe
-has had to re-pin it. It now wants every armed row to name a classifier that `emit_classify.vl`
-still probes.
+has had to re-pin it. It now compiles three programs that reach the classifiers still probed. It
+wants every armed row to name one that `emit_classify.vl` probes, and once none is probed it wants
+no row at all, which is step 7's done criterion.
