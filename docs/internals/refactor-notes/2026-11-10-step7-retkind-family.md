@@ -60,6 +60,31 @@ says `nulvariant`.
   - `tyIsPlainStructTy` (`check_types.vl`);
   - ten imports.
 
+## The cost: a rep read builds a descriptor, a flag did not
+
+The first push was red on `plumb-shape-cost`: the main unit's peak RSS was 456.70 MB against
+318.00 MB (+43.6%; the bar is +10%). Fuel was +2.5%. It reproduces on any host with Python's
+`ru_maxrss` standing in for GNU `time`: 314 MB on master, 447 MB on that candidate.
+
+- `vtKindOfType` is `repOfNode(...).rdKind`, and `repOfTy` builds a fresh `RepDesc` (`repMk`)
+  on every call. The old flags were allocation-free predicates.
+- Memoizing `vtKindOfType` per node, as an experiment only, brought the build back to 320 MB.
+  So the per-call descriptor is the whole cost, and no table was growing.
+- The hot callers run once per `return` statement: `returnArmHeapOf`, `retStrWidenOf`,
+  `retFlagsSeedResult` and `retFlagsSeedNiches`. The plumb unit has many returns.
+- A nullable pre-gate on the per-read parameter classifiers (`paramString`, `paramNulMap`,
+  `paramNulRefArray`) moved nothing, so those are not hot.
+
+The fix reads the fact where it was already computed, with no memo:
+
+- The per-return sites read `fnAnnRetKind(fn, fnIx)`: the annotated function's `fRetKind` row,
+  which `buildFnMapRowOfRetAnn` banks off the declared type. It takes an indexed
+  `fnStmtsPosOf` lookup and builds nothing.
+- The chains that asked `vtKindOfType` of one node several times in a row read it once:
+  `fnRetNullBearing`, `annValtypeSlotOf`, the annotated functype arm and `emitNullForRet`.
+
+Main unit: 320.7 MB, +2% on master; the tail unit is 314 MB on master, before and after.
+
 ## What stays, graded
 
 | reader | grade | why |
@@ -80,9 +105,10 @@ says `nulvariant`.
     reader's walk interned a dead signature as a side effect. The program's output is
     unchanged.
 - **L1 = L2:** the master seed and the candidate build byte-identical compilers from this tree.
-- **Seed:** 6,600,459 → 6,599,564 bytes (−895). `seed-size.vl --check` reads +0.2% against its baseline.
+- **Seed:** 6,600,459 → 6,599,583 bytes (−876). `seed-size.vl --check` reads +0.2% against its baseline.
 - **Gates:** all pass.
   - rep-fuzz is exact.
+  - `plumb-shape-cost.vl --check`: main fuel +0.6% and tail fuel −0.5%; peak RSS as measured above.
   - `lint-self.sh` is clean, the kind-ladder budget included.
   - late demands: 6, the baseline.
   - The dead-export budget is 0, after the four stranded exports were deleted.

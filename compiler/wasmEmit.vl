@@ -30553,18 +30553,28 @@ function inferredRetVariantIdx(fnPos: i32): i32 {
   -1
 }
 
+// The rep kind of annotated function `fn`'s declared result (node `fnIx`), as its `buildFnMap`
+// row banked it off the declared type: a return reads it with no descriptor built. "i32" for an
+// un-annotated one, whose result is not this question's.
+function fnAnnRetKind(fn: FuncDecl, fnIx: i32): VKind {
+  if fn.fnRet < 0 { return "i32" }
+  const fp = fnStmtsPosOf(fnIx)
+  if fp >= 0 && fp < fRetKind.length { return fRetKind[fp] }
+  vtKindOfType(fn.fnRet)
+}
+
 // The narrowed-arm unbox's destination heap for a return of function `fn` (at `fnStmts`
 // position `fnPos`, -1 when annotated), annotated or inferred; -1 when the result owes none.
-function returnArmHeapOf(fn: FuncDecl, fnPos: i32): i32 {
+function returnArmHeapOf(fn: FuncDecl, fnIx: i32, fnPos: i32): i32 {
   let retArmHeap = -1
   // A `: Circle | null` result's niche heap.
-  if vtKindOfType(fn.fnRet) == "nulvariant" {
+  if fnAnnRetKind(fn, fnIx) == "nulvariant" {
     const rnvi = nulVariantIndexOf(fn.fnRet)
     retArmHeap = armDestHeapOf("nulvariant", rnvi)
   }
   // The kind-9 twin: a `Dot | null` result over a DECLARED struct that is the arm's layout
   // twin. Same slot shape, same unbox owed, a struct row instead of a variant one.
-  if vtKindOfType(fn.fnRet) == "nulstruct" {
+  if fnAnnRetKind(fn, fnIx) == "nulstruct" {
     retArmHeap = armDestHeapOf(
       "nulstruct",
       annSlotOfKind("nulstruct", fn.fnRet),
@@ -30575,7 +30585,7 @@ function returnArmHeapOf(fn: FuncDecl, fnPos: i32): i32 {
   // slot are the destination, as the parameter's are at the call boundary (D1723).
   if retArmHeap < 0 && fn.fnRet >= 0 {
     retArmHeap = armDestHeapOf(
-      vtKindOfType(fn.fnRet),
+      fnAnnRetKind(fn, fnIx),
       annValtypeSlotOf(fn.fnRet),
     )
   }
@@ -30607,7 +30617,7 @@ function retStrWidenOf(
   // the `string | null` niche return takes the same widen: its slot is the same string
   // ref with null permitted, and a widened member string is non-null, so it subtypes the
   // slot. Asked of the declared type's rep rather than the spelling test above, since the nullable form does not spell `"string"`.
-  if vtKindOfType(fn.fnRet) == "nulstr" {
+  if fnAnnRetKind(fn, fnIx) == "nulstr" {
     if exprIsLitAtom(retArg, fnIx) { retStrWiden = true }
   }
   // an inline literal-union return (`: "circle" | "rect"`) takes the same widen: the
@@ -30791,7 +30801,7 @@ function retFlagsSeedResult(
 ): i32 {
   rf.retInferred = fn.fnRet < 0
   // A concrete-variant return (annotated `: Cat`, or a collapsed inferred lambda).
-  if vtKindOfType(fn.fnRet) == "variant" {
+  if fnAnnRetKind(fn, fnIx) == "variant" {
     rf.retVi = annVariantRowOf(fn.fnRet)
   }
   // Every value an inferred arm return delivers, a join included, goes through
@@ -30830,7 +30840,7 @@ function retFlagsSeedResult(
   // value-union box return, since `emitUnionBoxArg` would `struct.new` the member. A
   // nullable-closure return is the closure niche, not a value box, and takes the plain
   // arm; a nullable literal union is excluded on the same grounds.
-  if vtKindOfType(fn.fnRet) == "union" {
+  if fnAnnRetKind(fn, fnIx) == "union" {
     if (
       !nodeTyIsLitUnionAlias(fn.fnRet)
       && !nodeTyIsNulLitUnion(fn.fnRet)
@@ -30876,7 +30886,7 @@ function retFlagsSeedNiches(
   fnPos: i32,
   rf: RetFlags,
 ) {
-  if vtKindOfType(fn.fnRet) == "nulstr" { rf.retNulString = true }
+  if fnAnnRetKind(fn, fnIx) == "nulstr" { rf.retNulString = true }
   if nodeTyIsLitUnionAlias(fn.fnRet) { rf.retLitUnion = true }
   // A synthesized `: K` (a lambda pinned at its alias) is typed at the alias's copy, which
   // the index test above misses and the provenance-reading one does not (D3120).
@@ -31027,7 +31037,7 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
       )
     }
   }
-  if fn is FuncDecl { retArmHeap = returnArmHeapOf(fn, fnPos) }
+  if fn is FuncDecl { retArmHeap = returnArmHeapOf(fn, fnIx, fnPos) }
   emitReturnValueTail(body, retArg, fnIx, fnPos, retArmHeap)
 }
 
@@ -31414,34 +31424,35 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
   const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return emitFail("emitNullForRet: not a function") }
   const r = fn.fnRet
+  const rk = vtKindOfType(r)
   if tyIsNulBool(r) {
     fbI32Const(2)
     return 0
   }
-  if vtKindOfType(r) == "nulstr" {
+  if rk == "nulstr" {
     fbRefNull(sTy())
     return 0
   }
-  if vtKindOfType(r) == "nulstruct" {
+  if rk == "nulstruct" {
     const rsi = annSlotOfKind("nulstruct", r)
     if rsi >= 0 && rsi < sHeapIdx.length {
       fbRefNull(sHeapIdx[rsi])
       return 0
     }
   }
-  if vtKindOfType(r) == "nulmap" {
+  if rk == "nulmap" {
     fbRefNull(mapTypeIdxOf(mapAnnShape(r))) // the nullable map struct
     return 0
   }
   // A record that is also a union's member is that member's variant struct, nullable.
-  if vtKindOfType(r) == "nulvariant" {
+  if rk == "nulvariant" {
     const nvi = nulVariantIndexOf(r)
     if nvi >= 0 && nvi < uVarRow.length {
       fbRefNull(variantHeap(nvi))
       return 0
     }
   }
-  if vtKindOfType(r) == "nullist" {
+  if rk == "nullist" {
     fbRefNull(lTy())
     return 0
   }
@@ -31457,7 +31468,7 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
   }
   // A nullable ref-array return (`<ref-array> | null`, kind 18): the niche `ref.null $wrapper` over
   // the inner ref-list element wrapper (`tyAnnRefListSlot` strips the `| null` to resolve the slot).
-  if vtKindOfType(r) == "nulreflist" {
+  if rk == "nulreflist" {
     const rls = tyAnnRefListSlot(r)
     if rls >= 0 && rls < rlWrapIdx.length {
       fbRefNull(rlWrapIdx[rls])
@@ -31485,7 +31496,7 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
   // null-tagged box `{ tag: null, payload: ref.null }` — identical to `emitUnionCoerce`'s
   // bare-`null` path.
   let isU = false
-  if vtKindOfType(r) == "union" { isU = true }
+  if rk == "union" { isU = true }
   if r < 0 {
     const inm = inferRetNameOf(inferRetFnKey(fnIx, fn.fnName))
     if (
