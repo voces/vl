@@ -387,14 +387,11 @@ import {
 } from "./emit_fn_ret_kinds"
 import {
   ifElseValueIx,
-  ifIsChainHeadIn,
-  ifJoinIsNulString,
   ifJoinIsScalarPrim,
   ifRepArmValueIx,
   ifThenValueIx,
   joinedRecordRowOf,
   nulArmIfThenValueIx,
-  nulIfArmNullableValueIx,
   spreadElemWidens,
   spreadLitElemIsString,
   spreadLitElemRow,
@@ -467,11 +464,7 @@ import {
   mvValIsMap,
   variantRowInRowOfTy,
 } from "./emit_mv_slots"
-import {
-  globalLetOfSid,
-  ifJoinTypedAtom,
-  variantIndexOf,
-} from "./emit_local_slots"
+import { globalLetOfSid, variantIndexOf } from "./emit_local_slots"
 import {
   annValtypeSlotOf,
   asgValueIsFunc,
@@ -6317,22 +6310,10 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
 // `K|null`-annotated param / local / global, or a call of a `K|null`-returning function. The
 // litunion dual of `exprNulBool`; consulted at the `== null` compare and the `null`-seed boundaries.
 export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("exprNulLitUnion") }
   if exprIx < 0 { return false }
   const e = nodeAt(unwrapParen(exprIx))
   // A cast is the niche exactly when its result reps as one: `k as? K` over an atom or a box.
   if e is AsExpr { return nodeRepIsNulAtom(unwrapParen(exprIx), fnIx) }
-  // …and the same `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
-  const nlIfA = nulIfArmNullableValueIx(exprIx)
-  // A join typed `string | null` is the string niche, whatever its first arm is, at its chain's
-  // head in a function or the module; a link of an `else if` chain keeps its chain's answer (D3303).
-  if (
-    nlIfA >= 0
-    && !(ifJoinIsNulString(unwrapParen(exprIx), fnIx)
-      && ifIsChainHeadIn(unwrapParen(exprIx), fnIx))
-  ) {
-    if exprNulLitUnion(nlIfA, fnIx) { return true }
-  }
   // A value `if` is the niche exactly when its join's type reps as one, whichever arms hold the
   // atom and the `null` (D5770, D14571).
   if e is IfStmt { return nodeRepIsNulAtom(unwrapParen(exprIx), fnIx) }
@@ -6344,24 +6325,9 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       // whose miss reads `-1`: the producer `readStoreOf` names "nullitatom" from, asked alone.
       if idxReadNulLitAtom(e, fnIx) > 0 { return true }
     }
-    // A fused `m[k] ?? d` read over `{[string]: K | null}` yields the niche i32, so
-    // `const t = m[k] ?? d` narrows with `!= null` — the same fused-read home `m.get(k) ?? d` shares.
+    // A `??` is the niche exactly when its join reps as one.
     BinExpr => {
-      if e.binOp == "??" {
-        const nblRecv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
-        if nblRecv >= 0 {
-          if coalMapReadForeignDefault(nblRecv, e.binRight, fnIx) {
-            return false
-          }
-          if mapTyValIsNulLitUnion(mapRecvTyIn(nblRecv, fnIx)) { return true }
-        }
-        // The non-map `p ?? d` over the same niche keeps it `K | null` exactly when the
-        // default can still be null — the consumer half of `emitCoalesce`'s litunion arm.
-        // `coalesceLitUnionFits` makes the same claim the emit arm does, so both decline together.
-        if coalesceLitUnionFits(exprIx, fnIx) {
-          return coalesceDefaultNullable(e.binRight, fnIx)
-        }
-      }
+      if e.binOp == "??" { return nodeRepIsNulAtom(unwrapParen(exprIx), fnIx) }
     }
     // A call whose result the callee hands back as the niche.
     Call => {
@@ -6382,22 +6348,9 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       if nlv >= 0 {
         return bindingIsNulLitUnion(nlv, readDeclOwnerOf(nlv, fnIx))
       }
-      if fnIx >= 0 {
-        const fn = nodeAt(fnIx)
-        if fn is FuncDecl {
-          const params = fn.fnParams
-          let i = 0
-          while i < params.length {
-            const p = nodeAt(params[i])
-            if p is Param {
-              if p.parName == e.identName {
-                return nodeRepIsNulAtom(p.parType, fnIx)
-              }
-            }
-            i = i + 1
-          }
-        }
-      }
+      // A parameter: its annotation's rep.
+      const pt = paramTypeNodeOfRead(fnIx, unwrapParen(exprIx))
+      if pt >= 0 { return nodeRepIsNulAtom(pt, fnIx) }
       return false
     }
     // A `K | null` struct field read (`a.f`, code 30) is the niche i32 with the `-1`
@@ -8020,36 +7973,10 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       // half alone, without the conversions a hot caller need not pay for.
       return readStoreOf(exprIx, fnIx) == "litatom"
     }
+    // A value `if` is an atom exactly when its join reps as one.
     IfStmt => {
-      // A value if-expression joining two atoms yields an atom, since the join rep is the
-      // bare i32 id. A mixed atom/string join is an atom too when the checker recorded a
-      // registered literal union for it, which is the atom rep (`ifJoinTypedAtom`); otherwise it
-      // types `string` and widens at the string-join seam, so it does not classify here.
       if e.ifElse < 0 { return false }
-      if ifJoinTypedAtom(unwrapParen(exprIx), fnIx) { return true }
-      // A join typed `string | null` is the nullable string ref, whatever atoms its arms hold.
-      if nodeRepIs(unwrapParen(exprIx), "nulstr", fnIx) { return false }
-      // A join `emitIfExpr` lowers as a union box is the box, whatever its arms are alone: a
-      // generic's `a ?? 5` pinned at a literal union joins to `K | i32` (D3281).
-      if (
-        exprUnion(exprIx, fnIx)
-        && ifJoinUnionNameIn(unwrapParen(exprIx), fnIx) != ""
-      ) {
-        return false
-      }
-      const tv = ifArmValueExpr(e.ifThen)
-      if tv >= 0 {
-        if exprIsLitAtom(tv, fnIx) {
-          const eb = nodeAt(e.ifElse)
-          // An `else if` chain recurses on the nested IfStmt directly.
-          if eb is IfStmt { return exprIsLitAtom(e.ifElse, fnIx) }
-          if eb is Block {
-            const ev = ifArmValueExpr(e.ifElse)
-            if ev >= 0 { return exprIsLitAtom(ev, fnIx) }
-          }
-        }
-      }
-      return false
+      return nodeRepIsAtom(unwrapParen(exprIx), fnIx)
     }
     Member => {
       // A field read is an atom where its storage is one. `readStoreOf` is `readRepOf`'s store
