@@ -3921,8 +3921,37 @@ let elabMintValueFns: i32[] = []
 
 // Replaces the mint facts with one per call each instance makes through a parameter it binds to
 // a function set: the set, the call's argument types and each member's result there, so the tag
-// decision sees every call an instance makes. The number of facts noted.
+// decision sees every call an instance makes. The number of facts noted. A pass that took a field
+// row fact before a later instance forwarded a hole into its parameter runs again knowing it.
 export function elabMintFacts(): i32 {
+  elabRowFwdKnown = Map()
+  elabRowFwdTaken = []
+  const n = elabMintFactsPass()
+  let late = false
+  let i = 0
+  while i + 1 < elabRowFwdTaken.length {
+    if (
+      mintParamFwdInsOf(elabRowFwdTaken[i], elabRowFwdTaken[i + 1]).length
+      > 0
+    ) {
+      elabRowFwdKnown[i32ToStr(elabRowFwdTaken[i]) + "|" + i32ToStr(elabRowFwdTaken[i + 1])] = true
+      late = true
+    }
+    i = i + 2
+  }
+  elabRowFwdTaken = []
+  if !late { return n }
+  const n2 = elabMintFactsPass()
+  elabRowFwdKnown = Map()
+  n2
+}
+
+// The parameters, as `[decl, index, ...]`, whose field reads took a row fact this pass; and those a
+// hole is forwarded into by some instance of the pass before.
+let elabRowFwdTaken: i32[] = []
+let elabRowFwdKnown: {[string]: boolean} = Map()
+
+function elabMintFactsPass(): i32 {
   mintReset()
   for pe in elabPerEnclDecls.keys() { mintNestedPerEnclNote(pe) }
   elabHandBackMemo = Map()
@@ -9023,9 +9052,11 @@ function elabMintParamRowFactAt(
   const prr = elabParamRowRoot(cf, dn, 0)
   if !elabElemRead(cf, 0) || prr < 0 { return false }
   // A field of a parameter its callers forward a hole into reads the set the forward note gives.
+  const pri = i32ListIndexOf(dn.fnParams, prr)
   if (
     nodeAt(cf) is Member
-    && mintParamFwdInsOf(decl, i32ListIndexOf(dn.fnParams, prr)).length > 0
+    && (mintParamFwdInsOf(decl, pri).length > 0
+      || (elabRowFwdKnown[i32ToStr(decl) + "|" + i32ToStr(pri)] ?? false))
   ) {
     return false
   }
@@ -9046,7 +9077,14 @@ function elabMintParamRowFactAt(
   const rs: i32[] = []
   let split = false
   for d in ds {
-    const r = elabMemberResultAt(d, wp)
+    let r = elabMemberResultAt(d, wp)
+    // A hole function with no instance at these types takes one here, as a lambda does (D15647).
+    if r < 0 && elabHoleFnDecl(d) {
+      const n0 = ekDecl.length
+      elabEnqueueAtParams(d, wp)
+      elabSettle(n0)
+      r = elabMemberResultAt(d, wp)
+    }
     if r < 0 { return false }
     const w = widenLitTy(r)
     if rs.length > 0 && !tySame(w, rs[0]) { split = true }
@@ -9059,6 +9097,26 @@ function elabMintParamRowFactAt(
   elabMintCalls[ix] = at
   elabCallInstSets[i32ToStr(k) + "|" + i32ToStr(ix)] = set
   elabMintSets[ix] = set
+  if nodeAt(cf) is Member {
+    elabRowFwdTaken.push(decl)
+    elabRowFwdTaken.push(pri)
+  }
+  true
+}
+
+// Whether `d` declares a named function whose every parameter is un-annotated and that declares
+// no type parameter: any argument types instance it.
+function elabHoleFnDecl(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnName == "" || f.fnTyParams.length > 0 {
+    return false
+  }
+  if f.fnParams.length == 0 { return false }
+  for pi in f.fnParams {
+    const p = nodeAt(pi)
+    if !(p is Param) || p.parType >= 0 || p.parRest != 0 { return false }
+  }
   true
 }
 

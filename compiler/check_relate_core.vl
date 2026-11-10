@@ -233,6 +233,7 @@ import {
   hdRowOf,
   holeBaseTy,
   holePinHeld,
+  holePinHeldSet,
   mapPinReadTy,
 } from "./check_hole_pins"
 import {
@@ -4507,11 +4508,7 @@ function holeBindAt(
     if ix >= 0 && ix < P.nodes.length {
       const n = nodeAt(ix)
       if n is Call && holeBindCallsHole(n, names, k, owner) {
-        let inst = holeBindCallInst(ix, n, k, names, tys, owner)
-        if inst >= 0 { inst = holeBodyRet(vt, inst) }
-        holeBindSeen = holeBindSeen + 1
-        if inst < 0 || tyHasTyVar(inst) { holeBindOpen = holeBindOpen + 1 }
-        holeBindPush(inst, out)
+        holeBindNoteCall(ix, n, k, names, tys, owner, vt, out)
       } else if n is Call {
         holeBindForward(n, names, tys, k, owner, depth, out)
       }
@@ -4532,14 +4529,23 @@ function holeBindForward(
   depth: i32,
   out: i32[],
 ) {
-  // A hand-on inside a list literal is not followed, so the hole's calls there stay open.
-  for a in n.callArgs {
-    if holeBindArgListsHole(a, names[k], owner) {
-      holeBindSeen = holeBindSeen + 1
-      holeBindOpen = holeBindOpen + 1
-    }
-  }
   let g = cwCalleeDeclOf(n.callFn)
+  // A hand-on inside a literal argument stays open, so the argument stays generic; only the
+  // call's result follows one to the calls of its element or field in the callee (D15645).
+  let aj = 0
+  while aj < n.callArgs.length {
+    const a = n.callArgs[aj]
+    if holeBindArgListsHole(a, names[k], owner) {
+      if (
+        !holeBindFollowLit
+        || !holeBindLitForward(n, aj, g, names, tys, k, owner, depth, out)
+      ) {
+        holeBindSeen = holeBindSeen + 1
+        holeBindOpen = holeBindOpen + 1
+      }
+    }
+    aj = aj + 1
+  }
   if g < 0 {
     // A value joining several functions is each member, at its own holes.
     const ms = elabFnSetOf(nodeTyOf(n.callFn))
@@ -4553,6 +4559,221 @@ function holeBindForward(
     return holeBindSelfForward(n, names, tys, k, owner, depth, out)
   }
   holeBindForwardTo(g, n, names, tys, k, owner, depth, out)
+}
+
+// While set, `holeBindForward` follows a literal hand-on (`holeLitFwdRet`).
+let holeBindFollowLit = false
+
+// While non-negative, the one call through the bound hole whose instance is read; -1 for all.
+let holeBindOnlyCall = -1
+
+// How many literal hand-ons `holeBindLitForward` followed since `holeLitFwdRet` began.
+let holeBindLitFollowed = 0
+
+// Notes call `c` through hole `names[k]`, bound to `vt`, and the instance it takes at its body's
+// result; a call other than `holeBindOnlyCall` is skipped. The nested reads run with the walk's
+// own modes off.
+function holeBindNoteCall(
+  c: i32,
+  n: Call,
+  k: i32,
+  names: string[],
+  tys: i32[],
+  owner: i32,
+  vt: i32,
+  out: i32[],
+) {
+  if holeBindOnlyCall >= 0 && holeBindOnlyCall != c { return 0 }
+  const fl = holeBindFollowLit
+  const oc = holeBindOnlyCall
+  holeBindFollowLit = false
+  holeBindOnlyCall = -1
+  let inst = holeBindCallInst(c, n, k, names, tys, owner)
+  if inst >= 0 { inst = holeBodyRet(vt, inst) }
+  holeBindFollowLit = fl
+  holeBindOnlyCall = oc
+  holeBindSeen = holeBindSeen + 1
+  if inst < 0 || tyHasTyVar(inst) { holeBindOpen = holeBindOpen + 1 }
+  holeBindPush(inst, out)
+}
+
+// The result `retTy` of a call of `calleeFn` binding `vNames` to `vTys` when it is still open
+// because a generic argument is handed on inside a literal: read with each such argument at the
+// one instance every call of it there takes, as the elaboration's dispatch runs it; -1 otherwise.
+export function holeLitFwdRet(
+  vNames: string[],
+  vTys: i32[],
+  retTy: i32,
+  calleeFn: i32,
+): i32 {
+  // A read: it banks no pin, which the elaboration would take for this call's binding.
+  const held = holePinHeldSet(true)
+  const r = holeLitFwdRetHeld(vNames, vTys, retTy, calleeFn)
+  holePinHeldSet(held)
+  r
+}
+
+function holeLitFwdRetHeld(
+  vNames: string[],
+  vTys: i32[],
+  retTy: i32,
+  calleeFn: i32,
+): i32 {
+  const tys: i32[] = []
+  for t in vTys { tys.push(t) }
+  // A result read off one call through the hole takes that call's instance alone.
+  const row = hdRowOf(retTy)
+  holeBindOnlyCall = if row >= 0 && hdKind[row] == HD_RET { hdAlt[row] } else { -1 }
+  holeBindLitFollowed = 0
+  let moved = false
+  let k = 0
+  while k < vNames.length {
+    const vt = tys[k]
+    if tyIsForeignGenericSig(vt) || tyIsHoleGenericSig(vt) {
+      holeBindFollowLit = true
+      const inst = holeBindInstance(vNames, tys, k, vt, calleeFn)
+      holeBindFollowLit = false
+      if inst >= 0 && inst != HOLE_BIND_UNCALLED {
+        tys[k] = inst
+        moved = true
+      }
+    }
+    k = k + 1
+  }
+  holeBindOnlyCall = -1
+  // A result no literal hand-on reaches is the elaboration's to type, as before.
+  if !moved || holeBindLitFollowed == 0 { return -1 }
+  let r = substTyDeep(retTy, vNames, tys)
+  if r < 0 || tyHasTyVar(r) { r = holeRetTyOf(calleeFn, vNames, tys) }
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  r
+}
+
+// Call `n` hands hole `names[k]` on as a direct element or field of literal argument `j` to an
+// un-annotated parameter of declaration `g`: each call in `g`'s body of an element (`r[i](x)`)
+// or of a field holding the hole (`r.f(x)`) takes its instance. False, following nothing, when
+// `g`'s body reads the parameter any other way that could reach the hole.
+function holeBindLitForward(
+  n: Call,
+  j: i32,
+  g: i32,
+  names: string[],
+  tys: i32[],
+  k: i32,
+  owner: i32,
+  depth: i32,
+  out: i32[],
+): boolean {
+  if g < 0 || g >= P.nodes.length || g == owner || depth >= HOLE_CALL_NODE_MAX {
+    return false
+  }
+  const gf = nodeAt(g)
+  if !(gf is FuncDecl) || gf.fnParams.length != n.callArgs.length {
+    return false
+  }
+  const pd = gf.fnParams[j]
+  const gp = nodeAt(pd)
+  if !(gp is Param) || gp.parType >= 0 || gp.parRest != 0 { return false }
+  let lx = parenPeelIx(n.callArgs[j])
+  if lx < 0 || lx >= P.nodes.length { return false }
+  // A `const` list is its initializer, as `holeBindArgListsHole` reads it.
+  if nodeAt(lx) is Ident {
+    const d = identDeclOf(lx)
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(lx) }
+    if !(dn is LetDecl) || dn.letKw != "const" { return false }
+    lx = parenPeelIx(dn.letInit)
+    if lx < 0 || lx >= P.nodes.length || !(nodeAt(lx) is ArrayLit) {
+      return false
+    }
+  }
+  const ln = nodeAt(lx)
+  // The fields holding the hole; none for a list, whose every element may.
+  const flds: string[] = []
+  if ln is ObjLit {
+    for f in ln.objFields {
+      const fv = nodeAt(f)
+      if fv is FieldInit && holeBindArgIsHole(fv.fiValue, names[k], owner) {
+        flds.push(fv.fiName)
+      }
+    }
+    if flds.length == 0 { return false }
+  } else if ln is ArrayLit {
+    let direct = false
+    for e in ln.arrElems {
+      if holeBindArgIsHole(e, names[k], owner) { direct = true }
+    }
+    if !direct { return false }
+  } else {
+    return false
+  }
+  const gNames: string[] = []
+  const gTys: i32[] = []
+  let i = 0
+  while i < gf.fnParams.length {
+    const pi = nodeAt(gf.fnParams[i])
+    if i != j && pi is Param && pi.parType < 0 {
+      const t = holeCallNodeTy(n.callArgs[i], names, tys, owner, depth + 1)
+      if t >= 0 {
+        gNames.push(paramHoleName(gf.fnName, g, i))
+        gTys.push(t)
+      }
+    }
+    i = i + 1
+  }
+  // The hole's value rides a name no parameter has, which only the instance reads.
+  const gk = gNames.length
+  gNames.push("?#litfwd")
+  gTys.push(tys[k])
+  const calls: i32[] = []
+  let refs = 0
+  let quiet = 0
+  const todo: i32[] = [gf.fnBody]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const m = nodeAt(ix)
+      if m is Ident && identDeclOf(ix) == pd { refs = refs + 1 }
+      if m is Member && holeBindNamesParam(m.memObj, pd) {
+        if ln is ObjLit && !strListHas(flds, m.memProp) { quiet = quiet + 1 }
+        if ln is ArrayLit && m.memProp == "length" { quiet = quiet + 1 }
+      }
+      if m is Call && holeBindLitCallee(m.callFn, pd, flds, ln is ArrayLit) {
+        calls.push(ix)
+      }
+      for ch in nodeChildren(ix) { todo.push(ch) }
+    }
+  }
+  if refs != calls.length + quiet { return false }
+  holeBindLitFollowed = holeBindLitFollowed + 1
+  for c in calls {
+    const cn = nodeAt(c)
+    if cn is Call { holeBindNoteCall(c, cn, gk, gNames, gTys, g, tys[k], out) }
+  }
+  true
+}
+
+// Whether `x` is a read of parameter declaration `pd` by name.
+function holeBindNamesParam(x: i32, pd: i32): boolean {
+  const ix = parenPeelIx(x)
+  ix >= 0 && ix < P.nodes.length && nodeAt(ix) is Ident && identDeclOf(ix) == pd
+}
+
+// Whether callee `fx` is an element of parameter `pd` (`r[i]`) when `elem`, else one of its
+// fields `flds` (`r.f`).
+function holeBindLitCallee(
+  fx: i32,
+  pd: i32,
+  flds: string[],
+  elem: boolean,
+): boolean {
+  const ix = parenPeelIx(fx)
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const c = nodeAt(ix)
+  if elem && c is Index { return holeBindNamesParam(c.idxArr, pd) }
+  if !elem && c is Member {
+    return holeBindNamesParam(c.memObj, pd) && strListHas(flds, c.memProp)
+  }
+  false
 }
 
 // `holeBindForward` into declaration `g`, the function call `n` runs.
@@ -6911,17 +7132,51 @@ function holeDirectCallRetAt(
 ): i32 {
   if !directHoleDecl(decl) || holeFnArgDepth >= HOLE_CALL_NODE_MAX { return -1 }
   const ats: i32[] = []
+  let gen = false
   for a in n.callArgs {
-    const at = holeCallNodeTy(a, vNames, vTys, calleeFn, depth + 1)
-    if at < 0 { return -1 }
+    let at = holeCallNodeTy(a, vNames, vTys, calleeFn, depth + 1)
+    // A generic function handed on, bare or as a list's element, stays open; the callee's body
+    // calls it at its own instances.
+    if at < 0 {
+      at = substTyDeep(nodeTyOf(parenPeelIx(a)), vNames, vTys)
+      if !tyIsHoleGenericSig(at) && !tyIsHoleGenericSig(tyArrayElemIx(at)) {
+        return -1
+      }
+      gen = true
+    }
     ats.push(widenLitTy(at))
   }
   holeFnArgDepth = holeFnArgDepth + 1
   const noN: string[] = []
   const noT: i32[] = []
-  const r = holeLamRetAt(decl, mkFuncTy(ats, TY_I32), noN, noT)
+  const r = if gen { holeGenArgRetAt(decl, ats) } else { holeLamRetAt(decl, mkFuncTy(ats, TY_I32), noN, noT) }
   holeFnArgDepth = holeFnArgDepth - 1
   if r >= 0 && !directGenericNumRet(decl, r, r) { return -1 }
+  r
+}
+
+// The result of un-annotated function `decl` read off its body with its parameters bound to
+// `ats`, some of them a generic function's open signature (D15648); -1 when it stays open.
+function holeGenArgRetAt(decl: i32, ats: i32[]): i32 {
+  const lt = nodeTyOf(decl)
+  if lt < 0 || lt >= T.tys.length { return -1 }
+  const lf = tyAt(lt)
+  if (
+    !(lf is TyFunc)
+    || lf.fnParamTypes.length != ats.length
+    || lf.fnRet == TY_VOID
+  ) {
+    return -1
+  }
+  const hN: string[] = []
+  const hT: i32[] = []
+  let k = 0
+  while k < ats.length {
+    bindGenWalk(lf.fnParamTypes[k], ats[k], hN, hT)
+    k = k + 1
+  }
+  const r = holeRetTyOf(decl, hN, hT)
+  if r < 0 || tyHasTyVar(r) { return -1 }
   r
 }
 

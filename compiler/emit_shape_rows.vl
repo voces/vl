@@ -416,19 +416,20 @@ import {
   tyIsArray,
   tyMapHeld,
   tyMapValOf,
+  tyPeelNul,
   tyReachesHole,
   tyStepRet,
 } from "./tyquery"
 
-// The arrow index of the last `nulRefMapValInnerOfTy` call's closure member, paren-peeled, or -1.
-let nrmInnerArrow: i32 = -1
+// Whether the last `nulRefMapValInnerOfTy` call's member is a closure.
+let nrmInnerClosure = false
 
-// The single non-null member of a niche-nullable map value name — `{f: …} | null` yields the
-// struct member, `{[string]: V} | null` the map member — or "" when there is not exactly one
-// non-null member the nullable-value map rep covers, so the slot shares its vals rep with the
-// non-null twin. `ty` is the arena type or -1; no top-level `null` is "". Sets `nrmInnerArrow`.
+// The single non-null member of a niche-nullable map value name (`{f: …} | null` yields the
+// struct member), or "" when there is not exactly one the nullable-value map rep covers, so the
+// slot shares its vals rep with the non-null twin. `ty` is the arena type or -1, and the member's
+// kind is read off its inner; no top-level `null` is "". Sets `nrmInnerClosure`.
 export function nulRefMapValInnerOfTy(valName: string, ty: i32): string {
-  nrmInnerArrow = -1
+  nrmInnerClosure = false
   if !mvValHasNull(valName, ty) { return "" }
   const atoms: string[] = []
   unionArmsOfTy(valName, ty, atoms)
@@ -445,24 +446,22 @@ export function nulRefMapValInnerOfTy(valName: string, ty: i32): string {
   if nonNull != 1 { return "" }
   if inner == "string" { return inner }
   if nameIsBareMap(inner) { return inner }
-  // A closure member keeps its grouping parens, so the arrow sits at paren depth 1: the fat
-  // pointer rides the same `(ref null $cloStruct)` vals element a non-null closure uses. A
-  // top-level arrow on the raw member would be a function returning a nullable, which
-  // `splitUnionAtoms` never produces.
-  const iarrow = annArrowAt(peelGroupParens(inner))
-  if iarrow >= 0 {
-    nrmInnerArrow = iarrow
+  // A closure member's fat pointer rides the same `(ref null $cloStruct)` vals element a
+  // non-null closure uses.
+  const innerTy = tyPeelNul(ty)
+  if tyIsFuncArena(innerTy) {
+    nrmInnerClosure = true
     return inner
   }
   // A list member rides the same vals rep its non-null twin does, since a ref-valued map's
   // vals element is `(ref null <elem>)` for every value kind — the wrapper element, not the
   // element struct's. Answered above the struct probe: `structIndexOfTypeNameTy`'s field-name
   // parse ignores a trailing `[]`, so `{f: f64}[]` would match the element struct.
-  if nameIsArray(inner) {
+  if tyIsArray(innerTy) {
     // `u8[]` names itself here, ahead of the shared scalar-list classifier and for D1008's
     // reason, so the niche admits exactly the element reps its non-null twin does.
     if scalarListRepOfName(inner) != null { return inner }
-    if nameIsRefArray(inner) { return inner }
+    if tyIsRefArray(innerTy) { return inner }
     return ""
   }
   if structRowOfNameTy(inner, ty) >= 0 { return inner }
@@ -673,7 +672,8 @@ export function mvValKindOfName(valName: string): i32 {
 
 // `mvValKindOfName` for a caller that also holds the value's arena type `ty`, or -1. A record,
 // map, list, function or primitive type answers whether the value admits `null` without the
-// spelling being split; any other type, or -1, asks the spelling.
+// spelling being split. Whether it is a literal union, a ref list or a function is asked of
+// `ty` only, and -1 is none of them.
 export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
   if ty >= 0 && fnTagTyIsTagged(ty) { return MVK_MONO }
   // A list of a tagged set's ids, at any depth, is the i32 list wrapper it is stored as.
@@ -684,7 +684,7 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
   // A literal-union atom value, one quoted literal being its one-member set (D7451): each value
   // is the interned atom code, a plain i32, so the map is the mono i32 map. Checked before the
   // union arm, whose member count would otherwise claim the alias and box the values.
-  if nameIsLitUnionType(valName) || nameIsOneStrLit(valName) { return MVK_MONO }
+  if tyIsLitUnionOrLit(ty) { return MVK_MONO }
   // A nullable-atom value that reps as a plain i32 niche with no box — a nullable litunion
   // (atom ids, `-1` for null) or a nullable boolean (0/1, `2` for null). Each value is an i32
   // with a spare sentinel, so the map is the mono i32 map. Checked before the union arm, whose
@@ -696,7 +696,7 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
   // falls to the union arm. The remainder is a list element the kind-6 pair does not name.
   if mvValHasNull(valName, ty) {
     const nin = nulRefMapValInnerOfTy(valName, ty)
-    const nca = nrmInnerArrow
+    const nca = nrmInnerClosure
     if nin != "" {
       if nin == "string" { return MVK_STR }
       if nameIsMap(nin) { return MVK_REF }
@@ -704,7 +704,7 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
       // `(ref null $cloStruct)` fat-pointer, so the niche rides the non-null closure rep. A
       // litunion result stays a loud reject — the read stays nullable, so the call needs a
       // narrowed spelling the checker does not accept for this value shape.
-      if nca >= 0 {
+      if nca {
         // The closure's result is read off the arena type, never its cut spelling.
         if tyIsLitUnion(tyStepRet(tyNulFuncInner(ty))) {
           return MVK_UNSUPPORTED
@@ -716,7 +716,7 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
       // predicates are this ladder's kind-6 set, and they must admit the same element reps as
       // the non-null arm — `u8[]` names itself in both, or the pair splits.
       if scalarListRepOfName(nin) != null { return MVK_REF }
-      if nameIsRefArray(nin) { return MVK_REF }
+      if tyIsRefArray(tyPeelNul(ty)) { return MVK_REF }
       return MVK_STRUCT
     }
     const nulAtoms: string[] = []
@@ -775,11 +775,11 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
     // element heap and the store-coerce. A map member boxes exactly as it does in binding
     // position, and `markMapUnionArms` interns the arm's mv slot so tag and read agree.
     kind = MVK_UNION
-  } else if annArrowAt(valName) >= 0 {
-    // A function-valued map: each value is a closure fat-pointer stored in a ref list whose
-    // element kind is 5, the same rep an `((i32) => i32)[]` array uses. A litunion result
-    // rides it too — the call's `$fnsig` keys the i32 atom and the atom widens at the print
-    // seam, since `exprString` gates its `>S` claim on the call node's litunion-alias type.
+  } else if tyIsFuncArena(ty) && tyEmitNameNonEmpty(ty) != 0 {
+    // A function-valued map: each value is a closure fat-pointer in a kind-5 ref list, the rep
+    // an `((i32) => i32)[]` array uses; a litunion result rides it too (`exprString` widens the
+    // atom at the print seam). A function type with no emitter name, a hole or generic
+    // function, is not one yet: its slot is minted once a pin names it.
     kind = MVK_CLOSURE
   } else {
     if structRowOfNameTy(valName, ty) >= 0 { kind = MVK_STRUCT }
@@ -1194,7 +1194,7 @@ export function uFieldTgtStructIdx(vi: i32, fi: i32): i32 {
 
 // Restarts the walk depths at compile start.
 export function shapeRowsReset() {
-  nrmInnerArrow = -1
+  nrmInnerClosure = false
   rasDepth = 0
   0
 }
@@ -1632,8 +1632,8 @@ export function mvValNamesCompat(
   const ke = mvValKindOfNameTy(ve, veTy)
   if ka == MVK_UNSUPPORTED || ke == MVK_UNSUPPORTED { return true }
   if ka != ke {
-    if ka == MVK_STR && ke == MVK_MONO && nameIsLitUnionType(ve) { return true }
-    if ke == MVK_STR && ka == MVK_MONO && nameIsLitUnionType(va) { return true }
+    if ka == MVK_STR && ke == MVK_MONO && tyIsLitUnion(veTy) { return true }
+    if ke == MVK_STR && ka == MVK_MONO && tyIsLitUnion(vaTy) { return true }
     return false
   }
   const sa = mvSlotOfMapValNameOrMonoKTys(va, MAP_KEY_STR, -1, vaTy)
