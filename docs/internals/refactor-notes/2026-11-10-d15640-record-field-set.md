@@ -1,7 +1,7 @@
 # D15640: a named function in a record field keeps its set, 2026-11-10
 
 This builds the DECISIONS.md ruling "A named function in a record field is a set id, as in a list"
-for the shape D15640 names. Base is master `62b80f09`. Matrix template:
+for the shape D15640 names. Base is master `5502fc80`. Matrix template:
 `scripts/capability-probes/matrix/record-field-named-function.matrix.vl`.
 
 ## What changed
@@ -32,7 +32,7 @@ The previous lane's WIP kept the set whenever some call handed the field a hole 
 combination grid exposed losses that its 175-program script did not. The grid has 1,620 programs:
 three callee shapes × three `both` shapes × three record values × five binding positions × two
 argument types × three `both` arguments × two orders. Each run below is compared with master
-`62b80f09`:
+`62b80f09`. Against `5502fc80` the shipped row is unchanged:
 
 | candidate | runs → not-runs | → invalid wasm | not-runs → runs |
 | --- | --- | --- | --- |
@@ -42,15 +42,14 @@ argument types × three `both` arguments × two orders. Each run below is compar
 | plus "the hole's function calls it" (shipped) | 0 | 0 | 144 |
 
 The residue is now refused with the old honest message. That covers a hole handed two different
-functions (filed as D15648) and the matrix's annotated face.
+functions (filed as D15650) and the matrix's annotated face.
 
 ## Proof
 
-- **Seed:** 6,608,090 bytes, +0.3% on the baseline. Two refreshes are byte-identical.
+- **Seed:** 6,611,488 bytes, +0.3% on the baseline. Two refreshes are byte-identical.
 - **Matrix:** 22 of 48 run (master 3); 0 runs → not-runs; 0 silent.
-- **`check-filed-witnesses --strict`:** D15640 moved emit_reject → runs. D15639, D15643 and D15644
-  are unchanged as filed. D15645, D15646 and D15647 are unchanged as filed: silent invalid wasm,
-  not reached by this change.
+- **`check-filed-witnesses --strict`:** D15640 moved emit_reject → runs. D15639, D15643, D15644,
+  D15645, D15646, D15647 and D15650 are unchanged as filed.
 - **Distilled `regress.vl`:** no cell changed class.
 - **Also green:** rep-fuzz (exact), lint-self, seed-size, late-demands (6), the dead-export,
   render-parse and pin-helper budgets, the inventory tests, probe-rollback, scaling-shape and
