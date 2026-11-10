@@ -62,6 +62,7 @@ type mono should choose, so it stays a rep record.
 | ~~`calleeReturnsStructIdxOfRead`~~ | deleted 2026-11-10 | | the same key's struct slot | — |
 | `fieldCodeCellKind` | 847 (438) | 1: `readCellKind` | none needed | It answers only where the field's recorded storage type is a hole or `nulnone`, from the code `sFieldTypes` holds for the row. The code is written at mint and rewritten in place, so a copied column would go stale. It reads the emitter's storage: **group 1**, in `STORAGE_READERS` since 2026-11-10. |
 | ~~`cloValueCallRetKind`~~ | switched 2026-11-10 | | the callee's type is a function, a field stored as a closure; 38,859 / 189, wasm byte-identical in 23,816 of 23,816 | — |
+| `unionNameOfHoleRead` | 72,498 (877) | 1: `unionNameOfRead` | none | A name read whose type keeps a hole the instance does not bind: `const x = a.h` in an un-annotated parameter's instance boxes at the instance's join (D15628), `m.get("b")` over a map of hole functions at `i32 \| null`. The box the binding was stored as is the fact. Split out of `unionNameOfRead` 2026-11-10. |
 
 ## 3. Function-value list rows (8)
 
@@ -125,7 +126,7 @@ is the largest group by calls (5.3 M).
 | `exprNulLitUnion` | 1,221,687 (15,527) | 14: `exprIsLitAtom` 906,466, `letSpellsNulAtom` 165,378, `emitAssignIdent` 107,891 | `nodeRepIsNulAtom`, 1,220,010 / 916 (r20) | The same. |
 | `nulVariantIdxOfExpr` | 955,480 (18,406) | 17: `memRecvNulVariantIndex` 563,204, `exprNullableVariant` 134,001, `armFieldUnionName` 122,421 | the `nulvariant` rep's slot, 956,025 / 1,978 (r21) | `rdSlot` in the variant table's numbering. |
 | `exprIsNulNone` | 658,605 (18,483) | 11: `emitExpr` 172,070, `retNullIntoNonNullRef` 152,813, `nulNoneEqSides` 148,081 | `nodeRepIs nulnone`, 973,949 / 23,562 (r20) | The read's rep. Its `Ident`/`Member`/`Index`/`Call` arm already asks `readRepOf`, and the rest is the `if` and `??` joins. |
-| `unionNameOfRead` | 647,780 (11,790) | 18: `mapReadMvSlot` 316,254, `emitAssignIdent` 108,349, `unionNameOfExpr` 99,444 | none (its asker `unionIdentReadKind` was typed in r24, finding 77 legacy errors) | A union read's registered name: a by-name walk of parameters, `let`s and globals (D2316, D2325). The read's cell (`identStoreClaimed`) names the box. The union's registered name is the rep fact. |
+| ~~`unionNameOfRead`~~ | switched 2026-11-10 | | the name `regUnionNameOfTy` gives the read's storage type (`readStoreTyAt`), a nullable box with no row of its own at its inner union's, a hole at the instance's binding; 0 `runs → not-runs` in 23,826, D4203 closed ([notes](2026-11-10-step7-union-name-of-read.md)) | The by-name walk stays as `unionNameOfHoleRead` for a hole the instance does not bind: group 2. |
 | `mapReadMvSlot` | 492,182 (12,779) | 14: `mapReadNarrowableSlot` 156,405, `exprString` 47,984, `coalesceMvSlot` 46,934 | the `map`/`nulmap` rep's slot, 462,068 / 39,941 (r21) | `rdSlot` in the mv table's numbering. |
 
 ## 7. Layout twins and named rows (2)
