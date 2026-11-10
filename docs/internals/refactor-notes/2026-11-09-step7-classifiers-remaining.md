@@ -19,6 +19,10 @@ below keep the eight ruled-out rows for their reasons and mark each change.
   shadowed a post-mono twin. Every count is calls, not programs. A twin's count is from its own
   round's tree, so it can exceed today's calls (`exprIsNulNone`).
 
+**After the hole-rep round** (`2026-11-10-step7-hole-rep-and-kept-row.md`) 29 are probed.
+`cloValueCallRetKind` reads the callee's type, group 8's fact is provided, and `fieldCodeCellKind`
+reads the emitter's storage, so it joins group 1 in `STORAGE_READERS`.
+
 Grouped by the missing fact. Each group says whose fact it is: a CHECKER fact (the checker owns
 types) or an EMITTER rep fact (the emitter reconciles reps).
 
@@ -52,10 +56,10 @@ type mono should choose, so it stays a rep record.
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `calleeRetKindOfRead` | 223,633 (9,862) | 4: `exprUnionCall` 132,861, `calleeReturnsStringOfRead` 49,593, `callIsNulNone` 24,901 | the read's `$fnsig` key's result, 215,301 / 7,234 (r21) | The callee read's sig key where its type is a hole or an alias. |
-| `cloValueCallRetKind` | 39,035 (3,884) | 2: `callIsNulNone` 22,704, `mapShapeOfExpr` 16,331 | `Member` arm typed as a function, 19,989 / 788 (r23) | 685 are hole or generic function fields (D6342), the rest operator fields (`.[]`, `.+`) whose minted callee has no function type. Neither caller's answer moves. |
-| `calleeReturnsStructIdxOfRead` | 34,723 (1,789) | 1: `structIndexOfCallExpr` | the read's sig key's struct slot, 34,506 / 20 (r21) | Same as `calleeRetKindOfRead`. |
-| `fieldCodeCellKind` | 847 (438) | 1: `readCellKind` | the read's type's rep through `nulNicheOrNull`, 828 / 18 (r25) | The covered rep of a hole field: an empty-list-or-null join (D6271), a record field holding a generic application. |
+| `calleeRetKindOfRead` | 223,664 (9,866) | 4: `exprUnionCall` 132,861, `calleeReturnsStringOfRead` 49,593, `callIsNulNone` 24,901 | the read's type at the instance, its `$fnsig` key's result, 216,222 / 7,442 (2026-11-10) | 6,722 of the 7,442 are the binding's producer lambda, keyed where its signature is interned (`cloSigKeyExt`). The read's type is a hole function (5,470), no function (675) or a function over a type variable (576). Record that key per binding declaration there. |
+| `calleeReturnsStructIdxOfRead` | 34,723 (1,789) | 1: `structIndexOfCallExpr` | the same key's struct slot, 34,739 / 20 (2026-11-10) | Same as `calleeRetKindOfRead`. |
+| `fieldCodeCellKind` | 847 (438) | 1: `readCellKind` | none needed | It answers only where the field's recorded storage type is a hole or `nulnone`, from the code `sFieldTypes` holds for the row. The code is written at mint and rewritten in place, so a copied column would go stale. It reads the emitter's storage: **group 1**, in `STORAGE_READERS` since 2026-11-10. |
+| ~~`cloValueCallRetKind`~~ | switched 2026-11-10 | | the callee's type is a function, a field stored as a closure; 38,859 / 189, wasm byte-identical in 23,816 of 23,816 | — |
 
 ## 3. Function-value list rows (8)
 
@@ -141,12 +145,13 @@ declaration is lowered, and both classifiers still disagree on facts of other gr
 ## 8. A rep rule's row that the type does not key (1)
 
 `keep([mkcall()])` takes `Circle`'s rep (`recListRetTakesRep`) while its type is the call's own
-`{ r: null }` (D14813). **An EMITTER rep fact**: the kept delivery's row per binding, recorded where
-the rep rule fires, so `listRowOfExpr` reads it.
+`{ r: null }` (D14813). **Provided 2026-11-10**: the row is the callee instance's declared result
+type, so `listRowOfExpr` reads it for a named call whose own type keys no row (`callRetListRow`).
+The binding's `letRefListSlot` rung answers, and `letTailRowSlot`'s calls fall 8,996 → 8,782.
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `letTailRowSlot` | 8,251 (615) | 1: `letRefListSlot` | the initializer's rep row, else its type's, else the element's, 8,178 / 341 (r24) | 304 in `record-call-list-handed-back-by-generic-runs.vl` and D14813. |
+| `letTailRowSlot` | 8,782 (613) | 1: `letRefListSlot` | the initializer's rep row, else the literal's, else the element's, 7,941 / 5 (2026-11-10) | The 5 are 4 lists of function values (`[id]`, `[[inc0]]`, `fs: [inc0]`): group 3. It follows `refListSlotOfExpr` now. |
 
 ## 9. A call's result at its callee's published join (1)
 
@@ -184,13 +189,13 @@ build row, 14,881 / 0). The four left:
 | missing fact | owner | classifiers | calls | touches |
 | --- | --- | --- | --- | --- |
 | none: the emitter's own storage (`NOT_BLIND` since r27) | emitter (provided) | 8 → 0 | 1.83 M | D842, D219, D4636, D26, D1788, D6342 |
-| covered rep of a hole | emitter | 4 | 0.30 M | D6271, D6342 |
+| covered rep of a hole (a binding's producer key) | emitter | 2 (+1 switched, +1 to group 1) | 0.26 M | D6271, D6342 |
 | function-value list rows | emitter, lane w254 | 8 | 0.41 M | D15561, D12301, D12215, D6914 |
 | closure bundle, `fRet*` columns | emitter, lane w168 | 3 | 0.98 M | D15142, D15146 |
 | generic instance key | checker | 2 | 0.24 M | D9130, D3868 |
 | read rep in the table's numbering | emitter | 6 | 5.22 M | D2316, D2325 |
 | named intersection row | emitter, keyed at the declaration (2026-11-10) | 2 | 3.72 M | `struct-alias-transparent.vl`, D14162 |
-| rep-rule row (`recListRetTakesRep`) | emitter | 1 | 0.01 M | D14813 |
+| rep-rule row (`recListRetTakesRep`) | emitter (provided) | 1, now group 3's residual | 0.01 M | D14813 |
 | callee's published join | checker | 1 | 0.17 M | (the two r21 witnesses) |
 | list-literal classifiers (r27: 2 switched) | emitter, partly lane w254 | 6 → 4 | 0.19 M | tagged id lists |
 | follows the others | — | 1 | 0.02 M | none |
