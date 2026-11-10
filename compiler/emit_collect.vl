@@ -588,8 +588,11 @@ import {
   sScanLim,
   sioMemoReset,
   structFieldNameIxReset,
+  structIndexOfTy,
   structNameIxReset,
+  structTyIxAlias,
   structTyIxReset,
+  structTyMarkAliasable,
 } from "./emit_atom_kinds"
 import { nodeTyAt } from "./emit_capture_frames"
 import {
@@ -666,7 +669,7 @@ import {
   leqCoreKindOfAtomKind,
   nulFieldInnerCode,
 } from "./emit_eq_rows"
-import { nameIsWholeSpanShape } from "./emit_field_codes"
+import { fieldCodeOfTy, nameIsWholeSpanShape } from "./emit_field_codes"
 import { fieldStoreTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import { cloSigPosOfKey } from "./emit_fn_ret_kinds"
 import {
@@ -6132,12 +6135,22 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
       internShapeDeepOfTy(lr)
       return 0
     }
+    // Another literal's row already denoting the instance's record type is this one's too.
+    const known = if lr >= 0 && lr < T.tys.length && tyAt(lr) is TyObj { structIndexOfTy(lr) } else { -1 }
+    if !sLitIdRow.has(objIx) && known >= 0 { sLitIdRow.set(objIx, known) }
     if !sLitIdRow.has(objIx) {
       const pr = sLitMintRow.get(objIx) ?? -1
       const pf = sLitMintFn.get(objIx) ?? -1
       const before = sNames.length
       anonMintRowFor(objIx, fnIx)
-      if sNames.length > before { sLitIdRow.set(objIx, sNames.length - 1) }
+      if sNames.length > before {
+        sLitIdRow.set(objIx, sNames.length - 1)
+        // The instance's record type denotes that row, which a binding of its call reads.
+        if lr >= 0 && lr < T.tys.length && tyAt(lr) is TyObj {
+          structTyMarkAliasable(lr)
+          structTyIxAlias(lr, sNames.length - 1)
+        }
+      }
       // Instances holding no id keep the literal's own mint (-1 for none).
       sLitMintRow.set(objIx, pr)
       sLitMintFn.set(objIx, pf)
@@ -6408,6 +6421,14 @@ function anonEmptyListElemIsObj(ty: i32): boolean {
 }
 
 // Mint one anonymous struct row for the object literal at `objIx`. The body of
+// The field code of value `v` at instance `fnIx`'s primitive type for it, or -1.
+function anonInstPrimCode(v: i32, fnIx: i32): i32 {
+  const t = elabNodeTyAt(v, fnIx)
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyPrim) { return -1 }
+  const c = fieldCodeOfTy(t)
+  if c < 0 { -1 } else { c }
+}
+
 // `collectAnonShapes`' main loop, extracted so the pre-mint pass mints a row the same
 // way rather than through a second copy of it — two mints that disagree would put two
 // different layouts under one `#anonN` key.
@@ -6434,6 +6455,8 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         ) {
           code = FC_I32
         }
+        // So does one at the template's type parameter, at the instance's primitive (D15554).
+        if code < 0 && fnIx >= 0 { code = anonInstPrimCode(f.fiValue, fnIx) }
         if code == FC_MAP && !anonMapFieldDestAdmits(ai, f.fiName) { code = -1 }
         if code < 0 { ok = false }
         codes.push(code)
