@@ -1,7 +1,7 @@
 # Step 7: `preIndexMintTrees` deleted; a `Map()`/`Set()` slot mints from the checker's record (2026-11-10)
 
-Base: master after #7061, at seed 6,601,740. Both seeds are fixpoints (two self-compiles,
-byte-identical). The population is the sweep's 23,832 programs.
+Measured on #7061's tree (seed 6,601,740) and re-proved after merging master `bcf337c7` with #7061
+(seed 6,601,341, a fixpoint). Both seeds are fixpoints (two self-compiles, byte-identical). The population is the sweep's 23,832 programs.
 
 ## What changed
 
