@@ -84,11 +84,13 @@ and `sigDeclRecSlotOfTy`.
 | tree | probed | calls |
 | --- | --- | --- |
 | base `775f38bf` | 19 | 5,161,421 (`structIndexOfExpr` 1,221,630) |
-| this PR | 18 | 4,024,626 |
+| this PR on `775f38bf` | 18 | 4,024,626 |
+| master `797c12b5` (#7067) | 18 | 3,905,183 (`structIndexOfExpr` 1,188,071) |
+| this PR merged with `797c12b5` | 17 | 2,801,945 |
 
-The remaining classifiers rise by 84,835 calls between them. The storage readers ask
-`refListSlotOfExpr` (+35,826), `refListKeptSlotOfExpr` (+9,884) and `mapReadMvSlot` (+38,843)
-first. `refListElemNameOfExprRaw` falls from 7,281 to 3.
+On `775f38bf` the remaining classifiers rise by 84,835 calls between them. The storage readers
+ask `refListSlotOfExpr` (+35,826), `refListKeptSlotOfExpr` (+9,884) and `mapReadMvSlot`
+(+38,843) first. `refListElemNameOfExprRaw` falls from 7,281 to 3.
 
 ## Leads for the queue
 
@@ -114,3 +116,5 @@ first. `refListElemNameOfExprRaw` falls from 7,281 to 3.
 | `cases_wasm` shards 0–3 | | 7,402 passed, 0 failed |
 | inventory refs/rows, `vl_cls_census`, `vl_scaling_shape` | | 99 passed |
 | `lint-self.sh` | | clean |
+| merged with master `797c12b5`: fixpoint seed | 6,601,425 | 6,600,742 (−683) |
+| merged: sweep, 23,837 programs | | 23,837 same bytes |
