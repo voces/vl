@@ -61,10 +61,21 @@ Deno.test({
         if (!ok) throw new Error(`want <fn>\\t-1\\t<phase>\\t<n>, got ${row}`);
         names.add(f[0]);
       }
-      if (!names.has("exprIsLitAtom")) {
-        throw new Error(
-          `want an exprIsLitAtom row, got ${[...names].join(", ")}`,
-        );
+      // Every row names a classifier `emit_classify.vl` carries a probe for.
+      const src = await Deno.readTextFile(
+        `${ROOT}/compiler/emit_classify.vl`,
+      );
+      const probed = new Set(
+        [...src.matchAll(/clsCensusEnter\("([^"]+)"\)/g)].map((m) => m[1]),
+      );
+      for (const n of names) {
+        if (!probed.has(n)) {
+          throw new Error(
+            `want a probed classifier, got ${n} (probed: ${
+              [...probed].join(", ")
+            })`,
+          );
+        }
       }
     } finally {
       await Deno.remove(dir, { recursive: true });

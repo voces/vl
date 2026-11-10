@@ -64,3 +64,16 @@ default". With it, both print their `@log`.
 byte-identical, and the one-level candidate equals the fixpoint.
 
 * Sweep against the base's fixpoint: 23,842 same, 0 movers.
+* `rep-fuzz-check.sh`: exact.
+* `lint-self.sh`: clean.
+* `seed-size --check`: +0.2%.
+* `late-demands --check`: 6, the baseline.
+* The dead-export budget: 0, the baseline.
+* `cases_wasm` shards 0–3: 7,405 passed.
+* The inventory rows and refs tests, `vl_scaling_shape_test.ts`, `vl_cls_census_test.ts` and
+  `vl_probe_rollback_test.ts`: 106 passed.
+* `check-filed-witnesses --strict`: 4,689 as filed, 0 output mismatches.
+
+`vl_cls_census_test.ts` wanted an `exprIsLitAtom` row by name, and every lane that removes a probe
+has had to re-pin it. It now wants every armed row to name a classifier that `emit_classify.vl`
+still probes.
