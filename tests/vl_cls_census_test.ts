@@ -21,19 +21,27 @@ const PHASES = [
   "capsCached",
   "arenaFinal",
 ];
-const PROGRAM =
-  "type P = { q: i32 }\nfunction mk(n: i32): P[] { return [{ q: n }] }\nfor p in mk(3) { print(p.q) }\n";
+// Programs that reach the classifiers still probed: a struct list's literal, a generic's record
+// holding a hole-function list, a filled nullable-string list. Once no classifier is probed, the
+// armed census must print no row (step 7's classifier half is done).
+const PROGRAMS = [
+  "type P = { q: i32 }\nfunction mk(n: i32): P[] { return [{ q: n }] }\nfor p in mk(3) { print(p.q) }\n",
+  "function inc0(a) { return a + 1 }\nfunction mk<T>(x: T) { return { fs: [inc0], x: x } }\nconst rs = [mk(1), mk(2)]\nprint(rs[1].fs[0](rs[0].x))\n",
+  'import { filled } from "std:array"\nconst flags = filled<string | null>(2, null)\nprint(flags.length)\n',
+];
 
 Deno.test({
   name:
-    "cls-census: armed rows name a classifier, a site and a phase; unarmed none",
+    "cls-census: armed rows name a probed classifier, a site and a phase; unarmed none; none once nothing is probed",
   ignore: !ENABLED,
   fn: async () => {
+    const src = await Deno.readTextFile(`${ROOT}/compiler/emit_classify.vl`);
+    const probed = new Set(
+      [...src.matchAll(/clsCensusEnter\("([^"]+)"\)/g)].map((m) => m[1]),
+    );
     const dir = await Deno.makeTempDir({ prefix: "vl_cls_census_" });
     try {
-      const file = `${dir}/p.vl`;
-      await Deno.writeTextFile(file, PROGRAM);
-      const check = async (armed: boolean): Promise<string[]> => {
+      const check = async (file: string, armed: boolean): Promise<string[]> => {
         const env: Record<string, string> = { NO_COLOR: "1" };
         if (armed) env.VL_CLS_CENSUS = "1";
         const { code, stderr } = await new Deno.Command(VL, {
@@ -47,24 +55,43 @@ Deno.test({
         if (code !== 0) throw new Error(`want exit 0, got ${code}:\n${err}`);
         return err.split("\n").filter((l) => l.startsWith("[cls] "));
       };
-      const off = await check(false);
-      if (off.length !== 0) {
-        throw new Error(`unarmed: want no rows, got ${off.length}: ${off[0]}`);
+      const on: string[] = [];
+      for (let i = 0; i < PROGRAMS.length; i++) {
+        const file = `${dir}/p${i}.vl`;
+        await Deno.writeTextFile(file, PROGRAMS[i]);
+        const off = await check(file, false);
+        if (off.length !== 0) {
+          throw new Error(
+            `unarmed: want no rows, got ${off.length}: ${off[0]}`,
+          );
+        }
+        on.push(...await check(file, true));
       }
-      const on = await check(true);
-      if (on.length === 0) throw new Error("armed: want rows, got none");
-      const names = new Set<string>();
+      if (probed.size === 0) {
+        if (on.length !== 0) {
+          throw new Error(
+            `nothing probed: want no rows, got ${on.length}: ${on[0]}`,
+          );
+        }
+        return;
+      }
+      if (on.length === 0) {
+        throw new Error(
+          `armed: want rows, got none (probed: ${[...probed].join(", ")})`,
+        );
+      }
       for (const row of on) {
         const f = row.slice(row.indexOf(": ") + 2).split("\t");
         const ok = f.length === 4 && f[1] === "-1" && PHASES.includes(f[2]) &&
           Number(f[3]) > 0;
         if (!ok) throw new Error(`want <fn>\\t-1\\t<phase>\\t<n>, got ${row}`);
-        names.add(f[0]);
-      }
-      if (!names.has("exprIsLitAtom")) {
-        throw new Error(
-          `want an exprIsLitAtom row, got ${[...names].join(", ")}`,
-        );
+        if (!probed.has(f[0])) {
+          throw new Error(
+            `want a probed classifier, got ${f[0]} (probed: ${
+              [...probed].join(", ")
+            })`,
+          );
+        }
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
