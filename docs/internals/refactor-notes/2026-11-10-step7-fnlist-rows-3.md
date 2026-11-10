@@ -1,7 +1,7 @@
 # Step 7: three of classifier group 3's rest leave the probe set, 2026-11-10
 
 Group 3 of `2026-11-09-step7-classifiers-remaining.md` is function-value list rows. It was shadowed on master `34f46a82` and is
-merged over `81037c5e`, where probed classifiers go from 7 to 4 (`classifier-census.vl`, 23,842
+merged over `612ca416`, where probed classifiers go from 5 to 2 (`classifier-census.vl`, 23,842
 programs). `mfResultSlotOf` and `arrLitObjRowTy` are lane w278's.
 
 Each classifier was shadowed with `clsCensusEnter("SH …")` against its candidate twin, and the
@@ -41,7 +41,7 @@ the intern pass minted a spread literal at. It is in `STORAGE_READERS` with that
 
 ## Proof
 
-The fixpoint seed is 6,597,863 bytes over `81037c5e`. Two `refresh-compiler.sh` runs are
+The fixpoint seed is 6,597,789 bytes over `612ca416`. Two `refresh-compiler.sh` runs are
 byte-identical.
 
 * The 1,489 reached files build byte-identical wasm against master's source built by the same
