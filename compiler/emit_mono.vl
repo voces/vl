@@ -7855,7 +7855,17 @@ function monoSetPinDiscrim(tyIx: i32): string {
     const mm = tyAt(t)
     if mm is TyMap { return "#set" + i32ToStr(fnTagSetOfTy(mm.mVal)) + "{}" }
   }
-  if depth == 0 && monoTagRecTy(t) { return "#set" + monoTagRecKey(t, 8) }
+  // A record holding one keys by each field's sets; a record nested in it pins nowhere.
+  const ro = if depth == 0 && t >= 0 && t < T.tys.length && fnTagHoldsTy(t, 8) { tyAt(t) } else { null }
+  if ro is TyObj {
+    let rk = "#set{"
+    for f in ro.objFieldTypes {
+      rk = rk
+        + (if f >= 0 && f < T.tys.length && tyAt(f) is TyObj { "" } else { monoSetPinDiscrim(f) })
+        + ","
+    }
+    return rk + "}"
+  }
   if depth == 0 || !fnTagTyIsTagged(t) { return "" }
   "#set" + i32ToStr(fnTagSetOfTy(t)) + sfx
 }
@@ -7890,48 +7900,34 @@ function monoFloorDisagrees(bt: i32): boolean {
   !tySame(bt, TY_I32)
 }
 
-// The spelling of the map of ids a map `t` of a tagged set is stored as.
+// The spelling of the map or record of ids a map `t` of a tagged set, or a record holding one,
+// is stored as; "" for a record with a field that spelling cannot name, or one nested in it.
 function monoTagMapRepName(t: i32): string {
   if t < 0 || t >= T.tys.length { return "" }
   const m = tyAt(t)
-  if !(m is TyMap) { return "" }
-  "{[" + tyToStr(m.mKey) + "]: i32}"
-}
-
-// Whether `t` is a record a field of which holds a tagged set's ids.
-function monoTagRecTy(t: i32): boolean {
-  t >= 0 && t < T.tys.length && tyAt(t) is TyObj && fnTagHoldsTy(t, 8)
-}
-
-// The key of the sets record `t` holds, field by field, at most `depth` records deep.
-function monoTagRecKey(t: i32, depth: i32): string {
-  const o = if depth > 0 && t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-  if !(o is TyObj) { return "" }
-  let k = "{"
-  for f in o.objFieldTypes {
-    k = k
-      + (if monoTagRecTy(f) { monoTagRecKey(f, depth - 1) } else { monoSetPinDiscrim(f) })
-      + ","
-  }
-  k + "}"
-}
-
-// The spelling of the record of ids a record `t` holding a tagged set is stored as, at most
-// `depth` records deep; "" for a field that spelling cannot name.
-function monoTagRecRepName(t: i32, depth: i32): string {
-  const o = if depth > 0 && t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-  if !(o is TyObj) { return "" }
+  if m is TyMap { return "{[" + tyToStr(m.mKey) + "]: i32}" }
+  if !(m is TyObj) || !fnTagHoldsTy(t, 8) { return "" }
   let k = "{"
   let i = 0
-  while i < o.objFieldNames.length && i < o.objFieldTypes.length {
-    const f = o.objFieldTypes[i]
+  while i < m.objFieldNames.length && i < m.objFieldTypes.length {
+    const f = m.objFieldTypes[i]
     let sp = monoPinOfClosedTy(f)
-    if fnTagTyIsTagged(f) { sp = "i32" }
-    else if fnTagListTy(f) { sp = fnTagListRepName(f) }
-    else if monoTagMapTy(f) { sp = monoTagMapRepName(f) }
-    else if monoTagRecTy(f) { sp = monoTagRecRepName(f, depth - 1) }
+    if fnTagTyIsTagged(f) {
+      sp = "i32"
+    } else if fnTagListTy(f) {
+      sp = fnTagListRepName(f)
+    } else if monoTagMapTy(f) {
+      sp = monoTagMapRepName(f)
+    } else if (
+      f >= 0
+      && f < T.tys.length
+      && tyAt(f) is TyObj
+      && fnTagHoldsTy(f, 8)
+    ) {
+      sp = ""
+    }
     if sp == "" { return "" }
-    k = k + (if i > 0 { ", " } else { "" }) + o.objFieldNames[i] + ": " + sp
+    k = k + (if i > 0 { ", " } else { "" }) + m.objFieldNames[i] + ": " + sp
     i = i + 1
   }
   k + "}"
@@ -8650,7 +8646,10 @@ function monoMakeInstanceParams(
       } else if (
         fnTagTyIsTagged(pinTys[pj])
         || monoTagMapTy(pinTys[pj])
-        || monoTagRecTy(pinTys[pj])
+        || pinTys[pj] >= 0
+          && pinTys[pj] < T.tys.length
+          && tyAt(pinTys[pj]) is TyObj
+          && monoTagMapRepName(pinTys[pj]) != ""
       ) {
         // A tagged set's parameter is the set itself, not a closure of its signature; a map or
         // record of its ids is that map or record.
@@ -20484,7 +20483,7 @@ function monoPinHoleParam(
     return 0
   }
   // A record holding one is the record the elaboration binds, keyed by its sets (D15638).
-  const trn = if monoTagRecTy(bound) { monoTagRecRepName(bound, 8) } else { "" }
+  const trn = if bound >= 0 && bound < T.tys.length && tyAt(bound) is TyObj { monoTagMapRepName(bound) } else { "" }
   if trn != "" {
     pinned.push(trn)
     pinTys.push(bound)

@@ -14,11 +14,13 @@ binds the callee's parameter at `{f: Fn#s}`, a record holding the set.
 
 **Mono reads that binding instead of pinning from the argument.** `monoPinHoleParam` takes the
 elaboration's bound type, as it already does for a set, a list of one and a map of one. Its
-spelling is the record of ids it is stored as (`monoTagRecRepName`: `{f: i32}`), not the render,
-whose `(_) => _` field text a row's field split mis-parses once there are two fields. The
-instance key adds the sets field by field (`monoTagRecKey`), and the parameter is typed at the
-bound record itself (`monoMakeInstanceParams`), so the callee's `r.f(x)` reads the set and calls
-each member directly. A field of such a record handed on (`call1(r.f, x)`) takes the set's id rep,
+spelling is the record of ids it is stored as (`{f: i32}`, from `monoTagMapRepName`, which
+spells a map of ids the same way), not the render, whose `(_) => _` field text a row's field
+split mis-parses once there are two fields. The instance key adds the sets field by field
+(`monoSetPinDiscrim`), and the parameter is typed at the bound record itself
+(`monoMakeInstanceParams`), so the callee's `r.f(x)` reads the set and calls each member
+directly. A record nested in such a record is not spelled, so it pins as before. No function is
+added to emit_mono.vl: the pin-helper budget stays at 918. A field of such a record handed on (`call1(r.f, x)`) takes the set's id rep,
 as an index of a list of them already does (D15612's arm now admits a `Member`).
 
 **The row.** A literal built under two instances reuses its first row (`sLitIdRow`), but only the
