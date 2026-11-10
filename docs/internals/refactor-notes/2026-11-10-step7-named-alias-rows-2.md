@@ -32,7 +32,7 @@ done here. D14162 is re-filed on the record-field witness and stays open.
 
 ## Filed
 
-**D15635.** `==` over a record that recurses through a nullable field (`type Node = { v: i32,
+**D15636.** `==` over a record that recurses through a nullable field (`type Node = { v: i32,
 next: Node | null }`, `a == a`) passes `vl check` and exhausts the compiler's GC heap while
 building. It is the same with or without the alias. Recursion through a list runs.
 
