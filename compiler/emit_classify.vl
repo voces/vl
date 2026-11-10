@@ -421,7 +421,6 @@ import {
   arrElemIsNullUnitAt,
   declFallbackDepthCap,
   gLitUnionUsed,
-  variantFieldElemNameOr,
   variantFieldMayOmit,
 } from "./emit_lit_atoms"
 import {
@@ -448,7 +447,6 @@ import {
 import {
   annBareRefArrElemName,
   annBareRefArrSlot,
-  annNulRefArrSlot,
   arrLitCommitAnnAt,
   arrLitCommitNameAt,
   arrLitRlSlotAt,
@@ -496,19 +494,16 @@ import {
 import {
   atomNarrowOp,
   boxNarrowAtomFor,
-  declaredRefArrayName,
   declaredRefArraySlot,
   emptyArrHoleElemSlot,
   exprReReadable,
   fnRetNulRefArrayNameSid,
-  instAnnTyNameOfExpr,
   nodeTyIsUnionRow,
   objMapFieldCompat,
   objMapFieldKeyFits,
   objNestedFieldCompat,
   paramNulRefArray,
   paramRefArrayName,
-  recordListSlotOfNode,
   sharedFieldArmBoxKind,
   sharedFieldArmBoxesAtomSet,
   sharedFieldArmConverts,
@@ -3890,20 +3885,6 @@ export function captureValStructIdx(fe: i32, name: string) {
   -1
 }
 
-// The mv slot of a `m[k]` or `m[k] ?? d` read over a struct-list-valued map, else -1. The hook
-// `refListElemNameOfExpr` uses to name the read's element, so `(m[k] ?? []).length` resolves.
-function mapReadStructListMvSlot(exprIx: i32, fnIx: i32) {
-  const cm = coalesceMvSlot(exprIx, fnIx)
-  if cm >= 0 {
-    if mvListValKind(cm) == "reflist" { return cm }
-  }
-  const mr = mapReadMvSlot(exprIx, fnIx)
-  if mr >= 0 {
-    if mvListValKind(mr) == "reflist" { return mr }
-  }
-  -1
-}
-
 // True when `name` read in lifted frame `fnIx` is one of its captures, so the read is an env
 // field rather than a local. The list-op receiver stages such a name (D1965); the scratch
 // collector and the emitter both ask this one predicate.
@@ -6888,19 +6869,6 @@ export function arrLitNestedNumKind(a: ArrayLit, e0x: i32, fnIx: i32): i32 {
   if anyF64 && !anyI64 { return ALK_F64 }
   if anyI64 && !anyF64 { return ALK_I64 }
   ALK_NONE
-}
-
-// `arrLitElemName` with a nested literal's scalar leaf read inside function `fnIx`, where an
-// instance's parameter pin names it (`[[t]]` at `T := string` keys `string[]`); the pin-blind
-// answer when the leaf reads the same, or when the pinned leaf has no element row (D2798).
-export function arrLitElemNameIn(arrIx: i32, fnIx: i32): string {
-  const sn = spreadLitSrcRowName(arrIx, fnIx)
-  if sn != "" { return sn }
-  const nm = arrLitElemName(arrIx, fnIx)
-  if nm != "i32[]" { return nm }
-  const pn = arrLitFrameLeafRow(arrIx, fnIx)
-  if pn != "" && rlSlotByName(pn) >= 0 { return pn }
-  nm
 }
 
 // The scalar-leaf row a list-of-lists literal's element keys in frame `fnIx`: `string[]`, `f64[]`
@@ -11100,27 +11068,18 @@ function listIsRecvTysIn(ix: i32, name: string, fnIx: i32, out: i32[]) {
   0
 }
 
-// The row name of the ref-list element an array-typed node carries, keyed by its element
-// type; "" when no row is keyed by that type (a closure element, an unresolved hole).
-function refListElemNameOfNodeTy(exprIx: i32): string {
-  const s = rlSlotOfTy(tyRefArrElemOf(nodeTyIxOf(exprIx)))
-  if s >= 0 && s < rlElemName.length { return rlElemName[s] }
-  ""
-}
-// `refListElemNameOfNodeTy` at the pins of instance `fnIx`: a generic body's `T[]` names the
-// row of its pinned element; "" when a type parameter stays open or no row is keyed by it.
-function refListElemNameOfInstTy(exprIx: i32, fnIx: i32): string {
-  const s = rlSlotOfTy(tyRefArrElemOf(instanceTyOf(nodeTyIxOf(exprIx), fnIx)))
-  if s >= 0 && s < rlElemName.length { return rlElemName[s] }
-  ""
-}
 // The ref-list ELEMENT type-NAME the expression at `exprIx` produces, or "" if it is not
 // a ref list. Mirrors `exprRefArray`'s receiver shapes, resolving the per-element-
 // type table slot (`refListSlotOfExpr`) at every push / index / `.length` / store site.
 export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   const rs = listRowOfExpr(exprIx, fnIx)
   if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
-  refListElemNameOfExprRaw(exprIx, fnIx)
+  // A list whose type keys no row of its own, an `__array_new__` record fill: its element
+  // record's canonical row.
+  const t = nodeTyAt(exprIx, fnIx)
+  if !tyIsRefArray(t) { return "" }
+  const si = structRowOfRecordTy(tyArrayElemIx(t))
+  if si >= 0 && si < sNames.length { sNames[si] } else { "" }
 }
 // The ref-list row the expression at `exprIx` is built as in function `fnIx`: the row of its
 // rep type (`exprRepTy`), as `listBuildOfTy` builds that type; -1 where it is no ref list.
@@ -11353,90 +11312,6 @@ function fnRetRepTy(fe: i32, depth: i32): i32 {
   }
   r
 }
-function refListElemNameOfExprRaw(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("refListElemNameOfExprRaw") }
-  if exprIx < 0 { return "" }
-  const e = nodeAt(exprIx)
-  match e {
-    ArrayLit => {
-      return arrLitElemNameIn(exprIx, fnIx)
-    }
-    Paren => {
-      return refListElemNameOfExpr(e.parInner, fnIx)
-    }
-    BinExpr => {
-      if (
-        e.binOp == "="
-        && assignTargetReReads(exprIx, fnIx)
-        && asgLitWidth(exprIx, fnIx) == ""
-      ) {
-        return refListElemNameOfExpr(asgReadNode(exprIx, fnIx), fnIx)
-      }
-    }
-    // An if-expression's element is its join's row, the one its blocktype names (D2210).
-    IfStmt => {
-      if ifExprRefKind(exprIx, fnIx) != "reflist" { return "" }
-      const ifs = ifExprRefSlot(exprIx, fnIx, "reflist", -1)
-      if ifs < 0 || ifs >= rlElemName.length { return "" }
-      return rlElemName[ifs]
-    }
-    // Every other expression is resolved by the rungs below.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  // `m[k]` / `m[k] ?? d` over a struct-LIST-valued map: the row keyed by the value's element
-  // type, "" when none is.
-  const slsMv = mapReadStructListMvSlot(exprIx, fnIx)
-  if slsMv >= 0 {
-    const mvRs = mvValInnerRlSlotAt(slsMv)
-    if mvRs >= 0 && mvRs < rlElemName.length { return rlElemName[mvRs] }
-    return ""
-  }
-  match e {
-    Call => {
-      return refListElemNameOfCall(e, exprIx, fnIx)
-    }
-    Ident => {
-      return refListElemNameOfIdent(e, exprIx, fnIx)
-    }
-    Member => {
-      return refListElemNameOfMember(e, exprIx, fnIx)
-    }
-    OptMember => {
-      // The `?.` twin of the field read above: the chain resolves the receiver's row, and the
-      // element name is the field's own — the receiver's `| null` does not change it (D1676).
-      const osi = optChainStructIdxOf(e.omObj, fnIx)
-      if osi >= 0 {
-        const ofi = sFieldIndex(osi, e.omProp)
-        if ofi >= 0 { return sFieldElemNameAt(osi, ofi) }
-      }
-    }
-    Index => {
-      // Indexing a nested ref array (`g[i]` where `g: S[][]`): the element strips one `[]` off
-      // `g`'s element name — recurses for deeper nesting.
-      return refListElemNameOfIndex(e, exprIx, fnIx)
-    }
-    BinExpr => {
-      // `p ?? d` over a `<ref-array> | null` niche resolves via the niche's own inner-slot resolver
-      // first — the plain recursion alone misses an `Index`'s `| null`-suffixed element name.
-      // A ref-list concat yields a new list at the operands' own slot — skipping this, the slot-0
-      // clamp reads a wrong row as real. Both operands must agree, or there is no single slot. D721.
-      if e.binOp == "+" {
-        const cl = refListElemNameOfExpr(e.binLeft, fnIx)
-        if cl != "" {
-          if cl == refListElemNameOfExpr(e.binRight, fnIx) { return cl }
-        }
-        // A mixed pair concatenates at the row the narrower operand is copied into.
-        const side = catWidenSideOfBin(exprIx, fnIx)
-        if side == 2 { return cl }
-        if side == 1 { return refListElemNameOfExpr(e.binRight, fnIx) }
-      }
-    }
-    // No other expression names a ref-list element.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  ""
-}
-
 // The ref-list row of the bare list annotation on the return of the function `name` read at
 // `calleeIx` resolves to, or -1. The arena's row, which is the one the signature declares.
 function calleeAnnRetRefListSlot(name: string, calleeIx: i32, fnIx: i32): i32 {
@@ -11450,106 +11325,8 @@ function calleeAnnRetRefListSlot(name: string, calleeIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The ref-list element name a call `e` returns: an `__array_new__` fill, a named or
-// closure callee's result slot, `m.values()`, or a `.map`/`.filter` result. "" when the
-// result is not a ref list.
-function refListElemNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
-  // `__array_new__(n, {…})` — the ref-list element name is the fill's struct.
-  if arrNewIntrKind(exprIx, fnIx) == "reflist" {
-    // The DESTINATION's element names the row first: the list is allocated at the heap
-    // types it is stored into, and the fill's own spelling can be narrower — a `Node | null`
-    // fill answers the bare `Node`, whose row the destination never interned (D1630). The
-    // row is keyed by the destination's element type at this instance's pins; a miss is "".
-    const anDstNm = refListElemNameOfInstTy(exprIx, fnIx)
-    if anDstNm != "" { return anDstNm }
-    // An ANNOTATED fill names its own element, ahead of the struct index below: inside a
-    // monomorphized instance the annotation carries the pin, and it is the only one of the
-    // two that keeps a `| null` — the struct index answers the bare struct for both.
-    const anInst = instAnnTyNameOfExpr(e.callArgs[1], fnIx)
-    if anInst != "" { return anInst }
-    const asi = structIndexOfExpr(e.callArgs[1], fnIx)
-    if asi >= 0 { return sNames[asi] }
-    // The fill's own recorded type. A monomorphized clone shares this call node, so that
-    // type is still the template's `T` and only the annotation above can name the element;
-    // `""` reaches the caller's strict slot and refuses, rather than taking another
-    // element's row (D1605).
-    return rlMintNameOfTy(nodeTyIxOf(e.callArgs[1]))
-  }
-  if e.callFn < 0 { return "" }
-  const callee = nodeAt(e.callFn)
-  if callee is Ident {
-    // A declared list return's element is the row its signature's result names (D6731).
-    const asl = calleeAnnRetRefListSlot(callee.identName, e.callFn, fnIx)
-    if asl >= 0 && asl < rlElemName.length { return rlElemName[asl] }
-    const fn = fnRetRefArrayNameSid(
-      sidOfNode(e.callFn),
-      callee.identName,
-      fnIx,
-      e.callFn,
-    )
-    if fn != "" { return fn }
-    // A nulreflist-returning function (`mk: () => i32[][] | null`): the INNER ref-list element name.
-    const nfn = fnRetNulRefArrayNameSid(
-      sidOfNode(e.callFn),
-      callee.identName,
-      fnIx,
-      e.callFn,
-    )
-    if nfn != "" { return nfn }
-    // A closure-value callee returning a ref list: its element name is the `rlElemName` of
-    // the result slot parsed off the callee's resolved `$fnsig`.
-    const ck = calleeCloSigKeyOfRead(e.callFn, fnIx)
-    if sigKeyRetKind(ck) == "reflist" || sigKeyRetKind(ck) == "nulreflist" {
-      const rs = sigKeyRetSlot(ck)
-      if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
-    }
-    // A narrowed union binding's closure arm: the name-based path misses it, so the general
-    // `cloCallSigKey` fallback derives the key from the callee's checker type instead.
-    const nk = cloCallSigKey(exprIx, fnIx)
-    if sigKeyRetKind(nk) == "reflist" || sigKeyRetKind(nk) == "nulreflist" {
-      const nrs = sigKeyRetSlot(nk)
-      if nrs >= 0 && nrs < rlElemName.length { return rlElemName[nrs] }
-    }
-    return ""
-  }
-  // A ref-valued `m.values()` yields a ref list whose element is the map's value — read its
-  // name off the value's mv ref-list slot, checked before the `.filter` result-slot path.
-  if callee is Member {
-    if callee.memProp == "values" {
-      if exprMap(callee.memObj, fnIx) {
-        const vsh = mapShapeOfExpr(callee.memObj, fnIx)
-        if vsh >= 0 {
-          const rs = mvRlSlot[vsh]
-          if rs >= 0 { return rlElemName[rs] }
-        }
-      }
-    }
-    // Bound-guarded like the other reads in this function: `mfResultSlotOf` clamps a miss to
-    // 0 rather than -1, so an unbounded `rlElemName[ms]` traps the compiler on an empty table. D227.
-    // A nullable-record `.map` result names its own `| null` row even before it is interned,
-    // which a function's inferred return asks for (D12820).
-    const nrt = mfNulRecMapElemTy(exprIx, fnIx)
-    if nrt >= 0 { return rlMintNameOfTy(nrt) }
-    const ms = mfResultSlotOf(exprIx, fnIx)
-    if ms >= 0 && ms < rlElemName.length { return rlElemName[ms] }
-    const mrn = mfRecordElemRowName(exprIx, fnIx)
-    if mrn != "" { return mrn }
-    // A list-returning `.map` named before `collectMapFilterUse` interns its row.
-    const mln = mfListResultElemName(exprIx, fnIx)
-    if mln != "" { return mln }
-  }
-  // A struct-field or indexed closure-array element call whose result is a ref list: the
-  // resolved `$fnsig` result slot names the element, mirroring the Ident-callee arm above.
-  const mk2 = cloCallSigKey(exprIx, fnIx)
-  if sigKeyRetKind(mk2) == "reflist" || sigKeyRetKind(mk2) == "nulreflist" {
-    const mrs2 = sigKeyRetSlot(mk2)
-    if mrs2 >= 0 && mrs2 < rlElemName.length { return rlElemName[mrs2] }
-  }
-  return ""
-}
-
-// `refListElemNameOfCall`'s rungs as slots, in its order: the row each rung already holds, -2
-// at a rung that has only a name (an annotated or record fill, a result with no typed row).
+// The row a call's result list is held at: the destination's row for an `__array_new__` fill, the
+// callee's declared or recorded result row; -2 at a rung that has only a name.
 function refListKeptSlotOfCall(e: Call, exprIx: i32, fnIx: i32): i32 {
   if arrNewIntrKind(exprIx, fnIx) == "reflist" {
     const ds = rlSlotOfTy(
@@ -11605,161 +11382,8 @@ function refListKeptSlotOfCall(e: Call, exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The ref-list element name a name read `e` holds: a narrowed arm, a param, a local, a
-// capture or a global, nullable ref arrays answering their inner list. "" when the
-// binding is not a ref list.
-function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
-  // An `is K[]` arm's read of an empty list of another element is the arm's own `K[]` (D4962).
-  const fat = listFitArmTyOf(exprIx, fnIx)
-  if fat >= 0 {
-    const fa = tyAt(fat)
-    const fsl = if fa is TyArray { rlSlotOfTy(fa.aElem) } else { -1 }
-    if fsl >= 0 && fsl < rlElemName.length { return rlElemName[fsl] }
-  }
-  // A union binding NARROWED to a ref-element array arm (`if x is S[]` then `x[i]`): the row
-  // keyed by the arm's element at this instance's pins, the wrapper the narrowed read casts to.
-  if identReadContainerAt(exprIx, fnIx) == RC_REF_LIST {
-    return refListElemNameOfInstTy(exprIx, fnIx)
-  }
-  // A read the resolver bound to a module global is no same-named local of this frame (D9681).
-  const rdg = identReadsGlobal(exprIx)
-  // A kind-18 nullable ref-array local stores its INNER ref-list slot in `localStructIdx`; its element
-  // name is that inner slot's element name, so `refListSlotOfExpr` round-trips back to the inner slot.
-  if !rdg && declaredKind(exprIx) == "nulreflist" {
-    const sl18 = declaredSlotOf(exprIx)
-    if sl18 >= 0 {
-      const is18 = localStructIdx[sl18]
-      if is18 >= 0 && is18 < rlElemName.length { return rlElemName[is18] }
-    }
-  }
-  // A nulreflist param's inner ref-list element name is the ref-array's element (the
-  // `| null`-stripped annotation), so `refListSlotOfExpr` resolves the narrowed inner wrapper.
-  if (paramNulRefArray(fnIx, exprIx)) {
-    // Asked of the annotation's type: a monomorphized instance's grouped spelling
-    // `(i32[][]|null)` is still a nullable ref array there.
-    const pn18 = paramTypeNodeOfRead(fnIx, exprIx)
-    if annNulRefArrSlot(pn18) >= 0 { return refListElemNameOfNodeTy(pn18) }
-  }
-  const pn = paramRefArrayName(fnIx, exprIx)
-  if pn != "" && paramReadAt(fnIx, exprIx) { return pn }
-  const dn = if rdg { "" } else { declaredRefArrayName(exprIx) }
-  if dn != "" { return dn }
-  // A captured ref-array's element name is the `rlElemName` of the slot the env field is
-  // typed with — the storage-class mirror of `exprRefArray`'s capture arm.
-  const cn = capturedRefListSlot(fnIx, e.identName)
-  if cn >= 0 && cn < rlElemName.length { return rlElemName[cn] }
-  const grl = globalLetOfRead(fnIx, exprIx)
-  if grl >= 0 {
-    const gk = globalCellKind(grl)
-    // A kind-18 nullable ref-array global reads its inner ref-list row off the annotation,
-    // since the declared-element name below falls through to a nameless `[]`/`null` init.
-    // A ref-list global reads the row its cell is declared at, which a destination may name
-    // instead of the literal's own element, as a local reads its slot's (D3093).
-    if gk == "reflist" {
-      const grs = letRefListSlot(grl, -1)
-      if grs >= 0 && grs < rlElemName.length { return rlElemName[grs] }
-    }
-    // The ref-list element type-name the global declares (`S[]`/`N[]`).
-    const gra = letRefListElemName(grl, -1)
-    if gra != "" { return gra }
-  }
-  // A box narrowed to a list arm no registered union names (`{x: i32}[]` of a field read
-  // at a pin) reads the arm's row off its narrowed type (D4930).
-  const nrs = recordListSlotOfNode(exprIx, fnIx)
-  if nrs >= 0 && nrs < rlElemName.length { return rlElemName[nrs] }
-  return ""
-}
-
-// The ref-list element name a field read `e` yields, through the same receiver rungs as
-// `memFieldTypeCode`: a narrowed place, a union arm, a struct, or a struct union whose
-// members all record one element name. "" when the field is not a ref list.
-function refListElemNameOfMember(e: Member, exprIx: i32, fnIx: i32): string {
-  // The member path's own narrowing first (D1014): a narrowed ref-element arm names the
-  // arm's element, ahead of the receiver-narrowing arm below (a different question).
-  if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST {
-    return refListElemNameOfNodeTy(exprIx)
-  }
-  // A `recv.field` ref-list field read — the field's element name from the receiver's
-  // struct / narrowed variant.
-  // A narrowing that names no variant (a place narrowed to a plain struct) falls through to
-  // the receiver rungs below, as `memFieldTypeCode` does (D1735).
-  const vi = memNarrowVariantIndex(exprIx, fnIx)
-  if vi >= 0 {
-    const vfi = variantFieldIndex(vi, e.memProp)
-    if vfi >= 0 { return armFieldElemName()[uFieldStart[vi] + vfi] }
-    return ""
-  }
-  // The receiver rungs of `memFieldTypeCode`, arm for arm: a union ARM value (a variant
-  // param, local, capture or call) keeps its fields in the variant tables, so a struct-only
-  // leg answers "" for a field that code already called a ref list (D1960).
-  const avi = memRecvArmVariantIndex(e.memObj, fnIx)
-  if avi >= 0 {
-    const aen = variantFieldElemNameOr(avi, e.memProp)
-    if aen != "" { return aen }
-  }
-  const si = structIndexOfExpr(e.memObj, fnIx)
-  if si >= 0 {
-    const fi = sFieldIndex(si, e.memProp)
-    if fi >= 0 { return sFieldElemNameAt(si, fi) }
-  }
-  // An un-narrowed struct union whose members share the field: one element name only
-  // when every member records the same one, since the read has a single wrapper row.
-  const uvis: i32[] = []
-  const ufis: i32[] = []
-  if (
-    sharedUnionFieldPlan(e.memObj, e.memProp, exprIx, fnIx, uvis, ufis)
-    == FC_REF_LIST
-  ) {
-    const un0 = variantFieldElemName(uvis[0], ufis[0])
-    let uk = 1
-    while uk < uvis.length {
-      if variantFieldElemName(uvis[uk], ufis[uk]) != un0 { return "" }
-      uk = uk + 1
-    }
-    return un0
-  }
-  // The field read's twin of the Ident arm's last rung (D4930).
-  if memNarrowVariantIndex(exprIx, fnIx) >= 0 {
-    const mrs = recordListSlotOfNode(exprIx, fnIx)
-    if mrs >= 0 && mrs < rlElemName.length { return rlElemName[mrs] }
-  }
-  ""
-}
-
-// The ref-list element name an index read `e` yields: a narrowed place's arm element, or the
-// receiver's element name less one `[]`.
-// "" when the cell is not a ref list.
-function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
-  // The index place's own narrowing to a ref-array arm (D1014) — distinct from the
-  // nullable-niche narrowing below it, which peels a `| null` off the cell's own name.
-  if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST {
-    return refListElemNameOfNodeTy(exprIx)
-  }
-  // The receiver row's own inner row first: a structural name can key a same-layout record
-  // declared earlier than the one the items are built at (D6731). Otherwise a receiver whose
-  // element is itself a ref list — raw, `| null`, or at this instance's pins — yields the
-  // read's own typed row; any other receiver yields no ref-list element.
-  const outer = refListElemNameOfExpr(e.idxArr, fnIx)
-  if outer == "" { return "" }
-  const os = refListSlotOfExpr(e.idxArr, fnIx)
-  if rlSlotIsKindList(os, RLK_REF_LIST) {
-    const ins = rlElemInnerSlot(os)
-    if ins >= 0 && ins < rlElemName.length {
-      if rlSlotOfTyOrTwin(rlElemTyIxAt(ins)) == ins { return rlElemName[ins] }
-    }
-  }
-  const at = nodeTyAt(e.idxArr, fnIx)
-  if tyRefArrElemOf(tyRefArrElemOf(at)) >= 0 {
-    return refListElemNameOfNodeTy(exprIx)
-  }
-  if tyRefArrElemOf(tyRefArrElemOf(instanceTyOf(at, fnIx))) >= 0 {
-    return refListElemNameOfNodeTy(exprIx)
-  }
-  ""
-}
-
-// `refListElemNameOfMember`'s rungs as slots, in its order: the field's storage row, -1 where
-// the field holds no ref list, -2 at a rung that has only a name.
+// The row a field read's ref list is stored at: the narrowed arm's or the receiver row's field
+// row, -1 where the field holds no ref list, -2 at a rung that has only a name.
 function refListKeptSlotOfMember(e: Member, exprIx: i32, fnIx: i32): i32 {
   if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST { return -2 }
   const vi = memNarrowVariantIndex(exprIx, fnIx)
@@ -11786,8 +11410,8 @@ function refListKeptSlotOfMember(e: Member, exprIx: i32, fnIx: i32): i32 {
   -2
 }
 
-// `refListElemNameOfIndex`'s rungs as slots, in its order: the receiver row's inner row, -2
-// at a rung that has only a name.
+// The row an index read's ref list is stored at: the receiver row's inner row, -2 at a rung
+// that has only a name.
 function refListKeptSlotOfIndex(e: Index, exprIx: i32, fnIx: i32): i32 {
   if placeReadContainerAt(exprIx, fnIx) == RC_REF_LIST { return -2 }
   const os = refListSlotOfExpr(e.idxArr, fnIx)

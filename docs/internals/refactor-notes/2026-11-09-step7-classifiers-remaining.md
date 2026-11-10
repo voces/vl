@@ -178,7 +178,7 @@ build row, 14,881 / 0). The four left:
 | --- | --- | --- | --- | --- |
 | `arrLitIsRefTpl` | 93,162 (9,205) | 3: `arrLitIsRef` 88,891, itself 3,793, `arrLitFrameRefTy` 478 | at `arrLitIsRef`'s answer, `tyIsRefArray(nodeTyIxOf)` with a tagged set's function element a list of ids, 88,771 / 188 (r28) | A list at a hole or generic pin, whose stored row the template type does not name (groups 2 and 3). Switched in, it traps 2 programs and refuses 3 more (r28). |
 | `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | **Switched** to the width of `litRepTyAt`'s element, by ruling: 23 programs build different wasm with the same output (`2026-11-10-step7-arrlitnumkind-rep-width.md`). | none |
-| `refListElemNameOfExprRaw` | 7,595 (454) | 1: `refListElemNameOfExpr` (asked only when `listRowOfExpr` has no row) | `rlRowNameOfTy` of `nodeTyAt`'s element, 3,698 / 3,897, 437 of them one row spelled twice (r27) | The function-value list rows (group 3) and nested niche lists. |
+| ~~`refListElemNameOfExprRaw`~~ | deleted 2026-11-10 | | after #7070 its 3 calls were `__array_new__` record fills, which name the element record's canonical row ([notes](2026-11-10-step7-rlen-raw-deleted.md)) | — |
 | `arrLitElemNameTpl` | 7,049 (4,037) | 1: `arrLitElemName` | `rlRowNameOfTy` of `nodeTyIxOf`'s element, 5,365 / 1,682, 398 of them one row spelled twice (r27) | The same. |
 
 ## 11. Follows another classifier (1)
