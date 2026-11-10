@@ -36,7 +36,7 @@ A, C, D and E. `exprNulLitUnion` now answers:
 * a field, `?.` leaf, element or call read by the emitter's storage (field code, element and
   map-value types, the callee's result).
 
-It leaves the probe set and joins `NOT_BLIND`. Four imports that are now unused are dropped.
+It leaves the probe set and joins `NOT_BLIND`. Four imports that are now unused are dropped, and so are `ifIsChainHeadIn` and `ifJoinIsNulString` (emit_if_arm_values.vl), which nothing else asked.
 
 ## Census (`classifier-census.vl`)
 
@@ -48,7 +48,7 @@ It leaves the probe set and joins `NOT_BLIND`. Four imports that are now unused 
 `exprNulLitUnion` (1,221,403 calls) leaves the probe set. `exprIsLitAtom` goes from 1,244,730 to
 1,243,424.
 
-**Proof.** The fixpoint seed is 6,601,115 bytes (−1,015). Two `refresh-compiler.sh` runs are
+**Proof.** The fixpoint seed is 6,601,085 bytes (−1,045). Two `refresh-compiler.sh` runs are
 byte-identical.
 
 * Sweep against the base's fixpoint: 23,836 same, 0 movers.
