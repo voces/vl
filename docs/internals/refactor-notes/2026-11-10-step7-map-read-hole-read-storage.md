@@ -58,10 +58,22 @@ Both move to `STORAGE_READERS` in `scripts/classifier-census.vl`, with those rea
 
 | tree | probed | calls |
 | --- | --- | --- |
-| base `34f46a82` | 10 | 2,290,708 |
-| this PR | 8 | see the PR |
+| base `34f46a82` | 10 | 2,288,406 |
+| this PR | 8 | 1,416,690 |
+
+`mapReadMvSlot` (709,846) and `unionNameOfHoleRead` (161,870) leave the probe set. The other
+eight are unchanged.
 
 **Proof.** The fixpoint seed is 6,598,638 bytes (−336). Two `refresh-compiler.sh` runs are
 byte-identical.
 
 * Sweep against the base's fixpoint: 23,842 same, 0 movers.
+* `rep-fuzz-check.sh`: exact.
+* `lint-self.sh`: clean.
+* `seed-size --check`: +0.1%.
+* `late-demands --check`: 6, the baseline.
+* The dead-export budget: 0, the baseline.
+* `cases_wasm` shards 0–3: 7,405 passed.
+* The inventory rows and refs tests, `vl_scaling_shape_test.ts`, `vl_cls_census_test.ts` and
+  `vl_probe_rollback_test.ts`: 106 passed.
+* `check-filed-witnesses --strict`: 4,689 as filed, 0 output mismatches.
