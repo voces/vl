@@ -1732,7 +1732,7 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
       return hcPrimId(t.primName)
     }
     TyObj => {
-      if repKeyIsCanon(mode) { return hcCanonObjId(t, mode) }
+      if repKeyIsCanon(mode) { return hcCanonObjId(t, mode, false) }
       const ds = repSlotOfElemTy(ty, mode)
       if ds >= 0 {
         const a: i32[] = []
@@ -1839,7 +1839,7 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
 // `{a: i32, b: string}` and `{b: string, a: i32}` are one type and keying them by declaration
 // order minted two heap types for one shape. Field names are unique, so ordering by sid is a
 // bijection: it can merge twins and never collide distinct types.
-function hcCanonObjId(t: TyObj, mode: RepKeyMode): i32 {
+function hcCanonObjId(t: TyObj, mode: RepKeyMode, foldTagged: boolean): i32 {
   const sortedSid: i32[] = []
   const sortedIx: i32[] = []
   let si2 = 0
@@ -1869,7 +1869,7 @@ function hcCanonObjId(t: TyObj, mode: RepKeyMode): i32 {
     const ft = hcRowFieldTy(repCanonFieldTy(t.objFieldTypes[fx]), mode)
     const asSet = repFieldLitAsSet(ft)
     const fm = hcRowFieldMode(ft, mode)
-    const c = if asSet.length > 0 { hcUnionId(asSet, fm) } else if mode == "row" { hcRowHeldId(ft, fm) } else { repIdOf(ft, fm) }
+    const c = if asSet.length > 0 { hcUnionId(asSet, fm) } else if foldTagged && hcHoldsTaggedLeaf(ft) { hcHeapLeafId(ft) } else if mode == "row" { hcRowHeldId(ft, fm) } else { repIdOf(ft, fm) }
     a.push(sortedSid[i])
     a.push(c)
     len = len + t.objFieldNames[fx].length + 1 + hcLenOf(c) + 1
@@ -1905,6 +1905,35 @@ function hcRowHeldId(ft: i32, fm: RepKeyMode): i32 {
     return hcIntern(HC_NUL, a, hcLenOf(c) + 1)
   }
   repIdOf(ft, fm)
+}
+
+// `hcRowHeldId`'s storage twin: the tagged function leaf keys as the `i32` id it is stored as.
+function hcHeapLeafId(ft: i32): i32 {
+  const t = tyAt(ft)
+  if t is TyArray {
+    const a: i32[] = []
+    a.push(hcHeapLeafId(t.aElem))
+    return hcIntern(HC_ARRAY, a, hcLenOf(a[0]) + 2)
+  }
+  if t is TyNullable {
+    const a: i32[] = []
+    a.push(hcHeapLeafId(t.nInner))
+    return hcIntern(HC_NUL, a, hcLenOf(a[0]) + 1)
+  }
+  hcPrimId("i32")
+}
+
+// A struct row type's heap identity: `repRowId`, with each tagged function leaf keyed as its
+// `i32` id, so rows apart only in the set group they hold share one heap type.
+function repHeapId(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = tyAt(ty)
+  if t is TyObj {
+    for f in t.objFieldTypes {
+      if hcHoldsTaggedLeaf(repCanonFieldTy(f)) { return hcCanonObjId(t, "row", true) }
+    }
+  }
+  repRowId(ty)
 }
 
 // Whether `ft` is a tagged function type under list and non-union nullable layers.
@@ -2718,6 +2747,14 @@ function slotCanonId(si: i32): i32 {
   repRowId(ty)
 }
 
+// Row `si`'s heap identity (`repHeapId` of its record type), the key its twins share; -1 when
+// it has none.
+function slotHeapId(si: i32): i32 {
+  const ty = slotRowTyOf(si)
+  if ty < 0 { return -1 }
+  repHeapId(ty)
+}
+
 // The arena type index to record for an anonymous object-literal shape row (phase
 // D0): the literal node's context-resolved rep type (`nodeRepTyIxOf`), or -1 when
 // the node is uncovered / not a `TyObj`. Exported so the `emit_collect` intern site
@@ -2929,21 +2966,21 @@ function sfceElemRowsTwin(ra: i32, rb: i32): i32 {
   tw
 }
 
-// True when struct slots `a` and `b` share one WasmGC heap type under the canonical
-// structural key plus the field-code layout guard — the `sTwin` equivalence,
+// True when struct slots `a` and `b` share one WasmGC heap type under the heap key
+// (`slotHeapId`) plus the field-code layout guard — the `sTwin` equivalence,
 // queryable pairwise without `buildStructTwins` having run. The ref-list layer's
 // struct-twin slot rung (`rlSlotOfTyTwin`) uses it to decide whether two spellings share a heap type.
 export function repStructSlotsTwin(a: i32, b: i32): i32 {
   if a == b { return 1 }
   if a < 0 || b < 0 { return 0 }
-  const ka = slotCanonId(a)
+  const ka = slotHeapId(a)
   if ka < 0 { return 0 }
-  if ka != slotCanonId(b) { return 0 }
+  if ka != slotHeapId(b) { return 0 }
   structFieldCodesEq(a, b)
 }
 
 // The canonical (smallest `sTwin`-equivalent) representative of struct slot `si` —
-// the smallest `j <= si` sharing `si`'s `slotCanonId` under the `structFieldCodesEq`
+// the smallest `j <= si` sharing `si`'s `slotHeapId` under the `structFieldCodesEq`
 // layout guard, or `si` itself. The same equivalence `buildStructTwins` records in
 // `sTwin[]`, computed on demand and timing-independently, since callers need it before `mAssignTypeIndices` has built `sTwin[]`. Memoized per `tyMutEpoch`.
 let repSlotRepMemo: i32[] = []
@@ -2963,12 +3000,12 @@ export function repStructSlotRep(si: i32): i32 {
   if si < repSlotRepMemo.length {
     if repSlotRepMemo[si] >= 0 { return repSlotRepMemo[si] }
   }
-  const key = slotCanonId(si)
+  const key = slotHeapId(si)
   let rep = si
   if key >= 0 {
     let j = 0
     while j < si {
-      if slotCanonId(j) == key && structFieldCodesEq(j, si) == 1 {
+      if slotHeapId(j) == key && structFieldCodesEq(j, si) == 1 {
         rep = j
         j = si // stop at the first (smallest) twin
       }
@@ -2984,7 +3021,7 @@ export function repStructSlotRep(si: i32): i32 {
 // id, so two literals apart in a closure field's signature mint two rows. A generic body's row,
 // whose type still names a parameter, serves each instance; a tagged set's own parameters do not
 // make a row generic.
-function anonRowServes(si: i32, ty: i32): boolean {
+export function anonRowServes(si: i32, ty: i32): boolean {
   const nm = sNames[si]
   if nm.length < 5 || nm.slice(0, 5) != "#anon" { return true }
   let own = sAnonOwnTy.get(si) ?? -1
@@ -3151,13 +3188,13 @@ export function repScanLim(): i32 {
 
 // Populate `sTwin` (parallel to `sNames`): `sTwin[i]` is the representative struct
 // slot for slot `i`'s WasmGC heap type — the smallest earlier slot with the same
-// canonical key and field-code layout, or `i` itself when first of its structure.
+// heap key (`slotHeapId`) and field-code layout, or `i` itself when first of its structure.
 // Keys are computed once up front, then matched pairwise; called from `mAssignTypeIndices` before `sHeapIdx` allocation.
 export function buildStructTwins() {
   const keys: i32[] = []
   let i = 0
   while i < sNames.length {
-    keys.push(if sIsRefRow(i) { -1 } else { slotCanonId(i) })
+    keys.push(if sIsRefRow(i) { -1 } else { slotHeapId(i) })
     i = i + 1
   }
   sTwin = []
@@ -3180,14 +3217,14 @@ export function buildStructTwins() {
 }
 
 // `buildStructTwins`' answer for one row `i` minted after it ran: the smallest earlier row with
-// `i`'s canonical key and field codes, else `i`.
+// `i`'s heap key and field codes, else `i`.
 export function structLateTwinOf(i: i32): i32 {
   if sIsRefRow(i) { return i }
-  const k = slotCanonId(i)
+  const k = slotHeapId(i)
   if k < 0 { return i }
   let j = 0
   while j < i {
-    if !sIsRefRow(j) && slotCanonId(j) == k && structFieldCodesEq(j, i) == 1 {
+    if !sIsRefRow(j) && slotHeapId(j) == k && structFieldCodesEq(j, i) == 1 {
       return j
     }
     j = j + 1
