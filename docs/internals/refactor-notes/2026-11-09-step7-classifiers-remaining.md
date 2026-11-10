@@ -129,12 +129,14 @@ heap type, so a typed answer that names the canonical twin is graded at the cons
 did (2,174 programs byte-identical). What is left is a named alias or intersection row (`type AB =
 A & B`, `type MyCat = Cat`). The structural reader finds no row under that type, and creating one
 would be a mint on a miss in a question reader, which the rulings exclude. **EMITTER**: the
-intersection's row minted where the binding's type is first lowered.
+intersection's row minted where the binding's type is first lowered. **Done 2026-11-10**
+([notes](2026-11-10-step7-named-alias-rows.md)): the alias's row is keyed by its type where the
+declaration is lowered, and both classifiers still disagree on facts of other groups.
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `structIndexOfExpr` | 3,497,141 (13,707) | 50: `structIndexOfMemberExpr` 2,245,964, `memRecvStructRow` 690,308, `binEqStructRow` 171,338 | `structRowOfRecordTy(nonNullTy(nodeTyAt))`, 3,452,888 agree + 3,736 layout twins / 40,517 (r27) | Re-shadowed in r27. 17,111 typed-only calls are union arm values, whose layout is `exprVariantIndex`'s (D34). 16,674 name a record's build row where the type names the declared one (`nested-record-built-wider-beside-own-binding-runs.vl`), and the literal's `litRepTyAt` row covers 431 of them. Missing: the read's built-at row (group 6's read rep). |
-| `letCellSlot` | 224,897 (16,203) | 3: `letLocalSlot` 189,006, `emitGlobalSection` 27,126, `captureValStructIdx` 8,765 | per arm (r16, r23): struct/variant 20 / 10, reflist 11,024 / 35, nulmap switched | The named intersection row (struct arm). A hole element at a generic pin (reflist arm, group 2). An un-annotated `Map()`'s per-binding shape (r14). |
+| `structIndexOfExpr` | 3,497,141 (13,707) | 50: `structIndexOfMemberExpr` 2,245,964, `memRecvStructRow` 690,308, `binEqStructRow` 171,338 | `structRowOfRecordTy(nonNullTy(nodeTyAt))`, 3,452,888 agree + 3,736 layout twins / 40,517 (r27) | Re-shadowed in r27. 17,111 typed-only calls are union arm values, whose layout is `exprVariantIndex`'s (D34). 16,674 name a record's build row where the type names the declared one (`nested-record-built-wider-beside-own-binding-runs.vl`), and the literal's `litRepTyAt` row covers 431 of them. Missing: the read's built-at row (group 6's read rep). Named alias rows are keyed by their type since 2026-11-10, and against `repStructRowOfTy` no disagreement has an alias type (453 calls moved, [notes](2026-11-10-step7-named-alias-rows.md)). |
+| `letCellSlot` | 224,897 (16,203) | 3: `letLocalSlot` 189,006, `emitGlobalSection` 27,126, `captureValStructIdx` 8,765 | struct arm 18 / 19 (2026-11-10); reflist 11,024 / 35 (r23), nulmap switched | The struct arm's one miss is a binding stored at its generic callee's wider row (group 9). A hole element at a generic pin (reflist arm, group 2). An un-annotated `Map()`'s per-binding shape (r14). |
 
 ## 8. A rep rule's row that the type does not key (1)
 
@@ -187,7 +189,7 @@ build row, 14,881 / 0). The four left:
 | closure bundle, `fRet*` columns | emitter, lane w168 | 3 | 0.98 M | D15142, D15146 |
 | generic instance key | checker | 2 | 0.24 M | D9130, D3868 |
 | read rep in the table's numbering | emitter | 6 | 5.22 M | D2316, D2325 |
-| named intersection row | emitter (mint excluded today) | 2 | 3.72 M | `struct-alias-transparent.vl` |
+| named intersection row | emitter, keyed at the declaration (2026-11-10) | 2 | 3.72 M | `struct-alias-transparent.vl`, D14162 |
 | rep-rule row (`recListRetTakesRep`) | emitter | 1 | 0.01 M | D14813 |
 | callee's published join | checker | 1 | 0.17 M | (the two r21 witnesses) |
 | list-literal classifiers (r27: 2 switched) | emitter, partly lane w254 | 6 → 4 | 0.19 M | tagged id lists |
