@@ -1320,7 +1320,6 @@ import {
   nulScalarListKindOfNode,
   nulVariantIndexOf,
   paramStructIdxOf,
-  structIdxOfElemNameTy,
   tyAnnRefListSlot,
   vtKindOfParam,
   vtKindOfType,
@@ -1374,6 +1373,7 @@ import {
   sFieldRefSlot,
   structRowFieldStoresAtom,
   structRowOfAnnTy,
+  uFieldTgtStructIdx,
   variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
 import {
@@ -10732,7 +10732,7 @@ function variantFieldsComparable(vi: i32): boolean {
   let j = 0
   while j < cnt {
     if start + j >= sFieldTypes.length { return false }
-    if !variantFieldComparable(start + j) { return false }
+    if !variantFieldComparable(vi, start + j) { return false }
     j = j + 1
   }
   true
@@ -10746,7 +10746,7 @@ function variantFieldsComparable(vi: i32): boolean {
 // for: one unservable field declines the whole compare, so a `{ d: f64 }` arm would refuse
 // `p == a` while the identical field compares fine at its direct spelling. Most of those cores
 // exist already; `i64` and `f32` are the two the struct ladder does not serve either.
-function variantFieldComparable(ufi: i32): boolean {
+function variantFieldComparable(vi: i32, ufi: i32): boolean {
   const c = sFieldTypes[ufi]
   if c == FC_NUL_NONE {
     return true // `null` has one value: the core drops both reads and answers true
@@ -10775,7 +10775,7 @@ function variantFieldComparable(ufi: i32): boolean {
   // D974 — a nested shape field (code 15) is comparable when its shape has an interned struct
   // row, which `collectU` mints for exactly these (`internInlineShapeTy`). No row, no compare —
   // the same decline discipline every other code gets.
-  if c == FC_STRUCT { return variantNestedRow(ufi) >= 0 }
+  if c == FC_STRUCT { return variantNestedRow(vi, ufi) >= 0 }
   // A ref-list field needs the ref-list slot its element name resolves to, both to reserve the
   // frame and to pick the element core; without one there is no compare to emit.
   if c == FC_REF_LIST { return variantRefListFieldSlot(ufi) >= 0 }
@@ -10785,7 +10785,7 @@ function variantFieldComparable(ufi: i32): boolean {
   // a null guard, so it is comparable exactly when that twin is. Same table, same guard and the
   // same admission rule as the struct ladder's: one home, two ladders.
   const cn = nulFieldInnerCode(c)
-  if cn >= 0 { return variantFieldCodeComparable(ufi, cn) }
+  if cn >= 0 { return variantFieldCodeComparable(vi, ufi, cn) }
   eqVariantListFieldKind(c) >= 0
 }
 
@@ -10802,14 +10802,14 @@ function variantBoxFieldComparable(ufi: i32): boolean {
 
 // The admission question keyed by an EXPLICIT code, so the niche rung above can ask it of the
 // non-null twin without re-entering the niche arm.
-function variantFieldCodeComparable(ufi: i32, c: i32): boolean {
+function variantFieldCodeComparable(vi: i32, ufi: i32, c: i32): boolean {
   if c == FC_I32 || c == FC_NUL_BOOL || c == FC_NUL_LIT_UNION { return true }
   if c == FC_STR { return true }
   if c == FC_F64 { return true }
   if c == FC_I64 { return true }
   if c == FC_F32 { return true }
   if c == FC_CLOSURE { return true }
-  if c == FC_STRUCT { return variantNestedRow(ufi) >= 0 }
+  if c == FC_STRUCT { return variantNestedRow(vi, ufi) >= 0 }
   if c == FC_REF_LIST { return variantRefListFieldSlot(ufi) >= 0 }
   eqVariantListFieldKind(c) >= 0
 }
@@ -10906,7 +10906,7 @@ function emitVariantFieldsEq(body: u8[], al: i32, ar: i32, vi: i32, fnIx: i32) {
       fbStructGet(variantHeap(vi), j)
       fbLocalGet(ar)
       fbStructGet(variantHeap(vi), j)
-      if emitVariantFieldEqCore(body, start + j, fnIx) < 0 { return -1 }
+      if emitVariantFieldEqCore(body, vi, start + j, fnIx) < 0 { return -1 }
     }
     fbI32Bin(113) // 0x71 i32.and
     j = j + 1
@@ -10947,19 +10947,25 @@ function emitVariantNulFieldEq(
   fbLocalGet(ar)
   fbStructGet(variantHeap(vi), j)
   fbRefAsNonNull()
-  if emitVariantFieldEqCoreAt(body, ufi, fnIx, inner) < 0 { return -1 }
+  if emitVariantFieldEqCoreAt(body, vi, ufi, fnIx, inner) < 0 { return -1 }
   fbEnd()
   fbEnd()
   0
 }
 
-function emitVariantFieldEqCore(body: u8[], ufi: i32, fnIx: i32) {
-  emitVariantFieldEqCoreAt(body, ufi, fnIx, sFieldTypes[ufi])
+function emitVariantFieldEqCore(body: u8[], vi: i32, ufi: i32, fnIx: i32) {
+  emitVariantFieldEqCoreAt(body, vi, ufi, fnIx, sFieldTypes[ufi])
 }
 
 // The same ladder keyed by an EXPLICIT code — what the null guard re-enters at the niche's
 // non-null twin.
-function emitVariantFieldEqCoreAt(body: u8[], ufi: i32, fnIx: i32, c: i32) {
+function emitVariantFieldEqCoreAt(
+  body: u8[],
+  vi: i32,
+  ufi: i32,
+  fnIx: i32,
+  c: i32,
+) {
   if c == FC_NUL_NONE {
     // Both sides hold only `null`: drop the two reads, the field always agrees.
     fbDrop()
@@ -10972,7 +10978,7 @@ function emitVariantFieldEqCoreAt(body: u8[], ufi: i32, fnIx: i32, c: i32) {
     return 0
   }
   if c == FC_STR { return emitStrEqCore(body) }
-  if c == FC_STRUCT { return emitNestedShapeEq(body, ufi) }
+  if c == FC_STRUCT { return emitNestedShapeEq(body, vi, ufi) }
   if c == FC_F64 {
     fbI32Bin(97) // 0x61 f64.eq
     return 0
@@ -11005,15 +11011,15 @@ function emitVariantFieldEqCoreAt(body: u8[], ufi: i32, fnIx: i32, c: i32) {
   emitFail("emitProgram: unsupported variant field type in equality")
 }
 
-// D974 — the interned struct row of a variant field's NESTED shape, or -1.
-function variantNestedRow(ufi: i32): i32 {
+// D974 — the interned struct row of variant `vi`'s field `ufi` (a flat row) NESTED shape, or
+// -1: the row the type section stores it at, else its inline shape interned.
+function variantNestedRow(vi: i32, ufi: i32): i32 {
+  if vi < 0 || vi >= uFieldStart.length { return -1 }
+  if ufi < 0 || ufi >= sFieldElemName.length { return -1 }
   const nm = sFieldElemName[ufi]
   if nm == "" { return -1 }
-  // A NAMED nested type (`type C = {r: i32}` as an arm's field) has a struct row under its
-  // NAME; only an INLINE shape needs interning. Asking the name first is what makes the
-  // common spelling resolve — `internInlineShapeTy("C", …)` answers -1 for it.
-  const named = structIdxOfElemNameTy(nm, uFieldElemTyIxRow(ufi))
-  if named >= 0 && named < sHeapIdx.length { return named }
+  const stored = uFieldTgtStructIdx(vi, ufi - uFieldStart[vi])
+  if stored >= 0 && stored < sHeapIdx.length { return stored }
   const row = internInlineShapeTy(nm, uFieldElemTyIxRow(ufi))
   if row < 0 { return -1 }
   if row >= sHeapIdx.length { return -1 }
@@ -11023,8 +11029,8 @@ function variantNestedRow(ufi: i32): i32 {
 // Compare two NESTED shape refs already on the stack, field-wise. Unlike the arms themselves,
 // a nested shape HAS an interned struct row, so `emitStructEqRec` is available — it just needs
 // its operands parked, which is what its `-2` / `-3` sentinels read.
-function emitNestedShapeEq(body: u8[], ufi: i32) {
-  const row = variantNestedRow(ufi)
+function emitNestedShapeEq(body: u8[], vi: i32, ufi: i32) {
+  const row = variantNestedRow(vi, ufi)
   if row < 0 { return -1 }
   const nl = structEqStashSlot(row)
   const nr = structEqStashSlot(row + 1024)
