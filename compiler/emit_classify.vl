@@ -477,7 +477,6 @@ import {
   variantRowInRowOfTy,
 } from "./emit_mv_slots"
 import {
-  globalLetOfDeclRead,
   globalLetOfSid,
   ifJoinTypedAtom,
   variantIndexOf,
@@ -5877,92 +5876,58 @@ export function forInPairStructIdx(iterIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The element struct table index of a `for v in <S[]>` iterable (the struct that the
-// code-1 loop var binds), or -1 when the iterable is not a struct ref list. Mirrors
-// the index-read resolution (`structIndexOfExpr` over `xs[i]`): the element name comes
-// from the ref-list slot, then its struct table index.
-export function forInRefArrayStructIdx(iterIx: i32, fnIx: i32) {
-  const mvs = forInMapValsSlot(iterIx, fnIx)
-  if mvs >= 0 {
-    // An ARM-valued map's `.values()` walk has no STRUCT row to bind (D34) — the loop var's
-    // layout lives in the variant table, and this resolver's contract is a struct index. It
-    // declines rather than handing back a row from the other namespace.
-    if mvValVariantOf(mvs) >= 0 { return -1 }
-    if mvValKind[mvs] == MVK_STRUCT { return mvValStructIdxOf(mvs) }
-    return -1
-  }
-  if !exprRefArray(iterIx, fnIx) { return -1 }
-  // Strip a `| null` niche suffix (`(P | null)[]` → "P") so the nullable-struct loop var
-  // carries P's struct index.
-  structIdxOfElemNameTy(
-    refListElemNameOfExpr(iterIx, fnIx),
-    tyRefArrElemOf(nodeTyAt(iterIx, fnIx)),
-  )
-}
-
-// The variant row of the same loop var — `forInRefArrayStructIdx`'s storage-class twin,
-// built arm for arm against it (D50): an arm-valued map's `.values()` walk (the row the
-// struct half declines) and an arm-element ref list (the row `structIdxOfElemNameTy`'s
-// nominal floor declines, via `rlElemVariantRow`). Both halves already existed as declines.
-export function forInRefArrayVariantIdx(iterIx: i32, fnIx: i32) {
-  const mvs = forInMapValsSlot(iterIx, fnIx)
-  if mvs >= 0 { return mvValVariantOf(mvs) }
-  if !exprRefArray(iterIx, fnIx) { return -1 }
-  const byName = rlElemVariantRow(refListSlotOfExpr(iterIx, fnIx))
-  if byName >= 0 { return byName }
-  // A slot spelled at the arm's record shape names no variant; its type still folds to one.
-  repSlotOfKind("variant", tyRefArrElemOf(nodeTyAt(iterIx, fnIx)))
-}
-
-// The companion table slot of a `for-in` loop variable's cell — paired with `addLocalSlot`
-// the same way `declareForInLocals` does (lifted out of it, D1142, since a captured loop
-// var needs the same pair for its closure env field). -1 for every kind needing no slot —
-// the scalars, the leaf scalar lists, `str`/`nulstr`/`list`/`u8list`/`union`/`closure`.
+// The companion table slot of a `for-in` loop variable's cell, paired with `addLocalSlot` as
+// `declareForInLocals` does (D1142): the row of the iterated list's rep (`listRowOfExpr`), else
+// the slot its element type keys (`repSlotOfKind`); a `.values()` walk reads the map's vals slot.
+// -1 for every kind needing no slot, the scalars and scalar lists among them.
 export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
   if clsCensusOn { clsCensusEnter("forInVarStructIdx") }
   const fk = forInElemKind(iterIx, fnIx)
+  const e = tyRefArrElemOf(nodeTyAt(iterIx, fnIx))
   match fk {
     "struct" | "nulstruct" => {
-      const old = forInRefArrayStructIdx(iterIx, fnIx)
-      if repShadowOn { fivsShadow(iterIx, fnIx, fk, old) }
-      return old
+      const mvs = forInMapValsSlot(iterIx, fnIx)
+      if mvs >= 0 {
+        // An arm-valued map's walk has no struct row; its layout is a variant row (D34).
+        if mvValVariantOf(mvs) >= 0 { return -1 }
+        if mvValKind[mvs] == MVK_STRUCT { return mvValStructIdxOf(mvs) }
+        return -1
+      }
+      if !exprRefArray(iterIx, fnIx) { return -1 }
+      const rs = listRowOfExpr(iterIx, fnIx)
+      if rs >= 0 && rs < rlElemName.length {
+        return structIdxOfElemNameTy(rlElemName[rs], e)
+      }
+      return repSlotOfKind(fk, e)
     }
     "variant" | "nulvariant" => {
-      return forInRefArrayVariantIdx(iterIx, fnIx)
+      const mvs = forInMapValsSlot(iterIx, fnIx)
+      if mvs >= 0 { return mvValVariantOf(mvs) }
+      if !exprRefArray(iterIx, fnIx) { return -1 }
+      const rv = rlElemVariantRow(listRowOfExpr(iterIx, fnIx))
+      if rv >= 0 { return rv }
+      return repSlotOfKind("variant", e)
     }
-    // A nested ref array (`S[][]`): the loop var is the inner ref list, off the outer
-    // list's element slot.
+    // A nested ref array (`S[][]`): the loop var is the inner ref list. A list of hole
+    // functions keys no rep row, and its slot is the ladder's (D15561).
     "reflist" | "nulreflist" => {
+      const rs = listRowOfExpr(iterIx, fnIx)
+      if rs >= 0 { return rlElemInnerSlot(rs) }
       return rlElemInnerSlot(refListSlotOfExpr(iterIx, fnIx))
     }
-    // A map element or a nested-map value: the loop var's map shape, off the vals slot of a
-    // `.values()` walk or the element slot of a map list.
+    // A map element or a nested-map value: the vals slot of a `.values()` walk, else the
+    // element row of a map list.
     "map" | "nulmap" => {
       const mvs = forInMapValsSlot(iterIx, fnIx)
       if mvs >= 0 { return mvInnerMapShape(mvs) }
-      const rs = refListSlotOfExpr(iterIx, fnIx)
-      if rs < 0 || rs >= rlElemTyIx.length { return -1 }
-      return rlElemMapShape(rs)
+      const rs = listRowOfExpr(iterIx, fnIx)
+      if rs >= 0 && rs < rlElemTyIx.length { return rlElemMapShape(rs) }
+      return -1
     }
     // Every other element kind, and no element kind, carries no row.
     "i32" | "list" | "str" | "union" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulnone" | "u8list" | "v128" | null => {}
   }
   -1
-}
-
-// Shadow only (`$VL_REP_SHADOW`): `forInVarStructIdx`'s struct row against the canonical row
-// `repSlotOfKind` reads off the iterated list's element type.
-function fivsShadow(iterIx: i32, fnIx: i32, fk: VKind | null, old: i32) {
-  const e = tyRefArrElemOf(nodeTyAt(iterIx, fnIx))
-  repABNote("fivs", "kind", fivsWord(old, repSlotOfKind(fk, e)))
-}
-
-// How a typed answer compares with the classifier's.
-function fivsWord(old: i32, typed: i32): string {
-  if old == typed { return "agree" }
-  if old >= 0 && typed < 0 { return "old-row typed-none" }
-  if old < 0 { return "old-none typed-row" }
-  "two-rows"
 }
 
 // True if the map-typed expression at `exprIx` is a set at either key rep (shape -2 or -5,
@@ -13602,7 +13567,6 @@ export function identIsBoundClosure(readIx: i32, fnIx: i32): boolean {
 
 // `identIsBoundClosure` after mono, from the frame's locals and captures.
 function identIsBoundClosureGo(readIx: i32, fnIx: i32): boolean {
-  if clsCensusOn { clsCensusEnter("identIsBoundClosureGo") }
   const rn = nodeAt(readIx)
   const name = if rn is Ident { rn.identName } else { "" }
   if paramIsClosure(fnIx, readIx) { return true }
@@ -13627,9 +13591,9 @@ function identIsBoundClosureGo(readIx: i32, fnIx: i32): boolean {
       const ld = nodeAt(li)
       if ld is LetDecl {
         if ld.letType >= 0 { return tyIsFuncType(ld.letType) }
-        // `exprIsClosureNoLocal`, not `letDeclIsClosureNoLocal`: an alias of a closure param
-        // or global is a closure binding too, and that one hop is what this classifier is for.
-        return exprIsClosureNoLocal(ld.letInit, fnIx)
+        // The initializer's recorded type, so an alias of a closure parameter or global is one.
+        const it = unwrapParen(ld.letInit)
+        return it >= 0 && !fnTagTyIsTagged(nodeTyIxOf(it)) && nodeTyIsFunc(it)
       }
     }
   }
@@ -14297,7 +14261,7 @@ export function fnReturnsClosure(t: i32) {
     if fn.fnRet < 0 && tyIsFnArmUnion(tyStepRet(nodeTyIxOf(fnStmts[t]))) {
       return false
     }
-    return blockTailIsClosure(fn.fnBody, fnStmts[t])
+    return blockTailIsClosure(fn.fnBody)
   }
   false
 }
@@ -14340,89 +14304,19 @@ function fnHandsBackTaggedParam(fn: FuncDecl): boolean {
   true
 }
 
-// True if the block's tail (implicit-return) expression is a function value.
-function blockTailIsClosure(blockIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("blockTailIsClosure") }
+// True if the block's tail (implicit-return) expression is a function value: the checker records
+// a `TyFunc` for every spelling that yields one, and `nodeTyIsFunc` is structural, so a function
+// list, a nullable closure and a tagged set's member are not one (D1620).
+function blockTailIsClosure(blockIx: i32) {
   const b = nodeAt(blockIx)
   if b is Block {
-    const stmts = b.blkStmts
-    const n = stmts.length
+    const n = b.blkStmts.length
     if n == 0 { return false }
-    const last = stmts[n - 1]
+    const last = b.blkStmts[n - 1]
     const s = nodeAt(last)
-    if s is RetStmt {
-      if s.retArg >= 0 { return tailValueIsClosure(s.retArg, fnIx) }
-      return false
-    }
-    return tailValueIsClosure(last, fnIx)
-  }
-  false
-}
-
-// The tail value's own question, asked of the ARENA first and of the syntax second. The
-// checker recorded a `TyFunc` for every spelling that yields a function value — a call
-// hop, a returned local, a chain of them — and `nodeTyIsFunc` is structural, so a func
-// ARRAY and a NULLABLE closure are excluded and only the plain `closure` rep claims (D1620).
-function tailValueIsClosure(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 || fnTagTyIsTagged(nodeTyIxOf(exprIx)) { return false }
-  if nodeTyIsFunc(exprIx) { return true }
-  exprIsClosureNoLocal(exprIx, fnIx)
-}
-
-// The declaration half of `exprIsClosureNoLocal`'s binding arm: "does this `let`/`const`
-// hold a function value", without the locals registry: its annotation, else its initializer's
-// recorded type, is a function type.
-export function letDeclIsClosureNoLocal(letIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letType >= 0 { return tyIsFuncType(d.letType) }
-    if d.letInit < 0 { return false }
-    return tyIsFuncType(unwrapParen(d.letInit))
-  }
-  false
-}
-
-function exprIsClosureNoLocal(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("exprIsClosureNoLocal") }
-  if exprIx < 0 { return false }
-  const e = nodeAt(exprIx)
-  match e {
-    Paren => {
-      return exprIsClosureNoLocal(e.parInner, fnIx)
-    }
-    FuncDecl => {
-      return true
-    }
-    Ident => {
-      // The scope must be asked first: a module-wide function lookup ranks below every scope
-      // question, or a shadowing param/let/for-var would misclassify as the function.
-      const b = identBindingOfRead(fnIx, exprIx)
-      if b >= 0 {
-        const bn = nodeAt(b)
-        if bn is Param { return tyIsFuncType(bn.parType) }
-        if bn is LetDecl { return letDeclIsClosureNoLocal(b) }
-        // A `for` variable: an i32 counter, or an element of the iterated list. Neither is
-        // a bare function NAME, which is all this no-registry predicate can claim.
-        return false
-      }
-      const d = identDeclOf(exprIx)
-      if d >= 0 {
-        const dn = nodeAt(d)
-        if dn is LoopVar || dn is ForRange { return false }
-      }
-      // The module is the outermost frame, and the chain above never reaches it (D1542): a
-      // top-level lambda's `fnParent` walk ends at -1, missing a module-scope capture.
-      const mll = moduleLocalLetOfRead(emitRootIx, exprIx)
-      if mll >= 0 { return letDeclIsClosureNoLocal(mll) }
-      const gcl = globalLetOfDeclRead(exprIx)
-      if gcl >= 0 { return letDeclIsClosureNoLocal(gcl) }
-      return fnIndexOfNode(exprIx) >= 0
-    }
-    ObjLit => {
-      return false
-    }
-    // No other expression is a closure without a local cell.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+    const tx = if s is RetStmt { s.retArg } else { last }
+    if tx < 0 || fnTagTyIsTagged(nodeTyIxOf(tx)) { return false }
+    return nodeTyIsFunc(tx)
   }
   false
 }

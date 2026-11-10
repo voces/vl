@@ -18,6 +18,8 @@ Newest first:
 - [2026-11-09-step7-fret-repof](2026-11-09-step7-fret-repof.md): Step 7: the un-annotated `fRet*` columns read off `repOf`; five steps between them deleted, seed −2,088.
 - [2026-11-09-step7-classifier-r22](2026-11-09-step7-classifier-r22.md): Step 7: classifier round 22, `letCellKindGo`, `letInitIsNulLitBox`, `exprIsStrMethod` typed, `globalCellKindGo` deleted; 62 → 53 probed.
 - [2026-11-09-step7-classifier-r23](2026-11-09-step7-classifier-r23.md): Step 7: classifier round 23, `identCellVKind` and `identStoreVKind` read the declaration's cell; 53 → 51 probed.
+- [2026-11-09-step7-classifiers-remaining](2026-11-09-step7-classifiers-remaining.md): Step 7: the 42 classifiers that remain, grouped by the fact each would need (8 read the emitter's own storage and stay; two facts are the checker's).
+- [2026-11-09-step7-classifier-r26](2026-11-09-step7-classifier-r26.md): Step 7: classifier round 26, `forInVarStructIdx` reads the iterated list's row and `blockTailIsClosure` the tail's type; `exprIsClosureNoLocal` deleted; 45 → 42 probed.
 - [2026-11-09-step7-classifier-r25](2026-11-09-step7-classifier-r25.md): Step 7: classifier round 25, a captured local's env field kind and slot read the local's cell; `initIsNestedStructFieldRead` deleted; 47 → 45 probed.
 - [2026-11-09-step7-classifier-r24](2026-11-09-step7-classifier-r24.md): Step 7: classifier round 24, `unionIdentReadKind` and `popRefRecvSlot` typed, `letInitNarrowedAtomKind` deleted; 51 → 47 probed.
 - [2026-11-09-step7-union-arm-rows-minted-on-read](2026-11-09-step7-union-arm-rows-minted-on-read.md): Step 7: a union's ref-array arm row mints at its first read; the union pass's element intern is deleted.
