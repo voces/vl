@@ -7,8 +7,8 @@ is a shared cloud VM.
 The rep layer asks `readAtomKindOfTy` once per read. When `btOfTy` answers `-2`, `boxTagOfTy`
 renders the type and parses the spelling back, and that was about 6% of the L2 samples.
 `readAtomKindOfTy` (emit_start_block.vl) now keeps its answer per arena index. The memo is
-stamped with `tyRegGenNow` through a `MemoKey`, which `memoCompileReset` forgets at each compile, the generation over every table
-the render and `btOfTy` read.
+stamped with `tyRegGenNow`, the generation over every table the render and `btOfTy` read. The
+stamp is kept in a `MemoKey`, which `memoCompileReset` forgets at each compile.
 
 | build | fuel before | fuel after | Δ | peak RSS / peak live |
 | --- | ---: | ---: | ---: | --- |
