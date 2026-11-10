@@ -1,7 +1,7 @@
 # Step 7: a hole's covered rep (group 2) and the kept delivery's row (group 8), 2026-11-10
 
 The shadows ran on master `67329a97` plus #7022–#7024 (42 probed); the census and proof below are on
-the tree merged with master `3de5b959` (31 probed, after round 27). It covers groups 2 and 8 of `2026-11-09-step7-classifiers-remaining.md`, under
+the tree merged with master `fab5402d` (31 probed). It covers groups 2 and 8 of `2026-11-09-step7-classifiers-remaining.md`, under
 DECISIONS.md §"How step 7's classifier half finishes". It uses round 26's method: a scratch compiler
 runs each classifier beside a typed twin and counts `SH` tags under `$VL_CLS_CENSUS=1` over the
 23,816-program sweep population. Every count below is post-mono calls.
@@ -68,7 +68,7 @@ C refuses. So `cloValueCallRetKind` switches, and `letTailRowSlot` keeps its fal
 
 * `listRowOfExpr` reads a named call's row from the callee instance's declared result type, where the
   call's own type keys none (`callRetListRow`). That is group 8's fact: D14813's binding takes
-  `Circle`'s row from a typed reader, and `letTailRowSlot`'s calls fall 8,703 → 8,399 on the merged tree (8,251 → 7,947 before).
+  `Circle`'s row from a typed reader, and `letTailRowSlot`'s calls fall 8,996 → 8,782 on the merged tree (8,251 → 7,947 before the merge).
 * `cloValueCallRetKind` is A. It leaves the probe set. Its field gate is `memberIsClosure`, group 1.
 * `fieldCodeCellKind` is in `STORAGE_READERS` and leaves the probe set.
 * `letTailRowSlot` stays probed. What still reaches it is a list of function values, which follows
@@ -78,9 +78,9 @@ C refuses. So `cloValueCallRetKind` switches, and `letTailRowSlot` keeps its fal
 
 | tree | probed | post-only | pre-only | both | uncalled | warnings |
 | --- | --- | --- | --- | --- | --- | --- |
-| master `3de5b959` | 31 | 31 | 0 | 0 | 0 | 0 |
+| master `fab5402d` | 31 | 31 | 0 | 0 | 0 | 0 |
 | this PR | 29 | 29 | 0 | 0 | 0 | 0 |
 
 **Proof.** Both sides are fixpoint seeds (two `refresh-compiler.sh` runs, byte-identical). Before the
 merge, master `67329a97`+ was 6,597,010 bytes and this PR 6,597,370 (+360). Merged with
-`3de5b959`, master is 6,598,290 and this PR 6,598,606 (+316). Late demands are 6, the baseline.
+`fab5402d`, master is 6,598,251 and this PR 6,598,575 (+324). Late demands are 6, the baseline.
