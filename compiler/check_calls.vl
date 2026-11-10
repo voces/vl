@@ -492,12 +492,12 @@ import {
   tyAt,
   tyEqSameHoles,
   tyHasHole,
+  tyHasInferHole,
   tyIsDeclaredParam,
   tyIsHole,
   tyIsParamHole,
   tyIxIsView,
   tyMentionsTyVarNamed,
-  tyHasInferHole,
   tyPrintsAsRef,
   tyRefusesArrayDemand,
   tyRefusesArrayWrite,
@@ -529,7 +529,12 @@ import {
   cwSoleBinderAt,
   fnDeclIx,
 } from "./check_write_scan"
-import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import {
+  i32ListHas,
+  i32ListIndexOf,
+  strListHas,
+  strListIndexOf,
+} from "./listutil"
 import { declOrigOf, identDeclOf, identFrom } from "./symbols"
 import {
   isNullTy,
@@ -3462,19 +3467,24 @@ function judgeHoleFieldCalls(
   }
   if !agree || nSet == 0 || T.diags.length > d0 { return 0 }
   const keys: string[] = []
+  const fields: string[] = []
   let fi = 0
   while fi < set.length {
-    if set[fi] { keys.push(holeFieldKey(calleeFn, vNames[k], ro.objFieldNames[fi])) }
+    if set[fi] {
+      keys.push(holeFieldKey(calleeFn, vNames[k], ro.objFieldNames[fi]))
+      fields.push(ro.objFieldNames[fi])
+    }
     fi = fi + 1
   }
   hfbSrcs.push(s)
   hfbTys.push(mkObjTy(ro.objFieldNames, fTys))
   hfbAts.push(a)
   hfbKeys.push(keys)
+  hfbFields.push(fields)
 }
 
 // `holeFieldCloNote`'s second half: each field a record literal `a` is, or a list literal `a`
-// holds, writes as a read of an un-annotated parameter.
+// holds, writes as a read of an un-annotated parameter its function also calls.
 function holeFieldSetNote(a: i32, callee: i32, hole: string) {
   const v = cwPeel(a)
   if v < 0 || v >= P.nodes.length { return 0 }
@@ -3491,22 +3501,50 @@ function holeFieldSetNote(a: i32, callee: i32, hole: string) {
       const d = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
       const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
       if dn is Param && dn.parType < 0 {
-        hfbSet[holeFieldKey(callee, hole, fi.fiName)] = true
+        const key = holeFieldKey(callee, hole, fi.fiName)
+        const at = hfbSet[key] ?? []
+        const ef = recEnclosingFn(d)
+        const efn = if ef >= 0 { nodeAt(ef) } else { null }
+        if efn is FuncDecl && hfbCallsParam(efn.fnBody, d) {
+          const pi = i32ListIndexOf(efn.fnParams, d)
+          at.push(holeFieldKey(ef, paramHoleName(efn.fnName, ef, pi), ""))
+        }
+        hfbSet[key] = at
       }
     }
   }
   0
 }
 
-// The record builds `judgeHoleFieldCalls` queued this pass: each one's sources, record, argument
-// and the callee's parameter fields it closes. And the parameter fields some call hands a
-// closure at a closed function type, or a hole parameter of the function making the call.
+// Whether a call in `body` names parameter `d` as its callee.
+function hfbCallsParam(body: i32, d: i32): boolean {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x < 0 || x >= P.nodes.length { continue }
+    const xn = nodeAt(x)
+    if xn is Call {
+      const cf = parenPeelIx(xn.callFn)
+      if cf >= 0 && nodeAt(cf) is Ident && identDeclOf(cf) == d { return true }
+    }
+    for c in nodeChildren(x) { todo.push(c) }
+  }
+  false
+}
+
+// The record builds `judgeHoleFieldCalls` queued this pass: sources, record, argument, and the
+// callee's parameter fields each closes, keyed and by name.
 let hfbSrcs: HoleRecSrcs[] = []
 let hfbTys: i32[] = []
 let hfbAts: i32[] = []
 let hfbKeys: string[][] = []
+let hfbFields: string[][] = []
+// The parameter fields some call hands a closure at a closed function type; those some call
+// hands a called hole parameter of its own function, with those holes; each hole a call hands
+// a function by name, with the functions (-1 for any other value).
 let hfbClo: {[string]: boolean} = Map()
-let hfbSet: {[string]: boolean} = Map()
+let hfbSet: {[string]: string[]} = Map()
+let hfbHand: {[string]: i32[]} = Map()
 
 function holeFieldKey(callee: i32, hole: string, field: string): string {
   i32ToStr(callee) + "|" + hole + "|" + field
@@ -3517,6 +3555,12 @@ function holeFieldKey(callee: i32, hole: string, field: string): string {
 // of the function making the call.
 function holeFieldCloNote(a: i32, callee: i32, hole: string) {
   holeFieldSetNote(a, callee, hole)
+  const hk = holeFieldKey(callee, hole, "")
+  const hd = if nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
+  const hn = if hd >= 0 && hd < P.nodes.length { nodeAt(hd) } else { null }
+  const hands = hfbHand[hk] ?? []
+  hands.push(if hn is FuncDecl && hn.fnName != "" { hd } else { -1 })
+  hfbHand[hk] = hands
   let t = nonNullTy(nodeTyOf(a))
   if t < 0 || t >= T.tys.length { return 0 }
   const tl = tyAt(t)
@@ -3542,27 +3586,74 @@ function holeFieldCloNote(a: i32, callee: i32, hole: string) {
 }
 
 // Builds each queued record at its instances, except where some call hands its parameter's
-// field a hole parameter of its own caller and none hands it a closure: there the record keeps
-// the named function's set, as a list does, so the tag decision decides it with the hole's.
+// field a hole parameter of its own caller, every call of that caller hands the hole the
+// function each source names there, and no call hands the field a closure: there the record
+// keeps the named function's set, as a list does, so the tag decision decides it with the hole's.
 export function holeFieldBuildsFlush() {
   let i = 0
   while i < hfbTys.length {
     let clo = false
     let set = false
-    for key in hfbKeys[i] {
+    let j = 0
+    while j < hfbKeys[i].length {
+      const key = hfbKeys[i][j]
       if hfbClo.has(key) { clo = true }
-      if hfbSet.has(key) { set = true }
+      const holes = hfbSet[key]
+      if holes != null {
+        set = true
+        if !hfbHandsNamed(holes, hfbSrcs[i], hfbFields[i][j]) { clo = true }
+      }
+      j = j + 1
     }
-    if clo || !set { holeRecAdopt(hfbSrcs[i], hfbTys[i], hfbAts[i], recAdSetGroup()) }
+    if clo || !set {
+      holeRecAdopt(hfbSrcs[i], hfbTys[i], hfbAts[i], recAdSetGroup())
+    }
     i = i + 1
   }
   hfbSrcs = []
   hfbTys = []
   hfbAts = []
   hfbKeys = []
+  hfbFields = []
   hfbClo = Map()
   hfbSet = Map()
+  hfbHand = Map()
   0
+}
+
+// Whether every call of each hole `holes` keys is noted handing it, by name, the one function
+// each source record literal of `s` names at field `field`.
+function hfbHandsNamed(
+  holes: string[],
+  s: HoleRecSrcs,
+  field: string,
+): boolean {
+  let want = -1
+  for src in s.recs {
+    const sn = nodeAt(src)
+    let got = -1
+    if sn is ObjLit {
+      for fx in sn.objFields {
+        const f = nodeAt(fx)
+        if f is FieldInit && f.fiName == field {
+          const v = parenPeelIx(f.fiValue)
+          const d = if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident { identDeclOf(v) } else { -1 }
+          if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl { got = d }
+        }
+      }
+    }
+    if got < 0 || want >= 0 && got != want { return false }
+    want = got
+  }
+  if want < 0 || holes.length == 0 { return false }
+  for h in holes {
+    const hands = hfbHand[h] ?? []
+    if hands.length == 0 { return false }
+    for x in hands {
+      if x != want { return false }
+    }
+  }
+  true
 }
 
 // Refuses, at argument `a`, generic function `fnName` handed through callee `via`, which reads
