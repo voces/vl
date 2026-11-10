@@ -22,6 +22,8 @@ below keep the eight ruled-out rows for their reasons and mark each change.
 **After the hole-rep round** (`2026-11-10-step7-hole-rep-and-kept-row.md`) 29 are probed.
 `cloValueCallRetKind` reads the callee's type, group 8's fact is provided, and `fieldCodeCellKind`
 reads the emitter's storage, so it joins group 1 in `STORAGE_READERS`.
+Then `2026-11-10-step7-hole-rep-read-key.md`: 27. Both callee-read classifiers read one typed key
+(`readCloSigKey`) and are deleted, so group 2 is closed.
 
 Grouped by the missing fact. Each group says whose fact it is: a CHECKER fact (the checker owns
 types) or an EMITTER rep fact (the emitter reconciles reps).
@@ -56,8 +58,8 @@ type mono should choose, so it stays a rep record.
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `calleeRetKindOfRead` | 223,664 (9,866) | 4: `exprUnionCall` 132,861, `calleeReturnsStringOfRead` 49,593, `callIsNulNone` 24,901 | the read's type at the instance, its `$fnsig` key's result, 216,222 / 7,442 (2026-11-10) | 6,722 of the 7,442 are the binding's producer lambda, keyed where its signature is interned (`cloSigKeyExt`). The read's type is a hole function (5,470), no function (675) or a function over a type variable (576). Record that key per binding declaration there. |
-| `calleeReturnsStructIdxOfRead` | 34,723 (1,789) | 1: `structIndexOfCallExpr` | the same key's struct slot, 34,739 / 20 (2026-11-10) | Same as `calleeRetKindOfRead`. |
+| ~~`calleeRetKindOfRead`~~ | deleted 2026-11-10 | | `readCloSigKey`: the read's closed type, else its declaration's initializer's lowered key, a parameter's or annotation's instance type, or the read's own type; 360,269 / 363 by key, wasm byte-identical in 10,337 of 10,337 reaching files | The binding's covered rep is its producer's lowered key, which the declaration link reaches. |
+| ~~`calleeReturnsStructIdxOfRead`~~ | deleted 2026-11-10 | | the same key's struct slot | — |
 | `fieldCodeCellKind` | 847 (438) | 1: `readCellKind` | none needed | It answers only where the field's recorded storage type is a hole or `nulnone`, from the code `sFieldTypes` holds for the row. The code is written at mint and rewritten in place, so a copied column would go stale. It reads the emitter's storage: **group 1**, in `STORAGE_READERS` since 2026-11-10. |
 | ~~`cloValueCallRetKind`~~ | switched 2026-11-10 | | the callee's type is a function, a field stored as a closure; 38,859 / 189, wasm byte-identical in 23,816 of 23,816 | — |
 
@@ -189,7 +191,7 @@ build row, 14,881 / 0). The four left:
 | missing fact | owner | classifiers | calls | touches |
 | --- | --- | --- | --- | --- |
 | none: the emitter's own storage (`NOT_BLIND` since r27) | emitter (provided) | 8 → 0 | 1.83 M | D842, D219, D4636, D26, D1788, D6342 |
-| covered rep of a hole (a binding's producer key) | emitter | 2 (+1 switched, +1 to group 1) | 0.26 M | D6271, D6342 |
+| covered rep of a hole (a binding's producer key) | emitter (provided) | 0 (2 deleted, 1 switched, 1 to group 1) | — | D6271, D6342 |
 | function-value list rows | emitter, lane w254 | 8 | 0.41 M | D15561, D12301, D12215, D6914 |
 | closure bundle, `fRet*` columns | emitter, lane w168 | 3 | 0.98 M | D15142, D15146 |
 | generic instance key | checker | 2 | 0.24 M | D9130, D3868 |
