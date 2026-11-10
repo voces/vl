@@ -1,9 +1,11 @@
 import {
   arrLitMintTrees,
+  arrNewTopRowsMint,
   fnSigRowsMint,
   isListArmRowsMint,
+  mapCtorRowsMint,
   markInferredIfJoins,
-  preIndexMintTrees,
+  markTagCallJoins,
 } from "./emit_collect"
 import { elabStubArgsPrime } from "./elab_stub"
 import { mfrLitsRun } from "./mfr_shadow"
@@ -182,15 +184,17 @@ import {
   unwrapParen,
 } from "./emit_base"
 import {
-  blockHasScratch,
+  blockScratchMisses,
   constFoldOfLet,
-  exprHasScratch,
-  fnHasScratch,
+  exprScratchMisses,
+  fnScratchMisses,
   globalCellIsImmutable,
   globalHasTypeAnn,
   globalIsNonConst,
   letInitFoldsExpr,
   nliFnIndexReset,
+  scrArrNew,
+  scrCoalesceCall,
   tyHasFnMemoReset,
 } from "./emit_query"
 import {
@@ -1454,8 +1458,7 @@ function startScanBlock(blockIx: i32) {
       bi = bi + 1
     }
   }
-  if blockHasScratch(blockIx, "arrNew") { fnUsesArrNew = true }
-  if blockHasScratch(blockIx, "coalesceCall") { fnUsesCoalesceCall = true }
+  applyScratchHits(scrBoth, blockScratchMisses(blockIx, scrBoth))
   if blockHasMapOp(blockIx, -1) { fnUsesMap = true }
   collectRefSlots(blockIx, -1)
   0
@@ -1470,8 +1473,7 @@ function startScanHeaderExpr(exprIx: i32) {
   const armScoped = armScopeOpenOver(exprIx, exprIx)
   if exprHasStrOp(exprIx, -1) { fnUsesStrOp = true }
   if armScoped { scopePop() }
-  if exprHasScratch(exprIx, "arrNew") { fnUsesArrNew = true }
-  if exprHasScratch(exprIx, "coalesceCall") { fnUsesCoalesceCall = true }
+  applyScratchHits(scrBoth, exprScratchMisses(exprIx, scrBoth))
   if exprHasMapOp(exprIx, -1) { fnUsesMap = true }
   applyPushPopBits(exprPopBits(exprIx, -1))
   collectMemberPopRefSlotsExpr(exprIx, -1)
@@ -1984,6 +1986,16 @@ function scanStashes(ix: i32, fnIx: i32) {
   if (hit & stashListGet) != 0 { fnUsesListGet = true }
 }
 
+// Sets the flag of each scratch bit of `want` that a scan's misses `miss` leave out.
+function applyScratchHits(want: i32, miss: i32) {
+  const hit = want - (want & miss)
+  if (hit & scrArrNew) != 0 { fnUsesArrNew = true }
+  if (hit & scrCoalesceCall) != 0 { fnUsesCoalesceCall = true }
+  0
+}
+
+const scrBoth = scrArrNew + scrCoalesceCall
+
 // The scratch detection of user function `fnIx`'s body, after the resets in `emitFuncCode`.
 function fnDetectScratch(fnIx: i32) {
   const fn = nodeAt(fnIx)
@@ -2001,12 +2013,10 @@ function fnDetectScratch(fnIx: i32) {
     if !fnUsesStrOp {
       if fnHasStrOp(fnIx) { fnUsesStrOp = true }
     }
-    if !fnUsesArrNew {
-      if fnHasScratch(fnIx, "arrNew") { fnUsesArrNew = true }
-    }
-    if !fnUsesCoalesceCall {
-      if fnHasScratch(fnIx, "coalesceCall") { fnUsesCoalesceCall = true }
-    }
+    let scrWant = 0
+    if !fnUsesArrNew { scrWant = scrWant + scrArrNew }
+    if !fnUsesCoalesceCall { scrWant = scrWant + scrCoalesceCall }
+    applyScratchHits(scrWant, fnScratchMisses(fnIx, scrWant))
     if !fnUsesMap {
       if fnHasMap(fnIx) { fnUsesMap = true }
     }
@@ -2154,8 +2164,7 @@ function startFnDetectScratch() {
         // A `string` global initialized with a literal-union atom widens via the runtime tower
         // (`emitAtomToStr`), which stages the atom id in the string-op scratch frame.
         if globalInitWidensAtomToStr(globalStmts[gi]) { fnUsesStrOp = true }
-        if exprHasScratch(ix, "arrNew") { fnUsesArrNew = true }
-        if exprHasScratch(ix, "coalesceCall") { fnUsesCoalesceCall = true }
+        applyScratchHits(scrBoth, exprScratchMisses(ix, scrBoth))
         if exprHasMapOp(ix, -1) { fnUsesMap = true }
         collectMemberPopRefSlotsExpr(ix, -1)
         // A `.map`/`.filter` in a non-const global initializer (`const ys =
@@ -2211,10 +2220,7 @@ function startFnDetectScratch() {
       const armKept = stmtArmScopeOpen(startStmts[si])
       if exprHasStrOp(startStmts[si], -1) { fnUsesStrOp = true }
       if armKept >= 0 { scopePop() }
-      if exprHasScratch(startStmts[si], "arrNew") { fnUsesArrNew = true }
-      if exprHasScratch(startStmts[si], "coalesceCall") {
-        fnUsesCoalesceCall = true
-      }
+      applyScratchHits(scrBoth, exprScratchMisses(startStmts[si], scrBoth))
       if exprHasMapOp(startStmts[si], -1) { fnUsesMap = true }
       if callIsPushKind(startStmts[si], -1, "ref") {
         recordStartRefPushSlot(startStmts[si])
@@ -7400,12 +7406,10 @@ function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
     }
     "collectMapFilterUse" => {
       // The rows the signature passes read first and no reader may take late.
-      const tops: i32[] = []
-      for st in stmts {
-        if !(nodeAt(st) is FuncDecl) { tops.push(st) }
-      }
-      preIndexMintTrees(tops, fnStmts)
+      mapCtorRowsMint()
       isListArmRowsMint()
+      markTagCallJoins()
+      arrNewTopRowsMint()
       markInferredIfJoins()
       return collectMapFilterUse()
     }

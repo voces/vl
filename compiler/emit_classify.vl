@@ -66,7 +66,6 @@ import {
   arenaRefWritesNow,
   arithRegionSeen,
   binderNameAt,
-  callIsNever,
   externLinkOf,
   externRetIsVoid,
   hasSpreadItem,
@@ -387,7 +386,6 @@ import {
   popUnionBoxElem,
 } from "./emit_fn_ret_kinds"
 import {
-  exprIsNullLit,
   ifElseValueIx,
   ifIsChainHeadIn,
   ifJoinIsNulString,
@@ -1450,26 +1448,18 @@ function globalReadIsString(fnIx: i32, readIx: i32) {
 
 // The variant row of the `(ref null $variantHeap(vi))` niche expression `exprIx` holds, or -1
 // when it holds none. The one producer of the nullable-variant kind and its row:
-// `exprNullableVariant` is this answer `>= 0`. Each arm reads the storage that typed the value,
-// so an arm and its layout twin in another position keep their own rows.
+// `exprNullableVariant` is this answer `>= 0`. A read answers the storage it reads, so an arm and
+// its layout twin in another position keep their own rows; a join answers its own type's row.
 export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
-  if clsCensusOn { clsCensusEnter("nulVariantIdxOfExpr") }
   if exprIx < 0 { return -1 }
   const e = nodeAt(exprIx)
   match e {
     Paren => {
       return nulVariantIdxOfExpr(e.parInner, fnIx)
     }
-    // An if-expression whose arms join to one nullable rep (D1560): the row comes from the
-    // arm that carries the rep.
+    // A value `if` is the row of its join's nullable variant.
     IfStmt => {
-      const nlv = nulIfArmNullableValueIx(exprIx)
-      if nlv < 0 { return -1 }
-      const nlr = nulVariantIdxOfExpr(nlv, fnIx)
-      if nlr < 0 { return -1 }
-      const rav = ifRepArmValueIx(exprIx)
-      if rav == nlv { return nlr }
-      return nulVariantIdxOfExpr(rav, fnIx)
+      return nulVariantRowOfJoin(exprIx, fnIx)
     }
     BinExpr => {
       // An assignment's value is its target cell (D2603).
@@ -1483,11 +1473,8 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
         if !coalesceStaysNullable(exprIx, cri, fnIx) { return -1 }
         return mvValVariantOf(cri)
       }
-      // A same-arm `p ?? q` stays the left niche while its default is nullable (D2373).
-      if e.binOp == "??" && !coalesceResultIsBox(exprIx, fnIx) {
-        const lv = nulVariantIdxOfExpr(e.binLeft, fnIx)
-        if lv >= 0 && coalesceDefaultNullable(e.binRight, fnIx) { return lv }
-      }
+      // Any other `p ?? q` is the row of its join's nullable variant.
+      if e.binOp == "??" { return nulVariantRowOfJoin(exprIx, fnIx) }
     }
     AsExpr => {
       return nulVariantIndexOf(exprIx)
@@ -1499,6 +1486,16 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32): i32 {
     // No other expression carries a nullable variant row.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
+  -1
+}
+
+// The variant table's row of join `ix`'s type when the join reps as a nullable variant, or -1.
+function nulVariantRowOfJoin(ix: i32, fnIx: i32): i32 {
+  if !nodeRepIs(ix, "nulvariant", fnIx) { return -1 }
+  const t = nodeTyAt(ix, fnIx)
+  if t < 0 || t >= T.tys.length { return -1 }
+  const nt = tyAt(t)
+  if nt is TyNullable { return repVariantShapeRowOf(nt.nInner) }
   -1
 }
 
@@ -8545,7 +8542,6 @@ export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
 // `null`, and a call through a function value whose `$fnsig` result token is `Z`. The one home,
 // so consumers that must treat the value as statically null ask once.
 export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
-  if clsCensusOn { clsCensusEnter("exprIsNulNone") }
   if exprIx < 0 { return false }
   const e = nodeAt(unwrapParen(exprIx))
   // A name, field, element or call read is the `null` unit exactly when its storage holds one: a
@@ -8554,32 +8550,12 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
   if e is Ident || e is Member || e is Index || e is Call {
     return kindIn(readRepOf(exprIx, fnIx).rrStore, READ_NUL_NONE_KINDS)
   }
-  // An if-expression whose every arm is a bare `null` or itself `null`-typed is `null`-typed:
-  // the join of `null` with `null` is `null`. One arm carrying a real value is not this — its
-  // join is a genuine `T | null` and the niche paths own it. An else-less `if` used as a value
-  // is `T | null`, and here `T` is already `null`.
-  if e is IfStmt {
-    const tv = ifArmValueExpr(e.ifThen)
-    if (
-      tv < 0
-      || !(exprIsNullLit(tv) || callIsNever(tv) || nodeRepIs(tv, "nulnone", fnIx))
-    ) {
-      return false
-    }
-    if e.ifElse < 0 { return true }
-    if nodeAt(e.ifElse) is IfStmt { return exprIsNulNone(e.ifElse, fnIx) }
-    const ev = ifArmValueExpr(e.ifElse)
-    return ev >= 0
-      && (exprIsNullLit(ev)
-      || callIsNever(ev)
-      || nodeRepIs(ev, "nulnone", fnIx))
-  }
-  // `a ?? b` over a `null`-typed `a` is `b`, so it is `null`-typed when `b` is (D3355).
-  if e is BinExpr {
-    if e.binOp == "??" && e.binCompound.length == 0 {
-      if !exprIsNulNone(e.binLeft, fnIx) { return false }
-      return exprIsNullLit(e.binRight) || exprIsNulNone(e.binRight, fnIx)
-    }
+  // A value `if` or a `??` is the `null` unit exactly when its join reps as one.
+  if (
+    e is IfStmt
+    || (e is BinExpr && e.binOp == "??" && e.binCompound.length == 0)
+  ) {
+    return nodeRepIs(unwrapParen(exprIx), "nulnone", fnIx)
   }
   // Every other node kind asks the cell, which is the named default and not a fall-through: for
   // a kind that names no cell it answers `null`, the right answer for every remaining kind.

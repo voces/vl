@@ -13,7 +13,7 @@
 import { recordRowClassOf } from "./record_rows"
 import { fusedMapReadRecvIx } from "./check_leaf_steps"
 import { chainHasPrelude } from "./emit_if_arm_values"
-import { arrNewInFn } from "./check_decl_scan"
+import { arrNewAtTop, arrNewInFn } from "./check_decl_scan"
 import {
   elabLitInstTys,
   elabNodeInstTys,
@@ -33,7 +33,7 @@ import {
 } from "./check_node_tys"
 import {
   elabRestampedAt,
-  fnTagCallArms,
+  fnTagArmCalls,
   fnTagHeldRepOf,
   fnTagHoldsTy,
   fnTagSetIsTagged,
@@ -52,6 +52,7 @@ import {
   peelGroupParens,
 } from "./tyname"
 import {
+  ambientCtorCalls,
   nameMentionsGenAliasParam,
   nodeRepTyIxOf,
   recCopyFromOf,
@@ -2216,8 +2217,7 @@ export function recordedVoidFns() {
 
 let arrLitMintDone: boolean[] = []
 // Mints the rows node `i` needs once, on its first read: a list literal's, an `is` test's empty
-// arm list, a call's join atoms and an intrinsic call's constructed
-// collection. Returns -1 for a node out of range.
+// arm list and a `Map()`/`Set()` call's value slot. Returns -1 for a node out of range.
 function nodeMintOnRead(i: i32): i32 {
   if i < 0 || i >= P.nodes.length { return -1 }
   while arrLitMintDone.length <= i { arrLitMintDone.push(false) }
@@ -2283,6 +2283,33 @@ export function isListArmRowsMint() {
   0
 }
 
+// Marks the value boxes of each call through a tagged set the checker recorded: a call whose
+// members return different types boxes each member's result into the call's union, which nothing
+// else in the program need build. The box types are dealt with the type indices.
+export function markTagCallJoins() {
+  const was = nodeTyInstEnter(-1)
+  for c in fnTagArmCalls() {
+    const t = nodeTyIxOf(c)
+    if t >= 0 && !tyHasTyVar(t) { markInferredJoinAtoms(t) }
+  }
+  nodeTyInstEnter(was)
+  0
+}
+
+// Interns the pair each array-intrinsic call outside every function allocates, from the checker's
+// record of those calls: it builds a list with no literal or annotation in sight. A call in a
+// function mints in its frame (`collectArrNewFrames`).
+export function arrNewTopRowsMint() {
+  const was = nodeTyInstEnter(-1)
+  for c in arrNewAtTop.keys() {
+    if c >= 0 && c < P.nodes.length && !arrNewCallInFn(c) {
+      collectArrNewIntr(c, -1)
+    }
+  }
+  nodeTyInstEnter(was)
+  0
+}
+
 // Marks the value boxes of each if-expression join the checker recorded, a value union the
 // program declares nowhere (D1745). The box types are dealt with the type indices, ahead of every
 // reader of a join.
@@ -2295,26 +2322,21 @@ export function markInferredIfJoins() {
   0
 }
 
-// Mints the rows the signature passes read first and no reader may take after the type indices:
-// the rows of an `is K[]` test's record `K` that has no row yet, a tagged-set call's join atoms, and an
-// intrinsic call's map value slot. Walks the top-level statements `tops` and each function in
-// `fns`, not descending into a nested declaration.
-export function preIndexMintTrees(tops: i32[], fns: i32[]) {
-  const todo: i32[] = []
-  for r in tops { preIndexMintAt(r, todo, true) }
-  for r in fns { preIndexMintAt(r, todo, true) }
-  while todo.length > 0 { preIndexMintAt(todo.pop(), todo, false) }
+// Mints the map value slot of each `Map()`/`Set()` call the checker typed as the ambient
+// constructor, and of each instance's copy of one: an un-annotated call has no spelling for an
+// annotation's mint, and the signature passes read its slot first, which no reader may take
+// after the type indices.
+export function mapCtorRowsMint() {
+  for c in ambientCtorCalls.keys() { mapCtorRowMint(c) }
+  for c in nodeSrc.keys() {
+    if ambientCtorCalls.has(nodeSrc[c] ?? -1) { mapCtorRowMint(c) }
+  }
   0
 }
 
-// `preIndexMintTrees`'s step: mints node `at` and pushes its children, past a nested function
-// declaration only when `root`.
-function preIndexMintAt(at: i32, todo: i32[], root: boolean) {
-  if at < 0 || at >= P.nodes.length { return 0 }
-  const nd = nodeAt(at)
-  if nd is Call { nodeMintOnRead(at) }
-  if root || !(nd is FuncDecl) { nodeChildrenPush(at, todo) }
-  0
+function mapCtorRowMint(c: i32) {
+  if c < 0 || c >= P.nodes.length || !(nodeAt(c) is Call) { return 0 }
+  nodeMintOnRead(c)
 }
 
 // The row inferred list result `i` is built at: `rec`, its recorded result's row, or -2 when a
@@ -5023,13 +5045,6 @@ export function collectTyParamNames() {
   0
 }
 
-// The callee names `collectA`'s `Call` arm classifies as building a string.
-function collectACallIntrinsic(name: string): boolean {
-  if name == "fromCodePoint" || name == "fromCodePoints" { return true }
-  if name == "Map" || name == "Set" { return true }
-  name == "__array_new__" || name == "__array_new_default__"
-}
-
 // The scalar list pair an array-intrinsic call of element kind `ank` needs. Flags only, each
 // set and never cleared, so a second ask can only add. `"reflist"` is absent deliberately: a ref
 // fill mints a row, which moves slot numbering, and the arena walk is its one home (D1669).
@@ -5558,34 +5573,14 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   0
 }
 
-// What intrinsic call `i` constructs with no literal or annotation in sight: an un-annotated
-// `Map()`/`Set()`'s value slot, and the pair an array allocator outside any function fills.
+// The value slot an un-annotated `Map()`/`Set()` call `i` constructs: it has no map spelling for
+// `collectA`'s `TypeRef` arm, so the slot comes off the call's own recorded type, or a ref or wide
+// value never mints its rep. Idempotent: an annotated twin interns the same slot.
 function collectACallMint(i: i32, nd: Call) {
-  // A dispatch through a tagged function set whose members return different types boxes
-  // each member call into the call's union, which nothing else in the program need build.
-  if fnTagCallArms(i).length > 0 { markInferredJoinAtoms(nodeTyIxOf(i)) }
-  if nd.callFn >= 0 {
-    const cf = nodeAt(nd.callFn)
-    if cf is Ident && collectACallIntrinsic(cf.identName) {
-      // `fromCodePoints(xs)` builds a fresh string from an i32 list.
-      // An un-annotated `Map()`/`Set()` (usage-inferred binding) still constructs the
-      // map struct, as a `{[string]: i32}` annotation does.
-      if cf.identName == "Map" || cf.identName == "Set" {
-        // An UN-annotated `Map()`/`Set()` has no map spelling for `collectA`'s `TypeRef` arm, so
-        // its value's mv slot comes off the call's own recorded type, or a ref or wide value
-        // never mints its rep. Idempotent: an annotated twin interns the same slot.
-        mvShapeOfMapNodeTy(i)
-      }
-      // The array-intrinsic allocators construct a list with no literal or annotation in
-      // sight, so the pair its element kind names has to be interned here. `arrNewIntrKind` is
-      // the one home of that kind, so the intern and the lowering cannot disagree about it.
-      if (
-        cf.identName == "__array_new__"
-        || cf.identName == "__array_new_default__"
-      ) {
-        if !arrNewCallInFn(i) { collectArrNewIntr(i, -1) }
-      }
-    }
+  if nd.callFn < 0 { return 0 }
+  const cf = nodeAt(nd.callFn)
+  if cf is Ident && (cf.identName == "Map" || cf.identName == "Set") {
+    mvShapeOfMapNodeTy(i)
   }
   0
 }
