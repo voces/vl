@@ -17,6 +17,9 @@ substituted to `dbl`'s own open return.
   call of an element or of a field holding the hole (else it stays open). A result read off one
   hole call (`HD_RET`) takes that call's instance alone (`holeBindOnlyCall`), so a call at
   another type beside it does not open it.
+- It answers only when a literal hand-on was followed: without that gate the per-call read also
+  typed `lap(id)` (no literal, `g` called at two types) at check time, which moved
+  `tests/vl_fn_ret_shadow_test.ts`'s pinned rows; that result stays the elaboration's.
 - The read is pin-quiet (`holePinHeld`). Following the hand-on in the binding itself, or banking
   its pins, changed what the elaboration bound: the first left the tag decision unsettled (an
   internal emit failure) and the second turned `print(both1(dbl))` beside `print(g(1))` from
@@ -37,5 +40,5 @@ directly; `b + 1` is an `f64.add`.
 
 **Proof run locally.** refresh ×2 (fixpoint), distilled regress (no class moved), cases_wasm,
 inventory refs/rows, check-filed-witnesses `--strict` on both inventories (4697 as filed),
-scaling shape, probe rollback, rep-fuzz, lint-self, seed size (+0.2%), late demands (6), the
+scaling shape, probe rollback, the whole `vl_*` shard (after CI's ci-native caught the ungated read), rep-fuzz, lint-self, seed size (+0.2%), late demands (6), the
 dead-export, render-parse and pin-helper budgets.
