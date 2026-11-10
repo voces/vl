@@ -333,6 +333,7 @@ import {
   recKeptDecl,
   recKeptDst,
   recKeptFnPush,
+  recOwnPend,
   recOwnSrc,
   recPend,
   recPendDstTy,
@@ -4023,6 +4024,58 @@ export function recCoalLandsAt(u: i32, dst: i32): boolean {
   bt >= 0 && dst >= 0 && fieldStorageEq(nonNullTy(bt), dst, REC_STORE_DEPTH)
 }
 
+// Whether call `u`, a join leaf, is built at a record storing as `dst`, not at its own type: its
+// join is delivered or assigned there, or every leaf of the join is a call of a maker built there
+// (D15653).
+export function recArmLandsAt(u: i32, dst: i32): boolean {
+  if dst < 0 || u < 0 || u >= P.nodes.length || !(nodeAt(u) is Call) {
+    return false
+  }
+  const c = nodeCtxTyIxOf(u)
+  if c >= 0 && fieldStorageEq(c, dst, REC_STORE_DEPTH) { return true }
+  const pl = recAsgPlaceOf(u)
+  const bt = if pl >= 0 { recBuiltReadTy(pl) } else { -1 }
+  if bt >= 0 && fieldStorageEq(nonNullTy(bt), dst, REC_STORE_DEPTH) {
+    return true
+  }
+  if recCallKeptAt(recAsgBindInit(u), dst) { return true }
+  cwIxBuild()
+  let x = u
+  let hops = 0
+  while x >= 0 && cwIxCovers(x) && cwIxUpKind[x] == CW_UP_ARM && hops < 16 {
+    x = cwIxUp[x]
+    hops = hops + 1
+  }
+  if x == u || x < 0 { return false }
+  const leaves: i32[] = []
+  tailValueLeaves(x, leaves)
+  for lf in leaves {
+    if !recCallKeptAt(cwPeelValue(lf), dst) { return false }
+  }
+  leaves.length > 0
+}
+
+// Whether `v` is a call of a maker, or of one handing such a maker's call on, that a delivery
+// builds at a record storing as `dst`.
+function recCallKeptAt(v: i32, dst: i32): boolean {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Call) { return false }
+  const fd = recInferredFnOf(v)
+  if fd < 0 { return false }
+  const to = recHandOnMakerOf(fd, 6)
+  let k = 0
+  while k < recKeptDecl.length {
+    const kd = recKeptDecl[k]
+    if (
+      (kd == fd || kd == to)
+      && fieldStorageEq(recKeptDst[k], dst, REC_STORE_DEPTH)
+    ) {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
 function recMakerHandsOnCall(fd: i32): boolean {
   if fd < 0 || fd >= P.nodes.length { return false }
   for lf in recFnValueLeaves(fd) {
@@ -7319,6 +7372,27 @@ export function adoptArmAt(x: i32, dstTy: i32) {
     const p = cwPeelValue(lf)
     if p >= 0 && p < P.nodes.length && nodeAt(p) is Ident {
       recPend(p, nodeTyIxOf(p), dstTy, p)
+    }
+  }
+  0
+}
+
+// `adoptArmAt` for an `if` or `match` arm, where a call stored as the join is queued as an
+// own-storage delivery too (D15653).
+export function adoptJoinArmAt(x: i32, dstTy: i32) {
+  adoptArmAt(x, dstTy)
+  if x < 0 || x >= P.nodes.length { return 0 }
+  const leaves: i32[] = []
+  tailValueLeaves(x, leaves)
+  for lf in leaves {
+    const p = cwPeelValue(lf)
+    const own = if p >= 0 && p < P.nodes.length && nodeAt(p) is Call { nodeTyIxOf(p) } else { -1 }
+    if (
+      own >= 0
+      && fieldStorageEq(own, dstTy, REC_STORE_DEPTH)
+      && !i32ListHas(recOwnSrc, p)
+    ) {
+      recOwnPend(p, own)
     }
   }
   0
