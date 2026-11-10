@@ -11689,6 +11689,14 @@ Input: `docs/internals/refactor-notes/2026-11-09-step7-classifiers-remaining.md`
 - **A missing CHECKER fact is checker work, not an emitter workaround.** Groups 5 and 9: the instance key of a module copy of a generic, and a call site re-recorded at its callee's published join.
 - **Step 7's classifier half is done when every probed classifier either reads a typed fact or is `NOT_BLIND` with a recorded reason.** The probe count reaching zero is the measure. A classifier that is right and blind by design is not counted against it.
 
+## Step 7: what VKind producers stand by design (2026-11-10)
+
+Orchestrator ruling over `docs/internals/refactor-notes/2026-11-10-step7-vkind-census.md` §1.1, under "How step 7's classifier half finishes".
+
+- **`ifExprRefKindAt`'s object-literal arm stands.** An `ObjLit` is built at its context's row, so its kind is where the emitter stores it: a storage fact.
+- **`letCellKindGo`'s `holderRecordSigs` arm stands.** The holder record is the emitter's own bundle layout, so its `"struct"` is a layout fact, not a type the emitter chose.
+- **`repKindOfSigTok` stands while `$fnsig` keys are strings.** It is the decoder of a stored encoding whose encoder is `repSigTokOfKind`; it goes when the key stops being a string.
+
 ## A named function in a record field is a set id, as in a list (2026-11-10) — D15640
 
 Orchestrator ruling, option 1 of `docs/internals/refactor-notes/2026-11-10-d15640-record-of-named-function-options.md`. Steps 3 and 4 make a named function value a singleton set type, and a record field is one more holder of it, like a list element. So `{ f: dbl }` holds `{dbl}`'s id from the check onward, and the late tag decision decides it as it decides `[dbl]`. The record-adoption pin (`recAdPinLet`) may not fix the field at a closure type. Not yet built: the position count is in `2026-11-10-d15640-record-field-matrix.md`.
