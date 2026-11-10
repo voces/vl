@@ -47,7 +47,8 @@ closure type. So the spelling path stands until that residue is closed, and it i
 
 ## Proof
 
-- **Seed:** byte-identical to base, at 6,603,813 bytes. Two refreshes are byte-identical.
+- **Seed:** the same size as base, 6,603,813 bytes, but not byte-identical (`cmp` first differs at
+  byte 3,678,382). Two refreshes are byte-identical.
 - **Sweep:** all 23,857 programs, base against candidate: 23,857 the same, with 0 bytes-only movers
   and 0 output movers.
 - **Also green:**
