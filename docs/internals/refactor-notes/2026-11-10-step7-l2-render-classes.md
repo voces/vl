@@ -70,8 +70,8 @@ exclude a numeric literal-union element first, and that function has other calle
 - **Byte sweep.** `sweep.vl record --population cases` with the master fixpoint and with the
   candidate fixpoint: of 7,424 programs, 7,424 are the same, with 0 bytes-only movers.
 - **The render-parse ratchet** goes from 41 to 40 renders (79 parses unchanged), with
-  `--write-baseline` in this PR. `#7098` lowers the parses from the same base, so whichever lands
-  second re-writes the baseline: 40 renders, 71 parses.
+  `--write-baseline` in this PR. With `#7098` merged in, the baseline is 40 renders and 71
+  parses.
 - **Locally:** refresh ×2 byte-identical, rep-fuzz, lint-self, seed-size, late-demands,
   dead-export, render-parse, pin-helper budget, cases_wasm 0–3, inventory refs/rows,
   `vl_scaling_shape`, `vl_probe_rollback`, and `check-filed-witnesses --strict` on both inventories.
