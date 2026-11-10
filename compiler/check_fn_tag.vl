@@ -1067,6 +1067,9 @@ function ftChainCallsComplete(r: i32, s: i32, pd: i32): boolean {
   if fn < 0 || fn >= P.nodes.length { return false }
   const f = nodeAt(fn)
   if !(f is FuncDecl) { return false }
+  const c = mintFactCallOf(r)
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  const path = if cn is Call { ftChainFields(parenPeelIx(cn.callFn)) } else { "" }
   const todo: i32[] = [f.fnBody]
   while todo.length > 0 {
     const x = todo.pop() ?? -1
@@ -1077,6 +1080,7 @@ function ftChainCallsComplete(r: i32, s: i32, pd: i32): boolean {
           m is Call
           && identDeclOf(ftSlotRoot(parenPeelIx(m.callFn))) == pd
           && !ftPushOntoParamList(m, pd, f)
+          && ftChainFields(parenPeelIx(m.callFn)) == path
         ) {
           if mintFactSetOf(mintFactInScope(r, x)) != s { return false }
         }
@@ -1085,6 +1089,27 @@ function ftChainCallsComplete(r: i32, s: i32, pd: i32): boolean {
     }
   }
   true
+}
+
+// The field names element chain `x` reads, root first, each followed by `.`: a record's fields
+// hold sets of their own, where a list's elements share one (D15641).
+function ftChainFields(x: i32): string {
+  let r = x
+  let out = ""
+  let depth = 0
+  while r >= 0 && r < P.nodes.length && depth < 16 {
+    const n = nodeAt(r)
+    if n is Index {
+      r = parenPeelIx(n.idxArr)
+    } else if n is Member {
+      out = n.memProp + "." + out
+      r = parenPeelIx(n.memObj)
+    } else {
+      return out
+    }
+    depth = depth + 1
+  }
+  out
 }
 
 // Whether call `m` pushes onto list binding `pd`, which `elabListParamSource` takes as one of
@@ -3756,11 +3781,40 @@ function ftParamSetsTake(par: i32, i: i32, s: i32): boolean {
 // The deliveries of a choice to a closed function type noted by this check.
 let ftEscapes: i32[] = []
 
+// Whether delivery `x` of set `s` to a closed function type has its adapter built: by the next
+// check, which the decision after the elaboration has only for a set the check's decision tagged;
+// else as the closure the elaboration noted there, or a lone hole lambda's built at that type
+// (`fnCloCoerceNote` in `fnTagDecide`) (D15641).
+function ftEscBuilt(x: i32, s: i32): boolean {
+  if !ftLate || i32ListHas(ftWas, s) { return true }
+  const ms = fnTagMembers(s)
+  const ei = i32ListIndexOf(ftEscapes, x)
+  const dt = if ei >= 0 && ei < ftEscDstLast.length { ftEscDstLast[ei] } else { -1 }
+  if (
+    coerceRecordOpen()
+    && ms.length == 1
+    && ftHoleLambdaAlone(s, ms[0])
+    && dt >= 0
+    && dt < T.tys.length
+    && tyAt(dt) is TyFunc
+    && !tyHasTyVar(dt)
+  ) {
+    return true
+  }
+  let r = 0
+  while r < mintCloRows() {
+    if mintCloAtOf(r) == x && mintCloSetOf(r) == s { return true }
+    r = r + 1
+  }
+  false
+}
+
 // Whether node `x` of set `s`, the child of `p` (itself the child of `g`) inside function `fn`,
 // sits where its value is a binding, a return, an arm, or a callee through `s`.
 function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
   if p < 0 { return false }
-  if i32ListHas(ftEscapes, x) || ftWideEtaAt(x, s) { return true }
+  if i32ListHas(ftEscapes, x) { return ftEscBuilt(x, s) }
+  if ftWideEtaAt(x, s) { return true }
   const pn = nodeAt(p)
   match pn {
     Program | Paren => {
@@ -3865,7 +3919,8 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     // A record literal holds the id as the field's value.
     FieldInit => {
-      return pn.fiValue == x && ftRecHolds(g, s)
+      return pn.fiValue == x
+        && (ftRecHolds(g, s) || ftOpenFieldHolds(g, pn.fiName, s))
     }
     // Any other parent reads the value as a closure.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | ErrExpr | TypeRef | BreakStmt | ContinueStmt | FieldDef | TypeDecl | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread | LoopVar => {
@@ -4014,6 +4069,40 @@ const FT_HOLD_DEPTH = 8
 // no such set there is a closure field, so its value cannot be an id (D15205).
 function ftRecHolds(x: i32, s: i32): boolean {
   x >= 0 && ftTyHoldsDecided(nodeRepTyIxOf(x), s)
+}
+
+// Whether field `name` of record literal `x`, adopted at a hole parameter's record whose field is
+// open, holds set `s` in the literal's own type: after the elaboration the literal is built at
+// that type, which the instance binds the parameter to. Its other fields' sets are decided with
+// `s`, since the record's rep holds ids at all of them or none (D15641).
+function ftOpenFieldHolds(x: i32, name: string, s: i32): boolean {
+  if !ftLate || x < 0 { return false }
+  const ft = tyFieldTyOf(nodeRepTyIxOf(x), name)
+  const lt = nodeTyIxOf(x)
+  if (
+    ft < 0
+    || ft >= T.tys.length
+    || !(tyAt(ft) is TyVar)
+    || fnTagSetOfTy(tyFieldTyOf(lt, name)) != s
+  ) {
+    return false
+  }
+  const lo = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+  if lo is TyObj {
+    for f in lo.objFieldTypes {
+      const o = fnTagSetOfTy(f)
+      if (
+        o >= 0
+        && o != s
+        && !fnTagSetIsTagged(o)
+        && !i32ListHas(ftAssume, o)
+        && !i32ListHas(ftSubNeed, o)
+      ) {
+        ftSubNeed.push(o)
+      }
+    }
+  }
+  true
 }
 
 // 1: a list whose element carries set `s`; 2: a record with a field of any kind within `depth`
@@ -4356,7 +4445,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         || ftTyParamListTakes(p, x, s)
         || ftLate
         && ftHoleArg(pn, x)
-        && ftInnerLit(parenPeelIx(x))
+        && (ftInnerLit(parenPeelIx(x)) || nodeAt(parenPeelIx(x)) is ObjLit)
         && ftDeclsOnly(s)
         && !mintSetPartial(s)
         || ftHoleArg(pn, x)
