@@ -55,9 +55,10 @@ default". With it, both print their `@log`.
 | tree | probed | calls |
 | --- | --- | --- |
 | base `34f46a82` | 10 | 2,288,406 |
-| this PR | 9 | 1,044,824 |
+| this PR | 9 | 860,153 |
 
-`exprIsLitAtom` (1,243,582) leaves the probe set.
+`exprIsLitAtom` (1,243,582) leaves the probe set. The dropped arms were askers of two others:
+`mapReadMvSlot` goes from 709,846 to 606,757, and `unionNameOfHoleRead` from 161,870 to 80,290.
 
 **Proof.** The fixpoint seed is 6,599,098 bytes (+124). Two `refresh-compiler.sh` runs are
 byte-identical, and the one-level candidate equals the fixpoint.
