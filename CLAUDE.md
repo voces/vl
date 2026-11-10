@@ -7,7 +7,7 @@ same headings. Subsystem detail lives in `docs/internals/`; `ROADMAP.md` owns th
 
 A refactor measurement goes in a new dated file under `docs/internals/refactor-notes/`, never into
 `architecture-target-2026-10.md`. **A PR adds only its own refactor note; the orchestrator folds
-notes into architecture-target's Status and the notes index.**
+notes into architecture-target's Status and the notes index.** That way lanes never conflict on a shared line.
 
 ## `std:*` changes get a second pass — required
 
