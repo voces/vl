@@ -237,6 +237,7 @@ import {
   arrLitHasNullElem,
   nulLitAliasNameOfTy,
   plusChainHasStrLit,
+  regUnionNameOfTy,
 } from "./emit_anon_fields"
 import {
   fieldKindWidens,
@@ -10006,12 +10007,36 @@ function exprUnionIf(exprIx: i32, fnIx: i32): boolean {
 
 // ── value-union name resolution (the union a value flows as) ──────────────────
 
-// The registered union name the read `atIx` in function `fnIx` carries — from its param
-// annotation, `let` annotation, an inferred union-returning init, or a module global — or ""
-// when not union-typed. `atIx` picks among sibling blocks binding one name (`parentLetOfAt`,
-// D2316) and lets a block shadow of a same-named PARAMETER win (`fnBlockShadowsAt`, D2325).
+// The registered union name a name read `atIx` in frame `fnIx` holds its box under, or "" when
+// its storage is no union box: the name of the row its storage type keys. A nullable box with no
+// row of its own is its inner union's. A type holding a hole names the instance's binding of it.
 export function unionNameOfRead(atIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("unionNameOfRead") }
+  const u = unwrapParen(atIx)
+  if u < 0 || !(nodeAt(u) is Ident) { return "" }
+  let t = readStoreTyAt(u, fnIx)
+  if t >= 0 && t < T.tys.length && tyHasInferHole(t, 0) {
+    t = holeOperandTyOf(u, fnIx)
+    if t < 0 { return unionNameOfHoleRead(u, fnIx) }
+  }
+  if t < 0 || t >= T.tys.length { return "" }
+  // A record or a nullable one is never a box, and its spelling doubles per level (D2780).
+  const pt = tyPeelNul(t)
+  if pt >= 0 && pt < T.tys.length && tyAt(pt) is TyObj { return "" }
+  const n = regUnionNameOfTy(t)
+  if n != "" { return n }
+  const nt = tyAt(t)
+  if nt is TyNullable && repOfTy(t).rdKind == "union" {
+    return regUnionNameOfTy(nt.nInner)
+  }
+  ""
+}
+
+// The union name of a read whose type is a hole the instance does not bind, by its declaration:
+// a parameter's annotation, a `let`'s annotation or union-returning initializer, a loop variable's
+// iterable, a capture or a global. `atIx` picks among sibling blocks binding one name, and a
+// block shadow of a same-named parameter wins (D2325).
+function unionNameOfHoleRead(atIx: i32, fnIx: i32) {
+  if clsCensusOn { clsCensusEnter("unionNameOfHoleRead") }
   const sid = sidOfNode(atIx)
   const name = sidText(sid)
   if fnIx >= 0 {
@@ -14519,10 +14544,16 @@ function readRepGo(ix: i32, fnIx: i32): ReadRep {
   if rx < 0 { return r }
   const e = nodeAt(rx)
   if !(e is Ident || e is Member || e is Index || e is Call) { return r }
-  const ns = readNarrowedStoreAt(rx, fnIx)
-  r.rrStoreTy = if ns >= 0 { ns } else { nodeTyAt(rx, fnIx) }
+  r.rrStoreTy = readStoreTyAt(rx, fnIx)
   if e is Index { r.rrMv = mapReadMvSlot(rx, fnIx) }
   r
+}
+
+// The type read `rx`'s storage holds: the one the checker narrowed the read out of, else the
+// read's own. It is the read rep's `rrStoreTy`, which needs none of its kinds.
+function readStoreTyAt(rx: i32, fnIx: i32): i32 {
+  const ns = readNarrowedStoreAt(rx, fnIx)
+  if ns >= 0 { ns } else { nodeTyAt(rx, fnIx) }
 }
 
 function readRepKinds(ix: i32, fnIx: i32): ReadRep {
