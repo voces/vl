@@ -601,7 +601,6 @@ import {
   mapFindShapeOfTy,
   mapNodeValKindLowerable,
   mvInnerMapShape,
-  mvSlotOfMapNameTy,
   mvValStructIdxOf,
   mvValVariantOf,
   refListElemKindOfTy,
@@ -832,7 +831,6 @@ import {
   rlMintNameOfTy,
   rlRowNameOfTy,
   unionClosureArrElemUnion,
-  unionMapArmNameTy,
   unionNameOfVariant,
   unionSpellingOfTy,
   valueUnionNameOfSoftTy,
@@ -5792,11 +5790,9 @@ function mapIsSetExpr(exprIx: i32, fnIx: i32) {
 }
 
 // The mv slot a map READ expression resolves to: `m[k]` (Index over a ref-valued map) or
-// `m.get(k)` (the method form), else -1. The chokepoint the expression-kind resolvers
-// (`exprString` / struct resolution / `??` lowering) consult so a ref-valued `m[k] ?? d`
-// classifies as its value type.
+// `m.get(k)` (the method form), else -1. The slot is the receiver's own, the one its map was
+// built with, so a ref-valued `m[k] ?? d` classifies as its value type.
 function mapReadMvSlot(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("mapReadMvSlot") }
   if exprIx < 0 { return -1 }
   const e = nodeAt(exprIx)
   match e {
@@ -5804,32 +5800,7 @@ function mapReadMvSlot(exprIx: i32, fnIx: i32) {
       if exprMap(e.idxArr, fnIx) {
         const sl = mapShapeOfExpr(e.idxArr, fnIx)
         if sl >= 0 { return sl }
-        return -1
       }
-      // Narrowing-blind fallback: `t0[k]` where `t0` is a union ident with a map arm. In the
-      // frame pre-pass the `is`-narrow that would make `t0` a map isn't active, so `exprMap`
-      // misses — resolve the arm's value mv slot directly.
-      const ax = nodeAt(unwrapParen(e.idxArr))
-      if ax is Ident {
-        // A read the checker narrowed to the array or `string` arm is no map read, whether the
-        // narrow names an alias or its spelled-out twin; a `string` index reads a char (D1012).
-        const d12t = readNarrowedTyAt(unwrapParen(e.idxArr), fnIx)
-        if tyIsArray(d12t) || tyPrimNameOf(d12t) == "string" { return -1 }
-        const aun = unionNameOfRead(unwrapParen(e.idxArr), fnIx)
-        if aun != "" {
-          // The arm's arena type comes back with its spelling: the value slot resolves off
-          // the `TyMap` the member scan already read, rather than re-slicing `V` from the render.
-          // A row the scan does not cover asks the receiver's own type instead.
-          const armTy: i32[] = []
-          const ma = unionMapArmNameTy(aun, armTy)
-          if ma != "" {
-            const maVt = if armTy.length > 0 { tyMapValOf(armTy[0]) } else { -1 }
-            const msl = mvSlotOfMapNameTy(ma, maVt)
-            if msl >= 0 { return msl }
-          }
-        }
-      }
-      return -1
     }
     Call => {
       if e.callFn < 0 { return -1 }
@@ -9773,7 +9744,10 @@ export function unionNameOfRead(atIx: i32, fnIx: i32) {
 // iterable, a capture or a global. `atIx` picks among sibling blocks binding one name, and a
 // block shadow of a same-named parameter wins (D2325).
 function unionNameOfHoleRead(atIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("unionNameOfHoleRead") }
+  // A read of a cell in the emitting frame is a box only when that cell is one.
+  if fnIx == emitCurFnIx && declaredSlotOf(atIx) >= 0 {
+    if declaredKind(atIx) != "union" { return "" }
+  }
   const sid = sidOfNode(atIx)
   const name = sidText(sid)
   if fnIx >= 0 {
