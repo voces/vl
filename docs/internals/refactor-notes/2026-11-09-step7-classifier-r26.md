@@ -67,4 +67,7 @@ classifiers' accounting (`2026-11-09-step7-classifiers-remaining.md`) uses it.
 | this PR | 42 | 42 | 0 | 0 | 0 | 0 |
 
 **Proof.** Both sides are fixpoint seeds (two `refresh-compiler.sh` runs, byte-identical). Master
-`67329a97` is 6,595,637 bytes and this PR is 6,594,747 (−890).
+`67329a97` is 6,595,637 bytes and this PR is 6,594,747 (−890). With master `14b790dd` (#7022–#7024) merged in, master's fixpoint
+is 6,597,901 and this PR's is 6,597,010 (−891). On the merged tree the census reads 42 probed over
+23,816 programs with no warnings, late demands are 6 (the baseline), and the filed witnesses grade
+4,679 of 4,679 as filed.
