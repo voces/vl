@@ -75,14 +75,14 @@ and `forInVarStructIdx`'s fallback, can go.
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `cloArrCallRetKind` | 217,132 (10,552) | 2: `exprUnionCall` 147,179, `exprString` 69,953 | the call type's rep, 3,749 / 211,941 (r21) | It answers for the element signature the list stores, not the node. The twin is the wrong question. The right twin is the stored row's signature. |
+| ~~`cloArrCallRetKind`~~ | switched 2026-11-10 | | the result of `cloCallSigKey`, the key the call is lowered with; `STORAGE_READERS` ([notes](2026-11-10-step7-fnlist-rows-3.md)) | — |
 | `refListSlotOfExpr` | 142,613 (5,761) | 64: `exprVariantIndex` 31,045, `nulVariantIdxOfExpr` 23,128, `indexElemUnionSlot` 12,689 | the rep row, else the type's row, 144,742 / 2,187 (r24) | Function-value lists (93 of 175 `tests/cases/closures/` files) and bundle-record holders. |
 | `refListKeptSlotOfExpr` | 23,481 (965) | 2: `refListSlotOfExpr` 23,297, itself 184 | the rest of `refListSlotOfExpr`'s ladder, 14,316 / 2,000 (r25) | The same families: kept row 0 against a type that keys none (1,654). |
 | `forInVarStructIdx` | 8,456 (2,174) | 2: `declareForInLocals` 8,196, `captureValStructIdx` 260 | typed except the reflist fallback, 8,441 / 15, wasm identical in 2,174 of 2,174 (r26) | One call: a loop over a list of hole-function lists (`hole-fn-list-reached-through-alias-called-in-callback.vl`). |
 | `arrLitObjRowTy` | 6,532 (234) | 1: `arrLitRowTyIn` | the lead element's structural or variant row, 6,296 / 6 (r25) | `[{ fs: [inc0] }]`: the context row is the joined set's (`returned-lists-of-records-take-the-joined-set-runs.vl`). |
-| `mfResultSlotOf` | 4,526 (1,194) | 5: `mfScan` 1,963, `emitMapFilter` 1,908, `exprEmittedRefListSlot` 598 | the `.slice` / `.filter` call type's row, 4,512 / 14 (r24) | `generic-fn-list-written-then-called.vl`, `hole-fn-list-*`. |
+| ~~`mfResultSlotOf`~~ | switched 2026-11-10 | | the call type's row, else a `.filter`/`.slice` receiver's row; `STORAGE_READERS` ([notes](2026-11-10-step7-fnlist-rows-3.md)) | — |
 | `cloArrElemSelfKey` | 2,933 (394) | 1: `cloIndexCalleeSigKey` | the element's interned `sigKeyOfTy`, 1,293 / 79, plus 2,661 typed-only (r12) | A lambda literal's own key, which no type records. Not ablated. |
-| `cloPinnedListElemKey` | 690 (51) | 1: `cloCallSigKey` | the same reader, 1,334 / 142 (r12) | The same. |
+| ~~`cloPinnedListElemKey`~~ | deleted 2026-11-10 | | its rung fed no lowering: 1,489 reaching files byte-identical without it ([notes](2026-11-10-step7-fnlist-rows-3.md)) | — |
 
 ## 4. A closure bundle and the `fRet*` columns (3)
 
