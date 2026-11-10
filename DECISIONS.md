@@ -6030,6 +6030,21 @@ n-ary unroll's share of those bytes is now a DECIDED cost (see the string-buildi
 the helper that would have removed ~121 KB of them was built, measured and refused), and a
 ratchet carrying a stale baseline reds on the next landing for reasons that are not its own.
 
+### The published seed is binaryen `-O` without inlining; the ratchets read the fixpoint (2026-11-10)
+
+`seed-latest` is the proven fixpoint through `wasm-opt --no-inline=* -O` (`scripts/optimize-seed.sh`,
+from `publish-seed.yml`). The release binaries embed it and the playground runs it. It ships only
+when it compiles the compiler back to the fixpoint byte for byte and the corpus oracle passes on
+it. Measured on 4 cores: 6,601,413 → 5,098,108 bytes, L2 guest fuel 81.6G → 72.6G, self-build
+wall 23.0 → 21.5 s. The refresh does NOT take the step: wasm-opt costs 8.6 s wall and 28 s CPU,
+and one self-build saves about 1.5 s. So `build/vl-compiler.wasm`, the CI seed cache and every
+ratchet here (`seed-size`, `self-compile-time`, `plumb-shape-cost`, `late-demands`) keep the
+unoptimized fixpoint, and the fetched seed's first refresh lands back on it. Inlining is off
+because plain `-O` (`vl build -O`'s rung too) roughly doubles the V8 stack the seed needs: the
+fixpoint compiles `tests/cases/expressions/long-operator-chain.vl` in 600 KB, the inlined seed
+needs over 984 KB (V8's default), and the oracle failed it plus three later cells that shared
+the overflowed instance. `--no-inline=*` gives back that stack for about 1.5G of the fuel.
+
 ## An unbounded `<T>` is an ENTIRELY OPEN HOLE, and its refusal is the hole's sentence (owner, 2026-09-03) — D1431, BUILT
 
 > VL's banner feature is inference. An explicit generic `T` should function the same as an

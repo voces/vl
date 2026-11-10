@@ -45,9 +45,9 @@ Rolling pre-release, tag **`seed-latest`** (continuously re-pointed):
 
 | asset | meaning |
 | --- | --- |
-| `vl-compiler.wasm` | the seed; overwritten each master push (the "latest" pointer) |
+| `vl-compiler.wasm` | the seed; overwritten each master push (the "latest" pointer). It is the proven fixpoint through binaryen `-O` without inlining (`scripts/optimize-seed.sh`), and compiles the compiler back to that fixpoint byte for byte |
 | `vl-compiler.wasm.sha256` | checksum sidecar; `fetch-seed.sh` fails closed on mismatch |
-| `seed-fingerprint.txt` | `sha256` over `compiler/*.vl` + `compiler/driver.vl`, plus the producing commit SHA (provenance) |
+| `seed-fingerprint.txt` | `sha256` over `compiler/*.vl` + `compiler/driver.vl`, the `sha256` of the unoptimized fixpoint, and the producing commit SHA (provenance) |
 
 A second immutable tagged release **`seed-v0`** preserves the auditable genesis
 artifact (the one seed ever minted by TS).
