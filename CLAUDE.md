@@ -4,7 +4,8 @@ Repo-wide instructions. Subsystem detail lives in `docs/internals/`; `ROADMAP.md
 forward plan, `CHANGELOG.md` the shipped work, `DECISIONS.md` the non-obvious rationale.
 
 A refactor measurement goes in a new dated file under `docs/internals/refactor-notes/`, never into
-`architecture-target-2026-10.md`; the PR that moves a migration step updates that doc's status section.
+`architecture-target-2026-10.md`. A PR adds only its own note: the orchestrator folds notes into that doc's
+Status section and the notes index, so lanes never conflict on a shared line.
 
 ## `std:*` changes get a second pass — required
 
