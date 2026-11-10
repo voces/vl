@@ -123,12 +123,14 @@ heap type, so a typed answer that names the canonical twin is graded at the cons
 did (2,174 programs byte-identical). What is left is a named alias or intersection row (`type AB =
 A & B`, `type MyCat = Cat`). The structural reader finds no row under that type, and creating one
 would be a mint on a miss in a question reader, which the rulings exclude. **EMITTER**: the
-intersection's row minted where the binding's type is first lowered.
+intersection's row minted where the binding's type is first lowered. **Done 2026-11-10**
+([notes](2026-11-10-step7-named-alias-rows.md)): the alias's row is keyed by its type where the
+declaration is lowered, and both classifiers still disagree on facts of other groups.
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `structIndexOfExpr` | 3,497,142 (13,707) | 50: `structIndexOfMemberExpr` 2,245,964, `memRecvStructRow` 690,308, `binEqStructRow` 171,338 | `structRowOfRecordTy(nonNullTy(type))`, 3,485,215 / 44,649 (r20) | 7,670 layout twins (no fact needed; grade at the consumers), 24,245 where only the type names a row, and 12,734 where only the classifier does. Not ablated since round 20, which predates the canonical-row ruling (#7009). **Re-shadow first.** |
-| `letCellSlot` | 224,897 (16,203) | 3: `letLocalSlot` 189,006, `emitGlobalSection` 27,126, `captureValStructIdx` 8,765 | per arm (r16, r23): struct/variant 20 / 10, reflist 11,024 / 35, nulmap switched | The named intersection row (struct arm). A hole element at a generic pin (reflist arm, group 2). An un-annotated `Map()`'s per-binding shape (r14). |
+| `structIndexOfExpr` | 3,497,142 (13,707) | 50: `structIndexOfMemberExpr` 2,245,964, `memRecvStructRow` 690,308, `binEqStructRow` 171,338 | `repStructRowOfTy(nonNullTy(nodeTyAt))`, 3,446,099 same + 4,943 twins of 3,497,140 (2026-11-10) | Named alias rows are keyed by type since 2026-11-10, and no disagreement has an alias type. Left: 12,025 where only the classifier names a row (a value stored wider than its type, group 1), 29,851 where only the type does (a union arm the classifier declines on purpose; the twin needs a variant guard), and 4,190 different rows (storage facts). |
+| `letCellSlot` | 224,897 (16,203) | 3: `letLocalSlot` 189,006, `emitGlobalSection` 27,126, `captureValStructIdx` 8,765 | struct arm 18 / 19 (2026-11-10); reflist 11,024 / 35 (r23), nulmap switched | The struct arm's one miss is a binding stored at its generic callee's wider row (group 9). A hole element at a generic pin (reflist arm, group 2). An un-annotated `Map()`'s per-binding shape (r14). |
 
 ## 8. A rep rule's row that the type does not key (1)
 
@@ -183,7 +185,7 @@ leads**, and no missing fact is known for them yet.
 | closure bundle, `fRet*` columns | emitter, lane w168 | 3 | 0.98 M | D15142, D15146 |
 | generic instance key | checker | 2 | 0.24 M | D9130, D3868 |
 | read rep in the table's numbering | emitter | 6 | 5.22 M | D2316, D2325 |
-| named intersection row | emitter (mint excluded today) | 2 | 3.72 M | `struct-alias-transparent.vl` |
+| named intersection row | emitter, keyed at the declaration (2026-11-10) | 2 | 3.72 M | `struct-alias-transparent.vl`, D14162 |
 | rep-rule row (`recListRetTakesRep`) | emitter | 1 | 0.01 M | D14813 |
 | callee's published join | checker | 1 | 0.17 M | (the two r21 witnesses) |
 | not tried yet | ? | 6 | 0.22 M | none |
