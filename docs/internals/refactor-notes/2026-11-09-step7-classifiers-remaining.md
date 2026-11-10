@@ -4,6 +4,11 @@ This is the input for deciding how step 7's classifier half finishes. It covers 
 `classifier-census.vl` probes after round 26 (`2026-11-09-step7-classifier-r26.md`). All 42 are
 post-only.
 
+**After round 27** (`2026-11-10-step7-classifier-r27.md`) 32 are probed. Group 1's eight are
+`NOT_BLIND` (the census's `STORAGE_READERS`, each with its reason), and group 10's
+`arrLitObjElemBoxVariant` and `arrLitInstElemRow` read the literal's recorded types. The tables
+below keep the eight ruled-out rows for their reasons and mark each change.
+
 **Where the numbers come from.**
 
 * Calls and files are one census of the 23,814-program sweep population, run with `--callers
@@ -23,7 +28,8 @@ These read the cell, field code, companion slot or descriptor that the emitter w
 with. Under the rulings, that is the rep the emitter reconciles. A typed reader that disagrees
 names the type's row where the storage holds another (round 21's slot twins, round 23's field-code
 finding). **Recommendation: these stay.** Each can move to `NOT_BLIND` with its reason in the
-census, as `captureValKind` and `capturedKindOf` did in round 25.
+census, as `captureValKind` and `capturedKindOf` did in round 25. **Done in round 27**: all
+eight are in `classifier-census.vl`'s `STORAGE_READERS`, with the reasons below.
 
 | classifier | calls (files) | callers | best twin | why the legacy answer is right |
 | --- | --- | --- | --- | --- |
@@ -129,7 +135,7 @@ declaration is lowered, and both classifiers still disagree on facts of other gr
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `structIndexOfExpr` | 3,497,142 (13,707) | 50: `structIndexOfMemberExpr` 2,245,964, `memRecvStructRow` 690,308, `binEqStructRow` 171,338 | `repStructRowOfTy(nonNullTy(nodeTyAt))`, 3,446,099 same + 4,943 twins of 3,497,140 (2026-11-10) | Named alias rows are keyed by type since 2026-11-10, and no disagreement has an alias type. Left: 12,025 where only the classifier names a row (a value stored wider than its type, group 1), 29,851 where only the type does (a union arm the classifier declines on purpose; the twin needs a variant guard), and 4,190 different rows (storage facts). |
+| `structIndexOfExpr` | 3,497,141 (13,707) | 50: `structIndexOfMemberExpr` 2,245,964, `memRecvStructRow` 690,308, `binEqStructRow` 171,338 | `structRowOfRecordTy(nonNullTy(nodeTyAt))`, 3,452,888 agree + 3,736 layout twins / 40,517 (r27) | Re-shadowed in r27. 17,111 typed-only calls are union arm values, whose layout is `exprVariantIndex`'s (D34). 16,674 name a record's build row where the type names the declared one (`nested-record-built-wider-beside-own-binding-runs.vl`), and the literal's `litRepTyAt` row covers 431 of them. Missing: the read's built-at row (group 6's read rep). Named alias rows are keyed by their type since 2026-11-10, and against `repStructRowOfTy` no disagreement has an alias type (453 calls moved, [notes](2026-11-10-step7-named-alias-rows.md)). |
 | `letCellSlot` | 224,897 (16,203) | 3: `letLocalSlot` 189,006, `emitGlobalSection` 27,126, `captureValStructIdx` 8,765 | struct arm 18 / 19 (2026-11-10); reflist 11,024 / 35 (r23), nulmap switched | The struct arm's one miss is a binding stored at its generic callee's wider row (group 9). A hole element at a generic pin (reflist arm, group 2). An un-annotated `Map()`'s per-binding shape (r14). |
 
 ## 8. A rep rule's row that the type does not key (1)
@@ -154,32 +160,30 @@ site's type once the callee's result is published. A first try at `inferRetPubli
 | --- | --- | --- | --- | --- |
 | `exprUnionCall` | 171,346 (9,294) | 1: `exprUnion` | `nodeRepIs union`, 170,462 / 9 (r21); switching made 2 programs invalid wasm | `recursive-fn-joins-runtime-numbers-apart.vl`, `numeric-join-held-back-through-a-wrapper.vl`. |
 
-## 10. Not tried yet (6)
+## 10. List-literal classifiers (4 left of 6)
 
-No round has shadowed these post-mono. They classify a list literal by its elements, so the
-obvious twin is the literal's recorded type (`litRepTyAt`) or its rep. **These are the next round's
-leads**, and no missing fact is known for them yet.
+Round 27 shadowed all six. Two are switched and leave the probe set: `arrLitObjElemBoxVariant`
+(the recorded union and the lead's adopted arm, 18,578 / 0) and `arrLitInstElemRow` (the lead's
+build row, 14,881 / 0). The four left:
 
-| classifier | calls (files) | callers |
-| --- | --- | --- |
-| `arrLitIsRefTpl` | 93,162 (9,205) | 3: `arrLitIsRef` 88,891, itself 3,793, `arrLitFrameRefTy` 478 |
-| `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 |
-| `arrLitObjElemBoxVariant` | 18,578 (1,894) | 5: `arrLitElemHintTy` 7,203, `arrLitInstElemRow` 4,709, `arrLitElemKindTpl` 2,791 |
-| `arrLitInstElemRow` | 14,883 (4,093) | 3: `arrLitRowTyIn` 7,150, `arrLitElemName` 7,049, `arrLitKeptRowSlot` 684 |
-| `refListElemNameOfExprRaw` | 7,595 (454) | 1: `refListElemNameOfExpr` (asked only when `listRowOfExpr` has no row) |
-| `arrLitElemNameTpl` | 7,049 (4,037) | 1: `arrLitElemName` |
+| classifier | calls (files) | callers | best twin | missing fact |
+| --- | --- | --- | --- | --- |
+| `arrLitIsRefTpl` | 93,162 (9,205) | 3: `arrLitIsRef` 88,891, itself 3,793, `arrLitFrameRefTy` 478 | `tyIsRefArray(nodeTyIxOf)`, 82,027 / 11,201 (r27) | 4,628 lead with a tagged set's leaf, whose list is the i32 id list (group 3's fact). 6,573 more (maps, records, unions, non-leaf functions) may be the frame half's (`arrLitFrameRefTy`), not graded at `arrLitIsRef`. |
+| `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | the width of `litRepTyAt`'s element, 72,517 / 6,118 (r27) | Not ablated: the rep is `i64[]` or `f64[]` where the element scan reads none (5,713), and a box or niche where it reads a width (399). |
+| `refListElemNameOfExprRaw` | 7,595 (454) | 1: `refListElemNameOfExpr` (asked only when `listRowOfExpr` has no row) | `rlRowNameOfTy` of `nodeTyAt`'s element, 3,698 / 3,897, 437 of them one row spelled twice (r27) | The function-value list rows (group 3) and nested niche lists. |
+| `arrLitElemNameTpl` | 7,049 (4,037) | 1: `arrLitElemName` | `rlRowNameOfTy` of `nodeTyIxOf`'s element, 5,365 / 1,682, 398 of them one row spelled twice (r27) | The same. |
 
 ## 11. Follows another classifier (1)
 
 | classifier | calls (files) | callers | why |
 | --- | --- | --- | --- |
-| `captureValStructIdx` | 15,374 (1,654) | 4: `tsCloEnv` 9,861, `emitOneFuncType` 4,011, `capturedCompanionSlot` 1,336 | Its `let` arm is `letCellSlot` (r25, 8,765 / 0) and its loop-variable arm is `forInVarStructIdx`. It leaves the probe set when both do. |
+| `captureValStructIdx` | 15,374 (1,654) | 4: `tsCloEnv` 9,861, `emitOneFuncType` 4,011, `capturedCompanionSlot` 1,336 | Its `let` arm is `letCellSlot` (r25, 8,765 / 0) and its loop-variable arm is `forInVarStructIdx`. It leaves the probe set when both do. Neither moved in r27. |
 
 ## Summary for the ruling
 
 | missing fact | owner | classifiers | calls | touches |
 | --- | --- | --- | --- | --- |
-| none: the emitter's own storage | emitter (provided) | 8 | 1.83 M | D842, D219, D4636, D26, D1788, D6342 |
+| none: the emitter's own storage (`NOT_BLIND` since r27) | emitter (provided) | 8 → 0 | 1.83 M | D842, D219, D4636, D26, D1788, D6342 |
 | covered rep of a hole | emitter | 4 | 0.30 M | D6271, D6342 |
 | function-value list rows | emitter, lane w254 | 8 | 0.41 M | D15561, D12301, D12215, D6914 |
 | closure bundle, `fRet*` columns | emitter, lane w168 | 3 | 0.98 M | D15142, D15146 |
@@ -188,11 +192,11 @@ leads**, and no missing fact is known for them yet.
 | named intersection row | emitter, keyed at the declaration (2026-11-10) | 2 | 3.72 M | `struct-alias-transparent.vl`, D14162 |
 | rep-rule row (`recListRetTakesRep`) | emitter | 1 | 0.01 M | D14813 |
 | callee's published join | checker | 1 | 0.17 M | (the two r21 witnesses) |
-| not tried yet | ? | 6 | 0.22 M | none |
+| list-literal classifiers (r27: 2 switched) | emitter, partly lane w254 | 6 → 4 | 0.19 M | tagged id lists |
 | follows the others | — | 1 | 0.02 M | none |
 
 Two of these facts are the checker's: the instance key of a module copy of a generic, and the call
 site re-recorded at its callee's published join. Every other fact is a rep record the emitter
-already computes and does not keep where a typed reader can ask for it. Group 1's eight stay unless
-the orchestrator rules otherwise. Group 10's six and a re-shadow of `structIndexOfExpr` against the
-canonical row are the cheap next round.
+already computes and does not keep where a typed reader can ask for it. Round 27 moved group 1's
+eight to `NOT_BLIND`, switched two of group 10's six, and re-shadowed `structIndexOfExpr` against
+the canonical row. The probe count is 32.

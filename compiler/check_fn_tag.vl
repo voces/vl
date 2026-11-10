@@ -1572,12 +1572,11 @@ function ftScan(
       for v in ftSlotWrites(x, p, g, s) {
         const xti = nodeTyIxOf(x)
         const xt = if xti >= 0 && xti < T.tys.length { tyAt(xti) } else { null }
-        const rec = ftHoldKind(xti, s, FT_HOLD_DEPTH) == 6 && xt is TyArray
-        if (
-          rec
-          && xt is TyArray
-          && !ftRecWriteJoins(v, xt.aElem, s, ds, leaves, ids, 0)
-        ) {
+        const hk = ftHoldKind(xti, s, FT_HOLD_DEPTH)
+        const rec = hk == 6 && xt is TyArray || hk == 8 && xt is TyMap
+        // A list's or a map's record slot takes the written record's fields as its own.
+        const recTy = if xt is TyArray { xt.aElem } else if xt is TyMap { xt.mVal } else { -1 }
+        if rec && !ftRecWriteJoins(v, recTy, s, ds, leaves, ids, 0) {
           return false
         }
         if (
@@ -4127,7 +4126,7 @@ function ftSlotTyOf(ht: i32, s: i32): i32 {
 }
 
 // Whether `p`, a field read of holder `x`, names a method a call reads or writes one slot of
-// the holder through: a map's entry methods, a list's `push`, `pop` and `get`, or a list's `map` and `filter`
+// the holder through: a map's entry methods (a map of records' too), a list's `push`, `pop` and `get`, or a list's `map` and `filter`
 // handing each element to a callback whose parameter is closed or is the set, so an adapter can
 // be built or is already in place.
 function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
@@ -4162,7 +4161,7 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
   if k == 1 {
     return op == "push" || op == "slice" || op == "pop" || op == "get"
   }
-  (k == 3 || k == 5)
+  (k == 3 || k == 5 || k == 8)
     && (op == "get" || op == "set" || op == "has" || op == "delete")
 }
 
@@ -4353,6 +4352,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       // value's own type, and the callee's writes through it join this set (D14648, D15430).
       return ftDstTakes(ftArgDstTy(pn, x), x, s)
         || ftDstTakes(ftMapSetValTy(pn, x, s), x, s)
+        || ftRecIntoMapSet(x, pn, s, fn)
         || ftTyParamListTakes(p, x, s)
         || ftLate
         && ftHoleArg(pn, x)
@@ -4549,23 +4549,36 @@ let ftMapRecLit: i32[] = []
 let ftMapRecMap: i32[] = []
 let ftMapRecFn: i32[] = []
 
-// Whether record literal `x`, holding set `s`, is written by `x`'s store into slot `slot`, an index
-// of a map of the set's records (`ftHoldKind` 8) or of a parameter of `fd` every call hands one,
-// its function fields naming declared functions; the literal is noted for its row.
+// `ftRecIntoMap` for record literal `x` stored by index into slot `slot`.
 function ftRecIntoMapSlot(x: i32, slot: i32, s: i32, fd: i32): boolean {
+  const sn = if slot >= 0 && slot < P.nodes.length { nodeAt(slot) } else { null }
+  sn is Index && ftRecIntoMap(x, sn.idxArr, s, fd)
+}
+
+// `ftRecIntoMapSlot` for `m.set(k, x)`, call `c` storing record literal `x` into `m`'s slot.
+function ftRecIntoMapSet(x: i32, c: Call, s: i32, fd: i32): boolean {
+  const f = parenPeelIx(c.callFn)
+  const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+  fn is Member
+    && fn.memProp == "set"
+    && c.callArgs.length == 2
+    && c.callArgs[1] == x
+    && ftRecIntoMap(x, fn.memObj, s, fd)
+}
+
+// Whether record literal `x`, holding set `s`, is stored into a slot of map read `m`, a map of the
+// set's records (`ftHoldKind` 8) or a parameter of `fd` every call hands one, its function fields
+// naming declared functions; the literal is noted for its row.
+function ftRecIntoMap(x: i32, m: i32, s: i32, fd: i32): boolean {
   const lx = parenPeelIx(x)
   const ln = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
-  const sn = if slot >= 0 && slot < P.nodes.length { nodeAt(slot) } else { null }
-  if !(ln is ObjLit) || !(sn is Index) { return false }
-  const direct = ftHoldKind(nodeTyIxOf(sn.idxArr), s, FT_HOLD_DEPTH) == 8
-  if (
-    !direct
-    && !(ftRecFieldsNamed(ln, s) && ftParamHolderHolds(sn.idxArr, s, fd))
-  ) {
+  if !(ln is ObjLit) || m < 0 { return false }
+  const direct = ftHoldKind(nodeTyIxOf(m), s, FT_HOLD_DEPTH) == 8
+  if (!direct && !(ftRecFieldsNamed(ln, s) && ftParamHolderHolds(m, s, fd))) {
     return false
   }
   ftMapRecLit.push(lx)
-  ftMapRecMap.push(sn.idxArr)
+  ftMapRecMap.push(m)
   ftMapRecFn.push(fd)
   true
 }
