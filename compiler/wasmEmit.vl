@@ -368,8 +368,6 @@ import {
   retF32Flag,
   retF64Flag,
   retI64Flag,
-  retNulListFlag,
-  retNulStringFlag,
   strToCps,
   tyIsNulBool,
   tyNameOf,
@@ -1308,6 +1306,8 @@ import {
   variantIndexOf,
 } from "./emit_local_slots"
 import {
+  annNulVariantRowOf,
+  annSlotOfKind,
   annValtypeSlotOf,
   annVariantRowOf,
   fnRetIsNulAtom,
@@ -1320,13 +1320,6 @@ import {
   nulScalarListKindOfNode,
   nulVariantIndexOf,
   paramStructIdxOf,
-  retNulMapFlag,
-  retNulRefArrFlag,
-  retNulRefFlag,
-  retNulRefIndex,
-  retNulVariantFlag,
-  retUnionFlag,
-  retVariantFlag,
   structIdxOfElemNameTy,
   tyAnnRefListSlot,
   vtKindOfParam,
@@ -30565,14 +30558,17 @@ function inferredRetVariantIdx(fnPos: i32): i32 {
 function returnArmHeapOf(fn: FuncDecl, fnPos: i32): i32 {
   let retArmHeap = -1
   // A `: Circle | null` result's niche heap.
-  if retNulVariantFlag(fn.fnRet) == 1 {
+  if vtKindOfType(fn.fnRet) == "nulvariant" {
     const rnvi = nulVariantIndexOf(fn.fnRet)
     retArmHeap = armDestHeapOf("nulvariant", rnvi)
   }
   // The kind-9 twin: a `Dot | null` result over a DECLARED struct that is the arm's layout
   // twin. Same slot shape, same unbox owed, a struct row instead of a variant one.
-  if retNulRefFlag(fn.fnRet) == 1 {
-    retArmHeap = armDestHeapOf("nulstruct", retNulRefIndex(fn.fnRet))
+  if vtKindOfType(fn.fnRet) == "nulstruct" {
+    retArmHeap = armDestHeapOf(
+      "nulstruct",
+      annSlotOfKind("nulstruct", fn.fnRet),
+    )
   }
   // The plain-struct twin of the two annotated seeds: `function g(): A` returning a narrowed
   // arm of an inferred union, whose arm no seed above can find. The annotation's own rep and
@@ -30610,8 +30606,8 @@ function retStrWidenOf(
   }
   // the `string | null` niche return takes the same widen: its slot is the same string
   // ref with null permitted, and a widened member string is non-null, so it subtypes the
-  // slot. Asked of the arena (`retNulStringFlag`) rather than the spelling test above, since the nullable form does not spell `"string"`.
-  if retNulStringFlag(fn.fnRet) == 1 {
+  // slot. Asked of the declared type's rep rather than the spelling test above, since the nullable form does not spell `"string"`.
+  if vtKindOfType(fn.fnRet) == "nulstr" {
     if exprIsLitAtom(retArg, fnIx) { retStrWiden = true }
   }
   // an inline literal-union return (`: "circle" | "rect"`) takes the same widen: the
@@ -30795,7 +30791,9 @@ function retFlagsSeedResult(
 ): i32 {
   rf.retInferred = fn.fnRet < 0
   // A concrete-variant return (annotated `: Cat`, or a collapsed inferred lambda).
-  if retVariantFlag(fn.fnRet) == 1 { rf.retVi = annVariantRowOf(fn.fnRet) }
+  if vtKindOfType(fn.fnRet) == "variant" {
+    rf.retVi = annVariantRowOf(fn.fnRet)
+  }
   // Every value an inferred arm return delivers, a join included, goes through
   // `emitVariantCoerce`, not only the literal the seed above reaches (D4639).
   if fn.fnRet < 0 {
@@ -30832,7 +30830,7 @@ function retFlagsSeedResult(
   // value-union box return, since `emitUnionBoxArg` would `struct.new` the member. A
   // nullable-closure return is the closure niche, not a value box, and takes the plain
   // arm; a nullable literal union is excluded on the same grounds.
-  if retUnionFlag(fn.fnRet) == 1 {
+  if vtKindOfType(fn.fnRet) == "union" {
     if (
       !nodeTyIsLitUnionAlias(fn.fnRet)
       && !nodeTyIsNulLitUnion(fn.fnRet)
@@ -30878,7 +30876,7 @@ function retFlagsSeedNiches(
   fnPos: i32,
   rf: RetFlags,
 ) {
-  if retNulStringFlag(fn.fnRet) == 1 { rf.retNulString = true }
+  if vtKindOfType(fn.fnRet) == "nulstr" { rf.retNulString = true }
   if nodeTyIsLitUnionAlias(fn.fnRet) { rf.retLitUnion = true }
   // A synthesized `: K` (a lambda pinned at its alias) is typed at the alias's copy, which
   // the index test above misses and the provenance-reading one does not (D3120).
@@ -31420,30 +31418,30 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
     fbI32Const(2)
     return 0
   }
-  if retNulStringFlag(r) == 1 {
+  if vtKindOfType(r) == "nulstr" {
     fbRefNull(sTy())
     return 0
   }
-  if retNulRefFlag(r) == 1 {
-    const rsi = retNulRefIndex(r)
+  if vtKindOfType(r) == "nulstruct" {
+    const rsi = annSlotOfKind("nulstruct", r)
     if rsi >= 0 && rsi < sHeapIdx.length {
       fbRefNull(sHeapIdx[rsi])
       return 0
     }
   }
-  if retNulMapFlag(r) == 1 {
+  if vtKindOfType(r) == "nulmap" {
     fbRefNull(mapTypeIdxOf(mapAnnShape(r))) // the nullable map struct
     return 0
   }
   // A record that is also a union's member is that member's variant struct, nullable.
-  if retNulVariantFlag(r) == 1 {
+  if vtKindOfType(r) == "nulvariant" {
     const nvi = nulVariantIndexOf(r)
     if nvi >= 0 && nvi < uVarRow.length {
       fbRefNull(variantHeap(nvi))
       return 0
     }
   }
-  if retNulListFlag(r) == 1 {
+  if vtKindOfType(r) == "nullist" {
     fbRefNull(lTy())
     return 0
   }
@@ -31459,7 +31457,7 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
   }
   // A nullable ref-array return (`<ref-array> | null`, kind 18): the niche `ref.null $wrapper` over
   // the inner ref-list element wrapper (`tyAnnRefListSlot` strips the `| null` to resolve the slot).
-  if retNulRefArrFlag(r) == 1 {
+  if vtKindOfType(r) == "nulreflist" {
     const rls = tyAnnRefListSlot(r)
     if rls >= 0 && rls < rlWrapIdx.length {
       fbRefNull(rlWrapIdx[rls])
@@ -31487,7 +31485,7 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
   // null-tagged box `{ tag: null, payload: ref.null }` — identical to `emitUnionCoerce`'s
   // bare-`null` path.
   let isU = false
-  if retUnionFlag(r) == 1 { isU = true }
+  if vtKindOfType(r) == "union" { isU = true }
   if r < 0 {
     const inm = inferRetNameOf(inferRetFnKey(fnIx, fn.fnName))
     if (
@@ -38492,17 +38490,9 @@ function directArgSeedsOf(target: i32, i: i32): DirectArgSeeds {
       }
       // A list param position (`take(xs: f64[])`): its list kind.
       if nodeAt(cParams[i]) is Param { cParamSLKind = cpK }
-      const cpnb = nodeAt(cParams[i])
-      if cpnb is Param {
-        const cpnbT = parTyNode(cParams[i])
-        if retNulStringFlag(cpnbT) == 1 { cParamNulString = true }
-        if retNulVariantFlag(cpnbT) == 1 {
-          const cpNvi = nulVariantIndexOf(cpnbT)
-          if cpNvi >= 0 && cpNvi < uVarRow.length {
-            cParamNulVariantIdx = cpNvi
-          }
-        }
-      }
+      cParamNulString = cpK == "nulstr"
+      const cpNvi = annNulVariantRowOf(parTyNode(cParams[i]))
+      if cpNvi >= 0 && cpNvi < uVarRow.length { cParamNulVariantIdx = cpNvi }
     }
   }
   const seeds: DirectArgSeeds = {
