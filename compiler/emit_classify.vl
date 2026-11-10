@@ -369,11 +369,7 @@ import {
   ListRep,
   lrOf,
 } from "./emit_eq_rows"
-import {
-  cbRetVariantIdx,
-  fieldCodeForMatch,
-  fieldCodeOfTy,
-} from "./emit_field_codes"
+import { fieldCodeForMatch, fieldCodeOfTy } from "./emit_field_codes"
 import {
   bodyLetReadAtSid,
   callsOfCallee,
@@ -386,7 +382,6 @@ import {
   fnInMonoInstance,
   frameLetOf,
   globalIndexOf,
-  inferredRetKindCore,
   paramNulMap,
   paramReadAt,
   popUnionBoxElem,
@@ -452,7 +447,6 @@ import {
   readLoopNodeOf,
   repABRetWord,
   repOfFnSlot,
-  tailIsF64NoLocal,
 } from "./emit_local_scope"
 import {
   annBareRefArrElemName,
@@ -950,15 +944,12 @@ export function fnSigKeyOf(fe: i32) {
       key = key + tok
       pi = pi + 1
     }
-    // Key/bytes interlock: the `$fnsig` bytes stream from the key's representative via
-    // `cloRetValKind`, so a key coarser than it would let two different result reps share
-    // one slot and declare the loser with the winner's functype. `cloRetKindOf` is that
-    // coarser answer, so the value-ABI key is minted only where the two agree.
-    const r = cloRetKindOf(fe)
+    // The `$fnsig` bytes stream from the key's representative via `cloRetValKind`, so the
+    // value-ABI key is minted from that same kind.
     const vk = cloRetValKind(fe)
-    match r {
+    match vk {
       "i32" | "f64" => {
-        if vk == r { return key + ">" + repSigTokOfKind(r) }
+        return key + ">" + repSigTokOfKind(vk)
       }
       // Every other result kind is out of the value ABI, and void has no result.
       "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {}
@@ -966,36 +957,6 @@ export function fnSigKeyOf(fe: i32) {
     return ""
   }
   ""
-}
-
-// The value-ABI return kind of lifted function `fe` for `$fnsig` purposes: `"i32"`,
-// `"f64"`, or `null` for void, closure-returning, or any other kind. An annotated return
-// reads the annotation; an un-annotated one rides the stored kind plus `tailIsF64NoLocal`,
-// which stays registry-independent so the key cannot depend on the current function.
-export function cloRetKindOf(fe: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("cloRetKindOf") }
-  if fe < 0 || fe >= fnStmts.length { return null }
-  if fe >= fRetVoid.length { return null }
-  const fn = nodeAt(fnStmts[fe])
-  if fn is FuncDecl {
-    if fRetVoid[fe] == 1 { return null }
-    if fnReturnsClosure(fe) { return null }
-    if fn.fnRet >= 0 {
-      const k = vtKindOfType(fn.fnRet)
-      if k == "i32" || k == "nulbool" { return "i32" }
-      if k == "f64" { return "f64" }
-      return null
-    }
-    // Un-annotated: an inferred ref, i64 or f32 kind is out of the value ABI, an f64 tail
-    // is `"f64"`, and everything else rides the i32 result. The `"nulstr"` niche falls
-    // through with `"i32"` deliberately — this ladder does not consult `fRetNulStr`.
-    const irk = fRetKind[fe]
-    if irk == "f64" { return "f64" }
-    if irk != "i32" && irk != "nulstr" && irk != "nulbool" { return null }
-    if tailIsF64NoLocal(fnRetExprOf(fnStmts[fe]), fnStmts[fe]) { return "f64" }
-    return "i32"
-  }
-  null
 }
 
 // The lifted-function position (`fnStmts` index) of an object-literal field value that is
@@ -1060,37 +1021,24 @@ export function fieldValueFeOfIn(valIx: i32, fnIx: i32) {
   -1
 }
 
-// The result valtype kind of lifted function `fe`'s `$fnsig` functype — the same kind the
-// function's own functype emits, read from an annotation (`vtKindOfType`) or the stored
-// inferred return kind, so the closure functype byte-matches the callee. `null` for a void
-// result. The slot for the kinds that carry one comes from `cloRetValSlot`.
+// The result valtype kind of lifted function `fe`'s functype, `null` for a void result: a
+// declared result's annotation, else the return columns, where a closure the columns key `i32`
+// reads as one off the recorded result's rep. The slot comes from `cloRetValSlot`.
 export function cloRetValKind(fe: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("cloRetValKind") }
-  if fe < 0 || fe >= fnStmts.length { return null }
-  if fe >= fRetVoid.length { return null }
+  if fe < 0 || fe >= fnStmts.length || fe >= fRetVoid.length { return null }
+  if fRetVoid[fe] == 1 { return null }
   const fn = nodeAt(fnStmts[fe])
-  if fn is FuncDecl {
-    if fRetVoid[fe] == 1 { return null }
-    if fn.fnRet >= 0 {
-      if tyIsFuncType(fn.fnRet) { return "closure" }
-      return vtKindOfType(fn.fnRet)
-    }
-    if fnReturnsClosure(fe) { return "closure" }
-    // A callback collapsing to one concrete variant is typed as that variant, so the
-    // `$fnsig` result is the variant struct, not the union box. Checked before the
-    // `"union"` kind, which the emitter's syntactic inference also stores.
-    if cbRetVariantIdx(fe) >= 0 { return "variant" }
-    // The shared inferred-return-kind mapping, the same one the named-function functype
-    // result uses, so a kind added there is reflected here. The closure-specific cases are
-    // layered around it.
-    const core = inferredRetKindCore(fe)
-    if core != "i32" { return core }
-    // An f64 tail with no intervening local (`n => n * 2.0`) — detected structurally, not
-    // via `fRetF64`; without it the callback's functype declares i32 over an f64 body.
-    if tailIsF64NoLocal(fnRetExprOf(fnStmts[fe]), fnStmts[fe]) { return "f64" }
-    return "i32"
+  if !(fn is FuncDecl) { return null }
+  if fn.fnRet >= 0 {
+    if tyIsFuncType(fn.fnRet) { return "closure" }
+    return vtKindOfType(fn.fnRet)
   }
-  null
+  const k = fRetKind[fe]
+  if k == "i32" {
+    const rt = fnRecordedRetTyFn(fe)
+    if rt >= 0 && repOfTy(rt).rdKind == "closure" { return "closure" }
+  }
+  k
 }
 
 // The result type function `fe` returns as recorded (`fnRecordedRetTy`), installed by `emitProgram`
@@ -1118,7 +1066,6 @@ function cloRetResultTy(fe: i32): i32 {
 // The row `fe`'s result valtype names at `cloRetValKind`'s kind: a map's shape, an un-annotated
 // result's recorded row, a declared one's annotation row, else its type's slot (-1 for none).
 export function cloRetValSlot(fe: i32): i32 {
-  if clsCensusOn { clsCensusEnter("cloRetValSlot") }
   if fe < 0 || fe >= fnStmts.length { return -1 }
   const k = cloRetValKind(fe)
   const t = cloRetResultTy(fe)
@@ -5777,10 +5724,9 @@ export function forInPairStructIdx(iterIx: i32, fnIx: i32): i32 {
 
 // The companion table slot of a `for-in` loop variable's cell, paired with `addLocalSlot` as
 // `declareForInLocals` does (D1142): the row of the iterated list's rep (`listRowOfExpr`), else
-// the slot its element type keys (`repSlotOfKind`); a `.values()` walk reads the map's vals slot.
-// -1 for every kind needing no slot, the scalars and scalar lists among them.
+// the slot its element type keys, or for a list of lists its binding's cell row; a `.values()`
+// walk reads the map's vals slot. -1 for every kind needing no slot.
 export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
-  if clsCensusOn { clsCensusEnter("forInVarStructIdx") }
   const fk = forInElemKind(iterIx, fnIx)
   const e = tyRefArrElemOf(nodeTyAt(iterIx, fnIx))
   match fk {
@@ -5808,11 +5754,14 @@ export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
       return repSlotOfKind("variant", e)
     }
     // A nested ref array (`S[][]`): the loop var is the inner ref list. A list of hole
-    // functions keys no rep row, and its slot is the ladder's (D15561).
+    // functions keys no rep row, and its binding's cell holds its built row.
     "reflist" | "nulreflist" => {
       const rs = listRowOfExpr(iterIx, fnIx)
       if rs >= 0 { return rlElemInnerSlot(rs) }
-      return rlElemInnerSlot(refListSlotOfExpr(iterIx, fnIx))
+      const ie = if iterIx >= 0 && iterIx < P.nodes.length { nodeAt(iterIx) } else { null }
+      return rlElemInnerSlot(
+        if ie is Ident { declaredRefArraySlot(iterIx) } else { -1 },
+      )
     }
     // A map element or a nested-map value: the vals slot of a `.values()` walk, else the
     // element row of a map list.

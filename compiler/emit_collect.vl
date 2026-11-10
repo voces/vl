@@ -60,7 +60,7 @@ import {
 } from "./check_core_state"
 import { canonEmitNameOfTy } from "./check_program"
 import { assignable, substTyDeep } from "./check_relate_core"
-import { isVarTyIxOf } from "./check_list_union"
+import { isListArmNodes, isVarTyIxOf } from "./check_list_union"
 import { listDisjointDepth } from "./check_type_shape"
 import { inferRetNodeCarryNote, lambdaVoidAdoptedAt } from "./check_side_rows"
 import {
@@ -610,7 +610,6 @@ import {
   arrLitUnionElemName,
   arrNewIntrKind,
   captureCountOf,
-  cloRetKindOf,
   cloRetValKind,
   cloRetValSlot,
   cloSigKeyExt,
@@ -1684,6 +1683,8 @@ export function collectCloSigs() {
     if nn is TypeRef {
       if nodeTyIsNulClosure(ni) {
         const nInnerTy = tyPeelNul(nodeTyIxOf(ni))
+        // The key reads the result's rep, so a result map mints its value slot first.
+        forceCloResultMapTypes(nInnerTy)
         // The nulclosure annotation's inner closure sig.
         internNulCloSigOfTy(nInnerTy)
         // A nulclosure whose result is itself a closure: the intern above mints only the outer
@@ -2257,6 +2258,31 @@ export function arrLitMintTrees(roots: i32[], intoFns: boolean) {
   0
 }
 
+// Mints the rows of each function's signature annotations. The type section reads them first,
+// after the indices are dealt, so its reads are asked here, ahead of the deal.
+export function fnSigRowsMint() {
+  for fx in fnStmts {
+    const fn = nodeAt(fx)
+    if fn is FuncDecl {
+      if fn.fnRet >= 0 { nodeMintOnRead(fn.fnRet) }
+      for p in fn.fnParams {
+        const pn = nodeAt(p)
+        if pn is Param && pn.parType >= 0 { nodeMintOnRead(pn.parType) }
+      }
+    }
+  }
+  0
+}
+
+// Mints the list each `is K[]` test of a record list may hand its arm, from the checker's record
+// of those tests. The signature passes read its row first, a `.map` callback over the arm.
+export function isListArmRowsMint() {
+  for n in isListArmNodes {
+    if n >= 0 && n < P.nodes.length && nodeAt(n) is IsExpr { nodeMintOnRead(n) }
+  }
+  0
+}
+
 // Marks the value boxes of each if-expression join the checker recorded, a value union the
 // program declares nowhere (D1745). The box types are dealt with the type indices, ahead of every
 // reader of a join.
@@ -2286,15 +2312,7 @@ export function preIndexMintTrees(tops: i32[], fns: i32[]) {
 function preIndexMintAt(at: i32, todo: i32[], root: boolean) {
   if at < 0 || at >= P.nodes.length { return 0 }
   const nd = nodeAt(at)
-  if nd is IsExpr || nd is Call { nodeMintOnRead(at) }
-  // A signature's annotations are read by the type section, after the indices are dealt.
-  if nd is FuncDecl {
-    if nd.fnRet >= 0 { nodeMintOnRead(nd.fnRet) }
-    for p in nd.fnParams {
-      const pn = nodeAt(p)
-      if pn is Param && pn.parType >= 0 { nodeMintOnRead(pn.parType) }
-    }
-  }
+  if nd is Call { nodeMintOnRead(at) }
   if root || !(nd is FuncDecl) { nodeChildrenPush(at, todo) }
   0
 }
@@ -8405,6 +8423,8 @@ function collectTyReachCloSigsArm(tyIx: i32, depth: i32): i32 {
       return 0
     }
     TyFunc => {
+      // The sig's key reads its result's rep, so a result map mints its value slot first.
+      forceCloResultMapTypes(tyIx)
       // Interns this closure's sig from its arena render, the key the value-call site and a
       // concrete lambda both derive; a mixed-union unregistered result is skipped so the call rejects loudly.
       if !funcRetUnrepresentable(t.fnRet) {
@@ -9445,7 +9465,7 @@ export function collectMapFilterUse() {
                 // one, so force its wrapper/backing collection.
               } else if fe >= 0 && fnRetIsRecordRow(fe) {
                 // A struct-returning callback's result is a new ref list with no `Q[]` annotation to force
-                // its slot, so intern it here; `cloRetKindOf` folds a struct to -1, so ask `cloRetValKind`/`cloRetValSlot` directly.
+                // its slot, so intern it here at the row `cloRetValSlot` names.
                 const rsi = cloRetValSlot(fe)
                 if rsi >= 0 && rsi < sNames.length {
                   // Hinted with the struct table's own type column, so the hint skips `resolveAnnot` rather
@@ -9483,21 +9503,17 @@ export function collectMapFilterUse() {
                 // row its result list needs; without it the result has no ref-list row (D2301).
                 rlInternNameTy(sNames[csr], RLK_STRUCT, rlColAt(sTyIx, csr))
               } else {
-                let rk: VKind | null = null
-                if fe >= 0 { rk = cloRetKindOf(fe) }
-                // D1088 — `cloRetKindOf` answers only `"i32"`/`"f64"`/null, so an i64/f32-returning callback
-                // needs the second reader `cloRetValKind` (already consulted by the arms above) to name it.
                 let rvk: VKind | null = null
                 if fe >= 0 { rvk = cloRetValKind(fe) }
                 // A function-value callback has no lifted entry to ask: the call's recorded
                 // `T[]` names the scalar list its result is.
                 if fe < 0 {
                   const ep = tyArrayElemPrim(nodeTyIxOf(i))
-                  if ep == "f64" { rk = "f64" }
+                  if ep == "f64" { rvk = "f64" }
                   if ep == "i64" { rvk = "i64" }
                   if ep == "f32" { rvk = "f32" }
                 }
-                if rk == "f64" {
+                if rvk == "f64" {
                   // The f64 pair mints on first read (`fa64Ty`).
                 } else if rvk == "i64" {
                   // The i64 pair mints on first read (`ia64Ty`).
