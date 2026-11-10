@@ -4029,15 +4029,23 @@ function elabKeyCallsHandSet(k: i32, c: i32, d: i32): boolean {
 }
 
 // Whether every call reaching instance `k` names the function `d` itself and hands, at the
-// parameter `c` calls through, a value the reaching instance types as `c`'s set: `k` is that
-// call's instance at the set's rep, which a tagged set's direct call does not build.
+// parameter `c` calls through, a value the reaching instance types as one set `c` goes through in
+// some instance: `k` is that call's instance at the set's rep, which a tagged set's direct call
+// does not build (D15622).
 function elabKeyCallsHandSetValue(k: i32, c: i32, d: i32): boolean {
   const cn = nodeAt(c)
   if !(cn is Call) { return false }
   const dn = nodeAt(d)
   if !(dn is FuncDecl) { return false }
   const pi = i32ListIndexOf(dn.fnParams, identDeclOf(parenPeelIx(cn.callFn)))
-  elabReachHandsSet(k, d, pi, elabMintSets[c] ?? -1, 0)
+  if elabReachHandsSet(k, d, pi, elabMintSets[c] ?? -1, 0) { return true }
+  for a in elabMintCalls[c] ?? [] {
+    const s = elabCallInstSets[i32ToStr(a) + "|" + i32ToStr(c)] ?? -1
+    if s != (elabMintSets[c] ?? -1) && elabReachHandsSet(k, d, pi, s, 0) {
+      return true
+    }
+  }
+  false
 }
 
 // Whether every call reaching instance `k` of `d` hands, at parameter `pi`, a value its reaching
@@ -4720,6 +4728,14 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
       ) {
         // An element alias only ever called reads its holder's slot, as the callee chain does.
         n = n + elabMintCalleeIn(kid, decl, k, sc)
+      } else if (
+        cn is LetDecl
+        && kid == cn.letInit
+        && elabMintElemAliasFwd(cur, decl, k)
+      ) {
+        // So is a `const` holding that element, read only as such arguments (D15620).
+        const xk = nodeAt(parenPeelIx(kid))
+        if xk is Index { n = n + elabMintFactsIn(xk.idxIndex, decl, k, sc) }
       } else if cn is Call && elabMintElemFwd(kid, cur, decl, k) {
         // An element of a list parameter handed on is that parameter's value there (D15612).
         const xk = nodeAt(parenPeelIx(kid))
@@ -4756,6 +4772,53 @@ function elabMintElemFwd(ix: i32, p: i32, decl: i32, k: i32): boolean {
   const to = elabMintFwdTarget(ix, p)
   if to.length != 2 { return false }
   mintParamFwdNote(decl, i, to[0], to[1])
+  true
+}
+
+// Notes list parameter `fs` of `decl`, bound as `fs[i]` by `const` `d` every read of which is a
+// positional argument of a call to a named function's open parameter, as forwarded to each of
+// those; false, noting nothing, for any other binding or read.
+function elabMintElemAliasFwd(d: i32, decl: i32, k: i32): boolean {
+  if d < 0 || d >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
+    return false
+  }
+  const ln = nodeAt(d)
+  const fn = nodeAt(decl)
+  if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return false }
+  if !(fn is FuncDecl) { return false }
+  const init = parenPeelIx(ln.letInit)
+  if init < 0 || init >= P.nodes.length { return false }
+  const xn = nodeAt(init)
+  if !(xn is Index) { return false }
+  const ob = parenPeelIx(xn.idxArr)
+  if ob < 0 || ob >= P.nodes.length || !(nodeAt(ob) is Ident) { return false }
+  const i = i32ListIndexOf(fn.fnParams, identDeclOf(ob))
+  if i < 0 || elabHeldSetOf(elabNodeTy(ob, k)) < 0 { return false }
+  const tos: i32[] = []
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == d {
+        const to = elabMintFwdTarget(x, p)
+        if to.length != 2 { return false }
+        tos.push(to[0])
+        tos.push(to[1])
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+      }
+    }
+  }
+  if tos.length == 0 { return false }
+  let a = 0
+  while a + 1 < tos.length {
+    mintParamFwdNote(decl, i, tos[a], tos[a + 1])
+    a = a + 2
+  }
   true
 }
 
@@ -5959,9 +6022,15 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
       // A read handed to a named function's parameter of a closed function type is the closure
       // there of the set's one named member (D6741).
       if elabCloNoteAt(ix, p, pd, k) { return 0 }
-      mintSetPartialNote(elabHeldSetOf(elabNodeTy(ix, k)))
       const st = fnTagSetOfTy(elabNodeTy(ix, k))
       const to = elabMintFwdTarget(ix, p)
+      // A set-holding list handed whole to a named function's open parameter is that parameter's
+      // value there, as its element would be (D15621).
+      if st < 0 && to.length == 2 && elabHeldSetOf(elabNodeTy(ix, k)) >= 0 {
+        mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
+        return 0
+      }
+      mintSetPartialNote(elabHeldSetOf(elabNodeTy(ix, k)))
       if to.length == 2 && st >= 0 {
         mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
       } else if (
