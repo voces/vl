@@ -1,0 +1,406 @@
+// The VKind and slot producer census behind step 7's "VKind becomes derived from the rep
+// descriptor" (docs/internals/refactor-notes/2026-11-10-step7-vkind-census.md). A text walk
+// over compiler/*.vl: it finds producers by signature and name, and does not resolve calls.
+//
+//     vl run scripts/vkind-census.vl [-- --list | --slots | --slots-list] [--root DIR]
+//
+// Default is the VKind-returning functions by family. `--list` prints each with its
+// features; `--slots` the slot producers by bank and input. Run it from the checkout root.
+
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
+import { endsWith, join, split, startsWith, toLowerAscii } from "std:str"
+import { die, findFrom } from "./lib/common"
+import {
+  Fn,
+  cutComment,
+  functions,
+  modules,
+  padL,
+  padR,
+  readOrDie,
+  strip,
+} from "./lib/ladder-walk"
+
+const TOOL = "vkind-census"
+
+const MEMBERS = [
+  "i32", "struct", "list", "str", "union", "reflist", "map", "strlist",
+  "variant", "nulvariant", "nulstruct", "i64", "f64", "f64list", "f32",
+  "closure", "nullist", "nulstr", "nulbool", "nulreflist", "nulclosure",
+  "i64list", "f32list", "nulstrlist", "nulf64list", "nuli64list", "nulf32list",
+  "nulu8list", "nulmap", "nulnone", "u8list", "v128",
+]
+
+// The columns that store a VKind; a read of one is a stored kind, not a derived one.
+const COLUMNS = [
+  "fRetKind[", "localIsRef[", "gckVal[", "lckVal[", "rkMemoKind[",
+  "irkMemoKind[", "frsSnapKind[",
+]
+
+// The four slot banks of rep-descriptor-campaign.md §6.6, by function-name fragment.
+const BANKS = [
+  ["struct", "structidx", "structindex", "structrow", "structslot"],
+  [
+    "variant", "variantidx", "variantindex", "variantrow", "variantslot",
+  ],
+  ["reflist", "reflistslot", "rlslot", "rlrow", "reflistrow"],
+  ["mapval", "mvslot", "mapvalslot", "mvrow"],
+]
+
+type Row = {
+  rel: string,
+  line: i32,
+  name: string,
+  len: i32,
+  input: string,
+  lits: i32,
+  rd: i32,
+  col: i32,
+  family: string,
+}
+
+function count(s: string, needle: string): i32 {
+  let n = 0
+  let i = findFrom(s, needle, 0)
+  while i >= 0 {
+    n = n + 1
+    i = findFrom(s, needle, i + needle.length)
+  }
+  n
+}
+
+// The header text from `function` to the body's `{`, joined across lines.
+function header(lines: readonly string[], f: Fn): string {
+  const parts: string[] = []
+  let n = f.lo
+  while n <= f.hi {
+    const ln = cutComment(lines[n])
+    parts.push(strip(ln))
+    if findFrom(ln, "{", 0) >= 0 { return join(parts, " ") }
+    n = n + 1
+  }
+  join(parts, " ")
+}
+
+// The declared result after the parameter list's `)`, or "" when none is written.
+function resultOf(h: string): string {
+  let depth = 0
+  let i = findFrom(h, "(", 0)
+  while i >= 0 && i < h.length {
+    if h[i] == '(' { depth = depth + 1 }
+    if h[i] == ')' {
+      depth = depth - 1
+      if depth == 0 {
+        const rest = strip(h.slice(i + 1, h.length))
+        if !startsWith(rest, ":") { return "" }
+        const b = findFrom(rest, "{", 0)
+        return strip(rest.slice(1, if b < 0 { rest.length } else { b }))
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The parameter list's text between the outer parentheses.
+function paramsOf(h: string): string {
+  const a = findFrom(h, "(", 0)
+  if a < 0 { return "" }
+  let depth = 0
+  let i = a
+  while i < h.length {
+    if h[i] == '(' { depth = depth + 1 }
+    if h[i] == ')' {
+      depth = depth - 1
+      if depth == 0 { return h.slice(a + 1, i) }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+const TYPE_PARAMS = ["ty", "ty0", "t", "elemTy", "et", "tyIn", "valTy", "mems"]
+const SLOT_PARAMS = [
+  "code", "c", "k", "w", "slot", "rslot", "si", "vi", "row", "u", "ki", "rec",
+  "i", "fnPos", "key", "n", "ufn", "ti",
+]
+
+// What the first parameter is: a kind, a node, an arena type, a rendered name, a slot or
+// code of another encoding, a rep record, a callback (a setter), or nothing.
+function inputOf(ps: string): string {
+  const p = strip(ps)
+  if p == "" { return "none" }
+  const parts = split(p, ",")
+  let allKind = true
+  for q in parts {
+    if findFrom(q, "VKind", 0) < 0 { allKind = false }
+  }
+  if allKind { return "kind" }
+  const first = strip(parts[0])
+  const colon = findFrom(first, ":", 0)
+  if colon < 0 { return "other" }
+  const nm = strip(first.slice(0, colon))
+  const ty = strip(first.slice(colon + 1, first.length))
+  if startsWith(ty, "(") { return "setter" }
+  if ty == "string" { return "name" }
+  if ty == "ReadRep" || ty == "RepDesc" { return "record" }
+  if ty == "MfKind" || ty == "MfKind | null" || startsWith(ty, "VKind") {
+    return "slot"
+  }
+  for t in TYPE_PARAMS {
+    if nm == t { return "type" }
+  }
+  if (
+    endsWith(nm, "Ix")
+    || nm == "ix"
+    || nm == "rx"
+    || nm == "fe"
+    || nm == "sid"
+  ) {
+    return "node"
+  }
+  if ty != "" && ty[0] >= 'A' && ty[0] <= 'Z' { return "node" }
+  for s in SLOT_PARAMS {
+    if nm == s { return "slot" }
+  }
+  "other"
+}
+
+// Kind literals in producer position: not a comparison operand and not a match pattern.
+function producedLits(ln: string): i32 {
+  const t = strip(ln)
+  if endsWith(t, "=> {") && startsWith(t, "\"") { return 0 }
+  let n = 0
+  let i = 0
+  while i < ln.length {
+    if ln[i] == '"' {
+      let j = i + 1
+      while j < ln.length && ln[j] != '"' { j = j + 1 }
+      const lit = ln.slice(i + 1, j)
+      let isMember = false
+      for m in MEMBERS {
+        if m == lit { isMember = true }
+      }
+      if isMember {
+        let k = i - 1
+        while k >= 0 && ln[k] == ' ' { k = k - 1 }
+        const cmp = k >= 1
+          && ln[k] == '='
+          && (ln[k - 1] == '=' || ln[k - 1] == '!')
+        let e = j + 1
+        while e < ln.length && ln[e] == ' ' { e = e + 1 }
+        const cmpAfter = e + 1 < ln.length
+          && (ln[e] == '=' || ln[e] == '!')
+          && ln[e + 1] == '='
+        if !cmp && !cmpAfter { n = n + 1 }
+      }
+      i = j + 1
+    } else {
+      i = i + 1
+    }
+  }
+  n
+}
+
+function familyOf(r: Row): string {
+  if r.rel == "compiler/emit_rep.vl" { return "descriptor build" }
+  if r.input == "kind" { return "kind algebra" }
+  if r.col > 0 { return "stored column" }
+  if r.rd > 0 && r.lits == 0 { return "descriptor read" }
+  if r.rd > 0 { return "descriptor read + own rungs" }
+  if r.lits == 0 { return "forward" }
+  if r.input == "slot" { return "codec" }
+  if r.input == "name" { return "rendered name" }
+  "own ladder"
+}
+
+function vkindRows(root: string): Row[] {
+  const out: Row[] = []
+  for m in modules(TOOL, root) {
+    const lines = split(readOrDie(TOOL, m[1]), "\n")
+    for f in functions(lines) {
+      const h = header(lines, f)
+      const res = resultOf(h)
+      if res != "VKind" && res != "VKind | null" { continue }
+      let lits = 0
+      let rd = 0
+      let col = 0
+      let n = f.lo
+      while n <= f.hi {
+        const ln = cutComment(lines[n])
+        if n > f.lo || findFrom(ln, "{", 0) >= 0 {
+          const body = if n == f.lo { ln.slice(findFrom(ln, "{", 0), ln.length) } else { ln }
+          lits = lits + producedLits(body)
+          rd = rd + count(body, "rdKind")
+          for c in COLUMNS { col = col + count(body, c) }
+        }
+        n = n + 1
+      }
+      const r: Row = {
+        rel: m[0],
+        line: f.lo + 1,
+        name: f.name,
+        len: f.hi - f.lo + 1,
+        input: inputOf(paramsOf(h)),
+        lits: lits,
+        rd: rd,
+        col: col,
+        family: "",
+      }
+      r.family = familyOf(r)
+      out.push(r)
+    }
+  }
+  out
+}
+
+function bankOf(name: string): i32 {
+  const l = toLowerAscii(name)
+  let b = 0
+  while b < BANKS.length {
+    let i = 1
+    while i < BANKS[b].length {
+      if findFrom(l, BANKS[b][i], 0) >= 0 { return b }
+      i = i + 1
+    }
+    b = b + 1
+  }
+  -1
+}
+
+type Slot = { rel: string, line: i32, name: string, bank: i32, input: string }
+
+// Slot producers: a function named for a bank whose result is a number, not a predicate,
+// a kind or a name.
+function slotRows(root: string): Slot[] {
+  const out: Slot[] = []
+  for m in modules(TOOL, root) {
+    if !startsWith(m[0], "compiler/emit") && m[0] != "compiler/wasmEmit.vl" {
+      continue
+    }
+    const lines = split(readOrDie(TOOL, m[1]), "\n")
+    for f in functions(lines) {
+      const b = bankOf(f.name)
+      if b < 0 { continue }
+      const h = header(lines, f)
+      const res = resultOf(h)
+      if res != "" && res != "i32" { continue }
+      const inp = inputOf(paramsOf(h))
+      if inp == "setter" { continue }
+      const l = toLowerAscii(f.name)
+      if (
+        startsWith(l, "mint")
+        || endsWith(l, "build")
+        || endsWith(l, "off")
+        || endsWith(l, "drop")
+      ) {
+        continue
+      }
+      if (
+        endsWith(l, "reset")
+        || startsWith(l, "is")
+        || findFrom(l, "twin", 0) >= 0
+      ) {
+        continue
+      }
+      const body = cutComment(lines[f.hi])
+      if f.lo == f.hi && findFrom(body, "{ }", 0) >= 0 { continue }
+      out.push({ rel: m[0], line: f.lo + 1, name: f.name, bank: b, input: inp })
+    }
+  }
+  out
+}
+
+function tallyKeys(keys: string[]): string[][] {
+  const names: string[] = []
+  const counts: i32[] = []
+  for k in keys {
+    let i = 0
+    while i < names.length && names[i] != k { i = i + 1 }
+    if i == names.length {
+      names.push(k)
+      counts.push(0)
+    }
+    counts[i] = counts[i] + 1
+  }
+  const out: string[][] = []
+  let i = 0
+  while i < names.length {
+    out.push([names[i], "\{counts[i]}"])
+    i = i + 1
+  }
+  out
+}
+
+function main(args: string[]) {
+  let mode = ""
+  let root = "."
+  let i = 0
+  while i < args.length {
+    const a = args[i]
+    if a == "--root" && i + 1 < args.length {
+      root = args[i + 1]
+      i = i + 1
+    } else if a == "--list" || a == "--slots" || a == "--slots-list" {
+      mode = a
+    } else {
+      die("\{TOOL}: unknown argument \{a}", 2)
+    }
+    i = i + 1
+  }
+  if mode == "--slots" || mode == "--slots-list" {
+    const rows = slotRows(root)
+    if mode == "--slots-list" {
+      for r in rows {
+        print(
+          "\{padR(BANKS[r.bank][0], 8)} \{padR(r.input, 6)} \{r.rel}:\{r.line} \{r.name}",
+        )
+      }
+      return
+    }
+    print("\{rows.length} slot producers (name-pattern lower bound)")
+    let b = 0
+    while b < BANKS.length {
+      const keys: string[] = []
+      for r in rows {
+        if r.bank == b { keys.push(r.input) }
+      }
+      const parts: string[] = []
+      for t in tallyKeys(keys) { parts.push("\{t[0]} \{t[1]}") }
+      print(
+        "  \{padR(BANKS[b][0], 8)} \{padL("\{keys.length}", 4)}  \{join(parts, ", ")}",
+      )
+      b = b + 1
+    }
+    const all: string[] = []
+    for r in rows { all.push(r.input) }
+    const parts: string[] = []
+    for t in tallyKeys(all) { parts.push("\{t[0]} \{t[1]}") }
+    print("  by input: \{join(parts, ", ")}")
+    return
+  }
+  const rows = vkindRows(root)
+  if mode == "--list" {
+    for r in rows {
+      print(
+        "\{padR(r.family, 28)} \{padR(r.input, 6)} lits=\{r.lits} rd=\{r.rd} col=\{r.col} "
+          + "\{r.rel}:\{r.line} \{r.name}",
+      )
+    }
+    return
+  }
+  print("\{rows.length} functions return a VKind")
+  const keys: string[] = []
+  for r in rows { keys.push(r.family) }
+  for t in tallyKeys(keys) { print("  \{padR(t[0], 28)} \{padL(t[1], 4)}") }
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("\{TOOL}: an argument is not UTF-8: \{argv.msg}", 2)
+} else {
+  main(argv)
+  exit(0)
+}
