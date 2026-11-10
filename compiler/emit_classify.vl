@@ -606,7 +606,6 @@ import {
   arrElemIsClosureTy,
   arrLitArenaElemRow,
   arrLitBoxElem,
-  arrLitBoxElemName,
   arrLitClosureRowTy,
   arrLitElemRender,
   arrLitLeadInner,
@@ -4572,7 +4571,6 @@ function memRecvStructRow(objIx: i32, fnIx: i32): i32 {
 // where `v` is narrowed to a union arm carrying a value-union field `f`) — the field then
 // rides the variant tables, not the incrementally-built struct table.
 export function memberUnionFieldName(memIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("memberUnionFieldName") }
   const m = nodeAt(memIx)
   if m is Member {
     const si = memRecvStructRow(m.memObj, fnIx)
@@ -4661,7 +4659,6 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
 // the gap `memberUnionFieldName` leaves, since a union arm has no row in the standalone
 // struct table (`collectS` skips a member of a `type X = {…}` union). "" for the rest (D219).
 function armFieldUnionName(memIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("armFieldUnionName") }
   const m = nodeAt(memIx)
   if m is Member {
     const avi = exprVariantIndex(m.memObj, fnIx)
@@ -6932,24 +6929,26 @@ export function arrLitNumKind(arrIx: i32, fnIx: i32): i32 {
   ALK_NONE
 }
 
-// The union variant an object-literal-element array literal boxes its elements under, or ""
-// — the one home the rule `arrLitElemName`, `arrLitElemKind`, and `arrLitElemHintTy` all
-// need an arm for. `objVariantName` alone over-widens an anonymous shape shared by two
-// variants (D36); `arrLitBoxElemName` is the second gate, asking whether the element is a real union.
+// The union variant an object-literal-element array literal boxes its elements under, or "":
+// the arm its lead record literal is adopted at, when the literal's recorded element is a union
+// and its elements are not all one arm (D361: then it is a list of that arm, kind 1, the slot the
+// annotated `Circle[]` spelling interns).
 export function arrLitObjElemBoxVariant(arrIx: i32): string {
-  if clsCensusOn { clsCensusEnter("arrLitObjElemBoxVariant") }
-  if !uDeclared { return "" }
-  if arrLitBoxElemName(arrIx) == "" { return "" }
-  // The third gate (D361): the recorded union may be a join, not a disagreement of rows.
-  // When every element denotes one arm, the literal is a list of that arm, and declining
-  // here routes all three classifiers to kind 1 under that arm's own name — the same slot
-  // the annotated `Circle[]` spelling interns.
-  if arrLitObjElemsOneVariant(arrIx) != "" { return "" }
   const a = nodeAt(arrIx)
-  if a is ArrayLit {
-    if a.arrElems.length >= 1 {
-      const e0 = nodeAt(a.arrElems[0])
-      if e0 is ObjLit { return objVariantName(a.arrElems[0]) }
+  if !(a is ArrayLit) || a.arrElems.length < 1 { return "" }
+  const e = tyArrayElemIx(nodeTyIxOf(arrIx))
+  if e < 0 || !(tyAt(e) is TyUnion) { return "" }
+  const e0 = a.arrElems[0]
+  if !(nodeAt(e0) is ObjLit) { return "" }
+  const vr = litArmRowOf(e0, -1, litRepTyAt(e0, -1))
+  if vr < 0 || vr >= uVariants.length { return "" }
+  if a.arrElems.length < 2 { return uVariants[vr] }
+  for el in a.arrElems {
+    if (
+      !(nodeAt(el) is ObjLit)
+      || litArmRowOf(el, -1, litRepTyAt(el, -1)) != vr
+    ) {
+      return uVariants[vr]
     }
   }
   ""
@@ -7071,30 +7070,6 @@ export function arrLitElemHintTy(arrIx: i32) {
   }
   -1
 }
-// The one nominal row every object-literal element of `arrIx` denotes, or "" when they do
-// not all denote one row (D361) — the rung `arrLitObjElemBoxVariant` consults before it
-// widens. "The checker recorded a union" and "the elements denote different rows" are two
-// different facts: a naive structural join can name a union while every element is one arm.
-function arrLitObjElemsOneVariant(arrIx: i32): string {
-  const a = nodeAt(arrIx)
-  if a is ArrayLit {
-    if a.arrElems.length < 2 { return "" }
-    let nm = ""
-    let i = 0
-    while i < a.arrElems.length {
-      const e = nodeAt(a.arrElems[i])
-      if !(e is ObjLit) { return "" }
-      const vn = objVariantName(a.arrElems[i])
-      if vn == "" { return "" }
-      if i == 0 { nm = vn }
-      else if vn != nm { return "" }
-      i = i + 1
-    }
-    return nm
-  }
-  ""
-}
-
 // The scalar leaf kind of list-of-lists literal `a` (lead inner literal `e0x`): order-blind
 // over every inner literal, as `arrLitNumKind` is over a flat literal's elements, so a later
 // `[2.5]` keys `f64[]` as the checker's element join does (D4876). ALK_NONE for a mixed one.
@@ -7236,33 +7211,22 @@ function tyIsLitOrLitUnion(t: i32): boolean {
   }
 }
 
-// The struct row a plain record literal leading list literal `arrIx` builds at in instance
-// `fnIx`, or outside any instance at the record solve's build row (`objLitBindDestRow`), when
-// that is not the template's row and its list row exists; else -1.
+// The struct row a plain record literal leading list literal `arrIx` is built at in instance
+// `fnIx` (outside any instance at -1): its recorded build type's row, when that is not the
+// template's row and its list row exists; else -1.
 function arrLitInstElemRow(arrIx: i32, fnIx: i32): i32 {
-  if clsCensusOn { clsCensusEnter("arrLitInstElemRow") }
   if arrIx < 0 || arrIx >= P.nodes.length { return -1 }
   const a = nodeAt(arrIx)
-  if a is ArrayLit {
-    if a.arrElems.length < 1 || !(nodeAt(a.arrElems[0]) is ObjLit) { return -1 }
-    if (
-      arrLitObjElemBoxVariant(arrIx) != ""
-      || arrLitNulRefElemName(arrIx) != ""
-    ) {
-      return -1
-    }
-    const e0 = a.arrElems[0]
-    let si = -1
-    if fnIx < 0 {
-      si = objLitBindDestRow(e0, structIndexOfObjCtxMemo(e0, -1))
-    } else {
-      si = structIndexOfObjCtx(e0, fnIx)
-      if si == structIndexOfObj(e0) { return -1 }
-    }
-    if si < 0 || si >= sNames.length { return -1 }
-    if rlSlotByName(sNames[si]) >= 0 { return si }
+  if !(a is ArrayLit) || a.arrElems.length < 1 { return -1 }
+  const e0 = a.arrElems[0]
+  if !(nodeAt(e0) is ObjLit) { return -1 }
+  if arrLitObjElemBoxVariant(arrIx) != "" || arrLitNulRefElemName(arrIx) != "" {
+    return -1
   }
-  -1
+  const si = structRowOfRecordTy(litRepTyAt(e0, fnIx))
+  if si < 0 || si >= sNames.length { return -1 }
+  if si == structRowOfRecordTy(nodeRepTyIxOf(e0)) { return -1 }
+  if rlSlotByName(sNames[si]) >= 0 { si } else { -1 }
 }
 
 // `arrLitElemName` read off the literal's own recorded type, the answer every frame shares.
@@ -9166,7 +9130,6 @@ function ifArmsAllVariantIdx(ifIx: i32, fnIx: i32, vi: i32): boolean {
 // Frame-aware for the same reason its kind companion is: the two must resolve to the SAME
 // function, or the kind says struct while the row is another instance's (D1788).
 function fnRetStructIndexSid(sid: i32, name: string, fnIx: i32, at: i32) {
-  if clsCensusOn { clsCensusEnter("fnRetStructIndexSid") }
   const d = repOfNameResult(sid, name, fnIx, at)
   if d.rdCovered == 0 { return -1 }
   // Kind-gated, like every other reader of the polymorphic companion slot: `fRetStructIdx`
@@ -9181,7 +9144,6 @@ function fnRetStructIndexSid(sid: i32, name: string, fnIx: i32, at: i32) {
 // The struct table index of the module global the read `readIx` denotes (from its
 // annotation/initializer), or -1.
 function globalReadStructIndex(fnIx: i32, readIx: i32) {
-  if clsCensusOn { clsCensusEnter("globalReadStructIndex") }
   const li = globalLetOfRead(fnIx, readIx)
   if li < 0 { return -1 }
   // Kind-gated, like every other storage class's struct reader — with only its variant
@@ -9199,7 +9161,6 @@ function globalReadStructIndex(fnIx: i32, readIx: i32) {
 // resolves exactly as a param/local/global receiver would. Gated on the capture's kind: the
 // companion slot is polymorphic, so a map's mv slot read back as a struct index traps.
 function capturedStructIndex(fnIx: i32, name: string) {
-  if clsCensusOn { clsCensusEnter("capturedStructIndex") }
   const ck = capturedKindOf(fnIx, name)
   if ck != "struct" && ck != "nulstruct" { return -1 }
   capturedCompanionSlot(fnIx, name)
@@ -12470,7 +12431,6 @@ export function objLitBindDestRow(objIx: i32, own: i32): i32 {
 // or a value `m[k] = {...}` or `m.set(k, {...})` stores into such a `Map()` (`recBuildElemTyOf`);
 // -1 to keep its own type's row.
 export function recBuildRowOf(objIx: i32): i32 {
-  if clsCensusOn { clsCensusEnter("recBuildRowOf") }
   if objIx < 0 || !rsIxReady() { return -1 }
   const li = rsUp(objIx)
   if li < 0 || li >= P.nodes.length { return -1 }
@@ -14285,7 +14245,6 @@ function blockTailIsClosure(blockIx: i32) {
 // whose declared type is a function type. (For `objects/equality-function-field.vl` and
 // `escaping.vl`'s `o.go`.) Resolved against the receiver's struct table fields.
 function memberIsClosure(objIx: i32, prop: string, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("memberIsClosure") }
   const si = memRecvStructRow(objIx, fnIx)
   if si >= 0 { return structFieldIsClosure(si, prop) }
   // A narrowed union receiver: the struct index isn't resolvable from the declared union
@@ -15090,7 +15049,6 @@ function idxReadNulLitAtom(e: Index, fnIx: i32): i32 {
 
 // The kind an element or map-value read's slot holds.
 function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
-  if clsCensusOn { clsCensusEnter("readIndexStoreKind") }
   // An interned literal-union id: an atom list's element or an atom-valued map's value, and the
   // `K | null` niche where the cell also holds the `-1` null.
   if gLitUnionUsed != 0 && idxReadIsLitAtom(e, rx, fnIx) {
