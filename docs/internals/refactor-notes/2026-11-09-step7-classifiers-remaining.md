@@ -176,7 +176,7 @@ build row, 14,881 / 0). The four left:
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `arrLitIsRefTpl` | 93,162 (9,205) | 3: `arrLitIsRef` 88,891, itself 3,793, `arrLitFrameRefTy` 478 | at `arrLitIsRef`'s answer, `tyIsRefArray(nodeTyIxOf)` with a tagged set's function element a list of ids, 88,771 / 188 (r28) | A list at a hole or generic pin, whose stored row the template type does not name (groups 2 and 3). Switched in, it traps 2 programs and refuses 3 more (r28). |
+| ~~`arrLitIsRefTpl`~~ | switched 2026-11-10 | | its blind default reads the emitter's build for the literal's recorded type (`listBuildOfTyHeld`); all 23,842 sweep programs byte-identical ([notes](2026-11-10-step7-isref-tpl-default.md)) | — |
 | `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | **Switched** to the width of `litRepTyAt`'s element, by ruling: 23 programs build different wasm with the same output (`2026-11-10-step7-arrlitnumkind-rep-width.md`). | none |
 | ~~`refListElemNameOfExprRaw`~~ | deleted 2026-11-10 | | after #7070 its 3 calls were `__array_new__` record fills, which name the element record's canonical row ([notes](2026-11-10-step7-rlen-raw-deleted.md)) | — |
 | ~~`arrLitElemNameTpl`~~ | switched 2026-11-10 | | its one blind rung, a list of lists' scalar leaf, reads the inner literal's recorded rep; 448 of 450 reaching files byte-identical, 2 lose a dead row ([notes](2026-11-10-step7-elemname-tpl-leaf.md)) | — |
