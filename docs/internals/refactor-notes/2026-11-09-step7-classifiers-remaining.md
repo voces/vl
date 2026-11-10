@@ -116,13 +116,6 @@ is the largest group by calls (5.3 M).
 | `unionNameOfRead` | 647,780 (11,790) | 18: `mapReadMvSlot` 316,254, `emitAssignIdent` 108,349, `unionNameOfExpr` 99,444 | none (its asker `unionIdentReadKind` was typed in r24, finding 77 legacy errors) | A union read's registered name: a by-name walk of parameters, `let`s and globals (D2316, D2325). The read's cell (`identStoreClaimed`) names the box. The union's registered name is the rep fact. |
 | `mapReadMvSlot` | 492,182 (12,779) | 14: `mapReadNarrowableSlot` 156,405, `exprString` 47,984, `coalesceMvSlot` 46,934 | the `map`/`nulmap` rep's slot, 462,068 / 39,941 (r21) | `rdSlot` in the mv table's numbering. |
 
-**Measured 2026-11-10** (`2026-11-10-step7-read-rep-slots.md`): `ReadRep` now carries `rrStoreTy` and
-`rrMv`, and `nulVariantIdxOfExpr`'s four read arms read `readNulVariantRow`. Its joins stay. The
-other five stand with these gaps. `mapReadMvSlot`: 1,511 calls where the receiver's type keys no mv
-slot (D15319). `unionNameOfRead`: 14,337 with different names, rows not yet compared. `exprIsNulNone`:
-2 calls, ready. `exprIsLitAtom` and `exprNulLitUnion`: a name read's store is the `i32` cell, and
-the binding's atom rep is missing from it.
-
 ## 7. Layout twins and named rows (2)
 
 **Mostly settled by the ruling that the structural struct row is canonical.** A layout twin shares a
