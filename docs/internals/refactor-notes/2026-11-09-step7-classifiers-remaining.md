@@ -81,7 +81,7 @@ and `forInVarStructIdx`'s fallback, can go.
 | `forInVarStructIdx` | 8,456 (2,174) | 2: `declareForInLocals` 8,196, `captureValStructIdx` 260 | typed except the reflist fallback, 8,441 / 15, wasm identical in 2,174 of 2,174 (r26) | One call: a loop over a list of hole-function lists (`hole-fn-list-reached-through-alias-called-in-callback.vl`). |
 | `arrLitObjRowTy` | 6,532 (234) | 1: `arrLitRowTyIn` | reads the row `emitObj` builds the lead record literal at: **group 1**, in `STORAGE_READERS` since 2026-11-10 ([notes](2026-11-10-step7-mfresult-objrow.md)) | none needed |
 | ~~`mfResultSlotOf`~~ | switched 2026-11-10 | | the `.filter`/`.slice` arm reads the call type's row, else its receiver's; 0 disagreements, 52 of 52 reaching files byte-identical ([notes](2026-11-10-step7-mfresult-objrow.md)) | — |
-| `cloArrElemSelfKey` | 2,933 (394) | 1: `cloIndexCalleeSigKey` | the element's interned `sigKeyOfTy`, 1,293 / 79, plus 2,661 typed-only (r12) | A lambda literal's own key, which no type records. Not ablated. |
+| ~~`cloArrElemSelfKey`~~ | deleted 2026-11-10 | | the slot's key, else the read's type where it is a same-named twin of the slot's (a literal union, D2552), else a capture cell's seed key (`cellSeedSigKey`, `STORAGE_READERS`); 391 of 394 reaching files byte-identical, 3 the same failure ([notes](2026-11-10-step7-classifier-last.md)) | — |
 | ~~`cloPinnedListElemKey`~~ | deleted 2026-11-10 | | its rung fed no lowering: 1,489 reaching files byte-identical without it ([notes](2026-11-10-step7-fnlist-rows-3.md)) | — |
 
 ## 4. A closure bundle and the `fRet*` columns (3)
@@ -188,6 +188,11 @@ build row, 14,881 / 0). The four left:
 | `captureValStructIdx` | 15,374 (1,654) | 4: `tsCloEnv` 9,861, `emitOneFuncType` 4,011, `capturedCompanionSlot` 1,336 | Its `let` arm is `letCellSlot` (r25, 8,765 / 0) and its loop-variable arm is `forInVarStructIdx`. It leaves the probe set when both do. Neither moved in r27. |
 
 ## Summary for the ruling
+
+**The classifier half is done** (2026-11-10, [notes](2026-11-10-step7-classifier-last.md)):
+`classifier-census.vl` reports 0 probed classifiers over 23,842 programs. Every classifier either
+reads a typed fact or is `NOT_BLIND` with its reason recorded in the census. The table below is
+the grouping as it was ruled on.
 
 | missing fact | owner | classifiers | calls | touches |
 | --- | --- | --- | --- | --- |
