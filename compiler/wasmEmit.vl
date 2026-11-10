@@ -88,6 +88,7 @@ import {
   ctxElemOwnerOf,
   ctxFieldNameOf,
   ctxFieldOwnerOf,
+  fnCloCoerceSetAt,
   fnCloCoerceTyOf,
   listCopyTyOf,
   mapUnboxTyOf,
@@ -661,6 +662,7 @@ import {
   mkArrTy,
   mkListTy,
   monoCloCoerceFe,
+  monoCloCoerceSetFes,
   monoGradualAsScalar,
   monoInertCalled,
   monoInstFe,
@@ -28876,7 +28878,13 @@ function mfCallbackSigOf(argIx: i32, cbFe: i32, fnIx: i32): i32 {
   } else {
     // A closure-value callback (`xs.map(f)` where `f: (i32) => i32`) has no lifted fe to
     // inline; the loop `call_ref`s the closure value exactly as for a named-function callback.
-    const ck = mfCallbackCloKey(argIx, fnIx)
+    let ck = mfCallbackCloKey(argIx, fnIx)
+    // A set's id coerced to its member's closure at a closed type is a closure of that type.
+    const ct = fnCloCoerceAtNode(unwrapParen(argIx))
+    if ct >= 0 {
+      const k = sigKeyOfTy(ct)
+      if k != "" && cloSigPosOfKey(k) >= 0 { ck = k }
+    }
     if ck != "" { sig = cloSigTypeIdxAt(cloSigPosOfKey(ck)) }
   }
   sig
@@ -29667,9 +29675,16 @@ function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
       return emitListCopyTail(body, exprIx, listCopyAtNode(exprIx), fnIx)
     }
     "fnClo" => {
-      // The value's id names the one member; its closure at the destination's instance replaces it (D14884).
-      fbDrop()
-      return emitClosureValueCore(body, fe, fnIx)
+      // The value's id names the member; its closure at the destination's instance replaces it (D14884).
+      let fes = monoCloCoerceSetFes.get(exprIx) ?? []
+      if fes.length == 0 {
+        fes = monoCloCoerceSetFes.get(nodeSrc[exprIx] ?? -1) ?? []
+      }
+      if fes.length == 0 {
+        fbDrop()
+        return emitClosureValueCore(body, fe, fnIx)
+      }
+      return emitFnCloDispatch(body, exprIx, fes, fnIx)
     }
     "mapUnbox" => {
       if !boxed { return 0 }
@@ -29680,6 +29695,44 @@ function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
       return emitMapRetagTail(exprIx)
     }
     "none" => {}
+  }
+  0
+}
+
+// The id of a tagged set just emitted for `exprIx`, replaced by the closure of the member it names:
+// member `k` of the set's members is `fes[k]`, the last taking the remaining id. Returns 0, or -1.
+function emitFnCloDispatch(
+  body: u8[],
+  exprIx: i32,
+  fes: i32[],
+  fnIx: i32,
+): i32 {
+  let cs = fnTagSetOfTy(nodeTyIxOf(exprIx))
+  if cs < 0 { cs = fnCloCoerceSetAt.get(exprIx) ?? -1 }
+  const ds = fnTagMembers(cs)
+  if ds.length != fes.length {
+    return emitFailAt("emitProgram: a dispatch lost a member", exprIx)
+  }
+  const slot = fnTagIdSlot()
+  fbLocalSet(slot)
+  let k = 0
+  while k < fes.length {
+    const last = k == fes.length - 1
+    if !last {
+      fbLocalGet(slot)
+      fbI32Const(ds[k])
+      fbI32Bin(70) // 0x46 i32.eq
+      fbOpenIf()
+      fbValtype("closure", -1)
+    }
+    if emitClosureValueCore(body, fes[k], fnIx) < 0 { return -1 }
+    if !last { fbElse() }
+    k = k + 1
+  }
+  k = 0
+  while k < fes.length - 1 {
+    fbEnd()
+    k = k + 1
   }
   0
 }
