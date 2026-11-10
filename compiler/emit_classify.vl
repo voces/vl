@@ -915,6 +915,7 @@ import {
   flattenVariantsInto,
   isNullTy,
   nonNullTy,
+  primNameOf,
   tyAdmitsNull,
   tyHasTyVar,
   tyIsArray,
@@ -4592,8 +4593,12 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
         return sbn
       } else if bcode == FC_UNION && sharedPlanBoxesSome(bvis, bfis) {
         // A join holding `null` is a nullable row, and names its box as a union row does (D13361).
-        if nodeTyIsUnionRow(memIx) || nodeTyIsNullable(memIx) {
-          const bty = nodeTyInOf(memIx, fnIx)
+        const bty = nodeTyInOf(memIx, fnIx)
+        if (
+          nodeTyIsUnionRow(memIx)
+          || nodeTyIsNullable(memIx)
+          || tyIsUnionOrNullable(bty)
+        ) {
           const bn = valueUnionNameOfTy(bty)
           if bn != "" { return bn }
           // A join holding a literal set boxes it as its string (`registerSharedReadUnion`).
@@ -4611,6 +4616,13 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
     }
   }
   ""
+}
+
+// Whether `ty` is a union or a nullable: an instance's type for a read its template types at a hole.
+function tyIsUnionOrNullable(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  t is TyUnion || t is TyNullable
 }
 
 // The read-side composite: `memberUnionFieldName` (the receiver's own spelling where the read
@@ -6773,50 +6785,17 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
   false
 }
 
-// The scalar list the array literal at `arrIx` makes by its elements: `ALK_F64` when some
-// element is an f64 and none an i64, `ALK_I64` for the converse, else `ALK_NONE` (an empty
-// literal included, whose kind comes from its destination). Mixed float and int elements are a
-// checker-level union, so they answer `ALK_NONE`; one scan asks each element both widths.
+// The scalar list literal `arrIx` is built as in function `fnIx`: `ALK_F64` when its recorded
+// rep is an `f64[]` or `f32[]`, `ALK_I64` for an `i64[]`, else `ALK_NONE` (a box, niche or ref
+// element, and an empty literal, whose kind comes from its destination).
 export function arrLitNumKind(arrIx: i32, fnIx: i32): i32 {
-  if clsCensusOn { clsCensusEnter("arrLitNumKind") }
-  const a = nodeAt(arrIx)
-  if a is ArrayLit {
-    if a.arrElems.length < 1 { return ALK_NONE }
-    // A spread element is no scalar VALUE, so the element scan below would read `[...fs]` as
-    // the i32 default while `emitArrSpread` builds the source's rep — two heap types for one
-    // value. Both sides ask `spreadDestKind`, so they cannot disagree.
-    // A box-list literal boxes its spread sources too, whatever their scalar kind (D2969).
-    if hasSpreadItem(a.arrElems) && arrLitBoxElem(arrIx) { return ALK_NONE }
-    if hasSpreadItem(a.arrElems) {
-      const sk = spreadDestKind(arrIx, fnIx)
-      if sk == "f64" { return ALK_F64 }
-      if sk == "i64" { return ALK_I64 }
-      return ALK_NONE
-    }
-    // A box-list literal with an f64 or i64 member: the checker recorded a value union, so the
-    // elements box, and a scalar build would store a string ref into a scalar backing. The scan
-    // below is order-blind (any member claims the list), so the union has to win here.
-    if arrLitBoxElem(arrIx) { return ALK_NONE }
-    let anyF64 = false
-    let anyI64 = false
-    let i = 0
-    while i < a.arrElems.length && !(anyF64 && anyI64) {
-      const el = a.arrElems[i]
-      const n = if el >= 0 { nodeAt(el) } else { null }
-      if n is NumLit {
-        const w = numLitWidth(el, fnIx)
-        if w == "f64" || w == "f32" { anyF64 = true }
-        if w == "i64" { anyI64 = true }
-      } else {
-        if !anyI64 && exprIsI64(el, fnIx) { anyI64 = true }
-        if !anyF64 && exprIsF64(el, fnIx) { anyF64 = true }
-      }
-      i = i + 1
-    }
-    if anyF64 && !anyI64 { return ALK_F64 }
-    if anyI64 && !anyF64 { return ALK_I64 }
+  const p = primNameOf(tyArrayElemIx(litRepTyAt(arrIx, fnIx)))
+  if p == null { return ALK_NONE }
+  match p {
+    "f64" | "f32" => ALK_F64
+    "i64" => ALK_I64
+    "i32" | "u8" | "boolean" | "string" | "void" | "null" | "never" | "v128" => ALK_NONE
   }
-  ALK_NONE
 }
 
 // The union variant an object-literal-element array literal boxes its elements under, or "":
@@ -8664,7 +8643,7 @@ function callIsNulNone(e: Call, rx: i32, fnIx: i32): boolean {
   if cf is Ident {
     const t = fnIndexOfNode(e.callFn)
     if t >= 0 { return fnResultIsNulNone(t) }
-    return calleeRetKindOfRead(e.callFn, fnIx) == "nulnone"
+    return sigKeyRetKind(readCloSigKey(e.callFn, fnIx)) == "nulnone"
   }
   if cloValueCallRetKind(rx, fnIx) == "nulnone" { return true }
   methodCallIsNulNone(unwrapParen(e.callFn), fnIx)
@@ -9309,8 +9288,12 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
     // to `fnRetStructIndex`): the struct index from its resolved `>sN;` sig. Falls through to the
     // per-node-type fallback below when the sig path misses (a value INFERRED from a factory call —
     // `const g = mk()` — whose `>sN;` the syntactic path can't recover).
-    const ci = calleeReturnsStructIdxOfRead(e.callFn, fnIx)
-    if ci >= 0 { return ci }
+    const ck = readCloSigKey(e.callFn, fnIx)
+    const crk = sigKeyRetKind(ck)
+    if crk == "struct" || crk == "nulstruct" {
+      const ci = sigKeyRetSlot(ck)
+      if ci >= 0 { return ci }
+    }
     if dr >= 0 { return dr }
   }
   // A field-closure call (`(a."[]")(i)` — a chained index trap whose "[]"
@@ -12779,7 +12762,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       return sigKeyRetSlot(cloCallSigKey(exprIx, fnIx))
     }
     if callee is Ident && fnIndexOfNode(e.callFn) < 0 {
-      const ivk = calleeRetKindOfRead(e.callFn, fnIx)
+      const ivk = sigKeyRetKind(readCloSigKey(e.callFn, fnIx))
       if ivk == "map" || ivk == "nulmap" {
         return sigKeyRetSlot(calleeCloSigKeyOfRead(e.callFn, fnIx))
       }
@@ -13911,34 +13894,76 @@ function sigArityIsElemOf(key: string, listTy: i32): boolean {
 // `fnRetString` for a named function — drives the closure-call RESULT's string typing
 // (binding cell, print routing). `atIx` is the callee's own arena node (D2316).
 function calleeReturnsStringOfRead(atIx: i32, fnIx: i32) {
-  calleeRetKindOfRead(atIx, fnIx) == "str"
+  sigKeyRetKind(readCloSigKey(atIx, fnIx)) == "str"
 }
 
-// The struct-table index a function-value callee at `sid` (in scope of `fnIx`) returns, or
-// -1. Its resolved `$fnsig` key's result kind is `"struct"` (`>sN;`) or `"nulstruct"`
-// (`>nN;`); the slot digits parse through the shared result-slot reader. Drives the
-// closure-call result's struct typing. `atIx` is the callee's own arena node (D2316).
-function calleeReturnsStructIdxOfRead(atIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("calleeReturnsStructIdxOfRead") }
-  const k = calleeCloSigKeyOfRead(atIx, fnIx)
-  const rk = sigKeyRetKind(k)
-  if rk == "struct" || rk == "nulstruct" { return sigKeyRetSlot(k) }
-  -1
+// How many un-annotated aliases `readCloSigKey` follows from binding to binding.
+const READ_ALIAS_HOPS = 16
+
+// The `$fnsig` key the callee read `atIx` in `fnIx` calls through, from its type and its
+// declaration: a closed function type keys itself; a binding whose type is open (a hole bound
+// per call) holds its initializer's lowered value, which keys the binding's storage. Else the
+// read's own type at the instance, the key the call is lowered with.
+function readCloSigKey(atIx: i32, fnIx: i32): string {
+  const k = readCloSigKeyOfDecl(atIx, fnIx, READ_ALIAS_HOPS)
+  if k != "" { return k }
+  const aty = nodeTyAt(atIx, fnIx)
+  if aty >= 0 && aty < T.tys.length && tyAt(aty) is TyFunc {
+    sigKeyOfTy(aty)
+  } else {
+    ""
+  }
 }
 
-// The `cloRetValKind`-style result kind of a function-value callee (by `sid`, in scope of
-// `fnIx`), decoded from its resolved `$fnsig` key — the trailing `>X` token's `VKind`, or
-// `null` for a void or unresolved result. `atIx` is the callee's own arena node, threaded to
-// `calleeCloSigKeyOfRead` so two sibling blocks binding one name resolve the call's own (D2316).
-function calleeRetKindOfRead(atIx: i32, fnIx: i32): VKind | null {
-  if clsCensusOn { clsCensusEnter("calleeRetKindOfRead") }
-  return sigKeyRetKind(calleeCloSigKeyOfRead(atIx, fnIx))
+// `readCloSigKey` short of its last rung; "" where none of the typed rungs keys the read.
+function readCloSigKeyOfDecl(atIx: i32, fnIx: i32, hops: i32): string {
+  if atIx < 0 { return "" }
+  const fk = sigKeyOfTy(monoFieldReadTyAt(atIx, fnIx))
+  if fk != "" && cloSigPosOfKey(fk) >= 0 { return fk }
+  const nft = narrowedFnTyOf(atIx, fnIx)
+  if nft >= 0 { return sigKeyOfTy(nft) }
+  const rt = tyPeelNul(nodeTyAt(atIx, fnIx))
+  if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyFunc && !tyHasTyVar(rt) {
+    const rk = sigKeyOfTy(rt)
+    if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
+  }
+  const sd = bindingDeclInScope(atIx)
+  const d = if sd >= 0 { sd } else { identDeclOf(atIx) }
+  if d < 0 || d >= P.nodes.length { return "" }
+  const dn = nodeAt(d)
+  match dn {
+    LetDecl => {
+      if dn.letType >= 0 { return fnTyKeyOf(nodeTyInOf(dn.letType, fnIx)) }
+      if dn.letInit < 0 { return "" }
+      let fe = fieldValueFeOfIn(dn.letInit, fnIx)
+      if fe < 0 { fe = fieldValueFeOf(dn.letInit) }
+      if fe >= 0 { return cloSigKeyExt(fe) }
+      // An un-annotated alias of another binding holds that binding's value.
+      const src = unwrapParen(dn.letInit)
+      if hops > 0 && src >= 0 && nodeAt(src) is Ident {
+        return readCloSigKeyOfDecl(src, fnIx, hops - 1)
+      }
+      ""
+    }
+    Param => {
+      if dn.parType < 0 { "" } else { fnTyKeyOf(nodeTyInOf(dn.parType, fnIx)) }
+    }
+    // A named function, a loop variable and every other declaration key by the read's own type.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => ""
+  }
+}
+
+// The `$fnsig` key of function type `ty`, its `| null` peeled; "" for any other type.
+function fnTyKeyOf(ty: i32): string {
+  const t = tyPeelNul(ty)
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) { return "" }
+  sigKeyOfTy(t)
 }
 
 // The result kind of a call through a function value no binding names: the rep of the call's
 // type where the callee's own type at `fnIx` is a function, and a field callee is stored as a
 // closure (a hole function field holds none, D6342). `null` for an `Ident` callee, which
-// resolves through `calleeRetKindOfRead`.
+// resolves through `readCloSigKey`.
 function cloValueCallRetKind(callIx: i32, fnIx: i32): VKind | null {
   const c = nodeAt(callIx)
   if !(c is Call) { return null }

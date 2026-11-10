@@ -22,6 +22,8 @@ below keep the eight ruled-out rows for their reasons and mark each change.
 **After the hole-rep round** (`2026-11-10-step7-hole-rep-and-kept-row.md`) 29 are probed.
 `cloValueCallRetKind` reads the callee's type, group 8's fact is provided, and `fieldCodeCellKind`
 reads the emitter's storage, so it joins group 1 in `STORAGE_READERS`.
+Then `2026-11-10-step7-hole-rep-read-key.md`: 2 fewer (26 on master `cc8c522e`'s tree). Both callee-read classifiers read one typed key
+(`readCloSigKey`) and are deleted, so group 2 is closed.
 
 Grouped by the missing fact. Each group says whose fact it is: a CHECKER fact (the checker owns
 types) or an EMITTER rep fact (the emitter reconciles reps).
@@ -56,8 +58,8 @@ type mono should choose, so it stays a rep record.
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `calleeRetKindOfRead` | 223,664 (9,866) | 4: `exprUnionCall` 132,861, `calleeReturnsStringOfRead` 49,593, `callIsNulNone` 24,901 | the read's type at the instance, its `$fnsig` key's result, 216,222 / 7,442 (2026-11-10) | 6,722 of the 7,442 are the binding's producer lambda, keyed where its signature is interned (`cloSigKeyExt`). The read's type is a hole function (5,470), no function (675) or a function over a type variable (576). Record that key per binding declaration there. |
-| `calleeReturnsStructIdxOfRead` | 34,723 (1,789) | 1: `structIndexOfCallExpr` | the same key's struct slot, 34,739 / 20 (2026-11-10) | Same as `calleeRetKindOfRead`. |
+| ~~`calleeRetKindOfRead`~~ | deleted 2026-11-10 | | `readCloSigKey`: the read's closed type, else its declaration's initializer's lowered key, a parameter's or annotation's instance type, or the read's own type; 360,269 / 363 by key, wasm byte-identical in 10,337 of 10,337 reaching files | The binding's covered rep is its producer's lowered key, which the declaration link reaches. |
+| ~~`calleeReturnsStructIdxOfRead`~~ | deleted 2026-11-10 | | the same key's struct slot | — |
 | `fieldCodeCellKind` | 847 (438) | 1: `readCellKind` | none needed | It answers only where the field's recorded storage type is a hole or `nulnone`, from the code `sFieldTypes` holds for the row. The code is written at mint and rewritten in place, so a copied column would go stale. It reads the emitter's storage: **group 1**, in `STORAGE_READERS` since 2026-11-10. |
 | ~~`cloValueCallRetKind`~~ | switched 2026-11-10 | | the callee's type is a function, a field stored as a closure; 38,859 / 189, wasm byte-identical in 23,816 of 23,816 | — |
 
@@ -174,7 +176,7 @@ build row, 14,881 / 0). The four left:
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
 | `arrLitIsRefTpl` | 93,162 (9,205) | 3: `arrLitIsRef` 88,891, itself 3,793, `arrLitFrameRefTy` 478 | at `arrLitIsRef`'s answer, `tyIsRefArray(nodeTyIxOf)` with a tagged set's function element a list of ids, 88,771 / 188 (r28) | A list at a hole or generic pin, whose stored row the template type does not name (groups 2 and 3). Switched in, it traps 2 programs and refuses 3 more (r28). |
-| `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | the width of `litRepTyAt`'s element, 72,518 / 6,118; switched in, byte-identical in 1,197 of 1,221 files, the same output in the other 23 (r28) | No fact is missing. It needs a ruling: in 23 files the rep's box (a nullable or union element) or its `f64[]` (a nested inner literal) replaces a scalar build. |
+| `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | **Switched** to the width of `litRepTyAt`'s element, by ruling: 23 programs build different wasm with the same output (`2026-11-10-step7-arrlitnumkind-rep-width.md`). | none |
 | `refListElemNameOfExprRaw` | 7,595 (454) | 1: `refListElemNameOfExpr` (asked only when `listRowOfExpr` has no row) | `rlRowNameOfTy` of `nodeTyAt`'s element, 3,698 / 3,897, 437 of them one row spelled twice (r27) | The function-value list rows (group 3) and nested niche lists. |
 | `arrLitElemNameTpl` | 7,049 (4,037) | 1: `arrLitElemName` | `rlRowNameOfTy` of `nodeTyIxOf`'s element, 5,365 / 1,682, 398 of them one row spelled twice (r27) | The same. |
 
@@ -189,7 +191,7 @@ build row, 14,881 / 0). The four left:
 | missing fact | owner | classifiers | calls | touches |
 | --- | --- | --- | --- | --- |
 | none: the emitter's own storage (`NOT_BLIND` since r27) | emitter (provided) | 8 → 0 | 1.83 M | D842, D219, D4636, D26, D1788, D6342 |
-| covered rep of a hole (a binding's producer key) | emitter | 2 (+1 switched, +1 to group 1) | 0.26 M | D6271, D6342 |
+| covered rep of a hole (a binding's producer key) | emitter (provided) | 0 (2 deleted, 1 switched, 1 to group 1) | — | D6271, D6342 |
 | function-value list rows | emitter, lane w254 | 8 | 0.41 M | D15561, D12301, D12215, D6914 |
 | closure bundle, `fRet*` columns | emitter, lane w168 | 3 | 0.98 M | D15142, D15146 |
 | generic instance key | checker | 2 | 0.24 M | D9130, D3868 |
