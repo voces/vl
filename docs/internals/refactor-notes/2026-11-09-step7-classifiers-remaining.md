@@ -80,7 +80,7 @@ and `forInVarStructIdx`'s fallback, can go.
 | `refListKeptSlotOfExpr` | 23,481 (965) | 2: `refListSlotOfExpr` 23,297, itself 184 | the rest of `refListSlotOfExpr`'s ladder, 14,316 / 2,000 (r25) | The same families: kept row 0 against a type that keys none (1,654). |
 | `forInVarStructIdx` | 8,456 (2,174) | 2: `declareForInLocals` 8,196, `captureValStructIdx` 260 | typed except the reflist fallback, 8,441 / 15, wasm identical in 2,174 of 2,174 (r26) | One call: a loop over a list of hole-function lists (`hole-fn-list-reached-through-alias-called-in-callback.vl`). |
 | `arrLitObjRowTy` | 6,532 (234) | 1: `arrLitRowTyIn` | the lead element's structural or variant row, 6,296 / 6 (r25) | `[{ fs: [inc0] }]`: the context row is the joined set's (`returned-lists-of-records-take-the-joined-set-runs.vl`). |
-| ~~`mfResultSlotOf`~~ | switched 2026-11-10 | | the call type's row, else a `.filter`/`.slice` receiver's row; `STORAGE_READERS` ([notes](2026-11-10-step7-fnlist-rows-3.md)) | — |
+| `mfResultSlotOf` | 4,526 (1,194) | 5: `mfScan` 1,963, `emitMapFilter` 1,908, `exprEmittedRefListSlot` 598 | the `.slice` / `.filter` call type's row, 4,512 / 14 (r24) | `generic-fn-list-written-then-called.vl`, `hole-fn-list-*`. |
 | `cloArrElemSelfKey` | 2,933 (394) | 1: `cloIndexCalleeSigKey` | the element's interned `sigKeyOfTy`, 1,293 / 79, plus 2,661 typed-only (r12) | A lambda literal's own key, which no type records. Not ablated. |
 | ~~`cloPinnedListElemKey`~~ | deleted 2026-11-10 | | its rung fed no lowering: 1,489 reaching files byte-identical without it ([notes](2026-11-10-step7-fnlist-rows-3.md)) | — |
 
