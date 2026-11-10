@@ -174,7 +174,7 @@ build row, 14,881 / 0). The four left:
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
 | `arrLitIsRefTpl` | 93,162 (9,205) | 3: `arrLitIsRef` 88,891, itself 3,793, `arrLitFrameRefTy` 478 | at `arrLitIsRef`'s answer, `tyIsRefArray(nodeTyIxOf)` with a tagged set's function element a list of ids, 88,771 / 188 (r28) | A list at a hole or generic pin, whose stored row the template type does not name (groups 2 and 3). Switched in, it traps 2 programs and refuses 3 more (r28). |
-| `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | the width of `litRepTyAt`'s element, 72,518 / 6,118; switched in, byte-identical in 1,197 of 1,221 files, the same output in the other 23 (r28) | No fact is missing. It needs a ruling: in 23 files the rep's box (a nullable or union element) or its `f64[]` (a nested inner literal) replaces a scalar build. |
+| `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | **Switched** to the width of `litRepTyAt`'s element, by ruling: 23 programs build different wasm with the same output (`2026-11-10-step7-arrlitnumkind-rep-width.md`). | none |
 | `refListElemNameOfExprRaw` | 7,595 (454) | 1: `refListElemNameOfExpr` (asked only when `listRowOfExpr` has no row) | `rlRowNameOfTy` of `nodeTyAt`'s element, 3,698 / 3,897, 437 of them one row spelled twice (r27) | The function-value list rows (group 3) and nested niche lists. |
 | `arrLitElemNameTpl` | 7,049 (4,037) | 1: `arrLitElemName` | `rlRowNameOfTy` of `nodeTyIxOf`'s element, 5,365 / 1,682, 398 of them one row spelled twice (r27) | The same. |
 
