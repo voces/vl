@@ -81,7 +81,7 @@ and `forInVarStructIdx`'s fallback, can go.
 | `forInVarStructIdx` | 8,456 (2,174) | 2: `declareForInLocals` 8,196, `captureValStructIdx` 260 | typed except the reflist fallback, 8,441 / 15, wasm identical in 2,174 of 2,174 (r26) | One call: a loop over a list of hole-function lists (`hole-fn-list-reached-through-alias-called-in-callback.vl`). |
 | `arrLitObjRowTy` | 6,532 (234) | 1: `arrLitRowTyIn` | reads the row `emitObj` builds the lead record literal at: **group 1**, in `STORAGE_READERS` since 2026-11-10 ([notes](2026-11-10-step7-mfresult-objrow.md)) | none needed |
 | ~~`mfResultSlotOf`~~ | switched 2026-11-10 | | the `.filter`/`.slice` arm reads the call type's row, else its receiver's; 0 disagreements, 52 of 52 reaching files byte-identical ([notes](2026-11-10-step7-mfresult-objrow.md)) | — |
-| ~~`cloArrElemSelfKey`~~ | deleted 2026-11-10 | | the slot's key, else the read's type where it is a same-named twin of the slot's (a literal union, D2552), else a capture cell's seed key (`cellSeedSigKey`, `STORAGE_READERS`); 391 of 394 reaching files byte-identical, 3 the same failure ([notes](2026-11-10-step7-classifier-last.md)) | — |
+| ~~`cloArrElemSelfKey`~~ | deleted 2026-11-10 | | the slot's key, else the read's type where it keys no row of its own (a literal union the slot's name spells as its string, D2552), else a capture cell's seed key (`cellSeedSigKey`, `STORAGE_READERS`); 391 of 394 reaching files byte-identical, 3 the same failure ([notes](2026-11-10-step7-classifier-last.md)) | — |
 | ~~`cloPinnedListElemKey`~~ | deleted 2026-11-10 | | its rung fed no lowering: 1,489 reaching files byte-identical without it ([notes](2026-11-10-step7-fnlist-rows-3.md)) | — |
 
 ## 4. A closure bundle and the `fRet*` columns (3)

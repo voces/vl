@@ -36,10 +36,11 @@ happens with the arena type and with `nodeTyAt`, and with the type gated on havi
 The two niche files (`niche-signature-value-call.vl`, `lambda-niche-signature-per-instance.vl`,
 D2552) read a slot whose element type is re-read from its name, `(string)=>LI`. The name spells
 the literal union `LI` by its string, so the slot keys `S>i`. The read's own type has the same
-emit name and keys `i>i`, the lambda's functype. The new rung `slotTwinReadSigKey` takes the
-read's type key only where the read's type and the slot's type are distinct types with one emit
-name. In the hole-fn file the names differ (`(i32)=>i32` against `(i64)=>i64`), so the slot
-answers there, as before.
+emit name and keys `i>i`, the lambda's functype. It keys no row of its own (`rlSlotOfTy` is
+-1): the slot exists only under its name. The new rung `slotTwinReadSigKey` takes the read's type
+key only where that type differs from the slot's and keys no row. In the hole-fn file the read's
+`(i32)=>i32` keys a row of its own, so the slot's `(i64)=>i64` answers there, as before. The rung
+renders no type, so the render-parse budget does not move.
 
 The four capture-cell files (`captured-cell-hole-lambda-seed-in-generic-body.vl`,
 `capture-cell-hole-lambda-seed-flipped-in-generic-body-at-two-types.vl`, D3971, D15101) call
@@ -53,13 +54,14 @@ template's `let`, whose seed keys `>v`. The rung is in `classifier-census.vl`'s
 
 ## Proof
 
-The fixpoint seed is 6,596,961 bytes. Two `refresh-compiler.sh` runs are byte-identical.
+The fixpoint seed is 6,596,960 bytes. Two `refresh-compiler.sh` runs are byte-identical.
 
 * The 394 files that reach the deleted classifier build with master's source and with this
   branch's, each built by the same seed. 391 build byte-identical wasm. 3 (D14401, D14437,
   D15194) fail the same way on both.
 * `rep-fuzz-check.sh`: exact.
 * `lint-self.sh`: clean.
+* render-parse budget: ok, 41 `tyToEmitName` calls and 82 type-string parses.
 * `seed-size --check`: +0.1%.
 * `late-demands --check`: 6, the baseline.
 * Dead-export budget: 0.
