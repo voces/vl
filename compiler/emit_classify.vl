@@ -87,6 +87,7 @@ import {
   externValueSeen,
   litRetUnionIx,
   mapUnboxTyOf,
+  nodeRepStamped,
   nodeRepTyIxOf,
 } from "./check_core_state"
 import { letDeclFn, nodeTyIsUnionAlias } from "./check_decl_scan"
@@ -122,7 +123,6 @@ import {
   nodeLitUnionMemberTexts,
   nodeNulLitUnionMemberTexts,
   nodeNulStructInnerName,
-  nodeTyCanonObjName,
   nodeTyIsArrayish,
   nodeTyIsFunc,
   nodeTyIsLitUnionAlias,
@@ -254,7 +254,6 @@ import {
   sioMemoIx,
   sioMemoUn,
   sioMemoVer,
-  structIndexByName,
   structIndexOfTy,
   structRowRecordingTy,
   tyIsRefShaped,
@@ -427,7 +426,6 @@ import {
 } from "./emit_lit_atoms"
 import {
   LF_UNPLACED,
-  asNulStructRow,
   asgReadNarrowSet,
   asgUnwidenPrim,
   criFnIsAnonLambda,
@@ -456,7 +454,6 @@ import {
   arrLitRlSlotAt,
   mvUnionIsScalarNull,
   mvValInnerRlSlotAt,
-  nonNulBaseOf,
   rlElemIsNulNiche,
   structIdxOfElemTy,
   tyRefArrElemOf,
@@ -614,6 +611,7 @@ import {
   mvValStructIdxOf,
   mvValVariantOf,
   refListElemKindOfTy,
+  repStructRowOfTy,
   rlElemInnerSlot,
   rlElemMapValMvSlot,
   rlElemNulMapValMvSlot,
@@ -627,7 +625,6 @@ import {
   sFieldRefSlot,
   structIndexOfNullPartTy,
   structRowOfAnnTy,
-  structRowOfNameOrTy,
   structRowOfNameTy,
   structRowOfRecordTy,
   structRowOfSpelling,
@@ -655,7 +652,6 @@ import {
   outerFrameBinds,
   paramStructIndex,
   readPosIn,
-  recRowOfTy,
   sigKeyOfTy,
   sigKeyRetIsVoid,
   sigKeyRetKind,
@@ -9034,91 +9030,167 @@ export function identUnionTyAt(sid: i32, fnIx: i32, atIx: i32): i32 {
   unionTyIxOfIdentAt(sid, fnIx, atIx)
 }
 
-export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("structIndexOfExpr") }
+export function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return -1 }
   const e = nodeAt(exprIx)
-  match e {
-    ObjLit => {
-      return structIndexOfObjCtx(exprIx, fnIx)
-    }
-    // Every other expression is resolved by the rungs below.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
   const asgCell = asgCellOf(exprIx, fnIx)
   if asgCell >= 0 { return structIndexOfExpr(asgCell, fnIx) }
   match e {
-    Paren => {
-      return structIndexOfExpr(e.parInner, fnIx)
+    // A literal is built at its context's row.
+    ObjLit => structIndexOfObjCtx(exprIx, fnIx)
+    Paren => structIndexOfExpr(e.parInner, fnIx)
+    IfStmt => structIndexOfIfJoin(exprIx, fnIx)
+    BinExpr => structIndexOrRep(structIndexOfJoinStore(e, exprIx, fnIx), exprIx, fnIx)
+    Ident => structIndexOrRep(structIndexOfIdentStore(e, exprIx, fnIx), exprIx, fnIx)
+    Member => structIndexOrRep(structIndexOfMemberStore(e, exprIx, fnIx), exprIx, fnIx)
+    OptMember => structIndexOrRep(recvFieldStructRow(e.omObj, e.omProp, fnIx), exprIx, fnIx)
+    Index => structIndexOrRep(structIndexOfIndexStore(e, exprIx, fnIx), exprIx, fnIx)
+    Call => structIndexOrRep(structIndexOfCallStore(e, exprIx, fnIx), exprIx, fnIx)
+    // Every other node answers by its rep.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => structIndexOfRep(exprIx, fnIx)
+  }
+}
+
+// A storage reader's answer `st`, else the rep's: -2 is storage that holds no struct.
+function structIndexOrRep(st: i32, exprIx: i32, fnIx: i32): i32 {
+  if st >= 0 { return st }
+  if st == -2 { return -1 }
+  structIndexOfRep(exprIx, fnIx)
+}
+
+// An if-expression's row: a join of records wider than its arms is its own row, whatever row
+// an arm takes (D2731); else its THEN arm's, which the checker proved agrees.
+function structIndexOfIfJoin(exprIx: i32, fnIx: i32): i32 {
+  const jr = joinedRecordRowOf(exprIx, fnIx)
+  if jr >= 0 { return jr }
+  const tv = ifThenValueIx(exprIx)
+  if tv >= 0 { return structIndexOfExpr(tv, fnIx) }
+  structIndexOfRep(exprIx, fnIx)
+}
+
+// The row node `exprIx`'s rep names: a read at its storage's type, else the type it is built
+// at; -1 when the rep is no struct. An arm value's layout is `exprVariantIndex`'s (D34), but a
+// call or element stores a record arm at its own row (D14655).
+function structIndexOfRep(exprIx: i32, fnIx: i32): i32 {
+  if exprVariantIndex(exprIx, fnIx) >= 0 { return -1 }
+  const rx = unwrapParen(exprIx)
+  if rx < 0 { return -1 }
+  const e = nodeAt(rx)
+  let ty = -1
+  if e is Ident || e is Member || e is Index || e is Call {
+    ty = readRepOf(rx, fnIx).rrStoreTy
+  }
+  if ty < 0 {
+    ty = if nodeRepStamped(rx) { nodeRepTyIxOf(rx) } else { nodeTyAt(rx, fnIx) }
+  }
+  if ty < 0 { return -1 }
+  const k = repOfNodeAt(rx, ty).rdKind
+  if k == "struct" || k == "nulstruct" {
+    return repStructRowOfTy(nonNullTy(ty))
+  }
+  if (e is Call || e is Index) && (k == "variant" || k == "nulvariant") {
+    return repStructRowOfTy(nonNullTy(ty))
+  }
+  // A read stored in a box still names a record of its own type.
+  const own = nodeTyAt(rx, fnIx)
+  if own < 0 || own == ty { return -1 }
+  const ok = repOfNodeAt(rx, own).rdKind
+  if ok == "struct" || ok == "nulstruct" {
+    return repStructRowOfTy(nonNullTy(own))
+  }
+  -1
+}
+
+// The row a `??` holds: a struct-valued map read's mv slot, else the left's row, else the
+// default's; -1 for a box result, which has no struct row.
+function structIndexOfJoinStore(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  const cms = coalesceMvSlot(exprIx, fnIx)
+  if cms >= 0 {
+    if mvValVariantOf(cms) >= 0 { return -2 }
+    if mvValKind[cms] == MVK_STRUCT { return mvValStructIdxOf(cms) }
+  }
+  if e.binOp != "??" { return -1 }
+  if coalesceResultIsBox(exprIx, fnIx) { return -2 }
+  const ls = structIndexOfExpr(e.binLeft, fnIx)
+  if ls >= 0 { return ls }
+  const rs = structIndexOfExpr(e.binRight, fnIx)
+  if rs >= 0 { rs } else { -2 }
+}
+
+// The row a name read's cell holds: a parameter's, a declared local's, a global's, a
+// capture's companion slot, or the frame's own struct binding's cell slot.
+function structIndexOfIdentStore(e: Ident, exprIx: i32, fnIx: i32): i32 {
+  const pi = paramStructIndex(fnIx, exprIx)
+  if pi >= 0 && paramReadAt(fnIx, exprIx) { return pi }
+  if !identReadsGlobal(exprIx) {
+    const di = declaredStructIndex(exprIx)
+    if di >= 0 { return di }
+  }
+  const gi = globalReadStructIndex(fnIx, exprIx)
+  if gi >= 0 { return gi }
+  const ci = capturedStructIndex(fnIx, e.identName)
+  if ci >= 0 { return ci }
+  const fli = frameLetOf(fnIx, exprIx)
+  if fli < 0 { return -1 }
+  const k = letCellKind(fli, fnIx)
+  if k == "struct" || k == "nulstruct" { return letCellSlot(fli, fnIx, k) }
+  -1
+}
+
+// The row field `prop` is stored at in receiver `recvIx`'s struct row; -2 when that row stores
+// it as no struct, -1 when the receiver has no struct row.
+function recvFieldStructRow(recvIx: i32, prop: string, fnIx: i32): i32 {
+  const msi = structIndexOfExpr(recvIx, fnIx)
+  if msi < 0 { return -1 }
+  const mfi = sFieldIndex(msi, prop)
+  if mfi >= 0 && sFieldTypeAt(msi, mfi) == FC_STRUCT {
+    return sFieldTgtStructIdx(msi, mfi)
+  }
+  -2
+}
+
+// The row a field read is stored at: the receiver's struct field, a narrowed or variant
+// receiver's field, or the row every member of a struct union shares.
+function structIndexOfMemberStore(e: Member, exprIx: i32, fnIx: i32): i32 {
+  const sr = recvFieldStructRow(e.memObj, e.memProp, fnIx)
+  if sr != -1 { return sr }
+  const r1 = variantFieldStructRow(
+    memNarrowVariantIndex(exprIx, fnIx),
+    e.memProp,
+  )
+  if r1 >= 0 { return r1 }
+  const r2 = variantFieldStructRow(
+    nulVariantIdxOfExpr(e.memObj, fnIx),
+    e.memProp,
+  )
+  if r2 >= 0 { return r2 }
+  const pvi = exprVariantIndex(e.memObj, fnIx)
+  if pvi >= 0 { return variantFieldStructRow(pvi, e.memProp) }
+  sharedFieldTgtStructIdx(e.memObj, e.memProp, exprIx, fnIx)
+}
+
+// The struct row field `prop` of variant row `vi` is stored at, or -1.
+function variantFieldStructRow(vi: i32, prop: string): i32 {
+  if vi < 0 { return -1 }
+  const fi = variantFieldIndex(vi, prop)
+  if fi < 0 || variantFieldTypeAt(vi, fi) != FC_STRUCT { return -1 }
+  uFieldTgtStructIdx(vi, fi)
+}
+
+// The row an element read is stored at: a ref list's element row, or a struct-valued map
+// read's mv slot; -2 for a map of arm values.
+function structIndexOfIndexStore(e: Index, exprIx: i32, fnIx: i32): i32 {
+  if exprRefArray(e.idxArr, fnIx) {
+    const els = refListSlotOfExpr(e.idxArr, fnIx)
+    if els >= 0 {
+      const elr = rlElemStructRow(els)
+      if elr >= 0 { return elr }
     }
-    AsExpr => {
-      const asr = asNulStructRow(exprIx)
-      if asr >= 0 { return asr }
-      const atr = asTrapStructRow(exprIx)
-      if atr >= 0 { return atr }
-    }
-    IfStmt => {
-      // An if-EXPRESSION whose join is a struct (`const b = if c { mk(1) } else { mk(2) }`): the
-      // THEN arm's struct index classifies the whole `if` (the checker proved the arms agree), so an
-      // un-annotated binding resolves the same struct heap type the `emitIfExprRef` join emits.
-      // A join of records wider than its arms is its own row, whatever row an arm takes (D2731).
-      const jr = joinedRecordRowOf(exprIx, fnIx)
-      if jr >= 0 { return jr }
-      const tv = ifThenValueIx(exprIx)
-      if tv >= 0 { return structIndexOfExpr(tv, fnIx) }
-    }
-    BinExpr => {
-      // A `m[k] ?? default` over a STRUCT-valued map resolves to the value type's struct index (the
-      // mv slot's `mvValStructIdx`), so the field-read layout is found.
-      const cms = coalesceMvSlot(exprIx, fnIx)
-      if cms >= 0 {
-        // An ARM value has no `sNames` row; its layout is `exprVariantIndex`'s (D34).
-        if mvValVariantOf(cms) >= 0 { return -1 }
-        if mvValKind[cms] == MVK_STRUCT { return mvValStructIdxOf(cms) }
-      }
-      // A `<S|null> ?? <S>` coalesce resolves to the (inner) struct index — so `(r ?? d).field` finds
-      // the layout. The left's nullable struct drives it (its inner struct), else the right default.
-      if e.binOp == "??" {
-        if coalesceResultIsBox(exprIx, fnIx) { return -1 }
-        const ls = structIndexOfExpr(e.binLeft, fnIx)
-        if ls >= 0 { return ls }
-        return structIndexOfExpr(e.binRight, fnIx)
-      }
-    }
-    Call => {
-      return structIndexOfCallExpr(e, exprIx, fnIx)
-    }
-    Ident => {
-      return structIndexOfIdentExpr(e, exprIx, fnIx)
-    }
-    Index => {
-      // `xs[i]` over a struct-element ref list yields that list's element struct. The
-      // element struct table index comes from the receiver's per-element-type slot's name
-      // (`Tok[]` → `Tok` → its struct index), so distinct struct ref-lists resolve to
-      // distinct struct types — not always heap-type 0.
-      return structIndexOfIndexExpr(e, exprIx, fnIx)
-    }
-    OptMember => {
-      // The `?.` producer (D1084): `o?.f` over `o: T | null` with `T = {f: S}` banks `S | null`,
-      // so an `==` against another `S | null` resolves both operands through this function. Every
-      // other producer of `S | null` already answered; only `?.` fell to the -1 tail — a missing
-      // arm. The body is the `Member` arm's struct leg verbatim.
-      const osi = structIndexOfExpr(e.omObj, fnIx)
-      if osi >= 0 {
-        const ofi = sFieldIndex(osi, e.omProp)
-        if ofi >= 0 {
-          if sFieldTypeAt(osi, ofi) == FC_STRUCT {
-            return sFieldTgtStructIdx(osi, ofi)
-          }
-        }
-      }
-      return -1
-    }
-    Member => {
-      return structIndexOfMemberExpr(e, exprIx, fnIx)
-    }
-    // No other expression names a struct row.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+  }
+  const mrs = mapReadMvSlot(exprIx, fnIx)
+  if mrs >= 0 {
+    if mvValVariantOf(mrs) >= 0 { return -2 }
+    if mvValKind[mrs] == MVK_STRUCT { return mvValStructIdxOf(mrs) }
   }
   -1
 }
@@ -9142,45 +9214,25 @@ function fnDeclRetOwnRow(drn: i32): i32 {
   repRowOfTyStruct(nodeRepTyIxOf(drn), sScanLim())
 }
 
-// The struct row a call `e` returns: a named or closure callee's return row, a field or
-// indexed closure's, a list `pop`/`get`, then the checker's recorded type. -1 when the
-// result is not a struct.
-function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
+// The row a call's result is stored at: a named callee's return descriptor or declared
+// return row, a function value's signature, a field closure's return, or a list `pop`/`get`.
+// A callee returning a union arm with no row of its own answers by the rep (D8341).
+function structIndexOfCallStore(e: Call, exprIx: i32, fnIx: i32): i32 {
   if e.callFn < 0 { return -1 }
   const callee = nodeAt(e.callFn)
   if callee is Ident {
-    const ri = fnRetStructIndexSid(
-      sidOfNode(e.callFn),
-      callee.identName,
-      fnIx,
-      e.callFn,
-    )
+    const sid = sidOfNode(e.callFn)
+    const ri = fnRetStructIndexSid(sid, callee.identName, fnIx, e.callFn)
     if ri >= 0 { return ri }
-    const drn = fnDeclRetRecNodeAt(
-      sidOfNode(e.callFn),
-      callee.identName,
-      fnIx,
-      e.callFn,
+    const dr = fnDeclRetOwnRow(
+      fnDeclRetRecNodeAt(sid, callee.identName, fnIx, e.callFn),
     )
-    const dr = fnDeclRetOwnRow(drn)
-    // A function handing back a union arm, with no row of its declared return's own type, returns
-    // that arm's variant row, which `exprVariantIndex` names; a field-set scan names another (D8341).
     if (
       dr < 0
-      && fnRetVariantIndexSid(
-        sidOfNode(e.callFn),
-        callee.identName,
-        fnIx,
-        e.callFn,
-      )
-        >= 0
+      && fnRetVariantIndexSid(sid, callee.identName, fnIx, e.callFn) >= 0
     ) {
       return -1
     }
-    // A struct-returning function VALUE (a binding / `(i32) => S` param callee, invisible
-    // to `fnRetStructIndex`): the struct index from its resolved `>sN;` sig. Falls through to the
-    // per-node-type fallback below when the sig path misses (a value INFERRED from a factory call —
-    // `const g = mk()` — whose `>sN;` the syntactic path can't recover).
     const ck = readCloSigKey(e.callFn, fnIx)
     const crk = sigKeyRetKind(ck)
     if crk == "struct" || crk == "nulstruct" {
@@ -9189,209 +9241,18 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
     }
     if dr >= 0 { return dr }
   }
-  // A field-closure call (`(a."[]")(i)` — a chained index trap whose "[]"
-  // returns another trap object) yields the field function's return struct.
   if callee is Member && !callTyClosedIn(exprIx, fnIx) {
-    if (
-      drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp)
-    ) {
+    if drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp) {
       const cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if cfe >= 0 {
-        if fRetKind[cfe] == "struct" || fRetKind[cfe] == "nulstruct" {
-          return fRetStructIdx[cfe]
-        }
+      if (
+        cfe >= 0
+        && (fRetKind[cfe] == "struct" || fRetKind[cfe] == "nulstruct")
+      ) {
+        return fRetStructIdx[cfe]
       }
     }
   }
-  // `xs.pop()` / `xs.get(i)` over a struct-element ref list yield that list's
-  // element struct (as `S | null` — see `structListPopGetElem`).
-  const slv = structListPopGetElem(exprIx, fnIx)
-  if slv >= 0 { return slv }
-  // Fallback, scoped to a call: a struct-returning closure value call whose callee the
-  // cases above miss — an indexed closure-array element or a value inferred from a factory
-  // call. Resolves the struct from the checker's per-node type, gated on the cheap
-  // `nodeTyIsObj`. Off the hot path — struct receivers resolve syntactically above.
-  if nodeTyIsObj(exprIx) {
-    // The Index arm's ordering, exactly: exact spelling, then the arena row —
-    // `structIndexByName` runs ahead of the arena rung on purpose,
-    // since an inline shape interned under its render can differ from the arena's smallest
-    // row sharing the canon key; arena-first would silently flip a struct `==` into false.
-    if nodeTyCanonObjName(exprIx) != "" {
-      const sbn = structRowOfRecordTy(nodeTyIxOf(exprIx))
-      if sbn >= 0 {
-        // The render says struct; a declared record's own row says which one (D9784).
-        const sdr = recRowOfTy(nodeTyIxOf(exprIx))
-        if sdr >= 0 { return sdr }
-        return sbn
-      }
-    }
-    const cr = repRowOfTyStruct(nodeRepTyAt(exprIx, fnIx), sScanLim())
-    if cr >= 0 { return cr }
-    // A spellable record with no row answers -1, short-circuiting the nullable-struct rung below.
-    if anonTySpellable(nodeTyIxOf(exprIx)) { return -1 }
-  }
-  // The nullable-struct dual: a `S | null`-returning closure value call resolves to its
-  // inner struct's layout index, so the kind-9 binding's `!= null` narrow finds `P`. Arena
-  // first, peeling `TyNullable`. Wider than the name rung it fronts: `tyToEmitName` returns
-  // "" on a cycle while `repCanonId` does not, so a recursive inner answers a row here where the name rung declines.
-  const nnTy = nodeRepTyAt(exprIx, fnIx)
-  if nnTy >= 0 {
-    const nnT = tyAt(nnTy)
-    if nnT is TyNullable {
-      const nr = repRowOfTyStruct(nnT.nInner, sScanLim())
-      if nr >= 0 { return nr }
-    }
-  }
-  if nodeNulStructInnerName(exprIx) != "" {
-    return structRowOfRecordTy(nonNullTy(nodeTyIxOf(exprIx)))
-  }
-  return -1
-}
-
-// The struct row a name read `e` holds: a param, a declared or global binding, a capture,
-// or the frame's own `let`. -1 when the binding is not a struct, or is a variant.
-function structIndexOfIdentExpr(e: Ident, exprIx: i32, fnIx: i32): i32 {
-  const pi = paramStructIndex(fnIx, exprIx)
-  if pi >= 0 && paramReadAt(fnIx, exprIx) { return pi }
-  if !identReadsGlobal(exprIx) {
-    const di = declaredStructIndex(exprIx)
-    if di >= 0 { return di }
-  }
-  const gi = globalReadStructIndex(fnIx, exprIx)
-  if gi >= 0 { return gi }
-  const ci = capturedStructIndex(fnIx, e.identName)
-  if ci >= 0 { return ci }
-  // The frame's own `let`, arm for arm with `exprNullableStruct`'s leg: a kind without its
-  // row is `ref valtype with no interned shape`, so the two land together (D21). Gated on
-  // the variant the way every other index resolver here is: an arm's values live at
-  // `variantHeap`, so answering a struct row for one reaches a receiver that is not one.
-  const fli = frameLetOf(fnIx, exprIx)
-  if fli >= 0 && !letIsVariant(fli, fnIx) { return structIndexOfLet(fli, fnIx) }
-  // The module frame's own `let`, which the leg above cannot reach: a module-scope BLOCK
-  // binding is no frame's `fnBody` and no global. Annotated only — an initializer resolves
-  // against the frame it is written in, so reading one from outside can name a row other
-  // than the local's, while an annotation reads the same anywhere (D1636).
-  const mli = moduleLocalLetOfRead(emitRootIx, exprIx)
-  if mli >= 0 && globalHasTypeAnn(mli) && !letIsVariant(mli, -1) {
-    return structIndexOfLet(mli, -1)
-  }
-  -1
-}
-
-// The struct row an index read `e` yields: a struct-element ref list's element row, or a
-// struct-valued map's value row. -1 otherwise.
-function structIndexOfIndexExpr(e: Index, exprIx: i32, fnIx: i32): i32 {
-  if exprRefArray(e.idxArr, fnIx) {
-    let nm = refListElemNameOfExpr(e.idxArr, fnIx)
-    // A nullable-struct element (`(P | null)[]`, slot key "P | null") resolves to the bare
-    // struct `P` — strip the `| null` so a narrowed `xs[i].field` finds P's layout. The
-    // structural bridge (`structIndexOfTypeName`) then also resolves an inline-shape
-    // element (`{v:i32}[]` param) to its declared twin's layout.
-    nm = nonNulBaseOf(nm)
-    // Nominal exact-name match first — AFTER-not-FIRST relative to the arena rung (#1061).
-    const sbn = structIndexByName(nm)
-    if sbn >= 0 { return sbn }
-    // Node route: resolve the receiver's checked type, `| null` peeled like the name above,
-    // through the canonical-key vocabulary (`repRowOfTyStruct`), the read-side dual of
-    // `structIdxOfElemNameTy`. Tells a same-fieldset nested twin apart by its full field types
-    // (D4721); falls to the lenient fieldset scan when uncovered.
-    const rr = repRowOfTyStruct(
-      tyPeelNul(nodeRepTyAt(exprIx, fnIx)),
-      sScanLim(),
-    )
-    if rr >= 0 { return rr }
-    // The arena already said "not an object", so the field-set matcher is not asked:
-    // `structIndexOfTypeName` parses a field set that a non-`TyObj` recorded type does not
-    // have, so skipping it is answer-preserving. The guard is on "the arena recorded a
-    // non-object", not on "the arena declined" — `repRowOfTyStruct` also returns -1 for other reasons, where the name path still answers.
-    let sieObj = false
-    let sieKnown = false
-    const sieTy = nodeRepTyAt(exprIx, fnIx)
-    if sieTy >= 0 {
-      sieKnown = true
-      const sieT = tyAt(sieTy)
-      if sieT is TyObj { sieObj = true }
-    }
-    // The list's own element row, which its elements are stored at whatever the read's type.
-    const els = refListSlotOfExpr(e.idxArr, fnIx)
-    if els >= 0 {
-      const elr = rlElemStructRow(els)
-      if elr >= 0 { return elr }
-    }
-    if !sieKnown || sieObj {
-      const si = structRowOfNameOrTy(nm, sieTy)
-      if si >= 0 { return si }
-    }
-  }
-  // A BARE `m[k]` over a STRUCT-valued map resolves to the value type's struct index, so a
-  // narrowed `(m[k]).field` finds the layout — the Index dual of the `?? default` BinExpr case.
-  const mrs = mapReadMvSlot(exprIx, fnIx)
-  if mrs >= 0 {
-    // An ARM value has no `sNames` row; its layout is `exprVariantIndex`'s (D34).
-    if mvValVariantOf(mrs) >= 0 { return -1 }
-    if mvValKind[mrs] == MVK_STRUCT { return mvValStructIdxOf(mrs) }
-  }
-  -1
-}
-
-// The struct row a field read `e` yields: the receiver's struct field, a narrowed or
-// variant receiver's field, or the row every member of a struct union shares. -1 when the
-// field is not a nested struct.
-function structIndexOfMemberExpr(e: Member, exprIx: i32, fnIx: i32): i32 {
-  const msi = structIndexOfExpr(e.memObj, fnIx)
-  if msi >= 0 {
-    const mfi = sFieldIndex(msi, e.memProp)
-    if mfi >= 0 {
-      if sFieldTypeAt(msi, mfi) == FC_STRUCT {
-        return sFieldTgtStructIdx(msi, mfi)
-      }
-    }
-    return -1
-  }
-  // A narrowed union member and a variant-typed receiver resolve through the variant
-  // field tables — the code-15 twin of `mapShapeOfExpr`'s Member dispatch. Checked after
-  // the struct probe, and only on its receiver miss.
-  const nvi = memNarrowVariantIndex(exprIx, fnIx)
-  if nvi >= 0 {
-    const nvfi = variantFieldIndex(nvi, e.memProp)
-    if nvfi >= 0 {
-      if variantFieldTypeAt(nvi, nvfi) == FC_STRUCT {
-        return uFieldTgtStructIdx(nvi, nvfi)
-      }
-    }
-  }
-  // D1114 — the niche twin of the `pvi` rung below: an arm has no `sNames` row, so the
-  // struct probe above misses, and `variantStructHeapTwinAt` declines code 15 by design. A
-  // nested read needs the field's target row, which `uFieldTgtStructIdx` holds. Kind-gated
-  // exactly as `nulVariantIdxOfExpr`'s header requires.
-  const nvi2 = nulVariantIdxOfExpr(e.memObj, fnIx)
-  if nvi2 >= 0 {
-    const nvfi2 = variantFieldIndex(nvi2, e.memProp)
-    if nvfi2 >= 0 {
-      if variantFieldTypeAt(nvi2, nvfi2) == FC_STRUCT {
-        return uFieldTgtStructIdx(nvi2, nvfi2)
-      }
-    }
-  }
-  const pvi = exprVariantIndex(e.memObj, fnIx)
-  if pvi >= 0 {
-    const pvfi = variantFieldIndex(pvi, e.memProp)
-    if pvfi >= 0 {
-      if variantFieldTypeAt(pvi, pvfi) == FC_STRUCT {
-        // Not migrated: the arena twin of this lookup is `uFieldTgtStructIdx`, used at every
-        // other code-15 variant-field site. This arm does run, but only on names the nominal
-        // table already holds, so the widening it would take is unexercised rather than safe;
-        // the flip count licenses it, not byte identity (rep-descriptor-campaign.md §11.8).
-        return structIndexByName(variantFieldElemName(pvi, pvfi))
-      }
-    }
-  }
-  // A shared read over an un-narrowed struct union: the one row every member's field
-  // targets, the layout the dispatch's result is typed at (D3562).
-  if pvi < 0 {
-    return sharedFieldTgtStructIdx(e.memObj, e.memProp, exprIx, fnIx)
-  }
-  -1
+  structListPopGetElem(exprIx, fnIx)
 }
 
 // The struct row the shared field read `readIx` over a struct union yields, or -1 unless every
