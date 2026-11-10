@@ -4,7 +4,7 @@ This is the input for deciding how step 7's classifier half finishes. It covers 
 `classifier-census.vl` probes after round 26 (`2026-11-09-step7-classifier-r26.md`). All 42 are
 post-only.
 
-**After round 27** (`2026-11-10-step7-classifier-r27.md`) 32 are probed. Group 1's eight are
+**After round 27** (`2026-11-10-step7-classifier-r27.md`) 32 are probed, and 31 after #7031 deleted `moduleCopySigKey`. Round 28 (`2026-11-10-step7-classifier-r28.md`) graded `arrLitIsRefTpl` and `arrLitNumKind` at their consumers and switched neither. Group 1's eight are
 `NOT_BLIND` (the census's `STORAGE_READERS`, each with its reason), and group 10's
 `arrLitObjElemBoxVariant` and `arrLitInstElemRow` read the literal's recorded types. The tables
 below keep the eight ruled-out rows for their reasons and mark each change.
@@ -166,8 +166,8 @@ build row, 14,881 / 0). The four left:
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `arrLitIsRefTpl` | 93,162 (9,205) | 3: `arrLitIsRef` 88,891, itself 3,793, `arrLitFrameRefTy` 478 | `tyIsRefArray(nodeTyIxOf)`, 82,027 / 11,201 (r27) | 4,628 lead with a tagged set's leaf, whose list is the i32 id list (group 3's fact). 6,573 more (maps, records, unions, non-leaf functions) may be the frame half's (`arrLitFrameRefTy`), not graded at `arrLitIsRef`. |
-| `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | the width of `litRepTyAt`'s element, 72,517 / 6,118 (r27) | Not ablated: the rep is `i64[]` or `f64[]` where the element scan reads none (5,713), and a box or niche where it reads a width (399). |
+| `arrLitIsRefTpl` | 93,162 (9,205) | 3: `arrLitIsRef` 88,891, itself 3,793, `arrLitFrameRefTy` 478 | at `arrLitIsRef`'s answer, `tyIsRefArray(nodeTyIxOf)` with a tagged set's function element a list of ids, 88,771 / 188 (r28) | A list at a hole or generic pin, whose stored row the template type does not name (groups 2 and 3). Switched in, it traps 2 programs and refuses 3 more (r28). |
+| `arrLitNumKind` | 78,567 (9,196) | 5: `emitArrUnder` 39,824, `collectArrLitScalar` 25,043, `arrLitUnionElemName` 6,760 | the width of `litRepTyAt`'s element, 72,518 / 6,118; switched in, byte-identical in 1,197 of 1,221 files, the same output in the other 23 (r28) | No fact is missing. It needs a ruling: in 23 files the rep's box (a nullable or union element) or its `f64[]` (a nested inner literal) replaces a scalar build. |
 | `refListElemNameOfExprRaw` | 7,595 (454) | 1: `refListElemNameOfExpr` (asked only when `listRowOfExpr` has no row) | `rlRowNameOfTy` of `nodeTyAt`'s element, 3,698 / 3,897, 437 of them one row spelled twice (r27) | The function-value list rows (group 3) and nested niche lists. |
 | `arrLitElemNameTpl` | 7,049 (4,037) | 1: `arrLitElemName` | `rlRowNameOfTy` of `nodeTyIxOf`'s element, 5,365 / 1,682, 398 of them one row spelled twice (r27) | The same. |
 
