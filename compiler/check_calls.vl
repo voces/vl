@@ -497,6 +497,7 @@ import {
   tyIsParamHole,
   tyIxIsView,
   tyMentionsTyVarNamed,
+  tyHasInferHole,
   tyPrintsAsRef,
   tyRefusesArrayDemand,
   tyRefusesArrayWrite,
@@ -2951,6 +2952,7 @@ function judgeFnArgHoleCalls(
       continue
     }
     const an = nodeAt(a)
+    holeFieldCloNote(a, calleeFn, dhNames[j])
     if (an is Ident && holeFnArgDecls(a).length > 1) || holeFnReadsSlot(a) {
       // A re-pointed `let` or a list element or field handed to a hole the body calls is judged
       // at each call's argument types under this call's bindings (D9009, D9090).
@@ -3386,8 +3388,8 @@ function holeFieldRecOf(a: i32): i32 {
 
 // A field of the records argument `a` hands hole `vNames[k]`, holding a function with
 // un-annotated parameters, is judged at the instance the callee's calls through that field ask,
-// as the function handed directly is; when each such field asks one, the records are built at
-// those instances, so every source of them has the type those calls read (D13969).
+// as the function handed directly is (D13969). When each such field asks one, the records are
+// queued to be built at those instances (`holeFieldBuildsFlush`).
 function judgeHoleFieldCalls(
   a: i32,
   vNames: string[],
@@ -3459,7 +3461,108 @@ function judgeHoleFieldCalls(
     }
   }
   if !agree || nSet == 0 || T.diags.length > d0 { return 0 }
-  holeRecAdopt(s, mkObjTy(ro.objFieldNames, fTys), a, recAdSetGroup())
+  const keys: string[] = []
+  let fi = 0
+  while fi < set.length {
+    if set[fi] { keys.push(holeFieldKey(calleeFn, vNames[k], ro.objFieldNames[fi])) }
+    fi = fi + 1
+  }
+  hfbSrcs.push(s)
+  hfbTys.push(mkObjTy(ro.objFieldNames, fTys))
+  hfbAts.push(a)
+  hfbKeys.push(keys)
+}
+
+// `holeFieldCloNote`'s second half: each field a record literal `a` is, or a list literal `a`
+// holds, writes as a read of an un-annotated parameter.
+function holeFieldSetNote(a: i32, callee: i32, hole: string) {
+  const v = cwPeel(a)
+  if v < 0 || v >= P.nodes.length { return 0 }
+  const vn = nodeAt(v)
+  if vn is ArrayLit {
+    for el in vn.arrElems { holeFieldSetNote(el, callee, hole) }
+    return 0
+  }
+  if !(vn is ObjLit) { return 0 }
+  for f in vn.objFields {
+    const fi = nodeAt(f)
+    if fi is FieldInit {
+      const x = cwPeel(fi.fiValue)
+      const d = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+      const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+      if dn is Param && dn.parType < 0 {
+        hfbSet[holeFieldKey(callee, hole, fi.fiName)] = true
+      }
+    }
+  }
+  0
+}
+
+// The record builds `judgeHoleFieldCalls` queued this pass: each one's sources, record, argument
+// and the callee's parameter fields it closes. And the parameter fields some call hands a
+// closure at a closed function type, or a hole parameter of the function making the call.
+let hfbSrcs: HoleRecSrcs[] = []
+let hfbTys: i32[] = []
+let hfbAts: i32[] = []
+let hfbKeys: string[][] = []
+let hfbClo: {[string]: boolean} = Map()
+let hfbSet: {[string]: boolean} = Map()
+
+function holeFieldKey(callee: i32, hole: string, field: string): string {
+  i32ToStr(callee) + "|" + hole + "|" + field
+}
+
+// Notes each field of the records argument `a` hands hole `hole` of `callee` that holds a
+// function at a closed type, or that a record literal of it writes as an un-annotated parameter
+// of the function making the call.
+function holeFieldCloNote(a: i32, callee: i32, hole: string) {
+  holeFieldSetNote(a, callee, hole)
+  let t = nonNullTy(nodeTyOf(a))
+  if t < 0 || t >= T.tys.length { return 0 }
+  const tl = tyAt(t)
+  if tl is TyArray { t = nonNullTy(tl.aElem) }
+  if t < 0 || t >= T.tys.length { return 0 }
+  const ro = tyAt(t)
+  if !(ro is TyObj) { return 0 }
+  let i = 0
+  while i < ro.objFieldNames.length && i < ro.objFieldTypes.length {
+    const ft = ro.objFieldTypes[i]
+    if (
+      ft >= 0
+      && ft < T.tys.length
+      && tyAt(ft) is TyFunc
+      && !tyHasTyVar(ft)
+      && !tyHasInferHole(ft, 0)
+    ) {
+      hfbClo[holeFieldKey(callee, hole, ro.objFieldNames[i])] = true
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Builds each queued record at its instances, except where some call hands its parameter's
+// field a hole parameter of its own caller and none hands it a closure: there the record keeps
+// the named function's set, as a list does, so the tag decision decides it with the hole's.
+export function holeFieldBuildsFlush() {
+  let i = 0
+  while i < hfbTys.length {
+    let clo = false
+    let set = false
+    for key in hfbKeys[i] {
+      if hfbClo.has(key) { clo = true }
+      if hfbSet.has(key) { set = true }
+    }
+    if clo || !set { holeRecAdopt(hfbSrcs[i], hfbTys[i], hfbAts[i], recAdSetGroup()) }
+    i = i + 1
+  }
+  hfbSrcs = []
+  hfbTys = []
+  hfbAts = []
+  hfbKeys = []
+  hfbClo = Map()
+  hfbSet = Map()
+  0
 }
 
 // Refuses, at argument `a`, generic function `fnName` handed through callee `via`, which reads
