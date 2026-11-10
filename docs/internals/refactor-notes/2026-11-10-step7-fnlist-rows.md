@@ -2,8 +2,7 @@
 
 Group 3 of `2026-11-09-step7-classifiers-remaining.md` is function-value list rows. This PR takes
 `refListSlotOfExpr`, `refListKeptSlotOfExpr` and `letTailRowSlot` off the probe set, on master
-`775f38bf`. Probed classifiers go from 19 to 17: those three leave, and one residual
-(`refListSlotOfUntyped`, 221 calls) is probed in their place.
+`775f38bf`. Probed classifiers go from 19 to 17 there, and from 17 to 15 once merged over #7069. Those three leave, and one residual (`refListSlotOfUntyped`, 225 calls in 40 files) is probed in their place.
 
 **The literal's own row.** `listRowOfExpr` now answers a ref-list literal whose type keys no row.
 That is a function-value list at a hole or a set (`[inc0, dbl]`), which `exprRepTy` gives no row.
@@ -55,6 +54,6 @@ were the seed, which is not master's fixpoint, so a baseline is master's source 
 candidate's own seed.
 
 **Proof.** The fixpoint seed is byte-identical over two `refresh-compiler.sh` runs: 6,601,963
-bytes. Seed size is +0.2%. Late demands are 6, the baseline. rep-fuzz is exact, and lint-self is
+bytes, and 6,600,575 merged over #7069, where the 932 reached files are again byte-identical. Seed size is +0.2%. Late demands are 6, the baseline. rep-fuzz is exact, and lint-self is
 clean. The `cases_wasm` shards pass 7,402 with 0 failing. `check-filed-witnesses --strict` grades
 all 4,686 rows as filed. `vl_scaling_shape_test.ts` passes.
