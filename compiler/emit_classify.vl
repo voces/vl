@@ -173,7 +173,9 @@ import { listDisjointDepth, nameIsNewtypeBrand } from "./check_type_shape"
 import { recFreshDeclOf } from "./check_rec_fresh"
 import {
   T,
+  TY_NEVER,
   TY_STR,
+  TY_VOID,
   TyArray,
   TyErr,
   TyFunc,
@@ -329,6 +331,7 @@ import {
   elabHolderMemberTy,
   elabHolderRecordAt,
   elabHoldsRecordAnywhere,
+  elabHoleFnClosed,
   elabKeyAtPos,
   elabNarrowedFromAt,
   elabNodeTyAt,
@@ -336,6 +339,7 @@ import {
   elabPlainReturnsRecord,
   elabSlotFieldRecord,
   elabThroughMemberAt,
+  elabUnboundTpTy,
   isStorageRead,
   litRepTyAt,
   litRepUnionAt,
@@ -573,6 +577,7 @@ import {
 import {
   repSigRetTokOfTy,
   repSigSlotTyOf,
+  repSigTokOfTy,
   repSlotOfKind,
 } from "./emit_rep_slot"
 import { nameFieldCodeTy } from "./emit_shape_intern"
@@ -913,37 +918,72 @@ import {
   tyStepRet,
 } from "./tyquery"
 
-// The interning key for lifted function `fe`'s env-leading `$fnsig`, or "" when the
-// signature is not function-value-eligible. It encodes the param kinds (`cloParamTok`) and
-// the return kind, so two functions share one `$fnsig` exactly when their env-leading
-// functypes render the same bytes. `cloSigKeyExt` extends the result spine.
+// The interning key for lifted function `fe`'s env-leading `$fnsig`, or "" when the signature
+// is not function-value-eligible: each parameter type's token, then an `i32` or `f64` result's, so
+// two functions share one `$fnsig` exactly when their functypes match. `cloSigKeyExt` extends it.
 export function fnSigKeyOf(fe: i32) {
-  if clsCensusOn { clsCensusEnter("fnSigKeyOf") }
   if fe < 0 || fe >= fnStmts.length { return "" }
-  const fn = nodeAt(fnStmts[fe])
-  if fn is FuncDecl {
-    let key = ""
-    const params = fn.fnParams
-    let pi = 0
-    while pi < params.length {
-      const tok = cloParamTok(params[pi])
-      if tok == "" { return "" }
-      key = key + tok
-      pi = pi + 1
+  const fx = fnStmts[fe]
+  const fn = nodeAt(fx)
+  if !(fn is FuncDecl) { return "" }
+  let key = ""
+  for p in fn.fnParams {
+    const tn = parTyNode(p)
+    const tok = fnSigTokOfTy(
+      nodeTyIxOf(if tn >= 0 { tn } else { fnParamSrc(p) }),
+      fx,
+    )
+    if tok == "" { return "" }
+    key = key + tok
+  }
+  if fe < fRetVoid.length && fRetVoid[fe] == 1 { return "" }
+  const rt = cloRetResultTy(fe)
+  if rt == TY_VOID || rt == TY_NEVER { return "" }
+  const rk = fnSigKindOfTy(rt, fx)
+  match rk {
+    "i32" | "f64" => {
+      return key + ">" + repSigTokOfKind(rk)
     }
-    // The `$fnsig` bytes stream from the key's representative via `cloRetValKind`, so the
-    // value-ABI key is minted from that same kind.
-    const vk = cloRetValKind(fe)
-    match vk {
-      "i32" | "f64" => {
-        return key + ">" + repSigTokOfKind(vk)
-      }
-      // Every other result kind is out of the value ABI, and void has no result.
-      "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {}
-    }
-    return ""
+    // Every other result kind is out of the value ABI, and an unlowered result has no kind.
+    "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {}
   }
   ""
+}
+
+// The `$fnsig` token of a parameter of type `t` in the lifted function `fx`, "" for none.
+function fnSigTokOfTy(t: i32, fx: i32): string {
+  if fnTagTyIsTagged(t) { return repSigTokOfKind("i32") }
+  const c = fnSigClosedTy(t, fx)
+  if c < 0 || fnTagTyIsTagged(c) {
+    return if c < 0 { "" } else { repSigTokOfKind("i32") }
+  }
+  repSigTokOfTy(c)
+}
+
+// The rep kind a value of type `t` takes in the lifted function `fx`: a tagged set rides its id.
+function fnSigKindOfTy(t: i32, fx: i32): VKind | null {
+  if fnTagTyIsTagged(t) { return "i32" }
+  const c = fnSigClosedTy(t, fx)
+  if c < 0 { return null }
+  const d = repOfTy(c)
+  if d.rdCovered == 0 { return null }
+  d.rdKind
+}
+
+// `t` at the instance `fx` is lowered at: its pins, else an unbound variable at the type it takes
+// unbound and an open function at its uncalled default, as `frsColsOfTy` lowers them; -1 for none.
+function fnSigClosedTy(t: i32, fx: i32): i32 {
+  const c = instanceTyOf(t, fx)
+  if c >= 0 || t < 0 || t >= T.tys.length { return c }
+  const v = tyAt(t)
+  if v is TyVar { return elabUnboundTpTy(-1, fx, v.tvName) }
+  elabHoleFnClosed(t)
+}
+
+// The template parameter a lifted instance's un-annotated parameter `p` copies, or `p`.
+function fnParamSrc(p: i32): i32 {
+  if nodeTyIxOf(p) >= 0 { return p }
+  nodeSrc.get(p) ?? p
 }
 
 // The lifted-function position (`fnStmts` index) of an object-literal field value that is

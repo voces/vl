@@ -108,7 +108,7 @@ argument (step 3). That is checker work on the copy's binding, not a rep record.
 
 | classifier | calls (files) | callers | best twin | missing fact |
 | --- | --- | --- | --- | --- |
-| `fnSigKeyOf` | 235,301 (7,052) | 3: `cloSigKeyExt` 177,737, `collectLiftedCloSig` 55,487, `collectCloSigs` 2,077 | parameter tokens and the result type's rep, 2 / 17 (r19, pre-mono, at templates) | The instance binding of a template's type parameter. No post-mono twin has been tried, so its post-mono agreement is unknown. |
+| ~~`fnSigKeyOf`~~ | switched 2026-11-10 | | each parameter type's token at the instance, an unbound variable at `elabUnboundTpTy`, a tagged set as its id; 7,001 of 7,064 reached files byte-identical, 61 the same refusal, 2 the same output ([notes](2026-11-10-step7-fnsigkeyof-typed.md)) | — |
 | `moduleCopySigKey` | 7 (4) | 1: `calleeCloSigKeyOfRead` | the copied binding's type key, then the read's, 3 / 4 (r25) | D9130: the copy's instance key. |
 
 ## 6. A read's rep in the reader's own table (6)
