@@ -72,7 +72,12 @@ import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
 import { collectRetValues, unionAliasMembers } from "./check_nj_join"
 import { declAnnRawTyName, declAnnTyOf } from "./check_gen_alias_anns"
 import { fieldNameOrder } from "./check_obj_shape"
-import { inferJoinCount, inferJoinTyAt } from "./check_inline_lit_union"
+import {
+  inferIfJoinCount,
+  inferIfJoinTyAt,
+  inferJoinCount,
+  inferJoinTyAt,
+} from "./check_inline_lit_union"
 import { isTransparentAlias } from "./check_alias_transparent"
 import { letNullHoleFilledTy } from "./check_null_holes"
 import {
@@ -583,8 +588,11 @@ import {
   sScanLim,
   sioMemoReset,
   structFieldNameIxReset,
+  structIndexOfTy,
   structNameIxReset,
+  structTyIxAlias,
   structTyIxReset,
+  structTyMarkAliasable,
 } from "./emit_atom_kinds"
 import { nodeTyAt } from "./emit_capture_frames"
 import {
@@ -661,7 +669,7 @@ import {
   leqCoreKindOfAtomKind,
   nulFieldInnerCode,
 } from "./emit_eq_rows"
-import { nameIsWholeSpanShape } from "./emit_field_codes"
+import { fieldCodeOfTy, nameIsWholeSpanShape } from "./emit_field_codes"
 import { fieldStoreTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import { cloSigPosOfKey } from "./emit_fn_ret_kinds"
 import {
@@ -2207,7 +2215,7 @@ export function recordedVoidFns() {
 
 let arrLitMintDone: boolean[] = []
 // Mints the rows node `i` needs once, on its first read: a list literal's, an `is` test's empty
-// arm list, a call's or an if-expression's join atoms and an intrinsic call's constructed
+// arm list, a call's join atoms and an intrinsic call's constructed
 // collection. Returns -1 for a node out of range.
 function nodeMintOnRead(i: i32): i32 {
   if i < 0 || i >= P.nodes.length { return -1 }
@@ -2217,19 +2225,10 @@ function nodeMintOnRead(i: i32): i32 {
   const nd = nodeAt(i)
   // Frameless: a literal an instance shares reads its template's types.
   const was = nodeTyInstEnter(-1)
-  if nd is ArrayLit {
-    collectAArrayLit(i, nd)
-  } else if nd is IsExpr {
-    collectAIsExpr(i, nd)
-  } else if nd is Call {
-    collectACallMint(i, nd)
-  } else if nd is TypeRef {
-    collectATypeRef(i, nd)
-  } else if nd is IfStmt {
-    // An if-EXPRESSION whose arms join to a value union the program declares nowhere; the
-    // `TyUnion` test is what keeps a `T | null` join out, whose rep is the niche (D1745).
-    markInferredJoinAtoms(nodeTyIxOf(i))
-  }
+  if nd is ArrayLit { collectAArrayLit(i, nd) }
+  else if nd is IsExpr { collectAIsExpr(i, nd) }
+  else if nd is Call { collectACallMint(i, nd) }
+  else if nd is TypeRef { collectATypeRef(i, nd) }
   nodeTyInstEnter(was)
   0
 }
@@ -2258,8 +2257,20 @@ export function arrLitMintTrees(roots: i32[], intoFns: boolean) {
   0
 }
 
+// Marks the value boxes of each if-expression join the checker recorded, a value union the
+// program declares nowhere (D1745). The box types are dealt with the type indices, ahead of every
+// reader of a join.
+export function markInferredIfJoins() {
+  let i = 0
+  while i < inferIfJoinCount() {
+    markInferredJoinAtoms(inferIfJoinTyAt(i))
+    i = i + 1
+  }
+  0
+}
+
 // Mints the rows the signature passes read first and no reader may take after the type indices:
-// the rows of an `is K[]` test's record `K` that has no row yet, the join atoms of an if-expression or a tagged-set call, and an
+// the rows of an `is K[]` test's record `K` that has no row yet, a tagged-set call's join atoms, and an
 // intrinsic call's map value slot. Walks the top-level statements `tops` and each function in
 // `fns`, not descending into a nested declaration.
 export function preIndexMintTrees(tops: i32[], fns: i32[]) {
@@ -2275,7 +2286,7 @@ export function preIndexMintTrees(tops: i32[], fns: i32[]) {
 function preIndexMintAt(at: i32, todo: i32[], root: boolean) {
   if at < 0 || at >= P.nodes.length { return 0 }
   const nd = nodeAt(at)
-  if nd is IsExpr || nd is Call || nd is IfStmt { nodeMintOnRead(at) }
+  if nd is IsExpr || nd is Call { nodeMintOnRead(at) }
   // A signature's annotations are read by the type section, after the indices are dealt.
   if nd is FuncDecl {
     if nd.fnRet >= 0 { nodeMintOnRead(nd.fnRet) }
@@ -6124,12 +6135,22 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
       internShapeDeepOfTy(lr)
       return 0
     }
+    // Another literal's row already denoting the instance's record type is this one's too.
+    const known = if lr >= 0 && lr < T.tys.length && tyAt(lr) is TyObj { structIndexOfTy(lr) } else { -1 }
+    if !sLitIdRow.has(objIx) && known >= 0 { sLitIdRow.set(objIx, known) }
     if !sLitIdRow.has(objIx) {
       const pr = sLitMintRow.get(objIx) ?? -1
       const pf = sLitMintFn.get(objIx) ?? -1
       const before = sNames.length
       anonMintRowFor(objIx, fnIx)
-      if sNames.length > before { sLitIdRow.set(objIx, sNames.length - 1) }
+      if sNames.length > before {
+        sLitIdRow.set(objIx, sNames.length - 1)
+        // The instance's record type denotes that row, which a binding of its call reads.
+        if lr >= 0 && lr < T.tys.length && tyAt(lr) is TyObj {
+          structTyMarkAliasable(lr)
+          structTyIxAlias(lr, sNames.length - 1)
+        }
+      }
       // Instances holding no id keep the literal's own mint (-1 for none).
       sLitMintRow.set(objIx, pr)
       sLitMintFn.set(objIx, pf)
@@ -6400,6 +6421,14 @@ function anonEmptyListElemIsObj(ty: i32): boolean {
 }
 
 // Mint one anonymous struct row for the object literal at `objIx`. The body of
+// The field code of value `v` at instance `fnIx`'s primitive type for it, or -1.
+function anonInstPrimCode(v: i32, fnIx: i32): i32 {
+  const t = elabNodeTyAt(v, fnIx)
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyPrim) { return -1 }
+  const c = fieldCodeOfTy(t)
+  if c < 0 { -1 } else { c }
+}
+
 // `collectAnonShapes`' main loop, extracted so the pre-mint pass mints a row the same
 // way rather than through a second copy of it — two mints that disagree would put two
 // different layouts under one `#anonN` key.
@@ -6426,6 +6455,8 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         ) {
           code = FC_I32
         }
+        // So does one at the template's type parameter, at the instance's primitive (D15554).
+        if code < 0 && fnIx >= 0 { code = anonInstPrimCode(f.fiValue, fnIx) }
         if code == FC_MAP && !anonMapFieldDestAdmits(ai, f.fiName) { code = -1 }
         if code < 0 { ok = false }
         codes.push(code)
