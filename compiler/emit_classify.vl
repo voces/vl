@@ -146,7 +146,6 @@ import {
   fnTagRetIsTagged,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
-import { mapStoredTyOf } from "./check_fn_tag_facts"
 import { canonUnionMembersInto } from "./check_program"
 import {
   inferRetFnKey,
@@ -204,6 +203,7 @@ import {
   tyEq,
   tyFieldTyOf,
   tyHasInferHole,
+  tyIsDeclaredParam,
   tyIsFuncArena,
   tyIsLitUnion,
   tyIsLitUnionAlias,
@@ -591,7 +591,6 @@ import {
   arrElemIsClosureTy,
   arrLitArenaElemRow,
   arrLitBoxElem,
-  arrLitClosureRowTy,
   arrLitElemRender,
   arrLitLeadInner,
   arrLitLeadIsList,
@@ -11129,9 +11128,66 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
 // rep type (`exprRepTy`), as `listBuildOfTy` builds that type; -1 where it is no ref list.
 export function listRowOfExpr(exprIx: i32, fnIx: i32): i32 {
   const t = exprRepTy(exprIx, fnIx, 8)
-  if t < 0 { return -1 }
+  if t < 0 { return arrLitOwnRow(exprIx, fnIx) }
   if recListRowTy(t) < 0 { return callRetListRow(exprIx, fnIx) }
-  listRowOfRepTy(t)
+  const r = listRowOfRepTy(t)
+  if r >= 0 { return r }
+  arrLitOwnRow(exprIx, fnIx)
+}
+
+// The row a ref-list literal whose type keys none is built at: the row the intern pass minted
+// its elements at, else its elements' own row (`arrLitRowSlotIn`). A minted row is not read for
+// a literal typed over a declared type parameter, whose instance builds another; -1 else.
+function arrLitOwnRow(exprIx: i32, fnIx: i32): i32 {
+  const li = unwrapParen(exprIx)
+  const a = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { null }
+  if !(a is ArrayLit) || a.arrElems.length == 0 || arrLitHasSpread(li) {
+    return -1
+  }
+  const lt = nodeTyInOf(li, fnIx)
+  if !tyIsRefArray(lt) { return -1 }
+  const mint = arrLitRlSlotAt(li)
+  if mint >= 0 && mint < rlElemName.length && !tyNamesDeclaredParam(lt, 12) {
+    return mint
+  }
+  const own = arrLitRowSlotIn(li, fnIx)
+  if own >= 0 && own < rlElemName.length { own } else { -1 }
+}
+
+// Whether type `t` names a declared type parameter within `depth` steps. An inference hole is a
+// `TyVar` too, so `tyHasTyVar` cannot tell the two apart.
+function tyNamesDeclaredParam(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth <= 0 { return false }
+  if tyIsDeclaredParam(t) { return true }
+  const a = tyAt(t)
+  match a {
+    TyArray => tyNamesDeclaredParam(a.aElem, depth - 1)
+    TyNullable => tyNamesDeclaredParam(a.nInner, depth - 1)
+    TyNeg => tyNamesDeclaredParam(a.negTy, depth - 1)
+    TyMap => {
+      tyNamesDeclaredParam(a.mKey, depth - 1)
+        || tyNamesDeclaredParam(a.mVal, depth - 1)
+    }
+    TyObj => {
+      for f in a.objFieldTypes {
+        if tyNamesDeclaredParam(f, depth - 1) { return true }
+      }
+      false
+    }
+    TyFunc => {
+      for p in a.fnParamTypes {
+        if tyNamesDeclaredParam(p, depth - 1) { return true }
+      }
+      tyNamesDeclaredParam(a.fnRet, depth - 1)
+    }
+    TyUnion => {
+      for m in a.uMembers {
+        if tyNamesDeclaredParam(m, depth - 1) { return true }
+      }
+      false
+    }
+    TyPrim | TyLit | TyErr | TyVar => false
+  }
 }
 
 // The ref-list row a value of rep type `t` is built as, or -1 where it is no ref list or its
@@ -11754,123 +11810,87 @@ function keptOrName(s: i32): i32 {
 }
 
 // The ref-list table slot the expression at `exprIx` produces, or -1 when none resolves: its
-// rep's row, else its binding's kept slot, else (an identifier) its type's row, else its kind's
-// rungs' row (a literal's minted one, a call's result, a paren's or if's), else its type's row.
+// rep's row, else the row a read's storage holds (a binding's cell, a field, a list's element
+// row), else its type's row, else a join's, call's or literal's own (`refListSlotOfUntyped`).
 // Slot 0 is a real row, so a caller tests the result before indexing a backing table.
-export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
-  if clsCensusOn { clsCensusEnter("refListSlotOfExpr") }
-  const rs0 = listRowOfExpr(exprIx, fnIx)
-  if rs0 >= 0 { return rs0 }
-  const kept = refListKeptSlotOfExpr(exprIx, fnIx)
-  if kept != -2 { return kept }
-  // An identifier whose rung has only a name reads the row its own type keys.
-  if exprIx >= 0 && exprIx < P.nodes.length && nodeAt(exprIx) is Ident {
-    return rlSlotOfTyOrTwin(tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
-  }
-  const pe = if exprIx < P.nodes.length { nodeAt(exprIx) } else { null }
-  if pe is ArrayLit {
-    const ls = arrLitKeptRowSlot(exprIx, fnIx)
-    if ls != -2 { return ls }
-  }
-  if pe is Call {
-    const cs = refListKeptSlotOfCall(pe, exprIx, fnIx)
-    if cs != -2 { return cs }
-    // A named function's call its function's joined result row.
-    if pe.callFn >= 0 {
-      const ce = nodeAt(pe.callFn)
-      if ce is Ident {
-        const fe = fnIndexOfInScopeAt(
-          sidOfNode(pe.callFn),
-          ce.identName,
-          fnIx,
-          pe.callFn,
-        )
-        const js = fnRetRefListSlot(fe)
-        if js >= 0 && js < rlElemName.length { return js }
-      }
-    }
-  }
-  if pe is Paren { return refListSlotOfExpr(pe.parInner, fnIx) }
-  if pe is IfStmt {
+export function refListSlotOfExpr(exprIx: i32, fnIx: i32): i32 {
+  const rs = listRowOfExpr(exprIx, fnIx)
+  if rs >= 0 || exprIx < 0 || exprIx >= P.nodes.length { return rs }
+  const e = nodeAt(exprIx)
+  if e is Paren { return refListSlotOfExpr(e.parInner, fnIx) }
+  const cs = refListCellSlotOfRead(exprIx, fnIx)
+  if cs != -2 { return cs }
+  const fs = refListFieldSlotOfRead(exprIx, fnIx)
+  if fs != -2 { return fs }
+  const xs = refListElemSlotOfRead(exprIx, fnIx)
+  if xs != -2 { return xs }
+  const ts = rlSlotOfTyOrTwin(tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
+  if ts >= 0 { return ts }
+  refListSlotOfUntyped(exprIx, fnIx)
+}
+
+// The row a value whose type keys none is a list of: a value `if`'s join of its arms, a call's
+// recorded result, or the row the intern pass minted a literal's elements at; -1 else.
+function refListSlotOfUntyped(exprIx: i32, fnIx: i32): i32 {
+  if clsCensusOn { clsCensusEnter("refListSlotOfUntyped") }
+  const e = nodeAt(exprIx)
+  if e is IfStmt {
     if ifExprRefKind(exprIx, fnIx) != "reflist" { return -1 }
     const ifs = ifExprRefSlot(exprIx, fnIx, "reflist", -1)
-    if ifs >= 0 && ifs < rlElemName.length { return ifs }
-    return -1
+    return if ifs >= 0 && ifs < rlElemName.length { ifs } else { -1 }
   }
-  if pe is Member {
-    const ms = refListKeptSlotOfMember(pe, exprIx, fnIx)
-    if ms != -2 { return ms }
-  }
-  if pe is Index {
-    const xs = refListKeptSlotOfIndex(pe, exprIx, fnIx)
-    if xs != -2 { return xs }
-  }
-  // A literal the rungs leave to its name reads the row the intern pass minted it at.
-  if pe is ArrayLit {
-    const mint = arrLitRlSlotAt(exprIx)
-    if mint >= 0 && mint < rlElemName.length { return mint }
-  }
-  // Every other read takes the row its element type keys.
-  const s = rlSlotOfTyOrTwin(tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
-  if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "call") }
-  if s < 0 {
-    if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "CLAMPED") }
-    return -1
-  }
-  s
+  if e is Call { return refListSlotOfCallResult(e, exprIx, fnIx) }
+  arrLitMintedRow(exprIx)
 }
 
-// The ref-list slot a read at `exprIx` already holds, without its element name: the row its
-// binding, narrowed arm or capture is stored at. -1 for no ref list, -2 where only the element
-// name answers (`refListElemNameOfExpr`).
-function refListKeptSlotOfExpr(exprIx: i32, fnIx: i32): i32 {
-  if clsCensusOn { clsCensusEnter("refListKeptSlotOfExpr") }
-  if exprIx < 0 { return -1 }
+// The row field read `exprIx`'s field is stored at in its receiver's row; -2 for any other node
+// or where only the field's element name answers.
+function refListFieldSlotOfRead(exprIx: i32, fnIx: i32): i32 {
   const e = nodeAt(exprIx)
-  if e is Paren {
-    const rs = listRowOfExpr(e.parInner, fnIx)
-    if rs >= 0 && rs < rlElemName.length { return rs }
-    return refListKeptSlotOfExpr(e.parInner, fnIx)
-  }
-  if !(e is Ident) { return -2 }
-  const slsMv = mapReadStructListMvSlot(exprIx, fnIx)
-  if slsMv >= 0 {
-    const mvRs = mvValInnerRlSlotAt(slsMv)
-    if mvRs >= 0 && mvRs < rlElemName.length { return mvRs }
+  if e is Member { refListKeptSlotOfMember(e, exprIx, fnIx) } else { -2 }
+}
+
+// The element row of the list index read `exprIx` reads from; -2 for any other node or where
+// the list's row holds no element row.
+function refListElemSlotOfRead(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(exprIx)
+  if e is Index { refListKeptSlotOfIndex(e, exprIx, fnIx) } else { -2 }
+}
+
+// The row the intern pass minted list literal `exprIx`'s elements at, a spread literal's
+// included; -1 for any other node or none.
+function arrLitMintedRow(exprIx: i32): i32 {
+  if exprIx < 0 || exprIx >= P.nodes.length || !(nodeAt(exprIx) is ArrayLit) {
     return -1
   }
-  refListKeptSlotOfIdent(e, exprIx, fnIx)
+  const mint = arrLitRlSlotAt(exprIx)
+  if mint >= 0 && mint < rlElemName.length { mint } else { -1 }
 }
 
-// `arrLitElemNameIn`'s rungs as slots, in its order: the row of the type each rung renders, -2
-// at a rung that has only a name (a spread's source row, a record or union template element).
-function arrLitKeptRowSlot(arrIx: i32, fnIx: i32): i32 {
-  if spreadLitSrcRowName(arrIx, fnIx) != "" { return -2 }
-  const ae = arrLitArenaRecElem(arrIx)
-  if ae >= 0 { return rlSlotOfTyOrTwin(mapStoredTyOf(ae)) }
-  const ft = arrLitFrameRefTy(arrIx, fnIx)
-  if ft >= 0 {
-    const fe = tyArrayElemIx(ft)
-    if tyIsArray(fe) { return -2 }
-    return rlSlotOfTyOrTwin(mapStoredTyOf(fe))
-  }
-  const inst = arrLitInstElemRow(arrIx, fnIx)
-  if inst >= 0 && inst < sTyIx.length { return rlSlotOfTyOrTwin(sTyIx[inst]) }
-  if arrElemIsClosureTy(arrIx) {
-    const ct = arrLitClosureRowTy(arrIx)
-    return if ct >= 0 { rlSlotOfTyOrTwin(ct) } else { -2 }
-  }
-  // Any other template arm keys the row of the element type it renders; a record's row can
-  // still hold a fact only its name carries (D14533).
-  const el = tyArrayElemIx(nodeTyIxOf(arrIx))
-  if el < 0 || el >= T.tys.length || tyAt(el) is TyObj || tyAt(el) is TyUnion {
-    return -2
-  }
-  arrLitRowSlotIn(arrIx, fnIx)
+// The row a call's result is recorded at where its type keys none: the callee's recorded
+// result (`refListKeptSlotOfCall`), else a named function's joined result row; -1 else.
+function refListSlotOfCallResult(e: Call, exprIx: i32, fnIx: i32): i32 {
+  const cs = refListKeptSlotOfCall(e, exprIx, fnIx)
+  if cs >= 0 && cs < rlElemName.length { return cs }
+  if e.callFn < 0 { return -1 }
+  const ce = nodeAt(e.callFn)
+  if !(ce is Ident) { return -1 }
+  const fe = fnIndexOfInScopeAt(
+    sidOfNode(e.callFn),
+    ce.identName,
+    fnIx,
+    e.callFn,
+  )
+  const js = fnRetRefListSlot(fe)
+  if js >= 0 && js < rlElemName.length { js } else { -1 }
 }
 
-// `refListElemNameOfIdent`'s rungs as slots, in its order: -2 at a rung that has only a name.
-function refListKeptSlotOfIdent(e: Ident, exprIx: i32, fnIx: i32): i32 {
+// The row identifier read `exprIx`'s binding cell is stored at: a narrowed `is K[]` arm's, a
+// local's, a capture's or a global's; -2 for any other node, or where the binding holds no cell
+// row and its type answers.
+function refListCellSlotOfRead(exprIx: i32, fnIx: i32): i32 {
+  const nm = nodeAt(exprIx)
+  if !(nm is Ident) { return -2 }
   const fat = listFitArmTyOf(exprIx, fnIx)
   if fat >= 0 {
     const fa = tyAt(fat)
@@ -11880,33 +11900,28 @@ function refListKeptSlotOfIdent(e: Ident, exprIx: i32, fnIx: i32): i32 {
   if identReadContainerAt(exprIx, fnIx) == RC_REF_LIST { return -2 }
   const rdg = identReadsGlobal(exprIx)
   if !rdg && declaredKind(exprIx) == "nulreflist" {
-    const sl18 = declaredSlotOf(exprIx)
-    if sl18 >= 0 {
-      const is18 = localStructIdx[sl18]
-      if is18 >= 0 && is18 < rlElemName.length { return is18 }
+    const ns = declaredSlotOf(exprIx)
+    if ns >= 0 {
+      const nr = localStructIdx[ns]
+      if nr >= 0 && nr < rlElemName.length { return nr }
     }
   }
-  if (paramNulRefArray(fnIx, exprIx)) {
-    const pn18 = paramTypeNodeOfRead(fnIx, exprIx)
-    if annNulRefArrSlot(pn18) >= 0 { return -2 }
+  if (
+    paramNulRefArray(fnIx, exprIx)
+    || paramRefArrayName(fnIx, exprIx) != "" && paramReadAt(fnIx, exprIx)
+  ) {
+    return -2
   }
-  const pn = paramRefArrayName(fnIx, exprIx)
-  if pn != "" && paramReadAt(fnIx, exprIx) { return -2 }
   const dsl = if rdg { -1 } else { declaredRefArraySlot(exprIx) }
   if dsl >= 0 { return dsl }
-  const cn = capturedRefListSlot(fnIx, e.identName)
+  const cn = capturedRefListSlot(fnIx, nm.identName)
   if cn >= 0 && cn < rlElemName.length { return cn }
   const grl = globalLetOfRead(fnIx, exprIx)
-  if grl >= 0 {
-    if globalCellKind(grl) == "reflist" {
-      const grs = letRefListSlot(grl, -1)
-      if grs >= 0 && grs < rlElemName.length { return grs }
-    }
-    if letRefListElemName(grl, -1) != "" { return -2 }
+  if grl >= 0 && globalCellKind(grl) == "reflist" {
+    const grs = letRefListSlot(grl, -1)
+    if grs >= 0 && grs < rlElemName.length { return grs }
   }
-  const nrs = recordListSlotOfNode(exprIx, fnIx)
-  if nrs >= 0 && nrs < rlElemName.length { return nrs }
-  -1
+  -2
 }
 
 // The element type name of the ref list, a nullable one included, that binding `letIx` holds at
@@ -11979,7 +11994,19 @@ export function letRefListSlot(letIx: i32, fnIx: i32) {
   }
   const ul = letInitUnionListTy(letIx, fnIx)
   if ul >= 0 { return rlSlotOfTy(tyArrayElemIx(ul)) }
-  letTailRowSlot(letIx, fnIx)
+  // An un-annotated binding takes the row its initializer delivers, a list literal its
+  // elements' own; else, and where that resolves none, the row its element type keys.
+  if d is LetDecl && d.letInit >= 0 && d.letType < 0 {
+    const ai = unwrapParen(d.letInit)
+    if ai < 0 { return -1 }
+    if !(nodeAt(ai) is ArrayLit) {
+      const ir = refListSlotOfExpr(ai, fnIx)
+      if ir >= 0 { return ir }
+    } else if !arrLitHasSpread(ai) {
+      return arrLitRowSlotIn(ai, fnIx)
+    }
+  }
+  rlSlotOfRowTy(rlRowTyOfElem(letRefListElemTy(letIx, fnIx)))
 }
 
 // The union list an un-annotated list literal binding is built at, where the checker stamped
@@ -11996,28 +12023,6 @@ export function letInitUnionListTy(letIx: i32, fnIx: i32): i32 {
   const et = if lt >= 0 { tyArrayElemIx(lt) } else { -1 }
   if et < 0 || !(tyAt(et) is TyUnion) { return -1 }
   lt
-}
-
-// The row a `let` with no destination binds: for an un-annotated one, a list literal's own
-// row, or the row any other initializer delivers (`refListSlotOfExpr`); otherwise, and where
-// that resolves none, the row keyed by the element type. -1 for none.
-function letTailRowSlot(letIx: i32, fnIx: i32): i32 {
-  if clsCensusOn { clsCensusEnter("letTailRowSlot") }
-  const et = letRefListElemTy(letIx, fnIx)
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if d.letInit >= 0 && d.letType < 0 {
-      const ai = unwrapParen(d.letInit)
-      if ai < 0 { return -1 }
-      if nodeAt(ai) is ArrayLit {
-        if !arrLitHasSpread(ai) { return arrLitRowSlotIn(ai, fnIx) }
-      } else {
-        const dr = refListSlotOfExpr(ai, fnIx)
-        if dr >= 0 { return dr }
-      }
-    }
-  }
-  rlSlotOfRowTy(rlRowTyOfElem(et))
 }
 
 // The struct row an un-annotated binding of the object literal at `objIx` is built at, or -1
