@@ -5,7 +5,7 @@ import {
   bundleRetParamOf,
   bundleSigsOfParam,
 } from "./emit_bundle"
-import { clsCensusEnter, clsCensusOn, clsCensusReset } from "./emit_cls_census"
+import { clsCensusReset } from "./emit_cls_census"
 
 // `emit_classify.vl` — the emitter's type classifiers and their supporting state: the
 // `expr*` / `let*` / `declared*` / `param*` / `fnRet*` / `global*` families that resolve
@@ -5190,74 +5190,6 @@ export function localCloPinFieldTail(callFnIx: i32, fnIx: i32): i32 {
   unwrapParen(tx)
 }
 
-// The interned `$fnsig` key every element of the array literal behind `arrIx` shares, each a
-// lambda literal, or "" when any element is not one or two keys differ. Literals only: a
-// named element resolves by name, and two frames' same-named functions share it.
-function cloArrElemSelfKey(arrIx: i32, fnIx: i32): string {
-  if clsCensusOn { clsCensusEnter("cloArrElemSelfKey") }
-  const li = cloArrLitOf(arrIx, fnIx)
-  if li < 0 { return "" }
-  const a = nodeAt(li)
-  if a is ArrayLit {
-    let key = ""
-    let i = 0
-    while i < a.arrElems.length {
-      const el = unwrapParen(a.arrElems[i])
-      if el < 0 || !(nodeAt(el) is FuncDecl) { return "" }
-      const fe = fnStmtsPosOf(el)
-      if fe < 0 { return "" }
-      const k = cloSigKeyExt(fe)
-      if k == "" { return "" }
-      if key != "" && k != key { return "" }
-      key = k
-      i = i + 1
-    }
-    if key != "" && cloSigPosOfKey(key) >= 0 { return key }
-  }
-  ""
-}
-
-// The `ArrayLit` node an indexed callee's receiver resolves to — the literal itself, or the
-// initializer of the binding that names it. -1 for anything this cannot follow, which is the
-// answer that keeps every other indexed closure call on `cloArrSlotSigKey`'s route.
-function cloArrLitOf(arrIx: i32, fnIx: i32): i32 {
-  const ix = unwrapParen(arrIx)
-  if ix < 0 { return -1 }
-  const e = nodeAt(ix)
-  if e is ArrayLit { return ix }
-  cloArrBindingLitOf(ix, fnIx)
-}
-
-// The array literal a BINDING's initializer is — the one hop `cloArrLitOf`'s own arm
-// does not cover, and that ladder's default. -1 for a name this cannot follow: a parameter,
-// a global built elsewhere, an initializer that is not a literal.
-function cloArrBindingLitOf(ix: i32, fnIx: i32): i32 {
-  const e = nodeAt(ix)
-  if e is Ident {
-    let li = -1
-    if fnIx >= 0 {
-      const fn = nodeAt(fnIx)
-      if fn is FuncDecl { li = bodyLetOfRead(fn.fnBody, ix) }
-    }
-    if li < 0 { li = globalLetOfRead(fnIx, ix) }
-    if li >= 0 {
-      const d = nodeAt(li)
-      if d is LetDecl {
-        // Guarded before `unwrapParen`: a binding with no initializer is -1, and peeling
-        // parens off it reads `P.nodes[-1]` — a compiler trap, not a refusal (D1152).
-        if d.letInit >= 0 {
-          const iv = unwrapParen(d.letInit)
-          if iv >= 0 {
-            const ivn = nodeAt(iv)
-            if ivn is ArrayLit { return iv }
-          }
-        }
-      }
-    }
-  }
-  -1
-}
-
 // The type `monoFieldReadTys` holds for read `rd` in function `fx` or the nearest function
 // enclosing it that has one, since a closure minted inside an instance reads at it (D5112).
 function monoFieldReadTyAt(rd: i32, fx: i32): i32 {
@@ -5454,16 +5386,13 @@ function cloIndexCalleeSigKey(ix: i32, tyIx: i32, fnIx: i32): string {
   const cre = nodeAt(ix)
   if cre is Index {
     if exprRefArray(cre.idxArr, fnIx) {
-      // A literal whose elements are lifted lambdas of one signature is keyed by it, as a
-      // lambda called in place is: the slot's name-rendered key disagrees with it at a
-      // literal union or a niche (D2552).
-      const efk = cloArrElemSelfKey(cre.idxArr, fnIx)
-      if efk != "" { return efk }
       // An element read at the instance's type parameters (D7142).
       const ik = cloInstanceSigKey(tyIx, fnIx)
       if ik != "" { return ik }
       const k = arrSlotSigKeyOf(cre.idxArr, fnIx)
       if k != "" {
+        const tk = slotTwinReadSigKey(cre.idxArr, ix, fnIx)
+        if tk != "" { return tk }
         // The slot's key is rendered from the element's name, which spells a union arm by
         // its field set; the arena key names the arm's row. Overrides only an un-interned
         // key with an interned one, as the `Ident` resolver does (D3108).
@@ -5473,9 +5402,37 @@ function cloIndexCalleeSigKey(ix: i32, tyIx: i32, fnIx: i32): string {
         }
         return k
       }
+      return cellSeedSigKey(cre.idxArr)
     }
   }
   ""
+}
+
+// The key of the closure capture cell `d` (read as `d[0]`) holds: the lifted key of the seed
+// lambda of the `let` the frame's slot declares, which mono coerces each write into the cell
+// to. "" for a receiver that is no un-annotated `let` seeded with one lambda.
+function cellSeedSigKey(arrIx: i32): string {
+  const ix = unwrapParen(arrIx)
+  if ix < 0 || !(nodeAt(ix) is Ident) { return "" }
+  const sd = bindingDeclInScope(ix)
+  const d = if sd >= 0 { sd } else { identDeclOf(ix) }
+  if d < 0 || d >= P.nodes.length { return "" }
+  const dn = nodeAt(d)
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "let"
+    || dn.letType >= 0
+    || dn.letInit < 0
+  ) {
+    return ""
+  }
+  const cell = nodeAt(dn.letInit)
+  if !(cell is ArrayLit) || cell.arrElems.length != 1 { return "" }
+  const fe = fnStmtsPosOf(cell.arrElems[0])
+  if fe < 0 { return "" }
+  const k = cloSigKeyExt(fe)
+  if k == "" || cloSigPosOfKey(k) < 0 { return "" }
+  k
 }
 
 // The indexed initializer of the un-annotated binding the callee `ix` reads, -1 when it reads
@@ -13237,6 +13194,20 @@ function arrSlotSigKeyOf(arrIx: i32, fnIx: i32): string {
   const sk = cloArrSlotSigKey(refListSlotOfExpr(arrIx, fnIx))
   if sk != "" && !sigArityIsElemOf(sk, nodeTyAt(arrIx, fnIx)) { return "" }
   sk
+}
+
+// The key of element read `ix`'s own type where it keys no row and the slot `arrIx` reads stores
+// another type: that row is keyed by a name spelling a literal union by its string, so its key
+// widens a parameter the lambda takes as an atom (D2552). "" where untyped or the type has a row.
+function slotTwinReadSigKey(arrIx: i32, ix: i32, fnIx: i32): string {
+  const et = nodeTyAt(ix, fnIx)
+  const slot = refListSlotOfExpr(arrIx, fnIx)
+  const rt = rlElemTyIxAt(slot)
+  if et < 0 || rt < 0 || et == rt { return "" }
+  if rlSlotOfTy(et) >= 0 { return "" }
+  const tk = sigKeyOfTy(et)
+  if tk == "" || cloSigPosOfKey(tk) < 0 { return "" }
+  tk
 }
 
 // Whether `key` takes exactly as many parameters as the function element of list type
