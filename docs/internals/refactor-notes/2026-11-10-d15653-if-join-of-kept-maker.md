@@ -12,11 +12,14 @@ A call arm was never queued, so `recKeptConflicts` never asked it. The join was 
 **The change.**
 
 - check_fit_rules.vl:
-  - `adoptArmAt` queues a call leaf stored as the join as an own-storage delivery
-    (`recOwnPend`). `recPend` cannot do it: it drops a pair whose two types are the same index,
-    which is the case when the call is in the first arm.
+  - `adoptJoinArmAt`, the `if` and `match` arms' entry (check_node_rules.vl, check_match.vl),
+    queues a call leaf stored as the join as an own-storage delivery (`recOwnPend`). `recPend`
+    cannot do it: it drops a pair whose two types are the same index, which is the case when the
+    call is in the first arm. A list literal's element keeps `adoptArmAt`: queuing its call part
+    turned 12 running fixtures (D15372's list parts) into refusals.
   - `recArmLandsAt` says when a call leaf is built at the kept record and not at its own type.
-    Either the join is delivered whole there (its context type, `const b: J = if …`), or every
+    Either the join is delivered whole there (its context type, `const b: J = if …`), or it is
+    assigned into a binding built there (`z = if …` after `let z = mk2()`, D15280's fixture), or every
     leaf of the join is a call of a maker kept there (`recCallKeptAt`, through
     `recHandOnMakerOf`).
 - check_program.vl: `recKeptConflicts` spares such a leaf, in both the kept arm and the relay
@@ -38,6 +41,7 @@ turned that program into an emit error.
 | the arm a binding holding `{ f: 4 }`, read later | invalid wasm | check reject |
 | the arm a bound read of `mk2()` | check reject | check reject |
 | `const b: J = if … { { f: 4 } } else { mk2() }` | runs | runs |
+| `let z = mk2()`, then `z = if … { { f: 4 } } else { mk2() }` | runs | runs |
 | both arms `mk2()`, or both `mk4()` | runs | runs |
 | `{ f: null }` beside `mk2()` (the join is `J`) | runs | runs |
 | a maker no binding keeps | runs | runs |
