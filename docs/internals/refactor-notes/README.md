@@ -9,6 +9,8 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-11-step7-retkind-readers-graded](2026-11-11-step7-retkind-readers-graded.md): Step 7: the return-kind readers and `buildFnMap`, graded and ruled.
+- [2026-11-11-step7-closing-census-3](2026-11-11-step7-closing-census-3.md): Step 7 closing census 3: the Deletes, Absorbs and Closes lists as a checklist.
 - [2026-11-11-step7-vkind-ty-list-ladders-2](2026-11-11-step7-vkind-ty-list-ladders-2.md): Step 7: the last two arena-type list ladders are descriptor reads at their callers.
 - [2026-11-11-step7-vkind-name-ladders](2026-11-11-step7-vkind-name-ladders.md): Step 7: the rendered-name list ladders lose two callers, and what keeps the rest.
 - [2026-11-11-step7-vkind-forin-walk-kind](2026-11-11-step7-vkind-forin-walk-kind.md): Step 7: a for-in's `#l` temp reads its iterable's rep, and the `fiLk` ladder is deleted.
