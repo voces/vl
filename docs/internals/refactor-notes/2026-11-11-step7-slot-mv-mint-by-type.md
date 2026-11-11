@@ -41,7 +41,13 @@ This is not D1748's hole face. A field whose type still reaches a hole answers `
 
 `sweep.vl diff`, master's fixpoint seed against the candidate's (23,882 programs):
 
-<!-- filled from the candidate sweep -->
+- **23,882 same**;
+- 0 bytes-only movers;
+- 0 output movers;
+- 0 `runs → not-runs`;
+- 0 new compiler traps.
+
+D3919 still refuses as filed.
 
 ## Rulings checked
 
@@ -53,7 +59,12 @@ This is not D1748's hole face. A field whose type still reaches a hole answers `
 
 ## Proof
 
-<!-- filled from the gates -->
+- Refresh ×2 is a fixpoint at 6,615,452 bytes (−34). The comment edits after it gave a
+  byte-identical seed (`cmp`).
+- `scripts/gate.sh`: all 23 rows pass. That covers deno test, ci-native, lint-self + fmt, seed
+  size, late demands, plumb-shape cost, dead-export and render-parse budgets, scaling shape,
+  rep-fuzz, filed witnesses, inventory refs, capability probes and the distilled corpus.
+- The ladder, comment and sentinel budgets (`vl check --budget`) all exit 0.
 
 ## What is left
 
