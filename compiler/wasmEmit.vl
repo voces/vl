@@ -1,4 +1,5 @@
 import { isTestAnswer } from "./check_narrow_flow"
+import { primTyIxOfName } from "./check_decl_scan"
 import {
   armHeapOfTy,
   armSrcShadowNote,
@@ -157,6 +158,7 @@ import {
   cStructNames,
   listArmFitAcrossReps,
   mkArrayTy,
+  mkNullableTyOf,
   numLitUnionBaseName,
   numLitUnionBaseTy,
   objFieldType,
@@ -1124,6 +1126,7 @@ import {
   structIndexOfObjCtx,
   structListPopGetElem,
   tyIsBareStrLit,
+  unionBoxStoreTyOf,
   unionNameOfExpr,
   unionNameOfRead,
 } from "./emit_classify"
@@ -1248,7 +1251,7 @@ import {
 import {
   isScalarBackedListRep,
   popTakesElem,
-  rlElemListRep,
+  rlElemListRepAt,
 } from "./emit_list_rep"
 import {
   arrElemIsNulBoolAt,
@@ -3361,7 +3364,7 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
     // an operand that is no union answers here even when its tested type names a row (#1310).
     if (
       nodeTyIsUnion(nd.isObj)
-      && isTestedRowOf(isVarTyIxOf(isIx), nd.isObj) >= 0
+      && isTestedRowOf(isIx, isVarTyIxOf(isIx), nd.isObj) >= 0
     ) {
       return -1
     }
@@ -6424,7 +6427,7 @@ function recNeverFitsArm(arm: i32, rcv: i32): boolean {
 // by a static row fold where the row is the answer, else the box tag and discriminant test.
 // Returns 0 once the test is on the stack, -1 on failure.
 function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
-  const vi = isTestedRowOf(isVarTyIxOf(isIx), nd.isObj)
+  const vi = isTestedRowOf(isIx, isVarTyIxOf(isIx), nd.isObj)
   if vi < 0 {
     if recvIsTestedRecord(nd.isObj, isVarTyIxOf(isIx)) {
       if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
@@ -8168,11 +8171,24 @@ function boxRecordTyAt(ix: i32, fnIx: i32): i32 {
 function boxRecordNameOf(ty: i32): string {
   const r = unRowOfRecordTy(ty)
   if r >= 0 && r < unNames.length { return unNames[r] }
+  if boxRecordIsTagSet(ty) { return "i32|null" }
+  unionSpellingOfTy(ty, 8)
+}
+
+// The type `boxRecordNameOf(ty)` names: `i32 | null` for a nullable function set it boxes as
+// that, else `ty`.
+function boxRecordUnionTyOf(ty: i32): i32 {
+  if ty < 0 || unRowOfRecordTy(ty) >= 0 || !boxRecordIsTagSet(ty) { return ty }
+  mkNullableTyOf(primTyIxOfName("i32"))
+}
+
+// Whether `ty` is a nullable function set whose value is its member tag.
+function boxRecordIsTagSet(ty: i32): boolean {
   const d = tyAt(ty)
   if d is TyNullable && d.nInner >= 0 && tyAt(d.nInner) is TyFunc {
-    if repOfTy(d.nInner).rdKind == "i32" { return "i32|null" }
+    return repOfTy(d.nInner).rdKind == "i32"
   }
-  unionSpellingOfTy(ty, 8)
+  false
 }
 
 // `emitUnionBoxArg` into the union the checker records `valIx` delivered into, where a registry
@@ -8221,6 +8237,21 @@ function boxDstNameAt(valIx: i32, fnIx: i32): string {
     return unionNameOfExpr(valIx, fnIx)
   }
   ""
+}
+
+// The type `boxDstNameAt(valIx, fnIx)` names: the type of the row the recorded union names, else
+// the value's own union; -1 where it names none.
+function boxDstTyOf(valIx: i32, fnIx: i32): i32 {
+  const r = boxRecordTyAt(valIx, fnIx)
+  if r >= 0 && repOfTy(r).rdKind == "union" && boxRecordNameOf(r) != "" {
+    const u = unRowOfRecordTy(r)
+    if u >= 0 && u < unTyIx.length && unTyIx[u] >= 0 { return unTyIx[u] }
+    return boxRecordUnionTyOf(r)
+  }
+  if exprUnion(valIx, fnIx) && coerceKindAt(valIx, fnIx) == "none" {
+    return unionBoxTyOfRead(valIx, fnIx)
+  }
+  -1
 }
 
 // The value's form for the box shadow: 1 already a box, 2 a call that never returns, else 0.
@@ -10071,7 +10102,14 @@ function emitUnionEqOther(body: u8[], otherIx: i32, k: i32, fnIx: i32) {
 // can carry an annotation spelling no row is bound under (`K|null|i32`), and with no set the
 // box's literal-union arm reads as absent (D12050). -1 when neither names a row.
 function msSetOfUnionBox(boxIx: i32, uname: string, fnIx: i32): i32 {
-  msSetOfNameTy(uname, nodeTyInOf(unwrapParen(boxIx), fnIx))
+  msSetOfNameTy(uname, unionBoxTyOfRead(boxIx, fnIx))
+}
+
+// The union `unionNameOfExpr` names for a read of a box (`unionBoxStoreTyOf`), else the read's
+// own type.
+function unionBoxTyOfRead(ix: i32, fnIx: i32): i32 {
+  const st = unionBoxStoreTyOf(ix, fnIx)
+  if st >= 0 { st } else { nodeTyInOf(unwrapParen(ix), fnIx) }
 }
 
 // Union against a concrete value, in either operand order: the box's tag must select the arm
@@ -27055,8 +27093,9 @@ function emitAssignIdent(
     // the raw variant, so it takes the plain coerce. A literal-union target is an atom and falls
     // through below. The union is the checker's recorded one where a registry row answers it,
     // else the target's own.
-    const recTy = boxRecordTyAt(a.binRight, fnIx)
-    const recNm = boxRecordNameOf(recTy)
+    const recBt = boxRecordTyAt(a.binRight, fnIx)
+    const recNm = boxRecordNameOf(recBt)
+    const recTy = boxRecordUnionTyOf(recBt)
     if declaredKind(lhsIx) == "union" {
       const bNm = if recNm != "" { recNm } else { aUNm }
       const bTy = if recNm != "" { recTy } else { nodeTyAt(lhsIx, fnIx) }
@@ -27687,7 +27726,7 @@ function pushDestVKind(rslot: i32): VKind | null {
   if k == RLK_MAP { return "map" }
   if k == RLK_CLOSURE { return "closure" }
   // Code 2, the value-union box, owes nothing: its null is a tag inside a non-null box.
-  rlElemListRep(k)
+  rlElemListRepAt(rslot)
 }
 
 // receiver resolution for `.push` — `listOpRecvLocal`, the one home the four list ops
@@ -29682,7 +29721,13 @@ function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
     const seat = boxSeat
     boxSeat = -1
     if boxDstShadowArmed() { boxDstShadowAs("table") }
-    const rb = emitUnionBoxArg(body, boxRecordNameOf(bt), bt, exprIx, fnIx)
+    const rb = emitUnionBoxArg(
+      body,
+      boxRecordNameOf(bt),
+      boxRecordUnionTyOf(bt),
+      exprIx,
+      fnIx,
+    )
     boxSeat = seat
     return rb
   }
@@ -39158,7 +39203,7 @@ function emitCoalesceNulRefJoin(
   }
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
-  const joinTy = nodeTyInOf(exprIx, fnIx)
+  const joinTy = boxDstTyOf(e.binRight, fnIx)
   const tag = coalNicheBoxTag(
     joinSet,
     joinTy,
@@ -39219,7 +39264,7 @@ function emitCoalesceNulBoolJoin(
   }
   let joinSet = unionMemberSetOf(joinN)
   if joinSet == "" { joinSet = joinN }
-  const joinTy = nodeTyInOf(exprIx, fnIx)
+  const joinTy = boxDstTyOf(e.binRight, fnIx)
   const bvb = vbHeapIdxOfKind(1)
   if bvb < 0 || !unionHasAtomTy(joinSet, "boolean", false) {
     return emitFailAt(
@@ -40564,6 +40609,7 @@ function emitCoalesceUnionField(
     let mHeap = -1
     let mfi = -1
     let mphys = ""
+    let mphysTy = -1
     let mCast = -1
     // A box receiver narrowed to one arm is unwrapped to that arm, asked ahead of the row as
     // `emitMem` asks it: an index place is typed at the arm, so `structIndexOfExpr` answers
@@ -40576,6 +40622,7 @@ function emitCoalesceUnionField(
       if mfi >= 0 && sFieldTypeAt(msi, mfi) == FC_UNION {
         mHeap = sHeapIdx[msi]
         mphys = sFieldElemNameAt(msi, mfi)
+        mphysTy = sFieldElemTyIxAt(msi, mfi)
       }
     } else {
       if mvi < 0 { mvi = exprVariantIndex(lhs.memObj, fnIx) }
@@ -40588,6 +40635,7 @@ function emitCoalesceUnionField(
         if mfi >= 0 && variantFieldTypeAt(mvi, mfi) == FC_UNION {
           mHeap = variantHeap(mvi)
           mphys = variantFieldElemName(mvi, mfi)
+          mphysTy = uFieldElemTyIxAt(mvi, mfi)
         }
       }
     }
@@ -40595,9 +40643,13 @@ function emitCoalesceUnionField(
       // A wider record's box is read at the receiver's own member set (D3006).
       if memReadBoxAmbiguous(lhsIx, fnIx) { return emitBoxAmbiguousFail(lhsIx) }
       let munm = memReadBoxNarrowName(lhsIx, fnIx)
-      if munm == "" { munm = mphys }
+      let munTy = memReadBoxNarrowTy(lhsIx, fnIx)
+      if munm == "" {
+        munm = mphys
+        munTy = mphysTy
+      }
       // D-VALUNION + D-SETONCE — see the call arm above.
-      const msid = msSetOfNameTy(munm, nodeTyAt(lhsIx, fnIx))
+      const msid = msSetOfNameTy(munm, munTy)
       if (
         isValueUnionOfSet(msid, munm)
         && unionHasAtomK(msid, munm, "null", nullValKind())
