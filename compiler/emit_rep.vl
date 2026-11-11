@@ -152,7 +152,6 @@ import {
   tyIxIsVariantMember,
   tyMutEpoch,
   tySame,
-  tyToEmitName,
   tyToNominalName,
 } from "./check_types"
 import { sidOf } from "./symbols"
@@ -3250,11 +3249,117 @@ export function repOfTy(ty: i32): RepDesc {
 export function boxTagOfTy(ty: i32): i32 {
   const k = btOfTy(ty)
   if k != -2 { return k }
-  valueAtomKind(tyToEmitName(ty))
+  btSoftOfTy(ty)
 }
 
-// `boxTagOfTy`'s decision, or -2 where only the render decides: a union whose members share
-// a list or closure tag that several spellings carry (D4320).
+// `boxTagOfTy` where `btOfTy` leaves the union undecided: the one tag of its members once each
+// numeric literal is its base and equal members are one, else -1 (`i32[] | K[]` over `K = 0 | 1`
+// is the atom list; `K[] | J[]` over two string sets is two members).
+function btSoftOfTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = tyAt(ty)
+  if t is TyArray {
+    const e = t.aElem
+    if e < 0 || !(tyAt(e) is TyUnion) { return -1 }
+    const em: i32[] = []
+    if !btSoftMembersInto(e, em) || em.length != 1 { return -1 }
+    const lk = btOfList(ty, em[0])
+    return if lk == -2 { -1 } else { lk }
+  }
+  const ms: i32[] = []
+  if !btSoftMembersInto(ty, ms) || ms.length != 1 { return -1 }
+  const k = btOfTy(ms[0])
+  if k == -2 { return btSoftOfTy(ms[0]) }
+  k
+}
+
+// Appends union `ty`'s members, nested unions flattened, each numeric literal (or numeric
+// literal union) as its base, and a member equal to an earlier one dropped. False past a depth.
+function btSoftMembersInto(ty: i32, out: i32[]): boolean {
+  btSoftMembersGo(ty, out, 0)
+}
+
+function btSoftMembersGo(ty: i32, out: i32[], depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+  const t = tyAt(ty)
+  if t is TyUnion {
+    const nb = numLitUnionBaseTy(ty)
+    if nb >= 0 { return btSoftPush(nb, out) }
+    if tyIsLitUnion(ty) && depth > 0 { return btSoftPush(ty, out) }
+    for m in t.uMembers {
+      if !btSoftMembersGo(m, out, depth + 1) { return false }
+    }
+    return true
+  }
+  if t is TyNullable {
+    if !btSoftMembersGo(t.nInner, out, depth + 1) { return false }
+    return btSoftPush(TY_NULL, out)
+  }
+  if t is TyLit {
+    if t.litKind != "str" { return btSoftPush(litBaseTy(t), out) }
+  }
+  btSoftPush(ty, out)
+}
+
+// Pushes `m` unless a member already in `out` is the same after numeric-literal softening.
+function btSoftPush(m: i32, out: i32[]): boolean {
+  for o in out {
+    if btSoftSame(o, m) { return true }
+  }
+  out.push(m)
+  true
+}
+
+// Whether `a` and `b` are one value type once numeric literals are their base: lists by their
+// elements, anything else by `repCanonId`.
+function btSoftSame(a: i32, b: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 { return false }
+  const ta = tyAt(a)
+  const tb = tyAt(b)
+  if ta is TyArray {
+    if tb is TyArray { return btSoftElemSame(ta.aElem, tb.aElem, 0) }
+    return false
+  }
+  if tb is TyArray { return false }
+  // A literal is its own value here: the canonical id would fold a string literal to `string`.
+  if btHoldsLit(a) || btHoldsLit(b) { return tySame(a, b) }
+  repCanonId(a) == repCanonId(b)
+}
+
+// Whether `ty` is a literal or a union holding one.
+function btHoldsLit(ty: i32): boolean {
+  const t = tyAt(ty)
+  // Exhaustive over `Ty` and `_`-less: only a literal, or a union of members, holds one.
+  match t {
+    TyLit => {
+      return true
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if m >= 0 && btHoldsLit(m) { return true }
+      }
+      return false
+    }
+    TyPrim | TyFunc | TyArray | TyObj | TyMap | TyNullable | TyVar | TyNeg | TyErr => {
+      // A list, a nullable or a shape is compared as itself, never by its members' literals.
+      return false
+    }
+  }
+}
+
+// Two list elements alike after numeric-literal softening.
+function btSoftElemSame(a: i32, b: i32, depth: i32): boolean {
+  if depth > 8 { return false }
+  const sa: i32[] = []
+  const sb: i32[] = []
+  if !btSoftMembersInto(a, sa) || !btSoftMembersInto(b, sb) { return false }
+  if sa.length != 1 || sb.length != 1 { return false }
+  btSoftSame(sa[0], sb[0])
+}
+
+// `boxTagOfTy`'s decision, or -2 where its softened members decide (`btSoftOfTy`): a union
+// whose members share a list or closure tag that several spellings carry (D4320).
 function btOfTy(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   for s in btSeen {
@@ -3915,7 +4020,7 @@ function repOfNullableArray(elem: i32): RepDesc {
     if et.primName == "i64" { return repMk("nuli64list", 1, "i64") }
     if et.primName == "f32" { return repMk("nulf32list", 1, "f32") }
     // D979 — the PACKED byte list joins the nullable-scalar-list family.
-    if et.primName == "u8" { return repMk("nulu8list", 1, "u8list") }
+    if et.primName == "u8" { return repMk("nulu8list", 1, "u8") }
   }
   // A tagged set's ids are i32s, so their list made nullable is the nullable i32-list ref.
   if et is TyFunc && fnTagTyIsTagged(elem) { return repMk("nullist", 1, "i32") }
@@ -4944,7 +5049,11 @@ function repTreeVKind(ix: i32): VKind | null {
     "nul" => {
       return rtNulVKind(ix)
     }
-    "u8" | "unsup" => {
+    // A `u8` outside a list is read as the i32 it widens to.
+    "u8" => {
+      return "i32"
+    }
+    "unsup" => {
       return null
     }
   }
@@ -5039,6 +5148,36 @@ function rtNulNicheElemName(elem: i32): string {
   }
 }
 
+// The nullable niche of list kind `k`, which every list has; null for a kind that is no list.
+function rtNulListOf(k: VKind | null): VKind | null {
+  match k {
+    "list" => {
+      return "nullist"
+    }
+    "strlist" => {
+      return "nulstrlist"
+    }
+    "f64list" => {
+      return "nulf64list"
+    }
+    "i64list" => {
+      return "nuli64list"
+    }
+    "f32list" => {
+      return "nulf32list"
+    }
+    "u8list" => {
+      return "nulu8list"
+    }
+    "reflist" => {
+      return "nulreflist"
+    }
+    "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" | null => {
+      return null
+    }
+  }
+}
+
 function rtNulVKind(ix: i32): VKind | null {
   const d = rtDisc[ix]
   // `boolean | null` is its own kind over an i32 valtype; a litunion `K | null` keeps the plain
@@ -5066,33 +5205,7 @@ function rtNulVKind(ix: i32): VKind | null {
       return "nulmap"
     }
     "list" => {
-      const elem = rtChild[inner]
-      if elem < 0 { return null }
-      const ek = rtKind[elem]
-      match ek {
-        "i32" | "bool" | "atom" => {
-          return "nullist"
-        }
-        "str" => {
-          return "nulstrlist"
-        }
-        "f64" => {
-          return "nulf64list"
-        }
-        "i64" => {
-          return "nuli64list"
-        }
-        "f32" => {
-          return "nulf32list"
-        }
-        "u8" => {
-          return "nulu8list"
-        }
-        // A ref, box, nullable or unsup element has no nullable-list kind.
-        "list" | "map" | "box" | "closure" | "struct" | "nul" | "unsup" => {
-          return null
-        }
-      }
+      return rtNulListOf(rtListVKind(rtChild[inner]))
     }
     // A scalar, box, nested nullable or unsup inner has no nullable kind of its own.
     "i32" | "bool" | "i64" | "f64" | "f32" | "u8" | "atom" | "box" | "nul" | "unsup" => {}
