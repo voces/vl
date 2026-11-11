@@ -87,6 +87,7 @@ import {
   recArgRepOf,
   recBuildElemTyOf,
   recBuildPush,
+  recKeptFnLatePush,
 } from "./check_rec_rows"
 import { identBoundFnDeclOf } from "./check_scopes"
 import { identDeclOf } from "./symbols"
@@ -238,21 +239,72 @@ export function storeWritesResolve() {
   storeWritesClear()
 }
 
-// Builds a record literal written into a field stored as record `ft` (or `ft | null`) at that
-// record, as a literal nested in the receiver's own build is (D15820).
+// Builds a record written into a field stored as record `ft` (or `ft | null`) at that record, as
+// a literal nested in the receiver's own build is: a literal, the literal an un-annotated binding
+// holds (D15820), or the result of a call that is its function's only one (D15821).
 function storeWriteLitAt(v: i32, ft: i32): i32 {
-  let u = unwrapParen(v)
-  if u >= 0 && u < P.nodes.length && nodeAt(u) is Ident {
+  const at = nonNullTy(ft)
+  if at < 0 || at >= T.tys.length || !(tyAt(at) is TyObj) { return 0 }
+  const u = unwrapParen(v)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const own = nodeTyIxOf(u)
+  if own < 0 || own >= T.tys.length || tySame(own, at) { return 0 }
+  // A value its own type already stores as the field does needs no build.
+  if fieldStorageEq(own, at, REC_STORE_DEPTH) { return 0 }
+  const n = nodeAt(u)
+  if n is ObjLit { return recordRepTyAdopt(u, at, 6) }
+  if n is Ident {
     const d = identDeclOf(u)
     const dn = if d >= 0 { nodeAt(d) } else { null }
-    if dn is LetDecl && dn.letType < 0 { u = unwrapParen(dn.letInit) }
+    if dn is LetDecl && dn.letType < 0 {
+      const l = unwrapParen(dn.letInit)
+      if l >= 0 && l < P.nodes.length && nodeAt(l) is ObjLit {
+        recordRepTyAdopt(l, at, 6)
+        // Its other deliveries are taken at the record or refused at its own (D15695).
+        storeHeldArgsAt(d, at, u, [u])
+      }
+    }
+    return 0
   }
-  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is ObjLit) { return 0 }
-  const at = nonNullTy(ft)
-  const own = nodeTyIxOf(u)
-  if at < 0 || at >= T.tys.length || !(tyAt(at) is TyObj) { return 0 }
-  if own < 0 || tySame(own, at) { return 0 }
-  recordRepTyAdopt(u, at, 6)
+  if n is Call { return storeWriteCallAt(u, own, at) }
+  storeWriteBuiltOwn(u)
+}
+
+// Every other written value is a read of a storage its own build already chose.
+function storeWriteBuiltOwn(_ix: i32): i32 { 0 }
+
+// Builds call `u`'s result, typed `own`, at the record `at` a field write stores it as, where `u`
+// is its function's only call and every result is a literal; else refuses the write, since one
+// record cannot be stored at two layouts.
+function storeWriteCallAt(u: i32, own: i32, at: i32): i32 {
+  const fd = recInferredFnOf(u)
+  if fd < 0 { return 0 }
+  const sites: i32[] = []
+  let ok = rcwCallSites(fd, sites) < 0 && sites.length == 1 && sites[0] == u * 2
+  const lits: i32[] = []
+  for lf in recFnValueLeaves(fd) {
+    const l = unwrapParen(lf)
+    if l < 0 || l >= P.nodes.length || !(nodeAt(l) is ObjLit) {
+      ok = false
+    } else {
+      lits.push(l)
+    }
+  }
+  if !ok {
+    tErr(
+      "this call's result is stored as "
+        + tyToStr(at)
+        + " by the field it is written into, whose record is built wider than its own type, "
+        + "and its function also builds it as "
+        + tyToStr(own)
+        + "; a record is shared, not copied. Annotate the receiver, or copy the value with an "
+        + "object literal",
+      u,
+    )
+    return 0
+  }
+  for l in lits { recordRepTyAdopt(l, at, 6) }
+  recKeptFnLatePush(fd, own, at)
 }
 
 // Records, for each queued un-annotated binding, the record its initializer is held at where that
@@ -283,7 +335,7 @@ export function storeLetsResolve() {
       const lt = storeLitHeldAt(u, 4)
       if lt >= 0 && lt < T.tys.length && !tySame(lt, own) {
         recordRepTyAdopt(u, lt, 6)
-        storeHeldArgsAt(storeLetDeclAt(i), lt, u)
+        storeHeldArgsAt(storeLetDeclAt(i), lt, u, [])
       }
     } else if own >= 0 && own < T.tys.length && tyAt(own) is TyObj {
       const r = if joins[i] != -2 { joins[i] } else { storeHeldAt(u) }
@@ -307,8 +359,8 @@ export function storeLetsResolve() {
 
 // Instances each annotated parameter a read of the record binding `d`, its literal `l` held at
 // `lt`, is handed to and only read for a field, at `lt` (`recHeldArgTakesRep`), and refuses the
-// read's other deliveries at its own storage (D15695).
-function storeHeldArgsAt(d: i32, lt: i32, l: i32) {
+// read's other deliveries outside `skip` at its own storage (D15695).
+function storeHeldArgsAt(d: i32, lt: i32, l: i32, skip: i32[]) {
   if d < 0 || !(tyAt(lt) is TyObj) { return 0 }
   cwIxBuild()
   const ow = cwOccWalk(d)
@@ -317,7 +369,7 @@ function storeHeldArgsAt(d: i32, lt: i32, l: i32) {
       recHeldArgTakesRep(cwIxNode[ow.row], lt)
     }
   }
-  recHeldReadsOwnRefuse(d, lt, l, [])
+  recHeldReadsOwnRefuse(d, lt, l, skip)
 }
 
 // The type list or record literal `l` is built at where an element or field is a value held at
