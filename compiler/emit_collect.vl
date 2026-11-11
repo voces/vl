@@ -117,7 +117,7 @@ import {
   genAppNameOfTy,
   litUnionAliasOfLitTexts,
   litUnionInlineNameOfTy,
-  numLitUnionBaseName,
+  numLitUnionBaseTy,
   structNameOfTy,
   tyArrayElemIx,
   tyAt,
@@ -215,12 +215,8 @@ import {
   monoAnnHasTyParam,
   nameIsBareMap,
   nameIsClosureArrayTy,
-  nameIsF32Array,
-  nameIsF64Array,
-  nameIsI64Array,
   nameIsShapeSpanEnds,
   nameIsStringArray,
-  nameIsU8Array,
   nodeIsTypeDecl,
   normTypeAtom,
   nulLitUnionInnerNameOfTy,
@@ -589,8 +585,6 @@ import {
 } from "./emit_anon_fields"
 import {
   sFieldElemNameAt,
-  sFieldTypeAt,
-  sNameCanonSet,
   sScanLim,
   sioMemoReset,
   structFieldNameIxReset,
@@ -765,6 +759,7 @@ import {
   ALK_I64,
   annRefArrElemRow,
   arrElemIsClosureTy,
+  arrLitLeadInner,
   arrLitNestedElemKind,
   arrLitNestedElemName,
   arrLitNulRefElemName,
@@ -5217,12 +5212,16 @@ function collectAUnionRows() {
 }
 
 // The list mint's key hint for literal `i`: `arrLitElemHintTy`, else the closed element type the
-// literal is built at, where that type is a closure or a `string` or `u8` list. Any other
-// element keeps the name's key: its row is still read back by that name.
+// literal is built at. A hole, a type parameter, a literal or a record (whose declaration is its
+// identity) keeps the name's key.
 function arrLitMintHintTy(i: i32): i32 {
   const h = arrLitElemHintTy(i)
   if h >= 0 { return h }
   let e = tyStepElem(arrLitBuildTy(i))
+  // A list of lists is built at its lead inner literal's rep, which carries the element join the
+  // outer stamp misses (D4874, D4876); an element that is a union of lists keeps the union.
+  const ie = arrLitLeadInnerRepTy(i)
+  if ie >= 0 && e >= 0 && tyAt(e) is TyArray { e = ie }
   // A build type still open in the template is the one closed type every instance builds at.
   if e >= 0 && (tyHasInferHole(e, 0) || tyHasTyVar(e)) {
     e = tyStepElem(litRepTyOneClosed(i))
@@ -5235,14 +5234,23 @@ function arrLitMintHintTy(i: i32): i32 {
   ) {
     return -1
   }
-  if tyAt(e) is TyFunc { return e }
-  const leaf = tyStepElem(e)
-  if leaf < 0 { return -1 }
-  const lt = tyAt(leaf)
-  if lt is TyPrim && (lt.primName == "string" || lt.primName == "u8") {
-    return e
+  e
+}
+
+// The closed rep of list literal `i`'s lead inner literal, or -1 where `i` holds no inner literal.
+function arrLitLeadInnerRepTy(i: i32): i32 {
+  if i < 0 || i >= P.nodes.length { return -1 }
+  const a = nodeAt(i)
+  if (
+    !(a is ArrayLit)
+    || a.arrElems.length < 1
+    || !(nodeAt(a.arrElems[0]) is ArrayLit)
+  ) {
+    return -1
   }
-  -1
+  const t = litRepTyAt(arrLitLeadInner(a), -1)
+  if t < 0 || tyHasInferHole(t, 0) || tyHasTyVar(t) { return -1 }
+  t
 }
 
 // `collectA`'s arm for the list literal at node `i`: the list flags and ref-list rows its
@@ -5318,10 +5326,16 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       if ae >= 0 {
         rlInternNameTy(rlRowNameOfTy(ae, false), RLK_STRUCT, ae)
       } else if elemKind != RLK_STRUCT || !arrLitRepElemRow(i) {
-        recordArrLitRlSlot(
-          i,
-          rlInternNameTy(arrLitElemName(i, -1), elemKind, arrLitMintHintTy(i)),
-        )
+        const mh = arrLitMintHintTy(i)
+        // A row keyed by a list of lists interns its inner rows by type first, as kind 9 does.
+        if mh >= 0 && refListElemKindOfTy(mh) == RLK_REF_LIST {
+          recordArrLitRlSlot(i, ensureRefElemTys(arrLitElemName(i, -1), mh, mh))
+        } else {
+          recordArrLitRlSlot(
+            i,
+            rlInternNameTy(arrLitElemName(i, -1), elemKind, mh),
+          )
+        }
       }
       if elemKind == RLK_STRUCT { arrLitInstElemRows(nd) }
     }
@@ -5434,17 +5448,13 @@ function annArrayRungsSkip(i: i32, nd: TypeRef): boolean {
 
 // Whether annotation `i` is an array `checkArrName` must not validate: an `f64`, `i64`, `f32` or
 // `u8` list, whose pair mints on first read, or an array over a type parameter, which its
-// instances re-collect at pinned names. The element's rep is read first, then the name.
-function annScalarOrOpenArray(i: i32, nd: TypeRef): boolean {
+// instances re-collect at pinned names.
+function annScalarOrOpenArray(i: i32): boolean {
   const er = nodeTyArrayElemRepName(i)
   er == "f64"
-    || nameIsF64Array(nd.tyName)
     || er == "i64"
-    || nameIsI64Array(nd.tyName)
     || er == "f32"
-    || nameIsF32Array(nd.tyName)
     || er == "u8"
-    || nameIsU8Array(nd.tyName)
     || annArrOverTyParam(i)
 }
 
@@ -5456,7 +5466,7 @@ function annTyIsRefList(i: i32, nd: TypeRef): boolean {
   if ty < 0 || nd.tyName == "" { return false }
   if !(tyIsRefArray(ty) || tyIsNulRefArray(ty)) { return false }
   const e = tyStepElem(tyPeelNul(ty))
-  e < 0 || numLitUnionBaseName(e) == ""
+  e < 0 || numLitUnionBaseTy(e) < 0
 }
 
 // `collectA`'s arm for the annotation at node `i`: the heap types, list and map rows its
@@ -5499,7 +5509,7 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     } else if (
       annSpelledArray(i)
       && !isUnionOfTy(nodeTyIxOf(i))
-      && !annScalarOrOpenArray(i, nd)
+      && !annScalarOrOpenArray(i)
     ) {
       // A union ending in an array arm (`i64 | S[]`) is a box whose arms `markRefArrayArms`
       // interns, so it is not validated here.
@@ -6923,46 +6933,6 @@ function structTableReset() {
 }
 
 // ── struct-type collection ───────────────────────────────────────────────────
-// Maps each declared row in `lo` to `hi` onto the first earlier one of the same canonical type
-// whose field rows are identical, so two same-shape declarations answer one row.
-function declTwinRowsCanon(lo: i32, hi: i32) {
-  let j = lo + 1
-  while j < hi {
-    let i = lo
-    while i < j {
-      if declRowsTwin(i, j) {
-        sNameCanonSet(sNames[j], i)
-        i = j
-      } else {
-        i = i + 1
-      }
-    }
-    j = j + 1
-  }
-  0
-}
-
-// Whether declared rows `i` and `j` hold one canonical type at one layout.
-function declRowsTwin(i: i32, j: i32): boolean {
-  if i >= sTyIx.length || j >= sTyIx.length || j >= sFieldCount.length {
-    return false
-  }
-  const a = sTyIx[i]
-  const b = sTyIx[j]
-  if a < 0 || b < 0 || !tySame(a, b) { return false }
-  if sFieldCount[i] != sFieldCount[j] { return false }
-  let k = 0
-  while k < sFieldCount[i] {
-    const fa = sFieldStart[i] + k
-    const fb = sFieldStart[j] + k
-    if sFieldNames[fa] != sFieldNames[fb] { return false }
-    if sFieldTypeAt(i, k) != sFieldTypeAt(j, k) { return false }
-    if sFieldElemName[fa] != sFieldElemName[fb] { return false }
-    k = k + 1
-  }
-  true
-}
-
 // Scans top-level statements for every struct `type` declaration into the flat multi-struct
 // table; each interns its own WasmGC struct heap type, and a field whose type has no code
 // fails loudly. Then runs the shape passes in order. Returns 0, or -1 (via `emitFail`).
@@ -6973,7 +6943,6 @@ export function collectS(stmts: i32[]) {
   sioMemoReset()
   anonShapesNodeLen = 0
   structTableReset()
-  const declLo = sNames.length
   // Nested inline-shape field types intern first, so the struct decls that reference them resolve.
   collectNestedFieldShapes(stmts)
   // A `type X = {…}` that is a union variant is collected by `collectU` instead, not here; any
@@ -7088,7 +7057,6 @@ export function collectS(stmts: i32[]) {
   // D1050 — gives a mixed-spelling pair one layout now both field tables are complete, before
   // the shape passes below re-lay a row a shape could otherwise twin onto.
   if unifyMixedLitRepArms() < 0 { return -1 }
-  declTwinRowsCanon(declLo, sNames.length)
   // Generic-alias application shapes next: the declared structs they may reference are
   // interned above, so their names resolve as code-15 struct-ref fields.
   gaeCollectDecls(stmts)
