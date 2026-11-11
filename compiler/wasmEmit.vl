@@ -2774,7 +2774,37 @@ function emitVariantStruct(body: u8[], objIx: i32, vi: i32, fnIx: i32) {
   // row's fields are laid out sorted by name too, so `{ kind: "rect", w: f(), h: g() }` is
   // pushed `h, kind, w` and would run its initialisers permuted without this.
   const stash: i32[] = []
-  if objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) {
+  // A literal the checker built at this arm from a wider record runs each initialiser the arm
+  // drops for its effect, in source order, as `emitObj` does (D1696, D15093).
+  const drops = objLitHasFieldOutside(objIx, start, cnt)
+    && objLitBuildVariantRow(objIx, fnIx) == vi
+    && nodeRepTyAt(objIx, fnIx) != nodeTyAt(objIx, fnIx)
+  if drops {
+    let pj = 0
+    while pj < cnt {
+      stash.push(0 - 1)
+      pj = pj + 1
+    }
+    const pairs = objFieldSrcPairs(objIx, sFieldNames, start, cnt)
+    let oi = 0
+    while oi + 1 < pairs.length {
+      const ofj = pairs[oi]
+      const ovIx = pairs[oi + 1]
+      oi = oi + 2
+      if ofj < 0 {
+        if emitExpr(body, ovIx, fnIx) < 0 { return -1 }
+        fbDrop()
+        continue
+      }
+      if emitVariantFieldValue(body, vi, ofj, ovIx, fnIx) < 0 { return -1 }
+      const dslot = objOrderStashSlot(
+        variantFieldTypeAt(vi, ofj),
+        uFieldStorageSlot(vi, ofj),
+      )
+      stash[ofj] = dslot
+      fbLocalSet(dslot)
+    }
+  } else if objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) {
     let pj = 0
     while pj < cnt {
       stash.push(0 - 1)
@@ -2825,7 +2855,7 @@ function emitVariantStruct(body: u8[], objIx: i32, vi: i32, fnIx: i32) {
     if emitVariantFieldValue(body, vi, fj, valIx, fnIx) < 0 { return -1 }
     fj = fj + 1
   }
-  if objLitHasFieldOutside(objIx, start, cnt) {
+  if !drops && objLitHasFieldOutside(objIx, start, cnt) {
     return emitFailAt(
       "emitProgram: object literal writes a field its union variant does not declare",
       objIx,
