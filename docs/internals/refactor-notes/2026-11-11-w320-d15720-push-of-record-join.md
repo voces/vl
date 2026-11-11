@@ -13,7 +13,7 @@ union. The module failed to validate.
 **Graded.**
 
 - `record-literal-join-at-declared-record.matrix.vl`: `array_push` SILENT → runs in both faces;
-  26 of 46 run, 0 SILENT (the 20 un-annotated cells are D15717's shared read, on #7242).
+  26 of 46 run, 0 SILENT (the 20 un-annotated cells are D15717's shared read, unfiled: D15717, its row is on #7242).
 - Local sweep against #7265's fixpoint: 23,911 same, 2 output movers. D15720's witness goes
   compiler trap → runs, and the D15719 fixture gains its push line. 0 runs → not-runs, 0 new
   traps.
