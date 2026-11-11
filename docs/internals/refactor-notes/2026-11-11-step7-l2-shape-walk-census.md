@@ -1,10 +1,10 @@
-# Step 7 L2 §7: where the shape walk runs untyped, and an arm mint's fields walked by type, 2026-11-11
+# Step 7 L2 §7: where the shape walk runs untyped, 2026-11-11
 
 The spelling-predicates note (`2026-11-11-step7-l2-spelling-predicates.md`) found the shape
 walk's array and map tests untyped in about 700 programs. This note counts where those untyped
-reaches come from. It then cuts the largest source, an arm mint whose fields walked with no
-type, and names the rest. The walk is `internShapeDeepTy`, `internShapeDeepTyGo` and
-`internFuncTypeShapesTy` in `emit_shape_intern.vl`.
+reaches come from, and names what is left after #7160, which closed the largest source. The walk
+is `internShapeDeepTy`, `internShapeDeepTyGo` and `internFuncTypeShapesTy` in
+`emit_shape_intern.vl`.
 
 The base is master `94b382ce`. The population is the sweep's `cases` population: 7,442 programs.
 
@@ -26,20 +26,21 @@ On master, 780 programs enter the walk with no type at least once. By source:
 | descents from an untyped level | 132, 46, 26, 18 | the array, map, `\| null` and paren peels below an untyped root |
 | descents from a typed level | 29, 8, 7 | a union arm the arm-type hand-over did not cover, and a function's parameter or element step |
 
-## Changed
+## The largest source, closed by #7160
 
-- `internInlineShapeTyGo` walks each field with the field's type read off `fieldsTy`. It is
-  `tyIx` everywhere except the arm mint. The field code, the nested row, and every other field
-  read still take `tyIx`'s field type. Handing the arm's type to `nameFieldCodeTy` too changes
-  the code of a nested-shape field from -1 to 15 in about 30 programs, which skips the nested
-  row the -1 branch mints. That change is not made here.
+The arm mint passed `tyIx` -1 and kept the arm's type in `fieldsTy`, but the field walk read
+its field type off `tyIx`. #7160 reads the field type off `fieldsTy` for the walk, the field
+code and the store. This lane measured the walk half of that change on its own, before #7160
+merged, as a scratch cut. It handed only the walk the field type read off `fieldsTy`:
 
-The arm mint reaches this field walk in 423 programs. In every one, the arm's type has the
-field.
+- **Targeted A/B.** The 423 programs that reach the arm mint were built with the master seed
+  and with the scratch candidate. 0 exit codes differ and 0 modules differ in bytes.
+- **Agreement.** In every one of the 423, the arm's type has the field.
 
 ## After
 
-With the cut, 408 programs enter the walk with no type, down from 780. What is left:
+With the walk reading `fieldsTy` (the scratch cut, measured before #7160), 408 programs enter it
+with no type, down from 780. What is left:
 
 - **`collectAnnShapes`, 346 programs.** An untyped annotation's walk mints a row in 20 of them.
   The spellings are interface and record shapes, such as `{toString():string}`,
@@ -52,7 +53,5 @@ With the cut, 408 programs enter the walk with no type, down from 780. What is l
 
 ## Proof
 
-- **Targeted.** The 423 programs that reach the arm mint were each built with the master seed
-  and with a candidate built from it: 0 exit codes differ and 0 modules differ in bytes.
-- **Checks.** One `refresh-compiler.sh`, lint-self clean, distilled `regress.vl` with no runs
-  lost, render-parse within budget. The full identity sweep is the PR's `sweep` job.
+This PR changes no compiler file. The counts come from the probe compiler described under
+Census.

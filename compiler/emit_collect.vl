@@ -59,6 +59,7 @@ import {
   recordJoinSeen,
 } from "./check_core_state"
 import { canonEmitNameOfTy, canonUnionMembersInto } from "./check_program"
+import { recAdAnnDropped } from "./check_rec_adopt_rows"
 import { assignable, substTyDeep } from "./check_relate_core"
 import { isListArmNodes, isVarTyIxOf } from "./check_list_union"
 import { listDisjointDepth } from "./check_type_shape"
@@ -823,7 +824,6 @@ import {
   armFieldRowMove,
   armRefRowEnsure,
   buildVariantTwins,
-  ensureRefElem,
   ensureRefElemTy,
   ensureRefElemTys,
   forceCloResultListTypes,
@@ -1487,7 +1487,7 @@ function internCloSigKey(key: string, rep: i32) {
 // its own functype, and the cast traps.
 function internCloSigOfAtomTy(atom: string, kIn: string, ty: i32) {
   let k = kIn
-  if k == "" { k = unionArmSigKeyTy(atom, ty) }
+  if k == "" { k = unionArmSigKeyTy(ty) }
   if k == "" { return 0 }
   if nulCloMixedUnionUnregistered(atom, ty) { return 0 }
   internCloSigKey(k, -1)
@@ -5240,12 +5240,11 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
         rlInternNameTy(nestElem, nestKind, rlHintElemTy(i))
       }
     }
-    // D1511 — the same hole at the shape element kind: `const xs = []` then
-    // `xs.push({y: 1, x: 2})` reaches this pass with the element pinned to a struct and no
-    // row interned, since no `<shape>[]` spelling exists anywhere in the program. Unhinted:
-    // the name is nominal, and `rlInternNameTy` takes no key hint for a nominal spelling.
+    // D1511 — the same hole at the shape element kind: `xs.push({y: 1, x: 2})` onto `[]` pins
+    // the element to a struct no `<shape>[]` spelling interns. The key is unhinted, since a
+    // nominal spelling takes none; the element type still classifies it.
     const shapeElem = arrLitShapeElemName(i)
-    if shapeElem != "" { ensureRefElem(shapeElem) }
+    if shapeElem != "" { ensureRefElemTys(shapeElem, -1, rlHintElemTy(i)) }
     // The same hole at a nullable ref element: a push of a `T | null` value, or of a bare
     // `null` a later write filled, spells the `(T | null)[]` row nowhere (D2506).
     const nulElem = arrLitNulRefElemName(i)
@@ -5322,7 +5321,7 @@ function annNicheNulElemInner(annIx: i32): i32 {
 function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
   // Whether the annotation is the nullable list, asked of its type.
   const ranIsNul = tyIsNulRefArray(fdRowOf(i))
-  // The element kind, classified once before the `ensureRefElem` intern, the only call here
+  // The element kind, classified once before the `ensureRefElemTys` intern, the only call here
   // that mutates a table the classifier reads. It is the recorded element type's; the spelling
   // is the floor for a non-null node with no type or a declined one. A nullable list's declined
   // element (a type parameter, a union of lists) is no niche, so its kind is not read.
@@ -5373,8 +5372,8 @@ function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
     recordAnnRlSlot(i, -1, ranNul)
     return 0
   }
-  recordAnnRlSlot(i, ensureRefElemTy(ren, renTy), ranNul)
-  // A map element (`{[K]: V}[]`) forces the map machinery inside `ensureRefElem` above, whose
+  recordAnnRlSlot(i, ensureRefElemTys(ren, renTy, raTy), ranNul)
+  // A map element (`{[K]: V}[]`) forces the map machinery inside `ensureRefElemTys` above, whose
   // `k == 3` arm reaches every map element in every position.
   0
 }
@@ -5654,7 +5653,8 @@ export function collectAnnShapes() {
     const tn = nodeAt(ti)
     // Ahead of the TypeRef arm: the annotation it mints is appended, so this loop interns it.
     if joins { internJoinedRecordRow(ti) }
-    if tn is TypeRef {
+    // An annotation an undone adoption dropped belongs to no declaration.
+    if tn is TypeRef && !recAdAnnDropped(ti) {
       // One gate and one switch, each closing a disagreement between the recorded type and what
       // the name resolves to in the emitter's context. The gate: a spelling naming a generic-alias
       // type parameter reads the alias's declared type, whose `K` is still a type variable, since
