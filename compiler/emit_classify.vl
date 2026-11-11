@@ -414,7 +414,6 @@ import {
   declaredString,
   letMapKeyKind,
   listRepOfFieldCode,
-  listRepOfMf,
   listRepOrNull,
   nulListBase,
   paramString,
@@ -717,12 +716,12 @@ import {
   LBK_STR_LIST,
   LBK_U8_LIST,
   LBK_UNION,
+  ListKind,
   MVK_F32,
   MVK_F64,
   MVK_I64,
   MVK_STRUCT,
   MVK_UNION,
-  MfKind,
   RLK_CLOSURE,
   RLK_REF_LIST,
   RLK_UNION,
@@ -2280,7 +2279,7 @@ export function letBindTy(letIx: i32, fnIx: i32): i32 {
 // is another type than its own, else -1. A scalar binding holds its own type, so the rungs, which
 // build whole-program indices to answer, are not asked of one.
 function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
-  const own = nodeTyIxOf(letIx)
+  const own = nodeTyAt(letIx, fnIx)
   if (
     own >= 0
     && own < T.tys.length
@@ -2329,7 +2328,7 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   const u = unwrapParen(init)
   if u < 0 || !(nodeAt(u) is Ident) { return -1 }
   // A read narrowed to `null` still holds the named cell's nullable value.
-  if tyIsNullUnit(nodeTyIxOf(u)) {
+  if tyIsNullUnit(nodeTyAt(u, fnIx)) {
     const nd = identDeclOf(u)
     if nd < 0 || nd == letIx || !(nodeAt(nd) is LetDecl) { return -1 }
     const nt = letBindTy(nd, fnIx)
@@ -2343,7 +2342,7 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   if bd < 0 || bd == letIx || !(nodeAt(bd) is LetDecl) { return -1 }
   // A binding of a parameter stored at a wider record is stored there too.
   if letHoldsParamBuilt(bd, fnIx) { return letBindTy(bd, fnIx) }
-  const own = nodeTyIxOf(u)
+  const own = nodeTyAt(u, fnIx)
   const t0 = letBindTy(bd, fnIx)
   if own < 0 || own >= T.tys.length || t0 < 0 || t0 >= T.tys.length {
     return -1
@@ -2611,7 +2610,7 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
   const atom = letAnnIsAtom(letIx, fnIx)
     || letInitIsLitAtom(letIx, fnIx)
     && !letHoldsBox(letIx, fnIx)
-    && !letWidensToString(letIx)
+    && !letWidensToString(letIx, fnIx)
     || constBindsLitSet(letIx)
   if atom || letSpellsNulAtom(letIx, fnIx) {
     const aty = letBindTy(letIx, fnIx)
@@ -2693,12 +2692,12 @@ function letHoldsBox(letIx: i32, fnIx: i32): boolean {
 
 // Whether `letIx` is a `let` the checker widened to `string`: a copy of a `const`'s literal set
 // it may reassign to any string, so it holds the string, not its initializer's atom (D14757).
-function letWidensToString(letIx: i32): boolean {
+function letWidensToString(letIx: i32, fnIx: i32): boolean {
   const d = nodeAt(letIx)
   d is LetDecl
     && d.letKw == "let"
     && d.letType < 0
-    && nodeTyIxOf(letIx) == TY_STR
+    && nodeTyAt(letIx, fnIx) == TY_STR
 }
 
 // Loop variable `d`'s storage answer in frame `fnIx`, off the loop of that frame declaring it:
@@ -4703,11 +4702,11 @@ export function minMaxKind(ix: i32, fnIx: i32): string {
 // element the checker typed the literal at when every source widens to it losslessly
 // (`[...ints, 2.5]` is `f64[]`), each such group then copied converting. `null` when no source
 // is a list the emitter knows, which is the caller's refusal.
-export function spreadDestKind(arrIx: i32, fnIx: i32): MfKind | null {
+export function spreadDestKind(arrIx: i32, fnIx: i32): ListKind | null {
   const a = nodeAt(arrIx)
   if !(a is ArrayLit) { return null }
   const elems = a.arrElems
-  let k: MfKind | null = null
+  let k: ListKind | null = null
   let i = 0
   while i < elems.length && k == null {
     const src = spreadArgOf(elems[i])
@@ -4720,13 +4719,13 @@ export function spreadDestKind(arrIx: i32, fnIx: i32): MfKind | null {
     spreadBoxingSource(arrIx, fnIx) >= 0
     && spreadOwnBoxRow(arrIx, elems, fnIx) >= 0
   ) {
-    return "ref"
+    return "reflist"
   }
   if (
     spreadLitElemIsString(arrIx, fnIx)
     && spreadSourcesStrOrAtoms(elems, fnIx)
   ) {
-    return "str"
+    return "strlist"
   }
   const de = spreadLitScalarElem(arrIx, fnIx)
   if de == null || de == k { return k }
@@ -4740,7 +4739,7 @@ export function spreadDestKind(arrIx: i32, fnIx: i32): MfKind | null {
 export function spreadLitSrcRowName(arrIx: i32, fnIx: i32): string {
   const a = nodeAt(arrIx)
   if !(a is ArrayLit) || !hasSpreadItem(a.arrElems) { return "" }
-  if spreadDestKind(arrIx, fnIx) != "ref" { return "" }
+  if spreadDestKind(arrIx, fnIx) != "reflist" { return "" }
   if spreadBoxingSource(arrIx, fnIx) >= 0 { return "" }
   // Only when the literal's element IS every source's: a `null` or a nullable source joins
   // the literal to `C | null`, whose row is not the source's.
@@ -4781,8 +4780,8 @@ export function spreadOwnBoxRow(arrIx: i32, elems: i32[], fnIx: i32): i32 {
 export function spreadSrcBoxes(src: i32, row: i32, fnIx: i32): i32 {
   if row < 0 || row >= rlElemName.length { return -1 }
   const k = mfRecvKindOf(src, fnIx)
-  if k == null || k == "u8" { return -1 }
-  if k == "ref" {
+  if k == null || k == "u8list" { return -1 }
+  if k == "reflist" {
     const s = refListSlotOfExpr(src, fnIx)
     if s == row { return 0 }
     if s < 0 || s >= rlElemTyIx.length { return -1 }
@@ -4798,7 +4797,7 @@ export function spreadSrcBoxes(src: i32, row: i32, fnIx: i32): i32 {
 // whose elements each widen to their string in a `string[]` destination (D2868); else empty.
 export function spreadSrcAtomTexts(src: i32, fnIx: i32): string[] {
   const none: string[] = []
-  if mfRecvKindOf(src, fnIx) != "i32" { return none }
+  if mfRecvKindOf(src, fnIx) != "list" { return none }
   tyLitMemberTexts(tyStepElem(nodeTyAt(src, fnIx)))
 }
 
@@ -4811,7 +4810,7 @@ export function spreadSourcesStrOrAtoms(elems: i32[], fnIx: i32): boolean {
     const src = spreadArgOf(elems[j])
     if src >= 0 {
       if spreadSrcAtomTexts(src, fnIx).length > 0 { atoms = true }
-      else if mfRecvKindOf(src, fnIx) != "str" { return false }
+      else if mfRecvKindOf(src, fnIx) != "strlist" { return false }
     }
     j = j + 1
   }
@@ -4849,10 +4848,10 @@ export function spreadBoxingSource(arrIx: i32, fnIx: i32): i32 {
         const niche = dT is TyNullable
           && sk == mfRecvKindOf(arrIx, fnIx)
           && tySame(dT.nInner, se)
-        if sk != "ref" && sk != "str" && !niche { return src }
+        if sk != "reflist" && sk != "strlist" && !niche { return src }
         // A string list is a nullable string list's rep, and no other nullable's (D15045).
         if (
-          sk == "str"
+          sk == "strlist"
           && dT is TyNullable
           && !spreadNulInnerIsElem(dT.nInner, se)
         ) {
@@ -4876,7 +4875,7 @@ function spreadNulInnerIsElem(inner: i32, se: i32): boolean {
 // Whether every spread source among `elems` is a `de` list or one that widens to it.
 export function spreadSourcesWidenTo(
   elems: i32[],
-  de: MfKind,
+  de: ListKind,
   fnIx: i32,
 ): boolean {
   let j = 0
@@ -4891,7 +4890,7 @@ export function spreadSourcesWidenTo(
   true
 }
 
-// The ref-list row a spread literal builds at — 0 for every kind but `"ref"`, where the row is
+// The ref-list row a spread literal builds at — 0 for every kind but `"reflist"`, where the row is
 // the source's own, since a ref list's wrapper and backing heap types come from the row.
 export function spreadDestRow(elems: i32[], fnIx: i32) {
   let i = 0
@@ -4900,7 +4899,7 @@ export function spreadDestRow(elems: i32[], fnIx: i32) {
     if src >= 0 {
       const k = mfRecvKindOf(src, fnIx)
       if k != null {
-        if k == "ref" { return refListSlotOfExpr(src, fnIx) }
+        if k == "reflist" { return refListSlotOfExpr(src, fnIx) }
         return 0
       }
     }
@@ -4931,7 +4930,7 @@ export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
   // arm predicates keeps a nest of `if` arms linear, since each of them asks this of its arm.
   if ifJoinIsScalarPrim(ifIx) { return null }
   // Nor does a join of a tagged set, whose value is its member's i32 id.
-  if fnTagTyIsTagged(nodeTyIxOf(ifIx)) { return null }
+  if fnTagTyIsTagged(nodeTyAt(ifIx, fnIx)) { return null }
   let i = 0
   while i < irkMemoIx.length {
     if irkMemoIx[i] == ifIx && irkMemoFn[i] == fnIx {
@@ -5852,7 +5851,7 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
   }
   if nodeTyIsNullable(dix) { return true }
   // A default whose type is `null` itself, as a call of a function that only returns `null` (D3408).
-  if isNullTy(nodeTyIxOf(dix)) { return true }
+  if isNullTy(nodeTyAt(dix, fnIx)) { return true }
   // A hole the instance binds to a nullable type is nullable there.
   if tyBearsNull(holeOperandTyOf(dix, fnIx)) { return true }
   const un = unionNameOfExpr(dix, fnIx)
@@ -6082,7 +6081,7 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   }
   if !(nodeAt(recv) is Ident) { return false }
   if exprMap(recv, fnIx) { return false }
-  const tt = nodeTyIxOf(a.binLeft)
+  const tt = nodeTyAt(a.binLeft, fnIx)
   if tt < 0 { return tgt is Index && nodeAt(tgt.idxArr) is Ident }
   if tySame(tt, nodeTyAt(asgIx, fnIx)) { return true }
   // A binding a closure shares is its cell's slot, and its re-read is taken back to the right
@@ -6615,7 +6614,7 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
     if hasSpreadItem(a.arrElems) {
       // A box-list literal boxes a string source too (D2969).
       if arrLitBoxElem(arrIx) { return false }
-      return spreadDestKind(arrIx, fnIx) == "str"
+      return spreadDestKind(arrIx, fnIx) == "strlist"
     }
     // An atom-element literal (the checker adopted a `K[]` context) is the i32 atom-id
     // list, not a string list — its elements are string exprs syntactically but each lowers
@@ -12821,7 +12820,7 @@ function identIsBoundClosureGo(readIx: i32, fnIx: i32): boolean {
 // function value (a function whose body's tail is itself a function value).
 export function exprIsClosure(exprIx: i32, fnIx: i32) {
   // A tagged set's value is the i32 id of its member.
-  if exprIx < 0 || fnTagTyIsTagged(nodeTyIxOf(exprIx)) { return false }
+  if exprIx < 0 || fnTagTyIsTagged(nodeTyAt(exprIx, fnIx)) { return false }
   const e = nodeAt(exprIx)
   match e {
     Paren => {
@@ -13477,7 +13476,7 @@ export function fnReturnsClosure(t: i32) {
     if fn.fnRet < 0 && tyIsFnArmUnion(tyStepRet(nodeTyIxOf(fnStmts[t]))) {
       return false
     }
-    return blockTailIsClosure(fn.fnBody)
+    return blockTailIsClosure(fn.fnBody, fnStmts[t])
   }
   false
 }
@@ -13523,7 +13522,7 @@ function fnHandsBackTaggedParam(fn: FuncDecl): boolean {
 // True if the block's tail (implicit-return) expression is a function value: the checker records
 // a `TyFunc` for every spelling that yields one, and `nodeTyIsFunc` is structural, so a function
 // list, a nullable closure and a tagged set's member are not one (D1620).
-function blockTailIsClosure(blockIx: i32) {
+function blockTailIsClosure(blockIx: i32, fnIx: i32) {
   const b = nodeAt(blockIx)
   if b is Block {
     const n = b.blkStmts.length
@@ -13531,7 +13530,7 @@ function blockTailIsClosure(blockIx: i32) {
     const last = b.blkStmts[n - 1]
     const s = nodeAt(last)
     const tx = if s is RetStmt { s.retArg } else { last }
-    if tx < 0 || fnTagTyIsTagged(nodeTyIxOf(tx)) { return false }
+    if tx < 0 || fnTagTyIsTagged(nodeTyAt(tx, fnIx)) { return false }
     return nodeTyIsFunc(tx)
   }
   false
@@ -13630,7 +13629,7 @@ export function callIsArrSlice(exprIx: i32, fnIx: i32) {
 
 // The element kind of the list receiver `recvIx` of a `.map`/`.filter`/`.slice` call inside
 // `fnIx`, nullable or not: the rep of its type; null when that type is no list.
-export function mfRecvKindOf(recvIx: i32, fnIx: i32): MfKind | null {
+export function mfRecvKindOf(recvIx: i32, fnIx: i32): ListKind | null {
   const ty = nodeTyInOf(recvIx, fnIx)
   if ty < 0 || ty >= T.tys.length { return null }
   mfKindOfListTy(tyPeelNul(ty))
@@ -13638,21 +13637,43 @@ export function mfRecvKindOf(recvIx: i32, fnIx: i32): MfKind | null {
 
 // The element kind of the list the `.map`/`.filter`/`.slice` call at `callIx` returns inside
 // `fnIx`: the rep of the call's own type; null when that type is no list.
-export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
+export function mfResultKindOf(callIx: i32, fnIx: i32): ListKind | null {
   const ty = nodeTyInOf(callIx, fnIx)
   if ty < 0 || ty >= T.tys.length { return null }
   mfKindOfListTy(ty)
 }
 
-// The element kind whose list rep is `ty`'s, or null when `ty` reps as no list.
-function mfKindOfListTy(ty: i32): MfKind | null {
+// The element kind whose list rep is `ty`'s, or null when `ty` reps as no non-null list.
+function mfKindOfListTy(ty: i32): ListKind | null {
   const d = repOfTy(ty)
   if d.rdCovered != 1 { return null }
-  const ks: MfKind[] = ["i32", "f64", "ref", "str", "i64", "f32", "u8"]
-  for k in ks {
-    if listRepOfMf(k) == d.rdKind { return k }
+  match d.rdKind {
+    "list" => {
+      return "list"
+    }
+    "u8list" => {
+      return "u8list"
+    }
+    "i64list" => {
+      return "i64list"
+    }
+    "f32list" => {
+      return "f32list"
+    }
+    "f64list" => {
+      return "f64list"
+    }
+    "strlist" => {
+      return "strlist"
+    }
+    "reflist" => {
+      return "reflist"
+    }
+    // Not a non-null list.
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return null
+    }
   }
-  null
 }
 
 // The element type of a `.map` whose callback returns a list, a function, a nullable list, a
@@ -13736,7 +13757,7 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32): i32 {
   const callee = nodeAt(c.callFn)
   if !(callee is Member) { return -1 }
   if callee.memProp == "slice" || callee.memProp == "filter" {
-    if mfRecvKindOf(callee.memObj, fnIx) != "ref" { return -1 }
+    if mfRecvKindOf(callee.memObj, fnIx) != "reflist" { return -1 }
     // The call type's row; a result whose type keys none, a hole-function list, is built at
     // its receiver's.
     const ts = rlSlotOfTyOrTwin(tyArrayElemIx(nodeTyInOf(callIx, fnIx)))
@@ -13744,7 +13765,7 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32): i32 {
     return refListSlotOfExpr(callee.memObj, fnIx)
   }
   if callee.memProp != "map" || c.callArgs.length != 1 { return -1 }
-  if mfResultKindOf(callIx, fnIx) != "ref" { return -1 }
+  if mfResultKindOf(callIx, fnIx) != "reflist" { return -1 }
   rlSlotOfTyOrTwin(tyArrayElemIx(nodeTyInOf(callIx, fnIx)))
 }
 
