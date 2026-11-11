@@ -634,7 +634,7 @@ import {
   liSlots,
   liftWbEnd,
   listFitStoodIn,
-  listFitStoodWrap,
+  listFitStoodTy,
   listGetIdxSlot,
   listGetIdxStagedIx,
   listGetIdxStagedSet,
@@ -4820,26 +4820,30 @@ function emitListFitGrowLen(body: u8[], m: Member, memIx: i32, fnIx: i32): i32 {
   1
 }
 
-// The wrapper of the empty `K[]` a closure's read of capture `name` at `exprIx` stands in with,
-// or -1 (D4935): only an `is K[]` fitting an empty list of other elements types it so. A read
-// typed at a type parameter's list takes the enclosing region's `K[]` when `anyPos` or when it
-// is delivered whole. Two record lists are not told apart, since rows of one shape alias.
+// The wrapper of the empty `K[]` (pushed onto `tyOut`) a closure's read of capture `name` stands
+// in with, or -1 (D4935): only an `is K[]` fitting an empty list of other elements types it so. A
+// read at a type parameter's list takes the region's `K[]` when `anyPos` or delivered whole. Two
+// record lists are not told apart, since rows of one shape alias.
 function listFitCaptureStandIn(
   name: string,
   exprIx: i32,
   fnIx: i32,
   anyPos: boolean,
+  tyOut: i32[],
 ): i32 {
   if !listIsTestedIdent(unwrapParen(exprIx)) || !identIsEnvCapture(fnIx, name) {
     return -1
   }
   if narListReadsDecl(exprIx) { return -1 }
   const heaps: i32[] = []
-  let kind = listFitStandInKind(nodeTyIxOf(exprIx), heaps)
+  let st = nodeTyIxOf(exprIx)
+  let kind = listFitStandInKind(st, heaps)
   if kind == null && (anyPos || listFitReadIsWhole(fnIx, exprIx)) {
-    kind = listFitStandInKind(listFitRegionKTy(fnIx, name), heaps)
+    st = listFitRegionKTy(fnIx, name)
+    kind = listFitStandInKind(st, heaps)
   }
   if kind == null { return -1 }
+  tyOut.push(st)
   const ck = capturedKindOf(fnIx, name)
   if ck == null { return -1 }
   if ck == "reflist" { return if kind == "ref" { -1 } else { heaps[2] } }
@@ -4847,15 +4851,6 @@ function listFitCaptureStandIn(
   const se = scalarListElemOfListKind(ck)
   if se == null || scalarListWrap(se) == heaps[2] { return -1 }
   heaps[2]
-}
-
-// The scalar element of the stand-in list wrapper `w`, or null for any other list.
-function listFitStoodKind(w: i32): VKind | null {
-  if isLTy(w) { return "i32" }
-  if isFl64Ty(w) { return "f64" }
-  if isIl64Ty(w) { return "i64" }
-  if isFl32Ty(w) { return "f32" }
-  null
 }
 
 // `listFitElemKind` of list type `t`'s elements, or null when `t` is not a list of a kind
@@ -27644,7 +27639,7 @@ function listOpRecvLocal(
       // A closure's stand-in for such a list is its own, and a push into it would be lost.
       if (
         op == ".push"
-        && listFitCaptureStandIn(recv.identName, objIx, fnIx, true) >= 0
+        && listFitCaptureStandIn(recv.identName, objIx, fnIx, true, []) >= 0
       ) {
         return emitFailAt(LIST_FIT_PUSH_MSG, objIx)
       }
@@ -29949,7 +29944,8 @@ function emitScalarListCopy(
 ): boolean {
   if listFitStoodIn >= 0 && listFitStoodIn == unwrapParen(srcIx) {
     listFitStoodIn = -1
-    const stood = listFitStoodKind(listFitStoodWrap)
+    const sd = repOfTy(listFitStoodTy)
+    const stood = if sd.rdCovered == 1 { scalarListElemOfListKind(sd.rdKind) } else { null }
     if stood == null || stood == de || scalarWidenConvOp(stood, de) < 0 {
       return false
     }
@@ -36045,12 +36041,13 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
   }
   // …and a closure's read of its capture there, which reads an empty `K[]` of its own (D4935).
   listFitStoodIn = -1
-  const capSh = listFitCaptureStandIn(e.identName, exprIx, fnIx, false)
+  const capTy: i32[] = []
+  const capSh = listFitCaptureStandIn(e.identName, exprIx, fnIx, false, capTy)
   if capSh >= 0 {
     fbBacking(listBackOfWrap(capSh), 0)
     arrLitWrap(0, capSh)
     listFitStoodIn = exprIx
-    listFitStoodWrap = capSh
+    listFitStoodTy = capTy[0]
     return 0
   }
   const isid = sidOfNode(exprIx)
@@ -36785,14 +36782,6 @@ function njKindOfTy(t: i32): i32 {
   -1
 }
 
-// The valtype kind of value-atom kind `k`.
-function njVKind(k: i32): VKind {
-  if k == 3 { return "i64" }
-  if k == 4 { return "f64" }
-  if k == 5 { return "f32" }
-  "i32"
-}
-
 // Whether the value at `ix` is a union of numeric primitives (`njMembersOf`).
 export function nodeIsNumUnion(ix: i32, fnIx: i32): boolean {
   if ix < 0 { return false }
@@ -37165,8 +37154,11 @@ function emitNumUnionBin(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   }
   njResBox = rks.length > 1 && !numCmpOp(e.binOp)
   njBlockKind = "i32"
-  if njResBox { njBlockKind = "union" }
-  else if !numCmpOp(e.binOp) { njBlockKind = njVKind(rks[0]) }
+  if njResBox {
+    njBlockKind = "union"
+  } else if !numCmpOp(e.binOp) {
+    njBlockKind = repOfTy(numPrimTyOfKind(rks[0])).rdKind
+  }
   // The node's consumers read its recorded type, so a result shape it does not name is refused
   // loudly rather than handed on in a rep they do not expect (D3453).
   if !numCmpOp(e.binOp) {
@@ -37233,7 +37225,7 @@ function njConvertArm(ms: i32[], i: i32, bs: i32, to: i32) {
   }
   njTagTest(bs, mk)
   fbOpenIf()
-  fbValtype(njVKind(to), -1)
+  fbValtype(repOfTy(numPrimTyOfKind(to)).rdKind, -1)
   fbLocalGet(bs)
   if emitUnionUnboxTail(mk) < 0 { return -1 }
   if njConvert(mk, to) < 0 { return -1 }
