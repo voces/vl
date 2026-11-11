@@ -1,8 +1,7 @@
 # Step 7 slot layer, family B, PR 2: a cast's arm tag reads the declaration the cast names, 2026-11-11
 
 This PR follows #7139 (the annotation column) and closes D15670, which #7139 filed from its
-probe's control. Base is #7139's branch, merged with master `ada32709`. Its fixpoint seed is
-6,616,574 bytes.
+probe's control. Base is master `f50936aa` (#7141).
 
 ## The defect
 
@@ -32,6 +31,7 @@ before it. The lookup reads `CircleC`, which is no arm, and every spelling of th
   arms), `as` and a sub-union target, each with `CircleC` declared first, and the standalone
   record beside them.
 - `tests/cases/unions/as-struct-arm.vl` prints its full `@log`, including the ARM2 cast.
-- Refresh ×2 is a fixpoint at 6,617,531 bytes (+957).
+- Refresh ×2 is a fixpoint at 6,614,659 bytes on base `f50936aa`. On #7139's tree, the change
+  cost +957 bytes.
 - The `sweep` label re-proves the population. Expected movers are D15670's class: emit reject
   to runs.
