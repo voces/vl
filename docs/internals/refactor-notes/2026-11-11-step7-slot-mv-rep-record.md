@@ -41,7 +41,13 @@ decode the population reaches.
 
 ## The price, measured
 
-<!-- candidate sweep -->
+`sweep.vl diff`, the base's fixpoint seed against the candidate's (23,883 programs):
+
+- **23,883 same**;
+- 0 bytes-only movers;
+- 0 output movers;
+- 0 `runs → not-runs`;
+- 0 new compiler traps.
 
 ## Rulings checked
 
@@ -53,7 +59,13 @@ decode the population reaches.
 
 ## Proof
 
-<!-- gates -->
+- Refresh ×2 is a fixpoint at 6,616,659 bytes (+267, the column's record allocation). After
+  merging master `f50936aa` (#7144 and later) it is 6,614,005 bytes.
+- `scripts/gate.sh` passes every row but kind-ladder sets. That row wanted the new `mrKind` field
+  in `compiler/lint.vl`'s `klFieldNames`, which this PR adds. `ladder-sets.vl` is then ok, with 24
+  sets and 18 fields, and lint-self is clean.
+- rep-fuzz is exact. The seed-size, late-demands, plumb-shape, dead-export and render-parse
+  budgets are ok, and so are the ladder, comment and sentinel budgets.
 
 ## What is left
 
