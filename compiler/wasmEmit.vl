@@ -1154,21 +1154,23 @@ import {
   unionEqAtomKindOf,
 } from "./emit_closure_sites"
 import {
+  eqKindIsRecord,
   eqRowFieldCount,
-  eqRowFieldTypeAt,
+  eqRowFieldKind,
   eqRowHeapIdx,
   eqRowOfVariant,
   eqRowTgtStructIdx,
-  eqScalarListFieldKind,
-  eqVariantListFieldKind,
+  eqScalarListKind,
+  eqVariantListKind,
   eqgCoreFeOfSlot,
   eqgElemClass,
   eqgElemEqRow,
   eqgElemHasEqRow,
   eqgInnerKind,
   eqgInnerSlot,
+  fieldRowKind,
   leqCoreKindOfAtomKind,
-  nulFieldInnerCode,
+  nulFieldInnerKind,
   retLitUnionInline,
 } from "./emit_eq_rows"
 import { cbRetVariantIdx } from "./emit_field_codes"
@@ -10836,46 +10838,46 @@ function variantFieldsComparable(vi: i32): boolean {
 // `p == a` while the identical field compares fine at its direct spelling. Most of those cores
 // exist already; `i64` and `f32` are the two the struct ladder does not serve either.
 function variantFieldComparable(vi: i32, ufi: i32): boolean {
-  const c = sFieldTypes[ufi]
-  if c == FC_NUL_NONE {
+  const c = fieldRowKind(ufi)
+  if c == "nulnone" {
     return true // `null` has one value: the core drops both reads and answers true
   }
-  if c == FC_I32 || c == FC_NUL_BOOL || c == FC_NUL_LIT_UNION {
+  if c == "i32" || c == "nulbool" {
     // i32 and boolean, and the two i32-sentinel niches that share the slot (D1180) — the struct
     // ladder's own rung. Their null rides in the value space, so `i32.eq` answers `null == null`
     // true with no guard.
     return true
   }
-  if c == FC_STR {
+  if c == "str" {
     return true // string
   }
-  if c == FC_F64 {
+  if c == "f64" {
     return true // f64
   }
-  if c == FC_I64 {
+  if c == "i64" {
     return true // i64
   }
-  if c == FC_F32 {
+  if c == "f32" {
     return true // f32
   }
-  if c == FC_CLOSURE {
+  if c == "closure" {
     return true // a function-valued field: identity (id + env)
   }
   // D974 — a nested shape field (code 15) is comparable when its shape has an interned struct
   // row, which `collectU` mints for exactly these (`internInlineShapeTy`). No row, no compare —
   // the same decline discipline every other code gets.
-  if c == FC_STRUCT { return variantNestedRow(vi, ufi) >= 0 }
+  if eqKindIsRecord(c) { return variantNestedRow(vi, ufi) >= 0 }
   // A ref-list field needs the ref-list slot its element name resolves to, both to reserve the
   // frame and to pick the element core; without one there is no compare to emit.
-  if c == FC_REF_LIST { return variantRefListFieldSlot(ufi) >= 0 }
+  if c == "reflist" { return variantRefListFieldSlot(ufi) >= 0 }
   // A BOX field is comparable when the shared box core can serve every arm (D1290).
-  if c == FC_UNION { return variantBoxFieldComparable(ufi) }
+  if c == "union" { return variantBoxFieldComparable(ufi) }
   // D1180 — a ref-niche field (`string | null`, `T[] | null`) is its non-null twin's core under
   // a null guard, so it is comparable exactly when that twin is. Same table, same guard and the
   // same admission rule as the struct ladder's: one home, two ladders.
-  const cn = nulFieldInnerCode(c)
-  if cn >= 0 { return variantFieldCodeComparable(vi, ufi, cn) }
-  eqVariantListFieldKind(c) >= 0
+  const cn = nulFieldInnerKind(c)
+  if cn != null { return variantFieldCodeComparable(vi, ufi, cn) }
+  eqVariantListKind(c) >= 0
 }
 
 // Can the shared box core serve every arm of a code-16 variant field's union? The field's
@@ -10891,16 +10893,16 @@ function variantBoxFieldComparable(ufi: i32): boolean {
 
 // The admission question keyed by an EXPLICIT code, so the niche rung above can ask it of the
 // non-null twin without re-entering the niche arm.
-function variantFieldCodeComparable(vi: i32, ufi: i32, c: i32): boolean {
-  if c == FC_I32 || c == FC_NUL_BOOL || c == FC_NUL_LIT_UNION { return true }
-  if c == FC_STR { return true }
-  if c == FC_F64 { return true }
-  if c == FC_I64 { return true }
-  if c == FC_F32 { return true }
-  if c == FC_CLOSURE { return true }
-  if c == FC_STRUCT { return variantNestedRow(vi, ufi) >= 0 }
-  if c == FC_REF_LIST { return variantRefListFieldSlot(ufi) >= 0 }
-  eqVariantListFieldKind(c) >= 0
+function variantFieldCodeComparable(vi: i32, ufi: i32, c: VKind): boolean {
+  if c == "i32" || c == "nulbool" { return true }
+  if c == "str" { return true }
+  if c == "f64" { return true }
+  if c == "i64" { return true }
+  if c == "f32" { return true }
+  if c == "closure" { return true }
+  if eqKindIsRecord(c) { return variantNestedRow(vi, ufi) >= 0 }
+  if c == "reflist" { return variantRefListFieldSlot(ufi) >= 0 }
+  eqVariantListKind(c) >= 0
 }
 
 // The ref-list slot of the code-5 variant field at flat row `ufi`, or -1 — keyed by the
@@ -10979,11 +10981,11 @@ function emitVariantFieldsEq(body: u8[], al: i32, ar: i32, vi: i32, fnIx: i32) {
     // spellings, take the null guard: the payload may legitimately be `null`, and the core
     // underneath would `struct.get` it. Without the guard an `Inner | null` arm field is
     // `vl check` rc 0 and traps on `{d: null} == {d: null}`.
-    const jc = sFieldTypes[start + j]
-    const jn = nulFieldInnerCode(jc)
-    if jn >= 0 || jc == FC_STRUCT {
+    const jc = fieldRowKind(start + j)
+    const jn = nulFieldInnerKind(jc)
+    if jn != null || eqKindIsRecord(jc) {
       let inner = jc
-      if jn >= 0 { inner = jn }
+      if jn != null { inner = jn }
       if (
         emitVariantNulFieldEq(body, al, ar, vi, j, start + j, inner, fnIx)
         < 0
@@ -11013,7 +11015,7 @@ function emitVariantNulFieldEq(
   vi: i32,
   j: i32,
   ufi: i32,
-  inner: i32,
+  inner: VKind | null,
   fnIx: i32,
 ) {
   fbLocalGet(al)
@@ -11043,7 +11045,7 @@ function emitVariantNulFieldEq(
 }
 
 function emitVariantFieldEqCore(body: u8[], vi: i32, ufi: i32, fnIx: i32) {
-  emitVariantFieldEqCoreAt(body, vi, ufi, fnIx, sFieldTypes[ufi])
+  emitVariantFieldEqCoreAt(body, vi, ufi, fnIx, fieldRowKind(ufi))
 }
 
 // The same ladder keyed by an EXPLICIT code — what the null guard re-enters at the niche's
@@ -11053,40 +11055,40 @@ function emitVariantFieldEqCoreAt(
   vi: i32,
   ufi: i32,
   fnIx: i32,
-  c: i32,
+  c: VKind | null,
 ) {
-  if c == FC_NUL_NONE {
+  if c == "nulnone" {
     // Both sides hold only `null`: drop the two reads, the field always agrees.
     fbDrop()
     fbDrop()
     fbI32Const(1)
     return 0
   }
-  if c == FC_I32 || c == FC_NUL_BOOL || c == FC_NUL_LIT_UNION {
+  if c == "i32" || c == "nulbool" {
     fbI32Bin(70) // 0x46 i32.eq — and the two i32-sentinel niches, see the gate
     return 0
   }
-  if c == FC_STR { return emitStrEqCore(body) }
-  if c == FC_STRUCT { return emitNestedShapeEq(body, vi, ufi) }
-  if c == FC_F64 {
+  if c == "str" { return emitStrEqCore(body) }
+  if eqKindIsRecord(c) { return emitNestedShapeEq(body, vi, ufi) }
+  if c == "f64" {
     fbI32Bin(97) // 0x61 f64.eq
     return 0
   }
-  if c == FC_I64 {
+  if c == "i64" {
     fbI32Bin(81) // 0x51 i64.eq
     return 0
   }
-  if c == FC_F32 {
+  if c == "f32" {
     fbI32Bin(91) // 0x5b f32.eq
     return 0
   }
   // A function-valued field is compared by IDENTITY (id + env), the same core a standalone
   // struct's code-14 field takes.
-  if c == FC_CLOSURE { return emitCloEqCore(body) }
-  if c == FC_REF_LIST {
+  if c == "closure" { return emitCloEqCore(body) }
+  if c == "reflist" {
     return emitListEqAnyRep(body, LBK_REF, variantRefListFieldSlot(ufi), fnIx)
   }
-  if c == FC_UNION {
+  if c == "union" {
     if ufi < 0 { return -1 }
     const vbN = sFieldElemName[ufi]
     const vbArms: string[] = []
@@ -11095,7 +11097,7 @@ function emitVariantFieldEqCoreAt(
     if !unionBoxEqColumns(vbN, vbArms, vbVis, vbAks) { return -1 }
     return emitUnionBoxEqStaged(body, vbArms, vbVis, vbAks, false, vbN, fnIx)
   }
-  const lk = eqVariantListFieldKind(c)
+  const lk = eqVariantListKind(c)
   if lk >= 0 { return emitListEqAnyRep(body, lk, 0, fnIx) }
   emitFail("emitProgram: unsupported variant field type in equality")
 }
@@ -20192,7 +20194,7 @@ function emitNulFieldEq(
   pathSi: i32[],
   pathFi: i32[],
   fnIx: i32,
-  inner: i32,
+  inner: VKind,
 ) {
   if emitNulFieldGuardOpen(body, lRoot, rRoot, pathSi, pathFi, fnIx) < 0 {
     return -1
@@ -20226,9 +20228,9 @@ function emitStructEqFieldInner(
   pathFi: i32[],
   fnIx: i32,
 ) {
-  const code = eqRowFieldTypeAt(si, fi)
-  const nulInner = nulFieldInnerCode(code)
-  if nulInner >= 0 {
+  const code = eqRowFieldKind(si, fi)
+  const nulInner = nulFieldInnerKind(code)
+  if nulInner != null {
     return emitNulFieldEq(
       body,
       lRoot,
@@ -20255,47 +20257,47 @@ function emitStructEqFieldAt(
   pathSi: i32[],
   pathFi: i32[],
   fnIx: i32,
-  code: i32,
+  code: VKind | null,
 ) {
   // Codes 21 (`boolean | null`) and 30 (`K | null`) share the scalar arm (D101): their null
   // rides in the value space rather than beside it, using the same `0x7f i32` storagetype
   // code 0 does, so plain `i32.eq` already answers `null == null` true and `null == "a"`
   // false with no guard needed.
-  if code == FC_NUL_NONE {
+  if code == "nulnone" {
     // A `null`-typed field holds only `null`, so the two sides always agree.
     fbI32Const(1)
     return 0
   }
-  if code == FC_I32 || code == FC_NUL_BOOL || code == FC_NUL_LIT_UNION {
+  if code == "i32" || code == "nulbool" {
     // Scalar (i32 / boolean), or an i32-sentinel niche field: a native compare.
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     fbI32Bin(70) // 0x46 i32.eq
     return 0
   }
-  if code == FC_F64 || code == FC_I64 || code == FC_F32 {
+  if code == "f64" || code == "i64" || code == "f32" {
     // A wide numeric scalar field: one native compare opcode, i32 0/1 result. The two
     // ladders (this one and `emitVariantFieldEqCore`) must not disagree about a field rep
     // — `{d: i64}` compared inside an `A | i32` union but refused outside it before this
     // arm covered i64/f32 too (D1181); one arm now serves all three widths.
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    if code == FC_F64 {
+    if code == "f64" {
       fbI32Bin(97) // 0x61 f64.eq
-    } else if code == FC_I64 {
+    } else if code == "i64" {
       fbI32Bin(81) // 0x51 i64.eq
     } else {
       fbI32Bin(91) // 0x5b f32.eq
     }
     return 0
   }
-  if code == FC_STR {
+  if code == "str" {
     // String: the element-wise string-eq loop over the two field refs.
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     return emitStrEqCore(body)
   }
-  if code == FC_STRUCT {
+  if eqKindIsRecord(code) {
     return emitStructEqNestedField(
       body,
       lRoot,
@@ -20307,16 +20309,16 @@ function emitStructEqFieldAt(
       fnIx,
     )
   }
-  if code == FC_I32_LIST {
+  if code == "list" {
     return emitStructEqI32ListField(body, lRoot, rRoot, pathSi, pathFi, fnIx)
   }
-  if code == FC_CLOSURE {
+  if code == "closure" {
     // Function-valued field: identity compare (id + env) via the closure-eq frame.
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     return emitCloEqCore(body)
   }
-  if code == FC_UNION {
+  if code == "union" {
     // A value-union / struct-union box field compares exactly as the box does at top
     // level: tag first, then the arm the tag selects, reading the two boxes off a field
     // path instead of off two operands. Columns are resolved first, so an arm set the
@@ -20341,7 +20343,7 @@ function emitStructEqFieldAt(
       }
     }
   }
-  if code == FC_REF_LIST {
+  if code == "reflist" {
     // A ref-list field compares exactly as a ref list does at top level: push the two
     // lists and hand them to the shared core, whose struct-element class already routes
     // to the stash-based `emitStructEqRec(body, -2, -3, …)`. The only addition here is
@@ -20362,7 +20364,7 @@ function emitStructEqFieldAt(
   // two lists off the field path and hand them to the generic core, whose frame
   // `leqNoteBin` reserved from the same map (`i32[]`, code 4, keeps its own arm above);
   // `f64[]`/`i64[]`/`string[]`/`f32[]`/`u8[]` fields get the same coverage here (D1020).
-  const eqSk = eqScalarListFieldKind(code)
+  const eqSk = eqScalarListKind(code)
   if eqSk >= 0 {
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
     if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
@@ -20466,21 +20468,17 @@ function eqHelpPathsOf(si: i32): i32 {
 // The leaf fields field `fi` of struct row `si` contributes to its compare, or -1. A list,
 // union box or function field counts as one: the helper's frame holds what it stages (D9962).
 function eqHelpFieldPaths(si: i32, fi: i32): i32 {
-  const code = sFieldTypeAt(si, fi)
-  if code == FC_STRUCT { return eqHelpPathsOf(sFieldTgtStructIdx(si, fi)) }
-  if code == FC_STR || code == FC_NUL_STR { return 1 }
-  if code == FC_NUL_NONE || code == FC_I32 || code == FC_NUL_BOOL { return 1 }
-  if code == FC_NUL_LIT_UNION || code == FC_F64 || code == FC_I64 { return 1 }
-  if code == FC_F32 || code == FC_UNION || code == FC_CLOSURE { return 1 }
-  if code == FC_NUL_CLOSURE || code == FC_I32_LIST || code == FC_REF_LIST {
-    return 1
-  }
+  const code = eqRowFieldKind(si, fi)
+  if eqKindIsRecord(code) { return eqHelpPathsOf(sFieldTgtStructIdx(si, fi)) }
+  if code == "str" || code == "nulstr" { return 1 }
+  if code == "nulnone" || code == "i32" || code == "nulbool" { return 1 }
+  if code == "f64" || code == "i64" { return 1 }
+  if code == "f32" || code == "union" || code == "closure" { return 1 }
+  if code == "nulclosure" || code == "list" || code == "reflist" { return 1 }
   // Every other list code, nullable or not; a map field has no compare.
-  const inner = nulFieldInnerCode(code)
-  if inner == FC_I32_LIST || inner == FC_REF_LIST { return 1 }
-  if eqScalarListFieldKind(code) >= 0 || eqScalarListFieldKind(inner) >= 0 {
-    return 1
-  }
+  const inner = nulFieldInnerKind(code)
+  if inner == "list" || inner == "reflist" { return 1 }
+  if eqScalarListKind(code) >= 0 || eqScalarListKind(inner) >= 0 { return 1 }
   -1
 }
 
