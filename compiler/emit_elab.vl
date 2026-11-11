@@ -7596,7 +7596,9 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
     return 0
   }
   if rets.length > 0 && !elabHolderCanHoldReturned(h, from, rec) { return 0 }
-  if copies.length > 0 && !elabHolderCopiesHold(h, copies, rec) { return 0 }
+  if copies.length > 0 && !elabHolderCopiesHold(h, copies, rec, from) {
+    return 0
+  }
   const ms: i32[] = []
   let two = hands.length > 0
     || c < 0
@@ -7623,11 +7625,27 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
   const at = elabRecTable.length - 1
   elabTriplePut(elabHolderRecs, h, from, at)
   if c >= 0 { elabTriplePut(elabResKeeps, c, from, 1) }
-  // Each copy holds the same record, and each call through it takes its member.
+  // Each copy holds the same record, each call through it takes its member, and each hand of
+  // it delivers the record as the holder's own does.
   for w in copies {
     elabTriplePut(elabHolderRecs, w, from, at)
     for t in elabResThrough.get(w) ?? [] {
       elabTriplePut(elabThroughMembers, t, from, elabCallSigMember(t, rec))
+    }
+    const wh = elabResHands.get(w) ?? []
+    let wj = 0
+    while wj + 1 < wh.length {
+      const whm = elabHandMemberOf(wh[wj], wh[wj + 1], from, rec)
+      if whm >= 0 {
+        const row = elabHandMembers.get(wh[wj]) ?? []
+        row.push(from)
+        row.push(wh[wj + 1])
+        row.push(whm)
+        elabHandMembers[wh[wj]] = row
+      } else {
+        elabTriplePut(elabArgRecs, wh[wj] * 64 + wh[wj + 1], from, at)
+      }
+      wj = wj + 2
     }
   }
   let i = 0
@@ -7681,20 +7699,39 @@ function elabHolderCanHoldReturned(h: i32, from: i32, rec: i32[]): boolean {
   true
 }
 
-// Whether every copy in `copies` of holder `h` can hold record `rec`: it is read only by calls
-// through it at the record's signatures, in its own function, which is the function declaring
-// `h` or a lambda nested in it that captures `h`. Pure, so the holder and its copies are recorded
-// together or not at all.
-function elabHolderCopiesHold(h: i32, copies: i32[], rec: i32[]): boolean {
+// Whether every copy in `copies` of holder `h` can hold record `rec` in instance `from`: it is
+// read only by calls through it at the record's signatures and by hands the holder's own would
+// take, in its own function, which is the function declaring `h` or a lambda nested in it that
+// captures `h`. Pure, so the holder and its copies are recorded together or not at all.
+function elabHolderCopiesHold(
+  h: i32,
+  copies: i32[],
+  rec: i32[],
+  from: i32,
+): boolean {
   const fd = elabEnclosingFn(h)
+  // A module-scope `const` is one record whichever function reads it.
+  const hn = nodeAt(h)
+  const global = fd == -1 && hn is LetDecl && hn.letKw == "const"
   for w in copies {
     const wf = elabEnclosingFn(w)
     const through = elabResThrough.get(w) ?? []
+    const hands = elabResHands.get(w) ?? []
     if (
-      !elabLambdaWithin(wf, fd)
-      || through.length != (elabResReads.get(w) ?? 0)
+      !global && !elabLambdaWithin(wf, fd)
+      || through.length + hands.length / 2 != (elabResReads.get(w) ?? 0)
     ) {
       return false
+    }
+    let j = 0
+    while j + 1 < hands.length {
+      if (
+        !elabHandTakesRecord(hands[j], hands[j + 1], from, rec)
+        && elabHandMemberOf(hands[j], hands[j + 1], from, rec) < 0
+      ) {
+        return false
+      }
+      j = j + 2
     }
     for t in through {
       if elabEnclosingFn(t) != wf || elabCallSigMember(t, rec) < 0 {
@@ -7775,7 +7812,12 @@ function elabHolderLinkedHolds(
     + copies.length
     + elabResLinkReads(g)
   if reads != (elabResReads.get(g) ?? 0) { return false }
-  if copies.length > 0 && !elabHolderCopiesHold(g, copies, rec) { return false }
+  for w in copies {
+    if (elabResHands.get(w) ?? []).length > 0 { return false }
+  }
+  if copies.length > 0 && !elabHolderCopiesHold(g, copies, rec, from) {
+    return false
+  }
   for t in through {
     if elabEnclosingFn(t) != fd || elabCallSigMember(t, rec) < 0 {
       return false
