@@ -257,39 +257,36 @@ const ANNTAIL = `function pick(k: i32): i32 | f64 {
 print(pick(1))
 `;
 
-// A field write into a binding stored at a container's wider build (D14810): the value is boxed
-// at the field of the record it is stored as, not of its checked type.
+// A field write into a binding stored at a wider build (D14810): the value is boxed at the field of
+// the record it is stored as, not of its checked type. A literal binding is that build; a maker's
+// call no longer is, since it is copied where it lands wider.
 const STOREWRITE = `type J = { f: i32 | null }
-function mk() { { f: 4 } }
 function back(r) { return r }
-const wideJ: J = mk()
-const xs = [mk()]
+const o = { f: 4 }
+const xs = [o]
+const wideJ: J[] = [o]
 const b = back(xs[0])
 b.f = 9
 print(xs[0].f)
-print(wideJ.f ?? 0)
+print(wideJ[0].f ?? 0)
 `;
 
-// A field write into a parameter whose every call hands it a value built at a wider record: an
-// annotated one instanced at the build, and a hole one.
+// A field write into a hole parameter whose call hands it a value built at a wider record, a
+// literal binding built where a list takes it.
 const PARAMWRITE = `type J = { f: i32 | null }
-function mk() { { f: 4 } }
-function w(a: { f: i32 }) {
-  a.f = 9
-  a.f
-}
 function h(a) {
   a.f = 7
   a.f
 }
-const d: J = mk()
-print(w(mk()))
-print(h(mk()))
-print(d.f ?? 0)
+const o = { f: 4 }
+const d: J[] = [o]
+print(h(o))
+print(d[0].f ?? 0)
 `;
 
-// A literal stored into a map before the store that decides the map's wider build: it is built at
-// that build, so its field is boxed at the build's field.
+// A literal stored into a map before a maker's call stored there that a delivery takes wider: the
+// call is copied where it lands, so the map keeps its own build and no field is boxed. The
+// spelling where a literal binding built wider is stored instead is D15718.
 const STORELIT = `type J = { f: i32 | null }
 function mk() { { f: 4 } }
 const wideJ: J = mk()
@@ -454,7 +451,7 @@ Deno.test({
   name: "box-dst shadow: a field write takes the receiver's storage",
   ignore,
   fn: () =>
-    expectRows("storewrite", STOREWRITE, DROP_NONE, "nested agree=2; table=2"),
+    expectRows("storewrite", STOREWRITE, DROP_NONE, "nested agree=3; table=3"),
 });
 
 Deno.test({
@@ -468,7 +465,7 @@ Deno.test({
   name: "box-dst shadow: a stored literal's field takes the container's build",
   ignore,
   fn: () =>
-    expectRows("storelit", STORELIT, DROP_NONE, "nested agree=2; table=2"),
+    expectRows("storelit", STORELIT, DROP_NONE, ""),
 });
 
 Deno.test({

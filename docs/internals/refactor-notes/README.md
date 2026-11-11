@@ -9,8 +9,36 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-11-step7-exit-criteria](2026-11-11-step7-exit-criteria.md): Step 7 exit criteria: what stands between master and deleting §7's L1, L2 and L6 lines.
+- [2026-11-11-step7-decl-identity-row-key-census](2026-11-11-step7-decl-identity-row-key-census.md): Step 7: does a row key need declaration identity? Census and proposal: build none.
 - [2026-11-11-step7-retkind-readers-graded](2026-11-11-step7-retkind-readers-graded.md): Step 7: the return-kind readers and `buildFnMap`, graded and ruled.
 - [2026-11-11-step7-closing-census-3](2026-11-11-step7-closing-census-3.md): Step 7 closing census 3: the Deletes, Absorbs and Closes lists as a checklist.
+- [2026-11-11-step7-union-reg-ria-aligned](2026-11-11-step7-union-reg-ria-aligned.md): Step 7 L6: the last positional atom pairing follows the member.
+- [2026-11-11-step7-union-reg-clo-sig-slot](2026-11-11-step7-union-reg-clo-sig-slot.md): Step 7 L6: a closure signature's tag slot is keyed by its type, and its render is the slot's name.
+- [2026-11-11-step7-union-reg-arm-tys](2026-11-11-step7-union-reg-arm-tys.md): Step 7 L6: a shape arm's type is found by the canonical key, and two atom pairings follow the member.
+- [2026-11-11-step7-slot-mv-kind-column](2026-11-11-step7-slot-mv-kind-column.md): Step 7 slot layer: the map-value bank's MVK code column is deleted, and its readers read the rep record.
+- [2026-11-11-step7-rep-tree-covers-flat](2026-11-11-step7-rep-tree-covers-flat.md): Step 7: the rep tree's kind covers every type the flat arms do.
+- [2026-11-11-step7-mfkind-retired](2026-11-11-step7-mfkind-retired.md): Step 7 codecs: `MfKind` retired for `ListKind`, the non-null list `VKind`s.
+- [2026-11-11-step7-lbk-list-encoders](2026-11-11-step7-lbk-list-encoders.md): Step 7 codecs: the spread's build-code encoder and decoder ask the list-rep table.
+- [2026-11-11-step7-l2-shape-rekey-census](2026-11-11-step7-l2-shape-rekey-census.md): Step 7 L2 §7: what keying the inline-shape interner by type would merge and move.
+- [2026-11-11-step7-l2-shape-field-split-mismatch](2026-11-11-step7-l2-shape-field-split-mismatch.md): Step 7 L2 §7: the field walk's 8 name mismatches, one closed by the type and seven named.
+- [2026-11-11-step7-l2-mono-fn-value-spelling-deleted](2026-11-11-step7-l2-mono-fn-value-spelling-deleted.md): Step 7 L2 §7: the function-value coercion carries no spelling (render-parse 61 → 60).
+- [2026-11-11-step7-l2-mono-fn-value-pins-by-type](2026-11-11-step7-l2-mono-fn-value-pins-by-type.md): Step 7 L2 §7: a generic function value is pinned from its slot's type, not its spelling (render-parse 62 → 61).
+- [2026-11-11-step7-l2-mono-answered-not-spelled](2026-11-11-step7-l2-mono-answered-not-spelled.md): Step 7 L2 §7: three mono sites that spelled a type only to ask whether one was there.
+- [2026-11-11-step7-l2-fn-walk-declined-arrow](2026-11-11-step7-l2-fn-walk-declined-arrow.md): Step 7 L2 §7: the function-type walk stops at a function type whose arrow it cannot split.
+- [2026-11-11-step7-l2-arrlit-placeholder-rekey](2026-11-11-step7-l2-arrlit-placeholder-rekey.md): Step 7 L2 §7: a list literal's placeholder element name no longer keys its row.
+- [2026-11-11-step7-l2-arrlit-mint-hint](2026-11-11-step7-l2-arrlit-mint-hint.md): Step 7 L2 §7: the list mint passes the literal's own element type where the keys agree.
+- [2026-11-11-step7-l2-arrlit-instance-closed](2026-11-11-step7-l2-arrlit-instance-closed.md): Step 7 L2 §7: a list literal whose template build type is open keys by the one closed type its instances build at.
+- [2026-11-11-step7-inst-list-lit-census](2026-11-11-step7-inst-list-lit-census.md): Step 7 inst: list literals open in their element hold function values, so no per-instance record is missing.
+- [2026-11-11-step7-inst-is-test-tys](2026-11-11-step7-inst-is-test-tys.md): Step 7 inst: each instance banks its own `is`-test type, and the cloned test reads it.
+- [2026-11-11-step7-famb-decl-twin-rows](2026-11-11-step7-famb-decl-twin-rows.md): Step 7 slot layer, family B, 8a: two same-shape declarations answer one struct row.
+- [2026-11-11-step7-codecs-mf-nj-stood](2026-11-11-step7-codecs-mf-nj-stood.md): Step 7 codecs: `listRepOfMf`, `njVKind` and `listFitStoodKind` deleted.
+- [2026-11-11-step7-codec-field-store-own-type](2026-11-11-step7-codec-field-store-own-type.md): Step 7 codecs: an anonymous row in a generic body records its own field types.
+- [2026-11-11-step7-closing-census-2](2026-11-11-step7-closing-census-2.md): Step 7 closing census, re-run: the Deletes, Absorbs and Closes lists against master.
+- [2026-11-11-l1-instance-readers-classified](2026-11-11-l1-instance-readers-classified.md): L1: the 94 raw instance readers classified, and the first batch read the bank.
+- [2026-11-11-l1-instance-readers-batch-2](2026-11-11-l1-instance-readers-batch-2.md): L1: four more instance readers read the per-instance bank.
+- [2026-11-11-l1-instance-reader-recount](2026-11-11-l1-instance-reader-recount.md): L1: the instance readers re-counted.
+- [2026-11-11-d15651-hole-handed-two-named-functions](2026-11-11-d15651-hole-handed-two-named-functions.md): D15651: a record of a named function beside a hole handed two named functions.
 - [2026-11-11-step7-vkind-ty-list-ladders-2](2026-11-11-step7-vkind-ty-list-ladders-2.md): Step 7: the last two arena-type list ladders are descriptor reads at their callers.
 - [2026-11-11-step7-vkind-name-ladders](2026-11-11-step7-vkind-name-ladders.md): Step 7: the rendered-name list ladders lose two callers, and what keeps the rest.
 - [2026-11-11-step7-vkind-forin-walk-kind](2026-11-11-step7-vkind-forin-walk-kind.md): Step 7: a for-in's `#l` temp reads its iterable's rep, and the `fiLk` ladder is deleted.
