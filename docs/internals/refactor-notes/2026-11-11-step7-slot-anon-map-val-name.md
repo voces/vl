@@ -44,7 +44,12 @@ The gate keeps its old answer by construction. The stored name was measured unre
 
 ## Proof
 
-<!-- gates -->
+- One refresh, at 6,618,875 bytes (seed-size +0.5% against its baseline).
+- `cases_wasm`: 7,440 passed, 0 failed.
+- Distilled `regress.vl`: 0 `runs → not-runs` classes.
+- rep-fuzz is exact. lint-self is clean.
+- `ladder-sets` is ok. Late-demands is 6 against a baseline of 6.
+- The export, ladder, comment, sentinel, scan and render-parse budgets all exit 0.
 
 ## What is left
 
