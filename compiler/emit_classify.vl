@@ -193,6 +193,7 @@ import {
   mkNullableTy,
   mkObjTy,
   numLitUnionBaseTy,
+  objFieldType,
   oneListUnionRender,
   structNameOfTy,
   tyArrayElemIx,
@@ -457,6 +458,7 @@ import {
   arrLitRlSlotAt,
   mvUnionIsScalarNull,
   mvValInnerRlSlotAt,
+  mvValTyIxAt,
   rlElemIsNulNiche,
   structIdxOfElemTy,
   tyRefArrElemOf,
@@ -470,6 +472,7 @@ import {
 } from "./emit_mv_slots"
 import {
   annDeclVariantRow,
+  declVariantRowAt,
   globalLetOfSid,
   variantIndexOf,
 } from "./emit_local_slots"
@@ -1124,7 +1127,7 @@ export function cloRetValSlot(fe: i32): i32 {
   }
   // A declared variant takes its name's row.
   if k == "variant" {
-    const vi = variantIndexOf(structNameOfTy(t))
+    const vi = declVariantRowAt(fd.fnRet, t)
     if vi >= 0 { return vi }
   }
   repSlotOfKind(k, repSigSlotTyOf(t))
@@ -1660,7 +1663,10 @@ export function exprNulKind(exprIx: i32, fnIx: i32): VKind | null {
   if e is Ident || e is Member || e is Index {
     const rr = readRepOf(exprIx, fnIx)
     if rr.rrStore == "union" && rr.rrRead == "union" { return null }
-    if rr.rrRead != "" { return readNulVKind(rr.rrRead) }
+    if rr.rrRead != "" {
+      const rk = rr.rrKind
+      return if rk == null { null } else { vkNulKindOf(rk) }
+    }
   }
   tk
 }
@@ -4477,7 +4483,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
         let mCov = unionMemberTysOfAB(
           13,
           mun,
-          unionDeclTyIxOfExpr(m.memObj, fnIx),
+          unionBoxTyIxOfExpr(m.memObj, fnIx),
           mTys,
         )
         if mTys.length != mAtoms.length { mCov = false }
@@ -8978,11 +8984,10 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
     BinExpr => structIndexOrRep(structIndexOfJoinStore(e, exprIx, fnIx), exprIx, fnIx)
     Ident => structIndexOrRep(structIndexOfIdentStore(e, exprIx, fnIx), exprIx, fnIx)
     Member => structIndexOrRep(structIndexOfMemberStore(e, exprIx, fnIx), exprIx, fnIx)
-    OptMember => structIndexOrRep(recvFieldStructRow(e.omObj, e.omProp, fnIx), exprIx, fnIx)
     Index => structIndexOrRep(structIndexOfIndexStore(e, exprIx, fnIx), exprIx, fnIx)
     Call => structIndexOrRep(structIndexOfCallStore(e, exprIx, fnIx), exprIx, fnIx)
     // Every other node answers by its rep.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => structIndexOfRep(exprIx, fnIx)
+    OptMember | NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => structIndexOfRep(exprIx, fnIx)
   }
 }
 
@@ -10019,6 +10024,32 @@ function asResultIsOneAtom(ty: i32): boolean {
     return true
   }
   false
+}
+
+// The union `unionNameOfExpr` names for a read of a box: a map read's value union, else the
+// storage a narrowed read is narrowed out of, else `unionDeclTyIxOfExpr`.
+export function unionBoxTyIxOfExpr(exprIx: i32, fnIx: i32): i32 {
+  const r = unionBoxStoreTyOf(exprIx, fnIx)
+  if r >= 0 { r } else { unionDeclTyIxOfExpr(exprIx, fnIx) }
+}
+
+// `unionBoxTyIxOfExpr` short of its declaration fallback: a map read's value union, else the
+// storage a narrowed read is narrowed out of; -1 for any other read.
+export function unionBoxStoreTyOf(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const r = unwrapParen(exprIx)
+  if r >= P.nodes.length { return -1 }
+  const e = nodeAt(r)
+  if e is Index {
+    if exprMap(e.idxArr, fnIx) {
+      const sh = mapShapeOfExpr(e.idxArr, fnIx)
+      if sh >= 0 {
+        const vt = mvValTyIxAt(sh)
+        if vt >= 0 { return vt }
+      }
+    }
+  }
+  readNarrowedStoreAt(r, fnIx)
 }
 
 // The union NAME the expression at `exprIx` produces (the name-typed mirror of the
@@ -11256,6 +11287,13 @@ function exprStoredRepTy(exprIx: i32, fnIx: i32, depth: i32): i32 {
     const bt = if b >= 0 && b < T.tys.length { T.tys[b] } else { null }
     if bt is TyArray && bt.aElem >= 0 { return bt.aElem }
   }
+  // A field read of a record built at another record is that record's field (D15694).
+  if e is Member {
+    const b = exprRepTy(e.memObj, fnIx, depth - 1)
+    const bt = if b >= 0 && b < T.tys.length { T.tys[b] } else { null }
+    const ft = if bt is TyObj { objFieldType(bt, e.memProp) } else { -1 }
+    if ft >= 0 && (tyIsRefArray(ft) || tyAt(ft) is TyObj) { return ft }
+  }
   // A call is built bottom-up: a plain function's result rep (`fnRetRepTy`), or a list `.map`
   // over that of its callback.
   const callee = if e is Call && e.callFn >= 0 && e.callFn < P.nodes.length { nodeAt(e.callFn) } else { null }
@@ -11838,30 +11876,6 @@ export function arrLitIsF32(arrIx: i32, fnIx: i32) {
 // True if `exprIx` evaluates to a `u8[]`: a projection of `exprListRep`.
 export function exprU8Array(exprIx: i32, fnIx: i32) {
   exprListRep(exprIx, fnIx) == "u8list"
-}
-
-// Each read rep a read can read a list as, beside the list kind it reads: a list, a nullable
-// list's base, or the list a union box's atom code names.
-const READ_LIST_FROM: string[] = [
-  "list", "nullist", "atom7", "atom17", "atom18", "u8list", "nulu8list",
-  "atom13", "i64list", "nuli64list", "atom10", "f32list", "nulf32list",
-  "atom12", "f64list", "nulf64list", "atom8", "strlist", "nulstrlist", "atom9",
-  "reflist", "nulreflist",
-]
-const READ_LIST_TO: VKind[] = [
-  "list", "list", "list", "list", "list", "u8list", "u8list", "u8list",
-  "i64list", "i64list", "i64list", "f32list", "f32list", "f32list", "f64list",
-  "f64list", "f64list", "strlist", "strlist", "strlist", "reflist", "reflist",
-]
-
-// The list kind a read of read rep `r` reads, or null for a read of anything else.
-function readListKindOf(r: string): VKind | null {
-  let i = 0
-  while i < READ_LIST_FROM.length {
-    if READ_LIST_FROM[i] == r { return READ_LIST_TO[i] }
-    i = i + 1
-  }
-  null
 }
 
 // The non-null list rep the expression at `exprIx` produces, a nullable list's being its list's,
@@ -13104,7 +13118,7 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   const an = identFnTypeAnnNameOfRead(atIx, fnIx)
   if an != "" {
     // The arena builds the key where the binding carries a plain annotation; `cloNameSigKeyTy`
-    // is the fall-through, and parses the rendered name only where the type cannot key it. B255.
+    // is the fall-through over the joined or callee type. B255.
     const jnd = identFnTypeAnnNodeOfRead(atIx, fnIx)
     if jnd >= 0 {
       const jty = nodeTyIxOf(jnd)
@@ -13129,7 +13143,7 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
     let aty = -1
     if jnd >= 0 { aty = nodeTyIxOf(jnd) }
     if aty < 0 { aty = cty }
-    const ak = cloNameSigKeyTy(an, aty)
+    const ak = cloNameSigKeyTy(aty)
     if ak != "" { return ak }
   }
   // A read whose type at this instance is a closed function type is keyed by that type, a lifted
@@ -13824,6 +13838,8 @@ export function classifyStateReset() {
 type ReadRep = {
   rrStore: string,
   rrRead: string,
+  // The rep kind the read reads as, null for an atom id or a read with no rep.
+  rrKind: VKind | null,
   rrConv: i32,
   // The storage's type, and a map value read's mv slot; -1 for none.
   rrStoreTy: i32,
@@ -13889,18 +13905,30 @@ function readRepMoved(): boolean {
   moved
 }
 
+// What a read's storage holds: `rsTag` names it and `rsKind` is its cell's rep kind, null for a
+// storage that is no rep kind (`litatom`, `nullitatom`, `type`, an unlowered code, or "").
+type ReadStore = { rsTag: string, rsKind: VKind | null }
+
+function rsOfKind(k: VKind): ReadStore { { rsTag: k, rsKind: k } }
+function rsOfTag(t: string): ReadStore { { rsTag: t, rsKind: null } }
+
 // What a name, field, element or call read's storage holds: its cell's kind, `litatom` for an
 // interned literal-union id, `nullitatom` for that id or the `-1` null, `type` for a name with no
 // slot whose own type is covered, or "" for a node that is no such read or has no storage.
 export function readStoreOf(ix: i32, fnIx: i32): string {
+  readStoreAt(ix, fnIx).rsTag
+}
+
+// `readStoreOf` with the storage's rep kind beside its name.
+function readStoreAt(ix: i32, fnIx: i32): ReadStore {
   const rx = unwrapParen(ix)
-  if rx < 0 { return "" }
+  if rx < 0 { return rsOfTag("") }
   const e = nodeAt(rx)
-  let st = ""
+  let st = rsOfTag("")
   if e is Ident {
     const k = identStoreVKind(rx, fnIx)
-    if k != null { st = k }
-    else if repOfNode(rx, fnIx).rdCovered == 1 { st = "type" }
+    if k != null { st = rsOfKind(k) }
+    else if repOfNode(rx, fnIx).rdCovered == 1 { st = rsOfTag("type") }
   } else if e is Member {
     st = readFieldStoreKind(rx, fnIx)
   } else if e is Index {
@@ -13936,19 +13964,23 @@ function readRepKinds(ix: i32, fnIx: i32): ReadRep {
   const none: ReadRep = {
     rrStore: "",
     rrRead: "",
+    rrKind: null,
     rrConv: 0,
     rrStoreTy: -1,
     rrMv: -1,
   }
   if rx < 0 { return none }
   const e = nodeAt(rx)
-  const st = readStoreOf(rx, fnIx)
+  const sa = readStoreAt(rx, fnIx)
+  const st = sa.rsTag
   if st == "" { return none }
   // A read with no slot yet has no storage to read: it reads at its own type.
   if st == "type" {
+    const td = repOfNode(rx, fnIx)
     return {
       rrStore: "type",
-      rrRead: repOfNode(rx, fnIx).rdKind,
+      rrRead: td.rdKind,
+      rrKind: td.rdKind,
       rrConv: 7,
       rrStoreTy: -1,
       rrMv: -1,
@@ -13959,13 +13991,21 @@ function readRepKinds(ix: i32, fnIx: i32): ReadRep {
     return {
       rrStore: st,
       rrRead: "nulbool",
+      rrKind: "nulbool",
       rrConv: 2,
       rrStoreTy: -1,
       rrMv: -1,
     }
   }
   if nk == 2 {
-    return { rrStore: st, rrRead: "nulstr", rrConv: 2, rrStoreTy: -1, rrMv: -1 }
+    return {
+      rrStore: st,
+      rrRead: "nulstr",
+      rrKind: "nulstr",
+      rrConv: 2,
+      rrStoreTy: -1,
+      rrMv: -1,
+    }
   }
   let ak = -1
   let ck = 0
@@ -13986,18 +14026,27 @@ function readRepKinds(ix: i32, fnIx: i32): ReadRep {
     return {
       rrStore: st,
       rrRead: "atom" + i32ToStr(ak),
+      rrKind: null,
       rrConv: 1,
       rrStoreTy: -1,
       rrMv: -1,
     }
   }
   if ck == RC_MAP {
-    return { rrStore: st, rrRead: "map", rrConv: 3, rrStoreTy: -1, rrMv: -1 }
+    return {
+      rrStore: st,
+      rrRead: "map",
+      rrKind: "map",
+      rrConv: 3,
+      rrStoreTy: -1,
+      rrMv: -1,
+    }
   }
   if ck == RC_REF_LIST {
     return {
       rrStore: st,
       rrRead: "reflist",
+      rrKind: "reflist",
       rrConv: 3,
       rrStoreTy: -1,
       rrMv: -1,
@@ -14011,6 +14060,7 @@ function readRepKinds(ix: i32, fnIx: i32): ReadRep {
       return {
         rrStore: st,
         rrRead: md.rdKind,
+        rrKind: md.rdKind,
         rrConv: 4,
         rrStoreTy: -1,
         rrMv: -1,
@@ -14024,6 +14074,7 @@ function readRepKinds(ix: i32, fnIx: i32): ReadRep {
       return {
         rrStore: st,
         rrRead: nd.rdKind,
+        rrKind: nd.rdKind,
         rrConv: 4,
         rrStoreTy: -1,
         rrMv: -1,
@@ -14037,6 +14088,7 @@ function readRepKinds(ix: i32, fnIx: i32): ReadRep {
       return {
         rrStore: st,
         rrRead: "nulbool",
+        rrKind: "nulbool",
         rrConv: 6,
         rrStoreTy: -1,
         rrMv: -1,
@@ -14050,26 +14102,44 @@ function readRepKinds(ix: i32, fnIx: i32): ReadRep {
     if nd.rdCovered == 1 && !readKindIsNul(nd.rdKind) {
       if readNarrowedStoreAt(rx, fnIx) >= 0 || nd.rdKind == readNonNulKind(st) {
         // An atom's type reps as the i32 holding its id, so a de-nulled niche names the atom.
-        const dk = if st == "nullitatom" { "litatom" } else { nd.rdKind }
-        return { rrStore: st, rrRead: dk, rrConv: 5, rrStoreTy: -1, rrMv: -1 }
+        if st == "nullitatom" {
+          return {
+            rrStore: st,
+            rrRead: "litatom",
+            rrKind: null,
+            rrConv: 5,
+            rrStoreTy: -1,
+            rrMv: -1,
+          }
+        }
+        return {
+          rrStore: st,
+          rrRead: nd.rdKind,
+          rrKind: nd.rdKind,
+          rrConv: 5,
+          rrStoreTy: -1,
+          rrMv: -1,
+        }
       }
     }
   }
   // A read narrowed to a list arm reads the arm's own list, which an `is` test over a list of
   // another element makes apart from the cell it narrows (D4934).
-  if readListKindOf(st) != null && readNarrowedStoreAt(rx, fnIx) >= 0 {
+  const sk = sa.rsKind
+  if sk != null && vkListClass(sk) != 0 && readNarrowedStoreAt(rx, fnIx) >= 0 {
     const ld = repOfNode(rx, fnIx)
     if ld.rdCovered == 1 && vkListClass(ld.rdKind) == 1 && ld.rdKind != st {
       return {
         rrStore: st,
         rrRead: ld.rdKind,
+        rrKind: ld.rdKind,
         rrConv: 8,
         rrStoreTy: -1,
         rrMv: -1,
       }
     }
   }
-  { rrStore: st, rrRead: st, rrConv: 0, rrStoreTy: -1, rrMv: -1 }
+  { rrStore: st, rrRead: st, rrKind: sk, rrConv: 0, rrStoreTy: -1, rrMv: -1 }
 }
 
 // The variant table's row of the nullable variant read `rr`'s storage holds, or -1: a map value's
@@ -14161,20 +14231,6 @@ function letInFnBody(d: i32): boolean {
   if (letDeclFn.get(d) ?? -1) >= 0 { return true }
   const o = declOrigOf(d)
   o >= 0 && (letDeclFn.get(o) ?? -1) >= 0
-}
-
-// The nullable rep kinds a read can read as.
-const READ_NUL_VKINDS: VKind[] = [
-  "nulvariant", "nulstruct", "nullist", "nulstr", "nulbool", "nulreflist", "nulclosure",
-  "nulstrlist", "nulf64list", "nuli64list", "nulf32list", "nulu8list", "nulmap", "nulnone",
-]
-
-// The nullable rep kind a read reads as, or null for a read that reads no nullable rep.
-function readNulVKind(k: string): VKind | null {
-  for v in READ_NUL_VKINDS {
-    if v == k { return v }
-  }
-  null
 }
 
 // Whether `k` is a nullable rep kind.
@@ -14273,22 +14329,22 @@ function fieldReadIsNulLitAtom(rx: i32, fnIx: i32): boolean {
 function fieldCodeIsNulLitAtom(fc: i32): boolean { fc == FC_NUL_LIT_UNION }
 
 // The kind a field read's storage holds, by its field code.
-function readFieldStoreKind(rx: i32, fnIx: i32): string {
+function readFieldStoreKind(rx: i32, fnIx: i32): ReadStore {
   const fc = memberFieldCode(rx, fnIx)
-  if fieldCodeIsNulLitAtom(fc) { return "nullitatom" }
+  if fieldCodeIsNulLitAtom(fc) { return rsOfTag("nullitatom") }
   // An interned literal-union id, which the code column alone spells as a plain i32 field; a
   // receiver with no field code (an instance's hole) is asked too.
   if gLitUnionUsed != 0 && (fc == FC_I32 || fc < 0) {
     const fm = nodeAt(rx)
     if fm is Member {
-      if memberReadIsLitAtom(fm, rx, fnIx) { return "litatom" }
+      if memberReadIsLitAtom(fm, rx, fnIx) { return rsOfTag("litatom") }
     }
   }
-  if fc == FC_UNION { return "union" }
-  if fc == FC_MAP { return "map" }
-  if fc == FC_NUL_MAP { return "nulmap" }
-  if fc == FC_NUL_STR { return "nulstr" }
-  if fc == FC_NUL_BOOL { return "nulbool" }
+  if fc == FC_UNION { return rsOfKind("union") }
+  if fc == FC_MAP { return rsOfKind("map") }
+  if fc == FC_NUL_MAP { return rsOfKind("nulmap") }
+  if fc == FC_NUL_STR { return rsOfKind("nulstr") }
+  if fc == FC_NUL_BOOL { return rsOfKind("nulbool") }
   // A code-15 field holds a struct whether or not its type adds `null`, so its type names which.
   if fc == FC_STRUCT {
     const sd = repOfNode(rx, fnIx)
@@ -14298,15 +14354,15 @@ function readFieldStoreKind(rx: i32, fnIx: i32): string {
         || sd.rdKind == "nulvariant"
         || sd.rdKind == "variant")
     ) {
-      return sd.rdKind
+      return rsOfKind(sd.rdKind)
     }
-    return "struct"
+    return rsOfKind("struct")
   }
-  if fc == FC_NUL_CLOSURE { return "nulclosure" }
+  if fc == FC_NUL_CLOSURE { return rsOfKind("nulclosure") }
   const lk = listRepOfFieldCode(fc)
-  if lk != null { return lk }
-  if fc < 0 { return "" }
-  "fc" + i32ToStr(fc)
+  if lk != null { return rsOfKind(lk) }
+  if fc < 0 { return rsOfTag("") }
+  rsOfTag("fc" + i32ToStr(fc))
 }
 
 // Whether index read `e` reads an interned literal-union id: an atom list's element or an
@@ -14364,14 +14420,16 @@ function callResultIsNulLitAtom(rx: i32, fnIx: i32): boolean {
 
 // What a call's result is stored as: "nullitatom" for the `K | null` niche, "litatom" for an
 // interned literal-union id, its lowered list kind, "nulnone" for the `null` unit, else "".
-function readCallStoreKind(e: Call, rx: i32, fnIx: i32): string {
-  if callResultIsNulLitAtom(rx, fnIx) { return "nullitatom" }
-  if callStoreIsLitAtom(e, rx, fnIx) { return "litatom" }
+function readCallStoreKind(e: Call, rx: i32, fnIx: i32): ReadStore {
+  if callResultIsNulLitAtom(rx, fnIx) { return rsOfTag("nullitatom") }
+  if callStoreIsLitAtom(e, rx, fnIx) { return rsOfTag("litatom") }
   const ld = repOfNode(rx, fnIx)
-  if ld.rdCovered == 1 && vkListClass(ld.rdKind) != 0 { return ld.rdKind }
-  if callIsNulNone(e, rx, fnIx) { return "nulnone" }
-  if exprUnionCall(rx, fnIx) { return "union" }
-  ""
+  if ld.rdCovered == 1 && vkListClass(ld.rdKind) != 0 {
+    return rsOfKind(ld.rdKind)
+  }
+  if callIsNulNone(e, rx, fnIx) { return rsOfKind("nulnone") }
+  if exprUnionCall(rx, fnIx) { return rsOfKind("union") }
+  rsOfTag("")
 }
 
 // Whether call `rx` hands back an interned literal-union id. The callee's lowered result decides:
@@ -14421,63 +14479,71 @@ function idxReadNulLitAtom(e: Index, fnIx: i32): i32 {
 }
 
 // The kind an element or map-value read's slot holds.
-function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): string {
+function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): ReadStore {
   // An interned literal-union id: an atom list's element or an atom-valued map's value, and the
   // `K | null` niche where the cell also holds the `-1` null.
   if gLitUnionUsed != 0 && idxReadIsLitAtom(e, rx, fnIx) {
-    if idxReadNulLitAtom(e, fnIx) == 2 { return "nullitatom" }
-    return "litatom"
+    if idxReadNulLitAtom(e, fnIx) == 2 { return rsOfTag("nullitatom") }
+    return rsOfTag("litatom")
   }
   if exprRefArray(e.idxArr, fnIx) {
     const k = refListElemKind(e.idxArr, fnIx)
-    if k != null { return k }
-    return "reflist?"
+    if k != null { return rsOfKind(k) }
+    return rsOfTag("reflist?")
   }
   // An element of a `null[]` and a `null`-valued map's value are the `null` unit.
   if exprMap(e.idxArr, fnIx) {
-    if mapTyValIsNullUnit(mapRecvTyIn(e.idxArr, fnIx)) { return "nulnone" }
+    if mapTyValIsNullUnit(mapRecvTyIn(e.idxArr, fnIx)) {
+      return rsOfKind("nulnone")
+    }
   } else if arrElemIsNullUnitAt(e.idxArr, fnIx) {
-    return "nulnone"
+    return rsOfKind("nulnone")
   }
   // A string list's element is a string ref, or a nullable one in a list of nullable strings.
   if exprStringArray(e.idxArr, fnIx) {
     const sk = refListElemKind(e.idxArr, fnIx)
-    if sk == "nulstr" { return "nulstr" }
-    return "str"
+    if sk == "nulstr" { return rsOfKind("nulstr") }
+    return rsOfKind("str")
   }
   const mri = mapReadMvSlot(rx, fnIx)
   if mri >= 0 {
     const v = mvValKind[mri]
-    if v == MVK_UNION { return "union" }
-    if v == MVK_STRUCT { return "struct" }
-    return "mv" + i32ToStr(v)
+    if v == MVK_UNION { return rsOfKind("union") }
+    if v == MVK_STRUCT { return rsOfKind("struct") }
+    return rsOfTag("mv" + i32ToStr(v))
   }
   // A map with no value slot here (a hole bound per instance) holds what its type says.
   const vt = readMapValTyAt(e, fnIx)
   if vt >= 0 {
     const vk = repSigKindOfTy(vt)
-    if vk != null { return vk }
-    return ""
+    if vk != null { return rsOfKind(vk) }
+    return rsOfTag("")
   }
   // A scalar list's element is the scalar its list holds.
   scalarListElemCell(exprListRep(e.idxArr, fnIx))
 }
 
-// Each scalar list kind beside the scalar cell its element is read from.
-const SCALAR_LIST_ELEM: string[] = [
-  "list", "i32", "u8list", "i32", "f64list", "f64", "i64list", "i64", "f32list",
-  "f32",
-]
-
-// The cell an element of list kind `k` is read from: the scalar a scalar list holds, else "".
-function scalarListElemCell(k: VKind | null) {
-  if k == null { return "" }
-  let i = 0
-  while i + 1 < SCALAR_LIST_ELEM.length {
-    if SCALAR_LIST_ELEM[i] == k { return SCALAR_LIST_ELEM[i + 1] }
-    i = i + 2
+// The cell an element of list kind `k` is read from: the scalar a scalar list holds, else none.
+function scalarListElemCell(k: VKind | null): ReadStore {
+  if k == null { return rsOfTag("") }
+  match k {
+    "list" | "u8list" => {
+      return rsOfKind("i32")
+    }
+    "f64list" => {
+      return rsOfKind("f64")
+    }
+    "i64list" => {
+      return rsOfKind("i64")
+    }
+    "f32list" => {
+      return rsOfKind("f32")
+    }
+    // Not a scalar list.
+    "i32" | "struct" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {
+      return rsOfTag("")
+    }
   }
-  ""
 }
 
 // The value type of the map an index read `e` reads, from the receiver's type in frame
