@@ -61,7 +61,7 @@ record type and layout. Base is master `d9031606`, with #7191 merged.
 
 ## Proof
 
-- Refresh is at 6,622,731 bytes.
+- Refresh is at 6,622,731 bytes on base, and 6,622,655 bytes merged with current master.
 - `regress.vl`: no runs lost.
 - `cases_wasm_*`: 7,440 passed.
 - `vl_check_codegen` and `vl_scaling_shape`: pass.
