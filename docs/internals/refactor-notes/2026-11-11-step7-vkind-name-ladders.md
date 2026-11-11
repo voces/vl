@@ -3,7 +3,7 @@
 This is conversion 3 of `2026-11-10-step7-vkind-census.md` §4: the rendered-name ladders
 `scalarListRepOfName`, `nulScalarListKind`, `annNulListKind` and `annUnionSigKind`, and
 `nulScalarListKindOfNode`'s `tyName` rung. Base is master `5edb783b` (#7136), whose fixpoint seed
-is 6,615,486 bytes. The branch stacks on #7140.
+is 6,615,486 bytes. #7140 is below it.
 
 ## What changed
 
