@@ -1,4 +1,5 @@
 import { callBuiltTy } from "./check_store_rep"
+import { emitFail } from "./emit_bytes"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { constBindsLitSet, forInBindTy } from "./check_leaf_steps"
 import {
@@ -417,11 +418,14 @@ import {
   letMapKeyKind,
   listRepOfFieldCode,
   listRepOrNull,
+  mapKeyListKind,
   nulListBase,
   paramString,
   popRecvOf,
   popTakesElem,
   vkListClass,
+  vkNonNullRefTwin,
+  vkNonNullTwin,
 } from "./emit_list_rep"
 import {
   arrElemIsNulStrAt,
@@ -867,6 +871,7 @@ import {
   msSetOfUnion,
   msSoleMemberTy,
   msTextOf,
+  rlElemUnionName,
   unRowOfCanonFolded,
   unRowOfKeyOrMembers,
   unionArmsOf,
@@ -967,8 +972,8 @@ function fnSigTokOfTy(t: i32, fx: i32): string {
 
 // The rep kind a value of type `t` takes in the lifted function `fx`: a tagged set rides its id.
 function fnSigKindOfTy(t: i32, fx: i32): VKind | null {
-  if fnTagTyIsTagged(t) { return "i32" }
-  const c = fnSigClosedTy(t, fx)
+  // The tag decision is the declared type's, which the instance it closes to does not carry.
+  const c = if fnTagTyIsTagged(t) { t } else { fnSigClosedTy(t, fx) }
   if c < 0 { return null }
   const d = repOfTy(c)
   if d.rdCovered == 0 { return null }
@@ -1178,14 +1183,6 @@ export function cloSigKeyExt(fe: i32) {
     return key + suf
   }
   ""
-}
-
-// The lifted-function position of the closure held by field `prop` of struct `si`,
-// resolved through the object literals that intern shape `si` — every literal of one
-// shape carries sig-identical closures, so the first match types the call. -1 when no
-// literal of shape `si` sets a function-valued `prop`.
-function fieldClosureFeOf(si: i32, prop: string) {
-  fieldClosureFeOfWant(si, prop, -1)
 }
 
 // `fieldClosureFeOf` restricted, when `want` is a function type, to a closure of exactly that
@@ -1416,7 +1413,9 @@ function fieldClosureFeOfRecvRaw(recvIx: i32, prop: string, fnIx: i32) {
       }
     }
   }
-  fieldClosureFeOf(structIndexOfExpr(recvIx, fnIx), prop)
+  // Resolved through the object literals that intern the receiver's shape: every literal of
+  // one shape carries sig-identical closures, so the first match types the call.
+  fieldClosureFeOfWant(structIndexOfExpr(recvIx, fnIx), prop, -1)
 }
 
 // Resolve `prop`'s closure through an initializer expression: an object literal reads its
@@ -1684,7 +1683,12 @@ function nulNoneReadCellKind(exprIx: i32, fnIx: i32): VKind {
   }
   const ck = readCellKind(exprIx, fnIx)
   if ck != null { return ck }
-  "nulnone"
+  // A read that names no cell is the `null` unit itself, as its own rep says.
+  const nd = repOfNode(exprIx, fnIx)
+  if nd.rdCovered == 0 {
+    emitFail("emitProgram: a `null` read that names no cell has no rep")
+  }
+  nd.rdKind
 }
 
 // The kind of the cell a read takes its value from: a name's cell, or the rep of a field's storage
@@ -1747,48 +1751,6 @@ export function readOwesNonNullRecover(exprIx: i32, fnIx: i32): boolean {
 export function readCellHoldsNullRef(exprIx: i32, fnIx: i32): boolean {
   const ck = readCellKind(exprIx, fnIx)
   ck != null && vkNonNullRefTwin(ck) != null
-}
-
-// The non-null twin of a nullable ref kind, or null for a kind that is not one.
-function vkNonNullRefTwin(k: VKind): VKind | null {
-  match k {
-    "nulvariant" => {
-      return "variant"
-    }
-    "nulstruct" => {
-      return "struct"
-    }
-    "nullist" => {
-      return "list"
-    }
-    "nulreflist" => {
-      return "reflist"
-    }
-    "nulclosure" => {
-      return "closure"
-    }
-    "nulstrlist" => {
-      return "strlist"
-    }
-    "nulf64list" => {
-      return "f64list"
-    }
-    "nuli64list" => {
-      return "i64list"
-    }
-    "nulf32list" => {
-      return "f32list"
-    }
-    "nulu8list" => {
-      return "u8list"
-    }
-    "nulmap" => {
-      return "map"
-    }
-    "nulstr" | "nulbool" | "nulnone" | "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "i64" | "f64" | "f64list" | "f32" | "closure" | "i64list" | "f32list" | "u8list" | "v128" => {
-      return null
-    }
-  }
 }
 
 // `k` when it is a nullable niche kind, else null.
@@ -2185,14 +2147,9 @@ function letInitIsBox(init: i32, fnIx: i32): boolean {
   const ix = unwrapParen(init)
   if ix < 0 { return false }
   const e = nodeAt(ix)
-  if e is Ident { return readIsLoopBox(ix, fnIx) }
+  // A `for-in` variable over value-union-box elements.
+  if e is Ident { return readLoopElemRepKind(ix, fnIx) == "union" }
   false
-}
-
-// Whether the read `ix` in frame `fnIx` (-1 the module) is a `for-in` variable over
-// value-union-box elements.
-function readIsLoopBox(ix: i32, fnIx: i32): boolean {
-  readLoopElemRepKind(ix, fnIx) == "union"
 }
 
 // The rep kind of the element of the `for-in` loop whose variable the read `ix` in frame `fnIx`
@@ -4791,7 +4748,7 @@ export function spreadSrcBoxes(src: i32, row: i32, fnIx: i32): i32 {
     if rlWidenTagOf(s, row) < 0 { return -1 }
     return 1
   }
-  if spreadSrcBoxAtom(src, rlElemName[row], fnIx) < 0 { return -1 }
+  if spreadSrcBoxAtom(src, rlElemUnionName(row), fnIx) < 0 { return -1 }
   1
 }
 
@@ -4979,22 +4936,19 @@ let irkMemoNul: i32[] = []
 function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   const d = repOfNode(ifIx, fnIx)
   if d.rdCovered != 1 { return null }
-  const k = d.rdKind
-  if k == "nulstr" { return "str" }
-  const tw0 = vkNonNullRefTwin(k)
-  const tw = if tw0 == null { k } else { tw0 }
+  const k = vkNonNullTwin(d.rdKind)
   // A record the shape of a union member reps as that variant; with no variant row behind the
   // arm it is built as its own record (D4644).
-  if tw == "variant" {
+  if k == "variant" {
     if ifExprRefSlot(ifIx, fnIx, "variant", -1) >= 0 { return "variant" }
     return "struct"
   }
-  if tw0 != null { return tw0 }
   match k {
-    "struct" | "variant" | "list" | "reflist" | "map" | "strlist" | "f64list" | "closure" | "i64list" | "f32list" | "u8list" | "str" => {
+    "struct" | "list" | "reflist" | "map" | "strlist" | "f64list" | "closure" | "i64list" | "f32list" | "u8list" | "str" => {
       return k
     }
-    "nulbool" | "nulnone" | "i32" | "union" | "i64" | "f64" | "f32" | "v128" | "nulvariant" | "nulstruct" | "nullist" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" => {
+    // No ref blocktype of its own (`nulstr` is the twin's input, never its answer).
+    "nulstr" | "nulbool" | "nulnone" | "i32" | "union" | "i64" | "f64" | "f32" | "v128" | "nulvariant" | "nulstruct" | "nullist" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" => {
       return null
     }
   }
@@ -5551,7 +5505,7 @@ export function rlUnionNameOfTy(slot: i32, listTy: i32): string {
     const r = unRowOfKey(et)
     if r >= 0 { return unNames[r] }
   }
-  rlElemName[slot]
+  rlElemUnionName(slot)
 }
 
 // The value-union name of an index read `xs[0]` whose receiver is a ref list with a
@@ -5561,7 +5515,7 @@ export function rlUnionNameOfTy(slot: i32, listTy: i32): string {
 export function indexElemUnionName(idxIx: i32, fnIx: i32) {
   const slot = indexElemUnionSlot(idxIx, fnIx)
   if slot < 0 { return "" }
-  rlElemName[slot]
+  rlElemUnionName(slot)
 }
 
 function indexElemUnionSlot(idxIx: i32, fnIx: i32): i32 {
@@ -5634,12 +5588,7 @@ export function forInWalkKind(iterIx: i32, fnIx: i32): VKind | null {
   const k = repSigKindOfTy(t)
   if k == null { return null }
   if k == "str" { return k }
-  if k == "map" {
-    const kk = tyMapKeyKind(t)
-    if kk == MAP_KEY_I32 { return "list" }
-    if kk == MAP_KEY_I64 { return "i64list" }
-    return "strlist"
-  }
+  if k == "map" { return mapKeyListKind(tyMapKeyKind(t)) }
   listRepOrNull(k)
 }
 
@@ -6317,7 +6266,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     // receiver and the `is`-narrowed variant receiver (`memberFieldCode` resolves both), so
     // `const t0 = v.f` binds the niche and its `!= null` narrows against `-1`.
     Member => {
-      return fieldReadIsNulLitAtom(unwrapParen(exprIx), fnIx)
+      return fieldCodeIsNulLitAtom(memberFieldCode(unwrapParen(exprIx), fnIx))
     }
     // A `?.` whose leaf is a literal-union atom field, nullable or not, is the same niche:
     // `emitOptMemberValue` yields the field's atom or `-1` (D3457).
@@ -7103,6 +7052,14 @@ export function anonFieldCode(valIx: i32) {
     if ltt is TyLit {
       const lc = fieldCodeOfTy(litBaseTy(ltt))
       if lc >= 0 { return lc }
+    }
+    // A numeric literal union stores its base scalar too, as its type reps (D2541).
+    if ltt is TyUnion {
+      const nb = numLitUnionBaseTy(lt)
+      if nb >= 0 && nb != lt {
+        const nc = fieldCodeOfTy(nb)
+        if nc >= 0 { return nc }
+      }
     }
   }
   // A `K | null` whose `K` narrowing a wider box re-minted at a fresh index, which the alias
@@ -8527,31 +8484,6 @@ export function letIsNulNone(letIx: i32, fnIx: i32): boolean {
 // present.
 export function exprNulClosure(exprIx: i32, fnIx: i32): boolean {
   exprNulKind(exprIx, fnIx) == "nulclosure"
-}
-
-// True if the `LetDecl` at `letIx` binds a concrete union-variant value: a variant cell
-// `(ref $(variantHeap(vi)))`, distinct from the union box and a standalone struct.
-export function letIsVariant(letIx: i32, fnIx: i32) {
-  variantIndexOfLet(letIx, fnIx) >= 0
-}
-
-// The variant row the `LetDecl` at `letIx` binds: its annotation type's row, else its
-// initializer's, or -1. A value-union annotation pins the cell to the box whatever the
-// initializer is (D1606).
-export function variantIndexOfLet(letIx: i32, fnIx: i32) {
-  const d = nodeAt(letIx)
-  if d is LetDecl {
-    if letAnnIsUnion(letIx) { return -1 }
-    if d.letType >= 0 {
-      const at = nodeTyAt(d.letType, fnIx)
-      if at >= 0 && at < T.tys.length && tyAt(at) is TyObj {
-        const vi = repVariantShapeRowOf(at)
-        if vi >= 0 { return vi }
-      }
-    }
-    return exprVariantIndex(d.letInit, fnIx)
-  }
-  -1
 }
 
 // The union-variant row an un-annotated object-literal initializer in function `fnIx` (or a value
@@ -10237,7 +10169,7 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
   if callee is Member {
     const pus = popRefRecvSlot(exprIx, fnIx)
     if pus >= 0 && pus < rlElemName.length && popUnionBoxElem(pus) {
-      return rlElemName[pus]
+      return rlElemUnionName(pus)
     }
   }
   // A declared callee's own return annotation names the union its result boxes as; the call's
@@ -10343,7 +10275,7 @@ function unionNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
         // must answer together — `exprUnion` false with a name still resolving is exactly
         // the split D311 records one classifier over.
         if idxNarrowAtomKind(exprIx, fnIx) >= 0 { return "" }
-        return rlElemName[slot]
+        return rlElemUnionName(slot)
       }
     }
   }
@@ -11583,17 +11515,6 @@ function refListCellSlotOfRead(exprIx: i32, fnIx: i32): i32 {
   -2
 }
 
-// The element type name of the ref list, a nullable one included, that binding `letIx` holds at
-// `fnIx`, read off its row; "" when it holds no ref list.
-export function letRefListElemName(letIx: i32, fnIx: i32) {
-  const ty = letBindTy(letIx, fnIx)
-  const k = repSigKindOfTy(ty)
-  if k != "reflist" && k != "nulreflist" { return "" }
-  const sl = repSlotOfKind(k, ty)
-  if sl < 0 || sl >= rlElemName.length { return "" }
-  rlElemName[sl]
-}
-
 // The arena element type of the ref list binding `letIx` declares: the annotation's element where
 // that names a row, else the initializer's at `fnIx`. -1 else.
 export function letRefListElemTy(letIx: i32, fnIx: i32): i32 {
@@ -12406,6 +12327,40 @@ export function sFieldStoreKind(si: i32, fi: i32): VKind | null {
     if d.rdCovered == 1 { return d.rdKind }
   }
   fieldCodeVKind(sFieldTypeAt(si, fi))
+}
+
+// The covered rep of struct `si`'s field `fi`'s storage type, or null where none is recorded or
+// the descriptor does not cover it; there the field code is the only answer.
+function sFieldStoreRep(si: i32, fi: i32): RepDesc | null {
+  const ty = fieldPosStoreTy(sFieldStart[si] + fi)
+  if ty < 0 { return null }
+  const d = repOfTy(ty)
+  if d.rdCovered == 0 { return null }
+  d
+}
+
+// Whether struct `si`'s field `fi` holds the union box.
+export function sFieldIsUnionBox(si: i32, fi: i32): boolean {
+  const d = sFieldStoreRep(si, fi)
+  if d == null { return sFieldTypeAt(si, fi) == FC_UNION }
+  d.rdKind == "union"
+}
+
+// Whether struct `si`'s field `fi` holds a non-null `i32`: a number, a boolean or an atom.
+export function sFieldIsPlainI32(si: i32, fi: i32): boolean {
+  const d = sFieldStoreRep(si, fi)
+  if d == null { return sFieldTypeAt(si, fi) == FC_I32 }
+  d.rdKind == "i32" && d.rdNul == 0
+}
+
+// Whether struct `si`'s field `fi` holds a record ref. A `nulnone` storage is a hole's record or
+// the `null` unit, which only the code tells apart.
+export function sFieldIsRecordRef(si: i32, fi: i32): boolean {
+  const d = sFieldStoreRep(si, fi)
+  if d == null || d.rdKind == "nulnone" {
+    return sFieldTypeAt(si, fi) == FC_STRUCT
+  }
+  d.rdKind == "nulstruct" || d.rdKind == "nulvariant"
 }
 
 // The storage type at a `memberFieldPos` row, or -1 for none or an unrecorded one.
@@ -14363,11 +14318,6 @@ function memberReadIsLitAtom(e: Member, exprIx: i32, fnIx: i32): boolean {
     return holeRecvAtomFieldTexts(e.memObj, e.memProp, fnIx).length > 0
   }
   false
-}
-
-// Whether field read `rx` reads a cell holding the `K | null` niche.
-function fieldReadIsNulLitAtom(rx: i32, fnIx: i32): boolean {
-  fieldCodeIsNulLitAtom(memberFieldCode(rx, fnIx))
 }
 
 // Whether a field of code `fc` holds the `K | null` niche: an atom id or the `-1` null.
