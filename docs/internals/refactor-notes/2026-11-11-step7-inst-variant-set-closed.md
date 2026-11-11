@@ -30,8 +30,10 @@ filed.
   the record members of every union that an instance's node, parameter or result is typed at,
   through the types that hold one. `repVariantShapesPrime` registers them in the variant shape index as a third source
   (bit 4), so `repTyIsVariant` answers `variant` for them from the first emit-time question.
-- **The guard.** From that point, `rvsAnswerNote` remembers each record type's answer. A later
-  different answer is an `emitFail`: `a record type's rep changed during emit, from … to …`.
+- **The guard.** `rvsAnswerNote` remembers each record type's answer from the first question in
+  the compile, the elaboration's included. It sits where the rep tree builds a record node
+  (`rtOfObj`). A later different answer is an `emitFail`:
+  `a record type's rep changed during emit, from … to …`.
   Validated on a control (this candidate, with nothing primed): all three programs trip it.
   With the prime, all three run and print as before.
 
@@ -43,15 +45,21 @@ no interned shape`: a shape registered that no variant row ever holds. It is not
 A cut that walked node types alone missed a union in a generic's declared result (D14804's
 witness, `readonly (Dot | T)[]` at `T := {r: i32}`). The guard refused it in the full sweep, so
 the walk takes each instance's parameter and result types too.
-Answers given during `elabRun`, before the prime, are not watched. In
-`generic-body-list-union-read-ops.vl` the elaboration answers `struct` for `{x: i32}` before the
-prime. A guard on those answers would refuse the program.
+**Open floor:** a union of lists' record elements are not registered. If an instance reads
+such an element as an arm before its row exists, the guard refuses the program. The cell that
+breaks when they are registered is `unions/inferred-record-literal-list-union-arm-generic.vl`.
+
+The guard watches from the first answer, so the elaboration's own answers are graded too. No
+answer the elaboration gives is contradicted later in the full sweep. A probe counted the
+record-rep answers given before the prime in `generic-body-list-union-read-ops.vl`, and found 0.
 
 ## Proof
 
 - The three witnesses and D14804's run and print as before.
-- **Full local sweep**, fixpoint seeds, base `f570d7f7`, 23,911 programs: 23,911 same, 0 bytes-only,
-  0 output movers, 0 runs → not-runs, 0 new compiler traps.
+- **Full local sweep**, fixpoint seeds, base `dc782c89` (after merging master, where the rep tree
+  replaced `repOfTyFlat`), 23,914 programs: 23,914 same, 0 bytes-only, 0 output movers,
+  0 runs → not-runs, 0 new compiler traps. The same holds with the guard watching from the
+  prime only.
 - **Locally:** `cases_wasm` passes (7,441). `regress.vl` reports no runs lost. `rep-fuzz-check.sh`
   is exact. These pass: plumb-shape-cost, late-demands (6), lint-self with its budgets,
   dead-export, render-parse, kind-ladder sets, `mono-tyaram-grid.sh`,
