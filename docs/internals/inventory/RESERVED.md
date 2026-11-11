@@ -457,3 +457,4 @@ D15690-D15699  lane w313 (session_01XfykzyXhqyWpkzNLT7Fh1j)  2026-11-11  D15657'
 D15700-D15709  lane w318 (session_01XfykzxW8ZL5hbjGurjuXN7)  2026-11-11  function-value rows D15639/D15651/D15649: filed D15700 (a hole never called, handed on in a const record to a callee calling the field at two types, loud emit reject, clause 2, open); filed and closed D15701 (two functions' record literals of one tagged set built at two struct types, check-clean invalid wasm, clause 1); D15702-D15709 reserved
 D15730-D15739  w314 (session_01Xfykzy2viz8FjUoy6At28Y)  2026-11-11  step-7 field-code lane rows; D15730 filed
 D15750-D15759  lane w321 (session_01XfykzzgesqdfuKJvFQZUrL)  2026-11-11  per-instance node types: D15750-D15759 reserved
+D15800-D15809  lane w308 (session_01Xfykzz6gyNBEiBfaqJUfSV)  2026-11-11  step 7 VKind: D15800-D15809 reserved
