@@ -44,7 +44,13 @@ exactly when one of the seven codes equalled `c`. Under the standing velocity in
 
 ## Proof
 
-<!-- gates -->
+- One refresh, at 6,613,863 bytes (seed-size +0.4% against its baseline).
+- Distilled `regress.vl`: no runs lost. It names one movement, `d15317_d380_if_join`
+  (check-clean invalid wasm → loud check reject). The pre-change seed gives the same refusal, so
+  base moved it.
+- rep-fuzz is exact. lint-self is clean (`self-lint + fmt-check clean`).
+- The ladder, comment and sentinel budgets exit 0. `ladder-sets` is ok, and late-demands is 6
+  against a baseline of 6.
 
 ## What is left
 
