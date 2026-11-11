@@ -17,7 +17,7 @@ mint compared the stored code with the class `mrKind` names:
 - `struct` and `variant` are `MVK_STRUCT`;
 - `map` and the seven non-null lists are `MVK_REF`.
 
-The probe compiler was built into scratch from the base seed (the head of #7163). Over the whole
+The probe compiler was built into scratch from the base seed, the head of #7163. Over the whole
 population (`scripts/sweep.vl`, 23,894 programs) it fired **0** times. The call site is the one
 #7157's probe already validated against a failing control.
 
@@ -49,7 +49,15 @@ The mover list goes into the PR body from its summary.
 
 ## Proof
 
-<!-- gates -->
+Checks run on the tree merged with master after #7163:
+
+- One refresh, at 6,613,639 bytes (seed-size +0.4% against its baseline).
+- `cases_wasm`: 7,436 passed, 0 failed.
+- Distilled `regress.vl`: 0 `runs → not-runs` classes; no runs lost.
+- rep-fuzz is exact. lint-self is clean (`self-lint + fmt-check clean`).
+- `ladder-sets` is ok, with 24 sets and 20 fields. Late-demands is 6 against a baseline of 6.
+- The export, ladder, comment and sentinel budgets exit 0, and so do the scan and render-parse
+  budgets (both below their baselines).
 
 ## What is left
 
