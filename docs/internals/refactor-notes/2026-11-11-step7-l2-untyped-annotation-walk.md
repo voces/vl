@@ -23,6 +23,16 @@ program prints the same output. Those 11 are bound and constraint programs, such
 they lose are struct types that no value uses. Giving the bound a type would have kept those
 rows. A bound is not the type of any value, so it has no row to mint.
 
+## A row it closes
+
+CI's filed-witness job found that D3919 moved from a loud emit reject to runs. The row is a map
+field over a type parameter, inside a record annotated in a generic body. The generic
+original's `{ m: Map<string, T> }` has no recorded type. Walked by its spelling, it minted the
+record's row with a map field over the open `T`, and the instance's map lookup failed on that
+row. On a master seed the witness refuses with `map value type has no interned slot`. On the
+candidate it prints `s`, as the row wants. The row is closed in this PR. The same record with a
+function-valued map still refuses with the same message, so it stays open and the row names it.
+
 ## Duplicated arm block
 
 On master, `internInlineShapeTyGo` ran the `iasMintTopDepth()` arm block (D15095) twice in a
@@ -41,6 +51,8 @@ deleted.
 
 - **Targeted.** The 346 programs that reach an untyped annotation walk were each built with
   both compilers: 0 exit codes differ, 11 modules differ, and those 11 print the same output.
+- **Witnesses.** `check-filed-witnesses --strict` over both inventories: 4,718 graded, all as
+  filed. The inventory rows and refs tests pass.
 - **Checks.** One `refresh-compiler.sh`; lint-self clean; distilled `regress.vl` reports no runs
   lost; the export, ladder, comment, sentinel, scan and render-parse budgets are at or below
   baseline; `tests/vl_scaling_shape_test.ts` passes. The full identity sweep is the PR's
