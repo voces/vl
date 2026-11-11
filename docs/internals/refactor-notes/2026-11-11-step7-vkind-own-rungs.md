@@ -51,8 +51,8 @@ table names the reason:
 | `vtKindOfType`, `vtKindOfParam` | `?? "i32"` | the uncovered annotation's default (closing census 2) |
 | `captureValKind` | `"i32"` | a capture with no `Param` or `let` binding has no kind. Its no-binding default is reached in 13 cells; its loop-variable and pair defaults are never reached. |
 
-`ifExprRefKindOf`'s and `tyListRepKind`'s rows are graded here as storage facts under the
-classifier-half ruling. They are proposed for the orchestrator to confirm.
+The orchestrator ruled `ifExprRefKindOf`'s and `tyListRepKind`'s rows BY DESIGN under
+DECISIONS.md's classifier-half ruling: a reader of the emitter's own storage is not step-7 debt.
 
 `vl run scripts/vkind-census.vl` after this change reads 76 functions:
 
