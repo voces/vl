@@ -49,15 +49,14 @@ The mover list goes into the PR body from its summary.
 
 ## Proof
 
-Checks run on the tree merged with master after #7163:
+Checks run on the tree merged with master `2fb114d7` (#7188):
 
-- One refresh, at 6,613,639 bytes (seed-size +0.4% against its baseline).
-- `cases_wasm`: 7,436 passed, 0 failed.
+- One refresh, at 6,617,408 bytes (seed-size +0.4% against its baseline).
+- `cases_wasm`: 7,440 passed, 0 failed.
 - Distilled `regress.vl`: 0 `runs → not-runs` classes; no runs lost.
 - rep-fuzz is exact. lint-self is clean (`self-lint + fmt-check clean`).
 - `ladder-sets` is ok, with 24 sets and 20 fields. Late-demands is 6 against a baseline of 6.
-- The export, ladder, comment and sentinel budgets exit 0, and so do the scan and render-parse
-  budgets (both below their baselines).
+- The export, ladder, comment, sentinel, scan and render-parse budgets exit 0.
 
 ## What is left
 
