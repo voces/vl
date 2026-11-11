@@ -35,7 +35,7 @@ at its checked type and needs nothing.
 cells, `@@CELL_<name>@@`): master 39 of 120 run, 2 SILENT; now 126 of 126.
 
 Rows closed: D8301, D15219, D15241, D15316, D15318, D15380, D15653, D15691, D15692, D15693,
-D15696, D15697, D15698. Filed: D15700 (through a generic identity, still refused), D15701 (a `??`
+D15696, D15697, D15698. Filed: D15712 (through a generic identity, still refused), D15713 (a `??`
 of a map read with a hole parameter at `J`, invalid wasm on master too).
 
 Fixtures: 18 refusal pins now run and are `@run` fixtures, renamed `*-runs`. Four still refuse,
@@ -43,6 +43,6 @@ with moved positions: a `i32 | string` field (lists, maps), an `i64 | null` fiel
 relay.
 
 Distilled regress: no runs lost. 24 cells move reject → runs. Two cells, `d15318_pin_J` and
-`d15318_two_pins`, move loud → invalid wasm: the price, filed as D15701, a master defect the keep
+`d15318_two_pins`, move loud → invalid wasm: the price, filed as D15713, a master defect the keep
 had hidden. Four named cells' manifest wants were "no legitimate value" placeholders; they now
 hold the values the programs print.
