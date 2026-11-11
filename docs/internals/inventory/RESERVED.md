@@ -459,5 +459,8 @@ D15712-D15729  lane w320 (session_01Xfym11xtDnTbeFttriwDpd)  2026-11-11  the fre
 D15730-D15739  w314 (session_01Xfykzy2viz8FjUoy6At28Y)  2026-11-11  step-7 field-code lane rows; D15730 filed
 D15740-D15749  lane w318 (session_01XfykzxW8ZL5hbjGurjuXN7)  2026-11-11  function-value rows: block assigned by the orchestrator for new rows; none filed yet
 D15750-D15759  lane w321 (session_01XfykzzgesqdfuKJvFQZUrL)  2026-11-11  per-instance node types: D15750-D15759 reserved
+D15770-D15779  lane w311 (session_01XfykzymeVcd3d2TNCE6x2z)  2026-11-11  ref-list rows keyed by type and D15719's close; reserved
+D15790-D15799  lane w309 (session_01Xfym1114AQ3f27TUsSTiwX)  2026-11-11  step 7 slot layer and w315's clause-2 groups: filed and closed D15790 (a call through a field of a `.slice` of a list of records whose functions return different types, now the unsliced twin's loud check reject); filed D15791 (that twin's refusal, clause 2, open); D15792-D15799 reserved
 D15800-D15809  lane w308 (session_01Xfykzz6gyNBEiBfaqJUfSV)  2026-11-11  step 7 VKind: D15800-D15809 reserved
 D15830-D15839  lane w310 (session_01Xfym12m2NeEoYsY4RescqP)  2026-11-11  the shape walk and the D6 inline-shape interner's type re-key: D15830-D15839 reserved
+D15850-D15859  lane w324 (session_01XfykzzsENY3wBoFnHUgL4L)  2026-11-11  Family B remainder (variantIndexOf and the struct name producers): D15850-D15859 reserved
