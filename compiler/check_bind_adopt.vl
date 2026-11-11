@@ -33,7 +33,7 @@ import {
   callBindRowOf,
   callBindTysAt,
 } from "./check_bind_rows"
-import { nodeRepStamped, nodeRepTyIxOf } from "./check_core_state"
+import { nodeRepStamped, nodeRepTyIxOf, recCopyTyIx } from "./check_core_state"
 import { inferQuiet } from "./check_cursor"
 import { elabCallDeclOf } from "./check_elab_cap"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
@@ -740,6 +740,14 @@ function recListLitBuild(l: i32, late: boolean): boolean {
     }
     owns = kept
   }
+  // A call's fresh result, nothing else holds, is copied into the list's build (D15652).
+  if bt >= 0 && btAt >= 0 && owns.length > 0 {
+    const kept: i32[] = []
+    for o in owns {
+      if !recListCallCopy(o, bt) { kept.push(o) }
+    }
+    owns = kept
+  }
   // A part held at its own storage beside one built elsewhere: the list cannot hold both.
   if owns.length > 0 {
     if bt >= 0 && btAt >= 0 { recListPartsApartRefuse(owns, bt, btAt) }
@@ -752,6 +760,47 @@ function recListLitBuild(l: i32, late: boolean): boolean {
     recLitStamped[l] = true
   }
   false
+}
+
+// Copies list part `o`, a call, into the record `bt` the list's other parts are built at, where its
+// own record stores a field differently. False, recording nothing, for any other part.
+function recListCallCopy(o: i32, bt: i32): boolean {
+  if o < 0 || o >= P.nodes.length || !(nodeAt(o) is Call) { return false }
+  const ot = nodeTyIxOf(o)
+  if ot < 0 || ot >= T.tys.length || fieldStorageEq(ot, bt, REC_STORE_DEPTH) {
+    return false
+  }
+  if !recCopyBoxesOnly(ot, bt) { return false }
+  while recCopyTyIx.length <= o { recCopyTyIx.push(-1) }
+  recCopyTyIx[o] = bt
+  true
+}
+
+// Whether the record `dst` stores each field of the record `src` as `src` does, or a scalar field
+// as that scalar or `null`: the fields a record copy boxes.
+function recCopyBoxesOnly(src: i32, dst: i32): boolean {
+  const so = tyAt(src)
+  const d = tyAt(dst)
+  if (
+    !(so is TyObj)
+    || !(d is TyObj)
+    || so.objFieldNames.length != d.objFieldNames.length
+  ) {
+    return false
+  }
+  let i = 0
+  while i < d.objFieldNames.length {
+    const sf = tyFieldTyOf(src, d.objFieldNames[i])
+    const df = d.objFieldTypes[i]
+    const dn = if df >= 0 && df < T.tys.length { tyAt(df) } else { null }
+    const sp = if sf >= 0 && sf < T.tys.length { tyAt(sf) } else { null }
+    const boxes = dn is TyNullable && sp is TyPrim && tySame(dn.nInner, sf)
+    if sf < 0 || !(boxes || fieldStorageEq(sf, df, REC_STORE_DEPTH)) {
+      return false
+    }
+    i = i + 1
+  }
+  true
 }
 
 // Refuses each part in `owns` of a list literal whose elements are held at their own storage,

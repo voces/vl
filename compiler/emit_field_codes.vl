@@ -40,7 +40,6 @@ import { isStructOfTy, mvValLowersTy } from "./emit_mv_slots"
 import { variantIndexOf } from "./emit_local_slots"
 import {
   MV_ARM_NOHINT,
-  repElemTyOfName,
   repNameCanonId,
   repOfTy,
   repRowOfTyStruct,
@@ -363,21 +362,12 @@ export function nestedStructNamesCompat(ta: string, elem: string): boolean {
   ka == ke
 }
 
-// The arm whose own canonical render is `name` (D762) — strictly tighter than
-// `variantIndexOfTypeName` below, which is a lenient field-set match so an adopted
-// literal's render can reach the arm the adoption already chose. Asked of the arena type
-// `name` resolves to, field by field in order — the container-element question.
-export function variantIndexOfOwnRender(name: string): i32 {
-  if !nameIsShapeOpen(name) { return -1 }
-  variantRowOwnRender(jrOneRecordOf(repElemTyOfName(name)), true, -1)
-}
-
 // The arm whose own type renders as the record `ty` does — the arm recorded at that record
 // itself, else the first with its fields in its order, each spelled alike; -1 for none.
 export function variantRowOfOwnRenderTy(tyIn: i32): i32 {
   const ty = jrOneRecordOf(tyIn)
   if ty < 0 { return -1 }
-  variantRowOwnRender(ty, false, -1)
+  variantRowOwnRender(ty, -1)
 }
 
 // The inline arm an anonymous record `ty` is: an arm with no declared name whose type is the
@@ -387,7 +377,7 @@ function anonArmRowOfTy(ty: i32): i32 {
   if structNameOfTy(ty) != "" { return -1 }
   const r = jrOneRecordOf(ty)
   if r < 0 { return -1 }
-  variantRowOwnRender(r, false, ty)
+  variantRowOwnRender(r, ty)
 }
 
 // The arm a map value of type `ty` is, or holds through map hops: the arm recorded at the type,
@@ -411,17 +401,16 @@ export function mvArmHintOfShapeTy(ty: i32): i32 {
 }
 
 // The one arm scan both keys share: the first arm that is the record `ty` or has its fields in
-// its order, each spelled alike; `exact` also keeps a literal field apart from its base, as the
-// arm's own render does. `anonOf` >= 0 keeps only an arm with no declared name that is that
-// same type. -1 for none.
-function variantRowOwnRender(ty: i32, exact: boolean, anonOf: i32): i32 {
+// its order, each spelled alike. `anonOf` >= 0 keeps only an arm with no declared name that is
+// that same type. -1 for none.
+function variantRowOwnRender(ty: i32, anonOf: i32): i32 {
   if ty < 0 { return -1 }
   let vi = 0
   while vi < uVariants.length {
     if vi < uVarTyIx.length && uVarTyIx[vi] >= 0 {
       const a = uVarTyIx[vi]
       if (
-        (a == ty || jrSameFieldSeq(a, ty, 0, exact))
+        (a == ty || jrSameFieldSeq(a, ty, 0))
         && (anonOf < 0 || (structNameOfTy(a) == "" && tySame(a, anonOf)))
       ) {
         return vi
@@ -445,13 +434,13 @@ function jrOneRecordOf(ty: i32): i32 {
   if m0 < 0 || !(tyAt(m0) is TyObj) { return -1 }
   for m in ms {
     if m < 0 || !(tyAt(m) is TyObj) { return -1 }
-    if !jrSpelledAlike(m, m0, 0, false) { return -1 }
+    if !jrSpelledAlike(m, m0, 0) { return -1 }
   }
   m0
 }
 
 // Whether records `a` and `b` have the same fields in the same order, each spelled alike.
-function jrSameFieldSeq(a: i32, b: i32, depth: i32, exact: boolean): boolean {
+function jrSameFieldSeq(a: i32, b: i32, depth: i32): boolean {
   if a < 0 || a >= T.tys.length || b < 0 || b >= T.tys.length { return false }
   const ta = tyAt(a)
   const tb = tyAt(b)
@@ -464,12 +453,7 @@ function jrSameFieldSeq(a: i32, b: i32, depth: i32, exact: boolean): boolean {
       while k < na.length {
         if na[k] != nb[k] { return false }
         if (
-          !jrSpelledAlike(
-            ta.objFieldTypes[k],
-            tb.objFieldTypes[k],
-            depth + 1,
-            exact,
-          )
+          !jrSpelledAlike(ta.objFieldTypes[k], tb.objFieldTypes[k], depth + 1)
         ) {
           return false
         }
@@ -482,34 +466,29 @@ function jrSameFieldSeq(a: i32, b: i32, depth: i32, exact: boolean): boolean {
 }
 
 // Whether field types `a` and `b` render alike: one literal-union alias, one primitive (a
-// literal spells its base unless `exact`), or the same shape all the way down.
-function jrSpelledAlike(a: i32, b: i32, depth: i32, exact: boolean): boolean {
+// literal spells its base), or the same shape all the way down.
+function jrSpelledAlike(a: i32, b: i32, depth: i32): boolean {
   if a == b { return true }
   if depth > 8 || a < 0 || b < 0 { return false }
   if litUnionAliasNameOfTy(a) != litUnionAliasNameOfTy(b) { return false }
   const pa = tyEmitPrimOf(a)
   const pb = tyEmitPrimOf(b)
-  if pa != null || pb != null {
-    if exact && !(tyAt(a) is TyPrim && tyAt(b) is TyPrim) {
-      return tySame(a, b)
-    }
-    return pa == pb
-  }
+  if pa != null || pb != null { return pa == pb }
   if tySame(a, b) { return true }
   const ta = tyAt(a)
   const tb = tyAt(b)
   // Exhaustive over `Ty` and `_`-less: only a shape, a list or a nullable spells its parts.
   match ta {
     TyObj => {
-      return jrSameFieldSeq(a, b, depth + 1, exact)
+      return jrSameFieldSeq(a, b, depth + 1)
     }
     TyArray => {
       const eb = tyArrayElemIx(b)
-      return eb >= 0 && jrSpelledAlike(ta.aElem, eb, depth + 1, exact)
+      return eb >= 0 && jrSpelledAlike(ta.aElem, eb, depth + 1)
     }
     TyNullable => {
       if tb is TyNullable {
-        return jrSpelledAlike(ta.nInner, tb.nInner, depth + 1, exact)
+        return jrSpelledAlike(ta.nInner, tb.nInner, depth + 1)
       }
     }
     TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg | TyFunc | TyMap => {
@@ -526,10 +505,8 @@ function jrSpelledAlike(a: i32, b: i32, depth: i32, exact: boolean): boolean {
 export function cbRetVariantIdx(fe: i32) {
   if fe < 0 || fe >= fnStmts.length { return -1 }
   const nm = inferRetNameByNode(fnStmts[fe])
-  // The nominal arm on the name, the structural arm on the arena: `variantIndexOfTypeName`
-  // runs both, but only the direct name match asks whether this IS a declared variant —
-  // identity the arena can't recover (B208). The arena arm is stricter, refusing a
-  // field-set collision `shapeFieldTypeCompatK` would let through (avoided by the `fRetKind` guard below).
+  // The nominal arm on the name, the structural arm on the arena: only the direct name match
+  // asks whether this IS a declared variant, an identity the arena can't recover (B208).
   let vi = variantIndexOf(nm)
   if vi < 0 {
     const rt = inferRetTyIxByNode(fnStmts[fe])

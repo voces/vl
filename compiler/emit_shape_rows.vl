@@ -190,7 +190,6 @@ import {
   nestedStructNamesCompat,
   shapeFieldParse,
   unionMemberSetsCompat,
-  variantIndexOfOwnRender,
   variantRowOfOwnRenderTy,
 } from "./emit_field_codes"
 import {
@@ -795,28 +794,12 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
   kind
 }
 
-// The row an adopted shape names — the name-keyed twin of `collectAnonShapes`' suppression
-// gate. `collectAnonShapes` mints an `#anonN` row for
-// an object literal unless a node-side resolver already gave it one, so the shape has exactly
-// one row and it is the adopter's; the mv layer's four readers all come here (D671).
-export function mvValArmOfShape(name: string): i32 {
-  if !nameIsWholeSpanShape(name) { return -1 }
-  if structRowOfSpelling(name) >= 0 { return -1 }
-  const exact = variantIndexOfTypeName(name)
-  if exact >= 0 { return exact }
-  // The widenings the adopter builds a literal at: `{q:i32}` into an arm's `i32 | null` box
-  // field or `string | null` niche. Only a sole claimant, since the render cannot say
-  // which of two widening arms adopted the literal (D4636).
-  const boxed = variantIndexOfShapeK(name, 1, true)
-  if boxed >= 0 { return boxed }
-  variantIndexOfShapeK(name, 2, true)
-}
-
-// `mvValArmOfShape` for a caller that also holds the arena type `ty` of `name` (or of its
-// `| null` niche), -1 for none: a record type is matched against the arms by its field types.
+// The arm an adopted map-value shape `name` of record type `ty` (or its `| null` niche) is built
+// at (D671), -1 for none or a non-record: its fields' types matched against the arms, then the
+// widenings an adopter builds a literal at, each only for a sole claimant (D4636).
 export function mvValArmOfShapeTy(name: string, ty: i32): i32 {
   const ot = nonNullTy(ty)
-  if ot < 0 || !(tyAt(ot) is TyObj) { return mvValArmOfShape(name) }
+  if ot < 0 || !(tyAt(ot) is TyObj) { return -1 }
   if !nameIsWholeSpanShape(name) { return -1 }
   if structRowOfNameTy(name, ot) >= 0 { return -1 }
   const direct = variantIndexOf(name)
@@ -1176,17 +1159,18 @@ export function mvValInnerMvSlot(slot: i32): i32 {
   mvSlotOfMapNameTys(vn, -1, tyMapValOf(nonNullTy(mvValTyIxAt(slot))))
 }
 
-// The `sFieldTgtStructIdx` twin for a variant's nested-struct field, with one extra rung:
-// the arm twin. A variant's fields are recorded before the struct table exists, so an
-// arm-typed field banks the arm's own name and no `sNames` row ever carries it;
+// The `sFieldTgtStructIdx` twin for a variant's nested-struct field, with two extra rungs:
+// the arm twin and the mint. A variant's fields are recorded before the struct table exists, so
+// an arm-typed field banks the arm's own name and no `sNames` row ever carries it;
 // `armFieldStructRow` is the same resolver asked one phase later, once the mint has run.
 export function uFieldTgtStructIdx(vi: i32, fi: i32): i32 {
-  const a = structIndexOfTy(uFieldElemTyIxAt(vi, fi))
+  const ety = uFieldElemTyIxAt(vi, fi)
+  const a = structIndexOfTy(ety)
   if a >= 0 { return a }
+  const c = repRowOfTyStruct(ety, sScanLim())
+  if c >= 0 { return c }
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const nm = sFieldElemName[uFieldStart[vi] + fi]
-  const bn = structIndexByName(nm)
-  if bn >= 0 { return bn }
   const ar = armFieldStructRow(nm)
   if ar >= 0 { return ar }
   armStructRowMint(uFieldStart[vi] + fi)
@@ -1757,54 +1741,14 @@ function shapeFieldTypeCompatK(
   true
 }
 
-// The union-VARIANT table index whose field-set matches a `{meow: i32}` SHAPE name (a collapsed
-// `.map` callback return the checker rendered structurally) — the variant analogue of
-// `structIndexOfTypeName`. -1 if no variant matches. A NAME that is already a variant alias
-// resolves directly. Field-name parsing mirrors `structIndexOfTypeName`.
-export function variantIndexOfTypeName(name: string) {
-  const direct = variantIndexOf(name)
-  if direct >= 0 { return direct }
-  variantIndexOfShapeK(name, 0, false)
-}
-
-// The field-set scan of `variantIndexOfTypeName` at one `shapeFieldTypeCompatK` leniency.
-// `unique` declines when a second variant also matches, which a widened pass needs: there the
-// spelling does not pin the arm, so a first match would be a guess between declarations.
-function variantIndexOfShapeK(
-  name: string,
-  lenient: i32,
-  unique: boolean,
-): i32 {
-  if !nameIsShapeOpen(name) { return -1 }
-  const fnames: string[] = []
-  const ftypes: string[] = []
-  shapeFieldParse(name, fnames, ftypes)
-  variantScanK(fnames, ftypes, [], [], lenient, unique)
-}
-
-// `variantIndexOfShapeK` asked of the record type `ty` rather than of its render: each field's
-// type against the arm's field code, as `jrScanK` asks a struct row. -1 for a non-record.
+// The arm whose fields are the record `ty`'s, each field's type against the arm's field code as
+// `jrScanK` asks a struct row, at one `shapeFieldTypeCompatK` leniency; `unique` declines when a
+// second arm also matches. -1 for a non-record.
 function variantRowScanOfTyK(ty: i32, lenient: i32, unique: boolean): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   const t = tyAt(ty)
   if !(t is TyObj) { return -1 }
-  const wants: i32[] = []
-  for f in t.objFieldTypes { wants.push(jrWantOf(f)) }
-  variantScanK(t.objFieldNames, [], t.objFieldTypes, wants, lenient, unique)
-}
-
-// The variant whose fields are exactly `fnames`, each matching its spelling in `ftypes`, or, when
-// `ftys` is non-empty, its type `ftys[k]` with field code `wants[k]`. A shared field name with a
-// mismatched type is a distinct shape. `unique` declines on a second match.
-function variantScanK(
-  fnames: string[],
-  ftypes: string[],
-  ftys: i32[],
-  wants: i32[],
-  lenient: i32,
-  unique: boolean,
-): i32 {
-  const typed = ftys.length > 0
+  const fnames = t.objFieldNames
   let found = -1
   let vi = 0
   while vi < uVariants.length {
@@ -1813,26 +1757,15 @@ function variantScanK(
       let k = 0
       while ok && k < fnames.length {
         const fj = variantFieldIndex(vi, fnames[k])
-        if fj < 0 {
-          ok = false
-        } else if typed {
-          ok = jrFieldFitsAt(
-            ftys[k],
-            wants[k],
-            variantFieldTypeAt(vi, fj),
-            variantFieldElemName(vi, fj),
-            uFieldElemTyIxAt(vi, fj),
-            lenient,
-          )
-        } else {
-          ok = shapeFieldTypeCompatK(
-            ftypes[k],
-            variantFieldTypeAt(vi, fj),
-            variantFieldElemName(vi, fj),
-            uFieldElemTyIxAt(vi, fj),
-            lenient,
-          )
-        }
+        ok = fj >= 0
+          && jrFieldFitsAt(
+          t.objFieldTypes[k],
+          jrWantOf(t.objFieldTypes[k]),
+          variantFieldTypeAt(vi, fj),
+          variantFieldElemName(vi, fj),
+          uFieldElemTyIxAt(vi, fj),
+          lenient,
+        )
         k = k + 1
       }
       if ok {
@@ -2215,11 +2148,6 @@ function nameIsRefArrayGo(name: string) {
     if shapeElemDeclaredStructIdx(base) >= 0 { return true }
     // A `Cat[]` over a concrete union VARIANT — a ref list of bare variant structs.
     if variantIndexOf(base) >= 0 { return true }
-    // The same arm, reached by its structural render (D762): a value-call parameter type
-    // is rendered by canon, which expands the arm's own field types, so `Circle = {r:
-    // Shape2}` arrives as `{r:{c2:i32}|{s2:i32}}`, claimed by neither the nominal rung nor
-    // the struct bridge. `variantIndexOfTypeName` is the same resolver `objVariantName` uses.
-    if variantIndexOfOwnRender(base) >= 0 { return true }
     if unNameBound(base) { return true }
   }
   false
@@ -3850,12 +3778,6 @@ function refArrElemNameGo(name: string) {
     if shapeElemDeclaredStructIdx(base) >= 0 { return base }
     // A `Cat[]` concrete-variant element list — the bare variant name is the table key.
     if variantIndexOf(base) >= 0 { return base }
-    // D762 — the arm reached by its structural render, matching `nameIsRefArray`'s rung.
-    // The key is the arm's nominal name, not the render: an arm has no struct row, and every
-    // consumer that turns an element name back into a heap is nominal. Answering the render
-    // would intern a slot no consumer could resolve.
-    const rvi = variantIndexOfOwnRender(base)
-    if rvi >= 0 { return uVariants[rvi] }
     // A NESTED ref array (`Cell[]` as the element of `Cell[][]`): the base is itself a ref array
     // — the inner list's name keys its slot. Recurses to the leaf struct/union/closure array.
     if nameIsRefArray(base) { return base }
