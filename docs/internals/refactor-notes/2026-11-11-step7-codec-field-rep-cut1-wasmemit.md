@@ -30,15 +30,18 @@ arrays of the row matchers. They are cut 2 (the transforms) and cut 3 (the array
 
 ## Measurement
 
-`sweep.vl diff`, master `82eca538`'s fixpoint seed against this one (23,912 programs):
+`sweep.vl diff`. The `wasmEmit.vl` half (#7259) is 23,910 same against #7220's fixpoint. The
+`emit_classify.vl` half missed #7259's merge and lands separately, measured against master
+`0a9e9948`'s fixpoint (23,922 programs):
 
-- **23,912 same**;
+- **23,922 same**;
 - 0 bytes-only movers;
 - 0 output movers;
 - 0 `runs → not-runs`;
 - 0 new compiler traps.
 
-The seed is 6,618,677 bytes (+381 against master's 6,618,296), a fixpoint after two refreshes.
+That half's seed is 6,623,270 bytes (−16 against master's 6,623,286), a fixpoint after two
+refreshes.
 
 ## Proof
 
