@@ -46,6 +46,14 @@ with moved positions: a `i32 | string` field (lists, maps), an `i64 | null` fiel
 relay.
 
 Distilled regress: no runs lost. 24 cells move reject → runs. Two cells, `d15318_pin_J` and
-`d15318_two_pins`, move loud → invalid wasm: the price, filed as D15713, a master defect the keep
-had hidden. Four named cells' manifest wants were "no legitimate value" placeholders; they now
+`d15318_two_pins`, would move loud → invalid wasm, a compiler trap to the sweep: a `??` over a map
+read at its own row, defaulted to a hole parameter a call pins at `J`. That is D15713, a master
+defect the keep had hidden; it needs the instance's union row (w316, w321). Until it lands,
+`storeHoleDefaultApart` (check_store_rep.vl) refuses exactly that shape, so the cells stay refused. Four named cells' manifest wants were "no legitimate value" placeholders; they now
 hold the values the programs print.
+
+The box-dst shadow (`tests/vl_box_dst_shadow_test.ts`) had three witnesses whose wider build was a
+kept maker. With the copy they box nothing, so two now build wide through a literal binding:
+`storewrite` (3 agreements, one more read) and `paramwrite` (the hole parameter alone). `storelit`
+keeps its program and expects no rows, since the map keeps its own build. The literal-binding
+spelling of `storelit` is invalid wasm on master, filed as D15718.
