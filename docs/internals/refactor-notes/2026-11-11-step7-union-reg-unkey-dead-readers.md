@@ -34,6 +34,9 @@ never finds a row answers the same with or without the column.
 - **`isUNameKeyAB` with no type answers false.** It no longer keys the spelling.
 - **`unNameAdoptKeyRow` is deleted.** `unNameAdoptTyKeyRow` with no type answers false.
 - **`unRowOfTyWide` loses its `null`-position loop.**
+- **`unionRowKeyAB` falls back to the spelling's bound row** (`unRowOfName`) when its type's key
+  finds none, not to `unionRowOf`'s set-text key. The 39 hits that reached the key that way change
+  nothing (a second commit, swept separately: 23,910 of 23,910 same).
 
 ## Kept
 
@@ -42,6 +45,12 @@ never finds a row answers the same with or without the column.
   union's flattened member sequence that the softened key finds and the canonical key misses:
   the query keeps a literal that the row's key softened, the census's "soft-only" class. It
   stays until the type keys agree there.
+
+- **`unionRowOfAB` keeps the set-text key.** It answers 793 of the census's hits, in 14
+  programs. Its caller (`mvValUnionRow`) reads the registry by the spelling next. Answering by the
+  type's row instead moves 70 programs: 69 bytes-only and one output mover,
+  `objects/record-wider-than-union-arm-boxes-under-arm.vl`. It waits for that caller to read by
+  type.
 
 ## Proof
 
