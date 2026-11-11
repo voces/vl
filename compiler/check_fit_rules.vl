@@ -3302,7 +3302,8 @@ export function recAdoptMapNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
 // ends.
 const recMapFollowing: i32[] = []
 
-// The values stored into the `Map()` binding `d` by `m[k] = v` and `m.set(k, v)`.
+// The values stored into the container binding `d` by `m[k] = v`, `m.set(k, v)` and a kept
+// value's `xs.push(v)`.
 function recMapStoredValues(d: i32): i32[] {
   const out: i32[] = []
   const dn = nodeAt(d)
@@ -3347,13 +3348,16 @@ function recMapIndexStoreValue(p: i32, a: i32, fld: boolean): i32 {
   -1
 }
 
-// The value argument of the call `a` whose callee is the member `p`, when that is `.set(k, v)`;
-// -1 otherwise.
+// The value argument of the call `a` whose callee is the member `p`, when that is `.set(k, v)` or
+// `.push(v)` of a kept value; -1 otherwise.
 function recMapSetStoreValue(p: i32, a: i32): i32 {
   const pn = nodeAt(p)
   const an = nodeAt(a)
   if pn is Member && an is Call {
     if pn.memProp == "set" && an.callArgs.length == 2 { return an.callArgs[1] }
+    if pn.memProp == "push" && an.callArgs.length == 1 {
+      return if recMapStoreKeptDst(an.callArgs[0]) >= 0 { an.callArgs[0] } else { -1 }
+    }
   }
   -1
 }
@@ -4986,8 +4990,9 @@ function recKeptDstOfDecl(d: i32): i32 {
 }
 
 // The un-annotated container binding the value `v` is stored into: a `Map()` by `m[k] = v` or
-// `m.set(k, v)`, a list literal's binding by being its element or by `xs[i] = v`, or a record
-// literal's by being a field's value or by `w.f = v`; else -1.
+// `m.set(k, v)`, a list literal's binding by being its element, by `xs[i] = v` or by
+// `xs.push(v)` of a kept value, or a record literal's by being a field's value or by `w.f = v`;
+// else -1.
 export function recStoreDeclOf(v: i32): i32 {
   if v < 0 || !cwIxCovers(v) { return -1 }
   const a = cwIxUp[v]
@@ -5009,12 +5014,17 @@ export function recStoreDeclOf(v: i32): i32 {
         fld = true
       }
     }
-  } else if an is Call {
-    if an.callArgs.length == 2 && an.callArgs[1] == v && an.callFn >= 0 {
-      const f = nodeAt(an.callFn)
+  } else if an is Call && an.callFn >= 0 {
+    const f = nodeAt(an.callFn)
+    if an.callArgs.length == 2 && an.callArgs[1] == v {
       if f is Member && f.memProp == "set" {
         recv = f.memObj
         set = true
+      }
+    } else if an.callArgs.length == 1 && an.callArgs[0] == v {
+      // Only a kept value: a pushed literal or binding is built by the push's own rules.
+      if f is Member && f.memProp == "push" && recMapStoreKeptDst(v) >= 0 {
+        recv = f.memObj
       }
     }
   }
@@ -5048,7 +5058,10 @@ function recStoredValues(d: i32): i32[] {
   if dn is LetDecl && dn.letInit >= 0 {
     const a = nodeAt(cwPeelValue(dn.letInit))
     if a is ArrayLit {
-      for e in a.arrElems { out.push(e) }
+      // A spread part hands on another list's elements, built where that list is.
+      for e in a.arrElems {
+        if !(nodeAt(e) is Spread) { out.push(e) }
+      }
     } else if a is ObjLit {
       for fi in a.objFields {
         const fn = nodeAt(fi)
