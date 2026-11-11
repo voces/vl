@@ -1,6 +1,6 @@
 # Step 7 inst: an un-annotated instance's result is its own values' where they widen the template's, 2026-11-11
 
-Lane w321, D15713's remaining half, after w316's registry half (#7278). In
+Lane w321, D15713's remaining half (unfiled: D15713, filed in #7200), after w316's registry half (#7278). In
 `function pick(d) { (m.get("z") ?? d).f }` with `m` holding `{f: i32}`, the template's `??` is
 `{f: i32}`, so its result is `i32`. At `pick` with `d: J = {f: i32 | null}` the `??` is
 `{f: i32} | J`, and `.f` is `i32 | null`. With #7278 the body built that box. But the instance's
@@ -27,7 +27,7 @@ rule keeps every one of them.
 
 ## Proof
 
-- D15713's witness prints `2`. On a tree with #7200 merged and its `storeHoleDefaultApart`
+- D15713's witness (unfiled: D15713) prints `2`. On a tree with #7200 merged and its `storeHoleDefaultApart`
   refusal removed, `d15318_pin_J` prints `4` and `d15318_two_pins` prints `4` then `4`.
 - **Full local sweep**, fixpoint seeds, base master `f63c5c6d`, 23,923 programs: 23,923 same,
   0 bytes-only, 0 output movers, 0 runs → not-runs, 0 new compiler traps. The witness's row and
