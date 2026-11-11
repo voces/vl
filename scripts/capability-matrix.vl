@@ -179,6 +179,7 @@ type Tpl = {
   want2: string,
   proof: string,
   skips: Map<string, string>,
+  cells: string[][],
 }
 
 // The section name of a `// @@NAME@@` marker line, or "".
@@ -193,7 +194,14 @@ function marker(line: string): string {
   const start = i
   while i < line.length {
     const b = line[i]
-    if !((b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95) { break }
+    if (
+      !((b >= 65 && b <= 90)
+        || (b >= 97 && b <= 122)
+        || (b >= 48 && b <= 57)
+        || b == 95)
+    ) {
+      break
+    }
     i = i + 1
   }
   if i == start || !startsWith(line.slice(i, line.length), "@@") { return "" }
@@ -221,6 +229,7 @@ function section(s: Map<string, string>, key: string): string {
 function loadTpl(path: string): Tpl {
   const text = readText(path)
   const s: Map<string, string> = Map()
+  const order: string[] = []
   let cur = ""
   let open = false
   let buf: string[] = []
@@ -235,6 +244,7 @@ function loadTpl(path: string): Tpl {
     if m != "" {
       if open { s[cur] = stripNl(join(buf, "")) }
       cur = m
+      if !includes(order, m) { order.push(m) }
       open = true
       buf = []
     } else if open {
@@ -276,6 +286,7 @@ function loadTpl(path: string): Tpl {
     want2: section(s, "WANT2"),
     proof: section(s, "PROOF"),
     skips: skips,
+    cells: ownCells(s, order, path),
   }
   if t.proof == "" && t.test != "" {
     t.proof = "if \{t.test} {\n\{ind(t.hit, 2)}\n} else {\n\{ind(t.miss, 2)}\n}"
@@ -297,6 +308,37 @@ function loadTpl(path: string): Tpl {
     }
   }
   t
+}
+
+// The template's own positions: each `@@CELL_<name>@@` section in file order, as
+// [name, body, want]. A first body line `// want: X` overrides WANT for that cell.
+function ownCells(
+  s: Map<string, string>,
+  order: string[],
+  path: string,
+): string[][] {
+  const out: string[][] = []
+  for m in order {
+    if !startsWith(m, "CELL_") { continue }
+    const name = m.slice(5, m.length)
+    for p in POSITIONS {
+      if p[0] == name {
+        die("\{path}: @@\{m}@@ shadows a built-in position", 1)
+      }
+    }
+    let body = section(s, m)
+    let want = ""
+    const nl = findFrom(body, "\n", 0)
+    const first = if nl >= 0 { body.slice(0, nl) } else { body }
+    if startsWith(stripWs(first), "// want:") {
+      const w = stripWs(first)
+      want = stripWs(w.slice(8, w.length))
+      body = if nl >= 0 { stripNl(body.slice(nl + 1, body.length)) } else { "" }
+    }
+    if body == "" { die("\{path}: @@\{m}@@ has no program", 1) }
+    out.push([name, body, want])
+  }
+  out
 }
 
 // The list type over `ty`, parenthesised when the element spelling is a union or has
@@ -624,9 +666,27 @@ function letDecl(t: Tpl, face: string, name: string, expr: string): string {
   "let \{name} = \{expr}"
 }
 
+// A template cell's body with `__V__` the value, `__TY__` its type, and `__A__` / `__LA__`
+// the annotation `: TYPE` / `: TYPE[]` in the annotated face and nothing in the other.
+function ownBody(t: Tpl, body: string, ann: boolean): string {
+  let a = ""
+  let la = ""
+  if ann {
+    a = ": " + t.ty
+    la = ": " + arr(t.ty)
+  }
+  let b = replaceAll(body, "__LA__", la)
+  b = replaceAll(b, "__A__", a)
+  b = replaceAll(b, "__TY__", t.ty)
+  replaceAll(b, "__V__", t.value)
+}
+
 // The program for position `pos` in `face`.
 function buildAt(t: Tpl, pos: string, face: string): Built {
   const ann = face == "ann"
+  for c in t.cells {
+    if c[0] == pos { return made(program(t, [ownBody(t, c[1], ann)])) }
+  }
   if pos == "binding" {
     return made(assemble(t, [], [], [bind("v", t.value, face, t.ty), t.proof]))
   } else if pos == "return_inferred" {
@@ -829,9 +889,20 @@ function buildAt(t: Tpl, pos: string, face: string): Built {
   skipped("")
 }
 
+// The built-in positions, then the template's own cells.
+function positionsOf(t: Tpl): string[] {
+  const out: string[] = []
+  for p in POSITIONS { out.push(p[0]) }
+  for c in t.cells { out.push(c[0]) }
+  out
+}
+
 // ── driving ──────────────────────────────────────────────────────────────────────
 
 function wantFor(t: Tpl, pos: string): string {
+  for c in t.cells {
+    if c[0] == pos && c[2] != "" { return c[2] }
+  }
   if pos == "two_instances" && t.want2 != "" {
     return t.want + " then " + t.want2
   }
@@ -859,8 +930,7 @@ function selected(only: string[], pos: string): boolean {
 // Every selected cell of `t`, graded against `seed`, keyed `position/face`.
 function gradeAll(t: Tpl, seed: string, r: Run): Map<string, Cell> {
   const cells: Map<string, Cell> = Map()
-  for p in POSITIONS {
-    const pos = p[0]
+  for pos in positionsOf(t) {
     if !selected(r.only, pos) { continue }
     for face in FACES {
       const key = pos + "/" + face
@@ -911,6 +981,7 @@ function cellAt(cells: Map<string, Cell>, key: string): Cell {
 }
 
 function table(
+  names: string[],
   only: string[],
   hasBefore: boolean,
   before: Map<string, Cell>,
@@ -924,8 +995,7 @@ function table(
     out.push("| position | face | before | after |")
     out.push("| --- | --- | --- | --- |")
   }
-  for p in POSITIONS {
-    const pos = p[0]
+  for pos in names {
     if !selected(only, pos) { continue }
     for face in FACES {
       const key = pos + "/" + face
@@ -1045,11 +1115,9 @@ function main(args: string[]): i32 {
     const s = stripWs(x)
     if s != "" && !includes(only, s) { only.push(s) }
   }
+  const names = positionsOf(t)
   for n in sorted(only) {
-    let known = false
-    for p in POSITIONS {
-      if p[0] == n { known = true }
-    }
+    const known = includes(names, n)
     if !known { die("unknown position \{pyRepr(n)} (try --list-positions)", 1) }
   }
 
@@ -1089,7 +1157,7 @@ function main(args: string[]): i32 {
   )
   if hasBefore { print("before `\{basename(beforeSeed)}`") }
   print("")
-  print(table(only, hasBefore, before, after))
+  print(table(names, only, hasBefore, before, after))
 
   let runs = 0
   let silentN = 0
@@ -1099,10 +1167,10 @@ function main(args: string[]): i32 {
   const lostKeys: string[] = []
   const silentKeys: string[] = []
   const trapKeys: string[] = []
-  for p in POSITIONS {
-    if !selected(only, p[0]) { continue }
+  for pos in names {
+    if !selected(only, pos) { continue }
     for face in FACES {
-      const key = p[0] + "/" + face
+      const key = pos + "/" + face
       const c = cellAt(after, key)
       total = total + 1
       if c.verdict == "RUNS" {
