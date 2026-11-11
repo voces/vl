@@ -44,6 +44,11 @@ rep. A code carries more than a `VKind`, so the accessor answers a `RepDesc`:
 | 17, 23, 24 | `f64`, `i64`, `f32` | |
 | 37 | `nulnone` | |
 
+`fieldRowRep` inherits `repOfTy`'s union-membership rule: a record that is a union arm reps as
+a variant, and its row is laid out as a variant row. That rule is load-bearing for record
+identity (w321 confirmed it), so it stays. The census above was measured under it, and the
+byte-identical claim for cuts 1–3 depends on it.
+
 No column is added. The storage type is the column, and the companion columns that already
 exist (`sFieldElemName`, `sFieldElemTyIx`, `sFieldCloSig`, `sFieldElemKeyKind`) stay the slot.
 
