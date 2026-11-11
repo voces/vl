@@ -71,7 +71,7 @@ measured first.
 
 ## Proof
 
-- Refresh is at 6,616,321 bytes.
+- Refresh is at 6,616,321 bytes on base, and 6,620,508 bytes merged with master `d9031606` (#7182).
 - `regress.vl`: no runs lost.
 - `cases_wasm_*`: 7,436 passed.
 - `vl_check_codegen` and `vl_scaling_shape`: passed.
