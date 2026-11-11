@@ -32,11 +32,14 @@ at its checked type and needs nothing.
 ## Graded
 
 `scripts/capability-probes/matrix/kept-maker-delivery.matrix.vl` (the generator gains template
-cells, `@@CELL_<name>@@`): master 39 of 120 run, 2 SILENT; now 126 of 126.
+cells, `@@CELL_<name>@@`, and `owed-annotated` for a refusal the design owes): master 39 of
+120 run, 2 SILENT; now 123 of 123, plus 3 owed refusals: an annotated binding handed on at `J`
+has its own storage and identity, and a copy would split it.
 
 Rows closed: D8301, D15219, D15241, D15316, D15318, D15380, D15653, D15691, D15692, D15693,
 D15696, D15697, D15698. Filed: D15712 (through a generic identity, still refused), D15713 (a `??`
-of a map read with a hole parameter at `J`, invalid wasm on master too).
+of a map read with a hole parameter at `J`, invalid wasm on master too), D15714 (a field that is a
+union of the scalar), D15715 (a wider nullable number).
 
 Fixtures: 18 refusal pins now run and are `@run` fixtures, renamed `*-runs`. Four still refuse,
 with moved positions: a `i32 | string` field (lists, maps), an `i64 | null` field, and the identity

@@ -311,7 +311,8 @@ function loadTpl(path: string): Tpl {
 }
 
 // The template's own positions: each `@@CELL_<name>@@` section in file order, as
-// [name, body, want]. A first body line `// want: X` overrides WANT for that cell.
+// [name, body, want, owed]. Leading body lines `// want: X` override WANT for that cell, and
+// `// owed-annotated: X` names a check refusal the design owes in the annotated face.
 function ownCells(
   s: Map<string, string>,
   order: string[],
@@ -328,15 +329,25 @@ function ownCells(
     }
     let body = section(s, m)
     let want = ""
-    const nl = findFrom(body, "\n", 0)
-    const first = if nl >= 0 { body.slice(0, nl) } else { body }
-    if startsWith(stripWs(first), "// want:") {
-      const w = stripWs(first)
-      want = stripWs(w.slice(8, w.length))
-      body = if nl >= 0 { stripNl(body.slice(nl + 1, body.length)) } else { "" }
+    let owed = ""
+    let more = true
+    while more {
+      more = false
+      const nl = findFrom(body, "\n", 0)
+      const first = stripWs(if nl >= 0 { body.slice(0, nl) } else { body })
+      const rest = if nl >= 0 { stripNl(body.slice(nl + 1, body.length)) } else { "" }
+      if startsWith(first, "// want:") {
+        want = stripWs(first.slice(8, first.length))
+        body = rest
+        more = true
+      } else if startsWith(first, "// owed-annotated:") {
+        owed = stripWs(first.slice(18, first.length))
+        body = rest
+        more = true
+      }
     }
     if body == "" { die("\{path}: @@\{m}@@ has no program", 1) }
-    out.push([name, body, want])
+    out.push([name, body, want, owed])
   }
   out
 }
@@ -889,6 +900,15 @@ function buildAt(t: Tpl, pos: string, face: string): Built {
   skipped("")
 }
 
+// The refusal the design owes at template cell `pos` in `face`, or "".
+function owedRefusal(t: Tpl, pos: string, face: string): string {
+  if face != "ann" { return "" }
+  for c in t.cells {
+    if c[0] == pos { return c[3] }
+  }
+  ""
+}
+
 // The built-in positions, then the template's own cells.
 function positionsOf(t: Tpl): string[] {
   const out: string[] = []
@@ -960,7 +980,16 @@ function gradeAll(t: Tpl, seed: string, r: Run): Map<string, Cell> {
         detail = g.out
         if detail == "" { detail = "(no output)" }
       }
-      cells[key] = { verdict: g.verdict, detail: detail }
+      let verdict = g.verdict
+      const owed = owedRefusal(t, pos, face)
+      if (
+        owed != ""
+        && startsWith(verdict, "check refuses")
+        && contains(detail, owed)
+      ) {
+        verdict = "OWED"
+      }
+      cells[key] = { verdict: verdict, detail: detail }
     }
   }
   cells
@@ -969,6 +998,7 @@ function gradeAll(t: Tpl, seed: string, r: Run): Map<string, Cell> {
 function short(c: Cell): string {
   if c.verdict == "RUNS" { return "RUNS" }
   if c.verdict == "skipped" { return "skipped" }
+  if c.verdict == "OWED" { return "owed refusal" }
   if c.verdict == "WRONG" {
     return "WRONG " + cpPrefix(replaceAll(c.detail, "\n", " / "), 40)
   }
@@ -1162,6 +1192,7 @@ function main(args: string[]): i32 {
   let runs = 0
   let silentN = 0
   let skippedN = 0
+  let owedN = 0
   let other = 0
   let total = 0
   const lostKeys: string[] = []
@@ -1180,6 +1211,8 @@ function main(args: string[]): i32 {
         silentKeys.push(key)
       } else if c.verdict == "skipped" {
         skippedN = skippedN + 1
+      } else if c.verdict == "OWED" {
+        owedN = owedN + 1
       } else {
         other = other + 1
         if c.verdict == "TRAP (program)" { trapKeys.push(key) }
@@ -1194,8 +1227,10 @@ function main(args: string[]): i32 {
   const lost = sorted(lostKeys)
   const silent = sorted(silentKeys)
   const traps = sorted(trapKeys)
+  let owedPart = ""
+  if owedN > 0 { owedPart = " · \{toString(owedN)} owed refusals" }
   print(
-    "\nruns \{toString(runs)} of \{toString(total - skippedN)} graded · \{toString(skippedN)} skipped · \{toString(silentN)} silent · \{toString(other)} other",
+    "\nruns \{toString(runs)} of \{toString(total - skippedN - owedN)} graded\{owedPart} · \{toString(skippedN)} skipped · \{toString(silentN)} silent · \{toString(other)} other",
   )
   let lostTail = ""
   if lost.length > 0 { lostTail = "   " + join(lost, ", ") }

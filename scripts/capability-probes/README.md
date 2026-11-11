@@ -92,7 +92,9 @@ first marker is a free header.
     @@CELL_<name>@@   a position of the template's own, graded in both faces after the built-in
                   ones: a whole program (after PRELUDE) with `__V__` the value, `__TY__` its type,
                   and `__A__` / `__LA__` the annotation `: TYPE` / `: TYPE[]` in the annotated face
-                  and nothing in the other; a first line `// want: X` overrides WANT for it
+                  and nothing in the other; a leading `// want: X` overrides WANT for it, and
+                  `// owed-annotated: X` grades a check refusal holding X in the annotated face
+                  as OWED, a refusal the design owes, outside the graded count
 
 **The `block_*` six were added for D1244**, whose shape — a closure capturing a ref local
 declared in a MODULE-SCOPE block — none of the original twenty could reach, so
