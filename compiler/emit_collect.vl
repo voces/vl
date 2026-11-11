@@ -58,7 +58,7 @@ import {
   recCopyTyOf,
   recordJoinSeen,
 } from "./check_core_state"
-import { canonEmitNameOfTy, canonUnionMembersInto } from "./check_program"
+import { canonEmitNameOfTy } from "./check_program"
 import { recAdAnnDropped } from "./check_rec_adopt_rows"
 import { assignable, substTyDeep } from "./check_relate_core"
 import { isListArmNodes, isVarTyIxOf } from "./check_list_union"
@@ -99,6 +99,7 @@ import {
   TY_BOOL,
   TY_NEVER,
   TY_NULL,
+  TY_STR,
   TY_VOID,
   TyArray,
   TyErr,
@@ -487,6 +488,8 @@ import {
   sHeapIdx,
   sLateRowsOff,
   sLitIdRow,
+  sLitIdTyRows,
+  sLitIdTys,
   sLitMintFn,
   sLitMintRow,
   sNames,
@@ -567,6 +570,8 @@ import {
   recordSTyIx,
   recordUFieldElemRowTy,
   recordUnMemTys,
+  repElemId,
+  repElemIdOfNameTy,
   repOfTy,
   repRowOfTyStruct,
   repSigKindOfTy,
@@ -761,6 +766,7 @@ import {
   ALK_I64,
   annRefArrElemRow,
   arrElemIsClosureTy,
+  arrLitArenaElemRow,
   arrLitNestedElemKind,
   arrLitNestedElemName,
   arrLitNulRefElemName,
@@ -871,6 +877,7 @@ import {
   unRowOfCanonFolded,
   unRowOfKeyOrMembers,
   unVarSliceAdoptKeySibling,
+  unionAtomTysAlignedOf,
   unionAtomTysOf,
   unionMemberAtomsOf,
   unionSetAtomsOf,
@@ -5208,6 +5215,18 @@ function collectAUnionRows() {
   }
 }
 
+// The list mint's key hint for literal `i`: `arrLitElemHintTy`, else the literal's own closed
+// element type where it keys the row the name already keys. A hole or a type parameter is no
+// key; a declined hint keys on the name.
+function arrLitMintHintTy(i: i32): i32 {
+  const h = arrLitElemHintTy(i)
+  if h >= 0 { return h }
+  const e = arrLitArenaElemRow(i)
+  if e < 0 || tyHasInferHole(e, 0) || tyHasTyVar(e) { return -1 }
+  if repElemIdOfNameTy(arrLitElemName(i, -1), -1) != repElemId(e) { return -1 }
+  e
+}
+
 // `collectA`'s arm for the list literal at node `i`: the list flags and ref-list rows its
 // element type needs. Never fails.
 function collectAArrayLit(i: i32, nd: ArrayLit) {
@@ -5283,7 +5302,7 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       } else if elemKind != RLK_STRUCT || !arrLitRepElemRow(i) {
         recordArrLitRlSlot(
           i,
-          rlInternNameTy(arrLitElemName(i, -1), elemKind, arrLitElemHintTy(i)),
+          rlInternNameTy(arrLitElemName(i, -1), elemKind, arrLitMintHintTy(i)),
         )
       }
       if elemKind == RLK_STRUCT { arrLitInstElemRows(nd) }
@@ -5672,7 +5691,9 @@ export function collectAnnShapes() {
       // Ahead of the intern, which codes each field: an arm-typed field needs the arm's own
       // row to exist before `armFieldStructRow` is asked for it (D1672).
       internArmFieldShapeTy(root, 0)
-      internShapeDeepTy(tn.tyName, root)
+      // An annotation the checker typed nothing at, such as a type parameter's bound, is not
+      // the type of any value, so it has no shape to intern.
+      if root >= 0 { internShapeDeepTy(tn.tyName, root) }
     }
     ti = ti + 1
   }
@@ -6003,6 +6024,17 @@ function pinSubstObjLitTy(objIx: i32, fnIx: i32, lt: i32): i32 {
   st
 }
 
+// The row a literal holding a tagged set's id at a record type the same as `t` is built at; -1
+// when there is none.
+function litIdRowOfSameTy(t: i32): i32 {
+  let i = 0
+  while i < sLitIdTys.length && i < sLitIdTyRows.length {
+    if tySame(sLitIdTys[i], t) { return sLitIdTyRows[i] }
+    i = i + 1
+  }
+  -1
+}
+
 // Interns the row of the record literal at `objIx` at instance `fnIx`'s pins, when a field of
 // its recorded type is a type parameter and every such field's value has a pin.
 function mintPinnedObjLit(objIx: i32, fnIx: i32) {
@@ -6047,8 +6079,20 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
     }
     // Another literal's row already denoting the instance's record type is this one's too.
     const lro = lr >= 0 && lr < T.tys.length && tyAt(lr) is TyObj
-    const known = if lro { structIndexOfTy(lr) } else { -1 }
-    if !sLitIdRow.has(objIx) && known >= 0 { sLitIdRow.set(objIx, known) }
+    let known = if lro { structIndexOfTy(lr) } else { -1 }
+    // So is the row a literal of the same record type in another function is built at.
+    if known < 0 && lro && !sLitIdRow.has(objIx) {
+      known = litIdRowOfSameTy(lr)
+      if known >= 0 {
+        structTyMarkAliasable(lr)
+        structTyIxAlias(lr, known)
+      }
+    }
+    if !sLitIdRow.has(objIx) && known >= 0 {
+      sLitIdRow.set(objIx, known)
+      sLitIdTys.push(lr)
+      sLitIdTyRows.push(known)
+    }
     // So is the row another instance builds this literal at, which this instance's record type
     // then denotes too (D15638).
     const had = sLitIdRow.get(objIx) ?? -1
@@ -6067,6 +6111,8 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
         if lr >= 0 && lr < T.tys.length && tyAt(lr) is TyObj {
           structTyMarkAliasable(lr)
           structTyIxAlias(lr, sNames.length - 1)
+          sLitIdTys.push(lr)
+          sLitIdTyRows.push(sNames.length - 1)
         }
       }
       // Instances holding no id keep the literal's own mint (-1 for none).
@@ -6841,6 +6887,8 @@ function structTableReset() {
   sLitMintRow = Map()
   sLitMintFn = Map()
   sLitIdRow = Map()
+  sLitIdTys = []
+  sLitIdTyRows = []
   sFieldNames = []
   sFieldStart = []
   sFieldCount = []
@@ -7386,6 +7434,7 @@ function demoteLitFieldToString(vi: i32, fi: i32): i32 {
   if armStageTypes[r] != FC_STR {
     armStageTypes[r] = FC_STR
     armStageElemName[r] = nm
+    storeTyPut(armStageStoreTy, r, TY_STR)
     uFieldReLayNote()
     setUFieldElemRowTy(r, lty)
   }
@@ -7395,6 +7444,7 @@ function demoteLitFieldToString(vi: i32, fi: i32): i32 {
     if sFieldTypes[sr] != FC_STR {
       sFieldTypes[sr] = FC_STR
       sFieldElemName[sr] = nm
+      storeTyPut(sFieldStoreTy, sr, TY_STR)
       tyRegNoteWrite()
       setSFieldElemRowTy(sr, lty)
     }
@@ -7768,48 +7818,6 @@ function isVariantBoxUnionOfTy(
   const tys: i32[] = []
   unionAtomTysAlignedOf(ty, atoms, tys)
   isVariantBoxUnionAtoms(stmts, atoms, tys)
-}
-
-// Pushes the arena type of each atom of `atoms`, a spelling of union type `ty`, onto `out`: the
-// canonical member whose atom spells the same, so a pin that spells the members in another
-// order still pairs each atom with its own type. When some atom spells no canonical member,
-// the atoms pair by position (`unionAtomTysOf`).
-function unionAtomTysAlignedOf(ty: i32, atoms: string[], out: i32[]): i32 {
-  const cTys: i32[] = []
-  const cAtoms: string[] = []
-  if (
-    atoms.length > 1
-    && canonUnionMembersInto(ty, cTys, cAtoms)
-    && cAtoms.length == cTys.length
-  ) {
-    const used: boolean[] = []
-    for _c in cAtoms { used.push(false) }
-    const got: i32[] = []
-    let all = true
-    for a in atoms {
-      let at = -1
-      if a != "null" {
-        let hit = -1
-        let k = 0
-        while k < cAtoms.length && hit < 0 {
-          if !used[k] && cAtoms[k] == a { hit = k }
-          k = k + 1
-        }
-        if hit < 0 {
-          all = false
-        } else {
-          used[hit] = true
-          at = cTys[hit]
-        }
-      }
-      got.push(at)
-    }
-    if all {
-      for g in got { out.push(g) }
-      return 0
-    }
-  }
-  unionAtomTysOf(ty, atoms, out)
 }
 
 // `registerInlineUnionAt`'s pass over the atoms of a union of two or more: refuses a map
@@ -9585,7 +9593,7 @@ function nulCloMixedUnionUnregistered(arm: string, ty: i32) {
     if ft is TyFunc { rt = ft.fnRet } else { rt = -1 }
   }
   const tys: i32[] = []
-  unionAtomTysOf(rt, atoms, tys)
+  unionAtomTysAlignedOf(rt, atoms, tys)
   let hasScalar = false
   let hasComposite = false
   let i = 0
