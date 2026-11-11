@@ -93,7 +93,8 @@ parse converts.
   column, and F3 on Family B;
 - `scalarListRepOfName` and `nulScalarListKind`, which die with those ladders (coordinator ruling,
   #7303);
-- `retStructRowIndex`'s name rung: 109 programs, waiting on `(type, declaration)` row keys (#7296).
+- `retStructRowIndex`'s name rung (109 programs, #7296): it switches to the type with the struct
+  and variant name producers, below (w324).
 
 **Rows minted under a name:** `rlRowNameOfTy` (16) is w311's (ref-list rows keyed by type and
 declaration). The 15 slot-layer name producers are below, under L6.
@@ -131,8 +132,12 @@ SPELLING pair is a named floor". There are 14 + 2 today.
 
 Family B's grading puts most of the struct names on one road. #7269 grades `variantIndexOf`'s 53
 sites, #7294 grades `structRowOfSpelling` and `armFieldStructRow`, and #7300 names the step-7
-remainder as `retStructRowIndex`'s name rung. Every site left is a spelling ladder or a mint that
-waits on struct rows keyed by `(type, declaration)`.
+remainder as `retStructRowIndex`'s name rung. w324's census (#7306) then shows that no
+`(type, declaration)` key is needed:
+
+- a newtype brand is erased;
+- twins and arms share heaps;
+- D1023 is a value test, not a row key.
 
 **In flight:**
 
@@ -145,9 +150,9 @@ waits on struct rows keyed by `(type, declaration)`.
 
 **Floor or convert:**
 
-- **The struct and variant name producers (11):** the floor until struct rows key by
-  `(type, declaration)`. That key is not built and has no lane: Family B (w319, w324) grades the
-  sites, but no lane owns the key itself. **This is the one unowned item in step 7.**
+- **The struct and variant name producers (11), and `retStructRowIndex`'s name rung:** convert.
+  Each switches to the type and is deleted. w324 owns it, in cuts (#7306). Nothing in step 7 is
+  unowned.
 - **The ref-list name producers (4):** w311. #7236 names three of them floors.
 - **The union registry's name entries, `canonUnionKeyOfName` and the inline-union mint:** convert,
   on the union registry's cut order items 5b–6 (w316).
@@ -161,7 +166,8 @@ waits on struct rows keyed by `(type, declaration)`.
 
 **Exit items:**
 
-- the `(type, declaration)` struct-row key, which is unowned;
+- the 11 struct and variant name producers and `retStructRowIndex`'s rung switched to the type
+  and deleted (w324, #7306);
 - the union registry's cut order completed (w316);
 - a per-registry list for the spelling-keyed maps, which needs an instrument;
 - a ruling on the eight equality notions.
@@ -182,11 +188,10 @@ asked.
 - **Why it grew:** each step-7 conversion added a typed read where a name read was, and an
   invariant `emitFail` where a silent default was (`2026-11-11-step7-classify-trim-1.md`).
 - **Not reachable from in-flight work.** The lines that go with step 7's remainder are the name
-  ladders' callers. They leave when the `(type, declaration)` key and the union cut order land, and
-  their size is not estimated here.
-- **Proposed:** re-baseline the target to the reading at step 7's close, with that reason. Or grade
-  the file by the classifier census's NAME and SPELLING readers in it, which is what the target was
-  standing in for.
+  ladders' callers. They leave with w324's switch of the name producers and the union cut order,
+  and their size is not estimated here.
+- **Ruled (coordinator, 2026-11-11):** re-baseline the target at step 7's close, with that reason,
+  graded by the measure it stood in for: the classifier census's NAME and SPELLING readers.
 
 **seed ↓.**
 
@@ -202,9 +207,9 @@ asked.
 - **In flight:** no open PR is a large deletion.
 - **Not reachable from in-flight work.** §4.2 expects step 7 to cut the seed sharply (↓↓); the
   deletions that would do it are the name ladders, the same set as emit_classify's.
-- **Proposed:** grade "seed ↓" at step 7's close, against the 6,589,035 gate baseline, after the
-  `(type, declaration)` key and the union cut order land. If it is not met then, re-baseline it
-  with the conversions' cost named, as `2026-11-01-seed-growth.md` did for an earlier step.
+- **Ruled (coordinator, 2026-11-11):** re-baseline at step 7's close, with the conversions' cost
+  named, as `2026-11-01-seed-growth.md` did for an earlier step. It is graded by the measure it
+  stood in for: the name ladders deleted.
 
 ## The list to close step 7 against
 
@@ -217,10 +222,11 @@ asked.
      and 1 in `ensureRefElemTys` (w311);
    - the 14 ARENA + NAME and 2 ARENA + SPELLING pairs named.
 3. **L6:**
-   - **unowned:** the `(type, declaration)` struct-row key;
+   - the 11 struct and variant name producers and `retStructRowIndex`'s rung switched to the type
+     (w324, #7306);
    - the union cut order items 5b–6 (w316);
    - the ref-list name producers (w311);
    - an instrument listing the spelling-keyed maps by reader;
    - a ruling on the equality notions.
-4. **The scoreboard:** re-baseline both targets at the close with their reason, or grade them by
+4. **The scoreboard (ruled):** re-baseline both targets at the close with their reason, graded by
    the measures they stood in for. They are not landing criteria.
