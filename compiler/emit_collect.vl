@@ -41,7 +41,6 @@ import {
 } from "./check_elab_cap"
 import {
   annGenAppSpanEnds,
-  arrElemIs,
   gaeArgsTextOf,
   gaeHeadNameOf,
   gaeLtAt,
@@ -115,6 +114,7 @@ import {
   genAppNameOfTy,
   litUnionAliasOfLitTexts,
   litUnionInlineNameOfTy,
+  numLitUnionBaseName,
   structNameOfTy,
   tyArrayElemIx,
   tyArrayElemPrim,
@@ -123,6 +123,7 @@ import {
   tyFieldTyOf,
   tyHasInferHole,
   tyHoldsObj,
+  tyIsFuncArena,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsMap,
@@ -198,7 +199,6 @@ import {
   valueIfNodes,
 } from "./ast"
 import {
-  annGenAppDecompose,
   annRetNameOf,
   bodyLetOfRead,
   declStructIndexBuild,
@@ -216,15 +216,12 @@ import {
   nameIsF32Array,
   nameIsF64Array,
   nameIsI64Array,
-  nameIsNulString,
   nameIsShapeSpanEnds,
-  nameIsString,
   nameIsStringArray,
   nameIsU8Array,
   nodeIsTypeDecl,
   normTypeAtom,
   nulLitUnionInnerNameOfTy,
-  nullablePartOf,
   shapeInnerFieldSplit,
   strLess,
   tyIsFuncType,
@@ -438,9 +435,9 @@ import {
   mvLateSlotsOff,
   mvLateSlotsOn,
   mvMapTypeIdx,
-  mvNameMintOn,
   mvRlSlot,
   mvTwin,
+  mvTyMintOn,
   mvValArmSig,
   mvValKind,
   mvValName,
@@ -777,9 +774,6 @@ import {
   forceScalarListRep,
   mvCanonRepOf,
   nameIsConcreteGenAppDecl,
-  nameIsNulRefList,
-  nameIsRefArray,
-  nulScalarListKind,
   refArrElemKind,
   refListElemKindOfTy,
   rlElemInnerSlot,
@@ -842,7 +836,7 @@ import {
   mintValueUnionRowOfTy,
   mvShapeOfMapHeldTy,
   mvShapeOfMapNodeTy,
-  mvShapeOfValNameRowTy,
+  mvShapeOfValTyMint,
   refRowIndexReset,
   registerValueUnionName,
   registerValueUnionNameAB,
@@ -4380,7 +4374,7 @@ export function mAssignTypeIndices(_n: i32) {
   rvAssignViews()
   // Second pass: fill the NON-i32 nested-list ref-list element heaps now that the inner
   // string/f64/i64 list wrappers exist (a `string[]`/`f64[]`/`i64[]`-VALUED map's vals
-  // ref-list — kinds 6/7/8). The wrappers are forced by `mvShapeOfValNameRowTy` (a first ask
+  // ref-list — kinds 6/7/8). The wrappers are forced by `mvShapeOfValTyMint` (a first ask
   // mints them), so the index is real here.
   let rsfix = 0
   while rsfix < rlElemName.length {
@@ -4399,7 +4393,7 @@ export function mAssignTypeIndices(_n: i32) {
       // `canon` means the value-name leg canonicalizes (`mvCanonValNameTy`) before its lookup: the
       // mv table is keyed canonically, so a raw element-map name would miss the slot and leave
       // the element heap at the shared mono map while the map's own binding uses the box-backed
-      // struct. Mirrors `mvShapeOfValNameRowTy`; the arena leg folds that itself.
+      // struct. Mirrors `mvShapeOfValTyMint`; the arena leg folds that itself.
       const mmv = rlMapElemValSlot(rmf)
       if mmv >= 0 { rlElemHeap[rmf] = mvMapTypeIdx[mmv] }
     }
@@ -4813,51 +4807,8 @@ function mvKeysWrapMint(mvi: i32) {
   else { mkListTy() }
 }
 
-// The one home of "reserve the backing and wrapper heap types the type name `a` needs". A
-// presence flag is a reservation: `mAssignTypeIndices` mints a heap type only where the flag is
-// set, and an unminted index falls through to `mNextType`, so a missed reservation is
-// check-clean invalid wasm rather than a missing feature. Monotone, so a redundant call is inert.
-function forceAnnLeafReps(a: string): i32 {
-  if nameIsStringArray(a) {
-  } else if nameIsF64Array(a) {
-    // The f64 pair mints on first read (`fa64Ty`).
-  } else if nameIsI64Array(a) {
-    // The i64 pair mints on first read (`ia64Ty`).
-  } else if nameIsF32Array(a) {
-    // The f32 pair mints on first read (`fa32Ty`).
-  } else if nameIsBareMap(a) {
-    // The map struct mints on first ask (`mapTy`).
-  } else if arrElemIs(a, "i32") || arrElemIs(a, "boolean") {
-  } else if nameIsString(a) || nameIsNulString(a) {
-  } else if nulScalarListKind(a) != null {
-    const nsk = nulScalarListKind(a)
-    // Exhaustive over `VKind` and `_`-less, `null` included: each of the five marks its own
-    // backing, and a new leaf must say whether it needs one (D1898). The `null` alternative
-    // is unreachable under the guard above and is named because the language requires it.
-    match nsk {
-      "nulstrlist" => {}
-      "nulf64list" => {
-        // The f64 pair mints on first read (`fa64Ty`).
-      }
-      "nuli64list" => {
-        // The i64 pair mints on first read (`ia64Ty`).
-      }
-      "nulf32list" => {
-        // The f32 pair mints on first read (`fa32Ty`).
-      }
-      "nulu8list" => {
-        // The packed byte pair mints on first read (`ba8Ty`).
-      }
-      "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
-        // Not a nullable scalar list, so it marks no backing here.
-      }
-    }
-  }
-  0
-}
-
-// `forceAnnLeafReps` for the list type `kTy`, read off its arena element: a scalar element
-// list reserves its backing, and any other list reserves nothing here.
+// Reserve the backing and wrapper heap types list type `kTy` needs, read off its arena element:
+// a scalar element list reserves its backing, and any other list reserves nothing here.
 function forceListLeafRepsOfTy(kTy: i32): i32 {
   const k = tyAt(kTy)
   if !(k is TyArray) || k.aElem < 0 || k.aElem >= T.tys.length { return 0 }
@@ -4885,28 +4836,8 @@ function forceListLeafRepsOfTy(kTy: i32): i32 {
     }
     "i32" | "boolean" => {}
     "void" | "null" | "never" | "u8" | "v128" => {
-      // Not an element `forceAnnLeafReps` reserves a backing for.
+      // No backing to reserve for this element.
     }
-  }
-  0
-}
-
-// Reserve the reps a generic application's type arguments need. They are invisible to every
-// branch of `collectA`'s `TypeRef` ladder, since the whole spelling `Box<string>` is one name, so
-// without this `aTypeIdx` names whatever heap type sits at an index never allocated. Flag-only
-// and outside the ladder: it bypasses no arm, and at worst allocates a type nothing needed.
-function forceGenAppArgTypes(name: string): i32 {
-  if !annGenAppSpanEnds(name) { return 0 }
-  const args: string[] = []
-  const head = annGenAppDecompose(name, args)
-  if head == "" { return 0 }
-  let i = 0
-  while i < args.length {
-    const a = args[i]
-    // A nested application (`Box<Pair<i32, string>>`) is the same reservation one rung in.
-    forceGenAppArgTypes(a)
-    forceAnnLeafReps(a)
-    i = i + 1
   }
   0
 }
@@ -4937,8 +4868,8 @@ function tyElemIsStrListLeaf(e: i32): boolean {
   tyNulInnerIsPrim(e, "string")
 }
 
-// `forceAnnLeafReps` for arena type `t`: the backing and wrapper heap types a closure field's
-// result or parameter of that type needs. A type it does not name reserves nothing.
+// Reserve the backing and wrapper heap types a closure field's result or parameter of arena type
+// `t` needs. A type it does not name reserves nothing.
 function forceAnnLeafRepsOfTy(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return 0 }
   const k = tyAt(t)
@@ -5451,17 +5382,12 @@ function annNicheNulElemInner(annIx: i32): i32 {
 // forces the wrapper and backing of the non-null ref-array name and banks the interned row on
 // node `i`. Returns 0, or -1 once a niche-nullable element with no list rep has failed loudly.
 function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
-  let ran = nd.tyName
-  const ranp = nullablePartOf(ran)
-  // "Is this the NULLABLE ref-list spelling" — asked ONCE, and read again twenty
-  // lines down to set the banked row's null flag. The second read is by construction
-  // the same answer: `ranp` is never rewritten and no intern runs between them.
-  const ranIsNul = ranp != "" && tyIsNulRefArray(fdRowOf(i))
-  if ranIsNul { ran = ranp }
-  // The element kind, classified once for the seven reads in this arm, which straddle the
-  // `ensureRefElem` intern — the only call between them that mutates a table the classifier
-  // reads. It is the recorded element type's; `ran`'s spelling is the floor for a node with no
-  // type or a declined one, and `ran` is final here: the `| null` peel above is its last write.
+  // Whether the annotation is the nullable list, asked of its type.
+  const ranIsNul = tyIsNulRefArray(fdRowOf(i))
+  // The element kind, classified once before the `ensureRefElem` intern, the only call here
+  // that mutates a table the classifier reads. It is the recorded element type's; the spelling
+  // is the floor for a non-null node with no type or a declined one. A nullable list's declined
+  // element (a type parameter, a union of lists) is no niche, so its kind is not read.
   const raTy = annRefArrElemRow(i)
   let raKind = refListElemKindOfTy(raTy)
   // A literal-union element is a scalar list, whatever its spelling classifies as.
@@ -5469,7 +5395,7 @@ function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
     recordAnnRlSlot(i, -1, 0)
     return 0
   }
-  if raKind < 0 { raKind = refArrElemKind(ran) }
+  if raKind < 0 && !ranIsNul { raKind = refArrElemKind(nd.tyName) }
   // The element row's name, from the annotation's recorded element type; an anonymous record
   // element, which renders no name, is its canonical record row.
   let ren = rlRowNameOfTy(raTy, false)
@@ -5548,15 +5474,29 @@ function annScalarOrOpenArray(i: i32, nd: TypeRef): boolean {
     || annArrOverTyParam(i)
 }
 
+// Whether the written annotation at node `i` is a ref list or a nullable one, asked of its
+// recorded type. A list of a numeric literal union is stored as its scalar base, not by
+// reference; an unwritten parameter node is not an annotation.
+function annTyIsRefList(i: i32, nd: TypeRef): boolean {
+  const ty = nodeTyIxOf(i)
+  if ty < 0 || nd.tyName == "" { return false }
+  if !(tyIsRefArray(ty) || tyIsNulRefArray(ty)) { return false }
+  const e = tyStepElem(tyPeelNul(ty))
+  e < 0 || numLitUnionBaseName(e) == ""
+}
+
 // `collectA`'s arm for the annotation at node `i`: the heap types, list and map rows its
 // spelling forces. Returns 0, or -1 once a spelling with no rep has failed loudly.
 function collectATypeRef(i: i32, nd: TypeRef) {
   // A closure that is a struct field reserves nothing through the rung below —
   // see `forceNestedCloSigRepsOfTy`, which walks into the annotation's type for it.
   forceNestedCloSigRepsOfTy(nodeTyIxOf(i), 0)
-  // A top-level function type (`(i32) => R`) forces nothing here: its result's types are forced
-  // by `forceNestedCloSigRepsOfTy` above, and its trailing `[]` is not an array.
-  if annRetNameOf(nd.tyName) != "" {
+  // A function type forces nothing here: its result's types are forced by
+  // `forceNestedCloSigRepsOfTy` above. Asked of the recorded type; an untyped annotation is a
+  // function when its spelling has a top-level arrow, whose trailing `[]` is not an array.
+  const annTy = nodeTyIxOf(i)
+  const isFnAnn = if annTy >= 0 { tyIsFuncArena(annTy) } else { annRetNameOf(nd.tyName) != "" }
+  if isFnAnn {
   } else if nameIsBareMap(nd.tyName) && !typeRefIsRecord(i) {
     // A bare map annotation interns its per-(key, value) slot here, since collect scans every
     // `TypeRef`, so the type-index assignment sees the full slot set. An orphaned parser field
@@ -5580,7 +5520,7 @@ function collectATypeRef(i: i32, nd: TypeRef) {
       )
     }
   } else if !annArrayRungsSkip(i, nd) {
-    if nameIsRefArray(nd.tyName) || nameIsNulRefList(nd.tyName) {
+    if annTyIsRefList(i, nd) {
       if collectARefArrayAnn(i, nd) < 0 { return -1 }
     } else if (
       annSpelledArray(i)
@@ -5602,10 +5542,6 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   // finds them even when the program never constructs such a list. Same self-gating
   // placement as the map forcer above.
   forceCloResultListTypes(nodeTyIxOf(i))
-  // The generic-application dual of the two forcers above: a type argument (`Box<string>`,
-  // `Pair<i32, string[]>`) no branch of the chain can see, because the whole `Head<…>` is one
-  // name. Same self-gating placement and the same flag-only contract; see the helper.
-  forceGenAppArgTypes(nd.tyName)
   0
 }
 
@@ -5663,7 +5599,7 @@ export function collectUnionAndHeldRows() {
   rlArmRowMintOn(rlRowOfArmTyMinted)
   armStructRowMintOn(armFieldStructRowMinted)
   rlNameMintOn(rlRowOfNameMinted)
-  mvNameMintOn(mvShapeOfValNameRowTy)
+  mvTyMintOn(mvShapeOfValTyMint)
   // The read-only-covariance write memo is keyed by slot number, which a re-mint and a
   // resumed walk's own new rows both move (D791). Ahead of the fork, since both invalidate it.
   rlWrSlots = []
