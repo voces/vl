@@ -9,6 +9,102 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-11-step7-union-registry-census](2026-11-11-step7-union-registry-census.md): Step 7 L6: where the union registry is keyed by a spelling, measured against the type.
+- [2026-11-11-step7-union-reg-clean-sites](2026-11-11-step7-union-reg-clean-sites.md): Step 7 L6: 18 typed registry lookups ask the canonical type key.
+- [2026-11-11-step7-slot-variant-name-rows](2026-11-11-step7-slot-variant-name-rows.md): Step 7 slot layer: three variant-bank name producers deleted.
+- [2026-11-11-step7-slot-reflist-name-rungs](2026-11-11-step7-slot-reflist-name-rungs.md): Step 7 slot layer: two ref-list name rungs deleted, and an anonymous ref-list field records its element type.
+- [2026-11-11-step7-slot-mv-name-rungs](2026-11-11-step7-slot-mv-name-rungs.md): Step 7 slot layer: the map-value bank's name rungs deleted, and the mv key made structural.
+- [2026-11-11-step7-slot-mv-kind-of-ty](2026-11-11-step7-slot-mv-kind-of-ty.md): Step 7 slot layer: the map-value kind read off the type, and four name producers deleted.
+- [2026-11-11-step7-l2-tvv-union-rest-pin](2026-11-11-step7-l2-tvv-union-rest-pin.md): Step 7 L2 §7: the union-rest pin is decided by type.
+- [2026-11-11-step7-l2-tvv-presence-reads](2026-11-11-step7-l2-tvv-presence-reads.md): Step 7 L2 §7: thirteen `tvV` reads that asked only "is it bound".
+- [2026-11-11-step7-l2-tvv-layout-and-d6090](2026-11-11-step7-l2-tvv-layout-and-d6090.md): Step 7 L2 §7: the layout constant and the D6090 guard read the binding's type.
+- [2026-11-11-step7-famb-decl-identity-census](2026-11-11-step7-famb-decl-identity-census.md): Step 7 slot layer, family B: what the checker would record as a record's declaration identity.
+- [2026-11-11-d15656-list-of-join-of-kept-calls](2026-11-11-d15656-list-of-join-of-kept-calls.md): D15656: a list literal of a kept-call join's binding is built where the arms are.
+- [2026-11-11-d15655-held-call-list-part](2026-11-11-d15655-held-call-list-part.md): D15655: a binding of a call's fresh record is built where a list literal holding it is.
+- [2026-11-11-d15654-join-of-kept-maker-calls](2026-11-11-d15654-join-of-kept-maker-calls.md): D15654: a join of kept-maker calls is built where its arms are.
+- [2026-11-11-d15643-sets-sharing-a-member](2026-11-11-d15643-sets-sharing-a-member.md): D15643: choices of sets that share a member are decided together.
+- [2026-11-10-step7-vkind-ty-list-ladders](2026-11-10-step7-vkind-ty-list-ladders.md): Step 7: the arena-type list ladders read the descriptor.
+- [2026-11-10-step7-vkind-scalar-list-elem](2026-11-10-step7-vkind-scalar-list-elem.md): Step 7: `scalarListElemKind` is one descriptor read.
+- [2026-11-10-step7-vkind-census](2026-11-10-step7-vkind-census.md): Step 7: where a VKind is produced, the slot producers re-counted, and the three twin pairs.
+- [2026-11-10-step7-union-name-of-read](2026-11-10-step7-union-name-of-read.md): Step 7: `unionNameOfRead` names its storage type's row.
+- [2026-11-10-step7-struct-name-rungs-measured](2026-11-10-step7-struct-name-rungs-measured.md): Step 7: four struct-bank name rungs, measured against a type-only answer.
+- [2026-11-10-step7-struct-index-of-expr](2026-11-10-step7-struct-index-of-expr.md): Step 7: `structIndexOfExpr` reads a read's storage row, else its rep's struct row.
+- [2026-11-10-step7-slot-ufield-tgt-name-rung](2026-11-10-step7-slot-ufield-tgt-name-rung.md): Step 7 slot layer: `uFieldTgtStructIdx`'s name rung is deleted.
+- [2026-11-10-step7-slot-sfield-tgt-name-rung](2026-11-10-step7-slot-sfield-tgt-name-rung.md): Step 7 slot layer: `sFieldTgtStructIdx`'s name rung is deleted.
+- [2026-11-10-step7-slot-name-or-ty-rows](2026-11-10-step7-slot-name-or-ty-rows.md): Step 7 slot layer: `structRowOfNameOrTy` is deleted.
+- [2026-11-10-step7-slot-elem-name-rows-storage](2026-11-10-step7-slot-elem-name-rows-storage.md): Step 7 slot layer: `structIdxOfElemNameTy` is deleted, and its two callers read storage.
+- [2026-11-10-step7-rlen-raw-deleted](2026-11-10-step7-rlen-raw-deleted.md): Step 7: `refListElemNameOfExprRaw` deleted; a row-less list names its element record's row.
+- [2026-11-10-step7-retkind-family](2026-11-10-step7-retkind-family.md): Step 7: the return-kind flag family reads the declared type's rep.
+- [2026-11-10-step7-read-rep-slots](2026-11-10-step7-read-rep-slots.md): Step 7: the read rep carries its storage's type and mv slot; `nulVariantIdxOfExpr`'s reads switch.
+- [2026-11-10-step7-preindex-signatures](2026-11-10-step7-preindex-signatures.md): Step 7: a signature's annotations leave `preIndexMintTrees` (2026-11-10).
+- [2026-11-10-step7-preindex-is-arms](2026-11-10-step7-preindex-is-arms.md): Step 7: an `is K[]` arm's row leaves the `preIndexMintTrees` walk (2026-11-10).
+- [2026-11-10-step7-preindex-is-arm](2026-11-10-step7-preindex-is-arm.md): Step 7: an `is K[]` arm's empty list mints its row at its reader (2026-11-10).
+- [2026-11-10-step7-preindex-if-join](2026-11-10-step7-preindex-if-join.md): Step 7: an if-expression's join boxes come from the checker's record, not the pre-pass (2026-11-10).
+- [2026-11-10-step7-preindex-deleted](2026-11-10-step7-preindex-deleted.md): Step 7: `preIndexMintTrees` deleted; a `Map()`/`Set()` slot mints from the checker's record (2026-11-10).
+- [2026-11-10-step7-preindex-call-join-arrnew](2026-11-10-step7-preindex-call-join-arrnew.md): Step 7: the call arm's join atoms and top-level array intrinsic leave `preIndexMintTrees` (2026-11-10).
+- [2026-11-10-step7-nulnone-read-store](2026-11-10-step7-nulnone-read-store.md): Step 7: `exprIsNulNone`'s reads ask their storage.
+- [2026-11-10-step7-nulnone-nulvariant-joins](2026-11-10-step7-nulnone-nulvariant-joins.md): Step 7: `exprIsNulNone` and `nulVariantIdxOfExpr` answer a join by its own rep.
+- [2026-11-10-step7-njkind-rungs-deleted](2026-11-10-step7-njkind-rungs-deleted.md): Step 7: `njKindOfExpr`'s fallback rungs are deleted, and `annSigKeyTy`'s spelling path is measured.
+- [2026-11-10-step7-named-alias-rows](2026-11-10-step7-named-alias-rows.md): Step 7: a named alias or intersection row is found by its type; group 7 re-shadowed.
+- [2026-11-10-step7-named-alias-rows-2](2026-11-10-step7-named-alias-rows-2.md): Step 7: a recursive intersection alias reads its record's row at a parameter and a list.
+- [2026-11-10-step7-mfresult-objrow](2026-11-10-step7-mfresult-objrow.md): Step 7: `mfResultSlotOf` reads the call type's row; `arrLitObjRowTy` is a storage reader.
+- [2026-11-10-step7-map-read-hole-read-storage](2026-11-10-step7-map-read-hole-read-storage.md): Step 7: `mapReadMvSlot` and `unionNameOfHoleRead` read storage.
+- [2026-11-10-step7-lit-atom-joins](2026-11-10-step7-lit-atom-joins.md): Step 7: the literal-atom classifiers answer an `if` by its own rep; `exprNulLitUnion` switched.
+- [2026-11-10-step7-lit-atom-coalesce-link](2026-11-10-step7-lit-atom-coalesce-link.md): Step 7: `exprIsLitAtom` answers a `??` by its join's rep, a minted chain link by its chain's.
+- [2026-11-10-step7-let-cell-slot](2026-11-10-step7-let-cell-slot.md): Step 7: `letCellSlot` and `captureValStructIdx` read the binding's storage.
+- [2026-11-10-step7-l2-render-parse-floors](2026-11-10-step7-l2-render-parse-floors.md): Step 7 L2 §7: spelling floors measured, three type-held parses cut (82 → 79).
+- [2026-11-10-step7-l2-render-classes](2026-11-10-step7-l2-render-classes.md): Step 7 L2 §7: the 41 renders classified, one folded (41 → 40).
+- [2026-11-10-step7-l2-mv-value-ladder-of-ty](2026-11-10-step7-l2-mv-value-ladder-of-ty.md): Step 7 L2 §7: the mv value ladder asks the type (79 → 71 parses).
+- [2026-11-10-step7-l2-mono-typed-node-text](2026-11-10-step7-l2-mono-typed-node-text.md): Step 7 L2 §7: which typed annotation nodes still have their text read.
+- [2026-11-10-step7-l2-mono-pin-decisions](2026-11-10-step7-l2-mono-pin-decisions.md): Step 7 L2 §7: the mono pin decision renders (40 → 39 renders, 71 → 70 parses).
+- [2026-11-10-step7-l2-mono-key-census](2026-11-10-step7-l2-mono-key-census.md): Step 7 L2 §7: where mono keys by a rendered spelling, measured against the type.
+- [2026-11-10-step7-l2-mono-instance-for-by-type](2026-11-10-step7-l2-mono-instance-for-by-type.md): Step 7 L2 §7: `monoInstanceFor` asks the type.
+- [2026-11-10-step7-l2-mono-ann-typeref-nodes](2026-11-10-step7-l2-mono-ann-typeref-nodes.md): Step 7 L2 §7: mono's annotation nodes are built from the pin's type.
+- [2026-11-10-step7-l2-clone-binding-by-type](2026-11-10-step7-l2-clone-binding-by-type.md): Step 7 L2 §7: the body rewrite's substituted annotation reads the instance's typed binding.
+- [2026-11-10-step7-isref-tpl-default](2026-11-10-step7-isref-tpl-default.md): Step 7: `arrLitIsRefTpl` falls back to the emitter's build for its recorded type.
+- [2026-11-10-step7-intersection-alias-rows](2026-11-10-step7-intersection-alias-rows.md): Step 7: an intersection alias's field and nullable positions read its record's row (D14162) (2026-11-10).
+- [2026-11-10-step7-hole-rep-read-key](2026-11-10-step7-hole-rep-read-key.md): Step 7: a hole binding's covered rep is its producer's key; group 2 closes.
+- [2026-11-10-step7-hole-rep-and-kept-row](2026-11-10-step7-hole-rep-and-kept-row.md): Step 7: a hole's covered rep (group 2) and the kept delivery's row (group 8).
+- [2026-11-10-step7-held-list-row-by-type](2026-11-10-step7-held-list-row-by-type.md): Step 7: a held list's record row is minted by type; `heldRepMintUnder` deleted.
+- [2026-11-10-step7-generic-call-kept-join](2026-11-10-step7-generic-call-kept-join.md): Step 7: a generic call is recorded at its instance's kept-apart join, and `exprUnionCall` reads its rep.
+- [2026-11-10-step7-forin-cell-row](2026-11-10-step7-forin-cell-row.md): Step 7: classifier group 3, `forInVarStructIdx` reads its binding's cell row.
+- [2026-11-10-step7-fnsigkeyof-typed](2026-11-10-step7-fnsigkeyof-typed.md): Step 7: `fnSigKeyOf` keys a lifted function by its typed signature.
+- [2026-11-10-step7-fnmap-annotated-cols](2026-11-10-step7-fnmap-annotated-cols.md): Step 7: `buildFnMap`'s annotated return columns are read off the declared type.
+- [2026-11-10-step7-fnmap-2-deleted](2026-11-10-step7-fnmap-2-deleted.md): Step 7: the `buildFnMap#2` pass row is deleted.
+- [2026-11-10-step7-fnlist-rows](2026-11-10-step7-fnlist-rows.md): Step 7: classifier group 3's list-row ladders move to `listRowOfExpr`.
+- [2026-11-10-step7-fnlist-rows-3](2026-11-10-step7-fnlist-rows-3.md): Step 7: three of classifier group 3's rest leave the probe set.
+- [2026-11-10-step7-elemname-tpl-leaf](2026-11-10-step7-elemname-tpl-leaf.md): Step 7: `arrLitElemNameTpl` keys a list of lists by its inner literal's recorded leaf.
+- [2026-11-10-step7-d12465-arm-record-eq](2026-11-10-step7-d12465-arm-record-eq.md): Step 7 Closes: D12465, an arm compared with a same-shape record.
+- [2026-11-10-step7-closing-census](2026-11-10-step7-closing-census.md): Step 7 closing census: the Deletes, Absorbs and Closes lists against master.
+- [2026-11-10-step7-cloret-columns](2026-11-10-step7-cloret-columns.md): Step 7: classifier group 4, the closure result read off the return columns.
+- [2026-11-10-step7-classifier-r28](2026-11-10-step7-classifier-r28.md): Step 7: classifier round 28, `arrLitIsRefTpl` and `arrLitNumKind` graded at their consumers.
+- [2026-11-10-step7-classifier-r27](2026-11-10-step7-classifier-r27.md): Step 7: classifier round 27, the storage readers ruled out and two list-literal classifiers typed.
+- [2026-11-10-step7-classifier-last](2026-11-10-step7-classifier-last.md): Step 7: `cloArrElemSelfKey` is deleted, and no classifier is probed.
+- [2026-11-10-step7-checker-instance-and-join](2026-11-10-step7-checker-instance-and-join.md): Step 7: two checker facts, a copy's instance and a call at its callee's published return.
+- [2026-11-10-step7-arrlitnumkind-rep-width](2026-11-10-step7-arrlitnumkind-rep-width.md): Step 7: `arrLitNumKind` reads the literal's recorded rep width.
+- [2026-11-10-step7-annsig-arm-mint-fields-ty](2026-11-10-step7-annsig-arm-mint-fields-ty.md): Step 7: an arm mint's closure-field signature reads the arm's type.
+- [2026-11-10-set-in-record-member-instance](2026-11-10-set-in-record-member-instance.md): A record field's set of hole functions takes each member's instance at the call.
+- [2026-11-10-set-in-record-literal-handed-to-hole-callee](2026-11-10-set-in-record-literal-handed-to-hole-callee.md): A choice of named functions in a record literal handed to a hole callee.
+- [2026-11-10-set-delivered-to-closed-type-late](2026-11-10-set-delivered-to-closed-type-late.md): A choice of named functions delivered to a closed function type after the elaboration.
+- [2026-11-10-perf-src-section-anchor-once](2026-11-10-perf-src-section-anchor-once.md): `emitSrcSection` derives each row's anchor token once.
+- [2026-11-10-perf-self-build-profile](2026-11-10-perf-self-build-profile.md): The compiler's own cost: L2 self-build and plumb-shape profile.
+- [2026-11-10-perf-seed-opt](2026-11-10-perf-seed-opt.md): The published seed is binaryen `-O` without inlining.
+- [2026-11-10-perf-scratch-scan-fusion](2026-11-10-perf-scratch-scan-fusion.md): The scratch-frame scans, two refused memos, and the unoptimised seed.
+- [2026-11-10-perf-read-atom-kind-memo](2026-11-10-perf-read-atom-kind-memo.md): `readAtomKindOfTy` is remembered per type within a registry generation.
+- [2026-11-10-perf-nul-unit-read-filter](2026-11-10-perf-nul-unit-read-filter.md): `emitExpr` asks the `null`-unit question only of a read that can be one.
+- [2026-11-10-perf-box-names-nothing-structural](2026-11-10-perf-box-names-nothing-structural.md): `boxTyNamesNothing` answers from the type's structure.
+- [2026-11-10-hole-record-field-handon](2026-11-10-hole-record-field-handon.md): A hole function handed on as a record literal's field beside a direct call.
+- [2026-11-10-hole-nested-list-handon](2026-11-10-hole-nested-list-handon.md): A hole function handed on inside a nested list literal beside a direct call.
+- [2026-11-10-hole-in-literal-result](2026-11-10-hole-in-literal-result.md): The result of a call handing a generic on inside a literal.
+- [2026-11-10-generic-arg-handed-on-at-two-types](2026-11-10-generic-arg-handed-on-at-two-types.md): A generic function handed on to a callee calling it at two types.
+- [2026-11-10-d15653-if-join-of-kept-maker](2026-11-10-d15653-if-join-of-kept-maker.md): An `if` or `match` arm calling a kept maker is refused at its own type.
+- [2026-11-10-d15652-list-call-part-copy](2026-11-10-d15652-list-call-part-copy.md): A call part of a list literal is copied into the list's build.
+- [2026-11-10-d15646-set-record-beside-closure-record](2026-11-10-d15646-set-record-beside-closure-record.md): A set's record and a closure's record handed to one hole callee key two instances.
+- [2026-11-10-d15640-record-of-named-function-options](2026-11-10-d15640-record-of-named-function-options.md): D15640: a record of a named function beside a record of a hole function.
+- [2026-11-10-d15640-record-field-set](2026-11-10-d15640-record-field-set.md): D15640: a named function in a record field keeps its set.
+- [2026-11-10-d15640-record-field-matrix](2026-11-10-d15640-record-field-matrix.md): D15640 option 1: the record-field position matrix, measured.
+- [2026-11-10-d15380-relay-of-kept-maker](2026-11-10-d15380-relay-of-kept-maker.md): A `??` default relaying a kept maker's call is refused at its own type.
+- [2026-11-10-d15372-d15375-list-literal-parts](2026-11-10-d15372-d15375-list-literal-parts.md): A fresh record binding as a list part is built where the list is; a generic call's part refuses.
 - [2026-11-09-step7-preindex-held-arm](2026-11-09-step7-preindex-held-arm.md): Step 7: what `preIndexMintTrees` still mints, per arm; its held arm deleted; the mint-order key named.
 - [2026-11-09-step7-held-rep-minted-on-read](2026-11-09-step7-held-rep-minted-on-read.md): Step 7: a held node's rows mint at its first read; `collectAHeldRep` leaves collectA.
 - [2026-11-09-step7-mv-ladder-type-keyed-entry](2026-11-09-step7-mv-ladder-type-keyed-entry.md): Step 7: the mv ladder has a type-keyed entry; the map-twin arm stops rendering its member, render-parse 42 → 41.
