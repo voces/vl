@@ -1,9 +1,26 @@
-# Step 7: the return-kind readers and `buildFnMap`, graded; two ruling paragraphs, 2026-11-11
+# Step 7: the return-kind readers and `buildFnMap`, graded and ruled, 2026-11-11
 
 Closing census 3 (`2026-11-11-step7-closing-census-3.md`) left four items with no owner. This note
 grades A3 (the return-kind family's 4 readers) and D3 (`buildFnMap`). It also writes the
 paragraphs D7b and D7c ask a ruling on, and answers C3's request for a source for D12465's
 "65 cells". Base is master `f63c5c6d`.
+
+## The rulings
+
+The coordinator ruled on each proposal below, 2026-11-11:
+
+- **`retVoidAnnFlag`:** done.
+- **`retValueExitCount` and `retMapInFlight`:** not rep readers. They come off step 7's list.
+- **`retStructRowIndex`:** its name rung is a floor on w324's 109 programs. It waits on
+  `(type, declaration)` row keys.
+- **`buildFnMap`:** by design. It is the function table and its column cache, a pass-structure
+  fact, not a type question.
+- **`repOfNode`:** by design. Each rung reads a checker fact recorded at that node: the instance
+  type, the closed hole element kept out of the type for hover, and the node's own type. It is
+  the per-node face of `repOf(ty)`, not a second producer.
+- **`njKindOfExpr`:** by design. It is one recorded-type read with an invariant `emitFail`. It
+  is kept, not inlined.
+- **D12465's "65 cells":** withdrawn as unsourced.
 
 ## A3: the four readers
 
