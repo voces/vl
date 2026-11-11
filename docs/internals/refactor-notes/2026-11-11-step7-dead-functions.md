@@ -37,7 +37,8 @@ Validation:
 
 ## What was deleted
 
-All 23 functions, in 13 modules:
+All 23, in 13 modules, then a second wave of one: `fieldCodeWidensElem`, a private helper
+whose only caller was `objFieldCodeWidens`. `unused-function` names it once its caller is gone.
 
 | module | functions |
 | --- | --- |
@@ -47,7 +48,7 @@ All 23 functions, in 13 modules:
 | `check_types.vl` | `tyEmitNameKey`, `emitKeyWrapped`, `emitKeyObj`, and their three state cells |
 | `emit_atom_kinds.vl` | `declRowFnFieldFits`, `rowFnFieldFits`, `holeFnTyFieldFits`, `hfvSync`, and the five `hfv*` cells |
 | `emit_elab.vl` | `elabCallBundleRet`, `elabJoinRoundsOf`, and its write-only counter |
-| `emit_field_codes.vl` | `objFieldCodeWidens` |
+| `emit_field_codes.vl` | `objFieldCodeWidens`, then `fieldCodeWidensElem` |
 | `emit_fn_scans.vl` | `blockEndsInSpill`, `ifArmEndsInSpill` |
 | `emit_obj_lit_fits.vl` | `declaredRefArrayName` |
 | `emit_query.vl` | `blockHasValuedReturn`, `ifChainHasValuedReturn` |
@@ -56,6 +57,7 @@ All 23 functions, in 13 modules:
 | `emit_value_sites.vl` | `narrowedNulLitBoxKey` |
 
 - **Comments:** each comment that cited a deleted function now states its own contract.
+- **Imports:** the imports the deletions left unused are removed.
 - **State lists:** the `emitKey*` rows leave `probe-map-classes.tsv` and the state audit's list.
 - **Left alone:** `emit_classify.vl` is held for w314, so its one comment citing
   `declaredRefArrayName` is unchanged.
