@@ -41,7 +41,6 @@ import {
 } from "./check_elab_cap"
 import {
   annGenAppSpanEnds,
-  arrElemIs,
   gaeArgsTextOf,
   gaeHeadNameOf,
   gaeLtAt,
@@ -59,7 +58,7 @@ import {
   recCopyTyOf,
   recordJoinSeen,
 } from "./check_core_state"
-import { canonEmitNameOfTy } from "./check_program"
+import { canonEmitNameOfTy, canonUnionMembersInto } from "./check_program"
 import { assignable, substTyDeep } from "./check_relate_core"
 import { isListArmNodes, isVarTyIxOf } from "./check_list_union"
 import { listDisjointDepth } from "./check_type_shape"
@@ -124,6 +123,7 @@ import {
   tyFieldTyOf,
   tyHasInferHole,
   tyHoldsObj,
+  tyIsFuncArena,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsMap,
@@ -199,7 +199,6 @@ import {
   valueIfNodes,
 } from "./ast"
 import {
-  annGenAppDecompose,
   annRetNameOf,
   bodyLetOfRead,
   declStructIndexBuild,
@@ -217,15 +216,12 @@ import {
   nameIsF32Array,
   nameIsF64Array,
   nameIsI64Array,
-  nameIsNulString,
   nameIsShapeSpanEnds,
-  nameIsString,
   nameIsStringArray,
   nameIsU8Array,
   nodeIsTypeDecl,
   normTypeAtom,
   nulLitUnionInnerNameOfTy,
-  nullablePartOf,
   shapeInnerFieldSplit,
   strLess,
   tyIsFuncType,
@@ -630,6 +626,7 @@ import {
   forInPairIsMapVal,
   forInPairStructIdx,
   forInVarStructIdx,
+  forInWalkKind,
   letBindRepClaims,
   letCellKind,
   letCellSlot,
@@ -778,7 +775,6 @@ import {
   forceScalarListRep,
   mvCanonRepOf,
   nameIsConcreteGenAppDecl,
-  nulScalarListKind,
   refArrElemKind,
   refListElemKindOfTy,
   rlElemInnerSlot,
@@ -827,7 +823,6 @@ import {
   armFieldRowMove,
   armRefRowEnsure,
   buildVariantTwins,
-  ensureRefElem,
   ensureRefElemTy,
   ensureRefElemTys,
   forceCloResultListTypes,
@@ -880,12 +875,7 @@ import {
   unionSetAtomsOf,
   unionSetAtomsOfTy,
 } from "./emit_union_registry"
-import {
-  arrLitElemKind,
-  arrLitInferUnionElemName,
-  forInStringSrc,
-  forInU8Src,
-} from "./emit_value_sites"
+import { arrLitElemKind, arrLitInferUnionElemName } from "./emit_value_sites"
 import {
   litFieldRowIsAtomisable,
   variantFieldIndex,
@@ -2575,79 +2565,18 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
   if fiEk == null {
     return emitFailAt("emitProgram: unsupported for-in iterable", s.fiIter)
   }
-  // A struct element (`S[]`, code 1) binds the loop var as a struct local carrying the element
-  // struct table index; the `#l` temp holds the ref-list wrapper (code 5 plus the slot). The
-  // companion slot comes from `forInVarStructIdx` rather than from each arm below (D1142),
-  // because a captured loop variable's env field needs the identical (kind, slot) pair.
+  // A struct element (`S[]`) binds the loop var as a struct local carrying the element struct
+  // table index. The slot comes from `forInVarStructIdx` (D1142), because a captured loop
+  // variable's env field needs the identical (kind, slot) pair.
   const fiVarIdx = forInVarStructIdx(s.fiIter, fnIx)
-  let fiLk: VKind = "list"
-  if fiEk == "struct" {
-    fiLk = "reflist"
-  } else if fiEk == "variant" || fiEk == "nulvariant" {
-    // A union-arm element (code 8): the loop var carries the variant-table row, so its cell is
-    // `(ref $(variantHeap(vi)))` — what a `const c: Circle = …` local binds. The `#l` temp is the
-    // ref-list wrapper (code 5), as for every other ref element (D50).
-    fiLk = "reflist"
-  } else if fiEk == "nulstruct" {
-    // A NULLABLE-struct element (`(P | null)[]`): the loop var is a kind-9 niche carrying
-    // the element struct index; the `#l` temp is the ref-list WRAPPER (code 5).
-    fiLk = "reflist"
-  } else if fiEk == "union" {
-    // A union-box element list: the loop var is a kind-4 union box (no struct index);
-    // the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
-    fiLk = "reflist"
-  } else if (
-    fiEk == "list"
-    || fiEk == "nullist"
-    || fiEk == "strlist"
-    || fiEk == "f64list"
-    || fiEk == "i64list"
-    || fiEk == "f32list"
-    || fiEk == "nulstrlist"
-    || fiEk == "nulf64list"
-    || fiEk == "nuli64list"
-    || fiEk == "nulf32list"
-    || fiEk == "u8list"
-    || fiEk == "nulu8list"
-  ) {
-    // A nested-array loop var — the inner list (kind 2/7/12/20), or the nullable niche a
-    // `(T[] | null)[]` element binds (kind 15 for the shared i32 backing, 22/23/24/25 for the
-    // four distinct-backing leaves). The `#l` temp is the outer ref-list wrapper (code 5).
-    fiLk = "reflist"
-  } else if fiEk == "closure" || fiEk == "nulclosure" {
-    // A CLOSURE element (`((i32) => i32)[]`): the loop var is a kind-14 closure (no struct
-    // index); the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
-    fiLk = "reflist"
-  } else if (
-    fiEk == "reflist"
-    || fiEk == "nulreflist"
-    || fiEk == "map"
-    || fiEk == "nulmap"
-  ) {
-    // A nested ref array (`S[][]`): the loop var is the inner ref list (kind 5) carrying its
-    // ref-list slot; the `#l` temp is the outer ref-list wrapper (code 5). A `(S[] | null)[]`
-    // element binds the kind-18 nullable ref list off the same inner slot — the slot names the
-    // wrapper heap type, the kind carries the nullability. A map element walks the same way.
-    fiLk = "reflist"
-  } else if fiEk == "str" || fiEk == "nulstr" {
-    // A `(string | null)[]` iterable shares the string list's backing (`nulstr` is the
-    // string-ref niche, a `(ref null $sTypeIdx)` element slot), so the `#l` temp is the same
-    // string-list wrapper the non-null element uses. Only the loop var differs.
-    fiLk = "strlist"
-  } else if fiEk == "f64" {
-    fiLk = "f64list" // f64 element → f64-list `#l` temp
-  } else if fiEk == "i64" {
-    fiLk = "i64list" // i64 element → i64-list `#l` temp
-  } else if fiEk == "f32" {
-    fiLk = "f32list" // f32 element → f32-list `#l` temp
+  // The `#l` temp holds the walked value itself: the list, the string, or a map's keys list.
+  const fiLk = forInWalkKind(s.fiIter, fnIx)
+  if fiLk == null {
+    return emitFailAt(
+      "emitProgram: a for-in iterable walks no list or string",
+      s.fiIter,
+    )
   }
-  // A string iterable (`for ch in s`): the `#l` temp holds the string itself (code 3, the raw
-  // `(ref $aTypeIdx)` array), not an i32-list wrapper. The loop var stays code 0 (i32).
-  if fiEk == "i32" && forInStringSrc(s.fiIter, fnIx) { fiLk = "str" }
-  // A packed byte list (`for b in bs`, `bs: u8[]`): the `#l` temp is the `$bl8` wrapper over
-  // the one-byte backing, while the loop var stays code 0 since `array.get_u` widens each byte.
-  // Ordered beside the string arm; the two predicates are mutually exclusive.
-  if fiEk == "i32" && forInU8Src(s.fiIter, fnIx) { fiLk = "u8list" }
   const fiSlot = addLocalSlot(fiEk, fiVarIdx)
   // The slot holds the loop variable's declaration, which a scope-less scan asks the column
   // about (D1748).
@@ -4815,51 +4744,8 @@ function mvKeysWrapMint(mvi: i32) {
   else { mkListTy() }
 }
 
-// The one home of "reserve the backing and wrapper heap types the type name `a` needs". A
-// presence flag is a reservation: `mAssignTypeIndices` mints a heap type only where the flag is
-// set, and an unminted index falls through to `mNextType`, so a missed reservation is
-// check-clean invalid wasm rather than a missing feature. Monotone, so a redundant call is inert.
-function forceAnnLeafReps(a: string): i32 {
-  if nameIsStringArray(a) {
-  } else if nameIsF64Array(a) {
-    // The f64 pair mints on first read (`fa64Ty`).
-  } else if nameIsI64Array(a) {
-    // The i64 pair mints on first read (`ia64Ty`).
-  } else if nameIsF32Array(a) {
-    // The f32 pair mints on first read (`fa32Ty`).
-  } else if nameIsBareMap(a) {
-    // The map struct mints on first ask (`mapTy`).
-  } else if arrElemIs(a, "i32") || arrElemIs(a, "boolean") {
-  } else if nameIsString(a) || nameIsNulString(a) {
-  } else if nulScalarListKind(a) != null {
-    const nsk = nulScalarListKind(a)
-    // Exhaustive over `VKind` and `_`-less, `null` included: each of the five marks its own
-    // backing, and a new leaf must say whether it needs one (D1898). The `null` alternative
-    // is unreachable under the guard above and is named because the language requires it.
-    match nsk {
-      "nulstrlist" => {}
-      "nulf64list" => {
-        // The f64 pair mints on first read (`fa64Ty`).
-      }
-      "nuli64list" => {
-        // The i64 pair mints on first read (`ia64Ty`).
-      }
-      "nulf32list" => {
-        // The f32 pair mints on first read (`fa32Ty`).
-      }
-      "nulu8list" => {
-        // The packed byte pair mints on first read (`ba8Ty`).
-      }
-      "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
-        // Not a nullable scalar list, so it marks no backing here.
-      }
-    }
-  }
-  0
-}
-
-// `forceAnnLeafReps` for the list type `kTy`, read off its arena element: a scalar element
-// list reserves its backing, and any other list reserves nothing here.
+// Reserve the backing and wrapper heap types list type `kTy` needs, read off its arena element:
+// a scalar element list reserves its backing, and any other list reserves nothing here.
 function forceListLeafRepsOfTy(kTy: i32): i32 {
   const k = tyAt(kTy)
   if !(k is TyArray) || k.aElem < 0 || k.aElem >= T.tys.length { return 0 }
@@ -4887,28 +4773,8 @@ function forceListLeafRepsOfTy(kTy: i32): i32 {
     }
     "i32" | "boolean" => {}
     "void" | "null" | "never" | "u8" | "v128" => {
-      // Not an element `forceAnnLeafReps` reserves a backing for.
+      // No backing to reserve for this element.
     }
-  }
-  0
-}
-
-// Reserve the reps a generic application's type arguments need. They are invisible to every
-// branch of `collectA`'s `TypeRef` ladder, since the whole spelling `Box<string>` is one name, so
-// without this `aTypeIdx` names whatever heap type sits at an index never allocated. Flag-only
-// and outside the ladder: it bypasses no arm, and at worst allocates a type nothing needed.
-function forceGenAppArgTypes(name: string): i32 {
-  if !annGenAppSpanEnds(name) { return 0 }
-  const args: string[] = []
-  const head = annGenAppDecompose(name, args)
-  if head == "" { return 0 }
-  let i = 0
-  while i < args.length {
-    const a = args[i]
-    // A nested application (`Box<Pair<i32, string>>`) is the same reservation one rung in.
-    forceGenAppArgTypes(a)
-    forceAnnLeafReps(a)
-    i = i + 1
   }
   0
 }
@@ -4939,8 +4805,8 @@ function tyElemIsStrListLeaf(e: i32): boolean {
   tyNulInnerIsPrim(e, "string")
 }
 
-// `forceAnnLeafReps` for arena type `t`: the backing and wrapper heap types a closure field's
-// result or parameter of that type needs. A type it does not name reserves nothing.
+// Reserve the backing and wrapper heap types a closure field's result or parameter of arena type
+// `t` needs. A type it does not name reserves nothing.
 function forceAnnLeafRepsOfTy(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return 0 }
   const k = tyAt(t)
@@ -5373,12 +5239,11 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
         rlInternNameTy(nestElem, nestKind, rlHintElemTy(i))
       }
     }
-    // D1511 — the same hole at the shape element kind: `const xs = []` then
-    // `xs.push({y: 1, x: 2})` reaches this pass with the element pinned to a struct and no
-    // row interned, since no `<shape>[]` spelling exists anywhere in the program. Unhinted:
-    // the name is nominal, and `rlInternNameTy` takes no key hint for a nominal spelling.
+    // D1511 — the same hole at the shape element kind: `xs.push({y: 1, x: 2})` onto `[]` pins
+    // the element to a struct no `<shape>[]` spelling interns. The key is unhinted, since a
+    // nominal spelling takes none; the element type still classifies it.
     const shapeElem = arrLitShapeElemName(i)
-    if shapeElem != "" { ensureRefElem(shapeElem) }
+    if shapeElem != "" { ensureRefElemTys(shapeElem, -1, rlHintElemTy(i)) }
     // The same hole at a nullable ref element: a push of a `T | null` value, or of a bare
     // `null` a later write filled, spells the `(T | null)[]` row nowhere (D2506).
     const nulElem = arrLitNulRefElemName(i)
@@ -5453,17 +5318,12 @@ function annNicheNulElemInner(annIx: i32): i32 {
 // forces the wrapper and backing of the non-null ref-array name and banks the interned row on
 // node `i`. Returns 0, or -1 once a niche-nullable element with no list rep has failed loudly.
 function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
-  let ran = nd.tyName
-  const ranp = nullablePartOf(ran)
-  // "Is this the NULLABLE ref-list spelling" — asked ONCE, and read again twenty
-  // lines down to set the banked row's null flag. The second read is by construction
-  // the same answer: `ranp` is never rewritten and no intern runs between them.
-  const ranIsNul = ranp != "" && tyIsNulRefArray(fdRowOf(i))
-  if ranIsNul { ran = ranp }
-  // The element kind, classified once for the seven reads in this arm, which straddle the
-  // `ensureRefElem` intern — the only call between them that mutates a table the classifier
-  // reads. It is the recorded element type's; `ran`'s spelling is the floor for a node with no
-  // type or a declined one, and `ran` is final here: the `| null` peel above is its last write.
+  // Whether the annotation is the nullable list, asked of its type.
+  const ranIsNul = tyIsNulRefArray(fdRowOf(i))
+  // The element kind, classified once before the `ensureRefElemTys` intern, the only call here
+  // that mutates a table the classifier reads. It is the recorded element type's; the spelling
+  // is the floor for a non-null node with no type or a declined one. A nullable list's declined
+  // element (a type parameter, a union of lists) is no niche, so its kind is not read.
   const raTy = annRefArrElemRow(i)
   let raKind = refListElemKindOfTy(raTy)
   // A literal-union element is a scalar list, whatever its spelling classifies as.
@@ -5471,7 +5331,7 @@ function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
     recordAnnRlSlot(i, -1, 0)
     return 0
   }
-  if raKind < 0 { raKind = refArrElemKind(ran) }
+  if raKind < 0 && !ranIsNul { raKind = refArrElemKind(nd.tyName) }
   // The element row's name, from the annotation's recorded element type; an anonymous record
   // element, which renders no name, is its canonical record row.
   let ren = rlRowNameOfTy(raTy, false)
@@ -5511,8 +5371,8 @@ function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
     recordAnnRlSlot(i, -1, ranNul)
     return 0
   }
-  recordAnnRlSlot(i, ensureRefElemTy(ren, renTy), ranNul)
-  // A map element (`{[K]: V}[]`) forces the map machinery inside `ensureRefElem` above, whose
+  recordAnnRlSlot(i, ensureRefElemTys(ren, renTy, raTy), ranNul)
+  // A map element (`{[K]: V}[]`) forces the map machinery inside `ensureRefElemTys` above, whose
   // `k == 3` arm reaches every map element in every position.
   0
 }
@@ -5567,9 +5427,12 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   // A closure that is a struct field reserves nothing through the rung below —
   // see `forceNestedCloSigRepsOfTy`, which walks into the annotation's type for it.
   forceNestedCloSigRepsOfTy(nodeTyIxOf(i), 0)
-  // A top-level function type (`(i32) => R`) forces nothing here: its result's types are forced
-  // by `forceNestedCloSigRepsOfTy` above, and its trailing `[]` is not an array.
-  if annRetNameOf(nd.tyName) != "" {
+  // A function type forces nothing here: its result's types are forced by
+  // `forceNestedCloSigRepsOfTy` above. Asked of the recorded type; an untyped annotation is a
+  // function when its spelling has a top-level arrow, whose trailing `[]` is not an array.
+  const annTy = nodeTyIxOf(i)
+  const isFnAnn = if annTy >= 0 { tyIsFuncArena(annTy) } else { annRetNameOf(nd.tyName) != "" }
+  if isFnAnn {
   } else if nameIsBareMap(nd.tyName) && !typeRefIsRecord(i) {
     // A bare map annotation interns its per-(key, value) slot here, since collect scans every
     // `TypeRef`, so the type-index assignment sees the full slot set. An orphaned parser field
@@ -5615,10 +5478,6 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   // finds them even when the program never constructs such a list. Same self-gating
   // placement as the map forcer above.
   forceCloResultListTypes(nodeTyIxOf(i))
-  // The generic-application dual of the two forcers above: a type argument (`Box<string>`,
-  // `Pair<i32, string[]>`) no branch of the chain can see, because the whole `Head<…>` is one
-  // name. Same self-gating placement and the same flag-only contract; see the helper.
-  forceGenAppArgTypes(nd.tyName)
   0
 }
 
@@ -7772,9 +7631,7 @@ function registerInlineUnionGo(
   if nameIsWholeSpanShape(name) { return 0 }
   // The atom form again: `matoms` is still the read at the top of this function, since nothing
   // between there and this line rewrites either `name` or `matoms`.
-  const mtys: i32[] = []
-  unionAtomTysOf(sty, matoms, mtys)
-  if !isVariantBoxUnionAtoms(stmts, matoms, mtys) { return 0 }
+  if !isVariantBoxUnionOfTy(stmts, sty, matoms) { return 0 }
   // The row records the arena type its registrar holds, never a re-parse of its spelling.
   if ty < 0 {
     return emitFail(
@@ -7893,12 +7750,64 @@ function registerCloResultUnion(stmts: i32[], rt: i32): i32 {
   // annotated named-fn path lowers it; an arm the box still rejects stays loud.
   const ra: string[] = []
   unionSetAtomsOfTy(res, rt, ra)
-  const raTys: i32[] = []
-  unionAtomTysOf(rt, ra, raTys)
-  if isVariantBoxUnionAtoms(stmts, ra, raTys) {
+  if isVariantBoxUnionOfTy(stmts, rt, ra) {
     return registerInlineUnionAt(stmts, res, 35, rt, rt)
   }
   -2
+}
+
+// `isVariantBoxUnionAtoms` over the atoms `atoms` of union type `ty`, each beside its own
+// member type (`unionAtomTysAlignedOf`).
+function isVariantBoxUnionOfTy(
+  stmts: i32[],
+  ty: i32,
+  atoms: string[],
+): boolean {
+  const tys: i32[] = []
+  unionAtomTysAlignedOf(ty, atoms, tys)
+  isVariantBoxUnionAtoms(stmts, atoms, tys)
+}
+
+// Pushes the arena type of each atom of `atoms`, a spelling of union type `ty`, onto `out`: the
+// canonical member whose atom spells the same, so a pin that spells the members in another
+// order still pairs each atom with its own type. When some atom spells no canonical member,
+// the atoms pair by position (`unionAtomTysOf`).
+function unionAtomTysAlignedOf(ty: i32, atoms: string[], out: i32[]): i32 {
+  const cTys: i32[] = []
+  const cAtoms: string[] = []
+  if (
+    atoms.length > 1
+    && canonUnionMembersInto(ty, cTys, cAtoms)
+    && cAtoms.length == cTys.length
+  ) {
+    const used: boolean[] = []
+    for _c in cAtoms { used.push(false) }
+    const got: i32[] = []
+    let all = true
+    for a in atoms {
+      let at = -1
+      if a != "null" {
+        let hit = -1
+        let k = 0
+        while k < cAtoms.length && hit < 0 {
+          if !used[k] && cAtoms[k] == a { hit = k }
+          k = k + 1
+        }
+        if hit < 0 {
+          all = false
+        } else {
+          used[hit] = true
+          at = cTys[hit]
+        }
+      }
+      got.push(at)
+    }
+    if all {
+      for g in got { out.push(g) }
+      return 0
+    }
+  }
+  unionAtomTysOf(ty, atoms, out)
 }
 
 // `registerInlineUnionAt`'s pass over the atoms of a union of two or more: refuses a map
@@ -7922,19 +7831,19 @@ function registerInlineUnionAtoms(
     }
     mk = mk + 1
   }
-  const mtys: i32[] = []
-  unionAtomTysOf(sty, matoms, mtys)
   // A single map + `null` is exempt (the nullable map, owned by the nullable machinery); only
   // a map alongside another non-null member is the box-union shape handled here.
   if mHasMap && mNonNull >= 2 {
     // Supported falls through to `isVariantBoxUnion` below; unsupported is a loud fail, never a
     // silent mis-tag. `matoms` reuses the split this predicate would otherwise redo.
-    if !isVariantBoxUnionAtoms(stmts, matoms, mtys) {
+    if !isVariantBoxUnionOfTy(stmts, sty, matoms) {
       return emitFail(
         "emitProgram: a map union member is not supported — use a struct member instead",
       )
     }
   }
+  const mtys: i32[] = []
+  unionAtomTysOf(sty, matoms, mtys)
   // A ref-array atom's element union needs registration too, since it is not a standalone
   // annotation the recursions below would otherwise reach. Non-returning: the outer union
   // still registers through the dispatch below.
@@ -9182,6 +9091,23 @@ function unionArmsAreRecordsOrScalars(ty: i32): boolean {
   true
 }
 
+// Whether every member of union `ty` is a primitive, a literal, a list, a map or `null`: no record
+// or function arm, so a row with no variants holds all of it.
+function unionArmsAreScalarsOrContainers(ty: i32): boolean {
+  const xs: i32[] = []
+  flattenVariantsInto(ty, xs)
+  if xs.length < 2 { return false }
+  for x in xs {
+    if x >= 0 {
+      const t = tyAt(x)
+      if !(t is TyPrim || t is TyLit || t is TyArray || t is TyMap) {
+        return false
+      }
+    }
+  }
+  true
+}
+
 // Whether each record arm `s` names is a variant of row `kr`: by its own name, or as a layout
 // twin of exactly one of the row's arms (`V = D | S` beside `U = C | S`, `D` typed as `C`).
 // With `bind`, a twin's name is bound to that arm's variant, so both names read one position.
@@ -9228,8 +9154,8 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   if rootUnionDeclMembers(stmts, s.udName) < 0 { return -1 }
   // An alias whose type key already has a row names that row: one row per type. A value or
   // literal union binds to a row with no variants; a union of records and scalars binds to a row
-  // whose variants are its own arms or their twins. A list, map or function arm keeps its row
-  // (D14742).
+  // whose variants are its own arms or their twins; one with list or map arms registers them off
+  // the row's type (D14742). A function arm keeps its row.
   const dty = declTyIxOfName(s.udName)
   if dty >= 0 {
     const kr = unRowOfTyKey(dty)
@@ -9243,6 +9169,14 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
       ) {
         declArmsMatchRow(s, kr, true)
         unNameBindRow(s.udName, kr)
+        return 0
+      }
+      if !plain && unVarCount[kr] == 0 && unionArmsAreScalarsOrContainers(dty) {
+        unNameBindRow(s.udName, kr)
+        const krSet = unMemberSet[kr]
+        markValueUnionAtoms(krSet, dty)
+        markRefArrayArms(krSet, dty)
+        markMapUnionArms(krSet, dty)
         return 0
       }
     }
