@@ -47,6 +47,19 @@ field, and the probe seed ran that program.
 
 ## Proof
 
-<!-- gates -->
+`sweep.vl diff`, base `1d517770`'s fixpoint seed against the head's (23,909 programs; both are
+fixpoints at the second level):
 
-Under the standing velocity instruction, CI's `sweep` job re-proves identity on the merged tree.
+- **23,909 same**;
+- 0 bytes-only movers;
+- 0 output movers;
+- 0 `runs → not-runs`;
+- 0 new compiler traps.
+
+The seed is 6,621,332 bytes, against base's 6,621,941 (−609).
+
+- `cases_wasm`: 7,440 passed, 0 failed. `vl_scaling_shape_test.ts`: 90 passed.
+- Distilled `regress.vl`: no runs lost.
+- rep-fuzz is exact. lint-self is clean.
+- Seed-size is +0.5% against its baseline. `ladder-sets` is ok, and late-demands is 6 against 6.
+- The export, ladder, comment, sentinel, scan and render-parse budgets all exit 0.
