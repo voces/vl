@@ -502,9 +502,9 @@ function repFieldLitAsSet(ty: i32): i32[] {
 }
 
 // Which equivalence a rep key renders: `canon` the full structural key; `elem` the ref-list
-// element key (leaf lists folded to one token each, a declared struct nominal); `mv` the map-value
-// key, nominal with no leaf fold; `row` is `canon` with every function type keyed as its one
-// closure cell, which is a struct row's identity.
+// element key (leaf lists folded to one token each, a declared struct nominal); `mv` the
+// map-value key, structural with no leaf fold and an integer literal union as its base; `row`
+// is `canon` with every function type keyed as its one closure cell, a struct row's identity.
 type RepKeyMode = "canon" | "elem" | "mv" | "row"
 
 // Whether `mode` is the full structural key: it expands a declared struct, softens a
@@ -750,6 +750,14 @@ function repMapValTy(v: i32, mode: RepKeyMode): i32 {
   v
 }
 
+// Whether `ty` is a union of one integer base's literals that `mode` keys as that base: a map
+// value stores such a literal union as its base, so it shares the base's slot.
+function repMvIntLitUnion(ty: i32, mode: RepKeyMode): boolean {
+  if mode != "mv" { return false }
+  const t = tyAt(ty)
+  t is TyUnion && oneIntLitBaseOf(t.uMembers) >= 0
+}
+
 function oneIntLitBaseOf(ms: i32[]): i32 {
   let b = -1
   for m in ms {
@@ -774,10 +782,10 @@ function repKeyGo(ty: i32, mode: RepKeyMode): string {
       return t.primName
     }
     TyObj => {
-      // `canon` expands every struct; the slot keys name a declared struct by its slot and
-      // expand only an inline shape (`structural-twin-reflist-dedup.vl`).
+      // `canon` and `mv` expand every struct, since same-shape records are one type (D3870); the
+      // elem key names a declared struct by its slot (`structural-twin-reflist-dedup.vl`).
       const canon = repKeyIsCanon(mode)
-      if !canon {
+      if !canon && mode != "mv" {
         const ds = repSlotOfElemTy(ty, mode)
         if ds >= 0 { return "S" + i32ToStr(ds) }
       }
@@ -808,7 +816,7 @@ function repKeyGo(ty: i32, mode: RepKeyMode): string {
       return repKeyOf(t.nInner, mode) + "?"
     }
     TyUnion => {
-      const lb = if mode == "elem" { oneIntLitBaseOf(t.uMembers) } else { -1 }
+      const lb = if mode == "elem" || mode == "mv" { oneIntLitBaseOf(t.uMembers) } else { -1 }
       if lb >= 0 { return repKeyOf(lb, mode) }
       return repKeyUnion(t.uMembers, mode)
     }
@@ -1130,8 +1138,7 @@ export function mapShapeKeyInt(sh: i32): boolean {
 }
 
 // D48 — the interned mv slot whose (value type, key rep, arm) triple matches
-// `ty`/`keyI32`/`armHint`, or -1 — first-match-wins over the `mvValName` scan it
-// fronts. The arm is a third identity component, since a map whose value is a
+// `ty`/`keyI32`/`armHint`, or -1 — first match wins. The arm is a third identity component, since a map whose value is a
 // declared union arm and one over its exact layout twin never merge. `MV_ARM_NOHINT` matches any parity, -1 only a non-arm slot, `>= 0` only that arm's.
 export function mvSlotOfTyKArm(ty: i32, keyK: i32, armHint: i32): i32 {
   if ty < 0 { return -1 }
@@ -1182,24 +1189,6 @@ export function tyMapKeyKind(ty: i32): i32 {
   const mt = mapTwinUnionMember(ty)
   if mt >= 0 { return tyMapKeyKind(mt) }
   MAP_KEY_STR
-}
-
-// The name bridge for the mv layer (still name-keyed at entry): resolve a map-value
-// name to its arena type, then to its (key-paired) slot; -1 when the name does not
-// resolve or no row claims it. Most traffic now routes through a caller holding an
-// annotation/expression node whose map type the checker already banked (`nodeMapValTyIx`); this covers what has only a spelling, plus the fall-through those routed sites keep.
-export function mvSlotOfValNameTyK(nm: string, keyK: i32): i32 {
-  mvSlotOfValNameTyKArm(nm, keyK, MV_ARM_NOHINT)
-}
-
-// The arm-hinted form of the name bridge — the same resolution, filtered by the
-// caller's arm state (see `mvSlotOfTyKArm`). The un-hinted entry point is unchanged.
-export function mvSlotOfValNameTyKArm(
-  nm: string,
-  keyK: i32,
-  armHint: i32,
-): i32 {
-  mvSlotOfTyKArm(fieldElemTyIxOfName(nm), keyK, armHint)
 }
 
 // The arena type a map-value spelling denotes — the rung the name bridge sits on,
@@ -1733,7 +1722,7 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
     }
     TyObj => {
       if repKeyIsCanon(mode) { return hcCanonObjId(t, mode, false) }
-      const ds = repSlotOfElemTy(ty, mode)
+      const ds = if mode == "mv" { -1 } else { repSlotOfElemTy(ty, mode) }
       if ds >= 0 {
         const a: i32[] = []
         a.push(ds)
@@ -1766,7 +1755,12 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
     }
     TyNullable => {
       // A nullable union is the union's flat member set with a `null`, however it is nested.
-      if t.nInner >= 0 && !tyIsLitUnion(t.nInner) && tyAt(t.nInner) is TyUnion {
+      if (
+        t.nInner >= 0
+        && !tyIsLitUnion(t.nInner)
+        && tyAt(t.nInner) is TyUnion
+        && !repMvIntLitUnion(t.nInner, mode)
+      ) {
         const self: i32[] = []
         self.push(ty)
         return hcUnionId(self, mode)
@@ -1777,7 +1771,7 @@ function repIdGo(ty: i32, mode: RepKeyMode): i32 {
       return hcIntern(HC_NUL, a, hcLenOf(c) + 1)
     }
     TyUnion => {
-      const lb = if mode == "elem" { oneIntLitBaseOf(t.uMembers) } else { -1 }
+      const lb = if mode == "elem" || mode == "mv" { oneIntLitBaseOf(t.uMembers) } else { -1 }
       if lb >= 0 { return repIdOf(lb, mode) }
       return hcUnionId(t.uMembers, mode)
     }
