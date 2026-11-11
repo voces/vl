@@ -87,3 +87,25 @@ The disagreements by class:
   build byte-identical wasm against the base seed.
 - One refresh, at 6,613,982 bytes. `regress.vl` reports no runs lost. lint-self, rep-fuzz (exact),
   seed-size and the render-parse budget pass. The full population is graded by CI's Sweep job.
+
+## Step 3, measured: the list mint against the literal's own element type
+
+`arrLitElemHintTy` is the list mint's hint. It declines exactly on the classes its arms name. The
+probe compared the name key with `repElemId(arrLitArenaElemRow(i))` wherever it declines. Counts
+are the first marker per program.
+
+| at a declined hint | programs |
+| --- | --- |
+| the literal's type key agrees with the name key | ≥ 1,985: nested lists (338), `i32 \| null` (261), declared names (154), and record or map values (the rest) |
+| disagrees | 458 |
+| no recorded type | 1 |
+
+The disagreements by class: an inference hole (284), a type parameter (49), a nullable niche (28),
+a placeholder closure name (9), closures over literals or records (5), declared names (5),
+`#anonN` (2), and 70 others. The others are almost all a placeholder list name against the real
+element type: `i32[]` against `string[]` (22), `f64[]` (17), `u8[]` (2) or `V[]` (4); `f64[]`
+against `i32[]` (8). A placeholder name is what an empty inner literal is spelled. Like
+`(()=>void)`, it is a spelling that denotes no type, and the type is right there.
+
+So the agreeing classes could take the hint without any key moving. The placeholder-name classes
+are where a type key changes rows, by replacing a key that was an accident.
