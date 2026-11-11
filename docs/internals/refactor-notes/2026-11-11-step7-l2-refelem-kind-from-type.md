@@ -47,3 +47,7 @@ how often the spelling decides: from 1,226 programs to 4.
 - `scripts/gate.sh`: all 23 rows pass. These include lint-self and fmt, seed size, late demands,
   plumb-shape cost, the kind-ladder, dead-export and render-parse budgets (render-parse unchanged
   at 69), rep-fuzz, the filed witnesses, the capability probes and the distilled corpus.
+- Merged with master `82e3e434` (#7144, #7156). The only conflict was the comment above
+  `collectARefArrayAnn`'s kind read, resolved to master's text with the new callee name. The merged
+  tree is a fixpoint at 6,619,171 bytes. lint-self, seed-size and the render-parse budget pass, and
+  `regress.vl` reports no runs lost.
