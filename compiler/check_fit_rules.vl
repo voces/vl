@@ -5255,6 +5255,63 @@ export function recAdoptUnionList(
   true
 }
 
+// Whether `srcTy` is a union of records with `dstTy`'s field names, one of which stores a field
+// differently from the record `dstTy`.
+function recUnionStoredApart(srcTy: i32, dstTy: i32): boolean {
+  const s = nonNulTyOf(srcTy)
+  const d = nonNulTyOf(dstTy)
+  if (
+    s < 0
+    || d < 0
+    || s >= T.tys.length
+    || d >= T.tys.length
+    || !(tyAt(d) is TyObj)
+  ) {
+    return false
+  }
+  const u = tyAt(s)
+  if !(u is TyUnion) || !assignable(s, d) { return false }
+  let apart = false
+  for m in u.uMembers {
+    if (
+      m < 0
+      || m >= T.tys.length
+      || !(tyAt(m) is TyObj)
+      || !objFieldNameSetsEq(m, d)
+    ) {
+      return false
+    }
+    if !fieldStorageEq(m, d, REC_STORE_DEPTH) { apart = true }
+  }
+  apart
+}
+
+// Stamps the value join `p`, a union of records every tail of which is a record literal fitting
+// the one record `dstTy`, as built at that record: its tails are built there, so the join holds
+// one record and no union box (D15719).
+function recJoinOfLitsAtOne(p: i32, leaves: i32[], srcTy: i32, dstTy: i32) {
+  const s = nonNulTyOf(srcTy)
+  const d = nonNulTyOf(dstTy)
+  if (
+    s < 0
+    || d < 0
+    || s >= T.tys.length
+    || d >= T.tys.length
+    || !(tyAt(d) is TyObj)
+  ) {
+    return 0
+  }
+  if !(tyAt(s) is TyUnion) || leaves.length == 0 { return 0 }
+  for lf in leaves {
+    const l = cwPeelValue(lf)
+    if l < 0 || !(nodeAt(l) is ObjLit) || !recLitFits(l, d, REC_STORE_DEPTH) {
+      return 0
+    }
+  }
+  repStamp(p, d)
+  0
+}
+
 // Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
 // element of a literal list binding, to a record that stores a field differently.
 export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
@@ -5268,12 +5325,27 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     const leaves: i32[] = []
     tailValueLeaves(p, leaves)
     for lf in leaves { recAdoptNote(lf, nodeTyIxOf(lf), dstTy) }
+    recJoinOfLitsAtOne(p, leaves, srcTy, dstTy)
     return 0
   }
   const co = recCoalesceOperands(p)
   if co.length == 2 {
     recAdoptNote(co[0], nodeTyIxOf(co[0]), dstTy)
     recAdoptNote(co[1], nodeTyIxOf(co[1]), dstTy)
+    return 0
+  }
+  if e is Ident && recUnionStoredApart(srcTy, dstTy) {
+    // A binding of a union of records is shared, so no copy converts it into one record that
+    // stores a member's field differently (D15719).
+    tErr(
+      tyToStr(nonNulTyOf(srcTy))
+        + " is not "
+        + tyToStr(nonNulTyOf(dstTy))
+        + ": a member stores a field differently, and a record is shared, not copied. Annotate "
+        + "the binding as "
+        + tyToStr(nonNulTyOf(dstTy)),
+      p,
+    )
     return 0
   }
   if e is Ident {
@@ -5350,6 +5422,21 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   }
   if e is Call {
     const fd = recInferredFnOf(p)
+    // A union of records from a call has no converting copy into one record that stores a
+    // member's field differently (D15719).
+    if fd >= 0 && recUnionStoredApart(srcTy, dstTy) {
+      tErr(
+        "this call's result is the union "
+          + tyToStr(nonNulTyOf(srcTy))
+          + ", delivered as the one record "
+          + tyToStr(nonNulTyOf(dstTy))
+          + ", which stores a member's field differently; converting each member into it is not "
+          + "yet supported. Declare the function's result as "
+          + tyToStr(nonNulTyOf(dstTy)),
+        p,
+      )
+      return 0
+    }
     // A list result is delivered as the bindings its function returns. Literals it returns bare
     // are built at the destination list, and so is the result, when every value is one that can
     // be (D14223); a mix of the two adopts neither.
