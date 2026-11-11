@@ -3161,10 +3161,102 @@ function elabTysFirst(names: string[], tys: i32[]): i32[] {
   out
 }
 
+// A `const` record literal whose every field reads an un-annotated parameter is typed, with its
+// binding and the binding's reads, at the record of its fields' types in instance `k`: the
+// check gave it the join of every instance's (D15639).
+function elabConstRecRetype(k: i32) {
+  if k < 0 || k >= ekDecl.length { return 0 }
+  const d = ekDecl[k]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) || dn.fnBody < 0 { return 0 }
+  const todo: i32[] = [dn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is LetDecl && xn.letKw == "const" && xn.letType < 0 {
+        const t = elabConstRecTyAt(xn.letInit, dn, k)
+        if t >= 0 {
+          elabNodeTyPut(parenPeelIx(xn.letInit), k, t)
+          elabNodeTyPut(x, k, t)
+          elabBindingReadsPut(dn.fnBody, x, k, t)
+        }
+      }
+      if !(xn is FuncDecl) {
+        for c in nodeChildren(x) { todo.push(c) }
+      }
+    }
+  }
+  0
+}
+
+// The record of the types instance `k` gives the fields of record literal `lit`, each a read of
+// an un-annotated parameter of `fn`, when one of them holds a set of functions; else -1.
+function elabConstRecTyAt(lit: i32, fn: FuncDecl, k: i32): i32 {
+  const li = parenPeelIx(lit)
+  const ol = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { null }
+  if !(ol is ObjLit) || ol.objFields.length == 0 { return -1 }
+  const names: string[] = []
+  const tys: i32[] = []
+  let set = false
+  for fx in ol.objFields {
+    const f = nodeAt(fx)
+    if !(f is FieldInit) { return -1 }
+    const v = parenPeelIx(f.fiValue)
+    const vd = if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident { identDeclOf(v) } else { -1 }
+    const vp = if vd >= 0 && vd < P.nodes.length { nodeAt(vd) } else { null }
+    if !(vp is Param) || vp.parType >= 0 || !i32ListHas(fn.fnParams, vd) {
+      return -1
+    }
+    const t = elabNodeTy(v, k)
+    if t < 0 || !elabTyClosed(t, 0) { return -1 }
+    if fnTagSetOfTy(t) >= 0 { set = true }
+    names.push(f.fiName)
+    tys.push(t)
+  }
+  if set { mkObjTy(names, tys) } else { -1 }
+}
+
+// Records `t` as node `ix`'s type at instance `k`, over what the re-check recorded.
+function elabNodeTyPut(ix: i32, k: i32, t: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const ps = elabNodeTys[ix] ?? []
+  let i = 0
+  while i + 1 < ps.length {
+    if ps[i] == k {
+      ps[i + 1] = t
+      elabNodeTys[ix] = ps
+      return 0
+    }
+    i = i + 2
+  }
+  ps.push(k)
+  ps.push(t)
+  elabNodeTys[ix] = ps
+  0
+}
+
+// Records `t` at instance `k` for every read of binding `b` in `body`, outside nested functions.
+function elabBindingReadsPut(body: i32, b: i32, k: i32, t: i32) {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Ident && identDeclOf(x) == b { elabNodeTyPut(x, k, t) }
+      if !(xn is FuncDecl) {
+        for c in nodeChildren(x) { todo.push(c) }
+      }
+    }
+  }
+  0
+}
+
 // Walks key `k`, with `k` the key every hole row its walk banks records.
 function elabOne(k: i32) {
   const was = elabWalkNowSet(k)
   const r = elabOneAt(k)
+  elabConstRecRetype(k)
   elabWalkNowSet(was)
   while elabWalkedKeys.length <= k { elabWalkedKeys.push(false) }
   elabWalkedKeys[k] = true
@@ -6221,7 +6313,7 @@ function elabRecLitFwdTargets(fi: i32, body: i32): i32[] {
     if x >= 0 && x < P.nodes.length {
       const xn = nodeAt(x)
       if xn is ObjLit && i32ListHas(xn.objFields, fi) {
-        return elabMintFwdTarget(x, p)
+        return elabLitFwdTargets(x, body)
       }
       for c in nodeChildren(x) {
         todo.push(c)
