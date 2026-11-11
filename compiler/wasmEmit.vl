@@ -3267,18 +3267,28 @@ function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
     return dsi
   }
   if !exprStruct(exprIx, fnIx) { return -1 }
-  const ssi = structIndexOfExpr(exprIx, fnIx)
+  let ssi = structIndexOfExpr(exprIx, fnIx)
+  // A record that is also a union's arm answers no struct row by expression; its type names one.
+  if ssi < 0 { ssi = copyArmRowOf(exprIx) }
   if ssi < 0 || ssi >= sHeapIdx.length { return -1 }
   const vi = repVariantShapeRowOf(dst)
   if vi >= 0 && vi < uVarRow.length {
     if variantHeap(vi) == sHeapIdx[ssi] { return -1 }
     return -2 - vi
   }
-  const dsi = structIndexOfTy(dst)
+  let dsi = structIndexOfTy(dst)
+  if dsi < 0 { dsi = structRowOfAnnTy("", dst, dst) }
   if dsi < 0 || dsi >= sHeapIdx.length || sHeapIdx[dsi] == sHeapIdx[ssi] {
     return -1
   }
   dsi
+}
+
+// The struct row of a copied call's own record when that record is also a union's arm, or -1.
+function copyArmRowOf(exprIx: i32): i32 {
+  const own = nodeTyIxOf(exprIx)
+  if own < 0 || repVariantShapeRowOf(own) < 0 { return -1 }
+  structRowOfAnnTy("", own, own)
 }
 
 // `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`).
@@ -3287,7 +3297,8 @@ function emitRecCopyInto(body: u8[], exprIx: i32, row: i32, fnIx: i32): i32 {
   const codes: i32[] = []
   // A call copied back to its own record is read at the row its function builds it at.
   const from = recCopyFromOf(exprIx)
-  const ssi = if from >= 0 { structIndexOfTy(from) } else { structIndexOfExpr(exprIx, fnIx) }
+  let ssi = if from >= 0 { structIndexOfTy(from) } else { structIndexOfExpr(exprIx, fnIx) }
+  if ssi < 0 && from < 0 { ssi = copyArmRowOf(exprIx) }
   if row <= -2 {
     const vi = -2 - row
     if guardVariantFieldSpan(vi, "emitRecCopyInto") < 0 { return -1 }
@@ -39841,6 +39852,13 @@ function coalNarrowedReRead(ix: i32, fnIx: i32): i32 {
   cp
 }
 
+// A re-associated `??` link minted in emitted function `fnIx` stands for `src` there: it is typed
+// at `src`'s type in that instance, which a link minted per emission can hold as its own.
+function coalLinkTyAt(link: i32, src: i32, fnIx: i32) {
+  tyCarrySrcNote(link, src)
+  nodeTyRecord(link, nodeTyAt(src, fnIx))
+}
+
 function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -39882,9 +39900,9 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       } else {
         // Otherwise the outer link is the chain. The inner one lies between `d` and the chain,
         // so it is the chain's type exactly when `d` already is.
-        nodeTyCarry(reOuter, exprIx)
+        coalLinkTyAt(reOuter, exprIx, fnIx)
         if tySame(nodeTyAt(exprIx, fnIx), nodeTyAt(e.binRight, fnIx)) {
-          nodeTyCarry(reInner, exprIx)
+          coalLinkTyAt(reInner, exprIx, fnIx)
         }
       }
       // The inner link is the outer's default, delivered at the outer's type.

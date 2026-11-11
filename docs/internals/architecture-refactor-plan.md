@@ -229,6 +229,7 @@ Each is posted for question time; work that does not depend on it continues.
 5. **SC ruling (g)**: the multi-pin case (a binding called at two or more signatures), after the
    table lands. This decides B1's instance record for closures, not whether B1 happens.
 6. **Sibling contextual typing in list literals** (D12800): `fs.push((y) => y * 2)` onto a list of hole functions runs, while the same lambda as a literal element (`[(x: i32) => x + 1, (y) => y * 2]`) is a check reject, because a list literal's element type is the join of its elements (E15.2). That face is DESIGN today; making it agree with the push face is a language change.
+7. **ci-cost peak RSS** (lane w322, #7230, its note `refactor-notes/2026-11-11-ci-cost-rss-gc-growth.md`): `ci-cost`'s plumb-shape main unit reads about 426–443 MB against a 318 MB baseline with fuel within 1%. The step follows when the seed's copying GC heap doubles (`SeedGcHeadroom`, a 75% live line checked on a 10 ms tick), not the fuel cache. PENDING: (a) meter the RSS build with `VL_COMPILE_GC_GROW=off`, or (b) make the host's grow decision deterministic per collection and re-baseline.
 
 ## Ready to brief
 

@@ -92,6 +92,7 @@ import {
   mapUnboxTyOf,
   nodeRepStamped,
   nodeRepTyIxOf,
+  recCopyTyOf,
 } from "./check_core_state"
 import { letDeclFn, nodeTyIsUnionAlias } from "./check_decl_scan"
 import {
@@ -229,7 +230,7 @@ import { cwBindingOf, cwLambdaDeclOf } from "./check_write_scan"
 import {
   anonArithFieldCode,
   anonListWiderThanLits,
-  anonMapValName,
+  anonMapValNameable,
   anonNulCodeIsSelfContained,
   anonNulFieldCodeOfTy,
   anonNulInnerTyOf,
@@ -503,7 +504,6 @@ import {
   repABNote,
   retMapFlight,
   retMapInFlight,
-  retStructRowIndex,
   vtKindOfType,
 } from "./emit_nullable_rets"
 import {
@@ -1126,9 +1126,10 @@ export function cloRetValSlot(fe: i32): i32 {
     }
     return repSlotOfKind(k, repSigSlotTyOf(t))
   }
-  // A declared record takes the row its annotation names, ahead of the first row of its shape.
+  // A declared record takes the row its annotation names, ahead of the first row of its shape:
+  // the row `buildFnMap` stored for it.
   if k == "struct" || k == "nulstruct" {
-    const ds = retStructRowIndex(fd.fnRet)
+    const ds = if fe < fRetStructIdx.length { fRetStructIdx[fe] } else { -1 }
     if ds >= 0 { return ds }
   }
   // A declared variant takes its name's row.
@@ -4983,6 +4984,11 @@ export function ifExprRefSlot(
       if destStruct >= 0 && nodeAt(unwrapParen(tv)) is ObjLit {
         return destStruct
       }
+      // So does a call arm copied there where it is delivered.
+      const cp = recCopyTyOf(unwrapParen(tv))
+      if destStruct >= 0 && cp >= 0 && structIndexOfTy(cp) == destStruct {
+        return destStruct
+      }
       // With no destination, a join of records into a wider one builds at the join's own row.
       const jrow = joinedRecordRowOf(ifIx, fnIx)
       if jrow >= 0 { return jrow }
@@ -7089,7 +7095,7 @@ export function anonFieldCode(valIx: i32) {
   // literal lost its row and its function's return type had no shape (D3123).
   if nodeTyIsMap(valIx) {
     if !mapNodeValKindLowerable(valIx) { return -1 }
-    if anonFieldElemName(valIx, FC_MAP) == "" { return -1 }
+    if !anonMapValNameable(nodeTyIxOf(valIx)) { return -1 }
     return FC_MAP
   }
   // The gate, then the arena, then the render: `anonTySpellable` keeps an unspellable type
@@ -7145,9 +7151,9 @@ function anonCodeAdmitsValue(c: i32, valIx: i32) {
   if c == FC_STRUCT || c == FC_NUL_REF_LIST || c == FC_NUL_LIT_UNION {
     return anonFieldElemName(valIx, c) != ""
   }
-  // Code 29 the same way: the nullable map's slot is a ref to its value type's mv struct, so
-  // the value name is the companion the emitter re-finds that slot by (D1665).
-  if c == FC_NUL_MAP { return anonFieldElemName(valIx, c) != "" }
+  // Code 29: the nullable map's slot is a ref to its value type's mv struct, so the value must
+  // be one the emitter can key (D1665).
+  if c == FC_NUL_MAP { return anonMapValNameable(anonNulInnerTyOf(valIx)) }
   // Code 5 the same way, once its companion can name a non-struct element (D1688). The
   // struct-row rung stays its own disjunct: an EMPTY array literal resolves a row and names
   // no element, so folding the two would refuse a shape that mints today.
@@ -7324,15 +7330,10 @@ function anonFieldCodeSyn(valIx: i32) {
   -1
 }
 
-// The `sFieldElemName` entry for an anonymous-shape field: a map field (code 19) records
-// its value name, read off the recorded type instead of an annotation; a code-15 field
-// records the nested struct's table name. "" otherwise.
+// The `sFieldElemName` entry for an anonymous-shape field: a code-15 field records the nested
+// struct's table name. A map field (code 19 or 29) records none: its row carries the value's
+// type (`anonFieldElemValTy`), which is what the mv slot is found by. "" otherwise.
 export function anonFieldElemName(valIx: i32, code: i32) {
-  if code == FC_MAP { return anonMapValName(nodeTyIxOf(valIx)) }
-  // A nullable map field (code 29) records the `| null`-peeled map's value name — the same
-  // mv-slot key `shapeFieldElemName`'s code-29 arm reads off the declared spelling, so one
-  // map value type is one key at both codes (D1665).
-  if code == FC_NUL_MAP { return anonMapValName(anonNulInnerTyOf(valIx)) }
   // A value-union field (code 16) records its member set, the same column
   // `shapeFieldElemName` fills from the declared spelling. Supplying it is what admits
   // code 16 to `anonFieldCode` at all (D1242).
@@ -11982,7 +11983,6 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
         // picked. The value and the key kind resolve by the arena type, not the spelling.
         if nodeTyIsMap(d.letType) {
           const tsh = mvShapeOfMapHeldTy(
-            "",
             nodeTyIxOf(d.letType),
             nodeMapValTyIx(d.letType),
             nodeMapValTyIx(d.letType),
