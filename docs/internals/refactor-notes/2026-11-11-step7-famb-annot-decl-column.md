@@ -62,13 +62,13 @@ The sweep covered 23,877 programs (`scripts/sweep.vl record`). Counts are **prog
   - The cast now reads `A2`'s row, the arm the box holds.
   - The program printed its full `@log` before and after the change.
 
-## Found: D15657
+## Found: D15670
 
 The control still refuses after this PR, at another site. The cast's tag lookup
 (`unionArmTagsOfTy`, `wasmEmit.vl`) reads each arm's variant row through
 `nominalStructNameOfTy`. With `CircleC` declared before the arm `Circle`, `s as! Circle` is a
 loud emit reject. Declare `CircleC` second, or drop it, and the program runs. That is filed as
-D15657, the next PR's target. It reads the same column on the cast node.
+D15670, the next PR's target. It reads the same column on the cast node.
 
 ## Proof
 
