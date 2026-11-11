@@ -71,6 +71,7 @@ import {
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
   tyPrimNameOf,
+  tySame,
 } from "./check_types"
 import {
   isTestsNull,
@@ -306,17 +307,7 @@ let sNameIxLen = 0
 export function structNameIxReset() {
   sNameIx = Map()
   sNameIxLen = 0
-  sNameCanon = Map()
-  0
-}
-
-// The row each declared record name answers when an earlier declaration of the same canonical
-// type holds an identical row (`declTwinRowsCanon`): one struct row per canonical record type.
-let sNameCanon: {[string]: i32} = Map()
-
-// Records that declared record `name` answers row `row`.
-export function sNameCanonSet(name: string, row: i32) {
-  sNameCanon[name] = row
+  sRowCanonMemo = []
   0
 }
 
@@ -415,10 +406,68 @@ function sfnCands(b: i32[], lim: i32, out: i32[]): i32[] {
 
 // The struct table index whose name is `name`, or -1 if `name` is not a declared struct type.
 export function structIndexByName(name: string) {
-  const c = sNameCanon[name] ?? -1
-  if c >= 0 { return c }
   sNameIxSync()
-  sNameIx[name] ?? -1
+  sRowCanonOf(sNameIx[name] ?? -1)
+}
+
+// The first row holding struct row `r`'s canonical record type at an identical layout, else `r`:
+// one struct row per canonical record type. A row whose field rows are not all stored yet, or a
+// reference row, answers itself.
+let sRowCanonMemo: i32[] = []
+
+export function sRowCanonOf(r: i32): i32 {
+  if r < 0 { return r }
+  if r < sRowCanonMemo.length && sRowCanonMemo[r] >= 0 {
+    return sRowCanonMemo[r]
+  }
+  if !sRowLaidOut(r) || sIsRefRow(r) { return r }
+  let c = r
+  let i = 0
+  while i < r {
+    if sRowLaidOut(i) && !sIsRefRow(i) && sRowsTwin(i, r) {
+      c = i
+      i = r
+    } else {
+      i = i + 1
+    }
+  }
+  while sRowCanonMemo.length <= r { sRowCanonMemo.push(-1) }
+  sRowCanonMemo[r] = c
+  c
+}
+
+function sRowLaidOut(r: i32): boolean {
+  r < sTyIx.length
+    && r < sFieldCount.length
+    && r < sFieldStart.length
+    && sFieldStart[r] + sFieldCount[r] <= sFieldElemName.length
+    && sFieldStart[r] + sFieldCount[r] <= sFieldNames.length
+}
+
+// The record type row `r` holds: an anonymous row's own (`sAnonOwnTy`, where its recorded type is
+// a hole's context), else its recorded type.
+function sRowOwnTy(r: i32): i32 {
+  const own = sAnonOwnTy[r] ?? -1
+  if own >= 0 { own } else { sTyIx[r] }
+}
+
+// Whether rows `i` and `j` hold one canonical record type at one layout: field names in order,
+// codes and element names.
+export function sRowsTwin(i: i32, j: i32): boolean {
+  if sFieldCount[i] != sFieldCount[j] { return false }
+  const a = sRowOwnTy(i)
+  const b = sRowOwnTy(j)
+  if a < 0 || b < 0 { return false }
+  let k = 0
+  while k < sFieldCount[i] {
+    const fa = sFieldStart[i] + k
+    const fb = sFieldStart[j] + k
+    if sFieldNames[fa] != sFieldNames[fb] { return false }
+    if sFieldTypeAt(i, k) != sFieldTypeAt(j, k) { return false }
+    if sFieldElemName[fa] != sFieldElemName[fb] { return false }
+    k = k + 1
+  }
+  tySame(a, b)
 }
 
 // The number of fully-collected struct entries — the scan bound for any matcher reading
