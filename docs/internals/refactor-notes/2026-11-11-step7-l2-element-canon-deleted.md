@@ -47,3 +47,6 @@ answers the spelling unchanged.
 - `scripts/gate.sh`: all 23 rows pass. These include lint-self and fmt, seed size, late demands,
   plumb-shape cost, the kind-ladder, dead-export and render-parse budgets, rep-fuzz, the filed
   witnesses, the capability probes and the distilled corpus.
+- Merged with master `f50936aa` (#7141). The merged tree is a fixpoint at 6,610,953 bytes, and
+  render-parse goes from 69 to 64. lint-self, seed-size and the render-parse budget pass, and
+  `regress.vl` reports no runs lost.
