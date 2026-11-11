@@ -201,7 +201,6 @@ import {
   valueIfNodes,
 } from "./ast"
 import {
-  annRetNameOf,
   bodyLetOfRead,
   declStructIndexBuild,
   declStructNodeOf,
@@ -218,7 +217,6 @@ import {
   nameIsShapeSpanEnds,
   nameIsStringArray,
   nodeIsTypeDecl,
-  normTypeAtom,
   nulLitUnionInnerNameOfTy,
   shapeInnerFieldSplit,
   strLess,
@@ -725,6 +723,7 @@ import {
 } from "./emit_mv_slots"
 import {
   addLocalSlot,
+  annDeclVariantRow,
   globalLetOfDeclRead,
   markLocalDecl,
   markLoopVarIter,
@@ -738,11 +737,7 @@ import {
   structRowOfTy,
   vtKindOfType,
 } from "./emit_nullable_rets"
-import {
-  nodeTyIsUnionRow,
-  objLitFieldSig,
-  objVariantIndexDrop,
-} from "./emit_obj_lit_fits"
+import { nodeTyIsUnionRow, objLitFieldSig } from "./emit_obj_lit_fits"
 import { rlWidenTagOf } from "./emit_ref_list_kinds"
 import {
   funcTypeShapeLowerable,
@@ -959,7 +954,7 @@ function markInferredJoinAtoms(ty: i32) {
 }
 
 // Could this functype's result be a mixed scalar-plus-composite union? `false` is a definite
-// no, so the caller knows `nulCloMixedUnionUnregistered` would answer false without
+// no, so the caller knows `nulCloMixedUnionUnregisteredTy` would answer false without
 // rendering the type. This is the guard's answer, not its early-out: an atom count is a fact
 // about the spelling, while the verdict is structural.
 function cloResultMaybeMixed(tyIx: i32): boolean {
@@ -1251,7 +1246,7 @@ function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
 // committed rep can name different heaps (D39).
 function alcNamesArm(name: string, ann: i32): boolean {
   if name == "" { return false }
-  if variantIndexOf(name) >= 0 { return true }
+  if annDeclVariantRow(ann, name) >= 0 { return true }
   repTyHasArmShape(mapLeafValTy(annRowOfNode(ann)))
 }
 
@@ -1486,15 +1481,15 @@ function internCloSigKey(key: string, rep: i32) {
   0
 }
 
-// Interns the `$fnsig` of union arm `atom` of arena type `ty` (-1 when unknown) at rep -1, keyed
+// Interns the `$fnsig` of a union arm of arena type `ty` (-1 when unknown) at rep -1, keyed
 // `kIn`, or by `unionArmSigKeyTy` when `kIn` is "". A mixed scalar-plus-composite union result
 // is skipped: its synthesized sig would pass the call's floor while the un-pinned producer keeps
 // its own functype, and the cast traps.
-function internCloSigOfAtomTy(atom: string, kIn: string, ty: i32) {
+function internCloSigOfArmTy(kIn: string, ty: i32) {
   let k = kIn
   if k == "" { k = unionArmSigKeyTy(ty) }
   if k == "" { return 0 }
-  if nulCloMixedUnionUnregistered(atom, ty) { return 0 }
+  if nulCloMixedUnionUnregisteredTy(ty) { return 0 }
   internCloSigKey(k, -1)
 }
 
@@ -1761,9 +1756,7 @@ function collectUnionArmCloSigs(atoms: string[], atomTys: i32[]) {
     const armRow = atomTys[uj]
     if armRow >= 0 {
       const armT = tyAt(armRow)
-      if armT is TyFunc {
-        internCloSigOfAtomTy(atoms[uj], sigKeyOfTy(armRow), armRow)
-      }
+      if armT is TyFunc { internCloSigOfArmTy(sigKeyOfTy(armRow), armRow) }
       // A closure-array arm, plain or nullable-element: the element closure sig is interned by
       // neither the function-arm branch above nor the TypeRef pass below, which sees only a
       // top-level closure-array annotation.
@@ -4875,7 +4868,7 @@ function forceAnnLeafRepsOfTy(t: i32): i32 {
 }
 
 // Reserve the reps a closure field's signature needs, at every depth of annotation type `t`.
-// `collectA`'s `annRetNameOf` rung handles a top-level function type; a closure that is a field
+// `collectATypeRef`'s function-type rung handles a top-level function type; a closure that is a field
 // of an inline shape (`{f: () => string}`) reaches no rung. Forces only from the result and
 // parameters of such a field, descending through unions, lists, function parts and shapes.
 function forceNestedCloSigRepsOfTy(t: i32, depth: i32): i32 {
@@ -4896,8 +4889,8 @@ function forceNestedCloSigRepsOfTy(t: i32, depth: i32): i32 {
       forceNestedCloSigRepsOfTy(k.aElem, depth + 1)
     }
     TyFunc => {
-      // A function type's own parts are not forced here: a top-level return belongs to the
-      // `annRetNameOf` rung.
+      // A function type's own parts are not forced here: a top-level return belongs to
+      // `collectATypeRef`'s function-type rung.
       forceNestedCloSigRepsOfTy(k.fnRet, depth + 1)
       let ti = 0
       while ti < k.fnParamTypes.length {
@@ -5481,11 +5474,8 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   // see `forceNestedCloSigRepsOfTy`, which walks into the annotation's type for it.
   forceNestedCloSigRepsOfTy(nodeTyIxOf(i), 0)
   // A function type forces nothing here: its result's types are forced by
-  // `forceNestedCloSigRepsOfTy` above. Asked of the recorded type; an untyped annotation is a
-  // function when its spelling has a top-level arrow, whose trailing `[]` is not an array.
-  const annTy = nodeTyIxOf(i)
-  const isFnAnn = if annTy >= 0 { tyIsFuncArena(annTy) } else { annRetNameOf(nd.tyName) != "" }
-  if isFnAnn {
+  // `forceNestedCloSigRepsOfTy` above.
+  if tyIsFuncArena(nodeTyIxOf(i)) {
   } else if nameIsBareMap(nd.tyName) && !typeRefIsRecord(i) {
     // A bare map annotation interns its per-(key, value) slot here, since collect scans every
     // `TypeRef`, so the type-index assignment sees the full slot set. An orphaned parser field
@@ -7640,14 +7630,6 @@ function registerMapValUnion(stmts: i32[], mapTy: i32): i32 {
   registerInlineUnionOfChild(stmts, vt, 29)
 }
 
-// The one home of "the result atom of a closure spelling": strips grouping parens, takes the
-// text after the top-level `=>`, and normalizes it as a union arm is. "" when there is no
-// top-level arrow, which is also every caller's "not a closure" answer. The three steps
-// compose in a fixed order: peel before the arrow scan, normalize after it.
-function cloResultAtomOf(name: string) {
-  normTypeAtom(annRetNameOf(peelGroupParens(name)))
-}
-
 // Registers the inline union synthetic name `name` (e.g. `"A|B"`), the render of arena type
 // `sty` or -1, as a union alias, exactly as `collectU` registers a `UnionDecl`; the subtypes of
 // `sty` register theirs. A no-op if `name` is already registered or is not an inline
@@ -8438,13 +8420,13 @@ function collectTyReachCloSigsArm(tyIx: i32, depth: i32): i32 {
       // concrete lambda both derive; a mixed-union unregistered result is skipped so the call rejects loudly.
       if !funcRetUnrepresentable(t.fnRet) {
         // `sigKeyOfTy(tyIx)` gets the key directly off the type rather than parsing it back out of
-        // the render `arenaEmitName` would produce; only the mixed-union guard still reads the name.
+        // the render `arenaEmitName` would produce; the render is asked only whether it exists.
         const kAr = sigKeyOfTy(tyIx)
         if kAr != "" && !cloResultMaybeMixed(tyIx) {
           internCloSigKey(kAr, -1)
         } else {
           const nm = arenaEmitName(tyIx)
-          if nm != "" { internCloSigOfAtomTy(nm, kAr, tyIx) }
+          if nm != "" { internCloSigOfArmTy(kAr, tyIx) }
         }
       }
       // Descend params + result to reach closures nested inside them (a result struct's
@@ -9042,7 +9024,6 @@ function collectUReset() {
   uVarFieldRow = []
   armsAdopted = false
   variantSigMemoDrop()
-  objVariantIndexDrop()
   0
 }
 
@@ -9588,58 +9569,9 @@ function mapCallStructResultRow(callIx: i32): i32 {
   -1
 }
 
-// True when the nul-closure arm's result is a mixed scalar+composite union no registration
-// path admitted, so it has no pin/box path and its `>u` `$fnsig` must not intern (the call
-// site rejects loudly). `ty` is the arm's arena type or -1; a literal-union atom is told by
-// its member type, and an atom with no type counts as composite.
-function nulCloMixedUnionUnregistered(arm: string, ty: i32) {
-  const res = cloResultAtomOf(arm)
-  if res == "" { return false }
-  const atoms: string[] = []
-  unionSetAtomsOf(res, atoms)
-  if atoms.length < 2 { return false }
-  let rt = ty
-  if rt >= 0 {
-    const nt = tyAt(rt)
-    if nt is TyNullable { rt = nt.nInner }
-  }
-  if rt >= 0 {
-    const ft = tyAt(rt)
-    if ft is TyFunc { rt = ft.fnRet } else { rt = -1 }
-  }
-  const tys: i32[] = []
-  unionAtomTysAlignedOf(rt, atoms, tys)
-  let hasScalar = false
-  let hasComposite = false
-  let i = 0
-  while i < atoms.length {
-    const a = atoms[i]
-    if a != "null" {
-      if valueAtomKind(a) >= 0 || (tys[i] >= 0 && tyIsLitUnion(tys[i])) {
-        // A closure atom is value-atom kind 11 but composes like a ref — count only
-        // the non-closure value atoms as the scalar side of the mix test.
-        if nameIsFuncTypeAtom(a) {
-          hasComposite = true
-        } else {
-          hasScalar = true
-        }
-      } else {
-        hasComposite = true
-      }
-    }
-    i = i + 1
-  }
-  if !hasScalar || !hasComposite { return false }
-  if isUNameKeyAB(68, res, rt) { return false }
-  if isValueUnionName(res) { return false }
-  if nameIsLitUnionArmValueUnion(res) { return false }
-  if tyIsMapMemberUnion(rt) { return false }
-  true
-}
-
-// `nulCloMixedUnionUnregistered` on function type `ty` (its `| null` peeled): true when the
-// result is a union of a scalar and a composite member that no registration admitted. A closure
-// member is composite, a literal union scalar.
+// Whether function type `ty` (its `| null` peeled) has a result that is a union of a scalar and
+// a composite member that no registration admitted. A closure member is composite, a literal
+// union scalar.
 function nulCloMixedUnionUnregisteredTy(ty: i32) {
   const rt = tyStepRet(tyPeelNul(ty))
   if rt < 0 { return false }
