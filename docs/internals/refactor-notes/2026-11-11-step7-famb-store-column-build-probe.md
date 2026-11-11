@@ -70,9 +70,83 @@ No build record covers these reads:
 - **Not switched.** The checker's build record replaces the storage reader in 70 programs at
   most (51, plus the agreeing nodes of 19). It answers nothing in 258, and the wrong instance in
   15.
-- **The record that would replace the storage readers is a per-instance build column:** for each
-  `(node, instance)`, the record the value is built at. It would cover lists, maps and fields, and
-  be written where elaboration builds the value. It belongs with the per-instance bank (#7205's
-  instance readers) and step 5's records, not with the per-node build table in `check_fit_rules`.
 - **The literal-following extension of `recBuiltElemIn` is not worth building.** It would answer
   the 70 at most, and no storage reader would be deleted.
+
+## The per-instance build column, probed: the call leg
+
+A per-instance build column in `emit_elab` was the next candidate. It would extend
+`elabNodeReps` (`elabNodeRepAt`, the per-instance build stamp of a literal) from literals to
+reads. Two probes measured it.
+
+- **The per-instance bank alone does not answer.** Take the literal's `elabNodeRepAt`, else the row
+  of `nodeTyAt(rx, fnIx)`. At the struct-class nodes this matches the storage row at about 20
+  nodes. About 280 nodes have no row for that type, and about 125 name another row. The
+  store type (`rrStoreTy`) fails the same way.
+- **The call leg, derived from elaboration.** For every call whose `structIndexOfCallStore`
+  answers a struct row, the probe derived a row from elaboration: the callee instance's value
+  leaves, a literal at `elabNodeRepAt(lit, fe)`, bindings and calls followed. It compared the
+  canonical rows. 514 programs reach such a call:
+  - 273 agree at every call;
+  - 195 have no elaboration answer at some call (fn-value results, a relayed hole record, nested
+    and nullable list results);
+  - 46 disagree.
+
+  The first disagreeing cell is `tests/cases/parser/call-first-stmt-then-brace-tail.vl`. There
+  `mk1(n): Q1` has an annotated result, and the call's row is the declared result's row, which
+  no literal stamp carries.
+
+The call reader reads the callee instance's result-row column, `fRetStructIdx[fe]`. Its writer is
+emit_collect's `fnRetCols*` / `fnRetColsFromRecorded`, one writer per instance, under rules no
+literal stamp carries: the declared result, joins, fn-value results and the polymorphic
+companion slot. Derived again in elaboration, the same rows would be a second derivation that
+must stay equal to the column the module is built from.
+
+## Ruling: a struct-class read's row is its storage column's row
+
+The orchestrator's ruling. `structIndexOfExpr`'s dispatch on read kind is a syntax fact about
+where the value is held. The row a read answers is its storage column's row. This holds while
+every bank the dispatch consults is keyed by canonical type, and their rows are read canonical
+(`sRowCanonOf`, #7214 and #7226):
+
+| read | bank | writer | keyed by canonical type today |
+| --- | --- | --- | --- |
+| call | `fRetStructIdx` (`fnRetStructIndexSid`) | emit_collect `fnRetCols*`, one per instance | yes. The row is the result rep's slot; graded by design |
+| binding | param row, declared local row, global cell (`globalCellStructIdx`), capture, frame `let` cell (`letCellSlot`) | the slot layer's cell kinds | by the binding's stored type through the cell kind; the VKind lane (w308) owns the rest |
+| element | `rlElemStructRow` (ref-list bank) | `rlInternNameTy` | no. The key is `repElemIdOfNameTy(name, ty)`, half spelling; w311's ref-list key cut makes it so |
+| map value | `mvValStructIdxOf` (map-value bank) | the mv mint | yes. The bank stores a rep record (#7157), and its name producers are 0 |
+| field | `sFieldTgtStructIdx` (struct field table) | `pushFieldRow` | by field code and element name; w314's `sFieldStoreTy` cut makes it so |
+
+So the struct class is not converted further in Family B. It closes when the ref-list key (w311)
+and the field store column (w314) land.
+
+## What is left of Family B
+
+The struct and variant name producers that `2026-11-11-step7-closing-census-2.md` lists. Live
+call sites on master `f570d7f7`, before this lane's #7214, #7226, #7238 and #7251 merge:
+
+| producer | sites |
+| --- | --- |
+| `variantIndexOf` | 53 |
+| `structIndexByName` | 27 (answers the canonical row from #7214) |
+| `structRowOfSpelling` | 7 |
+| `armFieldStructRow` | 4 |
+| `structRowOfNameTy` | 4 |
+| `structRowOfAnnTy` | 4 (3 after #7251) |
+| `structIndexOfTypeName` | 3 (its two yes-or-no callers read the type since #7175) |
+| `repStructRowByName` | 2 |
+| `shapeElemDeclaredStructIdx` | 2 |
+| `structIndexOfTypeNameTy` | 1 |
+| `structIndexOfTypeNameGo` | 1 |
+
+The proposed next cut is **`variantIndexOf`'s 53 sites, graded by where the name comes from**, as
+the census did for the 63 sites in #7135:
+
+- a declaration's own name: by design;
+- an annotation, an `is` test or a cast: `annDeclVariantRow` / `declVariantRowAt` (#7139, #7150,
+  #7165);
+- a banked spelling: the bank's own cut;
+- the type's first name: `repVariantShapeRowOf` or the declaration column.
+
+Its witnesses are the Family B classes: MIX, where an arm shares its type with a standalone
+record, and ARM2, where two unions' arms share one type.
