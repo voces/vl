@@ -8,7 +8,7 @@ texts: `[(^1 ; null ; string)]` and `[([^1] ; null ; string)]` (D4140's
 `unions/recursive-alias-unfolded-list-is-alias-list.vl`, 14 splits in 2 programs). Every later
 cut that re-keys a site meeting a recursive alias needs this first.
 
-The base is master `98b73ba7`, with a fixpoint seed on both sides.
+The base is master `12ceb7b4`, with a fixpoint seed on both sides.
 
 ## Changed
 
@@ -39,7 +39,7 @@ The key is read only at the mint adopts and the 18 sites #7131 switched, and nei
 ## Proof
 
 - **Byte sweep.** `sweep.vl record` over the whole population with the master fixpoint and with
-  the candidate fixpoint: 23,877 of 23,877 are the same, with 0 bytes-only movers, 0 output
+  the candidate fixpoint: 23,883 of 23,883 are the same, with 0 bytes-only movers, 0 output
   movers and 0 runs → not-runs.
 - **Locally:** refresh ×2 byte-identical, rep-fuzz (exact), lint-self (clean), seed-size (+0.5%),
   late-demands (6, the baseline), and the dead-export, render-parse and pin-helper budgets,
