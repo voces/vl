@@ -1,7 +1,6 @@
 // The storage a value is built at, once a check pass's builds are known: the record every
 // result of a call or a binding of one is built at, and the field writes boxed at it.
 
-import { cwIxCovers } from "./check_write_scan"
 import {
   ArrayLit,
   BinExpr,
@@ -47,6 +46,8 @@ import {
   recCoalesceDefaultBuilt,
   recCoalesceDefaultDeliver,
   recCoalesceLitAdopt,
+  recHeldArgTakesRep,
+  recHeldReadsOwnRefuse,
   recHoleIdentityArg,
   recordBoxTy,
   recordRepTyAdopt,
@@ -66,11 +67,27 @@ import {
   storeWritesClear,
 } from "./check_fit_rules"
 import { recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
+import {
+  CW_OCC_USE,
+  cwFrJoins,
+  cwIxBuild,
+  cwIxCovers,
+  cwIxKind,
+  cwIxNode,
+  cwIxUp,
+  cwOccNext,
+  cwOccWalk,
+  cwPeelValue,
+} from "./check_write_scan"
 import { recSolePinArg } from "./check_record_origins"
 import { recFnValueLeaves } from "./check_type_shape"
-import { cwFrJoins, cwIxUp, cwPeelValue } from "./check_write_scan"
 import { i32ListHas } from "./listutil"
-import { recArgRepArgs, recArgRepOf, recBuildPush } from "./check_rec_rows"
+import {
+  recArgRepArgs,
+  recArgRepOf,
+  recBuildElemTyOf,
+  recBuildPush,
+} from "./check_rec_rows"
 import { identBoundFnDeclOf } from "./check_scopes"
 import { identDeclOf } from "./symbols"
 import { unwrapParen } from "./emit_base"
@@ -246,6 +263,7 @@ export function storeLetsResolve() {
       const lt = storeLitHeldAt(u, 4)
       if lt >= 0 && lt < T.tys.length && !tySame(lt, own) {
         recordRepTyAdopt(u, lt, 6)
+        storeHeldArgsAt(storeLetDeclAt(i), lt, u)
       }
     } else if own >= 0 && own < T.tys.length && tyAt(own) is TyObj {
       const r = if joins[i] != -2 { joins[i] } else { storeHeldAt(u) }
@@ -265,6 +283,21 @@ export function storeLetsResolve() {
     }
     i = i + 1
   }
+}
+
+// Instances each annotated parameter a read of the record binding `d`, its literal `l` held at
+// `lt`, is handed to and only read for a field, at `lt` (`recHeldArgTakesRep`), and refuses the
+// read's other deliveries at its own storage (D15695).
+function storeHeldArgsAt(d: i32, lt: i32, l: i32) {
+  if d < 0 || !(tyAt(lt) is TyObj) { return 0 }
+  cwIxBuild()
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    if cwIxKind[ow.row] == CW_OCC_USE {
+      recHeldArgTakesRep(cwIxNode[ow.row], lt)
+    }
+  }
+  recHeldReadsOwnRefuse(d, lt, l, [])
 }
 
 // The type list or record literal `l` is built at where an element or field is a value held at
@@ -341,12 +374,19 @@ function storeSlotHeldAt(v: i32, depth: i32): i32 {
     || r >= T.tys.length
     || own < 0
     || tySame(r, own)
-    || !(tyAt(r) is TyObj)
+    || !(tyAt(r) is TyObj || storeBuiltListTy(r))
   ) {
     return -1
   }
   if n is BinExpr { storeLetBuiltSet(v, r) }
   r
+}
+
+// Whether `t` is a list of records, as a list binding built at another record is held (D15690).
+function storeBuiltListTy(t: i32): boolean {
+  const a = tyAt(t)
+  const e = if a is TyArray { a.aElem } else { -1 }
+  e >= 0 && e < T.tys.length && tyAt(e) is TyObj
 }
 
 // -1 for slot value `v`, which is neither a `??` join nor a binding of one: it keeps its own row
@@ -563,6 +603,9 @@ function storeBindingHeldAt(x: i32): i32 {
   if v < 0 || v >= P.nodes.length { return -1 }
   const r = storeLetBuiltOf(v)
   if r >= 0 { return r }
+  // A list binding whose stores build its elements at another record (D15690).
+  const be = recBuildElemTyOf(d)
+  if be >= 0 && nodeAt(v) is ArrayLit { return mkArrayTy(be) }
   const vn = nodeAt(v)
   if !(vn is ArrayLit) && !(vn is ObjLit) { return -1 }
   const lt = litRepTyAt(v, -1)
