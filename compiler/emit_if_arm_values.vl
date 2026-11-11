@@ -36,7 +36,7 @@ import { ifArmValueExpr } from "./emit_query"
 import { emptyArrLitIxOf } from "./emit_shape_rows"
 import { structIndexOfTy } from "./emit_atom_kinds"
 import {
-  MfKind,
+  ListKind,
   liBack,
   liKinds,
   liSlots,
@@ -60,11 +60,11 @@ import { identDeclOf } from "./symbols"
 // temps — lazy, since a pre-pass can't know a delivery widens before the tables intern.
 // Sharing is safe: the source is fully emitted before the stash, no user code runs between.
 export function widenSrcWrapSlot(slot: i32) {
-  scratchSlot(8, "ref", slot, SCRATCH_BY_KEY)
+  scratchSlot(8, "reflist", slot, SCRATCH_BY_KEY)
 }
 
 export function widenDstBackSlot(slot: i32) {
-  scratchSlot(9, "ref", slot, SCRATCH_BY_KEY)
+  scratchSlot(9, "reflist", slot, SCRATCH_BY_KEY)
 }
 
 // D972 — the union-`==` operand stash, code 13. Its own code rather than
@@ -72,7 +72,7 @@ export function widenDstBackSlot(slot: i32) {
 // operand of a `==` may itself be a shared-union-field read), and two writers of one slot
 // is how a stash gets clobbered — an operand assigning itself.
 export function unionEqStashSlot() {
-  scratchSlot(13, "i32", 0, SCRATCH_BY_CODE)
+  scratchSlot(13, "list", 0, SCRATCH_BY_CODE)
 }
 
 // D1510 — the object-literal order stash, codes `100 + <field code>`. A struct/variant
@@ -80,7 +80,7 @@ export function unionEqStashSlot() {
 // and `struct.new` reads the slots back in layout order; the code carries the field's own
 // type so it can never disagree with `pushFieldStorage`. Fresh per field, never shared.
 export function objOrderStashSlot(code: i32, storageSlot: i32) {
-  liKinds.push("i32") // unread — `liBack` alone carries the field code
+  liKinds.push("list") // unread — `liBack` alone carries the field code
   liSlots.push(storageSlot)
   liBack.push(100 + code)
   listIdxScratchBase + liKinds.length
@@ -91,49 +91,53 @@ export function objOrderStashSlot(code: i32, storageSlot: i32) {
 // parked here at first read. Its own code, not `unionEqStashSlot`'s 13, because an `is`
 // can sit inside a union `==`'s operand and a second writer of one slot is how a stash clobbers.
 export function unionLitIsStashSlot() {
-  scratchSlot(17, "i32", 0, SCRATCH_BY_CODE)
+  scratchSlot(17, "list", 0, SCRATCH_BY_CODE)
 }
 
 // D12060 — the staged `is` receiver, code 42, keyed by its rep: 0 a union box, 1 an i32 atom
 // id, 2 or 3 a nullable string ref. Its own code, so a staged receiver cannot be clobbered by code 17's
 // tee inside the membership test that re-reads it.
 export function isRecvStashSlot(rep: i32) {
-  scratchSlot(42, "i32", rep, SCRATCH_BY_KEY)
+  scratchSlot(42, "list", rep, SCRATCH_BY_KEY)
 }
 
 // D973 — the three scratch slots a struct-union `==` needs: the two operand boxes (codes 13
 // and 15, `(ref null $uBoxIdx)`) and, per arm, the pair of casted variant payloads (code 14,
 // keyed by variant index; the right operand is keyed `vi + 1024`, outside any variant table).
 export function unionEqStashSlot2() {
-  scratchSlot(15, "i32", 0, SCRATCH_BY_CODE)
+  scratchSlot(15, "list", 0, SCRATCH_BY_CODE)
 }
 
 // D1721 — the nullable-niche box stash, code 19: an `anyref` slot parking a `V | null` value
 // so the null test and the payload read share ONE evaluation. `anyref` rather than the
 // niche's own heap, since the box payload is `anyref` and every niche rep is a subtype of it.
-export function nulNicheBoxSlot() { scratchSlot(19, "i32", 0, SCRATCH_BY_CODE) }
+export function nulNicheBoxSlot() {
+  scratchSlot(19, "list", 0, SCRATCH_BY_CODE)
+}
 
 // The `anyref` payload stash of a narrowed list read, code 28, parked between its wrapper test
 // and its cast (D4939). Its own code: a niche box may be staged in code 19 around the read.
 export function listPayloadStashSlot() {
-  scratchSlot(28, "i32", 0, SCRATCH_BY_CODE)
+  scratchSlot(28, "list", 0, SCRATCH_BY_CODE)
 }
 
 // The i32 stash of a literal-union atom `as` operand, code 29, read once per target member.
-export function litAtomCastSlot() { scratchSlot(29, "i32", 0, SCRATCH_BY_CODE) }
+export function litAtomCastSlot() {
+  scratchSlot(29, "list", 0, SCRATCH_BY_CODE)
+}
 
 // The i32 stash of the member id a call through a tagged function set dispatches on, code 43.
 // One slot serves every such call: a dispatched call's arguments hold no call.
-export function fnTagIdSlot() { scratchSlot(43, "i32", 0, SCRATCH_BY_CODE) }
+export function fnTagIdSlot() { scratchSlot(43, "list", 0, SCRATCH_BY_CODE) }
 
 // The number operand of a cross-width union `==`, code 44, keyed by its atom kind (0 i32, 3 i64,
 // 4 f64, 5 f32), staged once before the box's tag is read (D15090).
 export function numCrossEqSlot(kind: i32) {
-  scratchSlot(44, "i32", kind, SCRATCH_BY_KEY)
+  scratchSlot(44, "list", kind, SCRATCH_BY_KEY)
 }
 
 // The stash of a numeric literal-union scalar `as` operand, code 41, typed by its base's rep.
-export function numLitCastSlot(kind: MfKind) {
+export function numLitCastSlot(kind: ListKind) {
   scratchSlot(41, kind, 0, SCRATCH_BY_KIND)
 }
 
@@ -142,27 +146,27 @@ export function numLitCastSlot(kind: MfKind) {
 // shape is interned into the struct table even though the arms themselves are not, so the
 // nested compare can use `emitStructEqRec` given operands parked at the nested row's heap.
 export function structEqStashSlot(row: i32) {
-  scratchSlot(16, "ref", row, SCRATCH_BY_KEY)
+  scratchSlot(16, "reflist", row, SCRATCH_BY_KEY)
 }
 
 export function unionEqArmSlot(vi: i32) {
-  scratchSlot(14, "ref", vi, SCRATCH_BY_KEY)
+  scratchSlot(14, "reflist", vi, SCRATCH_BY_KEY)
 }
 
 // The scalar analogue of `widenSrcWrapSlot`/`widenDstBackSlot`: codes 11 and 12, keyed by
 // the list's element kind rather than a ref-list row, since a scalar list's wrapper and
 // backing heap types come from the kind alone. Two copies over the same kind share one
 // slot for the same reason: the source is fully emitted before the stash (D965).
-export function widenScalarWrapSlot(kind: MfKind) {
+export function widenScalarWrapSlot(kind: ListKind) {
   scratchSlot(11, kind, 0, SCRATCH_BY_KIND)
 }
 
-export function widenScalarBackSlot(kind: MfKind) {
+export function widenScalarBackSlot(kind: ListKind) {
   scratchSlot(12, kind, 0, SCRATCH_BY_KIND)
 }
 
 export function widenTmpSlot(which: i32) {
-  scratchSlot(10, "i32", which, SCRATCH_BY_KEY)
+  scratchSlot(10, "list", which, SCRATCH_BY_KEY)
 }
 
 // The ref-list row of the element the checker typed list literal `arrIx` at, or -1.
@@ -217,7 +221,7 @@ export function spreadLitElemIsString(arrIx: i32, fnIx: i32): boolean {
 }
 
 // The scalar element kind the checker typed list literal `arrIx` at, or `null` for any other.
-export function spreadLitScalarElem(arrIx: i32, fnIx: i32): MfKind | null {
+export function spreadLitScalarElem(arrIx: i32, fnIx: i32): ListKind | null {
   const t = nodeTyAt(arrIx, fnIx)
   if t < 0 { return null }
   const at = tyAt(t)
@@ -228,16 +232,16 @@ export function spreadLitScalarElem(arrIx: i32, fnIx: i32): MfKind | null {
   if p == null { return null }
   match p {
     "f64" => {
-      return "f64"
+      return "f64list"
     }
     "i64" => {
-      return "i64"
+      return "i64list"
     }
     "f32" => {
-      return "f32"
+      return "f32list"
     }
     "i32" => {
-      return "i32"
+      return "list"
     }
     "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
       return null
@@ -247,16 +251,16 @@ export function spreadLitScalarElem(arrIx: i32, fnIx: i32): MfKind | null {
 
 // Whether a spread source of element kind `sk` converts losslessly into a `de` element: the
 // three widenings scalar assignability admits (i32 to i64, i32 to f64, f32 to f64).
-export function spreadElemWidens(sk: MfKind | null, de: MfKind): boolean {
+export function spreadElemWidens(sk: ListKind | null, de: ListKind): boolean {
   if sk == null { return false }
   match sk {
-    "i32" => {
-      return de == "f64" || de == "i64"
+    "list" => {
+      return de == "f64list" || de == "i64list"
     }
-    "f32" => {
-      return de == "f64"
+    "f32list" => {
+      return de == "f64list"
     }
-    "f64" | "i64" | "u8" | "str" | "ref" => {
+    "f64list" | "i64list" | "u8list" | "strlist" | "reflist" => {
       return false
     }
   }
@@ -266,11 +270,11 @@ export function spreadElemWidens(sk: MfKind | null, de: MfKind): boolean {
 // destination BACKING (code 21), keyed by a per-site sequence so a nested spread literal
 // cannot write a live outer slot. Kind maps to heap type as codes 11 and 12 do, and the
 // ref-list row is `key % 4096`.
-export function spreadGroupWrapSlot(kind: MfKind, row: i32, seq: i32) {
+export function spreadGroupWrapSlot(kind: ListKind, row: i32, seq: i32) {
   scratchSlot(20, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
 }
 
-export function spreadDstBackSlot(kind: MfKind, row: i32, seq: i32) {
+export function spreadDstBackSlot(kind: ListKind, row: i32, seq: i32) {
   scratchSlot(21, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
 }
 
