@@ -57,8 +57,12 @@ as `forward`, the family that fell by 2.
 
 ## Proof
 
-- Refresh ×2 is a fixpoint at 6,610,141 bytes (−3,558).
-- `scripts/gate.sh`, and the ladder, comment and sentinel budgets: see the PR.
+- Refresh ×2 is a fixpoint at 6,610,215 bytes (−3,484). The sweep ran on the seed before the
+  two `klFieldNames` rows were added to `compiler/lint.vl`; that table is read by the kind-ladder
+  lint only, not by the emitter.
+- `scripts/gate.sh`: all 23 rows pass, `ladder-sets` among them (it named the two new
+  `VKind`-typed fields, `rrKind` and `rsKind`).
+- The ladder, comment, sentinel and arena-scan budgets (`vl check --budget`) all exit 0.
 
 ## What is left
 
