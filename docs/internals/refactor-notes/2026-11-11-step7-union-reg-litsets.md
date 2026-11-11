@@ -7,7 +7,7 @@ All of them are literal sets, at sites 79, 87, 102 and 103. The softened key han
 literal set's row (`K = "a" | "b"`) for the second set's type (`L = "c" | "d"`). This PR switches
 those four sites to the canonical key, so each set's type finds its own row.
 
-The base is master `98b73ba7`, with a fixpoint seed on both sides.
+The base is master `12ceb7b4`, with a fixpoint seed on both sides.
 
 ## Changed
 
@@ -32,7 +32,7 @@ Both readings hold over the whole population: no module moves.
 ## Proof
 
 - **Byte sweep.** `sweep.vl record` over the whole population with the master fixpoint and with
-  the candidate fixpoint: 23,877 of 23,877 are the same, with 0 bytes-only movers, 0 output
+  the candidate fixpoint: 23,883 of 23,883 are the same, with 0 bytes-only movers, 0 output
   movers and 0 runs → not-runs.
 - **Literal unions still never mint.** D14041 and D14042 still refuse as filed
   (`check-filed-witnesses --strict`).
