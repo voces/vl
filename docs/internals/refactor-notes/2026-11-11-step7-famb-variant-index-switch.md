@@ -43,10 +43,21 @@ the variant. The type says so directly. The spelling said so only when it happen
 - **`mfRecordElemRowName`.** No program reaches it (0 of 23,911). It and its one rung in the
   `.map` result-slot ladder are deleted.
 
+- **`monoArgTyNameProjected`'s nullable-receiver rung** (`emit_mono`), the type's-first-name
+  rung #7279 found unreached. A probe at the record-field arm fired in 4 programs and on a
+  hand-written un-annotated nullable receiver. In every one the receiver's pin named its row, so the
+  rung below never ran. It is deleted.
+
 `variantIndexOf` falls from 54 to 48 grep sites on this base, and `inferRetNameByNode` has one reader fewer.
+
+## Step-7 remainder
+
+- `retStructRowIndex`'s name rung (#7279: 109 programs). The newtype brands `I32View`/`F32View` and
+  same-shape declarations carry declaration identity that the type does not. It waits on struct
+  rows keyed by `(type, declaration)`.
 
 ## Proof
 
-- Refresh ×2 is a fixpoint at 6,619,677 bytes (−261). Local sweep, fixpoint seeds on both sides: 23,916 same, 0 movers.
+- Refresh ×2 is a fixpoint at 6,619,554 bytes (−384). Local sweep, fixpoint seeds on both sides: 23,916 same, 0 movers.
 - `regress.vl`, `lint-self`, `cases_wasm`, seed size, late demands, plumb-shape cost, ladder sets,
   the dead-export budget and the memo-generation and live-sites tests pass.
