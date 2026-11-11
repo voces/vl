@@ -40,9 +40,10 @@ are the spelling-only interns named in #7160 (`d188rp_objnest`, the pinned bound
 - `fieldCodeCellKind` is already the floor of a typed read (`repOfTy` of the storage type comes
   first). `nulScalarListCodeKind` and `listRepOfFieldCode` are asked of codes during interning,
   before any row exists. They go with the codes themselves.
-- A deduplicated row keeps its first writer's type (rows at code 14, 37 and 16 in 7 programs). No
-  such row reaches the two converted sites (0 disagreements). A reader that does reach them needs
-  the row's rep to be the join of the types it serves.
+- Seven programs still have a typed row whose stored type disagrees with its code. Five are an
+  `#anon` literal in a generic body: the row is built at the literal's own rep, but its type is
+  recorded as the type-parameter destination's. Two are a numeric literal union stored in the
+  union box (D2541's fixture). None reaches the two converted sites (0 disagreements).
 
 ## Proof
 
