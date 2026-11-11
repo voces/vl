@@ -37,18 +37,45 @@ Counts are **programs**:
 
 ## Grading
 
-- **Rep is a variant: by design, a position fact.** A record type's rep is `variant` wherever
-  the type is an arm of some union. Inventory row D1071 is the shape: `A` is an arm of
-  `A | i32` and is also bound as a plain `A`. A literal or read in a struct-typed position is
-  stored at the struct row. The same type in a union position is boxed as the arm. The type
-  is one, and the positions are two. The syntax side reads the position: the literal's
-  context, the read's storage. A typed read needs the rep recorded per position, not per
-  type.
-- **Rep is a struct, other row: by design until struct rows key by canonical type.** The
-  storage was built at a row minted under a declaration's name, or at a literal's `#anon`
-  row. The canonical row of its type is a same-shape twin's. This is the class of
-  `retStructRowIndex` (`2026-11-10-step7-retkind-family.md`) and `rlElemLitStructRow`
-  (`2026-11-11-step7-famb-banked-spellings.md`).
+The two big classes were split further by later probes on master `658a3841` (#7174), over
+23,902 programs. Counts are **programs**.
+
+### Rep is a variant (1,192): a coercion fused at the delivery, or a storage fact
+
+| part | programs | what it is |
+| --- | --- | --- |
+| the node is not an arm value, and it carries a box record (`boxDstTyAt`) | 909 (`ObjLit` 882) | a record built at its struct row, then boxed into the union position it is delivered to |
+| the node is not an arm value, and it carries no box record | about 56 (`Ident` 31, `Member` 29, `ObjLit` 23, overlapping) | the type is an arm of some union, but this value sits in a struct position |
+| the node is an arm value (`exprVariantIndex` ≥ 0) | about 227 (`Ident` 217, `Call` 116, `Member` 89, overlapping) | a record arm stored at its own struct row (D14655) |
+
+- **909: a fused coercion.** The value is built at its struct row and boxed at its delivery.
+  The record the typed read would use is the checker's union-box record for that delivery,
+  `boxDstTyAt`, which is step 5's record (`2026-11-07-lowercoerce-scope.md`).
+- **About 56: a step-5 gap.** No coercion record exists at these nodes. The rep is per type, so
+  a type that is an arm anywhere reps as `variant`, and nothing records that this position
+  holds a plain struct.
+- **About 227: storage.** The arm's value was stored at its struct row, which is the storage
+  reader's answer. The rep's arm answer is `exprVariantIndex`'s (D34).
+
+### Rep is a struct, other row (490): open, converted under family B
+
+| part | programs | what it is |
+| --- | --- | --- |
+| the row's type is not the value's type | 393 | a build widened by a delivery: D14512's `mk()` is built at `J` while the read is typed `{f: i32}` |
+| two `#anon` rows of one type, or an `#anon` row against a spelling row | 90 | one canonical type with two rows |
+| two declarations of one type | 27 (14 decl>decl, 13 decl>spell) | an element of `A[]` read at `A`'s row while the type's row is `B`'s; `Member` `R>S`; `Ident` `Pt>Vec` |
+
+This class is open. It is the "one row per canonical type, same-shape rows" item, converted in
+the family B series.
+
+**A value's declaration is not its type index.** A declared record keeps its own type index, so
+the candidate read the row of the record the index was declared as, before the shape's row
+(`nominalStructNameOfTy`, then `structNameOfTy`). The candidate was byte-identical on all 23,902
+programs, because the storage readers answer first. But the rep then disagreed with them in
+1,786 programs instead of 1,707. Most of the rise is `Ident` reads of a same-type row (54 to 135).
+A value of a declared type is often stored at the canonical row. So the declaration has to be
+recorded on the value node where the checker resolves it.
+
 - **The arm answers none (9 programs): by design.** An `ObjLit` or `Member` read whose storage
   holds no struct (`-2`) wins over a struct rep.
 - **`OptMember`: a rep read.** Its storage reader (`recvFieldStructRow`) agreed with the rep
