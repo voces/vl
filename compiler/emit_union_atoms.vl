@@ -21,6 +21,7 @@ import {
   mapTwinUnionMember,
   nameIsLitUnionArmValueUnion,
   storedTyOf,
+  tyMapKeyKindSpan,
   valueAtomKind,
 } from "./check_ty_rep"
 import {
@@ -57,7 +58,6 @@ import { structIndexByName, structIndexOfTy } from "./emit_atom_kinds"
 import {
   bodyLetOfRead,
   fnLetOfRead,
-  mapNameKeyKind,
   mapShapeFoldSet,
   nameIsMap,
   tyNameOf,
@@ -256,6 +256,7 @@ import { mapArmShapeOfTy, mapPinnedParamTyOf, mapTyPeel } from "./emit_ty_canon"
 import {
   isUNameABAt,
   isUNameOwnAB,
+  rlElemUnionName,
   softKeyProbe,
   unABMode,
   unABOn,
@@ -297,20 +298,13 @@ import {
 
 // The mv shape of the map held as `heldTy` (bare, nullable or through a one-member alias),
 // keyed by its value's declared name; `armTy` is the value's type as the caller's node recorded
-// it (D34) and `valTy` only classifies the value. The key kind follows spelling `mapName` when
-// given, as the map's ops hash by it. A value the arena cannot name has no slot: `-3`.
-export function mvShapeOfMapHeldTy(
-  mapName: string,
-  heldTy: i32,
-  armTy: i32,
-  valTy: i32,
-) {
+// it (D34) and `valTy` only classifies the value. The key kind is the held map's. A value the
+// arena cannot name has no slot: `-3`.
+export function mvShapeOfMapHeldTy(heldTy: i32, armTy: i32, valTy: i32) {
   const m = tyMapHeld(heldTy)
   const vn = mvDeclNameOfValTy(tyMapValOf(m))
   if vn == "" { return -3 }
-  let kk = tyMapKeyKind(m)
-  if mapName != "" { kk = mapNameKeyKind(mapName) }
-  mvShapeOfMapValKey(vn, kk, armTy, valTy)
+  mvShapeOfMapValKey(vn, tyMapKeyKind(m), armTy, valTy)
 }
 
 // The mv shape of a map whose value is keyed `valName` under key kind `ki`: the value's slot,
@@ -501,7 +495,7 @@ function mvShapeOfValNameArmTyGo(
   let rls6 = -1
   if kind == MVK_REF {
     if nameIsMap(bare) {
-      mvShapeOfMapHeldTy(bare, kindTy, -1, tyMapValOfHeld(kindTy))
+      mvShapeOfMapHeldTy(kindTy, -1, tyMapValOfHeld(kindTy))
     }
     // `bare`'s arena type: the value's own, or its non-null member's for a niche-nullable
     // value, and -1 where `bare` is not the spelling the find resolved.
@@ -611,7 +605,7 @@ export function rlElemMapShape(slot: i32): i32 {
   if enn != "" { en = enn }
   let ety = -1
   if slot >= 0 && slot < rlElemTyIx.length { ety = rlElemTyIx[slot] }
-  mvShapeOfMapHeldTy(en, ety, -1, tyMapValOfHeld(ety))
+  mvShapeOfMapHeldTy(ety, -1, tyMapValOfHeld(ety))
 }
 
 // Intern the ref-list slot whose element type is `elemName`, interning a nested inner list's
@@ -702,7 +696,6 @@ function ensureRefElemKindTail(elemName: string, k: i32, ty: i32, kindTy: i32) {
     // resolves to the declared type rather than the unrolled anonymous twin its rendered
     // spelling would mint (D1865). `-1` in, `-1` through: the unhinted call is unmoved.
     mvShapeOfMapHeldTy(
-      mve,
       kindTy,
       tyMapValOf(unMemPeelAliasWrapper(ty)),
       tyMapValOfHeld(kindTy),
@@ -788,14 +781,14 @@ export function rlInternNameTy(name: string, kind: i32, tyIn: i32) {
     const min = nulMapInnerName(men)
     if min != "" { men = min }
   }
-  rlElemMapKey.push(rlMintMapKey(kind, rlTy, men))
+  rlElemMapKey.push(rlMintMapKey(kind, rlTy))
   rlElemMvSlot.push(-1)
   // A map element's value slot is found, never minted, at the read; the row it looks for is
   // interned by the value's own first op, which can fall between the frame-layout pass and
   // the emit pass. Minting it HERE is what makes the two passes read one answer (D1786).
   if kind == RLK_MAP {
     const rlIx = rlElemMvSlot.length - 1
-    const msh = mvShapeOfMapHeldTy(men, rlTy, -1, tyMapValOfHeld(rlTy))
+    const msh = mvShapeOfMapHeldTy(rlTy, -1, tyMapValOfHeld(rlTy))
     if msh >= 0 { rlElemMvSlot[rlIx] = msh }
   }
   const row = rlElemName.length - 1
@@ -809,20 +802,11 @@ export function rlInternNameTy(name: string, kind: i32, tyIn: i32) {
 }
 
 // The key kind a ref-list slot of kind `kind` records at its mint: a map element's from its
-// arena type `rlTy` (one `| null` peeled), else from `men`, the spelling the slot's value
-// shape is minted under; `MAP_KEY_STR` for every other kind.
-function rlMintMapKey(kind: i32, rlTy: i32, men: string): i32 {
+// arena type `rlTy`, through a `| null` and a union of twin maps stored as its one map (D15800);
+// `MAP_KEY_STR` for every other kind.
+function rlMintMapKey(kind: i32, rlTy: i32): i32 {
   if kind != RLK_MAP { return MAP_KEY_STR }
-  if rlTy >= 0 {
-    let b = rlTy
-    const t = tyAt(b)
-    if t is TyNullable { b = t.nInner }
-    if b >= 0 {
-      const bt = tyAt(b)
-      if bt is TyMap { return tyMapKeyKind(b) }
-    }
-  }
-  mapNameKeyKind(men)
+  tyMapKeyKindSpan(rlTy)
 }
 
 // The smallest earlier variant whose softened arena type equals variant `i`'s and whose fields
@@ -1877,7 +1861,7 @@ function markMapUnionArmsOf(atoms: string[], mems: i32[], cov: boolean) {
     if isMap {
       let held = -1
       if cov { held = mems[i] }
-      const sh = mvShapeOfMapHeldTy(a, held, -1, tyMapValOfHeld(held))
+      const sh = mvShapeOfMapHeldTy(held, -1, tyMapValOfHeld(held))
       if sh < 0 && mapShapeKeyKind(sh) != MAP_KEY_STR { mIntMonoArmUsed = true }
       if cov && sh != -3 { mapTwinNote(mems[i], mapShapeFoldSet(sh)) }
     }
@@ -1924,7 +1908,7 @@ function forceCloMapResult(fnTy: i32, depth: i32) {
   const r = tyPeelNul(ret)
   if r < 0 { return 0 }
   if tyMapHeld(r) < 0 { return forceCloMapTypesGo(r, depth - 1) }
-  mvShapeOfMapHeldTy("", r, -1, tyMapValOfHeld(ret))
+  mvShapeOfMapHeldTy(r, -1, tyMapValOfHeld(ret))
 }
 
 // Forces the backing of scalar list rep `sk`; false when `sk` names none.
@@ -2302,7 +2286,7 @@ export function unionClosureArrElemUnion(name: string) {
     if a is TyArray {
       const slot = rlSlotOfTy(a.aElem)
       if slot >= 0 && rlElemKindAt(slot) == RLK_UNION {
-        const el = rlElemName[slot]
+        const el = rlElemUnionName(slot)
         if isValueUnionName(el) && unionHasClosureArm(el) { return el }
       }
     }
@@ -2412,7 +2396,7 @@ function unionRefArrayArmSlotForElemAtom(name: string, elemAtom: string) {
     const slot = unMemRefArrArmSlot(mems[i])
     if slot >= 0 && rlElemKindAt(slot) == RLK_UNION {
       if elemAtom == "" { return slot }
-      const en = rlElemName[slot]
+      const en = rlElemUnionName(slot)
       const eAtoms: string[] = []
       unionArmsOf(en, eAtoms)
       let j = 0
@@ -2470,7 +2454,7 @@ export function unionRefArrayArmSlotForNestedElem(
     ) {
       if wantMap {
         const eAtoms: string[] = []
-        unionArmsOf(rlElemName[slot], eAtoms)
+        unionArmsOf(rlElemUnionName(slot), eAtoms)
         for a in eAtoms {
           if nameIsMapOpen(a) { return slot }
         }
