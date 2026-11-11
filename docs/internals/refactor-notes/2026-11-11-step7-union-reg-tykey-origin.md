@@ -38,9 +38,9 @@ The key is read only at the mint adopts and the 18 sites #7131 switched, and nei
 
 ## Proof
 
-- **Bytes.** The 120 `tests/cases` programs declaring a recursive list alias that build, under
-  the master fixpoint and the candidate fixpoint: 120 of 120 byte-identical. The sweep (label
-  `sweep`) grades the whole population.
+- **Byte sweep.** `sweep.vl record` over the whole population with the master fixpoint and with
+  the candidate fixpoint: 23,877 of 23,877 are the same, with 0 bytes-only movers, 0 output
+  movers and 0 runs → not-runs.
 - **Locally:** refresh ×2 byte-identical, rep-fuzz (exact), lint-self (clean), seed-size (+0.5%),
   late-demands (6, the baseline), and the dead-export, render-parse and pin-helper budgets,
   cases_wasm, inventory refs/rows, `check-filed-witnesses --strict` on both inventories,
