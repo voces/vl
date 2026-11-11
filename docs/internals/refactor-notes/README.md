@@ -9,6 +9,49 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-11-step7-vkind-ty-list-ladders-2](2026-11-11-step7-vkind-ty-list-ladders-2.md): Step 7: the last two arena-type list ladders are descriptor reads at their callers.
+- [2026-11-11-step7-vkind-name-ladders](2026-11-11-step7-vkind-name-ladders.md): Step 7: the rendered-name list ladders lose two callers, and what keeps the rest.
+- [2026-11-11-step7-vkind-forin-walk-kind](2026-11-11-step7-vkind-forin-walk-kind.md): Step 7: a for-in's `#l` temp reads its iterable's rep, and the `fiLk` ladder is deleted.
+- [2026-11-11-step7-union-reg-wrong-type](2026-11-11-step7-union-reg-wrong-type.md): Step 7 L6: the union registry's callers hand over the type their spelling names.
+- [2026-11-11-step7-union-reg-tykey-origin](2026-11-11-step7-union-reg-tykey-origin.md): Step 7 L6: the canonical type key's recursive text no longer depends on the walk's origin.
+- [2026-11-11-step7-union-reg-litsets](2026-11-11-step7-union-reg-litsets.md): Step 7 L6: the literal-set sites ask the canonical type key.
+- [2026-11-11-step7-union-reg-d14742](2026-11-11-step7-union-reg-d14742.md): Step 7 L6: a recursive alias with list or map arms binds to its expansion's row (D14742).
+- [2026-11-11-step7-union-reg-boxtag-twin](2026-11-11-step7-union-reg-boxtag-twin.md): Step 7 L6: `boxTagOfTy`'s render fallback is a member-equality question asked of the type.
+- [2026-11-11-step7-slot-rl-elem-codecs](2026-11-11-step7-slot-rl-elem-codecs.md): Step 7 slot layer: the ref-list element codecs go.
+- [2026-11-11-step7-slot-mv-rep-record](2026-11-11-step7-slot-mv-rep-record.md): Step 7 slot layer: the map-value bank stores a rep record, and its two value codecs go.
+- [2026-11-11-step7-slot-mv-mint-by-type](2026-11-11-step7-slot-mv-mint-by-type.md): Step 7 slot layer: the map-value mint is keyed by type, and its spelling floor deleted.
+- [2026-11-11-step7-rep-tree-covers-nullable-lists](2026-11-11-step7-rep-tree-covers-nullable-lists.md): Step 7: the rep tree's kind covers every nullable list, and the two derivations measured.
+- [2026-11-11-step7-l2-w312-sites](2026-11-11-step7-l2-w312-sites.md): Step 7 L2 §7: lane w312's 19 sites classified, two parses cut (69 → 67).
+- [2026-11-11-step7-l2-void-twin-seam-deleted](2026-11-11-step7-l2-void-twin-seam-deleted.md): Step 7 L2 §7: the void-twin seam is deleted; only a placeholder spelling reached it.
+- [2026-11-11-step7-l2-varbox-atom-tys](2026-11-11-step7-l2-varbox-atom-tys.md): Step 7 L2 §7: a variant box's atoms paired with their own member types (D15675).
+- [2026-11-11-step7-l2-untyped-annotation-walk](2026-11-11-step7-l2-untyped-annotation-walk.md): Step 7 L2 §7: an annotation with no type is not shape-walked, and a duplicated arm block is removed.
+- [2026-11-11-step7-l2-spelling-predicates](2026-11-11-step7-l2-spelling-predicates.md): Step 7 L2 §7: the `emit_base` spelling predicates, four callers moved to the type.
+- [2026-11-11-step7-l2-shape-walk-census](2026-11-11-step7-l2-shape-walk-census.md): Step 7 L2 §7: where the shape walk runs untyped.
+- [2026-11-11-step7-l2-shape-rows-reflist-gate](2026-11-11-step7-l2-shape-rows-reflist-gate.md): Step 7 L2 §7: collectA's ref-list annotation gate asks the type (70 → 69), and the shape-rows floors measured.
+- [2026-11-11-step7-l2-reflist-row-key-census](2026-11-11-step7-l2-reflist-row-key-census.md): Step 7 L2 §7: the ref-list row registry under a type key, census (docs).
+- [2026-11-11-step7-l2-refelem-kind-from-type](2026-11-11-step7-l2-refelem-kind-from-type.md): Step 7 L2 §7: two ref-list mints classify by the element type, and `ensureRefElem` is deleted.
+- [2026-11-11-step7-l2-list-union-elem-kind](2026-11-11-step7-l2-list-union-elem-kind.md): Step 7 L2 §7: a union of lists with differing kinds is the union box, by type.
+- [2026-11-11-step7-l2-fnsig-key-of-ty](2026-11-11-step7-l2-fnsig-key-of-ty.md): Step 7 L2 §7: a function type's `$fnsig` key is read off the type before its spelling is cut.
+- [2026-11-11-step7-l2-element-canon-deleted](2026-11-11-step7-l2-element-canon-deleted.md): Step 7 L2 §7: the element canon is the identity, and is deleted (render-parse 70 → 65).
+- [2026-11-11-step7-famb-struct-index-of-expr-graded](2026-11-11-step7-famb-struct-index-of-expr-graded.md): Step 7 slot layer, family B: `structIndexOfExpr`'s syntax side, graded per arm.
+- [2026-11-11-step7-famb-shape-row-scan](2026-11-11-step7-famb-shape-row-scan.md): Step 7 slot layer: the shape-row scan's callers read the spelling's type.
+- [2026-11-11-step7-famb-mv-ladder-remeasure](2026-11-11-step7-famb-mv-ladder-remeasure.md): Step 7 slot layer, family B, item 4: the map-value kind ladder re-measured after #7134.
+- [2026-11-11-step7-famb-is-ret-decl](2026-11-11-step7-famb-is-ret-decl.md): Step 7 slot layer, family B, PR 3: the type's-first-name sites read the declaration.
+- [2026-11-11-step7-famb-cast-arm-decl](2026-11-11-step7-famb-cast-arm-decl.md): Step 7 slot layer, family B, PR 2: a cast's arm tag reads the declaration the cast names.
+- [2026-11-11-step7-famb-banked-spellings](2026-11-11-step7-famb-banked-spellings.md): Step 7 slot layer, family B: the banked spellings measured.
+- [2026-11-11-step7-famb-annot-decl-column](2026-11-11-step7-famb-annot-decl-column.md): Step 7 slot layer, family B, PR 1: the annotation's declaration, recorded by the checker.
+- [2026-11-11-step7-codecs-read-rep](2026-11-11-step7-codecs-read-rep.md): Step 7 codecs: the read rep stores its kind, and the read-rep string decoders deleted.
+- [2026-11-11-step7-codec-field-store-lit-set](2026-11-11-step7-codec-field-store-lit-set.md): Step 7 codecs: a one-literal field is stored at its one-member set, so its stored type reps as the atom.
+- [2026-11-11-step7-codec-field-store-kind](2026-11-11-step7-codec-field-store-kind.md): Step 7 codecs: the field-store recover asks the field's storage type, which follows its re-lays.
+- [2026-11-11-step7-codec-field-code-census](2026-11-11-step7-codec-field-code-census.md): Step 7 codecs: the field code's writers, censused; the arm mint's fields are typed (23,883 same).
+- [2026-11-11-step7-annsig-spelling-loop-deleted](2026-11-11-step7-annsig-spelling-loop-deleted.md): Step 7: an undone adoption's annotation is not interned, and `annSigKeyTy`'s spelling loop is deleted.
+- [2026-11-11-d15697-map-over-built-list-loud](2026-11-11-d15697-map-over-built-list-loud.md): D15697: a `map` or `filter` over a list built elsewhere is refused at check.
+- [2026-11-11-d15695-record-of-built-list-to-param](2026-11-11-d15695-record-of-built-list-to-param.md): D15695: a held record handed to a field-read parameter of its own type is instanced at its build.
+- [2026-11-11-d15694-for-over-field-list](2026-11-11-d15694-for-over-field-list.md): D15694: a field read of a record built elsewhere is built as that record's field.
+- [2026-11-11-d15690-record-of-built-list](2026-11-11-d15690-record-of-built-list.md): D15690: a literal holding a list built at a kept maker's record is built where the list is.
+- [2026-11-11-d15659-generic-member-in-a-generic-fns-literal-join](2026-11-11-d15659-generic-member-in-a-generic-fns-literal-join.md): D15659: a generic member in a generic function's literal join gets its instance.
+- [2026-11-11-d15657-push-of-kept-call](2026-11-11-d15657-push-of-kept-call.md): D15657: a push of a kept maker's call stores into the list as an index write does.
+- [2026-11-11-d15649-forwarded-record-field-takes-the-set](2026-11-11-d15649-forwarded-record-field-takes-the-set.md): D15649: a call through a forwarded record field makes its parameter take the set.
 - [2026-11-11-step7-union-registry-census](2026-11-11-step7-union-registry-census.md): Step 7 L6: where the union registry is keyed by a spelling, measured against the type.
 - [2026-11-11-step7-union-reg-clean-sites](2026-11-11-step7-union-reg-clean-sites.md): Step 7 L6: 18 typed registry lookups ask the canonical type key.
 - [2026-11-11-step7-slot-variant-name-rows](2026-11-11-step7-slot-variant-name-rows.md): Step 7 slot layer: three variant-bank name producers deleted.
