@@ -41,7 +41,6 @@ import {
 } from "./check_elab_cap"
 import {
   annGenAppSpanEnds,
-  arrElemIs,
   gaeArgsTextOf,
   gaeHeadNameOf,
   gaeLtAt,
@@ -200,7 +199,6 @@ import {
   valueIfNodes,
 } from "./ast"
 import {
-  annGenAppDecompose,
   annRetNameOf,
   bodyLetOfRead,
   declStructIndexBuild,
@@ -218,9 +216,7 @@ import {
   nameIsF32Array,
   nameIsF64Array,
   nameIsI64Array,
-  nameIsNulString,
   nameIsShapeSpanEnds,
-  nameIsString,
   nameIsStringArray,
   nameIsU8Array,
   nodeIsTypeDecl,
@@ -779,7 +775,6 @@ import {
   forceScalarListRep,
   mvCanonRepOf,
   nameIsConcreteGenAppDecl,
-  nulScalarListKind,
   refArrElemKind,
   refListElemKindOfTy,
   rlElemInnerSlot,
@@ -4813,51 +4808,8 @@ function mvKeysWrapMint(mvi: i32) {
   else { mkListTy() }
 }
 
-// The one home of "reserve the backing and wrapper heap types the type name `a` needs". A
-// presence flag is a reservation: `mAssignTypeIndices` mints a heap type only where the flag is
-// set, and an unminted index falls through to `mNextType`, so a missed reservation is
-// check-clean invalid wasm rather than a missing feature. Monotone, so a redundant call is inert.
-function forceAnnLeafReps(a: string): i32 {
-  if nameIsStringArray(a) {
-  } else if nameIsF64Array(a) {
-    // The f64 pair mints on first read (`fa64Ty`).
-  } else if nameIsI64Array(a) {
-    // The i64 pair mints on first read (`ia64Ty`).
-  } else if nameIsF32Array(a) {
-    // The f32 pair mints on first read (`fa32Ty`).
-  } else if nameIsBareMap(a) {
-    // The map struct mints on first ask (`mapTy`).
-  } else if arrElemIs(a, "i32") || arrElemIs(a, "boolean") {
-  } else if nameIsString(a) || nameIsNulString(a) {
-  } else if nulScalarListKind(a) != null {
-    const nsk = nulScalarListKind(a)
-    // Exhaustive over `VKind` and `_`-less, `null` included: each of the five marks its own
-    // backing, and a new leaf must say whether it needs one (D1898). The `null` alternative
-    // is unreachable under the guard above and is named because the language requires it.
-    match nsk {
-      "nulstrlist" => {}
-      "nulf64list" => {
-        // The f64 pair mints on first read (`fa64Ty`).
-      }
-      "nuli64list" => {
-        // The i64 pair mints on first read (`ia64Ty`).
-      }
-      "nulf32list" => {
-        // The f32 pair mints on first read (`fa32Ty`).
-      }
-      "nulu8list" => {
-        // The packed byte pair mints on first read (`ba8Ty`).
-      }
-      "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
-        // Not a nullable scalar list, so it marks no backing here.
-      }
-    }
-  }
-  0
-}
-
-// `forceAnnLeafReps` for the list type `kTy`, read off its arena element: a scalar element
-// list reserves its backing, and any other list reserves nothing here.
+// Reserve the backing and wrapper heap types list type `kTy` needs, read off its arena element:
+// a scalar element list reserves its backing, and any other list reserves nothing here.
 function forceListLeafRepsOfTy(kTy: i32): i32 {
   const k = tyAt(kTy)
   if !(k is TyArray) || k.aElem < 0 || k.aElem >= T.tys.length { return 0 }
@@ -4885,28 +4837,8 @@ function forceListLeafRepsOfTy(kTy: i32): i32 {
     }
     "i32" | "boolean" => {}
     "void" | "null" | "never" | "u8" | "v128" => {
-      // Not an element `forceAnnLeafReps` reserves a backing for.
+      // No backing to reserve for this element.
     }
-  }
-  0
-}
-
-// Reserve the reps a generic application's type arguments need. They are invisible to every
-// branch of `collectA`'s `TypeRef` ladder, since the whole spelling `Box<string>` is one name, so
-// without this `aTypeIdx` names whatever heap type sits at an index never allocated. Flag-only
-// and outside the ladder: it bypasses no arm, and at worst allocates a type nothing needed.
-function forceGenAppArgTypes(name: string): i32 {
-  if !annGenAppSpanEnds(name) { return 0 }
-  const args: string[] = []
-  const head = annGenAppDecompose(name, args)
-  if head == "" { return 0 }
-  let i = 0
-  while i < args.length {
-    const a = args[i]
-    // A nested application (`Box<Pair<i32, string>>`) is the same reservation one rung in.
-    forceGenAppArgTypes(a)
-    forceAnnLeafReps(a)
-    i = i + 1
   }
   0
 }
@@ -4937,8 +4869,8 @@ function tyElemIsStrListLeaf(e: i32): boolean {
   tyNulInnerIsPrim(e, "string")
 }
 
-// `forceAnnLeafReps` for arena type `t`: the backing and wrapper heap types a closure field's
-// result or parameter of that type needs. A type it does not name reserves nothing.
+// Reserve the backing and wrapper heap types a closure field's result or parameter of arena type
+// `t` needs. A type it does not name reserves nothing.
 function forceAnnLeafRepsOfTy(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return 0 }
   const k = tyAt(t)
@@ -5616,10 +5548,6 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   // finds them even when the program never constructs such a list. Same self-gating
   // placement as the map forcer above.
   forceCloResultListTypes(nodeTyIxOf(i))
-  // The generic-application dual of the two forcers above: a type argument (`Box<string>`,
-  // `Pair<i32, string[]>`) no branch of the chain can see, because the whole `Head<…>` is one
-  // name. Same self-gating placement and the same flag-only contract; see the helper.
-  forceGenAppArgTypes(nd.tyName)
   0
 }
 
