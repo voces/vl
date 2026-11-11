@@ -700,7 +700,16 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
     fuel and the rung facts (real `wasm-opt` included). The fuel engine maps 4–7 MB more than
     a plain build of the same seed (301 vs 297 MB, 316 vs 309 MB on two seeds). The
     control's own builds run first under both engines, so a cold sidecar's in-process JIT
-    (~1 GB) is never a measured build's.
+    (~1 GB) is never a measured build's. The metered build runs with
+    `VL_COMPILE_GC_GROW=off`: the seed's own grow policy (`SeedGcHeadroom`) decides on a 10 ms
+    wall-clock sample, and the main unit's live set (~100.6 MiB after a collection) sits on its
+    96 MiB line, so under the policy peak RSS was bimodal (~307–324 or ~426–443 MB) run to run
+    and box to box. With it off the heap grows only when wasmtime's own predicate says so, and
+    RSS depends on the program alone: six `--check` runs on one box read main 319.5–320.1 MB
+    and tail 317.3–317.8 MB, the same collection count each time, the same fuel as with it on.
+    The gate therefore prices the compiler's memory, not the grow policy: RSS under the
+    shipped policy is not graded here
+    (`docs/internals/refactor-notes/2026-11-11-ci-cost-rss-gc-growth.md`).
   * **CPU, +15% compile / +25% `wasm-opt`.** The least of three runs, graded only on the
     baseline's machine and only from runs whose control read within 15% of its
     baseline. Under `--check` a timed build runs only after a quiet control, and none runs
