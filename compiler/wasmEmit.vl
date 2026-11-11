@@ -104,11 +104,7 @@ import {
   recCopyTyOf,
   recCopyUnwrapOf,
 } from "./check_core_state"
-import {
-  nodeTyProvesNonNull,
-  nominalStructNameOfTy,
-  recArmPartialFields,
-} from "./check_emit_queries"
+import { nodeTyProvesNonNull, recArmPartialFields } from "./check_emit_queries"
 import { binPlusIsListByTy } from "./check_leaf_steps"
 import { numDeliverStamp, recFitNarrowedFields } from "./check_fit_rules"
 import {
@@ -1335,7 +1331,6 @@ import {
   vtKindOfType,
 } from "./emit_nullable_rets"
 import {
-  armRowNameOfRecord,
   armRowSharedAtRecv,
   atomNarrowOp,
   boxNarrowAtomFor,
@@ -3272,18 +3267,28 @@ function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
     return dsi
   }
   if !exprStruct(exprIx, fnIx) { return -1 }
-  const ssi = structIndexOfExpr(exprIx, fnIx)
+  let ssi = structIndexOfExpr(exprIx, fnIx)
+  // A record that is also a union's arm answers no struct row by expression; its type names one.
+  if ssi < 0 { ssi = copyArmRowOf(exprIx) }
   if ssi < 0 || ssi >= sHeapIdx.length { return -1 }
   const vi = repVariantShapeRowOf(dst)
   if vi >= 0 && vi < uVarRow.length {
     if variantHeap(vi) == sHeapIdx[ssi] { return -1 }
     return -2 - vi
   }
-  const dsi = structIndexOfTy(dst)
+  let dsi = structIndexOfTy(dst)
+  if dsi < 0 { dsi = structRowOfAnnTy("", dst, dst) }
   if dsi < 0 || dsi >= sHeapIdx.length || sHeapIdx[dsi] == sHeapIdx[ssi] {
     return -1
   }
   dsi
+}
+
+// The struct row of a copied call's own record when that record is also a union's arm, or -1.
+function copyArmRowOf(exprIx: i32): i32 {
+  const own = nodeTyIxOf(exprIx)
+  if own < 0 || repVariantShapeRowOf(own) < 0 { return -1 }
+  structRowOfAnnTy("", own, own)
 }
 
 // `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`).
@@ -3292,7 +3297,8 @@ function emitRecCopyInto(body: u8[], exprIx: i32, row: i32, fnIx: i32): i32 {
   const codes: i32[] = []
   // A call copied back to its own record is read at the row its function builds it at.
   const from = recCopyFromOf(exprIx)
-  const ssi = if from >= 0 { structIndexOfTy(from) } else { structIndexOfExpr(exprIx, fnIx) }
+  let ssi = if from >= 0 { structIndexOfTy(from) } else { structIndexOfExpr(exprIx, fnIx) }
+  if ssi < 0 && from < 0 { ssi = copyArmRowOf(exprIx) }
   if row <= -2 {
     const vi = -2 - row
     if guardVariantFieldSpan(vi, "emitRecCopyInto") < 0 { return -1 }
@@ -5349,14 +5355,10 @@ function unionArmTagsOfTy(
     // construction, not an `isArmTagOfTy` value-atom kind.
     let vi = -1
     if t1 < 0 {
-      let armNm = nominalStructNameOfTy(aty)
       // The declaration the annotation at `declAt` (-1 for none) names for this arm, which its
-      // type cannot tell apart from a same-shape record's.
+      // type cannot tell apart from a same-shape record's; else the arm's row by its type.
       const dp = annArmDeclPosOf(declAt, aty)
-      if dp >= 0 { armNm = cStructNames[dp] }
-      // An inline record arm has no nominal name; its row is the one every union stores it in.
-      if armNm == "" { armNm = armRowNameOfRecord(aty) }
-      if armNm != "" { vi = variantIndexOf(armNm) }
+      vi = if dp >= 0 { variantIndexOf(cStructNames[dp]) } else { repVariantShapeRowOf(aty) }
       if vi >= 0 { t1 = uTags[vi] }
     }
     if t1 < 0 { return false }
@@ -31691,12 +31693,58 @@ function emitStmtGo(body: u8[], stmtIx: i32, fnIx: i32) {
   // to `1 + 1`, reached through `stmtIsTailValue`. The tail statement of a body never
   // arrives here: `emitFuncBody`/`emitStmtTail` route a tail value to `emitReturnExit` first.
   if stmtIsBareFnName(stmtIx) { return 0 }
+  if stmtIsInertLit(stmtIx) { return 0 }
   if stmtIsTailValue(stmtIx, fnIx) {
     if emitExpr(body, stmtIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
     return 0
   }
   emitFail("emitProgram: unsupported statement in body")
+}
+
+// Whether discarded statement `stmtIx` is a list or record literal built only of constants and
+// function names `stmtIsBareFnName` admits, through parentheses: building it has no effect, so it
+// emits nothing and needs no row.
+function stmtIsInertLit(stmtIx: i32): boolean {
+  const x = unwrapParen(stmtIx)
+  if x < 0 { return false }
+  const e = nodeAt(x)
+  if !(e is ArrayLit) && !(e is ObjLit) { return false }
+  inertLitPart(x)
+}
+
+// Whether expression `ix` builds nothing observable: a constant, an inert function name, or a list
+// or record literal of such parts. A spread, a call or any other read is not.
+function inertLitPart(ix: i32): boolean {
+  const x = unwrapParen(ix)
+  if x < 0 { return false }
+  const e = nodeAt(x)
+  match e {
+    NumLit | StrLit | CharLit | BoolLit | NullLit => {
+      return true
+    }
+    Ident => {
+      return stmtIsBareFnName(x)
+    }
+    ArrayLit => {
+      for el in e.arrElems {
+        if !inertLitPart(el) { return false }
+      }
+      return true
+    }
+    ObjLit => {
+      for f in e.objFields {
+        const fi = nodeAt(f)
+        if !(fi is FieldInit) { return false }
+        if !inertLitPart(fi.fiValue) { return false }
+      }
+      return true
+    }
+    // Anything that computes, reads or binds may have an effect, so it is built and dropped.
+    Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return false
+    }
+  }
 }
 
 // Whether discarded statement `stmtIx` is a function's bare name, through parentheses: its
@@ -39804,6 +39852,13 @@ function coalNarrowedReRead(ix: i32, fnIx: i32): i32 {
   cp
 }
 
+// A re-associated `??` link minted in emitted function `fnIx` stands for `src` there: it is typed
+// at `src`'s type in that instance, which a link minted per emission can hold as its own.
+function coalLinkTyAt(link: i32, src: i32, fnIx: i32) {
+  tyCarrySrcNote(link, src)
+  nodeTyRecord(link, nodeTyAt(src, fnIx))
+}
+
 function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -39845,9 +39900,9 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       } else {
         // Otherwise the outer link is the chain. The inner one lies between `d` and the chain,
         // so it is the chain's type exactly when `d` already is.
-        nodeTyCarry(reOuter, exprIx)
+        coalLinkTyAt(reOuter, exprIx, fnIx)
         if tySame(nodeTyAt(exprIx, fnIx), nodeTyAt(e.binRight, fnIx)) {
-          nodeTyCarry(reInner, exprIx)
+          coalLinkTyAt(reInner, exprIx, fnIx)
         }
       }
       // The inner link is the outer's default, delivered at the outer's type.

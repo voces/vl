@@ -1,6 +1,6 @@
 # D15713, registry half: a `??` that is a union only at an instance gets its row, 2026-11-11
 
-D15713 (w320's row, on #7200's branch; unfiled: D15713 until that row lands) is check-clean
+D15713 is check-clean
 invalid wasm:
 
     type J = { f: i32 | null }

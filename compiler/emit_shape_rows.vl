@@ -1095,10 +1095,9 @@ export function mvValInnerMvSlot(slot: i32): i32 {
   mvSlotOfMapKeyKTys(tyMapKeyKind(m), -1, tyMapValOf(m))
 }
 
-// The `sFieldTgtStructIdx` twin for a variant's nested-struct field, with two extra rungs:
-// the arm twin and the mint. A variant's fields are recorded before the struct table exists, so
-// an arm-typed field banks the arm's own name and no `sNames` row ever carries it;
-// `armFieldStructRow` is the same resolver asked one phase later, once the mint has run.
+// The `sFieldTgtStructIdx` twin for a variant's nested-struct field, with an extra rung, the
+// mint: a variant's fields are recorded before the struct table exists, so an arm-typed field
+// may have no row until it is minted.
 export function uFieldTgtStructIdx(vi: i32, fi: i32): i32 {
   const ety = uFieldElemTyIxAt(vi, fi)
   const a = structIndexOfTy(ety)
@@ -1106,9 +1105,6 @@ export function uFieldTgtStructIdx(vi: i32, fi: i32): i32 {
   const c = repRowOfTyStruct(ety, sScanLim())
   if c >= 0 { return c }
   if vi < 0 || vi >= uFieldStart.length { return -1 }
-  const nm = sFieldElemName[uFieldStart[vi] + fi]
-  const ar = armFieldStructRow(nm)
-  if ar >= 0 { return ar }
   armStructRowMint(uFieldStart[vi] + fi)
 }
 
@@ -1603,7 +1599,7 @@ function shapeFieldTypeCompatK(
     // `{r: 7}` literal builds. Second-pass only: applied on the strict pass it would let a
     // box row declared first win every single-field render ahead of the exact one.
     if lenient >= 1 && code == FC_UNION { return true }
-    // The literal widenings (D733), level 2 only — the name side of `objFieldCodeWidens`:
+    // The literal widenings (D733), level 2 only — the name side of the field-code widenings:
     // a render `{r:i32}` denotes `{r:i64}`/`{r:K}` for the same reason the literal built there.
     if lenient >= 2 {
       if want == FC_I32 {
@@ -2894,20 +2890,11 @@ export function fieldRefElemName(tyIx: i32, code: i32) {
     // not: an inline-shape field records the name of its interned struct, so every
     // nominal-keyed use site resolves it like a declared `inner: Inner`.
     if code == FC_STRUCT {
-      // `nonNulBaseOf` is the answer-or-original fold applied here. The arena is checked
-      // first (`fieldBaseStructRow`); its -1 means "I do not know", never "no row" — the
-      // name-matcher path still answers for those.
+      // The row the field's type is stored at, else the spelling's non-null base, which a use
+      // site resolves once the struct table holds it.
       const ar = fieldBaseStructRow(tyIx)
       if ar >= 0 { return sNames[ar] }
-      const base = nonNulBaseOf(ty.tyName)
-      const idx = structRowOfSpelling(base)
-      if idx >= 0 { return sNames[idx] }
-      // An arm-typed field records its cross-table twin's name, not the arm's (D761): every
-      // code-15 consumer resolves through `structIndexByName`, a struct-table lookup where
-      // `Circle` has no row. The twin row's name resolves, and its heap is the arm's.
-      const armNm = armTwinRowName(base)
-      if armNm != "" { return armNm }
-      return base
+      return nonNulBaseOf(ty.tyName)
     }
     // The ATOM codes the shape-text recorder keys and the NODE recorder does not: a
     // code-0 literal-union field and a code-30 `K | null` niche field carry their union
@@ -3108,35 +3095,6 @@ export function arrLitObjBesideNonRecord(arrIx: i32): boolean {
         }
       }
     }
-  }
-  false
-}
-
-// True if the struct type at `ty` has a map field anywhere in its (nested-struct) shape,
-// depth-bounded against recursive struct definitions.
-export function tyStructHasMapField(ty: i32, depth: i32): boolean {
-  if ty < 0 { return false }
-  if depth > 12 { return false }
-  const t = tyAt(ty)
-  if !(t is TyObj) { return false }
-  const fts = t.objFieldTypes
-  let i = 0
-  while i < fts.length {
-    const ft = tyAt(fts[i])
-    // Exhaustive over `Ty` and `_`-less: a new arena variant that can hold a map field must be
-    // descended here rather than take the `false`.
-    match ft {
-      TyMap => {
-        return true
-      }
-      TyObj => {
-        if tyStructHasMapField(fts[i], depth + 1) { return true }
-      }
-      TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyArray | TyVar | TyLit | TyNeg => {
-        // Holds no map field of its own.
-      }
-    }
-    i = i + 1
   }
   false
 }
@@ -4863,8 +4821,7 @@ export function tyRegGenNow(): i32 {
 }
 
 // The declared struct or variant name the record (or record list) type `ty` resolves to. ""
-// means the arena does not resolve it, not "no nominal": a caller holding a render keeps it
-// (`shapeNominalOr`).
+// means the arena does not resolve it, not "no nominal": a caller holding a render keeps it.
 export function shapeNominalOfTy(ty: i32): string {
   if ty < 0 { return "" }
   const t = tyAt(ty)
@@ -5114,32 +5071,8 @@ export function famRelayStructRow(si: i32) {
   0
 }
 
-// Whether the rows record type `recTy` builds at store field `name`, typed by a string literal
-// or literal set, as the literal-union atom: 1 the atom, 0 a string, -1 when no row answers or
-// its struct row and its union-arm variant row disagree. `recTy` is a record, a declared struct
-// or a union arm, never the union; a layout family's rows agree (D14752).
-export function rowFieldStoresAtom(recTy: i32, name: string): i32 {
-  if recTy < 0 || recTy >= T.tys.length || !(tyAt(recTy) is TyObj) { return -1 }
-  let s = -1
-  let si = repStructRowOfTy(recTy)
-  if si < 0 { si = repRowOfTyStruct(recTy, sScanLim()) }
-  if si >= 0 && si < sFieldStart.length {
-    const fi = sFieldIndex(si, name)
-    if fi >= 0 { s = fieldCodeStoresAtom(sFieldTypes[sFieldStart[si] + fi]) }
-  }
-  let v = -1
-  const vi = repVariantShapeRowOf(recTy)
-  if vi >= 0 && vi < uFieldStart.length {
-    const fj = variantFieldIndex(vi, name)
-    if fj >= 0 {
-      v = fieldCodeStoresAtom(armFieldTypes()[uFieldStart[vi] + fj])
-    }
-  }
-  if s >= 0 && v >= 0 && s != v { return -1 }
-  if s >= 0 { s } else { v }
-}
-
-// `rowFieldStoresAtom`'s answer read off struct row `si` alone, -1 for no row or field.
+// Whether struct row `si` stores field `name` as the literal-union atom: 1 the atom, 0 a string,
+// -1 for no row or field, or any other code.
 export function structRowFieldStoresAtom(si: i32, name: string): i32 {
   if si < 0 || si >= sFieldStart.length { return -1 }
   const fi = sFieldIndex(si, name)
@@ -5147,7 +5080,7 @@ export function structRowFieldStoresAtom(si: i32, name: string): i32 {
   fieldCodeStoresAtom(sFieldTypes[sFieldStart[si] + fi])
 }
 
-// `rowFieldStoresAtom`'s answer read off variant row `vi` alone, -1 for no row or field.
+// `structRowFieldStoresAtom` for variant row `vi`.
 export function variantRowFieldStoresAtom(vi: i32, name: string): i32 {
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const fj = variantFieldIndex(vi, name)
@@ -5155,7 +5088,7 @@ export function variantRowFieldStoresAtom(vi: i32, name: string): i32 {
   fieldCodeStoresAtom(sFieldTypes[uFieldStart[vi] + fj])
 }
 
-// `rowFieldStoresAtom`'s answer for a literal field stored at code `c`.
+// The atom answer for a literal field stored at code `c`: 1 the atom, 0 a string, else -1.
 function fieldCodeStoresAtom(c: i32): i32 {
   if c == FC_I32 { return 1 }
   if c == FC_STR { return 0 }
