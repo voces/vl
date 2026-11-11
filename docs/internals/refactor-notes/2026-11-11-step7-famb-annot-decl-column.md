@@ -72,5 +72,6 @@ D15670, the next PR's target. It reads the same column on the cast node.
 
 ## Proof
 
-- Refresh ×2 is a fixpoint at 6,615,113 bytes (+1,095).
+- Refresh ×2 is a fixpoint at 6,615,113 bytes on base `98b73ba7` (+1,095). Merged with master
+  `ada32709`, it is a fixpoint at 6,616,574 bytes.
 - The `sweep` label re-proves the whole population on CI.
