@@ -411,6 +411,7 @@ type Meas = {
   ifs: i32 | null,
   wasmOpt: string | null,
   host: string,
+  gc: string | null,
 }
 
 type Row = {
@@ -433,6 +434,22 @@ function fuelOf(err: string): f64 | null {
       }
       if ok { return parseF64(n) }
     }
+  }
+  null
+}
+
+// The host's `$VL_GC_STATS` line, as "<n> collections, peak live <k> KiB"; null without one.
+// Peak RSS steps when the seed's heap doubles, so a reading names which heap it got.
+function gcOf(err: string): string | null {
+  const head = "vl: compile gc collections: "
+  const mid = ", peak live after a collection: "
+  for line in err.split("\n") {
+    if !startsWith(line, head) { continue }
+    const i = line.indexOf(mid)
+    if i < 0 { continue }
+    const n = line.slice(head.length, i)
+    const k = line.slice(i + mid.length, line.length)
+    return n + " collections, peak live " + k
   }
   null
 }
@@ -502,13 +519,17 @@ function measure(
   const realEnv = "PLUMB_SHAPE_REAL_WASM_OPT=" + (real ?? "")
 
   // One metered build, real `wasm-opt` included, gives the fuel, the peak RSS and the
-  // rung facts; the timed builds below exist only for CPU.
+  // rung facts; the timed builds below exist only for CPU. The seed's grow policy samples
+  // on a wall-clock tick, so it is off here: peak RSS then depends only on the program.
   truncate(log)
   const fenv = benv.slice(0, benv.length)
   fenv.push("VL_FUEL=1")
+  fenv.push("VL_COMPILE_GC_GROW=off")
+  fenv.push("VL_GC_STATS=1")
   fenv.push(realEnv)
   const fr = runTimed(build, fenv, work, true)
   const fuel = fuelOf(fr.err)
+  const gc = gcOf(fr.err)
   const facts = readOptLog(log).facts
 
   const tenv = benv.slice(0, benv.length)
@@ -607,6 +628,7 @@ function measure(
     ifs: ifs,
     wasmOpt: version,
     host: cpuModel(),
+    gc: gc,
   }
 }
 
@@ -628,7 +650,8 @@ function summary(name: string, m: Meas): string {
   const skip = pyBool(m.skip)
   const ifs = pyOptInt(m.ifs)
   const runs = "\{m.quiet} quiet of \{m.done} runs; control \{ctl}s"
-  "plumb-shape \{name} unit: fuel \{fuel}, peak RSS \{rss}, compile \{comp} CPU, -O \{opt} (\{runs}), skip ssa-nomerge \{skip}, const-1 ifs \{ifs}"
+  const gc = m.gc ?? "-"
+  "plumb-shape \{name} unit: fuel \{fuel}, peak RSS \{rss} (gc \{gc}), compile \{comp} CPU, -O \{opt} (\{runs}), skip ssa-nomerge \{skip}, const-1 ifs \{ifs}"
 }
 
 function numJson(v: f64 | null): string {
