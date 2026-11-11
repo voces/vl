@@ -1,3 +1,4 @@
+import { emitFail } from "./emit_bytes"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { constBindsLitSet, forInBindTy } from "./check_leaf_steps"
 import {
@@ -415,11 +416,14 @@ import {
   letMapKeyKind,
   listRepOfFieldCode,
   listRepOrNull,
+  mapKeyListKind,
   nulListBase,
   paramString,
   popRecvOf,
   popTakesElem,
   vkListClass,
+  vkNonNullRefTwin,
+  vkNonNullTwin,
 } from "./emit_list_rep"
 import {
   arrElemIsNulStrAt,
@@ -966,8 +970,8 @@ function fnSigTokOfTy(t: i32, fx: i32): string {
 
 // The rep kind a value of type `t` takes in the lifted function `fx`: a tagged set rides its id.
 function fnSigKindOfTy(t: i32, fx: i32): VKind | null {
-  if fnTagTyIsTagged(t) { return "i32" }
-  const c = fnSigClosedTy(t, fx)
+  // The tag decision is the declared type's, which the instance it closes to does not carry.
+  const c = if fnTagTyIsTagged(t) { t } else { fnSigClosedTy(t, fx) }
   if c < 0 { return null }
   const d = repOfTy(c)
   if d.rdCovered == 0 { return null }
@@ -1683,7 +1687,12 @@ function nulNoneReadCellKind(exprIx: i32, fnIx: i32): VKind {
   }
   const ck = readCellKind(exprIx, fnIx)
   if ck != null { return ck }
-  "nulnone"
+  // A read that names no cell is the `null` unit itself, as its own rep says.
+  const nd = repOfNode(exprIx, fnIx)
+  if nd.rdCovered == 0 {
+    emitFail("emitProgram: a `null` read that names no cell has no rep")
+  }
+  nd.rdKind
 }
 
 // The kind of the cell a read takes its value from: a name's cell, or the rep of a field's storage
@@ -1746,48 +1755,6 @@ export function readOwesNonNullRecover(exprIx: i32, fnIx: i32): boolean {
 export function readCellHoldsNullRef(exprIx: i32, fnIx: i32): boolean {
   const ck = readCellKind(exprIx, fnIx)
   ck != null && vkNonNullRefTwin(ck) != null
-}
-
-// The non-null twin of a nullable ref kind, or null for a kind that is not one.
-function vkNonNullRefTwin(k: VKind): VKind | null {
-  match k {
-    "nulvariant" => {
-      return "variant"
-    }
-    "nulstruct" => {
-      return "struct"
-    }
-    "nullist" => {
-      return "list"
-    }
-    "nulreflist" => {
-      return "reflist"
-    }
-    "nulclosure" => {
-      return "closure"
-    }
-    "nulstrlist" => {
-      return "strlist"
-    }
-    "nulf64list" => {
-      return "f64list"
-    }
-    "nuli64list" => {
-      return "i64list"
-    }
-    "nulf32list" => {
-      return "f32list"
-    }
-    "nulu8list" => {
-      return "u8list"
-    }
-    "nulmap" => {
-      return "map"
-    }
-    "nulstr" | "nulbool" | "nulnone" | "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "i64" | "f64" | "f64list" | "f32" | "closure" | "i64list" | "f32list" | "u8list" | "v128" => {
-      return null
-    }
-  }
 }
 
 // `k` when it is a nullable niche kind, else null.
@@ -4978,22 +4945,19 @@ let irkMemoNul: i32[] = []
 function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   const d = repOfNode(ifIx, fnIx)
   if d.rdCovered != 1 { return null }
-  const k = d.rdKind
-  if k == "nulstr" { return "str" }
-  const tw0 = vkNonNullRefTwin(k)
-  const tw = if tw0 == null { k } else { tw0 }
+  const k = vkNonNullTwin(d.rdKind)
   // A record the shape of a union member reps as that variant; with no variant row behind the
   // arm it is built as its own record (D4644).
-  if tw == "variant" {
+  if k == "variant" {
     if ifExprRefSlot(ifIx, fnIx, "variant", -1) >= 0 { return "variant" }
     return "struct"
   }
-  if tw0 != null { return tw0 }
   match k {
-    "struct" | "variant" | "list" | "reflist" | "map" | "strlist" | "f64list" | "closure" | "i64list" | "f32list" | "u8list" | "str" => {
+    "struct" | "list" | "reflist" | "map" | "strlist" | "f64list" | "closure" | "i64list" | "f32list" | "u8list" | "str" => {
       return k
     }
-    "nulbool" | "nulnone" | "i32" | "union" | "i64" | "f64" | "f32" | "v128" | "nulvariant" | "nulstruct" | "nullist" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" => {
+    // No ref blocktype of its own (`nulstr` is the twin's input, never its answer).
+    "nulstr" | "nulbool" | "nulnone" | "i32" | "union" | "i64" | "f64" | "f32" | "v128" | "nulvariant" | "nulstruct" | "nullist" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" => {
       return null
     }
   }
@@ -5633,12 +5597,7 @@ export function forInWalkKind(iterIx: i32, fnIx: i32): VKind | null {
   const k = repSigKindOfTy(t)
   if k == null { return null }
   if k == "str" { return k }
-  if k == "map" {
-    const kk = tyMapKeyKind(t)
-    if kk == MAP_KEY_I32 { return "list" }
-    if kk == MAP_KEY_I64 { return "i64list" }
-    return "strlist"
-  }
+  if k == "map" { return mapKeyListKind(tyMapKeyKind(t)) }
   listRepOrNull(k)
 }
 
@@ -7102,6 +7061,14 @@ export function anonFieldCode(valIx: i32) {
     if ltt is TyLit {
       const lc = fieldCodeOfTy(litBaseTy(ltt))
       if lc >= 0 { return lc }
+    }
+    // A numeric literal union stores its base scalar too, as its type reps (D2541).
+    if ltt is TyUnion {
+      const nb = numLitUnionBaseTy(lt)
+      if nb >= 0 && nb != lt {
+        const nc = fieldCodeOfTy(nb)
+        if nc >= 0 { return nc }
+      }
     }
   }
   // A `K | null` whose `K` narrowing a wider box re-minted at a fresh index, which the alias
