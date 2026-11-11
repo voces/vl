@@ -30,12 +30,12 @@ compiler: `recStoredValues` listed the spread part as a stored value, and `recRe
 | `push(mk2())`, `push(b)` after `[b]`, `push(c)`, in a function, unwritten `let`, loop | check reject | runs |
 | `[...xs, mk2()]`, `[mk2(), ...xs]`, `[...xs, ...]` after a push | compiler trap | runs |
 | `[...xs]` then `push(mk2())` | check reject | runs |
-| `[...own, mk2()]`, own a fresh literal list | compiler trap | check reject, D15671 |
+| `[...own, mk2()]`, own a fresh literal list | compiler trap | check reject, D15691 |
 | `[...own, mk2()]`, own annotated `{f: i32}[]` | compiler trap | check reject, fixture |
 | `xs[0] = mk2()`, `[mk2(), mk2()]`, `push({ f: 2 })`, `J[]` then push, `Map` set | runs | runs |
-| `{ ys: xs }` then a field read | emit error | emit error, D15670 |
-| std:array `insert` / `concat` | check reject | check reject, D15672 |
-| a reassigned `let` list, push or index write | check reject | check reject, D15673 |
+| `{ ys: xs }` then a field read | emit error | emit error, D15690 |
+| std:array `insert` / `concat` | check reject | check reject, D15692 |
+| a reassigned `let` list, push or index write | check reject | check reject, D15693 |
 | push of a call kept at another row `L` | check reject | check reject (owed) |
 
 There is no `unshift` on a list.
