@@ -4470,6 +4470,8 @@ type RtKind = "i32"
   | "f32"
   | "str"
   | "u8"
+  | "null"
+  | "v128"
   | "atom"
   | "list"
   | "map"
@@ -4712,7 +4714,9 @@ function rtOfPrim(pn: PrimName, ty: i32): i32 {
   // finds none.
   if pn == "u8" { return rtLeafOf("u8", 0, "", ty) }
   if pn == "void" { return rtLeafOf("i32", 0, "", ty) }
-  // `null` (and any future prim) — no standalone rep policy.
+  if pn == "null" { return rtLeafOf("null", 0, "", ty) }
+  if pn == "v128" { return rtLeafOf("v128", 0, "", ty) }
+  // `never` (and any future prim) — no standalone rep policy.
   rtLeafOf("unsup", 0, "prim:" + primNameStr(pn), ty)
 }
 
@@ -4804,8 +4808,22 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
     }
     return rtLeafOf("unsup", 0, "union:unclassified", ty)
   }
+  // A numeric literal union (`0 | 1`) is stored as its base scalar.
+  const nb = numLitUnionBaseTy(ty)
+  if nb >= 0 {
+    const bk = rtGo(nb)
+    rtByTyPut(ty, bk)
+    return bk
+  }
   if unionHasOpenMember(members) {
     return rtLeafOf("unsup", 0, "union:open", ty)
+  }
+  // Maps nothing can tell apart are the one map they all represent as (D15540).
+  const mt = mapTwinUnionMember(ty)
+  if mt >= 0 {
+    const mk = rtGo(mt)
+    rtByTyPut(ty, mk)
+    return mk
   }
   if tyIsValueUnionBox(ty) {
     const ix = rtAlloc("box", ty, 0, "", -1)
@@ -4818,13 +4836,6 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
     }
     rtSetKids(ix, kids)
     return rtComplete(ix, ty)
-  }
-  // A numeric literal union (`0 | 1`) is its base scalar; anything else is a policy gap.
-  const nb = numLitUnionBaseTy(ty)
-  if nb >= 0 {
-    const bk = rtGo(nb)
-    rtByTyPut(ty, bk)
-    return bk
   }
   rtLeafOf("unsup", 0, "union:unclassified", ty)
 }
@@ -4861,19 +4872,40 @@ function rtNulDiscOf(inner: i32): i32 {
       if nb >= 0 { return rtNulDiscOf(nb) }
       // Lists that all spell one list take a list's discipline.
       if oneListUnionRender(inner) != "" { return 1 }
-      if it.uMembers.length == 1 {
-        const m = tyAt(it.uMembers[0])
-        if m is TyObj { return 1 }
-      }
+      // A one-member union takes its member's; `Json`'s `TyUnion[TyNullable(rest)]` holds its null.
+      if it.uMembers.length == 1 { return rtNulDiscOf(it.uMembers[0]) }
+      // Maps nothing can tell apart take their one map's niche.
+      if mapTwinUnionMember(inner) >= 0 { return 1 }
       0
     }
-    // Nullable-of-nullable, negation, unnarrowable leaves — no discipline.
-    TyNullable | TyNeg | TyVar | TyLit | TyErr => 0
+    // A doubled nullable takes the single one's discipline.
+    TyNullable => {
+      if it.nInner < 0 { return 0 }
+      rtNulDiscOf(it.nInner)
+    }
+    // `"x" | null` is the atom sentinel; `1 | null` takes its base scalar's discipline.
+    TyLit => {
+      if it.litKind == "str" { return 3 }
+      rtNulDiscOf(litBaseTy(it))
+    }
+    // Negation and unnarrowable leaves — no discipline.
+    TyNeg | TyVar | TyErr => 0
   }
 }
 
 function rtOfNullable(ty: i32, inner: i32): i32 {
-  if inner < 0 { return rtLeafOf("unsup", 0, "nul:hole", ty) }
+  // No inner type, or an inference hole nothing filled: only `null` reaches it.
+  if inner < 0 { return rtLeafOf("null", 0, "", ty) }
+  const it = tyAt(inner)
+  if it is TyVar && it.tvName.length > 0 && it.tvName[0] == '?' {
+    return rtLeafOf("null", 0, "", ty)
+  }
+  // A doubled nullable is the single one.
+  if it is TyNullable {
+    const k = rtGo(inner)
+    rtByTyPut(ty, k)
+    return k
+  }
   const disc = rtNulDiscOf(inner)
   if disc == 0 { return rtLeafOf("unsup", 0, "nul:unclassified", ty) }
   const ix = rtAlloc("nul", ty, disc, "", -1)
@@ -4948,6 +4980,12 @@ function repTreeVKind(ix: i32): VKind | null {
     "u8" => {
       return "i32"
     }
+    "null" => {
+      return "nulnone"
+    }
+    "v128" => {
+      return "v128"
+    }
     "unsup" => {
       return null
     }
@@ -4960,12 +4998,13 @@ function rtListVKind(elem: i32): VKind | null {
   // Exhaustive over `RtKind` and `_`-less: the unnamed `box` takes `null` (a list element is
   // never a raw value box), so a new element kind must decide its list vocabulary here.
   match ek {
-    "unsup" => {
+    // A `v128` element has no list backing.
+    "unsup" | "v128" => {
       return null
     }
     // Atom elements share the i32-list backing (interned i32 ids), as do
-    // boolean elements (same valtype).
-    "i32" | "bool" | "atom" => {
+    // boolean elements (same valtype), and `null[]`, whose every element is the sentinel 2.
+    "i32" | "bool" | "atom" | "null" => {
       return "list"
     }
     "i64" => {
@@ -4992,8 +5031,9 @@ function rtListVKind(elem: i32): VKind | null {
     // A value-union BOX element the registry holds a row for — the box is a reference, so
     // the list is a ref list. Gated on the node's arena provenance, the same canon-id
     // question the flat arm asks, so a box with no row declines on both sides.
+    // A box with no row that joins records is a list of the one arm its literals denote.
     "box" => {
-      if unRowOfCanonFolded(rtTy[elem]) >= 0 { return "reflist" }
+      if rtBoxHasRow(elem) || rtIsRecordJoin(elem) { return "reflist" }
       return null
     }
   }
@@ -5006,7 +5046,19 @@ function rtNulElemListVKind(elem: i32): VKind | null {
   const d = rtDisc[elem]
   if d == 2 || d == 3 { return "list" }
   if d == 4 {
-    if unRowOfCanonFolded(rtTy[elem]) >= 0 { return "reflist" }
+    // The row is the nullable's, else its inner box's, else the registry's `N | null` over a
+    // numeric literal's base, as `repOfNulElemArray` looks them up.
+    const ci = rtChild[elem]
+    const inn = if ci >= 0 { rtTy[ci] } else { -1 }
+    if unRowOfCanonFolded(rtTy[elem]) >= 0 || unRowOfKey(rtTy[elem]) >= 0 {
+      return "reflist"
+    }
+    if (
+      inn >= 0
+      && (unRowOfCanonFolded(inn) >= 0 || unRowOfNullableOver(inn) >= 0)
+    ) {
+      return "reflist"
+    }
     return null
   }
   const n = rtNulNicheElemName(elem)
@@ -5037,7 +5089,7 @@ function rtNulNicheElemName(elem: i32): string {
       return k
     }
     // A scalar or box inner takes a sentinel or a box, never a niche.
-    "i32" | "bool" | "i64" | "f64" | "f32" | "u8" | "atom" | "box" | "nul" | "unsup" => {
+    "i32" | "bool" | "i64" | "f64" | "f32" | "u8" | "null" | "v128" | "atom" | "box" | "nul" | "unsup" => {
       return ""
     }
   }
@@ -5103,7 +5155,7 @@ function rtNulVKind(ix: i32): VKind | null {
       return rtNulListOf(rtListVKind(rtChild[inner]))
     }
     // A scalar, box, nested nullable or unsup inner has no nullable kind of its own.
-    "i32" | "bool" | "i64" | "f64" | "f32" | "u8" | "atom" | "box" | "nul" | "unsup" => {}
+    "i32" | "bool" | "i64" | "f64" | "f32" | "u8" | "null" | "v128" | "atom" | "box" | "nul" | "unsup" => {}
   }
   null
 }
@@ -5112,6 +5164,8 @@ function rtNulVKind(ix: i32): VKind | null {
 function repTreeNulOf(ix: i32): i32 {
   if ix < 0 { return 0 }
   if rtKind[ix] == "nul" { return rtDisc[ix] }
+  // `null` itself is the null of the niche discipline.
+  if rtKind[ix] == "null" { return 1 }
   0
 }
 
@@ -5128,7 +5182,7 @@ function repTreeListElemName(ix: i32): string {
   if elem < 0 { return "" }
   const ek = rtKind[elem]
   match ek {
-    "i32" | "bool" | "atom" => {
+    "i32" | "bool" | "atom" | "null" => {
       return "i32"
     }
     "i64" | "f64" | "f32" | "u8" => {
@@ -5153,12 +5207,29 @@ function repTreeListElemName(ix: i32): string {
       return rtNulElemName(elem)
     }
     "box" => {
+      if rtIsRecordJoin(elem) { return "struct" }
       return "union"
     }
-    // An unsup element is outside the flat alphabet.
-    "unsup" => {}
+    // An unsup or `v128` element is outside the flat alphabet.
+    "unsup" | "v128" => {}
   }
   ""
+}
+
+// Whether box node `ix` has a registry row, by its arena type's canon id or key, as
+// `repOfArray` finds one.
+function rtBoxHasRow(ix: i32): boolean {
+  unRowOfCanonFolded(rtTy[ix]) >= 0 || unRowOfKey(rtTy[ix]) >= 0
+}
+
+// Whether box node `ix` is a join of records with no row: a list of it is a struct-element ref
+// list, as `repOfArray` says.
+function rtIsRecordJoin(ix: i32): boolean {
+  if rtBoxHasRow(ix) { return false }
+  const ty = rtTy[ix]
+  if ty < 0 { return false }
+  const t = tyAt(ty)
+  t is TyUnion && repAllMembersObj(t.uMembers)
 }
 
 // Whether `root`'s tree contains an `unsup` node anywhere, and which policy gap,
