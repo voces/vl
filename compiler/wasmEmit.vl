@@ -48,6 +48,7 @@ import {
   nodeTyIsUnion,
   nodeTyIsVariant,
   nodeTyIxOf,
+  nodeTyPrimName,
   nodeTyRecord,
   tyCarrySrcNote,
 } from "./check_node_tys"
@@ -1107,6 +1108,9 @@ import {
   refListElemIsUnion,
   refListSlotOfExpr,
   rlUnionNameOfTy,
+  sFieldIsPlainI32,
+  sFieldIsRecordRef,
+  sFieldIsUnionBox,
   sFieldStoreKind,
   sharedUnionFieldPlan,
   spreadBoxingSource,
@@ -1247,6 +1251,7 @@ import {
 import {
   eqListKindOfListRep,
   isScalarBackedListRep,
+  nulListBase,
   popTakesElem,
   rlElemListRepAt,
 } from "./emit_list_rep"
@@ -1507,6 +1512,7 @@ import {
   msSubNull,
   printPlanPinNull,
   removeAtomFromSet,
+  rlElemUnionName,
   tyBoxTakesAtomAsStr,
   unMemIsMap,
   unMemIsRefElemArray,
@@ -3025,7 +3031,7 @@ function rcReadSource(
 // The destination row nested field `fj` of `dRow` is copied into, where its record is stored at
 // another row than the source row `sRow`'s field `sfi`; -1 where the field is not copied apart.
 function rcNestedRow(sRow: i32, sfi: i32, dRow: i32, fj: i32, code: i32): i32 {
-  if dRow < 0 || code != FC_STRUCT || sFieldTypeAt(sRow, sfi) != FC_STRUCT {
+  if dRow < 0 || code != FC_STRUCT || !sFieldIsRecordRef(sRow, sfi) {
     return -1
   }
   const sIn = sFieldTgtStructIdx(sRow, sfi)
@@ -3630,7 +3636,7 @@ function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
     if si >= 0 {
       const fi = sFieldIndex(si, e.omProp)
       if fi >= 0 {
-        if sFieldTypeAt(si, fi) == FC_UNION { return sFieldElemNameAt(si, fi) }
+        if sFieldIsUnionBox(si, fi) { return sFieldElemNameAt(si, fi) }
       }
     }
   }
@@ -6011,7 +6017,7 @@ function listIsStoreBackOf(recv: i32, fnIx: i32): ListIsStore {
     if rn is Member {
       const si = structIndexOfExpr(rn.memObj, fnIx)
       const fi = if si < 0 || si >= sHeapIdx.length { -1 } else { sFieldIndex(si, rn.memProp) }
-      if fi >= 0 && sFieldTypeAt(si, fi) == FC_UNION {
+      if fi >= 0 && sFieldIsUnionBox(si, fi) {
         return listIsStore(LIS_FIELD, si, fi, rn.memObj, -1)
       }
     } else if rn is Index {
@@ -6326,7 +6332,7 @@ function emitIsTestArmTag(body: u8[], isIx: i32, ndv: IsExpr, fnIx: i32) {
       if oisSi >= 0 {
         const oisFi = sFieldIndex(oisSi, vrecv.omProp)
         if oisFi >= 0 {
-          if sFieldTypeAt(oisSi, oisFi) == FC_UNION {
+          if sFieldIsUnionBox(oisSi, oisFi) {
             const oisSv = optRecvStageSave()
             optRecvStageMark(vrecv.omObj)
             if emitOptChainIsNull(body, vrecv.omObj, fnIx) < 0 { return -1 }
@@ -12329,7 +12335,7 @@ function emitMemStructRead(body: u8[], memIx: i32, fnIx: i32): i32 {
     // A union-typed field (code 16) read while the member path is narrowed to one scalar atom
     // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
     // ident read, at the atom the checker typed the read as; an un-narrowed read is the box.
-    if sFieldTypeAt(si, idx) == FC_UNION {
+    if sFieldIsUnionBox(si, idx) {
       if memReadBoxAmbiguous(memIx, fnIx) { return emitBoxAmbiguousFail(memIx) }
       const own = memReadBoxNarrowTy(memIx, fnIx)
       if own >= 0 {
@@ -12842,7 +12848,7 @@ function emitSpreadGroupBoxed(
     return emitRefListWidenTop(body, s, row)
   }
   let un = ""
-  if row >= 0 && row < rlElemName.length { un = rlElemName[row] }
+  if row >= 0 && row < rlElemName.length { un = rlElemUnionName(row) }
   const ak = spreadSrcBoxAtom(grp, un, fnIx)
   // Unreachable past `spreadSrcBoxes`, which admits only a scalar source whose element is a
   // member or widens to one.
@@ -17354,12 +17360,13 @@ function emitIndexNulScalarList(
   }
   // `nek` names the leaf element kind whose wrapper / backing / index-scratch pool this
   // read uses; `u8list` is the packed-byte leaf's spelling (the element is a plain i32,
-  // so the kind names the list, not a scalar). Without this arm a `u8[] | null` read fell
-  // to the `f64` default and read whatever heap index the offset formula left there — check-clean invalid wasm.
-  let nek: VKind = "f64"
-  if nsk == "nuli64list" { nek = "i64" }
-  if nsk == "nulf32list" { nek = "f32" }
-  if nsk == "nulu8list" { nek = "u8list" }
+  // so the kind names the list, not a scalar).
+  const nek = scalarListElemOfListKind(nulListBase(nsk) ?? "i32")
+  if nek == null {
+    return emitFail(
+      "emitProgram: a nullable scalar list read has no element kind",
+    )
+  }
   const nsv = svDstOfKind(nek)
   if nsv >= 0 { return emitSvIndexRead(nek, nsv) }
   emitListIdxGuard(listIdxWrapSlot(listIdxKindOf(nek), 0), scalarListWrap(nek))
@@ -19161,7 +19168,7 @@ function emitListEqGCore(body: u8[], kind: i32, slot: i32, fnIx: i32) {
     // A union-box element, tag first and then the arm, as a box-typed field compares; leaves
     // EQUALITY.
     "union" => {
-      const un = if slot >= 0 && slot < rlElemName.length { rlElemName[slot] } else { "" }
+      const un = if slot >= 0 && slot < rlElemName.length { rlElemUnionName(slot) } else { "" }
       const uArms: string[] = []
       const uVis: i32[] = []
       const uAks: i32[] = []
@@ -19384,8 +19391,8 @@ function xrepElemEq(
         "emitProgram: list compare over a union element with no row",
       )
     }
-    const unA = rlElemName[sA]
-    const unB = rlElemName[sB]
+    const unA = rlElemUnionName(sA)
+    const unB = rlElemUnionName(sB)
     const armsA: string[] = []
     const visA: i32[] = []
     const aksA: i32[] = []
@@ -24965,14 +24972,11 @@ function lmaParamName(fd: FuncDecl, k: i32): string {
   ""
 }
 
-// The primitive a type annotation node names, or "" for none or any other type.
+// The numeric primitive a type annotation node's recorded type is, or "" for none or any other.
 function lmaTypeName(ix: i32): string {
   if ix < 0 { return "" }
-  const t = nodeAt(ix)
-  if t is TypeRef {
-    const nm = t.tyName
-    if nm == "i32" || nm == "i64" || nm == "f32" || nm == "f64" { return nm }
-  }
+  const pn = nodeTyPrimName(ix)
+  if pn == "i32" || pn == "i64" || pn == "f32" || pn == "f64" { return pn }
   ""
 }
 
@@ -27212,7 +27216,7 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
       }
     }
     if refListElemIsUnion(arrIx, fnIx) {
-      st.unionNm = rlElemName[rslot]
+      st.unionNm = rlElemUnionName(rslot)
       st.unionTy = rlElemTyIxAt(rslot)
     }
     // A nullable element's value emits under the ambient seeds, as `.push`'s does.
@@ -30432,7 +30436,7 @@ function staleBoxFrom(slot: i32): string {
     return ""
   }
   if rlElemKindAt(slot) != RLK_UNION { return "" }
-  const u = rlElemName[slot]
+  const u = rlElemUnionName(slot)
   const ua: string[] = []
   unionSetAtomsOf(u, ua)
   // Which of the value atoms (`valueAtomKind` 0..5) the union holds.
@@ -30462,7 +30466,7 @@ function emitStaleBoxRetag(slot: i32, at: i32) {
   if slot < 0 || slot >= rlElemName.length { return 0 }
   const from = staleBoxFrom(slot)
   if from == "" { return 0 }
-  emitBoxAtomRetag(from, rlElemName[slot], at)
+  emitBoxAtomRetag(from, rlElemUnionName(slot), at)
 }
 
 // Invoke the callback closure (stashed in local `cL`) on `elem(i)`: push its env
@@ -31838,7 +31842,6 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
       localStructIdx[slot],
       fnIx,
       letUNm,
-      letAnnNm,
       letArmCell,
     )
     < 0
@@ -31868,7 +31871,6 @@ function emitLetInitValue(
   slotStruct: i32,
   fnIx: i32,
   letUNm: string,
-  letAnnNm: string,
   letArmCell: boolean,
 ) {
   if slotKind == "nulclosure" || isNulScalarListKind(slotKind) {
@@ -31922,16 +31924,15 @@ function emitLetInitValue(
   } else if letIsI64(stmtIx, fnIx) {
     if emitExprAsI64(body, s.letInit, fnIx) < 0 { return -1 }
   } else if (
-    (letAnnNm == "string"
+    (nodeTyPrimName(s.letType) == "string"
       || tyIsBareStrLit(nodeTyIxOf(s.letType))
       || s.letType < 0 && letCellKind(stmtIx, fnIx) == "str")
     && exprIsLitAtom(s.letInit, fnIx)
     && !letBindIsAtom(stmtIx, fnIx)
   ) {
     // A literal-union atom initializing a `string` local widens to its member string. Not
-    // where the binding's cell is the atom: an inline literal-union annotation renders as `string`, so
-    // the rendered name alone would widen into an atom cell (D1752). An un-annotated `let`
-    // copying a `const`'s literal set is that string cell (D14757).
+    // where the binding's cell is the atom (D1752). An un-annotated `let` copying a `const`'s
+    // literal set is that string cell (D14757).
     if emitAtomToStr(body, s.letInit, fnIx) < 0 { return -1 }
   } else if letIsNulString(stmtIx, fnIx) && exprIsLitAtom(s.letInit, fnIx) {
     // a literal-union atom initializing a `string | null` binding widens to its member
@@ -40561,7 +40562,7 @@ function emitCoalesceUnionField(
     const msi = if mvi >= 0 { -1 } else { structIndexOfExpr(lhs.memObj, fnIx) }
     if msi >= 0 {
       mfi = sFieldIndex(msi, lhs.memProp)
-      if mfi >= 0 && sFieldTypeAt(msi, mfi) == FC_UNION {
+      if mfi >= 0 && sFieldIsUnionBox(msi, mfi) {
         mHeap = sHeapIdx[msi]
         mphys = sFieldElemNameAt(msi, mfi)
         mphysTy = sFieldElemTyIxAt(msi, mfi)
@@ -40702,7 +40703,7 @@ function emitCoalesceOptListGet(
       "emitProgram: `?.` field is not on the list's element struct",
     )
   }
-  if sFieldTypeAt(gSi, gFi) != FC_I32 {
+  if !sFieldIsPlainI32(gSi, gFi) {
     return emitFail(
       "emitProgram: `?.` over a list .get supports only i32/boolean fields",
     )
@@ -40952,7 +40953,7 @@ function emitCoalesceOptMember(
       if dsi >= 0 {
         const dfi = sFieldIndex(dsi, lhs.omProp)
         if dfi >= 0 {
-          if sFieldTypeAt(dsi, dfi) != FC_I32 {
+          if !sFieldIsPlainI32(dsi, dfi) {
             return emitFail(
               "emitProgram: `?.` chain supports only i32/boolean leaf fields",
             )
