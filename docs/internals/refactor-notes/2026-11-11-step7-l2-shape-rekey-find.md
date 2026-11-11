@@ -29,9 +29,10 @@ The census's step 2, minting only when the type has no row, needs no change of i
 is reached only after the type find has missed. The 18 programs whose name finds a row the
 type does not reach keep the field-set find.
 
-The census predicted up to 89 programs could move. The sweep found none. Every disagreeing
-find either chose a row whose layout is the same heap type, or minted a row no emitted value
-reads. So the census's disagreements were all in row identity, never in a module.
+The census predicted up to 89 programs could move. The sweep found none. So the census's
+disagreements changed which row a shape names, never a module. The likely reason is that the
+rows involved share one layout (one heap type) or are never read, but this PR did not trace the
+89 one by one.
 
 ## Proof
 
