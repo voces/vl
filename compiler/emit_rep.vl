@@ -154,6 +154,7 @@ import {
   tyMutEpoch,
   tySame,
   tyToNominalName,
+  tyToStrUser,
 } from "./check_types"
 import { sidOf } from "./symbols"
 import {
@@ -3664,7 +3665,9 @@ function repOfTyFlat(ty0: i32): RepDesc {
       // A union-VARIANT member is the concrete variant struct ref (its slot is a
       // variant index, not a struct-table index); any other object shape is a
       // standalone struct ref.
-      if repTyIsVariant(ty) { return repMk("variant", 0, "") }
+      const variant = repTyIsVariant(ty)
+      rvsAnswerNote(ty, variant)
+      if variant { return repMk("variant", 0, "") }
       return repMk("struct", 0, "")
     }
     TyUnion => {
@@ -3855,7 +3858,7 @@ function repNulObjKind(objTy: i32): VKind {
 // match by index alone. Every variant-or-struct reader in the rep layer asks this.
 export function repTyIsVariant(ty: i32): boolean {
   if tyIxIsVariantMember(ty) { return true }
-  repVariantShapeHas(ty, 3)
+  repVariantShapeHas(ty, 7)
 }
 
 // Whether record type `ty` has the shape of an arm the variant table holds, and no declared
@@ -3924,6 +3927,21 @@ let rvsChkUpTo = 0
 
 let rvsRowUpTo = 0
 
+// Record arms of the unions instances are typed at, registered before emit reads a rep, so a
+// shape the variant table gains during monomorphization is a variant from the first answer.
+let rvsPreTys: i32[] = []
+let rvsPreUpTo = 0
+
+// Registers `tys` as union arms ahead of the variant rows that will hold them, and starts the
+// emit-time watch on record reps (`rvsAnswerNote`). The elaboration's own answers, given before
+// this, are not watched.
+export function repVariantShapesPrime(tys: i32[]) {
+  for t in tys { rvsPreTys.push(t) }
+  rvsSync()
+  rvsWatch = true
+  0
+}
+
 // How many times `rvsSync` has rebuilt the index.
 let rvsBuilds = 0
 
@@ -3940,6 +3958,7 @@ function rvsSync() {
     rvsBits = Map()
     rvsRow = Map()
     rvsChkUpTo = 0
+    rvsPreUpTo = 0
     rvsRowUpTo = 0
     rvsBuilds = rvsBuilds + 1
     repTreeDrop()
@@ -3947,6 +3966,10 @@ function rvsSync() {
   while rvsChkUpTo < cVariantMemberTyIxs.length {
     rvsAdd(cVariantMemberTyIxs[rvsChkUpTo], 1)
     rvsChkUpTo = rvsChkUpTo + 1
+  }
+  while rvsPreUpTo < rvsPreTys.length {
+    rvsAdd(rvsPreTys[rvsPreUpTo], 4)
+    rvsPreUpTo = rvsPreUpTo + 1
   }
   while rvsRowUpTo < uVarTyIx.length {
     const rc = rvsAdd(uVarTyIx[rvsRowUpTo], 2)
@@ -3969,6 +3992,35 @@ function rvsAdd(ty: i32, bit: i32): i32 {
     repTreeDrop()
   }
   c
+}
+
+// Record type → 1 struct, 2 variant: what `repOfTy` answered for it since the emit-time watch
+// began (`repVariantShapesPrime`). A later different answer lays one type out under two reps,
+// which is refused once per compile.
+let rvsAnswered: {[i32]: i32} = Map()
+let rvsLateFailed = false
+let rvsWatch = false
+
+function rvsAnswerNote(ty: i32, variant: boolean) {
+  if !rvsWatch { return 0 }
+  const now = if variant { 2 } else { 1 }
+  const was = rvsAnswered.get(ty) ?? 0
+  if was == 0 {
+    rvsAnswered[ty] = now
+    return 0
+  }
+  if was != now && !rvsLateFailed {
+    rvsLateFailed = true
+    emitFail(
+      "emitProgram: a record type's rep changed during emit, from "
+        + (if was == 2 { "a union arm" } else { "a plain struct" })
+        + " to "
+        + (if variant { "a union arm" } else { "a plain struct" })
+        + ": "
+        + tyToStrUser(ty),
+    )
+  }
+  0
 }
 
 // Whether type `ty` is `T | null` over a `T` whose rep is a numeric scalar, which has no spare
@@ -4445,6 +4497,11 @@ let repMaskMemo: i32[] = []
 let repGen = 0
 
 export function repReset() {
+  rvsPreTys = []
+  rvsPreUpTo = 0
+  rvsAnswered = Map()
+  rvsLateFailed = false
+  rvsWatch = false
   repSeenGen = []
   repMaskMemo = []
   repGen = 0
