@@ -186,6 +186,7 @@ import {
   elabCapDeadDiagsSet,
   elabCapDeadIx,
   elabCapEnd,
+  elabCapIsPat,
   elabCapKey,
   elabCapKeySet,
   elabCapNarrowArm,
@@ -336,6 +337,8 @@ import {
   mintCloDeliveryNote,
   mintCloRows,
   mintFactNote,
+  mintFwdFieldSetNote,
+  mintFwdFieldSetsOf,
   mintNestedPerEnclNote,
   mintParamFwdInsOf,
   mintParamFwdNote,
@@ -458,6 +461,9 @@ let elabNodeNarrowArms: {[i32]: i32[]} = Map()
 let elabNodeAtomSrcs: {[i32]: i32[]} = Map()
 // Delivered node → [key, numeric pair, ...], from `elabCapNumPair`.
 let elabNodeNumPairs: {[i32]: i32[]} = Map()
+// `is` test or pattern → [key, pattern type, ...]: each instance's own, where the shared node's
+// `isPatTyIx` holds the last instance checked.
+let elabNodeIsPats: {[i32]: i32[]} = Map()
 // The type the checker left on each node, taken before the emitter's passes rewrite any body; a
 // node the emitter has since retyped, or minted, reads none.
 let elabGenTy: i32[] = []
@@ -3333,6 +3339,12 @@ function elabOneAt(k: i32) {
     ps.push(elabCapNumPair[ix] ?? -1)
     elabNodeNumPairs[ix] = ps
   }
+  for ix in elabCapIsPat.keys() {
+    const ts = elabNodeIsPats[ix] ?? []
+    ts.push(k)
+    ts.push(elabCapIsPat[ix] ?? -1)
+    elabNodeIsPats[ix] = ts
+  }
   for ix in elabCapDeadIx.keys() {
     const ds = elabDeadKs[ix] ?? []
     ds.push(k)
@@ -3919,10 +3931,10 @@ function elabSelfRow(
 // hold, read once per `elabMintFacts`.
 let elabMintValueFns: i32[] = []
 
-// Replaces the mint facts with one per call each instance makes through a parameter it binds to
-// a function set: the set, the call's argument types and each member's result there, so the tag
-// decision sees every call an instance makes. The number of facts noted. A pass that took a field
-// row fact before a later instance forwarded a hole into its parameter runs again knowing it.
+// Replaces the mint facts with one per call an instance makes through a parameter bound to a
+// function set (the set, the argument types, each member's result), and returns their number plus
+// the sets called through a forwarded field. A pass that took a field row fact before a later
+// instance forwarded a hole into its parameter runs again knowing it.
 export function elabMintFacts(): i32 {
   elabRowFwdKnown = Map()
   elabRowFwdTaken = []
@@ -3940,10 +3952,10 @@ export function elabMintFacts(): i32 {
     i = i + 2
   }
   elabRowFwdTaken = []
-  if !late { return n }
+  if !late { return n + mintFwdFieldSetsOf().length }
   const n2 = elabMintFactsPass()
   elabRowFwdKnown = Map()
-  n2
+  n2 + mintFwdFieldSetsOf().length
 }
 
 // The parameters, as `[decl, index, ...]`, whose field reads took a row fact this pass; and those a
@@ -9116,6 +9128,13 @@ function elabMintParamRowFactAt(
     && (mintParamFwdInsOf(decl, pri).length > 0
       || (elabRowFwdKnown[i32ToStr(decl) + "|" + i32ToStr(pri)] ?? false))
   ) {
+    // The call goes through that set all the same, so the parameter takes it, and the decision
+    // after the elaboration tries the set though no fact names it.
+    const fs = fnTagSetOfTy(nonNullTy(elabNodeTy(cf, k)))
+    if fs >= 0 && fnTagSetOfTy(nonNullTy(nodeTyIxOf(cf))) < 0 {
+      mintParamSetNote(decl, pri, fs)
+      mintFwdFieldSetNote(fs)
+    }
     return false
   }
   const st = nonNullTy(elabNodeTy(cf, k))
@@ -9718,6 +9737,7 @@ export function elabRun() {
   elabNodeNarrowArms = Map()
   elabNodeAtomSrcs = Map()
   elabNodeNumPairs = Map()
+  elabNodeIsPats = Map()
   elabGenTy = []
   elabArmAltTys = Map()
   elabDeadKs = Map()
@@ -17386,6 +17406,13 @@ export function elabNodeBoxAt(ix: i32, fnIx: i32): i32 {
   elabPairIn(elabNodeBoxs, ix, elabKeyAt(fnIx))
 }
 
+// The type the pattern of `is` test or `match` pattern `ix` resolves to at instance `k`, or -1
+// where that instance's elaboration did not check it.
+export function elabIsPatTyIn(ix: i32, k: i32): i32 {
+  if ix < 0 { return -1 }
+  elabPairIn(elabNodeIsPats, ix, k)
+}
+
 export function elabNodeRepAt(ix: i32, fnIx: i32): i32 {
   if ix < 0 { return -1 }
   elabPairIn(elabNodeReps, ix, elabKeyAt(fnIx))
@@ -17403,6 +17430,24 @@ export function litRepUnionAt(ix: i32, fnIx: i32): i32 {
   const src = nodeSrc[ix] ?? -1
   const at = if ix < nodeRepTyIx.length && nodeRepTyIx[ix] >= 0 { ix } else { src }
   nodeRepUnionIx[at] ?? (-1)
+}
+
+// The one closed type literal `ix` (or its copy source) is stamped at across the elaborated
+// frames that stamp it: -1 where no frame does, one is still open, or two differ.
+export function litRepTyOneClosed(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  let rs = elabNodeReps[ix] ?? elabFnNone
+  if rs.length == 0 { rs = elabNodeReps[nodeSrc[ix] ?? -1] ?? elabFnNone }
+  let one = -1
+  let i = 0
+  while i + 1 < rs.length {
+    const t = rs[i + 1]
+    if t < 0 || tyHasInferHole(t, 0) || tyHasTyVar(t) { return -1 }
+    if one < 0 { one = t }
+    else if !tySame(one, t) { return -1 }
+    i = i + 2
+  }
+  one
 }
 
 // The type literal `ix` (or its copy source) is built at in emitted function `fnIx`'s instance:

@@ -429,12 +429,6 @@ import {
   LBK_STR_LIST,
   LBK_U8_LIST,
   LBK_UNION,
-  MVK_F32,
-  MVK_F64,
-  MVK_I64,
-  MVK_STR,
-  MVK_STRUCT,
-  MVK_UNION,
   MfKind,
   RLK_CLOSURE,
   RLK_F32_LIST,
@@ -672,7 +666,8 @@ import {
   monoOrigNode,
   monoStubValueOk,
   mvMapTypeIdx,
-  mvValKind,
+  mvValIsRecord,
+  mvValKindAt,
   mvValName,
   mvValRep,
   optRecvSlot,
@@ -1111,6 +1106,7 @@ import {
   refListElemIsUnion,
   refListSlotOfExpr,
   rlUnionNameOfTy,
+  sFieldStoreKind,
   sharedUnionFieldPlan,
   spreadBoxingSource,
   spreadDestKind,
@@ -1382,7 +1378,6 @@ import {
   variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
 import {
-  fieldCodeVKind,
   identCellSlot,
   sigKeyOfTy,
   sigKeyRetIsVoid,
@@ -1743,10 +1738,10 @@ export function capCacheBuild() {
 // i32 wrapper, and anything else to its interned ref-list wrapper (`rlWrapIdx`).
 export function mvValsWrapOf(slot: i32) {
   if slot < 0 { return lTy() }
-  if mvValKind[slot] == MVK_STR { return mkListTy() }
-  if mvValKind[slot] == MVK_F64 { return fl64Ty() }
-  if mvValKind[slot] == MVK_F32 { return fl32Ty() }
-  if mvValKind[slot] == MVK_I64 { return il64Ty() }
+  if mvValKindAt(slot) == "str" { return mkListTy() }
+  if mvValKindAt(slot) == "f64" { return fl64Ty() }
+  if mvValKindAt(slot) == "f32" { return fl32Ty() }
+  if mvValKindAt(slot) == "i64" { return il64Ty() }
   if mvValRep[slot].mrSlot < 0 || mvValRep[slot].mrSlot >= rlWrapIdx.length {
     emitFail("emitProgram: map value slot has no resolved vals wrapper")
     return 0
@@ -2079,7 +2074,7 @@ function emitStructFieldValueUnder(
   // ref keeps its `(ref null $H)` and the use site recovers, so a `{f: y}` under a non-null
   // guard would put one under a `(ref $H)` field. Asked through the same `nulNicheRecoverOwed`
   // the return, binding and assign deliveries ask; before the widen sites, which consume it.
-  if nulNicheRecoverOwed(fieldCodeVKind(scode), valIx, fnIx) {
+  if nulNicheRecoverOwed(sFieldStoreKind(si, fi), valIx, fnIx) {
     fbRefAsNonNull()
   }
   // the scalar covariant copy at the field boundary (D965).
@@ -9239,8 +9234,8 @@ function emitUnionBoxArgGo(
   if bxIdx is Index {
     if exprMap(bxIdx.idxArr, fnIx) {
       const bxSh = mapShapeOfExpr(bxIdx.idxArr, fnIx)
-      if bxSh >= 0 && bxSh < mvValKind.length {
-        if mvValKind[bxSh] == MVK_UNION {
+      if bxSh >= 0 && bxSh < mvValRep.length {
+        if mvValKindAt(bxSh) == "union" {
           const mgFrom: i32[] = []
           const mgTo: i32[] = []
           wideRetagPairs(exprIx, fnIx, unionName, unionTy, mgFrom, mgTo)
@@ -14090,7 +14085,7 @@ function emitMapValDefault(
 ) {
   if scalarVK != null {
     return emitScalarValue(body, defIx, fnIx, scalarVK)
-  } else if mslot >= 0 && mvValKind[mslot] == MVK_UNION {
+  } else if mslot >= 0 && mvValKindAt(mslot) == "union" {
     // A UNION-valued map's default is coerced into the shared box, like a stored value — a
     // concrete VARIANT default boxes (`emitUnionBoxArg`), as in a call arg / return.
     return emitUnionBoxOwed(
@@ -14147,7 +14142,7 @@ function emitMapGetOr(
     // `{[string]: A | B | null}`) stores null as a null-tagged box; `??` coalesces on
     // that tag and peels the value non-null, the value-union sibling of the ref-niche
     // `ref.is_null` path below. A null-free union value has no tag and takes the plain path.
-    if mvValKind[mslot] == MVK_UNION {
+    if mvValKindAt(mslot) == "union" {
       if mvValUnionHasNull(mslot) {
         return emitMapGetOrUnionBox(body, mslot, defIx, fnIx, rk)
       }
@@ -14403,7 +14398,7 @@ function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
   if rt < 0 || tyAdmitsNull(rt) { return 0 }
   // A UNION value already left the NON-null box (`emitMapGetUnionBox` recovers it), so only
   // the unbox is owed; every other ref value is the raw `(ref null <elem>)` vals slot.
-  if mvValKind[mrs] == MVK_UNION {
+  if mvValKindAt(mrs) == "union" {
     const ak = mapReadNarrowedAtomKind(idxIx, fnIx)
     if ak >= 0 { return emitUnionUnboxTail(ak) }
     // The CONTAINER arms of the same narrowing (`if m[k] is {[string]: V}`, `… is K[]`),
@@ -14448,9 +14443,9 @@ function emitMapGetTail(body: u8[], recvIx: i32, fnIx: i32) {
     fbElse()            // else
     // A miss yields the rep's empty value: 0.0 for an f64 or f32 map, 0 for an i64 map,
     // else `ref.null` for a ref (string/struct) value.
-    if mvValKind[mslot] == MVK_F64 { fbF64Const("0") }
-    else if mvValKind[mslot] == MVK_I64 { fbI64Const(0, 0) }
-    else if mvValKind[mslot] == MVK_F32 { fbF32Const("0") }
+    if mvValKindAt(mslot) == "f64" { fbF64Const("0") }
+    else if mvValKindAt(mslot) == "i64" { fbI64Const(0, 0) }
+    else if mvValKindAt(mslot) == "f32" { fbF32Const("0") }
     else { fbRefNull(mvValElemHeapOf(mslot)) }
     fbLocalSet(fnMvValStashLocal(mslot))
     fbEnd() // end
@@ -15261,7 +15256,7 @@ function emitMapSetValExpr(
     // A SCALAR-valued map (f64/i64): emit the value coerced to the element rep.
     return emitScalarValue(body, valIx, fnIx, svk)
   }
-  if mslot >= 0 && mvValKind[mslot] == MVK_UNION {
+  if mslot >= 0 && mvValKindAt(mslot) == "union" {
     // A UNION-valued map: box the stored value into the shared union box (a concrete
     // VARIANT value boxes via `emitUnionBoxArg`, like a call arg / return).
     return emitUnionBoxOwed(
@@ -15274,7 +15269,7 @@ function emitMapSetValExpr(
   }
   // A non-null ARM-valued map takes every value through `emitVariantCoerce`, a join included,
   // as an arm-typed local does; the coerce owns the narrowed unbox (D4639).
-  if mslot >= 0 && mvValKind[mslot] == MVK_STRUCT && !mvSlotNullable(mslot) {
+  if mslot >= 0 && mvValIsRecord(mslot) && !mvSlotNullable(mslot) {
     const svArmVi = mvValVariantOf(mslot)
     if svArmVi >= 0 { return emitVariantCoerce(body, svArmVi, valIx, fnIx) }
   }
@@ -15461,11 +15456,11 @@ export function mapSetFuncType(sh: i32) {
   else { fbRefValtype(sTy()) }
   if sh < 0 {
     fbValtype("i32", -1) // the mono map's value
-  } else if mvValKind[sh] == MVK_F64 {
+  } else if mvValKindAt(sh) == "f64" {
     fbValtype("f64", -1)
-  } else if mvValKind[sh] == MVK_I64 {
+  } else if mvValKindAt(sh) == "i64" {
     fbValtype("i64", -1)
-  } else if mvValKind[sh] == MVK_F32 {
+  } else if mvValKindAt(sh) == "f32" {
     fbValtype("f32", -1)
   } else {
     fbRefNullValtype(mvValElemHeapOf(sh)) // the vals element
@@ -21425,7 +21420,7 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
       // consumer's `struct.get $uBox 0` (the tag read) reading a null reference on `m[k] is
       // T`, `!= null`, `== null` and `print(m[k])` alike. The box is the read's own null.
       const ubs = mapReadNarrowableSlot(exprIx, fnIx)
-      if ubs >= 0 && mvValKind[ubs] == MVK_UNION {
+      if ubs >= 0 && mvValKindAt(ubs) == "union" {
         if emitMapGetUnionBox(body, e.idxArr, e.idxIndex, fnIx) < 0 {
           return -1
         }
@@ -27565,7 +27560,7 @@ function emitAssignMember(
   }
   // D1222 — the STORE half of the construct-side recover in `emitObj`; the two halves of
   // every field code have to be wired together, as the code-20 arm above records.
-  if nulNicheRecoverOwed(fieldCodeVKind(fscode), a.binRight, fnIx) {
+  if nulNicheRecoverOwed(sFieldStoreKind(si, fieldIdx), a.binRight, fnIx) {
     fbRefAsNonNull()
   }
   // the scalar covariant copy at the field-store boundary, the construct's twin (D2163)
@@ -40892,7 +40887,7 @@ function emitCoalesceOptMapField(
   omSl: i32,
   fnIx: i32,
 ) {
-  if mvValKind[omSl] != MVK_STRUCT {
+  if !mvValIsRecord(omSl) {
     return emitFail("emitProgram: `?.` needs a struct-valued map")
   }
   // The variant half of the value row, the same either/or the store seed and the `??`

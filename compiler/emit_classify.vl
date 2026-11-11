@@ -644,6 +644,7 @@ import {
   declaredStructIndex,
   drwFieldClosure,
   enclosingLoopVarBinds,
+  fieldCodeVKind,
   fnBlockShadowsAt,
   fnRetVariantIndexSid,
   frameBodyEnd,
@@ -715,12 +716,9 @@ import {
   LBK_STR_LIST,
   LBK_U8_LIST,
   LBK_UNION,
-  MVK_CLOSURE,
   MVK_F32,
   MVK_F64,
   MVK_I64,
-  MVK_REF,
-  MVK_STR,
   MVK_STRUCT,
   MVK_UNION,
   MfKind,
@@ -768,7 +766,10 @@ import {
   localPairIter,
   localStructIdx,
   monoFieldReadTyIn,
-  mvValKind,
+  mvValClassOf,
+  mvValIsRecord,
+  mvValIsRef,
+  mvValKindAt,
   mvValName,
   mvValRep,
   nestedNameBySid,
@@ -1550,7 +1551,7 @@ export function letNulMapReadUnionBox(letIx: i32, fnIx: i32) {
       if mapReadNarrowedContainer(unwrapParen(d.letInit), fnIx) { return false }
       // …and where it converts to a niche `A | null` (D2590).
       if placeNicheAtomKind(unwrapParen(d.letInit), fnIx) >= 0 { return false }
-      return mvValKind[mrs] == MVK_UNION
+      return mvValKindAt(mrs) == "union"
     }
   }
   false
@@ -2278,7 +2279,7 @@ export function letBindTy(letIx: i32, fnIx: i32): i32 {
 // is another type than its own, else -1. A scalar binding holds its own type, so the rungs, which
 // build whole-program indices to answer, are not asked of one.
 function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
-  const own = nodeTyIxOf(letIx)
+  const own = nodeTyAt(letIx, fnIx)
   if (
     own >= 0
     && own < T.tys.length
@@ -2327,7 +2328,7 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   const u = unwrapParen(init)
   if u < 0 || !(nodeAt(u) is Ident) { return -1 }
   // A read narrowed to `null` still holds the named cell's nullable value.
-  if tyIsNullUnit(nodeTyIxOf(u)) {
+  if tyIsNullUnit(nodeTyAt(u, fnIx)) {
     const nd = identDeclOf(u)
     if nd < 0 || nd == letIx || !(nodeAt(nd) is LetDecl) { return -1 }
     const nt = letBindTy(nd, fnIx)
@@ -2341,7 +2342,7 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   if bd < 0 || bd == letIx || !(nodeAt(bd) is LetDecl) { return -1 }
   // A binding of a parameter stored at a wider record is stored there too.
   if letHoldsParamBuilt(bd, fnIx) { return letBindTy(bd, fnIx) }
-  const own = nodeTyIxOf(u)
+  const own = nodeTyAt(u, fnIx)
   const t0 = letBindTy(bd, fnIx)
   if own < 0 || own >= T.tys.length || t0 < 0 || t0 >= T.tys.length {
     return -1
@@ -2609,7 +2610,7 @@ function bindCellGo(letIx: i32, fnIx: i32): BindCellGo {
   const atom = letAnnIsAtom(letIx, fnIx)
     || letInitIsLitAtom(letIx, fnIx)
     && !letHoldsBox(letIx, fnIx)
-    && !letWidensToString(letIx)
+    && !letWidensToString(letIx, fnIx)
     || constBindsLitSet(letIx)
   if atom || letSpellsNulAtom(letIx, fnIx) {
     const aty = letBindTy(letIx, fnIx)
@@ -2691,12 +2692,12 @@ function letHoldsBox(letIx: i32, fnIx: i32): boolean {
 
 // Whether `letIx` is a `let` the checker widened to `string`: a copy of a `const`'s literal set
 // it may reassign to any string, so it holds the string, not its initializer's atom (D14757).
-function letWidensToString(letIx: i32): boolean {
+function letWidensToString(letIx: i32, fnIx: i32): boolean {
   const d = nodeAt(letIx)
   d is LetDecl
     && d.letKw == "let"
     && d.letType < 0
-    && nodeTyIxOf(letIx) == TY_STR
+    && nodeTyAt(letIx, fnIx) == TY_STR
 }
 
 // Loop variable `d`'s storage answer in frame `fnIx`, off the loop of that frame declaring it:
@@ -4929,7 +4930,7 @@ export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
   // arm predicates keeps a nest of `if` arms linear, since each of them asks this of its arm.
   if ifJoinIsScalarPrim(ifIx) { return null }
   // Nor does a join of a tagged set, whose value is its member's i32 id.
-  if fnTagTyIsTagged(nodeTyIxOf(ifIx)) { return null }
+  if fnTagTyIsTagged(nodeTyAt(ifIx, fnIx)) { return null }
   let i = 0
   while i < irkMemoIx.length {
     if irkMemoIx[i] == ifIx && irkMemoFn[i] == fnIx {
@@ -5580,8 +5581,8 @@ function indexElemUnionSlot(idxIx: i32, fnIx: i32): i32 {
 // while those three miss as a numeric zero with no null to recover from.
 export function mapReadNarrowableSlot(idxIx: i32, fnIx: i32) {
   const mrs = mapReadMvSlot(idxIx, fnIx)
-  if mrs < 0 || mrs >= mvValKind.length { return -1 }
-  const k = mvValKind[mrs]
+  if mrs < 0 || mrs >= mvValRep.length { return -1 }
+  const k = mvValClassOf(mrs)
   if k == MVK_I64 || k == MVK_F64 || k == MVK_F32 { return -1 }
   mrs
 }
@@ -5593,7 +5594,7 @@ export function mapReadNarrowableSlot(idxIx: i32, fnIx: i32) {
 export function mapReadNarrowedAtomKind(exprIx: i32, fnIx: i32) {
   const mrs = mapReadNarrowableSlot(exprIx, fnIx)
   if mrs < 0 { return -1 }
-  if mvValKind[mrs] != MVK_UNION { return -1 }
+  if mvValKindAt(mrs) != "union" { return -1 }
   const ak = idxNarrowAtomKind(exprIx, fnIx)
   if ak < 0 || ak == 6 { return -1 }
   ak
@@ -5606,7 +5607,7 @@ export function mapReadNarrowedAtomKind(exprIx: i32, fnIx: i32) {
 export function mapReadNarrowedContainer(exprIx: i32, fnIx: i32): boolean {
   const mrs = mapReadNarrowableSlot(exprIx, fnIx)
   if mrs < 0 { return false }
-  if mvValKind[mrs] != MVK_UNION { return false }
+  if mvValKindAt(mrs) != "union" { return false }
   placeReadContainerAt(exprIx, fnIx) > 0
 }
 
@@ -5689,7 +5690,7 @@ export function forInPairStructIdx(iterIx: i32, fnIx: i32): i32 {
   const vsl = forInPairValsSlot(iterIx, fnIx)
   if vsl < 0 { return -1 }
   if mvValVariantOf(vsl) >= 0 { return -1 }
-  if mvValKind[vsl] == MVK_STRUCT { return mvValStructIdxOf(vsl) }
+  if mvValIsRecord(vsl) { return mvValStructIdxOf(vsl) }
   if mvValIsMap(vsl) { return mvInnerMapShape(vsl) }
   const lk = mvListValKind(vsl)
   if lk == "reflist" { return mvValInnerRlSlotAt(vsl) }
@@ -5709,7 +5710,7 @@ export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
       if mvs >= 0 {
         // An arm-valued map's walk has no struct row; its layout is a variant row (D34).
         if mvValVariantOf(mvs) >= 0 { return -1 }
-        if mvValKind[mvs] == MVK_STRUCT { return mvValStructIdxOf(mvs) }
+        if mvValIsRecord(mvs) { return mvValStructIdxOf(mvs) }
         return -1
       }
       if !exprRefArray(iterIx, fnIx) { return -1 }
@@ -5850,7 +5851,7 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
   }
   if nodeTyIsNullable(dix) { return true }
   // A default whose type is `null` itself, as a call of a function that only returns `null` (D3408).
-  if isNullTy(nodeTyIxOf(dix)) { return true }
+  if isNullTy(nodeTyAt(dix, fnIx)) { return true }
   // A hole the instance binds to a nullable type is nullable there.
   if tyBearsNull(holeOperandTyOf(dix, fnIx)) { return true }
   const un = unionNameOfExpr(dix, fnIx)
@@ -9046,7 +9047,7 @@ function structIndexOfJoinStore(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   const cms = coalesceMvSlot(exprIx, fnIx)
   if cms >= 0 {
     if mvValVariantOf(cms) >= 0 { return -2 }
-    if mvValKind[cms] == MVK_STRUCT { return mvValStructIdxOf(cms) }
+    if mvValIsRecord(cms) { return mvValStructIdxOf(cms) }
   }
   if e.binOp != "??" { return -1 }
   if coalesceResultIsBox(exprIx, fnIx) { return -2 }
@@ -9129,7 +9130,7 @@ function structIndexOfIndexStore(e: Index, exprIx: i32, fnIx: i32): i32 {
   const mrs = mapReadMvSlot(exprIx, fnIx)
   if mrs >= 0 {
     if mvValVariantOf(mrs) >= 0 { return -2 }
-    if mvValKind[mrs] == MVK_STRUCT { return mvValStructIdxOf(mrs) }
+    if mvValIsRecord(mrs) { return mvValStructIdxOf(mrs) }
   }
   -1
 }
@@ -9566,7 +9567,7 @@ function exprUnionIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
     // The container arms of the same narrowing, exactly as the ref-list arm above declines
     // them — the read delivers the map or list wrapper, not the box (D1866).
     if mapReadNarrowedContainer(exprIx, fnIx) { return false }
-    return mvValKind[mri] == MVK_UNION
+    return mvValKindAt(mri) == "union"
   }
   false
 }
@@ -9627,7 +9628,7 @@ function exprUnionBin(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
   if e.binOp == "??" && coalHoleNulNumRead(e, fnIx) { return true }
   const cmu = coalesceMvSlot(exprIx, fnIx)
   if cmu >= 0 {
-    if mvValKind[cmu] == MVK_UNION && !mvUnionIsScalarNull(cmu) { return true }
+    if mvValKindAt(cmu) == "union" && !mvUnionIsScalarNull(cmu) { return true }
     // A nullable default keeps a scalar read `S | null`, which is the box (D2253).
     return coalesceKeepsScalarBox(exprIx, cmu, fnIx)
   }
@@ -10118,7 +10119,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       const cmu = coalesceMvSlot(unwrapParen(exprIx), fnIx)
       if cmu >= 0 {
         // `scalar | null` peels to a raw scalar (not a union), so it has no union name here.
-        if mvValKind[cmu] == MVK_UNION && !mvUnionIsScalarNull(cmu) {
+        if mvValKindAt(cmu) == "union" && !mvUnionIsScalarNull(cmu) {
           return mvValName[cmu]
         }
       }
@@ -10350,7 +10351,7 @@ function unionNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   // so it carries no union name either — the two must answer together.
   const mri = mapReadMvSlot(unwrapParen(exprIx), fnIx)
   if mri >= 0 {
-    if mvValKind[mri] == MVK_UNION {
+    if mvValKindAt(mri) == "union" {
       if mapReadNarrowedAtomKind(unwrapParen(exprIx), fnIx) >= 0 { return "" }
       if mapReadNarrowedContainer(unwrapParen(exprIx), fnIx) { return "" }
       return mvValName[mri]
@@ -10433,7 +10434,7 @@ export function indexUnionReadKind(exprIx: i32, fnIx: i32) {
     // A union-valued map's bare read is the same box a union-element cell is (D1025), and a
     // narrowed cell unboxes at the read — the map receiver just one container over.
     const mrs = mapReadNarrowableSlot(exprIx, fnIx)
-    if mrs >= 0 && mvValKind[mrs] == MVK_UNION {
+    if mrs >= 0 && mvValKindAt(mrs) == "union" {
       const mak = mapReadNarrowedAtomKind(exprIx, fnIx)
       if mak >= 0 { return mak }
       return -2
@@ -12384,6 +12385,18 @@ function fieldPosCode(p: i32): i32 {
   -1
 }
 
+// The kind struct `si`'s field `fi` is stored at, from its storage type; the field code answers
+// only where no storage type is recorded or the descriptor does not cover it (a hole, a type
+// parameter). A code-15 field's storage type carries `null`, so it never owes a recover.
+export function sFieldStoreKind(si: i32, fi: i32): VKind | null {
+  const ty = fieldPosStoreTy(sFieldStart[si] + fi)
+  if ty >= 0 {
+    const d = repOfTy(ty)
+    if d.rdCovered == 1 { return d.rdKind }
+  }
+  fieldCodeVKind(sFieldTypeAt(si, fi))
+}
+
 // The storage type at a `memberFieldPos` row, or -1 for none or an unrecorded one.
 function fieldPosStoreTy(p: i32): i32 {
   if p >= 0 {
@@ -12594,7 +12607,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
       // type); a nullable value with a nullable default stays `string | null`.
       const cms = coalesceMvSlot(exprIx, fnIx)
       if cms >= 0 {
-        return mvValKind[cms] == MVK_STR
+        return mvValKindAt(cms) == "str"
           && !coalesceStaysNullable(exprIx, cms, fnIx)
       }
       // `r ?? d` over a `string | null` LHS yields a (non-null) string — the coalesce
@@ -12650,7 +12663,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
       // after, exactly as the ref-list arm of the index READ asks before it recovers (D1735).
       const smv = mapReadMvSlot(exprIx, fnIx)
       if smv >= 0 {
-        if mvValKind[smv] == MVK_STR {
+        if mvValKindAt(smv) == "str" {
           return nodeTyProvesNonNull(unwrapParen(exprIx))
         }
       }
@@ -12807,7 +12820,7 @@ function identIsBoundClosureGo(readIx: i32, fnIx: i32): boolean {
 // function value (a function whose body's tail is itself a function value).
 export function exprIsClosure(exprIx: i32, fnIx: i32) {
   // A tagged set's value is the i32 id of its member.
-  if exprIx < 0 || fnTagTyIsTagged(nodeTyIxOf(exprIx)) { return false }
+  if exprIx < 0 || fnTagTyIsTagged(nodeTyAt(exprIx, fnIx)) { return false }
   const e = nodeAt(exprIx)
   match e {
     Paren => {
@@ -12870,7 +12883,7 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
       // A bare `m[k]` over a FUNCTION-valued map (`{[string]: (i32) => i32}`, mv kind 14) reads
       // back the closure (nullable — narrow with `if f != null`).
       const mrs = mapReadMvSlot(exprIx, fnIx)
-      if mrs >= 0 { return mvValKind[mrs] == MVK_CLOSURE }
+      if mrs >= 0 { return mvValKindAt(mrs) == "closure" }
     }
     // No other expression is a closure value.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | ErrExpr | LetDecl | Param | TypeRef | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar | IfStmt | Call | BinExpr => {}
@@ -13463,7 +13476,7 @@ export function fnReturnsClosure(t: i32) {
     if fn.fnRet < 0 && tyIsFnArmUnion(tyStepRet(nodeTyIxOf(fnStmts[t]))) {
       return false
     }
-    return blockTailIsClosure(fn.fnBody)
+    return blockTailIsClosure(fn.fnBody, fnStmts[t])
   }
   false
 }
@@ -13509,7 +13522,7 @@ function fnHandsBackTaggedParam(fn: FuncDecl): boolean {
 // True if the block's tail (implicit-return) expression is a function value: the checker records
 // a `TyFunc` for every spelling that yields one, and `nodeTyIsFunc` is structural, so a function
 // list, a nullable closure and a tagged set's member are not one (D1620).
-function blockTailIsClosure(blockIx: i32) {
+function blockTailIsClosure(blockIx: i32, fnIx: i32) {
   const b = nodeAt(blockIx)
   if b is Block {
     const n = b.blkStmts.length
@@ -13517,7 +13530,7 @@ function blockTailIsClosure(blockIx: i32) {
     const last = b.blkStmts[n - 1]
     const s = nodeAt(last)
     const tx = if s is RetStmt { s.retArg } else { last }
-    if tx < 0 || fnTagTyIsTagged(nodeTyIxOf(tx)) { return false }
+    if tx < 0 || fnTagTyIsTagged(nodeTyAt(tx, fnIx)) { return false }
     return nodeTyIsFunc(tx)
   }
   false
@@ -13909,7 +13922,7 @@ function readRepMoved(): boolean {
     s[9] == af
     && s[3] == P.nodes.length
     && s[4] == ekDecl.length
-    && s[5] == mvValKind.length
+    && s[5] == mvValRep.length
     && s[6] == sFieldCount.length
     && s[7] == uVariants.length
     && s[8] == unNames.length
@@ -13918,7 +13931,7 @@ function readRepMoved(): boolean {
   }
   moved = memoMoved(rrKey, 3, P.nodes.length) || moved
   moved = memoMoved(rrKey, 4, ekDecl.length) || moved
-  moved = memoMoved(rrKey, 5, mvValKind.length) || moved
+  moved = memoMoved(rrKey, 5, mvValRep.length) || moved
   moved = memoMoved(rrKey, 6, sFieldCount.length) || moved
   moved = memoMoved(rrKey, 7, uVariants.length) || moved
   moved = memoMoved(rrKey, 8, unNames.length) || moved
@@ -14075,7 +14088,7 @@ function readRepKinds(ix: i32, fnIx: i32): ReadRep {
   }
   // A map value read is the value or null, at the read's own type.
   const mvr = if e is Index { mapReadMvSlot(rx, fnIx) } else { -1 }
-  if mvr >= 0 && mvValKind[mvr] == MVK_REF {
+  if mvr >= 0 && mvValIsRef(mvr) {
     const md = repOfNode(rx, fnIx)
     if md.rdCovered == 1 {
       return {
@@ -14528,7 +14541,7 @@ function readIndexStoreKind(e: Index, rx: i32, fnIx: i32): ReadStore {
   }
   const mri = mapReadMvSlot(rx, fnIx)
   if mri >= 0 {
-    const v = mvValKind[mri]
+    const v = mvValClassOf(mri)
     if v == MVK_UNION { return rsOfKind("union") }
     if v == MVK_STRUCT { return rsOfKind("struct") }
     return rsOfTag("mv" + i32ToStr(v))
