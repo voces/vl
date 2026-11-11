@@ -9,8 +9,8 @@ answers a row that the rep read does not. The largest parts are `Ident` with no 
 - the binding's stored row.
 
 The orchestrator ruled to replace them with the checker's build record, after a probe proved
-the two answers agree. This note is that probe. Nothing in the compiler changes. Base is master
-`e4c6bfa1`'s stack (#7251), probed off-tree.
+the two answers agree. This note is that probe. Nothing in the compiler changes. The probe was built on the
+#7251 stack (`e4c6bfa1`), and never committed.
 
 ## Method
 
