@@ -6054,9 +6054,9 @@ let monoNoRename: i32[] = []
 let monoBundleReads: i32[] = []
 // Callee identifiers that read a `let`/`const`, keyed to that binding, once renamed to an instance.
 let monoAliasCallDecl: {[i32]: i32} = Map()
-// A re-pointed `let` handed to a generic arrow parameter, keyed `<frame>:<decl>`, to the instance
-// its values are handed on at; a second instance asks for a slot per type (D9006).
-let monoWrittenLetHanded: {[string]: string} = Map()
+// A re-pointed `let` handed to a generic arrow parameter, keyed `<frame>:<decl>`, to the function
+// type its values are handed on at; a second type asks for a slot per type (D9006).
+let monoWrittenLetHanded: {[string]: i32} = Map()
 
 // Notes callee `calleeIx` before its rename to an instance, when it reads a binding.
 function monoAliasCallNote(calleeIx: i32) {
@@ -17183,8 +17183,6 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const pn: string[] = [tyToStr(lt.aElem)]
     if monoInstanceFor(gfe, pn, ax, ft, qs, [lt.aElem]) < 0 { return -1 }
   } else {
-    const fs = monoPinAnnSpelling(ft)
-    if fs == "" { return 0 }
     if monoCoerceFnValueName(a, ctx, ft) < 0 { return -1 }
   }
   // A `.map` the checker left open, its element a hole function's, gives a list of that result.
@@ -21041,22 +21039,21 @@ function monoHandWrittenLet(
   // The functions are instanced at the type the elaboration gives the parameter at this call;
   // the checker refuses a binding whose functions give two results there (D9003).
   const ept = elabCallParamTy(monoCallTplOf(callIx), argI)
-  const pre = if monoTyClosedFn(ept) { monoPinAnnSpelling(ept) } else { "" }
-  if pre == "" {
+  if !monoTyClosedFn(ept) {
     return emitFailAt(
       "emitProgram: internal: a reassigned function binding handed to a function parameter has no closed elaborated parameter type",
       at,
     )
   }
   const key = i32ToStr(lf[0]) + ":" + i32ToStr(lf[1])
-  const was = monoWrittenLetHanded.get(key) ?? ""
-  if was != "" && was != pre {
+  const was = monoWrittenLetHanded.get(key) ?? -1
+  if was >= 0 && !tySame(was, ept) {
     const d = nodeAt(lf[1])
     let nm = ""
     if d is LetDecl { nm = d.letName }
     return emitFail(MONO_BIND_SIG_PRE + nm + MONO_BIND_SIG_POST)
   }
-  monoWrittenLetHanded[key] = pre
+  monoWrittenLetHanded[key] = ept
   monoCoerceWrittenLetTys(
     at,
     ctx,
@@ -21135,10 +21132,10 @@ function monoPinTyParamComposite(
   // A bundle handed to a function-typed parameter hands the member at its type.
   const hm = elabCallHandMember(monoCallTplOf(callIx), i)
   if hm >= -1 { bundleHandMemberNote(args[i], hm) }
-  // A function-type param (`f: (A, T) => A`) binds from the closure
-  // argument's function-type name; any other composite (`Box<T>`, `{a:T}`)
-  // from its concrete value-type name.
-  let anC = ""
+  // Whether a rung below answers the argument's type: a function-type param (`f: (A, T) => A`)
+  // binds from the closure argument's function type, any other composite (`Box<T>`, `{a:T}`) from
+  // its concrete value type.
+  let anC = false
   // The argument's own `#anonN` row, kept as the parameter's pin where its spelled
   // shape would resolve to a declared record sharing the field names.
   let anRowPin = ""
@@ -21162,8 +21159,7 @@ function monoPinTyParamComposite(
       if monoParamTyOpenAt(p.parType, fn.fnTyParams, tvN) {
         monoBindArrowRet(p.parType, callIx, i, fn.fnTyParams, tvN, tvV, tvT)
       }
-      const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
-      if pre != "" { anC = pre }
+      anC = !monoParamTyOpenAt(p.parType, fn.fnTyParams, tvN)
     } else if wl[0] >= 0 {
       const hr = monoHandWrittenLet(
         p,
@@ -21179,50 +21175,48 @@ function monoPinTyParamComposite(
         i,
       )
       if hr < 0 { return hr }
-      if hr > 0 { anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) }
+      if hr > 0 { anC = !monoParamTyOpenAt(p.parType, fn.fnTyParams, tvN) }
     }
   }
   // The argument's own function-type name, where the slot's binding above names none: a generic
   // function value takes the type the call binds, not its template's.
-  if annIsFn && anC == "" { anC = monoArgFnTypeName(args[i], ctx) }
+  if annIsFn && !anC { anC = monoArgFnTypeName(args[i], ctx) != "" }
   // Else the closed parameter type the call key binds; a list read takes it in the arm below.
-  if annIsFn && anC == "" && !(nodeAt(unwrapParen(args[i])) is Index) {
-    const kpt = elabCallParamTy(monoCallTplOf(callIx), i)
-    if monoTyClosedFn(kpt) { anC = monoPinAnnSpelling(kpt) }
+  if annIsFn && !anC && !(nodeAt(unwrapParen(args[i])) is Index) {
+    anC = monoTyClosedFn(elabCallParamTy(monoCallTplOf(callIx), i))
   }
-  if !annIsFn && anC == "" {
-    anC = monoArgPinName(args[i], ctx, [0 - 1])
+  if !annIsFn && !anC {
+    const an = monoArgPinName(args[i], ctx, [0 - 1])
+    anC = an != ""
     // An anonymous row's `#anonN` has no fields to match the pattern against;
     // the checker's spelled shape does, unless the render softens a literal (D3123).
     const anTy = nodeTyIxOf(unwrapParen(args[i]))
     if (
-      anC.length >= 5
-      && anC.slice(0, 5) == "#anon"
+      an.length >= 5
+      && an.slice(0, 5) == "#anon"
       && !monoAnonArgSoftens(args[i], anTy)
+      && monoAnnPinNameOfTy(anTy) != ""
+      && !monoSpelledShapeStaysAnon(anTy)
     ) {
-      const anSp = monoAnnPinNameOfTy(anTy)
-      if anSp != "" {
-        if !monoSpelledShapeStaysAnon(anTy) { anRowPin = anC }
-        anC = anSp
-      }
+      anRowPin = an
     }
-    if anC == "" && monoLitHoldsGenericFn(args[i], 0) {
-      anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+    if !anC && monoLitHoldsGenericFn(args[i], 0) {
+      anC = !monoParamTyOpenAt(p.parType, fn.fnTyParams, tvN)
     }
   }
   // A read out of a list its pin annotated, at any depth, takes the element type (D10310).
   let atTy = monoPinSubTyOf(monoArgPinTyAt(args[i], ctx), ctx)
-  if annFnSlot && anC == "" && nodeAt(unwrapParen(args[i])) is Index {
+  if annFnSlot && !anC && nodeAt(unwrapParen(args[i])) is Index {
     const ept = elabCallParamTy(monoCallTplOf(callIx), i)
     if monoTyClosedFn(ept) {
-      anC = monoPinAnnSpelling(ept)
+      anC = true
       atTy = ept
     }
   }
   // An argument typed at this parameter with the callee's own type parameters still open, as an
   // empty `Map()` or `[]` is, binds them by the call's instance, else at the default (D14735).
   const openArg = !annIsFn && monoTyMentionsTyParam(atTy, fn.fnTyParams)
-  if anC == "" && !openArg { return monoArgTyFail(p.parName, fn.fnName) }
+  if !anC && !openArg { return monoArgTyFail(p.parName, fn.fnName) }
   monoBindInnerArmPins(
     monoCallTplOf(callIx),
     nodeTyIxOf(p.parType),
