@@ -460,3 +460,4 @@ D15740-D15749  lane w318 (session_01XfykzxW8ZL5hbjGurjuXN7)  2026-11-11  functio
 D15750-D15759  lane w321 (session_01XfykzzgesqdfuKJvFQZUrL)  2026-11-11  per-instance node types: D15750-D15759 reserved
 D15770-D15779  lane w311 (session_01XfykzymeVcd3d2TNCE6x2z)  2026-11-11  ref-list rows keyed by type and D15719's close; reserved
 D15800-D15809  lane w308 (session_01Xfykzz6gyNBEiBfaqJUfSV)  2026-11-11  step 7 VKind: D15800-D15809 reserved
+D15830-D15839  lane w310 (session_01Xfym12m2NeEoYsY4RescqP)  2026-11-11  the shape walk and the D6 inline-shape interner's type re-key: D15830-D15839 reserved
