@@ -21,7 +21,7 @@ is the same union, and nothing converted it.
 
 - `record-literal-join-at-declared-record.matrix.vl`: base 0 of 46 run, 25 SILENT. Now 24 of 46
   run, 2 SILENT (push, filed D15720) and 1 check refusal (an inferred return). The 20 un-annotated
-  cells are D15717's shared read, closed on #7242.
+  cells are D15717's shared read (unfiled: D15717, its row is on #7242), closed there.
 - Local sweep, fixpoint seeds both sides, base `origin/master`: 23,910 same, 0 bytes-only, 0
   output movers, 0 runs → not-runs, 0 new traps. 3 programs exist only in the candidate:
   D15719's witness (check reject), D15720's (invalid wasm, as filed) and the new fixture (runs).
