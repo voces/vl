@@ -26,8 +26,12 @@ find. So every census case where the type already had a row now returns at the t
 - the 57 programs that minted over a row the type already had.
 
 The census's step 2, minting only when the type has no row, needs no change of its own: a mint
-is reached only after the type find has missed. In all, up to 89 programs can move bytes. The
-18 programs whose name finds a row the type does not reach keep the field-set find.
+is reached only after the type find has missed. The 18 programs whose name finds a row the
+type does not reach keep the field-set find.
+
+The census predicted up to 89 programs could move. The sweep found none. Every disagreeing
+find either chose a row whose layout is the same heap type, or minted a row no emitted value
+reads. So the census's disagreements were all in row identity, never in a module.
 
 ## Proof
 
@@ -35,4 +39,5 @@ is reached only after the type find has missed. In all, up to 89 programs can mo
   `regress.vl` reports no runs lost; `check-filed-witnesses --strict` grades 4,722, all as
   filed; lint-self clean; the export, ladder, comment, sentinel, scan and render-parse budgets
   are at or below baseline; `vl_scaling_shape` passes.
-- **Sweep.** The PR's `sweep` job is the identity grade, and its movers are listed in the PR.
+- **Sweep.** The job ran on `419754d1`. After a re-run of record jobs that failed at artifact
+  upload, 23,910 programs are the same: 0 bytes-only movers, 0 output movers, 0 runs → not-runs.
