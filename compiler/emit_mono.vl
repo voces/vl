@@ -199,7 +199,7 @@ import {
   holeLitPinOf,
   nodeArrayElemIsNullUnit,
 } from "./check_bind_rows"
-import { flatConstOfNameProp } from "./check_flat_layout"
+import { flatConstOfTyProp } from "./check_annot_resolve"
 import { inferRetTyIxOf } from "./check_infer_ret"
 import { litTyOfExpr } from "./check_match_desugar"
 import { memberRungOnTy } from "./check_builtin_methods"
@@ -7374,17 +7374,11 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
 }
 
 // The layout constant `T.size` / `T.<field>` at `ix`, for a type parameter `mo` read through
-// member `n`: the byte layout of the `flat` type a parameter binds it to, in `tvN`/`tvV`, as a
-// number literal. An unbound, non-`flat` or field-less read fails loudly and answers `ix`.
-function monoLayoutConstOf(
-  ix: i32,
-  n: Member,
-  mo: Ident,
-  tvN: string[],
-  tvV: string[],
-): i32 {
-  const bind = monoBindOf(tvN, tvV, mo.identName)
-  if bind == "" {
+// member `n`: the byte layout of the `flat` type the instance being built binds it to, as a
+// number literal. Both folds run inside `monoMakeInstanceGo`, whose binding `tvN` names. An
+// unbound, untyped, non-`flat` or field-less read fails loudly and answers `ix`.
+function monoLayoutConstOf(ix: i32, n: Member, mo: Ident, tvN: string[]): i32 {
+  if !strListHas(tvN, mo.identName) {
     emitFail(
       "emitProgram: monomorphize: `"
         + mo.identName
@@ -7396,8 +7390,20 @@ function monoLayoutConstOf(
     )
     return ix
   }
+  const bt = monoBindTyOf(monoInstBindN, monoInstBindT, mo.identName)
+  if bt < 0 {
+    return emitFail(
+      "emitProgram: monomorphize: the layout constant `"
+        + mo.identName
+        + "."
+        + n.memProp
+        + "` reached an instance that binds `"
+        + mo.identName
+        + "` to no type",
+    )
+  }
   // Every call pins `T.member` against its binding (`flatLayoutPinMsg`), so a miss is a floor.
-  const v = flatConstOfNameProp(bind, n.memProp)
+  const v = flatConstOfTyProp(bt, n.memProp)
   if v < 0 {
     emitFail(
       "emitProgram: monomorphize: the layout constant `"
@@ -7405,7 +7411,7 @@ function monoLayoutConstOf(
         + "."
         + n.memProp
         + "` reached an instance at `"
-        + bind
+        + tyToStr(bt)
         + "`, which the call's pin refuses",
     )
     return ix
@@ -7474,7 +7480,7 @@ function monoFoldLayoutAt(
       const mo = nodeAt(n.memObj)
       if mo is Ident {
         if monoTyParamOf(mo.identName, typarams) != "" {
-          return monoLayoutConstOf(ix, n, mo, tvN, tvV)
+          return monoLayoutConstOf(ix, n, mo, tvN)
         }
       }
       const mc = monoFoldTyParamLayout(n.memObj, typarams, tvN, tvV)
@@ -20852,11 +20858,18 @@ function monoPinAnnotatedParam(
       bindTy = tyArrayElemIx(bindTy)
     }
     const b = monoBindOf(tvN, tvV, tp)
-    if b == "" {
+    const bound = strListHas(tvN, tp)
+    // A `T` an earlier parameter bound: the type it is bound at, or -1 for a spelling alone.
+    const boundTy = if bound { monoBindTyOf(tvN, tvT, tp) } else { -1 }
+    if !bound {
       tvN.push(tp)
       tvV.push(bind)
       monoTvTyLast(tvN, tvT, bindTy)
-    } else if genPin && b != an2 && monoPinIsFnTy(an2Ty) {
+    } else if (
+      genPin
+      && monoPinIsFnTy(an2Ty)
+      && !(boundTy >= 0 && an2Ty >= 0 && tyEq(boundTy, an2Ty))
+    ) {
       // A generic handed to a second `T` parameter called at another type: a bare-only `T` is
       // split per parameter by the check, or tagged as one set, so `T` takes one here (D6090).
       return emitFail(
@@ -20889,12 +20902,11 @@ function monoPinAnnotatedParam(
       )
     } else {
       // A `T` an earlier parameter bound pins this one at that binding's type, not the argument's.
-      const bt = if bind == b { monoBindTyOf(tvN, tvT, tp) } else { -1 }
       pinned.push(bind)
-      pinTys.push(if bt >= 0 { bt } else { an2Ty })
+      pinTys.push(if boundTy >= 0 { boundTy } else { an2Ty })
       // The type the ladder spelled the pin from, at the rep its spelling collapses to.
       const ownAt = if bind == an2 && an2Own[0] >= 0 { an2Own[0] } else { an2Ty }
-      pinOwn.push(if bt >= 0 { bt } else { monoAnnPinTy(ownAt) })
+      pinOwn.push(if boundTy >= 0 { boundTy } else { monoAnnPinTy(ownAt) })
     }
   }
   0
