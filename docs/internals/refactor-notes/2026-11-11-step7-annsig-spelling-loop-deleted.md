@@ -52,6 +52,15 @@ third probe repeated the first attempt here and also left the node at -1.
     `annRefListSlot`;
   - 21 imports, and `annSplitPipe` (`emit_base.vl`), which nothing else used.
 
+**After #7159.** That change keys every function type before reading the spelling. Merged with
+it, `annSigKeyTy` is `sigKeyOfTy` for a function type and `""` otherwise, so it no longer reads
+its spelling at all. It becomes the private `fnTySigKey`. Its wrappers drop their spelling
+arguments:
+
+- `unionArmSigKeyTy(ty)`;
+- `cloNameSigKeyTy(ty)`;
+- `fieldCloSigOf` keeps its signature for the shape interner's callers, and ignores the text.
+
 `scalarListRepOfName` and `nulScalarListKind` are left with only their codec callers
 (`fieldCodeOfSpelling`, `mvValKindOfName`, `nulScalarListFieldCode` and the nullable ref-map inner
 name). Census item 5 owns those.
