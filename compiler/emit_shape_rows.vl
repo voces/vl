@@ -76,7 +76,6 @@ import {
   mapTwinUnionMember,
   mapTyValIsLitUnion,
   mapTyValIsNulLitUnion,
-  mapTyValName,
   nameIsInlineLitUnion,
   nameIsLitUnionType,
   nameIsOneStrLit,
@@ -157,7 +156,6 @@ import {
   arrLeafNameOf,
   gaeParamShadowed,
   gaeSplitArgs,
-  mapNameKeyKind,
   mapValNameOf,
   nameIsBareMap,
   nameIsClosureArray,
@@ -223,12 +221,10 @@ import {
   rlElemNonNulTyAt,
   rlElemStructIdxAt,
   rlInnerSlotOfElem,
-  tyNulFuncInner,
 } from "./emit_map_value_slots"
 import {
   armLayoutContestedAt,
   mapMonoShapeOfKey,
-  mvArmKeyName,
   mvArmSigOfTy,
   mvSlotOfValTyK,
   mvValLowersTy,
@@ -651,13 +647,6 @@ function tyKidsAdd(kids: i32[], src: i32[]) {
   }
 }
 
-// Whether a map value of arena type `ty` is a ref list its value slot can name; false for -1.
-// A list whose type has no emitter name, such as a list of hole or generic functions, is not
-// one: its slot is minted once a pin names it.
-function mvValIsRefList(ty: i32): boolean {
-  ty >= 0 && tyIsRefArray(ty) && tyEmitNameNonEmpty(ty) != 0
-}
-
 // The mv value kind of a map value type-name — the one enumeration of which value types a
 // string-keyed map supports: `-1` a mono i32 value riding the shared `$mapStruct`, `-3`
 // unsupported, else the per-slot kind. Read by `mvShapeOfValNameRowTy`, the slot interner, and by
@@ -666,21 +655,92 @@ export function mvValKindOfName(valName: string): i32 {
   mvValKindOfNameTy(valName, -1)
 }
 
-// `mvValKindOfName` for a caller that also holds the value's arena type `ty`, or -1. A record,
-// map, list, function or primitive type answers whether the value admits `null` without the
-// spelling being split. Whether it is a literal union, a ref list or a function is asked of
-// `ty` only, and -1 is none of them.
+// `mvValKindOfName` for a caller that also holds the value's arena type `ty`, or -1: the type
+// answers whenever there is one, and the spelling only when there is none.
 export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
-  if ty >= 0 && fnTagTyIsTagged(ty) { return MVK_MONO }
-  // A list of a tagged set's ids, at any depth, is the i32 list wrapper it is stored as.
-  if ty >= 0 && fnTagListTy(ty) { return MVK_REF }
+  if ty >= 0 { return mvValKindOfTy(ty) }
+  mvValKindOfSpelling(valName)
+}
+
+// The mv value kind of map value type `ty`, read off its rep descriptor: `MVK_MONO` for a value
+// riding the shared mono map, `MVK_UNSUPPORTED` for one no vals list stores, else the slot kind.
+export function mvValKindOfTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return MVK_UNSUPPORTED }
+  if fnTagTyIsTagged(ty) { return MVK_MONO }
+  if fnTagListTy(ty) { return MVK_REF }
+  if tyIsLitUnionOrLit(ty) { return MVK_MONO }
+  const k = repOfTy(ty).rdKind
+  match k {
+    "i32" | "nulbool" | "nulnone" => {
+      return MVK_MONO
+    }
+    "str" | "nulstr" => {
+      return MVK_STR
+    }
+    "f64" => {
+      return MVK_F64
+    }
+    "i64" => {
+      return MVK_I64
+    }
+    "f32" => {
+      return MVK_F32
+    }
+    "v128" => {
+      return MVK_UNSUPPORTED
+    }
+    "map" | "nulmap" => {
+      // An inner map still open at a type variable is not one yet: a pin mints its slot.
+      if tyHasTyVar(tyPeelNul(ty)) { return MVK_UNSUPPORTED }
+      return MVK_REF
+    }
+    "list" | "strlist" | "f64list" | "i64list" | "f32list" | "u8list" | "nullist" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" => {
+      return MVK_REF
+    }
+    "reflist" | "nulreflist" => {
+      if tyEmitNameNonEmpty(tyPeelNul(ty)) != 0 { return MVK_REF }
+      return MVK_UNSUPPORTED
+    }
+    "closure" | "nulclosure" => {
+      const f = tyPeelNul(ty)
+      if tyEmitNameNonEmpty(f) == 0 { return MVK_UNSUPPORTED }
+      if k == "nulclosure" && tyIsLitUnion(tyStepRet(f)) {
+        return MVK_UNSUPPORTED
+      }
+      return MVK_CLOSURE
+    }
+    "struct" | "nulstruct" | "variant" | "nulvariant" => {
+      const o = nonNullTy(ty)
+      if structRowOfRecordTy(o) >= 0 { return MVK_STRUCT }
+      if repTyHasArmShape(o) { return MVK_STRUCT }
+      return MVK_UNSUPPORTED
+    }
+    "union" => {
+      return mvValUnionKindOfTy(ty)
+    }
+  }
+}
+
+// `mvValKindOfTy` of a value the descriptor boxes: a union box, unless it admits `null` beside a
+// lone ref member, or beside scalar members that are not all value atoms.
+function mvValUnionKindOfTy(ty: i32): i32 {
+  const ms: i32[] = []
+  const hasNull = jrFlatMembers(ty, ms)
+  if !hasNull { return MVK_UNION }
+  let refMember = false
+  for m in ms {
+    const bk = boxTagOfTy(m)
+    if bk < 0 || (bk >= 7 && bk != 14) { refMember = true }
+  }
+  if refMember && ms.length < 2 { return MVK_UNSUPPORTED }
+  MVK_UNION
+}
+
+// `mvValKindOfName` of a spelling with no type in hand, cut from the spelling alone.
+function mvValKindOfSpelling(valName: string): i32 {
   if valName == "i32" || valName == "boolean" { return MVK_MONO }
   // The `null` unit value stores the `boolean | null` sentinel, so it is the mono map too (D4671).
   if valName == "null" { return MVK_MONO }
-  // A literal-union atom value, one quoted literal being its one-member set (D7451): each value
-  // is the interned atom code, a plain i32, so the map is the mono i32 map. Checked before the
-  // union arm, whose member count would otherwise claim the alias and box the values.
-  if tyIsLitUnionOrLit(ty) { return MVK_MONO }
   // A nullable-atom value that reps as a plain i32 niche with no box — a nullable litunion
   // (atom ids, `-1` for null) or a nullable boolean (0/1, `2` for null). Each value is an i32
   // with a spare sentinel, so the map is the mono i32 map. Checked before the union arm, whose
@@ -690,33 +750,20 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
   // map or list member plus null — riding the same vals rep as its non-null twin; a pure
   // scalar nullable value-union, which boxes; and one with two or more non-null members, which
   // falls to the union arm. The remainder is a list element the kind-6 pair does not name.
-  if mvValHasNull(valName, ty) {
-    const nin = nulRefMapValInnerOfTy(valName, ty)
-    const nca = nrmInnerClosure
+  if mvValHasNull(valName, -1) {
+    const nin = nulRefMapValInnerOfTy(valName, -1)
     if nin != "" {
       if nin == "string" { return MVK_STR }
       if nameIsMap(nin) { return MVK_REF }
-      // A nullable-closure value is kind 14: the vals element is already the
-      // `(ref null $cloStruct)` fat-pointer, so the niche rides the non-null closure rep. A
-      // litunion result stays a loud reject — the read stays nullable, so the call needs a
-      // narrowed spelling the checker does not accept for this value shape.
-      if nca {
-        // The closure's result is read off the arena type, never its cut spelling.
-        if tyIsLitUnion(tyStepRet(tyNulFuncInner(ty))) {
-          return MVK_UNSUPPORTED
-        }
-        return MVK_CLOSURE
-      }
       // A nullable list value is kind 6, like its non-null twin: the vals element is already
       // `(ref null <wrapper>)`, so a stored `null` is `ref.null` of that wrapper. The three
       // predicates are this ladder's kind-6 set, and they must admit the same element reps as
       // the non-null arm — `u8[]` names itself in both, or the pair splits.
       if scalarListRepOfName(nin) != null { return MVK_REF }
-      if tyIsRefArray(tyPeelNul(ty)) { return MVK_REF }
       return MVK_STRUCT
     }
     const nulAtoms: string[] = []
-    unionArmsOfTy(valName, ty, nulAtoms)
+    unionArmsOfTy(valName, -1, nulAtoms)
     let nonNull = 0
     let refMember = false
     let na = 0
@@ -732,9 +779,6 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
     if refMember && nonNull < 2 { return MVK_UNSUPPORTED }
     if !refMember && !isValueUnionName(valName) { return MVK_UNSUPPORTED }
   }
-  // A scalar list value whose spelling names no list rep (`(1 | 2)[]`, `1[]`) is the list its
-  // type reps as, on the ref-value spine (D15084).
-  if ty >= 0 && tyAt(ty) is TyArray && mvTyIsScalarList(ty) { return MVK_REF }
   let kind = -1
   if valName == "string" {
     kind = MVK_STR
@@ -759,33 +803,19 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
     // A list-valued map: the value is a list wrapper ref, stored in a ref list whose element
     // kind picks the inner list's wrapper. Same ref-value spine as a nested map.
     kind = MVK_REF
-  } else if mvValIsRefList(ty) {
-    // Any ref-array map value — a struct list, a union list, a nested `S[][]`, a closure list
-    // — is a list wrapper ref stored in a ref-value list whose element is this value's
-    // wrapper. The store seeds the value literal off this slot and the read classifies the
-    // element recursively, so any nesting falls out with no per-shape special cases.
-    kind = MVK_REF
   } else if unionMemberCountOfName(valName) > 1 {
     // A union-valued map: each value is the shared union box ref, stored in a ref list whose
     // element kind is 2 — the same ref-value spine as a struct value, differing only in the
     // element heap and the store-coerce. A map member boxes exactly as it does in binding
     // position, and `markMapUnionArms` interns the arm's mv slot so tag and read agree.
     kind = MVK_UNION
-  } else if tyIsFuncArena(ty) && tyEmitNameNonEmpty(ty) != 0 {
-    // A function-valued map: each value is a closure fat-pointer in a kind-5 ref list, the rep
-    // an `((i32) => i32)[]` array uses; a litunion result rides it too (`exprString` widens the
-    // atom at the print seam). A function type with no emitter name, a hole or generic
-    // function, is not one yet: its slot is minted once a pin names it.
-    kind = MVK_CLOSURE
   } else {
-    if structRowOfNameTy(valName, ty) >= 0 { kind = MVK_STRUCT }
+    if structRowOfNameTy(valName, -1) >= 0 { kind = MVK_STRUCT }
     // The nominal half of that rung (D47): `structIndexByName` is a `sNames` lookup and
     // `collectS` skips a `type X = {…}` that is a union member, so an arm spelled by its own
     // name has no struct row. Reached only by the name-keyed gates, which do not canon and
     // must not disagree with the interner. Nominal: an exact `uVariants` lookup, no shape scan.
     if kind < 0 && variantIndexOf(valName) >= 0 { kind = MVK_STRUCT }
-    // The arm the adopter already took (D671), reached only when both lookups above decline.
-    if kind < 0 && mvValArmOfShapeTy(valName, ty) >= 0 { kind = MVK_STRUCT }
   }
   if kind < 0 { return MVK_UNSUPPORTED }
   kind
@@ -905,17 +935,11 @@ function canonAtomsOfTy(name: string, ty: i32): string[] {
 // The two atom rungs are load-bearing: an atom-valued map rides the mono i32 `vals` list and
 // interns no slot, while its rendered value name collapses to `string`.
 export function mapFindShapeOfNodeTy(ix: i32) {
-  mapShapeOfValKeyed(
-    nodeTyIxOf(ix),
-    nodeTyMapKeyKind(ix),
-    nodeMapValTyIx(ix),
-    mapNodeValName(ix),
-  )
+  mapShapeOfValKeyed(nodeTyIxOf(ix), nodeTyMapKeyKind(ix), nodeMapValTyIx(ix))
 }
 
-// The one rule both finds share: map type `m` keyed by kind `ki`, whose value `vTy` keys its mv
-// slot by `name`. The name stays because the rungs below the arena leg are still name-keyed.
-function mapShapeOfValKeyed(m: i32, ki: i32, vTy: i32, name: string): i32 {
+// The one rule both finds share: map type `m` keyed by kind `ki`, whose value has type `vTy`.
+function mapShapeOfValKeyed(m: i32, ki: i32, vTy: i32): i32 {
   if (
     mapStoredTyOf(m) != m
     || mapTyValIsLitUnion(m)
@@ -925,7 +949,7 @@ function mapShapeOfValKeyed(m: i32, ki: i32, vTy: i32, name: string): i32 {
   }
   const fs = mvDeepFuncSlotOfTy(vTy, ki)
   if fs >= 0 { return fs }
-  const sh = mvSlotOfMapValNameOrMonoKTy(name, ki, vTy)
+  const sh = mvSlotOfMapValOrMonoKTys(ki, vTy, vTy)
   if sh == -1 { return mapMonoShapeOfKey(ki) }
   sh
 }
@@ -979,8 +1003,7 @@ export function mapFindShapeOfTy(ty: i32, ki: i32) {
   const vTy = tyMapValOf(m)
   // A value that is still a hole (`{[_]: _}`) is unconstrained, so it builds the mono map.
   if vTy < 0 || tyAt(vTy) is TyVar { return mapMonoShapeOfKey(ki) }
-  const dn = mapValDeclName(vTy)
-  mapShapeOfValKeyed(m, ki, vTy, if dn != "" { dn } else { mapTyValName(m) })
+  mapShapeOfValKeyed(m, ki, vTy)
 }
 
 // The map shape the `Map()` call `ix`, stamped `ty`, builds: its binding's values when the
@@ -1014,12 +1037,11 @@ export function mvValStructIdxOf(slot: i32): i32 {
 // find missed: `-1` for the mono i32 map, else the slot the mint finds or mints once
 // `mvNameMint` is armed. A miss it cannot mint fails loudly.
 function mvSlotOfValNameFindK(valNameIn: string, valTy: i32, keyK: i32) {
-  const valName = mvCanonValNameTy(valNameIn, valTy)
   // Mono-ness is decided by the one classifier the interner uses: i32 and boolean, a
   // literal-union atom value, and the nullable-atom niches all ride the shared mono
-  // `$mStructIdx` with no interned slot. A two-name test rejects the atom spellings loudly
-  // even though the same map lowers fine as a binding.
-  if mvValKindOfNameTy(valName, valTy) == MVK_MONO { return -1 }
+  // `$mStructIdx` with no interned slot. The spelling decides only where there is no type.
+  const k = if valTy >= 0 { mvValKindOfTy(valTy) } else { mvValKindOfName(mvCanonValNameTy(valNameIn, -1)) }
+  if k == MVK_MONO { return -1 }
   const mFd = mvNameMint(valNameIn, keyK, valTy)
   if mFd >= 0 { return mFd }
   emitFail("emitProgram: map value type has no interned slot")
@@ -1114,42 +1136,33 @@ export function rlElemVariantRow(slot: i32): i32 {
   variantIndexOf(ln)
 }
 
-// The mv slot a map-element ref-list slot's value occupies — the chokepoint the
-// `mvSlotOfMapNameTy(rlElemName[s], -1)` readers share. Arena first
-// (`rlElemTyIx` to the `TyMap`'s value to `mvSlotOfTy`), and only for a real slot: the
-// name resolver's `-1` (mono) and `-3` (unsupported) answers stay its own (D5-final).
+// The mv slot a map-element ref-list slot's value occupies — the chokepoint the map-element
+// readers share. Arena first (`rlElemTyIx` to the `TyMap`'s value to `mvSlotOfTy`), and only
+// for a real slot: the key-kind find's `-1` (mono) and `-3` (unsupported) stay its own (D5-final).
 export function rlElemMapValMvSlot(slot: i32): i32 {
   const ar = rlElemMapValMvSlotAt(slot, false)
   if ar >= 0 { return ar }
-  if slot < 0 || slot >= rlElemName.length { return -3 }
-  mvSlotOfMapNameTys(rlElemName[slot], -1, tyMapValOf(rlElemTyIxAt(slot)))
+  const m = rlElemTyIxAt(slot)
+  mvSlotOfMapKeyKTys(tyMapKeyKind(m), -1, tyMapValOf(m))
 }
 
-// `rlElemMapValMvSlot` for a slot whose element may be a nullable map: the arena leg
-// peels one `TyNullable`, the name leg the `nulMapInnerName` spelling, before asking
-// for the value's slot. Same sentinel discipline.
+// `rlElemMapValMvSlot` for a slot whose element may be a nullable map: both legs peel one
+// `TyNullable` before asking for the value's slot. Same sentinel discipline.
 export function rlElemNulMapValMvSlot(slot: i32): i32 {
   const ar = rlElemMapValMvSlotAt(slot, true)
   if ar >= 0 { return ar }
-  if slot < 0 || slot >= rlElemName.length { return -3 }
-  let cen = rlElemName[slot]
-  const cnin = nulMapInnerName(cen)
-  if cnin != "" { cen = cnin }
-  mvSlotOfMapNameTys(cen, -1, tyMapValOf(nonNullTy(rlElemTyIxAt(slot))))
+  const m = nonNullTy(rlElemTyIxAt(slot))
+  mvSlotOfMapKeyKTys(tyMapKeyKind(m), -1, tyMapValOf(m))
 }
 
-// The mv slot of a nested-map value's inner value, for a value that may be a nullable map:
-// the arena leg peels one `TyNullable`, the name leg the `nulMapInnerName` spelling. Arena
-// first (`mvValTyIx` to the `TyMap`'s value to `mvSlotOfTy`), and only for a real slot: the
-// name resolver's `-1` (mono) and `-3` (unsupported) answers are its own (D5-final).
+// The mv slot of a nested-map value's inner value, for a value that may be a nullable map: both
+// legs peel one `TyNullable`. Arena first (`mvValTyIx` to the `TyMap`'s value to `mvSlotOfTy`),
+// and only for a real slot: the key-kind find's `-1` and `-3` answers are its own (D5-final).
 export function mvValInnerMvSlot(slot: i32): i32 {
   const ar = mvValInnerMvSlotAt(slot, true)
   if ar >= 0 { return ar }
-  if slot < 0 || slot >= mvValName.length { return -3 }
-  let vn = mvValName[slot]
-  const vnn = nulMapInnerName(vn)
-  if vnn != "" { vn = vnn }
-  mvSlotOfMapNameTys(vn, -1, tyMapValOf(nonNullTy(mvValTyIxAt(slot))))
+  const m = nonNullTy(mvValTyIxAt(slot))
+  mvSlotOfMapKeyKTys(tyMapKeyKind(m), -1, tyMapValOf(m))
 }
 
 // The `sFieldTgtStructIdx` twin for a variant's nested-struct field, with two extra rungs:
@@ -1428,7 +1441,7 @@ function jrFieldFitsAt(
   if want == FC_I32_LIST {
     return tyIsLitUnionArray(f) == nameIsLitUnionArray(elem)
   }
-  if want == FC_MAP || want == FC_NUL_MAP { return jrMapValFits(f, elem, et) }
+  if want == FC_MAP || want == FC_NUL_MAP { return jrMapValFits(f, et) }
   if want == FC_UNION { return jrBoxFits(f, et) }
   if want == FC_REF_LIST || want == FC_NUL_REF_LIST {
     const at = tyAt(nonNullTy(f))
@@ -1437,13 +1450,12 @@ function jrFieldFitsAt(
   true
 }
 
-// Whether map field `f` and a map field whose element name is `elem`, of type `et` or -1, store
-// values at one rep.
-function jrMapValFits(f: i32, elem: string, et: i32): boolean {
+// Whether map field `f` and a map field whose value has type `et` or -1 store values at one rep.
+function jrMapValFits(f: i32, et: i32): boolean {
   const mt = tyAt(nonNullTy(f))
   if !(mt is TyMap) { return true }
   const sa = mvSlotOfValTyK(mt.mVal, mapKeyKindOfTy(mt.mKey))
-  const sb = mvSlotOfMapValNameOrMonoKTys(elem, MAP_KEY_STR, -1, et)
+  const sb = mvSlotOfMapValOrMonoKTys(MAP_KEY_STR, -1, et)
   if sa >= 0 && sb >= 0 { return mvCanonRepOf(sa) == mvCanonRepOf(sb) }
   true
 }
@@ -1613,8 +1625,8 @@ export function mvValNamesCompat(
     if ke == MVK_STR && ka == MVK_MONO && tyIsLitUnion(vaTy) { return true }
     return false
   }
-  const sa = mvSlotOfMapValNameOrMonoKTys(va, MAP_KEY_STR, -1, vaTy)
-  const se = mvSlotOfMapValNameOrMonoKTys(ve, MAP_KEY_STR, -1, veTy)
+  const sa = mvSlotOfMapValOrMonoKTys(MAP_KEY_STR, -1, vaTy)
+  const se = mvSlotOfMapValOrMonoKTys(MAP_KEY_STR, -1, veTy)
   if sa >= 0 && se >= 0 { return mvCanonRepOf(sa) == mvCanonRepOf(se) }
   true
 }
@@ -4513,16 +4525,10 @@ export function variantFieldLayoutEq(a: i32, b: i32): i32 {
       // `{[string]: V}` field do store different map structs, but this guard never runs on
       // such a pair, since `buildVariantTwins` only calls it when `repNameCanonId` already
       // matched — and that key comes off the arena, where the two are `TyMap`s with different key types.
-      const ma = mvSlotOfMapValNameOrMonoKTy(
-        sFieldElemName[uFieldStart[a] + fi],
-        MAP_KEY_STR,
-        uFieldElemTyIxRow(uFieldStart[a] + fi),
-      )
-      const mb = mvSlotOfMapValNameOrMonoKTy(
-        sFieldElemName[uFieldStart[b] + fi],
-        MAP_KEY_STR,
-        uFieldElemTyIxRow(uFieldStart[b] + fi),
-      )
+      const ta = uFieldElemTyIxRow(uFieldStart[a] + fi)
+      const tb = uFieldElemTyIxRow(uFieldStart[b] + fi)
+      const ma = mvSlotOfMapValOrMonoKTys(MAP_KEY_STR, ta, ta)
+      const mb = mvSlotOfMapValOrMonoKTys(MAP_KEY_STR, tb, tb)
       let mOk = false
       if ma == -1 && mb == -1 { mOk = true }
       if ma >= 0 && mb >= 0 {
@@ -4737,13 +4743,6 @@ export function emptyArrLitIxOf(exprIx: i32) {
   -1
 }
 
-// The mv slot of the value of the bare-map spelling `mapName`, where `valTy` is the map VALUE's
-// banked arena type when the caller holds the node, else -1. There is deliberately NO
-// intern-side twin of this: the intern path is `mvShapeOfMapHeldTy`, which mints.
-export function mvSlotOfMapNameTy(mapName: string, valTy: i32): i32 {
-  mvSlotOfMapNameTys(mapName, valTy, valTy)
-}
-
 // The mv-slot key of map value type `mv` as a declaration spells it: a literal union by its
 // alias, a lone string literal as its one-member set `"x"` (D7446), else the value's nominal
 // name in the map-value position. "" for a value the arena cannot name, such as an unbound
@@ -4757,44 +4756,22 @@ export function mvDeclNameOfValTy(mv: i32): string {
   tyToNominalNameAt(mv, RC_MAP_VAL)
 }
 
-// The mv slot of map spelling `mapName` whose value has arena type `kindTy`, keyed by the
-// type's declared name as the mint keys it; `valTy` fronts the find with a type match, or -1.
-// The key kind follows the spelling, as the map's ops hash by it. A value the arena cannot
-// name has no slot: `-3`. A mono value is the `-1`/`-4` sentinel pair.
-export function mvSlotOfMapNameTys(
-  mapName: string,
-  valTy: i32,
-  kindTy: i32,
-): i32 {
-  mvSlotOfMapKeyKTys(mapNameKeyKind(mapName), valTy, kindTy)
-}
-
-// `mvSlotOfMapNameTys` for a map whose key kind (`MAP_KEY_*`) is `ki`.
+// The mv slot of a map keyed by kind `ki` (`MAP_KEY_*`) whose value has arena type `kindTy`;
+// `valTy` fronts the find with the arm hint, or -1. A value the arena cannot name has no slot:
+// `-3`. A mono value is the key's mono shape.
 export function mvSlotOfMapKeyKTys(ki: i32, valTy: i32, kindTy: i32): i32 {
-  const vn = mvDeclNameOfValTy(kindTy)
-  if vn == "" { return -3 }
-  const sl = mvSlotOfMapValNameOrMonoKTys(vn, ki, valTy, kindTy)
+  if mvDeclNameOfValTy(kindTy) == "" { return -3 }
+  const sl = mvSlotOfMapValOrMonoKTys(ki, valTy, kindTy)
   if sl == -1 { return mapMonoShapeOfKey(ki) }
   sl
 }
 
-// The mv slot whose map value type-name is `ivIn` and whose arena type is `valTy` or -1: `-1`
-// for a mono/atom value (never interned, rides `$mStructIdx`), or `-3` for a typed value whose
-// slot is never interned, so op sites fail loudly. Mono-tolerant, unlike `mvSlotOfValNameFindK`.
-function mvSlotOfMapValNameOrMonoKTy(ivIn: string, keyK: i32, valTy: i32): i32 {
-  mvSlotOfMapValNameOrMonoKTys(ivIn, keyK, valTy, valTy)
-}
-
-function mvSlotOfMapValNameOrMonoKTys(
-  ivIn: string,
-  keyK: i32,
-  valTy: i32,
-  kindTy: i32,
-): i32 {
-  // The value's kind, classified from the spelling the mint classifies (D47/D93).
-  const ivK = mvArmKeyName(ivIn, valTy)
-  const iv = mvCanonValNameTy(ivK, kindTy)
-  if mvValKindOfNameTy(iv, kindTy) == MVK_MONO { return -1 }
+// The mv slot of a map value of arena type `kindTy` under key kind `keyK`, `valTy` carrying the
+// arm hint or -1: `-1` for a mono/atom value (never interned, rides `$mStructIdx`), or `-3` for
+// a value with no type or no interned slot, so op sites fail loudly. Mono-tolerant, unlike
+// `mvSlotOfValNameFindK`.
+function mvSlotOfMapValOrMonoKTys(keyK: i32, valTy: i32, kindTy: i32): i32 {
+  if mvValKindOfTy(kindTy) == MVK_MONO { return -1 }
   // The find's half of the arm component (D48) — the same tri-state the mint threads,
   // answered from `valTy` when it is known, else `MV_ARM_NOHINT`.
   const armMo = mvArmHintOfShapeTy(valTy)
@@ -5340,16 +5317,4 @@ export function structRowOfAnnTy(name: string, rec: i32, ty: i32): i32 {
   const r = structRowOfRecordTy(rec)
   if r >= 0 { return r }
   structIndexOfTypeNameTy(name, ty)
-}
-
-// Whether the list type `ty` reps as one of the scalar lists (the i32, string, f64, i64, f32 or
-// byte list).
-function mvTyIsScalarList(ty: i32): boolean {
-  const k = repOfTy(ty).rdKind
-  k == "list"
-    || k == "strlist"
-    || k == "f64list"
-    || k == "i64list"
-    || k == "f32list"
-    || k == "u8list"
 }
