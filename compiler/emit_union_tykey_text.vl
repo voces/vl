@@ -29,14 +29,17 @@ export function utkIdOf(s: string): i32 {
 
 // One member's key text: `null` for -1; a union or a list keyed by its members' texts, sorted;
 // any other type its structural render, which keeps literals and spells a record as its shape.
-// A union or list already on the walk's path keys as `^k`, k steps up it, so a recursive
-// alias keys in time linear in its size.
+// A union or list already on the walk's path keys as `^k`, k steps up it. A cyclic member is
+// re-keyed over its structural classes, so the text is the same whichever id the cycle closes on.
 export function utkMemberText(ty: i32): string {
   const path: i32[] = []
-  utkTyText(ty, path)
+  const cyc = [0]
+  const t = utkTyText(ty, path, cyc)
+  if cyc[0] == 0 { return t }
+  utkCycText(ty)
 }
 
-function utkTyText(ty: i32, path: i32[]): string {
+function utkTyText(ty: i32, path: i32[], cyc: i32[]): string {
   if ty < 0 { return "null" }
   if ty >= T.tys.length || path.length >= TY_WALK_DEPTH {
     return tyToStructStr(ty)
@@ -44,7 +47,10 @@ function utkTyText(ty: i32, path: i32[]): string {
   const p = unMemPeelAliasWrapper(ty)
   let k = path.length - 1
   while k >= 0 {
-    if path[k] == p { return "^" + i32ToStr(path.length - 1 - k) }
+    if path[k] == p {
+      cyc[0] = 1
+      return "^" + i32ToStr(path.length - 1 - k)
+    }
     k = k - 1
   }
   const xs: i32[] = []
@@ -52,18 +58,162 @@ function utkTyText(ty: i32, path: i32[]): string {
   if xs.length > 1 {
     path.push(p)
     const texts: string[] = []
-    for x in xs { texts.push(utkTyText(x, path)) }
+    for x in xs { texts.push(utkTyText(x, path, cyc)) }
     path.pop()
     return "(" + utkTextOf(texts) + ")"
   }
   const t = tyAt(ty)
   if t is TyArray {
     path.push(p)
-    const e = utkTyText(t.aElem, path)
+    const e = utkTyText(t.aElem, path, cyc)
     path.pop()
     return "[" + e + "]"
   }
   tyToStructStr(ty)
+}
+
+// A walk node's kind, its children appended to `out`: 1 a union of two or more members, 2 a
+// list, 0 a leaf, which keys as its text.
+function utkNodeKids(ty: i32, out: i32[]): i32 {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const xs: i32[] = []
+  flattenVariantsInto(unMemPeelAliasWrapper(ty), xs)
+  if xs.length > 1 {
+    for x in xs { out.push(x) }
+    return 1
+  }
+  const t = tyAt(ty)
+  if t is TyArray {
+    out.push(t.aElem)
+    return 2
+  }
+  0
+}
+
+function utkLeafText(ty: i32): string {
+  if ty < 0 { return "null" }
+  tyToStructStr(ty)
+}
+
+// The text of cyclic member `root` with the walk's nodes merged by bisimulation: two nodes are
+// one when their unfoldings are the same tree, so a back-reference names a class, not an id.
+function utkCycText(root: i32): string {
+  const nodeOf: {[i32]: i32} = Map()
+  const kinds: i32[] = []
+  const kidStart: i32[] = []
+  const kidCount: i32[] = []
+  const kidNode: i32[] = []
+  const kidLeaf: string[] = []
+  const work = [root]
+  nodeOf[unMemPeelAliasWrapper(root)] = 0
+  let w = 0
+  while w < work.length {
+    const ks: i32[] = []
+    kinds.push(utkNodeKids(work[w], ks))
+    kidStart.push(kidNode.length)
+    kidCount.push(ks.length)
+    for x in ks {
+      const sub: i32[] = []
+      if utkNodeKids(x, sub) == 0 {
+        kidNode.push(-1)
+        kidLeaf.push(utkLeafText(x))
+      } else {
+        const p = unMemPeelAliasWrapper(x)
+        let n = nodeOf[p] ?? -1
+        if n < 0 {
+          n = work.length
+          nodeOf[p] = n
+          work.push(x)
+        }
+        kidNode.push(n)
+        kidLeaf.push("")
+      }
+    }
+    w = w + 1
+  }
+  const cls: i32[] = []
+  for k in kinds { cls.push(k) }
+  let count = 0
+  while true {
+    const ids: {[string]: i32} = Map()
+    const next: i32[] = []
+    let i = 0
+    while i < kinds.length {
+      const descs: string[] = []
+      let j = kidStart[i]
+      while j < kidStart[i] + kidCount[i] {
+        if kidNode[j] < 0 {
+          descs.push("l" + kidLeaf[j])
+        } else {
+          descs.push("c" + i32ToStr(cls[kidNode[j]]))
+        }
+        j = j + 1
+      }
+      const sig = i32ToStr(cls[i]) + "|" + utkTextOf(descs)
+      let c = ids[sig] ?? -1
+      if c < 0 {
+        c = next.length
+        ids[sig] = c
+      }
+      next.push(c)
+      i = i + 1
+    }
+    let n = 0
+    for c in next {
+      if c + 1 > n { n = c + 1 }
+    }
+    let m = 0
+    while m < next.length {
+      cls[m] = next[m]
+      m = m + 1
+    }
+    if n == count { break }
+    count = n
+  }
+  const path: i32[] = []
+  utkCycNodeText(0, path, kinds, kidStart, kidCount, kidNode, kidLeaf, cls)
+}
+
+function utkCycNodeText(
+  i: i32,
+  path: i32[],
+  kinds: i32[],
+  kidStart: i32[],
+  kidCount: i32[],
+  kidNode: i32[],
+  kidLeaf: string[],
+  cls: i32[],
+): string {
+  let k = path.length - 1
+  while k >= 0 {
+    if path[k] == cls[i] { return "^" + i32ToStr(path.length - 1 - k) }
+    k = k - 1
+  }
+  path.push(cls[i])
+  const texts: string[] = []
+  let j = kidStart[i]
+  while j < kidStart[i] + kidCount[i] {
+    if kidNode[j] < 0 {
+      texts.push(kidLeaf[j])
+    } else {
+      texts.push(
+        utkCycNodeText(
+          kidNode[j],
+          path,
+          kinds,
+          kidStart,
+          kidCount,
+          kidNode,
+          kidLeaf,
+          cls,
+        ),
+      )
+    }
+    j = j + 1
+  }
+  path.pop()
+  if kinds[i] == 2 { return "[" + texts[0] + "]" }
+  "(" + utkTextOf(texts) + ")"
 }
 
 // The key text of a member multiset: the member texts sorted, never deduped.
