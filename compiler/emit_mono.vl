@@ -403,7 +403,6 @@ import {
   annArrowAt,
   annFnDecompose,
   annObjFieldSplit,
-  annRetNameOf,
   annSplitParams,
   drwDispatchOp,
   exprEffectFree,
@@ -10153,6 +10152,20 @@ function monoFnTypeAnnParamsName(name: string, out: string[]) {
   annFnDecompose(name, out) != ""
 }
 
+// The pins of function type `t`'s parameters (a nullable one's function arm), appended to `out`;
+// false when `t` is no function type.
+function monoFnTyPinNames(t: i32, out: string[]): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const ft = if tyNulFuncInner(t) >= 0 { tyNulFuncInner(t) } else { t }
+  if ft < 0 || ft >= T.tys.length { return false }
+  const f = tyAt(ft)
+  if f is TyFunc {
+    for p in f.fnParamTypes { out.push(monoPinAnnSpelling(p)) }
+    return true
+  }
+  false
+}
+
 // The parameter types of the concrete function type `t` (the value's recorded type, or the
 // destination's), when it has `n` of them and names no type variable; empty otherwise.
 function monoFnValueParamTys(t: i32, n: i32): i32[] {
@@ -10549,7 +10562,7 @@ function monoCoerceFnValueTys(
     // A read through a written `let`'s capture cell is read as that `let` (D3939).
     Index => {
       const cn = monoCellReadName(exprIx)
-      if cn != "" { monoCoerceWrittenCell(exprIx, ctx, tname, delTys) }
+      if cn != "" { monoCoerceWrittenCell(exprIx, ctx, tname, delTys, tnameTy) }
       return 0
     }
     IfStmt => {
@@ -10593,7 +10606,7 @@ function monoCoerceFnValueTys(
       // So is one annotated with a function type: every write to it took that type (D4303).
       if monoAnnWrittenLetAt(exprIx, ctx) { return 0 }
       // An alias of a capture cell's read delivers that cell (D3948).
-      if monoCoerceAliasOfCell(exprIx, ctx, tname, delTys) { return 0 }
+      if monoCoerceAliasOfCell(exprIx, ctx, tname, delTys, tnameTy) { return 0 }
       // So does an alias of a reassigned `let` deliver that `let` (D9010).
       if monoCoerceAliasOfWrittenLet(exprIx, ctx, tname, delTys, tnameTy) {
         return 0
@@ -10630,20 +10643,13 @@ function monoCoerceFnValueTys(
         if monoGen[gfe] == 1 {
           const pnames: string[] = []
           // A nullable function slot (`((t: T) => void) | null`) takes the function's instance (D3932).
-          if (
-            monoFnTypeAnnParamsName(
-              peelGroupParens(nonNulBaseOf(tname)),
-              pnames,
-            )
-          ) {
+          if (monoFnTyPinNames(tnameTy, pnames)) {
             // A capturing nested generic's value is this frame's instance, as a call is (D3902).
             monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
             monoInstanceRetName = ""
             monoInstanceRetTy = monoFnTyRet(tnameTy)
             if monoInstanceWidenRet {
-              monoInstanceRetName = normTypeAtom(
-                annRetNameOf(peelGroupParens(tname)),
-              )
+              monoInstanceRetName = monoPinAnnSpelling(monoFnTyRet(tnameTy))
             }
             const vr = monoInstanceFor(
               gfe,
@@ -11134,7 +11140,7 @@ function monoCallWrittenLet(ix: i32, ctx: i32): i32 {
 const monoWrittenLetBusy: i32[] = []
 
 // For the capture cell read at `at` (`d[0]`) that a captured, written `let` becomes: its seed
-// and each live `d[0] = v` take function type `tname`, the cell is retyped to the instance, and
+// and each live `d[0] = v` take function type `tnameTy`, the cell is retyped to the instance, and
 // answers true (D3939). An annotated cell is taken only when its annotation names a type
 // parameter, whose writes every instance shares deliver at that instance's type (D3957).
 function monoCoerceWrittenCell(
@@ -11142,8 +11148,11 @@ function monoCoerceWrittenCell(
   ctx: i32,
   tname: string,
   tys: i32[],
+  tnameTy: i32,
 ): boolean {
-  if annArrowAt(tname) < 1 { return false }
+  if tnameTy < 0 || tnameTy >= T.tys.length || !(tyAt(tnameTy) is TyFunc) {
+    return false
+  }
   const lf = monoCoercibleLet(at, ctx)
   if lf[1] < 0 { return false }
   const d = nodeAt(lf[1])
@@ -11157,7 +11166,7 @@ function monoCoerceWrittenCell(
   const name = d.letName
   monoWrittenLetBusy.push(lf[1])
   monoLastInstFe = -1
-  const took = monoCellValueTake(seed, tname, lf[0], tys)
+  const took = monoCellValueTakeAt(seed, tname, lf[0], 0, tys, tnameTy)
   if took == 1 { emitFail(MONO_BIND_SIG_PRE + name + MONO_BIND_SIG_POST) }
   if took == 2 { monoCellValueFail(name) }
   // The cell takes the one closed type the elaboration delivers the binding at.
@@ -11171,7 +11180,7 @@ function monoCoerceWrittenCell(
     const nd = nodeAt(i)
     const wf = monoLetWriteFrame(lf, i)
     if nd is BinExpr && wf.length == 1 {
-      const wt = monoCellValueTake(nd.binRight, tname, wf[0], tys)
+      const wt = monoCellValueTakeAt(nd.binRight, tname, wf[0], 0, tys, tnameTy)
       if wt == 1 {
         if wf[0] == lf[0] || !monoFrameIsGenericInstance(lf[0]) {
           emitFail(MONO_BIND_SIG_PRE + name + MONO_BIND_SIG_POST)
@@ -11249,10 +11258,11 @@ function monoCoerceAliasOfCell(
   ctx: i32,
   tname: string,
   tys: i32[],
+  tnameTy: i32,
 ): boolean {
   const ar = monoAliasCellRead(at, ctx)
   if ar[0] < 0 { return false }
-  monoCoerceWrittenCell(ar[0], ar[1], tname, tys)
+  monoCoerceWrittenCell(ar[0], ar[1], tname, tys, tnameTy)
 }
 
 // For a name read at `at` in frame `ctx` that a chain of un-annotated aliases never written
@@ -14002,7 +14012,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     const wb = nodeAt(w)
     const wf = monoLetWriteFrame(lf, w)
     if wb is BinExpr && wf.length == 1 {
-      if monoPinWrittenLam(wb.binRight, ann, wf[0], ft) < 0 { return -1 }
+      if monoPinWrittenLam(wb.binRight, wf[0], ft) < 0 { return -1 }
       if monoCoerceFnValueTys(wb.binRight, ann, wf[0], -1, dTys, ft) < 0 {
         return -1
       }
@@ -14505,10 +14515,10 @@ function monoValueRetAt(v: i32, qs: i32[], depth: i32): i32 {
 }
 
 // Pins a lambda literal `v` with an un-annotated parameter, written in frame `wf` into a list
-// element or record field of function type `ann` (spelled from `annTy`), at that type, as its own
+// element or record field of function type `annTy`, at that type, as its own
 // contextual type would; -1 when it cannot take it (refused). The checker refuses a call that
 // gives it a type it does not take, at each instance of a generic body too (D12238).
-function monoPinWrittenLam(v: i32, ann: string, wf: i32, annTy: i32): i32 {
+function monoPinWrittenLam(v: i32, wf: i32, annTy: i32): i32 {
   const x = unwrapParen(v)
   if x < 0 || !(nodeAt(x) is FuncDecl) { return 0 }
   const lfe = monoLamValueFe(x, wf)
@@ -14520,7 +14530,7 @@ function monoPinWrittenLam(v: i32, ann: string, wf: i32, annTy: i32): i32 {
   ) {
     return 0
   }
-  if monoCellLamTake(lfe, x, ann, wf, [], annTy) == 0 { return 0 }
+  if monoCellLamTake(lfe, x, wf, [], annTy) == 0 { return 0 }
   emitFailAt(
     "emitProgram: a lambda written into an element or field holding a generic function cannot "
       + "take the type the calls through it give it — annotate its parameters",
@@ -14807,7 +14817,7 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
       const m = nodeAt(wb.binLeft)
       if m is Member {
         if m.memProp == name {
-          if monoPinWrittenLam(wb.binRight, ann, wf[0], annTy) < 0 { return -1 }
+          if monoPinWrittenLam(wb.binRight, wf[0], annTy) < 0 { return -1 }
           if (
             monoCoerceFnValueTys(wb.binRight, ann, wf[0], -1, dTys, annTy)
             < 0
@@ -15766,7 +15776,7 @@ function monoStoredSlotFnTy(lf0: i32[], path: string[], vals: i32[][]): i32 {
     const wf = vw[1]
     monoLastInstFe = -1
     const holeLam = monoListElemHoleLamFe(val, wf) >= 0
-    if monoPinWrittenLam(val, ann, wf, ft) < 0 { return -2 }
+    if monoPinWrittenLam(val, wf, ft) < 0 { return -2 }
     if monoCoerceFnValueTys(val, ann, wf, -1, dTys, ft) < 0 { return -2 }
     if holeLam && monoLastInstFe < 0 {
       if monoNoteBindDeliveryAt(val, ann, wf, ft) < 0 { return -2 }
@@ -16462,9 +16472,7 @@ function monoCoerceWrittenLetTys(
     if nd is BinExpr && wf.length == 1 {
       monoCoerceNamedGenericTys(nd.binRight, tname, wf[0], delTys, tnameTy)
       // The binding's own call is the type a hole lambda literal written to it is called at.
-      if byCall {
-        monoLamLitTakeTys(nd.binRight, tname, wf[0], delTys, tnameTy)
-      }
+      if byCall { monoLamLitTakeTys(nd.binRight, wf[0], delTys, tnameTy) }
     }
   }
   monoWrittenLetBusy.pop()
@@ -16645,29 +16653,25 @@ function monoLamInstanceNamed(v: i32, ctx: i32): i32 {
 // normalized. A node asked again at another list is one value two types want.
 let monoCellCoercedSig: {[i32]: string} = Map()
 
-// A value written into a capture cell at function type `tname`, in frame `ctx`, is one of: a
-// generic or instance by name, an alias or another cell resolving to one, a hole lambda (its own
-// rules), a parameter, or a value whose type names no type variable. 0 when it is, 1 when one
-// node is wanted at two types, 2 for anything else, which the cell cannot take (D3939).
-function monoCellValueTake(v: i32, tname: string, ctx: i32, tys: i32[]): i32 {
-  monoCellValueTakeAt(v, tname, ctx, 0, tys)
-}
-
-// `monoCellValueTake` `depth` aliases down.
+// A value written into a capture cell at function type `tnameTy`, in frame `ctx`, `depth` aliases
+// down, is one of: a generic or instance by name, an alias or another cell resolving to one, a hole
+// lambda (its own rules), a parameter, or a value whose type names no type variable. 0 when it is,
+// 1 when one node is wanted at two types, 2 for anything else, which the cell cannot take (D3939).
 function monoCellValueTakeAt(
   v: i32,
   tname: string,
   ctx: i32,
   depth: i32,
   tys: i32[],
+  tnameTy: i32,
 ): i32 {
   const x = unwrapParen(v)
   if x < 0 { return 2 }
   const n = nodeAt(x)
   if n is IfStmt {
-    const a = monoCellValueTakeAt(n.ifThen, tname, ctx, depth, tys)
+    const a = monoCellValueTakeAt(n.ifThen, tname, ctx, depth, tys, tnameTy)
     if a != 0 { return a }
-    return monoCellValueTakeAt(n.ifElse, tname, ctx, depth, tys)
+    return monoCellValueTakeAt(n.ifElse, tname, ctx, depth, tys, tnameTy)
   }
   if n is Block {
     if n.blkStmts.length == 0 { return 2 }
@@ -16677,11 +16681,12 @@ function monoCellValueTakeAt(
       ctx,
       depth,
       tys,
+      tnameTy,
     )
   }
   if monoNamesDeclaredGeneric(x, ctx) || monoNamesGenericInstance(x, ctx) {
     if !monoCellSigOne(x, tname) { return 1 }
-    monoCoerceNamedGenericTys(x, tname, ctx, tys, -1)
+    monoCoerceNamedGenericTys(x, tname, ctx, tys, tnameTy)
     return 0
   }
   // A hole lambda holds one signature, whichever instance or cell writes it.
@@ -16692,7 +16697,7 @@ function monoCellValueTakeAt(
     if nodeAt(x) is FuncDecl && monoLamIsHole(lfe) {
       if !monoCellSigOne(monoOrigNode[lfe], tname) { return 1 }
       if lfe < monoGen.length && monoGen[lfe] == 1 {
-        return monoCellLamTake(lfe, x, tname, ctx, tys, -1)
+        return monoCellLamTake(lfe, x, ctx, tys, tnameTy)
       }
       return 0
     }
@@ -16717,13 +16722,13 @@ function monoCellValueTakeAt(
   // Another cell's read delivers that cell at this type (D3949).
   const src = monoCellReadName(x)
   if src != "" && monoReadsGeneratedCell(x, ctx) {
-    monoCoerceWrittenCell(x, ctx, tname, tys)
+    monoCoerceWrittenCell(x, ctx, tname, tys, tnameTy)
     return 0
   }
   const nm = monoIdentNameOf(x)
   if nm != "" && monoReadGenFnFe(x) >= 0 {
     if !monoCellSigOne(x, tname) { return 1 }
-    if monoCoerceFnValueTys(x, tname, ctx, -1, tys, -1) < 0 { return 2 }
+    if monoCoerceFnValueTys(x, tname, ctx, -1, tys, tnameTy) < 0 { return 2 }
     return 0
   }
   // An un-annotated alias never written after its initializer is that initializer.
@@ -16734,7 +16739,14 @@ function monoCellValueTakeAt(
       if d is LetDecl {
         const fixed = d.letKw == "const" || !monoLetIsAssigned(nm, lf[1])
         if d.letType < 0 && d.letInit >= 0 && fixed {
-          return monoCellValueTakeAt(d.letInit, tname, lf[0], depth + 1, tys)
+          return monoCellValueTakeAt(
+            d.letInit,
+            tname,
+            lf[0],
+            depth + 1,
+            tys,
+            tnameTy,
+          )
         }
       }
     }
@@ -16793,7 +16805,7 @@ function monoReadsGeneratedCell(at: i32, ctx: i32): boolean {
   monoGeneratedCellElem(d.letInit) >= 0
 }
 
-// What `monoCellValueTake` answers for a value of type `t` delivered at function type `tname`:
+// What `monoCellValueTakeAt` answers for a value of type `t` delivered at function type `tname`:
 // 0 for a concrete function type with `tname`'s parameters (nullable where `tname` is), or a
 // primitive such as `null`; 1 for a function type with others; `open` for a type naming a type
 // variable; 2 for any other type.
@@ -16815,21 +16827,18 @@ function monoCellConcreteTake(t: i32, tname: string, open: i32): i32 {
   0
 }
 
-// Pins hole lambda `lfe`, the value at node `x` in frame `ctx`, at function type `tname`, where
+// Pins hole lambda `lfe`, the value at node `x` in frame `ctx`, at function type `ft`, where
 // nothing has yet: 0 when the lambda the cell holds then has that signature (and it is the last
 // instance), 1 when it holds another, 2 when it cannot take the type.
 function monoCellLamTake(
   lfe: i32,
   x: i32,
-  tname: string,
   ctx: i32,
   delTys: i32[],
-  tnameTy: i32,
+  ft: i32,
 ): i32 {
   const pnames: string[] = []
-  if !monoFnTypeAnnParamsName(peelGroupParens(nonNulBaseOf(tname)), pnames) {
-    return 2
-  }
+  if !monoFnTyPinNames(ft, pnames) { return 2 }
   monoCellLamTakeAt(
     lfe,
     x,
@@ -16837,7 +16846,7 @@ function monoCellLamTake(
     ctx,
     delTys,
     monoFnTyParamTys(
-      if tyNulFuncInner(tnameTy) >= 0 { tyNulFuncInner(tnameTy) } else { tnameTy },
+      if tyNulFuncInner(ft) >= 0 { tyNulFuncInner(ft) } else { ft },
     ),
   )
 }
@@ -17430,7 +17439,7 @@ function monoOpenCallAtElems(n: Call, ix: i32, ctx: i32): i32 {
   }
   for el in elems {
     // A hole lambda element is pinned in place at the call's type, as a delivered literal is.
-    if monoLamLitTake(el, nm, ctx, ft) != 0 {
+    if monoLamLitTakeTys(el, ctx, [], ft) != 0 {
       return emitFailAt(
         "emitProgram: a lambda this call reaches through a list cannot take the call's function type",
         el,
@@ -18686,7 +18695,7 @@ function monoFnPinAt(
   if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
   // A hole lambda literal no call instances, as one handed to a parameter nothing reads, takes
   // the pin itself; one already instanced keeps its instance (D6301).
-  monoLamLitTake(argIx, nm, ctx, bt)
+  monoLamLitTakeTys(argIx, ctx, [], bt)
   if flowDecl >= 0 {
     const noPath: string[] = []
     monoRetypePinCalls(flowDecl, noPath)
@@ -18829,7 +18838,7 @@ function monoElabDeliver(
   if tt is TyFunc {
     const nm = monoConcreteFnTyName(t)
     if nm == "" || inst && !(n is Ident) { return false }
-    if go && n is FuncDecl { monoLamLitTake(x, nm, ctx, t) }
+    if go && n is FuncDecl { monoLamLitTakeTys(x, ctx, [], t) }
     if go && !(n is FuncDecl) { monoCoerceFnValueName(x, nm, ctx, t) }
     return true
   }
@@ -18941,7 +18950,7 @@ function monoPinOpenCallLams(d: i32, bt: i32) {
     ) {
       monoCoerceFnValueName(ax, nm, fn0, bf.fnParamTypes[j])
     } else if nm != "" {
-      monoLamLitTake(c.callArgs[j], nm, fn0, bf.fnParamTypes[j])
+      monoLamLitTakeTys(c.callArgs[j], fn0, [], bf.fnParamTypes[j])
     }
     j = j + 1
   }
@@ -20349,7 +20358,7 @@ function monoPinHoleParam(
     // A literal handed to a parameter the body's own annotation decides delivers its open
     // functions at the slots the flow table pins, as at an annotated parameter (D9610).
     if an != "" && monoFlowIsLit(unwrapParen(args[i])) {
-      if monoCoerceFnValueName(args[i], an, ctx, -1) < 0 { return -1 }
+      if monoCoerceFnValueName(args[i], an, ctx, anTy) < 0 { return -1 }
     }
   } else {
     // The elaboration closes every parameter the checker typed closed, so a closed type here is
@@ -21891,6 +21900,7 @@ function monoCellCall(
   // of the seed, since retyping the cell rewrites the callee's recorded type (D3939, D3957).
   let ctn = ""
   let ctnTys: i32[] = []
+  let ctnTy = -1
   const sfe = monoCellSeedGenFe(at, cctx)
   // An alias is a value the cell's writes may have replaced, so its call is never renamed.
   if viaAlias { monoNoRename.push(n.callFn) }
@@ -21904,9 +21914,21 @@ function monoCellCall(
     if sr < 0 { return -1 }
     ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
     ctnTys = monoInstParamPinTys(monoLastInstFe)
+    // The cell takes the instance's type: its recorded one, else its pins and elaborated result.
+    const ifd = fnStmts[monoLastInstFe]
+    ctnTy = nodeTyIxOf(ifd)
+    const fd = nodeAt(ifd)
+    if (
+      (ctnTy < 0 || !(tyAt(ctnTy) is TyFunc))
+      && fd is FuncDecl
+      && fd.fnParams.length == ctnTys.length
+    ) {
+      const r = elabRetOf(elabKeyAt(ifd))
+      ctnTy = if r >= 0 { mkFuncTy(ctnTys, r) } else { -1 }
+    }
   }
   if ctn != "" && (live || sfe >= 0) {
-    monoCoerceWrittenCell(at, cctx, ctn, ctnTys)
+    monoCoerceWrittenCell(at, cctx, ctn, ctnTys, ctnTy)
   }
   // One cell holds one signature: a second call type is the binding conflict, refused.
   let rc = 0
@@ -22479,7 +22501,7 @@ function monoWalk(ix: i32, ctx: i32) {
             if monoCoerceFnValueTys(n.binRight, atn, ctx, -1, atTys, att) < 0 {
               return -1
             }
-            if byPin { monoLamLitTake(n.binRight, atn, ctx, att) }
+            if byPin { monoLamLitTakeTys(n.binRight, ctx, [], att) }
             if !byPin && monoDeliverCallAt(n.binRight, atn, att) < 0 {
               return -1
             }
@@ -22534,7 +22556,7 @@ function monoWalk(ix: i32, ctx: i32) {
             if monoCoerceFnValueTys(n.binRight, sn, ctx, -1, snTys, snt) < 0 {
               return -1
             }
-            monoLamLitTake(n.binRight, sn, ctx, snt)
+            monoLamLitTakeTys(n.binRight, ctx, [], snt)
           } else if monoDeliverAtPinTys(n.binRight, sn, ctx, snTys, snt) < 0 {
             return -1
           }
@@ -23606,7 +23628,7 @@ function monoDeliverLamLit(
     if ps != "-" { tnameTy = lt }
   }
   const none: i32[] = []
-  if monoLamLitTakeTys(at, tname, ctx, none, tnameTy) == 1 {
+  if monoLamLitTakeTys(at, ctx, none, tnameTy) == 1 {
     const x = unwrapParen(at)
     const pnames: string[] = []
     const lfe = monoLamValueFe(x, ctx)
@@ -23627,29 +23649,17 @@ function monoDeliverLamLit(
   0
 }
 
-// `monoCellLamTake` for the hole lambda literal at `at`, or 0 for anything else, including one
-// its context already typed, which keeps that signature and its result.
-function monoLamLitTake(at: i32, ann: string, ctx: i32, annTy: i32): i32 {
-  const none: i32[] = []
-  monoLamLitTakeTys(at, ann, ctx, none, annTy)
-}
-
-// `monoLamLitTake` where the caller holds the parameter types `delTys` the lambda is called at,
-// and `annTy`, the function type `ann` spells, else -1.
-function monoLamLitTakeTys(
-  at: i32,
-  ann: string,
-  ctx: i32,
-  delTys: i32[],
-  annTy: i32,
-): i32 {
+// `monoCellLamTake` for the hole lambda literal at `at` at function type `annTy`, called at the
+// parameter types `delTys` where the caller holds them; 0 for anything else, including one its
+// context already typed, which keeps that signature and its result.
+function monoLamLitTakeTys(at: i32, ctx: i32, delTys: i32[], annTy: i32): i32 {
   const x = unwrapParen(at)
   if x < 0 || !(nodeAt(x) is FuncDecl) { return 0 }
   if monoTyConcreteFn(nodeTyIxOf(x)) { return 0 }
   const lfe = monoLamValueFe(x, ctx)
   if lfe < 0 || lfe >= monoGen.length || monoGen[lfe] != 1 { return 0 }
   if !monoLamIsHole(lfe) { return 0 }
-  monoCellLamTake(lfe, x, ann, ctx, delTys, annTy)
+  monoCellLamTake(lfe, x, ctx, delTys, annTy)
 }
 
 // Hole lambda `lfe`, the literal `x` among the arguments of call `callIx`, instanced at the
