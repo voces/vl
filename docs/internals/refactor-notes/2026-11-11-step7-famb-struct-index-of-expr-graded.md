@@ -51,11 +51,15 @@ The two big classes were split further by later probes on master `658a3841` (#71
 - **909: a fused coercion.** The value is built at its struct row and boxed at its delivery.
   The record the typed read would use is the checker's union-box record for that delivery,
   `boxDstTyAt`, which is step 5's record (`2026-11-07-lowercoerce-scope.md`).
-- **About 56: a step-5 gap.** No coercion record exists at these nodes. The rep is per type, so
-  a type that is an arm anywhere reps as `variant`, and nothing records that this position
-  holds a plain struct.
-- **About 227: storage.** The arm's value was stored at its struct row, which is the storage
-  reader's answer. The rep's arm answer is `exprVariantIndex`'s (D34).
+- **About 56: a step-5 gap, a storage fact with no record.** No coercion record exists at these
+  nodes. The rep is per type, so a type that is an arm anywhere reps as `variant`, and nothing
+  records that this position holds a plain struct. The record that would replace the storage
+  reader is a per-position rep: the delivery's destination kind (struct, not box), written
+  where the checker types the position.
+- **About 227: a storage fact.** The arm's value was stored at its struct row (D14655), which is
+  the storage reader's answer. The rep's arm answer is `exprVariantIndex`'s (D34). The record
+  that would replace the storage reader is the type the value is stored at: the store column
+  the checker writes at the binding, field or element, read as `repOf(storedTy)`.
 
 ### Rep is a struct, other row (490): open, converted under family B
 
