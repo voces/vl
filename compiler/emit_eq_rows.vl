@@ -1,20 +1,14 @@
 // `emit_eq_rows.vl` — the equality rows: which element class a compare takes and
 // whether its reps are comparable.
 
-import { rlElemKindAt } from "./emit_rep"
+import { repOfTy, rlElemKindAt } from "./emit_rep"
 import { nodeTyIsLitUnionAlias } from "./check_node_tys"
 import { valueAtomKind } from "./check_ty_rep"
 import { tyIsLitUnion } from "./check_types"
-import {
-  sFieldElemNameAt,
-  sFieldTgtStructIdx,
-  sFieldTypeAt,
-  variantFieldTypeAt,
-} from "./emit_atom_kinds"
+import { sFieldElemNameAt, sFieldTgtStructIdx } from "./emit_atom_kinds"
 import { nodeTyAt } from "./emit_capture_frames"
 import {
   eqListKindOfListRep,
-  fieldCodeOfListRep,
   isScalarBackedListRep,
   listRepOfFieldCode,
   nulListBase,
@@ -34,15 +28,17 @@ import {
   FC_F32,
   FC_F64,
   FC_I32,
-  FC_I32_LIST,
   FC_I64,
+  FC_MAP,
   FC_NUL_BOOL,
   FC_NUL_CLOSURE,
   FC_NUL_LIT_UNION,
+  FC_NUL_MAP,
+  FC_NUL_NONE,
   FC_NUL_STR,
-  FC_REF_LIST,
   FC_STR,
   FC_STRUCT,
+  FC_UNION,
   LBK_F32_LIST,
   LBK_F64_LIST,
   LBK_I32_LIST,
@@ -52,11 +48,18 @@ import {
   LBK_U8_LIST,
   RLK_REF_LIST,
   RLK_UNION,
+  VKind,
+  armFieldStoreTy,
+  armFieldTypes,
   rlElemNullable,
   rlElemTyIx,
   sFieldCount,
+  sFieldStart,
+  sFieldStoreTy,
+  sFieldTypes,
   sHeapIdx,
   uFieldCount,
+  uFieldStart,
   variantHeap,
 } from "./emit_state"
 import { unionMemberAtomsOf } from "./emit_union_registry"
@@ -80,14 +83,6 @@ export function eqRowOfVariant(vi: i32) { -1 - vi }
 export function eqRowFieldCount(row: i32) {
   if row < 0 { return uFieldCount[-1 - row] }
   sFieldCount[row]
-}
-
-// The wasm-type code of an eq row's field `fi`. The two tables share one code vocabulary, so
-// the compare's field ladder is written once and its one loud floor catches the unsupported
-// codes whichever table the row came from.
-export function eqRowFieldTypeAt(row: i32, fi: i32) {
-  if row < 0 { return variantFieldTypeAt(-1 - row, fi) }
-  sFieldTypeAt(row, fi)
 }
 
 // The heap type an eq row's values are physically read through. A variant's cell is
@@ -248,7 +243,7 @@ export function eqgRowIsCyclic(row: i32): boolean {
     const nf = if r >= 0 && r < sFieldCount.length { sFieldCount[r] } else { 0 }
     while fi < nf {
       const nx = eqgFieldNextRow(r, fi)
-      const viaList = w % 2 == 1 || eqRowFieldTypeAt(r, fi) == FC_REF_LIST
+      const viaList = w % 2 == 1 || eqRowFieldKind(r, fi) == "reflist"
       if nx == row && viaList { return true }
       const nw = if viaList { nx * 2 + 1 } else { nx * 2 }
       if nx >= 0 && !i32ListHas(seen, nw) {
@@ -264,9 +259,9 @@ export function eqgRowIsCyclic(row: i32): boolean {
 // The struct row field `fi` of struct row `row` leads to, or -1: a nested struct's row, or
 // the struct row a ref-list field's element (through nested lists) resolves.
 function eqgFieldNextRow(row: i32, fi: i32): i32 {
-  const code = eqRowFieldTypeAt(row, fi)
-  if code == FC_STRUCT { return eqRowTgtStructIdx(row, fi) }
-  if code != FC_REF_LIST { return -1 }
+  const k = eqRowFieldKind(row, fi)
+  if eqKindIsRecord(k) { return eqRowTgtStructIdx(row, fi) }
+  if k != "reflist" { return -1 }
   let slot = eqgFieldRefSlot(row, fi)
   let depth = 0
   while slot >= 0 && slot < rlElemTyIx.length && depth < 32 {
@@ -289,29 +284,28 @@ function eqgStructElemFlat(row: i32, depth: i32, seen: i32[]): boolean {
   if cnt == 0 { return false }
   let fi = 0
   while fi < cnt {
-    const code = eqRowFieldTypeAt(row, fi)
-    if code == FC_STRUCT {
+    const k = eqRowFieldKind(row, fi)
+    if eqKindIsRecord(k) {
       // A nested-struct field target is a struct row in either namespace, or -1 for no
       // interned shape, so here — unlike the row above — a negative is the absence and must
       // be refused.
       const tgt = eqRowTgtStructIdx(row, fi)
       if tgt < 0 { return false }
       if !eqgStructElemFlat(tgt, depth + 1, seen) { return false }
-    } else if code == FC_REF_LIST {
+    } else if k == "reflist" {
       const rs = eqgFieldRefSlot(row, fi)
       if rs < 0 { return false }
       if eqgRefElemClass(rs, seen) == "none" { return false }
       if !eqgRepComparable(LBK_REF, rs, 0) { return false }
     } else if (
-      code != FC_I32
-      && code != FC_F64
-      && code != FC_I64
-      && code != FC_F32
-      && code != FC_NUL_BOOL
-      && code != FC_NUL_LIT_UNION
-      && code != FC_STR
-      && code != FC_I32_LIST
-      && eqScalarListFieldKind(code) < 0
+      k != "i32"
+      && k != "f64"
+      && k != "i64"
+      && k != "f32"
+      && k != "nulbool"
+      && k != "str"
+      && k != "list"
+      && eqScalarListKind(k) < 0
     ) {
       return false
     }
@@ -343,23 +337,23 @@ export function eqgStructElemNeeds(
   let str = false
   let fi = 0
   while fi < eqRowFieldCount(row) {
-    const code = eqRowFieldTypeAt(row, fi)
-    if code == FC_STRUCT {
+    const k = eqRowFieldKind(row, fi)
+    if eqKindIsRecord(k) {
       const tgt = eqRowTgtStructIdx(row, fi)
       if tgt >= 0 {
         if eqgStructElemNeeds(tgt, depth + 1, kinds, slots) { str = true }
       }
-    } else if code == FC_REF_LIST {
+    } else if k == "reflist" {
       const rs = eqgFieldRefSlot(row, fi)
       if rs >= 0 {
         kinds.push(LBK_REF)
         slots.push(rs)
       }
-    } else if code == FC_STR || code == FC_I32_LIST {
+    } else if k == "str" || k == "list" {
       // The string helper may widen an atom into the frame; the `i32[]` arm counts in it.
       str = true
     } else {
-      const sk = eqScalarListFieldKind(code)
+      const sk = eqScalarListKind(k)
       if sk >= 0 {
         kinds.push(sk)
         slots.push(0)
@@ -387,43 +381,92 @@ export function eqgInnerSlot(slot: i32) {
   0
 }
 
-// The scalar-list field code to generic-compare kind map (D1020), in `catListKindOfExpr`'s
-// alphabet, or -1 for a field code that is not a scalar-backed list. One home because two
-// sides read it: the compare-frame reservation and the field-equality ladder, and a core
-// emitted against a frame nobody reserved refuses loudly. Code 4 is deliberately absent.
-export function eqScalarListFieldKind(code: i32): i32 {
-  const k = listRepOfFieldCode(code)
+// The scalar-list rep to generic-compare kind map (D1020), in `catListKindOfExpr`'s alphabet, or
+// -1 for a field kind that is not a scalar-backed list. One home for the compare-frame
+// reservation and the field-equality ladder, since a core emitted against a frame nobody
+// reserved refuses loudly. `list` (`i32[]`) is deliberately absent.
+export function eqScalarListKind(k: VKind | null): i32 {
   if !isScalarBackedListRep(k) { return -1 }
   if k == null { return -1 }
   eqListKindOfListRep(k)
 }
 
-// D1180 — the non-null twin of a ref-niche field code, or -1 when the code is not one. A
-// `(ref null $H)` field is `null` or a value of `$H`, so its compare is the non-null code's
-// core under a null guard — one wrapper, not one arm per rep. One home, since the frame
-// pre-pass resolves a niche through this and `emitStructEqFieldInner` opens the guard from it.
-export function nulFieldInnerCode(code: i32): i32 {
-  if code == FC_NUL_STR {
-    return FC_STR // `string | null`
-  }
-  if code == FC_NUL_CLOSURE {
-    return FC_CLOSURE // `fn | null`
-  }
-  // A nullable list field's twin is its base list's code.
-  const base = nulListBase(listRepOfFieldCode(code))
-  if base == null { return -1 }
-  fieldCodeOfListRep(base)
+// D1180 — the non-null twin of a ref-niche field kind, or null when the kind is not one. A
+// `(ref null $H)` field is `null` or a value of `$H`, so its compare is the non-null kind's core
+// under a null guard: one wrapper, not one arm per rep. A record ref (`nulstruct`) is no niche.
+export function nulFieldInnerKind(k: VKind | null): VKind | null {
+  if k == "nulstr" { return "str" }
+  if k == "nulclosure" { return "closure" }
+  nulListBase(k)
 }
 
-// D1180 — the same map for a variant arm's field, differing in exactly one rung: code 4 is
-// included here and excluded there, because the struct ladder carries a hand-written `i32[]`
-// arm that predates the generic cores and the variant ladder has none. One home for the same
-// pairing its sibling is one for: the frame reservation and the core emitter read it alike.
-export function eqVariantListFieldKind(code: i32): i32 {
-  if code == FC_I32_LIST {
+// D1180 — the same map for a variant arm's field, differing in one rung: `list` is included
+// here and excluded there, because the struct ladder carries a hand-written `i32[]` arm the
+// variant ladder has none of.
+export function eqVariantListKind(k: VKind | null): i32 {
+  if k == "list" {
     return 0 // i32[] / boolean[] / K[]
   }
-  eqScalarListFieldKind(code)
+  eqScalarListKind(k)
+}
+
+// The kind field code `code` stores, or null for no code. The floor of a field whose storage
+// type is unrecorded or uncovered; every other field's kind is its storage type's rep.
+function fieldCodeKind(code: i32): VKind | null {
+  const lk = listRepOfFieldCode(code)
+  if lk != null { return lk }
+  if code == FC_I32 || code == FC_NUL_LIT_UNION { return "i32" }
+  if code == FC_STR { return "str" }
+  if code == FC_CLOSURE { return "closure" }
+  if code == FC_STRUCT { return "nulstruct" }
+  if code == FC_UNION { return "union" }
+  if code == FC_F64 { return "f64" }
+  if code == FC_MAP { return "map" }
+  if code == FC_NUL_STR { return "nulstr" }
+  if code == FC_NUL_BOOL { return "nulbool" }
+  if code == FC_NUL_CLOSURE { return "nulclosure" }
+  if code == FC_I64 { return "i64" }
+  if code == FC_F32 { return "f32" }
+  if code == FC_NUL_MAP { return "nulmap" }
+  if code == FC_NUL_NONE { return "nulnone" }
+  // A negative code is no field; the list codes are answered above.
+  null
+}
+
+// The kind flat field row `r` of table `codes` is stored at: its storage type's rep, or its
+// field code's where the type is unrecorded, uncovered or `nulnone` (a hole's record or the
+// `null` unit, which only the code tells apart).
+function fieldRowKindIn(codes: i32[], tys: i32[], r: i32): VKind | null {
+  if r < 0 || r >= codes.length { return null }
+  const ty = if r < tys.length { tys[r] } else { -1 }
+  if ty >= 0 {
+    const d = repOfTy(ty)
+    if d.rdCovered == 1 && d.rdKind != "nulnone" { return d.rdKind }
+  }
+  fieldCodeKind(codes[r])
+}
+
+// `fieldRowKindIn` of the struct table's flat row `r`.
+export function fieldRowKind(r: i32): VKind | null {
+  fieldRowKindIn(sFieldTypes, sFieldStoreTy, r)
+}
+
+// The kind eq row `row`'s field `fi` is stored at; a negative row is variant `-1 - row`.
+export function eqRowFieldKind(row: i32, fi: i32): VKind | null {
+  if row < 0 {
+    return fieldRowKindIn(
+      armFieldTypes(),
+      armFieldStoreTy(),
+      uFieldStart[-1 - row] + fi,
+    )
+  }
+  fieldRowKindIn(sFieldTypes, sFieldStoreTy, sFieldStart[row] + fi)
+}
+
+// Whether a field kind is a record ref: a struct row or a variant row, nullable as a code-15
+// field is stored.
+export function eqKindIsRecord(k: VKind | null): boolean {
+  k == "nulstruct" || k == "nulvariant"
 }
 
 // The union-atom code to generic-compare kind map, in `catListKindOfExpr`'s alphabet, or -1
@@ -483,14 +526,14 @@ export function shapeHasCloField(row: i32, seen: i32[]) {
   seen.push(row)
   let fi = 0
   while fi < eqRowFieldCount(row) {
-    let code = eqRowFieldTypeAt(row, fi)
+    let fk = eqRowFieldKind(row, fi)
     // A `fn | null` field runs the identity core under a null guard, so it needs the same
     // two-slot frame its non-null twin does — resolved through the one home the guard opens
     // from, else the core is a `local.set` into a slot the function never declared (D1292).
-    const cn = nulFieldInnerCode(code)
-    if cn >= 0 { code = cn }
-    if code == FC_CLOSURE { return true }
-    if code == FC_STRUCT {
+    const cn = nulFieldInnerKind(fk)
+    if cn != null { fk = cn }
+    if fk == "closure" { return true }
+    if eqKindIsRecord(fk) {
       const nsi = eqRowTgtStructIdx(row, fi)
       if nsi >= 0 {
         if shapeHasCloField(nsi, seen) { return true }
