@@ -760,6 +760,7 @@ import {
 } from "./emit_elab"
 import {
   isUNameDeclAB,
+  isUNameKeyAB,
   unABOn,
   unNameBound,
   unRowOfCanonFolded,
@@ -1036,19 +1037,34 @@ function monoTyIsList(ty: i32): boolean {
 // callers exist because mid-mono the `expr*` rep cascade cannot classify a binding at
 // all (`buildLocals` is post-mono), so the annotation is the only truth; both sit behind
 // `fnIx >= 0`. "" means no pin from the annotation, and the cascade answers instead.
-function monoAnnPinName(name: string) {
+function monoAnnPinName(name: string, ty: i32) {
   const isArr = nameIsArray(name)
+  // The element type a list spelling's element renders, where the caller holds the list's type.
+  let elemTy = -1
+  if ty >= 0 && ty < T.tys.length {
+    const lt = tyAt(ty)
+    if lt is TyArray { elemTy = lt.aElem }
+  }
   const r = monoStructAnnName(name, isArr)
   if r != "" { return r }
   // A union-typed annotation (`a: Cat | Dog`, or an alias): bind `T` to the union name
   // so the instance's param and return ride the union box. The union key answers; an
   // alias keys as the member set its declaration's row records.
-  if isUNameDeclAB(79, name) { return name }
+  if (
+    if ty >= 0 { isUNameKeyAB(79, name, ty) } else { isUNameDeclAB(79, name) }
+  ) {
+    return name
+  }
   // …and its list rung (D1082): the union registry has no row for an array name, so `first<T>(xs:
   // T[])` over a `const xs: Shape[]` had no arm at all. The pin is the caller's own
   // spelling, safe because the same program through a non-generic `firstS` runs.
   if isArr {
-    if isUNameDeclAB(80, arrElemNameRaw(name)) { return name }
+    const en = arrElemNameRaw(name)
+    if (
+      if elemTy >= 0 { isUNameKeyAB(80, en, elemTy) } else { isUNameDeclAB(80, en) }
+    ) {
+      return name
+    }
   }
   // A declared union arm (`Circle` in `type Shape = Circle | Sq`) — the kind-8 variant,
   // whose slot is `(ref $variantHeap(vi))`. `monoStructAnnName` declines it (no struct row)
@@ -1073,7 +1089,8 @@ function monoAnnPinName(name: string) {
   // alias is in `unNames` too. Kept as the rung whose absence a whole family witnessed.
   if isArr {
     const luElem = arrElemNameRaw(name)
-    const luTy = if luElem != "" && isUNameDeclAB(81, luElem) { cUserTypes.get(luElem) ?? -1 } else { -1 }
+    const luDecl = if elemTy >= 0 { isUNameKeyAB(81, luElem, elemTy) } else { isUNameDeclAB(81, luElem) }
+    const luTy = if luElem != "" && luDecl { cUserTypes.get(luElem) ?? -1 } else { -1 }
     if luTy >= 0 && tyIsLitUnion(luTy) { return name }
   }
   // A `boolean[]` annotation. Its rep is the i32 list exactly (`nameIsI32Array`), so the
@@ -1092,17 +1109,19 @@ function monoAnnPinName(name: string) {
   const rs = monoScalarAnnName(name, isArr)
   if rs != "" { return rs }
   // A nullable spelling, whose `| null` the pin has to carry.
-  monoNulAnnName(name)
+  monoNulAnnName(name, ty)
 }
 
 // A nullable annotation whose non-null base is a spelling `monoAnnPinName` already
 // claims, echoed back whole — else "". The nullability rides the pin because the pin is
 // the instance's parameter annotation, while every other channel answers about the rep,
 // whose nullable is its non-null base by design. The base must echo back unchanged.
-function monoNulAnnName(name: string) {
+function monoNulAnnName(name: string, ty: i32) {
   const base = nullablePartOf(name)
   if base == "" { return "" }
-  if monoAnnPinName(base) == base { return name }
+  if monoAnnPinName(base, if ty >= 0 { nonNullTy(ty) } else { -1 }) == base {
+    return name
+  }
   ""
 }
 
@@ -1325,7 +1344,7 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   }
   const n = tyToEmitName(nt)
   if monoNameNarrowsFrom(n, wide) || monoNicheNarrowsFrom(n, nt, wide) {
-    if monoAnnPinName(n) == n { return n }
+    if monoAnnPinName(n, nt) == n { return n }
     return ""
   }
   // The NOMINAL spelling of the same arm: the two sides of the membership test render
@@ -1341,7 +1360,7 @@ function monoNarrowedNominalPinName(nt: i32, n: string, wide: string): string {
   const nom = nominalStructNameOfTy(nt)
   if nom == "" { return monoNarrowedNulRecPinName(nt, n, wide) }
   if !monoNameNarrowsFrom(nom, wide) { return "" }
-  if monoAnnPinName(nom) != nom { return "" }
+  if monoAnnPinName(nom, -1) != nom { return "" }
   nom
 }
 
@@ -1350,7 +1369,7 @@ function monoNarrowedNominalPinName(nt: i32, n: string, wide: string): string {
 // whole-spelling membership test above cannot see (D3099). "" otherwise.
 function monoNarrowedNulRecPinName(nt: i32, n: string, wide: string): string {
   if !monoNulRecNamesNarrow(nt, wide) { return "" }
-  if monoAnnPinName(n) == n { return n }
+  if monoAnnPinName(n, -1) == n { return n }
   ""
 }
 
@@ -1375,7 +1394,7 @@ function monoNarrowedLitPinName(nt: i32, wide: string): string {
   const kn = litUnionAliasNameOfTy(nt)
   if kn == "" { return "" }
   if !monoNameNarrowsFrom(kn, wide) { return "" }
-  if monoAnnPinName(kn) != kn { return "" }
+  if monoAnnPinName(kn, nt) != kn { return "" }
   kn
 }
 
@@ -1388,7 +1407,7 @@ function monoLoopVarRecordPin(ix: i32, fnIx: i32): string {
   if readLoopNodeOf(ix, fnIx) < 0 { return "" }
   const t = nodeTyIxOf(ix)
   const nom = nominalStructNameOfTy(t)
-  if nom != "" { return monoAnnPinName(nom) }
+  if nom != "" { return monoAnnPinName(nom, -1) }
   if t < 0 || t >= T.tys.length || !(tyAt(t) is TyObj) || monoTyOpen(t) {
     return ""
   }
@@ -1423,7 +1442,7 @@ function monoNicheWidenedPinName(ax: i32, chosen: string, cTy: i32): string {
   // It widens only when the node's type is the nullable of the type the ladder chose.
   const ntt = tyAt(nt)
   if !(ntt is TyNullable) || cTy < 0 || !tySame(ntt.nInner, cTy) { return "" }
-  if monoAnnPinName(n) != n { return "" }
+  if monoAnnPinName(n, nt) != n { return "" }
   n
 }
 
@@ -1437,7 +1456,7 @@ function monoElemlessNulListPinName(nt: i32, chosen: string): string {
   }
   const l = tyAt(t.nInner)
   if !(l is TyArray) || l.aElem >= 0 { return "" }
-  if monoAnnPinName("i32[]|null") != "i32[]|null" { return "" }
+  if monoAnnPinName("i32[]|null", -1) != "i32[]|null" { return "" }
   "i32[]|null"
 }
 
@@ -1692,7 +1711,7 @@ function monoArmTailLocalInit(ix: i32): i32 {
 
 // The annotation ladder's pin for type `ty`, by its render, or "" when no rung takes it.
 function monoAnnPinNameOfTy(ty: i32): string {
-  monoAnnPinName(tyToEmitName(ty))
+  monoAnnPinName(tyToEmitName(ty), ty)
 }
 
 // The pin of a read of an un-annotated literal binding the record solve builds at another
@@ -1732,7 +1751,7 @@ function monoClosedTyName(ty: i32): string {
       if si < 0 || si >= sNames.length || sNames[si].slice(0, 1) == "#" {
         return ""
       }
-      return monoAnnPinName(sNames[si])
+      return monoAnnPinName(sNames[si], -1)
     }
     TyUnion | TyNullable => {
       // A union of non-literal members is its flattened members in order, which its render
@@ -1742,12 +1761,12 @@ function monoClosedTyName(ty: i32): string {
       }
       const ur = unRowOfTyKey(ty)
       if ur >= 0 && ur < unNames.length {
-        const un = monoAnnPinName(unNames[ur])
+        const un = monoAnnPinName(unNames[ur], -1)
         if un != "" { return un }
       }
       if t is TyNullable {
         const inm = monoClosedTyName(t.nInner)
-        if inm != "" { return monoAnnPinName(inm + "|null") }
+        if inm != "" { return monoAnnPinName(inm + "|null", -1) }
       }
       return ""
     }
@@ -1755,9 +1774,9 @@ function monoClosedTyName(ty: i32): string {
       const en = monoClosedTyName(t.aElem)
       if en == "" { return "" }
       if strContains(en, "|") && !tyIsArray(t.aElem) {
-        return monoAnnPinName("(" + en + ")[]")
+        return monoAnnPinName("(" + en + ")[]", -1)
       }
-      return monoAnnPinName(en + "[]")
+      return monoAnnPinName(en + "[]", -1)
     }
     // A scalar, function, map or open type has no declared name to keep.
     TyPrim | TyErr | TyFunc | TyMap | TyVar | TyLit | TyNeg => {}
@@ -1898,7 +1917,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32, tyOut: i32[]): string {
   if nodeAt(cax) is ObjLit {
     const ovr = litArmRowOf(cax, fnIx, nodeRepTyIxOf(cax))
     if ovr >= 0 && ovr < uVariants.length {
-      const ovn = monoAnnPinName(uVariants[ovr])
+      const ovn = monoAnnPinName(uVariants[ovr], -1)
       if ovn != "" { return ovn }
     }
   }
@@ -1908,13 +1927,13 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32, tyOut: i32[]): string {
   // arm for arm and each leg kind-gated, so the two cannot both answer (D57).
   const avi = exprVariantIndex(ix, fnIx)
   if avi >= 0 && avi < uVariants.length {
-    const avn = monoAnnPinName(uVariants[avi])
+    const avn = monoAnnPinName(uVariants[avi], -1)
     if avn != "" { return avn }
   }
   if exprStruct(ix, fnIx) {
     const olv = litRetArmRow(unwrapParen(cax))
     if olv >= 0 && olv < uVariants.length {
-      const olp = monoAnnPinName(uVariants[olv])
+      const olp = monoAnnPinName(uVariants[olv], -1)
       if olp != "" { return olp }
     }
     // The row the argument's checked record type is stored at; the type-blind classifier is
@@ -2054,7 +2073,12 @@ function monoArgTyNameProjected(
       const arrTy = monoArgTyName(argN.idxArr, fnIx, arrOut)
       const an = arrTy.length
       if an >= 3 && nameIsArray(arrTy) {
-        const r = monoAnnPinName(listElemNameOf(arrTy))
+        let aet = -1
+        if arrOut[0] >= 0 && arrOut[0] < T.tys.length {
+          const at = tyAt(arrOut[0])
+          if at is TyArray { aet = at.aElem }
+        }
+        const r = monoAnnPinName(listElemNameOf(arrTy), aet)
         if r != "" {
           tyOut[0] = if arrOut[0] >= 0 { tyArrayElemIx(arrOut[0]) } else { -1 }
           return r
@@ -2092,7 +2116,7 @@ function monoArgTyNameProjected(
           && (nodeTyIsNullableStruct(cax)
             || monoFieldDeclNullable(rsi, argN.memProp))
         ) {
-          return monoAnnPinName(fnm + "|null")
+          return monoAnnPinName(fnm + "|null", -1)
         }
         if isSName(fnm) {
           const fr = structIndexByName(fnm)
@@ -2136,7 +2160,10 @@ function monoArgTyNameBound(
               // A composite-element list local (`xs: i32[][]`, `(i32|null)[]`) is
               // among the spellings `monoAnnPinName` claims: the cascade below either
               // declines it or answers one dimension short.
-              const r = monoAnnPinName(tyNameOf(ld.letType))
+              const r = monoAnnPinName(
+                tyNameOf(ld.letType),
+                nodeTyIxOf(ld.letType),
+              )
               if r != "" {
                 tyOut[0] = monoPinClosedOrNone(
                   monoPinSubTyOf(nodeTyIxOf(ld.letType), fnIx),
@@ -2196,7 +2223,7 @@ function monoArgTyNameBound(
           // The annotated-local arm's param twin — a generic body passing its own
           // `xs: i32[][]` / `boolean[]` / `P` parameter on to a second generic call, the
           // shape a generic forwarder has. One home, so the two cannot drift.
-          const r = monoAnnPinName(pt.tyName)
+          const r = monoAnnPinName(pt.tyName, nodeTyIxOf(ptn))
           if r != "" {
             tyOut[0] = monoPinClosedOrNone(
               monoPinSubTyOf(nodeTyIxOf(ptn), fnIx),
@@ -2218,7 +2245,10 @@ function monoArgTyNameBound(
           // The global's annotation, through the one pin membership list — the same
           // call the annotated-local and param arms make, so a generic call pins its
           // instance identically wherever its argument's binding lives.
-          const rg = monoAnnPinName(tyNameOf(gd.letType))
+          const rg = monoAnnPinName(
+            tyNameOf(gd.letType),
+            nodeTyIxOf(gd.letType),
+          )
           if rg != "" {
             tyOut[0] = monoPinClosedOrNone(
               monoPinSubTyOf(nodeTyIxOf(gd.letType), fnIx),
@@ -3716,7 +3746,7 @@ function monoPinAnnSpelling(t: i32): string {
   if tw != "" { return tw }
   if tyIsLitUnion(t) {
     const ln = litUnionAliasNameOfTy(t)
-    if ln != "" && monoAnnPinName(ln) == ln { return ln }
+    if ln != "" && monoAnnPinName(ln, t) == ln { return ln }
   }
   const nm = tyToEmitName(t)
   if nm != "" && t >= 0 && t < T.tys.length && tyAt(t) is TyArray {
