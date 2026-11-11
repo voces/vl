@@ -1,6 +1,6 @@
 # A maker's union of records delivered at a declared record is built there (D15719), 2026-11-11
 
-Lane w311. unfiled: D15719, which is filed in #7242. The witness is invalid wasm on master `1d517770`:
+Lane w311. unfiled: D15719 and unfiled: D15717, which are filed in #7242. The witness is invalid wasm on master `1d517770`:
 
     type J = { a: i32 }
     type K = { j: J | null }
@@ -72,4 +72,4 @@ copied. It was not `runs` before. With #7242 alone it is still D15719's invalid 
   render-parse, kind-ladder sets, seed-size, late-demands, plumb-shape, rep-fuzz (exact),
   `cases_wasm` (7,441), `vl_check_codegen`, `vl_scaling_shape`, `vl_probe_rollback`, the inventory
   rows and refs tests, and the capability probes (222 of 226, as on base).
-- Claims D15770–D15779 in `RESERVED.md`.
+- Claims this lane's id block, 15770–15779, in `RESERVED.md`.
