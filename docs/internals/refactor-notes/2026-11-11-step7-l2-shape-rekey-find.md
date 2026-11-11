@@ -1,6 +1,6 @@
 # Step 7 L2 §7: an anonymous inline shape finds its struct row by type first, 2026-11-11
 
-This is step 1 of the D6 inline-shape interner's re-key (census:
+This is the D6 inline-shape interner's re-key, for anonymous records (census:
 `2026-11-11-step7-l2-shape-rekey-census.md`). The interner found a shape's row by its field set
 under the walk's spelling. An anonymous record now finds its row by type first, through
 `structRowOfRecordTy`. That is the key the struct registry has stored rows under since #7009.
@@ -19,11 +19,15 @@ The base is master `ebbc4bc2`+, with the cases population.
 
 ## Expected movers
 
-From the census, in 29 programs the field-set find returned a different row than the type key.
-Those rows are same-spelling twins, two literal `#anon` rows, and `{f:(i32)=>i32}` against
-`{f:(i32)=>f64}`, which the field codes do not tell apart. These programs are where this step
-can move bytes. Step 2 (mint only when the type has no row) is the 57-program merge, and it is a
-separate PR.
+The census asked `structRowOfRecordTy` at the same point this find does, before the field-set
+find. So every census case where the type already had a row now returns at the type find:
+
+- the 29 + 5 programs where a find returned a different row;
+- the 57 programs that minted over a row the type already had.
+
+The census's step 2, minting only when the type has no row, needs no change of its own: a mint
+is reached only after the type find has missed. In all, up to 89 programs can move bytes. The
+18 programs whose name finds a row the type does not reach keep the field-set find.
 
 ## Proof
 
