@@ -1,8 +1,7 @@
 # Step 7: the rep tree's kind covers every type the flat arms do, 2026-11-11
 
 This is the second cut of "the descriptor derives the kind once", after
-`2026-11-11-step7-rep-tree-covers-nullable-lists.md` (#7174), whose gap was 5,059 cells. It stacks
-on #7174.
+`2026-11-11-step7-rep-tree-covers-nullable-lists.md` (#7174), whose gap was 5,059 cells.
 
 ## What changed
 
@@ -40,7 +39,7 @@ then keep only coverage and `rdAtom`, and its `repMk` kinds would delete.
 
 ## Proof
 
-- **Probes:** as above, 0 / 0 / 0.
+- **Probes:** as above, 0 / 0 / 0. They read the same again on the tree merged with #7177.
 - **rep-fuzz:** exact. lint-self + fmt are clean, including the kind-ladder budget. The distilled
   `regress.vl` loses no runs. Seed-size is +0.4%.
 - **The corpus identity** is the CI Sweep job's, in the PR.

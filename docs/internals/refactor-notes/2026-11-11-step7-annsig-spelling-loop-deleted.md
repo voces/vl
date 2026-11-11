@@ -74,4 +74,7 @@ name). Census item 5 owns those.
 - **Seed:** 6,617,944 → 6,615,397 bytes (−2,547, one refresh).
 - **Gates:** lint-self + fmt are clean. The dead-export budget is 0 and the render-parse budget is
   unchanged at 62 parses. The distilled `regress.vl` loses no runs; its only movers are the two
-  known `d15317_d380*` cells. The corpus movers are the CI Sweep job's, in the PR.
+  known `d15317_d380*` cells.
+- **CI Sweep** (base `fae58534`): 23,893 of 23,894 the same. There are 0 output movers and 0
+  `runs → not-runs`. The 1 bytes-only mover is the case itself,
+  `closures/hole-fn-in-unannotated-map.vl`, whose orphan row is no longer interned.
