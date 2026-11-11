@@ -1,7 +1,7 @@
-# Step 7 codecs, cut 1: `wasmEmit.vl`'s field-code comparisons ask the field's storage rep, 2026-11-11
+# Step 7 codecs, cut 1: the field-code comparisons in `wasmEmit.vl` and `emit_classify.vl` ask the field's storage rep, 2026-11-11
 
-This is cut 1 of `2026-11-11-step7-codec-field-rep-column-design.md` (#7250), for the
-comparisons in `wasmEmit.vl`. It stacks on #7220.
+This is cut 1 of `2026-11-11-step7-codec-field-rep-column-design.md` (#7250), for the struct-row
+comparisons in `wasmEmit.vl` and `emit_classify.vl`.
 
 ## What changed
 
@@ -19,21 +19,29 @@ type is recorded or the descriptor does not cover it.
   `!= FC_STRUCT` test. A `nulnone` storage is either a hole's record (code 15) or the `null` unit
   (code 37), and only the code tells those apart, so it answers there.
 
+In `emit_classify.vl`, six more convert:
+- `memberUnionFieldName` (2) and `memReadBoxPlan` read `sFieldIsUnionBox`;
+- `optChainStructIdxOf` and `recvFieldStructRow` read `sFieldIsRecordRef`;
+- `memberReadIsLitAtom` reads `sFieldIsPlainI32`.
+
 The other 16 `sFieldTypeAt` reads in `wasmEmit.vl` hand the code to a function that takes a
 code: `emitStructFieldStoreValue`, `emitNulStrFieldRecover`, `fieldCodeNumKind`, and the `codes`
 arrays of the row matchers. They are cut 2 (the transforms) and cut 3 (the arrays).
 
 ## Measurement
 
-`sweep.vl diff`, #7220's fixpoint seed against this one (23,910 programs):
+`sweep.vl diff`. The `wasmEmit.vl` half (#7259) is 23,910 same against #7220's fixpoint. The
+`emit_classify.vl` half missed #7259's merge and lands separately, measured against master
+`0a9e9948`'s fixpoint (23,922 programs):
 
-- **23,910 same**;
+- **23,922 same**;
 - 0 bytes-only movers;
 - 0 output movers;
 - 0 `runs → not-runs`;
 - 0 new compiler traps.
 
-The seed is 6,621,201 bytes (+398 against #7220's 6,620,803), a fixpoint after two refreshes.
+That half's seed is 6,623,270 bytes (−16 against master's 6,623,286), a fixpoint after two
+refreshes.
 
 ## Proof
 
