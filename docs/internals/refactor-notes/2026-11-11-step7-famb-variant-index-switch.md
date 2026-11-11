@@ -38,13 +38,14 @@ the variant. The type says so directly. The spelling said so only when it happen
 ## The deletions
 
 - **`exprVariantIndex`'s pre-mono variant rung.** 140 programs call it before monomorphization,
-  and none passes `nodeRepIs(variant)`. The rung read the type's first name. A pre-mono variant
-  receiver is now an internal emit error, so a future caller fails loudly.
+  and none passes `nodeRepIs(variant)`. The rung read the type's first name. This PR made a
+  pre-mono variant receiver an internal emit error. After #7273, mono's pin naming asks before
+  an instance union's row exists, so #7292 made the rung answer -1 instead.
 - **`mfRecordElemRowName`.** No program reaches it (0 of 23,911). It and its one rung in the
   `.map` result-slot ladder are deleted.
 
-- **`monoArgTyNameProjected`'s nullable-receiver rung** (`emit_mono`), the type's-first-name
-  rung #7279 found unreached. A probe at the record-field arm fired in 4 programs and on a
+- **`monoArgTyNameProjected`'s nullable-receiver rung** (`emit_mono`, a follow-up PR), the
+  type's-first-name rung #7279 found unreached. A probe at the record-field arm fired in 4 programs and on a
   hand-written un-annotated nullable receiver. In every one the receiver's pin named its row, so the
   rung below never ran. It is deleted.
 
@@ -58,6 +59,6 @@ the variant. The type says so directly. The spelling said so only when it happen
 
 ## Proof
 
-- Refresh ×2 is a fixpoint at 6,619,554 bytes (−384). Local sweep, fixpoint seeds on both sides: 23,916 same, 0 movers.
+- Refresh ×2 is a fixpoint at 6,619,677 bytes (−261). Local sweep, fixpoint seeds on both sides: 23,916 same, 0 movers.
 - `regress.vl`, `lint-self`, `cases_wasm`, seed size, late demands, plumb-shape cost, ladder sets,
   the dead-export budget and the memo-generation and live-sites tests pass.
