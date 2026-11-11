@@ -103,5 +103,5 @@ cut 5 is behaviour by construction. Each is graded by the local sweep (velocity 
 
 ## Open, owned elsewhere
 
-D15730 (unfiled: D15730, its row is #7233): `{ k: null }` at an inline `{ k: 1 | 2 | null }`.
+D15730: `{ k: null }` at an inline `{ k: 1 | 2 | null }`.
 Its registry half is w316's, and w314 finishes it after that lands.
