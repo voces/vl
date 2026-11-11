@@ -58,7 +58,7 @@ import {
   recCopyTyOf,
   recordJoinSeen,
 } from "./check_core_state"
-import { canonEmitNameOfTy, canonUnionMembersInto } from "./check_program"
+import { canonEmitNameOfTy } from "./check_program"
 import { recAdAnnDropped } from "./check_rec_adopt_rows"
 import { assignable, substTyDeep } from "./check_relate_core"
 import { isListArmNodes, isVarTyIxOf } from "./check_list_union"
@@ -488,6 +488,8 @@ import {
   sHeapIdx,
   sLateRowsOff,
   sLitIdRow,
+  sLitIdTyRows,
+  sLitIdTys,
   sLitMintFn,
   sLitMintRow,
   sNames,
@@ -586,6 +588,8 @@ import {
 } from "./emit_anon_fields"
 import {
   sFieldElemNameAt,
+  sFieldTypeAt,
+  sNameCanonSet,
   sScanLim,
   sioMemoReset,
   structFieldNameIxReset,
@@ -790,6 +794,7 @@ import {
   tyIsFuncOrNulFunc,
   tyIsNulRefArray,
   tyIsRefArray,
+  tyMentionsLitOrObj,
   tyRegGenNow,
   variantFieldLitRepMixed,
   variantFieldLitRepStrMixed,
@@ -873,7 +878,7 @@ import {
   unRowOfCanonFolded,
   unRowOfKeyOrMembers,
   unVarSliceAdoptKeySibling,
-  unionAtomTysOf,
+  unionAtomTysAlignedOf,
   unionMemberAtomsOf,
   unionSetAtomsOf,
   unionSetAtomsOfTy,
@@ -5210,6 +5215,31 @@ function collectAUnionRows() {
   }
 }
 
+// The list mint's key hint for literal `i`: `arrLitElemHintTy`, else the closed element type the
+// literal is built at, where that type is a closure or a `string` or `u8` list. Any other
+// element keeps the name's key: its row is still read back by that name.
+function arrLitMintHintTy(i: i32): i32 {
+  const h = arrLitElemHintTy(i)
+  if h >= 0 { return h }
+  const e = tyStepElem(arrLitBuildTy(i))
+  if (
+    e < 0
+    || tyHasInferHole(e, 0)
+    || tyHasTyVar(e)
+    || tyMentionsLitOrObj(e, 0)
+  ) {
+    return -1
+  }
+  if tyAt(e) is TyFunc { return e }
+  const leaf = tyStepElem(e)
+  if leaf < 0 { return -1 }
+  const lt = tyAt(leaf)
+  if lt is TyPrim && (lt.primName == "string" || lt.primName == "u8") {
+    return e
+  }
+  -1
+}
+
 // `collectA`'s arm for the list literal at node `i`: the list flags and ref-list rows its
 // element type needs. Never fails.
 function collectAArrayLit(i: i32, nd: ArrayLit) {
@@ -5285,7 +5315,7 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       } else if elemKind != RLK_STRUCT || !arrLitRepElemRow(i) {
         recordArrLitRlSlot(
           i,
-          rlInternNameTy(arrLitElemName(i, -1), elemKind, arrLitElemHintTy(i)),
+          rlInternNameTy(arrLitElemName(i, -1), elemKind, arrLitMintHintTy(i)),
         )
       }
       if elemKind == RLK_STRUCT { arrLitInstElemRows(nd) }
@@ -5674,7 +5704,9 @@ export function collectAnnShapes() {
       // Ahead of the intern, which codes each field: an arm-typed field needs the arm's own
       // row to exist before `armFieldStructRow` is asked for it (D1672).
       internArmFieldShapeTy(root, 0)
-      internShapeDeepTy(tn.tyName, root)
+      // An annotation the checker typed nothing at, such as a type parameter's bound, is not
+      // the type of any value, so it has no shape to intern.
+      if root >= 0 { internShapeDeepTy(tn.tyName, root) }
     }
     ti = ti + 1
   }
@@ -6005,6 +6037,17 @@ function pinSubstObjLitTy(objIx: i32, fnIx: i32, lt: i32): i32 {
   st
 }
 
+// The row a literal holding a tagged set's id at a record type the same as `t` is built at; -1
+// when there is none.
+function litIdRowOfSameTy(t: i32): i32 {
+  let i = 0
+  while i < sLitIdTys.length && i < sLitIdTyRows.length {
+    if tySame(sLitIdTys[i], t) { return sLitIdTyRows[i] }
+    i = i + 1
+  }
+  -1
+}
+
 // Interns the row of the record literal at `objIx` at instance `fnIx`'s pins, when a field of
 // its recorded type is a type parameter and every such field's value has a pin.
 function mintPinnedObjLit(objIx: i32, fnIx: i32) {
@@ -6049,8 +6092,20 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
     }
     // Another literal's row already denoting the instance's record type is this one's too.
     const lro = lr >= 0 && lr < T.tys.length && tyAt(lr) is TyObj
-    const known = if lro { structIndexOfTy(lr) } else { -1 }
-    if !sLitIdRow.has(objIx) && known >= 0 { sLitIdRow.set(objIx, known) }
+    let known = if lro { structIndexOfTy(lr) } else { -1 }
+    // So is the row a literal of the same record type in another function is built at.
+    if known < 0 && lro && !sLitIdRow.has(objIx) {
+      known = litIdRowOfSameTy(lr)
+      if known >= 0 {
+        structTyMarkAliasable(lr)
+        structTyIxAlias(lr, known)
+      }
+    }
+    if !sLitIdRow.has(objIx) && known >= 0 {
+      sLitIdRow.set(objIx, known)
+      sLitIdTys.push(lr)
+      sLitIdTyRows.push(known)
+    }
     // So is the row another instance builds this literal at, which this instance's record type
     // then denotes too (D15638).
     const had = sLitIdRow.get(objIx) ?? -1
@@ -6069,6 +6124,8 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
         if lr >= 0 && lr < T.tys.length && tyAt(lr) is TyObj {
           structTyMarkAliasable(lr)
           structTyIxAlias(lr, sNames.length - 1)
+          sLitIdTys.push(lr)
+          sLitIdTyRows.push(sNames.length - 1)
         }
       }
       // Instances holding no id keep the literal's own mint (-1 for none).
@@ -6843,6 +6900,8 @@ function structTableReset() {
   sLitMintRow = Map()
   sLitMintFn = Map()
   sLitIdRow = Map()
+  sLitIdTys = []
+  sLitIdTyRows = []
   sFieldNames = []
   sFieldStart = []
   sFieldCount = []
@@ -6859,6 +6918,46 @@ function structTableReset() {
 }
 
 // ── struct-type collection ───────────────────────────────────────────────────
+// Maps each declared row in `lo` to `hi` onto the first earlier one of the same canonical type
+// whose field rows are identical, so two same-shape declarations answer one row.
+function declTwinRowsCanon(lo: i32, hi: i32) {
+  let j = lo + 1
+  while j < hi {
+    let i = lo
+    while i < j {
+      if declRowsTwin(i, j) {
+        sNameCanonSet(sNames[j], i)
+        i = j
+      } else {
+        i = i + 1
+      }
+    }
+    j = j + 1
+  }
+  0
+}
+
+// Whether declared rows `i` and `j` hold one canonical type at one layout.
+function declRowsTwin(i: i32, j: i32): boolean {
+  if i >= sTyIx.length || j >= sTyIx.length || j >= sFieldCount.length {
+    return false
+  }
+  const a = sTyIx[i]
+  const b = sTyIx[j]
+  if a < 0 || b < 0 || !tySame(a, b) { return false }
+  if sFieldCount[i] != sFieldCount[j] { return false }
+  let k = 0
+  while k < sFieldCount[i] {
+    const fa = sFieldStart[i] + k
+    const fb = sFieldStart[j] + k
+    if sFieldNames[fa] != sFieldNames[fb] { return false }
+    if sFieldTypeAt(i, k) != sFieldTypeAt(j, k) { return false }
+    if sFieldElemName[fa] != sFieldElemName[fb] { return false }
+    k = k + 1
+  }
+  true
+}
+
 // Scans top-level statements for every struct `type` declaration into the flat multi-struct
 // table; each interns its own WasmGC struct heap type, and a field whose type has no code
 // fails loudly. Then runs the shape passes in order. Returns 0, or -1 (via `emitFail`).
@@ -6869,6 +6968,7 @@ export function collectS(stmts: i32[]) {
   sioMemoReset()
   anonShapesNodeLen = 0
   structTableReset()
+  const declLo = sNames.length
   // Nested inline-shape field types intern first, so the struct decls that reference them resolve.
   collectNestedFieldShapes(stmts)
   // A `type X = {…}` that is a union variant is collected by `collectU` instead, not here; any
@@ -6983,6 +7083,7 @@ export function collectS(stmts: i32[]) {
   // D1050 — gives a mixed-spelling pair one layout now both field tables are complete, before
   // the shape passes below re-lay a row a shape could otherwise twin onto.
   if unifyMixedLitRepArms() < 0 { return -1 }
+  declTwinRowsCanon(declLo, sNames.length)
   // Generic-alias application shapes next: the declared structs they may reference are
   // interned above, so their names resolve as code-15 struct-ref fields.
   gaeCollectDecls(stmts)
@@ -7774,48 +7875,6 @@ function isVariantBoxUnionOfTy(
   isVariantBoxUnionAtoms(stmts, atoms, tys)
 }
 
-// Pushes the arena type of each atom of `atoms`, a spelling of union type `ty`, onto `out`: the
-// canonical member whose atom spells the same, so a pin that spells the members in another
-// order still pairs each atom with its own type. When some atom spells no canonical member,
-// the atoms pair by position (`unionAtomTysOf`).
-function unionAtomTysAlignedOf(ty: i32, atoms: string[], out: i32[]): i32 {
-  const cTys: i32[] = []
-  const cAtoms: string[] = []
-  if (
-    atoms.length > 1
-    && canonUnionMembersInto(ty, cTys, cAtoms)
-    && cAtoms.length == cTys.length
-  ) {
-    const used: boolean[] = []
-    for _c in cAtoms { used.push(false) }
-    const got: i32[] = []
-    let all = true
-    for a in atoms {
-      let at = -1
-      if a != "null" {
-        let hit = -1
-        let k = 0
-        while k < cAtoms.length && hit < 0 {
-          if !used[k] && cAtoms[k] == a { hit = k }
-          k = k + 1
-        }
-        if hit < 0 {
-          all = false
-        } else {
-          used[hit] = true
-          at = cTys[hit]
-        }
-      }
-      got.push(at)
-    }
-    if all {
-      for g in got { out.push(g) }
-      return 0
-    }
-  }
-  unionAtomTysOf(ty, atoms, out)
-}
-
 // `registerInlineUnionAt`'s pass over the atoms of a union of two or more: refuses a map
 // member beside another non-null member that cannot box, and registers each ref-array atom's
 // element union and each map atom's value union. Returns 0, or -1 (via `emitFail`).
@@ -7849,7 +7908,7 @@ function registerInlineUnionAtoms(
     }
   }
   const mtys: i32[] = []
-  unionAtomTysOf(sty, matoms, mtys)
+  unionAtomTysAlignedOf(sty, matoms, mtys)
   // A ref-array atom's element union needs registration too, since it is not a standalone
   // annotation the recursions below would otherwise reach. Non-returning: the outer union
   // still registers through the dispatch below.
@@ -9589,7 +9648,7 @@ function nulCloMixedUnionUnregistered(arm: string, ty: i32) {
     if ft is TyFunc { rt = ft.fnRet } else { rt = -1 }
   }
   const tys: i32[] = []
-  unionAtomTysOf(rt, atoms, tys)
+  unionAtomTysAlignedOf(rt, atoms, tys)
   let hasScalar = false
   let hasComposite = false
   let i = 0
