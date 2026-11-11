@@ -29,4 +29,4 @@ list already ran. `--names` build of the hole-callee repro: `$id1` is `(param i3
 its closure thunk `return_call`s it at `(structref, i32) => i32`. No set is tagged here because the
 checker closed the join's type, the same lowering as the `c: boolean` spelling.
 
-This closes the hole-callee spelling filed on PR #7136 too. That row's status flips once both land.
+[D15658](../inventory/D15658.md), the hole-callee spelling, closes with it.
