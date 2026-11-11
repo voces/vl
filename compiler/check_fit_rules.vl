@@ -4579,8 +4579,23 @@ function recAnnArgTakesRep(x: i32, rep: i32): boolean {
   true
 }
 
+// `recAnnArgTakesRep` for a binding read `x` the store column holds at `rep`, where the parameter
+// is the read's own type and so stores no field the way `rep` does (D15695).
+export function recHeldArgTakesRep(x: i32, rep: i32): boolean {
+  if !recAnnArgRepBy(x, rep, true) { return false }
+  const c = nodeAt(cwIxUp[x])
+  const fd = if c is Call { identBoundFnDeclOf(c.callFn) } else { -1 }
+  recArgRepNote(x, fd, rep)
+  true
+}
+
 // `recAnnArgTakesRep` without noting the argument.
 function recAnnArgRepOk(x: i32, rep: i32): boolean {
+  recAnnArgRepBy(x, rep, false)
+}
+
+// `recAnnArgRepOk`; with `held`, the parameter is `x`'s own type rather than a narrower record.
+function recAnnArgRepBy(x: i32, rep: i32, held: boolean): boolean {
   if x < 0 || !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_ARG { return false }
   const c = nodeAt(cwIxUp[x])
   if !(c is Call) || c.callFn < 0 { return false }
@@ -4599,8 +4614,15 @@ function recAnnArgRepOk(x: i32, rep: i32): boolean {
   const par = f.fnParams[i]
   const pn = nodeAt(par)
   if !(pn is Param) || pn.parType < 0 { return false }
-  const list = recListRepWider(nodeTyIxOf(par), rep)
-  if !list && !recRepWider(nodeTyIxOf(par), rep) { return false }
+  const pt = nodeTyIxOf(par)
+  const list = !held && recListRepWider(pt, rep)
+  const ownRow = held
+    && pt >= 0
+    && pt < T.tys.length
+    && tySame(pt, nodeTyIxOf(x))
+    && tyAt(pt) is TyObj
+    && objFieldNameSetsEq(pt, rep)
+  if !list && !ownRow && !recRepWider(pt, rep) { return false }
   cwIxBuild()
   let used = false
   const ow = cwOccWalk(par)
@@ -4690,6 +4712,35 @@ function recBuiltReadErr(
       + "` is stored differently there and no converting copy exists",
     at,
   )
+}
+
+// Refuses each read of the list binding `md`, built at another record, that is the receiver of a
+// `map` or `filter`: the callback takes the list's own element type, which stores a field
+// differently from the build (D15697).
+export function recBuiltCallbackRefuse(md: i32) {
+  const bt = recBuildPassAt(md)
+  if bt < 0 || bt >= T.tys.length { return 0 }
+  cwIxBuild()
+  const ow = cwOccWalk(md)
+  while cwOccNext(ow) {
+    const u = if cwIxKind[ow.row] == CW_OCC_USE { cwIxNode[ow.row] } else { -1 }
+    const m = if u >= 0 && cwIxCovers(u) && cwIxUpKind[u] == CW_UP_OBJ { cwIxUp[u] } else { -1 }
+    const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+    const own = if u >= 0 { nodeTyIxOf(u) } else { -1 }
+    const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+    if (
+      mn is Member
+      && (mn.memProp == "map" || mn.memProp == "filter")
+      && cwIxCovers(m)
+      && cwIxUpKind[m] == CW_UP_CALLEE
+      && ot is TyArray
+      && ot.aElem >= 0
+      && !fieldStorageEq(ot.aElem, bt, REC_STORE_DEPTH)
+    ) {
+      recBuiltReadErr(u, own, ot.aElem, bt, true)
+    }
+  }
+  0
 }
 
 // The element record the stores into the list or map binding `x` names build, else -1. This
