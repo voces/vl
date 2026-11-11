@@ -480,7 +480,6 @@ import {
   drwSelfFnOf,
   fnDeclNamed,
   synthTypeRefOfTy,
-  voidTwinSeamNote,
 } from "./emit_rewrite"
 import {
   FC_STRUCT,
@@ -489,7 +488,6 @@ import {
   cboxCellLits,
   emitCurStmtIx,
   emitRootIx,
-  fRetVoid,
   fmResumeArmed,
   fnChildHead,
   fnChildNext,
@@ -8257,7 +8255,6 @@ export function monoStateReset() {
   monoPinLetReaches = false
   monoShParNode = -1
   monoShTy = -1
-  monoSigCallRet = 0 - 2
   monoWriteCoercedCall = -1
   structTyAliasableReset()
   0
@@ -11123,12 +11120,9 @@ function monoCallWrittenLet(ix: i32, ctx: i32): i32 {
   if pins.length != 1 { return 0 }
   for t in monoPinFnParamTys(lf[1], [], pins[0]) { dTys.push(t) }
   const ct = monoSlotPinAnn(lf, [], pins[0], "void")
-  const prev = monoSigCallRet
-  monoSigCallRet = nodeTyIxOf(ix)
   monoCellSigByCall = true
   monoCoerceWrittenLetTys(n.callFn, ctx, ct, dTys, fts[0], [])
   monoCellSigByCall = false
-  monoSigCallRet = prev
   // An `if` seed leaves the binding's type open, as a name seed does not.
   if nodeAt(unwrapParen(d.letInit)) is IfStmt {
     monoRetypeIfInit(d.letInit, g0, n.callFn, lf[0])
@@ -16461,21 +16455,12 @@ function monoCoerceWrittenLetTys(
   monoCellSigByCall = false
   monoWrittenLetBusy.push(lf[1])
   monoLastInstFe = -1
-  // A binding seeded with a function that returns nothing drops the result of every function
-  // written to it, hole ones too (owner ruling B2, D15015).
-  const ix0 = unwrapParen(d.letInit)
-  const sd = if ix0 >= 0 && nodeAt(ix0) is Ident { identDeclOf(ix0) } else { -1 }
-  const st = if sd >= 0 && sd < P.nodes.length && nodeAt(sd) is FuncDecl { nodeTyIxOf(sd) } else { -1 }
-  const sf = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
-  const holes = sf is TyFunc && sf.fnRet == TY_VOID
   monoCoerceNamedGenericTys(d.letInit, tname, lf[0], delTys, tnameTy)
-  monoNoteVoidTwin(d.letInit, tname, tnameTy, lf[0], holes)
   for i in monoWritesOf("n:", lf[1]) {
     const nd = nodeAt(i)
     const wf = monoLetWriteFrame(lf, i)
     if nd is BinExpr && wf.length == 1 {
       monoCoerceNamedGenericTys(nd.binRight, tname, wf[0], delTys, tnameTy)
-      monoNoteVoidTwin(nd.binRight, tname, tnameTy, wf[0], holes)
       // The binding's own call is the type a hole lambda literal written to it is called at.
       if byCall {
         monoLamLitTakeTys(nd.binRight, tname, wf[0], delTys, tnameTy)
@@ -16484,35 +16469,6 @@ function monoCoerceWrittenLetTys(
   }
   monoWrittenLetBusy.pop()
   true
-}
-
-// Notes value `v`, read in frame `ctx`, for its instance's void twin where it names a declared
-// generic's instance that returns a value and the slot it is delivered to, the binding's own call
-// or a write's pin at type `tname`, returns nothing (D3969, D14785); a hole function's too when
-// `holes`, the binding being seeded with a function that returns nothing.
-function monoNoteVoidTwin(
-  v: i32,
-  tname: string,
-  ft: i32,
-  ctx: i32,
-  holes: boolean,
-) {
-  const x = unwrapParen(v)
-  if x < 0 || !monoSigRetVoid(tname) { return 0 }
-  if !monoNamesGenericInstance(x, ctx) && !monoNamesDeclaredGeneric(x, ctx) {
-    return 0
-  }
-  const n = nodeAt(x)
-  if !(n is Ident) { return 0 }
-  const fe = monoFnFeOfIdent(x, n.identName, ctx)
-  if fe < 0 || fe >= fnStmts.length { return 0 }
-  if fe >= fRetVoid.length || fRetVoid[fe] != 0 { return 0 }
-  // Otherwise a hole function is a set member its own rep answers; a declared generic is twinned.
-  const o = if fe < fnInstOrigin.length && fnInstOrigin[fe] >= 0 { fnInstOrigin[fe] } else { fe }
-  const on = if o >= 0 && o < monoOrigNode.length { monoOrigNode[o] } else { -1 }
-  const od = if on >= 0 && on < P.nodes.length { nodeAt(on) } else { n }
-  if !(od is FuncDecl) || (od.fnTyParams.length == 0 && !holes) { return 0 }
-  voidTwinSeamNote(x, fe, tname, ft)
 }
 
 // The closed pins the written `let` `lf` is delivered at, at the slot `path` derives from it.
@@ -16928,27 +16884,6 @@ function monoFnNameSig(tname: string): string {
   let sig = ""
   for pt in parts { sig = sig + normTypeAtom(pt) + "," }
   sig
-}
-
-// The result type of the call whose signature is being recorded; -2 outside one, where a
-// signature's own function type spells its result.
-let monoSigCallRet = 0 - 2
-
-// Whether the signature recorded now, of function type `tname`, returns nothing: only then may it
-// join another, since an argument converted to the joined type would come back unconverted.
-function monoSigRetVoid(tname: string): boolean {
-  const rt = monoSigCallRet
-  if rt == -2 {
-    const parts: string[] = []
-    return normTypeAtom(
-      annFnDecompose(peelGroupParens(nonNulBaseOf(tname)), parts),
-    )
-      == "void"
-  }
-  if rt < 0 || rt >= T.tys.length { return false }
-  const t = tyAt(rt)
-  if t is TyPrim { return t.primName == "void" }
-  false
 }
 
 // Set by a call through a written `let` just before it coerces the `let` at the call's type;
@@ -21970,15 +21905,12 @@ function monoCellCall(
     ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
     ctnTys = monoInstParamPinTys(monoLastInstFe)
   }
-  const prev = monoSigCallRet
-  monoSigCallRet = nodeTyIxOf(ix)
   if ctn != "" && (live || sfe >= 0) {
     monoCoerceWrittenCell(at, cctx, ctn, ctnTys)
   }
   // One cell holds one signature: a second call type is the binding conflict, refused.
   let rc = 0
   if ctn != "" && sfe >= 0 { rc = monoNoteBindDeliveryAt(at, ctn, cctx, -1) }
-  monoSigCallRet = prev
   if rc < 0 { return -1 }
   0
 }
@@ -22527,7 +22459,6 @@ function monoWalk(ix: i32, ctx: i32) {
           // binding at in this frame (D3957), a hole lambda literal written there included; one
           // written at two types is left to the binding's own two-signature refusal.
           let byPin = false
-          let byStamp = false
           const atTys: i32[] = []
           // The function type `atn` is spelled from.
           const atFt: i32[] = []
@@ -22536,7 +22467,6 @@ function monoWalk(ix: i32, ctx: i32) {
             atn = monoConcreteFnTyName(ast)
             atFt.push(ast)
             byPin = true
-            byStamp = true
           } else if atn == "" {
             atn = monoPlacePinNameTys(n.binLeft, "", ctx, atTys, atFt)
             byPin = true
@@ -22549,11 +22479,7 @@ function monoWalk(ix: i32, ctx: i32) {
             if monoCoerceFnValueTys(n.binRight, atn, ctx, -1, atTys, att) < 0 {
               return -1
             }
-            if byPin {
-              monoLamLitTake(n.binRight, atn, ctx, att)
-              // A generic returning a value, written where its stamp returns nothing, is twinned.
-              if byStamp { monoNoteVoidTwin(n.binRight, atn, att, ctx, false) }
-            }
+            if byPin { monoLamLitTake(n.binRight, atn, ctx, att) }
             if !byPin && monoDeliverCallAt(n.binRight, atn, att) < 0 {
               return -1
             }
@@ -22977,12 +22903,9 @@ function monoWalkIdentCall(
       // The call keeps its `call_ref` through a written `let`, so each generic written to it
       // takes the signature the elaboration instanced it at through this call (D3961).
       if ri >= 0 && !direct && monoLastInstFe >= 0 {
-        const prev = monoSigCallRet
-        monoSigCallRet = nodeTyIxOf(ix)
         monoCellSigByCall = true
         monoCoerceWrittenLetTys(wlAt, wlFr, "", [], -1, [ix, ctx])
         monoCellSigByCall = false
-        monoSigCallRet = prev
       }
       return ri
     }
@@ -25565,7 +25488,6 @@ export function monomorphize(stmts: i32[]) {
   monoBindCalled = Map()
   monoRetDeliveredAt = Map()
   monoCellCoercedSig = Map()
-  monoSigCallRet = -2
   monoHoleLamSlots = Map()
   monoBuiltinCbLamsBuilt = false
   monoDeliveredArgs = []
