@@ -31,7 +31,7 @@ import {
   rlElemKindAt,
 } from "./emit_rep"
 import {
-  MfKind,
+  ListKind,
   RLK_MAP,
   VKind,
   liBack,
@@ -169,7 +169,12 @@ export function unionStoreAtomKindOfSet(
 
 // The row of the (kind, ref-list slot) pair in the parallel frame tables `kinds`/`slots`, or
 // -1 when no frame requirement records it.
-function mfFrameIndex(kinds: MfKind[], slots: i32[], kind: MfKind, slot: i32) {
+function mfFrameIndex(
+  kinds: ListKind[],
+  slots: i32[],
+  kind: ListKind,
+  slot: i32,
+) {
   let i = 0
   while i < kinds.length {
     if kinds[i] == kind && slots[i] == slot { return i }
@@ -179,7 +184,7 @@ function mfFrameIndex(kinds: MfKind[], slots: i32[], kind: MfKind, slot: i32) {
 }
 
 // Record a distinct (kind, ref-list slot) source frame requirement.
-export function mfRecordSrc(kind: MfKind, slot: i32) {
+export function mfRecordSrc(kind: ListKind, slot: i32) {
   if mfFrameIndex(mfSrcKinds, mfSrcSlots, kind, slot) >= 0 { return 0 }
   mfSrcKinds.push(kind)
   mfSrcSlots.push(slot)
@@ -189,7 +194,7 @@ export function mfRecordSrc(kind: MfKind, slot: i32) {
 // Record a distinct (result-element-kind, ref-list slot) dest frame requirement. `slot` is
 // the ref-list table slot for a kind-2 (ref-list) dest (so two struct-array filters of
 // different element types get distinct backing locals), -1 for a non-ref dest.
-export function mfRecordDst(kind: MfKind, slot: i32) {
+export function mfRecordDst(kind: ListKind, slot: i32) {
   if mfFrameIndex(mfDstKinds, mfDstSlots, kind, slot) >= 0 { return 0 }
   mfDstKinds.push(kind)
   mfDstSlots.push(slot)
@@ -197,14 +202,14 @@ export function mfRecordDst(kind: MfKind, slot: i32) {
 }
 
 // The wasm local holding the source wrapper ref for (kind, slot), or -1.
-export function mfSrcLocalFor(kind: MfKind, slot: i32) {
+export function mfSrcLocalFor(kind: ListKind, slot: i32) {
   const i = mfFrameIndex(mfSrcKinds, mfSrcSlots, kind, slot)
   if i >= 0 && i < mfSrcBases.length { return mfSrcBases[i] }
   -1
 }
 
 // The wasm local holding the dest backing ref for result (kind, slot), or -1.
-export function mfDstLocalFor(kind: MfKind, slot: i32) {
+export function mfDstLocalFor(kind: ListKind, slot: i32) {
   const i = mfFrameIndex(mfDstKinds, mfDstSlots, kind, slot)
   if i >= 0 && i < mfDstBases.length { return mfDstBases[i] }
   -1
@@ -518,27 +523,27 @@ export type StashWant = "rebox" | "optrecv" | "listget"
 
 // The bounds-check frame kind for a scalar list element kind (`scalarListElemKind`
 // only ever yields the four scalar members of `VKind`).
-export function listIdxKindOf(ek: VKind): MfKind {
+export function listIdxKindOf(ek: VKind): ListKind {
   // The packed byte list's frame slots must carry its own heap types (`bl8`/`ba8`), not the
-  // i32 list's — the `"i32"` default below would type the hoisted wrapper local
+  // i32 list's — the `"list"` default below would type the hoisted wrapper local
   // `(ref null $lTypeIdx)` and store a `(ref $bl8TypeIdx)` into it.
   match ek {
     "u8list" => {
-      return "u8"
+      return "u8list"
     }
     "f64" => {
-      return "f64"
+      return "f64list"
     }
     "i64" => {
-      return "i64"
+      return "i64list"
     }
     "f32" => {
-      return "f32"
+      return "f32list"
     }
     // `i32` takes the default; no other kind is a scalar list element
     "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {}
   }
-  "i32"
+  "list"
 }
 
 // Which columns join the `liBack` code in a stash's match: the code alone, the code and
@@ -554,7 +559,7 @@ export const SCRATCH_BY_BOTH = 3
 // now as the row `(kind, key, code)`. A column `by` does not key on is still WRITTEN, so a
 // row always reads back the valtype it reserved. Slot 0 of the frame is the shared i32
 // index stash, so row k is slot `listIdxScratchBase + 1 + k`.
-export function scratchSlot(code: i32, kind: MfKind, key: i32, by: i32) {
+export function scratchSlot(code: i32, kind: ListKind, key: i32, by: i32) {
   let k = 0
   while k < liKinds.length {
     if liBack[k] == code {
@@ -579,7 +584,7 @@ export function scratchSlot(code: i32, kind: MfKind, key: i32, by: i32) {
 // for kind "ref", else 0), code 0 — the one stash keyed on both columns, since a wrapper's
 // heap type comes from the kind and its ref-list row together. Handed out during lowering:
 // first-use order is what keeps the layout deterministic.
-export function listIdxWrapSlot(kind: MfKind, slot: i32) {
+export function listIdxWrapSlot(kind: ListKind, slot: i32) {
   scratchSlot(0, kind, slot, SCRATCH_BY_BOTH)
 }
 
@@ -588,70 +593,72 @@ export function listIdxWrapSlot(kind: MfKind, slot: i32) {
 // eagerly reserved: whether a read is "shared" depends on `is`-narrowing, which a pre-pass
 // runs before and so cannot see.
 export function sharedFieldRecvSlot() {
-  scratchSlot(7, "i32", 0, SCRATCH_BY_CODE)
+  scratchSlot(7, "list", 0, SCRATCH_BY_CODE)
 }
 
 // The closure stash of a function-value call lowered inside another's arguments, code 23,
 // keyed by nesting depth so siblings share a slot and an inner call never writes the outer
 // call's (D2329). `(ref null $cloStruct)`, minted on first use, so depth 0 is a slot too.
 export function callRefNestSlot(depth: i32) {
-  scratchSlot(23, "i32", depth, SCRATCH_BY_KEY)
+  scratchSlot(23, "list", depth, SCRATCH_BY_KEY)
 }
 
 // The map struct local of mv slot `slot`, minted on first use in this function.
 export function fnMvMapRefLocal(slot: i32) {
-  scratchSlot(34, "i32", slot, SCRATCH_BY_KEY)
+  scratchSlot(34, "list", slot, SCRATCH_BY_KEY)
 }
 
 // The values-backing local of mv slot `slot`, minted on first use.
 export function fnMvValsBkLocal(slot: i32) {
-  scratchSlot(35, "i32", slot, SCRATCH_BY_KEY)
+  scratchSlot(35, "list", slot, SCRATCH_BY_KEY)
 }
 
 // The value stash of mv slot `slot` (a scalar for an f64/f32/i64 value), minted on first use.
 export function fnMvValStashLocal(slot: i32) {
-  scratchSlot(36, "i32", slot, SCRATCH_BY_KEY)
+  scratchSlot(36, "list", slot, SCRATCH_BY_KEY)
 }
 
 // The `m.values()` output backing local of mv slot `slot`, minted on first use.
 export function fnMvValsOutLocal(slot: i32) {
-  scratchSlot(37, "i32", slot, SCRATCH_BY_KEY)
+  scratchSlot(37, "list", slot, SCRATCH_BY_KEY)
 }
 
 // Slot `k` of the i32-keyed map frame, minted on first use: 0 the key, 1 the keys backing,
 // 2 and 3 the key-list builder's backings, 4 the map struct.
 export function mapI32KeyLocal(k: i32) {
-  scratchSlot(38, "i32", k, SCRATCH_BY_KEY)
+  scratchSlot(38, "list", k, SCRATCH_BY_KEY)
 }
 
 // Slot `k` of the i64-keyed map frame, laid out as `mapI32KeyLocal`'s.
 export function mapI64KeyLocal(k: i32) {
-  scratchSlot(39, "i32", k, SCRATCH_BY_KEY)
+  scratchSlot(39, "list", k, SCRATCH_BY_KEY)
 }
 
 // The `.map`/`.filter` callback closure, `(ref $cloStruct)`, minted on first use: a function
 // whose frame only `slice` uses declares no closure slot.
-export function mfCallbackLocal() { scratchSlot(40, "i32", 0, SCRATCH_BY_CODE) }
+export function mfCallbackLocal() {
+  scratchSlot(40, "list", 0, SCRATCH_BY_CODE)
+}
 
 // The union-`as` box stash, code 30: a non-null `(ref $uBoxIdx)` (an i32 when the module
 // mints no box), `local.set` before every read. Minted on first use, so a function that never
 // lowers a union `as` declares no slot for it.
-export function unionAsBoxSlot() { scratchSlot(30, "i32", 0, SCRATCH_BY_CODE) }
+export function unionAsBoxSlot() { scratchSlot(30, "list", 0, SCRATCH_BY_CODE) }
 
 // The numeric exact-or-fail `as` operand stash, code 31, keyed by source rep: 0 f64, 1 f32,
 // 2 i64. The exactness test reads the staged operand up to three times.
 export function numCastStashSlot(which: i32) {
-  scratchSlot(31, "i32", which, SCRATCH_BY_KEY)
+  scratchSlot(31, "list", which, SCRATCH_BY_KEY)
 }
 
 // The `fromCodePoints` argument spill, code 32: a `(ref null $lTypeIdx)` holding a list
 // argument that is not a re-readable name, so its backing and length come off one evaluation.
 export function fcpSpillStashSlot() {
-  scratchSlot(32, "i32", 0, SCRATCH_BY_CODE)
+  scratchSlot(32, "list", 0, SCRATCH_BY_CODE)
 }
 
 // The integer `min` / `max` / `abs` operand stash, code 33, keyed 0 and 1 for the two i32
 // operands and 2 and 3 for the two i64 ones.
 export function intMinMaxStashSlot(which: i32) {
-  scratchSlot(33, "i32", which, SCRATCH_BY_KEY)
+  scratchSlot(33, "list", which, SCRATCH_BY_KEY)
 }
