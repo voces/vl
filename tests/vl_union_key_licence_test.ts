@@ -1,14 +1,13 @@
-// THE UNION KEY'S LICENCE: two rows minted under one `unKey` describe one union.
+// THE UNION KEY'S LICENCE: two rows under one type key (`unTyKey`) describe one union.
 //
-// Step 5 of the registry-by-key migration (docs/internals/registry-by-type-id.md §5) lets a
-// seam return "the first row carrying this key" in place of the row its name finds. That is
-// sound only while every pair of rows sharing a key agrees on BOTH halves of what a tag
-// means: the member-set string (`keySweep/merge-diffset`, a value union's atoms) and the
-// variant slice (`keySweep/merge-diffvar`, a struct union's positional tags — D1492 was the
-// last pair to disagree). The sweep runs under `$VL_REP_SHADOW`, and only a program whose
-// rows share a key (`keySweep/merge`) can reach either half, so the witness list is every
-// `tests/cases` program that did, plus D1492's own. `VL_UNION_LICENCE_FULL=1` sweeps all
-// of `tests/cases` instead.
+// A typed lookup returns "the first row carrying this type key", which is sound only while
+// every pair of rows sharing a key agrees on BOTH halves of what a tag means: the member-set
+// string (`keySweep/merge-diffset`, a value union's atoms) and the variant slice
+// (`keySweep/merge-diffvar`, a struct union's positional tags). Two rows under one type key
+// that differ is the D1712 hazard: one union is one set, so one row. The sweep runs under
+// `$VL_REP_SHADOW`; `keySweep/merge` counts the keyed pairs it compares. The control is the one
+// known pair, D15761's record twins, pinned at its counts, so the compare is shown to be reached
+// and any other pair fails. `VL_UNION_LICENCE_FULL=1` sweeps all of `tests/cases` instead.
 import { filePath } from "./support/filePath.ts";
 const ROOT = filePath(new URL("..", import.meta.url)).replace(/[\\/]$/, "");
 const VL = `${ROOT}/scripts/vl-host/target/release/vl${
@@ -16,10 +15,13 @@ const VL = `${ROOT}/scripts/vl-host/target/release/vl${
 }`;
 const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const WITNESSES = `${ROOT}/tests/fixtures/union-key-licence/witnesses.txt`;
-// A struct union still minted as two rows under one key. D1492's own pair, `type AS = (Sc | Dg)`
-// beside the inline `Sc | Dg`, is one row now that a union names the row of its type key, and
-// so are the literal-alias twins (`{kind: KC}` beside `{kind: "circle"}`, D15082).
-const CONTROL = "tests/cases/unions/discriminated-union-tag-read.vl";
+// The one known pair under one type key, D15761: `Cat | Kot` and `Cat | { m: i32 }` key alike.
+// Its counts are pinned, so the compare is reached and a change to the pair is seen.
+const CONTROL = "tests/cases/unions/variant-twin-scalar-spellings.vl";
+const CONTROL_COUNTS: Record<string, number> = {
+  "keySweep/merge-diffset": 1,
+  "keySweep/merge-diffvar": 1,
+};
 const POOL = 4;
 
 const exists = (p: string) => {
@@ -69,7 +71,7 @@ const sweep = async (rel: string, dir: string, i: number) => {
 
 Deno.test({
   name:
-    "union key licence: no two rows sharing a key differ in member set or variant slice",
+    "union key licence: no two rows sharing a type key differ in member set or variant slice",
   ignore: !ENABLED,
   fn: async () => {
     const full = Deno.env.get("VL_UNION_LICENCE_FULL") === "1";
@@ -110,8 +112,11 @@ Deno.test({
           for (
             const half of ["keySweep/merge-diffset", "keySweep/merge-diffvar"]
           ) {
-            if (counts[half]) {
-              bad.push(`${rel}: want ${half} 0, got ${counts[half]}`);
+            const want = rel === CONTROL ? CONTROL_COUNTS[half] : 0;
+            if ((counts[half] ?? 0) !== want) {
+              bad.push(
+                `${rel}: want ${half} ${want}, got ${counts[half] ?? 0}`,
+              );
             }
           }
           if (rel === CONTROL && !(counts["keySweep/merge"] >= 1)) {
