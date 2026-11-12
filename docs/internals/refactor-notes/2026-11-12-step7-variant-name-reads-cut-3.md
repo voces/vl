@@ -27,7 +27,10 @@ keeps -1, the value it always had.
 
 Only `mvValArmOfShapeTy` used the arm scan `variantRowScanOfTyK`. Only that scan used the
 field-fit chain `jrFieldFitsAt`, `jrWantOf`, `jrUnionWantOf`, `jrLitAtomOf` and `jrMapValFits`.
-All are deleted, 230 lines in `emit_shape_rows`. The arena-scan ratchet falls from 24 to 21:
+All are deleted, 230 lines in `emit_shape_rows`. With them go the eight `emit_join_records`
+exports only that chain called: `jrPrimCode`, `jrListCode`, `jrNullableOf`, `jrIsRecord`,
+`jrIsBoolean`, `jrRetIsNullable`, `jrCanonFits` and `jrBoxFits`. CI's dead-export budget named
+them, and it reads 0 again. The arena-scan ratchet falls from 24 to 21:
 `variantRowScanOfTyK`'s `uVariants` loop goes with this cut, and `repStructRowByName`'s `sNames`
 loop went with #7615. The third fall, in `emit_obj_lit_fits`, came from master. The baseline is
 written.
@@ -36,6 +39,8 @@ written.
 
 - Refresh ×2 is a fixpoint at 6,716,925 bytes, −2,998 against master's 6,719,923.
 - Sweep against master's fixpoint seed: **24,189 same**, 0 bytes-only movers, 0 output movers.
+- Merged with master `49bcc3dc`, with the dead exports deleted: a fixpoint at 6,712,375 bytes,
+  −3,116 against master's 6,715,491. The sweep is **24,191 same**, and the export budget is 0.
 - Merged with master `8e0bb32c`: #7618 had edited the `jr*` chain, which stays deleted. The fixpoint
   is 6,713,194 bytes, −2,996 against master's 6,716,190, and the sweep is again 24,189 same.
 - lint-self is clean, and `regress.vl` lost no runs.
