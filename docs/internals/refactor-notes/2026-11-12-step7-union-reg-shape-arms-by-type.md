@@ -22,3 +22,19 @@ type path gave the same member types in the same order in all 37.
 row and the bound row both miss there, so the text answers, and the site stays until its
 callers hand it a type that keys. The other three (`unionArmMemberTys`, `unionArmTys` for an
 unbound name, the `emit_union_registry` prim-arm test) hold only text.
+
+## Proof
+
+- **Local full sweep**, `sweep.vl record` with fixpoint seeds on both sides, against master
+  `528cbd71`:
+
+  ```
+  same                            23958
+  bytes-only movers                   0
+  output movers                       0
+  runs -> not-runs  (blocking)        0
+  new compiler traps  (blocking)      0
+  ```
+- **Locally:** lint-self, rep-fuzz, `cases_wasm`, the memo-generation, state-audit and scaling
+  tests, emitter-state-audit, capability probes (`--live-sites`, `--floor`), splice-scan,
+  seed-size, late-demands, and the dead-export and render-parse budgets.
