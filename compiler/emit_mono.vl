@@ -220,6 +220,7 @@ import {
   TY_I32,
   TY_NEVER,
   TY_NULL,
+  TY_STR,
   TY_VOID,
   TyArray,
   TyErr,
@@ -378,6 +379,8 @@ import {
 } from "./ast"
 import {
   MC_RUNG_BUILTIN,
+  PIN_ANON,
+  PIN_NONE,
   PIN_SIGKEY,
   callTyArgEndsOf,
   callTyArgsOf,
@@ -425,7 +428,6 @@ import {
   normTypeAtom,
   noteCallOrigin,
   nullablePartOf,
-  parenUnionArrElemName,
   parentLetOfAt,
   pushUniqueAtom,
   tyIsFuncType,
@@ -547,6 +549,10 @@ import {
   unNames,
 } from "./emit_state"
 import { emitFail, emitFailAt } from "./emit_bytes"
+import { layoutFirstRowOf } from "./emit_shape_intern"
+import { fieldCodeOfTy } from "./emit_field_codes"
+import { mapStoredTyOf } from "./check_fn_tag_facts"
+import { fnTagRepTyOf } from "./check_elab_cap"
 import { parseI32 } from "./emit_bignum"
 import { tyHasLitDeep } from "./emit_anon_fields"
 import {
@@ -7707,14 +7713,36 @@ function monoAnyBakedCallback(cbFnNames: string[]) {
 
 // The pin column for one instance's parameter list, built in a single parallel pass keyed
 // by param index — a per-parameter fact belongs beside the parameters, not coded into one
-// of their strings. The bridge from the marker is `pinKindOfName`.
-function monoBuildPinCol(pinned: string[], kinds: i32[]) {
+// of their strings. A record of tagged-set ids reads its kind off its layout, any other pin
+// off its marker (`pinKindOfName`).
+function monoBuildPinCol(pinned: string[], pinTys: i32[], kinds: i32[]) {
   let i = 0
   while i < pinned.length {
-    kinds.push(pinKindOfName(pinned[i]))
+    const lk = monoTagRecordPinKind(
+      pinned[i],
+      if i < pinTys.length { pinTys[i] } else { -1 },
+    )
+    kinds.push(if lk >= 0 { lk } else { pinKindOfName(pinned[i]) })
     i = i + 1
   }
   0
+}
+
+// The pin kind of a record of tagged-set ids pinned as `pin` at record type `ty`, read off the
+// layout its stored fields have: `PIN_ANON` when a row holds that layout, else `PIN_NONE`; -1
+// for a pin that is not such a record's.
+function monoTagRecordPinKind(pin: string, ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const o = tyAt(ty)
+  if !(o is TyObj) { return -1 }
+  const codes: i32[] = []
+  const texts: string[] = []
+  if monoTagMapRepName(ty, codes, texts) != pin || pin == "" { return -1 }
+  if layoutFirstRowOf(o.objFieldNames, codes, texts, ty) >= 0 {
+    PIN_ANON
+  } else {
+    PIN_NONE
+  }
 }
 
 // Whether the subtree at `ix` mentions the identifier `name` anywhere: a read, an alias, a copy
@@ -7902,8 +7930,9 @@ function monoFloorDisagrees(bt: i32): boolean {
 }
 
 // The spelling of the map or record of ids a map `t` of a tagged set, or a record holding one,
-// is stored as; "" for a record with a field that spelling cannot name, or one nested in it.
-function monoTagMapRepName(t: i32): string {
+// is stored as; "" for a record with a field that spelling cannot name, or one nested in it. A
+// record's fields' stored field codes and spellings are appended to `codes` and `texts`.
+function monoTagMapRepName(t: i32, codes: i32[], texts: string[]): string {
   if t < 0 || t >= T.tys.length { return "" }
   const m = tyAt(t)
   if m is TyMap { return "{[" + tyToStr(m.mKey) + "]: i32}" }
@@ -7913,12 +7942,18 @@ function monoTagMapRepName(t: i32): string {
   while i < m.objFieldNames.length && i < m.objFieldTypes.length {
     const f = m.objFieldTypes[i]
     let sp = monoPinOfClosedTy(f)
+    let st = f
+    const none: i32[] = []
+    const noneS: string[] = []
     if fnTagTyIsTagged(f) {
       sp = "i32"
+      st = TY_I32
     } else if fnTagListTy(f) {
       sp = fnTagListRepName(f)
+      st = fnTagRepTyOf(f)
     } else if monoTagMapTy(f) {
-      sp = monoTagMapRepName(f)
+      sp = monoTagMapRepName(f, none, noneS)
+      st = mapStoredTyOf(f)
     } else if (
       f >= 0
       && f < T.tys.length
@@ -7928,6 +7963,8 @@ function monoTagMapRepName(t: i32): string {
       sp = ""
     }
     if sp == "" { return "" }
+    codes.push(fieldCodeOfTy(st))
+    texts.push(sp)
     k = k + (if i > 0 { ", " } else { "" }) + m.objFieldNames[i] + ": " + sp
     i = i + 1
   }
@@ -7975,7 +8012,18 @@ function monoPinMintedUnion(
   own: i32,
   shTag: i32,
 ): string {
-  const pun = parenUnionArrElemName(name)
+  // A list whose element is a union boxes each element, whether the union is spelled inline or
+  // named by an alias: one set, one row. A nullable `boolean`, `string` or literal union element
+  // is a niche, not a box.
+  const lt = if ty >= 0 && ty < T.tys.length { tyAt(ty) } else { tyAt(0) }
+  const le = if lt is TyArray { lt.aElem } else { -1 }
+  const lu = if le >= 0 && le < T.tys.length { tyAt(le) } else { tyAt(0) }
+  let boxEl = lu is TyUnion
+  if lu is TyNullable {
+    const ni = lu.nInner
+    boxEl = !(ni == TY_BOOL || ni == TY_STR || tyIsLitUnion(ni))
+  }
+  const pun = if boxEl { monoPinSpellShaped(le) } else { "" }
   let pc = ""
   if pun != "" {
     pc = monoPinUnionName(pun)
@@ -8623,10 +8671,14 @@ function monoMakeInstanceParams(
         } else if pinned[pj] == tyNameOf(p3.parType) {
           nt = p3.parType
         } else {
-          // The argument's type is one member of a union parameter; the explicit type
-          // arguments substituted through the annotation name the union itself (D2679).
+          // The argument's type is one member of a union parameter; the annotation substituted
+          // at the instance names the union itself: the parameter's own type where its bindings
+          // are inferred, else the written type arguments substituted through it (D2679).
           let gateTy = pinTys[pj]
-          if !monoTyHoldsRefArm(gateTy) && exBN.length > 0 {
+          const ownTy = if pj < pinOwn.length { pinOwn[pj] } else { -1 }
+          if !monoTyHoldsRefArm(gateTy) && ownTy >= 0 && !tyHasTyVar(ownTy) {
+            gateTy = ownTy
+          } else if !monoTyHoldsRefArm(gateTy) && exBN.length > 0 {
             const pst = monoSubstInst(nodeTyIxOf(p3.parType), exBN, exBT)
             if pst >= 0 && !tyHasTyVar(pst) { gateTy = pst }
           }
@@ -8666,7 +8718,7 @@ function monoMakeInstanceParams(
         || pinTys[pj] >= 0
           && pinTys[pj] < T.tys.length
           && tyAt(pinTys[pj]) is TyObj
-          && monoTagMapRepName(pinTys[pj]) != ""
+          && monoTagMapRepName(pinTys[pj], [], []) != ""
       ) {
         // A tagged set's parameter is the set itself, not a closure of its signature; a map or
         // record of its ids is that map or record.
@@ -10388,7 +10440,7 @@ function monoInstanceFor(
     // value escapes its call sites, so its body keeps the `call_ref`. Empty → no key/body change.
     const noCb: string[] = []
     const pinKinds: i32[] = []
-    monoBuildPinCol(pinned, pinKinds)
+    monoBuildPinCol(pinned, pinTys, pinKinds)
     // Each pin's own type: a concrete annotation's, else the boundary's, which a type parameter's
     // substituted annotation is checked against above.
     const pinOwn: i32[] = []
@@ -13842,6 +13894,37 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   const rt = if rtE >= 0 && rtE < T.tys.length && tyAt(rtE) is TyArray && !tyHasTyVar(rtE) { rtE } else { nodeTyIxOf(d.letInit) }
   if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyArray && !tyHasTyVar(rt) {
     return 0
+  }
+  // A literal of maps whose functions nothing calls takes the elaboration's closed slot fact, its
+  // open elements typed at the fact's element.
+  const ce = tyArrayElemIx(nodeTyIxOf(d.letInit))
+  if (
+    repoints.length == 0
+    && ce >= 0
+    && ce < T.tys.length
+    && tyAt(ce) is TyMap
+    && elabSlotUncalled(at, ["e", "v"])
+  ) {
+    const lt = elabSlotTyAt(at, [], ctx)
+    const et = tyArrayElemIx(lt)
+    let spread = false
+    for e in lit.arrElems {
+      if nodeAt(e) is Spread { spread = true }
+    }
+    if (
+      !spread
+      && et >= 0
+      && et < T.tys.length
+      && tyAt(et) is TyMap
+      && !monoTyOpen(lt)
+    ) {
+      d.letType = synthTypeRefOfTy(lt, -1)
+      nodeTyRecord(d.letInit, lt)
+      for e in lit.arrElems {
+        if monoTyOpen(nodeTyIxOf(e)) { nodeTyRecord(e, et) }
+      }
+      return 0
+    }
   }
   if repoints.length == 0 {
     const nr = monoPinNestedListElems(d, lf, lit)
@@ -19658,7 +19741,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         }
       }
       const pinKinds: i32[] = []
-      monoBuildPinCol(pinned, pinKinds)
+      monoBuildPinCol(pinned, pinTys, pinKinds)
       monoPinRespell(pinned, pinTys, params, pinOwn)
       monoPinArgLit = []
       let li = 0
@@ -20233,13 +20316,13 @@ function monoPinHoleParam(
   }
   const setTy = if fnTagTyIsTagged(bound) || fnTagListTy(bound) || monoTagMapTy(bound) { bound } else { 0 - 1 }
   if setTy >= 0 {
-    const rn = if monoTagMapTy(setTy) { monoTagMapRepName(setTy) } else { fnTagListRepName(setTy) }
+    const rn = if monoTagMapTy(setTy) { monoTagMapRepName(setTy, [], []) } else { fnTagListRepName(setTy) }
     pinned.push(if rn != "" { rn } else { tyToStr(setTy) })
     pinTys.push(setTy)
     return 0
   }
   // A record holding one is the record the elaboration binds, keyed by its sets (D15638).
-  const trn = if bound >= 0 && bound < T.tys.length && tyAt(bound) is TyObj { monoTagMapRepName(bound) } else { "" }
+  const trn = if bound >= 0 && bound < T.tys.length && tyAt(bound) is TyObj { monoTagMapRepName(bound, [], []) } else { "" }
   if trn != "" {
     pinned.push(trn)
     pinTys.push(bound)

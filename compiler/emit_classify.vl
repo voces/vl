@@ -1,3 +1,4 @@
+import { REC_STORE_DEPTH } from "./check_ty_relate"
 import { registeredUnionRowOfTy } from "./emit_start_block"
 import {
   rlElemUnionRow,
@@ -787,6 +788,7 @@ import {
   fnNestUsed,
   fnParent,
   fnStmts,
+  fnStmtsIndexOf,
   fnValUsed,
   globalIndexBySid,
   heldRepOf,
@@ -813,6 +815,7 @@ import {
   sFieldStart,
   sFieldStoreTy,
   sFieldTypes,
+  sHeapIdx,
   sIsRefRow,
   sLitIdRow,
   sLitMintFn,
@@ -823,10 +826,13 @@ import {
   uDeclared,
   uFieldCount,
   uFieldStart,
+  uTags,
   uVarTyIx,
   uVariants,
   unNames,
   unTyIx,
+  variantHeap,
+  variantRowOf,
 } from "./emit_state"
 import {
   ArrNewKind,
@@ -904,7 +910,7 @@ import {
   unionMemberSetOf,
   unionMemberTysOfAB,
   unionRowKeyAB,
-  unionSetHasNull,
+  unionSetHasNullTy,
 } from "./emit_union_registry"
 import { variantFieldIndex } from "./emit_variant_sig"
 import { strListHas } from "./listutil"
@@ -932,7 +938,11 @@ import {
 } from "./symbols"
 import { peelGroupParens } from "./tyname"
 import { recNarrowRecordOf, recRepWidens } from "./check_bind_adopt"
-import { recEnclosingFn, storeLetBuiltOf } from "./check_fit_rules"
+import {
+  recEnclosingFn,
+  recUnionRecMember,
+  storeLetBuiltOf,
+} from "./check_fit_rules"
 import { holeFnArgRetAtParams, tyProvesNonNull } from "./check_relate_core"
 import {
   flattenVariantsInto,
@@ -5229,6 +5239,25 @@ function monoFieldReadTyAt(rd: i32, fx: i32): i32 {
   -1
 }
 
+// The lifted function of the un-annotated lambda a top-level `const` read `cfx` is bound to, where
+// it returns a record of members as a call's value; -1 otherwise.
+export function topLambdaRecordFe(cfx: i32): i32 {
+  if cfx < 0 || !(nodeAt(cfx) is Ident) { return -1 }
+  const d = identDeclOf(cfx)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return -1 }
+  const v = unwrapParen(dn.letInit)
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const vn = nodeAt(v)
+  // Lifting names the lambda after its binding, so the initialiser's shape is the test.
+  if !(vn is FuncDecl) { return -1 }
+  const fe = fnStmtsIndexOf(v)
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  if calleeReturnsRecord(fnStmts[fe]).length < 2 { return -1 }
+  fe
+}
+
 // The callee's interned `$fnsig` KEY for a value call (`f(x)`, `(o.field)(x)`, `fs[i](x)`), or "" —
 // the param tokens drive argument coercion and the key resolves the functype the `call_ref` casts to.
 export function cloCallSigKey(callIx: i32, fnIx: i32) {
@@ -5239,6 +5268,9 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     // below, which answers "" for a callee the checker left an inference hole (D1626).
     const cfx = unwrapParen(c.callFn)
     if cfx < 0 { return "" }
+    // A call through a top-level lambda returning a record is at the lambda's own signature.
+    const tfe = topLambdaRecordFe(cfx)
+    if tfe >= 0 { return cloSigKeyExt(tfe) }
     // A call through a bundle is at the signature of the closure it reads (D14841).
     const bs = bundleCallSig(cfx, c.callArgs, fnIx)
     if bs >= 0 { return sigKeyOfTy(bs) }
@@ -5830,7 +5862,7 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
   // A hole the instance binds to a nullable type is nullable there.
   if tyBearsNull(holeOperandTyOf(dix, fnIx)) { return true }
   const un = unionNameOfExpr(dix, fnIx)
-  if un != "" { return unionSetHasNull(un) }
+  if un != "" { return unionSetHasNullTy(un, nodeTyAt(unwrapParen(dix), fnIx)) }
   false
 }
 
@@ -9079,10 +9111,9 @@ function structIndexOfIdentStore(e: Ident, exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The row field `prop` is stored at in receiver `recvIx`'s struct row; -2 when that row stores
+// The row field `prop` is stored at in the receiver's struct row `msi`; -2 when that row stores
 // it as no struct, -1 when the receiver has no struct row.
-function recvFieldStructRow(recvIx: i32, prop: string, fnIx: i32): i32 {
-  const msi = structIndexOfExpr(recvIx, fnIx)
+function recvFieldRowOf(msi: i32, prop: string): i32 {
   if msi < 0 { return -1 }
   const mfi = sFieldIndex(msi, prop)
   if mfi >= 0 && sFieldIsRecordRef(msi, mfi) {
@@ -9094,7 +9125,12 @@ function recvFieldStructRow(recvIx: i32, prop: string, fnIx: i32): i32 {
 // The row a field read is stored at: the receiver's struct field, a narrowed or variant
 // receiver's field, or the row every member of a struct union shares.
 function structIndexOfMemberStore(e: Member, exprIx: i32, fnIx: i32): i32 {
-  const sr = recvFieldStructRow(e.memObj, e.memProp, fnIx)
+  // The receiver's row, asked once: each level of a nested read asks its own receiver.
+  const msi = structIndexOfExpr(e.memObj, fnIx)
+  // A record built into a union of records and read at its own type is the member's row.
+  const avi = boxedArmAtRow(msi, e.memProp, exprIx, fnIx)
+  if avi >= 0 { return variantRowOf(avi) }
+  const sr = recvFieldRowOf(msi, e.memProp)
   if sr != -1 { return sr }
   const r1 = variantFieldStructRow(
     memNarrowVariantIndex(exprIx, fnIx),
@@ -9109,6 +9145,37 @@ function structIndexOfMemberStore(e: Member, exprIx: i32, fnIx: i32): i32 {
   const pvi = exprVariantIndex(e.memObj, fnIx)
   if pvi >= 0 { return variantFieldStructRow(pvi, e.memProp) }
   sharedFieldTgtStructIdx(e.memObj, e.memProp, exprIx, fnIx)
+}
+
+// The variant of the record member the field read `memIx` is, where its receiver's row stores
+// the field as a union of records and the read's own type is the one member with its field names
+// (`recUnionRecMember`): a record built into the union and read at its own type. Else -1.
+export function boxedArmOfMember(memIx: i32, fnIx: i32): i32 {
+  const r = unwrapParen(memIx)
+  if r < 0 { return -1 }
+  const rn = nodeAt(r)
+  if !(rn is Member) { return -1 }
+  boxedArmAtRow(structIndexOfExpr(rn.memObj, fnIx), rn.memProp, r, fnIx)
+}
+
+// `boxedArmOfMember` over the receiver's row `bsi`, already asked, for the read `r` of `prop`.
+function boxedArmAtRow(bsi: i32, prop: string, r: i32, fnIx: i32): i32 {
+  if bsi < 0 || bsi >= sHeapIdx.length || r < 0 { return -1 }
+  const bidx = sFieldIndex(bsi, prop)
+  if bidx < 0 || !sFieldIsUnionBox(bsi, bidx) { return -1 }
+  const u = sFieldElemTyIxAt(bsi, bidx)
+  const own = nonNullTy(nodeTyAt(r, fnIx))
+  if u < 0 || own < 0 || u >= T.tys.length || own >= T.tys.length { return -1 }
+  if !(tyAt(own) is TyObj) { return -1 }
+  const mt = recUnionRecMember(own, u, REC_STORE_DEPTH)
+  if mt < 0 { return -1 }
+  const vi = repVariantShapeRowOf(mt)
+  if vi < 0 || vi >= uTags.length { return -1 }
+  const vr = variantRowOf(vi)
+  if vr < 0 || vr >= sHeapIdx.length || sHeapIdx[vr] != variantHeap(vi) {
+    return -1
+  }
+  vi
 }
 
 // The struct row field `prop` of variant row `vi` is stored at, or -1.
@@ -9296,6 +9363,8 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     return nodeRepIs(exprIx, "union", fnIx)
   }
   const e = nodeAt(exprIx)
+  // A record read out of the union of records it is built into is emitted as the member's record.
+  if e is Member && boxedArmOfMember(exprIx, fnIx) >= 0 { return false }
   // A name, field or element read is the box when what the emitted code holds there is: its read
   // rep's read half. A storage read asks the store half, which the arms below answer, as they do
   // a read with no read rep and a `litatom` store, which can hold a narrowed union box.
@@ -11612,14 +11681,14 @@ function refListKeptSlotOfMember(e: Member, exprIx: i32, fnIx: i32): i32 {
   const vi = memNarrowVariantIndex(exprIx, fnIx)
   if vi >= 0 {
     const vfi = variantFieldIndex(vi, e.memProp)
-    if vfi < 0 || variantFieldElemName(vi, vfi) == "" { return -1 }
+    if vfi < 0 || variantFieldSlotTable(vi, vfi) != "reflist" { return -1 }
     return keptOrName(variantFieldRefSlot(vi, vfi))
   }
   const si = structIndexOfExpr(e.memObj, fnIx)
   if si >= 0 {
     const fi = sFieldIndex(si, e.memProp)
     if fi >= 0 {
-      if sFieldElemNameAt(si, fi) == "" { return -1 }
+      if fieldRowSlotTable(sFieldStart[si] + fi) != "reflist" { return -1 }
       return keptOrName(sFieldRefSlot(si, fi))
     }
   }

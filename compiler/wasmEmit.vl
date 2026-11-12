@@ -146,7 +146,11 @@ import {
   nodeWideStrLitText,
 } from "./check_wide_lits"
 import { covarRootFreshLocal, covarValueWriteState } from "./check_covar_write"
-import { EqCmpKind, eqCoreKindOfTyToken } from "./check_ty_relate"
+import {
+  EqCmpKind,
+  REC_STORE_DEPTH,
+  eqCoreKindOfTyToken,
+} from "./check_ty_relate"
 import {
   T,
   TY_ERR,
@@ -442,6 +446,7 @@ import {
   SYNTH_EMPTY_BACKING,
   VKind,
   aTy,
+  armFieldElemSame,
   armFieldNames,
   armFieldTypes,
   armPreludeBlocks,
@@ -955,6 +960,7 @@ import {
   asgYieldsNullLit,
   assignTargetReReads,
   binMixHardF64,
+  boxedArmOfMember,
   bundleRecordRowOfSigs,
   callIsArrSlice,
   callIsMapFilter,
@@ -1131,6 +1137,7 @@ import {
   structIndexOfExpr,
   structIndexOfObjCtx,
   structListPopGetElem,
+  topLambdaRecordFe,
   tyIsBareStrLit,
   unionBoxStoreTyOf,
   unionNameOfExpr,
@@ -1292,7 +1299,6 @@ import {
   mapTwinSame,
   refArrSlotTag,
   tyIsAtomLeafList,
-  unionSetArmTysAB,
   unionTyArms,
   unionTyHasAtom,
   variantDiscrimFieldNeeded,
@@ -1414,8 +1420,6 @@ import {
   readAtomKindOfTy,
   unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentAt,
-  unionDeclTyIxOfIdentRead,
-  unionTyIxOfIdentRead,
 } from "./emit_start_block"
 import {
   declaredKind,
@@ -1539,7 +1543,7 @@ import {
   unionMemberTysOf,
   unionRowKeyAB,
   unionSetAtomsOf,
-  unionSetHasNull,
+  unionSetHasNullTy,
 } from "./emit_union_registry"
 import {
   arrNewKindNamed,
@@ -2038,16 +2042,7 @@ function emitStructFieldValueUnder(
     "union" => {
       // coerces a raw scalar/string/null into the box with its atom tag via `emitUnionBoxArg`,
       // not `emitUnionCoerce` — a concrete-variant/`nulvariant` value must still be boxed here.
-      if (
-        emitUnionBoxOwed(
-          body,
-          sFieldElemNameAt(si, fi),
-          sFieldRowTyAt(si, fi),
-          valIx,
-          fnIx,
-        )
-        < 0
-      ) {
+      if (emitUnionBoxOwed(body, "", sFieldRowTyAt(si, fi), valIx, fnIx) < 0) {
         return -1
       }
     }
@@ -3159,7 +3154,7 @@ function rcUnionRecMember(
   const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
   const dt = rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), name)
   if st < 0 || dt < 0 { return -1 }
-  recUnionRecMember(st, dt)
+  recUnionRecMember(st, dt, REC_STORE_DEPTH)
 }
 
 // Copy source row `sRow`'s record field `sfi`, the field `name` along `pre`, into the union
@@ -4264,13 +4259,6 @@ function isNumRecvBaseName(recvIx: i32, fnIx: i32) {
   if tyAt(t) is TyUnion { numLitUnionBaseName(t) } else { "" }
 }
 
-// The value-union name of an `is` receiver, for the box-tag soundness floor in `emitIs`; `""`
-// when the receiver is not a union. An optional chain's leaf field is among the forms
-// `unionNameOfExpr` covers.
-function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
-  unionNameOfExpr(exprIx, fnIx)
-}
-
 // The operand of `x == null` / `null == x` whose checked type admits no `null`, or whose hole
 // instance `fnIx` binds it to a function type, or -1.
 // A capture cell's read `c[0]` carries the checker's type for the name it replaced, which is
@@ -4499,21 +4487,6 @@ function unionCarriesLitUnionArm(nm: string) {
   nameIsLitUnionArmValueUnion(setNm)
 }
 
-// How many members of `nm` ride the box as a string ref (a `string` arm or a literal-union
-// arm), read from its row's member types, or -1 for a row with an untyped member. One: kind
-// 2's tag discriminates that arm; two or more overlap in the tag, so `x is K` needs
-// membership over the payload.
-function unionStrArmCountOf(nm: string): i32 {
-  const mems: i32[] = []
-  if !unionMemberTysOf(nm, mems) { return -1 }
-  let n = 0
-  for m in mems {
-    if m >= T.tys.length { return -1 }
-    if primNameOf(m) == "string" || tyIsLitUnionOrLit(m) { n = n + 1 }
-  }
-  n
-}
-
 // Whether `recvIx` is a value-union box with no string or literal-union arm, so no string
 // literal (`texts`, from `tyLitMemberTexts`) can be its value.
 function litStrMembersOutsideBox(
@@ -4522,9 +4495,10 @@ function litStrMembersOutsideBox(
   fnIx: i32,
 ): boolean {
   if texts.length == 0 || !exprUnion(recvIx, fnIx) { return false }
-  const nm = unionNameOfExpr(recvIx, fnIx)
-  if nm == "" || !isValueUnionOfSet(msSetOfUnion(nm), nm) { return false }
-  unionStrArmCountOf(nm) == 0 && !unionCarriesLitUnionArm(nm)
+  emitFail(
+    "emitProgram: a string-literal `is` over a union box reached the test for a box with no string arm",
+  )
+  false
 }
 
 // True when `recvIx` is a receiver `emitLitMemberEq` can be applied to repeatedly: a
@@ -5052,13 +5026,7 @@ function emitListEmptyFitArms(
     const nm = unionNameOfExpr(nd.isObj, fnIx)
     if (
       nm == ""
-      || !unionSetArmTysAB(
-        92,
-        nm,
-        unionTyIxOfIdentRead(nd.isObj, fnIx),
-        atoms,
-        armTys,
-      )
+      || !unionTyArms(unionBoxTyOfRead(nd.isObj, fnIx), atoms, armTys)
     ) {
       return 0
     }
@@ -6898,14 +6866,12 @@ function emitIsTestArmTag(body: u8[], isIx: i32, ndv: IsExpr, fnIx: i32) {
     return 1
   }
 
-  // the tag compare below is unsound for a litunion tested type over a box with two
-  // string-repped arms: the litunion arm shares kind 2's tag with a plain `string` arm,
-  // so `tag == 2` would answer true for every string the box holds, members or not. A row
-  // with an untyped member cannot say, so it takes the refusal too.
+  // A literal union tested by its string tag would answer true for every string the box holds,
+  // members or not, so no box test reaches here with one; one that does fails loudly.
   if armTag == 2 && tyIsLitUnion(isVarTyIxOf(isIx)) {
-    const amNm = isStrTagUnionNameOf(ndv.isObj, fnIx)
-    const amStr = if amNm == "" { 0 } else { unionStrArmCountOf(amNm) }
-    if amStr < 0 || amStr > 1 { return emitFailNoMembershipRecv() }
+    return emitFail(
+      "emitProgram: `is` over a literal union reached the box's string-tag test, which cannot tell its members from other strings",
+    )
   }
   if armTag >= 0 {
     const vrecv = nodeAt(unwrapParen(ndv.isObj))
@@ -8454,7 +8420,7 @@ function emitEmptyArrUnionArm(
     tag = scalarTagOfKind(9) // "string[]", the tag a `(string | null)[]` arm shares
   } else if k == "reflist" {
     const slot = emptyArrUnionArmSlot(exprIx)
-    if !unionHasRefArrayArmSlot(unionName, unionTy, slot) { return 0 }
+    if !unionHasRefArrayArmSlot(unionTy, slot) { return 0 }
     tag = refArrBoxTagOf(exprIx, fnIx, slot, unionName, unionTy)
   }
   if tag < 0 { return 0 }
@@ -8953,7 +8919,7 @@ function emitUnionCoerceRefArray(
   fnIx: i32,
 ) {
   const raSlot = refListSlotOfExpr(exprIx, fnIx)
-  if unionHasRefArrayArmSlot(unionName, unionTy, raSlot) {
+  if unionHasRefArrayArmSlot(unionTy, raSlot) {
     const raTag = refArrBoxTagOf(exprIx, fnIx, raSlot, unionName, unionTy)
     if raTag < 0 { return emitFail("emitProgram: boolean list arm has no tag") }
     fbI32Rel(RS_TAG, raTag)
@@ -9031,10 +8997,11 @@ function coerceSetOf(uSet: i32, unionName: string): i32 {
   msSetOfUnion(unionName)
 }
 
-// Whether coerce target `unionName`, of set id `uSet` (-1 when unresolved), admits `null`.
-function coerceSetHasNull(uSet: i32, unionName: string): boolean {
+// Whether coerce target `unionName`, of set id `uSet` (-1 when unresolved) and arena type `uTy`,
+// admits `null`.
+function coerceSetHasNull(uSet: i32, unionName: string, uTy: i32): boolean {
   if uSet >= 0 { return msHasNull(uSet) }
-  unionSetHasNull(unionName)
+  unionSetHasNullTy(unionName, uTy)
 }
 
 // Whether a coerce target of set id `uSet`, else of arena type `uTy`, boxes a literal-union atom
@@ -9066,7 +9033,7 @@ function emitUnionCoerceValueAtom(
   // unconditional value tag over the rep's empty value. For `i32` that empty value is `0`, a
   // real value. The niche-bearing value types are excluded: their empty value already means absent.
   const mrk = mapReadScalarBoxKind(exprIx, fnIx)
-  if mrk >= 0 && coerceSetHasNull(uSet, unionName) {
+  if mrk >= 0 && coerceSetHasNull(uSet, unionName, uTy) {
     // Only when the map's own value atom is a MEMBER of the target union. A widening
     // consumption (`{[string]: i32}` read into `i64 | null`) has to go through the
     // ladder's promotion rules, which this arm does not replicate — declining leaves it
@@ -9136,7 +9103,7 @@ function emitUnionCoerceValueAtom(
           nlParam = true
         }
       }
-      if !coerceSetHasNull(uSet, unionName) || nlStrArm || !nlParam {
+      if !coerceSetHasNull(uSet, unionName, uTy) || nlStrArm || !nlParam {
         return emitFail(
           "emitProgram: literal-union string widening with no members",
         )
@@ -9632,7 +9599,7 @@ function emitUnionCoerceList(
   // A list literal the checker typed as a ref-list arm builds there (`emitArr`), so it boxes
   // under that arm's tag even where its elements alone read as scalars (`[null]`).
   const atSlot = arrLitRefSlotAtTy(bareIx, fnIx)
-  if unionName != "" && unionHasRefArrayArmSlot(unionName, uTy, atSlot) {
+  if unionName != "" && unionHasRefArrayArmSlot(uTy, atSlot) {
     const atTag = refArrBoxTagOf(exprIx, fnIx, atSlot, unionName, uTy)
     if atTag < 0 { return emitFail("emitProgram: boolean list arm has no tag") }
     fbI32Rel(RS_TAG, atTag)
@@ -10901,7 +10868,7 @@ function emitUnionConcreteEq(
     && exprNulLitUnion(otherIx, fnIx)
     && unionEqOperandOk(otherIx)
     && !eqOnce
-    && unionSetHasNull(uname)
+    && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   if nulOther {
     if emitExpr(body, otherIx, fnIx) < 0 { return -1 }
     fbI32Const(-1)
@@ -10920,13 +10887,13 @@ function emitUnionConcreteEq(
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
     && unionEqOperandOk(otherIx)
     && !eqOnce
-    && unionSetHasNull(uname)
+    && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   // The `boolean | null` niche's null is the value 2 (D2260).
   const nulBoolOther = eak == 1
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
     && unionEqOperandOk(otherIx)
     && !eqOnce
-    && unionSetHasNull(uname)
+    && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   if nulBoolOther {
     if emitExpr(body, otherIx, fnIx) < 0 { return -1 }
     fbI32Const(2)
@@ -11592,7 +11559,7 @@ function variantFieldCodeComparable(vi: i32, ufi: i32, c: VKind): boolean {
 // The ref-list slot of the code-5 variant field at flat row `ufi`, or -1 — keyed by the
 // field's recorded element type, as `variantFieldRefSlot` keys it by (variant, field).
 function variantRefListFieldSlot(ufi: i32): i32 {
-  if sFieldElemName[ufi] == "" { return 0 - 1 }
+  if fieldRowSlotTable(ufi) != "reflist" { return 0 - 1 }
   if ufi >= sFieldElemTyIx.length { return 0 - 1 }
   rlSlotOfTyOrTwin(sFieldElemTyIx[ufi])
 }
@@ -11915,15 +11882,9 @@ function emitUnionUnionEq(
   // surviving arms, index-parallel to the atom column; an uncovered row marks its arms -2.
   const lAtoms: string[] = []
   if !msMemberAtomsOfSet(lsid, lAtoms) {
-    // `unionSetArmTysAB` appends the atoms whether or not every member type resolved.
+    // The arms of the union the left read holds (`unionTyArms`); none when it covers none.
     const lMems: i32[] = []
-    unionSetArmTysAB(
-      96,
-      lname,
-      unionDeclTyIxOfIdentRead(lIx, fnIx),
-      lAtoms,
-      lMems,
-    )
+    unionTyArms(unionBoxTyOfRead(lIx, fnIx), lAtoms, lMems)
   }
   const lKinds: i32[] = []
   let lKindsOk = msMemberValKindsOf(lsid, lKinds)
@@ -11936,17 +11897,7 @@ function emitUnionUnionEq(
     // atoms, every arm is filtered out, and the loop emits nothing — so control reaches the
     // tag-only fallback and `==` compares just the two tags (D989).
     const rMems: i32[] = []
-    if (
-      unionSetArmTysAB(
-        97,
-        rname,
-        unionDeclTyIxOfIdentRead(rIx, fnIx),
-        rAtoms,
-        rMems,
-      )
-    ) {
-      rOk = true
-    }
+    if (unionTyArms(unionBoxTyOfRead(rIx, fnIx), rAtoms, rMems)) { rOk = true }
   }
   const arms: string[] = []
   const armKinds: i32[] = []
@@ -12315,11 +12266,14 @@ function sharedFieldPlanDispatchable(
     return true
   }
   const slot0 = uFieldStorageSlot(vis[0], fis[0])
-  const elem0 = variantFieldElemName(vis[0], fis[0])
+  const elem0 = uFieldStart[vis[0]] + fis[0]
   let i = 1
   while i < vis.length {
     if uFieldStorageSlot(vis[i], fis[i]) != slot0 { return false }
-    if code == FC_UNION && variantFieldElemName(vis[i], fis[i]) != elem0 {
+    if (
+      code == FC_UNION
+      && !armFieldElemSame(elem0, uFieldStart[vis[i]] + fis[i])
+    ) {
       return false
     }
     i = i + 1
@@ -13073,6 +13027,10 @@ function emitMemStructRead(body: u8[], memIx: i32, fnIx: i32): i32 {
     // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
     // ident read, at the atom the checker typed the read as; an un-narrowed read is the box.
     if sFieldIsUnionBox(si, idx) {
+      // A record read at its own type out of the union of records it is built into is that
+      // member's record (`boxedArmOfMember`).
+      const avi = boxedArmOfMember(memIx, fnIx)
+      if avi >= 0 { return emitArmUnboxCast(variantHeap(avi), false) }
       if memReadBoxAmbiguous(memIx, fnIx) { return emitBoxAmbiguousFail(memIx) }
       const own = memReadBoxNarrowTy(memIx, fnIx)
       // A read at one scalar of a box holding one wider scalar unboxes and converts it, with no
@@ -15599,7 +15557,9 @@ function emitScalarMapReadBoxEq(
   const bn = nodeAt(unwrapParen(boxIx))
   if bn is Index { return 0 }
   const un = unionNameOfExpr(boxIx, fnIx)
-  if un == "" || !unionSetHasNull(un) { return 0 }
+  if un == "" || !unionSetHasNullTy(un, unionBoxTyOfRead(boxIx, fnIx)) {
+    return 0
+  }
   if !unionHasAtom(un, scalarAtomNameOfKind(k)) { return 0 }
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
   pushMapScr(body, 5)     // entry
@@ -27305,7 +27265,13 @@ function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
         "emitProgram: closure ref-list result element twin (deferred value-ABI composition)",
       )
     }
-    return emitCallRefAt(body, callIx, c, fnIx, ckey, crDepth, crSlot)
+    if emitCallRefAt(body, callIx, c, fnIx, ckey, crDepth, crSlot) < 0 {
+      return -1
+    }
+    // A top-level lambda's returned record: the member its use takes, as for a direct call.
+    const tfe = topLambdaRecordFe(unwrapParen(c.callFn))
+    if tfe >= 0 { return emitBundleResultPick(callIx, tfe, fnIx) }
+    return 0
   }
   emitFail("emitProgram: expected a call expression")
 }
@@ -28202,13 +28168,7 @@ function emitStructFieldStoreValue(
     "union" => {
       // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
       if (
-        emitUnionBoxOwed(
-          body,
-          sFieldElemNameAt(si, fieldIdx),
-          sFieldRowTyAt(si, fieldIdx),
-          rhs,
-          fnIx,
-        )
+        emitUnionBoxOwed(body, "", sFieldRowTyAt(si, fieldIdx), rhs, fnIx)
         < 0
       ) {
         return -1
@@ -39908,17 +39868,11 @@ function refAtomElemName(k: i32): string {
 // The result union's box tag for the OPERAND's own non-null rep, or -1 when no arm of that
 // union carries it. A miss is a loud refusal at the caller and never a fall-through: a box
 // tagged with an atom the union does not have is valid wasm whose `is` test is silently false.
-function coalNicheBoxTag(
-  joinSet: string,
-  joinTy: i32,
-  lhsIx: i32,
-  heapIx: i32,
-  fnIx: i32,
-): i32 {
+function coalNicheBoxTag(joinTy: i32, lhsIx: i32, heapIx: i32, fnIx: i32): i32 {
   if exprNullableRefArray(lhsIx, fnIx) {
     const rs = refListSlotOfExpr(lhsIx, fnIx)
     if rs < 0 { return -1 }
-    if !unionHasRefArrayArmSlot(joinSet, joinTy, rs) { return -1 }
+    if !unionHasRefArrayArmSlot(joinTy, rs) { return -1 }
     return refArrSlotTag(rs)
   }
   const ak = coalNicheAtomKind(lhsIx, fnIx)
@@ -39969,7 +39923,7 @@ function emitUnionBoxNulNiche(
   // The value's shape is asked before the union's `null`, so only a niche reads the set.
   const nnBool = exprNulBool(nnIx, fnIx)
   if !nnBool && !coalesceNulRefNicheOperand(nnIx, fnIx) { return 0 }
-  if !unionSetHasNull(unionKey) { return 0 }
+  if !unionSetHasNullTy(unionKey, unionTy) { return 0 }
   // A `boolean | null` is the i32 niche whose null is the value 2, so the null test is on the
   // value, not the ref (D2260).
   if nnBool {
@@ -39993,7 +39947,6 @@ function emitUnionBoxNulNiche(
     return 1
   }
   const nnTag = coalNicheBoxTag(
-    unionName,
     unionTy,
     nnIx,
     nulNicheValueHeap(nnIx, fnIx),
@@ -40052,16 +40005,8 @@ function emitCoalesceNulRefJoin(
       exprIx,
     )
   }
-  let joinSet = unionMemberSetOf(joinN)
-  if joinSet == "" { joinSet = joinN }
   const joinTy = boxDstTyOf(e.binRight, fnIx)
-  const tag = coalNicheBoxTag(
-    joinSet,
-    joinTy,
-    unwrapParen(e.binLeft),
-    heapIx,
-    fnIx,
-  )
+  const tag = coalNicheBoxTag(joinTy, unwrapParen(e.binLeft), heapIx, fnIx)
   if tag < 0 {
     return emitFailAt(
       "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",

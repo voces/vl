@@ -107,6 +107,73 @@ The accessors (`sFieldElemNameAt`, `variantFieldElemName`, `armFieldElemName`), 
 `famRelayStructRow`, and `variantRowAgree`'s and `armStageAgree`'s swaps), and `tyRegGenNow`'s
 length read.
 
+## The row-identity compares, converted
+
+One rule, `fieldElemSame` (`emit_state`): two field slots hold one element when their recorded
+element types are the same type, and by their element names only where a type is missing.
+`sFieldElemSame` and `armFieldElemSame` apply it to the struct and arm columns. These sites now
+use it: `variantRowFieldsMatch`, `structFieldCodesEq`, `variantLitPairKind`,
+`variantRowsTagEqual`, `variantFieldTysEq`, `variantFirstLayoutDisagreeField`, `sigFieldMayMatch`
+and `sharedFieldPlanDispatchable`.
+
+- **`sRowsTwin` keeps the name.** Keyed by type, it merged a row holding a list of function ids
+  with one holding a list of closures. The two hold one element type at two storages, and only the
+  name records which. The result was invalid wasm in `closures/fn-nested-record-field-list-written`
+  and `record-literal-written-into-slot-of-fn-widened-binding-runs`. That site was found by reverting
+  each file in turn. This is a floor: the function-tag pass decides the storage, not the type. It is
+  the class of D15880, where a rep depends on a tag decision.
+- **`annShapeIndexOf` and `annShapeWiderRowOf` stay inline.** They already follow the rule with
+  stored types. Their name fallback calls `shapeFieldElemName`, which can intern a deferred
+  element, so it must stay lazy.
+- **`variantRowAgree` and `armStageAgree` are normalizers, not compares.** They rewrite one name
+  to the other where the types are the same, and they go when no reader is left.
+
+The record-field box sites `emitStructFieldValueUnder` and `emitStructFieldStoreValue` hand
+`emitUnionBoxOwed` `""`: `boxDstName` derives the box from the field's type at both, in every
+program.
+
+Eight programs build different bytes and print the same on both seeds:
+
+| program | output |
+| --- | --- |
+| `named/d15204_run_list_in_record_written` | `1.5` |
+| `named/d15204_run_record_in_list` | `4` |
+| `named/d15220_cell_field_of_id_lists` | `4` |
+| `named/d15296_nested_list` | `5` |
+| `closures/fn-tagged-ids-in-records-in-nested-lists` | `4 4 4 4` |
+| `closures/fn-tagged-records-held-lists-of-two-depths` | `4 4 4` |
+| `closures/hole-fn-nested-list-in-record-field` | `4 6 9 1.5` |
+| `closures/hole-fn-nested-list-record-field-tagged` | `6 6 6 4` |
+
+## The presence tests, converted
+
+Four reads asked whether a field records an element by testing its name for `""`. Each now asks
+the field's type:
+
+- `refListKeptSlotOfMember`, at its arm and receiver-row rungs (E11, E13), and
+  `variantRefListFieldSlot` (E54) ask whether the field's storage slot is a ref list
+  (`fieldRowSlotTable` / `variantFieldSlotTable`).
+- `shapeRowLayoutId`'s atom bit (E32) asks `layoutAtomField` of the stored type, the rule its
+  query side already uses. A row with no stored type keeps the name.
+
+A shadow beside each read, over 24,061 programs, agreed everywhere except one E32 row,
+`layout-family-literal-set-beside-string`. There the stored name marked an atom and the type did
+not. That program builds different bytes and prints the same.
+## The row lookups, graded
+
+- **Deleted.** `leqNoteVariantFields` and `leqNoteStructRowFields` (E14, E15) tested the name inside
+  a branch already narrowed to a ref-list field. A probe found the name set in every reach (2 and
+  13 programs), so the test is gone.
+- **Converted.** `eqgFieldRefSlot` (E19) asks whether the field's slot is a ref list; the shadow
+  agreed in 4 of 4.
+- **Floors: the walk's typeless class.** `variantNestedRow` (E56) and `armFieldStructRowMinted`
+  (E16) intern a nested row under the field's spelling. `sFieldRefSlot` (E36, E37) mints a ref list
+  by name only for an element whose type is a type variable or is unrecorded. All three go when the
+  shape walk hands those fields a type.
+- **Converted after its own shadow.** `variantFieldElemNameOr`'s caller (E20, the value-site
+  ref-list read of an arm receiver's field) asks the field's slot table. The shadow agreed in 2
+  of 2. `variantFieldElemNameOr` then had no caller and is deleted.
+
 ## Order
 
 1. (c): delete each unreached rung, with a control.
