@@ -7689,13 +7689,13 @@ function elabHolderCanHoldReturned(h: i32, from: i32, rec: i32[]): boolean {
     return false
   }
   const fd = elabEnclosingFn(h)
-  // A module-scope `const` is one record whichever function returns it, where that function
-  // returns the record whole (`elabGlobalReturnerWhole`).
+  // A module-scope `const` is one record whichever function returns it, where that function may
+  // return a record (`elabRetRecordShape`): an annotated return keeps its type.
   const hn = nodeAt(h)
   const global = fd == -1 && hn is LetDecl && hn.letKw == "const"
   for r in rets {
     const rf = elabEnclosingFn(r)
-    if rf != fd && !(global && elabGlobalReturnerWhole(rf, rec)) {
+    if rf != fd && !(global && rf >= 0 && elabRetRecordShape(rf)) {
       return false
     }
   }
@@ -7705,37 +7705,6 @@ function elabHolderCanHoldReturned(h: i32, from: i32, rec: i32[]): boolean {
     }
   }
   true
-}
-
-// Whether function `rf` may return record `rec` (`elabRetRecordShape`) and no call of it takes
-// one member by its holder or its destination, which would emit it at that member.
-function elabGlobalReturnerWhole(rf: i32, rec: i32[]): boolean {
-  if rf < 0 || !elabRetRecordShape(rf) { return false }
-  for g in elabResPlainCalls.keys() {
-    if (elabResPlainCalls[g] ?? -1) == rf && elabCallTakesOneMember(g, rec) {
-      return false
-    }
-  }
-  true
-}
-
-// Whether call `g`'s value is used as one member of `rec` in plain code: a holder called through
-// at one signature only, or a destination expecting one member's type.
-function elabCallTakesOneMember(g: i32, rec: i32[]): boolean {
-  const h = elabResHolder.get(g) ?? -1
-  if h >= 0 {
-    const through = elabResThrough.get(h) ?? []
-    const reads = through.length + elabResWriteReads(h)
-    if through.length > 0 && reads == (elabResReads.get(h) ?? 0) {
-      const m = elabCallSigMember(through[0], rec)
-      let one = m >= 0
-      for t in through {
-        if elabCallSigMember(t, rec) != m { one = false }
-      }
-      if one { return true }
-    }
-  }
-  elabRecIndexOf(rec, callDstTyOf(g)) >= 0
 }
 
 // Whether every copy in `copies` of holder `h` can hold record `rec` in instance `from`: it is
@@ -8140,9 +8109,11 @@ function elabRetValuesRecord(body: i32, from: i32, depth: i32): i32[] {
   let rec: i32[] = []
   for c in rets {
     const hc = elabRetHolderCall(c)
-    const r = elabCallRecord(if hc >= 0 { hc } else { c }, from, depth - 1)
+    // A holder made in plain code holds its record under no instance.
+    const hf = if hc >= 0 && elabInPlainCode(hc) { -1 } else { from }
+    const r = elabCallRecord(if hc >= 0 { hc } else { c }, hf, depth - 1)
     if r.length < 2 || rec.length > 0 && !elabTyListSame(r, rec) { return none }
-    if hc >= 0 && !elabHolderCanHoldReturned(identDeclOf(c), from, r) {
+    if hc >= 0 && !elabHolderCanHoldReturned(identDeclOf(c), hf, r) {
       return none
     }
     rec = r

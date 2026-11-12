@@ -23,22 +23,23 @@ field code into a valtype through a 27-arm ladder of its own. That ladder repeat
 
 ## The one disagreement it met
 
-D3938 (`P<i32> | Q<i32>` as a record field) is code 15 with no resolved struct row, but its
-storage type reps as `union`. Before the guard was widened to cover the code's row, that program
-wrote the union box and failed later with a different sentence: one output mover, still loud.
-With the code's row checked too, it keeps its sentence. This disagreement is reachable only on a
-program that is already refused.
+On master `c28961aa`, D3938 (`P<i32> | Q<i32>` as a record field) was code 15 with no resolved
+struct row, but its storage type repped as `union`. Before the guard covered the code's row, that
+refused program wrote the union box and failed later with a different sentence. #7357 has since
+closed D3938, and on the merged tree it runs and prints `7` then `-1`.
 
 ## Measurement
 
-`sweep.vl diff`, master `c28961aa`'s fixpoint seed (6,640,097 bytes) against this one (fixpoint,
-6,640,563 bytes), over 23,948 programs:
+`sweep.vl diff`, master `10033cbe` fixpoint seed (6,645,808 bytes) against this branch merged
+with it (fixpoint, 6,646,271 bytes), over 23,962 programs:
 
-- **23,948 same**;
+- **23,962 same**;
 - 0 bytes-only movers;
 - 0 output movers;
 - 0 `runs → not-runs`;
 - 0 new compiler traps.
+
+The first measurement, against `c28961aa`, was 23,948 same.
 
 ## What is left
 

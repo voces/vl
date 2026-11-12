@@ -40,7 +40,7 @@ These cells moved to runs, all un-annotated: `push_smaller`, `push_wider`, `push
 `push_in_function`, `push_then_read_wider_key` and `push_read_by_loop`.
 
 - The three SILENT cells are `array_push` (both faces) and `map_set` (annotated), the same on
-  both seeds. They are D15752 (unfiled: D15752, filed in #7396): a map of un-annotated
+  both seeds. They are D15752 (filed in #7396): a map of un-annotated
   functions delivered by `push` or `set` into an annotated container.
 - The record-field cells refuse as a ref-list field with no interned element. `argument` and
   `array_element` refuse at emit. The `*_assign` and `map_*` cells are check refusals of the two
