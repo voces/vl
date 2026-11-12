@@ -47,6 +47,8 @@ sweep, 24,011 programs.
 
 ## Proof
 
-- **Local full sweep.** PENDING
-- **Checks.** `emitter-state-audit --check` is clean. lint-self is clean. The export budget, with
-  findings, has 0 dead exports. Render-parse is flat at 13 renders and 55 parses.
+- **Local full sweep.** `--prove-fixpoint` seeds on both sides: 24,011 same, 0 bytes-only
+  movers, 0 output movers, 0 runs → not-runs, 0 new compiler traps.
+- **Checks.** `emitter-state-audit --check` is clean. `rep-fuzz-check.sh` is exact. `cases_wasm`
+  passes 7,487 with 0 failed. lint-self is clean. The export budget, with findings, has 0 dead
+  exports. Render-parse is flat at 13 renders and 55 parses.
