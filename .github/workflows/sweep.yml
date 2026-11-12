@@ -21,11 +21,15 @@ on:
   pull_request:
     types: [labeled, synchronize, reopened]
 
+# `actions: read` finds and downloads a base recording another run already made (`base-cache`).
 permissions:
   contents: read
+  actions: read
 
+# A new push to a labelled PR cancels its older sweep. Labelling a PR with anything but `sweep`
+# starts a run that does nothing, so it takes a group of its own rather than cancel a live sweep.
 concurrency:
-  group: sweep-${{ github.event.pull_request.number || github.run_id }}
+  group: sweep-${{ (github.event_name == 'pull_request' && (github.event.action != 'labeled' || github.event.label.name == 'sweep')) && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 # The same pinned feature level as ci.yml, so a seed sidecar cached there loads here.
@@ -150,16 +154,110 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
-  # Each runner records one shard of one side. HEAD's toolchain runs the sweep tool; the
-  # side's own compiles the programs.
-  record:
+  # The base recording is a function of the inputs below, so a run that already made it for the
+  # same inputs (any PR, any run in the repository) hands it over and the base record shards do
+  # not run. A wrong key compares the head against a stale base, so the key takes every input
+  # the recording can read, and some it cannot:
+  #   base        the base commit: its compiler, std and vl-host source (the side's seed,
+  #               binary and std are built from it), plus runner OS, VL_ISA and rustc.
+  #   population  the head's tests/cases, distilled cells/ and named/, and both inventories.
+  #   tool        sha256 of scripts/sweep.vl as the head toolchain builds it (its scripts/lib
+  #               imports, head std and head compiler are all in those bytes), the hash of its
+  #               source, and the head vl-host source that runs it.
+  #   recipe      this workflow file and the shard count.
+  # A candidate is used only when it came from this repository and the run that made it used a
+  # byte-identical sweep.yml, so a PR that edits the workflow cannot plant a recording for others.
+  base-cache:
     needs: [plan, seed]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+      run: ${{ steps.find.outputs.run }}
+      sides: ${{ steps.find.outputs.sides }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.head }}
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: sweep-side-head
+
+      - name: Key the base recording
+        id: key
+        run: |
+          # Installed and built exactly as `record` installs the head side and builds the tool.
+          mkdir -p sides/head scripts/vl-host/target/release build
+          tar -I zstd -xf side.tar.zst -C sides/head --strip-components=1
+          cp sides/head/vl scripts/vl-host/target/release/vl
+          cp sides/head/vl-compiler.wasm sides/head/vl-compiler.wasm.*.cwasm build/ 2>/dev/null || cp sides/head/vl-compiler.wasm build/
+          tool=$RUNNER_TEMP/sweep.wasm
+          scripts/vl-host/target/release/vl build scripts/sweep.vl --compiler build/vl-compiler.wasm -o "$tool"
+          {
+            echo "format sweep-base-v1"
+            echo "base $BASE"
+            echo "runner $RUNNER_OS $VL_ISA $(rustc -V | tr ' ' '_')"
+            echo "shards 8"
+            echo "workflow $(sha256sum .github/workflows/sweep.yml | cut -c1-64)"
+            echo "tool-wasm $(sha256sum "$tool" | cut -c1-64)"
+            echo "tool-src $TOOL_SRC"
+            echo "host-src $HOST_SRC"
+            echo "population $POPULATION"
+          } > base-manifest.txt
+          cat base-manifest.txt
+          echo "key=$(sha256sum base-manifest.txt | cut -c1-40)" >> "$GITHUB_OUTPUT"
+        env:
+          BASE: ${{ needs.plan.outputs.base }}
+          TOOL_SRC: ${{ hashFiles('scripts/sweep.vl', 'scripts/lib/**') }}
+          HOST_SRC: ${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}
+          POPULATION: ${{ hashFiles('tests/cases/**', 'scripts/silent-sweep/distilled/cells/**', 'scripts/silent-sweep/distilled/named/**', 'docs/internals/inventory/**', 'docs/internals/inventory-2/**') }}
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: sweep-base-manifest
+          path: base-manifest.txt
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Find a recording of this base
+        id: find
+        run: |
+          mine=$(sha256sum .github/workflows/sweep.yml | cut -c1-64)
+          run=""
+          for c in $(gh api "repos/$REPO/actions/artifacts?name=sweep-base-$KEY&per_page=100" --jq \
+              '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | reverse | .[] | "\(.workflow_run.id):\(.workflow_run.head_sha)"'); do
+            id=${c%%:*} sha=${c#*:}
+            from=$(gh api "repos/$REPO/actions/runs/$id" --jq '"\(.path) \(.head_repository.full_name)"') || continue
+            [ "$from" = ".github/workflows/sweep.yml $REPO" ] || { echo "skip run $id: $from"; continue; }
+            theirs=$(gh api "repos/$REPO/contents/.github/workflows/sweep.yml?ref=$sha" --jq .content | base64 -d | sha256sum | cut -c1-64) || continue
+            [ "$theirs" = "$mine" ] || { echo "skip run $id: its sweep.yml differs"; continue; }
+            run=$id
+            break
+          done
+          if [ -n "$run" ]; then
+            echo "base-cache: hit, sweep-base-$KEY from run $run; the base record shards are skipped"
+            echo 'sides=["head"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "base-cache: miss, recording the base"
+            echo 'sides=["base","head"]' >> "$GITHUB_OUTPUT"
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          KEY: ${{ steps.key.outputs.key }}
+
+  # Each runner records one shard of one side. HEAD's toolchain runs the sweep tool; the
+  # side's own compiles the programs. The base side runs only on a `base-cache` miss.
+  record:
+    needs: [plan, seed, base-cache]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        side: [base, head]
+        side: ${{ fromJSON(needs.base-cache.outputs.sides) }}
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v5
@@ -195,7 +293,7 @@ jobs:
           if-no-files-found: error
 
   diff:
-    needs: [plan, record]
+    needs: [plan, base-cache, record]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -213,16 +311,54 @@ jobs:
           path: recs
           merge-multiple: true
 
-      - name: Merge and diff
+      - uses: actions/download-artifact@v5
+        with:
+          name: sweep-base-manifest
+          path: manifest
+
+      - name: Restore the base recording (base-cache hit)
+        if: needs.base-cache.outputs.run != ''
+        uses: actions/download-artifact@v5
+        with:
+          name: sweep-base-${{ needs.base-cache.outputs.key }}
+          path: cached
+          run-id: ${{ needs.base-cache.outputs.run }}
+          github-token: ${{ github.token }}
+
+      # A restored recording must carry this run's manifest byte for byte; `merge` then refuses
+      # it unless it covers the head's population exactly once.
+      - name: Merge
         run: |
+          if [ -n "$CACHED_RUN" ]; then
+            cmp cached/base-manifest.txt manifest/base-manifest.txt
+            cp cached/rec-base-*.jsonl recs/
+            echo "base: restored from run $CACHED_RUN"
+          fi
           mkdir -p sides/head scripts/vl-host/target/release build
           tar -I zstd -xf side.tar.zst -C sides/head --strip-components=1
           cp sides/head/vl scripts/vl-host/target/release/vl
           cp sides/head/vl-compiler.wasm sides/head/vl-compiler.wasm.*.cwasm build/ 2>/dev/null || cp sides/head/vl-compiler.wasm build/
           vl=scripts/vl-host/target/release/vl
-          mkdir -p out
+          mkdir -p out base-rec
           $vl run scripts/sweep.vl -- merge --out out/base.jsonl recs/rec-base-*.jsonl
           $vl run scripts/sweep.vl -- merge --out out/head.jsonl recs/rec-head-*.jsonl
+          cp recs/rec-base-*.jsonl manifest/base-manifest.txt base-rec/
+        env:
+          CACHED_RUN: ${{ needs.base-cache.outputs.run }}
+
+      # Saved before the diff, so a red diff still leaves the base for the next run.
+      - name: Save the base recording (base-cache miss)
+        if: needs.base-cache.outputs.run == ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: sweep-base-${{ needs.base-cache.outputs.key }}
+          path: base-rec/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Diff
+        run: |
+          vl=scripts/vl-host/target/release/vl
           set +e
           $vl run scripts/sweep.vl -- diff out/base.jsonl out/head.jsonl > out/summary.txt
           rc=$?
