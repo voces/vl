@@ -28,26 +28,25 @@ A trap in the second build is a value read.
 | first value reader | storage type | programs | grade |
 | --- | --- | --- | --- |
 | none (layout only) | type parameter | 12 | **floor** |
-| `emitObj` → `emitStructFieldValueUnder` → `fieldRowKindIn` | type parameter | 16 | open, below |
-| `cloValueCallRetKind` → `structFieldIsClosure` → `fieldRowIsClosure` | type parameter | 10 | open, below |
-| `readStoreAt` → `readFieldStoreKind` | type parameter | 1 | open, below |
-| `memberUnionFieldNameReadGo` → `fieldRowIsUnionBox` | type parameter | 1 | open, below |
+| `emitObj` → `emitStructFieldValueUnder` → `fieldRowKindIn` | type parameter | 16 | **floor** |
+| `cloValueCallRetKind` → `structFieldIsClosure` → `fieldRowIsClosure` | type parameter | 10 | **floor** |
+| `readStoreAt` → `readFieldStoreKind` | type parameter | 1 | **floor** |
+| `memberUnionFieldNameReadGo` → `fieldRowIsUnionBox` | type parameter | 1 | **floor** |
 | `bindCellGo` → `letSpellsNulAtom` / `exprIsLitAtom` → `fieldRowIsNulAtom` | unresolved element | 3 | D15976 |
 | `emitObj` → `fieldRowKindIn` | unresolved element | 1 | D15976 |
 
-## The floor: layout only
+## The floor: type-parameter rows (40 programs)
 
-**12 programs.** Lane F's accepted contract covers these rows: "a type that holds a type
-parameter is not a rep; a template's row is keyed by its open type, each instance's by its closed
-type".
-- Such a row is laid out, and twin- and prefix-compared, from its field codes.
-- No value is read through it.
-- The coordinator ruled them a floor.
+**The contract (coordinator ruling):** "a type that holds a type parameter is not a rep; a body
+emitted with open type parameters builds at the open row, whose field layout comes from its
+code". It is lane F's contract applied to what step 2 decided: the checker owns the instance
+set, and a function it does not instantiate is emitted once as its original, its type
+parameters open.
 
-## Open: a value read of a type-parameter row (28 programs)
-
-The row comes from `structIndexOfObjCtx`. A probe tagged each rung that returned a row with a
-type-parameter field:
+- **12 programs read the row only for layout:** the type section, twin equality and the
+  subtype prefix.
+- **28 read a field's value kind through it,** from a body emitted as its original. Where the
+  row comes from: `structIndexOfObjCtx` chose a row with a type-parameter field in 910 programs.
 
 | rung | in a function emitted as its generic original | in an instance |
 | --- | --- | --- |
@@ -57,14 +56,13 @@ type-parameter field:
 | tagged field (`objLitTaggedFieldRow`) | 15 | 0 |
 | alias (`structIndexOfTy`) | 3 | 0 |
 
-Open rows are chosen in 910 programs. In all but one, the function is emitted as its generic
-original (`fnInstOrigin < 0`), with no instance. D15404's `mid2<F, G>` called at `same` is one:
-G is inferred and never closed. So the 28 programs whose field readers meet the open field
-mostly have no closed instance type to read. The one true instance is
-`closures/two-returns-records-of-hole-fns-field-called.vl`, at the mint rung.
+D15404's `mid2<F, G>`, called at `same`, is one: G is inferred and never closed into an
+instance. All 910 programs run with correct output. Closing an original's type parameters at
+emit would be a step-2 / mono change, out of step 7's scope.
 
-Whether an original emitted with open type parameters is a floor or a conversion is with the
-coordinator. The codec fallbacks stay until it rules. The row selection is lane B's.
+**The one true instance:** `closures/two-returns-records-of-hole-fns-field-called.vl` (mint
+rung) is not among the 44 programs. No field codec meets an uncovered field there, so nothing on
+the codec side converts. Its row choice is handed to lane B's row selection.
 
 ## The unresolved element: D15976
 
