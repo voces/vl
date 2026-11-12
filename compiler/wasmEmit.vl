@@ -20,6 +20,7 @@ import {
 import { repSlotOfKind } from "./emit_rep_slot"
 import {
   bundleFieldOfCall,
+  bundleHandMemberNote,
   bundleHandMemberOf,
   bundleParamOfRead,
   bundleRetParamOf,
@@ -61,6 +62,7 @@ import {
   elabArmStagePop,
   elabArmStagePush,
   elabBundleRecordOf,
+  elabCallHandMemberAt,
   elabCallKeepsRecordAt,
   elabDeliveredBundleSigs,
   elabDeliveredBundles,
@@ -8418,7 +8420,7 @@ function emitEmptyArrUnionArm(
     tag = scalarTagOfKind(9) // "string[]", the tag a `(string | null)[]` arm shares
   } else if k == "reflist" {
     const slot = emptyArrUnionArmSlot(exprIx)
-    if !unionHasRefArrayArmSlot(unionName, unionTy, slot) { return 0 }
+    if !unionHasRefArrayArmSlot(unionTy, slot) { return 0 }
     tag = refArrBoxTagOf(exprIx, fnIx, slot, unionName, unionTy)
   }
   if tag < 0 { return 0 }
@@ -8917,7 +8919,7 @@ function emitUnionCoerceRefArray(
   fnIx: i32,
 ) {
   const raSlot = refListSlotOfExpr(exprIx, fnIx)
-  if unionHasRefArrayArmSlot(unionName, unionTy, raSlot) {
+  if unionHasRefArrayArmSlot(unionTy, raSlot) {
     const raTag = refArrBoxTagOf(exprIx, fnIx, raSlot, unionName, unionTy)
     if raTag < 0 { return emitFail("emitProgram: boolean list arm has no tag") }
     fbI32Rel(RS_TAG, raTag)
@@ -9597,7 +9599,7 @@ function emitUnionCoerceList(
   // A list literal the checker typed as a ref-list arm builds there (`emitArr`), so it boxes
   // under that arm's tag even where its elements alone read as scalars (`[null]`).
   const atSlot = arrLitRefSlotAtTy(bareIx, fnIx)
-  if unionName != "" && unionHasRefArrayArmSlot(unionName, uTy, atSlot) {
+  if unionName != "" && unionHasRefArrayArmSlot(uTy, atSlot) {
     const atTag = refArrBoxTagOf(exprIx, fnIx, atSlot, unionName, uTy)
     if atTag < 0 { return emitFail("emitProgram: boolean list arm has no tag") }
     fbI32Rel(RS_TAG, atTag)
@@ -11557,7 +11559,7 @@ function variantFieldCodeComparable(vi: i32, ufi: i32, c: VKind): boolean {
 // The ref-list slot of the code-5 variant field at flat row `ufi`, or -1 — keyed by the
 // field's recorded element type, as `variantFieldRefSlot` keys it by (variant, field).
 function variantRefListFieldSlot(ufi: i32): i32 {
-  if sFieldElemName[ufi] == "" { return 0 - 1 }
+  if fieldRowSlotTable(ufi) != "reflist" { return 0 - 1 }
   if ufi >= sFieldElemTyIx.length { return 0 - 1 }
   rlSlotOfTyOrTwin(sFieldElemTyIx[ufi])
 }
@@ -39201,6 +39203,15 @@ function emitDirectCallArgsUnder(
       (emitBundleRecordRead(args[i], fnIx) || emitHolderRead(args[i], fnIx))
       && (bpar < 0 || bundleSigsOfParam(bpar).length == 0)
     ) {
+      // A callee with no instance is handed the member the elaboration chose for its annotation.
+      if bundleHandMemberOf(args[i]) == -2 {
+        const ehm = elabCallHandMemberAt(
+          nodeSrc[callIx] ?? callIx,
+          i,
+          elabKeyOfFn(fnIx),
+        )
+        if ehm >= -1 { bundleHandMemberNote(args[i], ehm) }
+      }
       if emitBundleMemberArg(body, args[i], fnIx) < 0 { return -1 }
       i = i + 1
     } else if (
@@ -39857,17 +39868,11 @@ function refAtomElemName(k: i32): string {
 // The result union's box tag for the OPERAND's own non-null rep, or -1 when no arm of that
 // union carries it. A miss is a loud refusal at the caller and never a fall-through: a box
 // tagged with an atom the union does not have is valid wasm whose `is` test is silently false.
-function coalNicheBoxTag(
-  joinSet: string,
-  joinTy: i32,
-  lhsIx: i32,
-  heapIx: i32,
-  fnIx: i32,
-): i32 {
+function coalNicheBoxTag(joinTy: i32, lhsIx: i32, heapIx: i32, fnIx: i32): i32 {
   if exprNullableRefArray(lhsIx, fnIx) {
     const rs = refListSlotOfExpr(lhsIx, fnIx)
     if rs < 0 { return -1 }
-    if !unionHasRefArrayArmSlot(joinSet, joinTy, rs) { return -1 }
+    if !unionHasRefArrayArmSlot(joinTy, rs) { return -1 }
     return refArrSlotTag(rs)
   }
   const ak = coalNicheAtomKind(lhsIx, fnIx)
@@ -39942,7 +39947,6 @@ function emitUnionBoxNulNiche(
     return 1
   }
   const nnTag = coalNicheBoxTag(
-    unionName,
     unionTy,
     nnIx,
     nulNicheValueHeap(nnIx, fnIx),
@@ -40001,16 +40005,8 @@ function emitCoalesceNulRefJoin(
       exprIx,
     )
   }
-  let joinSet = unionMemberSetOf(joinN)
-  if joinSet == "" { joinSet = joinN }
   const joinTy = boxDstTyOf(e.binRight, fnIx)
-  const tag = coalNicheBoxTag(
-    joinSet,
-    joinTy,
-    unwrapParen(e.binLeft),
-    heapIx,
-    fnIx,
-  )
+  const tag = coalNicheBoxTag(joinTy, unwrapParen(e.binLeft), heapIx, fnIx)
   if tag < 0 {
     return emitFailAt(
       "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
