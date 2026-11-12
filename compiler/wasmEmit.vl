@@ -1034,6 +1034,7 @@ import {
   exprVariantIndex,
   fieldClosureFeOfRecv,
   fieldValueFeOf,
+  fieldValueFeOfIn,
   fnHasEnvParam,
   fnIndexOf,
   fnIndexOfAt,
@@ -1523,8 +1524,8 @@ import {
   isUNameAB,
   msHasNull,
   msMemberAtomsOfSet,
-  msSetOfNameTy,
   msSetOfRowOr,
+  msSetOfTy,
   msSetOfTyAny,
   msSetOfUnion,
   msSetTakesAtomAsStr,
@@ -1949,7 +1950,7 @@ function emitOmittedFieldNull(_body: u8[], si: i32, fi: i32) {
       const fnm = sFieldElemNameAt(si, fi)
       if (
         unionHasAtomK(
-          msSetOfNameTy(fnm, sFieldElemTyIxAt(si, fi)),
+          msSetOfTy(sFieldElemTyIxAt(si, fi)),
           fnm,
           "null",
           nullValKind(),
@@ -6834,9 +6835,7 @@ function emitIsTestArmTag(body: u8[], isIx: i32, ndv: IsExpr, fnIx: i32) {
     && exprUnion(ndv.isObj, fnIx)
     && unionEqOperandOk(ndv.isObj)
     && !unionCarriesLitUnionArm(unionNameOfExpr(ndv.isObj, fnIx))
-    && msSetTakesAtomAsStr(
-      msSetOfUnionBox(ndv.isObj, unionNameOfExpr(ndv.isObj, fnIx), fnIx),
-    )
+    && msSetTakesAtomAsStr(msSetOfUnionBox(ndv.isObj, fnIx))
     && !readIsCallResult(ndv.isObj, fnIx)
   ) {
     let smI = 0
@@ -10767,12 +10766,16 @@ function emitUnionEqOther(body: u8[], otherIx: i32, k: i32, fnIx: i32) {
   emitExpr(body, otherIx, fnIx)
 }
 
-// The interned member set of the union box at `boxIx`, whose union name is `uname`: the row the
-// name binds, else the row its arena type keys to. A list element, a call result or a parameter
-// can carry an annotation spelling no row is bound under (`K|null|i32`), and with no set the
-// box's literal-union arm reads as absent (D12050). -1 when neither names a row.
-function msSetOfUnionBox(boxIx: i32, uname: string, fnIx: i32): i32 {
-  msSetOfNameTy(uname, unionBoxTyOfRead(boxIx, fnIx))
+// The interned member set of the union box at `boxIx`: the row its read's type keys, else, for
+// a nullable read, its non-null union's row. With no set the box's literal-union arm reads as
+// absent (D12050). -1 when neither names a row.
+function msSetOfUnionBox(boxIx: i32, fnIx: i32): i32 {
+  const ty = unionBoxTyOfRead(boxIx, fnIx)
+  const s = msSetOfTy(ty)
+  if s >= 0 || ty < 0 { return s }
+  // A nullable read keying no row is a box of its non-null union, whose miss rides the null tag.
+  const t = tyAt(ty)
+  if t is TyNullable { msSetOfTy(t.nInner) } else { -1 }
 }
 
 // The union `unionNameOfExpr` names for a read of a box (`unionBoxStoreTyOf`), else the read's
@@ -10807,7 +10810,7 @@ function emitUnionConcreteEq(
   // D-VALUNION / D-SETONCE: the union's interned member set, resolved ONCE — the
   // value-union gate below reads its banked member codes instead of re-splitting the
   // rendering.
-  const usid = msSetOfUnionBox(boxIx, uname, fnIx)
+  const usid = msSetOfUnionBox(boxIx, fnIx)
   // The arm spellings with a declared alias resolved, and the litunion-arm shape admitted beside
   // the plain value union — the same two lines `emitUnionLitIs` carries, for the same reason: a
   // `K | i32` box is a value-union box with the litunion arm riding it as its member string, and
@@ -12053,7 +12056,7 @@ function emitUnionLitIs(body: u8[], objIx: i32, lit: string, fnIx: i32) {
   const isOnce = !unionEqOperandOk(objIx)
   const uname = unionNameOfExpr(objIx, fnIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
-  const usid = msSetOfUnionBox(objIx, uname, fnIx)
+  const usid = msSetOfUnionBox(objIx, fnIx)
   // The arm spellings with a declared alias resolved — every predicate below that reads a name
   // reads this one, while the interned set stays keyed on the name the receiver carries.
   // `unionHasAtomTy` answers by splitting the spelling at top-level `|`,
@@ -15010,7 +15013,7 @@ function emitMapGetOrUnionBox(
   // un-interned value spelling re-splits (the ladder fall-through). One resolution
   // of the member set feeds both this walk and the residual-kind code below, so the
   // two do not each re-derive it and risk disagreeing.
-  const uvsid = msSetOfNameTy(uvn, mvValTyIxAt(mslot))
+  const uvsid = msSetOfTy(mvValTyIxAt(mslot))
   const atoms: string[] = []
   if !msMemberAtomsOfSet(uvsid, atoms) { unionSetAtomsOf(uvn, atoms) }
   const stashL = fnMvValStashLocal(mslot)
@@ -22401,6 +22404,13 @@ function emitIfExprRef(
   if kind == "str" && strJoinDropsNulAtom(ifIx, fnIx) {
     return refuseJoinDropsNul(ifIx)
   }
+  const split = joinCloSigSplitField(ifIx, fnIx)
+  if split >= 0 {
+    return emitFailAt(
+      "emitProgram: this record `if` stores functions of different signatures in one field, and a call through the joined record is lowered at one of them",
+      split,
+    )
+  }
   const open: i32[] = []
   let cur = ifIx
   let rc = 1
@@ -22414,6 +22424,35 @@ function emitIfExprRef(
     }
   }
   closeIfChainFrames(open, rc, false)
+}
+
+// The field value at which record join `ifIx`'s arms first store closures of two signatures in
+// one field, else -1: the joined record holds an untyped closure, which a call reads at one
+// signature; a tagged field holds an id and dispatches by it (D15809).
+function joinCloSigSplitField(ifIx: i32, fnIx: i32): i32 {
+  const names: string[] = []
+  const sigs: i32[] = []
+  for l in valueTailLeaves(ifIx) {
+    const o = nodeAt(l)
+    if !(o is ObjLit) { continue }
+    for fx in o.objFields {
+      const f = nodeAt(fx)
+      if !(f is FieldInit) { continue }
+      if fnTagSetIsTagged(fnTagSetOfTy(nodeTyAt(f.fiValue, fnIx))) { continue }
+      const fe = fieldValueFeOfIn(f.fiValue, fnIx)
+      const sg = if fe >= 0 { fnSigIdxOfFn(fe) } else { -1 }
+      if sg < 0 { continue }
+      let j = 0
+      while j < names.length && names[j] != f.fiName { j = j + 1 }
+      if j == names.length {
+        names.push(f.fiName)
+        sigs.push(sg)
+      } else if sigs[j] != sg {
+        return f.fiValue
+      }
+    }
+  }
+  -1
 }
 
 // Whether join arm `armIx` holds a `K | null` atom at this instance: by its pin, or, for a hole
@@ -32374,7 +32413,7 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
     const inm = inferRetNameOf(inferRetFnKey(fnIx, fn.fnName))
     if (
       isValueUnionOfSet(
-        msSetOfNameTy(inm, inferRetTyIxOf(inferRetFnKey(fnIx, fn.fnName))),
+        msSetOfTy(inferRetTyIxOf(inferRetFnKey(fnIx, fn.fnName))),
         inm,
       )
     ) {
@@ -41056,7 +41095,7 @@ function coalValUnionResidualKind(lhsIx: i32, cunm: string, fnIx: i32): i32 {
   // D-VALUNION resolves the declared union's set; the narrowing table's id below answers a
   // different question (the set surviving the narrow), so both stay resolved, and the null
   // test is a kind test over the banked codes.
-  const csid = msSetOfNameTy(cunm, nodeTyAt(lhsIx, fnIx))
+  const csid = msSetOfTy(nodeTyAt(lhsIx, fnIx))
   if (
     !isValueUnionOfSet(csid, cunm)
     || !unionHasAtomK(csid, cunm, "null", nullValKind())
@@ -41068,7 +41107,7 @@ function coalValUnionResidualKind(lhsIx: i32, cunm: string, fnIx: i32): i32 {
   const nt = readNarrowedTyAt(lhsIx, fnIx)
   if nt >= 0 { return unionResidualSoloKindOfSet(msSetOfTyAny(nt)) }
   let cak = unionResidualSoloKindOfSet(
-    msSetOfNameTy(cunm, unionDeclTyIxOfExpr(lhsIx, fnIx)),
+    msSetOfTy(unionDeclTyIxOfExpr(lhsIx, fnIx)),
   )
   if cak == -2 {
     cak = valueAtomKind(removeAtomFromSet(cunm, "null", nodeTyIxOf(lhsIx)))
@@ -41264,7 +41303,7 @@ function emitCoalesceCallStash(
       // D-VALUNION + D-SETONCE: one resolution feeds the value-union gate AND the
       // residual code below, which master resolved a second time inside
       // `unionResidualSoloKindOfSet`.
-      const ksid = msSetOfNameTy(kunm, nodeTyIxOf(lhsIx))
+      const ksid = msSetOfTy(nodeTyIxOf(lhsIx))
       if (
         isValueUnionOfSet(ksid, kunm)
         && unionHasAtomK(ksid, kunm, "null", nullValKind())
@@ -41472,7 +41511,7 @@ function emitCoalesceUnionField(
         munTy = mphysTy
       }
       // D-VALUNION + D-SETONCE — see the call arm above.
-      const msid = msSetOfNameTy(munm, munTy)
+      const msid = msSetOfTy(munTy)
       if (
         isValueUnionOfSet(msid, munm)
         && unionHasAtomK(msid, munm, "null", nullValKind())
@@ -42009,7 +42048,7 @@ function coalBoxFieldScalarKind(lhsIx: i32, fnIx: i32): i32 {
   }
   const un = memberUnionFieldNameRead(lhsIx, fnIx)
   if un == "" { return -1 }
-  const sid = msSetOfNameTy(un, nodeTyAt(lhsIx, fnIx))
+  const sid = msSetOfTy(nodeTyAt(lhsIx, fnIx))
   if !unionHasAtomK(sid, un, "null", nullValKind()) { return -1 }
   const k = unionResidualSoloKindOfSet(sid)
   if nulBoxScalarValtype(k) < 0 || vbHeapIdxOfKind(k) < 0 { return -1 }
