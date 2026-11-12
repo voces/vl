@@ -1,6 +1,7 @@
 // `emit_ref_list_kinds.vl` — the build kind of a ref list, and the destination
 // slots a lambda parameter or call writes.
 
+import { nodeTyAt } from "./emit_capture_frames"
 import {
   ArrayLit,
   AsExpr,
@@ -70,9 +71,14 @@ import {
 } from "./check_types"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
 import { unwrapParen } from "./emit_base"
-import { nonNulBaseOf, tyRefArrElemOf } from "./emit_map_value_slots"
-import { listRepOrNull } from "./emit_list_rep"
-import { variantIndexOf } from "./emit_local_slots"
+import { tyRefArrElemOf } from "./emit_map_value_slots"
+import {
+  eqListKindOfListRep,
+  isScalarBackedListRep,
+  listRepOrNull,
+  nulListBase,
+} from "./emit_list_rep"
+import { annDeclVariantRow } from "./emit_local_slots"
 import {
   nulScalarListBuildKind,
   nulVariantIndexOf,
@@ -91,20 +97,17 @@ import { repSlotOfKind } from "./emit_rep_slot"
 import {
   emptyArrLitIxOf,
   rlElemStructRow,
+  rlElemVariantRow,
   rlSlotOfTyOrTwin,
   tyIsNulLitUnionArr,
 } from "./emit_shape_rows"
 import {
-  LBK_F32_LIST,
   LBK_F64_LIST,
   LBK_I32_LIST,
   LBK_I64_LIST,
   LBK_NUL_BOOL_LIST,
   LBK_NUL_LIT_UNION_LIST,
-  LBK_REF,
   LBK_REF_AT_SLOT,
-  LBK_STR_LIST,
-  LBK_U8_LIST,
   LBK_UNION,
   RLK_CLOSURE,
   RLK_F32_LIST,
@@ -256,10 +259,10 @@ function listBuildAt(kind: i32, slot: i32): ListBuild {
 // The `VKind` an empty `[]`'s recorded array type reps as, or `null` when this is not an
 // element-pinned hole. Its ref-list row is resolved by NAME where the arena declines, which
 // is the one thing this reading has that the plain recorded-type one does not.
-export function emptyArrHoleKind(exprIx: i32): VKind | null {
+export function emptyArrHoleKind(exprIx: i32, fnIx: i32): VKind | null {
   const ax = emptyArrLitIxOf(exprIx)
   if ax < 0 { return null }
-  tyListRepKind(nodeTyIxOf(ax), emptyArrHoleElemSlot(exprIx))
+  tyListRepKind(nodeTyAt(ax, fnIx), emptyArrHoleElemSlot(exprIx, fnIx))
 }
 
 // True if `ty` is an array over a bare `TyPrim` element — the guard that keeps a leaf
@@ -268,48 +271,30 @@ export function emptyArrHoleKind(exprIx: i32): VKind | null {
 // scalar name, and a bare scalar is not a ref-list key: matching one would be a coincidence.
 function tyPrimLeafElem(ty: i32) { tyPrimLeafElemName(ty) != null }
 
-// The list build code (`LBK_*`, the `ListBuild.lbKind` alphabet) a list `VKind` + its ref-list
-// ROW demand. `0` (the i32-list default) for every
-// kind that is not a distinct-backing list, which is also right for the i32-backed ones.
+// The list build code (`LBK_*`, the `ListBuild.lbKind` alphabet) a list `VKind` and its ref-list
+// row demand: `eqListKindOfListRep`'s code for a non-null list, beside the rows and nullable
+// backings that build apart. `0` (the i32-list default) for every other kind.
 export function listBuildKindOfVKind(kind: VKind | null, slot: i32) {
-  // Exhaustive over `VKind` and `_`-less, `null` included: `0` is the i32 list's build code,
-  // a real answer, so a new list rep has to name its own rather than inherit it.
-  match kind {
-    "strlist" => {
-      return LBK_STR_LIST
-    }
-    "f64list" => {
-      return LBK_F64_LIST
-    }
-    "i64list" => {
-      return LBK_I64_LIST
-    }
-    "f32list" => {
-      return LBK_F32_LIST
-    }
-    "u8list" => {
-      return LBK_U8_LIST
-    }
-    "reflist" => {
-      if slot >= 0 && slot < rlElemTyIx.length {
-        if rlElemKindAt(slot) == RLK_UNION { return LBK_UNION }
-        if rlElemKindAt(slot) == RLK_CLOSURE { return LBK_REF_AT_SLOT }
-      }
-      return LBK_REF
-    }
-    "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" => {
-      return nulScalarListBuildKind(kind)
-    }
-    "list" | "nullist" | "nulreflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | null => {
-      // The i32-backed lists and every kind that is no list seed the i32-list default.
-      return LBK_I32_LIST
-    }
+  if kind == null { return LBK_I32_LIST }
+  if kind == "reflist" {
+    if rlElemKindAt(slot) == RLK_UNION { return LBK_UNION }
+    if rlElemKindAt(slot) == RLK_CLOSURE { return LBK_REF_AT_SLOT }
   }
+  // A nullable list over a distinct scalar backing builds in its nullable cell.
+  if isScalarBackedListRep(nulListBase(kind)) {
+    return nulScalarListBuildKind(kind)
+  }
+  const c = eqListKindOfListRep(kind)
+  // The i32-backed nullable lists and every kind that is no list seed the i32-list default.
+  if c < 0 { LBK_I32_LIST } else { c }
 }
 
 // The list build code an empty `[]` hole demands of `emitArr`.
-export function emptyArrHoleBuildKind(exprIx: i32) {
-  listBuildKindOfVKind(emptyArrHoleKind(exprIx), emptyArrHoleElemSlot(exprIx))
+export function emptyArrHoleBuildKind(exprIx: i32, fnIx: i32) {
+  listBuildKindOfVKind(
+    emptyArrHoleKind(exprIx, fnIx),
+    emptyArrHoleElemSlot(exprIx, fnIx),
+  )
 }
 
 // An empty `[]` delivered to a union is recorded as the union's first list member
@@ -331,8 +316,8 @@ export function emptyArrUnionArmKind(exprIx: i32): VKind | null {
 }
 
 // The ref-list row an empty `[]` hole builds at: its element's row, or 0 for a scalar list.
-export function emptyArrHoleBuildSlot(exprIx: i32) {
-  const s = emptyArrHoleElemSlot(exprIx)
+export function emptyArrHoleBuildSlot(exprIx: i32, fnIx: i32) {
+  const s = emptyArrHoleElemSlot(exprIx, fnIx)
   if s < 0 { return 0 }
   s
 }
@@ -369,9 +354,8 @@ export function rlWidenVariantOf(srcSlot: i32, dstSlot: i32): i32 {
   if dstSlot >= rlElemNullable.length { return -1 }
   if rlElemNullable[dstSlot] == 1 { return -1 }
   if srcSlot >= rlElemName.length { return -1 }
-  // LEG 1 — the element NAMES an arm (`Circle[]`). This is `rlElemVariantHeap`'s own
-  // lookup, which is where the slot's element heap came from in the first place.
-  const evi = variantIndexOf(nonNulBaseOf(rlElemName[srcSlot]))
+  // LEG 1: the element's type is an arm (`Circle[]`).
+  const evi = rlElemVariantRow(srcSlot)
   if evi >= 0 { return evi }
   // An inline shape or declared twin whose interned struct heap is an arm's heap (D280).
   // Compared on the resolved row, not `rlElemHeap` (pushed as 0 at intern time — a real index).
@@ -585,7 +569,7 @@ export function letAnnVariantIdx(letIx: i32) {
     if d.letType >= 0 {
       const lt = nodeAt(d.letType)
       if lt is TypeRef {
-        const lav = variantIndexOf(lt.tyName)
+        const lav = annDeclVariantRow(d.letType, lt.tyName)
         if lav >= 0 { return lav }
         // `Circle | null` seeds the same concrete variant the bare `Circle` annotation does:
         // the niche's non-null payload is a variant struct, so a literal must build that heap type.

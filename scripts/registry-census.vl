@@ -1,0 +1,533 @@
+// The emitter's spelling-keyed registries, by reader: every module-scope map keyed by `string`
+// in compiler/emit_*.vl and compiler/wasmEmit.vl, with the functions that read, write or reset it.
+//
+//     vl run scripts/registry-census.vl [-- --list | --probe <dir> | --reach <sweep.jsonl>] [--root DIR]
+//
+// Default is one line per registry. `--list` adds each user. `--probe <dir>` writes a copy of
+// compiler/ under <dir> in which every reader marks itself reached and `emitProgram` reports the
+// marks as its emit error. Build that copy with a seed, record a sweep with it, and pass the
+// sweep to `--reach` from the same tree for the programs reaching each reader. A mention in a
+// comment is no use, and a map handed on as an argument is read where it is handed on.
+
+import { IoError, writeTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { spawn } from "./lib/corpus"
+import { Utf8Error } from "std:utf8"
+import { endsWith, join, split, startsWith } from "std:str"
+import { insert } from "std:array"
+import { die, findFrom } from "./lib/common"
+import {
+  Fn,
+  cutComment,
+  functions,
+  isWord,
+  modules,
+  padL,
+  padR,
+  readOrDie,
+  rstrip,
+  strip,
+} from "./lib/ladder-walk"
+
+const TOOL = "registry-census"
+const TAG = "REGPROBE "
+const ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+type Reg = { rel: string, line: i32, name: string, valTy: string }
+
+// One function's use of one registry: whether it reads, writes or resets it.
+type Use = {
+  reg: i32,
+  rel: string,
+  fn: string,
+  lo: i32,
+  hi: i32,
+  reads: boolean,
+  writes: boolean,
+  resets: boolean,
+}
+
+function isEmitter(rel: string): boolean {
+  rel == "compiler/wasmEmit.vl" || startsWith(rel, "compiler/emit_")
+}
+
+// The value type of a `{[string]: V}` declaration's annotation, or "" when `ln` declares none.
+function stringMapVal(ln: string): string {
+  const k = findFrom(ln, ": {[string]: ", 0)
+  if k < 0 { return "" }
+  const a = k + 13
+  let depth = 1
+  let i = a
+  while i < ln.length {
+    if ln[i] == '{' { depth = depth + 1 }
+    if ln[i] == '}' {
+      depth = depth - 1
+      if depth == 0 { return strip(ln.slice(a, i)) }
+    }
+    i = i + 1
+  }
+  strip(ln.slice(a, ln.length))
+}
+
+// The declared name of a module-scope `let`/`const` line, or "".
+function declName(ln: string): string {
+  let i = 0
+  if startsWith(ln, "export ") { i = 7 }
+  if startsWith(ln.slice(i, ln.length), "let ") { i = i + 4 }
+  else if startsWith(ln.slice(i, ln.length), "const ") { i = i + 6 }
+  else { return "" }
+  let j = i
+  while j < ln.length && isWord(ln[j]) { j = j + 1 }
+  ln.slice(i, j)
+}
+
+// Whether line index `i` lies inside one of `fns`.
+function inFn(fns: readonly Fn[], i: i32): i32 {
+  let k = 0
+  while k < fns.length {
+    if i >= fns[k].lo && i <= fns[k].hi { return k }
+    k = k + 1
+  }
+  -1
+}
+
+function registries(mods: string[][]): Reg[] {
+  const out: Reg[] = []
+  for m in mods {
+    if !isEmitter(m[0]) { continue }
+    const lines = split(readOrDie(TOOL, m[1]), "\n")
+    const fns = functions(lines)
+    let i = 0
+    while i < lines.length {
+      const ln = lines[i]
+      const nm = declName(ln)
+      if nm != "" && inFn(fns, i) < 0 {
+        const v = stringMapVal(cutComment(ln))
+        if v != "" { out.push({ rel: m[0], line: i + 1, name: nm, valTy: v }) }
+      }
+      i = i + 1
+    }
+  }
+  out
+}
+
+// The names `lines` imports from the module whose file is `stem`.vl.
+function importsFrom(lines: readonly string[], stem: string): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < lines.length {
+    if startsWith(lines[i], "import {") {
+      let block = lines[i]
+      let j = i
+      while findFrom(lines[j], "} from ", 0) < 0 && j + 1 < lines.length {
+        j = j + 1
+        block = block + " " + lines[j]
+      }
+      if endsWith(rstrip(block), "\"./" + stem + "\"") {
+        const a = findFrom(block, "{", 0) + 1
+        const b = findFrom(block, "}", a)
+        for p in split(block.slice(a, b), ",") {
+          const n = strip(p)
+          if n != "" { out.push(n) }
+        }
+      }
+      i = j
+    }
+    i = i + 1
+  }
+  out
+}
+
+function stemOf(rel: string): string {
+  const s = rel.slice(9, rel.length)
+  s.slice(0, s.length - 3)
+}
+
+// The kind of the mention of a registry that ends at `e` on `ln`: 0 read, 1 write, 2 reset.
+function useKind(ln: string, e: i32): i32 {
+  let i = e
+  while i < ln.length && ln[i] == ' ' { i = i + 1 }
+  if i < ln.length && ln[i] == '[' {
+    let depth = 0
+    while i < ln.length {
+      if ln[i] == '[' { depth = depth + 1 }
+      if ln[i] == ']' {
+        depth = depth - 1
+        if depth == 0 { break }
+      }
+      i = i + 1
+    }
+    i = i + 1
+    while i < ln.length && ln[i] == ' ' { i = i + 1 }
+    if i + 1 < ln.length && ln[i] == '=' && ln[i + 1] != '=' { return 1 }
+    return 0
+  }
+  if i < ln.length && ln[i] == '.' {
+    const m = ln.slice(i + 1, ln.length)
+    if startsWith(m, "set(") || startsWith(m, "delete(") { return 1 }
+    if startsWith(m, "clear(") { return 2 }
+    return 0
+  }
+  if i + 1 < ln.length && ln[i] == '=' && ln[i + 1] != '=' { return 2 }
+  0
+}
+
+function uses(mods: string[][], regs: readonly Reg[]): Use[] {
+  const out: Use[] = []
+  for m in mods {
+    const lines = split(readOrDie(TOOL, m[1]), "\n")
+    const fns = functions(lines)
+    // The registries this module can name: its own, and those it imports.
+    const seen: i32[] = []
+    let r = 0
+    while r < regs.length {
+      if regs[r].rel == m[0] {
+        seen.push(r)
+      } else {
+        for n in importsFrom(lines, stemOf(regs[r].rel)) {
+          if n == regs[r].name { seen.push(r) }
+        }
+      }
+      r = r + 1
+    }
+    if seen.length == 0 { continue }
+    let f = 0
+    while f < fns.length {
+      for ri in seen {
+        const nm = regs[ri].name
+        let reads = false
+        let writes = false
+        let resets = false
+        let i = fns[f].lo
+        while i <= fns[f].hi {
+          const ln = cutComment(lines[i])
+          let at = findFrom(ln, nm, 0)
+          while at >= 0 {
+            const e = at + nm.length
+            const before = at == 0 || !isWord(ln[at - 1])
+            const after = e >= ln.length || !isWord(ln[e])
+            if before && after && (at == 0 || ln[at - 1] != '.') {
+              const k = useKind(ln, e)
+              if k == 0 { reads = true }
+              if k == 1 { writes = true }
+              if k == 2 { resets = true }
+            }
+            at = findFrom(ln, nm, e)
+          }
+          i = i + 1
+        }
+        if reads || writes || resets {
+          out.push(
+            {
+              reg: ri,
+              rel: m[0],
+              fn: fns[f].name,
+              lo: fns[f].lo,
+              hi: fns[f].hi,
+              reads: reads,
+              writes: writes,
+              resets: resets,
+            },
+          )
+        }
+      }
+      f = f + 1
+    }
+  }
+  out
+}
+
+// The reader functions, one per (module, function), in a stable order: each probe id.
+function readerIds(us: readonly Use[]): Use[] {
+  const out: Use[] = []
+  for u in us {
+    if !u.reads { continue }
+    let dup = false
+    for o in out {
+      if o.rel == u.rel && o.fn == u.fn { dup = true }
+    }
+    if !dup { out.push(u) }
+  }
+  out
+}
+
+function idOf(ids: readonly Use[], rel: string, fn: string): i32 {
+  let k = 0
+  while k < ids.length {
+    if ids[k].rel == rel && ids[k].fn == fn { return k }
+    k = k + 1
+  }
+  -1
+}
+
+// The line index of the `{` that opens function `u`'s body, or -1 for a one-line function.
+function bodyOpen(lines: readonly string[], u: Use): i32 {
+  if u.lo == u.hi { return -1 }
+  let i = u.lo
+  while i < u.hi {
+    if endsWith(rstrip(cutComment(lines[i])), "{") { return i }
+    i = i + 1
+  }
+  -1
+}
+
+const PROBE_MODULE = "// Probe-only: the reach marks registry-census.vl's probe tree records.
+export let regBits: i32[] = []
+
+export function regMark(id: i32) {
+  while regBits.length <= id { regBits.push(0) }
+  regBits[id] = 1
+  0
+}
+
+export function regReset() {
+  regBits = []
+  0
+}
+
+// The marks, six to a character, or \"\" when none is set.
+export function regEncode(): string {
+  const alpha = \"\{ALPHA}\"
+  let any = false
+  for b in regBits {
+    if b != 0 { any = true }
+  }
+  if !any { return \"\" }
+  let s = \"\"
+  let i = 0
+  while i < regBits.length {
+    let v = 0
+    let w = 1
+    let k = 0
+    while k < 6 {
+      if i + k < regBits.length && regBits[i + k] != 0 { v = v + w }
+      w = w * 2
+      k = k + 1
+    }
+    s = s + alpha.slice(v, v + 1)
+    i = i + 6
+  }
+  s
+}
+"
+
+const OVERRIDE_FN = "
+// Probe-only: replaces any earlier failure with `msg`, so no mark is masked.
+export function emitFailOverride(msg: string) {
+  emitFailed = true
+  emitErr = msg
+  emitErrAt = -1
+  emitErrCursorAt = -1
+  ropeReset(W)
+  -1
+}
+"
+
+function writeOrDie(path: string, text: string) {
+  const r = writeTextFile(path, text)
+  if r is IoError { die("\{TOOL}: cannot write \{path} (\{r.msg})", 2) }
+  0
+}
+
+function replaceOnce(
+  text: string,
+  old: string,
+  new: string,
+  what: string,
+): string {
+  const at = findFrom(text, old, 0)
+  if at < 0 { die("\{TOOL}: the probe cannot find \{what}", 2) }
+  text.slice(0, at) + new + text.slice(at + old.length, text.length)
+}
+
+function probe(mods: string[][], ids: readonly Use[], dir: string) {
+  const mk = spawn("mkdir", ["-p", "\{dir}/compiler"])
+  if mk.code != 0 {
+    die("\{TOOL}: cannot create \{dir}/compiler (\{mk.err})", 2)
+  }
+  let skipped = 0
+  for m in mods {
+    let text = readOrDie(TOOL, m[1])
+    const lines = split(text, "\n")
+    let touched = false
+    // Insert from the bottom so earlier line indices stay valid.
+    let k = ids.length - 1
+    while k >= 0 {
+      const u = ids[k]
+      if u.rel == m[0] {
+        const at = bodyOpen(lines, u)
+        if at < 0 {
+          skipped = skipped + 1
+        } else {
+          insert(lines, at + 1, "  regMark(\{k})")
+          touched = true
+        }
+      }
+      k = k - 1
+    }
+    text = join(lines, "\n")
+    if touched { text = "import { regMark } from \"./reg_probe\"\n" + text }
+    if m[0] == "compiler/emit_bytes.vl" { text = text + OVERRIDE_FN }
+    if m[0] == "compiler/emit_sections.vl" {
+      text = "import { regEncode, regReset } from \"./reg_probe\"\n"
+        + "import { emitFailOverride } from \"./emit_bytes\"\n"
+        + text
+      text = replaceOnce(
+        text,
+        "  const rc = emitProgramRun(rootIx)\n",
+        "  regReset()\n  const rc0 = emitProgramRun(rootIx)\n  const rm = regEncode()\n  const rc = if rm != \"\" { emitFailOverride(\"\{TAG}\" + rm) } else { rc0 }\n",
+        "emitProgram's run line",
+      )
+    }
+    writeOrDie(dir + "/" + m[0], text)
+  }
+  writeOrDie(dir + "/compiler/reg_probe.vl", PROBE_MODULE)
+  const marked = ids.length - skipped
+  print(
+    "probe: \{ids.length} readers, \{marked} marked, \{skipped} one-line readers left unmarked, written to \{dir}/compiler",
+  )
+  0
+}
+
+// The reader ids a sweep record's message carries, decoded from its marks.
+function marksOf(msg: string): i32[] {
+  const out: i32[] = []
+  const a = findFrom(msg, TAG, 0)
+  if a < 0 { return out }
+  let i = a + TAG.length
+  let base = 0
+  while i < msg.length {
+    const v = findFrom(ALPHA, msg.slice(i, i + 1), 0)
+    if v < 0 { break }
+    let k = 0
+    let w = 1
+    while k < 6 {
+      if (v / w) % 2 == 1 { out.push(base + k) }
+      w = w * 2
+      k = k + 1
+    }
+    base = base + 6
+    i = i + 1
+  }
+  out
+}
+
+// The field `"msg": "..."` of one sweep record line, or "".
+function msgField(ln: string): string {
+  const a = findFrom(ln, "\"msg\": \"", 0)
+  if a < 0 { return "" }
+  const b = findFrom(ln, "\"", a + 8)
+  if b < 0 { return "" }
+  ln.slice(a + 8, b)
+}
+
+function main(args: string[]) {
+  let root = "."
+  let mode = "summary"
+  let path = ""
+  let i = 0
+  while i < args.length {
+    if args[i] == "--root" && i + 1 < args.length {
+      root = args[i + 1]
+      i = i + 1
+    } else if args[i] == "--list" {
+      mode = "list"
+    } else if (
+      (args[i] == "--probe" || args[i] == "--reach")
+      && i + 1 < args.length
+    ) {
+      mode = args[i].slice(2, args[i].length)
+      path = args[i + 1]
+      i = i + 1
+    } else {
+      die("\{TOOL}: unknown argument `\{args[i]}`", 2)
+    }
+    i = i + 1
+  }
+  const mods = modules(TOOL, root)
+  const regs = registries(mods)
+  const us = uses(mods, regs)
+  const ids = readerIds(us)
+  if mode == "probe" { return probe(mods, ids, path) }
+  // Programs reaching each reader id, and each registry, when a sweep is given.
+  const reach: i32[] = []
+  const regReach: i32[] = []
+  for _ in ids { reach.push(0) }
+  for _ in regs { regReach.push(0) }
+  let programs = 0
+  let marked = 0
+  if mode == "reach" {
+    for ln in split(readOrDie(TOOL, path), "\n") {
+      if strip(ln) == "" { continue }
+      programs = programs + 1
+      const ms = marksOf(msgField(ln))
+      if ms.length > 0 { marked = marked + 1 }
+      const hit: boolean[] = []
+      for _ in regs { hit.push(false) }
+      for id in ms {
+        if id < ids.length {
+          reach[id] = reach[id] + 1
+          for u in us {
+            if u.reads && u.rel == ids[id].rel && u.fn == ids[id].fn {
+              hit[u.reg] = true
+            }
+          }
+        }
+      }
+      let r = 0
+      while r < regs.length {
+        if hit[r] { regReach[r] = regReach[r] + 1 }
+        r = r + 1
+      }
+    }
+  }
+  let readers = 0
+  let r = 0
+  while r < regs.length {
+    let nr = 0
+    let nw = 0
+    let nz = 0
+    for u in us {
+      if u.reg == r {
+        if u.reads { nr = nr + 1 }
+        if u.writes { nw = nw + 1 }
+        if u.resets { nz = nz + 1 }
+      }
+    }
+    readers = readers + nr
+    const where = "\{regs[r].rel.slice(9, regs[r].rel.length)}:\{regs[r].line}"
+    const ty = "{[string]: \{regs[r].valTy}}"
+    let row = "\{padR(where, 30)} \{padR(regs[r].name, 28)} \{padR(ty, 26)} readers \{padL("\{nr}", 3)}  writers \{padL("\{nw}", 3)}  resets \{padL("\{nz}", 2)}"
+    if mode == "reach" { row = "\{row}  programs \{padL("\{regReach[r]}", 6)}" }
+    print(row)
+    if mode == "list" || mode == "reach" {
+      for u in us {
+        if u.reg != r { continue }
+        let k = ""
+        if u.reads { k = k + "r" }
+        if u.writes { k = k + "w" }
+        if u.resets { k = k + "z" }
+        let line = "    \{padR(k, 3)} \{u.rel.slice(9, u.rel.length)}:\{u.lo + 1} \{u.fn}"
+        if mode == "reach" && u.reads {
+          line = "\{line}  programs \{reach[idOf(ids, u.rel, u.fn)]}"
+        }
+        print(line)
+      }
+    }
+    r = r + 1
+  }
+  print(
+    "\{regs.length} string-keyed registries, \{readers} reader functions (\{ids.length} distinct)",
+  )
+  if mode == "reach" {
+    print("\{programs} programs in the sweep, \{marked} reach a reader")
+  }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die(TOOL + ": an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  main(argv)
+}

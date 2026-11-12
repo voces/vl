@@ -1,4 +1,6 @@
+import { tyIsVariantMember } from "./check_node_tys"
 import { mapStoredTyOf } from "./check_fn_tag_facts"
+import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { recNarrowRecordOf } from "./check_bind_adopt"
 
 // `emit_shape_rows.vl` — the shape and struct rows a spelling, object field set or
@@ -52,7 +54,7 @@ import {
   i32ToStr,
   nodeAt,
 } from "./ast"
-import { readNarrowedTyAt } from "./emit_capture_frames"
+import { nodeTyAt, readNarrowedTyAt } from "./emit_capture_frames"
 import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
 import { nodeRepTyIxOf, setCtorKeys } from "./check_core_state"
 import { recBuildElemTyOfInit } from "./check_rec_rows"
@@ -143,6 +145,7 @@ import {
   sFieldRowTyAt,
   sFieldTypeAt,
   sIsAnonRow,
+  sRowCanonOf,
   sScanLim,
   structIndexByName,
   structIndexOfTy,
@@ -207,6 +210,8 @@ import {
   listRepOfFieldCode,
   nulListBase,
   rlElemCodeIsList,
+  vkListClass,
+  vkNonNullTwin,
 } from "./emit_list_rep"
 import {
   mvValCanonId,
@@ -255,7 +260,6 @@ import {
   slotRowTyOf,
   tyDenotesFunc,
   tyMapKeyKind,
-  unRowOfKey,
 } from "./emit_rep"
 import {
   FC_CLOSURE,
@@ -360,6 +364,7 @@ import {
   isUNameDeclAB,
   isUNameKeyAB,
   nulArmTyOf,
+  tyIsBareMap,
   unNameBound,
   unionArmsOfTy,
   unionMemberCountOfName,
@@ -448,7 +453,8 @@ export function nulRefMapValInnerOfTy(valName: string, ty: i32): string {
   if tyIsArray(innerTy) {
     // `u8[]` names itself here, ahead of the shared scalar-list classifier and for D1008's
     // reason, so the niche admits exactly the element reps its non-null twin does.
-    if scalarListRepOfName(inner) != null { return inner }
+    const slrK = repOfTy(innerTy).rdKind
+    if vkListClass(slrK) == 1 && slrK != "reflist" { return inner }
     if tyIsRefArray(innerTy) { return inner }
     return ""
   }
@@ -721,30 +727,7 @@ export function mvValKindOfTy(ty: i32): i32 {
 // or map at its non-null twin, since the vals element carries the null. null with no type.
 export function mvValRepKindOfTy(ty: i32): VKind | null {
   if ty < 0 || ty >= T.tys.length { return null }
-  const k = repOfTy(ty).rdKind
-  match k {
-    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
-      return nulListBase(k)
-    }
-    "nulmap" => {
-      return "map"
-    }
-    "nulstr" => {
-      return "str"
-    }
-    "nulstruct" => {
-      return "struct"
-    }
-    "nulvariant" => {
-      return "variant"
-    }
-    "nulclosure" => {
-      return "closure"
-    }
-    "list" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "reflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulbool" | "nulnone" => {
-      return k
-    }
-  }
+  vkNonNullTwin(repOfTy(ty).rdKind)
 }
 
 // `mvValKindOfTy` of a value the descriptor boxes: a union box, unless it admits `null` beside a
@@ -1056,34 +1039,33 @@ export function uFieldMapShape(vi: i32, fj: i32): i32 {
 export function rlElemInnerSlot(slot: i32): i32 { rlInnerSlotOfElem(slot) }
 
 // The struct-table row of a ref-list element, in four rungs: arena identity through the
-// `sTyIx` sidecar, nominal identity, the canon-key row off the recorded type, then the row the
-// recorded type is stored at. Declining is not neutral: `mAssignTypeIndices` then writes a 0
-// heap (D208).
+// `sTyIx` sidecar, the canon-key row off the recorded type, the row the recorded type is stored
+// at, then the name's row for an element whose type finds none. Declining is not neutral:
+// `mAssignTypeIndices` then writes a 0 heap (D208).
 export function rlElemStructRow(slot: i32): i32 {
   if slot < 0 || slot >= rlElemName.length { return -1 }
   const ln = nonNulBaseOf(rlElemName[slot])
   const bn = structIndexByName(ln)
-  // The nominal floor, the exact complement of the read side's gate: a ref-list element whose
-  // name is a registered union variant and not a registered plain struct has no struct-table
-  // row, its heap being `variantHeap(vi)`, so every rung below must decline. Keyed on the name
-  // because variants are nominal, and it gates the arena rung too, ahead of it (D32).
-  if bn < 0 && variantIndexOf(ln) >= 0 { return -1 }
+  // An element whose type is a declared arm has no struct-table row, its heap being
+  // `variantHeap(vi)`, so every rung below declines (D32). The arm and its same-shape twins
+  // share that heap (D280), so the element's type, not its spelling, decides.
+  if rlElemVariantRow(slot) >= 0 { return -1 }
   const ar = rlElemStructIdxAt(slot)
   if ar >= 0 { return ar }
-  if bn >= 0 { return bn }
   const cr = repRowOfTyStruct(rlElemNonNulTyAt(slot), sScanLim())
   if cr >= 0 { return cr }
-  structRowOfRecordTy(rlElemNonNulTyAt(slot))
+  const tr = structRowOfRecordTy(rlElemNonNulTyAt(slot))
+  if tr >= 0 { return tr }
+  bn
 }
 
-// The variant-table row of the same element, the other side of `rlElemStructRow`'s floor. -1
-// for a plain struct element, an unregistered name, and a name the struct table declares.
-// Nominal by construction: a name lookup in each table.
+// The variant-table row of the same element, the other side of `rlElemStructRow`'s floor: the
+// arm row of the element's type when that type is a declared arm, else -1.
 export function rlElemVariantRow(slot: i32): i32 {
   if slot < 0 || slot >= rlElemName.length { return -1 }
-  const ln = nonNulBaseOf(rlElemName[slot])
-  if structIndexByName(ln) >= 0 { return -1 }
-  variantIndexOf(ln)
+  const t = rlElemNonNulTyAt(slot)
+  if !tyIsVariantMember(t) { return -1 }
+  repVariantShapeRowOf(t)
 }
 
 // The mv slot a map-element ref-list slot's value occupies — the chokepoint the map-element
@@ -1115,10 +1097,9 @@ export function mvValInnerMvSlot(slot: i32): i32 {
   mvSlotOfMapKeyKTys(tyMapKeyKind(m), -1, tyMapValOf(m))
 }
 
-// The `sFieldTgtStructIdx` twin for a variant's nested-struct field, with two extra rungs:
-// the arm twin and the mint. A variant's fields are recorded before the struct table exists, so
-// an arm-typed field banks the arm's own name and no `sNames` row ever carries it;
-// `armFieldStructRow` is the same resolver asked one phase later, once the mint has run.
+// The `sFieldTgtStructIdx` twin for a variant's nested-struct field, with an extra rung, the
+// mint: a variant's fields are recorded before the struct table exists, so an arm-typed field
+// may have no row until it is minted.
 export function uFieldTgtStructIdx(vi: i32, fi: i32): i32 {
   const ety = uFieldElemTyIxAt(vi, fi)
   const a = structIndexOfTy(ety)
@@ -1126,9 +1107,6 @@ export function uFieldTgtStructIdx(vi: i32, fi: i32): i32 {
   const c = repRowOfTyStruct(ety, sScanLim())
   if c >= 0 { return c }
   if vi < 0 || vi >= uFieldStart.length { return -1 }
-  const nm = sFieldElemName[uFieldStart[vi] + fi]
-  const ar = armFieldStructRow(nm)
-  if ar >= 0 { return ar }
   armStructRowMint(uFieldStart[vi] + fi)
 }
 
@@ -1321,7 +1299,7 @@ function jrUnionWantOf(f: i32): i32 {
     }
   }
   if isValueUnionTyOr(f) == 1 { return FC_UNION }
-  if unRowOfKey(f) >= 0 { return FC_UNION }
+  if unRowOfTyKey(f) >= 0 { return FC_UNION }
   -1
 }
 
@@ -1623,7 +1601,7 @@ function shapeFieldTypeCompatK(
     // `{r: 7}` literal builds. Second-pass only: applied on the strict pass it would let a
     // box row declared first win every single-field render ahead of the exact one.
     if lenient >= 1 && code == FC_UNION { return true }
-    // The literal widenings (D733), level 2 only — the name side of `objFieldCodeWidens`:
+    // The literal widenings (D733), level 2 only — the name side of the field-code widenings:
     // a render `{r:i32}` denotes `{r:i64}`/`{r:K}` for the same reason the literal built there.
     if lenient >= 2 {
       if want == FC_I32 {
@@ -2192,6 +2170,9 @@ export function refListElemKindOfTy(e: i32): i32 {
       return RLK_STRUCT
     }
     TyUnion => {
+      // A map and its twins are stored as that one map (D15540).
+      const tw = mapTwinUnionMember(e)
+      if tw >= 0 { return refListElemKindOfTy(tw) }
       return rlUnionElemKindOfTy(et.uMembers)
     }
     TyFunc => {
@@ -2226,9 +2207,8 @@ export function refListElemKindOfTy(e: i32): i32 {
 }
 
 // The kind of a union element with arms `ms`: arms that are all one type (an alias wrapper,
-// or a degenerate `A | A`) are that type, and any other union is boxed. Lists whose kinds
-// differ are boxed too; -1 where they share one: `i32[] | K[]` is one i32 list or a box by
-// how the producer spelled it, not by type.
+// or a degenerate `A | A`) are that type, and any other union is boxed. A union of lists is
+// `rlListUnionKindOfTy`'s.
 function rlUnionElemKindOfTy(ms: i32[]): i32 {
   if ms.length < 1 { return -1 }
   let same = true
@@ -2242,7 +2222,9 @@ function rlUnionElemKindOfTy(ms: i32[]): i32 {
   RLK_UNION
 }
 
-// The kind of a union of lists `ms`: the box where two arms' list kinds differ, else -1.
+// The kind of a union of lists `ms`: the one scalar wrapper they share (`i32[] | K[]` is one
+// i32 list), else the box, which two ref lists or two different wrappers need. -1 where an
+// arm has no kind.
 function rlListUnionKindOfTy(ms: i32[]): i32 {
   const k0 = refListElemKindOfTy(ms[0])
   if k0 < 0 { return -1 }
@@ -2251,7 +2233,8 @@ function rlListUnionKindOfTy(ms: i32[]): i32 {
     if k < 0 { return -1 }
     if k != k0 { return RLK_UNION }
   }
-  -1
+  if k0 == RLK_REF_LIST { return RLK_UNION }
+  k0
 }
 
 // The kind of a list element that is itself list `l` of `a`: the leaf's own wrapper for a
@@ -2488,9 +2471,11 @@ function fieldCodeOfSpelling(t: string, fty: i32) {
   }
   // A map-typed field stores a non-null ref to its value type's map struct, code 19. The mv
   // slot is interned by `collectA`'s arena scan of the annotation node, so emission re-finds
-  // it by the value name. A map-member union field (`{[string]: string} | string`) starts
-  // with `{[` too, but `!nameIsMapMemberUnion` routes it to the union test (code 16) instead.
-  if nameIsBareMap(t) { return FC_MAP }
+  // it by the value name. A union with a map member (`{[string]: string} | string`) is not a
+  // map, and goes to the union test (code 16).
+  if (fty >= 0 && tyIsBareMap(fty)) || (fty < 0 && nameIsBareMap(t)) {
+    return FC_MAP
+  }
   // A nullable map field stores a nullable ref to the value type's map struct, code 29 — the
   // field analogue of the `nulmap` local/param/return niche. Gated to the same supported
   // value kinds as the non-null map field, so a nullable map over an unrepresentable value
@@ -2911,20 +2896,11 @@ export function fieldRefElemName(tyIx: i32, code: i32) {
     // not: an inline-shape field records the name of its interned struct, so every
     // nominal-keyed use site resolves it like a declared `inner: Inner`.
     if code == FC_STRUCT {
-      // `nonNulBaseOf` is the answer-or-original fold applied here. The arena is checked
-      // first (`fieldBaseStructRow`); its -1 means "I do not know", never "no row" — the
-      // name-matcher path still answers for those.
+      // The row the field's type is stored at, else the spelling's non-null base, which a use
+      // site resolves once the struct table holds it.
       const ar = fieldBaseStructRow(tyIx)
       if ar >= 0 { return sNames[ar] }
-      const base = nonNulBaseOf(ty.tyName)
-      const idx = structRowOfSpelling(base)
-      if idx >= 0 { return sNames[idx] }
-      // An arm-typed field records its cross-table twin's name, not the arm's (D761): every
-      // code-15 consumer resolves through `structIndexByName`, a struct-table lookup where
-      // `Circle` has no row. The twin row's name resolves, and its heap is the arm's.
-      const armNm = armTwinRowName(base)
-      if armNm != "" { return armNm }
-      return base
+      return nonNulBaseOf(ty.tyName)
     }
     // The ATOM codes the shape-text recorder keys and the NODE recorder does not: a
     // code-0 literal-union field and a code-30 `K | null` niche field carry their union
@@ -3033,8 +3009,8 @@ function genTyParamLeaf(base: string) {
 // whether the emitter holds that union's row — `arrLitInferUnionElemName` reads this at
 // registration time when the row does not exist yet, and `arrLitBoxElem` adds the union-row
 // gate back for every classifier that consults it afterward. A literal union is excluded.
-export function arrLitBoxElemName(arrIx: i32): string {
-  const ty = nodeTyIxOf(arrIx)
+export function arrLitBoxElemName(arrIx: i32, fnIx: i32): string {
+  const ty = nodeTyAt(arrIx, fnIx)
   if ty < 0 { return "" }
   const t = tyAt(ty)
   if !(t is TyArray) { return "" }
@@ -3050,27 +3026,27 @@ export function arrLitBoxElemName(arrIx: i32): string {
 // boxed nullable scalar (`i32 | null`) is recorded as `TyNullable`, so the scalar classifiers
 // saw no box and claimed the literal, storing the wrong heap type. `arrLitNulRefElemKind == 2`
 // is the rung that claims it for the ref path instead, keeping both classifiers one answer.
-function arrLitNulBoxElem(arrIx: i32): boolean {
+function arrLitNulBoxElem(arrIx: i32, fnIx: i32): boolean {
   // A nullable function element is the closure niche, never the box, and its spelling doubles
   // per level of a shared record its parameters carry (D9810).
-  const ae = tyArrayElemIx(nodeTyIxOf(arrIx))
+  const ae = tyArrayElemIx(nodeTyAt(arrIx, fnIx))
   if ae >= 0 && ae < T.tys.length {
     const el = tyAt(ae)
     if el is TyNullable {
       if el.nInner >= 0 && tyAt(el.nInner) is TyFunc { return false }
     }
   }
-  if arrLitNulRefElemName(arrIx) == "" { return false }
-  arrLitNulRefElemKind(arrIx) == RLK_UNION
+  if arrLitNulRefElemName(arrIx, fnIx) == "" { return false }
+  arrLitNulRefElemKind(arrIx, fnIx) == RLK_UNION
 }
 
 // The registered form — `arrLitBoxElemName` plus the row check — for the scalar classifiers
 // to consult; not `arrLitUnionElemName` itself, which asks `arrLitIsStr` and would close a
 // cycle. The scalar classifiers are first-element probes, so `[1, "two"]` and `["two", 1]`
 // would otherwise disagree; the recorded element type is order-blind and answers for both.
-export function arrLitBoxElem(arrIx: i32): boolean {
-  if arrLitNulBoxElem(arrIx) { return true }
-  const nm = arrLitBoxElemName(arrIx)
+export function arrLitBoxElem(arrIx: i32, fnIx: i32): boolean {
+  if arrLitNulBoxElem(arrIx, fnIx) { return true }
+  const nm = arrLitBoxElemName(arrIx, fnIx)
   if nm == "" { return false }
   isUNameAB(17, nm, nodeArrayElemTyIx(arrIx))
 }
@@ -3098,7 +3074,7 @@ export function arrLitNulUnionElemName(arrIx: i32): string {
   const inner = tyAt(el.nInner)
   if !(inner is TyUnion) { return "" }
   if inner.uMembers.length < 2 || tyIsLitUnion(el.nInner) { return "" }
-  if arrLitNulRefElemKind(arrIx) != RLK_UNION { return "" }
+  if arrLitNulRefElemKind(arrIx, -1) != RLK_UNION { return "" }
   tyToNominalName(ae)
 }
 
@@ -3125,35 +3101,6 @@ export function arrLitObjBesideNonRecord(arrIx: i32): boolean {
         }
       }
     }
-  }
-  false
-}
-
-// True if the struct type at `ty` has a map field anywhere in its (nested-struct) shape,
-// depth-bounded against recursive struct definitions.
-export function tyStructHasMapField(ty: i32, depth: i32): boolean {
-  if ty < 0 { return false }
-  if depth > 12 { return false }
-  const t = tyAt(ty)
-  if !(t is TyObj) { return false }
-  const fts = t.objFieldTypes
-  let i = 0
-  while i < fts.length {
-    const ft = tyAt(fts[i])
-    // Exhaustive over `Ty` and `_`-less: a new arena variant that can hold a map field must be
-    // descended here rather than take the `false`.
-    match ft {
-      TyMap => {
-        return true
-      }
-      TyObj => {
-        if tyStructHasMapField(fts[i], depth + 1) { return true }
-      }
-      TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyArray | TyVar | TyLit | TyNeg => {
-        // Holds no map field of its own.
-      }
-    }
-    i = i + 1
   }
   false
 }
@@ -3206,16 +3153,16 @@ function tyMentionsFunc(ty: i32, depth: i32): boolean {
 // `TyFunc`, a nullable `TyFunc`, a bare `TyObj` (declines even with a closure field), or an
 // arrow at any depth (`tyMentionsFunc`), and `arrLitElemRender` names it. Narrowing the last
 // arm to "is it a `TyFunc`" still produces correct output but a markedly larger module.
-export function arrElemIsClosureTy(arrIx: i32): boolean {
-  if !arrElemIsClosureArena(arrIx) { return false }
+export function arrElemIsClosureTy(arrIx: i32, fnIx: i32): boolean {
+  if !arrElemIsClosureArena(arrIx, fnIx) { return false }
   // "" is the checker declining to name the element, a decline the arena cannot see. Asked
   // after the arena arms, which are cheap where the render is not.
-  arrLitElemRender(arrIx) != ""
+  arrLitElemRender(arrIx, fnIx) != ""
 }
 
 // `arrElemIsClosureTy`'s arena arms alone.
-function arrElemIsClosureArena(arrIx: i32): boolean {
-  const aty = nodeTyIxOf(arrIx)
+function arrElemIsClosureArena(arrIx: i32, fnIx: i32): boolean {
+  const aty = nodeTyAt(arrIx, fnIx)
   if aty < 0 { return false }
   const at = tyAt(aty)
   if at is TyArray {
@@ -3249,23 +3196,23 @@ function arrElemIsClosureArena(arrIx: i32): boolean {
 // `[Set()]`, a map-factory call), or "" — the map twin of `arrLitUnionElemName`. The name is
 // the checker's recorded element type, whose render is the string an annotated `{[K]: V}[]`
 // spelling reduces to, so both spellings intern one row of kind 3.
-export function arrLitMapElemName(arrIx: i32): string {
-  if arrLitElemRendersNoMap(arrIx) { return "" }
+export function arrLitMapElemName(arrIx: i32, fnIx: i32): string {
+  if arrLitElemRendersNoMap(arrIx, fnIx) { return "" }
   // A map of a tagged function set is stored as the `i32`-valued map (D15187).
-  const el = tyArrayElemIx(nodeTyIxOf(arrIx))
+  const el = tyArrayElemIx(nodeTyAt(arrIx, fnIx))
   const st = mapStoredTyOf(el)
   if st != el { return tyToNominalName(st) }
-  const cen = arrLitElemRender(arrIx)
+  const cen = arrLitElemRender(arrIx, fnIx)
   if cen == "" { return "" }
-  if !nameIsBareMap(cen) { return "" }
+  if !tyIsBareMap(el) { return "" }
   cen
 }
 
 // Whether `arrLitElemRender` cannot spell a bare map for the literal at `arrIx`, read off the
 // arena alone: a record, primitive, list or function element renders a name, a `{field`
 // shape, a `[]` suffix or a `(` group, none of which opens `{[`.
-function arrLitElemRendersNoMap(arrIx: i32): boolean {
-  const ty = nodeTyIxOf(arrIx)
+function arrLitElemRendersNoMap(arrIx: i32, fnIx: i32): boolean {
+  const ty = nodeTyAt(arrIx, fnIx)
   if ty < 0 || ty >= T.tys.length { return true }
   const t = tyAt(ty)
   if t is TyArray {
@@ -3316,8 +3263,8 @@ function arrLitNulRefGrouped(name: string, elemTy: i32): string {
 // `nodeArrayElemName` of the literal at `arrIx`, but the nominal spelling for an element that
 // `deepDeclRecName` names, or a function type nesting past depth 8: what the annotation
 // interns, without a render that spells a declared record by shape at every level.
-export function arrLitElemRender(arrIx: i32): string {
-  const ty = nodeTyIxOf(arrIx)
+export function arrLitElemRender(arrIx: i32, fnIx: i32): string {
+  const ty = nodeTyAt(arrIx, fnIx)
   if ty >= 0 && ty < T.tys.length {
     const t = tyAt(ty)
     if t is TyArray {
@@ -3406,11 +3353,11 @@ export function heldListElemTy(arrIx: i32): i32 {
   e
 }
 
-export function arrLitNestedElemName(arrIx: i32): string {
+export function arrLitNestedElemName(arrIx: i32, fnIx: i32): string {
   // A list holding a tagged set's ids is named by the rep the checker stamped on it (D15220).
   const held = heldListElemTy(arrIx)
   if held >= 0 { return tyToNominalName(held) }
-  const ty = nodeTyIxOf(arrIx)
+  const ty = nodeTyAt(arrIx, fnIx)
   if ty < 0 { return "" }
   const t = tyAt(ty)
   if t is TyArray {
@@ -3427,7 +3374,7 @@ export function arrLitNestedElemName(arrIx: i32): string {
         // side resolves it by declared name, which the structural render is not.
         const nnr = nestedNulRefElemNominal(t.aElem)
         if nnr != "" { return nnr }
-        const nen = arrLitElemRender(arrIx)
+        const nen = arrLitElemRender(arrIx, fnIx)
         if nen == "" { return "" }
         // The ref-list layer must also be able to name it: `refArrElemKind` answers a kind
         // for every name, so a render alone is not enough. Without this, `{r: K}[]` (no
@@ -3445,7 +3392,7 @@ export function arrLitNestedElemName(arrIx: i32): string {
 // route asks (`refListElemKindOfTy` over the element type), so the two never differ —
 // `rlInternName` banks the first kind against a shared rep key. That name is given only for a
 // list element, which the classifier always answers, so there is no spelling floor.
-export function arrLitNestedElemKind(arrIx: i32): i32 {
+export function arrLitNestedElemKind(arrIx: i32, fnIx: i32): i32 {
   // Only a list of the ids themselves is the i32 list; a list of such lists is a ref list (D15204).
   const et = tyArrayElemIx(nodeTyIxOf(arrIx))
   if fnTagListTy(et) {
@@ -3453,7 +3400,7 @@ export function arrLitNestedElemKind(arrIx: i32): i32 {
   }
   const held = heldListElemTy(arrIx)
   if held >= 0 { return refListElemKindOfTy(held) }
-  if arrLitElemRender(arrIx) == "" { return RLK_I32_LIST }
+  if arrLitElemRender(arrIx, fnIx) == "" { return RLK_I32_LIST }
   refListElemKindOfTy(tyArrayElemIx(nodeTyIxOf(arrIx)))
 }
 
@@ -3461,8 +3408,8 @@ export function arrLitNestedElemKind(arrIx: i32): i32 {
 // or "" — the struct twin of `arrLitUnionElemName`/`arrLitNestedElemName`, for an empty
 // literal with no element for `arrLitIsRef` to classify. The name is `shapeNominalOfTy`'s,
 // not the render.
-export function arrLitShapeElemName(arrIx: i32): string {
-  const ty = nodeTyIxOf(arrIx)
+export function arrLitShapeElemName(arrIx: i32, fnIx: i32): string {
+  const ty = nodeTyAt(arrIx, fnIx)
   if ty < 0 { return "" }
   const t = tyAt(ty)
   if t is TyArray {
@@ -3507,8 +3454,8 @@ function nulRefElemEmitName(nulTy: i32, innerTy: i32): string {
   tyToEmitName(nulTy)
 }
 
-export function arrLitNulRefElemName(arrIx: i32): string {
-  nulRefElemNameOfArrTy(nodeTyIxOf(arrIx))
+export function arrLitNulRefElemName(arrIx: i32, fnIx: i32): string {
+  nulRefElemNameOfArrTy(nodeTyAt(arrIx, fnIx))
 }
 
 // The same question over a TYPE rather than a literal node — the twin the nested walk asks,
@@ -3530,8 +3477,8 @@ function nulRefElemNameOfArrTy(ty: i32): string {
 // The element kind for `arrLitNulRefElemName`'s literal, asked of the one producer the
 // annotation route asks, exactly as `arrLitNestedElemKind` is (D1270). -1 for a literal with
 // no such name, which `arrLitNulUnionElemName` reads as no union box.
-export function arrLitNulRefElemKind(arrIx: i32): i32 {
-  if arrLitNulRefElemName(arrIx) == "" { return -1 }
+export function arrLitNulRefElemKind(arrIx: i32, fnIx: i32): i32 {
+  if arrLitNulRefElemName(arrIx, fnIx) == "" { return -1 }
   refListElemKindOfTy(tyArrayElemIx(nodeTyIxOf(arrIx)))
 }
 
@@ -3544,22 +3491,22 @@ export const ALK_I64 = 2
 // can see it (an ident or a call) — the fourth home of the rule `arrLitIsRef`,
 // `arrLitElemName`, and `arrLitElemKind` must agree on (D40). Gated on a `TyObj` element:
 // `shapeNominalOfTy` recurses through `TyArray` and would misname a nested list otherwise.
-export function arrLitNominalElemName(arrIx: i32): string {
-  const et = arrLitNominalElemTy(arrIx)
+export function arrLitNominalElemName(arrIx: i32, fnIx: i32): string {
+  const et = arrLitNominalElemTy(arrIx, fnIx)
   if et < 0 { return "" }
   shapeNominalOfTy(et)
 }
 
 // `arrLitNominalElemName`'s answer as the row's arena type, or -1.
-export function arrLitNominalRowTy(arrIx: i32): i32 {
-  const et = arrLitNominalElemTy(arrIx)
+export function arrLitNominalRowTy(arrIx: i32, fnIx: i32): i32 {
+  const et = arrLitNominalElemTy(arrIx, fnIx)
   if et < 0 { return -1 }
   shapeNominalRowTyOf(et)
 }
 
 // The recorded record element of list literal `arrIx` whose lead is no object, list or
 // function literal, or -1.
-function arrLitNominalElemTy(arrIx: i32): i32 {
+function arrLitNominalElemTy(arrIx: i32, fnIx: i32): i32 {
   const a = nodeAt(arrIx)
   if a is ArrayLit {
     if a.arrElems.length < 1 { return -1 }
@@ -3569,7 +3516,7 @@ function arrLitNominalElemTy(arrIx: i32): i32 {
     const rt = nodeRepTyIxOf(arrIx)
     const re = if rt >= 0 { tyArrayElemIx(rt) } else { -1 }
     if re >= 0 && tyAt(re) is TyObj { return re }
-    const aty = nodeTyIxOf(arrIx)
+    const aty = nodeTyAt(arrIx, fnIx)
     if aty < 0 { return -1 }
     const at = tyAt(aty)
     if at is TyArray {
@@ -4705,6 +4652,10 @@ let asrRow: i32[] = []
 // The struct row a record `ty` is stored under: a row spelled by its shape, the row recording
 // it, its declared name's row, then its rep row and, undeclared, the field-set scan; -1 for none.
 export function repStructRowOfTy(ty: i32): i32 {
+  sRowCanonOf(repStructRowOfTyGo(ty))
+}
+
+function repStructRowOfTyGo(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   const shp = repStructRowByShape(ty)
   if shp >= 0 { return shp }
@@ -4876,8 +4827,7 @@ export function tyRegGenNow(): i32 {
 }
 
 // The declared struct or variant name the record (or record list) type `ty` resolves to. ""
-// means the arena does not resolve it, not "no nominal": a caller holding a render keeps it
-// (`shapeNominalOr`).
+// means the arena does not resolve it, not "no nominal": a caller holding a render keeps it.
 export function shapeNominalOfTy(ty: i32): string {
   if ty < 0 { return "" }
   const t = tyAt(ty)
@@ -5127,32 +5077,8 @@ export function famRelayStructRow(si: i32) {
   0
 }
 
-// Whether the rows record type `recTy` builds at store field `name`, typed by a string literal
-// or literal set, as the literal-union atom: 1 the atom, 0 a string, -1 when no row answers or
-// its struct row and its union-arm variant row disagree. `recTy` is a record, a declared struct
-// or a union arm, never the union; a layout family's rows agree (D14752).
-export function rowFieldStoresAtom(recTy: i32, name: string): i32 {
-  if recTy < 0 || recTy >= T.tys.length || !(tyAt(recTy) is TyObj) { return -1 }
-  let s = -1
-  let si = repStructRowOfTy(recTy)
-  if si < 0 { si = repRowOfTyStruct(recTy, sScanLim()) }
-  if si >= 0 && si < sFieldStart.length {
-    const fi = sFieldIndex(si, name)
-    if fi >= 0 { s = fieldCodeStoresAtom(sFieldTypes[sFieldStart[si] + fi]) }
-  }
-  let v = -1
-  const vi = repVariantShapeRowOf(recTy)
-  if vi >= 0 && vi < uFieldStart.length {
-    const fj = variantFieldIndex(vi, name)
-    if fj >= 0 {
-      v = fieldCodeStoresAtom(armFieldTypes()[uFieldStart[vi] + fj])
-    }
-  }
-  if s >= 0 && v >= 0 && s != v { return -1 }
-  if s >= 0 { s } else { v }
-}
-
-// `rowFieldStoresAtom`'s answer read off struct row `si` alone, -1 for no row or field.
+// Whether struct row `si` stores field `name` as the literal-union atom: 1 the atom, 0 a string,
+// -1 for no row or field, or any other code.
 export function structRowFieldStoresAtom(si: i32, name: string): i32 {
   if si < 0 || si >= sFieldStart.length { return -1 }
   const fi = sFieldIndex(si, name)
@@ -5160,7 +5086,7 @@ export function structRowFieldStoresAtom(si: i32, name: string): i32 {
   fieldCodeStoresAtom(sFieldTypes[sFieldStart[si] + fi])
 }
 
-// `rowFieldStoresAtom`'s answer read off variant row `vi` alone, -1 for no row or field.
+// `structRowFieldStoresAtom` for variant row `vi`.
 export function variantRowFieldStoresAtom(vi: i32, name: string): i32 {
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const fj = variantFieldIndex(vi, name)
@@ -5168,7 +5094,7 @@ export function variantRowFieldStoresAtom(vi: i32, name: string): i32 {
   fieldCodeStoresAtom(sFieldTypes[uFieldStart[vi] + fj])
 }
 
-// `rowFieldStoresAtom`'s answer for a literal field stored at code `c`.
+// The atom answer for a literal field stored at code `c`: 1 the atom, 0 a string, else -1.
 function fieldCodeStoresAtom(c: i32): i32 {
   if c == FC_I32 { return 1 }
   if c == FC_STR { return 0 }
@@ -5179,6 +5105,10 @@ function fieldCodeStoresAtom(c: i32): i32 {
 // key, else that of the one declared record it is narrower than (`recNarrowRecordOf`). Never a
 // reference row, which no value is built at; -1 for none.
 export function structRowOfRecordTy(ty: i32): i32 {
+  sRowCanonOf(structRowOfRecordTyGo(ty))
+}
+
+function structRowOfRecordTyGo(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   const t = tyAt(ty)
   // A one-member alias of a record is stored at the row its declaration recorded, else its record's.
@@ -5219,13 +5149,10 @@ export function spellingHasStructRow(name: string): boolean {
   structRowOfRecordTy(ty) >= 0
 }
 
-// The struct row of a value spelled `name` whose type is `ty`, or -1: a declared struct by name,
-// none for a registered union variant (an arm has no struct row), else the row `ty`'s non-null
-// part is stored at.
+// The struct row of a value spelled `name` whose type is `ty`: the row `ty`'s non-null part is
+// stored at, or the spelling's row when `ty` is -1. An arm and its same-shape records share it.
 export function structRowOfNameTy(name: string, ty: i32): i32 {
-  const bn = structIndexByName(name)
-  if bn >= 0 { return bn }
-  if variantIndexOf(name) >= 0 { return -1 }
+  if ty < 0 { return structIndexByName(name) }
   structRowOfRecordTy(nonNullTy(ty))
 }
 
