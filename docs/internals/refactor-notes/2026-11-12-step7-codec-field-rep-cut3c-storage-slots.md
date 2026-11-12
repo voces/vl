@@ -12,6 +12,8 @@ the field code.
   `FieldSlotTable` union.
   - They read the storage kind through an exhaustive `match`.
   - The field code answers where the kind is null.
+  - `FieldSlotTable` is module-private. It is still a closed set, so `compiler/lint.vl` mirrors it as
+    `klFieldSlotTable` (`scripts/ladder-sets.vl`).
 - `sFieldStorageSlot` (`wasmEmit.vl`) and `uFieldStorageSlot` (`emit_lit_atoms.vl`) match on that
   table. They no longer compare codes.
 - **`fieldRowsStoreAlike(a, b)`** replaces `sFieldStoreCode` in `structRowIsProperPrefix`
