@@ -37,18 +37,20 @@ seeds, with 0 runs → not-runs. Its silent `return_inferred` (annotated) cell i
 D15753. The record-write and bound-list matrices from this lane are unchanged and have no losses.
 
 D15755's witness, a function returning the bound list `inner` at `((a: f64) => f64)[]`, refuses at
-the return too. Its row is re-graded when #7459 lands.
+the return too. Its row is re-graded here, since #7459 has landed.
 
 ## Proof
 
-**Full local sweep.** Fixpoint seeds, base master `f7bef919`, 24,014 programs:
+**Full local sweep.** Fixpoint seeds, base master `2fdf5714`, 24,029 programs:
 
 | | count |
 | --- | --- |
-| same | 24,013 |
+| same | 24,027 |
 | bytes-only | 0 |
-| output movers | 1 |
+| output movers | 2 |
 | runs → not-runs | 0 |
 | new compiler traps | 0 |
 
-The one mover is D15753, which goes from check-clean invalid wasm to a loud emit reject.
+The two movers are D15753 and D15755, which go from check-clean invalid wasm to a loud emit
+reject. The guard asks the returned value's type for a map and compares list kinds directly, so
+there is no ladder over `VKind` literals.
