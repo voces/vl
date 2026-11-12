@@ -1,4 +1,4 @@
-# Step 7 L2: a closure-result list field's element is judged by its type (28 → 27 parses), 2026-11-12
+# Step 7 L2: a closure-result list field's element is judged by its type ; five emit_base predicates deleted with their last callers, 2026-11-12
 
 Lane E, cut E3. `structElemArrayLowerable(t, ty)` (`emit_shape_intern`) decides whether a ref-list
 field of a closure-result record lowers: is the element a declared plain struct, or an inline
@@ -34,9 +34,29 @@ the two answers agree in all 12.
 - Render-parse with `--findings`: 13 renders, 28 → 27 parses (`emit_shape_intern` 2 → 1). The
   `--write-baseline` is in this PR.
 
+## Five emit_base predicates lose their last callers
+
+Master `8e0bb32c` brought in #7618, which deleted the ref-list name cluster (`refArrShapeKindGo`,
+`refArrElemNameGo` and their kin). On the merged tree, five `emit_base` spelling predicates have no
+caller left. Each one is deleted here:
+
+| predicate | parse sites |
+| --- | --- |
+| `nameIsI32ListArray` | 1 |
+| `nameIsMapArray` | 1 |
+| `nameIsClosureArray` | 2 |
+| `parenUnionArrElemName` | 4 |
+| `mapValNameOf` | 0 (counted at its callers) |
+
+Three `tyname` helpers had no other reader, so they are deleted too: `nameIsMapSpan`,
+`unionMemberCountSpan` and `arrElemIsArrayOf`. The dead-export budget named them.
+
+- A sweep of this deletion alone runs against the merged tree's own fixpoint seed. All 24,189
+  programs are the same, with 0 bytes-only movers.
+- Render-parse on the merged tree goes from 18 to 10 parses, with 13 renders. `emit_base.vl` goes
+  from 14 parses to 6.
+
 ## What stays in `emit_shape_intern`
 
-- **`iisPushFieldElem`'s `refArrElemName`.** It records `sFieldElemName`, the name a ref-list
-  slot is found by. That is the ref-list key's owner (lane F).
 - **The three renders.** These are `internShapeDeepOfTy`, `shapeWalkKeyOf` and
   `internArmShapeRow`. They stand while the struct table `sNames` keys rows by name.
