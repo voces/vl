@@ -30,7 +30,7 @@ the two answers agree in all 12.
 - Refresh ×2: fixpoint.
 - Sweep with fixpoint seeds on both sides, master `b08c0903` against the candidate: 24,186 same,
   0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
-- `scripts/gate.sh`: all 23 rows pass.
+- `scripts/gate.sh`: all 23 rows pass, on the branch and on the tree merged with master `46ebbb50`.
 - Render-parse with `--findings`: 13 renders, 28 → 27 parses (`emit_shape_intern` 2 → 1). The
   `--write-baseline` is in this PR.
 
