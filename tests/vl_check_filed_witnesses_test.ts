@@ -670,3 +670,41 @@ Deno.test({
     }
   },
 });
+
+// A repro's `// file: batch-*.vl` files are checked before its entry on one instance, and the
+// entry is graded by its own record in that batch: a clean entry by its run, a refused one as
+// a check reject, a refusal in a `batch-*` file moving neither.
+Deno.test({
+  name:
+    "check-filed-witnesses: a batch-* file is checked before the entry it precedes",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_cfw_batch_" });
+    try {
+      const doc = `${dir}/rows.md`;
+      const before =
+        '// file: batch-a.vl\nconst x: i32 = "nope"\nprint(x)\n// file: main.vl\n';
+      await Deno.writeTextFile(
+        doc,
+        [
+          `### D1 — runs after a refused program\n**closed**\n\nRepro:\n\n${
+            ind(before + "print(6 * 7)")
+          }\n\nWant:\n\n    42\n`,
+          `### D2 — refused after a refused program\n**loud check reject**\n\nRepro:\n\n${
+            ind(before + 'const y: i32 = "no"\nprint(y)')
+          }\n`,
+        ].join("\n"),
+      );
+      const got = await port(["--strict", doc], { WITNESS_CACHE: "0" });
+      if (
+        got.code !== 0 || !got.out.includes("2 graded · 2 as filed · 0 MOVED")
+      ) {
+        throw new Error(
+          `want exit 0 and 2 as filed, got ${got.code}:\n${got.out}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

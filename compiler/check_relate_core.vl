@@ -5944,7 +5944,7 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
       const c = holeSlotCallPath(an.fiIter, cp)
       if c < 0 { return false }
       cp.push("[]")
-      return holeSlotCallJudgeAt(c, cp, wp, pts)
+      return holeSlotCallJudgeAt(a, c, cp, wp, pts)
     }
   } else if an is Param {
     root = cwSlotPath(cwElemCallbackRecv(a), p0)
@@ -5965,7 +5965,7 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     // A slice of the call's result adds no step, yet still reads through the call.
     if c >= 0 && (cp.length > 0 || c != cwPeel(bi)) {
       for st in path { cp.push(st) }
-      return holeSlotCallJudgeAt(c, cp, wp, pts)
+      return holeSlotCallJudgeAt(a, c, cp, wp, pts)
     }
   }
   // A call through an element fixes the tuple of the member it runs (D3975 A), so an element
@@ -5997,11 +5997,13 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
   }
   if !(nodeAt(bd) is LetDecl) { return false }
   const init = parenPeelIx(cwBoundInitOf(cwBindingOf(root)))
+  // A callback's element is not lifted: the built-in hands it the list's own records.
+  const lift = elem || !(an is Param) && holeSlotFieldLift(a, init, path)
   const rets: i32[] = []
   let called = false
   if init >= 0 && init < P.nodes.length {
     const cn = nodeAt(init)
-    holeSlotRetApart = elem
+    holeSlotRetApart = lift
     const rj = cn is Call
       && holeSlotRetJudge(cn, rn.identName, path, wp, pts, 0, true)
     holeSlotRetApart = false
@@ -6025,8 +6027,46 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     nW,
     wp,
     pts,
-    elem && (nW == 0 || holeSlotWidenLift(bd, cwBindingOf(root), path)),
+    lift && (nW == 0 || holeSlotWidenLift(bd, cwBindingOf(root), path)),
   )
+}
+
+// Whether `a`, a loop or a read, reaches its place by fields, indexes and slices only, rooted at
+// a name that is no callback's parameter or at a call: no `?.`, no `.get`.
+function holeSlotPlainRead(a: i32): boolean {
+  let x = cwPeel(a)
+  if x >= 0 && x < P.nodes.length && nodeAt(x) is ForIn { return true }
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 16 {
+    const n = nodeAt(x)
+    if n is OptMember || cwGetRecv(x) >= 0 { return false }
+    if n is Member { x = cwPeel(n.memObj) }
+    else if n is Index { x = cwPeel(n.idxArr) }
+    else if cwSliceRecv(x) >= 0 { x = cwPeel(cwSliceRecv(x)) }
+    else { hops = 16 }
+    hops = hops + 1
+  }
+  if x < 0 || x >= P.nodes.length { return false }
+  if nodeAt(x) is Call { return true }
+  if !(nodeAt(x) is Ident) { return false }
+  const d = identDeclOf(x)
+  !(d >= 0
+    && d < P.nodes.length
+    && nodeAt(d) is Param
+    && cwElemCallbackRecv(d) >= 0)
+}
+
+// Whether the read `a` of a field through an element at `path` is lifted as an element is: a
+// plain read of a list at the place's root, one literal's, the binding's initialiser `init` or
+// the one value the call there returns.
+function holeSlotFieldLift(a: i32, init: i32, path: string[]): boolean {
+  if path.length < 2 || path[0] != "[]" || !holeSlotPlainRead(a) {
+    return false
+  }
+  const n = if init >= 0 && init < P.nodes.length { nodeAt(init) } else { null }
+  if !(n is Call) { return true }
+  const rets: i32[] = []
+  holeSlotCallRetsDeep(n, rets, 0) && rets.length == 1
 }
 
 // `holeSlotJudge` for a slot read `a` rooted at a call, `mk()[1].f`: every function the call's
@@ -6035,11 +6075,13 @@ function holeSlotCallRootJudge(a: i32, wp: i32[], pts: i32[]): boolean {
   const path: string[] = []
   const c = holeSlotCallPath(a, path)
   if c < 0 || path.length == 0 { return false }
-  holeSlotCallJudgeAt(c, path, wp, pts)
+  holeSlotCallJudgeAt(a, c, path, wp, pts)
 }
 
-// `holeSlotCallRootJudge` for the slot `path` (root first) of what the call `c` returns.
+// `holeSlotCallRootJudge` for the slot `path` (root first) of what the call `c` returns, read by
+// `a`.
 function holeSlotCallJudgeAt(
+  a: i32,
   c: i32,
   path: string[],
   wp: i32[],
@@ -6049,7 +6091,7 @@ function holeSlotCallJudgeAt(
   if !(cn is Call) { return false }
   const nm = holeCallRootName(cn)
   if nm == "" { return false }
-  const elem = path[path.length - 1] == "[]"
+  const elem = path[path.length - 1] == "[]" || holeSlotFieldLift(a, c, path)
   holeSlotRetApart = elem
   const rj = holeSlotRetJudge(cn, nm, path, wp, pts, 0, true)
   holeSlotRetApart = false

@@ -2636,8 +2636,8 @@ function monoSubstLetType(
   const tn = nodeAt(letType)
   if tn is TypeRef {
     if monoAnnMentionsTyParam(letType, typarams) {
-      // An anonymous-record binding is spelled by its shape, as a parameter pin's is: its
-      // `#anonN` handle inside a union names no type the registry can key (D12641).
+      // An anonymous-record binding is spelled by its shape: its `#anonN` handle inside a union
+      // names no type the registry can key (D12641).
       let sub = monoSubstAnn(tn.tyName, typarams, tvN, tvV)
       if sub != "" {
         sub = monoSubstAnonShapes(tn.tyName, typarams, tvN, tvV, sub)
@@ -3626,31 +3626,19 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
 // instance at the unsubstituted type. The two sites below close that: substitute at the
 // pin, and stop emitting the template (the prune at the end of `monomorphize`).
 
-// One annotation node, substituted through this instance's binding: a fresh `TypeRef`
-// when a type parameter substitutes (`T[]` → `f64[]`), or -1 for "nothing to do" — the
-// annotation is absent, already concrete, or names a type parameter this instance could
-// not bind. The substituted type rides along, gated on `tyHasTyVar` as at every such site.
+// One annotation node, substituted through this instance's binding: a fresh `TypeRef` spelled
+// from the substituted type (`T[]` → `f64[]`), -1 for an absent or concrete annotation, or -2
+// for one naming a type parameter this instance substitutes no new type for.
 function monoSubstAnnNode(
   pty: i32,
   typarams: string[],
-  tvN: string[],
-  tvV: string[],
   bN: string[],
   bT: i32[],
 ) {
   if pty < 0 { return -1 }
   const tn = nodeAt(pty)
   if tn is TypeRef {
-    // The RAW spelling where a type parameter is shadowed by a declared alias — the same
-    // read every other substitution site in this file takes, for `monoDeclAnnName`'s reason.
-    const ann = monoDeclAnnName(pty, tn.tyName, typarams)
     if monoAnnHasTyParam(pty, -1, typarams) {
-      const sub = monoSubstAnn(ann, typarams, tvN, tvV)
-      // -2, not -1: the annotation does name a type parameter and the substitution
-      // produced no new spelling for it, which the caller must tell apart from an
-      // already-concrete one: the prune must not stub a template still called by name.
-      if sub == "" { return -2 }
-      if sub == tn.tyName { return -2 }
       let sty = -1
       const orig = nodeTyIxOf(pty)
       if orig >= 0 {
@@ -3661,7 +3649,11 @@ function monoSubstAnnNode(
       }
       // Else the instance's own binding types it.
       if sty < 0 { sty = monoInstBindTyOf(orig) }
-      if sty < 0 { return synthTypeRefFb(sub, tn.pos, -1) }
+      // -2, not -1: the annotation does name a type parameter and no new type substitutes
+      // for it, which the caller must tell apart from an already-concrete one.
+      if sty < 0 { return -2 }
+      const sub = monoPinSpellShaped(sty)
+      if sub == "" || sub == tn.tyName { return -2 }
       return synthTypeRefTy(sub, tn.pos, sty)
     }
   }
@@ -3803,11 +3795,11 @@ function monoCloneLambdaSubst(
     // template must not appear in either.
     if !monoLamNodeIsTemplateCore(fnIx, typarams) { return -1 }
     const ps: i32[] = []
-    const psAny = monoLamSubstParams(a, fnIx, typarams, tvN, tvV, bN, bT, ps)
+    const psAny = monoLamSubstParams(a, fnIx, typarams, bN, bT, ps)
     if psAny < 0 { return -1 }
     let any = psAny > 0
     let nret = a.fnRet
-    const rt = monoSubstAnnNode(a.fnRet, typarams, tvN, tvV, bN, bT)
+    const rt = monoSubstAnnNode(a.fnRet, typarams, bN, bT)
     if rt >= 0 {
       nret = rt
       any = true
@@ -3926,8 +3918,6 @@ function monoLamSubstParams(
   a: FuncDecl,
   fnIx: i32,
   typarams: string[],
-  tvN: string[],
-  tvV: string[],
   bN: string[],
   bT: i32[],
   ps: i32[],
@@ -3937,7 +3927,7 @@ function monoLamSubstParams(
   while i < a.fnParams.length {
     const p = nodeAt(a.fnParams[i])
     if p is Param {
-      const nt0 = monoSubstAnnNode(p.parType, typarams, tvN, tvV, bN, bT)
+      const nt0 = monoSubstAnnNode(p.parType, typarams, bN, bT)
       // A parameter whose annotation rides a type parameter, or whose inferred type mono pins,
       // takes the elaboration's type for it at this instance where that type is closed.
       const lt = elabNodeTy(fnIx, elabWalkTop())
@@ -3947,7 +3937,6 @@ function monoLamSubstParams(
         && et < T.tys.length
         && !tyHasTyVar(et)
         && !tyReachesHole(et, 16)
-      const sp = if etShut { monoPinNominalSpelling(et) } else { "" }
       const tn = if p.parType >= 0 && p.parType < P.nodes.length { nodeAt(p.parType) } else { null }
       const tpos = if tn is TypeRef { tn.pos } else { p.pos }
       if nt0 >= 0 && !etShut {
@@ -3959,7 +3948,7 @@ function monoLamSubstParams(
         )
       }
       const nt = if etShut && nt0 >= 0 { synthTypeRefOfTy(et, tpos) } else { nt0 }
-      if etShut && nt0 >= 0 && sp != tyNameOf(nt0) {
+      if etShut && nt0 >= 0 && !tySame(et, nodeTyIxOf(nt0)) {
         return emitFailAt(
           "emitProgram: internal: parameter `"
             + p.parName
@@ -5885,8 +5874,6 @@ function monoSubstTyArgNodes(tas: i32[]): i32[] {
     const sub = monoSubstAnnNode(
       tas[i],
       monoCgcTyParams,
-      monoCgcTvN,
-      monoCgcTvV,
       monoCgcSubN,
       monoCgcSubT,
     )
@@ -7981,9 +7968,9 @@ function monoTagMapTy(t: i32): boolean {
   m is TyMap && fnTagTyIsTagged(m.mVal)
 }
 
-// The registry name of pinned type `st`'s box: its emitter spelling, canon'd as a union name.
+// The registry name of pinned type `st`'s box: the naming rule's spelling, canon'd as a union name.
 function monoPinUnionNameOfTy(st: i32): string {
-  monoPinUnionName(tyToEmitName(st))
+  monoPinUnionName(monoPinSpellShaped(st))
 }
 
 // D1042 — the emitter-vocabulary spelling of a name `monoSubstAnn` produced, for the shapes
@@ -20591,7 +20578,6 @@ function monoPinAnnotatedParam(
       const cr = monoPinTyParamComposite(
         p,
         fn,
-        ann,
         params,
         args,
         i,
@@ -21148,11 +21134,10 @@ function monoElabCompositeTy(
   ept
 }
 
-// Pins parameter `p`'s composite annotation `ann` riding type params: -1 on a refusal, else 0.
+// Pins parameter `p`'s composite annotation riding type params: -1 on a refusal, else 0.
 function monoPinTyParamComposite(
   p: Param,
   fn: FuncDecl,
-  ann: string,
   params: i32[],
   args: i32[],
   i: i32,
@@ -21300,15 +21285,20 @@ function monoPinTyParamComposite(
       callIx,
     )
   }
-  let pinC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+  // The parameter's type closed under the instance's typed bindings, spelled by the naming rule;
+  // a slot that stays open has no pin.
+  const po = monoClosedSlotTyAt(
+    patTy,
+    own,
+    tvN,
+    monoPinOwnTvAtRep(tvN, tvV, tvT),
+  )
+  let pinC = if po >= 0 { monoPinSpellShaped(po) } else { "" }
   const pinPlain = pinC
   if i < monoUnionRestPin.length && monoUnionRestPin[i] != "" {
     pinC = monoUnionRestPin[i]
   }
   if anRowPin != "" && pinC != "" { pinC = anRowPin }
-  if anRowPin == "" && pinC != "" {
-    pinC = monoSubstAnonShapes(ann, fn.fnTyParams, tvN, tvV, pinC)
-  }
   if pinC == "" { return monoArgTyFail(p.parName, fn.fnName) }
   // The coercion `monoWalk` deferred, since at that point the pin names
   // would be the type variables themselves. `pinC` is the substituted
@@ -21321,12 +21311,6 @@ function monoPinTyParamComposite(
     if monoCoerceFnValueTys(args[i], ctx, -1, delTys, pinCFt) < 0 { return -1 }
   }
   // The pin spells its own type where that closes and nothing replaced the substitution.
-  const po = monoClosedSlotTyAt(
-    patTy,
-    own,
-    tvN,
-    monoPinOwnTvAtRep(tvN, tvV, tvT),
-  )
   const poSp = if pinC == pinPlain && po >= 0 { monoPinSpellOf(po) } else { "" }
   pinned.push(if poSp != "" { poSp } else { pinC })
   // A generic function value's own type still rides its type variables, so

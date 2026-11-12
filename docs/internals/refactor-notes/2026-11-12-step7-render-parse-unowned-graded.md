@@ -34,5 +34,5 @@ renders the value type for a value `tyEmitNameNonEmpty` cannot decide; no progra
 
 - Refresh ×2 is a fixpoint at 6,644,730 bytes (−28, base `13fb735b`, 6,644,758).
 - Local sweep, fixpoint seeds on both sides: **23,954 same**, 0 bytes-only, 0 output movers.
-- The render-parse budget with `--findings` falls from 20 to **19** renders (`--budget-why`: the `anonMapValNameable` site left), parses unchanged at 58; the baseline is lowered here.
+- The render-parse budget with `--findings` falls by one render (`--budget-why`: the `anonMapValNameable` site left). On the tree merged with master after #7371 it reads **18** renders and 55 parses; the baseline is written there.
 - `regress.vl`, `lint-self`, `cases_wasm` (7,457), seed size, late demands and the dead-export budget (with `--findings`) pass.
