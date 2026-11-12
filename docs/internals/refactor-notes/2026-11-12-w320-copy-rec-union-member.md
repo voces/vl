@@ -19,3 +19,8 @@ and read at its own type through the box. The union list-result template's guard
 `record_into_record_union` cell now runs (48/48 + 4 owed). Every kept-maker template is unchanged.
 Fixture `kept-maker-record-copied-into-union-member-runs.vl`. Two members sharing field names stay
 refused.
+
+**Found on the way (D15727, clause 1, master too).** The sweep's one `runs → not-runs`
+(`inferred-result-delivered-wider-runs.vl`) was a copied call whose own record is also an arm of a
+row union with no annotated row: `copyArmRowOf` answered -1, so no copy was emitted. It now falls
+back to the variant's own row; fixture `copied-call-record-also-row-union-arm-runs.vl`.
