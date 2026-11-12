@@ -3,7 +3,8 @@
 // call's argument, return, binding and method constraints, and the `if` joins a type
 // parameter pinned. The per-kind checkers reach `checkNode` through `checkNodeHook`.
 
-import { cwIxCovers } from "./check_write_scan"
+import { cwIxCovers, cwPeelValue } from "./check_write_scan"
+import { recFreshDeclOf } from "./check_rec_fresh"
 import { identTyOf } from "./check_nar_store"
 import { declareDecl, identBoundFnDeclOf, identFnDeclOf } from "./check_scopes"
 import {
@@ -1738,7 +1739,11 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       // reported at this seam and answered true, the program being type-valid.
       const cwCode = covarWriteThrough(srcExpr, srcTy, dstTy)
       if cwCode == 1 {
-        covarWriteThroughErr(srcExpr, srcTy, dstTy)
+        // A list literal binding the floor refuses adopts the list it is delivered to instead,
+        // and the re-check judges its later stores there (D3340).
+        if !recLitListAdopt(srcExpr, srcTy, dstTy) {
+          covarWriteThroughErr(srcExpr, srcTy, dstTy)
+        }
         return true
       }
       // D853 — the second arm is a different unsoundness and says so. Two declared unions over one
@@ -1771,7 +1776,10 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       }
       if !wsSuppress && objShapeAdapterlessAt(srcExpr, srcTy, dstTy) {
         // A fresh binding that drops a field at its destination is built there (D15093).
-        if !recDropAdopt(srcExpr, srcTy, dstTy, srcExpr) {
+        if (
+          !recDropAdopt(srcExpr, srcTy, dstTy, srcExpr)
+          && !recLitListAdopt(srcExpr, srcTy, dstTy)
+        ) {
           objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
         }
       } else if srcTy != dstTy {
@@ -4322,4 +4330,22 @@ function fvaCopyCalleeAtInstance(callee: i32, lamTy: i32) {
   if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return 0 }
   nodeTySet(callee, lamTy)
   0
+}
+
+// Adopts the list `dstTy` for an un-annotated list literal binding `x` delivered there; true
+// when it noted the adoption.
+function recLitListAdopt(x: i32, srcTy: i32, dstTy: i32): boolean {
+  recLitListBinding(x) && recAdForce(x, srcTy, dstTy)
+}
+
+// Whether `x` reads an un-annotated binding of a list literal.
+function recLitListBinding(x: i32): boolean {
+  const p = cwPeelValue(x)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return false }
+  const d = recFreshDeclOf(p)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  dn is LetDecl
+    && dn.letType < 0
+    && dn.letInit >= 0
+    && nodeAt(parenPeelIx(dn.letInit)) is ArrayLit
 }
