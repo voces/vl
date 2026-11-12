@@ -36,7 +36,8 @@ Population: the sweep's 23,925 programs.
 | a resolver, or a reader that also asks the instance type | 21 | by design: the template type is the resolver's input |
 | an openness gate: the read only asks whether the template is open, then routes to an instance answer | 19 | by design |
 | a `…Tpl` function: the answer every frame shares, by contract | 2 | by design |
-| a raw read of an open type with no instance answer beside it | **18** | **convert to `nodeTyAt(x, fnIx)`** |
+| storage built from the template | 1 | by design: `nodeTyIsUnionRow`, below |
+| a raw read of an open type with no instance answer beside it | **17** | **convert to `nodeTyAt(x, fnIx)`** |
 
 **By design: the instance type never differs (26).**
 
@@ -137,7 +138,9 @@ frame shares. A frame that needs its own answer asks `arrLitFrameRefTy` first.
 | `emit_classify.vl:6550` | `arrLitIsRefTpl` | 105 | 17 |
 | `emit_classify.vl:6970` | `arrLitElemNameTpl` | 6 | 4 |
 
-**Convert (18).** Each reads a type parameter's template where the instance has a closed type.
+**By design: storage built from the template (1).** `nodeTyIsUnionRow` (`emit_obj_lit_fits.vl:1123`) was first graded a convert. Read at the instance type, it plans a shared-field read for `u is B` inside `f<T>`. But `u` is stored from the template (D14487), so `instance-recheck-agrees-with-template.vl` builds an invalid module. The template read is the storage's, by design.
+
+**Convert (17).** Each reads a type parameter's template where the instance has a closed type.
 
 | site | function | programs reaching / differing | owner |
 | --- | --- | --- | --- |
@@ -145,7 +148,6 @@ frame shares. A frame that needs its own answer asks `arrLitFrameRefTy` first.
 | `emit_classify.vl:4320` | `objLitTaggedFieldRow` | 70 / 53 | w318 |
 | `emit_classify.vl:4333` | `objLitTaggedFieldRow` | 12 / 1 | w318 |
 | `emit_classify.vl:9607` | `ifBuiltAtRecord` | 23 / 1 | w318 |
-| `emit_obj_lit_fits.vl:1123` | `nodeTyIsUnionRow` | 1 / 1 | w318 |
 | `emit_obj_lit_fits.vl:1356` | `emptyArrHoleElemSlot` | 39 / 39 | w318, in flight in #7243 (`nodeTyAt(ax, fnIx)`) |
 | `emit_ref_list_kinds.vl:262` | `emptyArrHoleKind` | 39 / 39 | w318, in flight in #7243 (`nodeTyAt(ax, fnIx)`) |
 | `emit_shape_rows.vl:3011` | `arrLitBoxElemName` | 129 / 18 | w311 |
@@ -163,8 +165,9 @@ frame shares. A frame that needs its own answer asks `arrLitFrameRefTy` first.
 - **w311 (10):** the ten `emit_shape_rows.vl` producers are the `arrLit*` name and row producers,
   in the shape-rows lane (rows keyed by type). Each differs in 17 to 178 programs. The common witness
   is D12920's or D105's generic list literal.
-- **w318 (8):** `letStoreHeldTy`, `objLitTaggedFieldRow` (two reads), `ifBuiltAtRecord`,
-  `nodeTyIsUnionRow` and `asExprNumSrcName`, plus the two empty-`[]` readers that #7243 converts.
+- **w318 (7):** `letStoreHeldTy`, `objLitTaggedFieldRow` (two reads), `ifBuiltAtRecord` and
+  `asExprNumSrcName`, plus the two empty-`[]` readers that #7243 converts. w308 takes the first
+  five, at the coordinator's handover.
   The four `emit_classify.vl` sites sit in a file w314 is cutting, so the convert coordinates with
   w314.
 
@@ -174,6 +177,6 @@ changes no bytes, or a sweep naming each mover.
 
 ## For the L1 line
 
-L1 can be deleted once the 18 converts land; the 68 by-design sites stay with the reasons above.
+L1 can be deleted once the 17 converts land; the 69 by-design sites stay with the reasons above.
 The line also reports `bindGenWalk` and `monoArgTyName` call counts. They are counts, not
 instance reads, and this classification does not grade them.
