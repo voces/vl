@@ -84,7 +84,9 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 - **Flow-sensitive reads of a `let`** (owner ruling B, 2026-11-02). A read of a `let` takes
   the type of the most recent write in scope, not the join of every write. DECISIONS.md §"A
   read of a `let` takes its most recent write's type". The `let x = null` and annotated-union
-  faces shipped; left is the function-valued face (a re-pointed `let` read into a list).
+  faces shipped; left is the function-valued face: a call or delivery through a re-pointed
+  generic `let` re-asks every write and its function set, not the write that reaches it (D15956,
+  D15957).
 - **An inferred result built at its destination** (owner ruling B, 2026-11-02). When one use
   delivers an un-annotated function's result into a wider record (or a list of them), the
   result is built at the destination and the function's other uses read it at that storage.
