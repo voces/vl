@@ -107,6 +107,44 @@ The accessors (`sFieldElemNameAt`, `variantFieldElemName`, `armFieldElemName`), 
 `famRelayStructRow`, and `variantRowAgree`'s and `armStageAgree`'s swaps), and `tyRegGenNow`'s
 length read.
 
+## The row-identity compares, converted
+
+One rule, `fieldElemSame` (`emit_state`): two field slots hold one element when their recorded
+element types are the same type, and by their element names only where a type is missing.
+`sFieldElemSame` and `armFieldElemSame` apply it to the struct and arm columns. These sites now
+use it: `variantRowFieldsMatch`, `structFieldCodesEq`, `variantLitPairKind`,
+`variantRowsTagEqual`, `variantFieldTysEq`, `variantFirstLayoutDisagreeField`, `sigFieldMayMatch`
+and `sharedFieldPlanDispatchable`.
+
+- **`sRowsTwin` keeps the name.** Keyed by type, it merged a row holding a list of function ids
+  with one holding a list of closures. The two hold one element type at two storages, and only the
+  name records which. The result was invalid wasm in `closures/fn-nested-record-field-list-written`
+  and `record-literal-written-into-slot-of-fn-widened-binding-runs`. That site was found by reverting
+  each file in turn. This is a floor: the function-tag pass decides the storage, not the type. It is
+  the class of D15880, where a rep depends on a tag decision.
+- **`annShapeIndexOf` and `annShapeWiderRowOf` stay inline.** They already follow the rule with
+  stored types. Their name fallback calls `shapeFieldElemName`, which can intern a deferred
+  element, so it must stay lazy.
+- **`variantRowAgree` and `armStageAgree` are normalizers, not compares.** They rewrite one name
+  to the other where the types are the same, and they go when no reader is left.
+
+The record-field box sites `emitStructFieldValueUnder` and `emitStructFieldStoreValue` hand
+`emitUnionBoxOwed` `""`: `boxDstName` derives the box from the field's type at both, in every
+program.
+
+Eight programs build different bytes and print the same on both seeds:
+
+| program | output |
+| --- | --- |
+| `named/d15204_run_list_in_record_written` | `1.5` |
+| `named/d15204_run_record_in_list` | `4` |
+| `named/d15220_cell_field_of_id_lists` | `4` |
+| `named/d15296_nested_list` | `5` |
+| `closures/fn-tagged-ids-in-records-in-nested-lists` | `4 4 4 4` |
+| `closures/fn-tagged-records-held-lists-of-two-depths` | `4 4 4` |
+| `closures/hole-fn-nested-list-in-record-field` | `4 6 9 1.5` |
+| `closures/hole-fn-nested-list-record-field-tagged` | `6 6 6 4` |
+
 ## Order
 
 1. (c): delete each unreached rung, with a control.
