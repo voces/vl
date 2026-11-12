@@ -1,7 +1,7 @@
 # Step 7, L6: two of lane G's union readers by type, 2026-11-12
 
 The coordinator handed lane B two slices of lane G's union-registry split. Measured on master
-`aad6de06`, 24,202 programs, with an accumulating probe.
+`b323f223`, 24,202 programs, with an accumulating probe.
 
 ## `memReadBoxedAtomKinds`
 
