@@ -15,9 +15,24 @@ shadow beside the old kind agreed in 46 of 46 tagged-record pins. The typed row 
 (`structRowOfRecordTy`, `repRowOfTyStruct`) disagreed in 12, because their `anonRowServes` filter
 separates `{f: Fn#a}` from `{f: Fn#b}`.
 
-The pin's text is unchanged. Naming the pin by its row (`#anon0`) still breaks D15640, D15651,
-`closures/hole-fn-inline-list-record-stored` and the two `functions/named-function-…-beside-hole`
-cases, so that step waits on the readers that special-case an `#anon` name.
+## The pin's text is a floor
+
+The text stays. After this change no reader resolves a row from it: it is an instance-key component,
+the same class as `gaeApplyFieldTy`'s spelling.
+
+Naming the pin by its layout's first row (`#anon0`) builds invalid modules in five programs:
+D15640, D15651, `closures/hole-fn-inline-list-record-stored`,
+`functions/named-function-in-record-beside-hole-record` and `…-handed-two-functions`. These
+also fail when `anonHandleTyIx` keeps a pin type of the same `repRowId`, and when
+`retStructRowIndex` asks the type before the name. For D15651, the invalid module differs from the
+valid one only in its type section: the rename changes the struct type one instance parameter is
+declared at.
+
+Today's pin is a spelling that is not a declared name. Every name reader misses it and falls to the
+parameter's recorded type, whose row is the one the argument values are built at. `#anon0` resolves
+by name to the first row of the layout, a different heap type. So naming the pin needs the
+value-build row exposed by type. `repRowOfTyStruct(bound)` is not that row: as a pin, it lost four of
+the five.
 
 ## Proof
 
