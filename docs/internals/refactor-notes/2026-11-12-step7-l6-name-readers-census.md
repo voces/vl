@@ -65,12 +65,13 @@ The `emit_mono.vl` pin namers are the largest of those.
 
 ## Changed
 
-The first batch takes five round-trip sites, each of which holds the row or the type the name
+The first batch takes four round-trip sites, each of which holds the row or the type the name
 came from:
 
 - `memberUnionFieldName`'s arm walk reads the arms off the read's row (`unReadRowOut`).
 - `sharedUnionFieldPlan` reads its member set off the read's row, or the expression's row.
-- `emitUnionConcreteEq` and `emitUnionLitIs` read their arm spelling off the box's row.
+- `emitUnionConcreteEq` reads its arm spelling off the box's row. `emitUnionLitIs`'s spelling
+  went from master with lane w316's atom-test cut, so it needs none.
 - `nodeMixedUnionName` reads the row its type keys to, instead of the row its rendered name binds.
 
 `unionMemberSetOfRow` (`emit_union_registry.vl`) is the row-first form of `unionMemberSetOf`.
@@ -79,7 +80,7 @@ came from:
 
 - **Self-compile.** `--prove-fixpoint` holds. The head source built by a master seed and by this
   one is byte-identical.
-- **Targeted.** The 200 file cells reaching the five sites were built on a master seed and this
+- **Targeted.** The 200 file cells reaching the five sites, before the master merge, were built on a master seed and this
   one: 200 byte-identical modules. CI's sweep is the proof for the population.
 - **Checks.** lint-self is clean. `regress.vl` loses no runs. A fresh `render-parse-census.vl`
   report reads 12 renders and 44 parses, the baseline. A fresh `dead-exports.vl` report has 0 dead
