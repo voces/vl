@@ -5343,6 +5343,34 @@ export function recCopyBoxesOnly(src: i32, dst: i32): boolean {
   recCopyBoxesAt(src, dst, REC_STORE_DEPTH)
 }
 
+// Whether a list's element `se` is copied into the element `de` of a list the copy builds: a
+// number widened exactly, a record under the copy's rule, or a list whose element is, at most
+// `depth` levels down.
+function recListElemCopies(se: i32, de: i32, depth: i32): boolean {
+  if (
+    se < 0
+    || de < 0
+    || se >= T.tys.length
+    || de >= T.tys.length
+    || depth <= 1
+  ) {
+    return false
+  }
+  if recNumWidens(se, de) { return true }
+  const s = tyAt(se)
+  const d = tyAt(de)
+  if s is TyObj { return recCopyBoxesAt(se, de, depth - 1) }
+  if s is TyArray && d is TyArray {
+    return fieldStorageEq(s.aElem, d.aElem, REC_STORE_DEPTH)
+      || recListElemCopies(s.aElem, d.aElem, depth - 1)
+  }
+  recListElemNoCopy(se, de)
+}
+
+// An element that is neither a number the copy widens, a record nor a list is not copied: a
+// union, `| null`, map, function or type variable element is delivered as it is stored.
+function recListElemNoCopy(_se: i32, _de: i32): boolean { false }
+
 // `recCopyBoxesOnly` with at most `depth` levels of record fields left.
 function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
   const so = tyAt(src)
@@ -5367,12 +5395,7 @@ function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
     // A list of numbers is copied element by element into a list of a number they widen to.
     const lists = sp is TyArray
       && dn is TyArray
-      && (recNumWidens(sp.aElem, dn.aElem)
-      || depth > 1
-      && sp.aElem >= 0
-      && sp.aElem < T.tys.length
-      && tyAt(sp.aElem) is TyObj
-      && recCopyBoxesAt(sp.aElem, dn.aElem, depth - 1))
+      && recListElemCopies(sp.aElem, dn.aElem, depth)
     // A number is converted exactly into a wider one.
     const widens = sp is TyPrim && recNumWidens(sf, df)
     // A nested record is copied by the level below, under the same rule, into a record or a
@@ -5475,6 +5498,18 @@ function recHeldFreshCopy(p: i32, o: i32, srcTy: i32, dstTy: i32): boolean {
 // How many bindings `recAdoptNote` is delivering through: a call a binding holds is not the
 // delivered value itself.
 let recAdHeldDepth = 0
+
+// Whether `p` is a record literal's field value or the value of a field write.
+function recInRecordField(p: i32): boolean {
+  cwIxBuild()
+  if !cwIxCovers(p) { return false }
+  const k = cwIxUpKind[p]
+  if k == CW_UP_FIELD { return true }
+  if k != CW_UP_ASG_RHS { return false }
+  const a = nodeAt(cwIxUp[p])
+  if !(a is BinExpr) { return false }
+  nodeAt(parenPeelIx(a.binLeft)) is Member
+}
 
 // A call's value is fresh, so a destination storing a field differently gets a copy of it,
 // recorded on the call, and its function `fd`, called more than once, keeps its own record.
