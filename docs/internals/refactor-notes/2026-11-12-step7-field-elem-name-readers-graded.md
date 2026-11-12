@@ -145,6 +145,21 @@ Eight programs build different bytes and print the same on both seeds:
 | `closures/hole-fn-nested-list-in-record-field` | `4 6 9 1.5` |
 | `closures/hole-fn-nested-list-record-field-tagged` | `6 6 6 4` |
 
+## The row lookups, graded
+
+- **Deleted.** `leqNoteVariantFields` and `leqNoteStructRowFields` (E14, E15) tested the name inside
+  a branch already narrowed to a ref-list field. A probe found the name set in every reach (2 and
+  13 programs), so the test is gone.
+- **Converted.** `eqgFieldRefSlot` (E19) asks whether the field's slot is a ref list; the shadow
+  agreed in 4 of 4.
+- **Floors: the walk's typeless class.** `variantNestedRow` (E56) and `armFieldStructRowMinted`
+  (E16) intern a nested row under the field's spelling. `sFieldRefSlot` (E36, E37) mints a ref list
+  by name only for an element whose type is a type variable or is unrecorded. All three go when the
+  shape walk hands those fields a type.
+- **Next.** `variantFieldElemNameOr` (E20, 2 programs) is a presence test whose control flow
+  differs from the slot-table test (a struct field's non-empty name stops the rung), so it needs
+  its own shadow.
+
 ## Order
 
 1. (c): delete each unreached rung, with a control.
