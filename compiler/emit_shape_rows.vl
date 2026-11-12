@@ -137,7 +137,6 @@ import {
 } from "./check_types"
 import {
   code0KindOf,
-  declRowFnSpellingFits,
   fieldRowIsMap,
   fieldRowIsPlainI32,
   fieldRowIsRecordRef,
@@ -147,9 +146,6 @@ import {
   fieldRowsStoreAlike,
   rowCanonIdOfName,
   sFieldElemNameAt,
-  sFieldFlatRow,
-  sFieldRowTyAt,
-  sFieldTypeAt,
   sIsAnonRow,
   sRowCanonOf,
   sScanLim,
@@ -191,11 +187,8 @@ import { emitFail } from "./emit_bytes"
 import {
   code0SpellingFitsRow,
   mvArmHintOfShapeTy,
-  nameIsRecordSpelling,
   nameIsWholeSpanShape,
-  nestedStructNamesCompat,
   shapeFieldParse,
-  unionMemberSetsCompat,
   variantRowOfOwnRenderTy,
 } from "./emit_field_codes"
 import {
@@ -331,6 +324,7 @@ import {
   mvValName,
   mvValRep,
   mvValStructIdx,
+  rlArmRowMint,
   rlElemKey,
   rlElemName,
   rlElemTyIx,
@@ -400,7 +394,6 @@ import {
   annGenAppSpanEnds,
   arrElemIsArrayOf,
   arrElemNameRaw,
-  fnRetTextOf,
   gaeArgsTextOf,
   gaeHeadNameOf,
   gaeLtAt,
@@ -1203,21 +1196,6 @@ function jrUnionWantOf(f: i32): i32 {
   -1
 }
 
-// Whether row `si`'s field `fj` may hold a string-literal or literal-union field: not when the
-// row's own field type is known and is neither, as a declared `{k: string}` or `{k: i32}` is,
-// since that row reads the value at another rep (D11030).
-function rowFieldTakesLit(si: i32, fj: i32): boolean {
-  const r = sFieldFlatRow(si, fj)
-  if !fieldRowIsPlainI32(r) && !fieldRowIsStr(r, false) { return true }
-  const rt = sFieldRowTyAt(si, fj)
-  rt < 0 || tyIsLitUnionOrLit(rt)
-}
-
-// Whether field spelling `t` is a string literal or a literal union.
-function nameIsLitSpelling(t: string): boolean {
-  nameIsLitUnionType(t) || nameIsOneStrLit(t)
-}
-
 // `jrFieldFits` against a field given by its code, element name and element type, so a union
 // arm's field asks the same question as a struct row's.
 function jrFieldFitsAt(
@@ -1288,23 +1266,10 @@ function jrMapValFits(f: i32, et: i32): boolean {
   true
 }
 
-// The struct table index a type NAME names: a declared struct name directly, or an INLINE
-// object-shape name (`{x:i32,y:i32}`) matched by field-name SET against the interned shapes
-// (the anonymous literals interned the same sets). -1 if neither.
-export function structIndexOfTypeName(name: string) {
-  const gen = tyRegGenNow()
-  if memoMoved(trgReadGenKey, 0, gen) { sitnMemo = Map() }
-  const hit = sitnMemo[name]
-  if hit != null { return hit }
-  const si = structIndexOfTypeNameGo(name)
-  if trgGen == gen { sitnMemo[name] = si }
-  si
-}
-
-// `structIndexOfTypeName` given the arena type `ty` of `name` (or of its `| null` niche), -1 for
-// none: the name, the own and canonical-key rows of `ty` and of its non-null part, the field-TYPE
-// scan (reached only by a canon-key twin), then the spelling. A declared record with no own row
-// never gets another type's same-shape row: callers read that miss as a decision.
+// The struct row `name` names given its arena type `ty` (or its `| null` niche's), -1 for none:
+// the name, then the own and canonical-key rows of `ty` and of its non-null part. A declared
+// record with no own row never gets another type's same-shape row: callers read that miss as a
+// decision.
 export function structIndexOfTypeNameTy(name: string, ty: i32): i32 {
   const si = structIndexByName(name)
   if si >= 0 { return si }
@@ -1322,7 +1287,7 @@ export function structIndexOfTypeNameTy(name: string, ty: i32): i32 {
     if oo >= 0 { return oo }
     return repRowOfTyStruct(ot, sScanLim())
   }
-  structIndexOfTypeName(name)
+  -1
 }
 
 // The struct row the non-null part of nullable type `ty` names, by `structIndexOfRecordTy`; -1
@@ -1339,77 +1304,6 @@ function structIndexOfRecordTy(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   if structNameOfTy(ty) != "" { return structIndexOfTy(ty) }
   -1
-}
-
-// `structIndexOfTypeName`'s answers by name, all for the generation `trgReadGenKey` last read;
-// an answer whose own computation moved the generation is not kept.
-let sitnMemo: {[string]: i32} = Map()
-
-// Every caller asks `structIndexByName` first, so a declared name never reaches this.
-function structIndexOfTypeNameGo(name: string) {
-  // Only a single shape spanning the whole name is a bare struct — a composite (`{…}|null`,
-  // `{…}|{…}`, `{…}[]`) is not, so a nullable-struct name must not mis-match its leading shape.
-  if nameIsWholeSpanShape(name) {
-    // Collect the top-level field names + type texts (`shapeFieldParse`), then match by
-    // field-name set tightened with a field-type layout guard (`shapeFieldTypeCompatK`):
-    // two shapes sharing field names but differing in a field's type must not collide.
-    const fnames: string[] = []
-    const ftypes: string[] = []
-    shapeFieldParse(name, fnames, ftypes)
-    return shapeRowScanK(fnames, ftypes)
-  }
-  -1
-}
-
-// The row scan `structIndexOfTypeName` runs for a shape spelling that resolves no type: the
-// struct row whose field names are the spelling's and whose field types it does not refute.
-function shapeRowScanK(fnames: string[], ftypes: string[]): i32 {
-  let uniq = -1
-  let si2 = 0
-  const sLimB = sScanLim()
-  while si2 < sLimB {
-    // Skip a struct whose per-field rows aren't fully appended yet: `internInlineShape`
-    // pushes the header before populating its field rows one at a time, and a code-5
-    // ref-list field's element-name computation can re-enter this scanner mid-loop.
-    // Reading a not-yet-pushed trailing field is an out-of-bounds compiler crash.
-    if sFieldStart[si2] + sFieldCount[si2] > sFieldElemName.length {
-      si2 = si2 + 1
-      continue
-    }
-    if sFieldCount[si2] == fnames.length {
-      let ok = true
-      let k = 0
-      while k < fnames.length {
-        const fj = sFieldIndex(si2, fnames[k])
-        if fj < 0 {
-          ok = false
-        } else if (
-          !shapeFieldTypeCompatK(
-            ftypes[k],
-            sFieldTypeAt(si2, fj),
-            sFieldElemNameAt(si2, fj),
-            sFieldElemTyIxAt(si2, fj),
-          )
-        ) {
-          ok = false
-        } else if !declRowFnSpellingFits(ftypes[k], si2, fnames[k]) {
-          ok = false
-        } else if nameIsLitSpelling(ftypes[k]) && !rowFieldTakesLit(si2, fj) {
-          ok = false
-        }
-        k = k + 1
-      }
-      if ok {
-        // A strict match on a row whose `i32` or `boolean` field is the other kind is kept only
-        // as a fallback: the two share a layout, but a read formats by the row, and the
-        // spelling's own row may come later in the table (D2866; an anonymous row, D3693).
-        if code0SpellingFitsRow(fnames, ftypes, si2) { return si2 }
-        if uniq < 0 { uniq = si2 }
-      }
-    }
-    si2 = si2 + 1
-  }
-  uniq
 }
 
 // True if two map value types `vaTy`/`veTy` (or -1) denote the same map rep: the code-19
@@ -1431,92 +1325,8 @@ export function mvValTysCompat(vaTy: i32, veTy: i32): boolean {
   true
 }
 
-// Whether shape field type-string `t` is not a proven mismatch with emitter field code
-// `code`, whose row records element `elem` of arena type `elemTy` (-1 unknown): lenient when
-// `t` cannot classify, a map field tightened by its value rep.
-function shapeFieldTypeCompatK(
-  t: string,
-  code: i32,
-  elem: string,
-  elemTy: i32,
-): boolean {
-  const want = nameFieldCode(t, -1)
-  if want < 0 || code < 0 {
-    // A nested-struct candidate field (code 15) whose spelled type can't classify is
-    // almost always an inline nested shape — tighten by canonical structural key so two
-    // arms sharing a field-name set but differing in nested layout don't collide.
-    if code == FC_STRUCT && elem != "" {
-      const tb = nonNulBaseOf(t)
-      return nestedStructNamesCompat(tb, elem)
-    }
-    // An inline record, or an application of a generic record alias (`Box<A>`), is a struct
-    // field, so `{v:{x:i32}}` takes neither a `{v: A[]}` row nor a box row (D3898, D3920, D3901).
-    if code >= 0 && nameIsRecordSpelling(nonNulBaseOf(t)) {
-      return code == FC_STRUCT
-    }
-    // No refutation arm here: every caller reaching this point is already routed through
-    // an arena resolver that separates nested-alias twins by their full nested type.
-    return true
-  }
-  if want != code {
-    // A literal union has two reps, so `K` against a code-3 row is not a proven mismatch
-    // either (D1460): a discriminant can lay out as the string while canon still renders
-    // the arm's field as its declared alias (code 0).
-    if want == FC_I32 && code == FC_STR {
-      if nameIsLitSpelling(t) { return true }
-    }
-    // The ambiguous nullable-closure render: a code-22 field renders ungrouped
-    // (`()=>i64|null`), which `nameFieldCode` reads as a top-level arrow (14) — the grouped
-    // and ungrouped spellings render identically, so stay lenient when the result is nullable.
-    if code == FC_NUL_CLOSURE && want == FC_CLOSURE {
-      // The return cut (`fnRetTextOf`) takes a wider `aa >= 0` gate than other routed
-      // sites', since `.slice` clamps rather than traps at `aa == 0`.
-      const aa = annArrowAt(t)
-      if aa >= 0 && nullablePartOf(fnRetTextOf(t, aa)) != "" { return true }
-    }
-    return false
-  }
-  if want == FC_I32 {
-    // Atom-identity tightening (code 0 is layout-shared between plain i32/boolean and
-    // litunion-atom slots): a `{f: K0}` spelling must not adopt a plain row (a member
-    // literal would emit as a string into an i32 slot), and a plain spelling must not
-    // adopt an atom row (ids read back as booleans). Both sides decidable, proven-mismatch only.
-    if nameIsLitUnionType(t) != tyIsLitUnion(elemTy) { return false }
-    return true
-  }
-  if want == FC_I32_LIST {
-    // The atom-array sibling: `{f: K0[]}` (i32 list of member ids) vs a plain
-    // `{f: i32[]}`/`{f: boolean[]}` — the same shared-layout split as code 0.
-    if nameIsLitUnionArray(t) != nameIsLitUnionArray(elem) { return false }
-    return true
-  }
-  // A map field (19, or the `| null` niche 29) whose row records a value fits: this
-  // spelling carries no value type to tell a different row by.
-  if (want == FC_MAP || want == FC_NUL_MAP) && elem != "" { return true }
-  if want == FC_UNION && elem != "" {
-    // The name-side twin of `anonValueFitsField`'s box arm: a box's member sequence decides
-    // its tags, so a render naming a different one is a different row. Without it an
-    // un-annotated map's value row resolved by rendered shape name took the first box row
-    // in the table and narrowed the payload against the other set's tags (D1675).
-    return unionMemberSetsCompat(101, t, -1, elem, elemTy)
-  }
-  if (want == FC_REF_LIST || want == FC_NUL_REF_LIST) && elem != "" {
-    // The name-side twin of `anonValueFitsField`'s named-heap arm (D1689): a ref list's
-    // element decides its heap type, so a render naming a different one is a different row.
-    // Canonical on both sides, so two spellings of one layout still match.
-    return nestedStructNamesCompat(refArrElemKeyDeferred(nonNulBaseOf(t)), elem)
-  }
-  if want == FC_STRUCT && elem != "" {
-    // A declared-name nested-struct field (`inner: Inner`) against the variant's
-    // recorded target: the same canonical-key tightening as the inline spelling.
-    const tb15 = nonNulBaseOf(t)
-    return nestedStructNamesCompat(tb15, elem)
-  }
-  true
-}
-
 // The arm whose fields are the record `ty`'s, each field's type against the arm's field code as
-// `jrScanK` asks a struct row, at one `shapeFieldTypeCompatK` leniency; `unique` declines when a
+// `jrScanK` asks a struct row, at one leniency; `unique` declines when a
 // second arm also matches. -1 for a non-record.
 function variantRowScanOfTyK(ty: i32, lenient: i32, unique: boolean): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
@@ -1706,15 +1516,13 @@ function refArrShapeKindGo(name: string): i32 {
 }
 
 // The struct-table index an inline-SHAPE element spelling (`{v:i32}` of a `{v:i32}[]`
-// annotation) resolves to — the arena's canonical-key answer, else the structural bridge
-// (`structIndexOfTypeName`) — or -1 when nothing resolves. Ungated since #2004: an inline
+// annotation) resolves to by the arena's canonical key, or -1 when nothing resolves. An inline
 // spelling may resolve to an anonymous-literal row, not only a declared struct.
 function shapeElemDeclaredStructIdx(base: string) {
   if !nameIsShapeOpen(base) { return -1 }
   // Node-less caller: `base` is an inline shape `{…}` element spelling, routed through the
-  // canonical-key vocabulary (`repRowOfName` → `resolveAnnot` → `repRowOfTyStruct`) rather
-  // than the lenient fieldset scan, since it distinguishes a same-fieldset nested twin by
-  // the full nested field type. Falls to the fieldset scan when the arena declines.
+  // canonical-key vocabulary (`repRowOfName` → `resolveAnnot` → `repRowOfTyStruct`), which
+  // tells a same-fieldset nested twin by the full nested field type.
   let si = repRowOfName(base, sScanLim())
   if si < 0 { si = structRowOfSpelling(base) }
   if si < 0 { return -1 }
@@ -2211,17 +2019,14 @@ export function forceScalarListRep(rep: string) {
 // True if `name` is a nullable ref-list (`S[] | null`, `(i32|null)[] | null`), the ref-list
 // analogue of `tyIsNulI32List`; its non-null part is a ref array. Not `i32[] | null`,
 // which is code 18 / kind 15.
-function nameIsNulRefList(name: string) {
-  const np = nullablePartOf(name)
-  if np == "" { return false }
-  return nameIsRefArray(np)
+// Whether `ty` is a nullable list whose elements are stored by reference (`refListElemKindOfTy`).
+function tyIsNulRefList(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyNullable) { return false }
+  const l = nonNullTy(ty)
+  if l < 0 || l >= T.tys.length { return false }
+  const lt = tyAt(l)
+  lt is TyArray && refListElemKindOfTy(lt.aElem) >= 0
 }
-
-// The field-type spellings whose rep is deferred by design, as against the far larger set
-// `fieldCodeOfSpelling` refuses because it cannot yet tell what they are. A "not interned
-// yet" spelling is pass-order and a caller mid-cascade must stay silent on it; a deferred
-// spelling is permanent, refused loudly, and any new one belongs in this one set.
-export function fieldTypeIsDeferred(t: string): boolean { nameIsU8Array(t) }
 
 // The per-field wasm-type code a field type spelling carries — the one home of the
 // field-code ladder behind `nameFieldCode` and `nameFieldCodeTy`, whose arms must agree
@@ -2274,7 +2079,7 @@ function fieldCodeOfSpelling(t: string, fty: i32) {
   // value-union test (`i32[]` is not a value atom, so 16 never claims it). Asked of the type
   // alone; no caller without a type reaches it with a nullable i32 list.
   if recTy >= 0 && tyIsNulI32List(recTy) { return FC_NUL_I32_LIST }
-  if nameIsNulRefList(t) { return FC_NUL_REF_LIST }
+  if tyIsNulRefList(recTy) { return FC_NUL_REF_LIST }
   // A nullable distinct-backing scalar-list field (`f64[] | null` 32, `i64[] | null` 33,
   // `f32[] | null` 34, `string[] | null` 31): a `(ref null $leafWrapper)` slot, the field
   // mirror of the same-named binding niche. Checked after the ref-list arm so a spelling
@@ -4127,14 +3932,16 @@ export function variantFieldRefSlot(vi: i32, fi: i32) {
 }
 
 // The ref-list table slot of struct `si`'s ref-list field `fi`, `variantFieldRefSlot`'s struct
-// twin (D1579), minted on a miss. A template's field at a type parameter no row holds is keyed
-// by its stored name and classified by its open element type; a field with none by its name's.
+// twin (D1579), minted on a miss. A template's field at a type parameter no row holds is minted
+// under its stored name, classified by its open element type, and found by either key, since an
+// anonymous record's name has none (D15922); a field with no type is found by its name's.
 export function sFieldRefSlot(si: i32, fi: i32) {
   const ty = sFieldElemTyIxAt(si, fi)
   if ty >= 0 && tyHasTyVar(ty) && rlSlotOfTyOrTwin(ty) < 0 {
     const tn = sFieldElemNameAt(si, fi)
     rlNameMint(tn, ty)
-    return rlSlotByName(tn)
+    const byName = rlSlotByName(tn)
+    return if byName >= 0 { byName } else { rlSlotOfTyOrTwin(ty) }
   }
   if ty < 0 {
     const nm = sFieldElemNameAt(si, fi)
@@ -4149,6 +3956,9 @@ export function sFieldRefSlot(si: i32, fi: i32) {
   const s = rlSlotOfTyOrTwin(ty)
   if s >= 0 { return s }
   rlRowMint(ty)
+  const s2 = rlSlotOfTyOrTwin(ty)
+  if s2 >= 0 { return s2 }
+  rlArmRowMint(ty)
   rlSlotOfTyOrTwin(ty)
 }
 
@@ -4585,9 +4395,6 @@ export function wholeShapeRowOf(ty: i32): i32 {
   -1
 }
 
-// The registry generation `sitnMemo` last read.
-const trgReadGenKey = memoKeyNew(1)
-
 // The type-registry generation: it moves when anything type-name or signature resolution reads
 // may have changed: a table grows, a row or node type is rewritten in place, a type mutates, a
 // pass or the arena moves. A memo stamped with the value at the start of its computation
@@ -4598,8 +4405,6 @@ const trgGenKey = memoKeyNew(21)
 export function tyRegMemoReset() {
   trgGen = 0
   memoKeyClear(trgGenKey)
-  memoKeyClear(trgReadGenKey)
-  sitnMemo = Map()
   sktGen = []
   sktKey = []
   asrGen = []
@@ -4942,23 +4747,18 @@ function structRowOfRecordTyGo(ty: i32): i32 {
 
 // The struct row a spelled name denotes, or -1: a declared struct by name, else, for a whole
 // record shape `{…}`, the row the type it parses to is stored at. A spelling past the parse cap
-// (`fieldElemTyIxOfName`'s 4096) has no type to ask and is matched by its field set.
+// (`fieldElemTyIxOfName`'s 4096) has no type to ask and names none.
 export function structRowOfSpelling(name: string): i32 {
   const bn = structIndexByName(name)
   if bn >= 0 { return bn }
   if !nameIsWholeSpanShape(name) { return -1 }
-  if name.length > 4096 { return structIndexOfTypeName(name) }
+  if name.length > 4096 { return -1 }
   structRowOfRecordTy(fieldElemTyIxOfName(name))
 }
 
-// Whether spelling `name` denotes a struct row: `structRowOfSpelling`, except that a shape the
-// spelling resolves no type for is matched by its field set (`structIndexOfTypeName`).
+// Whether spelling `name` denotes a struct row (`structRowOfSpelling`).
 export function spellingHasStructRow(name: string): boolean {
-  if structIndexByName(name) >= 0 { return true }
-  if !nameIsWholeSpanShape(name) { return false }
-  const ty = if name.length > 4096 { -1 } else { fieldElemTyIxOfName(name) }
-  if ty < 0 { return structIndexOfTypeName(name) >= 0 }
-  structRowOfRecordTy(ty) >= 0
+  structRowOfSpelling(name) >= 0
 }
 
 // The struct row of a value spelled `name` whose type is `ty`: the row `ty`'s non-null part is

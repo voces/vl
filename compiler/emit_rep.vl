@@ -24,6 +24,7 @@ import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { emitFail } from "./emit_bytes"
 import { annGenAppSpanEnds, nameStripSpaces, peelGroupParens } from "./tyname"
 import {
+  FC_NUL_NONE,
   FC_NUL_REF_LIST,
   FC_REF_LIST,
   FC_STRUCT,
@@ -74,6 +75,7 @@ import {
   sFieldElemSame,
   sFieldElemTyIx,
   sFieldStart,
+  sFieldStoreTy,
   sFieldTypes,
   sIsRefRow,
   sNames,
@@ -2454,6 +2456,44 @@ export function msHasValKind(s: i32, k: i32): i32 {
   hit
 }
 
+// Whether member set `s` is a value union carrying a literal-union arm (`K0 | i64`): every member
+// a value atom, `null` or a literal union, at least one literal union and 2+ non-null members.
+// Tri-state as `msIsValueUnion`: -1 where the pool does not cover `s`, or where a member repeats,
+// since a literal union's widened row repeats its base per arm and hides which arm is literal.
+export function msSetCarriesLitUnionArm(s: i32): i32 {
+  if s < 0 || s >= msSetRow.length { return -1 }
+  if msSetGen[s] != msGen.at { return -1 }
+  const u = msSetRow[s]
+  const n = msSliceCount(u)
+  if n < 0 { return -1 }
+  if u >= 0 && unMemValKind.length != unMemAtoms.length { return -1 }
+  let lit = false
+  let nonNull = 0
+  let i = 0
+  while i < n {
+    if msSetHas(s, i) {
+      let j = 0
+      while j < i {
+        if msSetHas(s, j) && msSliceAtomId(u, j) == msSliceAtomId(u, i) {
+          return -1
+        }
+        j = j + 1
+      }
+      const ty = msSliceTy(u, i)
+      if ty >= 0 && tyIsLitUnion(ty) {
+        lit = true
+        nonNull = nonNull + 1
+      } else {
+        const k = msSliceValKind(u, i)
+        if k < 0 { return 0 }
+        if k != nullValKind() { nonNull = nonNull + 1 }
+      }
+    }
+    i = i + 1
+  }
+  if lit && nonNull >= 2 { 1 } else { 0 }
+}
+
 // Is the interned member set `s` a value union — one this emitter boxes into the
 // shared `{tag, payload}` rep? Tri-state: 1 yes, 0 no, -1 the pool or kind bank does
 // not cover `s` (the caller keeps its member-name path). Reads only the banked ABI
@@ -2905,18 +2945,93 @@ function repLeafRow(ty: i32): i32 {
   repElemRowByShape(ty)
 }
 
-// True when struct slots `a` and `b` have an identical emitter field-code list, with
-// the referenced-layer guard on every field code whose storage heap is named rather
-// than pinned by the code (`fieldCodeRefsElemHeap`). A layout guard on top of the
-// structural key: a key collision whose emitted layout differs (e.g. an atom-backed litunion field vs an inline one) must not merge even though `repCanonKey` agrees.
+// The covered rep of row `r` of storage-type column `tys`, or null where the row records no type
+// or the descriptor does not cover it; there the field code is the only answer.
+export function rowStoreRepIn(tys: i32[], r: i32): RepDesc | null {
+  if r < 0 { return null }
+  const ty = if r < tys.length { tys[r] } else { -1 }
+  if ty < 0 { return null }
+  const d = repOfTy(ty)
+  if d.rdCovered == 0 { return null }
+  d
+}
+
+// The kind a field with covered storage rep `d` and field code `code` is stored at, a variant
+// ref named as its arm's struct row (the slot a field passes is that row); null where only the
+// code answers, which includes a hole's record, since it reps as `nulnone` too.
+export function fieldStorageKindOf(d: RepDesc | null, code: i32): VKind | null {
+  if d == null { return null }
+  match d.rdKind {
+    "nulnone" => {
+      return if code == FC_NUL_NONE { "nulnone" } else { null }
+    }
+    "nulvariant" => {
+      return "nulstruct"
+    }
+    "variant" => {
+      return "struct"
+    }
+    "i32" | "i64" | "f64" | "f32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "nulstruct" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      return d.rdKind
+    }
+  }
+}
+
+// Whether row `a` of the table with storage types `ta` and codes `ca` is stored as row `b` of
+// `tb` and `cb` is: the same kind and null discipline, or the same code where either side has
+// only its code.
+export function rowsStoreAlikeIn(
+  ta: i32[],
+  ca: i32[],
+  a: i32,
+  tb: i32[],
+  cb: i32[],
+  b: i32,
+): boolean {
+  const codeA = if a >= 0 && a < ca.length { ca[a] } else { -1 }
+  const codeB = if b >= 0 && b < cb.length { cb[b] } else { -1 }
+  const da = rowStoreRepIn(ta, a)
+  const db = rowStoreRepIn(tb, b)
+  const ka = fieldStorageKindOf(da, codeA)
+  const kb = fieldStorageKindOf(db, codeB)
+  if da == null || db == null || ka == null || kb == null {
+    return codeA == codeB
+  }
+  ka == kb && da.rdNul == db.rdNul
+}
+
+// Whether struct-table flat row `r` stores a ref whose heap is named rather than pinned by its
+// storage: a record ref or a ref list, nullable or not; by the field code where only it answers.
+function fieldRowRefsElemHeap(r: i32): boolean {
+  const code = if r >= 0 && r < sFieldTypes.length { sFieldTypes[r] } else { -1 }
+  const k = fieldStorageKindOf(rowStoreRepIn(sFieldStoreTy, r), code)
+  if k == null { return fieldCodeRefsElemHeap(code) }
+  k == "struct" || k == "nulstruct" || k == "reflist" || k == "nulreflist"
+}
+
+// True when struct slots `a` and `b` store every field alike (`rowsStoreAlikeIn`), with the
+// referenced-layer guard on every field whose heap is named rather than pinned by its storage.
+// A layout guard on top of the structural key: a key collision whose emitted layout differs
+// (an atom-backed litunion field against an inline one) must not merge.
 export function structFieldCodesEq(a: i32, b: i32): i32 {
   if sFieldCount[a] != sFieldCount[b] { return 0 }
   let i = 0
   while i < sFieldCount[a] {
-    if sFieldTypes[sFieldStart[a] + i] != sFieldTypes[sFieldStart[b] + i] {
+    const fa = sFieldStart[a] + i
+    const fb = sFieldStart[b] + i
+    if (
+      !rowsStoreAlikeIn(
+        sFieldStoreTy,
+        sFieldTypes,
+        fa,
+        sFieldStoreTy,
+        sFieldTypes,
+        fb,
+      )
+    ) {
       return 0
     }
-    if fieldCodeRefsElemHeap(sFieldTypes[sFieldStart[a] + i]) {
+    if fieldRowRefsElemHeap(fa) {
       // A named-heap field stores a `(ref [null] <elem heap>)` — the code alone does not
       // pin the layout, so the referenced rows must share one heap type too. Same key and
       // same top-level codes is not enough: an `#anon` row's adopted type can disagree with
