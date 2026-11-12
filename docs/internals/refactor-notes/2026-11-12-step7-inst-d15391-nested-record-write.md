@@ -46,4 +46,21 @@ monomorphize refusals of the plain value.
 
 ## Proof
 
-SWEEP
+**Full local sweep.** Fixpoint seeds, base master `5e0a0ccf`, 23,962 programs:
+
+| | count |
+| --- | --- |
+| same | 23,959 |
+| bytes-only | 1 |
+| output movers | 2 |
+| runs → not-runs | 0 |
+| new compiler traps | 0 |
+
+The two movers go from refusal to runs: D15391, and D15158, whose witness was D15391's program.
+The bytes-only case is `tests/cases/closures/fn-tagged-ids-in-record-list-field-written-whole.vl`:
+same outcome and output, a different module.
+
+## Witnesses moved
+
+D15158's position witness and the control of `tests/vl_capability_matrix_test.ts`'s emit-reason
+guard now use D15395's list of maps. It still refuses from `emitGlobalSection` with no position.
