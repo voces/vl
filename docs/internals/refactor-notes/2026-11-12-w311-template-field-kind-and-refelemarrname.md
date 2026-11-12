@@ -17,8 +17,10 @@ recorded. Three changes answer it by type:
   is the box, which is what the spelling gave.
 
 The floor is then unreachable. It becomes an emit failure that names the contract.
-`refElemArrName` and its two helpers, `nulStructElemNiche` and `nulBoxUnionElem`, are deleted.
-The render-parse baseline's parse total falls from 58 to 56.
+`refElemArrName` is deleted, with its two helpers `nulStructElemNiche` and `nulBoxUnionElem`
+and the export only they read, `unionMemberCountOfName`. That removes two type-string parses.
+Written on the tree merged with master, the render-parse baseline's parse total falls from 57
+to 55.
 
 ## Measurement
 
