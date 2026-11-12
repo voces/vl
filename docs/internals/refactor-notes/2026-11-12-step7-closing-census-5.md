@@ -59,6 +59,11 @@ and `_`. Filed and closed as D15959 (#7640).
 - **Re-graded (#7646):** `cloSigPosBy` is reached by 7,338 programs through `cloSigPosOfKey`, not
   by none. Its key is the `$fnsig` key built from rep tokens, so it is not a spelling-keyed
   registry. That leaves 5 spelling-keyed registries.
+- **Converted (#7621):** `sFieldRefSlot`'s name mint and `rlRowOfNameMinted`. Lane F keys a
+  template field's open ref-list row by its type.
+- **Ruled (coordinator, 2026-11-12):** a guard whose deletion turns a loud failure into a silent
+  answer is an assertion, not a floor; `cloSigPosBy` is re-graded as rep-keyed; a refusal with no
+  witness is held as an assertion and gets no row.
 - **Clause-2 refusals with no reaching program:** `nulNicheIsTestImpossible` and
   `emitMapUnionPayloadTail` render a type inside a "… yet" refusal. No program in the sweep reaches
   either. Three hand-built variants of D2684's closed shape (a closure capture, a generic identity's
@@ -72,7 +77,6 @@ and `_`. Filed and closed as D15959 (#7640).
 | `nameFieldCode` / `nameFieldCodeTy` literal-member-union arm | lane G's no-row class (w316, cuts 3–4) | #7250 |
 | `fieldRowKind`; `objOrderStashSlot` and the `pushFieldStorage` code ladder; `sFieldStoreKind`; `fieldCodeCellKind` | lane H's field-code cuts 4–5 (#7250) | #7250, D1510 |
 | `variantNestedRow` (E56), `armFieldStructRowMinted` (E16) | the shape walk handing those fields a type (lane E) | — |
-| `sFieldRefSlot`'s name mint; `rlRowOfNameMinted` | in flight: lane F's #7621 keys both by the open type (`rlRowOfOpenTyMinted`) | #7342, #7306, #7621 |
 | `internShapeDeepOfTy`, `internArmShapeRow` renders | lane E's E3: class R first, G on w314 cut 5, U on w317's D15042 | #7513 |
 | `emitIfExprRef`'s record-join refusal (D15809, open) | the tag side (w308) | D15809 |
 | `emitUnionBoxOwed` at `letBindingUnionTy` | the instance's type read there (w321) | D15713, D15710, #7443 |
