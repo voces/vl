@@ -4193,7 +4193,7 @@ function recHeldOwnRefuse(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
     const o = if i32ListHas(skip, pu) || recOwnPinSkip(u) { -1 } else { recFreshOriginDecl(u, 6) }
     if o == d && recArgRepOf(u) < 0 {
       recAdRaising = true
-      tErr(recKeptOwnMsg(d, rep, p, false), u)
+      tErr(recKeptOwnMsgAt(d, rep, p, false, u), u)
       recAdRaising = false
     }
   }
@@ -4214,7 +4214,7 @@ export function recHeldReadsOwnRefuse(
     const o = if !read || i32ListHas(skip, pu) || recOwnPinSkip(u) { -1 } else { recHeldDecl(pu) }
     if o == d && recArgRepOf(u) < 0 {
       recAdRaising = true
-      tErr(recKeptOwnMsg(d, rep, p, false), u)
+      tErr(recKeptOwnMsgAt(d, rep, p, false, u), u)
       recAdRaising = false
     }
   }
@@ -4241,6 +4241,66 @@ export function recOwnPinSkip(u: i32): boolean {
   if nodeAt(u) is Call { return true }
   const pt = recReachPinTy(u)
   pt < 0 || !fieldStorageEq(pt, nodeTyIxOf(u), REC_STORE_DEPTH)
+}
+
+// The type mismatch of a store `u` of the binding `d`, built as `dst`, into a container pinned at
+// its own type, in the words the container's store gives the annotated binding; "" where `u` is no
+// `.set` value, `.push` argument or index store.
+export function recStoreMismatchMsg(u: i32, d: i32, dst: i32): string {
+  if u < 0 || !cwIxCovers(u) { return "" }
+  const a = cwIxUp[u]
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) { return "" }
+  const name = dn.letName
+  const note = " (`"
+    + name
+    + "` holds only a literal, so it is built as the `"
+    + tyToStr(dst)
+    + "` it is delivered to; annotate it to keep its own type, and copy it for the other use)"
+  if (
+    an is BinExpr
+    && an.binOp == "="
+    && an.binRight == u
+    && nodeAt(an.binLeft) is Index
+  ) {
+    return "cannot assign "
+      + tyToStr(dst)
+      + " to "
+      + tyToStr(nodeTyIxOf(u))
+      + note
+  }
+  if !(an is Call) || an.callFn < 0 { return "" }
+  const f = nodeAt(an.callFn)
+  if !(f is Member) { return "" }
+  if f.memProp == "set" && an.callArgs.length == 2 && an.callArgs[1] == u {
+    return "set: expected "
+      + tyToStr(nodeTyIxOf(u))
+      + ", got "
+      + tyToStr(dst)
+      + note
+  }
+  if f.memProp == "push" && an.callArgs.length == 1 && an.callArgs[0] == u {
+    return "push: cannot add "
+      + tyToStr(dst)
+      + " to "
+      + tyToStr(nodeTyIxOf(f.memObj))
+      + note
+  }
+  ""
+}
+
+// `recKeptOwnMsg` for the delivery `u`, said as the container's type mismatch where `u` is a store
+// into one (`recStoreMismatchMsg`).
+export function recKeptOwnMsgAt(
+  d: i32,
+  dst: i32,
+  at: i32,
+  inst: boolean,
+  u: i32,
+): string {
+  const said = recStoreMismatchMsg(u, d, dst)
+  if said != "" { said } else { recKeptOwnMsg(d, dst, at, inst) }
 }
 
 // D15180's refusal of a value `d` built as `dst` where `at` delivers it, handed on at its own type
@@ -5275,10 +5335,9 @@ export function recAdoptUnionList(
   true
 }
 
-// Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
-// element of a literal list binding, to a record that stores a field differently.
 // Whether the record `dst` stores each field of the record `src` as `src` does, or a scalar field
-// as that scalar or `null`: the fields a record copy boxes.
+// as that scalar or `null`, a number it widens to exactly or `null`, or a union listing that
+// scalar: the fields a record copy boxes.
 export function recCopyBoxesOnly(src: i32, dst: i32): boolean {
   const so = tyAt(src)
   const d = tyAt(dst)
@@ -5295,13 +5354,37 @@ export function recCopyBoxesOnly(src: i32, dst: i32): boolean {
     const df = d.objFieldTypes[i]
     const dn = if df >= 0 && df < T.tys.length { tyAt(df) } else { null }
     const sp = if sf >= 0 && sf < T.tys.length { tyAt(sf) } else { null }
-    const boxes = dn is TyNullable && sp is TyPrim && tySame(dn.nInner, sf)
+    const boxes = sp is TyPrim
+      && (dn is TyNullable
+      && (tySame(dn.nInner, sf) || recNumWidens(sf, dn.nInner))
+      || dn is TyUnion && recUnionHasMember(df, sf))
     if sf < 0 || !(boxes || fieldStorageEq(sf, df, REC_STORE_DEPTH)) {
       return false
     }
     i = i + 1
   }
   true
+}
+
+// Whether the number `src` converts to the other number `dst` exactly: `i32` into `i64` or `f64`,
+// `i64` or `f32` into `f64`.
+function recNumWidens(src: i32, dst: i32): boolean {
+  const s = tyAt(src)
+  const d = tyAt(dst)
+  if !(s is TyPrim) || !(d is TyPrim) { return false }
+  strListHas(NUM_WIDENS, s.primName + ">" + d.primName)
+}
+
+const NUM_WIDENS = ["i32>i64", "i32>f64", "i64>f64", "f32>f64"]
+
+// Whether the union `u` lists `m` as a member.
+function recUnionHasMember(u: i32, m: i32): boolean {
+  const ut = tyAt(u)
+  if !(ut is TyUnion) { return false }
+  for x in ut.uMembers {
+    if tySame(x, m) { return true }
+  }
+  false
 }
 
 // Whether every tail of the value join `j` is a call.
@@ -5382,6 +5465,8 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   true
 }
 
+// Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
+// element of a literal list binding, to a record that stores a field differently.
 export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if srcTy < 0 || dstTy < 0 || srcTy == dstTy { return 0 }
   if !tyHoldsObjDeep(srcTy) || !tyHoldsObjDeep(dstTy) { return 0 }

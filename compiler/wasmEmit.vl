@@ -76,7 +76,7 @@ import {
   storageReadEnter,
   storageReadLeave,
 } from "./emit_elab"
-import { canonUnionMembersInto } from "./check_program"
+import { canonUnionMemberTysOf, canonUnionMembersInto } from "./check_program"
 import {
   cexLitPeel,
   intLitIsNegated,
@@ -151,6 +151,7 @@ import {
   TyMap,
   TyNullable,
   TyObj,
+  TyPrim,
   TyUnion,
   TyVar,
   cStructNames,
@@ -162,6 +163,7 @@ import {
   objFieldType,
   oneListUnionRender,
   primNameStr,
+  softenLitTy,
   tyArrayElemIx,
   tyAt,
   tyBearsNull,
@@ -1295,7 +1297,6 @@ import {
 import {
   mvValTyIxAt,
   mvValUnionHasNull,
-  nonNulBaseOf,
   rlElemIsNulNiche,
   rlElemLitStructRow,
   tyRefArrElemOf,
@@ -1377,6 +1378,7 @@ import {
   narrowedNulStructArm,
   rlElemInnerSlot,
   rlElemStructRow,
+  rlElemVariantRow,
   rlSlotOfTyOrTwin,
   sFieldMapShape,
   sFieldRefSlot,
@@ -1403,6 +1405,7 @@ import {
   nodeJoinRowName,
   nodeMixedUnionName,
   nulLitMemberTexts,
+  readAtomKindOfTy,
   unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentAt,
   unionDeclTyIxOfIdentRead,
@@ -1521,7 +1524,6 @@ import {
   unionArmsOfTy,
   unionHasAtomAB,
   unionHasAtomTy,
-  unionHasValueAtom,
   unionMemberAtomsOf,
   unionMemberSetOf,
   unionMemberTysOf,
@@ -1583,6 +1585,7 @@ import {
   i32ListIndexOf,
   i32PairIndexOf,
   strListHas,
+  strListIndexOf,
 } from "./listutil"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
@@ -3225,6 +3228,9 @@ function emitRecCopyLevel(
     if rcReadSource(body, exprIx, sHeap, reReadable, fnIx) < 0 { return -1 }
     fbStructGet(sHeapIdx[sRow], sfi)
     if wk >= 0 {
+      const sk = fieldRowNumKind(sFieldStart[sRow] + sfi)
+      const wi = rcWidenTo(sk, nullableInnerOrNone(dFt))
+      if wi >= 0 && njConvert(sk, wi) < 0 { return -1 }
       if !atomIsRefKind(wk) {
         const vb = vbHeapIdxOfKind(wk)
         if vb < 0 {
@@ -3254,8 +3260,8 @@ function emitRecCopyLevel(
   0
 }
 
-// The atom kind a top-level copy boxes field `name` under: the source holds a scalar (`sCode`)
-// where the destination's union box (`dCode`) holds it or `null`; else -1.
+// The atom kind a top-level copy boxes field `name` under: the source row `sr` holds a scalar where
+// the destination row `dr`'s union box holds it, or a number it widens to, or `null`; else -1.
 function rcWrapKind(
   exprIx: i32,
   pre: string,
@@ -3269,10 +3275,40 @@ function rcWrapKind(
   if fieldRowNumKind(sr) < 0 && !fieldRowIsStr(sr, false) { return -1 }
   const st = rcFieldTy(nodeTyIxOf(exprIx), name)
   const dt = rcFieldTy(recCopyTyOf(exprIx), name)
-  const inner = if dt >= 0 { nullableInnerOrNone(dt) } else { -1 }
-  if st < 0 || inner < 0 || !tySame(st, inner) { return -1 }
-  boxTagOfTy(st)
+  if st < 0 || dt < 0 { return -1 }
+  const inner = nullableInnerOrNone(dt)
+  if inner >= 0 && tySame(st, inner) { return boxTagOfTy(st) }
+  // A number the nullable holds wider is converted there first (`rcWidenTo`).
+  if inner >= 0 && rcWidenTo(fieldRowNumKind(sr), inner) >= 0 {
+    return boxTagOfTy(inner)
+  }
+  // A union listing the scalar holds it in the same box.
+  const d = tyAt(dt)
+  if d is TyUnion {
+    for m in d.uMembers {
+      if tySame(m, st) { return boxTagOfTy(st) }
+    }
+  }
+  -1
 }
+
+// The numeric kind a source field of number kind `sk` is converted to for the nullable number
+// `inner`, where that is an exact widening (`i32` into `i64` or `f64`, `i64` or `f32` into `f64`),
+// else -1.
+function rcWidenTo(sk: i32, inner: i32): i32 {
+  const p = if inner >= 0 && inner < T.tys.length { tyAt(inner) } else { tyAt(TY_ERR) }
+  if sk < 0 { return -1 }
+  if p is TyPrim {
+    const at = strListIndexOf(RC_WIDENS, i32ToStr(sk) + ">" + p.primName)
+    if at >= 0 && at < RC_WIDEN_KINDS.length { return RC_WIDEN_KINDS[at] }
+  }
+  -1
+}
+
+// The exact widenings `rcWidenTo` converts, keyed by source kind and destination name, and the
+// kind each converts to.
+const RC_WIDENS = ["0>i64", "0>f64", "3>f64", "5>f64"]
+const RC_WIDEN_KINDS = [3, 4, 4, 4]
 
 // The type of field `name` of the checked record `dTy`, or -1.
 function rcFieldTy(dTy: i32, name: string): i32 {
@@ -6874,7 +6910,7 @@ function emitArmFieldsFit(
     if nonNullTy(fys[i]) == fys[i] { fxSet = nonNullTy(fxSet) }
     // A nullable string field answers its null apart, then tests only non-null strings: all
     // fit, none does, or they are compared against the set's string members.
-    const nulStr = fi >= 0 && variantFieldTypeAt(yi, fi) == FC_NUL_STR
+    const nulStr = fi >= 0 && fieldRowIsStr(uFieldStart[yi] + fi, true)
     let nnKind = 2
     if nulStr { nnKind = tyFitKind(nonNullTy(fys[i]), fxSet) }
     const lexes = tyLitSetMemberLexes(
@@ -6882,7 +6918,7 @@ function emitArmFieldsFit(
     )
     if (
       fi >= 0
-      && variantFieldTypeAt(yi, fi) != FC_UNION
+      && !fieldRowIsUnionBox(uFieldStart[yi] + fi)
       && (lexes.length > 0 || nnKind != 2)
     ) {
       if nulStr {
@@ -6919,7 +6955,7 @@ function emitArmFieldsFit(
       i = i + 1
       continue
     }
-    if fi < 0 || variantFieldTypeAt(yi, fi) != FC_UNION {
+    if fi < 0 || !fieldRowIsUnionBox(uFieldStart[yi] + fi) {
       return emitFail(
         "emitProgram: `is` across record arms whose shared field holds a value only some of which fit, outside a union box",
       )
@@ -6971,8 +7007,10 @@ function emitArmFieldsFit(
 // The `string | null` read rule for a field of code `code`, shared by every struct and variant
 // field read and by the ident reads in `emitIdentNode`: a value read recovers the non-null ref.
 // A read typed `string | null` keeps the raw ref (`nulStrReadRecovers`).
-function emitNulStrFieldRecover(code: i32, readIx: i32, fnIx: i32) {
-  if code == FC_NUL_STR && nulStrReadRecovers(readIx, fnIx) { fbRefAsNonNull() }
+function emitNulStrFieldRecover(r: i32, readIx: i32, fnIx: i32) {
+  if fieldRowIsStr(r, true) && nulStrReadRecovers(readIx, fnIx) {
+    fbRefAsNonNull()
+  }
   0
 }
 
@@ -6997,12 +7035,12 @@ function emitNarrowedMem(body: u8[], memIx: i32, fnIx: i32) {
     fbStructGet(uBoxIdx, 1)
     fbRefCast(variantHeap(vi))
     fbStructGet(variantHeap(vi), idx)
-    emitNulStrFieldRecover(variantFieldTypeAt(vi, idx), memIx, fnIx)
+    emitNulStrFieldRecover(uFieldStart[vi] + idx, memIx, fnIx)
 
     // A value-union field read while the checker types it as one atom unboxes to that atom,
     // through the home the bare-arm twin uses: an index-rooted path has no member key, so
     // only that home's checker-typed arm sees `xs[0].r` under `!= null` (D8145).
-    if variantFieldTypeAt(vi, idx) == FC_UNION {
+    if fieldRowIsUnionBox(uFieldStart[vi] + idx) {
       return emitUnionFieldNarrowUnbox(memIx, fnIx)
     }
     return 0
@@ -9065,7 +9103,7 @@ function emitUnionCoerceList(
   )
   if viaListArm < 0 { return -1 }
   if viaListArm == 1 { return 0 }
-  if unionName == "" || !unionHasValueAtom(unionName) {
+  if unionName == "" || !unionTyHasValueAtom(uTy) {
     return emitExpr(body, exprIx, fnIx)
   }
   return emitUnionCoerceValueAtom(
@@ -11643,7 +11681,7 @@ function sharedFieldPlanDispatchable(
 // members store the field at different value atoms (`sharedFieldArmsBoxable`), or this member
 // stores a scalar where another stores the box (D4056).
 function sharedFieldReadBoxes(code: i32, vi0: i32, fi0: i32): boolean {
-  code == FC_UNION && variantFieldTypeAt(vi0, fi0) != FC_UNION
+  code == FC_UNION && !fieldRowIsUnionBox(uFieldStart[vi0] + fi0)
 }
 
 // Whether any member of the plan boxes its field (`sharedFieldReadBoxes`), so the read
@@ -11786,7 +11824,7 @@ function emitSharedFieldArm(
     fbStructNew(uBoxIdx)
   }
   // A `string | null` member read where a narrowing excluded `null` holds a string.
-  if code == FC_STR && variantFieldTypeAt(vi, fi) == FC_NUL_STR {
+  if code == FC_STR && fieldRowIsStr(uFieldStart[vi] + fi, true) {
     fbRefAsNonNull()
   }
   0
@@ -12178,12 +12216,12 @@ function emitMemVariantRead(body: u8[], memIx: i32, fnIx: i32): i32 {
       }
       if emitExpr(body, m0.memObj, fnIx) < 0 { return -1 }
       fbStructGet(variantHeap(pvi), pvfi) // 0xfb 0x02 <variant struct ht> <field index>
-      emitNulStrFieldRecover(variantFieldTypeAt(pvi, pvfi), memIx, fnIx)
+      emitNulStrFieldRecover(uFieldStart[pvi] + pvfi, memIx, fnIx)
       // A code-16 (value-union box) field of the arm, read while its member PATH is
       // narrowed, unboxes to the narrowed atom — the arm-for-arm twin of the plain
       // struct read below and of `emitNarrowedMem`'s. Without it the box flowed into an
       // i32 consumer: check-clean INVALID WASM (silent-class-inventory D219).
-      if variantFieldTypeAt(pvi, pvfi) == FC_UNION {
+      if fieldRowIsUnionBox(uFieldStart[pvi] + pvfi) {
         if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
       }
       return 0
@@ -12201,8 +12239,8 @@ function emitMemVariantRead(body: u8[], memIx: i32, fnIx: i32): i32 {
       if emitExpr(body, m0.memObj, fnIx) < 0 { return -1 }
       fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
       fbStructGet(variantHeap(nvi), nvfi)
-      emitNulStrFieldRecover(variantFieldTypeAt(nvi, nvfi), memIx, fnIx)
-      if variantFieldTypeAt(nvi, nvfi) == FC_UNION {
+      emitNulStrFieldRecover(uFieldStart[nvi] + nvfi, memIx, fnIx)
+      if fieldRowIsUnionBox(uFieldStart[nvi] + nvfi) {
         if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
       }
       return 0
@@ -12361,7 +12399,7 @@ function emitMemStructRead(body: u8[], memIx: i32, fnIx: i32): i32 {
     fbStructGet(sHeapIdx[si], idx) // 0xfb 0x02 <struct ht> <field index>
     const narrowOp = memReadNarrowOp(memIx, fnIx)
     if narrowOp >= 0 { wU8(narrowOp) }
-    emitNulStrFieldRecover(sFieldTypeAt(si, idx), memIx, fnIx)
+    emitNulStrFieldRecover(sFieldStart[si] + idx, memIx, fnIx)
     // A union-typed field (code 16) read while the member path is narrowed to one scalar atom
     // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
     // ident read, at the atom the checker typed the read as; an un-narrowed read is the box.
@@ -13567,11 +13605,11 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32, lb: ListBuild) {
     // An empty `[]` whose pair is the i32 default builds at the element type the checker
     // pinned on the literal itself — a join arm's sibling, a return's witness (D2209).
     if elems.length == 0 && lb.lbKind == LBK_I32_LIST {
-      const hbk = emptyArrHoleBuildKind(arrIx)
+      const hbk = emptyArrHoleBuildKind(arrIx, fnIx)
       if hbk != LBK_I32_LIST {
         const hb: ListBuild = {
           lbKind: hbk,
-          lbSlot: emptyArrHoleBuildSlot(arrIx),
+          lbSlot: emptyArrHoleBuildSlot(arrIx, fnIx),
         }
         return emitArrUnder(body, arrIx, fnIx, hb)
       }
@@ -27239,9 +27277,7 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
     if listElemRepIsRow(arrIx, fnIx) {
       st.structIdx = rlElemStructRow(rslot)
       // ...and where that declines, the element is an ARM, at `variantHeap(vi)`.
-      if st.structIdx < 0 {
-        st.variantIdx = variantIndexOf(nonNulBaseOf(rlElemName[rslot]))
-      }
+      if st.structIdx < 0 { st.variantIdx = rlElemVariantRow(rslot) }
     }
     if refListElemIsUnion(arrIx, fnIx) {
       st.unionNm = rlElemUnionName(rslot)
@@ -40656,7 +40692,7 @@ function emitCoalesceUnionField(
       }
       if mvi >= 0 {
         mfi = variantFieldIndex(mvi, lhs.memProp)
-        if mfi >= 0 && variantFieldTypeAt(mvi, mfi) == FC_UNION {
+        if mfi >= 0 && fieldRowIsUnionBox(uFieldStart[mvi] + mfi) {
           mHeap = variantHeap(mvi)
           mphys = variantFieldElemName(mvi, mfi)
           mphysTy = uFieldElemTyIxAt(mvi, mfi)
@@ -41313,5 +41349,33 @@ function coalFieldStoredFlat(exprIx: i32, lhsIx: i32, fnIx: i32): boolean {
   if fc == FC_F64 { return pn == "f64" }
   if fc == FC_F32 { return pn == "f32" }
   if fc == FC_STR { return pn == "string" }
+  false
+}
+
+// Whether union type `ty` has a non-null member that boxes as a value atom: one with a read atom
+// kind, a string literal set, or an all-literal member (kept whole by the canonical walk) with a
+// literal whose softened scalar has one. False for an all-struct union.
+function unionTyHasValueAtom(ty: i32): boolean {
+  const ms: i32[] = []
+  if !canonUnionMemberTysOf(ty, ms) { return false }
+  for m in ms {
+    if m >= 0 {
+      if readAtomKindOfTy(m) >= 0 || tyIsLitUnionOrLit(m) { return true }
+      if litSetHasValueAtom(m) { return true }
+    }
+  }
+  false
+}
+
+// Whether `m` is a union of literals only, one of whose softened scalars reads as a value atom.
+function litSetHasValueAtom(m: i32): boolean {
+  const mt = tyAt(m)
+  if !(mt is TyUnion) || mt.uMembers.length == 0 { return false }
+  for u in mt.uMembers {
+    if u < 0 || !(tyAt(u) is TyLit) { return false }
+  }
+  for u in mt.uMembers {
+    if readAtomKindOfTy(softenLitTy(u)) >= 0 { return true }
+  }
   false
 }
