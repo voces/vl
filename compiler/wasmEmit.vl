@@ -110,7 +110,11 @@ import {
 } from "./check_core_state"
 import { nodeTyProvesNonNull, recArmPartialFields } from "./check_emit_queries"
 import { binPlusIsListByTy } from "./check_leaf_steps"
-import { numDeliverStamp, recFitNarrowedFields } from "./check_fit_rules"
+import {
+  numDeliverStamp,
+  recFitNarrowedFields,
+  recUnionRecMember,
+} from "./check_fit_rules"
 import {
   assignable,
   recArmFitKind,
@@ -1106,7 +1110,6 @@ import {
   recBuildRowOf,
   refListElemIsUnion,
   refListSlotOfExpr,
-  rlUnionNameOfTy,
   sFieldIsPlainI32,
   sFieldIsRecordRef,
   sFieldIsUnionBox,
@@ -3129,6 +3132,93 @@ function rcNestedRow(
   if sHeapIdx[sIn] == sHeapIdx[dIn] { -1 } else { dIn }
 }
 
+// The member of the union of records the destination field `name` is, that source row `sRow`'s
+// record field `sfi` is copied into (`recUnionRecMember`), or -1.
+function rcUnionRecMember(
+  exprIx: i32,
+  pre: string,
+  name: string,
+  sRow: i32,
+  sfi: i32,
+  dr: i32,
+): i32 {
+  if (
+    !fieldRowIsUnionBox(dr)
+    || !sFieldIsRecordRef(sRow, sfi)
+    || recCopyFromOf(exprIx) >= 0
+  ) {
+    return -1
+  }
+  const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
+  const dt = rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), name)
+  if st < 0 || dt < 0 { return -1 }
+  recUnionRecMember(st, dt)
+}
+
+// Copy source row `sRow`'s record field `sfi`, the field `name` along `pre`, into the union
+// member `m`'s row, and box it under the member's tag.
+function emitRecCopyIntoMember(
+  body: u8[],
+  exprIx: i32,
+  sHeap: i32,
+  reReadable: boolean,
+  sRow: i32,
+  sfi: i32,
+  m: i32,
+  pre: string,
+  name: string,
+  fnIx: i32,
+): i32 {
+  const vi = repVariantShapeRowOf(m)
+  const vr = variantRowOf(vi)
+  const sIn = sFieldTgtStructIdx(sRow, sfi)
+  if (
+    vi < 0
+    || vi >= uTags.length
+    || vr < 0
+    || sIn < 0
+    || sRow < 0
+    || sRow >= sHeapIdx.length
+  ) {
+    return emitFailAt(
+      "emitProgram: a record copied into a union of records has no member row",
+      exprIx,
+    )
+  }
+  const names: string[] = []
+  const rows: i32[] = []
+  variantRowFields(vi, names, rows)
+  const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
+  fbI32Rel(RS_TAG, uTags[vi])
+  rcPathHeap.push(sHeapIdx[sRow])
+  rcPathField.push(sfi)
+  const ps = rcElemSrc
+  const pd = rcElemDst
+  rcElemSrc = st
+  rcElemDst = m
+  const r = emitRecCopyLevel(
+    body,
+    exprIx,
+    sHeap,
+    reReadable,
+    sIn,
+    vr,
+    m,
+    pre + name + "|",
+    names,
+    rows,
+    fnIx,
+  )
+  rcElemSrc = ps
+  rcElemDst = pd
+  rcPathHeap.pop()
+  rcPathField.pop()
+  if r < 0 { return -1 }
+  fbStructNew(variantHeap(vi))
+  fbStructNew(uBoxIdx)
+  0
+}
+
 // The struct row of the record `ty` or `ty | null`, or -1.
 function rcRowOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
@@ -3276,6 +3366,37 @@ function emitRecCopyLevel(
       rcPathField.pop()
       if r < 0 { return -1 }
       fbStructNew(sHeapIdx[nest])
+      fj = fj + 1
+      continue
+    }
+    // A record copied into a union of records is built at the member with its field names, then
+    // boxed under that member's tag.
+    const um = rcUnionRecMember(
+      exprIx,
+      pre,
+      dNames[fj],
+      sRow,
+      sfi,
+      dFieldRows[fj],
+    )
+    if um >= 0 {
+      if (
+        emitRecCopyIntoMember(
+          body,
+          exprIx,
+          sHeap,
+          reReadable,
+          sRow,
+          sfi,
+          um,
+          pre,
+          dNames[fj],
+          fnIx,
+        )
+        < 0
+      ) {
+        return -1
+      }
       fj = fj + 1
       continue
     }
@@ -3624,7 +3745,13 @@ const RC_WIDEN_KINDS = [3, 4, 4, 4]
 function rcPathTy(ty: i32, pre: string): i32 {
   let t = ty
   let from = 0
+  // A path into a union member restarts at the member (`emitRecCopyIntoMember`).
   let i = 0
+  while i < pre.length {
+    if pre[i] == 124 { from = i + 1 }
+    i = i + 1
+  }
+  i = from
   while i < pre.length {
     if pre[i] == 46 {
       const f = rcFieldTy(t, pre.slice(from, i))
@@ -3680,8 +3807,11 @@ function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
 // The struct row of a copied call's own record when that record is also a union's arm, or -1.
 function copyArmRowOf(exprIx: i32): i32 {
   const own = nodeTyIxOf(exprIx)
-  if own < 0 || repVariantShapeRowOf(own) < 0 { return -1 }
-  structRowOfAnnTy("", own, own)
+  const vi = if own >= 0 { repVariantShapeRowOf(own) } else { -1 }
+  if vi < 0 { return -1 }
+  const r = structRowOfAnnTy("", own, own)
+  // An arm with no annotated row is laid out at its variant's own row.
+  if r >= 0 { r } else { variantRowOf(vi) }
 }
 
 // `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`).
@@ -4025,23 +4155,11 @@ function isNumRecvBaseName(recvIx: i32, fnIx: i32) {
   if tyAt(t) is TyUnion { numLitUnionBaseName(t) } else { "" }
 }
 
-// The value-union name of an `is` receiver, for the box-tag soundness floor in `emitIs`.
-// `unionNameOfExpr` covers every receiver form except the optional chain, whose leaf field
-// is resolved here instead. `""` when the receiver is not a union.
+// The value-union name of an `is` receiver, for the box-tag soundness floor in `emitIs`; `""`
+// when the receiver is not a union. An optional chain's leaf field is among the forms
+// `unionNameOfExpr` covers.
 function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
-  const nm = unionNameOfExpr(exprIx, fnIx)
-  if nm != "" { return nm }
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is OptMember {
-    const si = optChainStructIdxOf(e.omObj, fnIx)
-    if si >= 0 {
-      const fi = sFieldIndex(si, e.omProp)
-      if fi >= 0 {
-        if sFieldIsUnionBox(si, fi) { return sFieldElemNameAt(si, fi) }
-      }
-    }
-  }
-  ""
+  unionNameOfExpr(exprIx, fnIx)
 }
 
 // The operand of `x == null` / `null == x` whose checked type admits no `null`, or whose hole
@@ -8553,18 +8671,8 @@ function boxRecordTyAt(ix: i32, fnIx: i32): i32 {
   instTyOrSelf(r, fnIx)
 }
 
-// The registered name of the union row recorded type `ty` names (`unRowOfRecordTy`); for a value
-// union no row registered, its spelling, since its box is tagged by its members alone, and for a
-// nullable function set, whose value is its member tag, `i32|null`; else "".
-function boxRecordNameOf(ty: i32): string {
-  const r = unRowOfRecordTy(ty)
-  if r >= 0 && r < unNames.length { return unNames[r] }
-  if boxRecordIsTagSet(ty) { return "i32|null" }
-  unionSpellingOfTy(ty, 8)
-}
-
-// The type `boxRecordNameOf(ty)` names: `i32 | null` for a nullable function set it boxes as
-// that, else `ty`.
+// The union recorded type `ty` boxes as: `i32 | null` for a nullable function set, whose value is
+// its member tag, else `ty`.
 function boxRecordUnionTyOf(ty: i32): i32 {
   if ty < 0 || unRowOfRecordTy(ty) >= 0 || !boxRecordIsTagSet(ty) { return ty }
   mkNullableTyOf(primTyIxOfName("i32"))
@@ -8612,26 +8720,25 @@ function boxOwedAtRecord(valIx: i32, fnIx: i32): boolean {
     && unionNameOfExpr(valIx, fnIx) != ""
 }
 
-// The registry name of the union `valIx` is boxed into at its delivery: its record's row where
-// it is stored as a box, else, for a value already a box with no other coercion recorded, its
-// own union; "" where neither holds (`boxOwedAtRecord`).
+// The registry name of the union `valIx` is boxed into at its delivery (`boxDstTyOf`); "" where
+// it is boxed into none.
 function boxDstNameAt(valIx: i32, fnIx: i32): string {
-  const r = boxRecordTyAt(valIx, fnIx)
-  if r >= 0 && repOfTy(r).rdKind == "union" {
-    const nm = boxRecordNameOf(r)
-    if nm != "" { return nm }
-  }
-  if exprUnion(valIx, fnIx) && coerceKindAt(valIx, fnIx) == "none" {
-    return unionNameOfExpr(valIx, fnIx)
-  }
-  ""
+  boxTyName(boxDstTyOf(valIx, fnIx))
 }
 
-// The type `boxDstNameAt(valIx, fnIx)` names: the type of the row the recorded union names, else
-// the value's own union; -1 where it names none.
+// Whether recorded type `r` is stored as a box of a union its type names.
+function boxRecordOwed(r: i32): boolean {
+  r >= 0
+    && repOfTy(r).rdKind == "union"
+    && boxTyName(boxRecordUnionTyOf(r)) != ""
+}
+
+// The union `valIx` is boxed into at its delivery: the type of the row its record names where it
+// is stored as a box, else, for a value already a box with no other coercion recorded, its own
+// union; -1 where it names none.
 function boxDstTyOf(valIx: i32, fnIx: i32): i32 {
   const r = boxRecordTyAt(valIx, fnIx)
-  if r >= 0 && repOfTy(r).rdKind == "union" && boxRecordNameOf(r) != "" {
+  if boxRecordOwed(r) {
     const u = unRowOfRecordTy(r)
     if u >= 0 && u < unTyIx.length && unTyIx[u] >= 0 { return unTyIx[u] }
     return boxRecordUnionTyOf(r)
@@ -9536,6 +9643,9 @@ function boxDstName(name: string, ty: i32): string {
   if sp != UNION_SPELLING_DECLINE && isValueUnionName(sp) { return sp }
   name
 }
+
+// The union a box of type `ty` is built into, by `boxDstName`'s rungs; "" where `ty` names none.
+function boxTyName(ty: i32): string { boxDstName("", ty) }
 
 // One side of `nulNoneEqSides`: a `null`-typed value, or a bare `null` literal.
 function nulNoneEqSide(exprIx: i32, fnIx: i32): boolean {
@@ -13741,12 +13851,10 @@ function emitArrRef(
   // write boundary (`emitUnionCoerce` — the host's per-element `coerceUnion`):
   // a bare scalar/string boxes under its atom's tag; an object literal /
   // already-union value passes through to its existing boxing.
-  let elemUnionNm = ""
+  const elemUnionBox = rlElemKindAt(rslot) == RLK_UNION
   let elemUnionTy = -1
-  if rlElemKindAt(rslot) == RLK_UNION {
-    elemUnionNm = rlUnionNameOfTy(rslot, nodeTyInOf(arrIx, fnIx))
-    // The type `rlUnionNameOfTy` names: the slot's element, or the literal's own where the
-    // slot is a generic body's hole.
+  if elemUnionBox {
+    // The slot's element, or the literal's own where the slot is a generic body's hole.
     elemUnionTy = rlElemTyIxAt(rslot)
     const litEt = tyArrayElemIx(nodeTyInOf(arrIx, fnIx))
     if litEt >= 0 && !tyHasTyVar(litEt) && tyHasTyVar(elemUnionTy) {
@@ -13781,19 +13889,16 @@ function emitArrRef(
       && elemNest != RLK_REF_LIST
       && elemNest != RLK_F32_LIST
       && elemNest != RLK_U8_LIST
-      && elemUnionNm == ""
+      && !elemUnionBox
     ) {
       if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
         return emitFail("emitProgram: nested arrays are not supported")
       }
     }
-    if elemUnionNm != "" {
+    if elemUnionBox {
       // Box the element into the shared union box — a concrete variant element widens via
       // `emitUnionBoxArg`, like a call argument or return.
-      if (
-        emitUnionBoxOwed(body, elemUnionNm, elemUnionTy, elems[i], fnIx)
-        < 0
-      ) {
+      if (emitUnionBoxOwed(body, "", elemUnionTy, elems[i], fnIx) < 0) {
         return -1
       }
     } else {
@@ -27597,17 +27702,14 @@ function emitAssignIdent(
     // the raw variant, so it takes the plain coerce. A literal-union target is an atom and falls
     // through below. The union is the checker's recorded one where a registry row answers it,
     // else the target's own.
-    const recBt = boxRecordTyAt(a.binRight, fnIx)
-    const recNm = boxRecordNameOf(recBt)
-    const recTy = boxRecordUnionTyOf(recBt)
+    const recTy = boxRecordUnionTyOf(boxRecordTyAt(a.binRight, fnIx))
+    const recOwn = boxTyName(recTy) != ""
     if declaredKind(lhsIx) == "union" {
-      const bNm = if recNm != "" { recNm } else { aUNm }
-      const bTy = if recNm != "" { recTy } else { nodeTyAt(lhsIx, fnIx) }
-      if emitUnionBoxOwed(body, bNm, bTy, a.binRight, fnIx) < 0 { return -1 }
+      const bTy = if recOwn { recTy } else { nodeTyAt(lhsIx, fnIx) }
+      if emitUnionBoxOwed(body, aUNm, bTy, a.binRight, fnIx) < 0 { return -1 }
     } else {
-      const cNm = if recNm != "" { recNm } else { aUNm }
-      const cTy = if recNm != "" { recTy } else { nodeTyIxOf(lhsIx) }
-      if emitUnionBoxOwed(body, cNm, cTy, a.binRight, fnIx) < 0 { return -1 }
+      const cTy = if recOwn { recTy } else { nodeTyIxOf(lhsIx) }
+      if emitUnionBoxOwed(body, aUNm, cTy, a.binRight, fnIx) < 0 { return -1 }
     }
   } else if exprNulLitUnion(lhsIx, fnIx) {
     // a `K | null` niche target: the i32 cell holds an atom id or sentinel `-1`. Seeded
@@ -30181,8 +30283,7 @@ function boxAtTable(ix: i32, fnIx: i32): boolean {
 // Whether the checker records `ix` delivered into a union box a registry row names.
 function boxOwedAt(ix: i32, fnIx: i32): boolean {
   // A literal set or a nullable niche is no box, whatever row its union keys.
-  const r = boxRecordTyAt(ix, fnIx)
-  r >= 0 && repOfTy(r).rdKind == "union" && boxRecordNameOf(r) != ""
+  boxRecordOwed(boxRecordTyAt(ix, fnIx))
 }
 
 // `emitExpr` for a value whose delivery the checker recorded a coercion of kind `ck` at: the
@@ -30195,13 +30296,7 @@ function emitCoerced(body: u8[], exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
     const seat = boxSeat
     boxSeat = -1
     if boxDstShadowArmed() { boxDstShadowAs("table") }
-    const rb = emitUnionBoxArg(
-      body,
-      boxRecordNameOf(bt),
-      boxRecordUnionTyOf(bt),
-      exprIx,
-      fnIx,
-    )
+    const rb = emitUnionBoxArg(body, "", boxRecordUnionTyOf(bt), exprIx, fnIx)
     boxSeat = seat
     return rb
   }

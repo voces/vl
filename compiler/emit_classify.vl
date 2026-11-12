@@ -4440,7 +4440,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
       const vfi = variantFieldIndex(nvi, m.memProp)
       if vfi >= 0 {
         if variantFieldIsUnionBox(nvi, vfi) {
-          return variantFieldElemName(nvi, vfi)
+          return memVariantFieldName(nvi, vfi)
         }
         // The narrowed arm stores the field unboxed, whatever a same-named field of a
         // sibling arm stores.
@@ -4489,15 +4489,6 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
                 }
               }
             }
-            const mvi = variantIndexOf(ma)
-            if mvi >= 0 {
-              const mvfi = variantFieldIndex(mvi, m.memProp)
-              if mvfi >= 0 {
-                if variantFieldIsUnionBox(mvi, mvfi) {
-                  return variantFieldElemName(mvi, mvfi)
-                }
-              }
-            }
           }
           mi = mi + 1
         }
@@ -4520,19 +4511,7 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       const afi = variantFieldIndex(avi, m.memProp)
       if afi >= 0 {
         if variantFieldIsUnionBox(avi, afi) {
-          return variantFieldElemName(avi, afi)
-        }
-      }
-    }
-    // The nullable receiver (`z: A | null` under its null test) reads the same arm field, so
-    // it names the same box — `emitMem`'s nullable twin unboxes through this answer (D4636).
-    // A named receiver only: asked of every link of a member chain, the walk is super-linear.
-    if avi < 0 && nodeAt(unwrapParen(m.memObj)) is Ident {
-      const nvi = nulVariantIdxOfExpr(m.memObj, fnIx)
-      if nvi >= 0 && !armLayoutAmbiguousAt(nvi) {
-        const nfi = variantFieldIndex(nvi, m.memProp)
-        if nfi >= 0 && variantFieldIsUnionBox(nvi, nfi) {
-          return variantFieldElemName(nvi, nfi)
+          return memVariantFieldName(avi, afi)
         }
       }
     }
@@ -4592,13 +4571,39 @@ function tyIsUnionOrNullable(ty: i32): boolean {
 // ask this; the `is`-narrowing push sites ask `memberUnionFieldName` directly, since a pushed
 // value there is already a bare variant ref, not a box `emitNarrowedMem` could unwrap (D220).
 export function memberUnionFieldNameRead(memIx: i32, fnIx: i32) {
+  const outer = memFieldRowCur
+  memFieldRowCur = -1
+  const n = memberUnionFieldNameReadGo(memIx, fnIx)
+  memFieldRowOut = memFieldRowCur
+  memFieldRowCur = outer
+  n
+}
+
+function memberUnionFieldNameReadGo(memIx: i32, fnIx: i32) {
   const r = memberUnionFieldName(memIx, fnIx)
   if r != "" {
     const nn = memReadBoxNarrowName(memIx, fnIx)
-    if nn != "" { return nn }
+    if nn != "" {
+      memFieldRowCur = -1
+      return nn
+    }
     return r
   }
   armFieldUnionName(memIx, fnIx)
+}
+
+// The row a variant field's element union keys to, recorded by the member read that named it by
+// `memVariantFieldName`; -1 for a struct field, whose recorded name can be a box its arms share
+// (D4056), and for a narrowed read. Saved and restored per read, as `unNameRowLast` is.
+let memFieldRowCur = -1
+
+// The row behind the name the last completed `memberUnionFieldNameRead` returned, or -1.
+let memFieldRowOut = -1
+
+// Variant `vi`'s field `fi` element union name, with the row its element type keys to recorded.
+function memVariantFieldName(vi: i32, fi: i32): string {
+  memFieldRowCur = unRowOfTyKey(uFieldElemTyIxAt(vi, fi))
+  variantFieldElemName(vi, fi)
 }
 
 // ── the read/consumer channel predicate ──────────────────────────────────────
@@ -5521,18 +5526,6 @@ export function fnValuePlain(ix: i32, depth: i32): boolean {
     if !fnValuePlain(v, depth + 1) { return false }
   }
   true
-}
-
-// The union a union-box list at slot `slot` holds when the list's own type is `listTy`. Slots
-// dedup by rep, so the slot's union may be a generic's spelling of the box (`S | T`); a list
-// whose own element type is closed reads under the row that type keys to (D10931).
-export function rlUnionNameOfTy(slot: i32, listTy: i32): string {
-  const et = tyArrayElemIx(listTy)
-  if et >= 0 && !tyHasTyVar(et) && tyHasTyVar(rlElemTyIxAt(slot)) {
-    const r = unRowOfTyKey(et)
-    if r >= 0 { return unNames[r] }
-  }
-  rlElemUnionName(slot)
 }
 
 // The value-union name of an index read `xs[0]` whose receiver is a ref list with a
@@ -9728,19 +9721,19 @@ function exprUnionIf(exprIx: i32, fnIx: i32): boolean {
 export function unionNameOfRead(atIx: i32, fnIx: i32) {
   const k = unionReadTyOf(atIx, fnIx)
   if k == UNION_READ_HOLE {
-    return unionNameOfHoleRead(unwrapParen(atIx), fnIx)
+    const hn = unionNameOfHoleRead(unwrapParen(atIx), fnIx)
+    unReadRowOut = holeReadRowOut
+    return hn
   }
+  unReadRowOut = -1
   if k < 0 { return "" }
+  unReadRowOut = regUnionRowOfTy(k)
   regUnionNameOfTy(k)
 }
 
-// The row the union `unionNameOfRead` names the read at `atIx` by is registered as, where its
-// type keys one; -1 for a hole read or a name with no type-keyed row.
-function unionReadRowOf(atIx: i32, fnIx: i32): i32 {
-  const k = unionReadTyOf(atIx, fnIx)
-  if k < 0 { return -1 }
-  regUnionRowOfTy(k)
-}
+// The row the last `unionNameOfRead` named its read by, -1 where it answered no type-keyed or
+// declared row. Written as that call's last step, so its caller reads it before any other call.
+let unReadRowOut = -1
 
 // `unionReadTyOf`'s answer for a read whose type is a hole the operand types do not fill.
 const UNION_READ_HOLE = -2
@@ -9774,6 +9767,21 @@ function unionReadTyOf(atIx: i32, fnIx: i32): i32 {
 // iterable, a capture or a global. `atIx` picks among sibling blocks binding one name, and a
 // block shadow of a same-named parameter wins (D2325).
 function unionNameOfHoleRead(atIx: i32, fnIx: i32) {
+  const outer = holeReadRowLast
+  holeReadRowLast = -1
+  const n = unionNameOfHoleReadGo(atIx, fnIx)
+  holeReadRowOut = if n != "" { holeReadRowLast } else { -1 }
+  holeReadRowLast = outer
+  n
+}
+
+// The row the declaration answering the current hole read names, -1 until one does; saved and
+// restored per read as `unNameRowLast` is. `holeReadRowOut` is the finished read's.
+let holeReadRowLast = -1
+
+let holeReadRowOut = -1
+
+function unionNameOfHoleReadGo(atIx: i32, fnIx: i32) {
   // A read of a cell in the emitting frame is a box only when that cell is one.
   if fnIx == emitCurFnIx && declaredSlotOf(atIx) >= 0 {
     if declaredKind(atIx) != "union" { return "" }
@@ -9817,7 +9825,7 @@ function unionNameOfHoleRead(atIx: i32, fnIx: i32) {
         }
       }
       const li = bodyLetReadAtSid(body, sid, atIx)
-      if li >= 0 { return letUnionNameOf(li, fnIx) }
+      if li >= 0 { return letUnionNameOfHole(li, fnIx) }
       // A `for <name> in <(C|S)[]>` loop variable is a kind-4 union box with no `LetDecl` of
       // its own, so its member set comes from the iterable's union-box element type instead.
       const flv = forInLoopVarUnionName(atIx, fnIx)
@@ -9839,11 +9847,11 @@ function unionNameOfHoleRead(atIx: i32, fnIx: i32) {
   const cun = capturedUnionName(fnIx, name)
   if cun != "" { return cun }
   const gi = globalLetOfRead(fnIx, atIx)
-  if gi >= 0 { return letUnionNameOf(gi, -1) }
+  if gi >= 0 { return letUnionNameOfHole(gi, -1) }
   // A module block's binding: the read's own declaration, when no frame declares it (D2252).
   const bl = identDeclOf(atIx)
   if bl >= 0 && nodeAt(bl) is LetDecl && readDeclOwnerOf(bl, fnIx) < 0 {
-    return letUnionNameOf(bl, -1)
+    return letUnionNameOfHole(bl, -1)
   }
   ""
 }
@@ -9899,19 +9907,43 @@ function forInIterUnionElemName(iterIx: i32, fnIx: i32) {
   rlElemName[slot]
 }
 
+// `letUnionNameOf` for a hole read, which takes the binding's row as its own.
+function letUnionNameOfHole(letIx: i32, fnIx: i32): string {
+  const n = letUnionNameOf(letIx, fnIx)
+  holeReadRowLast = letRowOut
+  n
+}
+
 // The union name of a `LetDecl`: its annotation when that names a union, else the
 // union its (un-annotated) initializer produces (`const r = pick(true)`).
 export function letUnionNameOf(letIx: i32, fnIx: i32) {
+  const outer = letRowLast
+  letRowLast = -1
+  const n = letUnionNameOfGo(letIx, fnIx)
+  letRowOut = if n != "" { letRowLast } else { -1 }
+  letRowLast = outer
+  n
+}
+
+// The row the rung answering the current `letUnionNameOf` names, -1 until one does: an
+// annotation's type key, or an initializer's own row. `letRowOut` is the finished call's.
+let letRowLast = -1
+
+let letRowOut = -1
+
+function letUnionNameOfGo(letIx: i32, fnIx: i32): string {
   const d = nodeAt(letIx)
   if d is LetDecl {
     // Membership decided via `unRowOfCanonFolded` (canon-keyed), the name still rendered via
     // `tyNameOf` — the same split `unionNameOfIdentSid`'s param arm uses, and rendered on the
     // same side of the test, since an annotation naming no union row discards the spelling.
     if unRowOfCanonFolded(annRowOfNode(d.letType)) >= 0 {
+      letRowLast = unRowOfTyKey(annRowOfNode(d.letType))
       return tyNameOf(d.letType)
     }
     if d.letType < 0 {
       const inf = unionNameOfExpr(d.letInit, fnIx)
+      const infRow = unNameRowOut
       if inf != "" {
         // A narrowed read bound at its niche or arm cell is no box, whatever it reads (D3133).
         if nodeTyIsNarrowedShape(unwrapParen(d.letInit), fnIx) {
@@ -9925,6 +9957,7 @@ export function letUnionNameOf(letIx: i32, fnIx: i32) {
           fnIx,
         )
         if nrw != "" { return nrw }
+        letRowLast = if infRow >= 0 { infRow } else { unRowOfTyKey(nodeTyIxOf(letIx)) }
         return inf
       }
       // A null-hole binding (`let x = null` filled by a later `x = e`) carries
@@ -10282,7 +10315,7 @@ function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
       // The sid-taking twin, off the node's own column: `sidOfNode` of this Ident is `sidOf` of
       // its name by that column's contract, so the id is read rather than the spelling re-interned.
       const rdn = unionNameOfRead(unwrapParen(exprIx), fnIx)
-      if rdn != "" { unNameRowLast = unionReadRowOf(unwrapParen(exprIx), fnIx) }
+      if rdn != "" { unNameRowLast = unReadRowOut }
       return rdn
     }
     OptMember => {
@@ -10306,7 +10339,9 @@ function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
       // Must decline the same read `exprUnion`'s Member case does: a read the read site already
       // unboxes is a string ref, not a union box, whatever this field's declared type says. D311.
       if memReadUnboxAtomKind(mix, fnIx) >= 0 { return "" }
-      return memberUnionFieldNameRead(mix, fnIx)
+      const mfn = memberUnionFieldNameRead(mix, fnIx)
+      if mfn != "" { unNameRowLast = memFieldRowOut }
+      return mfn
     }
     Index => {
       // The name-typed half of `exprUnion`'s niche decline for a field or cell (D2590).
@@ -10335,6 +10370,7 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
   if callee is Member {
     const pus = popRefRecvSlot(exprIx, fnIx)
     if pus >= 0 && pus < rlElemName.length && popUnionBoxElem(pus) {
+      unNameRowLast = rlElemUnionRow(pus)
       return rlElemUnionName(pus)
     }
   }
@@ -10345,7 +10381,13 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
     if t >= 0 {
       const fn = nodeAt(fnStmts[t])
       if fn is FuncDecl {
-        if unRowOfCanonFolded(annRowOfNode(fn.fnRet)) >= 0 {
+        const arw = unRowOfCanonFolded(annRowOfNode(fn.fnRet))
+        if arw >= 0 {
+          // The call's own type row stands for the annotation where the two fold to one row; a
+          // literal-union annotation folds to its base's, which another row can carry.
+          if unRowOfTyKey(nodeTyIxOf(unwrapParen(exprIx))) == arw {
+            unNameRowLast = arw
+          }
           return tyNameOf(fn.fnRet)
         }
         if fn.fnRet < 0 {
@@ -10367,7 +10409,7 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
     if cuk != "" && sigKeyRetKind(cuk) == "union" {
       const kun = callUnionNameOfTy(nodeTyIxOf(unwrapParen(exprIx)))
       if kun != "" {
-        unNameRowLast = callUnionRowOfTy(nodeTyIxOf(unwrapParen(exprIx)))
+        unNameRowLast = unRowOfTyKey(nodeTyIxOf(unwrapParen(exprIx)))
         return kun
       }
     }
@@ -10405,19 +10447,6 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
 
 // The union name a value call of result type `ty` boxes as: a literal-union alias, bare or
 // nullable, else its value-union spelling, else the name of the row its key holds; "" for none.
-// The row `callUnionNameOfTy` named `ty` by, where it answered from the type key; -1 where it
-// answered by a literal-union alias or a value-union name.
-function callUnionRowOfTy(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = tyAt(ty)
-  if t is TyNullable {
-    if litUnionAliasNameOfTy(t.nInner) != "" { return -1 }
-  }
-  if litUnionAliasNameOfTy(ty) != "" { return -1 }
-  if valueUnionNameOfTy(ty) != "" { return -1 }
-  unRowOfTyKey(ty)
-}
-
 function callUnionNameOfTy(ty: i32): string {
   if ty < 0 { return "" }
   const t = tyAt(ty)
@@ -10489,6 +10518,7 @@ function unionNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
     if mvValKindAt(mri) == "union" {
       if mapReadNarrowedAtomKind(unwrapParen(exprIx), fnIx) >= 0 { return "" }
       if mapReadNarrowedContainer(unwrapParen(exprIx), fnIx) { return "" }
+      unNameRowLast = unRowOfTyKey(mvValTyIxAt(mri))
       return mvValName[mri]
     }
   }
@@ -11580,13 +11610,6 @@ function refListKeptSlotOfMember(e: Member, exprIx: i32, fnIx: i32): i32 {
     const vfi = variantFieldIndex(vi, e.memProp)
     if vfi < 0 || variantFieldElemName(vi, vfi) == "" { return -1 }
     return keptOrName(variantFieldRefSlot(vi, vfi))
-  }
-  const avi = memRecvArmVariantIndex(e.memObj, fnIx)
-  if avi >= 0 {
-    const afi = variantFieldIndex(avi, e.memProp)
-    if afi >= 0 && variantFieldElemName(avi, afi) != "" {
-      return keptOrName(variantFieldRefSlot(avi, afi))
-    }
   }
   const si = structIndexOfExpr(e.memObj, fnIx)
   if si >= 0 {
@@ -14059,6 +14082,13 @@ export function classifyStateReset() {
   asgReReadIx = -1
   unNameRowLast = -1
   unNameRowOut = -1
+  unReadRowOut = -1
+  holeReadRowLast = -1
+  holeReadRowOut = -1
+  letRowLast = -1
+  letRowOut = -1
+  memFieldRowCur = -1
+  memFieldRowOut = -1
   storageReadLeave(-1)
   objLitSlotsReset()
   0
