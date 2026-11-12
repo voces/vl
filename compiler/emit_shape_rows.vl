@@ -6,7 +6,7 @@ import { recNarrowRecordOf } from "./check_bind_adopt"
 // ref-array element resolves to, and the heap twins of a variant's struct rows.
 
 import { elabListFnElemTy } from "./emit_elab"
-import { fnTagListTy, fnTagTyIsTagged } from "./check_elab_cap"
+import { fnTagHoldsTy, fnTagListTy, fnTagTyIsTagged } from "./check_elab_cap"
 import {
   ArrayLit,
   AsExpr,
@@ -76,7 +76,6 @@ import {
   nameIsInlineLitUnion,
   nulNumLitUnionBaseName,
 } from "./check_ty_rep"
-import { nameIsNewtypeBrand } from "./check_type_shape"
 import {
   PrimName,
   RC_MAP_VAL,
@@ -100,6 +99,7 @@ import {
   mkArrayTy,
   mkFuncTy,
   mkMapTy,
+  nomNameOfTy,
   numLitUnionBaseName,
   numLitUnionBaseTy,
   oneStrLitSpelling,
@@ -340,7 +340,6 @@ import {
 } from "./memo"
 import {
   annGenAppSpanEnds,
-  arrElemNameRaw,
   gaeArgsTextOf,
   gaeHeadNameOf,
   gaeLtAt,
@@ -2470,25 +2469,35 @@ export function annRefArrElemRow(annIx: i32) {
   -1
 }
 
-// Is the element name `en` one `repElemKey` keys nominally? Those are the names a structural
-// row cannot stand in for. Four classes: an interned anonymous row, a newtype brand (the
-// name is the brand while the row is the unbranded base), a declared struct, and a declared
-// alias reached through the array grammar. A conservative decline costs nothing; a wrong hint is a silently wrong slot.
-export function elemNameIsNominal(en: string) { elemNameIsNominalAt(en, 0) }
-function elemNameIsNominalAt(en: string, depth: i32): boolean {
-  if en == "" { return true }
-  // A recursion bound, not a policy: past it the guard declines rather than guesses.
-  if depth > 8 { return true }
-  // Peel the array grammar and ask about the LEAF — `S[]` is nominal exactly when `S` is.
-  // The cut is "" both off a non-array and off the degenerate `[]`, whose empty leaf declines.
-  const leaf = arrElemNameRaw(en)
-  if leaf != "" || en == "[]" { return elemNameIsNominalAt(leaf, depth + 1) }
-  if en.length >= 5 {
-    if en.slice(0, 5) == "#anon" { return true }
+// Whether a list element of type `ty` is one `repElemKey` keys nominally, so a structural row
+// cannot stand in for it: a newtype brand, a declared record, or a record holding a tagged
+// function (its row is keyed by its set), at any list depth. A type it cannot see (-1) declines.
+export function elemTyIsNominal(ty: i32): boolean { elemTyIsNominalAt(ty, 0) }
+
+function elemTyIsNominalAt(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth > 8 { return true }
+  if nomNameOfTy(ty) != "" { return true }
+  const t = tyAt(ty)
+  match t {
+    TyArray => {
+      return elemTyIsNominalAt(t.aElem, depth + 1)
+    }
+    TyObj => {
+      return structNameOfTy(ty) != "" || fnTagHoldsTy(ty, 8)
+    }
+    TyUnion => {
+      // A one-member union is a declared alias's wrapper, and is its member.
+      if t.uMembers.length == 1 {
+        return elemTyIsNominalAt(t.uMembers[0], depth + 1)
+      }
+      return false
+    }
+    // A scalar, literal, map, function, nullable, variable, negation or error is keyed
+    // structurally.
+    TyPrim | TyLit | TyMap | TyFunc | TyNullable | TyVar | TyNeg | TyErr => {
+      return false
+    }
   }
-  if nameIsNewtypeBrand(en) { return true }
-  if structIndexByName(en) >= 0 { return true }
-  false
 }
 
 // A ref-list element is a nullable niche (the index read leaves it `(ref null $elem)`) iff
