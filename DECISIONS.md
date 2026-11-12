@@ -1281,6 +1281,12 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   consequence is accepted rather than papered over: a bound ALIAS body resolves in its own
   scope, so an alias naming `T` fits `<T: …>` and not `<U: …>`, and the refusal hands over the
   inline spelling. F-bounded generic bound aliases are not in phase 1.
+- **A SET OF FUNCTIONS IN ONE SLOT NEED NOT RETURN ONE TYPE** (2026-11-11, orchestrator ruling
+  on D15791, recorded 2026-11-12 with D15225). `every function a call through X may run must
+  return one type` was a soundness guard, not a language contract: an un-judged call through a
+  slot of differing results built one closure and trapped (D15221). A call through a slot whose
+  members' results differ instead keeps the set and dispatches on the member id, its result the
+  join of theirs; the refusal stays only where no dispatch is built yet.
 
 ## An object literal a union arm's field-name set MATCHES is not thereby a union BOX — and the row it gets is gated on the OWNER, not on the literal
 
@@ -11723,3 +11729,22 @@ Orchestrator ruling over `docs/internals/refactor-notes/2026-11-10-step7-vkind-c
 ## A named function in a record field is a set id, as in a list (2026-11-10) — D15640
 
 Orchestrator ruling, option 1 of `docs/internals/refactor-notes/2026-11-10-d15640-record-of-named-function-options.md`. Steps 3 and 4 make a named function value a singleton set type, and a record field is one more holder of it, like a list element. So `{ f: dbl }` holds `{dbl}`'s id from the check onward, and the late tag decision decides it as it decides `[dbl]`. The record-adoption pin (`recAdPinLet`) may not fix the field at a closure type. Not yet built: the position count is in `2026-11-10-d15640-record-field-matrix.md`.
+
+## Width subtyping of an existing record: specialize per concrete record (owner ruling A, B later, 2026-11-12) — D4054
+
+**The rule.** An existing record of a wider shape delivered where a narrower record is declared is
+taken at its own layout, and no copy is made. A declared record parameter is made generic and
+instantiated per concrete record, whether it is bare, nullable, or a list's element (D4021–D4023).
+A declared binding or return whose only sources are that record takes the record's own type
+(D4054). A fresh container (`{ f: a }`, `[a]`) is built at the concrete element.
+
+**The contract.** One storage has one layout. A slot or container whose storage is fixed at the
+narrow type, and which would hold records of two concrete layouts, is refused. That covers a slot
+fed two shapes or a join, an existing `Pos[]` pushed a wider record, a map value, a field of an
+existing `{ f: Pos }`, a global, and a closure capture of such a slot. A `readonly` view keeps its
+refusal until the view rep lands (D4050), since taking the record's own type would drop the
+promise of no writes.
+
+**Why.** Specializing keeps every write through the narrow handle on the one record, which a copy
+would split (DECISIONS "Record covariance", B). A view rep (option B) is the later route for the
+refused shapes.

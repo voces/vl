@@ -1,6 +1,7 @@
 import { REC_STORE_DEPTH } from "./check_ty_relate"
 import { registeredUnionRowOfTy } from "./emit_start_block"
 import {
+  msSetOfTy,
   rlElemUnionRow,
   unionMemberAtomsOf,
   unionMemberAtomsOfRow,
@@ -210,6 +211,7 @@ import {
   tyEq,
   tyFieldTyOf,
   tyHasInferHole,
+  tyHasLitLeaf,
   tyIsDeclaredParam,
   tyIsFuncArena,
   tyIsLitUnion,
@@ -899,9 +901,8 @@ import {
   isUNameABTyMayHit,
   msMemberAtomsOfSet,
   msMemberTysOfSet,
-  msSetOfNameTy,
+  msSetOfRowOr,
   msSetOfTyAny,
-  msSetOfUnion,
   msSoleMemberTy,
   msTextOf,
   rlElemUnionName,
@@ -4444,7 +4445,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
     if si >= 0 {
       const fi = sFieldIndex(si, m.memProp)
       if fi >= 0 {
-        if sFieldIsUnionBox(si, fi) { return sFieldElemNameAt(si, fi) }
+        if sFieldIsUnionBox(si, fi) { return memStructFieldName(si, fi) }
       }
     }
     // The receiver is a narrowed union arm (`v.f`, `v` narrowed to a struct variant):
@@ -4499,7 +4500,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
               const mfi = sFieldIndex(msi, m.memProp)
               if mfi >= 0 {
                 if sFieldIsUnionBox(msi, mfi) {
-                  return sFieldElemNameAt(msi, mfi)
+                  return memStructFieldName(msi, mfi)
                 }
               }
             }
@@ -4606,9 +4607,9 @@ function memberUnionFieldNameReadGo(memIx: i32, fnIx: i32) {
   armFieldUnionName(memIx, fnIx)
 }
 
-// The row a variant field's element union keys to, recorded by the member read that named it by
-// `memVariantFieldName`; -1 for a struct field, whose recorded name can be a box its arms share
-// (D4056), and for a narrowed read. Saved and restored per read, as `unNameRowLast` is.
+// The row a field's element union keys to, recorded by the member read that named it by
+// `memVariantFieldName` or `memStructFieldName`; -1 for a narrowed read. Saved and restored per
+// read, as `unNameRowLast` is.
 let memFieldRowCur = -1
 
 // The row behind the name the last completed `memberUnionFieldNameRead` returned, or -1.
@@ -4618,6 +4619,13 @@ let memFieldRowOut = -1
 function memVariantFieldName(vi: i32, fi: i32): string {
   memFieldRowCur = unRowOfTyKey(uFieldElemTyIxAt(vi, fi))
   variantFieldElemName(vi, fi)
+}
+
+// Struct `si`'s field `fi` element union name, with the row its element type keys to recorded. A
+// box the union's records share is recorded as the field's element type too.
+function memStructFieldName(si: i32, fi: i32): string {
+  memFieldRowCur = unRowOfTyKey(sFieldElemTyIxAt(si, fi))
+  sFieldElemNameAt(si, fi)
 }
 
 // ── the read/consumer channel predicate ──────────────────────────────────────
@@ -5721,8 +5729,11 @@ export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
         return -1
       }
       if !exprRefArray(iterIx, fnIx) { return -1 }
-      // The row the list's element heap is built from (its storage), when it has a row.
-      const rs = listRowOfExpr(iterIx, fnIx)
+      // The row the list's element heap is built from (its storage), when it has a row; else
+      // the ref-list slot the list is emitted at, as an element read of it asks (a list a
+      // record's field holds).
+      const rs0 = listRowOfExpr(iterIx, fnIx)
+      const rs = if rs0 >= 0 { rs0 } else { refListSlotOfExpr(iterIx, fnIx) }
       if rs >= 0 && rs < rlElemName.length { return rlElemStructRow(rs) }
       return repSlotOfKind(fk, e)
     }
@@ -10286,7 +10297,12 @@ function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
     // An if-expression names its union from its own recorded type, like the `AsExpr` arm: only
     // a desugared `??` (`nodeTyCarry`) puts a type on an `if` — a source-written one has none. D969.
     IfStmt => {
-      return ifJoinUnionNameIn(unwrapParen(exprIx), fnIx)
+      const ijn = ifJoinUnionNameIn(unwrapParen(exprIx), fnIx)
+      // The join is named off its type at the instance, and that type keys the name's row.
+      if ijn != "" {
+        unNameRowLast = unRowOfTyKey(nodeTyInOf(unwrapParen(exprIx), fnIx))
+      }
+      return ijn
     }
     // Every other expression is resolved by the rungs below.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -10466,8 +10482,16 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
         if fn.fnRet < 0 {
           const irk = inferRetFnKey(fnStmts[t], callee.identName)
           const im = inferRetNameOf(irk)
-          if isValueUnionName(im) { return im }
-          if im != "" && isUNameAB(18, im, inferRetTyIxOf(irk)) { return im }
+          const irt = inferRetTyIxOf(irk)
+          if isValueUnionName(im) {
+            // A literal member keys a literal row the name's spelling does not name.
+            if !tyHasLitLeaf(irt, 4) { unNameRowLast = unRowOfTyKey(irt) }
+            return im
+          }
+          if im != "" && isUNameAB(18, im, irt) {
+            unNameRowLast = unRowOfTyKey(irt)
+            return im
+          }
         }
       }
     }
@@ -10499,7 +10523,10 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
   // Fallback scoped to a call (an if-expr has its own union path): renders from the checker's
   // per-node type when the callee has no static name to key on (`arr[i](x)`).
   const crun = nodeUnionName(exprIx)
-  if crun != "" { return crun }
+  if crun != "" {
+    unNameRowLast = unRowOfTyKey(nodeTyInOf(unwrapParen(exprIx), fnIx))
+    return crun
+  }
   // A type parameter bound to a union stays nested in the result (`T | string` at `f64 | i32`),
   // which no render above flattens; the box is the row holding its flattened members (D10522).
   const nfr = nestedUnionRowName(nodeTyAt(unwrapParen(exprIx), fnIx))
@@ -10926,11 +10953,12 @@ export function sharedUnionFieldPlan(
     const un = unionNameOfRead(unwrapParen(recvIx), fnIx)
     set = unionMemberSetOf(un)
     // An un-annotated parameter's name is a spelling with no row; its instance type keys one (D15571).
-    setId = msSetOfNameTy(un, nodeTyAt(unwrapParen(recvIx), fnIx))
+    setId = msSetOfTy(nodeTyAt(unwrapParen(recvIx), fnIx))
   } else {
-    const un = unionNameOfExpr(recvIx, fnIx)
+    const unr: i32[] = []
+    const un = unionNameRowOfExpr(recvIx, fnIx, unr)
     set = unionMemberSetOf(un)
-    setId = msSetOfUnion(un)
+    setId = msSetOfRowOr(unr[0], un)
   }
   if set == "" { return -1 }
   const atoms: string[] = []
