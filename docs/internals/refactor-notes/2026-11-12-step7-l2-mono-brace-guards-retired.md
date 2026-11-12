@@ -59,6 +59,7 @@ fixture's `7`.
 
 ## Proof
 
+- **The controls in `distilled/named/`** (set `d15978-alias-arm-pin`, both `runs`), so `regress.vl` guards them.
 - **Locally, on master:**
   - refresh to a fixpoint;
   - `lint-self.sh` clean;
