@@ -39,12 +39,24 @@ the name rule over the sweep list (24,020 programs graded):
 | the name only: `i32[]|i32` in `distilled/named/d362al_numlitun_unionmem.vl` | 3 |
 | the type only: `W | null` with `W = 1 | 2 \| 5000000000`, `literal-unions/coalesce-litunion-int-default-arith.vl` | 1 |
 
-- **The name-only calls** hand the registrar a type that is not the named union: `sty` is the list
-  `L`, not `L | i32`. That is the census's "a caller handing over the wrong type" class (cut order
-  item 5). By type, the list is not a value union.
+- **The name-only calls** are `Z[] | i32` with `Z = 0 | 1`, spelled `i32[]|i32`. The registrar is
+  handed that union. `isValueUnionTyOr` declines (-1) on it, because `valueRowKind` has no kind for
+  a list of a literal union, and `riuValueOfBases` does not apply, because `i32` is no literal.
+  So the type no longer calls it a value union. The program builds byte-identically: the
+  registration was redundant. Folding a list of one literal base into the typed verdict
+  (`valueUnionVerdict`) would close the decline; that is the checker's verdict, not this cut's.
 - **The type-only call** keeps the alias `W` as one atom in its spelling.
 
 Both programs print what the base prints.
+
+## What the registrar reads its name for after this
+
+The inline union is keyed by its type. Its name is read for three things only:
+
+- the row's display name (the mint);
+- `isUNameKeyAB`'s A/B tally, a label;
+- `unNameAdoptTyKeyRow`, which binds the spelling to the row the type found. That is a contract:
+  the spelling index exists so that a source name resolves to its row.
 
 ## Graded by output
 
