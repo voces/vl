@@ -1,6 +1,9 @@
 import { registeredUnionRowOfTy } from "./emit_start_block"
-import { unionMemberAtomsOf } from "./emit_union_registry"
-import { unionMemberAtomsOfRow } from "./emit_union_registry"
+import {
+  rlElemUnionRow,
+  unionMemberAtomsOf,
+  unionMemberAtomsOfRow,
+} from "./emit_union_registry"
 import { valueTailLeaves } from "./check_num_adopt"
 import { callBuiltTy } from "./check_store_rep"
 import { emitFail } from "./emit_bytes"
@@ -242,6 +245,7 @@ import {
   nulLitAliasNameOfTy,
   plusChainHasStrLit,
   regUnionNameOfTy,
+  regUnionRowOfTy,
 } from "./emit_anon_fields"
 import {
   fieldKindWidens,
@@ -9708,27 +9712,47 @@ function exprUnionIf(exprIx: i32, fnIx: i32): boolean {
 // its storage is no union box: the name of the row its storage type keys. A nullable box with no
 // row of its own is its inner union's. A type holding a hole names the instance's binding of it.
 export function unionNameOfRead(atIx: i32, fnIx: i32) {
+  const k = unionReadTyOf(atIx, fnIx)
+  if k == UNION_READ_HOLE {
+    return unionNameOfHoleRead(unwrapParen(atIx), fnIx)
+  }
+  if k < 0 { return "" }
+  regUnionNameOfTy(k)
+}
+
+// The row the union `unionNameOfRead` names the read at `atIx` by is registered as, where its
+// type keys one; -1 for a hole read or a name with no type-keyed row.
+function unionReadRowOf(atIx: i32, fnIx: i32): i32 {
+  const k = unionReadTyOf(atIx, fnIx)
+  if k < 0 { return -1 }
+  regUnionRowOfTy(k)
+}
+
+// `unionReadTyOf`'s answer for a read whose type is a hole the operand types do not fill.
+const UNION_READ_HOLE = -2
+
+// The type `unionNameOfRead` names the read at `atIx` by: the read's union type, or a nullable
+// box's inner union; -1 for no union, `UNION_READ_HOLE` for an unfilled hole.
+function unionReadTyOf(atIx: i32, fnIx: i32): i32 {
   const u = unwrapParen(atIx)
-  if u < 0 || !(nodeAt(u) is Ident) { return "" }
+  if u < 0 || !(nodeAt(u) is Ident) { return -1 }
   let t = readStoreTyAt(u, fnIx)
   if t >= 0 && t < T.tys.length && tyHasInferHole(t, 0) {
     t = holeOperandTyOf(u, fnIx)
-    if t < 0 { return unionNameOfHoleRead(u, fnIx) }
+    if t < 0 { return UNION_READ_HOLE }
   }
-  if t < 0 || t >= T.tys.length { return "" }
+  if t < 0 || t >= T.tys.length { return -1 }
   // Only a union or a nullable is a box, and a nullable record's spelling doubles per level
   // (D2780), so neither renders a key.
   const tt = tyAt(t)
-  if !(tt is TyUnion || tt is TyNullable) { return "" }
+  if !(tt is TyUnion || tt is TyNullable) { return -1 }
   const pt = tyPeelNul(t)
-  if pt >= 0 && pt < T.tys.length && tyAt(pt) is TyObj { return "" }
-  const n = regUnionNameOfTy(t)
-  if n != "" { return n }
-  const nt = tyAt(t)
-  if nt is TyNullable && repOfTy(t).rdKind == "union" {
-    return regUnionNameOfTy(nt.nInner)
+  if pt >= 0 && pt < T.tys.length && tyAt(pt) is TyObj { return -1 }
+  if regUnionNameOfTy(t) != "" { return t }
+  if tt is TyNullable && repOfTy(t).rdKind == "union" {
+    if regUnionNameOfTy(tt.nInner) != "" { return tt.nInner }
   }
-  ""
+  -1
 }
 
 // The union name of a read whose type is a hole the instance does not bind, by its declaration:
@@ -10224,7 +10248,9 @@ function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
       if identReadContainerAt(exprIx, fnIx) > 0 { return "" }
       // The sid-taking twin, off the node's own column: `sidOfNode` of this Ident is `sidOf` of
       // its name by that column's contract, so the id is read rather than the spelling re-interned.
-      return unionNameOfRead(unwrapParen(exprIx), fnIx)
+      const rdn = unionNameOfRead(unwrapParen(exprIx), fnIx)
+      if rdn != "" { unNameRowLast = unionReadRowOf(unwrapParen(exprIx), fnIx) }
+      return rdn
     }
     OptMember => {
       // A `?.` whose leaf is a value-union field (code 16): the checker's own type for the node
@@ -10407,6 +10433,7 @@ function unionNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
         // must answer together — `exprUnion` false with a name still resolving is exactly
         // the split D311 records one classifier over.
         if idxNarrowAtomKind(exprIx, fnIx) >= 0 { return "" }
+        unNameRowLast = rlElemUnionRow(slot)
         return rlElemUnionName(slot)
       }
     }
