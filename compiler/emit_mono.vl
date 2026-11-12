@@ -119,7 +119,7 @@ import {
   tyIsUnionish,
 } from "./check_node_tys"
 import { nodePos } from "./fmt_util"
-import { arrElemSuffixed, listElemNameOf } from "./tyname"
+import { arrElemSuffixed } from "./tyname"
 import {
   fnCloCoerceSetAt,
   fnCloCoerceTyIx,
@@ -1964,9 +1964,8 @@ function monoArgTyNameProjected(
 ): string {
   const argN = nodeAt(unwrapParen(ix))
   // An indexed element argument (`id(xs[0])`): the array's own name resolves above through
-  // the annotation arms, and the element is that name minus one `[]`. The element goes
-  // through `monoAnnPinName`, the same home the array is named through — the two ends of
-  // one cut must claim the same spelling set. The peel is `listElemNameOf`.
+  // the annotation arms, and the element pins at the list's element type, spelled by the naming
+  // rule and claimed through `monoAnnPinName`, the same home the array is named through.
   if argN is Index {
     // The array NAME cannot carry a literal-union element: such an array reps as the
     // interned-atom i32 list, so an INFERRED one is named `i32[]` and this arm would pin the
@@ -1980,7 +1979,7 @@ function monoArgTyNameProjected(
       if arrTy.length >= 3 && monoTyIsList(lt) {
         const at = tyAt(lt)
         const aet = if at is TyArray { at.aElem } else { -1 }
-        const r = monoAnnPinName(listElemNameOf(arrTy), aet)
+        const r = monoAnnPinName(monoPinSpellShaped(aet), aet)
         if r != "" {
           tyOut[0] = tyArrayElemIx(lt)
           return r
@@ -5277,7 +5276,10 @@ function monoSubstIsExpr(ix: i32, io: i32, variant: string) {
     // A parameter bound to a literal's `#anon` row banks the list of the row's shape as the
     // check type, which is the arm an inferred union holds for it (D5083).
     const nx = monoMkIsExprLike(ix, io, variant)
-    const aty = monoAnonRowListTy(variant)
+    const aty = monoAnonRowListTy(
+      variant,
+      substTyDeep(isVarTyIxOf(ix), monoFoldSubN, monoFoldSubT),
+    )
     if aty >= 0 {
       recordClonedIsVarTyIx(nx, aty)
     } else if (
@@ -5310,20 +5312,22 @@ function monoSubstIsExpr(ix: i32, io: i32, variant: string) {
   ix
 }
 
-// The list type over a literal's `#anon` row's shape that `name` spells (`#anon0[]` is
-// `{x:i32}[]`); -1 for any other name, the bare row and a row with no recorded type included.
-function monoAnonRowListTy(name: string): i32 {
-  let base = name
+// The list type over the shape of a literal's `#anon` row, at the list depth of `listTy` (a list
+// type, open or closed): `name` spells that row's handle with one `[]` per level (`#anon0[]` is
+// `{x:i32}[]`). -1 for a `listTy` that is no list, a name that is no row handle, and a row with no
+// recorded type. The depth is the type's; the name is read only as the handle.
+function monoAnonRowListTy(name: string, listTy: i32): i32 {
   let depth = 0
-  while (
-    base.length > 2
-    && base[base.length - 1] == ']'
-    && base[base.length - 2] == '['
-  ) {
-    base = base.slice(0, base.length - 2)
+  let t = listTy
+  while t >= 0 && t < T.tys.length {
+    const a = tyAt(t)
+    if !(a is TyArray) { break }
+    t = a.aElem
     depth = depth + 1
   }
-  if depth == 0 || base.length < 5 || base[0] != '#' { return -1 }
+  if depth == 0 || name.length < 2 * depth + 5 { return -1 }
+  const base = name.slice(0, name.length - 2 * depth)
+  if base[0] != '#' { return -1 }
   const si = structIndexByName(base)
   if si < 0 || si >= sTyIx.length || sTyIx[si] < 0 { return -1 }
   let ty = sTyIx[si]
@@ -8565,7 +8569,7 @@ function monoSynthPinRef(name: string, ty: i32): i32 {
     const sp = monoPinSpellOf(ty)
     return synthTypeRefTy(if sp != "" { sp } else { name }, -1, ty)
   }
-  const alt = monoAnonRowListTy(name)
+  const alt = monoAnonRowListTy(name, ty)
   if alt >= 0 { return synthTypeRefOfTy(alt, -1) }
   synthTypeRefFb(name, -1, ty)
 }
@@ -20887,8 +20891,8 @@ function monoPinAnnotatedParam(
     let bind = an2
     let bindTy = monoArgClosedTyIn(args[i], ctx, an2Ty)
     if !tpBare {
-      // `T[]` param: the argument is a list by its type and its UNGROUPED element binds `T`,
-      // regrouped by `arrElemSuffixed` (D1896); an empty `[]` (its literal default) stays open too.
+      // `T[]` param: the argument is a list by its type and its element binds `T`, spelled by the
+      // naming rule from the element's type (D1896); an empty `[]` (its literal default) stays open.
       // A list by its closed type, else by its open pin type's shape (an empty `[]` stays `T[]`).
       const lt = if bindTy >= 0 { bindTy } else { an2Ty }
       if lt < 0 || lt >= T.tys.length || !(tyAt(lt) is TyArray) {
@@ -20900,7 +20904,8 @@ function monoPinAnnotatedParam(
             + "`",
         )
       }
-      bind = listElemNameOf(an2)
+      const elemTy = tyArrayElemIx(lt)
+      bind = monoPinSpellShaped(elemTy)
       bindTy = tyArrayElemIx(bindTy)
     }
     const b = monoBindOf(tvN, tvV, tp)
