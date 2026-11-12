@@ -1,4 +1,6 @@
+import { nodeTyAt } from "./emit_capture_frames"
 import { elabNodeInstTys } from "./emit_elab"
+import { unRowOfTyKey } from "./emit_union_tykey_text"
 
 // `emit_obj_lit_fits.vl` — whether an object literal or field fits a row, and the
 // leaf an arm path reaches.
@@ -77,11 +79,16 @@ import {
 import {
   declRowFieldKindFits,
   fieldKindWidens,
+  fieldRowIsRecordRef,
   fieldScalarKindOf,
   sFieldTgtStructIdx,
   sFieldTypeAt,
   variantFieldElemName,
   variantFieldIsLitUnion,
+  variantFieldIsNulNone,
+  variantFieldIsNulStr,
+  variantFieldIsRecordRef,
+  variantFieldIsUnionBox,
   variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import { objFieldVal, unwrapParen } from "./emit_base"
@@ -91,7 +98,7 @@ import { repSlotOfKind } from "./emit_rep_slot"
 import { declVariantRowAt, variantIndexOf } from "./emit_local_slots"
 import { vtKindOfType } from "./emit_nullable_rets"
 import { paramPosOfRead, paramTypeNodeOfRead } from "./emit_query"
-import { nodeMapValTyIx, nullValKind, unRowOfKey } from "./emit_rep"
+import { nodeMapValTyIx, nullValKind } from "./emit_rep"
 import { mapTwinSame } from "./emit_map_twins"
 import {
   emptyArrLitIxOf,
@@ -111,8 +118,6 @@ import {
   FC_NUL_NONE,
   FC_NUL_STR,
   FC_STR,
-  FC_STRUCT,
-  FC_UNION,
   MVK_MONO,
   armFieldLitTyIx,
   emitCurFnIx,
@@ -354,7 +359,7 @@ export function objLitFitsRow(
       if fv >= 0 { present = present + 1 }
       if fv < 0 {
         if exact && !structRowFieldMayOmit(si, name) { return false }
-      } else if sFieldTypeAt(si, fi) == FC_STRUCT {
+      } else if fieldRowIsRecordRef(sFieldStart[si] + fi) {
         if (
           !objLitFitsRow(
             unwrapParen(fv),
@@ -783,10 +788,10 @@ function tyIsStringPrim(ty: i32): boolean {
 }
 
 // The box tag under which a shared read typed as the union of records `rt` (in its instance)
-// stores member `vi`'s record field `fi`: the tag of that union's arm built at the field's own heap type, so
-// the record rides the box unchanged. -1 when the field is no record or no arm is that heap.
+// stores member `vi`'s record field `fi`: the tag of that union's arm built at the field's own
+// heap type, so the record rides the box unchanged. -1 when the field is no record or no arm is that heap.
 export function sharedFieldArmStructTag(vi: i32, fi: i32, rt: i32): i32 {
-  if variantFieldTypeAt(vi, fi) != FC_STRUCT { return -1 }
+  if !variantFieldIsRecordRef(vi, fi) { return -1 }
   const si = uFieldTgtStructIdx(vi, fi)
   if si < 0 || si >= sHeapIdx.length { return -1 }
   if rt < 0 || rt >= T.tys.length || !(tyAt(rt) is TyUnion) { return -1 }
@@ -914,7 +919,7 @@ export function isTestedRowOf(isIx: i32, ty: i32, recvIx: i32): i32 {
   if own >= 0 { return own }
   if recvIx >= 0 {
     const ut = unionTyOfRecv(nodeTyInOf(unwrapParen(recvIx), emitCurFnIx))
-    const u = if ut >= 0 { unRowOfKey(ut) } else { -1 }
+    const u = if ut >= 0 { unRowOfTyKey(ut) } else { -1 }
     if u >= 0 && u < unVarStart.length && u < unVarCount.length {
       const lo = unVarStart[u]
       const hi = lo + unVarCount[u]
@@ -1057,7 +1062,7 @@ export function sharedFieldArmConverts(code: i32, vi: i32, fi: i32): boolean {
 export function sharedPlanBoxesSome(vis: i32[], fis: i32[]): boolean {
   let i = 0
   while i < vis.length && i < fis.length {
-    if variantFieldTypeAt(vis[i], fis[i]) != FC_UNION { return true }
+    if !variantFieldIsUnionBox(vis[i], fis[i]) { return true }
     i = i + 1
   }
   false
@@ -1091,20 +1096,20 @@ export function sharedPlanOneBoxName(vis: i32[], fis: i32[]): string {
 // Whether member `vi` stores its field `fi` as a value-union box, which a mixed shared read
 // delivers as stored beside the members it boxes (D4056).
 function sharedFieldArmValueBox(vi: i32, fi: i32): boolean {
-  variantFieldTypeAt(vi, fi) == FC_UNION
+  variantFieldIsUnionBox(vi, fi)
     && isValueUnionName(variantFieldElemName(vi, fi))
 }
 
 // Whether member `vi` stores its field `fi` as `string | null`, which a mixed shared read boxes
 // under the string tag or the null tag by whether the stored ref is null (D13361).
 export function sharedFieldArmNulStr(vi: i32, fi: i32): boolean {
-  variantFieldTypeAt(vi, fi) == FC_NUL_STR
+  variantFieldIsNulStr(vi, fi)
 }
 
 // Whether member `vi` stores its field `fi` at the `null` type, which a mixed shared read
 // delivers as the null-tagged box without reading the field.
 export function sharedFieldArmNull(vi: i32, fi: i32): boolean {
-  variantFieldTypeAt(vi, fi) == FC_NUL_NONE
+  variantFieldIsNulNone(vi, fi)
 }
 
 // Whether some member of a shared read stores its field at the `null` type.
@@ -1171,7 +1176,7 @@ function registerSharedReadUnionAt(t: i32, r0: i32) {
 // field: a struct, a nullable, a union box, a list, or a literal-typed field (a discriminant,
 // whose reads keep their own lowering), none of which is boxed here.
 export function sharedFieldArmAtomKind(vi: i32, fi: i32): i32 {
-  if variantFieldTypeAt(vi, fi) == FC_UNION { return -1 }
+  if variantFieldIsUnionBox(vi, fi) { return -1 }
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const at = uFieldStart[vi] + fi
   if at < 0 || at >= sFieldTyText.length { return -1 }
@@ -1348,9 +1353,10 @@ export function declaredRefArraySlot(ix: i32): i32 {
   if slot >= 0 && slot < rlElemName.length { slot } else { -1 }
 }
 
-// The ref-list row keyed by the element type recorded on the empty `[]` at `exprIx`, or -1.
-export function emptyArrHoleElemSlot(exprIx: i32) {
+// The ref-list row keyed by the element type recorded on the empty `[]` at `exprIx` in instance
+// `fnIx`, or -1.
+export function emptyArrHoleElemSlot(exprIx: i32, fnIx: i32) {
   const ax = emptyArrLitIxOf(exprIx)
   if ax < 0 { return -1 }
-  repSlotOfKind("reflist", nodeTyIxOf(ax))
+  repSlotOfKind("reflist", nodeTyAt(ax, fnIx))
 }
