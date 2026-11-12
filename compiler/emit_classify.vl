@@ -4440,7 +4440,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
       const vfi = variantFieldIndex(nvi, m.memProp)
       if vfi >= 0 {
         if variantFieldIsUnionBox(nvi, vfi) {
-          return variantFieldElemName(nvi, vfi)
+          return memVariantFieldName(nvi, vfi)
         }
         // The narrowed arm stores the field unboxed, whatever a same-named field of a
         // sibling arm stores.
@@ -4494,7 +4494,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
               const mvfi = variantFieldIndex(mvi, m.memProp)
               if mvfi >= 0 {
                 if variantFieldIsUnionBox(mvi, mvfi) {
-                  return variantFieldElemName(mvi, mvfi)
+                  return memVariantFieldName(mvi, mvfi)
                 }
               }
             }
@@ -4520,7 +4520,7 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       const afi = variantFieldIndex(avi, m.memProp)
       if afi >= 0 {
         if variantFieldIsUnionBox(avi, afi) {
-          return variantFieldElemName(avi, afi)
+          return memVariantFieldName(avi, afi)
         }
       }
     }
@@ -4532,7 +4532,7 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       if nvi >= 0 && !armLayoutAmbiguousAt(nvi) {
         const nfi = variantFieldIndex(nvi, m.memProp)
         if nfi >= 0 && variantFieldIsUnionBox(nvi, nfi) {
-          return variantFieldElemName(nvi, nfi)
+          return memVariantFieldName(nvi, nfi)
         }
       }
     }
@@ -4592,13 +4592,39 @@ function tyIsUnionOrNullable(ty: i32): boolean {
 // ask this; the `is`-narrowing push sites ask `memberUnionFieldName` directly, since a pushed
 // value there is already a bare variant ref, not a box `emitNarrowedMem` could unwrap (D220).
 export function memberUnionFieldNameRead(memIx: i32, fnIx: i32) {
+  const outer = memFieldRowCur
+  memFieldRowCur = -1
+  const n = memberUnionFieldNameReadGo(memIx, fnIx)
+  memFieldRowOut = memFieldRowCur
+  memFieldRowCur = outer
+  n
+}
+
+function memberUnionFieldNameReadGo(memIx: i32, fnIx: i32) {
   const r = memberUnionFieldName(memIx, fnIx)
   if r != "" {
     const nn = memReadBoxNarrowName(memIx, fnIx)
-    if nn != "" { return nn }
+    if nn != "" {
+      memFieldRowCur = -1
+      return nn
+    }
     return r
   }
   armFieldUnionName(memIx, fnIx)
+}
+
+// The row a variant field's element union keys to, recorded by the member read that named it by
+// `memVariantFieldName`; -1 for a struct field, whose recorded name can be a box its arms share
+// (D4056), and for a narrowed read. Saved and restored per read, as `unNameRowLast` is.
+let memFieldRowCur = -1
+
+// The row behind the name the last completed `memberUnionFieldNameRead` returned, or -1.
+let memFieldRowOut = -1
+
+// Variant `vi`'s field `fi` element union name, with the row its element type keys to recorded.
+function memVariantFieldName(vi: i32, fi: i32): string {
+  memFieldRowCur = unRowOfTyKey(uFieldElemTyIxAt(vi, fi))
+  variantFieldElemName(vi, fi)
 }
 
 // ── the read/consumer channel predicate ──────────────────────────────────────
@@ -5521,18 +5547,6 @@ export function fnValuePlain(ix: i32, depth: i32): boolean {
     if !fnValuePlain(v, depth + 1) { return false }
   }
   true
-}
-
-// The union a union-box list at slot `slot` holds when the list's own type is `listTy`. Slots
-// dedup by rep, so the slot's union may be a generic's spelling of the box (`S | T`); a list
-// whose own element type is closed reads under the row that type keys to (D10931).
-export function rlUnionNameOfTy(slot: i32, listTy: i32): string {
-  const et = tyArrayElemIx(listTy)
-  if et >= 0 && !tyHasTyVar(et) && tyHasTyVar(rlElemTyIxAt(slot)) {
-    const r = unRowOfTyKey(et)
-    if r >= 0 { return unNames[r] }
-  }
-  rlElemUnionName(slot)
 }
 
 // The value-union name of an index read `xs[0]` whose receiver is a ref list with a
@@ -10306,7 +10320,9 @@ function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
       // Must decline the same read `exprUnion`'s Member case does: a read the read site already
       // unboxes is a string ref, not a union box, whatever this field's declared type says. D311.
       if memReadUnboxAtomKind(mix, fnIx) >= 0 { return "" }
-      return memberUnionFieldNameRead(mix, fnIx)
+      const mfn = memberUnionFieldNameRead(mix, fnIx)
+      if mfn != "" { unNameRowLast = memFieldRowOut }
+      return mfn
     }
     Index => {
       // The name-typed half of `exprUnion`'s niche decline for a field or cell (D2590).
@@ -14059,6 +14075,8 @@ export function classifyStateReset() {
   asgReReadIx = -1
   unNameRowLast = -1
   unNameRowOut = -1
+  memFieldRowCur = -1
+  memFieldRowOut = -1
   storageReadLeave(-1)
   objLitSlotsReset()
   0
