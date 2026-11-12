@@ -29,6 +29,7 @@ inventories as filed.
 | `cloSigNameOfTy` (emit_union_atoms) | the closure slot's name, rendered from its type | class B | `closures/alias-is-closure-arm-three-arm-union-call.vl`; 495 programs reach it (#7646) |
 | `rowDumpBuild` (emit_row_dump) | a dump is a diagnostic label | #7414 | `tests/vl_row_classes_test.ts` |
 | `anonRowTyOfName`, `anonPinRow`, `retStructRowIndex`'s `#anon` rung | an `#anonN` handle is the literal row's identity | #7414, #7546 | D15646, D2762 |
+| `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | a function-value-set row has no element type, so it is keyed by its set; a type that holds a type parameter is not a rep (a template's row keyed by its open type, each instance's by its closed type) | lane F's #7636 (open; its note `2026-11-12-w311-reflist-cut6-array-new-row-by-fill-type.md`), accepted by the coordinator; D15804, D15552, D15922 | D15552, D15804, D15922 |
 
 **Defect found and closed:** `cloCallSigRejectWhat`'s render came out empty in both witnesses
 ("parameter 1 of type `` …"). The diagnostic now renders with the checker's `tyToStr`, naming `T`
@@ -40,13 +41,11 @@ and `_`. Filed and closed as D15959 (#7640).
 | --- | --- | --- |
 | `nameFieldCode`'s B171 arms (nullable-element lists the descriptor declines) | reason | "the descriptor declines them" is a mechanism; B171 is not a D-numbered row |
 | `sRowsTwin` keeps the name (D15880) | reason | "the function-tag pass decides the storage" is a mechanism (witness runs) |
-| `rlElemStructRow`'s name rung (D15552, ruled) | reason | a last rung after three type rungs, deciding 6 programs; ruled by the orchestrator, so cited. The reason is still a mechanism |
-| `spellingHasStructRow`, `elemNameIsNominalAt`, `structRowOfSpelling`, `rowCanonIdOfName` | reason, witness | "a spelling predicate / API": mechanism, no witness. Lane B's name-producer road |
+| `spellingHasStructRow`, `elemNameIsNominalAt`, `structRowOfSpelling`, `rowCanonIdOfName` (`refArrShapeKindGo` left in #7618) | reason, witness | "a spelling predicate / API": mechanism, no witness. Lane B's name-producer road |
 | `structRowOfAnnTyGo`'s nullable branch | reason, witness | "callers read the miss as a decision": mechanism |
 | `structElemArrayLowerable`, `internFuncTypeShapesTyGo` parses | reason, witness | name and type disagree on nullability: mechanism (lane E) |
 | `unionNameOfExpr` identifier rung (twin rows) | reason | "both consumers are order-blind": mechanism, though both witnesses run |
 | `unionNameOfCall`'s literal-leaf return; its instance-hole and closure-array branches | reason; witness for the last two | "records no row": mechanism. The last two reach no program |
-| `rlKeyTyOf` gate's declines | reason | "waits for the instance", and keyed by function-value sets: part dependency, part mechanism |
 | `monoTagMapRepName`'s record pin text | reason | "until the interner can name that row by type": a mechanism with a dependency (below) |
 
 ### Resolved since the audit
@@ -73,7 +72,7 @@ and `_`. Filed and closed as D15959 (#7640).
 | `nameFieldCode` / `nameFieldCodeTy` literal-member-union arm | lane G's no-row class (w316, cuts 3–4) | #7250 |
 | `fieldRowKind`; `objOrderStashSlot` and the `pushFieldStorage` code ladder; `sFieldStoreKind`; `fieldCodeCellKind` | lane H's field-code cuts 4–5 (#7250) | #7250, D1510 |
 | `variantNestedRow` (E56), `armFieldStructRowMinted` (E16) | the shape walk handing those fields a type (lane E) | — |
-| `sFieldRefSlot`'s name mint; `rlRowOfNameMinted` | the template field's element type at the instance (lane F) | #7342, #7306 |
+| `sFieldRefSlot`'s name mint; `rlRowOfNameMinted` | in flight: lane F's #7621 keys both by the open type (`rlRowOfOpenTyMinted`) | #7342, #7306, #7621 |
 | `internShapeDeepOfTy`, `internArmShapeRow` renders | lane E's E3: class R first, G on w314 cut 5, U on w317's D15042 | #7513 |
 | `emitIfExprRef`'s record-join refusal (D15809, open) | the tag side (w308) | D15809 |
 | `emitUnionBoxOwed` at `letBindingUnionTy` | the instance's type read there (w321) | D15713, D15710, #7443 |
