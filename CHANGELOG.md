@@ -2,7 +2,8 @@
 
 Shipped work, in rough area order. Each entry is a terse one-liner; detail lives in git
 history, linked PRs, and `docs/`. For the forward plan see **`ROADMAP.md`**; for rationale
-see **`DECISIONS.md`**.
+see **`DECISIONS.md`**. A PR never edits this file: it adds a `changelog.d/` entry, folded in here by
+`scripts/changelog-fold.vl`.
 
 ---
 

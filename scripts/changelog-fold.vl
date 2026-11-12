@@ -1,0 +1,165 @@
+// Fold every `changelog.d/*.md` entry into CHANGELOG.md, then delete the folded files.
+//
+//     vl run scripts/changelog-fold.vl            fold, rewrite the pin, delete the entries
+//     vl run scripts/changelog-fold.vl -- --check parse the entries and check the pin; write nothing
+//
+// Run from the checkout root. An entry's first line is a CHANGELOG `## ` section heading, copied
+// exactly; the rest is its bullet text. Entries fold in file-name order at the head of their
+// section. `changelog.d/FOLDED` pins CHANGELOG.md's size and FNV-1a hash as the fold wrote it,
+// so a direct edit of CHANGELOG.md fails `tests/vl_changelog_d_test.ts`.
+
+import { IoError, listDir, readFile, readTextFile, writeTextFile } from "std:fs"
+import { runProgram } from "std:process"
+import { Utf8Error, programArgs } from "std:args"
+import { toString } from "std:fmt"
+import { endsWith, join, startsWith } from "std:str"
+import { die, splitLines, stripWs, univNl } from "./lib/common"
+import { sortStrings } from "./lib/corpus"
+
+const DIR = "changelog.d"
+const LOG = "CHANGELOG.md"
+const PIN = "changelog.d/FOLDED"
+
+// One parsed entry file: the section heading it names and its text, blank edges trimmed.
+type Entry = { path: string, heading: string, body: string[] }
+
+function readText(path: string): string {
+  const t = readTextFile(path)
+  if t is IoError {
+    die("changelog-fold: cannot read \{path} (\{t.msg})", 1)
+    return ""
+  }
+  univNl(t)
+}
+
+// The pin line for the file at `path`: its byte count and 32-bit FNV-1a hash.
+function pinOf(path: string): string {
+  const b = readFile(path)
+  if b is IoError {
+    die("changelog-fold: cannot read \{path} (\{b.msg})", 1)
+    return ""
+  }
+  let h: i64 = 2166136261
+  for x in b { h = ((h ^ (x as i64)) * 16777619) & 0xFFFFFFFF }
+  "bytes \{toString(b.length)} fnv1a32 \{toString(h)}"
+}
+
+// The entry files, in name order: every `*.md` under `changelog.d/` but its README.
+function entryPaths(): string[] {
+  const names = listDir(DIR)
+  if names is IoError {
+    die("changelog-fold: cannot list \{DIR} (\{names.msg})", 1)
+    return []
+  }
+  const out: string[] = []
+  for n in sortStrings(names) {
+    if endsWith(n, ".md") && n != "README.md" { out.push("\{DIR}/\{n}") }
+  }
+  out
+}
+
+// `path` parsed against the section headings `heads`; dies naming the file on a bad entry.
+function parseEntry(path: string, heads: string[]): Entry {
+  const lines = splitLines(readText(path))
+  let i = 0
+  while i < lines.length && stripWs(lines[i]) == "" { i = i + 1 }
+  if i >= lines.length || !startsWith(lines[i], "## ") {
+    die(
+      "changelog-fold: \{path}: the first line must be a CHANGELOG `## ` section heading",
+      1,
+    )
+  }
+  const heading = lines[i]
+  let known = false
+  for h in heads {
+    if h == heading { known = true }
+  }
+  if !known {
+    die(
+      "changelog-fold: \{path}: no CHANGELOG section is headed `\{heading}`",
+      1,
+    )
+  }
+  let lo = i + 1
+  let hi = lines.length
+  while lo < hi && stripWs(lines[lo]) == "" { lo = lo + 1 }
+  while hi > lo && stripWs(lines[hi - 1]) == "" { hi = hi - 1 }
+  if lo >= hi || !startsWith(lines[lo], "- ") {
+    die(
+      "changelog-fold: \{path}: the text under the heading must start with a `- ` bullet",
+      1,
+    )
+  }
+  { path, heading, body: lines.slice(lo, hi) }
+}
+
+function main() {
+  const args = programArgs()
+  if args is Utf8Error {
+    die("changelog-fold: unreadable arguments", 2)
+    return
+  }
+  let check = false
+  for a in args {
+    if a == "--check" {
+      check = true
+    } else {
+      die("usage: vl run scripts/changelog-fold.vl [-- --check]", 2)
+    }
+  }
+  const log = splitLines(readText(LOG))
+  const heads: string[] = []
+  for l in log {
+    if startsWith(l, "## ") { heads.push(l) }
+  }
+  const entries: Entry[] = []
+  for p in entryPaths() { entries.push(parseEntry(p, heads)) }
+  const want = stripWs(readText(PIN))
+  const got = pinOf(LOG)
+  if want != got {
+    die(
+      "changelog-fold: \{LOG} was edited outside the fold (pin `\{want}`, file `\{got}`); move the edit into a \{DIR}/ entry",
+      1,
+    )
+  }
+  if check {
+    print(
+      "changelog-fold: \{toString(entries.length)} entries parse; \{LOG} matches its pin",
+    )
+    return
+  }
+  // Insert each section's entries after its heading and the blank line under it.
+  const res: string[] = []
+  let k = 0
+  while k < log.length {
+    const l = log[k]
+    res.push(l)
+    if startsWith(l, "## ") {
+      if k + 1 < log.length && stripWs(log[k + 1]) == "" {
+        res.push(log[k + 1])
+        k = k + 1
+      }
+      for e in entries {
+        if e.heading == l {
+          for b in e.body { res.push(b) }
+        }
+      }
+    }
+    k = k + 1
+  }
+  const w = writeTextFile(LOG, join(res, "\n") + "\n")
+  if w is IoError { die("changelog-fold: cannot write \{LOG} (\{w.msg})", 1) }
+  const wp = writeTextFile(PIN, pinOf(LOG) + "\n")
+  if wp is IoError { die("changelog-fold: cannot write \{PIN} (\{wp.msg})", 1) }
+  for e in entries {
+    const r = runProgram("rm", ["--", e.path])
+    if r is IoError || r.code != 0 {
+      die("changelog-fold: cannot delete \{e.path}", 1)
+    }
+  }
+  print(
+    "changelog-fold: folded \{toString(entries.length)} entries into \{LOG}",
+  )
+}
+
+main()
