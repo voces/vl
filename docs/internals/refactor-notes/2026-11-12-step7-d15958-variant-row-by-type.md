@@ -54,3 +54,21 @@ before.
 - `rep-fuzz-check` exact. lint-self is clean, and `regress.vl` lost no runs.
 - Witnesses `--strict`: 4,860 as filed, D15958 and D36 both runs. The inventory row tests pass.
 - Late demands 8, seed +1.9%, render-parse 9 and 3, dead exports 0, and plumb-shape cost passes.
+
+## The `#anon` handle rungs: a contract (coordinator ruling, 2026-11-12)
+
+Three `structIndexByName` sites read an `#anonN` handle back to its row:
+
+- `retStructRowIndex`'s `#anon` rung (`emit_nullable_rets`);
+- `anonPinRow`, behind `anonHandleTyIx` (`emit_shape_rows`, mono's anonymous pins, D681);
+- `anonRowTyOfName`, behind `rlInternNameTy`'s untyped `RLK_STRUCT` mint (`emit_union_atoms`).
+
+**Contract:** an `#anonN` handle is not a type spelling. It is an object literal's row id, rendered
+as text because pins and ref-list names carry strings. Reading it back is a lookup by id, not a
+parse. A same-type shape row need not share the literal row's layout: #7414 measured 17 programs
+where the two differ (D15646, D2762, `hole-closure-reads-param-field-per-pin`,
+`record-is-narrowing-copy-runs`), so the type cannot stand in for the handle. This is the
+handle floor lane I's audit passed.
+
+**Exit:** when lane F's D6 carries row indices (`#rowN`) through pins and ref-list names, each
+rung becomes a direct index read and leaves `structIndexByName`.
