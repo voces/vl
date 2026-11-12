@@ -13,3 +13,19 @@ answers an unbound member-set spelling from the row the type keys to.
 ## The census behind it
 
 The outermost-caller census from #7388's note: 5 set-text hits in 2 programs here.
+
+## Proof
+
+- **Local full sweep**, `sweep.vl record` with fixpoint seeds on both sides, against master
+  `b5daa9f9` with #7388 merged in:
+
+  ```
+  same                            23969
+  bytes-only movers                   0
+  output movers                       0
+  runs -> not-runs  (blocking)        0
+  new compiler traps  (blocking)      0
+  ```
+- **Locally:** lint-self, rep-fuzz, `cases_wasm`, the memo-generation, state-audit and scaling
+  tests, emitter-state-audit, capability probes (`--live-sites`, `--floor`), splice-scan,
+  seed-size, late-demands, and the dead-export and render-parse budgets.
