@@ -33,7 +33,9 @@ spelling, so the site moves with that. The parse goes when the last caller holds
 
 ## Proof
 
-- **Local full sweep.** SWEEP_SUMMARY
+- **Local full sweep.** `--prove-fixpoint` seeds on both sides: 23,934 same, 0 bytes-only
+  movers, 0 output movers, 0 runs → not-runs, 0 new compiler traps.
 - **Render-parse.** Flat at 28 renders and 59 parses, with `--findings`. The parse stays until its
   callers outside this file hold a type.
-- **Checks.** Listed in the PR.
+- **Checks.** `rep-fuzz-check.sh` is exact. `cases_wasm` passes 7,445 with 0 failed. lint-self
+  is clean. The export budget, with findings, has 0 dead exports.
