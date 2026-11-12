@@ -9,6 +9,19 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-12-w311-reflist-cut2-closed-type-keys-nominal-mints](2026-11-12-w311-reflist-cut2-closed-type-keys-nominal-mints.md): Step 7 L6: a ref-list row a nominal spelling names is keyed by its closed element type, 2026-11-12
+- [2026-11-12-w311-reflist-cut1-list-of-row-by-type](2026-11-12-w311-reflist-cut1-list-of-row-by-type.md): Step 7 L6: a list of a record row is found by its element type, and `forceRefListOfTy` keys by type, 2026-11-12
+- [2026-11-12-step7-vkind-field-code-ladder-typed](2026-11-12-step7-vkind-field-code-ladder-typed.md): Step 7, lane H, cut 1: the field-code ladder reads no spelling without a type, 2026-11-12
+- [2026-11-12-step7-union-reg-retag-by-type](2026-11-12-step7-union-reg-retag-by-type.md): Step 7 L6 (lane G, cut 3b): a delivered box's retag is decided from the two union types, 2026-11-12
+- [2026-11-12-step7-union-reg-nli-floor](2026-11-12-step7-union-reg-nli-floor.md): Step 7 L6 (lane G, cut 2): `nliInferLet` is deleted behind a loud floor, 2026-11-12
+- [2026-11-12-step7-union-reg-cuk-gone](2026-11-12-step7-union-reg-cuk-gone.md): Step 7 L6 (lane G, cut 1): the spelling key and the softened-key probe are deleted, 2026-11-12
+- [2026-11-12-step7-struct-name-producers-cut-1](2026-11-12-step7-struct-name-producers-cut-1.md): Step 7, L6: the struct name producers, cut 1, 2026-11-12
+- [2026-11-12-step7-shape-walk-by-type](2026-11-12-step7-shape-walk-by-type.md): Step 7: the shape walk keys a type by its nominal name or render, 2026-11-12
+- [2026-11-12-step7-l2-mono-nul-ann-by-type](2026-11-12-step7-l2-mono-nul-ann-by-type.md): Step 7 L2: mono's nullable pin is recognised by its type; emit_mono has no parse left, 2026-11-12
+- [2026-11-12-step7-l2-mono-narrowed-pin-by-type](2026-11-12-step7-l2-mono-narrowed-pin-by-type.md): Step 7 L2: a narrowed argument's pin is tested against the wide pin's type, 2026-11-12
+- [2026-11-12-flow-reads-design](2026-11-12-flow-reads-design.md): Flow-sensitive reads of a `let`: design, 2026-11-12
+- [2026-11-12-d9492-num-litunion-fn-result-widens](2026-11-12-d9492-num-litunion-fn-result-widens.md): D9492: a numeric literal-union function result widens where a `return` delivers it, 2026-11-12
+- [2026-11-12-d15951-cell-read-null-delivery](2026-11-12-d15951-cell-read-null-delivery.md): D15951: a shared cell's read narrowed to `null` delivers that null, 2026-11-12
 - [2026-11-12-w320-union-member-by-rule](2026-11-12-w320-union-member-by-rule.md): A record copied into a union of records picks among members sharing its field names, 2026-11-12
 - [2026-11-12-w320-let-returned-list](2026-11-12-w320-let-returned-list.md): A `let` holding only list literals, returned by an inferred function, relays no existing list, 2026-11-12
 - [2026-11-12-w320-let-reassigned-list](2026-11-12-w320-let-reassigned-list.md): A `let` list binding reassigned list literals is built at the wider list it is delivered to, 2026-11-12
