@@ -47,13 +47,15 @@ The rep column compared against is `repOfTy(ty)`'s covered kind.
   other than the ref list. `scalarListRepOfName` (`emit_mv_slots.vl`) is deleted.
 - **The nullable scalar-list arm** asks `nulScalarListFieldCode(ty)`, the type's covered rep when
   it is a nullable list other than `nullist` and `nulreflist`. `nulScalarListKind` is deleted.
+- **Four `emit_base.vl` spelling predicates** lose their last caller and are deleted:
+  `nameIsF64Array`, `nameIsF32Array`, `nameIsI64Array` and `nameIsU8Array`.
 - **`internShapeAs`** reads each field's type from `aliasShapeObjTy(asTy)`, the alias union's first
   member. Every variant spells the one shape (`unionStructAliasShape`). The row's own type alias
   (`structTyIxAlias`) still records `asTy`.
 
 ## Measurement
 
-- **Seed:** 6,735,476 → 6,735,437 bytes, both fixpoints (6,735,665 merged with #7600).
+- **Seed:** 6,735,476 → 6,735,437 bytes, both fixpoints (6,735,606 merged with #7600, with the dead predicates gone).
 - **render-parse:** parses fall 38 → 34 on master after #7600 (40 → 36 on the base) (`nulScalarListKind`'s `nullablePartOf`, the ladder's
   `nameIsLitUnionType` and `nameIsArray`, and `nameFieldCode`'s `annArrowAt`). Renders stay at 12.
   The baseline is rewritten in this PR.
