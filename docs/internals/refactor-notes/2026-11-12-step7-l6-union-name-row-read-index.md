@@ -38,4 +38,6 @@ no byte moves, and the sweep confirms it.
 
 - **Local full sweep.** `--prove-fixpoint` seeds on both sides: 23,984 same, 0 bytes-only
   movers, 0 output movers, 0 runs → not-runs, 0 new compiler traps.
-- **Checks.** Listed in the PR.
+- **Checks.** On the tree with master merged in: `emitter-state-audit --check` is clean,
+  `rep-fuzz-check.sh` is exact, `cases_wasm` passes 7,481 with 0 failed, lint-self is clean, and
+  the export budget, with findings, has 0 dead exports. Render-parse is flat.
