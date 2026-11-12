@@ -248,15 +248,22 @@ import {
   regUnionRowOfTy,
 } from "./emit_anon_fields"
 import {
+  armRowIsNulAtom,
   armRowIsRecordRef,
+  armRowIsStr,
   armRowIsUnionBox,
   fieldKindWidens,
+  fieldRowIsNulAtom,
   fieldRowIsPlainI32,
   fieldRowIsRecordRef,
+  fieldRowIsStr,
   fieldRowIsUnionBox,
+  fieldRowNumKind,
+  fieldRowSlotTable,
   fieldScalarKindOf,
   olTagFieldTy,
   sFieldElemNameAt,
+  sFieldFlatRow,
   sFieldIsLitUnion,
   sFieldTgtStructIdx,
   sFieldTypeAt,
@@ -276,6 +283,7 @@ import {
   variantFieldIsRecordRef,
   variantFieldIsUnionBox,
   variantFieldNumKind,
+  variantFieldSlotTable,
   variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import {
@@ -4360,17 +4368,16 @@ function objLitTaggedFieldRow(objIx: i32): i32 {
   if nt < 0 { -1 } else { repRowOfTyStruct(nt, sScanLim()) }
 }
 
-// The leaf field's wasm type code of an optional chain (`x?.y`, `o?.inner?.y`) — the
-// `sFieldTypeAt` of the last link, or -1 when `exprIx` isn't a resolvable chain. The
-// chokepoint for "what rep does a `?.` deliver" (`exprNullableString`, `exprUnion`); the
-// consumer-side twin of what `emitOptMemberValue`'s `?? d` arm resolves by hand.
-function optChainLeafFieldCode(exprIx: i32, fnIx: i32) {
+// The flat field row of an optional chain's leaf (`x?.y`, `o?.inner?.y`), or -1 when `exprIx`
+// isn't a resolvable chain. The chokepoint for "what rep does a `?.` deliver"
+// (`exprNullableString`, `exprUnion`); the consumer-side twin of `emitOptMemberValue`'s `?? d` arm.
+function optChainLeafFieldRow(exprIx: i32, fnIx: i32): i32 {
   const e = nodeAt(unwrapParen(exprIx))
   if e is OptMember {
     const si = optChainStructIdxOf(e.omObj, fnIx)
     if si >= 0 {
       const fi = sFieldIndex(si, e.omProp)
-      if fi >= 0 { return sFieldTypeAt(si, fi) }
+      if fi >= 0 { return sFieldFlatRow(si, fi) }
     }
   }
   -1
@@ -4433,7 +4440,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
       const vfi = variantFieldIndex(nvi, m.memProp)
       if vfi >= 0 {
         if variantFieldIsUnionBox(nvi, vfi) {
-          return variantFieldElemName(nvi, vfi)
+          return memVariantFieldName(nvi, vfi)
         }
         // The narrowed arm stores the field unboxed, whatever a same-named field of a
         // sibling arm stores.
@@ -4487,7 +4494,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
               const mvfi = variantFieldIndex(mvi, m.memProp)
               if mvfi >= 0 {
                 if variantFieldIsUnionBox(mvi, mvfi) {
-                  return variantFieldElemName(mvi, mvfi)
+                  return memVariantFieldName(mvi, mvfi)
                 }
               }
             }
@@ -4513,7 +4520,7 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       const afi = variantFieldIndex(avi, m.memProp)
       if afi >= 0 {
         if variantFieldIsUnionBox(avi, afi) {
-          return variantFieldElemName(avi, afi)
+          return memVariantFieldName(avi, afi)
         }
       }
     }
@@ -4525,7 +4532,7 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       if nvi >= 0 && !armLayoutAmbiguousAt(nvi) {
         const nfi = variantFieldIndex(nvi, m.memProp)
         if nfi >= 0 && variantFieldIsUnionBox(nvi, nfi) {
-          return variantFieldElemName(nvi, nfi)
+          return memVariantFieldName(nvi, nfi)
         }
       }
     }
@@ -4585,13 +4592,39 @@ function tyIsUnionOrNullable(ty: i32): boolean {
 // ask this; the `is`-narrowing push sites ask `memberUnionFieldName` directly, since a pushed
 // value there is already a bare variant ref, not a box `emitNarrowedMem` could unwrap (D220).
 export function memberUnionFieldNameRead(memIx: i32, fnIx: i32) {
+  const outer = memFieldRowCur
+  memFieldRowCur = -1
+  const n = memberUnionFieldNameReadGo(memIx, fnIx)
+  memFieldRowOut = memFieldRowCur
+  memFieldRowCur = outer
+  n
+}
+
+function memberUnionFieldNameReadGo(memIx: i32, fnIx: i32) {
   const r = memberUnionFieldName(memIx, fnIx)
   if r != "" {
     const nn = memReadBoxNarrowName(memIx, fnIx)
-    if nn != "" { return nn }
+    if nn != "" {
+      memFieldRowCur = -1
+      return nn
+    }
     return r
   }
   armFieldUnionName(memIx, fnIx)
+}
+
+// The row a variant field's element union keys to, recorded by the member read that named it by
+// `memVariantFieldName`; -1 for a struct field, whose recorded name can be a box its arms share
+// (D4056), and for a narrowed read. Saved and restored per read, as `unNameRowLast` is.
+let memFieldRowCur = -1
+
+// The row behind the name the last completed `memberUnionFieldNameRead` returned, or -1.
+let memFieldRowOut = -1
+
+// Variant `vi`'s field `fi` element union name, with the row its element type keys to recorded.
+function memVariantFieldName(vi: i32, fi: i32): string {
+  memFieldRowCur = unRowOfTyKey(uFieldElemTyIxAt(vi, fi))
+  variantFieldElemName(vi, fi)
 }
 
 // ── the read/consumer channel predicate ──────────────────────────────────────
@@ -5516,18 +5549,6 @@ export function fnValuePlain(ix: i32, depth: i32): boolean {
   true
 }
 
-// The union a union-box list at slot `slot` holds when the list's own type is `listTy`. Slots
-// dedup by rep, so the slot's union may be a generic's spelling of the box (`S | T`); a list
-// whose own element type is closed reads under the row that type keys to (D10931).
-export function rlUnionNameOfTy(slot: i32, listTy: i32): string {
-  const et = tyArrayElemIx(listTy)
-  if et >= 0 && !tyHasTyVar(et) && tyHasTyVar(rlElemTyIxAt(slot)) {
-    const r = unRowOfTyKey(et)
-    if r >= 0 { return unNames[r] }
-  }
-  rlElemUnionName(slot)
-}
-
 // The value-union name of an index read `xs[0]` whose receiver is a ref list with a
 // union-box element (kind 2), or "" otherwise. The index twin of `memberUnionFieldNameRead`
 // — the one gate every index narrowing channel asks before minting a key, so the push side
@@ -6286,14 +6307,15 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     // receiver and the `is`-narrowed variant receiver (`memberFieldCode` resolves both), so
     // `const t0 = v.f` binds the niche and its `!= null` narrows against `-1`.
     Member => {
-      return fieldCodeIsNulLitAtom(memberFieldCode(unwrapParen(exprIx), fnIx))
+      return memberFieldIsNulAtom(unwrapParen(exprIx), fnIx)
     }
     // A `?.` whose leaf is a literal-union atom field, nullable or not, is the same niche:
     // `emitOptMemberValue` yields the field's atom or `-1` (D3457).
     OptMember => {
-      const olc = optChainLeafFieldCode(exprIx, fnIx)
-      if olc == FC_NUL_LIT_UNION { return true }
-      return olc == FC_I32 && nodeRepIsNulAtom(exprIx, fnIx)
+      const olr = optChainLeafFieldRow(exprIx, fnIx)
+      if olr < 0 { return false }
+      if fieldRowIsNulAtom(olr) { return true }
+      return fieldRowIsPlainI32(olr) && nodeRepIsNulAtom(exprIx, fnIx)
     }
     // No other expression reads a literal-union niche.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -9313,7 +9335,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       // A value-union leaf (code 16) is already the box, and the chain only adds `null` to
       // its member set, so the whole `?.` is a box value too (D803): without this arm the
       // chain classified as a scalar while `emitOptMemberValue` built the box.
-      return optChainLeafFieldCode(exprIx, fnIx) == FC_UNION
+      return fieldRowIsUnionBox(optChainLeafFieldRow(exprIx, fnIx))
     }
     // `x as Shape` over a wider union yields the BOX at a narrower type — the sub-union cast
     // does not unbox, so its result is a union value like any other. Answered from the cast's
@@ -10093,9 +10115,28 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   const outer = unNameRowLast
   unNameRowLast = -1
   const n = unionNameOfExprGo(exprIx, fnIx)
+  if n != "" && unNameRowLast < 0 {
+    unNameRowLast = unionKeyRowOfOperator(exprIx, fnIx)
+  }
   unNameRowOut = unNameRowLast
   unNameRowLast = outer
   n
+}
+
+// The row a union-typed operator expression's own type keys to, for an `as?`, a binary or unary
+// operator (`??` included) and a `?.` read: there the type's row is the row the name names. -1
+// for any other expression, whose type can key another row than its name.
+function unionKeyRowOfOperator(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const u = unwrapParen(exprIx)
+  if u < 0 || u >= P.nodes.length { return -1 }
+  const e = nodeAt(u)
+  if !(e is AsExpr || e is BinExpr || e is Unary || e is OptMember) {
+    return -1
+  }
+  const ty = nodeTyAt(u, fnIx)
+  if ty < 0 { return -1 }
+  unRowOfTyKey(ty)
 }
 
 // The row the rung answering the current `unionNameOfExpr` call read, -1 until one does. Each
@@ -10227,7 +10268,7 @@ function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
         // union minus `null` — rendered rather than assembled, as the `?.` arm above. D803.
         const olh = nodeAt(unwrapParen(e.binLeft))
         if olh is OptMember {
-          if optChainLeafFieldCode(e.binLeft, fnIx) == FC_UNION {
+          if fieldRowIsUnionBox(optChainLeafFieldRow(e.binLeft, fnIx)) {
             return nodeUnionName(unwrapParen(exprIx))
           }
         }
@@ -10261,7 +10302,7 @@ function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
     OptMember => {
       // A `?.` whose leaf is a value-union field (code 16): the checker's own type for the node
       // is exactly the union plus `null`, so it is rendered rather than assembled here. D803.
-      if optChainLeafFieldCode(exprIx, fnIx) == FC_UNION {
+      if fieldRowIsUnionBox(optChainLeafFieldRow(exprIx, fnIx)) {
         return nodeUnionName(unwrapParen(exprIx))
       }
       // A scalar leaf's `T | null` box, the row the collection walk registers for it (D3513),
@@ -10279,7 +10320,9 @@ function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
       // Must decline the same read `exprUnion`'s Member case does: a read the read site already
       // unboxes is a string ref, not a union box, whatever this field's declared type says. D311.
       if memReadUnboxAtomKind(mix, fnIx) >= 0 { return "" }
-      return memberUnionFieldNameRead(mix, fnIx)
+      const mfn = memberUnionFieldNameRead(mix, fnIx)
+      if mfn != "" { unNameRowLast = memFieldRowOut }
+      return mfn
     }
     Index => {
       // The name-typed half of `exprUnion`'s niche decline for a field or cell (D2590).
@@ -10941,11 +10984,8 @@ export function memReadNarrowOp(memIx: i32, fnIx: i32): i32 {
   if t is TyPrim { own = t.primName }
   if own != "i32" && own != "f32" { return -1 }
   if !memRecvIsRecord(memIx, fnIx) { return -1 }
-  const fc = memFieldTypeCode(memIx, fnIx)
-  let wk = -1
-  if fc == FC_I64 { wk = 3 }
-  if fc == FC_F64 { wk = 4 }
-  if fc == FC_F32 { wk = 5 }
+  const nk = memFieldNumKind(memIx, fnIx)
+  const wk = if nk == 3 || nk == 4 || nk == 5 { nk } else { -1 }
   atomNarrowOp(wk, valueAtomKind(own))
 }
 
@@ -11039,11 +11079,10 @@ export function memReadBoxPlan(memIx: i32, fnIx: i32, out: i32[]): i32 {
   0
 }
 
-// The wasm-type code of the struct/variant field a `Member` expression at `memIx` reads
-// (`0` i32, `3` string, `4` i32-list, `5` ref-list), or `-1` if not a known field read.
-// Mirrors `exprString`'s Member dispatch: a narrowed union identifier reads the variant
-// field's type; otherwise the receiver's struct field's type — drives array-field reads.
-function memFieldTypeCode(memIx: i32, fnIx: i32) {
+// The numeric kind (`fieldRowNumKind`) of the struct/variant field a `Member` expression at
+// `memIx` reads, or `-1` if it is no known numeric field read. Mirrors `exprString`'s Member
+// dispatch: a narrowed union identifier reads the variant field; otherwise the receiver's struct.
+function memFieldNumKind(memIx: i32, fnIx: i32): i32 {
   const e = nodeAt(memIx)
   if e is Member {
     // Only a narrowing that names a VARIANT re-homes the field onto the variant tables; one
@@ -11053,7 +11092,7 @@ function memFieldTypeCode(memIx: i32, fnIx: i32) {
     const vi = memNarrowVariantIndex(memIx, fnIx)
     if vi >= 0 {
       const vfi = variantFieldIndex(vi, e.memProp)
-      if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
+      if vfi >= 0 { return variantFieldNumKind(vi, vfi) }
       return -1
     }
     // A field read on a variant-typed param `o.field` reads the variant struct's field type
@@ -11061,18 +11100,18 @@ function memFieldTypeCode(memIx: i32, fnIx: i32) {
     const pvi = exprVariantIndex(e.memObj, fnIx)
     if pvi >= 0 {
       const pvfi = variantFieldIndex(pvi, e.memProp)
-      if pvfi >= 0 { return variantFieldTypeAt(pvi, pvfi) }
+      if pvfi >= 0 { return variantFieldNumKind(pvi, pvfi) }
     }
     // The fifth receiver shape — `memRecvNulVariantIndex`'s own header states what it costs.
     const nvi5 = memRecvNulVariantIndex(e.memObj, fnIx)
     if nvi5 >= 0 {
       const nvfi5 = variantFieldIndex(nvi5, e.memProp)
-      if nvfi5 >= 0 { return variantFieldTypeAt(nvi5, nvfi5) }
+      if nvfi5 >= 0 { return variantFieldNumKind(nvi5, nvfi5) }
     }
     const si = structIndexOfExpr(e.memObj, fnIx)
     if si >= 0 {
       const fi = sFieldIndex(si, e.memProp)
-      if fi >= 0 { return sFieldTypeAt(si, fi) }
+      if fi >= 0 { return fieldRowNumKind(sFieldFlatRow(si, fi)) }
     }
     // The fourth receiver shape: an un-narrowed struct union whose members all carry the
     // field at one code (`(A | B).tag`) — without it, a shared read classified as i32.
@@ -11086,8 +11125,17 @@ function memFieldTypeCode(memIx: i32, fnIx: i32) {
       uvis,
       ufis,
     )
-    if ucode >= 0 { return ucode }
+    if ucode >= 0 { return sharedPlanNumKind(ucode) }
   }
+  -1
+}
+
+// The numeric kind of a shared-field plan's code, `fieldRowNumKind`'s vocabulary, or -1.
+function sharedPlanNumKind(code: i32): i32 {
+  if code == FC_I32 { return 0 }
+  if code == FC_I64 { return 3 }
+  if code == FC_F64 { return 4 }
+  if code == FC_F32 { return 5 }
   -1
 }
 
@@ -12201,24 +12249,27 @@ function mapShapeOfMember(exprIx: i32, e: Member, fnIx: i32): i32 {
   if nvi >= 0 {
     const nvfi = variantFieldIndex(nvi, e.memProp)
     if nvfi >= 0 {
-      const nvc = variantFieldTypeAt(nvi, nvfi)
-      if nvc == FC_MAP || nvc == FC_NUL_MAP { return uFieldMapShape(nvi, nvfi) }
+      if variantFieldSlotTable(nvi, nvfi) == "map" {
+        return uFieldMapShape(nvi, nvfi)
+      }
     }
   }
   const pvi = exprVariantIndex(e.memObj, fnIx)
   if pvi >= 0 {
     const pvfi = variantFieldIndex(pvi, e.memProp)
     if pvfi >= 0 {
-      const pvc = variantFieldTypeAt(pvi, pvfi)
-      if pvc == FC_MAP || pvc == FC_NUL_MAP { return uFieldMapShape(pvi, pvfi) }
+      if variantFieldSlotTable(pvi, pvfi) == "map" {
+        return uFieldMapShape(pvi, pvfi)
+      }
     }
   }
   const msi = structIndexOfExpr(e.memObj, fnIx)
   if msi >= 0 {
     const mfi = sFieldIndex(msi, e.memProp)
     if mfi >= 0 {
-      const mfc = sFieldTypeAt(msi, mfi)
-      if mfc == FC_MAP || mfc == FC_NUL_MAP { return sFieldMapShape(msi, mfi) }
+      if fieldRowSlotTable(sFieldFlatRow(msi, mfi)) == "map" {
+        return sFieldMapShape(msi, mfi)
+      }
     }
   }
   mapShapeOfComposition(exprIx, fnIx)
@@ -12478,6 +12529,30 @@ function memberFieldIsUnionBox(memIx: i32, fnIx: i32): boolean {
   if p >= 0 { return fieldRowIsUnionBox(p) }
   if p <= -3 { return armRowIsUnionBox(-3 - p) }
   p == FPOS_SHARED && memberFieldCode(memIx, fnIx) == FC_UNION
+}
+
+// Whether the field a `Member` read resolves to holds a string (`nul` false) or `string | null`
+// (`nul` true); a shared read asks its plan's code.
+function memberFieldIsStr(memIx: i32, fnIx: i32, nul: boolean): boolean {
+  const p = memberFieldPos(memIx, fnIx)
+  if p >= 0 { return fieldRowIsStr(p, nul) }
+  if p <= -3 { return armRowIsStr(-3 - p, nul) }
+  const want = if nul { FC_NUL_STR } else { FC_STR }
+  p == FPOS_SHARED && memberFieldCode(memIx, fnIx) == want
+}
+
+// Whether the field a `Member` read resolves to holds the `K | null` niche; a shared read asks
+// its plan's code.
+function memberFieldIsNulAtom(memIx: i32, fnIx: i32): boolean {
+  const p = memberFieldPos(memIx, fnIx)
+  if p >= 0 { return fieldRowIsNulAtom(p) }
+  if p <= -3 { return armRowIsNulAtom(-3 - p) }
+  p == FPOS_SHARED && memberFieldCode(memIx, fnIx) == FC_NUL_LIT_UNION
+}
+
+// Whether a field stored at `k` holds a closure, nullable or not.
+function fieldKindIsClosure(k: VKind | null): boolean {
+  k == "closure" || k == "nulclosure"
 }
 
 // `memberFieldPos`'s answer for a read whose receiver shape names no one row: the members of an
@@ -12829,8 +12904,8 @@ export function exprString(exprIx: i32, fnIx: i32) {
       if muk != -3 { return muk == 2 }
       // A field read whose declared type is `string` (code 3), or a `string | null` niche
       // field (code 20) read as a value (it recovers the non-null string ref).
-      const mfc = memberFieldCode(exprIx, fnIx)
-      return mfc == FC_STR || mfc == FC_NUL_STR
+      return memberFieldIsStr(exprIx, fnIx, false)
+        || memberFieldIsStr(exprIx, fnIx, true)
     }
     // No other expression is a string value by its own form.
     NumLit | CharLit | BoolLit | NullLit | Unary | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -13015,8 +13090,9 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
       if mviC >= 0 {
         const mvfiC = variantFieldIndex(mviC, callMemProp(exprIx))
         if mvfiC >= 0 {
-          const vfcC = variantFieldTypeAt(mviC, mvfiC)
-          if vfcC == FC_CLOSURE || vfcC == FC_NUL_CLOSURE { return true }
+          if fieldKindIsClosure(eqRowFieldKind(-1 - mviC, mvfiC)) {
+            return true
+          }
         }
       }
       // A struct field holding a function value reads back as a closure.
@@ -13701,10 +13777,7 @@ function memberIsClosure(objIx: i32, prop: string, fnIx: i32) {
     const vi = variantRowOfShapeTy(nodeTyAt(ox, fnIx))
     if vi >= 0 {
       const vfi = variantFieldIndex(vi, prop)
-      if vfi >= 0 {
-        const vfc = variantFieldTypeAt(vi, vfi)
-        return vfc == FC_CLOSURE || vfc == FC_NUL_CLOSURE
-      }
+      if vfi >= 0 { return fieldKindIsClosure(eqRowFieldKind(-1 - vi, vfi)) }
     }
   }
   false
@@ -14002,6 +14075,8 @@ export function classifyStateReset() {
   asgReReadIx = -1
   unNameRowLast = -1
   unNameRowOut = -1
+  memFieldRowCur = -1
+  memFieldRowOut = -1
   storageReadLeave(-1)
   objLitSlotsReset()
   0
