@@ -266,7 +266,6 @@ import {
   tyPrimNameOf,
   tyRenderSoftensLits,
   tySame,
-  tyToEmitName,
   tyToNominalName,
   tyToStr,
   tyUnionAllLists,
@@ -991,7 +990,7 @@ function monoListUnionRowName(ty: i32): string {
 // A struct or struct-array annotation name usable as a monomorphization pin while the
 // locals and struct-classification tables are unbuilt: the bare struct `P`, or `P[]`.
 // "" for anything else. One level of `[]`; `n >= 3` excludes the degenerate `"[]"`.
-// `isArr` is `nameIsArray(name)`.
+// `isArr` is whether the annotation's type is a list.
 function monoStructAnnName(name: string, isArr: boolean) {
   if isSName(name) { return name }
   const n = name.length
@@ -1035,8 +1034,8 @@ function monoTyIsList(ty: i32): boolean {
 // all (`buildLocals` is post-mono), so the annotation is the only truth; both sit behind
 // `fnIx >= 0`. "" means no pin from the annotation, and the cascade answers instead.
 function monoAnnPinName(name: string, ty: i32) {
-  const isArr = nameIsArray(name)
-  // The element type a list spelling's element renders, where the caller holds the list's type.
+  // A list is one by its type, and its element type is the one its element spelling renders.
+  const isArr = monoTyIsList(ty)
   let elemTy = -1
   if ty >= 0 && ty < T.tys.length {
     const lt = tyAt(ty)
@@ -1079,7 +1078,7 @@ function monoAnnPinName(name: string, ty: i32) {
   // pushes no `sNames` entry (D53). After the variant arms and before the map arm, since
   // `nameIsShapeSpanEnds` is brace-span-not-second and a map spelling stays below.
   if nameIsShapeSpanEnds(name) { return name }
-  const rl = monoCompositeListAnnName(name, isArr)
+  const rl = monoCompositeListAnnName(name, isArr, elemTy)
   if rl != "" { return rl }
   // A literal-union alias array (`K[]`), the array sibling of the union-alias arm above and
   // subsumed by the union-alias list rung at the top of this ladder (D1082) — a litunion
@@ -1122,7 +1121,7 @@ function monoNulAnnName(name: string, ty: i32) {
 }
 
 // A canonical scalar-rep spelling (`i32` / `i64` / `f32` / `f64` / `boolean` / `string`),
-// a list over one (`isArr` is `nameIsArray(name)`), or `u8[]`, echoed back; else "". Exact
+// a list over one (`isArr`: its type is a list), or `u8[]`, echoed back; else "". Exact
 // spellings only: the pin becomes the instance's parameter annotation, so any other name
 // would rename the rep. A bare `u8` is storage and never a pin.
 function monoScalarAnnName(name: string, isArr: boolean) {
@@ -1144,15 +1143,15 @@ function monoScalarAnnName(name: string, isArr: boolean) {
   ""
 }
 
-// The annotation name of a local or parameter typed as a list (`isArr` is `nameIsArray(name)`)
+// The annotation name of a local or parameter typed as a list (`isArr`, element type `elemTy`)
 // over a composite element — a nested list, a paren group, an inline shape — or "". The
 // `expr*` cascade reads the expression, and mid-mono the locals table is unbuilt, so a
 // nested list would pin one dimension short of the checker's type.
-function monoCompositeListAnnName(name: string, isArr: boolean) {
+function monoCompositeListAnnName(name: string, isArr: boolean, elemTy: i32) {
   if !isArr { return "" }
   const elem = arrElemNameRaw(name)
   if elem == "" { return "" }
-  if nameIsArray(elem) { return name }
+  if monoTyIsList(elemTy) { return name }
   if nameIsParenSpanEnds(elem) { return name }
   if nameIsBraceSpanEnds(elem) { return name }
   ""
@@ -1452,7 +1451,7 @@ function monoElemlessNulListPinName(nt: i32, chosen: string): string {
   }
   const l = tyAt(t.nInner)
   if !(l is TyArray) || l.aElem >= 0 { return "" }
-  if monoAnnPinName("i32[]|null", -1) != "i32[]|null" { return "" }
+  if monoAnnPinName("i32[]|null", nt) != "i32[]|null" { return "" }
   "i32[]|null"
 }
 
@@ -3684,8 +3683,8 @@ function monoLamParamPinAnn(
 }
 
 // The annotation spelling of a pinned lambda type `t`: a list by `monoListSpelling`, which names
-// a nullable record element by its row; a literal union by its alias, which a render softens to
-// `string` (D3098); any other type as `tyToEmitName` renders it.
+// a nullable record element by its row; a literal union by its alias (D3098); any other type by
+// the naming rule (`monoPinSpellOf`).
 function monoPinAnnSpelling(t: i32): string {
   // A record bound apart from its row by a function field's type is still spelled by the row.
   const tw = monoFnFieldTwinRow.get(t) ?? ""
@@ -3694,7 +3693,7 @@ function monoPinAnnSpelling(t: i32): string {
     const ln = litUnionAliasNameOfTy(t)
     if ln != "" && monoAnnPinName(ln, t) == ln { return ln }
   }
-  const nm = tyToEmitName(t)
+  const nm = monoPinSpellOf(t)
   if nm != "" && t >= 0 && t < T.tys.length && tyAt(t) is TyArray {
     return monoListSpelling(nm, t)
   }
@@ -7983,10 +7982,10 @@ function monoPinUnionNameOfTy(st: i32): string {
   monoPinUnionName(monoPinSpellShaped(st))
 }
 
-// D1042 — the emitter-vocabulary spelling of a name `monoSubstAnn` produced, for the shapes
+// D1042 — the emitter-vocabulary spelling of a substituted annotation name, for the shapes
 // where the two can disagree: a union, and a list of a grouped element (`(T | string)[]`).
-// `monoSubstAnn` substitutes into the declared annotation text, so a literal member stays
-// literal and a collapsed group keeps its parens, while a direct annotation is canon'd.
+// A substitution into the declared text keeps a literal member literal and a collapsed group's
+// parens, while a direct annotation is canon'd.
 function monoPinUnionName(rs: string): string {
   const atoms: string[] = []
   unionSetAtomsOf(rs, atoms)
@@ -13895,24 +13894,35 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyArray && !tyHasTyVar(rt) {
     return 0
   }
-  // A literal of maps whose functions nothing calls takes the elaboration's closed slot fact, its
-  // open elements typed at the fact's element.
+  // A literal of maps takes the elaboration's closed slot fact, its open elements and the reads of
+  // its maps' values typed at it, where nothing calls those values or each element names a map
+  // already pinned at the fact's element.
   const ce = tyArrayElemIx(nodeTyIxOf(d.letInit))
   if (
     repoints.length == 0
     && ce >= 0
     && ce < T.tys.length
     && tyAt(ce) is TyMap
-    && elabSlotUncalled(at, ["e", "v"])
   ) {
     const lt = elabSlotTyAt(at, [], ctx)
     const et = tyArrayElemIx(lt)
     let spread = false
+    let pinned = lit.arrElems.length > 0
     for e in lit.arrElems {
       if nodeAt(e) is Spread { spread = true }
+      const bd = if nodeAt(e) is Ident { monoReadLetFrame(e, ctx)[1] } else { -1 }
+      const b = if bd >= 0 { nodeAt(bd) } else { null }
+      if (
+        !(b is LetDecl)
+        || b.letType < 0
+        || !tySame(elabSlotTyAt(bd, [], ctx), et)
+      ) {
+        pinned = false
+      }
     }
     if (
-      !spread
+      (pinned || elabSlotUncalled(at, ["e", "v"]))
+      && !spread
       && et >= 0
       && et < T.tys.length
       && tyAt(et) is TyMap
@@ -13923,6 +13933,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
       for e in lit.arrElems {
         if monoTyOpen(nodeTyIxOf(e)) { nodeTyRecord(e, et) }
       }
+      if pinned { monoRetypeMapReads(ctx, at, et, tyMapValOf(et), "[]") }
       return 0
     }
   }
@@ -15495,6 +15506,35 @@ function monoPinMapSlot(mx: i32, at: i32, ctx: i32, fld: string): i32 {
   const nt = mkMapTy(mt.mKey, nv, 0)
   nodeTyRecord(mx, nt)
   monoRetypeMapReads(ctx, at, nt, nv, fld)
+  // A `const` alias of the map, or of such an alias, holds it at the same type, and its reads are
+  // the map's.
+  if fld == "" {
+    const nodes = monoFrameNodes(ctx)
+    const held: i32[] = [at]
+    let hi = 0
+    while hi < held.length {
+      const hd = nodeAt(held[hi])
+      if hd is LetDecl {
+        for ix in nodes {
+          const a = nodeAt(ix)
+          if (
+            a is LetDecl
+            && a.letKw == "const"
+            && a.letType < 0
+            && a.letInit >= 0
+            && !i32ListHas(held, ix)
+            && monoReadsBinding(a.letInit, hd.letName, ctx, held[hi])
+          ) {
+            a.letType = synthTypeRefOfTy(nt, -1)
+            nodeTyRecord(a.letInit, nt)
+            monoRetypeMapReads(ctx, ix, nt, nv, "")
+            held.push(ix)
+          }
+        }
+      }
+      hi = hi + 1
+    }
+  }
   nt
 }
 
@@ -16125,7 +16165,8 @@ function monoCalleeFnTyThrough(cf: i32, reads: i32[], ft: i32): i32 {
   -1
 }
 
-// Whether `v` reads the binding `name` declared at `at`, or, when `fld` is not "", its field `fld`.
+// Whether `v` reads the binding `name` declared at `at`, or, when `fld` is not "", its field `fld`
+// (`[]`: one of its elements).
 function monoReadsSlotOf(
   v: i32,
   name: string,
@@ -16135,6 +16176,11 @@ function monoReadsSlotOf(
 ): boolean {
   if fld == "" { return monoReadsBinding(v, name, ctx, at) }
   const o = unwrapParen(v)
+  // The step `[]` reads an element of the list binding.
+  if fld == "[]" {
+    const ix = if o >= 0 && o < P.nodes.length { nodeAt(o) } else { null }
+    return ix is Index && monoReadsBinding(ix.idxArr, name, ctx, at)
+  }
   if o < 0 || o >= P.nodes.length { return false }
   const m = nodeAt(o)
   if !(m is Member) { return false }
