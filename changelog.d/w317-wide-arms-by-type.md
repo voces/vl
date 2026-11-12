@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **Step 7 L2, mono: a narrowed pin's niche and nullable-record rungs read the wide pin's arms from its type.** `monoNicheNarrowsFrom` asks whether the narrowed niche's arms are a proper subset of the wide pin's (`unionTyArms` on both types), and the nullable-record rung counts the wide pin's arms (`monoTyArmCount`) and asks whether its spelling holds a brace from the type (`monoTyMentionsBrace`). `monoArmsNarrowFrom` and `monoArmCount`, which split the wide pin's spelling through `unionArmsOf`, are deleted. Over 24,070 programs the typed answers agreed at all 15,241 decisions with a type; where the wide pin had none (135), the spelling had answered "no" every time.
