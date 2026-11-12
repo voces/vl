@@ -26,14 +26,16 @@ So each arm walks with no type, and its spelling decides the row.
 
 ## Changed
 
-`internShapeArms` gains a third pairing, `unionArmTysByRender` (`compiler/emit_shape_intern.vl`),
-which it tries only after both row pairings decline. It reads the set's own `TyUnion` members:
+`internShapeArms` gains a third pairing, `unionArmTysByPos` (`compiler/emit_shape_intern.vl`),
+which it tries only after both row pairings decline. It reads the set's own `TyUnion` members by
+position, the order `tyNameUnion` renders its atoms in. It declines in two cases:
 
-- Each arm takes the one member whose `tyToEmitName` is that arm.
-- One arm left over takes the one member whose render is `""`. That is a member holding a type
-  parameter, such as `{f: T}` in D15042.
-- Any other outcome declines, as before: a count that differs, two members with one render, or
-  more than one arm left over.
+- the counts differ;
+- an arm's member does not have the arm's shape, which is a record under the same number of list
+  layers for a record arm, and anything else for a non-record arm.
+
+It takes no render (the render-parse ratchet stays at its baseline), so a member holding a type
+parameter, such as D15042's `{f: T}`, pairs like any other.
 
 ## Graded
 
@@ -41,6 +43,7 @@ which it tries only after both row pairings decline. It reads the set's own `TyU
 - Each program's output is byte-identical to master's: it walks under its type and builds the
   row it built before.
 - Seed: fixpoint. `lint-self`: clean. `regress.vl`: no runs lost, 0 cells → silent.
+- Render-parse budget: ok, at baseline.
 
 ## What it leaves
 
