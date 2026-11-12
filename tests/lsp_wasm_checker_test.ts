@@ -309,31 +309,32 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
     (await checker.check(src, "/tmp/x.vl", noSiblings))
       .filter((d) => d.severity === "error")
       .map((d) => d.message);
-  const g = "function ap(f: (i64) => i64): i64 { f(1) }\nfunction af(f: (i64) => f32): f32 { f(1) }\n" +
+  const g = "function ap(f: (i64) => f32): f32 { f(1) }\nfunction ai(f: (i64) => i64): i64 { f(1) }\n" +
     "function a32(f: (i64) => i32): i32 { f(1) }\n";
-  const mis = "argument 1: expected (i64) => i64, got (i64) => i32";
+  // The destination returns `f32`, which an `i32` result does not widen to (D15896).
+  const mis = "argument 1: expected (i64) => f32, got (i64) => i32";
   const hits: [string, string][] = [
     [
       g + "function never(x: i64) { -1 }\nprint(ap(never))\n",
       mis + " — `never` returns the literal `-1` on line 4, so its return defaulted to `i32`; " +
-      "annotate it: `function never(x: i64): i64 { … }`",
+      "annotate it: `function never(x: i64): f32 { … }`",
     ],
     [
       g + "const k = (x: i64) => -1\nprint(ap(k))\n",
       mis + " — `k` returns the literal `-1` on line 4, so its return defaulted to `i32`; " +
-      "annotate it: `const k = (x: i64): i64 => -1`",
+      "annotate it: `const k = (x: i64): f32 => -1`",
     ],
     // A tree of literals is its constant, so it is named by its value.
     [
       g + "function m(x: i64) { 2 * 3 }\nprint(ap(m))\n",
       mis + " — `m` returns the literal `6` on line 4, so its return defaulted to `i32`; " +
-      "annotate it: `function m(x: i64): i64 { … }`",
+      "annotate it: `function m(x: i64): f32 { … }`",
     ],
     // A call whose result still fits the annotated return keeps the note.
     [
-      g + "function c(x: i64) { 5 }\nprint(ap(c))\nprint(c(2))\nc(3)\nconst y: i64 = c(4)\nprint(y)\n",
+      g + "function c(x: i64) { 5 }\nprint(ap(c))\nprint(c(2))\nc(3)\nconst y: f64 = c(4)\nprint(y)\n",
       mis + " — `c` returns the literal `5` on line 4, so its return defaulted to `i32`; " +
-      "annotate it: `function c(x: i64): i64 { … }`",
+      "annotate it: `function c(x: i64): f32 { … }`",
     ],
   ];
   for (const [src, want] of hits) {
@@ -348,11 +349,11 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
     [g + "function b(x: i64) { -1 }\nprint(ap(b))\nconst y: i32 = b(1)\nprint(y)\n", [mis]],
     // Two destinations want two annotations.
     [
-      g + "function d(x: i64) { 2 }\nprint(ap(d))\nprint(af(d))\n",
-      [mis, "argument 1: expected (i64) => f32, got (i64) => i32"],
+      g + "function d(x: i64) { 2 }\nprint(ap(d))\nprint(ai(d))\n",
+      [mis],
     ],
     // An `f32` holds integers only up to 2^24 exactly.
-    [g + "function e(x: i64) { 16777217 }\nprint(af(e))\n", ["argument 1: expected (i64) => f32, got (i64) => i32"]],
+    [g + "function e(x: i64) { 16777217 }\nprint(ap(e))\n", [mis]],
     // A lambda binding that is reassigned, or aliased.
     [g + "function z(x: i64): i32 { 0 }\nlet k = (x: i64) => -1\nprint(ap(k))\nk = z\n", [mis]],
     [g + "function h(x: i64) { 7 }\nconst al = h\nprint(ap(h))\nprint(a32(al))\n", [mis]],
