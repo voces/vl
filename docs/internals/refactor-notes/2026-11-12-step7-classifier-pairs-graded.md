@@ -67,14 +67,14 @@ mine).
 ## Proof
 
 - **Census after this PR** (on its base it read 9 ARENA+NAME and 5 SPELLING; the two `emit_elab`
-  pairs and `annIsSpelledInlineShape` are gone). Merged with master at #7615, it reads:
+  pairs and `annIsSpelledInlineShape` are gone). Merged with master at #7614, it reads:
 
   | set | classifiers | call sites |
   | --- | --- | --- |
   | ARENA+NAME | 7 | |
   | ARENA+SPELLING | 0 | |
-  | NAME | 33 | 64 |
-  | SPELLING | 4 | 7 |
+  | NAME | 32 | 62 |
+  | SPELLING | 4 | 6 |
 
   #7615 removed lane B's two pairs, and #7609 removed `nulScalarListKind`.
 - **Sweep:** both sides on fixpoint seeds (base `2c252adf2`), 24,178 programs: 24,178 same, 0
