@@ -32,7 +32,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 
 | contract | where §3.3/§3.4 states it | sites | cites |
 | --- | --- | --- | --- |
-| an `#anonN` handle is the literal row's identity | §3.3 registries | `anonRowTyOfName`, `anonPinRow`, `retStructRowIndex`'s `#anon` rung; `monoAnonRowListTy` pending lane D's caller sentence | #7414, #7546; D15646, D2762 |
+| an `#anonN` handle is the literal row's identity | §3.3 registries | `anonRowTyOfName`, `anonPinRow`, `retStructRowIndex`'s `#anon` rung | #7414, #7546; D15646, D2762 |
 | the spelling index resolves a source name to its row | §3.3 registries | `unNameAdoptTyKeyRow`, `annShapeIndexOf` (untyped shapes) | `2026-11-12-step7-union-reg-riu-value-union.md`, `2026-11-12-step7-shape-layout-id.md` |
 | a type parameter's name is an identifier; shadowing is a scoping question | §3.3 registries | `monoElabCompositeTy` | lane D, 2026-11-12 |
 | `tySame` plus the function sets | §3.3 registries | `sRowElemRepSame`, `fnSetsAgree` | `2026-11-12-step7-struct-name-producers-cut-2.md` |
@@ -48,10 +48,10 @@ The close is opened when this list is empty, or holds only items with an open PR
 | B | `structRowOfSpelling` chain, one site (`emit_nullable_rets.vl:615`) |
 | E (E5, after H's #7668) | `structElemArrayLowerable`, `internFuncTypeShapesTyGo` |
 | E3 | `internShapeDeepOfTy`, `internArmShapeRow` renders |
-| F | `sFieldRefSlot`'s `ty < 0` name fallback (probe with a firing control) |
-| H | `variantNestedRow`, `armFieldStructRowMinted`; `printUnionPlanCode`'s name fallbacks |
+| F | `sFieldRefSlot`'s `ty < 0` name fallback (#7683, open) |
+| H | `armFieldStructRowMinted`; `printUnionPlanCode`'s name fallbacks (`variantNestedRow` closed, #7679) |
 | G | `unionNameOfCall`; `unionNameOfExpr`'s callers (with A's two `emitUnionUnionEq` calls) |
-| D | `monoArgTyNameProjected`, `monoPinAnnotatedParam`; `monoAnonRowListTy`'s list-depth parse |
+| D | `monoArgTyNameProjected`, `monoPinAnnotatedParam`; `monoAnonRowListTy`'s list-depth parse (a spelling read, ruled) |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
 

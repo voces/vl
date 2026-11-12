@@ -274,7 +274,7 @@ type's spelling (`scripts/registry-census.vl`). `cloSigPosBy` is keyed by the `$
 from rep tokens, so it is a type key. Three keys look like spellings and are not:
 
 - **An `#anonN` handle** is a record literal's row identity, minted with the row. It is the row's
-  own key, not a spelling of a type (`anonRowTyOfName`, `anonPinRow`, `monoAnonRowListTy`).
+  own key, not a spelling of a type (`anonRowTyOfName`, `anonPinRow`).
 - **The spelling index** (`unNameAdoptTyKeyRow`, `annShapeIndexOf`) resolves a source name to the
   row its type found. It answers an identifier, never a type question.
 - **A type parameter's name** is an identifier. Whether a declared record shadows it is a scoping
