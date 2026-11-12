@@ -8938,7 +8938,7 @@ of two write-narrowed values whose narrowed types cannot be compared. This is th
 application of D2198 and of the dead-null-test split below, not an owner ruling. An always-true
 test runs, with or without an `else`: it names no missing member, and master runs the same test
 under a guard narrowing. Its `else` is typed from storage, since such a test is lowered over the
-box and its facts are computed from storage (D15952). **The price:** 11 programs of the
+box and its facts are computed from storage (D15955). **The price:** 11 programs of the
 24,177-program sweep that ran on master are refused. They are 9 `is` tests, 1 `match` and
 D7701's `==`, each a fixture or witness that declared a union `let` with one member and then
 tested it. Each is rewritten so the value arrives through a call, a parameter or a conditional

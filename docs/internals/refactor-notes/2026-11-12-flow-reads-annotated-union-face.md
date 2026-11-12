@@ -28,7 +28,7 @@ print(x.length)
   - The test is lowered at storage: the operand is recorded unnarrowed (`isOperandAtStorage`).
   - Its then and else facts are computed from storage (`isTestCurTy`).
   - A guard over it is a real guard row (`applyNarrows`).
-  - So a structural fit is tested on the box's contents (D15952).
+  - So a structural fit is tested on the box's contents (D15955).
 - **`writeReNarrowTy`** picks, among several members a value is assignable to, the one it is the
   same variant as (`{ v: 2 }` into `Box<i32> | Box<f64>`).
 
@@ -83,4 +83,4 @@ graded cells run. 0 runs → not-runs, 0 silent, 0 program traps.
 - 3 emit traps (scratch-frame reservation);
 - 4 traps and 4 lost refusals around writing calls and captures (D2390, D2402, D2462,
   call-ends-narrowing-*);
-- a silent wrong output (D15952, now pinned).
+- a silent wrong output (D15955, now pinned).

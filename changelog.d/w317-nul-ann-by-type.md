@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Step 7 L2, mono: a nullable pin is recognised by its type, not by splitting its spelling.** `monoNulAnnName` asks whether the pin's type is a nullable whose inner, spelled by the naming rule, the annotation ladder claims; it no longer calls `nullablePartOf`. The two callers that handed the ladder a nullable name with no type now pass one: `monoNarrowedNulRecPinName` (the argument's type) and the nullable record-field rung of `monoArgTyNameProjected` (the field's element type, made nullable). `emit_mono.vl` has no type-string parse left; render-parse 13 / 32 → 13 / 31 (on master after #7607).

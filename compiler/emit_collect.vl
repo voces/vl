@@ -85,7 +85,7 @@ import {
   inferJoinTyAt,
 } from "./check_inline_lit_union"
 import { isTransparentAlias } from "./check_alias_transparent"
-import { letNullHoleFilledTy } from "./check_null_holes"
+import { letNullHoleFilledTy, letNullHoleUnfilled } from "./check_null_holes"
 import {
   fnRecordedRetCols,
   fnRecordedRetTy,
@@ -235,12 +235,7 @@ import {
   sidOf,
   sidOfNode,
 } from "./symbols"
-import {
-  exprIsIfStmt,
-  ifArmValueExpr,
-  nliScanStmts,
-  tyHasFnDeep,
-} from "./emit_query"
+import { exprIsIfStmt, ifArmValueExpr, tyHasFnDeep } from "./emit_query"
 import {
   FC_CLOSURE,
   FC_I32,
@@ -840,6 +835,7 @@ import {
   rlInternName,
   rlInternNameTy,
   rlInternOfTy,
+  rlKeyTyOf,
   rlRowNameOfTy,
   uVariantsPush,
   unNameBindRow,
@@ -859,7 +855,6 @@ import {
 import {
   isUNameAB,
   isUNameKeyAB,
-  softKeyProbeNoTy,
   tyIsBareMap,
   tyIsNulMap,
   unABOn,
@@ -5297,10 +5292,12 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       }
     }
     // D1511 — the same hole at the shape element kind: `xs.push({y: 1, x: 2})` onto `[]` pins
-    // the element to a struct no `<shape>[]` spelling interns. The key is unhinted, since a
-    // nominal spelling takes none; the element type still classifies it.
+    // the element to a struct no `<shape>[]` spelling interns. The element type keys and
+    // classifies it.
     const shapeElem = arrLitShapeElemName(i, -1)
-    if shapeElem != "" { ensureRefElemTys(shapeElem, -1, rlHintElemTy(i)) }
+    if shapeElem != "" {
+      ensureRefElemTys(shapeElem, rlKeyTyOf(rlHintElemTy(i)), rlHintElemTy(i))
+    }
     // The same hole at a nullable ref element: a push of a `T | null` value, or of a bare
     // `null` a later write filled, spells the `(T | null)[]` row nowhere (D2506).
     const nulElem = arrLitNulRefElemName(i, -1)
@@ -5321,10 +5318,12 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       // A list the checker built at another type interns that type's rows, inner first.
       const bt = arrLitBuildTy(i)
       const btn = if bt != nodeTyIxOf(i) { rlRowNameOfTy(tyStepElem(bt), true) } else { "" }
+      const mh9 = arrLitMintHintTy(i)
+      const ck9 = arrLitClosedElemTy(i, tyStepElem(bt))
       ensureRefElemTys(
-        if btn != "" { btn } else { arrLitStoredElemName(i, arrLitMintHintTy(i)) },
-        arrLitMintHintTy(i),
-        arrLitClosedElemTy(i, tyStepElem(bt)),
+        if btn != "" { btn } else { arrLitStoredElemName(i, mh9) },
+        if mh9 >= 0 { mh9 } else { rlKeyTyOf(ck9) },
+        ck9,
       )
     } else {
       // A record list its rep stamp builds elsewhere has that row alone. Any other record list
@@ -5423,12 +5422,14 @@ function collectARefArrayAnn(i: i32, _nd: TypeRef): i32 {
   // `annRefArrSlot` without re-deriving it from the rendering.
   let ranNul = 0
   if ranIsNul { ranNul = 1 }
-  // The ref-list slot is interned from the annotation's own recorded element row where that
-  // row is what the name denotes, and from the name alone where it is not
-  // (`elemNameIsNominal`). -1 is the unhinted call, so every declined class is unchanged by
-  // construction and the hinted firings agree with the name path.
+  // The ref-list slot is keyed by the annotation's own recorded element row where that row is
+  // what the name denotes, else by the element type where it is closed (`rlKeyTyOf`).
   let renTy = -1
-  if !elemNameIsNominal(ren) { renTy = annRefArrElemRow(i) }
+  if !elemNameIsNominal(ren) {
+    renTy = annRefArrElemRow(i)
+  } else {
+    renTy = rlKeyTyOf(raTy)
+  }
   // A generic template's `T[]` interns no row: each instance's own annotation interns its own.
   const anTy = nodeTyIxOf(i)
   if anTy >= 0 && tyHasTyVar(anTy) {
@@ -7661,7 +7662,6 @@ function registerInlineUnionGo(
   if sty >= 0 && unRowOfTyKey(sty) >= 0 && unNameAdoptTyKeyRow(name, sty) {
     return 0
   }
-  if ty < 0 && sty >= 0 { softKeyProbeNoTy(site, name, sty, stmts) }
   if isUNameKeyAB(site, name, ty) && unNameAdoptTyKeyRow(name, ty) { return 0 }
   // A value union (`i32 | null`, `i32 | f64`) registers the name alone: its members are scalar
   // atoms riding shared value boxes, so it owns no variant structs and its slice is empty.
@@ -7957,31 +7957,27 @@ function registerRefArrayArmUnions(
 // fills the hole's `T`, making `x` the value union `T | null`, inferred once at collection
 // time and registered per `LetDecl` so every later classifier sees the union.
 
-// Infer + register the null hole of the un-annotated `let x = null` at `walk[i]`, scanning the
-// rest of `walk` for the filling assignment. A hole the checker filled holds its type instead,
-// so this runs only where there is no type to hand over (A/B site 66, no-ty).
-function nliInferLet(walk: i32[], i: i32) {
+// The checker gives every un-annotated `let x = null` a type: the one a later write fills its
+// hole with, else `null` when no write does. A hole it did neither for has no type to lower,
+// so it is refused here rather than registered under a spelling.
+function nliHoleHasType(walk: i32[], i: i32): i32 {
   const s = nodeAt(walk[i])
   if s is LetDecl {
-    if s.letType < 0 && s.letInit >= 0 && letNullHoleFilledTy(walk[i]) < 0 {
-      const ini = nodeAt(s.letInit)
-      if ini is NullLit {
-        const atom = nliScanStmts(walk, i + 1, s.letName)
-        if atom != "" {
-          const nn = atom + "|null"
-          registerValueUnionNameAB(66, nn, -1)
-          nliLetIxs.push(walk[i])
-          nliNames.push(nn)
-        }
+    if s.letType < 0 && s.letInit >= 0 && nodeAt(s.letInit) is NullLit {
+      if letNullHoleFilledTy(walk[i]) < 0 && !letNullHoleUnfilled(walk[i]) {
+        return emitFail(
+          "emitProgram: `let "
+            + s.letName
+            + " = null` reached emit with no type: the checker neither filled its hole nor closed it as `null`",
+        )
       }
     }
   }
   0
 }
 
-// Infers + registers the value union of an un-annotated `const x = <if-expression>`, the
-// if-expression counterpart of `nliInferLet`, in the same `nli` tables so `nliNameOf` drives
-// classification and emit reuses the annotated-binding lowering. The union name comes from
+// Infers + registers the value union of an un-annotated `const x = <if-expression>` in the
+// `nli` tables, so `nliNameOf` drives classification and emit reuses the annotated-binding lowering. The union name comes from
 // the checker's `inferLetNameOf`, falling back to `ifExprNliName` when that carries none.
 function nliInferIfLet(walk: i32[], i: i32) {
   const s = nodeAt(walk[i])
@@ -8600,8 +8596,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
         }
       }
       cloSigWalkRoots.push(nodeTyIxOf(letTy))
-      // Usage-driven `let x = null` hole (A-infer-null): infer + register `T|null`.
-      nliInferLet(walk, i)
+      if nliHoleHasType(walk, i) < 0 { return -1 }
       // An un-annotated `const x = if … { … } else { … }` whose arms join to a value
       // union: register the inferred name so the slot classifies + lowers like an
       // annotated nullable/value-union binding.

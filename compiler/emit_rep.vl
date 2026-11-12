@@ -925,10 +925,18 @@ function repUnionMemberMode(m: i32, mode: RepKeyMode): RepKeyMode {
   mode
 }
 
+// Whether a union of `mems` is its one member, which then keys as itself: a declared alias's
+// wrapper (`type AB = {a: i32} & {b: i32}`). A lone literal keeps its one-member set, the atom.
+function repUnionIsOneType(mems: i32[]): boolean {
+  if mems.length != 1 || mems[0] < 0 || mems[0] >= T.tys.length { return false }
+  !(tyAt(mems[0]) is TyLit)
+}
+
 // The union arm: without the mix-widening a declared and an inline spelling of one union
 // keyed differently and mismatched at the call boundary. A pure litunion keeps its atom-i32
 // render, guarded by `structFieldCodesEq`.
 function repKeyUnion(mems: i32[], mode: RepKeyMode): string {
+  if repUnionIsOneType(mems) { return repKeyOf(mems[0], mode) }
   const mixed = repUnionIsMixed(mems)
   const parts: string[] = []
   let s = "("
@@ -1981,7 +1989,10 @@ function hcRowFieldMode(ft: i32, mode: RepKeyMode): RepKeyMode {
 // holding `null` keys as the nullable of the rest, as the nullable arm does.
 function hcUnionId(given: i32[], mode: RepKeyMode): i32 {
   const mems: i32[] = []
-  if !hcUnionFlatInto(given, mems) { return hcUnionSetId(mems, mode) }
+  if !hcUnionFlatInto(given, mems) {
+    if repUnionIsOneType(mems) { return repIdOf(mems[0], mode) }
+    return hcUnionSetId(mems, mode)
+  }
   const c = if mems.length == 1 { repIdOf(mems[0], mode) } else { hcUnionSetId(mems, mode) }
   const n: i32[] = []
   n.push(c)
@@ -2843,22 +2854,10 @@ export function repNameCanonId(nm: string): i32 {
   repCanonId(di)
 }
 
-// The struct-table row whose sNames key is `nm`, or -1 — a local scan (the
-// `structIndexByName` twin; that resolver lives in emit_classify, ABOVE this
-// module, so the layout guard here reads the flat `emit_state` arrays directly).
-function repStructRowByName(nm: string): i32 {
-  let i = 0
-  while i < sNames.length {
-    if sNames[i] == nm { return i }
-    i = i + 1
-  }
-  -1
-}
-
-// The struct-table row whose D0 `sTyIx` sidecar entry is the ARENA type `ty`, or -1 —
-// `repStructRowByName`'s structural twin, first match wins. A real row wins over a reference
-// row of the same type, which answers only when alone. A row the sidecar does not cover holds
-// -1 there and never matches, so the caller falls through to its name path.
+// The struct-table row whose D0 `sTyIx` sidecar entry is the ARENA type `ty`, or -1, first
+// match wins. A real row wins over a reference row of the same type, which answers only when
+// alone. A row the sidecar does not cover holds -1 there and never matches, so the caller
+// falls through to the row of its shape.
 function repStructRowByTy(ty: i32): i32 {
   if ty < 0 { return -1 }
   let ref = -1
@@ -3032,16 +3031,13 @@ export function structFieldCodesEq(a: i32, b: i32): i32 {
       return 0
     }
     if fieldRowRefsElemHeap(fa) {
-      // A named-heap field stores a `(ref [null] <elem heap>)` — the code alone does not
-      // pin the layout, so the referenced rows must share one heap type too. Same key and
-      // same top-level codes is not enough: an `#anon` row's adopted type can disagree with
-      // its self-classified fields, merging a mismatched field ref into invalid wasm. Byte-equal elem names share a row trivially; distinct names must resolve and be twins, or decline.
-      const ea = sFieldElemName[sFieldStart[a] + i]
-      const eb = sFieldElemName[sFieldStart[b] + i]
-      // Two slots storing one element type share its heap whatever each spells it.
+      // A named-heap field stores a `(ref [null] <elem heap>)`, so the referenced rows must
+      // share one heap type too: an `#anon` row's adopted type can disagree with its fields.
+      // One element type shares its heap however it is spelled; distinct element types must
+      // resolve to twin rows, or decline.
       if !sFieldElemSame(sFieldStart[a] + i, sFieldStart[b] + i) {
-        // The referenced rows come off the arena (the recorded element type through the
-        // `sTyIx` scan), the recorded name only for a row the sidecars do not cover.
+        // The referenced rows come off the arena: the recorded element type through the
+        // `sTyIx` scan, else the row its shape is stored at.
         const ta = sFieldElemTyIxAt(a, i)
         const tb = sFieldElemTyIxAt(b, i)
         const da = repListDepth(ta)
@@ -3054,10 +3050,8 @@ export function structFieldCodesEq(a: i32, b: i32): i32 {
           rb = repLeafRow(repListLeafTy(tb))
         } else {
           ra = repStructRowByTy(ta)
-          if ra < 0 { ra = repStructRowByName(ea) }
           if ra < 0 { ra = repElemRowByShape(ta) }
           rb = repStructRowByTy(tb)
-          if rb < 0 { rb = repStructRowByName(eb) }
           if rb < 0 { rb = repElemRowByShape(tb) }
         }
         if sfceElemRowsTwin(ra, rb) == 0 { return 0 }
