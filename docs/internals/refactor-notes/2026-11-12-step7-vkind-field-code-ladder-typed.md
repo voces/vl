@@ -67,6 +67,6 @@ The arms that still read `t` are reached only with a type: `t == "i32"` and the 
 names, `nameIsInlineLitUnion`, `nameIsOneStrLit`, `nameIsString`, `isValueUnionName`,
 `isUNameDeclAB`, `nameIsStructDecl`, `armFieldStructRow` and `armFieldDeferredRowOk`. Cut 2
 compares each against a typed predicate. `funcTypeShapeLowerable` and `internShapeAs` call
-`nameFieldCode` directly, not `nameFieldCodeTy`. In 836 programs the descriptor codes a
-`funcTypeShapeLowerable` field 15 where the ladder answers -1 (the nested-shape recursion), so
-routing those callers through the descriptor moves behaviour, and is a separate cut.
+`nameFieldCode` directly, not `nameFieldCodeTy`. In 32 programs the descriptor codes a
+`funcTypeShapeLowerable` field differently from the ladder, and in 5 of them the shape's answer
+changes. So routing that caller through the descriptor moves behaviour; it is cut 2.
