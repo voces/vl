@@ -1879,11 +1879,30 @@ function recWidthCopyGapErr(at: i32, own: i32, dst: i32) {
   0
 }
 
+// The record `dst` a union of records `own` lands on when every member is a record of `dst`'s
+// field names landing there, else -1.
+function recUnionLandsAt(own: i32, dst: i32): i32 {
+  if own < 0 || dst < 0 || own >= T.tys.length || dst >= T.tys.length {
+    return -1
+  }
+  const u = tyAt(own)
+  if !(u is TyUnion) || !(tyAt(dst) is TyObj) { return -1 }
+  for m in u.uMembers {
+    if m < 0 || m >= T.tys.length || !(tyAt(m) is TyObj) { return -1 }
+    if recAdLanding(m, dst) != dst || !objFieldNameSetsEq(m, dst) { return -1 }
+  }
+  dst
+}
+
 // A function with no declared result called only at `call`, whose every returned value is an
 // object literal: each is built at the record the call delivers it to, `dstTy`'s member it
 // lands on (D3444). True when it recorded that build.
 function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
-  const own = nonNulTyOf(srcTy)
+  let own = nonNulTyOf(srcTy)
+  // A union of records each landing on the one record called once is built there member by
+  // member: every literal it returns is that record's.
+  const ru = recUnionLandsAt(own, nonNulTyOf(dstTy))
+  if ru >= 0 { own = ru }
   if own < 0 || !(tyAt(own) is TyObj) { return false }
   const dst = recAdLanding(own, nonNulTyOf(dstTy))
   if dst < 0 || !(tyAt(dst) is TyObj) || !objFieldNameSetsEq(own, dst) {
@@ -5257,6 +5276,111 @@ export function recAdoptUnionList(
 
 // Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
 // element of a literal list binding, to a record that stores a field differently.
+// Whether the record `dst` stores each field of the record `src` as `src` does, or a scalar field
+// as that scalar or `null`: the fields a record copy boxes.
+export function recCopyBoxesOnly(src: i32, dst: i32): boolean {
+  const so = tyAt(src)
+  const d = tyAt(dst)
+  if (
+    !(so is TyObj)
+    || !(d is TyObj)
+    || so.objFieldNames.length != d.objFieldNames.length
+  ) {
+    return false
+  }
+  let i = 0
+  while i < d.objFieldNames.length {
+    const sf = tyFieldTyOf(src, d.objFieldNames[i])
+    const df = d.objFieldTypes[i]
+    const dn = if df >= 0 && df < T.tys.length { tyAt(df) } else { null }
+    const sp = if sf >= 0 && sf < T.tys.length { tyAt(sf) } else { null }
+    const boxes = dn is TyNullable && sp is TyPrim && tySame(dn.nInner, sf)
+    if sf < 0 || !(boxes || fieldStorageEq(sf, df, REC_STORE_DEPTH)) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether every tail of the value join `j` is a call.
+function recJoinOfCalls(j: i32): boolean {
+  const leaves: i32[] = []
+  tailValueLeaves(j, leaves)
+  if leaves.length == 0 { return false }
+  for lf in leaves {
+    const c = cwPeelValue(lf)
+    if c < 0 || !(nodeAt(c) is Call) { return false }
+  }
+  true
+}
+
+// A binding read `p` holding `o`, a call or a join of calls, each of a function called more than
+// once: each call is copied to `dstTy`'s record where the binding is built, and the binding
+// keeps its type and is built there, as one holding a literal is. False, recording nothing,
+// where some call is not so or the copy does not serve.
+function recHeldFreshCopy(p: i32, o: i32, srcTy: i32, dstTy: i32): boolean {
+  const d = recHeldDecl(p)
+  const own = nonNulTyOf(srcTy)
+  const dst = nonNulTyOf(dstTy)
+  if (
+    d < 0
+    || own < 0
+    || dst < 0
+    || !(tyAt(own) is TyObj)
+    || !(tyAt(dst) is TyObj)
+  ) {
+    return false
+  }
+  if fieldStorageEq(own, dst, REC_STORE_DEPTH) { return false }
+  const leaves: i32[] = []
+  if recIsJoin(o) { tailValueLeaves(o, leaves) } else { leaves.push(o) }
+  if leaves.length == 0 { return false }
+  cwIxBuild()
+  for lf in leaves {
+    const c = cwPeelValue(lf)
+    if c < 0 || !(nodeAt(c) is Call) { return false }
+    const fd = recInferredFnOf(c)
+    if fd < 0 { return false }
+    const sites: i32[] = []
+    if rcwCallSites(fd, sites) < 0 && sites.length <= 1 { return false }
+    if !recCopyBoxesOnly(nonNulTyOf(nodeTyIxOf(c)), dst) { return false }
+  }
+  for lf in leaves {
+    const c = cwPeelValue(lf)
+    while recCopyTyIx.length <= c { recCopyTyIx.push(-1) }
+    recCopyTyIx[c] = dst
+  }
+  recBuildPush(d, own, dst, false)
+  true
+}
+
+// How many bindings `recAdoptNote` is delivering through: a call a binding holds is not the
+// delivered value itself.
+let recAdHeldDepth = 0
+
+// A call's value is fresh, so a destination storing a field differently gets a copy of it,
+// recorded on the call, and its function `fd`, called more than once, keeps its own record.
+// False, recording nothing, where the copy does not serve.
+function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
+  if recAdHeldDepth > 0 { return false }
+  // A function called once is built where that call lands (D3444).
+  cwIxBuild()
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) < 0 && sites.length <= 1 { return false }
+  const own = nonNulTyOf(srcTy)
+  const dst = nonNulTyOf(dstTy)
+  if own < 0 || dst < 0 || !(tyAt(own) is TyObj) || !(tyAt(dst) is TyObj) {
+    return false
+  }
+  if fieldStorageEq(own, dst, REC_STORE_DEPTH) || !recCopyBoxesOnly(own, dst) {
+    return false
+  }
+  while recCopyTyIx.length <= p { recCopyTyIx.push(-1) }
+  recCopyTyIx[p] = dst
+  true
+}
+
 export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if srcTy < 0 || dstTy < 0 || srcTy == dstTy { return 0 }
   if !tyHoldsObjDeep(srcTy) || !tyHoldsObjDeep(dstTy) { return 0 }
@@ -5287,7 +5411,28 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       }
       // One holding a call or an element read is delivered as that origin is (D8140).
       const oc = recHeldCallOrigin(p)
-      if oc >= 0 { return recAdoptNote(oc, nodeTyIxOf(oc), dstTy) }
+      if oc >= 0 && recHeldFreshCopy(p, oc, srcTy, dstTy) { return 0 }
+      if oc >= 0 {
+        recAdHeldDepth = recAdHeldDepth + 1
+        recAdoptNote(oc, nodeTyIxOf(oc), dstTy)
+        recAdHeldDepth = recAdHeldDepth - 1
+        return 0
+      }
+      // One holding a join of calls only delivers its tails as it would those calls.
+      const oj = recBindOrigin(p)
+      if (
+        oj >= 0
+        && oj != p
+        && recIsJoin(oj)
+        && recHeldFreshCopy(p, oj, srcTy, dstTy)
+      ) {
+        return 0
+      }
+      if oj >= 0 && oj != p && recIsJoin(oj) && recJoinOfCalls(oj) {
+        recAdHeldDepth = recAdHeldDepth + 1
+        recAdoptNote(oj, nodeTyIxOf(oj), dstTy)
+        recAdHeldDepth = recAdHeldDepth - 1
+      }
       // One aliasing a literal binding keeps its type, and the literal is built at the record.
       const od = recFreshOriginDecl(p, 6)
       if (
@@ -5386,7 +5531,12 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       ) {
         return 0
       }
+      if recFreshCallCopy(fd, p, srcTy, dstTy) { return 0 }
       if recFnBuiltAtDst(fd, p, srcTy, dstTy) {
+        // A union of records built at the one record keeps its result typed as the union and
+        // builds it as that record.
+        const ru = recUnionLandsAt(nonNulTyOf(srcTy), nonNulTyOf(dstTy))
+        if ru >= 0 { return recKeptFnPush(fd, nonNulTyOf(srcTy), ru, p) }
         return recAdPushDecl(fd, srcTy, nonNulTyOf(dstTy), false, p)
       }
       // A union destination keeps master's delivery, which boxes the record it builds.
@@ -5591,6 +5741,7 @@ export function recAdForce(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     for lf in recFnValueLeaves(fd) {
       if !recLitFits(cwPeel(lf), dl, REC_STORE_DEPTH) { return false }
     }
+    if recFreshCallCopy(fd, p, srcTy, dstTy) { return true }
     return recFnBuiltAtDst(fd, p, srcTy, dstTy)
   }
   if (
@@ -7935,14 +8086,8 @@ function numScalarTyOf(t: i32): i32 {
   t
 }
 
-// Records operand `ix`'s numeric pair at its operator's operand type `dt`, where `dt` is a wide
-// number and the operand's own type is a number. An operand is delivered at no position and has no
-// ctx record, so its one-kind pair is stored too.
-export function numOperandStamp(ix: i32, dt: i32): i32 {
-  numOperandStampAs(ix, numOperandTy(ix), dt)
-}
-
-// `numOperandStamp` for operand `ix` of scalar type `st`.
+// Records operand `ix`'s numeric pair, from its scalar type `st` to its operator's operand type
+// `dt`, where `dt` is a wide number. An operand has no ctx record, so its one-kind pair is stored.
 function numOperandStampAs(ix: i32, st: i32, dt: i32): i32 {
   const dk = numKindOfTy(dt)
   if dk < 3 || dk > 5 { return 0 }

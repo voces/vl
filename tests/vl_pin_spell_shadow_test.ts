@@ -29,7 +29,8 @@ const ENABLED = exists(VL) && exists(COMPILER);
 
 const CASES: { name: string; src: string; want: string[] }[] = [
   {
-    // A declared record, a union in declaration order against sorted, and a list of a union.
+    // A declared record, a union written out of the rule's order, and a list of a union: the
+    // cascade's atom pin is the rule's own spelling, so all three agree.
     name: "record, union order",
     src: `type Circle = { r: i32 }
 function id<T>(x: T): T { return x }
@@ -41,10 +42,8 @@ const xs: (i32 | string)[] = [1, "a"]
 print(id(xs).length)
 `,
     want: [
-      "param/agree ->  x2",
-      "param/union order or parens -> string|i32 ~ i32|string x1",
-      "typaram/agree ->  x2",
-      "typaram/union order or parens -> string|i32 ~ i32|string x1",
+      "param/agree ->  x3",
+      "typaram/agree ->  x3",
     ],
   },
   {
