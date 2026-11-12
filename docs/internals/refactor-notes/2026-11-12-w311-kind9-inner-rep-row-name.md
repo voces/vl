@@ -22,7 +22,7 @@ A list rung that recursed, naming the inner list `#anon0[]`, also served the two
 list-of-records cells. But their outer key still spells `{fs:i32[]}[]`, so each module grew by 2
 types, one row under two keys. That rung is left out.
 
-Fixpoint seeds on both sides, over the whole sweep population, base master `7c983694`-era: same
+Fixpoint seeds on both sides, over the whole sweep population, base master `bebbc99d`: same
 23,961, bytes-only 11, output movers 0, runs → not-runs 0, new compiler traps 0. All 11 movers
 keep their size, their type count and their lines, and only the type indices reorder: D15220,
 seven `d15220_cell_*` named cells and three `fn-tagged-*` cases.
