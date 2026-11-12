@@ -15516,6 +15516,41 @@ function monoPinMapSlot(mx: i32, at: i32, ctx: i32, fld: string): i32 {
       grew = false
       for ix in nodes {
         const a = nodeAt(ix)
+        // An un-annotated function every return of which reads a held binding returns the map,
+        // and its calls' reads are the map's.
+        if (
+          a is FuncDecl
+          && a.fnRet < 0
+          && a.fnName != ""
+          && !i32ListHas(held, ix)
+        ) {
+          let rets = 0
+          let rok = true
+          for rx in monoFrameNodes(ix) {
+            const r = nodeAt(rx)
+            if r is RetStmt {
+              rets = rets + 1
+              // A bare `return` returns no map.
+              let hit = false
+              for h in held {
+                const hn = nodeAt(h)
+                if (
+                  hn is LetDecl
+                  && r.retArg >= 0
+                  && monoReadsBinding(r.retArg, hn.letName, ix, h)
+                ) {
+                  hit = true
+                }
+              }
+              if !hit { rok = false }
+            }
+          }
+          if rets > 0 && rok {
+            monoRetypeMapReads(ctx, ix, nt, nv, "()")
+            held.push(ix)
+            grew = true
+          }
+        }
         if (
           a is LetDecl
           && a.letType < 0
@@ -15559,14 +15594,24 @@ function monoPinMapSlot(mx: i32, at: i32, ctx: i32, fld: string): i32 {
             src = if vn is Ident { monoReadLetFrame(sv, ctx)[1] } else if si > 0 && (vn is ArrayLit || vn is ObjLit) { sv } else { -1 }
             si = si - 1
           }
-          // A bare read names a held binding as its frame resolves it.
+          // A bare read names a held binding as its frame resolves it, or calls a held function.
           let ok = src >= 0 && i32ListHas(held, src)
           for h in held {
             const hn = nodeAt(h)
             if (
               steps.length == 0
               && hn is LetDecl
+              && x >= 0
               && monoReadsBinding(x, hn.letName, ctx, h)
+            ) {
+              ok = true
+            }
+            // A call of a held function returns the map.
+            if (
+              steps.length == 0
+              && hn is FuncDecl
+              && x >= 0
+              && monoReadsSlotOf(x, hn.fnName, "()", ctx, h)
             ) {
               ok = true
             }
@@ -15578,7 +15623,11 @@ function monoPinMapSlot(mx: i32, at: i32, ctx: i32, fld: string): i32 {
               let wok = false
               for h in held {
                 const hn = nodeAt(h)
-                if hn is LetDecl && monoReadsBinding(rx, hn.letName, ctx, h) {
+                if (
+                  hn is LetDecl
+                  && rx >= 0
+                  && monoReadsBinding(rx, hn.letName, ctx, h)
+                ) {
                   wok = true
                 }
               }
@@ -15941,7 +15990,9 @@ function monoUncalledSlotFnTy(at: i32, path: string[], vals: i32[][]): i32 {
 // guessed another function (`monoFnReadTyStale`).
 function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
   const d = nodeAt(at)
-  if !(d is LetDecl) { return 0 }
+  // A function holder's reads are of its calls (`()`).
+  const dn = if d is LetDecl { d.letName } else if d is FuncDecl { d.fnName } else { "" }
+  if dn == "" { return 0 }
   const isMap = nt >= 0 && nt < T.tys.length && tyAt(nt) is TyMap
   let rt = ft
   if isMap { rt = mkNullableTy(ft) }
@@ -15954,22 +16005,22 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
     // A parenthesised `??` is typed at both nodes.
     const n = nodeAt(unwrapParen(ix))
     const ty = nodeTyIxOf(ix)
-    if monoIsMapValueRead(ix, d.letName, fld, ctx, at) { reads.push(ix) }
+    if monoIsMapValueRead(ix, dn, fld, ctx, at) { reads.push(ix) }
     if n is LetDecl && n.letKw == "const" && n.letType < 0 && n.letInit >= 0 {
-      if monoIsMapValueRead(unwrapParen(n.letInit), d.letName, fld, ctx, at) {
+      if monoIsMapValueRead(unwrapParen(n.letInit), dn, fld, ctx, at) {
         aliases.push(ix)
       }
     }
-    if n is ForIn && monoReadsSlotOf(n.fiIter, d.letName, fld, ctx, at) {
+    if n is ForIn && monoReadsSlotOf(n.fiIter, dn, fld, ctx, at) {
       loops.push(ix)
     }
     const stale = monoFnReadTyStale(ty, ft, ctx)
-    if stale && monoIsMapValueRead(ix, d.letName, fld, ctx, at) {
+    if stale && monoIsMapValueRead(ix, dn, fld, ctx, at) {
       nodeTyRecord(ix, rt)
       monoRetypeRecMemberReads(ctx, nodes, ix, ft, 0)
     } else if stale && n is BinExpr && n.binOp == "??" {
       const rty = nodeTyIxOf(n.binRight)
-      if monoIsMapValueRead(unwrapParen(n.binLeft), d.letName, fld, ctx, at) {
+      if monoIsMapValueRead(unwrapParen(n.binLeft), dn, fld, ctx, at) {
         if monoTyOpen(rty) || sigKeyOfTy(rty) == sigKeyOfTy(ft) {
           nodeTyRecord(ix, ft)
           // An open list literal fallback is built at the value it stands in for.
@@ -15978,7 +16029,7 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
         }
         reads.push(unwrapParen(ix))
       }
-    } else if monoTyOpen(ty) && monoReadsSlotOf(ix, d.letName, fld, ctx, at) {
+    } else if monoTyOpen(ty) && monoReadsSlotOf(ix, dn, fld, ctx, at) {
       nodeTyRecord(ix, nt)
     }
   }
@@ -16237,6 +16288,13 @@ function monoReadsSlotOf(
 ): boolean {
   if fld == "" { return monoReadsBinding(v, name, ctx, at) }
   const o = unwrapParen(v)
+  // The step `()` reads a call of the function declared at `at`.
+  if fld == "()" {
+    const c = if o >= 0 && o < P.nodes.length { nodeAt(o) } else { null }
+    const cf = if c is Call { c.callFn } else { -1 }
+    const fn = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
+    return fn is Ident && fn.identName == name && identDeclOf(cf) == at
+  }
   // The step `[]` reads an element of the list binding.
   if fld == "[]" {
     const ix = if o >= 0 && o < P.nodes.length { nodeAt(o) } else { null }
