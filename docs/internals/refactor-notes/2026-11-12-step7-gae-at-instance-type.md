@@ -44,6 +44,8 @@ Over the sweep's 24,072 programs:
 - The registry's per-field tables (`gaeFieldStart`, `gaeFieldCount`, `gaeFieldNames`,
   `gaeFieldTyNames`, `gaeFieldTyNodes`).
 
+This removes the floor named in `2026-11-12-step7-l2-gae-field-ty-floor.md`.
+
 `gaeParamFieldNodes` stays, filled by `gaeNoteParamField`. `monoTyParamOf` survives, through
 `monoNodeNamesTyParam` and `monoParamBareTyParam`.
 
