@@ -10053,6 +10053,13 @@ which is a copy; the check refuses it and names the fix. A literal adapts each e
 since that is a delivery per element. The `| null` case could be adapted behind a null test, but a
 lambda parameter of nullable function type has no representation in the function-value ABI yet.
 
+**A result widened exactly as a number is admitted (2026-11-12, D15896).** `(i32) => i32` is a
+`(i32) => f64`, and `() => i32` a `() => i64`: the adapter's body returns the call, and `i32` to
+`f64` there is the delivery a `return` already makes. This lifts D9011's refusal, whose premise
+was that nothing converts a function's result. The container rule is unchanged: a held list or
+record of such functions is refused (D15895), and a literal adapts per element. A parameter
+widened the same way stays refused; only the result direction was ruled.
+
 **A generic function named as a value is always adapted**, whatever type the checker gave the
 name, so its instance is built by the adapter's direct call (D3112, D3113). One held with no
 concrete function type at all is D3381, which asks for a ruling.

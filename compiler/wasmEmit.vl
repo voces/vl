@@ -1,3 +1,4 @@
+import { unMemPeelAliasWrapper } from "./emit_union_tykey_text"
 import { monoPinSpellNoAnon } from "./pin_spell"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { unionArmRowOfTy } from "./emit_local_slots"
@@ -1414,14 +1415,14 @@ import {
   coalesceResultIsBox,
   ifJoinUnionNameIn,
   letBindingUnionTy,
-  letUnionDeclTyIxOf,
+  letUnionTyIxOf,
   nicheReadStashSlot,
   nodeJoinRowName,
   nodeMixedUnionName,
   nulLitMemberTexts,
   readAtomKindOfTy,
   unionDeclTyIxOfExpr,
-  unionDeclTyIxOfIdentAt,
+  unionTyIxOfIdentAt,
 } from "./emit_start_block"
 import {
   declaredKind,
@@ -8773,9 +8774,7 @@ function emitCoalesceMapJoin(
 // Whether `unionName`, typed `unionTy` (-1 when unknown), is a box-represented union (a non-null
 // value atom beside another member) that has no registry row, so no arm of it can be tagged.
 function unionBoxHasNoRow(unionName: string, unionTy: i32): boolean {
-  if unionName == "" || unionRowKeyAB(84, unionName, unionTy) >= 0 {
-    return false
-  }
+  if unionName == "" || unionRowKeyAB(84, unionTy) >= 0 { return false }
   const atoms: string[] = []
   unionSetAtomsOf(unionName, atoms)
   if atoms.length < 2 { return false }
@@ -9509,7 +9508,7 @@ function emitUnionCoerceRecord(
     // below picks the first field-name-set match across all unions, which can land on another
     // union's arm sharing the names — two nested-struct arms differing only in the nested
     // layout collide onto the first arm's tag. A single-union program resolves either way.
-    const ctxVi = unionArmVariantForObj(unionName, uTy, bareIx, fnIx)
+    const ctxVi = unionArmVariantForObj(uTy, bareIx, fnIx)
     if ctxVi >= 0 { return emitUnionBoxAs(body, bareIx, ctxVi, fnIx) }
     // When the literal matches a union variant, box it as that variant directly rather than
     // routing through `emitExpr` — whose `structIndexOfObj` re-inference mis-resolves a
@@ -9543,7 +9542,7 @@ function emitUnionCoerceRecord(
       }
     }
     // A record built at another row lands on the member the checker names, copied there.
-    const lvVi = unionArmLandingForStructExpr(unionName, uTy, exprIx, fnIx)
+    const lvVi = unionArmLandingForStructExpr(uTy, exprIx, fnIx)
     if lvVi >= 0 {
       const lvSsi = structIndexOfExpr(exprIx, fnIx)
       return emitStructExprAsVariantBox(body, exprIx, lvVi, lvSsi, fnIx)
@@ -14109,6 +14108,14 @@ function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
     if rlElemName.length < 1 {
       return emitFail(
         "emitProgram: ref array literal with no interned element type",
+      )
+    }
+    // Slot 0 is some other list's row; a list of maps whose value type is still open keys none.
+    const e0 = if elems.length >= 1 { nodeTyIxOf(unwrapParen(elems[0])) } else { -1 }
+    if e0 >= 0 && e0 < T.tys.length && tyAt(nonNullTy(e0)) is TyMap {
+      return emitFailAt(
+        "emitProgram: a list literal of maps whose value type is still open names no list row",
+        arrIx,
       )
     }
     rslot = 0
@@ -27881,7 +27888,7 @@ function emitAssignGlobal(body: u8[], a: BinExpr, lhsIx: i32, fnIx: i32) {
     if (
       gUNm != ""
       && !tyIsLitUnion(nodeTyIxOf(lhsIx))
-      && !unionRowIsLitUnion(88, gUNm, letUnionDeclTyIxOf(gLet))
+      && !bindingTyIsNoBox(letUnionTyIxOf(gLet, -1))
       && !gaCellIsArm
     ) {
       if (
@@ -27938,13 +27945,17 @@ function emitAssignGlobal(body: u8[], a: BinExpr, lhsIx: i32, fnIx: i32) {
   )
 }
 
-// Whether the registered union `nm`, declared `ty` (-1 for none), is a homogeneous literal
-// union, which reps as its atom or base scalar rather than a box, asked of its row's arena
-// type; false when no row, or no type, carries it.
-function unionRowIsLitUnion(site: i32, nm: string, ty: i32): boolean {
-  const u = unionRowKeyAB(site, nm, ty)
-  if u < 0 || u >= unTyIx.length { return false }
-  homogLitUnionBase(unTyIx[u]) >= 0
+// Whether a binding of type `ty` is stored as no union box: a homogeneous literal union, held as
+// its atom or base scalar, or a type that is no union at all (a literal union whose binding
+// carries its base, `i32`). False with no type, and for `null`: a null hole a later write fills
+// holds the box.
+function bindingTyIsNoBox(ty: i32): boolean {
+  const p = unMemPeelAliasWrapper(ty)
+  if p < 0 || p >= T.tys.length { return false }
+  if homogLitUnionBase(p) >= 0 { return true }
+  const t = tyAt(p)
+  if t is TyPrim { return t.primName != "null" }
+  !(t is TyUnion || t is TyNullable)
 }
 
 // `emitAssignIdent`'s plain arm: the RHS of `x = v` into a local or parameter cell, seeded with
@@ -27988,11 +27999,7 @@ function emitAssignIdent(
     if emitVariantCoerce(body, aArmVi, a.binRight, fnIx) < 0 { return -1 }
   } else if (
     aUNm != ""
-    && !unionRowIsLitUnion(
-      89,
-      aUNm,
-      unionDeclTyIxOfIdentAt(sidOfNode(lhsIx), fnIx, lhsIx),
-    )
+    && !bindingTyIsNoBox(unionTyIxOfIdentAt(sidOfNode(lhsIx), fnIx, lhsIx))
     && !aAtomCell
   ) {
     // A union-box local boxes a variant value as an argument does; a variant-init local keeps

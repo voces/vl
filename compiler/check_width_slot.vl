@@ -724,8 +724,13 @@ function slotCallClause(c: Call, x: i32, dst: i32) {
 
 // The literal that builds a fresh `dst` from the value at `at`: `{ x: a.x, y: a.y }`.
 function slotFreshLit(at: i32, dst: i32) {
+  if at < 0 || at >= P.nodes.length { return slotFreshLitOf("v", dst) }
   const n = nodeAt(at)
-  const src = if n is Ident { n.identName } else { "v" }
+  slotFreshLitOf(if n is Ident { n.identName } else { "v" }, dst)
+}
+
+// The literal that builds a fresh `dst` from a value named `src`.
+function slotFreshLitOf(src: string, dst: i32) {
   let out = "{ "
   if dst >= 0 && dst < T.tys.length {
     const d = tyAt(dst)
@@ -741,6 +746,36 @@ function slotFreshLit(at: i32, dst: i32) {
   out + " }"
 }
 
+// The mutable list slot an existing list at `at` is delivered to and declined at, which would
+// share that list's storage at another record layout (the container ruling), or -1.
+function slotListShare(at: i32, par: {[i32]: i32}) {
+  if at < 0 || at >= P.nodes.length { return -1 }
+  const path: i32[] = []
+  const s = slotOf(at, par, path)
+  if s < 0 || (slWhy[s] ?? SL_HELD) != SL_GAP || slotReadonly(s) { return -1 }
+  if nodeAt(at) is ArrayLit || !slotIsListTy(nodeTyOf(at)) { return -1 }
+  s
+}
+
+// The refusal of the existing list at `at` delivered to the mutable list slot `s` of record `dst`.
+function slotListShareMsg(at: i32, s: i32, dst: i32) {
+  const d = tyToStrUser(dst)
+  "an existing list keeps its elements' own record layout where it is delivered (no copy is made), "
+    + "and a mutable `"
+    + d
+    + "[]` stores one record layout for every element, so `"
+    + slotName(s)
+    + "` cannot share this "
+    + tyToStrUser(nodeTyOf(at))
+    + "; copy it into fresh "
+    + d
+    + " records with `.map((e) => ("
+    + slotFreshLitOf("e", dst)
+    + "))`, or keep `"
+    + slotName(s)
+    + "` at the list's own type"
+}
+
 // Rewords each refusal of an existing record whose storage holds one record layout by contract
 // (DECISIONS "Width subtyping of an existing record") from the capability-gap sentence to that
 // contract, with the fresh literal that stores it.
@@ -753,8 +788,19 @@ export function slotContractWords(root: i32) {
     let k = 0
     while k < wsSlotAt.length && wsSlotAt[k] != d.tat { k = k + 1 }
     if d.tcode == CODE_UNSUPPORTED_LOWERING && k < wsSlotAt.length {
-      const why = slotContractClause(d.tat, wsSlotDst[k], par)
-      if why != "" {
+      const share = slotListShare(d.tat, par)
+      const why = if share >= 0 { "" } else { slotContractClause(d.tat, wsSlotDst[k], par) }
+      if share >= 0 {
+        T.diags[i] = {
+          tmsg: slotListShareMsg(d.tat, share, wsSlotDst[k]),
+          tat: d.tat,
+          tline: d.tline,
+          tcol: d.tcol,
+          tendTok: d.tendTok,
+          tcode: "",
+          tdata: d.tdata,
+        }
+      } else if why != "" {
         const msg = "an existing record keeps its own record layout where it is delivered (no copy "
           + "is made), and "
           + why
