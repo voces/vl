@@ -56,7 +56,7 @@ The rep column compared against is `repOfTy(ty)`'s covered kind.
 ## Measurement
 
 - **Seed:** 6,735,476 → 6,735,437 bytes, both fixpoints (6,735,606 merged with #7600, with the dead predicates gone).
-- **render-parse:** parses fall 38 → 34 on master after #7600 (40 → 36 on the base) (`nulScalarListKind`'s `nullablePartOf`, the ladder's
+- **render-parse:** parses fall 36 → 32 on master at #7610 (40 → 36 on the base) (`nulScalarListKind`'s `nullablePartOf`, the ladder's
   `nameIsLitUnionType` and `nameIsArray`, and `nameFieldCode`'s `annArrowAt`). Renders stay at 12.
   The baseline is rewritten in this PR.
 - **vkind-census:** the "rendered name" family is 2 → 0.
