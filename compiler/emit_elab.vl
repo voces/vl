@@ -39,7 +39,7 @@ import { decDigitsOf } from "./strutil"
 import { constListFnElemDecl, elabNullOnlyTp, slotOfRead } from "./check_calls"
 
 import { litMembersBaseTy } from "./check_literals"
-import { nomErasedTyIx } from "./check_ty_rep"
+import { nomErasedTyIx, tyIsValueUnionBox } from "./check_ty_rep"
 import { ftParamListCopied, ftWithinInstancedFn } from "./check_fn_tag"
 import {
   ArrayLit,
@@ -7666,11 +7666,15 @@ function elabHolderCanHoldReturned(h: i32, from: i32, rec: i32[]): boolean {
     return false
   }
   const fd = elabEnclosingFn(h)
-  // A module-scope `const` is one record whichever function returns it.
+  // A module-scope `const` is one record whichever function returns it, where that function
+  // returns the record whole (`elabGlobalReturnerWhole`).
   const hn = nodeAt(h)
   const global = fd == -1 && hn is LetDecl && hn.letKw == "const"
   for r in rets {
-    if elabEnclosingFn(r) != fd && !global { return false }
+    const rf = elabEnclosingFn(r)
+    if rf != fd && !(global && elabGlobalReturnerWhole(rf, rec)) {
+      return false
+    }
   }
   for t in through {
     if elabEnclosingFn(t) != fd || elabCallSigMember(t, rec) < 0 {
@@ -7678,6 +7682,37 @@ function elabHolderCanHoldReturned(h: i32, from: i32, rec: i32[]): boolean {
     }
   }
   true
+}
+
+// Whether function `rf` may return record `rec` (`elabRetRecordShape`) and no call of it takes
+// one member by its holder or its destination, which would emit it at that member.
+function elabGlobalReturnerWhole(rf: i32, rec: i32[]): boolean {
+  if rf < 0 || !elabRetRecordShape(rf) { return false }
+  for g in elabResPlainCalls.keys() {
+    if (elabResPlainCalls[g] ?? -1) == rf && elabCallTakesOneMember(g, rec) {
+      return false
+    }
+  }
+  true
+}
+
+// Whether call `g`'s value is used as one member of `rec` in plain code: a holder called through
+// at one signature only, or a destination expecting one member's type.
+function elabCallTakesOneMember(g: i32, rec: i32[]): boolean {
+  const h = elabResHolder.get(g) ?? -1
+  if h >= 0 {
+    const through = elabResThrough.get(h) ?? []
+    const reads = through.length + elabResWriteReads(h)
+    if through.length > 0 && reads == (elabResReads.get(h) ?? 0) {
+      const m = elabCallSigMember(through[0], rec)
+      let one = m >= 0
+      for t in through {
+        if elabCallSigMember(t, rec) != m { one = false }
+      }
+      if one { return true }
+    }
+  }
+  elabRecIndexOf(rec, callDstTyOf(g)) >= 0
 }
 
 // Whether every copy in `copies` of holder `h` can hold record `rec`: it is read only by calls
@@ -17088,9 +17123,9 @@ function elabRootArgParamTy(a: i32, own: i32): i32 {
   if shaped { pt } else { -1 }
 }
 
-// The record members of every union the elaboration typed some instance's node, parameter or
-// result at, through the types that hold one: the arms an instance union adds to the variant
-// table later.
+// The record members of every union a node is checked at, or the elaboration typed some
+// instance's node, parameter or result at, through the types that hold one: the arms the variant
+// table gains later in emit. Run once per program, after the elaboration.
 export function elabInstUnionArmTys(): i32[] {
   const out: i32[] = []
   const seen: {[i32]: boolean} = Map()
@@ -17101,6 +17136,14 @@ export function elabInstUnionArmTys(): i32[] {
       elabUnionArmsInto(ps[i], out, seen, 8)
       i = i + 2
     }
+  }
+  // A checked union only counts where it boxes two distinct records, the union a row is minted
+  // for: a same-shape union collapses to its struct and mints none.
+  let n = 0
+  while n < P.nodes.length {
+    const nt = nodeTyIxOf(n)
+    if elabBoxesTwoRecords(nt) { elabUnionArmsInto(nt, out, seen, 1) }
+    n = n + 1
   }
   let k = 0
   while k < ekDecl.length {
@@ -17116,6 +17159,21 @@ export function elabInstUnionArmTys(): i32[] {
     k = k + 1
   }
   out
+}
+
+// Whether `u` is a value-union box with two record members of different types.
+function elabBoxesTwoRecords(u: i32): boolean {
+  if u < 0 || u >= T.tys.length || !tyIsValueUnionBox(u) { return false }
+  const t = tyAt(u)
+  if !(t is TyUnion) { return false }
+  let first = -1
+  for m in t.uMembers {
+    if m >= 0 && m < T.tys.length && tyAt(m) is TyObj {
+      if first < 0 { first = m }
+      else if !tySame(first, m) { return true }
+    }
+  }
+  false
 }
 
 function elabUnionArmsInto(
