@@ -31,48 +31,50 @@ A row's tags are per kind, so a rename moves no tag. Site 55 is cut 5b, graded b
 
 ## What the census missed, and the first candidate's regression
 
-The census graded only the calls where the registration mints or binds a value-union row. Two
-classes of call it graded as "skip" or "typed" still read the caller's name.
+The census graded the derived name, not every input the entry reads. One class still read the
+caller's name: sites 56 to 59. They name the row by the inner member's rep kind
+(`nulNumScalarUnionName`), so a function set's id registers as `i32|null`. `nulNumScalarUnionRowTy`
+hands over a type only for a primitive inner. Otherwise the entry resolved the name
+(`declTyIxOfName`), and the typed entry has nothing to resolve.
 
-- **The adopt in a skipped call.** When the type says the union is not a value union, the entry
-  still binds the caller's spelling to the row the type keys (`unNameAdoptTyKeyRow`) before it
-  skips. Later readers find that row by the spelling. Skipped calls: sites 23 (9), 50 (4), 54
-  (451), 60 (60), and lane E's 7 (5), 8 (13) and 63 (314).
-- **A rep-spelled name with no type.** Sites 56 to 59 name the row by the inner member's rep kind
-  (`nulNumScalarUnionName`), so a function set's id registers as `i32|null`.
-  `nulNumScalarUnionRowTy` hands over a type only for a primitive inner. Otherwise the entry
-  resolved the name (`declTyIxOfName`), and the typed entry has nothing to resolve.
+The first candidate converted all 13 of this lane's typed sites. `regress.vl` lost 147 classes,
+every one `emitProgram: scalar map read has no value-box type` in the D15116 family (a map of
+generic functions), and 47 inventory witnesses moved.
 
-The first candidate converted all 13 of this lane's typed sites, and `regress.vl` lost 147
-classes. Every one was `emitProgram: scalar map read has no value-box type`, in the D15116 map of
-generic functions family; 47 inventory witnesses also moved. Reverting the sites above restored
-every class. The census method needs this class added before the floors below can move: grade
-the adopt in a skipped call, and every call whose type is -1.
+- **Bisected:** reverting sites 23, 50, 54 and 60 changed nothing; reverting 56 to 59 restored
+  every class.
+- **Suspected, then cleared:** those four sites have calls the entry skips (the type says no value
+  union), where the entry still binds the caller's spelling to the type's row before skipping.
+  With them converted again and 56 to 59 kept on the name, regress, the witnesses and every gate
+  are clean.
+
+The census method needs one addition before the floors below move: grade every call whose type
+is -1, not only the name it derives.
 
 ## Changed
 
 - `registerValueUnionOfTy(site, ty)` (`emit_union_atoms.vl`) is the typed entry.
-- Four call sites drop their names: `emit_collect` 21 and 22 (the inferred `if`-expression and
-  optional-chain lets), `emit_obj_lit_fits` 51's typed call, and `emit_sections` 65 (an `as?`'s
-  numeric fallible result). None of them has a skipped call or a call with no type.
-- `emit_sections` no longer imports `asExprNumTgtName`.
+- Eight call sites drop their names:
+  - `emit_collect` 21 and 22 (the inferred `if`-expression and optional-chain lets), 23 (×2, the
+    inferred let and join unions), and 54 (a list field's union code);
+  - `emit_obj_lit_fits` 51's typed call;
+  - `emit_sections` 50 (an `as` value union) and 65 (an `as?`'s numeric fallible result);
+  - `emit_union_atoms` 60 (a map value's union).
+- `emit_sections` no longer imports `asExprNumTgtName` or `registerValueUnionNameAB`.
 
 ## Floors, each with its reason
 
 | site | why it keeps the name |
 | --- | --- |
-| 23, 50, 54, 60; lane E's 7, 8, 63 | skipped calls bind the spelling to the type's row; they move when the readers of that spelling ask the type |
 | 56, 57 (×2), 58, 59 | the name is the rep's (`nulNumScalarUnionName`); a non-primitive inner has no arena type here |
 | 47 | D10130's `i32|null`: the type declines and spells no value union |
 | 51's literal-set call | the widened set (`valueUnionNameOfSoftTy`) has no arena type |
 | 55 | cut 5b: 243 renames by member order or alias spelling |
-
-Lane E's 61 and 62 can switch to the typed entry: no skipped call, 0 differences.
+| lane E's 7, 8, 61, 62, 63 | lane E's file; handed over with this entry and the census (0 differences) |
 
 ## Proof
 
-- **Seed:** fixpoint, 6,716,273 bytes. The comment move and the formatting after it are
-  byte-identical.
+- **Seed:** fixpoint, 6,716,260 bytes.
 - **Locally:** lint-self, regress (no runs lost), rep-fuzz, check-filed-witnesses `--strict` (0
   moved), late-demands, seed-size, render-parse, dead-exports, emitter-state-audit.
 - **The full sweep:** CI's `sweep` label. Expected identity.
