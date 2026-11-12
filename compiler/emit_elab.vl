@@ -6626,6 +6626,7 @@ let elabResAsgTo: {[i32]: i32[]} = Map()
 // Per parameter, the unannotated `const` bindings initialised with a read of it; per bundle key,
 // whether a call hands that parameter a record whole.
 let elabResCopies: {[i32]: i32[]} = Map()
+let elabLambdaBound: {[i32]: i32} = Map()
 let elabResTypedReads: {[i32]: i32[]} = Map()
 let elabTypedReadMembers: {[i32]: i32[]} = Map()
 // Per holder, the `return` statements that return it.
@@ -6657,6 +6658,7 @@ function elabResultScanReset() {
   elabResWrites = Map()
   elabResBadWrite = Map()
   elabResCopies = Map()
+  elabLambdaBound = Map()
   elabResTypedReads = Map()
   elabTypedReadMembers = Map()
   elabResAsgFrom = Map()
@@ -6694,6 +6696,7 @@ function elabResultScanAt(g: i32) {
   elabResScanBlock(g)
   elabResScanAssign(g)
   elabResScanRet(g)
+  elabResScanTail(g)
   elabResScanSlots(g)
   0
 }
@@ -6725,6 +6728,26 @@ function elabResSlotValue(e: i32) {
   if v < 0 || v >= P.nodes.length { return 0 }
   if elabResMayReturnRecord(v) || elabSlotHolderOf(v) >= 0 {
     elabResSlotCalls.push(v)
+  }
+  0
+}
+
+// A function body ending in a read of a holder returns it whole, as a `return` of it does.
+function elabResScanTail(g: i32) {
+  const n = nodeAt(g)
+  if n is FuncDecl && n.fnBody >= 0 {
+    const b = nodeAt(n.fnBody)
+    if b is Block && b.blkStmts.length > 0 {
+      const t = parenPeelIx(b.blkStmts[b.blkStmts.length - 1])
+      if t >= 0 && t < P.nodes.length && nodeAt(t) is Ident {
+        const d = identDeclOf(t)
+        if elabResMayHold(d) {
+          const rs = elabResRets.get(d) ?? []
+          rs.push(t)
+          elabResRets[d] = rs
+        }
+      }
+    }
   }
   0
 }
@@ -6836,15 +6859,33 @@ function elabResHolderLink(g: i32, d: i32, v: i32): boolean {
   s != d && elabResMayHold(s) && elabResCallHolder(s)
 }
 
+// The function declaration `d` names as a callee: itself, or the un-annotated lambda an
+// un-annotated `const` binding `d` inside a function is initialised with (noted in
+// `elabLambdaBound`); -1 otherwise.
+function elabCalleeFn(d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const n = nodeAt(d)
+  if n is FuncDecl { return d }
+  if !(n is LetDecl) || n.letKw != "const" || n.letType >= 0 { return -1 }
+  // At the top level a call through the binding is a closure call, whose signature carries no
+  // record; inside a function it is a direct call to the lifted lambda.
+  if elabEnclosingFn(d) < 0 { return -1 }
+  const v = parenPeelIx(n.letInit)
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const vn = nodeAt(v)
+  if !(vn is FuncDecl) || vn.fnName != "" { return -1 }
+  elabLambdaBound[v] = d
+  v
+}
+
 // A read counts against the binding it reads.
 function elabResScanIdent(g: i32) {
   const n = nodeAt(g)
   if n is Ident {
     const d = identDeclOf(g)
     if elabResMayHold(d) { elabResReads[d] = (elabResReads.get(d) ?? 0) + 1 }
-    if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
-      elabFnReads[d] = (elabFnReads.get(d) ?? 0) + 1
-    }
+    const fd = elabCalleeFn(d)
+    if fd >= 0 { elabFnReads[fd] = (elabFnReads.get(fd) ?? 0) + 1 }
   }
   0
 }
@@ -6958,13 +6999,14 @@ function elabSlotHolderHolds(h: i32, stores: i32, rec: i32[]): boolean {
 }
 
 // Whether call `v` can return a record: its callee names a function with no return annotation,
-// as only such an instance returns one.
+// directly or through the `const` it is bound to (`elabCalleeFn`), as only such a function
+// returns one.
 function elabResMayReturnRecord(v: i32): boolean {
   const c = nodeAt(v)
   if !(c is Call) { return false }
   const cf = parenPeelIx(c.callFn)
   if cf < 0 || !(nodeAt(cf) is Ident) { return false }
-  const fd = identDeclOf(cf)
+  const fd = elabCalleeFn(identDeclOf(cf))
   if fd < 0 || fd >= P.nodes.length { return false }
   const fn = nodeAt(fd)
   fn is FuncDecl && fn.fnRet < 0
@@ -6977,9 +7019,10 @@ function elabResScanCall(g: i32) {
     const cf = parenPeelIx(n.callFn)
     if cf >= 0 && nodeAt(cf) is Ident {
       const d = identDeclOf(cf)
-      if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
-        elabFnCalleeReads[d] = (elabFnCalleeReads.get(d) ?? 0) + 1
-        if elabPlainCallee(g) >= 0 { elabResPlainCalls[g] = d }
+      const fd = elabCalleeFn(d)
+      if fd >= 0 {
+        elabFnCalleeReads[fd] = (elabFnCalleeReads.get(fd) ?? 0) + 1
+        if elabPlainCallee(g) >= 0 { elabResPlainCalls[g] = fd }
       }
       if elabResMayHold(d) {
         const at = elabResThrough.get(d) ?? []
@@ -7726,9 +7769,15 @@ function elabHolderCanHoldReturned(h: i32, from: i32, rec: i32[]): boolean {
   // return a record (`elabRetRecordShape`): an annotated return keeps its type.
   const hn = nodeAt(h)
   const global = fd == -1 && hn is LetDecl && hn.letKw == "const"
+  // A `const` holder captured by a lambda nested in its function is that one record too.
+  const nested = hn is LetDecl && hn.letKw == "const"
   for r in rets {
     const rf = elabEnclosingFn(r)
-    if rf != fd && !(global && rf >= 0 && elabRetRecordShape(rf)) {
+    const inLam = nested
+      && rf != fd
+      && elabLambdaWithin(rf, fd)
+      && elabRetRecordShape(rf)
+    if rf != fd && !inLam && !(global && rf >= 0 && elabRetRecordShape(rf)) {
       return false
     }
   }
@@ -8130,7 +8179,7 @@ function elabPlainCallee(c: i32): i32 {
   if !(cn is Call) { return -1 }
   const cf = parenPeelIx(cn.callFn)
   if cf < 0 || !(nodeAt(cf) is Ident) { return -1 }
-  const d = identDeclOf(cf)
+  const d = elabCalleeFn(identDeclOf(cf))
   if d < 0 || d >= P.nodes.length { return -1 }
   const dn = nodeAt(d)
   if !(dn is FuncDecl) || dn.fnRet >= 0 || dn.fnTyParams.length > 0 {
@@ -8147,7 +8196,8 @@ function elabPlainCallee(c: i32): i32 {
 // as a callee, with no return annotation.
 function elabRetRecordShape(d: i32): boolean {
   const dn = nodeAt(d)
-  if !(dn is FuncDecl) || dn.fnName == "" || dn.fnRet >= 0 { return false }
+  if !(dn is FuncDecl) || dn.fnRet >= 0 { return false }
+  if dn.fnName == "" && !elabLambdaBound.has(d) { return false }
   if (elabFnReads.get(d) ?? 0) != (elabFnCalleeReads.get(d) ?? 0) {
     return false
   }
@@ -8217,7 +8267,7 @@ function elabRetValues(body: i32, out: i32[]): boolean {
   if !(b is Block) || b.blkStmts.length == 0 { return false }
   const t = parenPeelIx(b.blkStmts[b.blkStmts.length - 1])
   if t < 0 { return false }
-  if nodeAt(t) is Call { out.push(t) }
+  if nodeAt(t) is Call || elabRetHolderCall(t) >= 0 { out.push(t) }
   else if !(nodeAt(t) is RetStmt) { return false }
   elabStmtRetValues(body, out)
 }
