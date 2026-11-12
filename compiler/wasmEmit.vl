@@ -3039,7 +3039,7 @@ function emitStructExprAsVariantBox(
 // A fresh record at the heap `dHeap`, whose fields are `dNames` at the flat field rows `dFieldRows`, built from
 // the record `exprIx` evaluates to at struct row `ssi`: field by field, each number converted
 // (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`.
-// `dRow` is the destination's struct row, or -1 for a variant row, whose fields are not nested.
+// `dRow` is the destination's struct row, or -1 for a variant row.
 function emitRecCopy(
   body: u8[],
   exprIx: i32,
@@ -3087,30 +3087,47 @@ function rcReadSource(
 }
 
 // The destination row nested field `fj` of `dRow` is copied into, where its record is stored at
-// another row than the source row `sRow`'s field `sfi`; -1 where the field is not copied apart.
-function rcNestedRow(sRow: i32, sfi: i32, dRow: i32, fj: i32, dr: i32): i32 {
-  if dRow < 0 || !fieldRowIsRecordRef(dr) || !sFieldIsRecordRef(sRow, sfi) {
-    return -1
-  }
+// another row than the source row `sRow`'s field `sfi`; -1 where the field is not copied apart. A
+// variant destination (`dRow` -1) names the row by its checked field type `dFt`.
+function rcNestedRow(
+  sRow: i32,
+  sfi: i32,
+  dRow: i32,
+  fj: i32,
+  dr: i32,
+  dFt: i32,
+): i32 {
+  if !fieldRowIsRecordRef(dr) || !sFieldIsRecordRef(sRow, sfi) { return -1 }
   const sIn = sFieldTgtStructIdx(sRow, sfi)
-  const dIn = sFieldTgtStructIdx(dRow, fj)
+  const dIn = if dRow >= 0 { sFieldTgtStructIdx(dRow, fj) } else { rcRowOfTy(dFt) }
   if sIn < 0 || dIn < 0 || sIn >= sHeapIdx.length || dIn >= sHeapIdx.length {
     return -1
   }
   if sHeapIdx[sIn] == sHeapIdx[dIn] { -1 } else { dIn }
 }
 
+// The struct row of the record `ty` or `ty | null`, or -1.
+function rcRowOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const inner = nullableInnerOrNone(ty)
+  const t = if inner >= 0 { inner } else { ty }
+  const r = structIndexOfTy(t)
+  if r >= 0 { r } else { structRowOfAnnTy("", t, t) }
+}
+
 // Whether any field of destination row `dRow` is copied at a nested row (`rcNestedRow`).
 function rcHasNested(
   ssi: i32,
   dRow: i32,
+  dTy: i32,
   dNames: string[],
   dFieldRows: i32[],
 ): boolean {
   let fj = 0
   while fj < dNames.length {
     const sfi = sFieldIndex(ssi, dNames[fj])
-    if sfi >= 0 && rcNestedRow(ssi, sfi, dRow, fj, dFieldRows[fj]) >= 0 {
+    const dFt = rcFieldTy(dTy, dNames[fj])
+    if sfi >= 0 && rcNestedRow(ssi, sfi, dRow, fj, dFieldRows[fj], dFt) >= 0 {
       return true
     }
     fj = fj + 1
@@ -3135,9 +3152,10 @@ function emitRecCopyFields(
     )
   }
   const sHeap = sHeapIdx[ssi]
+  const dTy = recCopyTyOf(exprIx)
   const reReadable = exprReReadable(unwrapParen(exprIx))
     || (dNames.length == 1
-    && !rcHasNested(ssi, dRow, dNames, dFieldRows))
+    && !rcHasNested(ssi, dRow, dTy, dNames, dFieldRows))
   if !reReadable {
     if !fnUsesVariantRebox {
       return emitFail(
@@ -3149,7 +3167,6 @@ function emitRecCopyFields(
   }
   rcPathHeap = []
   rcPathField = []
-  const dTy = recCopyTyOf(exprIx)
   emitRecCopyLevel(
     body,
     exprIx,
@@ -3204,7 +3221,7 @@ function emitRecCopyLevel(
       continue
     }
     const dFt = rcFieldTy(dTy, dNames[fj])
-    const nest = rcNestedRow(sRow, sfi, dRow, fj, dFieldRows[fj])
+    const nest = rcNestedRow(sRow, sfi, dRow, fj, dFieldRows[fj], dFt)
     if nest >= 0 {
       rcPathHeap.push(sHeapIdx[sRow])
       rcPathField.push(sfi)
@@ -3292,12 +3309,10 @@ function rcWrapKind(
   sr: i32,
   dr: i32,
 ): i32 {
-  if pre != "" || !fieldRowIsUnionBox(dr) || recCopyFromOf(exprIx) >= 0 {
-    return -1
-  }
+  if !fieldRowIsUnionBox(dr) || recCopyFromOf(exprIx) >= 0 { return -1 }
   if fieldRowNumKind(sr) < 0 && !fieldRowIsStr(sr, false) { return -1 }
-  const st = rcFieldTy(nodeTyIxOf(exprIx), name)
-  const dt = rcFieldTy(recCopyTyOf(exprIx), name)
+  const st = rcFieldTy(rcPathTy(nodeTyIxOf(exprIx), pre), name)
+  const dt = rcFieldTy(rcPathTy(recCopyTyOf(exprIx), pre), name)
   if st < 0 || dt < 0 { return -1 }
   const inner = nullableInnerOrNone(dt)
   if inner >= 0 && tySame(st, inner) { return boxTagOfTy(st) }
@@ -3332,6 +3347,25 @@ function rcWidenTo(sk: i32, inner: i32): i32 {
 // kind each converts to.
 const RC_WIDENS = ["0>i64", "0>f64", "3>f64", "5>f64"]
 const RC_WIDEN_KINDS = [3, 4, 4, 4]
+
+// The record at field path `pre` (`j.k.`) under the record `ty`, each step's `| null` peeled; -1
+// where a step names no record field.
+function rcPathTy(ty: i32, pre: string): i32 {
+  let t = ty
+  let from = 0
+  let i = 0
+  while i < pre.length {
+    if pre[i] == 46 {
+      const f = rcFieldTy(t, pre.slice(from, i))
+      if f < 0 { return -1 }
+      const inner = nullableInnerOrNone(f)
+      t = if inner >= 0 { inner } else { f }
+      from = i + 1
+    }
+    i = i + 1
+  }
+  t
+}
 
 // The type of field `name` of the checked record `dTy`, or -1.
 function rcFieldTy(dTy: i32, name: string): i32 {
