@@ -9,6 +9,10 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-11-step7-exit-criteria](2026-11-11-step7-exit-criteria.md): Step 7 exit criteria: what stands between master and deleting §7's L1, L2 and L6 lines.
+- [2026-11-11-step7-decl-identity-row-key-census](2026-11-11-step7-decl-identity-row-key-census.md): Step 7: does a row key need declaration identity? Census and proposal: build none.
+- [2026-11-11-step7-retkind-readers-graded](2026-11-11-step7-retkind-readers-graded.md): Step 7: the return-kind readers and `buildFnMap`, graded and ruled.
+- [2026-11-11-step7-closing-census-3](2026-11-11-step7-closing-census-3.md): Step 7 closing census 3: the Deletes, Absorbs and Closes lists as a checklist.
 - [2026-11-11-step7-union-reg-ria-aligned](2026-11-11-step7-union-reg-ria-aligned.md): Step 7 L6: the last positional atom pairing follows the member.
 - [2026-11-11-step7-union-reg-clo-sig-slot](2026-11-11-step7-union-reg-clo-sig-slot.md): Step 7 L6: a closure signature's tag slot is keyed by its type, and its render is the slot's name.
 - [2026-11-11-step7-union-reg-arm-tys](2026-11-11-step7-union-reg-arm-tys.md): Step 7 L6: a shape arm's type is found by the canonical key, and two atom pairings follow the member.
