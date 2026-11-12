@@ -4,7 +4,7 @@
 // (`captureBoxRewrite`). Consults the classifiers (`emit_classify.vl`); writes no bytes.
 
 import { monoPinSpellNoAnon } from "./pin_spell"
-import { cwDeclAssigned } from "./check_write_scan"
+import { cwDeclAssigned, cwFieldNameWritten } from "./check_write_scan"
 import { deliveryRetagMove } from "./check_retag_rows"
 import { elabNodeInstTys } from "./emit_elab"
 import {
@@ -5287,8 +5287,9 @@ function synthRecEqCoreFn(row: i32, pos: i32) {
 }
 
 // Writes each `const` record literal whose fields read only unwritten un-annotated parameters,
-// and whose one read is a positional argument of a named call, into that argument in place of
-// its binding: the literal is then delivered where it is built, as one written there is (D15700).
+// and whose one whole read is a positional argument of a named call, into that argument in place
+// of its binding; a read of one of its fields becomes the parameter the field holds. The literal
+// is then delivered where it is built, as one written there is (D15700).
 export function inlineConstRecArgs(stmts: i32[]) {
   const todo: i32[] = []
   for s in stmts { todo.push(s) }
@@ -5314,7 +5315,7 @@ function icraBody(fn: FuncDecl, body: i32) {
   0
 }
 
-// Whether statement `s` of `fn`'s body `body` is such a binding, now written into its one read.
+// Whether statement `s` of `fn`'s body `body` is such a binding, now written into its reads.
 function icraInline(fn: FuncDecl, body: i32, s: i32): boolean {
   const ln = nodeAt(s)
   if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return false }
@@ -5336,6 +5337,7 @@ function icraInline(fn: FuncDecl, body: i32, s: i32): boolean {
   let read = -1
   let call = -1
   let reads = 0
+  const fieldReads: i32[] = []
   const todo: i32[] = [body]
   const par: i32[] = [-1]
   while todo.length > 0 {
@@ -5344,9 +5346,18 @@ function icraInline(fn: FuncDecl, body: i32, s: i32): boolean {
     if x >= 0 && x < P.nodes.length {
       const xn = nodeAt(x)
       if xn is Ident && identDeclOf(x) == s {
-        reads = reads + 1
-        read = x
-        call = p
+        const pm = if p >= 0 { nodeAt(p) } else { xn }
+        if (
+          pm is Member
+          && pm.memObj == x
+          && icraFieldValue(ol, pm.memProp) >= 0
+        ) {
+          fieldReads.push(p)
+        } else {
+          reads = reads + 1
+          read = x
+          call = p
+        }
       }
       for c in nodeChildren(x) {
         todo.push(c)
@@ -5361,6 +5372,34 @@ function icraInline(fn: FuncDecl, body: i32, s: i32): boolean {
   if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return false }
   const j = i32ListIndexOf(cn.callArgs, read)
   if j < 0 { return false }
+  // A field read is the parameter the field holds, while no assignment writes such a field.
+  if fieldReads.length > 0 {
+    for f in ol.objFields {
+      const fi = nodeAt(f)
+      if fi is FieldInit && cwFieldNameWritten(fi.fiName) { return false }
+    }
+  }
+  for m in fieldReads {
+    const mn = nodeAt(m)
+    const v = if mn is Member { icraFieldValue(ol, mn.memProp) } else { -1 }
+    if v >= 0 {
+      const vn = nodeAt(v)
+      if vn is Ident {
+        arenaSetNode(m, { identName: vn.identName, pos: mn.pos })
+        identFromDecl(m, identDeclOf(v))
+        nodeSrcNote(m, v)
+      }
+    }
+  }
   cn.callArgs[j] = li
   true
+}
+
+// The value node of field `name` in record literal `ol`, or -1 where it has none.
+function icraFieldValue(ol: ObjLit, name: string): i32 {
+  for f in ol.objFields {
+    const fi = nodeAt(f)
+    if fi is FieldInit && fi.fiName == name { return fi.fiValue }
+  }
+  -1
 }
