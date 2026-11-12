@@ -41,6 +41,7 @@ import {
   cwParamArgs,
   cwPathFnTargets,
   cwPathFnTargetsFrom,
+  cwSliceRecv,
   cwSlotPath,
   cwSlotValuesFrom,
   cwSlotWrittenValues,
@@ -2922,6 +2923,16 @@ export function fnSetCalledWithAny(ds: i32[]): boolean {
 }
 
 // Whether call `ix`'s members give it different results.
+// Whether some call through set `s` runs members whose results differ there.
+export function fnTagSetSplits(s: i32): boolean {
+  for c in fnTagCallIxs {
+    if (fnTagCallSet[c] ?? -1) == s && (fnTagCallSplit[c] ?? false) {
+      return true
+    }
+  }
+  false
+}
+
 export function fnTagCallSplits(ix: i32): boolean {
   fnTagCallSplit[ix] ?? false
 }
@@ -3479,11 +3490,55 @@ export function fnTagHeldNote(x: i32) {
   }
   const v0 = if n is LetDecl { n.letInit } else { x }
   const deep = fnTagListOfLists(t) && fnTagInnerLitsOnly(v0, t, 0)
-  const r = fnTagRepTyIn(t, 16, deep)
+  // A list literal of record literals holding a tagged field mints their row as its element.
+  const recs = !deep && fnTagRecLitsOnly(v0, t)
+  const r = fnTagRepTyIn(t, 16, deep || recs)
   if r >= 0 && r != t { fnTagHeldRep[x] = r }
   // The inner literals of a list of lists are built at the same rep's elements (D15350).
   if deep { fnTagHeldInner(v0, r, 0) }
+  if recs { fnTagHeldRecLits(v0, r) }
   0
+}
+
+// Queues each record literal of list literal `v` to be built at the element of rep `r`.
+function fnTagHeldRecLits(v: i32, r: i32) {
+  const vn = nodeAt(parenPeelIx(v))
+  const ro = if r >= 0 && r < T.tys.length { T.tys[r] } else { null }
+  if !(vn is ArrayLit) || !(ro is TyArray) { return 0 }
+  for el in vn.arrElems {
+    fnTagHeldRecs.push(parenPeelIx(el))
+    fnTagHeldRecs.push(ro.aElem)
+  }
+  0
+}
+
+// Whether record type `t` has a field of a tagged set a call through runs at differing results.
+function fnTagHasSplitField(t: i32): boolean {
+  const o = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  if !(o is TyObj) { return false }
+  for f in o.objFieldTypes {
+    if fnTagTyIsTagged(f) && fnTagSetSplits(fnTagSetOfTy(f)) { return true }
+  }
+  false
+}
+
+// Whether `v`, of list type `t`, is a list literal of record literals only, whose record has a
+// field of a tagged set a call runs at differing results.
+function fnTagRecLitsOnly(v: i32, t: i32): boolean {
+  const vx = if v >= 0 && v < P.nodes.length { parenPeelIx(v) } else { -1 }
+  const vn = if vx >= 0 && vx < P.nodes.length { nodeAt(vx) } else { null }
+  const o = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
+  if !(vn is ArrayLit) || !(o is TyArray) || vn.arrElems.length == 0 {
+    return false
+  }
+  if !fnTagHasSplitField(o.aElem) { return false }
+  for el in vn.arrElems {
+    const ex = parenPeelIx(el)
+    if ex < 0 || ex >= P.nodes.length || !(nodeAt(ex) is ObjLit) {
+      return false
+    }
+  }
+  true
 }
 
 // The rep stamped at the place `v` reads: a stamped node or binding, or an element or field of
@@ -3505,6 +3560,9 @@ function fnTagPlaceRep(v: i32): i32 {
     } else if xn is Index {
       steps.push("")
       x = parenPeelIx(xn.idxArr)
+    } else if cwSliceRecv(x) >= 0 {
+      // A slice holds its receiver's own elements.
+      x = parenPeelIx(cwSliceRecv(x))
     } else {
       // Any other node is the root: a name reads its binding's stamp.
       const d = identDeclOf(x)
