@@ -72,7 +72,7 @@ Two notes on these rows:
 - Refresh ×2: fixpoint.
 - Sweep with fixpoint seeds on both sides, master `cb558bf3` against the candidate: 24,191 same,
   0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
-- `scripts/gate.sh`: all 23 rows pass.
+- `scripts/gate.sh`: all 23 rows pass, on the branch and on the tree merged with master `68905c69`.
 - Render-parse with `--findings`: 9 renders, 10 → 6 parses. `emit_base.vl` goes from 6 to 2.
   `--write-baseline` is in this PR.
 
