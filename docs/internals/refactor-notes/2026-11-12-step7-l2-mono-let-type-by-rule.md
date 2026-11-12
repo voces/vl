@@ -10,17 +10,14 @@ order. w316 fixed that in #7379, with D15760 as its pin. The fourth,
 `generics/generic-is-over-anonymous-record-pin.vl`, was the rule spelling an anonymous record by
 its handle (`#anon0|i32`). That spelling parses to no type, so no typed lookup finds its row.
 
-The base is master `bebbc99d`, after #7379, with a fixpoint seed on both sides. The population is
-the whole sweep: 23,972 programs.
+The base is master `bd129b4d`, after #7379 and #7397, with a fixpoint seed on both sides. The
+population is the whole sweep: 23,975 programs.
 
 ## Changed
 
-- The naming rule gains a third level: `monoPinSpellAnonFields(ty)` spells a record whose row is
-  an anonymous handle by its fields, at every depth.
-  - `monoPinSpellAt`'s `shapes` flag becomes an `i32` level: 0 = by row, 1 = also a record with
-    no row by its fields, 2 = also an `#anon` row by its fields.
-- `monoSubstLetType` takes `monoPinSpellAnonFields` of the let's type substituted at the
-  instance. A binding that stays open keeps its annotation.
+- `monoSubstLetType` takes `monoPinSpellNoAnon` (#7397) of the let's type substituted at the
+  instance. That is the naming rule with a record whose row is an `#anon` handle spelled by its
+  fields, at every depth. A binding that stays open keeps its annotation.
 - `monoSubstAnonShapes` has no caller left, so it is deleted.
 - `monoPinSpellFields`, read only by `monoSubstAnonShapes`, is deleted too.
 
@@ -42,7 +39,7 @@ parser's synthesized annotation carries its type.
 
 ## Proof
 
-- **Byte sweep.** The master fixpoint against the candidate fixpoint: same 23,946, bytes-only 26,
+- **Byte sweep.** The master fixpoint against the candidate fixpoint: same 23,949, bytes-only 26,
   output movers 0, runs → not-runs 0, new compiler traps 0.
   - **25 bytes-only movers change only the source-position section.** The disassembly is
     identical. The 24 open-`F` programs, plus one more, now keep the let's own TypeRef where a
