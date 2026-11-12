@@ -34,6 +34,6 @@ G's later bisect cleared the skip class: a type that spells no value union.
 - Refresh ×2: fixpoint.
 - Sweep with fixpoint seeds on both sides, master `f5fa3602` against the candidate: 24,202 same,
   0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
-- `scripts/gate.sh`: all 23 rows pass.
+- `scripts/gate.sh`: all 23 rows pass, on the branch and on the tree merged with master `b323f223`.
 - Render-parse: unchanged at 9 renders and 2 parses. No parse site moves: the spellings these
   calls handed over were never parsed here.
