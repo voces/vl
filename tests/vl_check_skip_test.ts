@@ -993,18 +993,18 @@ const CASES: Case[] = [
   },
   {
     // Main's refusal read `mk`'s site count, which lib's occurrences move.
-    // A list of lists, which the fresh-call copy does not convert: with the second site the
-    // delivery is refused, with one it builds `mk` at the destination.
+    // A list into a nullable list, which the fresh-call copy does not convert: with the second
+    // site the delivery is refused, with one it builds `mk` at the destination.
     name: "a lib call stops being a second site of a fresh builder",
     want: "decline",
     why: "fresh",
     from: "print(3)",
     to: "print(4)",
     libUses:
-      "export function mk() { { f: [[4]] } }\nexport function other(): void { const b = mk(); print(b.f[0][0] + 1) }\n",
+      "export function mk() { { f: [4] } }\nexport function other(): void { const b = mk(); print(b.f[0] + 1) }\n",
     uses:
-      'import { mk } from "./lib"\nlet v = { f: [[1.5]] }\nv = mk()\nprint(v.f[0][0])\n',
-    also: ["lib.vl", "const b = mk(); print(b.f[0][0] + 1)", "print(5)"],
+      'import { mk } from "./lib"\nconst go = [1].length > 0\nlet v = { f: if go { [1.5] } else { null } }\nv = mk()\nconst fv = v.f\nif fv != null { print(fv[0]) }\n',
+    also: ["lib.vl", "const b = mk(); print(b.f[0] + 1)", "print(5)"],
   },
   {
     name: "lib edits elsewhere while main keeps lib's builder",
@@ -1054,16 +1054,16 @@ const CASES: Case[] = [
   },
   {
     // A builder main's wider delivery keeps: lib's new own delivery is what main's refusal reads.
-    // A list of lists, which the fresh-call copy does not convert, keeps the builder.
+    // A list into a nullable list, which the fresh-call copy does not convert, keeps the builder.
     name: "lib hands on a kept builder main delivers to a wider record",
     want: "decline",
     why: "fresh",
     from: "function quiet",
     to:
-      "export function hand(): void { let w = { f: [[1]] }; w = mk(); print(w.f[0][0]) }\nfunction quiet",
-    libUses: "export function mk() { { f: [[4]] } }\n",
+      "export function hand(): void { let w = { f: [1] }; w = mk(); print(w.f[0]) }\nfunction quiet",
+    libUses: "export function mk() { { f: [4] } }\n",
     uses:
-      'import { mk } from "./lib"\nlet v = { f: [[1.5]] }\nv = mk()\nprint(v.f[0][0])\n',
+      'import { mk } from "./lib"\nconst go = [1].length > 0\nlet v = { f: if go { [1.5] } else { null } }\nv = mk()\nconst fv = v.f\nif fv != null { print(fv[0]) }\n',
   },
   {
     // Lib is in S only as mid's import, and a generic main calls from it closes over nothing moved.
