@@ -58,7 +58,9 @@ nullable elements, at two instances and from a return.
 
 ## Proof
 
-- Refresh ×2 is a fixpoint.
-- `regress.vl`, lint-self, cases and rep-fuzz pass, as do the budgets.
-- CI's sweep `diff` job is the mover list. The expected movers are 2 output movers (D12452 and
-  its fixture) and 16 bytes-only movers.
+- Refresh ×2 is a fixpoint at 6,706,227 bytes, 10,799 below master's 6,717,026.
+- Sweep against a fixpoint master seed, 24,107 programs: 0 `runs → not-runs`, 0 new traps,
+  2 output movers (D12452 and its fixture, both `emit_reject → runs`) and 16 bytes-only movers.
+- `regress.vl`, lint-self, cases, rep-fuzz, seed size, late demands and plumb cost pass.
+- The dead-export and render-parse budgets pass. Type-string parses in the emitter fall from 55
+  to 52.
