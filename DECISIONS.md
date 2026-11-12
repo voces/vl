@@ -11610,9 +11610,10 @@ uses read it at that storage. D14385's witness prints `true` and `false`.
 **The constraint.** The value must not be writable, between the delivery and a use, in a way
 that breaks the wider or the narrower type. This is the alias rule of D4084's ruling.
 
-**Status.** Backlogged in ROADMAP.md. D14385 and D14890 are its witnesses and wait on it. Until
-it is built, a separate change refuses the family at check with the kept-versus-own sentence,
-graded as clause 2.
+**Status.** Backlogged in ROADMAP.md; D14890 is its witness and waits on it. D14385 closed
+(2026-11-12) through the fresh-call copy instead: a call the function is called at more than once
+is copied where it lands, so the body stays at its own type for the other use, and the
+kept-versus-own refusal now fires only where no copy converts the delivery (D15892).
 
 ## A type variable's uses join over numeric widening (owner ruling, 2026-11-02) — D2459
 
