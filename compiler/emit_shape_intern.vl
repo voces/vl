@@ -454,56 +454,47 @@ function structElemArrayLowerable(ty: i32): boolean {
   if eTy < 0 { return false }
   let ln = tyToNominalName(eTy)
   if ln == "" { ln = shapeWalkKeyOf("", eTy) }
-  if nameIsShapeOpen(ln) { return funcTypeShapeLowerable(ln, eTy) }
+  if nameIsShapeOpen(ln) { return funcTypeShapeLowerable(eTy) }
   nameIsStructDecl(ln) && variantIndexOf(ln) < 0
 }
 
-// Whether inline shape `nm`, of recorded type `ty`, lowers as a closure result or param with
-// no unsupported composite field, recursing through nested inline shapes. A map, value-union,
-// distinct-backing-nullable-list, or closure field makes it un-lowerable, so the shape is
-// left un-interned and the closure stays a clean reject, never invalid wasm.
-export function funcTypeShapeLowerable(nm: string, ty: i32): boolean {
-  if !nameIsShapeSpanEnds(nm) { return false }
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
+// Whether record type `ty` lowers as a closure result or param with no unsupported composite
+// field, read off its fields' types. A map, value-union, distinct-backing-nullable-list or
+// closure field makes it un-lowerable, so the shape is left un-interned and the closure stays a
+// clean reject, never invalid wasm.
+export function funcTypeShapeLowerable(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = tyAt(ty)
+  if !(t is TyObj) { return false }
   let okAll = true
-  let fieldCount = 0
   let fi = 0
-  while fi < fnames.length {
-    if fnames[fi] == "" {
+  while fi < t.objFieldNames.length && fi < t.objFieldTypes.length {
+    const fTy = t.objFieldTypes[fi]
+    const fc = nameFieldCodeTy("", fTy)
+    if fc < 0 {
+      // The descriptor codes every closed record, so an uncoded field is one both it and
+      // the ladder decline.
+      emitFail(NESTED_FIELD_UNCODED)
       okAll = false
-    } else {
-      const ftxt = ftexts[fi]
-      const fTy = tyFieldTyOf(ty, fnames[fi])
-      const fc = nameFieldCodeTy(ftxt, fTy)
-      if fc < 0 {
-        // The descriptor codes every closed record, so an uncoded field is one both it and
-        // the ladder decline.
-        emitFail(NESTED_FIELD_UNCODED)
+    } else if !funcTypeFieldCodeSafe(fc) {
+      // A ref list of scalar leaves, lowerable records or closures, a map whose value kind the
+      // mv interner represents, a registered union box and a nullable closure are each the
+      // rep the field carries in any non-closure struct.
+      if (
+        !(fc == FC_REF_LIST
+          && (tyIsNestedScalarLeafArray(fTy)
+          || structElemArrayLowerable(fTy)
+          || tyIsFuncArena(tyStepElem(fTy))))
+        && !(fc == FC_MAP && fieldMapLowerable(fTy))
+        && !(fc == FC_UNION && isUNameKeyAB(67, "", fTy))
+        && fc != FC_NUL_CLOSURE
+      ) {
         okAll = false
-      } else if !funcTypeFieldCodeSafe(fc) {
-        // A code-5 field whose type is a nested scalar-leaf array or a lowerable
-        // struct-element array is a plain ref-list slot, lowerable. A code-19 map field
-        // whose value kind the mv interner represents is likewise a plain map-struct slot.
-        // A registered code-16 union box and a code-22 nullable closure are the same rep the field carries in any non-closure struct.
-        if (
-          !(fc == FC_REF_LIST
-            && (tyIsNestedScalarLeafArray(fTy)
-            || structElemArrayLowerable(fTy)
-            || tyIsFuncArena(tyStepElem(fTy))))
-          && !(fc == FC_MAP && fieldMapLowerable(fTy))
-          && !(fc == FC_UNION && isUNameKeyAB(67, ftxt, fTy))
-          && fc != FC_NUL_CLOSURE
-        ) {
-          okAll = false
-        }
       }
-      fieldCount = fieldCount + 1
     }
     fi = fi + 1
   }
-  okAll && fieldCount > 0
+  okAll && t.objFieldNames.length > 0
 }
 
 // The arm's render, spelled the way the arm's own row is coded (D1093): `tyToEmitName`
@@ -565,7 +556,7 @@ function internFuncTypeShapesTyGo(nm: string, ty: i32): i32 {
     }
     TyObj => {
       if nameIsShapeSpanEnds(ln) {
-        if funcTypeShapeLowerable(ln, ty) {
+        if funcTypeShapeLowerable(ty) {
           internShapeFieldElemsTy(ln, ty)
           internInlineShapeTy(ln, ty)
         } else {
@@ -1096,7 +1087,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       // shape arm above never runs and `ftxt` would stay the arm's name, unresolvable by
       // `structIndexByName`. Recorded as the cross-table twin's name instead.
       if fc == FC_STRUCT {
-        const armNm = armTwinRowName(nonNulBaseOf(ftxt))
+        const armNm = armTwinRowName(fldTy)
         if armNm != "" { ftxt = armNm }
       }
       // A field naming an arm with no row yet, inside an arm mint: an arm still being minted is
@@ -1105,7 +1096,11 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       if iasMintTopDepth() >= 0 {
         const xb = nonNulBaseOf(ftxt)
         const xv = variantIndexOf(xb)
-        if xv >= 0 && (fc < 0 || fc == FC_STRUCT) && armFieldStructRow(xb) < 0 {
+        if (
+          xv >= 0
+          && (fc < 0 || fc == FC_STRUCT)
+          && armFieldStructRow(fldTy) < 0
+        ) {
           const inFlight = iasMintNameOf(xv)
           if inFlight != "" {
             fc = FC_STRUCT
