@@ -60,11 +60,7 @@ import {
 import { fusedMapReadRecvIx } from "./check_leaf_steps"
 import { collectRetValues } from "./check_nj_join"
 import { assignable } from "./check_relate_core"
-import {
-  nodeLitUnionMemberTexts,
-  nodeTyIsNulLitUnion,
-  nodeTyIxOf,
-} from "./check_node_tys"
+import { nodeLitUnionMemberTexts, nodeTyIxOf } from "./check_node_tys"
 import { valueTailLeaves } from "./check_num_adopt"
 import { numCastCanFail } from "./check_num_lits"
 import { recAdLanding } from "./check_ty_relate"
@@ -90,16 +86,11 @@ import {
   tySame,
 } from "./check_types"
 import { structIndexOfTy } from "./emit_atom_kinds"
-import { nameIsBareMap, placeNarrowKeyOf, unwrapParen } from "./emit_base"
+import { placeNarrowKeyOf, unwrapParen } from "./emit_base"
 import { emitFailAt } from "./emit_bytes"
 import { nodeRepTyAt, nodeTyAt } from "./emit_capture_frames"
 import {
   arrLitFrameRefTy,
-  arrLitIsRef,
-  arrLitIsStr,
-  arrLitNestedNumKind,
-  arrLitObjElemBoxVariant,
-  arrLitUnionElemName,
   arrNewRepKind,
   asgReadUnwidenOp,
   callResultAtomTyAt,
@@ -174,9 +165,16 @@ import {
   lfResolveAt,
   nestedFnOnChain,
 } from "./emit_local_scope"
-import { arrLitCommitNameAt, tyRefArrElemOf } from "./emit_map_value_slots"
+import { tyRefArrElemOf } from "./emit_map_value_slots"
 import { repSlotOfKind } from "./emit_rep_slot"
-import { elabArmFeOf, isStorageRead, readNarrowedStoreAt } from "./emit_elab"
+import {
+  elabArmFeOf,
+  elabNodeInstTys,
+  elabSpreadRunHolderOf,
+  isStorageRead,
+  litRepTyOneClosed,
+  readNarrowedStoreAt,
+} from "./emit_elab"
 import { variantRowInRowOfTy } from "./emit_mv_slots"
 import {
   isNulScalarListKind,
@@ -193,21 +191,10 @@ import { paramIndexOf, paramTypeNodeOfRead } from "./emit_query"
 import { tyIsRecordUnion } from "./emit_ref_list_kinds"
 import { repShadowOn, rlElemKindAt } from "./emit_rep"
 import {
-  ALK_F64,
-  ALK_I64,
-  arrElemIsClosureTy,
   arrLitBoxElemName,
-  arrLitLeadInner,
   arrLitLeadIsList,
-  arrLitMapElemName,
-  arrLitNestedElemKind,
-  arrLitNestedElemName,
-  arrLitNominalElemName,
-  arrLitNulRefElemKind,
-  arrLitNulRefElemName,
   arrLitNulUnionElemName,
   arrLitObjBesideNonRecord,
-  emptyArrLitIxOf,
   refListElemKindOfTy,
   rlElemInnerSlot,
   rlSlotOfTyOrTwin,
@@ -227,12 +214,7 @@ import {
   LBK_U8_LIST,
   LBK_UNION,
   RLK_CLOSURE,
-  RLK_F64_LIST,
-  RLK_I32_LIST,
-  RLK_I64_LIST,
-  RLK_MAP,
   RLK_STRUCT,
-  RLK_STR_LIST,
   RLK_UNION,
   VKind,
   emitRootIx,
@@ -248,7 +230,6 @@ import {
   rlElemTyIx,
   sTyIx,
   scopeSlotOf,
-  uDeclared,
   uFieldCount,
   uVarTyIx,
   unVarCount,
@@ -283,6 +264,7 @@ import {
   nonNulTyOf,
   primNameOf,
   tyHasTyVar,
+  tyPeelNul,
   tyStepElem,
 } from "./tyquery"
 
@@ -763,93 +745,38 @@ function arrLitTyRefNonUnion(arrIx: i32): boolean {
 }
 
 // The ref-element kind of the array literal at `arrIx` in function `fnIx` (-1: no frame),
-// assuming `arrLitIsRef`: 2 when the first element is a union variant, else 1, so a `Tok[]`
-// literal is kind 1 even beside a declared union. A literal whose type in the frame is a ref
-// list the literal itself does not show is that type's kind.
+// assuming `arrLitIsRef`: its type in the frame's kind, else its recorded type's (for an
+// emitter-made run, its holder's), else its closed instance type's. A type none of them
+// closes is an emit failure.
 export function arrLitElemKind(arrIx: i32, fnIx: i32): i32 {
   const ft = arrLitFrameRefTy(arrIx, fnIx)
   if ft >= 0 { return refListElemKindOfTy(tyArrayElemIx(ft)) }
-  arrLitElemKindTpl(arrIx)
+  let lt = nodeTyIxOf(arrIx)
+  const rh = if lt < 0 { elabSpreadRunHolderOf(arrIx) } else { -1 }
+  if rh >= 0 { lt = nodeTyIxOf(rh) }
+  const re = tyArrayElemIx(tyPeelNul(lt))
+  const rk = if re >= 0 { refListElemKindOfTy(re) } else { -1 }
+  if rk >= 0 { return rk }
+  const ik = arrLitInstElemKind(arrIx)
+  if ik >= 0 { return ik }
+  emitFailAt(ARR_LIT_NO_ELEM_KIND_MSG, arrIx)
+  RLK_STRUCT
 }
 
-// `arrLitElemKind` read off the literal's own recorded type, the answer every frame shares.
-function arrLitElemKindTpl(arrIx: i32): i32 {
-  const a = nodeAt(arrIx)
-  if a is ArrayLit {
-    // A closure-element literal is kind 5, asked of the element itself, so a struct, map, or
-    // union element that merely contains a closure keeps its own kind and wrapper.
-    if arrElemIsClosureTy(arrIx) { return RLK_CLOSURE }
-    if a.arrElems.length >= 1 {
-      const e0 = nodeAt(a.arrElems[0])
-      // A nested-list element: the inner literal's leaf picks the element kind (string 6,
-      // f64 7, i64 8, else the i32-list wrapper 4). Mirrors `arrLitElemName`'s leaf keying.
-      if e0 is ArrayLit {
-        // Inner lists the checker joined to a union of lists box, whatever the lead inner's
-        // leaf: keying that leaf builds the outer backing for one arm only (D4894).
-        if arrLitUnionElemName(arrIx) != "" { return RLK_UNION }
-        // A ref inner literal is kind 9, and only the arena can say so: the three leaf
-        // probes below all decline an object/nested-list inner, and the arm would fall to 4,
-        // keying the i32-list wrapper over a backing holding a `(ref $rlWrap)` (D702). Must
-        // agree arm for arm with `arrLitElemName`'s rung of the same shape.
-        const e0x = arrLitLeadInner(a)
-        if arrLitIsRef(e0x, -1) || emptyArrLitIxOf(e0x) >= 0 {
-          if arrLitNestedElemName(arrIx) != "" {
-            return arrLitNestedElemKind(arrIx)
-          }
-        }
-        if arrLitIsStr(e0x, -1) { return RLK_STR_LIST }
-        const nk = arrLitNestedNumKind(a, e0x, -1)
-        if nk == ALK_F64 { return RLK_F64_LIST }
-        if nk == ALK_I64 { return RLK_I64_LIST }
-        return RLK_I32_LIST
-      }
-      if e0 is ObjLit {
-        // A union-variant element boxes into the union (kind 2); a plain struct is kind 1.
-        // Must agree arm for arm with `arrLitElemName`'s object arm, one shared predicate.
-        if arrLitObjElemBoxVariant(arrIx) != "" { return RLK_UNION }
-        // A later `null` names the nullable row ahead of the struct, as `arrLitElemName`'s
-        // object arm does: the niche of one record, or the box of a wider union (D4720).
-        if arrLitNulRefElemName(arrIx) != "" {
-          return arrLitNulRefElemKind(arrIx)
-        }
-        return RLK_STRUCT
-      }
-    }
-    // The checker-typed union element (`arrLitIsRef`'s last rung) boxes: kind 2. Stated
-    // explicitly, ahead of the `uDeclared` fall-through below, because the three classifiers
-    // must agree arm for arm and this answer follows from this literal's own element type.
-    if arrLitUnionElemName(arrIx) != "" { return RLK_UNION }
-    // Must agree arm for arm with `arrLitElemName`'s committed-rep rung (D163): a map
-    // spelling is kind 3, the same `refArrElemKind` gives the annotated `{[K]: V}[]`, and a
-    // bare union arm is kind 1, the unboxed variant-struct element. `scanArrLitCommit`'s
-    // gate holds nothing else, so there is no third case.
-    const acnK = arrLitCommitNameAt(arrIx)
-    if acnK != "" {
-      if nameIsBareMap(acnK) { return RLK_MAP }
-      return RLK_STRUCT
-    }
-    // The checker-typed map element: kind 3, the same `refArrElemKind` gives the annotated
-    // `{[K]: V}[]` spelling. Checked before the `uDeclared` fall-through, which would
-    // otherwise claim a map literal as a union box in any program declaring a union.
-    if arrLitMapElemName(arrIx) != "" { return RLK_MAP }
-    // The checker-typed object-shaped element: a direct struct element, kind 1 — the same
-    // kind `refArrElemKind` gives the annotated `Circle[]` spelling. Checked before the
-    // `uDeclared` fall-through, which would otherwise box an arm-element literal into the
-    // union in any program declaring one, a rep a reader that unboxes cannot meet (D36).
-    if arrLitNominalElemName(arrIx) != "" { return RLK_STRUCT }
-    // The checker-typed list element: the nested kinds 4/6/7/8, keyed on the inner array's
-    // leaf from the arena rather than a first element this literal lacks in literal form.
-    // Checked before the `uDeclared` fall-through, which would otherwise box a list-element
-    // literal into the union in any program declaring one — same placement as the rungs above.
-    if arrLitNestedElemName(arrIx) != "" { return arrLitNestedElemKind(arrIx) }
-    // D1270 — the checker-typed nullable-container element: the niche kinds, keyed off the
-    // arena render through the same authority the annotated `(i32[] | null)[]` spelling
-    // resolves by. Checked before the `uDeclared` fall-through, same placement as the rungs
-    // above, for the same reason.
-    if arrLitNulRefElemName(arrIx) != "" { return arrLitNulRefElemKind(arrIx) }
+const ARR_LIT_NO_ELEM_KIND_MSG = "a list literal's element type gives its list no element rep"
+
+// The element kind of a list literal whose recorded type is still open: its one closed stamp's,
+// else the kind every instance type agrees on; -1 where none closes or two disagree.
+function arrLitInstElemKind(arrIx: i32): i32 {
+  const c = litRepTyOneClosed(arrIx)
+  if c >= 0 { return refListElemKindOfTy(tyArrayElemIx(tyPeelNul(c))) }
+  let k = -1
+  for t in elabNodeInstTys(arrIx) {
+    const tk = if t >= 0 { refListElemKindOfTy(tyArrayElemIx(tyPeelNul(t))) } else { -1 }
+    if tk < 0 || (k >= 0 && tk != k) { return -1 }
+    k = tk
   }
-  if uDeclared { return RLK_UNION }
-  RLK_STRUCT
+  k
 }
 
 // The member texts to spell atom-repped node `ix` with — one home for the ladder the two
@@ -1113,17 +1040,9 @@ export function nulNicheRecoverOwed(dk: VKind | null, exprIx: i32, fnIx: i32) {
 }
 
 // The key of a read at `exprIx` narrowed to exactly `K | null`, `K` a literal-union alias, out of
-// a box that holds `K` as its string arm, or "". An atom-niche destination converts such a read
-// with `emitNarrowedNicheRead` (D3118); the read itself stays the box its other consumers expect.
-export function narrowedNulLitBoxKey(exprIx: i32, fnIx: i32): string {
-  const ix = unwrapParen(exprIx)
-  if ix < 0 { return "" }
-  if !nodeTyIsNulLitUnion(ix) { return "" }
-  narrowedNulLitBoxKeyAt(ix, fnIx)
-}
-
-// `narrowedNulLitBoxKey` for a consumer that converts the read where it stands, typed at its
-// instance (`instanceReadTyOf`): a binding's cell is classified at the recorded type (D8122).
+// a box holding `K` as its string arm, typed at its instance (`instanceReadTyOf`), or "". For a
+// consumer that converts the read where it stands; a binding's cell is classified at the recorded
+// type (D8122).
 export function narrowedNulLitPinBoxKey(exprIx: i32, fnIx: i32): string {
   const ix = unwrapParen(exprIx)
   if ix < 0 { return "" }

@@ -1,4 +1,5 @@
 import { elabNodeInstTys } from "./emit_elab"
+import { unRowOfTyKey } from "./emit_union_tykey_text"
 
 // `emit_obj_lit_fits.vl` — whether an object literal or field fits a row, and the
 // leaf an arm path reaches.
@@ -91,7 +92,7 @@ import { repSlotOfKind } from "./emit_rep_slot"
 import { declVariantRowAt, variantIndexOf } from "./emit_local_slots"
 import { vtKindOfType } from "./emit_nullable_rets"
 import { paramPosOfRead, paramTypeNodeOfRead } from "./emit_query"
-import { nodeMapValTyIx, nullValKind, unRowOfKey } from "./emit_rep"
+import { nodeMapValTyIx, nullValKind } from "./emit_rep"
 import { mapTwinSame } from "./emit_map_twins"
 import {
   emptyArrLitIxOf,
@@ -152,9 +153,7 @@ import {
   valueUnionNameOfSoftTy,
 } from "./emit_union_atoms"
 import { unionRowKeyAB } from "./emit_union_registry"
-import { variantSig } from "./emit_variant_sig"
 import { strListHas } from "./listutil"
-import { sidArrGet, sidArrPut, sidLookup, sidOf } from "./symbols"
 import {
   litSetBaseTy,
   nonNullTy,
@@ -429,54 +428,6 @@ export function fieldNamesSig(names: string[]) {
   out
 }
 
-// The variant buckets by signature: `ovnHeadBySid` holds the first variant row at each
-// signature's interned id, `ovnTailBySid` the last, `ovnNext` the next row sharing it, all in
-// ascending row order. Rebuilt when the variant table or either span column moves.
-let ovnHeadBySid: i32[] = []
-let ovnTailBySid: i32[] = []
-let ovnNext: i32[] = []
-let ovnVarsLen = -1
-let ovnStartLen = -1
-let ovnCountLen = -1
-
-// Drops the buckets. `collectU` rebuilds the variant table from empty and a second module can
-// refill it to the same three lengths with different names, which the stamp cannot see; the
-// signature ids are sid-keyed too, and a sid means nothing in the next program.
-export function objVariantIndexDrop() {
-  ovnHeadBySid = []
-  ovnTailBySid = []
-  ovnNext = []
-  ovnVarsLen = -1
-  ovnStartLen = -1
-  ovnCountLen = -1
-  0
-}
-
-// Fills the buckets from the variant table. Every row is appended to its signature's chain,
-// so a chain lists its rows in the order the scan this replaces visited them.
-function ovnBuild() {
-  ovnHeadBySid = []
-  ovnTailBySid = []
-  ovnNext = []
-  ovnVarsLen = uVariants.length
-  ovnStartLen = uFieldStart.length
-  ovnCountLen = uFieldCount.length
-  let vi = 0
-  while vi < uVariants.length {
-    ovnNext.push(-1)
-    if vi < uFieldStart.length && vi < uFieldCount.length {
-      const s = sidOf(variantSig(vi))
-      // The tail is kept beside the head so an append is a write, not a walk: a program whose
-      // variants all share one signature would otherwise make this build quadratic in them.
-      const tail = sidArrGet(ovnTailBySid, s)
-      if tail < 0 { sidArrPut(ovnHeadBySid, s, vi) } else { ovnNext[tail] = vi }
-      sidArrPut(ovnTailBySid, s, vi)
-    }
-    vi = vi + 1
-  }
-  0
-}
-
 // Whether variant `vi` stores field `name` of the object literal at `objIx` at the scalar kind
 // the checker gave it, by `declRowFieldKindFits`'s rule: an `i32` field is no `string` slot,
 // whatever names the two share (D3024). Refutation only: an unknown kind on either side agrees.
@@ -571,26 +522,6 @@ function fieldKindClass(k: i32): i32 {
   if b == 2 { return 2 }
   if b == 6 || b == 7 { return 3 }
   0
-}
-
-// The first variant row whose signature is `sig`, or -1. Rebuilds first when the stamp
-// disagrees, so a caller can never read a chain the current variant table did not produce.
-export function ovnFirst(sig: string) {
-  if (
-    ovnVarsLen != uVariants.length
-    || ovnStartLen != uFieldStart.length
-    || ovnCountLen != uFieldCount.length
-  ) {
-    ovnBuild()
-  }
-  sidArrGet(ovnHeadBySid, sidLookup(sig))
-}
-
-// The next variant row sharing `vi`'s signature, or -1. Only reached through `ovnFirst`,
-// which is what makes the chain current.
-export function ovnNextOf(vi: i32) {
-  if vi < 0 || vi >= ovnNext.length { return -1 }
-  ovnNext[vi]
 }
 
 // True if the plain struct at table index `ssi` has the same field layout (name set, count,
@@ -985,7 +916,7 @@ export function isTestedRowOf(isIx: i32, ty: i32, recvIx: i32): i32 {
   if own >= 0 { return own }
   if recvIx >= 0 {
     const ut = unionTyOfRecv(nodeTyInOf(unwrapParen(recvIx), emitCurFnIx))
-    const u = if ut >= 0 { unRowOfKey(ut) } else { -1 }
+    const u = if ut >= 0 { unRowOfTyKey(ut) } else { -1 }
     if u >= 0 && u < unVarStart.length && u < unVarCount.length {
       const lo = unVarStart[u]
       const hi = lo + unVarCount[u]
@@ -1028,24 +959,6 @@ function isTestedRowHolds(r: i32, ty: i32, how: i32): boolean {
     return armRowIsMember(r, ty) || tySameSet(rt, ty, TY_WALK_DEPTH)
   }
   tySame(rt, ty) || mapTwinSame(rt, ty)
-}
-
-// The name every variant row storing record `ty` shares, or "" when none does or two differ.
-// A row storing it has its field names, so only that signature's chain is walked.
-export function armRowNameOfRecord(ty: i32): string {
-  if ty < 0 || ty >= T.tys.length { return "" }
-  const rt = tyAt(ty)
-  if !(rt is TyObj) { return "" }
-  let nm = ""
-  let r = ovnFirst(fieldNamesSig(rt.objFieldNames))
-  while r >= 0 && r < uVariants.length {
-    if armRowIsMember(r, ty) {
-      if nm != "" && uVariants[r] != nm { return "" }
-      nm = uVariants[r]
-    }
-    r = ovnNextOf(r)
-  }
-  nm
 }
 
 // Whether row `vi` holds more than one member of the receiver `recvIx`'s union, so its tag
@@ -1428,27 +1341,13 @@ export function fnRetNulRefArrayNameSid(
   rlElemName[sl]
 }
 
-// The ref-list ELEMENT type-NAME of the local the `Ident` at `ix` reads (recorded in
-// `localStructIdx` as its table SLOT for code-5 locals), or "".
-// The ref-list row slot the local read at `ix` is declared at, or -1 (`declaredRefArrayName`).
+// The ref-list row slot the local read at `ix` is declared at (recorded in `localStructIdx` for a
+// code-5 local), or -1.
 export function declaredRefArraySlot(ix: i32): i32 {
   const i = declaredSlotOf(ix)
   if i < 0 || localIsRef[i] != "reflist" { return -1 }
   const slot = localStructIdx[i]
   if slot >= 0 && slot < rlElemName.length { slot } else { -1 }
-}
-
-export function declaredRefArrayName(ix: i32) {
-  const i = declaredSlotOf(ix)
-  if i >= 0 {
-    if localIsRef[i] == "reflist" {
-      const slot = localStructIdx[i]
-      if slot >= 0 {
-        if slot < rlElemName.length { return rlElemName[slot] }
-      }
-    }
-  }
-  ""
 }
 
 // The ref-list row keyed by the element type recorded on the empty `[]` at `exprIx`, or -1.

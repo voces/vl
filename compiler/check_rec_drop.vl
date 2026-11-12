@@ -1,0 +1,171 @@
+// The drop adoption: a fresh record binding delivered at a narrower record, or at the one union
+// arm it fits, is built there when nothing else reads a dropped field of it (D15093). Asked from
+// the delivery seam and from the pass end; it decides from the checker's write scan alone.
+import { Ident, LetDecl, Member, ObjLit, P, i32ToStr, nodeAt } from "./ast"
+import { nodeLineOf } from "./check_capture_loss"
+import { tErr } from "./check_relate_core"
+import { parenPeelIx } from "./check_places"
+import { recFreshDeclOf } from "./check_rec_fresh"
+import { recAdOpen, recAdPushDrop } from "./check_rec_rows"
+import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  objFieldType,
+  tyAt,
+  tyToStr,
+} from "./check_types"
+import {
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  CW_UP_CALLEE,
+  CW_UP_OBJ,
+  cwIxBuild,
+  cwIxCovers,
+  cwIxKind,
+  cwIxNode,
+  cwIxUp,
+  cwIxUpKind,
+  cwOccNext,
+  cwOccWalk,
+  cwPeelValue,
+} from "./check_write_scan"
+import { nonNulTyOf } from "./tyquery"
+
+// Builds a fresh record binding delivered at a record that drops some of its fields, or at the one
+// union arm it fits so, at that record: a fresh record built at its delivery point (D15093). Where
+// another use of the binding needs its own layout it is refused by that contract instead. True when
+// it settled the delivery either way; false leaves it to the caller's refusal.
+export function recDropAdopt(
+  src: i32,
+  srcTy: i32,
+  dstTy: i32,
+  at: i32,
+): boolean {
+  const p = cwPeelValue(src)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return false }
+  const decl = recFreshDeclOf(p)
+  const dn = if decl >= 0 { nodeAt(decl) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
+  if !(nodeAt(parenPeelIx(dn.letInit)) is ObjLit) { return false }
+  const own = nonNulTyOf(srcTy)
+  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return false }
+  const dst = recDropLanding(own, nonNulTyOf(dstTy))
+  if dst < 0 { return false }
+  const why = recDropUseBlocks(decl, p, own, dst)
+  if why != "" {
+    tErr(
+      "`"
+        + dn.letName
+        + "` is a record built where it is declared and "
+        + why
+        + ", so it cannot also be built as "
+        + tyToStr(dst)
+        + " here: a record is shared, not copied. Copy it here with an object literal of "
+        + tyToStr(dst)
+        + "'s fields",
+      at,
+    )
+    return true
+  }
+  recAdPushDrop(decl, own, dst, at)
+  true
+}
+
+// The record `d` delivers record `own` as when it drops some of `own`'s fields: `d` itself, or
+// the one member of a union `d` that does; -1 when none does, or two do.
+function recDropLanding(own: i32, d: i32): i32 {
+  if d < 0 || d >= T.tys.length { return -1 }
+  const dt = tyAt(d)
+  match dt {
+    TyObj => {
+      return if recDropFits(own, d) { d } else { -1 }
+    }
+    TyUnion => {
+      let hit = -1
+      for m in dt.uMembers {
+        const mm = nonNulTyOf(m)
+        if (
+          mm >= 0
+          && mm < T.tys.length
+          && tyAt(mm) is TyObj
+          && recDropFits(own, mm)
+        ) {
+          if hit >= 0 { return -1 }
+          hit = mm
+        }
+      }
+      return hit
+    }
+    // No other destination is a record a field can be dropped into.
+    TyPrim | TyErr | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      return -1
+    }
+  }
+}
+
+// Whether record `d` declares some but not all of record `own`'s fields. The seams ask it only of
+// a pair `assignable` already accepts, so each kept field holds its field.
+function recDropFits(own: i32, d: i32): boolean {
+  const o = tyAt(own)
+  const dd = tyAt(d)
+  if !(o is TyObj) || !(dd is TyObj) { return false }
+  if recAdOpen(own) || recAdOpen(d) { return false }
+  if dd.objFieldNames.length >= o.objFieldNames.length { return false }
+  let i = 0
+  while i < dd.objFieldNames.length {
+    const of = objFieldType(o, dd.objFieldNames[i])
+    if of < 0 { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Why a use of binding `decl` other than the delivery `p` needs `own`'s layout and not `dst`'s, as
+// a clause of the refusal; "" when every such use reads a field `dst` stores as `own` does.
+function recDropUseBlocks(decl: i32, p: i32, own: i32, dst: i32): string {
+  cwIxBuild()
+  const o = tyAt(own)
+  const d = tyAt(dst)
+  if !(o is TyObj) || !(d is TyObj) { return "is used apart from its fields" }
+  const ow = cwOccWalk(decl)
+  while cwOccNext(ow) {
+    const n = cwIxNode[ow.row]
+    const k = cwIxKind[ow.row]
+    if k != CW_OCC_USE && k != CW_OCC_BIND { return "is written or called" }
+    if k == CW_OCC_USE && n != p {
+      const u = if cwIxCovers(n) && cwIxUpKind[n] == CW_UP_OBJ { cwIxUp[n] } else { -1 }
+      const m = if u >= 0 { nodeAt(u) } else { null }
+      if !(m is Member) || (cwIxCovers(u) && cwIxUpKind[u] == CW_UP_CALLEE) {
+        return "is handed on at its own type on line " + i32ToStr(nodeLineOf(n))
+      }
+      const df = objFieldType(d, m.memProp)
+      const of = objFieldType(o, m.memProp)
+      if df < 0 {
+        return "is read for `"
+          + m.memProp
+          + "` on line "
+          + i32ToStr(nodeLineOf(n))
+      }
+      if of < 0 || !fieldStorageEq(of, df, REC_STORE_DEPTH) {
+        return "is read for `"
+          + m.memProp
+          + "`, which "
+          + tyToStr(dst)
+          + " stores differently, on line "
+          + i32ToStr(nodeLineOf(n))
+      }
+    }
+  }
+  ""
+}

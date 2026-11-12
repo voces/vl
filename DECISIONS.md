@@ -11233,6 +11233,16 @@ destination, the pinning argument's declared type or the written type argument (
 the monomorphizer and the literal's elaboration read it (`recCopyTyOf`) rather than the call's build,
 so the instance is the pin's and a literal holding the call is built at the destination.
 
+**Extended 2026-11-11 (D15093, owner ruling): a fresh binding that drops a field is built at its
+delivery point.** An un-annotated binding whose initialiser is a record literal, delivered into a
+record that declares only some of its fields, or into the one union arm it fits so, is built at
+that record (`recDropAdopt`), and each dropped field's initialiser still runs for its effect
+(D1696). It holds only where no use of the binding reads a dropped field or a field the record
+stores differently, and no other use delivers it at its own type; the checker decides this from
+its write scan, and a use it cannot classify disqualifies. A binding that fails is refused by the
+contract (a record is shared, not copied, D14532), naming the use. A binding nested in another
+literal or held in a list element is not lifted (D15823).
+
 ## A variant is a position in a union row, and union rows are keyed by member reps (ruling, D14551)
 
 Under structural records (D3870) a plain `{r: i32}` and a union's arm of the same shape are one
