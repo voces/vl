@@ -1,7 +1,7 @@
 # Step 7 inst: a list of bound lists of hole-function records gets its row, 2026-11-12
 
-Lane w321, D15358, D15356 and D15159. They are three of the containers-of-un-annotated-function rows that
-refuse with `ref valtype with no interned shape`.
+Lane w321, D15358, D15356 and D15159. They are three of the containers-of-un-annotated-function
+rows that refuse with `ref valtype with no interned shape`.
 
 Take `const inner = [{ f: id1 }]` then `const xs = [inner]`, with `id1` un-annotated and called
 at two types. `inner` is stored at a row the intern pass minted from its literal (`#anon0`). That
@@ -76,4 +76,15 @@ prelude's `inner` keeps its hole.
 
 ## Proof
 
-SWEEP
+**Full local sweep.** Fixpoint seeds, base master `426f9f27`, 23,945 programs:
+
+| | count |
+| --- | --- |
+| same | 23,941 |
+| bytes-only | 0 |
+| output movers | 4 |
+| runs → not-runs | 0 |
+| new compiler traps | 0 |
+
+Three movers go from refusal to runs: D15159, D15356 and D15358. D15357 changes message. The
+first cut's sweep had the one D14782 trap described above.
