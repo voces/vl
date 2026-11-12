@@ -1,7 +1,50 @@
 // The drop adoption: a fresh record binding delivered at a narrower record, or at the one union
 // arm it fits, is built there when nothing else reads a dropped field of it (D15093). Asked from
 // the delivery seam and from the pass end; it decides from the checker's write scan alone.
-import { Ident, LetDecl, Member, ObjLit, P, i32ToStr, nodeAt } from "./ast"
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  LoopVar,
+  MatchExpr,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+  i32ToStr,
+  nodeAt,
+} from "./ast"
 import { nodeLineOf } from "./check_capture_loss"
 import { tErr } from "./check_relate_core"
 import { parenPeelIx } from "./check_places"
@@ -43,28 +86,125 @@ import {
 import { nonNulTyOf } from "./tyquery"
 
 // Builds a fresh record binding delivered at a record that drops some of its fields, or at the one
-// union arm it fits so, at that record: a fresh record built at its delivery point (D15093). Where
-// another use of the binding needs its own layout it is refused by that contract instead. True when
-// it settled the delivery either way; false leaves it to the caller's refusal.
+// union arm it fits so, at that record: a fresh record built at its delivery point (D15093). A fresh
+// list or record literal holding such bindings delivers each at its own element or field. True when
+// it settled the delivery, a use needing the binding's own layout refused by that contract.
 export function recDropAdopt(
   src: i32,
   srcTy: i32,
   dstTy: i32,
   at: i32,
 ): boolean {
+  if !recDropPlans(src, srcTy, dstTy, REC_STORE_DEPTH) { return false }
+  recDropApply(src, srcTy, dstTy, at, REC_STORE_DEPTH)
+  true
+}
+
+// Whether `src` is a fresh binding `recDropLeafDst` lands, or a fresh literal whose every member
+// not stored as its destination stores it is one, and at least one member is.
+function recDropPlans(src: i32, srcTy: i32, dstTy: i32, depth: i32) {
+  if depth <= 0 { return false }
   const p = cwPeelValue(src)
-  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return false }
+  if p < 0 || p >= P.nodes.length { return false }
+  if recDropLeafDst(p, srcTy, dstTy) >= 0 { return true }
+  let any = false
+  const n = recDropKids(p, srcTy, dstTy)
+  let i = 0
+  while i < n.kids.length {
+    if !recDropPlans(n.kids[i], n.kidSrc[i], n.kidDst[i], depth - 1) {
+      return false
+    }
+    any = true
+    i = i + 1
+  }
+  any && n.ok
+}
+
+function recDropApply(src: i32, srcTy: i32, dstTy: i32, at: i32, depth: i32) {
+  const p = cwPeelValue(src)
+  if recDropLeafDst(p, srcTy, dstTy) >= 0 {
+    return recDropLeaf(p, srcTy, dstTy, at)
+  }
+  const n = recDropKids(p, srcTy, dstTy)
+  let i = 0
+  while i < n.kids.length {
+    recDropApply(n.kids[i], n.kidSrc[i], n.kidDst[i], at, depth - 1)
+    i = i + 1
+  }
+  0
+}
+
+// The members of fresh literal `p` not stored as their destination stores them, beside the type
+// each is and is delivered at; `ok` false when `p` is no such literal or a member has no place.
+type RecDropKids = { ok: boolean, kids: i32[], kidSrc: i32[], kidDst: i32[] }
+
+function recDropKids(p: i32, srcTy: i32, dstTy: i32): RecDropKids {
+  const out: RecDropKids = { ok: false, kids: [], kidSrc: [], kidDst: [] }
+  const s = nonNulTyOf(srcTy)
+  const d = nonNulTyOf(dstTy)
+  if s < 0 || d < 0 || s >= T.tys.length || d >= T.tys.length { return out }
+  const e = nodeAt(p)
+  const st = tyAt(s)
+  const dt = tyAt(d)
+  match e {
+    ArrayLit => {
+      if !(st is TyArray) || !(dt is TyArray) { return out }
+      for x in e.arrElems {
+        if nodeAt(x) is Spread { return out }
+        if !fieldStorageEq(st.aElem, dt.aElem, REC_STORE_DEPTH) {
+          out.kids.push(x)
+          out.kidSrc.push(st.aElem)
+          out.kidDst.push(dt.aElem)
+        }
+      }
+      out.ok = true
+    }
+    ObjLit => {
+      if !(st is TyObj) || !(dt is TyObj) { return out }
+      if e.objFields.length != dt.objFieldNames.length { return out }
+      for fx in e.objFields {
+        const f = nodeAt(fx)
+        if !(f is FieldInit) { return out }
+        const of = objFieldType(st, f.fiName)
+        const df = objFieldType(dt, f.fiName)
+        if of < 0 || df < 0 { return out }
+        if !fieldStorageEq(of, df, REC_STORE_DEPTH) {
+          out.kids.push(f.fiValue)
+          out.kidSrc.push(of)
+          out.kidDst.push(df)
+        }
+      }
+      out.ok = true
+    }
+    // Only a list or record literal is built at its destination from its members.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
+  }
+  out
+}
+
+// The record fresh binding read `p` is built at when delivered as `dstTy`; -1 when it is no
+// un-annotated binding of a record literal, or no record or single union arm drops its fields.
+function recDropLeafDst(p: i32, srcTy: i32, dstTy: i32) {
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return -1 }
   const decl = recFreshDeclOf(p)
   const dn = if decl >= 0 { nodeAt(decl) } else { null }
-  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
-  if !(nodeAt(parenPeelIx(dn.letInit)) is ObjLit) { return false }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  if !(nodeAt(parenPeelIx(dn.letInit)) is ObjLit) { return -1 }
   const own = nonNulTyOf(srcTy)
-  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return false }
-  const dst = recDropLanding(own, nonNulTyOf(dstTy))
-  if dst < 0 { return false }
+  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return -1 }
+  recDropLanding(own, nonNulTyOf(dstTy))
+}
+
+function recDropLeaf(p: i32, srcTy: i32, dstTy: i32, at: i32) {
+  const decl = recFreshDeclOf(p)
+  if decl < 0 || decl >= P.nodes.length { return 0 }
+  const dn = nodeAt(decl)
+  if !(dn is LetDecl) { return 0 }
+  const own = nonNulTyOf(srcTy)
+  const dst = recDropLeafDst(p, srcTy, dstTy)
   const why = recDropUseBlocks(decl, p, own, dst)
   if why != "" {
-    tErr(
+    return tErr(
       "`"
         + dn.letName
         + "` is a record built where it is declared and "
@@ -76,20 +216,22 @@ export function recDropAdopt(
         + "'s fields",
       at,
     )
-    return true
   }
   recAdPushDrop(decl, own, dst, at)
-  true
 }
 
 // The record `d` delivers record `own` as when it drops some of `own`'s fields: `d` itself, or
 // the one member of a union `d` that does; -1 when none does, or two do.
 function recDropLanding(own: i32, d: i32): i32 {
+  recDropLandingAt(own, d, REC_STORE_DEPTH)
+}
+
+function recDropLandingAt(own: i32, d: i32, depth: i32) {
   if d < 0 || d >= T.tys.length { return -1 }
   const dt = tyAt(d)
   match dt {
     TyObj => {
-      return if recDropFits(own, d) { d } else { -1 }
+      return if recDropFitsAt(own, d, depth) { d } else { -1 }
     }
     TyUnion => {
       let hit = -1
@@ -114,23 +256,36 @@ function recDropLanding(own: i32, d: i32): i32 {
   }
 }
 
-// Whether record `d` declares some but not all of record `own`'s fields. The seams ask it only of
-// a pair `assignable` already accepts, so each kept field holds its field.
-function recDropFits(own: i32, d: i32): boolean {
+// Whether record `d` keeps a subset of record `own`'s fields and drops at least one, here or in a
+// record field that lands, as `recDropLanding` lands, on a record or the one union arm that drops
+// some of its fields (D3566). The seams ask it only of a pair `assignable` accepts.
+export function recDropFits(own: i32, d: i32): boolean {
+  recDropFitsAt(own, d, REC_STORE_DEPTH)
+}
+
+function recDropFitsAt(own: i32, d: i32, depth: i32) {
+  if depth <= 0 { return false }
   const o = tyAt(own)
   const dd = tyAt(d)
   if !(o is TyObj) || !(dd is TyObj) { return false }
   if recAdOpen(own) || recAdOpen(d) { return false }
-  if dd.objFieldNames.length >= o.objFieldNames.length { return false }
+  if dd.objFieldNames.length > o.objFieldNames.length { return false }
+  let drops = dd.objFieldNames.length < o.objFieldNames.length
   let i = 0
   while i < dd.objFieldNames.length {
     const of = objFieldType(o, dd.objFieldNames[i])
     if of < 0 { return false }
+    const df = dd.objFieldTypes[i]
+    if !fieldStorageEq(of, df, REC_STORE_DEPTH) {
+      const on = nonNulTyOf(of)
+      if on >= 0 && on < T.tys.length && tyAt(on) is TyObj {
+        if recDropLandingAt(on, nonNulTyOf(df), depth - 1) >= 0 { drops = true }
+      }
+    }
     i = i + 1
   }
-  true
+  drops
 }
-
 // Why a use of binding `decl` other than the delivery `p` needs `own`'s layout and not `dst`'s, as
 // a clause of the refusal; "" when every such use reads a field `dst` stores as `own` does.
 function recDropUseBlocks(decl: i32, p: i32, own: i32, dst: i32): string {

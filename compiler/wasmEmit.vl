@@ -1,3 +1,6 @@
+import { unRowOfTyKey } from "./emit_union_tykey"
+import { unionArmRowOfTy } from "./emit_local_slots"
+import { unionTyOfRecv } from "./emit_obj_lit_fits"
 import { recKeptFnDstOf } from "./check_rec_rows"
 import { isTestAnswer } from "./check_narrow_flow"
 import { primTyIxOfName } from "./check_decl_scan"
@@ -24,7 +27,6 @@ import {
 import { arrLitDestTy, arrLitUnionDestTaken } from "./check_bind_rows"
 import { mintCallSoleSet } from "./check_mint"
 import {
-  annArmDeclPosOf,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
@@ -154,7 +156,6 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
-  cStructNames,
   listArmFitAcrossReps,
   mkArrayTy,
   mkNullableTyOf,
@@ -1410,6 +1411,7 @@ import {
   unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentAt,
   unionDeclTyIxOfIdentRead,
+  unionTyIxOfIdentRead,
 } from "./emit_start_block"
 import {
   declaredKind,
@@ -3441,7 +3443,7 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
     // an operand that is no union answers here even when its tested type names a row (#1310).
     if (
       nodeTyIsUnion(nd.isObj)
-      && isTestedRowOf(isIx, isVarTyIxOf(isIx), nd.isObj) >= 0
+      && isTestedRowOf(isVarTyIxOf(isIx), nd.isObj) >= 0
     ) {
       return -1
     }
@@ -3535,7 +3537,7 @@ function unionBoxLacksTag(recvIx: i32, tag: i32, fnIx: i32): boolean {
   if tag < uVariants.length { return false }
   const nm = unionNameOfExpr(recvIx, fnIx)
   if nm == "" { return false }
-  const declTy = unionDeclTyIxOfIdentRead(recvIx, fnIx)
+  const declTy = unionTyIxOfIdentRead(recvIx, fnIx)
   const atoms: string[] = []
   const arms: i32[] = []
   if !unionSetArmTysAB(91, nm, declTy, atoms, arms) || arms.length == 0 {
@@ -4501,7 +4503,7 @@ function emitListEmptyFitArms(
       || !unionSetArmTysAB(
         92,
         nm,
-        unionDeclTyIxOfIdentRead(nd.isObj, fnIx),
+        unionTyIxOfIdentRead(nd.isObj, fnIx),
         atoms,
         armTys,
       )
@@ -5406,7 +5408,7 @@ function emitRecordFitRecv(
 // False when an arm has no tag at all — the caller names its own refusal (D1774).
 function unionArmTagsOfTy(
   tty: i32,
-  declAt: i32,
+  recvU: i32,
   tags: i32[],
   vis: i32[],
 ): boolean {
@@ -5421,10 +5423,10 @@ function unionArmTagsOfTy(
     // construction, not an `isArmTagOfTy` value-atom kind.
     let vi = -1
     if t1 < 0 {
-      // The declaration the annotation at `declAt` (-1 for none) names for this arm, which its
-      // type cannot tell apart from a same-shape record's; else the arm's row by its type.
-      const dp = annArmDeclPosOf(declAt, aty)
-      vi = if dp >= 0 { variantIndexOf(cStructNames[dp]) } else { repVariantShapeRowOf(aty) }
+      // The arm of the receiver's union row `recvU` (-1 for none) whose checked type `aty` is: a
+      // tag is the member's within its union. Else the arm's row by its rep.
+      vi = unionArmRowOfTy(recvU, aty)
+      if vi < 0 { vi = repVariantShapeRowOf(aty) }
       if vi >= 0 { t1 = uTags[vi] }
     }
     if t1 < 0 { return false }
@@ -5528,13 +5530,7 @@ function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
   const nm = unionNameOfExpr(recvIx, fnIx)
   if nm != "" {
     const atoms: string[] = []
-    unionSetArmTysAB(
-      94,
-      nm,
-      unionDeclTyIxOfIdentRead(recvIx, fnIx),
-      atoms,
-      arms,
-    )
+    unionSetArmTysAB(94, nm, unionTyIxOfIdentRead(recvIx, fnIx), atoms, arms)
   }
   const pins: i32[] = []
   instancePinnedMaps(fnIx, pins)
@@ -5744,13 +5740,7 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   const atoms: string[] = []
   const arms: i32[] = []
   if (
-    !unionSetArmTysAB(
-      95,
-      nm,
-      unionDeclTyIxOfIdentRead(nd.isObj, fnIx),
-      atoms,
-      arms,
-    )
+    !unionSetArmTysAB(95, nm, unionTyIxOfIdentRead(nd.isObj, fnIx), atoms, arms)
   ) {
     return 0
   }
@@ -6494,7 +6484,7 @@ function recNeverFitsArm(arm: i32, rcv: i32): boolean {
 // by a static row fold where the row is the answer, else the box tag and discriminant test.
 // Returns 0 once the test is on the stack, -1 on failure.
 function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
-  const vi = isTestedRowOf(isIx, isVarTyIxOf(isIx), nd.isObj)
+  const vi = isTestedRowOf(isVarTyIxOf(isIx), nd.isObj)
   if vi < 0 {
     if recvIsTestedRecord(nd.isObj, isVarTyIxOf(isIx)) {
       if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
@@ -7855,7 +7845,7 @@ function emitEmptyArrUnionArm(
     tag = scalarTagOfKind(9) // "string[]", the tag a `(string | null)[]` arm shares
   } else if k == "reflist" {
     const slot = emptyArrUnionArmSlot(exprIx)
-    if !unionHasRefArrayArmSlot(unionName, slot) { return 0 }
+    if !unionHasRefArrayArmSlot(unionName, unionTy, slot) { return 0 }
     tag = refArrBoxTagOf(exprIx, fnIx, slot, unionName, unionTy)
   }
   if tag < 0 { return 0 }
@@ -8371,7 +8361,7 @@ function emitUnionCoerceRefArray(
   fnIx: i32,
 ) {
   const raSlot = refListSlotOfExpr(exprIx, fnIx)
-  if unionHasRefArrayArmSlot(unionName, raSlot) {
+  if unionHasRefArrayArmSlot(unionName, unionTy, raSlot) {
     const raTag = refArrBoxTagOf(exprIx, fnIx, raSlot, unionName, unionTy)
     if raTag < 0 { return emitFail("emitProgram: boolean list arm has no tag") }
     fbI32Rel(RS_TAG, raTag)
@@ -9038,7 +9028,7 @@ function emitUnionCoerceList(
   // A list literal the checker typed as a ref-list arm builds there (`emitArr`), so it boxes
   // under that arm's tag even where its elements alone read as scalars (`[null]`).
   const atSlot = arrLitRefSlotAtTy(bareIx, fnIx)
-  if unionName != "" && unionHasRefArrayArmSlot(unionName, atSlot) {
+  if unionName != "" && unionHasRefArrayArmSlot(unionName, uTy, atSlot) {
     const atTag = refArrBoxTagOf(exprIx, fnIx, atSlot, unionName, uTy)
     if atTag < 0 { return emitFail("emitProgram: boolean list arm has no tag") }
     fbI32Rel(RS_TAG, atTag)
@@ -12415,7 +12405,15 @@ function emitMemStructRead(body: u8[], memIx: i32, fnIx: i32): i32 {
     if sFieldIsUnionBox(si, idx) {
       if memReadBoxAmbiguous(memIx, fnIx) { return emitBoxAmbiguousFail(memIx) }
       const own = memReadBoxNarrowTy(memIx, fnIx)
+      // A read at one scalar of a box holding one wider scalar unboxes and converts it, with no
+      // box rebuilt at the scalar's own set.
       if own >= 0 {
+        const sc = boxNarrowScalarKinds(sFieldElemTyIxAt(si, idx), own)
+        if sc.length == 2 {
+          if emitUnionUnboxTail(sc[0]) < 0 { return -1 }
+          wU8(atomConvOp(sc[0], sc[1]))
+          return 0
+        }
         if emitBoxAtomRetagTys(sFieldElemTyIxAt(si, idx), own, memIx) < 0 {
           return -1
         }
@@ -14014,7 +14012,7 @@ function emitMapProbe(body: u8[], keepHash: boolean) {
 
 // The one home of the `-3` map-value reject. Four op sites each spelled out this verdict, two of
 // them enumerating a supported side that went stale. So the message names the remainder instead,
-// which is small and stays small: `mvValKindOfName` lowers every scalar, litunion atom, struct,
+// which is small and stays small: `mvValKindOfTy` lowers every scalar, litunion atom, struct,
 // list at any nesting, nested map, union and closure, plus each one's nullable niche.
 
 // What is left: a struct that is a member of a declared union, living in the variant table where
@@ -21215,6 +21213,28 @@ function atomConvOp(fk: i32, tk: i32): i32 {
   atomNarrowOp(fk, tk)
 }
 
+// The stored and own atom kinds of a field read whose box `phys` holds one non-null scalar the
+// own type, one other scalar, narrows back to; empty for any other pair.
+function boxNarrowScalarKinds(phys: i32, own: i32): i32[] {
+  const pa: string[] = []
+  const oa: string[] = []
+  if (
+    !canonUnionMembersInto(phys, [], pa)
+    || !canonUnionMembersInto(own, [], oa)
+  ) {
+    return []
+  }
+  const vals: string[] = []
+  for a in pa {
+    if a != "null" { vals.push(a) }
+  }
+  if vals.length != 1 || oa.length != 1 || vals[0] == oa[0] { return [] }
+  const fk = valueAtomKind(vals[0])
+  const tk = valueAtomKind(oa[0])
+  if fk < 0 || tk < 0 || atomConvOp(fk, tk) < 0 { return [] }
+  [fk, tk]
+}
+
 // The refusal of a field read at `memIx` whose wider record stores two of its own members as one.
 function emitBoxAmbiguousFail(memIx: i32) {
   emitFailAt(
@@ -23353,7 +23373,9 @@ function emitAsUnionCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   }
   const wantTags: i32[] = []
   const wantVis: i32[] = []
-  if !unionArmTagsOfTy(tty, _exprIx, wantTags, wantVis) {
+  const recvUt = unionTyOfRecv(nodeTyInOf(unwrapParen(obj), fnIx))
+  const recvU = if recvUt >= 0 { unRowOfTyKey(recvUt) } else { -1 }
+  if !unionArmTagsOfTy(tty, recvU, wantTags, wantVis) {
     return emitFail(
       "emitProgram: `as "
         + tgt
@@ -39125,7 +39147,7 @@ function coalNicheBoxTag(
   if exprNullableRefArray(lhsIx, fnIx) {
     const rs = refListSlotOfExpr(lhsIx, fnIx)
     if rs < 0 { return -1 }
-    if !unionHasRefArrayArmSlot(joinSet, rs) { return -1 }
+    if !unionHasRefArrayArmSlot(joinSet, joinTy, rs) { return -1 }
     return refArrSlotTag(rs)
   }
   const ak = coalNicheAtomKind(lhsIx, fnIx)

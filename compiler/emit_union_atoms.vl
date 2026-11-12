@@ -75,7 +75,6 @@ import {
 import {
   mvValTyIxAt,
   nonNulBaseOf,
-  nulMapInnerName,
   rlElemMapValMvSlotAt,
   unMemRefArrArmSlot,
 } from "./emit_map_value_slots"
@@ -116,12 +115,10 @@ import {
   mvDeepFuncSlotOfTy,
   mvSlotOfMapKeyKTys,
   mvValArmOfShapeTy,
-  mvValKindOfNameTy,
+  mvValKindOfTy,
   mvValRepKindOfTy,
   nulRefMapValInnerOfTy,
-  refArrElemKind,
   refArrElemName,
-  refElemArrName,
   refListElemKindOfTy,
   repStructRowIsOrTwin,
   rlElemMapValMvSlot,
@@ -445,7 +442,7 @@ function mvShapeOfValNameArmTyGo(
   const twin = mapTwinUnionMember(kindTy)
   if twin >= 0 { return mvShapeOfValTyK(twin, keyK, armTy) }
   let valName = mvCanonValNameTy(valNameIn, kindTy)
-  const kind = mvValKindOfNameTy(valName, kindTy)
+  const kind = mvValKindOfTy(kindTy)
   if kind == MVK_MONO { return -1 }
   if kind < 0 { return -3 }
   // An inferred value union can arrive spelled structurally (`{x:i32}[]|i32[]` for a write of
@@ -597,9 +594,6 @@ export function rlElemMapShape(slot: i32): i32 {
   const ar = rlElemMapValMvSlotAt(slot, true)
   if ar >= 0 { return ar }
   if slot < 0 || slot >= rlElemName.length { return -3 }
-  let en = rlElemName[slot]
-  const enn = nulMapInnerName(en)
-  if enn != "" { en = enn }
   let ety = -1
   if slot >= 0 && slot < rlElemTyIx.length { ety = rlElemTyIx[slot] }
   mvShapeOfMapHeldTy(ety, -1, tyMapValOfHeld(ety))
@@ -656,12 +650,16 @@ export function rlRowNameOfTy(tyIn: i32, unfold: boolean): string {
 // `ensureRefElemTy` with the element's type `kindTy` held apart from the key hint `ty`:
 // `kindTy` only classifies a map element's value, so a caller whose hint is -1 by design
 // still hands over the type it holds. Either may be -1.
+const RL_ELEM_NO_KIND_MSG = "a ref-list element type gives its row no element rep"
+
 export function ensureRefElemTys(elemName: string, ty: i32, kindTy: i32) {
   if elemName == "" { return -1 }
-  // The kind is `kindTy`'s; the spelling is the floor for a caller with no type, or a type
-  // the classifier declines (a type parameter, a union of lists).
-  let k = refListElemKindOfTy(kindTy)
-  if k < 0 { k = refArrElemKind(refElemArrName(elemName)) }
+  // The kind is `kindTy`'s; a row with none has no element rep to mint.
+  const k = refListElemKindOfTy(kindTy)
+  if k < 0 {
+    emitFail(RL_ELEM_NO_KIND_MSG)
+    return -1
+  }
   if k == RLK_REF_LIST {
     // The inner element's row is named from `kindTy`'s element type, past a `| null`; the cut is
     // the floor for a caller that holds no type, or a type with a hole.
@@ -684,11 +682,6 @@ function ensureRefElemKindTail(elemName: string, k: i32, ty: i32, kindTy: i32) {
   // struct a standalone `{[string]: V}` binding does. A mono or atom value interns nothing,
   // riding the shared mono `$mapStruct`.
   if k == RLK_MAP {
-    // A nullable map element strips to its inner map for the value intern — the slot
-    // shares the map struct and mv slot with the non-null element.
-    let mve = elemName
-    const nme = nulMapInnerName(elemName)
-    if nme != "" { mve = nme }
     // The element's own arena row carries the map value, so a RECURSIVE alias element
     // resolves to the declared type rather than the unrolled anonymous twin its rendered
     // spelling would mint (D1865). `-1` in, `-1` through: the unhinted call is unmoved.
@@ -772,11 +765,6 @@ export function rlInternNameTy(name: string, kind: i32, tyIn: i32) {
     rlElemNullable.push(1)
   } else {
     rlElemNullable.push(0)
-  }
-  let men = stored
-  if kind == RLK_MAP {
-    const min = nulMapInnerName(men)
-    if min != "" { men = min }
   }
   rlElemMapKey.push(rlMintMapKey(kind, rlTy))
   rlElemMvSlot.push(-1)
@@ -2310,15 +2298,26 @@ function nameIsPlainScalarAtom(a: string): boolean {
   false
 }
 
-// True if the union member-set `name` has a ref-element array arm whose interned reflist
-// slot is `slot` — the guard `emitUnionCoerce` uses to confirm a ref-array carrier matches
+// `unionArmMemberTys` for a caller holding the union's type `ty` (-1 for none): an unbound
+// member-set spelling reads the row `ty` keys to, not the row of its member-set text.
+function unionArmMemberTysOfTy(name: string, ty: i32, out: i32[]): boolean {
+  if unionMemberSetOf(name) != name { return false }
+  if ty >= 0 && unRowOfName(name) < 0 {
+    const u = unRowOfTyKey(ty)
+    if u >= 0 { return unionMemberTysOfRow(u, out) }
+  }
+  unionMemberTysOf(name, out)
+}
+
+// True if the union member-set `name` (of type `ty`, or -1) has a ref-element array arm whose
+// interned reflist slot is `slot` — the guard `emitUnionCoerce` uses to confirm a ref-array carrier matches
 // an arm before boxing it with that arm's `refArrSlotTag`. A slot matching no arm falls
 // through rather than mis-tag.
-export function unionHasRefArrayArmSlot(name: string, slot: i32) {
+export function unionHasRefArrayArmSlot(name: string, ty: i32, slot: i32) {
   // A carrier with no row (-1) must not match a member with no arm row, which is -1 too.
   if slot < 0 { return false }
   const mems: i32[] = []
-  if !unionArmMemberTys(name, mems) { return false }
+  if !unionArmMemberTysOfTy(name, ty, mems) { return false }
   let i = 0
   while i < mems.length {
     if unMemRefArrArmSlot(mems[i]) == slot { return true }
