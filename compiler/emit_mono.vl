@@ -107,7 +107,6 @@ import {
   nodeTyIsNulFunc,
   nodeTyIsNullType,
   nodeTyIsNullable,
-  nodeTyIsNullableStruct,
   nodeTyIsStringPrim,
   nodeTyIxIn,
   nodeTyIxOf,
@@ -263,6 +262,7 @@ import {
   tyUnionAllLists,
   tyVarRenameRow,
   tyWrapsRecord,
+  unionAliasDeclNameOfTy,
 } from "./check_types"
 import {
   blockHasBareReturn,
@@ -624,13 +624,7 @@ import {
   bundleParamNote,
   bundleReset,
 } from "./emit_bundle"
-import {
-  repCanonId,
-  repRowId,
-  repRowOfTyStruct,
-  repShadowOn,
-  sFieldElemTyIxAt,
-} from "./emit_rep"
+import { repCanonId, repRowId, repRowOfTyStruct, repShadowOn } from "./emit_rep"
 import {
   instKeyCallTime,
   instKeyCanon,
@@ -760,7 +754,6 @@ import {
   unionArmsOf,
   unionArmsOfTy,
   unionRowKeyAB,
-  unionSetAtomsOf,
 } from "./emit_union_registry"
 import {
   unRowOfTyKey,
@@ -1583,15 +1576,6 @@ function monoParamPinnedNull(ax: i32, fnIx: i32): boolean {
   nodeTyIxOf(ptn) == TY_NULL
 }
 
-// Whether struct row `si` declares field `prop` nullable. A clone's `q.next` is recorded against
-// the template's gradual `q`, so only the struct row knows the field is nullable (D3301).
-function monoFieldDeclNullable(si: i32, prop: string): boolean {
-  if si < 0 || si >= sTyIx.length { return false }
-  const ft = tyFieldTyOf(sTyIx[si], prop)
-  if ft < 0 || ft >= T.tys.length { return false }
-  tyAt(ft) is TyNullable
-}
-
 // The initializer of the local an if-expression's then arm yields, when that local is declared
 // in the arm's own prelude and the join's recorded type is still a type parameter, or -1.
 function monoArmTailLocalInit(ix: i32): i32 {
@@ -2018,19 +2002,6 @@ function monoArgTyNameProjected(
       const fi = sFieldIndex(rsi, argN.memProp)
       if fi >= 0 && sFieldTypeAt(rsi, fi) == FC_STRUCT {
         const fnm = sFieldElemNameAt(rsi, fi)
-        // A nullable record field shares code 15 with a bare one; its pin keeps the `| null`
-        // the field declares, or the instance's parameter is non-null and the call casts (D3301).
-        if (
-          isSName(fnm)
-          && (nodeTyIsNullableStruct(cax)
-            || monoFieldDeclNullable(rsi, argN.memProp))
-        ) {
-          const fet = nonNullTy(sFieldElemTyIxAt(rsi, fi))
-          return monoAnnPinName(
-            fnm + "|null",
-            if fet >= 0 { mkNullableTy(fet) } else { -1 },
-          )
-        }
         if isSName(fnm) {
           const fr = structIndexByName(fnm)
           tyOut[0] = if fr >= 0 && fr < sTyIx.length { sTyIx[fr] } else { -1 }
@@ -2572,9 +2543,7 @@ function monoSubstLetType(
         const subC = monoPinMintedUnion(sub, sty, sty, unTyKeyTagLet())
         // A union takes the type its registered spelling names, the one an assignment's
         // `letUnionNameOf` resolves against the registry, not the substitution's own row (D2676).
-        const subAtoms: string[] = []
-        unionSetAtomsOf(subC, subAtoms)
-        if subAtoms.length >= 2 {
+        if monoPinCanonIsUnion(sty) {
           // Typed by the spelling: the substitution's own type can keep a union the registered
           // row collapses (`f64[] | i32[]` against `f64[]`).
           return synthTypeRefFb(subC, tn.pos, -1)
@@ -7972,6 +7941,14 @@ function monoPinCanonKind(ty: i32): i32 {
   0
 }
 
+// Whether a pin of type `ty` canons to a union of two atoms or more: a union by
+// `monoPinCanonKind` that no declared or literal-union alias names, since a canon alias is one atom.
+function monoPinCanonIsUnion(ty: i32): boolean {
+  monoPinCanonKind(ty) == 1
+    && unionAliasDeclNameOfTy(ty) == ""
+    && litUnionAliasNameOfTy(ty) == ""
+}
+
 // The spelling an annotation pinned at `ty` takes when a pin substitutes into a union holding a
 // map or a record (`V | {[K]: i32}` at `V := {[K]: boolean}`), registered under the canon key a
 // direct spelling reuses (D2657) and typed by `own`, the whole annotation (-1: `ty`). One that
@@ -8001,9 +7978,7 @@ function monoPinMintedUnion(
   let pc = ""
   if pun != "" {
     pc = monoPinUnionName(pun, le)
-    const pcAtoms: string[] = []
-    unionSetAtomsOf(pc, pcAtoms)
-    if pcAtoms.length < 2 { return monoPinUnionName(name, wt) }
+    if !monoPinCanonIsUnion(le) { return monoPinUnionName(name, wt) }
   } else if !wu || monoPinCanonKind(wt) == 2 {
     return monoPinUnionName(name, wt)
   }
