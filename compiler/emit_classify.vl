@@ -1,3 +1,5 @@
+import { valueTailLeaves } from "./check_num_adopt"
+import { callBuiltTy } from "./check_store_rep"
 import { emitFail } from "./emit_bytes"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { constBindsLitSet, forInBindTy } from "./check_leaf_steps"
@@ -196,7 +198,6 @@ import {
   numLitUnionBaseTy,
   objFieldType,
   oneListUnionRender,
-  structNameOfTy,
   tyArrayElemIx,
   tyArrayElemPrimName,
   tyAt,
@@ -251,6 +252,7 @@ import {
   sFieldTgtStructIdx,
   sFieldTypeAt,
   sIsAnonRow,
+  sRowCanonOf,
   sScanLim,
   sioMemoFn,
   sioMemoIx,
@@ -501,7 +503,6 @@ import {
   repABNote,
   retMapFlight,
   retMapInFlight,
-  retStructRowIndex,
   vtKindOfType,
 } from "./emit_nullable_rets"
 import {
@@ -630,7 +631,6 @@ import {
   sFieldMapShape,
   sFieldRefSlot,
   structIndexOfNullPartTy,
-  structRowOfAnnTy,
   structRowOfNameTy,
   structRowOfRecordTy,
   structRowOfSpelling,
@@ -1125,9 +1125,10 @@ export function cloRetValSlot(fe: i32): i32 {
     }
     return repSlotOfKind(k, repSigSlotTyOf(t))
   }
-  // A declared record takes the row its annotation names, ahead of the first row of its shape.
+  // A declared record takes the row its annotation names, ahead of the first row of its shape:
+  // the row `buildFnMap` stored for it.
   if k == "struct" || k == "nulstruct" {
-    const ds = retStructRowIndex(fd.fnRet)
+    const ds = if fe < fRetStructIdx.length { fRetStructIdx[fe] } else { -1 }
     if ds >= 0 { return ds }
   }
   // A declared variant takes its name's row.
@@ -4366,7 +4367,7 @@ export function optChainStructIdxOf(exprIx: i32, fnIx: i32) {
     if psi < 0 { return -1 }
     const pfi = sFieldIndex(psi, e.omProp)
     if pfi < 0 { return -1 }
-    if sFieldTypeAt(psi, pfi) != FC_STRUCT { return -1 }
+    if !sFieldIsRecordRef(psi, pfi) { return -1 }
     return sFieldTgtStructIdx(psi, pfi)
   }
   structIndexOfExpr(exprIx, fnIx)
@@ -4406,7 +4407,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
     if si >= 0 {
       const fi = sFieldIndex(si, m.memProp)
       if fi >= 0 {
-        if sFieldTypeAt(si, fi) == FC_UNION { return sFieldElemNameAt(si, fi) }
+        if sFieldIsUnionBox(si, fi) { return sFieldElemNameAt(si, fi) }
       }
     }
     // The receiver is a narrowed union arm (`v.f`, `v` narrowed to a struct variant):
@@ -4460,7 +4461,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
             if msi >= 0 {
               const mfi = sFieldIndex(msi, m.memProp)
               if mfi >= 0 {
-                if sFieldTypeAt(msi, mfi) == FC_UNION {
+                if sFieldIsUnionBox(msi, mfi) {
                   return sFieldElemNameAt(msi, mfi)
                 }
               }
@@ -5773,7 +5774,7 @@ export function coalesceMapReadJoins(exprIx: i32, fnIx: i32): boolean {
   if !coalesceResultIsBox(ix, fnIx) { return false }
   const vt = tyPeelNul(tyMapValOf(mapRecvTyIn(recv, fnIx)))
   if vt < 0 { return false }
-  !tySameSet(vt, tyPeelNul(nodeTyInOf(ix, fnIx)), TY_WALK_DEPTH)
+  !tySameSet(vt, tyPeelNul(nodeTyAt(ix, fnIx)), TY_WALK_DEPTH)
 }
 
 // The one nullability decision for the `??` reps: a non-null default collapses to the
@@ -6613,29 +6614,35 @@ export function arrLitNumKind(arrIx: i32, fnIx: i32): i32 {
   }
 }
 
-// The union variant an object-literal-element array literal boxes its elements under, or "":
-// the arm its lead record literal is adopted at, when the literal's recorded element is a union
+// The variant row an object-literal-element array literal boxes its elements under, or -1: the
+// arm row its lead record literal is adopted at, when the literal's recorded element is a union
 // and its elements are not all one arm (D361: then it is a list of that arm, kind 1, the slot the
 // annotated `Circle[]` spelling interns).
-export function arrLitObjElemBoxVariant(arrIx: i32): string {
+function arrLitObjElemBoxRow(arrIx: i32): i32 {
   const a = nodeAt(arrIx)
-  if !(a is ArrayLit) || a.arrElems.length < 1 { return "" }
+  if !(a is ArrayLit) || a.arrElems.length < 1 { return -1 }
   const e = tyArrayElemIx(nodeTyIxOf(arrIx))
-  if e < 0 || !(tyAt(e) is TyUnion) { return "" }
+  if e < 0 || !(tyAt(e) is TyUnion) { return -1 }
   const e0 = a.arrElems[0]
-  if !(nodeAt(e0) is ObjLit) { return "" }
+  if !(nodeAt(e0) is ObjLit) { return -1 }
   const vr = litArmRowOf(e0, -1, litRepTyAt(e0, -1))
-  if vr < 0 || vr >= uVariants.length { return "" }
-  if a.arrElems.length < 2 { return uVariants[vr] }
+  if vr < 0 || vr >= uVariants.length { return -1 }
+  if a.arrElems.length < 2 { return vr }
   for el in a.arrElems {
     if (
       !(nodeAt(el) is ObjLit)
       || litArmRowOf(el, -1, litRepTyAt(el, -1)) != vr
     ) {
-      return uVariants[vr]
+      return vr
     }
   }
-  ""
+  -1
+}
+
+// `arrLitObjElemBoxRow`'s arm by name, or "".
+export function arrLitObjElemBoxVariant(arrIx: i32): string {
+  const vr = arrLitObjElemBoxRow(arrIx)
+  if vr >= 0 { uVariants[vr] } else { "" }
 }
 
 // The ref-list row literal `arrIx` builds in frame `fnIx`, found by the element type
@@ -6715,11 +6722,10 @@ export function arrLitElemHintTy(arrIx: i32) {
         // Must agree arm for arm with the two classifiers above: the hint denotes the row
         // the name arm picked, so it asks the same predicate. An element resolving to a bare
         // arm falls past into the struct arm, which declines the hint rather than guess.
-        const vn = arrLitObjElemBoxVariant(arrIx)
-        if vn != "" {
-          // The variant arm, dual-written at full agreement: the name is `unNames[u]`, the
-          // row is that table's own `unTyIx[u]`, resolved from that name at mint.
-          const u = unionOfVariant(variantIndexOf(vn))
+        const vr = arrLitObjElemBoxRow(arrIx)
+        if vr >= 0 {
+          // The variant arm: the union of the arm row the lead literal is built at.
+          const u = unionOfVariant(vr)
           if u < 0 { return -1 }
           if u >= unTyIx.length { return -1 }
           return unTyIx[u]
@@ -6962,8 +6968,8 @@ function arrLitElemNameTpl(arrIx: i32): string {
       if e0 is ObjLit {
         // The union widening is `arrLitObjElemBoxVariant`'s, not a bare field-set scan's —
         // one home for the rule, so this arm and `arrLitElemKind`'s cannot drift.
-        const vn = arrLitObjElemBoxVariant(arrIx)
-        if vn != "" { return unionNameOfVariant(variantIndexOf(vn)) }
+        const vr = arrLitObjElemBoxRow(arrIx)
+        if vr >= 0 { return unionNameOfVariant(vr) }
         // A LATER `null` element makes the row the NICHE, and the niche bit is read off the
         // name (`rlElemNicheNullable`) — so the nullable spelling has to be asked before the
         // bare nominal one, or `[{n: 42}, null]` keys a different slot than the annotated
@@ -8530,10 +8536,9 @@ export function letObjLitVariantIdx(letIx: i32, fnIx: i32) {
 // row of its checked type when that is a variant rep.
 export function exprVariantIndex(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
-  if !emitPhaseReached("monomorphized") {
-    if !nodeRepIs(exprIx, "variant", fnIx) { return -1 }
-    return variantIndexOf(structNameOfTy(nodeTyInOf(exprIx, fnIx)))
-  }
+  // Before monomorphization a variant row may not exist yet: an instance union's arm reps as a
+  // variant from the first question (`repVariantShapesPrime`), and its row is minted later.
+  if !emitPhaseReached("monomorphized") { return -1 }
   const e = nodeAt(exprIx)
   match e {
     Paren => {
@@ -8904,6 +8909,10 @@ export function identUnionTyAt(sid: i32, fnIx: i32, atIx: i32): i32 {
 }
 
 export function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
+  sRowCanonOf(structIndexOfExprGo(exprIx, fnIx))
+}
+
+function structIndexOfExprGo(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return -1 }
   const e = nodeAt(exprIx)
   const asgCell = asgCellOf(exprIx, fnIx)
@@ -8957,6 +8966,11 @@ function structIndexOfRep(exprIx: i32, fnIx: i32): i32 {
   }
   if ty < 0 { return -1 }
   const k = repOfNodeAt(rx, ty).rdKind
+  // A record read whose value is built at a wider record is stored at that record's row.
+  if (k == "struct" || k == "nulstruct") && (e is Ident || e is Call) {
+    const bt = callBuiltTy(rx, 8)
+    if bt >= 0 && !tySame(bt, nonNullTy(ty)) { return repStructRowOfTy(bt) }
+  }
   if k == "struct" || k == "nulstruct" {
     return repStructRowOfTy(nonNullTy(ty))
   }
@@ -9015,7 +9029,7 @@ function recvFieldStructRow(recvIx: i32, prop: string, fnIx: i32): i32 {
   const msi = structIndexOfExpr(recvIx, fnIx)
   if msi < 0 { return -1 }
   const mfi = sFieldIndex(msi, prop)
-  if mfi >= 0 && sFieldTypeAt(msi, mfi) == FC_STRUCT {
+  if mfi >= 0 && sFieldIsRecordRef(msi, mfi) {
     return sFieldTgtStructIdx(msi, mfi)
   }
   -2
@@ -9173,10 +9187,7 @@ export function structIndexOfLet(letIx: i32, fnIx: i32) {
         // while `structIndexOfTy` finds the first row denoting this type, possibly a
         // structurally identical twin. Revert this rung if a pair ever surfaces with `repStructSlotsTwin == 0`.
         let si = structIndexOfTy(nodeTyIxOf(d.letType))
-        if si < 0 {
-          const lty = nodeTyIxOf(d.letType)
-          si = structRowOfAnnTy(lt.tyName, lty, lty)
-        }
+        if si < 0 { si = structRowOfRecordTy(nodeTyIxOf(d.letType)) }
         if si >= 0 { return si }
         // A nullable annotation resolves its non-null part, as `collectAnnShapes` interned it:
         // needed when the initializer is a bare `null`, with no struct literal to infer from.
@@ -9589,10 +9600,30 @@ function exprUnionBin(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
   false
 }
 
+// Whether join `ix`, whose checked type is a union of records, is built as one record: it is
+// stamped as that record, or every value it yields is.
+export function ifBuiltAtRecord(ix: i32): boolean {
+  const t = nodeTyIxOf(ix)
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyUnion) { return false }
+  const r = nodeRepTyIxOf(ix)
+  if r >= 0 && r < T.tys.length && tyAt(r) is TyObj { return true }
+  let one = -1
+  for l in valueTailLeaves(ix) {
+    const lr = nodeRepTyIxOf(l)
+    if lr < 0 || lr >= T.tys.length || !(tyAt(lr) is TyObj) { return false }
+    if one < 0 { one = lr }
+    else if !tySame(one, lr) { return false }
+  }
+  one >= 0
+}
+
 // True if the if-expression at `exprIx` yields the union box: its join is a union neither
 // arm is, or its then arm is a union. False for a numeric literal union join, or a join
 // that is a bare primitive or a list.
 function exprUnionIf(exprIx: i32, fnIx: i32): boolean {
+  // …unless the checker builds the join as the one record its arms are delivered to (D15020):
+  // that record is the value, not the union of the arms' own records.
+  if ifBuiltAtRecord(exprIx) { return false }
   // …unless the join is a numeric literal union, whose rep is the `i32` and never the box (D2531).
   if nodeTyIsNumLitUnion(exprIx, fnIx) { return false }
   // …unless the JOIN is a union neither arm is: `if c { "green" } else { 7 }` joins to
@@ -10807,7 +10838,7 @@ export function memReadBoxPlan(memIx: i32, fnIx: i32, out: i32[]): i32 {
     const si = structIndexOfExpr(m.memObj, fnIx)
     if si < 0 { return 0 }
     const fi = sFieldIndex(si, m.memProp)
-    if fi < 0 || sFieldTypeAt(si, fi) != FC_UNION { return 0 }
+    if fi < 0 || !sFieldIsUnionBox(si, fi) { return 0 }
     if !memRecvIsRecord(memIx, fnIx) { return 0 }
     const rt = recvCheckedTyOf(unwrapParen(m.memObj), fnIx, 0)
     if rt < 0 || rt >= T.tys.length { return 0 }
@@ -11329,7 +11360,6 @@ function refListKeptSlotOfCall(e: Call, exprIx: i32, fnIx: i32): i32 {
     if mfNulRecMapElemTy(exprIx, fnIx) >= 0 { return -2 }
     const ms = mfResultSlotOf(exprIx, fnIx)
     if ms >= 0 && ms < rlElemName.length { return ms }
-    if mfRecordElemRowName(exprIx, fnIx) != "" { return -2 }
     if mfListResultElemName(exprIx, fnIx) != "" { return -2 }
   }
   const mk2 = cloCallSigKey(exprIx, fnIx)
@@ -13724,18 +13754,6 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32): i32 {
   rlSlotOfTyOrTwin(tyArrayElemIx(nodeTyInOf(callIx, fnIx)))
 }
 
-// The element name of a struct- or variant-returning `.map`'s result row, read off the call's
-// element type, or "". `collectMapFilterUse` interns that row after return inference, which
-// still has to name it in the result valtype.
-function mfRecordElemRowName(callIx: i32, fnIx: i32): string {
-  const et = tyArrayElemIx(nodeTyInOf(callIx, fnIx))
-  const si = structRowOfRecordTy(et)
-  if si >= 0 && si < sNames.length { return sNames[si] }
-  const vi = variantIndexOf(structNameOfTy(et))
-  if vi >= 0 && vi < uVariants.length { return uVariants[vi] }
-  ""
-}
-
 // The `unNames` row of a union-returning `.map`'s result element: the call's element type at
 // the pin of the instance `fnIx` is, else its recorded one; -1 when neither names a row. Every
 // union shares one box, so the row decides only what a reader of the element believes (D3092).
@@ -14290,7 +14308,7 @@ function memberReadIsLitAtom(e: Member, exprIx: i32, fnIx: i32): boolean {
     if mfi >= 0 {
       // A plain i32 slot the checker reads as a literal-set alias holds its atom id: a record
       // with a function field keeps its ident fields as i32 slots with no atom table (D2853).
-      if !sFieldIsLitUnion(msi, mfi) && sFieldTypeAt(msi, mfi) == FC_I32 {
+      if !sFieldIsLitUnion(msi, mfi) && sFieldIsPlainI32(msi, mfi) {
         if (
           nodeTyIsLitUnionAlias(mIxA)
           && numLitUnionBaseTy(nodeTyIxOf(mIxA)) < 0
