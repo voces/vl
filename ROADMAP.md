@@ -19,7 +19,7 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 > - an effort or time estimate;
 > - a relative link that does not resolve.
 >
-> A finished item is deleted in the PR that adds its `CHANGELOG.md` line, and a partial item keeps
+> A finished item is deleted in the PR that adds its `changelog.d/` entry, and a partial item keeps
 > only its forward part. A new item goes in a track and reaches the ordered list only by reach.
 
 ## Where each fact lives
