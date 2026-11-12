@@ -6627,6 +6627,8 @@ let elabResAsgTo: {[i32]: i32[]} = Map()
 // whether a call hands that parameter a record whole.
 let elabResCopies: {[i32]: i32[]} = Map()
 let elabLambdaBound: {[i32]: i32} = Map()
+let elabResTypedReads: {[i32]: i32[]} = Map()
+let elabTypedReadMembers: {[i32]: i32[]} = Map()
 // Per holder, the `return` statements that return it.
 let elabResRets: {[i32]: i32[]} = Map()
 let elabRecParams: {[i32]: boolean} = Map()
@@ -6657,6 +6659,8 @@ function elabResultScanReset() {
   elabResBadWrite = Map()
   elabResCopies = Map()
   elabLambdaBound = Map()
+  elabResTypedReads = Map()
+  elabTypedReadMembers = Map()
   elabResAsgFrom = Map()
   elabResAsgTo = Map()
   elabResRets = Map()
@@ -6768,6 +6772,7 @@ function elabResScanRet(g: i32) {
 // A binding initialised by a call holds that call's value; one initialised with a parameter's
 // read is a copy of it.
 function elabResScanLet(g: i32) {
+  elabResScanTypedRead(g)
   if elabResMayHold(g) {
     const n = nodeAt(g)
     if n is LetDecl {
@@ -6782,6 +6787,23 @@ function elabResScanLet(g: i32) {
         const cs = elabResCopies.get(pd) ?? []
         cs.push(g)
         elabResCopies[pd] = cs
+      }
+    }
+  }
+  0
+}
+
+// An annotated `const` initialised with a holder's read takes the one member its type names.
+function elabResScanTypedRead(g: i32) {
+  const n = nodeAt(g)
+  if (n is LetDecl && n.letKw == "const" && n.letType >= 0) {
+    const v = parenPeelIx(n.letInit)
+    if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident {
+      const pd = identDeclOf(v)
+      if elabResMayHold(pd) {
+        const ts = elabResTypedReads.get(pd) ?? []
+        ts.push(g)
+        elabResTypedReads[pd] = ts
       }
     }
   }
@@ -7629,12 +7651,14 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
   const hands = elabResHands.get(h) ?? []
   const rets = elabResRets.get(h) ?? []
   const copies = if c >= 0 { elabCopiesDeep(h) } else { [] }
+  const typed = elabResTypedReads.get(h) ?? []
   const reads = through.length
     + hands.length / 2
     + elabResWriteReads(h)
     + rets.length
     + (elabResCopies.get(h) ?? []).length
     + elabResLinkReads(h)
+    + typed.length
   if (
     reads != (elabResReads.get(h) ?? 0)
     || !elabHolderWritesAgree(h, from, rec)
@@ -7643,6 +7667,7 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
     return 0
   }
   if rets.length > 0 && !elabHolderCanHoldReturned(h, from, rec) { return 0 }
+  if !elabTypedReadsHold(h, typed, rec) { return 0 }
   if copies.length > 0 && !elabHolderCopiesHold(h, copies, rec, from) {
     return 0
   }
@@ -7651,6 +7676,7 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
     || c < 0
     || rets.length > 0
     || copies.length > 0
+    || typed.length > 0
     || elabResLinkReads(h) > 0
   for t in through {
     const m = elabCallSigMember(t, rec)
@@ -7672,6 +7698,13 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
   const at = elabRecTable.length - 1
   elabTriplePut(elabHolderRecs, h, from, at)
   if c >= 0 { elabTriplePut(elabResKeeps, c, from, 1) }
+  for t in typed {
+    const tn = nodeAt(t)
+    if tn is LetDecl {
+      const tm = elabRecIndexOf(rec, nodeTyIxOf(tn.letType))
+      elabTriplePut(elabTypedReadMembers, t, from, tm)
+    }
+  }
   // Each copy holds the same record, each call through it takes its member, and each hand of
   // it delivers the record as the holder's own does.
   for w in copies {
@@ -7798,6 +7831,20 @@ function elabHolderCopiesHold(
         return false
       }
     }
+  }
+  true
+}
+
+// Whether each annotated binding in `typed`, initialised with holder `h`'s read, names one
+// member of record `rec` and sits in `h`'s function or a lambda nested in it.
+function elabTypedReadsHold(h: i32, typed: i32[], rec: i32[]): boolean {
+  const fd = elabEnclosingFn(h)
+  for t in typed {
+    const tn = nodeAt(t)
+    if !(tn is LetDecl) || !elabLambdaWithin(elabEnclosingFn(t), fd) {
+      return false
+    }
+    if elabRecIndexOf(rec, nodeTyIxOf(tn.letType)) < 0 { return false }
   }
   true
 }
@@ -8086,6 +8133,13 @@ export function elabCallKeepsRecordAt(c: i32, k: i32): boolean {
 }
 
 // The member of its holder's record call `c` through it calls under instance `k`, or -1.
+// The member of its holder's record annotated binding `d`, initialised with the holder's read,
+// takes under instance `k`; -1 for none.
+export function elabTypedReadMemberAt(d: i32, k: i32): i32 {
+  if !elabTypedReadMembers.has(d) { return -1 }
+  elabPairUnder(elabTypedReadMembers, d, k)
+}
+
 export function elabThroughMemberAt(c: i32, k: i32): i32 {
   elabPairUnder(elabThroughMembers, c, k)
 }

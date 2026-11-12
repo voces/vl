@@ -95,6 +95,9 @@ same program different bytes on every run.
 * **By hand:** `gh workflow run sweep.yml -f base_ref=master -f head_ref=<branch or sha>`.
 
 The workflow builds each side's fixpoint seed, reusing ci.yml's caches. It records 8 shards per
-side on 16 runners, merges and diffs them, and writes the diff to the job summary. Artifact
+side on 16 runners, merges and diffs them, and writes the diff to the job summary. A base
+recording is kept for 7 days as artifact `sweep-base-<key>`; a later run whose key matches (same
+base commit, head population, head-built sweep tool and workflow file, listed in the `base-cache`
+job) restores it and records only the head side; `diff` reads it unchanged. Artifact
 `sweep-result` holds both merged recordings, so you can re-diff them locally. The run fails
 when `diff` does. The population and the tool come from the head commit.
