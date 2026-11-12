@@ -59,17 +59,23 @@ before and after.
 - **D1518's deferred predicate** is deleted with its only caller: `armFieldDeferredRowOk`,
   `armDeferStack`, `armPlainLayoutTyOk` and `armRefLeafNameOk`. `nameIsString` (`emit_base.vl`)
   loses its last caller and is deleted.
-- **The loud floor:** `nameFieldCodeTy` fails loudly when a declined type with a type in hand
-  reaches no rung. It answered -1 silently before. The floor is reached by no program in the
-  population.
+- **The loud floors.** The field type is in hand in each case; each answered silently before, and
+  no program in the population reaches any of them.
+  - `nameFieldCodeTy` fails loudly when a declined type reaches no rung. It answered -1.
+  - `funcTypeShapeLowerable`'s nested-record recursion fails loudly; it recursed into the field's
+    spelling. 0 programs reach it, since the descriptor codes every closed record.
+  - `variantNestedShapeOkTy` is called only for an uncoded field, so no program calls it. It is
+    a loud floor; it walked the field's spelling.
+  The last two were three of `nonNulBaseOf`'s callers. That spelling parse leaves both
+  functions.
 
 ## Measurement
 
 - **Sweep** (`sweep.vl diff`, fixpoint seeds both sides): 24,170 same, 0 bytes-only movers,
   0 output movers, 0 `runs → not-runs`, 0 new compiler traps. The step that only routes the
   callers was also byte-identical on its own.
-- **Seed:** 6,735,606 → 6,733,652 bytes (−1,954) against cut 1's head, a fixpoint. The sweep ran
-  before `nameIsString` was deleted; that deletion removes a function no code calls.
+- **Seed:** 6,724,704 → 6,722,304 bytes (−2,400) against cut 1's head merged with master
+  `2c252adf`, a fixpoint. The final sweep (24,178 programs, the same two seeds) is 24,178 same.
 - **rep-classifier-census:** NAME classifiers 38 → 37 (71 → 70 call sites); ARENA + NAME stays
   at 11; ARENA + SPELLING stays at 0.
 - **render-parse:** unchanged at 13 renders and 34 parses. The deleted arms' readers are not
