@@ -1,5 +1,4 @@
 import { unMemPeelAliasWrapper } from "./emit_union_tykey_text"
-import { monoPinSpellNoAnon } from "./pin_spell"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { unionArmRowOfTy } from "./emit_local_slots"
 import { unionTyOfRecv } from "./emit_obj_lit_fits"
@@ -1228,6 +1227,7 @@ import {
   listOpKindOfBin,
   listOpSlotOfBin,
   memberLenWidensAtom,
+  msSetHasAtom,
   printUnionArmsUnrenderable,
   printUnionPlan,
   tailIsValueOrNever,
@@ -6825,10 +6825,7 @@ function emitIsTestArmTag(body: u8[], isIx: i32, ndv: IsExpr, fnIx: i32) {
     && tyIsLitUnion(isVarTyIxOf(isIx))
     && exprUnion(ndv.isObj, fnIx)
     && unionEqOperandOk(ndv.isObj)
-    && !unionCarriesLitUnionArmOfSet(
-      msSetOfUnionBox(ndv.isObj, fnIx),
-      unionNameOfExpr(ndv.isObj, fnIx),
-    )
+    && msSetCarriesLitUnionArm(msSetOfUnionBox(ndv.isObj, fnIx)) != 1
     && msSetTakesAtomAsStr(msSetOfUnionBox(ndv.isObj, fnIx))
     && !readIsCallResult(ndv.isObj, fnIx)
   ) {
@@ -8840,7 +8837,7 @@ function emitUnionBoxAtRecord(
   // A value already of its destination's union is no coercion, so the checker records none: it is
   // delivered as its own union, and `boxRetagArmsOfTys` decides any retag from that.
   if exprUnion(valIx, fnIx) {
-    const own = unionNameOfExpr(valIx, fnIx)
+    const own = boxTyName(nodeTyAt(valIx, fnIx))
     if own != "" {
       return emitUnionBoxArg(body, own, nodeTyAt(valIx, fnIx), valIx, fnIx)
     }
@@ -8856,7 +8853,7 @@ function boxOwedAtRecord(valIx: i32, fnIx: i32): boolean {
   // recorded at it: a union of maps read as its one map unboxes (`mapUnbox`).
   exprUnion(valIx, fnIx)
     && coerceKindAt(valIx, fnIx) == "none"
-    && unionNameOfExpr(valIx, fnIx) != ""
+    && boxTyName(nodeTyAt(valIx, fnIx)) != ""
 }
 
 // The registry name of the union `valIx` is boxed into at its delivery (`boxDstTyOf`); "" where
@@ -12056,14 +12053,13 @@ function emitUnionLitIs(body: u8[], objIx: i32, lit: string, fnIx: i32) {
   // in force, and so the static-false fold below still evaluates it exactly once.
   const isStash = unionLitIsStashSlot()
   const isOnce = !unionEqOperandOk(objIx)
-  const uname = unionNameOfExpr(objIx, fnIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
   const usid = msSetOfUnionBox(objIx, fnIx)
   // D1047 — the empty-name reject stays ahead of the atom ladder. The ladder's i64-widening rung
   // and the mixed-union gate below both ask `unionHasAtomK`, whose fall-through fails loudly on
   // an unregistered row, and a receiver whose union has no name has no row at all. The message is
   // the condition's own; the branch is a floor, unreached by the tests and by the corpus.
-  if uname == "" {
+  if usid < 0 {
     return emitFail(
       "emitProgram: literal `is` over a union with no recorded members",
     )
@@ -12105,8 +12101,8 @@ function emitUnionLitIs(body: u8[], objIx: i32, lit: string, fnIx: i32) {
   // is arm-agnostic, so a struct or container arm simply has a tag that does not match. Widened
   // only where the literal's own rep has an arm, which the static-false fold below already trusts.
   if (
-    !isValueUnionOfSet(usid, uname)
-    && !unionCarriesLitUnionArmOfSet(usid, uname)
+    msIsValueUnion(usid) != 1
+    && msSetCarriesLitUnionArm(usid) != 1
     && !litHasArm
   ) {
     return emitFail(
@@ -15594,11 +15590,9 @@ function emitScalarMapReadBoxEq(
   if !unionEqOperandOk(boxIx) { return 0 }
   const bn = nodeAt(unwrapParen(boxIx))
   if bn is Index { return 0 }
-  const un = unionNameOfExpr(boxIx, fnIx)
-  if un == "" || !unionSetHasNullTy(un, unionBoxTyOfRead(boxIx, fnIx)) {
-    return 0
-  }
-  if !unionHasAtom(un, scalarAtomNameOfKind(k)) { return 0 }
+  const bxs = msSetOfTy(unionBoxTyOfRead(boxIx, fnIx))
+  if !exprUnion(boxIx, fnIx) || bxs < 0 || !msHasNull(bxs) { return 0 }
+  if !msSetHasAtom(bxs, scalarAtomNameOfKind(k)) { return 0 }
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
   pushMapScr(body, 5)     // entry
   fbIf(127)               // i32 result
@@ -26208,7 +26202,7 @@ function emitFnTagDispatch(
   if kind == "reflist" || kind == "nulreflist" {
     rslot = rlSlotOfTy(tyRefArrElemOf(ty))
   }
-  const un = if boxed { unionNameOfExpr(callIx, fnIx) } else { "" }
+  const un = if boxed { boxTyName(ty) } else { "" }
   let k = 0
   while k < arms.length {
     const last = k == arms.length - 1
@@ -31812,8 +31806,8 @@ function retFlagsSeedResult(
       && !nodeTyIsNulLitUnion(fn.fnRet)
       && nulCloFlag(fn.fnRet) != 1
     ) {
-      rf.retUNm = tyNameOf(fn.fnRet)
       rf.retUTy = nodeTyIxOf(fn.fnRet)
+      rf.retUNm = boxTyName(rf.retUTy)
     }
   }
   if fn.fnRet < 0 {
@@ -31825,7 +31819,7 @@ function retFlagsSeedResult(
     // alias name is excluded on the same grounds as the annotated arm above — it
     // registers as a union name but its value is the interned i32 atom, so boxing it would be wrong.
     if (isValueUnionName(im) || (isUNameAB(26, imTy) && !imLit)) {
-      rf.retUNm = im
+      rf.retUNm = boxTyName(imTy)
       rf.retUTy = imTy
     }
     // The inferred twins of the `nodeTyIsLitUnionAlias` / `nodeTyIsNulLitUnion` seeds
@@ -31838,7 +31832,7 @@ function retFlagsSeedResult(
   // instance's `() => null` for `T | null`) boxes each value at its recorded type.
   const recU = fnRecordedUnionRet(fn, fnPos)
   if rf.retUNm == "" && !rf.retLitUnion && !rf.retNulLitUnion && recU >= 0 {
-    rf.retUNm = monoPinSpellNoAnon(recU)
+    rf.retUNm = boxTyName(recU)
     rf.retUTy = recU
   }
   // A maker whose delivery builds its union of records as one record returns that record.
@@ -39590,7 +39584,7 @@ function directArgSeedsOf(target: i32, i: i32): DirectArgSeeds {
       if cpK == "union" {
         const cp4 = nodeAt(cParams[i])
         if cp4 is Param {
-          cUNm = tyNameOf(cp4.parType)
+          cUNm = boxTyName(nodeTyIxOf(cp4.parType))
           cUTy = nodeTyAt(cParams[i], fnStmts[target])
         }
       }
@@ -40588,7 +40582,7 @@ function emitCoalesceBoxRuntime(
   const bVt = nulBoxScalarValtype(bk)
   const bVb = vbHeapIdxOfKind(bk)
   let bNm = ""
-  if exprUnion(exprIx, fnIx) { bNm = unionNameOfExpr(exprIx, fnIx) }
+  if exprUnion(exprIx, fnIx) { bNm = boxTyName(nodeTyIxOf(exprIx)) }
   if (bVt < 0 || bVb < 0) && bNm == "" {
     return emitFail(
       "emitProgram: `??` over a null-narrowed value box has no rep for its result",
@@ -40637,7 +40631,7 @@ function emitOptCoalesceBoxLeaf(
 ) {
   const lhsIx = unwrapParen(e.binLeft)
   let bNm = ""
-  if exprUnion(exprIx, fnIx) { bNm = unionNameOfExpr(exprIx, fnIx) }
+  if exprUnion(exprIx, fnIx) { bNm = boxTyName(nodeTyIxOf(exprIx)) }
   // A link `emitCoalesceGo` re-associated out of a chain carries no type of its own; its
   // result is then the leaf's `T | null` with the null removed.
   let rTy = nodeTyIxOf(exprIx)
@@ -41423,13 +41417,13 @@ function emitCoalesceCallStash(
   // An `as?` yielding a box is the same shape (D1041), and an if-expression operand is a third
   // — all three name an operand that cannot be re-read (re-reading an `as?` re-runs the
   // exactness test). The gate widens rather than adding a second arm, since the lowering reads
-  // only `unionNameOfExpr` and the box — the same predicate `coalChainHasCallLhs` reserves the slot on.
+  // only the operand's type and the box — the same predicate `coalChainHasCallLhs` reserves the slot on.
   if (
     lhs is Call
     || ((lhs is AsExpr || lhs is IfStmt)
       && (tyIsNulValueUnionBox(nodeTyIxOf(lhsIx)) || nodeTyIsNulScalarBox(lhsIx)))
   ) {
-    const kunm = unionNameOfExpr(e.binLeft, fnIx)
+    const kunm = boxTyName(nodeTyIxOf(lhsIx))
     if kunm != "" {
       // D-VALUNION + D-SETONCE: one resolution feeds the value-union gate AND the
       // residual code below, which master resolved a second time inside
@@ -42089,7 +42083,7 @@ function emitCoalesceNullableRefs(
   // untangled, since the consumer double-boxes precisely because `exprUnion` answers false for
   // this node. Teaching `unionNameOfExpr` to answer for a value-union `??` is the other half; neither half works alone.
   if tyIsNulValueUnionBox(nodeTyAt(e.binLeft, fnIx)) {
-    const coNm = unionNameOfExpr(exprIx, fnIx)
+    const coNm = boxTyName(nodeTyIxOf(exprIx))
     if coNm != "" {
       const coSlot = sharedFieldRecvSlot()
       if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
