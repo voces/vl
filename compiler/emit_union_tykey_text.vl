@@ -8,6 +8,7 @@ import {
   T,
   TyArray,
   TyFunc,
+  TyLit,
   TyNullable,
   TyObj,
   TyUnion,
@@ -17,8 +18,10 @@ import {
   tyMutEpoch,
   tyToStructStr,
 } from "./check_types"
+import { numLexFitsI32 } from "./emit_bignum"
 import { strLess } from "./emit_base"
 import { unTyKeyFirstRow } from "./emit_state"
+import { strListHas } from "./listutil"
 import { flattenVariantsInto } from "./tyquery"
 
 // The depth every whole-type walk starts from: a revisited type is a cycle, so an acyclic
@@ -339,12 +342,43 @@ const utkMemoId: i32[] = []
 const utkMemoStamp: i32[] = []
 const utkMemoVer: i32[] = []
 
+// A union beside other members keys an integer literal set as the base or bases it is boxed
+// at, once each, so `(1 | 2) | null` keys as the `i32 | null` box it is stored in. A lone
+// literal set is its base scalar and has no row.
 function utkTyKeyTextGo(ty: i32): string {
   const mems: i32[] = []
   if !canonUnionMemberTysOf(ty, mems) { return "" }
   const texts: string[] = []
-  for m in mems { texts.push(utkMemberText(m)) }
-  utkTextOf(texts)
+  const wide: string[] = []
+  let widened = false
+  for m in mems {
+    const mt = utkMemberText(m)
+    texts.push(mt)
+    if mems.length > 1 && utkIntLitBasesInto(m, wide) { widened = true }
+    else if !strListHas(wide, mt) { wide.push(mt) }
+  }
+  utkTextOf(if widened { wide } else { texts })
+}
+
+// Appends the integer bases of literal set `m` to `out`, each once, and says whether `m` is one:
+// every member an integer literal.
+function utkIntLitBasesInto(m: i32, out: string[]): boolean {
+  if m < 0 || m >= T.tys.length { return false }
+  const xs: i32[] = []
+  flattenVariantsInto(unMemPeelAliasWrapper(m), xs)
+  if xs.length == 0 { return false }
+  for x in xs {
+    const xt = tyAt(x)
+    if !(xt is TyLit) || xt.litKind != "int" { return false }
+  }
+  for x in xs {
+    const xt = tyAt(x)
+    if xt is TyLit {
+      const b = if numLexFitsI32(xt.litText) { "i32" } else { "i64" }
+      if !strListHas(out, b) { out.push(b) }
+    }
+  }
+  true
 }
 
 // The first row whose type key is the key of type `ty`'s canonical members, or -1.
