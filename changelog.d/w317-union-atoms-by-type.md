@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **Step 7 L2, mono: emit_mono no longer splits a union spelling; the nullable record-field pin rung is deleted.** Whether a list element's pin and a substituted `let` annotation canon to a union of two atoms or more is asked of the type (`monoPinCanonIsUnion`: a union by `monoPinCanonKind` that no declared or literal-union alias names, since a canon alias is one atom), not of `unionSetAtomsOf`. The nullable record-field rung of `monoArgTyNameProjected`, which a loud floor showed no program in the 24,070-program population reaches, is deleted with `monoFieldDeclNullable` (coordinator ruling). `emit_mono.vl` has no `unionSetAtomsOf` caller left.
