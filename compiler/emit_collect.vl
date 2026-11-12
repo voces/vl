@@ -287,10 +287,9 @@ import {
   VKind,
   annRlNul,
   annRlSlot,
-  armFieldElemName,
+  armFieldElemSame,
   armFieldNames,
   armFieldTyText,
-  armFieldTypes,
   armPreludeBlocks,
   armStageClear,
   armStageElemKeyKind,
@@ -567,6 +566,7 @@ import {
   recordSTyIx,
   recordUFieldElemRowTy,
   recordUnMemTys,
+  repDeclRowsPending,
   repOfTy,
   repRowOfTyStruct,
   repSigKindOfTy,
@@ -585,8 +585,8 @@ import {
   regUnionNameOfTy,
 } from "./emit_anon_fields"
 import {
+  armRowsStoreAlike,
   fieldRowIsRecordRef,
-  sFieldElemNameAt,
   sScanLim,
   sioMemoReset,
   structFieldNameIxReset,
@@ -949,7 +949,7 @@ function markInferredJoinAtoms(ty: i32) {
   const nm = arenaEmitName(ty)
   if nm == "" { return 0 }
   uDeclared = true
-  markValueUnionAtoms(nm, ty)
+  markValueUnionAtoms(ty)
 }
 
 // Could this functype's result be a mixed scalar-plus-composite union? `false` is a definite
@@ -3677,11 +3677,8 @@ function leqNoteVariantFields(vi: i32) {
       // A ref-list field's frame is keyed by its field slot (`variantFieldRefSlot`), exactly as
       // the struct row's code-5 arm keys its own.
       if c == "reflist" {
-        const en = sFieldElemName[start + j]
-        if en != "" {
-          const rs = variantFieldRefSlot(vi, j)
-          if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
-        }
+        const rs = variantFieldRefSlot(vi, j)
+        if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
       }
       const lk = eqVariantListKind(c)
       if lk >= 0 { leqgNoteRep(lk, 0, 0) }
@@ -3706,11 +3703,8 @@ export function leqNoteStructRowFields(row: i32, seen: i32[]) {
     const fjn = nulFieldInnerKind(fjc)
     if fjn != null { fjc = fjn }
     if fjc == "reflist" {
-      const en = sFieldElemNameAt(row, fj)
-      if en != "" {
-        const rs = sFieldRefSlot(row, fj)
-        if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
-      }
+      const rs = sFieldRefSlot(row, fj)
+      if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
     }
     if eqKindIsRecord(fjc) {
       leqNoteStructRowFields(eqRowTgtStructIdx(row, fj), seen)
@@ -6959,6 +6953,27 @@ function structTableReset() {
   0
 }
 
+// Whether `collectS` mints a declared struct row for type declaration `s` at `sx`: a union variant
+// belongs to the variant table, a generic alias has no concrete shape, and a sub-word `flat`
+// record is layout-only.
+function typeDeclMintsRow(s: TypeDecl, sx: i32, stmts: i32[]): boolean {
+  variantIndexOf(s.tdName) < 0
+    && gaeLtAt(s.tdName) < 0
+    && !flatHasSubWordField(sx, stmts, 16)
+}
+
+// The arena types of the declared struct rows `collectS` will mint from `stmts`.
+function declRowTysOf(stmts: i32[]): i32[] {
+  const out: i32[] = []
+  for sx in stmts {
+    const s = nodeAt(sx)
+    if s is TypeDecl {
+      if typeDeclMintsRow(s, sx, stmts) { out.push(sTyIxOfName(s.tdName)) }
+    }
+  }
+  out
+}
+
 // ── struct-type collection ───────────────────────────────────────────────────
 // Scans top-level statements for every struct `type` declaration into the flat multi-struct
 // table; each interns its own WasmGC struct heap type, and a field whose type has no code
@@ -6993,11 +7008,7 @@ export function collectS(stmts: i32[]) {
       // exception is a sub-word storage field (`u8`/`i8`/`u16`/`i16`): it has no struct-field
       // rep, only a byte width, so such a record is layout-only — read by address and offset —
       // and builds no struct-field table.
-      if (
-        variantIndexOf(s.tdName) < 0
-        && gaeLtAt(s.tdName) < 0
-        && !flatHasSubWordField(stmts[i], stmts, 16)
-      ) {
+      if typeDeclMintsRow(s, stmts[i], stmts) {
         sDeclared = true
         sNames.push(s.tdName)
         recordSRowDeclOfName(s.tdName)
@@ -7092,6 +7103,8 @@ export function collectS(stmts: i32[]) {
   // unclassifiable param reads (`{ x: n }`) still matches the annotation's shape.
   collectAnnShapes()
   collectAnonShapes()
+  // The declared rows exist now, so the pending set `collectU` recorded is spent.
+  repDeclRowsPending([])
   // Every union arm whose record no struct row holds gets a reference row now, so the rows
   // exist for the rest of collection.
   const realRows = sNames.length
@@ -7333,10 +7346,7 @@ function variantFieldTysEq(a: i32, b: i32) {
   if uFieldCount[a] != uFieldCount[b] { return false }
   let fi = 0
   while fi < uFieldCount[a] {
-    if (
-      armFieldTypes()[uFieldStart[a] + fi]
-      != armFieldTypes()[uFieldStart[b] + fi]
-    ) {
+    if !armRowsStoreAlike(uFieldStart[a] + fi, uFieldStart[b] + fi) {
       return false
     }
     if !variantRecordFieldsOneRow(a, b, fi) {
@@ -7346,10 +7356,7 @@ function variantFieldTysEq(a: i32, b: i32) {
       ) {
         return false
       }
-      if (
-        armFieldElemName()[uFieldStart[a] + fi]
-        != armFieldElemName()[uFieldStart[b] + fi]
-      ) {
+      if !armFieldElemSame(uFieldStart[a] + fi, uFieldStart[b] + fi) {
         return false
       }
     }
@@ -7961,7 +7968,7 @@ function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
   if mintVariantRows(stmts, atoms, atomTys, atomPos) < 0 { return -1 }
   // A mixed union's scalar members box like a value union's — interns their per-rep value
   // boxes (a no-op for an all-struct union).
-  markValueUnionAtoms(name, mintTyIx)
+  markValueUnionAtoms(mintTyIx)
   // A ref-array arm interns its element shape and reflist slot, the twin of the value-atom
   // marking above; this early call ensures the element struct is in `sNames` before heap assignment.
   markRefArrayArms(name, mintTyIx)
@@ -8837,6 +8844,7 @@ export function collectU(stmts: i32[]) {
   // The struct table does not exist yet in this program: a previous program's rows would
   // resolve a variant's nested field to a row of theirs (D3031).
   structTableReset()
+  repDeclRowsPending([])
   // The declared-struct-name index, rebuilt here rather than memoised: a second module in the
   // same instance can present a statement list of the same length, which the index's own
   // stamp cannot see. Every `isStructAtom` ask in this pass and in mono's reads it.
@@ -8992,6 +9000,9 @@ export function collectU(stmts: i32[]) {
     ipu = ipu + 1
   }
   emitCurStmtIx = -1
+  // The variant table is complete, so the declared rows `collectS` will mint are known; a rep
+  // asked while the arms are tagged sees them (D15880).
+  repDeclRowsPending(declRowTysOf(stmts))
   if uDeclared {
     if assignTags() < 0 { return -1 }
   }
@@ -9241,7 +9252,7 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
       if !plain && unVarCount[kr] == 0 && unionArmsAreScalarsOrContainers(dty) {
         unNameBindRow(s.udName, kr)
         const krSet = unMemberSet[kr]
-        markValueUnionAtoms(krSet, dty)
+        markValueUnionAtoms(dty)
         markRefArrayArms(krSet, dty)
         markMapUnionArms(krSet, dty)
         return 0
@@ -9314,7 +9325,7 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   if mintVariantRows(stmts, vsx, vTys, vPos) < 0 { return -1 }
   // A MIXED union's scalar members intern their per-rep value boxes (no-op for an
   // all-struct union).
-  markValueUnionAtoms(udSet, declTyIxOfName(s.udName))
+  markValueUnionAtoms(declTyIxOfName(s.udName))
   // A ref-array arm of a named union interns its element shape + reflist slot, the same as
   // the inline path — so the two spellings register identically.
   markRefArrayArms(udSet, declTyIxOfName(s.udName))

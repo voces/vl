@@ -101,3 +101,7 @@ base commit, head population, head-built sweep tool and workflow file, listed in
 job) restores it and records only the head side; `diff` reads it unchanged. Artifact
 `sweep-result` holds both merged recordings, so you can re-diff them locally. The run fails
 when `diff` does. The population and the tool come from the head commit.
+
+Every pull_request run ends in `sweep-gate`, the status branch protection requires. Without the
+label it passes at once; with it, it passes only if `diff` succeeded (a cancelled sweep fails it).
+Adding the label re-runs the workflow (`labeled`), and removing it re-runs it green.

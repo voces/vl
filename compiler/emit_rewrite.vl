@@ -280,6 +280,7 @@ import {
   sidOfNode,
 } from "./symbols"
 import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
+import { identBoundFnDeclOf } from "./check_scopes"
 import { memoKeyNew, memoMoved } from "./memo"
 import {
   flattenVariantsInto,
@@ -5289,9 +5290,9 @@ function synthRecEqCoreFn(row: i32, pos: i32) {
   0
 }
 
-// Writes each `const` record literal whose fields read only unwritten un-annotated parameters,
-// and whose one whole read is a positional argument of a named call, into that argument in place
-// of its binding; a read of one of its fields becomes the parameter the field holds. The literal
+// Writes each `const` record of unwritten un-annotated parameters, or pure choice of named
+// functions, whose one whole read is a positional argument of a named call, into that argument
+// in place of its binding; a record's field read becomes the parameter the field holds. The value
 // is then delivered where it is built, as one written there is (D15700).
 export function inlineConstRecArgs(stmts: i32[]) {
   const todo: i32[] = []
@@ -5325,7 +5326,17 @@ function icraInline(fn: FuncDecl, body: i32, s: i32): boolean {
   const li = ln.letInit
   if li < 0 || li >= P.nodes.length { return false }
   const ol = nodeAt(li)
+  if ol is IfStmt {
+    if !icraChoicePure(fn, li) { return false }
+    const cr = icraReads(body, s, [])
+    const cj = icraArgSlot(cr)
+    if cj < 0 { return false }
+    const cc = nodeAt(cr[1])
+    if cc is Call { cc.callArgs[cj] = li }
+    return true
+  }
   if !(ol is ObjLit) || ol.objFields.length == 0 { return false }
+  const names: string[] = []
   for f in ol.objFields {
     const fi = nodeAt(f)
     if !(fi is FieldInit) { return false }
@@ -5336,53 +5347,20 @@ function icraInline(fn: FuncDecl, body: i32, s: i32): boolean {
     if !i32ListHas(fn.fnParams, pd) || cwDeclAssigned(pd) { return false }
     const pn = nodeAt(pd)
     if !(pn is Param) || pn.parType >= 0 { return false }
+    names.push(fi.fiName)
   }
-  let read = -1
-  let call = -1
-  let reads = 0
-  const fieldReads: i32[] = []
-  const todo: i32[] = [body]
-  const par: i32[] = [-1]
-  while todo.length > 0 {
-    const x = todo.pop() ?? -1
-    const p = par.pop() ?? -1
-    if x >= 0 && x < P.nodes.length {
-      const xn = nodeAt(x)
-      if xn is Ident && identDeclOf(x) == s {
-        const pm = if p >= 0 { nodeAt(p) } else { xn }
-        if (
-          pm is Member
-          && pm.memObj == x
-          && icraFieldValue(ol, pm.memProp) >= 0
-        ) {
-          fieldReads.push(p)
-        } else {
-          reads = reads + 1
-          read = x
-          call = p
-        }
-      }
-      for c in nodeChildren(x) {
-        todo.push(c)
-        par.push(x)
-      }
-    }
-  }
-  if reads != 1 || call < 0 { return false }
-  const cn = nodeAt(call)
-  if !(cn is Call) || hasNamedArgs(cn.callArgNames) { return false }
-  const cf = cn.callFn
-  if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return false }
-  const j = i32ListIndexOf(cn.callArgs, read)
+  const rd = icraReads(body, s, names)
+  const j = icraArgSlot(rd)
   if j < 0 { return false }
   // A field read is the parameter the field holds, while no assignment writes such a field.
-  if fieldReads.length > 0 {
-    for f in ol.objFields {
-      const fi = nodeAt(f)
-      if fi is FieldInit && cwFieldNameWritten(fi.fiName) { return false }
+  if rd.length > 3 {
+    for nm in names {
+      if cwFieldNameWritten(nm) { return false }
     }
   }
-  for m in fieldReads {
+  let k = 3
+  while k < rd.length {
+    const m = rd[k]
     const mn = nodeAt(m)
     const v = if mn is Member { icraFieldValue(ol, mn.memProp) } else { -1 }
     if v >= 0 {
@@ -5393,9 +5371,79 @@ function icraInline(fn: FuncDecl, body: i32, s: i32): boolean {
         nodeSrcNote(m, v)
       }
     }
+    k = k + 1
   }
-  cn.callArgs[j] = li
+  const cn = nodeAt(rd[1])
+  if cn is Call { cn.callArgs[j] = li }
   true
+}
+
+// The reads of binding `s` in `body`: the count of whole reads, the last one's parent and the
+// read, then each `s.<name>` read of a name in `names`.
+function icraReads(body: i32, s: i32, names: string[]): i32[] {
+  const out: i32[] = [0, -1, -1]
+  const todo: i32[] = [body]
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Ident && identDeclOf(x) == s {
+        const pm = if p >= 0 { nodeAt(p) } else { xn }
+        if pm is Member && pm.memObj == x && strListHas(names, pm.memProp) {
+          out.push(p)
+        } else {
+          out[0] = out[0] + 1
+          out[1] = p
+          out[2] = x
+        }
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+      }
+    }
+  }
+  out
+}
+
+// The positional argument slot of a named call that the one whole read in `rd` (`icraReads`)
+// fills, or -1 where the reads are not that.
+function icraArgSlot(rd: i32[]): i32 {
+  if rd.length < 3 || rd[0] != 1 || rd[1] < 0 || rd[1] >= P.nodes.length {
+    return -1
+  }
+  const cn = nodeAt(rd[1])
+  if !(cn is Call) || hasNamedArgs(cn.callArgNames) { return -1 }
+  const cf = cn.callFn
+  if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return -1 }
+  i32ListIndexOf(cn.callArgs, rd[2])
+}
+
+// Whether `x` is a choice of named functions whose conditions read only unwritten parameters of
+// `fn` or literals, so it means the same wherever in `fn` it is evaluated (D15451).
+function icraChoicePure(fn: FuncDecl, x: i32): boolean {
+  const u = unwrapParen(x)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = nodeAt(u)
+  if n is Ident { return identBoundFnDeclOf(u) >= 0 }
+  if n is Block {
+    return n.blkStmts.length == 1 && icraChoicePure(fn, n.blkStmts[0])
+  }
+  if !(n is IfStmt) || n.ifElse < 0 { return false }
+  const c = unwrapParen(n.ifCond)
+  if c < 0 || c >= P.nodes.length { return false }
+  const cn = nodeAt(c)
+  let pure = cn is BoolLit
+  if cn is Ident {
+    const d = identDeclOf(c)
+    pure = d >= 0
+      && d < P.nodes.length
+      && i32ListHas(fn.fnParams, d)
+      && !cwDeclAssigned(d)
+  }
+  pure && icraChoicePure(fn, n.ifThen) && icraChoicePure(fn, n.ifElse)
 }
 
 // The value node of field `name` in record literal `ol`, or -1 where it has none.

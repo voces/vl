@@ -9,8 +9,8 @@ that used to sit around the rows is at the bottom of this file, verbatim, as it 
 ## How to file a row
 
 1. `vl run scripts/inventory/ls.vl -- --next` prints the lowest unclaimed id, skipping every
-   range held in [`RESERVED.md`](RESERVED.md) — but CLAIM A BLOCK FIRST with
-   `--reserve D<lo>-D<hi> <holder> [<note>]`. Two agents running `--next` one second apart
+   range held in [`reserved/`](reserved/README.md) — but CLAIM A BLOCK FIRST with
+   `--reserve D<lo>-D<hi> <holder> [<note>]`, which writes `reserved/D<lo>-D<hi>.md`. Two agents running `--next` one second apart
    get the same answer, and that is how D976 and D978 were each minted twice in one day.
 2. `cp TEMPLATE.md D<id>.md` and fill it in. The heading id must equal the file's stem;
    the deno test refuses two files claiming one id.
@@ -32,8 +32,8 @@ that used to sit around the rows is at the bottom of this file, verbatim, as it 
 
 ## D-number reservations
 
-Held in [`RESERVED.md`](RESERVED.md), edited by `ls.vl --reserve` / `--release` — one home,
-not two. A reservation that lives in an agent's memory instead of a file is how two ids got
+Held in [`reserved/`](reserved/README.md), one file per range, created by `ls.vl --reserve`
+and deleted by `--release` — one home, not two, and no shared list for two lanes to conflict on. A reservation that lives in an agent's memory instead of a file is how two ids got
 minted twice on 2026-09-01. Check the id against MASTER, not your branch.
 
 <!-- inventory-split: relocated prose follows -->
