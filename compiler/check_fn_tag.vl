@@ -76,6 +76,8 @@ import {
   CW_OCC_CALL,
   CW_OCC_USE,
   CW_UP_ARG,
+  CW_UP_ELEM,
+  CW_UP_LETINIT,
   cwBindingWrittenValues,
   cwCalleeDeclOf,
   cwDeclWriteValues,
@@ -1901,7 +1903,9 @@ function ftNamedAtClosed(x: i32, p: i32, g: i32, s: i32): boolean {
   // A field of a record literal the record solve builds at a record whose field is closed.
   if pn is FieldInit {
     if pn.fiValue != x || g < 0 || !(nodeAt(g) is ObjLit) { return false }
-    return ftClosedFnTy(tyFieldTyOf(ftLitBuiltAt(g), pn.fiName))
+    const bt = ftLitBuiltAt(g)
+    const rt = if bt >= 0 { bt } else { ftLitAnnotAt(g) }
+    return ftClosedFnTy(tyFieldTyOf(rt, pn.fiName))
   }
   if !(pn is Call) || pn.callFn == x { return false }
   const i = i32ListIndexOf(pn.callArgs, x)
@@ -1911,6 +1915,80 @@ function ftNamedAtClosed(x: i32, p: i32, g: i32, s: i32): boolean {
   if !(f is FuncDecl) || i >= f.fnParams.length { return false }
   const q = nodeAt(f.fnParams[i])
   q is Param && q.parType >= 0 && ftClosedFnTy(nodeTyIxOf(f.fnParams[i]))
+}
+
+// Whether list literal `x`, bound at an annotation, holds set `s` only as members named in fields
+// of record literals that annotation builds at a closed function type, so each is its member's
+// closure and the list holds no id.
+function ftLitRecsAtClosed(x: i32, s: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  if !(n is ArrayLit) || n.arrElems.length == 0 { return false }
+  // The binding's annotation, not the literal's own type, is where the records are built, and it
+  // must hold no set decided with `s`.
+  cwIxBuild()
+  if !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_LETINIT { return false }
+  const b = cwIxUp[x]
+  const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { null }
+  if !(bn is LetDecl) || bn.letType < 0 || ftTyHoldsDecided(nodeTyIxOf(b), s) {
+    return false
+  }
+  for e in n.arrElems {
+    const o = nodeAt(e)
+    if !(o is ObjLit) { return false }
+    for fx in o.objFields {
+      const f = nodeAt(fx)
+      if !(f is FieldInit) { return false }
+      if ftHolds(f.fiValue, s) || ftIsS(f.fiValue, s) {
+        const fv = f.fiValue
+        if fv < 0 || fv >= P.nodes.length || !(nodeAt(fv) is Ident) {
+          return false
+        }
+        if !i32ListHas(fnTagMembers(s), identDeclOf(fv)) { return false }
+        if !ftClosedFnTy(tyFieldTyOf(ftLitAnnotAt(e), f.fiName)) {
+          return false
+        }
+      }
+    }
+  }
+  true
+}
+
+// The record a record literal `x` is built at, bound by an annotated binding directly or as an
+// element of one list literal (`const ys: R[] = [{ f: m }]`, or the annotation a lone use gives
+// it), or -1 (D15338). A list of lists of such records is not built at its closures yet.
+function ftLitAnnotAt(x: i32): i32 {
+  cwIxBuild()
+  let cur = x
+  let depth = 0
+  while depth < 2 {
+    if cur < 0 || !cwIxCovers(cur) { return -1 }
+    const up = cwIxUp[cur]
+    if up < 0 || up >= P.nodes.length { return -1 }
+    const un = nodeAt(up)
+    if cwIxUpKind[cur] == CW_UP_ELEM && un is ArrayLit {
+      cur = up
+      depth = depth + 1
+    } else if (
+      cwIxUpKind[cur] == CW_UP_LETINIT
+      && un is LetDecl
+      && un.letType >= 0
+    ) {
+      let t = nodeTyIxOf(up)
+      let k = 0
+      while k < depth {
+        if t < 0 || t >= T.tys.length { return -1 }
+        const tt = tyAt(t)
+        if !(tt is TyArray) { return -1 }
+        t = tt.aElem
+        k = k + 1
+      }
+      return t
+    } else {
+      return -1
+    }
+  }
+  -1
 }
 
 // Whether `x` is a call handing back one of its arguments (`ftHandBackArg`), the initialiser of
@@ -4108,6 +4186,8 @@ function ftHolderCoerced(x: i32, s: i32): boolean {
   if x < 0 || x >= P.nodes.length { return false }
   // A copy `fvaListSetCopy` built is a fresh list of adapters, which holds no id (D15132).
   if fvaListCopyAt(x) { return true }
+  // A list literal of records an annotation builds at its closures holds none either (D15338).
+  if ftLitRecsAtClosed(x, s) { return true }
   const n = nodeAt(x)
   // A record literal the record solve builds at a place holding no set decided with `s` holds
   // that place's closures.
