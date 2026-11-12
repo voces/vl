@@ -39,6 +39,6 @@ written.
 - lint-self is clean, and `regress.vl` lost no runs.
 - Witnesses `--strict`: 4,856 as filed, 0 moved.
 - Late demands 8, seed +1.9%, render-parse 13 and 28, and plumb-shape cost passes.
-- `variantIndexOf` goes from 27 to 27 code sites: the deleted rung was inside the deleted
-  function, and the two `variantIndexOf(valName)` rungs beside it stay. Those belong to the
-  map-value slots (H).
+- `variantIndexOf` code call sites go from 24 to 23: the rung inside the deleted function.
+  Master had already gone from 27 to 24, through other lanes. The two `variantIndexOf(valName)`
+  rungs beside the deleted callers stay, and belong to the map-value slots (H).
