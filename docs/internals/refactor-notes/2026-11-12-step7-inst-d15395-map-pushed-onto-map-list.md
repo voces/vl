@@ -56,4 +56,16 @@ to D15394. It still refuses from `emitGlobalSection` with no position.
 
 ## Proof
 
-SWEEP
+**Full local sweep.** Fixpoint seeds, base master `8fbf0d78`:
+
+| | count |
+| --- | --- |
+| same | 23,971 |
+| bytes-only | 0 |
+| output movers | 1 |
+| runs → not-runs | 0 |
+| new compiler traps | 0 |
+
+The one mover is D15395, which goes from refusal to runs. D15158's new witness, D15394's program,
+still refuses. One program is only in the base: D15752's witness. The base record was taken on
+the #7396 tree, which files that row.
