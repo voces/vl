@@ -158,7 +158,6 @@ import {
   gaeParamShadowed,
   gaeSplitArgs,
   mapValNameOf,
-  nameIsBareMap,
   nameIsClosureArray,
   nameIsElemArray,
   nameIsF32Array,
@@ -366,7 +365,6 @@ import {
   tyIsNulMap,
   unNameBound,
   unionArmsOfTy,
-  unionMemberCountOfName,
   unionSetHasNullTy,
   unionSetMemberCount,
 } from "./emit_union_registry"
@@ -398,7 +396,6 @@ import {
   nameIsArray,
   nameIsFuncTypeAtom,
   nameIsShapeOpen,
-  peelGroupParens,
 } from "./tyname"
 import {
   flattenVariantsInto,
@@ -1915,60 +1912,6 @@ function nameIsRefArrayGo(name: string) {
   false
 }
 
-// `refElemArrName` re-forms an element name as its array name (`<elem>[]`) for
-// `refArrElemKind` — one producer, no allow-list. `nulStructElemNiche` asks whether `nn`
-// is the niche kind-1 covers (a declared struct or union variant, one heap since D280),
-// reusing that ladder's exact rungs and order so the two can never disagree (D1340).
-function nulStructElemNiche(nn: string): boolean {
-  if structRowOfSpelling(nn) >= 0 { return true }
-  variantIndexOf(nn) >= 0
-}
-
-// Whether `enp`, the non-null part of a nullable element, is a registered union of two or
-// more members: its nullable is the union box with a null member, as `(U | null)[]` spells it.
-function nulBoxUnionElem(enp: string): boolean {
-  if enp == "" { return false }
-  isUNameDeclAB(74, enp) && unionMemberCountOfName(enp) >= 2
-}
-
-export function refElemArrName(elemName: string): string {
-  // Re-forms `elemName` as its array name for `refArrElemKind` to read the kind. A
-  // nullable-list, closure, or map element needs its grouping parens restored
-  // (`(elem)[]`), matching every niche kind `refArrShapeKind` recognizes; a value-union
-  // element has no niche and stays ungrouped so the union-box arm handles it directly.
-  let arrName = elemName + "[]"
-  const enp = nullablePartOf(elemName)
-  if (
-    enp != ""
-    && (nameIsArray(enp)
-      || nameIsFuncTypeAtom(enp)
-      || nameIsBareMap(enp)
-      || nulStructElemNiche(enp))
-  ) {
-    // A nullable-list, nullable-closure, or nullable-map element needs its grouping
-    // parens restored here to read as its niche kind.
-    arrName = "(" + elemName + ")[]"
-  } else if (
-    parenUnionArrElemName("(" + elemName + ")[]") != ""
-    && (isValueUnionName(elemName) || enp == "" || nulBoxUnionElem(enp))
-  ) {
-    // A value-union element needs its grouping parens restored, or `refArrElemKind`
-    // mis-splits it as a struct element and an unboxed value lands in a ref slot; a
-    // niche-nullable-scalar element (`string | null`) has no union-box rep, so it stays
-    // ungrouped to keep its kind-1 reject.
-
-    arrName = "(" + elemName + ")[]"
-  } else if (
-    enp == ""
-    && nameIsFuncTypeAtom(elemName)
-    && peelGroupParens(elemName) == elemName
-  ) {
-    // A bare function element (`(i32)=>i32`) is grouped too, or `[]` binds to its result (D9231).
-    arrName = "(" + elemName + ")[]"
-  }
-  arrName
-}
-
 export function refArrElemKind(name: string) {
   // Every shape-decided arm is `refArrShapeKind`, tested in the same order —
   // `nameIsRefArray` carries a second hand-written copy of this ladder.
@@ -3303,7 +3246,7 @@ function nulRefElemNameOfArrTy(ty: i32): string {
 // no such name, which `arrLitNulUnionElemName` reads as no union box.
 export function arrLitNulRefElemKind(arrIx: i32, fnIx: i32): i32 {
   if arrLitNulRefElemName(arrIx, fnIx) == "" { return -1 }
-  refListElemKindOfTy(tyArrayElemIx(nodeTyIxOf(arrIx)))
+  refListElemKindOfTy(tyArrayElemIx(nodeTyAt(arrIx, fnIx)))
 }
 
 // The `arrLitNumKind` answers.
@@ -4147,15 +4090,20 @@ export function variantFieldRefSlot(vi: i32, fi: i32) {
 }
 
 // The ref-list table slot of struct `si`'s ref-list field `fi`, `variantFieldRefSlot`'s struct
-// twin (D1579), minted on a miss. A field with no recorded element type (a template's field at
-// a type parameter) is minted by the type its stored name resolves to, else by the name.
+// twin (D1579), minted on a miss. A template's field at a type parameter no row holds is keyed
+// by its stored name and classified by its open element type; a field with none by its name's.
 export function sFieldRefSlot(si: i32, fi: i32) {
   const ty = sFieldElemTyIxAt(si, fi)
+  if ty >= 0 && tyHasTyVar(ty) && rlSlotOfTyOrTwin(ty) < 0 {
+    const tn = sFieldElemNameAt(si, fi)
+    rlNameMint(tn, ty)
+    return rlSlotByName(tn)
+  }
   if ty < 0 {
     const nm = sFieldElemNameAt(si, fi)
     const et = fieldElemTyIxOfName(nm)
     if et < 0 {
-      rlNameMint(nm)
+      rlNameMint(nm, -1)
       return rlSlotByName(nm)
     }
     rlRowMint(et)
