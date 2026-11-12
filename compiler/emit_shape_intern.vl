@@ -54,10 +54,8 @@ import {
 import {
   annFnDecompose,
   arrLeafNameOf,
-  mapValNameOf,
   nameIsElemArray,
   nameIsLitUnionArray,
-  nameIsMap,
   nameIsShapeSpanEnds,
   normTypeAtom,
   nullablePartOf,
@@ -186,7 +184,6 @@ import {
   annGenAppSpanEnds,
   arrElemNameRaw,
   groupInnerOf,
-  nameIsParenOpen,
   nameIsShapeOpen,
   nameStripSpaces,
 } from "./tyname"
@@ -360,27 +357,32 @@ function internFuncTypeShapesTy(nm: string, ty: i32): i32 {
   r
 }
 
+// The stored spelling of a record of tagged-set ids (`{f: Fn#a}` stored as `{f: i32}`),
+// installed by `emitProgram` before any pass, since its home sits above this module in the
+// import graph; a read before that traps.
+function tagRepNameUnset(_ty: i32): string { __trap__() }
+export let tagRepNameFn: (ty: i32) => string = tagRepNameUnset
+
+// Walks type `ty`, interning every inline shape, value union and function type it holds. The
+// walk keys each type by its nominal name when `nm` is that name (`shapeWalkName` passes
+// another on a cycle), else by its render, rendered only then since a deep record's render
+// doubles per level; a record of tagged-set ids, which has no render, by its stored spelling.
 function internShapeDeepTyGo(nm: string, ty: i32) {
-  if nm.length < 2 { return 0 }
-  // Peels only a grouping pair that wraps the whole name. A functype whose leading `(` is
-  // its own param list must not be blind-peeled — the garbled remainder dead-ends every case
-  // below, so the shapes buried in its result spine never intern.
-  const uw = normTypeAtom(nm)
-  if uw.length != nm.length { return internShapeDeepTy(uw, ty) }
-  // A value union leaf registers its box reps. Its `| null` is not peeled: here the null is
-  // a union atom (a tag in a non-null box), not a nullable-niche wrapper. Checked after the
-  // parens peel but before the `| null` peel, which would lose the atom.
-  if isValueUnionName(nm) {
-    registerValueUnionNameAB(7, nm, ty)
-    // A closure atom of the value union may bury inline shapes in its params or result,
-    // unreachable through the box registration alone. Descended through the
-    // soundness-gated functype interner, which keeps an unsupported-field shape
-    // un-interned — a clean reject, never invalid wasm.
-    if strContains(nm, "=>") {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = tyAt(ty)
+  const nn = tyToNominalName(ty)
+  let ln = nn
+  if nn == "" || nm != nn {
+    ln = tyToEmitName(ty)
+    if ln == "" { ln = nn }
+  }
+  if ln == "" && t is TyObj { ln = tagRepNameFn(ty) }
+  if ln == "" { return 0 }
+  if isValueUnionName(ln) {
+    registerValueUnionNameAB(7, ln, ty)
+    if strContains(ln, "=>") {
       const vArms: string[] = []
-      // The row just registered answers its recorded atoms, paired with its arena members
-      // the same way `internShapeArms` pairs its composite arms.
-      unionSetAtomsOf(nm, vArms)
+      unionSetAtomsOf(ln, vArms)
       const vTys: i32[] = []
       let vCov = unionMemberTysOfAB(10, ty, vTys)
       if vTys.length != vArms.length { vCov = false }
@@ -396,55 +398,18 @@ function internShapeDeepTyGo(nm: string, ty: i32) {
     }
     return 0
   }
-  // The function test runs before the `| null` and `[]` peels, which would claim `() => (f64 |
-  // null)[]` and `(i32) => string | null` by their result. It asks the type: a nullable closure
-  // is a nullable, not a function, and an untyped closure name only reaches here from a generic
-  // original or a declaration whose typed reach interns the same shapes.
-  if tyIsFuncArena(ty) && nameIsParenOpen(nm) {
-    return internFuncTypeShapesTy(nm, ty)
+  if tyIsFuncArena(ty) { return internFuncTypeShapesTy(ln, ty) }
+  if t is TyNullable { return internShapeDeepTy("", t.nInner) }
+  if t is TyUnion && unionSetMemberCount(ln) > 1 {
+    const uArms: string[] = []
+    unionSetAtomsOf(ln, uArms)
+    internShapeArms(ln, uArms, ty)
+    return 0
   }
-  const np = nullablePartOf(nm)
-  if np != "" { return internShapeDeepTy(np, nullableInnerOrNone(ty)) }
-  // A mixed composite union: a top-level `|` here means at least one arm is a composite, so
-  // its inline struct/map arms must intern now, before `collectAnonShapes` names the same
-  // shape `#anonN` and the union arm's name-based lookup fails to find the reflist slot
-  // the literal interns — a silent fall-through to scalar-boxing, invalid wasm.
-  if !strContains(nm, "(") {
-    // Count before cutting: the atoms are only used when the name has 2+ top-level members, so
-    // a single-member name would build and discard one string. `unionSetMemberCount` is the
-    // allocation-free dual (B272), and this is the hottest member-set split in
-    // the compiler — the overwhelming majority of reaches here are single-member.
-    if unionSetMemberCount(nm) > 1 {
-      const uArms: string[] = []
-      unionSetAtomsOf(nm, uArms)
-      internShapeArms(nm, uArms, ty)
-      return 0
-    }
-  } else {
-    // The same count-before-cut on the paren-carrying branch, most reaches single-member.
-    if unionSetMemberCount(nm) > 1 {
-      const pArms: string[] = []
-      unionSetAtomsOf(nm, pArms)
-      internShapeArms(nm, pArms, ty)
-      // Returns, exactly as the paren-free branch does: the arms below (array, map, and
-      // inline-shape peels) would otherwise treat a top-level `|` name as the composite its
-      // first arm happens to be — `{[string]:()=>i32}|{w:i32}|null` claimed by `nameIsMap`,
-      // for instance. The arms are already interned one line up, so nothing is left to reach.
-      return 0
-    }
-  }
-  if nameIsElemArray(nm) {
-    return internShapeDeepTy(arrElemNameRaw(nm), tyStepElem(ty))
-  }
-  // A map name: the inline shapes buried in the value position are otherwise unreachable,
-  // since the whole map is one TypeRef name and `internInlineShape` no-ops on a map. Descend
-  // into the value so its shapes intern, via position-independent map-value resolution. A
-  // named-alias value already interned via its own TypeRef, so this is the inline dual.
-  if nameIsMap(nm) {
-    return internShapeDeepTy(mapValNameOf(nm), tyMapValOf(ty))
-  }
-  gaeEnsure(nm, ty)
-  internInlineShapeTy(nm, ty) // no-op for any non-shape leaf
+  if t is TyArray { return internShapeDeepTy("", tyStepElem(ty)) }
+  if t is TyMap { return internShapeDeepTy("", tyMapValOf(ty)) }
+  gaeEnsure(ln, ty)
+  internInlineShapeTy(ln, ty)
   0
 }
 

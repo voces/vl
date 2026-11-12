@@ -79,7 +79,7 @@ pin such as `string|null` out of `string|i32|null`. They no longer disagree. Tha
 - **Locally:**
   - refresh to a fixpoint;
   - `lint-self.sh` clean;
-  - render-parse 12 / 38, with the baseline written;
+  - render-parse 12 / 38 at the base; 13 / 36 after merging #7600;
   - pin-helper 911, with the baseline written (it was one stale at 912);
   - late demands 8 (baseline 8);
   - seed size +2.2% (6,735,476 → 6,735,747 bytes);
