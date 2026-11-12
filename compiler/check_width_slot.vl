@@ -87,6 +87,10 @@ let slNo: i32[] = []
 let slRound: i32[] = []
 let slPath: i32[] = []
 let slSnap: {[i32]: string} = Map()
+// Where the pass before the round refused, each a refusal the round did not cause.
+let slPre: i32[] = []
+// Set once a round of several slots fails: each later round takes one slot, so each is judged alone.
+let slSingle = false
 // The `SL_*` reason each declined slot is declined for.
 let slWhy: {[i32]: i32} = Map()
 
@@ -98,6 +102,8 @@ export function slotReset() {
   slPath = []
   slSnap = Map()
   slWhy = Map()
+  slPre = []
+  slSingle = false
   0
 }
 
@@ -200,15 +206,6 @@ function slotSnapshot(root: i32): {[i32]: string} {
   out
 }
 
-// Whether every refusal of this pass is one a slot candidate raised.
-function slotOnlyRefusals() {
-  if T.diags.length == 0 { return false }
-  for d in T.diags {
-    if !i32ListHas(wsSlotAt, d.tat) { return false }
-  }
-  true
-}
-
 // Whether slot `d` is a binding; any other slot is a function's return.
 function slotIsLet(d: i32) { nodeAt(d) is LetDecl }
 
@@ -292,28 +289,30 @@ function slotTsReadonly(ix: i32) {
   false
 }
 
-// Drops the annotation of every slot this pass's refusals name, when they are its only refusals.
-// Answers how many it dropped, which the caller re-checks for.
+// Drops the annotation of each slot this pass's width refusals name that may drop. Answers how many
+// it dropped, which the caller re-checks for.
 export function slotApply(root: i32) {
-  if wsSlotAt.length == 0 || !slotOnlyRefusals() { return 0 }
+  if wsSlotAt.length == 0 { return 0 }
   const par = slotWalk(root)
   const found: i32[] = []
   const path: i32[] = []
   for at in wsSlotAt {
-    const s = slotOf(at, par, path)
-    if s < 0 && slotOtherContract(at, par) { continue }
+    const own: i32[] = []
+    const s = slotOf(at, par, own)
     // A `readonly` slot promises no write through it, which its dropped annotation would lose.
-    if (
-      s < 0
-      || i32ListHas(slNo, s)
-      || i32ListHas(slDecl, s)
-      || slotReadonly(s)
-    ) {
-      return 0
+    const ok = s >= 0
+      && !i32ListHas(slNo, s)
+      && !i32ListHas(slDecl, s)
+      && !slotReadonly(s)
+    if ok && !(slSingle && found.length > 0 && !i32ListHas(found, s)) {
+      for x in own { path.push(x) }
+      if !i32ListHas(found, s) { found.push(s) }
     }
-    if !i32ListHas(found, s) { found.push(s) }
   }
   if found.length == 0 { return 0 }
+  const pre: i32[] = []
+  for d in T.diags { pre.push(d.tat) }
+  slPre = pre
   slSnap = slotSnapshot(root)
   slPath = path
   slRound = found
@@ -429,7 +428,8 @@ function slotAsgTarget(x: i32) {
 
 // Why the re-check's refusals undo the round: `SL_MIXED` when one is a value handed to one of the
 // round's slots, `SL_GAP` when one is anything else, and `SL_HELD` when each is a contract refusal
-// outside the slots or a slot the next round drops, which leaves the round to the reads that follow.
+// outside the slots, a slot the next round drops, or one the pass before raised, which leaves the
+// round to the reads that follow.
 function slotRefusalsWhy(par: {[i32]: i32}) {
   let mixed = false
   for d in T.diags {
@@ -440,7 +440,11 @@ function slotRefusalsWhy(par: {[i32]: i32}) {
       || i32ListHas(slRound, identDeclOf(slotAsgTarget(d.tat)))
     ) {
       mixed = true
-    } else if !(s < 0 && slotOtherContract(d.tat, par)) && !slotNext(d.tat, s) {
+    } else if (
+      !(s < 0 && slotOtherContract(d.tat, par))
+      && !slotNext(d.tat, s)
+      && !i32ListHas(slPre, d.tat)
+    ) {
       return SL_GAP
     }
   }
@@ -501,6 +505,8 @@ function slotHeld(root: i32) {
           const u = slotUse(v, p, changed, par)
           if u == 0 { return SL_GAP }
           if u == 4 { return SL_JOINED }
+          // An assignment whose either side is the slot's value takes the slot's type with it.
+          if u == 1 { own[p] = true }
           if u == 3 {
             own[p] = true
             if !i32ListHas(fam, p) { fam.push(p) }
@@ -519,8 +525,9 @@ function slotHeld(root: i32) {
   SL_HELD
 }
 
-// Settles the round's drops after their re-check, restoring and declining them unless the
-// program held. True when it restored any, so a re-check is owed to report the refusals.
+// Settles the round's drops after their re-check: unless the program held, each is restored and
+// declined, or, after a first failing round of several, restored to be taken one at a time. True
+// when it restored any, so a re-check is owed.
 export function slotSettle(root: i32) {
   if slRound.length == 0 { return false }
   const why = slotHeld(root)
@@ -529,20 +536,24 @@ export function slotSettle(root: i32) {
   slPath = []
   slSnap = Map()
   if why == SL_HELD { return false }
+  const retry = round.length > 1 && !slSingle
+  if retry { slSingle = true }
   for s in round {
-    slWhy[s] = why
     let k = 0
     while k < slDecl.length {
       if slDecl[k] == s { slotSetAnn(s, slAnn[k]) }
       k = k + 1
     }
-    slNo.push(s)
+    if !retry {
+      slWhy[s] = why
+      slNo.push(s)
+    }
   }
   const kd: i32[] = []
   const ka: i32[] = []
   let r = 0
   while r < slDecl.length {
-    if !i32ListHas(slNo, slDecl[r]) {
+    if !i32ListHas(round, slDecl[r]) {
       kd.push(slDecl[r])
       ka.push(slAnn[r])
     }
@@ -744,11 +755,12 @@ export function slotContractWords(root: i32) {
     if d.tcode == CODE_UNSUPPORTED_LOWERING && k < wsSlotAt.length {
       const why = slotContractClause(d.tat, wsSlotDst[k], par)
       if why != "" {
-        const msg = "an existing record of shape "
-          + tyToStrUser(wsSlotSrc[k])
-          + " keeps its own layout where it is delivered (no copy is made), and "
+        const msg = "an existing record keeps its own record layout where it is delivered (no copy "
+          + "is made), and "
           + why
-          + "; build a fresh "
+          + "; this "
+          + tyToStrUser(wsSlotSrc[k])
+          + " cannot share it, so build a fresh "
           + tyToStrUser(wsSlotDst[k])
           + " here instead, as `"
           + slotFreshLit(d.tat, wsSlotDst[k])
