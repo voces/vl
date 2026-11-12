@@ -31,8 +31,8 @@ its registry key with `tyToNominalName(ty)` / `tyToEmitName(ty)`, which the cens
 | `annTyIsRefList` | emit_collect.vl | I (lane F told) | `nd.tyName == ""`: whether an annotation is written | a **label** (presence), not a second producer; the rep is the arena's (`tyIsRefArray`) |
 | `emitLetIfInit` | wasmEmit.vl | G | `tyNameOf(s.letType)`, the union box's name, handed with `nulTy` to `emitUnionBoxArg(siteNm, siteTy)` | lane **G**'s: it converts with that union-box reader; sent the site and the typed input `nulTy` |
 | `jrFieldFitsAt` | emit_shape_rows.vl | I | `nameIsLitUnionArray(elem)` on the arm field's element name, at the `FC_I32_LIST` rung | **unreached**: a trap control on that rung fires in 0 of 24,178 programs, and two hand-written controls built to reach it (an arm with a literal-union list field, matched through `mvValArmOfShapeTy`) do not. The typed input is `et`, the arm field's element type. It is converted or deleted with the first program that reaches it |
-| `paramStructIndex` | emit_sig_tokens.vl | B | `structRowOfAnnTy(ty.tyName, pty, pty)`: a struct-name producer | lane **B**'s; sent the site and the typed input `pty`. Its other read, `annIsSpelledInlineShape(…, ty.tyName)`, is converted below |
-| `structIndexOfTypeNameTy` | emit_shape_rows.vl | B | `structIndexByName(name)`, then `nameIsWholeSpanShape(name)` | lane **B**'s (the struct-name producers), in flight |
+| `paramStructIndex` | emit_sig_tokens.vl | B | `structRowOfAnnTy(ty.tyName, pty, pty)`: a struct-name producer | **closed by B** (#7615 asks the struct row by type). Its other read, `annIsSpelledInlineShape(…, ty.tyName)`, is converted below |
+| `structIndexOfTypeNameTy` | emit_shape_rows.vl | B | `structIndexByName(name)`, then `nameIsWholeSpanShape(name)` | **closed by B**: deleted in #7615 |
 | `retFlagsSeedResult` | wasmEmit.vl | G | `tyNameOf(fn.fnRet)` as the result's union name | lane **G**'s (union-box readers), in flight |
 | `unionNameOfCall` | emit_classify.vl | G | `tyNameOf(fn.fnRet)` as the call's union name | lane **G**'s, in flight |
 | `monoTagMapRepName` | emit_mono.vl | D | `tyToStr(m.mKey)` inside the pin spelling it builds from the arena | lane **D**'s (mono pin keys). It is one producer, the arena rendered into a key: an output, not a second source |
@@ -45,7 +45,7 @@ its registry key with `tyToNominalName(ty)` / `tyToEmitName(ty)`, which the cens
 | `annIsSpelledInlineShape` | emit_sig_tokens.vl | I | **converted**: it asks the annotation's tree alone. Its spelling fallback (`nameIsShapeSpanEnds(nm)` where the annotation has no tree) is reached by 206 programs, and a second probe that traps only when the fallback answers true fires in none of them. The fallback and its `nm` parameter are deleted |
 | `funcTypeShapeLowerable` | emit_shape_intern.vl | E (field codes: H) | in flight with E |
 | `structElemArrayLowerable` | emit_shape_intern.vl | E | in flight with E |
-| `nulScalarListKind` | emit_shape_rows.vl | H | in flight with H (#7609) |
+| `nulScalarListKind` | emit_shape_rows.vl | H | **closed by H**: deleted in #7609 |
 | `refArrElemNameGo` | emit_shape_rows.vl | F | in flight with F (cut 4) |
 | `refArrShapeKindGo` | emit_shape_rows.vl | F | in flight with F (cut 4) |
 
@@ -59,22 +59,24 @@ decide no rep:
 - `internShapeDeepTyGo` renders a key from the type.
 
 The two `emit_elab` keys were comparison keys standing in for a type comparison; one is now that
-comparison, and the other compared nothing. That leaves 6 pairs that are a second producer, all
-in other lanes' files: `emitLetIfInit`, `retFlagsSeedResult`, `unionNameOfCall` (G),
-`paramStructIndex`, `structIndexOfTypeNameTy` (B) and `jrFieldFitsAt` (unreached, mine).
+comparison, and the other compared nothing. Lane B's two (`paramStructIndex`,
+`structIndexOfTypeNameTy`) closed in #7615. That leaves 4 pairs that are a second producer:
+`emitLetIfInit`, `retFlagsSeedResult` and `unionNameOfCall` (G), and `jrFieldFitsAt` (unreached,
+mine).
 
 ## Proof
 
-- **Census after this PR:**
+- **Census after this PR** (on its base it read 9 ARENA+NAME and 5 SPELLING; the two `emit_elab`
+  pairs and `annIsSpelledInlineShape` are gone). Merged with master at #7615, it reads:
 
   | set | classifiers | call sites |
   | --- | --- | --- |
-  | ARENA+NAME | 9 | |
+  | ARENA+NAME | 7 | |
   | ARENA+SPELLING | 0 | |
-  | NAME | 37 | 68 |
-  | SPELLING | 5 | 8 |
+  | NAME | 33 | 64 |
+  | SPELLING | 4 | 7 |
 
-  The two `emit_elab` pairs and `annIsSpelledInlineShape` are gone.
+  #7615 removed lane B's two pairs, and #7609 removed `nulScalarListKind`.
 - **Sweep:** both sides on fixpoint seeds (base `2c252adf2`), 24,178 programs: 24,178 same, 0
   bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
 - **Probes:** built by the master seed into scratch and never refreshed into `build/`.
