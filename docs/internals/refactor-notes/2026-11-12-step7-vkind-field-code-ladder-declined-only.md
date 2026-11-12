@@ -78,8 +78,8 @@ before and after.
 ## What is left in the ladder
 
 - **Two spelling reads,** `isValueUnionName(t)` and `isUNameDeclAB(75, t)`: the union registry's
-  name lookups. They go when the registry answers by type, on w316's cut order. In the meantime
-  they are floors.
+  name lookups. They are not floors. They convert to the registry's typed readers when lane G's
+  cuts 3–4 land.
 - **The ref-list, scalar-list and nullable-list arms** answer from the type. They are the
   descriptor's B171 domain: a nullable element (`(i32|null)[]`) and a record or union element the
   descriptor's array arm declines.
