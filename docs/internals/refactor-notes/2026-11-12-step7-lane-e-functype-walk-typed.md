@@ -53,9 +53,9 @@ run.
   - 0 output movers;
   - 0 `runs → not-runs`;
   - 0 new compiler traps.
-- `scripts/gate.sh` on master `259c4329`: all 23 rows pass, among them rep-fuzz, filed witnesses, late demands, seed
+- `scripts/gate.sh` on master `259c4329` and on the tree merged with `66b6c496`: all 23 rows pass, among them rep-fuzz, filed witnesses, late demands, seed
   size, plumb-shape cost, the distilled corpus, scaling shape, and the dead-export budget (with
   `tyStepParam` deleted).
-- Render-parse with `--findings`, on master `259c4329`: 13 renders, 30 → 28 parses.
+- Render-parse with `--findings`, on master `259c4329` and again merged with `66b6c496`: 13 renders, 30 → 28 parses.
   `annFnDecompose`'s `annArrowAt` (emit_base 16 → 15) and the walk's `nullablePartOf`
   (emit_shape_intern 3 → 2) are gone. `--write-baseline` is in this PR.
