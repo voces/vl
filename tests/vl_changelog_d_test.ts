@@ -22,8 +22,10 @@ Deno.test("CHANGELOG.md matches the pin the last fold wrote", () => {
   if (want !== got) {
     throw new Error(
       `CHANGELOG.md was edited directly: want ${want}, got ${got}. ` +
-        "Put the entry in a new changelog.d/<branch>.md file (changelog.d/README.md) " +
-        "and restore CHANGELOG.md from master.",
+        "Fix: `git checkout origin/master -- CHANGELOG.md`, then put your entry in a new " +
+        "changelog.d/<branch>.md: its CHANGELOG `## ` section heading, then the `- ` bullet " +
+        "(changelog.d/README.md). If this is red on master itself, the orchestrator runs " +
+        "`vl run scripts/changelog-fold.vl -- --repin`.",
     );
   }
 });

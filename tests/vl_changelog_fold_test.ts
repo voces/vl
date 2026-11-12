@@ -98,6 +98,10 @@ Deno.test({
         true,
         d.out.includes("edited outside the fold"),
       );
+
+      const r = await fold(dir, ["--repin"]);
+      want("--repin exit", 0, r.code);
+      want("--repin accepts the edit", 0, (await fold(dir, ["--check"])).code);
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
