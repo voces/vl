@@ -1,6 +1,7 @@
 // `emit_shape_intern.vl` — interning inline and deep shapes, function-type shapes
 // and ref-array arms into the shape tables.
 
+import { cUserTypes } from "./check_types"
 import { fieldNameOrder } from "./check_obj_shape"
 import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { recFieldStoreTyOf } from "./emit_rec_field_codes"
@@ -26,6 +27,7 @@ import {
   TyUnion,
   TyVar,
   structNameOfTy,
+  tyArrayElemIx,
   tyAt,
   tyFieldTyOf,
   tyHasHole,
@@ -34,6 +36,7 @@ import {
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tyIsNullableLitUnion,
+  tyIsOneStrLit,
   tyNulInnerIsPrim,
   tySame,
   tyToEmitName,
@@ -72,6 +75,7 @@ import {
 } from "./emit_field_codes"
 import {
   fieldCloSigOf,
+  fieldCloSigOfTy,
   sFieldCloSigCompat,
   shapeFieldElemRow,
   shapeFieldRowOf,
@@ -116,7 +120,6 @@ import {
   nameIsStructDecl,
   nulRefListFieldCodeOfTy,
   refArrElemName,
-  refArrShapeKind,
   repStructRowIsOrTwin,
   shapeFieldElemName,
   structRowOfRecordTy,
@@ -125,6 +128,7 @@ import {
 } from "./emit_shape_rows"
 import { memoKeyNew, memoMoved } from "./memo"
 import {
+  FC_CLOSURE,
   FC_F32,
   FC_F32_LIST,
   FC_F64,
@@ -153,7 +157,6 @@ import {
   FC_STR_LIST,
   FC_U8_LIST,
   FC_UNION,
-  RLK_UNION,
   emitPhaseReached,
   gaeBases,
   gaeFieldCount,
@@ -736,13 +739,10 @@ function shapeFieldsRideTyParam(
     const eTy = tyStepElem(fTy)
     if eTy >= 0 {
       if tyAt(arrSpineLeafTy(eTy)) is TyVar { return true }
-      // `(T | null)[]`: `refArrShapeKind`'s paren-union fall-through is unconditional, so
-      // `rlInternName` would resolve the unregistered `T | null` onto struct row 0, invalid
-      // at run. A declared `T` the parameter shadows resolves to kind 1 and keeps its row.
+      // `(T | null)[]` over a parameter has no row until the parameter is substituted. A
+      // declared `T` the parameter's name shadows wins (the shadow ruling) and keeps its row.
       const nTy = nullableInnerOrNone(eTy)
-      if nTy >= 0 && tyAt(nTy) is TyVar && refArrShapeKind(t) == RLK_UNION {
-        return true
-      }
+      if nTy >= 0 && tyVarNamesNoDecl(nTy) { return true }
     }
     gp = gp + 1
   }
@@ -1242,8 +1242,12 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
   // is declared. The field-set find serves a type with no row.
   let existing = -1
   if fieldsTy >= 0 { existing = structRowOfRecordTy(fieldsTy) }
+  // A typed shape finds its row by layout, an untyped one by the field-set spelling key.
   if existing < 0 {
-    existing = annShapeIndexOf(names, codes, texts, tyIx, fieldsTy)
+    existing = annShapeLayoutRowOf(names, codes, texts, tyIx, fieldsTy)
+    if existing == -2 {
+      existing = annShapeIndexOf(names, codes, texts, tyIx, fieldsTy)
+    }
   }
   if existing >= 0 {
     // A literal's `#anon` row carries no spelling, so the annotation it serves is recorded
@@ -1252,7 +1256,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
     structTyIxAlias(tyIx, existing)
     return existing
   }
-  const same = annSameTypeRowOf(nm, tyIx, fieldsTy, names, codes)
+  const same = annSameTypeRowOf(tyIx, fieldsTy, names, codes)
   if same >= 0 {
     structTyIxAlias(tyIx, same)
     return same
@@ -1388,11 +1392,22 @@ let sSetTail: i32[] = []
 let sSetNext: i32[] = []
 let sSetLen = 0
 
+// The layout index: each stored row whose fields all record a storage type, bucketed by its
+// layout id (`shapeLayoutIdOf`). A row with an untyped field is in the spelling index only.
+let lSetHead: i32[] = []
+let lSetTail: i32[] = []
+let lSetNext: i32[] = []
+let lSetLen = 0
+
 export function shapeSetIxReset() {
   sSetHead = []
   sSetTail = []
   sSetNext = []
   sSetLen = 0
+  lSetHead = []
+  lSetTail = []
+  lSetNext = []
+  lSetLen = 0
   // A walk that trapped mid-compile must not leave its types marked for the next one.
   shapeWalkStack = []
   0
@@ -1526,23 +1541,205 @@ function sSetSync() {
   0
 }
 
-// The row already minted under spelling `nm`, or else for a type of the same storage, with the
-// same field codes, or -1. Name lookup answers the first such row, so a second one served only the
-// type-keyed readers, which then saw two rows for one type (D10771). A literal's `#anon` row is
-// not reused by type: a generic instance's value is built against its own row.
+// Whether field code `c` stores a reference whose identity the layout keys by the target's row.
+function layoutRefCode(c: i32): boolean {
+  c == FC_REF_LIST
+    || c == FC_STRUCT
+    || c == FC_UNION
+    || c == FC_MAP
+    || c == FC_NUL_REF_LIST
+    || c == FC_NUL_MAP
+}
+
+// Whether a field of code `c` and arena type `fty` holds literal-union atoms, whose encoding is
+// the union's own, so two such fields share a layout only for one union.
+function layoutAtomField(c: i32, fty: i32): boolean {
+  if fty < 0 { return false }
+  if c == FC_I32 { return tyIsLitUnion(fty) || tyIsOneStrLit(fty) }
+  if c == FC_STR { return tyIsLitUnion(fty) }
+  if c == FC_I32_LIST {
+    const e = tyArrayElemIx(fty)
+    return e >= 0 && tyIsLitUnion(e)
+  }
+  c == FC_NUL_LIT_UNION
+}
+
+// Pushes field `(code, storeTy)`'s layout key onto `out` as three ints, false when the field
+// records no type the key needs. A reference keys by its target's row identity and, for a list
+// of functions, the element's signature; an atom field by its union; any other scalar by its code.
+function layoutFieldPush(
+  code: i32,
+  storeTy: i32,
+  atom: boolean,
+  out: i32[],
+): boolean {
+  out.push(code)
+  if layoutRefCode(code) {
+    if storeTy < 0 { return false }
+    const rid = repRowId(storeTy)
+    if rid < 0 { return false }
+    out.push(rid)
+    let sig = -1
+    if code == FC_REF_LIST || code == FC_NUL_REF_LIST {
+      const e = tyArrayElemIx(tyPeelNul(storeTy))
+      if e >= 0 && tyAt(e) is TyFunc {
+        sig = sidOf(fieldCloSigOfTy(FC_CLOSURE, e))
+      }
+    }
+    out.push(sig)
+    return true
+  }
+  if atom {
+    if storeTy < 0 { return false }
+    out.push(repCanonId(storeTy))
+  } else {
+    out.push(-1)
+  }
+  out.push(-1)
+  true
+}
+
+// The layout id of fields `fnames` with keys `parts` (three ints a field, in `fnames` order),
+// ordered by field-name sid so field order cannot change it.
+function shapeLayoutIdOf(fnames: string[], parts: i32[]): i32 {
+  const sids: i32[] = []
+  const ord: i32[] = []
+  let i = 0
+  while i < fnames.length {
+    const sd = sidOf(fnames[i])
+    let j = sids.length
+    sids.push(sd)
+    ord.push(i)
+    while j > 0 && sids[j - 1] > sd {
+      sids[j] = sids[j - 1]
+      ord[j] = ord[j - 1]
+      sids[j - 1] = sd
+      ord[j - 1] = i
+      j = j - 1
+    }
+    i = i + 1
+  }
+  const a: i32[] = []
+  a.push(0 - 1 - fnames.length)
+  let k = 0
+  while k < sids.length {
+    const o = ord[k]
+    a.push(sids[k])
+    a.push(parts[o * 3])
+    a.push(parts[o * 3 + 1])
+    a.push(parts[o * 3 + 2])
+    k = k + 1
+  }
+  hcShapeSetId(a)
+}
+
+// Stored row `si`'s layout id, or -1 when one of its fields records no storage type it needs.
+function shapeRowLayoutId(si: i32): i32 {
+  const fn: string[] = []
+  const parts: i32[] = []
+  const st = sFieldStart[si]
+  let i = 0
+  while i < sFieldCount[si] {
+    fn.push(sFieldNames[st + i])
+    const code = sFieldTypes[st + i]
+    const atom = !layoutRefCode(code) && sFieldElemNameAt(si, i) != ""
+    if !layoutFieldPush(code, colAt(sFieldStoreTy, st + i), atom, parts) {
+      return -1
+    }
+    i = i + 1
+  }
+  shapeLayoutIdOf(fn, parts)
+}
+
+function lSetSync() {
+  if lSetLen > sNames.length { shapeSetIxReset() }
+  const lim = sSetLim()
+  while lSetLen < lim {
+    while lSetNext.length <= lSetLen { lSetNext.push(-1) }
+    if !sIsRefRow(lSetLen) {
+      const k = shapeRowLayoutId(lSetLen)
+      if k >= 0 {
+        while lSetHead.length <= k {
+          lSetHead.push(-1)
+          lSetTail.push(-1)
+        }
+        if lSetHead[k] < 0 {
+          lSetHead[k] = lSetLen
+        } else {
+          lSetNext[lSetTail[k]] = lSetLen
+        }
+        lSetTail[k] = lSetLen
+      }
+    }
+    lSetLen = lSetLen + 1
+  }
+  0
+}
+
+// The first stored row of the layout typed shape `fieldsTy` has, its fields `names` coded
+// `codes`; -1 for none, -2 when a field records no type the layout needs (the spelling decides).
+function annShapeLayoutRowOf(
+  names: string[],
+  codes: i32[],
+  texts: string[],
+  tyIx: i32,
+  fieldsTy: i32,
+): i32 {
+  if fieldsTy < 0 { return -2 }
+  const parts: i32[] = []
+  let i = 0
+  while i < names.length {
+    const fty = shapeFieldRowOf(fieldsTy, names[i])
+    const atom = !layoutRefCode(codes[i]) && layoutAtomField(codes[i], fty)
+    const sty = recFieldStoreTyOf(fieldsTy, names[i], codes[i])
+    if !layoutFieldPush(codes[i], sty, atom, parts) { return -2 }
+    i = i + 1
+  }
+  const k = shapeLayoutIdOf(names, parts)
+  lSetSync()
+  if k < 0 || k >= lSetHead.length { return -1 }
+  const lim = sScanLim()
+  let si = lSetHead[k]
+  while si >= 0 && si < lim {
+    let ok = true
+    let j = 0
+    while ok && j < names.length {
+      const fi = sFieldIndex(si, names[j])
+      if fi < 0 {
+        ok = false
+      } else if (
+        !sFieldCloSigCompat(
+          si,
+          fi,
+          codes[j],
+          texts[j],
+          shapeFieldRowOf(fieldsTy, names[j]),
+        )
+      ) {
+        ok = false
+      }
+      j = j + 1
+    }
+    if ok && !code0SpellingFitsRow(names, texts, si) { ok = false }
+    if ok && !anonRowServes(si, tyIx) { ok = false }
+    if ok { return si }
+    si = lSetNext[si]
+  }
+  -1
+}
+
+// The row already minted for a type of the same storage as `tyIx`, with the same field codes, or
+// -1, so a re-walked annotation does not mint a second row for one type (D10771). A literal's
+// `#anon` row is not reused: a generic instance's value is built against its own row.
 function annSameTypeRowOf(
-  nm: string,
   tyIx: i32,
   fieldsTy: i32,
   names: string[],
   codes: i32[],
 ): i32 {
   if tyIx < 0 || fieldsTy != tyIx { return -1 }
-  let si = structIndexByName(nm)
-  if si < 0 {
-    si = repRowOfTyStruct(tyIx, sScanLim())
-    if si >= 0 && sIsAnonRow(si) { return -1 }
-  }
+  const si = repRowOfTyStruct(tyIx, sScanLim())
+  if si >= 0 && sIsAnonRow(si) { return -1 }
   if si < 0 || si >= sScanLim() || si >= sTyIx.length { return -1 }
   if sTyIx[si] < 0 || sFieldCount[si] != names.length { return -1 }
   const key = repRowId(tyIx)
@@ -2081,5 +2278,12 @@ function fcHasLitMember(u: TyUnion): boolean {
   for m in u.uMembers {
     if m >= 0 && tyAt(m) is TyLit { return true }
   }
+  false
+}
+
+// Whether `ty` is a type parameter whose name no declared type takes.
+function tyVarNamesNoDecl(ty: i32): boolean {
+  const t = tyAt(ty)
+  if t is TyVar { return (cUserTypes.get(t.tvName) ?? -1) < 0 }
   false
 }
