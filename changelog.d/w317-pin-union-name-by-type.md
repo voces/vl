@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Step 7 L2, mono: a pin's union name is canon'd by its type, not by splitting its spelling.** `monoPinUnionName(rs, rsTy)` canonicalises a pin's spelling when its type is a union of two members or more (or one whose keyed arms are), or a list whose element the spelling groups in parentheses (`monoPinCanonKind`); it no longer calls `unionSetAtomsOf` or peels the spelling's list element. `monoPinMintedUnion` takes its name's own type, which its parameter-pin caller held apart from the gate type. Over 24,070 programs the typed answer returned the same name in 16,011 of 16,013 decisions; the 2 that differ are in one program whose module is byte-identical. `emit_mono.vl`'s `unionSetAtomsOf` callers 3 → 2.
