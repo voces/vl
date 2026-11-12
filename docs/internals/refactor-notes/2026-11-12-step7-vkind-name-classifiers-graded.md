@@ -77,8 +77,9 @@ types may have retired that premise; it is probed next.
   The rule is stated only in the checker's `flatStorageSpellWidth` comment and the 2026-11-11
   lane-B note. The arena has `u8` and no `i8`, `i16` or `u16`. Probing that showed every
   sub-word field types as `u8`: a legal `i16` literal is refused with a `u8` range message. A
-  computed value is not narrowed, unlike a `u8[]` element. Filed as D15978. The name read stays
-  until D15978's ruling. The nested `flat` lookup by its declaration's name
+  computed value is not narrowed, unlike a `u8[]` element. Filed as D15978; the owner ruled
+  storage semantics (DECISIONS, "A sub-word field of a `flat` record has storage semantics").
+  The name read stays until the arena has a type per width. The nested `flat` lookup by its declaration's name
   (`flatDeclByName`) is declaration identity.
 - **`elabArgRepins`:** a bare type-parameter annotation is identified by its declared name in
   `fnTyParams`, which is a type parameter's identity.
