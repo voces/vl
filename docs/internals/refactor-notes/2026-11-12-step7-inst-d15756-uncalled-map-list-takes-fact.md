@@ -23,7 +23,8 @@ and its module cell found no list row (`letCellSlot` -1).
 
 ## Change
 
-`monoPinListOfMaps` (emit_mono) runs before the nested-list arm. It applies to a literal of maps
+A map-element arm of `monoPinListElems` (emit_mono) runs before the nested-list arm. It adds no
+helper, since the pin layer is a ratchet (`budget_pin_helper_test`). It applies to a literal of maps
 whose functions nothing calls (`elabSlotUncalled(at, ["e", "v"])`) and that has a closed slot fact.
 It annotates the list at that fact and types its open elements at the fact's element. A list whose
 maps are called keeps its current path: without this guard, `ys[0].get("a")!(3)` would become
