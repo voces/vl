@@ -1,3 +1,5 @@
+import { rlElemNonNulTyAt } from "./emit_map_value_slots"
+
 // `emit_collect.vl` — the emitter's collection passes: the pre-lowering walks that fill
 // the shared emitter tables (`emit_state.vl`) before any bytes are emitted. Function and
 // global gathering with lambda lifting (`collectFns`), closure signatures, per-function
@@ -11,7 +13,7 @@
 // feature at all. Each pass below states only its own gate.
 
 import { recordRowClassOf } from "./record_rows"
-import { fusedMapReadRecvIx } from "./check_leaf_steps"
+import { flatStorageSpellWidth, fusedMapReadRecvIx } from "./check_leaf_steps"
 import { chainHasPrelude } from "./emit_if_arm_values"
 import { arrNewAtTop, arrNewInFn } from "./check_decl_scan"
 import {
@@ -117,10 +119,9 @@ import {
   genAppNameOfTy,
   litUnionAliasOfLitTexts,
   litUnionInlineNameOfTy,
-  numLitUnionBaseName,
+  numLitUnionBaseTy,
   structNameOfTy,
   tyArrayElemIx,
-  tyArrayElemPrim,
   tyAt,
   tyEqSameHoles,
   tyFieldTyOf,
@@ -202,7 +203,6 @@ import {
   valueIfNodes,
 } from "./ast"
 import {
-  annRetNameOf,
   bodyLetOfRead,
   declStructIndexBuild,
   declStructNodeOf,
@@ -212,18 +212,12 @@ import {
   isStructAtom,
   isVariantBoxUnionAtoms,
   listIsTestedIdent,
-  mapNameKeyKind,
   monoAnnHasTyParam,
   nameIsBareMap,
   nameIsClosureArrayTy,
-  nameIsF32Array,
-  nameIsF64Array,
-  nameIsI64Array,
   nameIsShapeSpanEnds,
   nameIsStringArray,
-  nameIsU8Array,
   nodeIsTypeDecl,
-  normTypeAtom,
   nulLitUnionInnerNameOfTy,
   shapeInnerFieldSplit,
   strLess,
@@ -586,12 +580,11 @@ import { repSigRetTokOfTy, repSlotOfKind } from "./emit_rep_slot"
 import { RS_TAG, relSkew } from "./emit_reloc"
 import {
   anonFieldElemKeyKind,
+  anonFieldElemValTy,
   anonMapFieldDestAdmits,
 } from "./emit_anon_fields"
 import {
   sFieldElemNameAt,
-  sFieldTypeAt,
-  sNameCanonSet,
   sScanLim,
   sioMemoReset,
   structFieldNameIxReset,
@@ -665,18 +658,20 @@ import {
   mfCbResultIsStrList,
 } from "./emit_closure_sites"
 import {
+  eqKindIsRecord,
   eqRowFieldCount,
-  eqRowFieldTypeAt,
+  eqRowFieldKind,
   eqRowTgtStructIdx,
-  eqScalarListFieldKind,
-  eqVariantListFieldKind,
+  eqScalarListKind,
+  eqVariantListKind,
   eqgElemClass,
   eqgElemEqRow,
   eqgInnerKind,
   eqgInnerSlot,
   eqgStructElemNeeds,
+  fieldRowKind,
   leqCoreKindOfAtomKind,
-  nulFieldInnerCode,
+  nulFieldInnerKind,
 } from "./emit_eq_rows"
 import { fieldCodeOfTy, nameIsWholeSpanShape } from "./emit_field_codes"
 import { fieldStoreTyOf, recFieldTyOf } from "./emit_rec_field_codes"
@@ -730,6 +725,7 @@ import {
 } from "./emit_mv_slots"
 import {
   addLocalSlot,
+  annDeclVariantRow,
   globalLetOfDeclRead,
   markLocalDecl,
   markLoopVarIter,
@@ -743,11 +739,7 @@ import {
   structRowOfTy,
   vtKindOfType,
 } from "./emit_nullable_rets"
-import {
-  nodeTyIsUnionRow,
-  objLitFieldSig,
-  objVariantIndexDrop,
-} from "./emit_obj_lit_fits"
+import { nodeTyIsUnionRow, objLitFieldSig } from "./emit_obj_lit_fits"
 import { rlWidenTagOf } from "./emit_ref_list_kinds"
 import {
   funcTypeShapeLowerable,
@@ -769,6 +761,7 @@ import {
   ALK_I64,
   annRefArrElemRow,
   arrElemIsClosureTy,
+  arrLitLeadInner,
   arrLitNestedElemKind,
   arrLitNestedElemName,
   arrLitNulRefElemName,
@@ -920,6 +913,7 @@ import {
   nulNumScalarUnionRowTy,
   oneListUnionAliasName,
   tyIsValueUnionBox,
+  tyMapKeyKindSpan,
   valueAtomKind,
 } from "./check_ty_rep"
 import { valueUnionRetName } from "./check_ret_names"
@@ -963,7 +957,7 @@ function markInferredJoinAtoms(ty: i32) {
 }
 
 // Could this functype's result be a mixed scalar-plus-composite union? `false` is a definite
-// no, so the caller knows `nulCloMixedUnionUnregistered` would answer false without
+// no, so the caller knows `nulCloMixedUnionUnregisteredTy` would answer false without
 // rendering the type. This is the guard's answer, not its early-out: an atom count is a fact
 // about the spelling, while the verdict is structural.
 function cloResultMaybeMixed(tyIx: i32): boolean {
@@ -1255,7 +1249,7 @@ function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
 // committed rep can name different heaps (D39).
 function alcNamesArm(name: string, ann: i32): boolean {
   if name == "" { return false }
-  if variantIndexOf(name) >= 0 { return true }
+  if annDeclVariantRow(ann, name) >= 0 { return true }
   repTyHasArmShape(mapLeafValTy(annRowOfNode(ann)))
 }
 
@@ -1490,15 +1484,15 @@ function internCloSigKey(key: string, rep: i32) {
   0
 }
 
-// Interns the `$fnsig` of union arm `atom` of arena type `ty` (-1 when unknown) at rep -1, keyed
+// Interns the `$fnsig` of a union arm of arena type `ty` (-1 when unknown) at rep -1, keyed
 // `kIn`, or by `unionArmSigKeyTy` when `kIn` is "". A mixed scalar-plus-composite union result
 // is skipped: its synthesized sig would pass the call's floor while the un-pinned producer keeps
 // its own functype, and the cast traps.
-function internCloSigOfAtomTy(atom: string, kIn: string, ty: i32) {
+function internCloSigOfArmTy(kIn: string, ty: i32) {
   let k = kIn
   if k == "" { k = unionArmSigKeyTy(ty) }
   if k == "" { return 0 }
-  if nulCloMixedUnionUnregistered(atom, ty) { return 0 }
+  if nulCloMixedUnionUnregisteredTy(ty) { return 0 }
   internCloSigKey(k, -1)
 }
 
@@ -1765,9 +1759,7 @@ function collectUnionArmCloSigs(atoms: string[], atomTys: i32[]) {
     const armRow = atomTys[uj]
     if armRow >= 0 {
       const armT = tyAt(armRow)
-      if armT is TyFunc {
-        internCloSigOfAtomTy(atoms[uj], sigKeyOfTy(armRow), armRow)
-      }
+      if armT is TyFunc { internCloSigOfArmTy(sigKeyOfTy(armRow), armRow) }
       // A closure-array arm, plain or nullable-element: the element closure sig is interned by
       // neither the function-arm branch above nor the TypeRef pass below, which sees only a
       // top-level closure-array annotation.
@@ -3672,7 +3664,7 @@ function leqNoteUnionArms(uname: string) {
 }
 
 // Reserve a compare frame per list field of variant row `vi`, mirroring `leqNoteBin`'s walk over
-// a struct row's fields. The map is `eqVariantListFieldKind`, the one home the field emitter
+// a struct row's fields. The map is `eqVariantListKind`, the one home the field emitter
 // reads, so a frame reserved here and a core emitted there are one decision.
 function leqNoteVariantFields(vi: i32) {
   if vi < 0 { return 0 }
@@ -3682,21 +3674,21 @@ function leqNoteVariantFields(vi: i32) {
   let j = 0
   while j < uFieldCount[vi] {
     if start + j < sFieldTypes.length {
-      let c = sFieldTypes[start + j]
+      let c = fieldRowKind(start + j)
       // A `T[] | null` arm field runs its non-null twin's core under a null guard, so the
       // frame it needs is that twin's — the struct row's walk resolves it the same way (D1180).
-      const cn = nulFieldInnerCode(c)
-      if cn >= 0 { c = cn }
+      const cn = nulFieldInnerKind(c)
+      if cn != null { c = cn }
       // A ref-list field's frame is keyed by its field slot (`variantFieldRefSlot`), exactly as
       // the struct row's code-5 arm keys its own.
-      if c == FC_REF_LIST {
+      if c == "reflist" {
         const en = sFieldElemName[start + j]
         if en != "" {
           const rs = variantFieldRefSlot(vi, j)
           if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
         }
       }
-      const lk = eqVariantListFieldKind(c)
+      const lk = eqVariantListKind(c)
       if lk >= 0 { leqgNoteRep(lk, 0, 0) }
     }
     j = j + 1
@@ -3715,21 +3707,21 @@ export function leqNoteStructRowFields(row: i32, seen: i32[]) {
   while fj < fc {
     // A `T[] | null` field compares through its non-null twin's core under a null guard, so
     // the frame it needs is that twin's (D1180).
-    let fjc = eqRowFieldTypeAt(row, fj)
-    const fjn = nulFieldInnerCode(fjc)
-    if fjn >= 0 { fjc = fjn }
-    if fjc == FC_REF_LIST {
+    let fjc = eqRowFieldKind(row, fj)
+    const fjn = nulFieldInnerKind(fjc)
+    if fjn != null { fjc = fjn }
+    if fjc == "reflist" {
       const en = sFieldElemNameAt(row, fj)
       if en != "" {
         const rs = sFieldRefSlot(row, fj)
         if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
       }
     }
-    if fjc == FC_STRUCT {
+    if eqKindIsRecord(fjc) {
       leqNoteStructRowFields(eqRowTgtStructIdx(row, fj), seen)
     }
     // A scalar-backed list field (`string[]`, `f64[]`, `i64[]`, `f32[]`, `u8[]`) too (D1020).
-    const eqSk = eqScalarListFieldKind(fjc)
+    const eqSk = eqScalarListKind(fjc)
     if eqSk >= 0 { leqgNoteRep(eqSk, 0, 0) }
     fj = fj + 1
   }
@@ -4238,10 +4230,9 @@ function rlMapElemValSlot(slot: i32): i32 {
 // The variant struct heap index of ref-list slot `slot`'s element (`Cat[]` gives the `Cat`
 // variant's `variantHeap`), or -1. One home, so the dedup signature pass and the element-heap pass
 // cannot drift: they are the same question by construction, the sig pass existing to predict the
-// heap pass. The name peel stays because no sweep reaches an arena reading of it.
+// heap pass. Read off the element's type: an arm and its same-shape twins share one heap.
 function rlElemVariantHeap(slot: i32): i32 {
-  const rsen = nonNulBaseOf(rlElemName[slot])
-  const evi = variantIndexOf(rsen)
+  const evi = repVariantShapeRowOf(rlElemNonNulTyAt(slot))
   if evi < 0 { return -1 }
   variantHeap(evi)
 }
@@ -4879,7 +4870,7 @@ function forceAnnLeafRepsOfTy(t: i32): i32 {
 }
 
 // Reserve the reps a closure field's signature needs, at every depth of annotation type `t`.
-// `collectA`'s `annRetNameOf` rung handles a top-level function type; a closure that is a field
+// `collectATypeRef`'s function-type rung handles a top-level function type; a closure that is a field
 // of an inline shape (`{f: () => string}`) reaches no rung. Forces only from the result and
 // parameters of such a field, descending through unions, lists, function parts and shapes.
 function forceNestedCloSigRepsOfTy(t: i32, depth: i32): i32 {
@@ -4900,8 +4891,8 @@ function forceNestedCloSigRepsOfTy(t: i32, depth: i32): i32 {
       forceNestedCloSigRepsOfTy(k.aElem, depth + 1)
     }
     TyFunc => {
-      // A function type's own parts are not forced here: a top-level return belongs to the
-      // `annRetNameOf` rung.
+      // A function type's own parts are not forced here: a top-level return belongs to
+      // `collectATypeRef`'s function-type rung.
       forceNestedCloSigRepsOfTy(k.fnRet, depth + 1)
       let ti = 0
       while ti < k.fnParamTypes.length {
@@ -5037,7 +5028,7 @@ function collectFrameMapCtor(ix: i32, fnIx: i32) {
   const t = mapCtorOpenInstTy(ix, fnIx)
   if t < 0 { return 0 }
   const m = tyMapHeld(t)
-  mvShapeOfMapHeldTy("", m, tyMapValOf(m), tyMapValOf(m))
+  mvShapeOfMapHeldTy(m, tyMapValOf(m), tyMapValOf(m))
   0
 }
 
@@ -5069,20 +5060,18 @@ function collectHoleElemListPair(elemIx: i32, fnIx: i32) {
 }
 
 // The row a list-of-lists literal's element keys only in its own frame (`arrLitFrameLeafRow`),
-// minted with its leaf list pair: the frameless walk keyed the template's `i32[]` (D3115).
+// keyed by the lead inner literal's type in that frame and minted with its leaf list pair: the
+// frameless walk keyed the template's `i32[]` (D3115).
 function collectFrameLeafRow(ix: i32, fnIx: i32) {
   const pn = arrLitFrameLeafRow(ix, fnIx)
-  if pn == "" || rlSlotByName(pn) >= 0 { return 0 }
+  if pn == "" || ix < 0 || ix >= P.nodes.length { return 0 }
+  const a = nodeAt(ix)
+  if !(a is ArrayLit) { return 0 }
+  const e = litRepTyAt(arrLitLeadInner(a), fnIx)
+  if e < 0 || rlSlotOfTy(e) >= 0 { return 0 }
   if arrLitElemName(ix, fnIx) != "i32[]" { return 0 }
-  let k = RLK_STR_LIST
-  if pn == "f64[]" {
-    k = RLK_F64_LIST
-    // The f64 pair mints on first read (`fa64Ty`).
-  } else if pn == "i64[]" {
-    k = RLK_I64_LIST
-    // The i64 pair mints on first read (`ia64Ty`).
-  }
-  rlInternNameTy(pn, k, -1)
+  // The f64 and i64 pairs mint on first read (`fa64Ty`, `ia64Ty`).
+  rlInternNameTy(pn, refListElemKindOfTy(e), e)
   0
 }
 
@@ -5221,12 +5210,16 @@ function collectAUnionRows() {
 }
 
 // The list mint's key hint for literal `i`: `arrLitElemHintTy`, else the closed element type the
-// literal is built at, where that type is a closure or a `string` or `u8` list. Any other
-// element keeps the name's key: its row is still read back by that name.
+// literal is built at. A hole, a type parameter, a literal or a record (whose declaration is its
+// identity) keeps the name's key.
 function arrLitMintHintTy(i: i32): i32 {
-  const h = arrLitElemHintTy(i)
+  const h = arrLitElemHintTy(i, -1)
   if h >= 0 { return h }
   let e = tyStepElem(arrLitBuildTy(i))
+  // A list of lists is built at its lead inner literal's rep, which carries the element join the
+  // outer stamp misses (D4874, D4876); an element that is a union of lists keeps the union.
+  const ie = arrLitLeadInnerRepTy(i)
+  if ie >= 0 && e >= 0 && tyAt(e) is TyArray { e = ie }
   // A build type still open in the template is the one closed type every instance builds at.
   if e >= 0 && (tyHasInferHole(e, 0) || tyHasTyVar(e)) {
     e = tyStepElem(litRepTyOneClosed(i))
@@ -5239,14 +5232,23 @@ function arrLitMintHintTy(i: i32): i32 {
   ) {
     return -1
   }
-  if tyAt(e) is TyFunc { return e }
-  const leaf = tyStepElem(e)
-  if leaf < 0 { return -1 }
-  const lt = tyAt(leaf)
-  if lt is TyPrim && (lt.primName == "string" || lt.primName == "u8") {
-    return e
+  e
+}
+
+// The closed rep of list literal `i`'s lead inner literal, or -1 where `i` holds no inner literal.
+function arrLitLeadInnerRepTy(i: i32): i32 {
+  if i < 0 || i >= P.nodes.length { return -1 }
+  const a = nodeAt(i)
+  if (
+    !(a is ArrayLit)
+    || a.arrElems.length < 1
+    || !(nodeAt(a.arrElems[0]) is ArrayLit)
+  ) {
+    return -1
   }
-  -1
+  const t = litRepTyAt(arrLitLeadInner(a), -1)
+  if t < 0 || tyHasInferHole(t, 0) || tyHasTyVar(t) { return -1 }
+  t
 }
 
 // `collectA`'s arm for the list literal at node `i`: the list flags and ref-list rows its
@@ -5257,7 +5259,7 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
   // the checker pinned to a registered union is invisible to `arrLitIsRef`, and the
   // synthesized annotation runs after this pass, so that slot has to be interned here.
   if nd.arrElems.length == 0 {
-    const emptyElem = arrLitUnionElemName(i)
+    const emptyElem = arrLitUnionElemName(i, -1)
     if emptyElem != "" {
       // Hinted with the literal's own recorded element row; every corpus firing agrees
       // with the name path, and the hint is available at each.
@@ -5267,9 +5269,9 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
     // `outer.push(inner)` with `inner: i32[]` reaches this pass with the element pinned to an
     // array and no row interned. The flags mirror the `arrLitIsRef` branch arm for arm,
     // because this interns the row the annotated `i32[][]` spelling interns.
-    const nestElem = arrLitNestedElemName(i)
+    const nestElem = arrLitNestedElemName(i, -1)
     if nestElem != "" {
-      const nestKind = arrLitNestedElemKind(i)
+      const nestKind = arrLitNestedElemKind(i, -1)
       // A ref inner list (kind 9 — a struct, map, union or closure leaf, or another nesting
       // level) has to intern its inner row first, because the outer element's heap is that
       // inner wrapper and the tables are read forward in this same pass. `ensureRefElemTy`
@@ -5284,11 +5286,11 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
     // D1511 — the same hole at the shape element kind: `xs.push({y: 1, x: 2})` onto `[]` pins
     // the element to a struct no `<shape>[]` spelling interns. The key is unhinted, since a
     // nominal spelling takes none; the element type still classifies it.
-    const shapeElem = arrLitShapeElemName(i)
+    const shapeElem = arrLitShapeElemName(i, -1)
     if shapeElem != "" { ensureRefElemTys(shapeElem, -1, rlHintElemTy(i)) }
     // The same hole at a nullable ref element: a push of a `T | null` value, or of a bare
     // `null` a later write filled, spells the `(T | null)[]` row nowhere (D2506).
-    const nulElem = arrLitNulRefElemName(i)
+    const nulElem = arrLitNulRefElemName(i, -1)
     if nulElem != "" { ensureRefElemTy(nulElem, rlHintElemTy(i)) }
     // D1569 — the same hole at a scalar element kind, where the three rescues above are all
     // ref ones. `const xs = []` then `xs.push(1.5)` pins the element to an f64 the program
@@ -5308,7 +5310,7 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       const btn = if bt != nodeTyIxOf(i) { rlRowNameOfTy(tyStepElem(bt), true) } else { "" }
       ensureRefElemTys(
         if btn != "" { btn } else { arrLitElemName(i, -1) },
-        arrLitElemHintTy(i),
+        arrLitMintHintTy(i),
         tyStepElem(bt),
       )
     } else {
@@ -5317,15 +5319,21 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       // which are still spelled by name (D14533).
       const ae = if elemKind == RLK_STRUCT { arrLitArenaRecElem(i) } else { -1 }
       // A record spelled by shape is built at its declared twin's row, minted first.
-      const tw = if elemKind == RLK_STRUCT { rlDeclTwinTy(arrLitElemHintTy(i)) } else { -1 }
+      const tw = if elemKind == RLK_STRUCT { rlDeclTwinTy(arrLitElemHintTy(i, -1)) } else { -1 }
       if tw >= 0 { rlRowOfTyMinted(tw) }
       if ae >= 0 {
         rlInternNameTy(rlRowNameOfTy(ae, false), RLK_STRUCT, ae)
       } else if elemKind != RLK_STRUCT || !arrLitRepElemRow(i) {
-        recordArrLitRlSlot(
-          i,
-          rlInternNameTy(arrLitElemName(i, -1), elemKind, arrLitMintHintTy(i)),
-        )
+        const mh = arrLitMintHintTy(i)
+        // A row keyed by a list of lists interns its inner rows by type first, as kind 9 does.
+        if mh >= 0 && refListElemKindOfTy(mh) == RLK_REF_LIST {
+          recordArrLitRlSlot(i, ensureRefElemTys(arrLitElemName(i, -1), mh, mh))
+        } else {
+          recordArrLitRlSlot(
+            i,
+            rlInternNameTy(arrLitElemName(i, -1), elemKind, mh),
+          )
+        }
       }
       if elemKind == RLK_STRUCT { arrLitInstElemRows(nd) }
     }
@@ -5438,17 +5446,13 @@ function annArrayRungsSkip(i: i32, nd: TypeRef): boolean {
 
 // Whether annotation `i` is an array `checkArrName` must not validate: an `f64`, `i64`, `f32` or
 // `u8` list, whose pair mints on first read, or an array over a type parameter, which its
-// instances re-collect at pinned names. The element's rep is read first, then the name.
-function annScalarOrOpenArray(i: i32, nd: TypeRef): boolean {
+// instances re-collect at pinned names.
+function annScalarOrOpenArray(i: i32): boolean {
   const er = nodeTyArrayElemRepName(i)
   er == "f64"
-    || nameIsF64Array(nd.tyName)
     || er == "i64"
-    || nameIsI64Array(nd.tyName)
     || er == "f32"
-    || nameIsF32Array(nd.tyName)
     || er == "u8"
-    || nameIsU8Array(nd.tyName)
     || annArrOverTyParam(i)
 }
 
@@ -5460,7 +5464,7 @@ function annTyIsRefList(i: i32, nd: TypeRef): boolean {
   if ty < 0 || nd.tyName == "" { return false }
   if !(tyIsRefArray(ty) || tyIsNulRefArray(ty)) { return false }
   const e = tyStepElem(tyPeelNul(ty))
-  e < 0 || numLitUnionBaseName(e) == ""
+  e < 0 || numLitUnionBaseTy(e) < 0
 }
 
 // `collectA`'s arm for the annotation at node `i`: the heap types, list and map rows its
@@ -5470,32 +5474,19 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   // see `forceNestedCloSigRepsOfTy`, which walks into the annotation's type for it.
   forceNestedCloSigRepsOfTy(nodeTyIxOf(i), 0)
   // A function type forces nothing here: its result's types are forced by
-  // `forceNestedCloSigRepsOfTy` above. Asked of the recorded type; an untyped annotation is a
-  // function when its spelling has a top-level arrow, whose trailing `[]` is not an array.
-  const annTy = nodeTyIxOf(i)
-  const isFnAnn = if annTy >= 0 { tyIsFuncArena(annTy) } else { annRetNameOf(nd.tyName) != "" }
-  if isFnAnn {
+  // `forceNestedCloSigRepsOfTy` above.
+  if tyIsFuncArena(nodeTyIxOf(i)) {
   } else if nameIsBareMap(nd.tyName) && !typeRefIsRecord(i) {
     // A bare map annotation interns its per-(key, value) slot here, since collect scans every
     // `TypeRef`, so the type-index assignment sees the full slot set. An orphaned parser field
     // (no type) mints nothing: the field-table passes mint from its owner.
     if nodeTyIxOf(i) >= 0 {
-      mvShapeOfMapHeldTy(
-        nd.tyName,
-        nodeTyIxOf(i),
-        nodeMapValTyIx(i),
-        nodeMapValTyIx(i),
-      )
+      mvShapeOfMapHeldTy(nodeTyIxOf(i), nodeMapValTyIx(i), nodeMapValTyIx(i))
     }
   } else if nulMapInnerName(nd.tyName) != "" {
     // A nullable map annotation collects what its non-null inner map does.
     if nodeTyIxOf(i) >= 0 {
-      mvShapeOfMapHeldTy(
-        nulMapInnerName(nd.tyName),
-        nodeTyIxOf(i),
-        -1,
-        nodeMapValTyIx(i),
-      )
+      mvShapeOfMapHeldTy(nodeTyIxOf(i), -1, nodeMapValTyIx(i))
     }
   } else if !annArrayRungsSkip(i, nd) {
     if annTyIsRefList(i, nd) {
@@ -5503,7 +5494,7 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     } else if (
       annSpelledArray(i)
       && !isUnionOfTy(nodeTyIxOf(i))
-      && !annScalarOrOpenArray(i, nd)
+      && !annScalarOrOpenArray(i)
     ) {
       // A union ending in an array arm (`i64 | S[]`) is a box whose arms `markRefArrayArms`
       // interns, so it is not validated here.
@@ -5650,7 +5641,7 @@ function collectAHeldRep(i: i32): i32 {
   const hv = if hr >= 0 && hr < T.tys.length && tyAt(hr) is TyMap { tyMapValOf(hr) } else { -1 }
   if hv >= 0 && tyAt(hv) is TyObj {
     internShapeDeepOfTy(hv)
-    mvShapeOfMapHeldTy("", hr, hv, hv)
+    mvShapeOfMapHeldTy(hr, hv, hv)
   }
   // A list held so as a list of flat records is read at that rep too: the element's row and
   // the list's ref-list slot (D15552). A nested element's rows are minted where it is built.
@@ -6452,7 +6443,7 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         const er = if code == FC_STRUCT { anonFieldStructRow(f.fiValue) } else { -1 }
         // A ref-list field led by a record literal keeps that literal's row, and so its type.
         elemRowTys.push(
-          if er >= 0 && er < sTyIx.length { sTyIx[er] } else if code == FC_REF_LIST { anonRefListLitElemTy(f.fiValue) } else { -1 },
+          if er >= 0 && er < sTyIx.length { sTyIx[er] } else if code == FC_REF_LIST { anonRefListLitElemTy(f.fiValue) } else { anonFieldElemValTy(f.fiValue, code) },
         )
         if er >= 0 {
           elemNames.push(sNames[er])
@@ -6877,10 +6868,9 @@ function flatHasSubWordField(sx: i32, stmts: i32[], depth: i32): boolean {
     while i < fields.length {
       const fd = nodeAt(fields[i])
       if fd is FieldDef {
+        // A sub-word width is a storage spelling the arena types as `i32`.
         const nm = tyNameOf(fd.fdType)
-        if nm == "u8" || nm == "i8" || nm == "u16" || nm == "i16" {
-          return true
-        }
+        if flatStorageSpellWidth(nm) > 0 { return true }
         const nx = flatDeclByName(stmts, nm)
         if nx >= 0 {
           if flatHasSubWordField(nx, stmts, depth - 1) { return true }
@@ -6927,46 +6917,6 @@ function structTableReset() {
 }
 
 // ── struct-type collection ───────────────────────────────────────────────────
-// Maps each declared row in `lo` to `hi` onto the first earlier one of the same canonical type
-// whose field rows are identical, so two same-shape declarations answer one row.
-function declTwinRowsCanon(lo: i32, hi: i32) {
-  let j = lo + 1
-  while j < hi {
-    let i = lo
-    while i < j {
-      if declRowsTwin(i, j) {
-        sNameCanonSet(sNames[j], i)
-        i = j
-      } else {
-        i = i + 1
-      }
-    }
-    j = j + 1
-  }
-  0
-}
-
-// Whether declared rows `i` and `j` hold one canonical type at one layout.
-function declRowsTwin(i: i32, j: i32): boolean {
-  if i >= sTyIx.length || j >= sTyIx.length || j >= sFieldCount.length {
-    return false
-  }
-  const a = sTyIx[i]
-  const b = sTyIx[j]
-  if a < 0 || b < 0 || !tySame(a, b) { return false }
-  if sFieldCount[i] != sFieldCount[j] { return false }
-  let k = 0
-  while k < sFieldCount[i] {
-    const fa = sFieldStart[i] + k
-    const fb = sFieldStart[j] + k
-    if sFieldNames[fa] != sFieldNames[fb] { return false }
-    if sFieldTypeAt(i, k) != sFieldTypeAt(j, k) { return false }
-    if sFieldElemName[fa] != sFieldElemName[fb] { return false }
-    k = k + 1
-  }
-  true
-}
-
 // Scans top-level statements for every struct `type` declaration into the flat multi-struct
 // table; each interns its own WasmGC struct heap type, and a field whose type has no code
 // fails loudly. Then runs the shape passes in order. Returns 0, or -1 (via `emitFail`).
@@ -6977,7 +6927,6 @@ export function collectS(stmts: i32[]) {
   sioMemoReset()
   anonShapesNodeLen = 0
   structTableReset()
-  const declLo = sNames.length
   // Nested inline-shape field types intern first, so the struct decls that reference them resolve.
   collectNestedFieldShapes(stmts)
   // A `type X = {…}` that is a union variant is collected by `collectU` instead, not here; any
@@ -7092,7 +7041,6 @@ export function collectS(stmts: i32[]) {
   // D1050 — gives a mixed-spelling pair one layout now both field tables are complete, before
   // the shape passes below re-lay a row a shape could otherwise twin onto.
   if unifyMixedLitRepArms() < 0 { return -1 }
-  declTwinRowsCanon(declLo, sNames.length)
   // Generic-alias application shapes next: the declared structs they may reference are
   // interned above, so their names resolve as code-15 struct-ref fields.
   gaeCollectDecls(stmts)
@@ -7175,7 +7123,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       true,
       fc,
       shapeFieldElemName(ftxt, fc, fldTy),
-      mapNameKeyKind(ftxt),
+      tyMapKeyKindSpan(fldTy),
       fnames[fi],
       variantFieldIdText(ftxt, fldTy),
       -1,
@@ -7670,14 +7618,6 @@ function registerMapValUnion(stmts: i32[], mapTy: i32): i32 {
   const vt = tyMapValOf(mapTy)
   if vt < 0 { return -2 }
   registerInlineUnionOfChild(stmts, vt, 29)
-}
-
-// The one home of "the result atom of a closure spelling": strips grouping parens, takes the
-// text after the top-level `=>`, and normalizes it as a union arm is. "" when there is no
-// top-level arrow, which is also every caller's "not a closure" answer. The three steps
-// compose in a fixed order: peel before the arrow scan, normalize after it.
-function cloResultAtomOf(name: string) {
-  normTypeAtom(annRetNameOf(peelGroupParens(name)))
 }
 
 // Registers the inline union synthetic name `name` (e.g. `"A|B"`), the render of arena type
@@ -8470,13 +8410,13 @@ function collectTyReachCloSigsArm(tyIx: i32, depth: i32): i32 {
       // concrete lambda both derive; a mixed-union unregistered result is skipped so the call rejects loudly.
       if !funcRetUnrepresentable(t.fnRet) {
         // `sigKeyOfTy(tyIx)` gets the key directly off the type rather than parsing it back out of
-        // the render `arenaEmitName` would produce; only the mixed-union guard still reads the name.
+        // the render `arenaEmitName` would produce; the render is asked only whether it exists.
         const kAr = sigKeyOfTy(tyIx)
         if kAr != "" && !cloResultMaybeMixed(tyIx) {
           internCloSigKey(kAr, -1)
         } else {
           const nm = arenaEmitName(tyIx)
-          if nm != "" { internCloSigOfAtomTy(nm, kAr, tyIx) }
+          if nm != "" { internCloSigOfArmTy(kAr, tyIx) }
         }
       }
       // Descend params + result to reach closures nested inside them (a result struct's
@@ -8884,7 +8824,7 @@ export function collectU(stmts: i32[]) {
   while iau < P.nodes.length {
     const an = nodeAt(iau)
     if an is ArrayLit {
-      const aeu = arrLitInferUnionElemName(iau)
+      const aeu = arrLitInferUnionElemName(iau, -1)
       if aeu != "" {
         const aety = arrLitElemTyIxOf(iau)
         if !(isUNameAB(24, aeu, aety) && unNameAdoptTyKeyRow(aeu, aety)) {
@@ -9074,7 +9014,6 @@ function collectUReset() {
   uVarFieldRow = []
   armsAdopted = false
   variantSigMemoDrop()
-  objVariantIndexDrop()
   0
 }
 
@@ -9494,7 +9433,7 @@ export function collectFnValUse() {
       // but only when the element itself constructs a closure — one merely containing one must not.
       ArrayLit => {
         // The same predicate the three `arrLit*` consumers use.
-        if arrElemIsClosureTy(i) { fnValUsed = true }
+        if arrElemIsClosureTy(i, -1) { fnValUsed = true }
       }
       // Every other node makes no bare function-value use.
       NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | Paren | ErrExpr | Param | WhileStmt | BreakStmt | ContinueStmt | Block | Program | FieldDef | TypeDecl | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
@@ -9569,24 +9508,6 @@ export function collectMapFilterUse() {
                 // has no lifted entry to ask, so the call's own recorded type names the struct
                 // row its result list needs; without it the result has no ref-list row (D2301).
                 rlInternNameTy(sNames[csr], RLK_STRUCT, rlColAt(sTyIx, csr))
-              } else {
-                let rvk: VKind | null = null
-                if fe >= 0 { rvk = cloRetValKind(fe) }
-                // A function-value callback has no lifted entry to ask: the call's recorded
-                // `T[]` names the scalar list its result is.
-                if fe < 0 {
-                  const ep = tyArrayElemPrim(nodeTyIxOf(i))
-                  if ep == "f64" { rvk = "f64" }
-                  if ep == "i64" { rvk = "i64" }
-                  if ep == "f32" { rvk = "f32" }
-                }
-                if rvk == "f64" {
-                  // The f64 pair mints on first read (`fa64Ty`).
-                } else if rvk == "i64" {
-                  // The i64 pair mints on first read (`ia64Ty`).
-                } else if rvk == "f32" {
-                  // The f32 pair mints on first read (`fa32Ty`).
-                }
               }
             }
           }
@@ -9638,58 +9559,9 @@ function mapCallStructResultRow(callIx: i32): i32 {
   -1
 }
 
-// True when the nul-closure arm's result is a mixed scalar+composite union no registration
-// path admitted, so it has no pin/box path and its `>u` `$fnsig` must not intern (the call
-// site rejects loudly). `ty` is the arm's arena type or -1; a literal-union atom is told by
-// its member type, and an atom with no type counts as composite.
-function nulCloMixedUnionUnregistered(arm: string, ty: i32) {
-  const res = cloResultAtomOf(arm)
-  if res == "" { return false }
-  const atoms: string[] = []
-  unionSetAtomsOf(res, atoms)
-  if atoms.length < 2 { return false }
-  let rt = ty
-  if rt >= 0 {
-    const nt = tyAt(rt)
-    if nt is TyNullable { rt = nt.nInner }
-  }
-  if rt >= 0 {
-    const ft = tyAt(rt)
-    if ft is TyFunc { rt = ft.fnRet } else { rt = -1 }
-  }
-  const tys: i32[] = []
-  unionAtomTysAlignedOf(rt, atoms, tys)
-  let hasScalar = false
-  let hasComposite = false
-  let i = 0
-  while i < atoms.length {
-    const a = atoms[i]
-    if a != "null" {
-      if valueAtomKind(a) >= 0 || (tys[i] >= 0 && tyIsLitUnion(tys[i])) {
-        // A closure atom is value-atom kind 11 but composes like a ref — count only
-        // the non-closure value atoms as the scalar side of the mix test.
-        if nameIsFuncTypeAtom(a) {
-          hasComposite = true
-        } else {
-          hasScalar = true
-        }
-      } else {
-        hasComposite = true
-      }
-    }
-    i = i + 1
-  }
-  if !hasScalar || !hasComposite { return false }
-  if isUNameKeyAB(68, res, rt) { return false }
-  if isValueUnionName(res) { return false }
-  if nameIsLitUnionArmValueUnion(res) { return false }
-  if tyIsMapMemberUnion(rt) { return false }
-  true
-}
-
-// `nulCloMixedUnionUnregistered` on function type `ty` (its `| null` peeled): true when the
-// result is a union of a scalar and a composite member that no registration admitted. A closure
-// member is composite, a literal union scalar.
+// Whether function type `ty` (its `| null` peeled) has a result that is a union of a scalar and
+// a composite member that no registration admitted. A closure member is composite, a literal
+// union scalar.
 function nulCloMixedUnionUnregisteredTy(ty: i32) {
   const rt = tyStepRet(tyPeelNul(ty))
   if rt < 0 { return false }
