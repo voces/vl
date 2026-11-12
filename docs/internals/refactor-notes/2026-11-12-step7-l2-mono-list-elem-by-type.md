@@ -29,6 +29,17 @@ bindings and pins name the same instance and rows.
 The probe reports through `emitFail` and is blind to programs that already refuse. CI's sweep
 covers those.
 
+## The pin-spelling shadow's witness
+
+`tests/vl_pin_spell_shadow_test.ts` pins the classes in which mono's pins disagree with the naming
+rule. Its "two names one row" witness has twin records `Dot` and `Circle` over one row. There, a
+`Circle[]` argument to `first<T>(xs: T[])` pinned `Circle[]` / `Circle` where the rule spells
+`Dot[]` / `Dot` (the row's registered name). After this cut the binding is the rule's spelling, so
+both rows read `agree`. The witness's module is byte-identical on both seeds.
+
+The test's `want` is updated. The `=>i>i` function-signature key still disagrees, which keeps the
+witness's control row.
+
 ## Counts
 
 - `listElemNameOf` in `emit_mono.vl`: 2 → 0, and the import goes.
