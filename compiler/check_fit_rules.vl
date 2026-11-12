@@ -5407,12 +5407,16 @@ function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
       && tyAt(dr) is TyObj
       && depth > 1
       && recCopyBoxesAt(sf, dr, depth - 1)
+    // A record is copied into the one member of a union of records that has its field names.
+    const um = if sp is TyObj && dn is TyUnion && depth > 1 { recUnionRecMember(sf, df) } else { -1 }
+    const members = um >= 0 && recCopyBoxesAt(sf, um, depth - 1)
     if (
       sf < 0
       || !(boxes
         || widens
         || lists
         || nests
+        || members
         || fieldStorageEq(sf, df, REC_STORE_DEPTH))
     ) {
       return false
@@ -5434,6 +5438,32 @@ function recNumWidens(src: i32, dst: i32): boolean {
 const NUM_WIDENS = ["i32>i64", "i32>f64", "i64>f64", "f32>f64"]
 
 // Whether the union `u` lists `m` as a member.
+// The one record member of the union `u` whose field names are the record `s`'s, or -1 where
+// none or two are.
+export function recUnionRecMember(s: i32, u: i32): i32 {
+  const st = tyAt(s)
+  const ut = tyAt(u)
+  if !(st is TyObj) || !(ut is TyUnion) { return -1 }
+  let found = -1
+  for m in ut.uMembers {
+    const mt = if m >= 0 && m < T.tys.length { tyAt(m) } else { null }
+    if mt is TyObj && recSameNames(mt.objFieldNames, st.objFieldNames) {
+      if found >= 0 { return -1 }
+      found = m
+    }
+  }
+  found
+}
+
+// Whether two records' field-name lists hold the same names.
+function recSameNames(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  for n in a {
+    if !strListHas(b, n) { return false }
+  }
+  true
+}
+
 function recUnionHasMember(u: i32, m: i32): boolean {
   const ut = tyAt(u)
   if !(ut is TyUnion) { return false }
@@ -5498,18 +5528,6 @@ function recHeldFreshCopy(p: i32, o: i32, srcTy: i32, dstTy: i32): boolean {
 // How many bindings `recAdoptNote` is delivering through: a call a binding holds is not the
 // delivered value itself.
 let recAdHeldDepth = 0
-
-// Whether `p` is a record literal's field value or the value of a field write.
-function recInRecordField(p: i32): boolean {
-  cwIxBuild()
-  if !cwIxCovers(p) { return false }
-  const k = cwIxUpKind[p]
-  if k == CW_UP_FIELD { return true }
-  if k != CW_UP_ASG_RHS { return false }
-  const a = nodeAt(cwIxUp[p])
-  if !(a is BinExpr) { return false }
-  nodeAt(parenPeelIx(a.binLeft)) is Member
-}
 
 // A call's value is fresh, so a destination storing a field differently gets a copy of it,
 // recorded on the call, and its function `fd`, called more than once, keeps its own record.
@@ -5694,16 +5712,6 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       return 0
     }
     if fd >= 0 {
-      // A fresh call is built at the union member it lands on (D8141), except as a record's field,
-      // where the literal or store around it does not build the member there (D15828).
-      if (
-        recLandingOf(srcTy, dstTy) != nonNulTyOf(dstTy)
-        && recInRecordField(p)
-        && recBuildsLit(fd, 8)
-        && recBuiltAtDeclared(p, srcTy, dstTy)
-      ) {
-        return 0
-      }
       if recFreshCallCopy(fd, p, srcTy, dstTy) { return 0 }
       if recFnBuiltAtDst(fd, p, srcTy, dstTy) {
         // A union of records built at the one record keeps its result typed as the union and
