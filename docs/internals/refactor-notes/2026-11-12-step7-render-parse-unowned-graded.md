@@ -10,7 +10,7 @@ convertible. The population is 23,947 programs.
 
 | site | kind | grade |
 | --- | --- | --- |
-| `anonMapValNameable` (`emit_anon_fields`) | render | **deleted**: entered in 77 programs, the render rung reached in 0 |
+| `anonMapValNameable` (`emit_anon_fields`) | render | **deleted**: entered in 77 programs, the render rung reached in 0; a cyclic value is answered from the type |
 | `cloCallSigRejectWhat` ×4 (`emit_closure_sites`) | render | BY DESIGN: it builds a refusal's diagnostic text |
 | `nulNicheIsTestImpossible`, `mapSoftTwinTagFail`, `emitMapUnionPayloadTail` (`wasmEmit`) | render | BY DESIGN: each renders the type into an `emitFail` message |
 | `synthTypeRefOfTy` (`emit_rewrite`) | render | BY DESIGN: a synthesized TypeRef's text is output, and its readers ask the type it records |
@@ -27,8 +27,21 @@ convertible. The population is 23,947 programs.
 
 ## What changed
 
-`anonMapValNameable` answers from the literal-union alias and `tyEmitNameNonEmpty`. It no longer
-renders the value type for a value `tyEmitNameNonEmpty` cannot decide; no program reaches that case.
+`anonMapValNameable` answers from the literal-union alias and `tyEmitNameNonEmpty`, and no longer
+renders the value type. The render served one case the sweep never reaches: a value whose name walk
+meets a cycle (`tyEmitNameNonEmpty` answers -1). A first cut answered that case "not nameable", and
+the plainest program with a recursive map value in an anonymous record stopped running
+(`emitProgram: ref valtype with no interned shape`). A cycle closes through a declared name, which
+is the value's render at its root, so the cyclic case now answers nameable, as the other
+`tyEmitNameNonEmpty` callers do (`!= 0`). Three cases pin it, each run on master and on this seed
+with the same output:
+
+- `maps/anon-record-map-field-recursive-value.vl` (`Node` names itself);
+- `maps/anon-record-map-field-self-map-value.vl` (the record's own map field, `Tree.kids`);
+- `maps/anon-record-map-field-mutual-recursive-value.vl` (`A` and `B` name each other).
+
+A generic recursive value (`L<T>`) is refused on both seeds by the recursive-generic refusal
+filed as D1045, which this change does not touch.
 
 ## Proof
 
