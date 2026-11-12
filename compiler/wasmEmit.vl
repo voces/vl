@@ -1,5 +1,5 @@
+import { armRowsOfUnionTy } from "./emit_classify"
 import { unMemPeelAliasWrapper } from "./emit_union_tykey_text"
-import { monoPinSpellNoAnon } from "./pin_spell"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { unionArmRowOfTy } from "./emit_local_slots"
 import { unionTyOfRecv } from "./emit_obj_lit_fits"
@@ -8838,7 +8838,7 @@ function emitUnionBoxAtRecord(
   // A value already of its destination's union is no coercion, so the checker records none: it is
   // delivered as its own union, and `boxRetagArmsOfTys` decides any retag from that.
   if exprUnion(valIx, fnIx) {
-    const own = unionNameOfExpr(valIx, fnIx)
+    const own = boxTyName(nodeTyAt(valIx, fnIx))
     if own != "" {
       return emitUnionBoxArg(body, own, nodeTyAt(valIx, fnIx), valIx, fnIx)
     }
@@ -8854,7 +8854,7 @@ function boxOwedAtRecord(valIx: i32, fnIx: i32): boolean {
   // recorded at it: a union of maps read as its one map unboxes (`mapUnbox`).
   exprUnion(valIx, fnIx)
     && coerceKindAt(valIx, fnIx) == "none"
-    && unionNameOfExpr(valIx, fnIx) != ""
+    && boxTyName(nodeTyAt(valIx, fnIx)) != ""
 }
 
 // The registry name of the union `valIx` is boxed into at its delivery (`boxDstTyOf`); "" where
@@ -9948,8 +9948,8 @@ function emitUnionWideArmBox(
     return 0
   }
   const vty = nodeTyAt(unwrapParen(exprIx), fnIx)
-  const atoms: string[] = []
-  unionArmsOfTy(unionName, unionTy, atoms)
+  const atoms: i32[] = []
+  unionArmRowsOfTy(unionName, unionTy, atoms)
   // A nullable record: its null is the union's, else it boxes as the record does.
   if tyBearsNull(vty) {
     if exprUnion(exprIx, fnIx) { return 0 }
@@ -10029,15 +10029,23 @@ function wideRetagPairs(
   fromTags: i32[],
   toTags: i32[],
 ) {
-  const vur: i32[] = []
-  const vun = unionNameRowOfExpr(exprIx, fnIx, vur)
-  if vun == "" || vun == unionName { return 0 }
-  const fa: string[] = []
-  unionArmsOfSet(vun, msSetOfRowOr(vur[0], vun), fa)
-  const ta: string[] = []
-  unionArmsOfTy(unionName, unionTy, ta)
-  for a in fa {
-    const vi = variantIndexOf(a)
+  const fa: i32[] = []
+  const sty = unionBoxTyIxOfExpr(exprIx, fnIx)
+  const sa: string[] = []
+  if sty >= 0 && armRowsOfUnionTy(sty, sa, fa) {
+    if tySame(sty, unionTy) { return 0 }
+  } else {
+    // The expression's union type does not resolve its arms: its registered spelling does.
+    const vur: i32[] = []
+    const vun = unionNameRowOfExpr(exprIx, fnIx, vur)
+    if vun == "" || vun == unionName { return 0 }
+    const fan: string[] = []
+    unionArmsOfSet(vun, msSetOfRowOr(vur[0], vun), fan)
+    for a in fan { fa.push(variantIndexOf(a)) }
+  }
+  const ta: i32[] = []
+  unionArmRowsOfTy(unionName, unionTy, ta)
+  for vi in fa {
     if vi >= 0 && vi < uTags.length && !armsHoldHeap(ta, variantHeap(vi)) {
       const w = wideArmOfRow(variantRowOf(vi), ta)
       if w >= 0 && w < uTags.length {
@@ -10076,27 +10084,35 @@ function emitWideRetagChain(fromTags: i32[], toTags: i32[]) {
   0
 }
 
-// Whether one of the arms named `atoms` is on heap type `heap`.
-function armsHoldHeap(atoms: string[], heap: i32): boolean {
+// `armRowsOfUnionTy` of `unionName`'s type `unionTy`, else the rows its arms' spellings name.
+function unionArmRowsOfTy(unionName: string, unionTy: i32, rows: i32[]) {
+  const ta: string[] = []
+  if unionTy >= 0 && armRowsOfUnionTy(unionTy, ta, rows) { return 0 }
+  const atoms: string[] = []
+  unionArmsOfTy(unionName, unionTy, atoms)
+  for a in atoms { rows.push(variantIndexOf(a)) }
+  0
+}
+
+// Whether one of the variant rows `arms` is on heap type `heap`.
+function armsHoldHeap(arms: i32[], heap: i32): boolean {
   if heap < 0 { return false }
-  for a in atoms {
-    const vi = variantIndexOf(a)
+  for vi in arms {
     if vi >= 0 && variantHeap(vi) == heap { return true }
   }
   false
 }
 
-// The arm among `atoms` whose row is on struct row `si`'s supertype chain, or -1; -1 too when
-// `si` is itself on one of their heaps, since then the value is that arm.
-function wideArmOfRow(si: i32, atoms: string[]): i32 {
-  if si < 0 || si >= sHeapIdx.length || armsHoldHeap(atoms, sHeapIdx[si]) {
+// The variant row among `arms` whose struct row is on struct row `si`'s supertype chain, or -1;
+// -1 too when `si` is itself on one of their heaps, since then the value is that arm.
+function wideArmOfRow(si: i32, arms: i32[]): i32 {
+  if si < 0 || si >= sHeapIdx.length || armsHoldHeap(arms, sHeapIdx[si]) {
     return -1
   }
   let x = sSuperAt(si)
   let guard = 0
   while x >= 0 && guard < 64 {
-    for a in atoms {
-      const vi = variantIndexOf(a)
+    for vi in arms {
       if vi >= 0 && variantRowOf(vi) == x { return vi }
     }
     x = sSuperAt(x)
@@ -26203,7 +26219,7 @@ function emitFnTagDispatch(
   if kind == "reflist" || kind == "nulreflist" {
     rslot = rlSlotOfTy(tyRefArrElemOf(ty))
   }
-  const un = if boxed { unionNameOfExpr(callIx, fnIx) } else { "" }
+  const un = if boxed { boxTyName(ty) } else { "" }
   let k = 0
   while k < arms.length {
     const last = k == arms.length - 1
@@ -31807,8 +31823,8 @@ function retFlagsSeedResult(
       && !nodeTyIsNulLitUnion(fn.fnRet)
       && nulCloFlag(fn.fnRet) != 1
     ) {
-      rf.retUNm = tyNameOf(fn.fnRet)
       rf.retUTy = nodeTyIxOf(fn.fnRet)
+      rf.retUNm = boxTyName(rf.retUTy)
     }
   }
   if fn.fnRet < 0 {
@@ -31820,7 +31836,7 @@ function retFlagsSeedResult(
     // alias name is excluded on the same grounds as the annotated arm above — it
     // registers as a union name but its value is the interned i32 atom, so boxing it would be wrong.
     if (isValueUnionName(im) || (isUNameAB(26, imTy) && !imLit)) {
-      rf.retUNm = im
+      rf.retUNm = boxTyName(imTy)
       rf.retUTy = imTy
     }
     // The inferred twins of the `nodeTyIsLitUnionAlias` / `nodeTyIsNulLitUnion` seeds
@@ -31833,7 +31849,7 @@ function retFlagsSeedResult(
   // instance's `() => null` for `T | null`) boxes each value at its recorded type.
   const recU = fnRecordedUnionRet(fn, fnPos)
   if rf.retUNm == "" && !rf.retLitUnion && !rf.retNulLitUnion && recU >= 0 {
-    rf.retUNm = monoPinSpellNoAnon(recU)
+    rf.retUNm = boxTyName(recU)
     rf.retUTy = recU
   }
   // A maker whose delivery builds its union of records as one record returns that record.
@@ -36468,7 +36484,7 @@ function emitPrintValueUnion(body: u8[], argIx: i32, kinds: i32[], fnIx: i32) {
   const puIf = nodeAt(unwrapParen(argIx))
   let puDone = false
   if puIf is IfStmt {
-    const puNm = unionNameOfExpr(argIx, fnIx)
+    const puNm = boxTyName(nodeTyIxOf(argIx))
     if puNm != "" {
       if emitUnionBoxOwed(body, puNm, nodeTyIxOf(argIx), argIx, fnIx) < 0 {
         return -1
@@ -39585,7 +39601,7 @@ function directArgSeedsOf(target: i32, i: i32): DirectArgSeeds {
       if cpK == "union" {
         const cp4 = nodeAt(cParams[i])
         if cp4 is Param {
-          cUNm = tyNameOf(cp4.parType)
+          cUNm = boxTyName(nodeTyIxOf(cp4.parType))
           cUTy = nodeTyAt(cParams[i], fnStmts[target])
         }
       }
@@ -40583,7 +40599,7 @@ function emitCoalesceBoxRuntime(
   const bVt = nulBoxScalarValtype(bk)
   const bVb = vbHeapIdxOfKind(bk)
   let bNm = ""
-  if exprUnion(exprIx, fnIx) { bNm = unionNameOfExpr(exprIx, fnIx) }
+  if exprUnion(exprIx, fnIx) { bNm = boxTyName(nodeTyIxOf(exprIx)) }
   if (bVt < 0 || bVb < 0) && bNm == "" {
     return emitFail(
       "emitProgram: `??` over a null-narrowed value box has no rep for its result",
@@ -40632,7 +40648,7 @@ function emitOptCoalesceBoxLeaf(
 ) {
   const lhsIx = unwrapParen(e.binLeft)
   let bNm = ""
-  if exprUnion(exprIx, fnIx) { bNm = unionNameOfExpr(exprIx, fnIx) }
+  if exprUnion(exprIx, fnIx) { bNm = boxTyName(nodeTyIxOf(exprIx)) }
   // A link `emitCoalesceGo` re-associated out of a chain carries no type of its own; its
   // result is then the leaf's `T | null` with the null removed.
   let rTy = nodeTyIxOf(exprIx)
@@ -41418,13 +41434,13 @@ function emitCoalesceCallStash(
   // An `as?` yielding a box is the same shape (D1041), and an if-expression operand is a third
   // — all three name an operand that cannot be re-read (re-reading an `as?` re-runs the
   // exactness test). The gate widens rather than adding a second arm, since the lowering reads
-  // only `unionNameOfExpr` and the box — the same predicate `coalChainHasCallLhs` reserves the slot on.
+  // only the operand's type and the box — the same predicate `coalChainHasCallLhs` reserves the slot on.
   if (
     lhs is Call
     || ((lhs is AsExpr || lhs is IfStmt)
       && (tyIsNulValueUnionBox(nodeTyIxOf(lhsIx)) || nodeTyIsNulScalarBox(lhsIx)))
   ) {
-    const kunm = unionNameOfExpr(e.binLeft, fnIx)
+    const kunm = boxTyName(nodeTyIxOf(lhsIx))
     if kunm != "" {
       // D-VALUNION + D-SETONCE: one resolution feeds the value-union gate AND the
       // residual code below, which master resolved a second time inside
@@ -42084,7 +42100,7 @@ function emitCoalesceNullableRefs(
   // untangled, since the consumer double-boxes precisely because `exprUnion` answers false for
   // this node. Teaching `unionNameOfExpr` to answer for a value-union `??` is the other half; neither half works alone.
   if tyIsNulValueUnionBox(nodeTyAt(e.binLeft, fnIx)) {
-    const coNm = unionNameOfExpr(exprIx, fnIx)
+    const coNm = boxTyName(nodeTyIxOf(exprIx))
     if coNm != "" {
       const coSlot = sharedFieldRecvSlot()
       if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
