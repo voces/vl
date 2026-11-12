@@ -58,8 +58,23 @@ import {
 } from "./ast"
 import { declTyOf } from "./check_nar_store"
 import { nodeTyOf } from "./check_node_tys"
-import { T, tyToStr } from "./check_types"
-import { wsAnnMentions, wsPendDecl, wsSlotAt } from "./check_width"
+import {
+  T,
+  TyArray,
+  TyMap,
+  TyObj,
+  tyAt,
+  tyToStr,
+  tyToStrUser,
+} from "./check_types"
+import { CODE_UNSUPPORTED_LOWERING } from "./check_messages"
+import {
+  wsAnnMentions,
+  wsPendDecl,
+  wsSlotAt,
+  wsSlotDst,
+  wsSlotSrc,
+} from "./check_width"
 import { i32ListHas } from "./listutil"
 import { strContains } from "./strutil"
 import { identDeclOf } from "./symbols"
@@ -72,6 +87,12 @@ let slNo: i32[] = []
 let slRound: i32[] = []
 let slPath: i32[] = []
 let slSnap: {[i32]: string} = Map()
+// Where the pass before the round refused, each a refusal the round did not cause.
+let slPre: i32[] = []
+// Set once a round of several slots fails: each later round takes one slot, so each is judged alone.
+let slSingle = false
+// The `SL_*` reason each declined slot is declined for.
+let slWhy: {[i32]: i32} = Map()
 
 export function slotReset() {
   slDecl = []
@@ -80,6 +101,9 @@ export function slotReset() {
   slRound = []
   slPath = []
   slSnap = Map()
+  slWhy = Map()
+  slPre = []
+  slSingle = false
   0
 }
 
@@ -114,7 +138,8 @@ function slotFnAbove(x: i32, par: {[i32]: i32}) {
   -1
 }
 
-// The annotated slot the value at `at` is delivered to, or -1: a binding's initializer, an
+// The annotated slot the value at `at` is delivered to (or one whose annotation this rewrite
+// dropped), or -1: a binding's initializer, an
 // assignment to a binding, or a function's return, reached through parentheses, list and record
 // literals and the tails of blocks and `if` arms. Each node passed is pushed to `path`.
 function slotOf(at: i32, par: {[i32]: i32}, path: i32[]) {
@@ -127,7 +152,7 @@ function slotOf(at: i32, par: {[i32]: i32}, path: i32[]) {
     const pn = nodeAt(p)
     match pn {
       LetDecl => {
-        return if pn.letInit == x && pn.letType >= 0 { p } else { -1 }
+        return if pn.letInit == x && (pn.letType >= 0 || i32ListHas(slDecl, p)) { p } else { -1 }
       }
       BinExpr => {
         if (
@@ -140,16 +165,16 @@ function slotOf(at: i32, par: {[i32]: i32}, path: i32[]) {
         const d = identDeclOf(pn.binLeft)
         if d < 0 || d >= P.nodes.length { return -1 }
         const dn = nodeAt(d)
-        return if dn is LetDecl && dn.letType >= 0 { d } else { -1 }
+        return if dn is LetDecl && (dn.letType >= 0 || i32ListHas(slDecl, d)) { d } else { -1 }
       }
       RetStmt => {
         const f = slotFnAbove(p, par)
         if f < 0 { return -1 }
         const fd = nodeAt(f)
-        return if fd is FuncDecl && fd.fnRet >= 0 { f } else { -1 }
+        return if fd is FuncDecl && (fd.fnRet >= 0 || i32ListHas(slDecl, f)) { f } else { -1 }
       }
       FuncDecl => {
-        return if pn.fnBody == x && pn.fnRet >= 0 { p } else { -1 }
+        return if pn.fnBody == x && (pn.fnRet >= 0 || i32ListHas(slDecl, p)) { p } else { -1 }
       }
       Block => {
         if pn.blkStmts.length == 0 || pn.blkStmts[pn.blkStmts.length - 1] != x {
@@ -179,15 +204,6 @@ function slotSnapshot(root: i32): {[i32]: string} {
     out[x] = if t >= 0 && t < T.tys.length { tyToStr(t) } else { "" }
   }
   out
-}
-
-// Whether every refusal of this pass is one a slot candidate raised.
-function slotOnlyRefusals() {
-  if T.diags.length == 0 { return false }
-  for d in T.diags {
-    if !i32ListHas(wsSlotAt, d.tat) { return false }
-  }
-  true
 }
 
 // Whether slot `d` is a binding; any other slot is a function's return.
@@ -273,26 +289,30 @@ function slotTsReadonly(ix: i32) {
   false
 }
 
-// Drops the annotation of every slot this pass's refusals name, when they are its only refusals.
-// Answers how many it dropped, which the caller re-checks for.
+// Drops the annotation of each slot this pass's width refusals name that may drop. Answers how many
+// it dropped, which the caller re-checks for.
 export function slotApply(root: i32) {
-  if wsSlotAt.length == 0 || !slotOnlyRefusals() { return 0 }
+  if wsSlotAt.length == 0 { return 0 }
   const par = slotWalk(root)
   const found: i32[] = []
   const path: i32[] = []
   for at in wsSlotAt {
-    const s = slotOf(at, par, path)
+    const own: i32[] = []
+    const s = slotOf(at, par, own)
     // A `readonly` slot promises no write through it, which its dropped annotation would lose.
-    if (
-      s < 0
-      || i32ListHas(slNo, s)
-      || i32ListHas(slDecl, s)
-      || slotReadonly(s)
-    ) {
-      return 0
+    const ok = s >= 0
+      && !i32ListHas(slNo, s)
+      && !i32ListHas(slDecl, s)
+      && !slotReadonly(s)
+    if ok && !(slSingle && found.length > 0 && !i32ListHas(found, s)) {
+      for x in own { path.push(x) }
+      if !i32ListHas(found, s) { found.push(s) }
     }
-    if !i32ListHas(found, s) { found.push(s) }
   }
+  if found.length == 0 { return 0 }
+  const pre: i32[] = []
+  for d in T.diags { pre.push(d.tat) }
+  slPre = pre
   slSnap = slotSnapshot(root)
   slPath = path
   slRound = found
@@ -304,10 +324,11 @@ export function slotApply(root: i32) {
   found.length
 }
 
-// How parent `p` takes slot value `v`: 0 hands it on elsewhere, 1 ends it (a field or element
-// read of the same type as before, or an assignment's target), 2 carries it as a value of its own
-// whose type changed, 3 binds it to an un-annotated binding, which joins the slot.
-function slotUse(v: i32, p: i32, changed: boolean) {
+// How parent `p` takes slot value `v`: 0 hands it on elsewhere, 1 ends it (a field or element read
+// of the same type as before, an assignment's target, or a delivery the checker judges: an annotated
+// binding, an assignment, a return), 2 carries it as a value of its own whose type changed, 3 binds
+// it to an un-annotated binding, which joins the slot, 4 joins it with other values.
+function slotUse(v: i32, p: i32, changed: boolean, par: {[i32]: i32}) {
   const pn = nodeAt(p)
   match pn {
     Member => {
@@ -317,19 +338,41 @@ function slotUse(v: i32, p: i32, changed: boolean) {
       return if pn.idxArr != v { 0 } else if changed { 2 } else { 1 }
     }
     BinExpr => {
-      return if pn.binOp == "=" && pn.binLeft == v { 1 } else { 0 }
+      if pn.binOp == "??" { return 4 }
+      return if pn.binOp == "=" && (pn.binLeft == v || pn.binRight == v) { 1 } else { 0 }
     }
     LetDecl => {
-      return if pn.letInit == v && pn.letType < 0 { 3 } else { 0 }
+      if pn.letInit != v { return 0 }
+      return if pn.letType < 0 { 3 } else { 1 }
     }
     Paren => {
       return 2
     }
+    ArrayLit => {
+      return 4
+    }
+    Block => {
+      if pn.blkStmts.length == 0 || pn.blkStmts[pn.blkStmts.length - 1] != v {
+        return 0
+      }
+      return if slotFnBodyOf(par[p] ?? -1) == p { 1 } else { 4 }
+    }
+    RetStmt => {
+      return 1
+    }
     // Any other parent reads the value at a type other than the one the slot declared.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | OptMember | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | OptMember | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
       return 0
     }
   }
+}
+
+// The body block of function `f`, or -1.
+function slotFnBodyOf(f: i32) {
+  if f < 0 { return -1 }
+  const n = nodeAt(f)
+  if n is FuncDecl { return n.fnBody }
+  -1
 }
 
 // The callee name node of call `i`, or -1.
@@ -369,18 +412,79 @@ function slotJoinsAlike(p: i32, now: {[i32]: string}) {
   }
 }
 
+// Why a drop is undone: `SL_MIXED` when the slot is handed values of two layouts, `SL_JOINED` when
+// its value is joined with another, `SL_GAP` for anything else.
+const SL_HELD = 0
+const SL_MIXED = 1
+const SL_JOINED = 2
+const SL_GAP = 3
+
+// The target name of assignment `x`, or -1.
+function slotAsgTarget(x: i32) {
+  const n = nodeAt(x)
+  if n is BinExpr && n.binOp == "=" { return n.binLeft }
+  -1
+}
+
+// Why the re-check's refusals undo the round: `SL_MIXED` when one is a value handed to one of the
+// round's slots, `SL_GAP` when one is anything else, and `SL_HELD` when each is a contract refusal
+// outside the slots, a slot the next round drops, or one the pass before raised, which leaves the
+// round to the reads that follow.
+function slotRefusalsWhy(par: {[i32]: i32}) {
+  let mixed = false
+  for d in T.diags {
+    const path: i32[] = []
+    const s = slotOf(d.tat, par, path)
+    if (
+      i32ListHas(slRound, s)
+      || i32ListHas(slRound, identDeclOf(slotAsgTarget(d.tat)))
+    ) {
+      mixed = true
+    } else if (
+      !(s < 0 && slotOtherContract(d.tat, par))
+      && !slotNext(d.tat, s)
+      && !i32ListHas(slPre, d.tat)
+    ) {
+      return SL_GAP
+    }
+  }
+  if mixed { SL_MIXED } else { SL_HELD }
+}
+
+// Whether the refusal at `at` is a candidate's at slot `s` the next round can drop: a slot a
+// dropped one's value is handed to.
+function slotNext(at: i32, s: i32) {
+  s >= 0
+    && i32ListHas(wsSlotAt, at)
+    && !i32ListHas(slNo, s)
+    && !i32ListHas(slDecl, s)
+    && !slotReadonly(s)
+}
+
+// Whether the refusal at `at` reaches no slot and is one the one-layout contract owes.
+function slotOtherContract(at: i32, par: {[i32]: i32}) {
+  let k = 0
+  while k < wsSlotAt.length && wsSlotAt[k] != at { k = k + 1 }
+  k < wsSlotAt.length && slotContractClause(at, wsSlotDst[k], par) != ""
+}
+
 // Whether the re-check after a drop left the program the same outside the slots: no refusal, no
 // rewrite left pending, each slot's value read only by a field, an element, an assignment's target
 // or an un-annotated binding (which joins the slot), and every other node of the same type.
+// Answers SL_HELD, or why not: SL_MIXED, SL_JOINED or SL_GAP.
 function slotHeld(root: i32) {
-  if T.diags.length > 0 || wsPendDecl.length > 0 { return false }
   const par = slotWalk(root)
+  if T.diags.length > 0 {
+    const w = slotRefusalsWhy(par)
+    if w != SL_HELD { return w }
+  }
+  if wsPendDecl.length > 0 { return SL_GAP }
   const now = slotSnapshot(root)
   const fam: i32[] = []
   for d in slRound { fam.push(d) }
   const own: {[i32]: boolean} = Map()
   for x in slPath {
-    if !slotJoinsAlike(x, now) { return false }
+    if !slotJoinsAlike(x, now) { return SL_JOINED }
     own[x] = true
   }
   let seen = 0
@@ -396,10 +500,13 @@ function slotHeld(root: i32) {
         while v >= 0 && steps < 256 {
           own[v] = true
           const p = par[v] ?? -1
-          if p < 0 { return false }
+          if p < 0 { return SL_GAP }
           const changed = !slSnap.has(p) || (slSnap[p] ?? "") != (now[p] ?? "")
-          const u = slotUse(v, p, changed)
-          if u == 0 { return false }
+          const u = slotUse(v, p, changed, par)
+          if u == 0 { return SL_GAP }
+          if u == 4 { return SL_JOINED }
+          // An assignment whose either side is the slot's value takes the slot's type with it.
+          if u == 1 { own[p] = true }
           if u == 3 {
             own[p] = true
             if !i32ListHas(fam, p) { fam.push(p) }
@@ -413,34 +520,40 @@ function slotHeld(root: i32) {
   }
   for x in now.keys() {
     const same = !slSnap.has(x) || (slSnap[x] ?? "") == (now[x] ?? "")
-    if !same && !(own[x] ?? false) && !i32ListHas(fam, x) { return false }
+    if !same && !(own[x] ?? false) && !i32ListHas(fam, x) { return SL_GAP }
   }
-  true
+  SL_HELD
 }
 
-// Settles the round's drops after their re-check, restoring and declining them unless the
-// program held. True when it restored any, so a re-check is owed to report the refusals.
+// Settles the round's drops after their re-check: unless the program held, each is restored and
+// declined, or, after a first failing round of several, restored to be taken one at a time. True
+// when it restored any, so a re-check is owed.
 export function slotSettle(root: i32) {
   if slRound.length == 0 { return false }
-  const held = slotHeld(root)
+  const why = slotHeld(root)
   const round = slRound
   slRound = []
   slPath = []
   slSnap = Map()
-  if held { return false }
+  if why == SL_HELD { return false }
+  const retry = round.length > 1 && !slSingle
+  if retry { slSingle = true }
   for s in round {
     let k = 0
     while k < slDecl.length {
       if slDecl[k] == s { slotSetAnn(s, slAnn[k]) }
       k = k + 1
     }
-    slNo.push(s)
+    if !retry {
+      slWhy[s] = why
+      slNo.push(s)
+    }
   }
   const kd: i32[] = []
   const ka: i32[] = []
   let r = 0
   while r < slDecl.length {
-    if !i32ListHas(slNo, slDecl[r]) {
+    if !i32ListHas(round, slDecl[r]) {
       kd.push(slDecl[r])
       ka.push(slAnn[r])
     }
@@ -449,4 +562,221 @@ export function slotSettle(root: i32) {
   slDecl = kd
   slAnn = ka
   true
+}
+
+// Whether type `t` is a map.
+function slotIsMapTy(t: i32) { t >= 0 && t < T.tys.length && tyAt(t) is TyMap }
+
+// Whether type `t` is a list.
+function slotIsListTy(t: i32) {
+  t >= 0 && t < T.tys.length && tyAt(t) is TyArray
+}
+
+// Whether the list literal `x` holds elements of two types.
+function slotListMixed(x: i32) {
+  const n = nodeAt(x)
+  if n is ArrayLit {
+    for e in n.arrElems {
+      if tyToStr(nodeTyOf(e)) != tyToStr(nodeTyOf(n.arrElems[0])) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// The name slot `d` declares.
+function slotName(d: i32) {
+  const n = nodeAt(d)
+  if n is LetDecl { return n.letName }
+  slotFnName(d)
+}
+
+// The name function `d` declares, or "".
+function slotFnName(d: i32) {
+  const n = nodeAt(d)
+  if n is FuncDecl { return n.fnName }
+  ""
+}
+
+// Why a declined slot `s` holds one layout, for a refused record of declared type `dst`.
+function slotWhyClause(s: i32) {
+  const why = slWhy[s] ?? SL_HELD
+  const nm = "`" + slotName(s) + "`"
+  if why == SL_MIXED {
+    if slotIsLet(s) {
+      return nm
+        + " is given records of two layouts, and one binding stores one record layout"
+    }
+    return nm
+      + " returns records of two layouts, and one return stores one record layout"
+  }
+  if why == SL_JOINED {
+    return nm
+      + " is joined with a value of another layout, and a join stores one record layout"
+  }
+  ""
+}
+
+// Why the existing storage written through `lhs`, a list element, a map value or a record field,
+// holds one layout, for a declared record `dst`; "" for any other target.
+function slotStoreClause(lhs: i32, dst: i32) {
+  const n = nodeAt(lhs)
+  match n {
+    Index => {
+      return slotRecvClause(n.idxArr, dst)
+    }
+    Member => {
+      return "the field `"
+        + n.memProp
+        + "` stores one record layout, fixed where its record is declared"
+    }
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return ""
+    }
+  }
+}
+
+// Why the existing list or map `recv` holds one layout for its declared record `dst`, or "".
+function slotRecvClause(recv: i32, dst: i32) {
+  const t = nodeTyOf(recv)
+  if slotIsListTy(t) {
+    return "a `"
+      + tyToStrUser(dst)
+      + "[]` stores one record layout for every element, fixed where the list is declared"
+  }
+  if slotIsMapTy(t) {
+    return "a map of `"
+      + tyToStrUser(dst)
+      + "` values stores one record layout for every value, fixed where the map is declared"
+  }
+  ""
+}
+
+// Why the storage the refused record at `at` is handed to holds one record layout by contract:
+// a slot declined for two layouts or a join, a list literal or `if` joining two layouts, or an
+// existing list, map or record field. "" where the refusal is a capability gap.
+function slotContractClause(at: i32, dst: i32, par: {[i32]: i32}) {
+  const path: i32[] = []
+  const s = slotOf(at, par, path)
+  for x in path {
+    if slotListMixed(x) {
+      return "this list literal holds records of two layouts, and a list stores one record layout for every element"
+    }
+  }
+  if s >= 0 { return slotWhyClause(s) }
+  let x = at
+  let p = par[x] ?? -1
+  let guard = 0
+  while p >= 0 && nodeAt(p) is Paren && guard < 64 {
+    x = p
+    p = par[x] ?? -1
+    guard = guard + 1
+  }
+  if p < 0 { return "" }
+  slotParentClause(x, p, dst, par)
+}
+
+// `slotContractClause` for the value `x` beside its parent `p`.
+function slotParentClause(x: i32, p: i32, dst: i32, par: {[i32]: i32}) {
+  const pn = nodeAt(p)
+  match pn {
+    ArrayLit => {
+      return if slotListMixed(p) { "this list literal holds records of two layouts, and a list stores one record layout for every element" } else { "" }
+    }
+    Block => {
+      const q = par[p] ?? -1
+      const tail = pn.blkStmts.length > 0
+        && pn.blkStmts[pn.blkStmts.length - 1] == x
+      return if tail && q >= 0 && nodeAt(q) is IfStmt { "this `if` gives records of two layouts, and its value stores one record layout" } else { "" }
+    }
+    BinExpr => {
+      if pn.binOp == "??" {
+        return "this `??` gives records of two layouts, and its value stores one record layout"
+      }
+      return if pn.binOp == "=" && pn.binRight == x { slotStoreClause(pn.binLeft, dst) } else { "" }
+    }
+    Call => {
+      return slotCallClause(pn, x, dst)
+    }
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+      return ""
+    }
+  }
+}
+
+// Why a list's `push` or a map's `set`, call `c` handing it `x`, stores one layout, or "".
+function slotCallClause(c: Call, x: i32, dst: i32) {
+  if !i32ListHas(c.callArgs, x) || c.callFn < 0 { return "" }
+  const f = nodeAt(c.callFn)
+  if !(f is Member) { return "" }
+  const listOp = f.memProp == "push"
+    || f.memProp == "unshift"
+    || f.memProp == "insert"
+  if listOp && slotIsListTy(nodeTyOf(f.memObj)) {
+    return slotRecvClause(f.memObj, dst)
+  }
+  if f.memProp == "set" && slotIsMapTy(nodeTyOf(f.memObj)) {
+    return slotRecvClause(f.memObj, dst)
+  }
+  ""
+}
+
+// The literal that builds a fresh `dst` from the value at `at`: `{ x: a.x, y: a.y }`.
+function slotFreshLit(at: i32, dst: i32) {
+  const n = nodeAt(at)
+  const src = if n is Ident { n.identName } else { "v" }
+  let out = "{ "
+  if dst >= 0 && dst < T.tys.length {
+    const d = tyAt(dst)
+    if d is TyObj {
+      let i = 0
+      while i < d.objFieldNames.length {
+        if i > 0 { out = out + ", " }
+        out = out + d.objFieldNames[i] + ": " + src + "." + d.objFieldNames[i]
+        i = i + 1
+      }
+    }
+  }
+  out + " }"
+}
+
+// Rewords each refusal of an existing record whose storage holds one record layout by contract
+// (DECISIONS "Width subtyping of an existing record") from the capability-gap sentence to that
+// contract, with the fresh literal that stores it.
+export function slotContractWords(root: i32) {
+  if T.diags.length == 0 || wsSlotAt.length == 0 { return 0 }
+  const par = slotWalk(root)
+  let i = 0
+  while i < T.diags.length {
+    const d = T.diags[i]
+    let k = 0
+    while k < wsSlotAt.length && wsSlotAt[k] != d.tat { k = k + 1 }
+    if d.tcode == CODE_UNSUPPORTED_LOWERING && k < wsSlotAt.length {
+      const why = slotContractClause(d.tat, wsSlotDst[k], par)
+      if why != "" {
+        const msg = "an existing record keeps its own record layout where it is delivered (no copy "
+          + "is made), and "
+          + why
+          + "; this "
+          + tyToStrUser(wsSlotSrc[k])
+          + " cannot share it, so build a fresh "
+          + tyToStrUser(wsSlotDst[k])
+          + " here instead, as `"
+          + slotFreshLit(d.tat, wsSlotDst[k])
+          + "`"
+        T.diags[i] = {
+          tmsg: msg,
+          tat: d.tat,
+          tline: d.tline,
+          tcol: d.tcol,
+          tendTok: d.tendTok,
+          tcode: "",
+          tdata: d.tdata,
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
 }
