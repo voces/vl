@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Step 7 L2, mono: a tagged set's map or record pin is spelled from its stored type.** `monoTagMapRepName` assembled the stored spelling of a map of tagged-set ids (`"{[" + tyToStr(key) + "]: i32}"`) and of a record holding one (field by field) by hand; it now builds the stored type (`mapStoredTyOf`, or a record of each field's stored type) and spells it by the naming rule. The text changes at every site (557 decisions, 60 programs); 59 modules are byte-identical, and one, `functions/hole-param-called-and-handed-on-in-record.vl`, is 9 bytes smaller: its pin now names the record's existing row, so a twin struct type is no longer minted. It prints the same.
