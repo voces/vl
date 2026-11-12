@@ -799,7 +799,7 @@ an `A` never equals a `Pos` view of a `B`, whatever `x` and `y` hold. This is wh
 `getClass()` idiom, Kotlin and Scala converge on: comparing only the narrow type's fields makes
 equality depend on the static type, which an implicit view hides. **Backlog, deep:** an operator
 (or a modified `==`) that compares a view only through the supertype's fields. Identity is
-`===` (identity-design §0), which is unbuilt: D15959.
+`===` (identity-design §0), which is unbuilt: D15975.
 
 ### union-twins-one-type — are two separately declared but identical unions one type? — not an owner question; withdrawn 2026-11-12
 

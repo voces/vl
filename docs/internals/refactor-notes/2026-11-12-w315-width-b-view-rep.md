@@ -97,7 +97,7 @@ The status of each lives in `open-rulings.md`.
 2. `width-view-is-narrowing`: **allowed.** `is A` on a view tests its shape and narrows.
 3. `width-view-equality`: **same concrete type, then every field**, not identity. `==` is
    structural in VL, so the "Identity, equality and mutation" section above is superseded on
-   `==`; reference identity is `===` (D15959).
+   `==`; reference identity is `===` (D15975).
 
 ## Estimated PR sequence
 
