@@ -50,6 +50,19 @@ These rows are the ones `rlKeyTyOf` declines (cut 2): their struct row is keyed 
 has no type yet. The rung, and its `nonNulBaseOf`, stay as a named floor until the held-rep type
 exists.
 
+## The `emit_base.vl` predicates this lane's stack frees
+
+The coordinator asked for this list, so that lane E can delete the predicates. Each one below has
+no caller in `compiler/` at this tip, other than its own definition. Each had at least one on
+master `f7b6b8d9`:
+
+| predicate | freed by |
+| --- | --- |
+| `mapValNameOf` | cut 3 (`shapeFieldElemName`'s map legs) |
+| `nameIsI32ListArray`, `nameIsMapArray`, `nameIsClosureArray`, `parenUnionArrElemName` | cut 4 (the refArr* cluster) |
+
+`nameIsI32KeyedMap` and `tyIsStructWithLitUnionField` have no caller on master already.
+
 ## Proof
 
 Refresh to a fixpoint, at 6,716,628 bytes. `scripts/gate.sh` passes in full: deno tests,
