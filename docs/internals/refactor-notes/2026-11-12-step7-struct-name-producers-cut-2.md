@@ -52,13 +52,17 @@ row decision that compares types must compare the sets as well (`fnSetsAgree`).
 Under structural typing two same-shape rows are already one type. Keying the twin test by type
 is therefore the contract, and the function set is part of a function type's storage.
 
-**Floor:** a slot with no recorded element type (`sFieldElemTyIx` −1 on either side) still
-compares element names. That path is reached in 692 programs and decides in 19, where the names
-differ. Its typed form waits on the element type being recorded at every field row.
+**The no-element slot reads no name either.** A slot with no recorded element type compared
+element names. That path was reached in 692 programs, and the names differed in 19. A probe
+printed both slots in every one of the 19. Each is a code-0 field that is an interned atom on one
+side (`K`, `"a" | "b"`, whose element type is recorded) and a plain scalar on the other, with no
+element at all (name `""`, type −1). So "no recorded type" means "no element", not a lost type.
+The rule is now: a slot with no element type matches only another such slot. Against the name
+fallback it is byte-identical over the sweep (24,192 same), and `sRowsTwin` reads no name.
 
 ## Proof
 
-- Refresh ×2 is a fixpoint at 6,711,413 bytes, against master's 6,710,159.
+- Refresh ×2 is a fixpoint at 6,711,300 bytes, against master's 6,710,159.
 - Sweep against master's fixpoint seed: 24,189 same and **3 bytes-only movers**, the twins that
   now merge: D627's witness, `maps/map-value-layout-twin-heap-merge` and
   `unions/error-arm-struct-equality-mixed`. 0 output movers, 0 `runs → not-runs`, 0 new traps.
