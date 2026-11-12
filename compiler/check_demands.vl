@@ -27,8 +27,13 @@ import {
   P,
   Param,
   Paren,
+  TS_ARR,
+  TS_NAME,
+  TS_NULL,
+  TS_UNION,
   TypeRef,
   adoptNodeTok,
+  annTsOf,
   arenaNoteEdit,
   arenaReplaceNode,
   declHasExportKw,
@@ -53,6 +58,11 @@ import {
   restParamIndex,
   stmtBraceNodes,
   stmtBraceTails,
+  tsKidCount,
+  tsKidStart,
+  tsKids,
+  tsKind,
+  tsText,
   ufcsImpMangled,
   ufcsImpName,
   ufcsImpSpec,
@@ -449,7 +459,9 @@ import {
   TyArray,
   TyErr,
   TyFunc,
+  TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
   TyPrim,
@@ -677,37 +689,49 @@ export function noteCallInvalidations(callIx: i32) {
   0
 }
 
-// Whether argument `i` of call `n`, of type `at`, is a wider record the parameter's declared
-// record type `expected` would refuse only for its extra fields, and the function can take a
-// generic parameter there: not exported, the type named in no other annotation of its signature.
-// A function read as a value is declined when the rewrite is applied.
+// The declared record name argument `i` of call `n`, of type `at`, would make generic: the
+// parameter's record type `expected` (bare, `| null`, or a list's element) refuses `at` only for
+// its extra fields, and the function can take a generic parameter there: not exported, the type
+// not named by its return. "" where it is no such argument. A value read is declined on apply.
 export function wsCandidate(
   n: Call,
   i: i32,
   arg: i32,
   at: i32,
   expected: i32,
-): boolean {
-  if arg < 0 || at < 0 || expected < 0 || expected >= T.tys.length {
-    return false
+): string {
+  if (
+    arg < 0
+    || at < 0
+    || expected < 0
+    || expected >= T.tys.length
+    || at == expected
+  ) {
+    return ""
   }
-  if at == expected || !(tyAt(expected) is TyObj) { return false }
+  const ex = wsInnerRec(expected)
+  const ax = wsInnerArg(at, expected)
+  if ex < 0 || ax < 0 { return "" }
+  // A literal inside a list or nullable parameter keeps the literal's own refusal of a field the
+  // record does not declare; only an existing record is passed on wider there.
+  const pa = parenPeelIx(arg)
+  const lit = pa >= 0 && (nodeAt(pa) is ArrayLit || nodeAt(pa) is ObjLit)
+  if ex != expected && lit { return "" }
   // Asked of every argument: only a record with more fields, or a parameter this rewrite made
   // generic, goes on to the declaration and the field-by-field comparison.
-  const pre = tyAt(at)
+  const pre = tyAt(ax)
+  const ew = tyAt(ex)
+  if !(ew is TyObj) { return "" }
   if pre is TyObj {
-    const ew = tyAt(expected)
-    if ew is TyObj {
-      if pre.objFieldNames.length <= ew.objFieldNames.length { return false }
-    }
+    if pre.objFieldNames.length <= ew.objFieldNames.length { return "" }
   } else if !(pre is TyVar) {
-    return false
+    return ""
   }
   const d = wsCalleeDecl(n)
-  if d < 0 || i32ListHas(wsNoDecl, d) { return false }
+  if d < 0 || i32ListHas(wsNoDecl, d) { return "" }
   const fd = nodeAt(d)
   if !(fd is FuncDecl) || i >= fd.fnParams.length || declHasExportKw(d) {
-    return false
+    return ""
   }
   const pn = nodeAt(fd.fnParams[i])
   if (
@@ -716,38 +740,92 @@ export function wsCandidate(
     || pn.parRest == 1
     || pn.parName == "self"
   ) {
-    return false
+    return ""
   }
-  const ann = nodeAt(pn.parType)
-  if !(ann is TypeRef) || !wsIsIdent(ann.tyName) { return false }
-  const et = tyAt(expected)
-  const st = tyAt(at)
-  if !(et is TyObj) { return false }
-  // A parameter this rewrite already made generic, passed on whole, makes this one generic too:
-  // each of its instances is one of the wider records its own calls are held to.
-  if st is TyVar {
-    if st.tvName.length < 3 || st.tvName.slice(0, 3) != "__W" { return false }
-  } else if st is TyObj {
+  const name = wsAnnRecName(pn.parType)
+  if name == "" { return "" }
+  if pre is TyVar {
+    if pre.tvName.length < 3 || pre.tvName.slice(0, 3) != "__W" { return "" }
+  } else if pre is TyObj {
     let f = 0
-    while f < et.objFieldNames.length {
-      const sf = objFieldType(st, et.objFieldNames[f])
-      if sf < 0 || !tySame(sf, et.objFieldTypes[f]) { return false }
+    while f < ew.objFieldNames.length {
+      const sf = objFieldType(pre, ew.objFieldNames[f])
+      if sf < 0 || !tySame(sf, ew.objFieldTypes[f]) { return "" }
       f = f + 1
     }
-    if !objShapeAdapterlessAt(arg, at, expected) { return false }
-  } else {
-    return false
+    if !objShapeAdapterlessAt(arg, at, expected) { return "" }
   }
-  let j = 0
-  while j < fd.fnParams.length {
-    const oj = nodeAt(fd.fnParams[j])
-    if j != i && oj is Param {
-      if wsAnnMentions(oj.parType, ann.tyName) { return false }
+  // Another parameter of the same record is its own candidate; an instance mixing them is refused
+  // there, which undoes the rewrite (D4021).
+  if fd.fnRet < 0 {
+    return if wsInferredRetPrim(fd.fnName) { name } else { "" }
+  }
+  if wsAnnMentions(fd.fnRet, name) { "" } else { name }
+}
+
+// The record a parameter type `t` holds by value: `t`, the inner of `t | null`, or a list's element.
+function wsInnerRec(t: i32) {
+  const tt = tyAt(t)
+  match tt {
+    TyNullable => {
+      return tt.nInner
     }
-    j = j + 1
+    TyArray => {
+      return tt.aElem
+    }
+    TyObj | TyVar => {
+      return t
+    }
+    // No other parameter type holds a record by value.
+    TyPrim | TyErr | TyFunc | TyMap | TyLit | TyNeg | TyUnion => {
+      return -1
+    }
   }
-  if fd.fnRet < 0 { return wsInferredRetPrim(fd.fnName) }
-  !wsAnnMentions(fd.fnRet, ann.tyName)
+}
+
+// The argument type `at` at the place `wsInnerRec` reads in `expected`: an argument of a list
+// parameter must be a list, and one of a nullable parameter is the record itself or its nullable.
+function wsInnerArg(at: i32, expected: i32) {
+  const et = tyAt(expected)
+  const a = tyAt(at)
+  match et {
+    TyArray => {
+      return if a is TyArray { a.aElem } else { -1 }
+    }
+    TyNullable => {
+      return if a is TyNullable { a.nInner } else { at }
+    }
+    // A record or a type parameter is passed as itself.
+    TyObj | TyVar | TyPrim | TyErr | TyFunc | TyMap | TyLit | TyNeg | TyUnion => {
+      return at
+    }
+  }
+}
+
+// The one record name a parameter annotation `ann` writes: `R`, `R | null` or `R[]`; "" for any
+// other spelling.
+function wsAnnRecName(ann: i32) {
+  const a = nodeAt(ann)
+  if !(a is TypeRef) { return "" }
+  const r = annTsOf(ann)
+  if r < 0 { return if wsIsIdent(a.tyName) { a.tyName } else { "" } }
+  const k = tsKind[r]
+  if k == TS_NAME { return if wsIsIdent(tsText[r]) { tsText[r] } else { "" } }
+  if k == TS_ARR && tsKidCount[r] == 1 {
+    const e = tsKids[tsKidStart[r]]
+    return if tsKind[e] == TS_NAME && wsIsIdent(tsText[e]) { tsText[e] } else { "" }
+  }
+  if k == TS_UNION && tsKidCount[r] == 2 {
+    const x = tsKids[tsKidStart[r]]
+    const y = tsKids[tsKidStart[r] + 1]
+    if tsKind[x] == TS_NAME && tsKind[y] == TS_NULL && wsIsIdent(tsText[x]) {
+      return tsText[x]
+    }
+    if tsKind[y] == TS_NAME && tsKind[x] == TS_NULL && wsIsIdent(tsText[y]) {
+      return tsText[y]
+    }
+  }
+  ""
 }
 
 // The declared record type a rewritten parameter `i` of the declaration call `n` names had, or -1
