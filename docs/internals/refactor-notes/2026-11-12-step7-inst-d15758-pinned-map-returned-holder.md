@@ -24,6 +24,11 @@ All in emit_mono, with no helper added.
 - **Bindings of a call.** A binding of a call of a held function is a holder too. A first cut
   without this retyped `__deliver()` to the pinned map but left `const v = __deliver()` open, and
   lost `return_inferred`.
+- **A bare `return` is no holder.** The neighbouring-matrix grid caught a compiler trap in
+  `hole-fn-map-in-record-field`'s `early_return_guard`: a function with a bare `return`
+  handed `retArg` -1 to `monoReadsBinding`, and `unwrapParen(-1)` read node -1. Every read the
+  walk tests is now bound-tested first, including the `let`-write and bare-read tests that D15759
+  (#7564) added.
 
 ## Grading
 
