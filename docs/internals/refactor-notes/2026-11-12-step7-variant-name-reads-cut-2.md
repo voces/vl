@@ -10,21 +10,22 @@ programs. Fixpoint seeds were used on both sides.
 
 The sites that hold a type were measured twice.
 
-1. A probe fired `emitFail` only where the name and the typed answer differ. An answer from one
-   side only counts as a difference. Only a program's first error is recorded, so a zero is read
-   with the second measurement.
+1. A probe marked each site where the name and the typed answer differ. An answer from one side
+   only counts as a difference. The marks accumulate per program, and `emitProgram` reports them
+   all at its end, overriding any earlier error, so no site hides behind another. A first-error
+   probe read 6 for `memberArmRow`; the accumulating one reads 8.
 2. Each site was switched to its type and the sweep was diffed. A probe difference is a different
    row; the sweep says whether a module or an output moves.
 
 | site | probe: differ | switched alone: sweep | grade |
 | --- | --- | --- | --- |
-| `memberArmRow` | 6, twin arms with different rows | 1 bytes-only, 0 output | **converted** (name only for a member with no type) |
+| `memberArmRow` | 8, twin arms with different rows; its no-type name fallback never answers | 1 bytes-only, 0 output | **converted**; it takes no name |
 | `declArmsMatchRow`'s name loop | 20, a twin the type finds | 12 bytes-only as `unionArmRowOfTy`; **0** as one typed loop that binds only an unnamed twin | **converted** |
 | `annDeclVariantRow`'s spelling fallback | 0, never answers | — | **deleted**; the function takes no spelling |
-| `collectVariantFields`' declared-record test (`declStructNodeOf(nonNulBaseOf(ftxt))`) | 0 against the field type's declaration (`structNameOfTy`) | — | **converted** (`fieldNamesDeclRecord`) |
+| `collectVariantFields`' declared-record test (`declStructNodeOf(nonNulBaseOf(ftxt))`) | 0, and never answers true | — | **converted** (`fieldNamesDeclRecord`, the field type's declaration) |
 | `collectShapeVariantFields`' generic-application rung (`nameIsConcreteGenAppDecl(nonNulBaseOf(ftxt))`) | 0, never reached; two hand witnesses (a `B<i32>` and a `B<i32> \| null` field of an inline arm) are answered by `nameFieldCodeTy` and run | — | **deleted**: a hit now reaches the refusal below it |
 | `typeDeclMintsRow`, `collectNestedFieldShapes`' `ownsRow` | 37 | **runs → trap**: `arrays/mixed-nullable-record-string-literal` (cast failure), plus 1 bytes-only | **floor** |
-| `mvValArmOfShapeTy` | 0 | not switched | open |
+| `mvValArmOfShapeTy` | 0, and never reached | not switched | open |
 
 **The floor.** `typeDeclMintsRow` asks whether a declaration is itself a union arm. A record
 declared as a same-shape twin of an arm has a type that `tyIsVariantMember` calls a variant
@@ -55,11 +56,11 @@ The variant table already carries its type column, `uVarTyIx`, written beside `u
 
 ## Proof
 
-- Refresh ×2 is a fixpoint at 6,724,092 bytes, 209 under master's 6,724,301.
+- Refresh ×2 is a fixpoint at 6,724,043 bytes, 258 under master's 6,724,301.
 - Sweep against master's fixpoint seed: 24,177 same. One bytes-only mover,
   `unions/shared-nullable-literal-field-read`: `memberArmRow` takes the member type's arm, not
   the first arm of that name. 0 output movers, 0 `runs → not-runs`, 0 new traps.
 - lint-self is clean, and `regress.vl` lost no runs.
 - Witnesses `--strict`: 4,849 as filed, 0 moved.
 - Late demands 8, seed +2.0%, render-parse 13 and 31, and plumb-shape cost passes.
-- `variantIndexOf` code call sites go from 30 to 28.
+- `variantIndexOf` code call sites go from 30 to 27.
