@@ -119,3 +119,55 @@ self-compile.
 The decision draws no line at annotation, so an annotated `let` narrows on a write the same way:
 p2 and p4 run (orchestrator ruling, 2026-11-12; DECISIONS.md entry amended). The annotated face
 is in the matrix from the first PR.
+
+## PR 1: the `let x = null` face (2026-11-12)
+
+**What changed.**
+- The declaration `let x = null` installs an assignment row of the closed `null` type
+  (`check_statements.vl`).
+- A write's fill reads storage to find its hole. The non-null shadow it installs also updates
+  the row, so a row at the declaration's own depth does not mask it (`check_operators.vl`).
+- `nullReadHoleTy` (`check_fit_rules.vl`) keeps container element inference as it was: a
+  null-narrowed read delivered into an open hole is the binding's hole, so it links (D2506).
+  The callers are list literals, `.push`, `.set`, index writes, the fill of an open container
+  slot, and `constrainEmptyExpr`, before #7576's `noteNullHoleDelivery`.
+- Emit:
+  - `emitNullReadAtDst` delivers a `null`-typed read as the destination's null where the
+    destination names a rep other than storage. An open-hole destination takes the storage
+    read.
+  - `emitNulIsNullTest` folds a `null`-typed read.
+  - `emitArrI32` stores the `null[]` sentinel for a `null`-typed element (D15950, a
+    pre-existing defect this face reaches).
+
+**Matrix** (`null-let-read-before-fill.matrix.vl`, master seed against the candidate):
+- 37 of 46 graded cells run; 18 cells moved from SILENT to RUNS, and 0 runs → not-runs.
+- The 3 SILENT cells are SILENT before and after: `block_while`, `block_while_capture` and
+  `fn_body_capture`, annotated. These are the loop and capture positions where the read is the
+  hole. On the merged tree #7576's judgement refuses the loop spelling
+  (`error-null-let-read-at-loop-head-before-a-filling-write.vl`).
+
+**By hand:**
+- the straight line, D2660, an `if` join, the loop soundness probe (`-1` then `5`) and a bound
+  copy run;
+- the capture called after the write is refused by the capture re-check;
+- the callback-with-a-later-write cell is still invalid wasm, as on master. It is filed as
+  D15951.
+
+**Census:**
+- inventory witnesses (`sweep.vl record --population inventory`), master against the candidate:
+  4,747 of 4,751 the same, 0 runs → not-runs, 0 new traps. D2660 and D1578 (the same program)
+  went from compiler trap to runs; D1589 and D2661 are bytes-only movers.
+- distilled `regress.vl`: no runs lost.
+- cases_wasm: 7,552 passed.
+- the self-compile: `refresh-compiler.sh`.
+
+**Fixtures re-graded:**
+- #7576's D2660 error fixture becomes the loop-head spelling, which is still refused;
+- `inference/null-let-read-takes-its-most-recent-write.vl` and
+  `generics/null-pinned-instance-list-literal.vl` are new.
+
+**The annotated face is PR 2.** A write that narrows `let x: i32 | string` would make 11
+fixtures fail:
+- a later `is` test of another member becomes "can never match", which needs a policy for a
+  test that a write made dead;
+- `writeReNarrowTy` picks the wrong member for a generic application.
