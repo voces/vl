@@ -554,36 +554,48 @@ Deno.test("a wrapped status line joins to its paragraph, whatever its length", (
   }
 });
 
-// A RESERVED RANGE WHOSE WORK HAS LANDED MUST GO BACK. `RESERVED.md` is what `ls.vl --next`
+// A RESERVED RANGE WHOSE WORK HAS LANDED MUST GO BACK. `reserved/` is what `ls.vl --next`
 // skips, so a forgotten reservation silently widens the gap between the highest filed row and
 // the next id anyone is handed — the block is invisible to everyone except the tool that
 // steps over it. Stale means every id in the range is filed: the work it was taken for is
-// done. Structural, no program run, ~1 ms.
-Deno.test("no reserved inventory range is stale", async () => {
-  const path = "docs/internals/inventory/RESERVED.md";
-  let text = "";
+// done. One file per range means two lanes' overlapping ranges merge without a conflict, so
+// the overlap is checked here on the merged tree. Structural, no program run, ~5 ms.
+Deno.test("no reserved inventory range is stale, overlapping, or misnamed", async () => {
+  const dir = "docs/internals/inventory/reserved";
+  const files: string[] = [];
   try {
-    text = await Deno.readTextFile(path);
+    for await (const e of Deno.readDir(dir)) {
+      if (e.isFile && e.name.endsWith(".md") && e.name !== "README.md") files.push(e.name);
+    }
   } catch {
-    return; // no reservations file is a valid state: nothing is reserved.
+    return; // no reservations directory is a valid state: nothing is reserved.
   }
   // Mirrors ls.vl's parseRes. The holder runs non-greedily to the date because it may contain
   // spaces — a `\S+` holder parses zero lines and every check built on it passes vacuously.
   const RANGE = /^D(\d+)-D(\d+)\s+(.+?)\s+(\d{4}-\d{2}-\d{2})\s*(.*)$/;
   const filed = new Set<number>();
-  for (const dir of DIRS) {
-    for await (const e of Deno.readDir(dir)) {
+  for (const d of DIRS) {
+    for await (const e of Deno.readDir(d)) {
       const m = e.name.match(/^D(\d+)[A-Za-z0-9-]*\.md$/);
       if (m) filed.add(Number(m[1]));
     }
   }
+  const bad: string[] = [];
   const stale: string[] = [];
-  let parsed = 0;
-  for (const line of text.split("\n")) {
-    const m = line.trim().match(RANGE);
-    if (!m) continue;
-    parsed++;
+  const ranges: { lo: number; hi: number; name: string }[] = [];
+  for (const name of files.sort()) {
+    const lines = (await Deno.readTextFile(`${dir}/${name}`)).split("\n")
+      .map((l) => l.trim()).filter((l) => l !== "");
+    const m = lines.length === 1 ? lines[0].match(RANGE) : null;
+    // A line ls.vl cannot parse is a range it does not skip, so the file must be exactly one.
+    if (m === null) {
+      bad.push(`${name}: want exactly one \`D<lo>-D<hi>  <holder>  <date>  <note>\` line`);
+      continue;
+    }
     const lo = Number(m[1]), hi = Number(m[2]);
+    if (name !== `D${lo}-D${hi}.md`) bad.push(`${name}: holds D${lo}-D${hi}`);
+    if (lo > hi) bad.push(`${name}: runs backwards`);
+    ranges.push({ lo, hi, name });
     let all = true;
     for (let n = lo; n <= hi; n++) if (!filed.has(n)) all = false;
     if (all) {
@@ -591,14 +603,16 @@ Deno.test("no reserved inventory range is stale", async () => {
         `vl run scripts/inventory/ls.vl -- --release D${lo}-D${hi}`);
     }
   }
-  // A file with reservation-shaped lines that parse to nothing is the failure this guard is
-  // most likely to have: it would report "no stale ranges" forever.
-  const shaped = text.split("\n").filter((l) => /^\s*D\d+-D\d+\s/.test(l)).length;
-  if (shaped !== parsed) {
-    throw new Error(
-      `${path}: ${shaped} reservation-shaped lines but ${parsed} parsed — the pattern and ` +
-        `the file disagree, so every check over them is vacuous`,
-    );
+  ranges.sort((a, b) => a.lo - b.lo || a.hi - b.hi);
+  for (let i = 1; i < ranges.length; i++) {
+    const p = ranges[i - 1], q = ranges[i];
+    if (q.lo <= p.hi) bad.push(`${q.name} overlaps ${p.name}: release one and re-reserve`);
+  }
+  if (files.length > 0 && ranges.length === 0) {
+    throw new Error(`${dir}: ${files.length} files but none parsed — every check is vacuous`);
+  }
+  if (bad.length > 0) {
+    throw new Error(`malformed reservations:\n  ${bad.join("\n  ")}`);
   }
   if (stale.length > 0) {
     throw new Error(`stale reserved ranges:\n  ${stale.join("\n  ")}`);

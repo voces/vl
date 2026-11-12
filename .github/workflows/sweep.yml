@@ -6,6 +6,9 @@
 # Run it by adding the `sweep` label to a pull request (it re-runs on every push while the
 # label is on, against the merge-base with the PR's base branch), or by hand:
 #   gh workflow run sweep.yml -f base_ref=master -f head_ref=<branch or sha>
+#
+# `sweep-gate` is the one job every pull_request run reports, so branch protection can require
+# it: it passes at once without the label, and with it passes only if `diff` did.
 name: Sweep
 
 on:
@@ -19,17 +22,17 @@ on:
         description: "Candidate commit, branch or tag"
         required: true
   pull_request:
-    types: [labeled, synchronize, reopened]
+    types: [opened, labeled, unlabeled, synchronize, reopened]
 
 # `actions: read` finds and downloads a base recording another run already made (`base-cache`).
 permissions:
   contents: read
   actions: read
 
-# A new push to a labelled PR cancels its older sweep. Labelling a PR with anything but `sweep`
-# starts a run that does nothing, so it takes a group of its own rather than cancel a live sweep.
+# A new push to a labelled PR cancels its older sweep, and so does removing the label. Adding or
+# removing any other label takes a group of its own rather than cancel a live sweep.
 concurrency:
-  group: sweep-${{ (github.event_name == 'pull_request' && (github.event.action != 'labeled' || github.event.label.name == 'sweep')) && github.event.pull_request.number || github.run_id }}
+  group: sweep-${{ (github.event_name == 'pull_request' && ((github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'sweep')) && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 # The same pinned feature level as ci.yml, so a seed sidecar cached there loads here.
@@ -384,3 +387,24 @@ jobs:
 
       - name: Verdict
         run: exit "$(cat out/exit)"
+
+  # The required status. A pull_request run's checks attach to the PR head SHA. `always()`, not
+  # `!cancelled()`: a skipped job counts as passing, so a cancelled labelled sweep must fail.
+  sweep-gate:
+    needs: [diff]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verdict
+        run: |
+          if [ "$LABELED" != true ]; then
+            echo "sweep-gate: no \`sweep\` label on PR #$PR, nothing to wait for"
+            exit 0
+          fi
+          echo "sweep-gate: \`sweep\` label on PR #$PR, diff $DIFF"
+          [ "$DIFF" = success ]
+        env:
+          LABELED: ${{ contains(github.event.pull_request.labels.*.name, 'sweep') }}
+          DIFF: ${{ needs.diff.result }}
+          PR: ${{ github.event.pull_request.number }}

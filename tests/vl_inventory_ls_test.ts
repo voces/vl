@@ -1,8 +1,8 @@
 // THE INVENTORY QUEUE, PINNED — `scripts/inventory/ls.vl` on a fixture checkout.
 //
 // `ls.vl` lists filed rows in id order with their declared outcome, filters them by
-// `--status`, and hands out the next free id while skipping every range `RESERVED.md` holds.
-// It resolves every path, `RESERVED.md` included, against the working directory, so this
+// `--status`, and hands out the next free id while skipping every range `reserved/` holds.
+// It resolves every path, `reserved/` included, against the working directory, so this
 // runs it in a temporary directory shaped like a checkout: the real tree's reservations are
 // never touched. The listing was graded beside the Python script it replaced, flag by flag,
 // before that was deleted; what is pinned here is that agreed behaviour.
@@ -46,10 +46,6 @@ const ROWS: Record<string, string> = {
   D5: "### D5 — a design close\n**now a loud check reject, closed by lane x**\n",
   D6: "### D6 — a half fixed\n**loud emit reject · lane y fixed the other half**\n",
 };
-
-// Everything above the marker is kept as written; the ranges below it are rewritten sorted.
-const RESERVED_HEAD = "# Reserved inventory id ranges\n\n" +
-  "<!-- reservations below; the marker is what --reserve/--release edit around -->\n\n";
 
 const check = (
   label: string,
@@ -95,8 +91,8 @@ Deno.test({
         `${dir}/docs/internals/inventory-2/D1.md`,
         "### D1 — the second inventory\n**closed**\n",
       );
-      const reserved = `${inv}/RESERVED.md`;
-      await Deno.writeTextFile(reserved, RESERVED_HEAD);
+      // No `reserved/` yet: the first --reserve must create it.
+      const reserved = `${inv}/reserved/D11-D12.md`;
 
       // Id order across both default targets, D2 before D10; a negated status files "?".
       check(
@@ -172,9 +168,9 @@ Deno.test({
       );
       const line = `D11-D12  a holder  ${date}  a note, with commas\n`;
       const after = await Deno.readTextFile(reserved);
-      if (after !== RESERVED_HEAD + line) {
+      if (after !== line) {
         throw new Error(
-          `--reserve: want RESERVED.md to gain\n${line}got:\n${after}`,
+          `--reserve: want ${reserved} to hold\n${line}got:\n${after}`,
         );
       }
       check(
@@ -202,8 +198,8 @@ Deno.test({
         0,
         "released D11-D12\n",
       );
-      if (await Deno.readTextFile(reserved) !== `${RESERVED_HEAD}\n`) {
-        throw new Error(`--release: want RESERVED.md back to its header`);
+      if (exists(reserved)) {
+        throw new Error(`--release: want ${reserved} deleted`);
       }
       check(
         "a malformed range",
