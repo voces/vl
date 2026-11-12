@@ -51,6 +51,7 @@ import {
   recHeldArgTakesRep,
   recHeldReadsOwnRefuse,
   recHoleIdentityArg,
+  recOwnPinSkip,
   recordBoxTy,
   recordRepTyAdopt,
   repStampHeldRead,
@@ -90,6 +91,7 @@ import {
   recBuildElemTyOf,
   recBuildPush,
   recKeptFnLatePush,
+  recOwnSrc,
 } from "./check_rec_rows"
 import { identBoundFnDeclOf } from "./check_scopes"
 import { identDeclOf } from "./symbols"
@@ -366,10 +368,46 @@ export function storeLetsResolve() {
         storeLetBuiltSet(u, r)
         // A binding of a call is built where the call's results are (`recBuildTyOf`, D15172).
         if nodeAt(u) is Call { recBuildPush(storeLetDeclAt(i), own, r, false) }
+        // A binding of a field read holds the field's record, so its reads are judged at it (D15825).
+        if nodeAt(u) is Member { storeHeldArgsAt(storeLetDeclAt(i), r, u, []) }
       }
     }
     i = i + 1
   }
+  storeReadsOwnResolve()
+}
+
+// Judges each delivery at its own type of a field read off a record built wider, which holds the
+// field's stored record (D15825): an annotated parameter only read is instanced at that record, as
+// a binding read is, and any other such delivery is refused, since a record is shared, not copied.
+function storeReadsOwnResolve() {
+  cwIxBuild()
+  for u in recOwnSrc {
+    const p = cwPeelValue(u)
+    const h = if p >= 0 && p < P.nodes.length && nodeAt(p) is Member { storeHeldAt(p) } else { -1 }
+    const own = if h >= 0 { nodeTyIxOf(p) } else { -1 }
+    if (
+      own >= 0
+      && h < T.tys.length
+      && tyAt(h) is TyObj
+      && !fieldStorageEq(own, h, REC_STORE_DEPTH)
+      && recArgRepOf(p) < 0
+      && !recOwnPinSkip(u)
+      && !recHeldArgTakesRep(p, h)
+    ) {
+      tErr(
+        "this field read holds a "
+          + tyToStr(h)
+          + ", as the record it is read from is built wider than its own type, and it is handed "
+          + "on here as "
+          + tyToStr(own)
+          + ", which stores a field differently; a record is shared, not copied. Copy it here "
+          + "with an object literal",
+        u,
+      )
+    }
+  }
+  0
 }
 
 // Instances each annotated parameter a read of the record binding `d`, its literal `l` held at
@@ -652,7 +690,8 @@ function storeHeldAt(u: i32): i32 {
     return if la is TyArray { la.aElem } else { -1 }
   }
   if n is Member {
-    const o = storeBindingHeldAt(unwrapParen(n.memObj))
+    const mo = unwrapParen(n.memObj)
+    const o = if mo >= 0 && nodeAt(mo) is Member { storeHeldAt(mo) } else { storeBindingHeldAt(mo) }
     const ot = if o >= 0 && o < T.tys.length { tyAt(o) } else { null }
     // A read typed as a record is not null, so it holds the field's record (D15824).
     const ft = if ot is TyObj { objFieldType(ot, n.memProp) } else { -1 }
