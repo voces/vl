@@ -32,10 +32,14 @@ import {
   TyVar,
   litUnionAliasNameOfTy,
   litUnionInlineNameOfTy,
+  numLitUnionBaseTy,
   tyArrayElemIx,
   tyAt,
   tyIsLitUnion,
+  tyIsLitUnionOrLit,
   tyIsNulStringRep,
+  tyIsNullableLitUnion,
+  tyIsPrimNamed,
   tyMentionsTyVarNamed,
   tyNulInnerIsPrim,
 } from "./check_types"
@@ -56,12 +60,10 @@ import { isPatTyIxOf, isVarTyIxOf, luIsTyOf } from "./check_list_union"
 // none — every emitter module asks the home directly. The layering is one-directional:
 // `emit_base.vl` imports `typecheck.vl`, which imports nothing from `emit_*`, avoiding a cycle.
 import {
-  arrElemIs,
   arrElemNameRaw,
   fieldNameOf,
   fieldTypeTextOf,
   groupInnerOf,
-  listElemNameOf,
   mapSpellKeyName,
   nameIsArray,
   nameIsBraceSpanEnds,
@@ -133,8 +135,6 @@ import {
   MAP_KEY_I64,
   mapKeyKindOfTy,
   nameIsI32HashedLitUnion,
-  nameIsLitUnionType,
-  nameIsOneStrLit,
   valueAtomKind,
 } from "./check_ty_rep"
 
@@ -2482,35 +2482,6 @@ export function tyIsNulBool(tyIx: i32) {
 // not the already-imported `nodeTyWidenedRepName` — the widened form is a superset (it also
 // accepts a softened litunion arm), and using a superset for this exact scalar test is unsound in general even though the two happen to agree for the literal `"boolean"` constant.
 export function tyIsBool(tyIx: i32) { nodeTyPrimName(tyIx) == "boolean" }
-// A `string | null` field type name — the niche field (code 20): a `(ref null $sTypeIdx)`
-// storage slot (the array backing a string), the field analogue of the kind-16 local.
-export function nameIsNulString(name: string) {
-  nullablePartOf(name) == "string"
-}
-// A `boolean | null` field type name — the niche field (code 21): an i32 storage slot
-// holding 0/1 with the spare value 2 = `null` (the field analogue of the sentinel local).
-export function nameIsNulBool(name: string) {
-  const b = nullablePartOf(name)
-  b == "boolean"
-}
-// True if `name` is a 1-D `(boolean | null)[]` list — a list of the boolean sentinel niche.
-// Its backing is the same `(array (mut i32))` as `boolean[]`/`i32[]`: each element is an i32
-// holding 0/1, with the spare value 2 = `null`. So it rides the i32-list machinery
-// (`nameIsI32Array`), not the union-box ref-list. A nested `(boolean|null)[][]` is not this — only the single-level list.
-export function nameIsNulBoolList(name: string) {
-  const elem = listElemNameOf(name)
-  if elem == "" { return false }
-  nameIsNulBool(elem)
-}
-// True if `name` is a 1-D `(string | null)[]` list — a list of the string ref made nullable.
-// Its backing is the same string list as `string[]`: a `string[]` element is already a
-// nullable ref at the wasm level, so only construct/read differ (`null → ref.null
-// $aTypeIdx`, narrowed with `!= null`). Rides the string-list machinery, not the union-box ref list; a nested `(string|null)[][]` is not this.
-export function nameIsNulStrList(name: string) {
-  const elem = listElemNameOf(name)
-  if elem == "" { return false }
-  nameIsNulString(elem)
-}
 // The re-quoted source lexeme for a literal-union member's inner text (`i32` -> `"i32"`) —
 // matches the raw `StrLit.strText` so `internAtom` yields the same id, and feeds a synthetic
 // `StrLit` for printing. Homed down here because membership ("is this default `StrLit` one of
@@ -2531,51 +2502,7 @@ export function litLexIsMember(lex: string, texts: string[]) {
   }
   false
 }
-// True if `name` is a 1-D `(K | null)[]` list — a list of the literal-union atom made
-// nullable via the i32 niche. Each element is an i32 holding a member id (>= 0) with the
-// spare value -1 = `null`. Rides the i32-list machinery (`nameIsI32Array`), not the
-// union-box ref-list: a member element lowers as its atom id, `null` as -1, and a read narrows by comparing against -1.
-export function nameIsNulLitUnionList(name: string) {
-  const elem = listElemNameOf(name)
-  if elem == "" { return false }
-  nameIsNulLitUnion(elem)
-}
-// A nullable literal-union type name — `K | null` / `"a" | "b" | null` (the i32 atom niche):
-// member ids intern >= 0 and the spare value -1 encodes `null`. `canonEmitName` preserves the
-// litunion (`nulLitUnionPreserve`) so members survive here. A caller holding the type asks
-// `nulLitUnionInnerNameOfTy` for the non-null part's name instead.
-export function nameIsNulLitUnion(name: string) { nulLitUnionScan(name) }
 
-// The predicate, decided without building anything: a two-part `X | null` whose `X` is a
-// literal set, or a top-level `null` beside 2+ quoted members, scanned in span form.
-function nulLitUnionScan(name: string): boolean {
-  const b = nullablePartOf(name)
-  if b != "" { return nameIsStrLitSet(b) }
-  // The first member must be `null` or a quoted literal, which its first byte already rules
-  // out for any other name, before a scan for its end.
-  if name.length < 2 { return false }
-  if name[0] != '"' && !(name.length >= 4 && spanEqAt(name, 0, 4, "null")) {
-    return false
-  }
-  let lits = 0
-  let hasNull = false
-  let start = 0
-  let going = true
-  while going {
-    const at = tyTopIndexOf(name, '|', '=', start)
-    let end = name.length
-    if at >= 0 && name[at] != '=' { end = at } else { going = false }
-    if spanEqAt(name, start, end, "null") {
-      hasNull = true
-    } else {
-      if end - start < 2 { return false }
-      if name[start] != '"' { return false }
-      lits = lits + 1
-    }
-    if going { start = at + 1 }
-  }
-  hasNull && lits >= 2
-}
 // The non-null union name a `K | null` niche of arena type `ty` records: the literal union's
 // alias (a written `K`, or an annotated inline set's hidden one, as the anonymous twin
 // `anonFieldElemName` records), else its inline member spelling. "" when `ty` is not the niche.
@@ -2777,40 +2704,31 @@ export function arrLeafNameOf(name: string) {
   }
   leaf
 }
-// ── the paren grammar and scalar-array classifiers, homed in `tyname.vl` ──
-// The two paren walks are not one: `peelGroupParens` rides `parenEnclosesWhole`, `normTypeAtom`
-// rides `tyGroupWrapsWhole`, and they differ on a group that never closes (false vs. true) — a
-// site spelling the comparison out instead of calling one of the two merges that silently.
-export function nameIsI32Array(name: string) {
-  // The two i32-backed leaf spellings share one cut — `nameIsI32Array`'s own header explains the family.
-  if arrElemIs(name, "i32") || arrElemIs(name, "boolean") { return true }
-  // `(boolean | null)[]` shares the exact i32-list backing: each element is an i32 0/1
-  // with the spare value 2 = `null` (the sentinel niche). Only the `null → 2` element
-  // coercion + the sentinel-aware read/print differ (see `nameIsNulBoolList`).
-  if nameIsNulBoolList(name) { return true }
-  // A literal-union array (`K[]`, or an inline `("a"|"b")[]`) — its elements are interned-i32
-  // ATOMS, so it shares the i32 backing/rep EXACTLY like `i32[]`. (Member literals lower as
-  // their ids; reads yield the atom.)
-  if nameIsLitUnionArray(name) { return true }
-  // A `(K | null)[]` shares the exact i32-list backing: each element is an i32 member id (≥ 0)
-  // with the spare value `-1` = `null` (the atom-niche analogue of `(boolean | null)[]`). Only the
-  // `null → -1` element coercion + the sentinel-aware read differ (see `nameIsNulLitUnionList`).
-  if nameIsNulLitUnionList(name) { return true }
-  // `null[]` shares it too, every element the sentinel 2 (D4671).
-  arrElemIs(name, "null")
+// Whether `ty` is a list on the i32-list backing: an element of `i32`, `boolean` or `null`, a
+// string-literal set, or the sentinel niche of `boolean | null` or a literal set with `null`.
+export function tyIsI32List(ty: i32): boolean {
+  const e = tyArrayElemIx(ty)
+  if e < 0 { return false }
+  const t = tyAt(e)
+  if t is TyPrim {
+    return t.primName == "i32"
+      || t.primName == "boolean"
+      || t.primName == "null"
+  }
+  if tyIsLitUnionOrLit(e) { return true }
+  if tyIsPrimNamed(numLitUnionBaseTy(e), "i32") { return true }
+  if tyNulInnerIsPrim(e, "boolean") { return true }
+  tyIsNullableLitUnion(e)
 }
-// True if `name` is `<litunion>[]` — an array whose element type is a literal union. The element
-// name is `name` minus the trailing `[]` (a parenthesized inline union keeps its parens, which
-// `nameIsLitUnionType` -> `nameIsInlineLitUnion` tolerates via the union split).
-export function nameIsLitUnionArray(name: string) {
-  const elem = listElemNameOf(name)
-  if elem == "" { return false }
-  nameIsStrLitSet(elem)
+// Whether `ty` is a list on the string-list backing: a `string` or `string | null` element.
+export function tyIsStrList(ty: i32): boolean {
+  const e = tyArrayElemIx(ty)
+  if e < 0 { return false }
+  tyIsPrimNamed(e, "string") || tyNulInnerIsPrim(e, "string")
 }
-// Whether `name` is a string-literal set: a literal union, or one quoted literal, which is its
-// one-member set at a list element or beside `null` and so the atom there (D7340, D7446).
-export function nameIsStrLitSet(name: string) {
-  nameIsLitUnionType(name) || nameIsOneStrLit(name)
+// Whether `ty` is a list whose element is a string-literal set, one literal included.
+export function tyIsStrLitSetList(ty: i32): boolean {
+  tyIsLitUnionOrLit(tyArrayElemIx(ty))
 }
 // True if `name` is a string-keyed map — the synthetic name `parseType` builds for an index
 // signature; the lowering assumes string keys. Distinct from `nameIsMapOpen` (`tyname.vl`):
@@ -2882,19 +2800,6 @@ export function tyIsNulBareMap(tyIx: i32) {
   false
 }
 
-// True if the type-name `name` is exactly `string[]` — a growable list whose elements
-// are string refs. It reuses the map keys list types (the `{backing,len,cap}` wrapper
-// over a `(ref null $sTypeIdx)` string backing); field code `6`.
-export function nameIsStringArray(name: string) {
-  // Element-name compare over the array grammar's one cut — see the family note at
-  // `nameIsI32Array`.
-  if arrElemIs(name, "string") { return true }
-  // `(string | null)[]` shares the exact string-list backing (`$mkListIdx` wrapper, `(ref null
-  // $sTypeIdx)` string backing — a `string[]` element is already a nullable ref). It rides the
-  // string-list machinery uniformly; only the element read diverges (kept `(ref null)`,
-  // intercepted by `exprNulStrArray`) and a `null` element/push/assign lowers as `ref.null`.
-  nameIsNulStrList(name)
-}
 // True if the node at `ix` is a struct `type` declaration (a single-level narrowing
 // helper, so callers avoid an inline `is TypeDecl` on the wide `Node` union).
 export function nodeIsTypeDecl(ix: i32) {
