@@ -24,7 +24,7 @@ answer was compared with the type-only one:
 ## What is left
 
 The ref `??` join (`emitCoalesceNulRefJoin`) keeps `unionMemberSetOf(joinN)`, only for
-`coalNicheBoxTag`'s ref-array arm test. That test keeps its name until [D15762](../inventory/D15762.md)'s
+`coalNicheBoxTag`'s ref-array arm test. That test keeps its name until [D4937](../inventory/D4937.md)'s
 instance body is right (C5).
 
 ## Proof
