@@ -110,7 +110,11 @@ import {
 } from "./check_core_state"
 import { nodeTyProvesNonNull, recArmPartialFields } from "./check_emit_queries"
 import { binPlusIsListByTy } from "./check_leaf_steps"
-import { numDeliverStamp, recFitNarrowedFields } from "./check_fit_rules"
+import {
+  numDeliverStamp,
+  recFitNarrowedFields,
+  recUnionRecMember,
+} from "./check_fit_rules"
 import {
   assignable,
   recArmFitKind,
@@ -3129,6 +3133,93 @@ function rcNestedRow(
   if sHeapIdx[sIn] == sHeapIdx[dIn] { -1 } else { dIn }
 }
 
+// The member of the union of records the destination field `name` is, that source row `sRow`'s
+// record field `sfi` is copied into (`recUnionRecMember`), or -1.
+function rcUnionRecMember(
+  exprIx: i32,
+  pre: string,
+  name: string,
+  sRow: i32,
+  sfi: i32,
+  dr: i32,
+): i32 {
+  if (
+    !fieldRowIsUnionBox(dr)
+    || !sFieldIsRecordRef(sRow, sfi)
+    || recCopyFromOf(exprIx) >= 0
+  ) {
+    return -1
+  }
+  const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
+  const dt = rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), name)
+  if st < 0 || dt < 0 { return -1 }
+  recUnionRecMember(st, dt)
+}
+
+// Copy source row `sRow`'s record field `sfi`, the field `name` along `pre`, into the union
+// member `m`'s row, and box it under the member's tag.
+function emitRecCopyIntoMember(
+  body: u8[],
+  exprIx: i32,
+  sHeap: i32,
+  reReadable: boolean,
+  sRow: i32,
+  sfi: i32,
+  m: i32,
+  pre: string,
+  name: string,
+  fnIx: i32,
+): i32 {
+  const vi = repVariantShapeRowOf(m)
+  const vr = variantRowOf(vi)
+  const sIn = sFieldTgtStructIdx(sRow, sfi)
+  if (
+    vi < 0
+    || vi >= uTags.length
+    || vr < 0
+    || sIn < 0
+    || sRow < 0
+    || sRow >= sHeapIdx.length
+  ) {
+    return emitFailAt(
+      "emitProgram: a record copied into a union of records has no member row",
+      exprIx,
+    )
+  }
+  const names: string[] = []
+  const rows: i32[] = []
+  variantRowFields(vi, names, rows)
+  const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
+  fbI32Rel(RS_TAG, uTags[vi])
+  rcPathHeap.push(sHeapIdx[sRow])
+  rcPathField.push(sfi)
+  const ps = rcElemSrc
+  const pd = rcElemDst
+  rcElemSrc = st
+  rcElemDst = m
+  const r = emitRecCopyLevel(
+    body,
+    exprIx,
+    sHeap,
+    reReadable,
+    sIn,
+    vr,
+    m,
+    pre + name + "|",
+    names,
+    rows,
+    fnIx,
+  )
+  rcElemSrc = ps
+  rcElemDst = pd
+  rcPathHeap.pop()
+  rcPathField.pop()
+  if r < 0 { return -1 }
+  fbStructNew(variantHeap(vi))
+  fbStructNew(uBoxIdx)
+  0
+}
+
 // The struct row of the record `ty` or `ty | null`, or -1.
 function rcRowOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
@@ -3276,6 +3367,37 @@ function emitRecCopyLevel(
       rcPathField.pop()
       if r < 0 { return -1 }
       fbStructNew(sHeapIdx[nest])
+      fj = fj + 1
+      continue
+    }
+    // A record copied into a union of records is built at the member with its field names, then
+    // boxed under that member's tag.
+    const um = rcUnionRecMember(
+      exprIx,
+      pre,
+      dNames[fj],
+      sRow,
+      sfi,
+      dFieldRows[fj],
+    )
+    if um >= 0 {
+      if (
+        emitRecCopyIntoMember(
+          body,
+          exprIx,
+          sHeap,
+          reReadable,
+          sRow,
+          sfi,
+          um,
+          pre,
+          dNames[fj],
+          fnIx,
+        )
+        < 0
+      ) {
+        return -1
+      }
       fj = fj + 1
       continue
     }
@@ -3624,7 +3746,13 @@ const RC_WIDEN_KINDS = [3, 4, 4, 4]
 function rcPathTy(ty: i32, pre: string): i32 {
   let t = ty
   let from = 0
+  // A path into a union member restarts at the member (`emitRecCopyIntoMember`).
   let i = 0
+  while i < pre.length {
+    if pre[i] == 124 { from = i + 1 }
+    i = i + 1
+  }
+  i = from
   while i < pre.length {
     if pre[i] == 46 {
       const f = rcFieldTy(t, pre.slice(from, i))
@@ -3680,8 +3808,11 @@ function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
 // The struct row of a copied call's own record when that record is also a union's arm, or -1.
 function copyArmRowOf(exprIx: i32): i32 {
   const own = nodeTyIxOf(exprIx)
-  if own < 0 || repVariantShapeRowOf(own) < 0 { return -1 }
-  structRowOfAnnTy("", own, own)
+  const vi = if own >= 0 { repVariantShapeRowOf(own) } else { -1 }
+  if vi < 0 { return -1 }
+  const r = structRowOfAnnTy("", own, own)
+  // An arm with no annotated row is laid out at its variant's own row.
+  if r >= 0 { r } else { variantRowOf(vi) }
 }
 
 // `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`).
