@@ -82,10 +82,11 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 ## Backlogged: ruled, waiting to be built
 
 - **Flow-sensitive reads of a `let`** (owner ruling B, 2026-11-02). A read of a `let` takes
-  the type of the most recent write in scope, not the join of every write. Witnesses: D2660
-  (a read before a filling write, delivered at `null`) and its function-value twin, a
-  re-pointed `let` read into a list. Both rows wait on this item. DECISIONS.md §"A read of a
-  `let` takes its most recent write's type".
+  the type of the most recent write in scope, not the join of every write. DECISIONS.md §"A
+  read of a `let` takes its most recent write's type". The `let x = null` face shipped; left are
+  the annotated-union face (a write narrows `let x: i32 | string`, with an `is` test the write
+  made impossible a dead-test warning) and the function-valued face (a re-pointed `let` read
+  into a list).
 - **An inferred result built at its destination** (owner ruling B, 2026-11-02). When one use
   delivers an un-annotated function's result into a wider record (or a list of them), the
   result is built at the destination and the function's other uses read it at that storage.
