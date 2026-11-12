@@ -71,6 +71,7 @@ import {
   callTyArgsOf,
   i32ToStr,
   nodeAt,
+  nodeContains,
   nodeToks,
   spreadArgOf,
   stmtAlwaysExits,
@@ -2964,8 +2965,34 @@ function recRepArgOf(i: i32, c: i32, own: i32, dst: i32): boolean {
     const de = tyArrayElemIx(nonNulTyOf(recPendDstTy[i]))
     if de < 0 || !fieldStorageEq(de, dst, REC_STORE_DEPTH) { return false }
   }
+  if recListRetArgRelayed(i, c, own) { return true }
   recListArgTakesRep(src)
     && recLandingIn(src, recPendDstTy[i], c, own, REC_STORE_DEPTH) >= 0
+}
+
+// Whether queued delivery `i` hands a list holding call `c`'s record of `own` to a generic declared
+// to return `T[]`, at its own type, while another queued delivery lands `c` through that generic's
+// result: the instance is taken at that landing's rep, so the own-type parameter does not decide.
+function recListRetArgRelayed(i: i32, c: i32, own: i32): boolean {
+  const src = recPendSrc[i]
+  if src < 0 || !cwIxCovers(src) || cwIxUpKind[src] != CW_UP_ARG { return false }
+  const k = cwIxUp[src]
+  if recListRetDecl(k) < 0 { return false }
+  if recLandingIn(src, recPendDstTy[i], c, own, REC_STORE_DEPTH) < 0 { return false }
+  let j = 0
+  while j < recPendSrc.length {
+    const sj = recPendSrc[j]
+    if (
+      j != i
+      && sj >= 0
+      && nodeContains(sj, k)
+      && recLandingIn(sj, recPendDstTy[j], c, own, REC_STORE_DEPTH) >= 0
+    ) {
+      return true
+    }
+    j = j + 1
+  }
+  false
 }
 
 // Whether `src` is an argument whose list parameter takes the rep (`recListParamTakesRep`).
@@ -3003,6 +3030,8 @@ function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
     }
     return -1
   }
+  const lr = recListRetArgsLanding(p, d, c, own, depth)
+  if lr != -2 { return lr }
   // A non-generic function handing back an un-annotated parameter lands its argument there.
   const pc = nodeAt(p)
   if pc is Call && pc.callFn >= 0 {
@@ -3031,6 +3060,11 @@ function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
   }
   if e is IfStmt || e is MatchExpr {
     return recJoinLandingIn(p, d, c, own, depth)
+  }
+  // An element read of a list lands the list's elements where the read lands.
+  const ib = if e is Index { cwPeelValue(e.idxArr) } else { -1 }
+  if ib >= 0 && tyIsListTy(nonNulTyOf(nodeTyIxOf(ib))) {
+    return recLandingIn(ib, mkArrayTy(d), c, own, depth - 1)
   }
   if e is ObjLit && dt is TyObj {
     let i = 0
@@ -5926,6 +5960,49 @@ function recAdParamListArgs(call: i32, d: i32): boolean {
     }
   }
   false
+}
+
+// Where call `c`'s record of `own` lands inside call `p` of a generic declared to return `T[]`
+// delivered as the list `d`: its `T[]` arguments land at `d`, its `T` ones at the element; -1
+// where none holds `c`, -2 when `p` is no such call.
+function recListRetArgsLanding(p: i32, d: i32, c: i32, own: i32, depth: i32): i32 {
+  const fd = recListRetDecl(p)
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  const cn = nodeAt(p)
+  if !(f is FuncDecl) || !(cn is Call) || !(tyAt(d) is TyArray) { return -2 }
+  const rt = nodeAt(f.fnRet)
+  const rn = if rt is TypeRef { rt.tyName } else { "" }
+  let i = 0
+  while i < f.fnParams.length && i < cn.callArgs.length {
+    const pn = nodeAt(f.fnParams[i])
+    const pt = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+    const pnm = if pt is TypeRef { pt.tyName } else { "" }
+    let t = -1
+    if pnm == rn {
+      t = recLandingIn(cn.callArgs[i], d, c, own, depth - 1)
+    } else if pnm + "[]" == rn {
+      t = recLandingIn(cn.callArgs[i], tyArrayElemIx(d), c, own, depth - 1)
+    }
+    if t >= 0 { return t }
+    i = i + 1
+  }
+  -1
+}
+
+// The generic declaration call `call` names when it is declared to return `T[]` over one of its
+// type parameters `T`, else -1.
+function recListRetDecl(call: i32): i32 {
+  const c = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { null }
+  if !(c is Call) || c.callFn < 0 || !(nodeAt(c.callFn) is Ident) { return -1 }
+  const fd = identBoundFnDeclOf(c.callFn)
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnRet < 0 { return -1 }
+  const rt = nodeAt(f.fnRet)
+  if !(rt is TypeRef) { return -1 }
+  for tp in f.fnTyParams {
+    if rt.tyName == tp + "[]" { return fd }
+  }
+  -1
 }
 
 // `recAdoptNote` for each field of the object literal `lit` delivered as the record `d`.
