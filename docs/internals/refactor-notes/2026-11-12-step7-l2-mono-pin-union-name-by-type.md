@@ -22,9 +22,17 @@ because it has two members. The first candidate counted keyed arms only. It refu
 `maps/map-twin-union-is-its-one-map.vl` (`a map union member is not supported`), and that is why
 the member count comes first.
 
-`monoPinMintedUnion` now takes `nameTy`, the type its `name` spells. The parameter-pin caller
-passes `pinTys[pj]`, which may differ from the gate type `ty` (the union parameter's own type).
-The `let` caller passes the substituted type.
+`monoPinMintedUnion` asks about its `name` at `wt`, the whole annotation at the pin. This is the
+type that function already computes from `own` (or `ty`), and `name` spells it. Two candidates
+used another type, and the sweep moved both:
+
+- **The argument's type `pinTys[pj]`.** A single map, where `name` spelled the substituted union
+  parameter (`T | IM` → `{[i32]:i32}|{[i32]:i32}`).
+- **The gate type.**
+
+Both moved the refusal message of `generics/error-literal-union-map-twin-through-one-instance.vl`
+and its `-plain-first` twin. The message went from "a test cannot tell {[i32]:i32} from the map
+…" to "a map union member is not supported". At `wt` both keep their message.
 
 ## Measured
 
@@ -45,7 +53,13 @@ function's final result instead.
 | `monoPinMintedUnion`'s grouped-list branch taken differently | 1 (1): `unions/list-read-over-string-list-and-literal-list.vl`, whose module is byte-identical |
 
 Each program a probe flagged was built on both seeds and compared with `cmp`, eleven programs in
-all. The first candidate's refusal is the only one that moved, and the member-count rule fixes it.
+all.
+
+The probes have a blind spot. They report through one `emitFail` at the end of `emitProgram`, and
+`emitFail` keeps only the first marker. So a program that already refuses never reports its
+decisions. The two refusal fixtures above are such programs, and only CI's sweep found them.
+`emitFail` decision probes therefore cover the programs that build, not the refusal fixtures. The
+sweep's message comparison covers those.
 
 ## Left
 
