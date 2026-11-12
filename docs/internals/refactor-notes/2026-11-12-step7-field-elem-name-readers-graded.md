@@ -145,6 +145,21 @@ Eight programs build different bytes and print the same on both seeds:
 | `closures/hole-fn-nested-list-in-record-field` | `4 6 9 1.5` |
 | `closures/hole-fn-nested-list-record-field-tagged` | `6 6 6 4` |
 
+## The presence tests, converted
+
+Four reads asked whether a field records an element by testing its name for `""`. Each now asks
+the field's type:
+
+- `refListKeptSlotOfMember`, at its arm and receiver-row rungs (E11, E13), and
+  `variantRefListFieldSlot` (E54) ask whether the field's storage slot is a ref list
+  (`fieldRowSlotTable` / `variantFieldSlotTable`).
+- `shapeRowLayoutId`'s atom bit (E32) asks `layoutAtomField` of the stored type, the rule its
+  query side already uses. A row with no stored type keeps the name.
+
+A shadow beside each read, over 24,061 programs, agreed everywhere except one E32 row,
+`layout-family-literal-set-beside-string`. There the stored name marked an atom and the type did
+not. That program builds different bytes and prints the same.
+
 ## Order
 
 1. (c): delete each unreached rung, with a control.
