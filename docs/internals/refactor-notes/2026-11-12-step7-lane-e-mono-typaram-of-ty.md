@@ -36,5 +36,5 @@ redeclares its enclosing function's `T` (D3081, D3840, D3853, D15263 and six
   0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
 - `scripts/gate.sh`: all 23 rows pass (seed size, late demands, plumb-shape cost, rep-fuzz, filed
   witnesses, the distilled corpus, render-parse, scaling shape among them).
-- Render-parse with `--findings`: 12 renders, 40 → 39 parses on `cf01f012` (`emit_base.vl` 17 → 16); 13 renders, 32 → 31 parses on the tree merged with master `473e2fb2`;
+- Render-parse with `--findings`: 12 renders, 40 → 39 parses on `cf01f012` (`emit_base.vl` 17 → 16); 13 renders, 31 → 30 parses on the tree merged with master `948f258a`;
   `--write-baseline` is in this PR.
