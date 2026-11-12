@@ -214,7 +214,6 @@ import {
   isVariantBoxUnionAtoms,
   listIsTestedIdent,
   monoAnnHasTyParam,
-  nameIsBareMap,
   nameIsClosureArrayTy,
   nameIsShapeSpanEnds,
   nameIsStringArray,
@@ -247,6 +246,7 @@ import {
   FC_MAP,
   FC_NUL_CLOSURE,
   FC_NUL_LIT_UNION,
+  FC_NUL_NONE,
   FC_NUL_REF_LIST,
   FC_REF_LIST,
   FC_STR,
@@ -583,6 +583,7 @@ import {
   anonFieldElemKeyKind,
   anonFieldElemValTy,
   anonMapFieldDestAdmits,
+  regUnionNameOfTy,
 } from "./emit_anon_fields"
 import {
   sFieldElemNameAt,
@@ -778,7 +779,6 @@ import {
   forceScalarListRep,
   mvCanonRepOf,
   nameIsConcreteGenAppDecl,
-  refArrElemKind,
   refListElemKindOfTy,
   rlElemInnerSlot,
   rlElemStructRow,
@@ -868,6 +868,7 @@ import {
   isUNameKeyAB,
   softKeyOrNameKey,
   softKeyProbeNoTy,
+  tyIsBareMap,
   unABOn,
   unKeyPushOfTy,
   unNameBound,
@@ -5368,21 +5369,19 @@ function annNicheNulElemInner(annIx: i32): i32 {
 // `collectATypeRef`'s ref-list arm: a `S[]`/`N[]` annotation, or its nullable `S[] | null`,
 // forces the wrapper and backing of the non-null ref-array name and banks the interned row on
 // node `i`. Returns 0, or -1 once a niche-nullable element with no list rep has failed loudly.
-function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
+function collectARefArrayAnn(i: i32, _nd: TypeRef): i32 {
   // Whether the annotation is the nullable list, asked of its type.
   const ranIsNul = tyIsNulRefArray(fdRowOf(i))
   // The element kind, classified once before the `ensureRefElemTys` intern, the only call here
-  // that mutates a table the classifier reads. It is the recorded element type's; the spelling
-  // is the floor for a non-null node with no type or a declined one. A nullable list's declined
-  // element (a type parameter, a union of lists) is no niche, so its kind is not read.
+  // that mutates a table the classifier reads: the recorded element type's. A nullable list's
+  // declined element (a type parameter, a union of lists) is no niche, so its kind is not read.
   const raTy = annRefArrElemRow(i)
-  let raKind = refListElemKindOfTy(raTy)
+  const raKind = refListElemKindOfTy(raTy)
   // A literal-union element is a scalar list, whatever its spelling classifies as.
   if raTy >= 0 && raKind < 0 && repSigKindOfTy(raTy) == "i32" {
     recordAnnRlSlot(i, -1, 0)
     return 0
   }
-  if raKind < 0 && !ranIsNul { raKind = refArrElemKind(nd.tyName) }
   // The element row's name, from the annotation's recorded element type; an anonymous record
   // element, which renders no name, is its canonical record row.
   let ren = rlRowNameOfTy(raTy, false)
@@ -5477,13 +5476,11 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   // A function type forces nothing here: its result's types are forced by
   // `forceNestedCloSigRepsOfTy` above.
   if tyIsFuncArena(nodeTyIxOf(i)) {
-  } else if nameIsBareMap(nd.tyName) && !typeRefIsRecord(i) {
+  } else if tyIsBareMap(nodeTyIxOf(i)) && !typeRefIsRecord(i) {
     // A bare map annotation interns its per-(key, value) slot here, since collect scans every
     // `TypeRef`, so the type-index assignment sees the full slot set. An orphaned parser field
     // (no type) mints nothing: the field-table passes mint from its owner.
-    if nodeTyIxOf(i) >= 0 {
-      mvShapeOfMapHeldTy(nodeTyIxOf(i), nodeMapValTyIx(i), nodeMapValTyIx(i))
-    }
+    mvShapeOfMapHeldTy(nodeTyIxOf(i), nodeMapValTyIx(i), nodeMapValTyIx(i))
   } else if nulMapInnerName(nd.tyName) != "" {
     // A nullable map annotation collects what its non-null inner map does.
     if nodeTyIxOf(i) >= 0 {
@@ -6421,6 +6418,16 @@ function anonLitDropsAtRep(an: ObjLit, objIx: i32): boolean {
   false
 }
 
+// The union box a `null` value of the literal at `objIx` is stored in at field `name`: the box
+// of the field type the literal is typed at, when that type is a value union, or "" (D15730).
+function anonNullFieldBox(objIx: i32, name: string): string {
+  const ft = recFieldTyOf(nodeTyIxOf(objIx), name)
+  if ft < 0 || tyHasTyVar(ft) { return "" }
+  const bn = regUnionNameOfTy(ft)
+  if bn == "" || !isValueUnionName(bn) { return "" }
+  bn
+}
+
 // `collectAnonShapes`' main loop, extracted so the pre-mint pass mints a row the same
 // way rather than through a second copy of it — two mints that disagree would put two
 // different layouts under one `#anonN` key.
@@ -6453,6 +6460,8 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         }
         // So does one at the template's type parameter, at the instance's primitive (D15554).
         if code < 0 && fnIx >= 0 { code = anonInstPrimCode(f.fiValue, fnIx) }
+        const nullBox = if code == FC_NUL_NONE { anonNullFieldBox(ai, f.fiName) } else { "" }
+        if nullBox != "" { code = FC_UNION }
         if code == FC_MAP && !anonMapFieldDestAdmits(ai, f.fiName) { code = -1 }
         if code < 0 { ok = false }
         codes.push(code)
@@ -6463,11 +6472,9 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         elemRowTys.push(
           if er >= 0 && er < sTyIx.length { sTyIx[er] } else if code == FC_REF_LIST { anonRefListLitElemTy(f.fiValue) } else { anonFieldElemValTy(f.fiValue, code) },
         )
-        if er >= 0 {
-          elemNames.push(sNames[er])
-        } else {
-          elemNames.push(anonFieldElemName(f.fiValue, code))
-        }
+        if er >= 0 { elemNames.push(sNames[er]) }
+        else if nullBox != "" { elemNames.push(nullBox) }
+        else { elemNames.push(anonFieldElemName(f.fiValue, code)) }
         elemKeys.push(anonFieldElemKeyKind(f.fiValue, code))
       } else {
         ok = false
