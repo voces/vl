@@ -7983,10 +7983,10 @@ function monoPinUnionNameOfTy(st: i32): string {
   monoPinUnionName(monoPinSpellShaped(st))
 }
 
-// D1042 — the emitter-vocabulary spelling of a name `monoSubstAnn` produced, for the shapes
+// D1042 — the emitter-vocabulary spelling of a substituted annotation name, for the shapes
 // where the two can disagree: a union, and a list of a grouped element (`(T | string)[]`).
-// `monoSubstAnn` substitutes into the declared annotation text, so a literal member stays
-// literal and a collapsed group keeps its parens, while a direct annotation is canon'd.
+// A substitution into the declared text keeps a literal member literal and a collapsed group's
+// parens, while a direct annotation is canon'd.
 function monoPinUnionName(rs: string): string {
   const atoms: string[] = []
   unionSetAtomsOf(rs, atoms)
@@ -13895,24 +13895,35 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyArray && !tyHasTyVar(rt) {
     return 0
   }
-  // A literal of maps whose functions nothing calls takes the elaboration's closed slot fact, its
-  // open elements typed at the fact's element.
+  // A literal of maps takes the elaboration's closed slot fact, its open elements and the reads of
+  // its maps' values typed at it, where nothing calls those values or each element names a map
+  // already pinned at the fact's element.
   const ce = tyArrayElemIx(nodeTyIxOf(d.letInit))
   if (
     repoints.length == 0
     && ce >= 0
     && ce < T.tys.length
     && tyAt(ce) is TyMap
-    && elabSlotUncalled(at, ["e", "v"])
   ) {
     const lt = elabSlotTyAt(at, [], ctx)
     const et = tyArrayElemIx(lt)
     let spread = false
+    let pinned = lit.arrElems.length > 0
     for e in lit.arrElems {
       if nodeAt(e) is Spread { spread = true }
+      const bd = if nodeAt(e) is Ident { monoReadLetFrame(e, ctx)[1] } else { -1 }
+      const b = if bd >= 0 { nodeAt(bd) } else { null }
+      if (
+        !(b is LetDecl)
+        || b.letType < 0
+        || !tySame(elabSlotTyAt(bd, [], ctx), et)
+      ) {
+        pinned = false
+      }
     }
     if (
-      !spread
+      (pinned || elabSlotUncalled(at, ["e", "v"]))
+      && !spread
       && et >= 0
       && et < T.tys.length
       && tyAt(et) is TyMap
@@ -13923,6 +13934,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
       for e in lit.arrElems {
         if monoTyOpen(nodeTyIxOf(e)) { nodeTyRecord(e, et) }
       }
+      if pinned { monoRetypeMapReads(ctx, at, et, tyMapValOf(et), "[]") }
       return 0
     }
   }
@@ -15495,6 +15507,35 @@ function monoPinMapSlot(mx: i32, at: i32, ctx: i32, fld: string): i32 {
   const nt = mkMapTy(mt.mKey, nv, 0)
   nodeTyRecord(mx, nt)
   monoRetypeMapReads(ctx, at, nt, nv, fld)
+  // A `const` alias of the map, or of such an alias, holds it at the same type, and its reads are
+  // the map's.
+  if fld == "" {
+    const nodes = monoFrameNodes(ctx)
+    const held: i32[] = [at]
+    let hi = 0
+    while hi < held.length {
+      const hd = nodeAt(held[hi])
+      if hd is LetDecl {
+        for ix in nodes {
+          const a = nodeAt(ix)
+          if (
+            a is LetDecl
+            && a.letKw == "const"
+            && a.letType < 0
+            && a.letInit >= 0
+            && !i32ListHas(held, ix)
+            && monoReadsBinding(a.letInit, hd.letName, ctx, held[hi])
+          ) {
+            a.letType = synthTypeRefOfTy(nt, -1)
+            nodeTyRecord(a.letInit, nt)
+            monoRetypeMapReads(ctx, ix, nt, nv, "")
+            held.push(ix)
+          }
+        }
+      }
+      hi = hi + 1
+    }
+  }
   nt
 }
 
@@ -16125,7 +16166,8 @@ function monoCalleeFnTyThrough(cf: i32, reads: i32[], ft: i32): i32 {
   -1
 }
 
-// Whether `v` reads the binding `name` declared at `at`, or, when `fld` is not "", its field `fld`.
+// Whether `v` reads the binding `name` declared at `at`, or, when `fld` is not "", its field `fld`
+// (`[]`: one of its elements).
 function monoReadsSlotOf(
   v: i32,
   name: string,
@@ -16135,6 +16177,11 @@ function monoReadsSlotOf(
 ): boolean {
   if fld == "" { return monoReadsBinding(v, name, ctx, at) }
   const o = unwrapParen(v)
+  // The step `[]` reads an element of the list binding.
+  if fld == "[]" {
+    const ix = if o >= 0 && o < P.nodes.length { nodeAt(o) } else { null }
+    return ix is Index && monoReadsBinding(ix.idxArr, name, ctx, at)
+  }
   if o < 0 || o >= P.nodes.length { return false }
   const m = nodeAt(o)
   if !(m is Member) { return false }
