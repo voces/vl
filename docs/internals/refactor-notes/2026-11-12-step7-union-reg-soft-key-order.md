@@ -13,7 +13,7 @@ raw: invalid wasm.
 construction) when the softened key finds no row. It only adds hits, and every softened-key hit
 stands.
 
-## Found by
+## Found by (D15760)
 
 Lane w317's `monoSubstLetType` spelled by the naming rule, which orders members differently from
 the substitution. Four programs built invalid modules. Under the change with this fix:
