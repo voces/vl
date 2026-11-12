@@ -41,4 +41,14 @@ depth 0, since the nested record's rows are minted apart.
 
 ## Proof
 
-SWEEP
+**Full local sweep.** Fixpoint seeds, base master `5e0a0ccf`, 23,962 programs:
+
+| | count |
+| --- | --- |
+| same | 23,961 |
+| bytes-only | 0 |
+| output movers | 1 |
+| runs → not-runs | 0 |
+| new compiler traps | 0 |
+
+The one mover is D15390, which goes from refusal to runs.
