@@ -30,7 +30,6 @@ import {
   NumLit,
   ObjLit,
   OptMember,
-  P,
   Param,
   Paren,
   Program,
@@ -71,6 +70,7 @@ import {
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
   tyPrimNameOf,
+  tySame,
 } from "./check_types"
 import {
   isTestsNull,
@@ -79,17 +79,28 @@ import {
   unwrapParen,
 } from "./emit_base"
 import {
+  RepDesc,
   declTyIxOfName,
   repCanonId,
+  repOfTy,
   repRowId,
   repRowOfTyStruct,
   sFieldElemTyIxAt,
 } from "./emit_rep"
 import {
+  FC_F32,
+  FC_F64,
   FC_I32,
   FC_I32_LIST,
+  FC_I64,
+  FC_NUL_NONE,
+  FC_NUL_STR,
+  FC_STR,
+  FC_STRUCT,
+  FC_UNION,
   armFieldElemName,
   armFieldElemTyIx,
+  armFieldStoreTy,
   armFieldTypes,
   fnStmts,
   sAnonOwnTy,
@@ -97,6 +108,7 @@ import {
   sFieldElemName,
   sFieldNames,
   sFieldStart,
+  sFieldStoreTy,
   sFieldTypes,
   sIsRefRow,
   sNames,
@@ -104,7 +116,6 @@ import {
   uFieldStart,
   uVarTyIx,
 } from "./emit_state"
-import { memoKeyNew, memoPassMoved } from "./memo"
 import { strContains } from "./strutil"
 import { recFitNarrowedFields } from "./check_fit_rules"
 import { nonNullTy, tyHasTyVar } from "./tyquery"
@@ -113,6 +124,139 @@ import { nonNullTy, tyHasTyVar } from "./tyquery"
 // field at field index `fi`.
 export function sFieldTypeAt(si: i32, fi: i32) {
   sFieldTypes[sFieldStart[si] + fi]
+}
+
+// The covered rep of the struct table's flat field row `r`'s storage type, or null where none
+// is recorded or the descriptor does not cover it; there the field code is the only answer.
+function fieldRowStoreRep(r: i32): RepDesc | null {
+  rowStoreRepIn(sFieldStoreTy, r)
+}
+
+// `fieldRowStoreRep` of row `r` of storage-type column `tys`.
+function rowStoreRepIn(tys: i32[], r: i32): RepDesc | null {
+  if r < 0 { return null }
+  const ty = if r < tys.length { tys[r] } else { -1 }
+  if ty < 0 { return null }
+  const d = repOfTy(ty)
+  if d.rdCovered == 0 { return null }
+  d
+}
+
+// The field code of flat row `r`, or -1 for no row.
+function fieldRowCode(r: i32): i32 {
+  if r < 0 || r >= sFieldTypes.length { return -1 }
+  sFieldTypes[r]
+}
+
+// Whether flat field row `r` holds the union box.
+export function fieldRowIsUnionBox(r: i32): boolean {
+  const d = fieldRowStoreRep(r)
+  if d == null { return fieldRowCode(r) == FC_UNION }
+  d.rdKind == "union"
+}
+
+// Whether flat field row `r` holds a non-null `i32`: a number, a boolean or an atom.
+export function fieldRowIsPlainI32(r: i32): boolean {
+  const d = fieldRowStoreRep(r)
+  if d == null { return fieldRowCode(r) == FC_I32 }
+  d.rdKind == "i32" && d.rdNul == 0
+}
+
+// Whether flat field row `r` holds a record ref. A `nulnone` storage is a hole's record or the
+// `null` unit, which only the code tells apart.
+export function fieldRowIsRecordRef(r: i32): boolean {
+  const d = fieldRowStoreRep(r)
+  if d == null || d.rdKind == "nulnone" { return fieldRowCode(r) == FC_STRUCT }
+  d.rdKind == "nulstruct" || d.rdKind == "nulvariant"
+}
+
+// Whether flat field row `r` holds only `null` (the `null` unit's `nullref` slot).
+export function fieldRowIsNulNone(r: i32): boolean {
+  const d = fieldRowStoreRep(r)
+  if d == null || d.rdKind == "nulnone" {
+    return fieldRowCode(r) == FC_NUL_NONE
+  }
+  false
+}
+
+// Whether flat field row `r` holds a string, non-null (`nul` false) or `string | null` (true).
+export function fieldRowIsStr(r: i32, nul: boolean): boolean {
+  const d = fieldRowStoreRep(r)
+  if d == null {
+    const want = if nul { FC_NUL_STR } else { FC_STR }
+    return fieldRowCode(r) == want
+  }
+  if nul { d.rdKind == "nulstr" } else { d.rdKind == "str" }
+}
+
+// The numeric scalar kind flat field row `r` holds (0 a plain `i32`, 3 `i64`, 4 `f64`, 5 `f32`),
+// or -1 for any other storage.
+export function fieldRowNumKind(r: i32): i32 {
+  const d = fieldRowStoreRep(r)
+  if d == null {
+    const c = fieldRowCode(r)
+    if c == FC_I32 { return 0 }
+    if c == FC_I64 { return 3 }
+    if c == FC_F64 { return 4 }
+    if c == FC_F32 { return 5 }
+    return -1
+  }
+  match d.rdKind {
+    "i32" => {
+      return if d.rdNul == 0 { 0 } else { -1 }
+    }
+    "i64" => {
+      return 3
+    }
+    "f64" => {
+      return 4
+    }
+    "f32" => {
+      return 5
+    }
+    "struct" | "list" | "str" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      return -1
+    }
+  }
+}
+
+// The covered storage rep of variant `vi`'s field `fi`, read through the arm table, which is the
+// staging column until the arms adopt their rows; null where the code is the only answer.
+function variantFieldStoreRep(vi: i32, fi: i32): RepDesc | null {
+  rowStoreRepIn(armFieldStoreTy(), uFieldStart[vi] + fi)
+}
+
+// Whether variant `vi`'s field `fi` holds the union box.
+export function variantFieldIsUnionBox(vi: i32, fi: i32): boolean {
+  const d = variantFieldStoreRep(vi, fi)
+  if d == null { return variantFieldTypeAt(vi, fi) == FC_UNION }
+  d.rdKind == "union"
+}
+
+// Whether variant `vi`'s field `fi` holds `string | null`.
+export function variantFieldIsNulStr(vi: i32, fi: i32): boolean {
+  const d = variantFieldStoreRep(vi, fi)
+  if d == null { return variantFieldTypeAt(vi, fi) == FC_NUL_STR }
+  d.rdKind == "nulstr"
+}
+
+// Whether variant `vi`'s field `fi` holds only `null`. A `nulnone` storage is a hole's record or
+// the `null` unit, which only the code tells apart.
+export function variantFieldIsNulNone(vi: i32, fi: i32): boolean {
+  const d = variantFieldStoreRep(vi, fi)
+  if d == null || d.rdKind == "nulnone" {
+    return variantFieldTypeAt(vi, fi) == FC_NUL_NONE
+  }
+  false
+}
+
+// Whether variant `vi`'s field `fi` holds a record ref.
+export function variantFieldIsRecordRef(vi: i32, fi: i32): boolean {
+  const d = variantFieldStoreRep(vi, fi)
+  if d == null || d.rdKind == "nulnone" {
+    return variantFieldTypeAt(vi, fi) == FC_STRUCT
+  }
+  d.rdKind == "nulstruct" || d.rdKind == "nulvariant"
 }
 
 // The ref-list element type-name of struct `si`'s field `fi` (a code-5 field), "" otherwise.
@@ -306,17 +450,10 @@ let sNameIxLen = 0
 export function structNameIxReset() {
   sNameIx = Map()
   sNameIxLen = 0
-  sNameCanon = Map()
-  0
-}
-
-// The row each declared record name answers when an earlier declaration of the same canonical
-// type holds an identical row (`declTwinRowsCanon`): one struct row per canonical record type.
-let sNameCanon: {[string]: i32} = Map()
-
-// Records that declared record `name` answers row `row`.
-export function sNameCanonSet(name: string, row: i32) {
-  sNameCanon[name] = row
+  sRowCanonMemo = []
+  sRowLayRows = Map()
+  sRowLayUpTo = 0
+  sRowLayPending = []
   0
 }
 
@@ -415,10 +552,115 @@ function sfnCands(b: i32[], lim: i32, out: i32[]): i32[] {
 
 // The struct table index whose name is `name`, or -1 if `name` is not a declared struct type.
 export function structIndexByName(name: string) {
-  const c = sNameCanon[name] ?? -1
-  if c >= 0 { return c }
   sNameIxSync()
-  sNameIx[name] ?? -1
+  sRowCanonOf(sNameIx[name] ?? -1)
+}
+
+// The first row holding struct row `r`'s canonical record type at an identical layout, else `r`:
+// one struct row per canonical record type. A row whose field rows are not all stored yet, or a
+// reference row, answers itself.
+let sRowCanonMemo: i32[] = []
+
+export function sRowCanonOf(r: i32): i32 {
+  if r < 0 { return r }
+  if r < sRowCanonMemo.length && sRowCanonMemo[r] >= 0 {
+    return sRowCanonMemo[r]
+  }
+  if !sRowLaidOut(r) || sIsRefRow(r) { return r }
+  sRowLayIndex(r)
+  let c = r
+  for i in sRowLayRows[sRowLayKey(r)] ?? [] {
+    if c == r && i < r && sRowsTwin(i, r) { c = i }
+  }
+  while sRowCanonMemo.length <= r { sRowCanonMemo.push(-1) }
+  sRowCanonMemo[r] = c
+  c
+}
+
+// The rows below `sRowLayUpTo` by their layout key, ascending, and those not yet laid out when
+// passed, which join their bucket once they are.
+let sRowLayRows: {[string]: i32[]} = Map()
+let sRowLayUpTo = 0
+let sRowLayPending: i32[] = []
+
+// Indexes every row below `r` that is laid out.
+function sRowLayIndex(r: i32) {
+  if sRowLayPending.length > 0 {
+    const still: i32[] = []
+    for q in sRowLayPending {
+      if sRowLaidOut(q) { sRowLayAdd(q) } else { still.push(q) }
+    }
+    sRowLayPending = still
+  }
+  while sRowLayUpTo < r {
+    const q = sRowLayUpTo
+    if !sIsRefRow(q) {
+      if sRowLaidOut(q) { sRowLayAdd(q) } else { sRowLayPending.push(q) }
+    }
+    sRowLayUpTo = q + 1
+  }
+  0
+}
+
+// Adds row `q` to its layout bucket, keeping the bucket ascending.
+function sRowLayAdd(q: i32) {
+  const k = sRowLayKey(q)
+  const b = sRowLayRows[k] ?? []
+  b.push(q)
+  let at = b.length - 1
+  while at > 0 && b[at - 1] > q {
+    b[at] = b[at - 1]
+    at = at - 1
+  }
+  b[at] = q
+  sRowLayRows[k] = b
+  0
+}
+
+// Row `r`'s bucket key: its field names in order, which a re-lay of its codes leaves alone.
+function sRowLayKey(r: i32): string {
+  let k = ""
+  let f = 0
+  while f < sFieldCount[r] {
+    const x = sFieldStart[r] + f
+    k = k + sFieldNames[x] + ";"
+    f = f + 1
+  }
+  k
+}
+
+function sRowLaidOut(r: i32): boolean {
+  r < sTyIx.length
+    && r < sFieldCount.length
+    && r < sFieldStart.length
+    && sFieldStart[r] + sFieldCount[r] <= sFieldElemName.length
+    && sFieldStart[r] + sFieldCount[r] <= sFieldNames.length
+}
+
+// The record type row `r` holds: an anonymous row's own (`sAnonOwnTy`, where its recorded type is
+// a hole's context), else its recorded type.
+function sRowOwnTy(r: i32): i32 {
+  const own = sAnonOwnTy[r] ?? -1
+  if own >= 0 { own } else { sTyIx[r] }
+}
+
+// Whether rows `i` and `j` hold one canonical record type at one layout: field names in order,
+// codes and element names.
+export function sRowsTwin(i: i32, j: i32): boolean {
+  if sFieldCount[i] != sFieldCount[j] { return false }
+  const a = sRowOwnTy(i)
+  const b = sRowOwnTy(j)
+  if a < 0 || b < 0 { return false }
+  let k = 0
+  while k < sFieldCount[i] {
+    const fa = sFieldStart[i] + k
+    const fb = sFieldStart[j] + k
+    if sFieldNames[fa] != sFieldNames[fb] { return false }
+    if sFieldTypeAt(i, k) != sFieldTypeAt(j, k) { return false }
+    if sFieldElemName[fa] != sFieldElemName[fb] { return false }
+    k = k + 1
+  }
+  tySame(a, b)
 }
 
 // The number of fully-collected struct entries — the scan bound for any matcher reading
@@ -458,72 +700,8 @@ export function declRowFieldKindFits(
   fieldKindWidens(lk, rk)
 }
 
-// `fnFieldTyFits` against field `name` of row `si` where that row is declared; true for an
-// anonymous row, whose closure fields `anonValueFitsField` checks by signature instead.
-export function declRowFnFieldFits(lt: i32, si: i32, name: string): boolean {
-  if sIsAnonRow(si) { return true }
-  if !holeFnTyFieldFits(lt, si, name) { return false }
-  rowFnFieldFits(lt, si, name)
-}
-
-// Every object-literal field value named `fiName` whose checked type is a function with holes,
-// collected once per pass and resumed as the arena grows: a type alone cannot say what such a
-// function returns, so `holeFnTyFieldFits` asks its values (D9530).
-const hfvKey = memoKeyNew(1)
-let hfvTys: i32[] = []
-let hfvVals: i32[] = []
-let hfvNames: string[] = []
-let hfvScanned = 0
-
-function hfvSync() {
-  if memoPassMoved(hfvKey, 0) {
-    hfvTys = []
-    hfvVals = []
-    hfvNames = []
-    hfvScanned = 0
-  }
-  let i = hfvScanned
-  while i < P.nodes.length {
-    const n = nodeAt(i)
-    if n is FieldInit {
-      const t = nodeTyIxOf(unwrapParen(n.fiValue))
-      if ownTyIsFunc(t) && tyHasTyVar(t) {
-        hfvTys.push(t)
-        hfvVals.push(n.fiValue)
-        hfvNames.push(n.fiName)
-      }
-    }
-    i = i + 1
-  }
-  hfvScanned = P.nodes.length
-  0
-}
-
-// `holeFnFieldFits` for a field type `lt` with no literal at hand: refuted when any field value
-// `name` checked at `lt` gives a result other than row `si`'s declared signature does (D9571).
-function holeFnTyFieldFits(lt: i32, si: i32, name: string): boolean {
-  if !ownTyIsFunc(lt) || !tyHasTyVar(lt) { return true }
-  if si < 0 || si >= sTyIx.length { return true }
-  const rt = tyFieldTyOf(sTyIx[si], name)
-  hfvSync()
-  let j = 0
-  while j < hfvTys.length {
-    if hfvTys[j] == lt && hfvNames[j] == name {
-      if !holeFnFieldFits(unwrapParen(hfvVals[j]), lt, rt) { return false }
-    }
-    j = j + 1
-  }
-  true
-}
-
-// `fnFieldTyFits` against field `name` of row `si`'s recorded type, declared or anonymous.
-export function rowFnFieldFits(lt: i32, si: i32, name: string): boolean {
-  if si < 0 || si >= sTyIx.length { return true }
-  fnFieldTyFits(lt, tyFieldTyOf(sTyIx[si], name))
-}
-
-// `declRowFnFieldFits` for a field spelled `text`, resolved only where it spells an arrow and
-// row `si` declares that field a function.
+// Whether a field spelled `text` fits field `name` of row `si`, resolved only where it spells an
+// arrow and that row declares the field a function.
 export function declRowFnSpellingFits(
   text: string,
   si: i32,
