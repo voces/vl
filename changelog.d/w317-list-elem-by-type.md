@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Step 7 L2, mono: a list argument's element pin is spelled from the element's type.** A `T[]` parameter's binding of `T` (`monoPinAnnotatedParam`'s `tvV` text) and an indexed element argument's pin (`id(xs[0])`) took their element by peeling `[]` off the list's spelling (`listElemNameOf`); both now spell the list's element type by the naming rule (`monoPinSpellShaped`). The text changes in 91 decisions across 58 programs, each of whose modules is byte-identical. `emit_mono.vl`'s only spelling reads left are the two by-design `structIndexByName` lookups.
