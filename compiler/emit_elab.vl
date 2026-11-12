@@ -6828,10 +6828,13 @@ function elabResScanIdent(g: i32) {
 }
 
 // Whether declaration `d` can hold a record: a binding initialised by a call that can return a
-// record, or an unannotated `const` initialised with a parameter's read. The scan banks reads of
-// such a binding alone, as nothing else can be a holder.
-function elabResMayHold(d: i32): boolean {
-  if d < 0 || d >= P.nodes.length { return false }
+// record, or an unannotated `const` initialised with a read of a parameter or of another such
+// binding. The scan banks reads of such a binding alone, as nothing else can be a holder.
+function elabResMayHold(d: i32): boolean { elabResMayHoldAt(d, 8) }
+
+// `elabResMayHold` through at most `depth` copies of copies.
+function elabResMayHoldAt(d: i32, depth: i32): boolean {
+  if depth <= 0 || d < 0 || d >= P.nodes.length { return false }
   const n = nodeAt(d)
   if !(n is LetDecl) || n.letInit < 0 { return false }
   const v = parenPeelIx(n.letInit)
@@ -6842,7 +6845,9 @@ function elabResMayHold(d: i32): boolean {
   }
   const pd = identDeclOf(v)
   if pd < 0 || pd >= P.nodes.length { return false }
-  nodeAt(pd) is Param || elabResCallHolder(pd)
+  nodeAt(pd) is Param
+    || elabResCallHolder(pd)
+    || elabResMayHoldAt(pd, depth - 1)
 }
 
 // Whether declaration `d` is a binding initialised by a call that can return a record.
@@ -7580,12 +7585,12 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
   const through = elabResThrough.get(h) ?? []
   const hands = elabResHands.get(h) ?? []
   const rets = elabResRets.get(h) ?? []
-  const copies = if c >= 0 { elabResCopies.get(h) ?? [] } else { [] }
+  const copies = if c >= 0 { elabCopiesDeep(h) } else { [] }
   const reads = through.length
     + hands.length / 2
     + elabResWriteReads(h)
     + rets.length
-    + copies.length
+    + (elabResCopies.get(h) ?? []).length
     + elabResLinkReads(h)
   if (
     reads != (elabResReads.get(h) ?? 0)
@@ -7734,8 +7739,8 @@ function elabCallTakesOneMember(g: i32, rec: i32[]): boolean {
 }
 
 // Whether every copy in `copies` of holder `h` can hold record `rec` in instance `from`: it is
-// read only by calls through it at the record's signatures and by hands the holder's own would
-// take, in its own function, which is the function declaring `h` or a lambda nested in it that
+// read only by calls through it at the record's signatures, by hands the holder's own would
+// take and by copies of it, in its own function, which is the function declaring `h` or a lambda nested in it that
 // captures `h`. Pure, so the holder and its copies are recorded together or not at all.
 function elabHolderCopiesHold(
   h: i32,
@@ -7752,9 +7757,10 @@ function elabHolderCopiesHold(
     const through = elabResThrough.get(w) ?? []
     const hands = elabResHands.get(w) ?? []
     const wr = elabResRets.get(w) ?? []
+    const wc = (elabResCopies.get(w) ?? []).length
     if (
       !global && !elabLambdaWithin(wf, fd)
-      || through.length + hands.length / 2 + wr.length
+      || through.length + hands.length / 2 + wr.length + wc
         != (elabResReads.get(w) ?? 0)
     ) {
       return false
@@ -7776,6 +7782,24 @@ function elabHolderCopiesHold(
     }
   }
   true
+}
+
+// Every copy of holder `h`, and every copy of a copy, each once.
+function elabCopiesDeep(h: i32): i32[] {
+  const out: i32[] = []
+  for x in elabResCopies.get(h) ?? [] { out.push(x) }
+  let i = 0
+  while i < out.length && i < 256 {
+    for x in elabResCopies.get(out[i]) ?? [] {
+      let seen = false
+      for y in out {
+        if y == x { seen = true }
+      }
+      if !seen { out.push(x) }
+    }
+    i = i + 1
+  }
+  out
 }
 
 // Whether function `f` is `fd` or a lambda nested in it through lambdas alone; -1 is the top level.
