@@ -1205,12 +1205,22 @@ export function elabFnRetJoinNote(j: i32, a: i32, b: i32) {
   elabFnJoinRecLists = false
 }
 
+// Whether `a` and `b` are function types of different results: a returned list's record notes
+// such a field apart (`fnRetRecSrcTo`), read only where a call through the set splits.
+function elabFnRetsDiffer(a: i32, b: i32): boolean {
+  const fa = if a >= 0 && a < T.tys.length { T.tys[a] } else { null }
+  const fb = if b >= 0 && b < T.tys.length { T.tys[b] } else { null }
+  fa is TyFunc && fb is TyFunc && !tySame(fa.fnRet, fb.fnRet)
+}
+
 // Whether the join note in progress is a return's, whose records' lists are noted too.
 let elabFnJoinRecLists = false
 // Whether the record the join note enters next is a returned list's element.
 let elabFnJoinListRec = false
 // Whether the join note is under such a record.
 let elabFnJoinUnderListRec = false
+// Whether the join note is a returned list's record's function field of different results.
+let elabFnJoinApart = false
 
 function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
   if (
@@ -1241,7 +1251,10 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
         return 0
       }
       for sd in [elabFnSetTy[a] ?? -1, elabFnSetTy[b] ?? -1] {
-        if sd >= 0 && sd != u {
+        if sd >= 0 && sd != u && elabFnJoinApart {
+          fnRetRecSrcTo.push(u)
+          fnRetRecSrcFrom.push(sd)
+        } else if sd >= 0 && sd != u {
           fnWidenSrcTo.push(u)
           fnWidenSrcFrom.push(sd)
         }
@@ -1260,9 +1273,18 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
         const ia = strListIndexOf(at.objFieldNames, nm)
         const ib = strListIndexOf(bt.objFieldNames, nm)
         const ft = jt.objFieldTypes[i]
-        const skip = listsOnly
+        const notList = listsOnly
           && !(ft >= 0 && ft < T.tys.length && T.tys[ft] is TyArray)
-        if ia >= 0 && ib >= 0 && !skip {
+        const apart = notList
+          && ia >= 0
+          && ib >= 0
+          && elabFnRetsDiffer(
+          at.objFieldTypes[ia],
+          bt.objFieldTypes[ib],
+        )
+        if ia >= 0 && ib >= 0 && (!notList || apart) {
+          const was = elabFnJoinApart
+          elabFnJoinApart = apart
           elabFnArmJoinAt(
             jt.objFieldTypes[i],
             at.objFieldTypes[ia],
@@ -1270,6 +1292,7 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
             depth + 1,
             true,
           )
+          elabFnJoinApart = was
         }
         i = i + 1
       }
@@ -2268,6 +2291,16 @@ export function fnWidenedSourceSets(s: i32): i32[] {
     }
     j = j + 1
   }
+  if fnTagSetSplits(s) {
+    j = 0
+    while j < fnRetRecSrcTo.length {
+      const o = fnRetRecSrcFrom[j]
+      if fnRetRecSrcTo[j] == s && o >= 0 && o != s && !i32ListHas(out, o) {
+        out.push(o)
+      }
+      j = j + 1
+    }
+  }
   for bd in fnListWidened {
     const n = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
     if n is LetDecl && n.letInit >= 0 && !i32ListHas(fnLetVeto, bd) {
@@ -2295,6 +2328,9 @@ export function fnSetGroupRep(s: i32): i32 {
     const t = fnWidenSrcTo[j]
     if t >= 0 && !i32ListHas(tos, t) { tos.push(t) }
     j = j + 1
+  }
+  for t in fnRetRecSrcTo {
+    if t >= 0 && !i32ListHas(tos, t) { tos.push(t) }
   }
   for bd in fnListWidened {
     const bt = if bd >= 0 && bd < P.nodes.length { nodeTyIxOf(bd) } else { -1 }
@@ -2923,14 +2959,25 @@ export function fnSetCalledWithAny(ds: i32[]): boolean {
 }
 
 // Whether call `ix`'s members give it different results.
-// Whether some call through set `s` runs members whose results differ there.
+// Whether some call through set `s`, or through a set holding all of its members, runs members
+// whose results differ there.
 export function fnTagSetSplits(s: i32): boolean {
+  if s < 0 || s >= fnSets.length { return false }
   for c in fnTagCallIxs {
-    if (fnTagCallSet[c] ?? -1) == s && (fnTagCallSplit[c] ?? false) {
-      return true
+    const cs = fnTagCallSet[c] ?? -1
+    if (fnTagCallSplit[c] ?? false) && cs >= 0 && cs < fnSets.length {
+      if cs == s || fnSetHoldsAll(fnSets[cs], fnSets[s]) { return true }
     }
   }
   false
+}
+
+// Whether `outer` holds every member of `inner`.
+function fnSetHoldsAll(outer: i32[], inner: i32[]): boolean {
+  for m in inner {
+    if !i32ListHas(outer, m) { return false }
+  }
+  true
 }
 
 export function fnTagCallSplits(ix: i32): boolean {
@@ -3097,6 +3144,10 @@ let fnFieldWidened: i32[] = []
 // Each set a widening copied a smaller set's ids into, beside that smaller set (D15270).
 let fnWidenSrcTo: i32[] = []
 let fnWidenSrcFrom: i32[] = []
+// `fnWidenSrcTo` for a returned list's record's function fields of different results: a source
+// set decided with the joined one only where a call through it splits.
+let fnRetRecSrcTo: i32[] = []
+let fnRetRecSrcFrom: i32[] = []
 let fnFieldWidenedName: string[] = []
 let fnLetVeto: i32[] = []
 // The list literals whose open element signature the functions written into their binding closed.
@@ -3247,6 +3298,8 @@ export function fnTyFactsReset() {
   fnFieldWidenedName = []
   fnWidenSrcTo = []
   fnWidenSrcFrom = []
+  fnRetRecSrcTo = []
+  fnRetRecSrcFrom = []
   0
 }
 
@@ -3273,6 +3326,8 @@ export function fnTagEtaReset() {
   fnFieldWidenedName = []
   fnWidenSrcTo = []
   fnWidenSrcFrom = []
+  fnRetRecSrcTo = []
+  fnRetRecSrcFrom = []
   fnListClosedLits = []
   fnLetVeto = []
 }
