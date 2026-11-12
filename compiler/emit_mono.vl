@@ -1,3 +1,4 @@
+import { unionTyArms } from "./emit_map_twins"
 import { voidCtxLambdaCarry } from "./check_side_rows"
 import { idShadowSpec } from "./emit_id_shadow"
 import {
@@ -106,7 +107,6 @@ import {
   nodeTyIsNulFunc,
   nodeTyIsNullType,
   nodeTyIsNullable,
-  nodeTyIsNullableStruct,
   nodeTyIsStringPrim,
   nodeTyIxIn,
   nodeTyIxOf,
@@ -118,14 +118,8 @@ import {
   tyIsClosureArray,
   tyIsUnionish,
 } from "./check_node_tys"
-import { nodePos, trimWs } from "./fmt_util"
-import {
-  arrElemNameRaw,
-  arrElemSuffixed,
-  listElemNameOf,
-  nameIsBraceSpanEnds,
-  peelGroupParens,
-} from "./tyname"
+import { nodePos } from "./fmt_util"
+import { arrElemSuffixed, listElemNameOf } from "./tyname"
 import {
   fnCloCoerceSetAt,
   fnCloCoerceTyIx,
@@ -268,6 +262,7 @@ import {
   tyUnionAllLists,
   tyVarRenameRow,
   tyWrapsRecord,
+  unionAliasDeclNameOfTy,
 } from "./check_types"
 import {
   blockHasBareReturn,
@@ -403,7 +398,6 @@ import {
   sidText,
 } from "./symbols"
 import {
-  annObjFieldSplit,
   annSplitParams,
   drwDispatchOp,
   exprEffectFree,
@@ -421,7 +415,6 @@ import {
   monoTyMentionsTyParam,
   monoTyParamOfTy,
   nodeIsTypeDecl,
-  normTypeAtom,
   noteCallOrigin,
   parentLetOfAt,
   pushUniqueAtom,
@@ -554,7 +547,6 @@ import { parseI32 } from "./emit_bignum"
 import { tyHasLitDeep } from "./emit_anon_fields"
 import {
   fnHasUnannotatedParam,
-  sFieldElemNameAt,
   sFieldTypeAt,
   sIsAnonRow,
   sScanLim,
@@ -615,7 +607,6 @@ import {
 } from "./emit_local_scope"
 import { tyNulFuncInner, tyRefArrElemOf } from "./emit_map_value_slots"
 import {
-  isSName,
   monoRetRowName,
   pinKindOfName,
   repABNote,
@@ -762,10 +753,7 @@ import {
   unABOn,
   unNameBound,
   unRowOfCanonFolded,
-  unionArmsOf,
-  unionArmsOfTy,
   unionRowKeyAB,
-  unionSetAtomsOf,
 } from "./emit_union_registry"
 import {
   unRowOfTyKey,
@@ -1181,15 +1169,21 @@ function monoTyNarrowsFrom(nTy: i32, wTy: i32): boolean {
   false
 }
 
-// Whether `narrow` is a niche-repped `boolean | null` or `string | null` whose arms are all arms
-// of the union `wide`: the argument's read converts the box to that niche, so the pin is it (D2590).
-function monoNicheNarrowsFrom(
-  narrow: string,
-  narrowTy: i32,
-  wide: string,
-): boolean {
-  if !monoTyIsNulBoolOrStr(narrowTy) { return false }
-  monoArmsNarrowFrom(narrow, narrowTy, wide)
+// Whether `narrowTy` is a niche-repped `boolean | null` or `string | null` whose arms
+// (`unionTyArms`) are all arms of the wider union `wTy`, and fewer: the argument's read converts
+// the box to that niche, so the pin is it (D2590). A side with no type or no arms is not.
+function monoNicheNarrowsFrom(narrowTy: i32, wTy: i32): boolean {
+  if !monoTyIsNulBoolOrStr(narrowTy) || wTy < 0 { return false }
+  const na: string[] = []
+  const nts: i32[] = []
+  if !unionTyArms(narrowTy, na, nts) { return false }
+  const wa: string[] = []
+  const wts: i32[] = []
+  if !unionTyArms(wTy, wa, wts) || wa.length <= na.length { return false }
+  for a in na {
+    if !strListHas(wa, a) { return false }
+  }
+  true
 }
 
 // Whether `ty` is a `boolean | null` or a `string | null` nullable.
@@ -1203,55 +1197,55 @@ function monoTyIsNulBoolOrStr(ty: i32): boolean {
   false
 }
 
-// Whether every arm of the union `narrow` (arena type `narrowTy`) is an arm of the wider `wide`.
-function monoArmsNarrowFrom(
-  narrow: string,
-  narrowTy: i32,
-  wide: string,
-): boolean {
-  if narrow == wide { return false }
-  const na: string[] = []
-  unionArmsOfTy(narrow, narrowTy, na)
-  const wa: string[] = []
-  unionArmsOf(wide, wa)
-  if wa.length <= na.length { return false }
-  let i = 0
-  while i < na.length {
-    let hit = false
-    let j = 0
-    while j < wa.length {
-      if wa[j] == na[i] { hit = true }
-      j = j + 1
+// Whether the spelling of type `ty` holds a brace: an inline record or a map anywhere in it,
+// through lists, nullables, unions and function signatures. A declared record spells its name, and
+// so does a declared union below the top; `top` opens the top-level union's members.
+function monoTyMentionsBrace(ty: i32, top: boolean): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  match t {
+    TyObj => {
+      return nominalStructNameOfTy(ty) == ""
     }
-    if !hit { return false }
-    i = i + 1
+    TyMap => {
+      return true
+    }
+    TyArray => {
+      return monoTyMentionsBrace(t.aElem, false)
+    }
+    TyNullable => {
+      return monoTyMentionsBrace(t.nInner, top)
+    }
+    TyUnion => {
+      if !top && unionAliasDeclNameOfTy(ty) != "" { return false }
+      for m in t.uMembers {
+        if monoTyMentionsBrace(m, false) { return true }
+      }
+      return false
+    }
+    TyFunc => {
+      for q in t.fnParamTypes {
+        if monoTyMentionsBrace(q, false) { return true }
+      }
+      return monoTyMentionsBrace(t.fnRet, false)
+    }
+    // A scalar, a literal, an open or error type spells no brace.
+    TyPrim | TyLit | TyVar | TyErr | TyNeg => {
+      return false
+    }
   }
-  true
 }
 
-// Whether `ty` is a list whose element peels, through lists and nullables, to a record: its
-// render is a brace span suffixed `[]`, or "".
-function monoTyIsListOfRecord(ty: i32): boolean {
-  ty >= 0 && ty < T.tys.length && tyAt(ty) is TyArray && tyWrapsRecord(ty)
-}
-
-// Whether `wide` or one of the arms `unionArmsOf` resolves it to holds a brace: the only
-// spellings a record's render can equal.
-function monoWideArmsHoldBrace(wide: string): boolean {
-  if strContains(wide, "{") { return true }
-  const arms: string[] = []
-  unionArmsOf(wide, arms)
-  for a in arms {
-    if strContains(a, "{") { return true }
-  }
-  false
-}
-
-// The number of arms `unionArmsOf` resolves `wide` to, as `monoArmsNarrowFrom` reads them.
-function monoArmCount(wide: string): i32 {
-  const arms: string[] = []
-  unionArmsOf(wide, arms)
-  arms.length
+// The number of arms union type `ty` has: its keyed arms (`unionTyArms`), else its flattened
+// variants; -1 for no type.
+function monoTyArmCount(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const atoms: string[] = []
+  const tys: i32[] = []
+  if unionTyArms(ty, atoms, tys) { return atoms.length }
+  const flat: i32[] = []
+  flattenVariantsInto(ty, flat)
+  flat.length
 }
 
 // The pin a narrowed argument at `ax` wants, given the pin `wide` (type `wTy`, or -1) the
@@ -1271,28 +1265,20 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string, wTy: i32) {
   // drops from the interned atom to a string ref. `tyRenderSoftensLits` is the home for
   // that hazard, and a litunion argument's pin is claimed by the litunion rungs anyway.
   if tyRenderSoftensLits(nt) { return monoNarrowedLitPinName(nt, wTy) }
-  // A record renders as a brace span, so it can be an arm of `wide` only when `wide` holds a
-  // brace; the render doubles with each nested level of a shared shape, so it is skipped (D2780).
-  if monoTyIsObj(nt) && !strContains(wide, "{") {
-    return monoNarrowedNominalPinName(nt, "", wTy)
-  }
-  // So does a list of records, which no rung below answers unless one of `wide`'s arms is
-  // its brace-holding render (D9330).
-  if monoTyIsListOfRecord(nt) && !monoWideArmsHoldBrace(wide) { return "" }
   // A nullable record has two arms, so it is a proper arm subset of `wide` only past two arms;
   // the nominal rung answers it only once its names have matched.
   if (
     nt >= 0
     && tyAt(nt) is TyNullable
     && tyWrapsRecord(nt)
-    && !monoWideArmsHoldBrace(wide)
-    && monoArmCount(wide) <= 2
+    && !monoTyMentionsBrace(wTy, true)
+    && monoTyArmCount(wTy) <= 2
     && !monoNulRecNamesNarrow(nt, wTy)
   ) {
     return monoNarrowedNominalPinName(nt, "", wTy)
   }
   const n = monoPinSpellShaped(nt)
-  if monoTyNarrowsFrom(nt, wTy) || monoNicheNarrowsFrom(n, nt, wide) {
+  if monoTyNarrowsFrom(nt, wTy) || monoNicheNarrowsFrom(nt, wTy) {
     if monoAnnPinName(n, nt) == n { return n }
     return ""
   }
@@ -1586,15 +1572,6 @@ function monoParamPinnedNull(ax: i32, fnIx: i32): boolean {
   const ptn = paramTypeNodeOfRead(fnIx, ax)
   if ptn < 0 { return false }
   nodeTyIxOf(ptn) == TY_NULL
-}
-
-// Whether struct row `si` declares field `prop` nullable. A clone's `q.next` is recorded against
-// the template's gradual `q`, so only the struct row knows the field is nullable (D3301).
-function monoFieldDeclNullable(si: i32, prop: string): boolean {
-  if si < 0 || si >= sTyIx.length { return false }
-  const ft = tyFieldTyOf(sTyIx[si], prop)
-  if ft < 0 || ft >= T.tys.length { return false }
-  tyAt(ft) is TyNullable
 }
 
 // The initializer of the local an if-expression's then arm yields, when that local is declared
@@ -2012,8 +1989,8 @@ function monoArgTyNameProjected(
     }
   }
   // A struct-field argument (`id(o.inner)`): resolve the receiver's struct from its pinned
-  // type, then read the field's struct type name off the struct
-  // table (a nested-struct field is code 15, whose `sFieldElemName` is its target struct name).
+  // type, then read the field's recorded record type off the struct table (a nested-struct
+  // field is code 15).
   // `structIndexOfExpr(o.inner)` would default to i32, the locals table being unbuilt.
   if argN is Member {
     const recvOut: i32[] = [0 - 1]
@@ -2022,24 +1999,13 @@ function monoArgTyNameProjected(
     if rsi >= 0 {
       const fi = sFieldIndex(rsi, argN.memProp)
       if fi >= 0 && sFieldTypeAt(rsi, fi) == FC_STRUCT {
-        const fnm = sFieldElemNameAt(rsi, fi)
-        // A nullable record field shares code 15 with a bare one; its pin keeps the `| null`
-        // the field declares, or the instance's parameter is non-null and the call casts (D3301).
-        if (
-          isSName(fnm)
-          && (nodeTyIsNullableStruct(cax)
-            || monoFieldDeclNullable(rsi, argN.memProp))
-        ) {
-          const fet = nonNullTy(sFieldElemTyIxAt(rsi, fi))
-          return monoAnnPinName(
-            fnm + "|null",
-            if fet >= 0 { mkNullableTy(fet) } else { -1 },
-          )
-        }
-        if isSName(fnm) {
-          const fr = structIndexByName(fnm)
-          tyOut[0] = if fr >= 0 && fr < sTyIx.length { sTyIx[fr] } else { -1 }
-          return fnm
+        // The field's recorded record type, when a struct row holds it: the pin is its type,
+        // spelled by the naming rule.
+        const fet = sFieldElemTyIxAt(rsi, fi)
+        const et = if fet >= 0 { nonNullTy(fet) } else { -1 }
+        if et >= 0 && structRowOfRecordTy(et) >= 0 {
+          tyOut[0] = et
+          return monoPinSpellShaped(et)
         }
       }
     }
@@ -2577,9 +2543,7 @@ function monoSubstLetType(
         const subC = monoPinMintedUnion(sub, sty, sty, unTyKeyTagLet())
         // A union takes the type its registered spelling names, the one an assignment's
         // `letUnionNameOf` resolves against the registry, not the substitution's own row (D2676).
-        const subAtoms: string[] = []
-        unionSetAtomsOf(subC, subAtoms)
-        if subAtoms.length >= 2 {
+        if monoPinCanonIsUnion(sty) {
           // Typed by the spelling: the substitution's own type can keep a union the registered
           // row collapses (`f64[] | i32[]` against `f64[]`).
           return synthTypeRefFb(subC, tn.pos, -1)
@@ -2726,7 +2690,7 @@ function monoPinUnionBoxed(j: i32, refArm: boolean): i32 {
   let name = valueUnionRetName(j)
   // Such a union is named as a binding of it is (`monoRegisterElabJoinRows`).
   if name == "" && refArm && monoTyHoldsRefArm(j) {
-    name = monoPinUnionName(monoPinSpellShaped(j))
+    name = monoPinUnionName(monoPinSpellShaped(j), j)
   }
   if name != "" { monoRegisterPinUnion(name, j) }
   j
@@ -7941,26 +7905,48 @@ function monoTagMapTy(t: i32): boolean {
 
 // The registry name of pinned type `st`'s box: the naming rule's spelling, canon'd as a union name.
 function monoPinUnionNameOfTy(st: i32): string {
-  monoPinUnionName(monoPinSpellShaped(st))
+  monoPinUnionName(monoPinSpellShaped(st), st)
 }
 
-// D1042 — the emitter-vocabulary spelling of a substituted annotation name, for the shapes
-// where the two can disagree: a union, and a list of a grouped element (`(T | string)[]`).
-// A substitution into the declared text keeps a literal member literal and a collapsed group's
-// parens, while a direct annotation is canon'd.
-function monoPinUnionName(rs: string): string {
-  const atoms: string[] = []
-  unionSetAtomsOf(rs, atoms)
-  if atoms.length < 2 && !monoNameIsGroupedList(rs) { return rs }
+// D1042 — the emitter-vocabulary spelling of a substituted annotation name `rs` of type `rsTy`,
+// for the shapes where the two can disagree: a union of two arms or more, and a list of a grouped
+// element (`(T | string)[]`). A substitution into the declared text keeps a literal member literal
+// and a collapsed group's parens, while a direct annotation is canon'd. With no type, `rs` stands.
+function monoPinUnionName(rs: string, rsTy: i32): string {
+  if monoPinCanonKind(rsTy) == 0 { return rs }
   const c = canonEmitName(rs)
   if c == "" { return rs }
   c
 }
 
-// Whether `name` is a list whose element is one parenthesised group (`(A | B)[]`, `(string)[]`).
-function monoNameIsGroupedList(name: string): boolean {
-  const e = arrElemNameRaw(name)
-  e != "" && peelGroupParens(e) != e
+// How the canon name of a pin of type `ty` can differ from its spelling: 1 for a union of two
+// members or more, or one whose arms (`unionTyArms`) number two or more (a union of twin maps keys
+// one arm and is still canon'd to its one map, D15540); 2 for a list whose element its spelling
+// groups in parentheses (a union, a nullable or a function); 0 otherwise, and for no type.
+function monoPinCanonKind(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = tyAt(ty)
+  if t is TyUnion {
+    if t.uMembers.length >= 2 { return 1 }
+  }
+  if t is TyArray {
+    if t.aElem >= 0 && t.aElem < T.tys.length {
+      const e = tyAt(t.aElem)
+      if e is TyUnion || e is TyNullable || e is TyFunc { return 2 }
+    }
+  }
+  const atoms: string[] = []
+  const tys: i32[] = []
+  if unionTyArms(ty, atoms, tys) && atoms.length >= 2 { return 1 }
+  0
+}
+
+// Whether a pin of type `ty` canons to a union of two atoms or more: a union by
+// `monoPinCanonKind` that no declared or literal-union alias names, since a canon alias is one atom.
+function monoPinCanonIsUnion(ty: i32): boolean {
+  monoPinCanonKind(ty) == 1
+    && unionAliasDeclNameOfTy(ty) == ""
+    && litUnionAliasNameOfTy(ty) == ""
 }
 
 // The spelling an annotation pinned at `ty` takes when a pin substitutes into a union holding a
@@ -7991,12 +7977,10 @@ function monoPinMintedUnion(
   const wu = wt >= 0 && (wtt is TyUnion || wtt is TyNullable)
   let pc = ""
   if pun != "" {
-    pc = monoPinUnionName(pun)
-    const pcAtoms: string[] = []
-    unionSetAtomsOf(pc, pcAtoms)
-    if pcAtoms.length < 2 { return monoPinUnionName(name) }
-  } else if !wu || monoNameIsGroupedList(name) {
-    return monoPinUnionName(name)
+    pc = monoPinUnionName(pun, le)
+    if !monoPinCanonIsUnion(le) { return monoPinUnionName(name, wt) }
+  } else if !wu || monoPinCanonKind(wt) == 2 {
+    return monoPinUnionName(name, wt)
   }
   if !monoTyHoldsRefArm(ty) || unNameBound(name) { return name }
   // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
@@ -8008,7 +7992,7 @@ function monoPinMintedUnion(
     return "(" + pc + ")[]"
   }
   if !wu { return name }
-  const c = monoPinUnionName(name)
+  const c = monoPinUnionName(name, wt)
   monoShStage(shTag, ty)
   if (
     monoRegisterPinUnion(c, if own >= 0 { monoAnnPinTy(own) } else { ty })
@@ -10219,22 +10203,10 @@ let monoInstRetWidenKey = ""
 // own result only converts to it; -1 for the substituted result.
 let monoInstRetWidenTy = 0 - 1
 
-// Inline record spelling `s` with the spaces around its field names and types dropped, nested
-// records included (`{k: i32}` is `{k:i32}`); any other spelling is `s` trimmed.
-function monoPinShapeSpell(s: string): string {
-  const t = trimWs(s)
-  const ns: string[] = []
-  const ts: string[] = []
-  if annObjFieldSplit(t, ns, ts) <= 0 { return t }
-  let out = "{"
-  let i = 0
-  while i < ns.length {
-    if ns[i] == "" { return t }
-    if i > 0 { out = out + "," }
-    out = out + trimWs(ns[i]) + ":" + monoPinShapeSpell(ts[i])
-    i = i + 1
-  }
-  out + "}"
+// Whether `ty` is a record no declaration names: an inline record, spelled by its shape.
+function monoTyIsInlineRecord(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  tyAt(ty) is TyObj && nominalStructNameOfTy(ty) == ""
 }
 
 // The result type of function type `t` (a nullable one's function arm), or -1.
@@ -10374,10 +10346,11 @@ function monoInstanceFor(
     const pinned: string[] = []
     let pj = 0
     for pn in pinnedNames {
-      // An inline record pin is the instance's parameter type, so it takes the spelling the
-      // record's shape is interned under (D9381).
-      if nameIsBraceSpanEnds(pn) {
-        pinned.push(monoPinShapeSpell(pn))
+      // An inline record pin is the instance's parameter type, so it takes the naming rule's
+      // spelling of its type, the one the record's shape is interned under (D9381).
+      const ipt = if pj < pinTys.length { pinTys[pj] } else { -1 }
+      if monoTyIsInlineRecord(ipt) {
+        pinned.push(monoPinSpellShaped(ipt))
       } else {
         // A declared function's hole function parameter is keyed by its `=>` signature, as a
         // call's argument keys it, so a delivery and a call at one signature share the instance.
@@ -16994,7 +16967,9 @@ function monoCellLamTake(
   )
 }
 
-// `monoCellLamTake` at the parameter pin names `pnames`.
+// `monoCellLamTake` at the parameter pin names `pnames`, of types `pinTys`. The lambda the cell
+// then holds takes the signature when its parameters' types are `pinTys`, position by position (a
+// parameter with no annotation is the all-i32 clone's `i32`); a type missing on either side does not.
 function monoCellLamTakeAt(
   lfe: i32,
   x: i32,
@@ -17003,8 +16978,6 @@ function monoCellLamTakeAt(
   delTys: i32[],
   pinTys: i32[],
 ): i32 {
-  let want = ""
-  for pn in pnames { want = want + normTypeAtom(pn) + "," }
   const had = monoInstantiatedAny(lfe)
   if !had {
     monoLastInstFe = -1
@@ -17013,11 +16986,19 @@ function monoCellLamTakeAt(
     monoCallFrameSlot = -1
     if r < 0 || monoLastInstFe < 0 { return 2 }
   }
-  const pins: string[] = []
-  if !monoSlotParamPins(lfe, pins) { return 2 }
-  let got = ""
-  for pn in pins { got = got + normTypeAtom(pn) + "," }
-  if got != want {
+  if lfe < 0 || lfe >= fnStmts.length { return 2 }
+  const fn = nodeAt(fnStmts[lfe])
+  if !(fn is FuncDecl) { return 2 }
+  let same = fn.fnParams.length == pinTys.length
+  let i = 0
+  while same && i < fn.fnParams.length {
+    const p = nodeAt(fn.fnParams[i])
+    if !(p is Param) { return 2 }
+    const pt = if p.parType >= 0 { nodeTyIxOf(p.parType) } else { TY_I32 }
+    same = pt >= 0 && pinTys[i] >= 0 && tySame(pt, pinTys[i])
+    i = i + 1
+  }
+  if !same {
     if had { return 1 }
     return 2
   }
@@ -24055,8 +24036,8 @@ function monoSlotPinAnn(
       out = out + "(" + monoConcreteFnTyName(fts[k]) + ")"
     } else if fts.length > 0 && monoConcreteNulFnTyName(fts[k]) != "" {
       out = out + monoConcreteNulFnTyName(fts[k])
-    } else if nameIsBraceSpanEnds(pn) {
-      out = out + monoPinShapeSpell(pn)
+    } else if k < fts.length && monoTyIsInlineRecord(fts[k]) {
+      out = out + monoPinSpellShaped(fts[k])
     } else {
       out = out + pn
     }

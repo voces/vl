@@ -9,6 +9,55 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-12-w311-stale-reflist-comments](2026-11-12-w311-stale-reflist-comments.md): Step 7: comments that named the deleted ref-list name path, rewritten, 2026-11-12
+- [2026-11-12-w311-reflist-cut6-array-new-row-by-fill-type](2026-11-12-w311-reflist-cut6-array-new-row-by-fill-type.md): Step 7 L6: an `__array_new__` ref list mints by its fill type; `rlElemStructRow`'s name rung is a named floor, 2026-11-12
+- [2026-11-12-w311-d6-interner-rekey-design](2026-11-12-w311-d6-interner-rekey-design.md): Step 7 L2: the D6 shape interner keyed by type, design, 2026-11-12
+- [2026-11-12-step7-vkind-uncovered-storage-rows](2026-11-12-step7-vkind-uncovered-storage-rows.md): Step 7, lane H: the field rows with no covered storage rep, graded, 2026-11-12
+- [2026-11-12-step7-vkind-nul-map-inner-name-deleted](2026-11-12-step7-vkind-nul-map-inner-name-deleted.md): Step 7, lane H: `nulMapInnerName` is deleted with the predicates it left, 2026-11-12
+- [2026-11-12-step7-variant-name-reads-cut-3](2026-11-12-step7-variant-name-reads-cut-3.md): Step 7, L6: `mvValArmOfShapeTy` is deleted, 2026-11-12
+- [2026-11-12-step7-union-reg-rvu-of-ty](2026-11-12-step7-union-reg-rvu-of-ty.md): Step 7 L6 (lane G, cut 5a): a value union is registered from its type, 2026-11-12
+- [2026-11-12-step7-union-reg-rvu-floors](2026-11-12-step7-union-reg-rvu-floors.md): Step 7 L6 (lane G, cut 5c): the value-union floors, each converted or under a contract, 2026-11-12
+- [2026-11-12-step7-union-reg-riu-55](2026-11-12-step7-union-reg-riu-55.md): Step 7 L6 (lane G, cut 5b): the inline registrar's value union is named by its type, 2026-11-12
+- [2026-11-12-step7-union-reg-let-if-box-by-type](2026-11-12-step7-union-reg-let-if-box-by-type.md): Step 7 L6 (lane G): a `let`-`if` binding's box is named by its type, 2026-11-12
+- [2026-11-12-step7-union-name-readers-by-set](2026-11-12-step7-union-name-readers-by-set.md): Step 7 L6: five more `unionNameOfExpr` readers ask the box's member set; census 5 re-graded, 2026-11-12
+- [2026-11-12-step7-union-name-gates-by-rep](2026-11-12-step7-union-name-gates-by-rep.md): Step 7 L6: five `unionNameOfExpr` gates ask the receiver's rep; the name read leaves them, 2026-11-12
+- [2026-11-12-step7-union-arm-tested-row-by-type](2026-11-12-step7-union-arm-tested-row-by-type.md): Step 7 L6 (lane A, for lane G): `isTestedRowIn` answers by type, not by its arm's spelling, 2026-11-12
+- [2026-11-12-step7-struct-name-producers-cut-2](2026-11-12-step7-struct-name-producers-cut-2.md): Step 7, L6: the struct name producers, cut 2, 2026-11-12
+- [2026-11-12-step7-lane-e-struct-elem-lowerable-ty](2026-11-12-step7-lane-e-struct-elem-lowerable-ty.md): Step 7 L2: a closure-result list field's element is judged by its type; five emit_base predicates deleted with their last callers, 2026-11-12
+- [2026-11-12-step7-lane-e-base-callers-typed](2026-11-12-step7-lane-e-base-callers-typed.md): Step 7 L2: emit_base's scalar-list predicates' last callers read the type; eleven predicates deleted, 2026-11-12
+- [2026-11-12-step7-l2-mono-wide-arms-by-type](2026-11-12-step7-l2-mono-wide-arms-by-type.md): Step 7 L2: a narrowed pin's niche and nullable-record rungs read the wide pin's arms from its type, 2026-11-12
+- [2026-11-12-step7-l2-mono-inline-rec-pin-by-type](2026-11-12-step7-l2-mono-inline-rec-pin-by-type.md): Step 7 L2: an inline record pin is spelled from its type, 2026-11-12
+- [2026-11-12-step7-l2-mono-field-elem-row-by-type](2026-11-12-step7-l2-mono-field-elem-row-by-type.md): Step 7 L2: a struct-field argument's pin is the field's recorded type, 2026-11-12
+- [2026-11-12-step7-elem-nominal-by-type](2026-11-12-step7-elem-nominal-by-type.md): Step 7: whether a list element is keyed nominally is asked of its type; `elemNameIsNominal` is deleted, 2026-11-12
+- [2026-11-12-dead-test-by-declared-type](2026-11-12-dead-test-by-declared-type.md): An impossible test is an error only by its declared types, 2026-11-12
+- [2026-11-12-w311-reflist-cut5-open-template-field-by-type](2026-11-12-w311-reflist-cut5-open-template-field-by-type.md): Step 7 L6: a template field's open ref-list row is keyed by its type; `rlSlotByName` is deleted, 2026-11-12
+- [2026-11-12-w311-reflist-cut4-d15778-ref-list-field-by-type](2026-11-12-w311-reflist-cut4-d15778-ref-list-field-by-type.md): Step 7 L2: a shape's ref-list field names its element by type, and the refArr* name cluster is deleted (D15778), 2026-11-12
+- [2026-11-12-w311-reflist-cut3-shape-map-field-spelling-legs](2026-11-12-w311-reflist-cut3-shape-map-field-spelling-legs.md): Step 7 L2: the shape-text recorder's map-field spelling legs are deleted, 2026-11-12
+- [2026-11-12-step7-vkind-push-dest-rung-ruled](2026-11-12-step7-vkind-push-dest-rung-ruled.md): Step 7, lane H: `pushDestVKind`'s struct-row rung is filed as ruled, 2026-11-12
+- [2026-11-12-step7-vkind-push-dest-kind-of-type](2026-11-12-step7-vkind-push-dest-kind-of-type.md): Step 7, lane H: a push destination's kind is read off the element type, 2026-11-12
+- [2026-11-12-step7-vkind-nulnone-by-type](2026-11-12-step7-vkind-nulnone-by-type.md): Step 7, lane H, cut 5: a field stored as `null` is the null unit by its rep, 2026-11-12
+- [2026-11-12-step7-vkind-ladder-union-reads-typed](2026-11-12-step7-vkind-ladder-union-reads-typed.md): Step 7, lane H, cut 3: the field-code ladder reads no spelling, 2026-11-12
+- [2026-11-12-step7-vkind-ladder-list-arms-by-rep](2026-11-12-step7-vkind-ladder-list-arms-by-rep.md): Step 7, lane H, cut 4: a list field the descriptor declines is coded from its rep, 2026-11-12
+- [2026-11-12-step7-vkind-field-code-ladder-declined-only](2026-11-12-step7-vkind-field-code-ladder-declined-only.md): Step 7, lane H, cut 2: the field-code ladder keeps only the arms the descriptor declines to, 2026-11-12
+- [2026-11-12-step7-variant-name-reads-cut-2](2026-11-12-step7-variant-name-reads-cut-2.md): Step 7, L6: `variantIndexOf`'s sites graded, and cut 2, 2026-11-12
+- [2026-11-12-step7-unreached-floors](2026-11-12-step7-unreached-floors.md): Step 7: the floor audit's unreached sites, deleted or re-graded, 2026-11-12
+- [2026-11-12-step7-union-reg-riu-value-union](2026-11-12-step7-union-reg-riu-value-union.md): Step 7 L6 (lane G, cut 4b): the inline union registrar's value-union verdict by type, 2026-11-12
+- [2026-11-12-step7-union-reg-riu-members](2026-11-12-step7-union-reg-riu-members.md): Step 7 L6 (lane G, cut 4c): the inline union registrar reads its members' types, not its spelling's atoms, 2026-11-12
+- [2026-11-12-step7-union-reg-riu-clo-shape](2026-11-12-step7-union-reg-riu-clo-shape.md): Step 7 L6 (lane G, cut 4d): the closure-result union and the registrar's shape test by type, 2026-11-12
+- [2026-11-12-step7-lane-e-mono-typaram-of-ty](2026-11-12-step7-lane-e-mono-typaram-of-ty.md): Step 7 L2: a bare type-parameter annotation is read from its type (one parse fewer), 2026-11-12
+- [2026-11-12-step7-lane-e-functype-walk-typed](2026-11-12-step7-lane-e-functype-walk-typed.md): Step 7 L2: the function-type shape walk dispatches on the type; `annFnDecompose` is gone, 2026-11-12
+- [2026-11-12-step7-l2-mono-union-atoms-by-type](2026-11-12-step7-l2-mono-union-atoms-by-type.md): Step 7 L2: emit_mono's last union-spelling splits ask the type; an unreached rung is deleted, 2026-11-12
+- [2026-11-12-step7-l2-mono-pin-union-name-by-type](2026-11-12-step7-l2-mono-pin-union-name-by-type.md): Step 7 L2: mono's union pin name is canon'd by its type, 2026-11-12
+- [2026-11-12-step7-l2-mono-cell-lam-by-type](2026-11-12-step7-l2-mono-cell-lam-by-type.md): Step 7 L2: a capture cell's hole lambda is matched by type, 2026-11-12
+- [2026-11-12-step7-l2-mono-ann-pin-by-type](2026-11-12-step7-l2-mono-ann-pin-by-type.md): Step 7 L2: the annotation ladder answers from the pin's type, 2026-11-12
+- [2026-11-12-step7-jr-i32-list-rung-deleted](2026-11-12-step7-jr-i32-list-rung-deleted.md): Step 7 L2: `jrFieldFitsAt`'s `FC_I32_LIST` rung is deleted, 2026-11-12
+- [2026-11-12-step7-equality-vectors-graded](2026-11-12-step7-equality-vectors-graded.md): Step 7 L6: the three unexplained equality vectors, graded, 2026-11-12
+- [2026-11-12-step7-closing-census-5](2026-11-12-step7-closing-census-5.md): Step 7 closing census 5: the floor audit
+- [2026-11-12-step7-closing-census-4](2026-11-12-step7-closing-census-4.md): Step 7 closing census 4: every L2 and L6 exit item on master, with its owner or floor
+- [2026-11-12-step7-classifier-pairs-graded](2026-11-12-step7-classifier-pairs-graded.md): Step 7 L2 exit: the two-producer rep classifiers, graded, 2026-11-12
+- [2026-11-12-flow-reads-function-face-measured](2026-11-12-flow-reads-function-face-measured.md): Flow-sensitive reads, the function-valued face: measured, 2026-11-12
+- [2026-11-12-flow-reads-annotated-union-face](2026-11-12-flow-reads-annotated-union-face.md): Flow-sensitive reads, the annotated-union face, 2026-11-12
+- [2026-11-12-d15959-clo-sig-reject-names-its-type](2026-11-12-d15959-clo-sig-reject-names-its-type.md): D15959: a function-value call's emit refusal names its type, 2026-11-12
 - [2026-11-12-w311-reflist-cut2-closed-type-keys-nominal-mints](2026-11-12-w311-reflist-cut2-closed-type-keys-nominal-mints.md): Step 7 L6: a ref-list row a nominal spelling names is keyed by its closed element type, 2026-11-12
 - [2026-11-12-w311-reflist-cut1-list-of-row-by-type](2026-11-12-w311-reflist-cut1-list-of-row-by-type.md): Step 7 L6: a list of a record row is found by its element type, and `forceRefListOfTy` keys by type, 2026-11-12
 - [2026-11-12-step7-vkind-field-code-ladder-typed](2026-11-12-step7-vkind-field-code-ladder-typed.md): Step 7, lane H, cut 1: the field-code ladder reads no spelling without a type, 2026-11-12

@@ -88,13 +88,16 @@ A view-rep storage receives:
 * **Gates:** `plumb-shape-cost.vl` (fuel +5%) and `seed-size.vl` (+3%) should not move for
   programs without view storage. A cost probe per position belongs in the first PR.
 
-## Open questions for the owner
+## Owner rulings (2026-11-12)
 
-1. Implicit or spelled? Should a `Pos` slot silently become a view, with a hidden indirection
-   on every access, or should the source spell it (`view Pos`, or a `readonly` record)? A
-   spelled view makes the cost visible. An implicit one makes the 17 cells run as written.
-2. `is` narrowing from a view back to its concrete record: allowed, or out of scope?
-3. Equality: identity of the underlying record, as above, or refuse `==` on views?
+The status of each lives in `open-rulings.md`.
+
+1. `width-view-implicit-or-spelled`: **implicit.** Storage that receives two layouts becomes a
+   view with nothing spelled.
+2. `width-view-is-narrowing`: **allowed.** `is A` on a view tests its shape and narrows.
+3. `width-view-equality`: **same concrete type, then every field**, not identity. `==` is
+   structural in VL, so the "Identity, equality and mutation" section above is superseded on
+   `==`; reference identity is `===` (D15975).
 
 ## Estimated PR sequence
 

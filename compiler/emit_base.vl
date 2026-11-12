@@ -32,10 +32,14 @@ import {
   TyVar,
   litUnionAliasNameOfTy,
   litUnionInlineNameOfTy,
+  numLitUnionBaseTy,
   tyArrayElemIx,
   tyAt,
   tyIsLitUnion,
+  tyIsLitUnionOrLit,
   tyIsNulStringRep,
+  tyIsNullableLitUnion,
+  tyIsPrimNamed,
   tyMentionsTyVarNamed,
   tyNulInnerIsPrim,
 } from "./check_types"
@@ -56,30 +60,19 @@ import { isPatTyIxOf, isVarTyIxOf, luIsTyOf } from "./check_list_union"
 // none — every emitter module asks the home directly. The layering is one-directional:
 // `emit_base.vl` imports `typecheck.vl`, which imports nothing from `emit_*`, avoiding a cycle.
 import {
-  arrElemIs,
-  arrElemIsArrayOf,
   arrElemNameRaw,
   fieldNameOf,
   fieldTypeTextOf,
-  fnParamsTextOf,
-  fnRetTextOf,
   groupInnerOf,
-  listElemNameOf,
   mapSpellKeyName,
-  nameIsArray,
   nameIsBraceSpanEnds,
-  nameIsFuncTypeAtom,
   nameIsMapOpen,
-  nameIsMapSpan,
-  nameIsParenOpen,
   nameIsParenSpanEnds,
   nameIsShapeOpen,
   spanEqAt,
   tyGroupEndIndex,
   tyTopIndexOf,
   tyTopLevelSplit,
-  unionMemberCount,
-  unionMemberCountSpan,
 } from "./tyname"
 import {
   ArrayLit,
@@ -138,11 +131,8 @@ import { hexVal } from "./strutil"
 import {
   MAP_KEY_I32,
   MAP_KEY_I64,
-  isValueUnionName,
   mapKeyKindOfTy,
   nameIsI32HashedLitUnion,
-  nameIsLitUnionType,
-  nameIsOneStrLit,
   valueAtomKind,
 } from "./check_ty_rep"
 
@@ -1564,21 +1554,6 @@ export function loopStackFind(labels: string[], label: string) {
   }
   -1
 }
-// The value type-name of a synthetic map type-name `{[K]:V}` — the text after the first
-// "]:", minus the closing `}`; "" if the name is not that shape. Not `tyname.mapSpellValName`,
-// despite the same cut: that one gates on a closing `}`, this one gates on `nameIsMap` (opens
-// `{[`, does not end `[]`), so this one accepts `{[string]:i32}|null` and returns garbled text where the checker's twin returns "".
-export function mapValNameOf(name: string) {
-  if !nameIsMap(name) { return "" }
-  let i = 2
-  while i < name.length - 1 {
-    if name[i] == ']' {
-      if name[i + 1] == ':' { return name.slice(i + 2, name.length - 1) }
-    }
-    i = i + 1
-  }
-  ""
-}
 // Maps a binary operator lexeme to its i32 wasm opcode, or -1 if unsupported. The three
 // arithmetic ops and the six signed i32 comparisons are recognized; anything else (`/`, `%`,
 // `=`, logical `&&`/`||`, …) falls through to -1 so the caller fails loudly rather than
@@ -2505,35 +2480,6 @@ export function tyIsNulBool(tyIx: i32) {
 // not the already-imported `nodeTyWidenedRepName` — the widened form is a superset (it also
 // accepts a softened litunion arm), and using a superset for this exact scalar test is unsound in general even though the two happen to agree for the literal `"boolean"` constant.
 export function tyIsBool(tyIx: i32) { nodeTyPrimName(tyIx) == "boolean" }
-// A `string | null` field type name — the niche field (code 20): a `(ref null $sTypeIdx)`
-// storage slot (the array backing a string), the field analogue of the kind-16 local.
-export function nameIsNulString(name: string) {
-  nullablePartOf(name) == "string"
-}
-// A `boolean | null` field type name — the niche field (code 21): an i32 storage slot
-// holding 0/1 with the spare value 2 = `null` (the field analogue of the sentinel local).
-export function nameIsNulBool(name: string) {
-  const b = nullablePartOf(name)
-  b == "boolean"
-}
-// True if `name` is a 1-D `(boolean | null)[]` list — a list of the boolean sentinel niche.
-// Its backing is the same `(array (mut i32))` as `boolean[]`/`i32[]`: each element is an i32
-// holding 0/1, with the spare value 2 = `null`. So it rides the i32-list machinery
-// (`nameIsI32Array`), not the union-box ref-list. A nested `(boolean|null)[][]` is not this — only the single-level list.
-export function nameIsNulBoolList(name: string) {
-  const elem = listElemNameOf(name)
-  if elem == "" { return false }
-  nameIsNulBool(elem)
-}
-// True if `name` is a 1-D `(string | null)[]` list — a list of the string ref made nullable.
-// Its backing is the same string list as `string[]`: a `string[]` element is already a
-// nullable ref at the wasm level, so only construct/read differ (`null → ref.null
-// $aTypeIdx`, narrowed with `!= null`). Rides the string-list machinery, not the union-box ref list; a nested `(string|null)[][]` is not this.
-export function nameIsNulStrList(name: string) {
-  const elem = listElemNameOf(name)
-  if elem == "" { return false }
-  nameIsNulString(elem)
-}
 // The re-quoted source lexeme for a literal-union member's inner text (`i32` -> `"i32"`) —
 // matches the raw `StrLit.strText` so `internAtom` yields the same id, and feeds a synthetic
 // `StrLit` for printing. Homed down here because membership ("is this default `StrLit` one of
@@ -2554,51 +2500,7 @@ export function litLexIsMember(lex: string, texts: string[]) {
   }
   false
 }
-// True if `name` is a 1-D `(K | null)[]` list — a list of the literal-union atom made
-// nullable via the i32 niche. Each element is an i32 holding a member id (>= 0) with the
-// spare value -1 = `null`. Rides the i32-list machinery (`nameIsI32Array`), not the
-// union-box ref-list: a member element lowers as its atom id, `null` as -1, and a read narrows by comparing against -1.
-export function nameIsNulLitUnionList(name: string) {
-  const elem = listElemNameOf(name)
-  if elem == "" { return false }
-  nameIsNulLitUnion(elem)
-}
-// A nullable literal-union type name — `K | null` / `"a" | "b" | null` (the i32 atom niche):
-// member ids intern >= 0 and the spare value -1 encodes `null`. `canonEmitName` preserves the
-// litunion (`nulLitUnionPreserve`) so members survive here. A caller holding the type asks
-// `nulLitUnionInnerNameOfTy` for the non-null part's name instead.
-export function nameIsNulLitUnion(name: string) { nulLitUnionScan(name) }
 
-// The predicate, decided without building anything: a two-part `X | null` whose `X` is a
-// literal set, or a top-level `null` beside 2+ quoted members, scanned in span form.
-function nulLitUnionScan(name: string): boolean {
-  const b = nullablePartOf(name)
-  if b != "" { return nameIsStrLitSet(b) }
-  // The first member must be `null` or a quoted literal, which its first byte already rules
-  // out for any other name, before a scan for its end.
-  if name.length < 2 { return false }
-  if name[0] != '"' && !(name.length >= 4 && spanEqAt(name, 0, 4, "null")) {
-    return false
-  }
-  let lits = 0
-  let hasNull = false
-  let start = 0
-  let going = true
-  while going {
-    const at = tyTopIndexOf(name, '|', '=', start)
-    let end = name.length
-    if at >= 0 && name[at] != '=' { end = at } else { going = false }
-    if spanEqAt(name, start, end, "null") {
-      hasNull = true
-    } else {
-      if end - start < 2 { return false }
-      if name[start] != '"' { return false }
-      lits = lits + 1
-    }
-    if going { start = at + 1 }
-  }
-  hasNull && lits >= 2
-}
 // The non-null union name a `K | null` niche of arena type `ty` records: the literal union's
 // alias (a written `K`, or an annotated inline set's hidden one, as the anonymous twin
 // `anonFieldElemName` records), else its inline member spelling. "" when `ty` is not the niche.
@@ -2787,13 +2689,6 @@ export function isConstInit(exprIx: i32) {
   }
   false
 }
-// ── the array-name grammar: `nameIsArray` tests it, `arrElemNameRaw` cuts it ──
-// Both homes are in `tyname.vl` (D-ARRDOWN); this file only layers over them (`typecheck.vl`
-// cannot import this one). `nameIsElemArray` is `nameIsArray` minus the degenerate `"[]"`, agreeing with `arrElemNameRaw(name) != ""` by construction — a layer, not a copy, since routing through the cut would allocate a slice to answer a boolean in inner loops.
-export function nameIsElemArray(name: string) {
-  if name.length < 3 { return false }
-  nameIsArray(name)
-}
 // The one home for the array-dimension peel: `name` with every trailing `[]` pair removed. A
 // non-array name is its own leaf (never ""), matching what every hand-written copy did. It is
 // the cut home applied to fixpoint, not a second copy: the loop calls `arrElemNameRaw` and
@@ -2807,89 +2702,31 @@ export function arrLeafNameOf(name: string) {
   }
   leaf
 }
-// ── the paren grammar and scalar-array classifiers, homed in `tyname.vl` ──
-// The two paren walks are not one: `peelGroupParens` rides `parenEnclosesWhole`, `normTypeAtom`
-// rides `tyGroupWrapsWhole`, and they differ on a group that never closes (false vs. true) — a
-// site spelling the comparison out instead of calling one of the two merges that silently.
-export function nameIsI32Array(name: string) {
-  // The two i32-backed leaf spellings share one cut — `nameIsI32Array`'s own header explains the family.
-  if arrElemIs(name, "i32") || arrElemIs(name, "boolean") { return true }
-  // `(boolean | null)[]` shares the exact i32-list backing: each element is an i32 0/1
-  // with the spare value 2 = `null` (the sentinel niche). Only the `null → 2` element
-  // coercion + the sentinel-aware read/print differ (see `nameIsNulBoolList`).
-  if nameIsNulBoolList(name) { return true }
-  // A literal-union array (`K[]`, or an inline `("a"|"b")[]`) — its elements are interned-i32
-  // ATOMS, so it shares the i32 backing/rep EXACTLY like `i32[]`. (Member literals lower as
-  // their ids; reads yield the atom.)
-  if nameIsLitUnionArray(name) { return true }
-  // A `(K | null)[]` shares the exact i32-list backing: each element is an i32 member id (≥ 0)
-  // with the spare value `-1` = `null` (the atom-niche analogue of `(boolean | null)[]`). Only the
-  // `null → -1` element coercion + the sentinel-aware read differ (see `nameIsNulLitUnionList`).
-  if nameIsNulLitUnionList(name) { return true }
-  // `null[]` shares it too, every element the sentinel 2 (D4671).
-  arrElemIs(name, "null")
+// Whether `ty` is a list on the i32-list backing: an element of `i32`, `boolean` or `null`, a
+// string-literal set, or the sentinel niche of `boolean | null` or a literal set with `null`.
+export function tyIsI32List(ty: i32): boolean {
+  const e = tyArrayElemIx(ty)
+  if e < 0 { return false }
+  const t = tyAt(e)
+  if t is TyPrim {
+    return t.primName == "i32"
+      || t.primName == "boolean"
+      || t.primName == "null"
+  }
+  if tyIsLitUnionOrLit(e) { return true }
+  if tyIsPrimNamed(numLitUnionBaseTy(e), "i32") { return true }
+  if tyNulInnerIsPrim(e, "boolean") { return true }
+  tyIsNullableLitUnion(e)
 }
-// True if `name` is `<litunion>[]` — an array whose element type is a literal union. The element
-// name is `name` minus the trailing `[]` (a parenthesized inline union keeps its parens, which
-// `nameIsLitUnionType` -> `nameIsInlineLitUnion` tolerates via the union split).
-export function nameIsLitUnionArray(name: string) {
-  const elem = listElemNameOf(name)
-  if elem == "" { return false }
-  nameIsStrLitSet(elem)
+// Whether `ty` is a list on the string-list backing: a `string` or `string | null` element.
+export function tyIsStrList(ty: i32): boolean {
+  const e = tyArrayElemIx(ty)
+  if e < 0 { return false }
+  tyIsPrimNamed(e, "string") || tyNulInnerIsPrim(e, "string")
 }
-// Whether `name` is a string-literal set: a literal union, or one quoted literal, which is its
-// one-member set at a list element or beside `null` and so the atom there (D7340, D7446).
-export function nameIsStrLitSet(name: string) {
-  nameIsLitUnionType(name) || nameIsOneStrLit(name)
-}
-// True if `name` is a 2-D array whose element is an i32-backed scalar list — `i32[][]`,
-// `boolean[][]`, or a literal-union `K[][]`. All three share the `i32[][]` rep exactly: the
-// element is the i32-list wrapper (ref-list element kind 4), since `i32[]`, `boolean[]` and a
-// litunion `K[]` share one i32[] backing (`nameIsI32Array`). A deeper `i32[][][]` is not this — only a single i32-backed leaf list qualifies.
-export function nameIsI32ListArray(name: string) {
-  // The element must itself be a list for any arm of `nameIsI32Array` to fire, so `name` must
-  // be `X[][]` — four character reads, no cut. The two cheap arms are asked in place
-  // (`arrElemIsArrayOf`); anything that passes the guard and fails both falls through to the
-  // full predicate rather than re-deriving it, so a partial reimplementation here cannot drift from the source of truth.
-  if !nameIsArray(name) { return false }
-  const to = name.length - 2
-  if to < 2 { return false }
-  if name[to - 2] != '[' { return false }
-  if name[to - 1] != ']' { return false }
-  if arrElemIsArrayOf(name, "i32") { return true }
-  if arrElemIsArrayOf(name, "boolean") { return true }
-  nameIsI32Array(arrElemNameRaw(name))
-}
-// True if `name` is a string-keyed map — the synthetic name `parseType` builds for an index
-// signature; the lowering assumes string keys. Distinct from `nameIsMapOpen` (`tyname.vl`):
-// that one also accepts a list-of-maps (`{[string]:i32}[]`), so a caller asking "does this
-// name START a map" — a union arm that must not fall into the map-value recursion — wants the opener, not this one.
-export function nameIsMap(name: string) {
-  // The map-name opener at its home, carrying its own `length >= 2` bound (this spelled the
-  // same two character compares out inline behind the same bound).
-  if !nameIsMapOpen(name) { return false }
-  // A trailing `[]` makes it a LIST of maps, not a bare map — the array-name grammar's
-  // TEST half, at its home. (This spelled the same two character compares out inline; at
-  // length >= 2 the two readings accept exactly the same names.)
-  !nameIsArray(name)
-}
-// True if `name` is a union whose first atom is a map (`{[string]: V} | …`) — a name that both
-// starts with `{[` (matching `nameIsMap`) and has 2+ top-level atoms. Such a name is a variant
-// box, not a bare map, and must not be classified as a map local/return/value/field/list
-// element. A bare map has one top-level atom (a union-valued map's inner `|` sits inside the braces).
-export function nameIsMapMemberUnion(name: string) {
-  if !nameIsMap(name) { return false }
-  // Count, don't materialize: this built the whole atom array and read only its length.
-  // `unionMemberCount` is that query without allocating the strings, sharing the top-level
-  // `=>` rule that keeps `(i32) => i32 | string` one member.
-  unionMemberCount(name) >= 2
-}
-// True if `name` is a bare map (`{[string]: V}`) — `nameIsMap(name) && !nameIsMapMemberUnion(name)`,
-// named once for callers that hold a string with no type node (an atom peeled from a union,
-// `nameIsMapArray`'s element). A node-holding caller asks the arena instead
-// (`typecheck.nodeTyIsMap`, D-BAREMAP) — `true` for a bare map, `false` for a `TyUnion` with a map arm.
-export function nameIsBareMap(name: string) {
-  nameIsMap(name) && !nameIsMapMemberUnion(name)
+// Whether `ty` is a list whose element is a string-literal set, one literal included.
+export function tyIsStrLitSetList(ty: i32): boolean {
+  tyIsLitUnionOrLit(tyArrayElemIx(ty))
 }
 // The one home of the emitter's key question: does the map spelling `name` carry an i32 key
 // (`{[i32]: V}`)? Reads the map-name grammar's key cut at its home (`mapSpellKeyName`,
@@ -2915,8 +2752,7 @@ export function mapShapeFoldSet(sh: i32) {
   sh
 }
 // True if the type-annotation node at `tyIx` is a nullable bare map (`{[string]: V} | null`) —
-// the arena dual of `nulMapInnerName` on the node's rendering, and the nullable twin of
-// `nodeTyIsMap`. A `TyNullable` over a `TyMap`: the `| null` peel and the bare-map test the
+// the nullable twin of `nodeTyIsMap`. A `TyNullable` over a `TyMap`: the `| null` peel and the bare-map test the
 // name pair spells as two scans are one walk down two variant tags, with no union split and no substring.
 export function tyIsNulBareMap(tyIx: i32) {
   const ty = nodeTyIxOf(tyIx)
@@ -2929,107 +2765,7 @@ export function tyIsNulBareMap(tyIx: i32) {
   }
   false
 }
-// True if the array type-name `name` is a string-keyed-MAP list `{[string]:i32}[]` —
-// a ref list whose ELEMENT is the map struct (`mStructIdx`). It is a `nameIsMap` name
-// with a trailing `[]`. The scope chain (`typecheck.vl`'s `scopes: {[string]:i32}[]`)
-// is exactly this. Routed through the ref-list machinery as element-kind `3`.
-export function nameIsMapArray(name: string) {
-  // The bare element (without the trailing `[]`) must be a bare map name, not a map-member union
-  // (`({[string]: i32} | boolean)[]` also starts with `{[`) — that is a union-box ref list (kind
-  // 2), not a list-of-maps (kind 3). The cut stays raw (`arrElemNameRaw`, not `listElemNameOf`)
-  // deliberately: unreached is not the same claim as licensed. Asked in place rather than cut out first, since slicing would allocate on every call.
-  if !nameIsArray(name) { return false }
-  const to = name.length - 2
-  if to == 0 { return false }
-  if !nameIsMapSpan(name, 0, to) { return false }
-  unionMemberCountSpan(name, 0, to) < 2
-}
-// True if `name` is an array of functions — `((i32) => i32)[]`: a trailing `[]` whose element
-// is a fully-parenthesized function type with the arrow nested (depth > 0). A top-level arrow
-// (`(i32) => i32[]`) is a function returning a list, not an array of functions — excluded via
-// `annArrowAt`. The element heap type is the shared closure fat-pointer struct; ref-list element kind 5.
-export function nameIsClosureArray(name: string) {
-  const n = name.length
-  if n < 4 { return false }
-  // The array-name grammar at its two homes. The TEST stays in front of the `annArrowAt`
-  // walk exactly as the inline compares did — running that walk on a non-array name would
-  // be a work regression — and the CUT stays behind it, so no name pays for a slice it is
-  // about to be rejected for.
-  if !nameIsArray(name) { return false }
-  if annArrowAt(name) >= 0 { return false }
-  const elem = arrElemNameRaw(name)
-  // The PAREN grammar's OPEN half at its home. The separate `elem.length < 1` reject this
-  // replaced is the home's own bound, so the empty element still declines before the
-  // `nameIsFuncTypeAtom` walk below rather than indexing out of bounds.
-  if !nameIsParenOpen(elem) { return false }
-  // The element must be a genuine function type — a top-level arrow (paren-aware, after
-  // peeling grouping parens). A bare `=>` substring test also matches a union whose first
-  // member is a closure (`(() => i64) | i64`, arrow nested inside the first member),
-  // mis-typing it as a closure ref list — a raw slot the boxed value could not store (invalid wasm).
-  nameIsFuncTypeAtom(elem)
-}
-// The VALUE-union element name of a parenthesized union-array annotation:
-// `(string|i32)[]` → `string|i32` (`canonEmitName` keeps a union element's
-// grouping parens), or "" when `name` is not a value-union array name.
-// Registration-independent (classifies from the atom set, not `unNames`).
-export function parenUnionArrElemName(name: string) {
-  if name.length < 5 { return "" }
-  // A top-level arrow makes this a function type returning an array
-  // (`(i32) => (string | {w: i32})[]`), not a value-union array. Without this guard, the
-  // `name[0]=='('`/`name[len-3]==')'` checks below would match the closure's outer parens,
-  // mis-typing the whole closure local as a union-box ref list.
-  if annArrowAt(name) >= 0 { return "" }
-  // The array-name grammar's TEST half, at its home (this spelled the same two character
-  // compares out inline; `name.length >= 5` is already established above).
-  if !nameIsArray(name) { return "" }
-  // The paren grammar's span, asked of the element rather than the whole name.
-  // `arrElemNameRaw(name)` is `name` minus exactly its final two characters (established one
-  // line above via `nameIsArray`), so this pair is `nameIsParenSpanEnds(elem)` character for
-  // character on every input, and the home's own `length >= 1` bound is covered by `name.length >= 5`.
-  if !nameIsParenSpanEnds(arrElemNameRaw(name)) { return "" }
-  // The whole name must be ONE atom — a multi-arm union that merely STARTS with a paren
-  // group and ENDS with `[]` (`(boolean|string)[] | (i32|f64)[]`) would otherwise slice an
-  // UNBALANCED "inner" (`boolean|string)[]|(i32|f64`) and mis-classify the whole union as
-  // a single union-array, derailing its registration.
-  if unionMemberCount(name) > 1 { return "" }
-  const inner = name.slice(1, name.length - 3)
-  // A `(boolean | null)[]` element is the i32 sentinel niche, not a box: it reps as a plain i32
-  // list (`nameIsI32Array`), so it must not read as a union-box ref-array element here. Returns
-  // "" so `nameIsRefArray`/`refArrElemKind` skip it and land on the i32-list path (scalar
-  // `boolean | null` is likewise a niche, excluded by `isValueUnionName` already).
-  if nameIsNulBool(inner) { return "" }
-  // A `(string | null)[]` element is the string ref niche (a `(ref null $sTypeIdx)` string), not a
-  // box: it reps as a plain string list (`nameIsNulStrList`), so it must NOT read as a union-box
-  // ref-array element here. Return "" so `nameIsRefArray` / `refArrElemKind` skip it and it lands on
-  // the string-list path. (Scalar `string | null` is likewise a niche, not a value union.)
-  if nameIsNulString(inner) { return "" }
-  // A `(K | null)[]` element is the litunion atom NICHE (an i32 member id with `-1` = `null`), not a
-  // box: it reps as a plain i32 list (`nameIsNulLitUnionList` → `nameIsI32Array`), so it must NOT read
-  // as a union-box ref-array element here. Return "" so `nameIsRefArray` / `refArrElemKind` skip it
-  // and it lands on the i32-list path. (Scalar `K | null` is likewise a niche, not a value union.)
-  if nameIsNulLitUnion(inner) { return "" }
-  if isValueUnionName(inner) { return inner }
-  // A struct / heterogeneous union element (`(C | S)[]`, `(A | i32)[]`): the parens are
-  // annotation grouping only, and the element slots hold the same `{tag, payload}` boxes a
-  // value-union element does (element kind 2, heap `uBoxIdx`). A top-level `|` in a type position
-  // is always a union, distinguishing it from a parenthesized non-union element (`((i32) => i32)[]`).
-  if unionMemberCount(inner) > 1 { return inner }
-  ""
-}
 
-// True if the type-name `name` is exactly `string[]` — a growable list whose elements
-// are string refs. It reuses the map keys list types (the `{backing,len,cap}` wrapper
-// over a `(ref null $sTypeIdx)` string backing); field code `6`.
-export function nameIsStringArray(name: string) {
-  // Element-name compare over the array grammar's one cut — see the family note at
-  // `nameIsI32Array`.
-  if arrElemIs(name, "string") { return true }
-  // `(string | null)[]` shares the exact string-list backing (`$mkListIdx` wrapper, `(ref null
-  // $sTypeIdx)` string backing — a `string[]` element is already a nullable ref). It rides the
-  // string-list machinery uniformly; only the element read diverges (kept `(ref null)`,
-  // intercepted by `exprNulStrArray`) and a `null` element/push/assign lowers as `ref.null`.
-  nameIsNulStrList(name)
-}
 // True if the node at `ix` is a struct `type` declaration (a single-level narrowing
 // helper, so callers avoid an inline `is TypeDecl` on the wide `Node` union).
 export function nodeIsTypeDecl(ix: i32) {
@@ -3291,23 +3027,6 @@ export function callMemProp(exprIx: i32) {
 // a monomorphized instance's synthetic annotation (`"=>ii>i"` → `"ii>i"`), or "" when `name` is
 // not such a param of function `fnIx`. Below: top-level (paren/brace/bracket depth 0) index of `=>` in a synthetic function-type name, or -1.
 export function annArrowAt(name: string) { tyTopIndexOf(name, '=', 0, 0) }
-// The one home of the function-type decomposition `(p1, p2) => ret`: fills `outParams` with
-// the top-level parameter annotations and returns the return annotation, or "" when `ann` is
-// not a fully-parenthesized function type. The empty param list is not split (`() => R`
-// yields no params): `annSplitParams` would push one empty part, which no caller can bind.
-export function annFnDecompose(ann: string, outParams: string[]) {
-  const fa = annArrowAt(ann)
-  if fa < 1 { return "" }
-  // The PAREN grammar's OPEN half at its home; `fa >= 1` above already implies the bound.
-  // The CLOSE test stays inline — this is the ARROW-relative spelling, closing the param
-  // list at `fa - 1`, where the LAST character belongs to the return annotation.
-  if !nameIsParenOpen(ann) { return "" }
-  if ann[fa - 1] != ')' { return "" }
-  // Both CUTS are `tyname.fnParamsTextOf` / `fnRetTextOf` (W4), given the index above.
-  const inner = fnParamsTextOf(ann, fa)
-  if inner.length > 0 { annSplitParams(inner, outParams) }
-  fnRetTextOf(ann, fa)
-}
 // The one home of the inline object-shape decomposition `{a:T,b:U}`: fills `outNames`/
 // `outTexts` with the top-level field names and type texts, returning 1 for an object shape,
 // 0 for a map (`{[`), -1 otherwise. The tri-state is load-bearing — a map must stay
@@ -3401,7 +3120,7 @@ function structLitUnionFieldAt(ty: i32, depth: i32): boolean {
 }
 // Split a function-type PARAM list (`i32,f64,S`) on top-level commas (depth-aware) —
 // the KEEP-empty reading of the shared depth walk, so an empty param list yields ONE
-// empty part (see `annFnDecompose`'s guard, and D-GRAMHOME's S5 fixture).
+// empty part (D-GRAMHOME's S5 fixture).
 export function annSplitParams(s: string, out: string[]) {
   tyTopLevelSplit(s, ',', false, out)
 }

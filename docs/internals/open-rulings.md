@@ -749,14 +749,89 @@ on top of the dynamic-step work — but it must REQUIRE the step, because the in
 default is what makes `for x in 0.0 to 1.0` a one-iteration loop nobody meant to write. (c) is
 the trap: it looks like the i32 loop and its count is not a property of the source.
 
-### write-narrowed-dead-test — is a test a write made impossible an error? — RULED (coordinator) 2026-11-12, owner may overrule
+### write-narrowed-dead-test — is a test a write made impossible an error? — RULED (owner) 2026-11-12: a warning; errors only for declared types
 
 `let x: i32 | string = 1; x = "s"; if x is i32 { … }` reads `x` as `string` under the flow-reads
-ruling, so the test can never match. The coordinator ruled it an ERROR, as D2198 refuses any
-impossible `is` member and as a guard narrowing already does (DECISIONS.md, "A WRITE'S NARROWING
-MEETS THE SAME REFUSAL"). An always-true test stays legal. The alternatives were a dead-test
-warning, mirroring the dead-null-test ruling, or testing at storage with no diagnostic. The price
-is 11 programs, rewritten.
+ruling, so the test can never match. **The owner's rule:** a test is an ERROR only when the
+DECLARED types can never overlap, and a WARNING when the impossibility comes only from flow (an
+earlier write, an enclosing guard's narrowing, or `match` arms already covered). Other languages
+draw the same line: Java, Go, Kotlin and TypeScript refuse an incompatible declared type, while
+flow-proved dead tests are a warning or nothing in Kotlin, Rust, Swift, Scala and C#. A `const`
+literal is declared, so `const MODE = "debug"; if MODE == "release"` stays an error (D2198), and
+the fix is to declare the union: `const MODE: "debug" | "release" = "debug"`. This replaces the
+coordinator's error ruling and returns the 11 programs it refused. Recorded in DECISIONS.md.
+
+### width-view-implicit-or-spelled — does a storage that holds two record layouts become a view silently, or must the source spell it? — RULED (owner) 2026-11-12: implicit
+
+Width subtyping option B ([note](refactor-notes/2026-11-12-w315-width-b-view-rep.md), #7592) lets one
+`Pos` storage hold existing records of two wider layouts through a view rep. Today the one-layout
+contract refuses it. The witness, re-run on `16dd6059` (`vl check` rc 1, both deliveries refused
+with "`p` is given records of two layouts"):
+
+```vl
+type Pos = { x: i32, y: i32 }
+type A = { x: i32, y: i32, a: i32 }
+type B = { b: string, x: i32, y: i32 }
+const a: A = { x: 1, y: 2, a: 3 }
+const b: B = { b: "s", x: 4, y: 5 }
+let p: Pos = a
+print(p.x)
+p = b
+print(p.x)
+```
+
+**Ruled implicit:** the delivery flow makes `p` a view and the program runs as written. Only
+storage that actually receives two layouts becomes a view, so programs that never mix layouts
+pay nothing. The rejected options were a spelled `view Pos` and leaving B out of scope.
+
+### width-view-is-narrowing — may `is` narrow a view back to its concrete record? — RULED (owner) 2026-11-12: allowed
+
+`if p is A { print(p.a) }` on a view tests the view's shape tag, as `is` does on a union, and
+narrows `p` to `A` inside the branch; a write there reaches the original record. A `Pos` is
+therefore not sealed: code holding one can discover its concrete record. (An entry here earlier
+the same day recorded "out of scope"; that was a dismissed prompt, not a ruling.)
+
+### width-view-equality — what does `==` mean on two views? — RULED (owner) 2026-11-12: same concrete type, then every field
+
+`==` is structural in VL (DECISIONS A15). Two views are equal when the same concrete record type
+is underneath and all of its fields are equal, Go's rule for interface values. So a `Pos` view of
+an `A` never equals a `Pos` view of a `B`, whatever `x` and `y` hold. This is what Go, Java's
+`getClass()` idiom, Kotlin and Scala converge on: comparing only the narrow type's fields makes
+equality depend on the static type, which an implicit view hides. **Backlog, deep:** an operator
+(or a modified `==`) that compares a view only through the supertype's fields. Identity is
+`===` (identity-design §0), which is unbuilt: D15975.
+
+### union-twins-one-type — are two separately declared but identical unions one type? — not an owner question; withdrawn 2026-11-12
+
+VL's types are structural: `type U = i32 | string` and `type V = i32 | string` are already
+interchangeable at every position (a `V` passed to a `U` parameter, a `U[]` stored as `V[]`, and
+the same for twin records), re-run on `16dd6059`. #7425's "one type under `tySame`" only decides
+whether the compiler keeps one representation row or two, which changes no program's behaviour.
+
+### generic-seeded-let-concrete-write — may a concrete write follow a `let` seeded by a generic function? — RULED (owner) 2026-10-10, option C; reaffirmed 2026-11-12
+
+D3960. The owner chose TypeScript's rule on 2026-10-10: a `let` whose un-annotated initializer is a
+generic function keeps the generic type, and a concrete function written to it is refused at the
+write with a fix that annotates the binding. The function-set narrowing that would let it run
+(D15956, D15957) is clause 2 and is scheduled after step 7.
+
+### flat-sub-word-field-value — what does a sub-word field of a `flat` record hold? — RULED (owner) 2026-11-12: storage semantics (a)
+
+D15978. `u8`/`i8`/`u16`/`i16` are storage types: legal as an array element and as a `flat` field,
+never as a value. A `flat` record built as a value disagreed with itself, re-run on `40a5f783`:
+
+```vl
+flat type Q = { a: u8, c: i32 }
+function f(n: i32): Q { return { a: n, c: 1 } }
+print(f(300).a)                 // 300, where a `u8[]` element stores 44
+flat type P = { a: i16, c: i32 }
+const p: P = { a: -3, c: 7 }    // refused as "does not fit a `u8` element"
+```
+
+**Ruled (a):** a sub-word field narrows on store exactly as an array element of its width does, and
+a visibly out-of-range literal is refused at the field's own width. Rejected: (b) the width is
+layout only and the field holds any `i32`; (c) a `flat` record with a sub-word field cannot be a
+value. Recorded in DECISIONS.md. Built after step 7.
 
 ### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — RULED 2026-10-12
 

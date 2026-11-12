@@ -507,7 +507,6 @@ import {
   exactArmRowOfTy,
   globalLetOfSid,
   unionArmRowOfTy,
-  variantIndexOf,
 } from "./emit_local_slots"
 import {
   annSlotOfKind,
@@ -661,7 +660,6 @@ import {
   sFieldRefSlot,
   structIndexOfNullPartTy,
   structRowOfRecordTy,
-  structRowOfSpelling,
   structRowOfValueTy,
   tyIsFuncOrNulFunc,
   tyIsRefArray,
@@ -760,7 +758,6 @@ import {
   RLK_STRUCT,
   RLK_UNION,
   VKind,
-  armFieldElemName,
   armFieldNames,
   armFieldStoreTy,
   armFieldTypes,
@@ -1738,10 +1735,7 @@ function readCellKind(exprIx: i32, fnIx: i32): VKind | null {
   const st = memberFieldStoreTy(mx, fnIx)
   if st >= 0 {
     const d = repOfTy(st)
-    // `nulnone` is the storage of a field whose type names no record yet (an inference hole).
-    if d.rdCovered == 1 && d.rdKind != "nulnone" {
-      return nulNicheOrNull(d.rdKind)
-    }
+    if d.rdCovered == 1 { return nulNicheOrNull(d.rdKind) }
   }
   fieldCodeCellKind(mx, fnIx)
 }
@@ -1753,8 +1747,8 @@ function nulNicheOrNull(k: VKind): VKind | null {
   null
 }
 
-// The cell kind of a field read whose storage type is unknown, uncovered or names no record, from
-// its code: code 15 is a nullable struct ref, whatever it declares.
+// The cell kind of a field read whose storage type is unknown or uncovered, from its code: code 15
+// is a nullable struct ref, whatever it declares.
 function fieldCodeCellKind(memIx: i32, fnIx: i32): VKind | null {
   const fc = memberFieldCode(memIx, fnIx)
   if fc == FC_NUL_STR { return "nulstr" }
@@ -4488,13 +4482,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
           if ma != "null" {
             let msi = -1
             if mCov { msi = structIndexOfTy(mTys[mi]) }
-            if msi < 0 {
-              if mCov {
-                msi = structRowOfValueTy(mTys[mi])
-              } else {
-                msi = structRowOfSpelling(ma)
-              }
-            }
+            if msi < 0 && mCov { msi = structRowOfValueTy(mTys[mi]) }
             if msi >= 0 {
               const mfi = sFieldIndex(msi, m.memProp)
               if mfi >= 0 {
@@ -7094,9 +7082,8 @@ function arrLitElemNameTpl(arrIx: i32): string {
         }
       }
     }
-    // The checker-typed union element: the registered composite is the table key — the
-    // same string `refArrElemName` yields for the annotated `(Cat | Dog)[]` spelling, so
-    // both spellings intern one slot.
+    // The checker-typed union element: the registered composite is the table key, the one
+    // the annotated `(Cat | Dog)[]` spelling keys, so both spellings intern one slot.
     const aun = arrLitUnionElemName(arrIx, -1)
     if aun != "" { return aun }
     // The element expression's own committed rep, ahead of every rung that reads the
@@ -7105,27 +7092,23 @@ function arrLitElemNameTpl(arrIx: i32): string {
     // `Dot` instead. Checked after the literal arms and the checker-typed union element.
     const acn = arrLitCommitNameAt(arrIx)
     if acn != "" { return acn }
-    // The checker-typed map element: the whole `{[K]:V}` spelling is the table key, the
-    // same string `refArrElemName` yields for the annotated `{[K]: V}[]` — so the two
-    // spellings intern one row of kind 3, carrying the key as well as the value.
+    // The checker-typed map element: the whole `{[K]:V}` spelling is the table key, the one
+    // the annotated `{[K]: V}[]` keys, so the two spellings intern one row of kind 3.
     const amn = arrLitMapElemName(arrIx, -1)
     if amn != "" { return amn }
     // The checker-typed object-shaped element: the declared row's own name is the table
-    // key, the same string `refArrElemName` yields for the annotated `Circle[]` spelling,
-    // whether that row is a struct or a union arm — so the inferred literal and the
-    // annotation intern one kind-1 slot.
+    // key, the one the annotated `Circle[]` keys, whether that row is a struct or a union
+    // arm, so the inferred literal and the annotation intern one kind-1 slot.
     const ann = arrLitNominalElemName(arrIx, -1)
     if ann != "" { return ann }
     // The checker-typed list element: the inner list's own emit name is the table key, the
-    // same string `refArrElemName` yields for the annotated `string[][]` spelling, so all
-    // three spellings intern one row. Must agree arm for arm with `arrLitIsRef` and
+    // one the annotated `string[][]` keys. Must agree arm for arm with `arrLitIsRef` and
     // `arrLitElemKind`, which ask the identical predicate.
     const anl = arrLitNestedElemName(arrIx, -1)
     if anl != "" { return anl }
     // D1270 — the checker-typed nullable-container element: the element's own emit render
-    // is the table key, the same string `refArrElemName` yields for the annotated
-    // `(i32[] | null)[]` spelling, so both spellings intern one row. Must agree arm for arm
-    // with `arrLitIsRef` and `arrLitElemKind`.
+    // is the table key, the one the annotated `(i32[] | null)[]` keys. Must agree arm for
+    // arm with `arrLitIsRef` and `arrLitElemKind`.
     const anr = arrLitNulRefElemName(arrIx, -1)
     if anr != "" { return anr }
   }
@@ -10885,7 +10868,7 @@ export function objMatchesVariantIdxOmit(
           !objNestedFieldCompat(
             objIx,
             armFieldNames()[start + fj],
-            armFieldElemName()[start + fj],
+            uFieldElemTyIxAt(vi, fj),
             fnIx,
           )
           || !variantFieldKindFits(objIx, armFieldNames()[start + fj], vi)
@@ -10920,11 +10903,12 @@ export function objMatchesVariantIdxOmit(
 // produces the i32 array (a `(ref $aTypeIdx)`) rather than an i32. An index read
 // `a[i]` and `a.length` are i32 (not arrays), so they are deliberately absent here.
 
-// The arm a union member is: a declared arm by its name `atom`, else the arm recorded at its
-// type `ty`, else the arm whose own type renders as that record does. -1 for none.
-function memberArmRow(atom: string, ty: i32): i32 {
-  const d = variantIndexOf(atom)
-  if d >= 0 || ty < 0 { return d }
+// The arm a union member of type `ty` is: the arm whose member is that type, else the arm recorded
+// at its shape, else the arm whose own type renders as that record does. -1 for none or no type.
+function memberArmRow(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const d = exactArmRowOfTy(ty)
+  if d >= 0 { return d }
   const r = repVariantShapeRowOf(ty)
   if r >= 0 { return r }
   variantRowOfOwnRenderTy(ty)
@@ -10978,12 +10962,9 @@ export function sharedUnionFieldPlan(
   // A receiver the checker proved non-null reads no field off its `null` atom.
   const skipNull = !nodeTyIsNullable(recvIx)
   while i < atoms.length {
-    // A declared arm by its name, else the arm the member's type is (D1083): a narrowed
-    // complement's fallback spells a member by its structural render.
-    const vi = memberArmRow(
-      atoms[i],
-      if i < atomTys.length { atomTys[i] } else { -1 },
-    )
+    // The arm the member's type is (D1083): a narrowed complement's fallback spells a member
+    // by its structural render, so its spelling names no arm.
+    const vi = memberArmRow(if i < atomTys.length { atomTys[i] } else { -1 })
     if vi < 0 && skipNull && atoms[i] == "null" {
       i = i + 1
       continue
@@ -11388,19 +11369,6 @@ function listIsRecvTysIn(ix: i32, name: string, fnIx: i32, out: i32[]) {
   0
 }
 
-// The ref-list ELEMENT type-NAME the expression at `exprIx` produces, or "" if it is not
-// a ref list. Mirrors `exprRefArray`'s receiver shapes, resolving the per-element-
-// type table slot (`refListSlotOfExpr`) at every push / index / `.length` / store site.
-export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
-  const rs = listRowOfExpr(exprIx, fnIx)
-  if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
-  // A list whose type keys no row of its own, an `__array_new__` record fill: its element
-  // record's canonical row.
-  const t = nodeTyAt(exprIx, fnIx)
-  if !tyIsRefArray(t) { return "" }
-  const si = structRowOfRecordTy(tyArrayElemIx(t))
-  if si >= 0 && si < sNames.length { sNames[si] } else { "" }
-}
 // The ref-list row the expression at `exprIx` is built as in function `fnIx`: the row of its
 // rep type (`exprRepTy`), as `listBuildOfTy` builds that type; -1 where it is no ref list.
 export function listRowOfExpr(exprIx: i32, fnIx: i32): i32 {
@@ -11639,10 +11607,17 @@ function fnRetRepTy(fe: i32, depth: i32): i32 {
   }
   r
 }
-// The ref-list row of the bare list annotation on the return of the function `name` read at
-// `calleeIx` resolves to, or -1. The arena's row, which is the one the signature declares.
-function calleeAnnRetRefListSlot(name: string, calleeIx: i32, fnIx: i32): i32 {
-  const fe = fnIndexOfInScopeAt(sidOfNode(calleeIx), name, fnIx, calleeIx)
+// The ref-list row of the bare list annotation on the return of the function the identifier
+// `calleeIx` resolves to in scope, or -1: the row its signature declares. No type is spelled.
+function calleeAnnRetRefListSlot(calleeIx: i32, fnIx: i32): i32 {
+  const c = nodeAt(calleeIx)
+  if !(c is Ident) { return -1 }
+  const fe = fnIndexOfInScopeAt(
+    sidOfNode(calleeIx),
+    c.identName,
+    fnIx,
+    calleeIx,
+  )
   if fe < 0 || fe >= fnStmts.length { return -1 }
   const fd = nodeAt(fnStmts[fe])
   if fd is FuncDecl {
@@ -11665,7 +11640,7 @@ function refListKeptSlotOfCall(e: Call, exprIx: i32, fnIx: i32): i32 {
   if e.callFn < 0 { return -1 }
   const callee = nodeAt(e.callFn)
   if callee is Ident {
-    const asl = calleeAnnRetRefListSlot(callee.identName, e.callFn, fnIx)
+    const asl = calleeAnnRetRefListSlot(e.callFn, fnIx)
     if asl >= 0 && asl < rlElemName.length { return asl }
     const sid = sidOfNode(e.callFn)
     // A function's recorded result: the row its element is minted under at this instance.
