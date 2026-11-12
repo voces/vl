@@ -67,7 +67,12 @@ import {
   elabTyClosed,
   fnLetReadTyOf,
 } from "./check_elab_cap"
-import { declareAmbient, identIsConst, identSlotOf } from "./check_scopes"
+import {
+  declareAmbient,
+  identIsConst,
+  identSlotOf,
+  identStoreTyOf,
+} from "./check_scopes"
 import {
   asgOpenElemRow,
   asgOpenElemRowOf,
@@ -169,6 +174,7 @@ import {
   litPrimMeetTy,
   litSetMeetTy,
   markFieldValue,
+  nullReadHoleTy,
   numBoxedStamp,
   numCastStamp,
   numDeliverStamp,
@@ -751,8 +757,13 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       // A re-check whose types now agree retires the earlier answer.
       asgStoreTysSetAt(ix, -1)
     }
-    const asgCur = identTyOf(n.binLeft, asgTgt.identName)
+    let asgCur = identTyOf(n.binLeft, asgTgt.identName)
     asgPreTy = asgCur
+    // A read narrowed to the initialiser's `null` still fills the binding's own hole.
+    if isNullTy(asgCur) {
+      const asgSt = identStoreTyOf(n.binLeft, asgTgt.identName)
+      if asgSt >= 0 { asgCur = asgSt }
+    }
     if asgCur >= 0 {
       // A write to a hole binding ends the pin's jurisdiction over it: the call site pins the
       // parameter, this write replaces the value, so a cast after it is not the pin's to adjudicate (D1342).
@@ -778,11 +789,10 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
           const asgSlot = identSlotOf(n.binLeft, asgTgt.identName)
           if narGuardSlot(asgSlot) < 0 {
             noteNarShadow(asgSlot, NAR_KIND_ASG)
-            if tvPlaceWrite(asgCur, rt) {
-              declareAt(asgSlot, asgTgt.identName, tvWriteTy(asgCur, rt, -1))
-            } else {
-              declareAt(asgSlot, asgTgt.identName, nonNullTy(asgCur))
-            }
+            let asgNarTy = nonNullTy(asgCur)
+            if tvPlaceWrite(asgCur, rt) { asgNarTy = tvWriteTy(asgCur, rt, -1) }
+            declareAt(asgSlot, asgTgt.identName, asgNarTy)
+            narLayerNote(asgSlot, T.frames.length - 1, asgNarTy)
             scWrNote(n.binLeft, identTyOf(n.binLeft, asgTgt.identName))
           }
         } else if asgCt.nInner < 0 && rtT is TyNullable {
@@ -916,10 +926,16 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       if arrT0.aRead == 1 { tErr(roWriteMsg("index assignment", arrTy0), ix) }
       if arrT0.aElem < 0 { calleeWritePrePin(arrTy0, rt) }
       if arrT0.aElem < 0 {
-        arrT0.aElem = cnhPinTy(rt, ix, tgt.idxArr, false, false)
+        arrT0.aElem = cnhPinTy(
+          nullReadHoleTy(n.binRight, rt),
+          ix,
+          tgt.idxArr,
+          false,
+          false,
+        )
         tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
       } else {
-        cnhFill(arrT0.aElem, rt)
+        cnhFill(arrT0.aElem, nullReadHoleTy(n.binRight, rt))
       }
       // A target its open list leaves untyped takes the value's numeric pair at the element the
       // list holds now.
@@ -947,10 +963,16 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       }
       if arrT0.mVal < 0 {
         const dmd = isHoleMapDemandTy(arrTy0)
-        arrT0.mVal = cnhPinTy(rt, ix, tgt.idxArr, true, dmd)
+        arrT0.mVal = cnhPinTy(
+          nullReadHoleTy(n.binRight, rt),
+          ix,
+          tgt.idxArr,
+          true,
+          dmd,
+        )
         tyMutEpoch = tyMutEpoch + 1 // index-write pinned the value in place
       } else {
-        cnhFill(arrT0.mVal, rt)
+        cnhFill(arrT0.mVal, nullReadHoleTy(n.binRight, rt))
       }
       elabSlotRecLitGrow(n.binRight, arrT0.mVal)
       cnhNullNote(n.binRight, arrT0.mVal)

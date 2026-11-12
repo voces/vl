@@ -114,9 +114,8 @@ self-compile.
 | q1, `if x == null { const y: string \| null = x }` | check refuses: no read narrows to `null` |
 | q2, `let x: i32 \| null = v; x = 5; const y: i32 = x` | runs: the existing non-null shadow |
 
-## Open question for the owner
+## Ruling on annotated `let`s
 
-The ruling's text and witnesses are about un-annotated `let`s. Do annotated `let`s also narrow
-on a write, so that p2 and p4 run? The mechanism is the same row, and D14930's findings treat
-p2 as the same rule. Until that is answered, the first PR builds the un-annotated face and the
-null-read arm, and leaves the annotated face's positions as recorded refusals.
+The decision draws no line at annotation, so an annotated `let` narrows on a write the same way:
+p2 and p4 run (orchestrator ruling, 2026-11-12; DECISIONS.md entry amended). The annotated face
+is in the matrix from the first PR.

@@ -11603,6 +11603,8 @@ modules assign imported `let`s throughout. A read-only rule would need a setter 
 **The rule.** A read of a `let` takes the type of the most recent write in scope, not the join
 of all its writes. In `let x = null; const y: string | null = x; x = 5`, the read of `x` is
 `null`, so the delivery is sound.
+An annotated `let` narrows the same way: the annotation bounds what may be written, and a read
+sees the most recent write's type, so `let x: i32 | string = 1; x = "s"; x.length` runs.
 
 **Status.** Backlogged in ROADMAP.md. The checker has no read-after-assignment typing for any
 type today, so this is a new rule. D2660 and D14930 are its witnesses and wait on it.

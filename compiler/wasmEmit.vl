@@ -4344,6 +4344,13 @@ function emitNulIsNullTest(
       if invert { fbI32Const(1) } else { fbI32Const(0) }
       return 1
     }
+    // …and one narrowed to `null` itself (a `let x = null` read before its fill) is null.
+    const nulFold = readNarrowedStoreAt(refIx, fnIx) >= 0
+      && isNullTy(nodeTyAt(unwrapParen(refIx), fnIx))
+    if nulFold {
+      if invert { fbI32Const(0) } else { fbI32Const(1) }
+      return 1
+    }
   }
 
   if exprNulBool(refIx, fnIx) {
@@ -14165,12 +14172,9 @@ function emitArrI32(
   // `null[]` a `null` as the sentinel 2, and `(K|null)[]` both. The element type comes from the checker's
   // recorded type; the `lbKind` 8 and 9 legs catch an all-`null` `[null]`.
   const litArr = nodeArrayElemIsLitUnion(arrIx)
-  if (
-    arrElemIsNulBoolAt(arrIx, fnIx)
-    || arrElemIsNullUnitAt(arrIx, fnIx)
-    || lbKind == LBK_NUL_BOOL_LIST
-  ) {
-  }
+  // A `null[]` list's element of the `null` type, at an instance whose element type is `null`,
+  // is the sentinel too, which a delivery with no destination around it does not name.
+  const nulUnit = arrElemIsNullUnitAt(arrIx, fnIx)
   if (
     (nodeArrayElemIsNulLitUnion(arrIx) && lbKind != LBK_UNION)
     || lbKind == LBK_NUL_LIT_UNION_LIST
@@ -14221,7 +14225,15 @@ function emitArrI32(
         )
       }
     }
-    if emitExpr(body, elems[i], fnIx) < 0 { return -1 }
+    if nulUnit && isNullTy(nodeTyAt(elems[i], fnIx)) {
+      if !(nodeAt(unwrapParen(elems[i])) is NullLit) {
+        if emitExpr(body, elems[i], fnIx) < 0 { return -1 }
+        fbDrop()
+      }
+      fbI32Const(2)
+    } else if emitExpr(body, elems[i], fnIx) < 0 {
+      return -1
+    }
     i = i + 1
     if dstI32 >= 0 {
       coffI32 = arrLitChunkFlush(dstI32, aTy(), coffI32, i, elems.length)
@@ -36993,6 +37005,11 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
   if identCellVKind(exprIx, fnIx) == "nulnone" {
     return emitNullAt(exprIx, fnIx)
   }
+  // A read whose most recent write is a `null` (a `let x = null` read before the write that
+  // fills it) holds its storage's null, delivered at a destination of another rep as its null.
+  if isNullTy(readNarrowedTyAt(exprIx, fnIx)) {
+    if emitNullReadAtDst(exprIx, fnIx) { return 0 }
+  }
   // An `is K[]` arm's read of an empty list of another element (D4911), ahead of the narrowed
   // unboxes, which would cast the receiver's own list to `K[]`.
   const fitSh = listFitShadowRead(e.identName, exprIx, fnIx)
@@ -37444,6 +37461,30 @@ function emitCallNode(body: u8[], e: Call, exprIx: i32, fnIx: i32) {
 // the bottom ref. A `null`-unit cell (`null[]`'s element) is an i32 holding 2 (D4671).
 function emitNullLitNode(_body: u8[], _e: NullLit, exprIx: i32, fnIx: i32) {
   emitNullAt(exprIx, fnIx)
+}
+
+// Push the null the destination of the `null`-typed read `exprIx` holds, when it names a rep
+// other than the read's storage; false, pushing nothing, where the storage read is that null.
+function emitNullReadAtDst(exprIx: i32, fnIx: i32): boolean {
+  const dst = ctxTyAt(parenPeelIx(exprIx), fnIx)
+  const st = readNarrowedStoreAt(exprIx, fnIx)
+  if dst < 0 || st < 0 { return false }
+  const dk = repOfTy(dst).rdKind
+  if dk == repOfTy(st).rdKind { return false }
+  // An open `_ | null` destination (an un-annotated binding of the read) is built at the read's
+  // storage, so the storage read is its null.
+  const dt = tyAt(dst)
+  if dt is TyNullable {
+    if dt.nInner < 0 { return false }
+  }
+  if dk == "union" {
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx)
+    return true
+  }
+  emitNullOwn(nullOwnOfTy(dst))
+  true
 }
 
 // The `null` value node `exprIx` evaluates to, built at the rep of the type the checker stamped
