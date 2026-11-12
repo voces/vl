@@ -20,10 +20,38 @@ ARCHITECTURE.md §7's two step-7 rows:
   - recorded TypeRef texts (`synthTypeRefOfTy`, `lvSpellOf`).
 
   No type-string parse remains.
-- **§3.3, registries:** keyed by a type key, an identifier, literal content or an index memo. The one
-  spelling-keyed registry is `cloSigPosBy`, under the `clo:` key.
+- **§3.3, registries:** keyed by a type key, an identifier, literal content or an index memo.
+  `cloSigPosBy` is re-graded as rep-keyed: its `$fnsig` key is built from rep tokens (#7646).
 - **§3.4, classifiers:** one producer, the type. A name read is a label: a key rendered from the
   type (`monoTagMapRepName`), or a presence test (`annTyIsRefList`). Rows are found by type.
+
+## The accepted contracts
+
+Each is a site that reads a name or keys a row without a closed type, and passes closing census
+5's three tests: it is cited, its reason is a contract, and a witness runs.
+
+| contract | where §3.3/§3.4 states it | sites | cites |
+| --- | --- | --- | --- |
+| an `#anonN` handle is the literal row's identity | §3.3 registries | `anonRowTyOfName`, `anonPinRow`, `retStructRowIndex`'s `#anon` rung; `monoAnonRowListTy` pending lane D's caller sentence | #7414, #7546; D15646, D2762 |
+| the spelling index resolves a source name to its row | §3.3 registries | `unNameAdoptTyKeyRow`, `annShapeIndexOf` (untyped shapes) | `2026-11-12-step7-union-reg-riu-value-union.md`, `2026-11-12-step7-shape-layout-id.md` |
+| a type parameter's name is an identifier; shadowing is a scoping question | §3.3 registries | `monoElabCompositeTy` | lane D, 2026-11-12 |
+| `tySame` plus the function sets | §3.3 registries | `sRowElemRepSame`, `fnSetsAgree` | `2026-11-12-step7-struct-name-producers-cut-2.md` |
+| a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
+| a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
+
+## Still failing at this draft (master `d5f26894`, 2026-11-12 23:00)
+
+The close is opened when this list is empty, or holds only items with an open PR.
+
+| lane | sites |
+| --- | --- |
+| B | `structRowOfSpelling` chain, one site (`emit_nullable_rets.vl:615`) |
+| E (E5, after H's #7668) | `structElemArrayLowerable`, `internFuncTypeShapesTyGo` |
+| E3 | `internShapeDeepOfTy`, `internArmShapeRow` renders |
+| F | `sFieldRefSlot`'s `ty < 0` name fallback (probe with a firing control) |
+| H | `variantNestedRow`, `armFieldStructRowMinted`; `printUnionPlanCode`'s name fallbacks |
+| G | `unionNameOfCall`; `unionNameOfExpr`'s callers (with A's two `emitUnionUnionEq` calls) |
+| D | `monoArgTyNameProjected`, `monoPinAnnotatedParam`; `monoAnonRowListTy`'s list-depth parse |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
 

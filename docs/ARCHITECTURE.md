@@ -264,14 +264,25 @@ The emitter keeps these renders, each for output, and parses no type spelling ba
 
 - **Diagnostics:** a message names a type for a person (`cloCallSigRejectWhat`,
   `nulNicheIsTestImpossible`, `mapSoftTwinTagFail`, `emitMapUnionPayloadTail`).
-- **The `clo:` link key** (`cloSigNameOfTy`): a printable key across the link, read back only
-  through `cloSigPosBy`.
+- **The `clo:` link key** (`cloSigNameOfTy`): the closure slot's printable name across the link,
+  rendered from its type.
 - **Recorded TypeRef texts** (`synthTypeRefOfTy`, `lvSpellOf`): a synthesized annotation is source
   text, checked again as source.
 
 A registry is keyed by a type key, an identifier, literal content or an index memo, never by a
-type's spelling (`scripts/registry-census.vl`). The one spelling-keyed registry is `cloSigPosBy`,
-keyed by the `clo:` link key above.
+type's spelling (`scripts/registry-census.vl`). `cloSigPosBy` is keyed by the `$fnsig` key built
+from rep tokens, so it is a type key. Three keys look like spellings and are not:
+
+- **An `#anonN` handle** is a record literal's row identity, minted with the row. It is the row's
+  own key, not a spelling of a type (`anonRowTyOfName`, `anonPinRow`, `monoAnonRowListTy`).
+- **The spelling index** (`unNameAdoptTyKeyRow`, `annShapeIndexOf`) resolves a source name to the
+  row its type found. It answers an identifier, never a type question.
+- **A type parameter's name** is an identifier. Whether a declared record shadows it is a scoping
+  question, asked before the parameter has a type (`monoElabCompositeTy`).
+
+Two types `tySame` equates can still need different rows. A tagged function set rides on the type
+index (`fnTagSetOfTy`), and neither `tySame` nor `repCanonId` compares it, so a row decision that
+compares types compares the sets too (`fnSetsAgree`).
 
 **Type equality.** "Are these two types one?" has seven answers, each a contract. Each draws its
 line on purpose, and two of them disagree on a pair only where their lines differ ([notes](internals/refactor-notes/2026-11-12-step7-registries-and-equality.md),
@@ -309,6 +320,13 @@ A classifier reads its rep from one producer, the type (`scripts/rep-classifier-
 name it reads is a label, never a second producer: a key rendered from the same type
 (`monoTagMapRepName`), or a test of whether an annotation is written (`annTyIsRefList`). A row is
 found by its type: no struct, variant, ref-list or union row is looked up by a spelling.
+
+Two rows have no closed type to be found by:
+
+- **A function-value-set row** has no element type, so it is keyed by its set (`rlKeyTyOf`).
+- **A type that holds a type parameter is not a rep.** A template's row is keyed by its open type
+  and each instance's by its closed type. A body the checker does not instantiate is emitted once,
+  its type parameters open, and builds at the open row, whose field layout comes from its code.
 
 Detail: `docs/internals/rep-descriptor-campaign.md`, `docs/internals/litunion-compact-rep-design.md`,
 `docs/internals/unboxed-union-rep-design.md`, `docs/internals/per-rep-ladder-audit.md`.
