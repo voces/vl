@@ -3310,7 +3310,7 @@ function emitRecCopyLevel(
     if sk >= 0 && vk >= 0 && sk != vk {
       if njConvert(sk, vk) < 0 { return -1 }
     }
-    // A list of records copied into a list of another record row is copied element by element.
+    // A list whose elements are stored otherwise is converted element by element.
     if recCopyFromOf(exprIx) < 0 {
       const lst = nonNullTy(
         rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), dNames[fj]),
@@ -3318,24 +3318,7 @@ function emitRecCopyLevel(
       const ldt = nonNullTy(
         rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), dNames[fj]),
       )
-      if rcRecListsApart(lst, ldt) {
-        const ls = repSlotOfKind("reflist", lst)
-        if emitRecListCopyTop(body, exprIx, lst, ldt, ls, fnIx) < 0 {
-          return -1
-        }
-      }
-    }
-    // A list of numbers copied into a list of a wider number is widened element by element.
-    if recCopyFromOf(exprIx) < 0 {
-      const le = rcScalarListElem(
-        rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), dNames[fj]),
-      )
-      const de = rcScalarListElem(
-        rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), dNames[fj]),
-      )
-      if le != null && de != null && le != de {
-        if emitScalarListWidenTop(body, le, de) < 0 { return -1 }
-      }
+      if emitListConvTop(body, exprIx, lst, ldt, fnIx) < 0 { return -1 }
     }
     fj = fj + 1
   }
@@ -3377,6 +3360,83 @@ function emitRecListCopy(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
     exprEmittedRefListSlot(exprIx, fnIx),
     fnIx,
   )
+}
+
+// The list `st` on the stack converted into the list `dt`, element by element where they store
+// their elements apart: a list of numbers widened, a list of records copied, and a list of lists
+// looped over, each element converted the same way. Nothing where they store alike.
+function emitListConvTop(
+  body: u8[],
+  exprIx: i32,
+  st: i32,
+  dt: i32,
+  fnIx: i32,
+): i32 {
+  const le = rcScalarListElem(st)
+  const de = rcScalarListElem(dt)
+  if le != null && de != null {
+    if le != de { return emitScalarListWidenTop(body, le, de) }
+    return 0
+  }
+  if rcRecListsApart(st, dt) {
+    return emitRecListCopyTop(
+      body,
+      exprIx,
+      st,
+      dt,
+      repSlotOfKind("reflist", st),
+      fnIx,
+    )
+  }
+  if st < 0 || dt < 0 || st >= T.tys.length || dt >= T.tys.length { return 0 }
+  const sa = tyAt(st)
+  const da = tyAt(dt)
+  if !(sa is TyArray) || !(da is TyArray) { return 0 }
+  const si = nonNullTy(sa.aElem)
+  const di = nonNullTy(da.aElem)
+  if si < 0 || di < 0 || !(tyAt(si) is TyArray) || !(tyAt(di) is TyArray) {
+    return 0
+  }
+  const srcSlot = repSlotOfKind("reflist", st)
+  const dstSlot = repSlotOfKind("reflist", dt)
+  // One storage: nothing to convert.
+  if srcSlot == dstSlot { return 0 }
+  if (
+    srcSlot < 0
+    || dstSlot < 0
+    || srcSlot >= rlWrapIdx.length
+    || dstSlot >= rlWrapIdx.length
+    || srcSlot >= rlBackIdx.length
+    || dstSlot >= rlBackIdx.length
+  ) {
+    return emitFailAt(
+      "emitProgram: a list of lists converted element by element has no row",
+      exprIx,
+    )
+  }
+  const srcWrap = rlWrapIdx[srcSlot]
+  const srcBack = rlBackIdx[srcSlot]
+  const dstWrap = rlWrapIdx[dstSlot]
+  const dstBack = rlBackIdx[dstSlot]
+  const sL = widenSrcWrapSlot(srcSlot)
+  const dL = widenDstBackSlot(dstSlot)
+  const iL = widenTmpSlot(2 * rcLoopDepth)
+  const nL = widenTmpSlot(2 * rcLoopDepth + 1)
+  emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
+  fbLocalGet(dL)
+  fbLocalGet(iL)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 0)
+  fbLocalGet(iL)
+  fbArrayGet(srcBack)
+  fbRefAsNonNull()
+  rcLoopDepth = rcLoopDepth + 1
+  const r = emitListConvTop(body, exprIx, si, di, fnIx)
+  rcLoopDepth = rcLoopDepth - 1
+  if r < 0 { return -1 }
+  fbArraySet(dstBack)
+  emitCopyLoopClose(iL, dL, nL, dstWrap)
+  0
 }
 
 // Whether `st` and `dt` are lists of records whose element rows differ.
@@ -29814,8 +29874,9 @@ function emitScalarListWidenTop(_body: u8[], srcKind: VKind, dstKind: VKind) {
   const dstBack = scalarListBack(dstKind)
   const sL = widenScalarWrapSlot(listIdxKindOf(srcKind))
   const dL = widenScalarBackSlot(listIdxKindOf(dstKind))
-  const iL = widenTmpSlot(0)
-  const nL = widenTmpSlot(1)
+  // Inside an element-by-element copy, the next pair of temps (`rcLoopDepth`).
+  const iL = widenTmpSlot(2 * rcLoopDepth)
+  const nL = widenTmpSlot(2 * rcLoopDepth + 1)
   // src = <stack>, evaluated ONCE by the caller.
   emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
   // block { loop { if i >= n br 1; back[i] = conv(src.back[i]); i++; br 0 } }
