@@ -54,6 +54,8 @@ import {
   nodeTyRecord,
   nodeTySet,
   nodeTySetGrow,
+  narrowedFromTySet,
+  narrowedFromTyOf,
 } from "./check_node_tys"
 import {
   elabCallDeclNote,
@@ -226,6 +228,7 @@ import {
   isVarTyIxSetAt,
   luWriteTgtPut,
   monoRecheckDepth,
+  isVarTyIxOf,
 } from "./check_list_union"
 import { constLitNeverMsg, litSetNeverMsg } from "./check_lit_never_msgs"
 import {
@@ -257,6 +260,8 @@ import {
   collectThenNarrows,
   crNoteRhsRetired,
   isOperandAtStorage,
+  operandDeclaredTy,
+  tyMembersMeet,
   popScope,
   retireNarrowingsForWrite,
   scWrEnter,
@@ -348,6 +353,7 @@ import {
   nhLink,
   recordDeadNullTest,
   recordDeepRecordEq,
+  recordDeadTest,
 } from "./check_side_rows"
 import { noteArrayWriteDemand } from "./check_subst"
 import {
@@ -400,6 +406,7 @@ import {
   tyMutEpoch,
   tySame,
   tyToStr,
+  TDiag,
 } from "./check_types"
 import {
   binArithOp,
@@ -429,6 +436,7 @@ import {
   tyMapValOfHeld,
   tyUnionCovers,
   unionCoversTy,
+  flattenVariantsInto,
 } from "./tyquery"
 
 // Re-binds `name` to `ty` as a layer over slot `s`; an unresolved name gets a slot of its own.
@@ -1261,7 +1269,7 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   if isLitBearing(lt) {
     const eqR = cmpLitTyOf(n.binRight)
     if eqR >= 0 {
-      if !assignable(eqR, lt) {
+      if !assignable(eqR, lt) && !eqDeadByFlow(n, ix, eqR, -1) {
         tErr(
           "cannot compare "
             + tyToStr(lt)
@@ -1278,7 +1286,7 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   } else if isLitBearing(rt) {
     const eqL = cmpLitTyOf(n.binLeft)
     if eqL >= 0 {
-      if !assignable(eqL, rt) {
+      if !assignable(eqL, rt) && !eqDeadByFlow(n, ix, -1, eqL) {
         tErr(
           "cannot compare "
             + tyToStr(eqL)
@@ -1299,7 +1307,7 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     || assignable(rt, lt)
     || nomEqLit
     || eqNonNullMutual(lt, rt)
-  if !eqMutual {
+  if !eqMutual && !eqDeadByFlow(n, ix, -1, -1) {
     tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
   }
   // Both `==` gates share one home (`eqRefusals`): structural soundness (field-by-field
@@ -2394,10 +2402,69 @@ function isClosedRecord(t: i32): boolean {
 }
 
 export function checkIsExprNode(n: IsExpr, ix: i32) {
+  const d0 = T.diags.length
   const r = checkIsExprAt(n, ix)
+  if T.diags.length > d0 { isDeadByFlowWarn(n, ix, d0) }
   isOperandAtStorage(n.isObj)
   r
 }
+
+// An `==` or `!=` a narrowing made impossible whose operands' declared types can be compared is a
+// warning (owner ruling 2026-11-12), and each narrowed operand is compared at its declared type.
+// `lfix`/`rfix` stand for an operand read as a literal, which no narrowing reaches (-1 for none).
+function eqDeadByFlow(n: BinExpr, ix: i32, lfix: i32, rfix: i32): boolean {
+  const dl = operandDeclaredTy(n.binLeft)
+  const dr = operandDeclaredTy(n.binRight)
+  if dl < 0 && dr < 0 { return false }
+  const l = if lfix >= 0 { lfix } else if dl >= 0 { dl } else { nodeTyIxOf(parenPeelIx(n.binLeft)) }
+  const r = if rfix >= 0 { rfix } else if dr >= 0 { dr } else { nodeTyIxOf(parenPeelIx(n.binRight)) }
+  if l < 0 || r < 0 { return false }
+  if !(assignable(l, r) || assignable(r, l) || eqNonNullMutual(l, r) || tyMembersMeet(l, r) || tyMembersMeet(r, l)) {
+    return false
+  }
+  recordDeadTest(ix, "`" + n.binOp + "` compares values a narrowing here keeps apart, so it is always " + (if n.binOp == "!=" { "true" } else { "false" }))
+  if dl >= 0 { operandAtDeclared(n.binLeft, dl) }
+  if dr >= 0 { operandAtDeclared(n.binRight, dr) }
+  true
+}
+
+// Record the narrowed read `op` at its declared type `dt`, unnarrowed, so its lowering reads it
+// as declared.
+function operandAtDeclared(op: i32, dt: i32) {
+  if inferQuiet { return 0 }
+  const ox = parenPeelIx(op)
+  nodeTySet(ox, dt)
+  narrowedFromTySet(ox, dt, dt)
+  0
+}
+
+// A test a narrowing made impossible, of an operand whose declared type it can match, is a
+// warning, not D2198's error (owner ruling 2026-11-12, DECISIONS.md "AN IMPOSSIBLE TEST IS AN
+// ERROR ONLY BY ITS DECLARED TYPES"): the refusals the check raised at `ix` since `d0` move to it.
+function isDeadByFlowWarn(n: IsExpr, ix: i32, d0: i32) {
+  const chk = isVarTyIxOf(ix)
+  const st = operandDeclaredTy(n.isObj)
+  if chk < 0 || st < 0 || !tyMembersMeet(st, chk) { return 0 }
+  deadByFlowMove(ix, d0, ", so this test is always false here")
+}
+
+// Move the diagnostics raised at `ix` since `d0` to the dead-test warning, each with `tail`.
+export function deadByFlowMove(ix: i32, d0: i32, tail: string) {
+  const rest: TDiag[] = []
+  while T.diags.length > d0 {
+    rest.push(T.diags[T.diags.length - 1])
+    T.diags.pop()
+  }
+  let i = rest.length - 1
+  while i >= 0 {
+    const d = rest[i]
+    if d.tat == ix { recordDeadTest(ix, d.tmsg + tail) } else { T.diags.push(d) }
+    i = i - 1
+  }
+  0
+}
+
+
 
 function checkIsExprAt(n: IsExpr, ix: i32) {
   // The tested place is a test, not a use: its lowering reads the field's own rep.
