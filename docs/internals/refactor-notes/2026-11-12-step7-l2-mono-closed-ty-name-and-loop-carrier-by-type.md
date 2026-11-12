@@ -22,7 +22,7 @@ Swept alone, the change gives same 23,984, bytes-only 0.
 ## The loop value's carrier: the floor #7401 named is gone
 
 #7401's note put `monoSubstLetType`'s last `monoSubstAnn` fallback on a parser-synthesized
-`T | null`. That attribution was wrong. The `let` comes from emit_rewrite: `lvBuild` builds a
+`T | null`. That attribution was wrong. The `let` comes from emit_rewrite: `lvRewriteAt` builds a
 loop value's carrier, and when the carrier's type holds a type parameter, its TypeRef is typed -1.
 The open type is recorded beside it with `monoAnnOpenTyNote`, and emit_base already reads it back
 with `monoAnnOpenTyOf`.
