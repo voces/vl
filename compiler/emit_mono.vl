@@ -442,7 +442,7 @@ import {
   monoPinOwnClose,
   monoPinOwnTvAtRep,
   monoPinRespell,
-  monoPinSpellFields,
+  monoPinSpellNoAnon,
   monoPinSpellNote,
   monoPinSpellOf,
   monoPinSpellShaped,
@@ -649,13 +649,7 @@ import {
   fnTagListRepName,
   structRowOfRecordTy,
 } from "./emit_shape_rows"
-import {
-  PIN_DECLINE,
-  nodeMapArmNominalName,
-  nominalizeFnTypeOfTy,
-  pinSigOf,
-  sigKeyOfTy,
-} from "./emit_sig_tokens"
+import { PIN_DECLINE, pinSigOf, sigKeyOfTy } from "./emit_sig_tokens"
 import { sFieldIndex } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
@@ -924,7 +918,7 @@ function monoFnNameIsSourceNamed(nm: string) {
 // The function-type name of argument `argIx`, preferring the checker's recorded type:
 // for an un-annotated lambda argument it inferred the param types from the generic
 // param's substituted expected type, which the syntactic build below cannot recover.
-// The gate is the arena (`nodeTyIsFunc`), and the struct part is nominalized once here.
+// The gate is the arena (`nodeTyIsFunc`); a closed type is spelled by the naming rule.
 function monoArgFnTypeName(argIx: i32, fnIx: i32) {
   const ax = unwrapParen(argIx)
   if ax < 0 { return "" }
@@ -932,15 +926,15 @@ function monoArgFnTypeName(argIx: i32, fnIx: i32) {
 
   if nodeTyIsFunc(ax) {
     const cn = nodeTyName(ax)
-    if cn != "" { return nominalizeFnTypeOfTy(nodeTyIxOf(ax)) }
+    if cn != "" { return monoPinSpellShaped(nodeTyIxOf(ax)) }
     // A type riding the instance's parameters names nothing until substituted (D4647).
     const pt = monoNodeTyAt(ax, fnIx)
-    if pt >= 0 && !tyHasTyVar(pt) { return nominalizeFnTypeOfTy(pt) }
+    if pt >= 0 && !tyHasTyVar(pt) { return monoPinSpellShaped(pt) }
   }
   // A hole parameter handed on reads the function type its instance pinned it at (D10132).
   if an is Ident && tyHasTyVar(nodeTyIxOf(ax)) {
     const ht = monoNodeTyAt(ax, fnIx)
-    if monoTyClosedFn(ht) { return nominalizeFnTypeOfTy(ht) }
+    if monoTyClosedFn(ht) { return monoPinSpellShaped(ht) }
   }
   let fe = -1
   if an is FuncDecl { fe = fnStmtsPosOf(ax) }
@@ -1481,40 +1475,6 @@ function monoAnonListPinName(lt: i32): string {
   monoAnnPinNameOfTy(lt)
 }
 
-// Composite annotation `ann` substituted with each `#anonN` binding spelled by its row's shape,
-// where the binding's type is stored at that row, else `pinC`. A handle inside a record spelling
-// resolves to nothing, and the field-set scan then claims a declared record (D3144).
-function monoSubstAnonShapes(
-  ann: string,
-  typarams: string[],
-  tvN: string[],
-  tvV: string[],
-  pinC: string,
-): string {
-  const vs: string[] = []
-  let changed = false
-  let i = 0
-  while i < tvV.length {
-    let v = tvV[i]
-    if v.length >= 5 && v.slice(0, 5) == "#anon" {
-      const rt = anonHandleTyIx(v, -1)
-      if rt >= 0 && !tyHasTyVar(rt) {
-        const sp = monoPinSpellFields(rt)
-        if (sp != "" && structRowOfRecordTy(rt) == structIndexByName(v)) {
-          v = sp
-          changed = true
-        }
-      }
-    }
-    vs.push(v)
-    i = i + 1
-  }
-  if !changed { return pinC }
-  const sub = monoSubstAnn(ann, typarams, tvN, vs)
-  if sub == "" { return pinC }
-  sub
-}
-
 // Whether the spelled shape of record argument `argIx`, typed `ty`, loses a literal: a literal
 // anywhere in the type, or in a field of the literal it is, whose own type may have widened one.
 function monoAnonArgSoftens(argIx: i32, ty: i32): boolean {
@@ -1828,10 +1788,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32, tyOut: i32[]): string {
   }
   // A map or Set argument pins its param as that map — the whole `{[K]:V}` spelling an
   // annotated parameter carries. Before the collection arms, since `exprArray`'s catch-all
-  // would otherwise name a map an array; and its arm-nominal form first, since
-  // `tyToEmitName` spells a declared union arm structurally and the two mint two (D88).
-  const mnArm = nodeMapArmNominalName(unwrapParen(ix), fnIx)
-  if mnArm != "" { return mnArm }
+  // would otherwise name a map an array.
   const hm = monoHoleMapPinName(nodeTyIxOf(unwrapParen(ix)))
   if hm != "" {
     tyOut[0] = elabHoleMapClosed(nodeTyIxOf(unwrapParen(ix)))
@@ -2636,24 +2593,23 @@ function monoSubstLetType(
   const tn = nodeAt(letType)
   if tn is TypeRef {
     if monoAnnMentionsTyParam(letType, typarams) {
-      // An anonymous-record binding is spelled by its shape: its `#anonN` handle inside a union
-      // names no type the registry can key (D12641).
-      let sub = monoSubstAnn(tn.tyName, typarams, tvN, tvV)
-      if sub != "" {
-        sub = monoSubstAnonShapes(tn.tyName, typarams, tvN, tvV, sub)
+      // The let's type substituted at the instance, spelled by the naming rule with an anonymous
+      // record by its fields: its `#anonN` handle inside a union names no type the registry can
+      // key (D12641). A binding that stays open keeps its annotation.
+      let sty = -1
+      const origLet = nodeTyIxOf(letType)
+      if origLet >= 0 {
+        const s2 = monoSubstInst(origLet, bN, bT)
+        if s2 >= 0 && s2 != origLet {
+          if !tyHasTyVar(s2) { sty = s2 }
+        }
+      }
+      let sub = if sty >= 0 { monoPinSpellNoAnon(sty) } else { "" }
+      // A loop value's `T | null` the parser synthesizes carries no type, so it takes the text.
+      if sub == "" && origLet < 0 {
+        sub = monoSubstAnn(tn.tyName, typarams, tvN, tvV)
       }
       if sub != "" && sub != tn.tyName {
-        // The substituted type, not a re-parse of the substituted name; the name handed
-        // to the synthesis is unchanged. Gated on completeness, since `substTyDeep`
-        // leaves a parameter it could not bind in place and `tyHasTyVar` sees that.
-        let sty = -1
-        const origLet = nodeTyIxOf(letType)
-        if origLet >= 0 {
-          const s2 = monoSubstInst(origLet, bN, bT)
-          if s2 >= 0 && s2 != origLet {
-            if !tyHasTyVar(s2) { sty = s2 }
-          }
-        }
         const subC = monoPinMintedUnion(sub, sty, sty, unTyKeyTagLet())
         // A union takes the type its registered spelling names, the one an assignment's
         // `letUnionNameOf` resolves against the registry, not the substitution's own row (D2676).
