@@ -11240,8 +11240,10 @@ that record (`recDropAdopt`), and each dropped field's initialiser still runs fo
 (D1696). It holds only where no use of the binding reads a dropped field or a field the record
 stores differently, and no other use delivers it at its own type; the checker decides this from
 its write scan, and a use it cannot classify disqualifies. A binding that fails is refused by the
-contract (a record is shared, not copied, D14532), naming the use. A binding nested in another
-literal or held in a list element is not lifted (D15823).
+contract (a record is shared, not copied, D14532), naming the use. Extended 2026-11-12 under the
+same conditions: a binding held in a fresh record or list literal is built at its own field or
+element of the destination (D15823), and a record literal nested in the binding at the one union
+arm it fits (D3566).
 
 ## A variant is a position in a union row, and union rows are keyed by member reps (ruling, D14551)
 

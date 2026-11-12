@@ -1457,26 +1457,15 @@ function structIndexOfTypeNameGo(name: string) {
     const fnames: string[] = []
     const ftypes: string[] = []
     shapeFieldParse(name, fnames, ftypes)
-    // Two passes: the strict pass is the scan every caller has always run; only a render
-    // that placed nowhere reaches the second, box-lenient pass (D461). A third pass (D733)
-    // handles the name side of literal widenings that both field-set resolvers refuse,
-    // requiring a unique claimant since two widened rows are two layouts.
-    const strictSi = shapeRowScanK(fnames, ftypes, 0)
-    if strictSi >= 0 { return strictSi }
-    const boxSi = shapeRowScanK(fnames, ftypes, 1)
-    if boxSi >= 0 { return boxSi }
-    return shapeRowScanK(fnames, ftypes, 2)
+    return shapeRowScanK(fnames, ftypes)
   }
   -1
 }
 
-// The row scan `structIndexOfTypeName` runs, at one leniency (D461, widened D733). Split
-// out verbatim so the passes cannot drift; `lenient` threads to `shapeFieldTypeCompatK`
-// and changes nothing else. `0` strict (every caller's default), `1` the union-box
-// leniency, `2` plus the literal widenings, which alone needs a unique claimant.
-function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
+// The row scan `structIndexOfTypeName` runs for a shape spelling that resolves no type: the
+// struct row whose field names are the spelling's and whose field types it does not refute.
+function shapeRowScanK(fnames: string[], ftypes: string[]): i32 {
   let uniq = -1
-  let nHit = 0
   let si2 = 0
   const sLimB = sScanLim()
   while si2 < sLimB {
@@ -1501,7 +1490,6 @@ function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
             sFieldTypeAt(si2, fj),
             sFieldElemNameAt(si2, fj),
             sFieldElemTyIxAt(si2, fj),
-            lenient,
           )
         ) {
           ok = false
@@ -1516,23 +1504,13 @@ function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
         // A strict match on a row whose `i32` or `boolean` field is the other kind is kept only
         // as a fallback: the two share a layout, but a read formats by the row, and the
         // spelling's own row may come later in the table (D2866; an anonymous row, D3693).
-        if lenient == 0 {
-          if code0SpellingFitsRow(fnames, ftypes, si2) { return si2 }
-          if uniq < 0 { uniq = si2 }
-        } else {
-          if lenient < 2 { return si2 }
-          if uniq < 0 { uniq = si2 }
-          nHit = nHit + 1
-        }
+        if code0SpellingFitsRow(fnames, ftypes, si2) { return si2 }
+        if uniq < 0 { uniq = si2 }
       }
     }
     si2 = si2 + 1
   }
-  if lenient == 0 { return uniq }
-  if lenient >= 2 {
-    if nHit == 1 { return uniq }
-  }
-  -1
+  uniq
 }
 
 // True if two map value type-names, of arena types `vaTy`/`veTy` or -1, denote the same map
@@ -1561,14 +1539,12 @@ export function mvValNamesCompat(
 
 // Whether shape field type-string `t` is not a proven mismatch with emitter field code
 // `code`, whose row records element `elem` of arena type `elemTy` (-1 unknown): lenient when
-// `t` cannot classify, a map field tightened by its value rep. `lenient` 0 is the exact pass;
-// 1 admits the union box and 2 the literal widenings, each for a render no earlier pass placed (D733).
+// `t` cannot classify, a map field tightened by its value rep.
 function shapeFieldTypeCompatK(
   t: string,
   code: i32,
   elem: string,
   elemTy: i32,
-  lenient: i32,
 ): boolean {
   const want = nameFieldCode(t, -1)
   if want < 0 || code < 0 {
@@ -1580,10 +1556,9 @@ function shapeFieldTypeCompatK(
       return nestedStructNamesCompat(tb, elem)
     }
     // An inline record, or an application of a generic record alias (`Box<A>`), is a struct
-    // field, or a box's arm on the lenient pass only, so `{v:{x:i32}}` takes neither a `{v: A[]}`
-    // row nor a box row declared first (D3898, D3920, D3901).
+    // field, so `{v:{x:i32}}` takes neither a `{v: A[]}` row nor a box row (D3898, D3920, D3901).
     if code >= 0 && nameIsRecordSpelling(nonNulBaseOf(t)) {
-      return code == FC_STRUCT || (code == FC_UNION && lenient >= 1)
+      return code == FC_STRUCT
     }
     // No refutation arm here: every caller reaching this point is already routed through
     // an arena resolver that separates nested-alias twins by their full nested type.
@@ -1595,29 +1570,6 @@ function shapeFieldTypeCompatK(
     // the arm's field as its declared alias (code 0).
     if want == FC_I32 && code == FC_STR {
       if nameIsLitSpelling(t) { return true }
-    }
-    // The union-box field accepts every atom — the name resolver's half of the leniency
-    // `anonValueFitsField` already applies node-side (D461): both answer which struct row a
-    // `{r: 7}` literal builds. Second-pass only: applied on the strict pass it would let a
-    // box row declared first win every single-field render ahead of the exact one.
-    if lenient >= 1 && code == FC_UNION { return true }
-    // The literal widenings (D733), level 2 only — the name side of the field-code widenings:
-    // a render `{r:i32}` denotes `{r:i64}`/`{r:K}` for the same reason the literal built there.
-    if lenient >= 2 {
-      if want == FC_I32 {
-        if code == FC_I64 { return true }
-        if code == FC_F32 { return true }
-        if code == FC_NUL_LIT_UNION { return true }
-        // D902 — and the `boolean | null` niche (21), which the code can't decide but the
-        // spelling can: only the literal text `boolean` widens into the niche, since that
-        // distinction is exactly what code 0 erased.
-        if code == FC_NUL_BOOL { return t == "boolean" }
-      }
-      if want == FC_STR {
-        if code == FC_NUL_STR { return true }
-        if code == FC_NUL_LIT_UNION { return true }
-        if code == FC_I32 { return elem != "" }
-      }
     }
     // The ambiguous nullable-closure render: a code-22 field renders ungrouped
     // (`()=>i64|null`), which `nameFieldCode` reads as a top-level arrow (14) — the grouped

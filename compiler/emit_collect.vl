@@ -120,6 +120,7 @@ import {
   litUnionAliasOfLitTexts,
   litUnionInlineNameOfTy,
   numLitUnionBaseTy,
+  objFieldType,
   structNameOfTy,
   tyArrayElemIx,
   tyAt,
@@ -873,7 +874,6 @@ import {
   unNameBound,
   unRowOfCanonFolded,
   unRowOfKeyOrMembers,
-  unVarSliceAdoptKeySibling,
   unionAtomTysAlignedOf,
   unionMemberAtomsOf,
   unionSetAtomsOf,
@@ -5210,6 +5210,14 @@ function collectAUnionRows() {
   }
 }
 
+// The spelling list literal `i`'s row is stored under: the row name of its key type `ty`, else
+// the literal's own element name where the key renders none.
+function arrLitStoredElemName(i: i32, ty: i32): string {
+  const n = rlRowNameOfTy(ty, false)
+  if n != "" { return n }
+  arrLitElemName(i, -1)
+}
+
 // The list mint's key hint for literal `i`: `arrLitElemHintTy`, else the closed element type the
 // literal is built at. A hole, a type parameter, a literal or a record (whose declaration is its
 // identity) keeps the name's key.
@@ -5310,7 +5318,7 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       const bt = arrLitBuildTy(i)
       const btn = if bt != nodeTyIxOf(i) { rlRowNameOfTy(tyStepElem(bt), true) } else { "" }
       ensureRefElemTys(
-        if btn != "" { btn } else { arrLitElemName(i, -1) },
+        if btn != "" { btn } else { arrLitStoredElemName(i, arrLitMintHintTy(i)) },
         arrLitMintHintTy(i),
         tyStepElem(bt),
       )
@@ -5328,11 +5336,14 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
         const mh = arrLitMintHintTy(i)
         // A row keyed by a list of lists interns its inner rows by type first, as kind 9 does.
         if mh >= 0 && refListElemKindOfTy(mh) == RLK_REF_LIST {
-          recordArrLitRlSlot(i, ensureRefElemTys(arrLitElemName(i, -1), mh, mh))
+          recordArrLitRlSlot(
+            i,
+            ensureRefElemTys(arrLitStoredElemName(i, mh), mh, mh),
+          )
         } else {
           recordArrLitRlSlot(
             i,
-            rlInternNameTy(arrLitElemName(i, -1), elemKind, mh),
+            rlInternNameTy(arrLitStoredElemName(i, mh), elemKind, mh),
           )
         }
       }
@@ -6403,6 +6414,20 @@ function anonInstPrimCode(v: i32, fnIx: i32): i32 {
   if c < 0 { -1 } else { c }
 }
 
+// Whether literal `an` at `objIx` is stamped with a record type other than its own that lacks one
+// of the fields it writes.
+function anonLitDropsAtRep(an: ObjLit, objIx: i32): boolean {
+  const at = anonRowTyIx(objIx)
+  if at < 0 || at == nodeTyIxOf(objIx) { return false }
+  const t = tyAt(at)
+  if !(t is TyObj) { return false }
+  for fx in an.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit && objFieldType(t, f.fiName) < 0 { return true }
+  }
+  false
+}
+
 // The union box a `null` value of the literal at `objIx` is stored in at field `name`: the box
 // of the field type the literal is typed at, when that type is a value union, or "" (D15730).
 function anonNullFieldBox(objIx: i32, name: string): string {
@@ -6418,6 +6443,9 @@ function anonNullFieldBox(objIx: i32, name: string): string {
 // different layouts under one `#anonN` key.
 function anonMintRowFor(objIx: i32, fnIx: i32) {
   const an = nodeAt(objIx)
+  // A literal the checker built at a record declaring fewer fields than it writes is built at
+  // that record's row, its extra fields run for effect, so it mints no row of its own (D3566).
+  if an is ObjLit && anonLitDropsAtRep(an, objIx) { return 0 }
   if an is ObjLit {
     const ai = objIx
     const fields = an.objFields
@@ -9273,10 +9301,6 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
     vPos.push(k)
   }
   if mintVariantRows(stmts, vsx, vTys, vPos) < 0 { return -1 }
-  // A one-member declaration over an inline union shares that union's slice (D1492).
-  if vs.length == 1 && unVarCount[unVarCount.length - 1] == 0 {
-    unVarSliceAdoptKeySibling(unNames.length - 1)
-  }
   // A MIXED union's scalar members intern their per-rep value boxes (no-op for an
   // all-struct union).
   markValueUnionAtoms(udSet, declTyIxOfName(s.udName))
