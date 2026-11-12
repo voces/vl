@@ -1,6 +1,6 @@
 # Step 7 L6 (lane G, cut 6a): the box-path union names come from the box's type, 2026-11-12
 
-The base is master `82ca1ef1`. Ten emit sites named the union a value is boxed into either by
+The base is master `8eddd05c`. Ten emit sites named the union a value is boxed into either by
 `unionNameOfExpr` (the expression's union by spelling and rungs) or by `tyNameOf` (the annotation
 rendered). Every one of them passes the name on to `emitUnionBoxOwed` / `emitUnionBoxArg` together
 with the box's type. `boxDstName(name, ty)` already prefers the row or the value-union key that
@@ -51,6 +51,6 @@ so `boxDstName` already ignores the old name.
 
 - **Seed:** fixpoint. The four comment rewords riding here (`nameIsMapMemberUnion`, deleted by
   #7656) are byte-identical on their own.
-- **Locally:** lint-self, regress, rep-fuzz.
+- **Locally:** lint-self, regress (no runs lost), rep-fuzz (exact), check-filed-witnesses `--strict` (4,860 graded, 0 moved), late-demands (8, baseline 8), seed-size (+1.9%), the comment, ladder, sentinel and scan budgets.
 - **The full sweep:** CI's `sweep` label. The census predicts identity, except where a same-row
   spelling reaches a reader past `boxDstName`.
