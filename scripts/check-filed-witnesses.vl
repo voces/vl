@@ -1,7 +1,8 @@
 // Run the repro filed under every defect heading of a docs inventory and report which rows
 // no longer behave as filed. A row's status line files an outcome, its `Repro:` block is the
 // witness, and an optional `Want:` block or `// PRINTS` line pins the output; `--strict`
-// also fails on a row it cannot grade. The row grammar is `scripts/lib/inventory.vl`.
+// also fails on a row it cannot grade. The row grammar is `scripts/lib/inventory.vl`. A repro's
+// `// file: batch-*.vl` files are checked before its entry in one `--batch --codegen` call.
 //
 //     vl run scripts/check-filed-witnesses.vl -- [--strict] [--json OUT] [--shard K/N] <doc-or-dir>...
 //     vl run scripts/check-filed-witnesses.vl -- --self-test
@@ -216,16 +217,21 @@ function makeTempDir(): string {
 
 // ── witnesses: write each to its own directory, then classify what `vl` does ───────
 
-// A witness written out: its entry's path, and its source when it is one file that names
-// no relative path (so a copy under another name compiles the same program), else "".
-type Staged = { entry: string, alone: string }
+// A witness written out: its entry's path, its source when it is one file that names no relative
+// path (so a copy under another name compiles the same program), else "", and the `batch-*.vl`
+// files compiled before it on one instance.
+type Staged = { entry: string, alone: string, before: string[] }
 
 // Write the files of the repro staged at `dir/repro` beside it.
 function stageWitness(dir: string): Staged {
   const files = splitFiles(readText(dir + "/repro"))
+  const before: string[] = []
   let k = 0
   while k < files.length {
     writeText(dir + "/" + files[k], files[k + 1])
+    if startsWith(files[k], "batch-") && k + 2 < files.length {
+      before.push(dir + "/" + files[k])
+    }
     k = k + 2
   }
   let alone = ""
@@ -236,12 +242,14 @@ function stageWitness(dir: string): Staged {
   ) {
     alone = files[1]
   }
-  { entry: dir + "/" + files[files.length - 2], alone: alone }
+  { entry: dir + "/" + files[files.length - 2], alone: alone, before: before }
 }
 
 // Classify the witness staged in `dir` on the check, run and build channels.
 function classify(dir: string): Ran {
-  const f = stageWitness(dir).entry
+  const st = stageWitness(dir)
+  const f = st.entry
+  if st.before.length > 0 { return classifyAfter(dir, f, st.before) }
   const chk = vl(["check", f, "--compiler", COMPILER])
   if wasKilled(chk) { return timedOut("check") }
   if chk.code != 0 {
@@ -256,6 +264,37 @@ function classify(dir: string): Ran {
     return { outcome: "check_reject", detail: cpPrefix(diag, 200), stdout: "" }
   }
   classifyRun(dir, f)
+}
+
+// Classify entry `f` checked with codegen on the instance that just checked `before`, the batch
+// a defect of leftover state needs: its batch record decides a refusal or an invalid module, and
+// a clean record is graded alone on the run channel.
+function classifyAfter(dir: string, f: string, before: string[]): Ran {
+  const args = ["check", "--batch", "--json", "--codegen"]
+  for b in before { args.push(b) }
+  args.push(f)
+  args.push("--compiler")
+  args.push(COMPILER)
+  const p = vlBatch(args)
+  if wasKilled(p) { return timedOut("check") }
+  for l in splitLines(p.out) {
+    if stripWs(l) == "" { continue }
+    const j = parseJson(l)
+    if j is JsonMap && strField(j, "file") == f {
+      const code = numField(j, "exit")
+      if code == 0.0 { return classifyRun(dir, f) }
+      const detail = cpPrefix(stripWs(l), 200)
+      if code == 70.0 {
+        return { outcome: "silent_invalid_wasm", detail: detail, stdout: "" }
+      }
+      return { outcome: "check_reject", detail: detail, stdout: "" }
+    }
+  }
+  {
+    outcome: "check_reject",
+    detail: "the batch gave the entry no record",
+    stdout: "",
+  }
 }
 
 // Classify the check-clean entry `f`, staged in `dir`, on the run and build channels.
@@ -466,7 +505,10 @@ function gradeChunk(dirs: string[]) {
   const rest: string[] = []
   k = 0
   while k < dirs.length {
-    if exists(dirs[k] + "/" + HINT_ALONE) { bad[k] = true }
+    // A row that needs its `batch-*.vl` files checked first is graded by `classify` alone.
+    if exists(dirs[k] + "/" + HINT_ALONE) || staged[k].before.length > 0 {
+      bad[k] = true
+    }
     if got[k] == null && !bad[k] { rest.push(entries[k]) }
     k = k + 1
   }

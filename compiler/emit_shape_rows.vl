@@ -81,7 +81,6 @@ import {
   nameIsLitUnionType,
   nameIsOneStrLit,
   nulNumLitUnionBaseName,
-  valueAtomKind,
 } from "./check_ty_rep"
 import { nameIsNewtypeBrand } from "./check_type_shape"
 import {
@@ -159,7 +158,6 @@ import {
   gaeParamShadowed,
   gaeSplitArgs,
   mapValNameOf,
-  nameIsBareMap,
   nameIsClosureArray,
   nameIsElemArray,
   nameIsF32Array,
@@ -168,7 +166,6 @@ import {
   nameIsI32ListArray,
   nameIsI64Array,
   nameIsLitUnionArray,
-  nameIsMap,
   nameIsMapArray,
   nameIsNulBool,
   nameIsNulLitUnion,
@@ -365,9 +362,9 @@ import {
   isUNameKeyAB,
   nulArmTyOf,
   tyIsBareMap,
+  tyIsNulMap,
   unNameBound,
   unionArmsOfTy,
-  unionMemberCountOfName,
   unionSetHasNullTy,
   unionSetMemberCount,
 } from "./emit_union_registry"
@@ -399,7 +396,6 @@ import {
   nameIsArray,
   nameIsFuncTypeAtom,
   nameIsShapeOpen,
-  peelGroupParens,
 } from "./tyname"
 import {
   flattenVariantsInto,
@@ -409,6 +405,7 @@ import {
   tyIsArray,
   tyMapHeld,
   tyMapValOf,
+  tyMapValOfHeld,
   tyPeelNul,
   tyReachesHole,
   tyStepRet,
@@ -438,10 +435,10 @@ export function nulRefMapValInnerOfTy(valName: string, ty: i32): string {
   }
   if nonNull != 1 { return "" }
   if inner == "string" { return inner }
-  if nameIsBareMap(inner) { return inner }
+  const innerTy = tyPeelNul(ty)
+  if tyIsBareMap(innerTy) { return inner }
   // A closure member's fat pointer rides the same `(ref null $cloStruct)` vals element a
   // non-null closure uses.
-  const innerTy = tyPeelNul(ty)
   if tyIsFuncArena(innerTy) {
     nrmInnerClosure = true
     return inner
@@ -472,15 +469,7 @@ export function mvSlotNullable(slot: i32) {
   nulRefMapValInnerOfTy(mvValName[slot], mvValTyIxAt(slot)) != ""
 }
 
-// True if the bare map spelling `mapName` has a value type the mv layer can lower —
-// `mvValKindOfName` of its value, tested against the `-3` unsupported sentinel. One home for
-// the classifier gates that would otherwise each spell out the slice and the sentinel, and
-// each have to be found again if the sentinel moves.
-export function mapValKindLowerable(mapName: string) {
-  mvValKindOfName(mapValNameOf(mapName)) != MVK_UNSUPPORTED
-}
-
-// The recorded-type twin of `mapValKindLowerable`, asked of the arena: `mvValLowersTy`, then
+// Whether a map type's value lowers, asked of the arena: `mvValLowersTy`, then
 // the residue it declines. False for a type that is not a map at all.
 export function mapTyValKindLowerable(mty: i32) {
   if mty < 0 { return false }
@@ -649,21 +638,6 @@ function tyKidsAdd(kids: i32[], src: i32[]) {
   }
 }
 
-// The mv value kind of a map value type-name — the one enumeration of which value types a
-// string-keyed map supports: `-1` a mono i32 value riding the shared `$mapStruct`, `-3`
-// unsupported, else the per-slot kind. Read by `mvShapeOfValTyMint`, the slot interner, and by
-// the `map` rep's lowerability gate, so the two cannot drift.
-export function mvValKindOfName(valName: string): i32 {
-  mvValKindOfNameTy(valName, -1)
-}
-
-// `mvValKindOfName` for a caller that also holds the value's arena type `ty`, or -1: the type
-// answers whenever there is one, and the spelling only when there is none.
-export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
-  if ty >= 0 { return mvValKindOfTy(ty) }
-  mvValKindOfSpelling(valName)
-}
-
 // The mv value kind of map value type `ty`, read off its rep descriptor: `MVK_MONO` for a value
 // riding the shared mono map, `MVK_UNSUPPORTED` for one no vals list stores, else the slot kind.
 export function mvValKindOfTy(ty: i32): i32 {
@@ -743,91 +717,6 @@ function mvValUnionKindOfTy(ty: i32): i32 {
   }
   if refMember && ms.length < 2 { return MVK_UNSUPPORTED }
   MVK_UNION
-}
-
-// `mvValKindOfName` of a spelling with no type in hand, cut from the spelling alone.
-function mvValKindOfSpelling(valName: string): i32 {
-  if valName == "i32" || valName == "boolean" { return MVK_MONO }
-  // The `null` unit value stores the `boolean | null` sentinel, so it is the mono map too (D4671).
-  if valName == "null" { return MVK_MONO }
-  // A nullable-atom value that reps as a plain i32 niche with no box — a nullable litunion
-  // (atom ids, `-1` for null) or a nullable boolean (0/1, `2` for null). Each value is an i32
-  // with a spare sentinel, so the map is the mono i32 map. Checked before the union arm, whose
-  // member count would else box a raw i32 niche into a `(ref $box)` cell.
-  if nameIsNulLitUnion(valName) || nameIsNulBool(valName) { return MVK_MONO }
-  // A nullable union value has three sound shapes: a niche nullable ref value — one struct,
-  // map or list member plus null — riding the same vals rep as its non-null twin; a pure
-  // scalar nullable value-union, which boxes; and one with two or more non-null members, which
-  // falls to the union arm. The remainder is a list element the kind-6 pair does not name.
-  if mvValHasNull(valName, -1) {
-    const nin = nulRefMapValInnerOfTy(valName, -1)
-    if nin != "" {
-      if nin == "string" { return MVK_STR }
-      if nameIsMap(nin) { return MVK_REF }
-      // A nullable list value is kind 6, like its non-null twin: the vals element is already
-      // `(ref null <wrapper>)`, so a stored `null` is `ref.null` of that wrapper. The three
-      // predicates are this ladder's kind-6 set, and they must admit the same element reps as
-      // the non-null arm — `u8[]` names itself in both, or the pair splits.
-      if scalarListRepOfName(nin) != null { return MVK_REF }
-      return MVK_STRUCT
-    }
-    const nulAtoms: string[] = []
-    unionArmsOfTy(valName, -1, nulAtoms)
-    let nonNull = 0
-    let refMember = false
-    let na = 0
-    while na < nulAtoms.length {
-      if nulAtoms[na] != "null" {
-        nonNull = nonNull + 1
-        const nvk = valueAtomKind(nulAtoms[na])
-        // The vector (14) is a scalar atom, boxed like the four numeric ones.
-        if nvk < 0 || (nvk >= 7 && nvk != 14) { refMember = true }
-      }
-      na = na + 1
-    }
-    if refMember && nonNull < 2 { return MVK_UNSUPPORTED }
-    if !refMember && !isValueUnionName(valName) { return MVK_UNSUPPORTED }
-  }
-  let kind = -1
-  if valName == "string" {
-    kind = MVK_STR
-  } else if valName == "f64" {
-    // An f64-valued map: its vals list is the scalar f64 list, not a ref list. It rides the
-    // existing mv-slot frame, but the value is a scalar, so its typed valStash is an f64
-    // local rather than a nullable ref.
-    kind = MVK_F64
-  } else if valName == "i64" {
-    // An i64-valued map: the scalar i64 list (`$il64TypeIdx`/`$ia64TypeIdx`); valStash i64.
-    kind = MVK_I64
-  } else if valName == "f32" {
-    // An f32-valued map: the scalar f32 list (`$fl32TypeIdx`/`$fa32TypeIdx`); valStash f32.
-    kind = MVK_F32
-  } else if nameIsBareMap(valName) {
-    // A nested map: the value is an inner map struct ref, stored in a ref list whose element
-    // kind is 3, reusing the same ref-value spine as a struct-valued map. The member-union
-    // guard keeps a map-first union value out of this arm, so it reaches the union arm below.
-    // The inner-value chain resolves recursively to any depth through `mvShapeOfValTyMint`.
-    kind = MVK_REF
-  } else if scalarListRepOfName(valName) != null {
-    // A list-valued map: the value is a list wrapper ref, stored in a ref list whose element
-    // kind picks the inner list's wrapper. Same ref-value spine as a nested map.
-    kind = MVK_REF
-  } else if unionMemberCountOfName(valName) > 1 {
-    // A union-valued map: each value is the shared union box ref, stored in a ref list whose
-    // element kind is 2 — the same ref-value spine as a struct value, differing only in the
-    // element heap and the store-coerce. A map member boxes exactly as it does in binding
-    // position, and `markMapUnionArms` interns the arm's mv slot so tag and read agree.
-    kind = MVK_UNION
-  } else {
-    if structRowOfNameTy(valName, -1) >= 0 { kind = MVK_STRUCT }
-    // The nominal half of that rung (D47): `structIndexByName` is a `sNames` lookup and
-    // `collectS` skips a `type X = {…}` that is a union member, so an arm spelled by its own
-    // name has no struct row. Reached only by the name-keyed gates, which do not canon and
-    // must not disagree with the interner. Nominal: an exact `uVariants` lookup, no shape scan.
-    if kind < 0 && variantIndexOf(valName) >= 0 { kind = MVK_STRUCT }
-  }
-  if kind < 0 { return MVK_UNSUPPORTED }
-  kind
 }
 
 // The arm an adopted map-value shape `name` of record type `ty` (or its `| null` niche) is built
@@ -1457,26 +1346,15 @@ function structIndexOfTypeNameGo(name: string) {
     const fnames: string[] = []
     const ftypes: string[] = []
     shapeFieldParse(name, fnames, ftypes)
-    // Two passes: the strict pass is the scan every caller has always run; only a render
-    // that placed nowhere reaches the second, box-lenient pass (D461). A third pass (D733)
-    // handles the name side of literal widenings that both field-set resolvers refuse,
-    // requiring a unique claimant since two widened rows are two layouts.
-    const strictSi = shapeRowScanK(fnames, ftypes, 0)
-    if strictSi >= 0 { return strictSi }
-    const boxSi = shapeRowScanK(fnames, ftypes, 1)
-    if boxSi >= 0 { return boxSi }
-    return shapeRowScanK(fnames, ftypes, 2)
+    return shapeRowScanK(fnames, ftypes)
   }
   -1
 }
 
-// The row scan `structIndexOfTypeName` runs, at one leniency (D461, widened D733). Split
-// out verbatim so the passes cannot drift; `lenient` threads to `shapeFieldTypeCompatK`
-// and changes nothing else. `0` strict (every caller's default), `1` the union-box
-// leniency, `2` plus the literal widenings, which alone needs a unique claimant.
-function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
+// The row scan `structIndexOfTypeName` runs for a shape spelling that resolves no type: the
+// struct row whose field names are the spelling's and whose field types it does not refute.
+function shapeRowScanK(fnames: string[], ftypes: string[]): i32 {
   let uniq = -1
-  let nHit = 0
   let si2 = 0
   const sLimB = sScanLim()
   while si2 < sLimB {
@@ -1501,7 +1379,6 @@ function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
             sFieldTypeAt(si2, fj),
             sFieldElemNameAt(si2, fj),
             sFieldElemTyIxAt(si2, fj),
-            lenient,
           )
         ) {
           ok = false
@@ -1516,37 +1393,22 @@ function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
         // A strict match on a row whose `i32` or `boolean` field is the other kind is kept only
         // as a fallback: the two share a layout, but a read formats by the row, and the
         // spelling's own row may come later in the table (D2866; an anonymous row, D3693).
-        if lenient == 0 {
-          if code0SpellingFitsRow(fnames, ftypes, si2) { return si2 }
-          if uniq < 0 { uniq = si2 }
-        } else {
-          if lenient < 2 { return si2 }
-          if uniq < 0 { uniq = si2 }
-          nHit = nHit + 1
-        }
+        if code0SpellingFitsRow(fnames, ftypes, si2) { return si2 }
+        if uniq < 0 { uniq = si2 }
       }
     }
     si2 = si2 + 1
   }
-  if lenient == 0 { return uniq }
-  if lenient >= 2 {
-    if nHit == 1 { return uniq }
-  }
-  -1
+  uniq
 }
 
-// True if two map value type-names, of arena types `vaTy`/`veTy` or -1, denote the same map
-// rep: the code-19 tightening the field-set matchers apply. Lenient when either side is
-// unclassifiable or a checker render collapses a litunion alias to `string`; otherwise kinds
-// must agree and slot-bearing values share their canonical rep.
-export function mvValNamesCompat(
-  va: string,
-  vaTy: i32,
-  ve: string,
-  veTy: i32,
-): boolean {
-  const ka = mvValKindOfNameTy(va, vaTy)
-  const ke = mvValKindOfNameTy(ve, veTy)
+// True if two map value types `vaTy`/`veTy` (or -1) denote the same map rep: the code-19
+// tightening the field-set matchers apply. Lenient when either side is -1 or unclassifiable, or
+// a checker render collapses a litunion alias to `string`; otherwise kinds must agree and
+// slot-bearing values share their canonical rep.
+export function mvValTysCompat(vaTy: i32, veTy: i32): boolean {
+  const ka = mvValKindOfTy(vaTy)
+  const ke = mvValKindOfTy(veTy)
   if ka == MVK_UNSUPPORTED || ke == MVK_UNSUPPORTED { return true }
   if ka != ke {
     if ka == MVK_STR && ke == MVK_MONO && tyIsLitUnion(veTy) { return true }
@@ -1561,14 +1423,12 @@ export function mvValNamesCompat(
 
 // Whether shape field type-string `t` is not a proven mismatch with emitter field code
 // `code`, whose row records element `elem` of arena type `elemTy` (-1 unknown): lenient when
-// `t` cannot classify, a map field tightened by its value rep. `lenient` 0 is the exact pass;
-// 1 admits the union box and 2 the literal widenings, each for a render no earlier pass placed (D733).
+// `t` cannot classify, a map field tightened by its value rep.
 function shapeFieldTypeCompatK(
   t: string,
   code: i32,
   elem: string,
   elemTy: i32,
-  lenient: i32,
 ): boolean {
   const want = nameFieldCode(t, -1)
   if want < 0 || code < 0 {
@@ -1580,10 +1440,9 @@ function shapeFieldTypeCompatK(
       return nestedStructNamesCompat(tb, elem)
     }
     // An inline record, or an application of a generic record alias (`Box<A>`), is a struct
-    // field, or a box's arm on the lenient pass only, so `{v:{x:i32}}` takes neither a `{v: A[]}`
-    // row nor a box row declared first (D3898, D3920, D3901).
+    // field, so `{v:{x:i32}}` takes neither a `{v: A[]}` row nor a box row (D3898, D3920, D3901).
     if code >= 0 && nameIsRecordSpelling(nonNulBaseOf(t)) {
-      return code == FC_STRUCT || (code == FC_UNION && lenient >= 1)
+      return code == FC_STRUCT
     }
     // No refutation arm here: every caller reaching this point is already routed through
     // an arena resolver that separates nested-alias twins by their full nested type.
@@ -1595,29 +1454,6 @@ function shapeFieldTypeCompatK(
     // the arm's field as its declared alias (code 0).
     if want == FC_I32 && code == FC_STR {
       if nameIsLitSpelling(t) { return true }
-    }
-    // The union-box field accepts every atom — the name resolver's half of the leniency
-    // `anonValueFitsField` already applies node-side (D461): both answer which struct row a
-    // `{r: 7}` literal builds. Second-pass only: applied on the strict pass it would let a
-    // box row declared first win every single-field render ahead of the exact one.
-    if lenient >= 1 && code == FC_UNION { return true }
-    // The literal widenings (D733), level 2 only — the name side of the field-code widenings:
-    // a render `{r:i32}` denotes `{r:i64}`/`{r:K}` for the same reason the literal built there.
-    if lenient >= 2 {
-      if want == FC_I32 {
-        if code == FC_I64 { return true }
-        if code == FC_F32 { return true }
-        if code == FC_NUL_LIT_UNION { return true }
-        // D902 — and the `boolean | null` niche (21), which the code can't decide but the
-        // spelling can: only the literal text `boolean` widens into the niche, since that
-        // distinction is exactly what code 0 erased.
-        if code == FC_NUL_BOOL { return t == "boolean" }
-      }
-      if want == FC_STR {
-        if code == FC_NUL_STR { return true }
-        if code == FC_NUL_LIT_UNION { return true }
-        if code == FC_I32 { return elem != "" }
-      }
     }
     // The ambiguous nullable-closure render: a code-22 field renders ungrouped
     // (`()=>i64|null`), which `nameFieldCode` reads as a top-level arrow (14) — the grouped
@@ -1644,14 +1480,9 @@ function shapeFieldTypeCompatK(
     if nameIsLitUnionArray(t) != nameIsLitUnionArray(elem) { return false }
     return true
   }
-  // A map field's row identity is its (key, value) pair, so a render naming a different
-  // value is a different row — at the plain code (19) and at the `| null` niche (29), whose
-  // value name comes off the same cut the recorder used (D1665).
-  if want == FC_MAP || want == FC_NUL_MAP {
-    if elem != "" {
-      return mvValNamesCompat(shapeFieldElemName(t, want, -1), -1, elem, elemTy)
-    }
-  }
+  // A map field (19, or the `| null` niche 29) whose row records a value fits: this
+  // spelling carries no value type to tell a different row by.
+  if (want == FC_MAP || want == FC_NUL_MAP) && elem != "" { return true }
   if want == FC_UNION && elem != "" {
     // The name-side twin of `anonValueFitsField`'s box arm: a box's member sequence decides
     // its tags, so a render naming a different one is a different row. Without it an
@@ -1834,10 +1665,6 @@ function refArrShapeKindGo(name: string): i32 {
       // otherwise fall to the kind-2 union box, which has no rep for a niche nullable. An
       // arm and its declared layout twin share one heap since D280, so no new rep is needed.
       if variantIndexOf(nn) >= 0 { return RLK_STRUCT }
-      // A `({[string]: V} | null)[]` nullable-map array is a map ref list (kind 3) — the
-      // same `(ref null $mapStruct)` backing the non-null element uses; the slot key keeps
-      // the `| null` so the index read stays nullable for the `e != null` narrow.
-      if nameIsBareMap(nn) { return RLK_MAP }
       // A `(i32[] | null)[]` nullable-list array reuses the inner list's own rep — kind 4
       // for an i32-backed inner, 6/7/8/10 for a distinct-backing scalar/string inner, 9 for
       // a ref inner — a `(ref null $wrapper)` niche, not a union box. The kind-set gate
@@ -2084,60 +1911,6 @@ function nameIsRefArrayGo(name: string) {
     if unNameBound(base) { return true }
   }
   false
-}
-
-// `refElemArrName` re-forms an element name as its array name (`<elem>[]`) for
-// `refArrElemKind` — one producer, no allow-list. `nulStructElemNiche` asks whether `nn`
-// is the niche kind-1 covers (a declared struct or union variant, one heap since D280),
-// reusing that ladder's exact rungs and order so the two can never disagree (D1340).
-function nulStructElemNiche(nn: string): boolean {
-  if structRowOfSpelling(nn) >= 0 { return true }
-  variantIndexOf(nn) >= 0
-}
-
-// Whether `enp`, the non-null part of a nullable element, is a registered union of two or
-// more members: its nullable is the union box with a null member, as `(U | null)[]` spells it.
-function nulBoxUnionElem(enp: string): boolean {
-  if enp == "" { return false }
-  isUNameDeclAB(74, enp) && unionMemberCountOfName(enp) >= 2
-}
-
-export function refElemArrName(elemName: string): string {
-  // Re-forms `elemName` as its array name for `refArrElemKind` to read the kind. A
-  // nullable-list, closure, or map element needs its grouping parens restored
-  // (`(elem)[]`), matching every niche kind `refArrShapeKind` recognizes; a value-union
-  // element has no niche and stays ungrouped so the union-box arm handles it directly.
-  let arrName = elemName + "[]"
-  const enp = nullablePartOf(elemName)
-  if (
-    enp != ""
-    && (nameIsArray(enp)
-      || nameIsFuncTypeAtom(enp)
-      || nameIsBareMap(enp)
-      || nulStructElemNiche(enp))
-  ) {
-    // A nullable-list, nullable-closure, or nullable-map element needs its grouping
-    // parens restored here to read as its niche kind.
-    arrName = "(" + elemName + ")[]"
-  } else if (
-    parenUnionArrElemName("(" + elemName + ")[]") != ""
-    && (isValueUnionName(elemName) || enp == "" || nulBoxUnionElem(enp))
-  ) {
-    // A value-union element needs its grouping parens restored, or `refArrElemKind`
-    // mis-splits it as a struct element and an unboxed value lands in a ref slot; a
-    // niche-nullable-scalar element (`string | null`) has no union-box rep, so it stays
-    // ungrouped to keep its kind-1 reject.
-
-    arrName = "(" + elemName + ")[]"
-  } else if (
-    enp == ""
-    && nameIsFuncTypeAtom(elemName)
-    && peelGroupParens(elemName) == elemName
-  ) {
-    // A bare function element (`(i32)=>i32`) is grouped too, or `[]` binds to its result (D9231).
-    arrName = "(" + elemName + ")[]"
-  }
-  arrName
 }
 
 export function refArrElemKind(name: string) {
@@ -2478,21 +2251,13 @@ function fieldCodeOfSpelling(t: string, fty: i32) {
   // slot is interned by `collectA`'s arena scan of the annotation node, so emission re-finds
   // it by the value name. A union with a map member (`{[string]: string} | string`) is not a
   // map, and goes to the union test (code 16).
-  if (fty >= 0 && tyIsBareMap(fty)) || (fty < 0 && nameIsBareMap(t)) {
-    return FC_MAP
-  }
+  if fty >= 0 && tyIsBareMap(fty) { return FC_MAP }
   // A nullable map field stores a nullable ref to the value type's map struct, code 29 — the
   // field analogue of the `nulmap` local/param/return niche. Gated to the same supported
   // value kinds as the non-null map field, so a nullable map over an unrepresentable value
   // type keeps failing loudly (-1, no interned shape).
-  const nmi = nulMapInnerName(t)
-  if nmi != "" {
-    if (
-      (recTy >= 0 && mapTyValKindLowerable(nonNullTy(recTy)))
-      || (recTy < 0 && mapValKindLowerable(nmi))
-    ) {
-      return FC_NUL_MAP
-    }
+  if tyIsNulMap(recTy) && mapTyValKindLowerable(nonNullTy(recTy)) {
+    return FC_NUL_MAP
   }
   // A NULLABLE i32-list field (`rest: i32[] | null`) stores a NULLABLE ref to
   // the same wrapper as code 4 — code 18 (`0x63 lTypeIdx`). Checked before the
@@ -3482,7 +3247,7 @@ function nulRefElemNameOfArrTy(ty: i32): string {
 // no such name, which `arrLitNulUnionElemName` reads as no union box.
 export function arrLitNulRefElemKind(arrIx: i32, fnIx: i32): i32 {
   if arrLitNulRefElemName(arrIx, fnIx) == "" { return -1 }
-  refListElemKindOfTy(tyArrayElemIx(nodeTyIxOf(arrIx)))
+  refListElemKindOfTy(tyArrayElemIx(nodeTyAt(arrIx, fnIx)))
 }
 
 // The `arrLitNumKind` answers.
@@ -4279,10 +4044,35 @@ export function refArrElemKeyDeferred(name: string) {
   arrElemNameRaw(name)
 }
 
+// `shapeFieldElemName` for a list or map field read off its type `fty`: the element row's
+// nominal name, a function type in parentheses; "" where the type names none.
+function shapeFieldElemNameOfTy(code: i32, fty: i32): string {
+  if fty < 0 { return "" }
+  if code == FC_REF_LIST { return fieldElemRowName(tyArrayElemIx(fty)) }
+  if code == FC_NUL_REF_LIST {
+    return fieldElemRowName(tyArrayElemIx(tyPeelNul(fty)))
+  }
+  if code == FC_MAP || code == FC_NUL_MAP {
+    return fieldElemRowName(tyMapValOfHeld(fty))
+  }
+  ""
+}
+
+// The row name of element type `ty`: its nominal render, a function type in parentheses.
+function fieldElemRowName(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const n = tyToNominalName(ty)
+  if n == "" { return "" }
+  if tyAt(ty) is TyFunc { return "(" + n + ")" }
+  n
+}
+
 // The element or target name a shape-text field records in `armFieldElemName`: a ref-list
 // field its element name, a nested-struct field its non-null target name, a value-union
 // field its atom-set name; "" otherwise. `fty` is the field's arena type (-1 for none).
 export function shapeFieldElemName(ftxt: string, code: i32, fty: i32) {
+  const tn = shapeFieldElemNameOfTy(code, fty)
+  if tn != "" { return tn }
   if code == FC_REF_LIST { return refArrElemKeyDeferred(ftxt) }
   if code == FC_STRUCT { return nonNulBaseOf(ftxt) }
   if code == FC_UNION { return ftxt }
@@ -4326,15 +4116,20 @@ export function variantFieldRefSlot(vi: i32, fi: i32) {
 }
 
 // The ref-list table slot of struct `si`'s ref-list field `fi`, `variantFieldRefSlot`'s struct
-// twin (D1579), minted on a miss. A field with no recorded element type (a template's field at
-// a type parameter) is minted by the type its stored name resolves to, else by the name.
+// twin (D1579), minted on a miss. A template's field at a type parameter no row holds is keyed
+// by its stored name and classified by its open element type; a field with none by its name's.
 export function sFieldRefSlot(si: i32, fi: i32) {
   const ty = sFieldElemTyIxAt(si, fi)
+  if ty >= 0 && tyHasTyVar(ty) && rlSlotOfTyOrTwin(ty) < 0 {
+    const tn = sFieldElemNameAt(si, fi)
+    rlNameMint(tn, ty)
+    return rlSlotByName(tn)
+  }
   if ty < 0 {
     const nm = sFieldElemNameAt(si, fi)
     const et = fieldElemTyIxOfName(nm)
     if et < 0 {
-      rlNameMint(nm)
+      rlNameMint(nm, -1)
       return rlSlotByName(nm)
     }
     rlRowMint(et)
