@@ -70,6 +70,8 @@ let hmsPaths: i32[][] = []
 let hmsPlaceMatches: i32[] = []
 // Every name the program can rebind — a `let`, a parameter, a loop variable — by spelling.
 let hmsRebindable: {[string]: boolean} = Map()
+// The call each recorded `if` argument is handed to, by the `if`.
+let hmsIfArgCall: {[i32]: i32} = Map()
 
 // Whether scrutinee `ix` may be read once per arm: a literal, or a place `placeKeyOf` keys.
 function matchScrutInPlace(ix: i32) {
@@ -106,6 +108,7 @@ export function hoistMatchScrutinees(rootIx: i32) {
   hmsPaths = []
   hmsPlaceMatches = []
   hmsRebindable = Map()
+  hmsIfArgCall = Map()
   const anc: i32[] = []
   hmsWalk(rootIx, anc)
   let done = 0
@@ -141,7 +144,10 @@ function hmsWalk(ix: i32, anc: i32[]) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = nodeAt(ix)
   if hmsInertLeaf(n) { return 0 }
-  if n is IfStmt { return hmsWalkIfChain(ix, anc) }
+  if n is IfStmt {
+    hmsWalkIfChain(ix, anc)
+    return hmsRecordIfArg(ix, anc)
+  }
   anc.push(ix)
   hmsWalkEach(nodeValueChildren(ix), anc)
   anc.pop()
@@ -222,6 +228,56 @@ function hmsRecordMatch(ix: i32, anc: i32[]) {
     hmsPaths.push(path)
   }
   0
+}
+
+// Records `if` node `ix` when it is an argument of the call its path ends at and every arm ends
+// in a record literal: bound first, its records are delivered as a binding's are (D15807).
+function hmsRecordIfArg(ix: i32, anc: i32[]) {
+  if anc.length == 0 || !hmsIfArmsRecords(ix) { return 0 }
+  const c = anc[anc.length - 1]
+  const cn = nodeAt(c)
+  if !(cn is Call) || !i32ListHasArg(cn.callArgs, ix) { return 0 }
+  hmsIfArgCall[ix] = c
+  const path: i32[] = []
+  for a in anc { path.push(a) }
+  hmsMatches.push(ix)
+  hmsPaths.push(path)
+  0
+}
+
+function i32ListHasArg(xs: i32[], x: i32): boolean {
+  for v in xs {
+    if v == x { return true }
+  }
+  false
+}
+
+// Whether every arm of the `if` chain at `ix` ends in a record literal, the chain closed by an
+// `else`.
+function hmsIfArmsRecords(ix: i32): boolean {
+  let cur = ix
+  let hops = 0
+  while cur >= 0 && cur < P.nodes.length && hops < 64 {
+    const n = nodeAt(cur)
+    if !(n is IfStmt) { return hmsBlockEndsInRecord(cur) }
+    if !hmsBlockEndsInRecord(n.ifThen) || n.ifElse < 0 { return false }
+    cur = n.ifElse
+    hops = hops + 1
+  }
+  false
+}
+
+// Whether block `b`'s last statement, parentheses peeled, is a record literal.
+function hmsBlockEndsInRecord(b: i32): boolean {
+  if b < 0 || b >= P.nodes.length { return false }
+  const bn = nodeAt(b)
+  if !(bn is Block) || bn.blkStmts.length == 0 { return false }
+  let x = bn.blkStmts[bn.blkStmts.length - 1]
+  while x >= 0 && x < P.nodes.length && nodeAt(x) is Paren {
+    const pn = nodeAt(x)
+    x = if pn is Paren { pn.parInner } else { -1 }
+  }
+  x >= 0 && x < P.nodes.length && nodeAt(x) is ObjLit
 }
 
 // Whether node `ix` is a `?.` read with a computed receiver, or else a match whose
@@ -676,7 +732,26 @@ function hmsBindOptRecv(m: i32, n: OptMember) {
 function hmsBind(m: i32) {
   const n = nodeAt(m)
   if n is OptMember { return hmsBindOptRecv(m, n) }
+  if n is IfStmt { return hmsBindIfArg(m) }
   hmsBindMatch(m)
+}
+
+// Mints `const $ij<m> = <the if>` and hands the call its read instead. Returns the declaration,
+// or -1.
+function hmsBindIfArg(m: i32) {
+  const c = hmsIfArgCall[m] ?? -1
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) { return -1 }
+  const name = "$ij" + i32ToStr(m)
+  const sp = nodePos(m)
+  const decl = mkLet("const", name, -1, m, sp)
+  adoptNodeTok(decl, m)
+  const ref = mkIdent(name, sp)
+  adoptNodeTok(ref, m)
+  const args: i32[] = []
+  for a in cn.callArgs { args.push(if a == m { ref } else { a }) }
+  cn.callArgs = args
+  decl
 }
 
 // Mints `const $scrut<m> = <scrutinee>` and points match `m` — its scrutinee, its type
