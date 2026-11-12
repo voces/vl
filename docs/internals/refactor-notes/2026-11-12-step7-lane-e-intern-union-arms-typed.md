@@ -53,6 +53,6 @@ The composite split got to its final rule in three steps:
 - Sweep with fixpoint seeds on both sides, master `c167a4c0` against the candidate: 24,196 same,
   0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps. The arm order
   changed, and no byte moved.
-- `scripts/gate.sh`: all 23 rows pass, among them scaling shape, self-compile time and plumb-shape
+- `scripts/gate.sh` on the branch and on the tree merged with master `a53e6913`: all 23 rows pass, among them scaling shape, self-compile time and plumb-shape
   cost.
 - Render-parse with `--findings`: 9 renders, 3 → 2 parses. `--write-baseline` is in this PR.
