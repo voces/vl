@@ -101,7 +101,7 @@ read E for equal and · for unequal, in the order `tyEq`, `tyEqSameHoles`, `tyEq
 | · · · · · E E | 37 | `{[string]: boolean}` ~ `Set<string>` | by design: `tySameSpelled` spells a Set as its map, and so does canon |
 | · · · · E · E | 23 | `{a: string \| i32}` ~ `P` | union members as a set |
 | · · · E E E E | 16 | `{fs: (...)[]}` ~ `{fs: readonly (...)[]}` | `readonly` counts only for the `tyEq` family |
-| E E E E E E · | 13 | `{[i32]: i32} \| {[i32]: boolean} \| string` twice, rendered alike | **unexplained: canon gives two types every other notion calls one different ids** |
+| E E E · E E E | 13 | `(i32 \| string) \| f64` ~ `i32 \| string \| f64`; `L1` ~ `L2` (declared recursive twins) | **`tySame` alone calls them different**: it does not flatten a nested union layer, and keeps declared twins apart. The canon key gives both one id (8 and 8, 4 and 4, read back by a witness build) |
 | · · E · · · · | 10 | `{tag: "a", v: i32}` ~ `{tag: string, v: i32}` | **unexplained: `tyEqSoftLits` softens a nested field literal, but the canon key it says it mirrors does not** |
 | · · E · E · E | 9 | `"a" \| "b" \| "x" \| "y" \| null` ~ the same members reordered | union order: the set notions and canon agree |
 | · · · · E · · | 5 | `{a: i32, b: i32}` ~ `AB` | **unexplained: `tySameSet` equates them where canon, which equates `Box2` with `{r: i32}` above, does not** |
@@ -114,18 +114,19 @@ Grading:
   notions means.
 - **Three vectors are not explained by any notion's comment.** These are where the ruling needs a
   probe on each witness before floor or contract can be decided:
-  - 13 programs, canon unequal on two identical-rendering types;
-  - 10 programs, `tyEqSoftLits` against canon at a nested field literal;
-  - 5 programs, `tySameSet` against canon for a declared record.
+  - 13 programs: `tySame` alone splits a nested union layer from its flat spelling, and two
+    declared recursive twins. Its comment says it compares components recursively; it does not
+    say that a union layer counts.
+  - 10 programs: `tyEqSoftLits` against canon at a nested field literal.
+  - 5 programs: `tySameSet` against canon for a declared record.
 
-  The first is the one to look at first. If the canonical key is not a function of the type, a
-  memo keyed by it can split one type in two. None of the three is filed: whether each is a defect
-  depends on the ruling, and no program is known to compile wrongly from it.
+  The canonical key is not split in any of them: every vector that has canon unequal is a notion
+  drawing its own documented line. None of the three is filed. Whether each is a defect depends on
+  the ruling, all 28 programs run, and their outputs match their `@log` lines or `Want:` blocks.
 
 **Proposed for the ruling:** the nine contracts are one notion each and belong in §3.3's contract
 text, not the deviation line. `tySameAnonRow` and `tyEqNoneIsMap` leave the list, since they are not
-type equalities. The three unexplained vectors are investigated before that, starting with the
-canon one.
+type equalities. The three unexplained vectors are investigated before that.
 
 ## Proof
 
