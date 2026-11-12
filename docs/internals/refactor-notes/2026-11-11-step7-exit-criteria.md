@@ -3,6 +3,9 @@
 Step 7 completes when `ARCHITECTURE.md` §7's deviation lines L1 (§3.5, §4.1), L2 (§2.4, §3.4,
 §4.1) and L6 (§3.3, §4.1) can be deleted. This note lists, for each line, what remains.
 
+L1 was deleted on 2026-11-12, its readers classified and converted
+(`2026-11-12-l1-deleted.md`). The sections below are L2's and L6's.
+
 It is measured on master `77d45015` (#7288), with a fixpoint seed of 6,623,600 bytes. The counts
 come from closing census 3 (`2026-11-11-step7-closing-census-3.md`), re-run where master has moved
 since. Each open PR's effect is measured on that PR's own tree against its merge base.
@@ -12,30 +15,6 @@ Each remaining site is graded one of two ways:
 - **floor:** named and accepted by design in architecture-target, a DECISIONS.md ruling or a
   coordinator ruling;
 - **convert:** a site that must change before the line can go.
-
-## L1: instance reads of a type holding type parameters
-
-**What the line cites:**
-
-- 94 of the emitter's 959 `nodeTyIxOf` call lines read a type holding type parameters while an
-  instance is emitted (`2026-11-11-l1-instance-reader-recount.md`, master `2fb114d7`, 19,544 files).
-- `bindGenWalk`: 3 call sites in `emit_mono.vl` and 23 in `emit_elab.vl`, by grep today.
-- `monoArgTyName`: 6, by grep.
-- No open row. The (c) literal is gone.
-
-**Floor or convert:** the 94 have not been classified. On 2026-10-24 each of the then 78 had a
-by-design reason. Of today's 94, the elaboration's 15 include its reads of the template's own type
-(`elabCheckedTyOf`, `litRepTyIn`, `litRepTyAt`), which are by design. The line can go only once
-every site is either classified by design or converted to `nodeTyAt(ix, fnIx)`.
-
-**In flight:** w318 is staging the deletion, and #7243 (w318) converts the empty `[]` readers. Its
-effect on the 94 is not measured here: the recount's instrument poisons a seed, and it is not
-committed.
-
-**Unowned:** nothing, since w318 holds the line.
-
-**Exit item:** w318's classification of the 94, one class per site, with every non-by-design site
-converted.
 
 ## L2: render-then-parse, two-producer classifiers, rows minted under a name
 
@@ -213,20 +192,19 @@ asked.
 
 ## The list to close step 7 against
 
-1. **L1:** w318's classification of the 94 instance reads, each by design or converted.
-2. **L2:**
+1. **L2:**
    - renders to the floor of 12, with 9 mono renders after #7298 (w317) and 7 key and union renders
      (w309, w310, w311, w316);
    - parses to 0, with 21 in `emit_base` (w310), 22 in `emit_shape_rows` (w311, w314, w309), 6 in
      mono (w317), 5 in the interner (w310), 2 in map values (w309), 2 in the union registry (w316)
      and 1 in `ensureRefElemTys` (w311);
    - the 14 ARENA + NAME and 2 ARENA + SPELLING pairs named.
-3. **L6:**
+2. **L6:**
    - the 11 struct and variant name producers and `retStructRowIndex`'s rung switched to the type
      (w324, #7306);
    - the union cut order items 5b–6 (w316);
    - the ref-list name producers (w311);
    - an instrument listing the spelling-keyed maps by reader;
    - a ruling on the equality notions.
-4. **The scoreboard (ruled):** re-baseline both targets at the close with their reason, graded by
+3. **The scoreboard (ruled):** re-baseline both targets at the close with their reason, graded by
    the measures they stood in for. They are not landing criteria.

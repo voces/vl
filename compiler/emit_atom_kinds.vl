@@ -79,17 +79,29 @@ import {
   unwrapParen,
 } from "./emit_base"
 import {
+  RepDesc,
   declTyIxOfName,
   repCanonId,
+  repOfTy,
   repRowId,
   repRowOfTyStruct,
   sFieldElemTyIxAt,
 } from "./emit_rep"
 import {
+  FC_F32,
+  FC_F64,
   FC_I32,
   FC_I32_LIST,
+  FC_I64,
+  FC_NUL_NONE,
+  FC_NUL_STR,
+  FC_STR,
+  FC_STRUCT,
+  FC_UNION,
+  VKind,
   armFieldElemName,
   armFieldElemTyIx,
+  armFieldStoreTy,
   armFieldTypes,
   fnStmts,
   sAnonOwnTy,
@@ -97,6 +109,7 @@ import {
   sFieldElemName,
   sFieldNames,
   sFieldStart,
+  sFieldStoreTy,
   sFieldTypes,
   sIsRefRow,
   sNames,
@@ -112,6 +125,170 @@ import { nonNullTy, tyHasTyVar } from "./tyquery"
 // field at field index `fi`.
 export function sFieldTypeAt(si: i32, fi: i32) {
   sFieldTypes[sFieldStart[si] + fi]
+}
+
+// The covered rep of the struct table's flat field row `r`'s storage type, or null where none
+// is recorded or the descriptor does not cover it; there the field code is the only answer.
+function fieldRowStoreRep(r: i32): RepDesc | null {
+  rowStoreRepIn(sFieldStoreTy, r)
+}
+
+// `fieldRowStoreRep` of row `r` of storage-type column `tys`.
+function rowStoreRepIn(tys: i32[], r: i32): RepDesc | null {
+  if r < 0 { return null }
+  const ty = if r < tys.length { tys[r] } else { -1 }
+  if ty < 0 { return null }
+  const d = repOfTy(ty)
+  if d.rdCovered == 0 { return null }
+  d
+}
+
+// The field code of flat row `r`, or -1 for no row.
+function fieldRowCode(r: i32): i32 {
+  if r < 0 || r >= sFieldTypes.length { return -1 }
+  sFieldTypes[r]
+}
+
+// Whether flat field row `r` holds the union box.
+export function fieldRowIsUnionBox(r: i32): boolean {
+  const d = fieldRowStoreRep(r)
+  if d == null { return fieldRowCode(r) == FC_UNION }
+  d.rdKind == "union"
+}
+
+// Whether flat field row `r` holds a non-null `i32`: a number, a boolean or an atom.
+export function fieldRowIsPlainI32(r: i32): boolean {
+  const d = fieldRowStoreRep(r)
+  if d == null { return fieldRowCode(r) == FC_I32 }
+  d.rdKind == "i32" && d.rdNul == 0
+}
+
+// Whether flat field row `r` holds a record ref. A `nulnone` storage is a hole's record or the
+// `null` unit, which only the code tells apart.
+export function fieldRowIsRecordRef(r: i32): boolean {
+  const d = fieldRowStoreRep(r)
+  if d == null || d.rdKind == "nulnone" { return fieldRowCode(r) == FC_STRUCT }
+  d.rdKind == "nulstruct" || d.rdKind == "nulvariant"
+}
+
+// Whether flat field row `r` holds only `null` (the `null` unit's `nullref` slot).
+export function fieldRowIsNulNone(r: i32): boolean {
+  const d = fieldRowStoreRep(r)
+  if d == null || d.rdKind == "nulnone" {
+    return fieldRowCode(r) == FC_NUL_NONE
+  }
+  false
+}
+
+// Whether flat field row `r` holds a string, non-null (`nul` false) or `string | null` (true).
+export function fieldRowIsStr(r: i32, nul: boolean): boolean {
+  const d = fieldRowStoreRep(r)
+  if d == null {
+    const want = if nul { FC_NUL_STR } else { FC_STR }
+    return fieldRowCode(r) == want
+  }
+  if nul { d.rdKind == "nulstr" } else { d.rdKind == "str" }
+}
+
+// The numeric scalar kind flat field row `r` holds (0 a plain `i32`, 3 `i64`, 4 `f64`, 5 `f32`),
+// or -1 for any other storage.
+export function fieldRowNumKind(r: i32): i32 {
+  const d = fieldRowStoreRep(r)
+  if d == null {
+    const c = fieldRowCode(r)
+    if c == FC_I32 { return 0 }
+    if c == FC_I64 { return 3 }
+    if c == FC_F64 { return 4 }
+    if c == FC_F32 { return 5 }
+    return -1
+  }
+  match d.rdKind {
+    "i32" => {
+      return if d.rdNul == 0 { 0 } else { -1 }
+    }
+    "i64" => {
+      return 3
+    }
+    "f64" => {
+      return 4
+    }
+    "f32" => {
+      return 5
+    }
+    "struct" | "list" | "str" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      return -1
+    }
+  }
+}
+
+// The covered storage rep of variant `vi`'s field `fi`, read through the arm table, which is the
+// staging column until the arms adopt their rows; null where the code is the only answer.
+function variantFieldStoreRep(vi: i32, fi: i32): RepDesc | null {
+  rowStoreRepIn(armFieldStoreTy(), uFieldStart[vi] + fi)
+}
+
+// Whether variant `vi`'s field `fi` holds the union box.
+export function variantFieldIsUnionBox(vi: i32, fi: i32): boolean {
+  const d = variantFieldStoreRep(vi, fi)
+  if d == null { return variantFieldTypeAt(vi, fi) == FC_UNION }
+  d.rdKind == "union"
+}
+
+// Whether variant `vi`'s field `fi` holds `string | null`.
+export function variantFieldIsNulStr(vi: i32, fi: i32): boolean {
+  const d = variantFieldStoreRep(vi, fi)
+  if d == null { return variantFieldTypeAt(vi, fi) == FC_NUL_STR }
+  d.rdKind == "nulstr"
+}
+
+// Whether variant `vi`'s field `fi` holds only `null`. A `nulnone` storage is a hole's record or
+// the `null` unit, which only the code tells apart.
+export function variantFieldIsNulNone(vi: i32, fi: i32): boolean {
+  const d = variantFieldStoreRep(vi, fi)
+  if d == null || d.rdKind == "nulnone" {
+    return variantFieldTypeAt(vi, fi) == FC_NUL_NONE
+  }
+  false
+}
+
+// The kind a field with covered storage rep `d` and field code `code` is stored at, a variant
+// ref named as its arm's struct row (the slot a field passes is that row); null where only the
+// code answers, which includes a hole's record, since it reps as `nulnone` too.
+function fieldStorageKindOf(d: RepDesc | null, code: i32): VKind | null {
+  if d == null { return null }
+  match d.rdKind {
+    "nulnone" => {
+      return if code == FC_NUL_NONE { "nulnone" } else { null }
+    }
+    "nulvariant" => {
+      return "nulstruct"
+    }
+    "variant" => {
+      return "struct"
+    }
+    "i32" | "i64" | "f64" | "f32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "nulstruct" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      return d.rdKind
+    }
+  }
+}
+
+// The kind flat field row `r` is stored at, or null where its field code is the only answer.
+export function fieldRowStorageKind(r: i32): VKind | null {
+  fieldStorageKindOf(fieldRowStoreRep(r), fieldRowCode(r))
+}
+
+// The kind variant `vi`'s field `fi` is stored at, or null where its field code is the only answer.
+export function variantFieldStorageKind(vi: i32, fi: i32): VKind | null {
+  fieldStorageKindOf(variantFieldStoreRep(vi, fi), variantFieldTypeAt(vi, fi))
+}
+
+// Whether variant `vi`'s field `fi` holds a record ref.
+export function variantFieldIsRecordRef(vi: i32, fi: i32): boolean {
+  const d = variantFieldStoreRep(vi, fi)
+  if d == null || d.rdKind == "nulnone" {
+    return variantFieldTypeAt(vi, fi) == FC_STRUCT
+  }
+  d.rdKind == "nulstruct" || d.rdKind == "nulvariant"
 }
 
 // The ref-list element type-name of struct `si`'s field `fi` (a code-5 field), "" otherwise.

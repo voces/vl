@@ -4,6 +4,7 @@
 // Each answers a type or a verdict for a node the core checker has already typed.
 
 import { cwIxCovers } from "./check_write_scan"
+import { recDropFits } from "./check_rec_drop"
 import { MemoGen, memoGenNew } from "./memo"
 import {
   fieldNameOf,
@@ -5334,10 +5335,9 @@ export function recAdoptUnionList(
   true
 }
 
-// Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
-// element of a literal list binding, to a record that stores a field differently.
 // Whether the record `dst` stores each field of the record `src` as `src` does, or a scalar field
-// as that scalar or `null`, or a union listing that scalar: the fields a record copy boxes.
+// as that scalar or `null`, a number it widens to exactly or `null`, or a union listing that
+// scalar: the fields a record copy boxes.
 export function recCopyBoxesOnly(src: i32, dst: i32): boolean {
   const so = tyAt(src)
   const d = tyAt(dst)
@@ -5355,7 +5355,8 @@ export function recCopyBoxesOnly(src: i32, dst: i32): boolean {
     const dn = if df >= 0 && df < T.tys.length { tyAt(df) } else { null }
     const sp = if sf >= 0 && sf < T.tys.length { tyAt(sf) } else { null }
     const boxes = sp is TyPrim
-      && (dn is TyNullable && tySame(dn.nInner, sf)
+      && (dn is TyNullable
+      && (tySame(dn.nInner, sf) || recNumWidens(sf, dn.nInner))
       || dn is TyUnion && recUnionHasMember(df, sf))
     if sf < 0 || !(boxes || fieldStorageEq(sf, df, REC_STORE_DEPTH)) {
       return false
@@ -5364,6 +5365,17 @@ export function recCopyBoxesOnly(src: i32, dst: i32): boolean {
   }
   true
 }
+
+// Whether the number `src` converts to the other number `dst` exactly: `i32` into `i64` or `f64`,
+// `i64` or `f32` into `f64`.
+function recNumWidens(src: i32, dst: i32): boolean {
+  const s = tyAt(src)
+  const d = tyAt(dst)
+  if !(s is TyPrim) || !(d is TyPrim) { return false }
+  strListHas(NUM_WIDENS, s.primName + ">" + d.primName)
+}
+
+const NUM_WIDENS = ["i32>i64", "i32>f64", "i64>f64", "f32>f64"]
 
 // Whether the union `u` lists `m` as a member.
 function recUnionHasMember(u: i32, m: i32): boolean {
@@ -5453,6 +5465,8 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   true
 }
 
+// Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
+// element of a literal list binding, to a record that stores a field differently.
 export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if srcTy < 0 || dstTy < 0 || srcTy == dstTy { return 0 }
   if !tyHoldsObjDeep(srcTy) || !tyHoldsObjDeep(dstTy) { return 0 }
@@ -5685,6 +5699,9 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
           return recAdPushDecl(pf, srcTy, nonNulTyOf(dstTy), false, pc)
         }
         if recHasLitLeaf(pf) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
+        // The identity hands back the fresh call it is given, so its result is copied where it
+        // lands, as the call's would be.
+        if pc == pp && recFreshCallCopy(pf, p, srcTy, dstTy) { return 0 }
         const pld = recLandingOf(srcTy, dstTy)
         if (
           recHasLitLeaf(pf)
@@ -6352,7 +6369,11 @@ function objShapeAdapterless(
           }
           // A pinned binding's literal runs the initializer of a field a record drops; no union
           // arm is built from a wider record (D3566).
-          if recAdPinInit && !objShapeAtArm && litShapeDropSrcExpr(cx) {
+          if (
+            recAdPinInit
+            && litShapeDropSrcExpr(cx)
+            && (!objShapeAtArm || recDropFits(src, dst))
+          ) {
             return false
           }
           // The width lift (D622): a `Wide` flowing into a `Narrow` whose fields are the first
@@ -8891,6 +8912,20 @@ function objLitUnionArm(e: ObjLit, srcTy: i32, members: i32[]): i32 {
       }
     }
     mi = mi + 1
+  }
+  // A pinned binding's literal that drops fields lands on the one arm it drops them at (D3566).
+  if first < 0 && recAdPinInit && srcTy >= 0 && srcTy < T.tys.length {
+    for m in members {
+      if (
+        m >= 0
+        && m < T.tys.length
+        && tyAt(m) is TyObj
+        && recDropFits(srcTy, m)
+      ) {
+        if first >= 0 { return -1 }
+        first = m
+      }
+    }
   }
   first
 }
