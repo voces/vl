@@ -45,3 +45,31 @@ candidate.
 - dead-export: 0.
 
 **The full sweep:** CI's `sweep` label.
+
+## The sweep's one mover, and its fix
+
+The first CI sweep lost one program: D10130, `k?.get("a") ?? d` over `{[string]: V} | null` at
+the `i32` pin. It went from runs to `union box atom test on a union with no recorded members: null`.
+
+**Cause.** The `??` call-stash arm asks `unionHasAtomK(ksid, "null", …)` of the operand's set.
+At this pin the set is unresolved (-1). The removed name fallback answered `false` for
+`i32|null`, because that name has no recorded arms. The arm then declined to a later one.
+
+**Rejected rules.**
+- Reading the instance type with `nodeTyAt` resolves no set either.
+- Reading null-membership off the type (`tyHasNullMember`) passes the gate. The arm then
+  refuses with `scalar map read has no value-box type`.
+
+**Fix.** `setHasNullAtom(s)` answers `false` for an unresolved set. All four `??` null gates use it.
+
+**Population: one program.** A probe compiler noted every unresolved set at the four gates,
+with the name fallback's answer beside it. Only D10130 hit, at the call-stash gate, where the
+name answered no null:
+- inventory witnesses: 1 of 4,743;
+- distilled and corpus chunks: 0 of 9,202;
+- the self-compile: 0.
+
+The rule matches master on every observed hit.
+
+**After the fix:** D10130 prints `5`. lint-self is clean, rep-fuzz is exact, regress loses no
+runs, cases_wasm passes 7,537, and the emitter-state audit passes.
