@@ -36,6 +36,12 @@ the program ran.
 - `value-join-of-maps-of-hole-fns.matrix.vl`, base master and head this branch: `array_push`
   (both faces) and `map_set` (annotated) go from TRAP (program) to runs. Runs → not-runs 0,
   → silent 0, → program trap 0.
-- Neighbouring matrices and the corpus: see the PR body.
+- 116 neighbouring matrices on fixpoint seeds: runs → not-runs 0, → program trap 0, no
+  COMPILER TRAP, no new SILENT; the only movers are the three cells above.
+- One movement, measured and named: a list literal of one map of an un-annotated function,
+  pushed onto an annotated list of lists of maps, moves from check-clean invalid wasm to a loud
+  `monoPinMapValues` refusal (silent → loud). The two-map spelling stays invalid wasm on both
+  sides. Both are filed as D15943 (clause 1), with the matrix that holds them.
+- Corpus: CI's sweep `diff` (PR body).
 - Fixture: `tests/cases/maps/hole-fn-map-value-join-pushed-inline.vl` (push, a second function,
   `set`).
