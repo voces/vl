@@ -39,19 +39,18 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `d5f26894`, 2026-11-12 23:00)
+## Still failing at this draft (master `b323f223`, 2026-11-12 23:35)
 
-The close is opened when this list is empty, or holds only items with an open PR.
+The close is opened when this list is empty, or holds only items with an open PR. Closed since
+the 23:00 draft: lane D's mono rows (#7681, #7688), lane F's `sFieldRefSlot` fallback (#7683) and
+lane H's `variantNestedRow` lookup (#7679).
 
 | lane | sites |
 | --- | --- |
 | B | `structRowOfSpelling` chain, one site (`emit_nullable_rets.vl:615`) |
-| E (E5, after H's #7668) | `structElemArrayLowerable`, `internFuncTypeShapesTyGo` |
-| E3 | `internShapeDeepOfTy`, `internArmShapeRow` renders |
-| F | `sFieldRefSlot`'s `ty < 0` name fallback (#7683, open) |
-| H | `armFieldStructRowMinted`; `printUnionPlanCode`'s name fallbacks (`variantNestedRow` closed, #7679) |
-| G | `unionNameOfCall`; `unionNameOfExpr`'s callers (with A's two `emitUnionUnionEq` calls) |
-| D | `monoArgTyNameProjected`, `monoPinAnnotatedParam`; `monoAnonRowListTy`'s list-depth parse (a spelling read, ruled) |
+| E | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; the D6 interner's `nm` input, which `variantNestedRow` and `armFieldStructRowMinted` hand it |
+| G | `unionNameOfCall`; `unionNameOfExpr`'s 18 call lines |
+| H | `printUnionPlanCode`'s name fallbacks |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
 
