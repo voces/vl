@@ -10,29 +10,30 @@ The base is master `e071cea1` (compiler as at `cf01f012`), with a fixpoint seed 
 ## Census
 
 The probe was a scratch compiler, never refreshed into a seed. Each probe site added a tag to an
-accumulator, and `emitProgram` raised every tag as one `emitFail`. The channel was checked first
-against a control: an unconditional tag fired on a plain program. The population is the sweep's,
-24,070 programs.
+accumulator, and `emitProgram` raised every tag as one `emitFail`. The accumulator is emptied
+at each `emitProgram`, since a `--batch` run keeps module state across its programs. The channel
+was checked first against a control: an unconditional tag fired on a plain program. The
+population is the sweep's, 24,070 programs; each count below is of programs.
 
 **Untyped reaches of the ladder.** Every arm was tagged, with its caller.
 
 | caller | spelling | programs | answer |
 | --- | --- | --- | --- |
-| `internShapeAs` | `i32` | 775 | 0 (`i32`) |
-| `nameFieldCodeTy` (`internInlineShapeTyGo`) | ` i32` | 377 | -1 |
+| `internShapeAs` | `i32` | 46 | 0 (`i32`) |
+| `nameFieldCodeTy` (`internInlineShapeTyGo`) | ` i32` | 12 | -1 |
 | any other caller, or any other arm | — | 0 | — |
 
 `internShapeAs`'s rows are struct-alias unions: `type AB = A & B`, `type MyCat = Cat`, and arms
 that all spell one shape. Its type `cUserTypes[key]` is a `TyUnion` whose members are that shape's
-`TyObj`, in all 10 distinct row/shape pairs. `shapeFieldRowOf` asked the union for a field and
+`TyObj`, in every one of its 10 distinct row/shape pairs. `shapeFieldRowOf` asked the union for a field and
 found none.
 
 **The two spelling producers against the type's rep**, at every reach:
 
-| producer | agree | spelling null, type a scalar list | disagree | untyped |
-| --- | --- | --- | --- | --- |
-| `scalarListRepOfName` | strlist 751, list 343, f64list 70, i64list 34 | 0 | 0 | 0 |
-| `nulScalarListKind` | nuli64list 44, nulstrlist 39 | 0 | 0 | ` i32` only (null) |
+| producer | reached | agree, the spelling answering | spelling null, type a scalar list | disagree | untyped |
+| --- | --- | --- | --- | --- | --- |
+| `scalarListRepOfName` | 92 | strlist 18, list 9, f64list 2, i64list 1 | 0 | 0 | 0 |
+| `nulScalarListKind` | 79 | nuli64list 2, nulstrlist 1 | 0 | 0 | 12, all ` i32` (null) |
 
 The rep column compared against is `repOfTy(ty)`'s covered kind.
 
