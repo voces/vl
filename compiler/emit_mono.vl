@@ -5276,7 +5276,10 @@ function monoSubstIsExpr(ix: i32, io: i32, variant: string) {
     // A parameter bound to a literal's `#anon` row banks the list of the row's shape as the
     // check type, which is the arm an inferred union holds for it (D5083).
     const nx = monoMkIsExprLike(ix, io, variant)
-    const aty = monoAnonRowListTy(variant)
+    const aty = monoAnonRowListTy(
+      variant,
+      substTyDeep(isVarTyIxOf(ix), monoFoldSubN, monoFoldSubT),
+    )
     if aty >= 0 {
       recordClonedIsVarTyIx(nx, aty)
     } else if (
@@ -5309,20 +5312,22 @@ function monoSubstIsExpr(ix: i32, io: i32, variant: string) {
   ix
 }
 
-// The list type over a literal's `#anon` row's shape that `name` spells (`#anon0[]` is
-// `{x:i32}[]`); -1 for any other name, the bare row and a row with no recorded type included.
-function monoAnonRowListTy(name: string): i32 {
-  let base = name
+// The list type over the shape of a literal's `#anon` row, at the list depth of `listTy` (a list
+// type, open or closed): `name` spells that row's handle with one `[]` per level (`#anon0[]` is
+// `{x:i32}[]`). -1 for a `listTy` that is no list, a name that is no row handle, and a row with no
+// recorded type. The depth is the type's; the name is read only as the handle.
+function monoAnonRowListTy(name: string, listTy: i32): i32 {
   let depth = 0
-  while (
-    base.length > 2
-    && base[base.length - 1] == ']'
-    && base[base.length - 2] == '['
-  ) {
-    base = base.slice(0, base.length - 2)
+  let t = listTy
+  while t >= 0 && t < T.tys.length {
+    const a = tyAt(t)
+    if !(a is TyArray) { break }
+    t = a.aElem
     depth = depth + 1
   }
-  if depth == 0 || base.length < 5 || base[0] != '#' { return -1 }
+  if depth == 0 || name.length < 2 * depth + 5 { return -1 }
+  const base = name.slice(0, name.length - 2 * depth)
+  if base[0] != '#' { return -1 }
   const si = structIndexByName(base)
   if si < 0 || si >= sTyIx.length || sTyIx[si] < 0 { return -1 }
   let ty = sTyIx[si]
@@ -7859,9 +7864,9 @@ export function monoTagMapRepName(
 ): string {
   if t < 0 || t >= T.tys.length { return "" }
   const m = tyAt(t)
-  if m is TyMap { return "{[" + tyToStr(m.mKey) + "]: i32}" }
+  if m is TyMap { return monoPinSpellShaped(mapStoredTyOf(t)) }
   if !(m is TyObj) || !fnTagHoldsTy(t, 8) { return "" }
-  let k = "{"
+  const sts: i32[] = []
   let i = 0
   while i < m.objFieldNames.length && i < m.objFieldTypes.length {
     const f = m.objFieldTypes[i]
@@ -7889,10 +7894,10 @@ export function monoTagMapRepName(
     if sp == "" { return "" }
     codes.push(fieldCodeOfTy(st))
     texts.push(sp)
-    k = k + (if i > 0 { ", " } else { "" }) + m.objFieldNames[i] + ": " + sp
+    sts.push(st)
     i = i + 1
   }
-  k + "}"
+  monoPinSpellShaped(mkObjTy(m.objFieldNames, sts))
 }
 
 // Whether `t` is a map whose values are a tagged set's ids.
@@ -8564,7 +8569,7 @@ function monoSynthPinRef(name: string, ty: i32): i32 {
     const sp = monoPinSpellOf(ty)
     return synthTypeRefTy(if sp != "" { sp } else { name }, -1, ty)
   }
-  const alt = monoAnonRowListTy(name)
+  const alt = monoAnonRowListTy(name, ty)
   if alt >= 0 { return synthTypeRefOfTy(alt, -1) }
   synthTypeRefFb(name, -1, ty)
 }
