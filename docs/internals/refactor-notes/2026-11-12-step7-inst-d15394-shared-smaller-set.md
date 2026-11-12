@@ -44,4 +44,16 @@ move to D14082 (a lambda's record result with no union box). It still refuses wi
 
 ## Proof
 
-SWEEP
+**Full local sweep.** The base is #7410's head (`4409aedc`, master `99032767` merged in) and the
+head is this branch's fixpoint seed; 23,986 programs:
+
+| | count |
+| --- | --- |
+| same | 23,985 |
+| bytes-only | 0 |
+| output movers | 1 |
+| runs → not-runs | 0 |
+| new compiler traps | 0 |
+
+The one mover is D15394, which goes from refusal to runs. D15158's new witness, D14082's program,
+still refuses.
