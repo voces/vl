@@ -633,7 +633,7 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   setEmitSrcMap: "input", setHeapWindow: "input", setImportMemory: "input",
   setLowMemoryUnused: "input", setMemoryPages: "input", setOneShot: "input",
   idShadowAt: "uncached", idShadowCount: "uncached", idShadowLen: "uncached",
-  setIdShadow: "uncached", clsCensusAt: "uncached", clsCensusCount: "uncached",
+  setIdShadow: "uncached", setOpaqueSNames: "input", clsCensusAt: "uncached", clsCensusCount: "uncached",
   clsCensusLen: "uncached", setClsCensus: "uncached", setOptimized: "input", setRepShadow: "uncached", setSharedMemory: "input", src: "input",
   srcReset: "input",
   vlRootCommit: "input", vlRootPush: "input", vltCount: "uncached", vltFailAt: "uncached",
