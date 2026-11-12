@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Step 7 L2, mono: an inline record pin is spelled by the naming rule from its type.** `monoInstanceFor`'s instance parameters and `monoSlotPinAnn`'s slot signatures recognised an inline record pin by its brace spelling (`nameIsBraceSpanEnds`) and re-spelled it by parsing its fields (`monoPinShapeSpell`, over `annObjFieldSplit`). Both now ask the pin's type (`monoTyIsInlineRecord`: a record no declaration names) and spell it with `monoPinSpellShaped`. The spelling parser is deleted. The text changes in 23 decisions across 8 programs, each of whose modules is byte-identical.
