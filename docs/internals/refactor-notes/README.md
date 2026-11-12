@@ -9,6 +9,287 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-12-w320-union-member-by-rule](2026-11-12-w320-union-member-by-rule.md): A record copied into a union of records picks among members sharing its field names, 2026-11-12
+- [2026-11-12-w320-let-returned-list](2026-11-12-w320-let-returned-list.md): A `let` holding only list literals, returned by an inferred function, relays no existing list, 2026-11-12
+- [2026-11-12-w320-let-reassigned-list](2026-11-12-w320-let-reassigned-list.md): A `let` list binding reassigned list literals is built at the wider list it is delivered to, 2026-11-12
+- [2026-11-12-w320-held-union-field-read](2026-11-12-w320-held-union-field-read.md): A record read at its own type out of a union of records it was built into, 2026-11-12
+- [2026-11-12-w320-for-record-list-fn-field](2026-11-12-w320-for-record-list-fn-field.md): A `for` loop over a list a record holds, calling through an element's function field, 2026-11-12
+- [2026-11-12-w320-d15721-batch-kept-fns](2026-11-12-w320-d15721-batch-kept-fns.md): A program on a shared compiler instance starts with none of the last program's kept functions, 2026-11-12
+- [2026-11-12-w320-d14385-lift-copied](2026-11-12-w320-d14385-lift-copied.md): D14385's interim refusal skips a delivery the fresh-call copy converts, 2026-11-12
+- [2026-11-12-w320-copy-widen](2026-11-12-w320-copy-widen.md): The fresh-call copy converts a field into an exactly wider number, and nests into a record or `null`, 2026-11-12
+- [2026-11-12-w320-copy-row-union-elems](2026-11-12-w320-copy-row-union-elems.md): The fresh-call copy copies a list of row unions arm by arm, closing D14385, 2026-11-12
+- [2026-11-12-w320-copy-record-list-field](2026-11-12-w320-copy-record-list-field.md): The record copy copies a list-of-records field element by element, 2026-11-12
+- [2026-11-12-w320-copy-rec-union-member](2026-11-12-w320-copy-rec-union-member.md): The fresh-call copy builds a record field at the member of a union of records, 2026-11-12
+- [2026-11-12-w320-copy-list](2026-11-12-w320-copy-list.md): The fresh-call copy widens a list of numbers into a list of a wider number, 2026-11-12
+- [2026-11-12-w320-copy-list-result](2026-11-12-w320-copy-list-result.md): A fresh call's list of records is copied element by element where it lands, 2026-11-12
+- [2026-11-12-w320-copy-list-of-lists](2026-11-12-w320-copy-list-of-lists.md): The fresh-call copy converts a list of lists elementwise, at any depth, 2026-11-12
+- [2026-11-12-w320-copy-list-elem-box](2026-11-12-w320-copy-list-elem-box.md): The fresh-call copy boxes a scalar list's elements into a `| null` or union element, 2026-11-12
+- [2026-11-12-w315-width-b-view-rep](2026-11-12-w315-width-b-view-rep.md): Width subtyping B: a view rep for an existing record held at a narrower type, 2026-11-12
+- [2026-11-12-w311-template-field-kind-and-refelemarrname](2026-11-12-w311-template-field-kind-and-refelemarrname.md): Step 7: a template field's ref-list row takes its kind from the open type; `refElemArrName` deleted, 2026-11-12
+- [2026-11-12-w311-shape-row-scan-deleted](2026-11-12-w311-shape-row-scan-deleted.md): The field-set scan behind `structIndexOfTypeName` is deleted, 2026-11-12
+- [2026-11-12-w311-shape-field-elem-spelling-legs-deleted](2026-11-12-w311-shape-field-elem-spelling-legs-deleted.md): The shape-text field recorder's ref-list spelling legs are deleted, 2026-11-12
+- [2026-11-12-w311-shape-field-elem-name-by-type](2026-11-12-w311-shape-field-elem-name-by-type.md): Step 7: a shape field's list and map element names are read off its type, 2026-11-12
+- [2026-11-12-w311-ref-elem-spelling-floors](2026-11-12-w311-ref-elem-spelling-floors.md): Step 7: the ref-list element spelling floors reach one cell, 2026-11-12
+- [2026-11-12-w311-nulref-elem-nominal](2026-11-12-w311-nulref-elem-nominal.md): Step 7: a nullable list element's row name is its nominal spelling, not a render, 2026-11-12
+- [2026-11-12-w311-nul-ref-list-field-code-by-type](2026-11-12-w311-nul-ref-list-field-code-by-type.md): The nullable ref-list field code is answered by the type, 2026-11-12
+- [2026-11-12-w311-kind9-inner-rep-row-name](2026-11-12-w311-kind9-inner-rep-row-name.md): Step 7: a kind-9 inner element holding un-annotated functions is named off its rep, 2026-11-12
+- [2026-11-12-w311-d15862-d15863-holder-typed-reads](2026-11-12-w311-d15862-d15863-holder-typed-reads.md): D15862, D15863: annotated reads of a holder's copy and of a module-scope holder, 2026-11-12
+- [2026-11-12-w311-d15861-holder-to-annotated-plain-param](2026-11-12-w311-d15861-holder-to-annotated-plain-param.md): D15861: a bundle holder handed to a plain function's annotated parameter, 2026-11-12
+- [2026-11-12-w311-d15860-bundle-member-through-binding](2026-11-12-w311-d15860-bundle-member-through-binding.md): D15860: a bundle member is found through the lambda the bundle holds, 2026-11-12
+- [2026-11-12-w311-d15808-const-lambda-param-args](2026-11-12-w311-d15808-const-lambda-param-args.md): D15808: a `const` lambda's parameter is judged at its calls, 2026-11-12
+- [2026-11-12-w311-d15779-ref-elem-inner-name-by-type](2026-11-12-w311-d15779-ref-elem-inner-name-by-type.md): D15779: a nested ref-list's inner row is named by a closed type, 2026-11-12
+- [2026-11-12-w311-d15775-const-lambda-hole-arg](2026-11-12-w311-d15775-const-lambda-hole-arg.md): D15775: a holder handed to a module-scope `const` lambda is a hole argument, 2026-11-12
+- [2026-11-12-w311-d15774-unwritten-module-let-holder](2026-11-12-w311-d15774-unwritten-module-let-holder.md): D15774: an unwritten module-scope `let` bundle holder reads as a `const`, 2026-11-12
+- [2026-11-12-w311-d15773-const-choice-handed-twice](2026-11-12-w311-d15773-const-choice-handed-twice.md): D15773: a pure `const` choice handed twice is written into each hand, 2026-11-12
+- [2026-11-12-w311-d15772-const-record-field-reads](2026-11-12-w311-d15772-const-record-field-reads.md): D15772: a `const` record read through its field beside its one hand-on, 2026-11-12
+- [2026-11-12-w311-d15700-const-record-inline](2026-11-12-w311-d15700-const-record-inline.md): D15700: a `const` record of a hole handed on whole is written into its one argument, 2026-11-12
+- [2026-11-12-w311-d15639-const-record-hand-on](2026-11-12-w311-d15639-const-record-hand-on.md): D15639: the checker follows a hole into a `const` record handed on, 2026-11-12
+- [2026-11-12-w311-d15485-coalesce-generic-function-value](2026-11-12-w311-d15485-coalesce-generic-function-value.md): D15485: a `??` over a generic function value folds to the value, 2026-11-12
+- [2026-11-12-w311-d15484-late-tag-refusal-sticks](2026-11-12-w311-d15484-late-tag-refusal-sticks.md): D15484: a set a late tag decision refuses stays untagged, so the rounds settle, 2026-11-12
+- [2026-11-12-w311-d15451-const-choice-inline](2026-11-12-w311-d15451-const-choice-inline.md): D15451: a `const` choice of named functions is written into its one hand, 2026-11-12
+- [2026-11-12-w311-collect-stored-elem-name](2026-11-12-w311-collect-stored-elem-name.md): Step 7: a type-keyed list literal row is stored under its type's row name, 2026-11-12
+- [2026-11-12-w311-arrlit-producers-instance-type](2026-11-12-w311-arrlit-producers-instance-type.md): L1: the ten `arrLit*` producers read the instance type, 2026-11-12
+- [2026-11-12-w311-arrlit-elem-kind-tpl-deleted](2026-11-12-w311-arrlit-elem-kind-tpl-deleted.md): Step 7: `arrLitElemKindTpl` deleted, a list literal's element kind is read by type, 2026-11-12
+- [2026-11-12-w311-anon-ref-list-key-by-type](2026-11-12-w311-anon-ref-list-key-by-type.md): Step 7: an anonymous ref-list field's key is its element type's row name, 2026-11-12
+- [2026-11-12-step7-union-reg-var-slice-sibling](2026-11-12-step7-union-reg-var-slice-sibling.md): Step 7 L6: the variant-slice key-sibling adopt is deleted, 2026-11-12
+- [2026-11-12-step7-union-reg-unkey-gone](2026-11-12-step7-union-reg-unkey-gone.md): Step 7 L6: the softened union key column is deleted, 2026-11-12
+- [2026-11-12-step7-union-reg-tykey-mixlit-wide](2026-11-12-step7-union-reg-tykey-mixlit-wide.md): Step 7 L6 (step R3): a union keys a mixed literal set beside other members as the bases it is boxed at, 2026-11-12
+- [2026-11-12-step7-union-reg-tykey-intlit-wide](2026-11-12-step7-union-reg-tykey-intlit-wide.md): Step 7 L6 (step R1): a union keys an integer literal set beside other members as the base it is boxed at, 2026-11-12
+- [2026-11-12-step7-union-reg-twin-one-row](2026-11-12-step7-union-reg-twin-one-row.md): Step 7 L6: a twin-record alias adopts its set's row (D15761), 2026-11-12
+- [2026-11-12-step7-union-reg-struct-atom-by-type](2026-11-12-step7-union-reg-struct-atom-by-type.md): Step 7 L6: a union member is a struct by its type, not only by its spelling, 2026-11-12
+- [2026-11-12-step7-union-reg-soft-key-order](2026-11-12-step7-union-reg-soft-key-order.md): Step 7 L6: the one-list sites find a set spelled in another order by its type key, 2026-11-12
+- [2026-11-12-step7-union-reg-shape-arms-by-type](2026-11-12-step7-union-reg-shape-arms-by-type.md): Step 7 L6: a union's inline-shape arms are typed by its type, not its member-set text, 2026-11-12
+- [2026-11-12-step7-union-reg-set-text-gone](2026-11-12-step7-union-reg-set-text-gone.md): Step 7 L6: the member-set-text lookup is deleted, 2026-11-12
+- [2026-11-12-step7-union-reg-rowkey-noname](2026-11-12-step7-union-reg-rowkey-noname.md): Step 7 L6 (step S2): `unionRowKeyAB` takes no name; the literal-union assignment guards ask the binding's type, 2026-11-12
+- [2026-11-12-step7-union-reg-refarr-ty](2026-11-12-step7-union-reg-refarr-ty.md): Step 7 L6 (step C9): the ref-array arm test takes the union's type; the ref `??` join reads no member set, 2026-11-12
+- [2026-11-12-step7-union-reg-ref-array-arm-by-type](2026-11-12-step7-union-reg-ref-array-arm-by-type.md): Step 7 L6: a ref-array arm slot test asks the union's type when its spelling is unbound, 2026-11-12
+- [2026-11-12-step7-union-reg-recv-arms-ty](2026-11-12-step7-union-reg-recv-arms-ty.md): Step 7 L6 (step C7): the `is`-arm and receiver readers key by the box read's union type, 2026-11-12
+- [2026-11-12-step7-union-reg-record-bound-row](2026-11-12-step7-union-reg-record-bound-row.md): Step 7 L6: a recorded union's row is its widened spelling's bound row, 2026-11-12
+- [2026-11-12-step7-union-reg-msset-ty-first](2026-11-12-step7-union-reg-msset-ty-first.md): Step 7 L6 (step R2): `msSetOfNameTy` asks the type's row first, 2026-11-12
+- [2026-11-12-step7-union-reg-msset-noname](2026-11-12-step7-union-reg-msset-noname.md): Step 7 L6 (step R4): the member-set lookup takes no name; `msSetOfNameTy` goes, 2026-11-12
+- [2026-11-12-step7-union-reg-msset-callers-typed](2026-11-12-step7-union-reg-msset-callers-typed.md): Step 7: every `msSetOfNameTy` caller hands it the union's type, 2026-11-12
+- [2026-11-12-step7-union-reg-let-sites-tykey](2026-11-12-step7-union-reg-let-sites-tykey.md): Step 7 L6: the let readers' registry membership asks the canonical type key, 2026-11-12
+- [2026-11-12-step7-union-reg-join-rest-ty](2026-11-12-step7-union-reg-join-rest-ty.md): Step 7 L6 (step C6): the bool `??` join and the record-default arm take the union's type, 2026-11-12
+- [2026-11-12-step7-union-reg-hasatomk-ty](2026-11-12-step7-union-reg-hasatomk-ty.md): Step 7 L6 (step H2): `unionHasAtomK` takes no name; the store-kind ladder and the coerce sets come from the union's type, 2026-11-12
+- [2026-11-12-step7-union-reg-hasatom-ty](2026-11-12-step7-union-reg-hasatom-ty.md): Step 7 L6 (step H1): `unionHasAtomOfTy` takes the union's type alone, 2026-11-12
+- [2026-11-12-step7-union-reg-eq-strtag-ty](2026-11-12-step7-union-reg-eq-strtag-ty.md): Step 7 L6 (step C8): the empty-fit arms and the union-union eq fallback key by the box read's type; the literal-union string-tag floors are loud, 2026-11-12
+- [2026-11-12-step7-union-reg-decl-bound-row](2026-11-12-step7-union-reg-decl-bound-row.md): Step 7 L6: an undeclared spelling's registry membership is its bound row, 2026-11-12
+- [2026-11-12-step7-union-reg-consumers-ty](2026-11-12-step7-union-reg-consumers-ty.md): Step 7 L6 (step C5): the map-arm, heap-arm, leaf-arm and `??` join consumers take the union's type, 2026-11-12
+- [2026-11-12-step7-union-reg-coerce-list-atom-by-type](2026-11-12-step7-union-reg-coerce-list-atom-by-type.md): Step 7 L6: the list coerce's atom tests ask the union's type, 2026-11-12
+- [2026-11-12-step7-union-reg-canon-members-gone](2026-11-12-step7-union-reg-canon-members-gone.md): Step 7 L6: `unRowOfCanonMembers` is deleted, its last hit gone, 2026-11-12
+- [2026-11-12-step7-union-reg-box-pred-ty](2026-11-12-step7-union-reg-box-pred-ty.md): Step 7 L6 (step C4): the box-destination predicates ask the type, and two name producers go, 2026-11-12
+- [2026-11-12-step7-union-reg-box-name-from-ty](2026-11-12-step7-union-reg-box-name-from-ty.md): Step 7 L6 (step C3a): a union box's name comes from its type wherever the type gives one, 2026-11-12
+- [2026-11-12-step7-union-reg-box-map-miss-ty](2026-11-12-step7-union-reg-box-map-miss-ty.md): Step 7 L6 (step C3b): the map-read miss's box is handed its type; the box path's floors, 2026-11-12
+- [2026-11-12-step7-union-reg-box-let-ty](2026-11-12-step7-union-reg-box-let-ty.md): Step 7 L6 (step C2): a let binding's box is handed the binding's union type, 2026-11-12
+- [2026-11-12-step7-union-reg-box-dst-by-type](2026-11-12-step7-union-reg-box-dst-by-type.md): Step 7 L6 (step C1): a union box is built into the row its destination type keys to, 2026-11-12
+- [2026-11-12-step7-union-reg-arm-tys-inferred-binding](2026-11-12-step7-union-reg-arm-tys-inferred-binding.md): Step 7 L6: a union box's arm readers ask an un-annotated binding's inferred type, 2026-11-12
+- [2026-11-12-step7-union-reg-arm-helpers-by-type](2026-11-12-step7-union-reg-arm-helpers-by-type.md): Step 7 L6: three union arm helpers ask the union's type when its spelling is unbound, 2026-11-12
+- [2026-11-12-step7-union-reg-ab-seams-noname](2026-11-12-step7-union-reg-ab-seams-noname.md): Step 7 L6 (step S1): the membership and member-type seams take no name, 2026-11-12
+- [2026-11-12-step7-tag-record-pin-kind-by-layout](2026-11-12-step7-tag-record-pin-kind-by-layout.md): Step 7 L2: a record of tagged-set ids reads its pin kind off its layout, 2026-11-12
+- [2026-11-12-step7-tag-key-exact-type](2026-11-12-step7-tag-key-exact-type.md): Step 7: a union tag is keyed by the member's exact checked type; the `annDeclPos` columns deleted (cuts 5b, 6), 2026-11-12
+- [2026-11-12-step7-struct-row-by-name-graded](2026-11-12-step7-struct-row-by-name-graded.md): Step 7: the struct-row-by-name registries graded, two dead name rungs deleted, 2026-11-12
+- [2026-11-12-step7-shape-walk-typeless-census](2026-11-12-step7-shape-walk-typeless-census.md): Step 7: the shape walk's typeless class, counted by why the type gives no name, 2026-11-12
+- [2026-11-12-step7-shape-walk-name-floor](2026-11-12-step7-shape-walk-name-floor.md): Step 7: the shape interner's name walk is a floor until generic and hole records render, 2026-11-12
+- [2026-11-12-step7-shape-scan-lenient-passes](2026-11-12-step7-shape-scan-lenient-passes.md): Step 7: the spelled-shape scan's two lenient passes deleted; its strict pass is the floor for typeless spellings, 2026-11-12
+- [2026-11-12-step7-shape-layout-id](2026-11-12-step7-shape-layout-id.md): Step 7: a typed inline shape finds its struct row by layout id, 2026-11-12
+- [2026-11-12-step7-render-parse-unowned-graded](2026-11-12-step7-render-parse-unowned-graded.md): Step 7: the unowned render-parse sites graded; one render rung deleted, 2026-11-12
+- [2026-11-12-step7-registries-and-equality](2026-11-12-step7-registries-and-equality.md): Step 7 L6: the spelling-keyed registries by reader, and the type-equality notions compared, 2026-11-12
+- [2026-11-12-step7-list-literal-arm-element-by-type](2026-11-12-step7-list-literal-arm-element-by-type.md): Step 7: an array literal's arm element is decided by the element's type, 2026-11-12
+- [2026-11-12-step7-l6-variant-union-row-direct](2026-11-12-step7-l6-variant-union-row-direct.md): Step 7 L6: `variantUnionNameOfTy` reads its row, not the row's name back, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-struct-field](2026-11-12-step7-l6-union-name-row-struct-field.md): Step 7 L6: a member read of a struct field hands back its element union's row, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-slot](2026-11-12-step7-l6-union-name-row-slot.md): Step 7 L6: each `unionNameOfExpr` call saves and restores its row slot, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-read-index](2026-11-12-step7-l6-union-name-row-read-index.md): Step 7 L6: the identifier and ref-list index rungs hand back their rows, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-pair](2026-11-12-step7-l6-union-name-row-pair.md): Step 7 L6: `unionNameOfExpr` hands back the row its rung read, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-operators](2026-11-12-step7-l6-union-name-row-operators.md): Step 7 L6: an operator expression's union name hands back its type's row, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-member](2026-11-12-step7-l6-union-name-row-member.md): Step 7 L6: a member read of a variant field hands back its element union's row, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-if-join](2026-11-12-step7-l6-union-name-row-if-join.md): Step 7 L6: an if-join's union name hands back its type's row, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-callers-set](2026-11-12-step7-l6-union-name-row-callers-set.md): Step 7 L6: four set lookups off a union name take its row first, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-callers-lit-arm](2026-11-12-step7-l6-union-name-row-callers-lit-arm.md): Step 7 L6: the literal-arm tests off a union name read its member set, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-callers-box-set](2026-11-12-step7-l6-union-name-row-callers-box-set.md): Step 7 L6: the box-equality and literal-`is` gates read the box's member set, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-callers-arms](2026-11-12-step7-l6-union-name-row-callers-arms.md): Step 7 L6: the wide-retag arms and the numeric-join kinds read the union name's row, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-call-rest](2026-11-12-step7-l6-union-name-row-call-rest.md): Step 7 L6: a call's inferred return and checker-type fallback hand back their row, 2026-11-12
+- [2026-11-12-step7-l6-union-name-row-call-hole](2026-11-12-step7-l6-union-name-row-call-hole.md): Step 7 L6: a call's and a hole read's union name hand back their row, 2026-11-12
+- [2026-11-12-step7-l6-name-readers-coerce-coalesce](2026-11-12-step7-l6-name-readers-coerce-coalesce.md): Step 7 L6: the coerce member set and the `??` literal-arm test read the union's type, 2026-11-12
+- [2026-11-12-step7-l6-name-readers-census](2026-11-12-step7-l6-name-readers-census.md): Step 7 L6: a census of the name readers, and the first batch that holds the row, 2026-11-12
+- [2026-11-12-step7-l6-mv-value-union-row-of-ty](2026-11-12-step7-l6-mv-value-union-row-of-ty.md): Step 7 L6: a map value's union row is the one its type keys to, 2026-11-12
+- [2026-11-12-step7-l2-variant-box-map-arm-of-ty](2026-11-12-step7-l2-variant-box-map-arm-of-ty.md): Step 7 L2 §7: a variant box's map arm is found by its type, 2026-11-12
+- [2026-11-12-step7-l2-value-atom-of-ty](2026-11-12-step7-l2-value-atom-of-ty.md): Step 7 L2 §7: whether a coerced union boxes a value atom is asked of its type (59 → 58 parses), 2026-11-12
+- [2026-11-12-step7-l2-shape-walk-u-arms-typed](2026-11-12-step7-l2-shape-walk-u-arms-typed.md): Step 7 L2 §7: the shape walk's class U reaches its arms typed, 2026-11-12
+- [2026-11-12-step7-l2-shape-rides-typaram-by-ty](2026-11-12-step7-l2-shape-rides-typaram-by-ty.md): Step 7 L2 §7: `shapeFieldsRideTyParam` reads the parameter's type, not the field's spelling, 2026-11-12
+- [2026-11-12-step7-l2-ret-join-rows-no-anon](2026-11-12-step7-l2-ret-join-rows-no-anon.md): Step 7 L2 §7: a return-join row is never named by an `#anon` handle, 2026-11-12
+- [2026-11-12-step7-l2-ret-join-rows-by-rule](2026-11-12-step7-l2-ret-join-rows-by-rule.md): Step 7 L2 §7: return-join and recorded-union rows are named by the naming rule, 2026-11-12
+- [2026-11-12-step7-l2-mv-val-kind-of-ty](2026-11-12-step7-l2-mv-val-kind-of-ty.md): Step 7 L2 §7: a map value's mv kind is read off its type alone, 2026-11-12
+- [2026-11-12-step7-l2-mv-map-arm-of-ty](2026-11-12-step7-l2-mv-map-arm-of-ty.md): Step 7 L2 §7: a union's map arm is found by its member type, not its spelling, 2026-11-12
+- [2026-11-12-step7-l2-mono-union-list-pin-by-type](2026-11-12-step7-l2-mono-union-list-pin-by-type.md): Step 7 L2 §7: a pinned list of a union registers its element by the element's type, alias or inline, 2026-11-12
+- [2026-11-12-step7-l2-mono-ty-param-of-by-type](2026-11-12-step7-l2-mono-ty-param-of-by-type.md): Step 7 L2 §7: a parameter that rides a type parameter is found by its annotation's type, 2026-11-12
+- [2026-11-12-step7-l2-mono-subst-ann-callers-measured](2026-11-12-step7-l2-mono-subst-ann-callers-measured.md): Step 7 L2 §7: emit_mono's monoSubstAnn callers measured against the naming rule; all stay, 2026-11-12
+- [2026-11-12-step7-l2-mono-signature-pins-by-type](2026-11-12-step7-l2-mono-signature-pins-by-type.md): Step 7 L2 §7: a delivered function value's signature pins are its type's parameters under the naming rule; `annFnDecompose` leaves emit_mono, 2026-11-12
+- [2026-11-12-step7-l2-mono-register-pin-union-by-type](2026-11-12-step7-l2-mono-register-pin-union-by-type.md): Step 7 L2 §7: `monoRegisterPinUnion` asks the type whether a pin is a union, 2026-11-12
+- [2026-11-12-step7-l2-mono-pin-ann-by-rule](2026-11-12-step7-l2-mono-pin-ann-by-rule.md): Step 7 L2 §7: `monoPinAnnSpelling` spells by the naming rule, emit_mono's last render, 2026-11-12
+- [2026-11-12-step7-l2-mono-minted-union-by-type](2026-11-12-step7-l2-mono-minted-union-by-type.md): Step 7 L2 §7: `monoPinMintedUnion` asks the whole annotation's type whether it is a union, 2026-11-12
+- [2026-11-12-step7-l2-mono-list-fit-arms-at-depth](2026-11-12-step7-l2-mono-list-fit-arms-at-depth.md): Step 7: `is K[]` over a union or nullable list arm tests emptiness at the depth the elements part (D15763, D15811 closed), 2026-11-12
+- [2026-11-12-step7-l2-mono-let-type-by-rule](2026-11-12-step7-l2-mono-let-type-by-rule.md): Step 7 L2 §7: a generic local's annotation is the naming rule's spelling of its substituted type; `monoSubstAnonShapes` is deleted, 2026-11-12
+- [2026-11-12-step7-l2-mono-lambda-param-subst-by-type](2026-11-12-step7-l2-mono-lambda-param-subst-by-type.md): Step 7 L2 §7: a cloned lambda's parameter is substituted by type, and its check compares types, 2026-11-12
+- [2026-11-12-step7-l2-mono-is-arm-by-type](2026-11-12-step7-l2-mono-is-arm-by-type.md): Step 7 L2 §7: an instance's `is` over a type parameter takes the elaboration's check type; emit_mono's last `monoSubstAnn` is gone, 2026-11-12
+- [2026-11-12-step7-l2-mono-inferred-union-param-registers](2026-11-12-step7-l2-mono-inferred-union-param-registers.md): Step 7 L2 §7: a union parameter whose type parameter is inferred registers its union at the instance (D4937, D15762 closed), 2026-11-12
+- [2026-11-12-step7-l2-mono-indexed-arg-list-by-type](2026-11-12-step7-l2-mono-indexed-arg-list-by-type.md): Step 7 L2 §7: an indexed argument's list is a list by its type, 2026-11-12
+- [2026-11-12-step7-l2-mono-fn-decompose-by-type](2026-11-12-step7-l2-mono-fn-decompose-by-type.md): Step 7 L2 §7: three of emit_mono's function-type decompositions ask the type; the `is` arm and two pin builders are measured floors, 2026-11-12
+- [2026-11-12-step7-l2-mono-fn-and-map-arm-pins-by-rule](2026-11-12-step7-l2-mono-fn-and-map-arm-pins-by-rule.md): Step 7 L2 §7: a function-typed argument's pin takes the naming rule; the map-arm pin and the function nominalizer are deleted (renders 19 → 17), 2026-11-12
+- [2026-11-12-step7-l2-mono-composite-pin-by-type](2026-11-12-step7-l2-mono-composite-pin-by-type.md): Step 7 L2 §7: a composite parameter's pin is the naming rule's spelling of its closed type, 2026-11-12
+- [2026-11-12-step7-l2-mono-composite-pin-anon-shapes-gone](2026-11-12-step7-l2-mono-composite-pin-anon-shapes-gone.md): Step 7 L2 §7: a composite parameter's pin no longer re-spells `#anon` bindings, 2026-11-12
+- [2026-11-12-step7-l2-mono-closure-array-by-type](2026-11-12-step7-l2-mono-closure-array-by-type.md): Step 7 L2 §7: emit_mono asks whether a parameter is a list of functions by its type, 2026-11-12
+- [2026-11-12-step7-l2-mono-closed-ty-name-and-loop-carrier-by-type](2026-11-12-step7-l2-mono-closed-ty-name-and-loop-carrier-by-type.md): Step 7 L2 §7: `monoClosedTyName` hands its names their type, and a loop value's carrier is substituted by type, 2026-11-12
+- [2026-11-12-step7-l2-mono-bare-map-leg-and-floors](2026-11-12-step7-l2-mono-bare-map-leg-and-floors.md): Step 7 L2 §7: `monoAnnPinName`'s untyped bare-map leg is deleted; `parenUnionArrElemName` and `monoTagMapRepName` are measured floors, 2026-11-12
+- [2026-11-12-step7-l2-mono-anon-shapes-by-fields](2026-11-12-step7-l2-mono-anon-shapes-by-fields.md): Step 7 L2 §7: an `#anon` binding is re-spelled by its fields under the naming rule (renders 22 → 21), 2026-11-12
+- [2026-11-12-step7-l2-mono-annpin-list-by-type](2026-11-12-step7-l2-mono-annpin-list-by-type.md): Step 7 L2 §7: `monoAnnPinName` reads a list off the type, 2026-11-12
+- [2026-11-12-step7-l2-gae-field-ty-floor](2026-11-12-step7-l2-gae-field-ty-floor.md): Step 7 L2 §7: `gaeApplyFieldTy` is a floor, an instance key spelled by design, 2026-11-12
+- [2026-11-12-step7-l2-dead-nul-map-strips](2026-11-12-step7-l2-dead-nul-map-strips.md): Step 7 L2 §7: two dead nullable-map strips leave `emit_union_atoms.vl`, 2026-11-12
+- [2026-11-12-step7-l2-d15809-record-join-closure-sig-floor](2026-11-12-step7-l2-d15809-record-join-closure-sig-floor.md): Step 7 L2 §7: a record `if` that joins functions of two signatures into one closure field is refused (D15809 contained), 2026-11-12
+- [2026-11-12-step7-l2-bare-map-of-ty](2026-11-12-step7-l2-bare-map-of-ty.md): Step 7 L2 §7: a bare map annotation is found by its type where one is held, 2026-11-12
+- [2026-11-12-step7-l2-bare-map-chain-of-ty](2026-11-12-step7-l2-bare-map-chain-of-ty.md): Step 7 L2 §7: the bare-map chain's nullable-map and member rungs read the type, 2026-11-12
+- [2026-11-12-step7-l2-annotation-list-rungs-of-ty](2026-11-12-step7-l2-annotation-list-rungs-of-ty.md): Step 7 L2 §7: two annotation rungs read their type, not the list spelling, 2026-11-12
+- [2026-11-12-step7-inst-variant-prime-checked-unions](2026-11-12-step7-inst-variant-prime-checked-unions.md): Step 7 inst: the variant prime covers a checked union that boxes two records, 2026-11-12
+- [2026-11-12-step7-inst-d15943-open-map-list-literal-contained](2026-11-12-step7-inst-d15943-open-map-list-literal-contained.md): step7 inst: D15943 — a list literal of open maps no longer takes slot 0's row
+- [2026-11-12-step7-inst-d15942-inline-join-pushed](2026-11-12-step7-inst-d15942-inline-join-pushed.md): step7 inst: D15942 — an inline value join pushed onto an annotated holder delivers its maps
+- [2026-11-12-step7-inst-d15759-pinned-map-holder-walk](2026-11-12-step7-inst-d15759-pinned-map-holder-walk.md): step7 inst: D15759 — the pinned map's holder walk follows elements, fields and `let`s
+- [2026-11-12-step7-inst-d15758-pinned-map-returned-holder](2026-11-12-step7-inst-d15758-pinned-map-returned-holder.md): step7 inst: D15758 — a function returning a pinned map is a holder
+- [2026-11-12-step7-inst-d15757-pinned-map-read-through-holder](2026-11-12-step7-inst-d15757-pinned-map-read-through-holder.md): step7 inst: D15757 — a pinned map's reads are retyped through a list or alias holding it
+- [2026-11-12-step7-inst-d15756-uncalled-map-list-takes-fact](2026-11-12-step7-inst-d15756-uncalled-map-list-takes-fact.md): step7 inst: D15756 — an uncalled list of maps of functions takes its slot fact
+- [2026-11-12-step7-inst-d15754-uncalled-slot-agrees-with-fact](2026-11-12-step7-inst-d15754-uncalled-slot-agrees-with-fact.md): step7 inst: D15754 — an uncalled slot's type agrees with its slot fact
+- [2026-11-12-step7-inst-d15753-returned-storage-contained](2026-11-12-step7-inst-d15753-returned-storage-contained.md): Step 7 inst: a returned container of functions at another storage than its result is refused, 2026-11-12
+- [2026-11-12-step7-inst-d15752-push-set-delivery](2026-11-12-step7-inst-d15752-push-set-delivery.md): Step 7 inst: a binding pushed or set into an annotated holder is delivered at its element, 2026-11-12
+- [2026-11-12-step7-inst-d15752-map-slot-fact-delivered](2026-11-12-step7-inst-d15752-map-slot-fact-delivered.md): step7 inst: D15752 — an uncalled map slot closes at its delivery, not the default
+- [2026-11-12-step7-inst-d15751-instance-union-field-read](2026-11-12-step7-inst-d15751-instance-union-field-read.md): Step 7 inst: a field read off an instance-only union of field records, 2026-11-12
+- [2026-11-12-step7-inst-d15395-map-pushed-onto-map-list](2026-11-12-step7-inst-d15395-map-pushed-onto-map-list.md): Step 7 inst: a map pushed onto a list of maps of a set takes the list's set, 2026-11-12
+- [2026-11-12-step7-inst-d15394-shared-smaller-set](2026-11-12-step7-inst-d15394-shared-smaller-set.md): Step 7 inst: a smaller set two lists of maps share is decided with both, 2026-11-12
+- [2026-11-12-step7-inst-d15393-value-join-of-maps](2026-11-12-step7-inst-d15393-value-join-of-maps.md): Step 7 inst: a value join of maps of a set and a smaller set is one map of the joined set, 2026-11-12
+- [2026-11-12-step7-inst-d15391-nested-record-write](2026-11-12-step7-inst-d15391-nested-record-write.md): Step 7 inst: a nested record written whole shares its binding's row, 2026-11-12
+- [2026-11-12-step7-inst-d15390-value-join-record-write](2026-11-12-step7-inst-d15390-value-join-record-write.md): Step 7 inst: a record written as a value join joins each tail literal, 2026-11-12
+- [2026-11-12-step7-inst-d15358-list-of-bound-lists-row](2026-11-12-step7-inst-d15358-list-of-bound-lists-row.md): Step 7 inst: a list of bound lists of hole-function records gets its row, 2026-11-12
+- [2026-11-12-step7-inst-d15353-map-keys-read](2026-11-12-step7-inst-d15353-map-keys-read.md): Step 7 inst: a map of un-annotated functions read by its own keys is tagged, 2026-11-12
+- [2026-11-12-step7-gae-at-instance-type](2026-11-12-step7-gae-at-instance-type.md): Step 7 N13: a generic-alias application interns at its instance type, 2026-11-12
+- [2026-11-12-step7-floors-deleted-4](2026-11-12-step7-floors-deleted-4.md): Step 7: `annDeclNameOf` deleted (cut 5a); the other `annDeclPos` readers carry tag identity, 2026-11-12
+- [2026-11-12-step7-floors-deleted-3](2026-11-12-step7-floors-deleted-3.md): Step 7: `structRowOfNameTy`'s arm test deleted (cut 4), 2026-11-12
+- [2026-11-12-step7-floors-deleted-2](2026-11-12-step7-floors-deleted-2.md): Step 7: the ref-list variant floor read by type (cuts 1–2), 2026-11-12
+- [2026-11-12-step7-field-elem-name-readers-graded](2026-11-12-step7-field-elem-name-readers-graded.md): Step 7: the field element-name column's readers graded, 2026-11-12
+- [2026-11-12-step7-codec-rep-struct-twins](2026-11-12-step7-codec-rep-struct-twins.md): Step 7 codecs: the struct twin guard compares field storage, not field codes, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-small-files](2026-11-12-step7-codec-field-rep-small-files.md): Step 7 codecs: the small-file code-column reads ask the storage, and the tag-assignment compares stay on codes, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-shape-rows](2026-11-12-step7-codec-field-rep-shape-rows.md): Step 7 codecs: five `emit_shape_rows.vl` field-code readers ask the storage, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-read-store](2026-11-12-step7-codec-field-rep-read-store.md): Step 7 codecs: a field read's storage tag is its row's storage kind, not `fc<code>`, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-cut3g-order-stash](2026-11-12-step7-codec-field-rep-cut3g-order-stash.md): Step 7 codecs, cut 3g: the object-literal order stash is typed by the field's storage kind, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-cut3f-opt-chain](2026-11-12-step7-codec-field-rep-cut3f-opt-chain.md): Step 7 codecs, cut 3f: the `?.` leaf and `?.` … `??` readers ask the field's storage, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-cut3e-store-values](2026-11-12-step7-codec-field-rep-cut3e-store-values.md): Step 7 codecs, cut 3e: the field store values match on the storage kind, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-cut3d-value-deliveries](2026-11-12-step7-codec-field-rep-cut3d-value-deliveries.md): Step 7 codecs, cut 3d: the struct and variant field value deliveries match on the storage kind, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-cut3c-storage-slots](2026-11-12-step7-codec-field-rep-cut3c-storage-slots.md): Step 7 codecs, cut 3c: a field's storage slot and the prefix rule ask the storage kind, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-cut3b-storage-valtype](2026-11-12-step7-codec-field-rep-cut3b-storage-valtype.md): Step 7 codecs, cut 3b (first part): the type section writes a field's storage valtype from its rep, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-cut1d-obj-lit-fits](2026-11-12-step7-codec-field-rep-cut1d-obj-lit-fits.md): Step 7 codecs, cut 1d: the row predicates move under `emit_obj_lit_fits.vl`, and its comparisons ask them, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-cut1c-variant-reads](2026-11-12-step7-codec-field-rep-cut1c-variant-reads.md): Step 7 codecs, cut 1c: the variant-table field-code comparisons and the `string | null` recover ask the row, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-classify-member-reads](2026-11-12-step7-codec-field-rep-classify-member-reads.md): Step 7 codecs: `emit_classify.vl`'s `?.`-leaf, map-shape, numeric, closure, string and niche field reads ask the storage, 2026-11-12
+- [2026-11-12-step7-codec-field-rep-classify-arm-reads](2026-11-12-step7-codec-field-rep-classify-arm-reads.md): Step 7 codecs: `emit_classify.vl`'s arm-field and member-field code comparisons ask the storage, 2026-11-12
+- [2026-11-12-step7-codec-decl-rows-before-tags](2026-11-12-step7-codec-decl-rows-before-tags.md): Step 7 codecs: the declared rows `collectS` will mint are known while the arms are tagged, and the tag-phase compares read the storage, 2026-11-12
+- [2026-11-12-step7-codec-d15730-null-field-box](2026-11-12-step7-codec-d15730-null-field-box.md): Step 7 codecs: a `null` field at an inline nullable numeric literal union is stored in its box, closing D15730, 2026-11-12
+- [2026-11-12-step7-codec-cut5-tyvar-field-floor](2026-11-12-step7-codec-cut5-tyvar-field-floor.md): Step 7 codecs, cut 5: a type parameter's field is no longer coded from its spelling, 2026-11-12
+- [2026-11-12-step7-app-spelling-readers-census](2026-11-12-step7-app-spelling-readers-census.md): Step 7: the readers that resolved an application spelling by name, re-measured after #7553, 2026-11-12
+- [2026-11-12-l1-instance-reads-classified](2026-11-12-l1-instance-reads-classified.md): L1: the instance reads of an open type, classified site by site, 2026-11-12
+- [2026-11-12-l1-five-converts](2026-11-12-l1-five-converts.md): L1: five instance reads of an open type read the instance's type, 2026-11-12
+- [2026-11-12-l1-deleted](2026-11-12-l1-deleted.md): L1 deleted: the instance reads of an open type, re-counted on master, 2026-11-12
+- [2026-11-12-d3465-long-literal-with-computed-elements](2026-11-12-d3465-long-literal-with-computed-elements.md): D3465: a long scalar literal with computed elements builds from a data segment plus stores, 2026-11-12
+- [2026-11-12-d3375-exported-name-past-engine-limit](2026-11-12-d3375-exported-name-past-engine-limit.md): D3375: an exported name past the engines' 100,000-byte limit is refused at parse, 2026-11-12
+- [2026-11-12-d2660-null-let-delivery-judged-at-its-fill](2026-11-12-d2660-null-let-delivery-judged-at-its-fill.md): D2660: a `let x = null` read delivered before its filling write is judged at the filled type, 2026-11-12
+- [2026-11-12-d15925-tail-join-of-records-agrees-with-return](2026-11-12-d15925-tail-join-of-records-agrees-with-return.md): D15925, the record half: a tail value `if` of records of functions agrees with its `return` spelling, 2026-11-12
+- [2026-11-12-d15924-record-list-of-wider-set](2026-11-12-d15924-record-list-of-wider-set.md): D15924: a record of a smaller function set in a returned list of a wider one is decided with it, 2026-11-12
+- [2026-11-12-d15922-struct-field-ref-list-row-holding-a-function](2026-11-12-d15922-struct-field-ref-list-row-holding-a-function.md): D15922: a struct field's ref-list row is minted when its element holds a function, 2026-11-12
+- [2026-11-12-d15921-captured-ref-list-reads-the-env-field-slot](2026-11-12-d15921-captured-ref-list-reads-the-env-field-slot.md): D15921: a captured ref list reads the slot its env field is typed at, 2026-11-12
+- [2026-11-12-d15883-returned-record-judges-its-field-binding](2026-11-12-d15883-returned-record-judges-its-field-binding.md): D15883: a returned record literal is judged at its field's binding, as a returned binding is, 2026-11-12
+- [2026-11-12-d15749-holder-read-annotated-binding](2026-11-12-d15749-holder-read-annotated-binding.md): D15749 closes: a bundle holder's read bound at one member's annotated type runs, 2026-11-12
+- [2026-11-12-d15748-returned-holder-member](2026-11-12-d15748-returned-holder-member.md): D15748 closes: a returned module `const` bundle used as one member runs, 2026-11-12
+- [2026-11-12-d15746-copy-of-copy](2026-11-12-d15746-copy-of-copy.md): D15746 closes: a copy of a copy of a bundle holder holds its record, 2026-11-12
+- [2026-11-12-d15744-lambda-returner-in-function](2026-11-12-d15744-lambda-returner-in-function.md): D15744, half (b): a lambda bound inside a function, returning a bundle, runs, 2026-11-12
+- [2026-11-12-d15042-union-arm-literal-at-instance](2026-11-12-d15042-union-arm-literal-at-instance.md): D15042: a literal whose own type holds the type parameter picks its union arm by that type at the instance, 2026-11-12
+- [2026-11-11-w323-l2-fuel-bisect](2026-11-11-w323-l2-fuel-bisect.md): 2026-11-11 — w323: the L2 self-compile fuel, 70.45 G to 82.65 G, bisected
+- [2026-11-11-w320-shared-field-record-or-null](2026-11-11-w320-shared-field-record-or-null.md): A shared read of a field stored as a record or `null` across a union's members, 2026-11-11
+- [2026-11-11-w320-fresh-call-copy](2026-11-11-w320-fresh-call-copy.md): A maker's call is copied where it lands wider, so nothing is kept, 2026-11-11
+- [2026-11-11-w320-d15718-store-mismatch](2026-11-11-w320-d15718-store-mismatch.md): A literal binding built wider, stored into a container pinned at its own type, is that container's type mismatch, 2026-11-11
+- [2026-11-11-w320-d15718-built-binding-store](2026-11-11-w320-d15718-built-binding-store.md): A literal binding built wider, stored beside a literal at the container's own row, is refused, 2026-11-11
+- [2026-11-11-w320-copy-nested](2026-11-11-w320-copy-nested.md): The fresh-call copy reaches a nullable field one record down, 2026-11-11
+- [2026-11-11-w320-copy-identity](2026-11-11-w320-copy-identity.md): A generic identity's result is copied where it lands, as its argument's call would be, 2026-11-11
+- [2026-11-11-w320-copy-gate-width](2026-11-11-w320-copy-gate-width.md): The fresh-call copy widens a number into a wider nullable, 2026-11-11
+- [2026-11-11-w320-copy-gate-union](2026-11-11-w320-copy-gate-union.md): The fresh-call copy boxes a scalar into a union listing it, 2026-11-11
+- [2026-11-11-w320-box-narrow-scalar](2026-11-11-w320-box-narrow-scalar.md): A field read at one scalar of a box holding one wider scalar unboxes and converts, 2026-11-11
+- [2026-11-11-w311-union-of-lists-elem-kind](2026-11-11-w311-union-of-lists-elem-kind.md): Step 7: a union of lists has an element kind by type, 2026-11-11
+- [2026-11-11-w311-twin-collapse-rl-elem-kind](2026-11-11-w311-twin-collapse-rl-elem-kind.md): Step 7: a twin-map union's ref-list element kind is its one map's, 2026-11-11
+- [2026-11-11-w311-spread-run-elem-kind](2026-11-11-w311-spread-run-elem-kind.md): Step 7: a spread literal's emitter-made run has its holder's element kind, 2026-11-11
+- [2026-11-11-w311-d15719-maker-union-at-declared-record](2026-11-11-w311-d15719-maker-union-at-declared-record.md): A maker's union of records delivered at a declared record is built there (D15719), 2026-11-11
+- [2026-11-11-w311-arrlit-elem-kind-recorded-type](2026-11-11-w311-arrlit-elem-kind-recorded-type.md): Step 7: a list literal's element kind is its recorded type's, 2026-11-11
+- [2026-11-11-step7-vkind-own-rungs](2026-11-11-step7-vkind-own-rungs.md): Step 7: the VKind producers outside the descriptor, each a descriptor read, kind algebra or a ruled rung, 2026-11-11
+- [2026-11-11-step7-vkind-name-readers](2026-11-11-step7-vkind-name-readers.md): Step 7: ten let and scalar kind readers that read a type NAME, converted or floored, 2026-11-11
+- [2026-11-11-step7-vkind-locals-and-repofnode](2026-11-11-step7-vkind-locals-and-repofnode.md): Step 7: the local VKind ladders graded, and `repOfNode`'s two adjustments graded by design, 2026-11-11
+- [2026-11-11-step7-union-reg-unkey-dead-readers](2026-11-11-step7-union-reg-unkey-dead-readers.md): Step 7 L6: the softened key's near-dead readers go, 2026-11-11
+- [2026-11-11-step7-union-reg-direct-tykey](2026-11-11-step7-union-reg-direct-tykey.md): Step 7 L6: the direct typed lookups ask the canonical type key, and `unRowOfKey` is retired, 2026-11-11
+- [2026-11-11-step7-union-reg-arm-tys-row](2026-11-11-step7-union-reg-arm-tys-row.md): Step 7 L6: a bound union's arms are read off its row, not looked up again by its member-set text, 2026-11-11
+- [2026-11-11-step7-union-reg-all-sites-tykey](2026-11-11-step7-union-reg-all-sites-tykey.md): Step 7 L6: every typed registry lookup but the one-list readers asks the canonical type key, 2026-11-11
+- [2026-11-11-step7-slot-mv-spelling-floor](2026-11-11-step7-slot-mv-spelling-floor.md): Step 7 slot layer: the map-value bank's spelling classifier is a named floor, unreached, 2026-11-11
+- [2026-11-11-step7-slot-mv-name-readers](2026-11-11-step7-slot-mv-name-readers.md): Step 7 slot layer: three map-value name readers read the type, and `mapNameKeyKind` is deleted, 2026-11-11
+- [2026-11-11-step7-slot-anon-map-val-name](2026-11-11-step7-slot-anon-map-val-name.md): Step 7 slot layer: an anonymous record's map field carries its value type, and `anonMapValName`'s key render goes, 2026-11-11
+- [2026-11-11-step7-rep-one-derivation](2026-11-11-step7-rep-one-derivation.md): Step 7: the descriptor's kind has one derivation, the rep tree, and the flat arms are deleted, 2026-11-11
+- [2026-11-11-step7-lbk-build-kind-dedupe](2026-11-11-step7-lbk-build-kind-dedupe.md): Step 7 codecs: `listBuildKindOfVKind` reads the list-rep table, and the spread's encoder is it, 2026-11-11
+- [2026-11-11-step7-l2-synth-typeref-declaration](2026-11-11-step7-l2-synth-typeref-declaration.md): Step 7 L2 §7: a synthesized TypeRef records its declaration at mint, 2026-11-11
+- [2026-11-11-step7-l2-shape-wider-by-store-ty](2026-11-11-step7-l2-shape-wider-by-store-ty.md): Step 7 L2 §7: the wider-row reuse compares a ref field's storage type, not its spelling, 2026-11-11
+- [2026-11-11-step7-l2-shape-rekey-find](2026-11-11-step7-l2-shape-rekey-find.md): Step 7 L2 §7: an anonymous inline shape finds its struct row by type first, 2026-11-11
+- [2026-11-11-step7-l2-shape-rekey-declared](2026-11-11-step7-l2-shape-rekey-declared.md): Step 7 L2 §7: a declared record's inline shape also finds its struct row by type, 2026-11-11
+- [2026-11-11-step7-l2-shape-dedup-by-store-ty](2026-11-11-step7-l2-shape-dedup-by-store-ty.md): Step 7 L2 §7: the inline-shape dedup compares a ref field's storage type, not its spelling, 2026-11-11
+- [2026-11-11-step7-l2-rl-union-readers](2026-11-11-step7-l2-rl-union-readers.md): Step 7 L2 §7: fifteen element-read readers take a ref-list row's union from its type, 2026-11-11
+- [2026-11-11-step7-l2-rl-name-producers](2026-11-11-step7-l2-rl-name-producers.md): Step 7 L2 §7: the four name-keyed ref-list producers, measured; the frame-leaf row asks the type, 2026-11-11
+- [2026-11-11-step7-l2-rl-elem-struct-row](2026-11-11-step7-l2-rl-elem-struct-row.md): Step 7 L2 §7: a ref-list element's struct row asks the type before the name, 2026-11-11
+- [2026-11-11-step7-l2-mono-ret-widen-by-type](2026-11-11-step7-l2-mono-ret-widen-by-type.md): Step 7 L2 §7: a widened instance result is carried by type (renders 37 → 36), and emit_mono's renders and parses classified, 2026-11-11
+- [2026-11-11-step7-l2-mono-naming-rule-every-pin](2026-11-11-step7-l2-mono-naming-rule-every-pin.md): Step 7 L2 §7: the naming rule spells every pin it can, and the census of the pins it cannot, 2026-11-11
+- [2026-11-11-step7-l2-mono-last-pin-renders-by-rule](2026-11-11-step7-l2-mono-last-pin-renders-by-rule.md): Step 7 L2 §7: six more mono renders take the naming rule's spelling (renders 28 → 22); emit_mono keeps three, 2026-11-11
+- [2026-11-11-step7-l2-mono-ladder-lambda-pins-by-rule](2026-11-11-step7-l2-mono-ladder-lambda-pins-by-rule.md): Step 7 L2 §7: seven argument-ladder and lambda pins take the naming rule's spelling (renders 35 → 28), 2026-11-11
+- [2026-11-11-step7-l2-mono-atom-pin-by-rule](2026-11-11-step7-l2-mono-atom-pin-by-rule.md): Step 7 L2 §7: the atom pin takes the naming rule's spelling (renders 36 → 35), and why the annotation pin cannot yet, 2026-11-11
+- [2026-11-11-step7-l2-mono-ann-pin-union-by-type](2026-11-11-step7-l2-mono-ann-pin-union-by-type.md): Step 7 L2 §7: monoAnnPinName's union rungs ask by type where the caller holds one, 2026-11-11
+- [2026-11-11-step7-l2-emit-base-parses](2026-11-11-step7-l2-emit-base-parses.md): Step 7 L2 §7: `annRetNameOf` deleted (60 → 59 parses), and emit_base's other 21 parses named, 2026-11-11
+- [2026-11-11-step7-l2-arrlit-widen-key](2026-11-11-step7-l2-arrlit-widen-key.md): Step 7 L2 §7: every closed list-literal element keys its row by the build type, 2026-11-11
+- [2026-11-11-step7-l2-arrlit-inner-join](2026-11-11-step7-l2-arrlit-inner-join.md): Step 7 L2 §7: a list-of-lists literal keys its row by its lead inner literal's joined rep, 2026-11-11
+- [2026-11-11-step7-inst-w318-producers](2026-11-11-step7-inst-w318-producers.md): Step 7 inst: a re-associated `??` link carries its instance's type; w318's other three gaps measured, 2026-11-11
+- [2026-11-11-step7-inst-variant-set-closed](2026-11-11-step7-inst-variant-set-closed.md): Step 7 inst: a record type's rep no longer changes during emit, 2026-11-11
+- [2026-11-11-step7-inst-variant-rung-premono](2026-11-11-step7-inst-variant-rung-premono.md): Step 7 inst: `exprVariantIndex` answers -1 before monomorphization, 2026-11-11
+- [2026-11-11-step7-inst-struct-position-census](2026-11-11-step7-inst-struct-position-census.md): Step 7 inst: values of a union-arm type held at a struct row, census, 2026-11-11
+- [2026-11-11-step7-inst-reisexpr](2026-11-11-step7-inst-reisexpr.md): Step 7 inst: `monoReIsExpr` reads the instance's own `is`-test types, 2026-11-11
+- [2026-11-11-step7-inst-d15713-instance-result](2026-11-11-step7-inst-d15713-instance-result.md): Step 7 inst: an un-annotated instance's result is its own values' where they widen the template's, 2026-11-11
+- [2026-11-11-step7-inst-coalesce-readers](2026-11-11-step7-inst-coalesce-readers.md): Step 7 inst: the three `??` result readers ask `nodeTyAt`, 2026-11-11
+- [2026-11-11-step7-floors-deleted-1](2026-11-11-step7-floors-deleted-1.md): Step 7: two declaration-identity floors deleted (E1, E2), 2026-11-11
+- [2026-11-11-step7-famb-variant-index-switch](2026-11-11-step7-famb-variant-index-switch.md): Step 7 slot layer, family B: the two disagreeing `variantIndexOf` sites switched, the unreached rungs deleted, 2026-11-11
+- [2026-11-11-step7-famb-variant-index-graded](2026-11-11-step7-famb-variant-index-graded.md): Step 7 slot layer, family B: `variantIndexOf`'s 53 sites graded by where the name comes from, 2026-11-11
+- [2026-11-11-step7-famb-struct-name-producers-graded](2026-11-11-step7-famb-struct-name-producers-graded.md): Step 7 slot layer, family B: `structIndexByName`'s 27 sites and the struct name producers graded, 2026-11-11
+- [2026-11-11-step7-famb-store-column-build-probe](2026-11-11-step7-famb-store-column-build-probe.md): Step 7 slot layer, family B: can the checker's build record replace the struct-class storage readers? Measured, 2026-11-11
+- [2026-11-11-step7-famb-spelling-fallbacks](2026-11-11-step7-famb-spelling-fallbacks.md): Step 7 slot layer, family B: `structRowOfSpelling` and `armFieldStructRow` graded, two dead fallbacks deleted, 2026-11-11
+- [2026-11-11-step7-famb-row-canon](2026-11-11-step7-famb-row-canon.md): Step 7 slot layer, family B, 8b: every struct row name answers its canonical row, 2026-11-11
+- [2026-11-11-step7-famb-row-canon-type-finds](2026-11-11-step7-famb-row-canon-type-finds.md): Step 7 slot layer, family B, 8c: the type-keyed row finds and `structIndexOfExpr` answer the canonical row, 2026-11-11
+- [2026-11-11-step7-famb-name-readers](2026-11-11-step7-famb-name-readers.md): Step 7 slot layer, family B, 10: four struct-row and classifier name readers read the type, 2026-11-11
+- [2026-11-11-step7-famb-built-row](2026-11-11-step7-famb-built-row.md): Step 7 slot layer, family B, 9a: a read of a value built at a wider record answers that record's row, 2026-11-11
+- [2026-11-11-step7-dead-functions](2026-11-11-step7-dead-functions.md): Step 7: dead functions across `compiler/`, and the dead-export ratchet learns reachability, 2026-11-11
+- [2026-11-11-step7-codec-numeric-lit-field](2026-11-11-step7-codec-numeric-lit-field.md): Step 7 codecs: a numeric literal union field stores its base scalar, 2026-11-11
+- [2026-11-11-step7-codec-field-rep-cut3a-rec-copy](2026-11-11-step7-codec-field-rep-cut3a-rec-copy.md): Step 7 codecs, cut 3a: the record-copy and record-fit matchers carry field rows, not codes, 2026-11-11
+- [2026-11-11-step7-codec-field-rep-cut2-eq](2026-11-11-step7-codec-field-rep-cut2-eq.md): Step 7 codecs, cut 2: the equality layer dispatches on the field's kind, not its code, 2026-11-11
+- [2026-11-11-step7-codec-field-rep-cut1-wasmemit](2026-11-11-step7-codec-field-rep-cut1-wasmemit.md): Step 7 codecs, cut 1: the field-code comparisons in `wasmEmit.vl` and `emit_classify.vl` ask the field's storage rep, 2026-11-11
+- [2026-11-11-step7-codec-field-rep-column-design](2026-11-11-step7-codec-field-rep-column-design.md): Step 7 codecs: design for retiring the field code, 2026-11-11
+- [2026-11-11-step7-codec-field-code-of-ty](2026-11-11-step7-codec-field-code-of-ty.md): Step 7 codecs, cut 4 producer: a field's code is read off its type, 2026-11-11
+- [2026-11-11-step7-classify-trim-1](2026-11-11-step7-classify-trim-1.md): Step 7: dead and single-caller helpers in `emit_classify.vl`, first trim, 2026-11-11
+- [2026-11-11-step7-arrlit-elem-kind-tpl](2026-11-11-step7-arrlit-elem-kind-tpl.md): Step 7: `arrLitElemKindTpl` cannot yet read the literal's recorded type, 2026-11-11
+- [2026-11-11-spelling-readers](2026-11-11-spelling-readers.md): The rep classifiers that read a spelling, 2026-11-11
+- [2026-11-11-name-readers-fn-value](2026-11-11-name-readers-fn-value.md): The function-value NAME readers, 2026-11-11
+- [2026-11-11-l1-empty-list-readers](2026-11-11-l1-empty-list-readers.md): L1: the empty `[]` readers read the instance's list type, 2026-11-11
+- [2026-11-11-d15748-returned-global-bundle-member](2026-11-11-d15748-returned-global-bundle-member.md): D15748: a returned module `const` bundle used as one member is refused, not invalid wasm, 2026-11-11
+- [2026-11-11-d15747-bundle-returned-as-copy](2026-11-11-d15747-bundle-returned-as-copy.md): D15747: a returned `const` copy of a bundle holder is kept whole, 2026-11-11
+- [2026-11-11-d15745-generic-maker-const](2026-11-11-d15745-generic-maker-const.md): D15745: a generic maker returning a `const` of its record literal widens the field, 2026-11-11
+- [2026-11-11-d15743-generic-maker-field](2026-11-11-d15743-generic-maker-field.md): D15743: a generic maker's record widens its written function field, 2026-11-11
+- [2026-11-11-d15742-two-level-maker-field](2026-11-11-d15742-two-level-maker-field.md): D15742: a two-level maker's record widens its written function field, 2026-11-11
+- [2026-11-11-d15741-bundle-copy-handed](2026-11-11-d15741-bundle-copy-handed.md): D15741: a `const` copy of a bundle holder is handed on as the holder is, 2026-11-11
+- [2026-11-11-d15740-bundle-holder-returned](2026-11-11-d15740-bundle-holder-returned.md): w315's emit-reject groups A and C, ablated; D15740 closes, 2026-11-11
+- [2026-11-11-d15713-instance-union-row](2026-11-11-d15713-instance-union-row.md): D15713, registry half: a `??` that is a union only at an instance gets its row, 2026-11-11
+- [2026-11-11-d10370-let-written-with-another-pickers-set](2026-11-11-d10370-let-written-with-another-pickers-set.md): D10370: a `let` written with another picker's set decides its initialiser's subset with it, 2026-11-11
+- [2026-11-11-ci-cost-rss-gc-growth](2026-11-11-ci-cost-rss-gc-growth.md): ci-cost: the plumb-shape main unit's peak RSS follows the seed's GC heap growth, not the fuel cache, 2026-11-11
+- [2026-11-11-ci-cost-rss-gc-grow-off](2026-11-11-ci-cost-rss-gc-grow-off.md): ci-cost: the plumb-shape metered build runs with the seed's grow policy off, 2026-11-11
 - [2026-11-11-step7-exit-criteria](2026-11-11-step7-exit-criteria.md): Step 7 exit criteria: what stands between master and deleting §7's L1, L2 and L6 lines.
 - [2026-11-11-step7-decl-identity-row-key-census](2026-11-11-step7-decl-identity-row-key-census.md): Step 7: does a row key need declaration identity? Census and proposal: build none.
 - [2026-11-11-step7-retkind-readers-graded](2026-11-11-step7-retkind-readers-graded.md): Step 7: the return-kind readers and `buildFnMap`, graded and ruled.
