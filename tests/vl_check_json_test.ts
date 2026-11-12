@@ -457,6 +457,50 @@ Deno.test({
   },
 });
 
+// D15935: a walk that refuses can leave the claimed-pair flags set (`shapeAdaptRecStorage` and its
+// field), and the next program's container refusal was worded as the last program's record one.
+Deno.test({
+  name:
+    "check --batch --json: a refusal's wording does not carry over from the previous program",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      await Deno.writeTextFile(
+        `${dir}/a.vl`,
+        "type A = { n: i32 | string }\ntype B = { n: string }\n" +
+          "function pick(i: i32): A | B {\n  if i == 0 {\n    const a: A = { n: 3 }\n    return a\n  }\n" +
+          '  const b: B = { n: "b" }\n  b\n}\n' +
+          "function f(i: i32) {\n  const o: (A | B) | null = pick(i)\n  if o == null { return }\n" +
+          "  if o is B {\n    const got: i32 | string = o.n\n    print(got)\n  }\n}\nf(0)\n",
+      );
+      await Deno.writeTextFile(
+        `${dir}/b.vl`,
+        "function sumF(xs: f64[]) { print(xs.length) }\nfunction idL<W>(xs: W[]): W[] { xs }\n" +
+          "function t<V>(q: V[]) { sumF(idL(q)) }\nt([1])\n",
+      );
+      const words = (out: string): string[] =>
+        parseBatch(out).slice(-1)[0].diagnostics
+          .filter((d) => d.severity === "error").map((d) => d.message);
+      const alone = words(
+        (await run(["check", "--batch", "--json", `${dir}/b.vl`])).out,
+      );
+      const after = words(
+        (await run(
+          ["check", "--batch", "--json", `${dir}/a.vl`, `${dir}/b.vl`],
+          { VL_JOBS: "1" },
+        )).out,
+      );
+      if (alone.length === 0 || JSON.stringify(after) !== JSON.stringify(alone)) {
+        throw new Error(
+          `want b.vl's diagnostics after a.vl as alone, got ${JSON.stringify(after)}, want ${
+            JSON.stringify(alone)
+          }`,
+        );
+      }
+    });
+  },
+});
+
 Deno.test({
   name:
     "check --batch --json: an unreadable entry is a record, not a silent skip",
