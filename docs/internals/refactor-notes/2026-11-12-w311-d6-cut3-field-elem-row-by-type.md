@@ -22,29 +22,30 @@ handed over as its arena type, and a list of literal unions still declines.
 
 ## Measured
 
-Fixpoint seeds over the whole sweep population (24,192 programs).
+Fixpoint seeds over the whole sweep population, re-measured after merging master `82ca1ef1`. That
+master includes #7658, which replaced `elemNameIsNominal` with a type test, `elemTyIsNominal`,
+but kept the gate. This cut removes the gate.
 
-| comparison | same | bytes-only | runs → not-runs | new traps |
-| --- | --- | --- | --- | --- |
-| master → this cut, unarmed | 24,192 | 0 | 0 | 0 |
-| this cut, unarmed → armed (`$VL_OPAQUE_SNAMES=1`) | 23,952 | 237 | **3** | 2 |
-| cut 1's reading, unarmed → armed | 23,782 | 230 | 180 | 1 |
+| comparison | programs | same | bytes-only | runs → not-runs | new traps |
+| --- | --- | --- | --- | --- | --- |
+| master → this cut, unarmed | 24,196 | 24,196 | 0 | 0 | 0 |
+| master, unarmed → armed (`$VL_OPAQUE_SNAMES=1`) | 24,196 | 23,876 | 234 | 86 | 3 |
+| this cut, unarmed → armed | 24,196 | 23,953 | 239 | **4** | 3 |
+| cut 1's reading (master `b20cfd07`), unarmed → armed | 24,192 | 23,782 | 230 | 180 | 1 |
 
-So the change is byte-identical unarmed. Armed, the decision readers it removes take the lost
-runs from 180 to 3. Two programs are now traps rather than rejects; they are among the three that
-remain:
+So the change is byte-identical unarmed. Armed, it takes master's lost runs from 86 to 4; #7658
+had already taken cut 1's 180 to 86. The ones left are the next layer:
 
-- `docs/internals/inventory/D15042.md` and
-  `tests/cases/generics/union-of-records-arm-holding-type-param-built-at-instance.vl`: an armed
-  module fails to validate in `g` (an arm row of a type-parameter record);
+- traps when armed (a module fails to validate): `docs/internals/inventory/D15042.md`,
+  `tests/cases/generics/union-of-records-arm-holding-type-param-built-at-instance.vl` and one
+  more;
 - `distilled/named/d2781_run_generic_pattern.vl`: "`is` names a type that is not a union
   variant" (a variant found by name).
 
-These, and the 237 bytes-only movers, are the next layer. They go to lanes B and H with the
-reader list, as agreed.
+These, and the bytes-only movers, go to lanes B and H with the reader list, as agreed.
 
-`elemNameIsNominal` keeps its other callers.
+`elemTyIsNominal` keeps its other callers.
 
 ## Proof
 
-Refresh to a fixpoint, at 6,710,159 bytes. `scripts/gate.sh`: ALL GATES PASS.
+Refresh to a fixpoint, at 6,716,249 bytes. `scripts/gate.sh`: ALL GATES PASS.
