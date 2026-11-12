@@ -17,8 +17,12 @@ A tErr probe in `holeSlotCallJudgeAt` (`check_relate_core.vl`), on a scratch com
 
 ## What changed
 
-`holeSlotArgJudge` judges a record literal as the value of the field the path's first step
-names, at the rest of the path. `xs` then reaches the binding arm that refuses the bare return,
+`holeSlotRetJudge` steps a returned record literal through the fields the path names
+(`holeSlotRetRecField`) and hands `holeSlotArgJudge` that field's value at the rest of the path.
+A first candidate put the arm in `holeSlotArgJudge` itself. Argument records then reached it
+too, and an empty remaining path trapped the compiler on
+`generics/hole-call-bound-function-field.vl`. So the step is taken for returns only, and only
+while a list or record step is left. `xs` then reaches the binding arm that refuses the bare return,
 and the sentence is the same one. An inline list in the record still reaches the array-literal
 arm, read apart, so it runs as before. So does D15804's loop over an inline list.
 
