@@ -198,7 +198,7 @@ CONTEXT demands i64/f64, and the seam-owner missed the widen. Each fixed at its 
   clean reject. Also: the print-import scan matched only an EXACT `f64` annotation (i64/f32 used
   substring match), so `() => f64`'s print routed to a non-existent import — now substring, which
   incidentally fixed `p2r f64 | null`. Frozen: `closures/lambda-return-widens-{i64,f64}.vl`,
-  `types/fn-value-numeric-return-invariant.vl`. Graduated: `p1r () => i64`, `p3r () => i64`,
+  `types/fn-value-numeric-return-invariant.vl` (since D15896 `types/fn-value-numeric-return-widens.vl`: the adapter converts a named value's result). Graduated: `p1r () => i64`, `p3r () => i64`,
   `p3r (() => i64)[]`, `p2r f64 | null`.
 - **Small literal in a union-VARIANT struct field** (`{f: 5}` into `{f: i64} | i32` — the live remnant
   of the union-param family): `emitVariantStruct` threaded ref/string list kinds but not the scalar
