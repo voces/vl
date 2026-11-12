@@ -11782,3 +11782,16 @@ receives two layouts becomes a view implicitly, with no spelling. `is` may narro
 concrete record. `==` on two views holds when the same concrete type is underneath and every field
 of it is equal, as Go compares interface values; comparing only the narrow type's fields is a
 backlog operator.
+
+## A sub-word field of a `flat` record has storage semantics (owner ruling (a), 2026-11-12) — D15978 (unfiled: D15978, its row lands in #7668)
+
+**The rule.** A `flat` field declared `u8`, `i8`, `u16` or `i16` behaves as an array element of
+that width does. A computed value stored into it keeps its low bits at the field's width. A literal
+the compiler can see is out of that width's range is refused, and the check uses the field's own
+width (an `i16` field accepts `-3`; a `u8` field refuses it). A read gives the narrowed value,
+widened back to `i32`.
+
+**Why.** A sub-word width has one meaning wherever it appears: `bytes[0] = 300` and a `u8` field
+given 300 both read back 44. The rejected options were a layout-only width (the field holds any
+`i32`, so the declared width is not what a read sees) and refusing `flat` values with sub-word
+fields (a refusal the design does not owe).

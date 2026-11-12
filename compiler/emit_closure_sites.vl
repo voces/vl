@@ -60,13 +60,17 @@ import { valueRowKind } from "./check_ty_rep"
 import {
   T,
   TyArray,
+  TyErr,
   TyFunc,
   TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
   TyPrim,
   TyUnion,
+  TyVar,
+  numLitUnionBaseName,
   tyArrayElemIx,
   tyArrayElemPrimName,
   tyAt,
@@ -144,7 +148,6 @@ import {
   atomLeafListArmTag,
   atomLeafListDepthOfTy,
   boolListArmTag,
-  boolListCodeOfName,
   frameLetInitOf,
   refArrSlotTag,
   tyBoolListCode,
@@ -182,7 +185,6 @@ import { elabClosedTyAt, holeOperandTyOf, nodeTyInOf } from "./emit_ty_canon"
 import { unionStoreAtomKindOfSet } from "./emit_union_casts"
 import { i32ListHas } from "./listutil"
 import { identDeclOf, sidOfNode } from "./symbols"
-import { arrElemNameRaw } from "./tyname"
 import { primNameOf, tyEmitPrimOf, tyHasTyVar } from "./tyquery"
 
 // True when the `.map` callback at `fe` produces an element riding the string list — a
@@ -801,19 +803,17 @@ export function cloCallReflistElemTwin(callIx: i32, fnIx: i32): boolean {
   false
 }
 
-// The declared list type-name of the expression at `ix`, or "" — an annotation, not a rep.
-// Covers all four storage classes a list binding can have (param, function-scoped
-// let/const, module global, one level of index), because inside a monomorphized instance
-// the checker never typed the cloned body, so only the substituted annotation is left.
-function listAnnNameOf(ix: i32, fnIx: i32) {
-  if ix < 0 { return "" }
+// The declared list type of the expression at `ix`, or -1: a parameter's, a let's or a
+// global's annotation, one level of index into one, or a direct call's declared return. Read
+// off the annotation node, which an instance types at its pin, so a clone needs no spelling.
+function listAnnTyOf(ix: i32, fnIx: i32): i32 {
+  if ix < 0 { return -1 }
   const e = nodeAt(unwrapParen(ix))
   match e {
     Ident => {
       const ptn = paramTypeNodeOfRead(fnIx, unwrapParen(ix))
       if ptn >= 0 {
-        const pt = nodeAt(ptn)
-        if pt is TypeRef { return pt.tyName }
+        if nodeAt(ptn) is TypeRef { return nodeTyIxOf(ptn) }
       }
       let li = fnLetOfRead(fnIx, unwrapParen(ix))
       if li < 0 { li = globalLetOfRead(fnIx, unwrapParen(ix)) }
@@ -821,16 +821,18 @@ function listAnnNameOf(ix: i32, fnIx: i32) {
         const d = nodeAt(li)
         if d is LetDecl {
           if d.letType >= 0 {
-            const lt = nodeAt(d.letType)
-            if lt is TypeRef { return lt.tyName }
+            if nodeAt(d.letType) is TypeRef { return nodeTyIxOf(d.letType) }
           }
         }
       }
-      return ""
+      return -1
     }
     Index => {
-      const outer = listAnnNameOf(e.idxArr, fnIx)
-      if outer != "" { return arrElemNameRaw(outer) }
+      const outer = listAnnTyOf(e.idxArr, fnIx)
+      if outer >= 0 {
+        const t = tyAt(outer)
+        if t is TyArray { return t.aElem }
+      }
     }
     // A direct call's declared return: inside a generic instance the call node keeps the
     // template's type, and only the callee instance's return names the pinned list (D2820).
@@ -841,8 +843,7 @@ function listAnnNameOf(ix: i32, fnIx: i32) {
           const fn = nodeAt(fnStmts[target])
           if fn is FuncDecl {
             if fn.fnRet >= 0 {
-              const rt = nodeAt(fn.fnRet)
-              if rt is TypeRef { return rt.tyName }
+              if nodeAt(fn.fnRet) is TypeRef { return nodeTyIxOf(fn.fnRet) }
             }
           }
         }
@@ -851,7 +852,36 @@ function listAnnNameOf(ix: i32, fnIx: i32) {
     // No other expression carries a declared list annotation.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
-  ""
+  -1
+}
+
+// The scalar a declared list type's elements are, or "": a primitive element, a numeric
+// literal set's base, or the one answer every member list of a union agrees on.
+function listAnnElemScalar(ty: i32): string {
+  if ty < 0 { return "" }
+  const t = tyAt(ty)
+  match t {
+    TyArray => {
+      const p = tyArrayElemPrimName(ty)
+      if p != "" { return p }
+      return numLitUnionBaseName(t.aElem)
+    }
+    TyUnion => {
+      let out = ""
+      let i = 0
+      while i < t.uMembers.length {
+        const m = listAnnElemScalar(t.uMembers[i])
+        if m == "" || (out != "" && out != m) { return "" }
+        out = m
+        i = i + 1
+      }
+      return out
+    }
+    // Not a list: no declared element.
+    TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+      return ""
+    }
+  }
 }
 
 // True if the list at `arrIx` carries boolean elements: a `[true, ...]` literal, a
@@ -867,14 +897,8 @@ export function listElemIsBool(arrIx: i32, fnIx: i32) {
     if e.arrElems.length > 0 { return exprIsBool(e.arrElems[0], fnIx) }
     return false
   }
-  // The array grammar's one cut (`arrElemNameRaw`) plus the bare leaf name — deliberately
-  // not `nameIsI32Array`, which is rep-wide (also accepts `i32[]`, litunion `K[]`, niche
-  // arrays) where this site is about the element's print formatting specifically.
-  const annElem = arrElemNameRaw(listAnnNameOf(inner, fnIx))
-  // Stays on the name rather than the arena twin (`tyArrayElemPrimName`) on purpose: inside
-  // a monomorphized instance the body is a clone the checker never typed, so the node-type
-  // bank has nothing and only the substituted annotation carries the boolean-ness.
-  // Substituting the arena twin breaks `generics/bool-list-arg-print.vl` (B77).
+  // The declared element decides the print format, ahead of the initializer below.
+  const annElem = listAnnElemScalar(listAnnTyOf(inner, fnIx))
   if annElem == "boolean" { return true }
   // A numeric declared element outranks the initializer-derived kind below: a declared
   // `i32[]` prints its elements as numbers whatever type its initializer's elements have.
@@ -988,8 +1012,8 @@ export function exprBoolListCode(ix: i32, fnIx: i32): i32 {
   if pc >= 0 { return pc }
   // A name or call read inside an instance: a parameter's substituted annotation, or the callee
   // instance's declared return (D2820's rung).
-  const an = listAnnNameOf(bix, fnIx)
-  if an != "" { return boolListCodeOfName(an) }
+  const an = listAnnTyOf(bix, fnIx)
+  if an >= 0 { return tyBoolListCode(an) }
   const init = frameLetInitOf(bix, fnIx)
   if init >= 0 { return exprBoolListCode(init, fnIx) }
   arrLitBoolListCode(bix, fnIx)
