@@ -374,6 +374,9 @@ import {
   npTysPop,
   npTysPush,
   placeNameTy,
+  asgRowStoreTy,
+  narBankRowsOf,
+  narRowLive,
 } from "./check_nar_store"
 import {
   narNoteWritten,
@@ -1834,7 +1837,9 @@ export function writeStorageTy(ix: i32) {
       // null write in a single-iteration loop is a correct program barring would reject.
       const s = identSlotOf(ix, n.identName)
       if narGuardSlot(s) >= 0 { return narWriteStorage(s) }
-      return narDeclaredTy(s, NAR_KIND_ASG)
+      const top = narDeclaredTy(s, NAR_KIND_ASG)
+      if top >= 0 { return top }
+      return asgRowStoreTy(s)
     }
     Member => {
       const slot = narrowedPathIx(placeAt(ix))
@@ -2491,6 +2496,8 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
     const nm = tn.identName
     const s = identSlotOf(tgtIx, nm)
     let dcl = narDeclaredTy(s, -1)
+    // A block that re-declares a write-narrowed `let` without a row of its own still answers.
+    if dcl < 0 { dcl = asgRowStoreTy(s) }
     const guarded = dcl >= 0 && narGuardSlot(s) >= 0
     if guarded {
       const ws = narWriteStorage(s)
@@ -2528,6 +2535,7 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
         const d = narTopDepth(s)
         if guarded { narRetireLayers(s, rn, dcl) }
         if d >= 0 { narSetScope(d, s, dcl) }
+        asgRowsRetireBelow(s, d, rt, dcl)
         // The RE-NARROW — the one member of the declaration the written value can be — is a
         // shadow in the CURRENT block instead, ending at its `}`. Banked at the assignment node
         // so every read after the write lowers alike (D1736).
@@ -2541,6 +2549,12 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
       // A kept write ends at the member of the declaration it stored, when that is narrower
       // than the narrowing it kept (a nullable union's inner member); else at that narrowing.
       if !retires && !guarded { keptEnd = writeMemberTy(dcl, rt) }
+      // A write to a `let` of a union type narrows its reads to the member it stored (DECISIONS.md,
+      // "A read of a `let` takes its most recent write's type").
+      if !retires && !guarded && letUnionWriteNarrows(s, dcl, keptEnd) {
+        noteNarShadow(s, NAR_KIND_ASG)
+        narLayerNote(s, T.frames.length - 1, keptEnd)
+      }
       if !retires && pre >= 0 && !assignable(keptEnd, pre) { keptEnd = pre }
       // Every write joins, retiring or not: an arm that wrote a member the narrowing already
       // allowed still ENDS at that member, and the first arm's in-place retirement is what
@@ -2560,6 +2574,32 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
       narClobRetiredPush(rtd)
     }
   }
+}
+
+// A write of `rt` that retired slot `s`'s narrowing at depth `d` also ends each live assignment row
+// below `d` that cannot hold `rt`, which would otherwise outlive the block that wrote.
+function asgRowsRetireBelow(s: i32, d: i32, rt: i32, dcl: i32) {
+  for i in narBankRowsOf(s) {
+    if (
+      npKind[i] == NAR_KIND_ASG
+      && narRowLive(i)
+      && npDepth[i] < d
+      && npTys[i] >= 0
+      && !assignable(rt, npTys[i])
+    ) {
+      narSetScope(npDepth[i], s, dcl)
+    }
+  }
+}
+
+// Whether a write to slot `s`, declared `dcl`, that stored the member `m` narrows its reads: `s`
+// is a `let` of a union type and `m` is one of its members.
+export function letUnionWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
+  if s < 0 || s >= P.nodes.length || m < 0 || m == dcl { return false }
+  const d = nodeAt(s)
+  if !(d is LetDecl) { return false }
+  if d.letKw != "let" { return false }
+  tyAt(dcl) is TyUnion
 }
 
 // The type a bare name reads at after an accepted write retired its narrowing: the sole member
@@ -2584,6 +2624,22 @@ function writeReNarrowTy(dcl: i32, rt: i32) {
       i = i + 1
     }
     if n == 1 { return hit }
+    // A value several members admit lands on the one it is the same variant as (`{ v: 2 }` into
+    // `Box<i32> | Box<f64>` is the `Box<i32>`).
+    if n > 1 {
+      const w = widenLitTy(rt)
+      let same = -1
+      let k = 0
+      i = 0
+      while i < d.uMembers.length {
+        if sameVariantTy(w, d.uMembers[i]) {
+          same = d.uMembers[i]
+          k = k + 1
+        }
+        i = i + 1
+      }
+      if k == 1 { return same }
+    }
   }
   dcl
 }
@@ -4019,6 +4075,20 @@ export function matchRestNarrows(
 // (innermost-last wins) override the path overlay, which overrides the scope or field lookup, so
 // successive narrowings compose. Read-only — collection must never raise a diagnostic. Parens peel
 // here too (D352), in the tail's own arm, or `(t).v` would key `t.v`, find no fact and answer -1.
+// The type an `is` test narrows the place `ix` from: a `let` a write narrowed is tested at its
+// storage, as the test is lowered (`isOperandAtStorage`), else `placeCurTy`.
+function isTestCurTy(ix: i32, places: i32[], tys: i32[]): i32 {
+  const cur = placeCurTy(ix, places, tys)
+  const ox = peelParenIx(ix)
+  if ox < 0 || i32ListHas(places, placeAt(ox)) { return cur }
+  const on = nodeAt(ox)
+  if !(on is Ident) { return cur }
+  const s = identSlotOf(ox, on.identName)
+  if s == -1 || narGuardSlot(s) >= 0 { return cur }
+  const st = asgRowStoreTy(s)
+  if st >= 0 && letUnionWriteNarrows(s, st, cur) { st } else { cur }
+}
+
 function placeCurTy(ix: i32, places: i32[], tys: i32[]) {
   const p = placeAt(ix)
   if p >= 0 {
@@ -4301,7 +4371,7 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
       } else {
         let tIdx = isTypeTyRead(cond.isVariant, condIx)
         // An overlapping literal set narrows to the overlap, as `checkIsExprNode` tests it.
-        const isCur = placeCurTy(isPl, places, tys)
+        const isCur = isTestCurTy(isPl, places, tys)
         let meet = litSetMeetTy(isCur, tIdx)
         if meet < 0 { meet = recFitMeetTy(isCur, tIdx) }
         if meet >= 0 { tIdx = meet }
@@ -4527,7 +4597,7 @@ function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
     IsExpr => {
       const isPl = asgTestedPlace(cond.isObj)
       if placeHasOptionalHop(cond.isObj) { return 0 }
-      const cur = placeCurTy(isPl, places, tys)
+      const cur = isTestCurTy(isPl, places, tys)
       if cond.isVariant == "null" {
         // The null face of the same hole (D1243), now the shared reader's — see its header.
         const inner = nonNullNarrowTy(cur)
@@ -4645,7 +4715,10 @@ export function applyNarrows(places: i32[], tys: i32[]) {
       }
     } else {
       const s = placeDecl(p)
-      const declTy = declTyOf(s)
+      // A test of a `let` a write narrowed is a guard over its storage, as it is unwritten.
+      const asgSt = asgRowStoreTy(s)
+      const asgGuard = asgSt >= 0 && letUnionWriteNarrows(s, asgSt, tys[i])
+      const declTy = if asgGuard { asgSt } else { declTyOf(s) }
       if declTy >= 0 && declTy != tys[i] { noteNarShadow(s, NAR_KIND_GUARD) }
       // A test that leaves the type unchanged records no narrowing, but its scope still binds
       // the name, so an enclosing narrowing is not this scope's (`retSiteTypedByAnnot`).
