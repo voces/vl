@@ -1,4 +1,4 @@
-# Step 7, L6: `armFieldStructRow` by type, 2026-11-12
+# Step 7, L6: `armFieldStructRow` by type, and `structRowOfAnnTyGo` through `| null`, 2026-11-12
 
 `armFieldStructRow(base)` gave a field typed as a union arm the arm's heap-twin struct row
 (D761). It asked `variantIndexOf` of the field's spelling, peeled of `| null`. `armTwinRowName`
@@ -25,9 +25,17 @@ spelling, so the recorded element name does not move.
 passes `fldTy` to both, in lane E's file: two call lines, no other change there. The `variantIndexOf`
 inside `armFieldStructRow` goes, and `variantIndexOf` has 18 code sites.
 
+## `structRowOfAnnTyGo`'s nullable branch
+
+Lane I's floor audit failed this branch as mechanism. `structRowOfAnnTyGo` answered -1 for a
+nullable annotation type, so each caller fell through to its next rung (`nulBaseStructRow` in
+`paramStructIndex`). It now steps through the `| null` and answers the non-null part's row,
+consistent with `structRowOfValueTy`. Switched alone against #7671's first head, the sweep is
+24,196 same, byte-identical, so the -1 never decided a module.
+
 ## Proof
 
-- Refresh ×2 is a fixpoint at 6,716,455 bytes, against master's 6,716,446.
+- Refresh ×2 is a fixpoint at 6,716,460 bytes, against master's 6,716,446.
 - Sweep against master's fixpoint seed: **24,196 same**, 0 bytes-only movers, 0 output movers.
 - lint-self is clean, and `regress.vl` lost no runs.
 - Witnesses `--strict`: 4,860 as filed, 0 moved.
