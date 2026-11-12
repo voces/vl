@@ -2540,7 +2540,9 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
         // shadow in the CURRENT block instead, ending at its `}`. Banked at the assignment node
         // so every read after the write lowers alike (D1736).
         if rn != dcl {
-          noteNarShadow(s, NAR_KIND_GUARD)
+          // A write to a union `let` outside any guard is the write's own narrowing.
+          const own = !guarded && letUnionWriteNarrows(s, dcl, rn)
+          noteNarShadow(s, if own { NAR_KIND_ASG } else { NAR_KIND_GUARD })
           narLayerNote(s, T.frames.length - 1, rn)
         }
       }
@@ -4088,6 +4090,35 @@ export function letWriteTargetTy(ix: i32, name: string, ty: i32): i32 {
   const st = asgRowStoreTy(s)
   if st >= 0 && letUnionWriteNarrows(s, st, ty) { st } else { ty }
 }
+
+// The storage of the read `op` of a `let` a write narrowed (no guard over it), else -1.
+export function letWriteNarrowedStore(op: i32): i32 {
+  const ox = peelParenIx(op)
+  if ox < 0 { return -1 }
+  const on = nodeAt(ox)
+  if !(on is Ident) { return -1 }
+  const s = identSlotOf(ox, on.identName)
+  if s == -1 || narGuardSlot(s) >= 0 { return -1 }
+  const st = asgRowStoreTy(s)
+  if st >= 0 && letUnionWriteNarrows(s, st, nodeTyIxOf(ox)) { st } else { -1 }
+}
+
+// A test of a `let` a write narrowed is judged at the member written, which refuses a member the
+// write ruled out (D2198), and lowered at the storage, which holds the box: the read is recorded
+// at storage, not narrowed.
+export function isOperandAtStorage(op: i32) {
+  if inferQuiet { return 0 }
+  const st = letWriteNarrowedStore(op)
+  if st < 0 { return 0 }
+  const ox = peelParenIx(op)
+  nodeTySet(ox, st)
+  narrowedFromTySet(ox, st, st)
+  0
+}
+
+// The `is` tests a write made always true, by node, at the type the write narrowed the operand
+// to: an `if` over one has an `else` that can never run, refused as D2198 refuses the test.
+export const isHoldsByWrite: {[i32]: i32} = Map()
 
 // The type an `is` test narrows the place `ix` from: a `let` a write narrowed is tested at its
 // storage, as the test is lowered (`isOperandAtStorage`), else `placeCurTy`.

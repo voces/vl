@@ -99,6 +99,8 @@ import {
   matchRestNarrows,
   matchValPatFact,
   popScope,
+  isOperandAtStorage,
+  letWriteNarrowedStore,
 } from "./check_narrow_flow"
 import { pushScope } from "./check_narrow_paths"
 import { declareDecl } from "./check_scopes"
@@ -700,7 +702,15 @@ function matchTypePatCover(
   elabCapIsNote(patIx, pt, pt)
   if patIx < nodeTyIx.length { nodeTySet(patIx, TY_BOOL) }
   const hit = markUnionCover(uMems, covered, pt)
-  if hit == 0 {
+  if hit != 0 && matchArmWrittenOut(pt) {
+    tErr(
+      "match pattern `"
+        + pn.isVariant
+        + "` can never match a value of type "
+        + tyToStr(matchWriteNarrowTy),
+      patIx,
+    )
+  } else if hit == 0 {
     tErr(
       "match pattern `" + pn.isVariant + "` is not a member of " + tyToStr(st),
       patIx,
@@ -714,6 +724,17 @@ function matchTypePatCover(
   const twin = mapTwinTestMsg(uMems, pt, "a `match` arm")
   if twin != "" { tErr(twin, patIx) }
   false
+}
+
+// Whether the arm type `pt` meets no member of the type a write narrowed the scrutinee to.
+function matchArmWrittenOut(pt: i32): boolean {
+  if matchWriteNarrowTy < 0 { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(matchWriteNarrowTy, ms)
+  for m in ms {
+    if assignable(m, pt) || assignable(pt, m) { return false }
+  }
+  true
 }
 
 // The index in `uMems` of the literal member value pattern `patIx` names: a string or integer
@@ -971,7 +992,28 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
 // (D1572), a litunion on member strings, any other union on member types. `mTail` is the
 // return-tail flag the enclosing statement held.
 function checkMatchExprByScrut(n: MatchExpr, ix: i32, mTail: boolean): i32 {
-  const st = checkNodeHook(n.matchScrut)
+  // A `let` a write narrowed dispatches over its storage, whose box the arms test, and an arm
+  // the write ruled out is refused (`matchTypePatCover`).
+  const st0 = checkNodeHook(n.matchScrut)
+  const wst = letWriteNarrowedStore(n.matchScrut)
+  const st = if wst >= 0 { wst } else { st0 }
+  if wst >= 0 { isOperandAtStorage(n.matchScrut) }
+  const savedWn = matchWriteNarrowTy
+  matchWriteNarrowTy = if wst >= 0 { st0 } else { -1 }
+  const r = checkMatchExprAtScrut(n, ix, mTail, st)
+  matchWriteNarrowTy = savedWn
+  r
+}
+
+// The type a write narrowed the `match` being checked's scrutinee to, or -1.
+let matchWriteNarrowTy = -1
+
+function checkMatchExprAtScrut(
+  n: MatchExpr,
+  ix: i32,
+  mTail: boolean,
+  st: i32,
+): i32 {
   matchCheckPatReads(n, st)
   tpMatchOkSet(mTail || tpIfOkAt.has(ix))
   const strSet = matchLitSetTys(st, "str").length > 0
