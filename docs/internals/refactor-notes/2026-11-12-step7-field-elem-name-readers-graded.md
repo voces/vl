@@ -120,7 +120,8 @@ and `sharedFieldPlanDispatchable`.
   with one holding a list of closures. The two hold one element type at two storages, and only the
   name records which. The result was invalid wasm in `closures/fn-nested-record-field-list-written`
   and `record-literal-written-into-slot-of-fn-widened-binding-runs`. That site was found by reverting
-  each file in turn.
+  each file in turn. This is a floor: the function-tag pass decides the storage, not the type. It is
+  the class of D15880, where a rep depends on a tag decision.
 - **`annShapeIndexOf` and `annShapeWiderRowOf` stay inline.** They already follow the rule with
   stored types. Their name fallback calls `shapeFieldElemName`, which can intern a deferred
   element, so it must stay lazy.
