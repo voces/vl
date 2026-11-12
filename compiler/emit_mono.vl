@@ -1,3 +1,4 @@
+import { unionTyArms } from "./emit_map_twins"
 import { voidCtxLambdaCarry } from "./check_side_rows"
 import { idShadowSpec } from "./emit_id_shadow"
 import {
@@ -106,7 +107,6 @@ import {
   nodeTyIsNulFunc,
   nodeTyIsNullType,
   nodeTyIsNullable,
-  nodeTyIsNullableStruct,
   nodeTyIsStringPrim,
   nodeTyIxIn,
   nodeTyIxOf,
@@ -119,13 +119,7 @@ import {
   tyIsUnionish,
 } from "./check_node_tys"
 import { nodePos, trimWs } from "./fmt_util"
-import {
-  arrElemNameRaw,
-  arrElemSuffixed,
-  listElemNameOf,
-  nameIsBraceSpanEnds,
-  peelGroupParens,
-} from "./tyname"
+import { arrElemSuffixed, listElemNameOf, nameIsBraceSpanEnds } from "./tyname"
 import {
   fnCloCoerceSetAt,
   fnCloCoerceTyIx,
@@ -268,6 +262,7 @@ import {
   tyUnionAllLists,
   tyVarRenameRow,
   tyWrapsRecord,
+  unionAliasDeclNameOfTy,
 } from "./check_types"
 import {
   blockHasBareReturn,
@@ -629,13 +624,7 @@ import {
   bundleParamNote,
   bundleReset,
 } from "./emit_bundle"
-import {
-  repCanonId,
-  repRowId,
-  repRowOfTyStruct,
-  repShadowOn,
-  sFieldElemTyIxAt,
-} from "./emit_rep"
+import { repCanonId, repRowId, repRowOfTyStruct, repShadowOn } from "./emit_rep"
 import {
   instKeyCallTime,
   instKeyCanon,
@@ -765,7 +754,6 @@ import {
   unionArmsOf,
   unionArmsOfTy,
   unionRowKeyAB,
-  unionSetAtomsOf,
 } from "./emit_union_registry"
 import {
   unRowOfTyKey,
@@ -1588,15 +1576,6 @@ function monoParamPinnedNull(ax: i32, fnIx: i32): boolean {
   nodeTyIxOf(ptn) == TY_NULL
 }
 
-// Whether struct row `si` declares field `prop` nullable. A clone's `q.next` is recorded against
-// the template's gradual `q`, so only the struct row knows the field is nullable (D3301).
-function monoFieldDeclNullable(si: i32, prop: string): boolean {
-  if si < 0 || si >= sTyIx.length { return false }
-  const ft = tyFieldTyOf(sTyIx[si], prop)
-  if ft < 0 || ft >= T.tys.length { return false }
-  tyAt(ft) is TyNullable
-}
-
 // The initializer of the local an if-expression's then arm yields, when that local is declared
 // in the arm's own prelude and the join's recorded type is still a type parameter, or -1.
 function monoArmTailLocalInit(ix: i32): i32 {
@@ -2023,19 +2002,6 @@ function monoArgTyNameProjected(
       const fi = sFieldIndex(rsi, argN.memProp)
       if fi >= 0 && sFieldTypeAt(rsi, fi) == FC_STRUCT {
         const fnm = sFieldElemNameAt(rsi, fi)
-        // A nullable record field shares code 15 with a bare one; its pin keeps the `| null`
-        // the field declares, or the instance's parameter is non-null and the call casts (D3301).
-        if (
-          isSName(fnm)
-          && (nodeTyIsNullableStruct(cax)
-            || monoFieldDeclNullable(rsi, argN.memProp))
-        ) {
-          const fet = nonNullTy(sFieldElemTyIxAt(rsi, fi))
-          return monoAnnPinName(
-            fnm + "|null",
-            if fet >= 0 { mkNullableTy(fet) } else { -1 },
-          )
-        }
         if isSName(fnm) {
           const fr = structIndexByName(fnm)
           tyOut[0] = if fr >= 0 && fr < sTyIx.length { sTyIx[fr] } else { -1 }
@@ -2577,9 +2543,7 @@ function monoSubstLetType(
         const subC = monoPinMintedUnion(sub, sty, sty, unTyKeyTagLet())
         // A union takes the type its registered spelling names, the one an assignment's
         // `letUnionNameOf` resolves against the registry, not the substitution's own row (D2676).
-        const subAtoms: string[] = []
-        unionSetAtomsOf(subC, subAtoms)
-        if subAtoms.length >= 2 {
+        if monoPinCanonIsUnion(sty) {
           // Typed by the spelling: the substitution's own type can keep a union the registered
           // row collapses (`f64[] | i32[]` against `f64[]`).
           return synthTypeRefFb(subC, tn.pos, -1)
@@ -2726,7 +2690,7 @@ function monoPinUnionBoxed(j: i32, refArm: boolean): i32 {
   let name = valueUnionRetName(j)
   // Such a union is named as a binding of it is (`monoRegisterElabJoinRows`).
   if name == "" && refArm && monoTyHoldsRefArm(j) {
-    name = monoPinUnionName(monoPinSpellShaped(j))
+    name = monoPinUnionName(monoPinSpellShaped(j), j)
   }
   if name != "" { monoRegisterPinUnion(name, j) }
   j
@@ -7941,26 +7905,48 @@ function monoTagMapTy(t: i32): boolean {
 
 // The registry name of pinned type `st`'s box: the naming rule's spelling, canon'd as a union name.
 function monoPinUnionNameOfTy(st: i32): string {
-  monoPinUnionName(monoPinSpellShaped(st))
+  monoPinUnionName(monoPinSpellShaped(st), st)
 }
 
-// D1042 — the emitter-vocabulary spelling of a substituted annotation name, for the shapes
-// where the two can disagree: a union, and a list of a grouped element (`(T | string)[]`).
-// A substitution into the declared text keeps a literal member literal and a collapsed group's
-// parens, while a direct annotation is canon'd.
-function monoPinUnionName(rs: string): string {
-  const atoms: string[] = []
-  unionSetAtomsOf(rs, atoms)
-  if atoms.length < 2 && !monoNameIsGroupedList(rs) { return rs }
+// D1042 — the emitter-vocabulary spelling of a substituted annotation name `rs` of type `rsTy`,
+// for the shapes where the two can disagree: a union of two arms or more, and a list of a grouped
+// element (`(T | string)[]`). A substitution into the declared text keeps a literal member literal
+// and a collapsed group's parens, while a direct annotation is canon'd. With no type, `rs` stands.
+function monoPinUnionName(rs: string, rsTy: i32): string {
+  if monoPinCanonKind(rsTy) == 0 { return rs }
   const c = canonEmitName(rs)
   if c == "" { return rs }
   c
 }
 
-// Whether `name` is a list whose element is one parenthesised group (`(A | B)[]`, `(string)[]`).
-function monoNameIsGroupedList(name: string): boolean {
-  const e = arrElemNameRaw(name)
-  e != "" && peelGroupParens(e) != e
+// How the canon name of a pin of type `ty` can differ from its spelling: 1 for a union of two
+// members or more, or one whose arms (`unionTyArms`) number two or more (a union of twin maps keys
+// one arm and is still canon'd to its one map, D15540); 2 for a list whose element its spelling
+// groups in parentheses (a union, a nullable or a function); 0 otherwise, and for no type.
+function monoPinCanonKind(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = tyAt(ty)
+  if t is TyUnion {
+    if t.uMembers.length >= 2 { return 1 }
+  }
+  if t is TyArray {
+    if t.aElem >= 0 && t.aElem < T.tys.length {
+      const e = tyAt(t.aElem)
+      if e is TyUnion || e is TyNullable || e is TyFunc { return 2 }
+    }
+  }
+  const atoms: string[] = []
+  const tys: i32[] = []
+  if unionTyArms(ty, atoms, tys) && atoms.length >= 2 { return 1 }
+  0
+}
+
+// Whether a pin of type `ty` canons to a union of two atoms or more: a union by
+// `monoPinCanonKind` that no declared or literal-union alias names, since a canon alias is one atom.
+function monoPinCanonIsUnion(ty: i32): boolean {
+  monoPinCanonKind(ty) == 1
+    && unionAliasDeclNameOfTy(ty) == ""
+    && litUnionAliasNameOfTy(ty) == ""
 }
 
 // The spelling an annotation pinned at `ty` takes when a pin substitutes into a union holding a
@@ -7991,12 +7977,10 @@ function monoPinMintedUnion(
   const wu = wt >= 0 && (wtt is TyUnion || wtt is TyNullable)
   let pc = ""
   if pun != "" {
-    pc = monoPinUnionName(pun)
-    const pcAtoms: string[] = []
-    unionSetAtomsOf(pc, pcAtoms)
-    if pcAtoms.length < 2 { return monoPinUnionName(name) }
-  } else if !wu || monoNameIsGroupedList(name) {
-    return monoPinUnionName(name)
+    pc = monoPinUnionName(pun, le)
+    if !monoPinCanonIsUnion(le) { return monoPinUnionName(name, wt) }
+  } else if !wu || monoPinCanonKind(wt) == 2 {
+    return monoPinUnionName(name, wt)
   }
   if !monoTyHoldsRefArm(ty) || unNameBound(name) { return name }
   // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
@@ -8008,7 +7992,7 @@ function monoPinMintedUnion(
     return "(" + pc + ")[]"
   }
   if !wu { return name }
-  const c = monoPinUnionName(name)
+  const c = monoPinUnionName(name, wt)
   monoShStage(shTag, ty)
   if (
     monoRegisterPinUnion(c, if own >= 0 { monoAnnPinTy(own) } else { ty })
