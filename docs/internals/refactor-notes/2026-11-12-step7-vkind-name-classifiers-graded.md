@@ -56,8 +56,9 @@ identity, not a spelling's rep.
 | lane E | `annShapeIndexOf`; `shapeFieldElemName` and `rlElemStoredName`, reassigned from lane F (whose cuts made their ref-list and map arms type-only) |
 | lane H, converted here | `funcTypeShapeLowerable` |
 | lane H, the nominal gate kept (above) | `structElemArrayLowerable`, `funcRetUnrepresentable` |
-| unowned, probe next | `listAnnNameOf` |
-| contract, below | `emitUnionLitIs`, `flatHasSubWordField`, `elabArgRepins` |
+| unowned, lane H (#7674) | `listAnnNameOf` |
+| contract, below | `emitUnionLitIs`, `elabArgRepins` |
+| gap, D15978 (below) | `flatHasSubWordField` |
 | floor | `nulNicheIsTestImpossible`, a diagnostic render (render-parse's floor) |
 
 `listAnnNameOf` (emit_closure_sites) returns a list binding's annotation text. Its premise is "inside
