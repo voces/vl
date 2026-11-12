@@ -8930,19 +8930,19 @@ false on the run, read where the other member is expected, e.g. `if x is f64 { i
 useF64(x) }`. The same program with the condition true trapped on master; it is refused now as
 D2611's union-to-`f64` delivery. No other cell that ran on master changed.
 
-**A WRITE'S NARROWING MEETS THE SAME REFUSAL (coordinator ruling, 2026-11-12; the owner may
-overrule it).** Under "A read of a `let` takes its most recent write's type", `let x: i32 |
-string = 1; x = "s"` reads `x` as `string`, and a test of a member that narrowing does not have is
-refused as above: an `is` that can never match, a `match` arm naming such a member, and an `==`
-of two write-narrowed values whose narrowed types cannot be compared. This is the coordinator's
-application of D2198 and of the dead-null-test split below, not an owner ruling. An always-true
-test runs, with or without an `else`: it names no missing member, and master runs the same test
-under a guard narrowing. Its `else` is typed from storage, since such a test is lowered over the
-box and its facts are computed from storage (D15955). **The price:** 11 programs of the
-24,177-program sweep that ran on master are refused. They are 9 `is` tests, 1 `match` and
-D7701's `==`, each a fixture or witness that declared a union `let` with one member and then
-tested it. Each is rewritten so the value arrives through a call, a parameter or a conditional
-write, which keeps what it tests.
+**AN IMPOSSIBLE TEST IS AN ERROR ONLY BY ITS DECLARED TYPES (owner ruling, 2026-11-12; it
+replaces the coordinator's "a write's narrowing meets the same refusal" of the same day).** A
+test that can never pass is an ERROR when the operands' DECLARED types can never overlap: an `is`
+of a member the declared type does not have, a `match` arm naming one, an `==` of types that do
+not compare (D2198 stands for these). It is a WARNING (`dead-test`) when the impossibility comes
+only from flow: a write's narrowing ("A read of a `let` takes its most recent write's type"), an
+enclosing guard's narrowing, or `match` arms already covered (a redundant arm). The dead test is
+lowered over the declared types, so it runs and answers at run time. A `const`'s type is the
+literal its initialiser declares, so `const MODE = "debug"; if MODE == "release"` stays an error,
+and its message names the fix: `const MODE: "debug" | "release" = "debug"`. An always-true test
+runs, with or without an `else`; its `else` is typed from storage (D15955). The 11 programs the
+coordinator's ruling had refused run again in their plain spelling, now with the warning, as do
+the four fixtures that pinned the old refusal of a redundant arm or a narrowed-away compare.
 
 **A NULL TEST OF A VALUE PROVED NON-NULL IS A WARNING (owner ruling, 2026-09-26, option (a) of
 open-rulings §dead-null-test).** `x == null` or `x != null` over a value whose type admits no
@@ -11782,3 +11782,16 @@ receives two layouts becomes a view implicitly, with no spelling. `is` may narro
 concrete record. `==` on two views holds when the same concrete type is underneath and every field
 of it is equal, as Go compares interface values; comparing only the narrow type's fields is a
 backlog operator.
+
+## A sub-word field of a `flat` record has storage semantics (owner ruling (a), 2026-11-12) — D15978 (unfiled: D15978, its row lands in #7668)
+
+**The rule.** A `flat` field declared `u8`, `i8`, `u16` or `i16` behaves as an array element of
+that width does. A computed value stored into it keeps its low bits at the field's width. A literal
+the compiler can see is out of that width's range is refused, and the check uses the field's own
+width (an `i16` field accepts `-3`; a `u8` field refuses it). A read gives the narrowed value,
+widened back to `i32`.
+
+**Why.** A sub-word width has one meaning wherever it appears: `bytes[0] = 300` and a `u8` field
+given 300 both read back 44. The rejected options were a layout-only width (the field holds any
+`i32`, so the declared width is not what a read sees) and refusing `flat` values with sub-word
+fields (a refusal the design does not owe).

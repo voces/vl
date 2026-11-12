@@ -1228,6 +1228,7 @@ import {
   listOpKindOfBin,
   listOpSlotOfBin,
   memberLenWidensAtom,
+  msSetHasAtom,
   printUnionArmsUnrenderable,
   printUnionPlan,
   tailIsValueOrNever,
@@ -4113,8 +4114,7 @@ function listLeafOf(ty: i32): i32 {
 // when the union is unnamed or an arm is neither, so its tag set is not known.
 function unionBoxLacksTag(recvIx: i32, tag: i32, fnIx: i32): boolean {
   if tag < uVariants.length { return false }
-  const nm = unionNameOfExpr(recvIx, fnIx)
-  if nm == "" { return false }
+  if !exprUnion(recvIx, fnIx) { return false }
   const uTy = unionBoxTyOfRead(recvIx, fnIx)
   const atoms: string[] = []
   const arms: i32[] = []
@@ -5043,11 +5043,7 @@ function emitListEmptyFitArms(
   const armTys: i32[] = []
   if boxed {
     const atoms: string[] = []
-    const nm = unionNameOfExpr(nd.isObj, fnIx)
-    if (
-      nm == ""
-      || !unionTyArms(unionBoxTyOfRead(nd.isObj, fnIx), atoms, armTys)
-    ) {
+    if (!unionTyArms(unionBoxTyOfRead(nd.isObj, fnIx), atoms, armTys)) {
       return 0
     }
   } else {
@@ -6087,8 +6083,7 @@ function emitVariantDiscrimTest(body: u8[], recvIx: i32, vi: i32, fnIx: i32) {
 // itself when the union has it exactly, has no such member, or `patTy` is not a map (D2733).
 function isPatUnionArmTy(recvIx: i32, patTy: i32, fnIx: i32): i32 {
   if patTy < 0 || !unMemIsMap(patTy) { return patTy }
-  const nm = unionNameOfExpr(recvIx, fnIx)
-  if nm == "" { return patTy }
+  if !exprUnion(recvIx, fnIx) { return patTy }
   const atoms: string[] = []
   const arms: i32[] = []
   unionTyArms(unionBoxTyOfRead(recvIx, fnIx), atoms, arms)
@@ -6115,8 +6110,7 @@ function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
   const pat: i32[] = []
   flattenVariantsInto(patTy, pat)
   const arms: i32[] = []
-  const nm = unionNameOfExpr(recvIx, fnIx)
-  if nm != "" {
+  if exprUnion(recvIx, fnIx) {
     const atoms: string[] = []
     unionTyArms(unionBoxTyOfRead(recvIx, fnIx), atoms, arms)
   }
@@ -6323,8 +6317,7 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   if luT >= 0 && !tyHasTyVar(luT) { return 0 }
   if isTestsNull(isIx) || !exprUnion(nd.isObj, fnIx) { return 0 }
   const chk = isVarTyIxOf(isIx)
-  const nm = unionNameOfExpr(nd.isObj, fnIx)
-  if tyArrayElemIx(chk) < 0 || nm == "" { return 0 }
+  if tyArrayElemIx(chk) < 0 { return 0 }
   const atoms: string[] = []
   const arms: i32[] = []
   if (!unionTyArms(unionBoxTyOfRead(nd.isObj, fnIx), atoms, arms)) { return 0 }
@@ -6833,10 +6826,7 @@ function emitIsTestArmTag(body: u8[], isIx: i32, ndv: IsExpr, fnIx: i32) {
     && tyIsLitUnion(isVarTyIxOf(isIx))
     && exprUnion(ndv.isObj, fnIx)
     && unionEqOperandOk(ndv.isObj)
-    && !unionCarriesLitUnionArmOfSet(
-      msSetOfUnionBox(ndv.isObj, fnIx),
-      unionNameOfExpr(ndv.isObj, fnIx),
-    )
+    && msSetCarriesLitUnionArm(msSetOfUnionBox(ndv.isObj, fnIx)) != 1
     && msSetTakesAtomAsStr(msSetOfUnionBox(ndv.isObj, fnIx))
     && !readIsCallResult(ndv.isObj, fnIx)
   ) {
@@ -12064,14 +12054,13 @@ function emitUnionLitIs(body: u8[], objIx: i32, lit: string, fnIx: i32) {
   // in force, and so the static-false fold below still evaluates it exactly once.
   const isStash = unionLitIsStashSlot()
   const isOnce = !unionEqOperandOk(objIx)
-  const uname = unionNameOfExpr(objIx, fnIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
   const usid = msSetOfUnionBox(objIx, fnIx)
   // D1047 — the empty-name reject stays ahead of the atom ladder. The ladder's i64-widening rung
   // and the mixed-union gate below both ask `unionHasAtomK`, whose fall-through fails loudly on
   // an unregistered row, and a receiver whose union has no name has no row at all. The message is
   // the condition's own; the branch is a floor, unreached by the tests and by the corpus.
-  if uname == "" {
+  if usid < 0 {
     return emitFail(
       "emitProgram: literal `is` over a union with no recorded members",
     )
@@ -12113,8 +12102,8 @@ function emitUnionLitIs(body: u8[], objIx: i32, lit: string, fnIx: i32) {
   // is arm-agnostic, so a struct or container arm simply has a tag that does not match. Widened
   // only where the literal's own rep has an arm, which the static-false fold below already trusts.
   if (
-    !isValueUnionOfSet(usid, uname)
-    && !unionCarriesLitUnionArmOfSet(usid, uname)
+    msIsValueUnion(usid) != 1
+    && msSetCarriesLitUnionArm(usid) != 1
     && !litHasArm
   ) {
     return emitFail(
@@ -15602,11 +15591,9 @@ function emitScalarMapReadBoxEq(
   if !unionEqOperandOk(boxIx) { return 0 }
   const bn = nodeAt(unwrapParen(boxIx))
   if bn is Index { return 0 }
-  const un = unionNameOfExpr(boxIx, fnIx)
-  if un == "" || !unionSetHasNullTy(un, unionBoxTyOfRead(boxIx, fnIx)) {
-    return 0
-  }
-  if !unionHasAtom(un, scalarAtomNameOfKind(k)) { return 0 }
+  const bxs = msSetOfTy(unionBoxTyOfRead(boxIx, fnIx))
+  if !exprUnion(boxIx, fnIx) || bxs < 0 || !msHasNull(bxs) { return 0 }
+  if !msSetHasAtom(bxs, scalarAtomNameOfKind(k)) { return 0 }
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
   pushMapScr(body, 5)     // entry
   fbIf(127)               // i32 result
