@@ -1290,7 +1290,6 @@ import {
   mapTwinSame,
   refArrSlotTag,
   tyIsAtomLeafList,
-  unionSetArmTysAB,
   unionTyArms,
   unionTyHasAtom,
   variantDiscrimFieldNeeded,
@@ -1412,8 +1411,6 @@ import {
   readAtomKindOfTy,
   unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentAt,
-  unionDeclTyIxOfIdentRead,
-  unionTyIxOfIdentRead,
 } from "./emit_start_block"
 import {
   declaredKind,
@@ -4262,13 +4259,6 @@ function isNumRecvBaseName(recvIx: i32, fnIx: i32) {
   if tyAt(t) is TyUnion { numLitUnionBaseName(t) } else { "" }
 }
 
-// The value-union name of an `is` receiver, for the box-tag soundness floor in `emitIs`; `""`
-// when the receiver is not a union. An optional chain's leaf field is among the forms
-// `unionNameOfExpr` covers.
-function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
-  unionNameOfExpr(exprIx, fnIx)
-}
-
 // The operand of `x == null` / `null == x` whose checked type admits no `null`, or whose hole
 // instance `fnIx` binds it to a function type, or -1.
 // A capture cell's read `c[0]` carries the checker's type for the name it replaced, which is
@@ -4497,21 +4487,6 @@ function unionCarriesLitUnionArm(nm: string) {
   nameIsLitUnionArmValueUnion(setNm)
 }
 
-// How many members of `nm` ride the box as a string ref (a `string` arm or a literal-union
-// arm), read from its row's member types, or -1 for a row with an untyped member. One: kind
-// 2's tag discriminates that arm; two or more overlap in the tag, so `x is K` needs
-// membership over the payload.
-function unionStrArmCountOf(nm: string): i32 {
-  const mems: i32[] = []
-  if !unionMemberTysOf(nm, mems) { return -1 }
-  let n = 0
-  for m in mems {
-    if m >= T.tys.length { return -1 }
-    if primNameOf(m) == "string" || tyIsLitUnionOrLit(m) { n = n + 1 }
-  }
-  n
-}
-
 // Whether `recvIx` is a value-union box with no string or literal-union arm, so no string
 // literal (`texts`, from `tyLitMemberTexts`) can be its value.
 function litStrMembersOutsideBox(
@@ -4520,9 +4495,10 @@ function litStrMembersOutsideBox(
   fnIx: i32,
 ): boolean {
   if texts.length == 0 || !exprUnion(recvIx, fnIx) { return false }
-  const nm = unionNameOfExpr(recvIx, fnIx)
-  if nm == "" || !isValueUnionOfSet(msSetOfUnion(nm), nm) { return false }
-  unionStrArmCountOf(nm) == 0 && !unionCarriesLitUnionArm(nm)
+  emitFail(
+    "emitProgram: a string-literal `is` over a union box reached the test for a box with no string arm",
+  )
+  false
 }
 
 // True when `recvIx` is a receiver `emitLitMemberEq` can be applied to repeatedly: a
@@ -5050,13 +5026,7 @@ function emitListEmptyFitArms(
     const nm = unionNameOfExpr(nd.isObj, fnIx)
     if (
       nm == ""
-      || !unionSetArmTysAB(
-        92,
-        nm,
-        unionTyIxOfIdentRead(nd.isObj, fnIx),
-        atoms,
-        armTys,
-      )
+      || !unionTyArms(unionBoxTyOfRead(nd.isObj, fnIx), atoms, armTys)
     ) {
       return 0
     }
@@ -6896,14 +6866,12 @@ function emitIsTestArmTag(body: u8[], isIx: i32, ndv: IsExpr, fnIx: i32) {
     return 1
   }
 
-  // the tag compare below is unsound for a litunion tested type over a box with two
-  // string-repped arms: the litunion arm shares kind 2's tag with a plain `string` arm,
-  // so `tag == 2` would answer true for every string the box holds, members or not. A row
-  // with an untyped member cannot say, so it takes the refusal too.
+  // A literal union tested by its string tag would answer true for every string the box holds,
+  // members or not, so no box test reaches here with one; one that does fails loudly.
   if armTag == 2 && tyIsLitUnion(isVarTyIxOf(isIx)) {
-    const amNm = isStrTagUnionNameOf(ndv.isObj, fnIx)
-    const amStr = if amNm == "" { 0 } else { unionStrArmCountOf(amNm) }
-    if amStr < 0 || amStr > 1 { return emitFailNoMembershipRecv() }
+    return emitFail(
+      "emitProgram: `is` over a literal union reached the box's string-tag test, which cannot tell its members from other strings",
+    )
   }
   if armTag >= 0 {
     const vrecv = nodeAt(unwrapParen(ndv.isObj))
@@ -11913,15 +11881,9 @@ function emitUnionUnionEq(
   // surviving arms, index-parallel to the atom column; an uncovered row marks its arms -2.
   const lAtoms: string[] = []
   if !msMemberAtomsOfSet(lsid, lAtoms) {
-    // `unionSetArmTysAB` appends the atoms whether or not every member type resolved.
+    // The arms of the union the left read holds (`unionTyArms`); none when it covers none.
     const lMems: i32[] = []
-    unionSetArmTysAB(
-      96,
-      lname,
-      unionDeclTyIxOfIdentRead(lIx, fnIx),
-      lAtoms,
-      lMems,
-    )
+    unionTyArms(unionBoxTyOfRead(lIx, fnIx), lAtoms, lMems)
   }
   const lKinds: i32[] = []
   let lKindsOk = msMemberValKindsOf(lsid, lKinds)
@@ -11934,17 +11896,7 @@ function emitUnionUnionEq(
     // atoms, every arm is filtered out, and the loop emits nothing — so control reaches the
     // tag-only fallback and `==` compares just the two tags (D989).
     const rMems: i32[] = []
-    if (
-      unionSetArmTysAB(
-        97,
-        rname,
-        unionDeclTyIxOfIdentRead(rIx, fnIx),
-        rAtoms,
-        rMems,
-      )
-    ) {
-      rOk = true
-    }
+    if (unionTyArms(unionBoxTyOfRead(rIx, fnIx), rAtoms, rMems)) { rOk = true }
   }
   const arms: string[] = []
   const armKinds: i32[] = []
