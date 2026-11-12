@@ -73,6 +73,7 @@ import {
   elabSpreadRunNote,
   elabSrcDecl,
   elabStoreMemberOf,
+  elabTypedReadMemberAt,
   elabValueSlotUncalled,
   litRepTyAt,
   readNarrowedStoreAt,
@@ -4098,13 +4099,11 @@ function unionBoxLacksTag(recvIx: i32, tag: i32, fnIx: i32): boolean {
   if tag < uVariants.length { return false }
   const nm = unionNameOfExpr(recvIx, fnIx)
   if nm == "" { return false }
-  const declTy = unionTyIxOfIdentRead(recvIx, fnIx)
+  const uTy = unionBoxTyOfRead(recvIx, fnIx)
   const atoms: string[] = []
   const arms: i32[] = []
-  if !unionSetArmTysAB(91, nm, declTy, atoms, arms) || arms.length == 0 {
-    return false
-  }
-  const u = unionRowKeyAB(91, nm, declTy)
+  if !unionTyArms(uTy, atoms, arms) || arms.length == 0 { return false }
+  const u = unRowOfTyKey(uTy)
   let i = 0
   while i < arms.length {
     const t = isArmTagOfTy(arms[i])
@@ -5064,28 +5063,76 @@ function emitListEmptyFitArms(
     flattenVariantsInto(recvTy, armTys)
   }
   const fits: i32[] = []
+  const depths: i32[] = []
   let meets = false
   for a in armTys {
     if a >= 0 && a < T.tys.length && tyAt(a) is TyArray {
-      if listDisjointDepth(a, kTy) == 1 { fits.push(a) } else { meets = true }
+      const d = listDisjointDepth(a, kTy)
+      if d >= 1 {
+        fits.push(a)
+        depths.push(d)
+      } else {
+        meets = true
+      }
     }
   }
-  // An arm whose elements can be `K`, or meet them below the first level, keeps its tag test.
+  // An arm whose elements can be `K` at every depth keeps its tag test.
   if fits.length == 0 || meets { return 0 }
   if !unionEqOperandOk(nd.isObj) { return emitFailNoMembershipRecv() }
   if !boxed && fits.length != 1 { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-  for a in fits {
-    if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, a) {
-      const sh = listFitShadowSet(isIx, a, 1, fnIx)
+  let fi = 0
+  while fi < fits.length {
+    if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, fits[fi]) {
+      const sh = listFitShadowSet(isIx, fits[fi], depths[fi], fnIx)
       if sh < 1 { return sh }
     }
+    fi = fi + 1
   }
   let i = 0
   while i < fits.length {
     const at = tyAt(fits[i])
     if !(at is TyArray) { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
     const heaps: i32[] = []
-    const kind = listFitElemKind(at.aElem, heaps)
+    let kind = listFitElemKind(at.aElem, heaps)
+    // An arm disjoint below its first level is a list of lists: its rows down to that depth are
+    // walked as `emitListEmptyFitIs` walks a bare receiver's, and the box holds the outer row.
+    const slots: i32[] = []
+    let slot = 0
+    let outer = -1
+    if depths[i] > 1 {
+      let s = rlSlotOfTyOrTwin(tyRefArrElemOf(fits[i]))
+      outer = s
+      kind = "reflist"
+      let k = 1
+      while k < depths[i] {
+        if s < 0 || s >= rlElemTyIx.length || rlElemNullable[s] != 0 {
+          return emitFailAt(LIST_FIT_REP_MSG, isIx)
+        }
+        slots.push(s)
+        const ek = rlElemKindAt(s)
+        if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
+        else if k == depths[i] - 1 && ek == RLK_I32_LIST { kind = "list" }
+        else if k == depths[i] - 1 && ek == RLK_STR_LIST { kind = "strlist" }
+        else if k == depths[i] - 1 && ek == RLK_F64_LIST { kind = "f64list" }
+        else if k == depths[i] - 1 && ek == RLK_I64_LIST { kind = "i64list" }
+        else if k == depths[i] - 1 && ek == RLK_F32_LIST { kind = "f32list" }
+        else if k == depths[i] - 1 && ek == RLK_U8_LIST { kind = "u8list" }
+        else { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
+        k = k + 1
+      }
+      if kind == "reflist" {
+        if s < 0 || s >= rlWrapIdx.length {
+          return emitFailAt(LIST_FIT_REP_MSG, isIx)
+        }
+        slot = s
+      }
+      if outer < 0 || outer >= rlWrapIdx.length {
+        return emitFailAt(LIST_FIT_REP_MSG, isIx)
+      }
+    } else {
+      if kind == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
+      slot = heaps[0]
+    }
     if kind == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
     if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
     if boxed {
@@ -5103,11 +5150,11 @@ function emitListEmptyFitArms(
     if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
     if boxed {
       fbStructGet(uBoxIdx, 1)
-      fbRefCast(heaps[2])
+      fbRefCast(if outer >= 0 { rlWrapIdx[outer] } else { heaps[2] })
     } else {
       fbRefAsNonNull()
     }
-    emitListEmptyLoop([], 0, kind, heaps[0])
+    emitListEmptyLoop(slots, 0, kind, slot)
     fbElse()
     fbI32Const(0)
     fbEnd()
@@ -6052,7 +6099,7 @@ function isPatUnionArmTy(recvIx: i32, patTy: i32, fnIx: i32): i32 {
   if nm == "" { return patTy }
   const atoms: string[] = []
   const arms: i32[] = []
-  unionSetArmTysAB(93, nm, unionDeclTyIxOfIdentRead(recvIx, fnIx), atoms, arms)
+  unionTyArms(unionBoxTyOfRead(recvIx, fnIx), atoms, arms)
   let same = -1
   let i = 0
   while i < arms.length {
@@ -6079,7 +6126,7 @@ function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
   const nm = unionNameOfExpr(recvIx, fnIx)
   if nm != "" {
     const atoms: string[] = []
-    unionSetArmTysAB(94, nm, unionTyIxOfIdentRead(recvIx, fnIx), atoms, arms)
+    unionTyArms(unionBoxTyOfRead(recvIx, fnIx), atoms, arms)
   }
   const pins: i32[] = []
   instancePinnedMaps(fnIx, pins)
@@ -6288,11 +6335,7 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   if tyArrayElemIx(chk) < 0 || nm == "" { return 0 }
   const atoms: string[] = []
   const arms: i32[] = []
-  if (
-    !unionSetArmTysAB(95, nm, unionTyIxOfIdentRead(nd.isObj, fnIx), atoms, arms)
-  ) {
-    return 0
-  }
+  if (!unionTyArms(unionBoxTyOfRead(nd.isObj, fnIx), atoms, arms)) { return 0 }
   const chkTag = isArmTagOfTy(chk)
   const chkLeaf = listLeafTyOf(chk)
   const tags: i32[] = []
@@ -27357,6 +27400,15 @@ function emitBundleMemberArg(body: u8[], arg: i32, fnIx: i32): i32 {
   emitBundleMemberPick(body, arg, bundleHandMemberOf(arg), fnIx)
 }
 
+// An annotated binding `letIx` initialised with a bundle holder's read: the member its type
+// names, picked off the holder's record. 0, -1, or 1 where the binding is no such one.
+export function emitTypedHolderInit(body: u8[], letIx: i32, fnIx: i32): i32 {
+  const tm = elabTypedReadMemberAt(nodeSrc[letIx] ?? letIx, elabKeyOfFn(fnIx))
+  const ln = nodeAt(letIx)
+  if tm < 0 || !(ln is LetDecl) { return 1 }
+  emitBundleMemberPick(body, ln.letInit, tm, fnIx)
+}
+
 // The bundle read `arg`'s member `m`, -1 where the record holds none at the destination's type.
 // 0, or -1.
 function emitBundleMemberPick(body: u8[], arg: i32, m: i32, fnIx: i32): i32 {
@@ -32679,6 +32731,8 @@ function emitLetInitValue(
   letUNm: string,
   letArmCell: boolean,
 ) {
+  const th = emitTypedHolderInit(body, stmtIx, fnIx)
+  if th != 1 { return th }
   if slotKind == "nulclosure" || isNulScalarListKind(slotKind) {
     // A nullable function value or distinct-backing scalar list: a niche nullable ref, not a
     // box, so it takes priority over the union-coerce path. A bare `null` is `ref.null none`
