@@ -95,6 +95,8 @@ import {
   applyNarrows,
   collectElseNarrows,
   collectThenNarrows,
+  isOperandAtStorage,
+  letWriteNarrowedStore,
   markUnionCover,
   matchRestNarrows,
   matchValPatFact,
@@ -971,7 +973,21 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
 // (D1572), a litunion on member strings, any other union on member types. `mTail` is the
 // return-tail flag the enclosing statement held.
 function checkMatchExprByScrut(n: MatchExpr, ix: i32, mTail: boolean): i32 {
+  // A `let` a write narrowed is matched over the member set the write left, which an arm naming
+  // another member is refused against, and lowered over its storage, whose box the arms test.
   const st = checkNodeHook(n.matchScrut)
+  const wst = letWriteNarrowedStore(n.matchScrut)
+  if wst >= 0 { isOperandAtStorage(n.matchScrut) }
+  checkMatchExprAtScrut(n, ix, mTail, st, wst >= 0)
+}
+
+function checkMatchExprAtScrut(
+  n: MatchExpr,
+  ix: i32,
+  mTail: boolean,
+  st: i32,
+  written: boolean,
+): i32 {
   matchCheckPatReads(n, st)
   tpMatchOkSet(mTail || tpIfOkAt.has(ix))
   const strSet = matchLitSetTys(st, "str").length > 0
@@ -989,7 +1005,7 @@ function checkMatchExprByScrut(n: MatchExpr, ix: i32, mTail: boolean): i32 {
   // D1898 — a NULLABLE literal union takes the member-string vocabulary too, with `null` as
   // one more member: it is the same interned i32 atom as the bare set, `null` riding the spare
   // `-1`, so the desugared `k is null` / `k == "a"` chain is what already lowers.
-  if !strSet { return checkMatchUnionScrut(n, ix, st) }
+  if !strSet { return checkMatchUnionScrut(n, ix, st, written) }
   checkMatchLitUnionArms(n, ix, st, setNul)
 }
 
@@ -1046,13 +1062,18 @@ function matchScrutOnlyNull(st: i32): boolean {
   isNullTy(st)
 }
 
-function checkMatchUnionScrut(n: MatchExpr, ix: i32, st: i32): i32 {
+function checkMatchUnionScrut(
+  n: MatchExpr,
+  ix: i32,
+  st: i32,
+  written: boolean,
+): i32 {
   // A value typed `null` alone (`const v = null`) has the one member `null`, which its `null`
   // arm tests; its inner hole is no member (D3335).
   let uMems: i32[] = []
   const onlyNull = matchScrutOnlyNull(st)
   if onlyNull { uMems = [TY_NULL] } else { flattenVariantsInto(st, uMems) }
-  if uMems.length > 1 || onlyNull {
+  if uMems.length > 1 || onlyNull || written && uMems.length == 1 {
     if unionHasLitMember(uMems) { resolveMatchConstPats(n, false) }
     return checkMatchTypeArms(n, ix, st, uMems)
   }

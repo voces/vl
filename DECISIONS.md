@@ -8930,6 +8930,20 @@ false on the run, read where the other member is expected, e.g. `if x is f64 { i
 useF64(x) }`. The same program with the condition true trapped on master; it is refused now as
 D2611's union-to-`f64` delivery. No other cell that ran on master changed.
 
+**A WRITE'S NARROWING MEETS THE SAME REFUSAL (coordinator ruling, 2026-11-12; the owner may
+overrule it).** Under "A read of a `let` takes its most recent write's type", `let x: i32 |
+string = 1; x = "s"` reads `x` as `string`, and a test of a member that narrowing does not have is
+refused as above: an `is` that can never match, a `match` arm naming such a member, and an `==`
+of two write-narrowed values whose narrowed types cannot be compared. This is the coordinator's
+application of D2198 and of the dead-null-test split below, not an owner ruling. An always-true
+test runs, with or without an `else`: it names no missing member, and master runs the same test
+under a guard narrowing. Its `else` is typed from storage, since such a test is lowered over the
+box and its facts are computed from storage (D15955). **The price:** 11 programs of the
+24,177-program sweep that ran on master are refused. They are 9 `is` tests, 1 `match` and
+D7701's `==`, each a fixture or witness that declared a union `let` with one member and then
+tested it. Each is rewritten so the value arrives through a call, a parameter or a conditional
+write, which keeps what it tests.
+
 **A NULL TEST OF A VALUE PROVED NON-NULL IS A WARNING (owner ruling, 2026-09-26, option (a) of
 open-rulings §dead-null-test).** `x == null` or `x != null` over a value whose type admits no
 `null` (by its declaration, a narrowing or a write) compiles, with the warning "`x == null` is
