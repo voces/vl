@@ -76,7 +76,7 @@ import {
   storageReadEnter,
   storageReadLeave,
 } from "./emit_elab"
-import { canonUnionMembersInto } from "./check_program"
+import { canonUnionMemberTysOf, canonUnionMembersInto } from "./check_program"
 import {
   cexLitPeel,
   intLitIsNegated,
@@ -163,6 +163,7 @@ import {
   objFieldType,
   oneListUnionRender,
   primNameStr,
+  softenLitTy,
   tyArrayElemIx,
   tyAt,
   tyBearsNull,
@@ -1296,7 +1297,6 @@ import {
 import {
   mvValTyIxAt,
   mvValUnionHasNull,
-  nonNulBaseOf,
   rlElemIsNulNiche,
   rlElemLitStructRow,
   tyRefArrElemOf,
@@ -1378,6 +1378,7 @@ import {
   narrowedNulStructArm,
   rlElemInnerSlot,
   rlElemStructRow,
+  rlElemVariantRow,
   rlSlotOfTyOrTwin,
   sFieldMapShape,
   sFieldRefSlot,
@@ -1404,6 +1405,7 @@ import {
   nodeJoinRowName,
   nodeMixedUnionName,
   nulLitMemberTexts,
+  readAtomKindOfTy,
   unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentAt,
   unionDeclTyIxOfIdentRead,
@@ -1522,7 +1524,6 @@ import {
   unionArmsOfTy,
   unionHasAtomAB,
   unionHasAtomTy,
-  unionHasValueAtom,
   unionMemberAtomsOf,
   unionMemberSetOf,
   unionMemberTysOf,
@@ -2778,7 +2779,38 @@ function emitVariantStruct(body: u8[], objIx: i32, vi: i32, fnIx: i32) {
   // row's fields are laid out sorted by name too, so `{ kind: "rect", w: f(), h: g() }` is
   // pushed `h, kind, w` and would run its initialisers permuted without this.
   const stash: i32[] = []
-  if objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) {
+  // A literal the checker built at this arm from a wider record runs each initialiser the arm
+  // drops for its effect, in source order, as `emitObj` does (D1696, D15093).
+  const drops = objLitHasFieldOutside(objIx, start, cnt)
+    && objLitBuildVariantRow(objIx, fnIx) == vi
+    && nodeRepTyAt(objIx, fnIx) != nodeTyAt(objIx, fnIx)
+  // A constant dropped initialiser cannot be observed, so it is skipped (D5342).
+  if drops && objLitDropsField(objIx, sFieldNames, start, cnt) {
+    let pj = 0
+    while pj < cnt {
+      stash.push(0 - 1)
+      pj = pj + 1
+    }
+    const pairs = objFieldSrcPairs(objIx, sFieldNames, start, cnt)
+    let oi = 0
+    while oi + 1 < pairs.length {
+      const ofj = pairs[oi]
+      const ovIx = pairs[oi + 1]
+      oi = oi + 2
+      if ofj < 0 {
+        if emitExpr(body, ovIx, fnIx) < 0 { return -1 }
+        fbDrop()
+        continue
+      }
+      if emitVariantFieldValue(body, vi, ofj, ovIx, fnIx) < 0 { return -1 }
+      const dslot = objOrderStashSlot(
+        variantFieldTypeAt(vi, ofj),
+        uFieldStorageSlot(vi, ofj),
+      )
+      stash[ofj] = dslot
+      fbLocalSet(dslot)
+    }
+  } else if objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) {
     let pj = 0
     while pj < cnt {
       stash.push(0 - 1)
@@ -2829,7 +2861,7 @@ function emitVariantStruct(body: u8[], objIx: i32, vi: i32, fnIx: i32) {
     if emitVariantFieldValue(body, vi, fj, valIx, fnIx) < 0 { return -1 }
     fj = fj + 1
   }
-  if objLitHasFieldOutside(objIx, start, cnt) {
+  if !drops && objLitHasFieldOutside(objIx, start, cnt) {
     return emitFailAt(
       "emitProgram: object literal writes a field its union variant does not declare",
       objIx,
@@ -6878,7 +6910,7 @@ function emitArmFieldsFit(
     if nonNullTy(fys[i]) == fys[i] { fxSet = nonNullTy(fxSet) }
     // A nullable string field answers its null apart, then tests only non-null strings: all
     // fit, none does, or they are compared against the set's string members.
-    const nulStr = fi >= 0 && variantFieldTypeAt(yi, fi) == FC_NUL_STR
+    const nulStr = fi >= 0 && fieldRowIsStr(uFieldStart[yi] + fi, true)
     let nnKind = 2
     if nulStr { nnKind = tyFitKind(nonNullTy(fys[i]), fxSet) }
     const lexes = tyLitSetMemberLexes(
@@ -6886,7 +6918,7 @@ function emitArmFieldsFit(
     )
     if (
       fi >= 0
-      && variantFieldTypeAt(yi, fi) != FC_UNION
+      && !fieldRowIsUnionBox(uFieldStart[yi] + fi)
       && (lexes.length > 0 || nnKind != 2)
     ) {
       if nulStr {
@@ -6923,7 +6955,7 @@ function emitArmFieldsFit(
       i = i + 1
       continue
     }
-    if fi < 0 || variantFieldTypeAt(yi, fi) != FC_UNION {
+    if fi < 0 || !fieldRowIsUnionBox(uFieldStart[yi] + fi) {
       return emitFail(
         "emitProgram: `is` across record arms whose shared field holds a value only some of which fit, outside a union box",
       )
@@ -6975,8 +7007,10 @@ function emitArmFieldsFit(
 // The `string | null` read rule for a field of code `code`, shared by every struct and variant
 // field read and by the ident reads in `emitIdentNode`: a value read recovers the non-null ref.
 // A read typed `string | null` keeps the raw ref (`nulStrReadRecovers`).
-function emitNulStrFieldRecover(code: i32, readIx: i32, fnIx: i32) {
-  if code == FC_NUL_STR && nulStrReadRecovers(readIx, fnIx) { fbRefAsNonNull() }
+function emitNulStrFieldRecover(r: i32, readIx: i32, fnIx: i32) {
+  if fieldRowIsStr(r, true) && nulStrReadRecovers(readIx, fnIx) {
+    fbRefAsNonNull()
+  }
   0
 }
 
@@ -7001,12 +7035,12 @@ function emitNarrowedMem(body: u8[], memIx: i32, fnIx: i32) {
     fbStructGet(uBoxIdx, 1)
     fbRefCast(variantHeap(vi))
     fbStructGet(variantHeap(vi), idx)
-    emitNulStrFieldRecover(variantFieldTypeAt(vi, idx), memIx, fnIx)
+    emitNulStrFieldRecover(uFieldStart[vi] + idx, memIx, fnIx)
 
     // A value-union field read while the checker types it as one atom unboxes to that atom,
     // through the home the bare-arm twin uses: an index-rooted path has no member key, so
     // only that home's checker-typed arm sees `xs[0].r` under `!= null` (D8145).
-    if variantFieldTypeAt(vi, idx) == FC_UNION {
+    if fieldRowIsUnionBox(uFieldStart[vi] + idx) {
       return emitUnionFieldNarrowUnbox(memIx, fnIx)
     }
     return 0
@@ -9069,7 +9103,7 @@ function emitUnionCoerceList(
   )
   if viaListArm < 0 { return -1 }
   if viaListArm == 1 { return 0 }
-  if unionName == "" || !unionHasValueAtom(unionName) {
+  if unionName == "" || !unionTyHasValueAtom(uTy) {
     return emitExpr(body, exprIx, fnIx)
   }
   return emitUnionCoerceValueAtom(
@@ -11647,7 +11681,7 @@ function sharedFieldPlanDispatchable(
 // members store the field at different value atoms (`sharedFieldArmsBoxable`), or this member
 // stores a scalar where another stores the box (D4056).
 function sharedFieldReadBoxes(code: i32, vi0: i32, fi0: i32): boolean {
-  code == FC_UNION && variantFieldTypeAt(vi0, fi0) != FC_UNION
+  code == FC_UNION && !fieldRowIsUnionBox(uFieldStart[vi0] + fi0)
 }
 
 // Whether any member of the plan boxes its field (`sharedFieldReadBoxes`), so the read
@@ -11790,7 +11824,7 @@ function emitSharedFieldArm(
     fbStructNew(uBoxIdx)
   }
   // A `string | null` member read where a narrowing excluded `null` holds a string.
-  if code == FC_STR && variantFieldTypeAt(vi, fi) == FC_NUL_STR {
+  if code == FC_STR && fieldRowIsStr(uFieldStart[vi] + fi, true) {
     fbRefAsNonNull()
   }
   0
@@ -12182,12 +12216,12 @@ function emitMemVariantRead(body: u8[], memIx: i32, fnIx: i32): i32 {
       }
       if emitExpr(body, m0.memObj, fnIx) < 0 { return -1 }
       fbStructGet(variantHeap(pvi), pvfi) // 0xfb 0x02 <variant struct ht> <field index>
-      emitNulStrFieldRecover(variantFieldTypeAt(pvi, pvfi), memIx, fnIx)
+      emitNulStrFieldRecover(uFieldStart[pvi] + pvfi, memIx, fnIx)
       // A code-16 (value-union box) field of the arm, read while its member PATH is
       // narrowed, unboxes to the narrowed atom — the arm-for-arm twin of the plain
       // struct read below and of `emitNarrowedMem`'s. Without it the box flowed into an
       // i32 consumer: check-clean INVALID WASM (silent-class-inventory D219).
-      if variantFieldTypeAt(pvi, pvfi) == FC_UNION {
+      if fieldRowIsUnionBox(uFieldStart[pvi] + pvfi) {
         if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
       }
       return 0
@@ -12205,8 +12239,8 @@ function emitMemVariantRead(body: u8[], memIx: i32, fnIx: i32): i32 {
       if emitExpr(body, m0.memObj, fnIx) < 0 { return -1 }
       fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
       fbStructGet(variantHeap(nvi), nvfi)
-      emitNulStrFieldRecover(variantFieldTypeAt(nvi, nvfi), memIx, fnIx)
-      if variantFieldTypeAt(nvi, nvfi) == FC_UNION {
+      emitNulStrFieldRecover(uFieldStart[nvi] + nvfi, memIx, fnIx)
+      if fieldRowIsUnionBox(uFieldStart[nvi] + nvfi) {
         if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
       }
       return 0
@@ -12365,7 +12399,7 @@ function emitMemStructRead(body: u8[], memIx: i32, fnIx: i32): i32 {
     fbStructGet(sHeapIdx[si], idx) // 0xfb 0x02 <struct ht> <field index>
     const narrowOp = memReadNarrowOp(memIx, fnIx)
     if narrowOp >= 0 { wU8(narrowOp) }
-    emitNulStrFieldRecover(sFieldTypeAt(si, idx), memIx, fnIx)
+    emitNulStrFieldRecover(sFieldStart[si] + idx, memIx, fnIx)
     // A union-typed field (code 16) read while the member path is narrowed to one scalar atom
     // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
     // ident read, at the atom the checker typed the read as; an un-narrowed read is the box.
@@ -27243,9 +27277,7 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
     if listElemRepIsRow(arrIx, fnIx) {
       st.structIdx = rlElemStructRow(rslot)
       // ...and where that declines, the element is an ARM, at `variantHeap(vi)`.
-      if st.structIdx < 0 {
-        st.variantIdx = variantIndexOf(nonNulBaseOf(rlElemName[rslot]))
-      }
+      if st.structIdx < 0 { st.variantIdx = rlElemVariantRow(rslot) }
     }
     if refListElemIsUnion(arrIx, fnIx) {
       st.unionNm = rlElemUnionName(rslot)
@@ -40660,7 +40692,7 @@ function emitCoalesceUnionField(
       }
       if mvi >= 0 {
         mfi = variantFieldIndex(mvi, lhs.memProp)
-        if mfi >= 0 && variantFieldTypeAt(mvi, mfi) == FC_UNION {
+        if mfi >= 0 && fieldRowIsUnionBox(uFieldStart[mvi] + mfi) {
           mHeap = variantHeap(mvi)
           mphys = variantFieldElemName(mvi, mfi)
           mphysTy = uFieldElemTyIxAt(mvi, mfi)
@@ -41317,5 +41349,33 @@ function coalFieldStoredFlat(exprIx: i32, lhsIx: i32, fnIx: i32): boolean {
   if fc == FC_F64 { return pn == "f64" }
   if fc == FC_F32 { return pn == "f32" }
   if fc == FC_STR { return pn == "string" }
+  false
+}
+
+// Whether union type `ty` has a non-null member that boxes as a value atom: one with a read atom
+// kind, a string literal set, or an all-literal member (kept whole by the canonical walk) with a
+// literal whose softened scalar has one. False for an all-struct union.
+function unionTyHasValueAtom(ty: i32): boolean {
+  const ms: i32[] = []
+  if !canonUnionMemberTysOf(ty, ms) { return false }
+  for m in ms {
+    if m >= 0 {
+      if readAtomKindOfTy(m) >= 0 || tyIsLitUnionOrLit(m) { return true }
+      if litSetHasValueAtom(m) { return true }
+    }
+  }
+  false
+}
+
+// Whether `m` is a union of literals only, one of whose softened scalars reads as a value atom.
+function litSetHasValueAtom(m: i32): boolean {
+  const mt = tyAt(m)
+  if !(mt is TyUnion) || mt.uMembers.length == 0 { return false }
+  for u in mt.uMembers {
+    if u < 0 || !(tyAt(u) is TyLit) { return false }
+  }
+  for u in mt.uMembers {
+    if readAtomKindOfTy(softenLitTy(u)) >= 0 { return true }
+  }
   false
 }
