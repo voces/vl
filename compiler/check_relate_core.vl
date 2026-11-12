@@ -279,13 +279,7 @@ import {
   zeroBytesFixIx,
 } from "./check_mismatch_notes"
 import { collectRetValues, isTopLevelStmt, joinArmIsLit } from "./check_nj_join"
-import {
-  annDeclNote,
-  nodeTyIx,
-  nodeTyIxOf,
-  nodeTyOf,
-  nodeTySet,
-} from "./check_node_tys"
+import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import { numCmpOp, numPairTy, valueTailSplit } from "./check_num_adopt"
 import {
   cexReported,
@@ -2615,7 +2609,6 @@ function nameToTyAnn(name: string, at: i32, ann: i32) {
   annotDiagAtSet(at)
   const r = annotResolve(name, annTsOf(ann))
   annotDiagAtSet(saved)
-  annDeclNote(ann, name, r)
   r
 }
 
@@ -6134,7 +6127,7 @@ function holeCallRootName(c: Call): string {
 
 // `holeSlotCallRets`, each returned call of such a function replaced by its own returns, at
 // most 8 calls deep; false when a call reached is not one `holeSlotCallRets` follows.
-function holeSlotCallRetsDeep(c: Call, out: i32[], depth: i32): boolean {
+export function holeSlotCallRetsDeep(c: Call, out: i32[], depth: i32): boolean {
   if depth > 8 { return false }
   const rv: i32[] = []
   if !holeSlotCallRets(c, rv) { return false }
@@ -6527,6 +6520,53 @@ export function holeSlotCallRets(c: Call, out: i32[]): boolean {
   }
   collectRetValues(fd.fnBody, out)
   true
+}
+
+// `holeSlotCallRetsDeep`, and else, for a call of a generic named function, its returned values
+// when each is a record literal, or a `const` of the callee holding one: the record's function
+// fields are the same in every instance.
+export function holeSlotCallRetRecs(c: Call, out: i32[]): boolean {
+  if holeSlotCallRetsDeep(c, out, 0) { return true }
+  const f = parenPeelIx(c.callFn)
+  const fx = if f >= 0 && f < P.nodes.length && nodeAt(f) is Ident { identFnDeclOf(f) } else { -1 }
+  const fd = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+  if !(fd is FuncDecl) || fd.fnTyParams.length == 0 || fd.fnBody < 0 {
+    return false
+  }
+  const rv: i32[] = []
+  collectRetValues(fd.fnBody, rv)
+  if rv.length == 0 { return false }
+  const lits: i32[] = []
+  for r in rv {
+    const x = cwPeel(r)
+    const l = holeSlotRetRecLit(x, fx)
+    if l < 0 { return false }
+    lits.push(l)
+  }
+  for l in lits { out.push(l) }
+  true
+}
+
+// Whether block `body` declares `d` among its own statements.
+function holeSlotStmtDeclares(body: i32, d: i32): boolean {
+  const b = if body >= 0 && body < P.nodes.length { nodeAt(body) } else { null }
+  b is Block && i32ListHas(b.blkStmts, d)
+}
+
+// The record literal returned value `x` of function `fx` is: itself, or the initialiser of a
+// `const` that `fx` declares; -1 for anything else.
+function holeSlotRetRecLit(x: i32, fx: i32): i32 {
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const n = nodeAt(x)
+  if n is ObjLit { return x }
+  if !(n is Ident) { return -1 }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return -1 }
+  const fd = if fx >= 0 && fx < P.nodes.length { nodeAt(fx) } else { null }
+  if !(fd is FuncDecl) || !holeSlotStmtDeclares(fd.fnBody, d) { return -1 }
+  const v = cwPeel(dn.letInit)
+  if v >= 0 && v < P.nodes.length && nodeAt(v) is ObjLit { v } else { -1 }
 }
 
 // Refuses the first function among `vals` (stored at `ats`, the last `nW` of them by a write)
