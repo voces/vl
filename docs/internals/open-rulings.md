@@ -749,68 +749,13 @@ on top of the dynamic-step work — but it must REQUIRE the step, because the in
 default is what makes `for x in 0.0 to 1.0` a one-iteration loop nobody meant to write. (c) is
 the trap: it looks like the i32 loop and its count is not a property of the source.
 
-### write-narrowed-dead-test — is a test a write made impossible an error? — RULED (coordinator) 2026-11-12, owner may overrule
+### write-narrowed-dead-test — is a test a write made impossible an error? — RULED (owner) 2026-11-12
 
-`let x: i32 | string = 1; x = "s"; if x is i32 { … }` reads `x` as `string` under the flow-reads
-ruling, so the test can never match. The coordinator ruled it an ERROR, as D2198 refuses any
-impossible `is` member and as a guard narrowing already does (DECISIONS.md, "A WRITE'S NARROWING
-MEETS THE SAME REFUSAL"). An always-true test stays legal. The alternatives were a dead-test
-warning, mirroring the dead-null-test ruling, or testing at storage with no diagnostic. The price
-is 11 programs, rewritten.
-
-### width-view-implicit-or-spelled — does a storage that holds two record layouts become a view silently, or must the source spell it? — raised 2026-11-12
-
-Width subtyping option B ([note](refactor-notes/2026-11-12-w315-width-b-view-rep.md), #7592) would
-let one `Pos` storage hold existing records of two wider layouts through a view rep. Today the
-one-layout contract refuses it. The witness, re-run on `16dd6059` (`vl check` rc 1, both
-deliveries refused with "`p` is given records of two layouts"):
-
-```vl
-type Pos = { x: i32, y: i32 }
-type A = { x: i32, y: i32, a: i32 }
-type B = { b: string, x: i32, y: i32 }
-const a: A = { x: 1, y: 2, a: 3 }
-const b: B = { b: "s", x: 4, y: 5 }
-let p: Pos = a
-print(p.x)
-p = b
-print(p.x)
-```
-
-**Options.** (a) **implicit**: the delivery flow makes `p` a view and the program runs as written,
-with an indirection on each access that the source does not show; (b) **spelled**: the source
-writes `view Pos` (or a `readonly` record), so the cost is visible, and each of the matrix's 17
-owed cells needs that annotation; (c) **not now**: B stays out of scope and the 17 cells stay
-refused by contract. **Recommendation: (a)**. It fits the near-zero-annotation aim, programs that
-never mix layouts pay nothing, and the refusal it replaces names a mechanism (one binding stores one
-layout), not a contract the design owes.
-
-### width-view-is-narrowing — may `is` narrow a view back to its concrete record? — RULED (owner) 2026-11-12: out of scope
-
-Under option B, `if p is A { … }` on a view would test the view's shape tag and recover `A`'s extra
-fields. **Ruled out of scope.** A view is not narrowed back to its concrete record, and the first
-view PR refuses `is` on a view by name. Recorded in DECISIONS.md ("A VIEW IS NOT NARROWED BACK").
-
-### width-view-equality — what does `==` mean on two views? — raised 2026-11-12
-
-Under option B, `p == q` on two `Pos` views, possibly of different underlying records.
-**Options.** (a) **identity** of the underlying record, which is how `==` already compares records;
-(b) **the fields `Pos` declares**, a structural equality that records do not have today; (c)
-**refuse** `==` on a view. **Recommendation: (a)**. It is the existing record rule, it needs only
-an unwrap at a view-rep operand, and (c) would add a refusal the design does not owe.
-
-### union-twins-one-type — are two separately declared but identical unions one type? — RULED (coordinator) 2026-11-12, owner may overrule
-
-`type U = i32 | string` and `type V = i32 | string` are one type under `tySame` (#7425). This
-supersedes #7416's "keyed apart". It follows ARCHITECTURE §3.3's equality contract (#7614): a
-union is its member set, and a name is a label. The alternative, nominal unions, would refuse
-assignments between the two that run today.
-
-### generic-seeded-let-concrete-write — may a concrete write follow a `let` seeded by a generic call? — RULED (coordinator) 2026-11-12, owner may overrule
-
-D3960, ruling C stands: a concrete write to a `let` whose type came from a generic call's result
-stays refused, and a one-token annotation is the fix the message gives. The function-set narrowing
-that would let it run (D15956, D15957) is clause 2 and is scheduled after step 7.
+A test that can never pass is an ERROR only when the operands' DECLARED types can never overlap,
+and a WARNING when the impossibility comes only from flow (a write's narrowing, a guard's
+narrowing, or `match` arms already covered). DECISIONS.md, "AN IMPOSSIBLE TEST IS AN ERROR ONLY BY
+ITS DECLARED TYPES". This replaces the coordinator's interim ruling of the same day, which made
+the write-narrowed tests errors.
 
 ### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — RULED 2026-10-12
 
