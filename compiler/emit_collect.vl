@@ -213,7 +213,6 @@ import {
   fnLetOfRead,
   gaeSplitArgs,
   isStructAtom,
-  isVariantBoxUnionAtoms,
   listIsTestedIdent,
   monoAnnHasTyParam,
   nameIsClosureArrayTy,
@@ -664,7 +663,7 @@ import {
   leqCoreKindOfAtomKind,
   nulFieldInnerKind,
 } from "./emit_eq_rows"
-import { fieldCodeOfTy, nameIsWholeSpanShape } from "./emit_field_codes"
+import { fieldCodeOfTy } from "./emit_field_codes"
 import { fieldStoreTyOf, recFieldTyOf } from "./emit_rec_field_codes"
 import { cloSigPosOfKey } from "./emit_fn_ret_kinds"
 import {
@@ -698,7 +697,6 @@ import {
 } from "./emit_map_twins"
 import {
   annTyNulFlag,
-  nonNulBaseOf,
   recordAnnRlSlot,
   recordArrLitCommitName,
   recordArrLitRlSlot,
@@ -766,7 +764,6 @@ import {
   forceScalarListField,
   forceScalarListRep,
   mvCanonRepOf,
-  nameIsConcreteGenAppDecl,
   refListElemKindOfTy,
   rlElemInnerSlot,
   rlElemStructRow,
@@ -860,9 +857,7 @@ import {
   unABOn,
   unNameBound,
   unRowOfCanonFolded,
-  unionAtomTysAlignedOf,
   unionSetAtomsOf,
-  unionSetAtomsOfTy,
 } from "./emit_union_registry"
 import { arrLitElemKind, arrLitInferUnionElemName } from "./emit_value_sites"
 import {
@@ -1235,7 +1230,7 @@ function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
 // committed rep can name different heaps (D39).
 function alcNamesArm(name: string, ann: i32): boolean {
   if name == "" { return false }
-  if annDeclVariantRow(ann, name) >= 0 { return true }
+  if annDeclVariantRow(ann) >= 0 { return true }
   repTyHasArmShape(mapLeafValTy(annRowOfNode(ann)))
 }
 
@@ -7118,11 +7113,6 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       if variantNestedShapeOkTy(ftxt, fldTy) { fc = FC_STRUCT }
     }
     if fc < 0 {
-      // A concrete generic application, keyed by its name as the declared field is (D4556).
-      const gb = nonNulBaseOf(ftxt)
-      if nameIsConcreteGenAppDecl(gb) { fc = FC_STRUCT }
-    }
-    if fc < 0 {
       // D1518 — `fieldTypeRefusalMsg`'s sentence, one table over: what reaches here is an
       // arm-typed field whose arm has no cross-table heap twin.
       return emitFail(fieldTypeRefusalMsg(ftxt))
@@ -7145,6 +7135,13 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
   }
   uFieldCount.push(cnt)
   0
+}
+
+// Whether field type node `ft` names a record declared among `stmts` (or its `| null`): the
+// declaration its non-null type is first declared by.
+function fieldNamesDeclRecord(stmts: i32[], ft: i32): boolean {
+  const dn = structNameOfTy(nonNullTy(nodeTyIxOf(ft)))
+  dn != "" && declStructNodeOf(stmts, dn) >= 0
 }
 
 // Record the field names + per-field wasm-type codes of the `TypeDecl` named `name` into the
@@ -7211,7 +7208,7 @@ function collectVariantFields(stmts: i32[], name: string, ty: i32) {
             }
             // A field naming a declared record, the arm itself included, waits the same way: the
             // record has no row until `collectS` runs (D3329).
-            if code < 0 && declStructNodeOf(stmts, nonNulBaseOf(ftxt)) >= 0 {
+            if code < 0 && fieldNamesDeclRecord(stmts, fnode.fdType) {
               code = FC_STRUCT
             }
             if code < 0 {
@@ -7613,9 +7610,6 @@ function sigRankOrder(keys: string[], ord: i32[]) {
   0
 }
 
-// The six single-shape tests below call `emit_classify.nameIsWholeSpanShape` directly — no
-// local wrapper is needed now that the walk it once required is gone.
-
 // Registers the value union of map type `mapTy`. Returns -2 when `mapTy` is not a map with a
 // value type, else 0 or -1.
 function registerMapValUnion(stmts: i32[], mapTy: i32): i32 {
@@ -7687,7 +7681,7 @@ function registerInlineUnionGo(
   }
   // An inline struct-shape annotation's unions live in its fields, interned before this call by
   // `collectTyReachRegister`'s structural walk — a single shape has none to register here.
-  if nameIsWholeSpanShape(name) { return 0 }
+  if sty >= 0 && tyAt(sty) is TyObj { return 0 }
   // `mtys` is still the read above: nothing between there and here rewrites `sty`.
   if !isVariantBoxUnionTys(mtys) { return 0 }
   // The row records the arena type its registrar holds, never a re-parse of its spelling.
@@ -7806,24 +7800,12 @@ function registerCloResultUnion(stmts: i32[], rt: i32): i32 {
   }
   // A variant-box union result: the contextual pin covers it once registered, so the
   // annotated named-fn path lowers it; an arm the box still rejects stays loud.
-  const ra: string[] = []
-  unionSetAtomsOfTy(res, rt, ra)
-  if isVariantBoxUnionOfTy(stmts, rt, ra) {
+  const rm: i32[] = []
+  riuMemberTys(rt, rm)
+  if isVariantBoxUnionTys(rm) {
     return registerInlineUnionAt(stmts, res, 35, rt, rt)
   }
   -2
-}
-
-// `isVariantBoxUnionAtoms` over the atoms `atoms` of union type `ty`, each beside its own
-// member type (`unionAtomTysAlignedOf`).
-function isVariantBoxUnionOfTy(
-  stmts: i32[],
-  ty: i32,
-  atoms: string[],
-): boolean {
-  const tys: i32[] = []
-  unionAtomTysAlignedOf(ty, atoms, tys)
-  isVariantBoxUnionAtoms(stmts, atoms, tys)
 }
 
 // `registerInlineUnionAt`'s pass over the members `mtys` of a union of two or more: refuses a
@@ -9155,12 +9137,8 @@ function declArmsMatchRow(s: UnionDecl, kr: i32, bind: boolean): boolean {
   const hi = lo + unVarCount[kr]
   const taken: i32[] = []
   for m in s.udVariants {
-    const vi = variantIndexOf(m)
-    if vi >= lo && vi < hi { taken.push(vi) }
-  }
-  for m in s.udVariants {
     const mt = declTyIxOfName(m)
-    if mt >= 0 && tyAt(mt) is TyObj && variantIndexOf(m) < 0 {
+    if mt >= 0 && tyAt(mt) is TyObj {
       let hit = -1
       let v = lo
       while v < hi && hit < 0 {
@@ -9176,7 +9154,9 @@ function declArmsMatchRow(s: UnionDecl, kr: i32, bind: boolean): boolean {
       }
       if hit < 0 { return false }
       taken.push(hit)
-      if bind { sidArrPut(uVariantRowBySid, sidOf(m), hit) }
+      if bind && variantIndexOf(m) < 0 {
+        sidArrPut(uVariantRowBySid, sidOf(m), hit)
+      }
     }
   }
   true
