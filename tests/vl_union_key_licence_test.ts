@@ -5,9 +5,10 @@
 // string (`keySweep/merge-diffset`, a value union's atoms) and the variant slice
 // (`keySweep/merge-diffvar`, a struct union's positional tags). Two rows under one type key
 // that differ is the D1712 hazard: one union is one set, so one row. The sweep runs under
-// `$VL_REP_SHADOW`; `keySweep/merge` counts the keyed pairs it compares. The control is the one
-// known pair, D15761's record twins, pinned at its counts, so the compare is shown to be reached
-// and any other pair fails. `VL_UNION_LICENCE_FULL=1` sweeps all of `tests/cases` instead.
+// `$VL_REP_SHADOW`; `keySweep/pair-keyed` counts the pairs of keyed rows it compares, so the
+// control shows the compare is reached. D15761's record twins were the last differing pair: a
+// twin alias now adopts its set's row, and a build with that adoption reverted reads 1 and 1 on
+// the control. `VL_UNION_LICENCE_FULL=1` sweeps all of `tests/cases` instead.
 import { filePath } from "./support/filePath.ts";
 const ROOT = filePath(new URL("..", import.meta.url)).replace(/[\\/]$/, "");
 const VL = `${ROOT}/scripts/vl-host/target/release/vl${
@@ -15,13 +16,8 @@ const VL = `${ROOT}/scripts/vl-host/target/release/vl${
 }`;
 const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const WITNESSES = `${ROOT}/tests/fixtures/union-key-licence/witnesses.txt`;
-// The one known pair under one type key, D15761: `Cat | Kot` and `Cat | { m: i32 }` key alike.
-// Its counts are pinned, so the compare is reached and a change to the pair is seen.
+// D15761's record twins, `Cat | Kot` beside `Cat | { m: i32 }`: one set, so one row.
 const CONTROL = "tests/cases/unions/variant-twin-scalar-spellings.vl";
-const CONTROL_COUNTS: Record<string, number> = {
-  "keySweep/merge-diffset": 1,
-  "keySweep/merge-diffvar": 1,
-};
 const POOL = 4;
 
 const exists = (p: string) => {
@@ -94,7 +90,6 @@ Deno.test({
     try {
       const bad: string[] = [];
       let next = 0;
-      let merged = 0;
       const worker = async () => {
         while (next < list.length) {
           const i = next++;
@@ -108,21 +103,17 @@ Deno.test({
             );
             continue;
           }
-          merged += counts["keySweep/merge"] ?? 0;
           for (
             const half of ["keySweep/merge-diffset", "keySweep/merge-diffvar"]
           ) {
-            const want = rel === CONTROL ? CONTROL_COUNTS[half] : 0;
-            if ((counts[half] ?? 0) !== want) {
-              bad.push(
-                `${rel}: want ${half} ${want}, got ${counts[half] ?? 0}`,
-              );
+            if (counts[half]) {
+              bad.push(`${rel}: want ${half} 0, got ${counts[half]}`);
             }
           }
-          if (rel === CONTROL && !(counts["keySweep/merge"] >= 1)) {
+          if (rel === CONTROL && !(counts["keySweep/pair-keyed"] >= 1)) {
             bad.push(
-              `${rel}: want keySweep/merge >= 1 (the pair compare must be reached), got ${
-                counts["keySweep/merge"] ?? 0
+              `${rel}: want keySweep/pair-keyed >= 1 (the pair compare must be reached), got ${
+                counts["keySweep/pair-keyed"] ?? 0
               }`,
             );
           }
@@ -134,11 +125,6 @@ Deno.test({
           `${bad.length} licence failures over ${list.length} programs:\n  ${
             bad.join("\n  ")
           }`,
-        );
-      }
-      if (merged === 0) {
-        throw new Error(
-          `want keySweep/merge > 0 over ${list.length} programs, got 0`,
         );
       }
     } finally {
