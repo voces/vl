@@ -9,6 +9,27 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-12-w311-stale-reflist-comments](2026-11-12-w311-stale-reflist-comments.md): Step 7: comments that named the deleted ref-list name path, rewritten, 2026-11-12
+- [2026-11-12-w311-reflist-cut6-array-new-row-by-fill-type](2026-11-12-w311-reflist-cut6-array-new-row-by-fill-type.md): Step 7 L6: an `__array_new__` ref list mints by its fill type; `rlElemStructRow`'s name rung is a named floor, 2026-11-12
+- [2026-11-12-w311-d6-interner-rekey-design](2026-11-12-w311-d6-interner-rekey-design.md): Step 7 L2: the D6 shape interner keyed by type, design, 2026-11-12
+- [2026-11-12-step7-vkind-uncovered-storage-rows](2026-11-12-step7-vkind-uncovered-storage-rows.md): Step 7, lane H: the field rows with no covered storage rep, graded, 2026-11-12
+- [2026-11-12-step7-vkind-nul-map-inner-name-deleted](2026-11-12-step7-vkind-nul-map-inner-name-deleted.md): Step 7, lane H: `nulMapInnerName` is deleted with the predicates it left, 2026-11-12
+- [2026-11-12-step7-variant-name-reads-cut-3](2026-11-12-step7-variant-name-reads-cut-3.md): Step 7, L6: `mvValArmOfShapeTy` is deleted, 2026-11-12
+- [2026-11-12-step7-union-reg-rvu-of-ty](2026-11-12-step7-union-reg-rvu-of-ty.md): Step 7 L6 (lane G, cut 5a): a value union is registered from its type, 2026-11-12
+- [2026-11-12-step7-union-reg-rvu-floors](2026-11-12-step7-union-reg-rvu-floors.md): Step 7 L6 (lane G, cut 5c): the value-union floors, each converted or under a contract, 2026-11-12
+- [2026-11-12-step7-union-reg-riu-55](2026-11-12-step7-union-reg-riu-55.md): Step 7 L6 (lane G, cut 5b): the inline registrar's value union is named by its type, 2026-11-12
+- [2026-11-12-step7-union-reg-let-if-box-by-type](2026-11-12-step7-union-reg-let-if-box-by-type.md): Step 7 L6 (lane G): a `let`-`if` binding's box is named by its type, 2026-11-12
+- [2026-11-12-step7-union-name-readers-by-set](2026-11-12-step7-union-name-readers-by-set.md): Step 7 L6: five more `unionNameOfExpr` readers ask the box's member set; census 5 re-graded, 2026-11-12
+- [2026-11-12-step7-union-name-gates-by-rep](2026-11-12-step7-union-name-gates-by-rep.md): Step 7 L6: five `unionNameOfExpr` gates ask the receiver's rep; the name read leaves them, 2026-11-12
+- [2026-11-12-step7-union-arm-tested-row-by-type](2026-11-12-step7-union-arm-tested-row-by-type.md): Step 7 L6 (lane A, for lane G): `isTestedRowIn` answers by type, not by its arm's spelling, 2026-11-12
+- [2026-11-12-step7-struct-name-producers-cut-2](2026-11-12-step7-struct-name-producers-cut-2.md): Step 7, L6: the struct name producers, cut 2, 2026-11-12
+- [2026-11-12-step7-lane-e-struct-elem-lowerable-ty](2026-11-12-step7-lane-e-struct-elem-lowerable-ty.md): Step 7 L2: a closure-result list field's element is judged by its type; five emit_base predicates deleted with their last callers, 2026-11-12
+- [2026-11-12-step7-lane-e-base-callers-typed](2026-11-12-step7-lane-e-base-callers-typed.md): Step 7 L2: emit_base's scalar-list predicates' last callers read the type; eleven predicates deleted, 2026-11-12
+- [2026-11-12-step7-l2-mono-wide-arms-by-type](2026-11-12-step7-l2-mono-wide-arms-by-type.md): Step 7 L2: a narrowed pin's niche and nullable-record rungs read the wide pin's arms from its type, 2026-11-12
+- [2026-11-12-step7-l2-mono-inline-rec-pin-by-type](2026-11-12-step7-l2-mono-inline-rec-pin-by-type.md): Step 7 L2: an inline record pin is spelled from its type, 2026-11-12
+- [2026-11-12-step7-l2-mono-field-elem-row-by-type](2026-11-12-step7-l2-mono-field-elem-row-by-type.md): Step 7 L2: a struct-field argument's pin is the field's recorded type, 2026-11-12
+- [2026-11-12-step7-elem-nominal-by-type](2026-11-12-step7-elem-nominal-by-type.md): Step 7: whether a list element is keyed nominally is asked of its type; `elemNameIsNominal` is deleted, 2026-11-12
+- [2026-11-12-dead-test-by-declared-type](2026-11-12-dead-test-by-declared-type.md): An impossible test is an error only by its declared types, 2026-11-12
 - [2026-11-12-w311-reflist-cut5-open-template-field-by-type](2026-11-12-w311-reflist-cut5-open-template-field-by-type.md): Step 7 L6: a template field's open ref-list row is keyed by its type; `rlSlotByName` is deleted, 2026-11-12
 - [2026-11-12-w311-reflist-cut4-d15778-ref-list-field-by-type](2026-11-12-w311-reflist-cut4-d15778-ref-list-field-by-type.md): Step 7 L2: a shape's ref-list field names its element by type, and the refArr* name cluster is deleted (D15778), 2026-11-12
 - [2026-11-12-w311-reflist-cut3-shape-map-field-spelling-legs](2026-11-12-w311-reflist-cut3-shape-map-field-spelling-legs.md): Step 7 L2: the shape-text recorder's map-field spelling legs are deleted, 2026-11-12
