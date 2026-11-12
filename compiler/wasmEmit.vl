@@ -98,6 +98,7 @@ import {
   fnCloCoerceSetAt,
   fnCloCoerceTyOf,
   listCopyTyOf,
+  listRecCopies,
   mapUnboxTyOf,
   narListReadsDecl,
   nodeCtxTyIxOf,
@@ -3297,10 +3298,10 @@ function emitRecCopyLevel(
     // A list of numbers copied into a list of a wider number is widened element by element.
     if recCopyFromOf(exprIx) < 0 {
       const le = rcScalarListElem(
-        rcFieldTy(rcPathTy(nodeTyIxOf(exprIx), pre), dNames[fj]),
+        rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), dNames[fj]),
       )
       const de = rcScalarListElem(
-        rcFieldTy(rcPathTy(recCopyTyOf(exprIx), pre), dNames[fj]),
+        rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), dNames[fj]),
       )
       if le != null && de != null && le != de {
         if emitScalarListWidenTop(body, le, de) < 0 { return -1 }
@@ -3308,6 +3309,109 @@ function emitRecCopyLevel(
     }
     fj = fj + 1
   }
+  0
+}
+
+// The record types an element-by-element list copy reads its fields at, or -1 outside one.
+let rcElemSrc = -1
+let rcElemDst = -1
+
+// The source and destination records a copy of `exprIx` reads its field types off.
+function rcSrcTyOf(exprIx: i32): i32 {
+  if rcElemSrc >= 0 { rcElemSrc } else { nodeTyIxOf(exprIx) }
+}
+
+function rcDstTyOf(exprIx: i32): i32 {
+  if rcElemDst >= 0 { rcElemDst } else { recCopyTyOf(exprIx) }
+}
+
+// The list of records just emitted for `exprIx`, copied element by element into the list `lct`'s
+// row, each element by the record copy (`emitRecCopyLevel`); 1 where the pair is not two record
+// lists stored apart, else 0 or -1.
+function emitRecListCopy(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
+  const st = nonNullTy(nodeTyIxOf(exprIx))
+  const dt = nonNullTy(instTyOrSelf(lct, fnIx))
+  if st < 0 || dt < 0 || st >= T.tys.length || dt >= T.tys.length { return 1 }
+  const sa = tyAt(st)
+  const da = tyAt(dt)
+  if !(sa is TyArray) || !(da is TyArray) { return 1 }
+  const se = sa.aElem
+  const de = da.aElem
+  if se < 0 || de < 0 || !(tyAt(se) is TyObj) || !(tyAt(de) is TyObj) {
+    return 1
+  }
+  const ssi = rcRowOfTy(se)
+  const dsi = rcRowOfTy(de)
+  if ssi < 0 || dsi < 0 || sHeapIdx[ssi] == sHeapIdx[dsi] { return 1 }
+  const srcSlot = exprEmittedRefListSlot(exprIx, fnIx)
+  const dstSlot = repSlotOfKind("reflist", dt)
+  if (
+    srcSlot < 0
+    || dstSlot < 0
+    || srcSlot >= rlWrapIdx.length
+    || dstSlot >= rlWrapIdx.length
+    || srcSlot >= rlBackIdx.length
+    || dstSlot >= rlBackIdx.length
+  ) {
+    return emitFailAt(
+      "emitProgram: a list of records copied element by element has no row",
+      exprIx,
+    )
+  }
+  if !fnUsesVariantRebox {
+    return emitFail(
+      "emitProgram: a list of records is copied with no element slot reserved",
+    )
+  }
+  const srcWrap = rlWrapIdx[srcSlot]
+  const srcBack = rlBackIdx[srcSlot]
+  const dstWrap = rlWrapIdx[dstSlot]
+  const dstBack = rlBackIdx[dstSlot]
+  const sL = widenSrcWrapSlot(srcSlot)
+  const dL = widenDstBackSlot(dstSlot)
+  const iL = widenTmpSlot(0)
+  const nL = widenTmpSlot(1)
+  const names: string[] = []
+  const rows: i32[] = []
+  let fj = 0
+  while fj < sFieldCount[dsi] {
+    names.push(sFieldNames[sFieldStart[dsi] + fj])
+    rows.push(sFieldStart[dsi] + fj)
+    fj = fj + 1
+  }
+  emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
+  fbLocalGet(dL)
+  fbLocalGet(iL)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 0)
+  fbLocalGet(iL)
+  fbArrayGet(srcBack)
+  fbLocalSet(variantReboxSlot)
+  const ps = rcElemSrc
+  const pd = rcElemDst
+  rcElemSrc = se
+  rcElemDst = de
+  rcPathHeap = []
+  rcPathField = []
+  const r = emitRecCopyLevel(
+    body,
+    exprIx,
+    sHeapIdx[ssi],
+    false,
+    ssi,
+    dsi,
+    de,
+    "",
+    names,
+    rows,
+    fnIx,
+  )
+  rcElemSrc = ps
+  rcElemDst = pd
+  if r < 0 { return -1 }
+  fbStructNew(sHeapIdx[dsi])
+  fbArraySet(dstBack)
+  emitCopyLoopClose(iL, dL, nL, dstWrap)
   0
 }
 
@@ -3330,8 +3434,8 @@ function rcWrapKind(
 ): i32 {
   if !fieldRowIsUnionBox(dr) || recCopyFromOf(exprIx) >= 0 { return -1 }
   if fieldRowNumKind(sr) < 0 && !fieldRowIsStr(sr, false) { return -1 }
-  const st = rcFieldTy(rcPathTy(nodeTyIxOf(exprIx), pre), name)
-  const dt = rcFieldTy(rcPathTy(recCopyTyOf(exprIx), pre), name)
+  const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
+  const dt = rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), name)
   if st < 0 || dt < 0 { return -1 }
   const inner = nullableInnerOrNone(dt)
   if inner >= 0 && tySame(st, inner) { return boxTagOfTy(st) }
@@ -29993,6 +30097,11 @@ function instTyOrSelf(t: i32, fnIx: i32): i32 {
 // The conversion of a list value just emitted at its own row into the row of `lct`, the list
 // its delivery copies into, where the two storages differ. Returns 0, or -1 failed.
 function emitListCopyTail(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
+  // A fresh call's list of records is copied element by element (`recFreshCallCopy`).
+  if listRecCopies > 0 {
+    const rc = emitRecListCopy(body, exprIx, lct, fnIx)
+    if rc != 1 { return rc }
+  }
   // A scalar list converts each number; a pair no convert serves is delivered as built.
   const ld = repOfTy(instTyOrSelf(lct, fnIx))
   if ld.rdCovered == 1 {
