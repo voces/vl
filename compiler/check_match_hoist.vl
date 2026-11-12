@@ -339,8 +339,9 @@ function hoistMatchScrutAt(m: i32, anc: i32[]): boolean {
 
 // A `?.` read whose receiver cannot move ahead of its statement is bound where it stands:
 // `(if true { const $om<m> = <receiver>; $om<m>?.p } else { null })` evaluates the receiver
-// once, in source order (D5331). Declined when the read is a callee, an index base, an
-// assignment target or a link of a longer chain, whose meaning the wrap would change.
+// once, in source order (D5331). A call's callee is bound around the call instead (D15803).
+// Declined when the read is an index base, an assignment target or a link of a longer chain,
+// whose meaning the wrap would change.
 function hmsBindOptInPlace(m: i32, anc: i32[]): boolean {
   const n = nodeAt(m)
   if !(n is OptMember) { return false }
@@ -348,7 +349,7 @@ function hmsBindOptInPlace(m: i32, anc: i32[]): boolean {
     const pn = nodeAt(anc[anc.length - 1])
     if pn is Member || pn is OptMember { return false }
     if pn is Call {
-      if pn.callFn == m { return false }
+      if pn.callFn == m { return hmsBindOptCallInPlace(m, n, anc) }
     }
     if pn is Index {
       if pn.idxArr == m { return false }
@@ -377,6 +378,46 @@ function hmsBindOptInPlace(m: i32, anc: i32[]): boolean {
     return true
   }
   false
+}
+
+// `hmsBindOptInPlace` for `?.` read `m`, the callee of the call its path `anc` ends at: the call
+// becomes `(if true { const $om<m> = <receiver>; <the call through $om<m>?.p> } else { null })`,
+// its arguments evaluated after the receiver, as before. Declined under a longer chain.
+function hmsBindOptCallInPlace(m: i32, n: OptMember, anc: i32[]): boolean {
+  const c = anc[anc.length - 1]
+  if anc.length > 1 {
+    const gp = nodeAt(anc[anc.length - 2])
+    if gp is Member || gp is OptMember { return false }
+    if gp is Call {
+      if gp.callFn == c { return false }
+    }
+    if gp is Index {
+      if gp.idxArr == c { return false }
+    }
+  }
+  const sp = nodePos(n.omObj)
+  const name = "$om" + i32ToStr(m)
+  const decl = mkLet("const", name, -1, n.omObj, sp)
+  adoptNodeTok(decl, n.omObj)
+  const ref = mkIdent(name, sp)
+  adoptNodeTok(ref, n.omObj)
+  const read = mkOptMember(ref, n.omProp, n.omDot, n.pos)
+  adoptNodeTok(read, m)
+  const pos = nodePos(c)
+  const inner = addNode(nodeAt(c))
+  adoptNodeTok(inner, c)
+  const ic = nodeAt(inner)
+  if !(ic is Call) { return false }
+  ic.callFn = read
+  const thenStmts: i32[] = [decl, inner]
+  const thenB = mkBlock(thenStmts, pos)
+  const elseStmts: i32[] = [mkNull("null", pos)]
+  const elseB = mkBlock(elseStmts, pos)
+  const ifn = valueIfAdd(mkIf(mkBool(1, pos), thenB, elseB, pos))
+  adoptNodeTok(ifn, c)
+  const wrap: Node = { parInner: ifn, pos: pos }
+  arenaSetNode(c, wrap)
+  true
 }
 
 // A computed scrutinee that cannot move ahead of its statement is bound where its match stands:
