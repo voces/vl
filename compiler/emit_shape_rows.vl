@@ -78,7 +78,6 @@ import {
   mapTyValIsLitUnion,
   mapTyValIsNulLitUnion,
   nameIsInlineLitUnion,
-  nameIsLitUnionType,
   nameIsOneStrLit,
   nulNumLitUnionBaseName,
 } from "./check_ty_rep"
@@ -164,20 +163,12 @@ import {
   mapValNameOf,
   nameIsClosureArray,
   nameIsElemArray,
-  nameIsF32Array,
-  nameIsF64Array,
   nameIsI32Array,
   nameIsI32ListArray,
-  nameIsI64Array,
   nameIsLitUnionArray,
   nameIsMapArray,
-  nameIsNulBool,
-  nameIsNulLitUnion,
-  nameIsNulStrList,
-  nameIsNulString,
   nameIsString,
   nameIsStringArray,
-  nameIsU8Array,
   nulLitUnionInnerNameOfTy,
   nullablePartOf,
   parenUnionArrElemName,
@@ -205,6 +196,7 @@ import {
 import {
   fieldCodeOfListRep,
   listRepOfFieldCode,
+  listRepOrNull,
   nulListBase,
   rlElemCodeIsList,
   vkListClass,
@@ -231,7 +223,6 @@ import {
   mvSlotOfValTyK,
   mvValLowersTy,
   mvValVariantRawOf,
-  scalarListRepOfName,
 } from "./emit_mv_slots"
 import { variantIndexOf } from "./emit_local_slots"
 import {
@@ -1357,31 +1348,29 @@ function variantRowScanOfTyK(ty: i32, lenient: i32, unique: boolean): i32 {
   found
 }
 
-// The nullable-scalar-list VKind of a distinct-backing nullable list type name (`string[] |
-// null`, `f64[] | null`, `i64[] | null`, `f32[] | null`), or "" otherwise. Each leaf has its
-// own wrapper heap type, unlike the i32-backed `tyIsNulI32List` fold: a bare `= null` init
-// lowers as `ref.null $wrapper`, and a list value's wrapper ref subtypes the nullable slot.
-export function nulScalarListKind(name: string): VKind | null {
-  const b = nullablePartOf(name)
-  if nameIsStringArray(b) { return "nulstrlist" }
-  // A nullable-element string list under the outer null (`(string | null)[] | null`) shares
-  // `string[]`'s wrapper heap type, so the nullable cell is the same kind. Un-admitted, the
-  // param fell through to the i32 default and pushed the wrapper ref into an i32 slot.
-  if nameIsNulStrList(b) { return "nulstrlist" }
-  if nameIsF64Array(b) { return "nulf64list" }
-  if nameIsI64Array(b) { return "nuli64list" }
-  if nameIsF32Array(b) { return "nulf32list" }
-  if nameIsU8Array(b) { return "nulu8list" }
-  null
-}
-// The struct/variant field code of a distinct-backing nullable scalar-list spelling (31 to
-// 34, and 36 for `u8[] | null`), or -1. Each leaf keeps its own wrapper heap type, unlike the
-// i32-backed leaves which all fold onto code 18, so `structFieldCodesEq` can split same-fieldset
-// twins by real layout.
-function nulScalarListFieldCode(name: string) {
-  const k = nulScalarListKind(name)
-  if k == null { return -1 }
+// The struct/variant field code of a distinct-backing nullable scalar list (31 to 34, and 36
+// for `u8[] | null`), from its type's rep, or -1. Each leaf keeps its own wrapper heap type,
+// unlike the i32-backed leaves which all fold onto code 18, so `structFieldCodesEq` can split
+// same-fieldset twins by real layout.
+function nulScalarListFieldCode(ty: i32) {
+  const k = coveredKindOfTy(ty)
+  if k == null || vkListClass(k) != 2 { return -1 }
+  if k == "nullist" || k == "nulreflist" { return -1 }
   fieldCodeOfListRep(k)
+}
+// The rep kind of `ty` where the descriptor covers it, else null (also for no type).
+function coveredKindOfTy(ty: i32): VKind | null {
+  if ty < 0 { return null }
+  const d = repOfTy(ty)
+  if d.rdCovered != 1 { return null }
+  d.rdKind
+}
+// The list rep of a scalar-element list type (the i32 list and its niches, the string, f64,
+// i64, f32 and packed u8 lists), or null: its type's covered rep, never the ref list.
+function scalarListRepOfTy(ty: i32): VKind | null {
+  const k = listRepOrNull(coveredKindOfTy(ty))
+  if k == "reflist" { return null }
+  k
 }
 // True if the type-annotation node `tyIx` denotes an array whose element is a nullable
 // literal union (`(K | null)[]`) — the atom-niche list interning i32 ids with `-1` for
@@ -1443,9 +1432,7 @@ function refArrShapeKindGo(name: string): i32 {
     return RLK_STR_LIST
   }
   // The three non-i32 scalar leaves, asked the way the `string[][]` arm above already
-  // does: the array grammar's one cut (`arrElemNameRaw`), then each inner list named by
-  // the leaf's own spelling-exact home (`nameIsF64Array` is `arrElemNameRaw(n) == "f64"`).
-  // `arrElemIsArrayOf` reads the inner `[]` and leaf span in place, without cutting first.
+  // does: `arrElemIsArrayOf` reads the inner `[]` and leaf span in place, without cutting.
   if arrElemIsArrayOf(name, "f64") { return RLK_F64_LIST }
   if arrElemIsArrayOf(name, "i64") { return RLK_I64_LIST }
   if arrElemIsArrayOf(name, "f32") {
@@ -2022,10 +2009,10 @@ function tyIsNulRefList(ty: i32): boolean {
   lt is TyArray && refListElemKindOfTy(lt.aElem) >= 0
 }
 
-// The per-field wasm-type code a field type spelling carries — the one home of the
-// field-code ladder behind `nameFieldCode` and `nameFieldCodeTy`, whose arms must agree
-// in order. `fty` is the caller's arena type for the field (-1 for none), read ahead of the
-// spelling by the literal-union and list arms.
+// The per-field wasm-type code of a field spelled `t` whose arena type is `fty` — the one home
+// of the field-code ladder behind `nameFieldCode` and `nameFieldCodeTy`, whose arms must agree
+// in order. Reached only with a type (`nameFieldCode` answers -1 without one); the arms that
+// still read `t` are the ones no typed predicate replaces yet.
 function fieldCodeOfSpelling(t: string, fty: i32) {
   if t == "i32" { return FC_I32 }
   // The `null` unit type stores its one value in a `nullref` slot (D4671).
@@ -2039,20 +2026,16 @@ function fieldCodeOfSpelling(t: string, fty: i32) {
   // A registered literal-union alias stores its interned i32 atom (code 0), an inline member
   // set the string slot. Checked before the union tests, which would claim either as code 16.
   if nameIsInlineLitUnion(t) { return FC_STR }
-  if (fty >= 0 && tyIsLitUnion(fty)) || (fty < 0 && nameIsLitUnionType(t)) {
-    return FC_I32
-  }
+  if tyIsLitUnion(fty) { return FC_I32 }
   // A lone string literal is its one-member set, the atom (D7220).
   if nameIsOneStrLit(t) { return FC_I32 }
   if nameIsString(t) { return FC_STR }
-  // A list or a nullable map is asked of the type where one came with the spelling, of the
-  // spelling where none did.
   const recTy = fty
-  if (recTy >= 0 && tyIsArray(recTy)) || (recTy < 0 && nameIsArray(t)) {
+  if tyIsArray(recTy) {
     // A list of a tagged set's ids is the i32 list.
-    if recTy >= 0 && fnTagListTy(recTy) { return FC_I32_LIST }
+    if fnTagListTy(recTy) { return FC_I32_LIST }
     // A scalar-element list stores its own wrapper, never code 5 (struct/union/closure only).
-    const sk = scalarListRepOfName(t)
+    const sk = scalarListRepOfTy(recTy)
     if sk != null { return fieldCodeOfListRep(sk) }
     return FC_REF_LIST
   }
@@ -2060,7 +2043,7 @@ function fieldCodeOfSpelling(t: string, fty: i32) {
   // slot is interned by `collectA`'s arena scan of the annotation node, so emission re-finds
   // it by the value name. A union with a map member (`{[string]: string} | string`) is not a
   // map, and goes to the union test (code 16).
-  if fty >= 0 && tyIsBareMap(fty) { return FC_MAP }
+  if tyIsBareMap(fty) { return FC_MAP }
   // A nullable map field stores a nullable ref to the value type's map struct, code 29 — the
   // field analogue of the `nulmap` local/param/return niche. Gated to the same supported
   // value kinds as the non-null map field, so a nullable map over an unrepresentable value
@@ -2072,40 +2055,24 @@ function fieldCodeOfSpelling(t: string, fty: i32) {
   // the same wrapper as code 4 — code 18 (`0x63 lTypeIdx`). Checked before the
   // value-union test (`i32[]` is not a value atom, so 16 never claims it). Asked of the type
   // alone; no caller without a type reaches it with a nullable i32 list.
-  if recTy >= 0 && tyIsNulI32List(recTy) { return FC_NUL_I32_LIST }
+  if tyIsNulI32List(recTy) { return FC_NUL_I32_LIST }
   if tyIsNulRefList(recTy) { return FC_NUL_REF_LIST }
   // A nullable distinct-backing scalar-list field (`f64[] | null` 32, `i64[] | null` 33,
   // `f32[] | null` 34, `string[] | null` 31): a `(ref null $leafWrapper)` slot, the field
   // mirror of the same-named binding niche. Checked after the ref-list arm so a spelling
   // it already claims (`(string|null)[] | null`) keeps code 28's rep.
-  const nsl = nulScalarListFieldCode(t)
+  const nsl = nulScalarListFieldCode(recTy)
   if nsl >= 0 { return nsl }
   // A `string | null` niche field — `(ref null $sTypeIdx)`, code 20. Checked before
   // the value-union test (it is NOT a value union — a single ref + null is a niche).
-  // This arm and the two below ask the type where one came, the spelling where none did.
-  if (
-    (recTy >= 0 && tyNulInnerIsPrim(recTy, "string"))
-    || (recTy < 0 && nameIsNulString(t))
-  ) {
-    return FC_NUL_STR
-  }
+  if tyNulInnerIsPrim(recTy, "string") { return FC_NUL_STR }
   // A `boolean | null` niche field — i32 sentinel, code 21.
-  if (
-    (recTy >= 0 && tyNulInnerIsPrim(recTy, "boolean"))
-    || (recTy < 0 && nameIsNulBool(t))
-  ) {
-    return FC_NUL_BOOL
-  }
+  if tyNulInnerIsPrim(recTy, "boolean") { return FC_NUL_BOOL }
   // A `K | null` nullable-litunion niche field — the i32 atom slot with the spare
   // value `-1` = `null` (member ids are interned ≥ 0), code 30. The field analogue
   // of the kind-0 `K | null` binding niche; checked before the value-union test
   // (a single atom set + null is a niche, not a box).
-  if (
-    (recTy >= 0 && tyIsNullableLitUnion(recTy))
-    || (recTy < 0 && nameIsNulLitUnion(t))
-  ) {
-    return FC_NUL_LIT_UNION
-  }
+  if tyIsNullableLitUnion(recTy) { return FC_NUL_LIT_UNION }
   // A box-union field — a value union or a registered struct/heterogeneous union — stores
   // the shared union box ref, code 16. Checked before the nullable-struct strip, so a
   // declared `type Opt = { v: i32 | null }` carries the same rep as the inline
@@ -3701,21 +3668,17 @@ export function anonCodeIsSelfContained(c: i32) {
   c == FC_CLOSURE
 }
 
+// The field code of a field spelled `t` of arena type `fty`, or -1. A field with no type has
+// no code: the spelling alone is not read.
 export function nameFieldCode(t: string, fty: i32) {
-  // A nullable function field is the nullable closure fat-pointer, code 22 — the
-  // declared field's `nulCloFlag` arm, asked of the caller's type. No caller without a type
-  // passes a nullable function spelling.
+  if fty < 0 { return -1 }
+  // A nullable function field is the nullable closure fat-pointer, code 22.
   if tyIsNulClosure(fty) { return FC_NUL_CLOSURE }
   // A tagged set's field holds its i32 id.
-  if fty >= 0 && fnTagTyIsTagged(fty) { return FC_I32 }
-  // A function-typed field name (a top-level arrow) is the closure rep, code 14.
-  // Depth-aware (`annArrowAt`, not a substring test): a union carrying a closure member
-  // nests its arrow in parens and is a value union (code 16), which a substring test would
-  // mis-claim as a bare closure and mismatch the box ref against the closure-typed field.
-  if (fty >= 0 && tyIsFuncArena(fty)) || (fty < 0 && annArrowAt(t) >= 0) {
-    return FC_CLOSURE
-  }
-  // -1: there is no node; `fty`, where the caller has one, decides ahead of the spelling.
+  if fnTagTyIsTagged(fty) { return FC_I32 }
+  // A function-typed field is the closure rep, code 14; a union carrying a closure member is
+  // a value union (code 16), below.
+  if tyIsFuncArena(fty) { return FC_CLOSURE }
   fieldCodeOfSpelling(t, fty)
 }
 
