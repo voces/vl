@@ -40,8 +40,11 @@ These spellings were invalid wasm and are now refused:
 fixtures under `tests/cases/inference/`.
 
 D1578's witness and `tests/vl_invalid_module_position_test.ts` used D2660's program, because that
-row is about the invalid-module diagnostic. Both now use D15927's program, with its function
-renamed `main` (`5:10`).
+row is about the invalid-module diagnostic. After D2660 and D15927 (#7570), master holds no
+check-clean invalid program in reach, so the test now builds its invalid module with
+`$VL_FAULT_INJECT=corrupt-validate-bytes`, over a valid program whose first body is `main`. An
+uninjected control run prints `42`. D1578 is restated as closed, with that program as its runs
+witness.
 
 ## Measurement
 
