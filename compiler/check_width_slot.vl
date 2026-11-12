@@ -40,19 +40,28 @@ import {
   RetStmt,
   Spread,
   StrLit,
+  TS_ARR,
   TypeDecl,
   TypeRef,
   Unary,
   UnionDecl,
   WhileStmt,
+  annTsWrittenOf,
   arenaSetNode,
   nodeAt,
   nodeChildren,
+  tsKidCount,
+  tsKidStart,
+  tsKids,
+  tsKind,
+  tsText,
 } from "./ast"
+import { declTyOf } from "./check_nar_store"
 import { nodeTyOf } from "./check_node_tys"
 import { T, tyToStr } from "./check_types"
-import { wsPendDecl, wsSlotAt } from "./check_width"
+import { wsAnnMentions, wsPendDecl, wsSlotAt } from "./check_width"
 import { i32ListHas } from "./listutil"
+import { strContains } from "./strutil"
 import { identDeclOf } from "./symbols"
 
 // Slots whose annotation is dropped, beside the annotation each held; slots declined for good.
@@ -121,7 +130,13 @@ function slotOf(at: i32, par: {[i32]: i32}, path: i32[]) {
         return if pn.letInit == x && pn.letType >= 0 { p } else { -1 }
       }
       BinExpr => {
-        if pn.binOp != "=" || pn.binRight != x || !(nodeAt(pn.binLeft) is Ident) { return -1 }
+        if (
+          pn.binOp != "="
+          || pn.binRight != x
+          || !(nodeAt(pn.binLeft) is Ident)
+        ) {
+          return -1
+        }
         const d = identDeclOf(pn.binLeft)
         if d < 0 || d >= P.nodes.length { return -1 }
         const dn = nodeAt(d)
@@ -137,7 +152,9 @@ function slotOf(at: i32, par: {[i32]: i32}, path: i32[]) {
         return if pn.fnBody == x && pn.fnRet >= 0 { p } else { -1 }
       }
       Block => {
-        if pn.blkStmts.length == 0 || pn.blkStmts[pn.blkStmts.length - 1] != x { return -1 }
+        if pn.blkStmts.length == 0 || pn.blkStmts[pn.blkStmts.length - 1] != x {
+          return -1
+        }
       }
       IfStmt => {
         if pn.ifCond == x { return -1 }
@@ -235,6 +252,27 @@ function slotRetAnn(d: i32) {
   -1
 }
 
+// Whether slot `d` is declared as or with a `readonly` list, as written or as resolved.
+function slotReadonly(d: i32) {
+  const ann = slotAnnOf(d)
+  if wsAnnMentions(ann, "readonly") { return true }
+  const root = annTsWrittenOf(ann)
+  if root >= 0 && slotTsReadonly(root) { return true }
+  const t = declTyOf(d)
+  t >= 0 && t < T.tys.length && strContains(tyToStr(t), "readonly")
+}
+
+// Whether spelling tree `ix` holds a `readonly` list.
+function slotTsReadonly(ix: i32) {
+  if tsKind[ix] == TS_ARR && tsText[ix] == "readonly" { return true }
+  let j = 0
+  while j < tsKidCount[ix] {
+    if slotTsReadonly(tsKids[tsKidStart[ix] + j]) { return true }
+    j = j + 1
+  }
+  false
+}
+
 // Drops the annotation of every slot this pass's refusals name, when they are its only refusals.
 // Answers how many it dropped, which the caller re-checks for.
 export function slotApply(root: i32) {
@@ -244,7 +282,15 @@ export function slotApply(root: i32) {
   const path: i32[] = []
   for at in wsSlotAt {
     const s = slotOf(at, par, path)
-    if s < 0 || i32ListHas(slNo, s) || i32ListHas(slDecl, s) { return 0 }
+    // A `readonly` slot promises no write through it, which its dropped annotation would lose.
+    if (
+      s < 0
+      || i32ListHas(slNo, s)
+      || i32ListHas(slDecl, s)
+      || slotReadonly(s)
+    ) {
+      return 0
+    }
     if !i32ListHas(found, s) { found.push(s) }
   }
   slSnap = slotSnapshot(root)
