@@ -166,8 +166,8 @@ is in the matrix from the first PR.
 - `inference/null-let-read-takes-its-most-recent-write.vl` and
   `generics/null-pinned-instance-list-literal.vl` are new.
 
-**The annotated face is PR 2.** A write that narrows `let x: i32 | string` would make 11
-fixtures fail:
+**The annotated face is PR 2** (`2026-11-12-flow-reads-annotated-union-face.md`). A write that
+narrows `let x: i32 | string` would make 11 fixtures fail:
 - a later `is` test of another member becomes "can never match", which needs a policy for a
   test that a write made dead;
 - `writeReNarrowTy` picks the wrong member for a generic application.
