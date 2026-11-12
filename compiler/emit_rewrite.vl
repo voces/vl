@@ -5328,11 +5328,16 @@ function icraInline(fn: FuncDecl, body: i32, s: i32): boolean {
   const ol = nodeAt(li)
   if ol is IfStmt {
     if !icraChoicePure(fn, li) { return false }
-    const cr = icraReads(body, s, [])
-    const cj = icraArgSlot(cr)
-    if cj < 0 { return false }
-    const cc = nodeAt(cr[1])
-    if cc is Call { cc.callArgs[cj] = li }
+    const hs = icraHands(body, s)
+    if hs.length == 0 { return false }
+    // The choice is pure, so each further hand takes a copy of it (D15773).
+    let h = 0
+    while h + 1 < hs.length {
+      const cc = nodeAt(hs[h])
+      const v = if h == 0 { li } else { icraChoiceCopy(li) }
+      if cc is Call { cc.callArgs[hs[h + 1]] = v }
+      h = h + 2
+    }
     return true
   }
   if !(ol is ObjLit) || ol.objFields.length == 0 { return false }
@@ -5406,6 +5411,60 @@ function icraReads(body: i32, s: i32, names: string[]): i32[] {
     }
   }
   out
+}
+
+// Each read of binding `s` in `body` as a call and its argument slot, flat; none where some read
+// is not a positional argument of a named call.
+function icraHands(body: i32, s: i32): i32[] {
+  const out: i32[] = []
+  const todo: i32[] = [body]
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == s {
+        const j = icraArgSlot([1, p, x])
+        if j < 0 { return [] }
+        out.push(p)
+        out.push(j)
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+      }
+    }
+  }
+  out
+}
+
+// A fresh copy of the pure choice `x` (`icraChoicePure`), each node typed as its source is.
+function icraChoiceCopy(x: i32): i32 {
+  const u = unwrapParen(x)
+  if u < 0 || u >= P.nodes.length { return x }
+  const n = nodeAt(u)
+  let m = -1
+  if n is Ident {
+    m = mkIdent(n.identName, n.pos)
+    identFromDecl(m, identDeclOf(u))
+  } else if n is BoolLit {
+    m = mkBool(n.boolVal, n.pos)
+  } else if n is Block {
+    const st: i32[] = []
+    for b in n.blkStmts { st.push(icraChoiceCopy(b)) }
+    m = mkBlock(st, n.pos)
+  } else if n is IfStmt {
+    m = mkIf(
+      icraChoiceCopy(n.ifCond),
+      icraChoiceCopy(n.ifThen),
+      icraChoiceCopy(n.ifElse),
+      n.pos,
+    )
+  } else {
+    return x
+  }
+  nodeTyCarry(m, u)
+  m
 }
 
 // The positional argument slot of a named call that the one whole read in `rd` (`icraReads`)
