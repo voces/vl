@@ -45,7 +45,7 @@ filed as D1045, which this change does not touch.
 
 ## Proof
 
-- Refresh ×2 is a fixpoint at 6,644,730 bytes (−28, base `13fb735b`, 6,644,758).
-- Local sweep, fixpoint seeds on both sides: **23,954 same**, 0 bytes-only, 0 output movers.
-- The render-parse budget with `--findings` falls by one render (`--budget-why`: the `anonMapValNameable` site left). The merged tree reads one render below master's baseline, which this PR leaves as it is; the budget is re-baselined centrally.
-- `regress.vl`, `lint-self`, `cases_wasm` (7,457), seed size, late demands and the dead-export budget (with `--findings`) pass.
+- Refresh ×2 is a fixpoint at 6,653,556 bytes (−28; base master `50210c06`, 6,653,584, itself a fixpoint).
+- Local sweep, fixpoint seeds on both sides: **23,979 same**, 0 bytes-only, 0 output movers, 0 `runs → not-runs`, 0 new traps. The three cases and the three `cyclic-map-value` cells are in both populations; master runs them too.
+- The render-parse budget with `--findings` falls by one render (`--budget-why`: the `anonMapValNameable` site left). The merged tree reads 15 renders and 55 parses, below master's baseline of 16; this PR leaves the baseline file as it is, and the budget is re-baselined centrally.
+- `regress.vl` (the new set at `runs`), `index.vl --check`, `lint-self`, `cases_wasm` (7,469), seed size, late demands and plumb-shape cost pass.
