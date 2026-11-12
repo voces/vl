@@ -11,9 +11,9 @@
 // that printed it for every program, so the controls below assert that a VALID module is
 // unchanged: rc 0, no banner, and the program's own output.
 //
-// THE WITNESS MUST STILL BE INVALID. This is D15042's if of record literals delivered to a
-// generic's annotated union of records, and it is check-clean invalid wasm on the current seed.
-// When D15042 is fixed this suite goes RED at the "still invalid"
+// THE WITNESS MUST STILL BE INVALID. This is D2660's generic bound from a list and a hole, and
+// it is check-clean invalid wasm on the current seed.
+// When D2660 is fixed this suite goes RED at the "still invalid"
 // assertion rather than silently measuring nothing; the replacement is any other
 // check-clean invalid-wasm program (`scripts/goal-scoreboard.vl` names the population).
 //
@@ -33,20 +33,24 @@ if (GATED && !ENABLED) {
 const EXIT_COMPILER_BUG = 70;
 const BUG_LINE = "this is a bug in vl, not in your program";
 
-// D15042's union-of-records delivery (D1471's, D1413's, D1887's and then D15040's witness served
-// until those rows closed or refused): `vl check` rc 0, and the engine refuses the module. `take` is declared on line 2,
+// D2660's generic bound from a list and a hole (D15042's, D1471's, D1413's, D1887's and then
+// D15040's witness served until those rows closed or refused): `vl check` rc 0, and the engine
+// refuses the module. The failing function, `main`, is declared on line 2,
 // so the position this suite asserts names its NAME token: `2:10`, ONE literal for all three channels. The host used to
 // print `2:9` here — the guest's raw 0-based column — while the CLI pump shifted to 1-based,
 // so one diagnostic reached two columns depending on which command found it. `cli-design.md`
 // makes the output 1-based ("`col` (1-based, inclusive)"); the host shifts too now.
 const WANT_AT = "take.vl:2:10";
-const INVALID = `function pick(b: boolean) { b }
-function take<T>(b: boolean, t: T) {
-  const v: {f: i32} | {f: T} = if pick(b) { {f: 1} } else { {f: t} }
-  print(v.f)
+const INVALID = `function link2<T>(xs: T[], v: T) { xs.push(v) }
+function main() {
+  const xs: (string | null)[] = []
+  let x = null
+  link2(xs, x)
+  x = 5
+  xs.push("s")
+  print(xs.length)
 }
-take(true, 2.5)
-take(false, 2.5)
+main()
 `;
 
 const VALID = `print(6 * 7)\n`;
@@ -103,8 +107,8 @@ const assertLocated = (what: string, want: string, code: number, out: string) =>
   if (!out.includes(want)) {
     throw new Error(`${what}: want the declaration position \`${want}\`, got:\n${out}`);
   }
-  if (!out.includes("failed to validate inside `take`")) {
-    throw new Error(`${what}: want the owning function named \`take\`, got:\n${out}`);
+  if (!out.includes("failed to validate inside `main`")) {
+    throw new Error(`${what}: want the owning function named \`main\`, got:\n${out}`);
   }
   if (!out.includes(BUG_LINE)) {
     throw new Error(`${what}: want the standing "${BUG_LINE}" line, got:\n${out}`);
