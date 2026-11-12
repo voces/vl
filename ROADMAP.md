@@ -90,7 +90,7 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   delivers an un-annotated function's result into a wider record (or a list of them), the
   result is built at the destination and the function's other uses read it at that storage.
   The value must not be writable, between the delivery and a use, in a way that breaks the
-  wider or the narrower type. Witness: D14890. DECISIONS.md §"An inferred result
+  wider or the narrower type. DECISIONS.md §"An inferred result
   one use delivers wider is built at the destination".
 - **Exact trap kinds through `-O`/`-O3`** (owner ruling (c), 2026-11-02). An optimizer that
   proves a trap always fires folds it into `unreachable`, and the banner can only list the
