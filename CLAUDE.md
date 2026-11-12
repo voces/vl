@@ -298,9 +298,9 @@ Why: [evidence](docs/internals/working-rules-evidence.md#table-read).
   Pass both inventories (they number independently) and **`--strict`**, and read all four columns.
 * The inventory is **one file per row** (`docs/internals/inventory/D<id>.md`).
   `vl run scripts/inventory/ls.vl -- --status open` is the queue, `--next` the next free id (skips
-  `RESERVED.md`); new rows start from `TEMPLATE.md`. A row needs a known-outcome status line and a
-  `Repro:` label with a block under it (`tests/vl_inventory_rows_test.ts`); a parse-stage outcome
-  says `parse error`.
+  every `inventory/reserved/D<lo>-D<hi>.md`, one file per range); new rows start from
+  `TEMPLATE.md`. A row needs a known-outcome status line and a `Repro:` label with a block under
+  it (`tests/vl_inventory_rows_test.ts`); a parse-stage outcome says `parse error`.
 * A defect reachable only under a REFUSED change is filed as a refutation pin, status `runs today
   and must keep running`.
 * Every cited `D<id>` must have a row (`tests/vl_inventory_refs_test.ts`); an id cited before its row

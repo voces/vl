@@ -440,6 +440,7 @@ import {
   SYNTH_EMPTY_BACKING,
   VKind,
   aTy,
+  armFieldElemSame,
   armFieldNames,
   armFieldTypes,
   armPreludeBlocks,
@@ -1535,7 +1536,7 @@ import {
   unionMemberTysOf,
   unionRowKeyAB,
   unionSetAtomsOf,
-  unionSetHasNull,
+  unionSetHasNullTy,
 } from "./emit_union_registry"
 import {
   arrNewKindNamed,
@@ -2034,16 +2035,7 @@ function emitStructFieldValueUnder(
     "union" => {
       // coerces a raw scalar/string/null into the box with its atom tag via `emitUnionBoxArg`,
       // not `emitUnionCoerce` — a concrete-variant/`nulvariant` value must still be boxed here.
-      if (
-        emitUnionBoxOwed(
-          body,
-          sFieldElemNameAt(si, fi),
-          sFieldRowTyAt(si, fi),
-          valIx,
-          fnIx,
-        )
-        < 0
-      ) {
+      if (emitUnionBoxOwed(body, "", sFieldRowTyAt(si, fi), valIx, fnIx) < 0) {
         return -1
       }
     }
@@ -8998,10 +8990,11 @@ function coerceSetOf(uSet: i32, unionName: string): i32 {
   msSetOfUnion(unionName)
 }
 
-// Whether coerce target `unionName`, of set id `uSet` (-1 when unresolved), admits `null`.
-function coerceSetHasNull(uSet: i32, unionName: string): boolean {
+// Whether coerce target `unionName`, of set id `uSet` (-1 when unresolved) and arena type `uTy`,
+// admits `null`.
+function coerceSetHasNull(uSet: i32, unionName: string, uTy: i32): boolean {
   if uSet >= 0 { return msHasNull(uSet) }
-  unionSetHasNull(unionName)
+  unionSetHasNullTy(unionName, uTy)
 }
 
 // Whether a coerce target of set id `uSet`, else of arena type `uTy`, boxes a literal-union atom
@@ -9033,7 +9026,7 @@ function emitUnionCoerceValueAtom(
   // unconditional value tag over the rep's empty value. For `i32` that empty value is `0`, a
   // real value. The niche-bearing value types are excluded: their empty value already means absent.
   const mrk = mapReadScalarBoxKind(exprIx, fnIx)
-  if mrk >= 0 && coerceSetHasNull(uSet, unionName) {
+  if mrk >= 0 && coerceSetHasNull(uSet, unionName, uTy) {
     // Only when the map's own value atom is a MEMBER of the target union. A widening
     // consumption (`{[string]: i32}` read into `i64 | null`) has to go through the
     // ladder's promotion rules, which this arm does not replicate — declining leaves it
@@ -9103,7 +9096,7 @@ function emitUnionCoerceValueAtom(
           nlParam = true
         }
       }
-      if !coerceSetHasNull(uSet, unionName) || nlStrArm || !nlParam {
+      if !coerceSetHasNull(uSet, unionName, uTy) || nlStrArm || !nlParam {
         return emitFail(
           "emitProgram: literal-union string widening with no members",
         )
@@ -10868,7 +10861,7 @@ function emitUnionConcreteEq(
     && exprNulLitUnion(otherIx, fnIx)
     && unionEqOperandOk(otherIx)
     && !eqOnce
-    && unionSetHasNull(uname)
+    && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   if nulOther {
     if emitExpr(body, otherIx, fnIx) < 0 { return -1 }
     fbI32Const(-1)
@@ -10887,13 +10880,13 @@ function emitUnionConcreteEq(
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
     && unionEqOperandOk(otherIx)
     && !eqOnce
-    && unionSetHasNull(uname)
+    && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   // The `boolean | null` niche's null is the value 2 (D2260).
   const nulBoolOther = eak == 1
     && tyBearsNull(nodeTyAt(unwrapParen(otherIx), fnIx))
     && unionEqOperandOk(otherIx)
     && !eqOnce
-    && unionSetHasNull(uname)
+    && unionSetHasNullTy(uname, unionBoxTyOfRead(boxIx, fnIx))
   if nulBoolOther {
     if emitExpr(body, otherIx, fnIx) < 0 { return -1 }
     fbI32Const(2)
@@ -12266,11 +12259,14 @@ function sharedFieldPlanDispatchable(
     return true
   }
   const slot0 = uFieldStorageSlot(vis[0], fis[0])
-  const elem0 = variantFieldElemName(vis[0], fis[0])
+  const elem0 = uFieldStart[vis[0]] + fis[0]
   let i = 1
   while i < vis.length {
     if uFieldStorageSlot(vis[i], fis[i]) != slot0 { return false }
-    if code == FC_UNION && variantFieldElemName(vis[i], fis[i]) != elem0 {
+    if (
+      code == FC_UNION
+      && !armFieldElemSame(elem0, uFieldStart[vis[i]] + fis[i])
+    ) {
       return false
     }
     i = i + 1
@@ -15550,7 +15546,9 @@ function emitScalarMapReadBoxEq(
   const bn = nodeAt(unwrapParen(boxIx))
   if bn is Index { return 0 }
   const un = unionNameOfExpr(boxIx, fnIx)
-  if un == "" || !unionSetHasNull(un) { return 0 }
+  if un == "" || !unionSetHasNullTy(un, unionBoxTyOfRead(boxIx, fnIx)) {
+    return 0
+  }
   if !unionHasAtom(un, scalarAtomNameOfKind(k)) { return 0 }
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
   pushMapScr(body, 5)     // entry
@@ -28159,13 +28157,7 @@ function emitStructFieldStoreValue(
     "union" => {
       // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
       if (
-        emitUnionBoxOwed(
-          body,
-          sFieldElemNameAt(si, fieldIdx),
-          sFieldRowTyAt(si, fieldIdx),
-          rhs,
-          fnIx,
-        )
+        emitUnionBoxOwed(body, "", sFieldRowTyAt(si, fieldIdx), rhs, fnIx)
         < 0
       ) {
         return -1
@@ -39917,7 +39909,7 @@ function emitUnionBoxNulNiche(
   // The value's shape is asked before the union's `null`, so only a niche reads the set.
   const nnBool = exprNulBool(nnIx, fnIx)
   if !nnBool && !coalesceNulRefNicheOperand(nnIx, fnIx) { return 0 }
-  if !unionSetHasNull(unionKey) { return 0 }
+  if !unionSetHasNullTy(unionKey, unionTy) { return 0 }
   // A `boolean | null` is the i32 niche whose null is the value 2, so the null test is on the
   // value, not the ref (D2260).
   if nnBool {
