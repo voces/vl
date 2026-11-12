@@ -138,8 +138,16 @@ import {
 import {
   code0KindOf,
   declRowFnSpellingFits,
+  fieldRowIsMap,
+  fieldRowIsPlainI32,
+  fieldRowIsRecordRef,
+  fieldRowIsStr,
+  fieldRowIsUnionBox,
+  fieldRowSlotTable,
+  fieldRowsStoreAlike,
   rowCanonIdOfName,
   sFieldElemNameAt,
+  sFieldFlatRow,
   sFieldRowTyAt,
   sFieldTypeAt,
   sIsAnonRow,
@@ -1199,8 +1207,8 @@ function jrUnionWantOf(f: i32): i32 {
 // row's own field type is known and is neither, as a declared `{k: string}` or `{k: i32}` is,
 // since that row reads the value at another rep (D11030).
 function rowFieldTakesLit(si: i32, fj: i32): boolean {
-  const code = sFieldTypeAt(si, fj)
-  if code != FC_I32 && code != FC_STR { return true }
+  const r = sFieldFlatRow(si, fj)
+  if !fieldRowIsPlainI32(r) && !fieldRowIsStr(r, false) { return true }
   const rt = sFieldRowTyAt(si, fj)
   rt < 0 || tyIsLitUnionOrLit(rt)
 }
@@ -4145,18 +4153,19 @@ export function sFieldRefSlot(si: i32, fi: i32) {
 }
 
 // ── canonical layout twins, variant slot layer ──
-// Two union-variant slots share one WasmGC heap type under the two-layer discipline: the
-// canonical key of the variant's type (`repNameCanonId`), then a layout guard over field
-// storage (`variantFieldLayoutEq`) — code equality plus, for codes 5/15/19, twin equivalence of the referenced layer.
+// Two union-variant slots share one heap type when the variant types' canonical keys agree
+// (`repNameCanonId`) and `variantFieldLayoutEq` finds the fields stored alike, with a ref-list,
+// record or map field's referenced layer twinned.
 
 // The per-field storage layout guard (the `structFieldCodesEq` analogue).
 export function variantFieldLayoutEq(a: i32, b: i32): i32 {
   if uFieldCount[a] != uFieldCount[b] { return 0 }
   let fi = 0
   while fi < uFieldCount[a] {
-    const ca = sFieldTypes[uFieldStart[a] + fi]
-    if ca != sFieldTypes[uFieldStart[b] + fi] { return 0 }
-    if ca == FC_REF_LIST || ca == FC_NUL_REF_LIST {
+    const ra = uFieldStart[a] + fi
+    if !fieldRowsStoreAlike(ra, uFieldStart[b] + fi) { return 0 }
+    const slots = fieldRowSlotTable(ra)
+    if slots == "reflist" {
       // Code 28 (`<ref-array> | null`) stores through the same per-slot wrapper as a
       // plain ref-list field — twin equivalence is the same referenced-layer guard.
       if (
@@ -4168,14 +4177,14 @@ export function variantFieldLayoutEq(a: i32, b: i32): i32 {
       ) {
         return 0
       }
-    } else if ca == FC_STRUCT {
+    } else if slots == "struct" {
       if (
         repStructSlotsTwin(uFieldTgtStructIdx(a, fi), uFieldTgtStructIdx(b, fi))
         == 0
       ) {
         return 0
       }
-    } else if ca == FC_MAP {
+    } else if fieldRowIsMap(ra, false) {
       // No key comparison here, by witness rather than assumption (B6b): a `{[i32]: V}` and a
       // `{[string]: V}` field do store different map structs, but this guard never runs on
       // such a pair, since `buildVariantTwins` only calls it when `repNameCanonId` already
@@ -4748,10 +4757,9 @@ function sigFieldMayMatch(fi: i32, fj: i32): boolean {
   if fi >= sFieldTypes.length || fj < 0 || fj >= sFieldTypes.length {
     return true
   }
-  if sFieldTypes[fi] != FC_STRUCT { return true }
-  const cj = sFieldTypes[fj]
-  if cj == FC_UNION { return true }
-  if cj != FC_STRUCT { return false }
+  if !fieldRowIsRecordRef(fi) { return true }
+  if fieldRowIsUnionBox(fj) { return true }
+  if !fieldRowIsRecordRef(fj) { return false }
   const ti = if fi < sFieldElemTyIx.length { sFieldElemTyIx[fi] } else { -1 }
   const tj = if fj < sFieldElemTyIx.length { sFieldElemTyIx[fj] } else { -1 }
   if ti >= 0 && tj >= 0 { return sFieldElemSame(fi, fj) }
@@ -4887,7 +4895,7 @@ export function structRowFieldStoresAtom(si: i32, name: string): i32 {
   if si < 0 || si >= sFieldStart.length { return -1 }
   const fi = sFieldIndex(si, name)
   if fi < 0 { return -1 }
-  fieldCodeStoresAtom(sFieldTypes[sFieldStart[si] + fi])
+  fieldRowStoresAtom(sFieldStart[si] + fi)
 }
 
 // `structRowFieldStoresAtom` for variant row `vi`.
@@ -4895,13 +4903,13 @@ export function variantRowFieldStoresAtom(vi: i32, name: string): i32 {
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const fj = variantFieldIndex(vi, name)
   if fj < 0 { return -1 }
-  fieldCodeStoresAtom(sFieldTypes[uFieldStart[vi] + fj])
+  fieldRowStoresAtom(uFieldStart[vi] + fj)
 }
 
-// The atom answer for a literal field stored at code `c`: 1 the atom, 0 a string, else -1.
-function fieldCodeStoresAtom(c: i32): i32 {
-  if c == FC_I32 { return 1 }
-  if c == FC_STR { return 0 }
+// The atom answer for a literal field at flat row `r`: 1 the atom, 0 a string, else -1.
+function fieldRowStoresAtom(r: i32): i32 {
+  if fieldRowIsPlainI32(r) { return 1 }
+  if fieldRowIsStr(r, false) { return 0 }
   -1
 }
 
