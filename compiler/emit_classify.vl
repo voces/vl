@@ -249,6 +249,7 @@ import {
 } from "./emit_anon_fields"
 import {
   armRowIsNulAtom,
+  armRowIsPlainI32,
   armRowIsRecordRef,
   armRowIsStr,
   armRowIsUnionBox,
@@ -393,7 +394,10 @@ import {
   LR_STR,
   LR_U8,
   ListRep,
+  armRowKind,
+  eqKindIsRecord,
   eqRowFieldKind,
+  fieldRowKind,
   lrOf,
 } from "./emit_eq_rows"
 import {
@@ -14609,8 +14613,45 @@ function memberReadIsLitAtom(e: Member, exprIx: i32, fnIx: i32): boolean {
 // Whether a field of code `fc` holds the `K | null` niche: an atom id or the `-1` null.
 function fieldCodeIsNulLitAtom(fc: i32): boolean { fc == FC_NUL_LIT_UNION }
 
-// The kind a field read's storage holds, by its field code.
+// The kind a field read's storage holds: the storage kind of the one row it resolves to, or by
+// the plan's code for a shared read of an un-narrowed union of records.
 function readFieldStoreKind(rx: i32, fnIx: i32): ReadStore {
+  const p = memberFieldPos(rx, fnIx)
+  if p == FPOS_SHARED { return readFieldCodeStoreKind(rx, fnIx) }
+  const k = if p >= 0 { fieldRowKind(p) } else if p <= -3 { armRowKind(-3 - p) } else { null }
+  const nulAtom = if p >= 0 { fieldRowIsNulAtom(p) } else { p <= -3 && armRowIsNulAtom(-3 - p) }
+  if nulAtom { return rsOfTag("nullitatom") }
+  // An interned literal-union id, which the storage spells as a plain `i32`; a read with no
+  // field row (an instance's hole) is asked too.
+  const plain = if p >= 0 { fieldRowIsPlainI32(p) } else { p <= -3 && armRowIsPlainI32(-3 - p) }
+  if gLitUnionUsed != 0 && (plain || k == null) {
+    const fm = nodeAt(rx)
+    if fm is Member {
+      if memberReadIsLitAtom(fm, rx, fnIx) { return rsOfTag("litatom") }
+    }
+  }
+  if k == null { return rsOfTag("") }
+  // A record field holds a struct whether or not its type adds `null`, so its type names which.
+  if eqKindIsRecord(k) { return readRecordFieldStore(rx, fnIx) }
+  rsOfKind(k)
+}
+
+// `readFieldStoreKind` of a record field: the read's own record rep, or `struct`.
+function readRecordFieldStore(rx: i32, fnIx: i32): ReadStore {
+  const sd = repOfNode(rx, fnIx)
+  if (
+    sd.rdCovered == 1
+    && (sd.rdKind == "nulstruct"
+      || sd.rdKind == "nulvariant"
+      || sd.rdKind == "variant")
+  ) {
+    return rsOfKind(sd.rdKind)
+  }
+  rsOfKind("struct")
+}
+
+// `readFieldStoreKind` of a shared read, by its plan's field code.
+function readFieldCodeStoreKind(rx: i32, fnIx: i32): ReadStore {
   const fc = memberFieldCode(rx, fnIx)
   if fieldCodeIsNulLitAtom(fc) { return rsOfTag("nullitatom") }
   // An interned literal-union id, which the code column alone spells as a plain i32 field; a
