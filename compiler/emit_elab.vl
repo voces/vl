@@ -7641,8 +7641,11 @@ function elabCopyRecordsNote() {
         const rec = if taken { elabBundleSigs.get(elabBundleKey(k, i)) ?? [] } else { [] }
         if rec.length >= 2 {
           for d in cs {
-            if elabCopyInFn(d, ekDecl[k]) {
-              elabHolderRecordWith(d, k, rec, -1)
+            // A copy inside a lambda nested in the function holds it under that lambda's instances.
+            for from in elabHandFromKeys(d, k) {
+              if elabCopyInFn(d, elabEnclosingFn(d)) {
+                elabHolderRecordWith(d, from, rec, -1)
+              }
             }
           }
         }
@@ -9302,7 +9305,7 @@ export function elabParamReadOtherThanCalled(
 ): boolean {
   if x < 0 || x >= P.nodes.length { return false }
   const n = nodeAt(x)
-  if n is Ident { return identDeclOf(x) == par }
+  if n is Ident { return identDeclOf(x) == par && !elabReadInitsHeldCopy(x) }
   if n is FuncDecl {
     for k in nodeChildren(x) {
       if elabParamReadOtherThanCalled(k, par, cap, cap, cap) { return true }
@@ -9337,6 +9340,30 @@ export function elabParamReadOtherThanCalled(
   }
   for k in nodeChildren(x) {
     if elabParamReadOtherThanCalled(k, par, own, fwd, cap) { return true }
+  }
+  false
+}
+
+// The callee instance whose copies `elabBodyReadsOtherThanCalled` is asking about, or -1.
+let elabHeldCopyHk = -1
+
+// Whether read `x` initialises a `const` copy the elaboration holds the record in, under the
+// instance `elabHeldCopyHk` names or a lambda's instance below it.
+function elabReadInitsHeldCopy(x: i32): boolean {
+  if elabHeldCopyHk < 0 || !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_LETINIT {
+    return false
+  }
+  const d = cwIxUp[x]
+  if d < 0 || d >= P.nodes.length { return false }
+  let kk = 0
+  while kk < ekDecl.length {
+    if (
+      (kk == elabHeldCopyHk || elabKeyBelow(kk, elabHeldCopyHk))
+      && elabHolderRecordAt(d, kk).length > 0
+    ) {
+      return true
+    }
+    kk = kk + 1
   }
   false
 }
@@ -9376,16 +9403,20 @@ function elabBodyReadsOtherThanCalled(
     }
     return false
   }
+  const was = elabHeldCopyHk
+  elabHeldCopyHk = hk
+  let other = false
   let i = 0
-  while i < b.blkStmts.length {
+  while i < b.blkStmts.length && !other {
     const st = b.blkStmts[i]
     const last = i == b.blkStmts.length - 1
     if !(last && elabIsParamRead(st, par)) && elabStmtReadsOther(st, par, hk) {
-      return true
+      other = true
     }
     i = i + 1
   }
-  false
+  elabHeldCopyHk = was
+  other
 }
 
 // Whether node `x` is a read of parameter `par`, under parentheses.
