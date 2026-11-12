@@ -1281,6 +1281,12 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   consequence is accepted rather than papered over: a bound ALIAS body resolves in its own
   scope, so an alias naming `T` fits `<T: …>` and not `<U: …>`, and the refusal hands over the
   inline spelling. F-bounded generic bound aliases are not in phase 1.
+- **A SET OF FUNCTIONS IN ONE SLOT NEED NOT RETURN ONE TYPE** (2026-11-11, orchestrator ruling
+  on D15791, recorded 2026-11-12 with D15225). `every function a call through X may run must
+  return one type` was a soundness guard, not a language contract: an un-judged call through a
+  slot of differing results built one closure and trapped (D15221). A call through a slot whose
+  members' results differ instead keeps the set and dispatches on the member id, its result the
+  join of theirs; the refusal stays only where no dispatch is built yet.
 
 ## An object literal a union arm's field-name set MATCHES is not thereby a union BOX — and the row it gets is gated on the OWNER, not on the literal
 
