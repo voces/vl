@@ -887,6 +887,7 @@ import {
   fieldRowIsUnionBox,
   fieldRowNumKind,
   fieldRowSlotTable,
+  fieldRowStorageKind,
   fnHasUnannotatedParam,
   listGetIdxReReadable,
   optChainBaseOf,
@@ -906,6 +907,7 @@ import {
   variantFieldIsLitUnionArray,
   variantFieldIsStr,
   variantFieldNumKind,
+  variantFieldStorageKind,
   variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import {
@@ -1291,7 +1293,6 @@ import {
   mvValTyIxAt,
   mvValUnionHasNull,
   rlElemIsNulNiche,
-  rlElemLitStructRow,
   tyRefArrElemOf,
   unMemRefArrArmSlot,
 } from "./emit_map_value_slots"
@@ -1394,6 +1395,7 @@ import {
   RC_REF_LIST,
   coalesceResultIsBox,
   ifJoinUnionNameIn,
+  letBindingUnionTy,
   letUnionDeclTyIxOf,
   nicheReadStashSlot,
   nodeJoinRowName,
@@ -1445,6 +1447,7 @@ import {
   tySameSpelled,
 } from "./emit_ty_canon"
 import {
+  UNION_SPELLING_DECLINE,
   cloArmTagOfTy,
   identChainTyBoxedUnion,
   identChainTyMapArmUnion,
@@ -1516,6 +1519,7 @@ import {
   tyBoxTakesAtomAsStr,
   unMemIsMap,
   unMemIsRefElemArray,
+  unRowOfName,
   unionArmsOf,
   unionArmsOfTy,
   unionHasAtomAB,
@@ -2146,6 +2150,7 @@ function emitObj(body: u8[], objIx: i32, fnIx: i32, row: i32) {
         }
         if emitStructFieldValue(body, si, ofi, ovIx, fnIx) < 0 { return -1 }
         const oslot = objOrderStashSlot(
+          fieldRowStorageKind(sFieldFlatRow(si, ofi)),
           sFieldTypeAt(si, ofi),
           sFieldStorageSlot(si, ofi),
         )
@@ -2817,6 +2822,7 @@ function emitVariantStruct(body: u8[], objIx: i32, vi: i32, fnIx: i32) {
       }
       if emitVariantFieldValue(body, vi, ofj, ovIx, fnIx) < 0 { return -1 }
       const dslot = objOrderStashSlot(
+        variantFieldStorageKind(vi, ofj),
         variantFieldTypeAt(vi, ofj),
         uFieldStorageSlot(vi, ofj),
       )
@@ -2841,6 +2847,7 @@ function emitVariantStruct(body: u8[], objIx: i32, vi: i32, fnIx: i32) {
       }
       if emitVariantFieldValue(body, vi, ofj, ovIx, fnIx) < 0 { return -1 }
       const oslot = objOrderStashSlot(
+        variantFieldStorageKind(vi, ofj),
         variantFieldTypeAt(vi, ofj),
         uFieldStorageSlot(vi, ofj),
       )
@@ -9518,6 +9525,23 @@ function nulNoneEqSides(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
   nulNoneEqSide(leftIx, fnIx) && nulNoneEqSide(rightIx, fnIx)
 }
 
+// The union a box is built into, from its type `ty`: the row `ty` keys to, named as registered,
+// unless `name` already names that row in any of its spellings; a value union keyed by no row,
+// by its spelling. `name` only where `ty` gives neither.
+function boxDstName(name: string, ty: i32): string {
+  if ty < 0 { return name }
+  const r = unRowOfTyKey(ty)
+  if r >= 0 {
+    if unRowOfName(name) == r { return name }
+    return unNames[r]
+  }
+  const vt = valueUnionKeyTextOfTy(ty)
+  if vt != "" { return vt }
+  const sp = unionSpellingOfTy(ty, 8)
+  if sp != UNION_SPELLING_DECLINE && isValueUnionName(sp) { return sp }
+  name
+}
+
 // One side of `nulNoneEqSides`: a `null`-typed value, or a bare `null` literal.
 function nulNoneEqSide(exprIx: i32, fnIx: i32): boolean {
   if exprIsNulNone(exprIx, fnIx) { return true }
@@ -9591,11 +9615,12 @@ function emitArmForEffect(body: u8[], blockIx: i32, fnIx: i32) {
 // written at a wider record's field reads back through every handle (D3006).
 function emitUnionBoxArg(
   body: u8[],
-  unionName: string,
+  unionNameIn: string,
   unionTy: i32,
   exprIx: i32,
   fnIx: i32,
 ) {
+  const unionName = boxDstName(unionNameIn, unionTy)
   if boxDstShadowArmed() {
     boxDstShadowNote(
       "box",
@@ -12123,7 +12148,7 @@ function emitSharedFieldArm(
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
     fbRefCast(variantHeap(vi))
     fbStructGet(variantHeap(vi), fi)
-    const strSlot = objOrderStashSlot(FC_STR, uFieldStorageSlot(vi, fi))
+    const strSlot = objOrderStashSlot("str", FC_STR, uFieldStorageSlot(vi, fi))
     fbLocalSet(strSlot)
     const r = emitStagedStrToAtomChain(body, texts, 0, strSlot, fnIx)
     return r
@@ -12161,7 +12186,7 @@ function emitSharedFieldArm(
         "emitProgram: literal-union string boxing with no members",
       )
     }
-    const setSlot = objOrderStashSlot(FC_I32, uFieldStorageSlot(vi, fi))
+    const setSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
     fbLocalSet(setSlot)
     if emitAtomToStrChain(body, texts, 0, setSlot) < 0 { return -1 }
     fbStructNew(uBoxIdx)
@@ -12174,13 +12199,17 @@ function emitSharedFieldArm(
         "emitProgram: literal-union string widening with no members",
       )
     }
-    const idSlot = objOrderStashSlot(FC_I32, uFieldStorageSlot(vi, fi))
+    const idSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
     fbLocalSet(idSlot)
     return emitAtomToStrChain(body, texts, 0, idSlot)
   }
   if nulStr {
     // A `string | null` field boxes under the null tag when its ref is null, else the string tag.
-    const sSlot = objOrderStashSlot(FC_NUL_STR, uFieldStorageSlot(vi, fi))
+    const sSlot = objOrderStashSlot(
+      "nulstr",
+      FC_NUL_STR,
+      uFieldStorageSlot(vi, fi),
+    )
     fbLocalSet(sSlot)
     fbI32Rel(RS_TAG, nullBoxTag())
     fbI32Rel(RS_TAG, scalarTagOfKind(2))
@@ -12242,7 +12271,11 @@ function emitSharedFieldAssign(body: u8[], memIx: i32, valIx: i32, fnIx: i32) {
       eqRowFieldKind(-1 - vis[0], fis[0]),
     )
     if sfVal < 0 { return -1 }
-    const vslot = objOrderStashSlot(code, uFieldStorageSlot(vis[0], fis[0]))
+    const vslot = objOrderStashSlot(
+      variantFieldStorageKind(vis[0], fis[0]),
+      code,
+      uFieldStorageSlot(vis[0], fis[0]),
+    )
     fbLocalSet(vslot)
     let i = 0
     while i < vis.length {
@@ -13706,8 +13739,8 @@ function emitArrRef(
   // A concrete-VARIANT element list (`Cat[]`) has no `sNames` entry: each element is coerced
   // into the arm read off the slot's element type, any `| null` peeled.
   let elemVariantIdx = -1
-  if rlElemKindAt(rslot) == RLK_STRUCT && rlElemLitStructRow(rslot) < 0 {
-    elemVariantIdx = repVariantShapeRowOf(tyPeelNul(rlElemTyIxAt(rslot)))
+  if rlElemKindAt(rslot) == RLK_STRUCT {
+    elemVariantIdx = rlElemVariantRow(rslot)
   }
   // A UNION-element list (kind 2) coerces each element into the box at the
   // write boundary (`emitUnionCoerce` — the host's per-element `coerceUnion`):
@@ -15076,7 +15109,7 @@ function emitMapGetOrScalarBox(body: u8[], ak: i32, defIx: i32, fnIx: i32) {
     emitUnionBoxOwed(
       body,
       scalarAtomNameOfKind(ak) + " | null",
-      -1,
+      mkNullableTyOf(primTyIxOfName(scalarAtomNameOfKind(ak))),
       defIx,
       fnIx,
     )
@@ -32445,8 +32478,7 @@ function emitLetInitValue(
     // boxes here exactly as an argument does (D1606) — `emitUnionCoerce` alone passes an arm
     // value raw, which fits only a variant cell, and a union annotation never types one.
     // An inferred null-hole union (`nliNameOf`) is recorded by name alone, so it has no type.
-    let letUTy = -1
-    if s.letType >= 0 { letUTy = nodeTyIxOf(s.letType) }
+    const letUTy = letBindingUnionTy(stmtIx, fnIx)
     let letArmBoxed = 0
     if slotKind == "union" {
       letArmBoxed = emitUnionArmValueBox(body, letUNm, letUTy, s.letInit, fnIx)
