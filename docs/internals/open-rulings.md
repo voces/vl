@@ -749,6 +749,15 @@ on top of the dynamic-step work — but it must REQUIRE the step, because the in
 default is what makes `for x in 0.0 to 1.0` a one-iteration loop nobody meant to write. (c) is
 the trap: it looks like the i32 loop and its count is not a property of the source.
 
+### write-narrowed-dead-test — is a test a write made impossible an error? — RULED (coordinator) 2026-11-12, owner may overrule
+
+`let x: i32 | string = 1; x = "s"; if x is i32 { … }` reads `x` as `string` under the flow-reads
+ruling, so the test can never match. The coordinator ruled it an ERROR, as D2198 refuses any
+impossible `is` member and as a guard narrowing already does (DECISIONS.md, "A WRITE'S NARROWING
+MEETS THE SAME REFUSAL"). An always-true test stays legal. The alternatives were a dead-test
+warning, mirroring the dead-null-test ruling, or testing at storage with no diagnostic. The price
+is 11 programs, rewritten.
+
 ### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — RULED 2026-10-12
 
 **Ruling (owner, 2026-10-12, spec Q3): (a) for now, (c) as the later target.** A null-only

@@ -66,8 +66,6 @@ import {
   nodeTyMapKeyKind,
   nodeTyMapOrTwinIx,
   nodeTyWrites,
-  tyIsNulClosure,
-  tyIsNulI32List,
 } from "./check_node_tys"
 import {
   MAP_KEY_STR,
@@ -78,7 +76,6 @@ import {
   mapTyValIsLitUnion,
   mapTyValIsNulLitUnion,
   nameIsInlineLitUnion,
-  nameIsOneStrLit,
   nulNumLitUnionBaseName,
 } from "./check_ty_rep"
 import { nameIsNewtypeBrand } from "./check_type_shape"
@@ -99,7 +96,6 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
-  aliasNameOfTyIx,
   cUserTypesVer,
   litBaseTy,
   litUnionAliasNameOfTy,
@@ -116,19 +112,16 @@ import {
   tyDeeperThan,
   tyEmitNameNonEmpty,
   tyEq,
-  tyEqSoftLits,
   tyFieldTyOf,
   tyIsFuncArena,
   tyIsLitUnion,
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
-  tyIsNullableLitUnion,
   tyIsOneStrLit,
   tyMutEpoch,
   tyNestedArrLeafRenders,
   tyNomNameCycled,
-  tyNulInnerIsPrim,
   tySame,
   tyToNominalName,
   tyToNominalNameAt,
@@ -161,7 +154,6 @@ import {
   gaeSplitArgs,
   nameIsI32Array,
   nameIsLitUnionArray,
-  nameIsString,
   nameIsStringArray,
   nulLitUnionInnerNameOfTy,
   setShapeOfTy,
@@ -256,7 +248,6 @@ import {
   FC_NUL_I32_LIST,
   FC_NUL_LIT_UNION,
   FC_NUL_MAP,
-  FC_NUL_NONE,
   FC_NUL_REF_LIST,
   FC_NUL_STR,
   FC_REF_LIST,
@@ -348,7 +339,6 @@ import {
   isUNameKeyAB,
   nulArmTyOf,
   tyIsBareMap,
-  tyIsNulMap,
   unionArmsOfTy,
   unionSetHasNullTy,
 } from "./emit_union_registry"
@@ -1665,93 +1655,28 @@ function tyIsNulRefList(ty: i32): boolean {
   lt is TyArray && refListElemKindOfTy(lt.aElem) >= 0
 }
 
-// The per-field wasm-type code of a field spelled `t` whose arena type is `fty` — the one home
-// of the field-code ladder behind `nameFieldCode` and `nameFieldCodeTy`, whose arms must agree
-// in order. Reached only with a type (`nameFieldCode` answers -1 without one); the arms that
-// still read `t` are the ones no typed predicate replaces yet.
-function fieldCodeOfSpelling(t: string, fty: i32) {
-  if t == "i32" { return FC_I32 }
-  // The `null` unit type stores its one value in a `nullref` slot (D4671).
-  if t == "null" { return FC_NUL_NONE }
-  if t == "boolean" { return FC_I32 }
-  // An f64 field (`x: f64`) stores a raw f64 valtype slot — code 17. An i64 / f32 field is
-  // the same idea in the other scalar valtypes — codes 23 / 24 (0x7e / 0x7d storage).
-  if t == "f64" { return FC_F64 }
-  if t == "i64" { return FC_I64 }
-  if t == "f32" { return FC_F32 }
-  // A registered literal-union alias stores its interned i32 atom (code 0), an inline member
-  // set the string slot. Checked before the union tests, which would claim either as code 16.
-  if nameIsInlineLitUnion(t) { return FC_STR }
-  if tyIsLitUnion(fty) { return FC_I32 }
-  // A lone string literal is its one-member set, the atom (D7220).
-  if nameIsOneStrLit(t) { return FC_I32 }
-  if nameIsString(t) { return FC_STR }
-  const recTy = fty
-  if tyIsArray(recTy) {
+// The field code of a field spelled `t` of arena type `fty`, where the rep descriptor
+// (`fieldCodeOfTyCovered`) declines it, or -1. Every arm below is one a declined type reaches;
+// `nameFieldCodeTy` fails loudly on a declined type that no rung codes.
+export function nameFieldCode(t: string, fty: i32) {
+  if fty < 0 { return -1 }
+  if tyIsArray(fty) {
     // A list of a tagged set's ids is the i32 list.
-    if fnTagListTy(recTy) { return FC_I32_LIST }
+    if fnTagListTy(fty) { return FC_I32_LIST }
     // A scalar-element list stores its own wrapper, never code 5 (struct/union/closure only).
-    const sk = scalarListRepOfTy(recTy)
+    const sk = scalarListRepOfTy(fty)
     if sk != null { return fieldCodeOfListRep(sk) }
     return FC_REF_LIST
   }
-  // A map-typed field stores a non-null ref to its value type's map struct, code 19. The mv
-  // slot is interned by `collectA`'s arena scan of the annotation node, so emission re-finds
-  // it by the value name. A union with a map member (`{[string]: string} | string`) is not a
-  // map, and goes to the union test (code 16).
-  if tyIsBareMap(fty) { return FC_MAP }
-  // A nullable map field stores a nullable ref to the value type's map struct, code 29 — the
-  // field analogue of the `nulmap` local/param/return niche. Gated to the same supported
-  // value kinds as the non-null map field, so a nullable map over an unrepresentable value
-  // type keeps failing loudly (-1, no interned shape).
-  if tyIsNulMap(recTy) && mapTyValKindLowerable(nonNullTy(recTy)) {
-    return FC_NUL_MAP
-  }
-  // A NULLABLE i32-list field (`rest: i32[] | null`) stores a NULLABLE ref to
-  // the same wrapper as code 4 — code 18 (`0x63 lTypeIdx`). Checked before the
-  // value-union test (`i32[]` is not a value atom, so 16 never claims it). Asked of the type
-  // alone; no caller without a type reaches it with a nullable i32 list.
-  if tyIsNulI32List(recTy) { return FC_NUL_I32_LIST }
-  if tyIsNulRefList(recTy) { return FC_NUL_REF_LIST }
-  // A nullable distinct-backing scalar-list field (`f64[] | null` 32, `i64[] | null` 33,
-  // `f32[] | null` 34, `string[] | null` 31): a `(ref null $leafWrapper)` slot, the field
-  // mirror of the same-named binding niche. Checked after the ref-list arm so a spelling
-  // it already claims (`(string|null)[] | null`) keeps code 28's rep.
-  const nsl = nulScalarListFieldCode(recTy)
+  if tyIsNulRefList(fty) { return FC_NUL_REF_LIST }
+  // A nullable distinct-backing scalar-list field: a `(ref null $leafWrapper)` slot. After the
+  // ref-list arm, so `(string|null)[] | null` keeps code 28's rep.
+  const nsl = nulScalarListFieldCode(fty)
   if nsl >= 0 { return nsl }
-  // A `string | null` niche field — `(ref null $sTypeIdx)`, code 20. Checked before
-  // the value-union test (it is NOT a value union — a single ref + null is a niche).
-  if tyNulInnerIsPrim(recTy, "string") { return FC_NUL_STR }
-  // A `boolean | null` niche field — i32 sentinel, code 21.
-  if tyNulInnerIsPrim(recTy, "boolean") { return FC_NUL_BOOL }
-  // A `K | null` nullable-litunion niche field — the i32 atom slot with the spare
-  // value `-1` = `null` (member ids are interned ≥ 0), code 30. The field analogue
-  // of the kind-0 `K | null` binding niche; checked before the value-union test
-  // (a single atom set + null is a niche, not a box).
-  if tyIsNullableLitUnion(recTy) { return FC_NUL_LIT_UNION }
-  // A box-union field — a value union or a registered struct/heterogeneous union — stores
-  // the shared union box ref, code 16. Checked before the nullable-struct strip, so a
-  // declared `type Opt = { v: i32 | null }` carries the same rep as the inline
-  // `{v:i32|null}` annotation.
+  // A box-union field, a value union or a member set keying a registered row (a
+  // self-referential arm's `Node | null` included, D4615), stores the union box ref, code 16.
   if isValueUnionName(t) { return FC_UNION }
-  // Any spelling whose member set keys a registered row, including a self-referential arm's
-  // `Node | null`, whose unrolled arm twin `buildVariantTwins` folds onto the rolled one (D4615).
   if isUNameDeclAB(75, t) { return FC_UNION }
-  // A field naming another struct, or a nullable struct, stores a `(ref null $S)`, code 15.
-  // Resolved via the declaration scan rather than the incrementally-built struct table, so a
-  // forward or mutually-recursive reference ties into the shared rec group.
-  const base = nonNulBaseOf(t)
-  if nameIsStructDecl(base) { return FC_STRUCT }
-  // A field typed as a union ARM (`g: Circle` / `g: Circle | null`) — the same code-15
-  // `(ref null $S)` slot, over the struct row whose heap the arm shares (D761). Placed on the
-  // ONE spelling ladder all three refusal sites reach, so the declared, the inline-shape and
-  // the generic-instance spellings of one field cannot answer differently.
-  if armFieldStructRow(base) >= 0 { return FC_STRUCT }
-  // The same field one phase earlier (D1518): a field on a declaration that is itself a
-  // union arm is coded from `collectU`, before the struct table exists, so the rung above
-  // declines. This predicate says the mint will answer, and `collectNestedFieldShapes` is
-  // what owes it.
-  if armFieldDeferredRowOk(base) { return FC_STRUCT }
   -1
 }
 
@@ -3264,118 +3189,6 @@ export function anonCodeIsSelfContained(c: i32) {
   c == FC_CLOSURE
 }
 
-// The field code of a field spelled `t` of arena type `fty`, or -1. A field with no type has
-// no code: the spelling alone is not read.
-export function nameFieldCode(t: string, fty: i32) {
-  if fty < 0 { return -1 }
-  // A nullable function field is the nullable closure fat-pointer, code 22.
-  if tyIsNulClosure(fty) { return FC_NUL_CLOSURE }
-  // A tagged set's field holds its i32 id.
-  if fnTagTyIsTagged(fty) { return FC_I32 }
-  // A function-typed field is the closure rep, code 14; a union carrying a closure member is
-  // a value union (code 16), below.
-  if tyIsFuncArena(fty) { return FC_CLOSURE }
-  fieldCodeOfSpelling(t, fty)
-}
-
-const armDeferStack: string[] = []
-
-// The arm's struct row, one phase before it exists (D1518) — the pure mirror of
-// `collectNestedFieldShapes`'s arm-field mint. `armFieldStructRow` reads the struct table,
-// but `collectVariantFields` codes an arm's fields during `collectU`, before `collectS`
-// builds it, so a field typed as an arm on a declaration that is itself an arm had no code.
-export function armFieldDeferredRowOk(base: string): boolean {
-  const vi = variantIndexOf(base)
-  if vi < 0 { return false }
-  if vi >= uVarTyIx.length { return false }
-  const aty = uVarTyIx[vi]
-  if aty < 0 { return false }
-  // The re-entrancy stack (`repCanonKey`'s idiom): the predicate below codes the arm's own
-  // fields through `nameFieldCode`, which reaches this rung again, so a self-referential arm
-  // asked about itself forever and the compiler trapped rather than refusing. Declining on
-  // re-entry keeps that arm's existing loud refusal instead.
-  let g = 0
-  while g < armDeferStack.length {
-    if armDeferStack[g] == base { return false }
-    g = g + 1
-  }
-  armDeferStack.push(base)
-  const seen: i32[] = []
-  const ok = armPlainLayoutTyOk(aty, 0, seen)
-  armDeferStack.pop()
-  ok
-}
-
-// The arm record `ty`'s fields, coded, under `variantStructHeapTwinAt`'s own layout guard
-// (D1518), so the gate and the lowering apply one rule. `seen` holds the records the walk is
-// inside; a revisit is where the arm's render stops at a declared name.
-function armPlainLayoutTyOk(ty: i32, depth: i32, seen: i32[]): boolean {
-  if depth > 8 { return false }
-  if ty < 0 || ty >= T.tys.length { return false }
-  const t = tyAt(ty)
-  if !(t is TyObj) { return false }
-  const ftys = t.objFieldTypes
-  if ftys.length == 0 { return false }
-  seen.push(ty)
-  let ok = true
-  for f in ftys {
-    if ok {
-      // The arm's row codes an inline literal union as the string slot.
-      let c = FC_STR
-      if !tyIsLitUnion(f) { c = jrWantOf(f) }
-      if c < 0 || c == FC_REF_LIST || c == FC_STRUCT || c == FC_NUL_REF_LIST {
-        if !armRefLeafTyOk(f, depth + 1, seen) { ok = false }
-      }
-    }
-  }
-  seen.pop()
-  ok
-}
-
-// The referenced layer of a 15/5/28 field `f`, one phase before the struct table exists
-// (D1579): through a one-member nullable or an array to a record, or to a revisit, which
-// `armRefLeafNameOk` decides by the declared name.
-function armRefLeafTyOk(f: i32, depth: i32, seen: i32[]): boolean {
-  if depth > 8 { return false }
-  if f < 0 || f >= T.tys.length { return false }
-  for s in seen {
-    if s == f { return armRefLeafNameOk(aliasNameOfTyIx(f)) }
-  }
-  const ms: i32[] = []
-  if jrFlatMembers(f, ms) {
-    if ms.length != 1 { return false }
-    seen.push(f)
-    const r = armRefLeafTyOk(ms[0], depth + 1, seen)
-    seen.pop()
-    return r
-  }
-  const t = tyAt(f)
-  // Exhaustive over `Ty` and `_`-less: past the nullable peel, only a list or a record leads on.
-  match t {
-    TyArray => {
-      seen.push(f)
-      const r = armRefLeafTyOk(t.aElem, depth + 1, seen)
-      seen.pop()
-      return r
-    }
-    TyObj => {
-      return armPlainLayoutTyOk(f, depth + 1, seen)
-    }
-    TyPrim | TyErr | TyNullable | TyUnion | TyVar | TyLit | TyNeg | TyFunc | TyMap => {
-      // No struct leaf the arm's row could twin.
-    }
-  }
-  false
-}
-
-// A revisited leaf, by its declared name `nm`: a struct closes a cycle whose anon row does
-// not twin the declared one, and an arm answers through its own deferred predicate.
-function armRefLeafNameOk(nm: string): boolean {
-  if nm == "" { return false }
-  if nameIsStructDecl(nm) { return false }
-  armFieldDeferredRowOk(nm)
-}
-
 // True when a generic-application argument is a FuncDecl type parameter rather than a real
 // type — the application belongs to a generic original and denotes no concrete struct. A
 // parameter that also names a real type binds nothing, so the application is concrete and
@@ -3898,8 +3711,8 @@ function wsrKeyOf(ty: i32): string {
   k
 }
 
-// The first struct row named by a whole record shape whose type is structurally the record `ty`,
-// or -1.
+// The first struct row named by a whole record shape whose type is the record `ty` as `tyEq`
+// compares it, or -1. A literal field counts: a row stores it as the atom, `string` as a string.
 export function wholeShapeRowOf(ty: i32): i32 {
   if wsrMut != tyMutEpoch || wsrRen != tyVarRenames { wsrClear() }
   let lim = sNames.length
@@ -3924,7 +3737,7 @@ export function wholeShapeRowOf(ty: i32): i32 {
   }
   let r = wsrHead[wsrKeyOf(ty)] ?? -1
   while r >= 0 {
-    if tyEqSoftLits(sTyIx[r], ty) { return r }
+    if tyEq(sTyIx[r], ty) { return r }
     r = wsrNext[r]
   }
   -1

@@ -260,19 +260,20 @@ names in the module, diagnostics, and keys that must be printable. It is not a w
 question about a type ([§4.1](#41-one-producer-per-fact)).
 
 **Type equality.** "Are these two types one?" has seven answers, each a contract. Each draws its
-line on purpose, and two of them disagree on a pair only where their lines differ ([notes](internals/refactor-notes/2026-11-12-step7-registries-and-equality.md)).
+line on purpose, and two of them disagree on a pair only where their lines differ ([notes](internals/refactor-notes/2026-11-12-step7-registries-and-equality.md),
+[the three vectors graded](internals/refactor-notes/2026-11-12-step7-equality-vectors-graded.md)).
 A caller picks the notion whose line is its question. It never picks another notion and patches
 the difference.
 
 | notion | equates | use it for | never for |
 | --- | --- | --- | --- |
-| `tySame` | the same arena variant with the same components, depth-bounded; a newtype brand is erased, while a union layer and a declared recursive twin count | structural identity in the checker and the elaboration | index identity where identity is nominal (a declared union is its declaration) |
+| `tySame` | the same arena variant with the same components, depth-bounded; union layers flatten in order and a newtype brand is erased. Two declared recursive twins compare apart, since the bound is reached before a cycle closes | structural identity in the checker and the elaboration | index identity where identity is nominal (a declared union is its declaration) |
 | `tyEq` | what renders alike: union layers flatten, holes compare equal, type parameters compare by name, field order and `readonly` count | "would these two print as one type" | telling holes or type parameters apart |
 | `tyEqSameHoles` | `tyEq`, with each inference hole equal only to itself | substitution: two types it equates take the same holes | comparing types whose holes are meant to unify |
-| `tyEqSoftLits` | `tyEq`, with a lone literal, at any depth, equal to its base scalar | rolled and unrolled spellings of one recursive arm, as a canon key widens a literal run | a literal-set membership or narrowing question |
+| `tyEqSoftLits` | `tyEq`, with a lone literal, at any depth, equal to its base scalar | rolled and unrolled spellings of one recursive arm, as a canon key widens a literal run, with a second test of how each field is stored | which row stores a record: a row stores a literal field as the atom and `string` as a string (`tyEq`), and a literal-set membership or narrowing question |
 | `tySameSet` | one type up to the order and repetition of union members, at any depth; a declared record equals its structure | map twins and union membership, where member order is not identity | a box tag, which stays positional |
 | `tySameSpelled` | one type once each nested Set is spelled as its boolean map; union members in order | a union's spelling against its members | a Set against a map where the value matters |
-| `repCanonId` | an interned canonical key: structural, literals widened, declarations, brands and member order erased | the emitter's structural identity for rows and memos | a question the checker must answer, or anything a declaration decides |
+| `repCanonId` | an interned canonical key: structural, a bare literal widened (a string literal at a record field keys as its one-member set, the atom), and declarations (an alias's one-member wrapper included), brands and member order erased | the emitter's structural identity for rows and memos | a question the checker must answer, or anything a declaration decides |
 
 Two exported functions are not type equalities. `tySameAnonRow` asks whether two anonymous records
 have the same field names in order, which is a row question. `tyEqNoneIsMap` asks whether an `==`
