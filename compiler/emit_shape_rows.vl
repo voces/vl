@@ -1,6 +1,5 @@
 import { tyIsVariantMember } from "./check_node_tys"
 import { mapStoredTyOf } from "./check_fn_tag_facts"
-import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { recNarrowRecordOf } from "./check_bind_adopt"
 
 // `emit_shape_rows.vl` — the shape and struct rows a spelling, object field set or
@@ -95,7 +94,6 @@ import {
   TyUnion,
   TyVar,
   cUserTypesVer,
-  litBaseTy,
   litUnionAliasNameOfTy,
   litUnionInlineNameOfTy,
   mkArrayTy,
@@ -145,8 +143,6 @@ import {
   structIndexOfTy,
   structRowRecordingTy,
   uFieldElemTyIxAt,
-  variantFieldElemName,
-  variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import {
   arrLeafNameOf,
@@ -166,17 +162,7 @@ import {
   shapeFieldParse,
   variantRowOfOwnRenderTy,
 } from "./emit_field_codes"
-import {
-  jrBoxFits,
-  jrCanonFits,
-  jrFlatMembers,
-  jrIsBoolean,
-  jrIsRecord,
-  jrListCode,
-  jrNullableOf,
-  jrPrimCode,
-  jrRetIsNullable,
-} from "./emit_join_records"
+import { jrFlatMembers } from "./emit_join_records"
 import {
   fieldCodeOfListRep,
   listRepOfFieldCode,
@@ -241,13 +227,9 @@ import {
   FC_I64,
   FC_I64_LIST,
   FC_MAP,
-  FC_NUL_BOOL,
-  FC_NUL_CLOSURE,
-  FC_NUL_I32_LIST,
   FC_NUL_LIT_UNION,
   FC_NUL_MAP,
   FC_NUL_REF_LIST,
-  FC_NUL_STR,
   FC_REF_LIST,
   FC_STR,
   FC_STRUCT,
@@ -684,23 +666,6 @@ function mvValUnionKindOfTy(ty: i32): i32 {
   MVK_UNION
 }
 
-// The arm an adopted map-value shape `name` of record type `ty` (or its `| null` niche) is built
-// at (D671), -1 for none or a non-record: its fields' types matched against the arms, then the
-// widenings an adopter builds a literal at, each only for a sole claimant (D4636).
-export function mvValArmOfShapeTy(name: string, ty: i32): i32 {
-  const ot = nonNullTy(ty)
-  if ot < 0 || !(tyAt(ot) is TyObj) { return -1 }
-  if !nameIsWholeSpanShape(name) { return -1 }
-  if structRowOfValueTy(ot) >= 0 { return -1 }
-  const direct = variantIndexOf(name)
-  if direct >= 0 { return direct }
-  const exact = variantRowScanOfTyK(ot, 0, false)
-  if exact >= 0 { return exact }
-  const boxed = variantRowScanOfTyK(ot, 1, true)
-  if boxed >= 0 { return boxed }
-  variantRowScanOfTyK(ot, 2, true)
-}
-
 // The mv-table spelling of map value `valName`, whose arena type is `ty` or -1: the list a
 // tagged set's ids are stored as, else the spelling itself.
 export function mvCanonValNameTy(valName: string, ty: i32) {
@@ -1055,174 +1020,6 @@ export function armLayoutAmbiguousAt(vi: i32): boolean {
   false
 }
 
-// The field code `nameFieldCodeTy` gives a record's field of type `f`, from the spelling the
-// record renders, or -1 where it gives none.
-function jrWantOf(f: i32): i32 {
-  if f < 0 || f >= T.tys.length { return -1 }
-  // A literal union kept as its alias, or a lone string literal, is the atom; an inline set is
-  // the string slot. Its list is the atom list.
-  if jrLitAtomOf(f) != 0 { return FC_I32 }
-  if tyIsLitUnion(f) { return FC_STR }
-  if tyIsLitUnionArray(f) { return FC_I32_LIST }
-  const t = tyAt(f)
-  // Exhaustive over `Ty` and `_`-less: each arm is the rung of the spelling ladder its render
-  // reaches.
-  match t {
-    TyPrim => {
-      return jrPrimCode(t.primName)
-    }
-    TyLit => {
-      const bt = tyAt(litBaseTy(t))
-      if bt is TyPrim { return jrPrimCode(bt.primName) }
-      return -1
-    }
-    TyFunc => {
-      if fnTagTyIsTagged(f) { return FC_I32 }
-      return FC_CLOSURE
-    }
-    TyMap => {
-      return FC_MAP
-    }
-    TyArray => {
-      return jrListCode(f, FC_REF_LIST)
-    }
-    TyNullable | TyUnion => {
-      return jrUnionWantOf(f)
-    }
-    TyErr | TyObj | TyVar | TyNeg => {
-      return -1
-    }
-  }
-}
-
-// How a record renders its string-literal field `f`: 1 as a literal-union alias's name, 2 as one
-// quoted literal, both the atom; 0 for any other type, an inline set among them.
-function jrLitAtomOf(f: i32): i32 {
-  if litUnionAliasNameOfTy(f) != "" { return 1 }
-  if tyIsOneStrLit(f) { return 2 }
-  0
-}
-
-// `jrWantOf` for a nullable or a union: a niche where one member and `null` make one, the box
-// for a value union or a union with a registered row (a record member keeps a union out of the
-// value set, but the field still stores the box), and -1 for a union the ladder does not code.
-function jrUnionWantOf(f: i32): i32 {
-  const ms: i32[] = []
-  const hasNull = jrFlatMembers(f, ms)
-  if hasNull && ms.length > 1 {
-    // Literal members beside `null` with nothing else spell the nullable literal union.
-    let allLit = true
-    for m in ms {
-      const lt = tyAt(m)
-      if lt is TyLit {
-        if lt.litKind != "str" { allLit = false }
-      } else {
-        allLit = false
-      }
-    }
-    if allLit { return FC_NUL_LIT_UNION }
-  }
-  if hasNull && ms.length == 1 {
-    const m = ms[0]
-    if tyIsLitUnion(m) { return FC_NUL_LIT_UNION }
-    const mt = tyAt(m)
-    // Exhaustive over `Ty` and `_`-less: the niche each single member makes with `null`.
-    match mt {
-      TyPrim => {
-        if mt.primName == "string" { return FC_NUL_STR }
-        if mt.primName == "boolean" { return FC_NUL_BOOL }
-      }
-      TyFunc => {
-        return FC_NUL_CLOSURE
-      }
-      TyArray => {
-        if tyIsLitUnionArray(m) { return FC_NUL_I32_LIST }
-        return jrListCode(jrNullableOf(f, m), -1)
-      }
-      TyMap => {
-        if mapTyValKindLowerable(m) { return FC_NUL_MAP }
-        return -1
-      }
-      TyObj => {
-        return -1
-      }
-      TyErr | TyNullable | TyUnion | TyVar | TyLit | TyNeg => {
-        // No niche of its own; the box test below answers.
-      }
-    }
-  }
-  if isValueUnionTyOr(f) == 1 { return FC_UNION }
-  if unRowOfTyKey(f) >= 0 { return FC_UNION }
-  -1
-}
-
-// `jrFieldFits` against a field given by its code, element name and element type, so a union
-// arm's field asks the same question as a struct row's.
-function jrFieldFitsAt(
-  f: i32,
-  want: i32,
-  code: i32,
-  elem: string,
-  et: i32,
-  lenient: i32,
-): boolean {
-  if want < 0 || code < 0 {
-    if code == FC_STRUCT && elem != "" {
-      return jrCanonFits(nonNullTy(f), et, elem)
-    }
-    // A record field is a struct field, or a box's arm on the lenient pass only.
-    if code >= 0 && jrIsRecord(f) {
-      return code == FC_STRUCT || (code == FC_UNION && lenient >= 1)
-    }
-    return true
-  }
-  if want != code {
-    // An atom field may sit at a row that lays the same literal union out as the string (D1460).
-    if want == FC_I32 && code == FC_STR && jrLitAtomOf(f) != 0 { return true }
-    if lenient >= 1 && code == FC_UNION { return true }
-    if lenient >= 2 {
-      if want == FC_I32 {
-        if code == FC_I64 || code == FC_F32 || code == FC_NUL_LIT_UNION {
-          return true
-        }
-        // Only a field spelled `boolean` widens into the `boolean | null` niche.
-        if code == FC_NUL_BOOL { return jrIsBoolean(f) }
-      }
-      if want == FC_STR {
-        if code == FC_NUL_STR || code == FC_NUL_LIT_UNION { return true }
-        if code == FC_I32 { return elem != "" }
-      }
-    }
-    // A function returning a nullable renders without grouping, as the nullable closure does.
-    if code == FC_NUL_CLOSURE && want == FC_CLOSURE {
-      return jrRetIsNullable(f)
-    }
-    return false
-  }
-  // An alias atom field is only an atom row's: a plain `i32` or `boolean` row reads it back as
-  // a number.
-  if want == FC_I32 && jrLitAtomOf(f) == 1 { return tyIsLitUnion(et) }
-  if elem == "" { return true }
-  if want == FC_I32 { return !tyIsLitUnion(et) }
-  if want == FC_MAP || want == FC_NUL_MAP { return jrMapValFits(f, et) }
-  if want == FC_UNION { return jrBoxFits(f, et) }
-  if want == FC_REF_LIST || want == FC_NUL_REF_LIST {
-    const at = tyAt(nonNullTy(f))
-    if at is TyArray { return jrCanonFits(at.aElem, et, elem) }
-  }
-  true
-}
-
-// Whether map field `f` and a map field whose value has type `et` or -1 store values at one rep.
-function jrMapValFits(f: i32, et: i32): boolean {
-  const mt = tyAt(nonNullTy(f))
-  if !(mt is TyMap) { return true }
-  const sa = mvSlotOfValTyK(mt.mVal, mapKeyKindOfTy(mt.mKey))
-  const sb = mvSlotOfMapValOrMonoKTys(MAP_KEY_STR, -1, et)
-  if sa >= 0 && sb >= 0 { return mvCanonRepOf(sa) == mvCanonRepOf(sb) }
-  true
-}
-
 // The struct row a non-null annotation type `ty` is stored at, -1 for none or a nullable type:
 // its own recording row, then an anonymous record's canonical-key row, then a record's indexed
 // or canonical-key row. A declared record with no own row never gets another type's same-shape
@@ -1274,44 +1071,6 @@ export function mvValTysCompat(vaTy: i32, veTy: i32): boolean {
   const se = mvSlotOfMapValOrMonoKTys(MAP_KEY_STR, -1, veTy)
   if sa >= 0 && se >= 0 { return mvCanonRepOf(sa) == mvCanonRepOf(se) }
   true
-}
-
-// The arm whose fields are the record `ty`'s, each field's type against the arm's field code as
-// `jrScanK` asks a struct row, at one leniency; `unique` declines when a
-// second arm also matches. -1 for a non-record.
-function variantRowScanOfTyK(ty: i32, lenient: i32, unique: boolean): i32 {
-  if ty < 0 || ty >= T.tys.length { return -1 }
-  const t = tyAt(ty)
-  if !(t is TyObj) { return -1 }
-  const fnames = t.objFieldNames
-  let found = -1
-  let vi = 0
-  while vi < uVariants.length {
-    if uFieldCount[vi] == fnames.length {
-      let ok = true
-      let k = 0
-      while ok && k < fnames.length {
-        const fj = variantFieldIndex(vi, fnames[k])
-        ok = fj >= 0
-          && jrFieldFitsAt(
-          t.objFieldTypes[k],
-          jrWantOf(t.objFieldTypes[k]),
-          variantFieldTypeAt(vi, fj),
-          variantFieldElemName(vi, fj),
-          uFieldElemTyIxAt(vi, fj),
-          lenient,
-        )
-        k = k + 1
-      }
-      if ok {
-        if !unique { return vi }
-        if found >= 0 { return -1 }
-        found = vi
-      }
-    }
-    vi = vi + 1
-  }
-  found
 }
 
 // The rep kind of `ty` where the descriptor covers it, else null (also for no type).
@@ -1719,7 +1478,7 @@ export function tyElemIsRefListElem(e: i32): boolean {
 }
 
 // Whether arena type `ty` is a list the ref-list layer stores by reference and can name a
-// row for: `nameIsRefArray`'s question asked of the type.
+// row for.
 export function tyIsRefArray(ty: i32): boolean {
   if ty < 0 { return false }
   const t = tyAt(ty)
@@ -2470,8 +2229,8 @@ export function arrLitNestedElemName(arrIx: i32, fnIx: i32): string {
         if nnr != "" { return nnr }
         const nen = arrLitElemRender(arrIx, fnIx)
         if nen == "" { return "" }
-        // The ref-list layer must also be able to name it: `refArrElemKind` answers a kind
-        // for every name, so a render alone is not enough. Without this, `{r: K}[]` (no
+        // The ref-list layer must also be able to name it, so a render alone is not enough.
+        // Without this, `{r: K}[]` (no
         // resolvable struct row) would intern as a kind-1 struct element and a neighbouring
         // `{r: i32}[]` literal would resolve to that same row and lose its wrapper.
         if !tyIsRefArray(ty) { return "" }
@@ -2528,7 +2287,7 @@ export function arrLitShapeElemName(arrIx: i32, fnIx: i32): string {
 // nullable scalar stays ungrouped and declines here exactly as it does on the annotation side.
 
 // The element name of a nullable element, its nominal spelling: a record under its declared
-// name, which `refArrShapeKind`'s niche rung resolves through `structIndexByName` (D1340).
+// name (D1340).
 function nulRefElemEmitName(nulTy: i32, innerTy: i32): string {
   if innerTy >= 0 {
     const it = tyAt(innerTy)
@@ -2695,8 +2454,7 @@ export function arrLitArenaElemRow(arrIx: i32) {
   -1
 }
 
-// The annotation node's recorded ref-array element row, or -1 — the arena twin of
-// `refArrElemName(nullablePartOf(nd.tyName))`. Reads the canon column where
+// The annotation node's recorded ref-array element row, or -1. Reads the canon column where
 // `canonRewroteNode` reports the node as rewritten, since `canonEmitTypeNames` rewrites the
 // name in place but leaves `nodeTyIx` holding the pre-rewrite type.
 export function annRefArrElemRow(annIx: i32) {

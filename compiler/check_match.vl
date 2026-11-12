@@ -1,3 +1,8 @@
+import { constLitNeverMsg } from "./check_lit_never_msgs"
+import { identIsConst } from "./check_scopes"
+import { parenPeelIx } from "./check_places"
+import { recordDeadTest } from "./check_side_rows"
+
 // A `match` expression: integer and literal arms, type arms with their bindings, and the
 // type the arms join to.
 
@@ -100,7 +105,9 @@ import {
   markUnionCover,
   matchRestNarrows,
   matchValPatFact,
+  operandDeclaredTy,
   popScope,
+  tyMembersMeet,
 } from "./check_narrow_flow"
 import { pushScope } from "./check_narrow_paths"
 import { declareDecl } from "./check_scopes"
@@ -122,6 +129,7 @@ import {
   TyLit,
   TyNullable,
   TyUnion,
+  mkLitTy,
   tyAt,
   tyIsCompositePat,
   tyIsHole,
@@ -175,7 +183,7 @@ function checkIntArmLit(
   if key.length != 2 { return true }
   const k = i32ToStr(key[0]) + ":" + i32ToStr(key[1])
   if claimed.has(k) {
-    tErr(
+    matchRedundantWarn(
       "redundant match arm: `"
         + matchPatLabel(patIx, matchIntPatLexeme(numIx, neg))
         + " is already covered",
@@ -213,7 +221,10 @@ function checkIntSetArmLit(
     return false
   }
   if claimed.has(k) {
-    tErr("redundant match arm: `" + label + " is already covered", patIx)
+    matchRedundantWarn(
+      "redundant match arm: `" + label + " is already covered",
+      patIx,
+    )
     return true
   }
   claimed.set(k, true)
@@ -302,7 +313,10 @@ function checkMatchIntArms(
         sawBadPat = true
       } else if setNul && matchPatIsNull(patIx) {
         if nulCovered {
-          tErr("redundant match arm: `null` is already covered", patIx)
+          matchRedundantWarn(
+            "redundant match arm: `null` is already covered",
+            patIx,
+          )
         } else {
           nulCovered = true
         }
@@ -702,13 +716,22 @@ function matchTypePatCover(
   elabCapIsNote(patIx, pt, pt)
   if patIx < nodeTyIx.length { nodeTySet(patIx, TY_BOOL) }
   const hit = markUnionCover(uMems, covered, pt)
-  if hit == 0 {
+  if hit == 0 && matchFlowStore >= 0 && tyMembersMeet(matchFlowStore, pt) {
+    recordDeadTest(
+      patIx,
+      "match pattern `"
+        + pn.isVariant
+        + "` can never match a value of type "
+        + tyToStr(st)
+        + " here, so this arm never runs",
+    )
+  } else if hit == 0 {
     tErr(
       "match pattern `" + pn.isVariant + "` is not a member of " + tyToStr(st),
       patIx,
     )
   } else if hit < 0 {
-    tErr(
+    matchRedundantWarn(
       "redundant match arm: `" + pn.isVariant + "` is already covered",
       patIx,
     )
@@ -781,7 +804,10 @@ function matchValPatCover(
     return true
   }
   if covered[mi] == 1 {
-    tErr("redundant match arm: " + label + " is already covered", patIx)
+    matchRedundantWarn(
+      "redundant match arm: " + label + " is already covered",
+      patIx,
+    )
   } else {
     covered[mi] = 1
     valMem[patIx] = uMems[mi]
@@ -973,12 +999,50 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
 // (D1572), a litunion on member strings, any other union on member types. `mTail` is the
 // return-tail flag the enclosing statement held.
 function checkMatchExprByScrut(n: MatchExpr, ix: i32, mTail: boolean): i32 {
-  // A `let` a write narrowed is matched over the member set the write left, which an arm naming
-  // another member is refused against, and lowered over its storage, whose box the arms test.
+  // A scrutinee a narrowing (a write's or a guard's) gave another type is matched over the member
+  // set it now holds, and an arm naming another member of its declared union is a dead arm, a
+  // warning; a written `let` is lowered over its storage.
   const st = checkNodeHook(n.matchScrut)
+  const fst = operandDeclaredTy(n.matchScrut)
   const wst = letWriteNarrowedStore(n.matchScrut)
   if wst >= 0 { isOperandAtStorage(n.matchScrut) }
-  checkMatchExprAtScrut(n, ix, mTail, st, wst >= 0)
+  const flow = fst >= 0 && tyMemberCount(fst) > 1
+  const saved = matchFlowStore
+  const savedScrut = matchScrutNode
+  matchFlowStore = if flow { fst } else { -1 }
+  matchScrutNode = n.matchScrut
+  const r = checkMatchExprAtScrut(n, ix, mTail, st, flow)
+  matchFlowStore = saved
+  matchScrutNode = savedScrut
+  r
+}
+
+// The scrutinee of the `match` being checked, for a refusal that names it.
+let matchScrutNode = -1
+
+// Whether the scrutinee is a `const` read, whose literal type is declared by its initialiser.
+function matchScrutIsConst(): boolean {
+  const px = parenPeelIx(matchScrutNode)
+  if px < 0 { return false }
+  const e = nodeAt(px)
+  if e is Ident { return identIsConst(px) }
+  false
+}
+
+// The declared union of the scrutinee of the `match` being checked when a narrowing gave it
+// another type, or -1.
+let matchFlowStore = -1
+
+// A redundant arm never runs: a warning, not an error.
+function matchRedundantWarn(msg: string, patIx: i32) {
+  recordDeadTest(patIx, msg + ", so this arm never runs")
+}
+
+// How many members `ty` has: a union's flattened members, else 1.
+function tyMemberCount(ty: i32): i32 {
+  const ms: i32[] = []
+  flattenVariantsInto(ty, ms)
+  if ms.length == 0 { 1 } else { ms.length }
 }
 
 function checkMatchExprAtScrut(
@@ -990,6 +1054,14 @@ function checkMatchExprAtScrut(
 ): i32 {
   matchCheckPatReads(n, st)
   tpMatchOkSet(mTail || tpIfOkAt.has(ix))
+  if (
+    written
+    && tyMemberCount(st) == 1
+    && matchLitSetTys(st, "str").length == 0
+    && matchLitSetTys(st, "int").length == 0
+  ) {
+    return checkMatchUnionScrut(n, ix, st, true)
+  }
   const strSet = matchLitSetTys(st, "str").length > 0
   const intSet = matchLitSetTys(st, "int")
   const setNul = tyHasNullMember(st)
@@ -1163,7 +1235,10 @@ function checkMatchLitUnionArms(
         if nulLit && pn.isVariant == "null" {
           isPatTyIxPut(matchPatValNode(patIx), TY_NULL)
           if nulCovered {
-            tErr("redundant match arm: `null` is already covered", patIx)
+            matchRedundantWarn(
+              "redundant match arm: `null` is already covered",
+              patIx,
+            )
           } else {
             nulCovered = true
           }
@@ -1251,7 +1326,19 @@ function matchStrPatCover(
     if members[fi] == inner { found = fi }
     fi = fi + 1
   }
-  if found < 0 {
+  const lit = mkLitTy("str", inner)
+  if found < 0 && matchFlowStore >= 0 && tyMembersMeet(matchFlowStore, lit) {
+    recordDeadTest(
+      patIx,
+      "match pattern "
+        + matchStrPatLabel(patIx, inner)
+        + " can never match a value of type "
+        + tyToStr(st)
+        + " here, so this arm never runs",
+    )
+  } else if found < 0 && matchScrutIsConst() {
+    tErr(constLitNeverMsg(matchScrutNode, st, lit, "arm never runs"), patIx)
+  } else if found < 0 {
     tErr(
       "match pattern "
         + matchStrPatLabel(patIx, inner)
@@ -1260,7 +1347,7 @@ function matchStrPatCover(
       patIx,
     )
   } else if covered[found] == 1 {
-    tErr(
+    matchRedundantWarn(
       "redundant match arm: "
         + matchStrPatLabel(patIx, inner)
         + " is already covered",
