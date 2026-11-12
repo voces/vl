@@ -47,8 +47,9 @@ print(id(xs).length)
     ],
   },
   {
-    // A hole function's `=>` signature key, and two declared names over one row: the row's
-    // registered name is the first declared, so `Circle` spells as `Dot`.
+    // A hole function's `=>` signature key, which the rule does not spell (the control row), and
+    // two declared names over one row: the row's registered name is the first declared, so a
+    // `Circle[]` argument's element binds `T` at `Dot` and its pin agrees with the rule.
     name: "fn sig key, two names one row",
     src: `type Dot = { r: i32 }
 type Circle = { r: i32 }
@@ -66,10 +67,9 @@ const cs: Circle[] = [c]
 print(first(cs).r)
 `,
     want: [
-      "param/agree ->  x4",
+      "param/agree ->  x5",
       "param/fn sig key -> =>i>i ~ (i32)=>i32 x1",
-      "param/record inside, another name -> Circle[] ~ Dot[] x1",
-      "typaram/record, another name -> Circle ~ Dot x1",
+      "typaram/agree ->  x1",
     ],
   },
 ];
