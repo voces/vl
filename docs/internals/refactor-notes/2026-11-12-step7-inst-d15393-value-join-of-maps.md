@@ -43,4 +43,15 @@ clause 1.
 
 ## Proof
 
-SWEEP
+**Full local sweep.** Fixpoint seeds, base master `784c38bf`, 23,995 programs:
+
+| | count |
+| --- | --- |
+| same | 23,994 |
+| bytes-only | 0 |
+| output movers | 1 |
+| runs → not-runs | 0 |
+| new compiler traps | 0 |
+
+The one mover is D15393, which goes from refusal to runs. D15753's witness is check-clean
+invalid wasm on both seeds.
