@@ -210,7 +210,6 @@ import {
   declStructIndexBuild,
   declStructNodeOf,
   fnLetOfRead,
-  gaeApplyFieldTy,
   gaeSplitArgs,
   isStructAtom,
   isVariantBoxUnionAtoms,
@@ -379,11 +378,6 @@ import {
   gPromoOk,
   gPromoSlot,
   gaeBases,
-  gaeFieldCount,
-  gaeFieldNames,
-  gaeFieldStart,
-  gaeFieldTyNames,
-  gaeFieldTyNodes,
   gaeParams,
   genTyParamNames,
   genTyParamSeen,
@@ -883,7 +877,7 @@ import {
   variantSigMemoDrop,
   variantTagKey,
 } from "./emit_variant_sig"
-import { i32ListHas, i32PairIndexOf, strListIndexOf } from "./listutil"
+import { i32ListHas, i32PairIndexOf } from "./listutil"
 import {
   flattenVariantsInto,
   isNullTy,
@@ -6559,16 +6553,12 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
   0
 }
 
-// The type name to record for one generic-alias field: the annotation as canon'd, except
-// where the field's type is a type parameter, where it is the declared spelling instead.
-// `canonEmitTypeNames` has no scope, so inside `type Box<Id> = { v: Id }` it resolves `Id`
-// through the declared registry; `monoAnnHasTyParam` keeps this narrow and notes the node.
-function gaeDeclFieldTyName(nodeIx: i32, canoned: string, pnames: string[]) {
-  const raw = declAnnRawTyName(nodeIx)
-  if raw == "" { return canoned }
-  if !monoAnnHasTyParam(nodeIx, -1, pnames) { return canoned }
-  gaeParamFieldNodes.push(nodeIx)
-  raw
+// Notes generic-alias field annotation `nodeIx` when its type mentions one of `pnames`: such a
+// node is a generic original, read by `gaeParamFieldNodeIs`.
+function gaeNoteParamField(nodeIx: i32, pnames: string[]) {
+  if declAnnRawTyName(nodeIx) == "" { return 0 }
+  if monoAnnHasTyParam(nodeIx, -1, pnames) { gaeParamFieldNodes.push(nodeIx) }
+  0
 }
 
 // The annotation nodes of generic-alias fields whose type mentions the alias's parameter,
@@ -6591,11 +6581,6 @@ function gaeParamFieldNodeIs(ix: i32): boolean {
 export function gaeDeclsReset() {
   gaeBases = []
   gaeParams = []
-  gaeFieldStart = []
-  gaeFieldCount = []
-  gaeFieldNames = []
-  gaeFieldTyNames = []
-  gaeFieldTyNodes = []
   gaeParamFieldNodes = []
 }
 
@@ -6613,31 +6598,17 @@ function gaeCollectDecls(stmts: i32[]) {
         gaeBases.push(gaeHeadNameOf(s.tdName, lt))
         const ptext = gaeArgsTextOf(s.tdName, lt)
         gaeParams.push(ptext)
-        // The parameter names, needed here (not only at `gaeEnsure`) so a field whose type
-        // is a parameter can be recorded as declared rather than as canon resolved it.
         const pnames: string[] = []
         gaeSplitArgs(ptext, pnames)
-        gaeFieldStart.push(gaeFieldNames.length)
-        let cnt = 0
         const fields = s.tdFields
         let fi = 0
         while fi < fields.length {
           const fnode = nodeAt(fields[fi])
-          if fnode is FieldDef {
-            let tname = ""
-            if fnode.fdType >= 0 {
-              const ftn = nodeAt(fnode.fdType)
-              if ftn is TypeRef { tname = ftn.tyName }
-              tname = gaeDeclFieldTyName(fnode.fdType, tname, pnames)
-            }
-            gaeFieldNames.push(fnode.fdName)
-            gaeFieldTyNames.push(tname)
-            gaeFieldTyNodes.push(fnode.fdType)
-            cnt = cnt + 1
+          if fnode is FieldDef && fnode.fdType >= 0 {
+            gaeNoteParamField(fnode.fdType, pnames)
           }
           fi = fi + 1
         }
-        gaeFieldCount.push(cnt)
       }
     }
     i = i + 1
@@ -6653,42 +6624,6 @@ function gaeAppUnder(ty: i32): i32 {
   t
 }
 
-// Interns the inline shapes an application's substituted field types name, before `gaeEnsure`
-// codes those fields: a monomorphized generic-alias field is the one kind no arena scan can
-// reach, since `Box<T> = {v: {a: T}}` at `Box<string>` names `{a:string}`, a text appearing
-// nowhere in the program, so `gaeEnsure` would otherwise find no struct row and decline it.
-function gaeInternAppFieldShapes(name: string, appTy: i32) {
-  if !annGenAppSpanEnds(name) { return 0 }
-  const ltAt = gaeLtAt(name)
-  // Both halves of the generic-application cut at their home (`gaeHeadNameOf`/`gaeArgsTextOf`),
-  // given the `<` the line above found.
-  const gi = strListIndexOf(gaeBases, gaeHeadNameOf(name, ltAt))
-  if gi < 0 { return 0 }
-  const pnames: string[] = []
-  gaeSplitArgs(gaeParams[gi], pnames)
-  const args: string[] = []
-  gaeSplitArgs(gaeArgsTextOf(name, ltAt), args)
-  if args.length != pnames.length { return 0 }
-  const fs = gaeFieldStart[gi]
-  const fc = gaeFieldCount[gi]
-  let fi = 0
-  while fi < fc {
-    // `internShapeDeepTy` peels the composition wrappers itself and descends a map value, so
-    // `{a: T}[]` and `{a: T[]}` are covered by the same call; a non-shape substitution is a no-op.
-    internShapeDeepTy(
-      gaeApplyFieldTy(
-        gaeFieldTyNames[fs + fi],
-        pnames,
-        args,
-        gaeFieldTyNodes[fs + fi],
-      ),
-      tyFieldTyOf(appTy, gaeFieldNames[fs + fi]),
-    )
-    fi = fi + 1
-  }
-  0
-}
-
 // Interns every generic-alias application a TypeRef's type holds behind `| null` and `[]`, or
 // as a map's value. The row name is the checker's application registry entry for the type
 // (`genAppNameOfTy`), "" for an application over a type parameter, which each instance interns.
@@ -6700,16 +6635,12 @@ export function collectGenAliasShapes() {
     if tn is TypeRef {
       const app = gaeAppUnder(fdRowOf(ti))
       const nm = genAppNameOfTy(app)
-      if nm != "" {
-        // The instance's own inline-shape field targets first — `gaeEnsure` codes a field
-        // from the struct table and declines the whole instance when the target is not in it.
-        gaeInternAppFieldShapes(nm, app)
-        gaeEnsure(nm)
-      }
+      if nm != "" { gaeEnsure(nm, app) }
       // A map annotation's value position (`{[string]: Box<i32>}`) is interior to the map's
       // one TypeRef, so the walk above misses it; interning it here makes the map spelling self-sufficient.
-      const mv = genAppNameOfTy(gaeAppUnder(tyMapValOf(app)))
-      if mv != "" { gaeEnsure(mv) }
+      const mvTy = gaeAppUnder(tyMapValOf(app))
+      const mv = genAppNameOfTy(mvTy)
+      if mv != "" { gaeEnsure(mv, mvTy) }
     }
     ti = ti + 1
   }

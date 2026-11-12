@@ -1643,6 +1643,7 @@ import {
   elabTyClosed,
   fnTagArmsAt,
   fnTagCallSetOf,
+  fnTagCallSplits,
   fnTagLeafId,
   fnTagMembers,
   fnTagSetIsTagged,
@@ -3337,6 +3338,17 @@ function emitRecCopyLevel(
     // A `null` field holds the one value its type has; the source's field is not read (D14817).
     if fieldRowIsNulNone(dFieldRows[fj]) {
       fbRefNullNone()
+      fj = fj + 1
+      continue
+    }
+    // A `null` field copied into a `| null` the destination boxes is the union's null box.
+    if (
+      fieldRowIsNulNone(sFieldStart[sRow] + sfi)
+      && fieldRowIsUnionBox(dFieldRows[fj])
+    ) {
+      fbI32Rel(RS_TAG, nullBoxTag())
+      fbRefNullNone()
+      fbStructNew(uBoxIdx)
       fj = fj + 1
       continue
     }
@@ -27384,6 +27396,13 @@ function emitCallRefAt(
     i = i + 1
   }
   callRefDepth = crDepth
+  // The judge let a call whose members return different types through for its set to be
+  // tagged; left a closure set, the call would run each member at one signature (D15926).
+  if fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx)) {
+    return emitFail(
+      "emitProgram: this call runs functions that return different types, and one of them is also held where it cannot be stored as one of the functions this value may hold, so the call has no one signature",
+    )
+  }
   // id = closure.id (field 1) — the callee's wasm function index, `call_indirect`'d at
   // the concrete `$fnsig` (the engine signature-checks the callee against it).
   let sig = -1
@@ -31926,6 +31945,20 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
       retArg,
     )
   }
+  // A `null` the row stores in a union box, returned where the result is the `null` unit, is
+  // that null: the box is read for effect and dropped.
+  if (
+    fnPos >= 0
+    && fnPos < fRetKind.length
+    && fRetKind[fnPos] == "nulnone"
+    && nodeTyAt(retArg, fnIx) == TY_NULL
+    && exprUnion(retArg, fnIx)
+  ) {
+    if emitExpr(body, retArg, fnIx) < 0 { return -1 }
+    fbDrop()
+    fbRefNullNone()
+    return 0
+  }
   emitReturnValueTail(body, retArg, fnIx, fnPos, retArmHeap)
 }
 
@@ -32676,11 +32709,10 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     scopeBind(s.letName, slot)
     return 0
   }
-  // value-flow monomorphization: a `const g = f` binding to a generic named function, used
-  // only as a direct-call callee, is sound — `monomorphize` rewrote each `g(args)` to its
-  // per-call instance, so the closure stored here is `call_ref`'d only at the pinned type.
-  // Requires a pinning call site (`monoInstantiatedAny`); with none, the floor's loud reject applies instead.
-  if fnIx >= 0 {
+  // A `const g = f` of a generic named function used only as a direct callee stores the closure:
+  // `monomorphize` rewrote each `g(args)` to its pinned instance (`monoInstantiatedAny`). A
+  // member of a tagged set is held as its id instead, its slot's rep (D15927).
+  if fnIx >= 0 && fnTagLeafId(s.letInit) < 0 {
     const aliasFe = fieldValueFeOf(s.letInit)
     if fnHasUnannotatedParam(aliasFe) {
       if !criFnIsAnonLambda(aliasFe) {
