@@ -6,11 +6,18 @@
 //     vl run scripts/inventory/ls.vl -- --reserve D<lo>-D<hi> <holder> [<note>]
 //     vl run scripts/inventory/ls.vl -- --release D<lo>-D<hi>
 //
-// Run from the checkout root: every path, `RESERVED.md` included, resolves against the
-// working directory. `--next` skips the reserved ranges and names each on stderr, which it
-// reaches through `/dev/stderr` because VL has no stderr sink (a `dogfood:` row).
+// Run from the checkout root: every path, the `reserved/` directory included, resolves
+// against the working directory. `--next` skips the reserved ranges and names each on stderr,
+// which it reaches through `/dev/stderr` because VL has no stderr sink (a `dogfood:` row).
+// A reservation is one file per range so concurrent lanes never edit the same file.
 
-import { IoError, appendTextFile, readTextFile, writeTextFile } from "std:fs"
+import {
+  IoError,
+  appendTextFile,
+  listDir,
+  readTextFile,
+  writeTextFile,
+} from "std:fs"
 import { exit, runProgram } from "std:process"
 import { programArgs } from "std:args"
 import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
@@ -20,7 +27,7 @@ import {
   die,
   findFrom,
   isDigit,
-  isFile,
+  isDir,
   rstripWs,
   stripWs,
   univNl,
@@ -42,8 +49,7 @@ import {
 } from "../lib/inventory"
 
 const TARGETS = ["docs/internals/inventory", "docs/internals/inventory-2"]
-const RESERVED_DOC = "docs/internals/inventory/RESERVED.md"
-const MARKER = "<!-- reservations below; the marker is what --reserve/--release edit around -->"
+const RESERVED_DIR = "docs/internals/inventory/reserved"
 const USAGE = "usage: vl run scripts/inventory/ls.vl -- [<doc-or-dir>...] [--status S] [--tail N]\n       vl run scripts/inventory/ls.vl -- --next\n       vl run scripts/inventory/ls.vl -- --reserve D<lo>-D<hi> <holder> [<note>]\n       vl run scripts/inventory/ls.vl -- --release D<lo>-D<hi>\n`--status` takes open, closed, silent, loud, or any canonical outcome by name."
 
 // One listed row; `key.path` carries the row's index into the list it came from.
@@ -55,8 +61,15 @@ type Listed = {
   key: IdKey,
 }
 
-// A live reservation line of `RESERVED.md`.
-type Res = { lo: i64, hi: i64, who: string, date: string, note: string }
+// A live reservation: the line of one `reserved/D<lo>-D<hi>.md`, and that file's path.
+type Res = {
+  lo: i64,
+  hi: i64,
+  who: string,
+  date: string,
+  note: string,
+  path: string,
+}
 
 function readText(path: string): string {
   const t = readTextFile(path)
@@ -263,7 +276,7 @@ function wsRun(s: string, i: i32): i32 {
 // `^D(\d+)-D(\d+)\s+(.+?)\s+(\d{4}-\d{2}-\d{2})\s*(.*)$` takes it; `who` is "" when
 // the line is not one.
 function parseRes(ln: string): Res {
-  const none: Res = { lo: 0, hi: 0, who: "", date: "", note: "" }
+  const none: Res = { lo: 0, hi: 0, who: "", date: "", note: "", path: "" }
   const sp = spanAt(ln)
   if sp.b.end < 0 { return none }
   const w0 = sp.b.end
@@ -291,6 +304,7 @@ function parseRes(ln: string): Res {
             who: ln.slice(hs, p),
             date: ln.slice(p + k, e),
             note: stripWs(ln.slice(e, ln.length)),
+            path: "",
           }
         }
       }
@@ -324,18 +338,50 @@ function sortRes(rs: Res[]): Res[] {
   out
 }
 
-// Every live range, sorted; none when the file is absent.
+// Every live range, sorted; none when the directory is absent.
 function reservations(): Res[] {
-  if !isFile(RESERVED_DOC) { return [] }
+  if !isDir(RESERVED_DIR) { return [] }
+  const names = listDir(RESERVED_DIR)
+  if names is IoError {
+    die("ls.vl: cannot list \{RESERVED_DIR} (\{names.msg})", 1)
+    return []
+  }
   const out: Res[] = []
-  for ln in split(readText(RESERVED_DOC), "\n") {
-    const r = parseRes(stripWs(ln))
-    if r.who != "" { out.push(r) }
+  for n in names {
+    if !startsWith(n, "D") || !endsWith(n, ".md") { continue }
+    const path = RESERVED_DIR + "/" + n
+    for ln in split(readText(path), "\n") {
+      const r = parseRes(stripWs(ln))
+      if r.who != "" {
+        out.push(
+          {
+            lo: r.lo,
+            hi: r.hi,
+            who: r.who,
+            date: r.date,
+            note: r.note,
+            path: path,
+          },
+        )
+      }
+    }
   }
   sortRes(out)
 }
 
 function rangeText(r: Res): string { "D\{toString(r.lo)}-D\{toString(r.hi)}" }
+
+// Runs `cmd args`, dying with `what` unless it exits 0.
+function mustRun(cmd: string, args: string[], what: string) {
+  const r = runProgram(cmd, args)
+  if r is IoError {
+    die("ls.vl: cannot \{what} (\{r.msg})", 1)
+    return
+  }
+  if r.code != 0 {
+    die("ls.vl: cannot \{what} (\{cmd} exited \{toString(r.code)})", 1)
+  }
+}
 
 function today(): string {
   const r = runProgram("date", ["+%F"])
@@ -382,49 +428,43 @@ function cmdReserve(
     print("ls.vl: \{spec} runs backwards")
     return 2
   }
-  const want: Res = { lo: lo, hi: hi, who: holder, date: "", note: note }
+  const want: Res = {
+    lo: lo,
+    hi: hi,
+    who: holder,
+    date: "",
+    note: note,
+    path: "",
+  }
   const res = reservations()
-  const keep: Res[] = []
   if release {
     for r in res {
-      if r.lo != lo || r.hi != hi { keep.push(r) }
-    }
-    if keep.length == res.length {
-      print("ls.vl: no reservation exactly \{rangeText(want)} to release")
-      return 2
-    }
-  } else {
-    for r in res {
-      if !(hi < r.lo || lo > r.hi) {
-        let why = "ls.vl: \{rangeText(want)} overlaps \{rangeText(r)}, held by \{r.who} since \{r.date}"
-        if r.note != "" { why = why + " (\{r.note})" }
-        print(why)
-        return 1
+      if r.lo == lo && r.hi == hi {
+        mustRun("rm", ["--", r.path], "delete \{r.path}")
+        print("released \{rangeText(want)}")
+        return 0
       }
-      keep.push(r)
     }
-    keep.push({ lo: lo, hi: hi, who: holder, date: today(), note: note })
+    print("ls.vl: no reservation exactly \{rangeText(want)} to release")
+    return 2
   }
-  const body = readText(RESERVED_DOC)
-  let head = body
-  const at = findFrom(body, MARKER, 0)
-  if at >= 0 { head = body.slice(0, at) }
-  const lines: string[] = []
-  for r in sortRes(keep) {
-    let ln = "\{rangeText(r)}  \{r.who}  \{r.date}"
-    if r.note != "" { ln = ln + "  " + r.note }
-    lines.push(ln)
+  for r in res {
+    if !(hi < r.lo || lo > r.hi) {
+      let why = "ls.vl: \{rangeText(want)} overlaps \{rangeText(r)}, held by \{r.who} since \{r.date}"
+      if r.note != "" { why = why + " (\{r.note})" }
+      print(why)
+      return 1
+    }
   }
-  const w = writeTextFile(
-    RESERVED_DOC,
-    head + MARKER + "\n\n" + join(lines, "\n") + "\n",
-  )
-  if w != null { die("ls.vl: cannot write \{RESERVED_DOC} (\{w.msg})", 1) }
-  if release {
-    print("released \{rangeText(want)}")
-  } else {
-    print("reserved \{rangeText(want)}")
+  if !isDir(RESERVED_DIR) {
+    mustRun("mkdir", ["-p", RESERVED_DIR], "create \{RESERVED_DIR}")
   }
+  const path = RESERVED_DIR + "/" + rangeText(want) + ".md"
+  let ln = "\{rangeText(want)}  \{holder}  \{today()}"
+  if note != "" { ln = ln + "  " + note }
+  const w = writeTextFile(path, ln + "\n")
+  if w != null { die("ls.vl: cannot write \{path} (\{w.msg})", 1) }
+  print("reserved \{rangeText(want)}")
   0
 }
 
