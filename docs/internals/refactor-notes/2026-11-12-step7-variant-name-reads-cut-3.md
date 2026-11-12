@@ -36,6 +36,8 @@ written.
 
 - Refresh ×2 is a fixpoint at 6,716,925 bytes, −2,998 against master's 6,719,923.
 - Sweep against master's fixpoint seed: **24,189 same**, 0 bytes-only movers, 0 output movers.
+- Merged with master `8e0bb32c`: #7618 had edited the `jr*` chain, which stays deleted. The fixpoint
+  is 6,713,194 bytes, −2,996 against master's 6,716,190, and the sweep is again 24,189 same.
 - lint-self is clean, and `regress.vl` lost no runs.
 - Witnesses `--strict`: 4,856 as filed, 0 moved.
 - Late demands 8, seed +1.9%, render-parse 13 and 28, and plumb-shape cost passes.
