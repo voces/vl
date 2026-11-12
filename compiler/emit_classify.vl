@@ -248,6 +248,8 @@ import {
   regUnionRowOfTy,
 } from "./emit_anon_fields"
 import {
+  armRowIsRecordRef,
+  armRowIsUnionBox,
   fieldKindWidens,
   fieldRowIsPlainI32,
   fieldRowIsRecordRef,
@@ -271,6 +273,9 @@ import {
   uFieldElemTyIxAt,
   variantFieldElemName,
   variantFieldIsLitUnion,
+  variantFieldIsRecordRef,
+  variantFieldIsUnionBox,
+  variantFieldNumKind,
   variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import {
@@ -380,6 +385,7 @@ import {
   LR_STR,
   LR_U8,
   ListRep,
+  eqRowFieldKind,
   lrOf,
 } from "./emit_eq_rows"
 import {
@@ -4426,7 +4432,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
     if nvi >= 0 {
       const vfi = variantFieldIndex(nvi, m.memProp)
       if vfi >= 0 {
-        if variantFieldTypeAt(nvi, vfi) == FC_UNION {
+        if variantFieldIsUnionBox(nvi, vfi) {
           return variantFieldElemName(nvi, vfi)
         }
         // The narrowed arm stores the field unboxed, whatever a same-named field of a
@@ -4480,7 +4486,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
             if mvi >= 0 {
               const mvfi = variantFieldIndex(mvi, m.memProp)
               if mvfi >= 0 {
-                if variantFieldTypeAt(mvi, mvfi) == FC_UNION {
+                if variantFieldIsUnionBox(mvi, mvfi) {
                   return variantFieldElemName(mvi, mvfi)
                 }
               }
@@ -4506,7 +4512,7 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
     if avi >= 0 {
       const afi = variantFieldIndex(avi, m.memProp)
       if afi >= 0 {
-        if variantFieldTypeAt(avi, afi) == FC_UNION {
+        if variantFieldIsUnionBox(avi, afi) {
           return variantFieldElemName(avi, afi)
         }
       }
@@ -4518,7 +4524,7 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       const nvi = nulVariantIdxOfExpr(m.memObj, fnIx)
       if nvi >= 0 && !armLayoutAmbiguousAt(nvi) {
         const nfi = variantFieldIndex(nvi, m.memProp)
-        if nfi >= 0 && variantFieldTypeAt(nvi, nfi) == FC_UNION {
+        if nfi >= 0 && variantFieldIsUnionBox(nvi, nfi) {
           return variantFieldElemName(nvi, nfi)
         }
       }
@@ -8719,7 +8725,7 @@ function memberVariantRow(memIx: i32, fnIx: i32): i32 {
 // The variant row a non-null, arm-typed field read `memIx` yields: the arm its field row records
 // for the field. The field code holds a ref either way, so the read's own type gates it.
 function memberVariantRowGo(memIx: i32, fnIx: i32): i32 {
-  if memberFieldCode(memIx, fnIx) != FC_STRUCT { return -1 }
+  if !memberFieldIsRecordRef(memIx, fnIx) { return -1 }
   const et = memberFieldElemTy(memIx, fnIx)
   if et < 0 || et >= T.tys.length { return -1 }
   const t = tyAt(et)
@@ -9104,7 +9110,7 @@ function structIndexOfMemberStore(e: Member, exprIx: i32, fnIx: i32): i32 {
 function variantFieldStructRow(vi: i32, prop: string): i32 {
   if vi < 0 { return -1 }
   const fi = variantFieldIndex(vi, prop)
-  if fi < 0 || variantFieldTypeAt(vi, fi) != FC_STRUCT { return -1 }
+  if fi < 0 || !variantFieldIsRecordRef(vi, fi) { return -1 }
   uFieldTgtStructIdx(vi, fi)
 }
 
@@ -10513,7 +10519,7 @@ function memberUnionReadKind(exprIx: i32, fnIx: i32) {
       return -2
     }
     // A shared read delivering a box, typed as one atom (`emitMemSharedRead`'s twin).
-    if memberFieldCode(exprIx, fnIx) == FC_UNION {
+    if memberFieldIsUnionBox(exprIx, fnIx) {
       const sa = pathReadAtomKind(exprIx, fnIx)
       if sa >= 0 { return sa }
     }
@@ -10698,7 +10704,7 @@ export function objMatchesVariantIdxOmit(
       if at >= 0 { present = present + 1 }
       if at < 0 {
         if !omit || !variantFieldMayOmit(vi, fj) { allMatch = false }
-      } else if armFieldTypes()[start + fj] == FC_MAP {
+      } else if eqRowFieldKind(-1 - vi, fj) == "map" {
         if (
           !objMapFieldCompat(
             objIx,
@@ -10709,8 +10715,8 @@ export function objMatchesVariantIdxOmit(
         ) {
           allMatch = false
         }
-      } else if armFieldTypes()[start + fj] == FC_STRUCT {
-        // A nested-struct candidate field (code 15) is tightened by its target's
+      } else if variantFieldIsRecordRef(vi, fj) {
+        // A record candidate field is tightened by its target's
         // field-name set, exactly as a map field is by its value rep.
         if (
           !objNestedFieldCompat(
@@ -12454,6 +12460,24 @@ export function memberFieldCode(memIx: i32, fnIx: i32) {
     if ucode >= 0 { return ucode }
   }
   -1
+}
+
+// Whether the field a `Member` read resolves to holds a record ref; a shared read asks its
+// plan's code.
+function memberFieldIsRecordRef(memIx: i32, fnIx: i32): boolean {
+  const p = memberFieldPos(memIx, fnIx)
+  if p >= 0 { return fieldRowIsRecordRef(p) }
+  if p <= -3 { return armRowIsRecordRef(-3 - p) }
+  p == FPOS_SHARED && memberFieldCode(memIx, fnIx) == FC_STRUCT
+}
+
+// Whether the field a `Member` read resolves to holds the union box; a shared read asks its
+// plan's code.
+function memberFieldIsUnionBox(memIx: i32, fnIx: i32): boolean {
+  const p = memberFieldPos(memIx, fnIx)
+  if p >= 0 { return fieldRowIsUnionBox(p) }
+  if p <= -3 { return armRowIsUnionBox(-3 - p) }
+  p == FPOS_SHARED && memberFieldCode(memIx, fnIx) == FC_UNION
 }
 
 // `memberFieldPos`'s answer for a read whose receiver shape names no one row: the members of an
@@ -14414,7 +14438,7 @@ function memberReadIsLitAtom(e: Member, exprIx: i32, fnIx: i32): boolean {
   const mviA = memRecvVariantIndex(e, mIxA, fnIx)
   if mviA >= 0 {
     const mvfiA = variantFieldIndex(mviA, e.memProp)
-    if mvfiA >= 0 && variantFieldTypeAt(mviA, mvfiA) == FC_I32 {
+    if mvfiA >= 0 && variantFieldNumKind(mviA, mvfiA) == 0 {
       const rv = variantFieldIsLitUnion(mviA, mvfiA)
       return rv
     }
