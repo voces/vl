@@ -110,7 +110,11 @@ import {
 } from "./check_core_state"
 import { nodeTyProvesNonNull, recArmPartialFields } from "./check_emit_queries"
 import { binPlusIsListByTy } from "./check_leaf_steps"
-import { numDeliverStamp, recFitNarrowedFields } from "./check_fit_rules"
+import {
+  numDeliverStamp,
+  recFitNarrowedFields,
+  recUnionRecMember,
+} from "./check_fit_rules"
 import {
   assignable,
   recArmFitKind,
@@ -1284,6 +1288,8 @@ import {
   refArrSlotTag,
   tyIsAtomLeafList,
   unionSetArmTysAB,
+  unionTyArms,
+  unionTyHasAtom,
   variantDiscrimFieldNeeded,
   variantFieldLitLexes,
   variantHasDiscrimField,
@@ -1523,7 +1529,6 @@ import {
   unionArmsOfTy,
   unionHasAtomAB,
   unionHasAtomOfTy,
-  unionHasAtomTy,
   unionMemberAtomsOf,
   unionMemberSetOf,
   unionMemberTysOf,
@@ -3127,6 +3132,93 @@ function rcNestedRow(
   if sHeapIdx[sIn] == sHeapIdx[dIn] { -1 } else { dIn }
 }
 
+// The member of the union of records the destination field `name` is, that source row `sRow`'s
+// record field `sfi` is copied into (`recUnionRecMember`), or -1.
+function rcUnionRecMember(
+  exprIx: i32,
+  pre: string,
+  name: string,
+  sRow: i32,
+  sfi: i32,
+  dr: i32,
+): i32 {
+  if (
+    !fieldRowIsUnionBox(dr)
+    || !sFieldIsRecordRef(sRow, sfi)
+    || recCopyFromOf(exprIx) >= 0
+  ) {
+    return -1
+  }
+  const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
+  const dt = rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), name)
+  if st < 0 || dt < 0 { return -1 }
+  recUnionRecMember(st, dt)
+}
+
+// Copy source row `sRow`'s record field `sfi`, the field `name` along `pre`, into the union
+// member `m`'s row, and box it under the member's tag.
+function emitRecCopyIntoMember(
+  body: u8[],
+  exprIx: i32,
+  sHeap: i32,
+  reReadable: boolean,
+  sRow: i32,
+  sfi: i32,
+  m: i32,
+  pre: string,
+  name: string,
+  fnIx: i32,
+): i32 {
+  const vi = repVariantShapeRowOf(m)
+  const vr = variantRowOf(vi)
+  const sIn = sFieldTgtStructIdx(sRow, sfi)
+  if (
+    vi < 0
+    || vi >= uTags.length
+    || vr < 0
+    || sIn < 0
+    || sRow < 0
+    || sRow >= sHeapIdx.length
+  ) {
+    return emitFailAt(
+      "emitProgram: a record copied into a union of records has no member row",
+      exprIx,
+    )
+  }
+  const names: string[] = []
+  const rows: i32[] = []
+  variantRowFields(vi, names, rows)
+  const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
+  fbI32Rel(RS_TAG, uTags[vi])
+  rcPathHeap.push(sHeapIdx[sRow])
+  rcPathField.push(sfi)
+  const ps = rcElemSrc
+  const pd = rcElemDst
+  rcElemSrc = st
+  rcElemDst = m
+  const r = emitRecCopyLevel(
+    body,
+    exprIx,
+    sHeap,
+    reReadable,
+    sIn,
+    vr,
+    m,
+    pre + name + "|",
+    names,
+    rows,
+    fnIx,
+  )
+  rcElemSrc = ps
+  rcElemDst = pd
+  rcPathHeap.pop()
+  rcPathField.pop()
+  if r < 0 { return -1 }
+  fbStructNew(variantHeap(vi))
+  fbStructNew(uBoxIdx)
+  0
+}
+
 // The struct row of the record `ty` or `ty | null`, or -1.
 function rcRowOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
@@ -3274,6 +3366,37 @@ function emitRecCopyLevel(
       rcPathField.pop()
       if r < 0 { return -1 }
       fbStructNew(sHeapIdx[nest])
+      fj = fj + 1
+      continue
+    }
+    // A record copied into a union of records is built at the member with its field names, then
+    // boxed under that member's tag.
+    const um = rcUnionRecMember(
+      exprIx,
+      pre,
+      dNames[fj],
+      sRow,
+      sfi,
+      dFieldRows[fj],
+    )
+    if um >= 0 {
+      if (
+        emitRecCopyIntoMember(
+          body,
+          exprIx,
+          sHeap,
+          reReadable,
+          sRow,
+          sfi,
+          um,
+          pre,
+          dNames[fj],
+          fnIx,
+        )
+        < 0
+      ) {
+        return -1
+      }
       fj = fj + 1
       continue
     }
@@ -3622,7 +3745,13 @@ const RC_WIDEN_KINDS = [3, 4, 4, 4]
 function rcPathTy(ty: i32, pre: string): i32 {
   let t = ty
   let from = 0
+  // A path into a union member restarts at the member (`emitRecCopyIntoMember`).
   let i = 0
+  while i < pre.length {
+    if pre[i] == 124 { from = i + 1 }
+    i = i + 1
+  }
+  i = from
   while i < pre.length {
     if pre[i] == 46 {
       const f = rcFieldTy(t, pre.slice(from, i))
@@ -3678,8 +3807,11 @@ function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
 // The struct row of a copied call's own record when that record is also a union's arm, or -1.
 function copyArmRowOf(exprIx: i32): i32 {
   const own = nodeTyIxOf(exprIx)
-  if own < 0 || repVariantShapeRowOf(own) < 0 { return -1 }
-  structRowOfAnnTy("", own, own)
+  const vi = if own >= 0 { repVariantShapeRowOf(own) } else { -1 }
+  if vi < 0 { return -1 }
+  const r = structRowOfAnnTy("", own, own)
+  // An arm with no annotated row is laid out at its variant's own row.
+  if r >= 0 { r } else { variantRowOf(vi) }
 }
 
 // `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`).
@@ -4023,23 +4155,11 @@ function isNumRecvBaseName(recvIx: i32, fnIx: i32) {
   if tyAt(t) is TyUnion { numLitUnionBaseName(t) } else { "" }
 }
 
-// The value-union name of an `is` receiver, for the box-tag soundness floor in `emitIs`.
-// `unionNameOfExpr` covers every receiver form except the optional chain, whose leaf field
-// is resolved here instead. `""` when the receiver is not a union.
+// The value-union name of an `is` receiver, for the box-tag soundness floor in `emitIs`; `""`
+// when the receiver is not a union. An optional chain's leaf field is among the forms
+// `unionNameOfExpr` covers.
 function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
-  const nm = unionNameOfExpr(exprIx, fnIx)
-  if nm != "" { return nm }
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is OptMember {
-    const si = optChainStructIdxOf(e.omObj, fnIx)
-    if si >= 0 {
-      const fi = sFieldIndex(si, e.omProp)
-      if fi >= 0 {
-        if sFieldIsUnionBox(si, fi) { return sFieldElemNameAt(si, fi) }
-      }
-    }
-  }
-  ""
+  unionNameOfExpr(exprIx, fnIx)
 }
 
 // The operand of `x == null` / `null == x` whose checked type admits no `null`, or whose hole
@@ -8354,13 +8474,7 @@ function mapBoxTag(sh: i32): i32 {
 // The tag the map value `exprIx` of shape `sh` boxes under in `unionName`. Where two map types
 // of the module's unions share that struct (D2493), each owns a tag, so the member is chosen by
 // TYPE: the union's one arm of the shape, else the arm the value's static type is.
-function mapBoxTagOf(
-  sh: i32,
-  unionName: string,
-  unionTy: i32,
-  exprIx: i32,
-  fnIx: i32,
-): i32 {
+function mapBoxTagOf(sh: i32, unionTy: i32, exprIx: i32, fnIx: i32): i32 {
   const s = mapShapeFoldSet(sh)
   if !mapShapeTwinned(s) { return mapBoxTag(s) }
   const vt = mapValueTyOf(exprIx, fnIx)
@@ -8369,7 +8483,7 @@ function mapBoxTagOf(
   let n = 0
   const atoms: string[] = []
   const mems: i32[] = []
-  if unionSetArmTysAB(106, unionName, unionTy, atoms, mems) {
+  if unionTyArms(unionTy, atoms, mems) {
     let i = 0
     while i < mems.length {
       const m = mems[i]
@@ -8417,8 +8531,8 @@ function emitUnionMapArmBox(
     nullable = true
   }
   const sh = mapShapeOfExpr(exprIx, fnIx)
-  if !unionHasMapArmSlot(unionName, unionTy, sh) { return 0 }
-  const tag = mapBoxTagOf(sh, unionName, unionTy, exprIx, fnIx)
+  if !unionHasMapArmSlot(unionTy, sh) { return 0 }
+  const tag = mapBoxTagOf(sh, unionTy, exprIx, fnIx)
   if tag < 0 { return -1 }
   if nullable { return emitNulMapArmBox(body, tag, exprIx, "", -1, -1, fnIx) }
   fbI32Rel(RS_TAG, tag)
@@ -8473,8 +8587,8 @@ function emitCoalesceMapJoin(
   if un == "" { return 0 }
   const unTy = nodeTyInOf(exprIx, fnIx)
   const sh = mapShapeOfExpr(e.binLeft, fnIx)
-  if !unionHasMapArmSlot(un, unTy, sh) { return 0 }
-  const tag = mapBoxTagOf(sh, un, unTy, e.binLeft, fnIx)
+  if !unionHasMapArmSlot(unTy, sh) { return 0 }
+  const tag = mapBoxTagOf(sh, unTy, e.binLeft, fnIx)
   if tag < 0 { return -1 }
   emitNulMapArmBox(
     body,
@@ -9248,7 +9362,7 @@ function emitUnionCoerceRecord(
   // where the box wants the variant struct. Re-box it against the matched arm
   // (`emitStructExprAsVariantBox`). Gated on the heaps differing, so a deduped shape is raw.
   if unionName != "" && exprStruct(exprIx, fnIx) {
-    const rbVi = unionArmVariantForStructExpr(unionName, uTy, exprIx, fnIx)
+    const rbVi = unionArmVariantForStructExpr(uTy, exprIx, fnIx)
     if rbVi >= 0 {
       const rbSsi = structIndexOfExpr(exprIx, fnIx)
       if rbSsi >= 0 {
@@ -9311,8 +9425,8 @@ function emitUnionCoerceMap(
     // A Set rides its key's mono map slot.
     if mSlot != -3 { mSlot = mapShapeFoldSet(mSlot) }
     if mSlot >= -1 || mSlot == -4 || mSlot == -6 {
-      if unionHasMapArmSlot(unionName, uTy, mSlot) {
-        const mTag = mapBoxTagOf(mSlot, unionName, uTy, exprIx, fnIx)
+      if unionHasMapArmSlot(uTy, mSlot) {
+        const mTag = mapBoxTagOf(mSlot, uTy, exprIx, fnIx)
         if mTag < 0 { return -1 }
         fbI32Rel(RS_TAG, mTag)
         if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
@@ -15144,10 +15258,11 @@ function emitMapGetOrScalarJoin(
       exprIx,
     )
   }
-  let joinSet = unionMemberSetOf(joinN)
-  if joinSet == "" { joinSet = joinN }
   const vb = vbHeapIdxOfKind(ak)
-  if vb < 0 || !unionHasAtomTy(joinSet, scalarAtomNameOfKind(ak), false) {
+  if (
+    vb < 0
+    || !unionTyHasAtom(boxDstTyOf(e.binRight, fnIx), scalarAtomNameOfKind(ak))
+  ) {
     return emitFailAt(
       "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
       exprIx,
@@ -39571,10 +39686,12 @@ function coalNicheBoxTag(
   if ak >= 0 {
     const en = refAtomElemName(ak)
     if en == "" { return -1 }
-    if !unionHasAtomTy(joinSet, en, ak != 2) { return -1 }
+    if !unionTyHasAtom(joinTy, if ak != 2 { en + "[]" } else { en }) {
+      return -1
+    }
     return scalarTagOfKind(ak)
   }
-  const vi = unionArmVariantWithHeap(joinSet, joinTy, heapIx)
+  const vi = unionArmVariantWithHeap(joinTy, heapIx)
   if vi >= 0 && vi < uTags.length { return uTags[vi] }
   -1
 }
@@ -39666,20 +39783,13 @@ function emitUnionBoxNulNiche(
 // nor a resolvable arm of `joinSet` passes RAW through the box coercion, and a bare
 // `(ref $struct)` under a box blocktype is invalid wasm. Only that shape can, so only it is
 // asked; every other default either boxes or takes its own loud reject (D1720).
-function coalJoinDefaultBoxes(
-  joinSet: string,
-  joinTy: i32,
-  defIx: i32,
-  fnIx: i32,
-): boolean {
+function coalJoinDefaultBoxes(joinTy: i32, defIx: i32, fnIx: i32): boolean {
   const d = nodeAt(unwrapParen(defIx))
   if d is ObjLit { return true }
   // A default that is itself a box (a nested join) is already the box rep.
   if exprUnion(defIx, fnIx) { return true }
   if !exprStruct(defIx, fnIx) { return true }
-  if unionArmVariantForStructExpr(joinSet, joinTy, defIx, fnIx) >= 0 {
-    return true
-  }
+  if unionArmVariantForStructExpr(joinTy, defIx, fnIx) >= 0 { return true }
   exprVariantIndex(defIx, fnIx) >= 0
 }
 
@@ -39719,7 +39829,7 @@ function emitCoalesceNulRefJoin(
       exprIx,
     )
   }
-  if !coalJoinDefaultBoxes(joinSet, joinTy, e.binRight, fnIx) {
+  if !coalJoinDefaultBoxes(joinTy, e.binRight, fnIx) {
     return emitFailAt(
       "emitProgram: `??` default names no arm of the union its result is",
       exprIx,
@@ -39764,17 +39874,15 @@ function emitCoalesceNulBoolJoin(
       exprIx,
     )
   }
-  let joinSet = unionMemberSetOf(joinN)
-  if joinSet == "" { joinSet = joinN }
   const joinTy = boxDstTyOf(e.binRight, fnIx)
   const bvb = vbHeapIdxOfKind(1)
-  if bvb < 0 || !unionHasAtomTy(joinSet, "boolean", false) {
+  if bvb < 0 || !unionTyHasAtom(joinTy, "boolean") {
     return emitFailAt(
       "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
       exprIx,
     )
   }
-  if !coalJoinDefaultBoxes(joinSet, joinTy, e.binRight, fnIx) {
+  if !coalJoinDefaultBoxes(joinTy, e.binRight, fnIx) {
     return emitFailAt(
       "emitProgram: `??` default names no arm of the union its result is",
       exprIx,
