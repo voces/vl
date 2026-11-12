@@ -49,7 +49,8 @@ lane H's `variantNestedRow` lookup (#7679).
 | --- | --- |
 | B | `structRowOfSpelling` chain, one site (`emit_nullable_rets.vl:615`): #7687, open |
 | E | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; all in the D6 re-key (E and F co-own; F's step 1a is #7689), with the D6 interner's `nm` input, which `variantNestedRow` and `armFieldStructRowMinted` hand it |
-| G | `unionNameOfCall`; `unionNameOfExpr`'s 7 call sites: 4 in its own producer (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2), `printUnionPlanCode` (#7690), `emitUnionUnionEq` ×2 (lane A) |
+| G | `unionNameOfCall`; `unionNameOfExpr`'s 7 call sites: 4 in its own producer (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2), `printUnionPlanCode` (#7690) |
+| A | `emitUnionUnionEq`'s two `unionNameOfExpr` calls (wasmEmit.vl), queued since #7686 |
 | H | `printUnionPlanCode`'s name fallbacks: #7690, open (24 → 2; the 2 filed as D16060) |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
