@@ -1,8 +1,10 @@
+import { tyIsVariantMember } from "./check_node_tys"
+
 // `emit_field_codes.vl` — the field code a type, value kind or match spelling
 // lowers to, and the shape fields it parses.
 
 import { fnTagTyIsTagged } from "./check_elab_cap"
-import { inferRetNameByNode, inferRetTyIxByNode } from "./check_infer_ret"
+import { inferRetTyIxByNode } from "./check_infer_ret"
 import { isValueUnionTyOr } from "./check_ty_rep"
 import {
   T,
@@ -27,18 +29,12 @@ import {
   tyIsLitUnionArray,
   tySame,
 } from "./check_types"
-import {
-  rowCanonIdOfName,
-  sFieldElemNameAt,
-  sScanLim,
-  structIndexOfTy,
-} from "./emit_atom_kinds"
+import { rowCanonIdOfName, sScanLim, structIndexOfTy } from "./emit_atom_kinds"
 import { nameIsShapeSpanEnds, tyGroupWrapsWhole } from "./emit_base"
 import { recNarrowRecordOf } from "./check_bind_adopt"
 import { rowFieldCode0Kind } from "./emit_join_records"
 import { fieldCodeOfListRep } from "./emit_list_rep"
 import { isStructOfTy, mvValLowersTy } from "./emit_mv_slots"
-import { variantIndexOf } from "./emit_local_slots"
 import {
   MV_ARM_NOHINT,
   repNameCanonId,
@@ -55,8 +51,6 @@ import {
   FC_I64,
   FC_MAP,
   FC_NUL_CLOSURE,
-  FC_NUL_LIT_UNION,
-  FC_NUL_STR,
   FC_REF_LIST,
   FC_STR,
   FC_STRUCT,
@@ -159,45 +153,6 @@ export function declNominalOfTy(ty: i32): string {
   const av = repVariantShapeRowOf(ty)
   if av >= 0 { return uVariants[av] }
   ""
-}
-
-// The declared-row widenings `anonValueFitsField` grants an object literal's field value,
-// asked of a recorded field type instead of a value node. The two sides must agree:
-// `structIndexOfObj` accepts a widening building the row, so the shape resolver must
-// accept the same widening naming it, or a container's element type resolves to no row at all.
-function fieldCodeWidensElem(qc: i32, rc: i32, elem: string): boolean {
-  if qc == rc { return true }
-  // A union-BOX field takes any member — `anonValueFitsField`'s own first line, and the
-  // pairing D461 added to the NAME side of this same question.
-  if rc == FC_UNION { return true }
-  if qc == FC_I32 {
-    // An i32/boolean/litunion-atom value widens into wider numeric slots and the `K | null`
-    // atom niche — not the `boolean | null` niche (21), which needs a boolean literal, a
-    // distinction the code has erased and a type can't recover; not the map slots either.
-    if rc == FC_I64 { return true }
-    if rc == FC_F32 { return true }
-    if rc == FC_NUL_LIT_UNION { return true }
-    return false
-  }
-  if qc == FC_STR {
-    // A string value: the `string | null` ref niche, the `K | null` atom niche, and a
-    // literal-union atom slot (records its union name in the element column).
-    if rc == FC_NUL_STR { return true }
-    if rc == FC_NUL_LIT_UNION { return true }
-    if rc == FC_I32 { return elem != "" }
-    return false
-  }
-  false
-}
-
-// `fieldCodeWidensElem` against a STRUCT row's field.
-export function objFieldCodeWidens(
-  qc: i32,
-  rc: i32,
-  si: i32,
-  fj: i32,
-): boolean {
-  fieldCodeWidensElem(qc, rc, sFieldElemNameAt(si, fj))
 }
 
 // Whether every field a shape spelling writes as `i32` or `boolean` has that same code-0 kind
@@ -505,25 +460,19 @@ function jrSpelledAlike(a: i32, b: i32, depth: i32): boolean {
 // ref list, rather than widening the narrowed receiver back to the box.
 export function cbRetVariantIdx(fe: i32) {
   if fe < 0 || fe >= fnStmts.length { return -1 }
-  const nm = inferRetNameByNode(fnStmts[fe])
-  // The nominal arm on the name, the structural arm on the arena: only the direct name match
-  // asks whether this IS a declared variant, an identity the arena can't recover (B208).
-  let vi = variantIndexOf(nm)
+  const rt = inferRetTyIxByNode(fnStmts[fe])
+  let vi = repVariantShapeRowOf(rt)
   if vi < 0 {
-    const rt = inferRetTyIxByNode(fnStmts[fe])
-    vi = repVariantShapeRowOf(rt)
-    if vi < 0 {
-      const nr = recNarrowRecordOf(rt)
-      if nr >= 0 { vi = repVariantShapeRowOf(nr) }
-    }
+    const nr = recNarrowRecordOf(rt)
+    if nr >= 0 { vi = repVariantShapeRowOf(nr) }
   }
   if vi < 0 { return -1 }
   // A lambda whose inferred return the checker classified as a plain struct must not
   // collapse to a variant merely because its anonymous shape coincides with an unrelated
   // sibling field's union arm: its `$fnsig` result must key the struct token, not the
-  // variant one. A direct nominal variant name is always a genuine collapse and passes through.
+  // variant one. A return typed as a declared arm is always a genuine collapse.
   if fe < fRetKind.length {
-    if variantIndexOf(nm) < 0 {
+    if !tyIsVariantMember(rt) {
       const k = fRetKind[fe]
       if (k == "struct" || k == "nulstruct") && fRetStructIdx[fe] >= 0 {
         return -1
