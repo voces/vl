@@ -1,3 +1,5 @@
+import { rlElemNonNulTyAt } from "./emit_map_value_slots"
+
 // `emit_collect.vl` — the emitter's collection passes: the pre-lowering walks that fill
 // the shared emitter tables (`emit_state.vl`) before any bytes are emitted. Function and
 // global gathering with lambda lifting (`collectFns`), closure signatures, per-function
@@ -210,7 +212,6 @@ import {
   isStructAtom,
   isVariantBoxUnionAtoms,
   listIsTestedIdent,
-  mapNameKeyKind,
   monoAnnHasTyParam,
   nameIsBareMap,
   nameIsClosureArrayTy,
@@ -579,6 +580,7 @@ import { repSigRetTokOfTy, repSlotOfKind } from "./emit_rep_slot"
 import { RS_TAG, relSkew } from "./emit_reloc"
 import {
   anonFieldElemKeyKind,
+  anonFieldElemValTy,
   anonMapFieldDestAdmits,
 } from "./emit_anon_fields"
 import {
@@ -911,6 +913,7 @@ import {
   nulNumScalarUnionRowTy,
   oneListUnionAliasName,
   tyIsValueUnionBox,
+  tyMapKeyKindSpan,
   valueAtomKind,
 } from "./check_ty_rep"
 import { valueUnionRetName } from "./check_ret_names"
@@ -4227,10 +4230,9 @@ function rlMapElemValSlot(slot: i32): i32 {
 // The variant struct heap index of ref-list slot `slot`'s element (`Cat[]` gives the `Cat`
 // variant's `variantHeap`), or -1. One home, so the dedup signature pass and the element-heap pass
 // cannot drift: they are the same question by construction, the sig pass existing to predict the
-// heap pass. The name peel stays because no sweep reaches an arena reading of it.
+// heap pass. Read off the element's type: an arm and its same-shape twins share one heap.
 function rlElemVariantHeap(slot: i32): i32 {
-  const rsen = nonNulBaseOf(rlElemName[slot])
-  const evi = variantIndexOf(rsen)
+  const evi = repVariantShapeRowOf(rlElemNonNulTyAt(slot))
   if evi < 0 { return -1 }
   variantHeap(evi)
 }
@@ -5026,7 +5028,7 @@ function collectFrameMapCtor(ix: i32, fnIx: i32) {
   const t = mapCtorOpenInstTy(ix, fnIx)
   if t < 0 { return 0 }
   const m = tyMapHeld(t)
-  mvShapeOfMapHeldTy("", m, tyMapValOf(m), tyMapValOf(m))
+  mvShapeOfMapHeldTy(m, tyMapValOf(m), tyMapValOf(m))
   0
 }
 
@@ -5058,20 +5060,18 @@ function collectHoleElemListPair(elemIx: i32, fnIx: i32) {
 }
 
 // The row a list-of-lists literal's element keys only in its own frame (`arrLitFrameLeafRow`),
-// minted with its leaf list pair: the frameless walk keyed the template's `i32[]` (D3115).
+// keyed by the lead inner literal's type in that frame and minted with its leaf list pair: the
+// frameless walk keyed the template's `i32[]` (D3115).
 function collectFrameLeafRow(ix: i32, fnIx: i32) {
   const pn = arrLitFrameLeafRow(ix, fnIx)
-  if pn == "" || rlSlotByName(pn) >= 0 { return 0 }
+  if pn == "" || ix < 0 || ix >= P.nodes.length { return 0 }
+  const a = nodeAt(ix)
+  if !(a is ArrayLit) { return 0 }
+  const e = litRepTyAt(arrLitLeadInner(a), fnIx)
+  if e < 0 || rlSlotOfTy(e) >= 0 { return 0 }
   if arrLitElemName(ix, fnIx) != "i32[]" { return 0 }
-  let k = RLK_STR_LIST
-  if pn == "f64[]" {
-    k = RLK_F64_LIST
-    // The f64 pair mints on first read (`fa64Ty`).
-  } else if pn == "i64[]" {
-    k = RLK_I64_LIST
-    // The i64 pair mints on first read (`ia64Ty`).
-  }
-  rlInternNameTy(pn, k, -1)
+  // The f64 and i64 pairs mint on first read (`fa64Ty`, `ia64Ty`).
+  rlInternNameTy(pn, refListElemKindOfTy(e), e)
   0
 }
 
@@ -5481,22 +5481,12 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     // `TypeRef`, so the type-index assignment sees the full slot set. An orphaned parser field
     // (no type) mints nothing: the field-table passes mint from its owner.
     if nodeTyIxOf(i) >= 0 {
-      mvShapeOfMapHeldTy(
-        nd.tyName,
-        nodeTyIxOf(i),
-        nodeMapValTyIx(i),
-        nodeMapValTyIx(i),
-      )
+      mvShapeOfMapHeldTy(nodeTyIxOf(i), nodeMapValTyIx(i), nodeMapValTyIx(i))
     }
   } else if nulMapInnerName(nd.tyName) != "" {
     // A nullable map annotation collects what its non-null inner map does.
     if nodeTyIxOf(i) >= 0 {
-      mvShapeOfMapHeldTy(
-        nulMapInnerName(nd.tyName),
-        nodeTyIxOf(i),
-        -1,
-        nodeMapValTyIx(i),
-      )
+      mvShapeOfMapHeldTy(nodeTyIxOf(i), -1, nodeMapValTyIx(i))
     }
   } else if !annArrayRungsSkip(i, nd) {
     if annTyIsRefList(i, nd) {
@@ -5651,7 +5641,7 @@ function collectAHeldRep(i: i32): i32 {
   const hv = if hr >= 0 && hr < T.tys.length && tyAt(hr) is TyMap { tyMapValOf(hr) } else { -1 }
   if hv >= 0 && tyAt(hv) is TyObj {
     internShapeDeepOfTy(hv)
-    mvShapeOfMapHeldTy("", hr, hv, hv)
+    mvShapeOfMapHeldTy(hr, hv, hv)
   }
   // A list held so as a list of flat records is read at that rep too: the element's row and
   // the list's ref-list slot (D15552). A nested element's rows are minted where it is built.
@@ -6453,7 +6443,7 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         const er = if code == FC_STRUCT { anonFieldStructRow(f.fiValue) } else { -1 }
         // A ref-list field led by a record literal keeps that literal's row, and so its type.
         elemRowTys.push(
-          if er >= 0 && er < sTyIx.length { sTyIx[er] } else if code == FC_REF_LIST { anonRefListLitElemTy(f.fiValue) } else { -1 },
+          if er >= 0 && er < sTyIx.length { sTyIx[er] } else if code == FC_REF_LIST { anonRefListLitElemTy(f.fiValue) } else { anonFieldElemValTy(f.fiValue, code) },
         )
         if er >= 0 {
           elemNames.push(sNames[er])
@@ -7133,7 +7123,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       true,
       fc,
       shapeFieldElemName(ftxt, fc, fldTy),
-      mapNameKeyKind(ftxt),
+      tyMapKeyKindSpan(fldTy),
       fnames[fi],
       variantFieldIdText(ftxt, fldTy),
       -1,
