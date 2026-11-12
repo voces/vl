@@ -93,7 +93,8 @@ A view-rep storage receives:
 1. Implicit or spelled? Should a `Pos` slot silently become a view, with a hidden indirection
    on every access, or should the source spell it (`view Pos`, or a `readonly` record)? A
    spelled view makes the cost visible. An implicit one makes the 17 cells run as written.
-2. `is` narrowing from a view back to its concrete record: allowed, or out of scope?
+2. `is` narrowing from a view back to its concrete record: **ruled out of scope by the owner,
+   2026-11-12.** A view is not narrowed back; the first PR refuses `is` on a view by name.
 3. Equality: identity of the underlying record, as above, or refuse `==` on views?
 
 ## Estimated PR sequence
