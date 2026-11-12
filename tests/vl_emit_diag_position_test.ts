@@ -150,18 +150,19 @@ Deno.test({
   },
 });
 
-// A refusal raised while a hole parameter's instance is lowered (D15315, a nested shared field
-// read off a union of records through an un-annotated parameter): the instance's body is rebuilt into nodes minted
-// after parsing, and the anchor is the line they were rebuilt from, line 7 inside `take`, in the
-// module that declares it (D15155, D15157). The last shape reaches the instance through a generic.
-const INSTANCE_WITNESS = `type K = { h: { f: i32 } }
-type J = { h: { f: i32, g: i32 } }
-const k: K = { h: { f: 4 } }
-const u: K | J = k
+// A refusal raised while a hole parameter's instance is lowered (D1680, a standalone `?.` whose
+// leaf field is a map, inside an un-annotated parameter's body): the instance's body is rebuilt
+// into nodes minted after parsing, and the anchor is the line they were rebuilt from, line 7
+// inside `take`, in the module that declares it (D15155, D15157). The last shape reaches the
+// instance through a generic.
+const INSTANCE_WITNESS = `type R = { m: {[string]: i32} }
+const mm: {[string]: i32} = Map()
+const u: R | null = { m: mm }
+const two = 2
 function take(a) {
   print(1)
-  const n = a.h.f
-  print(n)
+  const n = a?.m
+  print(two)
 }
 `;
 
@@ -212,7 +213,7 @@ Deno.test({
         if (!r.out.includes("emit error")) {
           throw new Error(
             `${s.name}: the instance witness no longer reaches an emit refusal, so this guard ` +
-              `is measuring nothing — replace INSTANCE_WITNESS (D15315 closed?).\n${r.out}`,
+              `is measuring nothing — replace INSTANCE_WITNESS (D1680 closed?).\n${r.out}`,
           );
         }
         const blk = errorBlock(r.out);
