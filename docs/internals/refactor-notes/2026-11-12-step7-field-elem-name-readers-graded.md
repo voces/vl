@@ -159,6 +159,20 @@ the field's type:
 A shadow beside each read, over 24,061 programs, agreed everywhere except one E32 row,
 `layout-family-literal-set-beside-string`. There the stored name marked an atom and the type did
 not. That program builds different bytes and prints the same.
+## The row lookups, graded
+
+- **Deleted.** `leqNoteVariantFields` and `leqNoteStructRowFields` (E14, E15) tested the name inside
+  a branch already narrowed to a ref-list field. A probe found the name set in every reach (2 and
+  13 programs), so the test is gone.
+- **Converted.** `eqgFieldRefSlot` (E19) asks whether the field's slot is a ref list; the shadow
+  agreed in 4 of 4.
+- **Floors: the walk's typeless class.** `variantNestedRow` (E56) and `armFieldStructRowMinted`
+  (E16) intern a nested row under the field's spelling. `sFieldRefSlot` (E36, E37) mints a ref list
+  by name only for an element whose type is a type variable or is unrecorded. All three go when the
+  shape walk hands those fields a type.
+- **Converted after its own shadow.** `variantFieldElemNameOr`'s caller (E20, the value-site
+  ref-list read of an arm receiver's field) asks the field's slot table. The shadow agreed in 2
+  of 2. `variantFieldElemNameOr` then had no caller and is deleted.
 
 ## Order
 
