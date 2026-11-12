@@ -11,11 +11,11 @@
 // that printed it for every program, so the controls below assert that a VALID module is
 // unchanged: rc 0, no banner, and the program's own output.
 //
-// THE WITNESS MUST STILL BE INVALID. This is D2660's generic bound from a list and a hole, and
-// it is check-clean invalid wasm on the current seed.
-// When D2660 is fixed this suite goes RED at the "still invalid"
-// assertion rather than silently measuring nothing; the replacement is any other
-// check-clean invalid-wasm program (`scripts/goal-scoreboard.vl` names the population).
+// THE WITNESS IS FAULT-INJECTED. `$VL_FAULT_INJECT=corrupt-validate-bytes` corrupts the first
+// function body between emission and validation, so the engine's real validator refuses real
+// emitted bytes and only the reason they are bad is synthetic. A live miscompile served until the
+// last check-clean invalid program in reach was closed (D2660, then D15927), which is the goal;
+// tests/vl_check_codegen_test.ts gives the rest of the argument.
 //
 // GATING: `SELFHOST_NATIVE_ALIGN=1` plus the built binary and seed, as vl_check_dir_test.ts.
 //
@@ -33,25 +33,19 @@ if (GATED && !ENABLED) {
 const EXIT_COMPILER_BUG = 70;
 const BUG_LINE = "this is a bug in vl, not in your program";
 
-// D2660's generic bound from a list and a hole (D15042's, D1471's, D1413's, D1887's and then
-// D15040's witness served until those rows closed or refused): `vl check` rc 0, and the engine
-// refuses the module. The failing function, `main`, is declared on line 2,
-// so the position this suite asserts names its NAME token: `2:10`, ONE literal for all three channels. The host used to
-// print `2:9` here — the guest's raw 0-based column — while the CLI pump shifted to 1-based,
-// so one diagnostic reached two columns depending on which command found it. `cli-design.md`
-// makes the output 1-based ("`col` (1-based, inclusive)"); the host shifts too now.
+// A valid program whose first function body is `main`, declared on line 2, so the position this
+// suite asserts names its NAME token: `2:10`, ONE literal for all three channels. The host used to
+// print a column one short here — the guest's raw 0-based column — while the CLI pump shifted to
+// 1-based, so one diagnostic reached two columns depending on which command found it.
+// `cli-design.md` makes the output 1-based ("`col` (1-based, inclusive)"); the host shifts too now.
 const WANT_AT = "take.vl:2:10";
-const INVALID = `function link2<T>(xs: T[], v: T) { xs.push(v) }
+const INVALID = `const n = 6
 function main() {
-  const xs: (string | null)[] = []
-  let x = null
-  link2(xs, x)
-  x = 5
-  xs.push("s")
-  print(xs.length)
+  print(n * 7)
 }
 main()
 `;
+const FAULT = { VL_FAULT_INJECT: "corrupt-validate-bytes" };
 
 const VALID = `print(6 * 7)\n`;
 
@@ -120,15 +114,13 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir({ "take.vl": INVALID }, async (dir) => {
-      // The premise: `vl check` (no --codegen) still passes, so this really is the
-      // check-clean half of a clause-1 miscompile and not a type error.
-      const chk = await run(["check", "take.vl"], dir);
-      if (chk.code !== 0) {
-        throw new Error(
-          `the witness no longer check-cleans (D15042 fixed?) — replace it: ${chk.out}`,
-        );
+      // The control: uninjected, the same source checks, runs and prints its answer, so the
+      // injected runs below are what make the module invalid.
+      const ok = await run(["run", "take.vl"], dir);
+      if (ok.code !== 0 || ok.out.trim() !== "42") {
+        throw new Error(`the control must run clean, got ${ok.code}: ${JSON.stringify(ok.out)}`);
       }
-      const r = await run(["check", "--codegen", "take.vl"], dir);
+      const r = await run(["check", "--codegen", "take.vl"], dir, FAULT);
       assertLocated("check --codegen", WANT_AT, r.code, r.out);
     });
   },
@@ -139,7 +131,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir({ "take.vl": INVALID }, async (dir) => {
-      const r = await run(["run", "take.vl"], dir);
+      const r = await run(["run", "take.vl"], dir, FAULT);
       assertLocated("run", `${WANT_AT}:`, r.code, r.out);
     });
   },
@@ -150,7 +142,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir({ "take.vl": INVALID }, async (dir) => {
-      const r = await run(["build", "take.vl", "-o", "take.wasm"], dir);
+      const r = await run(["build", "take.vl", "-o", "take.wasm"], dir, FAULT);
       assertLocated("build", `${WANT_AT}:`, r.code, r.out);
     });
   },
@@ -163,9 +155,8 @@ Deno.test({
 // span row at all, so it printed the bare offset and nothing else. That is the second
 // report from the same consumer (VL-042): `at offset 39223`, no function, no position.
 //
-// The witness is FAULT-INJECTED rather than a live miscompile, for the reason
-// tests/vl_check_codegen_test.ts gives at length: a test that must name a live defect
-// gets re-pointed every time one is fixed. `$VL_FAULT_INJECT=corrupt-start-fn-body`
+// The witness is fault-injected too, by the other fault:
+// `$VL_FAULT_INJECT=corrupt-start-fn-body`
 // corrupts the start function's body past its locals vector, so the engine's real
 // validator refuses real emitted bytes and only the REASON they are bad is synthetic.
 const START_FN_SRC = `function id(n: i32): i32 {
@@ -174,9 +165,8 @@ const START_FN_SRC = `function id(n: i32): i32 {
 print(id(41) + 1)
 `;
 
-// The seam is in `vl build` only, and `vl run` is covered anyway: both render through
-// the same `locate_invalid_module`, and the live-witness tests above already drive that
-// function on the run channel. One seam is the smaller test-only surface.
+// Driven through `vl build` only, and `vl run` is covered anyway: both render through the same
+// `locate_invalid_module`, and the tests above already drive that function on the run channel.
 Deno.test({
   name: "vl build positions an invalid module inside the module's top-level code",
   ignore: !ENABLED,
