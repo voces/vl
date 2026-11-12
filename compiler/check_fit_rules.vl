@@ -5336,12 +5336,79 @@ export function recAdoptUnionList(
   true
 }
 
+// Whether a list of records `oe` is copied element by element into a list of the record `de`: a
+// record stored apart, under the copy's rule, or a union of records whose every arm is.
+export function recListElemRecCopies(oe: i32, de: i32): boolean {
+  if oe < 0 || de < 0 || oe >= T.tys.length || de >= T.tys.length {
+    return false
+  }
+  if !(tyAt(de) is TyObj) { return false }
+  const o = tyAt(oe)
+  if o is TyObj {
+    return !fieldStorageEq(oe, de, REC_STORE_DEPTH) && recCopyBoxesOnly(oe, de)
+  }
+  if o is TyUnion {
+    if o.uMembers.length == 0 { return false }
+    for m in o.uMembers {
+      if m < 0 || m >= T.tys.length || !(tyAt(m) is TyObj) { return false }
+      if !recCopyBoxesOnly(m, de) { return false }
+    }
+    return true
+  }
+  recListElemNotRecs(oe)
+}
+
+// A list element that is neither a record nor a union of them is not copied as records.
+function recListElemNotRecs(_oe: i32): boolean { false }
+
 // Whether the record `dst` stores each field of the record `src` as `src` does, or a scalar field
 // as that scalar or `null`, a number it widens to exactly or `null`, or a union listing that
 // scalar: the fields a record copy boxes.
 export function recCopyBoxesOnly(src: i32, dst: i32): boolean {
   recCopyBoxesAt(src, dst, REC_STORE_DEPTH)
 }
+
+// Whether a list's element `se` is copied into the element `de` of a list the copy builds: a
+// number widened exactly, a scalar boxed, a record (or a union of records, arm by arm) under the
+// copy's rule, or a list whose element is, at most `depth` levels down.
+function recListElemCopies(se: i32, de: i32, depth: i32): boolean {
+  if (
+    se < 0
+    || de < 0
+    || se >= T.tys.length
+    || de >= T.tys.length
+    || depth <= 1
+  ) {
+    return false
+  }
+  if recNumWidens(se, de) { return true }
+  const s = tyAt(se)
+  const d = tyAt(de)
+  // A scalar is boxed into a `| null` holding it, or a number it widens to, or a union listing it.
+  if s is TyPrim && d is TyNullable {
+    return tySame(d.nInner, se) || recNumWidens(se, d.nInner)
+  }
+  if s is TyPrim && d is TyUnion { return recUnionHasMember(de, se) }
+  if s is TyObj { return recCopyBoxesAt(se, de, depth - 1) }
+  // A union of records is copied arm by arm into the one record.
+  if s is TyUnion && d is TyObj && s.uMembers.length > 0 {
+    for m in s.uMembers {
+      if m < 0 || m >= T.tys.length || !(tyAt(m) is TyObj) { return false }
+      if !recCopyBoxesAt(m, de, depth - 1) { return false }
+    }
+    return true
+  }
+  if s is TyArray && d is TyArray {
+    return fieldStorageEq(s.aElem, d.aElem, REC_STORE_DEPTH)
+      || recListElemCopies(s.aElem, d.aElem, depth - 1)
+  }
+  recListElemNoCopy(se, de)
+}
+
+// An element that is neither a scalar the copy widens or boxes, a record, a union of records nor a
+// list is not copied: a `| null`, map, function or type variable source element is delivered as
+// it is stored.
+function recListElemNoCopy(_se: i32, _de: i32): boolean { false }
 
 // `recCopyBoxesOnly` with at most `depth` levels of record fields left.
 function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
@@ -5367,12 +5434,7 @@ function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
     // A list of numbers is copied element by element into a list of a number they widen to.
     const lists = sp is TyArray
       && dn is TyArray
-      && (recNumWidens(sp.aElem, dn.aElem)
-      || depth > 1
-      && sp.aElem >= 0
-      && sp.aElem < T.tys.length
-      && tyAt(sp.aElem) is TyObj
-      && recCopyBoxesAt(sp.aElem, dn.aElem, depth - 1))
+      && recListElemCopies(sp.aElem, dn.aElem, depth)
     // A number is converted exactly into a wider one.
     const widens = sp is TyPrim && recNumWidens(sf, df)
     // A nested record is copied by the level below, under the same rule, into a record or a
@@ -5384,12 +5446,16 @@ function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
       && tyAt(dr) is TyObj
       && depth > 1
       && recCopyBoxesAt(sf, dr, depth - 1)
+    // A record is copied into the one member of a union of records that has its field names.
+    const um = if sp is TyObj && dn is TyUnion && depth > 1 { recUnionRecMember(sf, df) } else { -1 }
+    const members = um >= 0 && recCopyBoxesAt(sf, um, depth - 1)
     if (
       sf < 0
       || !(boxes
         || widens
         || lists
         || nests
+        || members
         || fieldStorageEq(sf, df, REC_STORE_DEPTH))
     ) {
       return false
@@ -5411,6 +5477,32 @@ function recNumWidens(src: i32, dst: i32): boolean {
 const NUM_WIDENS = ["i32>i64", "i32>f64", "i64>f64", "f32>f64"]
 
 // Whether the union `u` lists `m` as a member.
+// The one record member of the union `u` whose field names are the record `s`'s, or -1 where
+// none or two are.
+export function recUnionRecMember(s: i32, u: i32): i32 {
+  const st = tyAt(s)
+  const ut = tyAt(u)
+  if !(st is TyObj) || !(ut is TyUnion) { return -1 }
+  let found = -1
+  for m in ut.uMembers {
+    const mt = if m >= 0 && m < T.tys.length { tyAt(m) } else { null }
+    if mt is TyObj && recSameNames(mt.objFieldNames, st.objFieldNames) {
+      if found >= 0 { return -1 }
+      found = m
+    }
+  }
+  found
+}
+
+// Whether two records' field-name lists hold the same names.
+function recSameNames(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  for n in a {
+    if !strListHas(b, n) { return false }
+  }
+  true
+}
+
 function recUnionHasMember(u: i32, m: i32): boolean {
   const ut = tyAt(u)
   if !(ut is TyUnion) { return false }
@@ -5492,14 +5584,7 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   const da = tyAt(dst)
   // A list of records is copied element by element under the same rule.
   if oa is TyArray && da is TyArray {
-    const oe = oa.aElem
-    const de = da.aElem
-    if oe < 0 || de < 0 || !(tyAt(oe) is TyObj) || !(tyAt(de) is TyObj) {
-      return false
-    }
-    if fieldStorageEq(oe, de, REC_STORE_DEPTH) || !recCopyBoxesOnly(oe, de) {
-      return false
-    }
+    if !recListElemRecCopies(oa.aElem, da.aElem) { return false }
     while listCopyTyIx.length <= p { listCopyTyIx.push(-1) }
     listCopyTyIx[p] = dst
     listRecCopyNote()
@@ -5659,15 +5744,6 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       return 0
     }
     if fd >= 0 {
-      // A union member has no adoption of a call result, so one built at a declared row is
-      // refused there (D8141).
-      if (
-        recLandingOf(srcTy, dstTy) != nonNulTyOf(dstTy)
-        && recBuildsLit(fd, 8)
-        && recBuiltAtDeclared(p, srcTy, dstTy)
-      ) {
-        return 0
-      }
       if recFreshCallCopy(fd, p, srcTy, dstTy) { return 0 }
       if recFnBuiltAtDst(fd, p, srcTy, dstTy) {
         // A union of records built at the one record keeps its result typed as the union and

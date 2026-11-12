@@ -9964,6 +9964,16 @@ record (or list of records) member of those field names, as the annotated twin
   destination would be adopting the function's result.
 * **The re-check is undone** when it refuses anything but the adopted binding handed on whole,
   for an adoption that changes no number's width or kind.
+* **A destination that merges two of a field's own numbers blocks it** (owner ruling, 2026-11-12,
+  D12462). Where the re-check is undone and the binding keeps its own type while it is built at
+  the destination, the delivery is refused when the destination stores two of a union field's own
+  numbers as one member: once delivered, the binding is one record with two views, and the
+  own-type view cannot tell them apart (D3011's refusal, `recAdMergeRefuse`). Two numbers merge
+  when they land on one destination class, whether one of them is held there (`i32 | f64` into
+  `f64`) or neither is (`i32 | f32` into `f64`). Keeping the own member's tag inside the wider box
+  was rejected: it changes the rep every reader of the destination sees, to serve a spelling whose
+  neighbours (one numeric member, an annotation, a second literal) already run. Writes through the
+  destination need no condition of their own: D2060 refuses a widened write.
 
 Where master built invalid wasm for a delivery the checker neither adopts nor refuses as
 existing, it refuses instead, with the existing-record wording: a record a function called at
