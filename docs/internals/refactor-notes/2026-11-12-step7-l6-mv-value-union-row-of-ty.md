@@ -9,6 +9,12 @@ kindTy)` first and takes that row's name for the slot. The spelling's row, and t
 The base is master `cae0121e`, with a fixpoint seed on both sides. The population is the whole
 sweep, 23,966 programs.
 
+`unionRowOfAB` has no other caller, so it is deleted.
+
+In `maps/recursive-alias-declared-first.vl`, the program behind most of the floor's hits, all
+759 reaches of site 53 are answered by the type's row. None falls back to the spelling, and none
+is untyped.
+
 ## Movers
 
 #7261's trial of this switch moved 70 programs. This one moves 15, and every one is bytes-only:
