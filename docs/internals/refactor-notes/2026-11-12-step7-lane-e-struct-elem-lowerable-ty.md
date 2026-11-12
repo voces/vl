@@ -1,4 +1,4 @@
-# Step 7 L2: a closure-result list field's element is judged by its type ; five emit_base predicates deleted with their last callers, 2026-11-12
+# Step 7 L2: a closure-result list field's element is judged by its type; five emit_base predicates deleted with their last callers, 2026-11-12
 
 Lane E, cut E3. `structElemArrayLowerable(t, ty)` (`emit_shape_intern`) decides whether a ref-list
 field of a closure-result record lowers: is the element a declared plain struct, or an inline
