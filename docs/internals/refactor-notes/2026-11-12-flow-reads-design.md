@@ -150,8 +150,8 @@ is in the matrix from the first PR.
 - the straight line, D2660, an `if` join, the loop soundness probe (`-1` then `5`) and a bound
   copy run;
 - the capture called after the write is refused by the capture re-check;
-- the callback-with-a-later-write cell is still invalid wasm, as on master. It is filed as
-  D15951.
+- the callback-with-a-later-write cell was invalid wasm under this face. It is filed as D15951
+  and fixed in the same PR (`2026-11-12-d15951-cell-read-null-delivery.md`).
 
 **Census:**
 - inventory witnesses (`sweep.vl record --population inventory`), master against the candidate:
