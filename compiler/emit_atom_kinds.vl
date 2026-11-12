@@ -1,3 +1,5 @@
+import { fnTagSetOfTy } from "./check_elab_cap"
+
 // `emit_atom_kinds.vl` — which value-atom kind a type, list element or declared row
 // field lowers as, and whether a declared row's scalar fields fit an instance.
 
@@ -81,7 +83,6 @@ import {
 import {
   RepDesc,
   fieldStorageKindOf,
-  repCanonId,
   repRowId,
   repRowOfTyStruct,
   rowStoreRepIn,
@@ -117,6 +118,7 @@ import {
   sAnonOwnTy,
   sFieldCount,
   sFieldElemName,
+  sFieldElemTyIx,
   sFieldNames,
   sFieldStart,
   sFieldStoreTy,
@@ -795,8 +797,74 @@ function sRowOwnTy(r: i32): i32 {
   if own >= 0 { own } else { sTyIx[r] }
 }
 
+// Whether flat field slots `fa` and `fb` store one element: one type carrying one function set
+// at each function position, since the set decides storage and `tySame` does not compare it. A
+// slot with no recorded element type answers by its element name.
+function sRowElemRepSame(fa: i32, fb: i32): boolean {
+  const ta = if fa < sFieldElemTyIx.length { sFieldElemTyIx[fa] } else { -1 }
+  const tb = if fb < sFieldElemTyIx.length { sFieldElemTyIx[fb] } else { -1 }
+  if ta < 0 || tb < 0 { return sFieldElemName[fa] == sFieldElemName[fb] }
+  if ta == tb { return true }
+  tySame(ta, tb) && fnSetsAgree(ta, tb, 8)
+}
+
+// Whether types `a` and `b` carry the same function set at every function position they share:
+// through list elements, a nullable's inner type, a map's values, a record's fields and a
+// union's members.
+function fnSetsAgree(a: i32, b: i32, depth: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 || depth <= 0 { return a == b }
+  if fnTagSetOfTy(a) != fnTagSetOfTy(b) { return false }
+  const xs: i32[] = []
+  const ys: i32[] = []
+  if fnSetParts(a, xs) != fnSetParts(b, ys) { return true }
+  fnSetsAgreeAll(xs, ys, depth)
+}
+
+// The parts of type `t` a function set can sit in, pushed onto `out`, and a code for its
+// container kind (0 for a leaf). Exhaustive and `_`-less.
+function fnSetParts(t: i32, out: i32[]): i32 {
+  const x = tyAt(t)
+  match x {
+    TyArray => {
+      out.push(x.aElem)
+      return 1
+    }
+    TyNullable => {
+      out.push(x.nInner)
+      return 2
+    }
+    TyMap => {
+      out.push(x.mVal)
+      return 3
+    }
+    TyObj => {
+      for f in x.objFieldTypes { out.push(f) }
+      return 4
+    }
+    TyUnion => {
+      for m in x.uMembers { out.push(m) }
+      return 5
+    }
+    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {
+      return 0
+    }
+  }
+}
+
+// `fnSetsAgree` of two part lists in step; parts that differ in number do not agree.
+function fnSetsAgreeAll(xs: i32[], ys: i32[], depth: i32): boolean {
+  if xs.length != ys.length { return false }
+  let k = 0
+  while k < xs.length {
+    if !fnSetsAgree(xs[k], ys[k], depth - 1) { return false }
+    k = k + 1
+  }
+  true
+}
+
 // Whether rows `i` and `j` hold one canonical record type at one layout: field names in order,
-// codes and element names.
+// codes and element types.
 export function sRowsTwin(i: i32, j: i32): boolean {
   if sFieldCount[i] != sFieldCount[j] { return false }
   const a = sRowOwnTy(i)
@@ -808,9 +876,7 @@ export function sRowsTwin(i: i32, j: i32): boolean {
     const fb = sFieldStart[j] + k
     if sFieldNames[fa] != sFieldNames[fb] { return false }
     if sFieldTypeAt(i, k) != sFieldTypeAt(j, k) { return false }
-    // The element name, not its type: a list of function ids and a list of closures hold one
-    // element type at two storages, and only the name records which.
-    if sFieldElemName[fa] != sFieldElemName[fb] { return false }
+    if !sRowElemRepSame(fa, fb) { return false }
     k = k + 1
   }
   tySame(a, b)
@@ -1218,15 +1284,6 @@ export function listGetStagesOperand(ix: i32): boolean {
   if !optRecvReReadable(callee.memObj) { return true }
   if c.callArgs.length != 1 { return false }
   !listGetIdxReReadable(c.callArgs[0])
-}
-
-// The canonical identity of the struct row named `name` from the type it recorded, or -1.
-export function rowCanonIdOfName(name: string): i32 {
-  const si = structIndexByName(name)
-  if si < 0 || si >= sTyIx.length { return -1 }
-  const ty = sTyIx[si]
-  if ty < 0 || tyHasTyVar(ty) { return -1 }
-  repCanonId(ty)
 }
 
 // The wasm-type code (`0` i32, `3` string) of variant `vi`'s field at field index `fi`.
