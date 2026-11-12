@@ -14,7 +14,7 @@ import {
 import { primTyIxOfName } from "./check_decl_scan"
 import { nominalNameOfObj } from "./check_fit_rules"
 import { canonUnionMemberTysOf, canonUnionMembersInto } from "./check_program"
-import { canonUnionKeyAtomOfTy, mapTwinUnionMember } from "./check_ty_rep"
+import { mapTwinUnionMember } from "./check_ty_rep"
 import {
   RC_NULLABLE,
   RC_ROOT,
@@ -74,7 +74,6 @@ import {
   tyIsI32LeafElem,
   tyIsStrLeafElem,
   unMemRowStart,
-  unRowOfKeyId,
   unRowOfSoftKey,
 } from "./emit_rep"
 export { unRowOfCanonFolded } from "./emit_rep"
@@ -191,6 +190,16 @@ function unRowAtomsInto(u: i32, out: string[]) {
     i = i + 1
   }
   0
+}
+
+// Appends row `u`'s recorded member atoms to `out`, in box-tag order; false, appending nothing,
+// when `u` has no recorded member slice.
+export function unionMemberAtomsOfRow(u: i32, out: string[]): boolean {
+  if u < 0 || u >= unMemTyStart.length { return false }
+  const st = unMemTyStart[u]
+  if st < 0 || st + unMemTyCount[u] > unMemAtoms.length { return false }
+  unRowAtomsInto(u, out)
+  true
 }
 
 // Appends the member atoms of `name` to `out`, in box-tag order: a bound row's recorded
@@ -531,14 +540,11 @@ function unRowNullLast(u: i32): boolean {
   true
 }
 
-// The `unNames` ROW of the union `name` — matched on the alias NAME, else on the union key of
-// the member set it spells (a consumer that already resolved the alias hands us the set), or
-// -1. The name is asked first: a spelling that is one row's name keeps naming that row.
+// The `unNames` ROW the union spelling `name` is bound to, or -1. A member-set spelling no row is
+// bound to finds none here; a caller holding the union's type asks the row it keys to.
 export function unionRowOf(name: string): i32 {
   if name == "" { return -1 }
-  const u = unRowOfName(name)
-  if u >= 0 { return u }
-  unRowOfSetText(name)
+  unRowOfName(name)
 }
 
 // The softened key text of `ty`: its emit render's member sequence, literals widened (an integer
@@ -788,14 +794,6 @@ function sukUnionAtoms(
   }
   for a in partAtoms { out.push(a) }
   true
-}
-
-// The first row carrying the union key of member-set spelling `set`, or -1. A spelling that
-// names a declared type is that type's name, not a member set, and finds no row here.
-export function unRowOfSetText(set: string): i32 {
-  if set == "" { return -1 }
-  if (cUserTypes[set] ?? -1) >= 0 { return -1 }
-  unRowOfKeyId(canonUnionKeyOfName(set))
 }
 
 // Armed, the softened key text of `ty` against the key text of `name` at `site`: agree,
@@ -1065,25 +1063,17 @@ export function unSiteOnKey(site: i32): boolean {
 }
 
 // The sites whose typed lookup reads the canonical type key (`unTyKey`): all but 55, which keys
-// on `repCanonId`, and the two `let` readers (27, 28), whose one-list collapse is a rep question
-// decided before any row exists (D4320). Where the key parts from the softened one, it is a
-// literal set's own row, not the first set's that softens alike.
+// on `repCanonId`. Where the key parts from the softened one, it is a literal set's own row, not
+// the first set's that softens alike.
 function unSiteOnTyKey(site: i32): boolean {
-  site >= 1 && site < UNAB_N && site != 27 && site != 28 && site != 55
+  site >= 1 && site < UNAB_N && site != 55
 }
 
 // The ID side's row for `site`: the canonical type key's (`unSiteOnTyKey`), else the softened
-// key's (`unKey`) for 27, 28 and harness mode 3, else `repCanonId`'s. Only the A/B seams route
-// through here.
+// key's (`unKey`) for harness mode 3, else `repCanonId`'s. Only the A/B seams route through here.
 export function unRowOfTyAB(site: i32, ty: i32): i32 {
   if unSiteOnTyKey(site) { return unRowOfTyKey(ty) }
-  if unABMode == 3 || unSiteOnKey(site) {
-    // The softened key keeps the one-list collapse; its render keeps member order, so a set
-    // spelled in another order (D1712) is found by its type key instead.
-    const sr = unRowOfSoftKey(ty)
-    if sr >= 0 { return sr }
-    return unRowOfTyKey(ty)
-  }
+  if unABMode == 3 || unSiteOnKey(site) { return unRowOfSoftKey(ty) }
   unionRowOfTy(ty)
 }
 
@@ -1104,7 +1094,7 @@ export function isUNameAB(site: i32, name: string, ty: i32): boolean {
   if ty >= 0 { d = unRowOfTyAB(site, ty) }
   if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, ty) }
   if ty < 0 { return false }
-  d >= 0 || unSiteWideHit(site, ty) || unRowOfCanonMembers(ty) >= 0
+  d >= 0 || unSiteWideHit(site, ty)
 }
 
 // Whether union row `r` is the only row of its member multiset (`unTyKey`): every spelling of
@@ -1122,67 +1112,9 @@ export function unRowSoleOfMembers(r: i32): boolean {
 // that row is the only one of its member set, else the row's stored name.
 export function rlElemUnionName(slot: i32): string {
   if slot < 0 || slot >= rlElemName.length { return "" }
-  const r = unRowOfKeyOrMembers(rlElemTyIxAt(slot))
+  const r = unRowOfTyKey(rlElemTyIxAt(slot))
   if r >= 0 && r < unNames.length && unRowSoleOfMembers(r) { return unNames[r] }
   rlElemName[slot]
-}
-
-// The row union `ty`'s key finds, else the row its canonical member sequence finds, or -1: the
-// rows a typed site on the key answers yes about in `isUNameAB`.
-export function unRowOfKeyOrMembers(ty: i32): i32 {
-  const k = unRowOfTyKey(ty)
-  if k >= 0 { return k }
-  unRowOfCanonMembers(ty)
-}
-
-// The row keyed by the sequence of union `ty`'s canonical members, or -1: the spelling canon
-// gives the type, which its own nominal key misses when it nests a union (`K | (L | i32)`
-// keys apart from the `string | i32` row its canon spelling minted). A repeated member declines,
-// since a positional member set (`i32 | string | string`) is never folded onto a deduplicated row.
-function unRowOfCanonMembers(ty: i32): i32 {
-  if !tyNestsValueUnion(ty) { return -1 }
-  const tys: i32[] = []
-  if !canonUnionMemberTysOf(ty, tys) || tys.length < 2 { return -1 }
-  const own: i32[] = []
-  flattenVariantsInto(ty, own)
-  let i = 0
-  while i < own.length {
-    let j = i + 1
-    while j < own.length {
-      if tySame(own[i], own[j]) { return -1 }
-      j = j + 1
-    }
-    i = i + 1
-  }
-  let s = ""
-  for m in tys {
-    let a = "null"
-    if m >= 0 { a = canonUnionKeyAtomOfTy(m) }
-    if a == "" { return -1 }
-    if s != "" { s = s + "|" }
-    s = s + a
-  }
-  unRowOfKeyId(canonUnionKeyOfName(s))
-}
-
-// Whether union `ty` has a direct member that is itself a union other than a literal union, or
-// two literal-union members, which canon spells as one run.
-function tyNestsValueUnion(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  const t = tyAt(ty)
-  let litUnions = 0
-  if t is TyUnion {
-    for m in t.uMembers {
-      if m >= 0 && m < T.tys.length {
-        const mt = tyAt(m)
-        if mt is TyUnion || mt is TyNullable {
-          if !tyIsLitUnionOrLit(m) { return true }
-          litUnions = litUnions + 1
-        }
-      }
-    }
-  }
-  litUnions >= 2
 }
 
 // One union member against another in the same position: the same type, or two records or

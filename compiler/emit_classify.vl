@@ -1,3 +1,6 @@
+import { registeredUnionRowOfTy } from "./emit_start_block"
+import { unionMemberAtomsOf } from "./emit_union_registry"
+import { unionMemberAtomsOfRow } from "./emit_union_registry"
 import { valueTailLeaves } from "./check_num_adopt"
 import { callBuiltTy } from "./check_store_rep"
 import { emitFail } from "./emit_bytes"
@@ -875,7 +878,6 @@ import {
   msTextOf,
   rlElemUnionName,
   unRowOfCanonFolded,
-  unRowOfKeyOrMembers,
   unionArmsOf,
   unionMemberSetOf,
   unionMemberTysOfAB,
@@ -10058,6 +10060,43 @@ export function unionBoxStoreTyOf(exprIx: i32, fnIx: i32): i32 {
 // boolean `exprUnion`): a union-returning call's return annotation, a union-typed
 // ident, a parenthesized union. "" when the expression is not union-valued.
 export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
+  unNameRowLast = -1
+  unionNameOfExprGo(exprIx, fnIx)
+}
+
+// The row behind the name the last `unionNameOfExpr` returned, where the rung that answered
+// read one; -1 for a rung that names its union by spelling alone. Written by the rungs just
+// before they return, so a nested call cannot leave its row behind.
+let unNameRowLast = -1
+
+// `unionNameOfExpr`, with the row behind the name pushed onto `rowOut` (-1 when the rung that
+// answered named its union by spelling alone).
+export function unionNameRowOfExpr(
+  exprIx: i32,
+  fnIx: i32,
+  rowOut: i32[],
+): string {
+  const n = unionNameOfExpr(exprIx, fnIx)
+  rowOut.push(if n != "" { unNameRowLast } else { -1 })
+  n
+}
+
+// The member atoms of the union `exprIx` names, read off its row where the rung that named it
+// read one, else off the name. False when it names no union.
+export function unionArmAtomsOfExpr(
+  exprIx: i32,
+  fnIx: i32,
+  out: string[],
+): boolean {
+  const rs: i32[] = []
+  const n = unionNameRowOfExpr(exprIx, fnIx, rs)
+  if n == "" { return false }
+  if rs[0] >= 0 && unionMemberAtomsOfRow(rs[0], out) { return true }
+  unionMemberAtomsOf(n, out)
+  true
+}
+
+function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return "" }
   const e = nodeAt(unwrapParen(exprIx))
   // `x as? T`'s box (`i32 | null`, `Shape | null`) needs the union name so a narrow/unbox
@@ -10068,8 +10107,11 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       const avn = valueUnionNameOfTy(aty)
       if avn != "" { return avn }
       if asResultIsOneAtom(aty) { return "" }
-      const ar = unRowOfKeyOrMembers(aty)
-      if ar >= 0 && ar < unNames.length { return unNames[ar] }
+      const ar = unRowOfTyKey(aty)
+      if ar >= 0 && ar < unNames.length {
+        unNameRowLast = ar
+        return unNames[ar]
+      }
       return ""
     }
     // An if-expression names its union from its own recorded type, like the `AsExpr` arm: only
@@ -10259,7 +10301,10 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
     const cuk = cloCallSigKey(unwrapParen(exprIx), fnIx)
     if cuk != "" && sigKeyRetKind(cuk) == "union" {
       const kun = callUnionNameOfTy(nodeTyIxOf(unwrapParen(exprIx)))
-      if kun != "" { return kun }
+      if kun != "" {
+        unNameRowLast = callUnionRowOfTy(nodeTyIxOf(unwrapParen(exprIx)))
+        return kun
+      }
     }
   }
   // An instance's call through a hole parameter names no annotation, and its pinned result
@@ -10278,14 +10323,36 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
   // A type parameter bound to a union stays nested in the result (`T | string` at `f64 | i32`),
   // which no render above flattens; the box is the row holding its flattened members (D10522).
   const nfr = nestedUnionRowName(nodeTyAt(unwrapParen(exprIx), fnIx))
-  if nfr != "" { return nfr }
+  if nfr != "" {
+    unNameRowLast = unRowOfFlatMembers(nodeTyAt(unwrapParen(exprIx), fnIx))
+    return nfr
+  }
   // `nodeUnionName` gates itself to a value union first, so a call returning a declared
   // struct union (an inferred hole-param return with no annotation) named nothing here either. D1561.
-  return nodeRegisteredUnionName(exprIx, fnIx)
+  const rgn = nodeRegisteredUnionName(exprIx, fnIx)
+  if rgn != "" {
+    unNameRowLast = registeredUnionRowOfTy(
+      nodeTyInOf(unwrapParen(exprIx), fnIx),
+    )
+  }
+  rgn
 }
 
 // The union name a value call of result type `ty` boxes as: a literal-union alias, bare or
 // nullable, else its value-union spelling, else the name of the row its key holds; "" for none.
+// The row `callUnionNameOfTy` named `ty` by, where it answered from the type key; -1 where it
+// answered by a literal-union alias or a value-union name.
+function callUnionRowOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = tyAt(ty)
+  if t is TyNullable {
+    if litUnionAliasNameOfTy(t.nInner) != "" { return -1 }
+  }
+  if litUnionAliasNameOfTy(ty) != "" { return -1 }
+  if valueUnionNameOfTy(ty) != "" { return -1 }
+  unRowOfTyKey(ty)
+}
+
 function callUnionNameOfTy(ty: i32): string {
   if ty < 0 { return "" }
   const t = tyAt(ty)
@@ -13876,6 +13943,7 @@ export function classifyStateReset() {
   lckReset()
   irkDepth = 0
   asgReReadIx = -1
+  unNameRowLast = -1
   storageReadLeave(-1)
   objLitSlotsReset()
   0
