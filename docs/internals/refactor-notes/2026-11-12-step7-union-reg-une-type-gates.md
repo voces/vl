@@ -1,6 +1,6 @@
 # Step 7 L6 (lane G, cut 6b): three more `unionNameOfExpr` readers ask the type, 2026-11-12
 
-This cut is stacked on cut 6a (#7675), the box-path union names taken from the box's type.
+The base is master `8a5b3217`, after cut 6a (#7675): the box-path union names taken from the box's type.
 
 ## The census
 
@@ -30,6 +30,6 @@ fallback stays until those sets are covered.
 ## Proof
 
 - **Seed:** fixpoint.
-- **Locally:** lint-self, regress, rep-fuzz, check-filed-witnesses `--strict`, late-demands,
-  seed-size, and the comment, ladder, sentinel and scan budgets.
+- **Locally:** lint-self, regress (no runs lost), rep-fuzz (exact), check-filed-witnesses `--strict` (4,860 graded, 0 moved), late-demands (8, baseline 8),
+  seed-size (+1.9%), and the comment, ladder, sentinel and scan budgets.
 - **The full sweep:** CI's `sweep` label. Expected identity.
