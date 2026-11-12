@@ -22,16 +22,6 @@ function declaring it, and the keep was noted only for a returned call:
   function returns it.
 - `elabRetKeptCall`: a returned holder's initialiser call is kept whole as a returned call is, in
   `elabPlainCallsNote` and `elabRetRecordKeepsNote`.
-- `elabGlobalReturnerWhole`: the returner must be one that may return a record
-  (`elabRetRecordShape`), and no call of it may take one member, by a holder called at one
-  signature or a destination naming one member's type. Emit lowers such a returner at that member
-  while the returned `const` is the whole record. On master that built invalid wasm; it is now
-  refused and filed as D15748.
-
-**Position matrix** (`scripts/capability-probes/matrix/bundle-copy-handed.matrix.vl`, new): master
-`0a9e9948` runs 2 of 48 graded with 3 SILENT (`return_inferred`/annotated, `return_annotated` in
-both faces); this PR runs 2 with 0 SILENT, 0 runs → not-runs. The 3 SILENT cells are D15748, now
-loud.
 
 **Sweep** (`scripts/sweep.vl`, base master `abase` against the fixpoint candidate, 23,915
 programs): 23,914 same, 0 bytes-only, 1 output mover (D15740, emit reject → runs), 0 runs →

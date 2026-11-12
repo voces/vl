@@ -7,6 +7,8 @@
 // arms: the export nothing references is reported, the one a sibling module imports is
 // not, and adding a reference from `tests/` alone makes the first one go quiet. The
 // control's report also reds the budget, and `--budget-why` names the declaration.
+// A third pair of files pins the reachability arm: a self-calling pair named only in a
+// comment and an `import` list is reported, and a top-level call clears it.
 //
 // It also pins that the committed baseline is at zero, which is the claim the
 // gate row rests on: any export the tree stops referencing fails CI.
@@ -58,6 +60,17 @@ export let table: i32[] = []
 const USER = `import { imported } from "./mod"
 
 function use(): i32 { imported() + table.length }
+print(use())
+`;
+// The reachability arm: a pair that only calls itself, named again in a comment and in an
+// `import` list, is dead; a top-level call is what brings it back.
+const PAIR = `export function ping(n: i32): i32 { if n > 0 { pong(n - 1) } else { 0 } }
+export function pong(n: i32): i32 { ping(n) }
+`;
+const NAMER = `import { ping, pong } from "./pair"
+
+// ping and pong are named here only in this comment.
+print(1)
 `;
 
 Deno.test({
@@ -110,6 +123,24 @@ Deno.test({
         throw new Error(
           `a reference from tests/ must clear the row — got ${JSON.stringify(second)}`,
         );
+      }
+
+      // The reachability arm fires on a cluster the word count calls live ...
+      await Deno.writeTextFile(`${dir}/compiler/pair.vl`, PAIR);
+      await Deno.writeTextFile(`${dir}/compiler/namer.vl`, NAMER);
+      const third = (await run(["--root", dir, "--list"])).trim().split("\n").filter((l) => l);
+      const wantPair = ["compiler/pair.vl:1  function ping", "compiler/pair.vl:2  function pong"];
+      if (JSON.stringify(third) !== JSON.stringify(wantPair)) {
+        throw new Error(
+          `a cluster reached only from a comment and an import list: want ` +
+            `${JSON.stringify(wantPair)}, got ${JSON.stringify(third)}`,
+        );
+      }
+      // ... and a top-level call clears it.
+      await Deno.writeTextFile(`${dir}/compiler/namer.vl`, NAMER + "print(ping(2))\n");
+      const fourth = (await run(["--root", dir, "--list"])).trim();
+      if (fourth !== "") {
+        throw new Error(`a top-level call must clear the cluster — got ${JSON.stringify(fourth)}`);
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
