@@ -10060,6 +10060,11 @@ was that nothing converts a function's result. The container rule is unchanged: 
 record of such functions is refused (D15895), and a literal adapts per element. A parameter
 widened the same way stays refused; only the result direction was ruled.
 
+A numeric literal union widens the same way (D9492): `() => 1 | 2 | 5000000000` is a `() => i64`
+and a `() => f64`, because a `return` delivers it there (`litNumUnionConverts`: the destination
+holds each literal exactly), and the adapter's `return` converts it. A member the destination
+cannot hold (`16777217` in `f32`, `5000000000` in `i32`) keeps the union refused there.
+
 **A generic function named as a value is always adapted**, whatever type the checker gave the
 name, so its instance is built by the adapter's direct call (D3112, D3113). One held with no
 concrete function type at all is D3381, which asks for a ruling.
@@ -11610,6 +11615,8 @@ modules assign imported `let`s throughout. A read-only rule would need a setter 
 **The rule.** A read of a `let` takes the type of the most recent write in scope, not the join
 of all its writes. In `let x = null; const y: string | null = x; x = 5`, the read of `x` is
 `null`, so the delivery is sound.
+An annotated `let` narrows the same way: the annotation bounds what may be written, and a read
+sees the most recent write's type, so `let x: i32 | string = 1; x = "s"; x.length` runs.
 
 **Status.** Backlogged in ROADMAP.md. The checker has no read-after-assignment typing for any
 type today, so this is a new rule. D2660 and D14930 are its witnesses and wait on it.
