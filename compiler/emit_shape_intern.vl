@@ -10,7 +10,6 @@ import {
   arrSpineLeafTy,
   isValueUnionName,
   nameIsInlineLitUnion,
-  tyIsValueUnion,
   tyMapKeyKindSpan,
 } from "./check_ty_rep"
 import {
@@ -42,7 +41,6 @@ import {
   tyToEmitName,
   tyToNominalName,
 } from "./check_types"
-import { declAnnTyOf } from "./check_gen_alias_anns"
 import {
   sFieldElemNameAt,
   sFieldTypeAt,
@@ -56,8 +54,6 @@ import {
 import {
   annFnDecompose,
   arrLeafNameOf,
-  gaeApplyFieldTy,
-  gaeSplitArgs,
   mapValNameOf,
   nameIsElemArray,
   nameIsLitUnionArray,
@@ -68,11 +64,7 @@ import {
   shapeInnerFieldSplit,
 } from "./emit_base"
 import { emitFail } from "./emit_bytes"
-import {
-  code0SpellingFitsRow,
-  fieldCodeForMatch,
-  gaeIndexOf,
-} from "./emit_field_codes"
+import { code0SpellingFitsRow, fieldCodeForMatch } from "./emit_field_codes"
 import {
   fieldCloSigOf,
   fieldCloSigOfTy,
@@ -108,10 +100,8 @@ import {
   armTwinRowName,
   elemNameIsNominal,
   famRelayStructRow,
-  fieldTypeIsDeferred,
   fieldTypeRefusalMsg,
   forceScalarListField,
-  gaeArgIsTyParam,
   genAppRidesTyParam,
   mapTyValKindLowerable,
   nameFieldCode,
@@ -159,12 +149,6 @@ import {
   FC_UNION,
   emitPhaseReached,
   gaeBases,
-  gaeFieldCount,
-  gaeFieldNames,
-  gaeFieldStart,
-  gaeFieldTyNames,
-  gaeFieldTyNodes,
-  gaeParams,
   genTyParamNames,
   sDeclared,
   sFieldCloSig,
@@ -201,9 +185,6 @@ import { sidArrGet, sidArrPut, sidOf } from "./symbols"
 import {
   annGenAppSpanEnds,
   arrElemNameRaw,
-  gaeArgsTextOf,
-  gaeHeadNameOf,
-  gaeLtAt,
   groupInnerOf,
   nameIsParenOpen,
   nameIsShapeOpen,
@@ -462,7 +443,7 @@ function internShapeDeepTyGo(nm: string, ty: i32) {
   if nameIsMap(nm) {
     return internShapeDeepTy(mapValNameOf(nm), tyMapValOf(ty))
   }
-  gaeEnsure(nm)
+  gaeEnsure(nm, ty)
   internInlineShapeTy(nm, ty) // no-op for any non-shape leaf
   0
 }
@@ -1931,201 +1912,13 @@ function annShapeIndexOf(
   -1
 }
 
-// The index of the alias's own parameter `P` whose field, declared at annotation node `fnode`,
-// is `(P | null)[]`, or -1. Read off the declared type (`declAnnTyOf`): the node's own
-// `nodeTyIx` records the instance checked last, not `P`.
-function gaeNulParamIxOf(fnode: i32, pnames: string[]): i32 {
-  const dt = declAnnTyOf(fnode)
-  if dt < 0 { return -1 }
-  const at = tyAt(dt)
-  if !(at is TyArray) || at.aElem < 0 { return -1 }
-  const nt = tyAt(at.aElem)
-  if !(nt is TyNullable) || nt.nInner < 0 { return -1 }
-  const vt = tyAt(nt.nInner)
-  if !(vt is TyVar) { return -1 }
-  let i = 0
-  while i < pnames.length {
-    if pnames[i] == vt.tvName { return i }
-    i = i + 1
-  }
-  -1
-}
-
-// The argument index whose application (`Box<GB<i32>>`) fills a `(P | null)[]` field, or -1. The row's field resolves no ref-list slot of its own (`sFieldRefSlot` answers another
-// list's), so a list literal holding `null` builds at a union box; the application is refused
-// until that slot is interned (D2525's boundary).
-function gaeNulParamListAtApp(
-  fnode: i32,
-  pnames: string[],
-  args: string[],
-): i32 {
-  const p = gaeNulParamIxOf(fnode, pnames)
-  if p < 0 || p >= args.length { return -1 }
-  if annGenAppSpanEnds(normTypeAtom(args[p])) { return p }
-  -1
-}
-
-// Interns the application `name` ("Box<i32>") as a struct shape, once. A field the emitter
-// cannot type (an unbound param, an unsupported shape) leaves the application un-interned —
-// its use then fails loudly downstream, never a trap.
-export function gaeEnsure(name: string) {
-  // The generic-application span test at its home (`annGenAppSpanEnds`): a cheap length
-  // reject, a trailing-`>` compare, then a `gaeLtAt` scan, in that order. `gaeLtAt` is
-  // re-asked below for the head and argument slices rather than threaded out, costing a
-  // second scan only on a name that already ended in `>`.
+// Interns the generic application `name` ("Box<i32>") at its instance type `ty`: the record's
+// rendered shape walks as any inline shape does. An application over a type parameter interns
+// nothing; each instance re-runs this over its own concrete type.
+export function gaeEnsure(name: string, ty: i32) {
   if !annGenAppSpanEnds(name) { return 0 }
-  const ltAt = gaeLtAt(name)
-  if structIndexByName(name) >= 0 { return 0 }
-  const gi = gaeIndexOf(gaeHeadNameOf(name, ltAt))
-  if gi < 0 { return 0 }
-  const pnames: string[] = []
-  gaeSplitArgs(gaeParams[gi], pnames)
-  const args: string[] = []
-  gaeSplitArgs(gaeArgsTextOf(name, ltAt), args)
-  if args.length != pnames.length { return 0 }
-  // A generic original's application interns nothing, for the same reason its inline twin
-  // does not: the original is replaced by its instances and never emitted, and each
-  // instance re-runs this pass over its pinned, concrete name. Without the skip, the
-  // parameter would substitute for itself and intern as a nominal element name — invalid wasm at run.
-  let gp = 0
-  while gp < args.length {
-    if gaeArgIsTyParam(args[gp]) { return 0 }
-    gp = gp + 1
-  }
-  const names: string[] = []
-  const codes: i32[] = []
-  const elems: string[] = []
-  // The closure-signature column, banked per field and keyed from the application's own
-  // arena field type, so a closure field's signature is read from the type, not its spelling.
-  const csigs: string[] = []
-  const gaeTy = sTyIxOfName(name)
-  // B6b: the field row's key column, banked per field beside its element name — an
-  // applied field spelling is the only place the key is legible, and the push loop below
-  // lacks the spelling.
-  const ekeys: i32[] = []
-  // The element type of a field keyed by its interned row's name: that row's own type.
-  const etys: i32[] = []
-  let ok = true
-  const fs = gaeFieldStart[gi]
-  const fc = gaeFieldCount[gi]
-  let fi = 0
-  while fi < fc {
-    const tn = gaeApplyFieldTy(
-      gaeFieldTyNames[fs + fi],
-      pnames,
-      args,
-      gaeFieldTyNodes[fs + fi],
-    )
-    const nulArg = gaeNulParamListAtApp(gaeFieldTyNodes[fs + fi], pnames, args)
-    if nulArg >= 0 {
-      return emitFail(
-        "emitProgram: a nullable-"
-          + normTypeAtom(args[nulArg])
-          + " list element has no rep; use a non-null element type",
-      )
-    }
-    // A field that is ITSELF an application (or an array of one) interns
-    // depth-first, so the ref/elem lookups below resolve.
-    gaeEnsure(arrLeafNameOf(tn))
-    const gaeFty = shapeFieldRowOf(gaeTy, gaeFieldNames[fs + fi])
-    let code = nameFieldCode(tn, gaeFty)
-    let elem = ""
-    let elemTy = -1
-    if code < 0 {
-      // An interned application name is a struct-ref field (`nameFieldCode`
-      // only consults TypeDecl names, which an application is not).
-      if structIndexByName(tn) >= 0 {
-        code = FC_STRUCT
-        elem = tn
-      } else if fieldTypeIsDeferred(tn) {
-        // The instance's field is a deferred rep, so this -1 is the same refusal the
-        // declared-struct and struct-alias loops make, reported in their words. The silent
-        // `return 0` below is right for every other -1, but wrong here: without this, the
-        // instance stayed un-interned and its literal minted its own wrong-backing `#anon` row.
-        return emitFail(fieldTypeRefusalMsg(tn))
-      } else {
-        // A substituted inline-shape field (`s: {g: U}` at `U = i32`) is the interner's
-        // nested-field arm: its row may be an earlier literal's `#anonN`, which no lookup by
-        // the applied spelling finds, so the field keys the row's own name (D10930).
-        const iidx = nestedFieldShapeRow(tn, gaeFty)
-        if iidx >= 0 {
-          code = FC_STRUCT
-          elem = sNames[iidx]
-          if iidx < sTyIx.length { elemTy = sTyIx[iidx] }
-        }
-      }
-    } else if code == FC_REF_LIST {
-      // The applied element text, raw: an instance field's list element is spelled by
-      // `gaeApplyFieldTy`'s substitution, a name the canonicalizing recorder does not key —
-      // the one arm this path does not share with the shape-text table. The trailing-`[]`
-      // cut is dischargeable: `code == 5` implies `nameIsArray(tn)`, so the two forms compute the identical slice.
-      elem = arrElemNameRaw(tn)
-      // A nullable-struct element keys its slot by the paren-free spelling, as the declared
-      // struct's code-5 arm records it; the raw `(S | null)` keys no slot (D2528). Whether
-      // the element is one is read off the application's own field type.
-      const fe = tyStepElem(shapeFieldRowOf(gaeTy, gaeFieldNames[fs + fi]))
-      if fe >= 0 {
-        const fet = tyAt(fe)
-        if fet is TyNullable && !tyIsValueUnion(fe) {
-          elem = normTypeAtom(elem)
-        }
-      }
-    } else if code >= 0 {
-      // Codes 15/16/4 are recorded identically from the field's spelling: the nested
-      // target, the union name, and the atom-array name. This path deliberately records ""
-      // for the map, litunion-atom, nullable-ref-list, and `K | null` codes where the
-      // shape-text table records a key — a known, intentional divergence, not merged here.
-      elem = shapeFieldElemName(tn, code, gaeFty)
-      // An arm-typed field names its twin row, as the other two recorders do; an arm that
-      // reaches the instance only through a type argument has no row yet, so it is minted (D15096).
-      if code == FC_STRUCT {
-        const gaeBase = nonNulBaseOf(tn)
-        const gaeArmVi = variantIndexOf(gaeBase)
-        if gaeArmVi >= 0 {
-          internArmShapeRow(gaeArmVi)
-          const gaeArmNm = armTwinRowName(gaeBase)
-          if gaeArmNm != "" { elem = gaeArmNm }
-        }
-      }
-      if code == FC_UNION { registerValueUnionNameAB(64, elem, gaeFty) }
-    }
-    if code < 0 { ok = false }
-    names.push(gaeFieldNames[fs + fi])
-    codes.push(code)
-    elems.push(elem)
-    etys.push(elemTy)
-    csigs.push(
-      fieldCloSigOf(code, tn, shapeFieldRowOf(gaeTy, gaeFieldNames[fs + fi])),
-    )
-    ekeys.push(tyMapKeyKindSpan(shapeFieldRowOf(gaeTy, gaeFieldNames[fs + fi])))
-    fi = fi + 1
-  }
-  if !ok { return 0 }
-  if names.length == 0 { return 0 }
-  sDeclared = true
-  sNames.push(name)
-  recordSRowDeclOfName(name)
-  recordSTyIx(gaeTy) // D0
-  sFieldStart.push(sFieldNames.length)
-  sFieldCount.push(codes.length)
-  // The canonical field order (D622, `fieldNameOrder`).
-  const fOrd = fieldNameOrder(names)
-  let pj = 0
-  while pj < codes.length {
-    const pi = fOrd[pj]
-    storeTyPut(
-      sFieldStoreTy,
-      sFieldNames.length,
-      recFieldStoreTyOf(gaeTy, names[pi], codes[pi]),
-    )
-    sFieldNames.push(names[pi])
-    sFieldTypes.push(codes[pi])
-    sFieldCloSig.push(csigs[pi])
-    sFieldElemName.push(elems[pi])
-    recordSFieldElemRowTy(elems[pi], ekeys[pi], etys[pi]) // D5
-    pj = pj + 1
-  }
-  famRelayStructRow(sNames.length - 1)
+  if ty < 0 || tyHasTyVar(ty) || !(tyAt(ty) is TyObj) { return 0 }
+  internShapeDeepOfTy(ty)
   0
 }
 
