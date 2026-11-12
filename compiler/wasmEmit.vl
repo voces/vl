@@ -407,7 +407,6 @@ import {
   FC_NUL_I32_LIST,
   FC_NUL_LIT_UNION,
   FC_NUL_MAP,
-  FC_NUL_NONE,
   FC_NUL_REF_LIST,
   FC_NUL_STR,
   FC_REF_LIST,
@@ -2917,7 +2916,7 @@ function objLitHasFieldOutside(objIx: i32, start: i32, cnt: i32): boolean {
 
 // The store-side value of variant `vi`'s field `fi`, shared by the three `emitAssign` member
 // stores: a box-union field boxes the right-hand side, f64 / i64 / f32 fields re-encode it,
-// and any other code emits it plainly.
+// and any other field emits it plainly.
 function emitVariantFieldStoreVal(
   body: u8[],
   vi: i32,
@@ -2925,9 +2924,9 @@ function emitVariantFieldStoreVal(
   valIx: i32,
   fnIx: i32,
 ) {
-  const code = variantFieldTypeAt(vi, fi)
-  if code == FC_UNION { return emitVariantFieldBox(body, vi, fi, valIx, fnIx) }
-  emitScalarFieldStoreVal(body, valIx, fnIx, code)
+  const k = eqRowFieldKind(-1 - vi, fi)
+  if k == "union" { return emitVariantFieldBox(body, vi, fi, valIx, fnIx) }
+  emitScalarFieldStoreVal(body, valIx, fnIx, k)
 }
 
 // Variant `vi`'s box-union field `fi` gets `valIx`, boxed at the checker's record where it owes a
@@ -2973,15 +2972,33 @@ function boxFloorWhy(valIx: i32, fnIx: i32): string {
   "floor: no row"
 }
 
-function emitScalarFieldStoreVal(body: u8[], valIx: i32, fnIx: i32, code: i32) {
-  if code == FC_F64 { return emitExprAsF64(body, valIx, fnIx) }
-  if code == FC_I64 { return emitExprAsI64(body, valIx, fnIx) }
-  if code == FC_F32 { return emitExprAsF32(body, valIx, fnIx) }
-
-  if code == FC_STR || code == FC_NUL_STR {
-    if exprIsLitAtom(valIx, fnIx) { return emitStrValue(body, valIx, fnIx) }
+// `valIx` stored into a field of kind `k` (null for no field): the wide scalars re-encode it,
+// a string slot widens a literal-union atom to its member string, and the rest emit it plainly.
+function emitScalarFieldStoreVal(
+  body: u8[],
+  valIx: i32,
+  fnIx: i32,
+  k: VKind | null,
+) {
+  if k == null { return emitExpr(body, valIx, fnIx) }
+  match k {
+    "f64" => {
+      return emitExprAsF64(body, valIx, fnIx)
+    }
+    "i64" => {
+      return emitExprAsI64(body, valIx, fnIx)
+    }
+    "f32" => {
+      return emitExprAsF32(body, valIx, fnIx)
+    }
+    "str" | "nulstr" => {
+      if exprIsLitAtom(valIx, fnIx) { return emitStrValue(body, valIx, fnIx) }
+      return emitExpr(body, valIx, fnIx)
+    }
+    "i32" | "v128" | "struct" | "list" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      return emitExpr(body, valIx, fnIx)
+    }
   }
-  emitExpr(body, valIx, fnIx)
 }
 
 // Lower an object literal `{ f: v, … }` boxed into the declared union onto `body`:
@@ -11947,7 +11964,12 @@ function emitSharedFieldAssign(body: u8[], memIx: i32, valIx: i32, fnIx: i32) {
       if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
       fbLocalSet(rslot)
     }
-    const sfVal = emitScalarFieldStoreVal(body, valIx, fnIx, code)
+    const sfVal = emitScalarFieldStoreVal(
+      body,
+      valIx,
+      fnIx,
+      eqRowFieldKind(-1 - vis[0], fis[0]),
+    )
     if sfVal < 0 { return -1 }
     const vslot = objOrderStashSlot(code, uFieldStorageSlot(vis[0], fis[0]))
     fbLocalSet(vslot)
@@ -27591,70 +27613,91 @@ function emitVariantFieldWrite(
   0
 }
 
-// `emitAssignMember`'s value for field `fieldIdx` (code `fscode`) of struct row `si`, its
+// `emitAssignMember`'s value for field `fieldIdx` of struct row `si`, its
 // target context already applied: a box union coerces into the box, a literal-union atom widens
 // or lowers as its id, a scalar re-encodes, a niche seeds its null. Returns 0, or -1 failed.
 function emitStructFieldStoreValue(
   body: u8[],
   si: i32,
   fieldIdx: i32,
-  fscode: i32,
   rhs: i32,
   fnIx: i32,
 ): i32 {
-  // The niche fields seed their null rep for a bare `null` (the `emitNullLitNode` table). A
-  // box-union field (code 16) goes through `emitUnionBoxArg`, since the field cell is
-  // `(ref $uBox)` — one home so the three code-16 sites cannot drift.
-  if fscode == FC_UNION {
-    if (
-      emitUnionBoxOwed(
-        body,
-        sFieldElemNameAt(si, fieldIdx),
-        sFieldRowTyAt(si, fieldIdx),
-        rhs,
-        fnIx,
-      )
-      < 0
-    ) {
-      return -1
+  const k = fieldRowKind(sFieldStart[si] + fieldIdx)
+  if k == null {
+    return emitFail("emitProgram: struct field has no storage kind")
+  }
+  // An atom or atom-array field takes its RHS as interned atom ids, the construct's rule.
+  const atoms = k != "union"
+    && k != "str"
+    && k != "nulstr"
+    && (sFieldIsLitUnion(si, fieldIdx)
+    || sFieldIsLitUnionArray(si, fieldIdx))
+  match k {
+    "union" => {
+      // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
+      if (
+        emitUnionBoxOwed(
+          body,
+          sFieldElemNameAt(si, fieldIdx),
+          sFieldRowTyAt(si, fieldIdx),
+          rhs,
+          fnIx,
+        )
+        < 0
+      ) {
+        return -1
+      }
     }
-  } else if fscode == FC_STR && exprIsLitAtom(rhs, fnIx) {
-    // A literal-union atom assigned to a `string` field (code 3) widens to its member string.
-    if emitAtomToStr(body, rhs, fnIx) < 0 { return -1 }
-  } else if fscode == FC_NUL_STR && exprIsLitAtom(rhs, fnIx) {
-    // the `string | null` field takes the same widen: its slot is the same string ref
-    // with null permitted, and a widened member string is non-null. `emitObj` and
-    // `emitAssign` are the two halves of every field code, and must agree.
-    if emitStrValue(body, rhs, fnIx) < 0 { return -1 }
-  } else if sFieldIsLitUnion(si, fieldIdx) {
-    // A literal-union atom field assign (`b.kind = "a"`): the member RHS lowers as its atom id.
-    if emitExpr(body, rhs, fnIx) < 0 { return -1 }
-  } else if sFieldIsLitUnionArray(si, fieldIdx) {
-    // An atom-array field assign (`g.f = ["bb"]`): the RHS builds the i32 list of atom
-    // ids (the atom context routes the literal off the string-list build — construct
-    // parity with `emitObj`'s code-4 atom arm).
-    if emitExpr(body, rhs, fnIx) < 0 { return -1 }
-  } else if fscode == FC_F64 || fscode == FC_I64 || fscode == FC_F32 {
-    // A SCALAR f64/i64/f32 field widens its RHS at the store boundary, the exact
-    // treatment `emitObj` gives the construct (`p.g = 9` into an i64 field emitted
-    // a raw `i32.const` — invalid wasm at `struct.set`; pre-existing, flat AND
-    // nested spellings).
-    if emitScalarFieldStoreVal(body, rhs, fnIx, fscode) < 0 { return -1 }
-  } else if fscode == FC_NUL_NONE {
-    // The `null` unit type's slot, the construct arm's twin (D4671).
-    if emitNulNoneForEffect(body, rhs, fnIx) < 0 { return -1 }
-    fbRefNullNone()
-  } else if fscode == FC_STRUCT {
-    // The ASSIGN half of the construct arm (`p.g = s` after `if s is Circle`) — `emitObj`
-    // and `emitAssign` are the two halves of every field code and have to be wired
-    // together, which is the lesson the code-20 arm three branches up records.
-    if emitArmDelivery(body, rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx)) < 0 {
-      return -1
+    "str" => {
+      // A literal-union atom assigned to a `string` field widens to its member string.
+      if exprIsLitAtom(rhs, fnIx) {
+        if emitAtomToStr(body, rhs, fnIx) < 0 { return -1 }
+      } else if emitExpr(body, rhs, fnIx) < 0 {
+        return -1
+      }
     }
-  } else {
-    // A `K | null` niche field assign: member RHS -> atom id, `null` -> -1.
-    // then the value
-    if emitExpr(body, rhs, fnIx) < 0 { return -1 }
+    "nulstr" => {
+      // A `string | null` slot takes the same widen; a widened member string is non-null.
+      if exprIsLitAtom(rhs, fnIx) {
+        if emitStrValue(body, rhs, fnIx) < 0 { return -1 }
+      } else if emitExpr(body, rhs, fnIx) < 0 {
+        return -1
+      }
+    }
+    "f64" | "i64" | "f32" => {
+      // A wide scalar field widens its RHS at the store boundary, as the construct does.
+      if atoms {
+        if emitExpr(body, rhs, fnIx) < 0 { return -1 }
+      } else if emitScalarFieldStoreVal(body, rhs, fnIx, k) < 0 {
+        return -1
+      }
+    }
+    "nulnone" => {
+      // The `null` unit type's slot, the construct arm's twin (D4671).
+      if atoms {
+        if emitExpr(body, rhs, fnIx) < 0 { return -1 }
+      } else {
+        if emitNulNoneForEffect(body, rhs, fnIx) < 0 { return -1 }
+        fbRefNullNone()
+      }
+    }
+    "nulstruct" | "nulvariant" => {
+      // The assign half of the construct's narrowed-arm delivery (`p.g = s` after
+      // `if s is Circle`); `emitObj` and `emitAssign` must agree on every field.
+      if atoms {
+        if emitExpr(body, rhs, fnIx) < 0 { return -1 }
+      } else if (
+        emitArmDelivery(body, rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx))
+        < 0
+      ) {
+        return -1
+      }
+    }
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      // A `K | null` niche field takes a member as its atom id and `null` as -1.
+      if emitExpr(body, rhs, fnIx) < 0 { return -1 }
+    }
   }
   0
 }
@@ -27741,11 +27784,7 @@ function emitAssignMember(
   if emitExpr(body, target.memObj, fnIx) < 0 {
     return -1 // struct ref first
   }
-  const fscode = sFieldTypeAt(si, fieldIdx)
-  if (
-    emitStructFieldStoreValue(body, si, fieldIdx, fscode, a.binRight, fnIx)
-    < 0
-  ) {
+  if (emitStructFieldStoreValue(body, si, fieldIdx, a.binRight, fnIx) < 0) {
     return -1
   }
   // D1222 — the STORE half of the construct-side recover in `emitObj`; the two halves of
