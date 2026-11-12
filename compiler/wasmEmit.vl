@@ -16683,24 +16683,35 @@ function arrLitDataBuild(
   form: i32,
   backTy: i32,
 ): i32 {
+  const computed: i32[] = []
   let i = 0
   while i < elems.length {
-    if !arrLitElemIsConst(elems[i]) { return 0 }
+    if !arrLitElemIsConst(elems[i]) {
+      if !arrLitDataStores(elems[i], fnIx, form) { return 0 }
+      computed.push(i)
+    }
     i = i + 1
   }
   const parts: { b: u8[] }[] = [{ b: [] }]
   let n = 0
   i = 0
+  let ci = 0
   while i < elems.length {
-    const one: u8[] = []
-    const prev = wTarget(one)
-    const rc = arrLitDataElemEmit(body, elems[i], fnIx, form)
-    wTarget(prev)
-    if rc < 0 { return -1 }
     if parts[parts.length - 1].b.length >= LIT_PART { parts.push({ b: [] }) }
-    const w = arrLitDataPut(one, form, parts[parts.length - 1].b)
-    if w < 0 { return 0 }
-    n = n + w
+    if ci < computed.length && computed[ci] == i {
+      // A computed element's slot holds zero bytes until its store below.
+      n = n + arrLitDataZero(form, parts[parts.length - 1].b)
+      ci = ci + 1
+    } else {
+      const one: u8[] = []
+      const prev = wTarget(one)
+      const rc = arrLitDataElemEmit(body, elems[i], fnIx, form)
+      wTarget(prev)
+      if rc < 0 { return -1 }
+      const w = arrLitDataPut(one, form, parts[parts.length - 1].b)
+      if w < 0 { return 0 }
+      n = n + w
+    }
     i = i + 1
   }
   const seg = gStrDataLen.length
@@ -16714,7 +16725,55 @@ function arrLitDataBuild(
   fbI32Const(0)            // segment offset
   fbI32Const(elems.length) // element count
   fbArrayNewData(backTy, seg)
+  if computed.length == 0 { return 1 }
+  // The computed elements are stored after the segment builds the backing, in source order,
+  // so a literal of any length with some computed elements stays a few bytes per such element.
+  liKinds.push(arrLitDataKind(form))
+  liSlots.push(0)
+  liBack.push(1)
+  const dst = listIdxScratchBase + liKinds.length
+  fbLocalSet(dst)
+  for at in computed {
+    fbLocalGet(dst)
+    fbI32Const(at)
+    if arrLitDataElemEmit(body, elems[at], fnIx, form) < 0 { return -1 }
+    fbArraySet(backTy)
+  }
+  fbLocalGet(dst)
+  fbRefAsNonNull()
   1
+}
+
+// Whether a non-constant element `ix` of a literal built in data form `form` may be stored into
+// the segment-built backing: a scalar list form with a lazy-frame kind, and an element the
+// literal's own loop would lower as one scalar of that form.
+function arrLitDataStores(ix: i32, fnIx: i32, form: i32): boolean {
+  if form == ALD_U8 { return false }
+  if exprArray(ix, fnIx) || exprRefArray(ix, fnIx) || exprStruct(ix, fnIx) {
+    return false
+  }
+  if exprVariantIndex(ix, fnIx) >= 0 || nodeTyIsVariant(ix) { return false }
+  !(exprMap(ix, fnIx) || nodeTyIsMap(ix))
+}
+
+// The lazy-frame list kind whose backing data form `form` builds; `arrLitDataStores` admits no
+// other form.
+function arrLitDataKind(form: i32): ListKind {
+  if form == ALD_I64 { return "i64list" }
+  if form == ALD_F32 { return "f32list" }
+  if form == ALD_F64 { return "f64list" }
+  "list"
+}
+
+// Append the zero bytes of one element of data form `form` to `out`, returning their count.
+function arrLitDataZero(form: i32, out: u8[]): i32 {
+  const w = if form == ALD_I64 || form == ALD_F64 { 8 } else if form == ALD_U8 { 1 } else { 4 }
+  let j = 0
+  while j < w {
+    out.push(0)
+    j = j + 1
+  }
+  w
 }
 
 // A fresh backing array of type `ty` from the `n` elements on the stack. An empty one reads the
