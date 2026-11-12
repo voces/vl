@@ -24,7 +24,6 @@ import {
   nodeChildren,
 } from "./ast"
 import { memoKeyNew, memoMoved } from "./memo"
-import { splitUnionAtoms } from "./tyname"
 import {
   tailPushBlockTail,
   tailPushIfArms,
@@ -51,27 +50,22 @@ import {
   TyUnion,
   TyVar,
   cUserTypes,
-  cUserTypesVer,
   primNameStr,
   tyAt,
   tyIsHole,
-  tyMutEpoch,
   tyNameAtoms,
   tyToEmitName,
-  tyVarRenames,
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
 import { cwPeel } from "./check_write_scan"
 import {
   isNumericPrimTy,
   nonNullTy,
-  numLitUnionHasBase,
   primNameOf,
   tyHasTyVar,
   tyHoldsNumericPrim,
 } from "./tyquery"
 import { leafIsLit } from "./check_call_retire"
-import { cFillStmtIx, canonUnionKeyTextOfTy } from "./check_inline_lit_union"
 
 // The function whose body is being checked, re-checked at a pin or instantiated.
 export let njFnIx = -1
@@ -371,145 +365,6 @@ function rootUnionDeclAt(name: string): i32 {
 let rudAt: {[string]: i32} = Map()
 
 const rudKey = memoKeyNew(3)
-
-// ── the union registry's rep key, minted here and nowhere else (`registry-by-type-id.md`
-// §3) ── neither existing key works: an arena index is not an identity, and `repCanonId`
-// both merges disjoint literal unions of the same arity and splits a nested union from its
-// flattening. Canon's own softened, flattened rendering is the equivalence the registry needs.
-const cukTexts: string[] = []
-
-const cukIds: {[string]: i32} = Map()
-
-// The member sequence `name` denotes, in the registry's ABI order: a union-alias atom is
-// replaced by its members only when the expansion is multi-atom, and an alias whose expansion
-// is not, spelled alone, by the set its declaration's row records. Not deduped or reordered:
-// a union's box tags are positional over it.
-function canonUnionKeyText(name: string): string {
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
-  if atoms.length == 1 {
-    const ls = aliasDeclRowSet(name)
-    if ls != "" { return canonUnionKeyText(ls) }
-  }
-  let out = ""
-  let i = 0
-  while i < atoms.length {
-    let m = atoms[i]
-    const exp = unionAliasMultiMembers(m)
-    if exp != "" { m = exp }
-    if out.length > 0 { out = out + "|" }
-    out = out + m
-    i = i + 1
-  }
-  out
-}
-
-// `unionAliasMembers(name)` when it spells two or more atoms, else "". A one-member alias over
-// a list, record, map or scalar is one atom, decided without the render, which spells a
-// sub-record a nested record shares once per path (D9891).
-function unionAliasMultiMembers(name: string): string {
-  const ix = cUserTypes[name] ?? -1
-  if ix >= 0 {
-    const t = tyAt(ix)
-    if t is TyUnion && t.uMembers.length == 1 && t.uMembers[0] >= 0 {
-      const mt = tyAt(t.uMembers[0])
-      if mt is TyArray || mt is TyObj || mt is TyMap || mt is TyPrim {
-        return ""
-      }
-    }
-  }
-  const exp = unionAliasMembers(name)
-  if exp == "" { return "" }
-  const ea: string[] = []
-  splitUnionAtoms(exp, ea)
-  if ea.length > 1 { return exp }
-  ""
-}
-
-// The `|`-joined declared members of alias `name` (`type K = "a" | "b"` → `"a"|"b"`), the set
-// `collectU` keys its row by, where the member expansion is one atom or none: a softened
-// string litunion or a one-member alias. "" for any other name, and for a numeric litunion.
-function aliasDeclRowSet(name: string): string {
-  const ty = cUserTypes[name] ?? -1
-  if ty < 0 || numLitUnionHasBase(ty) { return "" }
-  if unionAliasMultiMembers(name) != "" { return "" }
-  const sx = cFillStmtIx[name] ?? (-1)
-  if sx < 0 { return "" }
-  const s = nodeAt(sx)
-  if s is UnionDecl {
-    if s.udName != name { return "" }
-    let out = ""
-    let i = 0
-    while i < s.udVariants.length {
-      if i > 0 { out = out + "|" }
-      out = out + s.udVariants[i]
-      i = i + 1
-    }
-    return out
-  }
-  ""
-}
-
-// The key for a spelling, -1 for the empty name, which the registry never holds. The flatten
-// is the key and the softening is not: the flatten is what makes `J | E` and
-// `boolean|f64|string|E` one key, while the softening collapses `"aa"|"bb"` and `61|62` to
-// `string`/`i32` (`registry-by-type-id.md` §3 measures the gap against `repCanonId`).
-export function canonUnionKeyOfName(name: string): i32 {
-  if name.length == 0 { return -1 }
-  cukIdOfText(cukTextOfName(name))
-}
-
-// `canonUnionKeyText(name)`, rendered once per spelling while the memo holds.
-function cukTextOfName(name: string): string {
-  cukMemoSync()
-  const hit = cukTextMemo[name]
-  if hit != null { return hit }
-  const text = canonUnionKeyText(name)
-  cukTextMemo[name] = text
-  text
-}
-
-// The key text `name` denotes, the member sequence its key is minted from; "" for "".
-export function canonUnionKeyTextOfName(name: string): string {
-  if name.length == 0 { return "" }
-  cukTextOfName(name)
-}
-
-// The id of a rendered key text, minted on first sight; -1 for "".
-function cukIdOfText(text: string): i32 {
-  if text.length == 0 { return -1 }
-  const at = cukIds[text] ?? -1
-  if at >= 0 { return at }
-  const id = cukTexts.length
-  cukTexts.push(text)
-  cukIds[text] = id
-  id
-}
-
-// A spelling's key text, memoised by spelling. The render reads the alias
-// tables and the arena, so the memo holds only while none of them has been rewritten.
-let cukTextMemo: {[string]: string} = Map()
-
-const cukMemoKey = memoKeyNew(4)
-
-function cukMemoSync() {
-  let moved = memoMoved(cukMemoKey, 0, tyMutEpoch)
-  moved = memoMoved(cukMemoKey, 1, cUserTypesVer) || moved
-  moved = memoMoved(cukMemoKey, 2, gRootStmts.length) || moved
-  moved = memoMoved(cukMemoKey, 3, tyVarRenames) || moved
-  if moved { cukTextMemo = Map() }
-  0
-}
-
-// The key for an arena type — the route a querier holding only a type takes to the row a
-// producer minted from a spelling. The text keeps a union alias member as its name, so the
-// spelling's alias expansion still keys it. -1 when `ty` is not a union shape at all, since a
-// coverage hole reading as a disagreement picks the wrong row.
-export function canonUnionKeyOfTy(ty: i32): i32 {
-  const text = canonUnionKeyTextOfTy(ty)
-  if text.length == 0 { return -1 }
-  canonUnionKeyOfName(text)
-}
 
 // The module bindings whose checked type is one of the scalars a wasm global can export
 // (`i32`, `i64`, `f32`, `f64`, `boolean`), by merged name — what the emitter asks before it
