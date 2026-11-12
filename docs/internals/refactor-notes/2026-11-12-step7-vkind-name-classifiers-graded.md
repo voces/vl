@@ -72,8 +72,13 @@ types may have retired that premise; it is probed next.
   type.
 - **`emitUnionLitIs`:** `nameIsQuotedLeaf` classifies a source literal's lexeme (string, float
   or integer), not a type's spelling.
-- **`flatHasSubWordField`:** a `flat` field's sub-word width (`u8`, `i8`, `u16`, `i16`) is a
-  storage spelling. The arena types it as `i32`, so the spelling is the only record of the
-  width. A nested `flat` is found by its declaration's name.
+- **`flatHasSubWordField`: a gap, not a contract.** No DECISIONS entry rules that a `flat`
+  field's sub-word width is a storage attribute of the declaration rather than of its type.
+  The rule is stated only in the checker's `flatStorageSpellWidth` comment and the 2026-11-11
+  lane-B note. The arena has `u8` and no `i8`, `i16` or `u16`. Probing that showed every
+  sub-word field types as `u8`: a legal `i16` literal is refused with a `u8` range message. A
+  computed value is not narrowed, unlike a `u8[]` element. Filed as D15978. The name read stays
+  until D15978's ruling. The nested `flat` lookup by its declaration's name
+  (`flatDeclByName`) is declaration identity.
 - **`elabArgRepins`:** a bare type-parameter annotation is identified by its declared name in
   `fnTyParams`, which is a type parameter's identity.
