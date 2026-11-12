@@ -98,6 +98,7 @@ import {
   fnCloCoerceSetAt,
   fnCloCoerceTyOf,
   listCopyTyOf,
+  listRecCopies,
   mapUnboxTyOf,
   narListReadsDecl,
   nodeCtxTyIxOf,
@@ -3084,7 +3085,14 @@ function rcReadSource(
   reReadable: boolean,
   fnIx: i32,
 ) {
-  if reReadable {
+  if rcElemSL >= 0 {
+    // An element-by-element list copy reads its source element off the loop's own locals.
+    fbLocalGet(rcElemSL)
+    fbStructGet(rcElemWrap, 0)
+    fbLocalGet(rcElemIL)
+    fbArrayGet(rcElemBack)
+    fbRefCast(sHeap)
+  } else if reReadable {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   } else {
     fbLocalGet(variantReboxSlot)
@@ -3307,13 +3315,28 @@ function emitRecCopyLevel(
     if sk >= 0 && vk >= 0 && sk != vk {
       if njConvert(sk, vk) < 0 { return -1 }
     }
+    // A list of records copied into a list of another record row is copied element by element.
+    if recCopyFromOf(exprIx) < 0 {
+      const lst = nonNullTy(
+        rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), dNames[fj]),
+      )
+      const ldt = nonNullTy(
+        rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), dNames[fj]),
+      )
+      if rcRecListsApart(lst, ldt) {
+        const ls = repSlotOfKind("reflist", lst)
+        if emitRecListCopyTop(body, exprIx, lst, ldt, ls, fnIx) < 0 {
+          return -1
+        }
+      }
+    }
     // A list of numbers copied into a list of a wider number is widened element by element.
     if recCopyFromOf(exprIx) < 0 {
       const le = rcScalarListElem(
-        rcFieldTy(rcPathTy(nodeTyIxOf(exprIx), pre), dNames[fj]),
+        rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), dNames[fj]),
       )
       const de = rcScalarListElem(
-        rcFieldTy(rcPathTy(recCopyTyOf(exprIx), pre), dNames[fj]),
+        rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), dNames[fj]),
       )
       if le != null && de != null && le != de {
         if emitScalarListWidenTop(body, le, de) < 0 { return -1 }
@@ -3321,6 +3344,159 @@ function emitRecCopyLevel(
     }
     fj = fj + 1
   }
+  0
+}
+
+// The record types an element-by-element list copy reads its fields at, or -1 outside one.
+let rcElemSrc = -1
+let rcElemDst = -1
+
+// The locals an element-by-element list copy reads its source element through (the source
+// wrapper and the index) and that list's row, or -1 outside one; and how many loops enclose it.
+let rcElemSL = -1
+let rcElemIL = -1
+let rcElemWrap = -1
+let rcElemBack = -1
+let rcLoopDepth = 0
+
+// The source and destination records a copy of `exprIx` reads its field types off.
+function rcSrcTyOf(exprIx: i32): i32 {
+  if rcElemSrc >= 0 { rcElemSrc } else { nodeTyIxOf(exprIx) }
+}
+
+function rcDstTyOf(exprIx: i32): i32 {
+  if rcElemDst >= 0 { rcElemDst } else { recCopyTyOf(exprIx) }
+}
+
+// The list of records just emitted for `exprIx`, copied element by element into the list `lct`'s
+// row (`emitRecListCopyTop`); 1 where the pair is not two record lists stored apart.
+function emitRecListCopy(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
+  const st = nonNullTy(nodeTyIxOf(exprIx))
+  const dt = nonNullTy(instTyOrSelf(lct, fnIx))
+  if !rcRecListsApart(st, dt) { return 1 }
+  emitRecListCopyTop(
+    body,
+    exprIx,
+    st,
+    dt,
+    exprEmittedRefListSlot(exprIx, fnIx),
+    fnIx,
+  )
+}
+
+// Whether `st` and `dt` are lists of records whose element rows differ.
+function rcRecListsApart(st: i32, dt: i32): boolean {
+  if st < 0 || dt < 0 || st >= T.tys.length || dt >= T.tys.length {
+    return false
+  }
+  const sa = tyAt(st)
+  const da = tyAt(dt)
+  if !(sa is TyArray) || !(da is TyArray) { return false }
+  const se = sa.aElem
+  const de = da.aElem
+  if se < 0 || de < 0 || !(tyAt(se) is TyObj) || !(tyAt(de) is TyObj) {
+    return false
+  }
+  const ssi = rcRowOfTy(se)
+  const dsi = rcRowOfTy(de)
+  ssi >= 0 && dsi >= 0 && sHeapIdx[ssi] != sHeapIdx[dsi]
+}
+
+// The list of records `st` on the stack, at ref-list slot `srcSlot`, copied into the list `dt`'s
+// row: each element read off the loop's locals and copied by `emitRecCopyLevel` at the element
+// types. A nested copy loop takes the next pair of temps (`rcLoopDepth`).
+function emitRecListCopyTop(
+  body: u8[],
+  exprIx: i32,
+  st: i32,
+  dt: i32,
+  srcSlot: i32,
+  fnIx: i32,
+): i32 {
+  const sa = tyAt(st)
+  const da = tyAt(dt)
+  const se = if sa is TyArray { sa.aElem } else { -1 }
+  const de = if da is TyArray { da.aElem } else { -1 }
+  const ssi = rcRowOfTy(se)
+  const dsi = rcRowOfTy(de)
+  const dstSlot = repSlotOfKind("reflist", dt)
+  if (
+    ssi < 0
+    || dsi < 0
+    || srcSlot < 0
+    || dstSlot < 0
+    || srcSlot >= rlWrapIdx.length
+    || dstSlot >= rlWrapIdx.length
+    || srcSlot >= rlBackIdx.length
+    || dstSlot >= rlBackIdx.length
+  ) {
+    return emitFailAt(
+      "emitProgram: a list of records copied element by element has no row",
+      exprIx,
+    )
+  }
+  const srcWrap = rlWrapIdx[srcSlot]
+  const srcBack = rlBackIdx[srcSlot]
+  const dstWrap = rlWrapIdx[dstSlot]
+  const dstBack = rlBackIdx[dstSlot]
+  const sL = widenSrcWrapSlot(srcSlot)
+  const dL = widenDstBackSlot(dstSlot)
+  const iL = widenTmpSlot(2 * rcLoopDepth)
+  const nL = widenTmpSlot(2 * rcLoopDepth + 1)
+  const names: string[] = []
+  const rows: i32[] = []
+  let fj = 0
+  while fj < sFieldCount[dsi] {
+    names.push(sFieldNames[sFieldStart[dsi] + fj])
+    rows.push(sFieldStart[dsi] + fj)
+    fj = fj + 1
+  }
+  emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
+  fbLocalGet(dL)
+  fbLocalGet(iL)
+  const ps = rcElemSrc
+  const pd = rcElemDst
+  const pSL = rcElemSL
+  const pIL = rcElemIL
+  const pWrap = rcElemWrap
+  const pBack = rcElemBack
+  const pHeap = rcPathHeap
+  const pField = rcPathField
+  rcElemSrc = se
+  rcElemDst = de
+  rcElemSL = sL
+  rcElemIL = iL
+  rcElemWrap = srcWrap
+  rcElemBack = srcBack
+  rcPathHeap = []
+  rcPathField = []
+  rcLoopDepth = rcLoopDepth + 1
+  const r = emitRecCopyLevel(
+    body,
+    exprIx,
+    sHeapIdx[ssi],
+    false,
+    ssi,
+    dsi,
+    de,
+    "",
+    names,
+    rows,
+    fnIx,
+  )
+  rcLoopDepth = rcLoopDepth - 1
+  rcElemSrc = ps
+  rcElemDst = pd
+  rcElemSL = pSL
+  rcElemIL = pIL
+  rcElemWrap = pWrap
+  rcElemBack = pBack
+  rcPathHeap = pHeap
+  rcPathField = pField
+  if r < 0 { return -1 }
+  fbStructNew(sHeapIdx[dsi])
+  fbArraySet(dstBack)
+  emitCopyLoopClose(iL, dL, nL, dstWrap)
   0
 }
 
@@ -3343,8 +3519,8 @@ function rcWrapKind(
 ): i32 {
   if !fieldRowIsUnionBox(dr) || recCopyFromOf(exprIx) >= 0 { return -1 }
   if fieldRowNumKind(sr) < 0 && !fieldRowIsStr(sr, false) { return -1 }
-  const st = rcFieldTy(rcPathTy(nodeTyIxOf(exprIx), pre), name)
-  const dt = rcFieldTy(rcPathTy(recCopyTyOf(exprIx), pre), name)
+  const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
+  const dt = rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), name)
   if st < 0 || dt < 0 { return -1 }
   const inner = nullableInnerOrNone(dt)
   if inner >= 0 && tySame(st, inner) { return boxTagOfTy(st) }
@@ -30080,6 +30256,11 @@ function instTyOrSelf(t: i32, fnIx: i32): i32 {
 // The conversion of a list value just emitted at its own row into the row of `lct`, the list
 // its delivery copies into, where the two storages differ. Returns 0, or -1 failed.
 function emitListCopyTail(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
+  // A fresh call's list of records is copied element by element (`recFreshCallCopy`).
+  if listRecCopies > 0 {
+    const rc = emitRecListCopy(body, exprIx, lct, fnIx)
+    if rc != 1 { return rc }
+  }
   // A scalar list converts each number; a pair no convert serves is delivered as built.
   const ld = repOfTy(instTyOrSelf(lct, fnIx))
   if ld.rdCovered == 1 {
@@ -35493,6 +35674,13 @@ function initBitOf(gi: i32): i32 {
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
   coerceHeld = -1
+  rcElemSrc = -1
+  rcElemDst = -1
+  rcElemSL = -1
+  rcElemIL = -1
+  rcElemWrap = -1
+  rcElemBack = -1
+  rcLoopDepth = 0
   boxSeat = -1
   armSeat = -1
   armServed = -1
