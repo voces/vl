@@ -4,7 +4,19 @@
 
 import { i32ToStr } from "./ast"
 import { canonUnionMemberTysOf } from "./check_program"
-import { T, TyArray, TyUnion, tyAt, tyToStructStr } from "./check_types"
+import {
+  T,
+  TyArray,
+  TyFunc,
+  TyNullable,
+  TyObj,
+  TyUnion,
+  cUserTypesVer,
+  nomNameOfTy,
+  tyAt,
+  tyMutEpoch,
+  tyToStructStr,
+} from "./check_types"
 import { strLess } from "./emit_base"
 import { unTyKeyFirstRow } from "./emit_state"
 import { flattenVariantsInto } from "./tyquery"
@@ -69,7 +81,7 @@ function utkTyText(ty: i32, path: i32[], cyc: i32[]): string {
     path.pop()
     return "[" + e + "]"
   }
-  tyToStructStr(ty)
+  utkShapeText(ty)
 }
 
 // A walk node's kind, its children appended to `out`: 1 a union of two or more members, 2 a
@@ -92,8 +104,66 @@ function utkNodeKids(ty: i32, out: i32[]): i32 {
 
 function utkLeafText(ty: i32): string {
   if ty < 0 { return "null" }
-  tyToStructStr(ty)
+  utkShapeText(ty)
 }
+
+// A leaf's text: a record spelled by its field names and each field's member text id, a function
+// by its parameters' and result's, so a shared sub-shape is keyed once and a diamond stays
+// linear; a newtype by its name and any other leaf by its structural render. A record already on
+// the walk keys as the render's cycle mark.
+function utkShapeText(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return tyToStructStr(ty) }
+  const nn = nomNameOfTy(ty)
+  if nn != "" { return nn }
+  const t = tyAt(ty)
+  if !(t is TyObj) && !(t is TyFunc) { return tyToStructStr(ty) }
+  while utkShapeId.length <= ty {
+    utkShapeId.push(-1)
+    utkShapeStamp.push(-1)
+    utkShapeVer.push(-1)
+  }
+  if utkShapeStamp[ty] == tyMutEpoch && utkShapeVer[ty] == cUserTypesVer {
+    return utkTexts[utkShapeId[ty]]
+  }
+  for o in utkShapeOpen {
+    if o == ty { return "…" }
+  }
+  utkShapeOpen.push(ty)
+  let out = ""
+  if t is TyObj {
+    out = "{"
+    let i = 0
+    while i < t.objFieldNames.length {
+      if i > 0 { out = out + ", " }
+      out = out
+        + t.objFieldNames[i]
+        + ": #"
+        + i32ToStr(utkIdOf(utkMemberText(t.objFieldTypes[i])))
+      i = i + 1
+    }
+    out = out + "}"
+  } else if t is TyFunc {
+    out = "("
+    let i = 0
+    while i < t.fnParamTypes.length {
+      if i > 0 { out = out + ", " }
+      out = out + "#" + i32ToStr(utkIdOf(utkMemberText(t.fnParamTypes[i])))
+      i = i + 1
+    }
+    out = out + ") => #" + i32ToStr(utkIdOf(utkMemberText(t.fnRet)))
+  }
+  utkShapeOpen.pop()
+  utkShapeStamp[ty] = tyMutEpoch
+  utkShapeVer[ty] = cUserTypesVer
+  utkShapeId[ty] = utkIdOf(out)
+  out
+}
+
+// `utkShapeText`'s memo, as `utkTyKeyText`'s, and the records and functions it is inside.
+const utkShapeId: i32[] = []
+const utkShapeStamp: i32[] = []
+const utkShapeVer: i32[] = []
+const utkShapeOpen: i32[] = []
 
 // The text of cyclic member `root` with the walk's nodes merged by bisimulation: two nodes are
 // one when their unfoldings are the same tree, so a back-reference names a class, not an id.
@@ -240,10 +310,38 @@ export function utkTextOf(texts: string[]): string {
   out
 }
 
-// The key text of type `ty`'s canonical members, or "" when it has none.
+// The key text of type `ty`'s canonical members, or "" when it has none. Memoised per arena index
+// and stamped with `tyMutEpoch` and `cUserTypesVer`, so a type many lookups share is keyed once: a record's text is
+// its render, which doubles with each level of a diamond.
 export function utkTyKeyText(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  // Only a union or a nullable has a row; any other type keys nothing, as the softened key did.
+  const tt = tyAt(ty)
+  if !(tt is TyUnion) && !(tt is TyNullable) { return "" }
+  while utkMemoId.length <= ty {
+    utkMemoId.push(-1)
+    utkMemoStamp.push(-1)
+    utkMemoVer.push(-1)
+  }
+  if utkMemoStamp[ty] == tyMutEpoch && utkMemoVer[ty] == cUserTypesVer {
+    const hit = utkMemoId[ty]
+    return if hit >= 0 { utkTexts[hit] } else { "" }
+  }
+  const t = utkTyKeyTextGo(ty)
+  utkMemoStamp[ty] = tyMutEpoch
+  utkMemoVer[ty] = cUserTypesVer
+  utkMemoId[ty] = if t == "" { -1 } else { utkIdOf(t) }
+  t
+}
+
+// `utkTyKeyText`'s memo: the key text's id per arena index, -1 for none, and its two stamps.
+const utkMemoId: i32[] = []
+const utkMemoStamp: i32[] = []
+const utkMemoVer: i32[] = []
+
+function utkTyKeyTextGo(ty: i32): string {
   const mems: i32[] = []
-  if ty < 0 || !canonUnionMemberTysOf(ty, mems) { return "" }
+  if !canonUnionMemberTysOf(ty, mems) { return "" }
   const texts: string[] = []
   for m in mems { texts.push(utkMemberText(m)) }
   utkTextOf(texts)
