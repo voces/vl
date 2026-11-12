@@ -3506,6 +3506,17 @@ function emitListConvTop(
     if le != de { return emitScalarListWidenTop(body, le, de) }
     return 0
   }
+  // A scalar list into a list of a `| null` or a union is boxed element by element.
+  const bk = rcListBoxAtom(st, dt)
+  // A string list is no scalar list, but boxes the same way under the string atom.
+  let lk = le
+  if le == null && bk == 2 { lk = "str" }
+  // A destination with no union-box row (`(string | null)[]`) stores the source's elements as
+  // they are.
+  const bs = if bk >= 0 { repSlotOfKind("reflist", dt) } else { -1 }
+  if lk != null && bs >= 0 {
+    return emitScalarListBoxTop(lk, bk, bs, SPREAD_NUL_NONE, rcLoopDepth)
+  }
   if rcRecListsApart(st, dt) {
     return emitRecListCopyTop(
       body,
@@ -13475,6 +13486,7 @@ function emitSpreadGroupBoxed(
     ak,
     row,
     spreadSrcNulMode(grp, fnIx),
+    0,
   )
 }
 
@@ -30105,6 +30117,31 @@ function scalarBoxWidenOp(srcKind: VKind, atomK: i32): i32 {
   -1
 }
 
+// The value atom a scalar list `st`'s elements are boxed under in the list `dt` whose element is a
+// `| null` holding them (or a number they widen to) or a union listing them, else -1.
+function rcListBoxAtom(st: i32, dt: i32): i32 {
+  if st < 0 || dt < 0 || st >= T.tys.length || dt >= T.tys.length { return -1 }
+  const sa = tyAt(st)
+  const da = tyAt(dt)
+  if !(sa is TyArray) || !(da is TyArray) || sa.aElem < 0 || da.aElem < 0 {
+    return -1
+  }
+  const se = sa.aElem
+  const d = tyAt(da.aElem)
+  if !(tyAt(se) is TyPrim) { return -1 }
+  if d is TyNullable {
+    if tySame(d.nInner, se) { return boxTagOfTy(se) }
+    if rcWidenTo(boxTagOfTy(se), d.nInner) >= 0 { return boxTagOfTy(d.nInner) }
+    return -1
+  }
+  if d is TyUnion {
+    for m in d.uMembers {
+      if tySame(m, se) { return boxTagOfTy(se) }
+    }
+  }
+  -1
+}
+
 // Consume a scalar list of `srcKind` on the stack and leave a `(ref $rlWrapIdx[dstSlot])` whose
 // union-box elements each hold one source element under value atom `atomK`'s tag: the boxing
 // sibling of `emitScalarListWidenTop`, for a spread into a list of a union element (D2869).
@@ -30114,6 +30151,7 @@ function emitScalarListBoxTop(
   atomK: i32,
   dstSlot: i32,
   nul: i32,
+  depth: i32,
 ) {
   const conv = scalarBoxWidenOp(srcKind, atomK)
   if conv == -2 {
@@ -30143,8 +30181,9 @@ function emitScalarListBoxTop(
   if srcKind == "str" { sk = "strlist" }
   const sL = widenScalarWrapSlot(sk)
   const dL = widenDstBackSlot(dstSlot)
-  const iL = widenTmpSlot(0)
-  const nL = widenTmpSlot(1)
+  // Inside an element-by-element copy, the next pair of temps.
+  const iL = widenTmpSlot(2 * depth)
+  const nL = widenTmpSlot(2 * depth + 1)
   emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
   // block { loop { if i >= n br 1; back[i] = {tag, box(src.back[i])}; i++; br 0 } }
   fbLocalGet(dL)
