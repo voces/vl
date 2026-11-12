@@ -1,3 +1,4 @@
+import { armRowsOfUnionTy } from "./emit_classify"
 import { unMemPeelAliasWrapper } from "./emit_union_tykey_text"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { unionArmRowOfTy } from "./emit_local_slots"
@@ -1381,6 +1382,7 @@ import {
   rlWidenAllowed,
   rlWidenTagOf,
 } from "./emit_ref_list_kinds"
+import { internInlineShapeTy } from "./emit_shape_intern"
 import {
   ALK_F64,
   ALK_I64,
@@ -1430,6 +1432,7 @@ import {
   rlElemTyIxAt,
   rlSlotOfTy,
   sFieldIndex,
+  uFieldElemTyIxRow,
 } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
@@ -9148,23 +9151,14 @@ function emitUnionCoerceValueAtom(
     fbStructNew(uBoxIdx) // { tag, member-string ref }
     return 0
   }
-  return emitUnionCoerceAtomBox(
-    body,
-    unionName,
-    uSet,
-    uTy,
-    exprIx,
-    bareIx,
-    fnIx,
-  )
+  return emitUnionCoerceAtomBox(body, uSet, uTy, exprIx, bareIx, fnIx)
 }
 
-// The value-atom box `{ tag, payload }` for `exprIx` entering `unionName`: the atom ladder
+// The value-atom box `{ tag, payload }` for `exprIx` entering set `uSet`: the atom ladder
 // settles one value-atom code, and the tag, the payload's widening and any list re-encode all
 // follow from it. `bareIx` is the paren-stripped node. Returns 0, or -1 once failed.
 function emitUnionCoerceAtomBox(
   body: u8[],
-  unionName: string,
   uSet: i32,
   uTy: i32,
   exprIx: i32,
@@ -9172,7 +9166,7 @@ function emitUnionCoerceAtomBox(
   fnIx: i32,
 ) {
   const cak = coerceListAtomOf(
-    coerceValueAtomKind(unionName, uSet, uTy, exprIx, bareIx, fnIx),
+    coerceValueAtomKind(uSet, uTy, exprIx, bareIx, fnIx),
     uTy,
     bareIx,
     fnIx,
@@ -9200,7 +9194,6 @@ function emitUnionCoerceAtomBox(
 
 // The value-atom code `exprIx` boxes at entering `unionName`, before any list widening.
 function coerceValueAtomKind(
-  unionName: string,
   uSet: i32,
   uTy: i32,
   exprIx: i32,
@@ -9255,8 +9248,8 @@ function coerceValueAtomKind(
     if bcode == 17 || bcode == 18 { cak = bcode }
     // A literal the union holds as another list on the same storage (`[false]` into a
     // `(boolean | null)[]` arm) takes that arm's code.
-    if cak == 17 && !unionHasAtomKindArm(unionName, 17) {
-      if unionHasAtomKindArm(unionName, 18) { cak = 18 }
+    if cak == 17 && !unionHasAtomKindArm(coerceSetOf(uSet, uTy), 17) {
+      if unionHasAtomKindArm(coerceSetOf(uSet, uTy), 18) { cak = 18 }
     }
   } else if exprIsV128(exprIx, fnIx) {
     cak = 14 // "v128"
@@ -9945,8 +9938,8 @@ function emitUnionWideArmBox(
     return 0
   }
   const vty = nodeTyAt(unwrapParen(exprIx), fnIx)
-  const atoms: string[] = []
-  unionArmsOfTy(unionName, unionTy, atoms)
+  const atoms: i32[] = []
+  unionArmRowsOfTy(unionName, unionTy, atoms)
   // A nullable record: its null is the union's, else it boxes as the record does.
   if tyBearsNull(vty) {
     if exprUnion(exprIx, fnIx) { return 0 }
@@ -10026,15 +10019,23 @@ function wideRetagPairs(
   fromTags: i32[],
   toTags: i32[],
 ) {
-  const vur: i32[] = []
-  const vun = unionNameRowOfExpr(exprIx, fnIx, vur)
-  if vun == "" || vun == unionName { return 0 }
-  const fa: string[] = []
-  unionArmsOfSet(vun, msSetOfRowOr(vur[0], vun), fa)
-  const ta: string[] = []
-  unionArmsOfTy(unionName, unionTy, ta)
-  for a in fa {
-    const vi = variantIndexOf(a)
+  const fa: i32[] = []
+  const sty = unionBoxTyIxOfExpr(exprIx, fnIx)
+  const sa: string[] = []
+  if sty >= 0 && armRowsOfUnionTy(sty, sa, fa) {
+    if tySame(sty, unionTy) { return 0 }
+  } else {
+    // The expression's union type does not resolve its arms: its registered spelling does.
+    const vur: i32[] = []
+    const vun = unionNameRowOfExpr(exprIx, fnIx, vur)
+    if vun == "" || vun == unionName { return 0 }
+    const fan: string[] = []
+    unionArmsOfSet(vun, msSetOfRowOr(vur[0], vun), fan)
+    for a in fan { fa.push(variantIndexOf(a)) }
+  }
+  const ta: i32[] = []
+  unionArmRowsOfTy(unionName, unionTy, ta)
+  for vi in fa {
     if vi >= 0 && vi < uTags.length && !armsHoldHeap(ta, variantHeap(vi)) {
       const w = wideArmOfRow(variantRowOf(vi), ta)
       if w >= 0 && w < uTags.length {
@@ -10073,27 +10074,35 @@ function emitWideRetagChain(fromTags: i32[], toTags: i32[]) {
   0
 }
 
-// Whether one of the arms named `atoms` is on heap type `heap`.
-function armsHoldHeap(atoms: string[], heap: i32): boolean {
+// `armRowsOfUnionTy` of `unionName`'s type `unionTy`, else the rows its arms' spellings name.
+function unionArmRowsOfTy(unionName: string, unionTy: i32, rows: i32[]) {
+  const ta: string[] = []
+  if unionTy >= 0 && armRowsOfUnionTy(unionTy, ta, rows) { return 0 }
+  const atoms: string[] = []
+  unionArmsOfTy(unionName, unionTy, atoms)
+  for a in atoms { rows.push(variantIndexOf(a)) }
+  0
+}
+
+// Whether one of the variant rows `arms` is on heap type `heap`.
+function armsHoldHeap(arms: i32[], heap: i32): boolean {
   if heap < 0 { return false }
-  for a in atoms {
-    const vi = variantIndexOf(a)
+  for vi in arms {
     if vi >= 0 && variantHeap(vi) == heap { return true }
   }
   false
 }
 
-// The arm among `atoms` whose row is on struct row `si`'s supertype chain, or -1; -1 too when
-// `si` is itself on one of their heaps, since then the value is that arm.
-function wideArmOfRow(si: i32, atoms: string[]): i32 {
-  if si < 0 || si >= sHeapIdx.length || armsHoldHeap(atoms, sHeapIdx[si]) {
+// The variant row among `arms` whose struct row is on struct row `si`'s supertype chain, or -1;
+// -1 too when `si` is itself on one of their heaps, since then the value is that arm.
+function wideArmOfRow(si: i32, arms: i32[]): i32 {
+  if si < 0 || si >= sHeapIdx.length || armsHoldHeap(arms, sHeapIdx[si]) {
     return -1
   }
   let x = sSuperAt(si)
   let guard = 0
   while x >= 0 && guard < 64 {
-    for a in atoms {
-      const vi = variantIndexOf(a)
+    for vi in arms {
       if vi >= 0 && variantRowOf(vi) == x { return vi }
     }
     x = sSuperAt(x)
@@ -10803,11 +10812,6 @@ function emitUnionConcreteEq(
   // value-union gate below reads its banked member codes instead of re-splitting the
   // rendering.
   const usid = msSetOfUnionBox(boxIx, fnIx)
-  // The arm spellings with a declared alias resolved, and the litunion-arm shape admitted beside
-  // the plain value union — the same two lines `emitUnionLitIs` carries, for the same reason: a
-  // `K | i32` box is a value-union box with the litunion arm riding it as its member string, and
-  // both the gate and the arm-membership test read a name.
-  const unmArms = unionMemberSetOfRow(unr[0], uname)
   // D1071 — the other operand's rep code, with a real "not an atom" answer. `-1` here is out of
   // band; the two branches below are the only readers, and both consume the code rather than a
   // spelling. `valueAtomNameOfKind` re-derives the spelling for the membership test's decline
@@ -10843,7 +10847,7 @@ function emitUnionConcreteEq(
   // plain `string` arm or a literal-union arm, `msSetTakesAtomAsStr`'s question and
   // `emitUnionLitIs`'s second leg. The gate asks it too: an alias arm beside a record (`K | E`)
   // has no banked string kind, and the box carries it as one (D4340).
-  let eqHasArm = unionEqArmPresent(usid, unmArms, atom, eak)
+  let eqHasArm = unionEqArmPresent(usid, atom, eak)
   if !eqHasArm && eak == 2 && msSetTakesAtomAsStr(usid) { eqHasArm = true }
   if (
     uname == ""
@@ -10989,13 +10993,8 @@ function unionEqTagOfArmTy(k: i32, armTy: i32): i32 {
 // on whether the code has a spelling: the seven scalar codes take the banked `unionHasAtomK`
 // with its keyword fall-through, and a container code — which `valueAtomNameOfKind` cannot name,
 // 7 being `i32[]` and `boolean[]` and `K[]` — takes the member walk. Both readers ask here.
-function unionEqArmPresent(
-  usid: i32,
-  unmArms: string,
-  atom: string,
-  eak: i32,
-): boolean {
-  if atom == "" { return unionHasAtomKindArm(unmArms, eak) }
+function unionEqArmPresent(usid: i32, atom: string, eak: i32): boolean {
+  if atom == "" { return unionHasAtomKindArm(usid, eak) }
   unionHasAtomK(usid, atom, eak)
 }
 
@@ -11775,16 +11774,19 @@ function emitVariantFieldEqCoreAt(
   emitFail("emitProgram: unsupported variant field type in equality")
 }
 
-// D974 — the struct row variant `vi`'s nested-record field `ufi` (a flat row) is stored at,
-// found by the field's type; a type with no row has already had the arm mint's one chance.
+// D974 — the interned struct row of variant `vi`'s field `ufi` (a flat row) NESTED shape, or
+// -1: the row the type section stores it at, else its inline shape interned.
 function variantNestedRow(vi: i32, ufi: i32): i32 {
   if vi < 0 || vi >= uFieldStart.length { return -1 }
-  if ufi < 0 || ufi >= sFieldTypes.length { return -1 }
+  if ufi < 0 || ufi >= sFieldElemName.length { return -1 }
+  const nm = sFieldElemName[ufi]
+  if nm == "" { return -1 }
   const stored = uFieldTgtStructIdx(vi, ufi - uFieldStart[vi])
   if stored >= 0 && stored < sHeapIdx.length { return stored }
-  emitFail(
-    "emitProgram: a variant's nested record field has no struct row to compare it at",
-  )
+  const row = internInlineShapeTy(nm, uFieldElemTyIxRow(ufi))
+  if row < 0 { return -1 }
+  if row >= sHeapIdx.length { return -1 }
+  row
 }
 
 // Compare two NESTED shape refs already on the stack, field-wise. Unlike the arms themselves,
@@ -13560,9 +13562,7 @@ function emitSpreadGroupBoxed(
     }
     return emitRefListWidenTop(body, s, row)
   }
-  let un = ""
-  if row >= 0 && row < rlElemName.length { un = rlElemUnionName(row) }
-  const ak = spreadSrcBoxAtom(grp, un, fnIx)
+  const ak = spreadSrcBoxAtom(grp, row, fnIx)
   // Unreachable past `spreadSrcBoxes`, which admits only a scalar source whose element is a
   // member or widens to one.
   if k == null || k == "u8list" || ak < 0 {
@@ -36462,7 +36462,7 @@ function emitPrintValueUnion(body: u8[], argIx: i32, kinds: i32[], fnIx: i32) {
   const puIf = nodeAt(unwrapParen(argIx))
   let puDone = false
   if puIf is IfStmt {
-    const puNm = unionNameOfExpr(argIx, fnIx)
+    const puNm = boxTyName(nodeTyIxOf(argIx))
     if puNm != "" {
       if emitUnionBoxOwed(body, puNm, nodeTyIxOf(argIx), argIx, fnIx) < 0 {
         return -1

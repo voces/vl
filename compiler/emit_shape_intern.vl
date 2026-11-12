@@ -1,7 +1,7 @@
 // `emit_shape_intern.vl` — interning inline and deep shapes, function-type shapes
 // and ref-array arms into the shape tables.
 
-import { cUserTypes } from "./check_types"
+import { cUserTypes, numLitUnionBaseTy, tyIsLitUnionOrLit } from "./check_types"
 import { opaqueSNamesOn } from "./opaque_snames_state"
 import { i32ToStr } from "./ast"
 import { fieldNameOrder } from "./check_obj_shape"
@@ -55,7 +55,6 @@ import {
 import {
   arrLeafNameOf,
   nameIsShapeSpanEnds,
-  normTypeAtom,
   shapeInnerFieldSplit,
   tyIsStrLitSetList,
 } from "./emit_base"
@@ -72,6 +71,7 @@ import {
   boolLeafListDepthOfTy,
   unionRowArmTys,
   unionSetArmTysAB,
+  unionTyArms,
 } from "./emit_map_twins"
 import { nonNulBaseOf } from "./emit_map_value_slots"
 import { variantIndexOf } from "./emit_local_slots"
@@ -94,7 +94,6 @@ import {
 import {
   armFieldStructRow,
   armTwinRowName,
-  elemTyIsNominal,
   famRelayStructRow,
   fieldCodeOfDeclinedTy,
   fieldTypeRefusalMsg,
@@ -164,18 +163,14 @@ import {
 import { sFieldElemKeyKindAt, sFieldIndex } from "./emit_struct_order"
 import {
   markAtomLeafListArms,
-  registerValueUnionNameAB,
+  registerValueUnionOfTy,
 } from "./emit_union_atoms"
 import {
   isUNameKeyAB,
   unMemIsRefElemArray,
-  unRowOfName,
-  unionMemberTysOf,
   unionMemberTysOfAB,
-  unionSetAtomsOf,
-  unionSetMemberCount,
 } from "./emit_union_registry"
-import { strContains } from "./strutil"
+import {} from "./strutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
 import {
   annGenAppSpanEnds,
@@ -226,40 +221,20 @@ export function nameFieldCodeTy(t: string, ty: i32): i32 {
   emitFail(NESTED_FIELD_UNCODED)
 }
 
-// Interns each union arm whose core (trailing `[]`s peeled) is an inline `{…}` shape, via
-// `internShapeDeepTy` — the shared body of the paren-free and paren-carrying splits. The bare
-// `{` opener test at index 0 is the one grammar character-test this file keeps, since no
-// existing brace-family predicate covers a bare `len >= 1` opener test.
-function internShapeArms(set: string, arms: string[], setTy: i32) {
-  // Arena hand-over: `arms` is `unionSetAtomsOf(set)`, and the members come in that order. The
-  // row `set` is bound to answers, else the row `setTy` keys to; a set with neither, and no
-  // type, reads its member-set text.
-  const armTys: i32[] = []
-  let cov = false
-  const byTy = setTy >= 0 && unRowOfName(set) < 0
-  if !byTy { cov = unionMemberTysOf(set, armTys) }
-  if armTys.length != arms.length { cov = false }
-  const abTys: i32[] = []
-  let abCov = false
-  if !cov && setTy >= 0 { abCov = unionMemberTysOfAB(10, setTy, abTys) }
-  if abTys.length != arms.length { abCov = false }
-  if !cov && !abCov && setTy >= 0 {
-    abCov = unionArmTysByPos(setTy, arms, abTys)
-  }
+// Interns each arm of a union whose core (trailing `[]`s peeled) is an inline `{…}` shape, via
+// `internShapeDeepTy`, and walks each function arm's shapes. `arms` and `armTys` pair each
+// member's recorded atom with its type (`unionTyArms`). The bare `{` opener test is the one
+// grammar character-test this file keeps.
+function internShapeArms(arms: string[], armTys: i32[]) {
   let uai = 0
   while uai < arms.length {
-    let armTy = -1
-    if cov { armTy = armTys[uai] }
-    if abCov { armTy = abTys[uai] }
-    const fnTy = armTy
+    const armTy = armTys[uai]
     const uCore = arrLeafNameOf(arms[uai])
     if uCore.length >= 1 && uCore[0] == '{' {
       internShapeDeepTy(arms[uai], armTy)
-    } else if tyIsFuncArena(tyStepArrRun(fnTy, arms[uai], uCore)) {
+    } else if tyIsFuncArena(tyStepArrRun(armTy, arms[uai], uCore)) {
       // A closure arm: the inline shapes buried in its params or result are otherwise
-      // unreachable, since the arm is one spelling inside the union name. Routed through
-      // the soundness-gated functype interner, which keeps an unsupported-field shape
-      // un-interned — a clean reject, never invalid wasm.
+      // unreachable, since the arm is one spelling inside the union name.
       internFuncTypeShapesTy(arms[uai], armTy)
     }
     uai = uai + 1
@@ -267,28 +242,13 @@ function internShapeArms(set: string, arms: string[], setTy: i32) {
   0
 }
 
-// Pairs each of `arms` with the member of union `setTy` at its position, into `out`, as the
-// member list orders its atoms; false, with `out` cleared, when the counts differ or a record
-// arm's member is no record under the same list depth, or a non-record arm's member is one.
-function unionArmTysByPos(setTy: i32, arms: string[], out: i32[]): boolean {
-  while out.length > 0 { out.pop() }
-  const u = tyAt(setTy)
-  if !(u is TyUnion) || u.uMembers.length != arms.length { return false }
-  let i = 0
-  while i < arms.length {
-    const m = u.uMembers[i]
-    const core = arrLeafNameOf(arms[i])
-    const leaf = tyStepArrRun(m, arms[i], core)
-    const rec = core.length >= 1 && core[0] == '{'
-    const isObj = leaf >= 0 && tyAt(leaf) is TyObj
-    if rec != isObj {
-      while out.length > 0 { out.pop() }
-      return false
-    }
-    out.push(m)
-    i = i + 1
-  }
-  true
+// Whether the walk splits union `ty`, keyed `ln`, into its `n` arms: a declared union, a
+// literal set and a numeric literal union are one leaf, as their keys spell one atom.
+function shapeWalkSplitsUnion(ln: string, ty: i32, n: i32): boolean {
+  if n < 2 { return false }
+  if (cUserTypes[ln] ?? -1) >= 0 { return false }
+  if tyIsLitUnionOrLit(ty) { return false }
+  numLitUnionBaseTy(ty) < 0
 }
 
 // Peels the arena twin of a trailing-`[]` run, sized by how much the name shortened:
@@ -386,32 +346,29 @@ function internShapeDeepTyGo(nm: string, ty: i32) {
   const ln = shapeWalkKeyOf(nm, ty)
   if ln == "" { return 0 }
   if isValueUnionName(ln) {
-    registerValueUnionNameAB(7, ln, ty)
-    if strContains(ln, "=>") {
-      const vArms: string[] = []
-      unionSetAtomsOf(ln, vArms)
-      const vTys: i32[] = []
-      let vCov = unionMemberTysOfAB(10, ty, vTys)
-      if vTys.length != vArms.length { vCov = false }
-      let va = 0
-      while va < vArms.length {
-        let vTy = -1
-        if vCov { vTy = vTys[va] }
-        if tyIsFuncArena(vTy) {
-          internFuncTypeShapesTy(normTypeAtom(vArms[va]), vTy)
-        }
-        va = va + 1
+    registerValueUnionOfTy(7, ty)
+    // A closure member may bury inline shapes in its params or result, unreachable through the
+    // box registration alone; the functype interner keeps an unsupported-field shape un-interned.
+    const vTys: i32[] = []
+    if unionMemberTysOfAB(10, ty, vTys) {
+      for m in vTys {
+        if tyIsFuncArena(m) { internFuncTypeShapesTy("", m) }
       }
     }
     return 0
   }
   if tyIsFuncArena(ty) { return internFuncTypeShapesTy(ln, ty) }
   if t is TyNullable { return internShapeDeepTy("", t.nInner) }
-  if t is TyUnion && unionSetMemberCount(ln) > 1 {
+  if t is TyUnion {
     const uArms: string[] = []
-    unionSetAtomsOf(ln, uArms)
-    internShapeArms(ln, uArms, ty)
-    return 0
+    const uTys: i32[] = []
+    if (
+      unionTyArms(ty, uArms, uTys)
+      && shapeWalkSplitsUnion(ln, ty, uArms.length)
+    ) {
+      internShapeArms(uArms, uTys)
+      return 0
+    }
   }
   if t is TyArray { return internShapeDeepTy("", tyStepElem(ty)) }
   if t is TyMap { return internShapeDeepTy("", tyMapValOf(ty)) }
@@ -537,7 +494,7 @@ function internFuncTypeShapesTyGo(nm: string, ty: i32): i32 {
   // a producer-less closure-arm annotation otherwise leaves the box un-minted while a narrowed
   // call's unbox casts to a default type-0 index, invalid wasm.
   if isValueUnionName(ln) {
-    registerValueUnionNameAB(8, ln, ty)
+    registerValueUnionOfTy(8, ty)
     return 0
   }
   match t {
@@ -550,7 +507,14 @@ function internFuncTypeShapesTyGo(nm: string, ty: i32): i32 {
     }
     // A composite union: `internShapeDeepTy` owns the arm grammar, so this delegates.
     TyUnion => {
-      if unionSetMemberCount(ln) > 1 { internShapeDeepTy(ln, ty) }
+      const fArms: string[] = []
+      const fTys: i32[] = []
+      if (
+        unionTyArms(ty, fArms, fTys)
+        && shapeWalkSplitsUnion(ln, ty, fArms.length)
+      ) {
+        internShapeDeepTy(ln, ty)
+      }
     }
     TyArray => {
       internFuncTypeShapesTy("", tyStepElem(ty))
@@ -694,7 +658,12 @@ function annShapeWiderRowOf(
           const rc = sFieldTypeAt(si, fi)
           if rc == FC_UNION && codes[i] != FC_UNION {
             boxed = true
-            if !unionSetNamesAtom(sFieldElemNameAt(si, fi), texts[i]) {
+            if (
+              !unionTyHasMemberTy(
+                colAt(sFieldStoreTy, sFieldStart[si] + fi),
+                shapeFieldRowOf(tyIx, names[i]),
+              )
+            ) {
               allIn = false
             }
           } else if rc == codes[i] {
@@ -726,20 +695,15 @@ function annShapeWiderRowOf(
   0 - 1
 }
 
-// Does the value-union member set `set` (`"i32|null"`, the spelling `sFieldElemName`
-// records) name `atom` as one of its members? Its atoms come
-// from `unionSetAtomsOf`, so a grouped or spaced spelling reads the same here as at the
-// mint.
-function unionSetNamesAtom(set: string, atom: string): boolean {
-  if set == "" { return false }
-  const at = normTypeAtom(atom)
-  if at == "" { return false }
-  const parts: string[] = []
-  unionSetAtomsOf(set, parts)
-  let i = 0
-  while i < parts.length {
-    if normTypeAtom(parts[i]) == at { return true }
-    i = i + 1
+// Whether union type `u` has a member of type `q` (`unionTyArms`); false where either is -1
+// or the union's arms are not covered.
+function unionTyHasMemberTy(u: i32, q: i32): boolean {
+  if u < 0 || q < 0 { return false }
+  const atoms: string[] = []
+  const tys: i32[] = []
+  if !unionTyArms(u, atoms, tys) { return false }
+  for m in tys {
+    if tySame(m, q) { return true }
   }
   false
 }
@@ -960,9 +924,8 @@ function iisPushFieldElem(
     const e5Open = e5Ty >= 0 && tyHasTyVar(e5Ty) && fieldElemTyIxOfName(e5) < 0
     recordSFieldElemRowTy(e5, fkK, if e5Open { e5Ty } else { -1 })
     if isValueUnionName(e5) {
-      registerValueUnionNameAB(
+      registerValueUnionOfTy(
         61,
-        e5,
         tyStepElem(shapeFieldRowOf(fieldsTy, names[pi])),
       )
     }
@@ -979,9 +942,8 @@ function iisPushFieldElem(
     sFieldElemName.push(e28)
     recordSFieldElemRow(e28, fkK) // D5 + B6b
     if isValueUnionName(e28) {
-      registerValueUnionNameAB(
+      registerValueUnionOfTy(
         62,
-        e28,
         tyStepElem(tyPeelNul(shapeFieldRowOf(fieldsTy, names[pi]))),
       )
     }
@@ -995,26 +957,19 @@ function iisPushFieldElem(
       codes[pi],
       shapeFieldRowOf(fieldsTy, names[pi]),
     )
-    // The field's own row, projected per code, where the name it accompanies is not
-    // one `repElemKey` keys nominally and the row is not a literal union.
+    // The field's own row, projected per code, unless it is a literal union: the element's
+    // type, never its stored name, decides its row (D6).
     let enTy = -1
     if en != "" {
-      if (
-        !elemTyIsNominal(
-          shapeFieldElemRow(shapeFieldRowOf(tyIx, names[pi]), codes[pi]),
-        )
-      ) {
-        const er = shapeFieldElemRow(
-          shapeFieldRowOf(tyIx, names[pi]),
-          codes[pi],
-        )
-        if (
-          !tyIsLitUnion(er)
-          && !tyIsLitUnionArray(er)
-          && !tyIsLitUnionAlias(er)
-        ) {
-          enTy = er
-        }
+      const er = shapeFieldElemRow(
+        shapeFieldRowOf(
+          if tyIx >= 0 { tyIx } else { fieldsTy },
+          names[pi],
+        ),
+        codes[pi],
+      )
+      if !tyIsLitUnion(er) && !tyIsLitUnionArray(er) && !tyIsLitUnionAlias(er) {
+        enTy = er
       }
     }
     sFieldElemName.push(en)
@@ -1023,7 +978,7 @@ function iisPushFieldElem(
     // box + the value-box reps it needs (this runs after `collectU`, but before any
     // type-index math).
     if codes[pi] == FC_UNION {
-      registerValueUnionNameAB(63, en, shapeFieldRowOf(tyIx, names[pi]))
+      registerValueUnionOfTy(63, shapeFieldRowOf(tyIx, names[pi]))
     }
   }
   0
@@ -1072,7 +1027,9 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       // row is pushed, so the flat `sField*` arrays are not corrupted by the re-entrant intern.
       const fldTy = tyFieldTyOf(fieldsTy, rawNames[fi])
       internShapeDeepTy(ftxt, fldTy)
-      let fc = nameFieldCodeTy(ftxt, fldTy)
+      // The field's code is read off its type; a field with no type (a caller that holds none)
+      // is coded from its text, the floor.
+      let fc = if fldTy >= 0 { nameFieldCodeTy("", fldTy) } else { nameFieldCodeTy(ftxt, fldTy) }
       if fc < 0 {
         // A nested inline-shape field interns the nested shape and stores a struct ref on
         // it under the canonical registered name. An earlier literal may have interned the
@@ -1197,7 +1154,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
     sFieldCloSig.push(
-      fieldCloSigOf(codes[pi], texts[pi], shapeFieldRowOf(fieldsTy, names[pi])),
+      fieldCloSigOf(codes[pi], shapeFieldRowOf(fieldsTy, names[pi])),
     )
     forceScalarListField(codes[pi])
     // B6b: the row's key column, read off the field's type and asked once for every code,
@@ -1279,11 +1236,7 @@ export function internShapeAs(key: string, nm: string) {
     sFieldNames.push(names[fx])
     sFieldTypes.push(codes[fx])
     sFieldCloSig.push(
-      fieldCloSigOf(
-        codes[fx],
-        rawTexts[fx],
-        shapeFieldRowOf(sTyIxOfName(nm), names[fx]),
-      ),
+      fieldCloSigOf(codes[fx], shapeFieldRowOf(sTyIxOfName(nm), names[fx])),
     )
     sFieldElemName.push("")
     // This recorder banks no element name for any code (its rows carry "", since the alias
@@ -1652,7 +1605,6 @@ function layoutRowWalk(
           si,
           fi,
           codes[j],
-          texts[j],
           shapeFieldRowOf(fieldsTy, names[j]),
         )
       ) {
@@ -1795,7 +1747,6 @@ function annShapeIndexOf(
               si,
               fi,
               codes[i],
-              texts[i],
               shapeFieldRowOf(fieldsTy, names[i]),
             )
           ) {

@@ -9,6 +9,19 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-12-w311-sfieldrefslot-no-name-rung](2026-11-12-w311-sfieldrefslot-no-name-rung.md): Step 7: `sFieldRefSlot` reads no element name, 2026-11-12
+- [2026-11-12-w311-d6-cut3-field-elem-row-by-type](2026-11-12-w311-d6-cut3-field-elem-row-by-type.md): Step 7 D6 cut 3: a struct or arm field's element row is recorded from its type, 2026-11-12
+- [2026-11-12-step7-wide-retag-arms-by-type](2026-11-12-step7-wide-retag-arms-by-type.md): The wide-arm box and its retag pairs read a union's arms by type, 2026-11-12
+- [2026-11-12-step7-vkind-variant-nested-row-by-type](2026-11-12-step7-vkind-variant-nested-row-by-type.md): Step 7, lane H: `variantNestedRow` by type, 2026-11-12
+- [2026-11-12-step7-vkind-name-classifiers-graded](2026-11-12-step7-vkind-name-classifiers-graded.md): Step 7, lane H: the rep-classifier census's NAME column graded; the lowerability walk by type, 2026-11-12
+- [2026-11-12-step7-vkind-list-ann-by-type](2026-11-12-step7-vkind-list-ann-by-type.md): Step 7, lane H: a list binding's declared element by type, 2026-11-12
+- [2026-11-12-step7-union-reg-une-type-gates](2026-11-12-step7-union-reg-une-type-gates.md): Step 7 L6 (lane G, cut 6b): three more `unionNameOfExpr` readers ask the type, 2026-11-12
+- [2026-11-12-step7-union-reg-box-by-type](2026-11-12-step7-union-reg-box-by-type.md): Step 7 L6 (lane G, cut 6a): the box-path union names come from the box's type, 2026-11-12
+- [2026-11-12-step7-union-eq-reserve-arms-by-type](2026-11-12-step7-union-eq-reserve-arms-by-type.md): A union `==`'s frame reservations read the operand's arms by type, 2026-11-12
+- [2026-11-12-step7-struct-name-producers-cut-3](2026-11-12-step7-struct-name-producers-cut-3.md): Step 7, L6: `armFieldStructRow` by type, and `structRowOfAnnTyGo` through `| null`, 2026-11-12
+- [2026-11-12-step7-lane-e-intern-union-arms-typed](2026-11-12-step7-lane-e-intern-union-arms-typed.md): Step 7 L2: the shape walks split a union by its type's arms; `unionSetMemberCount` is deleted, 2026-11-12
+- [2026-11-12-step7-l2-mono-list-elem-by-type](2026-11-12-step7-l2-mono-list-elem-by-type.md): Step 7 L2: a list argument's element pin is spelled from the element's type, 2026-11-12
+- [2026-11-12-step7-l2-mono-brace-guards-retired](2026-11-12-step7-l2-mono-brace-guards-retired.md): Step 7 L2: the narrowed pin's brace guards are retired behind a loud floor; D15980 and D15979 closed, 2026-11-12
 - [2026-11-12-w311-stale-reflist-comments](2026-11-12-w311-stale-reflist-comments.md): Step 7: comments that named the deleted ref-list name path, rewritten, 2026-11-12
 - [2026-11-12-w311-reflist-cut6-array-new-row-by-fill-type](2026-11-12-w311-reflist-cut6-array-new-row-by-fill-type.md): Step 7 L6: an `__array_new__` ref list mints by its fill type; `rlElemStructRow`'s name rung is a named floor, 2026-11-12
 - [2026-11-12-w311-d6-interner-rekey-design](2026-11-12-w311-d6-interner-rekey-design.md): Step 7 L2: the D6 shape interner keyed by type, design, 2026-11-12
