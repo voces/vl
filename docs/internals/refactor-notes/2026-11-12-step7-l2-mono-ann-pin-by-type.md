@@ -72,7 +72,7 @@ ran on #7611's tree over the sweep population and recorded 24,070 programs, coun
 - `emit_mono.vl` spelling reads, by the grep of the helpers listed in
   `2026-11-12-step7-l2-mono-narrowed-pin-by-type.md`: 42 → 15.
 - render-parse: unchanged at 13 / 31. `emit_mono.vl` was already at 0 / 0.
-- pin-helper: 911, unchanged. Four functions are deleted and four are added; the new list
+- pin-helper: 911 → 910 on the merged tree (master removed one); this PR deletes four functions and adds four; the new list
   predicate is a match the kind-ladder rule requires.
 - kind-ladder budget: 0.
 
