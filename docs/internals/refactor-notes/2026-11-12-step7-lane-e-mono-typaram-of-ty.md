@@ -1,4 +1,4 @@
-# Step 7 L2: a bare type-parameter annotation is read from its type (40 → 39 parses), 2026-11-12
+# Step 7 L2: a bare type-parameter annotation is read from its type (one parse fewer), 2026-11-12
 
 Lane E (w310's area: `emit_base`'s spelling predicates and the D6 interner). `monoTyParamOf(ann,
 typarams)` answered which type parameter a parameter annotation `T` or `T[]` rides on by cutting
@@ -36,5 +36,5 @@ redeclares its enclosing function's `T` (D3081, D3840, D3853, D15263 and six
   0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
 - `scripts/gate.sh`: all 23 rows pass (seed size, late demands, plumb-shape cost, rep-fuzz, filed
   witnesses, the distilled corpus, render-parse, scaling shape among them).
-- Render-parse with `--findings`: 12 renders, 40 → 39 parses (`emit_base.vl` 17 → 16);
+- Render-parse with `--findings`: 12 renders, 40 → 39 parses on `cf01f012` (`emit_base.vl` 17 → 16); 13 renders, 36 → 35 parses on the tree merged with master `06baca0f`;
   `--write-baseline` is in this PR.

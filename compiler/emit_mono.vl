@@ -1211,21 +1211,21 @@ function monoArgRowArmTy(ax: i32): i32 {
   }
 }
 
-// True when the spelling `narrow` is a top-level member of the union or nullable spelling
-// `wide` — what `wide` narrows to, and not a second rendering of it. Membership is the
-// whole safety property of the narrowed pin. `unionArmsOf` resolves an alias to its
-// member set; a non-union splits to one atom and is declined. See DECISIONS.md.
-function monoNameNarrowsFrom(narrow: string, wide: string) {
-  if narrow == "" { return false }
-  if narrow == wide { return false }
-  if nullablePartOf(wide) == narrow { return true }
-  const arms: string[] = []
-  unionArmsOf(wide, arms)
+// True when type `nTy` is a top-level member of the union or nullable `wTy`: what `wTy` narrows
+// to, and not `wTy` itself. Membership is the whole safety property of the narrowed pin. An arm
+// matches by shape and declared record name. A side with no type is no member. See DECISIONS.md.
+function monoTyNarrowsFrom(nTy: i32, wTy: i32): boolean {
+  if nTy < 0 || wTy < 0 { return false }
+  const nom = nominalStructNameOfTy(nTy)
+  if tySame(nTy, wTy) && nominalStructNameOfTy(wTy) == nom { return false }
+  const arms: i32[] = []
+  const wt = tyAt(wTy)
+  if wt is TyNullable { arms.push(wt.nInner) }
+  flattenVariantsInto(wTy, arms)
+  // `flattenVariantsInto` gives a nullable two arms at least, so its whole inner is the extra one.
   if arms.length < 2 { return false }
-  let ai = 0
-  while ai < arms.length {
-    if arms[ai] == narrow { return true }
-    ai = ai + 1
+  for a in arms {
+    if tySame(a, nTy) && nominalStructNameOfTy(a) == nom { return true }
   }
   false
 }
@@ -1303,11 +1303,11 @@ function monoArmCount(wide: string): i32 {
   arms.length
 }
 
-// The pin a narrowed argument at `ax` wants, given the pin `wide` the annotation ladder
-// chose — else "" (the ladder's answer stands). A pin becomes the instance's parameter
+// The pin a narrowed argument at `ax` wants, given the pin `wide` (type `wTy`, or -1) the
+// annotation ladder chose — else "" (the ladder's answer stands). A pin becomes the instance's parameter
 // annotation, so it is safe exactly where a non-generic function carrying that annotation
 // already lowers the same program. DECISIONS.md has the channel ruling.
-function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
+function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string, wTy: i32) {
   if wide == "" { return "" }
   let nt = nodeTyIxOf(ax)
   // A generic body records a read narrowed to one list as `T[]`, which the pins name.
@@ -1319,11 +1319,11 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   // reaches the membership test looking like a match on both sides, and the pin then
   // drops from the interned atom to a string ref. `tyRenderSoftensLits` is the home for
   // that hazard, and a litunion argument's pin is claimed by the litunion rungs anyway.
-  if tyRenderSoftensLits(nt) { return monoNarrowedLitPinName(nt, wide) }
+  if tyRenderSoftensLits(nt) { return monoNarrowedLitPinName(nt, wTy) }
   // A record renders as a brace span, so it can be an arm of `wide` only when `wide` holds a
   // brace; the render doubles with each nested level of a shared shape, so it is skipped (D2780).
   if monoTyIsObj(nt) && !strContains(wide, "{") {
-    return monoNarrowedNominalPinName(nt, "", wide)
+    return monoNarrowedNominalPinName(nt, "", wTy)
   }
   // So does a list of records, which no rung below answers unless one of `wide`'s arms is
   // its brace-holding render (D9330).
@@ -1336,62 +1336,68 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
     && tyWrapsRecord(nt)
     && !monoWideArmsHoldBrace(wide)
     && monoArmCount(wide) <= 2
-    && !monoNulRecNamesNarrow(nt, wide)
+    && !monoNulRecNamesNarrow(nt, wTy)
   ) {
-    return monoNarrowedNominalPinName(nt, "", wide)
+    return monoNarrowedNominalPinName(nt, "", wTy)
   }
   const n = monoPinSpellShaped(nt)
-  if monoNameNarrowsFrom(n, wide) || monoNicheNarrowsFrom(n, nt, wide) {
+  if monoTyNarrowsFrom(nt, wTy) || monoNicheNarrowsFrom(n, nt, wide) {
     if monoAnnPinName(n, nt) == n { return n }
     return ""
   }
-  // The NOMINAL spelling of the same arm: the two sides of the membership test render
-  // differently, since `tyToEmitName` spells a narrowed object structurally (`{r:i32}`)
-  // while a union carries its arms' declared names, so the test missed on the SPELLING and
-  // not on the type. This is the equality the variant tables are built under (D1754).
-  monoNarrowedNominalPinName(nt, n, wide)
+  // The NOMINAL spelling of the same arm: a union names its record arms by declaration, so a
+  // narrowed object pins at that name, the equality the variant tables are built under (D1754).
+  monoNarrowedNominalPinName(nt, n, wTy)
 }
 
-// The NOMINAL spelling of the narrowed arm `nt` (render `n`) when it is an arm of `wide`, else
+// The NOMINAL spelling of the narrowed arm `nt` (render `n`) when it is an arm of `wTy`, else
 // the nullable-record rung's answer, else "".
-function monoNarrowedNominalPinName(nt: i32, n: string, wide: string): string {
+function monoNarrowedNominalPinName(nt: i32, n: string, wTy: i32): string {
   const nom = nominalStructNameOfTy(nt)
-  if nom == "" { return monoNarrowedNulRecPinName(nt, n, wide) }
-  if !monoNameNarrowsFrom(nom, wide) { return "" }
+  if nom == "" { return monoNarrowedNulRecPinName(nt, n, wTy) }
+  if !monoTyNarrowsFrom(nt, wTy) { return "" }
   if monoAnnPinName(nom, -1) != nom { return "" }
   nom
 }
 
 // The narrowed pin of a nullable record (`Circle | null` out of `Circle | string | null`): its
-// render `n`, when the record's nominal name and `null` are both arms of `wide`, which the
-// whole-spelling membership test above cannot see (D3099). "" otherwise.
-function monoNarrowedNulRecPinName(nt: i32, n: string, wide: string): string {
-  if !monoNulRecNamesNarrow(nt, wide) { return "" }
+// render `n`, when the record and `null` are both arms of `wTy`, which the whole-type
+// membership test above cannot see (D3099). "" otherwise.
+function monoNarrowedNulRecPinName(nt: i32, n: string, wTy: i32): string {
+  if !monoNulRecNamesNarrow(nt, wTy) { return "" }
   if monoAnnPinName(n, -1) == n { return n }
   ""
 }
 
-// Whether `nt` is a nullable record whose nominal name and `null` are both arms of `wide`, and
-// `wide` is not already that nullable (whose ladder answer stands).
-function monoNulRecNamesNarrow(nt: i32, wide: string): boolean {
-  if nt < 0 { return false }
+// Whether `nt` is a nullable declared record whose record and `null` are both arms of `wTy`, and
+// `wTy` is not already that nullable (whose ladder answer stands).
+function monoNulRecNamesNarrow(nt: i32, wTy: i32): boolean {
+  if nt < 0 || wTy < 0 { return false }
   const t = tyAt(nt)
   if t is TyNullable {
-    const inom = nominalStructNameOfTy(t.nInner)
-    if inom == "" { return false }
-    if nullablePartOf(wide) == inom { return false }
-    return monoNameNarrowsFrom(inom, wide) && monoNameNarrowsFrom("null", wide)
+    if nominalStructNameOfTy(t.nInner) == "" { return false }
+    const wt = tyAt(wTy)
+    if wt is TyNullable {
+      const inom = nominalStructNameOfTy(t.nInner)
+      if (
+        tySame(wt.nInner, t.nInner)
+        && nominalStructNameOfTy(wt.nInner) == inom
+      ) {
+        return false
+      }
+    }
+    return monoTyNarrowsFrom(t.nInner, wTy) && monoTyNarrowsFrom(TY_NULL, wTy)
   }
   false
 }
 
 // The narrowed pin of a literal-union argument: its alias, when that alias is a member of the
-// union `wide` the ladder chose, so `T` pins at the atom the checker typed the argument at,
+// union `wTy` the ladder chose, so `T` pins at the atom the checker typed the argument at,
 // not at the box that holds it (D3098). "" otherwise.
-function monoNarrowedLitPinName(nt: i32, wide: string): string {
+function monoNarrowedLitPinName(nt: i32, wTy: i32): string {
   const kn = litUnionAliasNameOfTy(nt)
   if kn == "" { return "" }
-  if !monoNameNarrowsFrom(kn, wide) { return "" }
+  if !monoTyNarrowsFrom(nt, wTy) { return "" }
   if monoAnnPinName(kn, nt) != kn { return "" }
   kn
 }
@@ -1523,7 +1529,7 @@ function monoArgPinName(ix: i32, fnIx: i32, tyOut: i32[]) {
   const wTy = tyOut[0]
   tyOut[0] = -1
   if nodeArrayElemIsNullUnit(unwrapParen(ix)) { return "null[]" }
-  const n = monoNarrowedPinName(unwrapParen(ix), fnIx, w)
+  const n = monoNarrowedPinName(unwrapParen(ix), fnIx, w, wTy)
   if n != "" { return n }
   const wd = monoNicheWidenedPinName(unwrapParen(ix), w, wTy)
   if wd != "" { return wd }
@@ -7919,7 +7925,11 @@ function monoFloorDisagrees(bt: i32): boolean {
 // The spelling of the map or record of ids a map `t` of a tagged set, or a record holding one,
 // is stored as; "" for a record with a field that spelling cannot name, or one nested in it. A
 // record's fields' stored field codes and spellings are appended to `codes` and `texts`.
-function monoTagMapRepName(t: i32, codes: i32[], texts: string[]): string {
+export function monoTagMapRepName(
+  t: i32,
+  codes: i32[],
+  texts: string[],
+): string {
   if t < 0 || t >= T.tys.length { return "" }
   const m = tyAt(t)
   if m is TyMap { return "{[" + tyToStr(m.mKey) + "]: i32}" }
