@@ -35,7 +35,7 @@ caller's name with `boxTyName` of the type passed beside it (`E` empty, `N` non-
 
 - **No `NE` or `EN` row anywhere.** So each name test agrees with the type test on the corpus,
   and every box handed `""` has a type that names it.
-- **The `boxOwedAt` diff** is one value union in another member order (`i32|i32|null` against
+- **The `boxOwedAt` diff** is one value union in another member order (`i32|i64|null` against
   `i64|i32|null`, `unions/coalesce-numeric-union-widens.vl`). Its box tag is per atom kind, so the
   order is no part of the box.
 - **The global-let diffs** name the same row under another of its spellings (`Json`, `K|i32`
