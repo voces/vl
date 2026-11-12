@@ -1929,6 +1929,7 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   const lits: i32[] = []
   const litVia: i32[] = []
   const calls: i32[] = []
+  const reads: i32[] = []
   let i = 0
   while i < leaves.length {
     const lp = leaves[i]
@@ -1937,6 +1938,9 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
     if ll >= 0 {
       lits.push(ll)
       litVia.push(via[i])
+    } else if via[i] < 0 && recFreshListRead(lp) {
+      // An element of a fresh list is built where the list is delivered at `dst`'s list.
+      reads.push(lp)
     } else if (
       lp != call
       && recInferredFnOf(lp) >= 0
@@ -1972,6 +1976,10 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   }
   // A leaf calling another such function hands the destination on to it (D8143).
   for cl in calls { recAdoptNote(cl, nodeTyIxOf(cl), dst) }
+  for rd in reads {
+    recAdoptNote(rd, nodeTyIxOf(rd), dst)
+    repStamp(cwPeelValue(rd), dst)
+  }
   // A held-pinned call is built at `dst` and copied to its own record where it is delivered.
   let ci = 0
   while ci < copies.length {
@@ -5746,6 +5754,12 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       return 0
     }
     if bn is Call && recAdParamListArgs(b, nonNulTyOf(dstTy)) { return 0 }
+    // An element of an inferred function's list is delivered as that list is.
+    if bn is Call && recInferredFnOf(b) >= 0 && tyIsListTy(nonNulTyOf(nodeTyIxOf(b))) {
+      const dl = nonNulTyOf(dstTy)
+      if dl >= 0 { recAdoptNote(b, nodeTyIxOf(b), mkArrayTy(dl)) }
+      return 0
+    }
     const hc = if bn is Ident { recHeldCallOrigin(b) } else { -1 }
     if hc >= 0 && nodeAt(hc) is Call && recAdParamListArgs(hc, nonNulTyOf(dstTy)) { return 0 }
     // An element of a map or list is delivered as its container is, at the element's destination.
@@ -5960,6 +5974,23 @@ function recAdParamListArgs(call: i32, d: i32): boolean {
     }
   }
   false
+}
+
+// Whether `x` reads an element of a fresh list: a list literal, a binding holding only one, or a
+// call of a generic declared to return `T[]`, directly or through a binding holding only it.
+function recFreshListRead(x: i32): boolean {
+  const p = cwPeelValue(x)
+  const e = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if !(e is Index) { return false }
+  const b = cwPeelValue(e.idxArr)
+  if b < 0 || b >= P.nodes.length { return false }
+  const bn = nodeAt(b)
+  if bn is ArrayLit || recListRetDecl(b) >= 0 { return true }
+  if !(bn is Ident) { return false }
+  const decl = recFreshDeclOf(b)
+  if decl >= 0 && nodeAt(parenPeelIx(recDeclInit(decl))) is ArrayLit { return true }
+  const hc = recHeldCallOrigin(b)
+  hc >= 0 && recListRetDecl(hc) >= 0
 }
 
 // Where call `c`'s record of `own` lands inside call `p` of a generic declared to return `T[]`
