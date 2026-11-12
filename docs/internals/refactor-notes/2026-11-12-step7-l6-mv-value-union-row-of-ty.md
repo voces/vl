@@ -6,8 +6,8 @@ names, and asked the type only when the spelling found none. It now asks `unRowO
 kindTy)` first and takes that row's name for the slot. The spelling's row, and the D5113
 `unRowOfTyKey` recovery, answer only when the type keys no row or there is no type.
 
-The base is master `cae0121e`, with a fixpoint seed on both sides. The population is the whole
-sweep, 23,966 programs.
+The base is master `bebbc99d`, with a fixpoint seed on both sides. The population is the whole
+sweep, 23,972 programs.
 
 `unionRowOfAB` has no other caller, so it is deleted.
 
@@ -17,21 +17,17 @@ is untyped.
 
 ## Movers
 
-#7261's trial of this switch moved 70 programs. This one moves 15, and every one is bytes-only:
-it still runs and prints the same.
-
-| programs | what moved |
-| --- | --- |
-| 11 cases | The same size and the same type set, renumbered: the slot is minted at the type's row, earlier in the order (`maps/recursive-alias-declared-first.vl` swaps a map struct and its vals list). |
-| `generics/union-projection-into-hole-param.vl` | 2,734 → 2,704 bytes. |
-| D1037, D15058, D3511 | Bytes only, stdout the same. |
-
-No mover is `runs → not-runs`, an output change, or a new trap, so there is no finding.
+A first cut always took the type's row name, and moved 15 programs, all bytes-only. Merged with
+master after #7381 it lost `maps/inferred-map-literal-record-list-union-narrowed.vl` (`runs →
+not-runs`). Its spelling `{x:i32}[]|i32[]` names the type's own row, which #7381 had named
+`#anon0[]|i32[]`, and renaming handed the `#anon` handle to readers that cannot resolve the
+record. So the slot keeps a spelling whose row is the type's row, and takes the row's name only
+when the spelling names another row or none. That cut moves nothing.
 
 ## Proof
 
-- **Local full sweep.** `--prove-fixpoint` seeds on both sides: 23,951 same, 15 bytes-only
-  movers (12 cases, 3 inventory), 0 output movers, 0 runs → not-runs, 0 new compiler traps.
+- **Local full sweep.** `--prove-fixpoint` seeds on both sides, against master `bebbc99d`:
+  23,972 same, 0 bytes-only movers, 0 output movers, 0 runs → not-runs, 0 new compiler traps.
 - **Render-parse.** Flat at 19 renders and 55 parses, with `--findings`.
 - **Checks.** `rep-fuzz-check.sh` is exact. `cases_wasm` passes 7,462 with 0 failed. lint-self
   is clean. The export budget, with findings, has 0 dead exports.
