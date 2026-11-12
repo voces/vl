@@ -23,3 +23,19 @@ not reach the function, and it still prints `3`.
 - `unRowOfCanonMembers`, which is load-bearing.
 - `unRowOfSoftKey`, D4320's one-list sites 27 and 28.
 - The diagnostics: `unRowKeySame` in the A/B probe, `unKeySweepRow` and `unKeySweepPair`.
+
+## Proof
+
+- **Local full sweep**, `sweep.vl record` with fixpoint seeds on both sides, against master
+  `c28961aa`:
+
+  ```
+  same                            23947
+  bytes-only movers                   0
+  output movers                       0
+  runs -> not-runs  (blocking)        0
+  new compiler traps  (blocking)      0
+  ```
+- **Locally:** lint-self, rep-fuzz, `cases_wasm`, the memo-generation, state-audit and scaling
+  tests, emitter-state-audit, capability probes (`--live-sites`, `--floor`), splice-scan,
+  seed-size, late-demands, the dead-export and render-parse budgets, and the inventory tests.
