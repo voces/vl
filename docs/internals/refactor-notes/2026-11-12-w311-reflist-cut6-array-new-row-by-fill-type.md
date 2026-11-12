@@ -62,6 +62,24 @@ named floor.
 `sFieldRefSlot` and the former `rlRowOfNameMinted` are converted in cut 5: the open type keys
 them, and no name does.
 
+## The ref-list name producers: none is keyed by a name
+
+`vkind-census.vl -- --slots-list` classifies a producer by its first parameter. After cut 5 it
+still listed two reflist producers as `name`. Neither was keyed by a name, so this cut changes
+their signatures:
+
+- **`calleeAnnRetRefListSlot`** took the callee identifier's text, but only to resolve that
+  identifier in scope. It now takes the identifier node and reads the text itself. **Contract:**
+  a call's callee is resolved as a symbol in scope, and the row is the one its declared return
+  annotation banks (`annBareRefArrSlot`); no type spelling is read. **Witness:**
+  `tests/cases/closures/hole-fn-list-unbound-and-returned.vl` runs. A validated probe shows it
+  reaches the annotation row; it is the one fixture in `tests/cases` that does.
+- **`rlRowOfOpenTyMinted`** (and `rlOpenRowMint`) take the open type, its key, first, and the
+  stored label second.
+
+The census now reads `node` and `type` for them, so no reflist producer reads `name`. Fixpoint
+seeds before and after this change, over the whole population (24,191 programs): all the same.
+
 ## The `emit_base.vl` predicates this lane's stack frees
 
 The coordinator asked for this list, so that lane E can delete the predicates. Each one below has
