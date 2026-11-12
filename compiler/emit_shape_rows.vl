@@ -69,7 +69,6 @@ import {
 } from "./check_node_tys"
 import {
   MAP_KEY_STR,
-  isValueUnionName,
   isValueUnionTyOr,
   mapKeyKindOfTy,
   mapTwinUnionMember,
@@ -104,6 +103,7 @@ import {
   mkFuncTy,
   mkMapTy,
   numLitUnionBaseName,
+  numLitUnionBaseTy,
   oneStrLitSpelling,
   softenLitTy,
   structNameOfTy,
@@ -153,7 +153,6 @@ import {
   arrLeafNameOf,
   gaeParamShadowed,
   gaeSplitArgs,
-  mapValNameOf,
   nameIsClosureArray,
   nameIsElemArray,
   nameIsI32Array,
@@ -200,7 +199,6 @@ import {
   mvValNulRefNicheAt,
   mvValTyIxAt,
   nonNulBaseOf,
-  nulMapInnerName,
   rlElemIsNulNiche,
   rlElemMapKeyKind,
   rlElemMapValMvSlotAt,
@@ -1076,8 +1074,8 @@ export function armLayoutAmbiguousAt(vi: i32): boolean {
   false
 }
 
-// The field code `nameFieldCode` gives the spelling a record renders for its field of type `f`,
-// or -1 for a spelling that ladder does not code.
+// The field code `nameFieldCodeTy` gives a record's field of type `f`, from the spelling the
+// record renders, or -1 where it gives none.
 function jrWantOf(f: i32): i32 {
   if f < 0 || f >= T.tys.length { return -1 }
   // A literal union kept as its alias, or a lone string literal, is the atom; an inline set is
@@ -1996,10 +1994,10 @@ function tyIsNulRefList(ty: i32): boolean {
   lt is TyArray && refListElemKindOfTy(lt.aElem) >= 0
 }
 
-// The field code of a field spelled `t` of arena type `fty`, where the rep descriptor
+// The field code of a field of arena type `fty`, where the rep descriptor
 // (`fieldCodeOfTyCovered`) declines it, or -1. Every arm below is one a declined type reaches;
 // `nameFieldCodeTy` fails loudly on a declined type that no rung codes.
-export function nameFieldCode(t: string, fty: i32) {
+export function fieldCodeOfDeclinedTy(fty: i32) {
   if fty < 0 { return -1 }
   if tyIsArray(fty) {
     // A list of a tagged set's ids is the i32 list.
@@ -2014,11 +2012,23 @@ export function nameFieldCode(t: string, fty: i32) {
   // ref-list arm, so `(string|null)[] | null` keeps code 28's rep.
   const nsl = nulScalarListFieldCode(fty)
   if nsl >= 0 { return nsl }
-  // A box-union field, a value union or a member set keying a registered row (a
-  // self-referential arm's `Node | null` included, D4615), stores the union box ref, code 16.
-  if isValueUnionName(t) { return FC_UNION }
-  if isUNameDeclAB(75, t) { return FC_UNION }
+  // A box-union field stores the union box ref, code 16: a value union, a nullable numeric
+  // literal set (a nullable number), or a member set keying a registered row (a
+  // self-referential arm's `Node | null` included, D4615).
+  if isValueUnionTyOr(fty) == 1 || tyIsNulNumLitSet(fty) { return FC_UNION }
+  if isUNameAB(75, fty) { return FC_UNION }
   -1
+}
+
+// Whether `ty` is a numeric literal set or `null`, whose non-null part is a number.
+function tyIsNulNumLitSet(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = tyAt(ty)
+  if !(t is TyNullable) || t.nInner < 0 { return false }
+  const b = numLitUnionBaseTy(t.nInner)
+  if b < 0 || b == t.nInner { return false }
+  const bt = tyAt(b)
+  bt is TyPrim && bt.primName != "string" && bt.primName != "boolean"
 }
 
 // The `S[] | null` FIELD code (28) the ARENA decides, or -1. Ref-ELEMENT lists only: that is
@@ -3640,17 +3650,19 @@ export function fieldElemRowName(ty: i32): string {
 // The element or target name a shape-text field records in `armFieldElemName`: a ref-list
 // field its element name, a nested-struct field its non-null target name, a value-union
 // field its atom-set name; "" otherwise. `fty` is the field's arena type (-1 for none).
+const SHAPE_MAP_FIELD_NO_TY_MSG = "a shape field of map type recorded no type to name its value row"
+
 export function shapeFieldElemName(ftxt: string, code: i32, fty: i32) {
   const tn = shapeFieldElemNameOfTy(code, fty)
   if tn != "" { return tn }
   if code == FC_STRUCT { return nonNulBaseOf(ftxt) }
   if code == FC_UNION { return ftxt }
-  // A map-typed field (code 19) records its value type name — the mv-slot key, the
-  // shape-text mirror of `fieldRefElemName`'s code-19 arm. Without it a union variant with
-  // a map field recorded "" and every op site failed the loud slot find.
-  if code == FC_MAP { return mapValNameOf(ftxt) }
-  // A NULLABLE map field (code 29): the `| null`-stripped map's value name — same key.
-  if code == FC_NUL_MAP { return mapValNameOf(nulMapInnerName(ftxt)) }
+  // A map field records its value's row name, which its type gives above; one with no type
+  // has no value row to name.
+  if code == FC_MAP || code == FC_NUL_MAP {
+    emitFail(SHAPE_MAP_FIELD_NO_TY_MSG)
+    return ""
+  }
   // A literal-union atom field (code 0) or atom-array field (code 4) records its union name,
   // so the variant tables recover the rep and membership — without it construction emitted
   // the raw member string into the i32 atom slot. An inline litunion field (code 3) records
