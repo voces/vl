@@ -57,7 +57,8 @@ before and after.
   - `nameIsStructDecl`, `armFieldStructRow`, `armFieldDeferredRowOk`;
   - `nameFieldCode`'s nullable-closure, tagged-set and closure arms.
 - **D1518's deferred predicate** is deleted with its only caller: `armFieldDeferredRowOk`,
-  `armDeferStack`, `armPlainLayoutTyOk` and `armRefLeafNameOk`.
+  `armDeferStack`, `armPlainLayoutTyOk` and `armRefLeafNameOk`. `nameIsString` (`emit_base.vl`)
+  loses its last caller and is deleted.
 - **The loud floor:** `nameFieldCodeTy` fails loudly when a declined type with a type in hand
   reaches no rung. It answered -1 silently before. The floor is reached by no program in the
   population.
@@ -67,7 +68,8 @@ before and after.
 - **Sweep** (`sweep.vl diff`, fixpoint seeds both sides): 24,170 same, 0 bytes-only movers,
   0 output movers, 0 `runs → not-runs`, 0 new compiler traps. The step that only routes the
   callers was also byte-identical on its own.
-- **Seed:** 6,735,665 → 6,733,728 bytes (−1,937), a fixpoint.
+- **Seed:** 6,735,606 → 6,733,652 bytes (−1,954) against cut 1's head, a fixpoint. The sweep ran
+  before `nameIsString` was deleted; that deletion removes a function no code calls.
 - **rep-classifier-census:** NAME classifiers 38 → 37 (71 → 70 call sites); ARENA + NAME stays
   at 11; ARENA + SPELLING stays at 0.
 - **render-parse:** unchanged at 13 renders and 34 parses. The deleted arms' readers are not
