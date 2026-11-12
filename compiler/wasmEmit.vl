@@ -3089,7 +3089,14 @@ function rcReadSource(
   reReadable: boolean,
   fnIx: i32,
 ) {
-  if reReadable {
+  if rcElemSL >= 0 {
+    // An element-by-element list copy reads its source element off the loop's own locals.
+    fbLocalGet(rcElemSL)
+    fbStructGet(rcElemWrap, 0)
+    fbLocalGet(rcElemIL)
+    fbArrayGet(rcElemBack)
+    fbRefCast(sHeap)
+  } else if reReadable {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   } else {
     fbLocalGet(variantReboxSlot)
@@ -3312,6 +3319,21 @@ function emitRecCopyLevel(
     if sk >= 0 && vk >= 0 && sk != vk {
       if njConvert(sk, vk) < 0 { return -1 }
     }
+    // A list of records copied into a list of another record row is copied element by element.
+    if recCopyFromOf(exprIx) < 0 {
+      const lst = nonNullTy(
+        rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), dNames[fj]),
+      )
+      const ldt = nonNullTy(
+        rcFieldTy(rcPathTy(rcDstTyOf(exprIx), pre), dNames[fj]),
+      )
+      if rcRecListsApart(lst, ldt) {
+        const ls = repSlotOfKind("reflist", lst)
+        if emitRecListCopyTop(body, exprIx, lst, ldt, ls, fnIx) < 0 {
+          return -1
+        }
+      }
+    }
     // A list of numbers copied into a list of a wider number is widened element by element.
     if recCopyFromOf(exprIx) < 0 {
       const le = rcScalarListElem(
@@ -3333,6 +3355,14 @@ function emitRecCopyLevel(
 let rcElemSrc = -1
 let rcElemDst = -1
 
+// The locals an element-by-element list copy reads its source element through (the source
+// wrapper and the index) and that list's row, or -1 outside one; and how many loops enclose it.
+let rcElemSL = -1
+let rcElemIL = -1
+let rcElemWrap = -1
+let rcElemBack = -1
+let rcLoopDepth = 0
+
 // The source and destination records a copy of `exprIx` reads its field types off.
 function rcSrcTyOf(exprIx: i32): i32 {
   if rcElemSrc >= 0 { rcElemSrc } else { nodeTyIxOf(exprIx) }
@@ -3343,27 +3373,61 @@ function rcDstTyOf(exprIx: i32): i32 {
 }
 
 // The list of records just emitted for `exprIx`, copied element by element into the list `lct`'s
-// row, each element by the record copy (`emitRecCopyLevel`); 1 where the pair is not two record
-// lists stored apart, else 0 or -1.
+// row (`emitRecListCopyTop`); 1 where the pair is not two record lists stored apart.
 function emitRecListCopy(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
   const st = nonNullTy(nodeTyIxOf(exprIx))
   const dt = nonNullTy(instTyOrSelf(lct, fnIx))
-  if st < 0 || dt < 0 || st >= T.tys.length || dt >= T.tys.length { return 1 }
+  if !rcRecListsApart(st, dt) { return 1 }
+  emitRecListCopyTop(
+    body,
+    exprIx,
+    st,
+    dt,
+    exprEmittedRefListSlot(exprIx, fnIx),
+    fnIx,
+  )
+}
+
+// Whether `st` and `dt` are lists of records whose element rows differ.
+function rcRecListsApart(st: i32, dt: i32): boolean {
+  if st < 0 || dt < 0 || st >= T.tys.length || dt >= T.tys.length {
+    return false
+  }
   const sa = tyAt(st)
   const da = tyAt(dt)
-  if !(sa is TyArray) || !(da is TyArray) { return 1 }
+  if !(sa is TyArray) || !(da is TyArray) { return false }
   const se = sa.aElem
   const de = da.aElem
   if se < 0 || de < 0 || !(tyAt(se) is TyObj) || !(tyAt(de) is TyObj) {
-    return 1
+    return false
   }
   const ssi = rcRowOfTy(se)
   const dsi = rcRowOfTy(de)
-  if ssi < 0 || dsi < 0 || sHeapIdx[ssi] == sHeapIdx[dsi] { return 1 }
-  const srcSlot = exprEmittedRefListSlot(exprIx, fnIx)
+  ssi >= 0 && dsi >= 0 && sHeapIdx[ssi] != sHeapIdx[dsi]
+}
+
+// The list of records `st` on the stack, at ref-list slot `srcSlot`, copied into the list `dt`'s
+// row: each element read off the loop's locals and copied by `emitRecCopyLevel` at the element
+// types. A nested copy loop takes the next pair of temps (`rcLoopDepth`).
+function emitRecListCopyTop(
+  body: u8[],
+  exprIx: i32,
+  st: i32,
+  dt: i32,
+  srcSlot: i32,
+  fnIx: i32,
+): i32 {
+  const sa = tyAt(st)
+  const da = tyAt(dt)
+  const se = if sa is TyArray { sa.aElem } else { -1 }
+  const de = if da is TyArray { da.aElem } else { -1 }
+  const ssi = rcRowOfTy(se)
+  const dsi = rcRowOfTy(de)
   const dstSlot = repSlotOfKind("reflist", dt)
   if (
-    srcSlot < 0
+    ssi < 0
+    || dsi < 0
+    || srcSlot < 0
     || dstSlot < 0
     || srcSlot >= rlWrapIdx.length
     || dstSlot >= rlWrapIdx.length
@@ -3375,19 +3439,14 @@ function emitRecListCopy(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
       exprIx,
     )
   }
-  if !fnUsesVariantRebox {
-    return emitFail(
-      "emitProgram: a list of records is copied with no element slot reserved",
-    )
-  }
   const srcWrap = rlWrapIdx[srcSlot]
   const srcBack = rlBackIdx[srcSlot]
   const dstWrap = rlWrapIdx[dstSlot]
   const dstBack = rlBackIdx[dstSlot]
   const sL = widenSrcWrapSlot(srcSlot)
   const dL = widenDstBackSlot(dstSlot)
-  const iL = widenTmpSlot(0)
-  const nL = widenTmpSlot(1)
+  const iL = widenTmpSlot(2 * rcLoopDepth)
+  const nL = widenTmpSlot(2 * rcLoopDepth + 1)
   const names: string[] = []
   const rows: i32[] = []
   let fj = 0
@@ -3399,17 +3458,23 @@ function emitRecListCopy(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
   emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
   fbLocalGet(dL)
   fbLocalGet(iL)
-  fbLocalGet(sL)
-  fbStructGet(srcWrap, 0)
-  fbLocalGet(iL)
-  fbArrayGet(srcBack)
-  fbLocalSet(variantReboxSlot)
   const ps = rcElemSrc
   const pd = rcElemDst
+  const pSL = rcElemSL
+  const pIL = rcElemIL
+  const pWrap = rcElemWrap
+  const pBack = rcElemBack
+  const pHeap = rcPathHeap
+  const pField = rcPathField
   rcElemSrc = se
   rcElemDst = de
+  rcElemSL = sL
+  rcElemIL = iL
+  rcElemWrap = srcWrap
+  rcElemBack = srcBack
   rcPathHeap = []
   rcPathField = []
+  rcLoopDepth = rcLoopDepth + 1
   const r = emitRecCopyLevel(
     body,
     exprIx,
@@ -3423,8 +3488,15 @@ function emitRecListCopy(body: u8[], exprIx: i32, lct: i32, fnIx: i32): i32 {
     rows,
     fnIx,
   )
+  rcLoopDepth = rcLoopDepth - 1
   rcElemSrc = ps
   rcElemDst = pd
+  rcElemSL = pSL
+  rcElemIL = pIL
+  rcElemWrap = pWrap
+  rcElemBack = pBack
+  rcPathHeap = pHeap
+  rcPathField = pField
   if r < 0 { return -1 }
   fbStructNew(sHeapIdx[dsi])
   fbArraySet(dstBack)
@@ -35556,6 +35628,11 @@ export function wasmEmitStateReset() {
   coerceHeld = -1
   rcElemSrc = -1
   rcElemDst = -1
+  rcElemSL = -1
+  rcElemIL = -1
+  rcElemWrap = -1
+  rcElemBack = -1
+  rcLoopDepth = 0
   boxSeat = -1
   armSeat = -1
   armServed = -1
