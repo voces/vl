@@ -51,9 +51,7 @@ import {
   structTyMarkAliasable,
 } from "./emit_atom_kinds"
 import {
-  annFnDecompose,
   arrLeafNameOf,
-  nameIsElemArray,
   nameIsLitUnionArray,
   nameIsShapeSpanEnds,
   normTypeAtom,
@@ -97,11 +95,11 @@ import {
   armTwinRowName,
   elemNameIsNominal,
   famRelayStructRow,
+  fieldCodeOfDeclinedTy,
   fieldTypeRefusalMsg,
   forceScalarListField,
   genAppRidesTyParam,
   mapTyValKindLowerable,
-  nameFieldCode,
   nameIsConcreteGenAppDecl,
   nameIsGenAppDecl,
   nameIsStructDecl,
@@ -193,8 +191,6 @@ import {
   tyMapValOf,
   tyPeelNul,
   tyStepElem,
-  tyStepParam,
-  tyStepRet,
 } from "./tyquery"
 
 // The refusal of a field type both the rep descriptor and the field-code ladder decline.
@@ -202,14 +198,14 @@ const NESTED_FIELD_UNCODED = "emitProgram: a field's type has no storage code: t
   + "descriptor declined it and the field-code ladder has no arm for it"
 
 // The field code of a field spelled `t` whose recorded arena type is `ty` (-1 for none): read
-// off the type (`fieldCodeOfTyCovered`), and from the ladder (`nameFieldCode`) only where the
+// off the type (`fieldCodeOfTyCovered`), and from the ladder (`fieldCodeOfDeclinedTy`) only where the
 // type declines, then the `S[] | null` rung. A type parameter's field is uncoded: its row is the
 // generic original's, which no emitted read uses, and each instance mints its own.
 export function nameFieldCodeTy(t: string, ty: i32): i32 {
   const a = fieldCodeOfTyCovered(ty)
   if a != -2 { return a }
   if ty >= 0 && tyHasTyVar(ty) { return -1 }
-  const c = nameFieldCode(t, ty)
+  const c = fieldCodeOfDeclinedTy(ty)
   if c >= 0 { return c }
   // A union whose row its type keys, though its spelling does not: `null` before a member
   // keeps the name off the row (D10410).
@@ -368,20 +364,26 @@ function internFuncTypeShapesTy(nm: string, ty: i32): i32 {
 function tagRepNameUnset(_ty: i32): string { __trap__() }
 export let tagRepNameFn: (ty: i32) => string = tagRepNameUnset
 
-// Walks type `ty`, interning every inline shape, value union and function type it holds. The
-// walk keys each type by its nominal name when `nm` is that name (`shapeWalkName` passes
-// another on a cycle), else by its render, rendered only then since a deep record's render
+// The name a walk keys type `ty` on: its nominal name when `nm` is that name (`shapeWalkName`
+// passes another on a cycle), else its render, rendered only then since a deep record's render
 // doubles per level; a record of tagged-set ids, which has no render, by its stored spelling.
-function internShapeDeepTyGo(nm: string, ty: i32) {
-  if ty < 0 || ty >= T.tys.length { return 0 }
-  const t = tyAt(ty)
+function shapeWalkKeyOf(nm: string, ty: i32): string {
   const nn = tyToNominalName(ty)
   let ln = nn
   if nn == "" || nm != nn {
     ln = tyToEmitName(ty)
     if ln == "" { ln = nn }
   }
-  if ln == "" && t is TyObj { ln = tagRepNameFn(ty) }
+  if ln == "" && tyAt(ty) is TyObj { ln = tagRepNameFn(ty) }
+  ln
+}
+
+// Walks type `ty`, interning every inline shape, value union and function type it holds, each
+// keyed by `shapeWalkKeyOf`.
+function internShapeDeepTyGo(nm: string, ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = tyAt(ty)
+  const ln = shapeWalkKeyOf(nm, ty)
   if ln == "" { return 0 }
   if isValueUnionName(ln) {
     registerValueUnionNameAB(7, ln, ty)
@@ -545,63 +547,52 @@ export function armMintShapeName(nm: string) {
   out + "}"
 }
 
-// Interns the plainly-lowerable inline shapes in the params or result of function-type name
-// `nm` of recorded type `ty`, peeled in lockstep with `internShapeDeepTy`'s grammar. Only a
-// fully-lowerable struct leaf interns; an unsupported composite field is left un-interned so
-// the closure stays a clean reject, never invalid wasm.
+// Walks type `ty` below a function type, interning the plainly-lowerable inline shapes of its
+// params and result, keyed as `internShapeDeepTyGo` keys. Only a fully-lowerable struct leaf
+// interns; an unsupported composite field is left un-interned so the closure stays a clean
+// reject, never invalid wasm.
 function internFuncTypeShapesTyGo(nm: string, ty: i32): i32 {
-  if nm.length < 2 { return 0 }
-  // Peels only a grouping pair that wraps the whole name. A functype whose leading `(` is
-  // its own param list must not be blind-peeled — that garbles the name, and the shapes
-  // buried in a nested functype result never intern.
-  const uw = normTypeAtom(nm)
-  if uw.length != nm.length { return internFuncTypeShapesTy(uw, ty) }
-  // A value-union leaf registers its box reps, exactly as `internShapeDeepTy`'s value-union
-  // arm does, before the `| null` peel (the null is a union atom here, not a nullable
-  // wrapper). Without it a producer-less closure-arm annotation left the value box
-  // un-minted while a narrowed call's unbox still cast to a default type-0 index — invalid wasm.
-  if isValueUnionName(nm) {
-    registerValueUnionNameAB(8, nm, ty)
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = tyAt(ty)
+  const ln = shapeWalkKeyOf(nm, ty)
+  if ln == "" { return 0 }
+  // A value-union leaf registers its box reps, as `internShapeDeepTy`'s value-union arm does:
+  // a producer-less closure-arm annotation otherwise leaves the box un-minted while a narrowed
+  // call's unbox casts to a default type-0 index, invalid wasm.
+  if isValueUnionName(ln) {
+    registerValueUnionNameAB(8, ln, ty)
     return 0
   }
-  // The arrow split runs before the `| null` peel: a top-level arrow binds `| null` to its
-  // result (`nulCloFlag`'s rule), and the naive peel would treat it as a nullable closure,
-  // leaving that result's value box unregistered. A genuinely nullable closure nests its
-  // arrow in parens, so `annFnDecompose` declines it and the peel below takes it.
-  const fParts: string[] = []
-  const fRet = annFnDecompose(nm, fParts)
-  if fRet != "" {
-    let pi = 0
-    while pi < fParts.length {
-      internFuncTypeShapesTy(fParts[pi], tyStepParam(ty, pi, fParts.length))
-      pi = pi + 1
+  match t {
+    TyFunc => {
+      for p in t.fnParamTypes { internFuncTypeShapesTy("", p) }
+      internFuncTypeShapesTy("", t.fnRet)
     }
-    return internFuncTypeShapesTy(fRet, tyStepRet(ty))
-  }
-  // A function type the arrow split declines (a render that spaces its arrow) has no part
-  // names to walk; the `| null` and `[]` peels below would cut its result instead.
-  if tyIsFuncArena(ty) { return 0 }
-  const np = nullablePartOf(nm)
-  if np != "" { return internFuncTypeShapesTy(np, nullableInnerOrNone(ty)) }
-  // A composite-union position: every arm below this line reads one composite, so a
-  // top-level `|` that is not a pure value union reached no arm at all and the shapes
-  // inside its arms never interned. `internShapeDeepTy` owns that grammar, so this delegates
-  // rather than growing a second copy — reached only through a closure result, the arm never ran before.
-  if unionSetMemberCount(nm) > 1 { return internShapeDeepTy(nm, ty) }
-  if nameIsElemArray(nm) {
-    return internFuncTypeShapesTy(arrElemNameRaw(nm), tyStepElem(ty))
-  }
-  if nameIsShapeSpanEnds(nm) {
-    if funcTypeShapeLowerable(nm, ty) {
-      internShapeFieldElemsTy(nm, ty)
-      internInlineShapeTy(nm, ty)
-    } else {
-      // The result struct is not lowerable as a whole (e.g. it carries a plain closure
-      // field): the outer shape stays un-interned here, but its nested inline-shape fields
-      // and closure fields' result shapes must each still intern their own row, or a
-      // literal building the outer shape fieldset-collides onto a same-fieldset twin — invalid wasm.
-      internNonLowerableFieldShapesTy(nm, ty)
+    TyNullable => {
+      internFuncTypeShapesTy("", t.nInner)
     }
+    // A composite union: `internShapeDeepTy` owns the arm grammar, so this delegates.
+    TyUnion => {
+      if unionSetMemberCount(ln) > 1 { internShapeDeepTy(ln, ty) }
+    }
+    TyArray => {
+      internFuncTypeShapesTy("", tyStepElem(ty))
+    }
+    TyObj => {
+      if nameIsShapeSpanEnds(ln) {
+        if funcTypeShapeLowerable(ln, ty) {
+          internShapeFieldElemsTy(ln, ty)
+          internInlineShapeTy(ln, ty)
+        } else {
+          // The outer shape stays un-interned, but its nested shapes and closure fields'
+          // result shapes still intern their own rows, or a literal building the outer shape
+          // fieldset-collides onto a same-fieldset twin (invalid wasm).
+          internNonLowerableFieldShapesTy(ln, ty)
+        }
+      }
+    }
+    // A map's value is walked only by `internShapeDeepTy`; the rest hold no shape.
+    TyMap | TyPrim | TyVar | TyLit | TyNeg | TyErr => {}
   }
   0
 }
@@ -1096,7 +1087,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       let ftxt = rawTexts[fi]
       // Pre-interns any inline shape or value union buried in the field type before
       // classifying: a nullable ref-list field needs its element shape interned for
-      // `nameFieldCode` to recognize the non-null part as a ref array. Must run before any
+      // `nameFieldCodeTy` to recognize the non-null part as a ref array. Must run before any
       // row is pushed, so the flat `sField*` arrays are not corrupted by the re-entrant intern.
       const fldTy = tyFieldTyOf(fieldsTy, rawNames[fi])
       internShapeDeepTy(ftxt, fldTy)
