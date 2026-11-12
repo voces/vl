@@ -80,11 +80,25 @@ row is minted under the spelling (the shape walk's class).
 
 ## (c) no program reaches it
 
-E7 and E9 (`memberUnionFieldName`'s and `armFieldUnionName`'s second arm rung), E12
-(`refListKeptSlotOfMember`'s arm rung), E21 and E22 (`variantFirstLayoutDisagreeField`), E30
-(`annShapeWiderRowOf`'s untyped compare), E35 (`variantRowScanOfTyK`) and E52
-(`isStrTagUnionNameOf`). Each is a rung of a reached function, so it is deleted with a control,
-or, where it serves a case the corpus lacks, kept and named.
+Four are early-return rungs. An earlier rung answers each one in every program the sweep holds,
+and in the plainest programs written to reach it, so they are deleted:
+
+- E7, `memberUnionFieldName`'s union-member arm rung. Probed with a `Cat | Dog` receiver reading a
+  shared union-box field, in three spellings.
+- E9, `armFieldUnionName`'s nullable-receiver rung. Probed with a `Cat | null` receiver under its
+  null test, in two spellings.
+- E12, `refListKeptSlotOfMember`'s receiver-arm rung. Probed with an arm-typed receiver's ref-list
+  field.
+- E52, `isStrTagUnionNameOf`'s optional-chain rung. Probed with `o?.f is string`.
+
+On both seeds those programs build byte-identical modules.
+
+The other three sites stay:
+
+- E21 and E22 (`variantFirstLayoutDisagreeField`) and E30 (`annShapeWiderRowOf`'s untyped compare)
+  are compare guards. Deleting one changes what counts as "same" for a program the corpus lacks,
+  so they convert with the row-identity compares instead.
+- E35 is an argument to a call no program makes.
 
 ## Not readers
 
