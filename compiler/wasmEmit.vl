@@ -1,4 +1,4 @@
-import { monoPinSpellShaped } from "./pin_spell"
+import { monoPinSpellNoAnon } from "./pin_spell"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { unionArmRowOfTy } from "./emit_local_slots"
 import { unionTyOfRecv } from "./emit_obj_lit_fits"
@@ -394,7 +394,6 @@ import {
 } from "./emit_query"
 import {
   AS_FAIL_DOMS,
-  FC_CLOSURE,
   FC_F32,
   FC_F32_LIST,
   FC_F64,
@@ -403,7 +402,6 @@ import {
   FC_I32_LIST,
   FC_I64,
   FC_I64_LIST,
-  FC_MAP,
   FC_NUL_BOOL,
   FC_NUL_CLOSURE,
   FC_NUL_I32_LIST,
@@ -817,6 +815,7 @@ import {
   fbRefEq,
   fbRefIsNull,
   fbRefNull,
+  fbRefNullForKind,
   fbRefNullNone,
   fbRefNullOfKind,
   fbRefNullStruct,
@@ -894,10 +893,12 @@ import {
 } from "./emit_reloc"
 import {
   fieldRowIsNulNone,
+  fieldRowIsPlainI32,
   fieldRowIsRecordRef,
   fieldRowIsStr,
   fieldRowIsUnionBox,
   fieldRowNumKind,
+  fieldRowSlotTable,
   fnHasUnannotatedParam,
   listGetIdxReReadable,
   optChainBaseOf,
@@ -1326,7 +1327,6 @@ import {
   fnRetIsNulAtom,
   fnRetNullBearing,
   globalNameIsNonConstSid,
-  isNulScalarListFieldCode,
   isNulScalarListKind,
   mapAnnShape,
   memberCallYieldsValue,
@@ -1878,87 +1878,83 @@ function emitScalarValue(body: u8[], exprIx: i32, fnIx: i32, elemKind: VKind) {
 // row). `emitTypeSection`, the supertype prefix test and the object-literal order stash
 // (D1510) all read it, so the declared slot and the stash local cannot disagree.
 export function sFieldStorageSlot(si: i32, fi: i32): i32 {
-  const code = sFieldTypeAt(si, fi)
-  if code == FC_STRUCT { return sFieldTgtStructIdx(si, fi) }
-  if code == FC_MAP || code == FC_NUL_MAP { return sFieldMapShape(si, fi) }
   // Only a ref-list field reads a ref-list slot; asking for any other would mint an unused row.
-  if code == FC_REF_LIST || code == FC_NUL_REF_LIST {
-    return sFieldRefSlot(si, fi)
+  match fieldRowSlotTable(sFieldStart[si] + fi) {
+    "struct" => sFieldTgtStructIdx(si, fi)
+    "map" => sFieldMapShape(si, fi)
+    "reflist" => sFieldRefSlot(si, fi)
+    "none" => -1
   }
-  -1
 }
 
 // The null value of an omitted nullable field (`si`/`fi`, field code `scode`) in a
 // struct literal: `ref.null` of the field's own backing for the ref codes, the i32
 // sentinel for `boolean | null` (2) or `K | null` (-1, since member ids are >= 0), or
 // the null-tagged box for a union field with a `null` member. -1 when not nullable.
-function emitOmittedFieldNull(_body: u8[], si: i32, fi: i32, scode: i32) {
-  if scode == FC_NUL_STR {
-    fbRefNull(sTy())
-    return 0
-  }
-  if scode == FC_NUL_BOOL {
-    fbI32Const(2)
-    return 0
-  }
-  if scode == FC_NUL_LIT_UNION {
-    fbI32Const(0 - 1)
-    return 0
-  }
-  if scode == FC_STRUCT {
-    const tgt = sFieldTgtStructIdx(si, fi)
-    if tgt < 0 { return -1 }
-    fbRefNull(sHeapIdx[tgt])
-    return 0
-  }
-  if scode == FC_NUL_I32_LIST {
-    fbRefNull(lTy())
-    return 0
-  }
-  if isNulScalarListFieldCode(scode) {
-    fbRefNull(nulScalarListFieldWrapHeap(scode))
-    return 0
-  }
-  if scode == FC_NUL_REF_LIST {
-    const rs28 = sFieldRefSlot(si, fi)
-    if rs28 >= 0 && rs28 < rlWrapIdx.length {
-      fbRefNull(rlWrapIdx[rs28])
+function emitOmittedFieldNull(_body: u8[], si: i32, fi: i32) {
+  const r = sFieldStart[si] + fi
+  const k = fieldRowKind(r)
+  if k == null { return -1 }
+  match k {
+    "nulstr" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulclosure" => {
+      fbRefNullForKind(k, -1)
       return 0
     }
-    return -1
-  }
-  if scode == FC_NUL_CLOSURE {
-    fbRefNull(cloStructIdx)
-    return 0
-  }
-  if scode == FC_NUL_NONE {
-    fbRefNullNone()
-    return 0
-  }
-  if scode == FC_NUL_MAP {
-    fbRefNull(mapTypeIdxOf(sFieldMapShape(si, fi)))
-    return 0
-  }
-  if scode == FC_UNION {
-    // a value-union field defaults to null only when `null` is a member — resolve the
-    // member set once, then test its banked null code (`nullValKind()`), not the lexeme.
-    const fnm = sFieldElemNameAt(si, fi)
-    if (
-      unionHasAtomK(
-        msSetOfNameTy(fnm, sFieldElemTyIxAt(si, fi)),
-        fnm,
-        "null",
-        nullValKind(),
-      )
-    ) {
-      fbI32Rel(RS_TAG, nullBoxTag())
+    "nulbool" => {
+      fbI32Const(2)
+      return 0
+    }
+    "i32" => {
+      // A plain `i32` has no null; `K | null` rides the niche below every member id.
+      if fieldRowIsPlainI32(r) { return -1 }
+      fbI32Const(0 - 1)
+      return 0
+    }
+    "nulstruct" | "nulvariant" => {
+      const tgt = sFieldTgtStructIdx(si, fi)
+      if tgt < 0 { return -1 }
+      fbRefNull(sHeapIdx[tgt])
+      return 0
+    }
+    "nulreflist" => {
+      const rs = sFieldRefSlot(si, fi)
+      if rs >= 0 && rs < rlWrapIdx.length {
+        fbRefNull(rlWrapIdx[rs])
+        return 0
+      }
+      return -1
+    }
+    "nulnone" => {
       fbRefNullNone()
-      fbStructNew(uBoxIdx)
       return 0
     }
-    return -1
+    "nulmap" => {
+      fbRefNull(mapTypeIdxOf(sFieldMapShape(si, fi)))
+      return 0
+    }
+    "union" => {
+      // a value-union field defaults to null only when `null` is a member — resolve the
+      // member set once, then test its banked null code (`nullValKind()`), not the lexeme.
+      const fnm = sFieldElemNameAt(si, fi)
+      if (
+        unionHasAtomK(
+          msSetOfNameTy(fnm, sFieldElemTyIxAt(si, fi)),
+          fnm,
+          "null",
+          nullValKind(),
+        )
+      ) {
+        fbI32Rel(RS_TAG, nullBoxTag())
+        fbRefNullNone()
+        fbStructNew(uBoxIdx)
+        return 0
+      }
+      return -1
+    }
+    "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" => {
+      return -1
+    }
   }
-  -1
 }
 
 // One struct field's value, from the field's context through the emission arm its code
@@ -1989,16 +1985,19 @@ function emitStructFieldValueUnder(
   valIx: i32,
   fnIx: i32,
 ) {
-  const scode = sFieldTypeAt(si, fi)
-  // a struct value is allowed only into a nested-struct field (code 15) or a box-union
-  // field (code 16, boxed via `emitUnionCoerce`); any other field code has no rep for it.
-  if scode != FC_STRUCT && scode != FC_UNION {
+  const sk = fieldRowKind(sFieldStart[si] + fi)
+  if sk == null {
+    return emitFail("emitProgram: struct field has no storage kind")
+  }
+  // a struct value is allowed only into a record-ref field or a box-union field (boxed via
+  // `emitUnionCoerce`); any other field has no rep for it.
+  if !eqKindIsRecord(sk) && sk != "union" {
     if exprStruct(valIx, fnIx) {
       return emitFail("emitProgram: nested struct fields are not supported")
     }
   }
 
-  if scode == FC_CLOSURE {
+  if sk == "closure" {
     const cav = nodeAt(unwrapParen(valIx))
     if cav is ArrayLit {
       // a same-field-name literal-shape collision can mis-code a closure-array field as a
@@ -2009,7 +2008,7 @@ function emitStructFieldValueUnder(
     }
   }
 
-  if scode != FC_CLOSURE && scode != FC_NUL_CLOSURE && scode != FC_UNION {
+  if !fieldKindTakesClosure(sk) {
     const cfv = nodeAt(unwrapParen(valIx))
     if cfv is FuncDecl {
       // the inverse mis-resolution: a lambda value's own field-shape interning collided
@@ -2023,69 +2022,79 @@ function emitStructFieldValueUnder(
   // An explicit `null` is the field's own null, as an omitted one is.
   if (
     nodeAt(unwrapParen(valIx)) is NullLit
-    && emitOmittedFieldNull(body, si, fi, scode) == 0
+    && emitOmittedFieldNull(body, si, fi) == 0
   ) {
     return 0
   }
-  if scode == FC_REF_LIST && sFieldRefSlot(si, fi) >= rlElemTyIx.length {
+  if sk == "reflist" && sFieldRefSlot(si, fi) >= rlElemTyIx.length {
     return emitFail("emitProgram: ref-list field element type is not interned")
   }
 
-  if scode == FC_UNION {
-    // coerces a raw scalar/string/null into the box with its atom tag via `emitUnionBoxArg`,
-    // not `emitUnionCoerce` — a concrete-variant/`nulvariant` value must still be boxed here.
-    if (
-      emitUnionBoxOwed(
-        body,
-        sFieldElemNameAt(si, fi),
-        sFieldRowTyAt(si, fi),
-        valIx,
-        fnIx,
-      )
-      < 0
-    ) {
-      return -1
+  match sk {
+    "union" => {
+      // coerces a raw scalar/string/null into the box with its atom tag via `emitUnionBoxArg`,
+      // not `emitUnionCoerce` — a concrete-variant/`nulvariant` value must still be boxed here.
+      if (
+        emitUnionBoxOwed(
+          body,
+          sFieldElemNameAt(si, fi),
+          sFieldRowTyAt(si, fi),
+          valIx,
+          fnIx,
+        )
+        < 0
+      ) {
+        return -1
+      }
     }
-  } else if scode == FC_F64 {
-    if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
-  } else if scode == FC_I64 {
-    if emitExprAsI64(body, valIx, fnIx) < 0 { return -1 }
-  } else if scode == FC_F32 {
-    if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
-  } else if scode == FC_NUL_STR && exprIsLitAtom(valIx, fnIx) {
-    // a literal-union atom (an i32 id) widens to its member string here — the one
-    // non-null value that needs converting; niche codes 21/30/22 seed their own null rep.
-    if emitStrValue(body, valIx, fnIx) < 0 { return -1 }
-  } else if scode == FC_NUL_STR {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if scode == FC_NUL_BOOL {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if scode == FC_NUL_LIT_UNION {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if scode == FC_NUL_CLOSURE {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if scode == FC_NUL_NONE {
-    // The `null` unit type's slot holds only `ref.null none`; the value runs for effect (D4671).
-    if emitNulNoneForEffect(body, valIx, fnIx) < 0 { return -1 }
-    fbRefNullNone()
-  } else if scode == FC_STR && exprIsLitAtom(valIx, fnIx) {
-    // a literal-union atom widens to its member string here.
-    if emitAtomToStr(body, valIx, fnIx) < 0 { return -1 }
-  } else if sFieldIsLitUnion(si, fi) {
-    // the member literal lowers as its interned atom id, not a string.
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if sFieldIsLitUnionArray(si, fi) {
-    // an atom-array field: without the litunion context each string-lexeme element would
-    // build a string list, whose wrapper mismatches the field's `$lTypeIdx` of atom ids.
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if scode == FC_STRUCT {
-    // A narrowed arm into a nested-struct field (`{ g: s }` after `if s is Circle`) — see
-    // `emitArmDelivery`. Inert for every other code-15 value.
-    if emitArmDelivery(body, valIx, fnIx, sFieldTgtHeapOf(si, fi)) < 0 {
-      return -1
+    "f64" => {
+      if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
     }
-  } else {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+    "i64" => {
+      if emitExprAsI64(body, valIx, fnIx) < 0 { return -1 }
+    }
+    "f32" => {
+      if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
+    }
+    "nulstr" => {
+      // a literal-union atom (an i32 id) widens to its member string here — the one
+      // non-null value that needs converting; the i32 niches seed their own null rep.
+      if exprIsLitAtom(valIx, fnIx) {
+        if emitStrValue(body, valIx, fnIx) < 0 { return -1 }
+      } else if emitExpr(body, valIx, fnIx) < 0 {
+        return -1
+      }
+    }
+    "nulnone" => {
+      // The `null` unit type's slot holds only `ref.null none`; the value runs for effect (D4671).
+      if emitNulNoneForEffect(body, valIx, fnIx) < 0 { return -1 }
+      fbRefNullNone()
+    }
+    "str" => {
+      // a literal-union atom widens to its member string here.
+      if exprIsLitAtom(valIx, fnIx) {
+        if emitAtomToStr(body, valIx, fnIx) < 0 { return -1 }
+      } else if emitExpr(body, valIx, fnIx) < 0 {
+        return -1
+      }
+    }
+    "nulstruct" | "nulvariant" => {
+      // A literal-union field lowers its member as the interned atom id. Otherwise a narrowed
+      // arm into a record field (`{ g: s }` after `if s is Circle`) — see `emitArmDelivery`.
+      if sFieldIsLitUnion(si, fi) || sFieldIsLitUnionArray(si, fi) {
+        if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+      } else if (
+        emitArmDelivery(body, valIx, fnIx, sFieldTgtHeapOf(si, fi))
+        < 0
+      ) {
+        return -1
+      }
+    }
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      // An atom or atom-array field lowers its members as interned ids; the litunion context
+      // keeps each string-lexeme element from building a string list.
+      if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+    }
   }
 
   // D1222 — the construct half of the field layer's `ref.as_non_null`. A narrowed nullable
@@ -2156,11 +2165,10 @@ function emitObj(body: u8[], objIx: i32, fnIx: i32, row: i32) {
     let fi = 0
     while fi < cnt {
       const valIx = objFieldVal(objIx, sFieldNames[sFieldStart[si] + fi])
-      const scode = sFieldTypeAt(si, fi)
       if valIx < 0 {
         // An omitted field pushes a constant, so it has no source position to keep and
         // stays in the layout loop even under the stash.
-        if emitOmittedFieldNull(body, si, fi, scode) < 0 {
+        if emitOmittedFieldNull(body, si, fi) < 0 {
           return emitFail(
             "emitProgram: object literal is missing a struct field",
           )
@@ -2720,6 +2728,11 @@ function emitVariantFieldValue(
   emitVariantFieldValueUnder(body, vi, fj, valIx, fnIx)
 }
 
+// Whether a field stored at `k` can hold a closure: a closure slot, nullable or not, or the box.
+function fieldKindTakesClosure(k: VKind): boolean {
+  k == "closure" || k == "nulclosure" || k == "union"
+}
+
 // `emitVariantFieldValue`'s body: it applies the field's context and leaves it for the
 // wrapper's exit to undo.
 function emitVariantFieldValueUnder(
@@ -2729,49 +2742,52 @@ function emitVariantFieldValueUnder(
   valIx: i32,
   fnIx: i32,
 ) {
-  const vcode = variantFieldTypeAt(vi, fj)
+  const vk = eqRowFieldKind(-1 - vi, fj)
+  if vk == null {
+    return emitFail("emitProgram: union variant field has no storage kind")
+  }
 
   const vcfv = nodeAt(unwrapParen(valIx))
   if vcfv is FuncDecl {
-    if vcode != FC_CLOSURE && vcode != FC_NUL_CLOSURE && vcode != FC_UNION {
+    if !fieldKindTakesClosure(vk) {
       return emitFail(
         "emitProgram: a lambda field value resolved to a non-closure variant field slot",
       )
     }
   }
 
-  if vcode == FC_F64 {
-    if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
-  } else if vcode == FC_I64 {
-    if emitExprAsI64(body, valIx, fnIx) < 0 { return -1 }
-  } else if vcode == FC_F32 {
-    if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
-  } else if vcode == FC_NUL_STR {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if vcode == FC_NUL_BOOL {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if vcode == FC_NUL_LIT_UNION {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if vcode == FC_NUL_CLOSURE {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if vcode == FC_NUL_NONE {
-    if emitNulNoneForEffect(body, valIx, fnIx) < 0 { return -1 }
-    fbRefNullNone()
-  } else if variantFieldIsLitUnionArray(vi, fj) {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if vcode == FC_UNION {
-    if emitVariantFieldBox(body, vi, fj, valIx, fnIx) < 0 { return -1 }
-  } else if vcode == FC_I32 && variantFieldIsLitUnion(vi, fj) {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if vcode == FC_I32_LIST && variantFieldIsLitUnionArray(vi, fj) {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
-  } else if (
-    (vcode == FC_STR || vcode == FC_NUL_STR)
-    && exprIsLitAtom(valIx, fnIx)
-  ) {
-    if emitStrValue(body, valIx, fnIx) < 0 { return -1 }
-  } else {
-    if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+  match vk {
+    "f64" => {
+      if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
+    }
+    "i64" => {
+      if emitExprAsI64(body, valIx, fnIx) < 0 { return -1 }
+    }
+    "f32" => {
+      if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
+    }
+    "nulnone" => {
+      if emitNulNoneForEffect(body, valIx, fnIx) < 0 { return -1 }
+      fbRefNullNone()
+    }
+    "union" => {
+      if variantFieldIsLitUnionArray(vi, fj) {
+        if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+      } else if emitVariantFieldBox(body, vi, fj, valIx, fnIx) < 0 {
+        return -1
+      }
+    }
+    "str" => {
+      // a literal-union atom widens to its member string here.
+      if !variantFieldIsLitUnionArray(vi, fj) && exprIsLitAtom(valIx, fnIx) {
+        if emitStrValue(body, valIx, fnIx) < 0 { return -1 }
+      } else if emitExpr(body, valIx, fnIx) < 0 {
+        return -1
+      }
+    }
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+    }
   }
   0
 }
@@ -3022,7 +3038,7 @@ function emitStructExprAsVariantBox(
 // A fresh record at the heap `dHeap`, whose fields are `dNames` at the flat field rows `dFieldRows`, built from
 // the record `exprIx` evaluates to at struct row `ssi`: field by field, each number converted
 // (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`.
-// `dRow` is the destination's struct row, or -1 for a variant row, whose fields are not nested.
+// `dRow` is the destination's struct row, or -1 for a variant row.
 function emitRecCopy(
   body: u8[],
   exprIx: i32,
@@ -3070,30 +3086,47 @@ function rcReadSource(
 }
 
 // The destination row nested field `fj` of `dRow` is copied into, where its record is stored at
-// another row than the source row `sRow`'s field `sfi`; -1 where the field is not copied apart.
-function rcNestedRow(sRow: i32, sfi: i32, dRow: i32, fj: i32, dr: i32): i32 {
-  if dRow < 0 || !fieldRowIsRecordRef(dr) || !sFieldIsRecordRef(sRow, sfi) {
-    return -1
-  }
+// another row than the source row `sRow`'s field `sfi`; -1 where the field is not copied apart. A
+// variant destination (`dRow` -1) names the row by its checked field type `dFt`.
+function rcNestedRow(
+  sRow: i32,
+  sfi: i32,
+  dRow: i32,
+  fj: i32,
+  dr: i32,
+  dFt: i32,
+): i32 {
+  if !fieldRowIsRecordRef(dr) || !sFieldIsRecordRef(sRow, sfi) { return -1 }
   const sIn = sFieldTgtStructIdx(sRow, sfi)
-  const dIn = sFieldTgtStructIdx(dRow, fj)
+  const dIn = if dRow >= 0 { sFieldTgtStructIdx(dRow, fj) } else { rcRowOfTy(dFt) }
   if sIn < 0 || dIn < 0 || sIn >= sHeapIdx.length || dIn >= sHeapIdx.length {
     return -1
   }
   if sHeapIdx[sIn] == sHeapIdx[dIn] { -1 } else { dIn }
 }
 
+// The struct row of the record `ty` or `ty | null`, or -1.
+function rcRowOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const inner = nullableInnerOrNone(ty)
+  const t = if inner >= 0 { inner } else { ty }
+  const r = structIndexOfTy(t)
+  if r >= 0 { r } else { structRowOfAnnTy("", t, t) }
+}
+
 // Whether any field of destination row `dRow` is copied at a nested row (`rcNestedRow`).
 function rcHasNested(
   ssi: i32,
   dRow: i32,
+  dTy: i32,
   dNames: string[],
   dFieldRows: i32[],
 ): boolean {
   let fj = 0
   while fj < dNames.length {
     const sfi = sFieldIndex(ssi, dNames[fj])
-    if sfi >= 0 && rcNestedRow(ssi, sfi, dRow, fj, dFieldRows[fj]) >= 0 {
+    const dFt = rcFieldTy(dTy, dNames[fj])
+    if sfi >= 0 && rcNestedRow(ssi, sfi, dRow, fj, dFieldRows[fj], dFt) >= 0 {
       return true
     }
     fj = fj + 1
@@ -3118,9 +3151,10 @@ function emitRecCopyFields(
     )
   }
   const sHeap = sHeapIdx[ssi]
+  const dTy = recCopyTyOf(exprIx)
   const reReadable = exprReReadable(unwrapParen(exprIx))
     || (dNames.length == 1
-    && !rcHasNested(ssi, dRow, dNames, dFieldRows))
+    && !rcHasNested(ssi, dRow, dTy, dNames, dFieldRows))
   if !reReadable {
     if !fnUsesVariantRebox {
       return emitFail(
@@ -3132,7 +3166,6 @@ function emitRecCopyFields(
   }
   rcPathHeap = []
   rcPathField = []
-  const dTy = recCopyTyOf(exprIx)
   emitRecCopyLevel(
     body,
     exprIx,
@@ -3187,7 +3220,7 @@ function emitRecCopyLevel(
       continue
     }
     const dFt = rcFieldTy(dTy, dNames[fj])
-    const nest = rcNestedRow(sRow, sfi, dRow, fj, dFieldRows[fj])
+    const nest = rcNestedRow(sRow, sfi, dRow, fj, dFieldRows[fj], dFt)
     if nest >= 0 {
       rcPathHeap.push(sHeapIdx[sRow])
       rcPathField.push(sfi)
@@ -3275,12 +3308,10 @@ function rcWrapKind(
   sr: i32,
   dr: i32,
 ): i32 {
-  if pre != "" || !fieldRowIsUnionBox(dr) || recCopyFromOf(exprIx) >= 0 {
-    return -1
-  }
+  if !fieldRowIsUnionBox(dr) || recCopyFromOf(exprIx) >= 0 { return -1 }
   if fieldRowNumKind(sr) < 0 && !fieldRowIsStr(sr, false) { return -1 }
-  const st = rcFieldTy(nodeTyIxOf(exprIx), name)
-  const dt = rcFieldTy(recCopyTyOf(exprIx), name)
+  const st = rcFieldTy(rcPathTy(nodeTyIxOf(exprIx), pre), name)
+  const dt = rcFieldTy(rcPathTy(recCopyTyOf(exprIx), pre), name)
   if st < 0 || dt < 0 { return -1 }
   const inner = nullableInnerOrNone(dt)
   if inner >= 0 && tySame(st, inner) { return boxTagOfTy(st) }
@@ -3315,6 +3346,25 @@ function rcWidenTo(sk: i32, inner: i32): i32 {
 // kind each converts to.
 const RC_WIDENS = ["0>i64", "0>f64", "3>f64", "5>f64"]
 const RC_WIDEN_KINDS = [3, 4, 4, 4]
+
+// The record at field path `pre` (`j.k.`) under the record `ty`, each step's `| null` peeled; -1
+// where a step names no record field.
+function rcPathTy(ty: i32, pre: string): i32 {
+  let t = ty
+  let from = 0
+  let i = 0
+  while i < pre.length {
+    if pre[i] == 46 {
+      const f = rcFieldTy(t, pre.slice(from, i))
+      if f < 0 { return -1 }
+      const inner = nullableInnerOrNone(f)
+      t = if inner >= 0 { inner } else { f }
+      from = i + 1
+    }
+    i = i + 1
+  }
+  t
+}
 
 // The type of field `name` of the checked record `dTy`, or -1.
 function rcFieldTy(dTy: i32, name: string): i32 {
@@ -8577,7 +8627,15 @@ function emitUnionCoerceValueAtom(
     fbStructNew(uBoxIdx) // { tag, member-string ref }
     return 0
   }
-  return emitUnionCoerceAtomBox(body, unionName, uSet, exprIx, bareIx, fnIx)
+  return emitUnionCoerceAtomBox(
+    body,
+    unionName,
+    uSet,
+    uTy,
+    exprIx,
+    bareIx,
+    fnIx,
+  )
 }
 
 // The value-atom box `{ tag, payload }` for `exprIx` entering `unionName`: the atom ladder
@@ -8587,6 +8645,7 @@ function emitUnionCoerceAtomBox(
   body: u8[],
   unionName: string,
   uSet: i32,
+  uTy: i32,
   exprIx: i32,
   bareIx: i32,
   fnIx: i32,
@@ -8594,6 +8653,7 @@ function emitUnionCoerceAtomBox(
   const cak = coerceListAtomOf(
     coerceValueAtomKind(unionName, uSet, exprIx, bareIx, fnIx),
     unionName,
+    uTy,
     bareIx,
     fnIx,
   )
@@ -8737,6 +8797,7 @@ function coerceValueAtomKind(
 function coerceListAtomOf(
   cak0: i32,
   unionName: string,
+  uTy: i32,
   bareIx: i32,
   fnIx: i32,
 ): i32 {
@@ -8747,17 +8808,18 @@ function coerceListAtomOf(
   // of string-literal-union atoms (D4902).
   if (
     cak == 7
-    && !unionHasAtomTy(unionName, "i32", true)
-    && !(unionHasAtomTy(unionName, "boolean", true) && exprIsBoolList(bareIx, fnIx))
+    && !unionHasAtomOfTy(unionName, uTy, "i32", true)
+    && !(unionHasAtomOfTy(unionName, uTy, "boolean", true)
+      && exprIsBoolList(bareIx, fnIx))
     && !exprIsAtomList(bareIx, fnIx)
   ) {
-    if unionHasAtomTy(unionName, "i64", true) {
+    if unionHasAtomOfTy(unionName, uTy, "i64", true) {
       cak = 10 // "i64[]"
-    } else if unionHasAtomTy(unionName, "f64", true) {
+    } else if unionHasAtomOfTy(unionName, uTy, "f64", true) {
       cak = 8 // "f64[]"
-    } else if unionHasAtomTy(unionName, "f32", true) {
+    } else if unionHasAtomOfTy(unionName, uTy, "f32", true) {
       cak = 12 // "f32[]"
-    } else if unionHasAtomTy(unionName, "u8", true) {
+    } else if unionHasAtomOfTy(unionName, uTy, "u8", true) {
       // An empty `[]` classifies `i32[]` too: into `u8[] | Buf` it is the packed list.
       cak = 13 // "u8[]"
     }
@@ -8766,8 +8828,8 @@ function coerceListAtomOf(
   // `f32[]` the checker adopted that arm.
   if (
     cak == 8
-    && !unionHasAtomTy(unionName, "f64", true)
-    && unionHasAtomTy(unionName, "f32", true)
+    && !unionHasAtomOfTy(unionName, uTy, "f64", true)
+    && unionHasAtomOfTy(unionName, uTy, "f32", true)
   ) {
     cak = 12 // "f32[]"
   }
@@ -31009,7 +31071,7 @@ function retFlagsSeedResult(
   // instance's `() => null` for `T | null`) boxes each value at its recorded type.
   const recU = fnRecordedUnionRet(fn, fnPos)
   if rf.retUNm == "" && !rf.retLitUnion && !rf.retNulLitUnion && recU >= 0 {
-    rf.retUNm = monoPinSpellShaped(recU)
+    rf.retUNm = monoPinSpellNoAnon(recU)
     rf.retUTy = recU
   }
   // A maker whose delivery builds its union of records as one record returns that record.
