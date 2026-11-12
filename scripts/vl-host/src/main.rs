@@ -4517,6 +4517,7 @@ fn compile_vl_instance(
     // Identity shadow ($VL_ID_SHADOW=1 records and reports, =2 also keys callback
     // specialization by it): armed before the compile, read back after it. A seed
     // without `setIdShadow` ignores it.
+    arm_opaque_snames(inst, &mut store);
     let id_shadow = id_shadow_mode();
     if id_shadow > 0 {
         if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setIdShadow") {
@@ -4597,6 +4598,17 @@ fn cls_census_on() -> bool {
 
 /// Under `$VL_CLS_CENSUS=1`, arm the guest's classifier census. A seed without
 /// `setClsCensus` ignores it.
+/// Arms the opaque shape-row labels ($VL_OPAQUE_SNAMES=1, a measuring instrument) for the
+/// compiles this instance runs. A seed without `setOpaqueSNames` ignores it.
+fn arm_opaque_snames(inst: &Instance, store: &mut Store<()>) {
+    if std::env::var("VL_OPAQUE_SNAMES").ok().as_deref() != Some("1") {
+        return;
+    }
+    if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut *store, "setOpaqueSNames") {
+        let _ = set.call(&mut *store, 1);
+    }
+}
+
 fn arm_cls_census(inst: &Instance, store: &mut Store<()>) {
     if !cls_census_on() {
         return;
@@ -9684,6 +9696,7 @@ fn pump_session(
     stage_vl_root_and_cwd(&mut store, &inst)?;
     let keep_dir = keep_modules_dir(&mut store, &inst)?;
     arm_cls_census(&inst, &mut store);
+    arm_opaque_snames(&inst, &mut store);
     // `vl test`'s compile pool. A seed without the export compiles every test file in
     // this one instance, as before the pool existed.
     if compile_pool_allowed() {
