@@ -46,9 +46,21 @@ Validated probes: the control reaches the last rung in ≥ 989 programs. The nam
 | a record of functions (D15552) | 6 | `{fs:((i32)=>i32)[],x:i32}` | the same render, a row keyed by its function-value sets |
 | D15922's open template row | 1 | the open type | `#anonN` |
 
-These rows are the ones `rlKeyTyOf` declines (cut 2): their struct row is keyed by a held rep that
-has no type yet. The rung, and its `nonNulBaseOf`, stay as a named floor until the held-rep type
-exists.
+These rows are the ones `rlKeyTyOf` declines (cut 2). The rung, and its `nonNulBaseOf`, stay as a
+named floor.
+
+**The contracts for these floors:**
+
+- **A function-value-set row has no element type, so it is keyed by its set.** That covers
+  `rlElemStructRow`'s name rung for D15804 and D15552, and `rlKeyTyOf`'s decline of a record or
+  list that holds a function.
+- **A type that holds a type parameter is not a rep.** A template's row is keyed by its open type
+  (`rlRowOfOpenTyMinted`, cut 5). Each instance's row is keyed by its closed type. `rlKeyTyOf`
+  therefore declines an open type as a closed key, and D15922's open template row reaches the name
+  rung only for its label.
+
+`sFieldRefSlot` and the former `rlRowOfNameMinted` are converted in cut 5: the open type keys
+them, and no name does.
 
 ## The `emit_base.vl` predicates this lane's stack frees
 
