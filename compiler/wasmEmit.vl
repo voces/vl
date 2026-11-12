@@ -1017,6 +1017,11 @@ import {
   exprUnion,
   exprVariantIndex,
   fieldClosureFeOfRecv,
+  fieldRowIsNulNone,
+  fieldRowIsRecordRef,
+  fieldRowIsStr,
+  fieldRowIsUnionBox,
+  fieldRowNumKind,
   fieldValueFeOf,
   fnHasEnvParam,
   fnIndexOf,
@@ -1337,7 +1342,6 @@ import {
   boxNarrowAtomFor,
   boxWidenAtomFor,
   exprReReadable,
-  fieldCodeNumKind,
   isTestedRowOf,
   recvIsTestedRecord,
   sharedFieldArmAtomKind,
@@ -2964,11 +2968,11 @@ function emitStructExprAsVariantBox(
   if guardVariantFieldSpan(vi, "emitStructExprAsVariantBox") < 0 { return -1 }
   if vi < 0 { return -1 }
   const names: string[] = []
-  const codes: i32[] = []
-  variantRowFields(vi, names, codes)
+  const rows: i32[] = []
+  variantRowFields(vi, names, rows)
   fbI32Rel(RS_TAG, uTags[vi])
   if (
-    emitRecCopy(body, exprIx, ssi, variantHeap(vi), -1, names, codes, fnIx)
+    emitRecCopy(body, exprIx, ssi, variantHeap(vi), -1, names, rows, fnIx)
     < 0
   ) {
     return -1
@@ -2977,7 +2981,7 @@ function emitStructExprAsVariantBox(
   0
 }
 
-// A fresh record at the heap `dHeap`, whose fields are `dNames` stored as `dCodes`, built from
+// A fresh record at the heap `dHeap`, whose fields are `dNames` at the flat field rows `dFieldRows`, built from
 // the record `exprIx` evaluates to at struct row `ssi`: field by field, each number converted
 // (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`.
 // `dRow` is the destination's struct row, or -1 for a variant row, whose fields are not nested.
@@ -2988,12 +2992,12 @@ function emitRecCopy(
   dHeap: i32,
   dRow: i32,
   dNames: string[],
-  dCodes: i32[],
+  dFieldRows: i32[],
   fnIx: i32,
 ): i32 {
   const held = coerceHeld
   coerceHeld = exprIx
-  const r = emitRecCopyFields(body, exprIx, ssi, dRow, dNames, dCodes, fnIx)
+  const r = emitRecCopyFields(body, exprIx, ssi, dRow, dNames, dFieldRows, fnIx)
   coerceHeld = held
   if r < 0 { return -1 }
   fbStructNew(dHeap)
@@ -3029,8 +3033,8 @@ function rcReadSource(
 
 // The destination row nested field `fj` of `dRow` is copied into, where its record is stored at
 // another row than the source row `sRow`'s field `sfi`; -1 where the field is not copied apart.
-function rcNestedRow(sRow: i32, sfi: i32, dRow: i32, fj: i32, code: i32): i32 {
-  if dRow < 0 || code != FC_STRUCT || !sFieldIsRecordRef(sRow, sfi) {
+function rcNestedRow(sRow: i32, sfi: i32, dRow: i32, fj: i32, dr: i32): i32 {
+  if dRow < 0 || !fieldRowIsRecordRef(dr) || !sFieldIsRecordRef(sRow, sfi) {
     return -1
   }
   const sIn = sFieldTgtStructIdx(sRow, sfi)
@@ -3046,12 +3050,12 @@ function rcHasNested(
   ssi: i32,
   dRow: i32,
   dNames: string[],
-  dCodes: i32[],
+  dFieldRows: i32[],
 ): boolean {
   let fj = 0
   while fj < dNames.length {
     const sfi = sFieldIndex(ssi, dNames[fj])
-    if sfi >= 0 && rcNestedRow(ssi, sfi, dRow, fj, dCodes[fj]) >= 0 {
+    if sfi >= 0 && rcNestedRow(ssi, sfi, dRow, fj, dFieldRows[fj]) >= 0 {
       return true
     }
     fj = fj + 1
@@ -3066,7 +3070,7 @@ function emitRecCopyFields(
   ssi: i32,
   dRow: i32,
   dNames: string[],
-  dCodes: i32[],
+  dFieldRows: i32[],
   fnIx: i32,
 ): i32 {
   if ssi < 0 || ssi >= sHeapIdx.length {
@@ -3078,7 +3082,7 @@ function emitRecCopyFields(
   const sHeap = sHeapIdx[ssi]
   const reReadable = exprReReadable(unwrapParen(exprIx))
     || (dNames.length == 1
-    && !rcHasNested(ssi, dRow, dNames, dCodes))
+    && !rcHasNested(ssi, dRow, dNames, dFieldRows))
   if !reReadable {
     if !fnUsesVariantRebox {
       return emitFail(
@@ -3101,12 +3105,12 @@ function emitRecCopyFields(
     dTy,
     "",
     dNames,
-    dCodes,
+    dFieldRows,
     fnIx,
   )
 }
 
-// One level of a copy: each field of destination `dNames`/`dCodes` read off source row `sRow` at
+// One level of a copy: each field of destination `dNames`/`dFieldRows` read off source row `sRow` at
 // the current path, a nested record copied by the level below it. `dTy` is this level's checked
 // destination record and `pre` its field path (`j.`), which key the fields a copy unwraps.
 function emitRecCopyLevel(
@@ -3119,7 +3123,7 @@ function emitRecCopyLevel(
   dTy: i32,
   pre: string,
   dNames: string[],
-  dCodes: i32[],
+  dFieldRows: i32[],
   fnIx: i32,
 ): i32 {
   if sRow < 0 || sRow >= sHeapIdx.length {
@@ -3139,22 +3143,22 @@ function emitRecCopyLevel(
       )
     }
     // A `null` field holds the one value its type has; the source's field is not read (D14817).
-    if dCodes[fj] == FC_NUL_NONE {
+    if fieldRowIsNulNone(dFieldRows[fj]) {
       fbRefNullNone()
       fj = fj + 1
       continue
     }
     const dFt = rcFieldTy(dTy, dNames[fj])
-    const nest = rcNestedRow(sRow, sfi, dRow, fj, dCodes[fj])
+    const nest = rcNestedRow(sRow, sfi, dRow, fj, dFieldRows[fj])
     if nest >= 0 {
       rcPathHeap.push(sHeapIdx[sRow])
       rcPathField.push(sfi)
       const names: string[] = []
-      const codes: i32[] = []
+      const rows: i32[] = []
       let k = 0
       while k < sFieldCount[nest] {
         names.push(sFieldNames[sFieldStart[nest] + k])
-        codes.push(sFieldTypeAt(nest, k))
+        rows.push(sFieldStart[nest] + k)
         k = k + 1
       }
       const inner = nullableInnerOrNone(dFt)
@@ -3170,7 +3174,7 @@ function emitRecCopyLevel(
         nTy,
         pre + dNames[fj] + ".",
         names,
-        codes,
+        rows,
         fnIx,
       )
       rcPathHeap.pop()
@@ -3185,8 +3189,8 @@ function emitRecCopyLevel(
       exprIx,
       pre,
       dNames[fj],
-      sFieldTypeAt(sRow, sfi),
-      dCodes[fj],
+      sFieldStart[sRow] + sfi,
+      dFieldRows[fj],
     )
     if wk >= 0 { fbI32Rel(RS_TAG, scalarTagOfKind(wk)) }
     if rcReadSource(body, exprIx, sHeap, reReadable, fnIx) < 0 { return -1 }
@@ -3214,8 +3218,8 @@ function emitRecCopyLevel(
       fj = fj + 1
       continue
     }
-    const sk = fieldCodeNumKind(sFieldTypeAt(sRow, sfi))
-    const vk = fieldCodeNumKind(dCodes[fj])
+    const sk = fieldRowNumKind(sFieldStart[sRow] + sfi)
+    const vk = fieldRowNumKind(dFieldRows[fj])
     if sk >= 0 && vk >= 0 && sk != vk {
       if njConvert(sk, vk) < 0 { return -1 }
     }
@@ -3230,19 +3234,13 @@ function rcWrapKind(
   exprIx: i32,
   pre: string,
   name: string,
-  sCode: i32,
-  dCode: i32,
+  sr: i32,
+  dr: i32,
 ): i32 {
-  if pre != "" || dCode != FC_UNION || recCopyFromOf(exprIx) >= 0 { return -1 }
-  if (
-    !(sCode == FC_I32
-      || sCode == FC_F64
-      || sCode == FC_I64
-      || sCode == FC_F32
-      || sCode == FC_STR)
-  ) {
+  if pre != "" || !fieldRowIsUnionBox(dr) || recCopyFromOf(exprIx) >= 0 {
     return -1
   }
+  if fieldRowNumKind(sr) < 0 && !fieldRowIsStr(sr, false) { return -1 }
   const st = rcFieldTy(nodeTyIxOf(exprIx), name)
   const dt = rcFieldTy(recCopyTyOf(exprIx), name)
   if st < 0 || dt < 0 { return -1 }
@@ -3327,7 +3325,7 @@ function copyArmRowOf(exprIx: i32): i32 {
 // `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`).
 function emitRecCopyInto(body: u8[], exprIx: i32, row: i32, fnIx: i32): i32 {
   const names: string[] = []
-  const codes: i32[] = []
+  const rows: i32[] = []
   // A call copied back to its own record is read at the row its function builds it at.
   const from = recCopyFromOf(exprIx)
   let ssi = if from >= 0 { structIndexOfTy(from) } else { structIndexOfExpr(exprIx, fnIx) }
@@ -3335,7 +3333,7 @@ function emitRecCopyInto(body: u8[], exprIx: i32, row: i32, fnIx: i32): i32 {
   if row <= -2 {
     const vi = -2 - row
     if guardVariantFieldSpan(vi, "emitRecCopyInto") < 0 { return -1 }
-    variantRowFields(vi, names, codes)
+    variantRowFields(vi, names, rows)
     return emitRecCopy(
       body,
       exprIx,
@@ -3343,7 +3341,7 @@ function emitRecCopyInto(body: u8[], exprIx: i32, row: i32, fnIx: i32): i32 {
       variantHeap(vi),
       -1,
       names,
-      codes,
+      rows,
       fnIx,
     )
   }
@@ -3361,18 +3359,18 @@ function emitRecCopyInto(body: u8[], exprIx: i32, row: i32, fnIx: i32): i32 {
   let fj = 0
   while fj < sFieldCount[row] {
     names.push(sFieldNames[sFieldStart[row] + fj])
-    codes.push(sFieldTypeAt(row, fj))
+    rows.push(sFieldStart[row] + fj)
     fj = fj + 1
   }
-  emitRecCopy(body, exprIx, ssi, sHeapIdx[row], row, names, codes, fnIx)
+  emitRecCopy(body, exprIx, ssi, sHeapIdx[row], row, names, rows, fnIx)
 }
 
-// Pushes variant row `vi`'s field names and codes onto `names` and `codes`, in layout order.
-function variantRowFields(vi: i32, names: string[], codes: i32[]) {
+// Pushes variant row `vi`'s field names and flat field rows onto `names` and `rows`, in layout order.
+function variantRowFields(vi: i32, names: string[], rows: i32[]) {
   let fj = 0
   while fj < uFieldCount[vi] {
     names.push(sFieldNames[uFieldStart[vi] + fj])
-    codes.push(sFieldTypes[uFieldStart[vi] + fj])
+    rows.push(uFieldStart[vi] + fj)
     fj = fj + 1
   }
   0
@@ -4083,20 +4081,20 @@ function emitDiscrimFieldEq(
         + " fields",
     )
   }
-  const code = sFieldTypes[uFieldStart[vi] + fi]
   if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1)
   fbRefCast(variantHeap(vi))
   fbStructGet(variantHeap(vi), fi)
-  emitFieldLitEq(body, code, lex, fnIx)
+  emitFieldLitEq(body, uFieldStart[vi] + fi, lex, fnIx)
 }
 
-// Compares the field value on the stack, stored as field code `code`, with the literal `lex`.
-function emitFieldLitEq(body: u8[], code: i32, lex: string, fnIx: i32) {
-  if code == FC_STR || code == FC_NUL_STR {
+// Compares the field value on the stack, stored at flat field row `r`, with the literal `lex`.
+function emitFieldLitEq(body: u8[], r: i32, lex: string, fnIx: i32) {
+  const nk = fieldRowNumKind(r)
+  if fieldRowIsStr(r, false) || fieldRowIsStr(r, true) {
     return emitStrEqLit(body, mkStr(lex, -1), fnIx)
   }
-  if code == FC_I32 {
+  if nk == 0 {
     // The i32 slot serves both the interned string ATOM and a small numeric literal; the
     // quotes are what part them, exactly as they do in `emitLitMemberEq`.
     if nameIsQuotedLeaf(lex) {
@@ -4107,12 +4105,12 @@ function emitFieldLitEq(body: u8[], code: i32, lex: string, fnIx: i32) {
     fbI32Bin(70) // 0x46 i32.eq
     return 0
   }
-  if code == FC_F64 {
+  if nk == 4 {
     fbF64Const(lex)
     fbI32Bin(97) // 0x61 f64.eq
     return 0
   }
-  if code == FC_I64 {
+  if nk == 3 {
     const pr = parseI64Pair(lex)
     fbI64Const(pr[0], pr[1])
     fbI32Bin(81) // 0x51 i64.eq
@@ -4147,7 +4145,7 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
     return emitFailAt("emitProgram: `is` receiver stash not reserved", recv)
   }
   let heap = -1
-  const codes: i32[] = []
+  const rows: i32[] = []
   const fis: i32[] = []
   const si = structIndexOfExpr(recv, fnIx)
   const vi = if si >= 0 { -1 } else { exprVariantIndex(recv, fnIx) }
@@ -4156,14 +4154,14 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
     for f in names {
       const fi = sFieldIndex(si, f)
       fis.push(fi)
-      codes.push(if fi >= 0 { sFieldTypeAt(si, fi) } else { -1 })
+      rows.push(if fi >= 0 { sFieldStart[si] + fi } else { -1 })
     }
   } else if vi >= 0 && vi < uVarRow.length {
     heap = variantHeap(vi)
     for f in names {
       const fi = variantFieldIndex(vi, f)
       fis.push(fi)
-      codes.push(if fi >= 0 { variantFieldTypeAt(vi, fi) } else { -1 })
+      rows.push(if fi >= 0 { uFieldStart[vi] + fi } else { -1 })
     }
   }
   let laidOut = heap >= 0
@@ -4193,7 +4191,7 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
   let k = 0
   while k < names.length {
     // A nullable string field answers its null apart, then compares only non-null strings.
-    const nulStr = codes[k] == FC_NUL_STR
+    const nulStr = fieldRowIsStr(rows[k], true)
     const lexes = tyLitSetMemberLexes(
       if nulStr { nonNullTy(sets[k]) } else { sets[k] },
     )
@@ -4213,7 +4211,7 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
       if nullable && !staged { fbRefAsNonNull() }
       fbStructGet(heap, fis[k])
       if nulStr { fbRefAsNonNull() }
-      if emitFieldLitEq(body, codes[k], lexes[li], fnIx) < 0 { return -1 }
+      if emitFieldLitEq(body, rows[k], lexes[li], fnIx) < 0 { return -1 }
       if li > 0 {
         fbI32Bin(114) // i32.or
       }
@@ -6908,10 +6906,7 @@ function emitArmFieldsFit(
         fbRefCast(variantHeap(yi))
         fbStructGet(variantHeap(yi), fi)
         if nulStr { fbRefAsNonNull() }
-        if (
-          emitFieldLitEq(body, variantFieldTypeAt(yi, fi), lexes[li], fnIx)
-          < 0
-        ) {
+        if (emitFieldLitEq(body, uFieldStart[yi] + fi, lexes[li], fnIx) < 0) {
           return -1
         }
         if li > 0 {
