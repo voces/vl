@@ -7,13 +7,37 @@ the naming rule spells an instance-only record) read as unboxable, so no row was
 
 ## Changed
 
-A member whose aligned arena type (`unionAtomTysAlignedOf`) is a record counts as a struct
-(`atomTyIsRecord`).
+- A member whose aligned arena type (`unionAtomTysAlignedOf`) is a record counts as a struct
+  (`atomTyIsRecord`).
+- emit_mono's `monoPinUnionNameOfTy` spells by the naming rule (`monoPinSpellShaped`), not the
+  render. That was the floor D15810 pinned, shipped here at the orchestrator's request.
 
 ## Graded
 
-- **Under the naming rule** (emit_mono's `monoPinUnionNameOfTy` by `monoPinSpellShaped`, the
-  floor w317 deletes next): D15810's repro was invalid wasm and now prints `2`. D15713,
+- D15810's repro under the rule spelling was invalid wasm, and now prints `2`. D15713,
   `generics/union-member-order-across-pins.vl` and `generics/union-member-order-across-joins.vl`
   print what master prints.
-- **On master's spellings**, the full sweep is in the PR.
+- **Local full sweeps**, `sweep.vl record` with fixpoint seeds on both sides, against master
+  `7d392da3`. With the fix alone:
+
+  ```
+  same                            23950
+  bytes-only movers                   2
+  output movers                       1
+  runs -> not-runs  (blocking)        0
+  new compiler traps  (blocking)      0
+  ```
+
+  With the fix and the floor deletion, this PR:
+
+  ```
+  same                            23946
+  bytes-only movers                   6
+  output movers                       1
+  runs -> not-runs  (blocking)        0
+  new compiler traps  (blocking)      0
+  ```
+
+  The output mover in both is D3938, from `emit_reject` to `runs`. It prints `7` then `-1`, as
+  its row wants, so the row closes with the fixture
+  `tests/cases/unions/record-field-union-of-generic-applications.vl`.
