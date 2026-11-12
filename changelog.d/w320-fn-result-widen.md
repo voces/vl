@@ -1,0 +1,2 @@
+## Type system (Track A)
+- A function value whose result widens exactly as a number is admitted at the wider function type: `(i32) => i32` at `(i32) => f64` and `() => i32` at `() => i64`, converted by the delivery's adapter (D15896, lifting D9011's refusal). A held list of records holding un-annotated functions, read at a wider function field type, is now refused at check instead of trapping (D15895).
