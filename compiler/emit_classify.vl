@@ -809,6 +809,7 @@ import {
   sFieldStart,
   sFieldStoreTy,
   sFieldTypes,
+  sHeapIdx,
   sIsRefRow,
   sLitIdRow,
   sLitMintFn,
@@ -819,10 +820,13 @@ import {
   uDeclared,
   uFieldCount,
   uFieldStart,
+  uTags,
   uVarTyIx,
   uVariants,
   unNames,
   unTyIx,
+  variantHeap,
+  variantRowOf,
 } from "./emit_state"
 import {
   ArrNewKind,
@@ -928,7 +932,11 @@ import {
 } from "./symbols"
 import { peelGroupParens } from "./tyname"
 import { recNarrowRecordOf, recRepWidens } from "./check_bind_adopt"
-import { recEnclosingFn, storeLetBuiltOf } from "./check_fit_rules"
+import {
+  recEnclosingFn,
+  recUnionRecMember,
+  storeLetBuiltOf,
+} from "./check_fit_rules"
 import { holeFnArgRetAtParams, tyProvesNonNull } from "./check_relate_core"
 import {
   flattenVariantsInto,
@@ -9090,6 +9098,9 @@ function recvFieldStructRow(recvIx: i32, prop: string, fnIx: i32): i32 {
 // The row a field read is stored at: the receiver's struct field, a narrowed or variant
 // receiver's field, or the row every member of a struct union shares.
 function structIndexOfMemberStore(e: Member, exprIx: i32, fnIx: i32): i32 {
+  // A record built into a union of records and read at its own type is the member's row.
+  const avi = boxedArmOfMember(exprIx, fnIx)
+  if avi >= 0 { return variantRowOf(avi) }
   const sr = recvFieldStructRow(e.memObj, e.memProp, fnIx)
   if sr != -1 { return sr }
   const r1 = variantFieldStructRow(
@@ -9105,6 +9116,33 @@ function structIndexOfMemberStore(e: Member, exprIx: i32, fnIx: i32): i32 {
   const pvi = exprVariantIndex(e.memObj, fnIx)
   if pvi >= 0 { return variantFieldStructRow(pvi, e.memProp) }
   sharedFieldTgtStructIdx(e.memObj, e.memProp, exprIx, fnIx)
+}
+
+// The variant of the record member the field read `memIx` is, where its receiver's row stores
+// the field as a union of records and the read's own type is the one member with its field names
+// (`recUnionRecMember`): a record built into the union and read at its own type. Else -1.
+export function boxedArmOfMember(memIx: i32, fnIx: i32): i32 {
+  const r = unwrapParen(memIx)
+  if r < 0 { return -1 }
+  const rn = nodeAt(r)
+  if !(rn is Member) { return -1 }
+  const bsi = structIndexOfExpr(rn.memObj, fnIx)
+  if bsi < 0 || bsi >= sHeapIdx.length { return -1 }
+  const bidx = sFieldIndex(bsi, rn.memProp)
+  if bidx < 0 || !sFieldIsUnionBox(bsi, bidx) { return -1 }
+  const u = sFieldElemTyIxAt(bsi, bidx)
+  const own = nonNullTy(nodeTyAt(r, fnIx))
+  if u < 0 || own < 0 || u >= T.tys.length || own >= T.tys.length { return -1 }
+  if !(tyAt(own) is TyObj) { return -1 }
+  const mt = recUnionRecMember(own, u)
+  if mt < 0 { return -1 }
+  const vi = repVariantShapeRowOf(mt)
+  if vi < 0 || vi >= uTags.length { return -1 }
+  const vr = variantRowOf(vi)
+  if vr < 0 || vr >= sHeapIdx.length || sHeapIdx[vr] != variantHeap(vi) {
+    return -1
+  }
+  vi
 }
 
 // The struct row field `prop` of variant row `vi` is stored at, or -1.
@@ -9292,6 +9330,8 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     return nodeRepIs(exprIx, "union", fnIx)
   }
   const e = nodeAt(exprIx)
+  // A record read out of a union of records it was built into is emitted as the member's record.
+  if e is Member && boxedArmOfMember(exprIx, fnIx) >= 0 { return false }
   // A name, field or element read is the box when what the emitted code holds there is: its read
   // rep's read half. A storage read asks the store half, which the arms below answer, as they do
   // a read with no read rep and a `litatom` store, which can hold a narrowed union box.
