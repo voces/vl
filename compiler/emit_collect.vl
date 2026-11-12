@@ -1,4 +1,4 @@
-import { unionArmAtomsOfExpr } from "./emit_classify"
+import { unionArmRowsOfExpr } from "./emit_classify"
 import { rlElemNonNulTyAt } from "./emit_map_value_slots"
 
 // `emit_collect.vl` — the emitter's collection passes: the pre-lowering walks that fill
@@ -715,6 +715,7 @@ import {
 import {
   addLocalSlot,
   annDeclVariantRow,
+  exactArmRowOfTy,
   globalLetOfDeclRead,
   markLocalDecl,
   markLoopVarIter,
@@ -1077,14 +1078,21 @@ function litSetTyIxOf(tyIx: i32): i32 {
 }
 
 // The hint for a field row pushed from a `FieldDef` node: the field's own row projected per
-// `code`, declined for the names `repElemKey` keys nominally and for a list of literal unions.
+// `code`, declined for a list of literal unions. The element's type, never its stored name,
+// decides its row (D6).
 function fieldElemHintOf(fdType: i32, code: i32, elemNm: string) {
   if elemNm == "" { return -1 }
   const fty = nodeTyIxOf(fdType)
   // A bare string literal's atom row is its own literal type; its lexeme resolves to none.
   if code == FC_I32 && tyIsOneStrLit(fty) { return fty }
-  if elemTyIsNominal(shapeFieldElemRow(fdRowOf(fdType), code)) { return -1 }
-  const er = shapeFieldElemRow(fdRowOf(fdType), code)
+  fieldElemHintOfRow(fdRowOf(fdType), fty, code)
+}
+
+// `fieldElemHintOf` for a field read off its type `fdRow` (`fty` the field's own type where the
+// projection has none): the row projected per `code`, a literal union as its arena type, and
+// -1 for a list of literal unions.
+function fieldElemHintOfRow(fdRow: i32, fty: i32, code: i32): i32 {
+  const er = shapeFieldElemRow(fdRow, code)
   // A literal union is handed over as its arena type, the field's own where the projection has
   // none, so the recorder never resolves the spelling (that would mint past the mint-order line).
   let lu = er
@@ -3627,7 +3635,8 @@ function leqgNoteRep(kind: i32, slot: i32, depth: i32) {
 // lowering emits a compare per shared arm, and under-reserving is invalid wasm.
 function leqNoteUnionArms(exprIx: i32, fnIx: i32) {
   const arms: string[] = []
-  if !unionArmAtomsOfExpr(exprIx, fnIx, arms) { return 0 }
+  const rows: i32[] = []
+  if !unionArmRowsOfExpr(exprIx, fnIx, arms, rows) { return 0 }
   let ui = 0
   while ui < arms.length {
     const lk = leqCoreKindOfAtomKind(valueAtomKind(arms[ui]))
@@ -3635,7 +3644,7 @@ function leqNoteUnionArms(exprIx: i32, fnIx: i32) {
     // D1096 — a list field of a struct arm needs a frame for the same reason a list arm does:
     // the arm's own compare walks its variant row field by field, so a list-repped field runs
     // the ordinary list core one level in. The scan above only sees the arm atoms.
-    leqNoteVariantFields(variantIndexOf(arms[ui]))
+    leqNoteVariantFields(rows[ui])
     ui = ui + 1
   }
   0
@@ -6729,7 +6738,7 @@ function collectNestedFieldShapes(stmts: i32[]) {
     if s is TypeDecl {
       // D1518 — the arm-field mint below is not gated on the owner: it answers for the field's
       // target, which a declaration that is itself a union arm shares with an ordinary owner.
-      const ownsRow = variantIndexOf(s.tdName) < 0 && gaeLtAt(s.tdName) < 0
+      const ownsRow = !declIsVariantArm(s) && gaeLtAt(s.tdName) < 0
       const fields = s.tdFields
       let fi = 0
       while fi < fields.length {
@@ -6920,11 +6929,17 @@ function structTableReset() {
   0
 }
 
+// Whether record declaration `s` is stored at a variant row: a row holds its checked type, so a
+// same-shape record of an arm's type shares that arm's row.
+function declIsVariantArm(s: TypeDecl): boolean {
+  exactArmRowOfTy(declTyIxOfName(s.tdName)) >= 0
+}
+
 // Whether `collectS` mints a declared struct row for type declaration `s` at `sx`: a union variant
 // belongs to the variant table, a generic alias has no concrete shape, and a sub-word `flat`
 // record is layout-only.
 function typeDeclMintsRow(s: TypeDecl, sx: i32, stmts: i32[]): boolean {
-  variantIndexOf(s.tdName) < 0
+  !declIsVariantArm(s)
     && gaeLtAt(s.tdName) < 0
     && !flatHasSubWordField(sx, stmts, 16)
 }
@@ -7139,7 +7154,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       tyMapKeyKindSpan(fldTy),
       fnames[fi],
       variantFieldIdText(ftxt, fldTy),
-      -1,
+      fieldElemHintOfRow(fldTy, fldTy, fc),
       fldTy,
       "",
     )
