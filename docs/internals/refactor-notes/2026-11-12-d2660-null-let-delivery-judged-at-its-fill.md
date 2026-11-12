@@ -1,7 +1,8 @@
 # D2660: a `let x = null` read delivered before its filling write is judged at the filled type, 2026-11-12
 
-This closes D2660, a clause-1 row, as containment per the orchestrator's ruling. Running it is
-the owner-ruled flow-sensitive-read backlog item, which gets its own lane.
+This contains D2660, a clause-1 row, per the orchestrator's ruling. The row stays open at
+clause 2: running it is the owner-ruled flow-sensitive-read backlog item (w316's lane), which
+permits the program, so the refusal is interim.
 
 ## Mechanism
 
