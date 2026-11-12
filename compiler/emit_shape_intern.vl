@@ -199,9 +199,13 @@ import {
   tyStepRet,
 } from "./tyquery"
 
+// The refusal of a field type both the rep descriptor and the field-code ladder decline.
+const NESTED_FIELD_UNCODED = "emitProgram: a field's type has no storage code: the rep "
+  + "descriptor declined it and the field-code ladder has no arm for it"
+
 // The field code of a field spelled `t` whose recorded arena type is `ty` (-1 for none): read
-// off the type (`fieldCodeOfTyCovered`), and from the spelling ladder only where the type
-// declines, then the `S[] | null` rung. A type parameter's field is uncoded: its row is the
+// off the type (`fieldCodeOfTyCovered`), and from the ladder (`nameFieldCode`) only where the
+// type declines, then the `S[] | null` rung. A type parameter's field is uncoded: its row is the
 // generic original's, which no emitted read uses, and each instance mints its own.
 export function nameFieldCodeTy(t: string, ty: i32): i32 {
   const a = fieldCodeOfTyCovered(ty)
@@ -221,8 +225,11 @@ export function nameFieldCodeTy(t: string, ty: i32): i32 {
   // The last rung of the NODE ladder, which this one lacked: `nameIsNulRefList` resolves
   // through the struct table, so a shape whose field is `S[] | null` coded -1 whenever it is
   // classified before `S` has a row — and the mint refused a spelling the declared field
-  // codes 28 (D1692). Last, exactly as in `fieldCodeOfSpelling`, so no name arm can move.
-  nulRefListFieldCodeOfTy(ty)
+  // codes 28 (D1692). Last, so no name arm can move.
+  const n = nulRefListFieldCodeOfTy(ty)
+  if n >= 0 || ty < 0 { return n }
+  // A declined type that no rung codes: the descriptor and the ladder disagree on its domain.
+  emitFail(NESTED_FIELD_UNCODED)
 }
 
 // Interns each union arm whose core (trailing `[]`s peeled) is an inline `{…}` shape, via
@@ -476,12 +483,12 @@ export function funcTypeShapeLowerable(nm: string, ty: i32): boolean {
     } else {
       const ftxt = ftexts[fi]
       const fTy = tyFieldTyOf(ty, fnames[fi])
-      const fc = nameFieldCode(ftxt, fTy)
+      const fc = nameFieldCodeTy(ftxt, fTy)
       if fc < 0 {
-        // A nested inline-shape field: recurse into the base shape — lowerable only if
-        // it is.
-        const base = nonNulBaseOf(ftxt)
-        if !funcTypeShapeLowerable(base, tyPeelNul(fTy)) { okAll = false }
+        // The descriptor codes every closed record, so an uncoded field is one both it and
+        // the ladder decline.
+        emitFail(NESTED_FIELD_UNCODED)
+        okAll = false
       } else if !funcTypeFieldCodeSafe(fc) {
         // A code-5 field whose type is a nested scalar-leaf array or a lowerable
         // struct-element array is a plain ref-list slot, lowerable. A code-19 map field
@@ -506,41 +513,12 @@ export function funcTypeShapeLowerable(nm: string, ty: i32): boolean {
   okAll && fieldCount > 0
 }
 
-// Whether the field spelled `ftxt`, of recorded type `ty`, will intern cleanly as a nested
-// struct at the `collectA` phase — the pure, intern-free mirror of `internInlineShapeTy`'s
-// acceptance, usable during `collectU` before the struct table exists. Acceptance here
-// obligates the `collectA` variant-field pass to intern it, and is monotone-safe: a field code can only improve from -1.
-export function variantNestedShapeOkTy(ftxt: string, ty: i32): boolean {
-  // The `| null` peel belongs here, not at the callers, so name and arena are peeled together
-  // and the recursion's own fields keep an arena to ask (D1692). `tyStepNulIf` leaves a
-  // non-nullable spelling's type alone.
-  const nm = nonNulBaseOf(ftxt)
-  const nmTy = tyStepNulIf(ty, ftxt, nm)
-  if !nameIsShapeSpanEnds(nm) { return false }
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
-  let okAll = true
-  let fieldCount = 0
-  let fi = 0
-  while fi < fnames.length {
-    if fnames[fi] == "" {
-      okAll = false
-    } else {
-      const fty = tyFieldTyOf(nmTy, fnames[fi])
-      if nameFieldCodeTy(ftexts[fi], fty) < 0 {
-        // A nested inline-shape field (`g: {h: i32}` / `g: {h: i32} | null`):
-        // lowerable only if ITS shape is. A concrete generic application is lowerable as the
-        // interner's own rung codes it (D4556).
-        const gb = nonNulBaseOf(ftexts[fi])
-        const ga = nameIsConcreteGenAppDecl(gb)
-        if !ga && !variantNestedShapeOkTy(ftexts[fi], fty) { okAll = false }
-      }
-      fieldCount = fieldCount + 1
-    }
-    fi = fi + 1
-  }
-  okAll && fieldCount > 0
+// Whether a variant field the field code left uncoded interns as a nested struct at `collectA`.
+// The rep descriptor codes every closed record, so no field reaches here uncoded; one that does
+// is a field type both the descriptor and the ladder decline, and is refused loudly.
+export function variantNestedShapeOkTy(_ftxt: string, _ty: i32): boolean {
+  emitFail(NESTED_FIELD_UNCODED)
+  false
 }
 
 // The arm's render, spelled the way the arm's own row is coded (D1093): `tyToEmitName`
@@ -1011,7 +989,7 @@ function iisPushFieldElem(
     if e5 == "" {
       // The trailing-`[]` cut at its home (`tyname.arrElemNameRaw`). The guard is
       // dischargeable: `codes[pi] == 5` implies `nameFieldCode(texts[pi]) == 5`, since the
-      // code and text are pushed together and `fieldCodeOfSpelling`'s single `return 5` is
+      // code and text are pushed together and `nameFieldCodeTy`'s single `return 5` is
       // inside `if nameIsArray(t)`.
       const raw5 = arrElemNameRaw(texts[pi])
       if structIndexByName(raw5) >= 0 { e5 = raw5 }
@@ -1312,7 +1290,7 @@ export function internShapeAs(key: string, nm: string) {
     if rawNames[fi] == "" {
       return emitFail("emitProgram: malformed struct field")
     }
-    const fc = nameFieldCode(
+    const fc = nameFieldCodeTy(
       rawTexts[fi],
       shapeFieldRowOf(fieldsTy, rawNames[fi]),
     )
