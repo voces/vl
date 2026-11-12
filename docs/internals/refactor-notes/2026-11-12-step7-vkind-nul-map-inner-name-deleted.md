@@ -10,7 +10,7 @@ changes no program's output by construction. The seed is still a fixpoint.
 
 ## Measurement
 
-- **render-parse:** parses 19 → 17. `nulMapInnerName`'s `nullablePartOf` and
+- **render-parse:** parses fall by 2 (19 → 17 on the base; 10 → 8 merged with master `fe0c3ce3`). `nulMapInnerName`'s `nullablePartOf` and
   `nameIsMapMemberUnion`'s `unionMemberCount` are gone; renders stay at 9. The baseline is
   rewritten in this PR.
 - **Seed:** a fixpoint, 6,714,738 bytes.
