@@ -28,3 +28,15 @@ the substitution. Four programs built invalid modules. Under the change with thi
 The fourth is a different gap. The let's synthesized annotation carries no type
 (`synthTypeRefFb(…, -1)`), and its rule spelling (`#anon0|i32`) parses to none, so no typed
 lookup can find its row. That is `monoSubstLetType`'s to give it.
+
+## Proof
+
+- **Local full sweep**, `sweep.vl record` with fixpoint seeds on both sides, against master
+  `078abd54`: 23,965 same, 0 bytes-only, 0 output movers, 0 blocking. The one cell only in the
+  candidate is D15760's own repro.
+- **With w317's rule spelling applied on top**, for the lane that moves `monoSubstLetType`: 1
+  output mover, `generics/generic-is-over-anonymous-record-pin.vl`, the fourth program above.
+  It stays `monoSubstLetType`'s to close before that move lands. There are 2 bytes-only movers.
+- **Locally:** lint-self, rep-fuzz, `cases_wasm`, the memo-generation, state-audit and scaling
+  tests, emitter-state-audit, capability probes (`--live-sites`, `--floor`), splice-scan,
+  seed-size, late-demands, the dead-export and render-parse budgets, and the inventory tests.
