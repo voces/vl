@@ -396,25 +396,14 @@ import {
 import {
   AS_FAIL_DOMS,
   FC_F32,
-  FC_F32_LIST,
   FC_F64,
-  FC_F64_LIST,
   FC_I32,
-  FC_I32_LIST,
   FC_I64,
-  FC_I64_LIST,
   FC_NUL_BOOL,
-  FC_NUL_CLOSURE,
-  FC_NUL_I32_LIST,
   FC_NUL_LIT_UNION,
-  FC_NUL_MAP,
-  FC_NUL_REF_LIST,
   FC_NUL_STR,
-  FC_REF_LIST,
   FC_STR,
   FC_STRUCT,
-  FC_STR_LIST,
-  FC_U8_LIST,
   FC_UNION,
   INIT_REACH_NEVER,
   LBK_F32_LIST,
@@ -862,7 +851,6 @@ import {
   mapTypeIdxOf,
   mvValElemHeapOf,
   mvValsBackOf,
-  nulScalarListFieldWrapHeap,
   nulScalarListWrapHeap,
   pushFieldStorage,
   rpDecl,
@@ -905,6 +893,7 @@ import {
   optChainStagesRecv,
   optRecvReReadable,
   sFieldElemNameAt,
+  sFieldFlatRow,
   sFieldIsLitUnion,
   sFieldIsLitUnionArray,
   sFieldRowTyAt,
@@ -915,6 +904,8 @@ import {
   variantFieldElemName,
   variantFieldIsLitUnion,
   variantFieldIsLitUnionArray,
+  variantFieldIsStr,
+  variantFieldNumKind,
   variantFieldTypeAt,
 } from "./emit_atom_kinds"
 import {
@@ -7373,27 +7364,36 @@ function emitOptRecvBase(body: u8[], exprIx: i32, fnIx: i32, asRef: boolean) {
   0
 }
 
-// How a struct field of storage code `code` encodes `null`, in `rdNul`'s vocabulary: 0 never
-// null, 1 a null ref, 2 the boolean sentinel `2`, 3 the literal-union sentinel `-1`, 4 the
-// box's null tag. A non-nullable struct field (code 15) answers 1: its slot is a nullable ref.
-function optChainLeafNulDisc(code: i32): i32 {
-  if code == FC_STRUCT || code == FC_NUL_STR || code == FC_NUL_CLOSURE {
-    return 1
+// How struct `si`'s field `fi` encodes `null`, in `rdNul`'s vocabulary: 0 never null, 1 a null
+// ref, 2 the boolean sentinel `2`, 3 the literal-union sentinel `-1`, 4 the box's null tag. A
+// record field answers 1, its slot being a nullable ref; the `null` unit's slot answers 0.
+function optChainLeafNulDisc(si: i32, fi: i32): i32 {
+  const r = sFieldStart[si] + fi
+  const k = fieldRowKind(r)
+  if k == null { return 0 }
+  match k {
+    "nulstruct" | "nulvariant" | "nulstr" | "nulclosure" | "nullist" | "nulreflist" | "nulmap" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" => {
+      return 1
+    }
+    "nulbool" => {
+      return 2
+    }
+    "i32" => {
+      return if fieldRowIsPlainI32(r) { 0 } else { 3 }
+    }
+    "union" => {
+      return 4
+    }
+    "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" => {
+      return 0
+    }
   }
-  if code == FC_NUL_I32_LIST || code == FC_NUL_REF_LIST || code == FC_NUL_MAP {
-    return 1
-  }
-  if nulScalarListFieldWrapHeap(code) >= 0 { return 1 }
-  if code == FC_NUL_BOOL { return 2 }
-  if code == FC_NUL_LIT_UNION { return 3 }
-  if code == FC_UNION { return 4 }
-  0
 }
 
-// Consume a field value of storage code `code` and push 1 when it is that field's `null`.
-// Only called for a code `optChainLeafNulDisc` answers non-zero for.
-function emitOptChainLeafNulTest(code: i32) {
-  const disc = optChainLeafNulDisc(code)
+// Consume the value of struct `si`'s field `fi` and push 1 when it is that field's `null`.
+// Only called for a field `optChainLeafNulDisc` answers non-zero for.
+function emitOptChainLeafNulTest(si: i32, fi: i32) {
+  const disc = optChainLeafNulDisc(si, fi)
   if disc == 1 { return fbRefIsNull() }
   if disc == 4 {
     fbStructGet(uBoxIdx, 0) // field 0: the tag
@@ -7422,13 +7422,12 @@ function emitOptChainIsNull(body: u8[], exprIx: i32, fnIx: i32) {
     fbIf(127)
     fbI32Const(1)
     fbElse()
-    const pfc = sFieldTypeAt(psi, pfi)
-    if optChainLeafNulDisc(pfc) == 0 {
+    if optChainLeafNulDisc(psi, pfi) == 0 {
       fbI32Const(0)
     } else {
       if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[psi], pfi)
-      emitOptChainLeafNulTest(pfc)
+      emitOptChainLeafNulTest(psi, pfi)
     }
     fbEnd()
     return 0
@@ -7473,37 +7472,46 @@ function emitOptChainValue(body: u8[], exprIx: i32, fnIx: i32) {
   0
 }
 
-// The heap type a `?.` leaf of field code `code` delivers as `F | null`: the field's OWN
-// storage heap, read off the same table `pushFieldStorage` writes, so the value this arm
-// builds and the slot it reads cannot name different types. -1 when the leaf's rep is not a
-// ref — a scalar rides the box instead (`optChainLeafBoxKind`).
-function optChainLeafRefHeap(code: i32, si: i32, fi: i32): i32 {
-  // The nullable atom list (18) shares the i32 list's wrapper, as its field storage does.
-  if code == FC_I32_LIST || code == FC_NUL_I32_LIST { return lTy() }
-  if code == FC_STR_LIST { return mkListTy() }
-  if code == FC_F64_LIST { return fl64Ty() }
-  if code == FC_I64_LIST { return il64Ty() }
-  if code == FC_F32_LIST { return fl32Ty() }
-  if code == FC_U8_LIST { return bl8Ty() }
-  if code == FC_REF_LIST || code == FC_NUL_REF_LIST {
-    const rs = sFieldRefSlot(si, fi)
-    if rs < 0 || rs >= rlWrapIdx.length { return -1 }
-    return rlWrapIdx[rs]
+// The heap type a `?.` leaf at struct `si`'s field `fi` delivers as `F | null`: a list field's
+// own storage heap, the one the type section writes, so the value this arm builds and the slot it
+// reads cannot name different types. -1 for any other leaf; a scalar rides the box instead.
+function optChainLeafRefHeap(si: i32, fi: i32): i32 {
+  const k = fieldRowKind(sFieldStart[si] + fi)
+  if k == null { return -1 }
+  match k {
+    "list" | "nullist" => {
+      return lTy()
+    }
+    "strlist" | "nulstrlist" => {
+      return mkListTy()
+    }
+    "f64list" | "nulf64list" => {
+      return fl64Ty()
+    }
+    "i64list" | "nuli64list" => {
+      return il64Ty()
+    }
+    "f32list" | "nulf32list" => {
+      return fl32Ty()
+    }
+    "u8list" | "nulu8list" => {
+      return bl8Ty()
+    }
+    "reflist" | "nulreflist" => {
+      const rs = sFieldRefSlot(si, fi)
+      if rs < 0 || rs >= rlWrapIdx.length { return -1 }
+      return rlWrapIdx[rs]
+    }
+    "i32" | "i64" | "f64" | "f32" | "v128" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return -1
+    }
   }
-  const nsl = nulScalarListFieldWrapHeap(code)
-  if nsl >= 0 { return nsl }
-  -1
 }
 
-// The value-atom kind a `?.` leaf of field code `code` boxes as, for the `F | null` box the
-// scalar nullables ride — `i32 | null` and `f64 | null` are the same rep with a different
-// tag. -1 when the leaf is not a scalar the box speaks.
-function optChainLeafBoxKind(code: i32): i32 {
-  if code == FC_I32 { return 0 }
-  if code == FC_F64 { return 4 }
-  if code == FC_I64 { return 3 }
-  if code == FC_F32 { return 5 }
-  -1
+// Whether a `?.` leaf of kind `k` has a rep the standalone arms build: an `i32` (a number, a
+// boolean, an atom or its `K | null` niche), a string, `string | null`, `boolean | null` or the box.
+function optChainLeafBoxable(k: VKind | null): boolean {
+  k == "i32" || k == "str" || k == "nulstr" || k == "nulbool" || k == "union"
 }
 
 // The four `.get` staging markers as one saved value, so a nested `.get` — one in a `?? d`
@@ -7619,10 +7627,11 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
     if ofi < 0 {
       return emitFailAt("emitProgram: `?.` field is not on the struct", exprIx)
     }
-    const oCode = sFieldTypeAt(osi, ofi)
-    const oRefHeap = optChainLeafRefHeap(oCode, osi, ofi)
+    const oRow = sFieldStart[osi] + ofi
+    const oKind = fieldRowKind(oRow)
+    const oRefHeap = optChainLeafRefHeap(osi, ofi)
 
-    // The nested-struct leaf (code 15), the arm the `?.` producer needs (D1084). `o?.f` over
+    // The record leaf, the arm the `?.` producer needs (D1084). `o?.f` over
     // `o: T | null` with `T = {f: S}` has type `S | null`, and the rep for that is the nullable
     // struct ref the whole `nulstruct` family already speaks.
 
@@ -7630,7 +7639,7 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
     // heap type instead of the string array: a null receiver chain yields `ref.null $S`, a live
     // one reads the field. The `else` arm leaves a `(ref $S)`, a subtype of the block's
     // `(ref null $S)`, so the arms join without a cast. `structIndexOfExpr` is the other half.
-    if oCode == FC_STRUCT {
+    if eqKindIsRecord(oKind) {
       const oti = sFieldTgtStructIdx(osi, ofi)
       if oti < 0 {
         return emitFailAt(
@@ -7648,7 +7657,7 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
       return 0
     }
 
-    // A LIST leaf, the code-15 arm one table over: `T[] | null` is the list wrapper's own
+    // A LIST leaf, the record arm one table over: `T[] | null` is the list wrapper's own
     // nullable ref, so a null link yields `ref.null $wrap` and a live one reads the field.
     // A nullable-list field is already `(ref null $wrap)`, which the same blocktype accepts.
     if oRefHeap >= 0 {
@@ -7665,13 +7674,8 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
     // REF (a list, a nested struct, a string), the scalar box (i32/boolean/f64/i64/f32),
     // and the value-union box. A map or closure leaf reaches neither and is named as such.
     if (
-      oCode != FC_I32
-      && oCode != FC_STR
-      && oCode != FC_NUL_STR
-      && oCode != FC_UNION
-      && oCode != FC_NUL_BOOL
-      && oCode != FC_NUL_LIT_UNION
-      && optChainLeafBoxKind(oCode) < 0
+      !optChainLeafBoxable(oKind)
+      && fieldRowNumKind(oRow) < 0
       && oRefHeap < 0
     ) {
       return emitFailAt(
@@ -7702,16 +7706,16 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
     // null tag over an unread payload; both heap types are usage-gated against an uncollected union.
     // A wide scalar leaf rides the same box: `f64 | null` and `i32 | null` are one rep with
     // a different tag, so the kind comes from the leaf's own code and never from `i32`.
-    const oBoxKind = optChainLeafBoxKind(oCode)
+    const oBoxKind = fieldRowNumKind(oRow)
     if (
-      oCode == FC_UNION
+      oKind == "union"
       || (ord.rdKind == "union" && ord.rdNul == 4)
       || (oBoxKind > 0 && ord.rdNul == 4)
     ) {
       let ovbKind = 0
       if oBoxKind > 0 { ovbKind = oBoxKind }
       const ovb = vbHeapIdxOfKind(ovbKind)
-      if !uDeclared || (oCode != FC_UNION && ovb < 0) {
+      if !uDeclared || (oKind != "union" && ovb < 0) {
         return emitFailAt(
           "emitProgram: `?.` yields a nullable scalar but its union box was not collected",
           exprIx,
@@ -7724,7 +7728,7 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
       fbRefNullNone()
       fbStructNew(uBoxIdx)
       fbElse()
-      if oCode == FC_UNION {
+      if oKind == "union" {
         if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
         fbStructGet(sHeapIdx[osi], ofi)
         fbEnd()
@@ -7741,7 +7745,7 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
 
     // `string | null` is the nullable raw-array ref niche, so a null link is `ref.null
     // $sTypeIdx` and a present one the field's own string — no box needed.
-    if oCode == FC_NUL_STR || (ord.rdKind == "nulstr" && ord.rdNul == 1) {
+    if oKind == "nulstr" || (ord.rdKind == "nulstr" && ord.rdNul == 1) {
       if emitOptChainIsNull(body, exprIx, fnIx) < 0 { return -1 }
       fbIfRefNul(sTy(), true)
       fbRefNull(sTy())
@@ -11855,26 +11859,57 @@ function sharedFieldCodeDispatchable(code: i32): boolean {
   false
 }
 
-// The field-rep codes a `?.` … `??` may carry — `sharedFieldCodeDispatchable` minus the string
-// one. Both arms of the `if` have to leave the field's rep on the stack; a wide numeric default
-// coerces (`emitOptChainDefault`), but a string default in this value position builds a module the
-// engine refuses, its scratch reservation decided by a scan with no arm for this site.
-function optChainFieldCodeOk(code: i32): boolean {
-  // A string leaf (code 3 or 20) does not reach here: `exprNullableString` calls a `?.` over a
-  // string field `string | null`, so `emitCoalesce`'s string-niche arm claims the spelling first
-  // (D802). A value-union field (code 16) does not either: `emitOptCoalesceBoxLeaf` takes it.
-  sharedFieldCodeDispatchable(code)
+// The kind a `?.` … `??` leaf carries through its `if`, from the field's numeric kind
+// (`fieldRowNumKind`) and whether it is a non-null string: a plain `i32`, `i64`, `f64`, `f32` or
+// `str`; null for a leaf with no `if` blocktype here. A string leaf is claimed earlier by
+// `emitCoalesce`'s string-niche arm (D802), and a box leaf by `emitOptCoalesceBoxLeaf`.
+function optLeafKindOf(numKind: i32, str: boolean): VKind | null {
+  if numKind == 0 { return "i32" }
+  if numKind == 3 { return "i64" }
+  if numKind == 4 { return "f64" }
+  if numKind == 5 { return "f32" }
+  if str { return "str" }
+  null
 }
 
-// The DEFAULT arm of a `?.` … `??`, at the field's rep. A wide numeric field needs the
-// default WIDENED to it — `?? 1` against an `i64` field is an `i32.const` unless somebody
-// says otherwise, and the `if`'s blocktype is `i64`: invalid wasm. Same three coercions
-// `emitUnionCoerce`'s ladder performs for the same reason, and for the same three codes.
-function emitOptChainDefault(body: u8[], dIx: i32, code: i32, fnIx: i32) {
-  if code == FC_F64 { return emitExprAsF64(body, dIx, fnIx) }
-  if code == FC_I64 { return emitExprAsI64(body, dIx, fnIx) }
-  if code == FC_F32 { return emitExprAsF32(body, dIx, fnIx) }
-  emitExpr(body, dIx, fnIx)
+// The `if` whose result is a `?.` … `??` leaf of kind `k` (an `optLeafKindOf` answer).
+function fbIfForOptLeaf(k: VKind) {
+  match k {
+    "f64" => {
+      return fbIf(124)
+    }
+    "i64" => {
+      return fbIf(126)
+    }
+    "f32" => {
+      return fbIf(125)
+    }
+    "str" => {
+      return fbIfRef(sTy()) // string header ref
+    }
+    "i32" | "v128" | "struct" | "list" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      return fbIf(127) // i32 / boolean
+    }
+  }
+}
+
+// The default arm of a `?.` … `??` at a leaf of kind `k`: a wide numeric leaf widens the default
+// to its own valtype, which the `if` blocktype names (`?? 1` against an `i64` leaf).
+function emitOptLeafDefault(body: u8[], dIx: i32, k: VKind, fnIx: i32) {
+  match k {
+    "f64" => {
+      return emitExprAsF64(body, dIx, fnIx)
+    }
+    "i64" => {
+      return emitExprAsI64(body, dIx, fnIx)
+    }
+    "f32" => {
+      return emitExprAsF32(body, dIx, fnIx)
+    }
+    "i32" | "v128" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      return emitExpr(body, dIx, fnIx)
+    }
+  }
 }
 
 // Emit the `if` whose result is the shared field's rep. Only called for a code
@@ -41206,16 +41241,14 @@ function emitCoalesceOptNulRecord(
 ) {
   const nfi = sFieldIndex(nsi, lhs.omProp)
   if nfi < 0 { return emitFail("emitProgram: `?.` field is not on the struct") }
-  // The blocktype is the whole restriction, and it is not one rep wide. Both arms of
-  // this `if` yield the field's rep, so it needs a blocktype spelling it —
-  // `fbIfForSharedField` already owns this over the same `sFieldTypeAt` codes for the
-  // shared-union-field dispatch. Hard-coding `fbIf(127)` refused `f64`/`i64`/`f32`/`string` fields here while the narrowed spelling ran fine at every one of them.
-  const nfCode = sFieldTypeAt(nsi, nfi)
-  // A nested-struct field (code 15) spells its `if` result from the field's own target
-  // row, which `fbIfForSharedField` cannot give from a code alone. Two null tests, not
-  // one: a code-15 slot is `(ref null $S)` at both declarations (D1180), and `o?.f ??
+  // Both arms of this `if` yield the field's rep, so its blocktype spells that rep
+  // (`fbIfForOptLeaf`), not a fixed `i32`.
+  const nfRow = sFieldFlatRow(nsi, nfi)
+  const nfKind = fieldRowKind(nfRow)
+  // A record field spells its `if` result from the field's own target row. Two null tests,
+  // not one: a record slot is `(ref null $S)` at both declarations (D1180), and `o?.f ??
   // d` must yield `d` when the field is null too — receiver-null or field-null, short-circuited through one i32 `if` so `struct.get` never runs on a null receiver.
-  if nfCode == FC_STRUCT {
+  if eqKindIsRecord(nfKind) {
     const ntg = sFieldTgtStructIdx(nsi, nfi)
     if ntg < 0 {
       return emitFail(
@@ -41241,22 +41274,26 @@ function emitCoalesceOptNulRecord(
     fbEnd()
     return 0
   }
-  if nfCode == FC_UNION {
+  if nfKind == "union" {
     return emitOptCoalesceBoxLeaf(body, e, lhs, nHeap, nfi, exprIx, fnIx)
   }
-  if !optChainFieldCodeOk(nfCode) {
+  const nfLeaf = optLeafKindOf(
+    fieldRowNumKind(nfRow),
+    fieldRowIsStr(nfRow, false),
+  )
+  if nfLeaf == null {
     return emitFail(
       "emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep",
     )
   }
   if emitOptRecvBase(body, lhs.omObj, fnIx, false) < 0 { return -1 }
   fbRefIsNull()
-  fbIfForSharedField(nfCode) // if (result <the field's own rep>)
-  if emitOptChainDefault(body, e.binRight, nfCode, fnIx) < 0 { return -1 }
-  fbElse()                   // 0x05 else — present → the field
+  fbIfForOptLeaf(nfLeaf) // if (result <the field's own rep>)
+  if emitOptLeafDefault(body, e.binRight, nfLeaf, fnIx) < 0 { return -1 }
+  fbElse()               // 0x05 else — present → the field
   if emitOptRecvBase(body, lhs.omObj, fnIx, true) < 0 { return -1 }
   fbStructGet(nHeap, nfi)
-  fbEnd()                    // 0x0b end
+  fbEnd()                // 0x0b end
   return 0
 }
 
@@ -41277,16 +41314,19 @@ function emitCoalesceOptNulVariant(
   if vfi < 0 {
     return emitFail("emitProgram: `?.` field is not on the union arm")
   }
-  const vCode = variantFieldTypeAt(nvi, vfi)
-  if !optChainFieldCodeOk(vCode) {
+  const vLeaf = optLeafKindOf(
+    variantFieldNumKind(nvi, vfi),
+    variantFieldIsStr(nvi, vfi, false),
+  )
+  if vLeaf == null {
     return emitFail(
       "emitProgram: `?.` over a nullable union arm has no `if` blocktype for this field's rep",
     )
   }
   if emitOptRecvBase(body, lhs.omObj, fnIx, false) < 0 { return -1 }
   fbRefIsNull()
-  fbIfForSharedField(vCode)
-  if emitOptChainDefault(body, e.binRight, vCode, fnIx) < 0 { return -1 }
+  fbIfForOptLeaf(vLeaf)
+  if emitOptLeafDefault(body, e.binRight, vLeaf, fnIx) < 0 { return -1 }
   fbElse()
   if emitOptRecvBase(body, lhs.omObj, fnIx, false) < 0 { return -1 }
   fbRefCast(variantHeap(nvi))
@@ -41314,7 +41354,7 @@ function emitCoalesceOptMapField(
   // `variantFieldTypeAt` / `variantHeap` — arm-for-arm twins of the struct accessor beside it, since a missing branch answered -1 and blamed the wrong field.
   let omHeap = -1
   let omFi = -1
-  let omCode = -1
+  let omNum = -1
   // …through the layout identity (D123), the same read the store and `??`
   // default seeds take: the field lookup must run against the row whose heap the
   // vals element holds.
@@ -41323,7 +41363,7 @@ function emitCoalesceOptMapField(
     omFi = variantFieldIndex(omVi, lhs.omProp)
     if omFi >= 0 {
       omHeap = variantHeap(omVi)
-      omCode = variantFieldTypeAt(omVi, omFi)
+      omNum = variantFieldNumKind(omVi, omFi)
     }
   } else {
     const omSi = mvValStructIdxOf(omSl)
@@ -41333,13 +41373,13 @@ function emitCoalesceOptMapField(
     if omFi >= 0 {
       if omSi < 0 { return -1 }
       omHeap = sHeapIdx[omSi]
-      omCode = sFieldTypeAt(omSi, omFi)
+      omNum = fieldRowNumKind(sFieldStart[omSi] + omFi)
     }
   }
   if omFi < 0 {
     return emitFail("emitProgram: `?.` field is not on the map's value struct")
   }
-  if omCode != FC_I32 {
+  if omNum != 0 {
     return emitFail(
       "emitProgram: `?.` over a map read supports only i32/boolean fields",
     )
@@ -41686,14 +41726,15 @@ function coalFieldStoredFlat(exprIx: i32, lhsIx: i32, fnIx: i32): boolean {
   const si = structIndexOfExpr(m.memObj, fnIx)
   const fj = sFieldIndex(si, m.memProp)
   if fj < 0 { return false }
-  const fc = sFieldTypeAt(si, fj)
+  const r = sFieldFlatRow(si, fj)
   const pn = tyPrimNameOf(nodeTyInOf(exprIx, fnIx))
   if pn == null || tyPrimNameOf(nodeTyIxOf(e.binRight)) != pn { return false }
-  if fc == FC_I32 { return pn == "i32" }
-  if fc == FC_I64 { return pn == "i64" }
-  if fc == FC_F64 { return pn == "f64" }
-  if fc == FC_F32 { return pn == "f32" }
-  if fc == FC_STR { return pn == "string" }
+  const nk = fieldRowNumKind(r)
+  if nk == 0 { return pn == "i32" }
+  if nk == 3 { return pn == "i64" }
+  if nk == 4 { return pn == "f64" }
+  if nk == 5 { return pn == "f32" }
+  if fieldRowIsStr(r, false) { return pn == "string" }
   false
 }
 
