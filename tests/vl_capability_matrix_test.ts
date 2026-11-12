@@ -356,20 +356,15 @@ null
 // An emit refusal's reason is the refusal's own text. `vl check` prints a parenthesised note
 // when a program imports std (`(std: modules not linted …)`), and the reason column once quoted
 // that note for every emit refusal, since it is the first line the check phase leaves. The
-// control imports std through interpolation and is refused at emit by D15395's list of maps.
+// control imports std through interpolation and is refused at emit by D14082's lambda result.
 const EMIT_REASON_TEMPLATE = `// An emit refusal past a clean check, with std imported.
 // @@PRELUDE@@
-function __inc0(a) { return a + 1 }
-function __half(a) { return a / 2.0 }
-const __fm = Map()
-__fm.set("a", __inc0)
-__fm.set("b", __half)
-const __m2 = Map()
-__m2.set("a", __half)
-const __xs = [__m2, __fm]
-__xs.push(__m2)
-const __g = __xs[2].get("a")
-if __g != null { print("\\{__g(6)}") }
+type __P = {a: i32}
+const __p: __P = {a: 1}
+function __len<T>(f: () => T | string) {
+  7
+}
+print("\\{__len(() => __p)}")
 // @@VALUE@@
 1
 // @@TYPE@@

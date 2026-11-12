@@ -101,6 +101,7 @@ import {
   nodeTyFrozenOf,
   nodeTyInstEnter,
   nodeTyInstFrameNote,
+  nodeTyIsClosureArray,
   nodeTyIsFunc,
   nodeTyIsNulFunc,
   nodeTyIsNullType,
@@ -114,6 +115,7 @@ import {
   nodeTyNestedElemIsBoolPrim,
   nodeTyRecord,
   nodeTyRecordIn,
+  tyIsClosureArray,
   tyIsUnionish,
 } from "./check_node_tys"
 import { nodePos, trimWs } from "./fmt_util"
@@ -418,11 +420,9 @@ import {
   monoIsGenericDecl,
   monoNodeNamesTyParam,
   monoParamTyOpenAt,
-  monoSubstAnn,
   monoTyMentionsTyParam,
   monoTyParamOf,
   nameIsBareMap,
-  nameIsClosureArray,
   nameIsShapeSpanEnds,
   nodeIsTypeDecl,
   normTypeAtom,
@@ -7574,12 +7574,25 @@ function monoFoldLayoutAt(
     }
     IsExpr => {
       const io = monoFoldTyParamLayout(isExprKid(n), typarams, tvN, tvV)
-      // D951 — the check spelling is substituted only when it mentions a type parameter, the
-      // `monoAnnHasTyParam`-then-`monoSubstAnn` contract every other substitution site keeps.
-      // A concrete `is {v: i32}` must return verbatim: `monoSubstAnn`'s object arm rebuilds a
-      // shape spelling from its parts, and a rebuilt spelling is a second intern key.
+      // A test naming a type parameter takes the instance's own check of it (D951, D15710),
+      // spelled by the naming rule; a concrete test returns verbatim. A type parameter the
+      // instance holds no typed binding for is one its encloser leaves unbound, so its test
+      // stays refused (D4551).
       if monoAnnHasTyParam(ix, isVarTyIxOf(ix), typarams) {
-        const sub = monoSubstAnn(n.isVariant, typarams, tvN, tvV)
+        let bound = true
+        for tp in typarams {
+          const bq = strListIndexOf(monoInstBindN, tp)
+          const bt = if bq >= 0 && bq < monoInstBindT.length { monoInstBindT[bq] } else { -1 }
+          if monoAnnHasTyParam(ix, isVarTyIxOf(ix), [tp]) && bt < 0 {
+            bound = false
+          }
+        }
+        if !bound {
+          emitFail("emitProgram: `is` names a type that is not a union variant")
+          return ix
+        }
+        const er = elabIsPatTyIn(ix, elabWalkTop())
+        const sub = if er >= 0 && !tyHasTyVar(er) { monoPinSpellShaped(er) } else { "" }
         if sub != "" && sub != n.isVariant {
           return monoSubstIsExpr(ix, io, sub)
         }
@@ -17049,16 +17062,19 @@ function monoCoerceAtValueParams(n: Call, dfe: i32, ctx: i32): i32 {
   }
   const f = tyAt(ct)
   if !(f is TyFunc) { return 0 }
-  const parts: string[] = []
-  const ann = tyNameOf(monoCalleeAnnNode(n.callFn, ctx))
+  const an = monoCalleeAnnNode(n.callFn, ctx)
   // An un-annotated callee (a list element, a field, a loop variable) spells its recorded type.
-  const own = ann == "" || fromElab
-  if !own && !monoFnTypeAnnParamsName(ann, parts) { return 0 }
+  const own = tyNameOf(an) == "" || fromElab
+  // An annotated callee's arity is its annotation's, which is a function type and not its nullable.
+  const at = nodeTyIxOf(an)
+  const af = if at >= 0 && at < T.tys.length { tyAt(at) } else { tyAt(0) }
+  const nparts = if af is TyFunc { af.fnParamTypes.length } else { -1 }
+  if !own && nparts < 0 { return 0 }
   let i = 0
   while (
     i < n.callArgs.length
     && i < f.fnParamTypes.length
-    && (own || i < parts.length)
+    && (own || i < nparts)
   ) {
     const pt = f.fnParamTypes[i]
     if (
@@ -17966,7 +17982,6 @@ function monoCallGenFnToTyParamArrow(
     const p = nodeAt(params[i])
     if p is Param {
       if p.parType >= 0 {
-        const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
         if (
           monoAnnIsFnSlot(p.parType)
           && monoAnnHasTyParam(p.parType, -1, typarams)
@@ -17988,7 +18003,7 @@ function monoCallGenFnToTyParamArrow(
         }
         // A list of functions riding the type parameters, handed a literal of generics (D3913).
         if (
-          nameIsClosureArray(ann)
+          nodeTyIsClosureArray(p.parType)
           && monoAnnHasTyParam(p.parType, -1, typarams)
         ) {
           if monoLitHoldsGenericFn(args[i], 0) { return true }
@@ -21254,7 +21269,7 @@ function monoPinTyParamComposite(
   // The coercion `monoWalk` deferred, since at that point the pin names
   // would be the type variables themselves. `pinC` is the substituted
   // spelling, the concrete function type that parameter takes.
-  if annFnSlot || nameIsClosureArray(pinC) {
+  if annFnSlot || (pinC == pinPlain && tyIsClosureArray(po)) {
     const delTys = monoSlotParamTysAt(patTy, own, tvN, tvT)
     // The parameter's type substituted, which `pinC` spells unless a rest or row pin replaced it.
     const pinCTy = if pinC == pinPlain { substTyDeepOf(patTy, tvN, tvT, own) } else { -1 }
@@ -23044,8 +23059,7 @@ function monoNoteRetDeliveriesAt(
   ann: string,
   annTy: i32,
 ) {
-  const parts: string[] = []
-  if annFnDecompose(ann, parts) == "" { return 0 }
+  if annTy < 0 || annTy >= T.tys.length || !(tyAt(annTy) is TyFunc) { return 0 }
   for r in monoFnRetArgs(fn) {
     if monoNoteBindDeliveryCall(r, ann, fnIx, -1, annTy) < 0 { return -1 }
   }
@@ -25340,16 +25354,18 @@ function monoCloCoerceBuild(): i32 {
           fes.push(gfe)
           continue
         }
-        const tname = monoConcreteFnTyName(t)
         const pnames: string[] = []
         if (
           gfe < 0
           || gfe >= monoGen.length
           || monoGen[gfe] != 1
-          || tname == ""
-          || !monoFnTypeAnnParamsName(peelGroupParens(tname), pnames)
+          || monoConcreteFnTyName(t) == ""
         ) {
           return emitFailAt(fail, ix)
+        }
+        const tf = tyAt(t)
+        if tf is TyFunc {
+          for p in tf.fnParamTypes { pnames.push(monoPinSpellShaped(p)) }
         }
         // A fresh read stands for the member, so the pins are the destination's.
         const rd = mkIdent(monoSlotName(gfe), nodePos(ix))
