@@ -1,4 +1,4 @@
-# Step 7 L2: the narrowed pin's brace guards are retired behind a loud floor; D15978 and D15979 closed, 2026-11-12
+# Step 7 L2: the narrowed pin's brace guards are retired behind a loud floor; D15980 and D15979 closed, 2026-11-12
 
 `monoNarrowedPinName` had two spelling guards in front of the arm test:
 
@@ -32,7 +32,7 @@ It called `emitFail("FLOOR …")` only when they differed.
 | `type W = {r: i32} \| string`, a narrowed `w` passed to `id<T>` | D2780 | check-clean **invalid wasm** inside `id`: expected the record, found the union box | runs, `3` `0` |
 | `type R = {r: i32}; type W = R[] \| string`, the same | D9330 | check-clean **invalid wasm**: expected `R[]`, found the union box | runs, `1` `0` |
 
-Both are filed: [D15978](../inventory/D15978.md) and [D15979](../inventory/D15979.md). They share
+Both are filed: [D15980](../inventory/D15980.md) and [D15979](../inventory/D15979.md). They share
 the fixture `tests/cases/soundness/narrowed-inline-record-arm-of-alias-union-pin.vl`.
 
 Two more controls with the same shape did not fire the floors, and they run on both seeds: an
@@ -59,7 +59,7 @@ fixture's `7`.
 
 ## Proof
 
-- **The controls in `distilled/named/`** (set `d15978-alias-arm-pin`, both `runs`), so `regress.vl` guards them.
+- **The controls in `distilled/named/`** (set `d15980-alias-arm-pin`, both `runs`), so `regress.vl` guards them.
 - **Locally, on master:**
   - refresh to a fixpoint;
   - `lint-self.sh` clean;
@@ -68,7 +68,7 @@ fixture's `7`.
   - seed +1.9%;
   - `mono-tyaram-grid.sh` 0 BAD;
   - `regress.vl`, no runs lost;
-  - `check-filed-witnesses --strict`: 4,862 as filed, D15978 and D15979 run;
+  - `check-filed-witnesses --strict`: 4,862 as filed, D15980 and D15979 run;
   - the inventory row and reference tests pass.
 - **CI's sweep.** It should report one bytes-only mover, `error-generic-nulreflist-field-pin.vl`,
   and no runs lost.
