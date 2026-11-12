@@ -45,6 +45,10 @@ position, walked in step through list elements, a nullable's inner type, map val
 fields and union members (`fnSetsAgree`, over an exhaustive `fnSetParts`). With it the 3 programs
 are byte-identical again.
 
+**For §3.3's equality contract:** two types can be `tySame` and still need different rows when
+their function positions carry different tagged sets. The set is attached to the type index, so a
+row decision that compares types must compare the sets as well (`fnSetsAgree`).
+
 Under structural typing two same-shape rows are already one type. Keying the twin test by type
 is therefore the contract, and the function set is part of a function type's storage.
 
