@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Step 7 L2, mono: a struct-field argument's pin is the field's recorded record type.** `monoArgTyNameProjected`'s field arm read the field's element name (`sFieldElemNameAt`), asked it `isSName`, and found the row with `structIndexByName`. It now reads the field's recorded element type (`sFieldElemTyIxAt`), asks `structRowOfRecordTy` whether a struct row holds it, returns that type, and spells the pin by the naming rule. The site is reached 5 times in 4 programs, and the name, the row, the type and the pin text agree at every one. `emit_mono.vl` no longer reads `isSName`.
