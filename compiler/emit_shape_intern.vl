@@ -4,7 +4,7 @@
 import { fieldNameOrder } from "./check_obj_shape"
 import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { recFieldStoreTyOf } from "./emit_rec_field_codes"
-import { colAt } from "./check_node_tys"
+import { colAt, tyIsNulI32List } from "./check_node_tys"
 import {
   arrSpineLeafTy,
   isValueUnionName,
@@ -15,7 +15,11 @@ import {
 import {
   T,
   TyArray,
+  TyErr,
+  TyFunc,
   TyLit,
+  TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
   TyPrim,
@@ -29,6 +33,8 @@ import {
   tyIsLitUnion,
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
+  tyIsNullableLitUnion,
+  tyNulInnerIsPrim,
   tySame,
   tyToEmitName,
   tyToNominalName,
@@ -61,7 +67,7 @@ import {
 import { emitFail } from "./emit_bytes"
 import {
   code0SpellingFitsRow,
-  fieldCodeOfTy,
+  fieldCodeForMatch,
   gaeIndexOf,
 } from "./emit_field_codes"
 import {
@@ -128,9 +134,19 @@ import {
   FC_I64,
   FC_I64_LIST,
   FC_MAP,
+  FC_NUL_BOOL,
   FC_NUL_CLOSURE,
+  FC_NUL_F32_LIST,
+  FC_NUL_F64_LIST,
   FC_NUL_I32_LIST,
+  FC_NUL_I64_LIST,
+  FC_NUL_LIT_UNION,
+  FC_NUL_MAP,
+  FC_NUL_NONE,
   FC_NUL_REF_LIST,
+  FC_NUL_STR,
+  FC_NUL_STR_LIST,
+  FC_NUL_U8_LIST,
   FC_REF_LIST,
   FC_STR,
   FC_STRUCT,
@@ -190,6 +206,8 @@ import {
   nameStripSpaces,
 } from "./tyname"
 import {
+  litPeekBaseTy,
+  nonNullTy,
   nullableInnerOrNone,
   tyHasTyVar,
   tyMapValOf,
@@ -199,24 +217,11 @@ import {
   tyStepRet,
 } from "./tyquery"
 
-// `nameFieldCode` with the caller's recorded arena type for the field, the arena's own rules
-// first: a lone string literal is its atom, a closed record a struct ref before its row exists
-// (one over a hole or type parameter has none), an `i32` list behind `| null` is 18, a list of
-// integer literals the `i32` list; then the spelling ladder, then the `S[] | null` rung.
+// The field code of a field spelled `t` whose recorded arena type is `ty` (-1 for none): read
+// off the type (`fieldCodeOfTyCovered`), and from the spelling ladder only where the type
+// declines, then the `S[] | null` rung.
 export function nameFieldCodeTy(t: string, ty: i32): i32 {
-  if ty >= 0 && ty < T.tys.length {
-    const xt = tyAt(ty)
-    if xt is TyLit && xt.litKind == "str" { return FC_I32 }
-    if nfcIsClosedRecord(nfcPeelOne(ty)) { return FC_STRUCT }
-    if xt is TyNullable && nfcIsClosedRecord(nfcPeelOne(xt.nInner)) {
-      return FC_STRUCT
-    }
-    if xt is TyNullable && nfcIsI32List(nfcPeelOne(xt.nInner)) {
-      return FC_NUL_I32_LIST
-    }
-    if xt is TyArray && nfcIsIntLitUnion(xt.aElem) { return FC_I32_LIST }
-  }
-  const a = fieldCodeOfTy(ty)
+  const a = fieldCodeOfTyCovered(ty)
   if a != -2 { return a }
   const c = nameFieldCode(t, ty)
   if c >= 0 { return c }
@@ -1953,4 +1958,123 @@ function nfcIsIntLitUnion(ty: i32): boolean {
     if !(mt is TyLit) || mt.litKind != "int" { return false }
   }
   true
+}
+
+// The field code of arena type `ty` read off the type, or -2 where only the spelling answers: a
+// type parameter (typed at its instance), a list whose element is nullable (B171), and a union
+// with a literal member. A lone string literal is its atom, and a closed record a struct ref
+// before its row exists.
+export function fieldCodeOfTyCovered(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -2 }
+  const xt = tyAt(ty)
+  if xt is TyLit && xt.litKind == "str" { return FC_I32 }
+  if nfcIsClosedRecord(nfcPeelOne(ty)) { return FC_STRUCT }
+  if xt is TyNullable && nfcIsClosedRecord(nfcPeelOne(xt.nInner)) {
+    return FC_STRUCT
+  }
+  if xt is TyNullable && nfcIsI32List(nfcPeelOne(xt.nInner)) {
+    return FC_NUL_I32_LIST
+  }
+  if xt is TyArray && nfcIsIntLitUnion(xt.aElem) { return FC_I32_LIST }
+  const a = fieldCodeForMatch(ty)
+  if a != -2 { return a }
+  match xt {
+    TyPrim => {
+      if xt.primName == "null" { return FC_NUL_NONE }
+    }
+    TyLit => {
+      const b = litPeekBaseTy(ty)
+      if b >= 0 && b != ty { return fieldCodeOfTyCovered(b) }
+    }
+    TyVar => {
+      return -2
+    }
+    TyMap => {
+      return FC_MAP
+    }
+    TyNullable => {
+      if tyNulInnerIsPrim(ty, "string") { return FC_NUL_STR }
+      if tyNulInnerIsPrim(ty, "boolean") { return FC_NUL_BOOL }
+      if tyIsNullableLitUnion(ty) { return FC_NUL_LIT_UNION }
+      if tyIsNulI32List(ty) { return FC_NUL_I32_LIST }
+      if mapTyValKindLowerable(nonNullTy(ty)) { return FC_NUL_MAP }
+      const it = xt.nInner
+      if it >= 0 {
+        const ia = tyAt(it)
+        if ia is TyArray && ia.aElem >= 0 {
+          const ep = tyAt(ia.aElem)
+          if ep is TyPrim {
+            if ep.primName == "string" { return FC_NUL_STR_LIST }
+            if ep.primName == "f64" { return FC_NUL_F64_LIST }
+            if ep.primName == "i64" { return FC_NUL_I64_LIST }
+            if ep.primName == "f32" { return FC_NUL_F32_LIST }
+            if ep.primName == "u8" { return FC_NUL_U8_LIST }
+          }
+        }
+        if ia is TyArray && ia.aElem >= 0 && tyAt(ia.aElem) is TyNullable {
+          return -2
+        }
+        if ia is TyVar { return -2 }
+        // A nullable number is the value box.
+        if ia is TyPrim && ia.primName != "string" && ia.primName != "boolean" {
+          return FC_UNION
+        }
+        if ia is TyUnion && fcHasLitMember(ia) { return -2 }
+        if ia is TyUnion && fcAllScalarMembers(ia) { return FC_UNION }
+      }
+    }
+    TyArray => {
+      if xt.aElem >= 0 {
+        const ep = tyAt(xt.aElem)
+        if ep is TyPrim && ep.primName == "u8" { return FC_U8_LIST }
+        if ep is TyNullable { return -2 }
+        if ep is TyVar { return -2 }
+      }
+    }
+    TyUnion => {
+      const same = fcSharedMemberCode(xt)
+      if same != -2 { return same }
+      if fcHasLitMember(xt) { return -2 }
+      if fcAllScalarMembers(xt) { return FC_UNION }
+    }
+    TyErr | TyObj | TyFunc | TyNeg => {}
+  }
+  if unRowOfKey(ty) >= 0 { return FC_UNION }
+  if unRowOfCanonFolded(ty) >= 0 { return FC_UNION }
+  nulRefListFieldCodeOfTy(ty)
+}
+
+// The one list code every member of union `u` has, else -2: a union whose members share one
+// list rep (`i32[] | K[]`) is that list, not a box.
+function fcSharedMemberCode(u: TyUnion): i32 {
+  if u.uMembers.length < 2 { return -2 }
+  let c = -2
+  for m in u.uMembers {
+    const mc = if m >= 0 { fieldCodeOfTyCovered(m) } else { -2 }
+    if mc != FC_I32_LIST { return -2 }
+    if c == -2 { c = mc }
+    else if c != mc { return -2 }
+  }
+  c
+}
+
+// Whether every member of union `u` is a primitive: a value union, which is the box. A literal
+// member keeps the spelling's answer, since an inline literal set beside a scalar has no box.
+function fcAllScalarMembers(u: TyUnion): boolean {
+  if u.uMembers.length < 2 { return false }
+  for m in u.uMembers {
+    if m < 0 { return false }
+    const mt = tyAt(m)
+    if !(mt is TyPrim) { return false }
+  }
+  true
+}
+
+// Whether union `u` has a literal member. Whether such a union is the box turns on whether its
+// literals are a registered alias, which only the spelling says here.
+function fcHasLitMember(u: TyUnion): boolean {
+  for m in u.uMembers {
+    if m >= 0 && tyAt(m) is TyLit { return true }
+  }
+  false
 }
