@@ -32,6 +32,25 @@ type, and the walk now asks for it.
 This is not a new name path. The pin's text is the floor recorded in
 `2026-11-12-step7-tag-record-pin-kind-by-layout.md`, an instance key resolved by type.
 
+## Cost and the cycle guard
+
+The walk renders a type only when its nominal name does not key it. A deep record's render
+doubles per level, and computing it eagerly cost 5× fuel on `vl_scaling_shape`'s diamond-depth
+arms.
+
+`nm == nominal` is also the walk's cycle guard: `shapeWalkName` passes the caller's `nm` for a
+type already on the walk stack. A variant keying every type by its nominal name never finished
+a sweep. Dropping `nm` needs an explicit on-stack test in its place.
+
 ## Proof
 
-Filled in from the gates below.
+- Refresh ×2 is a fixpoint at 6,712,542 bytes.
+- The candidate builds master's `compiler/entry.vl` byte-identical to master's own fixpoint
+  seed (6,712,315 bytes).
+- Sweep against that seed, 24,132 programs: 0 `runs → not-runs`, 0 new traps, 0 output movers.
+  The 2 bytes-only movers are `generics/annotated-written-let-of-generic-read-as-itself` and
+  `generics/declared-return-holds-litunion-beside-type-param`.
+- `regress.vl`, lint-self, cases (7,553), rep-fuzz, seed size, late demands, plumb cost,
+  self-compile time, memo and scaling, and every budget pass.
+- Render-parse goes from 12 renders and 44 parses to 13 and 41: the walk's one render buys three
+  parses. The baseline is written.
