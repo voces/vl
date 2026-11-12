@@ -59,7 +59,6 @@ import {
   arrElemIs,
   arrElemIsArrayOf,
   arrElemNameRaw,
-  arrElemSuffixed,
   fieldNameOf,
   fieldTypeTextOf,
   fnParamsTextOf,
@@ -3109,57 +3108,6 @@ export function gaeParamShadowed(name: string) {
   if name == "void" { return true }
   valueAtomKind(name) >= 0
 }
-// The live parameter slots of a generic alias: the declared names that actually bind, paired
-// with the application arguments binding them. A primitive-spelled name binds nothing
-// (`gaeParamShadowed`), so it is dropped from both lists together before substitution sees it.
-// Filtered here rather than inside the shared `monoSubstAnn` walk, since that walk's FuncDecl half has its own, different shadow rule.
-function gaeLiveParams(
-  pnames: string[],
-  args: string[],
-  outP: string[],
-  outA: string[],
-) {
-  let i = 0
-  while i < pnames.length {
-    if !gaeParamShadowed(pnames[i]) {
-      outP.push(pnames[i])
-      outA.push(args[i])
-    }
-    i = i + 1
-  }
-  0
-}
-// Substitutes a declared type-parameter name in field annotation `node`'s type name `tn` with
-// the application's argument name, through the type's structure (`T` → `i32`, `{a: T}` →
-// `{a: i32}`). The result is the instance key generic-alias rows are found by, so it stays a
-// spelling until they key by type; an annotation naming no live parameter returns `tn` verbatim.
-export function gaeApplyFieldTy(
-  tn: string,
-  pnames: string[],
-  args: string[],
-  node: i32,
-) {
-  if !monoAnnHasTyParam(node, -1, pnames) { return tn }
-  const lp: string[] = []
-  const la: string[] = []
-  gaeLiveParams(pnames, args, lp, la)
-  const leaf = arrLeafNameOf(tn)
-  const s = monoSubstAnn(leaf, lp, lp, la)
-  // "" is `monoSubstAnn`'s UNBOUND answer, which cannot arise here — every name in `lp`
-  // is bound by construction — so this and the unchanged-leaf test are the
-  // un-substitutable fallbacks, not cases.
-  if s == "" { return tn }
-  if s == leaf { return tn }
-  // Each `[]` re-suffixes through `arrElemSuffixed`, so a union argument stays the element
-  // (`T[]` at `i32|string` is `(i32|string)[]`, not a union with a list arm; D12560).
-  let r = s
-  let k = leaf.length
-  while k + 2 <= tn.length {
-    r = arrElemSuffixed(r)
-    k = k + 2
-  }
-  r
-}
 // Lexicographic `a < b` over two strings by code point (VL has no `<` on `string`).
 // Compares char-by-char: at the first differing position the smaller code point wins;
 // if one is a prefix of the other, the shorter is smaller. Equal strings are NOT `<`.
@@ -3368,7 +3316,7 @@ export function annArrowAt(name: string) { tyTopIndexOf(name, '=', 0, 0) }
 // The one home of the function-type decomposition `(p1, p2) => ret`: fills `outParams` with
 // the top-level parameter annotations and returns the return annotation, or "" when `ann` is
 // not a fully-parenthesized function type. The empty param list is not split (`() => R`
-// yields no params) — without that, `annSplitParams` would push one empty part, and `monoSubstAnn` would substitute it, get "" back, and report the whole annotation unbindable.
+// yields no params): `annSplitParams` would push one empty part, which no caller can bind.
 export function annFnDecompose(ann: string, outParams: string[]) {
   const fa = annArrowAt(ann)
   if fa < 1 { return "" }
@@ -3696,171 +3644,6 @@ function monoSubstLitSetJoin(outs: string[]): string {
   if flat == "" { return "" }
   if hasNull { return flat + "|null" }
   flat
-}
-
-// Substitutes the per-call type-param bindings through an annotation name — bare `T`/`T[]`,
-// application arguments (`Box<T>` → `Box<i32>`), and inline object-shape field types.
-// Returns "" when an unbound type param remains (the instance cannot be named); a fully concrete annotation returns unchanged.
-export function monoSubstAnn(
-  ann: string,
-  typarams: string[],
-  tvN: string[],
-  tvV: string[],
-) {
-  const tp = monoTyParamOf(ann, typarams)
-  if tp != "" {
-    const b = monoBindOf(tvN, tvV, tp)
-    if b == "" { return "" }
-    if ann == tp { return b }
-    // `T[]` at a composite binding: the suffix is grouped, since bare it would bind into the
-    // binding's last arm and spell a union whose last member is a list (D1896).
-    return arrElemSuffixed(b)
-  }
-  // A top-level UNION (`T | null`): substitute each member and rejoin. Paired with
-  // `monoAnnHasTyParam`'s union arm — see the contract note there.
-  if unionMemberCount(ann) > 1 {
-    // Counts before cutting (B278): the split otherwise runs unconditionally though its result is
-    // needed only for a 2+-member union. `unionMemberCount` equals the split's length at every one
-    // of these sites, so counting first is the same answer for strictly less work on the common single-member case.
-    const uatoms: string[] = []
-    splitUnionAtoms(ann, uatoms)
-    // Substitution can collapse a union, and the rejoin must answer for that: a blind `a + "|" +
-    // b` produces spellings no source program can contain and no interner has seen (`T | string`
-    // at `T := string` → `"string|string"`), check-clean and invalid wasm. So the rejoin does what
-    // the checker would: flatten each substituted atom (itself possibly a union), dedupe by first occurrence, and return the bare atom when only one survives.
-    const outs: string[] = []
-    let u = 0
-    while u < uatoms.length {
-      const us = monoSubstAnn(uatoms[u], typarams, tvN, tvV)
-      if us == "" { return "" }
-      const inner: string[] = []
-      splitUnionAtoms(us, inner)
-      let k = 0
-      while k < inner.length {
-        let seen = false
-        let m = 0
-        while m < outs.length {
-          if outs[m] == inner[k] { seen = true }
-          m = m + 1
-        }
-        if !seen { outs.push(inner[k]) }
-        k = k + 1
-      }
-      u = u + 1
-    }
-    if outs.length == 0 { return "" }
-    if outs.length == 1 { return outs[0] }
-    const lit = monoSubstLitSetJoin(outs)
-    if lit != "" { return lit }
-    let outU = ""
-    let q = 0
-    while q < outs.length {
-      if q > 0 { outU = outU + "|" }
-      outU = outU + outs[q]
-      q = q + 1
-    }
-    return outU
-  }
-  // The map arm, paired with `monoAnnHasTyParam`'s. The key prefix rides as the slice it
-  // already is (`ann.slice(0, mi + 2)`), never rebuilt from parts, and the re-render is gated on
-  // the value actually moving — so a concrete map annotation returns verbatim and never becomes a second intern key.
-  if nameIsMap(ann) {
-    const mi = monoMapKeyEnd(ann)
-    if mi < 0 { return ann }
-    const mval = ann.slice(mi + 2, ann.length - 1)
-    if mval == "" { return ann }
-    const msub = monoSubstAnn(mval, typarams, tvN, tvV)
-    if msub == "" { return "" }
-    if msub == mval { return ann }
-    return ann.slice(0, mi + 2) + msub + "}"
-  }
-  const parts: string[] = []
-  const gHead = annGenAppDecompose(ann, parts)
-  if gHead != "" {
-    let outAnn = gHead + "<"
-    let i = 0
-    while i < parts.length {
-      const s = monoSubstAnn(parts[i], typarams, tvN, tvV)
-      if s == "" { return "" }
-      if i > 0 { outAnn = outAnn + "," }
-      outAnn = outAnn + s
-      i = i + 1
-    }
-    return outAnn + ">"
-  }
-  const onames: string[] = []
-  const otexts: string[] = []
-  const okind = annObjFieldSplit(ann, onames, otexts)
-  if okind == 0 { return ann }
-  if okind > 0 {
-    let outObj = "{"
-    let j = 0
-    while j < onames.length {
-      if onames[j] == "" { return ann }
-      const fs = monoSubstAnn(otexts[j], typarams, tvN, tvV)
-      if fs == "" { return "" }
-      if j > 0 { outObj = outObj + "," }
-      outObj = outObj + onames[j] + ":" + fs
-      j = j + 1
-    }
-    return outObj + "}"
-  }
-  // A function-type annotation `(p1, p2) => ret` riding type params: substitute each parameter
-  // and the return through the binding, so a generic closure param `f: (A, T) => A` pins to
-  // `(string, string) => string` for the instance. Without it the instance body's call resolves no interned `$fnsig` and mis-lowers.
-  const fparts: string[] = []
-  const fret = annFnDecompose(ann, fparts)
-  if fret != "" {
-    let outFn = "("
-    let fi = 0
-    while fi < fparts.length {
-      const fs2 = monoSubstAnn(fparts[fi], typarams, tvN, tvV)
-      if fs2 == "" { return "" }
-      if fi > 0 { outFn = outFn + "," }
-      outFn = outFn + fs2
-      fi = fi + 1
-    }
-    const rs2 = monoSubstAnn(fret, typarams, tvN, tvV)
-    if rs2 == "" { return "" }
-    return outFn + ")=>" + rs2
-  }
-  // A grouping paren around the whole (`(T | null)`, the form a composite element wears under a
-  // `[]`), the arm `monoAnnHasTyParam` closes with. Re-renders only when the recursion actually
-  // moved: an untouched inner name returns `ann` verbatim, since a rebuilt spelling is a second intern key.
-  const pk = peelGroupParens(ann)
-  if pk != ann {
-    const ps = monoSubstAnn(pk, typarams, tvN, tvV)
-    if ps == "" { return "" }
-    if ps == pk { return ann }
-    return "(" + ps + ")"
-  }
-  // The `[]` run, `monoAnnHasTyParam`'s closing arm in the same position. `arrLeafNameOf`
-  // strips whole `[]` pairs off the end, so the leaf is a prefix of `ann` and the remainder is
-  // precisely the repetitions to re-attach, never rebuilt from a count. An unbound leaf returns
-  // "" up the chain — `monoSubstAnn`'s documented "the instance cannot be named" — and re-rendering is gated on the leaf actually moving, so a concrete `[]` run returns verbatim.
-  const leaf = arrLeafNameOf(ann)
-  if leaf != ann {
-    const ls = monoSubstAnn(leaf, typarams, tvN, tvV)
-    if ls == "" { return "" }
-    if ls == leaf { return ann }
-    // The first `[]` goes through `arrElemSuffixed`, which groups a union leaf: bare,
-    // `i32|null[][]` is a union whose last member is a list (D13061).
-    return arrElemSuffixed(ls) + ann.slice(leaf.length + 2, ann.length)
-  }
-  ann
-}
-// The index of the `]` closing map annotation `ann`'s key, whose `]:` the value follows to the
-// closing `}`; -1 when `ann` is not a map.
-function monoMapKeyEnd(ann: string): i32 {
-  if !nameIsMap(ann) { return -1 }
-  let mi = 2
-  while mi < ann.length - 1 {
-    if ann[mi] == ']' {
-      if ann[mi + 1] == ':' { return mi }
-    }
-    mi = mi + 1
-  }
-  -1
 }
 
 // Is `op` an operator that may dispatch to a `self`-method / operator field?
