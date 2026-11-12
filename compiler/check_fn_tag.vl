@@ -1613,7 +1613,9 @@ function ftScan(
         if rec && !ftRecWriteJoins(v, recTy, s, ds, leaves, ids, 0) {
           return false
         }
-        if (
+        if hk == 7 && xt is TyArray {
+          if !ftMapElemOk(v, s) { return false }
+        } else if (
           !rec
           && !ftJoinAt(v, ftSlotTyOf(nodeTyIxOf(x), s), s, ds, leaves, ids)
         ) {
@@ -4011,14 +4013,7 @@ function ftLitJoin(
   // set decided with this one, whose ids are this set's (D15234).
   if ftHoldKind(lt, s, FT_HOLD_DEPTH) == 7 {
     for el in n.arrElems {
-      const et = nodeTyIxOf(el)
-      const ek = ftHoldKind(et, s, FT_HOLD_DEPTH)
-      const em = if et >= 0 && et < T.tys.length { tyAt(et) } else { null }
-      const es = if em is TyMap { fnTagSetOfTy(em.mVal) } else { -1 }
-      if ek != 3 && ek != 7 {
-        if es < 0 || es == s || !ftSetWithin(es, s) { return false }
-        if !i32ListHas(ftSubNeed, es) { ftSubNeed.push(es) }
-      }
+      if !ftMapElemOk(el, s) { return false }
     }
     return true
   }
@@ -4037,6 +4032,19 @@ function ftLitJoin(
       return false
     }
   }
+  true
+}
+
+// Whether `el`, an element of a list of maps of set `s`, is a map of `s` itself, or of a smaller set
+// decided with `s`, whose ids are `s`'s; the smaller set is noted as needed.
+function ftMapElemOk(el: i32, s: i32): boolean {
+  const et = nodeTyIxOf(el)
+  const ek = ftHoldKind(et, s, FT_HOLD_DEPTH)
+  if ek == 3 || ek == 7 { return true }
+  const em = if et >= 0 && et < T.tys.length { tyAt(et) } else { null }
+  const es = if em is TyMap { fnTagSetOfTy(em.mVal) } else { -1 }
+  if es < 0 || es == s || !ftSetWithin(es, s) { return false }
+  if !i32ListHas(ftSubNeed, es) { ftSubNeed.push(es) }
   true
 }
 
@@ -4325,6 +4333,8 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
   }
   // A slice of such a list of records copies its records, built at the holder's record.
   if k == 6 && op == "slice" && fnTagSetSplits(s) { return true }
+  // A list of maps of the set takes a pushed map as its literal takes an element (D15395).
+  if k == 7 && op == "push" { return true }
   // A slice copies the list's ids into a list of the same set, read as the holder is (D14931).
   if k == 1 {
     return op == "push" || op == "slice" || op == "pop" || op == "get"
@@ -4520,6 +4530,10 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       // value's own type, and the callee's writes through it join this set (D14648, D15430).
       return ftDstTakes(ftArgDstTy(pn, x), x, s)
         || ftDstTakes(ftMapSetValTy(pn, x, s), x, s)
+        || ftPushRecvOf(pn, x) >= 0
+        && ftMapListOfWider(ftPushRecvOf(pn, x), x, s)
+        || ftPushRecvOf(pn, x) >= 0
+        && ftDstTakes(ftArrElemTy(ftPushRecvOf(pn, x)), x, s)
         || ftRecIntoMapSet(x, pn, s, fn)
         || ftTyParamListTakes(p, x, s)
         || ftLate
@@ -4658,8 +4672,19 @@ function ftTyHoldsDecided(t: i32, s: i32): boolean {
   false
 }
 
-// Whether list literal `p` is a list of maps of a set decided with `s` that `s` is within, and
-// `x` a map whose value carries `s`: its ids are that set's (D15234).
+// The receiver of `xs.push(…)` call `c` where `x` is one of its arguments, else -1.
+function ftPushRecvOf(c: Call, x: i32): i32 {
+  const f = parenPeelIx(c.callFn)
+  const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+  if !(fn is Member) || fn.memProp != "push" || !i32ListHas(c.callArgs, x) {
+    return -1
+  }
+  fn.memObj
+}
+
+// Whether `p`, a list literal or a list a map is pushed onto, is a list of maps of a set decided
+// with `s` that `s` is within, and `x` a map whose value carries `s`: its ids are that set's
+// (D15234, D15395).
 function ftMapListOfWider(p: i32, x: i32, s: i32): boolean {
   if (
     x < 0
