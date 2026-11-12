@@ -1950,11 +1950,9 @@ function emitOmittedFieldNull(_body: u8[], si: i32, fi: i32) {
     "union" => {
       // a value-union field defaults to null only when `null` is a member — resolve the
       // member set once, then test its banked null code (`nullValKind()`), not the lexeme.
-      const fnm = sFieldElemNameAt(si, fi)
       if (
         unionHasAtomK(
           msSetOfTy(sFieldElemTyIxAt(si, fi)),
-          fnm,
           "null",
           nullValKind(),
         )
@@ -3339,6 +3337,17 @@ function emitRecCopyLevel(
     // A `null` field holds the one value its type has; the source's field is not read (D14817).
     if fieldRowIsNulNone(dFieldRows[fj]) {
       fbRefNullNone()
+      fj = fj + 1
+      continue
+    }
+    // A `null` field copied into a `| null` the destination boxes is the union's null box.
+    if (
+      fieldRowIsNulNone(sFieldStart[sRow] + sfi)
+      && fieldRowIsUnionBox(dFieldRows[fj])
+    ) {
+      fbI32Rel(RS_TAG, nullBoxTag())
+      fbRefNullNone()
+      fbStructNew(uBoxIdx)
       fj = fj + 1
       continue
     }
@@ -8198,6 +8207,13 @@ function unionResidualSoloKindOfSet(s: i32) {
   msSoloValKind(msSubNull(s))
 }
 
+// Whether the member set `s` holds `null`. An unresolved set (a pinned `V | null` instance
+// records none) answers false, so the `??` arm gating on it declines to a later arm.
+function setHasNullAtom(s: i32): boolean {
+  if s < 0 { return false }
+  unionHasAtomK(s, "null", nullValKind())
+}
+
 // Is this union a value union — the box question, asked of the interned member set the caller
 // already resolved, and of the spelling only where the pool declines. `msIsValueUnion` reads
 // the member ABI codes off the bank, where the name path scans the whole rendering twice and
@@ -9019,9 +9035,9 @@ function emitUnionCoerceMapElemList(
 }
 
 // The set id of coerce target `unionName`: `uSet` when the caller resolved it, else by name.
-function coerceSetOf(uSet: i32, unionName: string): i32 {
+function coerceSetOf(uSet: i32, uTy: i32): i32 {
   if uSet >= 0 { return uSet }
-  msSetOfUnion(unionName)
+  msSetOfTyAny(uTy)
 }
 
 // Whether coerce target `unionName`, of set id `uSet` (-1 when unresolved) and arena type `uTy`,
@@ -9184,7 +9200,7 @@ function emitUnionCoerceAtomBox(
   fnIx: i32,
 ) {
   const cak = coerceListAtomOf(
-    coerceValueAtomKind(unionName, uSet, exprIx, bareIx, fnIx),
+    coerceValueAtomKind(unionName, uSet, uTy, exprIx, bareIx, fnIx),
     uTy,
     bareIx,
     fnIx,
@@ -9214,6 +9230,7 @@ function emitUnionCoerceAtomBox(
 function coerceValueAtomKind(
   unionName: string,
   uSet: i32,
+  uTy: i32,
   exprIx: i32,
   bareIx: i32,
   fnIx: i32,
@@ -9237,7 +9254,7 @@ function coerceValueAtomKind(
   // over a slot whose only numeric arm is `i64` — valid wasm, `is i64` silently false.
   // `unionStoreAtomKind` makes the two sides of the round trip inverses.
   const d209k = memReadUnboxAtomKind(bareIx, fnIx)
-  if d209k >= 0 && unionStoreAtomKindOfSet(uSet, unionName, d209k) == d209k {
+  if d209k >= 0 && unionStoreAtomKindOfSet(uSet, uTy, d209k) == d209k {
     cak = d209k
   } else if exprString(exprIx, fnIx) {
     cak = 2 // "string"
@@ -9280,9 +9297,9 @@ function coerceValueAtomKind(
     // `unionStoreAtomKind` in general moved a case it should not have
     // (`d901_fold_f32_dest`, a `{q: f32} | null` whose f32 is a FIELD and not an arm), so
     // the test is spelled out here instead of widening that shared mapper.
-    const f32Set = coerceSetOf(uSet, unionName)
-    if !unionHasAtomK(f32Set, unionName, "f32", 5) {
-      if unionHasAtomK(f32Set, unionName, "f64", 4) { cak = 4 }
+    const f32Set = coerceSetOf(uSet, uTy)
+    if !unionHasAtomK(f32Set, "f32", 5) {
+      if unionHasAtomK(f32Set, "f64", 4) { cak = 4 }
     }
   } else if exprIsF64(exprIx, fnIx) {
     cak = 4 // "f64"
@@ -9292,10 +9309,10 @@ function coerceValueAtomKind(
     // is the only i64-classified value the checker admits into it (D1890's grant is
     // exactness-gated), and assuming kind 3 asks for an i64 value box the module never minted.
     cak = 3 // "i64"
-    const i64Set = coerceSetOf(uSet, unionName)
-    if !unionHasAtomK(i64Set, unionName, "i64", 3) {
-      if unionHasAtomK(i64Set, unionName, "f64", 4) { cak = 4 }
-      else if unionHasAtomK(i64Set, unionName, "f32", 5) { cak = 5 }
+    const i64Set = coerceSetOf(uSet, uTy)
+    if !unionHasAtomK(i64Set, "i64", 3) {
+      if unionHasAtomK(i64Set, "f64", 4) { cak = 4 }
+      else if unionHasAtomK(i64Set, "f32", 5) { cak = 5 }
     }
   } else if exprIsBool(exprIx, fnIx) {
     cak = 1 // "boolean"
@@ -9309,7 +9326,7 @@ function coerceValueAtomKind(
     // atom is a float would stay `cak = 0` and box an i32 into the f64 or f32 value box, which
     // is check-clean invalid wasm in the global, local and argument positions. f64 before f32,
     // matching the list arm.
-    const usw = unionStoreAtomKindOfSet(uSet, unionName, 0)
+    const usw = unionStoreAtomKindOfSet(uSet, uTy, 0)
     if usw >= 0 { cak = usw }
     if numLitWidth(bareIx, fnIx) == "i64" { cak = 3 }
   }
@@ -9318,7 +9335,7 @@ function coerceValueAtomKind(
   // box. The same promotion ladder, entered at f64 instead of i32. The `cak == 4` gate is
   // hoisted out of the call below so the set resolution is paid only by a float value.
   if cak == 4 {
-    const fsw = unionStoreAtomKindOfSet(uSet, unionName, 4)
+    const fsw = unionStoreAtomKindOfSet(uSet, uTy, 4)
     if fsw >= 0 { cak = fsw }
   }
   cak
@@ -10820,7 +10837,12 @@ function emitUnionConcreteEq(
   // band; the two branches below are the only readers, and both consume the code rather than a
   // spelling. `valueAtomNameOfKind` re-derives the spelling for the membership test's decline
   // argument, a bijection over the seven scalar codes and "" above them.
-  const eak = unionEqAtomKindOf(otherIx, unmArms, usid, fnIx)
+  const eak = unionEqAtomKindOf(
+    otherIx,
+    usid,
+    unionBoxTyOfRead(boxIx, fnIx),
+    fnIx,
+  )
   const atom = valueAtomNameOfKind(eak)
   if eak < 0 {
     // The operand has no atom rep — a struct, a map, a shape the arena named. The box can still
@@ -10999,7 +11021,7 @@ function unionEqArmPresent(
   eak: i32,
 ): boolean {
   if atom == "" { return unionHasAtomKindArm(unmArms, eak) }
-  unionHasAtomK(usid, unmArms, atom, eak)
+  unionHasAtomK(usid, atom, eak)
 }
 
 // D1180 — the variant row the concrete operand's value actually has, which is not always the row
@@ -12054,15 +12076,9 @@ function emitUnionLitIs(body: u8[], objIx: i32, lit: string, fnIx: i32) {
   // in force, and so the static-false fold below still evaluates it exactly once.
   const isStash = unionLitIsStashSlot()
   const isOnce = !unionEqOperandOk(objIx)
-  const unr: i32[] = []
-  const uname = unionNameRowOfExpr(objIx, fnIx, unr)
+  const uname = unionNameOfExpr(objIx, fnIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
   const usid = msSetOfUnionBox(objIx, fnIx)
-  // The arm spellings with a declared alias resolved — every predicate below that reads a name
-  // reads this one, while the interned set stays keyed on the name the receiver carries.
-  // `unionHasAtomTy` answers by splitting the spelling at top-level `|`,
-  // so a `type W = K | i32` alias splits to the single atom `"W"` and no arm holds a literal.
-  const unmArms = unionMemberSetOfRow(unr[0], uname)
   // D1047 — the empty-name reject stays ahead of the atom ladder. The ladder's i64-widening rung
   // and the mixed-union gate below both ask `unionHasAtomK`, whose fall-through fails loudly on
   // an unregistered row, and a receiver whose union has no name has no row at all. The message is
@@ -12089,10 +12105,7 @@ function emitUnionLitIs(body: u8[], objIx: i32, lit: string, fnIx: i32) {
   } else if !numLexFitsI32(lit) {
     atom = "i64"
     lak = 3
-  } else if (
-    !unionHasAtomK(usid, unmArms, "i32", 0)
-    && unionHasAtomK(usid, unmArms, "i64", 3)
-  ) {
+  } else if (!unionHasAtomK(usid, "i32", 0) && unionHasAtomK(usid, "i64", 3)) {
     atom = "i64"
     lak = 3
   }
@@ -12100,7 +12113,7 @@ function emitUnionLitIs(body: u8[], objIx: i32, lit: string, fnIx: i32) {
   // `string` arm or a literal-union arm, which is exactly `msSetTakesAtomAsStr`'s question.
   // Without its second leg a `K | f64` box statically answers `is "aa"` false: the member kinds
   // bank only `f64`, so the arm that holds the value looks absent. It is the gate's third disjunct.
-  let litHasArm = unionHasAtomK(usid, unmArms, atom, lak)
+  let litHasArm = unionHasAtomK(usid, atom, lak)
   if !litHasArm && lak == 2 && msSetTakesAtomAsStr(usid) { litHasArm = true }
   // A union carrying a literal-union alias arm (`K | string`, `K | f64`) is a box like any value
   // union — the arm rides it as its member string — but `isValueUnionName` declines it because
@@ -15543,7 +15556,13 @@ function emitScalarMapReadOtherEq(
     // A numeric literal widens to a wide read's own width (`emitUnionEqOther`); any other
     // operand must already have the read's atom kind.
     const olit = nodeAt(unwrapParen(otherIx))
-    let oOk = unionEqAtomKindOf(otherIx, atom + " | null", -1, fnIx) == k
+    let oOk = unionEqAtomKindOf(
+      otherIx,
+      -1,
+      mkNullableTyOf(primTyIxOfName(atom)),
+      fnIx,
+    )
+      == k
     if olit is NumLit {
       if k >= 3 { oOk = true }
     }
@@ -31744,7 +31763,7 @@ function retFlagsSeedResult(
     // (kind 4): box each concrete-variant/value-atom `return` via `retUNm`. A litunion
     // alias name is excluded on the same grounds as the annotated arm above — it
     // registers as a union name but its value is the interned i32 atom, so boxing it would be wrong.
-    if (isValueUnionName(im) || (isUNameAB(26, im, imTy) && !imLit)) {
+    if (isValueUnionName(im) || (isUNameAB(26, imTy) && !imLit)) {
       rf.retUNm = im
       rf.retUTy = imTy
     }
@@ -31936,6 +31955,20 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
       "emitProgram: a returned container of functions is built at another storage than this function's result",
       retArg,
     )
+  }
+  // A `null` the row stores in a union box, returned where the result is the `null` unit, is
+  // that null: the box is read for effect and dropped.
+  if (
+    fnPos >= 0
+    && fnPos < fRetKind.length
+    && fRetKind[fnPos] == "nulnone"
+    && nodeTyAt(retArg, fnIx) == TY_NULL
+    && exprUnion(retArg, fnIx)
+  ) {
+    if emitExpr(body, retArg, fnIx) < 0 { return -1 }
+    fbDrop()
+    fbRefNullNone()
+    return 0
   }
   emitReturnValueTail(body, retArg, fnIx, fnPos, retArmHeap)
 }
@@ -32687,11 +32720,10 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     scopeBind(s.letName, slot)
     return 0
   }
-  // value-flow monomorphization: a `const g = f` binding to a generic named function, used
-  // only as a direct-call callee, is sound — `monomorphize` rewrote each `g(args)` to its
-  // per-call instance, so the closure stored here is `call_ref`'d only at the pinned type.
-  // Requires a pinning call site (`monoInstantiatedAny`); with none, the floor's loud reject applies instead.
-  if fnIx >= 0 {
+  // A `const g = f` of a generic named function used only as a direct callee stores the closure:
+  // `monomorphize` rewrote each `g(args)` to its pinned instance (`monoInstantiatedAny`). A
+  // member of a tagged set is held as its id instead, its slot's rep (D15927).
+  if fnIx >= 0 && fnTagLeafId(s.letInit) < 0 {
     const aliasFe = fieldValueFeOf(s.letInit)
     if fnHasUnannotatedParam(aliasFe) {
       if !criFnIsAnonLambda(aliasFe) {
@@ -41118,12 +41150,7 @@ function coalValUnionResidualKind(lhsIx: i32, cunm: string, fnIx: i32): i32 {
   // different question (the set surviving the narrow), so both stay resolved, and the null
   // test is a kind test over the banked codes.
   const csid = msSetOfTy(nodeTyAt(lhsIx, fnIx))
-  if (
-    !isValueUnionOfSet(csid, cunm)
-    || !unionHasAtomK(csid, cunm, "null", nullValKind())
-  ) {
-    return -1
-  }
+  if (!isValueUnionOfSet(csid, cunm) || !setHasNullAtom(csid)) { return -1 }
   // A read the checker narrowed is the set of its narrowed type; an unnarrowed one the declared
   // union's. The rendered residual is built only where the pool covers no set.
   const nt = readNarrowedTyAt(lhsIx, fnIx)
@@ -41326,10 +41353,7 @@ function emitCoalesceCallStash(
       // residual code below, which master resolved a second time inside
       // `unionResidualSoloKindOfSet`.
       const ksid = msSetOfTy(nodeTyIxOf(lhsIx))
-      if (
-        isValueUnionOfSet(ksid, kunm)
-        && unionHasAtomK(ksid, kunm, "null", nullValKind())
-      ) {
+      if (isValueUnionOfSet(ksid, kunm) && setHasNullAtom(ksid)) {
         // D-union-atom-kind — see `unionResidualSoloKindOfSet`.
         let kak = unionResidualSoloKindOfSet(ksid)
         if kak == -2 {
@@ -41534,10 +41558,7 @@ function emitCoalesceUnionField(
       }
       // D-VALUNION + D-SETONCE — see the call arm above.
       const msid = msSetOfTy(munTy)
-      if (
-        isValueUnionOfSet(msid, munm)
-        && unionHasAtomK(msid, munm, "null", nullValKind())
-      ) {
+      if (isValueUnionOfSet(msid, munm) && setHasNullAtom(msid)) {
         // D-union-atom-kind — see `unionResidualSoloKindOfSet`.
         let mak = unionResidualSoloKindOfSet(msid)
         if mak == -2 {
@@ -42071,7 +42092,7 @@ function coalBoxFieldScalarKind(lhsIx: i32, fnIx: i32): i32 {
   const un = memberUnionFieldNameRead(lhsIx, fnIx)
   if un == "" { return -1 }
   const sid = msSetOfTy(nodeTyAt(lhsIx, fnIx))
-  if !unionHasAtomK(sid, un, "null", nullValKind()) { return -1 }
+  if !setHasNullAtom(sid) { return -1 }
   const k = unionResidualSoloKindOfSet(sid)
   if nulBoxScalarValtype(k) < 0 || vbHeapIdxOfKind(k) < 0 { return -1 }
   k

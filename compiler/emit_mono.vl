@@ -124,7 +124,6 @@ import {
   arrElemNameRaw,
   arrElemSuffixed,
   listElemNameOf,
-  nameIsArray,
   nameIsBraceSpanEnds,
   nameIsParenSpanEnds,
   peelGroupParens,
@@ -646,6 +645,7 @@ import {
   anonHandleTyIx,
   anonRowKindsAgree,
   fnTagListRepName,
+  structRowOfNameTy,
   structRowOfRecordTy,
 } from "./emit_shape_rows"
 import { PIN_DECLINE, pinSigOf, sigKeyOfTy } from "./emit_sig_tokens"
@@ -2029,28 +2029,27 @@ function monoArgTyNameProjected(
     if !tyIsLitUnion(nodeTyIxOf(unwrapParen(ix))) {
       const arrOut: i32[] = [0 - 1]
       const arrTy = monoArgTyName(argN.idxArr, fnIx, arrOut)
-      const an = arrTy.length
-      if an >= 3 && nameIsArray(arrTy) {
-        let aet = -1
-        if arrOut[0] >= 0 && arrOut[0] < T.tys.length {
-          const at = tyAt(arrOut[0])
-          if at is TyArray { aet = at.aElem }
-        }
+      // The list's type: the one its pin named, else the indexed node's own.
+      const lt = if arrOut[0] >= 0 { arrOut[0] } else { elabNodeTyOrChecked(argN.idxArr, fnIx) }
+      if arrTy.length >= 3 && monoTyIsList(lt) {
+        const at = tyAt(lt)
+        const aet = if at is TyArray { at.aElem } else { -1 }
         const r = monoAnnPinName(listElemNameOf(arrTy), aet)
         if r != "" {
-          tyOut[0] = if arrOut[0] >= 0 { tyArrayElemIx(arrOut[0]) } else { -1 }
+          tyOut[0] = tyArrayElemIx(lt)
           return r
         }
       }
     }
   }
-  // A struct-field argument (`id(o.inner)`): resolve the receiver's struct from its
-  // annotation, then read the field's struct type name off the struct table (a
-  // nested-struct field is code 15, whose `sFieldElemName` is its target struct name).
+  // A struct-field argument (`id(o.inner)`): resolve the receiver's struct from its pinned
+  // type, else its annotation's spelling, then read the field's struct type name off the struct
+  // table (a nested-struct field is code 15, whose `sFieldElemName` is its target struct name).
   // `structIndexOfExpr(o.inner)` would default to i32, the locals table being unbuilt.
   if argN is Member {
-    const recvTy = monoArgTyName(argN.memObj, fnIx, [0 - 1])
-    const rsi = structIndexByName(recvTy)
+    const recvOut: i32[] = [0 - 1]
+    const recvTy = monoArgTyName(argN.memObj, fnIx, recvOut)
+    const rsi = structRowOfNameTy(recvTy, recvOut[0])
     if rsi >= 0 {
       const fi = sFieldIndex(rsi, argN.memProp)
       if fi >= 0 && sFieldTypeAt(rsi, fi) == FC_STRUCT {
@@ -15506,33 +15505,95 @@ function monoPinMapSlot(mx: i32, at: i32, ctx: i32, fld: string): i32 {
   const nt = mkMapTy(mt.mKey, nv, 0)
   nodeTyRecord(mx, nt)
   monoRetypeMapReads(ctx, at, nt, nv, fld)
-  // A `const` alias of the map, or of such an alias, holds it at the same type, and its reads are
-  // the map's.
+  // A binding that holds the map holds it at the same type, and its reads are the map's: a `const`
+  // bound to a held binding, to a constant-index element or a field of a held literal's value, or a
+  // `let` every write of which stores a held binding.
   if fld == "" {
     const nodes = monoFrameNodes(ctx)
     const held: i32[] = [at]
-    let hi = 0
-    while hi < held.length {
-      const hd = nodeAt(held[hi])
-      if hd is LetDecl {
-        for ix in nodes {
-          const a = nodeAt(ix)
-          if (
-            a is LetDecl
-            && a.letKw == "const"
-            && a.letType < 0
-            && a.letInit >= 0
-            && !i32ListHas(held, ix)
-            && monoReadsBinding(a.letInit, hd.letName, ctx, held[hi])
+    let grew = true
+    while grew {
+      grew = false
+      for ix in nodes {
+        const a = nodeAt(ix)
+        if (
+          a is LetDecl
+          && a.letType < 0
+          && a.letInit >= 0
+          && !i32ListHas(held, ix)
+        ) {
+          // Peel the init's element and field steps to the binding it starts from, then replay
+          // them on literals, from that binding's, to the binding the last step reads.
+          const steps: i32[] = []
+          let x = unwrapParen(a.letInit)
+          while (
+            x >= 0
+            && x < P.nodes.length
+            && (nodeAt(x) is Index || nodeAt(x) is Member)
           ) {
+            steps.push(x)
+            const xn = nodeAt(x)
+            x = if xn is Index { unwrapParen(xn.idxArr) } else if xn is Member { unwrapParen(xn.memObj) } else { -1 }
+          }
+          let src = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { monoReadLetFrame(x, ctx)[1] } else { -1 }
+          let si = steps.length - 1
+          while si >= 0 && src >= 0 {
+            // `src` is a binding here, or, after an inner literal, that literal's node.
+            const sd = nodeAt(src)
+            const cur = if sd is LetDecl && sd.letInit >= 0 { nodeAt(unwrapParen(sd.letInit)) } else { sd }
+            const st = nodeAt(steps[si])
+            let sv = -1
+            if st is Index && cur is ArrayLit {
+              const k = nodeAt(unwrapParen(st.idxIndex))
+              const e = if k is NumLit { monoListLitIndex(k.numText, cur.arrElems.length) } else { -1 }
+              sv = if e >= 0 { unwrapParen(cur.arrElems[e]) } else { -1 }
+            } else if st is Member && cur is ObjLit {
+              for fx in cur.objFields {
+                const f = nodeAt(fx)
+                if f is FieldInit && f.fiName == st.memProp {
+                  sv = unwrapParen(f.fiValue)
+                }
+              }
+            }
+            const vn = if sv >= 0 && sv < P.nodes.length { nodeAt(sv) } else { null }
+            src = if vn is Ident { monoReadLetFrame(sv, ctx)[1] } else if si > 0 && (vn is ArrayLit || vn is ObjLit) { sv } else { -1 }
+            si = si - 1
+          }
+          // A bare read names a held binding as its frame resolves it.
+          let ok = src >= 0 && i32ListHas(held, src)
+          for h in held {
+            const hn = nodeAt(h)
+            if (
+              steps.length == 0
+              && hn is LetDecl
+              && monoReadsBinding(x, hn.letName, ctx, h)
+            ) {
+              ok = true
+            }
+          }
+          if ok && a.letKw != "const" {
+            for w in monoLetWholeWrites(ix) {
+              const wb = nodeAt(w)
+              const rx = if wb is BinExpr { unwrapParen(wb.binRight) } else { -1 }
+              let wok = false
+              for h in held {
+                const hn = nodeAt(h)
+                if hn is LetDecl && monoReadsBinding(rx, hn.letName, ctx, h) {
+                  wok = true
+                }
+              }
+              if !wok { ok = false }
+            }
+          }
+          if ok {
             a.letType = synthTypeRefOfTy(nt, -1)
             nodeTyRecord(a.letInit, nt)
             monoRetypeMapReads(ctx, ix, nt, nv, "")
             held.push(ix)
+            grew = true
           }
         }
       }
-      hi = hi + 1
     }
   }
   nt
