@@ -52,5 +52,5 @@ a sweep. Dropping `nm` needs an explicit on-stack test in its place.
   `generics/declared-return-holds-litunion-beside-type-param`.
 - `regress.vl`, lint-self, cases (7,553), rep-fuzz, seed size, late demands, plumb cost,
   self-compile time, memo and scaling, and every budget pass.
-- Render-parse goes from 12 renders and 44 parses to 13 and 41: the walk's one render buys three
-  parses. The baseline is written.
+- Render-parse: the walk's one render buys two parses. Merged with master `cf01f012` (12 renders,
+  40 parses), the census reads 13 and 38; the baseline is written from that measurement.
