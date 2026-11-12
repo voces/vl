@@ -7295,7 +7295,7 @@ function elabSlotRecordNote(c: i32) {
         }
         if pk != CW_UP_LETINIT { return 0 }
         const nh = cwIxUp[place]
-        if !elabSlotNulHolderOk(nh, rec, holders) { return 0 }
+        if !elabSlotNulHolderOk(nh, rec, holders, hands) { return 0 }
         holders.push(nh)
       } else if own {
         const uk = if cwIxCovers(m) { cwIxUpKind[m] } else { -1 }
@@ -7305,7 +7305,7 @@ function elabSlotRecordNote(c: i32) {
           places.push(cwIxUp[m])
           ms.push(pm)
         } else if uk == CW_UP_LETINIT {
-          if !elabSlotHolderOk(cwIxUp[m], rec) { return 0 }
+          if !elabSlotHolderOk(cwIxUp[m], rec, hands) { return 0 }
           holders.push(cwIxUp[m])
         } else if uk == CW_UP_ARG {
           // A read handed whole to a parameter its callee calls at the record's signatures.
@@ -7322,16 +7322,21 @@ function elabSlotRecordNote(c: i32) {
       return 0
     }
   }
+  elabRecTable.push(rec)
+  const at = elabRecTable.length - 1
+  // Each hand delivers the record whole, as a call returning it does (`elabArgRecordWith`).
   let hj = 0
   while hj + 1 < hands.length {
     elabHandTakesRecord(hands[hj], hands[hj + 1], -1, rec)
+    elabTriplePut(elabArgRecs, hands[hj] * 64 + hands[hj + 1], -1, at)
     hj = hj + 2
   }
-  elabRecTable.push(rec)
-  const at = elabRecTable.length - 1
   elabSlotRecDecl.push(d)
   elabSlotRecField.push(f)
   elabSlotRecAt.push(at)
+  // A field holding a record of members is that record, whichever member a call takes.
+  const rft = if !isList && !isMap { elabSlotRecFieldTy(d, nodeTyIxOf(d)) } else { -1 }
+  if rft >= 0 { elabSlotTys[elabSlotKey(d, -1)] = rft }
   elabAnyRetRecord = true
   for v in vals { elabTriplePut(elabResKeeps, elabSlotValueCall(v), -1, 1) }
   for h in linked {
@@ -7390,9 +7395,15 @@ function elabMapStoreDecl(c: i32): i32 {
 // Whether `const` binding `h`, holding a map's nullable value of record `rec`, is read only by a
 // comparison, a call through it at one of the record's signatures, or the initialiser of a `const`
 // copy (`elabSlotHolderOk`), which joins `copies`.
-function elabSlotNulHolderOk(h: i32, rec: i32[], copies: i32[]): boolean {
+function elabSlotNulHolderOk(
+  h: i32,
+  rec: i32[],
+  copies: i32[],
+  hands: i32[],
+): boolean {
   const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
   if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return false }
+  const mine: i32[] = []
   const hw = cwOccWalk(h)
   while cwOccNext(hw) {
     const k = cwIxKind[hw.row]
@@ -7401,10 +7412,16 @@ function elabSlotNulHolderOk(h: i32, rec: i32[], copies: i32[]): boolean {
       if cwUseInOtherFrame(u) || !cwIxCovers(u) { return false }
       const uk = cwIxUpKind[u]
       if uk == CW_UP_LETINIT {
-        if !elabSlotHolderOk(cwIxUp[u], rec) { return false }
+        if !elabSlotHolderOk(cwIxUp[u], rec, hands) { return false }
         copies.push(cwIxUp[u])
       } else if uk == CW_UP_CALLEE {
         if elabCallSigMember(cwIxUp[u], rec) < 0 { return false }
+      } else if uk == CW_UP_ARG {
+        if !elabHandCanTakeRecord(cwIxUp[u], cwIxUpAux[u], -1, rec) {
+          return false
+        }
+        mine.push(cwIxUp[u])
+        mine.push(cwIxUpAux[u])
       } else if uk != CW_UP_CMP {
         return false
       }
@@ -7414,17 +7431,44 @@ function elabSlotNulHolderOk(h: i32, rec: i32[], copies: i32[]): boolean {
       return false
     }
   }
+  for x in mine { hands.push(x) }
   true
 }
 
 // Whether `const` binding `h` holds record `rec` read from a slot: un-annotated, read only as the
-// callee of a call at one of the record's signatures, in its own frame.
-function elabSlotHolderOk(h: i32, rec: i32[]): boolean {
+// callee of a call at one of the record's signatures, or as an argument its callee instance takes
+// whole (appended to `hands` as call and index), in its own frame.
+function elabSlotHolderOk(h: i32, rec: i32[], hands: i32[]): boolean {
   const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
   if !(hn is LetDecl) || hn.letKw != "const" || hn.letType >= 0 { return false }
-  for t in elabSlotHolderCalls(h) {
-    if t < 0 || elabCallSigMember(t, rec) < 0 { return false }
+  const mine: i32[] = []
+  const hw = cwOccWalk(h)
+  while cwOccNext(hw) {
+    const k = cwIxKind[hw.row]
+    const u = cwIxNode[hw.row]
+    if k == CW_OCC_CALL {
+      const cn = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+      if !(cn is Call) || cwUseInOtherFrame(cn.callFn) { return false }
+      if elabCallSigMember(u, rec) < 0 { return false }
+    } else if k == CW_OCC_USE {
+      if cwUseInOtherFrame(u) || !cwIxCovers(u) { return false }
+      const uk = cwIxUpKind[u]
+      if uk == CW_UP_CALLEE {
+        if elabCallSigMember(cwIxUp[u], rec) < 0 { return false }
+      } else if uk == CW_UP_ARG {
+        if !elabHandCanTakeRecord(cwIxUp[u], cwIxUpAux[u], -1, rec) {
+          return false
+        }
+        mine.push(cwIxUp[u])
+        mine.push(cwIxUpAux[u])
+      } else {
+        return false
+      }
+    } else if k != CW_OCC_BIND {
+      return false
+    }
   }
+  for x in mine { hands.push(x) }
   true
 }
 
@@ -7590,8 +7634,11 @@ function elabCopyRecordsNote() {
         const rec = if taken { elabBundleSigs.get(elabBundleKey(k, i)) ?? [] } else { [] }
         if rec.length >= 2 {
           for d in cs {
-            if elabCopyInFn(d, ekDecl[k]) {
-              elabHolderRecordWith(d, k, rec, -1)
+            // A copy inside a lambda nested in the function holds it under that lambda's instances.
+            for from in elabHandFromKeys(d, k) {
+              if elabCopyInFn(d, elabEnclosingFn(d)) {
+                elabHolderRecordWith(d, from, rec, -1)
+              }
             }
           }
         }
@@ -9251,7 +9298,7 @@ export function elabParamReadOtherThanCalled(
 ): boolean {
   if x < 0 || x >= P.nodes.length { return false }
   const n = nodeAt(x)
-  if n is Ident { return identDeclOf(x) == par }
+  if n is Ident { return identDeclOf(x) == par && !elabReadInitsHeldCopy(x) }
   if n is FuncDecl {
     for k in nodeChildren(x) {
       if elabParamReadOtherThanCalled(k, par, cap, cap, cap) { return true }
@@ -9286,6 +9333,30 @@ export function elabParamReadOtherThanCalled(
   }
   for k in nodeChildren(x) {
     if elabParamReadOtherThanCalled(k, par, own, fwd, cap) { return true }
+  }
+  false
+}
+
+// The callee instance whose copies `elabBodyReadsOtherThanCalled` is asking about, or -1.
+let elabHeldCopyHk = -1
+
+// Whether read `x` initialises a `const` copy the elaboration holds the record in, under the
+// instance `elabHeldCopyHk` names or a lambda's instance below it.
+function elabReadInitsHeldCopy(x: i32): boolean {
+  if elabHeldCopyHk < 0 || !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_LETINIT {
+    return false
+  }
+  const d = cwIxUp[x]
+  if d < 0 || d >= P.nodes.length { return false }
+  let kk = 0
+  while kk < ekDecl.length {
+    if (
+      (kk == elabHeldCopyHk || elabKeyBelow(kk, elabHeldCopyHk))
+      && elabHolderRecordAt(d, kk).length > 0
+    ) {
+      return true
+    }
+    kk = kk + 1
   }
   false
 }
@@ -9325,16 +9396,20 @@ function elabBodyReadsOtherThanCalled(
     }
     return false
   }
+  const was = elabHeldCopyHk
+  elabHeldCopyHk = hk
+  let other = false
   let i = 0
-  while i < b.blkStmts.length {
+  while i < b.blkStmts.length && !other {
     const st = b.blkStmts[i]
     const last = i == b.blkStmts.length - 1
     if !(last && elabIsParamRead(st, par)) && elabStmtReadsOther(st, par, hk) {
-      return true
+      other = true
     }
     i = i + 1
   }
-  false
+  elabHeldCopyHk = was
+  other
 }
 
 // Whether node `x` is a read of parameter `par`, under parentheses.
@@ -13403,6 +13478,31 @@ function elabSlotFromDeliveries(
       return -1
     }
   }
+}
+
+// Record type `t` of binding `d` with the field whose record of members the slot note keeps whole
+// (`elabSlotRecordNote`) at that record; -1 where `d` keeps none or another field stays open.
+function elabSlotRecFieldTy(d: i32, t: i32): i32 {
+  const o = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if !(o is TyObj) { return -1 }
+  let i = 0
+  while i < elabSlotRecDecl.length {
+    if elabSlotRecDecl[i] == d && elabSlotRecField[i] != "[]" {
+      const rt = bundleRecordTyOf(elabRecTable[elabSlotRecAt[i]])
+      if rt < 0 { return -1 }
+      const fs: i32[] = []
+      let j = 0
+      while j < o.objFieldNames.length && j < o.objFieldTypes.length {
+        const ft = if o.objFieldNames[j] == elabSlotRecField[i] { rt } else { o.objFieldTypes[j] }
+        if tyHasTyVar(ft) { return -1 }
+        fs.push(ft)
+        j = j + 1
+      }
+      return mkObjTy(o.objFieldNames, fs)
+    }
+    i = i + 1
+  }
+  -1
 }
 
 // Closes every `let` binding outside a generic whose value holds an open function leaf, and every
