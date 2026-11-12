@@ -6464,7 +6464,7 @@ function elabBundleForwardsJoin() {
             let i = 0
             while kc >= 0 && i < n.callArgs.length && i < 64 {
               const a = parenPeelIx(n.callArgs[i])
-              const ok = if a >= 0 && nodeAt(a) is Ident { elabParamOwnerKey(identDeclOf(a), k) } else { -1 }
+              const ok = if a >= 0 && nodeAt(a) is Ident { elabParamOwnerKey(elabParamCopyRoot(identDeclOf(a)), k) } else { -1 }
               if ok >= 0 {
                 elabBundleUnite(up, ok, elabBundleKey(kc, i))
                 hands.push(x)
@@ -6615,6 +6615,12 @@ let elabResStmt: {[i32]: boolean} = Map()
 let elabResArgOf: {[i32]: i32} = Map()
 // Per binding, the (call, argument index) pairs that hand its read on whole.
 let elabResHands: {[i32]: i32[]} = Map()
+// Per parameter, the (call, argument index) pairs that hand its read on whole.
+let elabParamHands: {[i32]: i32[]} = Map()
+// Per parameter key, whether its copies are already noted as holding its record.
+let elabCopyNoted: {[i32]: boolean} = Map()
+// Per `let` binding, whether it is assigned anywhere.
+let elabLetAssignedMemo: {[i32]: boolean} = Map()
 // Per `let` holder, the calls it is written from (its initialiser first), and whether any write
 // is not a plain assignment of a call.
 let elabResWrites: {[i32]: i32[]} = Map()
@@ -6655,6 +6661,9 @@ function elabResultScanReset() {
   elabResStmt = Map()
   elabResArgOf = Map()
   elabResHands = Map()
+  elabParamHands = Map()
+  elabCopyNoted = Map()
+  elabLetAssignedMemo = Map()
   elabResWrites = Map()
   elabResBadWrite = Map()
   elabResCopies = Map()
@@ -6694,6 +6703,8 @@ function elabResultScanAt(g: i32) {
   elabResScanIdent(g)
   elabResScanCall(g)
   elabResScanBlock(g)
+  elabResScanProgram(g)
+  elabResScanVoidFn(g)
   elabResScanAssign(g)
   elabResScanRet(g)
   elabResScanTail(g)
@@ -6887,8 +6898,8 @@ function elabResScanIdent(g: i32) {
 }
 
 // Whether declaration `d` can hold a record: a binding initialised by a call that can return a
-// record, or an unannotated `const` initialised with a read of a parameter or of another such
-// binding. The scan banks reads of such a binding alone, as nothing else can be a holder.
+// record, or an unannotated `const` (or never-assigned `let`) initialised with a read of a
+// parameter or of another such binding. The scan banks reads of such a binding alone, as nothing else can be a holder.
 function elabResMayHold(d: i32): boolean { elabResMayHoldAt(d, 8) }
 
 // `elabResMayHold` through at most `depth` copies of copies.
@@ -6899,14 +6910,23 @@ function elabResMayHoldAt(d: i32, depth: i32): boolean {
   const v = parenPeelIx(n.letInit)
   if v < 0 { return false }
   if nodeAt(v) is Call { return elabResMayReturnRecord(v) }
-  if n.letKw != "const" || n.letType >= 0 || !(nodeAt(v) is Ident) {
-    return false
-  }
+  if n.letType >= 0 || !(nodeAt(v) is Ident) { return false }
   const pd = identDeclOf(v)
   if pd < 0 || pd >= P.nodes.length { return false }
-  nodeAt(pd) is Param
+  const src = nodeAt(pd) is Param
     || elabResCallHolder(pd)
     || elabResMayHoldAt(pd, depth - 1)
+  // A `let` copy never assigned is the record its source is, as a `const` copy is.
+  src && (n.letKw == "const" || !elabLetAssigned(d))
+}
+
+// Whether `let` binding `d` is assigned anywhere (`cwDeclAssigned`), asked once per binding.
+function elabLetAssigned(d: i32): boolean {
+  const m = elabLetAssignedMemo.get(d)
+  if m is boolean { return m }
+  const r = cwDeclAssigned(d)
+  elabLetAssignedMemo[d] = r
+  r
 }
 
 // Whether declaration `d` is a binding initialised by a call that can return a record.
@@ -7039,6 +7059,12 @@ function elabResScanCall(g: i32) {
           hs.push(i)
           elabResHands[ad] = hs
         }
+        if ad >= 0 && ad < P.nodes.length && nodeAt(ad) is Param {
+          const ps = elabParamHands.get(ad) ?? []
+          ps.push(g)
+          ps.push(i)
+          elabParamHands[ad] = ps
+        }
       }
       i = i + 1
     }
@@ -7052,11 +7078,38 @@ function elabResScanBlock(g: i32) {
   if n is Block && n.blkStmts.length > 1 {
     let i = 0
     while i + 1 < n.blkStmts.length {
-      const st = parenPeelIx(n.blkStmts[i])
-      if st >= 0 && nodeAt(st) is Call { elabResStmt[st] = true }
+      elabResDropAt(n.blkStmts[i])
       i = i + 1
     }
   }
+  0
+}
+
+// So does every top-level call statement.
+function elabResScanProgram(g: i32) {
+  const n = nodeAt(g)
+  if n is Program {
+    for x in n.progStmts { elabResDropAt(x) }
+  }
+  0
+}
+
+// So does the last statement of a `void` function's body.
+function elabResScanVoidFn(g: i32) {
+  const n = nodeAt(g)
+  if n is FuncDecl && n.fnRet >= 0 && nodeTyIxOf(n.fnRet) == TY_VOID {
+    const b = if n.fnBody >= 0 { nodeAt(n.fnBody) } else { null }
+    if b is Block && b.blkStmts.length > 0 {
+      elabResDropAt(b.blkStmts[b.blkStmts.length - 1])
+    }
+  }
+  0
+}
+
+// Statement `x`, where it is a call, drops its value.
+function elabResDropAt(x: i32) {
+  const st = parenPeelIx(x)
+  if st >= 0 && nodeAt(st) is Call { elabResStmt[st] = true }
   0
 }
 
@@ -7081,9 +7134,15 @@ function elabResultMembersNote() {
       j = j + 2
     }
   }
+  if elabParamHands.length > 0 { elabParamHandsNote() }
   if elabResCopies.length > 0 { elabCopyRecordsNote() }
   elabRetRecordKeepsNote()
-  if elabResPlainCalls.length > 0 { elabPlainCallsNote() }
+  if elabResPlainCalls.length > 0 {
+    elabPlainCallsNote()
+    // A plain call's record makes more parameters take it whole.
+    if elabParamHands.length > 0 { elabParamHandsNote() }
+    if elabResCopies.length > 0 { elabCopyRecordsNote() }
+  }
   for c in elabResSlotCalls { elabSlotRecordNote(c) }
   0
 }
@@ -7185,6 +7244,7 @@ function elabSlotRecordNote(c: i32) {
   const places: i32[] = []
   const ms: i32[] = []
   const holders: i32[] = []
+  const hands: i32[] = []
   const ow = cwOccWalk(d)
   while cwOccNext(ow) {
     const k = cwIxKind[ow.row]
@@ -7247,6 +7307,13 @@ function elabSlotRecordNote(c: i32) {
         } else if uk == CW_UP_LETINIT {
           if !elabSlotHolderOk(cwIxUp[m], rec) { return 0 }
           holders.push(cwIxUp[m])
+        } else if uk == CW_UP_ARG {
+          // A read handed whole to a parameter its callee calls at the record's signatures.
+          if !elabHandCanTakeRecord(cwIxUp[m], cwIxUpAux[m], -1, rec) {
+            return 0
+          }
+          hands.push(cwIxUp[m])
+          hands.push(cwIxUpAux[m])
         } else if uk != CW_UP_ASG_LHS {
           return 0
         }
@@ -7254,6 +7321,11 @@ function elabSlotRecordNote(c: i32) {
     } else if k != CW_OCC_BIND && k != CW_OCC_ASG {
       return 0
     }
+  }
+  let hj = 0
+  while hj + 1 < hands.length {
+    elabHandTakesRecord(hands[hj], hands[hj + 1], -1, rec)
+    hj = hj + 2
   }
   elabRecTable.push(rec)
   const at = elabRecTable.length - 1
@@ -7513,6 +7585,8 @@ function elabCopyRecordsNote() {
         const cs = elabResCopies.get(dn.fnParams[i]) ?? []
         const taken = cs.length > 0
           && (elabRecParams.get(elabBundleKey(k, i)) ?? false)
+          && !(elabCopyNoted.get(elabBundleKey(k, i)) ?? false)
+        if taken { elabCopyNoted[elabBundleKey(k, i)] = true }
         const rec = if taken { elabBundleSigs.get(elabBundleKey(k, i)) ?? [] } else { [] }
         if rec.length >= 2 {
           for d in cs {
@@ -7525,6 +7599,48 @@ function elabCopyRecordsNote() {
       }
     }
     k = k + 1
+  }
+  0
+}
+
+// Each parameter taking a record whole hands it on whole to a parameter its callee instance
+// calls at the record's signatures, which then takes it whole too; to a fixpoint along chains.
+function elabParamHandsNote() {
+  let changed = true
+  let guard = 0
+  while changed && guard < 16 {
+    changed = false
+    guard = guard + 1
+    let k = 0
+    while k < ekDecl.length {
+      const dn = nodeAt(ekDecl[k])
+      if dn is FuncDecl {
+        let i = 0
+        while i < dn.fnParams.length && i < 64 {
+          const key = elabBundleKey(k, i)
+          const rec = if elabRecParams.get(key) ?? false { elabBundleSigs.get(key) ?? [] } else { [] }
+          const hands = if rec.length >= 2 { elabParamHands.get(dn.fnParams[i]) ?? [] } else { [] }
+          let j = 0
+          while j + 1 < hands.length {
+            const ko = elabCallInstFrom(hands[j], k)
+            const fresh = ko >= 0
+              && hands[j + 1] < 64
+              && !(elabRecParams.get(elabBundleKey(ko, hands[j + 1]))
+              ?? false)
+            if (
+              fresh
+              && elabEnclosingFn(hands[j]) == ekDecl[k]
+              && elabHandTakesRecord(hands[j], hands[j + 1], k, rec)
+            ) {
+              changed = true
+            }
+            j = j + 2
+          }
+          i = i + 1
+        }
+      }
+      k = k + 1
+    }
   }
   0
 }
@@ -7705,6 +7821,13 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
   // it delivers the record as the holder's own does.
   for w in copies {
     elabTriplePut(elabHolderRecs, w, from, at)
+    for t in elabResTypedReads.get(w) ?? [] {
+      const tn = nodeAt(t)
+      if tn is LetDecl {
+        const tm = elabRecIndexOf(rec, nodeTyIxOf(tn.letType))
+        elabTriplePut(elabTypedReadMembers, t, from, tm)
+      }
+    }
     for t in elabResThrough.get(w) ?? [] {
       elabTriplePut(elabThroughMembers, t, from, elabCallSigMember(t, rec))
     }
@@ -7796,19 +7919,23 @@ function elabHolderCopiesHold(
   from: i32,
 ): boolean {
   const fd = elabEnclosingFn(h)
-  // A module-scope `const` is one record whichever function reads it.
+  // A module-scope `const`, or a `let` nothing writes, is one record whichever function reads it.
   const hn = nodeAt(h)
-  const global = fd == -1 && hn is LetDecl && hn.letKw == "const"
+  const global = fd == -1
+    && hn is LetDecl
+    && (hn.letKw == "const" || !cwDeclAssigned(h))
   for w in copies {
     const wf = elabEnclosingFn(w)
     const through = elabResThrough.get(w) ?? []
     const hands = elabResHands.get(w) ?? []
     const wr = elabResRets.get(w) ?? []
     const wc = (elabResCopies.get(w) ?? []).length
+    const wt = elabResTypedReads.get(w) ?? []
     if (
       !global && !elabLambdaWithin(wf, fd)
-      || through.length + hands.length / 2 + wr.length + wc
+      || through.length + hands.length / 2 + wr.length + wc + wt.length
         != (elabResReads.get(w) ?? 0)
+      || !elabTypedReadsHold(w, wt, rec)
     ) {
       return false
     }
@@ -7832,12 +7959,20 @@ function elabHolderCopiesHold(
 }
 
 // Whether each annotated binding in `typed`, initialised with holder `h`'s read, names one
-// member of record `rec` and sits in `h`'s function or a lambda nested in it.
+// member of record `rec` and sits in `h`'s function or a lambda nested in it; a module-scope
+// holder that is a `const`, or a `let` nothing writes, may be read anywhere.
 function elabTypedReadsHold(h: i32, typed: i32[], rec: i32[]): boolean {
   const fd = elabEnclosingFn(h)
+  const hn = nodeAt(h)
+  const global = fd == -1
+    && hn is LetDecl
+    && (hn.letKw == "const" || !cwDeclAssigned(h))
   for t in typed {
     const tn = nodeAt(t)
-    if !(tn is LetDecl) || !elabLambdaWithin(elabEnclosingFn(t), fd) {
+    if (
+      !(tn is LetDecl)
+      || !global && !elabLambdaWithin(elabEnclosingFn(t), fd)
+    ) {
       return false
     }
     if elabRecIndexOf(rec, nodeTyIxOf(tn.letType)) < 0 { return false }
@@ -7914,9 +8049,9 @@ function elabHolderLinkedHolds(
 ): boolean {
   const through = elabResThrough.get(g) ?? []
   const copies = elabResCopies.get(g) ?? []
+  const hands = elabResHands.get(g) ?? []
   if (
     elabEnclosingFn(g) != fd
-    || (elabResHands.get(g) ?? []).length > 0
     || (elabResRets.get(g) ?? []).length > 0
     || !elabResCallHolder(g)
     || !elabHolderWritesAgree(g, from, rec)
@@ -7929,12 +8064,20 @@ function elabHolderLinkedHolds(
     return false
   }
   const reads = through.length
+    + hands.length / 2
     + elabResWriteReads(g)
     + copies.length
     + elabResLinkReads(g)
   if reads != (elabResReads.get(g) ?? 0) { return false }
-  for w in copies {
-    if (elabResHands.get(w) ?? []).length > 0 { return false }
+  // Each hand goes to a parameter its instance calls at the record's signatures or at one.
+  let j = 0
+  while j + 1 < hands.length {
+    if elabEnclosingFn(hands[j]) != fd { return false }
+    const whole = elabHandTakesRecord(hands[j], hands[j + 1], from, rec)
+    if !whole && elabHandMemberOf(hands[j], hands[j + 1], from, rec) < 0 {
+      return false
+    }
+    j = j + 2
   }
   if copies.length > 0 && !elabHolderCopiesHold(g, copies, rec, from) {
     return false
@@ -8032,6 +8175,13 @@ function elabRecMemberAt(rec: i32[], t: i32): i32 {
     j = j + 1
   }
   -1
+}
+
+// `elabHandTakesRecord`'s test alone, noting nothing.
+function elabHandCanTakeRecord(x: i32, i: i32, from: i32, rec: i32[]): boolean {
+  const ko = elabCallInstFrom(x, from)
+  if ko < 0 || i < 0 || i >= 64 { return false }
+  elabSigsPermute(elabBundleSigs.get(elabBundleKey(ko, i)) ?? [], rec)
 }
 
 // Whether call `x` from instance `from` takes record `rec` whole at argument `i`: the callee
@@ -8698,6 +8848,21 @@ function elabJoinDemandsEnqueue() {
 
 // The parameter key of declaration `d` as instance `k` reads it: `k`'s own parameter, else that
 // of the enclosing instance whose function declares it; -1 where `d` is no such parameter.
+// The parameter declaration `d` reads through un-annotated `const` copies, or `d` itself.
+function elabParamCopyRoot(d: i32): i32 {
+  let x = d
+  let guard = 0
+  while x >= 0 && x < P.nodes.length && guard < 8 {
+    const n = nodeAt(x)
+    if !(n is LetDecl) || n.letKw != "const" || n.letType >= 0 { return x }
+    const v = parenPeelIx(n.letInit)
+    if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return x }
+    x = identDeclOf(v)
+    guard = guard + 1
+  }
+  if x >= 0 && x < P.nodes.length && nodeAt(x) is Param { x } else { d }
+}
+
 function elabParamOwnerKey(d: i32, k: i32): i32 {
   let a = k
   let guard = 0
