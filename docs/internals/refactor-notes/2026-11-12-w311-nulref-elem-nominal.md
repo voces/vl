@@ -4,7 +4,7 @@
 record had its declared name, and a registered box had its nominal union name. Anything else was
 `tyToEmitName`, the structural render. It now ends on `tyToNominalName`. That is the last
 `tyToEmitName` call in `emit_shape_rows.vl`, so the render-parse baseline's ty-render total
-falls from 22 to 21.
+falls by one (21 to 20 on master `a33a4dde`).
 
 ## Measurement
 
