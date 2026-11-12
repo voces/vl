@@ -46,6 +46,14 @@ The 86 bytes-only movers are twin declarations now stored at their arm's row: 13
 distilled cells and 4 inventory witnesses (D351, D48, D627, D93). Every one prints what it printed
 before.
 
+## The row dump
+
+`tests/vl_row_classes_test.ts`' D15107 no-union control asserts that `C` and `D` build at one
+row. It read `D`'s row out of `rowDumpBuild`'s `type` lines, which asked `variantIndexOf` of the
+name. With `D` now stored at the arm `C`'s row, its name has no variant row, and the dump said -1.
+The contract the test states still holds, so the dump's `variant` column now falls back to
+`exactArmRowOfTy` of the declared type.
+
 ## Proof
 
 - Refresh ×2 is a fixpoint at 6,716,409 bytes, against master's 6,716,345.
