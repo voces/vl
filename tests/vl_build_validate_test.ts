@@ -23,22 +23,12 @@
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
 // to disassemble. The exit code, not the artifact's absence, is the signal.
 //
-// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (D2660 — a generic `T` bound from a list
-// and from a `let x = null` hole that a later write fills builds an invalid module). If that hole is closed the fixture stops
-// producing an invalid module and this pin would silently go inert — so the first
-// assertions check the PRECONDITION and fail loudly with a swap instruction rather than
-// passing vacuously. Swap in any other source that emits an invalid module; the whole
-// corpus had none (1,411 files swept, 0 divergences), which is why the fixture must be
-// constructed.
-//
-// THE PRECONDITION IS TWO ASSERTIONS, NOT ONE, AND THE SECOND WAS ADDED THE FOURTH TIME
-// THIS FIXTURE ROTATED. `vl run` failing is not evidence the MODULE is invalid — it is
-// also how a CHECKER reject looks. When the container-element storage-class rule landed
-// and started rejecting the old `i32[]`-into-`f64[]` fixture at check time, `vl run`
-// still exited 1, the precondition still passed, and the pin failed three assertions
-// later with "the failure must name the artifact as invalid, got: Error: type error" —
-// true, but it buries the actual news. So `vl check` exiting 0 is now asserted first: a
-// fixture the CHECKER rejects is a closed hole, and it says so in those words.
+// THE FIXTURE IS FAULT-INJECTED. `INVALID_SRC` is a valid program, and
+// `$VL_FAULT_INJECT=corrupt-validate-bytes` corrupts its first function body between emission
+// and validation, so the engine's real validator refuses real emitted bytes. Live miscompiles
+// served until the last check-clean invalid program in reach was refused at check (D2660), which
+// is the goal; tests/vl_check_codegen_test.ts gives the rest of the argument. The precondition
+// assertions below still check that the injected module fails at the ENGINE and not the CHECKER.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary + seed.
 //
@@ -52,44 +42,34 @@ if (GATED && !ENABLED) {
   console.warn("[vl-build-validate] skipped — missing vl binary or seed wasm.");
 }
 
-// Type-checks clean, emits invalid wasm: D2660's witness, invalid inside `main`. Closing D2660 is
-// a change the precondition assertions below catch.
-//
-// It REPLACES D14891's record built from a wider value union (refused since the call delivery
-// judges a literal its destination merges numbers in by its type), which REPLACED D2225's reassigned `[]`-or-`null` binding (closed by the assignment pinning the
-// list's element), which REPLACED D14960's spread of a wider record list into a narrower rest parameter (closed by
-// building the rest list at the parameter's type), which REPLACED D13960's `name: string` face of the same spread, refused since the width-drop check
-// judges a spread's elements, which REPLACED D3689's `d is 1` over `d: f64`, which became a loud emit refusal pending its ruling
-// (D14642), which itself REPLACED D1400's annotated-binding cell, which the checker refuses since `as?` over a hole
-// is typed `N | null` before any pin (D3654). Before that: the member-variance fixture (refused
-// since the record-covariance ruling), the narrowed-litunion-arm fixture, a `.map` callback
-// PARAMETER spelled as the inline member union, and an unread global binding of a generic
-// function's nullable-closure return. The precondition assertion caught all five.
+// A valid program that type-checks clean; under `FAULT` its first body is corrupted, so the module
+// it writes is invalid. Before the fault, the witness was a live miscompile, most recently D2660's,
+// and before it D14891's, D2225's, D14960's, D13960's, D3689's and D1400's.
 const INVALID_SRC = [
-  "function link2<T>(xs: T[], v: T) { xs.push(v) }",
+  "const n = 6",
   "function main() {",
-  "  const xs: (string | null)[] = []",
-  "  let x = null",
-  "  link2(xs, x)",
-  "  x = 5",
-  "  xs.push(\"s\")",
-  "  print(xs.length)",
+  "  print(n * 7)",
   "}",
   "main()",
   "",
 ].join("\n");
+const FAULT = { VL_FAULT_INJECT: "corrupt-validate-bytes" };
 
 // The over-rejection control: an ordinary valid program must still build clean.
 const VALID_SRC = `print(6 * 7)\n`;
 
 type Res = { code: number; out: string; err: string };
 
-const vl = async (args: string[]): Promise<Res> => {
+const vl = async (
+  args: string[],
+  env: Record<string, string> = {},
+): Promise<Res> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: [...args, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv({ NO_COLOR: "1" }),
+    // `VL_FAULT_INJECT: ""` is pinned so a stray export cannot corrupt an uninjected run.
+    env: nativeEnv({ NO_COLOR: "1", VL_FAULT_INJECT: "", ...env }),
   }).output();
   return {
     code,
@@ -121,29 +101,27 @@ Deno.test({
     await withCase(INVALID_SRC, async (srcPath, outPath) => {
       // PRECONDITION — the fixture must still emit an invalid module, else this
       // pin is inert. `vl run` is the independent witness (it has always rejected).
-      const ran = await vl(["run", srcPath]);
+      const ran = await vl(["run", srcPath], FAULT);
       if (ran.code === 0) {
         throw new Error(
-          "the fixture no longer emits an invalid module (vl run exited 0) — the underlying " +
-            "emitter bug was fixed. Swap INVALID_SRC for another source that emits invalid wasm; " +
-            "do NOT delete this pin.",
+          "the injected fixture no longer emits an invalid module (vl run exited 0) — the " +
+            "fault no longer reaches the validator; do NOT delete this pin.",
         );
       }
       // ...and it must fail at the ENGINE, not at the CHECKER. `vl run` exits 1 for both,
       // so without this the pin reports a confusing downstream assertion instead of the
       // news. A checker reject means the hole closed — same swap instruction, said plainly.
-      const checked = await vl(["check", srcPath]);
+      const checked = await vl(["check", srcPath], FAULT);
       if (checked.code !== 0) {
         throw new Error(
           "the fixture is now REJECTED BY THE CHECKER (vl check exited " + checked.code +
-            ") — the hole it rides is closed, so it no longer reaches the emitter at all. " +
-            "Swap INVALID_SRC for another source that type-checks clean and emits invalid " +
-            "wasm; do NOT delete this pin.\n  vl check said: " +
+            "), so it no longer reaches the emitter at all; INVALID_SRC must type-check " +
+            "clean. Do NOT delete this pin.\n  vl check said: " +
             checked.err.trim().split("\n").slice(0, 2).join(" | "),
         );
       }
 
-      const built = await vl(["build", srcPath, "-o", outPath]);
+      const built = await vl(["build", srcPath, "-o", outPath], FAULT);
       if (built.code === 0) {
         throw new Error(
           `vl build blessed a module vl run rejects: build rc 0, run rc ${ran.code}.\n` +
@@ -161,9 +139,8 @@ Deno.test({
         );
       }
       // …and it must say WHERE (D1578): the owning function, and the position of its
-      // declaration. `b` is the binding whose store is refused, inside the synthesized
-      // start function, so only the sentence is asserted here — the per-function
-      // positions are pinned in tests/vl_invalid_module_position_test.ts.
+      // declaration. Only the sentence is asserted here — the per-function positions are
+      // pinned in tests/vl_invalid_module_position_test.ts.
       if (!/this is a bug in vl, not in your program/.test(built.err)) {
         throw new Error(
           `the failure must say the program is not at fault, got:\n${built.err}`,
@@ -182,7 +159,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withCase(INVALID_SRC, async (srcPath, outPath) => {
-      const r = await vl(["build", srcPath, "-o", outPath, "--no-validate"]);
+      const r = await vl(["build", srcPath, "-o", outPath, "--no-validate"], FAULT);
       if (r.code !== 0) {
         throw new Error(`--no-validate must restore the old path, got rc ${r.code}:\n${r.err}`);
       }

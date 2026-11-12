@@ -3,6 +3,7 @@
 // folding at a destination (`cex*`), object-shape adapters and the inferred-return joins.
 // Each answers a type or a verdict for a node the core checker has already typed.
 
+import { noteNullHoleDelivery } from "./check_null_holes"
 import { cwIxCovers } from "./check_write_scan"
 import { recDropFits } from "./check_rec_drop"
 import { MemoGen, memoGenNew } from "./memo"
@@ -630,6 +631,7 @@ export function constrainEmptyExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     recordRepTyAdopt(srcExpr, dstTy, 6)
   }
   if inferQuiet || srcExpr < 0 { return constrainEmpty(srcTy, dstTy) }
+  noteNullHoleDelivery(srcTy, dstTy, srcExpr)
   holeLinkSiteSet(srcExpr, srcTy, dstTy)
   constrainEmpty(srcTy, dstTy)
   holeLinkSiteSet(-1, -1, -1)
@@ -5686,6 +5688,47 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   true
 }
 
+// Whether call `c` is an element of a list literal beside a part built at its own row of `own`'s
+// storage: a record literal, or a spread of a list literal binding built there.
+function recElemBesideOwn(c: i32, own: i32): boolean {
+  cwIxBuild()
+  if c < 0 || !cwIxCovers(c) || cwIxUpKind[c] != CW_UP_ELEM { return false }
+  const l = cwIxUp[c]
+  const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+  if !(ln is ArrayLit) { return false }
+  for e in ln.arrElems {
+    const pe = parenPeelIx(e)
+    const pn = if pe >= 0 && pe < P.nodes.length { nodeAt(pe) } else { null }
+    if (
+      pe != c
+      && pn is ObjLit
+      && fieldStorageEq(recLitBuiltTy(pe), own, REC_STORE_DEPTH)
+    ) {
+      return true
+    }
+    const sv = if pn is Spread { cwPeelValue(pn.spdArg) } else { -1 }
+    const d = if sv >= 0 && nodeAt(sv) is Ident { recFreshDeclOf(sv) } else { -1 }
+    const iv = if d >= 0 { parenPeelIx(recDeclInit(d)) } else { -1 }
+    if iv >= 0 && nodeAt(iv) is ArrayLit {
+      const et = tyArrayElemIx(recLitBuiltTy(iv))
+      if et >= 0 && fieldStorageEq(et, own, REC_STORE_DEPTH) { return true }
+    }
+    // A binding annotated as a list stores its elements at the annotation's element.
+    const bd = if sv >= 0 && d < 0 && nodeAt(sv) is Ident { recBindDeclOf(sv) } else { -1 }
+    const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
+    if bn is LetDecl && bn.letType >= 0 {
+      const at = tyArrayElemIx(nonNulTyOf(nodeTyIxOf(bn.letType)))
+      if at >= 0 && fieldStorageEq(at, own, REC_STORE_DEPTH) { return true }
+    }
+  }
+  false
+}
+
+// The record literal `l` is built at: its rep stamp, else its own type.
+function recLitBuiltTy(l: i32): i32 {
+  if nodeRepStamped(l) { nodeRepTyIxOf(l) } else { nodeTyIxOf(l) }
+}
+
 // Whether call `c` is a value an inferred function hands back beside a record literal built at
 // its own row of `own`'s storage: the function's result is that row, so `c` lands there.
 function recRetBesideOwnLit(c: i32, own: i32): boolean {
@@ -5702,11 +5745,44 @@ function recRetBesideOwnLit(c: i32, own: i32): boolean {
       l >= 0
       && l != c
       && nodeAt(l) is ObjLit
-      && !nodeRepStamped(l)
-      && fieldStorageEq(nodeTyIxOf(l), own, REC_STORE_DEPTH)
+      && fieldStorageEq(recLitBuiltTy(l), own, REC_STORE_DEPTH)
     ) {
       return true
     }
+  }
+  false
+}
+
+// Whether call `c` is a tail of a value `if`, `match` or block, a few joins up, whose other
+// tails include a record literal built at its own row of `own`'s storage: the join is that row.
+function recJoinBesideOwnLit(c: i32, own: i32): boolean {
+  cwIxBuild()
+  let x = c
+  let hops = 0
+  while hops < 6 && x >= 0 && cwIxCovers(x) {
+    x = cwIxUp[x]
+    if x < 0 || x >= P.nodes.length { return false }
+    if recIsJoin(x) {
+      const leaves: i32[] = []
+      tailValueLeaves(x, leaves)
+      let has = false
+      for lf in leaves {
+        if cwPeelValue(lf) == c { has = true }
+      }
+      if !has { return false }
+      for lf in leaves {
+        const l = cwPeelValue(lf)
+        if (
+          l >= 0
+          && l != c
+          && nodeAt(l) is ObjLit
+          && fieldStorageEq(recLitBuiltTy(l), own, REC_STORE_DEPTH)
+        ) {
+          return true
+        }
+      }
+    }
+    hops = hops + 1
   }
   false
 }
@@ -5736,7 +5812,13 @@ function recSitesLandOff(sites: i32[], own: i32, dst: i32): boolean {
   for s in sites {
     if s % 2 != 0 { return true }
     const c = s / 2
-    if recRetBesideOwnLit(c, own) { return true }
+    if (
+      recRetBesideOwnLit(c, own)
+      || recJoinBesideOwnLit(c, own)
+      || recElemBesideOwn(c, own)
+    ) {
+      return true
+    }
     let i = 0
     while i < recPendSrc.length && i < recPendDstTy.length {
       if !recPendInert(i) {
