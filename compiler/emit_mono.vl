@@ -101,6 +101,7 @@ import {
   nodeTyFrozenOf,
   nodeTyInstEnter,
   nodeTyInstFrameNote,
+  nodeTyIsClosureArray,
   nodeTyIsFunc,
   nodeTyIsNulFunc,
   nodeTyIsNullType,
@@ -114,6 +115,7 @@ import {
   nodeTyNestedElemIsBoolPrim,
   nodeTyRecord,
   nodeTyRecordIn,
+  tyIsClosureArray,
   tyIsUnionish,
 } from "./check_node_tys"
 import { nodePos, trimWs } from "./fmt_util"
@@ -411,6 +413,7 @@ import {
   gaeParamShadowed,
   moduleLocalLetOfUnique,
   monoAnnHasTyParam,
+  monoAnnOpenTyOf,
   monoBindOf,
   monoDeclAnnName,
   monoIsCopyNote,
@@ -421,7 +424,6 @@ import {
   monoTyMentionsTyParam,
   monoTyParamOf,
   nameIsBareMap,
-  nameIsClosureArray,
   nameIsShapeSpanEnds,
   nodeIsTypeDecl,
   normTypeAtom,
@@ -442,7 +444,7 @@ import {
   monoPinOwnClose,
   monoPinOwnTvAtRep,
   monoPinRespell,
-  monoPinSpellFields,
+  monoPinSpellNoAnon,
   monoPinSpellNote,
   monoPinSpellOf,
   monoPinSpellShaped,
@@ -649,13 +651,7 @@ import {
   fnTagListRepName,
   structRowOfRecordTy,
 } from "./emit_shape_rows"
-import {
-  PIN_DECLINE,
-  nodeMapArmNominalName,
-  nominalizeFnTypeOfTy,
-  pinSigOf,
-  sigKeyOfTy,
-} from "./emit_sig_tokens"
+import { PIN_DECLINE, pinSigOf, sigKeyOfTy } from "./emit_sig_tokens"
 import { sFieldIndex } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
@@ -924,7 +920,7 @@ function monoFnNameIsSourceNamed(nm: string) {
 // The function-type name of argument `argIx`, preferring the checker's recorded type:
 // for an un-annotated lambda argument it inferred the param types from the generic
 // param's substituted expected type, which the syntactic build below cannot recover.
-// The gate is the arena (`nodeTyIsFunc`), and the struct part is nominalized once here.
+// The gate is the arena (`nodeTyIsFunc`); a closed type is spelled by the naming rule.
 function monoArgFnTypeName(argIx: i32, fnIx: i32) {
   const ax = unwrapParen(argIx)
   if ax < 0 { return "" }
@@ -932,15 +928,15 @@ function monoArgFnTypeName(argIx: i32, fnIx: i32) {
 
   if nodeTyIsFunc(ax) {
     const cn = nodeTyName(ax)
-    if cn != "" { return nominalizeFnTypeOfTy(nodeTyIxOf(ax)) }
+    if cn != "" { return monoPinSpellShaped(nodeTyIxOf(ax)) }
     // A type riding the instance's parameters names nothing until substituted (D4647).
     const pt = monoNodeTyAt(ax, fnIx)
-    if pt >= 0 && !tyHasTyVar(pt) { return nominalizeFnTypeOfTy(pt) }
+    if pt >= 0 && !tyHasTyVar(pt) { return monoPinSpellShaped(pt) }
   }
   // A hole parameter handed on reads the function type its instance pinned it at (D10132).
   if an is Ident && tyHasTyVar(nodeTyIxOf(ax)) {
     const ht = monoNodeTyAt(ax, fnIx)
-    if monoTyClosedFn(ht) { return nominalizeFnTypeOfTy(ht) }
+    if monoTyClosedFn(ht) { return monoPinSpellShaped(ht) }
   }
   let fe = -1
   if an is FuncDecl { fe = fnStmtsPosOf(ax) }
@@ -1481,40 +1477,6 @@ function monoAnonListPinName(lt: i32): string {
   monoAnnPinNameOfTy(lt)
 }
 
-// Composite annotation `ann` substituted with each `#anonN` binding spelled by its row's shape,
-// where the binding's type is stored at that row, else `pinC`. A handle inside a record spelling
-// resolves to nothing, and the field-set scan then claims a declared record (D3144).
-function monoSubstAnonShapes(
-  ann: string,
-  typarams: string[],
-  tvN: string[],
-  tvV: string[],
-  pinC: string,
-): string {
-  const vs: string[] = []
-  let changed = false
-  let i = 0
-  while i < tvV.length {
-    let v = tvV[i]
-    if v.length >= 5 && v.slice(0, 5) == "#anon" {
-      const rt = anonHandleTyIx(v, -1)
-      if rt >= 0 && !tyHasTyVar(rt) {
-        const sp = monoPinSpellFields(rt)
-        if (sp != "" && structRowOfRecordTy(rt) == structIndexByName(v)) {
-          v = sp
-          changed = true
-        }
-      }
-    }
-    vs.push(v)
-    i = i + 1
-  }
-  if !changed { return pinC }
-  const sub = monoSubstAnn(ann, typarams, tvN, vs)
-  if sub == "" { return pinC }
-  sub
-}
-
 // Whether the spelled shape of record argument `argIx`, typed `ty`, loses a literal: a literal
 // anywhere in the type, or in a field of the literal it is, whose own type may have widened one.
 function monoAnonArgSoftens(argIx: i32, ty: i32): boolean {
@@ -1756,7 +1718,7 @@ function monoClosedTyName(ty: i32): string {
       if si < 0 || si >= sNames.length || sNames[si].slice(0, 1) == "#" {
         return ""
       }
-      return monoAnnPinName(sNames[si], -1)
+      return monoAnnPinName(sNames[si], ty)
     }
     TyUnion | TyNullable => {
       // A union of non-literal members is its flattened members in order, which its render
@@ -1766,12 +1728,12 @@ function monoClosedTyName(ty: i32): string {
       }
       const ur = unRowOfTyKey(ty)
       if ur >= 0 && ur < unNames.length {
-        const un = monoAnnPinName(unNames[ur], -1)
+        const un = monoAnnPinName(unNames[ur], ty)
         if un != "" { return un }
       }
       if t is TyNullable {
         const inm = monoClosedTyName(t.nInner)
-        if inm != "" { return monoAnnPinName(inm + "|null", -1) }
+        if inm != "" { return monoAnnPinName(inm + "|null", ty) }
       }
       return ""
     }
@@ -1779,9 +1741,9 @@ function monoClosedTyName(ty: i32): string {
       const en = monoClosedTyName(t.aElem)
       if en == "" { return "" }
       if strContains(en, "|") && !tyIsArray(t.aElem) {
-        return monoAnnPinName("(" + en + ")[]", -1)
+        return monoAnnPinName("(" + en + ")[]", ty)
       }
-      return monoAnnPinName(en + "[]", -1)
+      return monoAnnPinName(en + "[]", ty)
     }
     // A scalar, function, map or open type has no declared name to keep.
     TyPrim | TyErr | TyFunc | TyMap | TyVar | TyLit | TyNeg => {}
@@ -1828,10 +1790,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32, tyOut: i32[]): string {
   }
   // A map or Set argument pins its param as that map — the whole `{[K]:V}` spelling an
   // annotated parameter carries. Before the collection arms, since `exprArray`'s catch-all
-  // would otherwise name a map an array; and its arm-nominal form first, since
-  // `tyToEmitName` spells a declared union arm structurally and the two mint two (D88).
-  const mnArm = nodeMapArmNominalName(unwrapParen(ix), fnIx)
-  if mnArm != "" { return mnArm }
+  // would otherwise name a map an array.
   const hm = monoHoleMapPinName(nodeTyIxOf(unwrapParen(ix)))
   if hm != "" {
     tyOut[0] = elabHoleMapClosed(nodeTyIxOf(unwrapParen(ix)))
@@ -2622,8 +2581,6 @@ function monoSubstLetType(
   letIx: i32,
   letType: i32,
   typarams: string[],
-  tvN: string[],
-  tvV: string[],
   bN: string[],
   bT: i32[],
 ) {
@@ -2636,24 +2593,21 @@ function monoSubstLetType(
   const tn = nodeAt(letType)
   if tn is TypeRef {
     if monoAnnMentionsTyParam(letType, typarams) {
-      // An anonymous-record binding is spelled by its shape: its `#anonN` handle inside a union
-      // names no type the registry can key (D12641).
-      let sub = monoSubstAnn(tn.tyName, typarams, tvN, tvV)
-      if sub != "" {
-        sub = monoSubstAnonShapes(tn.tyName, typarams, tvN, tvV, sub)
-      }
-      if sub != "" && sub != tn.tyName {
-        // The substituted type, not a re-parse of the substituted name; the name handed
-        // to the synthesis is unchanged. Gated on completeness, since `substTyDeep`
-        // leaves a parameter it could not bind in place and `tyHasTyVar` sees that.
-        let sty = -1
-        const origLet = nodeTyIxOf(letType)
-        if origLet >= 0 {
-          const s2 = monoSubstInst(origLet, bN, bT)
-          if s2 >= 0 && s2 != origLet {
-            if !tyHasTyVar(s2) { sty = s2 }
-          }
+      // The let's type substituted at the instance, spelled by the naming rule with an anonymous
+      // record by its fields: its `#anonN` handle inside a union names no type the registry can
+      // key (D12641). A binding that stays open keeps its annotation.
+      let sty = -1
+      // A loop value's carrier keeps its open type beside its annotation (`monoAnnOpenTyNote`).
+      const ot = nodeTyIxOf(letType)
+      const origLet = if ot >= 0 { ot } else { monoAnnOpenTyOf(letType) }
+      if origLet >= 0 {
+        const s2 = monoSubstInst(origLet, bN, bT)
+        if s2 >= 0 && s2 != origLet {
+          if !tyHasTyVar(s2) { sty = s2 }
         }
+      }
+      const sub = if sty >= 0 { monoPinSpellNoAnon(sty) } else { "" }
+      if sub != "" && sub != tn.tyName {
         const subC = monoPinMintedUnion(sub, sty, sty, unTyKeyTagLet())
         // A union takes the type its registered spelling names, the one an assignment's
         // `letUnionNameOf` resolves against the registry, not the substitution's own row (D2676).
@@ -3373,7 +3327,7 @@ function monoCloneBodyRaw(
       return mkBlock(ns, n.pos)
     }
     LetDecl => {
-      return monoCloneLetDecl(n, ix, typarams, tvN, tvV, bN, bT)
+      return monoCloneLetDecl(n, ix, typarams, bN, bT)
     }
     WhileStmt => {
       const cb = monoCloneBody(n.whileBody, typarams, tvN, tvV, bN, bT)
@@ -3457,15 +3411,13 @@ function monoCloneLetDecl(
   n: LetDecl,
   ix: i32,
   typarams: string[],
-  tvN: string[],
-  tvV: string[],
   bN: string[],
   bT: i32[],
 ): i32 {
   const nt = monoMintedLetAnn(
     n,
     ix,
-    monoSubstLetType(ix, n.letType, typarams, tvN, tvV, bN, bT),
+    monoSubstLetType(ix, n.letType, typarams, bN, bT),
   )
   if nt == n.letType { return ix }
   const ninit = monoCtorInitCopy(n.letInit, nt)
@@ -4189,7 +4141,7 @@ function monoPinBodyLambdasRaw(
     const nt = monoMintedLetAnn(
       n,
       ix,
-      monoSubstLetType(ix, n.letType, typarams, tvN, tvV, bN, bT),
+      monoSubstLetType(ix, n.letType, typarams, bN, bT),
     )
     if ci == n.letInit && nt == n.letType { return ix }
     return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ci, n.pos))
@@ -17098,16 +17050,19 @@ function monoCoerceAtValueParams(n: Call, dfe: i32, ctx: i32): i32 {
   }
   const f = tyAt(ct)
   if !(f is TyFunc) { return 0 }
-  const parts: string[] = []
-  const ann = tyNameOf(monoCalleeAnnNode(n.callFn, ctx))
+  const an = monoCalleeAnnNode(n.callFn, ctx)
   // An un-annotated callee (a list element, a field, a loop variable) spells its recorded type.
-  const own = ann == "" || fromElab
-  if !own && !monoFnTypeAnnParamsName(ann, parts) { return 0 }
+  const own = tyNameOf(an) == "" || fromElab
+  // An annotated callee's arity is its annotation's, which is a function type and not its nullable.
+  const at = nodeTyIxOf(an)
+  const af = if at >= 0 && at < T.tys.length { tyAt(at) } else { tyAt(0) }
+  const nparts = if af is TyFunc { af.fnParamTypes.length } else { -1 }
+  if !own && nparts < 0 { return 0 }
   let i = 0
   while (
     i < n.callArgs.length
     && i < f.fnParamTypes.length
-    && (own || i < parts.length)
+    && (own || i < nparts)
   ) {
     const pt = f.fnParamTypes[i]
     if (
@@ -18015,7 +17970,6 @@ function monoCallGenFnToTyParamArrow(
     const p = nodeAt(params[i])
     if p is Param {
       if p.parType >= 0 {
-        const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
         if (
           monoAnnIsFnSlot(p.parType)
           && monoAnnHasTyParam(p.parType, -1, typarams)
@@ -18037,7 +17991,7 @@ function monoCallGenFnToTyParamArrow(
         }
         // A list of functions riding the type parameters, handed a literal of generics (D3913).
         if (
-          nameIsClosureArray(ann)
+          nodeTyIsClosureArray(p.parType)
           && monoAnnHasTyParam(p.parType, -1, typarams)
         ) {
           if monoLitHoldsGenericFn(args[i], 0) { return true }
@@ -21303,7 +21257,7 @@ function monoPinTyParamComposite(
   // The coercion `monoWalk` deferred, since at that point the pin names
   // would be the type variables themselves. `pinC` is the substituted
   // spelling, the concrete function type that parameter takes.
-  if annFnSlot || nameIsClosureArray(pinC) {
+  if annFnSlot || (pinC == pinPlain && tyIsClosureArray(po)) {
     const delTys = monoSlotParamTysAt(patTy, own, tvN, tvT)
     // The parameter's type substituted, which `pinC` spells unless a rest or row pin replaced it.
     const pinCTy = if pinC == pinPlain { substTyDeepOf(patTy, tvN, tvT, own) } else { -1 }
@@ -23093,8 +23047,7 @@ function monoNoteRetDeliveriesAt(
   ann: string,
   annTy: i32,
 ) {
-  const parts: string[] = []
-  if annFnDecompose(ann, parts) == "" { return 0 }
+  if annTy < 0 || annTy >= T.tys.length || !(tyAt(annTy) is TyFunc) { return 0 }
   for r in monoFnRetArgs(fn) {
     if monoNoteBindDeliveryCall(r, ann, fnIx, -1, annTy) < 0 { return -1 }
   }
@@ -25389,16 +25342,18 @@ function monoCloCoerceBuild(): i32 {
           fes.push(gfe)
           continue
         }
-        const tname = monoConcreteFnTyName(t)
         const pnames: string[] = []
         if (
           gfe < 0
           || gfe >= monoGen.length
           || monoGen[gfe] != 1
-          || tname == ""
-          || !monoFnTypeAnnParamsName(peelGroupParens(tname), pnames)
+          || monoConcreteFnTyName(t) == ""
         ) {
           return emitFailAt(fail, ix)
+        }
+        const tf = tyAt(t)
+        if tf is TyFunc {
+          for p in tf.fnParamTypes { pnames.push(monoPinSpellShaped(p)) }
         }
         // A fresh read stands for the member, so the pins are the destination's.
         const rd = mkIdent(monoSlotName(gfe), nodePos(ix))

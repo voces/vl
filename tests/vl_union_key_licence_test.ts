@@ -1,14 +1,14 @@
-// THE UNION KEY'S LICENCE: two rows minted under one `unKey` describe one union.
+// THE UNION KEY'S LICENCE: two rows under one type key (`unTyKey`) describe one union.
 //
-// Step 5 of the registry-by-key migration (docs/internals/registry-by-type-id.md §5) lets a
-// seam return "the first row carrying this key" in place of the row its name finds. That is
-// sound only while every pair of rows sharing a key agrees on BOTH halves of what a tag
-// means: the member-set string (`keySweep/merge-diffset`, a value union's atoms) and the
-// variant slice (`keySweep/merge-diffvar`, a struct union's positional tags — D1492 was the
-// last pair to disagree). The sweep runs under `$VL_REP_SHADOW`, and only a program whose
-// rows share a key (`keySweep/merge`) can reach either half, so the witness list is every
-// `tests/cases` program that did, plus D1492's own. `VL_UNION_LICENCE_FULL=1` sweeps all
-// of `tests/cases` instead.
+// A typed lookup returns "the first row carrying this type key", which is sound only while
+// every pair of rows sharing a key agrees on BOTH halves of what a tag means: the member-set
+// string (`keySweep/merge-diffset`, a value union's atoms) and the variant slice
+// (`keySweep/merge-diffvar`, a struct union's positional tags). Two rows under one type key
+// that differ is the D1712 hazard: one union is one set, so one row. The sweep runs under
+// `$VL_REP_SHADOW`; `keySweep/pair-keyed` counts the pairs of keyed rows it compares, so the
+// control shows the compare is reached. D15761's record twins were the last differing pair: a
+// twin alias now adopts its set's row, and a build with that adoption reverted reads 1 and 1 on
+// the control. `VL_UNION_LICENCE_FULL=1` sweeps all of `tests/cases` instead.
 import { filePath } from "./support/filePath.ts";
 const ROOT = filePath(new URL("..", import.meta.url)).replace(/[\\/]$/, "");
 const VL = `${ROOT}/scripts/vl-host/target/release/vl${
@@ -16,10 +16,8 @@ const VL = `${ROOT}/scripts/vl-host/target/release/vl${
 }`;
 const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const WITNESSES = `${ROOT}/tests/fixtures/union-key-licence/witnesses.txt`;
-// A struct union still minted as two rows under one key. D1492's own pair, `type AS = (Sc | Dg)`
-// beside the inline `Sc | Dg`, is one row now that a union names the row of its type key, and
-// so are the literal-alias twins (`{kind: KC}` beside `{kind: "circle"}`, D15082).
-const CONTROL = "tests/cases/unions/discriminated-union-tag-read.vl";
+// D15761's record twins, `Cat | Kot` beside `Cat | { m: i32 }`: one set, so one row.
+const CONTROL = "tests/cases/unions/variant-twin-scalar-spellings.vl";
 const POOL = 4;
 
 const exists = (p: string) => {
@@ -69,7 +67,7 @@ const sweep = async (rel: string, dir: string, i: number) => {
 
 Deno.test({
   name:
-    "union key licence: no two rows sharing a key differ in member set or variant slice",
+    "union key licence: no two rows sharing a type key differ in member set or variant slice",
   ignore: !ENABLED,
   fn: async () => {
     const full = Deno.env.get("VL_UNION_LICENCE_FULL") === "1";
@@ -92,7 +90,6 @@ Deno.test({
     try {
       const bad: string[] = [];
       let next = 0;
-      let merged = 0;
       const worker = async () => {
         while (next < list.length) {
           const i = next++;
@@ -106,7 +103,6 @@ Deno.test({
             );
             continue;
           }
-          merged += counts["keySweep/merge"] ?? 0;
           for (
             const half of ["keySweep/merge-diffset", "keySweep/merge-diffvar"]
           ) {
@@ -114,10 +110,10 @@ Deno.test({
               bad.push(`${rel}: want ${half} 0, got ${counts[half]}`);
             }
           }
-          if (rel === CONTROL && !(counts["keySweep/merge"] >= 1)) {
+          if (rel === CONTROL && !(counts["keySweep/pair-keyed"] >= 1)) {
             bad.push(
-              `${rel}: want keySweep/merge >= 1 (the pair compare must be reached), got ${
-                counts["keySweep/merge"] ?? 0
+              `${rel}: want keySweep/pair-keyed >= 1 (the pair compare must be reached), got ${
+                counts["keySweep/pair-keyed"] ?? 0
               }`,
             );
           }
@@ -129,11 +125,6 @@ Deno.test({
           `${bad.length} licence failures over ${list.length} programs:\n  ${
             bad.join("\n  ")
           }`,
-        );
-      }
-      if (merged === 0) {
-        throw new Error(
-          `want keySweep/merge > 0 over ${list.length} programs, got 0`,
         );
       }
     } finally {

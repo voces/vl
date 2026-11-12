@@ -103,6 +103,7 @@ import {
   inferObservedLitSet,
   inferObservedSet,
   listCopyTyIx,
+  listRecCopyNote,
   litRetUnionIx,
   mapUnboxTyIx,
   nodeAtomSrcHeld,
@@ -5363,12 +5364,34 @@ function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
       && (dn is TyNullable
       && (tySame(dn.nInner, sf) || recNumWidens(sf, dn.nInner))
       || dn is TyUnion && recUnionHasMember(df, sf))
-    // A nested record is copied by the level below, under the same rule.
+    // A list of numbers is copied element by element into a list of a number they widen to.
+    const lists = sp is TyArray
+      && dn is TyArray
+      && (recNumWidens(sp.aElem, dn.aElem)
+      || depth > 1
+      && sp.aElem >= 0
+      && sp.aElem < T.tys.length
+      && tyAt(sp.aElem) is TyObj
+      && recCopyBoxesAt(sp.aElem, dn.aElem, depth - 1))
+    // A number is converted exactly into a wider one.
+    const widens = sp is TyPrim && recNumWidens(sf, df)
+    // A nested record is copied by the level below, under the same rule, into a record or a
+    // record `| null`.
+    const dr = if dn is TyNullable { dn.nInner } else { df }
     const nests = sp is TyObj
-      && dn is TyObj
+      && dr >= 0
+      && dr < T.tys.length
+      && tyAt(dr) is TyObj
       && depth > 1
-      && recCopyBoxesAt(sf, df, depth - 1)
-    if sf < 0 || !(boxes || nests || fieldStorageEq(sf, df, REC_STORE_DEPTH)) {
+      && recCopyBoxesAt(sf, dr, depth - 1)
+    if (
+      sf < 0
+      || !(boxes
+        || widens
+        || lists
+        || nests
+        || fieldStorageEq(sf, df, REC_STORE_DEPTH))
+    ) {
       return false
     }
     i = i + 1
@@ -5464,9 +5487,25 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   if rcwCallSites(fd, sites) < 0 && sites.length <= 1 { return false }
   const own = nonNulTyOf(srcTy)
   const dst = nonNulTyOf(dstTy)
-  if own < 0 || dst < 0 || !(tyAt(own) is TyObj) || !(tyAt(dst) is TyObj) {
-    return false
+  if own < 0 || dst < 0 { return false }
+  const oa = tyAt(own)
+  const da = tyAt(dst)
+  // A list of records is copied element by element under the same rule.
+  if oa is TyArray && da is TyArray {
+    const oe = oa.aElem
+    const de = da.aElem
+    if oe < 0 || de < 0 || !(tyAt(oe) is TyObj) || !(tyAt(de) is TyObj) {
+      return false
+    }
+    if fieldStorageEq(oe, de, REC_STORE_DEPTH) || !recCopyBoxesOnly(oe, de) {
+      return false
+    }
+    while listCopyTyIx.length <= p { listCopyTyIx.push(-1) }
+    listCopyTyIx[p] = dst
+    listRecCopyNote()
+    return true
   }
+  if !(oa is TyObj) || !(da is TyObj) { return false }
   if fieldStorageEq(own, dst, REC_STORE_DEPTH) || !recCopyBoxesOnly(own, dst) {
     return false
   }
@@ -5596,6 +5635,8 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     // be (D14223); a mix of the two adopts neither.
     const sl = nonNulTyOf(srcTy)
     if fd >= 0 && sl >= 0 && tyAt(sl) is TyArray {
+      // A call of a function called more than once is copied where it lands, element by element.
+      if recFreshCallCopy(fd, p, srcTy, dstTy) { return 0 }
       const dl = recAdLandingList(nonNulTyOf(dstTy))
       const os = recReturnedOrigins(fd, p, sl, dl)
       // One body builds one list, so calls landing it on two storages refuse (D8301).
