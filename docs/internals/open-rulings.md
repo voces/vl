@@ -817,7 +817,7 @@ write with a fix that annotates the binding. The function-set narrowing that wou
 
 ### flat-sub-word-field-value — what does a sub-word field of a `flat` record hold? — RULED (owner) 2026-11-12: storage semantics (a)
 
-D15978. `u8`/`i8`/`u16`/`i16` are storage types: legal as an array element and as a `flat` field,
+D15978 (unfiled: D15978, its row lands in #7668). `u8`/`i8`/`u16`/`i16` are storage types: legal as an array element and as a `flat` field,
 never as a value. A `flat` record built as a value disagreed with itself, re-run on `40a5f783`:
 
 ```vl
