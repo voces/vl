@@ -189,6 +189,7 @@ import {
   tyIsStructBearingUnion,
   tyIxIsFunc,
   tyLitMemberTexts,
+  tyMayHoldFn,
   tyNulLitUnionInner,
   tyNulNumScalarValKind,
   tyPrimNameOf,
@@ -1277,6 +1278,7 @@ import {
   memNarrowVariantIndex,
   narrowedArmTyAt,
   narrowedStructArmVi,
+  repOfFnSlot,
 } from "./emit_local_scope"
 import {
   atomLeafListArmTag,
@@ -31894,7 +31896,40 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     }
   }
   if fn is FuncDecl { retArmHeap = returnArmHeapOf(fn, fnIx, fnPos) }
+  // A returned map or ref list built at another storage than the function's result is one no
+  // conversion here reconciles; refused rather than mistyped (D15753, D15755).
+  if retStorageMismatch(retArg, fnIx) {
+    return emitFailAt(
+      "emitProgram: a returned container of functions is built at another storage than this function's result",
+      retArg,
+    )
+  }
   emitReturnValueTail(body, retArg, fnIx, fnPos, retArmHeap)
+}
+
+// Whether `retArg`, returned by function `fnIx` whose result is inferred, is a map or ref list
+// that holds a function and is built at another slot than the function's result.
+function retStorageMismatch(retArg: i32, fnIx: i32): boolean {
+  // A written result type converts what is returned into it.
+  const fd = nodeAt(fnIx)
+  if !(fd is FuncDecl) || fd.fnRet >= 0 { return false }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return false }
+  const rt = nodeTyIxOf(unwrapParen(retArg))
+  // Only a value whose type still holds a hole, built at its bindings' own storage, can miss the
+  // result's; a closed one is built at the result's type.
+  if rt < 0 || rt >= T.tys.length || !tyMayHoldFn(rt, 0) || !tyHasTyVar(rt) {
+    return false
+  }
+  const rd = repOfFnSlot(fe)
+  if tyAt(rt) is TyMap { return mapShapeOfExpr(retArg, fnIx) != rd.rdSlot }
+  // A list is built at its own kind; a ref list at another kind than the result's misses it, and
+  // one at the result's kind misses it where its row differs.
+  const lk = exprListRep(retArg, fnIx)
+  if lk == null || !vkIsNonNullRef(lk) { return false }
+  if lk != rd.rdKind { return true }
+  const s = refListSlotOfExpr(retArg, fnIx)
+  s >= 0 && rd.rdSlot >= 0 && s != rd.rdSlot
 }
 
 // The member texts of the `K | null` result of function `fnIx`: its annotation's (a
