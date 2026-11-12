@@ -76,11 +76,13 @@ Two notes on these rows:
 - Render-parse with `--findings`: 9 renders, 10 → 6 parses. `emit_base.vl` goes from 6 to 2.
   `--write-baseline` is in this PR.
 
-## What stays in emit_base
+## emit_base at zero
 
-`nameIsMap` and `nameIsMapMemberUnion`, 2 parses. Their only caller is `nameIsBareMap`, from
-`emit_map_value_slots.nulMapInnerName`, which the coordinator assigned to lane H. They go when
-it reads the type.
+Lane H's #7656 deleted `nulMapInnerName` and the two map predicates `nameIsBareMap` and
+`nameIsMapMemberUnion`. On the tree merged with master `8eddd05c`, that left `nameIsMap` with no
+caller, so it is deleted here. That was `emit_base`'s last render-parse site. Render-parse on the
+merged tree reads 9 renders and 3 parses (master: 9 and 8). `emit_base.vl` has 0 parses.
+`scripts/gate.sh` passes on that tree.
 
 Comments in other files still name the deleted predicates, as the structural duals they were.
 They are left for lane F's comment sweep.

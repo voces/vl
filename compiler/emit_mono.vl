@@ -754,7 +754,6 @@ import {
   unNameBound,
   unRowOfCanonFolded,
   unionArmsOf,
-  unionArmsOfTy,
   unionRowKeyAB,
 } from "./emit_union_registry"
 import {
@@ -1171,15 +1170,21 @@ function monoTyNarrowsFrom(nTy: i32, wTy: i32): boolean {
   false
 }
 
-// Whether `narrow` is a niche-repped `boolean | null` or `string | null` whose arms are all arms
-// of the union `wide`: the argument's read converts the box to that niche, so the pin is it (D2590).
-function monoNicheNarrowsFrom(
-  narrow: string,
-  narrowTy: i32,
-  wide: string,
-): boolean {
-  if !monoTyIsNulBoolOrStr(narrowTy) { return false }
-  monoArmsNarrowFrom(narrow, narrowTy, wide)
+// Whether `narrowTy` is a niche-repped `boolean | null` or `string | null` whose arms
+// (`unionTyArms`) are all arms of the wider union `wTy`, and fewer: the argument's read converts
+// the box to that niche, so the pin is it (D2590). A side with no type or no arms is not.
+function monoNicheNarrowsFrom(narrowTy: i32, wTy: i32): boolean {
+  if !monoTyIsNulBoolOrStr(narrowTy) || wTy < 0 { return false }
+  const na: string[] = []
+  const nts: i32[] = []
+  if !unionTyArms(narrowTy, na, nts) { return false }
+  const wa: string[] = []
+  const wts: i32[] = []
+  if !unionTyArms(wTy, wa, wts) || wa.length <= na.length { return false }
+  for a in na {
+    if !strListHas(wa, a) { return false }
+  }
+  true
 }
 
 // Whether `ty` is a `boolean | null` or a `string | null` nullable.
@@ -1191,32 +1196,6 @@ function monoTyIsNulBoolOrStr(ty: i32): boolean {
     return p == "boolean" || p == "string"
   }
   false
-}
-
-// Whether every arm of the union `narrow` (arena type `narrowTy`) is an arm of the wider `wide`.
-function monoArmsNarrowFrom(
-  narrow: string,
-  narrowTy: i32,
-  wide: string,
-): boolean {
-  if narrow == wide { return false }
-  const na: string[] = []
-  unionArmsOfTy(narrow, narrowTy, na)
-  const wa: string[] = []
-  unionArmsOf(wide, wa)
-  if wa.length <= na.length { return false }
-  let i = 0
-  while i < na.length {
-    let hit = false
-    let j = 0
-    while j < wa.length {
-      if wa[j] == na[i] { hit = true }
-      j = j + 1
-    }
-    if !hit { return false }
-    i = i + 1
-  }
-  true
 }
 
 // Whether `ty` is a list whose element peels, through lists and nullables, to a record: its
@@ -1237,11 +1216,55 @@ function monoWideArmsHoldBrace(wide: string): boolean {
   false
 }
 
-// The number of arms `unionArmsOf` resolves `wide` to, as `monoArmsNarrowFrom` reads them.
-function monoArmCount(wide: string): i32 {
-  const arms: string[] = []
-  unionArmsOf(wide, arms)
-  arms.length
+// Whether the spelling of type `ty` holds a brace: an inline record or a map anywhere in it,
+// through lists, nullables, unions and function signatures. A declared record spells its name, and
+// so does a declared union below the top; `top` opens the top-level union's members.
+function monoTyMentionsBrace(ty: i32, top: boolean): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  match t {
+    TyObj => {
+      return nominalStructNameOfTy(ty) == ""
+    }
+    TyMap => {
+      return true
+    }
+    TyArray => {
+      return monoTyMentionsBrace(t.aElem, false)
+    }
+    TyNullable => {
+      return monoTyMentionsBrace(t.nInner, top)
+    }
+    TyUnion => {
+      if !top && unionAliasDeclNameOfTy(ty) != "" { return false }
+      for m in t.uMembers {
+        if monoTyMentionsBrace(m, false) { return true }
+      }
+      return false
+    }
+    TyFunc => {
+      for q in t.fnParamTypes {
+        if monoTyMentionsBrace(q, false) { return true }
+      }
+      return monoTyMentionsBrace(t.fnRet, false)
+    }
+    // A scalar, a literal, an open or error type spells no brace.
+    TyPrim | TyLit | TyVar | TyErr | TyNeg => {
+      return false
+    }
+  }
+}
+
+// The number of arms union type `ty` has: its keyed arms (`unionTyArms`), else its flattened
+// variants; -1 for no type.
+function monoTyArmCount(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const atoms: string[] = []
+  const tys: i32[] = []
+  if unionTyArms(ty, atoms, tys) { return atoms.length }
+  const flat: i32[] = []
+  flattenVariantsInto(ty, flat)
+  flat.length
 }
 
 // The pin a narrowed argument at `ax` wants, given the pin `wide` (type `wTy`, or -1) the
@@ -1275,14 +1298,14 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string, wTy: i32) {
     nt >= 0
     && tyAt(nt) is TyNullable
     && tyWrapsRecord(nt)
-    && !monoWideArmsHoldBrace(wide)
-    && monoArmCount(wide) <= 2
+    && !monoTyMentionsBrace(wTy, true)
+    && monoTyArmCount(wTy) <= 2
     && !monoNulRecNamesNarrow(nt, wTy)
   ) {
     return monoNarrowedNominalPinName(nt, "", wTy)
   }
   const n = monoPinSpellShaped(nt)
-  if monoTyNarrowsFrom(nt, wTy) || monoNicheNarrowsFrom(n, nt, wide) {
+  if monoTyNarrowsFrom(nt, wTy) || monoNicheNarrowsFrom(nt, wTy) {
     if monoAnnPinName(n, nt) == n { return n }
     return ""
   }
