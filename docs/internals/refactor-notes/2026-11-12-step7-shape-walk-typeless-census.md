@@ -46,11 +46,15 @@ are, under substituted types. These are not part of the floor.
 - **R, concrete records whose render is empty: 13 at the leaf, 8 at `internShapeDeepOfTy`, 5 at
   the arm fallback.** These are recursive and intersection records: D14162, D4615, D5104, D5105,
   D5155, `objects/intersection-alias-field-and-nullable-positions`,
-  `structs/recursive-nullable-field-equality`, `types/recursive-type-emit-render-cycle`. Their type
-  is concrete. The render is `""` only because `tyToEmitName` meets a cycle. So the row can be
-  found by layout id (`annShapeLayoutRowOf`) and minted under a type-derived key, with readers
-  asking by type. This class needs no other lane, so it goes first. D14162 and the intersection
-  case are two of E6's seven lost runs (`2026-11-12-step7-shape-walk-name-floor.md`).
+  `structs/recursive-nullable-field-equality`, `types/recursive-type-emit-render-cycle`. They are
+  not typeless. Their type is concrete, and `tyToNominalName` names each one: its spelling, cut at
+  the cycle. Only `tyToEmitName` answers `""`, at its cycle guard. A shadow at
+  `internShapeDeepOfTy` agrees: all 8 R entries are "nominal only". D14162 and the intersection
+  case are two of E6's seven lost runs (`2026-11-12-step7-shape-walk-name-floor.md`). E6 named each
+  child by its render, so the fix is the naming rule the walk already uses at its entry
+  (`shapeWalkName`, nominal-or-render), not a new key. The two names differ in 9,144 programs where
+  both are non-empty (`{r:f64}` against `Circle`), so this is a rule for the walk's children, not a
+  change of what `internShapeDeepOfTy` returns.
 - **G, records whose type still holds type variables: 58 at the leaf, 12 at
   `internShapeDeepOfTy`.** These are a hole function's or a tagged set's record fields, typed only
   in the instance: D13967, D13968, D14161, D14726, D15167, D15330, D15559, D15638. w314's cut 5
@@ -65,7 +69,8 @@ are, under substituted types. These are not part of the floor.
 
 ## Order
 
-1. R by layout id (this lane).
-2. G with w314's cut 5, then re-census.
-3. U with w317's D15042 and the descent by type.
+1. G with w314's cut 5, then re-census.
+2. Re-run E6, the descent by type, naming each child nominal-or-render. That covers R, and grades
+   whether U survives the type-only descent.
+3. U's remainder with w317's D15042.
 4. With all three closed, the walk's name path goes, with its parses and the renders above.
