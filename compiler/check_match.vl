@@ -702,15 +702,7 @@ function matchTypePatCover(
   elabCapIsNote(patIx, pt, pt)
   if patIx < nodeTyIx.length { nodeTySet(patIx, TY_BOOL) }
   const hit = markUnionCover(uMems, covered, pt)
-  if hit != 0 && matchArmWrittenOut(pt) {
-    tErr(
-      "match pattern `"
-        + pn.isVariant
-        + "` can never match a value of type "
-        + tyToStr(matchWriteNarrowTy),
-      patIx,
-    )
-  } else if hit == 0 {
+  if hit == 0 {
     tErr(
       "match pattern `" + pn.isVariant + "` is not a member of " + tyToStr(st),
       patIx,
@@ -724,17 +716,6 @@ function matchTypePatCover(
   const twin = mapTwinTestMsg(uMems, pt, "a `match` arm")
   if twin != "" { tErr(twin, patIx) }
   false
-}
-
-// Whether the arm type `pt` meets no member of the type a write narrowed the scrutinee to.
-function matchArmWrittenOut(pt: i32): boolean {
-  if matchWriteNarrowTy < 0 { return false }
-  const ms: i32[] = []
-  flattenVariantsInto(matchWriteNarrowTy, ms)
-  for m in ms {
-    if assignable(m, pt) || assignable(pt, m) { return false }
-  }
-  true
 }
 
 // The index in `uMems` of the literal member value pattern `patIx` names: a string or integer
@@ -992,27 +973,20 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
 // (D1572), a litunion on member strings, any other union on member types. `mTail` is the
 // return-tail flag the enclosing statement held.
 function checkMatchExprByScrut(n: MatchExpr, ix: i32, mTail: boolean): i32 {
-  // A `let` a write narrowed dispatches over its storage, whose box the arms test, and an arm
-  // the write ruled out is refused (`matchTypePatCover`).
-  const st0 = checkNodeHook(n.matchScrut)
+  // A `let` a write narrowed is matched over the member set the write left, which an arm naming
+  // another member is refused against, and lowered over its storage, whose box the arms test.
+  const st = checkNodeHook(n.matchScrut)
   const wst = letWriteNarrowedStore(n.matchScrut)
-  const st = if wst >= 0 { wst } else { st0 }
   if wst >= 0 { isOperandAtStorage(n.matchScrut) }
-  const savedWn = matchWriteNarrowTy
-  matchWriteNarrowTy = if wst >= 0 { st0 } else { -1 }
-  const r = checkMatchExprAtScrut(n, ix, mTail, st)
-  matchWriteNarrowTy = savedWn
-  r
+  checkMatchExprAtScrut(n, ix, mTail, st, wst >= 0)
 }
-
-// The type a write narrowed the `match` being checked's scrutinee to, or -1.
-let matchWriteNarrowTy = -1
 
 function checkMatchExprAtScrut(
   n: MatchExpr,
   ix: i32,
   mTail: boolean,
   st: i32,
+  written: boolean,
 ): i32 {
   matchCheckPatReads(n, st)
   tpMatchOkSet(mTail || tpIfOkAt.has(ix))
@@ -1031,7 +1005,7 @@ function checkMatchExprAtScrut(
   // D1898 — a NULLABLE literal union takes the member-string vocabulary too, with `null` as
   // one more member: it is the same interned i32 atom as the bare set, `null` riding the spare
   // `-1`, so the desugared `k is null` / `k == "a"` chain is what already lowers.
-  if !strSet { return checkMatchUnionScrut(n, ix, st) }
+  if !strSet { return checkMatchUnionScrut(n, ix, st, written) }
   checkMatchLitUnionArms(n, ix, st, setNul)
 }
 
@@ -1088,13 +1062,18 @@ function matchScrutOnlyNull(st: i32): boolean {
   isNullTy(st)
 }
 
-function checkMatchUnionScrut(n: MatchExpr, ix: i32, st: i32): i32 {
+function checkMatchUnionScrut(
+  n: MatchExpr,
+  ix: i32,
+  st: i32,
+  written: boolean,
+): i32 {
   // A value typed `null` alone (`const v = null`) has the one member `null`, which its `null`
   // arm tests; its inner hole is no member (D3335).
   let uMems: i32[] = []
   const onlyNull = matchScrutOnlyNull(st)
   if onlyNull { uMems = [TY_NULL] } else { flattenVariantsInto(st, uMems) }
-  if uMems.length > 1 || onlyNull {
+  if uMems.length > 1 || onlyNull || written && uMems.length == 1 {
     if unionHasLitMember(uMems) { resolveMatchConstPats(n, false) }
     return checkMatchTypeArms(n, ix, st, uMems)
   }
