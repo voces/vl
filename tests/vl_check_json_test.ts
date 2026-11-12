@@ -33,12 +33,13 @@ type Batch = { file: string; exit: number; diagnostics: Diag[] };
 
 const run = async (
   args: string[],
+  env: Record<string, string> = {},
 ): Promise<{ code: number; out: string; err: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: [...args, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv({ NO_COLOR: "1" }),
+    env: nativeEnv({ NO_COLOR: "1", ...env }),
   }).output();
   return {
     code,
@@ -412,6 +413,45 @@ Deno.test({
       }
       if (!recs[0].diagnostics.some((d) => d.stage === "type")) {
         throw new Error(`the bad file must carry its type error: ${out}`);
+      }
+    });
+  },
+});
+
+// D15934: a program whose check stops before the record solve's pass end left that pass's queues
+// keyed by its node indices, and the next program on the same instance skipped a refusal at a
+// node one of them named. One worker keeps both on one instance.
+Deno.test({
+  name:
+    "check --batch --json: a program after one whose check stopped early keeps its refusal",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      await Deno.writeTextFile(
+        `${dir}/a.vl`,
+        "function id(a) { return a }\nconst lap = (g) => {\n  const x = g(1); return x.toString()\n}\n" +
+          "function use(k) { return k(id) }\nprint(use(lap))\n",
+      );
+      await Deno.writeTextFile(
+        `${dir}/b.vl`,
+        "type J = { f: i32 | null }\nconst o = { f: 4 }\nconst wideJ: J[] = [o]\n" +
+          'const m = Map()\nm.set("b", { f: 5 })\nm.set("a", o)\n',
+      );
+      const alone = parseBatch(
+        (await run(["check", "--batch", "--json", `${dir}/b.vl`])).out,
+      );
+      const { out } = await run(
+        ["check", "--batch", "--json", `${dir}/a.vl`, `${dir}/b.vl`],
+        { VL_JOBS: "1" },
+      );
+      const recs = parseBatch(out);
+      if (alone.length !== 1 || alone[0].exit !== 1) {
+        throw new Error(`want b.vl refused alone, got ${JSON.stringify(alone)}`);
+      }
+      if (recs.length !== 2 || recs[1].exit !== alone[0].exit) {
+        throw new Error(
+          `want b.vl's exit ${alone[0].exit} after a.vl, got ${recs[1]?.exit}: ${out}`,
+        );
       }
     });
   },
