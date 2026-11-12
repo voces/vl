@@ -815,6 +815,24 @@ generic function keeps the generic type, and a concrete function written to it i
 write with a fix that annotates the binding. The function-set narrowing that would let it run
 (D15956, D15957) is clause 2 and is scheduled after step 7.
 
+### flat-sub-word-field-value — what does a sub-word field of a `flat` record hold? — RULED (owner) 2026-11-12: storage semantics (a)
+
+D15978 (unfiled: D15978, its row lands in #7668). `u8`/`i8`/`u16`/`i16` are storage types: legal as an array element and as a `flat` field,
+never as a value. A `flat` record built as a value disagreed with itself, re-run on `40a5f783`:
+
+```vl
+flat type Q = { a: u8, c: i32 }
+function f(n: i32): Q { return { a: n, c: 1 } }
+print(f(300).a)                 // 300, where a `u8[]` element stores 44
+flat type P = { a: i16, c: i32 }
+const p: P = { a: -3, c: 7 }    // refused as "does not fit a `u8` element"
+```
+
+**Ruled (a):** a sub-word field narrows on store exactly as an array element of its width does, and
+a visibly out-of-range literal is refused at the field's own width. Rejected: (b) the width is
+layout only and the field holds any `i32`; (c) a `flat` record with a sub-word field cannot be a
+value. Recorded in DECISIONS.md. Built after step 7.
+
 ### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — RULED 2026-10-12
 
 **Ruling (owner, 2026-10-12, spec Q3): (a) for now, (c) as the later target.** A null-only
