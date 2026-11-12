@@ -279,7 +279,7 @@ import {
   sidNoteNodeName,
   sidOfNode,
 } from "./symbols"
-import { i32ListHas, strListHas } from "./listutil"
+import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
 import { memoKeyNew, memoMoved } from "./memo"
 import {
   flattenVariantsInto,
@@ -807,7 +807,7 @@ function lvIfAt(x: i32, thenB: i32, ty: i32, atStmt: boolean) {
 
 // The annotation spelling of type `ty` for a synthesized binding, or "" when it has none: a
 // type parameter's by name, and a literal union's by its members, since its emit name is the
-// softened `string`.
+// softened `string`. Output text beside a closed type, a name mono pins beside an open one.
 function lvSpellOf(ty: i32): string {
   let spell = tyToEmitName(ty)
   if spell == "" && tyHasTyVar(ty) { spell = lvSpaceless(tyToStr(ty)) }
@@ -5284,4 +5284,83 @@ function synthRecEqCoreFn(row: i32, pos: i32) {
   )
   eqgCoreAdd(row, fnStmtsAppendTop(fe))
   0
+}
+
+// Writes each `const` record literal whose fields read only unwritten un-annotated parameters,
+// and whose one read is a positional argument of a named call, into that argument in place of
+// its binding: the literal is then delivered where it is built, as one written there is (D15700).
+export function inlineConstRecArgs(stmts: i32[]) {
+  const todo: i32[] = []
+  for s in stmts { todo.push(s) }
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is FuncDecl && xn.fnBody >= 0 { icraBody(xn, xn.fnBody) }
+      for c in nodeChildren(x) { todo.push(c) }
+    }
+  }
+  0
+}
+
+function icraBody(fn: FuncDecl, body: i32) {
+  const bn = nodeAt(body)
+  if !(bn is Block) { return 0 }
+  const keep: i32[] = []
+  for s in bn.blkStmts {
+    if !icraInline(fn, body, s) { keep.push(s) }
+  }
+  if keep.length != bn.blkStmts.length { bn.blkStmts = keep }
+  0
+}
+
+// Whether statement `s` of `fn`'s body `body` is such a binding, now written into its one read.
+function icraInline(fn: FuncDecl, body: i32, s: i32): boolean {
+  const ln = nodeAt(s)
+  if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return false }
+  const li = ln.letInit
+  if li < 0 || li >= P.nodes.length { return false }
+  const ol = nodeAt(li)
+  if !(ol is ObjLit) || ol.objFields.length == 0 { return false }
+  for f in ol.objFields {
+    const fi = nodeAt(f)
+    if !(fi is FieldInit) { return false }
+    const v = fi.fiValue
+    if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return false }
+    const pd = identDeclOf(v)
+    if pd < 0 || pd >= P.nodes.length { return false }
+    if !i32ListHas(fn.fnParams, pd) || cwDeclAssigned(pd) { return false }
+    const pn = nodeAt(pd)
+    if !(pn is Param) || pn.parType >= 0 { return false }
+  }
+  let read = -1
+  let call = -1
+  let reads = 0
+  const todo: i32[] = [body]
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Ident && identDeclOf(x) == s {
+        reads = reads + 1
+        read = x
+        call = p
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+      }
+    }
+  }
+  if reads != 1 || call < 0 { return false }
+  const cn = nodeAt(call)
+  if !(cn is Call) || hasNamedArgs(cn.callArgNames) { return false }
+  const cf = cn.callFn
+  if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return false }
+  const j = i32ListIndexOf(cn.callArgs, read)
+  if j < 0 { return false }
+  cn.callArgs[j] = li
+  true
 }
