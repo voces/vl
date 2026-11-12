@@ -57,24 +57,26 @@ import { tyHasTyVar } from "./tyquery"
 // The pin spelling of closed type `ty` under the naming rule: a record by its row's registered
 // name, every other type by its structural spelling with union members sorted and records inside
 // by row name. "" for an open type or a part no annotation can spell.
-export function monoPinSpellOf(ty: i32): string { monoPinSpellAt(ty, 0) }
+export function monoPinSpellOf(ty: i32): string { monoPinSpellAt(ty, PS_ROWS) }
 
 // `monoPinSpellOf`, with a record that has no row spelled as its fields: the spelling a pin that
 // names no row takes.
-export function monoPinSpellShaped(ty: i32): string { monoPinSpellAt(ty, 1) }
+export function monoPinSpellShaped(ty: i32): string {
+  monoPinSpellAt(ty, PS_SHAPES)
+}
 
-// `monoPinSpellShaped`, with a record whose row is an anonymous `#anonN` handle spelled by its
-// fields at every depth: the spelling an annotation takes, where a handle names no type.
-export function monoPinSpellAnonFields(ty: i32): string {
-  monoPinSpellAt(ty, 2)
+// `monoPinSpellShaped`, with a record whose row is an anonymous `#anon` handle also spelled as
+// its fields, at any depth: a name a spelling reader can parse back.
+export function monoPinSpellNoAnon(ty: i32): string {
+  monoPinSpellAt(ty, PS_FIELDS)
 }
 
 // Record `t` spelled as its fields, in their declared order; "" when a field has no spelling.
-function monoPinSpellObjFields(t: TyObj, shapes: i32): string {
+function monoPinSpellObjFields(t: TyObj, mode: i32): string {
   const fs: string[] = []
   let i = 0
   while i < t.objFieldNames.length && i < t.objFieldTypes.length {
-    const f = monoPinSpellAt(t.objFieldTypes[i], shapes)
+    const f = monoPinSpellAt(t.objFieldTypes[i], mode)
     if f == "" { return "" }
     fs.push(t.objFieldNames[i] + ":" + f)
     i = i + 1
@@ -82,9 +84,14 @@ function monoPinSpellObjFields(t: TyObj, shapes: i32): string {
   "{" + monoPinSpellJoin(fs, ",") + "}"
 }
 
-// `monoPinSpellOf` at `shapes`: 0 spells a record by its row, 1 also spells a record with no row
-// by its fields, 2 also spells a record whose row is an anonymous handle by its fields.
-function monoPinSpellAt(ty: i32, shapes: i32): string {
+// What a record spells as: its row's name only (`PS_ROWS`), its fields where it has no row
+// (`PS_SHAPES`), or its fields too where its row is an `#anon` handle (`PS_FIELDS`).
+const PS_ROWS = 0
+const PS_SHAPES = 1
+const PS_FIELDS = 2
+
+// `monoPinSpellOf` under `mode`.
+function monoPinSpellAt(ty: i32, mode: i32): string {
   if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return "" }
   const t = tyAt(ty)
   match t {
@@ -92,19 +99,24 @@ function monoPinSpellAt(ty: i32, shapes: i32): string {
       const r = repRowOfTyStruct(ty, sNames.length)
       if r >= 0 && r < sNames.length {
         const rn = monoPinSpellRowName(ty, r)
-        if shapes < 2 || rn.length < 5 || rn.slice(0, 5) != "#anon" {
-          return rn
+        if mode == PS_FIELDS && strContains(rn, "#anon") {
+          return monoPinSpellObjFields(t, mode)
         }
-        return monoPinSpellObjFields(t, shapes)
+        return rn
       }
       // A union member's record has no struct row; it spells as its declared name, else its
       // variant row.
       const sn = structNameOfTy(ty)
       if sn != "" { return sn }
       const vr = repVariantShapeRowOf(ty)
-      if vr >= 0 && vr < uVariants.length { return uVariants[vr] }
-      if shapes == 0 { return "" }
-      return monoPinSpellObjFields(t, shapes)
+      if vr >= 0 && vr < uVariants.length {
+        if mode == PS_FIELDS && strContains(uVariants[vr], "#anon") {
+          return monoPinSpellObjFields(t, mode)
+        }
+        return uVariants[vr]
+      }
+      if mode == PS_ROWS { return "" }
+      return monoPinSpellObjFields(t, mode)
     }
     // `never` has no value to pin, so a type holding it has no pin.
     TyPrim => {
@@ -115,13 +127,13 @@ function monoPinSpellAt(ty: i32, shapes: i32): string {
       return t.litText
     }
     TyArray => {
-      const e = monoPinSpellAt(t.aElem, shapes)
+      const e = monoPinSpellAt(t.aElem, mode)
       if e == "" { return "" }
       // A readonly view spells as its list: the view is the node's type, not its rep.
       return monoPinSpellAtom(t.aElem, e) + "[]"
     }
     TyNullable => {
-      const inner = monoPinSpellAt(t.nInner, shapes)
+      const inner = monoPinSpellAt(t.nInner, mode)
       if inner == "" { return "" }
       // A union's members and `null` spell as one flat union.
       if t.nInner < T.tys.length && tyAt(t.nInner) is TyUnion {
@@ -137,7 +149,7 @@ function monoPinSpellAt(ty: i32, shapes: i32): string {
       if ud != "" { return ud }
       const ms: string[] = []
       for m in t.uMembers {
-        const s = monoPinSpellAt(m, shapes)
+        const s = monoPinSpellAt(m, mode)
         if s == "" { return "" }
         const a = if tyIsUnionish(m) { s } else { monoPinSpellFnAtom(m, s) }
         let j = ms.length
@@ -151,21 +163,21 @@ function monoPinSpellAt(ty: i32, shapes: i32): string {
       return monoPinSpellJoin(ms, "|")
     }
     TyMap => {
-      const k = monoPinSpellAt(t.mKey, shapes)
+      const k = monoPinSpellAt(t.mKey, mode)
       if k == "" { return "" }
       // A set spells as the map it is stored as.
-      const v = monoPinSpellAt(t.mVal, shapes)
+      const v = monoPinSpellAt(t.mVal, mode)
       if v == "" { return "" }
       return "{[" + k + "]:" + v + "}"
     }
     TyFunc => {
       const ps: string[] = []
       for p in t.fnParamTypes {
-        const s = monoPinSpellAt(p, shapes)
+        const s = monoPinSpellAt(p, mode)
         if s == "" { return "" }
         ps.push(s)
       }
-      const r = monoPinSpellAt(t.fnRet, shapes)
+      const r = monoPinSpellAt(t.fnRet, mode)
       if r == "" { return "" }
       return "("
         + monoPinSpellJoin(ps, ",")
