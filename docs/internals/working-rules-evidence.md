@@ -855,7 +855,9 @@ gap looks like: a row does not announce that nobody has re-run it.
 defect PR appended to one file's tail and two concurrent PRs conflicted there nearly every
 hour. The command above takes either form — a directory of `D*.md`, or the monolith.
 `vl run scripts/inventory/ls.vl -- --status open` is the queue, `--next` the next free id
-(skipping `RESERVED.md`), and `TEMPLATE.md` is what a new row starts from.
+(skipping every range in `reserved/`), and `TEMPLATE.md` is what a new row starts from.
+Reservations are ONE FILE PER RANGE (`reserved/D<lo>-D<hi>.md`) for the same reason: the
+single `RESERVED.md` every lane edited conflicted on nearly every PR once ~10 lanes ran at once.
 
 It runs each row's OWN filed program — never a paraphrase, which is a different program —
 and prints which rows no longer behave as filed; non-zero exit means at least one moved.
