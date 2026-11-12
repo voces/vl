@@ -39,7 +39,7 @@ import { decDigitsOf } from "./strutil"
 import { constListFnElemDecl, elabNullOnlyTp, slotOfRead } from "./check_calls"
 
 import { litMembersBaseTy } from "./check_literals"
-import { nomErasedTyIx } from "./check_ty_rep"
+import { nomErasedTyIx, tyIsValueUnionBox } from "./check_ty_rep"
 import { ftParamListCopied, ftWithinInstancedFn } from "./check_fn_tag"
 import {
   ArrayLit,
@@ -17066,8 +17066,31 @@ export function elabRetOf(k: i32): i32 {
   let r = elabSubstClosed(f.fnRet, k)
   if r < 0 { r = elabRetOfValues(k) }
   if r < 0 { return -1 }
+  // An un-annotated result is what the instance's own values are where they widen the template's
+  // to a union holding it: a `??` whose default is the instance's record reads a nullable field.
+  const own = elabValuesResultOf(ekDecl[k], k)
+  if elabTyWidensTo(r, own) { r = own }
   const kd = recKeptFnDstOf(ekDecl[k], r)
   if kd >= 0 { kd } else { r }
+}
+
+// Whether closed type `w` is `r` with `null`, or a union with `r` as a member: wider than `r`
+// and holding it.
+export function elabTyWidensTo(r: i32, w: i32): boolean {
+  if r < 0 || w < 0 || w >= T.tys.length || tySame(r, w) { return false }
+  if !elabTyClosed(w, 0) || tyHasTyVar(w) { return false }
+  const t = tyAt(w)
+  match t {
+    TyNullable => tySame(t.nInner, r)
+    TyUnion => {
+      for m in t.uMembers {
+        if tySame(m, r) { return true }
+      }
+      false
+    }
+    // No other type holds `r` as a part.
+    TyPrim | TyFunc | TyObj | TyArray | TyMap | TyVar | TyLit | TyNeg | TyErr => false
+  }
 }
 
 // The type every value instance `k`'s body hands back has there, when each is a call through a
@@ -17154,9 +17177,9 @@ function elabRootArgParamTy(a: i32, own: i32): i32 {
   if shaped { pt } else { -1 }
 }
 
-// The record members of every union the elaboration typed some instance's node, parameter or
-// result at, through the types that hold one: the arms an instance union adds to the variant
-// table later.
+// The record members of every union a node is checked at, or the elaboration typed some
+// instance's node, parameter or result at, through the types that hold one: the arms the variant
+// table gains later in emit. Run once per program, after the elaboration.
 export function elabInstUnionArmTys(): i32[] {
   const out: i32[] = []
   const seen: {[i32]: boolean} = Map()
@@ -17167,6 +17190,14 @@ export function elabInstUnionArmTys(): i32[] {
       elabUnionArmsInto(ps[i], out, seen, 8)
       i = i + 2
     }
+  }
+  // A checked union only counts where it boxes two distinct records, the union a row is minted
+  // for: a same-shape union collapses to its struct and mints none.
+  let n = 0
+  while n < P.nodes.length {
+    const nt = nodeTyIxOf(n)
+    if elabBoxesTwoRecords(nt) { elabUnionArmsInto(nt, out, seen, 1) }
+    n = n + 1
   }
   let k = 0
   while k < ekDecl.length {
@@ -17182,6 +17213,21 @@ export function elabInstUnionArmTys(): i32[] {
     k = k + 1
   }
   out
+}
+
+// Whether `u` is a value-union box with two record members of different types.
+function elabBoxesTwoRecords(u: i32): boolean {
+  if u < 0 || u >= T.tys.length || !tyIsValueUnionBox(u) { return false }
+  const t = tyAt(u)
+  if !(t is TyUnion) { return false }
+  let first = -1
+  for m in t.uMembers {
+    if m >= 0 && m < T.tys.length && tyAt(m) is TyObj {
+      if first < 0 { first = m }
+      else if !tySame(first, m) { return true }
+    }
+  }
+  false
 }
 
 function elabUnionArmsInto(
@@ -17668,7 +17714,7 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
 // is under it: that call's record, a list literal whose every element is such, or a record literal
 // with such a field. -1 where nothing under it is, or a list literal mixes it with other elements.
 function litKeptRepOf(ix: i32, depth: i32): i32 {
-  if recKeptFnDecl.length == 0 || depth <= 0 || ix < 0 { return -1 }
+  if depth <= 0 || ix < 0 { return -1 }
   const m = litKeptMemo[ix] ?? -2
   if m != -2 { return m }
   const r = litKeptRepFrom(ix, depth)

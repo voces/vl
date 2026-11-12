@@ -4192,7 +4192,7 @@ function recHeldOwnRefuse(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
     const o = if i32ListHas(skip, pu) || recOwnPinSkip(u) { -1 } else { recFreshOriginDecl(u, 6) }
     if o == d && recArgRepOf(u) < 0 {
       recAdRaising = true
-      tErr(recKeptOwnMsg(d, rep, p, false), u)
+      tErr(recKeptOwnMsgAt(d, rep, p, false, u), u)
       recAdRaising = false
     }
   }
@@ -4213,7 +4213,7 @@ export function recHeldReadsOwnRefuse(
     const o = if !read || i32ListHas(skip, pu) || recOwnPinSkip(u) { -1 } else { recHeldDecl(pu) }
     if o == d && recArgRepOf(u) < 0 {
       recAdRaising = true
-      tErr(recKeptOwnMsg(d, rep, p, false), u)
+      tErr(recKeptOwnMsgAt(d, rep, p, false, u), u)
       recAdRaising = false
     }
   }
@@ -4240,6 +4240,66 @@ export function recOwnPinSkip(u: i32): boolean {
   if nodeAt(u) is Call { return true }
   const pt = recReachPinTy(u)
   pt < 0 || !fieldStorageEq(pt, nodeTyIxOf(u), REC_STORE_DEPTH)
+}
+
+// The type mismatch of a store `u` of the binding `d`, built as `dst`, into a container pinned at
+// its own type, in the words the container's store gives the annotated binding; "" where `u` is no
+// `.set` value, `.push` argument or index store.
+export function recStoreMismatchMsg(u: i32, d: i32, dst: i32): string {
+  if u < 0 || !cwIxCovers(u) { return "" }
+  const a = cwIxUp[u]
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) { return "" }
+  const name = dn.letName
+  const note = " (`"
+    + name
+    + "` holds only a literal, so it is built as the `"
+    + tyToStr(dst)
+    + "` it is delivered to; annotate it to keep its own type, and copy it for the other use)"
+  if (
+    an is BinExpr
+    && an.binOp == "="
+    && an.binRight == u
+    && nodeAt(an.binLeft) is Index
+  ) {
+    return "cannot assign "
+      + tyToStr(dst)
+      + " to "
+      + tyToStr(nodeTyIxOf(u))
+      + note
+  }
+  if !(an is Call) || an.callFn < 0 { return "" }
+  const f = nodeAt(an.callFn)
+  if !(f is Member) { return "" }
+  if f.memProp == "set" && an.callArgs.length == 2 && an.callArgs[1] == u {
+    return "set: expected "
+      + tyToStr(nodeTyIxOf(u))
+      + ", got "
+      + tyToStr(dst)
+      + note
+  }
+  if f.memProp == "push" && an.callArgs.length == 1 && an.callArgs[0] == u {
+    return "push: cannot add "
+      + tyToStr(dst)
+      + " to "
+      + tyToStr(nodeTyIxOf(f.memObj))
+      + note
+  }
+  ""
+}
+
+// `recKeptOwnMsg` for the delivery `u`, said as the container's type mismatch where `u` is a store
+// into one (`recStoreMismatchMsg`).
+export function recKeptOwnMsgAt(
+  d: i32,
+  dst: i32,
+  at: i32,
+  inst: boolean,
+  u: i32,
+): string {
+  const said = recStoreMismatchMsg(u, d, dst)
+  if said != "" { said } else { recKeptOwnMsg(d, dst, at, inst) }
 }
 
 // D15180's refusal of a value `d` built as `dst` where `at` delivers it, handed on at its own type
@@ -5274,6 +5334,136 @@ export function recAdoptUnionList(
   true
 }
 
+// Whether the record `dst` stores each field of the record `src` as `src` does, or a scalar field
+// as that scalar or `null`, a number it widens to exactly or `null`, or a union listing that
+// scalar: the fields a record copy boxes.
+export function recCopyBoxesOnly(src: i32, dst: i32): boolean {
+  const so = tyAt(src)
+  const d = tyAt(dst)
+  if (
+    !(so is TyObj)
+    || !(d is TyObj)
+    || so.objFieldNames.length != d.objFieldNames.length
+  ) {
+    return false
+  }
+  let i = 0
+  while i < d.objFieldNames.length {
+    const sf = tyFieldTyOf(src, d.objFieldNames[i])
+    const df = d.objFieldTypes[i]
+    const dn = if df >= 0 && df < T.tys.length { tyAt(df) } else { null }
+    const sp = if sf >= 0 && sf < T.tys.length { tyAt(sf) } else { null }
+    const boxes = sp is TyPrim
+      && (dn is TyNullable
+      && (tySame(dn.nInner, sf) || recNumWidens(sf, dn.nInner))
+      || dn is TyUnion && recUnionHasMember(df, sf))
+    if sf < 0 || !(boxes || fieldStorageEq(sf, df, REC_STORE_DEPTH)) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether the number `src` converts to the other number `dst` exactly: `i32` into `i64` or `f64`,
+// `i64` or `f32` into `f64`.
+function recNumWidens(src: i32, dst: i32): boolean {
+  const s = tyAt(src)
+  const d = tyAt(dst)
+  if !(s is TyPrim) || !(d is TyPrim) { return false }
+  strListHas(NUM_WIDENS, s.primName + ">" + d.primName)
+}
+
+const NUM_WIDENS = ["i32>i64", "i32>f64", "i64>f64", "f32>f64"]
+
+// Whether the union `u` lists `m` as a member.
+function recUnionHasMember(u: i32, m: i32): boolean {
+  const ut = tyAt(u)
+  if !(ut is TyUnion) { return false }
+  for x in ut.uMembers {
+    if tySame(x, m) { return true }
+  }
+  false
+}
+
+// Whether every tail of the value join `j` is a call.
+function recJoinOfCalls(j: i32): boolean {
+  const leaves: i32[] = []
+  tailValueLeaves(j, leaves)
+  if leaves.length == 0 { return false }
+  for lf in leaves {
+    const c = cwPeelValue(lf)
+    if c < 0 || !(nodeAt(c) is Call) { return false }
+  }
+  true
+}
+
+// A binding read `p` holding `o`, a call or a join of calls, each of a function called more than
+// once: each call is copied to `dstTy`'s record where the binding is built, and the binding
+// keeps its type and is built there, as one holding a literal is. False, recording nothing,
+// where some call is not so or the copy does not serve.
+function recHeldFreshCopy(p: i32, o: i32, srcTy: i32, dstTy: i32): boolean {
+  const d = recHeldDecl(p)
+  const own = nonNulTyOf(srcTy)
+  const dst = nonNulTyOf(dstTy)
+  if (
+    d < 0
+    || own < 0
+    || dst < 0
+    || !(tyAt(own) is TyObj)
+    || !(tyAt(dst) is TyObj)
+  ) {
+    return false
+  }
+  if fieldStorageEq(own, dst, REC_STORE_DEPTH) { return false }
+  const leaves: i32[] = []
+  if recIsJoin(o) { tailValueLeaves(o, leaves) } else { leaves.push(o) }
+  if leaves.length == 0 { return false }
+  cwIxBuild()
+  for lf in leaves {
+    const c = cwPeelValue(lf)
+    if c < 0 || !(nodeAt(c) is Call) { return false }
+    const fd = recInferredFnOf(c)
+    if fd < 0 { return false }
+    const sites: i32[] = []
+    if rcwCallSites(fd, sites) < 0 && sites.length <= 1 { return false }
+    if !recCopyBoxesOnly(nonNulTyOf(nodeTyIxOf(c)), dst) { return false }
+  }
+  for lf in leaves {
+    const c = cwPeelValue(lf)
+    while recCopyTyIx.length <= c { recCopyTyIx.push(-1) }
+    recCopyTyIx[c] = dst
+  }
+  recBuildPush(d, own, dst, false)
+  true
+}
+
+// How many bindings `recAdoptNote` is delivering through: a call a binding holds is not the
+// delivered value itself.
+let recAdHeldDepth = 0
+
+// A call's value is fresh, so a destination storing a field differently gets a copy of it,
+// recorded on the call, and its function `fd`, called more than once, keeps its own record.
+// False, recording nothing, where the copy does not serve.
+function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
+  if recAdHeldDepth > 0 { return false }
+  // A function called once is built where that call lands (D3444).
+  cwIxBuild()
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) < 0 && sites.length <= 1 { return false }
+  const own = nonNulTyOf(srcTy)
+  const dst = nonNulTyOf(dstTy)
+  if own < 0 || dst < 0 || !(tyAt(own) is TyObj) || !(tyAt(dst) is TyObj) {
+    return false
+  }
+  if fieldStorageEq(own, dst, REC_STORE_DEPTH) || !recCopyBoxesOnly(own, dst) {
+    return false
+  }
+  while recCopyTyIx.length <= p { recCopyTyIx.push(-1) }
+  recCopyTyIx[p] = dst
+  true
+}
+
 // Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
 // element of a literal list binding, to a record that stores a field differently.
 export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
@@ -5306,7 +5496,28 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       }
       // One holding a call or an element read is delivered as that origin is (D8140).
       const oc = recHeldCallOrigin(p)
-      if oc >= 0 { return recAdoptNote(oc, nodeTyIxOf(oc), dstTy) }
+      if oc >= 0 && recHeldFreshCopy(p, oc, srcTy, dstTy) { return 0 }
+      if oc >= 0 {
+        recAdHeldDepth = recAdHeldDepth + 1
+        recAdoptNote(oc, nodeTyIxOf(oc), dstTy)
+        recAdHeldDepth = recAdHeldDepth - 1
+        return 0
+      }
+      // One holding a join of calls only delivers its tails as it would those calls.
+      const oj = recBindOrigin(p)
+      if (
+        oj >= 0
+        && oj != p
+        && recIsJoin(oj)
+        && recHeldFreshCopy(p, oj, srcTy, dstTy)
+      ) {
+        return 0
+      }
+      if oj >= 0 && oj != p && recIsJoin(oj) && recJoinOfCalls(oj) {
+        recAdHeldDepth = recAdHeldDepth + 1
+        recAdoptNote(oj, nodeTyIxOf(oj), dstTy)
+        recAdHeldDepth = recAdHeldDepth - 1
+      }
       // One aliasing a literal binding keeps its type, and the literal is built at the record.
       const od = recFreshOriginDecl(p, 6)
       if (
@@ -5405,6 +5616,7 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       ) {
         return 0
       }
+      if recFreshCallCopy(fd, p, srcTy, dstTy) { return 0 }
       if recFnBuiltAtDst(fd, p, srcTy, dstTy) {
         // A union of records built at the one record keeps its result typed as the union and
         // builds it as that record.
@@ -5486,6 +5698,9 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
           return recAdPushDecl(pf, srcTy, nonNulTyOf(dstTy), false, pc)
         }
         if recHasLitLeaf(pf) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
+        // The identity hands back the fresh call it is given, so its result is copied where it
+        // lands, as the call's would be.
+        if pc == pp && recFreshCallCopy(pf, p, srcTy, dstTy) { return 0 }
         const pld = recLandingOf(srcTy, dstTy)
         if (
           recHasLitLeaf(pf)
@@ -5614,6 +5829,7 @@ export function recAdForce(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     for lf in recFnValueLeaves(fd) {
       if !recLitFits(cwPeel(lf), dl, REC_STORE_DEPTH) { return false }
     }
+    if recFreshCallCopy(fd, p, srcTy, dstTy) { return true }
     return recFnBuiltAtDst(fd, p, srcTy, dstTy)
   }
   if (
