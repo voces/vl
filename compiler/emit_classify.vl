@@ -242,6 +242,9 @@ import {
 } from "./emit_anon_fields"
 import {
   fieldKindWidens,
+  fieldRowIsPlainI32,
+  fieldRowIsRecordRef,
+  fieldRowIsUnionBox,
   fieldScalarKindOf,
   olTagFieldTy,
   sFieldElemNameAt,
@@ -4999,7 +5002,7 @@ export function ifExprRefSlot(
       return destStruct
     }
     "reflist" => {
-      const hs = emptyArrHoleElemSlot(tv)
+      const hs = emptyArrHoleElemSlot(tv, fnIx)
       if hs >= 0 { return hs }
       return refListSlotOfExpr(tv, fnIx)
     }
@@ -6439,10 +6442,10 @@ export function globalCellStructIdx(letIx: i32) {
 // home `arrLitIsRef`, `arrLitElemKind`, and `arrLitElemName` each need an arm for. A call or
 // an ident element is neither an object literal, nested literal, nor lambda, so the
 // first-element probes those three classifiers run cannot see a union arriving by either route.
-export function arrLitUnionElemName(arrIx: i32): string {
+export function arrLitUnionElemName(arrIx: i32, fnIx: i32): string {
   const ety = nodeArrayElemTyIx(arrIx)
   if !isUNameABTyMayHit(ety) { return "" }
-  const cen = arrLitElemRender(arrIx)
+  const cen = arrLitElemRender(arrIx, fnIx)
   if cen == "" { return "" }
   // A numeric literal union keys to its own row but reps as its base scalar: no union element.
   if tyNumScalarBaseName(ety) != "" { return "" }
@@ -6504,7 +6507,7 @@ function arrLitIsRefTpl(arrIx: i32) {
     // closure cell, checker-driven rather than a first-element guess, so a local shadowing
     // a function name is never mis-claimed. Subsumes the lambda-literal rung below for any
     // closure array the checker concretely typed.
-    if arrElemIsClosureTy(arrIx) { return true }
+    if arrElemIsClosureTy(arrIx, -1) { return true }
     const e0 = nodeAt(a.arrElems[0])
     if e0 is ObjLit { return true }
     // A closure-element literal is a ref list (kind 5), not an i32 list — without this,
@@ -6522,26 +6525,26 @@ function arrLitIsRefTpl(arrIx: i32) {
     // A checker-typed union element: the kind-2 box list. Last rung, deliberately — every
     // literal that classifies by its first element keeps that classification, so this arm
     // only ever claims a literal that otherwise falls through to the i32 default.
-    if arrLitUnionElemName(arrIx) != "" { return true }
+    if arrLitUnionElemName(arrIx, -1) != "" { return true }
     // A checker-typed map element: the kind-3 map list. Same placement as the union rung —
     // a `Map()`/`Set()` element is no object literal, no nested literal, and no lambda, so
     // every probe above misses it and the literal falls to the i32 list, where
     // `emitArr`'s guard refuses the map-struct ref element loudly.
-    if arrLitMapElemName(arrIx) != "" { return true }
+    if arrLitMapElemName(arrIx, -1) != "" { return true }
     // A checker-typed object-shaped element the first-element probes cannot see — an ident
     // or a call whose recorded element is a declared struct or union arm. Last, beside the
     // union and map rungs, for the same reason: it only claims a literal falling to i32.
-    if arrLitNominalElemName(arrIx) != "" { return true }
+    if arrLitNominalElemName(arrIx, -1) != "" { return true }
     // A checker-typed list element the first-element probes cannot see (D180): `[c]` where
     // `c` is a `string[]` local is no object literal, nested literal, lambda, map, or
     // declared shape, so it fell to the i32 backing with a ref operand — check-clean invalid
     // wasm. Reuses `arrLitNestedElemName`, last because an array-first-element is claimed above.
-    if arrLitNestedElemName(arrIx) != "" { return true }
+    if arrLitNestedElemName(arrIx, -1) != "" { return true }
     // D1270 — the nullable-niche element, one peel short of the list rung above: its
     // recorded element is a `TyNullable`, not the `TyArray` that rung reads, so every probe
     // missed it and the literal built the mono i32 list with a nullable-ref element stored
     // in it — check-clean invalid wasm. Last, for the same reason the rungs above are.
-    if arrLitNulRefElemName(arrIx) != "" { return true }
+    if arrLitNulRefElemName(arrIx, -1) != "" { return true }
     // Else the build the emitter gives the literal's recorded type.
     return listTyBuildsRef(nodeTyIxOf(arrIx))
   }
@@ -6565,7 +6568,7 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
     if a.arrElems.length < 1 { return false }
     if hasSpreadItem(a.arrElems) {
       // A box-list literal boxes a string source too (D2969).
-      if arrLitBoxElem(arrIx) { return false }
+      if arrLitBoxElem(arrIx, fnIx) { return false }
       return spreadDestKind(arrIx, fnIx) == "strlist"
     }
     // An atom-element literal (the checker adopted a `K[]` context) is the i32 atom-id
@@ -6597,7 +6600,7 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
     // value union and the elements box, so the string-list build would store the i32 sibling
     // into a ref backing — invalid wasm. Asked of the recorded type, order-blind, so
     // `[1, "two"]` and `["two", 1]` are one answer. Last, right before the first-element probe.
-    if arrLitBoxElem(arrIx) { return false }
+    if arrLitBoxElem(arrIx, fnIx) { return false }
     return exprString(a.arrElems[0], fnIx)
   }
   false
@@ -6663,14 +6666,14 @@ export function arrLitRowTyIn(arrIx: i32, fnIx: i32): i32 {
   if ft >= 0 { et = tyArrayElemIx(ft) }
   const inst = if et < 0 { arrLitInstElemRow(arrIx, fnIx) } else { -1 }
   if inst >= 0 && inst < sTyIx.length { et = sTyIx[inst] }
-  if et < 0 { et = arrLitElemHintTy(arrIx) }
+  if et < 0 { et = arrLitElemHintTy(arrIx, fnIx) }
   if et < 0 { et = arrLitObjRowTy(arrIx, fnIx) }
   // The element's own committed annotation outranks its recorded shape's row (D163).
   if et < 0 {
     const ca = arrLitCommitAnnAt(arrIx)
     if ca >= 0 { et = annRowOfNode(ca) }
   }
-  if et < 0 { et = arrLitNominalRowTy(arrIx) }
+  if et < 0 { et = arrLitNominalRowTy(arrIx, fnIx) }
   if et < 0 && arrLitLeadIsList(arrIx) {
     et = tyRefArrElemOf(nodeTyInOf(arrIx, fnIx))
   }
@@ -6686,7 +6689,7 @@ function arrLitObjRowTy(arrIx: i32, fnIx: i32): i32 {
   if a is ArrayLit {
     if a.arrElems.length < 1 || !(nodeAt(a.arrElems[0]) is ObjLit) { return -1 }
     if arrLitObjElemBoxVariant(arrIx) != "" { return -1 }
-    if arrLitNulRefElemName(arrIx) != "" { return -1 }
+    if arrLitNulRefElemName(arrIx, fnIx) != "" { return -1 }
     const si = structIndexOfObjCtx(a.arrElems[0], fnIx)
     if si >= 0 && si < sTyIx.length { return sTyIx[si] }
     if uDeclared {
@@ -6701,13 +6704,13 @@ function arrLitObjRowTy(arrIx: i32, fnIx: i32): i32 {
 // where the arm's answer is deliberately a name. Each arm must use its own source — hinting
 // every arm from the array's arena element disagrees for the two object-literal arms, whose
 // name is a row found in a table, not the array's recorded element.
-export function arrLitElemHintTy(arrIx: i32) {
+export function arrLitElemHintTy(arrIx: i32, fnIx: i32) {
   const a = nodeAt(arrIx)
   if a is ArrayLit {
     // The closure-element arm is hinted at full agreement under the guard: the row is the
     // array's own recorded element, but only where the element mentions no literal type and
     // no object shape (`tyMentionsLitOrObj`), the two classes that disagree.
-    if arrElemIsClosureTy(arrIx) {
+    if arrElemIsClosureTy(arrIx, fnIx) {
       const cty = arrLitArenaElemRow(arrIx)
       if cty < 0 { return -1 }
       if tyMentionsLitOrObj(cty, 0) { return -1 }
@@ -6736,7 +6739,7 @@ export function arrLitElemHintTy(arrIx: i32) {
         // DECLINES rather than hand over the non-null struct row below, which would key a
         // second slot for one wrapper. Declining keys on the name alone, the one string both
         // the inferred literal and the annotation reach the table with.
-        if arrLitNulRefElemName(arrIx) != "" { return -1 }
+        if arrLitNulRefElemName(arrIx, fnIx) != "" { return -1 }
         // The struct arm, at full agreement once two row classes are excluded: `sIsAnonRow`
         // (`sTyIx` has two producers that disagree for an `#anonN` row), and
         // `nameIsNewtypeBrand` (the row's name is the brand while `sTyIx[si]` holds the
@@ -6754,7 +6757,9 @@ export function arrLitElemHintTy(arrIx: i32) {
     // The union-element arm, dual-written at full agreement: `arrLitUnionElemName` is
     // `nodeArrayElemName` gated by a union row, so its row is the array's own recorded
     // element, read off `nodeTyIxOf` — the same column that renderer reads.
-    if arrLitUnionElemName(arrIx) != "" { return arrLitArenaElemRow(arrIx) }
+    if arrLitUnionElemName(arrIx, fnIx) != "" {
+      return arrLitArenaElemRow(arrIx)
+    }
     // The committed-rep arm declines too (D163): its name is a spelling the element
     // expression committed to, never a row this function looked up, so there is no arena
     // twin to hand over. The nominal-element arm declines deliberately, for the same reason
@@ -6817,7 +6822,7 @@ export function arrLitElemName(arrIx: i32, fnIx: i32): string {
 // element's function-type key, the lead element's committed annotation, the row a lead object
 // literal builds at, the nominal row of a recorded record element, else the recorded element's row.
 function arrLitElemNameTy(arrIx: i32, fnIx: i32): string {
-  if arrElemIsClosureTy(arrIx) { return arrLitElemRender(arrIx) }
+  if arrElemIsClosureTy(arrIx, fnIx) { return arrLitElemRender(arrIx, fnIx) }
   const acn = arrLitCommitNameAt(arrIx)
   if acn != "" { return acn }
   const a = nodeAt(arrIx)
@@ -6831,7 +6836,7 @@ function arrLitElemNameTy(arrIx: i32, fnIx: i32): string {
       if si >= 0 { return sNames[si] }
     }
   }
-  const ann = arrLitNominalElemName(arrIx)
+  const ann = arrLitNominalElemName(arrIx, fnIx)
   if ann != "" { return ann }
   const t = litRepTyAt(arrIx, fnIx)
   if t < 0 { return "" }
@@ -6899,7 +6904,10 @@ function arrLitInstElemRow(arrIx: i32, fnIx: i32): i32 {
   if !(a is ArrayLit) || a.arrElems.length < 1 { return -1 }
   const e0 = a.arrElems[0]
   if !(nodeAt(e0) is ObjLit) { return -1 }
-  if arrLitObjElemBoxVariant(arrIx) != "" || arrLitNulRefElemName(arrIx) != "" {
+  if (
+    arrLitObjElemBoxVariant(arrIx) != ""
+    || arrLitNulRefElemName(arrIx, fnIx) != ""
+  ) {
     return -1
   }
   const si = structRowOfRecordTy(litRepTyAt(e0, fnIx))
@@ -6929,26 +6937,26 @@ function arrLitElemNameTpl(arrIx: i32): string {
   if a is ArrayLit {
     // A closure-element literal: the parenthesized function-type table key the checker
     // recorded. Must agree arm for arm with `arrLitElemKind`'s kind-5 gate.
-    if arrElemIsClosureTy(arrIx) { return arrLitElemRender(arrIx) }
+    if arrElemIsClosureTy(arrIx, -1) { return arrLitElemRender(arrIx, -1) }
     if a.arrElems.length >= 1 {
       const e0 = nodeAt(a.arrElems[0])
       // A nested-list element keys the inner list's name by its leaf — the table key
       // `arrLitElemKind` picks the matching kind for (6/7/8, else 4).
       if e0 is ArrayLit {
         // A union-of-lists element keys the union, as `arrLitElemKind`'s rung does (D4894).
-        const nun = arrLitUnionElemName(arrIx)
+        const nun = arrLitUnionElemName(arrIx, -1)
         if nun != "" { return nun }
         // An inner hole (`[[]]`) has no element for the three leaf probes below to read, so
         // all three would decline and key `i32[]` regardless of what the outer list holds —
         // check-clean invalid wasm (D16). The checker's own recorded element renders the
         // inner list's emit name instead, gated on the hole so a non-empty inner classifies normally.
         if emptyArrLitIxOf(a.arrElems[0]) >= 0 {
-          const cen = arrLitElemRender(arrIx)
+          const cen = arrLitElemRender(arrIx, -1)
           if cen != "" { return cen }
         }
         const e0x = arrLitLeadInner(a)
         if emptyArrLitIxOf(e0x) >= 0 {
-          const hen = arrLitNestedElemName(arrIx)
+          const hen = arrLitNestedElemName(arrIx, -1)
           if hen != "" { return hen }
         }
         // A ref inner literal's element is the inner ref list, whose name the leaf probes
@@ -6956,7 +6964,7 @@ function arrLitElemNameTpl(arrIx: i32): string {
         // the element actually builds (D702). The arena renders it instead, the same string
         // the annotated spelling interns. Must agree arm for arm with `arrLitElemKind`'s kind-9 rung.
         if arrLitIsRef(e0x, -1) {
-          const rin = arrLitNestedElemName(arrIx)
+          const rin = arrLitNestedElemName(arrIx, -1)
           if rin != "" { return rin }
         }
         // The inner literal's recorded rep keys the leaf. A union rep is the box a join built,
@@ -6976,7 +6984,7 @@ function arrLitElemNameTpl(arrIx: i32): string {
         // name (`rlElemNicheNullable`) — so the nullable spelling has to be asked before the
         // bare nominal one, or `[{n: 42}, null]` keys a different slot than the annotated
         // `(P | null)[]` interns and the `!= null` guard falls to a struct compare (D1831).
-        const nre = arrLitNulRefElemName(arrIx)
+        const nre = arrLitNulRefElemName(arrIx, -1)
         if nre != "" { return nre }
         const si = structIndexOfObj(a.arrElems[0])
         if si >= 0 { return sNames[si] }
@@ -6993,7 +7001,7 @@ function arrLitElemNameTpl(arrIx: i32): string {
     // The checker-typed union element: the registered composite is the table key — the
     // same string `refArrElemName` yields for the annotated `(Cat | Dog)[]` spelling, so
     // both spellings intern one slot.
-    const aun = arrLitUnionElemName(arrIx)
+    const aun = arrLitUnionElemName(arrIx, -1)
     if aun != "" { return aun }
     // The element expression's own committed rep, ahead of every rung that reads the
     // checker's structural record (D163): `shapeNominalOfTy` resolves the struct table
@@ -7004,25 +7012,25 @@ function arrLitElemNameTpl(arrIx: i32): string {
     // The checker-typed map element: the whole `{[K]:V}` spelling is the table key, the
     // same string `refArrElemName` yields for the annotated `{[K]: V}[]` — so the two
     // spellings intern one row of kind 3, carrying the key as well as the value.
-    const amn = arrLitMapElemName(arrIx)
+    const amn = arrLitMapElemName(arrIx, -1)
     if amn != "" { return amn }
     // The checker-typed object-shaped element: the declared row's own name is the table
     // key, the same string `refArrElemName` yields for the annotated `Circle[]` spelling,
     // whether that row is a struct or a union arm — so the inferred literal and the
     // annotation intern one kind-1 slot.
-    const ann = arrLitNominalElemName(arrIx)
+    const ann = arrLitNominalElemName(arrIx, -1)
     if ann != "" { return ann }
     // The checker-typed list element: the inner list's own emit name is the table key, the
     // same string `refArrElemName` yields for the annotated `string[][]` spelling, so all
     // three spellings intern one row. Must agree arm for arm with `arrLitIsRef` and
     // `arrLitElemKind`, which ask the identical predicate.
-    const anl = arrLitNestedElemName(arrIx)
+    const anl = arrLitNestedElemName(arrIx, -1)
     if anl != "" { return anl }
     // D1270 — the checker-typed nullable-container element: the element's own emit render
     // is the table key, the same string `refArrElemName` yields for the annotated
     // `(i32[] | null)[]` spelling, so both spellings intern one row. Must agree arm for arm
     // with `arrLitIsRef` and `arrLitElemKind`.
-    const anr = arrLitNulRefElemName(arrIx)
+    const anr = arrLitNulRefElemName(arrIx, -1)
     if anr != "" { return anr }
   }
   ""
@@ -12347,95 +12355,6 @@ export function sFieldStoreKind(si: i32, fi: i32): VKind | null {
     if d.rdCovered == 1 { return d.rdKind }
   }
   fieldCodeVKind(sFieldTypeAt(si, fi))
-}
-
-// The covered rep of the struct table's flat field row `r`'s storage type, or null where none
-// is recorded or the descriptor does not cover it; there the field code is the only answer.
-function fieldRowStoreRep(r: i32): RepDesc | null {
-  if r < 0 { return null }
-  const ty = fieldPosStoreTy(r)
-  if ty < 0 { return null }
-  const d = repOfTy(ty)
-  if d.rdCovered == 0 { return null }
-  d
-}
-
-// The field code of flat row `r`, or -1 for no row.
-function fieldRowCode(r: i32): i32 {
-  if r < 0 || r >= sFieldTypes.length { return -1 }
-  sFieldTypes[r]
-}
-
-// Whether flat field row `r` holds the union box.
-export function fieldRowIsUnionBox(r: i32): boolean {
-  const d = fieldRowStoreRep(r)
-  if d == null { return fieldRowCode(r) == FC_UNION }
-  d.rdKind == "union"
-}
-
-// Whether flat field row `r` holds a non-null `i32`: a number, a boolean or an atom.
-export function fieldRowIsPlainI32(r: i32): boolean {
-  const d = fieldRowStoreRep(r)
-  if d == null { return fieldRowCode(r) == FC_I32 }
-  d.rdKind == "i32" && d.rdNul == 0
-}
-
-// Whether flat field row `r` holds a record ref. A `nulnone` storage is a hole's record or the
-// `null` unit, which only the code tells apart.
-export function fieldRowIsRecordRef(r: i32): boolean {
-  const d = fieldRowStoreRep(r)
-  if d == null || d.rdKind == "nulnone" { return fieldRowCode(r) == FC_STRUCT }
-  d.rdKind == "nulstruct" || d.rdKind == "nulvariant"
-}
-
-// Whether flat field row `r` holds only `null` (the `null` unit's `nullref` slot).
-export function fieldRowIsNulNone(r: i32): boolean {
-  const d = fieldRowStoreRep(r)
-  if d == null || d.rdKind == "nulnone" {
-    return fieldRowCode(r) == FC_NUL_NONE
-  }
-  false
-}
-
-// Whether flat field row `r` holds a string, non-null (`nul` false) or `string | null` (true).
-export function fieldRowIsStr(r: i32, nul: boolean): boolean {
-  const d = fieldRowStoreRep(r)
-  if d == null {
-    const want = if nul { FC_NUL_STR } else { FC_STR }
-    return fieldRowCode(r) == want
-  }
-  if nul { d.rdKind == "nulstr" } else { d.rdKind == "str" }
-}
-
-// The numeric scalar kind flat field row `r` holds (0 a plain `i32`, 3 `i64`, 4 `f64`, 5 `f32`),
-// or -1 for any other storage.
-export function fieldRowNumKind(r: i32): i32 {
-  const d = fieldRowStoreRep(r)
-  if d == null {
-    const c = fieldRowCode(r)
-    if c == FC_I32 { return 0 }
-    if c == FC_I64 { return 3 }
-    if c == FC_F64 { return 4 }
-    if c == FC_F32 { return 5 }
-    return -1
-  }
-  match d.rdKind {
-    "i32" => {
-      return if d.rdNul == 0 { 0 } else { -1 }
-    }
-    "i64" => {
-      return 3
-    }
-    "f64" => {
-      return 4
-    }
-    "f32" => {
-      return 5
-    }
-    "struct" | "list" | "str" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
-      return -1
-    }
-  }
 }
 
 // Whether struct `si`'s field `fi` holds the union box.

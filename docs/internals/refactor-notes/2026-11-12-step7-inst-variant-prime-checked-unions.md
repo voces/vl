@@ -26,7 +26,7 @@ records keeps all four.
 ## Proof
 
 - Both cells now pass the guard. They still floor where the template's 17 other un-annotated cells
-  floor, `field access receiver is not a struct`. That is D15717's shared read (unfiled: D15717, filed in #7242), which #7242
+  floor, `field access receiver is not a struct`. That is D15717's shared read, which #7242
   closes.
 - **Full local sweep**, fixpoint seeds, base master `5c962b49`, 23,933 programs: 23,933 same,
   0 bytes-only, 0 output movers, 0 runs → not-runs, 0 new compiler traps.

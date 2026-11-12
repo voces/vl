@@ -213,7 +213,6 @@ import {
   isVariantBoxUnionAtoms,
   listIsTestedIdent,
   monoAnnHasTyParam,
-  nameIsBareMap,
   nameIsClosureArrayTy,
   nameIsShapeSpanEnds,
   nameIsStringArray,
@@ -867,6 +866,7 @@ import {
   isUNameKeyAB,
   softKeyOrNameKey,
   softKeyProbeNoTy,
+  tyIsBareMap,
   unABOn,
   unKeyPushOfTy,
   unNameBound,
@@ -5213,7 +5213,7 @@ function collectAUnionRows() {
 // literal is built at. A hole, a type parameter, a literal or a record (whose declaration is its
 // identity) keeps the name's key.
 function arrLitMintHintTy(i: i32): i32 {
-  const h = arrLitElemHintTy(i)
+  const h = arrLitElemHintTy(i, -1)
   if h >= 0 { return h }
   let e = tyStepElem(arrLitBuildTy(i))
   // A list of lists is built at its lead inner literal's rep, which carries the element join the
@@ -5259,7 +5259,7 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
   // the checker pinned to a registered union is invisible to `arrLitIsRef`, and the
   // synthesized annotation runs after this pass, so that slot has to be interned here.
   if nd.arrElems.length == 0 {
-    const emptyElem = arrLitUnionElemName(i)
+    const emptyElem = arrLitUnionElemName(i, -1)
     if emptyElem != "" {
       // Hinted with the literal's own recorded element row; every corpus firing agrees
       // with the name path, and the hint is available at each.
@@ -5269,9 +5269,9 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
     // `outer.push(inner)` with `inner: i32[]` reaches this pass with the element pinned to an
     // array and no row interned. The flags mirror the `arrLitIsRef` branch arm for arm,
     // because this interns the row the annotated `i32[][]` spelling interns.
-    const nestElem = arrLitNestedElemName(i)
+    const nestElem = arrLitNestedElemName(i, -1)
     if nestElem != "" {
-      const nestKind = arrLitNestedElemKind(i)
+      const nestKind = arrLitNestedElemKind(i, -1)
       // A ref inner list (kind 9 — a struct, map, union or closure leaf, or another nesting
       // level) has to intern its inner row first, because the outer element's heap is that
       // inner wrapper and the tables are read forward in this same pass. `ensureRefElemTy`
@@ -5286,11 +5286,11 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
     // D1511 — the same hole at the shape element kind: `xs.push({y: 1, x: 2})` onto `[]` pins
     // the element to a struct no `<shape>[]` spelling interns. The key is unhinted, since a
     // nominal spelling takes none; the element type still classifies it.
-    const shapeElem = arrLitShapeElemName(i)
+    const shapeElem = arrLitShapeElemName(i, -1)
     if shapeElem != "" { ensureRefElemTys(shapeElem, -1, rlHintElemTy(i)) }
     // The same hole at a nullable ref element: a push of a `T | null` value, or of a bare
     // `null` a later write filled, spells the `(T | null)[]` row nowhere (D2506).
-    const nulElem = arrLitNulRefElemName(i)
+    const nulElem = arrLitNulRefElemName(i, -1)
     if nulElem != "" { ensureRefElemTy(nulElem, rlHintElemTy(i)) }
     // D1569 — the same hole at a scalar element kind, where the three rescues above are all
     // ref ones. `const xs = []` then `xs.push(1.5)` pins the element to an f64 the program
@@ -5319,7 +5319,7 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
       // which are still spelled by name (D14533).
       const ae = if elemKind == RLK_STRUCT { arrLitArenaRecElem(i) } else { -1 }
       // A record spelled by shape is built at its declared twin's row, minted first.
-      const tw = if elemKind == RLK_STRUCT { rlDeclTwinTy(arrLitElemHintTy(i)) } else { -1 }
+      const tw = if elemKind == RLK_STRUCT { rlDeclTwinTy(arrLitElemHintTy(i, -1)) } else { -1 }
       if tw >= 0 { rlRowOfTyMinted(tw) }
       if ae >= 0 {
         rlInternNameTy(rlRowNameOfTy(ae, false), RLK_STRUCT, ae)
@@ -5476,13 +5476,11 @@ function collectATypeRef(i: i32, nd: TypeRef) {
   // A function type forces nothing here: its result's types are forced by
   // `forceNestedCloSigRepsOfTy` above.
   if tyIsFuncArena(nodeTyIxOf(i)) {
-  } else if nameIsBareMap(nd.tyName) && !typeRefIsRecord(i) {
+  } else if tyIsBareMap(nodeTyIxOf(i)) && !typeRefIsRecord(i) {
     // A bare map annotation interns its per-(key, value) slot here, since collect scans every
     // `TypeRef`, so the type-index assignment sees the full slot set. An orphaned parser field
     // (no type) mints nothing: the field-table passes mint from its owner.
-    if nodeTyIxOf(i) >= 0 {
-      mvShapeOfMapHeldTy(nodeTyIxOf(i), nodeMapValTyIx(i), nodeMapValTyIx(i))
-    }
+    mvShapeOfMapHeldTy(nodeTyIxOf(i), nodeMapValTyIx(i), nodeMapValTyIx(i))
   } else if nulMapInnerName(nd.tyName) != "" {
     // A nullable map annotation collects what its non-null inner map does.
     if nodeTyIxOf(i) >= 0 {
@@ -8824,7 +8822,7 @@ export function collectU(stmts: i32[]) {
   while iau < P.nodes.length {
     const an = nodeAt(iau)
     if an is ArrayLit {
-      const aeu = arrLitInferUnionElemName(iau)
+      const aeu = arrLitInferUnionElemName(iau, -1)
       if aeu != "" {
         const aety = arrLitElemTyIxOf(iau)
         if !(isUNameAB(24, aeu, aety) && unNameAdoptTyKeyRow(aeu, aety)) {
@@ -9433,7 +9431,7 @@ export function collectFnValUse() {
       // but only when the element itself constructs a closure — one merely containing one must not.
       ArrayLit => {
         // The same predicate the three `arrLit*` consumers use.
-        if arrElemIsClosureTy(i) { fnValUsed = true }
+        if arrElemIsClosureTy(i, -1) { fnValUsed = true }
       }
       // Every other node makes no bare function-value use.
       NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | Paren | ErrExpr | Param | WhileStmt | BreakStmt | ContinueStmt | Block | Program | FieldDef | TypeDecl | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
