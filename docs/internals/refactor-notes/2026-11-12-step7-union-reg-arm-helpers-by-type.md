@@ -31,3 +31,19 @@ cell (9,202). These sites held 23 hits:
 `coerceListAtomOf` (5 hits) is handed a member-set id, not a type, by its caller. It needs one
 threaded from that caller's caller. The tag that `unionArmTagOf` gives an arm stays keyed by the
 arm's exact type (#7347); only the arm's type is read here.
+
+## Proof
+
+- **Local full sweep**, `sweep.vl record` with fixpoint seeds on both sides, against master
+  `8580f63d`:
+
+  ```
+  same                            23965
+  bytes-only movers                   0
+  output movers                       0
+  runs -> not-runs  (blocking)        0
+  new compiler traps  (blocking)      0
+  ```
+- **Locally:** lint-self, rep-fuzz, `cases_wasm`, the memo-generation, state-audit and scaling
+  tests, emitter-state-audit, capability probes (`--live-sites`, `--floor`), splice-scan,
+  seed-size, late-demands, and the dead-export and render-parse budgets.
