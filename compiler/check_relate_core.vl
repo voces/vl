@@ -123,6 +123,7 @@ import {
   njRejoinApartSet,
   nomLitRelax,
   nullTestOp,
+  objLitFieldExpr,
   rebaseDerivedHole,
   rejoinDropSubsumed,
   softenBareLitTy,
@@ -541,6 +542,7 @@ import {
   cwSlotDescend,
   cwSlotPath,
   cwSlotValuesFrom,
+  cwSlotWrittenAfter,
   cwSlotWrittenValues,
   cwSoleBinderAt,
   cwUfcsDeclOf,
@@ -6007,7 +6009,9 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
   if !(nodeAt(bd) is LetDecl) { return false }
   const init = parenPeelIx(cwBoundInitOf(cwBindingOf(root)))
   // A callback's element is not lifted: the built-in hands it the list's own records.
-  const lift = elem || !(an is Param) && holeSlotFieldLift(a, init, path)
+  const lift = elem
+    || !(an is Param)
+    && holeSlotFieldLift(a, init, path, cwBindingOf(root))
   const rets: i32[] = []
   let called = false
   if init >= 0 && init < P.nodes.length {
@@ -6068,6 +6072,34 @@ function holeSlotPlainRead(a: i32): boolean {
     && cwElemCallbackRecv(d) >= 0)
 }
 
+// Whether `path` reads a field of a record nested in a list's element: `[]` first, then two or
+// more field steps.
+function holeSlotElemNestedField(path: string[]): boolean {
+  if path.length < 3 || path[0] != "[]" { return false }
+  let k = 1
+  while k < path.length {
+    if path[k] == "[]" { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Whether each element in `els` builds every record along `path` (after its `[]` step, before
+// its last field) as a record literal.
+function holeSlotElemLitsOnly(els: i32[], path: string[]): boolean {
+  for el in els {
+    let x = parenPeelIx(el)
+    let k = 1
+    while k < path.length - 1 {
+      if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) { return false }
+      x = parenPeelIx(objLitFieldExpr(x, path[k]))
+      k = k + 1
+    }
+    if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) { return false }
+  }
+  true
+}
+
 // Whether `path` reads a field of exactly one list element: one `[]` step, then that element's
 // field, last. A record nested in the element is not lifted.
 function holeSlotOneElemField(path: string[]): boolean {
@@ -6082,14 +6114,29 @@ function holeSlotOneElemField(path: string[]): boolean {
 
 // Whether the read `a` of a field at `path` is lifted as an element is: a plain read of a field of
 // a list's records or of a record, nested in records at any depth, at the place's root, the
-// binding's initialiser `init` or the values the call there returns. A record nested in a list's
-// element is not lifted (D15805).
-function holeSlotFieldLift(a: i32, init: i32, path: string[]): boolean {
+// binding `b`'s initialiser `init` or the values the call there returns. A record nested in a
+// list's element is lifted only where record literals build it (D15805).
+function holeSlotFieldLift(a: i32, init: i32, path: string[], b: i32): boolean {
   const recField = path.length > 0 && !strListHas(path, "[]")
-  if !(recField || holeSlotOneElemField(path)) || !holeSlotPlainRead(a) {
+  const nestedElem = holeSlotElemNestedField(path)
+  if (
+    !(recField || nestedElem || holeSlotOneElemField(path))
+    || !holeSlotPlainRead(a)
+  ) {
     return false
   }
   const n = if init >= 0 && init < P.nodes.length { nodeAt(init) } else { null }
+  // A list's nested record is restamped at the list's rep only where its literal builds it
+  // (D15805), whether in the list's initialiser or a later push; not one returned, or bound
+  // before it is placed.
+  if nestedElem {
+    if !(n is ArrayLit) || n.arrElems.length == 0 || b < 0 { return false }
+    const pushed: i32[] = []
+    const ats: i32[] = []
+    if !cwSlotWrittenAfter(b, ["[]"], pushed, ats) { return false }
+    return holeSlotElemLitsOnly(n.arrElems, path)
+      && holeSlotElemLitsOnly(pushed, path)
+  }
   if !(n is Call) { return true }
   const rets: i32[] = []
   holeSlotCallRetsDeep(n, rets, 0)
@@ -6117,7 +6164,8 @@ function holeSlotCallJudgeAt(
   if !(cn is Call) { return false }
   const nm = holeCallRootName(cn)
   if nm == "" { return false }
-  const elem = path[path.length - 1] == "[]" || holeSlotFieldLift(a, c, path)
+  const elem = path[path.length - 1] == "[]"
+    || holeSlotFieldLift(a, c, path, -1)
   holeSlotRetApart = elem
   const rj = holeSlotRetJudge(cn, nm, path, wp, pts, 0, true)
   holeSlotRetApart = false
@@ -6643,9 +6691,46 @@ function holeSlotRetJudge(
   const rv: i32[] = []
   if !holeSlotCallRets(c, rv) { return false }
   for r in rv {
-    if holeSlotArgJudge(r, pNm, path, wp, pts, depth + 1, lift) { return true }
+    const rest: string[] = []
+    const fv = holeSlotRetRecField(r, path, rest)
+    if fv >= 0 {
+      if holeSlotArgJudge(fv, pNm, rest, wp, pts, depth + 1, lift) {
+        return true
+      }
+    } else if holeSlotArgJudge(r, pNm, path, wp, pts, depth + 1, lift) {
+      return true
+    }
   }
   false
+}
+
+// The value a returned record literal `r` holds where `path` steps through its fields, with the
+// steps left in `rest`, so a returned `{ a: xs }` is judged at `xs`'s slot as a returned `xs` is
+// (D15883); -1 where `r` is no record literal or no list or record step is left.
+function holeSlotRetRecField(r: i32, path: string[], rest: string[]): i32 {
+  let v = parenPeelIx(r)
+  let k = 0
+  while k < path.length && path[k] != "[]" && v >= 0 && v < P.nodes.length {
+    const n = nodeAt(v)
+    if !(n is ObjLit) { k = path.length }
+    if n is ObjLit {
+      let nx = -1
+      for f in n.objFields {
+        const fi = nodeAt(f)
+        if fi is FieldInit && fi.fiName == path[k] {
+          nx = parenPeelIx(fi.fiValue)
+        }
+      }
+      v = nx
+      k = k + 1
+    }
+  }
+  if k == 0 || k >= path.length || v < 0 || v >= P.nodes.length { return -1 }
+  while k < path.length {
+    rest.push(path[k])
+    k = k + 1
+  }
+  v
 }
 
 // `holeSlotCallRets` for the call node `x`; false for any other node.
