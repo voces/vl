@@ -11,7 +11,7 @@ checker's `tyToStr`. That names `T` in `objects/error-record-field-of-generic-ca
 and `_` in D15776's witness, as the checker's diagnostics do.
 
 **Effect.**
-- The four renders leave the render-parse ratchet, which now reads 9 renders and 26 parses on master after the merge.
+- The four renders leave the render-parse ratchet, which reads 9 renders after the merge (see the baseline for parses).
   `--write-baseline` was run in this PR.
 - The refusal itself stands: it is a clause-2 site with its own rows.
 - D15776's quoted message is updated to the new text.
