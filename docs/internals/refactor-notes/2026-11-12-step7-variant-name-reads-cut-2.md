@@ -24,17 +24,31 @@ The sites that hold a type were measured twice.
 | `annDeclVariantRow`'s spelling fallback | 0, never answers | — | **deleted**; the function takes no spelling |
 | `collectVariantFields`' declared-record test (`declStructNodeOf(nonNulBaseOf(ftxt))`) | 0, and never answers true | — | **converted** (`fieldNamesDeclRecord`, the field type's declaration) |
 | `collectShapeVariantFields`' generic-application rung (`nameIsConcreteGenAppDecl(nonNulBaseOf(ftxt))`) | 0, never reached; two hand witnesses (a `B<i32>` and a `B<i32> \| null` field of an inline arm) are answered by `nameFieldCodeTy` and run | — | **deleted**: a hit now reaches the refusal below it |
-| `typeDeclMintsRow`, `collectNestedFieldShapes`' `ownsRow` | 37 | **runs → trap**: `arrays/mixed-nullable-record-string-literal` (cast failure), plus 1 bytes-only | **floor** |
+| `typeDeclMintsRow`, `collectNestedFieldShapes`' `ownsRow` | 37 each | see below | **floor, named after D15952** |
 | `mvValArmOfShapeTy` | 0, and never reached | not switched | open |
 
-**The floor.** `typeDeclMintsRow` asks whether a declaration is itself a union arm. A record
-declared as a same-shape twin of an arm has a type that `tyIsVariantMember` calls a variant
-member, but the declaration is not one, and it must mint its own struct row. That is a
-declaration's identity, not its type's. The type alone loses a program, so this site stays on the
-declaration's own name until a declaration-level key exists, such as `UnionDecl` member lists by
-declaration node.
+**The floor.** `typeDeclMintsRow` asks whether a record declaration is stored at a variant row.
+Under #7425 a same-shape twin of an arm shares that arm's row, so the typed answer is the ruled
+behaviour. Two typed forms were measured:
 
-## The other sites (24), by owner
+- **`tyIsVariantMember(decl type)`:** 1 program goes runs → trap,
+  `arrays/mixed-nullable-record-string-literal`, with a cast failure. The checker counts `A` and
+  `B` as members of the union inferred from `[xa, null, xb]`, but no variant row exists for an
+  inferred union's members, so `A` minted no row at all. This is the wrong question, not a
+  hidden defect.
+- **`exactArmRowOfTy(decl type) >= 0`**, "a variant row holds this type": 85 bytes-only
+  movers, the twins now sharing their arms' rows. 1 program goes runs → not-runs: D36's
+  witness becomes an emit reject. D36 ran because its twin `Dot` minted the only struct row
+  of the arm's shape. Without it, D36 is its own no-twin control, which master already
+  refuses. That defect is filed as [D15952](../inventory/D15952.md): a held list literal of an
+  arm-shaped anonymous record, returned, has no struct row for its element's field read.
+  Removing the `sDeclared` floor alone reaches "receiver is not a struct", so the fix is the
+  variant-row read, not a guard.
+
+So `typeDeclMintsRow` and `ownsRow` keep the declaration's name until D15952 closes. Then
+`exactArmRowOfTy(declTyIxOfName(s.tdName)) >= 0` replaces it and D36 is re-graded.
+
+## The other sites, by owner
 
 - **Arm-atom lists (7):** `leqNoteUnionArms`, `unionArmsNeedCloEq`, `wideRetagPairs`,
   `armsHoldHeap`, `wideArmOfRow`, `unionBoxEqColumns`, `isTestedRowIn`. They iterate a union's
@@ -49,6 +63,7 @@ declaration node.
 - **Diagnostics (2):** `fieldTypeRefusalMsg`. A refusal sentence names a spelling by design.
 - **Debug (1):** `rowDumpBuild`, by design.
 - **This lane (1):** `mvValArmOfShapeTy`, the next cut.
+- **Floor (2):** `typeDeclMintsRow`, `ownsRow`, until D15952.
 
 The variant table already carries its type column, `uVarTyIx`, written beside `uVariants` in
 `collectU`'s arm loop. A reader holding a row can ask its type there (lane D's
