@@ -26,6 +26,7 @@ const NOT_READERS: Record<string, string> = {
   "tests/vl_view_descriptor_melt_test.ts": "message",
   "tests/vl_check_filed_witnesses_test.ts": "fixture",
   "tests/vl_inventory_ls_test.ts": "fixture",
+  "tests/vl_changelog_fold_test.ts": "fixture",
   "tests/vl_seed_provenance_test.ts": "fixture",
   "tests/vl_survey_regrade_port_test.ts": "fixture",
   "tests/ci_docs_only_test.ts": "this guard: reads only the list and ci.yml",
