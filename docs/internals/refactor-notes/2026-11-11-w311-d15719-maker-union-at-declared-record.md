@@ -1,6 +1,6 @@
 # A maker's union of records delivered at a declared record is built there (D15719), 2026-11-11
 
-Lane w311. unfiled: D15719 and unfiled: D15717, which are filed in #7242. The witness is invalid wasm on master `1d517770`:
+Lane w311. unfiled: D15717, which is filed in #7242. The witness is invalid wasm on master `1d517770`:
 
     type J = { a: i32 }
     type K = { j: J | null }
