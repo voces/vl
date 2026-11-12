@@ -907,8 +907,8 @@ import {
   msTextOf,
   rlElemUnionName,
   unRowOfCanonFolded,
-  unionArmsOf,
-  unionMemberSetOf,
+  unionArmsOfSet,
+  unionMemberSetOfRow,
   unionMemberTysOfAB,
   unionRowKeyAB,
   unionSetHasNullTy,
@@ -4470,9 +4470,10 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
     const mObj = nodeAt(unwrapParen(m.memObj))
     if mObj is Ident {
       const mun = unionNameOfRead(unwrapParen(m.memObj), fnIx)
+      const munRow = unReadRowOut
       if mun != "" {
         const mAtoms: string[] = []
-        unionArmsOf(mun, mAtoms)
+        unionArmsOfSet(mun, msSetOfRowOr(munRow, mun), mAtoms)
         // The arm's struct row can be asked for by type: `unionMemberTysOf` appends
         // member types in the same order `splitUnionAtoms` cuts names, so the two arrays pair up.
         const mTys: i32[] = []
@@ -4651,7 +4652,7 @@ export function memReadBoxedAtomKind(memIx: i32, fnIx: i32): i32 {
   if t is TyPrim {
     const k = valueAtomKind(t.primName)
     if k < 0 || k == 6 { return -1 }
-    return unionStoreAtomKind(un0, k)
+    return unionStoreAtomKind(unionBoxTyIxOfExpr(memIx, fnIx), k)
   }
   -1
 }
@@ -8888,8 +8889,8 @@ function capturedStructIndex(fnIx: i32, name: string) {
 }
 
 // The ref-list table slot of a captured ref-array variable `name` of `fnIx`, a nullable one
-// included, read off the type its parent frame's binding holds; -1 for any other capture and for
-// a captured loop variable.
+// included, read off the type its parent frame's binding holds, else the env field's own slot
+// where that type keys no row (D15921); -1 for any other capture and for a captured loop variable.
 export function capturedRefListSlot(fnIx: i32, name: string) {
   if fnIx < 0 { return -1 }
   const fe = fnStmtsPosOf(fnIx)
@@ -8906,7 +8907,11 @@ export function capturedRefListSlot(fnIx: i32, name: string) {
   }
   const k = repSigKindOfTy(ty)
   if k != "reflist" && k != "nulreflist" { return -1 }
-  repSlotOfKind(k, ty)
+  const s = repSlotOfKind(k, ty)
+  if s >= 0 { return s }
+  const ck = capturedKindOf(fnIx, name)
+  if ck != "reflist" && ck != "nulreflist" { return s }
+  capturedCompanionSlot(fnIx, name)
 }
 
 // The map shape of a captured nullable-map cell, or -1 when `name` is not such a capture.
@@ -10945,13 +10950,13 @@ export function sharedUnionFieldPlan(
     if setId >= 0 { set = msTextOf(setId) }
   } else if recv is Ident {
     const un = unionNameOfRead(unwrapParen(recvIx), fnIx)
-    set = unionMemberSetOf(un)
+    set = unionMemberSetOfRow(unReadRowOut, un)
     // An un-annotated parameter's name is a spelling with no row; its instance type keys one (D15571).
     setId = msSetOfTy(nodeTyAt(unwrapParen(recvIx), fnIx))
   } else {
     const unr: i32[] = []
     const un = unionNameRowOfExpr(recvIx, fnIx, unr)
-    set = unionMemberSetOf(un)
+    set = unionMemberSetOfRow(unr[0], un)
     setId = msSetOfRowOr(unr[0], un)
   }
   if set == "" { return -1 }
@@ -13489,16 +13494,21 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
     if ak != "" { return ak }
   }
   // A read whose type at this instance is a closed function type is keyed by that type, a lifted
-  // lambda's included, since its lowering follows the recorded type (D8880).
+  // lambda's included, since its lowering follows the recorded type (D8880). A binding of one
+  // lambda holds the closure it is lowered at, whatever type a call reads it at (D15897).
+  const fe = identClosureFeOfRead(atIx, fnIx)
   const rt = tyPeelNul(nodeTyAt(atIx, fnIx))
   if rt >= 0 && tyAt(rt) is TyFunc && !tyHasTyVar(rt) {
     const rk = sigKeyOfTy(rt)
-    if rk != "" && cloSigPosOfKey(rk) >= 0 { return rk }
+    if rk != "" && cloSigPosOfKey(rk) >= 0 {
+      const bk = if fe >= 0 { cloSigKeyExt(fe) } else { "" }
+      if bk != "" && bk != rk && cloSigPosOfKey(bk) >= 0 { return bk }
+      return rk
+    }
   }
   // A closure binding keys by the signature its held value is lowered at: the producer for a
   // read whose type at this instance is open, not a fallback (D14825). The extended key, so a
   // void-returning binding resolves its `>v` sig.
-  const fe = identClosureFeOfRead(atIx, fnIx)
   if fe >= 0 { return cloSigKeyExt(fe) }
   // An inferred COPY of another closure binding (`const t0 = p`): chase the source so a call
   // through the intermediate binding classifies its result (nullable-closure read pattern).
