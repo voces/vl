@@ -33,7 +33,7 @@ map-read scalar join in `coalesce-nullable-default-fused.vl` (`emitMapGetOrScala
 ## Proof
 
 - **Local full sweep**, `sweep.vl record` with fixpoint seeds on both sides, against master
-  `784c38bf`:
+  `790e0d24`:
 
   ```
   same                            23995
