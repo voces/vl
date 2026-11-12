@@ -76,7 +76,8 @@ const MODULE = ENABLED
   : undefined;
 
 const instance = (skip: boolean, drop = 0): Exports => {
-  const exp = new WebAssembly.Instance(MODULE!, {}).exports as unknown as Exports;
+  const exp = new WebAssembly.Instance(MODULE!, {})
+    .exports as unknown as Exports;
   exp.ifaceHashArm(1);
   exp.ifaceHashDrop(drop);
   if (skip) exp.checkSkipArm(1);
@@ -149,14 +150,16 @@ const check = (exp: Exports, g: Graph, entry = "main.vl"): Result => {
     const code = readStr(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j));
     const data = readStr(exp.diagDataLen(i), (j) => exp.diagDataByte(i, j));
     diags.push(
-      `${keys[exp.diagModule(i)] ?? "?"} ${exp.diagLine(i)}:${exp.diagCol(i)}-` +
+      `${keys[exp.diagModule(i)] ?? "?"} ${exp.diagLine(i)}:${
+        exp.diagCol(i)
+      }-` +
         `${exp.diagEndLine(i)}:${exp.diagEndCol(i)} [${code}|${data}] ${msg}`,
     );
   }
   // The rows listed stably by `diagOrderKey`, the order the LSP publishes.
-  const canon = diags.map((d, i) => ({ d, k: order[i] })).sort((a, b) => a.k - b.k).map((r) =>
-    r.d
-  );
+  const canon = diags.map((d, i) => ({ d, k: order[i] })).sort((a, b) =>
+    a.k - b.k
+  ).map((r) => r.d);
   return {
     rc,
     diags,
@@ -253,11 +256,14 @@ const worse: boolean = area(1)
 
 // Main calls a generic from gen, which hub also imports, so an edit to hub puts gen in S.
 const HUB: Graph = {
-  "gen.vl": 'import { keep } from "./base"\nexport function gp<T>(x: T): T {\n  keep(x)\n  return x\n}\n',
+  "gen.vl":
+    'import { keep } from "./base"\nexport function gp<T>(x: T): T {\n  keep(x)\n  return x\n}\n',
   "base.vl": "export function keep(x: i32): void { print(x) }\n",
-  "hub.vl": 'import { gp } from "./gen"\nexport function hub(): i32 { return 1 }\n',
+  "hub.vl":
+    'import { gp } from "./gen"\nexport function hub(): i32 { return 1 }\n',
 };
-const HUB_USES = 'import { gp } from "./gen"\nimport { hub } from "./hub"\nprint(gp(1))\nprint(hub())\n';
+const HUB_USES =
+  'import { gp } from "./gen"\nimport { hub } from "./hub"\nprint(gp(1))\nprint(hub())\n';
 
 // std:fmt's own source, for an edit to the template renderer.
 const FMT = ENABLED ? Deno.readTextFileSync(`${STD}/fmt.vl`) : "";
@@ -348,7 +354,8 @@ const CASES: Case[] = [
     badWhy: "decor",
     from: "lone(n: i32): i32 { return n }",
     to: "lone(k: i32): i32 { return k + 1 }",
-    libUses: "function lone(n: i32): i32 { return n }\nexport function user(): i32 { return lone(1) }\n",
+    libUses:
+      "function lone(n: i32): i32 { return n }\nexport function user(): i32 { return lone(1) }\n",
   },
   {
     name: "type edit of a binding main does not import",
@@ -393,7 +400,8 @@ const CASES: Case[] = [
     want: "serve",
     from: "return n }\nexport let",
     to: "return n + 1 }\nexport let",
-    uses: `import { dflt, sdflt } from "./lib"\nprint(dflt())\nprint(sdflt(2))\n`,
+    uses:
+      `import { dflt, sdflt } from "./lib"\nprint(dflt())\nprint(sdflt(2))\n`,
   },
   {
     // A `null` default is typed by the declaration's check as well.
@@ -470,7 +478,8 @@ const CASES: Case[] = [
     want: "serve",
     from: "n * 2",
     to: "n * 3",
-    uses: `import { level, box, grow } from "./lib"\nlevel = 2\nbox.h = 3\ngrow()\nprint(level + box.w)\n`,
+    uses:
+      `import { level, box, grow } from "./lib"\nlevel = 2\nbox.h = 3\ngrow()\nprint(level + box.w)\n`,
   },
   {
     name: "scalar constants main widens, lib body edit",
@@ -494,7 +503,8 @@ const CASES: Case[] = [
     want: "serve",
     from: "n * 2",
     to: "n * 3",
-    uses: `import { count } from "./lib"\nconst w: i64 = 5\ncount = w\nprint(count)\n`,
+    uses:
+      `import { count } from "./lib"\nconst w: i64 = 5\ncount = w\nprint(count)\n`,
   },
   {
     name: "number binding main stores and delivers wider, lib body edit",
@@ -545,7 +555,8 @@ const CASES: Case[] = [
     why: "writer",
     from: "clear(): void { print(0) }",
     to: "clear(): void { g = null }",
-    uses: `import { g, clear } from "./lib"\nconst gv = g\nif g != null {\n  clear()\n  const k: i32 = g\n  print(k)\n}\nprint(gv)\n`,
+    uses:
+      `import { g, clear } from "./lib"\nconst gv = g\nif g != null {\n  clear()\n  const k: i32 = g\n  print(k)\n}\nprint(gv)\n`,
   },
   {
     name: "a callee main narrows across stops writing the binding",
@@ -553,7 +564,8 @@ const CASES: Case[] = [
     at: "lib.vl",
     from: "export function grow(): void { box.w = box.w + 1 }",
     to: "export function grow(): void { print(box.w + 1) }",
-    uses: `import { box, grow } from "./lib"\nconst bw = box.w\ngrow()\nprint(bw + box.w)\n`,
+    uses:
+      `import { box, grow } from "./lib"\nconst bw = box.w\ngrow()\nprint(bw + box.w)\n`,
   },
   {
     // A check reads no export surface, so an entry's re-export is an import like any other.
@@ -561,7 +573,8 @@ const CASES: Case[] = [
     want: "serve",
     from: "n * 2",
     to: "n * 3",
-    uses: `export { area, Shape as Sh } from "./lib"\nexport { size as sz } from "./lib"\n`,
+    uses:
+      `export { area, Shape as Sh } from "./lib"\nexport { size as sz } from "./lib"\n`,
   },
   {
     name: "re-export of a function whose signature changes",
@@ -614,7 +627,8 @@ const CASES: Case[] = [
     why: "ambient",
     from: "print(3)",
     to: "const qq: { f: i32 } = { f: 1 }\n  print(qq.f)",
-    uses: "type J = { f: f64 }\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n",
+    uses:
+      "type J = { f: f64 }\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n",
   },
   {
     name: "a private lib type spells main's literal record",
@@ -622,7 +636,8 @@ const CASES: Case[] = [
     why: "ambient",
     from: "function quiet",
     to: "type II = { f: i32 }\nfunction quiet",
-    uses: "type J = { f: f64 }\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n",
+    uses:
+      "type J = { f: f64 }\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n",
   },
   {
     name: "a lib generic application spells main's literal record",
@@ -631,7 +646,8 @@ const CASES: Case[] = [
     from: "function quiet",
     to: "function bq(b: Bx<i32>): void { print(b.f) }\nfunction quiet",
     libUses: "export type J = { f: f64 }\ntype Bx<T> = { f: T }\n",
-    uses: 'import { J } from "./lib"\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
+    uses:
+      'import { J } from "./lib"\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
   },
   {
     name: "a private lib self-function main's typo is near",
@@ -667,7 +683,8 @@ const CASES: Case[] = [
     why: "ambient",
     from: "n * 2",
     to: "n * 3",
-    libUses: "export type Cq = new i32\nfunction qv(): void {\n  const c = 3 as! Cq\n  print(c.zzg)\n}\n",
+    libUses:
+      "export type Cq = new i32\nfunction qv(): void {\n  const c = 3 as! Cq\n  print(c.zzg)\n}\n",
     uses: 'import { Cq } from "./lib"\nget zzg(self: Cq): i32 { 1 }\n',
   },
   {
@@ -676,7 +693,8 @@ const CASES: Case[] = [
     want: "serve",
     from: "n * 2",
     to: "n * 3",
-    uses: "type Mq = { zqa: i32, zqb: i32 }\nconst mq: Mq = { zqa: 1, zqb: 2 }\nprint(mq.zqa)\n",
+    uses:
+      "type Mq = { zqa: i32, zqb: i32 }\nconst mq: Mq = { zqa: 1, zqb: 2 }\nprint(mq.zqa)\n",
   },
   {
     name: "main's private self-function has a name lib never spells",
@@ -687,18 +705,21 @@ const CASES: Case[] = [
   },
   {
     // Lib spells `x` and `n`, but builds no record of exactly those fields, so none adopts it.
-    name: "main's private record spells lib's words but no lib record's field set",
+    name:
+      "main's private record spells lib's words but no lib record's field set",
     want: "serve",
     from: "n * 2",
     to: "n * 3",
-    uses: "type Iq = { x: i32, n: i32 }\nconst iq: Iq = { x: 1, n: 2 }\nprint(iq.n)\n",
+    uses:
+      "type Iq = { x: i32, n: i32 }\nconst iq: Iq = { x: 1, n: 2 }\nprint(iq.n)\n",
   },
   {
     name: "main spells the built-in Map",
     want: "serve",
     from: "n * 2",
     to: "n * 3",
-    uses: 'const mq: Map<string, i32> = Map()\nmq["a"] = 1\nprint(mq["a"] ?? 0)\n',
+    uses:
+      'const mq: Map<string, i32> = Map()\nmq["a"] = 1\nprint(mq["a"] ?? 0)\n',
   },
   {
     name: "a lib application of a declared Map spells main's literal record",
@@ -707,7 +728,8 @@ const CASES: Case[] = [
     from: "function quiet",
     to: "function bq(b: Map<i32>): void { print(b.f) }\nfunction quiet",
     libUses: "export type J = { f: f64 }\ntype Map<T> = { f: T }\n",
-    uses: 'import { J } from "./lib"\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
+    uses:
+      'import { J } from "./lib"\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
   },
   {
     name: "main's private type spells a lib body literal's record",
@@ -725,8 +747,10 @@ const CASES: Case[] = [
     why: "ambient",
     from: "b.h = 2",
     to: "b.w = null",
-    libUses: "export function setf(b: { w: i32 | null, h: i32 }): void { b.h = 2 }\n",
-    uses: 'import { setf } from "./lib"\nconst rw: { w: i32, h: i32 } = { w: 1, h: 2 }\nsetf(rw)\nprint(rw.h)\n',
+    libUses:
+      "export function setf(b: { w: i32 | null, h: i32 }): void { b.h = 2 }\n",
+    uses:
+      'import { setf } from "./lib"\nconst rw: { w: i32, h: i32 } = { w: 1, h: 2 }\nsetf(rw)\nprint(rw.h)\n',
   },
   {
     name: "alias write moves",
@@ -734,8 +758,10 @@ const CASES: Case[] = [
     why: "ambient",
     from: "c.h = 2",
     to: "c.w = null",
-    libUses: "export function seta(b: { w: i32 | null, h: i32 }): void {\n  const c = b\n  c.h = 2\n}\n",
-    uses: 'import { seta } from "./lib"\nconst ra: { w: i32, h: i32 } = { w: 1, h: 2 }\nseta(ra)\nprint(ra.h)\n',
+    libUses:
+      "export function seta(b: { w: i32 | null, h: i32 }): void {\n  const c = b\n  c.h = 2\n}\n",
+    uses:
+      'import { seta } from "./lib"\nconst ra: { w: i32, h: i32 } = { w: 1, h: 2 }\nseta(ra)\nprint(ra.h)\n',
   },
   {
     name: "a callee's write moves to the narrowed field",
@@ -782,7 +808,8 @@ const CASES: Case[] = [
       'import { bp, qp } from "./lib"\nif bp.w != null {\n  qp()\n  const kp: i32 = bp.w\n  print(kp)\n}\n',
   },
   {
-    name: "a private helper reached through a function value moves the exported callee's write",
+    name:
+      "a private helper reached through a function value moves the exported callee's write",
     want: "decline",
     why: "interface",
     from: "bv.h = 1",
@@ -804,7 +831,8 @@ const CASES: Case[] = [
       'import { bm, qm } from "./lib"\nfunction mm(): void { qm() }\nif bm.w != null {\n  mm()\n  const km: i32 = bm.w\n  print(km)\n}\n',
   },
   {
-    name: "an exported callee's own body moves its write, asked from inside a served function",
+    name:
+      "an exported callee's own body moves its write, asked from inside a served function",
     want: "decline",
     why: "interface",
     from: "be.h = 1",
@@ -873,7 +901,8 @@ const CASES: Case[] = [
     want: "serve",
     from: "clear(): void { print(0) }",
     to: "clear(): void { print(5) }",
-    uses: `import { g, clear } from "./lib"\nif g != null {\n  clear()\n  const k: i32 = g\n  print(k)\n}\n`,
+    uses:
+      `import { g, clear } from "./lib"\nif g != null {\n  clear()\n  const k: i32 = g\n  print(k)\n}\n`,
   },
   {
     // D6780: an escaping lib lambda starts writing the binding main narrows across a call.
@@ -884,7 +913,8 @@ const CASES: Case[] = [
     to: "run8(() => { g = null })",
     libUses:
       "function run8(f: () => void): void { f() }\nfunction zz8(): void { run8(() => { print(0) }) }\nexport function noop8(): void { print(1) }\n",
-    uses: `import { g, noop8 } from "./lib"\nif g != null {\n  noop8()\n  const k: i32 = g\n  print(k)\n}\n`,
+    uses:
+      `import { g, noop8 } from "./lib"\nif g != null {\n  noop8()\n  const k: i32 = g\n  print(k)\n}\n`,
   },
   {
     name: "a private lib lambda keeps writing nothing main narrows",
@@ -893,7 +923,8 @@ const CASES: Case[] = [
     to: "run8(() => { print(2) })",
     libUses:
       "function run8(f: () => void): void { f() }\nfunction zz8(): void { run8(() => { print(0) }) }\nexport function noop8(): void { print(1) }\n",
-    uses: `import { g, noop8 } from "./lib"\nif g != null {\n  noop8()\n  const k: i32 = g\n  print(k)\n}\n`,
+    uses:
+      `import { g, noop8 } from "./lib"\nif g != null {\n  noop8()\n  const k: i32 = g\n  print(k)\n}\n`,
   },
   {
     // D6781: lib starts narrowing across a call while a served main function writes and escapes.
@@ -902,20 +933,24 @@ const CASES: Case[] = [
     why: "writer",
     badWhy: "decor",
     from: "export function noop9(): void { print(1) }\n",
-    to: "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    noop9()\n    const k: i32 = g\n    return k\n  }\n  0\n}\n",
+    to:
+      "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    noop9()\n    const k: i32 = g\n    return k\n  }\n  0\n}\n",
     libUses:
       "export function noop9(): void { print(1) }\nexport function reg9(h: () => void): void { h() }\n",
-    uses: `import { g, reg9 } from "./lib"\nfunction w9(): void { g = null }\nreg9(w9)\n`,
+    uses:
+      `import { g, reg9 } from "./lib"\nfunction w9(): void { g = null }\nreg9(w9)\n`,
   },
   {
     name: "lib starts narrowing a binding no served function writes",
     want: "serve",
     badWhy: "decor",
     from: "export function noop9(): void { print(1) }\n",
-    to: "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    noop9()\n    const k: i32 = g\n    return k\n  }\n  0\n}\n",
+    to:
+      "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    noop9()\n    const k: i32 = g\n    return k\n  }\n  0\n}\n",
     libUses:
       "export function noop9(): void { print(1) }\nexport function reg9(h: () => void): void { h() }\n",
-    uses: `import { g, reg9 } from "./lib"\nfunction w9(): void {\n  let q9 = 1\n  q9 = 2\n  print(q9 + (g ?? 0))\n}\nreg9(w9)\n`,
+    uses:
+      `import { g, reg9 } from "./lib"\nfunction w9(): void {\n  let q9 = 1\n  q9 = 2\n  print(q9 + (g ?? 0))\n}\nreg9(w9)\n`,
   },
   {
     // Nothing the adoption reads moved: no occurrence of `mk` in S, nor its body.
@@ -934,7 +969,8 @@ const CASES: Case[] = [
     from: "print(3)",
     to: "print(mk().f)",
     libUses: "export function mk() { { f: 4 } }\n",
-    uses: 'import { mk } from "./lib"\nconst w: { f: f64 } = mk()\nprint(w.f / 8)\n',
+    uses:
+      'import { mk } from "./lib"\nconst w: { f: f64 } = mk()\nprint(w.f / 8)\n',
   },
   {
     // Lib's own delivery refuses; main's read of `mk` keeps the type it had.
@@ -942,7 +978,8 @@ const CASES: Case[] = [
     want: "serve",
     from: "print(3)",
     to: "takeW(mk())",
-    libUses: "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\n",
+    libUses:
+      "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\n",
     uses: 'import { mk } from "./lib"\nconst z: i32 = mk().f\nprint(z)\n',
   },
   {
@@ -950,19 +987,24 @@ const CASES: Case[] = [
     want: "serve",
     from: "takeW(mk())",
     to: "print(3)",
-    libUses: "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\nfunction qq(): void { takeW(mk()) }\n",
+    libUses:
+      "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\nfunction qq(): void { takeW(mk()) }\n",
     uses: 'import { mk } from "./lib"\nconst z: i32 = mk().f\nprint(z)\n',
   },
   {
     // Main's refusal read `mk`'s site count, which lib's occurrences move.
+    // A list of lists, which the fresh-call copy does not convert: with the second site the
+    // delivery is refused, with one it builds `mk` at the destination.
     name: "a lib call stops being a second site of a fresh builder",
     want: "decline",
     why: "fresh",
     from: "print(3)",
     to: "print(4)",
-    libUses: "export function mk() { { f: 4 } }\nexport function other(): void { const b = mk(); print(b.f + 1) }\n",
-    uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
-    also: ["lib.vl", "const b = mk(); print(b.f + 1)", "print(5)"],
+    libUses:
+      "export function mk() { { f: [[4]] } }\nexport function other(): void { const b = mk(); print(b.f[0][0] + 1) }\n",
+    uses:
+      'import { mk } from "./lib"\nlet v = { f: [[1.5]] }\nv = mk()\nprint(v.f[0][0])\n',
+    also: ["lib.vl", "const b = mk(); print(b.f[0][0] + 1)", "print(5)"],
   },
   {
     name: "lib edits elsewhere while main keeps lib's builder",
@@ -970,7 +1012,8 @@ const CASES: Case[] = [
     from: "print(3)",
     to: "print(4)",
     libUses: "export function mk() { { f: 4 } }\n",
-    uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
+    uses:
+      'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
   {
     // The builder's declaring statement is an input: a leaf that becomes an element read is
@@ -981,7 +1024,8 @@ const CASES: Case[] = [
     from: "{ { f: 4 } }",
     to: "{ const t = [{ f: 4 }]; t[0] }",
     libUses: "export function mk() { { f: 4 } }\n",
-    uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
+    uses:
+      'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
   {
     // D6750: an occurrence named like the builder that resolves elsewhere; the skip declines.
@@ -991,7 +1035,8 @@ const CASES: Case[] = [
     from: "function quiet",
     to: "function zz(mk: i32): void { print(mk) }\nfunction quiet",
     extra: { "lib2.vl": "export function mk() { { f: 4 } }\n" },
-    uses: 'import { mk } from "./lib2"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
+    uses:
+      'import { mk } from "./lib2"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
   {
     // D6751: main's wider delivery pins lib's literal binding at main's type, so lib checked
@@ -1001,19 +1046,24 @@ const CASES: Case[] = [
     why: "interface",
     badWhy: "decor",
     from: "function quiet",
-    to: "export function hand(): void { let w = { f: 1, g: { h: 1, k: 2 } }; w = q2; print(w.f) }\nfunction quiet",
+    to:
+      "export function hand(): void { let w = { f: 1, g: { h: 1, k: 2 } }; w = q2; print(w.f) }\nfunction quiet",
     libUses: "export const pk = { f: 4, g: { h: 1, k: 2 } }\nconst q2 = pk\n",
-    uses: 'import { pk } from "./lib"\nlet vk = { f: 1.5, g: { h: 1 } }\nvk = pk\nprint(vk.f)\n',
+    uses:
+      'import { pk } from "./lib"\nlet vk = { f: 1.5, g: { h: 1 } }\nvk = pk\nprint(vk.f)\n',
   },
   {
     // A builder main's wider delivery keeps: lib's new own delivery is what main's refusal reads.
+    // A list of lists, which the fresh-call copy does not convert, keeps the builder.
     name: "lib hands on a kept builder main delivers to a wider record",
     want: "decline",
     why: "fresh",
     from: "function quiet",
-    to: "export function hand(): void { let w = { f: 1 }; w = mk(); print(w.f) }\nfunction quiet",
-    libUses: "export function mk() { { f: 4 } }\n",
-    uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
+    to:
+      "export function hand(): void { let w = { f: [[1]] }; w = mk(); print(w.f[0][0]) }\nfunction quiet",
+    libUses: "export function mk() { { f: [[4]] } }\n",
+    uses:
+      'import { mk } from "./lib"\nlet v = { f: [[1.5]] }\nv = mk()\nprint(v.f[0][0])\n',
   },
   {
     // Lib is in S only as mid's import, and a generic main calls from it closes over nothing moved.
@@ -1025,7 +1075,8 @@ const CASES: Case[] = [
     uses: 'import { pick } from "./lib"\nprint(pick(1, 2))\n',
   },
   {
-    name: "a generic called from a module S only imports, over an unmoved closure",
+    name:
+      "a generic called from a module S only imports, over an unmoved closure",
     want: "serve",
     at: "hub.vl",
     from: "return 1",
@@ -1045,7 +1096,8 @@ const CASES: Case[] = [
     also: ["base.vl", "x: i32", "x: string"],
   },
   {
-    name: "a generic called from a module S only imports, over a banked diagnostic",
+    name:
+      "a generic called from a module S only imports, over a banked diagnostic",
     want: "decline",
     why: "demand",
     at: "hub.vl",
@@ -1111,7 +1163,8 @@ const CASES: Case[] = [
     from: "zna: i32 }",
     to: "zna: string }",
     libUses: "export type Nq = { zna: i32 }\n",
-    uses: 'import { Nq } from "./lib"\nfunction nqf(q: Nq): i32 { 1 }\nprint(1)\n',
+    uses:
+      'import { Nq } from "./lib"\nfunction nqf(q: Nq): i32 { 1 }\nprint(1)\n',
   },
   {
     // Main's own errors may suggest any name lib declares, so they decline every ambient move.
@@ -1120,7 +1173,8 @@ const CASES: Case[] = [
     badWhy: "ambient",
     from: "zua: i32 }",
     to: "zua: i64 }",
-    libUses: "type Uq = { zua: i32 }\nfunction uqf(): i32 {\n  const u: Uq = { zua: 1 }\n  return 1\n}\n",
+    libUses:
+      "type Uq = { zua: i32 }\nfunction uqf(): i32 {\n  const u: Uq = { zua: 1 }\n  return 1\n}\n",
   },
   {
     // Main's typed bindings share the record's field names; a binding is not a field.
@@ -1129,8 +1183,10 @@ const CASES: Case[] = [
     badWhy: "ambient",
     from: "zwb: i32 }",
     to: "zwb: i64 }",
-    libUses: "type Wq = { zwa: i32, zwb: i32 }\nfunction wqf(): i32 {\n  const w: Wq = { zwa: 1, zwb: 2 }\n  return w.zwa\n}\n",
-    uses: "let zwa: i32 = 1\nfunction wqm(): i32 {\n  const zwb: i32 = 2\n  return zwb\n}\nprint(zwa + wqm())\n",
+    libUses:
+      "type Wq = { zwa: i32, zwb: i32 }\nfunction wqf(): i32 {\n  const w: Wq = { zwa: 1, zwb: 2 }\n  return w.zwa\n}\n",
+    uses:
+      "let zwa: i32 = 1\nfunction wqm(): i32 {\n  const zwb: i32 = 2\n  return zwb\n}\nprint(zwa + wqm())\n",
   },
   {
     // A getter is found from its receiver, so main reads it without importing it.
@@ -1140,7 +1196,8 @@ const CASES: Case[] = [
     from: "zgq(self: Cr): i32 { 1 }",
     to: 'zgq(self: Cr): string { "x" }',
     libUses: "export type Cr = new i32\nexport get zgq(self: Cr): i32 { 1 }\n",
-    uses: 'import { Cr } from "./lib"\nconst cr = 3 as! Cr\nconst vq: i32 = cr.zgq\nprint(vq)\n',
+    uses:
+      'import { Cr } from "./lib"\nconst cr = 3 as! Cr\nconst vq: i32 = cr.zgq\nprint(vq)\n',
   },
   {
     name: "a bare import of std:fmt beside an edit to a lib template",
@@ -1158,10 +1215,12 @@ const CASES: Case[] = [
     why: "pass",
     from: "{ return 0 }",
     to: "{\n  if r is Cfg { return r.port }\n  return 0\n}",
-    libUses: "export type Json = null | boolean | f64 | string | Json[] | { [string]: Json }\n" +
+    libUses:
+      "export type Json = null | boolean | f64 | string | Json[] | { [string]: Json }\n" +
       "type Cfg = { port: i32, host: string | null }\n" +
       "export function jd(r: Json): i32 { return 0 }\n",
-    uses: 'import { jd, Json } from "./lib"\nconst jm: { [string]: Json } = Map()\nprint(jd(jm))\n',
+    uses:
+      'import { jd, Json } from "./lib"\nconst jm: { [string]: Json } = Map()\nprint(jd(jm))\n',
   },
   {
     // The re-export's target moves, so main's import resolves to another function.
@@ -1182,29 +1241,34 @@ const CASES: Case[] = [
     why: "no bank",
     from: '"x" | "y"',
     to: "i32 | i64",
-    libUses: 'function luq(): void {\n  const u: "x" | "y" | null = null\n  print(1)\n}\n',
+    libUses:
+      'function luq(): void {\n  const u: "x" | "y" | null = null\n  print(1)\n}\n',
     uses: 'const l0: "#lu0" = "c"\n',
   },
   {
     // A shape summary memoised while rig's bodies were still being typed is not what the
     // finished check answers (D14460), so a trailing comment on defs must not move it.
-    name: "a trailing comment on a module whose import holds a write-shape question",
+    name:
+      "a trailing comment on a module whose import holds a write-shape question",
     want: "serve",
     badWhy: "decor",
     at: "defs.vl",
     from: "export const RIG_BOAR = 0",
     to: "export const RIG_BOAR = 0\n// a trailing note",
     extra: {
-      "rig.vl": "export type Key = { fn: f64, ff: f64 }\nexport const PART_LEG = 3\n" +
+      "rig.vl":
+        "export type Key = { fn: f64, ff: f64 }\nexport const PART_LEG = 3\n" +
         "export type View = { side: boolean }\n" +
         "export type Gait = { cycle: f64, gait: f64, stride: f64 }\n" +
         "function lerp(a: f64, b: f64, t: f64) { a + (b - a) * t }\n" +
         "export function pose(v: View, k: Key, g: Gait): i32 {\n  leg(v, 0, k, g, 0.5, 0.5, 0)\n  0\n}\n" +
         "function leg(v: View, i: i32, k: Key, g: Gait, amp: f64, run: f64, s: i32) {\n" +
         "  const extra = [k.fn, k.ff][i]\n  const fold = min(1.0, g.gait) * lerp(0.15, 0.28, run)\n}\n",
-      "defs.vl": 'import { View, PART_LEG } from "./rig"\nexport const RIG_BOAR = 0\n',
+      "defs.vl":
+        'import { View, PART_LEG } from "./rig"\nexport const RIG_BOAR = 0\n',
     },
-    uses: 'import { Buffer } from "std:buffer"\nimport { RIG_BOAR } from "./defs"\nprint(RIG_BOAR)\n',
+    uses:
+      'import { Buffer } from "std:buffer"\nimport { RIG_BOAR } from "./defs"\nprint(RIG_BOAR)\n',
   },
   {
     // Lib's error renders a literal union by its members, and a whole check, which also holds
@@ -1219,7 +1283,8 @@ const CASES: Case[] = [
   },
   {
     // Lib's error offers no near name, so main's private declarations cannot reach its text.
-    name: "lib's error offers no name and main declares a private self-function",
+    name:
+      "lib's error offers no name and main declares a private self-function",
     want: "serve",
     from: "print(3)",
     to: "print(4)",
@@ -1240,7 +1305,9 @@ const graphs = (c: Case, bad: boolean): [Graph, Graph] => {
   if (c.also) edits.push(c.also);
   const h: Graph = { ...g };
   for (const [at, from, to] of edits) {
-    if (!h[at].includes(from)) throw new Error(`${c.name}: no \`${from}\` in ${at}`);
+    if (!h[at].includes(from)) {
+      throw new Error(`${c.name}: no \`${from}\` in ${at}`);
+    }
     h[at] = h[at].replace(from, to);
   }
   return [g, h];
@@ -1263,7 +1330,13 @@ const grade = (
   c: Case,
   bad: boolean,
   p: Pair,
-): { fails: string[]; got: Result; reordered: boolean; before: Graph; after: Graph } => {
+): {
+  fails: string[];
+  got: Result;
+  reordered: boolean;
+  before: Graph;
+  after: Graph;
+} => {
   const [before, after] = graphs(c, bad);
   const tag = `${c.name}${bad ? " (main with errors)" : ""}`;
   const fails: string[] = [];
@@ -1271,18 +1344,31 @@ const grade = (
   const first = check(p.warm, before);
   if (first.reason !== 1) fails.push(`${tag}: the first check found a bank`);
   if (!same(first.canon, first.diags)) {
-    fails.push(`${tag}: the armed whole check listed [${first.diags.join(" | ")}] out of order`);
+    fails.push(
+      `${tag}: the armed whole check listed [${
+        first.diags.join(" | ")
+      }] out of order`,
+    );
   }
   const got = check(p.warm, after);
   const plain = check(p.plain, after);
-  if (plain.rc !== got.rc || !same(plain.canon, got.diags) || !same(got.canon, got.diags)) {
+  if (
+    plain.rc !== got.rc || !same(plain.canon, got.diags) ||
+    !same(got.canon, got.diags)
+  ) {
     fails.push(
-      `${tag}: served rc ${got.rc} [${got.diags.join(" | ")}], unarmed rc ${plain.rc} in order [${
-        plain.canon.join(" | ")
-      }]`,
+      `${tag}: served rc ${got.rc} [${
+        got.diags.join(" | ")
+      }], unarmed rc ${plain.rc} in order [${plain.canon.join(" | ")}]`,
     );
   }
-  return { fails, got, reordered: !same(plain.diags, plain.canon), before, after };
+  return {
+    fails,
+    got,
+    reordered: !same(plain.diags, plain.canon),
+    before,
+    after,
+  };
 };
 
 // The cases whose served instance also builds: one served, one declined and rerun.
@@ -1328,18 +1414,28 @@ Deno.test({
         const fresh = instance(true);
         const b = build(fresh, after);
         if (!bytesEq(build(p.warm, after), b)) {
-          fails.push(`${c.name}: the build after a module check differs from a fresh build`);
+          fails.push(
+            `${c.name}: the build after a module check differs from a fresh build`,
+          );
         }
         if (bytesEq(build(fresh, before), b)) {
-          fails.push(`${c.name}: want the edit to change the build, got the same bytes`);
+          fails.push(
+            `${c.name}: want the edit to change the build, got the same bytes`,
+          );
         }
       }
     }
     if (Deno.env.get("VL_CHECK_SKIP_TABLE")) {
-      console.log(`${table.join("\n")}\n${reordered} unarmed checks listed in another order`);
+      console.log(
+        `${
+          table.join("\n")
+        }\n${reordered} unarmed checks listed in another order`,
+      );
     }
     if (fails.length > 0) {
-      throw new Error(`want every served check sound, got:\n  ${fails.join("\n  ")}`);
+      throw new Error(
+        `want every served check sound, got:\n  ${fails.join("\n  ")}`,
+      );
     }
   },
 });
@@ -1368,7 +1464,10 @@ Deno.test({
       ["main's private type spells a lib body literal's record", 524288],
       ["a lib generic application spells main's literal record", 8388608],
       // `IH_NO_AMB_SHADOW` reads `Map<…>` as the built-in even where a module declares `Map`.
-      ["a lib application of a declared Map spells main's literal record", 67108864],
+      [
+        "a lib application of a declared Map spells main's literal record",
+        67108864,
+      ],
       ["a lib method typo is near a private main self-function", 4194304],
       ["lib's error renders a literal union a private main alias names", 32768],
       ["main declares a getter on a lib type lib reads", 2097152 | 4194304],
@@ -1376,9 +1475,18 @@ Deno.test({
       ["a callee's write moves to the narrowed field", 2048],
       ["a callee's helper write moves to the narrowed field", 2048],
       ["a callee's alias write moves to the narrowed field", 2048],
-      ["a private helper two calls down moves the exported callee's write", 2048],
-      ["a private helper reached through a function value moves the exported callee's write", 2048],
-      ["an exported callee's own body moves its write, asked from inside a served function", 2048],
+      [
+        "a private helper two calls down moves the exported callee's write",
+        2048,
+      ],
+      [
+        "a private helper reached through a function value moves the exported callee's write",
+        2048,
+      ],
+      [
+        "an exported callee's own body moves its write, asked from inside a served function",
+        2048,
+      ],
       ["a served function's call into lib moves its write", 2048],
       // `SK_NO_WRITER` drops the writer closure of a name a whole-program question asked about.
       ["a private lib lambda starts writing a binding main narrows", 16],
@@ -1391,16 +1499,26 @@ Deno.test({
       ["lib's builder leaf becomes an element read", 65536],
       ["a lib call stops being a second site of a fresh builder", 1073741824],
       // With `SK_NO_FRESH_OCC` too: lib's new site of `mk` alone declines it at stage 0.
-      ["lib hands on a kept builder main delivers to a wider record", 1073741824 | -2147483648],
+      [
+        "lib hands on a kept builder main delivers to a wider record",
+        1073741824 | -2147483648,
+      ],
       // `IH_NO_TYPES` hides the type main's delivery pins a lib binding at.
       ["lib hands on a binding main delivers to a wider record", 8],
       // `SK_NO_KEPT_SRC | IH_NO_CROSS` keeps a bank across a generic whose closure moved, with
       // the reach below the origin dropped; dropping the reach alone still declines `demand`.
-      ["a generic called from a module S only imports, over a moved closure", 134217728 | 8192],
+      [
+        "a generic called from a module S only imports, over a moved closure",
+        134217728 | 8192,
+      ],
     ];
     const p = pairOf();
     for (const [name, mask] of witness) {
-      const { fails, got } = grade(CASES.find((c) => c.name === name)!, false, masked(p, mask));
+      const { fails, got } = grade(
+        CASES.find((c) => c.name === name)!,
+        false,
+        masked(p, mask),
+      );
       if (got.served === 0 || fails.length === 0) {
         throw new Error(
           `want mask ${mask} to serve \`${name}\` unsoundly, got ${got.served} served` +
@@ -1411,32 +1529,50 @@ Deno.test({
     const moved = CASES.find((c) => c.name.endsWith("over a moved closure"))!;
     const alone = grade(moved, false, masked(p, 8192)).got;
     if (alone.served !== 0 || REASON[alone.reason] !== "demand") {
-      throw new Error(`want IH_NO_CROSS alone to decline \`demand\`, got ${REASON[alone.reason]}`);
+      throw new Error(
+        `want IH_NO_CROSS alone to decline \`demand\`, got ${
+          REASON[alone.reason]
+        }`,
+      );
     }
     // `IH_NO_IMPORT_MAP` hides a moved re-export from the resolved guard; the reach row's own
     // change still declines it, one guard later.
-    const rx = CASES.find((c) => c.name.startsWith("a re-export main imports"))!;
+    const rx = CASES.find((c) =>
+      c.name.startsWith("a re-export main imports")
+    )!;
     const late = grade(rx, true, masked(p, 262144)).got;
     if (late.served !== 0 || REASON[late.reason] !== "decor") {
-      throw new Error(`want IH_NO_IMPORT_MAP to decline \`decor\`, got ${REASON[late.reason]}`);
+      throw new Error(
+        `want IH_NO_IMPORT_MAP to decline \`decor\`, got ${
+          REASON[late.reason]
+        }`,
+      );
     }
     // A bank read under another mask is no bank: its hashes were taken with other ingredients.
     const unmasked = check(masked(p, 0).warm, graphs(moved, false)[0]);
     if (unmasked.served !== 0 || REASON[unmasked.reason] !== "no bank") {
-      throw new Error(`want the mask-262144 bank unread at mask 0, got ${REASON[unmasked.reason]}`);
+      throw new Error(
+        `want the mask-262144 bank unread at mask 0, got ${
+          REASON[unmasked.reason]
+        }`,
+      );
     }
   },
 });
 
 Deno.test({
-  name: "a second edit on top of a served check is served from the refreshed bank",
+  name:
+    "a second edit on top of a served check is served from the refreshed bank",
   ignore: !ENABLED,
   fn() {
     // Main's self-function error carries data, and a served module's readings are carried, so
     // every step is compared with the whole check's rows and with its hashes.
     const uses = "function get(self: {[i32]: i32}, k: i32): i32 { k }\n";
     const [g0, g1] = graphs({ ...CASES[0], uses }, true);
-    const g2 = { ...g1, "lib.vl": g1["lib.vl"].replace("print(3)", "print(5)") };
+    const g2 = {
+      ...g1,
+      "lib.vl": g1["lib.vl"].replace("print(3)", "print(5)"),
+    };
     // A mid edit after a lib edit, so mid's reach of lib is the one the served check carried.
     const g3 = { ...g2, "mid.vl": g2["mid.vl"].replace("+ 1", "+ 2") };
     const warm = instance(true);
@@ -1455,8 +1591,12 @@ Deno.test({
       const held = hashes(warm) === hashes(plain);
       if (got.served === 0 || !same(got.diags, want.diags) || !held) {
         throw new Error(
-          `want step ${i + 1} served with the whole check's rows and hashes, got ${got.served}` +
-            ` served (${REASON[got.reason]}), [${got.diags.join(" | ")}] against` +
+          `want step ${
+            i + 1
+          } served with the whole check's rows and hashes, got ${got.served}` +
+            ` served (${REASON[got.reason]}), [${
+              got.diags.join(" | ")
+            }] against` +
             ` [${want.diags.join(" | ")}], hashes ${held ? "equal" : "differ"}`,
         );
       }
@@ -1469,14 +1609,18 @@ Deno.test({
   ignore: !ENABLED,
   fn() {
     const [g0, g1] = graphs(CASES[0], true);
-    const other = `import { area } from "./lib"\nprint(area(2))\nconst no: string = 1\n`;
+    const other =
+      `import { area } from "./lib"\nprint(area(2))\nconst no: string = 1\n`;
     const h0 = { ...g0, "other.vl": other };
     const h1 = { ...g1, "other.vl": other };
     const warm = instance(true);
     check(warm, h0);
     check(warm, h0, "other.vl");
     const got: Result[] = [check(warm, h1), check(warm, h1, "other.vl")];
-    const want = [check(instance(true), h1), check(instance(true), h1, "other.vl")];
+    const want = [
+      check(instance(true), h1),
+      check(instance(true), h1, "other.vl"),
+    ];
     got.forEach((r, i) => {
       if (r.served === 0 || !same(r.diags, want[i].diags)) {
         throw new Error(
@@ -1494,23 +1638,33 @@ const lintRows = (exp: Exports, paired: boolean) => {
   exp.lintGraph();
   const out: string[] = [];
   for (let i = 0; i < exp.lintGraphCount(); i++) {
-    const code = readStr(exp.lintGraphCodeLen(i), (j) => exp.lintGraphCodeByte(i, j));
-    const msg = readStr(exp.lintGraphMsgLen(i), (j) => exp.lintGraphMsgByte(i, j));
+    const code = readStr(
+      exp.lintGraphCodeLen(i),
+      (j) => exp.lintGraphCodeByte(i, j),
+    );
+    const msg = readStr(
+      exp.lintGraphMsgLen(i),
+      (j) => exp.lintGraphMsgByte(i, j),
+    );
     out.push(
-      `${exp.lintGraphModule(i)} ${exp.lintGraphLine(i)}:${exp.lintGraphCol(i)} [${code}] ${msg}`,
+      `${exp.lintGraphModule(i)} ${exp.lintGraphLine(i)}:${
+        exp.lintGraphCol(i)
+      } [${code}] ${msg}`,
     );
   }
   return out;
 };
 
 Deno.test({
-  name: "a lint paired with a served check reads the served module's typed sites",
+  name:
+    "a lint paired with a served check reads the served module's typed sites",
   ignore: !ENABLED,
   fn() {
     // `prefer-interpolation` judges a chain opening with a parameter only from the typed `+`
     // links, so lib's chain is reported by a paired lint and not by an unpaired one; main's
     // chain is in a served module, whose links the served check carries from the bank.
-    const lib = `export function greet(n: string): string { return n + " a" + " b" + " c" }
+    const lib =
+      `export function greet(n: string): string { return n + " a" + " b" + " c" }
 function quiet(): void { print(3) }
 export function noise(): void { quiet() }
 `;
@@ -1529,12 +1683,22 @@ print(greet(shout("x")))
     const whole = lintRows(fresh, true);
     check(fresh, g1);
     const unpaired = lintRows(fresh, false);
-    if (got.served === 0) throw new Error(`want lib served, got ${REASON[got.reason]}`);
+    if (got.served === 0) {
+      throw new Error(`want lib served, got ${REASON[got.reason]}`);
+    }
     if (!same(served, whole)) {
-      throw new Error(`want [${whole.join(" | ")}] after the served check, got [${served.join(" | ")}]`);
+      throw new Error(
+        `want [${whole.join(" | ")}] after the served check, got [${
+          served.join(" | ")
+        }]`,
+      );
     }
     if (same(whole, unpaired)) {
-      throw new Error(`want the paired lint to differ from an unpaired one, got [${whole.join(" | ")}] for both`);
+      throw new Error(
+        `want the paired lint to differ from an unpaired one, got [${
+          whole.join(" | ")
+        }] for both`,
+      );
     }
   },
 });
