@@ -98,6 +98,6 @@ The workflow builds each side's fixpoint seed, reusing ci.yml's caches. It recor
 side on 16 runners, merges and diffs them, and writes the diff to the job summary. A base
 recording is kept for 7 days as artifact `sweep-base-<key>`; a later run whose key matches (same
 base commit, head population, head-built sweep tool and workflow file, listed in the `base-cache`
-job) restores it and records only the head side. Artifact
+job) restores it and records only the head side; `diff` reads it unchanged. Artifact
 `sweep-result` holds both merged recordings, so you can re-diff them locally. The run fails
 when `diff` does. The population and the tool come from the head commit.
