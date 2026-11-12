@@ -1288,6 +1288,8 @@ import {
   refArrSlotTag,
   tyIsAtomLeafList,
   unionSetArmTysAB,
+  unionTyArms,
+  unionTyHasAtom,
   variantDiscrimFieldNeeded,
   variantFieldLitLexes,
   variantHasDiscrimField,
@@ -1527,7 +1529,6 @@ import {
   unionArmsOfTy,
   unionHasAtomAB,
   unionHasAtomOfTy,
-  unionHasAtomTy,
   unionMemberAtomsOf,
   unionMemberSetOf,
   unionMemberTysOf,
@@ -4165,23 +4166,11 @@ function isNumRecvBaseName(recvIx: i32, fnIx: i32) {
   if tyAt(t) is TyUnion { numLitUnionBaseName(t) } else { "" }
 }
 
-// The value-union name of an `is` receiver, for the box-tag soundness floor in `emitIs`.
-// `unionNameOfExpr` covers every receiver form except the optional chain, whose leaf field
-// is resolved here instead. `""` when the receiver is not a union.
+// The value-union name of an `is` receiver, for the box-tag soundness floor in `emitIs`; `""`
+// when the receiver is not a union. An optional chain's leaf field is among the forms
+// `unionNameOfExpr` covers.
 function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
-  const nm = unionNameOfExpr(exprIx, fnIx)
-  if nm != "" { return nm }
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is OptMember {
-    const si = optChainStructIdxOf(e.omObj, fnIx)
-    if si >= 0 {
-      const fi = sFieldIndex(si, e.omProp)
-      if fi >= 0 {
-        if sFieldIsUnionBox(si, fi) { return sFieldElemNameAt(si, fi) }
-      }
-    }
-  }
-  ""
+  unionNameOfExpr(exprIx, fnIx)
 }
 
 // The operand of `x == null` / `null == x` whose checked type admits no `null`, or whose hole
@@ -8496,13 +8485,7 @@ function mapBoxTag(sh: i32): i32 {
 // The tag the map value `exprIx` of shape `sh` boxes under in `unionName`. Where two map types
 // of the module's unions share that struct (D2493), each owns a tag, so the member is chosen by
 // TYPE: the union's one arm of the shape, else the arm the value's static type is.
-function mapBoxTagOf(
-  sh: i32,
-  unionName: string,
-  unionTy: i32,
-  exprIx: i32,
-  fnIx: i32,
-): i32 {
+function mapBoxTagOf(sh: i32, unionTy: i32, exprIx: i32, fnIx: i32): i32 {
   const s = mapShapeFoldSet(sh)
   if !mapShapeTwinned(s) { return mapBoxTag(s) }
   const vt = mapValueTyOf(exprIx, fnIx)
@@ -8511,7 +8494,7 @@ function mapBoxTagOf(
   let n = 0
   const atoms: string[] = []
   const mems: i32[] = []
-  if unionSetArmTysAB(106, unionName, unionTy, atoms, mems) {
+  if unionTyArms(unionTy, atoms, mems) {
     let i = 0
     while i < mems.length {
       const m = mems[i]
@@ -8559,8 +8542,8 @@ function emitUnionMapArmBox(
     nullable = true
   }
   const sh = mapShapeOfExpr(exprIx, fnIx)
-  if !unionHasMapArmSlot(unionName, unionTy, sh) { return 0 }
-  const tag = mapBoxTagOf(sh, unionName, unionTy, exprIx, fnIx)
+  if !unionHasMapArmSlot(unionTy, sh) { return 0 }
+  const tag = mapBoxTagOf(sh, unionTy, exprIx, fnIx)
   if tag < 0 { return -1 }
   if nullable { return emitNulMapArmBox(body, tag, exprIx, "", -1, -1, fnIx) }
   fbI32Rel(RS_TAG, tag)
@@ -8615,8 +8598,8 @@ function emitCoalesceMapJoin(
   if un == "" { return 0 }
   const unTy = nodeTyInOf(exprIx, fnIx)
   const sh = mapShapeOfExpr(e.binLeft, fnIx)
-  if !unionHasMapArmSlot(un, unTy, sh) { return 0 }
-  const tag = mapBoxTagOf(sh, un, unTy, e.binLeft, fnIx)
+  if !unionHasMapArmSlot(unTy, sh) { return 0 }
+  const tag = mapBoxTagOf(sh, unTy, e.binLeft, fnIx)
   if tag < 0 { return -1 }
   emitNulMapArmBox(
     body,
@@ -9390,7 +9373,7 @@ function emitUnionCoerceRecord(
   // where the box wants the variant struct. Re-box it against the matched arm
   // (`emitStructExprAsVariantBox`). Gated on the heaps differing, so a deduped shape is raw.
   if unionName != "" && exprStruct(exprIx, fnIx) {
-    const rbVi = unionArmVariantForStructExpr(unionName, uTy, exprIx, fnIx)
+    const rbVi = unionArmVariantForStructExpr(uTy, exprIx, fnIx)
     if rbVi >= 0 {
       const rbSsi = structIndexOfExpr(exprIx, fnIx)
       if rbSsi >= 0 {
@@ -9453,8 +9436,8 @@ function emitUnionCoerceMap(
     // A Set rides its key's mono map slot.
     if mSlot != -3 { mSlot = mapShapeFoldSet(mSlot) }
     if mSlot >= -1 || mSlot == -4 || mSlot == -6 {
-      if unionHasMapArmSlot(unionName, uTy, mSlot) {
-        const mTag = mapBoxTagOf(mSlot, unionName, uTy, exprIx, fnIx)
+      if unionHasMapArmSlot(uTy, mSlot) {
+        const mTag = mapBoxTagOf(mSlot, uTy, exprIx, fnIx)
         if mTag < 0 { return -1 }
         fbI32Rel(RS_TAG, mTag)
         if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
@@ -15287,10 +15270,11 @@ function emitMapGetOrScalarJoin(
       exprIx,
     )
   }
-  let joinSet = unionMemberSetOf(joinN)
-  if joinSet == "" { joinSet = joinN }
   const vb = vbHeapIdxOfKind(ak)
-  if vb < 0 || !unionHasAtomTy(joinSet, scalarAtomNameOfKind(ak), false) {
+  if (
+    vb < 0
+    || !unionTyHasAtom(boxDstTyOf(e.binRight, fnIx), scalarAtomNameOfKind(ak))
+  ) {
     return emitFailAt(
       "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
       exprIx,
@@ -39745,10 +39729,12 @@ function coalNicheBoxTag(
   if ak >= 0 {
     const en = refAtomElemName(ak)
     if en == "" { return -1 }
-    if !unionHasAtomTy(joinSet, en, ak != 2) { return -1 }
+    if !unionTyHasAtom(joinTy, if ak != 2 { en + "[]" } else { en }) {
+      return -1
+    }
     return scalarTagOfKind(ak)
   }
-  const vi = unionArmVariantWithHeap(joinSet, joinTy, heapIx)
+  const vi = unionArmVariantWithHeap(joinTy, heapIx)
   if vi >= 0 && vi < uTags.length { return uTags[vi] }
   -1
 }
@@ -39840,20 +39826,13 @@ function emitUnionBoxNulNiche(
 // nor a resolvable arm of `joinSet` passes RAW through the box coercion, and a bare
 // `(ref $struct)` under a box blocktype is invalid wasm. Only that shape can, so only it is
 // asked; every other default either boxes or takes its own loud reject (D1720).
-function coalJoinDefaultBoxes(
-  joinSet: string,
-  joinTy: i32,
-  defIx: i32,
-  fnIx: i32,
-): boolean {
+function coalJoinDefaultBoxes(joinTy: i32, defIx: i32, fnIx: i32): boolean {
   const d = nodeAt(unwrapParen(defIx))
   if d is ObjLit { return true }
   // A default that is itself a box (a nested join) is already the box rep.
   if exprUnion(defIx, fnIx) { return true }
   if !exprStruct(defIx, fnIx) { return true }
-  if unionArmVariantForStructExpr(joinSet, joinTy, defIx, fnIx) >= 0 {
-    return true
-  }
+  if unionArmVariantForStructExpr(joinTy, defIx, fnIx) >= 0 { return true }
   exprVariantIndex(defIx, fnIx) >= 0
 }
 
@@ -39893,7 +39872,7 @@ function emitCoalesceNulRefJoin(
       exprIx,
     )
   }
-  if !coalJoinDefaultBoxes(joinSet, joinTy, e.binRight, fnIx) {
+  if !coalJoinDefaultBoxes(joinTy, e.binRight, fnIx) {
     return emitFailAt(
       "emitProgram: `??` default names no arm of the union its result is",
       exprIx,
@@ -39938,17 +39917,15 @@ function emitCoalesceNulBoolJoin(
       exprIx,
     )
   }
-  let joinSet = unionMemberSetOf(joinN)
-  if joinSet == "" { joinSet = joinN }
   const joinTy = boxDstTyOf(e.binRight, fnIx)
   const bvb = vbHeapIdxOfKind(1)
-  if bvb < 0 || !unionHasAtomTy(joinSet, "boolean", false) {
+  if bvb < 0 || !unionTyHasAtom(joinTy, "boolean") {
     return emitFailAt(
       "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
       exprIx,
     )
   }
-  if !coalJoinDefaultBoxes(joinSet, joinTy, e.binRight, fnIx) {
+  if !coalJoinDefaultBoxes(joinTy, e.binRight, fnIx) {
     return emitFailAt(
       "emitProgram: `??` default names no arm of the union its result is",
       exprIx,
