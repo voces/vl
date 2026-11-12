@@ -1,0 +1,101 @@
+# Step 7: the field element-name column's readers graded, 2026-11-12
+
+`sFieldElemName` (struct rows) and its arm twin `armFieldElemName()` record, for each field, a
+spelling: the union, nested row or literal set the field holds. Every field now also records its
+arena type, `sFieldStoreTy` (w314's census: on every typed, covered row the type agrees with the
+code). This note grades each read of the spelling column by what it needs:
+
+- **(a)** it already holds the field's type and only hands the name to the union registry, so it
+  converts when the registry names its row from the type (w316's C3);
+- **(b)** it needs the name for something else: a row-identity compare, a presence test, or a
+  row lookup by name;
+- **(c)** no program reaches it.
+
+The population is the sweep's 24,006 programs, master `a8bc40d3`. Every read was wrapped by a probe
+that tagged its reach and whether the value was empty. The probe was validated on
+`arm-element-list-mutation`, which answers the arm-agreement sites E42–E46. Reach counts programs.
+
+## (a) the name is a union-registry key, handed over beside the field's type
+
+| site | function | reach |
+| --- | --- | --- |
+| E4, E5, E6 | `memberUnionFieldName` (`emit_classify`) | 1,205 · 53 · 10 |
+| E8 | `armFieldUnionName` | 621 |
+| E50 | `emitStructFieldValueUnder` (`wasmEmit`) | 975 |
+| E51 | `emitVariantFieldBox` | 738 |
+| E49 | `emitOmittedFieldNull` | 557 |
+| E62, E63 | `emitCoalesceUnionField` | 290 · 25 |
+| E61 | `emitStructFieldStoreValue` | 109 |
+| E26 | `sharedFieldArmValueBox` (`isValueUnionName`) | 37 |
+| E24, E25 | `sharedPlanBoxName`, `sharedPlanOneBoxName` | 14 · 6 |
+| E59, E60 | `emitStructEqFieldAt` | 5 · 13 |
+| E53 | `variantBoxFieldComparable` | 1 |
+| E55 | `emitVariantFieldEqCoreAt` | 1 |
+| E23 | `monoArgTyNameProjected` (`emit_mono`, w317's) | 4 |
+
+## (b) the name does something other than key the registry
+
+**Row-identity compares.** Two rows or arms count as the same layout when their element names are
+equal. Each converts to a compare of the two stored types, as `annShapeIndexOf`'s dedup did
+(`2026-11-11-step7-l2-shape-dedup-by-store-ty.md`). A field with no stored type keeps the name.
+
+| site | function | reach |
+| --- | --- | --- |
+| E44, E45 | `variantRowFieldsMatch` (`emit_union_atoms`) | 4,032 |
+| E42, E43 | `variantRowAgree` | 3,455 |
+| E46 | `armStageAgree` | 3,429 |
+| E1, E2 | `sRowsTwin` (`emit_atom_kinds`) | 1,055 |
+| E10 | `objMatchesVariantIdxOmit` (passes the column on) | 76 |
+| E27, E28 | `structFieldCodesEq` (`emit_rep`) | 58 |
+| E38, E39 | `variantLitPairKind` | 48 |
+| E47, E48 | `variantRowsTagEqual` (`emit_variant_sig`) | 37 |
+| E34 | `shapeRowScanK` | 34 |
+| E40, E41 | `sigFieldMayMatch` (already a canonical id of the name) | 32 |
+| E17, E18 | `variantFieldTysEq` (`emit_collect`) | 18 |
+| E57, E58 | `sharedFieldPlanDispatchable` (an atom-set identity test across arms) | 11 · 6 |
+| E29 | `annShapeWiderRowOf` (`unionSetNamesAtom`) | 4 |
+| E31, E33 | `shapeRowSetId`, `annShapeIndexOf` (the spelling index, kept for untyped shapes) | 6 |
+
+**Presence tests.** "Does this field record an element?" reads the name's emptiness. Each converts
+to a test on the stored type.
+
+| site | function | reach |
+| --- | --- | --- |
+| E32 | `shapeRowLayoutId`'s atom bit (#7414) | 1,575 |
+| E13, E11 | `refListKeptSlotOfMember` | 22 · 1 |
+| E54 | `variantRefListFieldSlot` | 2 |
+
+**Row lookups by name.** The name finds a nested row, slot or mint. Each converts where the stored
+type has a row by type (`structRowOfRecordTy`, `repVariantShapeRowOf`), and is a floor where the
+row is minted under the spelling (the shape walk's class).
+
+| site | function | reach |
+| --- | --- | --- |
+| E15, E14 | `leqNoteStructRowFields`, `leqNoteVariantFields` | 13 · 2 |
+| E19 | `eqgFieldRefSlot` | 4 |
+| E56 | `variantNestedRow` | 3 |
+| E20 | `variantFieldElemNameOr` | 2 |
+| E36, E37 | `sFieldRefSlot` | 1 |
+| E16 | `armFieldStructRowMinted` (interns by the name: the walk's floor) | 1 |
+
+## (c) no program reaches it
+
+E7 and E9 (`memberUnionFieldName`'s and `armFieldUnionName`'s second arm rung), E12
+(`refListKeptSlotOfMember`'s arm rung), E21 and E22 (`variantFirstLayoutDisagreeField`), E30
+(`annShapeWiderRowOf`'s untyped compare), E35 (`variantRowScanOfTyK`) and E52
+(`isStrTagUnionNameOf`). Each is a rung of a reached function, so it is deleted with a control,
+or, where it serves a case the corpus lacks, kept and named.
+
+## Not readers
+
+The accessors (`sFieldElemNameAt`, `variantFieldElemName`, `armFieldElemName`), the writers
+(`armFieldStructRowMinted`'s store, `promoteLitFieldToAtom`, `demoteLitFieldToString`,
+`famRelayStructRow`, and `variantRowAgree`'s and `armStageAgree`'s swaps), and `tyRegGenNow`'s
+length read.
+
+## Order
+
+1. (c): delete each unreached rung, with a control.
+2. (b) row-identity compares: by stored type, one PR, the sweep to grade.
+3. (b) presence tests and row lookups: by type, with the walk's spelling-minted rows as the floor.
+4. (a): one PR, as C3 lands.
