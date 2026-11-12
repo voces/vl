@@ -156,9 +156,9 @@ Eight programs build different bytes and print the same on both seeds:
   (E16) intern a nested row under the field's spelling. `sFieldRefSlot` (E36, E37) mints a ref list
   by name only for an element whose type is a type variable or is unrecorded. All three go when the
   shape walk hands those fields a type.
-- **Next.** `variantFieldElemNameOr` (E20, 2 programs) is a presence test whose control flow
-  differs from the slot-table test (a struct field's non-empty name stops the rung), so it needs
-  its own shadow.
+- **Converted after its own shadow.** `variantFieldElemNameOr`'s caller (E20, the value-site
+  ref-list read of an arm receiver's field) asks the field's slot table. The shadow agreed in 2
+  of 2. `variantFieldElemNameOr` then had no caller and is deleted.
 
 ## Order
 
