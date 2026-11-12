@@ -468,6 +468,7 @@ import { wideLitByNode } from "./check_wide_lits"
 import { recAdPinInit } from "./check_rec_adopt_rows"
 import { argLitAt, wsSuppress } from "./check_width"
 import {
+  CW_UP_ARG,
   CW_UP_CALLEE,
   cwBindingOf,
   cwCalleeDeclOf,
@@ -482,7 +483,12 @@ import {
   fnDeclIx,
 } from "./check_write_scan"
 import { numLexIsFloat } from "./emit_bignum"
-import { i32ListEq, strListHas, strListIndexOf } from "./listutil"
+import {
+  i32ListEq,
+  i32ListIndexOf,
+  strListHas,
+  strListIndexOf,
+} from "./listutil"
 import { nodePos } from "./fmt_util"
 import { identDeclOf, identFrom } from "./symbols"
 import {
@@ -602,20 +608,58 @@ function bundleMemberFits(
   const cn = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { null }
   const fd = if cn is Call && cn.callFn >= 0 { identBoundFnDeclOf(cn.callFn) } else { -1 }
   const f = if fd >= 0 { nodeAt(fd) } else { null }
-  if !(f is FuncDecl) { return false }
   cwIxBuild()
-  for par in f.fnParams {
-    const ow = cwOccWalk(par)
-    while cwOccNext(ow) {
-      const u = cwIxNode[ow.row]
-      const isCallee = u >= 0 && cwIxCovers(u) && cwIxUpKind[u] == CW_UP_CALLEE
-      const pc = if isCallee { nodeAt(cwIxUp[u]) } else { null }
-      if pc is Call && bundleSigFits(got, want, bNames, bTys, pc.callArgs) {
-        return true
-      }
+  if f is FuncDecl {
+    for par in f.fnParams {
+      if bundleParamCallsFit(par, got, want, bNames, bTys) { return true }
+    }
+  }
+  // A call through a binding of the bundle names no function of its own: the lambda the bundle
+  // holds is handed to a named function's parameter, whose calls are the bundle's signatures.
+  const lam = bundleLamOfHoles(bNames)
+  if lam < 0 || !cwIxCovers(lam) || cwIxUpKind[lam] != CW_UP_ARG {
+    return false
+  }
+  const hc = nodeAt(cwIxUp[lam])
+  if !(hc is Call) || hc.callFn < 0 { return false }
+  const hd = identBoundFnDeclOf(hc.callFn)
+  const hf = if hd >= 0 { nodeAt(hd) } else { null }
+  const j = i32ListIndexOf(hc.callArgs, lam)
+  if !(hf is FuncDecl) || j < 0 || j >= hf.fnParams.length { return false }
+  bundleParamCallsFit(hf.fnParams[j], got, want, bNames, bTys)
+}
+
+// Whether one call of parameter `par` through itself binds `got`'s lambda holes so it fits `want`.
+function bundleParamCallsFit(
+  par: i32,
+  got: i32,
+  want: i32,
+  bNames: string[],
+  bTys: i32[],
+): boolean {
+  const ow = cwOccWalk(par)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    const isCallee = u >= 0 && cwIxCovers(u) && cwIxUpKind[u] == CW_UP_CALLEE
+    const pc = if isCallee { nodeAt(cwIxUp[u]) } else { null }
+    if pc is Call && bundleSigFits(got, want, bNames, bTys, pc.callArgs) {
+      return true
     }
   }
   false
+}
+
+// The lambda node whose parameter holes (`?#L<n>.<i>`) `bNames` binds, or -1 where none does.
+function bundleLamOfHoles(bNames: string[]): i32 {
+  for nm in bNames {
+    if nm.length > 3 && nm.slice(0, 3) == "?#L" {
+      let dot = 3
+      while dot < nm.length && nm.charCodeAt(dot) != 46 { dot = dot + 1 }
+      const n = bundleHoleIndex(nm.slice(0, dot), 3)
+      if n >= 0 && n < P.nodes.length { return n }
+    }
+  }
+  -1
 }
 
 // Whether `got` fits `want` with each lambda-parameter hole of `bNames` bound at the matching
