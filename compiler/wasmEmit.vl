@@ -187,6 +187,7 @@ import {
   tyIsStructBearingUnion,
   tyIxIsFunc,
   tyLitMemberTexts,
+  tyMayHoldFn,
   tyNulLitUnionInner,
   tyNulNumScalarValKind,
   tyPrimNameOf,
@@ -1275,6 +1276,7 @@ import {
   memNarrowVariantIndex,
   narrowedArmTyAt,
   narrowedStructArmVi,
+  repOfFnSlot,
 } from "./emit_local_scope"
 import {
   atomLeafListArmTag,
@@ -3095,6 +3097,8 @@ function rcReadSource(
     fbStructGet(rcElemWrap, 0)
     fbLocalGet(rcElemIL)
     fbArrayGet(rcElemBack)
+    // An element of a list of a union of records is its box's payload.
+    if rcElemBoxed { fbStructGet(uBoxIdx, 1) }
     fbRefCast(sHeap)
   } else if reReadable {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
@@ -3462,6 +3466,7 @@ let rcElemSL = -1
 let rcElemIL = -1
 let rcElemWrap = -1
 let rcElemBack = -1
+let rcElemBoxed = false
 let rcLoopDepth = 0
 
 // The source and destination records a copy of `exprIx` reads its field types off.
@@ -3587,12 +3592,30 @@ function rcRecListsApart(st: i32, dt: i32): boolean {
   if !(sa is TyArray) || !(da is TyArray) { return false }
   const se = sa.aElem
   const de = da.aElem
-  if se < 0 || de < 0 || !(tyAt(se) is TyObj) || !(tyAt(de) is TyObj) {
-    return false
+  if se < 0 || de < 0 || !(tyAt(de) is TyObj) { return false }
+  // A list of a union of records is copied arm by arm (`emitRowUnionElemCopy`).
+  if tyAt(se) is TyUnion {
+    return rcRowOfTy(de) >= 0 && rcArmRows(se).length > 0
   }
+  if !(tyAt(se) is TyObj) { return false }
   const ssi = rcRowOfTy(se)
   const dsi = rcRowOfTy(de)
   ssi >= 0 && dsi >= 0 && sHeapIdx[ssi] != sHeapIdx[dsi]
+}
+
+// The variant rows of the union of records `u`, one per member in order, or empty where a member
+// is not a record with a row.
+function rcArmRows(u: i32): i32[] {
+  const out: i32[] = []
+  if u < 0 || u >= T.tys.length { return out }
+  const ut = tyAt(u)
+  if !(ut is TyUnion) { return out }
+  for m in ut.uMembers {
+    const vi = if m >= 0 && m < T.tys.length && tyAt(m) is TyObj { repVariantShapeRowOf(m) } else { -1 }
+    if vi < 0 || vi >= uTags.length || variantRowOf(vi) < 0 { return [] }
+    out.push(vi)
+  }
+  out
 }
 
 // The list of records `st` on the stack, at ref-list slot `srcSlot`, copied into the list `dt`'s
@@ -3610,7 +3633,8 @@ function emitRecListCopyTop(
   const da = tyAt(dt)
   const se = if sa is TyArray { sa.aElem } else { -1 }
   const de = if da is TyArray { da.aElem } else { -1 }
-  const ssi = rcRowOfTy(se)
+  const arms = if se >= 0 && se < T.tys.length && tyAt(se) is TyUnion { rcArmRows(se) } else { [] }
+  const ssi = if arms.length > 0 { variantRowOf(arms[0]) } else { rcRowOfTy(se) }
   const dsi = rcRowOfTy(de)
   const dstSlot = repSlotOfKind("reflist", dt)
   if (
@@ -3664,7 +3688,7 @@ function emitRecListCopyTop(
   rcPathHeap = []
   rcPathField = []
   rcLoopDepth = rcLoopDepth + 1
-  const r = emitRecCopyLevel(
+  const r = if arms.length > 0 { emitRowUnionElemCopy(body, exprIx, arms, se, dsi, de, names, rows, fnIx) } else { emitRecCopyLevel(
     body,
     exprIx,
     sHeapIdx[ssi],
@@ -3676,7 +3700,7 @@ function emitRecListCopyTop(
     names,
     rows,
     fnIx,
-  )
+  ) }
   rcLoopDepth = rcLoopDepth - 1
   rcElemSrc = ps
   rcElemDst = pd
@@ -3687,9 +3711,82 @@ function emitRecListCopyTop(
   rcPathHeap = pHeap
   rcPathField = pField
   if r < 0 { return -1 }
-  fbStructNew(sHeapIdx[dsi])
+  if arms.length == 0 { fbStructNew(sHeapIdx[dsi]) }
   fbArraySet(dstBack)
   emitCopyLoopClose(iL, dL, nL, dstWrap)
+  0
+}
+
+// One element of a list of a union of records, read off the copy loop's locals, built at row
+// `dsi`: the arm its box's tag names is copied at that arm's row, the last arm untested.
+function emitRowUnionElemCopy(
+  body: u8[],
+  exprIx: i32,
+  arms: i32[],
+  se: i32,
+  dsi: i32,
+  de: i32,
+  names: string[],
+  rows: i32[],
+  fnIx: i32,
+): i32 {
+  const ut = tyAt(se)
+  if (
+    !(ut is TyUnion)
+    || ut.uMembers.length != arms.length
+    || dsi < 0
+    || dsi >= sHeapIdx.length
+  ) {
+    return emitFailAt(
+      "emitProgram: a list of a union of records copied element by element has no arm rows",
+      exprIx,
+    )
+  }
+  const pb = rcElemBoxed
+  rcElemBoxed = true
+  let k = 0
+  while k < arms.length {
+    const last = k == arms.length - 1
+    if !last {
+      fbLocalGet(rcElemSL)
+      fbStructGet(rcElemWrap, 0)
+      fbLocalGet(rcElemIL)
+      fbArrayGet(rcElemBack)
+      fbStructGet(uBoxIdx, 0)
+      fbI32Rel(RS_TAG, uTags[arms[k]])
+      fbI32Bin(70) // i32.eq
+      fbIfRef(sHeapIdx[dsi])
+    }
+    const vr = variantRowOf(arms[k])
+    rcElemSrc = ut.uMembers[k]
+    const r = emitRecCopyLevel(
+      body,
+      exprIx,
+      variantHeap(arms[k]),
+      false,
+      vr,
+      dsi,
+      de,
+      "",
+      names,
+      rows,
+      fnIx,
+    )
+    if r < 0 {
+      rcElemBoxed = pb
+      return -1
+    }
+    fbStructNew(sHeapIdx[dsi])
+    if !last { fbElse() }
+    k = k + 1
+  }
+  k = 0
+  while k < arms.length - 1 {
+    fbEnd()
+    k = k + 1
+  }
+  rcElemSrc = se
+  rcElemBoxed = pb
   0
 }
 
@@ -31749,7 +31846,40 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     }
   }
   if fn is FuncDecl { retArmHeap = returnArmHeapOf(fn, fnIx, fnPos) }
+  // A returned map or ref list built at another storage than the function's result is one no
+  // conversion here reconciles; refused rather than mistyped (D15753, D15755).
+  if retStorageMismatch(retArg, fnIx) {
+    return emitFailAt(
+      "emitProgram: a returned container of functions is built at another storage than this function's result",
+      retArg,
+    )
+  }
   emitReturnValueTail(body, retArg, fnIx, fnPos, retArmHeap)
+}
+
+// Whether `retArg`, returned by function `fnIx` whose result is inferred, is a map or ref list
+// that holds a function and is built at another slot than the function's result.
+function retStorageMismatch(retArg: i32, fnIx: i32): boolean {
+  // A written result type converts what is returned into it.
+  const fd = nodeAt(fnIx)
+  if !(fd is FuncDecl) || fd.fnRet >= 0 { return false }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return false }
+  const rt = nodeTyIxOf(unwrapParen(retArg))
+  // Only a value whose type still holds a hole, built at its bindings' own storage, can miss the
+  // result's; a closed one is built at the result's type.
+  if rt < 0 || rt >= T.tys.length || !tyMayHoldFn(rt, 0) || !tyHasTyVar(rt) {
+    return false
+  }
+  const rd = repOfFnSlot(fe)
+  if tyAt(rt) is TyMap { return mapShapeOfExpr(retArg, fnIx) != rd.rdSlot }
+  // A list is built at its own kind; a ref list at another kind than the result's misses it, and
+  // one at the result's kind misses it where its row differs.
+  const lk = exprListRep(retArg, fnIx)
+  if lk == null || !vkIsNonNullRef(lk) { return false }
+  if lk != rd.rdKind { return true }
+  const s = refListSlotOfExpr(retArg, fnIx)
+  s >= 0 && rd.rdSlot >= 0 && s != rd.rdSlot
 }
 
 // The member texts of the `K | null` result of function `fnIx`: its annotation's (a
@@ -35900,6 +36030,7 @@ export function wasmEmitStateReset() {
   rcElemIL = -1
   rcElemWrap = -1
   rcElemBack = -1
+  rcElemBoxed = false
   rcLoopDepth = 0
   boxSeat = -1
   armSeat = -1
