@@ -11776,3 +11776,8 @@ promise of no writes.
 **Why.** Specializing keeps every write through the narrow handle on the one record, which a copy
 would split (DECISIONS "Record covariance", B). A view rep (option B) is the later route for the
 refused shapes.
+
+**A VIEW IS NOT NARROWED BACK (owner ruling, 2026-11-12).** Under option B, `is` from a view to its
+concrete record (`if p is A`) is out of scope: the first view PR refuses `is` on a view by name.
+Whether a view is implicit or spelled, and what `==` means on two views, are still open
+(open-rulings.md, `width-view-implicit-or-spelled` and `width-view-equality`).
