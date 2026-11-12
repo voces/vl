@@ -53,8 +53,7 @@ identity, not a spelling's rep.
 | --- | --- |
 | lane G, union names | `coalesceResultUnionName`, `unionRetName`, `unionNameOfHoleReadGo`, `nameIsPlainScalarAtom`, `directArgSeedsOf`, `emitCapturedCall`, `emitLetDeclStmt` |
 | lane D | `monoSlotParamPins` |
-| lane F | `shapeFieldElemName`, `rlElemStoredName` |
-| lane E | `annShapeIndexOf` |
+| lane E | `annShapeIndexOf`; `shapeFieldElemName` and `rlElemStoredName`, reassigned from lane F (whose cuts made their ref-list and map arms type-only) |
 | lane H, converted here | `funcTypeShapeLowerable` |
 | lane H, the nominal gate kept (above) | `structElemArrayLowerable`, `funcRetUnrepresentable` |
 | unowned, probe next | `listAnnNameOf` |
