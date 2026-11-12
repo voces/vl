@@ -40,7 +40,7 @@ These still refuse:
   the list part.
 
 Fixtures:
-- `record-list-literal-held-call-part-runs.vl` and `record-list-literal-held-call-part-own-read-reject.vl`, both new
+- `record-list-literal-held-call-part-runs.vl` and `record-list-literal-held-call-part-own-read-runs.vl`, both new
 - the two former `*-call-part-reject.vl` fixtures, which now run and were renamed `*-call-parts-runs.vl`
 
 Gates:
