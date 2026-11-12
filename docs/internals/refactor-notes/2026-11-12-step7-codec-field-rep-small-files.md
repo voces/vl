@@ -46,7 +46,8 @@ w305, and `cloTailRefusal` reads `memberFieldCode`'s plan vocabulary.
 ## Measurement
 
 `sweep.vl diff`, #7455's fixpoint seed merged with master (6,671,471 bytes) against this one
-(fixpoint, 6,671,428 bytes, before deleting the then-unread `fieldCodeNumKind`), over 24,010 programs:
+(fixpoint, 6,671,428 bytes), over 24,010 programs. That seed predates deleting the then-unread
+`fieldCodeNumKind`:
 
 - **24,010 same**;
 - 0 bytes-only movers;
