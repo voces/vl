@@ -11777,7 +11777,8 @@ promise of no writes.
 would split (DECISIONS "Record covariance", B). A view rep (option B) is the later route for the
 refused shapes.
 
-**A VIEW IS NOT NARROWED BACK (owner ruling, 2026-11-12).** Under option B, `is` from a view to its
-concrete record (`if p is A`) is out of scope: the first view PR refuses `is` on a view by name.
-Whether a view is implicit or spelled, and what `==` means on two views, are still open
-(open-rulings.md, `width-view-implicit-or-spelled` and `width-view-equality`).
+**Option B's surface (owner rulings, 2026-11-12; open-rulings `width-view-*`).** A storage that
+receives two layouts becomes a view implicitly, with no spelling. `is` may narrow a view back to its
+concrete record. `==` on two views holds when the same concrete type is underneath and every field
+of it is equal, as Go compares interface values; comparing only the narrow type's fields is a
+backlog operator.
