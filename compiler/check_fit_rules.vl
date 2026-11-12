@@ -5461,6 +5461,20 @@ function recListElemCopies(se: i32, de: i32, depth: i32): boolean {
 // it is stored.
 function recListElemNoCopy(_se: i32, _de: i32): boolean { false }
 
+// Whether the copy rule admits a `null` field into a `| null`, which only a call whose sites land
+// on two storages takes (`recNullCopyOnly`).
+let recCopyNullArm = true
+
+// Whether the copy of `own` into `dst` holds only through a `null` field copied into a `| null`.
+function recNullCopyOnly(own: i32, dst: i32): boolean {
+  const o = tyAt(own)
+  const d = tyAt(dst)
+  recCopyNullArm = false
+  const plain = if o is TyArray && d is TyArray { recListElemRecCopies(o.aElem, d.aElem) } else { recCopyBoxesOnly(own, dst) }
+  recCopyNullArm = true
+  !plain
+}
+
 // `recCopyBoxesOnly` with at most `depth` levels of record fields left.
 function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
   const so = tyAt(src)
@@ -5480,7 +5494,9 @@ function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
     const sp = if sf >= 0 && sf < T.tys.length { tyAt(sf) } else { null }
     const boxes = sp is TyPrim
       && (dn is TyNullable
-      && (tySame(dn.nInner, sf) || recNumWidens(sf, dn.nInner))
+      && (tySame(dn.nInner, sf)
+      || recNumWidens(sf, dn.nInner)
+      || recCopyNullArm && sp.primName == "null")
       || dn is TyUnion && recUnionHasMember(df, sf))
     // A list of numbers is copied element by element into a list of a number they widen to.
     const lists = sp is TyArray
@@ -5647,6 +5663,9 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   // A list of records is copied element by element under the same rule.
   if oa is TyArray && da is TyArray {
     if !recListElemRecCopies(oa.aElem, da.aElem) { return false }
+    if recNullCopyOnly(own, dst) && !recSitesLandOff(sites, own, dst) {
+      return false
+    }
     while listCopyTyIx.length <= p { listCopyTyIx.push(-1) }
     listCopyTyIx[p] = dst
     listRecCopyNote()
@@ -5656,9 +5675,86 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   if fieldStorageEq(own, dst, REC_STORE_DEPTH) || !recCopyBoxesOnly(own, dst) {
     return false
   }
+  // A copy only the `null` arm admits is taken where some call lands off `dst`'s storage; calls
+  // that all land there share one build, which keeps their identity.
+  if (
+    recNullCopyOnly(own, dst)
+    && (!recSitesLandOff(sites, own, dst) || recElemOfGenericListArg(p))
+  ) {
+    return false
+  }
   while recCopyTyIx.length <= p { recCopyTyIx.push(-1) }
   recCopyTyIx[p] = dst
   true
+}
+
+// Whether call `c` is a value an inferred function hands back beside a record literal built at
+// its own row of `own`'s storage: the function's result is that row, so `c` lands there.
+function recRetBesideOwnLit(c: i32, own: i32): boolean {
+  cwIxBuild()
+  if c < 0 || !cwIxCovers(c) { return false }
+  const uk = cwIxUpKind[c]
+  if uk != CW_UP_RET && uk != CW_UP_TAIL { return false }
+  const fd = recEnclosingFn(c)
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnRet >= 0 { return false }
+  for lf in recFnValueLeaves(fd) {
+    const l = cwPeelValue(lf)
+    if (
+      l >= 0
+      && l != c
+      && nodeAt(l) is ObjLit
+      && !nodeRepStamped(l)
+      && fieldStorageEq(nodeTyIxOf(l), own, REC_STORE_DEPTH)
+    ) {
+      return true
+    }
+  }
+  false
+}
+
+// Whether `p` is an element of a list literal handed to a generic returning `T[]` or pinned by
+// that argument alone: the list is built at the read's destination and the instance taken there,
+// so the call is built there rather than copied (D15930).
+function recElemOfGenericListArg(p: i32): boolean {
+  if p < 0 || !cwIxCovers(p) || cwIxUpKind[p] != CW_UP_ELEM { return false }
+  const l = cwIxUp[p]
+  if (
+    l < 0
+    || !cwIxCovers(l)
+    || !(nodeAt(l) is ArrayLit)
+    || cwIxUpKind[l] != CW_UP_ARG
+  ) {
+    return false
+  }
+  const k = cwIxUp[l]
+  recListRetDecl(k) >= 0
+    || (recSolePinArg(k) >= 0 && cwPeelValue(recSolePinArg(k)) == l)
+}
+
+// Whether some call site in `sites` has a queued delivery landing its record of `own` at a field
+// storage other than `dst`'s: only then does a build at `dst` fail to serve every call.
+function recSitesLandOff(sites: i32[], own: i32, dst: i32): boolean {
+  for s in sites {
+    if s % 2 != 0 { return true }
+    const c = s / 2
+    if recRetBesideOwnLit(c, own) { return true }
+    let i = 0
+    while i < recPendSrc.length && i < recPendDstTy.length {
+      if !recPendInert(i) {
+        const t = recLandingIn(
+          recPendSrc[i],
+          recCoalesceDefaultLanding(recPendSrc[i], recPendDstTy[i]),
+          c,
+          own,
+          REC_STORE_DEPTH,
+        )
+        if t >= 0 && !fieldStorageEq(t, dst, REC_STORE_DEPTH) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
 }
 
 // Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
