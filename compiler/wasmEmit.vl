@@ -4958,28 +4958,76 @@ function emitListEmptyFitArms(
     flattenVariantsInto(recvTy, armTys)
   }
   const fits: i32[] = []
+  const depths: i32[] = []
   let meets = false
   for a in armTys {
     if a >= 0 && a < T.tys.length && tyAt(a) is TyArray {
-      if listDisjointDepth(a, kTy) == 1 { fits.push(a) } else { meets = true }
+      const d = listDisjointDepth(a, kTy)
+      if d >= 1 {
+        fits.push(a)
+        depths.push(d)
+      } else {
+        meets = true
+      }
     }
   }
-  // An arm whose elements can be `K`, or meet them below the first level, keeps its tag test.
+  // An arm whose elements can be `K` at every depth keeps its tag test.
   if fits.length == 0 || meets { return 0 }
   if !unionEqOperandOk(nd.isObj) { return emitFailNoMembershipRecv() }
   if !boxed && fits.length != 1 { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-  for a in fits {
-    if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, a) {
-      const sh = listFitShadowSet(isIx, a, 1, fnIx)
+  let fi = 0
+  while fi < fits.length {
+    if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, fits[fi]) {
+      const sh = listFitShadowSet(isIx, fits[fi], depths[fi], fnIx)
       if sh < 1 { return sh }
     }
+    fi = fi + 1
   }
   let i = 0
   while i < fits.length {
     const at = tyAt(fits[i])
     if !(at is TyArray) { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
     const heaps: i32[] = []
-    const kind = listFitElemKind(at.aElem, heaps)
+    let kind = listFitElemKind(at.aElem, heaps)
+    // An arm disjoint below its first level is a list of lists: its rows down to that depth are
+    // walked as `emitListEmptyFitIs` walks a bare receiver's, and the box holds the outer row.
+    const slots: i32[] = []
+    let slot = 0
+    let outer = -1
+    if depths[i] > 1 {
+      let s = rlSlotOfTyOrTwin(tyRefArrElemOf(fits[i]))
+      outer = s
+      kind = "reflist"
+      let k = 1
+      while k < depths[i] {
+        if s < 0 || s >= rlElemTyIx.length || rlElemNullable[s] != 0 {
+          return emitFailAt(LIST_FIT_REP_MSG, isIx)
+        }
+        slots.push(s)
+        const ek = rlElemKindAt(s)
+        if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
+        else if k == depths[i] - 1 && ek == RLK_I32_LIST { kind = "list" }
+        else if k == depths[i] - 1 && ek == RLK_STR_LIST { kind = "strlist" }
+        else if k == depths[i] - 1 && ek == RLK_F64_LIST { kind = "f64list" }
+        else if k == depths[i] - 1 && ek == RLK_I64_LIST { kind = "i64list" }
+        else if k == depths[i] - 1 && ek == RLK_F32_LIST { kind = "f32list" }
+        else if k == depths[i] - 1 && ek == RLK_U8_LIST { kind = "u8list" }
+        else { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
+        k = k + 1
+      }
+      if kind == "reflist" {
+        if s < 0 || s >= rlWrapIdx.length {
+          return emitFailAt(LIST_FIT_REP_MSG, isIx)
+        }
+        slot = s
+      }
+      if outer < 0 || outer >= rlWrapIdx.length {
+        return emitFailAt(LIST_FIT_REP_MSG, isIx)
+      }
+    } else {
+      if kind == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
+      slot = heaps[0]
+    }
     if kind == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
     if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
     if boxed {
@@ -4997,11 +5045,11 @@ function emitListEmptyFitArms(
     if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
     if boxed {
       fbStructGet(uBoxIdx, 1)
-      fbRefCast(heaps[2])
+      fbRefCast(if outer >= 0 { rlWrapIdx[outer] } else { heaps[2] })
     } else {
       fbRefAsNonNull()
     }
-    emitListEmptyLoop([], 0, kind, heaps[0])
+    emitListEmptyLoop(slots, 0, kind, slot)
     fbElse()
     fbI32Const(0)
     fbEnd()
