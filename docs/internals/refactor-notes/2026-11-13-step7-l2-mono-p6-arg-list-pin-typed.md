@@ -45,3 +45,7 @@ spelling. That is 8 decisions in 7 programs:
 
 Filed as [D16022](../inventory/D16022.md). Closing it needs the elaborated instance type of the literal, which the census site stays open
 for.
+
+Ruling: D16022 is carried past step 7 as a floor. The fallback is loud (`emitFail`, citing
+D16022) for any closed literal type that reaches it. A forced control fires it on the witness,
+and 85 of 85 reaching programs stay byte-identical with the floor in.
