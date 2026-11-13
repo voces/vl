@@ -18,6 +18,9 @@ This is lane E's step (d). It closes the D6 interner re-key on lane E's side: af
 
 `internShapeAs` keeps its split, because its field codes still read the field text.
 
+`annObjFieldSplit` and the `gaeSplitArgs` it alone called are deleted: master had already left
+`annObjFieldSplit` with no caller.
+
 ## Probe
 
 The probe used a scratch compiler, never refreshed into a seed, on master `6ec3ca16`. A
