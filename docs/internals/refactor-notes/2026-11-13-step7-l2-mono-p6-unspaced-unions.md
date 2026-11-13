@@ -24,9 +24,8 @@ Master vs PR on the 72 programs that reach `monoListSpelling`: **72 of 72 SAME**
 
 ## Census
 
-Type-string parses go from 63 to 62; ungraded parses also go from 54 to 52, from #7758. The baseline is lowered, `monoUnspacedUnions` leaves the
-census's parser list, and the two stale origin rows (this one and #7749's `nonNulBaseOf`) leave
-`scripts/render-parse-origins.txt`.
+Type-string parses go from 63 to 62; ungraded parses also go from 54 to 52, from #7758. The baseline is lowered, and `monoUnspacedUnions` leaves the
+census's parser list. The generated origins file and sites table are left to the coordinator's fold.
 
 ## Not in this cut
 
