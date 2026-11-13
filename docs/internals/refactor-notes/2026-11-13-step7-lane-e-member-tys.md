@@ -22,5 +22,7 @@ and `unionTyArms` is no longer imported by `emit_shape_intern.vl`.
 ## Proof
 
 - Refresh ×2: fixpoint.
-- Sweep with fixpoint seeds on both sides, master `52100b11` against the candidate: SWEEP.
+- Sweep with fixpoint seeds on both sides, master `52100b11` against the candidate: 24,229 same, 0
+  bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
+- Render-parse census: within budget, no entry moves (the sites parsed no render).
 - `scripts/gate.sh`: all rows pass.
