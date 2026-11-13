@@ -59,10 +59,10 @@ not-runs, 0 new traps):
 - master `846a645b` → this: 24,208 programs;
 - master `32ab5241` → this branch with that master merged in: 24,209 programs;
 - master `9b46a53b` → this branch with that master merged in: 24,211 programs;
-- master `f163a56d` → this branch with that master merged in: 24,212 programs.
+- master `4bea0675` → this branch with that master merged in: 24,212 programs.
 
-Render-parse census on the merged tree, at master `f163a56d`: ty-parse-unclassified goes from 40
-to 23. That is 18 of this PR's entries leaving and one added, the `annGenAppSpanEnds` floor.
+Render-parse census on the merged tree, at master `4bea0675`: ty-parse-unclassified goes from 36
+to 19. That is 18 of this PR's entries leaving and one added, the `annGenAppSpanEnds` floor.
 
 `scripts/render-parse-origins.txt` re-points `monoArgTyNameRep`'s graded site to ordinal 0. The
 cut removed the earlier `arrElemSuffixed` call, so the graded call's ordinal fell from 1 to 0.
