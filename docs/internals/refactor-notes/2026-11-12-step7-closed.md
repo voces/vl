@@ -42,7 +42,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `641ad71b`, 2026-11-13 05:00)
+## Still failing at this draft (master `4a26a7be`, 2026-11-13 05:20)
 
 The close is opened when this list is empty, or holds only items with an open PR. Closed since
 the 23:00 draft: lane D's mono rows (#7681, #7688, #7699, #7708, #7710), lane F's `sFieldRefSlot`
@@ -52,8 +52,8 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 
 | lane | sites |
 | --- | --- |
-| E / F (D6 re-key) | `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds` on `shapeWalkKeyOf`); `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`); `tyIsDeclaredNominal` (#7740) asks `cUserTypes[tyToNominalName(ty)]` and `nameIsGenAppDecl` of the render, the pattern #7738 removed (type-side: `structNameOfTy`, `unionAliasDeclNameOfTy`, `tyIsGenAppInstance`) |
-| F | `nonNulBaseOf` at emit_map_value_slots:653; D16040 (`rlElemStructRow`'s class A, the held-rep key), a floor not on the carried list, so it closes before the close |
+| E / F (D6 re-key) | the walk key `shapeWalkKeyOf(kn, ty)` decides in two places: `tyIsDeclaredNominal` (#7740: `cUserTypes[tyToNominalName(ty)] || nameIsGenAppDecl`) and `shapeWalkSplitsUnion` (`cUserTypes[ln]`); E's type-side `tyIsDeclaredNominal` (`structNameOfTy`, `genAppNameOfTy`, a union alias that is not a numeric literal union) is in its sweep. `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`) |
+| F | D16040 (filed, #7735; 6 programs): `rlElemStructRowOfName` finds a generic instance's function-holding record by `structIndexByName(nonNulBaseOf(nm))`. Not on the carried list (coordinator), so it closes before the close |
 | B | `variantIndexOf` as a name producer (w324-vio) |
 
 ## Floors held by a filed row
