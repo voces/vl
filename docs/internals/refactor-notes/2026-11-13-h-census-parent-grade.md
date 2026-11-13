@@ -86,7 +86,8 @@ nothing.
 
 The list starts with the two rows filed so far:
 
-- **D16022:** `monoArgTyNameRep`'s `arrElemSuffixed` and `nameToTy`, emit_mono.
-- **D16032:** `arenaEmitName`'s `canonEmitNameOfTy`, emit_collect.
+- **D16022 (×2):** `monoArgTyNameRep`'s `arrElemSuffixed` and `nameToTy`, emit_mono
+  (both were `ty-string-parse`).
+- **D16032 (×1):** `arenaEmitName`'s `canonEmitNameOfTy`, emit_collect (was `ty-render`).
 
 A lane carrying another floor adds its row here in the PR that files it.
