@@ -20,6 +20,11 @@ row in 3,662 programs. In one program the key found no row while the spelling di
 `generics/generic-union-param-litunion-alias-arm.vl`. In 13, the spelling found no row. Neither
 moves the outcome: the sweep below is identical.
 
+The one key miss is a defect, not agreement: `unRowOfTyKey` misses a union the registry holds, a
+generic parameter's `T | i32 | null` bound to a literal-union alias. The verdicts agree only
+because that union has no clash to find. It is filed as [D16011](../inventory/D16011.md), runs
+today and must keep running.
+
 ## Change
 
 - `unionArmTagClash(unionTy)` drops its spelling parameter. A union type flattens its variants,
