@@ -56,7 +56,4 @@ registry to the type's one row.
 ## Census
 
 - One type-string parse leaves: `canonEmitName(rs)`.
-- `emit_mono.vl` renders: three leave and three enter here, net zero.
-- The baseline also records `const ls = monoPinSpellShaped(lt)` from #7762. That render replaced
-  a parse, but it raced #7764's re-graded census, which left master's render-parse gate at 39
-  against 38.
+- `emit_mono.vl` renders: three leave and three enter, net zero.
