@@ -41,18 +41,18 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `283177f3`, 2026-11-13 01:40)
+## Still failing at this draft (master `36048dd2`, 2026-11-13 02:35)
 
 The close is opened when this list is empty, or holds only items with an open PR. Closed since
 the 23:00 draft: lane D's mono rows (#7681, #7688, #7699, #7708, #7710), lane F's `sFieldRefSlot`
 fallback (#7683), lane H's `variantNestedRow` lookup (#7679) and `printUnionPlanCode` (#7690),
 lane B's `structRowOfSpelling` chain (#7687), lane G's `utkAtomText` (#7704, so `sNameIx`'s
-contract carries no exception), lane E's field-set spelling key (#7707), and E/F's `internShapeDeepOfTy` render (#7705, the shape walk takes a type).
+contract carries no exception), lane E's field-set spelling key (#7707), E/F's `internShapeDeepOfTy` render (#7705, the shape walk takes a type), and `emitUnionUnionEq`'s two name reads (#7714).
 
 | lane | sites |
 | --- | --- |
 | E / F (D6 re-key) | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internArmShapeRow` render (`tyToEmitName(aty)` into `armMintShapeName`); the `nm` input `variantNestedRow` and `armFieldStructRowMinted` hand `internInlineShapeTy` |
-| G / D | the `unionNameOfExpr` producer: its rungs (`unionNameOfCall`, which #7711 gave its row) and internal calls (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2) close together when its last external consumers, `emitUnionUnionEq` ×2 (offered to lane D), read the type and the producer is deleted |
+| G / D | the `unionNameOfExpr` producer, with its rungs (`unionNameOfCall`) and internal calls, closes when its external consumers read the type: 10 `unionNameRowOfExpr` callers (emit_classify 2, wasmEmit 8) and 2 `letUnionNameOf` callers. `printUnionPlanCode`'s call is D16060's floor |
 
 ## Floors held by a filed row
 
