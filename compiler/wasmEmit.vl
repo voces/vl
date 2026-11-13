@@ -394,7 +394,6 @@ import {
   tyIsNulBool,
   tyNameOf,
   unionEqOperandOk,
-  unionHasAtom,
   unwrapParen,
 } from "./emit_base"
 import {
@@ -1520,6 +1519,7 @@ import {
   isUNameAB,
   msHasNull,
   msMemberAtomsOfSet,
+  msMemberTysOfSet,
   msSetOfRowOr,
   msSetOfTy,
   msSetOfTyAny,
@@ -1599,6 +1599,7 @@ import {
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
   atomEqOpcodeOfKind,
+  boxAtomKindOfMemberTy,
   boxTagOfTy,
   mapShapeKeyInt,
   mapShapeKeyKind,
@@ -9057,6 +9058,12 @@ function coerceSetHasNull(uSet: i32, unionName: string, uTy: i32): boolean {
   unionSetHasNullTy(unionName, uTy)
 }
 
+// Whether a coerce target of set id `uSet`, else of arena type `uTy`, holds a member that is
+// value kind `k`'s own scalar (not a literal riding its tag). False when the caller holds neither.
+function coerceSetHasPlainKind(uSet: i32, uTy: i32, k: i32): boolean {
+  msHasPlainValKind(if uSet >= 0 { uSet } else { msSetOfTyAny(uTy) }, k)
+}
+
 // Whether a coerce target of set id `uSet`, else of arena type `uTy`, boxes a literal-union atom
 // as its member string. False when the caller holds neither.
 function coerceTakesAtomAsStr(uSet: i32, uTy: i32): boolean {
@@ -9091,7 +9098,7 @@ function emitUnionCoerceValueAtom(
     // consumption (`{[string]: i32}` read into `i64 | null`) has to go through the
     // ladder's promotion rules, which this arm does not replicate — declining leaves it
     // exactly as it is today rather than tagging it with the wrong width.
-    if unionHasAtom(unionName, scalarAtomNameOfKind(mrk)) {
+    if coerceSetHasPlainKind(uSet, uTy, mrk) {
       const mre = nodeAt(unwrapParen(exprIx))
       if mre is Index {
         return emitMapGetScalarBox(body, mre.idxArr, mre.idxIndex, mrk, fnIx)
@@ -9911,11 +9918,15 @@ function emitUnionBoxArg(
   if go < 0 { return -1 }
   if !exprUnion(exprIx, fnIx) || deliveryRetagHas(exprIx) { return 0 }
   const fa: string[] = []
+  const ft: i32[] = []
   const ta: string[] = []
-  if !boxRetagArmsOfTys(unionBoxTyIxOfExpr(exprIx, fnIx), unionTy, fa, ta) {
+  const tt: i32[] = []
+  if (
+    !boxRetagArmsOfTys(unionBoxTyIxOfExpr(exprIx, fnIx), unionTy, fa, ft, ta, tt)
+  ) {
     return 0
   }
-  emitBoxAtomRetagAtoms(fa, ta, exprIx)
+  emitBoxAtomRetagAtoms(fa, ft, ta, tt, exprIx)
 }
 
 function emitUnionBoxArgGo(
@@ -22111,14 +22122,28 @@ function boxRetagArmsOfTys(
   fromTy: i32,
   toTy: i32,
   fa: string[],
+  ft: i32[],
   ta: string[],
+  tt: i32[],
 ): boolean {
   if fromTy < 0 || toTy < 0 { return false }
-  const ft: i32[] = []
-  const tt: i32[] = []
   if !unionTyArms(fromTy, fa, ft) || !unionTyArms(toTy, ta, tt) { return false }
-  for a in fa {
-    if boxAtomRetagKind(a, ta, fa) >= 0 { return true }
+  let i = 0
+  while i < fa.length {
+    if (
+      boxAtomRetagKind(
+        fa[i],
+        if i < ft.length { ft[i] } else { -1 },
+        ta,
+        tt,
+        fa,
+        ft,
+      )
+      >= 0
+    ) {
+      return true
+    }
+    i = i + 1
   }
   false
 }
@@ -22126,10 +22151,17 @@ function boxRetagArmsOfTys(
 // The kind of the member of `to` that member `p` of `from` is rebuilt as, or -1: widened by
 // `boxWidenAtomFor`'s first-match rule, else narrowed back by its exact inverse
 // (`boxNarrowAtomFor`); a stored member two members widen to answers -1, never a guess.
-function boxAtomRetagKind(p: string, to: string[], from: string[]): i32 {
-  const w = boxWidenAtomFor(p, to, from)
+function boxAtomRetagKind(
+  p: string,
+  pt: i32,
+  to: string[],
+  toTys: i32[],
+  from: string[],
+  fromTys: i32[],
+): i32 {
+  const w = boxWidenAtomFor(p, pt, to, toTys, from)
   if w >= 0 { return w }
-  const n = boxNarrowAtomFor(p, to, from)
+  const n = boxNarrowAtomFor(p, pt, to, toTys, from, fromTys)
   if n >= 0 { return n }
   -1
 }
@@ -22167,36 +22199,52 @@ function emitWidenRetagArm(fromTy: i32, toTy: i32) {
 // (`boxAtomRetagKind`). A field read narrows a wider record's box back (D3006).
 function emitBoxAtomRetag(fromTy: i32, toTy: i32, at: i32) {
   const fa: string[] = []
+  const ft: i32[] = []
   const ta: string[] = []
+  const tt: i32[] = []
+  const fs = msSetOfTyAny(fromTy)
+  const ts = msSetOfTyAny(toTy)
   if (
-    !msMemberAtomsOfSet(msSetOfTyAny(fromTy), fa)
-    || !msMemberAtomsOfSet(msSetOfTyAny(toTy), ta)
+    !msMemberAtomsOfSet(fs, fa)
+    || !msMemberTysOfSet(fs, ft)
+    || !msMemberAtomsOfSet(ts, ta)
+    || !msMemberTysOfSet(ts, tt)
   ) {
     return emitFailAt("emitProgram: a union box retag has no member set", at)
   }
-  emitBoxAtomRetagAtoms(fa, ta, at)
+  emitBoxAtomRetagAtoms(fa, ft, ta, tt, at)
 }
 
 // `emitBoxAtomRetag` from union type `fromTy` to `toTy`, over their canonical members, for a
 // pair `memReadBoxPlan` accepted (so both have them).
 function emitBoxAtomRetagTys(fromTy: i32, toTy: i32, at: i32) {
   const fa: string[] = []
-  canonUnionMembersInto(fromTy, [], fa)
+  const ft: i32[] = []
+  canonUnionMembersInto(fromTy, ft, fa)
   const ta: string[] = []
-  canonUnionMembersInto(toTy, [], ta)
-  emitBoxAtomRetagAtoms(fa, ta, at)
+  const tt: i32[] = []
+  canonUnionMembersInto(toTy, tt, ta)
+  emitBoxAtomRetagAtoms(fa, ft, ta, tt, at)
 }
 
-// `emitBoxAtomRetag` over the member atoms `fa` of the box on the stack and `ta` of its target.
-function emitBoxAtomRetagAtoms(fa: string[], ta: string[], at: i32) {
+// `emitBoxAtomRetag` over the member atoms `fa` (types `ft`, index-parallel) of the box on the
+// stack and `ta` (`tt`) of its target.
+function emitBoxAtomRetagAtoms(
+  fa: string[],
+  ft: i32[],
+  ta: string[],
+  tt: i32[],
+  at: i32,
+) {
   const slot = sharedFieldRecvSlot()
   fbLocalSet(slot)
   let arms = 0
   let i = 0
   while i < fa.length {
-    const k = boxAtomRetagKind(fa[i], ta, fa)
+    const pt = if i < ft.length { ft[i] } else { -1 }
+    const k = boxAtomRetagKind(fa[i], pt, ta, tt, fa, ft)
     if k >= 0 {
-      const fk = valueAtomKind(fa[i])
+      const fk = boxAtomKindOfMemberTy(pt)
       const vb = vbHeapIdxOfKind(k)
       if vb < 0 {
         return emitFailAt(
@@ -31493,7 +31541,7 @@ let mfRv = false
 // Appends to `from` the members a union box read out of ref-list slot `slot` may hold beyond its
 // own: each narrower scalar the slot's union holds only widened, which a list shared across a
 // widening delivery still carries (D3026). Appends none where there is none, or no such delivery.
-function staleBoxFrom(slot: i32, from: string[]) {
+function staleBoxFrom(slot: i32, from: string[], fromTys: i32[]) {
   if !listWidenRetagAny() { return 0 }
   if slot < 0 || slot >= rlElemName.length || slot >= rlElemTyIx.length {
     return 0
@@ -31518,8 +31566,12 @@ function staleBoxFrom(slot: i32, from: string[]) {
   // A member no box of this module is built for cannot be carried.
   if !hasI32 && (hasI64 || hasF64) && vbHeapIdxOfKind(0) >= 0 {
     from.push("i32")
+    fromTys.push(TY_I32)
   }
-  if !hasF32 && hasF64 && vbHeapIdxOfKind(5) >= 0 { from.push("f32") }
+  if !hasF32 && hasF64 && vbHeapIdxOfKind(5) >= 0 {
+    from.push("f32")
+    fromTys.push(TY_F32)
+  }
   0
 }
 
@@ -31528,11 +31580,14 @@ function staleBoxFrom(slot: i32, from: string[]) {
 function emitStaleBoxRetag(slot: i32, at: i32) {
   if slot < 0 || slot >= rlElemName.length { return 0 }
   const from: string[] = []
-  if staleBoxFrom(slot, from) < 0 { return -1 }
+  const fromTys: i32[] = []
+  if staleBoxFrom(slot, from, fromTys) < 0 { return -1 }
   if from.length == 0 { return 0 }
   const to: string[] = []
-  if !msMemberAtomsOfSet(msSetOfTyAny(rlElemTyIx[slot]), to) { return 0 }
-  emitBoxAtomRetagAtoms(from, to, at)
+  const toTys: i32[] = []
+  const ts = msSetOfTyAny(rlElemTyIx[slot])
+  if !msMemberAtomsOfSet(ts, to) || !msMemberTysOfSet(ts, toTys) { return 0 }
+  emitBoxAtomRetagAtoms(from, fromTys, to, toTys, at)
 }
 
 // Invoke the callback closure (stashed in local `cL`) on `elem(i)`: push its env

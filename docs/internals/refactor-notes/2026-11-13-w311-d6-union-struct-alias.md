@@ -51,6 +51,6 @@ receiver is not a struct" when a field is read. It is reported to the coordinato
 
 - **Sweep:** fixpoint seeds, master `723db85a` → this: all 24,224 the same (0 bytes-only movers,
   0 output movers, 0 runs → not-runs, 0 new traps).
-- **Render-parse census:** ty-string-parse goes from 22 to 20, and ty-source-parse from 7 to 9.
+- **Render-parse census:** ty-string-parse goes from 14 to 12, and ty-source-parse from 6 to 8 (at master `ddd58e6e`).
   The brace test moves from a render-graded helper to a source-graded one, which only
   unrewritten source text reaches. `render-parse-origins.txt` grades the new site.
