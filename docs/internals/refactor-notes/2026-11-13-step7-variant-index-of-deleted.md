@@ -35,29 +35,30 @@ row of the type, which that program's unchanged sweep cell confirms.
 
 ## Change
 
-- Every reader of a declared identifier now asks `exactArmRowOfTy(cUserTypes[name] ?? -1)`. That
-  is an identifier lookup of the checker's declared-type table, then the arm row by type, with no
-  spelling parse.
-- The arm-mint field reads `exactArmRowOfTy(tyPeelNul(fldTy))`, the field's own type.
-- `gaeArgIsTyParam` reads the `baseTy` it already held.
+Two sites moved on master while this was in flight. #7714 floored the `==` spelling arm. #7717
+converted the arm-mint field to read the field's type, and deleted `gaeArgIsTyParam`. This change
+takes master's side of both.
+
+- Every remaining reader of a declared identifier asks `exactArmRowOfTy(cUserTypes[name] ?? -1)`.
+  That is an identifier lookup of the checker's declared-type table, then the arm row by type,
+  with no spelling parse. This covers the three atom fallbacks, `structElemArrayLowerable`,
+  `nameIsStructDecl` and the two `mvVal` rungs.
 - `rowDumpVariantOf` is the typed read alone.
 - Deleted: `variantIndexOf`, `uVariantRowBySid` and its resets, the index write in
   `uVariantsPush`, and `declArmsMatchRow`'s `bind` pass, which only wrote the index.
 
 ## Measured
 
-Base 55c764120 against this change, both fixpoint seeds:
-
 | instrument | result |
 | --- | --- |
-| full sweep, 24,204 programs | 24,202 same; 0 output movers; 0 runs → not-runs; 0 new traps |
-| bytes-only movers | 2: `unions/self-recursive-arm-field.vl`, `unions/struct-holding-self-recursive-arm.vl` |
+| full sweep, 24,204 programs, base 7683149ab against this change on it, both fixpoint seeds | 24,204 same; 0 bytes-only movers; 0 output movers; 0 runs → not-runs; 0 new traps |
 | `vl_row_classes_test.ts` | 19 passed |
 | `vkind-census --slots-list`, variant `name` | 1 → 0 |
 
-The two movers come from the arm-mint field. Four bytes move in each: the function types
-`(ref $7, ref $7)` and `(ref $5, ref $5)` swap places, where `$5` and `$7` are the mutually
-recursive struct pair. The type set is the same, and so are the output and `wasm-dis` text.
+On base 55c764120, before #7717, the same change moved two programs' bytes only:
+`unions/self-recursive-arm-field.vl` and `unions/struct-holding-self-recursive-arm.vl`. Two function
+types swapped places in the type section. Both moves came from the arm-mint site, which master now
+reads by type itself.
 
 The only struct name producer left is `structIndexByName`, under the `sNameIx` contract.
 
