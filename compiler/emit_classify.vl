@@ -4,13 +4,7 @@ import { storageNormTy, widenLitTy } from "./check_relate_core"
 import { unionTyArms } from "./emit_map_twins"
 import { REC_STORE_DEPTH } from "./check_ty_relate"
 import { registeredUnionRowOfTy } from "./emit_start_block"
-import {
-  msHasNull,
-  msSetOfTy,
-  rlElemUnionRow,
-  unionMemberAtomsOf,
-  unionMemberAtomsOfRow,
-} from "./emit_union_registry"
+import { msHasNull, msSetOfTy, rlElemUnionRow } from "./emit_union_registry"
 import { valueTailLeaves } from "./check_num_adopt"
 import { callBuiltTy } from "./check_store_rep"
 import { emitFail } from "./emit_bytes"
@@ -33,7 +27,7 @@ import { clsCensusReset } from "./emit_cls_census"
 // The character grammars over a type-name string come from `compiler/tyname.vl` directly,
 // not through the republications in `emit_base.vl` and `typecheck.vl`.
 // `isTopLevelFuncTypeName` stays out of it because it also writes the module-level
-// `funcArrowAt` bank; `nameIsShapeSpanEnds` and `mapValNameOf`, because their span differs.
+// `funcArrowAt` bank; `mapValNameOf`, because its span differs.
 import { collectRetValues } from "./check_nj_join"
 import { parenPeelIx } from "./check_places"
 import {
@@ -178,7 +172,6 @@ import {
   tyIsNulLitUnionNiche,
   tyIsNullUnit,
   tyIsValueUnionBox,
-  valueAtomKind,
 } from "./check_ty_rep"
 import { listDisjointDepth, nameIsNewtypeBrand } from "./check_type_shape"
 import { recFreshDeclOf } from "./check_rec_fresh"
@@ -598,7 +591,10 @@ import {
 } from "./emit_ref_list_kinds"
 import {
   RepDesc,
+  boxAtomKindOfMemberTy,
   boxTagOfTy,
+  msSliceCount,
+  msSliceTy,
   nodeMapValTyIx,
   nodeRepIs,
   nodeRepIsAtom,
@@ -9945,6 +9941,17 @@ export function unionNameOfRead(atIx: i32, fnIx: i32) {
   regUnionNameOfTy(k)
 }
 
+// `unionNameOfRead` that also appends to `rowOut` the row it named the read by, -1 for none.
+export function unionNameRowOfRead(
+  atIx: i32,
+  fnIx: i32,
+  rowOut: i32[],
+): string {
+  const n = unionNameOfRead(atIx, fnIx)
+  rowOut.push(unReadRowOut)
+  n
+}
+
 // The row the last `unionNameOfRead` named its read by, -1 where it answered no type-keyed or
 // declared row. Written as that call's last step, so its caller reads it before any other call.
 let unReadRowOut = -1
@@ -10482,30 +10489,46 @@ export function armRowTysOfUnionTy(
   true
 }
 
-// The arms of the union value `exprIx` produces (`armRowsOfUnionTy` of its box type), else of the
-// union it names. False when it is not a union value.
-export function unionArmRowsOfExpr(
+// The box kind and variant row of each arm of the union value `exprIx`: the arms of its box type,
+// else of the row of the union it names (`boxAtomKindOfMemberTy` per arm). False when it is not a union
+// value or names no row.
+export function unionArmKindRowsOfExpr(
   exprIx: i32,
   fnIx: i32,
-  atoms: string[],
+  kinds: i32[],
   rows: i32[],
 ): boolean {
   if !exprUnion(exprIx, fnIx) { return false }
   const ty = unionBoxTyIxOfExpr(exprIx, fnIx)
-  if ty >= 0 && armRowsOfUnionTy(ty, atoms, rows) { return true }
-  if !unionArmAtomsOfExpr(exprIx, fnIx, atoms) { return false }
-  for a in atoms { rows.push(exactArmRowOfTy(cUserTypes[a] ?? -1)) }
-  true
-}
-
-// The member atoms of the union `exprIx` names, read off its row where the rung that named it
-// read one, else off the name. False when it names no union.
-function unionArmAtomsOfExpr(exprIx: i32, fnIx: i32, out: string[]): boolean {
-  const rs: i32[] = []
-  const n = unionNameRowOfExpr(exprIx, fnIx, rs)
-  if n == "" { return false }
-  if rs[0] >= 0 && unionMemberAtomsOfRow(rs[0], out) { return true }
-  unionMemberAtomsOf(n, out)
+  const atoms: string[] = []
+  const tys: i32[] = []
+  if ty < 0 || !armRowTysOfUnionTy(ty, atoms, tys, rows) {
+    const rs: i32[] = []
+    if unionNameRowOfExpr(exprIx, fnIx, rs) == "" { return false }
+    const u = rs[0]
+    const n = if u >= 0 { msSliceCount(u) } else { -1 }
+    let i = 0
+    while i < n {
+      tys.push(msSliceTy(u, i))
+      rows.push(exactArmRowOfTy(msSliceTy(u, i)))
+      i = i + 1
+    }
+    if n < 0 {
+      // A nullable no row records (a map read's miss) has two arms: its non-null part and null.
+      const nt = nodeTyAt(unwrapParen(exprIx), fnIx)
+      if nt < 0 || nt >= T.tys.length || !(tyAt(nt) is TyNullable) {
+        emitFail(
+          "emitProgram: a union value's arms were asked of a union no member row records",
+        )
+        return false
+      }
+      tys.push(tyPeelNul(nt))
+      rows.push(exactArmRowOfTy(tyPeelNul(nt)))
+      tys.push(-1)
+      rows.push(-1)
+    }
+  }
+  for t in tys { kinds.push(boxAtomKindOfMemberTy(t)) }
   true
 }
 
@@ -11320,7 +11343,7 @@ export function memReadNarrowOp(memIx: i32, fnIx: i32): i32 {
   if !memRecvIsRecord(memIx, fnIx) { return -1 }
   const nk = memFieldNumKind(memIx, fnIx)
   const wk = if nk == 3 || nk == 4 || nk == 5 { nk } else { -1 }
-  atomNarrowOp(wk, valueAtomKind(own))
+  atomNarrowOp(wk, boxTagOfTy(ty))
 }
 
 // Whether the checker typed the receiver of the field read at `memIx` as a record, `| null`
@@ -11385,8 +11408,10 @@ export function memReadBoxPlan(memIx: i32, fnIx: i32, out: i32[]): i32 {
     const phys = sFieldElemTyIxAt(si, fi)
     const oa: string[] = []
     const pa: string[] = []
-    if !canonUnionMembersInto(own, [], oa) { return 0 }
-    if !canonUnionMembersInto(phys, [], pa) { return 0 }
+    const oTys: i32[] = []
+    const pTys: i32[] = []
+    if !canonUnionMembersInto(own, oTys, oa) { return 0 }
+    if !canonUnionMembersInto(phys, pTys, pa) { return 0 }
     out.push(own)
     out.push(phys)
     let narrowed = 0
@@ -11394,7 +11419,14 @@ export function memReadBoxPlan(memIx: i32, fnIx: i32, out: i32[]): i32 {
     while i < pa.length {
       // A stored `null` the own type lacks holds no value a read at that type sees (D3403).
       if !strListHas(oa, pa[i]) && pa[i] != "null" {
-        const k = boxNarrowAtomFor(pa[i], oa, pa)
+        const k = boxNarrowAtomFor(
+          pa[i],
+          if i < pTys.length { pTys[i] } else { -1 },
+          oa,
+          oTys,
+          pa,
+          pTys,
+        )
         if k == -2 { return 2 }
         if k < 0 { return 0 }
         narrowed = 1

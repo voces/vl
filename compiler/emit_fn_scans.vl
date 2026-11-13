@@ -1,6 +1,7 @@
 import { unionTyArms } from "./emit_map_twins"
 import { unMemIsMap } from "./emit_union_registry"
-import { unionArmRowsOfExpr } from "./emit_classify"
+import { emitFail } from "./emit_bytes"
+import { unionArmKindRowsOfExpr } from "./emit_classify"
 import { sidOfNode } from "./symbols"
 import { unRowOfTyKey } from "./emit_union_tykey_text"
 
@@ -73,7 +74,6 @@ import {
   eqCoreKindOfTyToken,
   xrepListPair,
 } from "./check_ty_relate"
-import { valueAtomKind } from "./check_ty_rep"
 import {
   T,
   TyUnion,
@@ -146,6 +146,7 @@ import {
   unionBoxTyIxOfExpr,
   unionNameOfExpr,
   unionNameOfRead,
+  unionNameRowOfRead,
 } from "./emit_classify"
 import {
   bcOpen,
@@ -191,6 +192,7 @@ import {
 import { ifArmValueExpr, paramTypeNodeOfRead } from "./emit_query"
 import { TK_STR, rlSlotIsKindList, tyKindOf } from "./emit_ref_list_kinds"
 import {
+  boxAtomKindOfMemberTy,
   msMemberValKindsOf,
   nodeRepIs,
   nullValKind,
@@ -221,7 +223,7 @@ import { coalesceRetypedAtomToStr } from "./emit_ty_canon"
 import {
   armPathArenaDeclined,
   nodeTyUnionHasMapArm,
-  unionArmTys,
+  unionArmTysOfRow,
   unionHasMapArm,
   unionHasMapArrayArm,
 } from "./emit_union_atoms"
@@ -2225,13 +2227,16 @@ export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
     if obj is Index {
       const arr = nodeAt(unwrapParen(obj.idxArr))
       if arr is Ident {
-        const un = unionNameOfRead(unwrapParen(obj.idxArr), fnIx)
+        const unr: i32[] = []
+        const un = unionNameRowOfRead(unwrapParen(obj.idxArr), fnIx, unr)
         if un != "" {
           const atoms: string[] = []
           // The arm's element type is `tyStepElem` and the `.f` leaf's map test is
           // `tyArmPathIsMap`; a row the arena cannot type reserves the spare.
           const mems: i32[] = []
-          if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+          if !unionArmTysOfRow(unr[0], un, atoms, mems) {
+            return armPathArenaDeclined()
+          }
           let i = 0
           while i < mems.length {
             const path: string[] = []
@@ -2284,7 +2289,8 @@ export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
     const path: string[] = []
     const cur = memberChainPath(unwrapParen(exprIx), path)
     if cur < 0 { return false }
-    const un = unionNameOfRead(cur, fnIx)
+    const unr: i32[] = []
+    const un = unionNameRowOfRead(cur, fnIx, unr)
     if un == "" { return false }
     const atoms: string[] = []
     // The arm's field path is walked over the member's arena type (`tyArmPathIsMap`)
@@ -2293,7 +2299,9 @@ export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
     const mems: i32[] = []
     // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
     // second walk over the arms' rendered spellings.
-    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+    if !unionArmTysOfRow(unr[0], un, atoms, mems) {
+      return armPathArenaDeclined()
+    }
     let m = 0
     while m < mems.length {
       if atoms[m] != "null" {
@@ -2356,7 +2364,8 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
       path.push(props[pr])
       pr = pr - 1
     }
-    const un = unionNameOfRead(rootIx, fnIx)
+    const unr: i32[] = []
+    const un = unionNameRowOfRead(rootIx, fnIx, unr)
     if un == "" { return false }
     const atoms: string[] = []
     // The arm walk is structural (`tyArmPathIsMapList`, a `TyArray` over a `TyMap` leaf),
@@ -2364,7 +2373,9 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
     const mems: i32[] = []
     // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
     // second walk over the arms' rendered spellings.
-    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+    if !unionArmTysOfRow(unr[0], un, atoms, mems) {
+      return armPathArenaDeclined()
+    }
     let mi = 0
     while mi < mems.length {
       if atoms[mi] != "null" {
@@ -2468,6 +2479,14 @@ function printUnionStoreSetOf(exprIx: i32, fnIx: i32, bty: i32): i32 {
   own
 }
 
+// Appends set `s`'s member types to `out` when it has exactly `n`; false, leaving `out` empty,
+// otherwise.
+function printPlanSetTys(s: i32, n: i32, out: i32[]): boolean {
+  if msMemberTysOfSet(s, out) && out.length == n { return true }
+  out.clear()
+  false
+}
+
 function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   // A read narrowed to `null` is printed from its box's tag, so the reservation scan and the
   // handler both plan the whole box with the narrowing lifted (D2801).
@@ -2486,37 +2505,40 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   const bty = printUnionBoxTyOf(exprIx, fnIx)
   const sid = msSetOfTy(bty)
   const atoms: string[] = []
-  if (
-    !msMemberAtomsOfSet(sid, atoms)
-    && !msMemberAtomsOfSet(printUnionStoreSetOf(exprIx, fnIx, bty), atoms)
-  ) {
+  const storeSet = printUnionStoreSetOf(exprIx, fnIx, bty)
+  let nameSet = -1
+  if (!msMemberAtomsOfSet(sid, atoms) && !msMemberAtomsOfSet(storeSet, atoms)) {
     // D16060: a field read through an un-annotated parameter is typed at the hole, so only the
     // name rung that read the arms knows the members.
     const nm = unionNameOfExpr(exprIx, fnIx)
     if nm == "" { return 0 }
     unionMemberAtomsOf(nm, atoms)
+    nameSet = msSetOfUnion(nm)
   }
   if atoms.length < 2 { return 0 }
   // The member types, index-parallel to `atoms`: the set's own, else the declared type's
-  // leaves. Left empty when neither lines up, so no member reads as a literal union.
+  // leaves, else the store set's, else the named union's. Left empty when none lines up.
   const mtys: i32[] = []
-  if !msMemberTysOfSet(sid, mtys) || mtys.length != atoms.length {
-    while mtys.length > 0 { mtys.pop() }
+  if !printPlanSetTys(sid, atoms.length, mtys) {
     printPlanLeafTys(dty, mtys)
     if mtys.length != atoms.length {
-      while mtys.length > 0 { mtys.pop() }
+      mtys.clear()
+      if !printPlanSetTys(storeSet, atoms.length, mtys) {
+        printPlanSetTys(nameSet, atoms.length, mtys)
+      }
     }
   }
   const kinds: i32[] = []
-  // The BANKED codes when the row has them (`unMemValKind` is index-parallel to the atom
-  // column and is literally `valueAtomKind` per member), else the per-atom derivation.
+  // The banked codes when the row has them, else each member type's box kind.
   if !msMemberValKindsOf(sid, kinds) || kinds.length != atoms.length {
-    while kinds.length > 0 { kinds.pop() }
-    let d = 0
-    while d < atoms.length {
-      kinds.push(valueAtomKind(atoms[d]))
-      d = d + 1
+    kinds.clear()
+    if mtys.length != atoms.length {
+      emitFail(
+        "emitProgram: a printed union's members have no types to read their box kinds from",
+      )
+      return 0
     }
+    for t in mtys { kinds.push(boxAtomKindOfMemberTy(t)) }
   }
   // A bare map read is `V | null` whatever `V` is (a missing key reads the null-tagged box),
   // so the dispatch needs a `null` arm the map's declared value set may not carry.
@@ -2851,10 +2873,10 @@ export function fnHasGlobalMapOp(fnIx: i32) {
 
 // Whether an arm of the union value `exprIx` needs the closure-eq frame; false for a non-union.
 function unionOperandNeedsCloEq(exprIx: i32, fnIx: i32): boolean {
-  const arms: string[] = []
+  const kinds: i32[] = []
   const rows: i32[] = []
-  unionArmRowsOfExpr(exprIx, fnIx, arms, rows)
-  unionArmsNeedCloEq(arms, rows)
+  unionArmKindRowsOfExpr(exprIx, fnIx, kinds, rows)
+  unionArmsNeedCloEq(kinds, rows)
 }
 
 // Whether member set `s` records the member atom `atom` verbatim; false for no set (-1) or one

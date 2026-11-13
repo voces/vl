@@ -1,6 +1,12 @@
+import { mkUnionTy } from "./check_union_mint"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import { sFieldElemSame, unMemAtoms } from "./emit_state"
-import { unMemRowStart, valueBoxOfTy } from "./emit_rep"
+import {
+  repShadowAddReason,
+  repShadowOn,
+  unMemRowStart,
+  valueBoxOfTy,
+} from "./emit_rep"
 
 // `emit_union_atoms.vl` — which value unions carry atoms or map arms, the
 // map-value shapes they intern, and the twins a variant is built with.
@@ -25,12 +31,12 @@ import {
   mapTwinUnionMember,
   storedTyOf,
   tyMapKeyKindSpan,
-  valueAtomKind,
   valueRowKind,
   valueUnionFromAtomKinds,
 } from "./check_ty_rep"
 import {
   T,
+  TY_NULL,
   TyArray,
   TyErr,
   TyFunc,
@@ -47,6 +53,7 @@ import {
   litUnionAliasNameOfTy,
   litUnionInlineNameOfTy,
   mixedLitRunAliasOf,
+  mkNullableTy,
   oneStrLitSpelling,
   structNameOfTy,
   tyAt,
@@ -94,7 +101,7 @@ import {
   mvArmSigOfTy,
   mvValArmName,
 } from "./emit_mv_slots"
-import { ifExprCollectAtoms, paramTypeNodeOfRead } from "./emit_query"
+import { paramTypeNodeOfRead } from "./emit_query"
 import {
   boxTagOfTy,
   declTyIxOfName,
@@ -264,6 +271,7 @@ import {
   unRowOfTyAB,
   unSiteOnKey,
   unionArmsOf,
+  unionArmsOfRow,
   unionMemberSetOf,
   unionMemberTysOf,
   unionMemberTysOfRow,
@@ -1642,6 +1650,129 @@ function unionPartSpelling(m: i32, depth: i32): string {
   }
 }
 
+// The type `unionSpellingOfTy(ty)` reads back as, built from the same decisions instead of
+// parsed from the text: a literal widens to its base, a literal-union alias and a mixed run's
+// alias are their declared types, and a nested union or `null` part joins the outer union.
+// -1 where the spelling declines; a caller holds a spelling, so a function part is not re-tested.
+export function unionSpellingTyOf(ty: i32): i32 {
+  const ms: i32[] = []
+  const nul: boolean[] = [false]
+  if !spellTyParts(ty, ms, nul, 8) { return -1 }
+  let u = -1
+  if ms.length == 1 { u = ms[0] }
+  else if ms.length > 1 { u = mkUnionTy(ms) }
+  if !nul[0] { return u }
+  if u < 0 { return TY_NULL }
+  mkNullableTy(u)
+}
+
+// `unionSpellingTyOf`'s walk: pushes the parts `ty` spells onto `ms`, setting `nul[0]` for a
+// `null` part. False where `unionSpellingOfTy` declines.
+function spellTyParts(ty: i32, ms: i32[], nul: boolean[], depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyUnion => spellUnionTyParts(ty, t.uMembers, ms, nul, depth)
+    TyNullable => spellNullableTyParts(t.nInner, ms, nul, depth)
+    TyPrim | TyLit | TyObj | TyArray | TyMap | TyFunc | TyVar | TyNeg | TyErr => false
+  }
+}
+
+// `unionMembersSpelling`'s parts as types, over the members `members` of union `ty`.
+function spellUnionTyParts(
+  ty: i32,
+  members: i32[],
+  ms: i32[],
+  nul: boolean[],
+  depth: i32,
+): boolean {
+  if members.length == 0 { return false }
+  if litUnionInlineNameOfTy(ty) != "" {
+    for m in members {
+      if isNullTy(m) {
+        nul[0] = true
+        for x in members {
+          if !isNullTy(x) { spellTyPush(ms, x) }
+        }
+        return true
+      }
+    }
+  }
+  const rgAlias = mixedLitRunAliasOf(members)
+  let rgDone = false
+  for m in members {
+    if rgAlias != "" && tyAt(m) is TyLit {
+      if !rgDone {
+        rgDone = true
+        spellTyPush(ms, cUserTypes[rgAlias] ?? m)
+      }
+    } else if !spellPartTy(m, ms, nul, depth - 1) {
+      return false
+    }
+  }
+  true
+}
+
+// `nullableSpelling`'s parts as types: `inner`, then `null`.
+function spellNullableTyParts(
+  inner: i32,
+  ms: i32[],
+  nul: boolean[],
+  depth: i32,
+): boolean {
+  if inner < 0 || inner >= T.tys.length { return false }
+  nul[0] = true
+  const nal = litUnionAliasNameOfTy(inner)
+  if nal != "" {
+    spellTyPush(ms, cUserTypes[nal] ?? inner)
+    return true
+  }
+  if litUnionInlineNameOfTy(inner) != "" || oneStrLitSpelling(inner) != "" {
+    spellTyPush(ms, inner)
+    return true
+  }
+  spellPartTy(inner, ms, nul, depth - 1)
+}
+
+// `unionPartSpelling`'s part as a type, pushed onto `ms`; a nested union or nullable joins.
+function spellPartTy(m: i32, ms: i32[], nul: boolean[], depth: i32): boolean {
+  if m < 0 || m >= T.tys.length || depth <= 0 { return false }
+  const al = litUnionAliasNameOfTy(m)
+  if al != "" {
+    spellTyPush(ms, cUserTypes[al] ?? m)
+    return true
+  }
+  const t = tyAt(m)
+  match t {
+    TyPrim => {
+      if t.primName == "never" { return false }
+      if t.primName == "null" {
+        nul[0] = true
+        return true
+      }
+      spellTyPush(ms, m)
+    }
+    TyLit => {
+      const b = litBaseTy(t)
+      if b < 0 || b >= T.tys.length || !(tyAt(b) is TyPrim) { return false }
+      spellTyPush(ms, b)
+    }
+    TyUnion => spellUnionTyParts(m, t.uMembers, ms, nul, depth)
+    TyNullable => spellNullableTyParts(t.nInner, ms, nul, depth)
+    TyArray | TyFunc => spellTyPush(ms, m)
+    TyObj | TyMap | TyVar | TyNeg | TyErr => false
+  }
+}
+
+// Appends part `p` unless an equal part is already there, as the spelling drops a repeat.
+function spellTyPush(ms: i32[], p: i32): boolean {
+  for x in ms {
+    if tySame(x, p) { return true }
+  }
+  ms.push(p)
+  true
+}
+
 // Marks the per-rep value-box usage flags for every scalar atom of the value union typed `ty`, at
 // registration time so `mAssignTypeIndices` interns exactly the used reps. The arms are
 // `unionTyArms`': the row `ty` keys to where its members resolved, else the type's own members.
@@ -2421,45 +2552,6 @@ export function nliForgetLet(letIx: i32) {
   0
 }
 
-// The value-union name an un-annotated if-expression binding init carries, or "" when it
-// is not a value union the box can hold (a non-union if, a `string | null` niche, or an
-// arm the static pre-pass cannot classify). The canonical name is the deduped arm atoms in
-// arm order, with a trailing `|null` when any arm or the else-less path is null.
-export function ifExprNliName(ifIx: i32) {
-  const atoms: string[] = []
-  const hn = ifExprCollectAtoms(ifIx, atoms)
-  if hn == -2 { return "" }
-  if atoms.length == 0 { return "" }
-  // Mixed numeric arms widen to a single numeric — they are not a union, and this static
-  // atom list cannot do that lattice join. Bail so the numeric value-position-if path
-  // (`letIsF64`/`letIsI64`) handles them instead. A single numeric scalar is fine.
-  let numCount = 0
-  const kinds: i32[] = []
-  let j = 0
-  while j < atoms.length {
-    const k = valueAtomKind(atoms[j])
-    kinds.push(k)
-    if k == 0 || k == 3 || k == 4 || k == 5 { numCount = numCount + 1 }
-    j = j + 1
-  }
-  if numCount >= 2 { return "" }
-  let nm = ""
-  let i = 0
-  while i < atoms.length {
-    if nm != "" { nm = nm + "|" }
-    nm = nm + atoms[i]
-    i = i + 1
-  }
-  if hn == 1 {
-    nm = nm + "|null"
-    kinds.push(6)
-  }
-  // Only a value union the box rep can hold (≥2 non-null atoms, or one NUMERIC scalar +
-  // null) registers here — a `string | null` niche / a non-union stay on their own paths.
-  if !valueUnionFromAtomKinds(kinds) { return "" }
-  nm
-}
-
 // The only writer of `uVariants`.
 export function uVariantsPush(name: string) {
   uVariants.push(name)
@@ -2621,6 +2713,18 @@ export function unionArmTys(
   unionMemberTysOf(nm, tys) && tys.length == atoms.length
 }
 
+// `unionArmTys` for a caller holding `u`, the row its read of `name` carried, or -1: that row's
+// atoms and member types where it records them, else `name`'s (D16032).
+export function unionArmTysOfRow(
+  u: i32,
+  name: string,
+  atoms: string[],
+  tys: i32[],
+): boolean {
+  if !unionArmsOfRow(u, atoms) { return unionArmTys(name, atoms, tys) }
+  unionMemberTysOfRow(u, tys) && tys.length == atoms.length
+}
+
 // `isUNameAB` for a binding's annotation node, keyed on the spelling canon left on the node.
 export function isUNameAnnAB(site: i32, annIx: i32): boolean {
   isUNameAB(site, annRowOfNode(annIx))
@@ -2636,10 +2740,10 @@ export function registerValueUnionOfTy(site: i32, ty: i32): i32 {
   registerValueUnionNameAB(site, name, ty)
 }
 
-// The value-union mint's seam. `registerValueUnionName` resolves the spelling once at the
-// boundary; a switched site, mode 2, or any caller whose type `valueUnionTyIsFlat` accepts
-// mints from the caller's id instead. Armed, it then asks the read seams' question: does the
-// caller's id name the row the spelling now names.
+// The value-union mint's seam. A switched site, mode 2, or a type `valueUnionTyIsFlat` accepts
+// mints from the caller's id; any other type mints from the type its spelling reads back as
+// (`unionSpellingTyOf`), so no caller holding a type parses its name. Only a caller with no
+// type resolves the spelling.
 export function registerValueUnionNameAB(
   site: i32,
   name: string,
@@ -2649,9 +2753,38 @@ export function registerValueUnionNameAB(
     && (unSiteOnKey(site) || unABMode == 2 || valueUnionTyIsFlat(ty))
   if k {
     registerValueUnionNameTy(name, ty)
+  } else if ty >= 0 {
+    const st = unionSpellingTyOf(ty)
+    if st < 0 {
+      return emitFail("emitProgram: a value union's own type has no spelling")
+    }
+    if repShadowOn { repShadowCheckSpellTy(name, st) }
+    registerValueUnionNameTy(name, st)
   } else {
     registerValueUnionNameTy(name, declTyIxOfName(name))
   }
+  0
+}
+
+// Under the shadow harness, the type `unionSpellingTyOf` built is compared with its spelling
+// `name` parsed back: the two encode one set of rules, so a disagreement means one drifted.
+function repShadowCheckSpellTy(name: string, st: i32) {
+  spellTyChecked = spellTyChecked + 1
+  if !tySame(st, declTyIxOfName(name)) { spellTyDisagree = spellTyDisagree + 1 }
+  0
+}
+
+let spellTyChecked = 0
+let spellTyDisagree = 0
+
+// Reports `repShadowCheckSpellTy`'s tallies after the shadow sweep, then empties them. A no-op
+// unless armed.
+export function spellTyShadowSweep() {
+  if !repShadowOn { return 0 }
+  repShadowAddReason("spellTy/checked", spellTyChecked)
+  repShadowAddReason("spellTy/disagree", spellTyDisagree)
+  spellTyChecked = 0
+  spellTyDisagree = 0
   0
 }
 

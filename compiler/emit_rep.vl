@@ -21,7 +21,6 @@ import { nodeTyAt } from "./emit_capture_frames"
 import { i32ToStr } from "./ast"
 import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { emitFail } from "./emit_bytes"
-import { peelGroupParens } from "./tyname"
 import {
   FC_NUL_REF_LIST,
   FC_REF_LIST,
@@ -41,9 +40,6 @@ import {
   armStageElemKeyKind,
   armStageElemName,
   armStageElemTyIx,
-  msAtomIds,
-  msAtomTexts,
-  msFreeAtomIds,
   msFreeAtoms,
   msFreeByTy,
   msFreeChain,
@@ -84,7 +80,6 @@ import {
   uVarTyIx,
   uVarTyIxResets,
   uVariants,
-  unMemAtomIds,
   unMemAtoms,
   unMemKinds,
   unMemTyCount,
@@ -184,7 +179,6 @@ import {
   mapKeyKindOfTy,
   mapTwinUnionMember,
   tyIsValueUnionBox,
-  valueAtomKind,
   valueRowKind,
 } from "./check_ty_rep"
 
@@ -2180,20 +2174,6 @@ function recordFieldElemRow(
   0
 }
 
-// The interned id of a union member's atom spelling, after `peelGroupParens` (applied
-// to both sides, so a `(() => i64)` member and an `is () => i64` test are the same
-// reference). Two references are
-// equal iff their ids are, so membership and subtraction are integer work. Ids are pure text identities with no arena content, so the table lives across programs.
-export function msAtomIdOf(atom: string): i32 {
-  const p = peelGroupParens(atom)
-  const hit = msAtomIds[p] ?? -1
-  if hit >= 0 { return hit }
-  const id = msAtomTexts.length
-  msAtomTexts.push(p)
-  msAtomIds[p] = id
-  id
-}
-
 // What a union member is, recorded beside its arena type: 0 the `null` keyword, 1
 // nominal (a declared alias/struct/variant name, whose identity is the name), 2 a
 // scalar primitive, 3 a composite, -1 unresolved. `ty` is the member's already-
@@ -2274,9 +2254,21 @@ export function msSliceAtom(u: i32, i: i32): string {
   msFreeAtoms[msFreeStart[-2 - u] + i]
 }
 
-export function msSliceAtomId(u: i32, i: i32): i32 {
-  if u >= 0 { return unMemAtomIds[unMemRowStart(u) + i] }
-  msFreeAtomIds[msFreeStart[-2 - u] + i]
+// Whether members `i` and `j` of slice `u` are one member: a literal arm reads as its base, so
+// two literal arms on one base are alike; one shape under two declarations is two members.
+function msSliceMembersAlike(u: i32, i: i32, j: i32): boolean {
+  const a = litArmBaseTy(msSliceTy(u, i))
+  const b = litArmBaseTy(msSliceTy(u, j))
+  if a < 0 || b < 0 { return a == b }
+  a == b || tySame(a, b) && armDeclSame(a, b)
+}
+
+// Member type `t` with a literal read as its base; `t` itself otherwise, -1 for `null`.
+function litArmBaseTy(t: i32): i32 {
+  if t < 0 { return t }
+  const x = tyAt(t)
+  if x is TyLit { return litBaseTy(x) }
+  t
 }
 
 export function msSliceKind(u: i32, i: i32): i32 {
@@ -2318,7 +2310,6 @@ export function msFreeSlicePush(
     const a = atoms[i]
     msFreeTys.push(tys[i])
     msFreeAtoms.push(a)
-    msFreeAtomIds.push(msAtomIdOf(a))
     msFreeKinds.push(unMemKindOf(a, tys[i]))
     msFreeValKind.push(if tys[i] < 0 { 6 } else { boxTagOfTy(tys[i]) })
     msFreeLitArm.push(i < lits.length && lits[i])
@@ -2503,11 +2494,7 @@ export function msSetCarriesLitUnionArm(s: i32): i32 {
       let first = true
       let j = 0
       while j < n {
-        if (
-          j != i
-          && msSetHas(s, j)
-          && msSliceAtomId(u, j) == msSliceAtomId(u, i)
-        ) {
+        if (j != i && msSetHas(s, j) && msSliceMembersAlike(u, i, j)) {
           if la != 1 || msSliceLitArm(u, j) != 1 { return -1 }
           twin = true
           if j < i { first = false }
@@ -2704,7 +2691,6 @@ export function msPoolReset() {
   msFreeChain = []
   msFreeTys = []
   msFreeAtoms = []
-  msFreeAtomIds = []
   msFreeKinds = []
   msFreeValKind = []
   msFreeLitArm = []
@@ -2724,7 +2710,6 @@ export function recordUnMemTys(set: string) {
   // (an over-long column is the signature: only this function appends, in lock-step).
   if unMemAtoms.length > unMemTys.length {
     unMemAtoms = []
-    unMemAtomIds = []
     unMemKinds = []
     msPoolReset()
   }
@@ -2768,7 +2753,6 @@ export function recordUnMemTys(set: string) {
     const ty = tys[i]
     unMemTys.push(ty)
     unMemAtoms.push(a)
-    unMemAtomIds.push(msAtomIdOf(a))
     unMemKinds.push(unMemKindOf(a, ty))
     unMemValKind.push(if ty < 0 { 6 } else { boxTagOfTy(ty) })
     unMemLitArm.push(i < lits.length && lits[i])
@@ -3391,6 +3375,14 @@ export function boxTagOfTy(ty: i32): i32 {
   btSoftOfTy(ty)
 }
 
+// The box kind of a union member of type `t`: `null` (-1) is 6, a literal or literal union -1
+// (it rides its base scalar's box under no tag of its own), any other member its box tag.
+export function boxAtomKindOfMemberTy(t: i32): i32 {
+  if t < 0 { return 6 }
+  if tyIsLitUnion(t) || tyAt(t) is TyLit { return -1 }
+  boxTagOfTy(t)
+}
+
 // Whether a value of type `ty` is a value-union box: the rep tree boxes it (`unionRepClassOfTy`'s
 // box, or a boxed nullable) and every arm, nested unions flattened and `null` aside, has a value
 // box tag (`boxTagOfTy`). A literal arm rides at its tag; a struct, map or ref-list arm makes a
@@ -3622,7 +3614,7 @@ function btGo(ty: i32): i32 {
   // Exhaustive over `Ty` and `_`-less: every arena shape says which tag it boxes under.
   match t {
     TyPrim => {
-      return btOfPrim(t.primName)
+      return boxTagOfPrim(t.primName)
     }
     TyFunc => {
       // A function value boxes at its rep: a tagged set's i32 member id, else the closure ref.
@@ -3642,7 +3634,7 @@ function btGo(ty: i32): i32 {
       if nb >= 0 { return btOfTy(nb) }
       if tyIsLitUnion(ty) { return 2 }
       const p = tyEmitPrimOf(ty)
-      if p != null { return btOfPrim(p) }
+      if p != null { return boxTagOfPrim(p) }
       return btOfUnion(t.uMembers)
     }
     TyObj | TyMap | TyNullable | TyVar | TyNeg | TyErr => {
@@ -3652,8 +3644,8 @@ function btGo(ty: i32): i32 {
   }
 }
 
-// The tag of a primitive, -1 for one with no value or no box arm of its own.
-function btOfPrim(p: PrimName | null): i32 {
+// The union-box tag of a value of primitive `p`, -1 for one with no value arm (`void`, `u8`).
+export function boxTagOfPrim(p: PrimName | null): i32 {
   if p == null { return -1 }
   match p {
     "i32" => {
@@ -4099,9 +4091,8 @@ export function nulScalarBoxAtomOf(inner: i32): i32 {
   if inner < 0 || inner >= T.tys.length { return -1 }
   rtSync()
   if nulDisciplineOfTy(inner) != 4 { return -1 }
-  // A scalar rep's kind is its primitive's name, so the atom is that primitive's. A v128 or a
-  // box boxes too, but neither is a scalar atom a miss can stand in for.
-  const a = valueAtomKind(repOfTy(inner).rdKind)
+  // A v128 or a box boxes too, but neither is a scalar atom a miss can stand in for.
+  const a = boxTagOfTy(inner)
   if a == 0 || a == 3 || a == 4 || a == 5 { return a }
   -1
 }
