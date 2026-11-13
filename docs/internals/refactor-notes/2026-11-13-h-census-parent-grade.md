@@ -37,14 +37,15 @@ eight feed a decision, so all are failing:
 | site                                  | what the output feeds                                           | owner |
 | ------------------------------------- | --------------------------------------------------------------- | ----- |
 | emit_classify `memReadBoxPlan` ×2     | `boxNarrowAtomFor` kinds and the narrowing choice               | D     |
-| wasmEmit `boxNarrowScalarKinds` ×2    | `valueAtomKind` → the conversion opcode                         | D     |
-| wasmEmit `emitBoxAtomRetagTys` ×2     | the retag arms                                                  | D     |
+| wasmEmit `boxNarrowScalarKinds` ×2    | `valueAtomKind` → the conversion opcode                         | A     |
+| wasmEmit `emitBoxAtomRetagTys` ×2     | the retag arms                                                  | A     |
 | emit_collect `riuMemberTys`           | registry member types, deduped by canon spelling (changes rows) | G     |
 | emit_union_registry `msFreeSliceOfTy` | registry atoms and literal flags                                | G     |
 
 The budget rises by exactly these eight `ty-string-parse` entries: emit_classify
 0 → 2, emit_collect 4 → 5, emit_union_registry 0 → 1, wasmEmit 3 → 7 (total 14 →
-22). The rise is a correction, not a regression.
+22, then 18 once the two floored `ty-string-parse` sites move to `ty-carried-floor`).
+The rise is a correction, not a regression.
 
 ## The regeneration
 
