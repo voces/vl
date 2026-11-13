@@ -52,7 +52,8 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 
 | lane | sites |
 | --- | --- |
-| H (D16062 PR 2) | D16050, D16051: a union member's box code decided by its spelling |
+| H (D16062 PR 2) | D16062: class A and the literal-arm channel |
+| G (the slice producer and its readers, one PR) | D16050, D16051: a union member's box code decided by its spelling; the producer switch cannot land without its readers (57 programs lost alone) |
 | A | `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`), after E's step (d), which waits on F's last `ftxt` readers in `shapeFieldElemName` |
 
 ## The renders at this draft (master `537a04cc`, coordinator's measurement)
@@ -150,7 +151,7 @@ is the checker's job. A checker parse reached from emit whose input the emitter 
 then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
 §3.3's sentence "parses no type spelling back" waits on that.
 
-**On master `39f3f015`:** 44 render or synthesized parses, 12 source, 36 unclassified; with #7764's widened render set, 101 renders and 44 display renders. D16000 (#7772) and D16001 (#7775) are closed. D16022 is filed (#7762). Lane H's #7776 counts programs that end in a refusal: `mapSoftTwinTagFail` now shows 2 programs (`generics/error-literal-union-map-twin-through-one-instance-plain-first.vl`), which settles the conflict; `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` stay at 0. New rows D16050 and D16051 (#7777): a union member's box code is a fact about its spelling. They block the close (coordinator: a rep decided by a spelling is what step 7 forbids) and close in lane H's D16062 PR 2, which switches the member-slice producer to `boxTagOfTy`. Across #7776 the sites table moved in 197 rows, by reach counts and example strings only; no site changed origin class, and `mapSoftTwinTagFail` is the one site whose reach rose from 0.
+**On master `39f3f015`:** 44 render or synthesized parses, 12 source, 36 unclassified; with #7764's widened render set, 101 renders and 44 display renders. D16000 (#7772) and D16001 (#7775) are closed. D16022 is filed (#7762). Lane H's #7776 counts programs that end in a refusal: `mapSoftTwinTagFail` now shows 2 programs (`generics/error-literal-union-map-twin-through-one-instance-plain-first.vl`), which settles the conflict; `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` stay at 0. New rows D16050 and D16051 (#7777): a union member's box code is a fact about its spelling. They block the close (coordinator: a rep decided by a spelling is what step 7 forbids) and close in lane G's later PR that switches the member-slice producer to `boxTagOfTy` together with its readers. Across #7776 the sites table moved in 197 rows, by reach counts and example strings only; no site changed origin class, and `mapSoftTwinTagFail` is the one site whose reach rose from 0.
 
 **On master `23e03fce`:** 47 render or synthesized parses, 12 source, 40 unclassified, 13 renders. Since 08:15: P1 parts 1 and 2 (#7752, #7770), P4's `gaeEnsure` and gates (#7757), P6 (#7761, #7769), `arenaEmitName` down to 4 callers (#7763), G's literal-arm question (#7766), and `nodeArrayElemName` graded a floor (#7760; D16000 and D16001 filed).
 
