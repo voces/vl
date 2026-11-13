@@ -33,7 +33,6 @@ import { unionHasAtom } from "./emit_base"
 import { emitFail } from "./emit_bytes"
 import { rlElemTyIxAt } from "./emit_struct_order"
 import {
-  declTyIxOfName,
   msAtomIdOf,
   msFreeSlicePush,
   msMaskClear,
@@ -48,7 +47,6 @@ import {
   msSliceKind,
   msSliceTy,
   repCanonId,
-  repShadowAddReason,
   repShadowBumpReason,
   repShadowOn,
   tyIsI32LeafElem,
@@ -353,16 +351,6 @@ function unionArmsOfSetTy(name: string, s: i32, ty: i32, out: string[]) {
   nm
 }
 
-// Whether row `u` records a member slice in bounds of the member columns.
-function unRowHasSlice(u: i32): boolean {
-  if u < 0 || u >= unMemTyStart.length || u >= unMemTyCount.length {
-    return false
-  }
-  const st = unMemTyStart[u]
-  const end = st + unMemTyCount[u]
-  st >= 0 && end <= unMemAtoms.length && end <= unMemKinds.length
-}
-
 // The `unNames` ROW the union spelling `name` is bound to, or -1. A member-set spelling no row is
 // bound to finds none here; a caller holding the union's type asks the row it keys to.
 export function unionRowOf(name: string): i32 {
@@ -378,25 +366,6 @@ export function unionRowOf(name: string): i32 {
 // `repCanonId`, both armed from source only, since a compiler reading its own environment is a second input.
 export const unABMode: i32 = 0
 
-// The emit-time tallies, per converted site — counters, not a shared reason-bucket, because
-// `repShadowSweep` resets the bucket table before this sweep runs (a bump during emit would
-// not survive to the report) and a pooled bucket can't say which site a disagreement belongs
-// to: `unABCnt[site * UNAB_K + k]`, six outcomes per site.
-let unABCnt: i32[] = []
-const UNAB_K = 7
-// 0 agree · 1 differ · 2 name-only · 3 id-only · 4 neither · 5 no-ty · 6 alias.
-const UNAB_AGREE = 0
-const UNAB_DIFFER = 1
-const UNAB_NAMEONLY = 2
-const UNAB_IDONLY = 3
-const UNAB_NEITHER = 4
-// Two rows keyed to the same member sequence but differing only in name (a declared alias
-// beside its inline spelling, or two monomorphized instances) are not a disagreement — their
-// tag slices are identical and either row answers. D1491.
-const UNAB_ALIAS = 6
-let unRetryHit: i32 = 0
-let unRetryMiss: i32 = 0
-
 export function unABOn(): i32 {
   if unABMode > 0 { return unABMode }
   if repShadowOn { return 1 }
@@ -408,153 +377,12 @@ export function unABOn(): i32 {
 // sites the initial shim added (including id-free callers that already hold an arena id);
 // 11+ came from later one-hop threading. `UNAB_N` bounds the report loop.
 const UNAB_N = 107
-function unABSiteName(s: i32): string {
-  if s == 47 { return "collectU/optCallRet" }
-  // 69-81 are registry-membership readers asking a declared name's type (`isUNameDeclAB`);
-  // 82-97 are `unionRowOf` callers handed the union's type (`unionRowKeyAB`).
-  if s == 69 { return "annParamKind/union" }
-  if s == 70 { return "inferRetIsUnion/noRow" }
-  if s == 71 { return "inferRetIsUnion/noTy" }
-  if s == 72 { return "forInNarrow/elem" }
-  if s == 73 { return "unionRetName" }
-  if s == 74 { return "nulBoxUnionElem" }
-  if s == 75 { return "fieldCode/union" }
-  if s == 76 { return "gaeLeaf/union" }
-  if s == 77 { return "nameIsStructDecl" }
-  if s == 78 { return "typeParamBase/union" }
-  if s == 79 { return "monoAnnPin/union" }
-  if s == 80 { return "monoAnnPin/listElem" }
-  if s == 81 { return "monoAnnPin/litUnionList" }
-  if s == 82 { return "armVariantForObj" }
-  if s == 83 { return "armVariantForStructExpr" }
-  if s == 84 { return "unionBoxHasNoRow" }
-  if s == 85 { return "armVariantWithHeap" }
-  if s == 86 { return "unionSetCanHoldStruct" }
-  if s == 87 { return "markValueUnionAtoms" }
-  if s == 88 { return "assignGlobal/litUnion" }
-  if s == 89 { return "assignLocal/litUnion" }
-  if s == 90 { return "narrowedBoxRender" }
-  if s == 91 { return "unionBoxLacksTag" }
-  if s == 92 { return "listEmptyFitArms" }
-  if s == 93 { return "isPatUnionArmTy" }
-  if s == 94 { return "mapSoftTwinTag" }
-  if s == 95 { return "listIsAcrossReps" }
-  if s == 96 { return "unionUnionEq/left" }
-  if s == 97 { return "unionUnionEq/right" }
-  if s == 98 { return "anonValueFitsField/boxed" }
-  if s == 99 { return "anonValueFitsField/union" }
-  if s == 100 { return "shapeRowFits/union" }
-  if s == 101 { return "shapeFieldTypeCompatK" }
-  if s == 102 { return "markMapUnionArms" }
-  if s == 103 { return "markRefArrayArms" }
-  if s == 104 { return "unionHasMapArmSlot" }
-  if s == 105 { return "unionHasAtomLeafArm" }
-  if s == 106 { return "mapBoxTagOf" }
-  // 67-68 are registry-membership readers moved onto the type key (`isUNameKeyAB`).
-  if s == 67 { return "funcTypeShape/unionField" }
-  if s == 68 { return "nulCloMixedUnion/res" }
-  // 61-65 are the last `registerValueUnionName` callers, handed the type at their source.
-  if s == 61 { return "iisField/refListElem" }
-  if s == 62 { return "iisField/nulRefListElem" }
-  if s == 63 { return "iisField/union" }
-  if s == 64 { return "gaeField/union" }
-  if s == 65 { return "asNull/numFallible" }
-  // 54-60 are `registerValueUnionName` callers that hold the type they rendered the name from.
-  if s == 54 { return "pushFieldRow/union" }
-  if s == 55 { return "riu/valueUnion" }
-  if s == 56 { return "collectU/arrLitNulScalar" }
-  if s == 57 { return "collectU/popGet" }
-  if s == 58 { return "collectU/coalesceIf" }
-  if s == 59 { return "collectU/optMember" }
-  if s == 60 { return "mvShape/valueUnion" }
-  // 52-53 are `unionRowOf` callers that hold the type they rendered the name from.
-  if s == 52 { return "anonUnionFieldName" }
-  if s == 53 { return "mvValUnionRow" }
-  // 48-51 are step 5: name-only readers and a mint that rendered a type they held.
-  if s == 48 { return "mapValNominalName" }
-  if s == 49 { return "nulRefElemNominal" }
-  if s == 50 { return "asNullResult" }
-  if s == 51 { return "sharedReadUnion" }
-  // 29-46 are step 4b(c): `registerInlineUnionAt`'s descents into a subtype, each keyed on its
-  // own canon key, plus `collectTyReachRegister`'s two ID-FREE callers, which hold a type.
-  if s == 29 { return "riu/mapVal" }
-  if s == 30 { return "riu/arrayAtom" }
-  if s == 31 { return "riu/pun" }
-  if s == 32 { return "riu/nulRefArray" }
-  if s == 34 { return "riu/nulCloValue" }
-  if s == 35 { return "riu/nulCloVariant" }
-  if s == 36 { return "riu/nulCloRefArray" }
-  if s == 37 { return "riu/nestedArray" }
-  if s == 39 { return "riu/fnResult" }
-  if s == 40 { return "riu/refArrayArm" }
-  if s == 41 { return "ctr/nullableName" }
-  if s == 42 { return "ctr/unionName" }
-  if s == 43 { return "riu/collapsedName" }
-  if s == 44 { return "riu/inferRetNominal" }
-  if s == 45 { return "riu/arrElemUnion" }
-  if s == 46 { return "riu/api" }
-  if s == 1 { return "regValueUnionTy" }
-  if s == 2 { return "letAnnUnionKind" }
-  if s == 3 { return "unionNameOfExpr/as" }
-  if s == 4 { return "unionNameOfExpr/is" }
-  if s == 5 { return "letAnnUnionRetSink" }
-  if s == 6 { return "letAnnUnionSlot" }
-  if s == 7 { return "internShapeDeep/valueUnion" }
-  if s == 8 { return "internFuncTypeShapes/valueUnion" }
-  if s == 9 { return "inferRetArenaUnionIsDup" }
-  if s == 10 { return "internShapeDeep/armTys" }
-  if s == 11 { return "exprIsUnionStrEq/l" }
-  if s == 12 { return "exprIsUnionStrEq/r" }
-  if s == 13 { return "memberUnionFieldName" }
-  if s == 14 { return "writeRhsIsNullBearing" }
-  if s == 15 { return "fnUnionRetSinkOk" }
-  if s == 16 { return "arrLitUnionElemName" }
-  if s == 17 { return "arrLitBoxElem" }
-  if s == 18 { return "unionNameOfExpr/callee" }
-  if s == 19 { return "unionNameOfExpr/closure" }
-  if s == 20 { return "unionNameOfExpr/method" }
-  if s == 21 { return "nliInferIfLet" }
-  if s == 22 { return "nliInferOptChainLet" }
-  if s == 23 { return "collectU/inferLetTy" }
-  if s == 24 { return "collectU/arrLitInferElem" }
-  if s == 25 { return "emitUnionUnionEq" }
-  if s == 26 { return "emitReturnValue/inferRet" }
-  if s == 27 { return "emitLetDeclStmt/union" }
-  if s == 28 { return "emitLetDeclStmt/nli" }
-  "site?"
-}
-
-// One bucket's name. Split out so the report loop reads as a table rather than as a
-// six-armed ladder inside two nested loops.
-function unABKindName(k: i32): string {
-  if k == UNAB_AGREE { return "agree" }
-  if k == UNAB_DIFFER { return "differ" }
-  if k == UNAB_NAMEONLY { return "name-only" }
-  if k == UNAB_IDONLY { return "id-only" }
-  if k == UNAB_NEITHER { return "neither" }
-  if k == UNAB_ALIAS { return "alias" }
-  "no-ty"
-}
 
 // The id-keyed twin of `unionRowOf(name)`. `unRowOfCanonFolded` is the reverse index this repo
 // already built (`repCanonId` over the `unTyIx` sidecar B-1 step 1 populated); this name is
 // its registry-facing spelling, so a converted call site reads as the twin of the call it
 // replaces rather than as a new idea.
 function unionRowOfTy(ty: i32): i32 { unRowOfCanonFolded(ty) }
-
-// The raw-arena-index twin, kept beside the canon one so all three candidate keys can be
-// priced against each other on one run. The arena is not hash-consed for composite
-// spellings, so one spelling mints several indices and this misses rows the canon key
-// finds — that gap is the argument against keying on the raw index.
-function unionRowOfTyRaw(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  let u = 0
-  while u < unTyIx.length {
-    if unTyIx[u] == ty { return u }
-    u = u + 1
-  }
-  -1
-}
 
 // The seams that answer from the union KEY, step 5's switch: every one but 55, whose type keeps
 // the literals, aliases and nesting its name's render drops. Where the key finds no row,
@@ -740,143 +568,6 @@ export function unionMemberTysOfAB(site: i32, ty: i32, out: i32[]): boolean {
   unionMemberTysOfRow(d, out)
 }
 
-// The second half of the key's licence — `merge-diffset` alone is not it (D1492). A struct
-// union's tags are positional over its variant slice, not the member-set string, so two rows
-// with the same set but different slices need this too. Complementary: a value union owns no
-// variants, so only the set compare can see two atom sets fused.
-function unRowVariantsSame(a: i32, b: i32): boolean {
-  if a >= unVarStart.length || b >= unVarStart.length { return false }
-  if a >= unVarCount.length || b >= unVarCount.length { return false }
-  const na = unVarCount[a]
-  if na != unVarCount[b] { return false }
-  const sa = unVarStart[a]
-  const sb = unVarStart[b]
-  if sa < 0 || sb < 0 { return false }
-  if sa + na > uVariants.length || sb + na > uVariants.length { return false }
-  let i = 0
-  while i < na {
-    if uVariants[sa + i] != uVariants[sb + i] { return false }
-    i = i + 1
-  }
-  true
-}
-
-// The ABI assertion the type key owes: two rows it would fuse (`unTyKey`), and how many of those
-// record a different member set. A union's box tags are positional over its own member set, so a merge
-// across different sets reads a value tagged under one slice through the other's — the
-// hazard that disqualified `repCanonId`. `merge-diffset` must be 0 for the key to be usable.
-function unKeySweepPair(u: i32, v: i32) {
-  let k = -1
-  let kv = -1
-  if u < unTyKey.length { k = unTyKey[u] }
-  if v < unTyKey.length { kv = unTyKey[v] }
-  if k < 0 || kv < 0 { return 0 }
-  repShadowBumpReason("keySweep/pair-keyed")
-  if k != kv { return 0 }
-  repShadowBumpReason("keySweep/merge")
-  if unNames[u] != unNames[v] { repShadowBumpReason("keySweep/merge-diffname") }
-  if !unRowSetSameNullBlind(u, v) {
-    repShadowBumpReason("keySweep/merge-diffset")
-  }
-  if !unRowVariantsSame(u, v) { repShadowBumpReason("keySweep/merge-diffvar") }
-  0
-}
-
-// Whether rows `u` and `v` record the same members in the same order once their `null` members
-// are set aside, with as many members each. `null`'s box tag is global, so where it sits is no
-// part of the layout; every other member's position is, and none is deduped. A row with no
-// recorded slice compares by its member-set spelling.
-function unRowSetSameNullBlind(u: i32, v: i32): boolean {
-  if u < 0 || v < 0 || u >= unMemberSet.length || v >= unMemberSet.length {
-    return true
-  }
-  if unMemberSet[u] == unMemberSet[v] { return true }
-  if !unRowHasSlice(u) || !unRowHasSlice(v) { return false }
-  const n = unMemTyCount[u]
-  if n != unMemTyCount[v] { return false }
-  const su = unMemTyStart[u]
-  const sv = unMemTyStart[v]
-  let i = 0
-  let j = 0
-  while i < n || j < n {
-    while i < n && unMemKinds[su + i] == 0 { i = i + 1 }
-    while j < n && unMemKinds[sv + j] == 0 { j = j + 1 }
-    if i < n && j < n {
-      if unMemAtoms[su + i] != unMemAtoms[sv + j] { return false }
-      i = i + 1
-      j = j + 1
-    } else if i < n || j < n {
-      return false
-    }
-  }
-  true
-}
-
-// The whole-registry measurement, run once per program beside `repShadowSweep`: every row
-// asked about itself, both ways, with no call-site plumbing. The round-trips say whether a
-// key can even name its own row; `canon-merge` counts pairs of distinct rows one canon id
-// would fuse — the ABI hazard, since a union's box tags are positional over its own member set.
-export function unionRegistryABSweep() {
-  if unABOn() == 0 { return 0 }
-  let s = 1
-  while s < UNAB_N {
-    let k = 0
-    while k < UNAB_K {
-      const at = s * UNAB_K + k
-      if at < unABCnt.length {
-        repShadowAddReason(
-          "unionAB/" + unABSiteName(s) + "/" + unABKindName(k),
-          unABCnt[at],
-        )
-      }
-      k = k + 1
-    }
-    s = s + 1
-  }
-  repShadowAddReason("atomRetry/id-hit", unRetryHit)
-  repShadowAddReason("atomRetry/id-miss", unRetryMiss)
-  unABCnt = []
-  unRetryHit = 0
-  unRetryMiss = 0
-  let u = 0
-  while u < unNames.length {
-    repShadowBumpReason("unionSweep/rows")
-    if unionRowOf(unNames[u]) == u { repShadowBumpReason("unionSweep/name-rt") }
-    let ty = -1
-    if u < unTyIx.length { ty = unTyIx[u] }
-    if ty >= 0 {
-      repShadowBumpReason("unionSweep/covered")
-      if unionRowOfTy(ty) == u { repShadowBumpReason("unionSweep/canon-rt") }
-      if unionRowOfTyRaw(ty) == u { repShadowBumpReason("unionSweep/raw-rt") }
-    }
-    let v = u + 1
-    while v < unNames.length {
-      if unNames[u] == unNames[v] { repShadowBumpReason("unionSweep/name-dup") }
-      let tv = -1
-      if v < unTyIx.length { tv = unTyIx[v] }
-      unKeySweepPair(u, v)
-      if ty >= 0 && tv >= 0 {
-        if repCanonId(ty) == repCanonId(tv) {
-          repShadowBumpReason("unionSweep/canon-merge")
-          if unNames[u] != unNames[v] {
-            repShadowBumpReason("unionSweep/canon-merge-diffname")
-          }
-          // Bounded, not assumed adjacent: `unMemberSet` is pushed in lockstep with `unNames`
-          // at all three mint sites, but this sweep never relies on that alignment holding.
-          if v < unMemberSet.length && u < unMemberSet.length {
-            if unMemberSet[u] != unMemberSet[v] {
-              repShadowBumpReason("unionSweep/canon-merge-diffset")
-            }
-          }
-        }
-      }
-      v = v + 1
-    }
-    u = u + 1
-  }
-  0
-}
-
 // The row-keyed core of `unMemHasAtom` — the same walk from a row instead of a spelling.
 // Every parallel-table read here is bounded: a row named by a key the table never grew
 // is exactly the shape that trapped before. D1152.
@@ -911,33 +602,6 @@ function unMemHasAtomRow(u: i32, want: string, arr: boolean): i32 {
     i = i + 1
   }
   0
-}
-
-// The registry row for a SPELLING, keyed by rep identity rather than by text: the name is
-// used only as a ROUTE to the arena (`declTyIxOfName`), and the comparison is `repCanonId`.
-// This is the query a registry keyed on an interned rep key would perform, written so the
-// three filed witnesses can be graded without threading a type through their call chains.
-function unionRowOfSpellingTy(name: string): i32 {
-  const ty = declTyIxOfName(name)
-  if ty < 0 { return -1 }
-  unionRowOfTy(ty)
-}
-
-// The id-keyed RETRY at the atom test's decline. -1 always when unarmed, so the shipped
-// compiler reaches its `emitFail` exactly as before; mode 1 only TALLIES whether the id key
-// would have found the row, mode 2 answers from it. `id-hit` counts the refusals a rep-keyed
-// registry would not have raised — the number the design's witness claim rests on.
-function unABAtomRetry(name: string, want: string, arr: boolean): i32 {
-  const m = unABOn()
-  if m == 0 { return -1 }
-  const u = unionRowOfSpellingTy(name)
-  if u < 0 {
-    unRetryMiss = unRetryMiss + 1
-    return -1
-  }
-  unRetryHit = unRetryHit + 1
-  if m != 2 { return -1 }
-  unMemHasAtomRow(u, want, arr)
 }
 
 // The arena member types of the union `name`, appended to `out` in the row's recorded order
@@ -1019,10 +683,6 @@ export function unionHasAtomTy(
 ): boolean {
   const a = unMemHasAtom(name, want, arr)
   if a >= 0 { return a == 1 }
-  // SPIKE: would a registry keyed on rep identity have found this row? -1 when unarmed, so
-  // the refusal below is reached exactly as before (`unABAtomRetry`).
-  const r = unABAtomRetry(name, want, arr)
-  if r >= 0 { return r == 1 }
   // The RENDERED member set, when the name is one: an inferred join has no registered row,
   // and its render is the checker's own member list, so reading it invents neither a row nor
   // an order. A name with no top-level `|` is an alias and still refuses (D1733).
@@ -1569,4 +1229,102 @@ export function unMemIsRefElemArray(m: i32): boolean {
     return true
   }
   false
+}
+
+// The union registry's key licence, once per program under the rep shadow: every pair of rows the
+// type key would fuse is compared (`unKeySweepPair`). A no-op unless the shadow is armed.
+export function unionKeySweep() {
+  if !repShadowOn { return 0 }
+  let u = 0
+  while u < unNames.length {
+    let v = u + 1
+    while v < unNames.length {
+      unKeySweepPair(u, v)
+      v = v + 1
+    }
+    u = u + 1
+  }
+  0
+}
+
+// Whether row `u` records a member slice in bounds of the member columns.
+function unRowHasSlice(u: i32): boolean {
+  if u < 0 || u >= unMemTyStart.length || u >= unMemTyCount.length {
+    return false
+  }
+  const st = unMemTyStart[u]
+  const end = st + unMemTyCount[u]
+  st >= 0 && end <= unMemAtoms.length && end <= unMemKinds.length
+}
+
+// Whether rows `u` and `v` record the same members in the same order once their `null` members
+// are set aside, with as many members each. `null`'s box tag is global, so where it sits is no
+// part of the layout; every other member's position is, and none is deduped. A row with no
+// recorded slice compares by its member-set spelling.
+function unRowSetSameNullBlind(u: i32, v: i32): boolean {
+  if u < 0 || v < 0 || u >= unMemberSet.length || v >= unMemberSet.length {
+    return true
+  }
+  if unMemberSet[u] == unMemberSet[v] { return true }
+  if !unRowHasSlice(u) || !unRowHasSlice(v) { return false }
+  const n = unMemTyCount[u]
+  if n != unMemTyCount[v] { return false }
+  const su = unMemTyStart[u]
+  const sv = unMemTyStart[v]
+  let i = 0
+  let j = 0
+  while i < n || j < n {
+    while i < n && unMemKinds[su + i] == 0 { i = i + 1 }
+    while j < n && unMemKinds[sv + j] == 0 { j = j + 1 }
+    if i < n && j < n {
+      if unMemAtoms[su + i] != unMemAtoms[sv + j] { return false }
+      i = i + 1
+      j = j + 1
+    } else if i < n || j < n {
+      return false
+    }
+  }
+  true
+}
+
+// The second half of the key's licence — `merge-diffset` alone is not it (D1492). A struct
+// union's tags are positional over its variant slice, not the member-set string, so two rows
+// with the same set but different slices need this too. Complementary: a value union owns no
+// variants, so only the set compare can see two atom sets fused.
+function unRowVariantsSame(a: i32, b: i32): boolean {
+  if a >= unVarStart.length || b >= unVarStart.length { return false }
+  if a >= unVarCount.length || b >= unVarCount.length { return false }
+  const na = unVarCount[a]
+  if na != unVarCount[b] { return false }
+  const sa = unVarStart[a]
+  const sb = unVarStart[b]
+  if sa < 0 || sb < 0 { return false }
+  if sa + na > uVariants.length || sb + na > uVariants.length { return false }
+  let i = 0
+  while i < na {
+    if uVariants[sa + i] != uVariants[sb + i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The ABI assertion the type key owes: two rows it would fuse (`unTyKey`), and how many of those
+// record a different member set. A union's box tags are positional over its own member set, so a merge
+// across different sets reads a value tagged under one slice through the other's — the
+// hazard that disqualified `repCanonId`. `merge-diffset` must be 0 for the key to be usable.
+function unKeySweepPair(u: i32, v: i32) {
+  let k = -1
+  let kv = -1
+  if u < unTyKey.length { k = unTyKey[u] }
+  if v < unTyKey.length { kv = unTyKey[v] }
+  if k < 0 || kv < 0 { return 0 }
+  repShadowBumpReason("keySweep/pair-keyed")
+  if k != kv { return 0 }
+  repShadowBumpReason("keySweep/merge")
+  if unNames[u] != unNames[v] { repShadowBumpReason("keySweep/merge-diffname") }
+  if !unRowSetSameNullBlind(u, v) {
+    repShadowBumpReason("keySweep/merge-diffset")
+  }
+  if !unRowVariantsSame(u, v) { repShadowBumpReason("keySweep/merge-diffvar") }
+  0
 }
