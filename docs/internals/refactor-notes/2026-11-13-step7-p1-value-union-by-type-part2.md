@@ -54,4 +54,25 @@ mirrored: the alias-before-base order, a nested union, and a list of a literal u
 
 **Sweep** (`sweep.vl diff`, fixpoint seeds, master `4f7761cb` against this): 24,210 same, 0 movers.
 
+## Six unreached parse sites, floored
+
+Lane F's audit (#7759) found six `emit_union_atoms` parse sites with no reaches. A probe counted
+each site and a control over 24,206 programs: one witness, `D12131`, exhausts the stack in batch
+mode on either seed. Each site reads 0; each control fires.
+
+| site | parse | control | control reaches | cut |
+| --- | --- | --- | --- | --- |
+| `registerValueUnionNameTy` | `isValueUnionName` on a declined row test | function entry | 5,792 | the decline fails loudly |
+| `atomArmUseBits` | `valueAtomKind` per arm | `markValueUnionArms`, the `cov \|\| ty < 0` arm | 10,216 | the arm with neither member types nor a type fails loudly; `atomArmUseBits` deleted |
+| `unionHasClosureArm` | `valueAtomKind` fallback | `unionNameOfIndex`, the rung before (see below) | 270 | deleted with its only caller |
+| `unionClosureArmName` | `valueAtomKind` fallback | function entry | 71 | the fallback fails loudly |
+| `unionClosureArrElemUnion` | `isValueUnionName` | `unionNameOfIndex`, the rung before | 270 | the rung fails loudly; the function deleted |
+| `unionRefArrayArmSlotForNestedElem` | `nameIsMapOpen` | its caller's non-empty array-literal arm | 181 | the map branch fails loudly |
+
+`unionNameOfIndex`'s arm-name recovery for a union binding's index read never ran: an index read
+that reaches it already classified as a ref-list read (`exprRefArray`) one rung earlier, including
+`tests/cases/unions/union-arm-closure-element-array-index-call.vl`, the case it was written for.
+
+`ty-string-parse` in this PR's files falls 56 → 50 and `ty-parse-unclassified` 46 → 40.
+
 The semantic question, one value-union answer per type, stays D16062.

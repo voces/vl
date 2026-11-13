@@ -258,7 +258,7 @@ import {
   vbU8ArmUsed,
   vbV128Used,
 } from "./emit_state"
-import { rlDeclTwinTy, rlSlotOfTy } from "./emit_struct_order"
+import { rlDeclTwinTy } from "./emit_struct_order"
 import { mapArmShapeOfTy, mapPinnedParamTyOf, mapTyPeel } from "./emit_ty_canon"
 import {
   isUNameAB,
@@ -285,7 +285,6 @@ import {
 import { variantSig } from "./emit_variant_sig"
 import { i32ListHas } from "./listutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
-import { nameIsMapOpen } from "./tyname"
 import {
   isNullTy,
   nulLitUnionPeelTy,
@@ -1407,14 +1406,16 @@ function cloSigNameOfTy(ty: i32): string { tyToEmitName(ty) }
 // asked by type rather than by spelling once its readers move.
 function registerValueUnionNameTy(name: string, tyIx: i32) {
   if isUNameAB(1, tyIx) && unNameAdoptTyKeyRow(name, tyIx) { return 0 }
-  // The row decides: `isValueUnionTyOr` asks `valueRowKind` per member, matching
-  // `isValueUnionName`'s spelling test, and declines (-1) rather than guess. A value union
+  // The row decides: `isValueUnionTyOr` asks `valueRowKind` per member. A decline fails
+  // loudly: every registration reaching here carries a type the rows place. A value union
   // with a litunion-alias arm registers here too, since the alias rides the box as its
   // member-string atom — without it the scalar arms' value boxes are never minted.
-  let isVU = isValueUnionTyOr(tyIx)
+  const isVU = isValueUnionTyOr(tyIx)
   if isVU < 0 {
-    isVU = 0
-    if isValueUnionName(name) { isVU = 1 }
+    emitFail(
+      "emitProgram: a value-union registration has a type its rows cannot place",
+    )
+    return 0
   }
   if isVU == 0 && !nameIsLitUnionArmValueUnion(name) { return 0 }
   pushValueUnionRow(name, tyIx)
@@ -1860,17 +1861,8 @@ function tyArmUseBits(ty: i32): i32 {
   armUseBits(boxTagOfTy(ty))
 }
 
-// The usage bits of one arm spelled `atom` in a row with no type: its value-atom kind's, or a
-// string's when the spelling declares a literal union.
-function atomArmUseBits(atom: string): i32 {
-  if atom == "" { return 0 }
-  const k = valueAtomKind(atom)
-  if k < 0 && tyIsLitUnion(declTyIxOfName(atom)) { return armUseBits(2) }
-  armUseBits(k)
-}
-
 // The marks for one union's `atoms`: read through member types `mems` when `cov`, else through
-// the union's type `ty`, else (`ty` -1) through each atom's declared type.
+// the union's type `ty`. A union with neither fails loudly: every registered row has one.
 function markValueUnionArms(
   atoms: string[],
   mems: i32[],
@@ -1878,16 +1870,17 @@ function markValueUnionArms(
   ty: i32,
 ) {
   let m = 0
-  if cov || ty < 0 {
+  if cov {
     let i = 0
     while i < atoms.length {
-      if cov {
-        m = m | armUseBits(boxTagOfTy(mems[i]))
-      } else {
-        m = m | atomArmUseBits(atoms[i])
-      }
+      m = m | armUseBits(boxTagOfTy(mems[i]))
       i = i + 1
     }
+  } else if ty < 0 {
+    emitFail(
+      "emitProgram: a value union has neither member types nor a union type",
+    )
+    return 0
   } else {
     m = tyArmUseBits(ty)
   }
@@ -2292,31 +2285,6 @@ export function identChainTyBoxedUnion(
 // over-reservation is a harmless spare and an under-reservation is invalid wasm.
 export function armPathArenaDeclined(): boolean { true }
 
-// True if the union member-set `name` has a bare-closure arm. A closure is value-atom kind
-// 11 (a ref atom riding the box anyref as the fat-pointer), and it tags on an interned slot,
-// its signature's (`cloSigSlotTag`), since kind 11 alone cannot separate two function-typed
-// arms. Mirrors `unionHasClosureArrayArm`, which tests the distinct closure-element array shape.
-export function unionHasClosureArm(name: string) {
-  const atoms: string[] = []
-  // Value-atom kind 11 is "the member is a function type" — ask the arena
-  // (`tyIxIsFunc`) rather than `valueAtomKind`'s spelling ladder.
-  const mems: i32[] = []
-  if unionArmTys(name, atoms, mems) {
-    let m = 0
-    while m < mems.length {
-      if tyIxIsFunc(mems[m]) { return true }
-      m = m + 1
-    }
-    return false
-  }
-  let i = 0
-  while i < atoms.length {
-    if valueAtomKind(atoms[i]) == 11 { return true }
-    i = i + 1
-  }
-  false
-}
-
 // The bare-closure arm name of the union member-set `name`, or "" when it has none — the
 // presence question `emitUnionCoerce` gates its closure-carrier box on. The returned name
 // does not decide the box tag: only the arm's signature separates several function-typed
@@ -2334,11 +2302,9 @@ export function unionClosureArmName(name: string, ty: i32) {
     }
     return ""
   }
-  let i = 0
-  while i < atoms.length {
-    if valueAtomKind(atoms[i]) == 11 { return atoms[i] }
-    i = i + 1
-  }
+  emitFail(
+    "emitProgram: a closure-arm lookup reached a union with no recorded member types",
+  )
   ""
 }
 
@@ -2370,27 +2336,6 @@ export function unionClosureArmTy(name: string): i32 {
     }
   }
   -1
-}
-
-// The element value-union of union member-set `name`'s array arm whose element is itself a
-// value union carrying a bare-closure member, read off that element's ref-list row; "" when
-// no arm has one. Such an arm is a union-element array, not a bare closure element, so
-// `unionHasClosureArrayArm` does not cover it.
-export function unionClosureArrElemUnion(name: string) {
-  const atoms: string[] = []
-  const mems: i32[] = []
-  if !unionArmTys(name, atoms, mems) { return "" }
-  for m in mems {
-    const a = tyAt(m)
-    if a is TyArray {
-      const slot = rlSlotOfTy(a.aElem)
-      if slot >= 0 && rlElemKindAt(slot) == RLK_UNION {
-        const el = rlElemUnionName(slot)
-        if isValueUnionName(el) && unionHasClosureArm(el) { return el }
-      }
-    }
-  }
-  ""
 }
 
 // The recorded member types of a member-set spelling, for the four ref-array arm
@@ -2519,11 +2464,10 @@ export function unionRefArrayArmSlotForNestedElem(
       && rlElemKindAt(slot) == RLK_UNION
     ) {
       if wantMap {
-        const eAtoms: string[] = []
-        unionArmsOf(rlElemUnionName(slot), eAtoms)
-        for a in eAtoms {
-          if nameIsMapOpen(a) { return slot }
-        }
+        emitFail(
+          "emitProgram: a map element reached the nested-arm search of a union list arm",
+        )
+        return -1
       } else {
         if elemUnionHasArrayMember(rlElemName[slot]) { return slot }
       }
