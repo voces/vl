@@ -233,6 +233,7 @@ import {
   mkMapTy,
   mkNullableTy,
   mkObjTy,
+  nomNameOfTy,
   numLitUnionBaseName,
   oneStrLitSpelling,
   structNameOfTy,
@@ -2261,16 +2262,59 @@ function monoRecordNominalPin(ty: i32): string {
     }
     return genAppNameOfTy(ty)
   }
+  if monoTyHasFieldRecord(ty, 24) { return "" }
   const raw = tyToNominalName(ty)
   let out = ""
   let i = 0
   while i < raw.length {
     const c = raw.slice(i, i + 1)
-    if c == "{" && raw.slice(i + 1, i + 2) != "[" { return "" }
     if c != " " { out = out + c }
     i = i + 1
   }
   out
+}
+
+// Whether closed type `t` holds, at any depth, a record no declared or application name spells:
+// the record its nominal render spells by its fields.
+function monoTyHasFieldRecord(t: i32, depth: i32): boolean {
+  if depth <= 0 || t < 0 || t >= T.tys.length { return false }
+  if nomNameOfTy(t) != "" || unionAliasDeclNameOfTy(t) != "" { return false }
+  const o = tyAt(t)
+  match o {
+    TyObj => {
+      if structNameOfTy(t) == "" && genAppNameOfTy(t) == "" { return true }
+      if structNameOfTy(t) != "" { return false }
+      for f in o.objFieldTypes {
+        if monoTyHasFieldRecord(f, depth - 1) { return true }
+      }
+      return false
+    }
+    TyArray => {
+      return monoTyHasFieldRecord(o.aElem, depth - 1)
+    }
+    TyNullable => {
+      return monoTyHasFieldRecord(o.nInner, depth - 1)
+    }
+    TyUnion => {
+      for m in o.uMembers {
+        if monoTyHasFieldRecord(m, depth - 1) { return true }
+      }
+      return false
+    }
+    TyMap => {
+      return monoTyHasFieldRecord(o.mKey, depth - 1)
+        || monoTyHasFieldRecord(o.mVal, depth - 1)
+    }
+    TyFunc => {
+      for p in o.fnParamTypes {
+        if monoTyHasFieldRecord(p, depth - 1) { return true }
+      }
+      return monoTyHasFieldRecord(o.fnRet, depth - 1)
+    }
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
 }
 
 // The pin of closed type `ty`, which holds no record, as mono keys an instance: a function-
@@ -3553,7 +3597,7 @@ function monoSubstAnnNode(
       // for it, which the caller must tell apart from an already-concrete one.
       if sty < 0 { return -2 }
       const sub = monoPinSpellShaped(sty)
-      if sub == "" || sub == tn.tyName { return -2 }
+      if sub == "" { return -2 }
       return synthTypeRefTy(sub, tn.pos, sty)
     }
   }
@@ -7653,7 +7697,6 @@ function monoBuildPinCol(pinned: string[], pinTys: i32[], kinds: i32[]) {
   let i = 0
   while i < pinned.length {
     const lk = monoTagRecordPinKind(
-      pinned[i],
       if i < pinTys.length { pinTys[i] } else { -1 },
     )
     kinds.push(if lk >= 0 { lk } else { pinKindOfName(pinned[i]) })
@@ -7662,18 +7705,16 @@ function monoBuildPinCol(pinned: string[], pinTys: i32[], kinds: i32[]) {
   0
 }
 
-// The pin kind of a record of tagged-set ids pinned as `pin` at record type `ty`, read off the
-// layout its stored fields have: `PIN_ANON` when a row holds that layout, else `PIN_NONE`; -1
-// for a pin that is not such a record's.
-function monoTagRecordPinKind(pin: string, ty: i32): i32 {
+// The pin kind of a pin at record type `ty` that holds tagged-set ids, read off the layout its
+// stored fields have: `PIN_ANON` when a row holds that layout, else `PIN_NONE`; -1 for a type
+// that is no such record.
+function monoTagRecordPinKind(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   const o = tyAt(ty)
   if !(o is TyObj) { return -1 }
   const codes: i32[] = []
   const texts: string[] = []
-  if monoPinSpellShaped(monoTagMapRepTy(ty, codes, texts)) != pin || pin == "" {
-    return -1
-  }
+  if monoTagMapRepTy(ty, codes, texts) < 0 { return -1 }
   if layoutFirstRowOf(o.objFieldNames, codes, ty) >= 0 {
     PIN_ANON
   } else {
