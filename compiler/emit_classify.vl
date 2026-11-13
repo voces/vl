@@ -1,3 +1,4 @@
+import { widenLitTy } from "./check_relate_core"
 import { unionTyArms } from "./emit_map_twins"
 import { REC_STORE_DEPTH } from "./check_ty_relate"
 import { registeredUnionRowOfTy } from "./emit_start_block"
@@ -716,7 +717,6 @@ import {
   readContainerKindOfTy,
   unionDeclTyIxOfExpr,
   unionDeclTyIxOfIdentRead,
-  unionRetName,
   unionTyIxOfIdentAt,
 } from "./emit_start_block"
 import {
@@ -9895,15 +9895,10 @@ function unionNameOfHoleReadGo(atIx: i32, fnIx: i32) {
       if pIx >= 0 && !fnBlockShadowsAt(fnIx, sid, atIx) {
         const p = nodeAt(pIx)
         if p is Param {
-          // The registry-membership test via the canon-keyed index instead of a spelling's
-          // linear scan over `unNames`: same question, same name returned, on interned ids.
-          // The spelling renders only once the row exists, since a non-union param drops it.
-          // An un-annotated parameter names the row its recorded type keys.
+          // A parameter names the row its annotation or recorded type keys, by the canon-keyed
+          // index; a non-union parameter keys none.
           const pur = unRowOfCanonFolded(annRowOfNode(parTyNode(pIx)))
-          if pur >= 0 {
-            if p.parType < 0 && pur < unNames.length { return unNames[pur] }
-            return tyNameOf(p.parType)
-          }
+          if pur >= 0 && pur < unNames.length { return unNames[pur] }
           return ""
         }
       }
@@ -10487,20 +10482,18 @@ function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
   ""
 }
 
-// The union name a call `e` returns: a list `pop`/`get` box, a declared callee's annotated or
-// inferred return, a boxed `$fnsig` result, then the checker's recorded type. "" when the
-// result is not a union.
+// The union name a call `e` returns: a declared callee's annotated or inferred return, then the
+// checker's recorded type, each beside the row its type keys to. "" when the result is not a
+// union. A call whose name would carry no row is a floor (`callNameFloor`).
 function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
   if e.callFn < 0 { return "" }
   const callee = nodeAt(e.callFn)
-  // `xs.pop()` / `xs.get(i)` over a value-union ref list: the read's `T | null` IS the
-  // box, `null` riding as its tag, so the element's union name is what makes a narrowed
-  // read unbox rather than hand its consumer the raw box ref (D1825).
+  // `xs.pop()` / `xs.get(i)` over a value-union ref list is named by `unionNameOfExpr`'s earlier
+  // rungs (D1825).
   if callee is Member {
     const pus = popRefRecvSlot(exprIx, fnIx)
     if pus >= 0 && pus < rlElemName.length && popUnionBoxElem(pus) {
-      unNameRowLast = rlElemUnionRow(pus)
-      return rlElemUnionName(pus)
+      return callNameFloor("a list `pop`/`get` box")
     }
   }
   // A declared callee's own return annotation names the union its result boxes as; the call's
@@ -10512,9 +10505,10 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
       if fn is FuncDecl {
         const arw = unRowOfCanonFolded(annRowOfNode(fn.fnRet))
         if arw >= 0 {
-          // The call's own type row stands for the annotation where the two fold to one row; a
-          // literal-union annotation folds to its base's, which another row can carry.
-          if unRowOfTyKey(nodeTyIxOf(unwrapParen(exprIx))) == arw {
+          // The call's own type, or its literal leaves widened, stands for the annotation's row
+          // where the two fold to one row; a literal-union annotation folds to its base's.
+          const cty = nodeTyIxOf(unwrapParen(exprIx))
+          if unRowOfTyKey(cty) == arw || unRowOfTyKey(widenLitTy(cty)) == arw {
             unNameRowLast = arw
           }
           return tyNameOf(fn.fnRet)
@@ -10525,7 +10519,10 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
           const irt = inferRetTyIxOf(irk)
           if isValueUnionName(im) {
             // A literal member keys a literal row the name's spelling does not name.
-            if !tyHasLitLeaf(irt, 4) { unNameRowLast = unRowOfTyKey(irt) }
+            if tyHasLitLeaf(irt, 4) {
+              return callNameFloor("an inferred return with a literal member")
+            }
+            unNameRowLast = unRowOfTyKey(irt)
             return im
           }
           if im != "" && isUNameAB(18, irt) {
@@ -10536,29 +10533,26 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
       }
     }
   }
-  // A value call the callee's `$fnsig` keys with a boxed result is that union, named from the
-  // call's type (D2535).
+  // A value call the callee's `$fnsig` keys with a boxed result is named by the rungs before
+  // this one (D2535).
   if (
     tyBearsNull(nodeTyAt(unwrapParen(exprIx), fnIx))
     && callIsValueCall(unwrapParen(exprIx))
   ) {
     const cuk = cloCallSigKey(unwrapParen(exprIx), fnIx)
     if cuk != "" && sigKeyRetKind(cuk) == "union" {
-      const kun = callUnionNameOfTy(nodeTyIxOf(unwrapParen(exprIx)))
-      if kun != "" {
-        unNameRowLast = unRowOfTyKey(nodeTyIxOf(unwrapParen(exprIx)))
-        return kun
-      }
+      return callNameFloor("a value call's boxed `$fnsig` result")
     }
   }
-  // An instance's call through a hole parameter names no annotation, and its pinned result
-  // is the nullable value-union box the bound function returns (D9700).
+  // An instance's call through a hole parameter, whose pinned result is a nullable value-union
+  // box, is named by the rungs before this one (D9700).
   if (
     fnInPinnedInstance(fnIx)
     && tyIsNulValueUnionBox(nodeTyAt(unwrapParen(exprIx), fnIx))
   ) {
-    const iun = valueUnionNameOfTy(nodeTyIxOf(unwrapParen(exprIx)))
-    if iun != "" { return iun }
+    if valueUnionNameOfTy(nodeTyIxOf(unwrapParen(exprIx))) != "" {
+      return callNameFloor("an instance's call through a hole parameter")
+    }
   }
   // Fallback scoped to a call (an if-expr has its own union path): renders from the checker's
   // per-node type when the callee has no static name to key on (`arr[i](x)`).
@@ -10567,12 +10561,10 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
     unNameRowLast = unRowOfTyKey(nodeTyInOf(unwrapParen(exprIx), fnIx))
     return crun
   }
-  // A type parameter bound to a union stays nested in the result (`T | string` at `f64 | i32`),
-  // which no render above flattens; the box is the row holding its flattened members (D10522).
-  const nfr = nestedUnionRowName(nodeTyAt(unwrapParen(exprIx), fnIx))
-  if nfr != "" {
-    unNameRowLast = unRowOfFlatMembers(nodeTyAt(unwrapParen(exprIx), fnIx))
-    return nfr
+  // A type parameter bound to a union nested in the result (`T | string` at `f64 | i32`) is
+  // flattened by the render above (D10522).
+  if nestedUnionRowName(nodeTyAt(unwrapParen(exprIx), fnIx)) != "" {
+    return callNameFloor("a result nesting a union-bound type parameter")
   }
   // `nodeUnionName` gates itself to a value union first, so a call returning a declared
   // struct union (an inferred hole-param return with no annotation) named nothing here either. D1561.
@@ -10585,21 +10577,10 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
   rgn
 }
 
-// The union name a value call of result type `ty` boxes as: a literal-union alias, bare or
-// nullable, else its value-union spelling, else the name of the row its key holds; "" for none.
-function callUnionNameOfTy(ty: i32): string {
-  if ty < 0 { return "" }
-  const t = tyAt(ty)
-  if t is TyNullable {
-    const nal = litUnionAliasNameOfTy(t.nInner)
-    if nal != "" { return unionRetName(nal + "|null") }
-  }
-  const bal = litUnionAliasNameOfTy(ty)
-  if bal != "" { return unionRetName(bal) }
-  const vn = valueUnionNameOfTy(ty)
-  if vn != "" { return vn }
-  const r = unRowOfTyKey(ty)
-  if r >= 0 { return unNames[r] }
+// A call rung no program reaches, whose name would carry no row: a compile failure naming `what`,
+// and "".
+function callNameFloor(what: string): string {
+  emitFail("emitProgram: the union name of " + what + " carries no row")
   ""
 }
 
