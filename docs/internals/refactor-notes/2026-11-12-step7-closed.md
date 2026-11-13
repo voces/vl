@@ -52,7 +52,7 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 | lane | sites |
 | --- | --- |
 | E / F (D6 re-key) | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internArmShapeRow` render (`tyToEmitName(aty)` into `armMintShapeName`); the `nm` input `variantNestedRow` and `armFieldStructRowMinted` hand `internInlineShapeTy` |
-| G / D | the `unionNameOfExpr` producer, with its rungs (`unionNameOfCall`) and internal calls, closes when its external consumers read the type: 10 `unionNameRowOfExpr` callers (emit_classify 2, wasmEmit 8) and 2 `letUnionNameOf` callers. `printUnionPlanCode`'s call is D16060's floor |
+| G / D | the `unionNameOfExpr` producer, with its rungs (`unionNameOfCall`) and internal calls, closes when its external consumers read the type: 10 `unionNameRowOfExpr` callers (emit_classify 2, wasmEmit 8) and 2 `letUnionNameOf` callers. `printUnionPlanCode`'s call is D16060's floor. Lane G's cut 8a types the two wrappers (box type, else node type, one named floor for the function-set and alias-spelling families), converting all 12 at once |
 
 ## Floors held by a filed row
 
