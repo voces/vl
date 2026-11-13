@@ -1538,10 +1538,8 @@ import {
   unMemIsMap,
   unMemIsRefElemArray,
   unionArmsOf,
-  unionArmsOfSet,
   unionArmsOfTy,
   unionHasAtomOfTy,
-  unionMemberAtomsOf,
   unionMemberSetOf,
   unionMemberSetOfRow,
   unionMemberTysOf,
@@ -9073,12 +9071,7 @@ function emitUnionCoerceValueAtom(
     const nlTexts = nulAtomWidenTexts(exprIx, fnIx)
     if nlTexts.length > 0 {
       // Beside a plain `string` arm the join is `string | null`, not this box.
-      const nlAtoms: string[] = []
-      unionMemberAtomsOf(unionName, nlAtoms)
-      let nlStrArm = false
-      for na in nlAtoms {
-        if na == "string" { nlStrArm = true }
-      }
+      const nlStrArm = unionTyHasValKindOf(uTy, valueAtomKind("string"))
       // A binding typed `K | null` holds the atom at every spelling; a parameter does too, unless
       // its function's declared return reads the box at the declaration's rep.
       const nlArg = nodeAt(unwrapParen(exprIx))
@@ -9397,7 +9390,7 @@ function emitUnionCoerceUnder(
     return emitUnionIfValue(body, unionName, unionTy, bareIx, fnIx)
   }
   if numUnionMinted {
-    const nuRb = emitNumUnionRebox(body, exprIx, unionName, fnIx)
+    const nuRb = emitNumUnionRebox(body, exprIx, unionName, unionTy, fnIx)
     if nuRb != 0 { return nuRb }
   }
   if exprUnion(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
@@ -10038,13 +10031,8 @@ function wideRetagPairs(
   if sty >= 0 && armRowsOfUnionTy(sty, sa, fa) {
     if tySame(sty, unionTy) { return 0 }
   } else {
-    // The expression's union type does not resolve its arms: its registered spelling does.
-    const vur: i32[] = []
-    const vun = unionNameRowOfExpr(exprIx, fnIx, vur)
-    if vun == "" || vun == unionName { return 0 }
-    const fan: string[] = []
-    unionArmsOfSet(vun, msSetOfRowOr(vur[0], vun), fan)
-    for a in fan { fa.push(variantIndexOf(a)) }
+    // A union whose arms do not resolve by type is a row-less value union: no record arm to retag.
+    return 0
   }
   const ta: i32[] = []
   unionArmRowsOfTy(unionName, unionTy, ta)
@@ -11921,9 +11909,11 @@ function emitUnionUnionEq(
       && unionBoxEqColumns(lUTy, sArms, sVis, sAks)
     ) {
       const rKs: i32[] = []
-      const rAtomsS: string[] = []
-      unionArmsOf(rname, rAtomsS)
-      for ra in rAtomsS { rKs.push(valueAtomKind(ra)) }
+      if !msMemberValKindsOf(msSetOfTyAny(unionEqOperandTy(rIx, fnIx)), rKs) {
+        return emitFail(
+          "emitProgram: a union `==` operand's type has no banked member kinds",
+        )
+      }
       if emitExpr(body, lIx, fnIx) < 0 { return -1 }
       if emitExpr(body, rIx, fnIx) < 0 { return -1 }
       return emitUnionBoxEqStagedX(
@@ -38353,27 +38343,23 @@ function njConvertArm(ms: i32[], i: i32, bs: i32, to: i32) {
   0
 }
 
-// The value-atom kinds of the members of union `unionName` whose row is `u`, or -1: the row's
-// banked kinds, else the spelling's.
+// The value-atom kinds of the members of union `unionName` whose row is `u`: the row's banked
+// kinds. A row with none is a compile failure.
 function njKindsOfUnion(u: i32, unionName: string): i32[] {
   const ks: i32[] = []
   if msMemberValKindsOf(msSetOfRowOr(u, unionName), ks) { return ks }
-  njKindsOfUnionName(unionName)
+  emitFail("emitProgram: a numeric union's row has no banked member kinds")
+  ks
 }
 
-// The value-atom kinds of the members of union name `unionName`, spaces trimmed.
-function njKindsOfUnionName(unionName: string): i32[] {
-  const atoms: string[] = []
-  unionArmsOf(unionName, atoms)
-  const out: i32[] = []
-  for a in atoms {
-    let lo = 0
-    let hi = a.length
-    while lo < hi && a[lo] == ' ' { lo = lo + 1 }
-    while hi > lo && a[hi - 1] == ' ' { hi = hi - 1 }
-    out.push(valueAtomKind(a.slice(lo, hi)))
+// Whether union type `ty`'s member set banks value kind `k`; false where it has no banked kinds.
+function unionTyHasValKindOf(ty: i32, k: i32): boolean {
+  const ks: i32[] = []
+  if !msMemberValKindsOf(msSetOfTyAny(ty), ks) { return false }
+  for x in ks {
+    if x == k { return true }
   }
-  out
+  false
 }
 
 // The destination kind a numeric member of kind `k` is stored at in a union of kinds `dk`: its
@@ -38399,13 +38385,15 @@ function emitNumUnionRebox(
   body: u8[],
   ix: i32,
   unionName: string,
+  unionTy: i32,
   fnIx: i32,
 ): i32 {
   if unionName == "" || !nodeIsNumUnion(ix, fnIx) { return 0 }
   // A delivery the checker recorded a re-tag for is re-tagged as it is emitted.
   if mapDeliveryRecorded && deliveryRetagHas(ix) { return 0 }
   const ms = njMembersOf(ix, fnIx)
-  const dk = njKindsOfUnionName(unionName)
+  const dk: i32[] = []
+  if !msMemberValKindsOf(msSetOfTyAny(unionTy), dk) { return 0 }
   let needs = false
   for m in ms {
     const k = njKindOfTy(m)
