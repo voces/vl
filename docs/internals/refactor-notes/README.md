@@ -9,6 +9,25 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-d15975-identity-design](2026-11-13-d15975-identity-design.md): D15975 design: `===`/`!==` reference identity, 2026-11-13
+- [2026-11-13-d15978-flat-sub-word-plan](2026-11-13-d15978-flat-sub-word-plan.md): D15978 plan: a `flat` record's sub-word field has storage semantics, 2026-11-13
+- [2026-11-13-d16033-nullable-variant-eq](2026-11-13-d16033-nullable-variant-eq.md): D16033: a nullable record compares with the bare record once a union holding it is declared, 2026-11-13
+- [2026-11-13-d16034-narrowed-let-union-eq](2026-11-13-d16034-narrowed-let-union-eq.md): D16034: a union `==` reads a narrowed `let` operand's arms from the union it is stored as, 2026-11-13
+- [2026-11-13-g30-value-atom-kind-sites](2026-11-13-g30-value-atom-kind-sites.md): Step 7: the five unreached `valueAtomKind` sites in wasmEmit, read by type, 2026-11-13
+- [2026-11-13-h-anon-union-field-ty](2026-11-13-h-anon-union-field-ty.md): 2026-11-13 — lane H: a record literal's union field mints from its type, 2026-11-13
+- [2026-11-13-h-baseline-merge-layout](2026-11-13-h-baseline-merge-layout.md): 2026-11-13 — lane H: budget baselines merge without conflict when lanes lower neighbouring rows, 2026-11-13
+- [2026-11-13-h-ud-variant-tys](2026-11-13-h-ud-variant-tys.md): 2026-11-13 — lane H: a declared union's variants match the row by type (D16052), 2026-11-13
+- [2026-11-13-step7-d16032-arm-tys-row-by-type](2026-11-13-step7-d16032-arm-tys-row-by-type.md): D16032 (a): `unionArmTysOfTy` reads the row its type keys first, 2026-11-13
+- [2026-11-13-step7-d16032-checklist-quick-wins](2026-11-13-step7-d16032-checklist-quick-wins.md): Step 7 (lane D, D16032): the checklist's quick wins and the element-union readers, 2026-11-13
+- [2026-11-13-step7-d16032-closure-arm-by-type](2026-11-13-step7-d16032-closure-arm-by-type.md): Step 7 (lane D, D16032): the closure-arm coerce reads its arm by the union type, 2026-11-13
+- [2026-11-13-step7-d16032-eq-and-box-count-read-row](2026-11-13-step7-d16032-eq-and-box-count-read-row.md): Step 7 (lane D, D16032): union equality and the `??` box count read the carried row, 2026-11-13
+- [2026-11-13-step7-d16032-ref-array-scanners-read-type-row](2026-11-13-step7-d16032-ref-array-scanners-read-type-row.md): Step 7 (lane D, D16032): the ref-array arm scanners read the union type's row, 2026-11-13
+- [2026-11-13-step7-d16052-print-live-tys](2026-11-13-step7-d16052-print-live-tys.md): D16052 close, step 2a: a print plan's narrowing keeps members by box arm, not spelling, 2026-11-13
+- [2026-11-13-step7-fn-record-ref-list-key-by-type](2026-11-13-step7-fn-record-ref-list-key-by-type.md): Step 7: a record holding a function keys its ref-list row by its type, 2026-11-13
+- [2026-11-13-step7-lane-e-member-tys](2026-11-13-step7-lane-e-member-tys.md): Step 7 D16052: three union walks read member types via `unionTyMemberTys`, 2026-11-13
+- [2026-11-13-step7-rl-stored-name-rung](2026-11-13-step7-rl-stored-name-rung.md): Step 7: a folded ref-list spelling's type is typed, not parsed, 2026-11-13
+- [2026-11-13-step7-walk-typed-dedupe](2026-11-13-step7-walk-typed-dedupe.md): Step 7: the canonical union walk dedupes by type, 2026-11-13
+- [2026-11-13-w311-d6-struct-alias-tree-kind](2026-11-13-w311-d6-struct-alias-tree-kind.md): Step 7 D6: a union member's record spelling is read off its spelling tree, 2026-11-13
 - [2026-11-13-h-census-walk-rule](2026-11-13-h-census-walk-rule.md): 2026-11-13 — lane H: the canon member walk counts once, its callers only where they read names, 2026-11-13
 - [2026-11-13-h-ud-functype-arm](2026-11-13-h-ud-functype-arm.md): 2026-11-13 — lane H: a declared union's function member is grouped by its type, 2026-11-13
 - [2026-11-13-step7-d16032-coalesce-and-print-plan-read-row](2026-11-13-step7-d16032-coalesce-and-print-plan-read-row.md): Step 7 (lane D, D16032): the coalesce reservations and the print plan read the result's row, 2026-11-13
