@@ -9,6 +9,18 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-step7-arms-all-same-by-declaration](2026-11-13-step7-arms-all-same-by-declaration.md): Step 7 L6 (lane G): `unionArmsAllSame` compares declarations, not renders, 2026-11-13
+- [2026-11-13-step7-canonical-key-tests](2026-11-13-step7-canonical-key-tests.md): The canonical-key test over the render-keyed tables, 2026-11-13
+- [2026-11-13-step7-d16062-pr1-value-box](2026-11-13-step7-d16062-pr1-value-box.md): Step 7, lane H: D16062 PR 1, one value-union verdict read off the rep tree's boxing decision, 2026-11-13
+- [2026-11-13-step7-d16062-pr2](2026-11-13-step7-d16062-pr2.md): Step 7, lane H: D16062 PR 2, class A joins the rule and the literal-arm channel goes, 2026-11-13
+- [2026-11-13-step7-l2-mono-p5-is-var-typed](2026-11-13-step7-l2-mono-p5-is-var-typed.md): Step 7 L2, mono, P5: an instance's `is T` banks its tested type, never its spelling, 2026-11-13
+- [2026-11-13-step7-lane-e-slot-decl-shared](2026-11-13-step7-lane-e-slot-decl-shared.md): Step 7: the union key licence and `unionArmsAllSame` share one declaration test, 2026-11-13
+- [2026-11-13-step7-lane-e-variant-rows-by-type](2026-11-13-step7-lane-e-variant-rows-by-type.md): Step 7: variant rows choose their fields by the arm's type; the spelling is a position label, 2026-11-13
+- [2026-11-13-step7-origins-regen](2026-11-13-step7-origins-regen.md): Step 7, lane H: render-parse origins regenerated after #7770 and D16062 PR 1, 2026-11-13
+- [2026-11-13-step7-p5-let-annot-held-type](2026-11-13-step7-p5-let-annot-held-type.md): Step 7 P5: `letDeclResolveAnnot` reads the held annotation type, 2026-11-13
+- [2026-11-13-step7-s1-arm-mint-typed](2026-11-13-step7-s1-arm-mint-typed.md): S1: an arm mint interns its row at the arm's type, 2026-11-13
+- [2026-11-13-step7-vu-type-reads](2026-11-13-step7-vu-type-reads.md): Step 7, lane H: five value-union questions ask the type they already hold, 2026-11-13
+- [2026-11-13-w311-d6-unreached-parse-sites](2026-11-13-w311-d6-unreached-parse-sites.md): Step 7 D6: the census's unreached parse sites, deleted behind loud floors, 2026-11-13
 - [2026-11-13-step7-union-reg-recursive-mint-once](2026-11-13-step7-union-reg-recursive-mint-once.md): Step 7 L6 (lane G): a recursive union mints one row (D16000), 2026-11-13
 - [2026-11-13-step7-union-reg-member-kind-quirks](2026-11-13-step7-union-reg-member-kind-quirks.md): Step 7 L6 (lane G, #13 P2): two member-kind quirks filed before the typed column, 2026-11-13
 - [2026-11-13-step7-union-reg-lit-arm-by-type](2026-11-13-step7-union-reg-lit-arm-by-type.md): Step 7 L6 (lane G, #13 step 2): the literal-union-arm question reads the union's type, 2026-11-13
