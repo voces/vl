@@ -28,4 +28,6 @@ caller and is deleted.
 - `scripts/gate.sh`: all rows pass.
 - Render-parse census: the site's entry leaves (emit_map_twins' `ty-string-parse` goes from 1 to
   0). The census drops `boolLeafListDepthOfName` from `EXTRA_PARSERS`, and the site's
-  `RENDER_FED` line (#7837) goes with it.
+  `RENDER_FED` line (#7837) goes with it. `RENDER_FED` moves to
+  `scripts/render-parse-fed.txt`, read under `--root` as `render-parse-floors.txt` is, so its
+  fixture test supplies its own key rather than relying on this site.
