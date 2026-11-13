@@ -380,11 +380,11 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
 
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  // Type-valid, but codegen cannot lower an INFERRED nullable i32-KEYED MAP return — raised
-  // on the distinct channel whose `unsupported-lowering` code rides the
-  // `diagCodeLen`/`diagCodeByte` ABI into `VLDiagnostic.code`. (The annotated
-  // `: {[i32]: i32} | null` spelling of the same function lowers and runs, which is what
-  // makes this a capability admission and not a type error.)
+  // Type-valid, but codegen cannot lower an INFERRED nullable SET return — raised on the
+  // distinct channel whose `unsupported-lowering` code rides the `diagCodeLen`/`diagCodeByte`
+  // ABI into `VLDiagnostic.code`. (The annotated `: Set<i32> | null` spelling of the same
+  // function lowers and runs, which is what makes this a capability admission and not a type
+  // error.)
   //
   // THE WITNESS HAS MOVED TWICE NOW, AND THAT IS THE POINT OF THE TEST. It was
   // `print(pick(true))` over an `i32 | string` until D712 built the box-tag dispatch; it was
@@ -396,6 +396,8 @@ Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its st
   // it has moved a FIFTH. What still floors
   // on this channel is the i32-KEYED map: `nullableRetName`'s map arm requires a `string`
   // key. The annotated twin runs, so it is a capability gap and the witness will move again.
+  // D1108 closed the i32- and i64-keyed map, so it has moved a SIXTH time, to the nullable `Set`
+  // (D16037), which that arm still excludes.
   // `scripts/capability-probes/inferred-nullable-container-return.vl` and
   // `inferred-nullable-list-return.vl` are the standing probes for the closed halves; when
   // the rest closes, this witness moves again.
@@ -403,7 +405,7 @@ Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its st
     [
       "function pick(c: boolean) {",
       "  if c { return null }",
-      "  const m: {[i32]: i32} = Map()",
+      "  const m: Set<i32> = Set()",
       "  m",
       "}",
       "function go() {",
