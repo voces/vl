@@ -42,7 +42,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `bf693a80`, 2026-11-13 12:10)
+## Still failing at this draft (master `09aede4a`, 2026-11-13 12:30)
 
 **Closing census 5's failing column is empty** (coordinator, 2026-11-13). `internArmShapeRow`'s render is a floor: since #7768 it answers its type's row first, and the render only labels a row it mints, which no row choice reads. The rows below are the L2 work and the blockers filed since.
 
@@ -54,8 +54,6 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 
 | lane | sites |
 | --- | --- |
-| H (D16062 PR 2) | D16062: class A and the literal-arm channel |
-| G (the slice producer and its readers, one PR) | D16050, D16051: a union member's box code decided by its spelling; the producer switch cannot land without its readers (57 programs lost alone) |
 
 ## The renders at this draft (master `537a04cc`, coordinator's measurement)
 
@@ -151,6 +149,8 @@ is the checker's job. A checker parse reached from emit whose input the emitter 
 (`synthTypeRefFb` → `recordClonedNodeTyFb`) is in scope, whatever file holds the parser. Lane I
 then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
 §3.3's sentence "parses no type spelling back" waits on that.
+
+**On master `09aede4a`:** 33 render or synthesized parses, 7 source, 19 unclassified; 99 renders and 44 display renders. D16050 and D16051 closed (#7797: member slices bank `boxTagOfTy`). `shapeWalkKeyOf` is deleted (#7794: the walk's key is two bits of walk state). What blocks the close (coordinator, 2026-11-13): the render-origin parses (F the shape family; B, D, E and G the rest), the renders that feed a decision (`arenaEmitName`, E; mono's R1 pin decisions, D), and D16002 (A, unfiled at this draft).
 
 **On master `bf693a80`:** 36 render or synthesized parses, 7 source, 20 unclassified; 99 renders and 44 display renders. Since 11:10:
 - D16062 closed (#7789, PR 2).
