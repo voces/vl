@@ -113,15 +113,18 @@ Lane H's per-site grade (#7748, `scripts/render-parse-origins.ts`) supersedes th
 synthesized parse sites (a lower bound), 19 source-only, 55 ungraded, and 13 renders. Lane I's
 triage, by mechanism (sent to the coordinator to assign):
 
-| package | parser | sites | owner |
+| package | parser | sites | owner (coordinator, 2026-11-13) |
 | --- | --- | --- | --- |
-| P1 value-union-ness of a name | `isValueUnionName` | 16 | G 12 (union_atoms ×5, wasmEmit ×3, fn_scans, nullable_rets, start_block, collect:5429); E 3 (shape_intern:317, `iisPushFieldElem` ×2); H 1 (`mvShapeOfValNameArmTyGo`) |
-| P2 atom kind of a member set's rendered atom | `valueAtomKind` | 13 | G/A: emit_rep ×2, union_casts, eq_rows, obj_lit_fits ×3, collect ×2, query, wasmEmit eq ×3 |
-| P3 shape-spelling grammar | `groupInnerOf`, `nameIsShapeSpanEnds`/`nameIsShapeOpen`, `tyTopLevelSplit`, `peelGroupParens`, … | 20 | E/F (D6): emit_base 9, shape_intern 5, collect 4; G: `msAtomIdOf`; classify: `identFnTypeAnnNameOfRead` |
-| P4 generic-application spelling | `gae*`, `annGenAppSpanEnds`, `nameMentionsGenAliasParam` | 11 | D/E: collect 8, `gaeEnsure`, `nameIsGenAppDecl`, `gaeParamShadowed` |
-| P5 a name resolved back to a type | `resolveAnnot`, `nameToTy` | 5 | F/B: emit_rep ×3; D: `recordClonedIsVarTy`; ruling: `recordClonedNodeTyFb` re-checks `synthTypeRefOfTy`'s text (the TypeRef-text contract?) |
-| P6 mono spellings | `arrElemSuffixed`, `monoUnspacedUnions`, `canonEmitName` | 4 | D |
-| P7 literal-set and nullable membership of a name | `nameIsLitUnionArmValueUnion`, `unionHasAtom`, `nullablePartOf` | 6 | G 5; D 1 (`nonNulBaseOf`, D16040) |
+| P1 value-union-ness of a name | `isValueUnionName` | 16 | H 13 (G's 12 and H's 1); E 3 inside D6 |
+| P2 atom kind of a member set's rendered atom | `valueAtomKind` | 13 | G, one producer change in the member-set slice, with P7's G sites and `msAtomIdOf` |
+| P3 shape-spelling grammar | `groupInnerOf`, `nameIsShapeSpanEnds`/`nameIsShapeOpen`, `tyTopLevelSplit`, `peelGroupParens`, … | 18 (A's #7744 deleted `armMintShapeName`'s two) | E: emit_base 9, collect 4; F: shape_intern 3 (`internShapeFieldElemsTy`, `internInlineShapeTyGo`, `internShapeAs`); G: `msAtomIdOf`; B: `identFnTypeAnnNameOfRead` |
+| P4 generic-application spelling | `gae*`, `annGenAppSpanEnds`, `nameMentionsGenAliasParam` | 11 | A |
+| P5 a name resolved back to a type | `resolveAnnot`, `nameToTy` | 5 | B: emit_rep 3 and `recordClonedNodeTyFb` (ruled: converts, since `synthTypeRefTy` carries the type, and the TypeRef-text floor covers producing text, not reading it back); D: `recordClonedIsVarTy` |
+| P6 mono spellings | `arrElemSuffixed`, `monoUnspacedUnions`, `canonEmitName` | 4 | D, after its PR 2 |
+| P7 literal-set and nullable membership of a name | `nameIsLitUnionArmValueUnion`, `unionHasAtom`, `nullablePartOf` | 6 | G 5 (with P2); D 1 (`nonNulBaseOf`, D16040) |
+
+The 34 unreached sites go to lane B after P5, as loud-floor deletions. The 20 bare-name sites are
+lane I's to grade by provenance at the call site.
 
 ## Floors held by a filed row
 
