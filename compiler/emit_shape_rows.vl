@@ -94,7 +94,6 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
-  cUserTypes,
   cUserTypesVer,
   litUnionAliasNameOfTy,
   litUnionInlineNameOfTy,
@@ -146,9 +145,6 @@ import {
   uFieldElemTyIxAt,
 } from "./emit_atom_kinds"
 import {
-  arrLeafNameOf,
-  gaeParamShadowed,
-  gaeSplitArgs,
   nulLitUnionInnerNameOfTy,
   setShapeOfTy,
   tyIsI32List,
@@ -265,9 +261,6 @@ import {
   armFieldTypes,
   armStructRowMint,
   emitPhaseReached,
-  gaeBases,
-  gaeParams,
-  genTyParamNames,
   heldRepOf,
   monoSupersededObjTys,
   msGen,
@@ -328,7 +321,7 @@ import {
   variantSig,
   variantTagKey,
 } from "./emit_variant_sig"
-import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import { i32ListHas, strListIndexOf } from "./listutil"
 import { recordRowClassOf } from "./record_rows"
 import {
   memoKeyClear,
@@ -338,12 +331,7 @@ import {
   tyRegNoteWrite,
   tyRegWrites,
 } from "./memo"
-import {
-  annGenAppSpanEnds,
-  gaeArgsTextOf,
-  gaeHeadNameOf,
-  gaeLtAt,
-} from "./tyname"
+import { annGenAppSpanEnds, gaeHeadNameOf, gaeLtAt } from "./tyname"
 import {
   flattenVariantsInto,
   intLitUnionBasesOf,
@@ -1667,40 +1655,6 @@ export function nameIsGenAppDecl(name: string) {
   false
 }
 
-// `nameIsGenAppDecl` for an application `gaeEnsure` will intern: one whose arguments, at
-// any nesting, name no type parameter. `B<T>` in a generic original denotes no struct.
-export function nameIsConcreteGenAppDecl(name: string): boolean {
-  if !nameIsGenAppDecl(name) { return false }
-  !genAppRidesTyParam(name, 8)
-}
-
-export function genAppRidesTyParam(name: string, depth: i32): boolean {
-  if depth <= 0 { return true }
-  const lt = gaeLtAt(name)
-  if lt <= 0 { return false }
-  const args: string[] = []
-  gaeSplitArgs(gaeArgsTextOf(name, lt), args)
-  let i = 0
-  while i < args.length {
-    if gaeArgIsTyParam(args[i]) { return true }
-    const leaf = arrLeafNameOf(nonNulBaseOf(args[i]))
-    // A generic alias's own parameter, which `gaeArgIsTyParam` (FuncDecl names only) misses.
-    if (
-      genTyParamLeaf(leaf)
-      && !gaeParamShadowed(leaf)
-      && !nameIsStructDecl(leaf)
-      && !isUNameDeclAB(76, leaf)
-    ) {
-      return true
-    }
-    if annGenAppSpanEnds(leaf) {
-      if genAppRidesTyParam(leaf, depth - 1) { return true }
-    }
-    i = i + 1
-  }
-  false
-}
-
 // True if `name` is a STANDALONE struct `type` declaration's name — independent of
 // the (incrementally-built) struct table, so a struct field may reference a LATER
 // struct declaration. Union aliases and union variants are excluded (their fields
@@ -1827,35 +1781,6 @@ export function fieldTypeRefusalMsg(name: string, ty: i32): string {
       + "` has no struct-field rep"
   }
   "emitProgram: struct field type has no struct-field rep"
-}
-
-// True when `base` is a FuncDecl type-parameter name anywhere in the program. A parameter
-// that also names a real type is the caller's to rule out, as `gaeArgIsTyParam` does.
-export function fnTyParamName(base: string) {
-  strListHas(genTyParamNames, base)
-}
-
-// True when `base` is a declared type parameter of either kind: a FuncDecl's names
-// (`genTyParamNames`) or a generic alias's (`gaeParams`, split back out by
-// `gaeCollectDecls`). `genAppRidesTyParam` is its one caller.
-function genTyParamLeaf(base: string) {
-  if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
-  if fnTyParamName(base) { return true }
-  // The generic-alias half: `gaeParams` stores the raw parameter text per declaration
-  // ("T", "A,B"), split by `gaeSplitArgs` — the same cut `gaeEnsure` makes, not a second
-  // grammar. An empty registry (no generic alias) never runs this loop.
-  let gi = 0
-  while gi < gaeBases.length {
-    const pnames: string[] = []
-    gaeSplitArgs(gaeParams[gi], pnames)
-    let pj = 0
-    while pj < pnames.length {
-      if pnames[pj] == base { return true }
-      pj = pj + 1
-    }
-    gi = gi + 1
-  }
-  false
 }
 
 // The checker-recorded value-union element of the array literal at `arrIx`, without asking
@@ -2906,31 +2831,6 @@ export function anonCodeIsSelfContained(c: i32) {
     return true
   }
   c == FC_CLOSURE
-}
-
-// True when a generic-application argument is a FuncDecl type parameter rather than a real
-// type — the application belongs to a generic original and denotes no concrete struct. A
-// parameter that also names a real type binds nothing, so the application is concrete and
-// must intern.
-export function gaeArgIsTyParam(arg: string) {
-  if genTyParamNames.length == 0 { return false }
-  // The leaf, peeled through every `[]`: `T[][]` is as much a
-  // type-parameter array as `T[]` is. Asked of the raw argument this missed `Box<T[]>`,
-  // whose substituted field text matches an array-bodied alias at `X := T` exactly —
-  // skipping one and not the other let the unskipped half report invalid wasm at run.
-  const base = arrLeafNameOf(arg)
-  if !fnTyParamName(base) { return false }
-  // Two shadow sets, and the union of them is the answer — neither alone is:
-  // `gaeParamShadowed` catches a parameter named for a primitive (without it, `Box<f64>`
-  // beside `function idF64<f64>` got skipped and failed loudly on a program master runs);
-  // the declared-type tests below catch a parameter shadowing a declared type instead.
-  if gaeParamShadowed(base) { return false }
-  const baseTy = cUserTypes[base] ?? -1
-  if tyIsLitUnion(baseTy) { return false }
-  // A parameter named for a declared struct, union or union arm spells a ref list of it.
-  !(nameIsStructDecl(base)
-    || isUNameDeclAB(78, base)
-    || variantIndexOf(base) >= 0)
 }
 
 // `shapeFieldElemName` for a list or map field read off its type `fty`: the element row's
