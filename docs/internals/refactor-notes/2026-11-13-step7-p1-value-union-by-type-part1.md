@@ -47,9 +47,9 @@ bytes-only movers, 0 output movers.
 
 | | before | after |
 | --- | --- | --- |
-| `ty-string-parse` | 69 | 60 |
-| `ty-source-parse` | 25 | 14 |
-| `ty-parse-unclassified` | 55 | 58 |
+| `ty-string-parse` | 69 | 58 |
+| `ty-source-parse` | 25 | 12 |
+| `ty-parse-unclassified` | 55 | 51 |
 
 What moved:
 - **Gone:** the two `isValueUnionName` sites in `ifExprNliName` and `valueUnionNameOfSoftTy`.
