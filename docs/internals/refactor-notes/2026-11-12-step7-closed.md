@@ -77,7 +77,17 @@ The census's other five renders are all in one function, `nodeArrayElemName`
 and emit_shape_rows' `arrLitBoxElemName` (2 callers) and `arrLitElemRender` (8 callers) consume
 that name. Graded a floor under the spelling-index contract by lane A's canonical-key probe (#7760, pending): no duplicate row carries its key. It moves to the floors when #7760 lands. The probe's one-type-two-rows cases are filed as D16000 (`unNames`, lane G) and D16001 (ref-list, lane A), and both block the close.
 
-Of the 13 renders, six are floors and seven block the close. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
+Of the 13 renders, six are floors and seven block the close.
+
+Lane H's #7764 widens the render set: the census reads 98 renders, plus 44 display and diagnostic
+ones. The criterion "renders down to the floor" is graded against that set once #7764 merges
+(coordinator, 2026-11-13). Each render is graded by what its output feeds:
+
+- (a) a decision or a re-parse: fails, with an owner;
+- (b) a dictionary key: a floor only if its table passes lane A's canonical-key test (every mint and
+  lookup renders alike), else it fails;
+- (c) a label, output text or a diagnostic: a floor;
+- (d) unreached: deleted. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
 
 ## The census's coverage (lane H, #7748, open)
 
