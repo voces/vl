@@ -13,6 +13,8 @@
 //                own text, of std, or of a parser spelling;
 //   bare         a bare identifier (`i32`, `T`), which no text test can place;
 //   render       anything else: no source holds it, so a render or a substitution made it.
+// A string that lies strictly inside one a site of the same function received as a render is a
+// piece split out of that render, and is graded render whatever text it matches.
 // A site that ever receives a render or a synthesized string is `render`; one that receives only
 // source strings is `source`; the rest (bare names only, or unreached) stay unclassified.
 // The origins file grades the census's own (emitter) sites. The report, by default
@@ -572,6 +574,8 @@ const programText = (file: string): string => {
   return out;
 };
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+// A site's file and function, the scope a split piece's parent grade is propagated within.
+const fnOf = (s: Site) => `${s.file}\t${s.key.split("\t")[1]}`;
 
 const main = async () => {
   const sites = await sitesOf();
@@ -639,9 +643,9 @@ const main = async () => {
             const parsed = news.map(nos).join("\x00");
             const src = programText(rec.file);
             const seen = new Map<number, Set<string>>();
+            const graded: [number, string, string][] = [];
             for (const item of body.split("\x03").slice(1)) {
               const [ks, exact, v] = item.split("\x02");
-              const k = Number(ks);
               let c: string;
               if (v === "") c = "empty";
               else if (/[#$@]/.test(v)) c = "synthesized";
@@ -652,6 +656,24 @@ const main = async () => {
               ) {
                 c = "source";
               } else c = "render";
+              graded.push([Number(ks), v, c]);
+            }
+            // A piece split out of a render is a render: a string graded source by a text match is
+            // regraded when it lies strictly inside one a site of the same function received as a
+            // render or synthesized in this program (`tyTopLevelSplit`'s parts at `fieldNameOf`).
+            const rendersByFn = new Map<string, string[]>();
+            for (const [k, v, c] of graded) {
+              if (c !== "render" && c !== "synthesized") continue;
+              const f = fnOf(sites[k]);
+              rendersByFn.set(f, [...(rendersByFn.get(f) ?? []), nos(v)]);
+            }
+            for (const g of graded) {
+              if (g[2] !== "source") continue;
+              const n = nos(g[1]);
+              const rs = rendersByFn.get(fnOf(sites[g[0]])) ?? [];
+              if (rs.some((x) => x !== n && x.includes(n))) g[2] = "render";
+            }
+            for (const [k, v, c] of graded) {
               if (!seen.has(k)) seen.set(k, new Set());
               seen.get(k)!.add(c);
               if (!witness[k].has(c)) witness[k].set(c, rec.file);
