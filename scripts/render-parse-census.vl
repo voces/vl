@@ -2,11 +2,11 @@
 //
 //     vl run scripts/render-parse-census.vl -- --list [<code>] [--root <dir>]
 //     vl run scripts/render-parse-census.vl -- --out <findings.json> [--root <dir>]
-//     vl run scripts/render-parse-census.vl -- --parsers [--root <dir>]
+//     vl run scripts/render-parse-census.vl -- --parsers [--root <dir>]   (every counted name)
 //     vl run scripts/render-parse-census.vl -- --sites [--all-files] [--root <dir>]
 //
-// Counts `tyToEmitName(` calls and type-string parser calls in compiler/emit_*.vl,
-// compiler/wasmEmit.vl and compiler/check_emit_queries.vl (the emitter's checker queries), minus
+// Counts render calls (`RENDERERS`; a message's `DISPLAY_RENDERERS` apart) and type-string parser
+// calls in compiler/emit_*.vl, compiler/wasmEmit.vl and compiler/check_emit_queries.vl, minus
 // the bodies of the renderers and parsers themselves (a parser's `<parser>Go` ladder included).
 // The parsers are every export of compiler/tyname.vl, the type-name grammar, except the display
 // rewrite `demangleSpelling` and the character test `nameIdentChar`, plus `EXTRA_PARSERS` below;
@@ -30,11 +30,21 @@ import { join, split } from "std:str"
 import { sort } from "std:array"
 
 const RENDER = "ty-render"
+const RENDER_DISPLAY = "ty-render-display"
 const PARSE = "ty-string-parse"
 const SOURCE = "ty-source-parse"
 const UNCLASSIFIED = "ty-parse-unclassified"
 const ORIGINS = "scripts/render-parse-origins.txt"
-const RENDERER = "tyToEmitName"
+// The renderers whose spelling a later decision reads (a name, a row key, a pin), and the ones that
+// render for a message, counted apart. A listed renderer declared nowhere fails the census.
+const RENDERERS = [
+  "tyToEmitName", "tyToNominalName", "tyToNominalNameAt", "canonEmitNameOfTy",
+  "canonUnionKeyTextOfTy", "canonUnionKeyAtomOfTy", "unionSpellingOfTy",
+  "cloSigNameOfTy", "rlRowNameOfTy", "monoPinSpellNoAnon", "monoPinSpellShaped",
+]
+const DISPLAY_RENDERERS = [
+  "tyToStr", "tyToStructStr", "tyToStrUser", "tyToStructStrUser",
+]
 // The type-string parsers outside compiler/tyname.vl: each reads a type spelling back into a
 // type, a member set, an atom kind or a shape fact. A checker-side one counts where the emitter
 // calls it.
@@ -43,7 +53,6 @@ const EXTRA_PARSERS = [
   "annArrowAt", "nameIsLitUnionType", "isTopLevelFuncTypeName",
   "isValueUnionName", "unionHasAtom", "nameIsLitUnionArmValueUnion",
   "boolLeafListDepthOfName", "valueAtomKind", "nameIsInlineLitUnion",
-  "nameIsI32HashedLitUnion",
 ]
 // The tyname.vl exports that read no spelling back: a rewrite for a message, and a test of one
 // character code.
@@ -191,9 +200,23 @@ function blankLine(b: u8[], s: i32, e: i32): boolean {
   true
 }
 
+function isRendererName(name: string): boolean {
+  for r in RENDERERS {
+    if r == name { return true }
+  }
+  for r in DISPLAY_RENDERERS {
+    if r == name { return true }
+  }
+  false
+}
+
 function isExempt(fn: string): boolean {
-  if fn.length >= RENDERER.length && fn.slice(0, RENDERER.length) == RENDERER {
-    return true
+  // A renderer's body, its `<renderer>At`/`<renderer>Go` variants included, is the renderer.
+  for r in RENDERERS {
+    if fn.length >= r.length && fn.slice(0, r.length) == r { return true }
+  }
+  for r in DISPLAY_RENDERERS {
+    if fn.length >= r.length && fn.slice(0, r.length) == r { return true }
   }
   // A parser's `<parser>Go` helper is the ladder behind its memo, so it is the parser's body.
   for p in PARSERS {
@@ -203,7 +226,12 @@ function isExempt(fn: string): boolean {
 }
 
 function codeOf(callee: string): string {
-  if callee == RENDERER { return RENDER }
+  for r in RENDERERS {
+    if r == callee { return RENDER }
+  }
+  for r in DISPLAY_RENDERERS {
+    if r == callee { return RENDER_DISPLAY }
+  }
   UNCLASSIFIED
 }
 
@@ -219,7 +247,7 @@ function siteKeys(found: Hit[]): string[] {
   const seen: string[] = []
   const counts: i32[] = []
   for h in found {
-    if h.callee == RENDERER {
+    if isRendererName(h.callee) {
       keys.push("")
       continue
     }
@@ -284,7 +312,7 @@ function applyOrigins(root: string, found: Hit[]): Hit[] {
 // The counted callee spelled by the identifier run `t[s..e]`, or "".
 function counted(t: u8[], s: i32, e: i32): string {
   const name = decodeUtf8Lossy(t.slice(s, e))
-  if name == RENDERER { return name }
+  if isRendererName(name) { return name }
   for p in PARSERS {
     if p == name { return name }
   }
@@ -433,6 +461,20 @@ function loadParsers(root: string): string[] {
     }
     ps.push(x)
   }
+  for group in [RENDERERS, DISPLAY_RENDERERS] {
+    for x in group {
+      let found = false
+      for d in declared {
+        if d == x { found = true }
+      }
+      if !found {
+        die(
+          "render-parse-census: renderer `\{x}` is declared nowhere in compiler/; drop it from its list",
+          2,
+        )
+      }
+    }
+  }
   ps
 }
 
@@ -481,6 +523,8 @@ function main(args: string[]) {
   PARSERS = loadParsers(root)
   if parsersOnly {
     for p in PARSERS { print(p) }
+    for r in RENDERERS { print(r) }
+    for r in DISPLAY_RENDERERS { print(r) }
     return 0
   }
   if sitesOnly {

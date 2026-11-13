@@ -31,6 +31,5 @@ Master vs PR over every program reaching `monoSubstIsExpr`'s `is` rewrite, plus
 
 ## Census
 
-Type-string parses go from 47 to 45. Three entries leave, all lane D's: this site,
-`monoUnspacedUnions(render)` (#7761), and `pinned.push(arrElemSuffixed(bind))` (#7769). The last
-two merged before the baseline was lowered.
+The census entry leaves: `recordClonedIsVarTyIx(nodeIx, nameToTy(name))`. Master's baseline,
+re-derived by #7764, already matches the merged tree, so the baseline is unchanged here.

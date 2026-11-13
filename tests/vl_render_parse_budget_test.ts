@@ -59,6 +59,11 @@ function shapeOf(name: string) {
   demangleSpelling(inner)
 }
 
+function rowOf(t: i32) {
+  const nm = tyToNominalName(t)
+  emitFail(tyToStr(t))
+}
+
 export function tyToEmitNameAt(ix: i32, rc: i32) { nullablePartOf(tyToEmitName(ix)) }
 
 function emitCast(fromTy: i32, toTy: i32) {
@@ -109,6 +114,9 @@ Deno.test({
         }`,
       );
     }
+    if (!parsers.includes("tyToNominalName") || !parsers.includes("tyToStr")) {
+      throw new Error("--parsers does not list the renderers");
+    }
     if (parsers.includes("demangleSpelling")) {
       throw new Error("--parsers lists the display rewrite `demangleSpelling`");
     }
@@ -123,10 +131,12 @@ Deno.test({
         "compiler/emit_x.vl:9  kindOf  nameIsArray",
         "compiler/emit_x.vl:9  kindOf  tyToEmitName",
         "compiler/emit_x.vl:13  shapeOf  groupInnerOf",
-        "compiler/emit_x.vl:20  emitCast  valueAtomKind",
-        "compiler/emit_x.vl:20  emitCast  tyToEmitName",
-        "compiler/emit_x.vl:21  emitCast  nullablePartOf",
-        "compiler/emit_x.vl:21  emitCast  tyToEmitName",
+        "compiler/emit_x.vl:18  rowOf  tyToNominalName",
+        "compiler/emit_x.vl:19  rowOf  tyToStr",
+        "compiler/emit_x.vl:25  emitCast  valueAtomKind",
+        "compiler/emit_x.vl:25  emitCast  tyToEmitName",
+        "compiler/emit_x.vl:26  emitCast  nullablePartOf",
+        "compiler/emit_x.vl:26  emitCast  tyToEmitName",
       ];
       if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(want)) {
         throw new Error(
@@ -137,7 +147,9 @@ Deno.test({
       }
       const only = await census(["--list", "ty-render", "--root", dir]);
       const gotRender = only.out.trim().split(/\r?\n/).filter((l) => l);
-      const wantRender = want.filter((l) => l.endsWith("tyToEmitName"));
+      const wantRender = want.filter((l) =>
+        l.endsWith("tyToEmitName") || l.endsWith("tyToNominalName")
+      );
       if (JSON.stringify(gotRender) !== JSON.stringify(wantRender)) {
         throw new Error(
           `--list ty-render: want ${JSON.stringify(wantRender)}, got ${
@@ -167,8 +179,8 @@ Deno.test({
         "ty-source-parse": ["compiler/emit_x.vl:13  shapeOf  groupInnerOf"],
         "ty-parse-unclassified": [
           "compiler/check_emit_queries.vl:1  recordClonedTy  nameToTy",
-          "compiler/emit_x.vl:20  emitCast  valueAtomKind",
-          "compiler/emit_x.vl:21  emitCast  nullablePartOf",
+          "compiler/emit_x.vl:25  emitCast  valueAtomKind",
+          "compiler/emit_x.vl:26  emitCast  nullablePartOf",
         ],
       };
       if (JSON.stringify(graded) !== JSON.stringify(wantGraded)) {
