@@ -58,11 +58,9 @@ argument, or a bare name's nearest initializer above the call, found by text.
 | emit_union_atoms.vl:2413 | ifExprNliName | valueAtomKind | (c) source | `atoms[j]` | 1 | tests/cases/types/if-expression-no-else-scope-rep-grid.vl | `i32[]` |
 | emit_union_casts.vl:91 | memReadCheckerAtomKind | valueAtomKind | unclassified: bare names | `t.primName` | 29 | build/sweep/witnesses/inventory/D13902.vl | `i32` |
 | emit_union_casts.vl:118 | unionHasAtomKindArm | valueAtomKind | (a) render | `a (a parameter)` | 17 | build/sweep/witnesses/inventory/D14084.vl | `boolean[]` |
-| emit_union_registry.vl:1071 | unionSetHasNullTy | unionHasAtom | (a) render | `set (a parameter)` | 1 | tests/cases/unions/nullable-ref-into-union-keeps-null.vl | `boolean\|i32\|null` |
 | wasmEmit.vl:4476 | emitLitMemberEq | nameIsQuotedLeaf | (c) source | `lex (a parameter)` | 52 | build/sweep/witnesses/inventory/D15251.vl | `"x"` |
 | wasmEmit.vl:4718 | emitFieldLitEq | nameIsQuotedLeaf | (c) source | `lex (a parameter)` | 28 | build/sweep/witnesses/inventory/D14570.vl | `"a"` |
 | wasmEmit.vl:8240 | isValueUnionOfSet | isValueUnionName | (a) render | `unionMemberSetOf(nm)` | 13 | build/sweep/witnesses/inventory/D14800.vl | `string\|null` |
-| wasmEmit.vl:9094 | emitUnionCoerceValueAtom | unionHasAtom | (a) render | `unionName (a parameter)` | 8 | scripts/silent-sweep/distilled/named/d3127_r2_g1_F1_ab_i32_0_93_i32_print_hole.vl | `AB\|i32\|null` |
 | wasmEmit.vl:9115 | emitUnionCoerceValueAtom | valueAtomKind | unclassified: bare names | `"string"` | 58 | build/sweep/witnesses/inventory/D3347.vl | `string` |
 | wasmEmit.vl:9797 | valueKindIsPlainScalar | valueAtomKind | unclassified: bare names | `p (a parameter)` | 53 | build/sweep/witnesses/inventory/D14084.vl | `i32` |
 | wasmEmit.vl:11220 | unionBoxEqColumns | valueAtomKind | (a) render | `arms[i]` | 1 | tests/cases/closures/function-values-in-two-union-arms-equality.vl | `((string)=>i32)` |
