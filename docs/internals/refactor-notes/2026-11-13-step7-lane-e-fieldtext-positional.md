@@ -8,12 +8,12 @@ Lane E. Four readers compared two rows of the variant field identity column (`ar
 - the pair-kind test in emit_shape_rows, which parts arms that genuinely differ;
 - `sharedFieldTysIdentical` (wasmEmit), the shared-field dispatch.
 
-## The column is not plain type identity
+## The column is storage identity, not type identity
 
 The column softens a number literal inside a union or nullable to its base, as canon does:
 `{x: 1 | 2}` and `{x: i32}` spell `i32` alike, and so do `1 | null` and `i32 | null`. A lone
-literal is quoted (`"1"`), a string set keeps its members, and a named literal-union alias keeps
-its name.
+literal is quoted (`"1"`) and a string set keeps its members. `assignTags` groups by layout, and
+a number literal set stores as its base number, so this is the design (coordinator's ruling).
 
 The probe used a scratch compiler, never refreshed into a seed. At each site it compared the old
 text answer with two typed candidates, drained once after `emitProgramRun`, over the sweep's
@@ -29,15 +29,30 @@ text answer with two typed candidates, drained once after `emitProgramRun`, over
 | Candidate | Programs disagreeing with the text |
 |---|---|
 | strict: `tySame` and `armDeclSame` | 9, all number literal sets beside their base |
+| the storage row: `armFieldStoreTy` compared by type | 11: the same 9, and 2 record fields |
 | keyed: the strict test, with number literals in a union or nullable softened member by member | 0 |
+| keyed, but a named literal-union alias compared strictly | 0 |
 
-The strict test would change `assignTags`' grouping in those 9 programs. That is a semantic
-change, not this refactor's, so the keyed test lands.
+The storage row keeps the declared set (`fieldStoreTyOf`), so it cannot stand in for the column.
+The keyed test lands, without an alias case, since no program reaches one.
+
+## The alias edge
+
+`type K1 = 1 | 2` in a field is the same type as the inline `1 | 2`, so `{x: K1}` and `{x: 1 | 2}`
+are one union arm and never reach a positional compare. Against `{x: i32}` both spellings group
+alike. A string-set alias against its inline set is the same. All of these run identically on
+both seeds.
+
+Checking the nullable spelling found D16031: a `1 | null` field read through an un-narrowed
+`R | S` is refused at emit when the literal arm comes first, and runs as `S | R`. The alias and
+the inline set fail alike, so it is not an alias defect; it is the number-literal sibling of
+D15882.
 
 ## Changed
 
 - `variantRowFieldTysSame(ra, rb)` (emit_variant_sig) reads each row's field in its variant's
-  record type (`uVarTyIx`) and applies the keyed test. A row with no arena type is a loud floor
+  record type (`uVarTyIx`) and applies the keyed test. Its contract: fields are identical when
+  they store alike, and a number literal inside a union or nullable stores as its base. A row with no arena type is a loud floor
   (`VARIANT_FIELD_UNTYPED_MSG`); the probe found 0.
 - The four readers call it. Only lane G's `valueAtomKind(sFieldTyText[at])` reader in
   emit_obj_lit_fits still reads the column.
@@ -45,7 +60,9 @@ change, not this refactor's, so the keyed test lands.
 ## Proof
 
 - Refresh ×2: fixpoint.
-- Sweep with fixpoint seeds on both sides, master `e39d632e` against the candidate: see the PR.
+- Sweep with fixpoint seeds on both sides, master `e39d632e` against the candidate with the alias
+  case: 24,218 same, 0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler
+  traps. Dropping the alias case changes no answer the probe reached.
 - `scripts/gate.sh`: all rows pass.
 
 ## Next
