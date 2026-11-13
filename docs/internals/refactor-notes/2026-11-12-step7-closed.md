@@ -52,8 +52,7 @@ contract carries no exception), lane E's field-set spelling key (#7707), and E/F
 | lane | sites |
 | --- | --- |
 | E / F (D6 re-key) | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internArmShapeRow` render (`tyToEmitName(aty)` into `armMintShapeName`); the `nm` input `variantNestedRow` and `armFieldStructRowMinted` hand `internInlineShapeTy` |
-| A | `unionNameOfCall`: #7711 records the row beside the name (`unNameRowLast`), but still returns `tyNameOf(fn.fnRet)` and reads `isValueUnionName` on an inferred return's name; it feeds `unionNameOfExpr`, so it closes with G's last consumers or as its own conversion (asked) |
-| G | `unionNameOfExpr`'s producer-internal calls (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2) and `emitUnionUnionEq` ×2 |
+| G / D | the `unionNameOfExpr` producer: its rungs (`unionNameOfCall`, which #7711 gave its row) and internal calls (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2) close together when its last external consumers, `emitUnionUnionEq` ×2 (offered to lane D), read the type and the producer is deleted |
 
 ## Floors held by a filed row
 
