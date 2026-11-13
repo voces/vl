@@ -10,7 +10,7 @@ and lane E's handover.
    though (`i32[]`), and the pin now spells it. `arrElemSuffixed(bind)` is gone. A loud floor
    fires where neither type closes.
 2. **`monoArgTyNameRep`'s spread rung** (`arrElemSuffixed(spreadLitSrcRowName(...))`) is
-   unreached and becomes a loud floor.
+   unreached. Master floored it loudly in parallel; the merge keeps master's floor.
 3. **`annSplitParams` / `monoSigPinsTop`** are deleted.
    - `monoSlotPinAnn` spells each parameter from the closed type `monoPinFnParamTys` hands back,
      not from the pin list's text.
@@ -42,8 +42,7 @@ of 1,627 identical** (1,603 SAME, 24 SAME refusal).
 
 Entries leaving the baseline, all lane D's:
 - `annSplitParams`' `tyTopLevelSplit`;
-- the spread rung's and the `T[]` fallback's `arrElemSuffixed` (both ungraded);
-- `arrElemSuffixed(aen)` as a type-string parse.
+- the `T[]` fallback's `arrElemSuffixed(bind)`.
 
-The census now grades that last one, the D16022 floor, as ungraded. Renders hold: the slot pin's
-inline-record branch merges into the new by-type spelling, so no render is added.
+The `T[]` pin's render changes text only. Renders hold: the slot pin's inline-record branch
+merges into the new by-type spelling.
