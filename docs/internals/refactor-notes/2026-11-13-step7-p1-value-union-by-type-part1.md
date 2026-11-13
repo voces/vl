@@ -47,15 +47,17 @@ bytes-only movers, 0 output movers.
 
 | | before | after |
 | --- | --- | --- |
-| `ty-string-parse` | 69 | 63 |
-| `ty-source-parse` | 25 | 21 |
-| `ty-parse-unclassified` | 55 | 59 |
+| `ty-string-parse` | 69 | 60 |
+| `ty-source-parse` | 25 | 14 |
+| `ty-parse-unclassified` | 55 | 58 |
 
 What moved:
 - **Gone:** the two `isValueUnionName` sites in `ifExprNliName` and `valueUnionNameOfSoftTy`.
   `armMintShapeName`'s two sites were deleted on master (#7744).
 - **Render to unreached:** `collectARefArrayAnn`'s fallback, which no program reaches.
-- **Source to unreached:** four `nameIsGenAppDecl` sites (`emit_shape_rows`), unreached since #7747.
+- **Source to unreached:** four `nameIsGenAppDecl` sites (`emit_shape_rows`), unreached since #7747,
+  and `gaeSplitArgs` (`emit_base`), unreached since master's generic-application-by-type change.
+- **Other lanes' merged changes** account for the rest of the movement on master.
 
 The unclassified count rises only by sites that became unreachable. They are deletion candidates,
 and the baseline is rewritten here with that reason.
