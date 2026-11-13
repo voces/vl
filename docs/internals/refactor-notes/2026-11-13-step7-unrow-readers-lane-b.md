@@ -32,5 +32,5 @@ moves the outcome: the sweep below is identical.
 
 | instrument | result |
 | --- | --- |
-| full sweep, 24,207 programs, base bac3d89b5 against this change on it, both fixpoint seeds | 24,207 same; 0 bytes-only movers; 0 runs → not-runs; 0 new traps |
+| full sweep, 24,208 programs, base 17755ac1a against this change on it, both fixpoint seeds | 24,208 same; 0 bytes-only movers; 0 runs → not-runs; 0 new traps |
 | fast set on the same tree | all green |
