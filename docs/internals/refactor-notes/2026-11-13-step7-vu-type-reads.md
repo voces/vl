@@ -26,5 +26,5 @@ name while the type it names is in hand:
   goes with lane G's set readers.
 - **Three check-time sites** (`litUnionArrayValueUnionRetName`,
   `cloArmValueUnionRetName`, `elemRefArmValueUnionListRetName`): none runs
-  during emit (the sites table lists none of them as reached), so they are
-  backlog. They would need the rule at the check layer.
+  during emit, so they are filed as D16063, carried past step 7 as the checker's
+  render→parse.
