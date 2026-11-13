@@ -1384,7 +1384,6 @@ import {
   rlWidenAllowed,
   rlWidenTagOf,
 } from "./emit_ref_list_kinds"
-import { internInlineShapeTy } from "./emit_shape_intern"
 import {
   ALK_F64,
   ALK_I64,
@@ -1434,7 +1433,6 @@ import {
   rlElemTyIxAt,
   rlSlotOfTy,
   sFieldIndex,
-  uFieldElemTyIxRow,
 } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
@@ -11147,7 +11145,7 @@ function emitStructUnionEq(
   const arms: string[] = []
   const vis: i32[] = []
   const aks: i32[] = []
-  if !unionBoxEqColumns(uname, uty, arms, vis, aks) { return -1 }
+  if !unionBoxEqColumns(uty, arms, vis, aks) { return -1 }
   // Both operands ride the wasm stack until both are computed, and only then are they parked.
   // These slots are shared per function, so a left operand parked before the right one is
   // evaluated is a value the right one's code can overwrite — a nested union `==` re-enters this
@@ -11162,12 +11160,12 @@ function sFieldElemTyIxOfRow(ufi: i32): i32 {
   if ufi >= 0 && ufi < sFieldElemTyIx.length { sFieldElemTyIx[ufi] } else { -1 }
 }
 
-// The arm columns of a box `==` over union type `uty` (named `uname`, whose spelling answers
-// where `uty` is -1 or its arms do not resolve), index-parallel to `arms`: a struct arm carries
-// its variant row in `vis` and -1 in `aks`, a scalar arm the reverse. False declines before any
-// byte is written, so an arm set the lowering cannot serve keeps its caller's loud refusal.
+// The arm columns of a box `==` over union type `uty`, index-parallel to `arms`: a struct arm
+// carries its variant row in `vis` and -1 in `aks`, a scalar arm the reverse. False declines
+// before any byte is written, so an arm set the lowering cannot serve keeps its caller's loud refusal.
+const UNION_BOX_EQ_NO_ARMS_MSG = "emitProgram: a union box compared with `==` has no type to read its arms from"
+
 function unionBoxEqColumns(
-  uname: string,
   uty: i32,
   arms: string[],
   vis: i32[],
@@ -11184,11 +11182,8 @@ function unionBoxEqColumns(
       k = k + 1
     }
   } else {
-    unionMemberAtomsOf(uname, arms)
-    for a in arms {
-      rows.push(variantIndexOf(a))
-      tys.push(unionArmTyOfAtom(uname, a))
-    }
+    emitFail(UNION_BOX_EQ_NO_ARMS_MSG)
+    return false
   }
   if arms.length < 2 { return false }
   let i = 0
@@ -11598,12 +11593,12 @@ function variantFieldComparable(vi: i32, ufi: i32): boolean {
 // Can the shared box core serve every arm of a code-16 variant field's union? The field's
 // recorded elem name is the atom-set name the box is built against.
 function variantBoxFieldComparable(ufi: i32): boolean {
-  const bn = sFieldElemName[ufi]
-  if bn == "" { return false }
+  const bty = sFieldElemTyIxOfRow(ufi)
+  if bty < 0 { return false }
   const bArms: string[] = []
   const bVis: i32[] = []
   const bAks: i32[] = []
-  unionBoxEqColumns(bn, sFieldElemTyIxOfRow(ufi), bArms, bVis, bAks)
+  unionBoxEqColumns(bty, bArms, bVis, bAks)
 }
 
 // The admission question keyed by an EXPLICIT code, so the niche rung above can ask it of the
@@ -11809,7 +11804,7 @@ function emitVariantFieldEqCoreAt(
     const vbArms: string[] = []
     const vbVis: i32[] = []
     const vbAks: i32[] = []
-    if !unionBoxEqColumns(vbN, sFieldElemTyIxOfRow(ufi), vbArms, vbVis, vbAks) {
+    if !unionBoxEqColumns(sFieldElemTyIxOfRow(ufi), vbArms, vbVis, vbAks) {
       return -1
     }
     return emitUnionBoxEqStaged(body, vbArms, vbVis, vbAks, false, vbN, fnIx)
@@ -11819,19 +11814,16 @@ function emitVariantFieldEqCoreAt(
   emitFail("emitProgram: unsupported variant field type in equality")
 }
 
-// D974 — the interned struct row of variant `vi`'s field `ufi` (a flat row) NESTED shape, or
-// -1: the row the type section stores it at, else its inline shape interned.
+// D974 — the struct row variant `vi`'s nested-record field `ufi` (a flat row) is stored at,
+// found by the field's type; a type with no row has already had the arm mint's one chance.
 function variantNestedRow(vi: i32, ufi: i32): i32 {
   if vi < 0 || vi >= uFieldStart.length { return -1 }
-  if ufi < 0 || ufi >= sFieldElemName.length { return -1 }
-  const nm = sFieldElemName[ufi]
-  if nm == "" { return -1 }
+  if ufi < 0 || ufi >= sFieldTypes.length { return -1 }
   const stored = uFieldTgtStructIdx(vi, ufi - uFieldStart[vi])
   if stored >= 0 && stored < sHeapIdx.length { return stored }
-  const row = internInlineShapeTy(nm, uFieldElemTyIxRow(ufi))
-  if row < 0 { return -1 }
-  if row >= sHeapIdx.length { return -1 }
-  row
+  emitFail(
+    "emitProgram: a variant's nested record field has no struct row to compare it at",
+  )
 }
 
 // Compare two NESTED shape refs already on the stack, field-wise. Unlike the arms themselves,
@@ -11931,7 +11923,7 @@ function emitUnionUnionEq(
     if (
       lname != ""
       && rname != ""
-      && unionBoxEqColumns(lname, lUTy, sArms, sVis, sAks)
+      && unionBoxEqColumns(lUTy, sArms, sVis, sAks)
     ) {
       const rKs: i32[] = []
       const rAtomsS: string[] = []
@@ -20052,7 +20044,7 @@ function emitListEqGCore(body: u8[], kind: i32, slot: i32, fnIx: i32) {
       const uAks: i32[] = []
       if (
         un == ""
-        || !unionBoxEqColumns(un, rlElemTyIxAt(slot), uArms, uVis, uAks)
+        || !unionBoxEqColumns(rlElemTyIxAt(slot), uArms, uVis, uAks)
       ) {
         return emitFail(
           "emitProgram: list compare over a union element with no arm columns",
@@ -20273,7 +20265,6 @@ function xrepElemEq(
       )
     }
     const unA = rlElemUnionName(sA)
-    const unB = rlElemUnionName(sB)
     const armsA: string[] = []
     const visA: i32[] = []
     const aksA: i32[] = []
@@ -20281,8 +20272,8 @@ function xrepElemEq(
     const visB: i32[] = []
     const aksB: i32[] = []
     if (
-      !unionBoxEqColumns(unA, rlElemTyIxAt(sA), armsA, visA, aksA)
-      || !unionBoxEqColumns(unB, rlElemTyIxAt(sB), armsB, visB, aksB)
+      !unionBoxEqColumns(rlElemTyIxAt(sA), armsA, visA, aksA)
+      || !unionBoxEqColumns(rlElemTyIxAt(sB), armsB, visB, aksB)
     ) {
       return emitFail(
         "emitProgram: list compare over a union element with no arm columns",
@@ -20323,15 +20314,7 @@ function xrepElemEq(
   const arms: string[] = []
   const vis: i32[] = []
   const aks: i32[] = []
-  if (
-    !unionBoxEqColumns(
-      rlElemName[boxSlot],
-      rlElemTyIxAt(boxSlot),
-      arms,
-      vis,
-      aks,
-    )
-  ) {
+  if (!unionBoxEqColumns(rlElemTyIxAt(boxSlot), arms, vis, aks)) {
     return emitFail(
       "emitProgram: list compare over a union element with no arm columns",
     )
@@ -21212,14 +21195,13 @@ function emitStructEqFieldAt(
     // level: tag first, then the arm the tag selects, reading the two boxes off a field
     // path instead of off two operands. Columns are resolved first, so an arm set the
     // core cannot serve declines before any byte is written and reaches the loud refusal below (D1290).
-    const bxN = sFieldElemNameAt(si, fi)
-    if bxN != "" {
+    const bxTy = sFieldElemTyIxAt(si, fi)
+    if bxTy >= 0 {
+      const bxN = sFieldElemNameAt(si, fi)
       const bxArms: string[] = []
       const bxVis: i32[] = []
       const bxAks: i32[] = []
-      if (
-        unionBoxEqColumns(bxN, sFieldElemTyIxAt(si, fi), bxArms, bxVis, bxAks)
-      ) {
+      if (unionBoxEqColumns(bxTy, bxArms, bxVis, bxAks)) {
         if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
         if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
         return emitUnionBoxEqStaged(
@@ -21240,8 +21222,7 @@ function emitStructEqFieldAt(
     // to the stash-based `emitStructEqRec(body, -2, -3, …)`. The only addition here is
     // reading the two lists off a field path instead of off two operands (D1017).
     if si >= 0 {
-      const d17n = sFieldElemNameAt(si, fi)
-      if d17n != "" {
+      if sFieldElemTyIxAt(si, fi) >= 0 {
         const d17s = sFieldRefSlot(si, fi)
         if d17s >= 0 {
           if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
