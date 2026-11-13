@@ -46,5 +46,7 @@ replaces the guard with: `ty` is a registered, finite application and is not alr
 **Sweep** (fixpoint seeds both sides, 24,207 programs): 24,207 same, 0 bytes-only movers,
 0 output movers, 0 runs → not-runs, 0 new compiler traps.
 
-**Ratchet.** render-parse 63 → 60 `ty-string-parse` and 19 → 15 `ty-source-parse`; the seven
-origins rows for the removed sites are dropped. With #7751, P4's render sites are at zero.
+**Ratchet.** render-parse 61 → 58 `ty-string-parse` (this cut's three) and 52 → 46
+`ty-parse-unclassified`: `nameIsGenAppDecl`'s four declaration-name scans, which #7756's origins
+regeneration left ungraded, plus two that #7758 removed. The origins rows for the removed sites
+are dropped. With #7751, P4's render sites are at zero.
