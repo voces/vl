@@ -231,11 +231,11 @@ function internShapeArms(arms: string[], armTys: i32[]) {
     const armTy = armTys[uai]
     const uCore = arrLeafNameOf(arms[uai])
     if uCore.length >= 1 && uCore[0] == '{' {
-      internShapeDeepTy(arms[uai], armTy)
+      internShapeDeepTy(armTy)
     } else if tyIsFuncArena(tyStepArrRun(armTy, arms[uai], uCore)) {
       // A closure arm: the inline shapes buried in its params or result are otherwise
       // unreachable, since the arm is one spelling inside the union name.
-      internFuncTypeShapesTy(arms[uai], armTy)
+      internFuncTypeShapesTy(armTy)
     }
     uai = uai + 1
   }
@@ -275,62 +275,19 @@ function tyStepNulIf(ty: i32, full: string, base: string): i32 {
   nullableInnerOrNone(ty)
 }
 
-// `internShapeDeepTy` for an arena type, walked under its emitter render: the one place a
-// caller holding only `ty` turns it into the name the walk still keys on, which it returns.
-export function internShapeDeepOfTy(ty: i32): string {
-  const nm = tyToEmitName(ty)
-  internShapeDeepTy(nm, ty)
-  nm
-}
-
-// Recursively peels the composition wrappers off a type name — grouping parens, a trailing
-// `| null`, and trailing `[]` suffixes, in any order and to any depth — interning the
-// inline-shape struct reached at the bottom. A non-shape leaf (`i32`, a named type, a map)
-// interns as a no-op.
-export function internShapeDeepTy(nm: string, ty: i32) {
-  const kn = shapeWalkName(nm, ty)
-  shapeWalkStack.push(ty)
-  const r = internShapeDeepTyGo(kn, ty)
-  shapeWalkStack.pop()
-  r
-}
-
-// Types whose shape walk is in progress, innermost last.
-let shapeWalkStack: i32[] = []
-
-// The name a shape walk of `ty` keys on: its declaration's name (`tyToNominalName`) when it
-// has one, else the spelling `nm`. A type already being walked keeps `nm`, so a declaration
-// that reaches itself is entered by name only once.
-function shapeWalkName(nm: string, ty: i32): string {
-  if ty < 0 { return nm }
-  for b in shapeWalkStack {
-    if b == ty { return nm }
-  }
-  const rn = tyToNominalName(ty)
-  if rn == "" { nm } else { rn }
-}
-
-function internFuncTypeShapesTy(nm: string, ty: i32): i32 {
-  const kn = shapeWalkName(nm, ty)
-  shapeWalkStack.push(ty)
-  const r = internFuncTypeShapesTyGo(kn, ty)
-  shapeWalkStack.pop()
-  r
-}
-
 // The stored spelling of a record of tagged-set ids (`{f: Fn#a}` stored as `{f: i32}`),
 // installed by `emitProgram` before any pass, since its home sits above this module in the
 // import graph; a read before that traps.
 function tagRepNameUnset(_ty: i32): string { __trap__() }
 export let tagRepNameFn: (ty: i32) => string = tagRepNameUnset
 
-// The name a walk keys type `ty` on: its nominal name when `nm` is that name (`shapeWalkName`
-// passes another on a cycle), else its render, rendered only then since a deep record's render
-// doubles per level; a record of tagged-set ids, which has no render, by its stored spelling.
-function shapeWalkKeyOf(nm: string, ty: i32): string {
+// The name a walk keys type `ty` on when `kn` is its nominal name, and its render otherwise,
+// rendered only then since a deep record's render doubles per level; a record of tagged-set ids,
+// which has no render, by its stored spelling.
+function shapeWalkKeyOf(kn: string, ty: i32): string {
   const nn = tyToNominalName(ty)
   let ln = nn
-  if nn == "" || nm != nn {
+  if nn == "" || kn != nn {
     ln = tyToEmitName(ty)
     if ln == "" { ln = nn }
   }
@@ -338,13 +295,39 @@ function shapeWalkKeyOf(nm: string, ty: i32): string {
   ln
 }
 
+// Types whose shape walk is in progress, innermost last.
+let shapeWalkStack: i32[] = []
+
+// The key hint a fresh walk of `ty` starts from: its nominal name, or "" when `ty` is already
+// being walked, so a declaration that reaches itself is re-entered under its render.
+function shapeWalkName(ty: i32): string {
+  for b in shapeWalkStack {
+    if b == ty { return "" }
+  }
+  tyToNominalName(ty)
+}
+
 // Walks type `ty`, interning every inline shape, value union and function type it holds, each
-// keyed by `shapeWalkKeyOf`.
-function internShapeDeepTyGo(nm: string, ty: i32) {
-  if ty < 0 || ty >= T.tys.length { return 0 }
+// keyed by `shapeWalkKeyOf`. Returns the row a record leaf reached through `| null`, list and
+// map wrappers interned at, else -1.
+export function internShapeDeepTy(ty: i32) {
+  internShapeDeepTyAs(shapeWalkName(ty), ty)
+}
+
+// `internShapeDeepTy` keyed from `kn`: a frame handing its own type to the other walker passes
+// its own key, so the hand-over keeps the key the type was entered under.
+function internShapeDeepTyAs(kn: string, ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  shapeWalkStack.push(ty)
+  const r = internShapeDeepTyGo(kn, ty)
+  shapeWalkStack.pop()
+  r
+}
+
+function internShapeDeepTyGo(kn: string, ty: i32) {
   const t = tyAt(ty)
-  const ln = shapeWalkKeyOf(nm, ty)
-  if ln == "" { return 0 }
+  const ln = shapeWalkKeyOf(kn, ty)
+  if ln == "" { return -1 }
   if isValueUnionName(ln) {
     registerValueUnionNameAB(7, ln, ty)
     // A closure member may bury inline shapes in its params or result, unreachable through the
@@ -352,13 +335,16 @@ function internShapeDeepTyGo(nm: string, ty: i32) {
     const vTys: i32[] = []
     if unionMemberTysOfAB(10, ty, vTys) {
       for m in vTys {
-        if tyIsFuncArena(m) { internFuncTypeShapesTy("", m) }
+        if tyIsFuncArena(m) { internFuncTypeShapesTy(m) }
       }
     }
-    return 0
+    return -1
   }
-  if tyIsFuncArena(ty) { return internFuncTypeShapesTy(ln, ty) }
-  if t is TyNullable { return internShapeDeepTy("", t.nInner) }
+  if tyIsFuncArena(ty) {
+    internFuncTypeShapesTyAs(ln, ty)
+    return -1
+  }
+  if t is TyNullable { return internShapeDeepTy(t.nInner) }
   if t is TyUnion {
     const uArms: string[] = []
     const uTys: i32[] = []
@@ -367,14 +353,13 @@ function internShapeDeepTyGo(nm: string, ty: i32) {
       && shapeWalkSplitsUnion(ln, ty, uArms.length)
     ) {
       internShapeArms(uArms, uTys)
-      return 0
+      return -1
     }
   }
-  if t is TyArray { return internShapeDeepTy("", tyStepElem(ty)) }
-  if t is TyMap { return internShapeDeepTy("", tyMapValOf(ty)) }
+  if t is TyArray { return internShapeDeepTy(tyStepElem(ty)) }
+  if t is TyMap { return internShapeDeepTy(tyMapValOf(ty)) }
   gaeEnsure(ln, ty)
   internInlineShapeTy(ln, ty)
-  0
 }
 
 // Whether a map field of recorded type `fTy` has a value the mv layer lowers; false for a
@@ -482,13 +467,24 @@ export function armMintShapeName(nm: string) {
 }
 
 // Walks type `ty` below a function type, interning the plainly-lowerable inline shapes of its
-// params and result, keyed as `internShapeDeepTyGo` keys. Only a fully-lowerable struct leaf
+// params and result, keyed as `internShapeDeepTy` keys. Only a fully-lowerable struct leaf
 // interns; an unsupported composite field is left un-interned so the closure stays a clean
 // reject, never invalid wasm.
-function internFuncTypeShapesTyGo(nm: string, ty: i32): i32 {
+function internFuncTypeShapesTy(ty: i32): i32 {
+  internFuncTypeShapesTyAs(shapeWalkName(ty), ty)
+}
+
+function internFuncTypeShapesTyAs(kn: string, ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return 0 }
+  shapeWalkStack.push(ty)
+  const r = internFuncTypeShapesTyGo(kn, ty)
+  shapeWalkStack.pop()
+  r
+}
+
+function internFuncTypeShapesTyGo(kn: string, ty: i32): i32 {
   const t = tyAt(ty)
-  const ln = shapeWalkKeyOf(nm, ty)
+  const ln = shapeWalkKeyOf(kn, ty)
   if ln == "" { return 0 }
   // A value-union leaf registers its box reps, as `internShapeDeepTy`'s value-union arm does:
   // a producer-less closure-arm annotation otherwise leaves the box un-minted while a narrowed
@@ -499,11 +495,11 @@ function internFuncTypeShapesTyGo(nm: string, ty: i32): i32 {
   }
   match t {
     TyFunc => {
-      for p in t.fnParamTypes { internFuncTypeShapesTy("", p) }
-      internFuncTypeShapesTy("", t.fnRet)
+      for p in t.fnParamTypes { internFuncTypeShapesTy(p) }
+      internFuncTypeShapesTy(t.fnRet)
     }
     TyNullable => {
-      internFuncTypeShapesTy("", t.nInner)
+      internFuncTypeShapesTy(t.nInner)
     }
     // A composite union: `internShapeDeepTy` owns the arm grammar, so this delegates.
     TyUnion => {
@@ -513,11 +509,11 @@ function internFuncTypeShapesTyGo(nm: string, ty: i32): i32 {
         unionTyArms(ty, fArms, fTys)
         && shapeWalkSplitsUnion(ln, ty, fArms.length)
       ) {
-        internShapeDeepTy(ln, ty)
+        internShapeDeepTyAs(ln, ty)
       }
     }
     TyArray => {
-      internFuncTypeShapesTy("", tyStepElem(ty))
+      internFuncTypeShapesTy(tyStepElem(ty))
     }
     TyObj => {
       if nameIsShapeSpanEnds(ln) {
@@ -554,7 +550,7 @@ function internNonLowerableFieldShapesTy(nm: string, ty: i32) {
       // shape.
       const fldTy = tyFieldTyOf(ty, fnames[fi])
       if tyIsFuncArena(fldTy) {
-        internShapeDeepTy(ftxt, fldTy)
+        internShapeDeepTy(fldTy)
       } else {
         // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
         // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
@@ -562,7 +558,6 @@ function internNonLowerableFieldShapesTy(nm: string, ty: i32) {
         const base = arrLeafNameOf(nul)
         if nameIsShapeOpen(base) {
           internShapeDeepTy(
-            base,
             tyStepArrRun(tyStepNulIf(fldTy, ftxt, nul), nul, base),
           )
         }
@@ -885,13 +880,14 @@ function shapeIsAVariant(ty: i32): boolean {
 // a wider row that boxes a field it stores bare.
 let iisOwnRow = false
 
-// `internShapeDeepOfTy` for a record literal whose wider row is one its reader cannot use
-// (D8682): the shape is interned at its own field storage.
+// `internShapeDeepTy` for a record literal whose wider row is one its reader cannot use
+// (D8682): the shape is interned at its own field storage. Returns that row's name, the
+// spelling mono pins the call's return at, or "" when the walk interns no record row.
 export function internOwnShapeOfTy(ty: i32): string {
   iisOwnRow = true
-  const nm = internShapeDeepOfTy(ty)
+  const row = internShapeDeepTy(ty)
   iisOwnRow = false
-  nm
+  if row >= 0 && row < sNames.length { sNames[row] } else { "" }
 }
 
 const IIS_REF_LIST_FIELD_NO_TY_MSG = "a shape's ref-list field recorded no type to name its element row"
@@ -1028,7 +1024,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       // `nameFieldCodeTy` to recognize the non-null part as a ref array. Must run before any
       // row is pushed, so the flat `sField*` arrays are not corrupted by the re-entrant intern.
       const fldTy = tyFieldTyOf(fieldsTy, rawNames[fi])
-      internShapeDeepTy(ftxt, fldTy)
+      internShapeDeepTy(fldTy)
       // The field's code is read off its type; a field with no type (a caller that holds none)
       // is coded from its text, the floor.
       let fc = if fldTy >= 0 { nameFieldCodeTy("", fldTy) } else { nameFieldCodeTy(ftxt, fldTy) }
@@ -1780,7 +1776,7 @@ function annShapeIndexOf(
 export function gaeEnsure(name: string, ty: i32) {
   if !annGenAppSpanEnds(name) { return 0 }
   if ty < 0 || tyHasTyVar(ty) || !(tyAt(ty) is TyObj) { return 0 }
-  internShapeDeepOfTy(ty)
+  internShapeDeepTy(ty)
   0
 }
 
@@ -1807,15 +1803,13 @@ export function markRefArrayArmsRow(u: i32) {
 // row is never boxed; each instance mints its own covered row.
 function markRefArrayArmsOf(atoms: string[], mems: i32[], cov: boolean) {
   if !cov { return 0 }
-  // The stored atom text still feeds the name-keyed reflist layer downstream.
   let i = 0
-  while i < atoms.length {
-    const a = atoms[i]
+  while i < mems.length {
     if unMemIsRefElemArray(mems[i]) {
       const aTy = mems[i]
       const bd = boolLeafListDepthOfTy(aTy)
       if bd > vbBoolListTop { vbBoolListTop = bd }
-      internShapeDeepTy(a, aTy)
+      internShapeDeepTy(aTy)
     }
     i = i + 1
   }
