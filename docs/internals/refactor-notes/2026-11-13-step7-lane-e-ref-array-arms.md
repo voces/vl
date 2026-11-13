@@ -27,4 +27,4 @@ parameter goes.
   bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
 - `scripts/gate.sh`: all rows pass.
 - Render-parse census: the `valueAtomKind(atoms[rai])` entry leaves, so `ty-string-parse` goes
-  from 18 to 17.
+  from 14 to 13.
