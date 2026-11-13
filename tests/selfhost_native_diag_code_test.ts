@@ -96,9 +96,8 @@ Deno.test({
   ignore,
 }, () => {
   const exp = instantiate();
-  // An INFERRED nullable i32-KEYED MAP return is type-valid; codegen cannot lower it
-  // un-annotated (the annotated `: {[i32]: i32} | null` spelling of the same function
-  // builds and runs).
+  // An INFERRED nullable SET return is type-valid; codegen cannot lower it un-annotated (the
+  // annotated `: Set<i32> | null` spelling of the same function builds and runs).
   //
   // THE WITNESS HAS MOVED TWICE, AND WHY IS THE POINT OF THE TEST. It was
   // `print(pick(true))` over an `i32 | string`, which now RUNS — D712 built the box-tag
@@ -111,7 +110,8 @@ Deno.test({
   // `i64[] | null`; D1062 closed the nullable LIST at every element type, which is why it
   // has moved a FIFTH. What still floors here is the i32-KEYED map — `nullableRetName`'s
   // map arm requires a `string` key — and its annotated twin runs, so it is a capability
-  // gap and this will move again.
+  // gap and this will move again. D1108 closed the i32- and i64-keyed map, so it has moved a
+  // SIXTH time, to the nullable `Set` (D16037), which that arm still excludes.
   // `scripts/capability-probes/inferred-nullable-container-return.vl` and
   // `inferred-nullable-list-return.vl` are the standing probes for the closed halves; when
   // the rest closes, this moves again.
@@ -120,7 +120,7 @@ Deno.test({
     [
       "function pick(c: boolean) {",
       "  if c { return null }",
-      "  const m: {[i32]: i32} = Map()",
+      "  const m: Set<i32> = Set()",
       "  m",
       "}",
       "function go() {",
