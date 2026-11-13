@@ -37,7 +37,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a type parameter's name is an identifier; shadowing is a scoping question | §3.3 registries | `monoElabCompositeTy` | lane D, 2026-11-12 |
 | no row key needs declaration identity: an inline field and its `tySame` twin share a row, except `flat` and differing function sets (coordinator, #7306) | §3.3 | the shape interner's rows | #7306, #7669 |
 | mono's anon-pin discriminator decides by the pin's type (coordinator, ruling (a)) | §3.3 | `monoAnonPinDiscrim` | lane D |
-| the `unionNameOfExpr` producer's floor (`unionNameOfExprFloor` / `letUnionNameOfGo`, #7720): a function value's nullable box is keyed by its set | §3.4 | about 614 calls; `unionNameOfCall` is its rung | #7636; witness `closures/fn-map-index-read.vl` (runs, output as filed) |
+| the `unionNameOfExpr` producer's floor (`unionNameOfExprFloor` / `letUnionNameOfGo`, #7720): a function value's nullable box is keyed by its set | §3.4 | about 614 calls; `unionNameOfCall` is its rung | #7636; witness `closures/fn-map-index-read.vl` (runs, output as filed; a scratch probe on master `7683149a` shows it reaches the floor and the floor answers) |
 | `tySame` plus the function sets | §3.3 registries | `sRowElemRepSame`, `fnSetsAgree` | `2026-11-12-step7-struct-name-producers-cut-2.md` |
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
