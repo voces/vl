@@ -9,6 +9,24 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-step7-union-reg-recursive-mint-once](2026-11-13-step7-union-reg-recursive-mint-once.md): Step 7 L6 (lane G): a recursive union mints one row (D16000), 2026-11-13
+- [2026-11-13-step7-union-reg-member-kind-quirks](2026-11-13-step7-union-reg-member-kind-quirks.md): Step 7 L6 (lane G, #13 P2): two member-kind quirks filed before the typed column, 2026-11-13
+- [2026-11-13-step7-union-reg-lit-arm-by-type](2026-11-13-step7-union-reg-lit-arm-by-type.md): Step 7 L6 (lane G, #13 step 2): the literal-union-arm question reads the union's type, 2026-11-13
+- [2026-11-13-step7-render-set-wider](2026-11-13-step7-render-set-wider.md): Step 7, lane H: the render-parse census counts every spelling renderer, 2026-11-13
+- [2026-11-13-step7-render-consumers](2026-11-13-step7-render-consumers.md): Step 7, lane H: each render's consumer, reach and witness, 2026-11-13
+- [2026-11-13-step7-probe-refusals](2026-11-13-step7-probe-refusals.md): Step 7, lane H: the render-parse probe counts programs that end in a refusal, 2026-11-13
+- [2026-11-13-step7-p5-cut-5a](2026-11-13-step7-p5-cut-5a.md): Step 7 P5, cut 5a: three emit render/parse sites read the type they hold, 2026-11-13
+- [2026-11-13-step7-p1-value-union-by-type-part2](2026-11-13-step7-p1-value-union-by-type-part2.md): Step 7, lane H: P1 part 2, the value-union verdict per spelling convention, 2026-11-13
+- [2026-11-13-step7-p1-value-union-by-type-part1](2026-11-13-step7-p1-value-union-by-type-part1.md): Step 7, lane H: P1 part 1, value-union-ness asked of the type, 2026-11-13
+- [2026-11-13-step7-nodearrayelemname-key-contract](2026-11-13-step7-nodearrayelemname-key-contract.md): `nodeArrayElemName`: graded a floor under the spelling-index contract, 2026-11-13
+- [2026-11-13-step7-lane-e-union-arms-by-leaf-type](2026-11-13-step7-lane-e-union-arms-by-leaf-type.md): Step 7 P3: the shape walk's union arms are decided by type, 2026-11-13
+- [2026-11-13-step7-lane-e-emit-base-dead-parsers](2026-11-13-step7-lane-e-emit-base-dead-parsers.md): Step 7 P3: emit_base's callerless and unreached spelling helpers go, 2026-11-13
+- [2026-11-13-step7-lane-e-arena-emit-name-tests](2026-11-13-step7-lane-e-arena-emit-name-tests.md): Step 7 P3: `arenaEmitName`'s test-only callers ask the type, 2026-11-13
+- [2026-11-13-step7-l2-mono-p6-unspaced-unions](2026-11-13-step7-l2-mono-p6-unspaced-unions.md): Step 7 L2, mono, P6 cut 1: `monoUnspacedUnions` deleted (2026-11-13)
+- [2026-11-13-step7-l2-mono-p6-arg-list-pin-typed](2026-11-13-step7-l2-mono-p6-arg-list-pin-typed.md): Step 7 L2, mono, P6 cut 2: a record-list literal argument pins at its own type (2026-11-13)
+- [2026-11-13-step7-l2-mono-p6-annotated-param-typed](2026-11-13-step7-l2-mono-p6-annotated-param-typed.md): Step 7 L2, mono, P6 cut 3: a `T[]` parameter's pin is spelled from its element type (2026-11-13)
+- [2026-11-13-step7-d16001-sole-member-union-key](2026-11-13-step7-d16001-sole-member-union-key.md): D16001: a one-member union keys as its member, 2026-11-13
+- [2026-11-13-step7-arm-row-by-type](2026-11-13-step7-arm-row-by-type.md): `internArmShapeRow` answers the row its type already has, 2026-11-13
 - [2026-11-13-w311-d6-walk-union-tests-by-type](2026-11-13-w311-d6-walk-union-tests-by-type.md): Step 7 L2 D6: the shape walk's union tests read the type, 2026-11-13
 - [2026-11-13-w311-d6-sfe-reads-no-text](2026-11-13-w311-d6-sfe-reads-no-text.md): Step 7 L2 D6: a shape field's element name reads no field text, 2026-11-13
 - [2026-11-13-step7-unrow-readers-lane-b](2026-11-13-step7-unrow-readers-lane-b.md): Step 7 L6: lane B's half of the `unRowOfName` readers, 2026-11-13
