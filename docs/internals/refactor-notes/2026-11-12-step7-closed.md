@@ -52,6 +52,8 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 
 | lane | sites |
 | --- | --- |
+| G | D16000: one type, two `unNames` rows (A's canonical-key probe, #7760) |
+| A | D16001: one type, two ref-list rows (the same probe) |
 | A | `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`), after E's step (d), which waits on F's last `ftxt` readers in `shapeFieldElemName` |
 
 ## The renders at this draft (master `537a04cc`, coordinator's measurement)
@@ -73,7 +75,7 @@ graded:
 The census's other five renders are all in one function, `nodeArrayElemName`
 (check_emit_queries:742, 764, 768, 772, 791). It renders an array literal's element type to a name,
 and emit_shape_rows' `arrLitBoxElemName` (2 callers) and `arrLitElemRender` (8 callers) consume
-that name. All five fail: a render handed to the emitter as a key. Owner: A (coordinator, 2026-11-13).
+that name. Graded a floor under the spelling-index contract by lane A's canonical-key probe (#7760, pending): no duplicate row carries its key. It moves to the floors when #7760 lands. The probe's one-type-two-rows cases are filed as D16000 (`unNames`, lane G) and D16001 (ref-list, lane A), and both block the close.
 
 Of the 13 renders, six are floors and seven block the close. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
 
@@ -107,7 +109,7 @@ is the checker's job. A checker parse reached from emit whose input the emitter 
 then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
 §3.3's sentence "parses no type spelling back" waits on that.
 
-**On master `32ab5241`:** 61 render or synthesized parses, 12 source, 52 unclassified, 13 renders (#7751 P4, #7754 G's literal-arm column, #7755, #7756 E's field split, #7758 B since 07:15). `shapeWalkKeyOf` still decides: `ln == kn` picks the by-declaration path, and `ln` reaches `gaeEnsure`'s parse and the interner's key, so it stays failing (E/F, D6).
+**On master `32ab5241`:** 61 render or synthesized parses, 12 source, 52 unclassified, 13 renders (#7751 P4, #7754 G's literal-arm column, #7755, #7756 E's field split, #7758 B since 07:15). `shapeWalkKeyOf` still decides: `ln == kn` picks the by-declaration path, and `ln` reaches `gaeEnsure`'s parse and the interner's key. It goes to F for deletion after A's #7757 lands `gaeEnsure(ty)`; #7757's note gives the replacement for the `kn` guard.
 
 **On master `846a645b`, after #7748 merged:** the census baseline reads 66 render or synthesized parses, 25 source, 54 unclassified and 13 renders (`arenaEmitName` is not yet among them).
 
