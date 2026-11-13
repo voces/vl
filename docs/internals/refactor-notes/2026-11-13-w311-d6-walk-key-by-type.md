@@ -49,7 +49,8 @@ The label is a lookup key (`structIndexByName`). Lane A's canonical-key test on 
 label table shows every hit lands on a row of the name's own type, with 0 misses and 0 clashes
 over 24,215 programs. So minting it from the type cannot change what a lookup finds. The three
 renders left in `shapeWalkLabelOf` feed only that label. The render-parse census still counts
-them as decision renders (`ty-render` is unchanged), because `sNames` is a key.
+them as decision renders (`ty-render` is unchanged), because `sNames` is a key. Because that
+key passes the canonical test, these three renders grade as floor.
 
 ## Measurement
 
