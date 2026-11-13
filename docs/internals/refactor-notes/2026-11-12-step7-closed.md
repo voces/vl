@@ -185,6 +185,8 @@ its witness runs as filed on master `54b68c07`. The close carries them forward.
 | [D15976](../inventory/D15976.md) | `emitObj` → `fieldRowKindIn` | a record field's un-annotated `[]`-or-`null` join reaches emit with its element hole unfilled |
 | [D16010](../inventory/D16010.md) | `sLitMintRow` | a hole instance's record literal has no elaborated type, so it builds at its minted row |
 | [D16060](../inventory/D16060.md) | `printUnionPlanCode`'s name fallback | a field read through an un-annotated parameter stays typed at the hole in its instance |
+| [D16061](../inventory/D16061.md) | the field recorder | an anonymous record handed to an un-annotated parameter keeps its field typed at the hole, so the recorder resolves the element's name |
+| D16022 (lane D's #7762, unfiled on master at this draft) | `monoArgTyNameRep`'s residual census site | a record-list literal argument with an open element type (a hole function or a type parameter) pins by its element's name; the pin must be chosen after the callee instance resolves, a mono reorder beyond step 7 (7 programs, all running, the scope loud) |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
 
