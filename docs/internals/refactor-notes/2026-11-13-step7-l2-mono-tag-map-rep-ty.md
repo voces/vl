@@ -5,9 +5,10 @@ ref-list row is found by type and `rlElemStructRow`'s name rung can go.
 
 Since #7692, `monoTagMapRepName` built that type and only spelled it at the end:
 `mapStoredTyOf(t)` for a map, or `mkObjTy(names, sts)` for a record of its fields' stored types.
-It is now `monoTagMapRepTy`, which answers the type, or -1 wherever it answered `""`. Each of its
-6 callers spells the type with `monoPinSpellShaped`, which answers `""` for -1, so every spelling
-is what it was. The arena calls are made in the same order.
+It is now `monoTagMapRepTy`, which answers the type, or -1 wherever a record answered `""`. A map
+always answers its stored type, even one the naming rule cannot spell. Each of the 6 callers
+spells the type with `monoPinSpellShaped`, which answers `""` for -1 and for an unspellable type,
+so every spelling is what it was. The arena calls are made in the same order.
 
 The function walks one level deep, as before:
 
