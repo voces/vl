@@ -14,8 +14,6 @@ argument, or a bare name's nearest initializer above the call, found by text.
 | emit_classify.vl:11402 | memReadBoxPlan | canonUnionMembersInto | (a) render | `own = tyFieldTyOf(ot, m.memProp)` | 1198 | build/sweep/witnesses/inventory/D13902.vl | `(a type, rendered inside)` |
 | emit_classify.vl:11403 | memReadBoxPlan | canonUnionMembersInto | (a) render | `phys = sFieldElemTyIxAt(si, fi)` | 1198 | build/sweep/witnesses/inventory/D13902.vl | `(a type, rendered inside)` |
 | emit_collect.vl:7998 | registerRefArrayArmUnions | valueAtomKind | (a) render | `atoms[rai]` | 9 | build/sweep/witnesses/inventory/D4862.vl | `(i32\|null)[]` |
-| emit_collect.vl:9289 | collectDeclaredUnion | nameIsFuncTypeAtom | (a) render | `udMem = vs[usj]` | 32 | build/sweep/witnesses/inventory/D14302.vl | `{v:i32}` |
-| emit_collect.vl:9289 | collectDeclaredUnion | peelGroupParens | (a) render | `udMem = vs[usj]` | 1 | tests/cases/unions/alias-fn-arm-is.vl | `(i32)=>i32` |
 | emit_fn_scans.vl:2517 | printUnionPlanCode | valueAtomKind | unclassified: bare names | `atoms[d]` | 25 | build/sweep/witnesses/inventory/D13783.vl | `string` |
 | emit_map_twins.vl:341 | unionHasBoolLeafArm | boolLeafListDepthOfName | (c) source | `arms[i]` | 7 | build/sweep/witnesses/inventory/D2857.vl | `boolean[][]` |
 | emit_mono.vl:1793 | monoArgTyNameRep | arrElemSuffixed | (b) synthesized | `aen = arrLitElemName(ix, fnIx)` | 5 | build/sweep/witnesses/inventory/D16022.vl | `#anon0` |
