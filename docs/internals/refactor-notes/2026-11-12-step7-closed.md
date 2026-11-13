@@ -274,7 +274,7 @@ no program reads a wrong answer:
   `{f: (i32,i32,i32) => boolean}` carries the `=> string` twin's name, because two layout-identical
   closure records fold to one heap type and the name is the folded twin's. It prints `false`, as
   filed.
-- **A newtype's name resolves to its unbranded base** (D16003, a refutation pin, runs today):
+- **A newtype's name resolves to its unbranded base** ([D16003](../inventory/D16003.md), a refutation pin, runs today):
   `memory/newtype-struct-reflist-key-population.vl` (`PView`),
   `maps/newtype-struct-map-value-struct-field.vl` (`EView`), and
   `types/newtype-over-litunion-alias.vl` (`NK = new K`). `declTyIxOfName` answers from
