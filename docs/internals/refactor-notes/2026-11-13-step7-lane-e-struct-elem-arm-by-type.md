@@ -37,4 +37,4 @@ were **0** disagreements. The site is reached in 12 programs, according to the p
 - Refresh ×2: fixpoint.
 - Sweep with fixpoint seeds on both sides: 24,204 same, 0 bytes-only movers, 0 output movers,
   0 `runs → not-runs`, 0 new compiler traps.
-- `scripts/gate.sh`: all 23 rows pass.
+- `scripts/gate.sh`: all 23 rows pass, on the branch and on the tree merged with master `79de107d` (D's #7726).
