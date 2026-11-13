@@ -1,7 +1,7 @@
 // `cli_budget.vl` — `vl check --budget <baseline>`: a per-file lint ratchet held by the
 // lint itself. The baseline is a JSON file naming a `label`, the `writer` that rewrites
-// it, the `targets`/`exclude` to walk, the per-code `total`, the per-file counts and the
-// named `entries`; the CLI feeds every finding of a budgeted code through `budgetNote`
+// it, the `targets`/`exclude` to walk, the budgeted `codes`, the per-file counts and the
+// named `entries`; a code's total is the sum of its file rows, never stored; the CLI feeds every finding of a budgeted code through `budgetNote`
 // and prints `budgetCheckLines` or `budgetWhyLines`, or `budgetWriteText` rewrites the
 // baseline from the run. docs/internals/architecture-refactor-plan.md T2.
 
@@ -212,8 +212,7 @@ function bjCounts(rel: string) {
     bjExpect(':')
     const n = bjInt()
     if rel == "" {
-      bgCodes.push(code)
-      bgTotal.push(n)
+      bgCodeAdd(code)
     } else {
       bgFileRel.push(rel)
       bgFileCode.push(code)
@@ -264,8 +263,19 @@ function bjEntries() {
   0
 }
 
+// Adds `code` to the budgeted codes once.
+function bgCodeAdd(code: string) {
+  for c in bgCodes {
+    if c == code { return 0 }
+  }
+  bgCodes.push(code)
+  0
+}
+
 // Read baseline `src`, replacing any earlier one and every finding noted against it.
-// Returns "" or what is wrong with the file; a baseline must name a `label` and a `total`.
+// Returns "" or what is wrong with the file; a baseline must name a `label` and its `codes`.
+// A legacy `total` names the codes by its keys; its counts are not read, since two
+// concurrent lowerings of one stored total merge into one edit and loosen the ratchet.
 export function budgetLoad(src: string): string {
   bgLabel = ""
   bgWriter = ""
@@ -295,17 +305,33 @@ export function budgetLoad(src: string): string {
     while bjErr == "" {
       const key = bjString()
       bjExpect(':')
-      if key == "label" { bgLabel = bjString() }
-      else if key == "writer" { bgWriter = bjString() }
-      else if key == "ok" { bgOkText = bjString() }
-      else if key == "remedy" { bgRemedyText = bjString() }
-      else if key == "commit" { bgCommit = bjString() }
-      else if key == "targets" { bjStrList(bgTargets) }
-      else if key == "exclude" { bjStrList(bgExclude) }
-      else if key == "total" { bjCounts("") }
-      else if key == "files" { bjFiles() }
-      else if key == "entries" { bjEntries() }
-      else { bjSkip() }
+      if key == "label" {
+        bgLabel = bjString()
+      } else if key == "writer" {
+        bgWriter = bjString()
+      } else if key == "ok" {
+        bgOkText = bjString()
+      } else if key == "remedy" {
+        bgRemedyText = bjString()
+      } else if key == "commit" {
+        bgCommit = bjString()
+      } else if key == "targets" {
+        bjStrList(bgTargets)
+      } else if key == "exclude" {
+        bjStrList(bgExclude)
+      } else if key == "total" {
+        bjCounts("")
+      } else if key == "codes" {
+        const cs: string[] = []
+        bjStrList(cs)
+        for c in cs { bgCodeAdd(c) }
+      } else if key == "files" {
+        bjFiles()
+      } else if key == "entries" {
+        bjEntries()
+      } else {
+        bjSkip()
+      }
       if bjPeek() != ',' { break }
       bjPos = bjPos + 1
     }
@@ -313,7 +339,16 @@ export function budgetLoad(src: string): string {
   bjExpect('}')
   if bjErr == "" && bgLabel == "" { bjErr = "it names no `label`" }
   if bjErr == "" && bgCodes.length == 0 {
-    bjErr = "it budgets no code (`total`)"
+    bjErr = "it budgets no code (`codes`)"
+  }
+  for c in bgCodes {
+    let n = 0
+    let i = 0
+    while i < bgFileCode.length {
+      if bgFileCode[i] == c { n = n + bgFileN[i] }
+      i = i + 1
+    }
+    bgTotal.push(n)
   }
   bjCps = []
   bjErr
@@ -784,7 +819,7 @@ export function budgetWriteText(commit: string): string {
   if bgExclude.length > 0 {
     body.push("\"exclude\": " + bgQuoteList(bgExclude) + ",")
   }
-  body.push("\"total\": " + bgCountsJson("") + ",")
+  body.push("\"codes\": " + bgQuoteList(bgCodes) + ",")
   body.push("\"files\": {")
   let rows = ""
   for rel in bgSortedUniq(bgHitRel) {
