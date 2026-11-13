@@ -218,6 +218,26 @@ The armed control is now byte-level. D12340's witness (7 lines) builds to a diff
 than unarmed (`cmp` differs), and both run correctly. The spares are D14739, D15099, D15151,
 D15241 and D15298. The close quotes that `cmp` on its own master, with a post-#7661 host and seed.
 
+## A spelling-keyed registry still standing: variant rows by the arm's spelling (lane E, a refuted swap)
+
+`mintVariantRows` (emit_collect) counts and mints a variant row for each struct member with
+`isStructAtom(stmts, names[i])`, the spelling test (a declared struct name or an inline `{…}`). It
+keys the row by that spelling: `uVariantsPush(names[i])`, and `collectVariantFields(stmts,
+names[i], tys[i])` resolves the member's struct by name. The member's type `tys[i]` is in hand.
+
+Lane E's probe, whose control fired at 7,013 reaches over the sweep, found that "the member type
+is a `TyObj`" disagrees with the spelling test in exactly five programs. All five are intersection
+arms spelled `Node&{v:i32}`, whose type is a record: D14162, D16001,
+`objects/intersection-alias-field-and-nullable-positions.vl`,
+`structs/recursive-nullable-field-equality.vl` and
+`types/intersection-alias-recursive-positions.vl`. Taking the typed test moves three of them from
+runs to an emit reject ("union variant names an unknown struct type"), because the row's key is
+the spelling and an intersection spelling names no struct.
+
+The variant-row key passes lane A's canonical-key test or is re-keyed by type (position and type,
+as `variantIndexOf`'s retirement did). The owner follows from that result, likely lane B.
+`isStructAtom` and its emit_base spelling test go with it. Ruling pending.
+
 ## Floors held by a filed row
 
 Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the site reads a name
