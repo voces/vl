@@ -7692,6 +7692,10 @@ function tyIsUnionOrNullable(ty: i32): boolean {
   t is TyNullable
 }
 
+// The union registry labels its rows by emitter name, and every union a subtype or a closure
+// result reaches has one; an unspellable one would register nothing silently.
+const UNION_NO_EMIT_NAME_MSG = "emitProgram: a union reached through a subtype has no emitter name to register it under"
+
 // The subtypes `registerInlineUnionOfChild` is descending through, innermost last.
 const riuOpenTys: i32[] = []
 
@@ -7700,7 +7704,7 @@ const riuOpenTys: i32[] = []
 function registerInlineUnionOfChild(stmts: i32[], cty: i32, site: i32): i32 {
   if i32ListHas(riuOpenTys, cty) { return 0 }
   const nm = arenaEmitName(cty)
-  if nm == "" { return 0 }
+  if nm == "" { return emitFail(UNION_NO_EMIT_NAME_MSG) }
   riuOpenTys.push(cty)
   const r = registerInlineUnionAt(stmts, nm, site, cty, cty)
   riuOpenTys.pop()
@@ -7783,7 +7787,7 @@ function registerCloResultUnion(stmts: i32[], rt: i32): i32 {
   if r is TyMap { return registerMapValUnion(stmts, rt) }
   if r is TyArray { return registerInlineUnionOfChild(stmts, rt, 36) }
   const res = arenaEmitName(rt)
-  if res == "" { return -2 }
+  if res == "" { return emitFail(UNION_NO_EMIT_NAME_MSG) }
   if valueBoxOfTy(rt) || tyIsMapMemberUnion(rt) {
     return registerInlineUnionAt(stmts, res, 34, rt, rt)
   }
@@ -8578,21 +8582,6 @@ function registerInferRetNominalUnion(stmts: i32[], nm: string, row: i32) {
   0
 }
 
-// The gate that stops an inferred-return row registering twice: the arena walk renders the
-// recorded anonymous type structurally and registers it, then the fallback registers the
-// reverse-mapped nominal composite — two `unNames` rows, one layout, every variant of the
-// second a duplicate in `uVariants`. True when the two names are not two spellings of one union.
-function inferRetArenaUnionIsDup(tyIx: i32, nm: string, row: i32): boolean {
-  if tyIx < 0 { return false }
-  const t = tyAt(tyIx)
-  if !(t is TyUnion) { return false }
-  if inferRetAtomCountAt(row) < 2 { return false }
-  const ar = reachRegisterName(tyIx, false)
-  if ar == "" { return false }
-  if ar == nm { return false }
-  !isUNameAB(9, tyIx)
-}
-
 // Scans every top-level `FuncDecl`'s param/return annotations and `let`/`const` annotations
 // for inline union types, registering each as a synthetic union alias. Must run after the
 // `UnionDecl` pass (so a matching inline name is a no-op) and before `assignTags` (which
@@ -9371,16 +9360,11 @@ function collectInferredUnions(stmts: i32[]) {
   let iru = 0
   while iru < inferRetCount() {
     // Arena walk over the inferred return type first (bucket (c) ordering, as at the annotation
-    // sites): registers every reachable union, not just what the name render surfaced. Idempotent.
-    // `inferRetArenaUnionIsDup`: where the walk's structural render and the name fallback's
-    // nominal composite are two spellings of one union, the walk descends members only.
+    // sites): registers every reachable union, not just what the name render surfaced. Idempotent,
+    // and keyed by type, so the name fallback below adopts the walk's row rather than minting one.
     const irTyIx = inferRetTyIxAt(iru)
     const irNom = inferRetTyAt(iru)
-    if inferRetArenaUnionIsDup(irTyIx, irNom, iru) {
-      if collectTyMembersReach(stmts, irTyIx, 15, false) < 0 { return -1 }
-    } else {
-      if collectTyReachRegister(stmts, irTyIx, 16, false) < 0 { return -1 }
-    }
+    if collectTyReachRegister(stmts, irTyIx, 16, false) < 0 { return -1 }
     // The name fallback: an inferred struct/variant-box return whose members are anonymous
     // shapes, recorded under its nominal composite, which the arena walk cannot reach (`registerInferRetNominalUnion`).
     if registerInferRetNominalUnion(stmts, irNom, iru) < 0 { return -1 }
