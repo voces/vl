@@ -435,6 +435,9 @@ const EMIT_HOOK_NEW = `  const d0 = T.diags.length
   const hm = hpEnd()
   let rc = rc0
   if hm != "" {
+    // A refusal has already latched the first failure; the probe's report replaces it, so a
+    // site reached only by a refusing program still counts.
+    emitFailed = false
     emitFail("HPROBE" + hm)
     rc = -1
   }
