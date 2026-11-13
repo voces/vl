@@ -6068,6 +6068,11 @@ function monoNestedShadowsOuter(fe: i32): boolean {
 // The instance-key suffix `monoInstantiate` hands `monoMakeInstance` for a call with explicit
 // type arguments, consumed (and cleared) where the key is built.
 let monoKeyExtra = ""
+// Each binding `monoKeyExtra` names, beside it: the type parameter, its type (-1 for none) and its
+// text in the key.
+let monoKeyExtraN: string[] = []
+let monoKeyExtraT: i32[] = []
+let monoKeyExtraS: string[] = []
 // The same call's explicit bindings as arena types, consumed beside `monoKeyExtra`: the type
 // column a body annotation substitutes through, which the parameters alone cannot bind for a
 // type parameter no parameter mentions (D2676).
@@ -6078,8 +6083,8 @@ let monoExplicitBT: i32[] = []
 let monoPinArgLit: boolean[] = []
 
 // Binds `typarams` to the call's explicit type arguments (their canonical spellings) in `tvN`
-// / `tvV`. Answers the key suffix: the bindings of the parameters no value parameter mentions,
-// the ones the pins cannot tell apart (`make<i32>()` and `make<string>()` pin nothing).
+// / `tvV`, and stages as the key suffix the bindings of the parameters no value parameter
+// mentions, the ones the pins cannot tell apart (`make<i32>()` and `make<string>()` pin nothing).
 function monoBindExplicitTyArgs(
   callIx: i32,
   typarams: string[],
@@ -6087,12 +6092,15 @@ function monoBindExplicitTyArgs(
   tvN: string[],
   tvV: string[],
   tvT: i32[],
-): string {
+): i32 {
   monoExplicitBN = []
   monoExplicitBT = []
+  monoKeyExtra = ""
+  monoKeyExtraN = []
+  monoKeyExtraT = []
+  monoKeyExtraS = []
   const tas = callTyArgsOf(callIx)
-  if tas.length != typarams.length { return "" }
-  let extra = ""
+  if tas.length != typarams.length { return 0 }
   let i = 0
   while i < tas.length {
     let nm = tyNameOf(tas[i])
@@ -6116,12 +6124,21 @@ function monoBindExplicitTyArgs(
       if at >= 0 && !tyHasTyVar(at) { monoTvTyLast(tvN, tvT, at) }
       const one: string[] = [typarams[i]]
       if !elabParamsMention(params, one) {
-        extra = extra + typarams[i] + "=" + nm + ";"
+        monoKeyExtraAdd(typarams[i], at, nm)
       }
     }
     i = i + 1
   }
-  extra
+  0
+}
+
+// Adds binding `tp` = `sp`, of type `t` (-1 for none), to the pending key suffix `monoKeyExtra`.
+function monoKeyExtraAdd(tp: string, t: i32, sp: string) {
+  monoKeyExtra = monoKeyExtra + tp + "=" + sp + ";"
+  monoKeyExtraN.push(tp)
+  monoKeyExtraT.push(t)
+  monoKeyExtraS.push(tp + "=" + sp + ";")
+  0
 }
 
 // Binds each type parameter of a call whose uses the checker joined over numeric widening at the
@@ -6269,7 +6286,7 @@ function monoBindSeededTyParams(
         monoExplicitBN.push(tp)
         monoExplicitBT.push(t)
       }
-      monoKeyExtra = monoKeyExtra + tp + "=" + nm + ";"
+      monoKeyExtraAdd(tp, t, nm)
     }
   }
   0
@@ -6310,7 +6327,7 @@ function monoBindTyParamElab(
     monoExplicitBN.push(tp)
     monoExplicitBT.push(eb)
   }
-  monoKeyExtra = monoKeyExtra + tp + "=" + sp + ";"
+  monoKeyExtraAdd(tp, eb, sp)
   0
 }
 
@@ -7778,16 +7795,6 @@ function monoAnonPinDiscrim(pin: string, tyIx: i32): string {
   "=" + canon
 }
 
-// The key suffix a function-value pin needs, or "". The pin is the value's `$fnsig` key, which
-// `i32`, `boolean` and a literal union share, so an instance typed at one would serve the others
-// and read their results at its own type (D3167). Keyed by the value's checked type instead.
-function monoSigPinDiscrim(pin: string, tyIx: i32): string {
-  if tyIx < 0 || tyIx >= T.tys.length { return "" }
-  if sigKeyPinPayload(pin) == "" { return "" }
-  if !(tyAt(tyIx) is TyFunc) || tyHasTyVar(tyIx) { return "" }
-  "=" + tyCanonKey(tyIx, TY_WALK_DEPTH)
-}
-
 // A pin holding a tagged function set keys apart from a closure of the same signature: its value
 // is a member's id, and its calls go to each member directly.
 function monoSetPinDiscrim(tyIx: i32): string {
@@ -8388,6 +8395,20 @@ function monoKeyPinSeg(
   let seg = ""
   let pk = 0
   while pk < pinned.length {
+    // A function pin reaches the key spelled by its type (`monoPinRespell`). Its `$fnsig` key is
+    // shared by `i32`, `boolean` and a literal union, so one keyed by it is refused (D3167).
+    const pt = pinTys[pk]
+    if (
+      sigKeyPinPayload(pinned[pk]) != ""
+      && pt >= 0
+      && pt < T.tys.length
+      && tyAt(pt) is TyFunc
+      && !tyHasTyVar(pt)
+    ) {
+      emitFail(
+        "emitProgram: monomorphize: a function pin reached the instance key as its signature key, which several types share",
+      )
+    }
     // A parameter annotated with a union naming a type parameter is pinned at that annotation
     // under the key's bindings, which already fix it; the argument's exact type and its
     // literal-union rep add nothing (D15109).
@@ -8396,19 +8417,13 @@ function monoKeyPinSeg(
     // whose records share a row build one instance, whatever their names or spellings (D15262).
     const rowCls = typeRowClassOf(pinOwn[pk])
     if rowCls != "" {
-      seg = seg
-        + "#row"
-        + rowCls
-        + monoSigPinDiscrim(pinned[pk], pinTys[pk])
-        + monoSetPinDiscrim(pinTys[pk])
-        + ","
+      seg = seg + "#row" + rowCls + monoSetPinDiscrim(pinTys[pk]) + ","
       pk = pk + 1
       continue
     }
     seg = seg
       + heads[pk]
       + (if unionPin || monoPinExactFree(exact, pinTys[pk]) { "" } else { monoAnonPinDiscrim(pinned[pk], pinTys[pk]) })
-      + monoSigPinDiscrim(pinned[pk], pinTys[pk])
       + monoSetPinDiscrim(pinTys[pk])
       + (if unionPin { "" } else { monoLitUnionPinDiscrim(pinTys[pk]) })
       + ","
@@ -9268,6 +9283,9 @@ function monoMakeInstanceLaterName(
 function monoMakeInstanceKeyHead(origFe: i32, callFrame: i32): string {
   let key = i32ToStr(origFe) + "#" + monoKeyExtra
   monoKeyExtra = ""
+  monoKeyExtraN = []
+  monoKeyExtraT = []
+  monoKeyExtraS = []
   if callFrame >= 0 { key = key + "^" + i32ToStr(callFrame) }
   key
 }
@@ -9340,6 +9358,9 @@ type MonoInstKey = {
   pinEnd: i32,
   extraAt: i32,
   extraEnd: i32,
+  extraN: string[],
+  extraT: i32[],
+  extraS: string[],
 }
 
 // The key of `fn`'s instance at these pins, taking over the staged explicit bindings.
@@ -9364,6 +9385,9 @@ function monoMakeInstanceKeyOf(
   monoEnclosingPinRow(origFe, callFrame, fn.fnTyParams, outerN, outerT)
   const extraAt = i32ToStr(origFe).length + 1
   const extraEnd = extraAt + monoKeyExtra.length
+  const extraN = monoKeyExtraN
+  const extraT = monoKeyExtraT
+  const extraS = monoKeyExtraS
   let key = monoMakeInstanceKeyHead(origFe, callFrame)
   const exBN = monoExplicitBN
   const exBT = monoExplicitBT
@@ -9409,6 +9433,9 @@ function monoMakeInstanceKeyOf(
     pinEnd: pinEnd,
     extraAt: extraAt,
     extraEnd: extraEnd,
+    extraN: extraN,
+    extraT: extraT,
+    extraS: extraS,
   }
   k
 }
@@ -9516,28 +9543,27 @@ function monoPinnedTyParamCanon(
 }
 
 // The key's explicit and defaulted bindings, each by its canonical type, leaving out one the
-// pins already name, so `f<i32>(x)` and `f(x)` at an `i32` pin share an instance; the text as
-// spelled where a binding has no type.
+// pins already name, so `f<i32>(x)` and `f(x)` at an `i32` pin share an instance. A binding with
+// no closed type keeps its text: the type parameter it names is the enclosing instance's.
 function monoTypedExtra(
   k: MonoInstKey,
   fd: FuncDecl,
   pinnedTyIx: i32[],
 ): string {
-  const text = k.key.slice(k.extraAt, k.extraEnd)
-  let n = 0
-  for ch in text {
-    if ch == ';' { n = n + 1 }
-  }
-  if n != k.exBN.length { return text }
   let out = ""
   let i = 0
-  while i < k.exBN.length {
-    const c = tyCanonKey(k.exBT[i], TY_WALK_DEPTH)
-    if (
-      monoPinnedTyParamCanon(fd, k.exBN[i], pinnedTyIx) != c
-      && monoKeyExactCanon(k, k.exBN[i]) != c
-    ) {
-      out = out + k.exBN[i] + "=" + c + ";"
+  while i < k.extraN.length && i < k.extraT.length && i < k.extraS.length {
+    const t = k.extraT[i]
+    if t < 0 || t >= T.tys.length || tyHasTyVar(t) {
+      out = out + k.extraS[i]
+    } else {
+      const c = tyCanonKey(t, TY_WALK_DEPTH)
+      if (
+        monoPinnedTyParamCanon(fd, k.extraN[i], pinnedTyIx) != c
+        && monoKeyExactCanon(k, k.extraN[i]) != c
+      ) {
+        out = out + k.extraN[i] + "=" + c + ";"
+      }
     }
     i = i + 1
   }
@@ -19675,14 +19701,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       // (`monoTvTyLast`); a binding pushed by spelling alone has -1 or no entry.
       const tvT: i32[] = []
       // A call's explicit type arguments bind first, so every later binding reads them.
-      monoKeyExtra = monoBindExplicitTyArgs(
-        callIx,
-        fn.fnTyParams,
-        fn.fnParams,
-        tvN,
-        tvV,
-        tvT,
-      )
+      monoBindExplicitTyArgs(callIx, fn.fnTyParams, fn.fnParams, tvN, tvV, tvT)
       monoPreBindNumJoin(callIx, fn.fnTyParams, tvN, tvV, tvT)
       const pinned: string[] = []
       // The arena type each pinned param denotes, parallel to `pinned`. Sourced from the
