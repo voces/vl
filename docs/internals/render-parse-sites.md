@@ -53,8 +53,6 @@ argument, or a bare name's nearest initializer above the call, found by text.
 | emit_rep.vl:2796 | recordUnMemTys | valueAtomKind | (a) render | `a = atoms[i]` | 474 | build/sweep/witnesses/inventory/D13900.vl | `{r:f64}` |
 | emit_rep.vl:4137 | nulScalarBoxAtomOf | valueAtomKind | unclassified: bare names | `repOfTy(inner).rdKind` | 961 | build/sweep/witnesses/inventory/D14229.vl | `i32` |
 | emit_rewrite.vl:3924 | cboxElemNeedsParens | tyTopIndexOf | (c) source | `name (a parameter)` | 2 | tests/cases/loops/exit-first-arm-captured-mutable.vl | `Rec\|null` |
-| emit_shape_intern.vl:888 | iisPushFieldElem | isValueUnionName | (a) render | `e5 = shapeFieldElemName(` | 64 | build/sweep/witnesses/inventory/D15194.vl | `((i32)=>i32)` |
-| emit_shape_intern.vl:909 | iisPushFieldElem | isValueUnionName | (a) render | `e28 = shapeFieldElemName(` | 1 | tests/cases/generics/alias-inline-record-list-field.vl | `{g:string}` |
 | emit_shape_intern.vl:1126 | internShapeAs | groupInnerOf | (a) render | `nm (a parameter)` | 29 | build/sweep/witnesses/inventory/D14794.vl | `{a:i32,b:i32}` |
 | emit_union_atoms.vl:1405 | registerValueUnionNameTy | nameIsLitUnionArmValueUnion | (c) source | `name (a parameter)` | 1 | tests/cases/literal-unions/as-num-litunion-scalar-member-test.vl | `i32\|null` |
 | emit_union_atoms.vl:2413 | ifExprNliName | valueAtomKind | (c) source | `atoms[j]` | 1 | tests/cases/types/if-expression-no-else-scope-rep-grid.vl | `i32[]` |
