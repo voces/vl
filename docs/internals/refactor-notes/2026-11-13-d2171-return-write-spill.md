@@ -30,7 +30,12 @@ Each position is a program, run on base master and on this change:
 
 ## Measured
 
+`capability-matrix.vl` over `scripts/capability-probes/matrix/element-write-value.matrix.vl`, base
+against candidate: 12 of 50 graded cells run (from 0), 0 silent, 0 runs → not-runs, 0 program
+traps. The other 38 are module-scope and operand positions, D16015.
+
+
 | instrument | result |
 | --- | --- |
-| full sweep, base master against this change, both fixpoint seeds | SWEEP_RESULT |
-| fast set | FASTSET_RESULT |
+| full sweep, base master against this change, both fixpoint seeds | 2 output movers, both `emit_reject` → `runs` (D2171's witness and the new test); 1 bytes-only mover (`field-element-assignment-value.vl`, a `let` of a write now spilled, same output); 0 runs → not-runs; 0 new traps |
+| fast set | all green (fixpoint, lint-self clean, regress no runs lost, filed witnesses, late demands, seed size, comment, ladder, sentinel, scan, render-parse and export ratchets) |
