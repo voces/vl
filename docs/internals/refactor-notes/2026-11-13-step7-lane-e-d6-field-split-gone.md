@@ -37,7 +37,7 @@ one-record program. The population was the sweep's 24,207 programs. Wherever the
 - Sweep with fixpoint seeds on both sides, master `6ec3ca16` against the candidate: 24,207 same,
   0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
 - Render-parse census, regenerated with `render-parse-origins.ts`: `ty-string-parse` 66 → 64
-  (both deleted `shapeInnerFieldSplit` sites).
+  (both deleted `shapeInnerFieldSplit` sites); 63 after merging #7753.
 - `ty-source-parse` 25 → 19. Two of the six left with this PR's deletions. The other four,
   `nameIsGenAppDecl`'s `gaeHeadNameOf`/`gaeLtAt`, are no longer reached by any sweep program,
   so the origin probe leaves them ungraded and they count as `ty-parse-unclassified`
