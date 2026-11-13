@@ -25,8 +25,9 @@ family. The name predicate grades a literal member by how its site's spelling wr
 - the inferred-return names write a literal or an alias arm, which `valueAtomKind` does not call
   an atom.
 
-`isValueUnionTyOr` follows neither convention. Part 2 adds one type predicate per convention, and
-the semantic question is filed as its own row.
+`isValueUnionTyOr` follows neither convention. Part 2 adds one type predicate per convention.
+The semantic question is D16062: its three ablation families, each with a minimal witness. The
+type twin also answers no for a mixed-base literal union (`"a" | 1`) that boxes.
 
 ## The change
 
