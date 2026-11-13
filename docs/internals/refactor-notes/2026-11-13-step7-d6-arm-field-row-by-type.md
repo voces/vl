@@ -34,5 +34,5 @@ with this cut's. All 61 are byte-identical.
 - **Locally:**
   - refresh to a fixpoint;
   - `lint-self.sh` clean;
-  - `scripts/gate.sh`.
+  - `scripts/gate.sh`: all gates pass.
 - **CI's sweep** should report no movers.
