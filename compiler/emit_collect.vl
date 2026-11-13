@@ -1,3 +1,5 @@
+import { nameIsBraceSpanEnds, nameIsShapeOpen } from "./tyname"
+import { nomNameOfTy } from "./check_types"
 import { unionArmKindRowsOfExpr } from "./emit_classify"
 import { rlElemNonNulTyAt } from "./emit_map_value_slots"
 
@@ -44,7 +46,6 @@ import {
   fnTagSetIsTagged,
   fnTagSetOfTy,
 } from "./check_elab_cap"
-import { nameIsFuncTypeAtom, peelGroupParens } from "./tyname"
 import {
   ambientCtorCalls,
   gaParamNames,
@@ -64,7 +65,12 @@ import {
   optCallRetNameAt,
   optCallRetNodeAt,
 } from "./check_call_resolve"
-import { canonRewroteNode, canonTyIxOf, udMemberTyAt } from "./check_canon_raw"
+import {
+  canonRewroteNode,
+  canonRewroteSlot,
+  canonTyIxOf,
+  udMemberTyAt,
+} from "./check_canon_raw"
 import { collectRetValues, unionAliasMembers } from "./check_nj_join"
 import { declAnnRawTyName, declAnnTyOf } from "./check_gen_alias_anns"
 import { fieldNameOrder } from "./check_obj_shape"
@@ -128,7 +134,6 @@ import {
   tyIsOneStrLit,
   tyLitMemberTexts,
   tyMayHoldFn,
-  tyMembersDistinctRecords,
   tyMentionsTyVarNamed,
   tyNomNameCycled,
   tyNulInnerIsPrim,
@@ -213,7 +218,6 @@ import {
   strLess,
   tyIsFuncType,
   tyNameOf,
-  unionStructAliasShape,
   unwrapParen,
 } from "./emit_base"
 import {
@@ -6947,8 +6951,7 @@ export function collectS(stmts: i32[]) {
     // A struct-alias union decl (a single inline-shape variant) is a plain named struct: intern
     // it here, since `collectU` skipped it.
     if s is UnionDecl {
-      const aliasShape = unionDeclStructAlias(s)
-      if aliasShape != "" {
+      if unionDeclStructAlias(stmts[i], s) {
         if internShapeAs(s.udName) < 0 { return -1 }
       }
     }
@@ -9045,22 +9048,32 @@ function collectUReset() {
   0
 }
 
-// The one struct shape a union decl `s` lowers as, or "" when it lowers as a union. Arms
-// that differ only in a lone literal spell one softened shape yet are distinct types, so
-// they keep the box their type names and share its row (D5157).
-function unionDeclStructAlias(s: UnionDecl): string {
-  const shape = unionStructAliasShape(s.udVariants)
-  if shape == "" { return "" }
-  const hit = cUserTypes[s.udName]
-  if hit is i32 {
-    const ut = tyAt(hit)
-    if ut is TyUnion {
-      if tyIsValueUnionBox(hit) && tyMembersDistinctRecords(ut.uMembers) {
-        return ""
-      }
-    }
+// Whether union decl `s` at node `sx` lowers as one struct: every member is one anonymous record
+// type (D446) that no declaration, brand or application names, written as that record. A member
+// canon folded is one; an unfolded member keeps the author's spelling, read as source. Arms
+// differing only in a lone literal are distinct types, so they keep their box (D5157).
+function unionDeclStructAlias(sx: i32, s: UnionDecl): boolean {
+  const n = s.udVariants.length
+  if n == 0 { return false }
+  if !canonRewroteSlot(sx, 0) && !nameWrittenAsShape(s.udVariants[0]) {
+    return false
   }
-  shape
+  const first = udMemberTyAt(sx, 0)
+  if first < 0 || !(tyAt(first) is TyObj) { return false }
+  if (
+    structNameOfTy(first) != ""
+    || genAppNameOfTy(first) != ""
+    || nomNameOfTy(first) != ""
+  ) {
+    return false
+  }
+  let k = 1
+  while k < n {
+    const t = udMemberTyAt(sx, k)
+    if t < 0 || !tySame(t, first) { return false }
+    k = k + 1
+  }
+  true
 }
 
 // The row member position of the declared union's arm `vs[vi]`: the member spelled alike at the
@@ -9200,7 +9213,7 @@ function declMemberTy(sx: i32, mi: i32): i32 {
 function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   // A struct-alias union (single inline-shape variant) is a named struct, not a union:
   // `collectS` interns it; skip it here.
-  if unionDeclStructAlias(s) != "" { return 0 }
+  if unionDeclStructAlias(stmtIx, s) { return 0 }
   // A transparent one-member alias denotes its member, not a union (#1122's ruling), so it
   // gets no row here: minting one pushed the member's name into `uVariants` a second time.
   if isTransparentAlias(s.udName) { return 0 }
@@ -9284,9 +9297,9 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
       vsx.push(vs[usj])
       vsxTys.push(at)
     }
-    // A function-type member keeps its grouping parens in the join, as the inline union's
-    // name does: bare, `(i32)=>i32|string` reads as one arrow returning `i32|string`.
-    if nameIsFuncTypeAtom(udMem) && peelGroupParens(udMem) == udMem {
+    // A function-type member is grouped in the join, as the inline union's name is: bare,
+    // `(i32)=>i32|string` reads as one arrow returning `i32|string`. Canon spells the member bare.
+    if udMem == vs[usj] && at >= 0 && at < T.tys.length && tyAt(at) is TyFunc {
       udMem = "(" + udMem + ")"
     }
     if udSet != "" { udSet = udSet + "|" }
@@ -9703,4 +9716,9 @@ function annMentionsGaParam(nodeIx: i32): boolean {
     }
   }
   false
+}
+
+// Whether source spelling `name` is written as one inline record (`{...}`, not a map).
+function nameWrittenAsShape(name: string): boolean {
+  nameIsBraceSpanEnds(name) && nameIsShapeOpen(name)
 }
