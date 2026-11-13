@@ -18,7 +18,8 @@
 // The origins file grades the census's own (emitter) sites. The report, by default
 // docs/internals/render-parse-sites.md, has one row per reached site of any compiler file: its
 // origin, the expression that produced its argument, the program count and a witness program.
-// `--check` exits 1 when the graded rows differ from the committed file's.
+// `--check` exits 1 when a live site's grade differs from the committed file's; a committed row
+// whose site no longer exists is ignored.
 
 const args = [...Deno.args];
 const opt = (name: string, dflt: string) => {
@@ -538,8 +539,12 @@ const main = async () => {
       try {
         old = Deno.readTextFileSync(ORIGINS);
       } catch { /* absent */ }
+      // A committed row whose site no longer exists is a deleted parse: a fall, never a failure.
+      const live = new Set(sites.filter((s) => s.inScope).map((s) => s.key));
       const rows = (t: string) =>
-        t.split("\n").filter((l) => l && !l.startsWith("#")).join("\n");
+        t.split("\n").filter((l) => l && !l.startsWith("#")).filter((l) =>
+          live.has(l.split("\t").slice(1).join("\t"))
+        ).sort().join("\n");
       if (rows(old) !== rows(text)) {
         console.log(
           `render-parse-origins: ${ORIGINS} is stale; rerun without --check`,
