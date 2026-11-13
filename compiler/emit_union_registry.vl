@@ -84,7 +84,7 @@ import {
   unVarStart,
 } from "./emit_state"
 import { sidArrGet, sidLookup } from "./symbols"
-import { roListInnerName, splitUnionAtoms, tyTopIndexOf } from "./tyname"
+import { roListInnerName, tyTopIndexOf } from "./tyname"
 import { flattenVariantsInto, isNullTy, primNameOf } from "./tyquery"
 
 // The non-null member `X` when type `t` is exactly `X | null`, -1 otherwise.
@@ -174,53 +174,17 @@ export function unionMemberAtomsOfRow(u: i32, out: string[]): boolean {
   true
 }
 
-// Appends the member atoms of `name` to `out`, in box-tag order: a bound row's recorded
-// members, else the atoms `name` itself spells. An alias name answers with its declared arms.
+// Appends the member atoms of `name`'s bound row to `out`, in box-tag order. An alias name answers
+// with its declared arms; a name no row binds is a compile failure.
 export function unionMemberAtomsOf(name: string, out: string[]) {
   const u = unMemRowOfName(name)
-  if u < 0 { return unionSetAtomsOf(unionMemberSetOf(name), out) }
+  if u < 0 {
+    emitFail(
+      "emitProgram: a union's member atoms were asked of a name no row binds",
+    )
+    return 0
+  }
   unRowAtomsInto(u, out)
-}
-
-// Appends the atoms member-set spelling `set` splits into, in box-tag order: the recorded
-// members of the row whose set is `set` itself, else one atom for a declared type name or a
-// primitive keyword (neither spells a top-level `|`), else the split.
-export function unionSetAtomsOf(set: string, out: string[]) {
-  const u = unMemRowOfName(set)
-  if u >= 0 && unMemberSet[u] == set { return unRowAtomsInto(u, out) }
-  if (cUserTypes[set] ?? -1) >= 0 || primTyIxOfName(set) >= 0 {
-    out.push(set)
-    return 0
-  }
-  splitUnionAtoms(set, out)
-}
-
-// `unionSetAtomsOf` for a caller holding `ty`, the arena type `set` is a render of, or -1. A
-// type that is neither a union nor a nullable renders as one atom, and a nullable of one (or of
-// a union named by its alias) as that atom then `null`; only the rest are split.
-export function unionSetAtomsOfTy(set: string, ty: i32, out: string[]) {
-  if ty < 0 || ty >= T.tys.length { return unionSetAtomsOf(set, out) }
-  const t = tyAt(ty)
-  if !(t is TyUnion) && !(t is TyNullable) {
-    out.push(set)
-    return 0
-  }
-  if t is TyNullable {
-    const n = set.length - 5
-    if n > 0 && t.nInner >= 0 && set.slice(n, set.length) == "|null" {
-      const it = tyAt(t.nInner)
-      const inner = set.slice(0, n)
-      if (
-        !(it is TyNullable)
-        && (!(it is TyUnion) || (cUserTypes[inner] ?? -1) >= 0)
-      ) {
-        out.push(inner)
-        out.push("null")
-        return 0
-      }
-    }
-  }
-  unionSetAtomsOf(set, out)
 }
 
 // Whether the box of member set `s` carries a member as a string ref, counted over its member
@@ -314,7 +278,7 @@ export function tyBoxTakesAtomAsStr(ty: i32): boolean {
 // row's recorded members.
 export function unionNameNonNullCountTy(name: string, ty: i32): i32 {
   const u = unMemRowOfName(name)
-  if u < 0 { return unionSetNonNullCountTy(unionMemberSetOf(name), ty) }
+  if u < 0 { return unionSetNonNullCountTy(ty) }
   const st = unMemTyStart[u]
   let n = 0
   let i = 0
@@ -348,7 +312,7 @@ export function unionArmsOf(name: string, out: string[]) {
 }
 
 // `unionArmsOf` for a caller holding the arena type `ty` of `name`, or -1: the row keyed by
-// `ty` answers, else the atoms `ty` renders as (`unionSetAtomsOfTy`), before any split.
+// `ty` answers, else the members of `ty`'s own set (`msSetOfTyAny`).
 export function unionArmsOfTy(name: string, ty: i32, out: string[]) {
   unionArmsOfSetTy(name, msSetOfTy(ty), ty, out)
 }
@@ -374,10 +338,17 @@ function unionArmsOfSetTy(name: string, s: i32, ty: i32, out: string[]) {
     return nm
   }
   if msMemberAtomsOfSet(s, out) { return nm }
-  if nm == name {
-    unionSetAtomsOfTy(nm, ty, out)
-  } else {
-    unionSetAtomsOf(nm, out)
+  if nm != name {
+    emitFail(
+      "emitProgram: an alias's member atoms were asked of its declared spelling",
+    )
+    return nm
+  }
+  // A spelling no row binds answers from the type it renders: its own member set.
+  if ty < 0 || !msMemberAtomsOfSet(msSetOfTyAny(ty), out) {
+    emitFail(
+      "emitProgram: a union's member atoms were asked of a type with no member set",
+    )
   }
   nm
 }
@@ -1512,20 +1483,15 @@ export function unionSetHasNullTy(set: string, ty: i32): boolean {
   unionHasAtom(set, "null")
 }
 
-// CARDINALITY of a member set's non-`null` members, structurally; `ty` is `set`'s arena type
-// when the caller holds it, or -1.
-export function unionSetNonNullCountTy(set: string, ty: i32): i32 {
-  const s = msSetOfTy(ty)
+// CARDINALITY of the non-`null` members of type `ty`'s member set (row or not). A type with no
+// member set is a compile failure.
+export function unionSetNonNullCountTy(ty: i32): i32 {
+  const s = msSetOfTyAny(ty)
   if s >= 0 { return msNonNullCount(s) }
-  const atoms: string[] = []
-  unionSetAtomsOf(set, atoms)
-  let n = 0
-  let i = 0
-  while i < atoms.length {
-    if atoms[i] != "null" { n = n + 1 }
-    i = i + 1
-  }
-  n
+  emitFail(
+    "emitProgram: a union's non-null members are counted over a type with no member set",
+  )
+  0
 }
 
 // ── the arena duals of the union structural member classifiers ─────────────────

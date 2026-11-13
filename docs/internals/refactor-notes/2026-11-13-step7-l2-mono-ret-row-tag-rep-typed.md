@@ -1,12 +1,12 @@
 # Step 7 L2, mono: `retStructRowIndex` answers a tagged record's stored row by type (2026-11-13)
 
-Lane D. Base `739db770`. Inventory row D16020.
+Lane D. Measured on base `739db770`; byte comparison re-run on master `3ce5ee4b`. Inventory row D16020.
 
 ## Cut
 
 - `retStructRowIndex` (`emit_nullable_rets.vl`) gets a first rung. A record type holding a
-  tagged set answers the row of the type it is stored at, via `monoTagMapRepTy`, which
-  `emitProgram` installs as `tagRepTyFn` (the `tagRepNameFn` pattern).
+  tagged set answers the row of the type it is stored at, via `monoTagMapRepTy`. It reads it
+  through `tagRepTyFn` (`emit_shape_rows.vl`), the hook #7735 installed in `emitProgram`.
 - The rest of the typed ladder moves into `retStructRowOfTy`.
 - The `#anonN` label rung is demoted. It used to answer first. It now answers only when its row
   disagrees with `retStructRowOfTy`, and it is a loud `emitFail` floor citing D16020 when no

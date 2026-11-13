@@ -9,6 +9,22 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-w311-d6-field-elem-same-by-type](2026-11-13-w311-d6-field-elem-same-by-type.md): Step 7 L2 D6: two field slots hold one element by type, not by name, 2026-11-13
+- [2026-11-13-step7-vkind-wasmemit-elem-readers](2026-11-13-step7-vkind-wasmemit-elem-readers.md): Step 7, lane H: `wasmEmit`'s `sFieldElemName` readers, 2026-11-13
+- [2026-11-13-step7-vkind-field-elem-hint-cut-3](2026-11-13-step7-vkind-field-elem-hint-cut-3.md): Step 7, lane H: field element hints, cut 3, and the fallback's contract, 2026-11-13
+- [2026-11-13-step7-union-reg-une-typed-wrappers](2026-11-13-step7-union-reg-une-typed-wrappers.md): Step 7 L6 (lane G, cut 8a): the union-name wrappers answer from types; the producer is one floor, 2026-11-13
+- [2026-11-13-step7-union-reg-une-recursion](2026-11-13-step7-union-reg-une-recursion.md): Step 7 L6 (lane G, cut 8b): the producer's own recursion reads the typed wrapper, 2026-11-13
+- [2026-11-13-step7-union-reg-mem-field-box](2026-11-13-step7-union-reg-mem-field-box.md): Step 7 L6 (lane G, cut 9a): a field read's union box is named off its element type, 2026-11-13
+- [2026-11-13-step7-nullable-miss-names-its-union](2026-11-13-step7-nullable-miss-names-its-union.md): A nullable's miss names its non-null part's union; the floor keeps only function values, 2026-11-13
+- [2026-11-13-step7-lane-e-wider-row-by-type](2026-11-13-step7-lane-e-wider-row-by-type.md): Step 7 D6: the wider-row find reads no field text, 2026-11-13
+- [2026-11-13-step7-lane-e-struct-elem-arm-by-type](2026-11-13-step7-lane-e-struct-elem-arm-by-type.md): Step 7 D6: a closure-result list field's struct element is told from a union arm by its type, 2026-11-13
+- [2026-11-13-step7-lane-e-nonnul-last-callers](2026-11-13-step7-lane-e-nonnul-last-callers.md): Step 7 D6: lane E's last `nonNulBaseOf` callers go, 2026-11-13
+- [2026-11-13-step7-l6-union-eq-names-by-box-type](2026-11-13-step7-l6-union-eq-names-by-box-type.md): Step 7 L6: union `==` names its operands from their box types, 2026-11-13
+- [2026-11-13-step7-l2-mono-tag-map-rep-ty](2026-11-13-step7-l2-mono-tag-map-rep-ty.md): Step 7 L2: the tagged-set stored-type speller answers the type, 2026-11-13
+- [2026-11-13-step7-d6-code0-fit-by-type](2026-11-13-step7-d6-code0-fit-by-type.md): Step 7 D6: the code-0 fit test reads the record's field types, 2026-11-13
+- [2026-11-13-step7-d6-arm-field-row-by-type](2026-11-13-step7-d6-arm-field-row-by-type.md): Step 7 D6: a union arm's record field interns its row from the field's element type, 2026-11-13
+- [2026-11-13-step7-cloned-is-test-by-type](2026-11-13-step7-cloned-is-test-by-type.md): Step 7: a cloned `is` test keeps its elaborated type, 2026-11-13
+- [2026-11-12-step7-g-slices-by-type](2026-11-12-step7-g-slices-by-type.md): Step 7, L6: two of lane G's union readers by type, 2026-11-12
 - [2026-11-13-step7-vkind-struct-elem-name-by-type](2026-11-13-step7-vkind-struct-elem-name-by-type.md): Step 7, lane H: the FC_STRUCT element name producers, 2026-11-13
 - [2026-11-13-step7-vkind-field-elem-hint-cut-2](2026-11-13-step7-vkind-field-elem-hint-cut-2.md): Step 7, lane H: field element hints, cut 2, 2026-11-13
 - [2026-11-13-step7-union-reg-box-atoms](2026-11-13-step7-union-reg-box-atoms.md): Step 7 L6 (lane G, cut 7a): the box-atom retags and three dead spellings read member sets, 2026-11-13
