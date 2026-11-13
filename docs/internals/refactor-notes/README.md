@@ -9,6 +9,18 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-12-w311-d6-step1a-field-code-by-type](2026-11-12-w311-d6-step1a-field-code-by-type.md): Step 7 D6 step 1a: the interner codes a field from its type, and the closure-signature column takes no text, 2026-11-12
+- [2026-11-12-step7-vkind-mv-union-row-by-type](2026-11-12-step7-vkind-mv-union-row-by-type.md): Step 7, lane H: a map's union value slot by its row, 2026-11-12
+- [2026-11-12-step7-union-reg-let-box](2026-11-12-step7-union-reg-let-box.md): Step 7 L6 (lane G, cut 6c): a let binding's union box by its type, 2026-11-12
+- [2026-11-12-step7-union-box-eq-columns-by-type](2026-11-12-step7-union-box-eq-columns-by-type.md): A box `==`'s arm columns are read from the union's type, 2026-11-12
+- [2026-11-12-step7-struct-row-of-spelling-deleted](2026-11-12-step7-struct-row-of-spelling-deleted.md): Step 7, L6: `structRowOfSpelling` deleted, 2026-11-12
+- [2026-11-12-step7-snameix-contract](2026-11-12-step7-snameix-contract.md): Step 7, L6: the spelling-keyed registries, and `sNameIx`'s contract, 2026-11-12
+- [2026-11-12-step7-lane-e-intern-register-of-ty](2026-11-12-step7-lane-e-intern-register-of-ty.md): Step 7 L6: the shape interner registers its value unions from their types, 2026-11-12
+- [2026-11-12-step7-l2-mono-tag-map-rep-by-type](2026-11-12-step7-l2-mono-tag-map-rep-by-type.md): Step 7 L2: a tagged set's map or record pin is spelled from its stored type, 2026-11-12
+- [2026-11-12-step7-l2-mono-registries-by-slot](2026-11-12-step7-l2-mono-registries-by-slot.md): Step 7 L2: mono's instance registries are keyed by type and by instance slot, 2026-11-12
+- [2026-11-12-step7-l2-mono-anon-row-depth-by-type](2026-11-12-step7-l2-mono-anon-row-depth-by-type.md): Step 7 L2: a literal row's list pin takes its depth from the list type, 2026-11-12
+- [2026-11-12-step7-d15958-variant-row-by-type](2026-11-12-step7-d15958-variant-row-by-type.md): Step 7, L6: D15958 closed, and `typeDeclMintsRow` by type, 2026-11-12
+- [2026-11-12-step7-atom-kind-arm-by-set](2026-11-12-step7-atom-kind-arm-by-set.md): Step 7 L6: `unionHasAtomKindArm` reads the member set, 2026-11-12
 - [2026-11-12-w311-sfieldrefslot-no-name-rung](2026-11-12-w311-sfieldrefslot-no-name-rung.md): Step 7: `sFieldRefSlot` reads no element name, 2026-11-12
 - [2026-11-12-w311-d6-cut3-field-elem-row-by-type](2026-11-12-w311-d6-cut3-field-elem-row-by-type.md): Step 7 D6 cut 3: a struct or arm field's element row is recorded from its type, 2026-11-12
 - [2026-11-12-step7-wide-retag-arms-by-type](2026-11-12-step7-wide-retag-arms-by-type.md): The wide-arm box and its retag pairs read a union's arms by type, 2026-11-12
