@@ -52,8 +52,6 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 
 | lane | sites |
 | --- | --- |
-| G | D16000: one type, two `unNames` rows (A's canonical-key probe, #7760) |
-| A | D16001: one type, two ref-list rows (the same probe) |
 | A | `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`), after E's step (d), which waits on F's last `ftxt` readers in `shapeFieldElemName` |
 
 ## The renders at this draft (master `537a04cc`, coordinator's measurement)
@@ -150,6 +148,8 @@ is the checker's job. A checker parse reached from emit whose input the emitter 
 (`synthTypeRefFb` → `recordClonedNodeTyFb`) is in scope, whatever file holds the parser. Lane I
 then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
 §3.3's sentence "parses no type spelling back" waits on that.
+
+**On master `39f3f015`:** 44 render or synthesized parses, 12 source, 36 unclassified; with #7764's widened render set, 101 renders and 44 display renders. D16000 (#7772) and D16001 (#7775) are closed. D16022 is filed (#7762). Lane H's #7776 counts programs that end in a refusal: `mapSoftTwinTagFail` now shows 2 programs (`generics/error-literal-union-map-twin-through-one-instance-plain-first.vl`), which settles the conflict; `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` stay at 0. New rows D16050 and D16051 (#7777): a union member's box code is a fact about its spelling, filed runs today.
 
 **On master `23e03fce`:** 47 render or synthesized parses, 12 source, 40 unclassified, 13 renders. Since 08:15: P1 parts 1 and 2 (#7752, #7770), P4's `gaeEnsure` and gates (#7757), P6 (#7761, #7769), `arenaEmitName` down to 4 callers (#7763), G's literal-arm question (#7766), and `nodeArrayElemName` graded a floor (#7760; D16000 and D16001 filed).
 
@@ -251,7 +251,7 @@ its witness runs as filed on master `54b68c07`. The close carries them forward.
 | [D16060](../inventory/D16060.md) | `printUnionPlanCode`'s name fallback | a field read through an un-annotated parameter stays typed at the hole in its instance |
 | [D16061](../inventory/D16061.md) | the field recorder | an anonymous record handed to an un-annotated parameter keeps its field typed at the hole, so the recorder resolves the element's name |
 | [D16012](../inventory/D16012.md) (lands with lane B's PR; not on master at this draft) | `letDeclResolveAnnot`'s residual re-parse | it re-parses only when two bound type parameters share a name or a type variable survives `substTyDeep`, where substitution by name can answer a concrete but wrong type; a checker gap (`generics/nested-generic-shadowed-param-capture.vl`) |
-| D16022 (lane D's #7762, unfiled on master at this draft) | `monoArgTyNameRep`'s residual census site | a record-list literal argument with an open element type (a hole function or a type parameter) pins by its element's name; the pin must be chosen after the callee instance resolves, a mono reorder beyond step 7 (7 programs, all running, the scope loud) |
+| [D16022](../inventory/D16022.md) | `monoArgTyNameRep`'s residual census site | a record-list literal argument with an open element type (a hole function or a type parameter) pins by its element's name; the pin must be chosen after the callee instance resolves, a mono reorder beyond step 7 (7 programs, all running, the scope loud) |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
 
