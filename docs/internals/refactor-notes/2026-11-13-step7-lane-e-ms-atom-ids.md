@@ -36,4 +36,4 @@ programs. A control fired.
 - Sweep with fixpoint seeds on both sides, master `580eb218` against the candidate: 24,224 same,
   0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
 - `scripts/gate.sh`: all rows pass.
-- Render-parse census: `msAtomIdOf`'s `peelGroupParens` entry leaves, so `ty-string-parse` goes from 20 to 19.
+- Render-parse census: `msAtomIdOf`'s `peelGroupParens` entry leaves, so `ty-string-parse` goes from 19 to 18.
