@@ -50,3 +50,21 @@ so B's 471-program agreement stands without a re-run.
 - **Census:** does not move, since `declTyIxOfName` is graded once for the whole
   function.
 - `deno task test` passes (8,760), and rep-fuzz-check is exact.
+
+## Keeping the two faces from drifting
+
+`unionSpellingOfTy` and `unionSpellingTyOf` encode one set of rules, so one
+should derive from the other. Spelling the twin's type with the emit render was
+tried first: it is not byte-identical, 99 of 6,697 programs differ. A list arm's
+element is spelled by its nominal name in the spelling but structurally by
+`tyToEmitName`, and the render declines a few others. So both faces stay, and
+drift fails loudly instead:
+
+- **Shadow compare:** under `$VL_REP_SHADOW` each mint from the twin also parses
+  the spelling and compares (`spellTy/checked`, `spellTy/disagree`, reported
+  after the shadow sweep by `spellTyShadowSweep`).
+- **Test:** `tests/vl_spell_ty_agreement_test.ts` asserts disagree is 0 and
+  checked is above 0 over the 151 `tests/cases` programs that reach the mint
+  (`tests/fixtures/spell-ty-agreement/witnesses.txt`).
+- **Control:** a twin drifted alone (its literal-run grouping disabled, the
+  spelling left alone) makes 18 of the 151 disagree, so the test fails.
