@@ -115,7 +115,7 @@ triage, by mechanism (sent to the coordinator to assign):
 
 | package | parser | sites | owner |
 | --- | --- | --- | --- |
-| P1 value-union-ness of a name | `isValueUnionName` | 16 | G 11 (union_atoms 5, wasmEmit 3, fn_scans, nullable_rets, start_block, collect:5429 = 12, less H's one), E 3 (shape_intern:317, `iisPushFieldElem` ×2), H 1 (`mvShapeOfValNameArmTyGo`) |
+| P1 value-union-ness of a name | `isValueUnionName` | 16 | G 12 (union_atoms ×5, wasmEmit ×3, fn_scans, nullable_rets, start_block, collect:5429); E 3 (shape_intern:317, `iisPushFieldElem` ×2); H 1 (`mvShapeOfValNameArmTyGo`) |
 | P2 atom kind of a member set's rendered atom | `valueAtomKind` | 13 | G/A: emit_rep ×2, union_casts, eq_rows, obj_lit_fits ×3, collect ×2, query, wasmEmit eq ×3 |
 | P3 shape-spelling grammar | `groupInnerOf`, `nameIsShapeSpanEnds`/`nameIsShapeOpen`, `tyTopLevelSplit`, `peelGroupParens`, … | 20 | E/F (D6): emit_base 9, shape_intern 5, collect 4; G: `msAtomIdOf`; classify: `identFnTypeAnnNameOfRead` |
 | P4 generic-application spelling | `gae*`, `annGenAppSpanEnds`, `nameMentionsGenAliasParam` | 11 | D/E: collect 8, `gaeEnsure`, `nameIsGenAppDecl`, `gaeParamShadowed` |
