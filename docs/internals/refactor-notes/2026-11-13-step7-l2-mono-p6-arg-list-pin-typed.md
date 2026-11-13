@@ -43,5 +43,5 @@ spelling. That is 8 decisions in 7 programs:
 - the `D9647` witness;
 - `d15203_run_param`.
 
-Closing it needs the elaborated instance type of the literal, which the census site stays open
+Filed as [D16022](../inventory/D16022.md). Closing it needs the elaborated instance type of the literal, which the census site stays open
 for.
