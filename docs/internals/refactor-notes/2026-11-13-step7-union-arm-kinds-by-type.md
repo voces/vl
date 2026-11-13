@@ -3,7 +3,7 @@
 `leqNoteUnionArms` (emit_collect) and `unionArmsNeedCloEq` (emit_eq_rows) reserve compare frames
 for a union operand's arms. Each read an arm's box kind by parsing its atom with `valueAtomKind`.
 They now take `unionArmKindRowsOfExpr` (emit_classify). It gives each arm's kind as
-`unionArmBoxKind(ty)`: `boxTagOfTy`, with `null` (-1) as 6, and -1 for a literal or literal-union
+`boxAtomKindOfMemberTy(ty)` (emit_rep, shared with lane D's #7820): `boxTagOfTy`, with `null` (-1) as 6, and -1 for a literal or literal-union
 arm, matching what the name parse gave those arms. `unionArmRowsOfExpr` and
 `unionArmAtomsOfExpr` are deleted.
 
