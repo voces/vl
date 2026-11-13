@@ -36,7 +36,7 @@ eight feed a decision, so all are failing:
 
 | site                                  | what the output feeds                                           | owner |
 | ------------------------------------- | --------------------------------------------------------------- | ----- |
-| emit_classify `memReadBoxPlan` ×2     | `boxNarrowAtomFor` kinds and the narrowing choice               | D     |
+| emit_classify `memReadBoxPlan` ×2     | `boxNarrowAtomFor` kinds and the narrowing choice               | A     |
 | wasmEmit `boxNarrowScalarKinds` ×2    | `valueAtomKind` → the conversion opcode                         | A     |
 | wasmEmit `emitBoxAtomRetagTys` ×2     | the retag arms                                                  | A     |
 | emit_collect `riuMemberTys`           | registry member types, deduped by canon spelling (changes rows) | G     |
@@ -45,7 +45,10 @@ eight feed a decision, so all are failing:
 The budget rises by exactly these eight `ty-string-parse` entries: emit_classify
 0 → 2, emit_collect 4 → 5, emit_union_registry 0 → 1, wasmEmit 3 → 7 (total 14 →
 22, then 18 once the two floored `ty-string-parse` sites move to `ty-carried-floor`).
-The rise is a correction, not a regression.
+The rise is a correction, not a regression. The render→parse itself is the walk's
+dedupe (`canonUnionMembersWalk` in check_program, owner A), which the emitter-only census
+cannot see; `riuMemberTys` reads only the member types and stands in for that one walk site, so
+the count is the walk plus the seven callers that read the returned names.
 
 ## The regeneration
 
