@@ -105,6 +105,7 @@ import {
   mapTyValKindLowerable,
   nulRefListFieldCodeOfTy,
   repStructRowIsOrTwin,
+  repStructRowOfTy,
   shapeFieldElemName,
   structRowOfRecordTy,
   tagRepTyFn,
@@ -174,7 +175,7 @@ import {
 } from "./emit_union_registry"
 import {} from "./strutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
-import { groupInnerOf, nameStripSpaces } from "./tyname"
+import { groupInnerOf } from "./tyname"
 import {
   litPeekBaseTy,
   nonNullTy,
@@ -186,14 +187,16 @@ import {
 } from "./tyquery"
 
 // The refusal of a field type both the rep descriptor and the field-code ladder decline.
+const FIELD_UNION_FOLDED_ONLY_MSG = "emitProgram: a union field's row is found only under a "
+  + "structurally equal member set, and its type keys no row"
 const NESTED_FIELD_UNCODED = "emitProgram: a field's type has no storage code: the rep "
   + "descriptor declined it and the field-code ladder has no arm for it"
 
-// The field code of a field spelled `t` whose recorded arena type is `ty` (-1 for none): read
-// off the type (`fieldCodeOfTyCovered`), and from the ladder (`fieldCodeOfDeclinedTy`) only where the
-// type declines, then the `S[] | null` rung. A type parameter's field is uncoded: its row is the
-// generic original's, which no emitted read uses, and each instance mints its own.
-export function nameFieldCodeTy(t: string, ty: i32): i32 {
+// The field code of a field whose recorded arena type is `ty` (-1 for none): read
+// off the type (`fieldCodeOfTyCovered`), and from the ladder (`fieldCodeOfDeclinedTy`) only where
+// the type declines, then the `S[] | null` rung. A type parameter's field is uncoded: its row is
+// the generic original's, which no emitted read uses, and each instance mints its own.
+export function nameFieldCodeTy(ty: i32): i32 {
   const a = fieldCodeOfTyCovered(ty)
   if a != -2 { return a }
   if ty >= 0 && tyHasTyVar(ty) { return -1 }
@@ -202,11 +205,10 @@ export function nameFieldCodeTy(t: string, ty: i32): i32 {
   // A union whose row its type keys, though its spelling does not: `null` before a member
   // keeps the name off the row (D10410).
   if ty >= 0 && unRowOfTyKey(ty) >= 0 { return FC_UNION }
-  // A union whose row is filed under a structurally equal member set (`i32 | Q` against the
-  // row for `i32 | {q: string}`), asked by type. A spaced spelling stays off it: its record is
-  // minted under the spaced name, which the compact struct lookup would then miss.
-  if ty >= 0 && nameStripSpaces(t) == t && unRowOfCanonFolded(ty) >= 0 {
-    return FC_UNION
+  // A union whose row is filed only under a structurally equal member set (`i32 | Q` against
+  // the row for `i32 | {q: string}`) has no field code by its type.
+  if ty >= 0 && unRowOfCanonFolded(ty) >= 0 {
+    return emitFail(FIELD_UNION_FOLDED_ONLY_MSG)
   }
   // The last rung of the NODE ladder, which this one lacked: `nameIsNulRefList` resolves
   // through the struct table, so a shape whose field is `S[] | null` coded -1 whenever it is
@@ -402,7 +404,7 @@ export function funcTypeShapeLowerable(ty: i32): boolean {
   let fi = 0
   while fi < t.objFieldNames.length && fi < t.objFieldTypes.length {
     const fTy = t.objFieldTypes[fi]
-    const fc = nameFieldCodeTy("", fTy)
+    const fc = nameFieldCodeTy(fTy)
     if fc < 0 {
       // The descriptor codes every closed record, so an uncoded field is one both it and
       // the ladder decline.
@@ -765,9 +767,13 @@ export function internArmShapeRow(vi: i32): i32 {
     iasRow = []
   }
   if vi < iasDone.length && iasDone[vi] == aty + 1 { return iasRow[vi] }
-  // D34 — no arena hint: banking `tyIx` into `sTyIx` would make `structIndexOfTy` answer this
-  // row for the arm's own node, turning off D34's decline module-wide. Found structurally
-  // instead; the arm's type reaches only its fields' element names.
+  // A row the type already has is the arm's row: one row per type, whatever its label.
+  const own = repStructRowOfTy(aty)
+  if own >= 0 {
+    iasNote(vi, aty, gen, own)
+    return own
+  }
+  // The row is minted with the arm's type as its type: an arm is a reference to its type's row.
   let spell = armMintRenderOf(aty)
   if spell == "" { spell = tyToEmitName(aty) }
   if armHasInlineLitUnionField(aty) {
@@ -780,19 +786,24 @@ export function internArmShapeRow(vi: i32): i32 {
   iasMintVi.push(vi)
   iasMintNm.push(nm)
   iasMintDepth.push(iisBusy + 1)
-  const r = internInlineShapeFieldsTy(nm, -1, aty)
+  const r = internInlineShapeTy(nm, aty)
   iasMintVi.pop()
   iasMintNm.pop()
   iasMintDepth.pop()
-  if tyRegGenNow() == gen {
-    while iasDone.length <= vi {
-      iasDone.push(0)
-      iasRow.push(-1)
-    }
-    iasDone[vi] = aty + 1
-    iasRow[vi] = r
-  }
+  iasNote(vi, aty, gen, r)
   r
+}
+
+// Banks `r` as arm `vi`'s row for type `aty` when the registry has not moved since `gen`.
+function iasNote(vi: i32, aty: i32, gen: i32, r: i32) {
+  if tyRegGenNow() != gen { return 0 }
+  while iasDone.length <= vi {
+    iasDone.push(0)
+    iasRow.push(-1)
+  }
+  iasDone[vi] = aty + 1
+  iasRow[vi] = r
+  0
 }
 
 // The arms being minted, innermost last: variant row, the name its row is pushed under, and the
@@ -1046,7 +1057,8 @@ function internInlineShapeTyGo(
       const fldTy = rawTys[fi]
       if fldTy < 0 { return emitFail(IIS_SHAPE_FIELD_NO_LAYOUT_MSG) }
       internShapeDeepTy(fldTy)
-      let fc = nameFieldCodeTy("", fldTy)
+      // The field's code is read off its type.
+      let fc = nameFieldCodeTy(fldTy)
       if fc < 0 {
         // A nested inline-shape field interns the nested shape and stores a struct ref on it.
         if nestedFieldShapeRow(fldTy) >= 0 {
@@ -1183,10 +1195,7 @@ export function internShapeAs(key: string, nm: string) {
     if rawNames[fi] == "" {
       return emitFail("emitProgram: malformed struct field")
     }
-    const fc = nameFieldCodeTy(
-      rawTexts[fi],
-      shapeFieldRowOf(fieldsTy, rawNames[fi]),
-    )
+    const fc = nameFieldCodeTy(shapeFieldRowOf(fieldsTy, rawNames[fi]))
     if fc < 0 {
       return emitFail(
         fieldTypeRefusalMsg(
