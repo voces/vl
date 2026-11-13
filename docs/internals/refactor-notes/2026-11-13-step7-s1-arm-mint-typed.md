@@ -30,10 +30,19 @@ answered for an arm mint (all 2,984 reached the push). The banked `sTyIx` is the
 | sweep | same | bytes-only movers | output movers | runs → not-runs | new compiler traps |
 |---|---|---|---|---|---|
 | plain | 24,201 | 14 | 0 | 0 | 0 |
-| armed (`VL_OPAQUE_SNAMES=1`) | ARMED_SAME | ARMED_BYTES | ARMED_OUT | ARMED_LOST | ARMED_TRAPS |
+| armed (`VL_OPAQUE_SNAMES=1`) | 24,179 | 33 | 3, all now running | 0 | 0 |
 
 The 14 plain byte movers reorder the type section only: the same type count and module size, with
 two types exchanging indices. They are the D411, D741, D814 and D851 distilled cells,
 `spread-boxes-nested-and-pushed`, `inferred-return-narrowed-arm` and the two
 `nullable-variant-list-element-inferred` cases. The armed sweep ran on a host built after #7661;
 D12340's witness builds to different bytes armed and unarmed and prints `6` both ways.
+
+Armed, the three output movers are programs that failed before and now run:
+- D15151's witness and `unions/struct-holding-arm-with-record-map-value` were invalid modules.
+- `maps/narrowed-map-place-object-value` was refused as `map-value layout twins resolved different
+  vals wrappers`.
+
+Each now prints its expected output, armed and unarmed. With opaque labels, an arm's unlabelled
+row was the one the map-value and twin lookups could not find by type; a row carrying its type is
+found. The 33 armed byte movers are the same type-section reordering as the plain ones.
