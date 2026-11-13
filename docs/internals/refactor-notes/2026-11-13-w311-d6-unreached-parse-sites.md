@@ -57,11 +57,12 @@ now a refusal, not a resolution.
 Sweep with fixpoint seeds, all the same both times (0 bytes-only movers, 0 output movers, 0 runs →
 not-runs, 0 new traps):
 - master `846a645b` → this: 24,208 programs;
-- master `32ab5241` → this branch with that master merged in: 24,209 programs.
+- master `32ab5241` → this branch with that master merged in: 24,209 programs;
+- master `9b46a53b` → this branch with that master merged in: 24,211 programs.
 
-Render-parse census on the merged tree: ty-parse-unclassified goes from 52 to 33.
-- 17 entries are this PR's sites. The two `unionHasAtomTy` entries are #7758's deletion, which
-  had not lowered the baseline.
-- One entry is added: the `annGenAppSpanEnds` floor. `scripts/render-parse-origins.txt` re-points `monoArgTyNameRep`'s graded
-site to ordinal 0. The cut removed the earlier `arrElemSuffixed` call, so the graded call's
-ordinal fell from 1 to 0.
+Render-parse census on the merged tree, at master `9b46a53b`: ty-parse-unclassified goes from 46
+to 29. That is 18 of this PR's entries leaving and one added, the `annGenAppSpanEnds` floor.
+
+`scripts/render-parse-origins.txt` re-points `monoArgTyNameRep`'s graded site to ordinal 0. The
+cut removed the earlier `arrElemSuffixed` call, so the graded call's ordinal fell from 1 to 0.
+Without this, the graded site would read as ungraded.
