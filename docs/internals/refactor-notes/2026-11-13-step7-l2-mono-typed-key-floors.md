@@ -36,6 +36,12 @@ by its canonical type, and keeps the text only for a binding with no closed type
 **That kept text is a named floor.** It is an open binding naming the enclosing instance's type
 parameter: 22 decisions in 12 programs.
 
+- **Contract:** "a type that holds a type parameter is not a rep" (§3.4, as ruled in #7654,
+  `2026-11-12-step7-vkind-uncovered-storage-rows.md`). An open binding has no closed type to
+  key by, so its text names the type parameter it stands for.
+- **Witness:** `tests/cases/generics/param-copied-into-two-type-params-called-apart.vl`. It
+  reaches the floor and runs, printing `w`, `3`, `v`, `4`.
+
 ## Measured
 
 A probe ran old and new `monoTypedExtra` side by side over the population:
