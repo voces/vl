@@ -174,6 +174,7 @@ import {
   TyUnion,
   TyVar,
   listArmFitAcrossReps,
+  memberTySame,
   mkArrayTy,
   mkNullableTyOf,
   numLitUnionBaseName,
@@ -201,6 +202,7 @@ import {
   tyMayHoldFn,
   tyNulLitUnionInner,
   tyNulNumScalarValKind,
+  tyPrimNameIs,
   tyPrimNameOf,
   tySame,
   tyScalarBasePrim,
@@ -1303,7 +1305,6 @@ import {
   mapTwinSame,
   refArrSlotTag,
   tyIsAtomLeafList,
-  unionTyArms,
   unionTyHasBoxKind,
   unionTyMemberTys,
   variantDiscrimFieldNeeded,
@@ -1473,7 +1474,6 @@ import {
   mapValueTyOf,
   nliNameOf,
   unRowOfRecordTy,
-  unionArmTyOfAtomTy,
   unionClosureArmTyOfRow,
   unionClosureArmTyOfTy,
   unionHasMapArmSlot,
@@ -11976,47 +11976,32 @@ function emitUnionUnionEq(
       "emitProgram: `==` over a struct union is not supported yet",
     )
   }
-  // The shared non-null arms, matched by atom, since atoms tag globally. Both operands' member
-  // lists come from the recorded member columns when the pool covers them — `msMemberAtomsOf`
-  // hands back exactly the atoms `splitUnionAtoms` would, in the row's recorded box-tag order —
-  // so the intersection walks two recorded lists. Each side declines independently.
-
-  // The membership compare stays the verbatim spelling compare `unionHasAtom` performs, not the
-  // keyword-primitive test of `unMemHasAtomRow`: an arm spelled `(() => i64)` or a litunion alias
-  // is a member here and answers no there. The left row's banked value-atom codes travel with the
-  // surviving arms, index-parallel to the atom column; an uncovered row marks its arms -2.
-  const lAtoms: string[] = []
+  // The shared non-null arms, matched by member type (`memberTySame`): each operand's member types
+  // come from its recorded member set, else from the union its read holds, and each side declines
+  // independently. The left set's banked kinds travel with the surviving arms, index-parallel to
+  // its member types; an uncovered set marks its arms -2.
   const lTys: i32[] = []
-  if msMemberAtomsOfSet(lsid, lAtoms) {
-    msMemberTysOfSet(lsid, lTys)
-  } else {
-    // The arms of the union the left read holds (`unionTyArms`); none when it covers none.
-    unionTyArms(unionBoxTyOfRead(lIx, fnIx), lAtoms, lTys)
+  if !msMemberTysOfSet(lsid, lTys) {
+    unionTyMemberTys(unionBoxTyOfRead(lIx, fnIx), lTys)
   }
   const lKinds: i32[] = []
   let lKindsOk = msMemberValKindsOf(lsid, lKinds)
-  if lKinds.length != lAtoms.length { lKindsOk = false }
-  const rAtoms: string[] = []
+  if lKinds.length != lTys.length { lKindsOk = false }
   const rTys: i32[] = []
-  let rOk = msMemberAtomsOfSet(rsid, rAtoms)
-  if rOk { msMemberTysOfSet(rsid, rTys) }
+  let rOk = msMemberTysOfSet(rsid, rTys)
   if !rOk {
-    // The right list needs the same alias expansion as the left. Without it the intersection
-    // below falls to `unionHasAtom(rname, …)`, which answers false for a declared union's own
-    // atoms, every arm is filtered out, and the loop emits nothing — so control reaches the
-    // tag-only fallback and `==` compares just the two tags (D989).
-    if (unionTyArms(unionBoxTyOfRead(rIx, fnIx), rAtoms, rTys)) { rOk = true }
+    // A right side with no recorded set still has its type's members; without them every arm
+    // would filter out and `==` would compare just the two tags (D989).
+    rOk = unionTyMemberTys(unionBoxTyOfRead(rIx, fnIx), rTys)
   }
-  const arms: string[] = []
+  const arms: i32[] = []
   const armKinds: i32[] = []
   let ai = 0
-  while ai < lAtoms.length {
+  while ai < lTys.length {
     let inR = false
     if rOk {
-      let rj = 0
-      while rj < rAtoms.length {
-        if rAtoms[rj] == lAtoms[ai] { inR = true }
-        rj = rj + 1
+      for rt in rTys {
+        if memberTySame(lTys[ai], rt) { inR = true }
       }
     } else {
       // The right operand's arms come from its member set or its box type; one with neither has
@@ -12025,29 +12010,26 @@ function emitUnionUnionEq(
         "emitProgram: union `==`: the right operand's arms are known from neither its member set nor its type",
       )
     }
-    if lAtoms[ai] != "null" && inR {
-      arms.push(lAtoms[ai])
+    const isNull = lTys[ai] < 0 || tyPrimNameIs(lTys[ai], "null")
+    if !isNull && inR {
+      arms.push(lTys[ai])
       if lKindsOk { armKinds.push(lKinds[ai]) } else { armKinds.push(-2) }
     }
     ai = ai + 1
   }
-  // The READ half of the banked-kind pair: the arm's recorded code, or a per-atom derivation
-  // where the bank did not cover the row. Both sides read the LEFT union's arm type — the
-  // intersection above matched the two arms by verbatim SPELLING, so they render the same
-  // signature and claim the same slot.
+  // The READ half of the banked-kind pair: the arm's recorded code, refined by its member type.
+  // Both sides read the LEFT union's arm type; the intersection above matched the two arms as the
+  // same member, so they claim the same slot.
   const armKs: i32[] = []
   const armTys: i32[] = []
   const cloTags: i32[] = []
-  const lTy = nodeTyAt(unwrapParen(lIx), fnIx)
   let ki = 0
   while ki < arms.length {
     let armK = armKinds[ki]
     if armK == -2 {
-      return emitFail(
-        "emitProgram: a union == arm has no banked kind: " + arms[ki],
-      )
+      return emitFail("emitProgram: a union == arm has no banked kind")
     }
-    const armTy = unionArmTyOfAtomTy(lname, lTy, arms[ki])
+    const armTy = arms[ki]
     armK = boxArmKindOfTy(armK, armTy)
     armKs.push(armK)
     armTys.push(armTy)
