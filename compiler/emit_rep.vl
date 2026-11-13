@@ -3407,6 +3407,111 @@ export function boxTagOfTy(ty: i32): i32 {
   btSoftOfTy(ty)
 }
 
+// Whether a value of type `ty` is a value-union box: the rep tree boxes it (`unionRepClassOfTy`'s
+// box, or a boxed nullable) and every arm, nested unions flattened and `null` aside, has a value
+// box tag (`boxTagOfTy`). A literal arm rides at its tag; a struct, map or ref-list arm makes a
+// struct union.
+export function valueBoxOfTy(ty: i32): boolean {
+  if !repBoxesTy(ty, 0) { return false }
+  const arms: i32[] = []
+  if !valueBoxArmsInto(ty, arms, 0) || arms.length == 0 { return false }
+  for m in arms {
+    if boxTagOfTy(m) < 0 { return false }
+  }
+  true
+}
+
+// `valueBoxOfTy` for a site that registers rows: a numeric literal set with `null` (`N | null`
+// over `N = 1 | 2`) is boxed, but no row is registered under it yet, so these sites say no (D16062).
+export function valueBoxRowOfTy(ty: i32): boolean {
+  !nulNumLitSetTy(ty) && valueBoxOfTy(ty)
+}
+
+// Whether `ty` is a numeric literal set with `null` (`N | null` over `N = 1 | 2`).
+function nulNumLitSetTy(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  if !(t is TyNullable) || t.nInner < 0 { return false }
+  const b = numLitUnionBaseTy(t.nInner)
+  if b < 0 || b == t.nInner { return false }
+  const bt = tyAt(b)
+  bt is TyPrim && bt.primName != "string" && bt.primName != "boolean"
+}
+
+// Whether the rep tree lowers `ty` as a union box or a boxed nullable, read off the same
+// classifiers `rtOfUnion` and `rtOfNullable` build from.
+function repBoxesTy(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+  const t = tyAt(ty)
+  if t is TyUnion {
+    const c = unionRepClassOfTy(ty)
+    if c == URC_SAME { return repBoxesTy(t.uMembers[0], depth + 1) }
+    return c == URC_BOX
+  }
+  if t is TyNullable {
+    const inner = t.nInner
+    if inner < 0 || nulInnerIsHole(inner) { return false }
+    if tyAt(inner) is TyNullable { return repBoxesTy(inner, depth + 1) }
+    return nulDisciplineOfTy(inner) == 4
+  }
+  false
+}
+
+// How the rep tree lowers union `ty` (`rtOfUnion`'s ladder, in its order): a string literal set
+// is the atom, its nullable the atom niche, one repeated arm that arm (a record arm the record
+// itself), lists spelling one list that list, a numeric literal set its base, then an open arm,
+// twin maps, a value or struct box, or no rep.
+const URC_ATOM = 0
+const URC_NUL_ATOM = 1
+const URC_SAME = 2
+const URC_SAME_RECORD = 3
+const URC_ONE_LIST = 4
+const URC_NUM_BASE = 5
+const URC_OPEN = 6
+const URC_MAP_TWIN = 7
+const URC_BOX = 8
+const URC_NONE = 9
+
+export function unionRepClassOfTy(ty: i32): i32 {
+  const t = tyAt(ty)
+  if !(t is TyUnion) { return URC_NONE }
+  if tyIsLitUnion(ty) { return URC_ATOM }
+  if tyIsNullableLitUnion(ty) { return URC_NUL_ATOM }
+  if unionArmsAllSame(t.uMembers) {
+    if tyAt(t.uMembers[0]) is TyObj { return URC_SAME_RECORD }
+    return URC_SAME
+  }
+  if oneListUnionRender(ty) != "" { return URC_ONE_LIST }
+  if numLitUnionBaseTy(ty) >= 0 { return URC_NUM_BASE }
+  if unionHasOpenMember(t.uMembers) { return URC_OPEN }
+  if mapTwinUnionMember(ty) >= 0 { return URC_MAP_TWIN }
+  if tyIsValueUnionBox(ty) { return URC_BOX }
+  URC_NONE
+}
+
+// Whether a nullable's inner `inner` is an inference hole nothing filled.
+function nulInnerIsHole(inner: i32): boolean {
+  const it = tyAt(inner)
+  it is TyVar && it.tvName.length > 0 && it.tvName[0] == '?'
+}
+
+// Appends `ty`'s arms to `out`: a union or nullable contributes its members, nested unions
+// flattened, `null` dropped; a string-literal union is one arm. False past a depth.
+function valueBoxArmsInto(ty: i32, out: i32[], depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+  const t = tyAt(ty)
+  if t is TyNullable { return valueBoxArmsInto(t.nInner, out, depth + 1) }
+  if t is TyUnion && (depth == 0 || !tyIsLitUnion(ty)) {
+    for m in t.uMembers {
+      if !valueBoxArmsInto(m, out, depth + 1) { return false }
+    }
+    return true
+  }
+  if t is TyPrim && t.primName == "null" { return true }
+  out.push(ty)
+  true
+}
+
 // `boxTagOfTy` where `btOfTy` leaves the union undecided: the one tag of its members once each
 // numeric literal is its base and equal members are one, else -1 (`i32[] | K[]` over `K = 0 | 1`
 // is the atom list; `K[] | J[]` over two string sets is two members).
@@ -3538,8 +3643,8 @@ function btGo(ty: i32): i32 {
       return btOfPrim(t.primName)
     }
     TyFunc => {
-      // A function value boxes at its rep: the closure ref, or a tagged set's i32 member id.
-      if repOfTy(ty).rdKind == "i32" { return 0 }
+      // A function value boxes at its rep: a tagged set's i32 member id, else the closure ref.
+      if fnTagTyIsTagged(ty) { return 0 }
       return 11
     }
     TyLit => {
@@ -3999,7 +4104,7 @@ export function tyIsNulScalarBox(ty: i32): boolean {
 export function nulScalarBoxAtomOf(inner: i32): i32 {
   if inner < 0 || inner >= T.tys.length { return -1 }
   rtSync()
-  if rtNulDiscOf(inner) != 4 { return -1 }
+  if nulDisciplineOfTy(inner) != 4 { return -1 }
   // A scalar rep's kind is its primitive's name, so the atom is that primitive's. A v128 or a
   // box boxes too, but neither is a scalar atom a miss can stand in for.
   const a = valueAtomKind(repOfTy(inner).rdKind)
@@ -4662,13 +4767,14 @@ function rtOfObjAs(memoTy: i32, objTy: i32, disc: i32, fieldTys: i32[]): i32 {
 }
 
 function rtOfUnion(ty: i32, members: i32[]): i32 {
+  const c = unionRepClassOfTy(ty)
   // A string literal union is the interned i32 atom, whatever its spelling.
-  if tyIsLitUnion(ty) { return rtLeafOf("atom", 0, "", ty) }
+  if c == URC_ATOM { return rtLeafOf("atom", 0, "", ty) }
   // D-NULLITHOME: the expanded nullable-litunion `"a" | "b" | null` is the same type
   // the two-part `K | null` spelling builds as a `nul` node (disc 3, atom-sentinel),
   // so building it identically here lets the hash-cons fold both spellings into one
   // node. Without this arm the tree answered "union" for a type every reader lowers as the i32 atom niche, giving invalid wasm.
-  if tyIsNullableLitUnion(ty) {
+  if c == URC_NUL_ATOM {
     const nix = rtAlloc("nul", ty, 3, "", -1)
     rtByTyPut(ty, nix)
     return rtCompleteChild(
@@ -4677,21 +4783,21 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
       ty,
     )
   }
-  if unionArmsAllSame(members) {
+  if c == URC_SAME_RECORD {
+    // The canonicalized `{a} & {b}` struct alias — a plain struct, never a variant:
+    // the emitter lowers a one-member union as the struct itself (disc 0). The
+    // member's own index agrees since variant-member registration is arity-aware (#920 irregularity (a)): a single-member decl never marks its member a variant.
     const m = tyAt(members[0])
-    if m is TyObj {
-      // The canonicalized `{a} & {b}` struct alias — a plain struct, never a variant:
-      // the emitter lowers a one-member union as the struct itself (disc 0). The
-      // member's own index agrees since variant-member registration is arity-aware (#920 irregularity (a)): a single-member decl never marks its member a variant.
-      return rtOfObjAs(ty, members[0], 0, m.objFieldTypes)
-    }
+    if m is TyObj { return rtOfObjAs(ty, members[0], 0, m.objFieldTypes) }
+  }
+  if c == URC_SAME {
     // Any other union of one type is that type.
     const k1 = rtGo(members[0])
     rtByTyPut(ty, k1)
     return k1
   }
   // Lists that all spell one list are that list: the first member with a flat kind decides.
-  if oneListUnionRender(ty) != "" {
+  if c == URC_ONE_LIST {
     for m in members {
       const k = rtGo(m)
       if repTreeVKind(k) != null {
@@ -4702,23 +4808,19 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
     return rtLeafOf("unsup", 0, "union:unclassified", ty)
   }
   // A numeric literal union (`0 | 1`) is stored as its base scalar.
-  const nb = numLitUnionBaseTy(ty)
-  if nb >= 0 {
-    const bk = rtGo(nb)
+  if c == URC_NUM_BASE {
+    const bk = rtGo(numLitUnionBaseTy(ty))
     rtByTyPut(ty, bk)
     return bk
   }
-  if unionHasOpenMember(members) {
-    return rtLeafOf("unsup", 0, "union:open", ty)
-  }
+  if c == URC_OPEN { return rtLeafOf("unsup", 0, "union:open", ty) }
   // Maps nothing can tell apart are the one map they all represent as (D15540).
-  const mt = mapTwinUnionMember(ty)
-  if mt >= 0 {
-    const mk = rtGo(mt)
+  if c == URC_MAP_TWIN {
+    const mk = rtGo(mapTwinUnionMember(ty))
     rtByTyPut(ty, mk)
     return mk
   }
-  if tyIsValueUnionBox(ty) {
+  if c == URC_BOX {
     const ix = rtAlloc("box", ty, 0, "", -1)
     rtByTyPut(ty, ix)
     const kids: i32[] = []
@@ -4736,7 +4838,7 @@ function rtOfUnion(ty: i32, members: i32[]): i32 {
 // The nullable DISCIPLINE for inner type `inner` — `rdNul`'s vocabulary
 // (1 nullable ref niche · 2 i32 sentinel 2 · 3 atom sentinel -1 · 4 boxed),
 // or 0 when no discipline exists (the nullable is a policy gap).
-function rtNulDiscOf(inner: i32): i32 {
+export function nulDisciplineOfTy(inner: i32): i32 {
   const it = tyAt(inner)
   match it {
     TyPrim => {
@@ -4750,9 +4852,9 @@ function rtNulDiscOf(inner: i32): i32 {
         "void" | "null" | "never" | "u8" => 0
       }
     }
-    // A function takes its own rep's discipline: the closure ref, or a tagged set's i32 id.
+    // A function takes its own rep's discipline: a tagged set's i32 id, else the closure ref.
     TyFunc => {
-      if rtKind[rtGo(inner)] == "i32" { return 4 }
+      if fnTagTyIsTagged(inner) { return 4 }
       1
     }
     TyObj | TyArray | TyMap => 1
@@ -4762,11 +4864,11 @@ function rtNulDiscOf(inner: i32): i32 {
       if tyIsValueUnionBox(inner) { return 4 }
       // A numeric literal union takes its base scalar's discipline.
       const nb = numLitUnionBaseTy(inner)
-      if nb >= 0 { return rtNulDiscOf(nb) }
+      if nb >= 0 { return nulDisciplineOfTy(nb) }
       // Lists that all spell one list take a list's discipline.
       if oneListUnionRender(inner) != "" { return 1 }
       // A one-member union takes its member's; `Json`'s `TyUnion[TyNullable(rest)]` holds its null.
-      if it.uMembers.length == 1 { return rtNulDiscOf(it.uMembers[0]) }
+      if it.uMembers.length == 1 { return nulDisciplineOfTy(it.uMembers[0]) }
       // Maps nothing can tell apart take their one map's niche.
       if mapTwinUnionMember(inner) >= 0 { return 1 }
       0
@@ -4774,12 +4876,12 @@ function rtNulDiscOf(inner: i32): i32 {
     // A doubled nullable takes the single one's discipline.
     TyNullable => {
       if it.nInner < 0 { return 0 }
-      rtNulDiscOf(it.nInner)
+      nulDisciplineOfTy(it.nInner)
     }
     // `"x" | null` is the atom sentinel; `1 | null` takes its base scalar's discipline.
     TyLit => {
       if it.litKind == "str" { return 3 }
-      rtNulDiscOf(litBaseTy(it))
+      nulDisciplineOfTy(litBaseTy(it))
     }
     // Negation and unnarrowable leaves — no discipline.
     TyNeg | TyVar | TyErr => 0
@@ -4790,16 +4892,14 @@ function rtOfNullable(ty: i32, inner: i32): i32 {
   // No inner type, or an inference hole nothing filled: only `null` reaches it.
   if inner < 0 { return rtLeafOf("null", 0, "", ty) }
   const it = tyAt(inner)
-  if it is TyVar && it.tvName.length > 0 && it.tvName[0] == '?' {
-    return rtLeafOf("null", 0, "", ty)
-  }
+  if nulInnerIsHole(inner) { return rtLeafOf("null", 0, "", ty) }
   // A doubled nullable is the single one.
   if it is TyNullable {
     const k = rtGo(inner)
     rtByTyPut(ty, k)
     return k
   }
-  const disc = rtNulDiscOf(inner)
+  const disc = nulDisciplineOfTy(inner)
   if disc == 0 { return rtLeafOf("unsup", 0, "nul:unclassified", ty) }
   const ix = rtAlloc("nul", ty, disc, "", -1)
   rtByTyPut(ty, ix)
@@ -5381,12 +5481,29 @@ function repShadowCheckTy(ty: i32) {
   // the moment it stops being load-bearing, which is exactly when drift stops being visible.
   hcCheckKey("mv", repMvValKey(ty), repMvValId(ty))
   const tix = repTreeOfTy(ty)
+  repShadowCheckValueBox(ty, tix)
   repShadowTys = repShadowTys + 1
   const reason = repTreeUnsupReason(tix)
   if reason == "" {
     repShadowReal = repShadowReal + 1
   } else {
     repShadowBumpReason(reason)
+  }
+  0
+}
+
+// `valueBoxOfTy`'s box decision against the tree built for `ty`: a union or nullable the tree
+// lowers as a `box` or a boxed `nul` must be the one `repBoxesTy` names, and no other.
+function repShadowCheckValueBox(ty: i32, tix: i32) {
+  const t = tyAt(ty)
+  if !(t is TyUnion) && !(t is TyNullable) { return 0 }
+  if tix < 0 { return 0 }
+  const k = rtKind[tix]
+  const treeBox = k == "box" || (k == "nul" && rtDisc[tix] == 4)
+  repShadowBumpReason("valueBox/checked")
+  if treeBox != repBoxesTy(ty, 0) {
+    repShadowBumpReason("valueBox/disagree")
+    repShadowNoteRaw("value-box ty=" + i32ToStr(ty))
   }
   0
 }
