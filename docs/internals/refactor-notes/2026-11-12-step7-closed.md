@@ -42,7 +42,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `846a645b`, 2026-11-13 07:15)
+## Still failing at this draft (master `32ab5241`, 2026-11-13 08:15)
 
 The close is opened when this list is empty, or holds only items with an open PR. Closed since
 the 23:00 draft: lane D's mono rows (#7681, #7688, #7699, #7708, #7710), lane F's `sFieldRefSlot`
@@ -106,6 +106,8 @@ is the checker's job. A checker parse reached from emit whose input the emitter 
 (`synthTypeRefFb` → `recordClonedNodeTyFb`) is in scope, whatever file holds the parser. Lane I
 then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
 §3.3's sentence "parses no type spelling back" waits on that.
+
+**On master `32ab5241`:** 61 render or synthesized parses, 12 source, 52 unclassified, 13 renders (#7751 P4, #7754 G's literal-arm column, #7755, #7756 E's field split, #7758 B since 07:15). `shapeWalkKeyOf` still decides: `ln == kn` picks the by-declaration path, and `ln` reaches `gaeEnsure`'s parse and the interner's key, so it stays failing (E/F, D6).
 
 **On master `846a645b`, after #7748 merged:** the census baseline reads 66 render or synthesized parses, 25 source, 54 unclassified and 13 renders (`arenaEmitName` is not yet among them).
 
