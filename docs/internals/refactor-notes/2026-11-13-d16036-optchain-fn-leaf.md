@@ -30,6 +30,10 @@ for a closure leaf field``). It was the last leaf rep `emitOptMemberValueGo` had
 - **Test:** `tests/cases/expressions/optchain-standalone-fn-leaf.vl`, five cells: a hit, a null
   receiver, a capturing closure with an argument, a nested chain, and a `?.` argument. On the base
   seed the file is refused at emit.
-- Sweep with fixpoint seeds on both sides: SWEEP.
-- Render-parse census: CENSUS.
+- Sweep with fixpoint seeds on both sides, master `15e3e80f` against the candidate:
+  - 24,257 same, **0 bytes-only movers**;
+  - 2 output movers, D16036's witness and the new test, both `emit_reject` → runs;
+  - 0 `runs → not-runs`, 0 new compiler traps. The refusal's new position is not part of the
+    sweep's record; the position test grades it.
+- Render-parse census: within budget, at the baseline. No entry entered or left.
 - `scripts/gate.sh`: all rows pass.
