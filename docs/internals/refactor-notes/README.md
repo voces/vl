@@ -9,6 +9,17 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-h-census-walk-rule](2026-11-13-h-census-walk-rule.md): 2026-11-13 — lane H: the canon member walk counts once, its callers only where they read names, 2026-11-13
+- [2026-11-13-h-ud-functype-arm](2026-11-13-h-ud-functype-arm.md): 2026-11-13 — lane H: a declared union's function member is grouped by its type, 2026-11-13
+- [2026-11-13-step7-d16032-coalesce-and-print-plan-read-row](2026-11-13-step7-d16032-coalesce-and-print-plan-read-row.md): Step 7 (lane D, D16032): the coalesce reservations and the print plan read the result's row, 2026-11-13
+- [2026-11-13-step7-d16032-map-arm-prepass-reads-row](2026-11-13-step7-d16032-map-arm-prepass-reads-row.md): Step 7 (lane D, D16032): the frame pre-pass's map-arm scans read the carried row, 2026-11-13
+- [2026-11-13-step7-d16052-member-tys-twin](2026-11-13-step7-d16052-member-tys-twin.md): D16052 close, step 1: `unionTyMemberTys`, a union's member types without its atoms, 2026-11-13
+- [2026-11-13-step7-lane-e-bool-leaf-arm](2026-11-13-step7-lane-e-bool-leaf-arm.md): Step 7: `unionHasBoolLeafArm` reads each arm's depth off its type, 2026-11-13
+- [2026-11-13-step7-lane-e-ref-array-arms](2026-11-13-step7-lane-e-ref-array-arms.md): Step 7: `registerRefArrayArmUnions` reads the arm's box tag off its type, 2026-11-13
+- [2026-11-13-step7-member-types-and-typed-membership](2026-11-13-step7-member-types-and-typed-membership.md): Box kinds and union membership read the member's type, 2026-11-13
+- [2026-11-13-step7-mv-struct-rungs-held-type](2026-11-13-step7-mv-struct-rungs-held-type.md): Step 7: the map-value struct rungs pass their held type, 2026-11-13
+- [2026-11-13-w311-d6-cbs-mono-parse](2026-11-13-w311-d6-cbs-mono-parse.md): Step 7 D6: the call-bind shadow parses mono's spelling itself, 2026-11-13
+- [2026-11-13-w311-d6-rl-inner-held-hint](2026-11-13-w311-d6-rl-inner-held-hint.md): Step 7 D6: a ref-list's inner row is keyed by the held element type, 2026-11-13
 - [2026-11-13-d16041-decl-union-dedupe](2026-11-13-d16041-decl-union-dedupe.md): D16041 — a declared union's equal anonymous record arms are one member, 2026-11-13
 - [2026-11-13-h-budget-derived-totals](2026-11-13-h-budget-derived-totals.md): Step 7, lane H: `--budget` baselines store codes, not totals, 2026-11-13
 - [2026-11-13-h-census-parent-grade](2026-11-13-h-census-parent-grade.md): Step 7, lane H: the render-parse census grades a split piece by its parent, and sees the canon member walk, 2026-11-13
