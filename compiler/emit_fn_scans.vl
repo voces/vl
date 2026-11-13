@@ -82,6 +82,7 @@ import {
   tyIsLitUnionOrLit,
   tyIsNullableLitUnion,
   tyNulInnerTy,
+  tySame,
 } from "./check_types"
 import {
   listGetStagesOperand,
@@ -191,7 +192,9 @@ import {
 import { ifArmValueExpr, paramTypeNodeOfRead } from "./emit_query"
 import { TK_STR, rlSlotIsKindList, tyKindOf } from "./emit_ref_list_kinds"
 import {
+  armDeclSame,
   boxAtomKindOfMemberTy,
+  boxTagOfTy,
   msMemberValKindsOf,
   nodeRepIs,
   nullValKind,
@@ -238,7 +241,7 @@ import {
   msSetOfTyAny,
   msSetTakesAtomAsStr,
   printNarrowKeepsBox,
-  printNarrowLiveAtoms,
+  printNarrowLiveTys,
   printPlanNullPinned,
   printPlanPinNull,
   tyDeclTakesAtomAsStr,
@@ -247,7 +250,6 @@ import {
   unionArmsOfRow,
   unionMemberAtomsOf,
 } from "./emit_union_registry"
-import { strListHas } from "./listutil"
 import { tyIsFnArmUnion, tyIsListUnion, tyStepElem, tyStepRet } from "./tyquery"
 
 // Classify the `.push` or `.pop` receiver at `objIx` into its PushKind bits with one classifier
@@ -2488,6 +2490,29 @@ function printPlanSetTys(s: i32, n: i32, out: i32[]): boolean {
   false
 }
 
+// Whether member type `t` (`null` as -1) is one of the narrowing's live members: the same box
+// arm, read off the value box tag where both have one (a literal union rides its base's arm),
+// else the same type under the same declaration.
+function printPlanTyLive(live: i32[], t: i32): boolean {
+  const tk = printPlanArmTag(t)
+  for l in live {
+    const lk = printPlanArmTag(l)
+    if tk >= 0 || lk >= 0 {
+      if tk == lk { return true }
+    } else if tySame(l, t) && armDeclSame(l, t) {
+      return true
+    }
+  }
+  false
+}
+
+// The value box tag member type `t` rides under (`null`, spelled -1 or as its primitive, is 6),
+// or -1 for a member with no value tag (a record, a map, a list of records).
+function printPlanArmTag(t: i32): i32 {
+  if t < 0 { return 6 }
+  boxTagOfTy(t)
+}
+
 function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   // A read narrowed to `null` is printed from its box's tag, so the reservation scan and the
   // handler both plan the whole box with the narrowing lifted (D2801).
@@ -2557,13 +2582,17 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   let bad = false
   let pinSkipped = 0
   const seen: i32[] = []
-  const live: string[] = []
-  printNarrowLiveAtoms(exprIx, fnIx, live)
+  const live: i32[] = []
+  const narrowed = printNarrowLiveTys(exprIx, fnIx, live)
   let i = 0
   while i < kinds.length {
     let k = kinds[i]
-    // A member the narrowing excluded is no arm of this read.
-    if live.length > 0 && !strListHas(live, atoms[i]) {
+    // A member the narrowing excluded is no arm of this read; past the member types is the
+    // appended map-miss `null`.
+    if (
+      narrowed
+      && !printPlanTyLive(live, if i < mtys.length { mtys[i] } else { -1 })
+    ) {
       i = i + 1
       continue
     }
