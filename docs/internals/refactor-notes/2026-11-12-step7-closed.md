@@ -19,7 +19,7 @@ ARCHITECTURE.md §7's two step-7 rows:
   - the `clo:` link key (`cloSigNameOfTy`);
   - recorded TypeRef texts (`synthTypeRefOfTy`, `lvSpellOf`).
 
-  No type-string parse remains.
+  Whether a type-string parse remains is re-measured under #7748's census (below).
 - **§3.3, registries:** keyed by a type key, an identifier, literal content or an index memo.
   `cloSigPosBy` is re-graded as rep-keyed: its `$fnsig` key is built from rep tokens (#7646).
 - **§3.4, classifiers:** one producer, the type. A name read is a label: a key rendered from the
