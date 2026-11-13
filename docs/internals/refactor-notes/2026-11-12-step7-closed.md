@@ -154,11 +154,14 @@ feeds each one. About 130 rows sit inside parser bodies, and each inherits its e
 | `canonEmitName` (`monoPinUnionName`, mono:7942) and `canonEmitNameOfTy` via `arenaEmitName` (emit_collect:8143) | check_program's `canonEmitNameTs`, `canonShapeName`, `canonGenAppName`, `canonArrayName`, `canonFuncTypeName`, `canonEmitUnionName`, the `nulLit*` helpers, `canonSameShapeRecord`, `nameIsGenAppOfDecl`, `nameIsOneStrLit`; check_lit_union_spell (about 60 rows; up to 4,529 programs) | fails: the input is a render | D (P6) and the `arenaEmitName` callers |
 | `resolveAnnot` (emit_rep:1104, 2092, 2097, 2148, 2780) and `nameToTy` (check_emit_queries:694, 713) | `annotResolve`, `applyGenAliasArgs` (with the bare `nameToTy(argNames[ai])`, 303 programs), `nameToTyReal` (with the bare `nameToTy(mapSpellKeyName(name))`, 606), `nameUnionTy`, `nameFuncTy`, `nameObjTy`, `retNameToTy`, `litMemberTy` (about 40 rows) | fails: each bare name is a piece the parser cut from a rendered spelling (a generic argument, or a map key) | B (P5) and D (`recordClonedIsVarTy`) |
 | `valueAtomKind` (50 emit call sites) | check_ty_rep's `valueAtomKindSpan` ×8, `nulElemListAtomKind` ×7, `litUnionArrayElemOf` ×2 | fails where the caller passes a rendered atom (P2); passes for a primitive name | G (P2) |
-| none from emit | `letDeclResolveAnnot` (check_statements:393, 3 programs), `wsOrigTyOf` (check_demands:858), `litUnionArmValueUnionRetName` (check_ret_names:345–346, which renders with `tyToEmitName` inside the checker) | needs a ruling: the checker's own render or a re-checked synthesized TypeRef | — |
+| a synthesized TypeRef (the capture-cell rewrite) | `letDeclResolveAnnot` (check_statements:393, 3 programs): the source writes `(t: T) => void`, and the string received is `((T)=>void)[]`, the emitter's rewrite of it | converts (the `recordClonedNodeTyFb` ruling) | B, with P5 |
+| checker source | `wsOrigTyOf` (check_demands:858): a bare type-parameter identifier | passes (coordinator) | — |
+| a checker render, run during emit | `litUnionArmValueUnionRetName` (check_ret_names:345–346, 56 and 114 programs): `tyToEmitName` then `isValueUnionName` / `nameIsLitUnionArmValueUnion` | fails: in scope since it runs during emit | H, with P1 |
 
-`arenaEmitName` is a render (`tyToNominalName` then `canonEmitNameOfTy`) that the census does not
-count among the 13 `tyToEmitName` renders. It has 7 callers: emit_collect ×6 and
-`monoInstanceRetSpelling`.
+`arenaEmitName` (emit_collect:8143) is a render (`tyToNominalName` then `canonEmitNameOfTy`) that
+the census does not count. It joins the render count, so there are 14 renders and 8 block the close.
+Its six emit_collect callers go to E with P3 and D6, and `monoInstanceRetSpelling` goes to D with
+P6. `slotRowTyOf` (emit_rep:2780) goes to B with P5 (coordinator, 2026-11-13).
 
 ## Floors held by a filed row
 
