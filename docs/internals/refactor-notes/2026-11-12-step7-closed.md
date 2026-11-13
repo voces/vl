@@ -106,6 +106,9 @@ is the checker's job. A checker parse reached from emit whose input the emitter 
 then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
 §3.3's sentence "parses no type spelling back" waits on that.
 
+H's origin probe (lower bound): 73 reached parse sites of class (a) or (b), 20 ambiguous bare-name
+sites, 21 source-only and 34 unreached, beside 13 renders. L2 stays open.
+
 ## Floors held by a filed row
 
 Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the site reads a name
