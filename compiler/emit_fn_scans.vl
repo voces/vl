@@ -225,9 +225,12 @@ import {
 import { StashWant, structIdxHasReboxVariant } from "./emit_union_casts"
 import {
   isUNameAB,
+  msHasNull,
   msMemberAtomsOfSet,
+  msMemberCount,
   msMemberTysOfSet,
   msSetOfTy,
+  msSetOfTyAny,
   msSetOfUnion,
   msSetTakesAtomAsStr,
   printNarrowKeepsBox,
@@ -238,7 +241,6 @@ import {
   tyTakesAtomAsStr,
   unRowHasMapArm,
   unionMemberAtomsOf,
-  unionSetHasNullTy,
 } from "./emit_union_registry"
 import { strListHas } from "./listutil"
 import { tyIsFnArmUnion, tyIsListUnion, tyStepElem, tyStepRet } from "./tyquery"
@@ -2436,6 +2438,22 @@ function printUnionBoxTyOf(exprIx: i32, fnIx: i32): i32 {
   nodeTyAt(unwrapParen(exprIx), fnIx)
 }
 
+// The member set of the value a print reads when no row keys its type `bty`: `bty`'s own members
+// when it is a union, else, for a `??` typed at one member, its left operand's box, which holds it.
+function printUnionStoreSetOf(exprIx: i32, fnIx: i32, bty: i32): i32 {
+  const own = msSetOfTyAny(bty)
+  if own >= 0 && msMemberCount(own) >= 2 { return own }
+  const u = unwrapParen(exprIx)
+  if u >= 0 {
+    const e = nodeAt(u)
+    if e is BinExpr && e.binOp == "??" {
+      const ls = msSetOfTyAny(unionBoxTyIxOfExpr(e.binLeft, fnIx))
+      if ls >= 0 { return ls }
+    }
+  }
+  own
+}
+
 function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   // A read narrowed to `null` is printed from its box's tag, so the reservation scan and the
   // handler both plan the whole box with the narrowing lifted (D2801).
@@ -2448,15 +2466,22 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
     return nnRc
   }
   if !printUnionRecvIsBox(exprIx, fnIx) { return 0 }
-  const nm = unionNameOfExpr(exprIx, fnIx)
-  if nm == "" { return 0 }
   // The row's recorded members, in box-tag ABI order — the order the dispatch walks and
-  // `emitUnionCoerce` tagged them in; an uncovered set falls back to the rendered expansion.
+  // `emitUnionCoerce` tagged them in; a type no row keys answers from its own members.
   const dty = unionDeclTyIxOfExpr(exprIx, fnIx)
   const bty = printUnionBoxTyOf(exprIx, fnIx)
   const sid = msSetOfTy(bty)
   const atoms: string[] = []
-  if !msMemberAtomsOfSet(sid, atoms) { unionMemberAtomsOf(nm, atoms) }
+  if (
+    !msMemberAtomsOfSet(sid, atoms)
+    && !msMemberAtomsOfSet(printUnionStoreSetOf(exprIx, fnIx, bty), atoms)
+  ) {
+    // D16060: a field read through an un-annotated parameter is typed at the hole, so only the
+    // name rung that read the arms knows the members.
+    const nm = unionNameOfExpr(exprIx, fnIx)
+    if nm == "" { return 0 }
+    unionMemberAtomsOf(nm, atoms)
+  }
   if atoms.length < 2 { return 0 }
   // The member types, index-parallel to `atoms`: the set's own, else the declared type's
   // leaves. Left empty when neither lines up, so no member reads as a literal union.
@@ -2482,7 +2507,8 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   // A bare map read is `V | null` whatever `V` is (a missing key reads the null-tagged box),
   // so the dispatch needs a `null` arm the map's declared value set may not carry.
   if mapReadNarrowableSlot(unwrapParen(exprIx), fnIx) >= 0 {
-    if !unionSetHasNullTy(nm, bty) {
+    const bns = msSetOfTy(bty)
+    if !(bns >= 0 && msHasNull(bns)) {
       atoms.push("null")
       kinds.push(nullValKind())
     }
