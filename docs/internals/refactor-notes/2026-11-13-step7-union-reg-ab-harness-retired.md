@@ -8,12 +8,11 @@ instrument that tallies nothing is dead code.
 
 In `emit_union_registry`:
 
-- `unionRegistryABSweep` and its tables: `unABCnt`, the `UNAB_*` outcome codes,
-  `unABSiteName`, `unABKindName` and `unKeySweepPair`.
+- `unionRegistryABSweep` and its tables: `unABCnt`, the `UNAB_*` outcome codes, `unABSiteName`
+  and `unABKindName`.
 - The atom-test retry `unABAtomRetry` and its counters (`unRetryHit` / `unRetryMiss`).
   `unABMode` is the constant 0, so the retry always answered -1 and only tallied.
-- What only the sweep reached: `unRowHasSlice`, `unionRowOfTyRaw`, `unRowVariantsSame`,
-  `unRowSetSameNullBlind` and `unionRowOfSpellingTy`, plus five imports.
+- What only the sweep's A/B half reached: `unionRowOfTyRaw` and `unionRowOfSpellingTy`.
 
 Elsewhere:
 
@@ -21,8 +20,17 @@ Elsewhere:
 - Its entry in `lint.vl`'s pass list.
 - A comment in `emit_nullable_rets` that named it.
 
-No test or script reads its report keys (`unionAB/`, `unionSweep/`, `atomRetry/`). Only
+No test or script reads the `unionAB/`, `unionSweep/` or `atomRetry/` keys. Only
 `docs/internals/registry-by-type-id.md`, the harness's design note, describes them.
+
+## Kept: the type key's licence
+
+The sweep's pair compare (`unKeySweepPair`, with `unRowSetSameNullBlind`, `unRowVariantsSame` and
+`unRowHasSlice`) is not A/B tallying. It asserts that two rows the type key would fuse carry
+the same member set and variant slice, and `tests/vl_union_key_licence_test.ts` reads its
+`keySweep/*` buckets under `$VL_REP_SHADOW`. It now runs as its own pass, `unionKeySweep`.
+The first head of this PR deleted it, and the licence test caught that in CI
+(`ci-native (4)`: `want keySweep/pair-keyed >= 1, got 0`).
 
 ## Kept
 
