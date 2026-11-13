@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **Step 7 L2, mono: the anonymous-pin discriminator reads the pin's type.** `monoAnonPinDiscrim` used to decide from the pin's text (a `#`/`{` prefix, or a declared-type lookup by name) whether an argument's exact type extends the instance key. It now decides from the pin's own type: a record no declared name spells, or a map, at the top or inside a list, nullable or union, or an argument that differs from the pin's type only in function fields. Over the population the new rule never drops an extension the old one made, and adds 7. Every program it touches builds byte-identically. The typed instance key has no named floors left.
