@@ -119,7 +119,7 @@ import {
   tyIsUnionish,
 } from "./check_node_tys"
 import { nodePos } from "./fmt_util"
-import { arrElemSuffixed, nameStripSpaces } from "./tyname"
+import { arrElemSuffixed } from "./tyname"
 import {
   fnCloCoerceSetAt,
   fnCloCoerceTyIx,
@@ -139,7 +139,6 @@ import {
   tpIfJoinPinName,
 } from "./check_emit_queries"
 import { i32TyIx, tyIsGradualUnion } from "./check_leaf_steps"
-import { canonEmitName } from "./check_program"
 import {
   topFnOwnerOf,
   tyIsForeignGenericSig,
@@ -399,7 +398,6 @@ import {
   sidText,
 } from "./symbols"
 import {
-  annSplitParams,
   drwDispatchOp,
   exprEffectFree,
   fnLetOfRead,
@@ -758,6 +756,7 @@ import {
   unionRowKeyAB,
 } from "./emit_union_registry"
 import {
+  unNameAdoptTyKeyRow,
   unRowOfTyKey,
   unTyKeyShadow,
   unTyKeyTagArm,
@@ -1765,9 +1764,13 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32, tyOut: i32[]): string {
       // the checker's whole array type, which is the pin this site wants; two `TyArray` hops
       // ask the question, so the render is built only for the pin.
       if nodeTyNestedElemIsBoolPrim(ix) { return nodeTyName(ix) }
-      // A spread copy pins the row it is built at, its source's (D2938).
-      const spn = spreadLitSrcRowName(ix, fnIx)
-      if spn != "" { return arrElemSuffixed(spn) }
+      // A spread copy is built at its source's row (D2938), which no type here names.
+      if spreadLitSrcRowName(ix, fnIx) != "" {
+        emitFail(
+          "emitProgram: a generic call's spread-copy argument has no pin for its source's row",
+        )
+        return ""
+      }
       const aen = arrLitElemName(ix, fnIx)
       if aen == "" { return monoAnonListPinName(nodeTyIxOf(ix)) }
       // The pin is the literal's own list type, which keys the instance; its text follows.
@@ -2256,7 +2259,15 @@ function monoRecordNominalPin(ty: i32): string {
     return genAppNameOfTy(ty)
   }
   if monoTyHasFieldRecord(ty, 24) { return "" }
-  nameStripSpaces(tyToNominalName(ty))
+  const raw = tyToNominalName(ty)
+  let out = ""
+  let i = 0
+  while i < raw.length {
+    const c = raw.slice(i, i + 1)
+    if c != " " { out = out + c }
+    i = i + 1
+  }
+  out
 }
 
 // Whether closed type `t` holds, at any depth, a record no declared or application name spells:
@@ -2737,7 +2748,7 @@ function monoPinUnionBoxed(j: i32, refArm: boolean): i32 {
   let name = valueUnionRetName(j)
   // Such a union is named as a binding of it is (`monoRegisterElabJoinRows`).
   if name == "" && refArm && monoTyHoldsRefArm(j) {
-    name = monoPinUnionName(monoPinSpellShaped(j), j)
+    name = monoPinSpellShaped(j)
   }
   if name != "" { monoRegisterPinUnion(name, j) }
   j
@@ -3219,7 +3230,7 @@ function monoRegisterElabJoinRows() {
           && (tyIsTpJoinUnion(t) || coal)
           && monoTyIsUnionOrNulUnion(st)
         ) {
-          let nm = monoPinUnionNameOfTy(st)
+          let nm = monoPinSpellShaped(st)
           // A literal union is spelled by its alias, whose rep is the atom; its render is `string`.
           if tyIsLitUnion(nonNullTy(st)) { nm = monoI32AtomPinName(st) }
           if nm != "" { monoRegisterPinUnion(nm, st) }
@@ -7956,22 +7967,6 @@ function monoTagMapTy(t: i32): boolean {
   m is TyMap && fnTagTyIsTagged(m.mVal)
 }
 
-// The registry name of pinned type `st`'s box: the naming rule's spelling, canon'd as a union name.
-function monoPinUnionNameOfTy(st: i32): string {
-  monoPinUnionName(monoPinSpellShaped(st), st)
-}
-
-// D1042 — the emitter-vocabulary spelling of a substituted annotation name `rs` of type `rsTy`,
-// for the shapes where the two can disagree: a union of two arms or more, and a list of a grouped
-// element (`(T | string)[]`). A substitution into the declared text keeps a literal member literal
-// and a collapsed group's parens, while a direct annotation is canon'd. With no type, `rs` stands.
-function monoPinUnionName(rs: string, rsTy: i32): string {
-  if monoPinCanonKind(rsTy) == 0 { return rs }
-  const c = canonEmitName(rs)
-  if c == "" { return rs }
-  c
-}
-
 // How the canon name of a pin of type `ty` can differ from its spelling: 1 for a union of two
 // members or more, or one whose arms (`unionTyArms`) number two or more (a union of twin maps keys
 // one arm and is still canon'd to its one map, D15540); 2 for a list whose element its spelling
@@ -8028,12 +8023,10 @@ function monoPinMintedUnion(
   const wt = if own >= 0 { monoAnnPinTy(own) } else { ty }
   const wtt = if wt >= 0 && wt < T.tys.length { tyAt(wt) } else { tyAt(0) }
   const wu = wt >= 0 && (wtt is TyUnion || wtt is TyNullable)
-  let pc = ""
   if pun != "" {
-    pc = monoPinUnionName(pun, le)
-    if !monoPinCanonIsUnion(le) { return monoPinUnionName(name, wt) }
+    if !monoPinCanonIsUnion(le) { return name }
   } else if !wu || monoPinCanonKind(wt) == 2 {
-    return monoPinUnionName(name, wt)
+    return name
   }
   if !monoTyHoldsRefArm(ty) || unNameBound(name) { return name }
   // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
@@ -8041,19 +8034,13 @@ function monoPinMintedUnion(
     monoShStage(unTyKeyTagParamList(), tyStepElem(ty))
     // The registered type is the whole annotation's (`own`) at the rep its spelling collapses to.
     const elemTy = if own >= 0 { monoAnnPinTy(tyStepElem(own)) } else { tyStepElem(ty) }
-    if monoRegisterPinUnion(pc, elemTy) < 0 { return name }
-    return "(" + pc + ")[]"
+    if monoRegisterPinUnion(pun, elemTy) < 0 { return name }
+    return "(" + pun + ")[]"
   }
   if !wu { return name }
-  const c = monoPinUnionName(name, wt)
   monoShStage(shTag, ty)
-  if (
-    monoRegisterPinUnion(c, if own >= 0 { monoAnnPinTy(own) } else { ty })
-    < 0
-  ) {
-    return name
-  }
-  c
+  monoRegisterPinUnion(name, if own >= 0 { monoAnnPinTy(own) } else { ty })
+  name
 }
 
 // The type-key shadow's stage for the next `monoRegisterPinUnion`: the root's tag (0 for none)
@@ -8184,7 +8171,13 @@ function monoRegisterPinUnion(name: string, ty: i32) {
   // A pin minted at a union or a nullable needs a box row; any other pin registers nothing.
   const ut = if ty >= 0 && ty < T.tys.length { tyAt(ty) } else { tyAt(0) }
   if ty < 0 || !(ut is TyUnion || ut is TyNullable) { return 0 }
-  if unNameBound(name) { return monoShOffer(shTag, name, shTy) }
+  // A union type already holding a row binds this spelling to it; only a new type mints one.
+  if (
+    unNameBound(name)
+    || (unRowOfTyKey(ty) >= 0 && unNameAdoptTyKeyRow(name, ty))
+  ) {
+    return monoShOffer(shTag, name, shTy)
+  }
   const before = uVariants.length
   if registerInlineUnionOfTy(monoProgStmts, name, ty) < 0 { return -1 }
   monoShOffer(shTag, name, shTy)
@@ -9166,15 +9159,15 @@ function monoClosedRecordOwnRow(r: i32) {
 }
 
 // The spelling of instance return `r`: a literal union by its alias, which a render softens to
-// `string`; a primitive by its own name, `never` included; anything else by its arena name,
-// which keeps a declared row and an application.
+// `string`; a primitive by its own name, `never` included; anything else by the naming rule, and
+// by its arena name only where the rule has no spelling.
 function monoInstanceRetSpelling(r: i32): string {
   if tyIsLitUnion(r) { return monoPinAnnSpelling(r) }
   const p = tyAt(r)
   if p is TyPrim { return p.primName }
-  const an = arenaEmitName(r)
-  if an != "" { return an }
-  monoPinSpellShaped(r)
+  const sp = monoPinSpellShaped(r)
+  if sp != "" { return sp }
+  arenaEmitName(r)
 }
 
 // Result type `r` where it is two lists no one rep stores, else -1.
@@ -21005,10 +20998,16 @@ function monoPinAnnotatedParam(
     }
     if !tpBare {
       // A `T[]` pin is the list of the element type `T` binds, spelled from that type; a `T`
-      // bound by spelling alone keeps its spelling.
+      // bound by an explicit argument's spelling alone takes the argument's own closed list type.
       const pet = if bound { boundTy } else { bindTy }
-      const pls = if pet >= 0 { monoPinSpellShaped(mkArrayTy(pet)) } else { "" }
-      pinned.push(if pls != "" { pls } else { arrElemSuffixed(bind) })
+      const plt = if pet >= 0 { mkArrayTy(pet) } else if an2Ty >= 0 && !tyHasTyVar(an2Ty) { an2Ty } else { -1 }
+      const pls = if plt >= 0 { monoPinSpellShaped(plt) } else { "" }
+      if pls == "" {
+        return emitFail(
+          "emitProgram: monomorphize: a `T[]` parameter's list type has no closed spelling",
+        )
+      }
+      pinned.push(pls)
       pinTys.push(monoArgPinTyAt(args[i], ctx))
       const lpat = monoParamPatTy(
         params,
@@ -24101,9 +24100,8 @@ function monoSlotPinNameTys(
 }
 
 // The function type spelling pin `sig` of slot `path` of binding frame `lf` names, returning
-// `ret`, so the name parses as a type: a function-value pin (`=>k`) names only a wasm signature
-// and is spelled as the closed parameter type the pin is taken at, and an inline record pin
-// takes the spelling its shape is interned under (D9381, D9431).
+// `ret`, spelled from the closed parameter types the pin is taken at: a function-value pin (`=>k`)
+// by its concrete function type, any other by the naming rule (D9381, D9431).
 function monoSlotPinAnn(
   lf: i32[],
   path: string[],
@@ -24111,31 +24109,26 @@ function monoSlotPinAnn(
   ret: string,
 ): string {
   const fts = monoPinFnParamTys(lf[1], path, sig)
+  if sig != "" && fts.length == 0 {
+    emitFail(
+      "emitProgram: monomorphize: a slot's pin list has no closed parameter types to spell",
+    )
+    return ""
+  }
   let out = "("
   let k = 0
-  for pn in monoSigPinsTop(sig) {
+  while k < fts.length {
     if k > 0 { out = out + "," }
     if fts.length > 0 && monoPinTyIsFnSig(fts[k]) {
       out = out + "(" + monoConcreteFnTyName(fts[k]) + ")"
     } else if fts.length > 0 && monoConcreteNulFnTyName(fts[k]) != "" {
       out = out + monoConcreteNulFnTyName(fts[k])
-    } else if k < fts.length && monoTyIsInlineRecord(fts[k]) {
-      out = out + monoPinSpellShaped(fts[k])
     } else {
-      out = out + pn
+      out = out + monoPinSpellShaped(fts[k])
     }
     k = k + 1
   }
   out + ")=>" + ret
-}
-
-// The pins of pin list `sig` (`p1,p2,`), split at its top-level commas so a pin spelling a
-// nullable function type keeps its own parameter list.
-function monoSigPinsTop(sig: string): string[] {
-  const out: string[] = []
-  annSplitParams(sig, out)
-  if out.length > 0 { out.pop() }
-  out
 }
 
 // `monoSlotPinNameTys` with a function-value pin left as its wasm signature, which a hole lambda
@@ -24159,7 +24152,6 @@ function monoSlotRetName(lf: i32[], path: string[]): string {
 // otherwise.
 function monoPinFnParamTys(d: i32, path: string[], sig: string): i32[] {
   const none: i32[] = []
-  const ps = monoSigPinsTop(sig)
   let tys: i32[] = none
   for t in elabSlotDeliveries(d, path, -1) {
     const ft = tyAt(t)
@@ -24167,9 +24159,8 @@ function monoPinFnParamTys(d: i32, path: string[], sig: string): i32[] {
       tys = ft.fnParamTypes
     }
   }
-  if tys.length != ps.length { return none }
   let k = 0
-  while k < ps.length {
+  while k < tys.length {
     if monoPinTyIsFnSig(tys[k]) && monoConcreteFnTyName(tys[k]) == "" {
       return none
     }

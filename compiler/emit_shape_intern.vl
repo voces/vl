@@ -7,7 +7,12 @@ import {
 // `emit_shape_intern.vl` — interning inline and deep shapes, function-type shapes
 // and ref-array arms into the shape tables.
 
-import { cUserTypes, numLitUnionBaseTy, tyIsLitUnionOrLit } from "./check_types"
+import {
+  cUserTypes,
+  nomNameOfTy,
+  numLitUnionBaseTy,
+  tyIsLitUnionOrLit,
+} from "./check_types"
 import { opaqueSNamesOn } from "./opaque_snames_state"
 import { i32ToStr } from "./ast"
 import { fieldNameOrder } from "./check_obj_shape"
@@ -95,7 +100,6 @@ import {
   armFieldStructRow,
   famRelayStructRow,
   fieldCodeOfDeclinedTy,
-  fieldTypeRefusalMsg,
   forceScalarListField,
   mapTyValKindLowerable,
   nulRefListFieldCodeOfTy,
@@ -103,6 +107,7 @@ import {
   repStructRowOfTy,
   shapeFieldElemName,
   structRowOfRecordTy,
+  tagRepTyFn,
   tyIsNestedScalarLeafArray,
   tyRegGenNow,
 } from "./emit_shape_rows"
@@ -169,7 +174,7 @@ import {
 } from "./emit_union_registry"
 import {} from "./strutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
-import { groupInnerOf, nameStripSpaces } from "./tyname"
+import { groupInnerOf } from "./tyname"
 import {
   litPeekBaseTy,
   nonNullTy,
@@ -181,14 +186,16 @@ import {
 } from "./tyquery"
 
 // The refusal of a field type both the rep descriptor and the field-code ladder decline.
+const FIELD_UNION_FOLDED_ONLY_MSG = "emitProgram: a union field's row is found only under a "
+  + "structurally equal member set, and its type keys no row"
 const NESTED_FIELD_UNCODED = "emitProgram: a field's type has no storage code: the rep "
   + "descriptor declined it and the field-code ladder has no arm for it"
 
-// The field code of a field spelled `t` whose recorded arena type is `ty` (-1 for none): read
-// off the type (`fieldCodeOfTyCovered`), and from the ladder (`fieldCodeOfDeclinedTy`) only where the
-// type declines, then the `S[] | null` rung. A type parameter's field is uncoded: its row is the
-// generic original's, which no emitted read uses, and each instance mints its own.
-export function nameFieldCodeTy(t: string, ty: i32): i32 {
+// The field code of a field whose recorded arena type is `ty` (-1 for none): read
+// off the type (`fieldCodeOfTyCovered`), and from the ladder (`fieldCodeOfDeclinedTy`) only where
+// the type declines, then the `S[] | null` rung. A type parameter's field is uncoded: its row is
+// the generic original's, which no emitted read uses, and each instance mints its own.
+export function nameFieldCodeTy(ty: i32): i32 {
   const a = fieldCodeOfTyCovered(ty)
   if a != -2 { return a }
   if ty >= 0 && tyHasTyVar(ty) { return -1 }
@@ -197,11 +204,10 @@ export function nameFieldCodeTy(t: string, ty: i32): i32 {
   // A union whose row its type keys, though its spelling does not: `null` before a member
   // keeps the name off the row (D10410).
   if ty >= 0 && unRowOfTyKey(ty) >= 0 { return FC_UNION }
-  // A union whose row is filed under a structurally equal member set (`i32 | Q` against the
-  // row for `i32 | {q: string}`), asked by type. A spaced spelling stays off it: its record is
-  // minted under the spaced name, which the compact struct lookup would then miss.
-  if ty >= 0 && nameStripSpaces(t) == t && unRowOfCanonFolded(ty) >= 0 {
-    return FC_UNION
+  // A union whose row is filed only under a structurally equal member set (`i32 | Q` against
+  // the row for `i32 | {q: string}`) has no field code by its type.
+  if ty >= 0 && unRowOfCanonFolded(ty) >= 0 {
+    return emitFail(FIELD_UNION_FOLDED_ONLY_MSG)
   }
   // The last rung of the NODE ladder, which this one lacked: `nameIsNulRefList` resolves
   // through the struct table, so a shape whose field is `S[] | null` coded -1 whenever it is
@@ -247,55 +253,60 @@ function shapeWalkSplitsUnion(byDecl: boolean, ty: i32, n: i32): boolean {
 function tagRepNameUnset(_ty: i32): string { __trap__() }
 export let tagRepNameFn: (ty: i32) => string = tagRepNameUnset
 
-// The name a walk keys type `ty` on when `kn` is its nominal name, and its render otherwise,
-// rendered only then since a deep record's render doubles per level; a record of tagged-set ids,
-// which has no render, by its stored spelling.
-function shapeWalkKeyOf(kn: string, ty: i32): string {
-  const nn = tyToNominalName(ty)
-  let ln = nn
-  if nn == "" || kn != nn {
-    ln = tyToEmitName(ty)
-    if ln == "" { ln = nn }
-  }
-  if ln == "" && tyAt(ty) is TyObj { ln = tagRepNameFn(ty) }
-  ln
+// The label a walk's record row is minted under, for output: its nominal spelling when the walk
+// is keyed by that (`nom`), else its render; a record of tagged-set ids, which has neither, by
+// its stored spelling.
+function shapeWalkLabelOf(nom: boolean, ty: i32): string {
+  if nom { return tyToNominalName(ty) }
+  let r = tyToEmitName(ty)
+  if r == "" { r = tyToNominalName(ty) }
+  if r == "" { r = tagRepNameFn(ty) }
+  r
+}
+
+// Whether a walk descends into `ty`: a type holding a type variable is the generic original's,
+// which no instance reads, unless it is a record of tagged-set ids, stored without one.
+function shapeWalkEnters(ty: i32): boolean {
+  if !tyHasTyVar(ty) { return true }
+  tyAt(ty) is TyObj && tagRepTyFn(ty) >= 0
 }
 
 // Types whose shape walk is in progress, innermost last.
 let shapeWalkStack: i32[] = []
 
-// The key hint a fresh walk of `ty` starts from: its nominal name, or "" when `ty` is already
-// being walked, so a declaration that reaches itself is re-entered under its render.
-function shapeWalkName(ty: i32): string {
+// Whether a fresh walk of `ty` is keyed by its declaration: a type already being walked is
+// re-entered structurally, and a type holding a type variable has no declaration key.
+function shapeWalkKeyed(ty: i32): boolean {
   for b in shapeWalkStack {
-    if b == ty { return "" }
+    if b == ty { return false }
   }
-  tyToNominalName(ty)
+  !tyHasTyVar(ty)
 }
 
-// Walks type `ty`, interning every inline shape, value union and function type it holds, each
-// keyed by `shapeWalkKeyOf`. Returns the row a record leaf reached through `| null`, list and
-// map wrappers interned at, else -1.
+// Walks type `ty`, interning every inline shape, value union and function type it holds.
+// Returns the row a record leaf reached through `| null`, list and map wrappers interned at,
+// else -1.
 export function internShapeDeepTy(ty: i32) {
-  internShapeDeepTyAs(shapeWalkName(ty), ty)
+  const k = shapeWalkKeyed(ty)
+  internShapeDeepTyAs(k, k, ty)
 }
 
-// `internShapeDeepTy` keyed from `kn`: a frame handing its own type to the other walker passes
-// its own key, so the type keeps the key it is entered under.
-function internShapeDeepTyAs(kn: string, ty: i32) {
+// `internShapeDeepTy` in walk state `keyed` (entered under its declaration's key) and `nom`
+// (that key is its nominal spelling): a frame handing its own type to the other walker passes
+// its own state, so the type keeps the key it is entered under.
+function internShapeDeepTyAs(keyed: boolean, nom: boolean, ty: i32) {
   if ty < 0 || ty >= T.tys.length { return -1 }
   shapeWalkStack.push(ty)
-  const r = internShapeDeepTyGo(kn, ty)
+  const r = internShapeDeepTyGo(keyed, nom, ty)
   shapeWalkStack.pop()
   r
 }
 
-function internShapeDeepTyGo(kn: string, ty: i32) {
+function internShapeDeepTyGo(keyed: boolean, nom: boolean, ty: i32) {
   const t = tyAt(ty)
-  const ln = shapeWalkKeyOf(kn, ty)
-  if ln == "" { return -1 }
-  // Whether the walk keys `ty` by its declaration's name, under which it is one leaf.
-  const byDecl = kn != "" && ln == kn
+  if !shapeWalkEnters(ty) { return -1 }
+  // A keyed walk enters `ty` under its declaration, under which it is one leaf.
+  const byDecl = keyed
   if !(byDecl && tyIsDeclaredNominal(ty)) && walkValueUnionTy(ty) {
     registerValueUnionOfTy(7, ty)
     // A closure member may bury inline shapes in its params or result, unreachable through the
@@ -309,7 +320,7 @@ function internShapeDeepTyGo(kn: string, ty: i32) {
     return -1
   }
   if tyIsFuncArena(ty) {
-    internFuncTypeShapesTyAs(ln, ty)
+    internFuncTypeShapesTyAs(true, nom, ty)
     return -1
   }
   if t is TyNullable { return internShapeDeepTy(t.nInner) }
@@ -328,8 +339,18 @@ function internShapeDeepTyGo(kn: string, ty: i32) {
   if t is TyMap { return internShapeDeepTy(tyMapValOf(ty)) }
   // A fresh walk of a registered application is keyed by its application name, so the same
   // instance also interns under its structural key.
-  if kn != "" && tyIsGenAppInstance(ty) { gaeEnsure(ty) }
-  internInlineShapeTy(ln, ty)
+  if keyed && tyIsGenAppInstance(ty) { gaeEnsure(ty) }
+  internShapeWalkLeafTy(keyed, nom, ty)
+}
+
+// Whether walk leaf `ty` is an inline shape the interner mints: a record no declaration, brand
+// or union alias names, and no generic application the walk is keyed by.
+function walkLeafIsShape(keyed: boolean, ty: i32): boolean {
+  if !(tyAt(ty) is TyObj) { return false }
+  structNameOfTy(ty) == ""
+    && unionAliasDeclNameOfTy(ty) == ""
+    && nomNameOfTy(ty) == ""
+    && !(keyed && genAppNameOfTy(ty) != "")
 }
 
 // Whether a map field of recorded type `fTy` has a value the mv layer lowers; false for a
@@ -382,7 +403,7 @@ export function funcTypeShapeLowerable(ty: i32): boolean {
   let fi = 0
   while fi < t.objFieldNames.length && fi < t.objFieldTypes.length {
     const fTy = t.objFieldTypes[fi]
-    const fc = nameFieldCodeTy("", fTy)
+    const fc = nameFieldCodeTy(fTy)
     if fc < 0 {
       // The descriptor codes every closed record, so an uncoded field is one both it and
       // the ladder decline.
@@ -425,13 +446,14 @@ function armHasInlineLitUnionField(aty: i32): boolean {
 // interns; an unsupported composite field is left un-interned so the closure stays a clean
 // reject, never invalid wasm.
 function internFuncTypeShapesTy(ty: i32): i32 {
-  internFuncTypeShapesTyAs(shapeWalkName(ty), ty)
+  const k = shapeWalkKeyed(ty)
+  internFuncTypeShapesTyAs(k, k, ty)
 }
 
-function internFuncTypeShapesTyAs(kn: string, ty: i32): i32 {
+function internFuncTypeShapesTyAs(keyed: boolean, nom: boolean, ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return 0 }
   shapeWalkStack.push(ty)
-  const r = internFuncTypeShapesTyGo(kn, ty)
+  const r = internFuncTypeShapesTyGo(keyed, nom, ty)
   shapeWalkStack.pop()
   r
 }
@@ -496,10 +518,9 @@ function tyIsDeclaredNominal(ty: i32): boolean {
   unionAliasDeclNameOfTy(ty) != "" && numLitUnionBaseTy(ty) < 0
 }
 
-function internFuncTypeShapesTyGo(kn: string, ty: i32): i32 {
+function internFuncTypeShapesTyGo(keyed: boolean, nom: boolean, ty: i32): i32 {
   const t = tyAt(ty)
-  const ln = shapeWalkKeyOf(kn, ty)
-  if ln == "" { return 0 }
+  if !shapeWalkEnters(ty) { return 0 }
   // A value-union leaf registers its box reps, as `internShapeDeepTy`'s value-union arm does:
   // a producer-less closure-arm annotation otherwise leaves the box un-minted while a narrowed
   // call's unbox casts to a default type-0 index, invalid wasm. A declared union is one leaf.
@@ -521,9 +542,9 @@ function internFuncTypeShapesTyGo(kn: string, ty: i32): i32 {
       const fTys: i32[] = []
       if (
         unionTyArms(ty, fArms, fTys)
-        && shapeWalkSplitsUnion(kn != "" && ln == kn, ty, fArms.length)
+        && shapeWalkSplitsUnion(keyed, ty, fArms.length)
       ) {
-        internShapeDeepTyAs(ln, ty)
+        internShapeDeepTyAs(true, nom, ty)
       }
     }
     TyArray => {
@@ -532,7 +553,7 @@ function internFuncTypeShapesTyGo(kn: string, ty: i32): i32 {
     TyObj => {
       if !tyIsDeclaredNominal(ty) {
         if funcTypeShapeLowerable(ty) {
-          internInlineShapeTy(ln, ty)
+          internShapeWalkLeafTy(keyed, nom, ty)
         } else {
           // The outer shape stays un-interned, but its nested shapes and closure fields'
           // result shapes still intern their own rows, or a literal building the outer shape
@@ -680,24 +701,54 @@ export function internInlineShapeFieldsTy(
     }
   }
   iisBusy = iisBusy + 1
-  const iisAns = internInlineShapeTyGo(nm, tyIx, fieldsTy)
+  let iisAns = -1
+  if nameIsShapeSpanEnds(nm) {
+    iisAns = internInlineShapeTyGo(nm, false, tyIx, fieldsTy)
+  }
   iisBusy = iisBusy - 1
   if iisBusy > 0 {
     sidArrPut(iisMemoTy, iisSid, tyIx + 2)
     sidArrPut(iisMemoRow, iisSid, iisAns + 2)
     iisMemoSids.push(iisSid)
   } else {
-    // Cleared where this intern wrote, not replaced: a fresh `[]` regrows to the sid count.
-    let k = 0
-    while k < iisMemoSids.length {
-      const ks = iisMemoSids[k]
-      if ks >= 0 && ks < iisMemoTy.length { iisMemoTy[ks] = -1 }
-      k = k + 1
-    }
-    iisMemoSids = []
-    sLateRows(sNames.length)
+    iisSettle()
   }
   iisAns
+}
+
+// A shape walk's leaf `ty` in walk state `keyed` / `nom`, interned when `walkLeafIsShape`: the
+// row is found by type, or minted under `shapeWalkLabelOf`. Memoized by type as
+// `internInlineShapeFieldsTy` is by name.
+function internShapeWalkLeafTy(keyed: boolean, nom: boolean, ty: i32) {
+  if iisBusy > 0 && ty < iisWalkMemo.length && iisWalkMemo[ty] >= 1 {
+    return iisWalkMemo[ty] - 2
+  }
+  iisBusy = iisBusy + 1
+  let ans = -1
+  if walkLeafIsShape(keyed, ty) { ans = internInlineShapeTyGo("", nom, ty, ty) }
+  iisBusy = iisBusy - 1
+  if iisBusy > 0 {
+    while iisWalkMemo.length <= ty { iisWalkMemo.push(0) }
+    iisWalkMemo[ty] = ans + 2
+    iisWalkMemoTys.push(ty)
+  } else {
+    iisSettle()
+  }
+  ans
+}
+
+// The outermost intern's exit: each memo clears the slots it wrote, and late rows settle.
+function iisSettle() {
+  let k = 0
+  while k < iisMemoSids.length {
+    const ks = iisMemoSids[k]
+    if ks >= 0 && ks < iisMemoTy.length { iisMemoTy[ks] = -1 }
+    k = k + 1
+  }
+  iisMemoSids = []
+  for wt in iisWalkMemoTys { iisWalkMemo[wt] = 0 }
+  iisWalkMemoTys = []
+  sLateRows(sNames.length)
 }
 
 // The mint itself, keyed on the variant ROW: a declared field type reaches it by name, an
@@ -821,10 +872,15 @@ let iisBusy: i32 = 0
 const iisMemoRow: i32[] = []
 const iisMemoTy: i32[] = []
 let iisMemoSids: i32[] = []
+// The walk leaf's memo, by type: the answer `+ 2`, 0 for none; and the types written since.
+let iisWalkMemo: i32[] = []
+let iisWalkMemoTys: i32[] = []
 
 // Restarts the depth at compile start, so a compile that stopped mid-intern leaves no memo open.
 export function iisReset() {
   iisBusy = 0
+  iisWalkMemo = []
+  iisWalkMemoTys = []
   iisOwnRow = false
   0
 }
@@ -966,8 +1022,13 @@ function fieldIsConcreteGenApp(fldTy: i32): boolean {
 
 const IIS_SHAPE_FIELD_NO_LAYOUT_MSG = "emitProgram: an inline record field has no storage type to key its row by"
 
-function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
-  if !nameIsShapeSpanEnds(nm) { return -1 }
+// `nm` is the row's label; "" mints it from the type with `shapeWalkLabelOf(nom, tyIx)`.
+function internInlineShapeTyGo(
+  nm: string,
+  nom: boolean,
+  tyIx: i32,
+  fieldsTy: i32,
+) {
   // The fields are the record type's own; a spelling with no record type behind it (a union of
   // records, or no type at all) interns nothing.
   if fieldsTy < 0 { return -1 }
@@ -995,7 +1056,8 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       const fldTy = rawTys[fi]
       if fldTy < 0 { return emitFail(IIS_SHAPE_FIELD_NO_LAYOUT_MSG) }
       internShapeDeepTy(fldTy)
-      let fc = nameFieldCodeTy("", fldTy)
+      // The field's code is read off its type.
+      let fc = nameFieldCodeTy(fldTy)
       if fc < 0 {
         // A nested inline-shape field interns the nested shape and stores a struct ref on it.
         if nestedFieldShapeRow(fldTy) >= 0 {
@@ -1068,11 +1130,12 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
   // Interned under the annotation text itself (`{v:i32}`) — a real key, so
   // `structIndexByName` on the annotation (or on a ref-list element name `{v:i32}[]` ->
   // `{v:i32}`) resolves directly.
+  const lbl = if nm != "" { nm } else { shapeWalkLabelOf(nom, tyIx) }
   sNames.push(
-    if opaqueSNamesOn() { "#row" + i32ToStr(sNames.length) } else { nm },
+    if opaqueSNamesOn() { "#row" + i32ToStr(sNames.length) } else { lbl },
   )
-  recordSRowDeclOfName(nm)
-  recordSTyIx(sTyIxOfNameTy(nm, tyIx)) // D0
+  recordSRowDeclOfName(lbl)
+  recordSTyIx(sTyIxOfNameTy(lbl, tyIx)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
   // The canonical field order (D622, `fieldNameOrder`): the layout find above matches by
@@ -1131,17 +1194,9 @@ export function internShapeAs(key: string, nm: string) {
     if rawNames[fi] == "" {
       return emitFail("emitProgram: malformed struct field")
     }
-    const fc = nameFieldCodeTy(
-      rawTexts[fi],
-      shapeFieldRowOf(fieldsTy, rawNames[fi]),
-    )
+    const fc = nameFieldCodeTy(shapeFieldRowOf(fieldsTy, rawNames[fi]))
     if fc < 0 {
-      return emitFail(
-        fieldTypeRefusalMsg(
-          rawTexts[fi],
-          shapeFieldRowOf(fieldsTy, rawNames[fi]),
-        ),
-      )
+      return emitFail("emitProgram: struct field type has no struct-field rep")
     }
     names.push(rawNames[fi])
     codes.push(fc)

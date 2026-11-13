@@ -1092,7 +1092,6 @@ import {
   mapReadNarrowedContainer,
   mapShapeOfExpr,
   memNarrowAtomKind,
-  memReadBoxNarrowName,
   memReadBoxNarrowTy,
   memReadBoxedAtomKind,
   memReadNarrowOp,
@@ -1529,7 +1528,6 @@ import {
   msSetTakesAtomAsStr,
   msSubNull,
   printPlanPinNull,
-  removeAtomFromSet,
   rlElemUnionName,
   tyBoxTakesAtomAsStr,
   unMemIsMap,
@@ -1537,7 +1535,6 @@ import {
   unionArmsOf,
   unionArmsOfTy,
   unionHasAtomOfTy,
-  unionMemberSetOf,
   unionMemberSetOfRow,
   unionMemberTysOfRow,
   unionRowKeyAB,
@@ -1605,6 +1602,7 @@ import {
   boxTagOfTy,
   mapShapeKeyInt,
   mapShapeKeyKind,
+  msHasPlainValKind,
   msIsValueUnion,
   msMemberValKindsOf,
   msSetCarriesLitUnionArm,
@@ -1702,7 +1700,6 @@ import {
   MAP_KEY_I32,
   MAP_KEY_I64,
   MAP_KEY_STR,
-  isValueUnionName,
   mapTwinUnionMember,
   mapTyValIsBool,
   mapTyValIsLitUnion,
@@ -4563,7 +4560,7 @@ function litMembershipRecvOk(recvIx: i32, fnIx: i32) {
     const bxNm = unionNameRowOfExpr(recvIx, fnIx, bxr)
     if bxNm == "" { return false }
     const bxs = msSetOfRowOr(bxr[0], bxNm)
-    if isValueUnionOfSet(bxs, bxNm) { return true }
+    if isValueUnionOfSet(bxs, bxr[1]) { return true }
     return unionCarriesLitUnionArmOfSet(bxs, bxr[1])
   }
   if nodeTyIsLitUnion(recvIx) { return true }
@@ -6797,7 +6794,7 @@ function emitIsTestLitArms(body: u8[], isIx: i32, nd0: IsExpr, fnIx: i32) {
       const nbNm = unionNameRowOfExpr(nd0.isObj, fnIx, nbr)
       if (
         nbNm != ""
-        && (isValueUnionOfSet(msSetOfRowOr(nbr[0], nbNm), nbNm)
+        && (isValueUnionOfSet(msSetOfRowOr(nbr[0], nbNm), nbr[1])
           || unionCarriesLitUnionArmOfSet(msSetOfRowOr(nbr[0], nbNm), nbr[1]))
       ) {
         let nbI = 0
@@ -7140,7 +7137,7 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
     const boxNo = exprUnion(nd.isObj, fnIx)
       && tyIsRecord(isVarTyIxOf(isIx))
       && boxNm != ""
-      && (isValueUnionOfSet(msSetOfRowOr(boxr[0], boxNm), boxNm)
+      && (isValueUnionOfSet(msSetOfRowOr(boxr[0], boxNm), boxr[1])
       || unionCarriesLitUnionArmOfSet(
       msSetOfRowOr(boxr[0], boxNm),
       boxr[1],
@@ -8207,13 +8204,12 @@ function listWrapHeapOfKind(k: i32) {
 }
 
 // The banked value-atom kind of the single member left when `null` is removed from the member
-// set `s` — the structural form of `valueAtomKind(removeAtomFromSet(set, "null"))`, which four
-// `… | null` peeling sites ask. `msSubNull` clears the null members' bits structurally, so the
-// residual set keeps its identity rather than being rendered and re-parsed for the ABI code.
+// set `s`, which four `… | null` peeling sites ask. `msSubNull` clears the null members' bits
+// structurally, so the residual set keeps its identity.
 
 // A singleton yields the member's kind straight out of the bank `recordUnMemTys` filled, a
 // non-singleton -1, and -2 means the pool does not cover the set — a narrowed subset spelling
-// it never interned — so the caller keeps its rendered-atom path. Takes a set id, never a text.
+// it never interned — which each caller refuses loudly. Takes a set id, never a text.
 function unionResidualSoloKindOfSet(s: i32) {
   if s < 0 { return -2 }
   msSoloValKind(msSubNull(s))
@@ -8231,13 +8227,18 @@ function setHasNullAtom(s: i32): boolean {
 // the member ABI codes off the bank, where the name path scans the whole rendering twice and
 // materializes every atom for the same predicate.
 
-// The caller resolves the set id. The name fallback resolves a declared
-// alias first — `isValueUnionName` splits at top-level `|`, so `type WN = N | string` is one
-// atom of kind -1 and answers no where the inline spelling answers yes.
-function isValueUnionOfSet(s: i32, nm: string): boolean {
+// The caller resolves the set id `s` (-1 where a name lookup found none) and passes the union's
+// type `ty`: the set answers, else the type's own member set. A union neither answers is a loud
+// floor.
+function isValueUnionOfSet(s: i32, ty: i32): boolean {
   const v = msIsValueUnion(s)
   if v >= 0 { return v == 1 }
-  isValueUnionName(unionMemberSetOf(nm))
+  const tv = msIsValueUnion(msSetOfTyAny(ty))
+  if tv >= 0 { return tv == 1 }
+  emitFail(
+    "emitProgram: a union's value-box verdict is read off neither its member set nor its type",
+  )
+  false
 }
 
 // True if a value-union atom of kind `k` is a ref that rides the box's anyref `value` directly
@@ -8782,10 +8783,9 @@ function unionBoxHasNoRow(unionName: string, unionTy: i32): boolean {
   const atoms: string[] = []
   msMemberAtomsOfSet(msSetOfTyAny(unionTy), atoms)
   if atoms.length < 2 { return false }
-  for a in atoms {
-    const k = valueAtomKind(a)
-    if k >= 0 && k != 6 { return true }
-  }
+  emitFail(
+    "emitProgram: a record delivered into a rowless union box has no typed member test",
+  )
   false
 }
 
@@ -9112,7 +9112,7 @@ function emitUnionCoerceValueAtom(
     const nlTexts = nulAtomWidenTexts(exprIx, fnIx)
     if nlTexts.length > 0 {
       // Beside a plain `string` arm the join is `string | null`, not this box.
-      const nlStrArm = unionTyHasValKindOf(uTy, valueAtomKind("string"))
+      const nlStrArm = msHasPlainValKind(msSetOfTyAny(uTy), 2)
       // A binding typed `K | null` holds the atom at every spelling; a parameter does too, unless
       // its function's declared return reads the box at the declaration's rep.
       const nlArg = nodeAt(unwrapParen(exprIx))
@@ -10893,7 +10893,7 @@ function emitUnionConcreteEq(
   if !eqHasArm && eak == 2 && msSetTakesAtomAsStr(usid) { eqHasArm = true }
   if (
     uname == ""
-    || (!isValueUnionOfSet(usid, uname)
+    || (!isValueUnionOfSet(usid, unr[1])
       && !unionCarriesLitUnionArmOfSet(usid, unr[1])
       && !eqHasArm)
   ) {
@@ -11954,7 +11954,7 @@ function emitUnionUnionEq(
   // need it: it evaluates each operand once into its own slot and reads the slots. The gate
   // exists for the value-union lowering below, which re-reads both sides per arm.
   if lname != "" && lname == rname {
-    if !isValueUnionOfSet(msSetOfUnion(lname), lname) {
+    if !isValueUnionOfSet(msSetOfUnion(lname), lUTy) {
       if emitStructUnionEq(body, lIx, rIx, isNe, lUTy, fnIx) == 0 { return 0 }
     }
   }
@@ -11998,9 +11998,9 @@ function emitUnionUnionEq(
   const lsid = msSetOfUnion(lname)
   const rsid = msSetOfUnion(rname)
   // A literal-union arm rides a value box as its member string, so it compares as one (D3347).
-  const lVal = isValueUnionOfSet(lsid, lname)
+  const lVal = isValueUnionOfSet(lsid, unionEqOperandTy(lIx, fnIx))
     || unionCarriesLitUnionArmOfSet(lsid, unionEqOperandTy(lIx, fnIx))
-  const rVal = isValueUnionOfSet(rsid, rname)
+  const rVal = isValueUnionOfSet(rsid, unionEqOperandTy(rIx, fnIx))
     || unionCarriesLitUnionArmOfSet(rsid, unionEqOperandTy(rIx, fnIx))
   if !lVal || !rVal {
     // A struct union compares by tag, then by the arm's fields (D973), riding the same
@@ -12073,7 +12073,11 @@ function emitUnionUnionEq(
   let ki = 0
   while ki < arms.length {
     let armK = armKinds[ki]
-    if armK == -2 { armK = valueAtomKind(arms[ki]) }
+    if armK == -2 {
+      return emitFail(
+        "emitProgram: a union == arm has no banked kind: " + arms[ki],
+      )
+    }
     const armTy = unionArmTyOfAtomTy(lname, lTy, arms[ki])
     armK = boxArmKindOfTy(armK, armTy)
     armKs.push(armK)
@@ -15163,9 +15167,11 @@ function emitMapGetOrUnionBox(
     // the rendered atom instead. That fallback is unreached on the corpus and fuzz
     // corpora (`docs/internals/destringify-types-program.md` P-RCH/P-SITE) because an
     // alias-spelled nullable value union is rejected by the checker before emit.
-    let ak = unionResidualSoloKindOfSet(uvsid)
+    const ak = unionResidualSoloKindOfSet(uvsid)
     if ak == -2 {
-      ak = valueAtomKind(removeAtomFromSet(uvn, "null", mvValTyIxAt(mslot)))
+      return emitFail(
+        "emitProgram: scalar|null map value has no banked residual kind",
+      )
     }
     const vb = vbHeapIdxOfKind(ak)
     if vb < 0 {
@@ -32647,15 +32653,8 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
   let isU = false
   if rk == "union" { isU = true }
   if r < 0 {
-    const inm = inferRetNameOf(inferRetFnKey(fnIx, fn.fnName))
-    if (
-      isValueUnionOfSet(
-        msSetOfTy(inferRetTyIxOf(inferRetFnKey(fnIx, fn.fnName))),
-        inm,
-      )
-    ) {
-      isU = true
-    }
+    const irTy = inferRetTyIxOf(inferRetFnKey(fnIx, fn.fnName))
+    if isValueUnionOfSet(msSetOfTy(irTy), irTy) { isU = true }
   }
   if isU {
     fbI32Rel(RS_TAG, nullBoxTag())
@@ -38425,16 +38424,6 @@ function njKindsOfUnion(u: i32, unionName: string): i32[] {
   ks
 }
 
-// Whether union type `ty`'s member set banks value kind `k`; false where it has no banked kinds.
-function unionTyHasValKindOf(ty: i32, k: i32): boolean {
-  const ks: i32[] = []
-  if !msMemberValKindsOf(msSetOfTyAny(ty), ks) { return false }
-  for x in ks {
-    if x == k { return true }
-  }
-  false
-}
-
 // The destination kind a numeric member of kind `k` is stored at in a union of kinds `dk`: its
 // own, else the one it widens to exactly (`i64` then `f64` for `i32`, `f64` for `f32`); -1 none.
 function njStoreKind(k: i32, dk: i32[]): i32 {
@@ -41318,7 +41307,7 @@ function emitCoalesceIdentBox(
     // type). The receiver is a pure name, re-read in the non-null arm.
     const cunm = unionNameOfRead(lhsIx, fnIx)
     if cunm != "" {
-      const cak = coalValUnionResidualKind(lhsIx, cunm, fnIx)
+      const cak = coalValUnionResidualKind(lhsIx, fnIx)
       if cak >= 0 && cak != nullValKind() {
         return emitCoalesceValUnionIdent(
           body,
@@ -41355,23 +41344,30 @@ function emitCoalesceBoolPop(body: u8[], e: BinExpr, fnIx: i32): i32 {
 }
 
 // The banked ABI code of the one member left when `null` is removed from the read `lhsIx`'s
-// value union `cunm`, or -1 when `cunm` is not a value union holding `null`. A negative
-// answer, or the null kind itself, means the arm declines.
-function coalValUnionResidualKind(lhsIx: i32, cunm: string, fnIx: i32): i32 {
+// value union, or -1 when its type is not a value union holding `null`. A negative answer, or
+// the null kind itself, means the arm declines.
+function coalValUnionResidualKind(lhsIx: i32, fnIx: i32): i32 {
   // D-VALUNION resolves the declared union's set; the narrowing table's id below answers a
   // different question (the set surviving the narrow), so both stay resolved, and the null
   // test is a kind test over the banked codes.
   const csid = msSetOfTy(nodeTyAt(lhsIx, fnIx))
-  if (!isValueUnionOfSet(csid, cunm) || !setHasNullAtom(csid)) { return -1 }
+  if (
+    !isValueUnionOfSet(csid, nodeTyAt(lhsIx, fnIx))
+    || !setHasNullAtom(csid)
+  ) {
+    return -1
+  }
   // A read the checker narrowed is the set of its narrowed type; an unnarrowed one the declared
   // union's. The rendered residual is built only where the pool covers no set.
   const nt = readNarrowedTyAt(lhsIx, fnIx)
   if nt >= 0 { return unionResidualSoloKindOfSet(msSetOfTyAny(nt)) }
-  let cak = unionResidualSoloKindOfSet(
+  const cak = unionResidualSoloKindOfSet(
     msSetOfTy(unionDeclTyIxOfExpr(lhsIx, fnIx)),
   )
   if cak == -2 {
-    cak = valueAtomKind(removeAtomFromSet(cunm, "null", nodeTyIxOf(lhsIx)))
+    return emitFail(
+      "emitProgram: `??` over a nullable value union has no banked residual kind",
+    )
   }
   cak
 }
@@ -41565,13 +41561,13 @@ function emitCoalesceCallStash(
       // residual code below, which master resolved a second time inside
       // `unionResidualSoloKindOfSet`.
       const ksid = msSetOfTy(nodeTyIxOf(lhsIx))
-      if (isValueUnionOfSet(ksid, kunm) && setHasNullAtom(ksid)) {
+      if (isValueUnionOfSet(ksid, nodeTyIxOf(lhsIx)) && setHasNullAtom(ksid)) {
         // D-union-atom-kind — see `unionResidualSoloKindOfSet`.
-        let kak = unionResidualSoloKindOfSet(ksid)
+        const kak = unionResidualSoloKindOfSet(ksid)
         if kak == -2 {
-          kak = valueAtomKind(
-            removeAtomFromSet(kunm, "null", nodeTyIxOf(lhsIx)),
-          ) // D-RESIDUE
+          return emitFail(
+            "emitProgram: `??` over a call result has no banked residual kind",
+          )
         }
         if kak >= 0 && kak != nullValKind() {
           if kak == 2 {
@@ -41762,21 +41758,23 @@ function emitCoalesceUnionField(
     if mHeap >= 0 {
       // A wider record's box is read at the receiver's own member set (D3006).
       if memReadBoxAmbiguous(lhsIx, fnIx) { return emitBoxAmbiguousFail(lhsIx) }
-      let munm = memReadBoxNarrowName(lhsIx, fnIx)
-      let munTy = memReadBoxNarrowTy(lhsIx, fnIx)
-      if munm == "" {
-        munm = mphys
-        munTy = mphysTy
+      // A box rebuilt at a narrower union has no `??` lowering; the field's own box is read.
+      if memReadBoxNarrowTy(lhsIx, fnIx) >= 0 {
+        return emitFail(
+          "emitProgram: `??` over a narrowed union-box field read",
+        )
       }
+      const munm = mphys
+      const munTy = mphysTy
       // D-VALUNION + D-SETONCE — see the call arm above.
       const msid = msSetOfTy(munTy)
-      if (isValueUnionOfSet(msid, munm) && setHasNullAtom(msid)) {
+      if (isValueUnionOfSet(msid, munTy) && setHasNullAtom(msid)) {
         // D-union-atom-kind — see `unionResidualSoloKindOfSet`.
-        let mak = unionResidualSoloKindOfSet(msid)
+        const mak = unionResidualSoloKindOfSet(msid)
         if mak == -2 {
-          mak = valueAtomKind(
-            removeAtomFromSet(munm, "null", nodeTyIxOf(lhsIx)),
-          ) // D-RESIDUE
+          return emitFail(
+            "emitProgram: `??` over a union field has no banked residual kind",
+          )
         }
         if mak >= 0 && mak != nullValKind() {
           if mak == 2 {

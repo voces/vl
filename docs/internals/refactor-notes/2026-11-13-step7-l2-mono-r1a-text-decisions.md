@@ -34,3 +34,8 @@ The walk took two refinements before it agreed with the scan:
 
 Master vs PR over every program reaching any of the three: **2,515 of 2,515 identical** (2,501
 SAME, 14 SAME refusal).
+
+## Census
+
+One render leaves: the deleted spelling comparison in `monoTagRecordPinKind`. The baseline is
+lowered by it. The nominal-name space-strip stays an inline loop, so the render count only falls.
