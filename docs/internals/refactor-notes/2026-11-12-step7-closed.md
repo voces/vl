@@ -52,9 +52,21 @@ contract carries no exception), and lane E's field-set spelling key (#7707).
 | lane | sites |
 | --- | --- |
 | E / F (D6 re-key) | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; the `nm` input `variantNestedRow` and `armFieldStructRowMinted` hand `internInlineShapeTy` |
-| G | `unionNameOfCall`; `unionNameOfExpr`'s producer-internal calls (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2) and `emitUnionUnionEq` ×2 |
+| A | `unionNameOfCall` |
+| G | `unionNameOfExpr`'s producer-internal calls (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2) and `emitUnionUnionEq` ×2 |
 | D | `monoAnonPinDiscrim`, converting to the pin's type (ruled), PR to come |
-| ruling asked | `printUnionPlanCode`'s D16060 fallback: a field read through an un-annotated parameter is typed at the hole, so only the name rung knows the members. A checker-side gap, as D16010 was ruled, or a step-7 item |
+
+## Floors held by a filed row
+
+Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the site reads a name
+because the checker records no type there. Each is filed `runs today and must keep running`, and
+its witness runs as filed on master `54b68c07`. The close carries them forward.
+
+| row | site | the gap |
+| --- | --- | --- |
+| [D15976](../inventory/D15976.md) | `emitObj` → `fieldRowKindIn` | a record field's un-annotated `[]`-or-`null` join reaches emit with its element hole unfilled |
+| [D16010](../inventory/D16010.md) | `sLitMintRow` | a hole instance's record literal has no elaborated type, so it builds at its minted row |
+| [D16060](../inventory/D16060.md) | `printUnionPlanCode`'s name fallback | a field read through an un-annotated parameter stays typed at the hole in its instance |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
 
