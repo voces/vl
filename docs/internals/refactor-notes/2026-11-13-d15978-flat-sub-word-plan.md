@@ -56,7 +56,7 @@ There are four templates, one per width:
   literal, field assignment, a nested `flat`, a list element's field, `p.a + 1`, and the
   out-of-range literal (an owed refusal).
 
-Graded on master `57cda2b6`, the `--before` picture:
+Graded on master `57cda2b6`, the `--before` picture. The two findings beyond D15978 are filed: D16044 (an `i8` literal above 127 is accepted, clause 1) and D16045 (`p.a + 1` refused, the read not widened):
 
 | width | graded | runs | WRONG (unnarrowed) | check refuses | owed |
 | --- | --- | --- | --- | --- | --- |
