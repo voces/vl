@@ -1,6 +1,6 @@
 import { exactArmRowOfTy } from "./emit_local_slots"
 import { sFieldElemSame, unMemAtoms } from "./emit_state"
-import { unMemRowStart } from "./emit_rep"
+import { unMemRowStart, valueBoxOfTy, valueBoxRowOfTy } from "./emit_rep"
 
 // `emit_union_atoms.vl` — which value unions carry atoms or map arms, the
 // map-value shapes they intern, and the twins a variant is built with.
@@ -12,9 +12,7 @@ import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
 import { recBuildElemTyOfInit } from "./check_rec_rows"
 import {
   canonUnionKeyTextOfTy,
-  keyAtomKindOfList,
   keyTextValueUnionVerdict,
-  rowNameValueUnionVerdict,
 } from "./check_inline_lit_union"
 import {
   nodeTyMapValIsLitUnion,
@@ -24,8 +22,6 @@ import { nodeTyIsMap, nodeTyIxOf, nodeTyMapKeyKind } from "./check_node_tys"
 import {
   MAP_KEY_STR,
   canonUnionKeyAtomOfTy,
-  isValueUnionName,
-  isValueUnionTyOr,
   mapTwinUnionMember,
   nameIsLitUnionArmValueUnion,
   storedTyOf,
@@ -476,10 +472,7 @@ function mvShapeOfValNameArmTyGo(
   // rides the box payload and needs none. A map arm's mv value slot is interned so the
   // store-coerce tag and the narrowed read resolve the same slot.
   if kind == MVK_UNION {
-    const rv = rowNameValueUnionVerdict(kindTy)
-    if rv == 1 || (rv < 0 && isValueUnionName(valName)) {
-      registerValueUnionOfTy(60, kindTy)
-    }
+    if valueBoxOfTy(kindTy) { registerValueUnionOfTy(60, kindTy) }
     markMapUnionArms(kindTy)
   }
   // The slot's identity is structural — `repMvValKey` over the value's arena type — paired
@@ -1409,14 +1402,7 @@ function registerValueUnionNameTy(name: string, tyIx: i32) {
   // loudly: every registration reaching here carries a type the rows place. A value union
   // with a litunion-alias arm registers here too, since the alias rides the box as its
   // member-string atom — without it the scalar arms' value boxes are never minted.
-  const isVU = isValueUnionTyOr(tyIx)
-  if isVU < 0 {
-    emitFail(
-      "emitProgram: a value-union registration has a type its rows cannot place",
-    )
-    return 0
-  }
-  if isVU == 0 && !nameIsLitUnionArmValueUnion(name) { return 0 }
+  if !valueBoxRowOfTy(tyIx) && !nameIsLitUnionArmValueUnion(name) { return 0 }
   pushValueUnionRow(name, tyIx)
 }
 
@@ -1459,13 +1445,7 @@ export function mintValueUnionRowOfTy(ty: i32) {
   if ty < 0 || unRowOfTyKey(ty) >= 0 || nulLitUnionPeelTy(ty) >= 0 { return 0 }
   const text = canonUnionKeyTextOfTy(ty)
   if text == "" { return 0 }
-  const kv = keyTextValueUnionVerdict(ty)
-  if (
-    isValueUnionTyOr(ty) != 1
-    && !(kv == 1 || (kv < 0 && isValueUnionName(text)))
-  ) {
-    return 0
-  }
+  if !valueBoxRowOfTy(ty) && keyTextValueUnionVerdict(ty) != 1 { return 0 }
   pushValueUnionRow(text, ty)
 }
 
@@ -1475,11 +1455,7 @@ export function valueUnionKeyTextOfTy(ty: i32): string {
   if ty < 0 { return "" }
   const text = canonUnionKeyTextOfTy(ty)
   if text == "" { return "" }
-  const vu = isValueUnionTyOr(ty)
-  const kv = keyTextValueUnionVerdict(ty)
-  if vu == 1 || (vu < 0 && (kv == 1 || (kv < 0 && isValueUnionName(text)))) {
-    return text
-  }
+  if valueBoxRowOfTy(ty) { return text }
   ""
 }
 
@@ -1487,9 +1463,7 @@ export function valueUnionKeyTextOfTy(ty: i32): string {
 // spelling is a value union, else "".
 export function valueUnionNameOfTy(ty: i32): string {
   const text = unionSpellingOfTy(ty, 8)
-  if text == UNION_SPELLING_DECLINE || spellingValueUnionVerdict(ty, 8) != 1 {
-    return ""
-  }
+  if text == UNION_SPELLING_DECLINE || !valueBoxOfTy(ty) { return "" }
   text
 }
 
@@ -1638,171 +1612,6 @@ function unionPartSpelling(m: i32, depth: i32): string {
     }
     // A record or a map is no value atom, and a hole has no spelling.
     TyObj | TyMap | TyVar | TyNeg | TyErr => UNION_SPELLING_DECLINE
-  }
-}
-
-// The value-union verdict of `unionSpellingOfTy(ty, depth)`'s spelling, decided arm for arm over the
-// kinds of its parts, a part equal to an earlier one dropped as the speller drops it (by a key that
-// equals when the part's spelling does). 1 or 0; -1 where the speller declines. A change to
-// `unionSpellingOfTy` changes this.
-export function spellingValueUnionVerdict(ty: i32, depth: i32): i32 {
-  const kinds: i32[] = []
-  const keys: string[] = []
-  if !specOfTy(ty, depth, kinds, keys) { return -1 }
-  if valueUnionFromAtomKinds(kinds) { 1 } else { 0 }
-}
-
-// The parts of a spelling key, `|`-joined.
-function keyJoin(ps: string[]): string {
-  let out = ""
-  for p in ps {
-    if out != "" { out = out + "|" }
-    out = out + p
-  }
-  out
-}
-
-// `unionSpellingOfTy`'s walk: appends the kinds of `ty`'s spelling to `kinds` and its parts' keys to
-// `keys`; false where it declines.
-function specOfTy(ty: i32, depth: i32, kinds: i32[], keys: string[]): boolean {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
-  const t = tyAt(ty)
-  match t {
-    TyUnion => specMembers(ty, t.uMembers, depth, kinds, keys)
-    TyNullable => specNullable(t.nInner, depth, kinds, keys)
-    TyPrim | TyLit | TyObj | TyArray | TyMap | TyFunc | TyVar | TyNeg | TyErr => false
-  }
-}
-
-// `unionMembersSpelling`'s walk over the members `ms` of union `ty`.
-function specMembers(
-  ty: i32,
-  ms: i32[],
-  depth: i32,
-  kinds: i32[],
-  keys: string[],
-): boolean {
-  if ms.length == 0 { return false }
-  if litUnionInlineNameOfTy(ty) != "" {
-    for m in ms {
-      if isNullTy(m) {
-        kinds.push(-1)
-        kinds.push(6)
-        keys.push("lui")
-        return true
-      }
-    }
-  }
-  const rgAlias = mixedLitRunAliasOf(ms)
-  const partKeys: string[] = []
-  let rgDone = false
-  for m in ms {
-    const pk: i32[] = []
-    const pkeys: string[] = []
-    if rgAlias != "" && tyAt(m) is TyLit {
-      if rgDone { continue }
-      rgDone = true
-      pk.push(-1)
-      pkeys.push("al:" + rgAlias)
-    } else if !specPart(m, depth - 1, pk, pkeys) {
-      return false
-    }
-    const key = keyJoin(pkeys)
-    let dup = false
-    for p in partKeys {
-      if p == key { dup = true }
-    }
-    if !dup {
-      partKeys.push(key)
-      for k in pk { kinds.push(k) }
-    }
-  }
-  keys.push(keyJoin(partKeys))
-  true
-}
-
-// `nullableSpelling`'s walk over `T | null`'s `inner`.
-function specNullable(
-  inner: i32,
-  depth: i32,
-  kinds: i32[],
-  keys: string[],
-): boolean {
-  if inner < 0 || inner >= T.tys.length { return false }
-  if (
-    litUnionAliasNameOfTy(inner) != ""
-    || litUnionInlineNameOfTy(inner) != ""
-    || oneStrLitSpelling(inner) != ""
-  ) {
-    kinds.push(-1)
-    kinds.push(6)
-    keys.push("grp|null")
-    return true
-  }
-  const pkeys: string[] = []
-  if !specPart(inner, depth - 1, kinds, pkeys) { return false }
-  kinds.push(6)
-  keys.push(keyJoin(pkeys) + "|null")
-  true
-}
-
-// `unionPartSpelling`'s walk over one member `m`: its kinds and its key, false where it declines.
-function specPart(m: i32, depth: i32, kinds: i32[], keys: string[]): boolean {
-  if m < 0 || m >= T.tys.length || depth <= 0 { return false }
-  const al = litUnionAliasNameOfTy(m)
-  if al != "" {
-    kinds.push(-1)
-    keys.push("al:" + al)
-    return true
-  }
-  const t = tyAt(m)
-  match t {
-    TyPrim => {
-      if t.primName == "never" { return false }
-      const k = valueRowKind(m)
-      kinds.push(if k < 0 { -1 } else { k })
-      keys.push("p:" + t.primName)
-      true
-    }
-    TyLit => {
-      const b = litBaseTy(t)
-      if b < 0 || b >= T.tys.length { return false }
-      const bt = tyAt(b)
-      if bt is TyPrim {
-        const k = valueRowKind(b)
-        kinds.push(if k < 0 { -1 } else { k })
-        keys.push("p:" + bt.primName)
-        return true
-      }
-      false
-    }
-    TyUnion => {
-      const sub: string[] = []
-      if !specMembers(m, t.uMembers, depth, kinds, sub) { return false }
-      keys.push("u:" + keyJoin(sub))
-      true
-    }
-    TyNullable => {
-      const sub: string[] = []
-      if !specNullable(t.nInner, depth, kinds, sub) { return false }
-      keys.push("n:" + keyJoin(sub))
-      true
-    }
-    TyArray => {
-      const k = keyAtomKindOfList(m)
-      kinds.push(k)
-      // Keyed by the atom the speller writes, so two lists drop together exactly when their spellings do.
-      keys.push("a:" + canonUnionKeyAtomOfTy(m))
-      true
-    }
-    TyFunc => {
-      const sig = cloSigNameOfTy(m)
-      if sig == "" { return false }
-      kinds.push(11)
-      keys.push("f:" + sig)
-      true
-    }
-    TyObj | TyMap | TyVar | TyNeg | TyErr => false
   }
 }
 
@@ -2824,7 +2633,7 @@ export function registerValueUnionNameAB(
 // Whether `ty` is a value union whose members are its spelling's atoms: no literal member, which
 // the spelling softens to its base, and no nested union alias, which the spelling flattens.
 function valueUnionTyIsFlat(ty: i32): boolean {
-  if isValueUnionTyOr(ty) != 1 { return false }
+  if !valueBoxRowOfTy(ty) { return false }
   let u = ty
   const t = tyAt(ty)
   if t is TyNullable { u = t.nInner }
