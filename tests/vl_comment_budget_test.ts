@@ -10,7 +10,7 @@
 //
 // @test-timing sweep n=30
 
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 const TOO_LONG = "comment-block-too-long";
 const UNCITED = "comment-measurement-uncited";
 const SHOUTING = "comment-shouting";
@@ -25,7 +25,8 @@ if (GATED && !ENABLED) {
 }
 
 const dull = (n: number, tag: string) =>
-  Array.from({ length: n }, (_, i) => `// ${tag} line ${i + 1} of the block`).join("\n");
+  Array.from({ length: n }, (_, i) => `// ${tag} line ${i + 1} of the block`)
+    .join("\n");
 
 // Every `dull` line reads "line N of the block" — no unit, no date, no verdict, no
 // capitals, no history phrase — so a long run of them trips clause 1 ONLY. That
@@ -147,14 +148,24 @@ type Hits = { lines: Record<string, number[]>; msgs: string[] };
 const lint = async (dir: string, file: string): Promise<Hits> => {
   const path = `compiler/${file}`;
   const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: ["check", path, "--severity", "info", "--json", "--compiler", COMPILER],
+    args: [
+      "check",
+      path,
+      "--severity",
+      "info",
+      "--json",
+      "--compiler",
+      COMPILER,
+    ],
     cwd: dir,
     stdout: "piped",
     stderr: "piped",
     env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
   if (code > 1) {
-    throw new Error(`vl check ${path} exited ${code}: ${new TextDecoder().decode(stderr)}`);
+    throw new Error(
+      `vl check ${path} exited ${code}: ${new TextDecoder().decode(stderr)}`,
+    );
   }
   const all = JSON.parse(new TextDecoder().decode(stdout)) as {
     file: string;
@@ -163,10 +174,15 @@ const lint = async (dir: string, file: string): Promise<Hits> => {
     message: string;
   }[];
   // A graph target lints its deps too; only the fixture under test is compared.
-  const diags = all.filter((d) => d.file.endsWith(`/${path}`) || d.file === path);
+  const diags = all.filter((d) =>
+    d.file.endsWith(`/${path}`) || d.file === path
+  );
   const lines: Record<string, number[]> = {};
   for (const c of CODES) {
-    lines[c] = diags.filter((d) => d.code === c).map((d) => d.line).sort((x, y) => x - y);
+    lines[c] = diags.filter((d) => d.code === c).map((d) => d.line).sort((
+      x,
+      y,
+    ) => x - y);
   }
   return {
     lines,
@@ -174,10 +190,12 @@ const lint = async (dir: string, file: string): Promise<Hits> => {
   };
 };
 
-const eq = (a: number[], b: number[]) => JSON.stringify(a) === JSON.stringify(b);
+const eq = (a: number[], b: number[]) =>
+  JSON.stringify(a) === JSON.stringify(b);
 
 Deno.test({
-  name: "comment rules: the lint grades every fixture to the line, all four codes",
+  name:
+    "comment rules: the lint grades every fixture to the line, all four codes",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_comment_budget_" });
@@ -193,7 +211,9 @@ Deno.test({
         const want = f.want[c] ?? [];
         if (!eq(l.lines[c], want)) {
           throw new Error(
-            `${f.name}: want ${c} at lines ${JSON.stringify(want)}, compiler/lint.vl got ` +
+            `${f.name}: want ${c} at lines ${
+              JSON.stringify(want)
+            }, compiler/lint.vl got ` +
               `${JSON.stringify(l.lines[c])}`,
           );
         }
@@ -203,7 +223,9 @@ Deno.test({
         if (l.msgs.length !== 1 || !l.msgs[0].includes(f.says)) {
           throw new Error(
             `${f.name}: the ${TOO_LONG} message must name the budget it applied — want ` +
-              `one message containing "${f.says}", got ${JSON.stringify(l.msgs)}`,
+              `one message containing "${f.says}", got ${
+                JSON.stringify(l.msgs)
+              }`,
           );
         }
       }
@@ -238,16 +260,29 @@ export function loud(): i32 { 2 }
 export function told(): i32 { 3 }
 `;
 
-const lintIn = async (dir: string, rel: string): Promise<Record<string, number[]>> => {
+const lintIn = async (
+  dir: string,
+  rel: string,
+): Promise<Record<string, number[]>> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: ["check", rel, "--severity", "info", "--json", "--compiler", COMPILER],
+    args: [
+      "check",
+      rel,
+      "--severity",
+      "info",
+      "--json",
+      "--compiler",
+      COMPILER,
+    ],
     cwd: dir,
     stdout: "piped",
     stderr: "piped",
     env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
   if (code > 1) {
-    throw new Error(`vl check ${rel} exited ${code}: ${new TextDecoder().decode(stderr)}`);
+    throw new Error(
+      `vl check ${rel} exited ${code}: ${new TextDecoder().decode(stderr)}`,
+    );
   }
   const all = JSON.parse(new TextDecoder().decode(stdout)) as {
     code?: string;
@@ -255,13 +290,16 @@ const lintIn = async (dir: string, rel: string): Promise<Record<string, number[]
   }[];
   const lines: Record<string, number[]> = {};
   for (const c of CODES) {
-    lines[c] = all.filter((d) => d.code === c).map((d) => d.line).sort((x, y) => x - y);
+    lines[c] = all.filter((d) => d.code === c).map((d) => d.line).sort((x, y) =>
+      x - y
+    );
   }
   return lines;
 };
 
 Deno.test({
-  name: "comment rules: the four codes skip a std module and fire on a compiler one",
+  name:
+    "comment rules: the four codes skip a std module and fire on a compiler one",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_comment_scope_" });
@@ -284,7 +322,9 @@ Deno.test({
       for (const c of CODES) {
         if (inStd[c].length !== 0) {
           throw new Error(
-            `${c} fired on a std module at lines ${JSON.stringify(inStd[c])} — ` +
+            `${c} fired on a std module at lines ${
+              JSON.stringify(inStd[c])
+            } — ` +
               `comment-style.md is the compiler's rubric; std is graded by ` +
               `std-comment-audience (D1601)`,
           );
@@ -299,22 +339,30 @@ Deno.test({
 Deno.test({
   name: "comment rules: the ratchet baseline counts the compiler graph only",
   fn: () => {
-    const b = JSON.parse(Deno.readTextFileSync(`${ROOT}/scripts/comment-budget-baseline.json`)) as {
+    const b = JSON.parse(
+      Deno.readTextFileSync(`${ROOT}/scripts/comment-budget-baseline.json`),
+    ) as {
       targets?: string[];
-      total?: Record<string, number>;
+      codes?: string[];
       files?: Record<string, unknown>;
     };
     const targets = b.targets ?? [];
     if (targets.length !== 1 || targets[0] !== "compiler/entry.vl") {
       throw new Error(
         `the comment ratchet must count compiler/entry.vl's graph alone — the lint no longer produces std ` +
-          `counts, so a baseline for them can never fall. targets: ${JSON.stringify(targets)}`,
+          `counts, so a baseline for them can never fall. targets: ${
+            JSON.stringify(targets)
+          }`,
       );
     }
     for (const c of CODES) {
-      if (typeof b.total?.[c] !== "number") throw new Error(`the baseline budgets no ${c}`);
+      if (!(b.codes ?? []).includes(c)) {
+        throw new Error(`the baseline budgets no ${c}`);
+      }
     }
     const std = Object.keys(b.files ?? {}).filter((f) => f.startsWith("std/"));
-    if (std.length > 0) throw new Error(`the baseline holds std rows: ${JSON.stringify(std)}`);
+    if (std.length > 0) {
+      throw new Error(`the baseline holds std rows: ${JSON.stringify(std)}`);
+    }
   },
 });
