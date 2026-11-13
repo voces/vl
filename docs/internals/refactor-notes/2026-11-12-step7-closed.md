@@ -50,7 +50,7 @@ lane H's `variantNestedRow` lookup (#7679).
 | B | `structRowOfSpelling` chain, one site (`emit_nullable_rets.vl:615`): #7687, open |
 | E | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; all in the D6 re-key (E and F co-own; F's step 1a is #7689), with the D6 interner's `nm` input, which `variantNestedRow` and `armFieldStructRowMinted` hand it |
 | G | `unionNameOfCall`; `unionNameOfExpr`'s 7 call sites: 4 in its own producer (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2), `printUnionPlanCode` (#7690) |
-| D | mono's typed instance key, after #7699 (open; the four instance registries off spellings): `monoSigPinDiscrim` reaches 0 programs and is deleted next cut; `monoAnonPinDiscrim` (7,481 shape-rung decisions in 2,415 programs; the typed test disagrees on 96 in 51) converts to the pin's type; `monoTypedExtra` (5 decisions, 3 programs) converts or is filed |
+| D | mono's typed instance key (#7699 merged: the four instance registries are off spellings, leaving `sNameIx` the one spelling-keyed registry): `monoSigPinDiscrim` reaches 0 programs and is deleted next cut; `monoAnonPinDiscrim` (7,481 shape-rung decisions in 2,415 programs; the typed test disagrees on 96 in 51) converts to the pin's type; `monoTypedExtra` (5 decisions, 3 programs) converts or is filed |
 | A | `emitUnionUnionEq`'s two `unionNameOfExpr` calls (wasmEmit.vl), queued since #7686 |
 | H | `printUnionPlanCode`'s name fallbacks: #7690, open (24 → 2; the 2 filed as D16060) |
 
