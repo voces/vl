@@ -305,6 +305,9 @@ Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the 
 because the checker records no type there. Each is filed `runs today and must keep running`, and
 its witness runs as filed on master `54b68c07`. The close carries them forward.
 
+The close carries 9 rows. Three of them hold the census's 4 floor sites, the `ty-carried-floor` code in
+`scripts/render-parse-floors.txt`: D16022 ×2, D16032 and D16052. D16042 is the ninth, outside the census.
+
 | row | site | the gap |
 | --- | --- | --- |
 | [D15976](../inventory/D15976.md) | `emitObj` → `fieldRowKindIn` | a record field's un-annotated `[]`-or-`null` join reaches emit with its element hole unfilled |
