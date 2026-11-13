@@ -23,7 +23,6 @@ argument, or a bare name's nearest initializer above the call, found by text.
 | emit_mono.vl:1794 | monoArgTyNameRep | nameToTy | (b) synthesized | `epin = arrElemSuffixed(aen)` | 5 | build/sweep/witnesses/inventory/D16022.vl | `#anon0[]` |
 | emit_rep.vl:1098 | repElemTyOfName | resolveAnnot | (a)+(b) render and synthesized | `name (a parameter)` | 113 render, 1 synthesized | build/sweep/witnesses/inventory/D15298.vl | `{f:i32}` |
 | emit_rep.vl:2133 | declTyIxOfName | resolveAnnot | (a)+(b) render and synthesized | `nm (a parameter)` | 123 render, 1 synthesized | build/sweep/witnesses/inventory/D15298.vl | `{f:i32}` |
-| emit_rewrite.vl:3924 | cboxElemNeedsParens | tyTopIndexOf | (c) source | `name (a parameter)` | 2 | tests/cases/loops/exit-first-arm-captured-mutable.vl | `Rec\|null` |
 | emit_union_registry.vl:762 | msFreeSliceOfTy | canonUnionMembersLitsInto | (a) render | `ty (a parameter)` | 6526 | build/sweep/witnesses/inventory/D12921.vl | `(a type, rendered inside)` |
 | wasmEmit.vl:4474 | emitLitMemberEq | nameIsQuotedLeaf | (c) source | `lex (a parameter)` | 52 | build/sweep/witnesses/inventory/D15251.vl | `"x"` |
 | wasmEmit.vl:4716 | emitFieldLitEq | nameIsQuotedLeaf | (c) source | `lex (a parameter)` | 28 | build/sweep/witnesses/inventory/D14570.vl | `"a"` |

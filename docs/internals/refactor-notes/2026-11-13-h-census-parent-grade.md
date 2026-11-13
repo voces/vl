@@ -59,7 +59,7 @@ removed code. No surviving site changes grade.
 ## Source on the corpus, not by construction
 
 A (c) grade has to hold by construction. The tool cannot see where a string was
-made, so these are listed by hand. Three of the six (c) census sites receive
+made, so these are listed by hand. Three of the six (c) census sites received
 text that a type render or the emitter produces:
 
 | site                                              | its input                                                   | owner |
@@ -71,6 +71,9 @@ text that a type render or the emitter produces:
 They count as failing. The other three (`emitLitMemberEq`, `emitFieldLitEq`,
 `emitUnionLitIs` → `nameIsQuotedLeaf`) receive a literal's own lexeme,
 `TyLit.litText` quoted, which holds by construction.
+
+`cboxElemNeedsParens` closed on master before this landed (lane F's cbox parens change), so
+its row is gone from the origins and the sites table, and `ty-source-parse` is 4.
 
 ## 3. Carried floors are counted apart
 
