@@ -1473,8 +1473,8 @@ import {
   nliNameOf,
   unRowOfRecordTy,
   unionArmTyOfAtomTy,
-  unionClosureArmName,
   unionClosureArmTyOfRow,
+  unionClosureArmTyOfTy,
   unionHasMapArmSlot,
   unionHasRefArrayArmSlot,
   unionNestedArrayArmSlot,
@@ -8519,7 +8519,7 @@ function emitUnionListLitViaRefArm(
       // one, the same recursive step the annotated binding performs. No such arm: bail.
       if exprArray(e0, fnIx) || exprRefArray(e0, fnIx) || exprMap(e0, fnIx) {
         selfSlot = unionRefArrayArmSlotForNestedElem(
-          unionName,
+          unRowOfTyKey(unionTy),
           exprMap(e0, fnIx),
         )
         if selfSlot < 0 { return 0 }
@@ -8563,7 +8563,7 @@ function emitUnionListLitViaRefArm(
         return 0
       }
     }
-    let armSlot = unionRefArrayArmSlotForElem(unionName, elemAtom)
+    let armSlot = unionRefArrayArmSlotForElem(unRowOfTyKey(unionTy), elemAtom)
     if selfArm { armSlot = selfSlot }
     if armSlot < 0 { return 0 }
     const armTag = refArrBoxTagOf(exprIx, fnIx, armSlot, unionTy)
@@ -8590,14 +8590,13 @@ function emitUnionListLitViaRefArm(
 // unambiguous nested-array arm and the caller keeps its loud reject, -1 on a failure.
 function emitUnionNestedListLit(
   body: u8[],
-  unionName: string,
   unionTy: i32,
   exprIx: i32,
   fnIx: i32,
 ) {
   const bare = nodeAt(unwrapParen(exprIx))
   if bare is ArrayLit {
-    const armSlot = unionNestedArrayArmSlot(unionName)
+    const armSlot = unionNestedArrayArmSlot(unRowOfTyKey(unionTy))
     if armSlot < 0 { return 0 }
     const nestTag = refArrBoxTagOf(exprIx, fnIx, armSlot, unionTy)
     if nestTag < 0 {
@@ -8612,19 +8611,22 @@ function emitUnionNestedListLit(
   0
 }
 
-// The function type a closure carrier boxed into `unionName` tags as — the box side of
-// `cloArmTagOfTy`, whose test side is `isArmTagOfTy`.
-
-// The value's own checked type is the answer, not the union's arm: a union may carry several
-// function-typed arms, and taking the arm makes every one of them box under the first arm's tag
-// (D6). The union's own arm is the fallback, for a carrier the checker banked no function type
-// for; a union with one function arm tags the same either way. `u` is the union's row, or -1.
-function cloBoxArmTy(exprIx: i32, u: i32, unionName: string, fnIx: i32): i32 {
+// The function type a closure carrier boxes under (`cloArmTagOfTy`): its own checked type, not the
+// union's arm, since several function arms would otherwise all tag as the first (D6). -1 when the
+// checker banked none, and the caller falls back to the union's first function arm.
+function cloBoxOwnFnTy(exprIx: i32, fnIx: i32): i32 {
   const vt = nodeTyAt(exprIx, fnIx)
   if tyIxIsFunc(vt) { return vt }
   const bt = nodeTyAt(unwrapParen(exprIx), fnIx)
   if tyIxIsFunc(bt) { return bt }
-  unionClosureArmTyOfRow(u, unionName)
+  -1
+}
+
+// `cloBoxOwnFnTy`, else the first function-typed member of the union (row `u`, else `uname`).
+function cloBoxEqArmTy(exprIx: i32, u: i32, uname: string, fnIx: i32): i32 {
+  const own = cloBoxOwnFnTy(exprIx, fnIx)
+  if own >= 0 { return own }
+  unionClosureArmTyOfRow(u, uname)
 }
 
 // `emitUnionCoerce` lowers an expression coerced into the boxed union's representation (a
@@ -8994,7 +8996,7 @@ function emitUnionCoerceRefArray(
   // nested-array arm (`[[50183]]` self-classified `i32[][]` into `i64[][] | boolean |
   // null`): rebuild it through the ARM's slot — the arm's inner-list build widens the
   // bare-int leaves at the store (`emitExprAsI64`), so no in-place re-encode is needed.
-  const viaNest = emitUnionNestedListLit(body, unionName, unionTy, exprIx, fnIx)
+  const viaNest = emitUnionNestedListLit(body, unionTy, exprIx, fnIx)
   if viaNest < 0 { return -1 }
   if viaNest == 1 { return 0 }
   // A ref-element array carrier whose interned slot matches no ref-array arm of the union:
@@ -9011,13 +9013,13 @@ function emitUnionCoerceRefArray(
 // Returns 0, or -1 once failed; with neither arm the failure is loud.
 function emitUnionCoerceMapElemList(
   body: u8[],
-  unionName: string,
+  uTy: i32,
   bare: ArrayLit,
   exprIx: i32,
   fnIx: i32,
 ) {
   const mapArmSlot = unionRefArrayArmSlotForMapElem(
-    unionName,
+    unRowOfTyKey(uTy),
     mapShapeOfExpr(bare.arrElems[0], fnIx),
   )
   if mapArmSlot >= 0 {
@@ -9030,7 +9032,7 @@ function emitUnionCoerceMapElemList(
   // `unionRefArrayArmSlotForMapElem` above looks for an array-of-map arm, and `Json[]` is
   // not one: its element is the union `Json`, which merely has a map among its atoms. The
   // arm's build boxes each element into the union box.
-  const nmSlot = unionRefArrayArmSlotForNestedElem(unionName, true)
+  const nmSlot = unionRefArrayArmSlotForNestedElem(unRowOfTyKey(uTy), true)
   if nmSlot >= 0 {
     fbI32Rel(RS_TAG, refArrSlotTag(nmSlot))
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
@@ -9653,7 +9655,7 @@ function emitUnionCoerceList(
   // literal matching no arm keeps the loud reject; falling through would be invalid wasm.
   if unionName != "" && bare is ArrayLit {
     if bare.arrElems.length >= 1 && exprMap(bare.arrElems[0], fnIx) {
-      return emitUnionCoerceMapElemList(body, unionName, bare, exprIx, fnIx)
+      return emitUnionCoerceMapElemList(body, uTy, bare, exprIx, fnIx)
     }
     // A nested array literal whose leaf does not self-classify as a ref array (`[["ab"]]` — a
     // string-leaf inner makes `arrLitIsRef` false, so the `exprRefArray` carrier path above
@@ -9662,13 +9664,7 @@ function emitUnionCoerceList(
     if bare.arrElems.length >= 1 {
       const bareE0 = nodeAt(bare.arrElems[0])
       if bareE0 is ArrayLit {
-        const viaNest2 = emitUnionNestedListLit(
-          body,
-          unionName,
-          uTy,
-          exprIx,
-          fnIx,
-        )
+        const viaNest2 = emitUnionNestedListLit(body, uTy, exprIx, fnIx)
         if viaNest2 < 0 { return -1 }
         if viaNest2 == 1 { return 0 }
       }
@@ -9679,9 +9675,10 @@ function emitUnionCoerceList(
   // box anyref directly, tagged by the closure arm's `scalarTagOf` (value-atom kind 11).
   // Checked before the ladder below, whose scalar branches would store the ref in a value box.
   if unionName != "" && exprIsClosure(exprIx, fnIx) {
-    const clArm = unionClosureArmName(unionName, uTy)
-    if clArm != "" {
-      fbI32Rel(RS_TAG, cloArmTagOfTy(cloBoxArmTy(exprIx, -1, unionName, fnIx)))
+    const clArm = unionClosureArmTyOfTy(unionName, uTy)
+    if clArm >= 0 {
+      const own = cloBoxOwnFnTy(exprIx, fnIx)
+      fbI32Rel(RS_TAG, cloArmTagOfTy(if own >= 0 { own } else { clArm }))
       if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx) // { tag, closure fat-pointer ref }
       return 0
@@ -10993,11 +10990,11 @@ function emitUnionConcreteEq(
   if eqOnce { fbLocalTee(eqStash) }
   fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
   // The CONCRETE operand's own arm type, through the very composition the BOX site uses
-  // (`cloBoxArmTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
+  // (`cloBoxOwnFnTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
   // actually writes.
   fbI32Rel(
     RS_TAG,
-    unionEqTagOfArmTy(eak, cloBoxArmTy(otherIx, unr[0], uname, fnIx)),
+    unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], uname, fnIx)),
   )
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
@@ -11033,7 +11030,7 @@ function emitUnionConcreteEq(
 
 // The tag has one home — `cloArmTagOfTy`, whose box side is `emitUnionCoerce` and whose test
 // side is `isArmTagOfTy`. This routes the compare through it too, so all three derive an arm's
-// tag from one render of one arena type; `cloBoxArmTy` names the caller split.
+// tag from one render of one arena type; `cloBoxOwnFnTy` names the caller split.
 function unionEqTagOfArmTy(k: i32, armTy: i32): i32 {
   if k == 11 { return cloArmTagOfTy(armTy) }
   scalarTagOfKind(k)
