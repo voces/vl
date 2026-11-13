@@ -9,6 +9,20 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-w311-d6-rl-elem-struct-row-tagged](2026-11-13-w311-d6-rl-elem-struct-row-tagged.md): Step 7 L2 D6: a ref-list element's struct row is read off its tagged form, 2026-11-13
+- [2026-11-13-w311-d6-fcstruct-records-no-name](2026-11-13-w311-d6-fcstruct-records-no-name.md): Step 7 L2 D6: a typed nested-record field records no element name, 2026-11-13
+- [2026-11-13-step7-vkind-mono-union-annotation-by-type](2026-11-13-step7-vkind-mono-union-annotation-by-type.md): Step 7, lane H: two armed traps at a generic instance's union annotation, 2026-11-13
+- [2026-11-13-step7-vkind-hint-guards-by-code](2026-11-13-step7-vkind-hint-guards-by-code.md): Step 7, lane H: element-type hints keyed on the field's code, 2026-11-13
+- [2026-11-13-step7-variant-index-of-deleted](2026-11-13-step7-variant-index-of-deleted.md): Step 7 L6: `variantIndexOf` deleted, its readers by type, 2026-11-13
+- [2026-11-13-step7-union-set-atoms-deleted](2026-11-13-step7-union-set-atoms-deleted.md): `unionSetAtomsOf` and `unionSetAtomsOfTy` are deleted: the last union spelling split, 2026-11-13
+- [2026-11-13-step7-union-reg-unrow-readers](2026-11-13-step7-union-reg-unrow-readers.md): Step 7 L6 (lane G, cut 10a): the `unRowOfName` readers, graded; three removed, 2026-11-13
+- [2026-11-13-step7-union-reg-ab-harness-retired](2026-11-13-step7-union-reg-ab-harness-retired.md): Step 7 L6 (lane G, cut 10b): the union registry A/B harness's report side is retired, 2026-11-13
+- [2026-11-13-step7-struct-elem-lowerable-declared-by-type](2026-11-13-step7-struct-elem-lowerable-declared-by-type.md): Step 7 L2: `structElemArrayLowerable` asks the type whether its element is declared, 2026-11-13
+- [2026-11-13-step7-set-atoms-registry-wrappers](2026-11-13-step7-set-atoms-registry-wrappers.md): The registry's `unionSetAtomsOf` wrappers: callers read member sets, unreached splits are floors, 2026-11-13
+- [2026-11-13-step7-lane-e-functype-walk-keys-by-type](2026-11-13-step7-lane-e-functype-walk-keys-by-type.md): Step 7 D6: the function-type walk's value-union and record-leaf tests read the type, 2026-11-13
+- [2026-11-13-step7-lane-e-declared-nominal-by-type](2026-11-13-step7-lane-e-declared-nominal-by-type.md): Step 7 D6: `tyIsDeclaredNominal` asks the type, 2026-11-13
+- [2026-11-13-step7-l2-mono-ret-row-tag-rep-typed](2026-11-13-step7-l2-mono-ret-row-tag-rep-typed.md): Step 7 L2, mono: `retStructRowIndex` answers a tagged record's stored row by type (2026-11-13)
+- [2026-11-13-step7-arm-mint-softening-floored](2026-11-13-step7-arm-mint-softening-floored.md): The arm mint's literal-union softening is a floor; `internArmShapeRow`'s render, graded, 2026-11-13
 - [2026-11-13-w311-d6-field-elem-same-by-type](2026-11-13-w311-d6-field-elem-same-by-type.md): Step 7 L2 D6: two field slots hold one element by type, not by name, 2026-11-13
 - [2026-11-13-step7-vkind-wasmemit-elem-readers](2026-11-13-step7-vkind-wasmemit-elem-readers.md): Step 7, lane H: `wasmEmit`'s `sFieldElemName` readers, 2026-11-13
 - [2026-11-13-step7-vkind-field-elem-hint-cut-3](2026-11-13-step7-vkind-field-elem-hint-cut-3.md): Step 7, lane H: field element hints, cut 3, and the fallback's contract, 2026-11-13
