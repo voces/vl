@@ -40,5 +40,5 @@ reaches of the first and 1,089 of 1,106 of the second.
 - Refresh ×2: fixpoint.
 - Sweep with fixpoint seeds on both sides, master `32ab5241` against the candidate: 24,209 same,
   0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
-- Render-parse census, regenerated: `ty-string-parse` 61 → 60, `ty-parse-unclassified` 52 → 50.
+- Render-parse census, regenerated: `ty-string-parse` 61 → 60 (the `nameIsShapeOpen` site). `ty-parse-unclassified` 52 → 50 is lane B's #7758, merged in.
 - `scripts/gate.sh`: all rows pass.
