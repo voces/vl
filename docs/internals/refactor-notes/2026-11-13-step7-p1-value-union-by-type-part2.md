@@ -52,7 +52,7 @@ Each twin's comment names the speller it mirrors, so a change to one is visibly 
 The twins converged over several probes. Each time, the probe named a speller arm the twin had not
 mirrored: the alias-before-base order, a nested union, and a list of a literal union.
 
-**Sweep** (`sweep.vl diff`, fixpoint seeds, master `4f7761cb` against this): 24,210 same, 0 movers.
+**Sweep** (`sweep.vl diff`, fixpoint seeds, master `3eb0db25` against this, the floors included): 24,212 same, 0 movers.
 
 ## Six unreached parse sites, floored
 
@@ -73,6 +73,6 @@ mode on either seed. Each site reads 0; each control fires.
 that reaches it already classified as a ref-list read (`exprRefArray`) one rung earlier, including
 `tests/cases/unions/union-arm-closure-element-array-index-call.vl`, the case it was written for.
 
-`ty-string-parse` in this PR's files falls 56 → 50 and `ty-parse-unclassified` 46 → 40.
+With part 2's twins, `ty-string-parse` falls 53 → 47 and `ty-parse-unclassified` 46 → 40, all in this PR's files.
 
 The semantic question, one value-union answer per type, stays D16062.
