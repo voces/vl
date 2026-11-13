@@ -30,10 +30,11 @@ The six NAME readers:
 
 - `annTyIsRefList` (ARENA + NAME): a presence test, whether an annotation is written.
 - `unionNameOfCall` (ARENA + NAME): a rung of the `unionNameOfExpr` floor (contracts, below). It
-  is **open under G**. Its declared-callee rung returns the annotation's name with row -1 when the
+  is **open, pending lane H's reach probe** (coordinator, 2026-11-13). Its declared-callee rung returns the annotation's name with row -1 when the
   call's type does not fold to that row. On that path, decisions read the name:
   `unionMemberSetOfRow`'s fallback to `unRowOfName`, `unionSetHasNullTy`, `unionArmTysOfRow`, and
-  the `??` arm's `crn == cln`.
+  the `??` arm's `crn == cln`. If no program reaches that path, the rung becomes a loud floor and the name a label under
+  D16032. If one does, step 7 waits for H's fix. It is the one exit item still open.
 - `emitUnionLitIs` and `elabArgRepins`: contract. A literal's lexeme, and a type parameter's
   identity.
 - `nulNicheIsTestImpossible`: a diagnostic render.
