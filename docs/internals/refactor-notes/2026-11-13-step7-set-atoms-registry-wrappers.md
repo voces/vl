@@ -32,10 +32,10 @@ The typed answer against each reached caller's old one (probe, same population):
 - `unionMemberAtomsOf`'s no-row branch, `unionSetAtomsOfTy`'s final split and `unionArmsOfSetTy`'s
   alias branch are loud floors.
 
-**Left.** `unionSetAtomsOf` keeps two callers:
-- `unionSetAtomsOfTy`'s no-type branch, still reached through `unionArmTys` (emit_union_atoms,
-  three programs). `unionArmTys` has nine callers across lanes F and G and is not in this cut.
-- `memReadBoxedAtomKinds` (lane B).
+**Left.** With lane B's #7695 merged (`memReadBoxedAtomKinds` by type), `unionSetAtomsOf` keeps
+one caller: `unionSetAtomsOfTy`'s no-type branch. It is still reached through `unionArmTys`
+(emit_union_atoms, three programs), which has nine callers across lanes F and G and is not in this
+cut.
 
 **Sweep** (master fixpoint seed vs candidate, same tree): 24,204 same, 0 bytes-only movers, 0
 output movers, 0 runs → not-runs, 0 new traps.
