@@ -30,7 +30,6 @@ import {
   TyNullable,
   TyObj,
   TyPrim,
-  TyUnion,
   TyVar,
   litUnionAliasNameOfTy,
   litUnionInlineNameOfTy,
@@ -55,20 +54,16 @@ import {
   sidOf,
   sidOfNode,
 } from "./symbols"
-import { isNullTy, nulLitUnionPeelTy, tyMapHeld } from "./tyquery"
+import { isNullTy, nulLitUnionPeelTy } from "./tyquery"
 import { isPatTyIxOf, isVarTyIxOf, luIsTyOf } from "./check_list_union"
 // ── the type-name grammars this file calls, homed in `tyname.vl` ──
 // A leaf with zero imports; this file binds them for its own calls and republishes
 // none — every emitter module asks the home directly. The layering is one-directional:
 // `emit_base.vl` imports `typecheck.vl`, which imports nothing from `emit_*`, avoiding a cycle.
 import {
-  arrElemNameRaw,
   fieldNameOf,
   fieldTypeTextOf,
-  groupInnerOf,
-  mapSpellKeyName,
   nameIsBraceSpanEnds,
-  nameIsParenSpanEnds,
   nameIsShapeOpen,
   spanEqAt,
   tyGroupEndIndex,
@@ -129,13 +124,7 @@ import {
   tsText,
 } from "./ast"
 import { hexVal } from "./strutil"
-import {
-  MAP_KEY_I32,
-  MAP_KEY_I64,
-  mapKeyKindOfTy,
-  nameIsI32HashedLitUnion,
-  valueAtomKind,
-} from "./check_ty_rep"
+import { MAP_KEY_I32, MAP_KEY_I64, mapKeyKindOfTy } from "./check_ty_rep"
 
 // Append all of `src` onto `dst` (in place) and return `dst`.
 export function appendAll(dst: u8[], src: u8[]) {
@@ -2690,19 +2679,6 @@ export function isConstInit(exprIx: i32) {
   }
   false
 }
-// The one home for the array-dimension peel: `name` with every trailing `[]` pair removed. A
-// non-array name is its own leaf (never ""), matching what every hand-written copy did. It is
-// the cut home applied to fixpoint, not a second copy: the loop calls `arrElemNameRaw` and
-// advances only while that yields a non-empty element, so the degenerate `"[]"` terminates the peel.
-export function arrLeafNameOf(name: string) {
-  let leaf = name
-  let done = false
-  while !done {
-    const nx = arrElemNameRaw(leaf)
-    if nx == "" { done = true } else { leaf = nx }
-  }
-  leaf
-}
 // Whether `ty` is a list on the i32-list backing: an element of `i32`, `boolean` or `null`, a
 // string-literal set, or the sentinel niche of `boolean | null` or a literal set with `null`.
 export function tyIsI32List(ty: i32): boolean {
@@ -2728,18 +2704,6 @@ export function tyIsStrList(ty: i32): boolean {
 // Whether `ty` is a list whose element is a string-literal set, one literal included.
 export function tyIsStrLitSetList(ty: i32): boolean {
   tyIsLitUnionOrLit(tyArrayElemIx(ty))
-}
-// The one home of the emitter's key question: does the map spelling `name` carry an i32 key
-// (`{[i32]: V}`)? Reads the map-name grammar's key cut at its home (`mapSpellKeyName`,
-// `tyname.vl`), which deliberately does not require the closing `}` — so a list of i32-keyed
-// maps or a nullable one also answer true here.
-export function nameIsI32KeyedMap(name: string) {
-  const k = mapSpellKeyName(name)
-  if k == "i32" { return true }
-  // A literal-union key spells as its alias or its member set and HASHES as i32, because its
-  // values rep as the interned atom. Without this rung the spelling says string-keyed while
-  // `mapKeyRepTy` — the checker's own answer, which the arena legs project — says i32 (D1748).
-  nameIsI32HashedLitUnion(k)
 }
 // Folds a map shape to the flavor-blind twin every op that does not care about set-ness wants:
 // the set sentinel to its map sibling (-2 → -1 string, -5 → -4 i32, -7 → -6 i64 keys) and the
@@ -2845,26 +2809,6 @@ export function unionHasAtom(name: string, atom: string) {
   }
   false
 }
-// `peelGroupParens` peels every fully-enclosing grouping-paren layer; its home is `tyname.vl`,
-// republished here. Below: the one home of union-arm normalization — trim whitespace, then
-// peel one fully-wrapping `(...)` pair, using `tyGroupWrapsWhole` (not `parenEnclosesWhole`),
-// so a key derived from a wrapped, space-padded `splitUnionAtoms` arm byte-matches one derived from the annotation; skipping the trailing-`)` reject would slice a real character off a name with no closing paren.
-export function normTypeAtom(arm: string) {
-  let lo = 0
-  let hi = arm.length
-  while lo < hi && (arm[lo] == ' ' || arm[lo] == '\t') { lo = lo + 1 }
-  while hi > lo && (arm[hi - 1] == ' ' || arm[hi - 1] == '\t') { hi = hi - 1 }
-  let t = arm
-  if lo != 0 || hi != arm.length { t = arm.slice(lo, hi) }
-  // The paren grammar's span half at its home — the cheap reject above, named. Stays
-  // `tyGroupWrapsWhole`, not `peelGroupParens`'s `parenEnclosesWhole` (they disagree on a
-  // never-closing group). The cut is `tyname.groupInnerOf`, kept separate from the balance walk
-  // on purpose: it is the fourth distinct guard the home's call sites put in front of the same three characters of arithmetic, and folding any one in would be wrong for the rest.
-  if nameIsParenSpanEnds(t) {
-    if tyGroupWrapsWhole(t) { t = groupInnerOf(t) }
-  }
-  t
-}
 // The declared-struct index — the arena NODE of the first top-level `TypeDecl` at each
 // declared name's interned id, or -1. `declStructStmtsLen` stamps the statement list it
 // answers for, so a reader holding a list of another length rebuilds rather than read rows
@@ -2918,75 +2862,7 @@ export function isStructAtom(stmts: i32[], a: string) {
   if isDeclaredStructName(stmts, a) { return true }
   nameIsShapeSpanEnds(a)
 }
-// True if the union atoms `atoms`, of arena types `tys` (`unionAtomTysAlignedOf`, -1 for none), make a
-// variant-box union this emitter interns: 2+ non-null members, each a struct variant, a
-// value-atom, a boxable map or a ref-element array, with at least one that is not a value-atom.
-// An untyped atom is neither a literal union nor a list. A struct plus `null` stays the niche.
-export function isVariantBoxUnionAtoms(
-  stmts: i32[],
-  atoms: string[],
-  tys: i32[],
-) {
-  if atoms.length < 2 { return false }
-  let structAtoms = 0
-  let refArrAtoms = 0
-  let mapAtoms = 0
-  let nonNull = 0
-  let j = 0
-  while j < atoms.length {
-    if atoms[j] != "null" {
-      nonNull = nonNull + 1
-      if isStructAtom(stmts, atoms[j]) || atomTyIsRecord(tys, j) {
-        structAtoms = structAtoms + 1
-      } else if valueAtomKind(atoms[j]) >= 0 || atomTyIsLitUnion(tys, j) {
-        // A value atom (scalar/string/scalar-element list/closure) — it boxes into a shared value box
-        // or rides the anyref, tagged via `scalarTagOfKind`. Checked before the array test so a
-        // scalar-element list (`i32[]`, `string[]`) keeps its value-atom rep rather than being
-        // mistaken for a ref-element array. A litunion-alias atom rides the box as its member-string atom too.
-      } else if atomTyIsMap(tys, j) {
-        // A map arm (`{[string]: string}`, `{[string]: f64}`): not a struct, nor a value atom, so it
-        // boxes as its map struct ref riding the box anyref, tagged via `mapTagOf`.
-        mapAtoms = mapAtoms + 1
-      } else if atomTyIsArray(tys, j) {
-        // A ref-element array arm (`S[]`, `(() => f64)[]`, `(C | D)[]`): not a scalar-element
-        // list (those are value atoms, handled above), so it boxes as its reflist wrapper ref
-        // riding the box anyref, tagged via `refArrTagOf`.
-        refArrAtoms = refArrAtoms + 1
-      } else {
-        // Neither a struct variant, a value-atom, a map, nor a ref-element array — not boxable.
-        return false
-      }
-    }
-    j = j + 1
-  }
-  (structAtoms >= 1 || refArrAtoms >= 1 || mapAtoms >= 1) && nonNull >= 2
-}
 
-// Whether atom `j` of types `tys` is a record: a struct variant whatever its spelling names, such
-// as a heap row's own name (`#anon1`).
-function atomTyIsRecord(tys: i32[], j: i32): boolean {
-  j < tys.length && tys[j] >= 0 && tyAt(tys[j]) is TyObj
-}
-
-// Whether atom `j` of types `tys` is a literal-union atom: a union of string literals, of two or
-// more members or under an alias name. A lone literal with no alias is a string atom.
-function atomTyIsLitUnion(tys: i32[], j: i32): boolean {
-  if j >= tys.length || !tyIsLitUnion(tys[j]) { return false }
-  const t = tyAt(tys[j])
-  if t is TyUnion && t.uMembers.length >= 2 { return true }
-  litUnionAliasNameOfTy(tys[j]) != ""
-}
-
-// Whether atom `j` of types `tys` is a map; an atom with no type is not.
-function atomTyIsMap(tys: i32[], j: i32): boolean {
-  j < tys.length && tyMapHeld(tys[j]) >= 0
-}
-
-// Whether atom `j` of types `tys` is a list.
-function atomTyIsArray(tys: i32[], j: i32): boolean {
-  if j >= tys.length || tys[j] < 0 { return false }
-  tyAt(tys[j]) is TyArray
-}
 // The synthetic type-name string of the annotation node at `tyIx` (a `TypeRef`), or
 // "" if `tyIx` is unset / not a type name. Lets the inline-union scan read a param /
 // return annotation's name without a `P.nodes[...] is TypeRef` round-trip at the call
