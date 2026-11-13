@@ -56,3 +56,18 @@ whose heap type the arm shares, which is the module-level fact it pins.
 mint, when the arm's type has no row yet. There it is the new row's label, and
 `internInlineShapeFieldsTy` checks it with its `nameIsShapeSpanEnds` guard; no row choice reads
 it. Lane I grades it as a floor.
+
+**The arm's named twin.** `variantStructHeapTwinAt` answers -1 for 17 arms after the cut, all
+of them `J` in the generic-identity-literal family. Over the full population there are 0 other
+movers: no twin is gained or moved to another row. Their twin was the label-minted duplicate row
+the cut removes, so -1 is the honest answer: no other type's row shares `J`'s heap, only the
+arm's own `#ref` row (`uVarRow`). Falling back to `uVarRow[vi]` there would answer a different
+question ("the arm's own row") for 5,073 arms in 3,132 programs that have no cross-table twin in
+the base either, so the function is unchanged.
+
+The callers that write through the twin are the literal-field re-lays (`relayLitFieldToString`,
+`demoteLitFieldToString`). They would miss `#ref1` only for a `J` whose inline literal-set field is
+re-laid. That case is not reachable: a literal spelled for it infers `{r: string}`, so it never
+lands on `J`'s arm, and no program in the population has it. If a witness ever reaches it, the fix
+belongs in those re-lay readers, reading `uVarRow[vi]` as "the row sharing the arm's heap". It
+does not belong in `variantStructHeapTwinAt`.
