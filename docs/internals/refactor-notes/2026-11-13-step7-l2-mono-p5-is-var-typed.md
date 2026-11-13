@@ -31,5 +31,5 @@ Master vs PR over every program reaching `monoSubstIsExpr`'s `is` rewrite, plus
 
 ## Census
 
-The census entry leaves: `recordClonedIsVarTyIx(nodeIx, nameToTy(name))`. Master's baseline,
-re-derived by #7764, already matches the merged tree, so the baseline is unchanged here.
+The census entry `recordClonedIsVarTyIx(nodeIx, nameToTy(name))` leaves the baseline. It is the
+only entry this PR lowers, in #7764's re-derived structure.
