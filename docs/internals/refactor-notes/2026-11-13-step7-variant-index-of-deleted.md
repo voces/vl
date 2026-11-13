@@ -6,7 +6,8 @@
 - `uVariantsPush`, under the spelling each union pushed;
 - `declArmsMatchRow(bind)`, which bound a twin arm's declared name to its row.
 
-There are 12 code sites; the other grep hits are comments. Each reader was graded with a probe compiler over the sweep (24,204 programs). The probe compared
+There are 12 code sites; the other grep hits are comments. Each reader was graded with a probe
+compiler over the sweep (24,204 programs). The probe compared
 the name answer with the arm row of the declared type, `exactArmRowOfTy(declTyIxOfName(name))`.
 
 | site | reached / name says variant | typed reading |
