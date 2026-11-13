@@ -6,5 +6,5 @@
   `canonUnionMembersInto`/`canonUnionMembersLitsInto`, which parse a render of
   each union leaf, are counted at their eight emitter callers as render. The
   census is regenerated, and the budget rises by exactly those eight as a
-  correction. Four (c) sites fed by type renders are named as source on the
+  correction. Three (c) sites fed by type renders are named as source on the
   corpus only.

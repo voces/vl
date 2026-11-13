@@ -43,25 +43,24 @@ eight feed a decision, so all are failing:
 | emit_union_registry `msFreeSliceOfTy` | registry atoms and literal flags                                | G     |
 
 The budget rises by exactly these eight `ty-string-parse` entries: emit_classify
-0 → 2, emit_collect 4 → 5, emit_union_registry 0 → 1, wasmEmit 3 → 7. The rise
-is a correction, not a regression.
+0 → 2, emit_collect 4 → 5, emit_union_registry 0 → 1, wasmEmit 3 → 7 (total 14 →
+22). The rise is a correction, not a regression.
 
 ## The regeneration
 
-On master b00182da7, fixpoint seed, 24,224 programs: 47 census sites, 26 render,
-7 source and 14 unclassified. Apart from the eight added, rows go only with
+On master 27b27b681, fixpoint seed, 24,224 programs: 40 census sites, 22 render,
+6 source and 12 unclassified. Apart from the eight added, rows go only with
 removed code. No surviving site changes grade.
 
 ## Source on the corpus, not by construction
 
 A (c) grade has to hold by construction. The tool cannot see where a string was
-made, so these are listed by hand. Four of the seven (c) census sites receive
+made, so these are listed by hand. Three of the six (c) census sites receive
 text that a type render or the emitter produces:
 
 | site                                              | its input                                                   | owner |
 | ------------------------------------------------- | ----------------------------------------------------------- | ----- |
 | `unionHasBoolLeafArm` → `boolLeafListDepthOfName` | arm atoms `unionTyArms` renders from the union's type       | G     |
-| `boxWidenAtomFor` → `valueAtomKind`               | member atoms of a set row, recorded from a render           | D     |
 | `ifExprNliName` → `valueAtomKind`                 | arm atoms from `nliAtomOfExpr`, a render of each arm's type | G     |
 | `cboxElemNeedsParens` → `tyTopIndexOf`            | the spelling of an annotation the emitter minted            | F     |
 
