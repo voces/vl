@@ -37,6 +37,10 @@ const PARSE = "ty-string-parse"
 const SOURCE = "ty-source-parse"
 const UNCLASSIFIED = "ty-parse-unclassified"
 const ORIGINS = "scripts/render-parse-origins.txt"
+// Sites a filed row carries past its milestone as a floor, kept by hand: `D<id>\t<site key>`,
+// the key as `--sites` or `--render-sites` prints it. A listed site counts as `ty-carried-floor`.
+const FLOORS = "scripts/render-parse-floors.txt"
+const FLOOR = "ty-carried-floor"
 // The renderers whose spelling a later decision reads (a name, a row key, a pin), and the ones that
 // render for a message, counted apart. A listed renderer declared nowhere fails the census.
 const RENDERERS = [
@@ -335,6 +339,81 @@ function applyOrigins(root: string, found: Hit[]): Hit[] {
   out
 }
 
+// Re-codes each site `<root>/scripts/render-parse-floors.txt` lists as a carried floor. Dies on a
+// row whose site no longer exists or whose `D<id>` has no inventory row, so the list cannot go
+// stale or cite nothing.
+function applyFloors(root: string, found: Hit[]): Hit[] {
+  const listed = listDir("\{root}/scripts")
+  if listed is IoError { return found }
+  let present = false
+  for n in listed {
+    if n == "render-parse-floors.txt" { present = true }
+  }
+  if !present { return found }
+  const rowOf: {[string]: string} = Map()
+  const used: {[string]: boolean} = Map()
+  const order: string[] = []
+  const text = decodeUtf8Lossy(bytesOf("\{root}/\{FLOORS}"))
+  for line in text.split("\n") {
+    if line.length == 0 || line[0] == '#' { continue }
+    let tab = 0
+    while tab < line.length && line[tab] != '\t' { tab = tab + 1 }
+    if tab >= line.length {
+      die("render-parse-census: \{FLOORS}: no tab in `\{line}`", 1)
+    }
+    const row = line.slice(0, tab)
+    const key = line.slice(tab + 1, line.length)
+    if !inventoryRowExists(root, row) {
+      die("render-parse-census: \{FLOORS}: \{row} has no inventory row", 1)
+    }
+    rowOf[key] = row
+    order.push(key)
+  }
+  const pk = siteKeys(found)
+  const rk = renderKeys(found)
+  const out: Hit[] = []
+  let i = 0
+  while i < found.length {
+    const h = found[i]
+    const key = if pk[i] != "" { pk[i] } else { rk[i] }
+    let code = h.code
+    if key != "" && (rowOf[key] ?? "") != "" {
+      code = FLOOR
+      used[key] = true
+    }
+    out.push(
+      {
+        rel: h.rel,
+        line: h.line,
+        col: h.col,
+        fn: h.fn,
+        code: code,
+        callee: h.callee,
+        text: h.text,
+      },
+    )
+    i = i + 1
+  }
+  for key in order {
+    if !(used[key] ?? false) {
+      die("render-parse-census: \{FLOORS}: no live site `\{key}`", 1)
+    }
+  }
+  out
+}
+
+// Whether inventory row `row` (`D<id>`) has its file in either inventory.
+function inventoryRowExists(root: string, row: string): boolean {
+  for dir in ["docs/internals/inventory", "docs/internals/inventory-2"] {
+    const names = listDir("\{root}/\{dir}")
+    if names is IoError { continue }
+    for n in names {
+      if n == "\{row}.md" { return true }
+    }
+  }
+  false
+}
+
 // The counted callee spelled by the identifier run `t[s..e]`, or "".
 function counted(t: u8[], s: i32, e: i32): string {
   const name = decodeUtf8Lossy(t.slice(s, e))
@@ -582,7 +661,7 @@ function main(args: string[]) {
       2,
     )
   }
-  const found = applyOrigins(root, hits(root, false))
+  const found = applyFloors(root, applyOrigins(root, hits(root, false)))
   if list {
     for h in found {
       if only == "" || h.code == only {

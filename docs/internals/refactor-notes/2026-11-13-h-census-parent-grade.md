@@ -67,3 +67,22 @@ text that a type render or the emitter produces:
 They count as failing. The other three (`emitLitMemberEq`, `emitFieldLitEq`,
 `emitUnionLitIs` → `nameIsQuotedLeaf`) receive a literal's own lexeme,
 `TyLit.litText` quoted, which holds by construction.
+
+## 3. Carried floors are counted apart
+
+A site a filed row carries past step 7 as a floor counted as an ordinary
+`ty-render` or `ty-string-parse`, so the close draft could not tell it from a
+failing one. Its only marking was a comment at the site. Now
+`scripts/render-parse-floors.txt`, kept by hand, lists each such site as
+`D<id>\t<site key>`, with the key as `--sites` or `--render-sites` prints it.
+The census counts a listed site as `ty-carried-floor`, a code of its own in the
+baseline. The census dies on a row whose site no longer exists, or whose `D<id>`
+has no inventory row (both checked: exit 1), so the list cannot go stale or cite
+nothing.
+
+The list starts with the two rows filed so far:
+
+- **D16022:** `monoArgTyNameRep`'s `arrElemSuffixed` and `nameToTy`, emit_mono.
+- **D16032:** `arenaEmitName`'s `canonEmitNameOfTy`, emit_collect.
+
+A lane carrying another floor adds its row here in the PR that files it.

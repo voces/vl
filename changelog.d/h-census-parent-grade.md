@@ -7,4 +7,5 @@
   each union leaf, are counted at their eight emitter callers as render. The
   census is regenerated, and the budget rises by exactly those eight as a
   correction. Three (c) sites fed by type renders are named as source on the
-  corpus only.
+  corpus only. A hand-kept `scripts/render-parse-floors.txt` marks the sites a
+  filed row carries as a floor; the census counts them as `ty-carried-floor`.
