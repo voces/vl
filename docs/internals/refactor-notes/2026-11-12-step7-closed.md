@@ -72,7 +72,12 @@ graded:
 | `shapeWalkKeyOf` (emit_shape_intern:277) | failing | E / F, the D6 re-key: the walk key still decides in `tyIsDeclaredNominal` and `shapeWalkSplitsUnion` | — |
 | `internArmShapeRow` (emit_shape_intern:730) | failing | A, after E's step (d) | — |
 
-Six are floors and two block the close. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
+The census's other five renders are all in one function, `nodeArrayElemName`
+(check_emit_queries:742, 764, 768, 772, 791). It renders an array literal's element type to a name,
+and emit_shape_rows' `arrLitBoxElemName` (2 callers) and `arrLitElemRender` (8 callers) consume
+that name. All five fail: a render handed to the emitter as a key.
+
+Of the 13 renders, six are floors and seven block the close. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
 
 ## The census's coverage (lane H, #7748, open)
 
@@ -130,7 +135,7 @@ once imported modules' declaration names grade as source, and 67 on master after
 
 | grade | sites | why |
 | --- | --- | --- |
-| passes: a primitive's own name, read off the type | 8: `memReadBoxedAtomKind`, `memReadNarrowOp`, `memReadCheckerAtomKind` (`t.primName`); `spreadSrcBoxAtom` (`tyArrayElemPrimName`); `nulScalarBoxAtomOf` (`repOfTy(inner).rdKind`); `emitNumExactCastFrom`, `emitHoleNumAsOpt` (`asExprNumTgtName` = `primNameStr(primNameOf(type))`); `njKindOfTy` (`primNameStr(p)`) | a `TyPrim`'s name is its identity, a keyword, not a rendered structure (check_ty_rep's `retAtomKindOf` states the same) |
+| passes: a primitive's own name, read off the type | 8: `memReadBoxedAtomKind`, `memReadNarrowOp`, `memReadCheckerAtomKind` (`t.primName`); `spreadSrcBoxAtom` (`tyArrayElemPrimName`); `nulScalarBoxAtomOf` (`repOfTy(inner).rdKind`: a rep descriptor's kind word, which also takes the sentinel `union`, answered -1); `emitNumExactCastFrom`, `emitHoleNumAsOpt` (`asExprNumTgtName` = `primNameStr(primNameOf(type))`); `njKindOfTy` (`primNameStr(p)`) | a `TyPrim`'s name is its identity, a keyword, not a rendered structure (check_ty_rep's `retAtomKindOf` states the same) |
 | passes: a compiler literal | 2: `emitUnionCoerceValueAtom` (`"string"`), `valueKindIsPlainScalar` (a loop over keywords) | no type was rendered |
 | fails: a member set's rendered atoms (P2, G) | 8: `printUnionPlanCode` (`atoms[d]`), `boxNarrowAtomFor` (`own[j]`), `emitUnionConcreteNumCross` (`unionArmsOf(uname)`), `xrepElemEq` (`unionBoxEqColumns`' arms), `boxNarrowScalarKinds` ×2 (`canonUnionMembersInto`), `emitBoxAtomRetagAtoms` (`msMemberAtomsOfSet` / `canonUnionMembersInto`), `staleBoxFrom` (`msMemberAtomsOfSet`) | the atoms are the canon render of each member |
 | fails: P5 (B) | 1: `sTyIxOfNameTy`'s `annGenAppSpanEnds(nm)` | the same name `sTyIxOfNameTy` resolves back to a type |
