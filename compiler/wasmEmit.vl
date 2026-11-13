@@ -184,6 +184,7 @@ import {
   tyArrayElemIx,
   tyAt,
   tyBearsNull,
+  tyEq,
   tyHasHole,
   tyIsLitUnion,
   tyIsLitUnionOrLit,
@@ -11223,7 +11224,7 @@ function unionBoxEqColumns(
       // this lowering can unbox and compare — the same bound `emitUnionPayloadUnbox` and
       // `atomEqOpcodeOfKind` enforce, asked BEFORE any byte is written so an unservable arm
       // still DECLINES (keeping the caller's loud message) instead of failing loudly here.
-      let ak = valueAtomKind(arms[i])
+      let ak = boxAtomKindOfMemberTy(tys[i])
       if ak < 0 { ak = boxArmKindOfTy(ak, tys[i]) }
       if ak < 0 { return false }
       if ak == 2 {
@@ -11407,22 +11408,22 @@ function wideKindOf(a: i32, b: i32): i32 {
   -1
 }
 
-// For each number atom of `lAtoms` and a different one of `rAtoms` one widens to the other, an
+// For each number member of `lTys` and a different one of `rTys` one widens to the other, an
 // `if` on the two operands holding exactly that pair, comparing the values at the wider type,
 // each left open on its `else`. Returns how many it opened, or -1 on error.
 function emitUnionUnionNumCross(
   body: u8[],
   lIx: i32,
   rIx: i32,
-  lAtoms: string[],
-  rAtoms: string[],
+  lTys: i32[],
+  rTys: i32[],
   fnIx: i32,
 ): i32 {
   let opened = 0
-  for la in lAtoms {
-    for ra in rAtoms {
-      const ka = valueAtomKind(la)
-      const kb = valueAtomKind(ra)
+  for lt in lTys {
+    for rt in rTys {
+      const ka = boxAtomKindOfMemberTy(lt)
+      const kb = boxAtomKindOfMemberTy(rt)
       const upL = widenConvOpOfKinds(ka, kb)
       const upR = widenConvOpOfKinds(kb, ka)
       if ka != kb && (upL >= 0 || upR >= 0) {
@@ -12026,23 +12027,26 @@ function emitUnionUnionEq(
   // is a member here and answers no there. The left row's banked value-atom codes travel with the
   // surviving arms, index-parallel to the atom column; an uncovered row marks its arms -2.
   const lAtoms: string[] = []
-  if !msMemberAtomsOfSet(lsid, lAtoms) {
+  const lTys: i32[] = []
+  if msMemberAtomsOfSet(lsid, lAtoms) {
+    msMemberTysOfSet(lsid, lTys)
+  } else {
     // The arms of the union the left read holds (`unionTyArms`); none when it covers none.
-    const lMems: i32[] = []
-    unionTyArms(unionBoxTyOfRead(lIx, fnIx), lAtoms, lMems)
+    unionTyArms(unionBoxTyOfRead(lIx, fnIx), lAtoms, lTys)
   }
   const lKinds: i32[] = []
   let lKindsOk = msMemberValKindsOf(lsid, lKinds)
   if lKinds.length != lAtoms.length { lKindsOk = false }
   const rAtoms: string[] = []
+  const rTys: i32[] = []
   let rOk = msMemberAtomsOfSet(rsid, rAtoms)
+  if rOk { msMemberTysOfSet(rsid, rTys) }
   if !rOk {
     // The right list needs the same alias expansion as the left. Without it the intersection
     // below falls to `unionHasAtom(rname, …)`, which answers false for a declared union's own
     // atoms, every arm is filtered out, and the loop emits nothing — so control reaches the
     // tag-only fallback and `==` compares just the two tags (D989).
-    const rMems: i32[] = []
-    if (unionTyArms(unionBoxTyOfRead(rIx, fnIx), rAtoms, rMems)) { rOk = true }
+    if (unionTyArms(unionBoxTyOfRead(rIx, fnIx), rAtoms, rTys)) { rOk = true }
   }
   const arms: string[] = []
   const armKinds: i32[] = []
@@ -12140,14 +12144,7 @@ function emitUnionUnionEq(
     k = k - 1
   }
   // Two number arms the sides do not share compare by value at the wider one (D15090).
-  const crossOpened = emitUnionUnionNumCross(
-    body,
-    lIx,
-    rIx,
-    lAtoms,
-    rAtoms,
-    fnIx,
-  )
+  const crossOpened = emitUnionUnionNumCross(body, lIx, rIx, lTys, rTys, fnIx)
   if crossOpened < 0 { return -1 }
   // Chain bottom: bare tag equality (null arm / non-shared arms).
   if emitExpr(body, lIx, fnIx) < 0 { return -1 }
@@ -22081,21 +22078,18 @@ function atomConvOp(fk: i32, tk: i32): i32 {
 // The stored and own atom kinds of a field read whose box `phys` holds one non-null scalar the
 // own type, one other scalar, narrows back to; empty for any other pair.
 function boxNarrowScalarKinds(phys: i32, own: i32): i32[] {
-  const pa: string[] = []
-  const oa: string[] = []
-  if (
-    !canonUnionMembersInto(phys, [], pa)
-    || !canonUnionMembersInto(own, [], oa)
-  ) {
+  const pt: i32[] = []
+  const ot: i32[] = []
+  if !canonUnionMemberTysOf(phys, pt) || !canonUnionMemberTysOf(own, ot) {
     return []
   }
-  const vals: string[] = []
-  for a in pa {
-    if a != "null" { vals.push(a) }
+  const vals: i32[] = []
+  for t in pt {
+    if t >= 0 { vals.push(t) }
   }
-  if vals.length != 1 || oa.length != 1 || vals[0] == oa[0] { return [] }
-  const fk = valueAtomKind(vals[0])
-  const tk = valueAtomKind(oa[0])
+  if vals.length != 1 || ot.length != 1 || tyEq(vals[0], ot[0]) { return [] }
+  const fk = boxAtomKindOfMemberTy(vals[0])
+  const tk = boxAtomKindOfMemberTy(ot[0])
   if fk < 0 || tk < 0 || atomConvOp(fk, tk) < 0 { return [] }
   [fk, tk]
 }
@@ -31542,17 +31536,15 @@ function staleBoxFrom(slot: i32, from: string[], fromTys: i32[]) {
     return 0
   }
   if rlElemKindAt(slot) != RLK_UNION { return 0 }
-  const ua: string[] = []
-  if !msMemberAtomsOfSet(msSetOfTyAny(rlElemTyIx[slot]), ua) {
+  const ut: i32[] = []
+  if !msMemberTysOfSet(msSetOfTyAny(rlElemTyIx[slot]), ut) {
     return emitFail("emitProgram: a ref-list union slot has no member set")
   }
-  // Which of the value atoms (`valueAtomKind` 0..5) the union holds.
+  // Which of the value box kinds 0..5 the union's members hold.
   const has = [false, false, false, false, false, false]
-  let i = 0
-  while i < ua.length {
-    const ak = valueAtomKind(ua[i])
+  for t in ut {
+    const ak = boxAtomKindOfMemberTy(t)
     if ak >= 0 && ak < has.length { has[ak] = true }
-    i = i + 1
   }
   const hasI32 = has[0]
   const hasI64 = has[3]
