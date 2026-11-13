@@ -34,8 +34,6 @@ import {
   tyHasHole,
   tyIsFuncArena,
   tyIsLitUnion,
-  tyIsLitUnionAlias,
-  tyIsLitUnionArray,
   tyIsNullableLitUnion,
   tyIsOneStrLit,
   tyNulInnerIsPrim,
@@ -56,7 +54,6 @@ import {
   arrLeafNameOf,
   nameIsShapeSpanEnds,
   shapeInnerFieldSplit,
-  tyIsStrLitSetList,
 } from "./emit_base"
 import { emitFail } from "./emit_bytes"
 import { code0SpellingFitsRow, fieldCodeForMatch } from "./emit_field_codes"
@@ -74,11 +71,10 @@ import {
   unionTyArms,
 } from "./emit_map_twins"
 import { nonNulBaseOf } from "./emit_map_value_slots"
-import { variantIndexOf } from "./emit_local_slots"
+import { exactArmRowOfTy, variantIndexOf } from "./emit_local_slots"
 import { isNulScalarListFieldCode } from "./emit_nullable_rets"
 import {
   anonRowServes,
-  fieldElemTyIxOfName,
   hcShapeSetId,
   recordSFieldElemRow,
   recordSFieldElemRowTy,
@@ -98,9 +94,7 @@ import {
   fieldCodeOfDeclinedTy,
   fieldTypeRefusalMsg,
   forceScalarListField,
-  genAppRidesTyParam,
   mapTyValKindLowerable,
-  nameIsConcreteGenAppDecl,
   nameIsGenAppDecl,
   nameIsStructDecl,
   nulRefListFieldCodeOfTy,
@@ -160,7 +154,7 @@ import {
   uVarTyIx,
   vbBoolListTop,
 } from "./emit_state"
-import { sFieldElemKeyKindAt, sFieldIndex } from "./emit_struct_order"
+import { sFieldIndex } from "./emit_struct_order"
 import {
   markAtomLeafListArms,
   registerValueUnionOfTy,
@@ -231,11 +225,11 @@ function internShapeArms(arms: string[], armTys: i32[]) {
     const armTy = armTys[uai]
     const uCore = arrLeafNameOf(arms[uai])
     if uCore.length >= 1 && uCore[0] == '{' {
-      internShapeDeepTy(arms[uai], armTy)
+      internShapeDeepTy(armTy)
     } else if tyIsFuncArena(tyStepArrRun(armTy, arms[uai], uCore)) {
       // A closure arm: the inline shapes buried in its params or result are otherwise
       // unreachable, since the arm is one spelling inside the union name.
-      internFuncTypeShapesTy(arms[uai], armTy)
+      internFuncTypeShapesTy(armTy)
     }
     uai = uai + 1
   }
@@ -275,62 +269,19 @@ function tyStepNulIf(ty: i32, full: string, base: string): i32 {
   nullableInnerOrNone(ty)
 }
 
-// `internShapeDeepTy` for an arena type, walked under its emitter render: the one place a
-// caller holding only `ty` turns it into the name the walk still keys on, which it returns.
-export function internShapeDeepOfTy(ty: i32): string {
-  const nm = tyToEmitName(ty)
-  internShapeDeepTy(nm, ty)
-  nm
-}
-
-// Recursively peels the composition wrappers off a type name — grouping parens, a trailing
-// `| null`, and trailing `[]` suffixes, in any order and to any depth — interning the
-// inline-shape struct reached at the bottom. A non-shape leaf (`i32`, a named type, a map)
-// interns as a no-op.
-export function internShapeDeepTy(nm: string, ty: i32) {
-  const kn = shapeWalkName(nm, ty)
-  shapeWalkStack.push(ty)
-  const r = internShapeDeepTyGo(kn, ty)
-  shapeWalkStack.pop()
-  r
-}
-
-// Types whose shape walk is in progress, innermost last.
-let shapeWalkStack: i32[] = []
-
-// The name a shape walk of `ty` keys on: its declaration's name (`tyToNominalName`) when it
-// has one, else the spelling `nm`. A type already being walked keeps `nm`, so a declaration
-// that reaches itself is entered by name only once.
-function shapeWalkName(nm: string, ty: i32): string {
-  if ty < 0 { return nm }
-  for b in shapeWalkStack {
-    if b == ty { return nm }
-  }
-  const rn = tyToNominalName(ty)
-  if rn == "" { nm } else { rn }
-}
-
-function internFuncTypeShapesTy(nm: string, ty: i32): i32 {
-  const kn = shapeWalkName(nm, ty)
-  shapeWalkStack.push(ty)
-  const r = internFuncTypeShapesTyGo(kn, ty)
-  shapeWalkStack.pop()
-  r
-}
-
 // The stored spelling of a record of tagged-set ids (`{f: Fn#a}` stored as `{f: i32}`),
 // installed by `emitProgram` before any pass, since its home sits above this module in the
 // import graph; a read before that traps.
 function tagRepNameUnset(_ty: i32): string { __trap__() }
 export let tagRepNameFn: (ty: i32) => string = tagRepNameUnset
 
-// The name a walk keys type `ty` on: its nominal name when `nm` is that name (`shapeWalkName`
-// passes another on a cycle), else its render, rendered only then since a deep record's render
-// doubles per level; a record of tagged-set ids, which has no render, by its stored spelling.
-function shapeWalkKeyOf(nm: string, ty: i32): string {
+// The name a walk keys type `ty` on when `kn` is its nominal name, and its render otherwise,
+// rendered only then since a deep record's render doubles per level; a record of tagged-set ids,
+// which has no render, by its stored spelling.
+function shapeWalkKeyOf(kn: string, ty: i32): string {
   const nn = tyToNominalName(ty)
   let ln = nn
-  if nn == "" || nm != nn {
+  if nn == "" || kn != nn {
     ln = tyToEmitName(ty)
     if ln == "" { ln = nn }
   }
@@ -338,13 +289,39 @@ function shapeWalkKeyOf(nm: string, ty: i32): string {
   ln
 }
 
+// Types whose shape walk is in progress, innermost last.
+let shapeWalkStack: i32[] = []
+
+// The key hint a fresh walk of `ty` starts from: its nominal name, or "" when `ty` is already
+// being walked, so a declaration that reaches itself is re-entered under its render.
+function shapeWalkName(ty: i32): string {
+  for b in shapeWalkStack {
+    if b == ty { return "" }
+  }
+  tyToNominalName(ty)
+}
+
 // Walks type `ty`, interning every inline shape, value union and function type it holds, each
-// keyed by `shapeWalkKeyOf`.
-function internShapeDeepTyGo(nm: string, ty: i32) {
-  if ty < 0 || ty >= T.tys.length { return 0 }
+// keyed by `shapeWalkKeyOf`. Returns the row a record leaf reached through `| null`, list and
+// map wrappers interned at, else -1.
+export function internShapeDeepTy(ty: i32) {
+  internShapeDeepTyAs(shapeWalkName(ty), ty)
+}
+
+// `internShapeDeepTy` keyed from `kn`: a frame handing its own type to the other walker passes
+// its own key, so the type keeps the key it is entered under.
+function internShapeDeepTyAs(kn: string, ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  shapeWalkStack.push(ty)
+  const r = internShapeDeepTyGo(kn, ty)
+  shapeWalkStack.pop()
+  r
+}
+
+function internShapeDeepTyGo(kn: string, ty: i32) {
   const t = tyAt(ty)
-  const ln = shapeWalkKeyOf(nm, ty)
-  if ln == "" { return 0 }
+  const ln = shapeWalkKeyOf(kn, ty)
+  if ln == "" { return -1 }
   if isValueUnionName(ln) {
     registerValueUnionOfTy(7, ty)
     // A closure member may bury inline shapes in its params or result, unreachable through the
@@ -352,13 +329,16 @@ function internShapeDeepTyGo(nm: string, ty: i32) {
     const vTys: i32[] = []
     if unionMemberTysOfAB(10, ty, vTys) {
       for m in vTys {
-        if tyIsFuncArena(m) { internFuncTypeShapesTy("", m) }
+        if tyIsFuncArena(m) { internFuncTypeShapesTy(m) }
       }
     }
-    return 0
+    return -1
   }
-  if tyIsFuncArena(ty) { return internFuncTypeShapesTy(ln, ty) }
-  if t is TyNullable { return internShapeDeepTy("", t.nInner) }
+  if tyIsFuncArena(ty) {
+    internFuncTypeShapesTyAs(ln, ty)
+    return -1
+  }
+  if t is TyNullable { return internShapeDeepTy(t.nInner) }
   if t is TyUnion {
     const uArms: string[] = []
     const uTys: i32[] = []
@@ -367,14 +347,13 @@ function internShapeDeepTyGo(nm: string, ty: i32) {
       && shapeWalkSplitsUnion(ln, ty, uArms.length)
     ) {
       internShapeArms(uArms, uTys)
-      return 0
+      return -1
     }
   }
-  if t is TyArray { return internShapeDeepTy("", tyStepElem(ty)) }
-  if t is TyMap { return internShapeDeepTy("", tyMapValOf(ty)) }
+  if t is TyArray { return internShapeDeepTy(tyStepElem(ty)) }
+  if t is TyMap { return internShapeDeepTy(tyMapValOf(ty)) }
   gaeEnsure(ln, ty)
   internInlineShapeTy(ln, ty)
-  0
 }
 
 // Whether a map field of recorded type `fTy` has a value the mv layer lowers; false for a
@@ -444,7 +423,7 @@ export function funcTypeShapeLowerable(ty: i32): boolean {
           || structElemArrayLowerable(fTy)
           || tyIsFuncArena(tyStepElem(fTy))))
         && !(fc == FC_MAP && fieldMapLowerable(fTy))
-        && !(fc == FC_UNION && isUNameKeyAB(67, "", fTy))
+        && !(fc == FC_UNION && isUNameKeyAB(67, fTy))
         && fc != FC_NUL_CLOSURE
       ) {
         okAll = false
@@ -482,13 +461,24 @@ export function armMintShapeName(nm: string) {
 }
 
 // Walks type `ty` below a function type, interning the plainly-lowerable inline shapes of its
-// params and result, keyed as `internShapeDeepTyGo` keys. Only a fully-lowerable struct leaf
+// params and result, keyed as `internShapeDeepTy` keys. Only a fully-lowerable struct leaf
 // interns; an unsupported composite field is left un-interned so the closure stays a clean
 // reject, never invalid wasm.
-function internFuncTypeShapesTyGo(nm: string, ty: i32): i32 {
+function internFuncTypeShapesTy(ty: i32): i32 {
+  internFuncTypeShapesTyAs(shapeWalkName(ty), ty)
+}
+
+function internFuncTypeShapesTyAs(kn: string, ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return 0 }
+  shapeWalkStack.push(ty)
+  const r = internFuncTypeShapesTyGo(kn, ty)
+  shapeWalkStack.pop()
+  r
+}
+
+function internFuncTypeShapesTyGo(kn: string, ty: i32): i32 {
   const t = tyAt(ty)
-  const ln = shapeWalkKeyOf(nm, ty)
+  const ln = shapeWalkKeyOf(kn, ty)
   if ln == "" { return 0 }
   // A value-union leaf registers its box reps, as `internShapeDeepTy`'s value-union arm does:
   // a producer-less closure-arm annotation otherwise leaves the box un-minted while a narrowed
@@ -499,11 +489,11 @@ function internFuncTypeShapesTyGo(nm: string, ty: i32): i32 {
   }
   match t {
     TyFunc => {
-      for p in t.fnParamTypes { internFuncTypeShapesTy("", p) }
-      internFuncTypeShapesTy("", t.fnRet)
+      for p in t.fnParamTypes { internFuncTypeShapesTy(p) }
+      internFuncTypeShapesTy(t.fnRet)
     }
     TyNullable => {
-      internFuncTypeShapesTy("", t.nInner)
+      internFuncTypeShapesTy(t.nInner)
     }
     // A composite union: `internShapeDeepTy` owns the arm grammar, so this delegates.
     TyUnion => {
@@ -513,11 +503,11 @@ function internFuncTypeShapesTyGo(nm: string, ty: i32): i32 {
         unionTyArms(ty, fArms, fTys)
         && shapeWalkSplitsUnion(ln, ty, fArms.length)
       ) {
-        internShapeDeepTy(ln, ty)
+        internShapeDeepTyAs(ln, ty)
       }
     }
     TyArray => {
-      internFuncTypeShapesTy("", tyStepElem(ty))
+      internFuncTypeShapesTy(tyStepElem(ty))
     }
     TyObj => {
       if nameIsShapeSpanEnds(ln) {
@@ -554,7 +544,7 @@ function internNonLowerableFieldShapesTy(nm: string, ty: i32) {
       // shape.
       const fldTy = tyFieldTyOf(ty, fnames[fi])
       if tyIsFuncArena(fldTy) {
-        internShapeDeepTy(ftxt, fldTy)
+        internShapeDeepTy(fldTy)
       } else {
         // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
         // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
@@ -562,7 +552,6 @@ function internNonLowerableFieldShapesTy(nm: string, ty: i32) {
         const base = arrLeafNameOf(nul)
         if nameIsShapeOpen(base) {
           internShapeDeepTy(
-            base,
             tyStepArrRun(tyStepNulIf(fldTy, ftxt, nul), nul, base),
           )
         }
@@ -600,25 +589,22 @@ function internShapeFieldElemsTy(nm: string, ty: i32) {
   0
 }
 
-// True if any field of shape `tyIx` (raw names `rawNames`, texts `rawTexts`) holds a generic
+// True if any field of shape `tyIx` (field names `rawNames`) holds a generic
 // type parameter as an array element (`T[]` at any depth, or `(T | null)[]`), declining to
 // mint a shape row before the parameter is substituted. A field with no arena type answers
 // false.
-function shapeFieldsRideTyParam(
-  rawTexts: string[],
-  rawNames: string[],
-  tyIx: i32,
-) {
+function shapeFieldsRideTyParam(rawNames: string[], tyIx: i32) {
   if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
   let gp = 0
-  while gp < rawTexts.length {
-    const t = rawTexts[gp]
-    // An application over a parameter (`B<T>`) is the original's too: `gaeEnsure` never
-    // interns it, so a row coding it as a struct ref has no heap to point at (D4556).
-    const ga = arrLeafNameOf(nonNulBaseOf(t))
-    if nameIsGenAppDecl(ga) && genAppRidesTyParam(ga, 8) { return true }
+  while gp < rawNames.length {
     let fTy = -1
     if tyIx >= 0 { fTy = tyFieldTyOf(tyIx, rawNames[gp]) }
+    // An application over a parameter (`B<T>`) is the original's too: `gaeEnsure` never
+    // interns it, so a row coding it as a struct ref has no heap to point at (D4556).
+    const ga = arrSpineLeafTy(nonNullTy(fTy))
+    if ga >= 0 && tyHasTyVar(ga) && nameIsGenAppDecl(tyToNominalName(ga)) {
+      return true
+    }
     const eTy = tyStepElem(fTy)
     if eTy >= 0 {
       if tyAt(arrSpineLeafTy(eTy)) is TyVar { return true }
@@ -634,7 +620,7 @@ function shapeFieldsRideTyParam(
 
 // D831 — a row whose field is already a box over this atom serves this annotation too, so an
 // annotation interned after it must not mint a narrower twin and split the program's reps in
-// two. `annShapeIndexOf` dedups on exact field codes, so a `??`-joined pair's merged row (coded
+// two. The layout find dedups on exact field codes, so a `??`-joined pair's merged row (coded
 // 16) would otherwise miss that dedup and mint a second row for the same value.
 function annShapeWiderRowOf(
   names: string[],
@@ -667,7 +653,7 @@ function annShapeWiderRowOf(
               allIn = false
             }
           } else if rc == codes[i] {
-            // The storage types decide when both rows record one, as in `annShapeIndexOf`.
+            // The storage types decide when both rows record one, as the layout key does.
             const rowTy = colAt(sFieldStoreTy, sFieldStart[si] + fi)
             const qTy = recFieldStoreTyOf(tyIx, names[i], codes[i])
             if rowTy >= 0 && qTy >= 0 {
@@ -710,7 +696,7 @@ function unionTyHasMemberTy(u: i32, q: i32): boolean {
 
 // Interns the inline object-shape text `nm` as an anonymous struct shape and returns its
 // struct table index, or -1 when `nm` is not an internable shape, with the caller's arena
-// type for `nm` (-1 for none). The hint reaches the field codes and `annShapeIndexOf`'s
+// type for `nm` (-1 for none). The hint reaches the field codes and the layout
 // key, so it must compute the key the `sTyIx` leg would (`rlInternNameTy`'s rule).
 export function internInlineShapeTy(nm: string, tyIx: i32) {
   internInlineShapeFieldsTy(nm, tyIx, tyIx)
@@ -726,7 +712,7 @@ export function internInlineShapeFieldsTy(
   // A re-entrancy memo, live only while an outer intern is on the stack (D1700). Each field
   // interns its nested shape TWICE — once through `internShapeDeepTy` and again to recover
   // the row when `nameFieldCodeTy` declines — which is 2^depth walks of one spine. The second
-  // visit is a no-op that `annShapeIndexOf` would answer with the same row.
+  // visit is a no-op that the layout find would answer with the same row.
   const iisSid = sidOf(nm)
   if iisBusy > 0 {
     if sidArrGet(iisMemoTy, iisSid) == tyIx + 2 {
@@ -885,13 +871,14 @@ function shapeIsAVariant(ty: i32): boolean {
 // a wider row that boxes a field it stores bare.
 let iisOwnRow = false
 
-// `internShapeDeepOfTy` for a record literal whose wider row is one its reader cannot use
-// (D8682): the shape is interned at its own field storage.
+// `internShapeDeepTy` for a record literal whose wider row is one its reader cannot use
+// (D8682): the shape is interned at its own field storage. Returns that row's name, the
+// spelling mono pins the call's return at, or "" when the walk interns no record row.
 export function internOwnShapeOfTy(ty: i32): string {
   iisOwnRow = true
-  const nm = internShapeDeepOfTy(ty)
+  const row = internShapeDeepTy(ty)
   iisOwnRow = false
-  nm
+  if row >= 0 && row < sNames.length { sNames[row] } else { "" }
 }
 
 const IIS_REF_LIST_FIELD_NO_TY_MSG = "a shape's ref-list field recorded no type to name its element row"
@@ -918,11 +905,12 @@ function iisPushFieldElem(
     )
     if e5 == "" { emitFail(IIS_REF_LIST_FIELD_NO_TY_MSG) }
     sFieldElemName.push(e5)
-    // A template field whose name resolves to no type records its open element type, the kind
-    // its row is minted by.
-    const e5Ty = tyStepElem(shapeFieldRowOf(fieldsTy, names[pi]))
-    const e5Open = e5Ty >= 0 && tyHasTyVar(e5Ty) && fieldElemTyIxOfName(e5) < 0
-    recordSFieldElemRowTy(e5, fkK, if e5Open { e5Ty } else { -1 })
+    // The field's element type, open in a template, which its row is minted by.
+    recordSFieldElemRowTy(
+      e5,
+      fkK,
+      tyStepElem(shapeFieldRowOf(fieldsTy, names[pi])),
+    )
     if isValueUnionName(e5) {
       registerValueUnionOfTy(
         61,
@@ -940,7 +928,11 @@ function iisPushFieldElem(
       shapeFieldRowOf(fieldsTy, names[pi]),
     )
     sFieldElemName.push(e28)
-    recordSFieldElemRow(e28, fkK) // D5 + B6b
+    recordSFieldElemRowTy(
+      e28,
+      fkK,
+      tyStepElem(tyPeelNul(shapeFieldRowOf(fieldsTy, names[pi]))),
+    ) // D5 + B6b
     if isValueUnionName(e28) {
       registerValueUnionOfTy(
         62,
@@ -957,20 +949,14 @@ function iisPushFieldElem(
       codes[pi],
       shapeFieldRowOf(fieldsTy, names[pi]),
     )
-    // The field's own row, projected per code, unless it is a literal union: the element's
-    // type, never its stored name, decides its row (D6).
+    // The field's own row, projected per code: the element's type, never its stored name,
+    // decides its row (D6).
     let enTy = -1
     if en != "" {
-      const er = shapeFieldElemRow(
-        shapeFieldRowOf(
-          if tyIx >= 0 { tyIx } else { fieldsTy },
-          names[pi],
-        ),
+      enTy = shapeFieldElemRow(
+        shapeFieldRowOf(if tyIx >= 0 { tyIx } else { fieldsTy }, names[pi]),
         codes[pi],
       )
-      if !tyIsLitUnion(er) && !tyIsLitUnionArray(er) && !tyIsLitUnionAlias(er) {
-        enTy = er
-      }
     }
     sFieldElemName.push(en)
     recordSFieldElemRowTy(en, fkK, enTy) // D5 + B6b
@@ -984,16 +970,27 @@ function iisPushFieldElem(
   0
 }
 
-// The struct row a nested inline-shape field `ftxt` (`{g:i32}`, `{g:i32} | null`) of arena
-// type `fldTy` (-1 for none) stores a ref to, interning it if needed, or -1 for any other
-// spelling. The row may carry an earlier literal's `#anonN` name, so a caller keys the field
-// by `sNames` of the answer, never by `ftxt`.
-function nestedFieldShapeRow(ftxt: string, fldTy: i32): i32 {
-  const base = nonNulBaseOf(ftxt)
-  // The `| null` the name peel dropped is peeled off the hint too — and only when the name
-  // actually shortened, so a non-nullable field keeps its own type.
-  internInlineShapeTy(base, tyStepNulIf(fldTy, ftxt, base))
+// The struct row a nested record field of type `fldTy` (`{g:i32}`, `{g:i32} | null`) stores a
+// ref to, found or interned by its non-null type, or -1 for a non-record. Twins share the row
+// (an inline `{v:i32}` and `Box<i32>` are one type). The row may carry a literal's `#anonN`
+// label, so a caller keys the field by `sNames` of the answer.
+function nestedFieldShapeRow(fldTy: i32): i32 {
+  const inner = nonNullTy(fldTy)
+  if inner < 0 || !(tyAt(inner) is TyObj) { return -1 }
+  const r = structRowOfRecordTy(inner)
+  if r >= 0 { return r }
+  internShapeDeepTy(inner)
 }
+
+// Whether field type `fldTy`, past `| null`, is a generic application with no type variable left
+// (`Box<i32>`): a declared field's instance row may not exist yet, and is keyed by its name.
+function fieldIsConcreteGenApp(fldTy: i32): boolean {
+  const inner = nonNullTy(fldTy)
+  if inner < 0 || tyHasTyVar(inner) { return false }
+  nameIsGenAppDecl(tyToNominalName(inner))
+}
+
+const IIS_SHAPE_FIELD_NO_LAYOUT_MSG = "emitProgram: an inline record field has no storage type to key its row by"
 
 function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
   if !nameIsShapeSpanEnds(nm) { return -1 }
@@ -1010,7 +1007,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
   // alias declares none, so it must not be interned: without this a type-parameter array
   // field resolved to "" and `pushFieldStorage` read `rlWrapIdx[-1]`, a compiler crash.
   // Skipping is right because the original is replaced by its instances, never emitted.
-  if shapeFieldsRideTyParam(rawTexts, rawNames, tyIx) { return -1 }
+  if shapeFieldsRideTyParam(rawNames, tyIx) { return -1 }
   const names: string[] = []
   const codes: i32[] = []
   const texts: string[] = []
@@ -1026,7 +1023,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       // `nameFieldCodeTy` to recognize the non-null part as a ref array. Must run before any
       // row is pushed, so the flat `sField*` arrays are not corrupted by the re-entrant intern.
       const fldTy = tyFieldTyOf(fieldsTy, rawNames[fi])
-      internShapeDeepTy(ftxt, fldTy)
+      internShapeDeepTy(fldTy)
       // The field's code is read off its type; a field with no type (a caller that holds none)
       // is coded from its text, the floor.
       let fc = if fldTy >= 0 { nameFieldCodeTy("", fldTy) } else { nameFieldCodeTy(ftxt, fldTy) }
@@ -1035,12 +1032,11 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
         // it under the canonical registered name. An earlier literal may have interned the
         // identical shape as a synthetic `#anonN`, so keying this field by the raw inline
         // spelling instead would block the dedup and leave the element unresolvable at emit.
-        const iidx = nestedFieldShapeRow(ftxt, fldTy)
-        const base = nonNulBaseOf(ftxt)
+        const iidx = nestedFieldShapeRow(fldTy)
         if iidx >= 0 {
           fc = FC_STRUCT
           ftxt = sNames[iidx]
-        } else if nameIsConcreteGenAppDecl(base) {
+        } else if fieldIsConcreteGenApp(fldTy) {
           // The declared field's generic-application rung (D4556): a shape
           // nested in a declaration interns before `collectGenAliasShapes`, so the instance
           // has no row yet and is keyed by its application name, as a declared field is.
@@ -1059,8 +1055,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
       // pointed at by the name its row is pushed under, at any depth, and the mint's own field
       // naming any other arm mints that arm first, so a cycle of arms closes (D15095).
       if iasMintTopDepth() >= 0 {
-        const xb = nonNulBaseOf(ftxt)
-        const xv = variantIndexOf(xb)
+        const xv = exactArmRowOfTy(nonNullTy(fldTy))
         if (
           xv >= 0
           && (fc < 0 || fc == FC_STRUCT)
@@ -1095,15 +1090,13 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
     if nameStripSpaces(groupInnerOf(nm)).length != 0 { return -1 }
   }
   // A record finds its row by type first, the key the struct registry holds, whether or not it
-  // is declared. The field-set find serves a type with no row.
+  // is declared. The layout find serves a type with no row.
   let existing = -1
   if fieldsTy >= 0 { existing = structRowOfRecordTy(fieldsTy) }
-  // A typed shape finds its row by layout, an untyped one by the field-set spelling key.
   if existing < 0 {
     existing = annShapeLayoutRowOf(names, codes, texts, tyIx, fieldsTy)
-    if existing == -2 {
-      existing = annShapeIndexOf(names, codes, texts, tyIx, fieldsTy)
-    }
+    // A field with no storage type has no layout key, and no spelling key stands in for it.
+    if existing == -2 { return emitFail(IIS_SHAPE_FIELD_NO_LAYOUT_MSG) }
   }
   if existing >= 0 {
     // A literal's `#anon` row carries no spelling, so the annotation it serves is recorded
@@ -1139,9 +1132,9 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
   recordSTyIx(sTyIxOfNameTy(nm, tyIx)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
-  // The canonical field order (D622, `fieldNameOrder`): `annShapeIndexOf` above already
-  // matches by field name off a sorted field-set id, so the dedup this recorder depends on
-  // is unaffected; only the emitted sequence moves.
+  // The canonical field order (D622, `fieldNameOrder`): the layout find above matches by
+  // field name off a sorted layout id, so the dedup this recorder depends on is unaffected;
+  // only the emitted sequence moves.
   const dOrd = fieldNameOrder(names)
   let pj = 0
   while pj < codes.length {
@@ -1199,7 +1192,14 @@ export function internShapeAs(key: string, nm: string) {
       rawTexts[fi],
       shapeFieldRowOf(fieldsTy, rawNames[fi]),
     )
-    if fc < 0 { return emitFail(fieldTypeRefusalMsg(rawTexts[fi])) }
+    if fc < 0 {
+      return emitFail(
+        fieldTypeRefusalMsg(
+          rawTexts[fi],
+          shapeFieldRowOf(fieldsTy, rawNames[fi]),
+        ),
+      )
+    }
     names.push(rawNames[fi])
     codes.push(fc)
     fi = fi + 1
@@ -1252,27 +1252,15 @@ export function internShapeAs(key: string, nm: string) {
   0
 }
 
-// ── the shape-row fieldset index ──
-// `annShapeIndexOf`'s three conditions collapse to one key: the multiset of (field name,
-// field code), hash-consed so the scan becomes a walk of one bucket. The bucket only
-// narrows candidates; every member still faces the unchanged per-candidate test.
-let sSetHead: i32[] = []
-let sSetTail: i32[] = []
-let sSetNext: i32[] = []
-let sSetLen = 0
-
+// ── the shape-row layout index ──
 // The layout index: each stored row whose fields all record a storage type, bucketed by its
-// layout id (`shapeLayoutIdOf`). A row with an untyped field is in the spelling index only.
+// layout id (`shapeLayoutIdOf`). A row with an untyped field is in no index.
 let lSetHead: i32[] = []
 let lSetTail: i32[] = []
 let lSetNext: i32[] = []
 let lSetLen = 0
 
 export function shapeSetIxReset() {
-  sSetHead = []
-  sSetTail = []
-  sSetNext = []
-  sSetLen = 0
   lSetHead = []
   lSetTail = []
   lSetNext = []
@@ -1282,73 +1270,12 @@ export function shapeSetIxReset() {
   0
 }
 
-// The canonical id of a (field name, field code) multiset, sorted by sid so field order
-// cannot change the key. The sid of an element name maps "" to a value no real name can
-// take, since an empty element name means "no element", a different fact from "the element
-// is the empty spelling" that `sidOf("")` would otherwise conflate.
-function elemSid(nm: string): i32 {
-  if nm == "" { return -1 }
-  sidOf(nm)
-}
-
-// The row identity, per field, in canonical (sid-sorted) order: field-name sid, field code,
-// element-name sid, map-key bit, litunion-atom bit. Four of the five are live; the atom bit
-// is inert by construction (set only under `qb == ""`, which `shapeFieldElemName` never
-// yields for the two codes it guards) and stays as a backstop — an incomplete key is a miss, never a wrong answer.
-function shapeFieldSetIdOf(
-  fnames: string[],
-  fcodes: i32[],
-  felems: string[],
-  fkeys: i32[],
-  fatoms: i32[],
-): i32 {
-  const sids: i32[] = []
-  const ord: i32[] = []
-  let i = 0
-  while i < fnames.length {
-    const sd = sidOf(fnames[i])
-    let j = sids.length
-    sids.push(sd)
-    ord.push(i)
-    while j > 0 {
-      if sids[j - 1] <= sd {
-        j = 0
-      } else {
-        sids[j] = sids[j - 1]
-        ord[j] = ord[j - 1]
-        sids[j - 1] = sd
-        ord[j - 1] = i
-        j = j - 1
-      }
-    }
-    i = i + 1
-  }
-  const a: i32[] = []
-  a.push(fnames.length)
-  let k = 0
-  while k < sids.length {
-    const o = ord[k]
-    a.push(sids[k])
-    a.push(fcodes[o])
-    a.push(elemSid(felems[o]))
-    a.push(fkeys[o])
-    a.push(fatoms[o])
-    k = k + 1
-  }
-  hcShapeSetId(a)
-}
-
-// The stored row's own key, read off the flat field columns. `sScanLim` bounds by the
-// header columns, not the three detail arrays `shapeRowSetId` reads, so inside a mint's
-// header-then-details window it can include a row whose details are short. This index
-// never re-keys a row, so a row bucketed mid-construction would keep the wrong key forever.
-function sSetLim(): i32 {
+// The rows the layout index may bucket: `sScanLim` bounds by the header columns, so inside a
+// mint's header-then-details window it can include a row whose details are short, and the index
+// never re-keys a row. Scanned from the index's own watermark `from`, which only grows.
+function sSetLim(from: i32): i32 {
   const n = sScanLim()
-  // From `sSetLen`, not from 0 — otherwise this guard is O(rows) on every query and puts
-  // back the O(rows²) the watermark index exists to remove. Answer-identical: no row below
-  // `sSetLen` can be short, since it is complete by the time the index consumes it, and the detail
-  // columns only grow within a program.
-  let i = sSetLen
+  let i = from
   while i < n {
     if sFieldStart[i] + sFieldCount[i] > sFieldElemName.length { return i }
     if sFieldStart[i] + sFieldCount[i] > sFieldNames.length { return i }
@@ -1356,58 +1283,6 @@ function sSetLim(): i32 {
     i = i + 1
   }
   n
-}
-
-function shapeRowSetId(si: i32): i32 {
-  const fn: string[] = []
-  const fc: i32[] = []
-  const fe: string[] = []
-  const fk: i32[] = []
-  const fa: i32[] = []
-  const st = sFieldStart[si]
-  const n = sFieldCount[si]
-  let i = 0
-  while i < n {
-    fn.push(sFieldNames[st + i])
-    fc.push(sFieldTypes[st + i])
-    const en = sFieldElemNameAt(si, i)
-    fe.push(en)
-    let kb = 0
-    if en != "" { kb = sFieldElemKeyKindAt(si, i) }
-    fk.push(kb)
-    // A row whose field records no element name is a plain scalar there — a litunion field
-    // records its union name — so its atom bit is 0, and the query's is its own text's
-    // litunion-ness, the split the refinement's two atom arms make.
-    fa.push(0)
-    i = i + 1
-  }
-  shapeFieldSetIdOf(fn, fc, fe, fk, fa)
-}
-
-function sSetSync() {
-  if sSetLen > sNames.length { shapeSetIxReset() }
-  const lim = sSetLim()
-  while sSetLen < lim {
-    if sIsRefRow(sSetLen) {
-      while sSetNext.length <= sSetLen { sSetNext.push(-1) }
-      sSetLen = sSetLen + 1
-      continue
-    }
-    const k = shapeRowSetId(sSetLen)
-    while sSetHead.length <= k {
-      sSetHead.push(-1)
-      sSetTail.push(-1)
-    }
-    while sSetNext.length <= sSetLen { sSetNext.push(-1) }
-    if sSetHead[k] < 0 {
-      sSetHead[k] = sSetLen
-    } else {
-      sSetNext[sSetTail[k]] = sSetLen
-    }
-    sSetTail[k] = sSetLen
-    sSetLen = sSetLen + 1
-  }
-  0
 }
 
 // Whether field code `c` stores a reference whose identity the layout keys by the target's row.
@@ -1522,7 +1397,7 @@ function shapeRowLayoutId(si: i32): i32 {
 
 function lSetSync() {
   if lSetLen > sNames.length { shapeSetIxReset() }
-  const lim = sSetLim()
+  const lim = sSetLim(lSetLen)
   while lSetLen < lim {
     while lSetNext.length <= lSetLen { lSetNext.push(-1) }
     if !sIsRefRow(lSetLen) {
@@ -1646,174 +1521,46 @@ function annSameTypeRowOf(
   si
 }
 
-function annShapeIndexOf(
-  names: string[],
-  codes: i32[],
-  texts: string[],
-  tyIx: i32,
-  fieldsTy: i32,
-) {
-  const sLimC = sScanLim()
-  sSetSync()
-  const qElems: string[] = []
-  const qKeys: i32[] = []
-  const qAtoms: i32[] = []
-  const qLit: boolean[] = []
-  let qi = 0
-  while qi < names.length {
-    // The same derivation the refinement makes, hoisted: `shapeFieldElemName` is the
-    // mint's one home for "what element does this (text, code) record", and "" means the
-    // field records none — in which case the atom bit carries the split instead.
-    let qb = shapeFieldElemName(
-      texts[qi],
-      codes[qi],
-      shapeFieldRowOf(fieldsTy, names[qi]),
-    )
-    if qb != "" {
-      if codes[qi] == FC_STRUCT { qb = nonNulBaseOf(qb) }
-    }
-    qElems.push(qb)
-    let kb = 0
-    if qb != "" { kb = tyMapKeyKindSpan(shapeFieldRowOf(fieldsTy, names[qi])) }
-    qKeys.push(kb)
-    // Asked once per code-0 field: the dedup scan below splits on the same answer.
-    let lu = false
-    if codes[qi] == FC_I32 {
-      const luTy = shapeFieldRowOf(fieldsTy, names[qi])
-      lu = luTy >= 0 && tyIsLitUnion(luTy)
-    }
-    qLit.push(lu)
-    let ab = 0
-    if qb == "" {
-      if codes[qi] == FC_I32 {
-        if lu { ab = 1 }
-      } else if codes[qi] == FC_I32_LIST {
-        if tyIsStrLitSetList(shapeFieldRowOf(fieldsTy, names[qi])) { ab = 1 }
-      }
-    }
-    qAtoms.push(ab)
-    qi = qi + 1
-  }
-  const qk = shapeFieldSetIdOf(names, codes, qElems, qKeys, qAtoms)
-  if qk < 0 || qk >= sSetHead.length { return -1 }
-  let si = sSetHead[qk]
-  while si >= 0 && si < sLimC {
-    if sFieldCount[si] == names.length {
-      let allIn = true
-      let i = 0
-      while i < names.length {
-        const fi = sFieldIndex(si, names[i])
-        if fi < 0 {
-          allIn = false
-        } else if sFieldTypeAt(si, fi) != codes[i] {
-          // The same field-name set with a different field type is a distinct shape —
-          // intern it separately so each annotation resolves its own struct.
-          allIn = false
-        } else {
-          // Same field name and code, but a ref field with a different element type is still
-          // a distinct shape: without this, `{f:{f:i32}}` and `{f:{f:{f:i32}}}` (both field
-          // `f`, code 15) would wrongly dedup, since the recursion produces identical
-          // name+code at every level when field names repeat.
-          const en = sFieldElemNameAt(si, fi)
-          if en != "" {
-            // The storage types decide when both rows record one: an element name is not its
-            // field's text (a map's is its value). Without a type the spelling decides, and
-            // unifying that with `shapeFieldElemName` enables merges the rep fuzzer proves unsound
-            // (`p2r ((i32) => {f: boolean}[] | {w: i32}) | f64` takes the wrong narrowing branch).
-            const rowTy = colAt(sFieldStoreTy, sFieldStart[si] + fi)
-            const qTy = recFieldStoreTyOf(fieldsTy, names[i], codes[i])
-            if rowTy >= 0 && qTy >= 0 {
-              if !tySame(rowTy, qTy) { allIn = false }
-            } else {
-              let bi = texts[i]
-              if codes[i] == FC_STRUCT { bi = nonNulBaseOf(bi) }
-              if en != bi { allIn = false }
-            }
-          } else if codes[i] == FC_I32 && qLit[i] {
-            // Atom-identity split (code 0 is layout-shared): a litunion-atom field must not
-            // dedup onto a plain i32/boolean row — layout-equal but encoding-different, since
-            // the shared row served both and the atom side's member literal emitted as a
-            // string ref into the i32 slot, invalid wasm.
-            allIn = false
-          } else if (
-            codes[i] == FC_I32_LIST
-            && tyIsStrLitSetList(shapeFieldRowOf(fieldsTy, names[i]))
-          ) {
-            // The atom-array sibling: same shared-layout split — the atom-element context
-            // is per-row (`sFieldIsLitUnionArray`), so the rows must stay distinct.
-            allIn = false
-          } else if (
-            !sFieldCloSigCompat(
-              si,
-              fi,
-              codes[i],
-              shapeFieldRowOf(fieldsTy, names[i]),
-            )
-          ) {
-            // Signature-identity split, the closure field's twin of the two atom splits
-            // above: code 14 is layout-shared, so `{f: () => string}` and `{f: () => i32}`
-            // matched here and the second annotation resolved the first's row, leaving its
-            // own spelling with no interned shape on a program `vl check` accepts.
-            allIn = false
-          }
-        }
-        i = i + 1
-      }
-      // An `i32` field and a `boolean` one share code 0, and a read formats by the row, so a
-      // spelling does not dedup onto a row that stores the other kind (D2866's comparator).
-      if allIn && !code0SpellingFitsRow(names, texts, si) { allIn = false }
-      // A literal's `#anon` row holds only its own type's canonical id: a spelling of another
-      // type matching its fields mints a row of its own.
-      if allIn && !anonRowServes(si, tyIx) { allIn = false }
-      if allIn { return si }
-    }
-    si = sSetNext[si]
-  }
-  -1
-}
-
 // Interns the generic application `name` ("Box<i32>") at its instance type `ty`: the record's
 // rendered shape walks as any inline shape does. An application over a type parameter interns
 // nothing; each instance re-runs this over its own concrete type.
 export function gaeEnsure(name: string, ty: i32) {
   if !annGenAppSpanEnds(name) { return 0 }
   if ty < 0 || tyHasTyVar(ty) || !(tyAt(ty) is TyObj) { return 0 }
-  internShapeDeepOfTy(ty)
+  internShapeDeepTy(ty)
   0
 }
 
-// Interns the reflist wrapper slot for every ref-element-array arm of the union `name` — its
+// Interns the reflist wrapper slot for every ref-element-array arm of union type `ty` — its
 // box payload rides that wrapper ref, and `refArrTagOf` needs the slot to exist. The
 // ref-array analogue of `markValueUnionAtoms`. Gated on a non-value array atom, so
 // scalar-element lists (owned by `markValueUnionAtoms`) are skipped.
-export function markRefArrayArms(name: string, ty: i32) {
+export function markRefArrayArms(ty: i32) {
   const atoms: string[] = []
   const mems: i32[] = []
-  markRefArrayArmsOf(atoms, mems, unionSetArmTysAB(103, name, ty, atoms, mems))
+  markRefArrayArmsOf(mems, unionSetArmTysAB(103, ty, atoms, mems))
 }
 
 // `markRefArrayArms` over registered row `u`'s own members.
 export function markRefArrayArmsRow(u: i32) {
   const atoms: string[] = []
   const mems: i32[] = []
-  markRefArrayArmsOf(atoms, mems, unionRowArmTys(u, atoms, mems))
+  markRefArrayArmsOf(mems, unionRowArmTys(u, atoms, mems))
 }
 
-// The reflist interning for one union's `atoms`, read through member types `mems` when `cov`.
+// The reflist interning for one union's member types `mems`, when `cov`.
 // An uncovered row interns nothing: its rows mint from the union's canonical members, so a
 // member with no arena type is an arm over a generic body's unbound type parameter, and that
 // row is never boxed; each instance mints its own covered row.
-function markRefArrayArmsOf(atoms: string[], mems: i32[], cov: boolean) {
+function markRefArrayArmsOf(mems: i32[], cov: boolean) {
   if !cov { return 0 }
-  // The stored atom text still feeds the name-keyed reflist layer downstream.
   let i = 0
-  while i < atoms.length {
-    const a = atoms[i]
+  while i < mems.length {
     if unMemIsRefElemArray(mems[i]) {
       const aTy = mems[i]
       const bd = boolLeafListDepthOfTy(aTy)
       if bd > vbBoolListTop { vbBoolListTop = bd }
-      internShapeDeepTy(a, aTy)
+      internShapeDeepTy(aTy)
     }
     i = i + 1
   }

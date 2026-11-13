@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Step 7 L2, mono: the typed instance key loses two text tests.** `monoSigPinDiscrim`, which keyed a function pin by its `$fnsig` spelling, is replaced by an assertion. No pin reaches it once `monoPinRespell` spells pins by type, and a control with the respell disabled shows the assertion fires. `monoTypedExtra` now keys a call's explicit and defaulted type bindings by their canonical types, read from columns recorded beside the key text. Before, it zipped the text against a different list and fell back to the raw spelling when their counts disagreed. Every program the change touches builds byte-identically.
