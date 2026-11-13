@@ -40,9 +40,10 @@ of 1,627 identical** (1,603 SAME, 24 SAME refusal).
 
 ## Census
 
-- Type-string parses go from 36 to 35.
-- Ungraded parses stay at 36: two leave (the spread and `T[]` fallbacks), and the census moves
-  `arrElemSuffixed(aen)` (the D16022 floor) into this code.
-- `annSplitParams`' `tyTopLevelSplit` leaves.
-- Renders hold at 100. The slot pin's existing inline-record branch merges into the new by-type
-  spelling, so no render is added.
+Entries leaving the baseline, all lane D's:
+- `annSplitParams`' `tyTopLevelSplit`;
+- the spread rung's and the `T[]` fallback's `arrElemSuffixed` (both ungraded);
+- `arrElemSuffixed(aen)` as a type-string parse.
+
+The census now grades that last one, the D16022 floor, as ungraded. Renders hold: the slot pin's
+inline-record branch merges into the new by-type spelling, so no render is added.
