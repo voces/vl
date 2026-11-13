@@ -19,5 +19,8 @@ The armed tally no longer records a spelling row at these sites. No test or scri
 ## Proof
 
 - **Seed:** fixpoint.
+- **Locally:** lint-self, regress (no runs lost), rep-fuzz (exact), check-filed-witnesses `--strict`
+  (4,865 graded, 0 moved), late-demands (8, baseline 8), seed-size (+1.9%), and the comment,
+  ladder, sentinel and scan budgets.
 - **The full sweep:** CI's `sweep` label. Unarmed, the emitted program is unchanged, so the
   expectation is identity.
