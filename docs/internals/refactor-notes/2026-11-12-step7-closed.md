@@ -29,20 +29,24 @@ parse except the carried floors.
 The six NAME readers:
 
 - `annTyIsRefList` (ARENA + NAME): a presence test, whether an annotation is written.
-- `unionNameOfCall` (ARENA + NAME): a rung of the `unionNameOfExpr` floor (contracts, below). Its
-  row is found by type.
+- `unionNameOfCall` (ARENA + NAME): a rung of the `unionNameOfExpr` floor (contracts, below). It
+  is **open under G**. Its declared-callee rung returns the annotation's name with row -1 when the
+  call's type does not fold to that row. On that path, decisions read the name:
+  `unionMemberSetOfRow`'s fallback to `unRowOfName`, `unionSetHasNullTy`, `unionArmTysOfRow`, and
+  the `??` arm's `crn == cln`.
 - `emitUnionLitIs` and `elabArgRepins`: contract. A literal's lexeme, and a type parameter's
   identity.
 - `nulNicheIsTestImpossible`: a diagnostic render.
-- `flatHasSubWordField`: D15978, a `flat` field's sub-word width that has no type.
+- `flatHasSubWordField`: D15978, a `flat` field's sub-word width that has no type, carried.
 
 `structIndexByName`'s five call sites read an `#anonN` handle, a type parameter's identity, or the
 row dump, all under `sNameIx`'s contract. `registerInlineUnionAt` and `mintInlineUnion` take the
 type; the name they carry is the `unNames` label (D16032).
 
-**Carried past step 7: 9 rows.** D15976, D16010, D16012, D16014, D16022, D16032, D16052, D16060
-and D16063. Four of them hold the census's 7 floor sites: D16022 ×2, D16032, D16052 ×2 and D16014 ×2.
-D16042 is a tenth row outside the census (an armed-only instrument). On master `11274d92`,
+**Carried past step 7: 10 rows.** D15976, D16010, D16012, D16014, D16022, D16032, D16052, D16060
+and D16063, and D15978, `flatHasSubWordField`'s gap (owner ruling: built after step 7, the flat
+sub-word plan from #7854; D16044 and D16045 are filed beside it). Four of them hold the census's 7 floor sites: D16022 ×2, D16032, D16052 ×2 and D16014 ×2.
+D16042 is an eleventh row, outside the census (an armed-only instrument). On master `11274d92`,
 `check-filed-witnesses.vl --strict` over both inventories grades all 4,893 witnesses as filed,
 with 0 moved and 0 output mismatches. Each carried row reads `runs  runs  as filed`.
 
@@ -360,13 +364,14 @@ Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the 
 because the checker records no type there. Each is filed `runs today and must keep running`, and
 its witness runs as filed on master `11274d92`. The close carries them forward.
 
-The close carries 9 rows. Four of them hold the census's 7 floor sites, the `ty-carried-floor`
+The close carries 10 rows. Four of them hold the census's 7 floor sites, the `ty-carried-floor`
 code in `scripts/render-parse-floors.txt`: D16022 ×2, D16032, D16052 ×2 and D16014 ×2. D16042 is
-a tenth row, outside the census.
+an eleventh row, outside the census.
 
 | row | site | the gap |
 | --- | --- | --- |
 | [D15976](../inventory/D15976.md) | `emitObj` → `fieldRowKindIn` | a record field's un-annotated `[]`-or-`null` join reaches emit with its element hole unfilled |
+| [D15978](../inventory/D15978.md) | `flatHasSubWordField` | a `flat` field's sub-word width has no type (`i8`, `i16` and `u16` check as `u8`); owner ruling: built after step 7 (#7854's plan), with D16044 and D16045 beside it |
 | [D16010](../inventory/D16010.md) | `sLitMintRow` | a hole instance's record literal has no elaborated type, so it builds at its minted row |
 | [D16052](../inventory/D16052.md) | `msFreeSliceOfTy` (emit_union_registry:772) | a row-less member slice keeps its members' canon spellings as an atom column that readers decide by |
 | [D16042](../inventory/D16042.md) | `call_bind_shadow`'s armed-only instrument | it parses mono's binding spelling for the shadow's lifetime; an instrument, armed only, with no compile effect, and outside the census, which scans emitter files only |
