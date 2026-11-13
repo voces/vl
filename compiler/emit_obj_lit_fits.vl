@@ -57,6 +57,7 @@ import { fieldNameOrder } from "./check_obj_shape"
 import { tyIsNullUnit } from "./check_ty_rep"
 import {
   T,
+  TY_STR,
   TyArray,
   TyErr,
   TyFunc,
@@ -68,6 +69,8 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  genAppRowOf,
+  softenLitTy,
   tyAt,
   tyBearsNull,
   tyEq,
@@ -103,6 +106,7 @@ import { exactArmRowOfTy } from "./emit_local_slots"
 import { vtKindOfType } from "./emit_nullable_rets"
 import { paramPosOfRead, paramTypeNodeOfRead } from "./emit_query"
 import {
+  armDeclSame,
   boxAtomKindOfMemberTy,
   boxTagOfTy,
   nodeMapValTyIx,
@@ -166,6 +170,7 @@ import {
 import { unionRowKeyAB } from "./emit_union_registry"
 import { strListHas } from "./listutil"
 import {
+  isNullTy,
   litSetBaseTy,
   nonNullTy,
   tyExcludesNull,
@@ -1276,50 +1281,80 @@ export function atomWidens(fk: i32, tk: i32): boolean {
   (fk == 0 && (tk == 3 || tk == 4)) || (fk == 5 && tk == 4)
 }
 
-// The kind member `p` (type `pt`) of `from` is stored as in a union `to` (member types `toTys`)
-// lacking it, or -1: the FIRST member of `to`, in `to`'s order, that `from` lacks and `p` widens
-// to. A read inverts exactly this first-match rule (`boxNarrowAtomFor`), so the two directions
-// cannot disagree.
-export function boxWidenAtomFor(
-  p: string,
-  pt: i32,
-  to: string[],
-  toTys: i32[],
-  from: string[],
-): i32 {
-  if strListHas(to, p) { return -1 }
+// The kind member `pt` of `fromTys` is stored as in a union of members `toTys` lacking it, or -1:
+// the FIRST member of `toTys`, in order, that `fromTys` lacks and `pt` widens to. A read
+// inverts exactly this first-match rule (`boxNarrowAtomFor`), so the two directions cannot
+// disagree. Membership is `memberTyIn`'s.
+export function boxWidenAtomFor(pt: i32, toTys: i32[], fromTys: i32[]): i32 {
+  if memberTyIn(pt, toTys) { return -1 }
   const fk = boxAtomKindOfMemberTy(pt)
-  let j = 0
-  while j < to.length && j < toTys.length {
-    const k = boxAtomKindOfMemberTy(toTys[j])
-    if !strListHas(from, to[j]) && atomWidens(fk, k) { return k }
-    j = j + 1
+  for t in toTys {
+    const k = boxAtomKindOfMemberTy(t)
+    if !memberTyIn(t, fromTys) && atomWidens(fk, k) { return k }
   }
   -1
 }
 
-// The kind of the one member of `own` (types `ownTys`) that `boxWidenAtomFor` stores as the stored
-// member `p` (type `pt`), -1 when none is, or -2 when two are and a read cannot tell them apart.
+// The kind of the one member of `ownTys` that `boxWidenAtomFor` stores as the stored member `pt`,
+// -1 when none is, or -2 when two are and a read cannot tell them apart.
 export function boxNarrowAtomFor(
-  p: string,
   pt: i32,
-  own: string[],
   ownTys: i32[],
-  stored: string[],
   storedTys: i32[],
 ): i32 {
   const pk = boxAtomKindOfMemberTy(pt)
-  if pk < 0 || strListHas(own, p) { return -1 }
+  if pk < 0 || memberTyIn(pt, ownTys) { return -1 }
   let found = -1
-  let j = 0
-  while j < own.length && j < ownTys.length {
-    if boxWidenAtomFor(own[j], ownTys[j], stored, storedTys, own) == pk {
+  for t in ownTys {
+    if boxWidenAtomFor(t, storedTys, ownTys) == pk {
       if found >= 0 { return -2 }
-      found = boxAtomKindOfMemberTy(ownTys[j])
+      found = boxAtomKindOfMemberTy(t)
     }
-    j = j + 1
   }
   found
+}
+
+// Whether member type `t` is one of `tys`, as a union's member render spells members: `null`
+// (-1 or the `null` primitive) matches `null`, a numeric literal its base scalar, and two others
+// match when `memberTySame` holds.
+export function memberTyIn(t: i32, tys: i32[]): boolean {
+  const nt = t < 0 || isNullTy(t)
+  for u in tys {
+    const nu = u < 0 || isNullTy(u)
+    if nt || nu {
+      if nt && nu { return true }
+    } else if memberTySame(memberNumSoft(u), memberNumSoft(t), 8) {
+      return true
+    }
+  }
+  false
+}
+
+// Whether members `a` and `b` render as one member: the same declaration, brand and generic
+// application at each leaf (`tyEq` alone joins a record with its declared twin), a list
+// read-only or not.
+function memberTySame(a: i32, b: i32, depth: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 || depth <= 0 { return false }
+  const ta = tyAt(a)
+  const tb = tyAt(b)
+  if ta is TyArray && tb is TyArray {
+    return memberTySame(ta.aElem, tb.aElem, depth - 1)
+  }
+  if ta is TyNullable && tb is TyNullable {
+    return memberTySame(ta.nInner, tb.nInner, depth - 1)
+  }
+  tyEq(a, b)
+    && armDeclSame(a, b)
+    && (genAppRowOf(a) >= 0) == (genAppRowOf(b) >= 0)
+}
+
+// A numeric literal or literal union at its base scalar, as the member render spells it; a
+// string literal set keeps its own type, since it renders under its alias.
+function memberNumSoft(t: i32): i32 {
+  const s = softenLitTy(t)
+  if s == t || s == TY_STR { return t }
+  s
 }
 
 // ── ref-array-typedness of expressions (G7-ref) ─────────────────────────────────

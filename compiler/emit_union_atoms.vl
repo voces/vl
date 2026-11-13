@@ -31,7 +31,6 @@ import {
   mapTwinUnionMember,
   storedTyOf,
   tyMapKeyKindSpan,
-  valueAtomKind,
   valueRowKind,
   valueUnionFromAtomKinds,
 } from "./check_ty_rep"
@@ -90,6 +89,7 @@ import {
   unionRowArmTys,
   unionSetArmTysAB,
   unionTyArms,
+  unionTyMemberTys,
 } from "./emit_map_twins"
 import {
   mvValTyIxAt,
@@ -102,7 +102,7 @@ import {
   mvArmSigOfTy,
   mvValArmName,
 } from "./emit_mv_slots"
-import { ifExprCollectAtoms, paramTypeNodeOfRead } from "./emit_query"
+import { paramTypeNodeOfRead } from "./emit_query"
 import {
   boxTagOfTy,
   declTyIxOfName,
@@ -273,6 +273,7 @@ import {
   unRowOfTyAB,
   unSiteOnKey,
   unionArmsOf,
+  unionArmsOfRow,
   unionMemberSetOf,
   unionMemberTysOf,
   unionMemberTysOfRow,
@@ -586,17 +587,26 @@ function mvShapeOfValNameArmTyGo(
   let rlS = -1
   if kind == MVK_STRUCT {
     // An arm value is keyed by the arm's name and type (D34), since `sNames[vsi]` is the
-    // inline-shape row minted from the arm's field set, over the wrong heap. The `sNames[vsi]`
-    // rung is deliberately unhinted: that row's `sTyIx` sidecar has two producers that answer
-    // differently for an `#anonN` row.
+    // inline-shape row minted from the arm's field set, over the wrong heap. A row is keyed by
+    // its minted type, where closed (`rlKeyTyOf`); one holding a function inside a
+    // record is keyed by the function-value sets its name carries.
     let armNm = mvValArmName(armTy)
-    if armNm == "" && exactArmRowOfTy(cUserTypes[valName] ?? -1) >= 0 {
-      armNm = valName
+    let armNmTy = armTy
+    if armNm == "" {
+      const declTy = cUserTypes[valName] ?? -1
+      if exactArmRowOfTy(declTy) >= 0 {
+        armNm = valName
+        armNmTy = declTy
+      }
     }
     if armNm != "" {
-      rlS = rlInternNameTy(armNm, RLK_STRUCT, armTy)
+      rlS = rlInternNameTy(armNm, RLK_STRUCT, armNmTy)
     } else if vsi >= 0 && vsi < sNames.length {
-      rlS = rlInternName(sNames[vsi], RLK_STRUCT)
+      rlS = rlInternNameTy(
+        sNames[vsi],
+        RLK_STRUCT,
+        rlKeyTyOf(if vsi < sTyIx.length { sTyIx[vsi] } else { -1 }),
+      )
     } else {
       // No row: refused here rather than read out of bounds, the slot kept in step.
       emitFail("emitProgram: a record map value has no struct row")
@@ -722,8 +732,12 @@ export function ensureRefElemTys(elemName: string, ty: i32, kindTy: i32) {
     let inm = rlRowNameOfTy(innerKindTy, true)
     if inm == "" { inm = rlRepRowNameOfTy(innerKindTy) }
     if inm == "" { inm = rlRowNameOfTy(tyStepElem(tyPeelNul(ty)), true) }
+    // The inner key is the stored element's, else the held element type's, so an unhinted
+    // outer row's inner row is keyed by type rather than by its spelling.
     let inner = tyStepElem(ty)
-    if elemTyIsNominal(innerKindTy) { inner = rlKeyTyOf(innerKindTy) }
+    if inner < 0 || elemTyIsNominal(innerKindTy) {
+      inner = rlKeyTyOf(innerKindTy)
+    }
     ensureRefElemTys(inm, inner, innerKindTy)
   }
   ensureRefElemKindTail(elemName, k, ty, kindTy)
@@ -762,10 +776,6 @@ function ensureRefElemKindTail(elemName: string, k: i32, ty: i32, kindTy: i32) {
   } else if k == RLK_U8_LIST {
   }
   rlInternNameTyK(elemName, k, ty, kindTy)
-}
-
-export function rlInternName(name: string, kind: i32) {
-  rlInternNameTy(name, kind, -1)
 }
 
 // The record type a literal's `#anon` struct row recorded at its mint, or -1 for any other
@@ -2102,42 +2112,18 @@ export function unionHasMapArmSlot(ty: i32, slot: i32) {
   false
 }
 
-// True if the union member-set `name` has a MAP arm (`{[string]: V}`). Resolves an alias to its
-// member set first. Used by the frame pre-pass (`exprHasMapOp` → `unionMapArmIdent`) to reserve the
-// map scratch frame for a `t[k]` on a union binding narrowed to its map arm — the narrowing is not
-// active in that pass, so the map op must be spotted from the binding's DECLARED union.
-export function unionHasMapArm(name: string) { unionMapArmName(name) != "" }
-
-// The map arm name of the union member-set `name`, or "" when it has none — the value-atom
-// scheme carries one map arm per union.
-export function unionMapArmName(name: string) {
-  const armTy: i32[] = []
-  unionMapArmNameTy(name, armTy)
-}
-
-// The form that also hands back the arm's arena type, pushed onto `outTy` (empty when the
-// arena leg did not decide the arm). The map-slot layer downstream is still name-keyed, so
-// the spelling stays the return value, sparing the caller from re-deriving `V` from
-// it. An out-array rather than a second function, since the arm is chosen by one walk.
-function unionMapArmNameTy(name: string, outTy: i32[]) {
+// True if union `name`, read with row `u` (-1: none carried), has a MAP arm (`{[string]: V}`):
+// the row's members where it records them (D16032), else `name`'s. The frame pre-pass asks it
+// (`unionMapArmIdent`) for a `t[k]` on a binding narrowed to its map arm, a narrowing that pass
+// does not see, so the map op is spotted from the binding's declared union.
+export function unionHasMapArmOfRow(u: i32, name: string): boolean {
   const atoms: string[] = []
-  // Picks the map arm from the row's recorded arena member types (`unMemIsMap`) instead of
-  // re-classifying each atom's rendered spelling with `nameIsMap`. The recorded member slice
-  // is in atom order, so `atoms[m]` is this member's stored spelling, which the still-
-  // name-keyed map-slot layer downstream needs. An uncovered row has no map arm.
   const mems: i32[] = []
-  if unionArmTys(name, atoms, mems) {
-    let m = 0
-    while m < mems.length {
-      if unMemIsMap(mems[m]) {
-        outTy.push(mems[m])
-        return atoms[m]
-      }
-      m = m + 1
-    }
-    return ""
+  if !unionArmTysOfRow(u, name, atoms, mems) { return false }
+  for m in mems {
+    if unMemIsMap(m) { return true }
   }
-  ""
+  false
 }
 
 // True when the CHECKED type of `exprIx` is a union carrying a MAP member, or a bare
@@ -2317,9 +2303,8 @@ export function unionArmMemberTys(name: string, out: i32[]): boolean {
 export function unionHasRefArrayArmSlot(ty: i32, slot: i32) {
   // A carrier with no row (-1) must not match a member with no arm row, which is -1 too.
   if slot < 0 { return false }
-  const atoms: string[] = []
   const mems: i32[] = []
-  if !unionTyArms(ty, atoms, mems) { return false }
+  if !unionTyMemberTys(ty, mems) { return false }
   let i = 0
   while i < mems.length {
     if unMemRefArrArmSlot(mems[i]) == slot { return true }
@@ -2511,13 +2496,13 @@ export function unionNestedArrayArmSlot(name: string) {
 // True if the union member-set `name` has an array-of-map arm. The frame pre-pass
 // consults this (via `unionMapArrayElemIndex`) to reserve the map scratch for a `t[i][k]`
 // read on a union binding narrowed to its map-array arm, since the narrowing is not active
-// in that pass — the map-array twin of `unionHasMapArm`.
-export function unionHasMapArrayArm(name: string) {
+// in that pass — the map-array twin of `unionHasMapArmOfRow`, likewise reading row `u`.
+export function unionHasMapArrayArmOfRow(u: i32, name: string): boolean {
   const atoms: string[] = []
   // A `TyArray` over a `TyMap` (`unMemIsMapArray`). A map-member union element is a
   // `TyUnion`, never a `TyMap`, however it renders, so it is not an arm here.
   const mems: i32[] = []
-  if unionArmTys(name, atoms, mems) {
+  if unionArmTysOfRow(u, name, atoms, mems) {
     let m = 0
     while m < mems.length {
       if unMemIsMapArray(mems[m]) { return true }
@@ -2547,45 +2532,6 @@ export function nliForgetLet(letIx: i32) {
     i = i + 1
   }
   0
-}
-
-// The value-union name an un-annotated if-expression binding init carries, or "" when it
-// is not a value union the box can hold (a non-union if, a `string | null` niche, or an
-// arm the static pre-pass cannot classify). The canonical name is the deduped arm atoms in
-// arm order, with a trailing `|null` when any arm or the else-less path is null.
-export function ifExprNliName(ifIx: i32) {
-  const atoms: string[] = []
-  const hn = ifExprCollectAtoms(ifIx, atoms)
-  if hn == -2 { return "" }
-  if atoms.length == 0 { return "" }
-  // Mixed numeric arms widen to a single numeric — they are not a union, and this static
-  // atom list cannot do that lattice join. Bail so the numeric value-position-if path
-  // (`letIsF64`/`letIsI64`) handles them instead. A single numeric scalar is fine.
-  let numCount = 0
-  const kinds: i32[] = []
-  let j = 0
-  while j < atoms.length {
-    const k = valueAtomKind(atoms[j])
-    kinds.push(k)
-    if k == 0 || k == 3 || k == 4 || k == 5 { numCount = numCount + 1 }
-    j = j + 1
-  }
-  if numCount >= 2 { return "" }
-  let nm = ""
-  let i = 0
-  while i < atoms.length {
-    if nm != "" { nm = nm + "|" }
-    nm = nm + atoms[i]
-    i = i + 1
-  }
-  if hn == 1 {
-    nm = nm + "|null"
-    kinds.push(6)
-  }
-  // Only a value union the box rep can hold (≥2 non-null atoms, or one NUMERIC scalar +
-  // null) registers here — a `string | null` niche / a non-union stay on their own paths.
-  if !valueUnionFromAtomKinds(kinds) { return "" }
-  nm
 }
 
 // The only writer of `uVariants`.
@@ -2747,6 +2693,18 @@ export function unionArmTys(
   const u = unRowOfName(name)
   if u >= 0 { return unionMemberTysOfRow(u, tys) && tys.length == atoms.length }
   unionMemberTysOf(nm, tys) && tys.length == atoms.length
+}
+
+// `unionArmTys` for a caller holding `u`, the row its read of `name` carried, or -1: that row's
+// atoms and member types where it records them, else `name`'s (D16032).
+export function unionArmTysOfRow(
+  u: i32,
+  name: string,
+  atoms: string[],
+  tys: i32[],
+): boolean {
+  if !unionArmsOfRow(u, atoms) { return unionArmTys(name, atoms, tys) }
+  unionMemberTysOfRow(u, tys) && tys.length == atoms.length
 }
 
 // `isUNameAB` for a binding's annotation node, keyed on the spelling canon left on the node.
