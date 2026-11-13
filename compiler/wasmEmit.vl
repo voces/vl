@@ -155,6 +155,7 @@ import {
   eqCoreKindOfTyToken,
 } from "./check_ty_relate"
 import {
+  PrimName,
   T,
   TY_ERR,
   TY_F32,
@@ -1533,7 +1534,6 @@ import {
   tyBoxTakesAtomAsStr,
   unMemIsMap,
   unMemIsRefElemArray,
-  unionArmsOf,
   unionArmsOfTy,
   unionHasAtomOfTy,
   unionMemberSetOfRow,
@@ -1602,6 +1602,7 @@ import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
   atomEqOpcodeOfKind,
   boxAtomKindOfMemberTy,
+  boxTagOfPrim,
   boxTagOfTy,
   mapShapeKeyInt,
   mapShapeKeyKind,
@@ -1712,7 +1713,6 @@ import {
   mapTyValLitUnionTexts,
   tyIsNulLitUnionNiche,
   tyIsNulStrBoxUnion,
-  valueAtomKind,
   valueRowKind,
 } from "./check_ty_rep"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
@@ -9795,8 +9795,11 @@ function unionTyHasValueKind(ty: i32, vak: i32): i32 {
 // Whether value kind `k` is a bare primitive or `null`, which a kind compare can decide.
 function valueKindIsPlainScalar(k: i32): boolean {
   if k < 0 { return false }
-  for p in ["i32", "i64", "f32", "f64", "boolean", "string", "u8", "null"] {
-    if valueAtomKind(p) == k { return true }
+  const ps: PrimName[] = [
+    "i32", "i64", "f32", "f64", "boolean", "string", "null",
+  ]
+  for p in ps {
+    if boxTagOfPrim(p) == k { return true }
   }
   false
 }
@@ -10921,7 +10924,6 @@ function emitUnionConcreteEq(
       eak,
       isNe,
       unr[0],
-      uname,
       fnIx,
     )
     if cross != 0 { return if cross < 0 { -1 } else { 0 } }
@@ -11351,7 +11353,9 @@ function emitUnionBoxEqStagedX(
   0
 }
 
-// `emitUnionConcreteEq` where the box's union (row `u`, else `uname`) has no arm of number kind
+const UNION_NUM_CROSS_NO_TYS_MSG = "emitProgram: a union compared with a number has no member types to read its arms from"
+
+// `emitUnionConcreteEq` where the box's union (row `u`, else the box's type) has no arm of number kind
 // `eak` but arms of a kind it widens to or from: box and operand are evaluated once and each such
 // arm compares at the wider kind; any other arm is unequal. Returns 1 handled, 0 when no arm
 // qualifies, -1 on error.
@@ -11362,18 +11366,16 @@ function emitUnionConcreteNumCross(
   eak: i32,
   isNe: boolean,
   u: i32,
-  uname: string,
   fnIx: i32,
 ): i32 {
   const kinds: i32[] = []
   const tys: i32[] = []
-  if u >= 0 && unionMemberTysOfRow(u, tys) {
-    for t in tys { kinds.push(boxAtomKindOfMemberTy(t)) }
-  } else {
-    const atoms: string[] = []
-    unionArmsOf(uname, atoms)
-    for a in atoms { kinds.push(valueAtomKind(a)) }
+  if !(u >= 0 && unionMemberTysOfRow(u, tys)) {
+    if !unionTyMemberTys(tyPeelNul(unionBoxTyOfRead(boxIx, fnIx)), tys) {
+      return emitFail(UNION_NUM_CROSS_NO_TYS_MSG)
+    }
   }
+  for t in tys { kinds.push(boxAtomKindOfMemberTy(t)) }
   const kas: i32[] = []
   for ka in kinds {
     if ka != eak && numEqOpOfKind(wideKindOf(ka, eak)) >= 0 { kas.push(ka) }
@@ -20394,8 +20396,7 @@ function xrepElemEq(
     )
   }
   let opened = 0
-  for an in arms {
-    const ka = valueAtomKind(an)
+  for ka in aks {
     const wide = xrepWideKind(ka, numKind)
     if ka >= 0 && wide >= 0 && numEqOpOfKind(wide) >= 0 {
       fbLocalGet(bs)
@@ -23862,6 +23863,12 @@ function emitNumExactCast(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
   emitNumExactCastFrom(body, e, exprIx, asExprNumSrcName(exprIx), fnIx)
 }
 
+// The box tag of the numeric `as` target at `ix`, read off the node's type as
+// `asExprNumTgtName` reads its spelling.
+function asExprNumTgtKind(ix: i32): i32 {
+  boxTagOfPrim(primNameOf(tyPeelNul(nodeTyIxOf(ix))))
+}
+
 // `emitNumExactCast` from the source rep `srcIn`, which a type-parameter operand reads off
 // its instance rather than its recorded type.
 function emitNumExactCastFrom(
@@ -23895,7 +23902,7 @@ function emitNumExactCastFrom(
   const integral = src != "i64" && exprIsIntegralFloat(e.asObj, fnIx)
   if emitNumExactTest(src, dom, integral) < 0 { return -1 }
   if e.asMode == "null" {
-    const nck = valueAtomKind(tgt)
+    const nck = asExprNumTgtKind(exprIx)
     const nvb = vbHeapIdxOfKind(nck)
     if nvb < 0 || !uDeclared {
       return emitFail(
@@ -24612,7 +24619,7 @@ function numCastSrcRepOf(obj: i32, fnIx: i32): string {
 // takes the exact-or-fail box.
 function emitHoleNumAsOpt(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
   const tgt = asExprNumTgtName(exprIx)
-  const nck = valueAtomKind(tgt)
+  const nck = asExprNumTgtKind(exprIx)
   const nvb = vbHeapIdxOfKind(nck)
   if nvb < 0 || !uDeclared {
     return emitFail(
