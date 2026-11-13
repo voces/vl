@@ -26,4 +26,5 @@ caller and is deleted.
 - Sweep with fixpoint seeds on both sides, master `ddd58e6e` against the candidate: 24,224 same, 0
   bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
 - `scripts/gate.sh`: all rows pass.
-- Render-parse census: no entry moves. The deleted parser was not a graded site.
+- Render-parse census: the site's `ty-source-parse` entry leaves (emit_map_twins goes from 1 to
+  0), and the census drops `boolLeafListDepthOfName` from its `EXTRA_PARSERS`.
