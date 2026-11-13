@@ -76,6 +76,27 @@ graded:
 
 Six are floors and two block the close. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
 
+## The census's coverage (lane H, #7748, open)
+
+The render and parse counts above came from a census that read only `emit_*.vl` and `wasmEmit.vl`,
+and counted ten named parsers, three of which no longer exist. Lane H's audit wrapped every
+type-spelling parser's call site and recorded the sites reached while `emitProgram` runs, over
+24,170 corpus programs:
+
+| | old census | #7748 |
+| --- | --- | --- |
+| static type-string parse sites in scope | 1 | 149 (115 reached at emit) |
+| static `tyToEmitName` renders in scope | 8 | 13 (5 in `check_emit_queries.vl`) |
+
+There are also 148 `check_*` entry sites that emit reaches and the checker shares. Among them,
+`nameToTy` is reached from emit through `synthTypeRefFb` (78 programs) and `monoSubstIsExpr`
+(36 programs).
+
+So "renders down to the floor, parses at one" is a claim about the old census, not about the
+emitter. The close does not open on it. §3.3's sentence "parses no type spelling back" waits on
+the re-measure under #7748's census. Each of the 115 reached parse sites is graded as a floor
+with a contract, or as failing with an owner.
+
 ## Floors held by a filed row
 
 Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the site reads a name
