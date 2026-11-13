@@ -1,3 +1,4 @@
+import { unionAliasDeclNameOfTy } from "./check_types"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import { armRowTysOfUnionTy, armRowsOfUnionTy } from "./emit_classify"
 import { unMemPeelAliasWrapper } from "./emit_union_tykey_text"
@@ -1144,7 +1145,6 @@ import {
   tyIsBareStrLit,
   unionBoxStoreTyOf,
   unionBoxTyIxOfExpr,
-  unionNameOfExpr,
   unionNameOfRead,
   unionNameRowOfExpr,
 } from "./emit_classify"
@@ -1487,7 +1487,6 @@ import {
   unionRefArrayArmSlotForElem,
   unionRefArrayArmSlotForMapElem,
   unionRefArrayArmSlotForNestedElem,
-  unionSetHasAtom,
   unionSpellingOfTy,
   valueUnionKeyTextOfTy,
   valueUnionNameOfTy,
@@ -1544,7 +1543,6 @@ import {
   unionArmsOf,
   unionArmsOfSet,
   unionArmsOfTy,
-  unionHasAtomAB,
   unionHasAtomOfTy,
   unionMemberAtomsOf,
   unionMemberSetOf,
@@ -9749,6 +9747,27 @@ function nulNoneEqSides(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
   nulNoneEqSide(leftIx, fnIx) && nulNoneEqSide(rightIx, fnIx)
 }
 
+// Whether union type `ty` has an arm of value kind `vak`, by its member set's banked kinds: 0 only
+// when every member is a bare primitive or `null` and none is `vak`. A set the bank does not
+// cover, or a member a kind cannot rule out (a record, list, closure or nested union), answers 1.
+function unionTyHasValueKind(ty: i32, vak: i32): i32 {
+  const ks: i32[] = []
+  if !msMemberValKindsOf(msSetOfTyAny(ty), ks) || ks.length < 2 { return 1 }
+  for k in ks {
+    if k == vak || !valueKindIsPlainScalar(k) { return 1 }
+  }
+  0
+}
+
+// Whether value kind `k` is a bare primitive or `null`, which a kind compare can decide.
+function valueKindIsPlainScalar(k: i32): boolean {
+  if k < 0 { return false }
+  for p in ["i32", "i64", "f32", "f64", "boolean", "string", "u8", "null"] {
+    if valueAtomKind(p) == k { return true }
+  }
+  false
+}
+
 // The union a box is built into, from its type `ty`: the row `ty` keys to, named as registered,
 // unless `name` already names that row in any of its spellings; a value union keyed by no row,
 // by its spelling. `name` only where `ty` gives neither.
@@ -11848,6 +11867,27 @@ function unionEqOperandTy(ix: i32, fnIx: i32): i32 {
   nodeTyAt(unwrapParen(ix), fnIx)
 }
 
+// The union operand `ix` of `==` is boxed in, named from its box type (`boxTyName`), else by the
+// declared alias its type is; "" where neither names one. A union-typed operand neither names is
+// refused, since its name would come from a spelling.
+function unionEqNameOf(ix: i32, fnIx: i32): string {
+  const n = boxTyName(unionBoxTyIxOfExpr(ix, fnIx))
+  if n != "" { return n }
+  const t = nodeTyAt(unwrapParen(ix), fnIx)
+  const an = unionAliasDeclNameOfTy(t)
+  if an != "" { return an }
+  if (
+    t >= 0
+    && t < T.tys.length
+    && (tyAt(t) is TyUnion || tyAt(t) is TyNullable)
+  ) {
+    emitFail(
+      "emitProgram: union `==`: an operand's type names no union it is boxed in",
+    )
+  }
+  ""
+}
+
 // Union against union: equal iff the same arm (tag) holds and the unboxed payloads value-compare
 // equal per that arm. Folded as a nested value-typed `if` chain over the shared non-null arms,
 // bottoming out at bare tag equality — which covers the `null` arm and any non-shared arm. The
@@ -11859,8 +11899,8 @@ function emitUnionUnionEq(
   isNe: boolean,
   fnIx: i32,
 ) {
-  let lname = unionNameOfExpr(lIx, fnIx)
-  let rname = unionNameOfExpr(rIx, fnIx)
+  let lname = unionEqNameOf(lIx, fnIx)
+  let rname = unionEqNameOf(rIx, fnIx)
   let lUTy = unionEqOperandTy(lIx, fnIx)
   // Two spellings of one member set are one union: both name the row their types reach.
   if lname != rname {
@@ -11969,7 +12009,11 @@ function emitUnionUnionEq(
         rj = rj + 1
       }
     } else {
-      inR = unionHasAtomAB(25, rname, nodeTyIxOf(unwrapParen(rIx)), lAtoms[ai])
+      // The right operand's arms come from its member set or its box type; one with neither has
+      // nothing to match the left's arms against.
+      return emitFail(
+        "emitProgram: union `==`: the right operand's arms are known from neither its member set nor its type",
+      )
     }
     if lAtoms[ai] != "null" && inR {
       arms.push(lAtoms[ai])
@@ -37153,9 +37197,7 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
     // parameter narrowed to an impossible arm type-checks, so the arm is
     // constant-false there and would otherwise read a box that is not there.
     if fnHasTyParams(fnIx) {
-      const vSet = unionNameOfRead(exprIx, fnIx)
-      const vAtom = valueAtomNameOfKind(vak)
-      if vSet != "" && vAtom != "" && !unionSetHasAtom(vSet, vAtom) {
+      if unionTyHasValueKind(unionBoxTyOfRead(exprIx, fnIx), vak) == 0 {
         fbUnreachable()
         return 0
       }
@@ -39750,7 +39792,7 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
       const cpn = nodeAt(cps[cai])
       if cpn is Param {
         if cpKind == "union" {
-          cuNm = tyNameOf(cpn.parType)
+          cuNm = boxTyName(nodeTyIxOf(cpn.parType))
           cuTy = nodeTyAt(cps[cai], fnStmts[target])
         }
         // Alias-INDEX, so a NARROWED copy is recognized.

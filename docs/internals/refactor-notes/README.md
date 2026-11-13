@@ -9,6 +9,22 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-step7-vkind-struct-elem-name-by-type](2026-11-13-step7-vkind-struct-elem-name-by-type.md): Step 7, lane H: the FC_STRUCT element name producers, 2026-11-13
+- [2026-11-13-step7-vkind-field-elem-hint-cut-2](2026-11-13-step7-vkind-field-elem-hint-cut-2.md): Step 7, lane H: field element hints, cut 2, 2026-11-13
+- [2026-11-13-step7-union-reg-box-atoms](2026-11-13-step7-union-reg-box-atoms.md): Step 7 L6 (lane G, cut 7a): the box-atom retags and three dead spellings read member sets, 2026-11-13
+- [2026-11-13-step7-union-reg-anon-field-rung](2026-11-13-step7-union-reg-anon-field-rung.md): Step 7 L6 (lane G, cut 7b): an anonymous field's union box names no row by spelling, 2026-11-13
+- [2026-11-13-step7-union-reg-ab-name-params](2026-11-13-step7-union-reg-ab-name-params.md): Step 7 L6 (lane G, cut 7c): two registry seams drop their spelling parameter, 2026-11-13
+- [2026-11-13-step7-name-classifiers-by-type](2026-11-13-step7-name-classifiers-by-type.md): Five NAME-reading classifiers answer from types, rows and member sets, 2026-11-13
+- [2026-11-13-step7-map-twin-arm-walks-by-type](2026-11-13-step7-map-twin-arm-walks-by-type.md): The map-twin arm walks read a union's arms by type or row, never its spelling, 2026-11-13
+- [2026-11-13-step7-lane-e-field-refusal-by-type](2026-11-13-step7-lane-e-field-refusal-by-type.md): Step 7 L2: the struct-field refusal decides "union arm" from the field's type, 2026-11-13
+- [2026-11-13-step7-lane-e-d6-spelling-key-floor](2026-11-13-step7-lane-e-d6-spelling-key-floor.md): Step 7 D6: the interner's field-set spelling key is deleted behind a loud floor, 2026-11-13
+- [2026-11-13-step7-lane-e-d6-key-producers-by-type](2026-11-13-step7-lane-e-d6-key-producers-by-type.md): Step 7 D6: the interner's nested-field, gen-app and arm-mint key producers read the field's type, 2026-11-13
+- [2026-11-13-step7-l2-mono-typed-key-floors](2026-11-13-step7-l2-mono-typed-key-floors.md): Step 7 L2: two of the typed instance key's three named floors, 2026-11-13
+- [2026-11-13-step7-l2-mono-anon-pin-by-type](2026-11-13-step7-l2-mono-anon-pin-by-type.md): Step 7 L2: the anonymous-pin discriminator reads the pin's type, 2026-11-13
+- [2026-11-13-step7-call-union-name-and-declared-union-by-type](2026-11-13-step7-call-union-name-and-declared-union-by-type.md): A call's union name carries its row; a declared union reads its alias members by type, 2026-11-13
+- [2026-11-12-w311-d6-walk-by-type](2026-11-12-w311-d6-walk-by-type.md): Step 7 L2 D6: the shape walk takes a type, not a spelling, 2026-11-12
+- [2026-11-12-step7-vkind-print-union-members-by-type](2026-11-12-step7-vkind-print-union-members-by-type.md): Step 7, lane H: the print plan's union members by type, 2026-11-12
+- [2026-11-12-step7-vkind-field-elem-hint-by-type](2026-11-12-step7-vkind-field-elem-hint-by-type.md): Step 7, lane H: the interner's field recorders pass the element type, 2026-11-12
 - [2026-11-12-w311-d6-step1a-field-code-by-type](2026-11-12-w311-d6-step1a-field-code-by-type.md): Step 7 D6 step 1a: the interner codes a field from its type, and the closure-signature column takes no text, 2026-11-12
 - [2026-11-12-step7-vkind-mv-union-row-by-type](2026-11-12-step7-vkind-mv-union-row-by-type.md): Step 7, lane H: a map's union value slot by its row, 2026-11-12
 - [2026-11-12-step7-union-reg-let-box](2026-11-12-step7-union-reg-let-box.md): Step 7 L6 (lane G, cut 6c): a let binding's union box by its type, 2026-11-12
