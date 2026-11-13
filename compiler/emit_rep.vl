@@ -50,6 +50,7 @@ import {
   msFreeChain,
   msFreeCount,
   msFreeKinds,
+  msFreeLitArm,
   msFreeStart,
   msFreeTys,
   msFreeValKind,
@@ -2243,6 +2244,11 @@ function unMemKindOf(atom: string, ty: i32): i32 {
 // while it already holds each member's text. Exact, never a fold, since folding could hand a tag no producer interned — a runtime trap rather than a loud reject.
 export let unMemValKind: i32[] = []
 
+// Whether recorded member `m` is a literal arm softened to its base scalar (`boxRowMembersInto`'s
+// `lits`), index-parallel to `unMemValKind` and reset with it. Twin arms over one base share an
+// atom id; this column tells them apart from a repeated plain member.
+let unMemLitArm: boolean[] = []
+
 // The banked value-atom kind of recorded member `m`, or -2 when the bank does not
 // cover it (a member recorded before this column existed in this program, or a
 // column the external reset left behind — see the lock-step guard).
@@ -2307,6 +2313,19 @@ export function msSliceKind(u: i32, i: i32): i32 {
   msFreeKinds[msFreeStart[-2 - u] + i]
 }
 
+// 1 where member `i` of slice `u` is a literal arm at its base scalar, 0 where it is not, -1 where
+// the column does not cover the row.
+export function msSliceLitArm(u: i32, i: i32): i32 {
+  if u >= 0 {
+    const m = unMemRowStart(u) + i
+    if unMemLitArm.length != unMemAtoms.length || m >= unMemLitArm.length {
+      return -1
+    }
+    return if unMemLitArm[m] { 1 } else { 0 }
+  }
+  if msFreeLitArm[msFreeStart[-2 - u] + i] { 1 } else { 0 }
+}
+
 export function msSliceValKind(u: i32, i: i32): i32 {
   if u >= 0 { return unMemValKindAt(unMemRowStart(u) + i) }
   msFreeValKind[msFreeStart[-2 - u] + i]
@@ -2314,7 +2333,11 @@ export function msSliceValKind(u: i32, i: i32): i32 {
 
 // The row-less slice holding members `tys` spelled `atoms` (index-parallel, -1 / "null" for
 // `null`), as row id `-2 - k`; banked like `recordUnMemTys` banks a row's members.
-export function msFreeSlicePush(tys: i32[], atoms: string[]): i32 {
+export function msFreeSlicePush(
+  tys: i32[],
+  atoms: string[],
+  lits: boolean[],
+): i32 {
   const k = msFreeStart.length
   msFreeStart.push(msFreeAtoms.length)
   msFreeCount.push(atoms.length)
@@ -2327,6 +2350,7 @@ export function msFreeSlicePush(tys: i32[], atoms: string[]): i32 {
     msFreeAtomIds.push(msAtomIdOf(a))
     msFreeKinds.push(unMemKindOf(a, tys[i]))
     msFreeValKind.push(valueAtomKind(a))
+    msFreeLitArm.push(i < lits.length && lits[i])
     i = i + 1
   }
   -2 - k
@@ -2469,9 +2493,9 @@ export function msHasValKind(s: i32, k: i32): i32 {
 }
 
 // Whether member set `s` is a value union carrying a literal-union arm (`K0 | i64`): every member
-// a value atom, `null` or a literal union, at least one literal union and 2+ non-null members.
-// Tri-state as `msIsValueUnion`: -1 where the pool does not cover `s`, or where a member repeats,
-// since a literal union's widened row repeats its base per arm and hides which arm is literal.
+// a value atom, `null` or a literal union, one literal union and 2+ distinct non-null members. A
+// literal union is 2+ literal arms on one base; a lone literal arm is its base. -1 as
+// `msIsValueUnion`, and where a plain member repeats.
 export function msSetCarriesLitUnionArm(s: i32): i32 {
   if s < 0 || s >= msSetRow.length { return -1 }
   if msSetGen[s] != msGen.at { return -1 }
@@ -2484,21 +2508,32 @@ export function msSetCarriesLitUnionArm(s: i32): i32 {
   let i = 0
   while i < n {
     if msSetHas(s, i) {
+      const la = msSliceLitArm(u, i)
+      if la < 0 { return -1 }
+      let twin = false
+      let first = true
       let j = 0
-      while j < i {
-        if msSetHas(s, j) && msSliceAtomId(u, j) == msSliceAtomId(u, i) {
-          return -1
+      while j < n {
+        if (
+          j != i
+          && msSetHas(s, j)
+          && msSliceAtomId(u, j) == msSliceAtomId(u, i)
+        ) {
+          if la != 1 || msSliceLitArm(u, j) != 1 { return -1 }
+          twin = true
+          if j < i { first = false }
         }
         j = j + 1
       }
       const ty = msSliceTy(u, i)
-      if ty >= 0 && tyIsLitUnion(ty) {
+      const k = msSliceValKind(u, i)
+      if twin || ty >= 0 && tyIsLitUnion(ty) {
         lit = true
+        if first { nonNull = nonNull + 1 }
+      } else if k < 0 {
+        return 0
+      } else if k != nullValKind() {
         nonNull = nonNull + 1
-      } else {
-        const k = msSliceValKind(u, i)
-        if k < 0 { return 0 }
-        if k != nullValKind() { nonNull = nonNull + 1 }
       }
     }
     i = i + 1
@@ -2683,6 +2718,7 @@ export function msPoolReset() {
   msFreeAtomIds = []
   msFreeKinds = []
   msFreeValKind = []
+  msFreeLitArm = []
   msFreeByTy = []
   memoGenAdvance(msGen)
   0
@@ -2708,18 +2744,20 @@ export function recordUnMemTys(set: string) {
   // them; the disagreement is observed here, before this row's members append, and
   // re-empties the column.
   if unMemValKind.length != unMemAtoms.length { unMemValKind = [] }
+  if unMemLitArm.length != unMemAtoms.length { unMemLitArm = [] }
   while unMemTyStart.length + 1 < unNames.length {
     unMemTyStart.push(-1)
     unMemTyCount.push(0)
   }
   const atoms: string[] = []
   const tys: i32[] = []
+  const lits: boolean[] = []
   const row = unNames.length - 1
   let rowTy = -1
   if row >= 0 && row < unTyIx.length { rowTy = unTyIx[row] }
   if rowTy < 0 {
     emitFail("emitProgram: union row has no arena type: " + set)
-  } else if boxRowMembersInto(rowTy, tys, atoms) {
+  } else if boxRowMembersInto(rowTy, tys, atoms, lits) {
     // A member is its arena type, never a re-parse of its spelling, which renders a numeric
     // literal field as its base and would merge twin arms (D14540). The row's -1 is null.
     let j = 0
@@ -2744,6 +2782,7 @@ export function recordUnMemTys(set: string) {
     unMemAtomIds.push(msAtomIdOf(a))
     unMemKinds.push(unMemKindOf(a, ty))
     unMemValKind.push(valueAtomKind(a))
+    unMemLitArm.push(i < lits.length && lits[i])
     i = i + 1
   }
   0

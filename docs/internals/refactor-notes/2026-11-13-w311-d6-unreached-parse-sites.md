@@ -31,7 +31,8 @@ of the 34 sites, so it goes with the chain. `msSubAtom` had no compiler caller; 
 a `tests/cases` file kept it off the dead-export list.
 
 `unionHasAtomTy` is never entered: its only callers, in `emit_map_value_slots.vl`, are not reached.
-Its rendered-member rung goes, and the `emitFail` it already had answers.
+Its rendered-member rung went first. Then #7758 (lane B) deleted the function, and the merge keeps
+that deletion.
 
 Two floors keep a parse as their condition: `annGenAppSpanEnds` in `sTyIxOfNameTy` and
 `nameIsShapeSpanEnds` in `slotRowTyOf`. A name with no type has nothing else to test. Each is
@@ -53,11 +54,14 @@ now a refusal, not a resolution.
 
 ## Measurement
 
-Sweep with fixpoint seeds, master `846a645b` → this: all 24,208 the same (0 bytes-only movers, 0
-output movers, 0 runs → not-runs, 0 new traps).
+Sweep with fixpoint seeds, all the same both times (0 bytes-only movers, 0 output movers, 0 runs →
+not-runs, 0 new traps):
+- master `846a645b` → this: 24,208 programs;
+- master `32ab5241` → this branch with that master merged in: 24,209 programs.
 
-Render-parse census: ty-parse-unclassified 54 → 35, and ty-string-parse 66 → 65. The string-parse
-site that left is `internShapeDeepTyGo`'s `isValueUnionName`, from #7753, which merged after the
-baseline was recorded. `scripts/render-parse-origins.txt` re-points `monoArgTyNameRep`'s graded
+Render-parse census on the merged tree: ty-parse-unclassified goes from 52 to 33.
+- 17 entries are this PR's sites. The two `unionHasAtomTy` entries are #7758's deletion, which
+  had not lowered the baseline.
+- One entry is added: the `annGenAppSpanEnds` floor. `scripts/render-parse-origins.txt` re-points `monoArgTyNameRep`'s graded
 site to ordinal 0. The cut removed the earlier `arrElemSuffixed` call, so the graded call's
 ordinal fell from 1 to 0.

@@ -8,7 +8,10 @@ import { readNarrowedTyAt } from "./emit_capture_frames"
 import { unMemPeelAliasWrapper, unRowOfTyKey } from "./emit_union_tykey_text"
 import { canonUnionKeyTextOfTy } from "./check_inline_lit_union"
 import { primTyIxOfName } from "./check_decl_scan"
-import { canonUnionMemberTysOf, canonUnionMembersInto } from "./check_program"
+import {
+  canonUnionMemberTysOf,
+  canonUnionMembersLitsInto,
+} from "./check_program"
 import { mapTwinUnionMember } from "./check_ty_rep"
 import {
   T,
@@ -542,13 +545,17 @@ export function isUNameKeyAB(site: i32, ty: i32): boolean {
   ty >= 0 && unRowOfTyAB(site, ty) >= 0
 }
 
-// Registry membership for a caller holding only a spelling: a declared type's name asks the key of
-// its declared arena type, and any other spelling the row it is bound to.
+// Registry membership for a declared type's name: whether a row carries the key of its declared
+// arena type. Every caller asks it of a declared name.
 export function isUNameDeclAB(site: i32, name: string): boolean {
   const ty = cUserTypes[name] ?? -1
-  let d = -1
-  if ty >= 0 { d = unRowOfTyAB(site, ty) } else { d = unRowOfName(name) }
-  d >= 0
+  if ty < 0 {
+    emitFail(
+      "emitProgram: a union registry membership test names no declared type",
+    )
+    return false
+  }
+  unRowOfTyAB(site, ty) >= 0
 }
 
 // The row union type `ty`'s key finds under `site`, or -1.
@@ -565,7 +572,8 @@ export function unionMemberTysOfAB(site: i32, ty: i32, out: i32[]): boolean {
   unionMemberTysOfRow(d, out)
 }
 
-// The row-keyed core of `unMemHasAtom` — the same walk from a row instead of a spelling.
+// Whether union row `u` has a member that is exactly the keyword primitive `want` (or a list of it
+// when `arr`): 1, 0, or -1 for an uncovered row.
 // Every parallel-table read here is bounded: a row named by a key the table never grew
 // is exactly the shape that trapped before. D1152.
 function unMemHasAtomRow(u: i32, want: string, arr: boolean): i32 {
@@ -630,34 +638,6 @@ export function unionMemberTysOfRow(u: i32, out: i32[]): boolean {
   true
 }
 
-// The union-box ABI's atom test, from the arena: 1 when the union `name` has a member whose
-// type is exactly the keyword primitive `want` (or exactly an array over it when `arr`), 0
-// for none, -1 when the row is uncovered — a "cannot happen" its only caller diagnoses. Exact
-// match only: the caller turns the atom into a tag, never asking "reps like this" instead.
-export function unMemHasAtom(name: string, want: string, arr: boolean): i32 {
-  const mems: i32[] = []
-  if !unionMemberTysOf(name, mems) { return -1 }
-  let i = 0
-  while i < mems.length {
-    let m = mems[i]
-    if m >= T.tys.length { return -1 }
-    if arr {
-      const ta = tyAt(m)
-      m = -1
-      if ta is TyArray { m = ta.aElem }
-      if m >= T.tys.length { return -1 }
-    }
-    if m >= 0 {
-      const t = tyAt(m)
-      if t is TyPrim {
-        if t.primName == want { return 1 }
-      }
-    }
-    i = i + 1
-  }
-  0
-}
-
 // Whether union type `ty` has a member of the primitive `want` (its list `want[]` with `arr`),
 // read off the row `ty` keys. A union no covered row answers fails loudly.
 export function unionHasAtomOfTy(ty: i32, want: string, arr: boolean): boolean {
@@ -665,24 +645,6 @@ export function unionHasAtomOfTy(ty: i32, want: string, arr: boolean): boolean {
   if a >= 0 { return a == 1 }
   emitFail(
     "emitProgram: union box atom test on a union with no recorded members",
-  )
-  false
-}
-
-// The union-box ABI's atom test, answered only from the arena: a row minted without its
-// members, an unresolved member spelling, or an unregistered name are each structurally
-// impossible once a value is boxed with a tag, since the registration that mints the tag
-// also records the members. An uncovered row is a "cannot happen" — it fails loudly.
-export function unionHasAtomTy(
-  name: string,
-  want: string,
-  arr: boolean,
-): boolean {
-  const a = unMemHasAtom(name, want, arr)
-  if a >= 0 { return a == 1 }
-  emitFail(
-    "emitProgram: union box atom test on a union with no recorded members: "
-      + name,
   )
   false
 }
@@ -791,7 +753,7 @@ export function msSetOfTyAny(ty: i32): i32 {
 }
 
 // The row-less member slice of type `ty`, built once per type: its members as
-// `canonUnionMembersInto` spells them, never reordered or deduplicated past that. -1 when a
+// `canonUnionMembersLitsInto` spells them, never reordered or deduplicated past that. -1 when a
 // member has no render.
 function msFreeSliceOfTy(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
@@ -801,11 +763,12 @@ function msFreeSliceOfTy(ty: i32): i32 {
   if got == -2 { return -1 }
   const tys: i32[] = []
   const atoms: string[] = []
-  if !canonUnionMembersInto(ty, tys, atoms) || atoms.length < 1 {
+  const lits: boolean[] = []
+  if !canonUnionMembersLitsInto(ty, tys, atoms, lits) || atoms.length < 1 {
     msFreeByTy[ty] = -2
     return -1
   }
-  const u = msFreeSlicePush(tys, atoms)
+  const u = msFreeSlicePush(tys, atoms, lits)
   msFreeByTy[ty] = -2 - u
   u
 }
