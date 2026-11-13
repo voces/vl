@@ -3,8 +3,10 @@
 Lane G split the P2 set: the `valueAtomKind` calls that classified a rendered atom. Lane D took
 four of them. Each now reads a type, through `boxAtomKindOfMemberTy` (emit_rep). That function
 wraps `boxTagOfTy` with the two rules the atom parse had: a `null` member (type -1) is 6, and a
-literal-union member is -1. It is not a second twin: `boxTagOfTy` gives a literal union 2, its
-in-box string tag, and the widen/narrow ladder must not treat that as a widenable string.
+literal or literal-union member is -1. `boxTagOfTy` gives a literal its base scalar's in-box tag,
+and the widen/narrow ladder must not treat that as a widenable scalar. Lane G's `unionArmBoxKind`
+(emit_classify, its P2 step 2c) is the same function and moves to this one; emit_rep is the lowest
+point in the import graph that every caller can reach.
 
 | site | before | after |
 | --- | --- | --- |
