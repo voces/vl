@@ -9,24 +9,24 @@ argument, or a bare name's nearest initializer above the call, found by text.
 
 | site | function | parser | origin | producer of the argument | programs | witness | example |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| check_emit_queries.vl:695 | recordClonedNodeTyFb | nameToTy | (a)+(b) render and synthesized | `name (a parameter)` | 10 render, 10 synthesized | build/sweep/witnesses/inventory/D15637.vl | `i32[][]` |
+| check_emit_queries.vl:695 | recordClonedNodeTyFb | nameToTy | (a)+(b) render and synthesized | `name (a parameter)` | 12 render, 15 synthesized | build/sweep/witnesses/inventory/D15136.vl | `((i32)=>i32)[]` |
 | check_emit_queries.vl:716 | recordClonedIsVarTy | nameToTy | (a) render | `name (a parameter)` | 24 | build/sweep/witnesses/inventory/D15710.vl | `boolean[]` |
-| emit_base.vl:2437 | tyGroupWrapsWhole | tyGroupEndIndex | (a) render | `name (a parameter)` | 1039 | build/sweep/witnesses/inventory/D15524.vl | `{f:(i32)=>i32}` |
-| emit_base.vl:2691 | arrLeafNameOf | arrElemNameRaw | (a) render | `leaf = name` | 92 | build/sweep/witnesses/inventory/D13964.vl | `null[]` |
-| emit_base.vl:2760 | nameIsShapeSpanEnds | nameIsBraceSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 2335 render, 2175 synthesized | build/sweep/witnesses/inventory/D15482.vl | `{r:i32,g:i32}` |
-| emit_base.vl:2761 | nameIsShapeSpanEnds | nameIsShapeOpen | (a) render | `name (a parameter)` | 2218 | build/sweep/witnesses/inventory/D15482.vl | `{r:i32,g:i32}` |
-| emit_base.vl:2926 | shapeInnerFieldSplit | tyTopLevelSplit | (a) render | `inner (a parameter)` | 357 | build/sweep/witnesses/inventory/D15717.vl | `j:{a:i32}` |
-| emit_base.vl:2936 | shapeInnerFieldSplit | fieldNameOf | (a) render | `part = parts[k]` | 325 | build/sweep/witnesses/inventory/D15717.vl | `j:{a:i32}` |
-| emit_base.vl:2937 | shapeInnerFieldSplit | fieldTypeTextOf | (a) render | `part = parts[k]` | 325 | build/sweep/witnesses/inventory/D15717.vl | `j:{a:i32}` |
-| emit_base.vl:2967 | annSplitParams | tyTopLevelSplit | (a) render | `s (a parameter)` | 87 | build/sweep/witnesses/inventory/D15460.vl | `f64,f64,` |
+| emit_base.vl:2437 | tyGroupWrapsWhole | tyGroupEndIndex | (a) render | `name (a parameter)` | 1043 | build/sweep/witnesses/inventory/D15020.vl | `{f:f64}` |
+| emit_base.vl:2691 | arrLeafNameOf | arrElemNameRaw | (a) render | `leaf = name` | 92 | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| emit_base.vl:2760 | nameIsShapeSpanEnds | nameIsBraceSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 2353 render, 2189 synthesized | build/sweep/witnesses/inventory/D15020.vl | `{f:f64}` |
+| emit_base.vl:2761 | nameIsShapeSpanEnds | nameIsShapeOpen | (a) render | `name (a parameter)` | 2236 | build/sweep/witnesses/inventory/D15020.vl | `{f:f64}` |
+| emit_base.vl:2926 | shapeInnerFieldSplit | tyTopLevelSplit | (a) render | `inner (a parameter)` | 357 | build/sweep/witnesses/inventory/D15314.vl | `h:{f:i32}` |
+| emit_base.vl:2936 | shapeInnerFieldSplit | fieldNameOf | (a) render | `part = parts[k]` | 325 | build/sweep/witnesses/inventory/D15314.vl | `h:{f:i32}` |
+| emit_base.vl:2937 | shapeInnerFieldSplit | fieldTypeTextOf | (a) render | `part = parts[k]` | 325 | build/sweep/witnesses/inventory/D15314.vl | `h:{f:i32}` |
+| emit_base.vl:2967 | annSplitParams | tyTopLevelSplit | (a) render | `s (a parameter)` | 87 | build/sweep/witnesses/inventory/D15012.vl | `i32,string,` |
 | emit_classify.vl:2989 | asgReadNarrowTy | isValueUnionName | (c) source | `un = unionNameOfRead(t, fnIx)` | 7 | build/sweep/witnesses/inventory/D2630.vl | `A\|B` |
-| emit_classify.vl:4652 | memReadBoxedAtomKind | valueAtomKind | unclassified: bare names | `t.primName` | 73 | build/sweep/witnesses/inventory/D15537.vl | `null` |
+| emit_classify.vl:4652 | memReadBoxedAtomKind | valueAtomKind | unclassified: bare names | `t.primName` | 73 | build/sweep/witnesses/inventory/D15185.vl | `i32` |
 | emit_classify.vl:10594 | unionNameOfCall | isValueUnionName | (c) source | `im = inferRetNameOf(irk)` | 2 | tests/cases/arrays/list-callback-fixes-the-length-at-entry.vl | `i32[]` |
-| emit_classify.vl:11198 | memReadNarrowOp | valueAtomKind | unclassified: bare names | `own = ""` | 3162 | build/sweep/witnesses/inventory/D15480.vl | `i32` |
+| emit_classify.vl:11198 | memReadNarrowOp | valueAtomKind | unclassified: bare names | `own = ""` | 3166 | build/sweep/witnesses/inventory/D1510.vl | `i32` |
 | emit_classify.vl:13460 | identFnTypeAnnNameOfRead | peelGroupParens | (a) render | `enm = rlElemName[islot]` | 2 | tests/cases/closures/inferred-container-over-hole-param.vl | `((i32)=>i32)` |
 | emit_collect.vl:3632 | leqNoteUnionArms | valueAtomKind | (a) render | `arms[ui]` | 14 | build/sweep/witnesses/inventory/D2563.vl | `{item:i32}` |
 | emit_collect.vl:6467 | anonNullFieldBox | isValueUnionName | (c) source | `bn = regUnionNameOfTy(ft)` | 2 | build/sweep/witnesses/inventory/D15730.vl | `i32\|null` |
-| emit_collect.vl:7112 | collectShapeVariantFields | groupInnerOf | (a) render | `nm (a parameter)` | 383 | build/sweep/witnesses/inventory/D15713.vl | `{f:i32}` |
+| emit_collect.vl:7112 | collectShapeVariantFields | groupInnerOf | (a) render | `nm (a parameter)` | 383 | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
 | emit_collect.vl:7824 | registerCloResultUnion | isValueUnionName | (c) source | `res = arenaEmitName(rt)` | 21 | tests/cases/arrays/nullable-closure-element-composite-results.vl | `()=>string` |
 | emit_collect.vl:8055 | registerRefArrayArmUnions | valueAtomKind | (a) render | `atoms[rai]` | 9 | build/sweep/witnesses/inventory/D4862.vl | `(i32\|null)[]` |
 | emit_collect.vl:9344 | collectDeclaredUnion | nameIsFuncTypeAtom | (a) render | `udMem = vs[usj]` | 31 | build/sweep/witnesses/inventory/D14302.vl | `{v:i32}` |
@@ -36,43 +36,43 @@ argument, or a bare name's nearest initializer above the call, found by text.
 | emit_if_arm_values.vl:207 | spreadSrcBoxAtom | valueAtomKind | unclassified: bare names | `pn = tyArrayElemPrimName(nodeTyAt(src, fnIx))` | 18 | build/sweep/witnesses/inventory/D15044.vl | `boolean` |
 | emit_map_twins.vl:341 | unionHasBoolLeafArm | boolLeafListDepthOfName | (c) source | `arms[i]` | 7 | build/sweep/witnesses/inventory/D2857.vl | `boolean[][]` |
 | emit_mono.vl:1772 | monoArgTyNameRep | arrElemSuffixed | (a)+(b) render and synthesized | `aen = arrLitElemName(ix, fnIx)` | 24 render, 6 synthesized | build/sweep/witnesses/inventory/D15692.vl | `{f:i32}` |
-| emit_mono.vl:7924 | monoPinUnionName | canonEmitName | (a)+(b) render and synthesized | `rs (a parameter)` | 625 render, 13 synthesized | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)\|null` |
+| emit_mono.vl:7924 | monoPinUnionName | canonEmitName | (a)+(b) render and synthesized | `rs (a parameter)` | 629 render, 13 synthesized | build/sweep/witnesses/inventory/D15042.vl | `f64\|i32` |
 | emit_mono.vl:20965 | monoPinAnnotatedParam | arrElemSuffixed | unclassified: bare names | `bind = an2` | 2 | build/sweep/witnesses/inventory/D5001.vl | `V` |
-| emit_obj_lit_fits.vl:1134 | sharedFieldArmValueBox | isValueUnionName | (c) source | `variantFieldElemName(vi, fi)` | 37 | build/sweep/witnesses/inventory/D15713.vl | `i32\|null` |
-| emit_obj_lit_fits.vl:1222 | sharedFieldArmAtomKind | valueAtomKind | (a) render | `sFieldTyText[at]` | 6 | build/sweep/witnesses/inventory/D14511.vl | `{r:i32}` |
+| emit_obj_lit_fits.vl:1134 | sharedFieldArmValueBox | isValueUnionName | (c) source | `variantFieldElemName(vi, fi)` | 37 | build/sweep/witnesses/inventory/D15314.vl | `i32\|null` |
+| emit_obj_lit_fits.vl:1222 | sharedFieldArmAtomKind | valueAtomKind | (a) render | `sFieldTyText[at]` | 6 | build/sweep/witnesses/inventory/D15314.vl | `{f:i32}` |
 | emit_obj_lit_fits.vl:1271 | boxWidenAtomFor | valueAtomKind | (c) source | `p (a parameter)` | 14 | build/sweep/witnesses/inventory/D1514.vl | `u8[]` |
 | emit_obj_lit_fits.vl:1274 | boxWidenAtomFor | valueAtomKind | (a) render | `to[j]` | 2 | build/sweep/witnesses/inventory/D5155.vl | `{kind:"a" \| "b",w:i32,v:i32,next:{kind:"a" \| "b",w:i32,v:i` |
-| emit_obj_lit_fits.vl:1288 | boxNarrowAtomFor | valueAtomKind | (a) render | `p (a parameter)` | 104 | build/sweep/witnesses/inventory/D15710.vl | `boolean[]` |
+| emit_obj_lit_fits.vl:1288 | boxNarrowAtomFor | valueAtomKind | (a) render | `p (a parameter)` | 104 | build/sweep/witnesses/inventory/D15314.vl | `{h:{f:i32}}` |
 | emit_obj_lit_fits.vl:1295 | boxNarrowAtomFor | valueAtomKind | unclassified: bare names | `own[j]` | 6 | build/sweep/witnesses/inventory/D15716.vl | `i32` |
 | emit_query.vl:803 | nliAtomOfExpr | valueAtomKind | (a) render | `rn = tyNameOf(f.fnRet)` | 1 | tests/cases/generics/coalesce-nullable-generic-map-default.vl | `{[string]:T}` |
-| emit_rep.vl:1105 | repElemTyOfName | resolveAnnot | (a)+(b) render and synthesized | `name (a parameter)` | 224 render, 1 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| emit_rep.vl:2093 | sTyIxOfNameTy | resolveAnnot | (a) render | `nm (a parameter)` | 112 | build/sweep/witnesses/inventory/D1579.vl | `{n:i32,inner:{base:i32,length:i32}}` |
+| emit_rep.vl:1105 | repElemTyOfName | resolveAnnot | (a)+(b) render and synthesized | `name (a parameter)` | 224 render, 1 synthesized | build/sweep/witnesses/inventory/D15118.vl | `{[string]:i32}` |
+| emit_rep.vl:2093 | sTyIxOfNameTy | resolveAnnot | (a) render | `nm (a parameter)` | 112 | build/sweep/witnesses/inventory/D15097.vl | `{n:i32,g:{[string]:A}}` |
 | emit_rep.vl:2098 | sTyIxOfNameTy | annGenAppSpanEnds | unclassified: bare names | `nm (a parameter)` | 8 | build/sweep/witnesses/inventory/D1441.vl | `Showable` |
-| emit_rep.vl:2149 | declTyIxOfName | resolveAnnot | (a)+(b) render and synthesized | `nm (a parameter)` | 422 render, 1 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| emit_rep.vl:2215 | msAtomIdOf | peelGroupParens | (a) render | `atom (a parameter)` | 2557 | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| emit_rep.vl:2350 | msFreeSlicePush | valueAtomKind | (a) render | `a = atoms[i]` | 2146 | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| emit_rep.vl:2784 | recordUnMemTys | valueAtomKind | (a) render | `a = atoms[i]` | 474 | build/sweep/witnesses/inventory/D15710.vl | `boolean[]` |
-| emit_rep.vl:4005 | nulScalarBoxAtomOf | valueAtomKind | unclassified: bare names | `repOfTy(inner).rdKind` | 961 | build/sweep/witnesses/inventory/D15492.vl | `i32` |
+| emit_rep.vl:2149 | declTyIxOfName | resolveAnnot | (a)+(b) render and synthesized | `nm (a parameter)` | 424 render, 1 synthesized | build/sweep/witnesses/inventory/D15118.vl | `{[string]:i32}` |
+| emit_rep.vl:2215 | msAtomIdOf | peelGroupParens | (a) render | `atom (a parameter)` | 2568 | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| emit_rep.vl:2350 | msFreeSlicePush | valueAtomKind | (a) render | `a = atoms[i]` | 2157 | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| emit_rep.vl:2784 | recordUnMemTys | valueAtomKind | (a) render | `a = atoms[i]` | 474 | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| emit_rep.vl:4005 | nulScalarBoxAtomOf | valueAtomKind | unclassified: bare names | `repOfTy(inner).rdKind` | 961 | build/sweep/witnesses/inventory/D14976.vl | `i32` |
 | emit_rewrite.vl:3924 | cboxElemNeedsParens | tyTopIndexOf | (c) source | `name (a parameter)` | 2 | tests/cases/loops/exit-first-arm-captured-mutable.vl | `Rec\|null` |
-| emit_shape_intern.vl:900 | iisPushFieldElem | isValueUnionName | (a) render | `e5 = shapeFieldElemName(` | 63 | build/sweep/witnesses/inventory/D15548.vl | `((i32)=>i32)` |
+| emit_shape_intern.vl:900 | iisPushFieldElem | isValueUnionName | (a) render | `e5 = shapeFieldElemName(` | 64 | build/sweep/witnesses/inventory/D15194.vl | `((i32)=>i32)` |
 | emit_shape_intern.vl:921 | iisPushFieldElem | isValueUnionName | (a) render | `e28 = shapeFieldElemName(` | 1 | tests/cases/generics/alias-inline-record-list-field.vl | `{g:string}` |
 | emit_shape_intern.vl:1138 | internShapeAs | groupInnerOf | (a) render | `nm (a parameter)` | 29 | build/sweep/witnesses/inventory/D14794.vl | `{a:i32,b:i32}` |
 | emit_union_atoms.vl:1419 | registerValueUnionNameTy | nameIsLitUnionArmValueUnion | (a) render | `name (a parameter)` | 3 | build/sweep/witnesses/inventory/D3531.vl | `i32\|string` |
 | emit_union_atoms.vl:2604 | ifExprNliName | valueAtomKind | (c) source | `atoms[j]` | 1 | tests/cases/types/if-expression-no-else-scope-rep-grid.vl | `i32[]` |
-| emit_union_casts.vl:91 | memReadCheckerAtomKind | valueAtomKind | unclassified: bare names | `t.primName` | 29 | build/sweep/witnesses/inventory/D15716.vl | `i32` |
+| emit_union_casts.vl:91 | memReadCheckerAtomKind | valueAtomKind | unclassified: bare names | `t.primName` | 29 | build/sweep/witnesses/inventory/D15185.vl | `i32` |
 | emit_union_casts.vl:118 | unionHasAtomKindArm | valueAtomKind | (a) render | `a (a parameter)` | 17 | build/sweep/witnesses/inventory/D15710.vl | `boolean[]` |
 | emit_union_registry.vl:1071 | unionSetHasNullTy | unionHasAtom | (a) render | `set (a parameter)` | 1 | tests/cases/unions/nullable-ref-into-union-keeps-null.vl | `boolean\|i32\|null` |
-| wasmEmit.vl:4480 | emitLitMemberEq | nameIsQuotedLeaf | (c) source | `lex (a parameter)` | 50 | build/sweep/witnesses/inventory/D15251.vl | `"x"` |
+| wasmEmit.vl:4480 | emitLitMemberEq | nameIsQuotedLeaf | (c) source | `lex (a parameter)` | 52 | build/sweep/witnesses/inventory/D15251.vl | `"x"` |
 | wasmEmit.vl:4722 | emitFieldLitEq | nameIsQuotedLeaf | (c) source | `lex (a parameter)` | 28 | build/sweep/witnesses/inventory/D14570.vl | `"a"` |
-| wasmEmit.vl:8244 | isValueUnionOfSet | isValueUnionName | (a) render | `unionMemberSetOf(nm)` | 12 | build/sweep/witnesses/inventory/D14800.vl | `string\|null` |
+| wasmEmit.vl:8244 | isValueUnionOfSet | isValueUnionName | (a) render | `unionMemberSetOf(nm)` | 13 | build/sweep/witnesses/inventory/D2498.vl | `{[string]:boolean\|f64\|string\|Json[]\|{[string]:Json}\|nul` |
 | wasmEmit.vl:9098 | emitUnionCoerceValueAtom | unionHasAtom | (a) render | `unionName (a parameter)` | 8 | scripts/silent-sweep/distilled/named/d3127_r2_g1_F1_ab_i32_0_93_i32_print_hole.vl | `AB\|i32\|null` |
-| wasmEmit.vl:9119 | emitUnionCoerceValueAtom | valueAtomKind | unclassified: bare names | `"string"` | 57 | build/sweep/witnesses/inventory/D3347.vl | `string` |
+| wasmEmit.vl:9119 | emitUnionCoerceValueAtom | valueAtomKind | unclassified: bare names | `"string"` | 58 | build/sweep/witnesses/inventory/D3347.vl | `string` |
 | wasmEmit.vl:9801 | valueKindIsPlainScalar | valueAtomKind | unclassified: bare names | `p (a parameter)` | 53 | build/sweep/witnesses/inventory/D15710.vl | `i32` |
 | wasmEmit.vl:11226 | unionBoxEqColumns | valueAtomKind | (a) render | `arms[i]` | 1 | tests/cases/closures/function-values-in-two-union-arms-equality.vl | `((string)=>i32)` |
 | wasmEmit.vl:11371 | emitUnionConcreteNumCross | valueAtomKind | unclassified: bare names | `a (a parameter)` | 1 | tests/cases/unions/nullable-number-cross-width-eq.vl | `i32` |
 | wasmEmit.vl:11424 | emitUnionUnionNumCross | valueAtomKind | (a) render | `la (a parameter)` | 1 | tests/cases/closures/function-values-in-two-union-arms-equality.vl | `((string)=>i32)` |
 | wasmEmit.vl:11425 | emitUnionUnionNumCross | valueAtomKind | (a) render | `ra (a parameter)` | 1 | tests/cases/closures/function-values-in-two-union-arms-equality.vl | `((string)=>i32)` |
-| wasmEmit.vl:12200 | emitUnionLitIs | nameIsQuotedLeaf | (c) source | `lit (a parameter)` | 135 | build/sweep/witnesses/inventory/D16062.vl | `"a"` |
+| wasmEmit.vl:12200 | emitUnionLitIs | nameIsQuotedLeaf | (c) source | `lit (a parameter)` | 135 | build/sweep/witnesses/inventory/D15170.vl | `"a"` |
 | wasmEmit.vl:20389 | xrepElemEq | valueAtomKind | unclassified: bare names | `an (a parameter)` | 2 | build/sweep/witnesses/inventory/D15055.vl | `i32` |
 | wasmEmit.vl:22091 | boxNarrowScalarKinds | valueAtomKind | unclassified: bare names | `vals[0]` | 2 | build/sweep/witnesses/inventory/D15716.vl | `i64` |
 | wasmEmit.vl:22092 | boxNarrowScalarKinds | valueAtomKind | unclassified: bare names | `oa[0]` | 2 | build/sweep/witnesses/inventory/D15716.vl | `i32` |
@@ -86,133 +86,133 @@ argument, or a bare name's nearest initializer above the call, found by text.
 
 | site | function | parser | origin | producer of the argument | programs | witness | example |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| check_demands.vl:858 | wsOrigTyOf | resolveAnnot | unclassified: bare names | `a.tyName` | 11 | build/sweep/witnesses/inventory/D16021.vl | `G` |
+| check_demands.vl:858 | wsOrigTyOf | resolveAnnot | unclassified: bare names | `a.tyName` | 14 | build/sweep/witnesses/inventory/D15447.vl | `G` |
 | check_fit_rules.vl:2624 | recReachTv | nameStripSpaces | (c) source | `recParamTyName(g.fnParams[i])` | 2 | build/sweep/witnesses/inventory/D15210.vl | `T[]` |
 | check_fit_rules.vl:2627 | recReachTv | listElemNameOf | (c) source | `name = nameStripSpaces(recParamTyName(g.fnParams[i]))` | 2 | build/sweep/witnesses/inventory/D15210.vl | `T[]` |
-| check_gen_alias_anns.vl:118 | nameIsGenAppOfDecl | annGenAppSpanEnds | (a) render | `name (a parameter)` | 357 | build/sweep/witnesses/inventory/D15713.vl | `{f:i32}` |
-| check_gen_alias_anns.vl:119 | nameIsGenAppOfDecl | gaeHeadNameOf | (c) source | `name (a parameter)` | 30 | build/sweep/witnesses/inventory/D14300.vl | `Box<i32>` |
-| check_gen_alias_anns.vl:119 | nameIsGenAppOfDecl | gaeLtAt | (c) source | `name (a parameter)` | 30 | build/sweep/witnesses/inventory/D14300.vl | `Box<i32>` |
-| check_lit_union_spell.vl:26 | nameHasSep | tyTopIndexOf | (a)+(b) render and synthesized | `name (a parameter)` | 4444 render, 24 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| check_lit_union_spell.vl:35 | topLevelArrowIndex | tyTopIndexOf | (a)+(b) render and synthesized | `name (a parameter)` | 4443 render, 24 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| check_lit_union_spell.vl:86 | litUnionPreserve | nameIsLitUnionType | (a)+(b) render and synthesized | `core = kept[0]` | 1947 render, 13 synthesized | build/sweep/witnesses/inventory/D15500.vl | `boolean\|null` |
+| check_gen_alias_anns.vl:118 | nameIsGenAppOfDecl | annGenAppSpanEnds | (a) render | `name (a parameter)` | 357 | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_gen_alias_anns.vl:119 | nameIsGenAppOfDecl | gaeHeadNameOf | (c) source | `name (a parameter)` | 30 | build/sweep/witnesses/inventory/D2563.vl | `Box<i32>` |
+| check_gen_alias_anns.vl:119 | nameIsGenAppOfDecl | gaeLtAt | (c) source | `name (a parameter)` | 30 | build/sweep/witnesses/inventory/D2563.vl | `Box<i32>` |
+| check_lit_union_spell.vl:26 | nameHasSep | tyTopIndexOf | (a)+(b) render and synthesized | `name (a parameter)` | 4464 render, 29 synthesized | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_lit_union_spell.vl:35 | topLevelArrowIndex | tyTopIndexOf | (a)+(b) render and synthesized | `name (a parameter)` | 4463 render, 29 synthesized | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_lit_union_spell.vl:86 | litUnionPreserve | nameIsLitUnionType | (a)+(b) render and synthesized | `core = kept[0]` | 1958 render, 13 synthesized | build/sweep/witnesses/inventory/D15042.vl | `f64\|i32` |
 | check_lit_union_spell.vl:94 | litUnionPreserve | groupInnerOf | (c) source | `kept[q]` | 7 | build/sweep/witnesses/inventory/D5380.vl | `"a"` |
-| check_lit_union_spell.vl:172 | litRunPartTexts | nameIsParenSpanEnds | (a)+(b) render and synthesized | `p (a parameter)` | 176 render, 13 synthesized | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_lit_union_spell.vl:172 | litRunPartTexts | isTopLevelFuncTypeName | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_lit_union_spell.vl:173 | litRunPartTexts | groupInnerOf | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_lit_union_spell.vl:177 | litRunPartTexts | isTopLevelFuncTypeName | (c) source | `p (a parameter)` | 30 | tests/cases/closures/closure-and-struct-arm-union-result.vl | `(i32)=>(()=>f32\|null)\|{w:i32}` |
-| check_lit_union_spell.vl:238 | partIsStrLitSet | nameIsParenSpanEnds | (a)+(b) render and synthesized | `p (a parameter)` | 235 render, 13 synthesized | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_lit_union_spell.vl:238 | partIsStrLitSet | isTopLevelFuncTypeName | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_lit_union_spell.vl:239 | partIsStrLitSet | groupInnerOf | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_lit_union_spell.vl:241 | partIsStrLitSet | nameIsLitUnionType | (a)+(b) render and synthesized | `p (a parameter)` | 214 render, 13 synthesized | build/sweep/witnesses/inventory/D15539.vl | `(i32)=>i32` |
-| check_lit_union_spell.vl:242 | partIsStrLitSet | isTopLevelFuncTypeName | (c) source | `p (a parameter)` | 30 | tests/cases/closures/closure-and-struct-arm-union-result.vl | `(i32)=>(()=>f32\|null)\|{w:i32}` |
-| check_program.vl:1506 | canonShapeName | mapSpellKeyEnd | (a)+(b) render and synthesized | `name (a parameter)` | 1249 render, 1 synthesized | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}` |
+| check_lit_union_spell.vl:172 | litRunPartTexts | nameIsParenSpanEnds | (a)+(b) render and synthesized | `p (a parameter)` | 176 render, 13 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_lit_union_spell.vl:172 | litRunPartTexts | isTopLevelFuncTypeName | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15174.vl | `((i32)=>i32)` |
+| check_lit_union_spell.vl:173 | litRunPartTexts | groupInnerOf | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15174.vl | `((i32)=>i32)` |
+| check_lit_union_spell.vl:177 | litRunPartTexts | isTopLevelFuncTypeName | (c) source | `p (a parameter)` | 30 | tests/cases/closures/generic-nulclosure-return-sig-skip.vl | `(i32)=>i32\|{w:i32}` |
+| check_lit_union_spell.vl:238 | partIsStrLitSet | nameIsParenSpanEnds | (a)+(b) render and synthesized | `p (a parameter)` | 235 render, 13 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_lit_union_spell.vl:238 | partIsStrLitSet | isTopLevelFuncTypeName | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15174.vl | `((i32)=>i32)` |
+| check_lit_union_spell.vl:239 | partIsStrLitSet | groupInnerOf | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15174.vl | `((i32)=>i32)` |
+| check_lit_union_spell.vl:241 | partIsStrLitSet | nameIsLitUnionType | (a)+(b) render and synthesized | `p (a parameter)` | 214 render, 13 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_lit_union_spell.vl:242 | partIsStrLitSet | isTopLevelFuncTypeName | (c) source | `p (a parameter)` | 30 | tests/cases/closures/generic-nulclosure-return-sig-skip.vl | `(i32)=>i32\|{w:i32}` |
+| check_program.vl:1506 | canonShapeName | mapSpellKeyEnd | (a)+(b) render and synthesized | `name (a parameter)` | 1251 render, 1 synthesized | build/sweep/witnesses/inventory/D15031.vl | `{a:i32}` |
 | check_program.vl:1508 | canonShapeName | mapSpellKeyName | (a) render | `name (a parameter)` | 192 | build/sweep/witnesses/inventory/D15759.vl | `{[string]:(i32)=>f64}` |
 | check_program.vl:1510 | canonShapeName | mapSpellValName | (a) render | `name (a parameter)` | 192 | build/sweep/witnesses/inventory/D15759.vl | `{[string]:(i32)=>f64}` |
-| check_program.vl:1515 | canonShapeName | groupInnerOf | (a)+(b) render and synthesized | `name (a parameter)` | 1083 render, 1 synthesized | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}` |
-| check_program.vl:1518 | canonShapeName | nameIsMapOpen | (a)+(b) render and synthesized | `name (a parameter)` | 1083 render, 1 synthesized | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}` |
-| check_program.vl:1525 | canonShapeName | tyTopIndexOf | (a)+(b) render and synthesized | `inner = groupInnerOf(name)` | 838 render, 1 synthesized | build/sweep/witnesses/inventory/D15530.vl | `f:()=>boolean` |
-| check_program.vl:1531 | canonShapeName | tyTopIndexOf | (a)+(b) render and synthesized | `field = inner.slice(start, end)` | 790 render, 1 synthesized | build/sweep/witnesses/inventory/D15530.vl | `f:()=>boolean` |
-| check_program.vl:1538 | canonShapeName | fieldNameOf | (a)+(b) render and synthesized | `field = inner.slice(start, end)` | 790 render, 1 synthesized | build/sweep/witnesses/inventory/D15530.vl | `f:()=>boolean` |
-| check_program.vl:1539 | canonShapeName | fieldTypeTextOf | (a)+(b) render and synthesized | `field = inner.slice(start, end)` | 790 render, 1 synthesized | build/sweep/witnesses/inventory/D15530.vl | `f:()=>boolean` |
-| check_program.vl:1554 | unionMemberGenAppShape | nameToTy | (c) source | `member (a parameter)` | 18 | build/sweep/witnesses/inventory/D14300.vl | `Box<i32>` |
+| check_program.vl:1515 | canonShapeName | groupInnerOf | (a)+(b) render and synthesized | `name (a parameter)` | 1085 render, 1 synthesized | build/sweep/witnesses/inventory/D15031.vl | `{a:i32}` |
+| check_program.vl:1518 | canonShapeName | nameIsMapOpen | (a)+(b) render and synthesized | `name (a parameter)` | 1085 render, 1 synthesized | build/sweep/witnesses/inventory/D15031.vl | `{a:i32}` |
+| check_program.vl:1525 | canonShapeName | tyTopIndexOf | (a)+(b) render and synthesized | `inner = groupInnerOf(name)` | 840 render, 1 synthesized | build/sweep/witnesses/inventory/D15031.vl | `a:i32` |
+| check_program.vl:1531 | canonShapeName | tyTopIndexOf | (a)+(b) render and synthesized | `field = inner.slice(start, end)` | 792 render, 1 synthesized | build/sweep/witnesses/inventory/D15031.vl | `a:i32` |
+| check_program.vl:1538 | canonShapeName | fieldNameOf | (a)+(b) render and synthesized | `field = inner.slice(start, end)` | 792 render, 1 synthesized | build/sweep/witnesses/inventory/D15031.vl | `a:i32` |
+| check_program.vl:1539 | canonShapeName | fieldTypeTextOf | (a)+(b) render and synthesized | `field = inner.slice(start, end)` | 792 render, 1 synthesized | build/sweep/witnesses/inventory/D15031.vl | `a:i32` |
+| check_program.vl:1554 | unionMemberGenAppShape | nameToTy | (c) source | `member (a parameter)` | 18 | build/sweep/witnesses/inventory/D2563.vl | `Box<i32>` |
 | check_program.vl:1567 | inlineUnionGenAppShapes | splitUnionAtoms | (a) render | `name (a parameter)` | 10 | scripts/silent-sweep/distilled/named/mty_ret_arrnulapp_f64.vl | `CX<f64>\|null` |
-| check_program.vl:1602 | nulLitLiftedParts | nameIsParenSpanEnds | (a)+(b) render and synthesized | `p (a parameter)` | 235 render, 13 synthesized | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_program.vl:1602 | nulLitLiftedParts | isTopLevelFuncTypeName | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_program.vl:1603 | nulLitLiftedParts | tyTopLevelSplit | (a) render | `groupInnerOf(p)` | 14 | build/sweep/witnesses/inventory/D15539.vl | `(i32)=>i32` |
-| check_program.vl:1603 | nulLitLiftedParts | groupInnerOf | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_program.vl:1623 | nulStrLitSetParts | nameIsLitUnionType | (a) render | `ip (a parameter)` | 14 | build/sweep/witnesses/inventory/D15539.vl | `(i32)=>i32` |
-| check_program.vl:1653 | nulLitUnionPreserve | nameIsLitUnionType | (a)+(b) render and synthesized | `core = rest[0]` | 467 render, 5 synthesized | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_program.vl:1664 | nulLitUnionPreserve | nameIsParenSpanEnds | (a)+(b) render and synthesized | `core = rest[0]` | 409 render, 5 synthesized | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_program.vl:1664 | nulLitUnionPreserve | isTopLevelFuncTypeName | (a) render | `core = rest[0]` | 30 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_program.vl:1666 | nulLitUnionPreserve | tyTopLevelSplit | (a) render | `groupInnerOf(core)` | 13 | build/sweep/witnesses/inventory/D15539.vl | `(i32)=>i32` |
-| check_program.vl:1666 | nulLitUnionPreserve | groupInnerOf | (a) render | `core = rest[0]` | 30 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_program.vl:2083 | canonEmitNameTs | annGenAppSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 4267 render, 13 synthesized | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| check_program.vl:2099 | canonEmitNameTs | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `name (a parameter)` | 2053 render, 13 synthesized | build/sweep/witnesses/inventory/D15500.vl | `boolean\|null` |
-| check_program.vl:2110 | canonEmitNameTs | nameIsReadOnlyList | (a)+(b) render and synthesized | `name (a parameter)` | 3168 render, 4 synthesized | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| check_program.vl:2117 | canonEmitNameTs | arrElemNameRaw | (a)+(b) render and synthesized | `name (a parameter)` | 3168 render, 4 synthesized | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| check_program.vl:2118 | canonEmitNameTs | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `name (a parameter)` | 2121 render, 3 synthesized | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}[]` |
-| check_program.vl:2125 | canonEmitNameTs | nameIsParenSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 2713 render, 1 synthesized | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| check_program.vl:2125 | canonEmitNameTs | isTopLevelFuncTypeName | (a) render | `name (a parameter)` | 1245 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_program.vl:2128 | canonEmitNameTs | groupInnerOf | (a) render | `name (a parameter)` | 1244 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_program.vl:2134 | canonEmitNameTs | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `name (a parameter)` | 1668 render, 1 synthesized | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| check_program.vl:2161 | canonEmitNameTs | nameIsBraceSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 1249 render, 1 synthesized | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}` |
-| check_program.vl:2198 | canonGenAppName | gaeLtAt | (a) render | `name (a parameter)` | 135 | build/sweep/witnesses/inventory/D3688.vl | `B<i32>` |
+| check_program.vl:1602 | nulLitLiftedParts | nameIsParenSpanEnds | (a)+(b) render and synthesized | `p (a parameter)` | 235 render, 13 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_program.vl:1602 | nulLitLiftedParts | isTopLevelFuncTypeName | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15174.vl | `((i32)=>i32)` |
+| check_program.vl:1603 | nulLitLiftedParts | tyTopLevelSplit | (a) render | `groupInnerOf(p)` | 14 | build/sweep/witnesses/inventory/D15174.vl | `(i32)=>i32` |
+| check_program.vl:1603 | nulLitLiftedParts | groupInnerOf | (a) render | `p (a parameter)` | 36 | build/sweep/witnesses/inventory/D15174.vl | `((i32)=>i32)` |
+| check_program.vl:1623 | nulStrLitSetParts | nameIsLitUnionType | (a) render | `ip (a parameter)` | 14 | build/sweep/witnesses/inventory/D15174.vl | `(i32)=>i32` |
+| check_program.vl:1653 | nulLitUnionPreserve | nameIsLitUnionType | (a)+(b) render and synthesized | `core = rest[0]` | 469 render, 5 synthesized | build/sweep/witnesses/inventory/D15044.vl | `boolean\|i32` |
+| check_program.vl:1664 | nulLitUnionPreserve | nameIsParenSpanEnds | (a)+(b) render and synthesized | `core = rest[0]` | 411 render, 5 synthesized | build/sweep/witnesses/inventory/D15044.vl | `boolean\|i32` |
+| check_program.vl:1664 | nulLitUnionPreserve | isTopLevelFuncTypeName | (a) render | `core = rest[0]` | 30 | build/sweep/witnesses/inventory/D15174.vl | `((i32)=>i32)` |
+| check_program.vl:1666 | nulLitUnionPreserve | tyTopLevelSplit | (a) render | `groupInnerOf(core)` | 13 | build/sweep/witnesses/inventory/D15174.vl | `(i32)=>i32` |
+| check_program.vl:1666 | nulLitUnionPreserve | groupInnerOf | (a) render | `core = rest[0]` | 30 | build/sweep/witnesses/inventory/D15174.vl | `((i32)=>i32)` |
+| check_program.vl:2083 | canonEmitNameTs | annGenAppSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 4285 render, 13 synthesized | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_program.vl:2099 | canonEmitNameTs | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `name (a parameter)` | 2066 render, 13 synthesized | build/sweep/witnesses/inventory/D15042.vl | `f64\|i32` |
+| check_program.vl:2110 | canonEmitNameTs | nameIsReadOnlyList | (a)+(b) render and synthesized | `name (a parameter)` | 3180 render, 4 synthesized | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_program.vl:2117 | canonEmitNameTs | arrElemNameRaw | (a)+(b) render and synthesized | `name (a parameter)` | 3180 render, 4 synthesized | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_program.vl:2118 | canonEmitNameTs | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `name (a parameter)` | 2127 render, 3 synthesized | build/sweep/witnesses/inventory/D15032.vl | `((i32)=>i32)[]` |
+| check_program.vl:2125 | canonEmitNameTs | nameIsParenSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 2723 render, 1 synthesized | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_program.vl:2125 | canonEmitNameTs | isTopLevelFuncTypeName | (a) render | `name (a parameter)` | 1249 | build/sweep/witnesses/inventory/D15032.vl | `((i32)=>i32)` |
+| check_program.vl:2128 | canonEmitNameTs | groupInnerOf | (a) render | `name (a parameter)` | 1248 | build/sweep/witnesses/inventory/D15032.vl | `((i32)=>i32)` |
+| check_program.vl:2134 | canonEmitNameTs | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `name (a parameter)` | 1676 render, 1 synthesized | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_program.vl:2161 | canonEmitNameTs | nameIsBraceSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 1251 render, 1 synthesized | build/sweep/witnesses/inventory/D15031.vl | `{a:i32}` |
+| check_program.vl:2198 | canonGenAppName | gaeLtAt | (a) render | `name (a parameter)` | 135 | build/sweep/witnesses/inventory/D4709.vl | `W<i32>` |
 | check_program.vl:2201 | canonGenAppName | tyTopLevelSplit | (a) render | `gaeArgsTextOf(name, gLt)` | 19 | scripts/silent-sweep/distilled/named/mty_loc_appofapp_f64.vl | `C<f64>` |
-| check_program.vl:2201 | canonGenAppName | gaeArgsTextOf | (a) render | `name (a parameter)` | 135 | build/sweep/witnesses/inventory/D3688.vl | `B<i32>` |
-| check_program.vl:2202 | canonGenAppName | gaeHeadNameOf | (a) render | `name (a parameter)` | 135 | build/sweep/witnesses/inventory/D3688.vl | `B<i32>` |
-| check_program.vl:2256 | canonArrayName | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `core = canonEmitNameAt(arrCore, RC_ELEM)` | 604 render, 3 synthesized | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}` |
-| check_program.vl:2265 | canonFuncTypeName | fnParamsTextOf | (a) render | `name (a parameter)` | 564 | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| check_program.vl:2269 | canonFuncTypeName | tyTopLevelSplit | (a) render | `psStr = fnParamsTextOf(name, fa)` | 82 | build/sweep/witnesses/inventory/D1573.vl | `i32,i32` |
-| check_program.vl:2277 | canonFuncTypeName | fnRetTextOf | (a) render | `name (a parameter)` | 564 | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| check_program.vl:2278 | canonFuncTypeName | isTopLevelFuncTypeName | (a) render | `rc = canonEmitNameAt(fnRetTextOf(name, fa), RC_FN_RES)` | 25 | build/sweep/witnesses/inventory/D14500.vl | `i32\|string` |
-| check_program.vl:2308 | canonEmitUnionName | tyTopLevelSplit | (a)+(b) render and synthesized | `name (a parameter)` | 2034 render, 13 synthesized | build/sweep/witnesses/inventory/D15500.vl | `boolean\|null` |
-| check_program.vl:2396 | canonEmitUnionName | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `c = canonEmitNameAt(parts[i], memCtx)` | 172 render, 13 synthesized | build/sweep/witnesses/inventory/D15539.vl | `(i32)=>i32` |
-| check_program.vl:2404 | canonEmitUnionName | splitUnionAtoms | (a)+(b) render and synthesized | `c = canonEmitNameAt(parts[i], memCtx)` | 193 render, 13 synthesized | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_program.vl:2425 | canonEmitUnionName | nameToTy | (a) render | `name (a parameter)` | 1 | tests/cases/maps/map-twin-union-is-its-one-map.vl | `{[i32]:i32}\|{[i32]:i32}` |
-| check_program.vl:2477 | canonSameShapeRecord | nameToTy | (a)+(b) render and synthesized | `all = ""` | 1759 render, 9 synthesized | build/sweep/witnesses/inventory/D15553.vl | `f64\|i32\|string` |
-| check_relate_core.vl:2597 | annotResolve | nameToTy | (a)+(b) render and synthesized | `name (a parameter)` | 531 render, 1 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
+| check_program.vl:2201 | canonGenAppName | gaeArgsTextOf | (a) render | `name (a parameter)` | 135 | build/sweep/witnesses/inventory/D4709.vl | `W<i32>` |
+| check_program.vl:2202 | canonGenAppName | gaeHeadNameOf | (a) render | `name (a parameter)` | 135 | build/sweep/witnesses/inventory/D4709.vl | `W<i32>` |
+| check_program.vl:2256 | canonArrayName | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `core = canonEmitNameAt(arrCore, RC_ELEM)` | 607 render, 3 synthesized | build/sweep/witnesses/inventory/D15032.vl | `(i32)=>i32` |
+| check_program.vl:2265 | canonFuncTypeName | fnParamsTextOf | (a) render | `name (a parameter)` | 571 | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_program.vl:2269 | canonFuncTypeName | tyTopLevelSplit | (a) render | `psStr = fnParamsTextOf(name, fa)` | 83 | build/sweep/witnesses/inventory/D1573.vl | `i32,i32` |
+| check_program.vl:2277 | canonFuncTypeName | fnRetTextOf | (a) render | `name (a parameter)` | 571 | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_program.vl:2278 | canonFuncTypeName | isTopLevelFuncTypeName | (a) render | `rc = canonEmitNameAt(fnRetTextOf(name, fa), RC_FN_RES)` | 28 | build/sweep/witnesses/inventory/D15158.vl | `P\|string` |
+| check_program.vl:2308 | canonEmitUnionName | tyTopLevelSplit | (a)+(b) render and synthesized | `name (a parameter)` | 2047 render, 13 synthesized | build/sweep/witnesses/inventory/D15042.vl | `f64\|i32` |
+| check_program.vl:2396 | canonEmitUnionName | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `c = canonEmitNameAt(parts[i], memCtx)` | 172 render, 13 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_program.vl:2404 | canonEmitUnionName | splitUnionAtoms | (a)+(b) render and synthesized | `c = canonEmitNameAt(parts[i], memCtx)` | 193 render, 13 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_program.vl:2425 | canonEmitUnionName | nameToTy | (a) render | `name (a parameter)` | 3 | tests/cases/generics/error-literal-union-map-twin-through-one-instance-plain-first.vl | `{[i32]:i32}\|{[i32]:i32}` |
+| check_program.vl:2477 | canonSameShapeRecord | nameToTy | (a)+(b) render and synthesized | `all = ""` | 1769 render, 9 synthesized | build/sweep/witnesses/inventory/D15042.vl | `f64\|i32` |
+| check_relate_core.vl:2597 | annotResolve | nameToTy | (a)+(b) render and synthesized | `name (a parameter)` | 533 render, 1 synthesized | build/sweep/witnesses/inventory/D15097.vl | `{n:i32,g:{[string]:A}}` |
 | check_relate_core.vl:2670 | applyGenAliasArgs | tyTopLevelSplit | (c) source | `inner (a parameter)` | 43 | scripts/silent-sweep/distilled/named/mty_loc_twoparam_f64.vl | `A,B` |
-| check_relate_core.vl:2673 | applyGenAliasArgs | nameToTy | unclassified: bare names | `argNames[ai]` | 303 | build/sweep/witnesses/inventory/D15778.vl | `V` |
+| check_relate_core.vl:2673 | applyGenAliasArgs | nameToTy | unclassified: bare names | `argNames[ai]` | 304 | build/sweep/witnesses/inventory/D15096.vl | `T` |
 | check_relate_core.vl:2802 | nameIsectOperandTy | nameToTy | (c) source | `part (a parameter)` | 5 | build/sweep/witnesses/inventory/D16001.vl | `{v:i32}` |
-| check_relate_core.vl:3281 | tsToTyReal | groupInnerOf | (c) source | `lex = tsText[ix]` | 116 | build/sweep/witnesses/inventory/D16011.vl | `"x"` |
-| check_relate_core.vl:3363 | nameToTyReal | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `name (a parameter)` | 1861 render, 9 synthesized | build/sweep/witnesses/inventory/D15553.vl | `f64\|i32\|string` |
+| check_relate_core.vl:3281 | tsToTyReal | groupInnerOf | (c) source | `lex = tsText[ix]` | 118 | build/sweep/witnesses/inventory/D15170.vl | `"a"` |
+| check_relate_core.vl:3363 | nameToTyReal | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `name (a parameter)` | 1873 render, 9 synthesized | build/sweep/witnesses/inventory/D15042.vl | `f64\|i32` |
 | check_relate_core.vl:3369 | nameToTyReal | isTopLevelFuncTypeName | (c) source | `name (a parameter)` | 5 | build/sweep/witnesses/inventory/D16001.vl | `Node&{v:i32}` |
-| check_relate_core.vl:3387 | nameToTyReal | nameIsParenSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 487 render, 20 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| check_relate_core.vl:3388 | nameToTyReal | parenEnclosesWhole | (a) render | `name (a parameter)` | 57 | build/sweep/witnesses/inventory/D15552.vl | `((i32)=>i32)` |
-| check_relate_core.vl:3388 | nameToTyReal | nameToTy | (a) render | `groupInnerOf(name)` | 31 | build/sweep/witnesses/inventory/D15552.vl | `(i32)=>i32` |
-| check_relate_core.vl:3388 | nameToTyReal | groupInnerOf | (a) render | `name (a parameter)` | 57 | build/sweep/witnesses/inventory/D15552.vl | `((i32)=>i32)` |
-| check_relate_core.vl:3393 | nameToTyReal | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `name (a parameter)` | 475 render, 20 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| check_relate_core.vl:3405 | nameToTyReal | nameIsReadOnlyList | (a)+(b) render and synthesized | `name (a parameter)` | 450 render, 20 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| check_relate_core.vl:3416 | nameToTyReal | nameIsArray | (a)+(b) render and synthesized | `name (a parameter)` | 450 render, 20 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| check_relate_core.vl:3419 | nameToTyReal | arrElemNameRaw | (a)+(b) render and synthesized | `name (a parameter)` | 85 render, 1 synthesized | build/sweep/witnesses/inventory/D15552.vl | `((i32)=>i32)[]` |
-| check_relate_core.vl:3423 | nameToTyReal | nameToTy | (a)+(b) render and synthesized | `aeName = arrElemNameRaw(name)` | 35 render, 1 synthesized | build/sweep/witnesses/inventory/D15552.vl | `((i32)=>i32)` |
-| check_relate_core.vl:3431 | nameToTyReal | nameIsMapSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 392 render, 20 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| check_relate_core.vl:3431 | nameToTyReal | mapSpellKeyEnd | (a) render | `name (a parameter)` | 91 | build/sweep/witnesses/inventory/D14228.vl | `{[string]:boolean}` |
-| check_relate_core.vl:3432 | nameToTyReal | nameToTy | unclassified: bare names | `mapSpellKeyName(name)` | 607 | build/sweep/witnesses/inventory/D16000.vl | `string` |
-| check_relate_core.vl:3432 | nameToTyReal | mapSpellKeyName | (a) render | `name (a parameter)` | 91 | build/sweep/witnesses/inventory/D14228.vl | `{[string]:boolean}` |
-| check_relate_core.vl:3434 | nameToTyReal | nameToTy | (a) render | `mapSpellValName(name)` | 14 | build/sweep/witnesses/inventory/D14506.vl | `{[string]:{[string]:{[string]:{[string]:{[string]:{[string]:` |
-| check_relate_core.vl:3434 | nameToTyReal | mapSpellValName | (a) render | `name (a parameter)` | 91 | build/sweep/witnesses/inventory/D14228.vl | `{[string]:boolean}` |
-| check_relate_core.vl:3439 | nameToTyReal | nameIsBraceSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 319 render, 20 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| check_relate_core.vl:3449 | nameToTyReal | annGenAppSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 19 render, 20 synthesized | build/sweep/witnesses/inventory/D6950.vl | `"a" \| "b" \| "x" \| "y"` |
+| check_relate_core.vl:3387 | nameToTyReal | nameIsParenSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 489 render, 25 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_relate_core.vl:3388 | nameToTyReal | parenEnclosesWhole | (a) render | `name (a parameter)` | 59 | build/sweep/witnesses/inventory/D15136.vl | `((i32)=>i32)` |
+| check_relate_core.vl:3388 | nameToTyReal | nameToTy | (a) render | `groupInnerOf(name)` | 32 | build/sweep/witnesses/inventory/D15136.vl | `(i32)=>i32` |
+| check_relate_core.vl:3388 | nameToTyReal | groupInnerOf | (a) render | `name (a parameter)` | 59 | build/sweep/witnesses/inventory/D15136.vl | `((i32)=>i32)` |
+| check_relate_core.vl:3393 | nameToTyReal | isTopLevelFuncTypeName | (a)+(b) render and synthesized | `name (a parameter)` | 477 render, 25 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_relate_core.vl:3405 | nameToTyReal | nameIsReadOnlyList | (a)+(b) render and synthesized | `name (a parameter)` | 452 render, 25 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_relate_core.vl:3416 | nameToTyReal | nameIsArray | (a)+(b) render and synthesized | `name (a parameter)` | 452 render, 25 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_relate_core.vl:3419 | nameToTyReal | arrElemNameRaw | (a)+(b) render and synthesized | `name (a parameter)` | 87 render, 1 synthesized | build/sweep/witnesses/inventory/D15136.vl | `((i32)=>i32)[]` |
+| check_relate_core.vl:3423 | nameToTyReal | nameToTy | (a)+(b) render and synthesized | `aeName = arrElemNameRaw(name)` | 37 render, 1 synthesized | build/sweep/witnesses/inventory/D15136.vl | `((i32)=>i32)` |
+| check_relate_core.vl:3431 | nameToTyReal | nameIsMapSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 392 render, 25 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_relate_core.vl:3431 | nameToTyReal | mapSpellKeyEnd | (a) render | `name (a parameter)` | 91 | build/sweep/witnesses/inventory/D15097.vl | `{[string]:A}` |
+| check_relate_core.vl:3432 | nameToTyReal | nameToTy | unclassified: bare names | `mapSpellKeyName(name)` | 610 | build/sweep/witnesses/inventory/D14971.vl | `string` |
+| check_relate_core.vl:3432 | nameToTyReal | mapSpellKeyName | (a) render | `name (a parameter)` | 91 | build/sweep/witnesses/inventory/D15097.vl | `{[string]:A}` |
+| check_relate_core.vl:3434 | nameToTyReal | nameToTy | (a) render | `mapSpellValName(name)` | 14 | build/sweep/witnesses/inventory/D15151.vl | `{m:i32}\|null` |
+| check_relate_core.vl:3434 | nameToTyReal | mapSpellValName | (a) render | `name (a parameter)` | 91 | build/sweep/witnesses/inventory/D15097.vl | `{[string]:A}` |
+| check_relate_core.vl:3439 | nameToTyReal | nameIsBraceSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 319 render, 25 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_relate_core.vl:3449 | nameToTyReal | annGenAppSpanEnds | (a)+(b) render and synthesized | `name (a parameter)` | 19 render, 25 synthesized | build/sweep/witnesses/inventory/D6950.vl | `"a" \| "b" \| "x" \| "y"` |
 | check_relate_core.vl:3450 | nameToTyReal | gaeLtAt | (a) render | `name (a parameter)` | 1 | tests/cases/generics/type-param-shadows-alias-through-constructors.vl | `Inner<Sx>` |
 | check_relate_core.vl:3451 | nameToTyReal | gaeHeadNameOf | (a) render | `name (a parameter)` | 1 | tests/cases/generics/type-param-shadows-alias-through-constructors.vl | `Inner<Sx>` |
 | check_relate_core.vl:3451 | nameToTyReal | gaeArgsTextOf | (a) render | `name (a parameter)` | 1 | tests/cases/generics/type-param-shadows-alias-through-constructors.vl | `Inner<Sx>` |
-| check_relate_core.vl:3461 | nameUnionTy | tyTopLevelSplit | (a)+(b) render and synthesized | `name (a parameter)` | 1861 render, 9 synthesized | build/sweep/witnesses/inventory/D15553.vl | `f64\|i32\|string` |
-| check_relate_core.vl:3472 | nameUnionTy | nameToTy | (a)+(b) render and synthesized | `part = parts[pi]` | 111 render, 9 synthesized | build/sweep/witnesses/inventory/D15710.vl | `boolean[]` |
+| check_relate_core.vl:3461 | nameUnionTy | tyTopLevelSplit | (a)+(b) render and synthesized | `name (a parameter)` | 1873 render, 9 synthesized | build/sweep/witnesses/inventory/D15042.vl | `f64\|i32` |
+| check_relate_core.vl:3472 | nameUnionTy | nameToTy | (a)+(b) render and synthesized | `part = parts[pi]` | 111 render, 9 synthesized | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
 | check_relate_core.vl:3486 | nameIsectTy | tyTopLevelSplit | (c) source | `name (a parameter)` | 5 | build/sweep/witnesses/inventory/D16001.vl | `Node&{v:i32}` |
-| check_relate_core.vl:3503 | nameFuncTy | fnParamsTextOf | (a) render | `name (a parameter)` | 48 | build/sweep/witnesses/inventory/D15552.vl | `(i32)=>i32` |
-| check_relate_core.vl:3504 | nameFuncTy | fnRetTextOf | (a) render | `name (a parameter)` | 48 | build/sweep/witnesses/inventory/D15552.vl | `(i32)=>i32` |
+| check_relate_core.vl:3503 | nameFuncTy | fnParamsTextOf | (a) render | `name (a parameter)` | 49 | build/sweep/witnesses/inventory/D15136.vl | `(i32)=>i32` |
+| check_relate_core.vl:3504 | nameFuncTy | fnRetTextOf | (a) render | `name (a parameter)` | 49 | build/sweep/witnesses/inventory/D15136.vl | `(i32)=>i32` |
 | check_relate_core.vl:3508 | nameFuncTy | tyTopLevelSplit | (a) render | `paramsStr = fnParamsTextOf(name, arrowAt)` | 4 | build/sweep/witnesses/inventory/D3108.vl | `{r:i32}\|null` |
 | check_relate_core.vl:3511 | nameFuncTy | nameToTy | (a) render | `pparts[pk]` | 4 | build/sweep/witnesses/inventory/D3108.vl | `{r:i32}\|null` |
 | check_relate_core.vl:3529 | retNameToTy | nameToTy | (a) render | `name (a parameter)` | 6 | tests/cases/closures/coalesce-nullable-struct.vl | `{x:i32}\|null` |
-| check_relate_core.vl:3544 | nameObjTy | tyTopIndexOf | (a) render | `name (a parameter)` | 301 | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| check_relate_core.vl:3551 | nameObjTy | tyTopIndexOf | (a) render | `field = name.slice(fstart, fend)` | 243 | build/sweep/witnesses/inventory/D15552.vl | `fs:((i32)=>i32)[]` |
-| check_relate_core.vl:3566 | nameObjTy | nameToTy | (a) render | `fieldTypeTextOf(field, colonAt)` | 125 | build/sweep/witnesses/inventory/D15552.vl | `((i32)=>i32)[]` |
-| check_relate_core.vl:3566 | nameObjTy | fieldTypeTextOf | (a) render | `field = name.slice(fstart, fend)` | 243 | build/sweep/witnesses/inventory/D15552.vl | `fs:((i32)=>i32)[]` |
-| check_relate_core.vl:3568 | nameObjTy | fieldNameOf | (a) render | `field = name.slice(fstart, fend)` | 243 | build/sweep/witnesses/inventory/D15552.vl | `fs:((i32)=>i32)[]` |
-| check_statements.vl:393 | letDeclResolveAnnot | nameToTyAt | (a) render | `tn.tyName` | 3 | tests/cases/closures/capture-cell-annotated-written-with-generic-by-shared-closure.vl | `((T)=>void)[]` |
-| check_ty_rep.vl:807 | retAtomKindOf | valueAtomKind | unclassified: bare names | `t.primName` | 649 | build/sweep/witnesses/inventory/D15456.vl | `i32` |
+| check_relate_core.vl:3544 | nameObjTy | tyTopIndexOf | (a) render | `name (a parameter)` | 301 | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}` |
+| check_relate_core.vl:3551 | nameObjTy | tyTopIndexOf | (a) render | `field = name.slice(fstart, fend)` | 243 | build/sweep/witnesses/inventory/D15097.vl | `g:{[string]:A}` |
+| check_relate_core.vl:3566 | nameObjTy | nameToTy | (a) render | `fieldTypeTextOf(field, colonAt)` | 125 | build/sweep/witnesses/inventory/D15097.vl | `{[string]:A}` |
+| check_relate_core.vl:3566 | nameObjTy | fieldTypeTextOf | (a) render | `field = name.slice(fstart, fend)` | 243 | build/sweep/witnesses/inventory/D15097.vl | `g:{[string]:A}` |
+| check_relate_core.vl:3568 | nameObjTy | fieldNameOf | (a) render | `field = name.slice(fstart, fend)` | 243 | build/sweep/witnesses/inventory/D15097.vl | `g:{[string]:A}` |
+| check_statements.vl:393 | letDeclResolveAnnot | nameToTyAt | (a) render | `tn.tyName` | 3 | tests/cases/closures/hole-lambda-alias-written-values.vl | `((string)=>string)[]` |
+| check_ty_rep.vl:807 | retAtomKindOf | valueAtomKind | unclassified: bare names | `t.primName` | 655 | build/sweep/witnesses/inventory/D14973.vl | `i32` |
 | check_ty_rep.vl:819 | retAtomKindOf | nameIsLitUnionType | unclassified: bare names | `en = et.primName` | 61 | build/sweep/witnesses/inventory/D15710.vl | `string` |
-| check_ty_rep.vl:1189 | nameIsOneStrLit | nameIsQuotedWhole | (a)+(b) render and synthesized | `name (a parameter)` | 409 render, 5 synthesized | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_ty_rep.vl:1390 | nulElemListAtomKind | listElemNameOf | (a) render | `name (a parameter)` | 2418 | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| check_ty_rep.vl:1392 | nulElemListAtomKind | unionMemberCount | (a) render | `elem = listElemNameOf(name)` | 886 | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}` |
-| check_ty_rep.vl:1401 | nulElemListAtomKind | tyTopIndexOf | (a) render | `elem = listElemNameOf(name)` | 372 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)\|null` |
-| check_ty_rep.vl:1404 | nulElemListAtomKind | spanEqAt | (a) render | `elem = listElemNameOf(name)` | 372 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)\|null` |
+| check_ty_rep.vl:1189 | nameIsOneStrLit | nameIsQuotedWhole | (a)+(b) render and synthesized | `name (a parameter)` | 411 render, 5 synthesized | build/sweep/witnesses/inventory/D15044.vl | `boolean\|i32` |
+| check_ty_rep.vl:1390 | nulElemListAtomKind | listElemNameOf | (a) render | `name (a parameter)` | 2429 | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_ty_rep.vl:1392 | nulElemListAtomKind | unionMemberCount | (a) render | `elem = listElemNameOf(name)` | 889 | build/sweep/witnesses/inventory/D15032.vl | `(i32)=>i32` |
+| check_ty_rep.vl:1401 | nulElemListAtomKind | tyTopIndexOf | (a) render | `elem = listElemNameOf(name)` | 373 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)\|null` |
+| check_ty_rep.vl:1404 | nulElemListAtomKind | spanEqAt | (a) render | `elem = listElemNameOf(name)` | 373 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)\|null` |
 | check_ty_rep.vl:1418 | nulElemListAtomKind | spanEqAt | (a) render | `elem = listElemNameOf(name)` | 57 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)\|null` |
 | check_ty_rep.vl:1419 | nulElemListAtomKind | spanEqAt | (a) render | `elem = listElemNameOf(name)` | 56 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)\|null` |
 | check_ty_rep.vl:1420 | nulElemListAtomKind | nameIsLitUnionType | (a) render | `elem.slice(soloFrom, soloTo)` | 14 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)` |
-| check_ty_rep.vl:1469 | litUnionArrayElemOf | listElemNameOf | (a) render | `name (a parameter)` | 2515 | build/sweep/witnesses/inventory/D15495.vl | `(string)=>string` |
-| check_ty_rep.vl:1471 | litUnionArrayElemOf | nameIsLitUnionType | (a) render | `elem = listElemNameOf(name)` | 887 | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}` |
-| check_ty_rep.vl:1731 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 21 | build/sweep/witnesses/inventory/D14800.vl | `string\|null` |
-| check_ty_rep.vl:1732 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 21 | build/sweep/witnesses/inventory/D14800.vl | `string\|null` |
-| check_ty_rep.vl:1733 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 21 | build/sweep/witnesses/inventory/D14800.vl | `string\|null` |
-| check_ty_rep.vl:1734 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 20 | build/sweep/witnesses/inventory/D14800.vl | `string\|null` |
-| check_ty_rep.vl:1735 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 18 | build/sweep/witnesses/inventory/D14800.vl | `string\|null` |
-| check_ty_rep.vl:1736 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 18 | build/sweep/witnesses/inventory/D14800.vl | `string\|null` |
-| check_ty_rep.vl:1737 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 18 | build/sweep/witnesses/inventory/D14800.vl | `string\|null` |
-| check_ty_rep.vl:1738 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 12 | build/sweep/witnesses/inventory/D2498.vl | `{[string]:boolean\|f64\|string\|Json[]\|{[string]:Json}\|nul` |
-| check_types.vl:4588 | litMemberTy | nameIsQuotedWhole | (a)+(b) render and synthesized | `name (a parameter)` | 1591 render, 24 synthesized | build/sweep/witnesses/inventory/D15493.vl | `{f:i32}` |
-| check_types.vl:4588 | litMemberTy | groupInnerOf | (c) source | `name (a parameter)` | 231 | build/sweep/witnesses/inventory/D15954.vl | `"a"` |
+| check_ty_rep.vl:1469 | litUnionArrayElemOf | listElemNameOf | (a) render | `name (a parameter)` | 2526 | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| check_ty_rep.vl:1471 | litUnionArrayElemOf | nameIsLitUnionType | (a) render | `elem = listElemNameOf(name)` | 890 | build/sweep/witnesses/inventory/D15032.vl | `(i32)=>i32` |
+| check_ty_rep.vl:1731 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 22 | build/sweep/witnesses/inventory/D2498.vl | `{[string]:boolean\|f64\|string\|Json[]\|{[string]:Json}\|nul` |
+| check_ty_rep.vl:1732 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 22 | build/sweep/witnesses/inventory/D2498.vl | `{[string]:boolean\|f64\|string\|Json[]\|{[string]:Json}\|nul` |
+| check_ty_rep.vl:1733 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 22 | build/sweep/witnesses/inventory/D2498.vl | `{[string]:boolean\|f64\|string\|Json[]\|{[string]:Json}\|nul` |
+| check_ty_rep.vl:1734 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 21 | build/sweep/witnesses/inventory/D2498.vl | `{[string]:boolean\|f64\|string\|Json[]\|{[string]:Json}\|nul` |
+| check_ty_rep.vl:1735 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 19 | build/sweep/witnesses/inventory/D2498.vl | `{[string]:boolean\|f64\|string\|Json[]\|{[string]:Json}\|nul` |
+| check_ty_rep.vl:1736 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 19 | build/sweep/witnesses/inventory/D2498.vl | `{[string]:boolean\|f64\|string\|Json[]\|{[string]:Json}\|nul` |
+| check_ty_rep.vl:1737 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 19 | build/sweep/witnesses/inventory/D2498.vl | `{[string]:boolean\|f64\|string\|Json[]\|{[string]:Json}\|nul` |
+| check_ty_rep.vl:1738 | valueAtomKindSpan | spanEqAt | (a) render | `name (a parameter)` | 13 | build/sweep/witnesses/inventory/D2498.vl | `{[string]:boolean\|f64\|string\|Json[]\|{[string]:Json}\|nul` |
+| check_types.vl:4588 | litMemberTy | nameIsQuotedWhole | (a)+(b) render and synthesized | `name (a parameter)` | 1595 render, 29 synthesized | build/sweep/witnesses/inventory/D15031.vl | `{a:i32}` |
+| check_types.vl:4588 | litMemberTy | groupInnerOf | (c) source | `name (a parameter)` | 231 | build/sweep/witnesses/inventory/D15083.vl | `"x"` |
 
 ## Renders a later decision reads (`ty-render`), by consumer
 
@@ -224,106 +224,106 @@ counts the programs that reached the call during emit.
 
 | site | function | renderer | consumer | keyed | programs | witness | example |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| check_emit_queries.vl:745 | nodeArrayElemName | tyToEmitName | `return` | no | 1061 | build/sweep/witnesses/inventory/D15547.vl | `{[string]:i32}` |
-| check_emit_queries.vl:753 | nodeArrayElemName | tyToNominalName | `aeu → return` | no | 1052 | build/sweep/witnesses/inventory/D15540.vl | `{[i32]:i32}` |
-| check_emit_queries.vl:767 | nodeArrayElemName | tyToEmitName | `fn → compare: "" && fnElem >= 0 { fn = tyToEmitName(fnElem) }; compare: "" && tyHasTyVar(t.aElem) {; compare: ` | compare | 550 | build/sweep/witnesses/inventory/D15548.vl | `(i32)=>i32` |
+| check_emit_queries.vl:745 | nodeArrayElemName | tyToEmitName | `return` | no | 1062 | build/sweep/witnesses/inventory/D15547.vl | `{[string]:i32}` |
+| check_emit_queries.vl:753 | nodeArrayElemName | tyToNominalName | `aeu → return` | no | 1055 | build/sweep/witnesses/inventory/D14980.vl | `i32\|AB` |
+| check_emit_queries.vl:767 | nodeArrayElemName | tyToEmitName | `fn → compare: "" && fnElem >= 0 { fn = tyToEmitName(fnElem) }; compare: "" && tyHasTyVar(t.aElem) {; compare: ` | compare | 557 | build/sweep/witnesses/inventory/D15032.vl | `(i32)=>i32` |
 | check_emit_queries.vl:771 | nodeArrayElemName | tyToEmitName | `store: fn` | no | 10 | build/sweep/witnesses/inventory/D1794.vl | `(i32)=>i32` |
-| check_emit_queries.vl:775 | nodeArrayElemName | tyToEmitName | `store: fn` | no | 150 | build/sweep/witnesses/inventory/D15548.vl | `()=>void` |
-| check_emit_queries.vl:794 | nodeArrayElemName | tyToEmitName | `return` | no | 363 | build/sweep/witnesses/inventory/D15711.vl | `i32[]` |
-| emit_classify.vl:6539 | arrLitFrameRefTy | rlRowNameOfTy | `compare: "" { return -1 }` | compare | 4204 | build/sweep/witnesses/inventory/D15510.vl | `` |
-| emit_classify.vl:6907 | arrLitElemName | rlRowNameOfTy | `return` | no | 45 | build/sweep/witnesses/inventory/D15692.vl | `{f:i32}` |
+| check_emit_queries.vl:775 | nodeArrayElemName | tyToEmitName | `store: fn` | no | 155 | build/sweep/witnesses/inventory/D15101.vl | `()=>void` |
+| check_emit_queries.vl:794 | nodeArrayElemName | tyToEmitName | `return` | no | 364 | build/sweep/witnesses/inventory/D1513.vl | `{y:i32,x:i32}[]` |
+| emit_classify.vl:6539 | arrLitFrameRefTy | rlRowNameOfTy | `compare: "" { return -1 }` | compare | 4209 | build/sweep/witnesses/inventory/D14978.vl | `Circle` |
+| emit_classify.vl:6907 | arrLitElemName | rlRowNameOfTy | `return` | no | 45 | build/sweep/witnesses/inventory/D15262.vl | `{r:null}` |
 | emit_classify.vl:6909 | arrLitElemName | rlRowNameOfTy | `return` | no | 0 |  | `` |
 | emit_classify.vl:6938 | arrLitElemNameTy | rlRowNameOfTy | `return` | no | 26 | build/sweep/witnesses/inventory/D804b.vl | `{[string]:{r:i32\|null}}` |
 | emit_classify.vl:11246 | memReadBoxNarrowName | unionSpellingOfTy | `return` | no | 0 |  | `` |
 | emit_collect.vl:5062 | collectFrameRefRow | rlRowNameOfTy | `arg: ensureRefElemTys(…)` | no | 149 | build/sweep/witnesses/inventory/D157.vl | `{r:i32}` |
-| emit_collect.vl:5214 | arrLitStoredElemName | rlRowNameOfTy | `n → compare: "" { return n }; return` | compare | 4179 | build/sweep/witnesses/inventory/D15510.vl | `` |
-| emit_collect.vl:5324 | collectAArrayLit | rlRowNameOfTy | `return` | no | 114 | build/sweep/witnesses/inventory/D14222.vl | `Circle[]` |
-| emit_collect.vl:5341 | collectAArrayLit | rlRowNameOfTy | `arg: rlInternNameTy(…)` | yes, via rlInternNameTy | 921 | build/sweep/witnesses/inventory/D15548.vl | `{fs:((i32)=>i32)[],x:i32}` |
-| emit_collect.vl:5409 | collectARefArrayAnn | rlRowNameOfTy | `ren → compare: "" {; arg: isValueUnionName(…); arg: ensureRefElemTys(…)` | compare | 4238 | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}` |
+| emit_collect.vl:5214 | arrLitStoredElemName | rlRowNameOfTy | `n → compare: "" { return n }; return` | compare | 4192 | build/sweep/witnesses/inventory/D14978.vl | `{r:i32\|null}` |
+| emit_collect.vl:5324 | collectAArrayLit | rlRowNameOfTy | `return` | no | 114 | build/sweep/witnesses/inventory/D15285.vl | `J[]` |
+| emit_collect.vl:5341 | collectAArrayLit | rlRowNameOfTy | `arg: rlInternNameTy(…)` | yes, via rlInternNameTy | 921 | build/sweep/witnesses/inventory/D14960.vl | `{r:f64,w:f64}` |
+| emit_collect.vl:5409 | collectARefArrayAnn | rlRowNameOfTy | `ren → compare: "" {; arg: isValueUnionName(…); arg: ensureRefElemTys(…)` | compare | 4249 | build/sweep/witnesses/inventory/D14960.vl | `Shape` |
 | emit_collect.vl:6348 | arrLitInstElemRows | rlRowNameOfTy | `arg: rlInternNameTy(…)` | yes, via rlInternNameTy | 34 | build/sweep/witnesses/inventory/D3036.vl | `{k:string,n:i32}` |
-| emit_collect.vl:6375 | arrLitRepElemRow | rlRowNameOfTy | `arg: rlInternNameTy(…)` | yes, via rlInternNameTy | 605 | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}` |
-| emit_collect.vl:8135 | arenaEmitName | tyToNominalName | `nom → compare: "" { return "" }; arg: canonEmitNameOfTy(…)` | compare | 10392 | build/sweep/witnesses/inventory/D15461.vl | `` |
-| emit_collect.vl:8137 | arenaEmitName | canonEmitNameOfTy | `return` | no | 9817 | build/sweep/witnesses/inventory/D15480.vl | `CaseMap` |
-| emit_collect.vl:8145 | reachRegisterName | tyToNominalName | `return` | no | 349 | build/sweep/witnesses/inventory/D15520.vl | `K` |
-| emit_collect.vl:8595 | registerInferredUnionTy | tyToNominalName | `inm → compare: "" { return 0 }; arg: unNameAdoptTyKeyRow(…); arg: registerInlineUnionAt(…)` | yes, via unNameAdoptTyKeyRow, registerInlineUnionAt | 435 | build/sweep/witnesses/inventory/D1561.vl | `Shape` |
-| emit_collect.vl:8812 | tyNomRenderLoops | tyToNominalName | `discarded` | no | 10414 | build/sweep/witnesses/inventory/D15480.vl | `CaseMap` |
-| emit_mono.vl:920 | monoArgFnTypeName | monoPinSpellShaped | `return` | no | 165 | build/sweep/witnesses/inventory/D14080.vl | `()=>null` |
+| emit_collect.vl:6375 | arrLitRepElemRow | rlRowNameOfTy | `arg: rlInternNameTy(…)` | yes, via rlInternNameTy | 606 | build/sweep/witnesses/inventory/D14960.vl | `Shape` |
+| emit_collect.vl:8135 | arenaEmitName | tyToNominalName | `nom → compare: "" { return "" }; arg: canonEmitNameOfTy(…)` | compare | 10434 | build/sweep/witnesses/inventory/D14941.vl | `(K)=>K` |
+| emit_collect.vl:8137 | arenaEmitName | canonEmitNameOfTy | `return` | no | 9850 | build/sweep/witnesses/inventory/D14941.vl | `(K)=>K` |
+| emit_collect.vl:8145 | reachRegisterName | tyToNominalName | `return` | no | 352 | build/sweep/witnesses/inventory/D14941.vl | `K` |
+| emit_collect.vl:8595 | registerInferredUnionTy | tyToNominalName | `inm → compare: "" { return 0 }; arg: unNameAdoptTyKeyRow(…); arg: registerInlineUnionAt(…)` | yes, via unNameAdoptTyKeyRow, registerInlineUnionAt | 435 | build/sweep/witnesses/inventory/D15081.vl | `A\|{r:f64}` |
+| emit_collect.vl:8812 | tyNomRenderLoops | tyToNominalName | `discarded` | no | 10449 | build/sweep/witnesses/inventory/D14941.vl | `K` |
+| emit_mono.vl:920 | monoArgFnTypeName | monoPinSpellShaped | `return` | no | 168 | build/sweep/witnesses/inventory/D15033.vl | `(i32)=>void` |
 | emit_mono.vl:923 | monoArgFnTypeName | monoPinSpellShaped | `return` | no | 3 | build/sweep/witnesses/inventory/D4647.vl | `(i32,i32)=>boolean` |
 | emit_mono.vl:928 | monoArgFnTypeName | monoPinSpellShaped | `return` | no | 10 | build/sweep/witnesses/inventory/D5880.vl | `(i32,f64[][])=>i32` |
 | emit_mono.vl:971 | monoListUnionRowName | monoPinSpellShaped | `store: mn` | no | 3 | build/sweep/witnesses/inventory/D2834.vl | `string[]` |
-| emit_mono.vl:1281 | monoNarrowedPinName | monoPinSpellShaped | `n → arg: monoAnnPinName(…); compare: { return n }; return` | compare | 5366 | build/sweep/witnesses/inventory/D15456.vl | `i32` |
-| emit_mono.vl:1381 | monoNicheWidenedPinName | monoPinSpellShaped | `n → compare: "" { return monoElemlessNulListPinName(nt, chosen) }; compare: chosen { return "" }; arg: monoAnn` | compare | 4401 | build/sweep/witnesses/inventory/D15456.vl | `i32` |
-| emit_mono.vl:1613 | monoAnnPinNameOfTy | monoPinSpellShaped | `arg: monoAnnPinName(…)` | no | 10 | build/sweep/witnesses/inventory/D15530.vl | `#anon0[]` |
-| emit_mono.vl:1630 | monoI32AtomPinName | monoPinSpellShaped | `return` | no | 6630 | build/sweep/witnesses/inventory/D15456.vl | `i32` |
+| emit_mono.vl:1281 | monoNarrowedPinName | monoPinSpellShaped | `n → arg: monoAnnPinName(…); compare: { return n }; return` | compare | 5391 | build/sweep/witnesses/inventory/D14931.vl | `i32` |
+| emit_mono.vl:1381 | monoNicheWidenedPinName | monoPinSpellShaped | `n → compare: "" { return monoElemlessNulListPinName(nt, chosen) }; compare: chosen { return "" }; arg: monoAnn` | compare | 4417 | build/sweep/witnesses/inventory/D14931.vl | `i32` |
+| emit_mono.vl:1613 | monoAnnPinNameOfTy | monoPinSpellShaped | `arg: monoAnnPinName(…)` | no | 13 | build/sweep/witnesses/inventory/D15190.vl | `{xs:((i32)=>i32)[]}` |
+| emit_mono.vl:1630 | monoI32AtomPinName | monoPinSpellShaped | `return` | no | 6656 | build/sweep/witnesses/inventory/D14931.vl | `i32` |
 | emit_mono.vl:1699 | monoHoleMapPinName | monoPinSpellShaped | `return` | no | 2 | build/sweep/witnesses/inventory/D1887.vl | `{[string]:i32}` |
 | emit_mono.vl:1949 | monoLitUnionPinOfTy | monoPinSpellShaped | `luInl → compare: "" { return luInl }; return` | compare | 1 | tests/cases/functions/pin-string-concat-litunion-arg.vl | `"red"` |
 | emit_mono.vl:1983 | monoArgTyNameProjected | monoPinSpellShaped | `arg: monoAnnPinName(…)` | no | 5 | build/sweep/witnesses/inventory/D3900.vl | `{x:i32}` |
 | emit_mono.vl:2008 | monoArgTyNameProjected | monoPinSpellShaped | `return` | no | 4 | build/sweep/witnesses/inventory/D3900.vl | `{x:i32}` |
-| emit_mono.vl:2242 | monoRecordNominalPin | tyToNominalName | `raw → scan: .length {; scan: .slice(i, i + 1); scan: .slice(i + 1, i + 2) != "[" { return "" }` | no | 469 | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}[]` |
+| emit_mono.vl:2242 | monoRecordNominalPin | tyToNominalName | `raw → scan: .length {; scan: .slice(i, i + 1); scan: .slice(i + 1, i + 2) != "[" { return "" }` | no | 470 | build/sweep/witnesses/inventory/D15181.vl | `Circle[]` |
 | emit_mono.vl:2313 | monoFnTyPin | monoPinSpellShaped | `return` | no | 4 | tests/cases/closures/fn-arm-union-call-result-to-hole-param.vl | `((i32)=>i32)\|null` |
-| emit_mono.vl:2541 | monoSubstLetType | monoPinSpellNoAnon | `return` | no | 594 | build/sweep/witnesses/inventory/D157.vl | `Circle[]` |
+| emit_mono.vl:2541 | monoSubstLetType | monoPinSpellNoAnon | `return` | no | 598 | build/sweep/witnesses/inventory/D15042.vl | `{f:f64}\|{f:i32}` |
 | emit_mono.vl:2689 | monoPinUnionBoxed | monoPinSpellShaped | `arg: monoPinUnionName(…)` | no | 73 | build/sweep/witnesses/inventory/D14084.vl | `K[]\|boolean[]` |
-| emit_mono.vl:3533 | monoSubstAnnNode | monoPinSpellShaped | `sub → compare: "" \|\| sub == tn.tyName { return -2 }; compare: tn.tyName { return -2 }; arg: synthTypeRefTy(…` | compare | 188 | build/sweep/witnesses/inventory/D14080.vl | `()=>null` |
+| emit_mono.vl:3533 | monoSubstAnnNode | monoPinSpellShaped | `sub → compare: "" \|\| sub == tn.tyName { return -2 }; compare: tn.tyName { return -2 }; arg: synthTypeRefTy(…` | compare | 191 | build/sweep/witnesses/inventory/D15103.vl | `string[]` |
 | emit_mono.vl:6131 | monoPreBindNumJoin | monoPinSpellShaped | `push: tvV.push(…)` | push | 2 | build/sweep/witnesses/inventory/D2459.vl | `f64` |
-| emit_mono.vl:7524 | monoFoldLayoutAt | monoPinSpellShaped | `return` | no | 52 | build/sweep/witnesses/inventory/D15710.vl | `string[]` |
-| emit_mono.vl:7654 | monoTagRecordPinKind | monoPinSpellShaped | `compare: pin \|\| pin == "" {` | compare | 1822 | build/sweep/witnesses/inventory/D15481.vl | `` |
+| emit_mono.vl:7524 | monoFoldLayoutAt | monoPinSpellShaped | `return` | no | 52 | build/sweep/witnesses/inventory/D15255.vl | `(i32)=>i32` |
+| emit_mono.vl:7654 | monoTagRecordPinKind | monoPinSpellShaped | `compare: pin \|\| pin == "" {` | compare | 1838 | build/sweep/witnesses/inventory/D15031.vl | `` |
 | emit_mono.vl:7887 | monoTagMapRepTy | monoPinSpellShaped | `store: sp` | no | 6 | build/sweep/witnesses/inventory/D9181.vl | `{[string]:i32}` |
-| emit_mono.vl:7915 | monoPinUnionNameOfTy | monoPinSpellShaped | `arg: monoPinUnionName(…)` | no | 801 | build/sweep/witnesses/inventory/D15553.vl | `f64\|i32\|string` |
+| emit_mono.vl:7915 | monoPinUnionNameOfTy | monoPinSpellShaped | `arg: monoPinUnionName(…)` | no | 801 | build/sweep/witnesses/inventory/D15042.vl | `f64\|i32` |
 | emit_mono.vl:7980 | monoPinMintedUnion | monoPinSpellShaped | `return` | no | 185 | build/sweep/witnesses/inventory/D15539.vl | `((i32)=>i32)\|null` |
-| emit_mono.vl:9131 | monoInstanceRetSpelling | monoPinSpellShaped | `return` | no | 178 | build/sweep/witnesses/inventory/D15461.vl | `` |
+| emit_mono.vl:9131 | monoInstanceRetSpelling | monoPinSpellShaped | `return` | no | 184 | build/sweep/witnesses/inventory/D15039.vl | `` |
 | emit_mono.vl:10386 | monoInstanceFor | monoPinSpellShaped | `push: pinned.push(…)` | push | 25 | build/sweep/witnesses/inventory/D15031.vl | `#anon0` |
-| emit_mono.vl:20446 | monoPinHoleParam | monoPinSpellShaped | `return` | no | 10 | build/sweep/witnesses/inventory/D15492.vl | `{[string]:i32}` |
-| emit_mono.vl:20452 | monoPinHoleParam | monoPinSpellShaped | `return` | no | 838 | build/sweep/witnesses/inventory/D15524.vl | `` |
-| emit_mono.vl:20930 | monoPinAnnotatedParam | monoPinSpellShaped | `store: bind` | no | 566 | build/sweep/witnesses/inventory/D15537.vl | `Circle` |
-| emit_mono.vl:20964 | monoPinAnnotatedParam | monoPinSpellShaped | `return` | no | 566 | build/sweep/witnesses/inventory/D15537.vl | `Circle[]` |
-| emit_mono.vl:21023 | monoPinNominalSpelling | tyToNominalName | `nm → compare: "" { return nm }; return` | compare | 867 | build/sweep/witnesses/inventory/D15492.vl | `i32` |
-| emit_mono.vl:21485 | monoPinTyParamComposite | monoPinSpellShaped | `return` | no | 375 | build/sweep/witnesses/inventory/D15530.vl | `#anon0[]\|null` |
-| emit_mono.vl:23663 | monoNoteBindDeliveryCall | monoPinSpellShaped | `ps → compare: "" { return 0 }; concat` | compare | 834 | build/sweep/witnesses/inventory/D15463.vl | `i32` |
+| emit_mono.vl:20446 | monoPinHoleParam | monoPinSpellShaped | `return` | no | 10 | build/sweep/witnesses/inventory/D15174.vl | `{[string]:i32}` |
+| emit_mono.vl:20452 | monoPinHoleParam | monoPinSpellShaped | `return` | no | 850 | build/sweep/witnesses/inventory/D15125.vl | `` |
+| emit_mono.vl:20930 | monoPinAnnotatedParam | monoPinSpellShaped | `store: bind` | no | 567 | build/sweep/witnesses/inventory/D15016.vl | `i32` |
+| emit_mono.vl:20964 | monoPinAnnotatedParam | monoPinSpellShaped | `return` | no | 567 | build/sweep/witnesses/inventory/D15016.vl | `i32[]` |
+| emit_mono.vl:21023 | monoPinNominalSpelling | tyToNominalName | `nm → compare: "" { return nm }; return` | compare | 874 | build/sweep/witnesses/inventory/D14941.vl | `string` |
+| emit_mono.vl:21485 | monoPinTyParamComposite | monoPinSpellShaped | `return` | no | 383 | build/sweep/witnesses/inventory/D15016.vl | `(i32)=>i32` |
+| emit_mono.vl:23663 | monoNoteBindDeliveryCall | monoPinSpellShaped | `ps → compare: "" { return 0 }; concat` | compare | 839 | build/sweep/witnesses/inventory/D14941.vl | `K` |
 | emit_mono.vl:23762 | monoDeliverLamLit | monoPinSpellShaped | `ps → compare: "" { pinsOk = false }; push: pnames.push(…)` | push | 5 | build/sweep/witnesses/inventory/D14729.vl | `f64` |
 | emit_mono.vl:24077 | monoSlotPinAnn | monoPinSpellShaped | `concat` | no | 5 | build/sweep/witnesses/inventory/D15031.vl | `#anon0` |
-| emit_mono.vl:24176 | monoConcreteFnPinName | monoPinSpellShaped | `return` | no | 648 | build/sweep/witnesses/inventory/D15462.vl | `(i32)=>i32` |
-| emit_mono.vl:25122 | monoPinLamAtTys | monoPinSpellShaped | `store: nm` | no | 10 | build/sweep/witnesses/inventory/D14887.vl | `i32` |
+| emit_mono.vl:24176 | monoConcreteFnPinName | monoPinSpellShaped | `return` | no | 663 | build/sweep/witnesses/inventory/D15062.vl | `(i32)=>i32` |
+| emit_mono.vl:25122 | monoPinLamAtTys | monoPinSpellShaped | `store: nm` | no | 11 | build/sweep/witnesses/inventory/D14887.vl | `i32` |
 | emit_mono.vl:25186 | monoLamPinName | monoPinSpellShaped | `return` | no | 11 | build/sweep/witnesses/inventory/D3875.vl | `{v:A}` |
-| emit_mono.vl:25561 | monoCloCoerceBuild | monoPinSpellShaped | `push: pnames.push(…)` | push | 15 | build/sweep/witnesses/inventory/D15642.vl | `i32` |
+| emit_mono.vl:25561 | monoCloCoerceBuild | monoPinSpellShaped | `push: pnames.push(…)` | push | 15 | build/sweep/witnesses/inventory/D15065.vl | `i32` |
 | emit_mv_slots.vl:376 | mvDeepArmKeyName | tyToNominalName | `return` | no | 238 | build/sweep/witnesses/inventory/D156.vl | `{[string]:{r:i32}}` |
-| emit_mv_slots.vl:385 | mvDeepDeclKeyName | tyToNominalName | `return` | no | 58 | build/sweep/witnesses/inventory/D14505.vl | `{[string]:{[string]:Circle}}` |
-| emit_rep.vl:3787 | unionArmsAllSame | tyToNominalName | `n0 → compare: { return false }` | compare | 5933 | build/sweep/witnesses/inventory/D15480.vl | `i32` |
-| emit_rep.vl:3789 | unionArmsAllSame | tyToNominalName | `compare: n0 { return false }` | compare | 5933 | build/sweep/witnesses/inventory/D15480.vl | `i32` |
+| emit_mv_slots.vl:385 | mvDeepDeclKeyName | tyToNominalName | `return` | no | 58 | build/sweep/witnesses/inventory/D1786.vl | `{[string]:Rec}` |
+| emit_rep.vl:3787 | unionArmsAllSame | tyToNominalName | `n0 → compare: { return false }` | compare | 5958 | build/sweep/witnesses/inventory/D14971.vl | `{[string]:i32}` |
+| emit_rep.vl:3789 | unionArmsAllSame | tyToNominalName | `compare: n0 { return false }` | compare | 5958 | build/sweep/witnesses/inventory/D14971.vl | `{[string]:i32}` |
 | emit_rewrite.vl:813 | lvSpellOf | tyToEmitName | `spell → compare: "" && tyHasTyVar(ty) { spell = lvSpaceless(tyToStr(ty)) }; return` | compare | 57 | build/sweep/witnesses/inventory/D13081.vl | `(string)=>string` |
-| emit_rewrite.vl:1238 | synthTypeRefOfTy | tyToEmitName | `arg: synthTypeRefTy(…)` | no | 1275 | build/sweep/witnesses/inventory/D15463.vl | `{[string]:(i32)=>i32}` |
-| emit_rewrite.vl:3186 | registerRetJoinUnions | monoPinSpellNoAnon | `store: jnm` | no | 42 | build/sweep/witnesses/inventory/D1622.vl | `((i32)=>i32)\|null` |
-| emit_sections.vl:10389 | tagRepNameOfTy | monoPinSpellShaped | `return` | no | 265 | build/sweep/witnesses/inventory/D15537.vl | `` |
-| emit_shape_intern.vl:277 | shapeWalkKeyOf | tyToNominalName | `nn → bind: ln; compare: "" \|\| kn != nn {; compare: {` | compare | 18306 | build/sweep/witnesses/inventory/D15456.vl | `` |
-| emit_shape_intern.vl:280 | shapeWalkKeyOf | tyToEmitName | `store: ln` | no | 6579 | build/sweep/witnesses/inventory/D15456.vl | `` |
-| emit_shape_intern.vl:296 | shapeWalkName | tyToNominalName | `return` | no | 18306 | build/sweep/witnesses/inventory/D15456.vl | `` |
-| emit_shape_intern.vl:745 | internArmShapeRow | tyToEmitName | `store: spell` | no | 2427 | build/sweep/witnesses/inventory/D155.vl | `{r:i32}` |
+| emit_rewrite.vl:1238 | synthTypeRefOfTy | tyToEmitName | `arg: synthTypeRefTy(…)` | no | 1287 | build/sweep/witnesses/inventory/D14941.vl | `(string)=>K` |
+| emit_rewrite.vl:3186 | registerRetJoinUnions | monoPinSpellNoAnon | `store: jnm` | no | 43 | build/sweep/witnesses/inventory/D1622.vl | `((i32)=>i32)\|null` |
+| emit_sections.vl:10389 | tagRepNameOfTy | monoPinSpellShaped | `return` | no | 273 | build/sweep/witnesses/inventory/D15042.vl | `` |
+| emit_shape_intern.vl:277 | shapeWalkKeyOf | tyToNominalName | `nn → bind: ln; compare: "" \|\| kn != nn {; compare: {` | compare | 18405 | build/sweep/witnesses/inventory/D14931.vl | `` |
+| emit_shape_intern.vl:280 | shapeWalkKeyOf | tyToEmitName | `store: ln` | no | 6617 | build/sweep/witnesses/inventory/D14931.vl | `` |
+| emit_shape_intern.vl:296 | shapeWalkName | tyToNominalName | `return` | no | 18405 | build/sweep/witnesses/inventory/D14931.vl | `` |
+| emit_shape_intern.vl:745 | internArmShapeRow | tyToEmitName | `store: spell` | no | 2432 | build/sweep/witnesses/inventory/D14978.vl | `{r:i32\|null}` |
 | emit_shape_rows.vl:1774 | fieldTypeRefusalMsg | tyToNominalName | `concat` | no | 0 |  | `` |
 | emit_shape_rows.vl:1858 | arrLitNulUnionElemName | tyToNominalName | `return` | no | 42 | build/sweep/witnesses/inventory/D15044.vl | `boolean\|i32\|null` |
 | emit_shape_rows.vl:1984 | arrLitMapElemName | tyToNominalName | `return` | no | 48 | build/sweep/witnesses/inventory/D15118.vl | `{[string]:i32}` |
 | emit_shape_rows.vl:2067 | fnElemNominalName | tyToNominalName | `fnm → compare: "" \|\| tyNomNameCycled() { return "" }; concat; return` | compare | 6 | build/sweep/witnesses/inventory/D9810.vl | `((A12)=>i32)\|null` |
 | emit_shape_rows.vl:2139 | arrLitNestedElemName | tyToNominalName | `return` | no | 31 | build/sweep/witnesses/inventory/D15204.vl | `i32[][]` |
-| emit_shape_rows.vl:2228 | nulRefElemEmitName | tyToNominalName | `nun → compare: "" && isUNameKeyAB(49, nulTy) { return nun }; return` | compare | 141 | build/sweep/witnesses/inventory/D15044.vl | `boolean\|i32\|null` |
-| emit_shape_rows.vl:2232 | nulRefElemEmitName | tyToNominalName | `return` | no | 803 | build/sweep/witnesses/inventory/D15550.vl | `f64\|null` |
-| emit_shape_rows.vl:2855 | fieldElemRowName | tyToNominalName | `n → compare: "" { return "" }; concat; return` | compare | 1240 | build/sweep/witnesses/inventory/D15548.vl | `` |
+| emit_shape_rows.vl:2228 | nulRefElemEmitName | tyToNominalName | `nun → compare: "" && isUNameKeyAB(49, nulTy) { return nun }; return` | compare | 142 | build/sweep/witnesses/inventory/D15044.vl | `boolean\|i32\|null` |
+| emit_shape_rows.vl:2232 | nulRefElemEmitName | tyToNominalName | `return` | no | 804 | build/sweep/witnesses/inventory/D15043.vl | `boolean\|null` |
+| emit_shape_rows.vl:2855 | fieldElemRowName | tyToNominalName | `n → compare: "" { return "" }; concat; return` | compare | 1249 | build/sweep/witnesses/inventory/D15095.vl | `O` |
 | emit_shape_rows.vl:2916 | shapeFieldElemName | tyToNominalName | `return` | no | 16 | build/sweep/witnesses/inventory/D3164.vl | `K[]` |
-| emit_shape_rows.vl:3221 | mvDeclNameOfValTy | tyToNominalNameAt | `return` | no | 3321 | build/sweep/witnesses/inventory/D15463.vl | `(i32)=>i32` |
-| emit_start_block.vl:507 | coalesceResultUnionName | unionSpellingOfTy | `nm → compare: UNION_SPELLING_DECLINE {; return` | compare | 1954 | build/sweep/witnesses/inventory/D15462.vl | `` |
-| emit_union_atoms.vl:626 | rlMintNameOfTy | rlRowNameOfTy | `return` | no | 1471 | build/sweep/witnesses/inventory/D15510.vl | `{fs:i32[]}` |
-| emit_union_atoms.vl:696 | ensureRefElemTys | rlRowNameOfTy | `inm → compare: "" { inm = rlRepRowNameOfTy(innerKindTy) }; compare: "" { inm = rlRowNameOfTy(tyStepElem(tyPeel` | compare | 612 | build/sweep/witnesses/inventory/D15779.vl | `` |
+| emit_shape_rows.vl:3221 | mvDeclNameOfValTy | tyToNominalNameAt | `return` | no | 3330 | build/sweep/witnesses/inventory/D14971.vl | `i32` |
+| emit_start_block.vl:507 | coalesceResultUnionName | unionSpellingOfTy | `nm → compare: UNION_SPELLING_DECLINE {; return` | compare | 1967 | build/sweep/witnesses/inventory/D15020.vl | `` |
+| emit_union_atoms.vl:626 | rlMintNameOfTy | rlRowNameOfTy | `return` | no | 1475 | build/sweep/witnesses/inventory/D14978.vl | `Circle` |
+| emit_union_atoms.vl:696 | ensureRefElemTys | rlRowNameOfTy | `inm → compare: "" { inm = rlRepRowNameOfTy(innerKindTy) }; compare: "" { inm = rlRowNameOfTy(tyStepElem(tyPeel` | compare | 615 | build/sweep/witnesses/inventory/D1513.vl | `{y:i32,x:i32}` |
 | emit_union_atoms.vl:698 | ensureRefElemTys | rlRowNameOfTy | `store: inm` | no | 5 | build/sweep/witnesses/inventory/D15350.vl | `{f:i32}` |
-| emit_union_atoms.vl:1368 | cloSigTagSlotOfTy | cloSigNameOfTy | `nm → compare: "" { return -1 }; push: cloSigTagNames.push(…)` | push | 91 | build/sweep/witnesses/inventory/D15581.vl | `(i32)=>K0` |
-| emit_union_atoms.vl:1460 | mintValueUnionRowOfTy | canonUnionKeyTextOfTy | `text → compare: "" { return 0 }; arg: isValueUnionName(…); arg: pushValueUnionRow(…)` | yes, via pushValueUnionRow | 9119 | build/sweep/witnesses/inventory/D15480.vl | `` |
-| emit_union_atoms.vl:1476 | valueUnionKeyTextOfTy | canonUnionKeyTextOfTy | `text → compare: "" { return "" }; arg: isValueUnionName(…); return` | compare | 9751 | build/sweep/witnesses/inventory/D15480.vl | `` |
-| emit_union_atoms.vl:1489 | valueUnionNameOfTy | unionSpellingOfTy | `text → compare: UNION_SPELLING_DECLINE \|\| spellingValueUnionVerdict(ty, 8) !; return` | compare | 8520 | build/sweep/witnesses/inventory/D15462.vl | `` |
-| emit_union_atoms.vl:1633 | unionPartSpelling | canonUnionKeyAtomOfTy | `return` | no | 585 | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}[]` |
-| emit_union_atoms.vl:1635 | unionPartSpelling | cloSigNameOfTy | `sig → compare: "" { return UNION_SPELLING_DECLINE }; concat` | compare | 103 | build/sweep/witnesses/inventory/D15581.vl | `(i32)=>K0` |
-| emit_union_atoms.vl:1795 | specPart | canonUnionKeyAtomOfTy | `concat` | no | 536 | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}[]` |
-| emit_union_atoms.vl:1799 | specPart | cloSigNameOfTy | `sig → compare: "" { return false }; concat` | compare | 102 | build/sweep/witnesses/inventory/D15581.vl | `(i32)=>K0` |
-| emit_union_atoms.vl:2048 | forceRefListOfTy | rlRowNameOfTy | `arg: ensureRefElemTys(…)` | no | 89 | build/sweep/witnesses/inventory/D1442.vl | `i64\|boolean` |
-| emit_union_registry.vl:515 | unRowOfTyWide | canonUnionKeyTextOfTy | `compare: "" { return -1 }` | compare | 7901 | build/sweep/witnesses/inventory/D15456.vl | `` |
+| emit_union_atoms.vl:1368 | cloSigTagSlotOfTy | cloSigNameOfTy | `nm → compare: "" { return -1 }; push: cloSigTagNames.push(…)` | push | 92 | build/sweep/witnesses/inventory/D15581.vl | `(i32)=>K0` |
+| emit_union_atoms.vl:1460 | mintValueUnionRowOfTy | canonUnionKeyTextOfTy | `text → compare: "" { return 0 }; arg: isValueUnionName(…); arg: pushValueUnionRow(…)` | yes, via pushValueUnionRow | 9165 | build/sweep/witnesses/inventory/D14931.vl | `` |
+| emit_union_atoms.vl:1476 | valueUnionKeyTextOfTy | canonUnionKeyTextOfTy | `text → compare: "" { return "" }; arg: isValueUnionName(…); return` | compare | 9778 | build/sweep/witnesses/inventory/D14974.vl | `` |
+| emit_union_atoms.vl:1489 | valueUnionNameOfTy | unionSpellingOfTy | `text → compare: UNION_SPELLING_DECLINE \|\| spellingValueUnionVerdict(ty, 8) !; return` | compare | 8581 | build/sweep/witnesses/inventory/D14941.vl | `` |
+| emit_union_atoms.vl:1633 | unionPartSpelling | canonUnionKeyAtomOfTy | `return` | no | 591 | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}[]` |
+| emit_union_atoms.vl:1635 | unionPartSpelling | cloSigNameOfTy | `sig → compare: "" { return UNION_SPELLING_DECLINE }; concat` | compare | 104 | build/sweep/witnesses/inventory/D15581.vl | `(i32)=>K0` |
+| emit_union_atoms.vl:1795 | specPart | canonUnionKeyAtomOfTy | `concat` | no | 542 | build/sweep/witnesses/inventory/D15530.vl | `{f:()=>boolean}[]` |
+| emit_union_atoms.vl:1799 | specPart | cloSigNameOfTy | `sig → compare: "" { return false }; concat` | compare | 103 | build/sweep/witnesses/inventory/D15581.vl | `(i32)=>K0` |
+| emit_union_atoms.vl:2048 | forceRefListOfTy | rlRowNameOfTy | `arg: ensureRefElemTys(…)` | no | 89 | build/sweep/witnesses/inventory/D2484.vl | `((i32)=>i32)` |
+| emit_union_registry.vl:515 | unRowOfTyWide | canonUnionKeyTextOfTy | `compare: "" { return -1 }` | compare | 7922 | build/sweep/witnesses/inventory/D14972.vl | `` |
 | wasmEmit.vl:4640 | nulNicheIsTestImpossible | tyToEmitName | `concat` | no | 0 |  | `` |
-| wasmEmit.vl:6183 | mapSoftTwinTagFail | tyToEmitName | `concat` | no | 0 |  | `` |
-| wasmEmit.vl:9814 | boxDstName | unionSpellingOfTy | `sp → compare: UNION_SPELLING_DECLINE && spellingValueUnionVerdict(ty, 8) =; return` | compare | 6084 | build/sweep/witnesses/inventory/D15480.vl | `` |
+| wasmEmit.vl:6183 | mapSoftTwinTagFail | tyToEmitName | `concat` | no | 2 | tests/cases/generics/error-literal-union-map-twin-through-one-instance-plain-first.vl | `{[i32]:i32}` |
+| wasmEmit.vl:9814 | boxDstName | unionSpellingOfTy | `sp → compare: UNION_SPELLING_DECLINE && spellingValueUnionVerdict(ty, 8) =; return` | compare | 6092 | build/sweep/witnesses/inventory/D14978.vl | `` |
 | wasmEmit.vl:22001 | emitMapUnionPayloadTail | tyToEmitName | `concat` | no | 0 |  | `` |
 
 ## The census's sites no program reaches
