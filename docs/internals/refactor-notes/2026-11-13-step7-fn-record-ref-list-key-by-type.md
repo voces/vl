@@ -31,8 +31,9 @@ with the type key. 46 programs reach a decline: 33 agree and 13 disagree. The di
 | `ann` | 1 | `{fs:((i32)=>i32)[],x:i32}` | a generic instance (`d15296_bound_returned`) |
 
 In the `shapeelem` class the name key is wrong: it files the list under a declared type of another
-signature. A second probe shows the row the call mints there is not read by the emitted module,
-so neither key moves the output.
+signature. A second probe shows that the key the row is minted under does not move the output.
+The row itself is load-bearing: it is D1511's empty-literal shape rescue, and deleting the rescue
+loses 16 programs (9 plain shapes, 7 function-holding records; sweep of 2026-11-13).
 
 ## Probe 2: unhinted `rlInternNameTyK` reach
 
