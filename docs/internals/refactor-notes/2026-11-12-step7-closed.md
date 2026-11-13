@@ -47,11 +47,10 @@ lane H's `variantNestedRow` lookup (#7679). Then lane B's `structRowOfSpelling` 
 
 | lane | sites |
 | --- | --- |
-| E | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; all in the D6 re-key (E and F co-own; F's step 1a is #7689), with the D6 interner's `nm` input, which `variantNestedRow` and `armFieldStructRowMinted` hand it |
-| G | `unionNameOfCall`; `unionNameOfExpr`'s 7 call sites: 4 in its own producer (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2), `printUnionPlanCode` (#7690) |
+| E | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; all in the D6 re-key (E and F co-own; F's step 1a is #7689; E on 2b, nested and arm rows by type, F on the walk), with the D6 interner's `nm` input, which `variantNestedRow` and `armFieldStructRowMinted` hand it |
+| G | `unionNameOfCall`; `unionNameOfExpr`'s 7 call sites: 4 in its own producer (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2), `printUnionPlanCode` (#7690); `emitUnionUnionEq` ×2 (moved from lane A: a literal set needs a widened rep, a union-type question) |
 | D | mono's typed instance key (#7699 merged: the four instance registries are off spellings, leaving `sNameIx` the one spelling-keyed registry): `monoSigPinDiscrim` reaches 0 programs and is deleted next cut; `monoAnonPinDiscrim` (7,481 shape-rung decisions in 2,415 programs; the typed test disagrees on 96 in 51) converts to the pin's type; `monoTypedExtra` (5 decisions, 3 programs) converts or is filed |
 | G | `utkAtomText`, the last `sNameIx` reader with a spelling (convert or contract, #7685's note) |
-| A | `emitUnionUnionEq`'s two `unionNameOfExpr` calls (wasmEmit.vl), queued since #7686 |
 | H | `printUnionPlanCode`'s name fallbacks: #7690, open (24 → 2; the 2 filed as D16060) |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
