@@ -314,3 +314,49 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    "render-parse ratchet: a render-fed key grades its site render, and a stale one fails",
+  ignore: !ENABLED,
+  async fn() {
+    const real = await census(["--parsers"]);
+    const parsers = real.out.trim().split(/\r?\n/).filter((l) => l);
+    const extras = parsers.filter((p) => !TYNAME.includes(`function ${p}(`));
+    const dir = await Deno.makeTempDir({ prefix: "vl_render_parse_fed_" });
+    try {
+      await writeTree(dir, extras, "");
+      await Deno.mkdir(`${dir}/scripts`);
+      await Deno.writeTextFile(
+        `${dir}/scripts/render-parse-origins.txt`,
+        "source\tcompiler/emit_map_twins.vl\tunionHasBoolLeafArm\tboolLeafListDepthOfName\t0\n",
+      );
+      await Deno.writeTextFile(
+        `${dir}/compiler/emit_map_twins.vl`,
+        `function unionHasBoolLeafArm(arms: string[]) {\n  boolLeafListDepthOfName(arms[0])\n}\n`,
+      );
+      const fed = await census(["--list", "ty-string-parse", "--root", dir]);
+      const want =
+        "compiler/emit_map_twins.vl:2  unionHasBoolLeafArm  boolLeafListDepthOfName";
+      if (fed.code !== 0 || fed.out.trim() !== want) {
+        throw new Error(
+          `render-fed: want ${want}, got rc ${fed.code} ${fed.out}`,
+        );
+      }
+      await Deno.writeTextFile(
+        `${dir}/compiler/emit_map_twins.vl`,
+        `function unionHasBoolLeafArm(arms: string[]) { 0 }\n`,
+      );
+      const stale = await census(["--list", "--root", dir]);
+      if (
+        stale.code !== 1 || !stale.out.includes("RENDER_FED names no live site")
+      ) {
+        throw new Error(
+          `stale render-fed key: want rc 1, got rc ${stale.code} ${stale.out}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

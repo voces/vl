@@ -26,7 +26,7 @@ The other seven callers read the names and stay: `memReadBoxPlan` ×2, `boxNarro
 `emitBoxAtomRetagTys` ×2 (A), `msFreeSliceOfTy` (G). The `ty-string-parse` total is unchanged at
 18; the baseline moves one entry from emit_collect (4 → 3) to check_program (0 → 1). The stale
 `riuMemberTys` row is dropped from `render-parse-origins.txt` and `render-parse-sites.md` by hand;
-the origins were not regenerated.
+the origins were not regenerated. (The `ty-string-parse` total is then 19, below.)
 
 ## Control
 
@@ -34,3 +34,13 @@ the origins were not regenerated.
 name-reading caller, a `[]` argument and a walk: only the walk and the name-reader are listed, and
 a walk with no `canonEmitNameAt` lists no walk site. On the census before this change the same test
 fails, listing all three callers and no walk.
+
+## A site fed by a render by construction
+
+`unionHasBoolLeafArm` → `boolLeafListDepthOfName` (emit_map_twins) reads arm atoms that
+`unionTyArms` renders from the union's type, but the corpus probe graded it source because each
+atom also appears in the program's text. The parent-grade note listed it as failing by hand. The
+census now holds such sites in `RENDER_FED` (file, function, callee, ordinal), graded render over
+the origins file, and fails on a key with no live site, so the entry is dropped in the PR that
+converts the site (E's). Effect: `ty-source-parse` 4 → 3, `ty-string-parse` 18 → 19 (emit_map_twins
+0 → 1). `ifExprNliName`, the other one listed then, is no longer a census site.
