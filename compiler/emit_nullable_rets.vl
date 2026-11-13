@@ -152,7 +152,6 @@ import {
   uVariants,
   unNames,
 } from "./emit_state"
-import { emitFail } from "./emit_bytes"
 import { i32ListHas } from "./listutil"
 import { emitPassGen, memoKeyNew, memoMoved, memoPassMoved } from "./memo"
 import { nonNullTy } from "./tyquery"
@@ -503,21 +502,17 @@ export function retStructRowIndex(tyIx: i32) {
     const sr = if st >= 0 && st != tagged { structRowOfRecordTy(st) } else { -1 }
     if sr >= 0 { return sr }
   }
-  const tr = retStructRowOfTy(tyIx)
-  // An `#anonN` reference names the row its literal is built at, which the type need not key
-  // while that literal is built at its own fields' row (D16020): the label wins a disagreement.
+  // A literal's pin is typed at the literal's own record, whose anonymous row holds that very
+  // type: a declared row of an equal type need not share its layout (D16020). A pin forwarded
+  // from another instance's parameter holds only the placeholder type, and its label names
+  // the row (D16021).
   if ty is TypeRef && nameIsAnonHandle(ty.tyName) {
+    const ar = sAnonRowByTy(anonPinLitTy[tyIx] ?? -1)
+    if ar >= 0 { return ar }
     const lr = structIndexByName(ty.tyName)
-    if lr >= 0 && lr != tr {
-      if tr < 0 {
-        emitFail(
-          "an anonymous record reference names a row no type keys (D16020)",
-        )
-      }
-      return lr
-    }
+    if lr >= 0 { return lr }
   }
-  tr
+  retStructRowOfTy(tyIx)
 }
 
 // The struct row the type recorded at `tyIx` keys, or -1: the declared-name, arena-type and
@@ -605,12 +600,24 @@ export function tyAnnRefListSlot(tyIx: i32) {
   0
 }
 
+// The literal type an `#anonN` pin node stands for, by node: the identity its anonymous row is
+// recorded at, which the node's checker type (a placeholder) does not carry. -1 for other nodes.
+let anonPinLitTy: {[i32]: i32} = Map()
+
+// Forgets every pin's literal type: node indices are this program's. Called from
+// `emitProgramReset`, which runs before any pass that synthesizes a pin.
+export function resetAnonPinLitTy() {
+  anonPinLitTy = Map()
+  0
+}
+
 // An emitter-synthesized type-annotation node (a mono clone, an inferred-list synthesis, a
 // contextual return/param pin) spelled `name` and typed `tyIx`, the type the caller holds. The
 // spelling derives from the type and is never parsed back: where `tyIx` is -1 the node records
 // only the placeholder `name`'s provenance names (`pinKindOfName`).
 export function synthTypeRefTy(name: string, pos: i32, tyIx: i32) {
   const n = mkTypeRef(name, pos)
+  anonPinLitTy[n] = -1
   const root = tyTsExact(tyIx)
   if root >= 0 { setAnnTs(n, root) }
   // A pin kind is read only where the type is unknown.
@@ -623,6 +630,7 @@ export function synthTypeRefTy(name: string, pos: i32, tyIx: i32) {
 // For a caller holding no type the pin denotes; see `recordClonedNodeTyFb`.
 export function synthTypeRefFb(name: string, pos: i32, tyFb: i32) {
   const n = mkTypeRef(name, pos)
+  anonPinLitTy[n] = if pinKindOfName(name) == PIN_ANON { tyFb } else { -1 }
   recordClonedNodeTyFb(n, name, pinKindOfName(name), tyFb)
   n
 }
@@ -985,7 +993,7 @@ export function repABNote(family: string, ladder: string, desc: string) {
   0
 }
 
-// Reported once per program beside `unionRegistryABSweep`, after `repShadowSweep` has reset
+// Reported once per program, after `repShadowSweep` has reset
 // the bucket table — a bump during emit would not survive that reset.
 export function repLadderABSweep() {
   if !repShadowOn { return 0 }

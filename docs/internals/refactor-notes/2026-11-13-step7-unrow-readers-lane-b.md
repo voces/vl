@@ -25,8 +25,8 @@ moves the outcome: the sweep below is identical.
 - `unionArmTagClash(unionTy)` drops its spelling parameter. A union type flattens its variants,
   and any other type reads the row its key reaches.
 - The three unreached rungs fail loudly with a sentence naming the missing record.
-- Deleted: `unionHasAtomTy`, `unMemHasAtom`, `unABAtomRetry`, `unionRowOfSpellingTy` and the
-  `atomRetry` id-hit/id-miss counters, which only that retry fed.
+- Deleted: `unionHasAtomTy` and `unMemHasAtom`. Lane G's #7746 retired the atom-test retry
+  instrument they fed (`unABAtomRetry`, `unionRowOfSpellingTy`) while this was in flight.
 
 ## Measured
 

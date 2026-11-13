@@ -1,0 +1,3 @@
+## Infrastructure (Track F)
+
+- **Step 7: the render-parse census counts every type-string parser the emitter calls, and grades each by where its input came from.** Its parser set is every `tyname.vl` grammar export plus a checked list of the parsers outside it (`nameToTy`, `valueAtomKind`, `isValueUnionName`, `resolveAnnot` and others), and `check_emit_queries.vl` is in scope. A listed parser that no longer exists fails the census. `scripts/render-parse-origins.ts` probes which sites receive a render or a synthesized name, and the census ratchets those (69), source-text parses (25, an upper bound) and ungraded ones (55) apart. Before this change it reported 1 parse.
