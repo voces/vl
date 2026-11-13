@@ -25,8 +25,13 @@ different keys, so there is none, and `monoTagMapRepTy`'s reach is unchanged:
    to the element's type.
 
 4. **`nonNulBaseOf` is deleted** (`emit_map_value_slots.vl`). Its only caller was D16040's name
-   lookup. It held the emitter's last type-string parse, so the render-parse census reads
-   **0 type-string parses** (was 1) and 8 `tyToEmitName` calls, and the baseline is lowered.
+   lookup, and its `nullablePartOf(name)` was a parse of a stored name. In #7748's re-graded
+   census, type-string parses go from 69 to 66 and ungraded parses from 55 to 54.
+   - This PR removes 1 of those: `nullablePartOf(name)`.
+   - #7747 removed the other two type-string parses (in `emit_shape_intern.vl`) and the
+     ungraded one (in `emit_shape_rows.vl`). It merged after #7748 recorded its baseline.
+
+   The baseline is lowered over all of them, in #7748's four-code structure.
 
 ## Decision tables
 
