@@ -273,8 +273,10 @@ A registry is keyed by a type key, an identifier, literal content or an index me
 type's spelling (`scripts/registry-census.vl`). `cloSigPosBy` is keyed by the `$fnsig` key built
 from rep tokens, so it is a type key. Three keys look like spellings and are not:
 
-- **An `#anonN` handle** is a record literal's row identity, minted with the row. It is the row's
-  own key, not a spelling of a type (`anonRowTyOfName`, `anonPinRow`).
+- **`sNameIx`** maps a struct row's own name to the row: a declared record's name, an identifier,
+  or the `#anonN` handle a record literal's mint gave it, which is the row's own key, not a
+  spelling of a type (`anonRowTyOfName`, `anonPinRow`)
+  ([contract](internals/refactor-notes/2026-11-12-step7-snameix-contract.md)).
 - **The spelling index** (`unNameAdoptTyKeyRow`, `annShapeIndexOf`) resolves a source name to the
   row its type found. It answers an identifier, never a type question.
 - **A type parameter's name** is an identifier. Whether a declared record shadows it is a scoping

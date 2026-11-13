@@ -32,7 +32,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 
 | contract | where §3.3/§3.4 states it | sites | cites |
 | --- | --- | --- | --- |
-| an `#anonN` handle is the literal row's identity | §3.3 registries | `anonRowTyOfName`, `anonPinRow`, `retStructRowIndex`'s `#anon` rung | #7414, #7546; D15646, D2762 |
+| `sNameIx` maps a row's own name (an identifier or an `#anonN` handle) to the row, #7685 | §3.3 registries | `anonRowTyOfName`, `anonPinRow`, `retStructRowIndex`'s `#anon` rung | #7414, #7546; D15646, D2762 |
 | the spelling index resolves a source name to its row | §3.3 registries | `unNameAdoptTyKeyRow`, `annShapeIndexOf` (untyped shapes) | `2026-11-12-step7-union-reg-riu-value-union.md`, `2026-11-12-step7-shape-layout-id.md` |
 | a type parameter's name is an identifier; shadowing is a scoping question | §3.3 registries | `monoElabCompositeTy` | lane D, 2026-11-12 |
 | `tySame` plus the function sets | §3.3 registries | `sRowElemRepSame`, `fnSetsAgree` | `2026-11-12-step7-struct-name-producers-cut-2.md` |
@@ -50,6 +50,7 @@ lane H's `variantNestedRow` lookup (#7679). Then lane B's `structRowOfSpelling` 
 | E | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; all in the D6 re-key (E and F co-own; F's step 1a is #7689), with the D6 interner's `nm` input, which `variantNestedRow` and `armFieldStructRowMinted` hand it |
 | G | `unionNameOfCall`; `unionNameOfExpr`'s 7 call sites: 4 in its own producer (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2), `printUnionPlanCode` (#7690) |
 | D | mono's typed instance key (#7699 merged: the four instance registries are off spellings, leaving `sNameIx` the one spelling-keyed registry): `monoSigPinDiscrim` reaches 0 programs and is deleted next cut; `monoAnonPinDiscrim` (7,481 shape-rung decisions in 2,415 programs; the typed test disagrees on 96 in 51) converts to the pin's type; `monoTypedExtra` (5 decisions, 3 programs) converts or is filed |
+| G | `utkAtomText`, the last `sNameIx` reader with a spelling (convert or contract, #7685's note) |
 | A | `emitUnionUnionEq`'s two `unionNameOfExpr` calls (wasmEmit.vl), queued since #7686 |
 | H | `printUnionPlanCode`'s name fallbacks: #7690, open (24 → 2; the 2 filed as D16060) |
 
