@@ -34,4 +34,4 @@ Order does not matter: the names are put in canonical order (`fieldNameOrder`) a
   bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
 - `scripts/gate.sh`: all rows pass.
 - Render-parse census: four `ty-string-parse` entries leave: three in `shapeInnerFieldSplit`'s
-  body (emit_base) and its call (emit_shape_intern). The compiler total goes from 29 to 25.
+  body (emit_base) and its call (emit_shape_intern). The compiler total goes from 26 to 22.
