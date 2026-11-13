@@ -313,7 +313,7 @@ The close carries 9 rows. Three of them hold the census's 4 floor sites, the `ty
 | [D15976](../inventory/D15976.md) | `emitObj` → `fieldRowKindIn` | a record field's un-annotated `[]`-or-`null` join reaches emit with its element hole unfilled |
 | [D16010](../inventory/D16010.md) | `sLitMintRow` | a hole instance's record literal has no elaborated type, so it builds at its minted row |
 | [D16052](../inventory/D16052.md) | `msFreeSliceOfTy` (emit_union_registry:772) | a row-less member slice keeps its members' canon spellings as an atom column that readers decide by |
-| D16042 (unfiled: D16042, filed by #7848) | `call_bind_shadow`'s armed-only instrument | it parses mono's binding spelling for the shadow's lifetime; an instrument, armed only, with no compile effect, and outside the census, which scans emitter files only |
+| [D16042](../inventory/D16042.md) | `call_bind_shadow`'s armed-only instrument | it parses mono's binding spelling for the shadow's lifetime; an instrument, armed only, with no compile effect, and outside the census, which scans emitter files only |
 | [D16060](../inventory/D16060.md) | `printUnionPlanCode`'s name fallback | a field read through an un-annotated parameter stays typed at the hole in its instance |
 | [D16012](../inventory/D16012.md) | `letDeclResolveAnnot`'s residual re-parse | it re-parses only when two bound type parameters share a name or a type variable survives `substTyDeep`, where substitution by name can answer a concrete but wrong type; a checker gap (`generics/nested-generic-shadowed-param-capture.vl`) |
 | [D16063](../inventory/D16063.md) | three inferred-return namers (check time) | they decide value-union-ness by parsing the name they just rendered; checker-only |
