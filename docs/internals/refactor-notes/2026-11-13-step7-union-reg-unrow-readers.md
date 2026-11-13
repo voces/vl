@@ -23,5 +23,8 @@ the registered name.
 
 ## Proof
 
-- **Seed:** fixpoint.
+- **Seed:** fixpoint, before and after merging master.
+- **Locally:** lint-self, regress (no runs lost), rep-fuzz (exact), check-filed-witnesses `--strict`
+  (4,866 graded, 0 moved), late-demands (8, baseline 8), seed-size (+1.8%), and the comment,
+  ladder, sentinel and scan budgets.
 - **The full sweep:** CI's `sweep` label.
