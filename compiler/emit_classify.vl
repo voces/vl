@@ -232,6 +232,7 @@ import {
   tySame,
   tyScalarBaseIs,
   tyScalarBasePrim,
+  unionAliasDeclNameOfTy,
 } from "./check_types"
 import { cexLitPeel } from "./check_num_lits"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
@@ -883,6 +884,7 @@ import {
   unionClosureArrElemUnion,
   unionNameOfVariant,
   unionSpellingOfTy,
+  valueUnionKeyTextOfTy,
   valueUnionNameOfSoftTy,
   valueUnionNameOfTy,
 } from "./emit_union_atoms"
@@ -4603,6 +4605,10 @@ let memFieldRowCur = -1
 
 // The row behind the name the last completed `memberUnionFieldNameRead` returned, or -1.
 let memFieldRowOut = -1
+
+// `memFieldRowOut`, for a reader beside the member read: the union row the last completed
+// `memberUnionFieldNameRead` keyed, -1 for a narrowed read or none.
+export function memberUnionFieldRowRead(): i32 { memFieldRowOut }
 
 // Variant `vi`'s field `fi` element union name, with the row its element type keys to recorded.
 function memVariantFieldName(vi: i32, fi: i32): string {
@@ -9891,15 +9897,10 @@ function unionNameOfHoleReadGo(atIx: i32, fnIx: i32) {
       if pIx >= 0 && !fnBlockShadowsAt(fnIx, sid, atIx) {
         const p = nodeAt(pIx)
         if p is Param {
-          // The registry-membership test via the canon-keyed index instead of a spelling's
-          // linear scan over `unNames`: same question, same name returned, on interned ids.
-          // The spelling renders only once the row exists, since a non-union param drops it.
-          // An un-annotated parameter names the row its recorded type keys.
+          // A parameter names the row its annotation or recorded type keys, by the canon-keyed
+          // index; a non-union parameter keys none.
           const pur = unRowOfCanonFolded(annRowOfNode(parTyNode(pIx)))
-          if pur >= 0 {
-            if p.parType < 0 && pur < unNames.length { return unNames[pur] }
-            return tyNameOf(p.parType)
-          }
+          if pur >= 0 && pur < unNames.length { return unNames[pur] }
           return ""
         }
       }
@@ -9993,9 +9994,15 @@ function letUnionNameOfHole(letIx: i32, fnIx: i32): string {
   n
 }
 
-// The union name of a `LetDecl`: its annotation when that names a union, else the
-// union its (un-annotated) initializer produces (`const r = pick(true)`).
+// The union name of a `LetDecl`: the union its binding's type names (`unionNameOfTyForBox`),
+// else, where no type names one, its annotation or its initializer's union by `letUnionNameOfGo`.
 export function letUnionNameOf(letIx: i32, fnIx: i32) {
+  const bt = letBindTy(letIx, fnIx)
+  const tn = unionNameOfTyForBox(bt)
+  if tn != "" {
+    letRowOut = unRowOfTyKey(bt)
+    return tn
+  }
   const outer = letRowLast
   letRowLast = -1
   const n = letUnionNameOfGo(letIx, fnIx)
@@ -10239,16 +10246,72 @@ let unNameRowLast = -1
 // The row behind the name the last completed `unionNameOfExpr` call returned, or -1.
 let unNameRowOut = -1
 
-// `unionNameOfExpr`, with the row behind the name pushed onto `rowOut` (-1 when the rung that
-// answered named its union by spelling alone).
+// The union `exprIx`'s box is built in, named off its box type, else off its own type, with the
+// row that type keys pushed onto `rowOut`; a nullable's miss names its non-null part's union. Where
+// no type names one, `unionNameOfExprFloor` answers, its row beside it (-1 when it read a spelling).
 export function unionNameRowOfExpr(
   exprIx: i32,
   fnIx: i32,
   rowOut: i32[],
 ): string {
-  const n = unionNameOfExpr(exprIx, fnIx)
-  rowOut.push(if n != "" { unNameRowOut } else { -1 })
-  n
+  let t = unionBoxTyIxOfExpr(exprIx, fnIx)
+  let n = unionNameOfTyForBox(t)
+  if n == "" {
+    t = nodeTyAt(unwrapParen(exprIx), fnIx)
+    n = unionNameOfTyForBox(t)
+  }
+  if n != "" {
+    rowOut.push(unRowOfTyKey(t))
+    return n
+  }
+  // A nullable no union names, a union-valued map's read with its miss, rides its non-null
+  // part's box with `null` as its tag (D1009); a literal union's nullable is a niche, not a box.
+  const nn = nullableBoxTy(
+    unionBoxTyIxOfExpr(exprIx, fnIx),
+    unwrapParen(exprIx),
+    fnIx,
+  )
+  if nn >= 0 {
+    rowOut.push(unRowOfTyKey(nn))
+    return unionNameOfTyForBox(nn)
+  }
+  const f = unionNameOfExprFloor(exprIx, fnIx)
+  rowOut.push(if f != "" { unNameRowOut } else { -1 })
+  f
+}
+
+// The non-null part of box type `bt`, else of node `u`'s type, where that part names a union and
+// is not a literal union; -1 where neither does.
+function nullableBoxTy(bt: i32, u: i32, fnIx: i32): i32 {
+  const b = nullablePartNamingUnion(bt)
+  if b >= 0 { return b }
+  nullablePartNamingUnion(nodeTyAt(u, fnIx))
+}
+
+// The non-null part of nullable type `t` where it names a union and is not a literal union, or -1.
+function nullablePartNamingUnion(t: i32): i32 {
+  if t < 0 { return -1 }
+  const inner = nonNullTy(t)
+  if inner == t || tyIsLitUnion(inner) { return -1 }
+  if unionNameOfTyForBox(inner) == "" { return -1 }
+  inner
+}
+
+// The union a box of type `t` is built in: the row its key finds, named as registered, else its
+// value-union key, else the union alias its declaration names; "" where `t` names none.
+export function unionNameOfTyForBox(t: i32): string {
+  if t < 0 { return "" }
+  const r = unRowOfTyKey(t)
+  if r >= 0 && r < unNames.length { return unNames[r] }
+  const v = valueUnionKeyTextOfTy(t)
+  if v != "" { return v }
+  unionAliasDeclNameOfTy(t)
+}
+
+// The union no type names: a function value's nullable, whose box is keyed by its set (a
+// function-value-set row has no element type).
+function unionNameOfExprFloor(exprIx: i32, fnIx: i32): string {
+  unionNameOfExpr(exprIx, fnIx)
 }
 
 // The arms of union type `ty`: each member's atom into `atoms` and its variant row into `rows`,

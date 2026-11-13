@@ -1,4 +1,4 @@
-import { cUserTypes } from "./check_types"
+import { cUserTypes, unionAliasDeclNameOfTy } from "./check_types"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import { armRowTysOfUnionTy, armRowsOfUnionTy } from "./emit_classify"
 import { unMemPeelAliasWrapper } from "./emit_union_tykey_text"
@@ -1145,7 +1145,6 @@ import {
   tyIsBareStrLit,
   unionBoxStoreTyOf,
   unionBoxTyIxOfExpr,
-  unionNameOfExpr,
   unionNameOfRead,
   unionNameRowOfExpr,
 } from "./emit_classify"
@@ -1384,7 +1383,6 @@ import {
   rlWidenAllowed,
   rlWidenTagOf,
 } from "./emit_ref_list_kinds"
-import { internInlineShapeTy } from "./emit_shape_intern"
 import {
   ALK_F64,
   ALK_I64,
@@ -1434,7 +1432,6 @@ import {
   rlElemTyIxAt,
   rlSlotOfTy,
   sFieldIndex,
-  uFieldElemTyIxRow,
 } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
@@ -1487,7 +1484,6 @@ import {
   unionRefArrayArmSlotForElem,
   unionRefArrayArmSlotForMapElem,
   unionRefArrayArmSlotForNestedElem,
-  unionSetHasAtom,
   unionSpellingOfTy,
   valueUnionKeyTextOfTy,
   valueUnionNameOfTy,
@@ -1544,7 +1540,6 @@ import {
   unionArmsOf,
   unionArmsOfSet,
   unionArmsOfTy,
-  unionHasAtomAB,
   unionHasAtomOfTy,
   unionMemberAtomsOf,
   unionMemberSetOf,
@@ -9749,6 +9744,27 @@ function nulNoneEqSides(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
   nulNoneEqSide(leftIx, fnIx) && nulNoneEqSide(rightIx, fnIx)
 }
 
+// Whether union type `ty` has an arm of value kind `vak`, by its member set's banked kinds: 0 only
+// when every member is a bare primitive or `null` and none is `vak`. A set the bank does not
+// cover, or a member a kind cannot rule out (a record, list, closure or nested union), answers 1.
+function unionTyHasValueKind(ty: i32, vak: i32): i32 {
+  const ks: i32[] = []
+  if !msMemberValKindsOf(msSetOfTyAny(ty), ks) || ks.length < 2 { return 1 }
+  for k in ks {
+    if k == vak || !valueKindIsPlainScalar(k) { return 1 }
+  }
+  0
+}
+
+// Whether value kind `k` is a bare primitive or `null`, which a kind compare can decide.
+function valueKindIsPlainScalar(k: i32): boolean {
+  if k < 0 { return false }
+  for p in ["i32", "i64", "f32", "f64", "boolean", "string", "u8", "null"] {
+    if valueAtomKind(p) == k { return true }
+  }
+  false
+}
+
 // The union a box is built into, from its type `ty`: the row `ty` keys to, named as registered,
 // unless `name` already names that row in any of its spellings; a value union keyed by no row,
 // by its spelling. `name` only where `ty` gives neither.
@@ -11128,7 +11144,7 @@ function emitStructUnionEq(
   const arms: string[] = []
   const vis: i32[] = []
   const aks: i32[] = []
-  if !unionBoxEqColumns(uname, uty, arms, vis, aks) { return -1 }
+  if !unionBoxEqColumns(uty, arms, vis, aks) { return -1 }
   // Both operands ride the wasm stack until both are computed, and only then are they parked.
   // These slots are shared per function, so a left operand parked before the right one is
   // evaluated is a value the right one's code can overwrite — a nested union `==` re-enters this
@@ -11143,12 +11159,12 @@ function sFieldElemTyIxOfRow(ufi: i32): i32 {
   if ufi >= 0 && ufi < sFieldElemTyIx.length { sFieldElemTyIx[ufi] } else { -1 }
 }
 
-// The arm columns of a box `==` over union type `uty` (named `uname`), index-parallel to `arms`:
-// a struct arm carries its variant row in `vis` and -1 in `aks`, a scalar arm the reverse. False
-// declines before any byte is written, so an arm set the lowering cannot serve keeps its caller's
-// loud refusal.
+// The arm columns of a box `==` over union type `uty`, index-parallel to `arms`: a struct arm
+// carries its variant row in `vis` and -1 in `aks`, a scalar arm the reverse. False declines
+// before any byte is written, so an arm set the lowering cannot serve keeps its caller's loud refusal.
+const UNION_BOX_EQ_NO_ARMS_MSG = "emitProgram: a union box compared with `==` has no type to read its arms from"
+
 function unionBoxEqColumns(
-  uname: string,
   uty: i32,
   arms: string[],
   vis: i32[],
@@ -11165,8 +11181,7 @@ function unionBoxEqColumns(
       k = k + 1
     }
   } else {
-    // Every `==` operand union carries a type that resolves its arms.
-    emitFail("emitProgram: a union `==` operand has no type that resolves its arms")
+    emitFail(UNION_BOX_EQ_NO_ARMS_MSG)
     return false
   }
   if arms.length < 2 { return false }
@@ -11577,12 +11592,12 @@ function variantFieldComparable(vi: i32, ufi: i32): boolean {
 // Can the shared box core serve every arm of a code-16 variant field's union? The field's
 // recorded elem name is the atom-set name the box is built against.
 function variantBoxFieldComparable(ufi: i32): boolean {
-  const bn = sFieldElemName[ufi]
-  if bn == "" { return false }
+  const bty = sFieldElemTyIxOfRow(ufi)
+  if bty < 0 { return false }
   const bArms: string[] = []
   const bVis: i32[] = []
   const bAks: i32[] = []
-  unionBoxEqColumns(bn, sFieldElemTyIxOfRow(ufi), bArms, bVis, bAks)
+  unionBoxEqColumns(bty, bArms, bVis, bAks)
 }
 
 // The admission question keyed by an EXPLICIT code, so the niche rung above can ask it of the
@@ -11788,7 +11803,7 @@ function emitVariantFieldEqCoreAt(
     const vbArms: string[] = []
     const vbVis: i32[] = []
     const vbAks: i32[] = []
-    if !unionBoxEqColumns(vbN, sFieldElemTyIxOfRow(ufi), vbArms, vbVis, vbAks) {
+    if !unionBoxEqColumns(sFieldElemTyIxOfRow(ufi), vbArms, vbVis, vbAks) {
       return -1
     }
     return emitUnionBoxEqStaged(body, vbArms, vbVis, vbAks, false, vbN, fnIx)
@@ -11798,19 +11813,16 @@ function emitVariantFieldEqCoreAt(
   emitFail("emitProgram: unsupported variant field type in equality")
 }
 
-// D974 — the interned struct row of variant `vi`'s field `ufi` (a flat row) NESTED shape, or
-// -1: the row the type section stores it at, else its inline shape interned.
+// D974 — the struct row variant `vi`'s nested-record field `ufi` (a flat row) is stored at,
+// found by the field's type; a type with no row has already had the arm mint's one chance.
 function variantNestedRow(vi: i32, ufi: i32): i32 {
   if vi < 0 || vi >= uFieldStart.length { return -1 }
-  if ufi < 0 || ufi >= sFieldElemName.length { return -1 }
-  const nm = sFieldElemName[ufi]
-  if nm == "" { return -1 }
+  if ufi < 0 || ufi >= sFieldTypes.length { return -1 }
   const stored = uFieldTgtStructIdx(vi, ufi - uFieldStart[vi])
   if stored >= 0 && stored < sHeapIdx.length { return stored }
-  const row = internInlineShapeTy(nm, uFieldElemTyIxRow(ufi))
-  if row < 0 { return -1 }
-  if row >= sHeapIdx.length { return -1 }
-  row
+  emitFail(
+    "emitProgram: a variant's nested record field has no struct row to compare it at",
+  )
 }
 
 // Compare two NESTED shape refs already on the stack, field-wise. Unlike the arms themselves,
@@ -11846,6 +11858,27 @@ function unionEqOperandTy(ix: i32, fnIx: i32): i32 {
   nodeTyAt(unwrapParen(ix), fnIx)
 }
 
+// The union operand `ix` of `==` is boxed in, named from its box type (`boxTyName`), else by the
+// declared alias its type is; "" where neither names one. A union-typed operand neither names is
+// refused, since its name would come from a spelling.
+function unionEqNameOf(ix: i32, fnIx: i32): string {
+  const n = boxTyName(unionBoxTyIxOfExpr(ix, fnIx))
+  if n != "" { return n }
+  const t = nodeTyAt(unwrapParen(ix), fnIx)
+  const an = unionAliasDeclNameOfTy(t)
+  if an != "" { return an }
+  if (
+    t >= 0
+    && t < T.tys.length
+    && (tyAt(t) is TyUnion || tyAt(t) is TyNullable)
+  ) {
+    emitFail(
+      "emitProgram: union `==`: an operand's type names no union it is boxed in",
+    )
+  }
+  ""
+}
+
 // Union against union: equal iff the same arm (tag) holds and the unboxed payloads value-compare
 // equal per that arm. Folded as a nested value-typed `if` chain over the shared non-null arms,
 // bottoming out at bare tag equality — which covers the `null` arm and any non-shared arm. The
@@ -11857,8 +11890,8 @@ function emitUnionUnionEq(
   isNe: boolean,
   fnIx: i32,
 ) {
-  let lname = unionNameOfExpr(lIx, fnIx)
-  let rname = unionNameOfExpr(rIx, fnIx)
+  let lname = unionEqNameOf(lIx, fnIx)
+  let rname = unionEqNameOf(rIx, fnIx)
   let lUTy = unionEqOperandTy(lIx, fnIx)
   // Two spellings of one member set are one union: both name the row their types reach.
   if lname != rname {
@@ -11889,7 +11922,7 @@ function emitUnionUnionEq(
     if (
       lname != ""
       && rname != ""
-      && unionBoxEqColumns(lname, lUTy, sArms, sVis, sAks)
+      && unionBoxEqColumns(lUTy, sArms, sVis, sAks)
     ) {
       const rKs: i32[] = []
       const rAtomsS: string[] = []
@@ -11967,7 +12000,11 @@ function emitUnionUnionEq(
         rj = rj + 1
       }
     } else {
-      inR = unionHasAtomAB(25, rname, nodeTyIxOf(unwrapParen(rIx)), lAtoms[ai])
+      // The right operand's arms come from its member set or its box type; one with neither has
+      // nothing to match the left's arms against.
+      return emitFail(
+        "emitProgram: union `==`: the right operand's arms are known from neither its member set nor its type",
+      )
     }
     if lAtoms[ai] != "null" && inR {
       arms.push(lAtoms[ai])
@@ -20006,7 +20043,7 @@ function emitListEqGCore(body: u8[], kind: i32, slot: i32, fnIx: i32) {
       const uAks: i32[] = []
       if (
         un == ""
-        || !unionBoxEqColumns(un, rlElemTyIxAt(slot), uArms, uVis, uAks)
+        || !unionBoxEqColumns(rlElemTyIxAt(slot), uArms, uVis, uAks)
       ) {
         return emitFail(
           "emitProgram: list compare over a union element with no arm columns",
@@ -20227,7 +20264,6 @@ function xrepElemEq(
       )
     }
     const unA = rlElemUnionName(sA)
-    const unB = rlElemUnionName(sB)
     const armsA: string[] = []
     const visA: i32[] = []
     const aksA: i32[] = []
@@ -20235,8 +20271,8 @@ function xrepElemEq(
     const visB: i32[] = []
     const aksB: i32[] = []
     if (
-      !unionBoxEqColumns(unA, rlElemTyIxAt(sA), armsA, visA, aksA)
-      || !unionBoxEqColumns(unB, rlElemTyIxAt(sB), armsB, visB, aksB)
+      !unionBoxEqColumns(rlElemTyIxAt(sA), armsA, visA, aksA)
+      || !unionBoxEqColumns(rlElemTyIxAt(sB), armsB, visB, aksB)
     ) {
       return emitFail(
         "emitProgram: list compare over a union element with no arm columns",
@@ -20277,15 +20313,7 @@ function xrepElemEq(
   const arms: string[] = []
   const vis: i32[] = []
   const aks: i32[] = []
-  if (
-    !unionBoxEqColumns(
-      rlElemName[boxSlot],
-      rlElemTyIxAt(boxSlot),
-      arms,
-      vis,
-      aks,
-    )
-  ) {
+  if (!unionBoxEqColumns(rlElemTyIxAt(boxSlot), arms, vis, aks)) {
     return emitFail(
       "emitProgram: list compare over a union element with no arm columns",
     )
@@ -21166,14 +21194,13 @@ function emitStructEqFieldAt(
     // level: tag first, then the arm the tag selects, reading the two boxes off a field
     // path instead of off two operands. Columns are resolved first, so an arm set the
     // core cannot serve declines before any byte is written and reaches the loud refusal below (D1290).
-    const bxN = sFieldElemNameAt(si, fi)
-    if bxN != "" {
+    const bxTy = sFieldElemTyIxAt(si, fi)
+    if bxTy >= 0 {
+      const bxN = sFieldElemNameAt(si, fi)
       const bxArms: string[] = []
       const bxVis: i32[] = []
       const bxAks: i32[] = []
-      if (
-        unionBoxEqColumns(bxN, sFieldElemTyIxAt(si, fi), bxArms, bxVis, bxAks)
-      ) {
+      if (unionBoxEqColumns(bxTy, bxArms, bxVis, bxAks)) {
         if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
         if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
         return emitUnionBoxEqStaged(
@@ -21194,8 +21221,7 @@ function emitStructEqFieldAt(
     // to the stash-based `emitStructEqRec(body, -2, -3, …)`. The only addition here is
     // reading the two lists off a field path instead of off two operands (D1017).
     if si >= 0 {
-      const d17n = sFieldElemNameAt(si, fi)
-      if d17n != "" {
+      if sFieldElemTyIxAt(si, fi) >= 0 {
         const d17s = sFieldRefSlot(si, fi)
         if d17s >= 0 {
           if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
@@ -37151,9 +37177,7 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
     // parameter narrowed to an impossible arm type-checks, so the arm is
     // constant-false there and would otherwise read a box that is not there.
     if fnHasTyParams(fnIx) {
-      const vSet = unionNameOfRead(exprIx, fnIx)
-      const vAtom = valueAtomNameOfKind(vak)
-      if vSet != "" && vAtom != "" && !unionSetHasAtom(vSet, vAtom) {
+      if unionTyHasValueKind(unionBoxTyOfRead(exprIx, fnIx), vak) == 0 {
         fbUnreachable()
         return 0
       }
@@ -39748,7 +39772,7 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
       const cpn = nodeAt(cps[cai])
       if cpn is Param {
         if cpKind == "union" {
-          cuNm = tyNameOf(cpn.parType)
+          cuNm = boxTyName(nodeTyIxOf(cpn.parType))
           cuTy = nodeTyAt(cps[cai], fnStmts[target])
         }
         // Alias-INDEX, so a NARROWED copy is recognized.
