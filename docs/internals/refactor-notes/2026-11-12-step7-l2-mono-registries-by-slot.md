@@ -66,5 +66,7 @@ covers those. The seed is 128 bytes smaller.
 - **Locally, on master:**
   - refresh to a fixpoint;
   - `lint-self.sh` clean;
-  - `scripts/gate.sh`.
+  - `scripts/gate.sh`: all 23 rows pass, among them seed size, late demands, render-parse,
+    filed witnesses and the distilled corpus;
+  - `mono-tyaram-grid.sh`: 252 OK, 9 REJECT, 0 BAD.
 - **CI's sweep** should report no movers.
