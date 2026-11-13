@@ -121,8 +121,22 @@ triage, by mechanism (sent to the coordinator to assign):
 | P6 mono spellings | `arrElemSuffixed`, `monoUnspacedUnions`, `canonEmitName` | 4 | D, after its PR 2 |
 | P7 literal-set and nullable membership of a name | `nameIsLitUnionArmValueUnion`, `unionHasAtom`, `nullablePartOf` | 6 | G 5 (with P2); D 1 (`nonNulBaseOf`, D16040) |
 
-The 34 unreached sites go to lane B after P5, as loud-floor deletions. The 20 bare-name sites are
-lane I's to grade by provenance at the call site.
+The 34 unreached sites go to lane B after P5, as loud-floor deletions.
+
+H's per-site table (`docs/internals/render-parse-sites.md`, #7748) moved the count to 69 (a)+(b)
+once imported modules' declaration names grade as source, and 67 on master after #7744.
+
+**The 20 bare-name sites, graded by provenance** (lane I, master `6faa6df4`):
+
+| grade | sites | why |
+| --- | --- | --- |
+| passes: a primitive's own name, read off the type | 8: `memReadBoxedAtomKind`, `memReadNarrowOp`, `memReadCheckerAtomKind` (`t.primName`); `spreadSrcBoxAtom` (`tyArrayElemPrimName`); `nulScalarBoxAtomOf` (`repOfTy(inner).rdKind`); `emitNumExactCastFrom`, `emitHoleNumAsOpt` (`asExprNumTgtName` = `primNameStr(primNameOf(type))`); `njKindOfTy` (`primNameStr(p)`) | a `TyPrim`'s name is its identity, a keyword, not a rendered structure (check_ty_rep's `retAtomKindOf` states the same) |
+| passes: a compiler literal | 2: `emitUnionCoerceValueAtom` (`"string"`), `valueKindIsPlainScalar` (a loop over keywords) | no type was rendered |
+| fails: a member set's rendered atoms (P2, G) | 8: `printUnionPlanCode` (`atoms[d]`), `boxNarrowAtomFor` (`own[j]`), `emitUnionConcreteNumCross` (`unionArmsOf(uname)`), `xrepElemEq` (`unionBoxEqColumns`' arms), `boxNarrowScalarKinds` ×2 (`canonUnionMembersInto`), `emitBoxAtomRetagAtoms` (`msMemberAtomsOfSet` / `canonUnionMembersInto`), `staleBoxFrom` (`msMemberAtomsOfSet`) | the atoms are the canon render of each member |
+| fails: P5 (B) | 1: `sTyIxOfNameTy`'s `annGenAppSpanEnds(nm)` | the same name `sTyIxOfNameTy` resolves back to a type |
+| fails: F's field text | 1: `shapeFieldElemName`'s `nameIsInlineLitUnion(ftxt)` | `ftxt` is a field's spelling, among F's last `ftxt` readers |
+
+So 10 of the 20 fail. P2 grows to 21 sites, and the census-scope total of failing parses is 77.
 
 ## Floors held by a filed row
 
