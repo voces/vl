@@ -1,6 +1,6 @@
 # Step 7 L6 (lane G, cut 7b): an anonymous field's union box names no row by spelling, 2026-11-13
 
-This cut is stacked on cut 7a (#7704). `regUnionNameGo` (emit_anon_fields) names the union box an
+This cut follows cut 7a (#7704). `regUnionNameGo` (emit_anon_fields) names the union box an
 anonymous record field registers under: its row by type key, else the row its widened spelling
 (`unionSpellingOfTy`) was bound to, through `unRowOfName`.
 
@@ -25,4 +25,7 @@ imports `unRowOfName` or `unionSpellingOfTy`.
 ## Proof
 
 - **Seed:** fixpoint.
+- **Locally:** lint-self, regress (no runs lost), rep-fuzz (exact), check-filed-witnesses `--strict`
+  (4,865 graded, 0 moved), late-demands (8, baseline 8), seed-size (+1.9%), and the comment,
+  ladder, sentinel and scan budgets.
 - **The full sweep:** CI's `sweep` label. Expected identity.
