@@ -1,7 +1,7 @@
 # Step 7 closed: §7's L2 and L6 lines deleted, the floors stated as contract, the scoreboard re-baselined
 
-Measured on master `11274d92` (2026-11-13) and re-read on `25a28d6c` with the same counts, with a
-fixpoint seed of 6,713,341 bytes (two refreshes cmp-identical). Lane H's census regeneration
+Measured on master `11274d92` (2026-11-13) and re-read on `65665469` with the same counts, with a
+fixpoint seed of 6,713,944 bytes (two refreshes cmp-identical). Lane H's census regeneration
 (#7886) reads the same counts. The sections after
 "The close, graded" are the working record of closing census 5, kept for its rulings.
 
@@ -30,12 +30,10 @@ parse except the carried floors.
 The six NAME readers:
 
 - `annTyIsRefList` (ARENA + NAME): a presence test, whether an annotation is written.
-- `unionNameOfCall` (ARENA + NAME): a rung of the `unionNameOfExpr` floor (contracts, below). It
-  is **open, pending lane H's reach probe** (coordinator, 2026-11-13). Its declared-callee rung returns the annotation's name with row -1 when the
-  call's type does not fold to that row. On that path, decisions read the name:
-  `unionMemberSetOfRow`'s fallback to `unRowOfName`, `unionSetHasNullTy`, `unionArmTysOfRow`, and
-  the `??` arm's `crn == cln`. If no program reaches that path, the rung becomes a loud floor and the name a label under
-  D16032. If one does, step 7 waits for H's fix. It is the one exit item still open.
+- `unionNameOfCall` (ARENA + NAME): a label under D16032 since lane H's #7890. Its declared-callee
+  rung's rowless exit is now a loud `callNameFloor`, so no name leaves it without a row. The
+  `??` arm compares the operands' rows, not their names. H's probe found that rung reached at no
+  `arw >= 0` site in 24,247 programs; the sweep of the change moved none.
 - `emitUnionLitIs` and `elabArgRepins`: contract. A literal's lexeme, and a type parameter's
   identity.
 - `nulNicheIsTestImpossible`: a diagnostic render.
@@ -54,9 +52,9 @@ with 0 moved and 0 output mismatches. Each carried row reads `runs  runs  as fil
 
 **The scoreboard, re-baselined (ruled 2026-11-11):**
 
-- **emit_classify:** 15,204 lines and 655 functions, against the 14,412 reference. It is graded by
+- **emit_classify:** 15,218 lines and 655 functions, against the 14,412 reference. It is graded by
   the classifier census it stood in for: NAME 51 → 6, SPELLING 12 → 0.
-- **The seed:** 6,713,341 bytes on `25a28d6c`, +1.9% against the gate's 6,589,035. This PR runs
+- **The seed:** 6,713,944 bytes on `65665469`, +1.9% against the gate's 6,589,035. This PR runs
   `seed-size.vl -- --write-baseline` on the fixpoint seed. The cost is the conversions': a typed
   read where a name read was, and an invariant `emitFail` where a silent default was. It is graded
   by the name ladders deleted.
