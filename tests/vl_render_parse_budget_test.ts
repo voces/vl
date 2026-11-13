@@ -329,15 +329,19 @@ Deno.test({
       await Deno.mkdir(`${dir}/scripts`);
       await Deno.writeTextFile(
         `${dir}/scripts/render-parse-origins.txt`,
-        "source\tcompiler/emit_map_twins.vl\tunionHasBoolLeafArm\tboolLeafListDepthOfName\t0\n",
+        "source\tcompiler/emit_map_twins.vl\tunionHasBoolLeafArm\tunionHasAtom\t0\n",
+      );
+      await Deno.writeTextFile(
+        `${dir}/scripts/render-parse-fed.txt`,
+        "# fixture\ncompiler/emit_map_twins.vl\tunionHasBoolLeafArm\tunionHasAtom\t0\n",
       );
       await Deno.writeTextFile(
         `${dir}/compiler/emit_map_twins.vl`,
-        `function unionHasBoolLeafArm(arms: string[]) {\n  boolLeafListDepthOfName(arms[0])\n}\n`,
+        `function unionHasBoolLeafArm(arms: string[]) {\n  unionHasAtom(arms[0])\n}\n`,
       );
       const fed = await census(["--list", "ty-string-parse", "--root", dir]);
       const want =
-        "compiler/emit_map_twins.vl:2  unionHasBoolLeafArm  boolLeafListDepthOfName";
+        "compiler/emit_map_twins.vl:2  unionHasBoolLeafArm  unionHasAtom";
       if (fed.code !== 0 || fed.out.trim() !== want) {
         throw new Error(
           `render-fed: want ${want}, got rc ${fed.code} ${fed.out}`,
