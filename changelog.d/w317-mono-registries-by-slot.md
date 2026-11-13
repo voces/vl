@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Step 7 L2, mono: the instance registries are keyed by type and by instance slot.** `monoKeyEk` and `monoKeyPins` were keyed by mono's registry key, which on the spelled path is the pins' spelling; they are now keyed by the instance's slot. `monoTypedKeys` holds a registry row, and its last spelled fallback (a pin with no resolved type, reached by no program) now refuses loudly. `instKeyFirst` notes a merge by instance slot. `monoSlotSig`, which rendered an instance's parameter annotations to compare signatures as text, is replaced by `monoSlotIsFn` and `monoSlotParamsAre`, which compare by type. A probe found every replaced read agreeing over the sweep population. Spelling-keyed registries: 5 → 1.
