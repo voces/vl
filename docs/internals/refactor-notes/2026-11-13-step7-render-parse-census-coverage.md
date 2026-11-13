@@ -74,8 +74,8 @@ annotation text is the checker's job. So each parse site is graded by where its 
 
 **The instrument.** `scripts/render-parse-origins.ts` builds a probe compiler from a scratch copy of
 `compiler/`:
-- the first argument of every census site is wrapped, so the probe records each distinct string a
-  site receives during emit;
+- the first argument of every parse site in every compiler file is wrapped, so the probe records
+  each distinct string a site receives during emit;
 - each parser `mkTypeRef` records its spelling.
 
 It checks the sweep's population of 24,207 programs, in fixed batches. Each string is graded:
@@ -83,42 +83,57 @@ It checks the sweep's population of 24,207 programs, in fixed batches. Each stri
 | grade | test |
 | --- | --- |
 | synthesized | holds `#`, `$` or `@` |
-| source | a parser spelling of this program, or (whitespace ignored) a substring of the program's text, of std, or of a parser spelling |
+| source | a parser spelling of this program, or (whitespace ignored) a substring of the program's text, of a module it imports by a relative path, of std, or of a parser spelling |
 | bare | a bare identifier, which no text test can place |
 | render | anything else |
 
 A site that ever receives a render or a synthesized string is graded `render`. Graded only on
 source strings, it is `source`. Bare-only and unreached sites stay ungraded. Two runs at different
-`--jobs` write the same file.
+`--jobs` grade the same.
 
 **The control.** At D15042's instance, the arm sites receive `{f:f64}`, which no source holds:
 render. They also receive `{f:i32}`, a slice of the user's `{f: i32} | {f: T}`: source.
 
-**How the census uses it.** It reads the result, `scripts/render-parse-origins.txt`, keyed by file,
-enclosing function, callee and ordinal, and reports three codes. All three are ratcheted, so a new
-ungraded parse fails the budget until it is graded. The control: one added
-`isValueUnionName(n)` in `emit_rep.vl` fails with `ty-parse-unclassified: 5 (baseline 4)`.
+**Two outputs:**
+- `scripts/render-parse-origins.txt` grades the census's own sites. It records the probe's date,
+  seed and population, and `--check` compares only its graded rows.
+- `docs/internals/render-parse-sites.md` lists every reached site of any compiler file, the
+  `check_*` ones included: its origin, the expression that produced its argument, the program
+  count and a witness.
+
+**How the census uses it.** It keys sites by file, enclosing function, callee and ordinal, and
+reports three codes. All three are ratcheted, so:
+- a new ungraded parse fails the budget until it is graded;
+- a site regraded from source to render raises its file's `ty-string-parse` and fails, unless the
+  PR that regenerates the file names why.
+
+The control: one added `isValueUnionName(n)` in `emit_rep.vl` fails with
+`ty-parse-unclassified: 5 (baseline 4)`.
 
 | | before | after |
 | --- | --- | --- |
-| `ty-string-parse`: a render or synthesized name, the violation | 1 (ungraded) | **75** |
-| `ty-source-parse`: source text only | — | 19 |
+| `ty-string-parse`: a render or synthesized name, the violation | 1 (ungraded) | **69** |
+| `ty-source-parse`: source text only | — | 25 |
 | `ty-parse-unclassified`: bare names only (20), unreached (34), empty only (1) | — | 55 |
 | `ty-render`: `tyToEmitName` calls | 8 | 13 |
 
-**How to read 75.** It is a lower bound on violations:
-- A render that happens to equal some source text grades as source.
-- The 55 ungraded sites may hold more violations. 18 of the 20 bare-name sites are
-  `valueAtomKind` over a primitive name.
-
-Each `render` site has a witness program; `--report` names one string per site.
+**How to read the numbers:**
+- **69 is a lower bound.** A site counts only where the corpus shows it a render or a synthesized
+  name.
+- **25 is an upper bound, not 25 proven clean.** A render that happens to equal a source substring
+  grades as source.
+- **The 20 bare-name sites are unclassified.** 18 of them are `valueAtomKind` over a primitive.
+  Before step 7 closes, each must be shown source (by an ablation, or the call site's provenance)
+  or counted as failing.
+- **The 34 unreached sites are deletion candidates**, by the same rule as other unreached arms: a
+  loud floor, then a sweep.
 
 **`ty-string-parse` by file:**
 
-| file | render or synthesized | source | ungraded |
+| file | (a)+(b) | (c) | ungraded |
 | --- | --- | --- | --- |
-| `emit_collect.vl` | 15 | 2 | 0 |
 | `emit_base.vl` | 10 | 1 | 9 |
+| `emit_collect.vl` | 9 | 8 | 0 |
 | `emit_shape_intern.vl` | 9 | 2 | 2 |
 | `wasmEmit.vl` | 9 | 3 | 17 |
 | `emit_union_atoms.vl` | 7 | 1 | 6 |
@@ -131,23 +146,16 @@ Each `render` site has a witness program; `--report` names one string per site.
 
 **By parser:**
 
-| parser | `render` sites |
+| parser | (a)+(b) sites |
 | --- | --- |
 | `isValueUnionName` | 16 |
 | `valueAtomKind` | 14 |
 | `groupInnerOf` | 5 |
 | `peelGroupParens` | 3 |
-| `annGenAppSpanEnds` | 3 |
-| `gaeLtAt` | 3 |
 | `resolveAnnot` | 3 |
 | `nameIsLitUnionArmValueUnion` | 3 |
-| `nameToTy` | 2 |
-| `nameIsShapeOpen` | 2 |
-| `tyTopLevelSplit` | 2 |
-| `nameMentionsGenAliasParam` | 2 |
-| `arrElemSuffixed` | 2 |
-| `unionHasAtom` | 2 |
-| 13 others | 1 each |
+| 7 parsers | 2 each |
+| 11 parsers | 1 each |
 
 ## Not counted
 

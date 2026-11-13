@@ -4,7 +4,7 @@
 //   deno run -A scripts/render-parse-origins.ts [--seed S] [--jobs N] [--report FILE] [--check]
 //
 // It builds a probe compiler from a scratch copy of compiler/: the first argument of every site
-// `render-parse-census.vl -- --sites` lists is wrapped so the probe records each distinct string
+// `render-parse-census.vl -- --sites --all-files` lists is wrapped so the probe records each distinct string
 // the site receives while `emitProgram` runs, and every `mkTypeRef` the parser makes records its
 // spelling as source text. The probe checks the sweep's population (`sweep.vl -- list`), then each
 // string is graded:
@@ -15,7 +15,10 @@
 //   render       anything else: no source holds it, so a render or a substitution made it.
 // A site that ever receives a render or a synthesized string is `render`; one that receives only
 // source strings is `source`; the rest (bare names only, or unreached) stay unclassified.
-// `--check` exits 1 when the graded file differs from the committed one.
+// The origins file grades the census's own (emitter) sites. The report, by default
+// docs/internals/render-parse-sites.md, has one row per reached site of any compiler file: its
+// origin, the expression that produced its argument, the program count and a witness program.
+// `--check` exits 1 when the graded rows differ from the committed file's.
 
 const args = [...Deno.args];
 const opt = (name: string, dflt: string) => {
@@ -33,7 +36,7 @@ const flag = (name: string) => {
 };
 const SEED = opt("--seed", "build/vl-compiler.wasm");
 const JOBS = Number(opt("--jobs", "4"));
-const REPORT = opt("--report", "");
+const REPORT = opt("--report", "docs/internals/render-parse-sites.md");
 const CHECK = flag("--check");
 const VL = `${Deno.cwd()}/scripts/vl-host/target/release/vl`;
 const ORIGINS = "scripts/render-parse-origins.txt";
@@ -58,7 +61,16 @@ const die = (msg: string): never => {
   Deno.exit(2);
 };
 
-type Site = { key: string; file: string; line: number; col: number };
+type Site = {
+  key: string;
+  file: string;
+  line: number;
+  col: number;
+  inScope: boolean;
+  producer: string;
+};
+
+const SCOPE = /^compiler\/(emit_[^/]*|wasmEmit|check_emit_queries)\.vl$/;
 
 // The census's parse sites, keyed as the census keys them.
 const sitesOf = async (): Promise<Site[]> => {
@@ -67,6 +79,7 @@ const sitesOf = async (): Promise<Site[]> => {
     "scripts/render-parse-census.vl",
     "--",
     "--sites",
+    "--all-files",
   ]);
   if (r.code !== 0) die(`census --sites failed: ${r.err}`);
   return r.out.split("\n").filter((l) => l).map((l) => {
@@ -76,6 +89,8 @@ const sitesOf = async (): Promise<Site[]> => {
       file: f[0],
       line: Number(f[4]),
       col: Number(f[5]),
+      inScope: SCOPE.test(f[0]),
+      producer: "",
     };
   });
 };
@@ -122,12 +137,13 @@ const applyInserts = (b: Uint8Array, ins: Insert[]): string => {
 };
 
 // Wraps the first argument of `call(` at byte `at` (the callee's first byte) in `pre` … `)`.
+// Returns the argument's source text.
 const wrapFirstArg = (
   b: Uint8Array,
   at: number,
   pre: string,
   ins: Insert[],
-) => {
+): string => {
   let open = at;
   while (open < b.length && b[open] !== 0x28) open++;
   const end = firstArgEnd(b, open);
@@ -136,6 +152,30 @@ const wrapFirstArg = (
     text: ")",
     order: 0,
   });
+  return dec.decode(b.subarray(open + 1, end)).replace(/\s+/g, " ").trim();
+};
+
+// The producer of a site's argument: the expression itself, or for a bare name the
+// initializer of its nearest `const`/`let` above the call, else that it is a parameter.
+const producerOf = (text: string, callAt: number, arg: string): string => {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) return arg;
+  const before = text.slice(0, callAt);
+  const fnAt = before.lastIndexOf("\nfunction ") >= 0 ||
+      before.lastIndexOf("\nexport function ") >= 0
+    ? Math.max(
+      before.lastIndexOf("\nfunction "),
+      before.lastIndexOf("\nexport function "),
+    )
+    : 0;
+  const body = before.slice(fnAt);
+  const re = new RegExp(
+    `(?:const|let)\\s+${arg}\\s*(?::[^=\\n]+)?=\\s*([^\\n]+)`,
+    "g",
+  );
+  let last = "";
+  for (const m of body.matchAll(re)) last = m[1].trim();
+  if (last) return `${arg} = ${last}`;
+  return `${arg} (a parameter)`;
 };
 
 const lineStarts = (b: Uint8Array): number[] => {
@@ -220,12 +260,14 @@ const buildProbe = async (sites: Site[], dir: string): Promise<string> => {
     const ks = byFile.get(rel) ?? [];
     if (ks.length > 0) {
       const ls = lineStarts(b);
+      const text = dec.decode(b);
       for (const k of ks) {
-        wrapFirstArg(
-          b,
-          ls[sites[k].line - 1] + sites[k].col - 1,
-          `hpS(${k}, `,
-          ins,
+        const at = ls[sites[k].line - 1] + sites[k].col - 1;
+        const arg = wrapFirstArg(b, at, `hpS(${k}, `, ins);
+        sites[k].producer = producerOf(
+          text,
+          dec.decode(b.subarray(0, at)).length,
+          arg,
         );
       }
     }
@@ -270,6 +312,37 @@ const buildProbe = async (sites: Site[], dir: string): Promise<string> => {
 };
 
 const nos = (t: string) => t.replace(/\s+/g, "");
+
+// A program's own text with every module it imports by a relative path, whitespace removed.
+const programText = (file: string): string => {
+  const seen = new Set<string>();
+  const todo = [file];
+  let out = "";
+  while (todo.length > 0) {
+    const f = todo.pop()!;
+    if (seen.has(f)) continue;
+    seen.add(f);
+    let t = "";
+    try {
+      t = Deno.readTextFileSync(f);
+    } catch {
+      continue;
+    }
+    out += "\x00" + nos(t);
+    const dir = f.includes("/") ? f.slice(0, f.lastIndexOf("/")) : ".";
+    for (const m of t.matchAll(/from\s+"(\.{1,2}\/[^"]+)"/g)) {
+      const rel = m[1].endsWith(".vl") ? m[1] : `${m[1]}.vl`;
+      const parts = `${dir}/${rel}`.split("/");
+      const norm: string[] = [];
+      for (const x of parts) {
+        if (x === "..") norm.pop();
+        else if (x !== ".") norm.push(x);
+      }
+      todo.push(norm.join("/"));
+    }
+  }
+  return out;
+};
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const main = async () => {
@@ -292,6 +365,7 @@ const main = async () => {
     // per site: class -> programs, and examples
     const per = sites.map(() => new Map<string, number>());
     const ex = sites.map(() => new Map<string, string[]>());
+    const witness = sites.map(() => new Map<string, string>());
     // Fixed-size batches in file order, so a program's neighbours, and with them any parser
     // text a failed predecessor left behind, do not depend on --jobs.
     const BATCH = 400;
@@ -324,10 +398,7 @@ const main = async () => {
             if (!d.message.startsWith("HPROBE")) continue;
             const [body, ...news] = d.message.split("\x04");
             const parsed = news.map(nos).join("\x00");
-            let src = "";
-            try {
-              src = nos(Deno.readTextFileSync(rec.file));
-            } catch { /* a module path that is not a file */ }
+            const src = programText(rec.file);
             const seen = new Map<number, Set<string>>();
             for (const item of body.split("\x03").slice(1)) {
               const [ks, exact, v] = item.split("\x02");
@@ -344,6 +415,7 @@ const main = async () => {
               } else c = "render";
               if (!seen.has(k)) seen.set(k, new Set());
               seen.get(k)!.add(c);
+              if (!witness[k].has(c)) witness[k].set(c, rec.file);
               const xs = ex[k].get(c) ?? [];
               if (xs.length < 3 && !xs.includes(v)) ex[k].set(c, [...xs, v]);
             }
@@ -361,39 +433,114 @@ const main = async () => {
       if (p.get("source")) return "source";
       return "";
     };
-    const lines = sites.map((s, k) => [grade(k), s.key]).filter(([g]) => g).map(
-      ([g, key]) => `${g}\t${key}`,
-    ).sort();
+    const lines = sites.map((s, k) => [s.inScope ? grade(k) : "", s.key])
+      .filter(([g]) => g).map(
+        ([g, key]) => `${g}\t${key}`,
+      ).sort();
+    const seedHash = Array.from(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", Deno.readFileSync(SEED)),
+      ),
+    ).slice(0, 8).map((x) => x.toString(16).padStart(2, "0")).join("");
+    const today = new Date().toISOString().slice(0, 10);
     const text =
       `# Generated by scripts/render-parse-origins.ts; read by scripts/render-parse-census.vl.\n` +
+      `# Probed ${today} on seed ${seedHash} over ${files.length} programs (sweep.vl -- list).\n` +
       `# <origin>\\t<file>\\t<fn>\\t<callee>\\t<ordinal>; an ungraded site is absent.\n` +
       lines.join("\n") + "\n";
     const tally = new Map<string, number>();
-    sites.forEach((_, k) =>
+    const scoped = sites.map((s, k) => [s, k] as const).filter(([s]) =>
+      s.inScope
+    );
+    scoped.forEach(([, k]) =>
       tally.set(
         grade(k) || "unclassified",
         (tally.get(grade(k) || "unclassified") ?? 0) + 1,
       )
     );
     console.log(
-      `render-parse-origins: ${sites.length} sites — ${
+      `render-parse-origins: ${scoped.length} census sites — ${
         [...tally].map(([c, n]) => `${n} ${c}`).join(", ")
       }`,
     );
-    if (REPORT) {
-      const rows = sites.map((s, k) =>
-        `${grade(k) || "unclassified"}\t${s.key}\t${s.line}\t${
-          JSON.stringify(Object.fromEntries(per[k]))
-        }\t${JSON.stringify(Object.fromEntries(ex[k]))}`
+    if (REPORT && !CHECK) {
+      const cls = (k: number) => {
+        const p = per[k];
+        if (p.get("render") || p.get("synthesized")) {
+          return p.get("synthesized") && !p.get("render")
+            ? "(b) synthesized"
+            : p.get("synthesized")
+            ? "(a)+(b) render and synthesized"
+            : "(a) render";
+        }
+        if (p.get("source")) return "(c) source";
+        if (p.get("bare")) return "unclassified: bare names";
+        return "unclassified: empty only";
+      };
+      const pick = (k: number) => {
+        for (const c of ["render", "synthesized", "source", "bare", "empty"]) {
+          if (witness[k].has(c)) {
+            return [witness[k].get(c)!, (ex[k].get(c) ?? [""])[0]];
+          }
+        }
+        return ["", ""];
+      };
+      const cell = (t: string) => t.replace(/\|/g, "\\|").replace(/`/g, "'");
+      const reached = sites.map((s, k) => [s, k] as const).filter(([, k]) =>
+        per[k].size > 0
       );
-      Deno.writeTextFileSync(REPORT, rows.join("\n") + "\n");
+      const row = ([s, k]: readonly [Site, number]) => {
+        const [w, e] = pick(k);
+        const n = (c: string) => per[k].get(c) ?? 0;
+        const c = cls(k);
+        const progs = c.startsWith("(a)+(b)")
+          ? `${n("render")} render, ${n("synthesized")} synthesized`
+          : c.startsWith("(a)")
+          ? `${n("render")}`
+          : c.startsWith("(b)")
+          ? `${n("synthesized")}`
+          : c.startsWith("(c)")
+          ? `${n("source")}`
+          : `${n("bare") || n("empty")}`;
+        const fn = s.key.split("\t")[1];
+        const callee = s.key.split("\t")[2];
+        return `| ${
+          s.file.replace("compiler/", "")
+        }:${s.line} | ${fn} | ${callee} | ${cls(k)} | \`${
+          cell(s.producer).slice(0, 80)
+        }\` | ${progs} | ${w} | \`${cell(e).slice(0, 60)}\` |`;
+      };
+      const head =
+        "| site | function | parser | origin | producer of the argument | programs | witness | example |\n" +
+        "| --- | --- | --- | --- | --- | --- | --- | --- |";
+      const unreached = sites.filter((s, k) => s.inScope && per[k].size === 0);
+      const doc = `# Render-parse sites by input origin\n\n` +
+        `Generated by \`scripts/render-parse-origins.ts\` (${today}, seed ${seedHash}, ${files.length} programs).\n` +
+        `One row per type-string parse site reached during emit. \`programs\` counts the programs in which\n` +
+        `the site received a string of its origin class; the witness and example are one of them. The producer is the call's\n` +
+        `argument, or a bare name's nearest initializer above the call, found by text.\n\n` +
+        `## The census's sites (emitter files)\n\n${head}\n` +
+        reached.filter(([s]) => s.inScope).map(row).join("\n") +
+        `\n\n## Checker-file sites reached during emit\n\n${head}\n` +
+        reached.filter(([s]) => !s.inScope).map(row).join("\n") +
+        `\n\n## The census's sites no program reaches\n\n` +
+        unreached.map((s) =>
+          `- ${s.file.replace("compiler/", "")}:${s.line} ${
+            s.key.split("\t")[1]
+          } → ${s.key.split("\t")[2]}`
+        )
+          .join("\n") +
+        "\n";
+      Deno.writeTextFileSync(REPORT, doc);
     }
     if (CHECK) {
       let old = "";
       try {
         old = Deno.readTextFileSync(ORIGINS);
       } catch { /* absent */ }
-      if (old !== text) {
+      const rows = (t: string) =>
+        t.split("\n").filter((l) => l && !l.startsWith("#")).join("\n");
+      if (rows(old) !== rows(text)) {
         console.log(
           `render-parse-origins: ${ORIGINS} is stale; rerun without --check`,
         );
