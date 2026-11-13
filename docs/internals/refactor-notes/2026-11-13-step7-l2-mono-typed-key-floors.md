@@ -60,5 +60,6 @@ The seed is 75 bytes larger.
 - **Locally, on master:**
   - refresh to a fixpoint;
   - `lint-self.sh` clean;
-  - `scripts/gate.sh`.
+  - `scripts/gate.sh`: all 23 rows pass;
+  - `mono-tyaram-grid.sh`: 0 BAD.
 - **CI's sweep** should report no movers.
