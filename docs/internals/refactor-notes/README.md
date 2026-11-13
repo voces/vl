@@ -9,6 +9,23 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-d16041-decl-union-dedupe](2026-11-13-d16041-decl-union-dedupe.md): D16041 — a declared union's equal anonymous record arms are one member, 2026-11-13
+- [2026-11-13-h-budget-derived-totals](2026-11-13-h-budget-derived-totals.md): Step 7, lane H: `--budget` baselines store codes, not totals, 2026-11-13
+- [2026-11-13-h-census-parent-grade](2026-11-13-h-census-parent-grade.md): Step 7, lane H: the render-parse census grades a split piece by its parent, and sees the canon member walk, 2026-11-13
+- [2026-11-13-h-mono-ann](2026-11-13-h-mono-ann.md): Step 7, lane H: `identFnTypeAnnNameOfRead` answers a boolean; its `ann` thread is dead, 2026-11-13
+- [2026-11-13-h-site55-spelling-ty](2026-11-13-h-site55-spelling-ty.md): Step 7, lane H: the value-union mint reads the type its spelling reads back as, 2026-11-13
+- [2026-11-13-step7-d16032-arm-path-scans-read-row](2026-11-13-step7-d16032-arm-path-scans-read-row.md): Step 7 (lane D, D16032): the arm-path scans read the row their read carried, 2026-11-13
+- [2026-11-13-step7-d16032-key-folds-scalar-brand](2026-11-13-step7-d16032-key-folds-scalar-brand.md): Step 7 (lane D, D16032): the union key folds a brand over a scalar to its base, 2026-11-13
+- [2026-11-13-step7-d16032-value-union-row](2026-11-13-step7-d16032-value-union-row.md): Step 7 (lane D, D16032 step 1): a value union's read names its row by type, 2026-11-13
+- [2026-11-13-step7-free-slice-atoms-floor](2026-11-13-step7-free-slice-atoms-floor.md): Step 7 (L6, lane G): a row-less slice's atom column is carried as floor D16052, 2026-11-13
+- [2026-11-13-step7-l2-mono-p2-atom-kinds-by-type](2026-11-13-step7-l2-mono-p2-atom-kinds-by-type.md): Step 7 (lane D, #13 P2, D's half): four atom-kind decisions read the member's type, 2026-11-13
+- [2026-11-13-step7-lane-e-ms-atom-ids](2026-11-13-step7-lane-e-ms-atom-ids.md): Step 7: a member slice's twin test reads the members' types; `msAtomIdOf` goes, 2026-11-13
+- [2026-11-13-step7-print-plan-kinds-by-type](2026-11-13-step7-print-plan-kinds-by-type.md): Step 7 (L6, lane G #13 P2, last stray): a printed union's box kinds come from member types, 2026-11-13
+- [2026-11-13-step7-union-arm-kinds-by-type](2026-11-13-step7-union-arm-kinds-by-type.md): Step 7 (L6, lane G #13 P2 step 2c): union operand arm kinds read off arm types, 2026-11-13
+- [2026-11-13-step7-union-has-atom-pair](2026-11-13-step7-union-has-atom-pair.md): Two `unionHasAtom` sites ask the member set, 2026-11-13
+- [2026-11-13-step7-union-reg-strays-by-type](2026-11-13-step7-union-reg-strays-by-type.md): Step 7 (L6, lane G #13 P2 strays): box kinds read off types; the if-let atom fallback deleted, 2026-11-13
+- [2026-11-13-w311-d6-cbox-parens](2026-11-13-w311-d6-cbox-parens.md): Step 7 D6: a captured cell's element is parenthesized by its type, 2026-11-13
+- [2026-11-13-w311-d6-union-struct-alias](2026-11-13-w311-d6-union-struct-alias.md): Step 7 D6: a union declaration's struct-alias test reads its members' types, 2026-11-13
 - [2026-11-13-h-ud-member-bank](2026-11-13-h-ud-member-bank.md): Step 7, lane H: declared-union members read the checker's resolution, 2026-11-13
 - [2026-11-13-step7-d16013-storage-norm](2026-11-13-step7-d16013-storage-norm.md): Step 7: D16013 closed, a typed normalizer for the list element's key, 2026-11-13
 - [2026-11-13-step7-decl-name-callers](2026-11-13-step7-decl-name-callers.md): Four `declTyIxOfName` callers graded by origin; the mv name fallbacks are deleted, 2026-11-13
