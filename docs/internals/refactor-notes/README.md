@@ -9,6 +9,18 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-h-decl-rung](2026-11-13-h-decl-rung.md): Step 7, lane H: two `declTyIxOfName` callers stop running the annotation grammar, 2026-11-13
+- [2026-11-13-h-unreached-renders](2026-11-13-h-unreached-renders.md): Step 7, lane H: three unreached renders floored, 2026-11-13
+- [2026-11-13-step7-l2-mono-p6-pin-union-typed](2026-11-13-step7-l2-mono-p6-pin-union-typed.md): Step 7 L2, mono, P6 cut 4: union pins and instance returns are spelled from their types, 2026-11-13
+- [2026-11-13-step7-l2-mono-p6-residuals](2026-11-13-step7-l2-mono-p6-residuals.md): Step 7 L2, mono, P6 cut 5: the last pin-list and element-name parses, 2026-11-13
+- [2026-11-13-step7-lane-e-fieldtext-positional](2026-11-13-step7-lane-e-fieldtext-positional.md): Step 7: the variant field-type compares read the field's type, 2026-11-13
+- [2026-11-13-step7-lane-e-fieldtext-string-readers](2026-11-13-step7-lane-e-fieldtext-string-readers.md): Step 7: the variant field-text string readers ask the field's type, 2026-11-13
+- [2026-11-13-step7-p5-arr-lit-key-ty](2026-11-13-step7-p5-arr-lit-key-ty.md): Step 7 P5: the list-literal mint keys its row by its rung's type, 2026-11-13
+- [2026-11-13-step7-snames-canonical-key](2026-11-13-step7-snames-canonical-key.md): The canonical-key test over the struct-row label table, and D16002, 2026-11-13
+- [2026-11-13-step7-union-reg-prim-kind-by-type](2026-11-13-step7-union-reg-prim-kind-by-type.md): Step 7 L6 (lane G, #13 P2 step 2a): a primitive's box kind is read off its type, 2026-11-13
+- [2026-11-13-step7-union-reg-slice-bank-boxtag](2026-11-13-step7-union-reg-slice-bank-boxtag.md): Step 7 L6 (lane G, #13 P2): member slices bank `boxTagOfTy`, 2026-11-13
+- [2026-11-13-w311-d6-shape-spell-by-type](2026-11-13-w311-d6-shape-spell-by-type.md): Step 7 D6: the shape-spelling tests read the type or the row, 2026-11-13
+- [2026-11-13-w311-d6-walk-key-by-type](2026-11-13-w311-d6-walk-key-by-type.md): Step 7 D6: the shape walk's key is two bits of walk state, not a render, 2026-11-13
 - [2026-11-13-step7-arms-all-same-by-declaration](2026-11-13-step7-arms-all-same-by-declaration.md): Step 7 L6 (lane G): `unionArmsAllSame` compares declarations, not renders, 2026-11-13
 - [2026-11-13-step7-canonical-key-tests](2026-11-13-step7-canonical-key-tests.md): The canonical-key test over the render-keyed tables, 2026-11-13
 - [2026-11-13-step7-d16062-pr1-value-box](2026-11-13-step7-d16062-pr1-value-box.md): Step 7, lane H: D16062 PR 1, one value-union verdict read off the rep tree's boxing decision, 2026-11-13
