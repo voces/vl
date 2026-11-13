@@ -26,7 +26,7 @@
 //
 // @test-timing sweep n=30
 
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 import { builtScript } from "./support/builtScript.ts";
 
 const SCRIPT = `${ROOT}/scripts/sentinel-census.vl`;
@@ -168,7 +168,10 @@ function bad(t: Row): i32 {
 `,
     unguarded: ["11:3"],
     strict: [],
-    says: { code: UNGUARDED, text: "a field its module graph tests against 0 elsewhere" },
+    says: {
+      code: UNGUARDED,
+      text: "a field its module graph tests against 0 elsewhere",
+    },
   },
   {
     // D1462 and #2498, reduced: the producer LAUNDERS a hole four hops down and carries
@@ -222,7 +225,10 @@ function innerSlot(slot: i32): i32 {
 `,
     unguarded: ["16:12"],
     strict: [],
-    says: { code: UNGUARDED, text: "the parameter `slot` on a fall-through path" },
+    says: {
+      code: UNGUARDED,
+      text: "the parameter `slot` on a fall-through path",
+    },
   },
   {
     // A WRAPPED HEADER. `vl fmt` breaks a long parameter list over several lines, and a
@@ -356,7 +362,10 @@ function bad(t: Row): i32 {
 `,
     unguarded: ["6:3"],
     strict: [],
-    says: { code: UNGUARDED, text: "a field its module graph tests against 0 elsewhere" },
+    says: {
+      code: UNGUARDED,
+      text: "a field its module graph tests against 0 elsewhere",
+    },
   },
   {
     // A reader is one wherever it lives: `fallthrough.vl` with its answerer two modules
@@ -397,7 +406,10 @@ function innerSlot(slot: i32): i32 {
 `,
     unguarded: ["13:11"],
     strict: [],
-    says: { code: UNGUARDED, text: "the parameter `slot` on a fall-through path" },
+    says: {
+      code: UNGUARDED,
+      text: "the parameter `slot` on a fall-through path",
+    },
   },
   {
     // The ARENA ACCESSORS: `nodeAt(ix)` is `P.nodes[ix]` with its bounds check held in one
@@ -435,7 +447,10 @@ function bad(n: i32): i32 {
 `,
     unguarded: ["26:3"],
     strict: [],
-    says: { code: UNGUARDED, text: "`nodeAt(s)` indexes a table with `slotOf`" },
+    says: {
+      code: UNGUARDED,
+      text: "`nodeAt(s)` indexes a table with `slotOf`",
+    },
   },
   {
     // `tyAt` is the type arena's accessor, graded the same way; here off a hole field.
@@ -458,7 +473,10 @@ function bad(t: Row): i32 {
 `,
     unguarded: ["14:3"],
     strict: [],
-    says: { code: UNGUARDED, text: "`tyAt(t.inner)` indexes a table with `t.inner`" },
+    says: {
+      code: UNGUARDED,
+      text: "`tyAt(t.inner)` indexes a table with `t.inner`",
+    },
   },
 ];
 
@@ -472,7 +490,10 @@ const script = async (path: string): Promise<Hits> => {
         new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr),
     );
   }
-  const raw = JSON.parse(new TextDecoder().decode(stdout)) as Record<string, unknown[][]>;
+  const raw = JSON.parse(new TextDecoder().decode(stdout)) as Record<
+    string,
+    unknown[][]
+  >;
   const at: Record<string, string[]> = {};
   for (const c of CODES) at[c] = raw[c].map((r) => `${r[0]}:${r[1]}`).sort();
   return { at, msgs: {} };
@@ -483,14 +504,24 @@ const script = async (path: string): Promise<Hits> => {
 const lint = async (dir: string, file: string): Promise<Hits> => {
   const path = `compiler/${file}`;
   const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: ["check", path, "--severity", "info", "--json", "--compiler", COMPILER],
+    args: [
+      "check",
+      path,
+      "--severity",
+      "info",
+      "--json",
+      "--compiler",
+      COMPILER,
+    ],
     cwd: dir,
     stdout: "piped",
     stderr: "piped",
     env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
   if (code > 1) {
-    throw new Error(`vl check ${path} exited ${code}: ${new TextDecoder().decode(stderr)}`);
+    throw new Error(
+      `vl check ${path} exited ${code}: ${new TextDecoder().decode(stderr)}`,
+    );
   }
   const all = JSON.parse(new TextDecoder().decode(stdout)) as {
     file: string;
@@ -499,7 +530,9 @@ const lint = async (dir: string, file: string): Promise<Hits> => {
     col: number;
     message: string;
   }[];
-  const diags = all.filter((d) => d.file.endsWith(`/${path}`) || d.file === path);
+  const diags = all.filter((d) =>
+    d.file.endsWith(`/${path}`) || d.file === path
+  );
   const at: Record<string, string[]> = {};
   const msgs: Record<string, string[]> = {};
   for (const c of CODES) {
@@ -510,7 +543,8 @@ const lint = async (dir: string, file: string): Promise<Hits> => {
   return { at, msgs };
 };
 
-const eq = (a: string[], b: string[]) => JSON.stringify(a) === JSON.stringify(b);
+const eq = (a: string[], b: string[]) =>
+  JSON.stringify(a) === JSON.stringify(b);
 
 Deno.test({
   name: "sentinel-index: the lint and the ratchet script agree, both codes",
@@ -532,7 +566,9 @@ Deno.test({
         if (!eq(s.at[c], l.at[c])) {
           throw new Error(
             `${f.name}: ${c} disagrees — sentinel-census.vl wants ` +
-              `${JSON.stringify(s.at[c])}, compiler/lint.vl got ${JSON.stringify(l.at[c])}. ` +
+              `${JSON.stringify(s.at[c])}, compiler/lint.vl got ${
+                JSON.stringify(l.at[c])
+              }. ` +
               `The two carry the same table definition, the same hole-field and map ` +
               `derivations and the same guard model; whichever moved has to move back, ` +
               `or both together.`,
@@ -541,11 +577,16 @@ Deno.test({
       }
 
       // Pin the fixture's own arithmetic, so an agreeing pair of ZEROS cannot pass.
-      const want: Record<string, string[]> = { [UNGUARDED]: f.unguarded, [STRICT]: f.strict };
+      const want: Record<string, string[]> = {
+        [UNGUARDED]: f.unguarded,
+        [STRICT]: f.strict,
+      };
       for (const c of CODES) {
         if (!eq(s.at[c], want[c].slice().sort())) {
           throw new Error(
-            `${f.name}: want ${c} at ${JSON.stringify(want[c])}, got ${JSON.stringify(s.at[c])}`,
+            `${f.name}: want ${c} at ${JSON.stringify(want[c])}, got ${
+              JSON.stringify(s.at[c])
+            }`,
           );
         }
       }
@@ -569,14 +610,17 @@ Deno.test({
 // holds the lint's count per file, and the baseline's totals must be the sum of its rows.
 // The census is held to the lint by the fixtures above, not by a whole-tree run: each
 // census over-count the tree run alone could see has a fixture shape that fails "agree".
-Deno.test("sentinel-index: the committed baseline's totals are the sum of its rows", async () => {
+// A total is derived from the rows (cli_budget), so a stored one could only drift from them.
+Deno.test("sentinel-index: the committed baseline names its codes and stores no total", async () => {
   const base = JSON.parse(
     await Deno.readTextFile(`${ROOT}/scripts/sentinel-budget-baseline.json`),
-  ) as { total: Record<string, number>; files: Record<string, Record<string, number>> };
+  ) as { codes?: string[]; total?: unknown };
   const bad: string[] = [];
+  if (base.total !== undefined) bad.push("stores a `total`");
   for (const c of CODES) {
-    const sum = Object.values(base.files).reduce((n, v) => n + (v[c] ?? 0), 0);
-    if (sum !== base.total[c]) bad.push(`total ${c} is ${base.total[c]}, its rows sum to ${sum}`);
+    if (!(base.codes ?? []).includes(c)) bad.push(`names no code ${c}`);
   }
-  if (bad.length > 0) throw new Error(`the sentinel baseline:\n  ${bad.join("\n  ")}`);
+  if (bad.length > 0) {
+    throw new Error(`the sentinel baseline:\n  ${bad.join("\n  ")}`);
+  }
 });
