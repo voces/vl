@@ -1,7 +1,8 @@
 # Step 7 closed: §7's L2 and L6 lines deleted, the floors stated as contract, the scoreboard re-baselined
 
-Measured on master `11274d92` (2026-11-13), with a fixpoint seed of 6,712,490 bytes (two refreshes
-cmp-identical). Lane H's census regeneration (#7886) reads the same counts. The sections after
+Measured on master `11274d92` (2026-11-13) and re-read on `25a28d6c` with the same counts, with a
+fixpoint seed of 6,713,341 bytes (two refreshes cmp-identical). Lane H's census regeneration
+(#7886) reads the same counts. The sections after
 "The close, graded" are the working record of closing census 5, kept for its rulings.
 
 ## The close, graded against the exit criteria
@@ -55,7 +56,7 @@ with 0 moved and 0 output mismatches. Each carried row reads `runs  runs  as fil
 
 - **emit_classify:** 15,204 lines and 655 functions, against the 14,412 reference. It is graded by
   the classifier census it stood in for: NAME 51 → 6, SPELLING 12 → 0.
-- **The seed:** 6,712,490 bytes, +1.9% against the gate's 6,589,035. This PR runs
+- **The seed:** 6,713,341 bytes on `25a28d6c`, +1.9% against the gate's 6,589,035. This PR runs
   `seed-size.vl -- --write-baseline` on the fixpoint seed. The cost is the conversions': a typed
   read where a name read was, and an invariant `emitFail` where a silent default was. It is graded
   by the name ladders deleted.
