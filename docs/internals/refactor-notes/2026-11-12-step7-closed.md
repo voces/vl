@@ -108,7 +108,18 @@ Unreached (d): `arrLitElemName` (emit_classify:6909), `memReadBoxNarrowName` and
 `fieldTypeRefusalMsg`. H also lists `nulNicheIsTestImpossible`, `mapSoftTwinTagFail` and
 `emitMapUnionPayloadTail` at 0 programs during emit, but census 5 named
 `generics/error-literal-union-map-twin-through-one-instance.vl` as `mapSoftTwinTagFail`'s witness.
-That conflict is checked at the close. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
+That conflict goes to lane H. If the probe skips refusing programs, the census undercounts.
+
+Routing (coordinator, 2026-11-13):
+
+- every (b) canonical-key test goes to lane A, who owns the probe, one table at a time: ref-list
+  after #7775, `unNames` after #7772, the mv slots, the shape_rows element rows, and mono's
+  `pinned`, `pnames` and `tvV`; the owners fix whatever fails;
+- R1's (a) and (b) go to lane D, graded per site;
+- the R2 and R3 (a) sites that run through `isValueUnionName` go to lane H's D16062 PRs, which
+  replace that predicate;
+- R4a goes to lane E, R4c to lane G, R6 to lanes F and A;
+- the (d) unreached sites go to lane F as deletions. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
 
 ## The census's coverage (lane H, #7748, open)
 
