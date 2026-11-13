@@ -39,8 +39,8 @@ The 13 remaining are two kinds:
 (`tests/cases/generics/type-param-shadows-alias-through-constructors.vl`, a builtin-named
 parameter), 0 output movers, 0 runs → not-runs, 0 new compiler traps.
 
-**Ratchet.** render-parse 69 → 65 `ty-string-parse` and 25 → 19 `ty-source-parse`. The four
-render falls are this cut's two plus two that #7747 removed without lowering the baseline.
+**Ratchet.** render-parse 66 → 63 `ty-string-parse` and 25 → 19 `ty-source-parse`. The three
+render falls are this cut's two plus one that #7753 removed without lowering the baseline.
 `nameMentionsGenAliasParam` leaves `EXTRA_PARSERS`, and the eight origins rows for the removed
 sites leave `render-parse-origins.txt`. `docs/internals/render-parse-sites.md` still lists the
 eight sites, so the orchestrator's next regrade drops them.
