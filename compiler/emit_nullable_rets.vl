@@ -129,6 +129,7 @@ import {
   mapFindShapeOfNodeTy,
   mvDeclNameOfValTy,
   structRowOfRecordTy,
+  tagRepTyFn,
   tyIsNulLitUnionArr,
 } from "./emit_shape_rows"
 import {
@@ -151,6 +152,7 @@ import {
   uVariants,
   unNames,
 } from "./emit_state"
+import { emitFail } from "./emit_bytes"
 import { i32ListHas } from "./listutil"
 import { emitPassGen, memoKeyNew, memoMoved, memoPassMoved } from "./memo"
 import { nonNullTy } from "./tyquery"
@@ -494,15 +496,34 @@ function namedRowOfTy(ty: i32): i32 {
 export function retStructRowIndex(tyIx: i32) {
   if tyIx < 0 { return -1 }
   const ty = nodeAt(tyIx)
-  // An `#anonN` reference names its literal's row, which a shape row of the same type need not
-  // share a layout with. A declared name answers its type's row below: twins share one heap.
-  if ty is TypeRef {
-    const an = ty.tyName
-    if an.length >= 5 && an.slice(0, 5) == "#anon" {
-      const si = structIndexByName(an)
-      if si >= 0 { return si }
+  // A record holding a tagged set is stored as its ids: its row is the stored type's.
+  const tagged = nodeTyIxOf(tyIx)
+  if tagged >= 0 && tagged < T.tys.length && tyAt(tagged) is TyObj {
+    const st = tagRepTyFn(tagged)
+    const sr = if st >= 0 && st != tagged { structRowOfRecordTy(st) } else { -1 }
+    if sr >= 0 { return sr }
+  }
+  const tr = retStructRowOfTy(tyIx)
+  // An `#anonN` reference names the row its literal is built at, which the type need not key
+  // while that literal is built at its own fields' row (D16020): the label wins a disagreement.
+  if ty is TypeRef && nameIsAnonHandle(ty.tyName) {
+    const lr = structIndexByName(ty.tyName)
+    if lr >= 0 && lr != tr {
+      if tr < 0 {
+        emitFail(
+          "an anonymous record reference names a row no type keys (D16020)",
+        )
+      }
+      return lr
     }
   }
+  tr
+}
+
+// The struct row the type recorded at `tyIx` keys, or -1: the declared-name, arena-type and
+// alias rungs, then an un-annotated parameter's recorded type.
+function retStructRowOfTy(tyIx: i32): i32 {
+  const ty = nodeAt(tyIx)
   const ds = recordStructRow(nodeRepTyIxOf(tyIx))
   if ds >= 0 { return ds }
   if ty is TypeRef {
