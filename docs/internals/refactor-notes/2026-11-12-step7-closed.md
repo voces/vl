@@ -75,7 +75,7 @@ graded:
 The census's other five renders are all in one function, `nodeArrayElemName`
 (check_emit_queries:742, 764, 768, 772, 791). It renders an array literal's element type to a name,
 and emit_shape_rows' `arrLitBoxElemName` (2 callers) and `arrLitElemRender` (8 callers) consume
-that name. All five fail: a render handed to the emitter as a key.
+that name. All five fail: a render handed to the emitter as a key. Owner: A (coordinator, 2026-11-13).
 
 Of the 13 renders, six are floors and seven block the close. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
 
