@@ -288,7 +288,8 @@ compares types compares the sets too (`fnSetsAgree`).
 
 No row key needs declaration identity (#7306). An inline-spelled record field and its `tySame`
 declared twin share one row, except a `flat` record, and twins whose function positions carry
-different sets. Mono's anonymous-pin discriminator decides by the pin's type, not its text.
+different sets. Two separately declared records keep their own rows, linked as layout twins that
+share one heap type (D732), so declaration identity separates compiler rows, never runtime storage. Mono's anonymous-pin discriminator decides by the pin's type, not its text.
 
 **Type equality.** "Are these two types one?" has seven answers, each a contract. Each draws its
 line on purpose, and two of them disagree on a pair only where their lines differ ([notes](internals/refactor-notes/2026-11-12-step7-registries-and-equality.md),
