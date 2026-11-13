@@ -1,6 +1,12 @@
+import { mkUnionTy } from "./check_union_mint"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import { sFieldElemSame, unMemAtoms } from "./emit_state"
-import { unMemRowStart, valueBoxOfTy } from "./emit_rep"
+import {
+  repShadowAddReason,
+  repShadowOn,
+  unMemRowStart,
+  valueBoxOfTy,
+} from "./emit_rep"
 
 // `emit_union_atoms.vl` — which value unions carry atoms or map arms, the
 // map-value shapes they intern, and the twins a variant is built with.
@@ -25,12 +31,13 @@ import {
   mapTwinUnionMember,
   storedTyOf,
   tyMapKeyKindSpan,
-  valueAtomKind,
   valueRowKind,
   valueUnionFromAtomKinds,
 } from "./check_ty_rep"
 import {
   T,
+  TY_I32,
+  TY_NULL,
   TyArray,
   TyErr,
   TyFunc,
@@ -47,6 +54,8 @@ import {
   litUnionAliasNameOfTy,
   litUnionInlineNameOfTy,
   mixedLitRunAliasOf,
+  mkArrayTy,
+  mkNullableTy,
   oneStrLitSpelling,
   structNameOfTy,
   tyAt,
@@ -54,7 +63,6 @@ import {
   tyEqSoftLits,
   tyIsLitUnion,
   tyIxIsFunc,
-  tyMayHoldFn,
   tyReachesCycle,
   tySame,
   tyToEmitName,
@@ -82,6 +90,7 @@ import {
   unionRowArmTys,
   unionSetArmTysAB,
   unionTyArms,
+  unionTyMemberTys,
 } from "./emit_map_twins"
 import {
   mvValTyIxAt,
@@ -94,14 +103,13 @@ import {
   mvArmSigOfTy,
   mvValArmName,
 } from "./emit_mv_slots"
-import { ifExprCollectAtoms, paramTypeNodeOfRead } from "./emit_query"
+import { paramTypeNodeOfRead } from "./emit_query"
 import {
   boxTagOfTy,
   declTyIxOfName,
   fieldElemTyIxOfName,
   mapShapeKeyKind,
   mvSlotOfTyKArm,
-  mvValTyIxOfNameRow,
   nodeMapValTyIx,
   recordMvValTyIx,
   recordUnMemTys,
@@ -118,6 +126,7 @@ import {
 import {
   elemTyIsNominal,
   fnTagListRepName,
+  fnTagListRepTy,
   mapNodeValName,
   mvCanonRepOf,
   mvCanonValNameTy,
@@ -132,11 +141,11 @@ import {
   rlElemMapValMvSlot,
   rlElemNicheNullable,
   rlElemStoredName,
+  rlElemStoredTy,
   sigFuncDeeperThan,
   sigRowHasNoArmTwin,
   sigRowHasNoTwin,
   structRowOfRecordTy,
-  tyIsFuncOrNulFunc,
   tyIsRefArray,
   unionOfVariant,
   variantFieldLayoutEq,
@@ -249,7 +258,7 @@ import {
   vbU8ArmUsed,
   vbV128Used,
 } from "./emit_state"
-import { rlDeclTwinTy } from "./emit_struct_order"
+import { rlDeclTwinTy, rlElemTyIxAt } from "./emit_struct_order"
 import { mapArmShapeOfTy, mapPinnedParamTyOf, mapTyPeel } from "./emit_ty_canon"
 import {
   isUNameAB,
@@ -264,7 +273,7 @@ import {
   unRowOfTyAB,
   unSiteOnKey,
   unionArmsOf,
-  unionMemberSetOf,
+  unionArmsOfRow,
   unionMemberTysOf,
   unionMemberTysOfRow,
 } from "./emit_union_registry"
@@ -294,15 +303,28 @@ import {
 // arena cannot name has no slot: `-3`.
 export function mvShapeOfMapHeldTy(heldTy: i32, armTy: i32, valTy: i32) {
   const m = tyMapHeld(heldTy)
-  const vn = mvDeclNameOfValTy(tyMapValOf(m))
+  const vt = tyMapValOf(m)
+  const vn = mvDeclNameOfValTy(vt)
   if vn == "" { return -3 }
-  mvShapeOfMapValKey(vn, tyMapKeyKind(m), armTy, valTy)
+  mvShapeOfMapValKey(
+    vn,
+    tyMapKeyKind(m),
+    if armTy >= 0 { armTy } else { vt },
+    armTy,
+    valTy,
+  )
 }
 
-// The mv shape of a map whose value is keyed `valName` under key kind `ki`: the value's slot,
-// or the mono sentinel of `ki` for a value that needs none.
-function mvShapeOfMapValKey(valName: string, ki: i32, armTy: i32, valTy: i32) {
-  const sh = mvShapeOfValNameTys(valName, ki, armTy, armTy, valTy)
+// The mv shape of a map whose value is keyed `valName` (of type `rowTy`) under key kind `ki`:
+// the value's slot, or the mono sentinel of `ki` for a value that needs none.
+function mvShapeOfMapValKey(
+  valName: string,
+  ki: i32,
+  rowTy: i32,
+  armTy: i32,
+  valTy: i32,
+) {
+  const sh = mvShapeOfValNameTys(valName, ki, rowTy, armTy, valTy)
   // A mono value — i32, boolean, a literal-union atom or a nullable atom — rides the shared
   // i32 `vals` list and needs no per-value struct, so it is the `-1` string-keyed or `-4`
   // i32-keyed sentinel every value-blind classifier already reads as the mono rep.
@@ -320,7 +342,7 @@ export function mvShapeOfMapNodeTy(ix: i32) {
   // A `Map()` whose values the checker builds at another record mints that record's slot.
   const bv = recBuildElemTyOfInit(ix)
   if bv >= 0 && mvDeclNameOfValTy(bv) != "" {
-    return mvShapeOfMapValKey(mvDeclNameOfValTy(bv), ki, bv, bv)
+    return mvShapeOfMapValKey(mvDeclNameOfValTy(bv), ki, bv, bv, bv)
   }
   if nodeTyMapValIsLitUnion(ix) { return mapMonoShapeOfKey(ki) }
   if nodeTyMapValIsNulLitUnion(ix) { return mapMonoShapeOfKey(ki) }
@@ -335,7 +357,13 @@ export function mvShapeOfMapNodeTy(ix: i32) {
   if sigFuncDeeperThan(nodeMapValTyIx(ix), 8) {
     const dn = mvDeclNameOfValTy(nodeMapValTyIx(ix))
     if dn != "" {
-      return mvShapeOfMapValKey(dn, ki, nodeMapValTyIx(ix), nodeMapValTyIx(ix))
+      return mvShapeOfMapValKey(
+        dn,
+        ki,
+        nodeMapValTyIx(ix),
+        nodeMapValTyIx(ix),
+        nodeMapValTyIx(ix),
+      )
     }
   }
   const sh = mvShapeOfValNameArmTy(
@@ -425,6 +453,12 @@ export function mvShapeOfValTyMint(ty: i32, keyK: i32): i32 {
   mvShapeOfValNameTys(vn, keyK, ty, ty, ty)
 }
 
+// The arena type union row `u` holds (`unTyIx`), or -1.
+function unRowTyAt(u: i32): i32 {
+  if u < 0 || u >= unTyIx.length { return -1 }
+  unTyIx[u]
+}
+
 function mvShapeOfValNameArmTyGo(
   valNameInRaw: string,
   keyK: i32,
@@ -434,12 +468,13 @@ function mvShapeOfValNameArmTyGo(
 ) {
   const valNameIn = mvArmKeyName(valNameInRaw, armTy)
   // A caller with no type classifies by the type the slot banks, so kind and key agree.
-  let kindTy = kindTyIn
-  if kindTy < 0 { kindTy = mvValTyIxOfNameRow(valNameIn, rowTy) }
+  const kindTy = if kindTyIn >= 0 { kindTyIn } else { rowTy }
   // A value of maps nothing can tell apart is stored as their one map.
   const twin = mapTwinUnionMember(kindTy)
   if twin >= 0 { return mvShapeOfValTyK(twin, keyK, armTy) }
   let valName = mvCanonValNameTy(valNameIn, kindTy)
+  // The type a rewritten `valName` denotes, banked in place of a resolution of its spelling.
+  let valNameTy = if valName == valNameIn { -1 } else { fnTagListRepTy(kindTy) }
   const kind = mvValKindOfTy(kindTy)
   if kind == MVK_MONO { return -1 }
   if kind < 0 { return -3 }
@@ -450,9 +485,13 @@ function mvShapeOfValNameArmTyGo(
     const tr = if kindTy >= 0 { unRowOfTyAB(53, kindTy) } else { -1 }
     if tr >= 0 {
       valName = unNames[tr]
+      valNameTy = unRowTyAt(tr)
     } else {
-      const cu = unRowOfTyKey(mvValTyIxOfNameRow(valNameIn, rowTy))
-      if cu >= 0 { valName = unNames[cu] }
+      const cu = unRowOfTyKey(rowTy)
+      if cu >= 0 {
+        valName = unNames[cu]
+        valNameTy = unRowTyAt(cu)
+      }
     }
   }
   // A niche-nullable value name resolves its struct or map identity — and keys its vals
@@ -471,11 +510,10 @@ function mvShapeOfValNameArmTyGo(
     if valueBoxOfTy(kindTy) { registerValueUnionOfTy(60, kindTy) }
     markMapUnionArms(kindTy)
   }
-  // The slot's identity is structural — `repMvValKey` over the value's arena type — paired
-  // with the key rep, not the recorded spelling; the name scan is the fall-through for a
-  // spelling the arena does not resolve. Held rather than consumed, because the row this call
-  // may push records the very same index.
-  const vTy = mvValTyIxOfNameRow(valNameIn, rowTy)
+  // The slot's identity is structural — `repMvValKey` over the value's arena type `rowTy` —
+  // paired with the key rep, not the recorded spelling. Held rather than consumed, because the
+  // row this call may push records the very same index.
+  const vTy = rowTy
   // The arm is part of what is being looked up (D48). Asking the hint at the two find rungs is
   // not the better-answer-at-a-mint the interner rule forbids: it never makes a find succeed
   // where it failed, only decline a slot whose arm is not this value's, so the mint below runs
@@ -507,7 +545,7 @@ function mvShapeOfValNameArmTyGo(
     const bareKindTy = if bareTy >= 0 { bareTy } else if nin != "" { tyPeelNul(kindTy) } else { kindTy }
     rls6 = ensureRefElemTys(
       bare,
-      if bareTy >= 0 { bareTy } else { rlKeyTyOf(bareKindTy) },
+      if bareTy >= 0 { bareTy } else { rlKeyOrTagRepTyOf(bareKindTy) },
       bareKindTy,
     )
   }
@@ -519,9 +557,8 @@ function mvShapeOfValNameArmTyGo(
   // `valNameIn` through the same resolver and `resolveAnnot` memoizes per spelling with no
   // invalidation of a positive entry. The one thing that can make the two inputs differ is
   // `mvCanonValNameTy` rewriting the spelling, and there the bank is withheld.
-  let vBank = -1
-  if valName == valNameIn { vBank = vTy }
-  recordMvValTyIx(valName, vBank)
+  const vBank = if valName == valNameIn { vTy } else { valNameTy }
+  recordMvValTyIx(vBank)
   // The row that line just banked: `recordMvValTyIx` holds `valName`'s arena index over the
   // very spelling the two `valName` interns below key on. A mint may be fronted only with a
   // banked input provably the one it would have computed. The kind-6 site above is not
@@ -549,17 +586,25 @@ function mvShapeOfValNameArmTyGo(
   let rlS = -1
   if kind == MVK_STRUCT {
     // An arm value is keyed by the arm's name and type (D34), since `sNames[vsi]` is the
-    // inline-shape row minted from the arm's field set, over the wrong heap. The `sNames[vsi]`
-    // rung is deliberately unhinted: that row's `sTyIx` sidecar has two producers that answer
-    // differently for an `#anonN` row.
+    // inline-shape row minted from the arm's field set, over the wrong heap. A row is keyed by
+    // its minted type, where closed (`rlKeyTyOf`).
     let armNm = mvValArmName(armTy)
-    if armNm == "" && exactArmRowOfTy(cUserTypes[valName] ?? -1) >= 0 {
-      armNm = valName
+    let armNmTy = armTy
+    if armNm == "" {
+      const declTy = cUserTypes[valName] ?? -1
+      if exactArmRowOfTy(declTy) >= 0 {
+        armNm = valName
+        armNmTy = declTy
+      }
     }
     if armNm != "" {
-      rlS = rlInternNameTy(armNm, RLK_STRUCT, armTy)
+      rlS = rlInternNameTy(armNm, RLK_STRUCT, armNmTy)
     } else if vsi >= 0 && vsi < sNames.length {
-      rlS = rlInternName(sNames[vsi], RLK_STRUCT)
+      rlS = rlInternNameTy(
+        sNames[vsi],
+        RLK_STRUCT,
+        rlKeyTyOf(if vsi < sTyIx.length { sTyIx[vsi] } else { -1 }),
+      )
     } else {
       // No row: refused here rather than read out of bounds, the slot kept in step.
       emitFail("emitProgram: a record map value has no struct row")
@@ -614,12 +659,11 @@ export function rlInternOfTy(tyIn: i32) {
 // name `rlRowNameOfTy` gives, so a declared record mints under its own name.
 export function rlMintNameOfTy(ty: i32): string { rlRowNameOfTy(ty, false) }
 
-// Element type `ty` as a ref-list row's key: a closed type, else -1. A type holding a type
-// parameter waits for its instance, and one holding a function inside a record or list is keyed
-// by its function-value sets, which the name's row carries.
+// Element type `ty` as a ref-list row's key: a closed type, else -1, since a type holding a type
+// parameter waits for its instance. A record holding functions is keyed by its type here too: its
+// function-value sets choose its struct row (D16040), not its ref-list row.
 export function rlKeyTyOf(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return -1 }
-  if tyMayHoldFn(ty, 0) && !tyIsFuncOrNulFunc(ty) { return -1 }
   ty
 }
 
@@ -664,6 +708,27 @@ function rlRepRowNameOfTy(ty: i32): string {
   ""
 }
 
+// Element type `ty` as a ref-list key, else, for a list whose functions a tagged set stores as
+// ids, the `i32` list those ids are stored as.
+function rlKeyOrTagRepTyOf(ty: i32): i32 {
+  const k = rlKeyTyOf(ty)
+  if k >= 0 || ty < 0 || !tyHasTyVar(ty) || fnTagListRepName(ty) == "" {
+    return k
+  }
+  rlTagListRepTy(ty)
+}
+
+// The `i32` list a tagged list of `ty`'s depth stores its ids as.
+function rlTagListRepTy(ty: i32): i32 {
+  const a = tyAt(ty)
+  if a is TyArray {
+    if fnTagListRepName(a.aElem) != "" {
+      return mkArrayTy(rlTagListRepTy(a.aElem))
+    }
+  }
+  mkArrayTy(TY_I32)
+}
+
 const RL_ELEM_NO_KIND_MSG = "a ref-list element type gives its row no element rep"
 
 // `ensureRefElemTy` with the element's type `kindTy` held apart from the key hint `ty`:
@@ -683,10 +748,20 @@ export function ensureRefElemTys(elemName: string, ty: i32, kindTy: i32) {
     // ids (D15779).
     const innerKindTy = tyStepElem(tyPeelNul(kindTy))
     let inm = rlRowNameOfTy(innerKindTy, true)
-    if inm == "" { inm = rlRepRowNameOfTy(innerKindTy) }
+    let inmRep = false
+    if inm == "" {
+      inm = rlRepRowNameOfTy(innerKindTy)
+      inmRep = inm != ""
+    }
     if inm == "" { inm = rlRowNameOfTy(tyStepElem(tyPeelNul(ty)), true) }
+    // The inner key is the stored element's, else the held element type's, so an unhinted
+    // outer row's inner row is keyed by type rather than by its spelling.
     let inner = tyStepElem(ty)
-    if elemTyIsNominal(innerKindTy) { inner = rlKeyTyOf(innerKindTy) }
+    if inner < 0 || elemTyIsNominal(innerKindTy) {
+      inner = rlKeyTyOf(innerKindTy)
+    }
+    // A row named by its rep is keyed by that rep's type.
+    if inner < 0 && inmRep { inner = rlKeyOrTagRepTyOf(innerKindTy) }
     ensureRefElemTys(inm, inner, innerKindTy)
   }
   ensureRefElemKindTail(elemName, k, ty, kindTy)
@@ -725,10 +800,6 @@ function ensureRefElemKindTail(elemName: string, k: i32, ty: i32, kindTy: i32) {
   } else if k == RLK_U8_LIST {
   }
   rlInternNameTyK(elemName, k, ty, kindTy)
-}
-
-export function rlInternName(name: string, kind: i32) {
-  rlInternNameTy(name, kind, -1)
 }
 
 // The record type a literal's `#anon` struct row recorded at its mint, or -1 for any other
@@ -778,16 +849,17 @@ export function rlInternNameTyK(
     i = i + 1
   }
   rlInternDepth = rlInternDepth + 1
-  const stored = rlElemStoredName(name, if ty >= 0 { ty } else { kindTy })
+  const storeTy = if ty >= 0 { ty } else { kindTy }
+  const stored = rlElemStoredName(name, storeTy)
   rlElemName.push(stored)
   rlElemKey.push(key)
-  // The arena type the stored spelling denotes, recorded once at mint time — resolved from
-  // the stored name (which `rlElemStoredName` may have folded), never the raw `name`. Prefers
-  // the caller's hint when the stored spelling is unfolded (`stored == name`), since a folded
-  // spelling's own resolve would land on a different row than the checker's.
+  // The arena type the stored spelling denotes, recorded once at mint time: the caller's hint
+  // when the spelling is unfolded, the list a folded spelling names (`rlElemStoredTy`), and only
+  // for an unfolded spelling with no hint, the name's own resolve.
   let rlTy = -1
-  if ty >= 0 && stored == name { rlTy = ty }
-  if rlTy < 0 { rlTy = fieldElemTyIxOfName(stored) }
+  if stored != name { rlTy = rlElemStoredTy(storeTy) }
+  else if ty >= 0 { rlTy = ty }
+  else { rlTy = fieldElemTyIxOfName(stored) }
   rlElemTyIx.push(rlTy)
   rlElemHeap.push(0)
   rlBackIdx.push(0)
@@ -1382,7 +1454,7 @@ export function cloArmTagOfTy(ty: i32): i32 {
 // union's name. The structural render, so an alias and its inline spelling meet.
 function cloSigNameOfTy(ty: i32): string { tyToEmitName(ty) }
 
-// `registerValueUnionName` with the caller's arena type for this union, or -1 when the
+// `registerValueUnionNameTy` with the caller's arena type for this union, or -1 when the
 // caller has only a name. The row's `unTyIx` entry is that index, so the registry can be
 // asked by type rather than by spelling once its readers move.
 function registerValueUnionNameTy(name: string, tyIx: i32) {
@@ -1416,12 +1488,16 @@ function pushValueUnionRow(name: string, tyIx: i32) {
   0
 }
 
-// The name-only entry point: resolves the name once, here, exactly as the two
-// declaration-driven registration sites do, so a row minted through this path carries an
-// arena index instead of -1 without every one of its twelve callers threading one.
-// Resolving at the boundary means the string work happens once at mint, not at every query.
-export function registerValueUnionName(name: string) {
-  registerValueUnionNameTy(name, declTyIxOfName(name))
+// Registers a record literal's union field box under `name`, the spelling rendered from its type
+// `ty`. A type with a spelling twin mints as the typed seam does; one without (a record or
+// alias arm) mints from `ty` itself. A field with no type fails loudly.
+export function registerAnonUnionField(name: string, ty: i32): i32 {
+  if ty < 0 {
+    return emitFail("emitProgram: a record literal's union field has no type")
+  }
+  if unionSpellingTyOf(ty) >= 0 { return registerValueUnionNameAB(0, name, ty) }
+  registerValueUnionNameTy(name, ty)
+  0
 }
 
 // The row a value union `ty` keys to, minted when no row carries that key: it is named by the
@@ -1609,13 +1685,135 @@ function unionPartSpelling(m: i32, depth: i32): string {
   }
 }
 
-// Marks the per-rep value-box usage flags for every scalar atom of the value union typed `ty`, at
-// registration time so `mAssignTypeIndices` interns exactly the used reps. The arms are
-// `unionTyArms`': the row `ty` keys to where its members resolved, else the type's own members.
+// The type `unionSpellingOfTy(ty)` reads back as, built from the same decisions instead of
+// parsed from the text: a literal widens to its base, a literal-union alias and a mixed run's
+// alias are their declared types, and a nested union or `null` part joins the outer union.
+// -1 where the spelling declines; a caller holds a spelling, so a function part is not re-tested.
+export function unionSpellingTyOf(ty: i32): i32 {
+  const ms: i32[] = []
+  const nul: boolean[] = [false]
+  if !spellTyParts(ty, ms, nul, 8) { return -1 }
+  let u = -1
+  if ms.length == 1 { u = ms[0] }
+  else if ms.length > 1 { u = mkUnionTy(ms) }
+  if !nul[0] { return u }
+  if u < 0 { return TY_NULL }
+  mkNullableTy(u)
+}
+
+// `unionSpellingTyOf`'s walk: pushes the parts `ty` spells onto `ms`, setting `nul[0]` for a
+// `null` part. False where `unionSpellingOfTy` declines.
+function spellTyParts(ty: i32, ms: i32[], nul: boolean[], depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyUnion => spellUnionTyParts(ty, t.uMembers, ms, nul, depth)
+    TyNullable => spellNullableTyParts(t.nInner, ms, nul, depth)
+    TyPrim | TyLit | TyObj | TyArray | TyMap | TyFunc | TyVar | TyNeg | TyErr => false
+  }
+}
+
+// `unionMembersSpelling`'s parts as types, over the members `members` of union `ty`.
+function spellUnionTyParts(
+  ty: i32,
+  members: i32[],
+  ms: i32[],
+  nul: boolean[],
+  depth: i32,
+): boolean {
+  if members.length == 0 { return false }
+  if litUnionInlineNameOfTy(ty) != "" {
+    for m in members {
+      if isNullTy(m) {
+        nul[0] = true
+        for x in members {
+          if !isNullTy(x) { spellTyPush(ms, x) }
+        }
+        return true
+      }
+    }
+  }
+  const rgAlias = mixedLitRunAliasOf(members)
+  let rgDone = false
+  for m in members {
+    if rgAlias != "" && tyAt(m) is TyLit {
+      if !rgDone {
+        rgDone = true
+        spellTyPush(ms, cUserTypes[rgAlias] ?? m)
+      }
+    } else if !spellPartTy(m, ms, nul, depth - 1) {
+      return false
+    }
+  }
+  true
+}
+
+// `nullableSpelling`'s parts as types: `inner`, then `null`.
+function spellNullableTyParts(
+  inner: i32,
+  ms: i32[],
+  nul: boolean[],
+  depth: i32,
+): boolean {
+  if inner < 0 || inner >= T.tys.length { return false }
+  nul[0] = true
+  const nal = litUnionAliasNameOfTy(inner)
+  if nal != "" {
+    spellTyPush(ms, cUserTypes[nal] ?? inner)
+    return true
+  }
+  if litUnionInlineNameOfTy(inner) != "" || oneStrLitSpelling(inner) != "" {
+    spellTyPush(ms, inner)
+    return true
+  }
+  spellPartTy(inner, ms, nul, depth - 1)
+}
+
+// `unionPartSpelling`'s part as a type, pushed onto `ms`; a nested union or nullable joins.
+function spellPartTy(m: i32, ms: i32[], nul: boolean[], depth: i32): boolean {
+  if m < 0 || m >= T.tys.length || depth <= 0 { return false }
+  const al = litUnionAliasNameOfTy(m)
+  if al != "" {
+    spellTyPush(ms, cUserTypes[al] ?? m)
+    return true
+  }
+  const t = tyAt(m)
+  match t {
+    TyPrim => {
+      if t.primName == "never" { return false }
+      if t.primName == "null" {
+        nul[0] = true
+        return true
+      }
+      spellTyPush(ms, m)
+    }
+    TyLit => {
+      const b = litBaseTy(t)
+      if b < 0 || b >= T.tys.length || !(tyAt(b) is TyPrim) { return false }
+      spellTyPush(ms, b)
+    }
+    TyUnion => spellUnionTyParts(m, t.uMembers, ms, nul, depth)
+    TyNullable => spellNullableTyParts(t.nInner, ms, nul, depth)
+    TyArray | TyFunc => spellTyPush(ms, m)
+    TyObj | TyMap | TyVar | TyNeg | TyErr => false
+  }
+}
+
+// Appends part `p` unless an equal part is already there, as the spelling drops a repeat.
+function spellTyPush(ms: i32[], p: i32): boolean {
+  for x in ms {
+    if tySame(x, p) { return true }
+  }
+  ms.push(p)
+  true
+}
+
+// Marks the per-rep value-box usage flags for every scalar member of the value union typed `ty`,
+// at registration time so `mAssignTypeIndices` interns exactly the used reps. The members are
+// `unionTyMemberTys`': the row `ty` keys to where its members resolved, else the type's own.
 export function markValueUnionAtoms(ty: i32) {
-  const atoms: string[] = []
   const mems: i32[] = []
-  markValueUnionArms(atoms, mems, unionTyArms(ty, atoms, mems), ty)
+  markValueUnionArms(mems, unionTyMemberTys(ty, mems), ty)
 }
 
 // `markValueUnionAtoms` over registered row `u`'s own members.
@@ -1624,7 +1822,7 @@ export function markValueUnionAtomsRow(u: i32) {
   const mems: i32[] = []
   let ty = -1
   if u >= 0 && u < unTyIx.length { ty = unTyIx[u] }
-  markValueUnionArms(atoms, mems, unionRowArmTys(u, atoms, mems), ty)
+  markValueUnionArms(mems, unionRowArmTys(u, atoms, mems), ty)
 }
 
 // The usage bits one arm of box tag `k` forces. Bits: 1 i32, 2 string array, 4 i64, 8 f64, 16 f32,
@@ -1663,21 +1861,12 @@ function tyArmUseBits(ty: i32): i32 {
   armUseBits(boxTagOfTy(ty))
 }
 
-// The marks for one union's `atoms`: read through member types `mems` when `cov`, else through
-// the union's type `ty`. A union with neither fails loudly: every registered row has one.
-function markValueUnionArms(
-  atoms: string[],
-  mems: i32[],
-  cov: boolean,
-  ty: i32,
-) {
+// The marks for one union: read through its member types `mems` when `cov`, else through the
+// union's type `ty`. A union with neither fails loudly: every registered row has one.
+function markValueUnionArms(mems: i32[], cov: boolean, ty: i32) {
   let m = 0
   if cov {
-    let i = 0
-    while i < atoms.length {
-      m = m | armUseBits(boxTagOfTy(mems[i]))
-      i = i + 1
-    }
+    for t in mems { m = m | armUseBits(boxTagOfTy(t)) }
   } else if ty < 0 {
     emitFail(
       "emitProgram: a value union has neither member types nor a union type",
@@ -1914,11 +2103,10 @@ export function unionHasMapArmSlot(ty: i32, slot: i32) {
   // D-UNION: the arm SHAPE test is structural (`unMemIsMap` — a `TyMap` member); the
   // SLOT comparison stays where it is, because a slot is a REP question and
   // `mvSlotOfMapKeyKTys`/`mvCanonRepOf` already answer it canonically.
-  const atoms: string[] = []
   const mems: i32[] = []
-  const cov = unionTyArms(ty, atoms, mems)
+  const cov = unionTyMemberTys(ty, mems)
   let i = 0
-  while i < atoms.length {
+  while i < mems.length {
     // An arm with no member type is not taken for a map by its spelling.
     const isMap = cov && unMemIsMap(mems[i])
     if isMap {
@@ -1941,42 +2129,18 @@ export function unionHasMapArmSlot(ty: i32, slot: i32) {
   false
 }
 
-// True if the union member-set `name` has a MAP arm (`{[string]: V}`). Resolves an alias to its
-// member set first. Used by the frame pre-pass (`exprHasMapOp` → `unionMapArmIdent`) to reserve the
-// map scratch frame for a `t[k]` on a union binding narrowed to its map arm — the narrowing is not
-// active in that pass, so the map op must be spotted from the binding's DECLARED union.
-export function unionHasMapArm(name: string) { unionMapArmName(name) != "" }
-
-// The map arm name of the union member-set `name`, or "" when it has none — the value-atom
-// scheme carries one map arm per union.
-export function unionMapArmName(name: string) {
-  const armTy: i32[] = []
-  unionMapArmNameTy(name, armTy)
-}
-
-// The form that also hands back the arm's arena type, pushed onto `outTy` (empty when the
-// arena leg did not decide the arm). The map-slot layer downstream is still name-keyed, so
-// the spelling stays the return value, sparing the caller from re-deriving `V` from
-// it. An out-array rather than a second function, since the arm is chosen by one walk.
-function unionMapArmNameTy(name: string, outTy: i32[]) {
+// True if union `name`, read with row `u` (-1: none carried), has a MAP arm (`{[string]: V}`):
+// the row's members where it records them (D16032), else `name`'s. The frame pre-pass asks it
+// (`unionMapArmIdent`) for a `t[k]` on a binding narrowed to its map arm, a narrowing that pass
+// does not see, so the map op is spotted from the binding's declared union.
+export function unionHasMapArmOfRow(u: i32, name: string): boolean {
   const atoms: string[] = []
-  // Picks the map arm from the row's recorded arena member types (`unMemIsMap`) instead of
-  // re-classifying each atom's rendered spelling with `nameIsMap`. The recorded member slice
-  // is in atom order, so `atoms[m]` is this member's stored spelling, which the still-
-  // name-keyed map-slot layer downstream needs. An uncovered row has no map arm.
   const mems: i32[] = []
-  if unionArmTys(name, atoms, mems) {
-    let m = 0
-    while m < mems.length {
-      if unMemIsMap(mems[m]) {
-        outTy.push(mems[m])
-        return atoms[m]
-      }
-      m = m + 1
-    }
-    return ""
+  if !unionArmTysOfRow(u, name, atoms, mems) { return false }
+  for m in mems {
+    if unMemIsMap(m) { return true }
   }
-  ""
+  false
 }
 
 // True when the CHECKED type of `exprIx` is a union carrying a MAP member, or a bare
@@ -2087,27 +2251,22 @@ export function identChainTyBoxedUnion(
 // over-reservation is a harmless spare and an under-reservation is invalid wasm.
 export function armPathArenaDeclined(): boolean { true }
 
-// The bare-closure arm name of the union member-set `name`, or "" when it has none — the
-// presence question `emitUnionCoerce` gates its closure-carrier box on. The returned name
-// does not decide the box tag: only the arm's signature separates several function-typed
-// arms, so the tag comes from the arena type (`unionClosureArmTy` -> `cloArmTagOfTy`).
-export function unionClosureArmName(name: string, ty: i32) {
+// The first function-typed member of union `name` of type `ty` (the row `ty` keys first), or -1
+// when it has none: the bare-closure arm `emitUnionCoerce` gates its closure-carrier box on, and
+// the fallback type that box is tagged by (`cloBoxOwnFnTy`).
+export function unionClosureArmTyOfTy(name: string, ty: i32): i32 {
   const atoms: string[] = []
-  // The arm selection is structural (`tyIxIsFunc`); the returned name stays the
-  // member's stored spelling.
   const mems: i32[] = []
   if unionArmTysOfTy(name, ty, atoms, mems) {
-    let m = 0
-    while m < mems.length {
-      if tyIxIsFunc(mems[m]) { return atoms[m] }
-      m = m + 1
+    for m in mems {
+      if tyIxIsFunc(m) { return m }
     }
-    return ""
+    return -1
   }
   emitFail(
     "emitProgram: a closure-arm lookup reached a union with no recorded member types",
   )
-  ""
+  -1
 }
 
 // The member type of the arm spelled `atom` in union `name` of type `ty` (-1 for none), or -1.
@@ -2127,10 +2286,12 @@ export function unionArmTyOfAtomTy(name: string, ty: i32, atom: string): i32 {
   0 - 1
 }
 
-export function unionClosureArmTy(name: string): i32 {
+// The first function-typed member of union `name`, read from row `u` where it records members,
+// else from `name`'s (D16032); -1 when it has none.
+export function unionClosureArmTyOfRow(u: i32, name: string): i32 {
   const atoms: string[] = []
   const mems: i32[] = []
-  if unionArmTys(name, atoms, mems) {
+  if unionArmTysOfRow(u, name, atoms, mems) {
     let m = 0
     while m < mems.length {
       if tyIxIsFunc(mems[m]) { return mems[m] }
@@ -2140,15 +2301,6 @@ export function unionClosureArmTy(name: string): i32 {
   -1
 }
 
-// The recorded member types of a member-set spelling, for the four ref-array arm
-// scanners. `unionMemberTysOf` accepts an alias name too, but an alias must not expand
-// here: the name loops these scanners replaced split an alias spelling into one atom,
-// which no arm test accepts, so expanding it would be an extension, not a migration.
-export function unionArmMemberTys(name: string, out: i32[]): boolean {
-  if unionMemberSetOf(name) != name { return false }
-  unionMemberTysOf(name, out)
-}
-
 // True if union type `ty` has a ref-element array arm whose
 // interned reflist slot is `slot` — the guard `emitUnionCoerce` uses to confirm a ref-array carrier matches
 // an arm before boxing it with that arm's `refArrSlotTag`. A slot matching no arm falls
@@ -2156,9 +2308,8 @@ export function unionArmMemberTys(name: string, out: i32[]): boolean {
 export function unionHasRefArrayArmSlot(ty: i32, slot: i32) {
   // A carrier with no row (-1) must not match a member with no arm row, which is -1 too.
   if slot < 0 { return false }
-  const atoms: string[] = []
   const mems: i32[] = []
-  if !unionTyArms(ty, atoms, mems) { return false }
+  if !unionTyMemberTys(ty, mems) { return false }
   let i = 0
   while i < mems.length {
     if unMemRefArrArmSlot(mems[i]) == slot { return true }
@@ -2171,8 +2322,8 @@ export function unionHasRefArrayArmSlot(ty: i32, slot: i32) {
 // union admits the member atom `elemAtom` (exact match), or -1. An empty `elemAtom` (an
 // empty `[]` literal) matches the first union-box-element arm, since an empty list's
 // element type is vacuous and the checker already proved the literal fits the union.
-export function unionRefArrayArmSlotForElem(name: string, elemAtom: string) {
-  const exact = unionRefArrayArmSlotForElemAtom(name, elemAtom)
+export function unionRefArrayArmSlotForElem(u: i32, elemAtom: string) {
+  const exact = unionRefArrayArmSlotForElemAtom(u, elemAtom)
   if exact >= 0 { return exact }
   // Literal-widening admission: the probe classifies a bare int literal as "i32" and a
   // float literal as "f64", but the checker already admits it into a wider scalar element
@@ -2183,27 +2334,28 @@ export function unionRefArrayArmSlotForElem(name: string, elemAtom: string) {
     return -1
   }
   if elemAtom == "i32" {
-    const wi = unionRefArrayArmSlotForElemAtom(name, "i64")
+    const wi = unionRefArrayArmSlotForElemAtom(u, "i64")
     if wi >= 0 { return wi }
-    const wf = unionRefArrayArmSlotForElemAtom(name, "f64")
+    const wf = unionRefArrayArmSlotForElemAtom(u, "f64")
     if wf >= 0 { return wf }
   }
-  unionRefArrayArmSlotForElemAtom(name, "f32")
+  unionRefArrayArmSlotForElemAtom(u, "f32")
 }
 
 // The exact-atom pass of `unionRefArrayArmSlotForElem`: the first union-box-element
 // ref-array arm whose element union carries `elemAtom` verbatim (any arm for "").
-function unionRefArrayArmSlotForElemAtom(name: string, elemAtom: string) {
+function unionRefArrayArmSlotForElemAtom(u: i32, elemAtom: string) {
   const mems: i32[] = []
-  if !unionArmMemberTys(name, mems) { return -1 }
+  if !unionMemberTysOfRow(u, mems) { return -1 }
   let i = 0
   while i < mems.length {
     const slot = unMemRefArrArmSlot(mems[i])
     if slot >= 0 && rlElemKindAt(slot) == RLK_UNION {
       if elemAtom == "" { return slot }
-      const en = rlElemUnionName(slot)
       const eAtoms: string[] = []
-      unionArmsOf(en, eAtoms)
+      if !unionArmsOfRow(elemUnionRowOf(slot), eAtoms) {
+        unionArmsOf(rlElemUnionName(slot), eAtoms)
+      }
       let j = 0
       while j < eAtoms.length {
         if eAtoms[j] == elemAtom { return slot }
@@ -2212,18 +2364,30 @@ function unionRefArrayArmSlotForElemAtom(name: string, elemAtom: string) {
       // R3's boxed-member rule: a litunion member of a value union rides the box as the
       // `string` atom. Without this leg a `(K | i32)[]` arm is invisible to a
       // string-element literal — invalid wasm.
-      if elemAtom == "string" && elemUnionHasLitUnionMember(en) { return slot }
+      if elemAtom == "string" && elemUnionHasLitUnionMember(slot) {
+        return slot
+      }
     }
     i = i + 1
   }
   -1
 }
 
-// True when the element union row `en` has a literal-union member. A row with no recorded
-// members fails loudly: every union element's row records them.
-function elemUnionHasLitUnionMember(en: string): boolean {
+// The row ref-list slot `slot`'s element union type keys to, or -1 (D16032).
+function elemUnionRowOf(slot: i32): i32 { unRowOfTyKey(rlElemTyIxAt(slot)) }
+
+// The member types of ref-list slot `slot`'s element union into `out`: its type's row where it
+// records them, else the row its name is bound to.
+function elemUnionMemberTys(slot: i32, out: i32[]): boolean {
+  if unionMemberTysOfRow(elemUnionRowOf(slot), out) { return true }
+  unionMemberTysOf(rlElemUnionName(slot), out)
+}
+
+// True when ref-list slot `slot`'s element union has a literal-union member. A union with no
+// recorded members fails loudly: every union element's row records them.
+function elemUnionHasLitUnionMember(slot: i32): boolean {
   const ms: i32[] = []
-  if !unionMemberTysOf(en, ms) {
+  if !elemUnionMemberTys(slot, ms) {
     emitFail("emitProgram: a list arm's element union has no recorded members")
     return false
   }
@@ -2233,11 +2397,11 @@ function elemUnionHasLitUnionMember(en: string): boolean {
   false
 }
 
-// True when the element union row `en` has a list member. A row with no recorded members fails
-// loudly: every union element's row records them.
-function elemUnionHasArrayMember(en: string): boolean {
+// True when ref-list slot `slot`'s element union has a list member. A union with no recorded
+// members fails loudly: every union element's row records them.
+function elemUnionHasArrayMember(slot: i32): boolean {
   const ms: i32[] = []
-  if !unionMemberTysOf(en, ms) {
+  if !elemUnionMemberTys(slot, ms) {
     emitFail("emitProgram: a list arm's element union has no recorded members")
     return false
   }
@@ -2251,12 +2415,9 @@ function elemUnionHasArrayMember(en: string): boolean {
 // element union carries an atom that is itself an array (`wantMap` false) or a map
 // (`wantMap` true) — the arm a nested list or map-element literal has to build through.
 // Structural on the element union's own atoms, not nominal on the union name (D1016).
-export function unionRefArrayArmSlotForNestedElem(
-  name: string,
-  wantMap: boolean,
-) {
+export function unionRefArrayArmSlotForNestedElem(u: i32, wantMap: boolean) {
   const mems: i32[] = []
-  if !unionArmMemberTys(name, mems) { return -1 }
+  if !unionMemberTysOfRow(u, mems) { return -1 }
   let i = 0
   while i < mems.length {
     const slot = unMemRefArrArmSlot(mems[i])
@@ -2271,7 +2432,7 @@ export function unionRefArrayArmSlotForNestedElem(
         )
         return -1
       } else {
-        if elemUnionHasArrayMember(rlElemName[slot]) { return slot }
+        if elemUnionHasArrayMember(slot) { return slot }
       }
     }
     i = i + 1
@@ -2283,14 +2444,14 @@ export function unionRefArrayArmSlotForNestedElem(
 // rep matches the literal element's map shape `mvShape` (canonical rep, `mvCanonRepOf`),
 // or -1. `emitUnionCoerce` routes an array literal of map exprs (invisible to
 // `exprRefArray`) into the arm's build and tag; an unmatched literal keeps the loud reject.
-export function unionRefArrayArmSlotForMapElem(name: string, mvShape: i32) {
+export function unionRefArrayArmSlotForMapElem(u: i32, mvShape: i32) {
   if mvShape < -1 { return -1 }
   // The arm shape test is `unMemIsMapArray`; a map-member union element is a `TyUnion`, so
   // the shape test excludes it. The arm row is
   // `unMemRefArrArmSlot`, and the arm's map-value slot is the ref-list layer's own
   // chokepoint `rlElemMapValMvSlot`.
   const mems: i32[] = []
-  if !unionArmMemberTys(name, mems) { return -1 }
+  if !unionMemberTysOfRow(u, mems) { return -1 }
   let i = 0
   while i < mems.length {
     if unMemIsMapArray(mems[i]) {
@@ -2316,12 +2477,12 @@ export function unionRefArrayArmSlotForMapElem(name: string, mvShape: i32) {
 // element is itself a list, kinds 4/6/7/8/9/10), or -1 when the union has no such arm or
 // more than one — an ambiguous route stays the loud reject. `emitUnionCoerce` routes an
 // ArrayLit carrier through this arm's own build so the inner lists build the arm's own leaf.
-export function unionNestedArrayArmSlot(name: string) {
+export function unionNestedArrayArmSlot(u: i32) {
   // The arm rows come off the recorded member types, asking `unMemRefArrArmSlot` (does a
   // row exist for the member's element) rather than the shape predicate `unMemIsRefElemArray`,
   // since an inert over-accept is still not an equality.
   const mems: i32[] = []
-  if !unionArmMemberTys(name, mems) { return -1 }
+  if !unionMemberTysOfRow(u, mems) { return -1 }
   let found = -1
   let n = 0
   let i = 0
@@ -2350,13 +2511,13 @@ export function unionNestedArrayArmSlot(name: string) {
 // True if the union member-set `name` has an array-of-map arm. The frame pre-pass
 // consults this (via `unionMapArrayElemIndex`) to reserve the map scratch for a `t[i][k]`
 // read on a union binding narrowed to its map-array arm, since the narrowing is not active
-// in that pass — the map-array twin of `unionHasMapArm`.
-export function unionHasMapArrayArm(name: string) {
+// in that pass — the map-array twin of `unionHasMapArmOfRow`, likewise reading row `u`.
+export function unionHasMapArrayArmOfRow(u: i32, name: string): boolean {
   const atoms: string[] = []
   // A `TyArray` over a `TyMap` (`unMemIsMapArray`). A map-member union element is a
   // `TyUnion`, never a `TyMap`, however it renders, so it is not an arm here.
   const mems: i32[] = []
-  if unionArmTys(name, atoms, mems) {
+  if unionArmTysOfRow(u, name, atoms, mems) {
     let m = 0
     while m < mems.length {
       if unMemIsMapArray(mems[m]) { return true }
@@ -2386,45 +2547,6 @@ export function nliForgetLet(letIx: i32) {
     i = i + 1
   }
   0
-}
-
-// The value-union name an un-annotated if-expression binding init carries, or "" when it
-// is not a value union the box can hold (a non-union if, a `string | null` niche, or an
-// arm the static pre-pass cannot classify). The canonical name is the deduped arm atoms in
-// arm order, with a trailing `|null` when any arm or the else-less path is null.
-export function ifExprNliName(ifIx: i32) {
-  const atoms: string[] = []
-  const hn = ifExprCollectAtoms(ifIx, atoms)
-  if hn == -2 { return "" }
-  if atoms.length == 0 { return "" }
-  // Mixed numeric arms widen to a single numeric — they are not a union, and this static
-  // atom list cannot do that lattice join. Bail so the numeric value-position-if path
-  // (`letIsF64`/`letIsI64`) handles them instead. A single numeric scalar is fine.
-  let numCount = 0
-  const kinds: i32[] = []
-  let j = 0
-  while j < atoms.length {
-    const k = valueAtomKind(atoms[j])
-    kinds.push(k)
-    if k == 0 || k == 3 || k == 4 || k == 5 { numCount = numCount + 1 }
-    j = j + 1
-  }
-  if numCount >= 2 { return "" }
-  let nm = ""
-  let i = 0
-  while i < atoms.length {
-    if nm != "" { nm = nm + "|" }
-    nm = nm + atoms[i]
-    i = i + 1
-  }
-  if hn == 1 {
-    nm = nm + "|null"
-    kinds.push(6)
-  }
-  // Only a value union the box rep can hold (≥2 non-null atoms, or one NUMERIC scalar +
-  // null) registers here — a `string | null` niche / a non-union stay on their own paths.
-  if !valueUnionFromAtomKinds(kinds) { return "" }
-  nm
 }
 
 // The only writer of `uVariants`.
@@ -2551,25 +2673,29 @@ function unionArmTysOfTy(
   atoms: string[],
   tys: i32[],
 ): boolean {
-  if ty >= 0 && unRowOfName(name) < 0 {
+  if ty >= 0 {
     const u = unRowOfTyKey(ty)
-    const st = unMemRowStart(u)
-    if u >= 0 && st >= 0 && u < unMemTyCount.length {
-      let i = 0
-      while i < unMemTyCount[u] {
-        if st + i >= unMemAtoms.length || st + i >= unMemTys.length {
-          return false
-        }
-        atoms.push(unMemAtoms[st + i])
-        tys.push(unMemTys[st + i])
-        i = i + 1
-      }
-      return true
-    }
+    if u >= 0 && unionRowArmsInto(u, atoms, tys) { return true }
     // A row-less union reads its own members, never its spelling.
-    if u < 0 { return unionTyArms(ty, atoms, tys) }
+    if u < 0 && unRowOfName(name) < 0 { return unionTyArms(ty, atoms, tys) }
   }
   unionArmTys(name, atoms, tys)
+}
+
+// Appends row `u`'s recorded atoms and member types, index-parallel; false, appending nothing,
+// when the row records no member slice.
+function unionRowArmsInto(u: i32, atoms: string[], tys: i32[]): boolean {
+  const st = unMemRowStart(u)
+  if st < 0 || u >= unMemTyCount.length { return false }
+  const n = unMemTyCount[u]
+  if st + n > unMemAtoms.length || st + n > unMemTys.length { return false }
+  let i = 0
+  while i < n {
+    atoms.push(unMemAtoms[st + i])
+    tys.push(unMemTys[st + i])
+    i = i + 1
+  }
+  true
 }
 
 // Resolves `name`'s arm spellings via `unionArmsOf` into `atoms`, then fills `tys` with their
@@ -2588,6 +2714,18 @@ export function unionArmTys(
   unionMemberTysOf(nm, tys) && tys.length == atoms.length
 }
 
+// `unionArmTys` for a caller holding `u`, the row its read of `name` carried, or -1: that row's
+// atoms and member types where it records them, else `name`'s (D16032).
+export function unionArmTysOfRow(
+  u: i32,
+  name: string,
+  atoms: string[],
+  tys: i32[],
+): boolean {
+  if !unionArmsOfRow(u, atoms) { return unionArmTys(name, atoms, tys) }
+  unionMemberTysOfRow(u, tys) && tys.length == atoms.length
+}
+
 // `isUNameAB` for a binding's annotation node, keyed on the spelling canon left on the node.
 export function isUNameAnnAB(site: i32, annIx: i32): boolean {
   isUNameAB(site, annRowOfNode(annIx))
@@ -2603,10 +2741,10 @@ export function registerValueUnionOfTy(site: i32, ty: i32): i32 {
   registerValueUnionNameAB(site, name, ty)
 }
 
-// The value-union mint's seam. `registerValueUnionName` resolves the spelling once at the
-// boundary; a switched site, mode 2, or any caller whose type `valueUnionTyIsFlat` accepts
-// mints from the caller's id instead. Armed, it then asks the read seams' question: does the
-// caller's id name the row the spelling now names.
+// The value-union mint's seam. A switched site, mode 2, or a type `valueUnionTyIsFlat` accepts
+// mints from the caller's id; any other type mints from the type its spelling reads back as
+// (`unionSpellingTyOf`), so no caller holding a type parses its name. Only a caller with no
+// type resolves the spelling.
 export function registerValueUnionNameAB(
   site: i32,
   name: string,
@@ -2616,9 +2754,38 @@ export function registerValueUnionNameAB(
     && (unSiteOnKey(site) || unABMode == 2 || valueUnionTyIsFlat(ty))
   if k {
     registerValueUnionNameTy(name, ty)
+  } else if ty >= 0 {
+    const st = unionSpellingTyOf(ty)
+    if st < 0 {
+      return emitFail("emitProgram: a value union's own type has no spelling")
+    }
+    if repShadowOn { repShadowCheckSpellTy(name, st) }
+    registerValueUnionNameTy(name, st)
   } else {
     registerValueUnionNameTy(name, declTyIxOfName(name))
   }
+  0
+}
+
+// Under the shadow harness, the type `unionSpellingTyOf` built is compared with its spelling
+// `name` parsed back: the two encode one set of rules, so a disagreement means one drifted.
+function repShadowCheckSpellTy(name: string, st: i32) {
+  spellTyChecked = spellTyChecked + 1
+  if !tySame(st, declTyIxOfName(name)) { spellTyDisagree = spellTyDisagree + 1 }
+  0
+}
+
+let spellTyChecked = 0
+let spellTyDisagree = 0
+
+// Reports `repShadowCheckSpellTy`'s tallies after the shadow sweep, then empties them. A no-op
+// unless armed.
+export function spellTyShadowSweep() {
+  if !repShadowOn { return 0 }
+  repShadowAddReason("spellTy/checked", spellTyChecked)
+  repShadowAddReason("spellTy/disagree", spellTyDisagree)
+  spellTyChecked = 0
+  spellTyDisagree = 0
   0
 }
 

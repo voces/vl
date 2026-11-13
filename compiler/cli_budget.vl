@@ -1,7 +1,7 @@
 // `cli_budget.vl` — `vl check --budget <baseline>`: a per-file lint ratchet held by the
 // lint itself. The baseline is a JSON file naming a `label`, the `writer` that rewrites
-// it, the `targets`/`exclude` to walk, the per-code `total`, the per-file counts and the
-// named `entries`; the CLI feeds every finding of a budgeted code through `budgetNote`
+// it, the `targets`/`exclude` to walk, the budgeted `codes`, the per-file counts and the
+// named `entries`; a code's total is the sum of its file rows, never stored; the CLI feeds every finding of a budgeted code through `budgetNote`
 // and prints `budgetCheckLines` or `budgetWhyLines`, or `budgetWriteText` rewrites the
 // baseline from the run. docs/internals/architecture-refactor-plan.md T2.
 
@@ -13,7 +13,6 @@ let bgLabel = ""
 let bgWriter = ""
 let bgOkText = ""
 let bgRemedyText = ""
-let bgCommit = ""
 let bgTargets: string[] = []
 let bgExclude: string[] = []
 let bgCodes: string[] = []
@@ -212,8 +211,7 @@ function bjCounts(rel: string) {
     bjExpect(':')
     const n = bjInt()
     if rel == "" {
-      bgCodes.push(code)
-      bgTotal.push(n)
+      bgCodeAdd(code)
     } else {
       bgFileRel.push(rel)
       bgFileCode.push(code)
@@ -264,14 +262,24 @@ function bjEntries() {
   0
 }
 
+// Adds `code` to the budgeted codes once.
+function bgCodeAdd(code: string) {
+  for c in bgCodes {
+    if c == code { return 0 }
+  }
+  bgCodes.push(code)
+  0
+}
+
 // Read baseline `src`, replacing any earlier one and every finding noted against it.
-// Returns "" or what is wrong with the file; a baseline must name a `label` and a `total`.
+// Returns "" or what is wrong with the file; a baseline must name a `label` and its `codes`.
+// A legacy `total` names the codes by its keys; its counts are not read, since two
+// concurrent lowerings of one stored total merge into one edit and loosen the ratchet.
 export function budgetLoad(src: string): string {
   bgLabel = ""
   bgWriter = ""
   bgOkText = ""
   bgRemedyText = ""
-  bgCommit = ""
   bgTargets = []
   bgExclude = []
   bgCodes = []
@@ -295,17 +303,31 @@ export function budgetLoad(src: string): string {
     while bjErr == "" {
       const key = bjString()
       bjExpect(':')
-      if key == "label" { bgLabel = bjString() }
-      else if key == "writer" { bgWriter = bjString() }
-      else if key == "ok" { bgOkText = bjString() }
-      else if key == "remedy" { bgRemedyText = bjString() }
-      else if key == "commit" { bgCommit = bjString() }
-      else if key == "targets" { bjStrList(bgTargets) }
-      else if key == "exclude" { bjStrList(bgExclude) }
-      else if key == "total" { bjCounts("") }
-      else if key == "files" { bjFiles() }
-      else if key == "entries" { bjEntries() }
-      else { bjSkip() }
+      if key == "label" {
+        bgLabel = bjString()
+      } else if key == "writer" {
+        bgWriter = bjString()
+      } else if key == "ok" {
+        bgOkText = bjString()
+      } else if key == "remedy" {
+        bgRemedyText = bjString()
+      } else if key == "targets" {
+        bjStrList(bgTargets)
+      } else if key == "exclude" {
+        bjStrList(bgExclude)
+      } else if key == "total" {
+        bjCounts("")
+      } else if key == "codes" {
+        const cs: string[] = []
+        bjStrList(cs)
+        for c in cs { bgCodeAdd(c) }
+      } else if key == "files" {
+        bjFiles()
+      } else if key == "entries" {
+        bjEntries()
+      } else {
+        bjSkip()
+      }
       if bjPeek() != ',' { break }
       bjPos = bjPos + 1
     }
@@ -313,7 +335,16 @@ export function budgetLoad(src: string): string {
   bjExpect('}')
   if bjErr == "" && bgLabel == "" { bjErr = "it names no `label`" }
   if bjErr == "" && bgCodes.length == 0 {
-    bjErr = "it budgets no code (`total`)"
+    bjErr = "it budgets no code (`codes`)"
+  }
+  for c in bgCodes {
+    let n = 0
+    let i = 0
+    while i < bgFileCode.length {
+      if bgFileCode[i] == c { n = n + bgFileN[i] }
+      i = i + 1
+    }
+    bgTotal.push(n)
   }
   bjCps = []
   bjErr
@@ -559,8 +590,8 @@ function bgCloseBrace(s: string, from: i32): i32 {
 }
 
 // The `--budget-why` report: per code, the entries that `LEFT`, `ENTERED` or changed count
-// between the baseline's stored `entries` and this run. Without stored entries it is one
-// line saying so, and `budgetFailed()` is true.
+// between the baseline's stored `entries` (a zero entry names nothing) and this run. Without
+// stored entries it is one line saying so, and `budgetFailed()` is true.
 export function budgetWhyLines(baselinePath: string): string[] {
   const out: string[] = []
   bgFailed = !bgHasEntries
@@ -573,7 +604,7 @@ export function budgetWhyLines(baselinePath: string): string[] {
     )
     return out
   }
-  out.push(bgLabel + ": " + bgCommit + " -> working tree")
+  out.push(bgLabel + ": baseline -> working tree")
   out.push("")
   let moved = 0
   for code in bgCodes {
@@ -582,7 +613,7 @@ export function budgetWhyLines(baselinePath: string): string[] {
     let wasSum = 0
     let i = 0
     while i < bgEntCode.length {
-      if bgEntCode[i] == code {
+      if bgEntCode[i] == code && bgEntN[i] > 0 {
         was[bgEntName[i]] = (was[bgEntName[i]] ?? 0) + bgEntN[i]
         wasNames.push(bgEntName[i])
         wasSum = wasSum + bgEntN[i]
@@ -764,10 +795,11 @@ function bgCountsJson(rel: string): string {
   out + "}"
 }
 
-// The baseline this run counted, laid out line for line as scripts/ratchet.py writes
-// one: `label`, `writer`, `targets` and `exclude` kept from the loaded baseline, `commit`
-// replaced, counts recounted, and `entries` rewritten when the loaded baseline had them.
-export function budgetWriteText(commit: string): string {
+// The baseline this run counted: `label`, `writer`, `targets` and `exclude` kept from the loaded
+// baseline, counts recounted, and `entries` rewritten when the loaded baseline had them. A loaded
+// file row or entry stays at zero, and a blank line follows each, so two lowerings of
+// different rows never touch one hunk and merge cleanly.
+export function budgetWriteText(): string {
   const body: string[] = ["{"]
   if bgLabel != "" { body.push("\"label\": " + bgQuote(bgLabel, true) + ",") }
   if bgWriter != "" {
@@ -777,21 +809,23 @@ export function budgetWriteText(commit: string): string {
   if bgRemedyText != "" {
     body.push("\"remedy\": " + bgQuote(bgRemedyText, true) + ",")
   }
-  body.push("\"commit\": " + bgQuote(commit, true) + ",")
   if bgTargets.length > 0 {
     body.push("\"targets\": " + bgQuoteList(bgTargets) + ",")
   }
   if bgExclude.length > 0 {
     body.push("\"exclude\": " + bgQuoteList(bgExclude) + ",")
   }
-  body.push("\"total\": " + bgCountsJson("") + ",")
+  body.push("\"codes\": " + bgQuoteList(bgCodes) + ",")
   body.push("\"files\": {")
+  const rels: string[] = []
+  for r in bgHitRel { rels.push(r) }
+  for r in bgFileRel { rels.push(r) }
   let rows = ""
-  for rel in bgSortedUniq(bgHitRel) {
-    if rows != "" { rows = rows + ",\n" }
+  for rel in bgSortedUniq(rels) {
+    if rows != "" { rows = rows + ",\n\n" }
     rows = rows + bgQuote(rel, true) + ": " + bgCountsJson(rel)
   }
-  body.push(rows)
+  if rows != "" { body.push(rows + "\n") }
   if bgHasEntries {
     body.push("},")
     body.push("\"entries\": [")
@@ -807,8 +841,13 @@ export function budgetWriteText(commit: string): string {
         }
         h = h + 1
       }
+      let e = 0
+      while e < bgEntCode.length {
+        if bgEntCode[e] == code { names.push(bgEntName[e]) }
+        e = e + 1
+      }
       for x in bgSortedUniq(names) {
-        if ents != "" { ents = ents + ",\n" }
+        if ents != "" { ents = ents + ",\n\n" }
         ents = ents
           + "["
           + bgQuote(code, false)
@@ -819,7 +858,7 @@ export function budgetWriteText(commit: string): string {
           + "]"
       }
     }
-    body.push(ents)
+    if ents != "" { body.push(ents + "\n") }
     body.push("]")
   } else {
     body.push("}")
@@ -839,82 +878,4 @@ export function budgetWroteLine(baselinePath: string): string {
     i = i + 1
   }
   out
-}
-
-// The checkout's HEAD commit, resolved through the host's file reads alone: a linked
-// worktree's `.git` file names its git dir, `commondir` the shared one, and a branch
-// resolves through its loose ref or `packed-refs`. `budgetGitStart` returns the first
-// path to read and `budgetGitStep` each next one, or "" once `budgetGitCommit` is known.
-let bgGitStage = 0
-let bgGitDir = ""
-let bgGitCommon = ""
-let bgGitRef = ""
-let bgGitSha = ""
-// HEAD's 9-character prefix, as `git rev-parse --short` prints it for this tree; "" when
-// HEAD could not be resolved.
-export function budgetGitCommit(): string {
-  if bgGitSha.length > 9 { return bgGitSha.slice(0, 9) }
-  bgGitSha
-}
-export function budgetGitStart(): string {
-  bgGitStage = 0
-  bgGitDir = ".git"
-  bgGitCommon = ""
-  bgGitRef = ""
-  bgGitSha = ""
-  ".git"
-}
-export function budgetGitStep(found: boolean, src: string): string {
-  const text = bgTrim(src)
-  if bgGitStage == 0 {
-    if found && text.length > 7 && text.slice(0, 7) == "gitdir:" {
-      bgGitDir = bgTrim(text.slice(7, text.length))
-    }
-    bgGitStage = 1
-    return bgGitDir + "/HEAD"
-  }
-  if bgGitStage == 1 {
-    if !found { return "" }
-    if text.length > 4 && text.slice(0, 4) == "ref:" {
-      bgGitRef = bgTrim(text.slice(4, text.length))
-      bgGitStage = 2
-      return bgGitDir + "/commondir"
-    }
-    bgGitSha = text
-    return ""
-  }
-  if bgGitStage == 2 {
-    bgGitCommon = bgGitDir
-    if found && text != "" {
-      bgGitCommon = text
-      if text[0] != '/' { bgGitCommon = bgGitDir + "/" + text }
-    }
-    bgGitStage = 3
-    return bgGitCommon + "/" + bgGitRef
-  }
-  if bgGitStage == 3 {
-    if found && text != "" {
-      bgGitSha = text
-      return ""
-    }
-    bgGitStage = 4
-    return bgGitCommon + "/packed-refs"
-  }
-  if found { bgGitSha = bgPackedRef(src, " " + bgGitRef) }
-  ""
-}
-// The sha on the `packed-refs` line ending in `suffix`, or "".
-function bgPackedRef(src: string, suffix: string): string {
-  let a = 0
-  let i = 0
-  while i <= src.length {
-    if i == src.length || src[i] == '\n' {
-      const l = bgTrim(src.slice(a, i))
-      const k = l.length - suffix.length
-      if k > 0 && l.slice(k, l.length) == suffix { return l.slice(0, k) }
-      a = i + 1
-    }
-    i = i + 1
-  }
-  ""
 }

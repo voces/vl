@@ -1,16 +1,13 @@
+import { unRowOfNullableKey } from "./emit_union_tykey_text"
+import { valueRowKind } from "./check_ty_rep"
+import { numPrimTyOfKind } from "./tyquery"
 import { mapStoredTyOf } from "./check_fn_tag_facts"
-import { cUserTypes } from "./check_types"
+import { TY_V128, cUserTypes } from "./check_types"
 import { storageNormTy, widenLitTy } from "./check_relate_core"
-import { unionTyArms } from "./emit_map_twins"
+import { unionTyMemberTys } from "./emit_map_twins"
 import { REC_STORE_DEPTH } from "./check_ty_relate"
 import { registeredUnionRowOfTy } from "./emit_start_block"
-import {
-  msHasNull,
-  msSetOfTy,
-  rlElemUnionRow,
-  unionMemberAtomsOf,
-  unionMemberAtomsOfRow,
-} from "./emit_union_registry"
+import { msHasNull, msSetOfTy, rlElemUnionRow } from "./emit_union_registry"
 import { valueTailLeaves } from "./check_num_adopt"
 import { callBuiltTy } from "./check_store_rep"
 import { emitFail } from "./emit_bytes"
@@ -33,7 +30,7 @@ import { clsCensusReset } from "./emit_cls_census"
 // The character grammars over a type-name string come from `compiler/tyname.vl` directly,
 // not through the republications in `emit_base.vl` and `typecheck.vl`.
 // `isTopLevelFuncTypeName` stays out of it because it also writes the module-level
-// `funcArrowAt` bank; `nameIsShapeSpanEnds` and `mapValNameOf`, because their span differs.
+// `funcArrowAt` bank; `mapValNameOf`, because its span differs.
 import { collectRetValues } from "./check_nj_join"
 import { parenPeelIx } from "./check_places"
 import {
@@ -159,7 +156,7 @@ import {
   fnTagRetIsTagged,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
-import { canonUnionMembersInto } from "./check_program"
+import { canonUnionMemberTysOf } from "./check_program"
 import {
   inferRetFnKey,
   mapDeliveryRecorded,
@@ -178,7 +175,6 @@ import {
   tyIsNulLitUnionNiche,
   tyIsNullUnit,
   tyIsValueUnionBox,
-  valueAtomKind,
 } from "./check_ty_rep"
 import { listDisjointDepth, nameIsNewtypeBrand } from "./check_type_shape"
 import { recFreshDeclOf } from "./check_rec_fresh"
@@ -203,6 +199,7 @@ import {
   TyVar,
   litBaseTy,
   litUnionAliasNameOfTy,
+  memberTyIn,
   mkArrayTy,
   mkFuncTy,
   mkNullableTy,
@@ -598,7 +595,10 @@ import {
 } from "./emit_ref_list_kinds"
 import {
   RepDesc,
+  boxAtomKindOfMemberTy,
   boxTagOfTy,
+  msSliceCount,
+  msSliceTy,
   nodeMapValTyIx,
   nodeRepIs,
   nodeRepIsAtom,
@@ -817,7 +817,6 @@ import {
   mvValRep,
   nestedNameBySid,
   rlElemName,
-  rlElemNullable,
   rlElemTyIx,
   rlListOfRowMint,
   sFieldCount,
@@ -886,6 +885,7 @@ import {
   mvShapeOfMapHeldTy,
   nliNameOf,
   rlElemMapShape,
+  rlKeyTyOf,
   rlMintNameOfTy,
   rlRowNameOfTy,
   unionNameOfVariant,
@@ -907,7 +907,7 @@ import {
   isUNameABTyMayHit,
   msMemberAtomsOfSet,
   msMemberTysOfSet,
-  msSetOfRowOr,
+  msSetOfRow,
   msSetOfTyAny,
   msSoleMemberTy,
   msTextOf,
@@ -942,7 +942,6 @@ import {
   sidOfNode,
   sidText,
 } from "./symbols"
-import { peelGroupParens } from "./tyname"
 import { recNarrowRecordOf, recRepWidens } from "./check_bind_adopt"
 import {
   recEnclosingFn,
@@ -4473,7 +4472,7 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
       const munRow = unReadRowOut
       if mun != "" {
         const mAtoms: string[] = []
-        unionArmsOfSet(mun, msSetOfRowOr(munRow, mun), mAtoms)
+        unionArmsOfSet(mun, msSetOfRow(munRow), mAtoms)
         // The arm's struct row can be asked for by type: `unionMemberTysOf` appends
         // member types in the same order `splitUnionAtoms` cuts names, so the two arrays pair up.
         const mTys: i32[] = []
@@ -4722,6 +4721,8 @@ export function spreadDestKind(arrIx: i32, fnIx: i32): ListKind | null {
     if src >= 0 { k = mfRecvKindOf(src, fnIx) }
     i = i + 1
   }
+  // No source carries a kind (each is an untyped `[]`): the literal builds at its own list type.
+  if k == null { k = mfRecvKindOf(arrIx, fnIx) }
   if k == null { return null }
   // A union element whose sources each box into it builds at its union-box row.
   if (
@@ -7202,8 +7203,14 @@ function arrLitElemKeyTyTpl(arrIx: i32): i32 {
   if arrLitMapElemName(arrIx, -1) != "" {
     return mapStoredTyOf(tyArrayElemIx(nodeTyAt(arrIx, -1)))
   }
+  // A declared name is its declaration; a rendered record name is the row type its render names,
+  // where closed; an `#anon` row is keyed by its recorded type downstream.
   const ann = arrLitNominalElemName(arrIx, -1)
-  if ann != "" { return cUserTypes[ann] ?? -1 }
+  if ann != "" {
+    const declTy = cUserTypes[ann] ?? -1
+    if declTy >= 0 || ann[0] == '#' { return declTy }
+    return rlKeyTyOf(arrLitNominalRowTy(arrIx, -1))
+  }
   if arrLitNestedElemName(arrIx, -1) != "" {
     const held = heldListElemTy(arrIx)
     return storageNormTy(
@@ -9947,6 +9954,17 @@ export function unionNameOfRead(atIx: i32, fnIx: i32) {
   regUnionNameOfTy(k)
 }
 
+// `unionNameOfRead` that also appends to `rowOut` the row it named the read by, -1 for none.
+export function unionNameRowOfRead(
+  atIx: i32,
+  fnIx: i32,
+  rowOut: i32[],
+): string {
+  const n = unionNameOfRead(atIx, fnIx)
+  rowOut.push(unReadRowOut)
+  n
+}
+
 // The row the last `unionNameOfRead` named its read by, -1 where it answered no type-keyed or
 // declared row. Written as that call's last step, so its caller reads it before any other call.
 let unReadRowOut = -1
@@ -10181,7 +10199,10 @@ function letUnionNameOfGo(letIx: i32, fnIx: i32): string {
       // its inferred `T|null` value union (A-infer-null).
       const nli = nliNameOf(letIx)
       if nli != "" { return nli }
-      return letNulScalarBoxName(letIx, fnIx)
+      letNulScalarBoxRowOut = -1
+      const nsb = letNulScalarBoxName(letIx, fnIx)
+      if nsb != "" { letRowLast = letNulScalarBoxRowOut }
+      return nsb
     }
   }
   ""
@@ -10213,7 +10234,25 @@ export function letNulScalarBoxName(letIx: i32, fnIx: i32): string {
     if u >= 0 { name = unNames[u] }
   }
   if name == "" || repOfTy(ty).rdKind != "union" { return "" }
+  letNulScalarBoxRowOut = nulScalarBoxRowOf(ty)
   name
+}
+
+// The row `letNulScalarBoxName`'s last answer is named by, -1 for none.
+let letNulScalarBoxRowOut = -1
+
+// The row a binding of type `ty` boxes in as `T | null`: the key of the scalar box its member's
+// rep names, else `ty`'s own key.
+function nulScalarBoxRowOf(ty: i32): i32 {
+  if nulNumScalarUnionName(ty) != "" {
+    const t = tyAt(ty)
+    if t is TyNullable {
+      const k = valueRowKind(t.nInner)
+      const p = if k == 14 { TY_V128 } else { numPrimTyOfKind(k) }
+      return unRowOfNullableKey(p)
+    }
+  }
+  unRowOfTyKey(ty)
 }
 
 // The value union a name, or a narrowed field or element read, at `ix` is narrowed to, when it
@@ -10378,6 +10417,17 @@ let unNameRowLast = -1
 // The row behind the name the last completed `unionNameOfExpr` call returned, or -1.
 let unNameRowOut = -1
 
+// `unionNameOfExpr` that also appends to `rowOut` the row behind the name it returns, -1 for none.
+export function unionNameOfExprRow(
+  exprIx: i32,
+  fnIx: i32,
+  rowOut: i32[],
+): string {
+  const n = unionNameOfExpr(exprIx, fnIx)
+  rowOut.push(unNameRowOut)
+  n
+}
+
 // The union `exprIx`'s box is built in, named off its box type, else off its own type; `rowOut`
 // gets the row that type keys, then the type. A nullable's miss names its non-null part's union.
 // Where no type names one, `unionNameOfExprFloor` answers, with its row (-1 when it read a
@@ -10450,33 +10500,22 @@ function unionNameOfExprFloor(exprIx: i32, fnIx: i32): string {
   unionNameOfExpr(exprIx, fnIx)
 }
 
-// The arms of union type `ty`: each member's atom into `atoms` and its variant row into `rows`,
-// the union's own row of that member type, else the first row of it. False, appending nothing,
+// The arms of union type `ty`: each member's variant row into `rows`, the union's own row of
+// that member type, else the first row of it. False, appending nothing,
 // where `ty`'s arms do not resolve.
-export function armRowsOfUnionTy(
-  ty: i32,
-  atoms: string[],
-  rows: i32[],
-): boolean {
+export function armRowsOfUnionTy(ty: i32, rows: i32[]): boolean {
   const tys: i32[] = []
-  armRowTysOfUnionTy(ty, atoms, tys, rows)
+  armRowTysOfUnionTy(ty, tys, rows)
 }
 
 // `armRowsOfUnionTy` that also appends each arm's member type into `tys`.
-export function armRowTysOfUnionTy(
-  ty: i32,
-  atoms: string[],
-  tys: i32[],
-  rows: i32[],
-): boolean {
-  const a: string[] = []
+export function armRowTysOfUnionTy(ty: i32, tys: i32[], rows: i32[]): boolean {
   const t: i32[] = []
-  if !unionTyArms(ty, a, t) || a.length != t.length { return false }
+  if !unionTyMemberTys(ty, t) { return false }
   const u = unRowOfTyKey(ty)
   let i = 0
   while i < t.length {
     const r = unionArmRowOfTy(u, t[i])
-    atoms.push(a[i])
     tys.push(t[i])
     rows.push(if r >= 0 { r } else { exactArmRowOfTy(t[i]) })
     i = i + 1
@@ -10484,30 +10523,45 @@ export function armRowTysOfUnionTy(
   true
 }
 
-// The arms of the union value `exprIx` produces (`armRowsOfUnionTy` of its box type), else of the
-// union it names. False when it is not a union value.
-export function unionArmRowsOfExpr(
+// The box kind and variant row of each arm of the union value `exprIx`: the arms of its box type,
+// else of the row of the union it names (`boxAtomKindOfMemberTy` per arm). False when it is not a union
+// value or names no row.
+export function unionArmKindRowsOfExpr(
   exprIx: i32,
   fnIx: i32,
-  atoms: string[],
+  kinds: i32[],
   rows: i32[],
 ): boolean {
   if !exprUnion(exprIx, fnIx) { return false }
   const ty = unionBoxTyIxOfExpr(exprIx, fnIx)
-  if ty >= 0 && armRowsOfUnionTy(ty, atoms, rows) { return true }
-  if !unionArmAtomsOfExpr(exprIx, fnIx, atoms) { return false }
-  for a in atoms { rows.push(exactArmRowOfTy(cUserTypes[a] ?? -1)) }
-  true
-}
-
-// The member atoms of the union `exprIx` names, read off its row where the rung that named it
-// read one, else off the name. False when it names no union.
-function unionArmAtomsOfExpr(exprIx: i32, fnIx: i32, out: string[]): boolean {
-  const rs: i32[] = []
-  const n = unionNameRowOfExpr(exprIx, fnIx, rs)
-  if n == "" { return false }
-  if rs[0] >= 0 && unionMemberAtomsOfRow(rs[0], out) { return true }
-  unionMemberAtomsOf(n, out)
+  const tys: i32[] = []
+  if ty < 0 || !armRowTysOfUnionTy(ty, tys, rows) {
+    const rs: i32[] = []
+    if unionNameRowOfExpr(exprIx, fnIx, rs) == "" { return false }
+    const u = rs[0]
+    const n = if u >= 0 { msSliceCount(u) } else { -1 }
+    let i = 0
+    while i < n {
+      tys.push(msSliceTy(u, i))
+      rows.push(exactArmRowOfTy(msSliceTy(u, i)))
+      i = i + 1
+    }
+    if n < 0 {
+      // A nullable no row records (a map read's miss) has two arms: its non-null part and null.
+      const nt = nodeTyAt(unwrapParen(exprIx), fnIx)
+      if nt < 0 || nt >= T.tys.length || !(tyAt(nt) is TyNullable) {
+        emitFail(
+          "emitProgram: a union value's arms were asked of a union no member row records",
+        )
+        return false
+      }
+      tys.push(tyPeelNul(nt))
+      rows.push(exactArmRowOfTy(tyPeelNul(nt)))
+      tys.push(-1)
+      rows.push(-1)
+    }
+  }
+  for t in tys { kinds.push(boxAtomKindOfMemberTy(t)) }
   true
 }
 
@@ -11182,7 +11236,7 @@ export function sharedUnionFieldPlan(
     const unr: i32[] = []
     const un = unionNameRowOfExpr(recvIx, fnIx, unr)
     set = unionMemberSetOfRow(unr[0], un)
-    setId = msSetOfRowOr(unr[0], un)
+    setId = msSetOfRow(unr[0])
   }
   if set == "" { return -1 }
   const atoms: string[] = []
@@ -11322,7 +11376,7 @@ export function memReadNarrowOp(memIx: i32, fnIx: i32): i32 {
   if !memRecvIsRecord(memIx, fnIx) { return -1 }
   const nk = memFieldNumKind(memIx, fnIx)
   const wk = if nk == 3 || nk == 4 || nk == 5 { nk } else { -1 }
-  atomNarrowOp(wk, valueAtomKind(own))
+  atomNarrowOp(wk, boxTagOfTy(ty))
 }
 
 // Whether the checker typed the receiver of the field read at `memIx` as a record, `| null`
@@ -11385,23 +11439,21 @@ export function memReadBoxPlan(memIx: i32, fnIx: i32, out: i32[]): i32 {
     if t is TyNullable { ot = t.nInner }
     const own = tyFieldTyOf(ot, m.memProp)
     const phys = sFieldElemTyIxAt(si, fi)
-    const oa: string[] = []
-    const pa: string[] = []
-    if !canonUnionMembersInto(own, [], oa) { return 0 }
-    if !canonUnionMembersInto(phys, [], pa) { return 0 }
+    const oTys: i32[] = []
+    const pTys: i32[] = []
+    if !canonUnionMemberTysOf(own, oTys) { return 0 }
+    if !canonUnionMemberTysOf(phys, pTys) { return 0 }
     out.push(own)
     out.push(phys)
     let narrowed = 0
-    let i = 0
-    while i < pa.length {
+    for pt in pTys {
       // A stored `null` the own type lacks holds no value a read at that type sees (D3403).
-      if !strListHas(oa, pa[i]) && pa[i] != "null" {
-        const k = boxNarrowAtomFor(pa[i], oa, pa)
+      if pt >= 0 && !isNullTy(pt) && !memberTyIn(pt, oTys) {
+        const k = boxNarrowAtomFor(pt, oTys, pTys)
         if k == -2 { return 2 }
         if k < 0 { return 0 }
         narrowed = 1
       }
-      i = i + 1
     }
     return narrowed
   }
@@ -13521,9 +13573,10 @@ export function identLetOfRead(readIx: i32, fnIx: i32) {
   -1
 }
 
-// The function-type annotation name (`(f64)=>f64`) of the `let`/`const`/global binding the read
-// `readIx` in `fnIx` resolves to, or "" when it is not a function-typed binding.
-export function identFnTypeAnnNameOfRead(readIx: i32, fnIx: i32) {
+// Whether the `let`/`const`/global binding the read `readIx` in `fnIx` resolves to is
+// function-typed: by annotation, by a nullable-closure annotation, by an init the arena types as
+// a function and can spell, or as a closure element of a ref list.
+export function identReadIsFnAnnotated(readIx: i32, fnIx: i32): boolean {
   if fnIx >= 0 && readIx >= 0 {
     const fn = nodeAt(fnIx)
     if fn is FuncDecl {
@@ -13535,49 +13588,36 @@ export function identFnTypeAnnNameOfRead(readIx: i32, fnIx: i32) {
       if li >= 0 {
         const d = nodeAt(li)
         if d is LetDecl {
-          if tyIsFuncType(d.letType) { return tyNameOf(d.letType) }
-          // A nullable-closure annotation (kind 19): return its name so a narrowed call
-          // through a null-seeded binding resolves its sig even with no closure value to trace.
-          if nulCloFlag(d.letType) == 1 { return tyNameOf(d.letType) }
+          if tyIsFuncType(d.letType) { return true }
+          // A nullable-closure annotation (kind 19) counts, so a narrowed call through a
+          // null-seeded binding resolves its sig even with no closure value to trace.
+          if nulCloFlag(d.letType) == 1 { return true }
           // An un-annotated closure local from a call result: recover the function type from
           // the checker's recorded init type — a bare lambda instead trusts its own lifted sig.
           if d.letType < 0 && d.letInit >= 0 {
             const ini = nodeAt(d.letInit)
             if ini is Call {
-              // The arena test before the render: the two conditions are ANDed, so this builds
-              // the name only for an init the arena already agreed is a function type.
+              // A function type the arena holds but cannot spell is not one a call can resolve
+              // a sig through: it falls to the arms below rather than answering here.
               if nodeTyIsFunc(d.letInit) {
-                const itn = nodeTyName(d.letInit)
-                if itn != "" { return itn }
+                if nodeTyName(d.letInit) != "" { return true }
               }
             }
             // A copy of another closure binding: the init is a bare Ident, so its checked type
             // is authoritative (unlike a lambda's inferred return, which can disagree).
             if ini is BinExpr {
               if ini.binOp == "??" {
-                // The arena test before the render, as the Call arm above: builds the name
-                // only for an init the arena already agreed is a function type.
-                if nodeTyIsFunc(d.letInit) {
-                  const jtn = nodeTyName(d.letInit)
-                  if jtn != "" { return jtn }
-                }
+                if nodeTyIsFunc(d.letInit) { return true }
               }
             }
-            // An un-annotated binding read from a closure-element ref list: the kind-5 slot's
-            // element name is the function type — return it so a call resolves the element's real sig.
+            // An un-annotated binding read from a closure-element ref list: the kind-5 slot
+            // holds the element's function type, which a call resolves its real sig through.
             if ini is Index {
               if exprRefArray(ini.idxArr, fnIx) {
                 const islot = refListSlotOfExpr(ini.idxArr, fnIx)
                 if islot >= 0 && islot < rlElemTyIx.length {
                   if rlElemKindAt(islot) == RLK_CLOSURE {
-                    const enm = rlElemName[islot]
-                    if (
-                      islot < rlElemNullable.length
-                      && rlElemNullable[islot] == 1
-                    ) {
-                      return enm
-                    }
-                    return peelGroupParens(enm)
+                    return rlElemName[islot] != ""
                   }
                 }
               }
@@ -13593,12 +13633,12 @@ export function identFnTypeAnnNameOfRead(readIx: i32, fnIx: i32) {
   if gi >= 0 {
     const gd = nodeAt(gi)
     if gd is LetDecl {
-      if tyIsFuncType(gd.letType) { return tyNameOf(gd.letType) }
+      if tyIsFuncType(gd.letType) { return true }
       // The dual of the local nulclosure-annotation arm above.
-      if nulCloFlag(gd.letType) == 1 { return tyNameOf(gd.letType) }
+      if nulCloFlag(gd.letType) == 1 { return true }
     }
   }
-  ""
+  false
 }
 
 // The identifier node the un-annotated binding the read `readIx` resolves to copies, or -1: the
@@ -13671,8 +13711,7 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   // Positioned throughout (D2316): two sibling FUNCTION-scoped blocks binding one name are as
   // ambiguous unpositioned as two sibling module-scoped ones (D1751).
   const csid = sid
-  const an = identFnTypeAnnNameOfRead(atIx, fnIx)
-  if an != "" {
+  if identReadIsFnAnnotated(atIx, fnIx) {
     // The arena builds the key where the binding carries a plain annotation; `cloNameSigKeyTy`
     // is the fall-through over the joined or callee type. B255.
     const jnd = identFnTypeAnnNodeOfRead(atIx, fnIx)
@@ -14401,6 +14440,7 @@ export function classifyStateReset() {
   holeReadRowOut = -1
   letRowLast = -1
   letRowOut = -1
+  letNulScalarBoxRowOut = -1
   memFieldRowCur = -1
   memFieldRowOut = -1
   storageReadLeave(-1)

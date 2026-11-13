@@ -1,4 +1,5 @@
-import { unionArmRowsOfExpr } from "./emit_classify"
+import { nomNameOfTy } from "./check_types"
+import { unionArmKindRowsOfExpr } from "./emit_classify"
 import { rlElemNonNulTyAt } from "./emit_map_value_slots"
 
 // `emit_collect.vl` — the emitter's collection passes: the pre-lowering walks that fill
@@ -44,7 +45,6 @@ import {
   fnTagSetIsTagged,
   fnTagSetOfTy,
 } from "./check_elab_cap"
-import { nameIsFuncTypeAtom, peelGroupParens } from "./tyname"
 import {
   ambientCtorCalls,
   gaParamNames,
@@ -64,7 +64,12 @@ import {
   optCallRetNameAt,
   optCallRetNodeAt,
 } from "./check_call_resolve"
-import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
+import {
+  canonRewroteNode,
+  canonRewroteSlot,
+  canonTyIxOf,
+  udMemberTyAt,
+} from "./check_canon_raw"
 import { collectRetValues, unionAliasMembers } from "./check_nj_join"
 import { declAnnRawTyName, declAnnTyOf } from "./check_gen_alias_anns"
 import { fieldNameOrder } from "./check_obj_shape"
@@ -128,7 +133,6 @@ import {
   tyIsOneStrLit,
   tyLitMemberTexts,
   tyMayHoldFn,
-  tyMembersDistinctRecords,
   tyMentionsTyVarNamed,
   tyNomNameCycled,
   tyNulInnerIsPrim,
@@ -178,6 +182,8 @@ import {
   Spread,
   StrLit,
   TS_ARR,
+  TS_OBJ,
+  TS_PAREN,
   TypeDecl,
   TypeRef,
   Unary,
@@ -197,7 +203,11 @@ import {
   nodeChildren,
   nodeChildrenPush,
   nodeSpineChildren,
+  tsKidCount,
+  tsKidStart,
+  tsKids,
   tsKind,
+  udTsRootAt,
   valueIfNodes,
 } from "./ast"
 import {
@@ -213,7 +223,6 @@ import {
   strLess,
   tyIsFuncType,
   tyNameOf,
-  unionStructAliasShape,
   unwrapParen,
 } from "./emit_base"
 import {
@@ -679,7 +688,7 @@ import {
 } from "./emit_lit_atoms"
 import {
   mapTwinDropSlots,
-  unionTyArms,
+  unionTyMemberTys,
   variantFirstLayoutDisagreeField,
   variantLitRepMismatch,
   variantLitRepUnifiable,
@@ -800,7 +809,6 @@ import {
   ensureRefElemTys,
   forceCloResultListTypes,
   forceCloResultMapTypes,
-  ifExprNliName,
   isUnionOfTy,
   markMapUnionArms,
   markMapUnionArmsRow,
@@ -811,7 +819,7 @@ import {
   mvShapeOfMapNodeTy,
   mvShapeOfValTyMint,
   refRowIndexReset,
-  registerValueUnionName,
+  registerAnonUnionField,
   registerValueUnionNameAB,
   registerValueUnionOfTy,
   rlInternNameTy,
@@ -880,7 +888,6 @@ import {
   oneListUnionAliasName,
   tyIsValueUnionBox,
   tyMapKeyKindSpan,
-  valueAtomKind,
 } from "./check_ty_rep"
 import { valueUnionRetName } from "./check_ret_names"
 import {
@@ -3605,12 +3612,12 @@ function leqgNoteRep(kind: i32, slot: i32, depth: i32) {
 // the ordinary list core over two wrappers. Every arm, not the one the operands pick: the
 // lowering emits a compare per shared arm, and under-reserving is invalid wasm.
 function leqNoteUnionArms(exprIx: i32, fnIx: i32) {
-  const arms: string[] = []
+  const kinds: i32[] = []
   const rows: i32[] = []
-  if !unionArmRowsOfExpr(exprIx, fnIx, arms, rows) { return 0 }
+  if !unionArmKindRowsOfExpr(exprIx, fnIx, kinds, rows) { return 0 }
   let ui = 0
-  while ui < arms.length {
-    const lk = leqCoreKindOfAtomKind(valueAtomKind(arms[ui]))
+  while ui < kinds.length {
+    const lk = leqCoreKindOfAtomKind(kinds[ui])
     if lk >= 0 { leqgNoteRep(lk, 0, 0) }
     // D1096 — a list field of a struct arm needs a frame for the same reason a list arm does:
     // the arm's own compare walks its variant row field by field, so a list-repped field runs
@@ -6466,6 +6473,7 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
     const elemNames: string[] = []
     const elemRowTys: i32[] = []
     const elemKeys: i32[] = []
+    const elemUnionTys: i32[] = []
     let ok = true
     let fi = 0
     while fi < fields.length {
@@ -6484,6 +6492,11 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         if code < 0 && fnIx >= 0 { code = anonInstPrimCode(f.fiValue, fnIx) }
         const nullBox = if code == FC_NUL_NONE { anonNullFieldBox(ai, f.fiName) } else { "" }
         if nullBox != "" { code = FC_UNION }
+        // The type a union field's box name is rendered from (`anonNullFieldBox`,
+        // `anonUnionFieldName`), so its mint reads the type rather than the name.
+        elemUnionTys.push(
+          if nullBox != "" { recFieldTyOf(nodeTyIxOf(ai), f.fiName) } else if code == FC_UNION { nodeTyIxOf(f.fiValue) } else { -1 },
+        )
         if code == FC_MAP && !anonMapFieldDestAdmits(ai, f.fiName) { code = -1 }
         if code < 0 { ok = false }
         codes.push(code)
@@ -6567,7 +6580,12 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
       // leaf set is named nowhere else, so without it `struct.new` builds a raw scalar, not a box.
       let rj = 0
       while rj < codes.length {
-        if codes[rj] == FC_UNION { registerValueUnionName(elemNames[rj]) }
+        if (
+          codes[rj] == FC_UNION
+          && registerAnonUnionField(elemNames[rj], elemUnionTys[rj]) < 0
+        ) {
+          return -1
+        }
         rj = rj + 1
       }
     }
@@ -6948,8 +6966,7 @@ export function collectS(stmts: i32[]) {
     // A struct-alias union decl (a single inline-shape variant) is a plain named struct: intern
     // it here, since `collectU` skipped it.
     if s is UnionDecl {
-      const aliasShape = unionDeclStructAlias(s)
-      if aliasShape != "" {
+      if unionDeclStructAlias(stmts[i], s) {
         if internShapeAs(s.udName) < 0 { return -1 }
       }
     }
@@ -7977,7 +7994,7 @@ function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
   // A ref-array arm interns its element shape and reflist slot, the twin of the value-atom
   // marking above; this early call ensures the element struct is in `sNames` before heap assignment.
   markRefArrayArms(mintTyIx)
-  if registerRefArrayArmUnions(stmts, atoms, atomTys) < 0 { return -1 }
+  if registerRefArrayArmUnions(stmts, atomTys) < 0 { return -1 }
   // A map arm interns its value shape and forces the shared map heap flags, the map twin of
   // the ref-array marking; this keeps the inline and named spellings identical.
   markMapUnionArms(mintTyIx)
@@ -7985,18 +8002,14 @@ function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
 }
 
 // `mintInlineUnion`'s ref-array arms: an arm whose element is itself a union of two or more
-// registers that inner union, `atomTys[i]` being atom `i`'s arena row. Returns 0, or -1 once failed.
-function registerRefArrayArmUnions(
-  stmts: i32[],
-  atoms: string[],
-  atomTys: i32[],
-): i32 {
+// registers that inner union, unless the arm is a list a box tags directly. Returns 0, or -1 once failed.
+function registerRefArrayArmUnions(stmts: i32[], atomTys: i32[]): i32 {
   // A list arm whose element is itself a union registers that inner union too, the
   // arm-position twin of the whole-type list-element recursion above.
   let rai = 0
-  while rai < atoms.length && rai < atomTys.length {
+  while rai < atomTys.length {
     const el = tyStepElem(atomTys[rai])
-    if (el >= 0 && tyIsUnionOrNullable(el) && valueAtomKind(atoms[rai]) < 0) {
+    if (el >= 0 && tyIsUnionOrNullable(el) && boxTagOfTy(atomTys[rai]) < 0) {
       if registerInlineUnionOfChild(stmts, el, 40) < 0 { return -1 }
     }
     rai = rai + 1
@@ -8029,15 +8042,14 @@ function nliHoleHasType(walk: i32[], i: i32): i32 {
 }
 
 // Infers + registers the value union of an un-annotated `const x = <if-expression>` in the
-// `nli` tables, so `nliNameOf` drives classification and emit reuses the annotated-binding lowering. The union name comes from
-// the checker's `inferLetNameOf`, falling back to `ifExprNliName` when that carries none.
+// `nli` tables, so `nliNameOf` drives classification and emit reuses the annotated-binding
+// lowering. The union name is the checker's `inferLetNameOf`; none, and nothing registers.
 function nliInferIfLet(walk: i32[], i: i32) {
   const s = nodeAt(walk[i])
   if s is LetDecl {
     if s.letType < 0 && s.letInit >= 0 {
       if exprIsIfStmt(s.letInit) {
-        let nn = inferLetNameOf(walk[i])
-        if nn == "" { nn = ifExprNliName(s.letInit) }
+        const nn = inferLetNameOf(walk[i])
         if nn != "" {
           registerValueUnionOfTy(21, nodeTyIxOf(s.letInit))
           nliLetIxs.push(walk[i])
@@ -9047,39 +9059,42 @@ function collectUReset() {
   0
 }
 
-// The one struct shape a union decl `s` lowers as, or "" when it lowers as a union. Arms
-// that differ only in a lone literal spell one softened shape yet are distinct types, so
-// they keep the box their type names and share its row (D5157).
-function unionDeclStructAlias(s: UnionDecl): string {
-  const shape = unionStructAliasShape(s.udVariants)
-  if shape == "" { return "" }
-  const hit = cUserTypes[s.udName]
-  if hit is i32 {
-    const ut = tyAt(hit)
-    if ut is TyUnion {
-      if tyIsValueUnionBox(hit) && tyMembersDistinctRecords(ut.uMembers) {
-        return ""
-      }
-    }
+// Whether union decl `s` at node `sx` lowers as one struct: every member is one anonymous record
+// type (D446) that no declaration, brand or application names, written as that record. A member
+// canon folded is one; an unfolded member keeps the author's spelling, read as source. Arms
+// differing only in a lone literal are distinct types, so they keep their box (D5157).
+function unionDeclStructAlias(sx: i32, s: UnionDecl): boolean {
+  const n = s.udVariants.length
+  if n == 0 { return false }
+  if !canonRewroteSlot(sx, 0) && !memberWrittenAsRecord(sx, 0) { return false }
+  const first = udMemberTyAt(sx, 0)
+  if first < 0 || !(tyAt(first) is TyObj) { return false }
+  if (
+    structNameOfTy(first) != ""
+    || genAppNameOfTy(first) != ""
+    || nomNameOfTy(first) != ""
+  ) {
+    return false
   }
-  shape
+  let k = 1
+  while k < n {
+    const t = udMemberTyAt(sx, k)
+    if t < 0 || !tySame(t, first) { return false }
+    k = k + 1
+  }
+  true
 }
 
-// The row member position of the declared union's arm `vs[vi]`: the member spelled alike at the
-// same occurrence, since twin arms that differ only in a numeric tag share one spelling. -1 for
-// an arm the row does not spell (an expanded alias), which resolves its own name.
-function declVariantPos(vs: string[], vi: i32, atoms: string[]): i32 {
-  let nth = 0
-  let j = 0
-  while j < vi {
-    if vs[j] == vs[vi] { nth = nth + 1 }
-    j = j + 1
-  }
+// The row member position of a declared union's arm of type `ty`: the first member of that type
+// no earlier arm took, so twin arms keep their order. -1 for an arm the row holds under no member
+// of its type, which keeps its own type.
+function declVariantPos(ty: i32, memTys: i32[], taken: i32[]): i32 {
+  if ty < 0 { return -1 }
   let k = 0
-  while k < atoms.length {
-    if atoms[k] == vs[vi] {
-      if nth == 0 { return k }
-      nth = nth - 1
+  while k < memTys.length {
+    if memTys[k] >= 0 && !i32ListHas(taken, k) && tySame(memTys[k], ty) {
+      taken.push(k)
+      return k
     }
     k = k + 1
   }
@@ -9155,12 +9170,14 @@ function unionArmsAreScalarsOrContainers(ty: i32): boolean {
 // Whether each record arm `s` names is a variant of row `kr`: by its own name, or as a layout
 // twin of one of the row's arms (`V = D | S` beside `U = C | S`, `D` typed as `C`). Twins are one
 // set (D1712), so a twin takes the first such arm no other arm of `s` names or has taken.
-function declArmsMatchRow(s: UnionDecl, kr: i32): boolean {
+function declArmsMatchRow(s: UnionDecl, sx: i32, kr: i32): boolean {
   const lo = unVarStart[kr]
   const hi = lo + unVarCount[kr]
   const taken: i32[] = []
-  for m in s.udVariants {
-    const mt = declTyIxOfName(m)
+  let mi = 0
+  while mi < s.udVariants.length {
+    const mt = declMemberTy(sx, mi)
+    mi = mi + 1
     if mt >= 0 && tyAt(mt) is TyObj {
       let hit = -1
       let v = lo
@@ -9182,6 +9199,17 @@ function declArmsMatchRow(s: UnionDecl, kr: i32): boolean {
   true
 }
 
+// The type member `mi` of the union declared at node `sx` resolved to when the checker filled
+// it. Every declaration the checker accepts banks its members, so a miss fails loudly.
+function declMemberTy(sx: i32, mi: i32): i32 {
+  const t = udMemberTyAt(sx, mi)
+  if t < 0 {
+    emitFail("emitProgram: a declared union member has no checked type")
+    return -1
+  }
+  t
+}
+
 // Register the declared union `s` (at statement `stmtIx`): its row, member set and key, its
 // struct variants and their fields, and the value boxes, ref-array and map arms its members
 // need. A struct alias or an alias that denotes one member or one list gets no row. Returns 0,
@@ -9189,7 +9217,7 @@ function declArmsMatchRow(s: UnionDecl, kr: i32): boolean {
 function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   // A struct-alias union (single inline-shape variant) is a named struct, not a union:
   // `collectS` interns it; skip it here.
-  if unionDeclStructAlias(s) != "" { return 0 }
+  if unionDeclStructAlias(stmtIx, s) { return 0 }
   // A transparent one-member alias denotes its member, not a union (#1122's ruling), so it
   // gets no row here: minting one pushed the member's name into `uVariants` a second time.
   if isTransparentAlias(s.udName) { return 0 }
@@ -9214,7 +9242,9 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
       const plain = valueBoxOfTy(dty) || tyIsLitUnion(dty)
       if (
         (plain && unVarCount[kr] == 0)
-        || (!plain && unionArmsAreRecordsOrScalars(dty) && declArmsMatchRow(s, kr))
+        || (!plain
+          && unionArmsAreRecordsOrScalars(dty)
+          && declArmsMatchRow(s, stmtIx, kr))
       ) {
         unNameBindRow(s.udName, kr)
         return 0
@@ -9236,40 +9266,48 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   let udSet = ""
   // The variant names: a nullable alias member names its own members, as the flat spelling does (D4040).
   const vsx: string[] = []
+  // Each `vsx` entry's type, from the member's resolution or the arm `unionTyMemberTys` read off
+  // it. An arm of an expanded member is named after the row is recorded, from its row member.
+  const vsxTys: i32[] = []
+  const vsxNamed: boolean[] = []
   let usj = 0
   while usj < vs.length {
     let udMem = vs[usj]
     // Asked of the arena row (knows both numeric and string litunion bases); only an alias of
     // more than one arm is expanded, never a literal union's, and never deduped (box-tag ABI).
     const udExp = unionAliasMembers(udMem)
-    const at = declTyIxOfName(vs[usj])
+    const at = declMemberTy(stmtIx, usj)
     if udExp != "" {
-      const xAtoms: string[] = []
       const xTys: i32[] = []
-      if !unionTyArms(at, xAtoms, xTys) {
+      if !unionTyMemberTys(at, xTys) {
         return emitFail(
           "emitProgram: a declared union's alias member has no resolved arms",
         )
       }
-      if xAtoms.length > 1 && !tyIsLitUnion(at) { udMem = udExp }
+      if xTys.length > 1 && !tyIsLitUnion(at) { udMem = udExp }
     }
-    const vAtoms: string[] = []
+    const vTys0: i32[] = []
     if at >= 0 && at < T.tys.length && tyAt(at) is TyNullable {
-      const vTys0: i32[] = []
-      if !unionTyArms(at, vAtoms, vTys0) {
+      if !unionTyMemberTys(at, vTys0) {
         return emitFail(
           "emitProgram: a declared union's nullable member has no resolved arms",
         )
       }
     }
-    if vAtoms.length > 1 {
-      for a in vAtoms { vsx.push(a) }
+    if vTys0.length > 1 {
+      for t in vTys0 {
+        vsx.push("")
+        vsxTys.push(t)
+        vsxNamed.push(false)
+      }
     } else {
       vsx.push(vs[usj])
+      vsxTys.push(at)
+      vsxNamed.push(true)
     }
-    // A function-type member keeps its grouping parens in the join, as the inline union's
-    // name does: bare, `(i32)=>i32|string` reads as one arrow returning `i32|string`.
-    if nameIsFuncTypeAtom(udMem) && peelGroupParens(udMem) == udMem {
+    // A function-type member is grouped in the join, as the inline union's name is: bare,
+    // `(i32)=>i32|string` reads as one arrow returning `i32|string`. Canon spells the member bare.
+    if udMem == vs[usj] && at >= 0 && at < T.tys.length && tyAt(at) is TyFunc {
       udMem = "(" + udMem + ")"
     }
     if udSet != "" { udSet = udSet + "|" }
@@ -9296,9 +9334,22 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   unTyKeyPushRow()
   const vTys: i32[] = []
   const vPos: i32[] = []
+  const taken: i32[] = []
   while vPos.length < vsx.length {
-    const k = declVariantPos(vsx, vPos.length, memAtoms)
-    vTys.push(if k >= 0 { memTys[k] } else { declTyIxOfName(vsx[vPos.length]) })
+    const i = vPos.length
+    const k = declVariantPos(vsxTys[i], memTys, taken)
+    if !vsxNamed[i] {
+      if k >= 0 {
+        vsx[i] = memAtoms[k]
+      } else if vsxTys[i] < 0 {
+        vsx[i] = "null"
+      } else {
+        return emitFail(
+          "emitProgram: a declared union's expanded arm is no member of its row",
+        )
+      }
+    }
+    vTys.push(if k >= 0 { memTys[k] } else { vsxTys[i] })
     vPos.push(k)
   }
   if mintVariantRows(stmts, vsx, vTys, vPos) < 0 { return -1 }
@@ -9686,4 +9737,14 @@ function annMentionsGaParam(nodeIx: i32): boolean {
     }
   }
   false
+}
+
+// Whether member `vi` of the union declared at node `sx` is written as one inline record
+// (`{x: T}`, not a map), read off its spelling tree past any grouping parentheses.
+function memberWrittenAsRecord(sx: i32, vi: i32): boolean {
+  let r = udTsRootAt(sx, vi)
+  while r >= 0 && tsKind[r] == TS_PAREN && tsKidCount[r] == 1 {
+    r = tsKids[tsKidStart[r]]
+  }
+  r >= 0 && tsKind[r] == TS_OBJ
 }

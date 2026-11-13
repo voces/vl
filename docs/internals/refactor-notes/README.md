@@ -9,6 +9,64 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-d15975-identity-design](2026-11-13-d15975-identity-design.md): D15975 design: `===`/`!==` reference identity, 2026-11-13
+- [2026-11-13-d15978-flat-sub-word-plan](2026-11-13-d15978-flat-sub-word-plan.md): D15978 plan: a `flat` record's sub-word field has storage semantics, 2026-11-13
+- [2026-11-13-d16033-nullable-variant-eq](2026-11-13-d16033-nullable-variant-eq.md): D16033: a nullable record compares with the bare record once a union holding it is declared, 2026-11-13
+- [2026-11-13-d16034-narrowed-let-union-eq](2026-11-13-d16034-narrowed-let-union-eq.md): D16034: a union `==` reads a narrowed `let` operand's arms from the union it is stored as, 2026-11-13
+- [2026-11-13-g30-value-atom-kind-sites](2026-11-13-g30-value-atom-kind-sites.md): Step 7: the five unreached `valueAtomKind` sites in wasmEmit, read by type, 2026-11-13
+- [2026-11-13-h-anon-union-field-ty](2026-11-13-h-anon-union-field-ty.md): 2026-11-13 — lane H: a record literal's union field mints from its type, 2026-11-13
+- [2026-11-13-h-baseline-merge-layout](2026-11-13-h-baseline-merge-layout.md): 2026-11-13 — lane H: budget baselines merge without conflict when lanes lower neighbouring rows, 2026-11-13
+- [2026-11-13-h-ud-variant-tys](2026-11-13-h-ud-variant-tys.md): 2026-11-13 — lane H: a declared union's variants match the row by type (D16052), 2026-11-13
+- [2026-11-13-step7-d16032-arm-tys-row-by-type](2026-11-13-step7-d16032-arm-tys-row-by-type.md): D16032 (a): `unionArmTysOfTy` reads the row its type keys first, 2026-11-13
+- [2026-11-13-step7-d16032-checklist-quick-wins](2026-11-13-step7-d16032-checklist-quick-wins.md): Step 7 (lane D, D16032): the checklist's quick wins and the element-union readers, 2026-11-13
+- [2026-11-13-step7-d16032-closure-arm-by-type](2026-11-13-step7-d16032-closure-arm-by-type.md): Step 7 (lane D, D16032): the closure-arm coerce reads its arm by the union type, 2026-11-13
+- [2026-11-13-step7-d16032-eq-and-box-count-read-row](2026-11-13-step7-d16032-eq-and-box-count-read-row.md): Step 7 (lane D, D16032): union equality and the `??` box count read the carried row, 2026-11-13
+- [2026-11-13-step7-d16032-ref-array-scanners-read-type-row](2026-11-13-step7-d16032-ref-array-scanners-read-type-row.md): Step 7 (lane D, D16032): the ref-array arm scanners read the union type's row, 2026-11-13
+- [2026-11-13-step7-d16052-print-live-tys](2026-11-13-step7-d16052-print-live-tys.md): D16052 close, step 2a: a print plan's narrowing keeps members by box arm, not spelling, 2026-11-13
+- [2026-11-13-step7-fn-record-ref-list-key-by-type](2026-11-13-step7-fn-record-ref-list-key-by-type.md): Step 7: a record holding a function keys its ref-list row by its type, 2026-11-13
+- [2026-11-13-step7-lane-e-member-tys](2026-11-13-step7-lane-e-member-tys.md): Step 7 D16052: three union walks read member types via `unionTyMemberTys`, 2026-11-13
+- [2026-11-13-step7-rl-stored-name-rung](2026-11-13-step7-rl-stored-name-rung.md): Step 7: a folded ref-list spelling's type is typed, not parsed, 2026-11-13
+- [2026-11-13-step7-walk-typed-dedupe](2026-11-13-step7-walk-typed-dedupe.md): Step 7: the canonical union walk dedupes by type, 2026-11-13
+- [2026-11-13-w311-d6-struct-alias-tree-kind](2026-11-13-w311-d6-struct-alias-tree-kind.md): Step 7 D6: a union member's record spelling is read off its spelling tree, 2026-11-13
+- [2026-11-13-h-census-walk-rule](2026-11-13-h-census-walk-rule.md): 2026-11-13 — lane H: the canon member walk counts once, its callers only where they read names, 2026-11-13
+- [2026-11-13-h-ud-functype-arm](2026-11-13-h-ud-functype-arm.md): 2026-11-13 — lane H: a declared union's function member is grouped by its type, 2026-11-13
+- [2026-11-13-step7-d16032-coalesce-and-print-plan-read-row](2026-11-13-step7-d16032-coalesce-and-print-plan-read-row.md): Step 7 (lane D, D16032): the coalesce reservations and the print plan read the result's row, 2026-11-13
+- [2026-11-13-step7-d16032-map-arm-prepass-reads-row](2026-11-13-step7-d16032-map-arm-prepass-reads-row.md): Step 7 (lane D, D16032): the frame pre-pass's map-arm scans read the carried row, 2026-11-13
+- [2026-11-13-step7-d16052-member-tys-twin](2026-11-13-step7-d16052-member-tys-twin.md): D16052 close, step 1: `unionTyMemberTys`, a union's member types without its atoms, 2026-11-13
+- [2026-11-13-step7-lane-e-bool-leaf-arm](2026-11-13-step7-lane-e-bool-leaf-arm.md): Step 7: `unionHasBoolLeafArm` reads each arm's depth off its type, 2026-11-13
+- [2026-11-13-step7-lane-e-ref-array-arms](2026-11-13-step7-lane-e-ref-array-arms.md): Step 7: `registerRefArrayArmUnions` reads the arm's box tag off its type, 2026-11-13
+- [2026-11-13-step7-member-types-and-typed-membership](2026-11-13-step7-member-types-and-typed-membership.md): Box kinds and union membership read the member's type, 2026-11-13
+- [2026-11-13-step7-mv-struct-rungs-held-type](2026-11-13-step7-mv-struct-rungs-held-type.md): Step 7: the map-value struct rungs pass their held type, 2026-11-13
+- [2026-11-13-w311-d6-cbs-mono-parse](2026-11-13-w311-d6-cbs-mono-parse.md): Step 7 D6: the call-bind shadow parses mono's spelling itself, 2026-11-13
+- [2026-11-13-w311-d6-rl-inner-held-hint](2026-11-13-w311-d6-rl-inner-held-hint.md): Step 7 D6: a ref-list's inner row is keyed by the held element type, 2026-11-13
+- [2026-11-13-d16041-decl-union-dedupe](2026-11-13-d16041-decl-union-dedupe.md): D16041 — a declared union's equal anonymous record arms are one member, 2026-11-13
+- [2026-11-13-h-budget-derived-totals](2026-11-13-h-budget-derived-totals.md): Step 7, lane H: `--budget` baselines store codes, not totals, 2026-11-13
+- [2026-11-13-h-census-parent-grade](2026-11-13-h-census-parent-grade.md): Step 7, lane H: the render-parse census grades a split piece by its parent, and sees the canon member walk, 2026-11-13
+- [2026-11-13-h-mono-ann](2026-11-13-h-mono-ann.md): Step 7, lane H: `identFnTypeAnnNameOfRead` answers a boolean; its `ann` thread is dead, 2026-11-13
+- [2026-11-13-h-site55-spelling-ty](2026-11-13-h-site55-spelling-ty.md): Step 7, lane H: the value-union mint reads the type its spelling reads back as, 2026-11-13
+- [2026-11-13-step7-d16032-arm-path-scans-read-row](2026-11-13-step7-d16032-arm-path-scans-read-row.md): Step 7 (lane D, D16032): the arm-path scans read the row their read carried, 2026-11-13
+- [2026-11-13-step7-d16032-key-folds-scalar-brand](2026-11-13-step7-d16032-key-folds-scalar-brand.md): Step 7 (lane D, D16032): the union key folds a brand over a scalar to its base, 2026-11-13
+- [2026-11-13-step7-d16032-value-union-row](2026-11-13-step7-d16032-value-union-row.md): Step 7 (lane D, D16032 step 1): a value union's read names its row by type, 2026-11-13
+- [2026-11-13-step7-free-slice-atoms-floor](2026-11-13-step7-free-slice-atoms-floor.md): Step 7 (L6, lane G): a row-less slice's atom column is carried as floor D16052, 2026-11-13
+- [2026-11-13-step7-l2-mono-p2-atom-kinds-by-type](2026-11-13-step7-l2-mono-p2-atom-kinds-by-type.md): Step 7 (lane D, #13 P2, D's half): four atom-kind decisions read the member's type, 2026-11-13
+- [2026-11-13-step7-lane-e-ms-atom-ids](2026-11-13-step7-lane-e-ms-atom-ids.md): Step 7: a member slice's twin test reads the members' types; `msAtomIdOf` goes, 2026-11-13
+- [2026-11-13-step7-print-plan-kinds-by-type](2026-11-13-step7-print-plan-kinds-by-type.md): Step 7 (L6, lane G #13 P2, last stray): a printed union's box kinds come from member types, 2026-11-13
+- [2026-11-13-step7-union-arm-kinds-by-type](2026-11-13-step7-union-arm-kinds-by-type.md): Step 7 (L6, lane G #13 P2 step 2c): union operand arm kinds read off arm types, 2026-11-13
+- [2026-11-13-step7-union-has-atom-pair](2026-11-13-step7-union-has-atom-pair.md): Two `unionHasAtom` sites ask the member set, 2026-11-13
+- [2026-11-13-step7-union-reg-strays-by-type](2026-11-13-step7-union-reg-strays-by-type.md): Step 7 (L6, lane G #13 P2 strays): box kinds read off types; the if-let atom fallback deleted, 2026-11-13
+- [2026-11-13-w311-d6-cbox-parens](2026-11-13-w311-d6-cbox-parens.md): Step 7 D6: a captured cell's element is parenthesized by its type, 2026-11-13
+- [2026-11-13-w311-d6-union-struct-alias](2026-11-13-w311-d6-union-struct-alias.md): Step 7 D6: a union declaration's struct-alias test reads its members' types, 2026-11-13
+- [2026-11-13-h-ud-member-bank](2026-11-13-h-ud-member-bank.md): Step 7, lane H: declared-union members read the checker's resolution, 2026-11-13
+- [2026-11-13-step7-d16013-storage-norm](2026-11-13-step7-d16013-storage-norm.md): Step 7: D16013 closed, a typed normalizer for the list element's key, 2026-11-13
+- [2026-11-13-step7-decl-name-callers](2026-11-13-step7-decl-name-callers.md): Four `declTyIxOfName` callers graded by origin; the mv name fallbacks are deleted, 2026-11-13
+- [2026-11-13-step7-field-elem-hint-fallback-deleted](2026-11-13-step7-field-elem-hint-fallback-deleted.md): The field recorder's name fallback is deleted, 2026-11-13
+- [2026-11-13-step7-l2-mono-narrowed-pin-typed](2026-11-13-step7-l2-mono-narrowed-pin-typed.md): Step 7 L2, mono: the pin-acceptance test reads the type, not an echoed spelling, 2026-11-13
+- [2026-11-13-step7-l2-mono-r1a-text-decisions](2026-11-13-step7-l2-mono-r1a-text-decisions.md): Step 7 L2, mono, R1 (a): three pin decisions read the type, not their text, 2026-11-13
+- [2026-11-13-step7-lane-e-arena-emit-name](2026-11-13-step7-lane-e-arena-emit-name.md): Step 7: `arenaEmitName`'s renders graded by what they feed, 2026-11-13
+- [2026-11-13-step7-lane-e-drop-fieldtext](2026-11-13-step7-lane-e-drop-fieldtext.md): Step 7: the variant field identity spelling column is deleted, 2026-11-13
+- [2026-11-13-step7-lane-e-intern-shape-as](2026-11-13-step7-lane-e-intern-shape-as.md): Step 7: `internShapeAs` reads the alias's fields off its record type, 2026-11-13
+- [2026-11-13-step7-shared-field-kind-by-type](2026-11-13-step7-shared-field-kind-by-type.md): Step 7 L6 (lane G, #13 P2 step 2b): a shared field's box kind is read off its type, 2026-11-13
+- [2026-11-13-w311-d6-pin-rep-ty](2026-11-13-w311-d6-pin-rep-ty.md): Step 7 D6: a cloned pin carries the type its spelling was minted at, 2026-11-13
 - [2026-11-13-h-decl-rung](2026-11-13-h-decl-rung.md): Step 7, lane H: two `declTyIxOfName` callers stop running the annotation grammar, 2026-11-13
 - [2026-11-13-h-unreached-renders](2026-11-13-h-unreached-renders.md): Step 7, lane H: three unreached renders floored, 2026-11-13
 - [2026-11-13-step7-l2-mono-p6-pin-union-typed](2026-11-13-step7-l2-mono-p6-pin-union-typed.md): Step 7 L2, mono, P6 cut 4: union pins and instance returns are spelled from their types, 2026-11-13
