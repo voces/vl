@@ -35,6 +35,11 @@ the closure.
   - **D16035:** `mapShapeOfExpr` answers nothing for an `OptMember`, and the fused `?? d` has no
     map arm. Deferred, with (a) pre-approved after the regeneration.
   - **D16036:** the function-value leaf.
-- Sweep with fixpoint seeds on both sides: SWEEP.
-- Render-parse census: CENSUS.
+- Sweep with fixpoint seeds on both sides, master `f11a3e11` against the candidate:
+  - 24,241 same, 0 bytes-only movers;
+  - 4 output movers. D1680's witness and the new test go from `emit_reject` to runs. The new rows
+    D16035 and D16036 stay `emit_reject` with a new message: D16035 now stops at the i32-key read,
+    and D16036's sentence names only the closure;
+  - 0 `runs → not-runs`, 0 new compiler traps.
+- Render-parse census: within budget. The change adds no entry.
 - `scripts/gate.sh`: all rows pass.
