@@ -296,13 +296,13 @@ import {
   tpIfRowBuilt,
 } from "./check_list_union"
 import {
+  lexValueCapped,
   litPinN,
   litPinNSet,
   litPinT,
   litPinTSet,
   litUnionOneBase,
   recordElemRepArrayLit,
-  u8LexValue,
 } from "./check_literals"
 import { litTyOfExpr } from "./check_match_desugar"
 import {
@@ -426,6 +426,7 @@ import {
   numKindMask,
 } from "./check_type_shape"
 import {
+  PrimName,
   T,
   TY_ERR,
   TY_I32,
@@ -446,6 +447,7 @@ import {
   mkFuncTy,
   nwTyIxs,
   objFieldType,
+  primNameStr,
   tyArrayElemIx,
   tyAt,
   tyHasHole,
@@ -498,6 +500,7 @@ import {
   isNumericPrimTy,
   isVoidTy,
   nonNullTy,
+  primIsSubWord,
   primNameOf,
   tyAdmitsNull,
   tyHasTyVar,
@@ -1449,11 +1452,14 @@ export function holeChoiceArmCstrsAt(a: i32, pts: i32[]) {
   0
 }
 
-// A `u8` storage slot, the only position `u8` is legal in, takes any `i32` value: the store
-// truncates to the low 8 bits. The refusals are an integer literal past 255 and a negative one,
-// and so a constant holding either (owner ruling, D3428); `as% u8` spells the wrap.
+// A sub-word storage slot (a `u8[]` element, a `flat` field) takes any `i32` value: the store
+// keeps its low bits at the width. A literal outside the width's range is refused, and so a
+// constant holding one (owner rulings, D3428 and D15978); `as% u8` spells the wrap.
 // `assignable(i32, u8)` stays false, so an `i32[]` still cannot flow into a `u8[]`.
-function assignableU8Slot(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+function assignableSubWordSlot(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  const w = primNameOf(dstTy)
+  const lo = if w == "i8" { 0 - 128 } else if w == "i16" { 0 - 32768 } else { 0 }
+  const hi = if w == "i8" { 127 } else if w == "u16" { 65535 } else if w == "i16" { 32767 } else { 255 }
   if srcExpr >= 0 {
     const u8e = nodeAt(srcExpr)
     if u8e is Paren { return assignableExpr(u8e.parInner, srcTy, dstTy) }
@@ -1462,29 +1468,19 @@ function assignableU8Slot(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       if (
         nl is NumLit
         && !numLexIsFloat(nl.numText)
-        && u8LexValue(nl.numText) > 0
+        && 0 - lexValueCapped(nl.numText, 65536) < lo
       ) {
         if !inferQuiet {
-          tErr(
-            "the literal -"
-              + nl.numText
-              + " does not fit a `u8` element (0..255) — a computed value truncates to its low 8 bits, but a negative literal is a mistake the compiler can see; `as% u8` keeps its low 8 bits",
-            srcExpr,
-          )
+          tErr(subWordLitMsg(w, "-" + nl.numText, lo, hi, true), srcExpr)
         }
         return true
       }
     }
     if u8e is NumLit {
       if numLexIsFloat(u8e.numText) { return false }
-      if u8LexValue(u8e.numText) > 255 {
+      if lexValueCapped(u8e.numText, 65536) > hi {
         if !inferQuiet {
-          tErr(
-            "the literal "
-              + u8e.numText
-              + " does not fit a `u8` element (0..255) — a computed value truncates to its low 8 bits, but a literal this size is a mistake the compiler can see",
-            srcExpr,
-          )
+          tErr(subWordLitMsg(w, u8e.numText, lo, hi, false), srcExpr)
         }
         // Reported here and answered true, the same discipline `objShapeAdapterlessErr` follows:
         // the position is otherwise well-typed, so a second "cannot assign" from the caller
@@ -1495,7 +1491,40 @@ function assignableU8Slot(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     }
   }
   const u8s = primNameOf(srcTy)
-  return u8s == "i32" || u8s == "u8"
+  return u8s == "i32" || primIsSubWord(u8s)
+}
+
+// The refusal of literal `lit` at sub-word width `w` (`lo..hi`). A `u8` element keeps its
+// sentences; the other widths, legal only as a `flat` field, name the field.
+function subWordLitMsg(
+  w: PrimName | null,
+  lit: string,
+  lo: i32,
+  hi: i32,
+  neg: boolean,
+): string {
+  if w == "u8" {
+    if neg {
+      return "the literal "
+        + lit
+        + " does not fit a `u8` element (0..255) — a computed value truncates to its low 8 bits, but a negative literal is a mistake the compiler can see; `as% u8` keeps its low 8 bits"
+    }
+    return "the literal "
+      + lit
+      + " does not fit a `u8` element (0..255) — a computed value truncates to its low 8 bits, but a literal this size is a mistake the compiler can see"
+  }
+  const bits = if w == "i8" { "8" } else { "16" }
+  "the literal "
+    + lit
+    + " does not fit an `"
+    + primNameStr(w)
+    + "` field ("
+    + i32ToStr(lo)
+    + ".."
+    + i32ToStr(hi)
+    + ") — a computed value keeps its low "
+    + bits
+    + " bits, but a literal this size is a mistake the compiler can see"
 }
 
 // A literal source `srcExpr` meeting `dstTy` after the type-level answer said no: a bare
@@ -1804,8 +1833,8 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // the call that worked. Keyed on the expected type's return being void, and granted only for the
   // set `synthVoidTwins` can mint a capture-free void twin for; other values keep the mismatch.
   if fnValVoidCoerce(srcExpr, srcTy, dstTy) { return true }
-  if primNameOf(dstTy) == "u8" {
-    return assignableU8Slot(srcExpr, srcTy, dstTy)
+  if primIsSubWord(primNameOf(dstTy)) {
+    return assignableSubWordSlot(srcExpr, srcTy, dstTy)
   }
   // A literal re-encodes exactly at f32, so it flows into any destination whose f32 position it
   // fits: a bare `f32`, a nullable `f32?`, or an f32 member of a union. An arbitrary f64 or i32
@@ -2925,7 +2954,7 @@ function tyHoldsNoFn(w: i32, depth: i32): boolean {
         || t.primName == "i64"
         || t.primName == "f32"
         || t.primName == "f64"
-        || t.primName == "u8"
+        || primIsSubWord(t.primName)
         || t.primName == "null"
     }
     TyNullable => {
