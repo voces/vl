@@ -200,6 +200,23 @@ Deno.test({
           `--sites: want a keyed row for shapeOf's groupInnerOf, got ${sites.out}`,
         );
       }
+      const rs = await census(["--render-sites", "--root", dir]);
+      const gotRs = rs.out.trim().split(/\r?\n/).filter((l) => l).map((l) =>
+        l.split("\t").slice(0, 5).join(" ")
+      );
+      const wantRs = [
+        "compiler/emit_x.vl kindOf tyToEmitName 0 9",
+        "compiler/emit_x.vl rowOf tyToNominalName 0 18",
+        "compiler/emit_x.vl emitCast tyToEmitName 0 25",
+        "compiler/emit_x.vl emitCast tyToEmitName 1 26",
+      ];
+      if (rs.code !== 0 || JSON.stringify(gotRs) !== JSON.stringify(wantRs)) {
+        throw new Error(
+          `--render-sites: want ${JSON.stringify(wantRs)}, got rc ${rs.code} ${
+            JSON.stringify(gotRs)
+          }`,
+        );
+      }
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
