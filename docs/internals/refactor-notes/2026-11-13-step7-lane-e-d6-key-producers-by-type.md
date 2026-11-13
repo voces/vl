@@ -35,7 +35,7 @@ expected. An output mover, a `runs → not-runs` or a new trap would veto the cu
 - The two movers are the recursive-arm cells. Both builds disassemble to identical text
   (`wasm-dis`: 94 and 231 struct types, unchanged), and the output hash is the same. The byte
   difference is in the type section's order: the arm's row is now found by type, earlier.
-- `scripts/gate.sh`: all 23 rows pass. That includes the dead-export budget, with the five
+- `scripts/gate.sh`: all 23 rows pass, on the branch and on the tree merged with master `55c76412`. That includes the dead-export budget, with the five
   spelling helpers deleted.
 - Render-parse: unchanged at 2 parses. `nonNulBaseOf` keeps 6 callers:
   - `internNonLowerableFieldShapesTy` and `elemNameIsDeclared` ×2: lane E;
