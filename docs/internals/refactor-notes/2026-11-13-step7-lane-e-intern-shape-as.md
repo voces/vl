@@ -27,6 +27,14 @@ Order does not matter: the names are put in canonical order (`fieldNameOrder`) a
   `fieldNameOf`, `fieldTypeTextOf` and `tyTopLevelSplit` imports.
 - The caller's `unionDeclStructAlias(s) != ""` gate is lane F's and stays.
 
+## Control
+
+Canon can rewrite the alias's spelling in place, for example a literal field widened, so a grade
+by source had to hold by construction. No corpus cell had such an alias.
+`tests/cases/structs/struct-alias-literal-field.vl` is one: `type AB = { k: 1 } & { b: i32 }`.
+It reaches `internShapeAs`, and its fields come from the record type. It runs alike on master and
+the candidate.
+
 ## Proof
 
 - Refresh ×2: fixpoint.
