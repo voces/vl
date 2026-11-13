@@ -236,7 +236,7 @@ the spelling and an intersection spelling names no struct.
 
 The variant-row key passes lane A's canonical-key test or is re-keyed by type (position and type,
 as `variantIndexOf`'s retirement did). The owner follows from that result, likely lane B.
-`isStructAtom` and its emit_base spelling test go with it. Ruling pending.
+`isStructAtom` and its emit_base spelling test go with it. So does `collectVariantFields` → `collectShapeVariantFields`: it dispatches on `nameIsShapeSpanEnds` of the arm's spelling and splits that spelling's fields, and although the record type supplies each field's name and type, `variantFieldIdText(ftxt, fldTy)` stores the field text as the variant table's identity column. It re-keys with `uVariantsPush(names[i])`, not apart from it. Ruling pending.
 
 ## Floors held by a filed row
 
