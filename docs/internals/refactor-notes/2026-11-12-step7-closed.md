@@ -74,7 +74,7 @@ graded:
 | `shapeWalkKeyOf` (emit_shape_intern:277) | failing | E / F, the D6 re-key: the walk key still decides in `tyIsDeclaredNominal` and `shapeWalkSplitsUnion` | — |
 | `internArmShapeRow` (emit_shape_intern:730) | failing | A, after E's step (d) | — |
 
-Six are floors and two block the close. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
+Six are floors and two block the close. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
 
 ## Floors held by a filed row
 
