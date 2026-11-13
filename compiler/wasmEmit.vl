@@ -138,7 +138,11 @@ import {
   mapRetagRowsOf,
   widenRetagRowsOf,
 } from "./check_retag_rows"
-import { inferRetNameOf, inferRetTyIxOf } from "./check_infer_ret"
+import {
+  inferRetIsValueUnion,
+  inferRetNameOf,
+  inferRetTyIxOf,
+} from "./check_infer_ret"
 import { isNumIntrinsicName } from "./check_getter_effects"
 import { matchConstPatLitAt } from "./check_match_desugar"
 import { numCmpOp, numPairOpTy, valueTailLeaves } from "./check_num_adopt"
@@ -1472,6 +1476,7 @@ import {
   mapShapeOfTyPeeled,
   mapValueTyOf,
   nliNameOf,
+  spellingValueUnionVerdict,
   unRowOfRecordTy,
   unionArmTyOfAtomTy,
   unionClosureArmName,
@@ -1709,10 +1714,10 @@ import {
   mapTyValIsNulLitUnion,
   mapTyValIsNullUnit,
   mapTyValLitUnionTexts,
-  nameIsLitUnionArmValueUnion,
   tyIsNulLitUnionNiche,
   tyIsNulStrBoxUnion,
   valueAtomKind,
+  valueRowKind,
 } from "./check_ty_rep"
 import { numUnionMinted, tyIsNumUnion } from "./check_union_mint"
 import { tyIsTpJoinUnion } from "./check_tp_join"
@@ -4490,24 +4495,67 @@ function emitFailNoMembershipRecv() {
   )
 }
 
-// True when union `nm` carries a literal-union arm beside another value arm — the box
-// shape where `x is K` is membership over the payload, never a tag compare (the litunion
-// arm shares kind 2's tag with a plain `string` arm). Resolves an alias to its member set
-// first: an un-resolved alias would wrongly fall into the tag compare.
-function unionCarriesLitUnionArm(nm: string) {
-  if nm == "" { return false }
-  if nameIsLitUnionArmValueUnion(nm) { return true }
-  const setNm = unionMemberSetOf(nm)
-  if setNm == nm { return false }
-  nameIsLitUnionArmValueUnion(setNm)
-}
-
-// `unionCarriesLitUnionArm` for a caller holding `nm`'s member set `s`, or -1: the set answers
-// where it can, else the spelling.
-function unionCarriesLitUnionArmOfSet(s: i32, nm: string): boolean {
+// True when the union with member set `s` and type `ty` carries a literal-union arm beside another
+// value arm: the box shape where `x is K` is membership over the payload, never a tag compare. The
+// set answers where it can, else the type. A union neither answers for has no arm reading, which
+// is a loud floor.
+function unionCarriesLitUnionArmOfSet(s: i32, ty: i32): boolean {
   const v = msSetCarriesLitUnionArm(s)
   if v >= 0 { return v == 1 }
-  unionCarriesLitUnionArm(nm)
+  const tv = tyCarriesLitUnionArm(ty)
+  if tv >= 0 { return tv == 1 }
+  emitFail(
+    "emitProgram: a union's literal-union arms are read off neither its member set nor its type",
+  )
+  false
+}
+
+// Whether union type `ty` is a value union with a literal-union arm, read off its declared
+// members, so an alias arm stays whole: every member a value atom, `null` or a literal union, one
+// literal union and 2+ non-null members. A bare literal member is its base. -1 where `ty` is no
+// union, or carries a literal union beside a shape this walk does not claim.
+function tyCarriesLitUnionArm(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = tyAt(ty)
+  let ms: i32[] = []
+  if t is TyUnion {
+    ms = t.uMembers
+  } else if t is TyNullable {
+    if t.nInner < 0 { return -1 }
+    const it = tyAt(t.nInner)
+    if it is TyUnion { ms = it.uMembers } else { ms = [t.nInner] }
+  } else {
+    return -1
+  }
+  let lit = false
+  let unclaimed = false
+  let nonNull = 0
+  for m in ms {
+    if m >= 0 {
+      if tyIsLitUnionOfAnyBase(m) {
+        lit = true
+        nonNull = nonNull + 1
+      } else {
+        const k = valueRowKind(m)
+        if k == -2 { unclaimed = true }
+        if k == -1 { return 0 }
+        if k >= 0 && k != 6 { nonNull = nonNull + 1 }
+      }
+    }
+  }
+  if !lit { return 0 }
+  if unclaimed { return -1 }
+  if nonNull >= 2 { 1 } else { 0 }
+}
+
+// Whether `m` is a union of literals only, of any base.
+function tyIsLitUnionOfAnyBase(m: i32): boolean {
+  const t = tyAt(m)
+  if !(t is TyUnion) || t.uMembers.length < 1 { return false }
+  for u in t.uMembers {
+    if u < 0 || !(tyAt(u) is TyLit) { return false }
+  }
+  true
 }
 
 // True when `recvIx` is a receiver `emitLitMemberEq` can be applied to repeatedly: a
@@ -4520,7 +4568,7 @@ function litMembershipRecvOk(recvIx: i32, fnIx: i32) {
     if bxNm == "" { return false }
     const bxs = msSetOfRowOr(bxr[0], bxNm)
     if isValueUnionOfSet(bxs, bxNm) { return true }
-    return unionCarriesLitUnionArmOfSet(bxs, bxNm)
+    return unionCarriesLitUnionArmOfSet(bxs, bxr[1])
   }
   if nodeTyIsLitUnion(recvIx) { return true }
   if exprString(recvIx, fnIx) { return true }
@@ -6728,7 +6776,7 @@ function emitIsTestLitArms(body: u8[], isIx: i32, nd0: IsExpr, fnIx: i32) {
   const luNm = unionNameRowOfExpr(nd0.isObj, fnIx, lur)
   if (
     luNm != ""
-    && unionCarriesLitUnionArmOfSet(msSetOfRowOr(lur[0], luNm), luNm)
+    && unionCarriesLitUnionArmOfSet(msSetOfRowOr(lur[0], luNm), lur[1])
   ) {
     const luTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
     if luTexts.length > 0 && unionEqOperandOk(nd0.isObj) {
@@ -6754,7 +6802,7 @@ function emitIsTestLitArms(body: u8[], isIx: i32, nd0: IsExpr, fnIx: i32) {
       if (
         nbNm != ""
         && (isValueUnionOfSet(msSetOfRowOr(nbr[0], nbNm), nbNm)
-          || unionCarriesLitUnionArmOfSet(msSetOfRowOr(nbr[0], nbNm), nbNm))
+          || unionCarriesLitUnionArmOfSet(msSetOfRowOr(nbr[0], nbNm), nbr[1]))
       ) {
         let nbI = 0
         while nbI < nbTexts.length {
@@ -7099,7 +7147,7 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
       && (isValueUnionOfSet(msSetOfRowOr(boxr[0], boxNm), boxNm)
       || unionCarriesLitUnionArmOfSet(
       msSetOfRowOr(boxr[0], boxNm),
-      boxNm,
+      boxr[1],
     ))
     // Only a join the checker kept apart over declared parameters reaches here by design.
     if (
@@ -9764,7 +9812,9 @@ function boxDstName(name: string, ty: i32): string {
   const vt = valueUnionKeyTextOfTy(ty)
   if vt != "" { return vt }
   const sp = unionSpellingOfTy(ty, 8)
-  if sp != UNION_SPELLING_DECLINE && isValueUnionName(sp) { return sp }
+  if sp != UNION_SPELLING_DECLINE && spellingValueUnionVerdict(ty, 8) == 1 {
+    return sp
+  }
   name
 }
 
@@ -10850,7 +10900,7 @@ function emitUnionConcreteEq(
   if (
     uname == ""
     || (!isValueUnionOfSet(usid, uname)
-      && !unionCarriesLitUnionArmOfSet(usid, uname)
+      && !unionCarriesLitUnionArmOfSet(usid, unr[1])
       && !eqHasArm)
   ) {
     // The second door to the variant compare, for an operand the arena declined to type
@@ -11954,8 +12004,10 @@ function emitUnionUnionEq(
   const lsid = msSetOfUnion(lname)
   const rsid = msSetOfUnion(rname)
   // A literal-union arm rides a value box as its member string, so it compares as one (D3347).
-  const lVal = isValueUnionOfSet(lsid, lname) || unionCarriesLitUnionArm(lname)
-  const rVal = isValueUnionOfSet(rsid, rname) || unionCarriesLitUnionArm(rname)
+  const lVal = isValueUnionOfSet(lsid, lname)
+    || unionCarriesLitUnionArmOfSet(lsid, unionEqOperandTy(lIx, fnIx))
+  const rVal = isValueUnionOfSet(rsid, rname)
+    || unionCarriesLitUnionArmOfSet(rsid, unionEqOperandTy(rIx, fnIx))
   if !lVal || !rVal {
     // A struct union compares by tag, then by the arm's fields (D973), riding the same
     // `{tag, payload}` box a value union does. Reaching here means `emitStructUnionEq` declined
@@ -31909,7 +31961,10 @@ function retFlagsSeedResult(
     // (kind 4): box each concrete-variant/value-atom `return` via `retUNm`. A litunion
     // alias name is excluded on the same grounds as the annotated arm above — it
     // registers as a union name but its value is the interned i32 atom, so boxing it would be wrong.
-    if (isValueUnionName(im) || (isUNameAB(26, imTy) && !imLit)) {
+    if (
+      inferRetIsValueUnion(inferRetFnKey(fnIx, fn.fnName))
+      || (isUNameAB(26, imTy) && !imLit)
+    ) {
       rf.retUNm = boxTyName(imTy)
       rf.retUTy = imTy
     }
