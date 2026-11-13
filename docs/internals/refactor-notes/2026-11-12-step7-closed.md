@@ -52,7 +52,7 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 | lane | sites |
 | --- | --- |
 | E / F (D6 re-key) | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internArmShapeRow` render (`tyToEmitName(aty)` into `armMintShapeName`); the `nm` input `armFieldStructRowMinted` hands `internInlineShapeTy` (emit_collect) |
-| G (grading) | the producer's one floor, `unionNameOfExprFloor` / `letUnionNameOfGo` (#7720): about 614 calls are a function value's nullable, keyed by its set (the function-value-set contract, if a witness is named); about 15 are a declared alias spelling no type names (a reason is asked). `unionNameOfCall` is a rung behind it |
+| G (grading) | the producer's one floor, `unionNameOfExprFloor` / `letUnionNameOfGo` (#7720): about 614 calls are a function value's nullable, keyed by its set (the function-value-set contract, if a witness is named); about 15 are a declared alias spelling: no contract (coordinator): they key by the alias's resolved type in G's next cut, and any with no type is filed from G's block and floored under its row. `unionNameOfCall` is a rung behind it |
 
 ## Floors held by a filed row
 
