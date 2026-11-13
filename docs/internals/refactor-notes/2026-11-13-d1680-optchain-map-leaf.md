@@ -45,6 +45,11 @@ D16035, after the regeneration:
   `s`). Filed D16036, the function-value leaf. D15155, D15157 and `vl_emit_diag_position_test`'s
   `INSTANCE_WITNESS` had read a map leaf through a standalone `?.`. They now read a function-value
   field, refused at the same `lib.vl:7:16`, so the position guard keeps measuring.
-- Sweep with fixpoint seeds on both sides: SWEEP.
-- Render-parse census: CENSUS.
+- Sweep with fixpoint seeds on both sides, master `2f7a8d64` (after the regeneration) against the
+  candidate:
+  - 24,246 same, 0 bytes-only movers;
+  - 4 output movers. D1680's and D16035's witnesses and the new test go from `emit_reject` to runs,
+    and D16036 stays `emit_reject` with its sentence narrowed to the closure;
+  - 0 `runs → not-runs`, 0 new compiler traps.
+- Render-parse census: within budget, at the baseline. No entry entered or left.
 - `scripts/gate.sh`: all rows pass.
