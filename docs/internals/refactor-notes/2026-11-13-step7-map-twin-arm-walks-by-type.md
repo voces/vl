@@ -24,10 +24,11 @@ against new):
 | `unionRowArmTys` | 62,562 / 10,131 | the row, every time |
 
 The spelling fallbacks deleted here were never reached in the corpus. The type and set
-fallbacks that replace them were never reached either.
+fallbacks that replace them were never reached either. A miss past them is now a loud floor
+(`emitFail`), so a spelling split cannot quietly return.
 
-**Sweep** (master fixpoint seed vs candidate, same tree): 24,202 same, 0 bytes-only movers, 0
-output movers, 0 runs → not-runs, 0 new traps.
+**Sweep** (master fixpoint seed vs candidate, same tree, with lane H's #7697 merged): 24,203
+same, 0 bytes-only movers, 0 output movers, 0 runs → not-runs, 0 new traps.
 
 `markRefArrayArms` and `markMapUnionArms` no longer read their name parameter. It is marked
 `_name` rather than removed, since their callers are in emit_collect, where lane G has work in
