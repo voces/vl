@@ -27,8 +27,6 @@ import {
   TyUnion,
   TyVar,
   cUserTypes,
-  nomNameOfTy,
-  structNameOfTy,
   tyAt,
   tyIsLitUnion,
   tyIsLitUnionOrLit,
@@ -38,7 +36,7 @@ import { unionHasAtom } from "./emit_base"
 import { emitFail } from "./emit_bytes"
 import { rlElemTyIxAt } from "./emit_struct_order"
 import {
-  msAtomIdOf,
+  armDeclSame,
   msFreeSlicePush,
   msMaskClear,
   msMaskFull,
@@ -47,7 +45,6 @@ import {
   msSetHas,
   msSetMaskCopy,
   msSliceAtom,
-  msSliceAtomId,
   msSliceCount,
   msSliceKind,
   msSliceTy,
@@ -87,7 +84,6 @@ import {
   unVarStart,
 } from "./emit_state"
 import { sidArrGet, sidLookup } from "./symbols"
-import { roListInnerName } from "./tyname"
 import { flattenVariantsInto, isNullTy, primNameOf } from "./tyquery"
 
 // The non-null member `X` when type `t` is exactly `X | null`, -1 otherwise.
@@ -898,7 +894,7 @@ export function msSubNull(s: i32): i32 {
 
 // SELECTION of one member by arena TYPE: clear every member the type is not. The write
 // half of the reads-only rule needs a member the CHECKER named, and it names it by arena
-// index — `msSubAtom`'s spelling identity cannot answer for a type with no written atom.
+// index.
 export function msKeepTy(s: i32, ty: i32): i32 {
   if s < 0 || s >= msSetRow.length { return -1 }
   if ty < 0 { return -1 }
@@ -935,93 +931,7 @@ function msTyCovers(ty: i32, m: i32): boolean {
   false
 }
 
-// SUBTRACTION of a named member: clear every member whose interned IDENTITY is the
-// removed one. `msAtomIdOf` peels grouping parens on both sides, exactly as the
-// string surgery's `peelGroupParens` comparison did, so an `is () => i64` test still
-// strips the `(() => i64)` member.
-export function msSubAtom(s: i32, removed: string): i32 {
-  if s < 0 || s >= msSetRow.length { return -1 }
-  const u = msSetRow[s]
-  const n = msSliceCount(u)
-  if n < 0 { return -1 }
-  const rid = msAtomIdOf(removed)
-  const mask = msSetMaskCopy(s)
-  let i = 0
-  while i < n {
-    if msMaskHas(mask, i) {
-      if msSliceAtomId(u, i) == rid { msMaskClear(mask, i) }
-    }
-    i = i + 1
-  }
-  msSetIntern(u, mask)
-}
-
-// ── the set ADT's consumers (structure first, string surgery as fall-through) ──
-
-// Set SUBTRACTION — the else-branch complement of `is removed` / `!= null`: resolves the set,
-// clears the removed member's bits and renders the survivors in the row's recorded ORDER. `ty`
-// is `set`'s arena type (-1 none), as `removeAtomRestOf` takes it.
-export function removeAtomFromSet(
-  set: string,
-  removed: string,
-  ty: i32,
-): string {
-  removeAtomFromSetOf(-1, set, removed, ty)
-}
-
-// The id of set `s` less member `removed`, or -1 when `s` is -1 or the set path declines. `null`
-// is a keyword, the one member removed without any name.
-export function msRemoveAtomId(s: i32, removed: string): i32 {
-  if s < 0 { return -1 }
-  if removed == "null" { return msSubNull(s) }
-  msSubAtomOrView(s, removed)
-}
-
-// `removeAtomFromSet` for a caller already holding the id `sid` of `set` (-1 resolves `set`) and
-// `set`'s arena type `ty` (-1 none), as `removeAtomRestOf` takes it.
-export function removeAtomFromSetOf(
-  sid: i32,
-  set: string,
-  removed: string,
-  ty: i32,
-): string {
-  removeAtomRestOf(removeAtomIdOf(sid, set, removed), set, removed, ty)
-}
-
-// The id of `set` less `removed`, where `sid` is `set`'s id or -1 to resolve `set` by key; -1
-// when no key covers it. A narrowing pushed from the survivors banks this id.
-export function removeAtomIdOf(sid: i32, set: string, removed: string): i32 {
-  let s = sid
-  if s < 0 && primTyIxOfName(set) < 0 { s = msSetOfUnion(set) }
-  msRemoveAtomId(s, removed)
-}
-
-// The rendering of the survivors `rid` from `removeAtomIdOf`. With no id, `set`'s arena type
-// `ty` (-1 none) builds a set from its own members, rendered less `removed` and not banked: its
-// row need not be the row the rendering names. `set` itself when neither covers it.
-export function removeAtomRestOf(
-  rid: i32,
-  set: string,
-  removed: string,
-  ty: i32,
-): string {
-  if rid >= 0 { return msTextOf(rid) }
-  if set == "" || ty < 0 { return set }
-  const c = msSetOfTyAny(ty)
-  const rc = msRemoveAtomId(c, removed)
-  if rc < 0 || rc == c { return set }
-  msTextOf(rc)
-}
-
-// `msSubAtom`, where a set that spells a view's member as its list still loses it: the two are
-// one rep and one atom, so `is readonly f64[]` rules out an `f64[]` member (D2887).
-export function msSubAtomOrView(s: i32, removed: string): i32 {
-  const r = msSubAtom(s, removed)
-  if r != s { return r }
-  const roIn = roListInnerName(removed)
-  if roIn == "" { return r }
-  msSubAtom(s, roIn)
-}
+// ── the set ADT's consumers ──
 
 // The per-arm plan for `print(<value-union box>)`: the box-tag ABI-ordered value-atom kind of
 // every arm, appended to `out`, true only when every arm is a value `print` renders on its
@@ -1245,11 +1155,10 @@ function unRowSetSameNullBlind(u: i32, v: i32): boolean {
 }
 
 // Whether two variant slots hold one type under one declaration: twin records (`Cat`, `Kot`)
-// are one shape but two declarations, and the licence keeps them apart as their spellings did.
+// are one shape but two declarations, kept apart as `unionArmsAllSame` keeps them.
 function variantSlotSame(a: i32, b: i32): boolean {
   if a == b { return true }
-  if !tySame(a, b) { return false }
-  structNameOfTy(a) == structNameOfTy(b) && nomNameOfTy(a) == nomNameOfTy(b)
+  tySame(a, b) && armDeclSame(a, b)
 }
 
 // The second half of the key's licence (D1492): a struct union's tags are positional over its
