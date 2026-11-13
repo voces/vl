@@ -42,7 +42,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `ad5abe1b`, 2026-11-13 13:45)
+## Still failing at this draft (master `0b123e39`, 2026-11-13 14:25)
 
 **Closing census 5's failing column is empty** (coordinator, 2026-11-13). `internArmShapeRow`'s render is a floor: since #7768 it answers its type's row first, and the render only labels a row it mints, which no row choice reads. The rows below are the L2 work and the blockers filed since.
 
@@ -149,6 +149,8 @@ is the checker's job. A checker parse reached from emit whose input the emitter 
 (`synthTypeRefFb` → `recordClonedNodeTyFb`) is in scope, whatever file holds the parser. Lane I
 then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
 §3.3's sentence "parses no type spelling back" waits on that.
+
+**On master `0b123e39`:** 27 render or synthesized parses (26 failing beside D16022's floor; `iisPushFieldElem` ×2 are gone), 7 source, 14 unclassified; 96 renders and 42 display renders. `arenaEmitName` is graded by what it feeds (#7809): its compare converts, its `monoInstanceRetSpelling` fallback is deleted, its empty-render returns are loud floors never taken, and its registry uses are labels under #7782. So the renders a content decision reads are D's four mono sites (#7805 pending). G read a primitive's box kind off its type at three sites (#7807).
 
 **On master `ad5abe1b`:** 29 render or synthesized parses (28 failing beside D16022's floor), 7 source, 17 unclassified; 96 renders and 42 display renders. D16002 closed (#7798), P6 closed (#7785, #7793). The failing parses by owner: B 4 (P5 and `identFnTypeAnnNameOfRead`); E/F 9 (the shape grammar, #7800 pending); E 2 (`iisPushFieldElem`); G 15 (`valueAtomKind` over rendered atoms ×12, `msAtomIdOf`, `unionHasAtom` ×2). The renders a content decision reads: D's `monoRecordNominalPin`, `monoSubstAnnNode`, `monoTagRecordPinKind` and `monoNarrowedPinName` (#7805 pending), and E's `arenaEmitName`. Another 17 renders are tested only for emptiness or for the decline sentinel. That is a **presence test, and a floor** (coordinator, 2026-11-13): the answer is whether the type has a rendering, never anything in the text. Each family's test stands for:
 
