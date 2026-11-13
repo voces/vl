@@ -259,8 +259,9 @@ Two distinct mechanisms carry "the same type" across the phases, and they must n
 names in the module, diagnostics, and keys that must be printable. It is not a way to ask a
 question about a type ([§4.1](#41-one-producer-per-fact)).
 
-The emitter keeps these renders, each for output, and parses no type spelling back.
-`scripts/render-parse-budget-baseline.json` holds them:
+The emitter keeps these renders, each for output, and parses no render back into a type. The
+exceptions are the carried floors in `scripts/render-parse-floors.txt`, each held by a filed row
+for a gap with no closed type to read. `scripts/render-parse-budget-baseline.json` holds the renders:
 
 - **Diagnostics:** a message names a type for a person (`cloCallSigRejectWhat`,
   `nulNicheIsTestImpossible`, `mapSoftTwinTagFail`, `emitMapUnionPayloadTail`).

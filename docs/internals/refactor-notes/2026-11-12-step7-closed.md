@@ -1,7 +1,62 @@
 # Step 7 closed: §7's L2 and L6 lines deleted, the floors stated as contract, the scoreboard re-baselined
 
-DRAFT, prepared on branch `step7-close`. It is finalized when the coordinator reports the lanes
-done, and every figure below is re-read on the master it lands on (closing census 5).
+Measured on master `11274d92` (2026-11-13), with a fixpoint seed of 6,712,490 bytes (two refreshes
+cmp-identical). Lane H's census regeneration (#7886) reads the same counts. The sections after
+"The close, graded" are the working record of closing census 5, kept for its rulings.
+
+## The close, graded against the exit criteria
+
+Graded against the list in `2026-11-11-step7-exit-criteria.md`:
+
+| item | then (`77d45015`) | at the close | instrument |
+| --- | --- | --- | --- |
+| L2: type-string parses of a render or synthesized name | 59 | **0** | `render-parse-census.vl -- --list ty-string-parse` |
+| L2: unclassified parses | — | 0 | `--list ty-parse-unclassified` |
+| L2: carried floors | — | 7 sites under 4 filed rows | `--list ty-carried-floor`, `scripts/render-parse-floors.txt` |
+| L2: source parses | — | 3 (`nameIsQuotedLeaf` over a literal's own lexeme) | `--list ty-source-parse` |
+| L2: classifiers reading NAME (call sites) | 51 (106) | 6 (11) | `rep-classifier-census.vl -- --summary` |
+| L2: classifiers reading SPELLING (call sites) | 12 (29) | 0 (0) | the same |
+| L2: ARENA + NAME / ARENA + SPELLING pairs | 14 / 2 | 2 / 0 | the same |
+| L6: slot-layer name producers | 15 | 1 (`structIndexByName`, the `sNameIx` reader) | `vkind-census.vl -- --slots-list` |
+| L6: `canonUnionKeyOfName` / `nliInferLet` | 21 / 3 | 0 / 0 | live grep |
+
+The renders are a different measure from the line's figure. The census now counts every renderer
+whose spelling a later decision reads (93) and every render for a message (42), not
+`tyToEmitName` alone. Each render is graded by its consumer ("The renders at this draft", below):
+a label, a key that passes the canonical-key test, output text or a presence test. None feeds a
+parse except the carried floors.
+
+The six NAME readers:
+
+- `annTyIsRefList` (ARENA + NAME): a presence test, whether an annotation is written.
+- `unionNameOfCall` (ARENA + NAME): a rung of the `unionNameOfExpr` floor (contracts, below). Its
+  row is found by type.
+- `emitUnionLitIs` and `elabArgRepins`: contract. A literal's lexeme, and a type parameter's
+  identity.
+- `nulNicheIsTestImpossible`: a diagnostic render.
+- `flatHasSubWordField`: D15978, a `flat` field's sub-word width that has no type.
+
+`structIndexByName`'s five call sites read an `#anonN` handle, a type parameter's identity, or the
+row dump, all under `sNameIx`'s contract. `registerInlineUnionAt` and `mintInlineUnion` take the
+type; the name they carry is the `unNames` label (D16032).
+
+**Carried past step 7: 9 rows.** D15976, D16010, D16012, D16014, D16022, D16032, D16052, D16060
+and D16063. Four of them hold the census's 7 floor sites: D16022 ×2, D16032, D16052 ×2 and D16014 ×2.
+D16042 is a tenth row outside the census (an armed-only instrument). On master `11274d92`,
+`check-filed-witnesses.vl --strict` over both inventories grades all 4,893 witnesses as filed,
+with 0 moved and 0 output mismatches. Each carried row reads `runs  runs  as filed`.
+
+**The scoreboard, re-baselined (ruled 2026-11-11):**
+
+- **emit_classify:** 15,204 lines and 655 functions, against the 14,412 reference. It is graded by
+  the classifier census it stood in for: NAME 51 → 6, SPELLING 12 → 0.
+- **The seed:** 6,712,490 bytes, +1.9% against the gate's 6,589,035. This PR runs
+  `seed-size.vl -- --write-baseline` on the fixpoint seed. The cost is the conversions': a typed
+  read where a name read was, and an invariant `emitFail` where a silent default was. It is graded
+  by the name ladders deleted.
+
+`goal-scoreboard.vl` reports 1 cell against the goal: a function-value call with no interned
+signature, an emit reject outside step 7's lines.
 
 ## What the close deletes
 
@@ -303,10 +358,11 @@ no program reads a wrong answer:
 
 Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the site reads a name
 because the checker records no type there. Each is filed `runs today and must keep running`, and
-its witness runs as filed on master `54b68c07`. The close carries them forward.
+its witness runs as filed on master `11274d92`. The close carries them forward.
 
-The close carries 9 rows. Three of them hold the census's 4 floor sites, the `ty-carried-floor` code in
-`scripts/render-parse-floors.txt`: D16022 ×2, D16032 and D16052. D16042 is the ninth, outside the census.
+The close carries 9 rows. Four of them hold the census's 7 floor sites, the `ty-carried-floor`
+code in `scripts/render-parse-floors.txt`: D16022 ×2, D16032, D16052 ×2 and D16014 ×2. D16042 is
+a tenth row, outside the census.
 
 | row | site | the gap |
 | --- | --- | --- |
@@ -318,6 +374,7 @@ The close carries 9 rows. Three of them hold the census's 4 floor sites, the `ty
 | [D16012](../inventory/D16012.md) | `letDeclResolveAnnot`'s residual re-parse | it re-parses only when two bound type parameters share a name or a type variable survives `substTyDeep`, where substitution by name can answer a concrete but wrong type; a checker gap (`generics/nested-generic-shadowed-param-capture.vl`) |
 | [D16063](../inventory/D16063.md) | three inferred-return namers (check time) | they decide value-union-ness by parsing the name they just rendered; checker-only |
 | [D16032](../inventory/D16032.md) | `arenaEmitName`'s canon pass (emit_collect:8081) | the `unNames` label of a type-reached union is canon of a render, not spelled from the type; the label lookups move to `unRowOfTyKey` (lane D) |
+| [D16014](../inventory/D16014.md) | `repElemTyOfName`, `declTyIxOfName` (`rlInternNameTyK`'s two name parses) | a ref-list row whose element holds a hole function is keyed by its name: the hole is stored as tagged ids, and no closed type spells that rep |
 | [D16022](../inventory/D16022.md) | `monoArgTyNameRep`'s residual census site | a record-list literal argument with an open element type (a hole function or a type parameter) pins by its element's name; the pin must be chosen after the callee instance resolves, a mono reorder beyond step 7 (7 programs, all running, the scope loud) |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
