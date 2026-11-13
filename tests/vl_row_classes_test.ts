@@ -12,6 +12,8 @@ type Dump = {
   arms: Map<string, { twin: number; codes: string }>;
   types: Map<string, { row: number; variant: number; cls: string }>;
   armTwins: number[];
+  rowHeaps: number[];
+  armHeaps: number[];
 };
 
 const dump = (src: string): Dump => {
@@ -35,17 +37,23 @@ const dump = (src: string): Dump => {
     { row: number; variant: number; cls: string }
   >();
   const armTwins: number[] = [];
+  const rowHeaps: number[] = [];
+  const armHeaps: number[] = [];
   for (const line of text.split("\n")) {
     const row = /^row (\d+) (\S+) decl=(\d) heap=(-?\d+) codes=(\S*)$/.exec(
       line,
     );
-    if (row) rows[Number(row[1])] = `${row[2]} decl=${row[3]} codes=${row[5]}`;
+    if (row) {
+      rows[Number(row[1])] = `${row[2]} decl=${row[3]} codes=${row[5]}`;
+      rowHeaps[Number(row[1])] = Number(row[4]);
+    }
     const arm = /^arm (\d+) (\S+) twin=(-?\d+) heap=(-?\d+) codes=(\S*)$/.exec(
       line,
     );
     if (arm) {
       arms.set(arm[2], { twin: Number(arm[3]), codes: arm[5] });
       armTwins[Number(arm[1])] = Number(arm[3]);
+      armHeaps[Number(arm[1])] = Number(arm[4]);
     }
     const ty = /^type (\S+) row=(-?\d+) variant=(-?\d+) class=(.*)$/.exec(line);
     if (ty) {
@@ -59,7 +67,7 @@ const dump = (src: string): Dump => {
       throw new Error(`unparsed dump line: ${JSON.stringify(line)}`);
     }
   }
-  return { rc, rows, arms, types, armTwins };
+  return { rc, rows, arms, types, armTwins, rowHeaps, armHeaps };
 };
 
 const arm = (d: Dump, name: string) => {
@@ -149,7 +157,9 @@ Deno.test({
   },
 });
 
-// The row a declared type name builds at: its own row, else its arm's twin row; -1 for neither.
+// The row a declared type name builds at: its own row, else its arm's twin row, else the row
+// whose heap type its arm shares (an arm answering its type's own `#ref` row has no named
+// twin); -1 for none.
 const rowOf = (d: Dump, name: string): number => {
   const t = d.types.get(name);
   if (!t) {
@@ -159,7 +169,11 @@ const rowOf = (d: Dump, name: string): number => {
   }
   if (t.row >= 0) return t.row;
   if (t.variant < 0) return -1;
-  return d.armTwins[t.variant] ?? -1;
+  const twin = d.armTwins[t.variant] ?? -1;
+  if (twin >= 0) return twin;
+  const heap = d.armHeaps[t.variant] ?? -1;
+  if (heap < 0) return -1;
+  return d.rowHeaps.findIndex((h) => h === heap);
 };
 
 // D15107's class-A witness: `ap` elaborates once for `C` and `D`, which mono keeps apart as two
