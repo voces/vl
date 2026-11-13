@@ -53,8 +53,9 @@ spelling on the corpus only by coincidence:
 | `ifExprNliName` → `valueAtomKind`                 | arm atoms from `nliAtomOfExpr`, a render of each arm's type |
 | `cboxElemNeedsParens` → `tyTopIndexOf`            | the spelling of an annotation the emitter minted            |
 
-These are source on the corpus, not by construction, and stay open for their
-owners. The other three (`emitLitMemberEq`, `emitFieldLitEq`, `emitUnionLitIs` →
-`nameIsQuotedLeaf`) receive a literal's own lexeme, `TyLit.litText` quoted,
-which holds by construction. No (c) census site reads `udVariants` directly.
-`internShapeAs`, which does, already grades render.
+These are source on the corpus, not by construction, and count as failing.
+Owners: `boxWidenAtomFor` D, `ifExprNliName` G, `unionHasBoolLeafArm` G,
+`cboxElemNeedsParens` F. The other three (`emitLitMemberEq`, `emitFieldLitEq`,
+`emitUnionLitIs` → `nameIsQuotedLeaf`) receive a literal's own lexeme,
+`TyLit.litText` quoted, which holds by construction. No (c) census site reads
+`udVariants` directly. `internShapeAs`, which does, already grades render.
