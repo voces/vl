@@ -456,6 +456,7 @@ import {
   litBaseTy,
   litMemberTy,
   litRegularTy,
+  litUnionAliasNameOfTy,
   mkArrayTy,
   mkArrayViewTy,
   mkFuncTy,
@@ -10518,4 +10519,64 @@ export function voidStoreRefuse(shown: string, ix: i32) {
       + "` stores `void`, which has no value: no list element, map key or map value can be `void`",
     ix,
   )
+}
+
+// `ty` normalized the way its rendered name normalizes it on the way to a row key: a literal leaf
+// widens to its base scalar, except a string literal inside a union and a litunion alias, which the
+// render keeps outside a function parameter; a one-member union is its member; a function or list
+// is rebuilt fresh, dropping what the render does not spell.
+export function storageNormTy(ty: i32): i32 {
+  storageNormGo(ty, 6, false, false)
+}
+
+function storageNormGo(
+  ty: i32,
+  depth: i32,
+  inUnion: boolean,
+  param: boolean,
+): i32 {
+  if ty < 0 || depth <= 0 { return ty }
+  if !param && litUnionAliasNameOfTy(ty) != "" { return ty }
+  const t = tyAt(ty)
+  match t {
+    TyLit => if inUnion && !param && t.litKind == "str" { ty } else { litBaseTy(t) }
+    TyUnion => {
+      if t.uMembers.length == 1 {
+        return storageNormGo(t.uMembers[0], depth - 1, inUnion, param)
+      }
+      let changed = false
+      const ws: i32[] = []
+      for m in t.uMembers {
+        const w = storageNormGo(m, depth - 1, true, param)
+        if w != m { changed = true }
+        ws.push(w)
+      }
+      if !changed || ws.length == 0 { return ty }
+      let acc = ws[0]
+      let k = 1
+      while k < ws.length {
+        acc = joinTys(acc, ws[k])
+        k = k + 1
+      }
+      acc
+    }
+    TyNullable => {
+      const wi = storageNormGo(t.nInner, depth - 1, false, param)
+      if wi == t.nInner { ty } else { mkNullableTy(wi) }
+    }
+    TyFunc => {
+      const ps: i32[] = []
+      for p in t.fnParamTypes {
+        ps.push(storageNormGo(p, depth - 1, false, true))
+      }
+      mkFuncTy(ps, storageNormGo(t.fnRet, depth - 1, false, false))
+    }
+    TyArray => mkArrayTy(storageNormGo(t.aElem, depth - 1, false, param))
+    TyMap => {
+      const wk = storageNormGo(t.mKey, depth - 1, false, param)
+      const wv = storageNormGo(t.mVal, depth - 1, false, param)
+      if wk == t.mKey && wv == t.mVal { ty } else { mkMapTy(wk, wv, t.mSet) }
+    }
+    TyObj | TyPrim | TyErr | TyVar | TyNeg => ty
+  }
 }
