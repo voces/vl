@@ -109,6 +109,20 @@ then lists (a) and (b), renders included, by owner with counts, for the coordina
 H's origin probe (lower bound): 73 reached parse sites of class (a) or (b), 20 ambiguous bare-name
 sites, 21 source-only and 34 unreached, beside 13 renders. L2 stays open.
 
+Lane H's per-site grade (#7748, `scripts/render-parse-origins.ts`) supersedes that: 75 render or
+synthesized parse sites (a lower bound), 19 source-only, 55 ungraded, and 13 renders. Lane I's
+triage, by mechanism (sent to the coordinator to assign):
+
+| package | parser | sites | owner |
+| --- | --- | --- | --- |
+| P1 value-union-ness of a name | `isValueUnionName` | 16 | G 11 (union_atoms 5, wasmEmit 3, fn_scans, nullable_rets, start_block, collect:5429 = 12, less H's one), E 3 (shape_intern:317, `iisPushFieldElem` ×2), H 1 (`mvShapeOfValNameArmTyGo`) |
+| P2 atom kind of a member set's rendered atom | `valueAtomKind` | 13 | G/A: emit_rep ×2, union_casts, eq_rows, obj_lit_fits ×3, collect ×2, query, wasmEmit eq ×3 |
+| P3 shape-spelling grammar | `groupInnerOf`, `nameIsShapeSpanEnds`/`nameIsShapeOpen`, `tyTopLevelSplit`, `peelGroupParens`, … | 20 | E/F (D6): emit_base 9, shape_intern 5, collect 4; G: `msAtomIdOf`; classify: `identFnTypeAnnNameOfRead` |
+| P4 generic-application spelling | `gae*`, `annGenAppSpanEnds`, `nameMentionsGenAliasParam` | 11 | D/E: collect 8, `gaeEnsure`, `nameIsGenAppDecl`, `gaeParamShadowed` |
+| P5 a name resolved back to a type | `resolveAnnot`, `nameToTy` | 5 | F/B: emit_rep ×3; D: `recordClonedIsVarTy`; ruling: `recordClonedNodeTyFb` re-checks `synthTypeRefOfTy`'s text (the TypeRef-text contract?) |
+| P6 mono spellings | `arrElemSuffixed`, `monoUnspacedUnions`, `canonEmitName` | 4 | D |
+| P7 literal-set and nullable membership of a name | `nameIsLitUnionArmValueUnion`, `unionHasAtom`, `nullablePartOf` | 6 | G 5; D 1 (`nonNulBaseOf`, D16040) |
+
 ## Floors held by a filed row
 
 Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the site reads a name
