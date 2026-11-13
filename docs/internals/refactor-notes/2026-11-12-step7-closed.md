@@ -92,10 +92,19 @@ There are also 148 `check_*` entry sites that emit reaches and the checker share
 `nameToTy` is reached from emit through `synthTypeRefFb` (78 programs) and `monoSubstIsExpr`
 (36 programs).
 
-So "renders down to the floor, parses at one" is a claim about the old census, not about the
-emitter. The close does not open on it. §3.3's sentence "parses no type spelling back" waits on
-the re-measure under #7748's census. Each of the 115 reached parse sites is graded as a floor
-with a contract, or as failing with an owner.
+**L2's render/parse criterion is UNVERIFIED** (coordinator, 2026-11-13). "Renders down to the
+floor, parses at one" is a claim about the old census, not about the emitter, so the close does not
+open on it. The re-measure grades by the string's origin, not by file (coordinator, 2026-11-13). Lane H
+classifies each reached parse site first:
+
+- (a) a render, or (b) a synthesized or mangled name: fails, unless an accepted contract covers it;
+- (c) user-written source text: not a violation.
+
+A `check_*` site is graded by the same rule. A checker parse of the program's own annotation text
+is the checker's job. A checker parse reached from emit whose input the emitter or mono produced
+(`synthTypeRefFb` → `recordClonedNodeTyFb`) is in scope, whatever file holds the parser. Lane I
+then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
+§3.3's sentence "parses no type spelling back" waits on that.
 
 ## Floors held by a filed row
 
