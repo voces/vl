@@ -47,7 +47,7 @@ bytes-only movers, 0 output movers.
 
 | | before | after |
 | --- | --- | --- |
-| `ty-string-parse` | 69 | 64 |
+| `ty-string-parse` | 69 | 63 |
 | `ty-source-parse` | 25 | 21 |
 | `ty-parse-unclassified` | 55 | 59 |
 
