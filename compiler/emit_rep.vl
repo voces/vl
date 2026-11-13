@@ -19,10 +19,9 @@ import {
 import { nodeTyIxOf } from "./check_node_tys"
 import { nodeTyAt } from "./emit_capture_frames"
 import { i32ToStr } from "./ast"
-import { nameIsShapeSpanEnds } from "./emit_base"
 import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { emitFail } from "./emit_bytes"
-import { annGenAppSpanEnds, peelGroupParens } from "./tyname"
+import { peelGroupParens } from "./tyname"
 import {
   FC_NUL_REF_LIST,
   FC_REF_LIST,
@@ -2098,18 +2097,6 @@ export function sTyIxOfNameTy(nm: string, tyIx: i32): i32 {
   if tyIx >= 0 { return tyIx }
   const di = cUserTypes[nm] ?? -1
   if di >= 0 { return di }
-  // The inline-shape fallback: only a bare `{...}` spelling (not a map `{[`) resolves.
-  // Runs at intern time inside `collectS`'s row-minting loop; `resolveAnnot` mints
-  // arena types per call (the #961 runaway shape), but the annotation-name memo keeps
-  // the cost in the noise. A name resolving through neither path stays -1, and `slotCanonId` falls through to its existing name behaviour.
-  if nameIsShapeSpanEnds(nm) { return resolveAnnot(nm, repNoTyparams) }
-  // A generic application (`Box<i32>`) is minted with its type, so a spelled one here has none.
-  if annGenAppSpanEnds(nm) {
-    emitFail(
-      "emitProgram: a generic application's row was minted with no type: " + nm,
-    )
-    return -1
-  }
   -1
 }
 
@@ -2163,38 +2150,26 @@ export function declTyIxOfName(nm: string): i32 {
   resolveAnnot(nm, repNoTyparams)
 }
 
-// Record the two sidecar columns of the struct field row just pushed onto
-// `sFieldElemName`: the element/target name's arena type (phase D5) and, for a map
-// field, the key half of the map's rep (B6b). Pads -1/0 so a skipped push self-heals
-// to uncovered. One recorder for both, since writing the key at only some push sites is exactly the parallel-array skew this table is most fragile to.
-export function recordSFieldElemRow(nm: string, keyK: i32) {
-  recordSFieldElemRowTy(nm, keyK, -1)
-}
-
-// `recordSFieldElemRow` with the caller's arena row for `nm`; -1 is exactly the
-// unhinted call, unchanged by construction. On the sidecar side of the mint-order
-// line (D-MAPNODETY): the row is recorded beside a mint that already happened,
-// never fronting one — a mint path here emits invalid wasm (the mv-slot interner).
-export function recordSFieldElemRowTy(nm: string, keyK: i32, tyHint: i32) {
+// Record the two sidecar columns of the struct field row just pushed onto `sFieldElemName`:
+// the element's arena type `ty` (-1 when the field has no element) and, for a map field, the
+// key half of the map's rep `keyK`. Pads -1/0 so a skipped push self-heals to uncovered. On
+// the sidecar side of the mint-order line (D-MAPNODETY): it never fronts a mint.
+export function recordSFieldElemRowTy(keyK: i32, tyHint: i32) {
   recordFieldElemRow(
     sFieldElemName,
     sFieldElemTyIx,
     sFieldElemKeyKind,
-    nm,
     keyK,
     tyHint,
   )
 }
 
-// The `recordSFieldElemRowTy` twin for the VARIANT field table (`armFieldElemName`), with the
-// caller's arena row for `nm` or -1. The sidecar side of the mint-order line, exactly as
-// `recordSFieldElemRowTy`.
-export function recordUFieldElemRowTy(nm: string, keyK: i32, tyHint: i32) {
+// The `recordSFieldElemRowTy` twin for the variant field table (`armStageElemName`).
+export function recordUFieldElemRowTy(keyK: i32, tyHint: i32) {
   recordFieldElemRow(
     armStageElemName,
     armStageElemTyIx,
     armStageElemKeyKind,
-    nm,
     keyK,
     tyHint,
   )
@@ -2206,16 +2181,11 @@ function recordFieldElemRow(
   names: string[],
   tys: i32[],
   keys: i32[],
-  nm: string,
   keyK: i32,
   tyHint: i32,
 ) {
   while tys.length + 1 < names.length { tys.push(-1) }
-  let ty = tyHint
-  // D16061: an anonymous literal's field typed at the hole hands no element type, so the
-  // element's name is resolved. A list of literal unions hands -1 by design and resolves too.
-  if ty < 0 { ty = fieldElemTyIxOfName(nm) }
-  tys.push(ty)
+  tys.push(tyHint)
   while keys.length + 1 < names.length { keys.push(0) }
   keys.push(keyK)
   0
@@ -2843,13 +2813,6 @@ export function slotRowTyOf(si: i32): i32 {
   // its properties stay invisible to the corpus, stated rather than banked as a zero.
   const nm = sNames[si]
   const di = cUserTypes[nm] ?? -1
-  // An inline record row is minted with its type (rung 1), so a spelled one here has none.
-  if di < 0 && nameIsShapeSpanEnds(nm) {
-    emitFail(
-      "emitProgram: an inline record's row was minted with no type: " + nm,
-    )
-    return -1
-  }
   if di >= 0 {
     const t = tyAt(di)
     if !(t is TyObj) { return -1 }
