@@ -75,6 +75,14 @@ type Site = {
 
 const SCOPE = /^compiler\/(emit_[^/]*|wasmEmit|check_emit_queries)\.vl$/;
 
+// Parsers that take a type and parse a render of it inside (`canonUnionMembersInto` renders each
+// leaf with `tyToNominalName` and canons the text): the input of their parse is a render by
+// construction, so a reach is graded render without reading an argument.
+const RENDERS_INSIDE = new Set([
+  "canonUnionMembersInto",
+  "canonUnionMembersLitsInto",
+]);
+
 // The census's parse sites, keyed as the census keys them.
 const sitesOf = async (): Promise<Site[]> => {
   const r = await run(VL, [
@@ -393,6 +401,17 @@ export function hpS(k: i32, v: string): string {
   v
 }
 
+export function hpN(k: i32, v: i32): i32 {
+  if hpOn {
+    const key = i32ToStr(k) + "\\u{1}#"
+    if (hpSeen[key] ?? 0) == 0 {
+      hpSeen[key] = 1
+      if hpOut.length < 4000 { hpOut.push(i32ToStr(k) + "\\u{2}R\\u{2}(a type, rendered inside)") }
+    }
+  }
+  v
+}
+
 let hpRSeen: {[string]: i32} = Map()
 let hpROut: string[] = []
 
@@ -471,7 +490,13 @@ const buildProbe = async (
       const text = dec.decode(b);
       for (const k of ks) {
         const at = ls[sites[k].line - 1] + sites[k].col - 1;
-        const arg = wrapFirstArg(b, at, `hpS(${k}, `, ins);
+        const inside = RENDERS_INSIDE.has(sites[k].key.split("\t")[2]);
+        const arg = wrapFirstArg(
+          b,
+          at,
+          inside ? `hpN(${k}, ` : `hpS(${k}, `,
+          ins,
+        );
         sites[k].producer = producerOf(
           text,
           dec.decode(b.subarray(0, at)).length,
@@ -514,7 +539,7 @@ const buildProbe = async (
     }
     let out = ins.length > 0 ? applyInserts(b, ins) : dec.decode(b);
     if (ins.length > 0) {
-      out = `import { hpR, hpS, hpSrcNote } from "./hprobe"\n${out}`;
+      out = `import { hpN, hpR, hpS, hpSrcNote } from "./hprobe"\n${out}`;
     }
     if (e.name === "emit_sections.vl") {
       if (!out.includes(EMIT_HOOK_OLD)) {
@@ -647,7 +672,8 @@ const main = async () => {
             for (const item of body.split("\x03").slice(1)) {
               const [ks, exact, v] = item.split("\x02");
               let c: string;
-              if (v === "") c = "empty";
+              if (exact === "R") c = "render";
+              else if (v === "") c = "empty";
               else if (/[#$@]/.test(v)) c = "synthesized";
               else if (IDENT.test(v)) c = "bare";
               else if (
