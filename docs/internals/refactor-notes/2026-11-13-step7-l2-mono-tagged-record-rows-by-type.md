@@ -17,7 +17,8 @@ different keys, so there is none, and `monoTagMapRepTy`'s reach is unchanged:
 2. **Parameter side (D16020).** `synthTypeRefFb` keeps the literal's type for an `#anonN` pin
    in `anonPinLitTy`. The node's checker type stays the `{}` placeholder: recording the
    literal's type there makes `paramValtypeFloor` refuse a pin whose literal type holds a type
-   variable. `retStructRowIndex` reads the anonymous row at that type (`sAnonRowByTy`). The
+   variable. The table is cleared in `emitProgramReset`, which runs before any pass that
+   synthesizes a pin. `retStructRowIndex` reads the anonymous row at that type (`sAnonRowByTy`). The
    label is read only where no literal type is held, which is D16021.
 3. **Ref-list element (D16040).** `rlElemStructRowOfName`'s `structIndexByName(nonNulBaseOf(nm))`
    becomes `rowOfTyUpToFnSets`: the first declared or shape row whose recorded type is `tySame`
