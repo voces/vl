@@ -58,6 +58,24 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 | D | D16040 (filed, #7735; 6 programs; bundled with D16020 in D's PR 2, after #7742): `rlElemStructRowOfName` finds a generic instance's function-holding record by `structIndexByName(nonNulBaseOf(nm))`. Not on the carried list (coordinator), so it closes before the close |
 | B | `variantIndexOf` as a name producer: #7737, open |
 
+## The renders at this draft (master `537a04cc`, coordinator's measurement)
+
+The close criterion is "renders down to the floor". Each of the 8 standing `tyToEmitName` renders,
+graded:
+
+| site | grade | contract or owner | witness |
+| --- | --- | --- | --- |
+| `lvSpellOf` (emit_rewrite:813) | floor | a recorded TypeRef text: a synthesized annotation is source text, checked again as source (§3.3) | `closures/capture-module-value-block-local.vl` (41 cases reach it) |
+| `synthTypeRefOfTy` (emit_rewrite:1238) | floor | the same | `arrays/map-returning-list-runs.vl` (378 cases) |
+| `cloSigNameOfTy` (emit_union_atoms:1392) | floor | the `clo:` link key: the closure slot's printable name, rendered from its type (§3.3) | `closures/alias-is-closure-arm-three-arm-union-call.vl` (495 programs) |
+| `mapSoftTwinTagFail` (wasmEmit:6136) | floor | a diagnostic names a type for a person (§3.3) | `generics/error-literal-union-map-twin-through-one-instance{,-plain-first}.vl` |
+| `nulNicheIsTestImpossible` (wasmEmit:4593) | floor | a diagnostic, inside a guard ruled an assertion (no program reaches it; filed when one does) | none, by the assertion ruling |
+| `emitMapUnionPayloadTail` (wasmEmit:21950) | floor | the same | none, by the assertion ruling |
+| `shapeWalkKeyOf` (emit_shape_intern:277) | failing | E / F, the D6 re-key: the walk key still decides in `tyIsDeclaredNominal` and `shapeWalkSplitsUnion` | — |
+| `internArmShapeRow` (emit_shape_intern:730) | failing | A, after E's step (d) | — |
+
+Six are floors and two block the close. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
+
 ## Floors held by a filed row
 
 Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the site reads a name
