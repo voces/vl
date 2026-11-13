@@ -26,5 +26,5 @@ parameter goes.
 - Sweep with fixpoint seeds on both sides, master `ff65f873` against the candidate: 24,224 same, 0
   bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
 - `scripts/gate.sh`: all rows pass.
-- Render-parse census: the `valueAtomKind(atoms[rai])` entry leaves, so `ty-string-parse` goes
-  from 12 to 11.
+- Render-parse census: the `valueAtomKind(atoms[rai])` entry leaves, so emit_collect's
+  `ty-string-parse` goes from 1 to 0.
