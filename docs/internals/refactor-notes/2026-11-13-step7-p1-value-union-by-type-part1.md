@@ -43,19 +43,8 @@ type twin also answers no for a mixed-base literal union (`"a" | 1`) that boxes.
 this change before the fallback was inlined; the inlined form is the same logic): 24,207 same, 0
 bytes-only movers, 0 output movers.
 
-**The census after regeneration:**
+**The census.** Per the coordinator's rule, the origins and the sites table are master's own; only
+this change's files lower in the baseline. `ty-string-parse` falls by the two `isValueUnionName`
+sites deleted from `ifExprNliName` and `valueUnionNameOfSoftTy`. `collectARefArrayAnn`'s and
+`fnRetNullBearing`'s parses stay, reached now only where the type declines.
 
-| | before | after |
-| --- | --- | --- |
-| `ty-string-parse` | 69 | 63 |
-| `ty-source-parse` | 25 | 21 |
-| `ty-parse-unclassified` | 55 | 59 |
-
-What moved:
-- **Gone:** the two `isValueUnionName` sites in `ifExprNliName` and `valueUnionNameOfSoftTy`.
-  `armMintShapeName`'s two sites were deleted on master (#7744).
-- **Render to unreached:** `collectARefArrayAnn`'s fallback, which no program reaches.
-- **Source to unreached:** four `nameIsGenAppDecl` sites (`emit_shape_rows`), unreached since #7747.
-
-The unclassified count rises only by sites that became unreachable. They are deletion candidates,
-and the baseline is rewritten here with that reason.
