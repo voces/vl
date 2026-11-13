@@ -18,12 +18,21 @@ import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
 if (GATED && !ENABLED) {
-  console.warn("[vl-render-parse-budget] skipped — missing vl binary or seed wasm.");
+  console.warn(
+    "[vl-render-parse-budget] skipped — missing vl binary or seed wasm.",
+  );
 }
 
-const census = async (args: string[]): Promise<{ code: number; out: string }> => {
+const census = async (
+  args: string[],
+): Promise<{ code: number; out: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: ["run", await builtScript("scripts/render-parse-census.vl", { cwd: ROOT }), "--", ...args],
+    args: [
+      "run",
+      await builtScript("scripts/render-parse-census.vl", { cwd: ROOT }),
+      "--",
+      ...args,
+    ],
     cwd: ROOT,
     env: nativeEnv(),
     stdout: "piped",
@@ -69,7 +78,9 @@ function privateHelper(name: string) { name }
 
 // Declares every parser the census lists, so a fixture tree passes its stale-name check.
 const stubOf = (names: string[], drop: string): string =>
-  names.filter((n) => n !== drop).map((n) => `export function ${n}(name: string) { 0 }\n`).join("");
+  names.filter((n) => n !== drop).map((n) =>
+    `export function ${n}(name: string) { 0 }\n`
+  ).join("");
 
 const writeTree = async (dir: string, parsers: string[], drop: string) => {
   await Deno.mkdir(`${dir}/compiler`);
@@ -81,13 +92,21 @@ const writeTree = async (dir: string, parsers: string[], drop: string) => {
 };
 
 Deno.test({
-  name: "render-parse ratchet: counts the emitter's real calls and nothing else",
+  name:
+    "render-parse ratchet: counts the emitter's real calls and nothing else",
   ignore: !ENABLED,
   async fn() {
     const real = await census(["--parsers"]);
     const parsers = real.out.trim().split(/\r?\n/).filter((l) => l);
-    if (real.code !== 0 || !parsers.includes("nameToTy") || !parsers.includes("groupInnerOf")) {
-      throw new Error(`--parsers on the tree: rc ${real.code}, got ${JSON.stringify(parsers)}`);
+    if (
+      real.code !== 0 || !parsers.includes("nameToTy") ||
+      !parsers.includes("groupInnerOf")
+    ) {
+      throw new Error(
+        `--parsers on the tree: rc ${real.code}, got ${
+          JSON.stringify(parsers)
+        }`,
+      );
     }
     if (parsers.includes("demangleSpelling")) {
       throw new Error("--parsers lists the display rewrite `demangleSpelling`");
@@ -103,18 +122,27 @@ Deno.test({
         "compiler/emit_x.vl:9  kindOf  nameIsArray",
         "compiler/emit_x.vl:9  kindOf  tyToEmitName",
         "compiler/emit_x.vl:13  shapeOf  groupInnerOf",
+        "compiler/emit_x.vl:20  emitCast  valueAtomKind",
         "compiler/emit_x.vl:20  emitCast  tyToEmitName",
         "compiler/emit_x.vl:21  emitCast  nullablePartOf",
         "compiler/emit_x.vl:21  emitCast  tyToEmitName",
       ];
       if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(want)) {
-        throw new Error(`rc ${r.code}: want ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+        throw new Error(
+          `rc ${r.code}: want ${JSON.stringify(want)}, got ${
+            JSON.stringify(got)
+          }`,
+        );
       }
       const only = await census(["--list", "ty-render", "--root", dir]);
       const gotRender = only.out.trim().split(/\r?\n/).filter((l) => l);
       const wantRender = want.filter((l) => l.endsWith("tyToEmitName"));
       if (JSON.stringify(gotRender) !== JSON.stringify(wantRender)) {
-        throw new Error(`--list ty-render: want ${JSON.stringify(wantRender)}, got ${JSON.stringify(gotRender)}`);
+        throw new Error(
+          `--list ty-render: want ${JSON.stringify(wantRender)}, got ${
+            JSON.stringify(gotRender)
+          }`,
+        );
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
@@ -124,7 +152,9 @@ Deno.test({
       await writeTree(stale, extras, "nameToTy");
       const r = await census(["--list", "--root", stale]);
       if (r.code !== 2 || !r.out.includes("`nameToTy` is declared nowhere")) {
-        throw new Error(`stale parser: want rc 2 naming nameToTy, got rc ${r.code}: ${r.out}`);
+        throw new Error(
+          `stale parser: want rc 2 naming nameToTy, got rc ${r.code}: ${r.out}`,
+        );
       }
     } finally {
       await Deno.remove(stale, { recursive: true });
