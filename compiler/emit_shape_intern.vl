@@ -1,4 +1,8 @@
-import { litUnionAliasNameOfTy } from "./check_types"
+import {
+  genAppRowOf,
+  litUnionAliasNameOfTy,
+  tyIsGenAppInstance,
+} from "./check_types"
 
 // `emit_shape_intern.vl` — interning inline and deep shapes, function-type shapes
 // and ref-array arms into the shape tables.
@@ -93,13 +97,11 @@ import {
 } from "./emit_rep"
 import {
   armFieldStructRow,
-  armTwinRowName,
   famRelayStructRow,
   fieldCodeOfDeclinedTy,
   fieldTypeRefusalMsg,
   forceScalarListField,
   mapTyValKindLowerable,
-  nameIsGenAppDecl,
   nulRefListFieldCodeOfTy,
   repStructRowIsOrTwin,
   shapeFieldElemName,
@@ -170,12 +172,7 @@ import {
 } from "./emit_union_registry"
 import {} from "./strutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
-import {
-  annGenAppSpanEnds,
-  groupInnerOf,
-  nameIsShapeOpen,
-  nameStripSpaces,
-} from "./tyname"
+import { groupInnerOf, nameStripSpaces } from "./tyname"
 import {
   litPeekBaseTy,
   nonNullTy,
@@ -352,7 +349,9 @@ function internShapeDeepTyGo(kn: string, ty: i32) {
   }
   if t is TyArray { return internShapeDeepTy(tyStepElem(ty)) }
   if t is TyMap { return internShapeDeepTy(tyMapValOf(ty)) }
-  gaeEnsure(ln, ty)
+  // A fresh walk of a registered application is keyed by its application name, so the same
+  // instance also interns under its structural key.
+  if kn != "" && tyIsGenAppInstance(ty) { gaeEnsure(ty) }
   internInlineShapeTy(ln, ty)
 }
 
@@ -556,7 +555,6 @@ function internFuncTypeShapesTyGo(kn: string, ty: i32): i32 {
     TyObj => {
       if !tyIsDeclaredNominal(ty) {
         if funcTypeShapeLowerable(ty) {
-          internShapeFieldElemsTy(ln, ty)
           internInlineShapeTy(ln, ty)
         } else {
           // The outer shape stays un-interned, but its nested shapes and closure fields'
@@ -590,33 +588,6 @@ function internNonLowerableFieldShapesTy(ty: i32) {
   0
 }
 
-// Pre-interns the inline-shape leaves of `nm`'s array-typed fields, so `internInlineShape`'s
-// code-5 arm resolves each element name — interning mid-field-loop would corrupt the flat
-// `sField*` arrays. The functype twin of `collectNestedFieldShapes`' leaf strip, run only on
-// a shape `funcTypeShapeLowerable` accepted, before the shape itself interns.
-function internShapeFieldElemsTy(nm: string, ty: i32) {
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
-  let fi = 0
-  while fi < fnames.length {
-    if fnames[fi] != "" {
-      const ftxt = arrLeafNameOf(ftexts[fi])
-      // `peeled` — "the loop ran at least once" — IS `leaf != name`: every iteration
-      // shortens by exactly two characters, so the peel is the identity iff nothing peeled.
-      const peeled = ftxt != ftexts[fi]
-      if peeled && nameIsShapeOpen(ftxt) {
-        internInlineShapeTy(
-          ftxt,
-          tyStepArrRun(tyFieldTyOf(ty, fnames[fi]), ftexts[fi], ftxt),
-        )
-      }
-    }
-    fi = fi + 1
-  }
-  0
-}
-
 // True if any field of shape `tyIx` (field names `rawNames`) holds a generic
 // type parameter as an array element (`T[]` at any depth, or `(T | null)[]`), declining to
 // mint a shape row before the parameter is substituted. A field with no arena type answers
@@ -630,9 +601,7 @@ function shapeFieldsRideTyParam(rawNames: string[], tyIx: i32) {
     // An application over a parameter (`B<T>`) is the original's too: `gaeEnsure` never
     // interns it, so a row coding it as a struct ref has no heap to point at (D4556).
     const ga = arrSpineLeafTy(nonNullTy(fTy))
-    if ga >= 0 && tyHasTyVar(ga) && nameIsGenAppDecl(tyToNominalName(ga)) {
-      return true
-    }
+    if ga >= 0 && tyHasTyVar(ga) && genAppRowOf(ga) >= 0 { return true }
     const eTy = tyStepElem(fTy)
     if eTy >= 0 {
       if tyAt(arrSpineLeafTy(eTy)) is TyVar { return true }
@@ -1006,20 +975,20 @@ function nestedFieldShapeRow(fldTy: i32): i32 {
 function fieldIsConcreteGenApp(fldTy: i32): boolean {
   const inner = nonNullTy(fldTy)
   if inner < 0 || tyHasTyVar(inner) { return false }
-  nameIsGenAppDecl(tyToNominalName(inner))
+  genAppRowOf(inner) >= 0
 }
 
 const IIS_SHAPE_FIELD_NO_LAYOUT_MSG = "emitProgram: an inline record field has no storage type to key its row by"
 
 function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
   if !nameIsShapeSpanEnds(nm) { return -1 }
-  // A spelling that opens and closes a brace can still be a union of records; its type says so.
-  if fieldsTy >= 0 && !(tyAt(fieldsTy) is TyObj) { return -1 }
-  // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
-  // the shape layer's ONE field scanner).
-  const rawNames: string[] = []
-  const rawTexts: string[] = []
-  shapeInnerFieldSplit(groupInnerOf(nm), rawNames, rawTexts)
+  // The fields are the record type's own; a spelling with no record type behind it (a union of
+  // records, or no type at all) interns nothing.
+  if fieldsTy < 0 { return -1 }
+  const ft = tyAt(fieldsTy)
+  if !(ft is TyObj) { return -1 }
+  const rawNames = ft.objFieldNames
+  const rawTys = ft.objFieldTypes
   // A generic original's inline shape declares no concrete struct, exactly as a generic
   // alias declares none, so it must not be interned: without this a type-parameter array
   // field resolved to "" and `pushFieldStorage` read `rlWrapIdx[-1]`, a compiler crash.
@@ -1033,39 +1002,24 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
     if rawNames[fi] == "" {
       ok = false
     } else {
-      let ftxt = rawTexts[fi]
       // Pre-interns any inline shape or value union buried in the field type before
       // classifying: a nullable ref-list field needs its element shape interned for
       // `nameFieldCodeTy` to recognize the non-null part as a ref array. Must run before any
       // row is pushed, so the flat `sField*` arrays are not corrupted by the re-entrant intern.
-      const fldTy = tyFieldTyOf(fieldsTy, rawNames[fi])
+      const fldTy = rawTys[fi]
+      if fldTy < 0 { return emitFail(IIS_SHAPE_FIELD_NO_LAYOUT_MSG) }
       internShapeDeepTy(fldTy)
-      // The field's code is read off its type; a field with no type (a caller that holds none)
-      // is coded from its text, the floor.
-      let fc = if fldTy >= 0 { nameFieldCodeTy("", fldTy) } else { nameFieldCodeTy(ftxt, fldTy) }
+      let fc = nameFieldCodeTy("", fldTy)
       if fc < 0 {
-        // A nested inline-shape field interns the nested shape and stores a struct ref on
-        // it under the canonical registered name. An earlier literal may have interned the
-        // identical shape as a synthetic `#anonN`, so keying this field by the raw inline
-        // spelling instead would block the dedup and leave the element unresolvable at emit.
-        const iidx = nestedFieldShapeRow(fldTy)
-        if iidx >= 0 {
+        // A nested inline-shape field interns the nested shape and stores a struct ref on it.
+        if nestedFieldShapeRow(fldTy) >= 0 {
           fc = FC_STRUCT
-          ftxt = sNames[iidx]
         } else if fieldIsConcreteGenApp(fldTy) {
           // The declared field's generic-application rung (D4556): a shape
           // nested in a declaration interns before `collectGenAliasShapes`, so the instance
           // has no row yet and is keyed by its application name, as a declared field is.
           fc = FC_STRUCT
         }
-      }
-      // The arm-typed field's element name, the interner's copy of `fieldRefElemName`'s rung
-      // (D761): `nameFieldCodeTy` already answers 15 for an arm-typed field, so the nested-
-      // shape arm above never runs and `ftxt` would stay the arm's name, unresolvable by
-      // `structIndexByName`. Recorded as the cross-table twin's name instead.
-      if fc == FC_STRUCT {
-        const armNm = armTwinRowName(fldTy)
-        if armNm != "" { ftxt = armNm }
       }
       // A field naming an arm with no row yet, inside an arm mint: an arm still being minted is
       // pointed at by the name its row is pushed under, at any depth, and the mint's own field
@@ -1077,16 +1031,10 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
           && (fc < 0 || fc == FC_STRUCT)
           && armFieldStructRow(fldTy) < 0
         ) {
-          const inFlight = iasMintNameOf(xv)
-          if inFlight != "" {
+          if iasMintNameOf(xv) != "" {
             fc = FC_STRUCT
-            ftxt = inFlight
           } else if iasMintTopDepth() == iisBusy {
-            const xr = internArmShapeRow(xv)
-            if xr >= 0 {
-              fc = FC_STRUCT
-              ftxt = sNames[xr]
-            }
+            if internArmShapeRow(xv) >= 0 { fc = FC_STRUCT }
           }
         }
       }
@@ -1097,13 +1045,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
     fi = fi + 1
   }
   if !ok { return -1 }
-  // The empty shape `{}` is a real zero-field layout, not a parse failure (D1171): a bare
-  // `names.length == 0` refusal would leave `{} | null` with no interned shape, a loud
-  // reject on a program the alias spelling already compiles and runs. Only a body that is
-  // actually empty may mint a zero-field row; a non-empty body splitting into none is malformed.
-  if names.length == 0 {
-    if nameStripSpaces(groupInnerOf(nm)).length != 0 { return -1 }
-  }
+  // A record with no fields is the real zero-field layout `{}` (D1171), not a parse failure.
   // A record finds its row by type first, the key the struct registry holds, whether or not it
   // is declared. The layout find serves a type with no row.
   let existing = -1
@@ -1532,11 +1474,10 @@ function annSameTypeRowOf(
   si
 }
 
-// Interns the generic application `name` ("Box<i32>") at its instance type `ty`: the record's
-// rendered shape walks as any inline shape does. An application over a type parameter interns
-// nothing; each instance re-runs this over its own concrete type.
-export function gaeEnsure(name: string, ty: i32) {
-  if !annGenAppSpanEnds(name) { return 0 }
+// Interns generic application instance `ty` (`Box<i32>`) under its structural key, as any inline
+// shape walks. An application over a type parameter interns nothing; each instance re-runs this
+// over its own concrete type.
+export function gaeEnsure(ty: i32) {
   if ty < 0 || tyHasTyVar(ty) || !(tyAt(ty) is TyObj) { return 0 }
   internShapeDeepTy(ty)
   0
