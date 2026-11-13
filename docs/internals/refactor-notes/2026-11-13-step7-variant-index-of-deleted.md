@@ -60,3 +60,12 @@ The two movers come from the arm-mint field. Four bytes move in each: the functi
 recursive struct pair. The type set is the same, and so are the output and `wasm-dis` text.
 
 The only struct name producer left is `structIndexByName`, under the `sNameIx` contract.
+
+## The `sNameIx` contract carries no exception
+
+Lane G converted `utkAtomText` in cut 7a (#7704). It now keys a union atom by its member's type,
+and keys a member with no type as `?` plus its spelling, a case the sweep never reaches.
+`emit_union_tykey` no longer reads `structIndexByName`. So the
+[`sNameIx` contract](2026-11-12-step7-snameix-contract.md) holds with no exception clause: every
+key is an identifier or an `#anonN` handle. Lane F's `rlElemStructRow` reads it under F's
+contract (#7636).
