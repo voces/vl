@@ -43,5 +43,8 @@ sweep's 24,221 programs. A control fired.
 ## Proof
 
 - Refresh ×2: fixpoint.
-- Sweep with fixpoint seeds on both sides, master against the candidate: see the PR.
+- Sweep with fixpoint seeds on both sides, master `03549c92` against the candidate: 24,221
+  same, 0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps. The 8
+  programs that took the dup gate are among the same: the type-keyed registration already made
+  the second registration a no-op.
 - `scripts/gate.sh`: all rows pass.
