@@ -23,7 +23,7 @@ control arm firing on the `(i32)=>i32` member:
 
 ## Effect
 
-- render-parse budget: emit_collect `ty-string-parse` 4 → 2 (total 18 → 16 on this base). The two
+- render-parse budget: emit_collect `ty-string-parse` 4 → 2 (on master after #7837: 3 → 1, total 16 → 14). The two
   rows leave `render-parse-origins.txt` and `render-parse-sites.md` by hand.
 - `regress.vl`: no runs lost. Fixpoint seed; late-demands, plumb-shape-cost at baseline; seed
   size +1.9% (the base's drift; this change removes code).
