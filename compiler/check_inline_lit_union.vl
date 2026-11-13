@@ -12,8 +12,18 @@ import {
   nodeAt,
 } from "./ast"
 import { litUnionArmValueUnionRetName } from "./check_ret_names"
-import { canonUnionKeyAtomOfTy } from "./check_ty_rep"
-import { nonNulTyOf, tyIsListUnion } from "./tyquery"
+import {
+  canonUnionKeyAtomOfTy,
+  valueRowKind,
+  valueRowListKind,
+  valueUnionFromAtomKinds,
+} from "./check_ty_rep"
+import {
+  homogLitUnionBase,
+  isStringTy,
+  nonNulTyOf,
+  tyIsListUnion,
+} from "./tyquery"
 import {
   TyArray,
   TyErr,
@@ -38,6 +48,7 @@ import {
   cVariantMemberTyIxSet,
   cVariantMemberTyIxs,
   inlineLitUnionPrefix,
+  litBaseTy,
   mixedLitRunAliasOf,
   nwBaseTyIxs,
   nwDeclNames,
@@ -302,6 +313,149 @@ export function canonUnionKeyTextOfTy(ty: i32): string {
     TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
   ""
+}
+
+// The value-union verdict of `canonUnionKeyTextOfTy(ty)`'s spelling, decided arm for arm over the
+// kinds its atoms would read as: a literal at its base, a regrouped literal run or declared alias no
+// atom. 1 or 0; -1 where the key has no text; -2 where a member's kind is not the arena's to tell.
+// A change to `canonUnionKeyTextOfTy` changes this.
+export function keyTextValueUnionVerdict(ty: i32): i32 {
+  const kinds: i32[] = []
+  const r = keyTextKinds(ty, kinds)
+  if r < 0 { return r }
+  if valueUnionFromAtomKinds(kinds) { 1 } else { 0 }
+}
+
+// The value-union verdict of the name a union row of type `ty` is registered under: a declared union
+// alias's own name, which is no atom, else its key text (`keyTextValueUnionVerdict`).
+export function rowNameValueUnionVerdict(ty: i32): i32 {
+  if ty >= 0 && unionAliasDeclNameOfTy(ty) != "" { return 0 }
+  keyTextValueUnionVerdict(ty)
+}
+
+// `canonUnionKeyTextOfTy`'s walk, pushing each atom's kind to `out`: 0, or its decline code.
+function keyTextKinds(ty: i32, out: i32[]): i32 {
+  if ty < 0 { return -1 }
+  const t = tyAt(ty)
+  match t {
+    TyUnion => {
+      const ms = t.uMembers
+      if ms.length == 0 { return -1 }
+      if ms.length == 1 {
+        const mt = tyAt(ms[0])
+        if mt is TyNullable {
+          const mark = out.length
+          let r = keyTextKinds(mt.nInner, out)
+          if r == -1 {
+            while out.length > mark { out.pop() }
+            r = keyAtomKindInto(mt.nInner, out)
+          }
+          if r != -1 {
+            if r < 0 { return r }
+            out.push(6)
+            return 0
+          }
+          while out.length > mark { out.pop() }
+        }
+      }
+      const rgAlias = mixedLitRunAliasOf(ms)
+      if rgAlias == "" && declLitUnionAliasMembersOfTy(ty) != "" {
+        out.push(-1)
+        return 0
+      }
+      let rgDone = false
+      let i = 0
+      while i < ms.length {
+        const mt = tyAt(ms[i])
+        if rgAlias != "" && mt is TyLit {
+          if !rgDone {
+            rgDone = true
+            out.push(-1)
+          }
+        } else {
+          const r = keyAtomKindInto(ms[i], out)
+          if r < 0 { return r }
+        }
+        i = i + 1
+      }
+      return 0
+    }
+    TyNullable => {
+      const mark = out.length
+      let r = keyTextKinds(t.nInner, out)
+      if r == -1 {
+        while out.length > mark { out.pop() }
+        r = keyAtomKindInto(t.nInner, out)
+      }
+      if r < 0 { return r }
+      out.push(6)
+      return 0
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+  }
+  -1
+}
+
+// The kind `canonUnionKeyAtomOfTy` spells list `m` as, -1 for none (`keyAtomKindInto`'s list arm).
+export function keyAtomKindOfList(m: i32): i32 {
+  const out: i32[] = []
+  if keyAtomKindInto(m, out) < 0 || out.length != 1 { return -1 }
+  out[0]
+}
+
+// The kinds `canonUnionKeyAtomOfTy(m)`'s spelling splits into, pushed to `out`: a literal or a
+// literal union at its base, a declared union alias no atom, any other union its members, a nullable
+// its inner then `null`. 0, -1 for no atom text, -2 where the arena declines.
+function keyAtomKindInto(m: i32, out: i32[]): i32 {
+  if m < 0 { return -1 }
+  const t = tyAt(m)
+  match t {
+    TyLit => {
+      out.push(valueRowKind(litBaseTy(t)))
+      return 0
+    }
+    TyUnion => {
+      if unionAliasDeclNameOfTy(m) != "" {
+        out.push(-1)
+        return 0
+      }
+      const hb = homogLitUnionBase(m)
+      if hb >= 0 {
+        out.push(valueRowKind(hb))
+        return 0
+      }
+      for x in t.uMembers {
+        const r = keyAtomKindInto(x, out)
+        if r < 0 { return r }
+      }
+      return 0
+    }
+    TyNullable => {
+      const r = keyAtomKindInto(t.nInner, out)
+      if r < 0 { return r }
+      out.push(6)
+      return 0
+    }
+    TyVar | TyNeg | TyErr => {
+      out.push(-1)
+      return 0
+    }
+    TyArray => {
+      // A list of a literal union spells as its base's list (a string one rides `i32[]`); a list the
+      // arena's list ladder does not place (`i32[][]`) is no atom, as its spelling is not.
+      const hb = homogLitUnionBase(t.aElem)
+      let k = valueRowKind(m)
+      if hb >= 0 { k = if isStringTy(hb) { 7 } else { valueRowListKind(hb) } }
+      out.push(if k == -2 { -1 } else { k })
+      return 0
+    }
+    TyPrim | TyFunc | TyObj | TyMap => {
+      const k = valueRowKind(m)
+      if k == -2 { return -2 }
+      out.push(k)
+      return 0
+    }
+  }
 }
 
 // Records the type of join node `ix` (`exprJoinsArms`) when it is a struct-bearing union, a list
