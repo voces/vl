@@ -105,7 +105,7 @@ right.
 
 The remainder: `capFrame`, `cmSlot`, `eqStashL`/`eqStashR`, `gStrInfLet`,
 `emitRootIx`, `cloStructIdx`, `cloSigBase`, `gMemLogIdx`, `monoProgStmts`,
-`msAtomTexts`/`msAtomIds`, `narrowStripNullOnly`, `narrowBareIdentOnly`, `pendingNulClosure`,
+`narrowStripNullOnly`, `narrowBareIdentOnly`, `pendingNulClosure`,
 `pendingNulList`, `pendingRawNullRead`, `gDivRemNonzero`, `repShadowOn`, `rtWalkN`,
 `fnUsesUnionAs`, `fnUsesNumCast`, `gckDepth`, `mvShapeNest`, `monoInstIsFirst`, `saFnIx`,
 `unABMode`. `emitRootIx` is assigned in the prologue with a value, not cleared.
