@@ -40,5 +40,5 @@ reaches of the first and 1,089 of 1,106 of the second.
 - Refresh ×2: fixpoint.
 - Sweep with fixpoint seeds on both sides, master `32ab5241` against the candidate: 24,209 same,
   0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
-- Render-parse budget: `ty-string-parse` 61 → 60 (the `nameIsShapeOpen` site; only this file's entry is lowered).
+- Render-parse budget: `ty-string-parse` in emit_collect 7 → 6 (the `nameIsShapeOpen` site; only this file's entry is lowered).
 - `scripts/gate.sh`: all rows pass.
