@@ -234,3 +234,83 @@ Deno.test({
     }
   },
 });
+
+// A canon member walk caller counts only where it reads the names the walk returns; the walk's own
+// render-parse counts once, while the walk calls `canonEmitNameAt`.
+const CANON_CALLERS = `function typesOnly(t: i32, out: i32[]) {
+  const atoms: string[] = []
+  if !canonUnionMembersInto(t, out, atoms) { return 0 }
+  0
+}
+
+function readsNames(t: i32) {
+  const names: string[] = []
+  canonUnionMembersInto(t, [], names)
+  names.length
+}
+
+function litArg(t: i32, out: i32[]) {
+  canonUnionMembersLitsInto(t, out, [], [])
+}
+`;
+const WALK =
+  `function canonUnionMembersWalk(ty: i32, atoms: string[]): boolean {
+  const r = canonEmitNameAt(tyToNominalName(ty), 0)
+  atoms.push(r)
+  true
+}
+`;
+const TYPED_WALK =
+  `function canonUnionMembersWalk(ty: i32, atoms: string[]): boolean {
+  true
+}
+`;
+
+Deno.test({
+  name:
+    "render-parse ratchet: a canon walk caller counts only when it reads the names; the walk once",
+  ignore: !ENABLED,
+  async fn() {
+    const real = await census(["--parsers"]);
+    const parsers = real.out.trim().split(/\r?\n/).filter((l) => l);
+    const extras = parsers.filter((p) => !TYNAME.includes(`function ${p}(`));
+    const dir = await Deno.makeTempDir({ prefix: "vl_render_parse_walk_" });
+    try {
+      await writeTree(dir, extras, "");
+      await Deno.writeTextFile(`${dir}/compiler/emit_y.vl`, CANON_CALLERS);
+      await Deno.writeTextFile(`${dir}/compiler/check_program.vl`, WALK);
+      const list = async () =>
+        (await census(["--list", "--root", dir])).out.trim().split(/\r?\n/)
+          .filter((l) => l.includes("canon"));
+      const got = await list();
+      const want = [
+        "compiler/check_program.vl:2  canonUnionMembersWalk  canonEmitNameAt",
+        "compiler/emit_y.vl:9  readsNames  canonUnionMembersInto",
+      ];
+      if (JSON.stringify(got) !== JSON.stringify(want)) {
+        throw new Error(
+          `walk callers: want ${JSON.stringify(want)}, got ${
+            JSON.stringify(got)
+          }`,
+        );
+      }
+      const walk = (await census(["--list", "ty-string-parse", "--root", dir]))
+        .out;
+      if (!walk.includes("canonUnionMembersWalk  canonEmitNameAt")) {
+        throw new Error(`the walk site is not ty-string-parse: ${walk}`);
+      }
+      // A typed walk closes its own site.
+      await Deno.writeTextFile(`${dir}/compiler/check_program.vl`, TYPED_WALK);
+      const typed = await list();
+      if (JSON.stringify(typed) !== JSON.stringify([want[1]])) {
+        throw new Error(
+          `typed walk: want ${JSON.stringify([want[1]])}, got ${
+            JSON.stringify(typed)
+          }`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

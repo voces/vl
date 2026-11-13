@@ -13,7 +13,6 @@ argument, or a bare name's nearest initializer above the call, found by text.
 | emit_base.vl:2734 | nameIsShapeSpanEnds | nameIsShapeOpen | (a) render | `name (a parameter)` | 39 | build/sweep/witnesses/inventory/D14506.vl | `{[string]:{[string]:{r:i32\|null}}}` |
 | emit_classify.vl:11402 | memReadBoxPlan | canonUnionMembersInto | (a) render | `own = tyFieldTyOf(ot, m.memProp)` | 1198 | build/sweep/witnesses/inventory/D13902.vl | `(a type, rendered inside)` |
 | emit_classify.vl:11403 | memReadBoxPlan | canonUnionMembersInto | (a) render | `phys = sFieldElemTyIxAt(si, fi)` | 1198 | build/sweep/witnesses/inventory/D13902.vl | `(a type, rendered inside)` |
-| emit_collect.vl:7816 | riuMemberTys | canonUnionMembersInto | (a) render | `sty (a parameter)` | 4212 | build/sweep/witnesses/inventory/D1291.vl | `(a type, rendered inside)` |
 | emit_collect.vl:7998 | registerRefArrayArmUnions | valueAtomKind | (a) render | `atoms[rai]` | 9 | build/sweep/witnesses/inventory/D4862.vl | `(i32\|null)[]` |
 | emit_collect.vl:9289 | collectDeclaredUnion | nameIsFuncTypeAtom | (a) render | `udMem = vs[usj]` | 32 | build/sweep/witnesses/inventory/D14302.vl | `{v:i32}` |
 | emit_collect.vl:9289 | collectDeclaredUnion | peelGroupParens | (a) render | `udMem = vs[usj]` | 1 | tests/cases/unions/alias-fn-arm-is.vl | `(i32)=>i32` |
