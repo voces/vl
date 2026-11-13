@@ -70,7 +70,6 @@ import {
   unionSetArmTysAB,
   unionTyArms,
 } from "./emit_map_twins"
-import { nonNulBaseOf } from "./emit_map_value_slots"
 import { exactArmRowOfTy, variantIndexOf } from "./emit_local_slots"
 import { isNulScalarListFieldCode } from "./emit_nullable_rets"
 import {
@@ -259,14 +258,6 @@ function tyStepArrRun(ty: i32, full: string, leaf: string): i32 {
   }
   if n != 0 { return -1 }
   t
-}
-
-// `nullableInnerOrNone`, but only when the name actually lost its `| null` — a non-nullable
-// spelling keeps its own type rather than declining.
-function tyStepNulIf(ty: i32, full: string, base: string): i32 {
-  if ty < 0 { return -1 }
-  if base.length == full.length { return ty }
-  nullableInnerOrNone(ty)
 }
 
 // The stored spelling of a record of tagged-set ids (`{f: Fn#a}` stored as `{f: i32}`),
@@ -518,7 +509,7 @@ function internFuncTypeShapesTyGo(kn: string, ty: i32): i32 {
           // The outer shape stays un-interned, but its nested shapes and closure fields'
           // result shapes still intern their own rows, or a literal building the outer shape
           // fieldset-collides onto a same-fieldset twin (invalid wasm).
-          internNonLowerableFieldShapesTy(ln, ty)
+          internNonLowerableFieldShapesTy(ty)
         }
       }
     }
@@ -528,36 +519,20 @@ function internFuncTypeShapesTyGo(kn: string, ty: i32): i32 {
   0
 }
 
-// Descends the fields of a non-lowerable closure-result struct, interning the nested
-// inline-shape and closure fields' shapes. Only composite fields (a nested shape, or a
-// closure) are descended; a scalar, string, map, or value-union field is left untouched,
-// preserving the closure's clean-reject semantics for genuinely-unsupported reps.
-function internNonLowerableFieldShapesTy(nm: string, ty: i32) {
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
-  let fi = 0
-  while fi < fnames.length {
-    if fnames[fi] != "" {
-      const ftxt = ftexts[fi]
-      // A closure field (`() => {f: i64}`), read from the field's type: intern its result
-      // shape.
-      const fldTy = tyFieldTyOf(ty, fnames[fi])
-      if tyIsFuncArena(fldTy) {
-        internShapeDeepTy(fldTy)
-      } else {
-        // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
-        // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
-        const nul = nonNulBaseOf(ftxt)
-        const base = arrLeafNameOf(nul)
-        if nameIsShapeOpen(base) {
-          internShapeDeepTy(
-            tyStepArrRun(tyStepNulIf(fldTy, ftxt, nul), nul, base),
-          )
-        }
-      }
+// Descends the fields of non-lowerable closure-result record `ty`, interning each closure
+// field's shapes and each record field's leaf (past `| null` and `[]`). A scalar, string, map or
+// value-union field is left untouched, so the closure keeps its clean reject.
+function internNonLowerableFieldShapesTy(ty: i32) {
+  if ty < 0 { return 0 }
+  const t = tyAt(ty)
+  if !(t is TyObj) { return 0 }
+  for fldTy in t.objFieldTypes {
+    if tyIsFuncArena(fldTy) {
+      internShapeDeepTy(fldTy)
+    } else {
+      const leaf = arrSpineLeafTy(nonNullTy(fldTy))
+      if leaf >= 0 && tyAt(leaf) is TyObj { internShapeDeepTy(leaf) }
     }
-    fi = fi + 1
   }
   0
 }
@@ -622,12 +597,7 @@ function shapeFieldsRideTyParam(rawNames: string[], tyIx: i32) {
 // annotation interned after it must not mint a narrower twin and split the program's reps in
 // two. The layout find dedups on exact field codes, so a `??`-joined pair's merged row (coded
 // 16) would otherwise miss that dedup and mint a second row for the same value.
-function annShapeWiderRowOf(
-  names: string[],
-  codes: i32[],
-  texts: string[],
-  tyIx: i32,
-) {
+function annShapeWiderRowOf(names: string[], codes: i32[], tyIx: i32) {
   if !emitPhaseReached("monomorphized") { return 0 - 1 }
   const sLimW = sScanLim()
   let si = 0
@@ -653,21 +623,11 @@ function annShapeWiderRowOf(
               allIn = false
             }
           } else if rc == codes[i] {
-            // The storage types decide when both rows record one, as the layout key does.
+            // The storage types decide, as the layout key does; a field either side records no
+            // storage type for serves no merge, and the query mints its own row.
             const rowTy = colAt(sFieldStoreTy, sFieldStart[si] + fi)
             const qTy = recFieldStoreTyOf(tyIx, names[i], codes[i])
-            if rowTy >= 0 && qTy >= 0 {
-              if !tySame(rowTy, qTy) { allIn = false }
-            } else if (
-              sFieldElemNameAt(si, fi)
-              != shapeFieldElemName(
-                texts[i],
-                codes[i],
-                shapeFieldRowOf(tyIx, names[i]),
-              )
-            ) {
-              allIn = false
-            }
+            if rowTy < 0 || qTy < 0 || !tySame(rowTy, qTy) { allIn = false }
           } else {
             allIn = false
           }
@@ -1114,7 +1074,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
   // its arena type records that row, since no row carries the annotation spelling (D8340).
   let wider = -1
   if !(iisOwnRow && iisBusy == 1) && !shapeIsAVariant(tyIx) {
-    wider = annShapeWiderRowOf(names, codes, texts, fieldsTy)
+    wider = annShapeWiderRowOf(names, codes, fieldsTy)
   }
   if wider >= 0 {
     structTyMarkAliasable(tyIx)
