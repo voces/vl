@@ -42,7 +42,9 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `23e03fce`, 2026-11-13 09:10)
+## Still failing at this draft (master `6b9f3f3c`, 2026-11-13 11:10)
+
+**Closing census 5's failing column is empty** (coordinator, 2026-11-13). `internArmShapeRow`'s render is a floor: since #7768 it answers its type's row first, and the render only labels a row it mints, which no row choice reads. The rows below are the L2 work and the blockers filed since.
 
 The close is opened when this list is empty, or holds only items with an open PR. Closed since
 the 23:00 draft: lane D's mono rows (#7681, #7688, #7699, #7708, #7710), lane F's `sFieldRefSlot`
@@ -54,7 +56,6 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 | --- | --- |
 | H (D16062 PR 2) | D16062: class A and the literal-arm channel |
 | G (the slice producer and its readers, one PR) | D16050, D16051: a union member's box code decided by its spelling; the producer switch cannot land without its readers (57 programs lost alone) |
-| A | `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`), after E's step (d), which waits on F's last `ftxt` readers in `shapeFieldElemName` |
 
 ## The renders at this draft (master `537a04cc`, coordinator's measurement)
 
@@ -70,7 +71,7 @@ graded:
 | `nulNicheIsTestImpossible` (wasmEmit:4593) | floor | a diagnostic, inside a guard ruled an assertion (no program reaches it; filed when one does) | none, by the assertion ruling |
 | `emitMapUnionPayloadTail` (wasmEmit:21950) | floor | the same | none, by the assertion ruling |
 | `shapeWalkKeyOf` (emit_shape_intern:277) | failing | E / F, the D6 re-key: the walk key still decides in `tyIsDeclaredNominal` and `shapeWalkSplitsUnion` | — |
-| `internArmShapeRow` (emit_shape_intern:730) | failing | A, after E's step (d) | — |
+| `internArmShapeRow` (emit_shape_intern:745) | floor | a label on a fresh mint (#7768: the type's own row is answered first) | — |
 
 The census's other five renders are all in one function, `nodeArrayElemName`
 (check_emit_queries:742, 764, 768, 772, 791). It renders an array literal's element type to a name,
@@ -102,7 +103,7 @@ renders), by renderer family. Reach is summed over each family's rows:
 | R4b mv slot keys (`mvDeepArmKeyName`, `mvDeepDeclKeyName`, `mvDeclNameOfValTy`) | 3 | 3,617 | (b), the canonical-key test owed | H |
 | R4c `unionArmsAllSame` | 2 | 11,866 | (a): it compares two renders for equality, where `tyEq` or the canon key is the question | G |
 | R4d shape_rows element names | 9 | 2,327 | (b), row keys with the canonical-key test owed; `fieldTypeRefusalMsg` is a diagnostic (floor) and unreached | A, with F |
-| R6 the shape walk key (`shapeWalkKeyOf`, `shapeWalkName`) and `internArmShapeRow` | 4 | 45,618 | (a) | F deletes the walk key; A |
+| R6 the shape walk key (`shapeWalkKeyOf`, `shapeWalkName`) and `internArmShapeRow` | 4 | 45,618 | (a) for the walk key; `internArmShapeRow` is a floor since #7768 | F deletes the walk key; A |
 
 Unreached (d): `arrLitElemName` (emit_classify:6909), `memReadBoxNarrowName` and
 `fieldTypeRefusalMsg`. H also lists `nulNicheIsTestImpossible`, `mapSoftTwinTagFail` and
