@@ -42,4 +42,5 @@ markers in the same probe build, which fired in 3,922 programs.
 
 ## Measurement
 
-Sweep with fixpoint seeds, master `1fff67ce` → this: see the PR.
+Sweep with fixpoint seeds, master `1fff67ce` → this: all 24,204 the same (0 bytes-only movers, 0
+output movers, 0 runs → not-runs, 0 new traps).
