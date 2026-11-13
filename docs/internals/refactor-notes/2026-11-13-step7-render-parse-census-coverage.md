@@ -67,13 +67,89 @@ Master's census over the same fixture is red; this census is green:
 | master | `emit_x.vl:9` ×2, `:20`, `:21` ×2 — misses `check_emit_queries.vl:1 nameToTy` and `emit_x.vl:13 groupInnerOf` |
 | this | all seven, plus `valueAtomKind` at `:20` |
 
-## The true count
+## The true count, by origin
+
+A parse is a violation only when its input came from a render or a synthesized name. Parsing source
+annotation text is the checker's job. So each parse site is graded by where its strings came from.
+
+**The instrument.** `scripts/render-parse-origins.ts` builds a probe compiler from a scratch copy of
+`compiler/`:
+- the first argument of every census site is wrapped, so the probe records each distinct string a
+  site receives during emit;
+- each parser `mkTypeRef` records its spelling.
+
+It checks the sweep's population of 24,207 programs, in fixed batches. Each string is graded:
+
+| grade | test |
+| --- | --- |
+| synthesized | holds `#`, `$` or `@` |
+| source | a parser spelling of this program, or (whitespace ignored) a substring of the program's text, of std, or of a parser spelling |
+| bare | a bare identifier, which no text test can place |
+| render | anything else |
+
+A site that ever receives a render or a synthesized string is graded `render`. Graded only on
+source strings, it is `source`. Bare-only and unreached sites stay ungraded. Two runs at different
+`--jobs` write the same file.
+
+**The control.** At D15042's instance, the arm sites receive `{f:f64}`, which no source holds:
+render. They also receive `{f:i32}`, a slice of the user's `{f: i32} | {f: T}`: source.
+
+**How the census uses it.** It reads the result, `scripts/render-parse-origins.txt`, keyed by file,
+enclosing function, callee and ordinal, and reports three codes. All three are ratcheted, so a new
+ungraded parse fails the budget until it is graded. The control: one added
+`isValueUnionName(n)` in `emit_rep.vl` fails with `ty-parse-unclassified: 5 (baseline 4)`.
 
 | | before | after |
 | --- | --- | --- |
-| type-string parse sites in scope (static) | 1 | 149 |
-| `tyToEmitName` renders in scope (static) | 8 | 13 |
-| of the 149, sites that run at emit in the corpus | — | 115 |
+| `ty-string-parse`: a render or synthesized name, the violation | 1 (ungraded) | **75** |
+| `ty-source-parse`: source text only | — | 19 |
+| `ty-parse-unclassified`: bare names only (20), unreached (34), empty only (1) | — | 55 |
+| `ty-render`: `tyToEmitName` calls | 8 | 13 |
+
+**How to read 75.** It is a lower bound on violations:
+- A render that happens to equal some source text grades as source.
+- The 55 ungraded sites may hold more violations. 18 of the 20 bare-name sites are
+  `valueAtomKind` over a primitive name.
+
+Each `render` site has a witness program; `--report` names one string per site.
+
+**`ty-string-parse` by file:**
+
+| file | render or synthesized | source | ungraded |
+| --- | --- | --- | --- |
+| `emit_collect.vl` | 15 | 2 | 0 |
+| `emit_base.vl` | 10 | 1 | 9 |
+| `emit_shape_intern.vl` | 9 | 2 | 2 |
+| `wasmEmit.vl` | 9 | 3 | 17 |
+| `emit_union_atoms.vl` | 7 | 1 | 6 |
+| `emit_rep.vl` | 6 | 0 | 4 |
+| `emit_mono.vl` | 4 | 0 | 1 |
+| `emit_obj_lit_fits.vl` | 3 | 2 | 1 |
+| `check_emit_queries.vl` | 2 | 0 | 0 |
+| 10 files with 1 each | 10 | 6 | 9 |
+| `emit_field_codes`, `emit_if_arm_values`, `emit_map_twins`, `emit_rewrite` | 0 | 2 | 7 |
+
+**By parser:**
+
+| parser | `render` sites |
+| --- | --- |
+| `isValueUnionName` | 16 |
+| `valueAtomKind` | 14 |
+| `groupInnerOf` | 5 |
+| `peelGroupParens` | 3 |
+| `annGenAppSpanEnds` | 3 |
+| `gaeLtAt` | 3 |
+| `resolveAnnot` | 3 |
+| `nameIsLitUnionArmValueUnion` | 3 |
+| `nameToTy` | 2 |
+| `nameIsShapeOpen` | 2 |
+| `tyTopLevelSplit` | 2 |
+| `nameMentionsGenAliasParam` | 2 |
+| `arrElemSuffixed` | 2 |
+| `unionHasAtom` | 2 |
+| 13 others | 1 each |
+
+## Not counted
 
 **Emit-time parse sites the widened census still does not count, in scope: 7, each by design.**
 - 4 are inside a parser's own body: `nullablePartOf` and `unionHasAtom` reading `spanEqAt` and
@@ -94,8 +170,8 @@ the checker, so a static per-file ratchet cannot own them:
 | 13 other `check_*` files | 23 |
 
 Where the emitter enters one of these through a listed parser (`valueAtomKind`, `resolveAnnot`,
-`canonEmitName`), the emit-side call is now counted. `canonEmitNameOfTy` (a type plus its render)
-is not listed; the render it parses is named here instead.
+`canonEmitName`), the emit-side call is counted and graded. `canonEmitNameOfTy` (a type plus its
+render) is not listed; the render it parses is named here instead.
 
 The parser set comes from name-flow and character-scan heuristics plus a reading of each
 candidate. It is a lower bound: a hand-rolled scanner outside `tyname.vl` that no heuristic flags

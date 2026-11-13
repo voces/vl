@@ -7,7 +7,8 @@
 // a comment, a name in a string, a parser's own declaration, a parser's body or its `<parser>Go`
 // ladder, a renderer's body (`tyToEmitNameAt`), the display rewrite and a file outside the
 // emitter are not. A grammar export and `check_emit_queries.vl` are in scope. An extra parser
-// declared nowhere fails the census. The committed tree against its baseline is the
+// declared nowhere fails the census. An origins file re-codes a graded site by its key; a stale
+// row is ignored and an ungraded site stays unclassified. The committed tree against its baseline is the
 // `render-parse budget` row of scripts/gate.sh and its own step in ci.yml.
 //
 // @test-timing native
@@ -142,6 +143,49 @@ Deno.test({
           `--list ty-render: want ${JSON.stringify(wantRender)}, got ${
             JSON.stringify(gotRender)
           }`,
+        );
+      }
+      await Deno.mkdir(`${dir}/scripts`);
+      await Deno.writeTextFile(
+        `${dir}/scripts/render-parse-origins.txt`,
+        "# a comment\n" +
+          "render\tcompiler/emit_x.vl\tkindOf\tnameIsArray\t0\n" +
+          "source\tcompiler/emit_x.vl\tshapeOf\tgroupInnerOf\t0\n" +
+          "render\tcompiler/emit_x.vl\tgone\tnameIsArray\t0\n",
+      );
+      const byCode = async (code: string) =>
+        (await census(["--list", code, "--root", dir])).out.trim().split(
+          /\r?\n/,
+        ).filter((l) => l);
+      const graded = {
+        "ty-string-parse": await byCode("ty-string-parse"),
+        "ty-source-parse": await byCode("ty-source-parse"),
+        "ty-parse-unclassified": await byCode("ty-parse-unclassified"),
+      };
+      const wantGraded = {
+        "ty-string-parse": ["compiler/emit_x.vl:9  kindOf  nameIsArray"],
+        "ty-source-parse": ["compiler/emit_x.vl:13  shapeOf  groupInnerOf"],
+        "ty-parse-unclassified": [
+          "compiler/check_emit_queries.vl:1  recordClonedTy  nameToTy",
+          "compiler/emit_x.vl:20  emitCast  valueAtomKind",
+          "compiler/emit_x.vl:21  emitCast  nullablePartOf",
+        ],
+      };
+      if (JSON.stringify(graded) !== JSON.stringify(wantGraded)) {
+        throw new Error(
+          `origins: want ${JSON.stringify(wantGraded)}, got ${
+            JSON.stringify(graded)
+          }`,
+        );
+      }
+      const sites = await census(["--sites", "--root", dir]);
+      if (
+        !sites.out.includes(
+          "compiler/emit_x.vl\tshapeOf\tgroupInnerOf\t0\t13\t",
+        )
+      ) {
+        throw new Error(
+          `--sites: want a keyed row for shapeOf's groupInnerOf, got ${sites.out}`,
         );
       }
     } finally {
