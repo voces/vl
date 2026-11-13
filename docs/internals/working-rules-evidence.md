@@ -540,7 +540,7 @@ different confidence levels, and only the second rules out a detector that stopp
 something — the ratchets with stored entries name what left since the baseline's commit:
 `vl check --budget <baseline> --budget-why` for comment, scan, sentinel, interp, ladder, export and
 render-parse (the last two over a `--findings` report; `seed-size` is
-a scalar and has no entries to name). A baseline recording no `commit` falls back to the commit that last
+a scalar and has no entries to name). A baseline records no commit; its baseline is the commit that last
 CHANGED it.
 
 `vl fmt -w`, `vl check` and `vl test` take several paths (files or directories) in one run.

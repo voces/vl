@@ -438,10 +438,11 @@ once per position, named `"<checkout-relative path>: <trimmed source line>"`. It
 the ratchet's verdict — `<label> budget ok — …` (exit 0) or `<label> budget REGRESSED — …`
 with one line per file whose count rose (exit 1) — and no diagnostics. `--budget-why`
 compares the baseline's stored `entries` with this run, by name (`LEFT`, `ENTERED`, count
-moved). `--write-baseline` rewrites the baseline from this run in the layout the
-retired `scripts/ratchet.py` wrote — its `label`/`targets`/`exclude` kept, `commit` re-read from the checkout's `.git`,
-`entries` kept one per line — unless it names a Python `writer`, which then owns it and is
-what the remedy line names. `--exempt-codes` prints the codes whose `total` is still above
+moved). `--write-baseline` rewrites the baseline from this run — its `label`/`targets`/`exclude`
+kept, one file row and one entry per line with a blank line after each, and a row or entry the
+loaded baseline held kept at zero, so two lowerings of different rows edit separate hunks and
+merge without a conflict (`tests/vl_budget_merge_test.ts`) — unless it names a `writer`, which
+then owns it and is what the remedy line names. It records no commit. `--exempt-codes` prints the codes whose `total` is still above
 zero, for `lint-self.sh`. `compiler/cli_budget.vl`; the first ratchet on it is interp
 (architecture-refactor-plan T2), which has no script any more: `tests/vl_budget_mode_test.ts`
 holds the three verbs to one answer.
