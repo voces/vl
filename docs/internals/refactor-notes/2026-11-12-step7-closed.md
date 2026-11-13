@@ -118,7 +118,7 @@ Routing (coordinator, 2026-11-13):
 - the R2 and R3 (a) sites that run through `isValueUnionName` go to lane H's D16062 PRs, which
   replace that predicate;
 - R4a goes to lane E, R4c to lane G, R6 to lanes F and A;
-- the (d) unreached sites go to lane F as deletions. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; check that `scripts/render-parse-floors.txt` (the census's `ty-carried-floor` code, from #7815) names exactly the carried rows' sites (D16022 ×2, D16032 ×1 and D16052 ×1 at `8c4de865`), and that the census reports no `ty-string-parse`; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
+- the (d) unreached sites go to lane F as deletions. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; check that `scripts/render-parse-floors.txt` (the census's `ty-carried-floor` code, from #7815) names exactly the carried rows' sites (D16022 ×2, D16032 ×1 and D16052 ×1 at `8c4de865`), and that the census reports no `ty-string-parse`. Read the counts off `render-parse-census.vl --list` or by value, because a baseline row that reaches zero stays at zero since #7859; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
 
 ## The census's coverage (lane H, #7748, open)
 
