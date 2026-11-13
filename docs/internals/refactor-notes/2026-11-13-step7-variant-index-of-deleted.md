@@ -55,7 +55,7 @@ Four sites moved on master while this was in flight, and this change takes maste
 
 | instrument | result |
 | --- | --- |
-| full sweep, 24,204 programs, base 7683149ab against this change on it, both fixpoint seeds | 24,204 same; 0 bytes-only movers; 0 output movers; 0 runs → not-runs; 0 new traps |
+| full sweep, 24,205 programs, base 993081603 against this change on it, both fixpoint seeds | 24,205 same; 0 bytes-only movers; 0 output movers; 0 runs → not-runs; 0 new traps |
 | `vl_row_classes_test.ts` | 19 passed |
 | `vkind-census --slots-list`, variant `name` | 1 → 0 |
 
