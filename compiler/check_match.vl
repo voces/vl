@@ -10,12 +10,14 @@ import { declTyOf } from "./check_nar_store"
 import {
   BinExpr,
   Block,
+  FuncDecl,
   Ident,
   IfStmt,
   IsExpr,
   LetDecl,
   MatchExpr,
   P,
+  Param,
   StrLit,
   arenaReplaceNode,
   i32ToStr,
@@ -35,7 +37,8 @@ import {
   valueArmAt,
   valueArmAtSet,
 } from "./check_core_state"
-import { noteBinCstr } from "./check_cstr_rows"
+import { cstrOwnerTop, noteArgCstr, noteBinCstr } from "./check_cstr_rows"
+import { mkUnionTy } from "./check_union_mint"
 import { inferQuiet, tpEnvNames } from "./check_cursor"
 import { elabCapIsNote, elabCapLive } from "./check_elab_cap"
 import { matchUnknownTypeMsg } from "./check_diag_text"
@@ -57,6 +60,7 @@ import {
 } from "./check_if_value"
 import { tpIfOkAt } from "./check_tp_join"
 import {
+  ACF_PLAIN,
   blockTailTy,
   intArmRejectMsg,
   matchArmHasBinds,
@@ -87,6 +91,7 @@ import {
 } from "./check_list_union"
 import {
   desugarMatchAt,
+  litTyOfExpr,
   matchArmBindsOf,
   matchArmsAreIntLits,
   matchConstPatLitAt,
@@ -129,6 +134,7 @@ import {
   TyLit,
   TyNullable,
   TyUnion,
+  TyVar,
   mkLitTy,
   tyAt,
   tyIsCompositePat,
@@ -612,8 +618,9 @@ function matchArmsJoin(
       q = q + 1
     }
     // The arm's own then-fact, pushed after the accumulated complement (order matters —
-    // `applyNarrows` binds in order, so the arm's own type wins over the complement).
-    if bi != elseArm || !exhaustive {
+    // `applyNarrows` binds in order, so the arm's own type wins over the complement). An open
+    // scrutinee's complement is still open, so its last arm takes its own fact too.
+    if bi != elseArm || !exhaustive || matchOpenScrutLive {
       if n.matchArmCount[bi] == 1 {
         const p0 = n.matchPats[n.matchArmStart[bi]]
         const vm0 = valMem[p0]
@@ -1073,6 +1080,10 @@ function checkMatchExprAtScrut(
   if tyIsIntMatchScrut(st) || (tyIsHole(st) && matchArmsAreIntLits(n)) {
     return checkMatchIntArms(n, ix, st, [], false)
   }
+  if matchScrutOpen(st) && !matchArmsAreIntLits(n) {
+    const au = matchArmUnion(n)
+    if au >= 0 { return checkMatchOpenScrut(n, ix, mTail, st, au) }
+  }
   if intSet.length > 0 { return checkMatchIntArms(n, ix, st, intSet, setNul) }
   // D1898 — a NULLABLE literal union takes the member-string vocabulary too, with `null` as
   // one more member: it is the same interned i32 atom as the bare set, `null` riding the spare
@@ -1080,6 +1091,91 @@ function checkMatchExprAtScrut(
   if !strSet { return checkMatchUnionScrut(n, ix, st, written) }
   checkMatchLitUnionArms(n, ix, st, setNul)
 }
+
+// Whether `st` is a parameter's still-open type: a hole (un-annotated) or a type parameter.
+function matchScrutOpen(st: i32): boolean {
+  if st < 0 || st >= T.tys.length { return false }
+  tyIsHole(st) || tyAt(st) is TyVar
+}
+
+// The union of the types `n`'s patterns name — a type pattern's type, a literal's literal type,
+// `null` — or -1 when a pattern names none, which leaves the open scrutinee's refusal standing.
+function matchArmUnion(n: MatchExpr): i32 {
+  const tys: i32[] = []
+  for patIx in n.matchPats {
+    const pn = nodeAt(patIx)
+    if matchPatIsWild(patIx) { continue }
+    if pn is IsExpr {
+      const pt = isTypeTy(pn.isVariant, patIx)
+      if pt < 0 { return -1 }
+      tys.push(pt)
+    } else if matchPatIsNull(patIx) {
+      tys.push(TY_NULL)
+    } else {
+      const lt = litTyOfExpr(matchPatValNode(patIx))
+      if lt < 0 { return -1 }
+      tys.push(lt)
+    }
+  }
+  if tys.length == 0 { return -1 }
+  if tys.length == 1 { return tys[0] }
+  mkUnionTy(tys)
+}
+
+// A `match` over an open parameter type `st`, checked over `au`, the union its arms name, as the
+// spelling annotated `au` is; unless a `_` takes the rest, the call that pins the parameter is
+// asked that annotation's argument question, so it widens nothing the annotation would refuse.
+function checkMatchOpenScrut(
+  n: MatchExpr,
+  ix: i32,
+  mTail: boolean,
+  st: i32,
+  au: i32,
+): i32 {
+  let wild = false
+  for p in n.matchPats {
+    if matchPatIsWild(p) { wild = true }
+  }
+  if !wild { noteArgCstr(st, au, matchOwnerName(), matchScrutParamForm(n), -1) }
+  const saved = matchOpenScrutLive
+  matchOpenScrutLive = true
+  const r = checkMatchExprAtScrut(n, ix, mTail, au, tyMemberCount(au) == 1)
+  matchOpenScrutLive = saved
+  r
+}
+
+// The name of the declaration whose body is being checked, or "" at module scope.
+function matchOwnerName(): string {
+  const o = cstrOwnerTop()
+  if o < 0 { return "" }
+  const d = nodeAt(o)
+  if d is FuncDecl { return d.fnName }
+  ""
+}
+
+// The demand form an open scrutinee's arm union is asked at: the 1-based position of the owning
+// declaration's parameter the scrutinee reads, so the pin asks the annotated spelling's argument
+// question of that argument; `ACF_PLAIN` for any other scrutinee.
+function matchScrutParamForm(n: MatchExpr): i32 {
+  const s = nodeAt(parenPeelIx(n.matchScrut))
+  if !(s is Ident) { return ACF_PLAIN }
+  const o = cstrOwnerTop()
+  if o < 0 { return ACF_PLAIN }
+  const d = nodeAt(o)
+  if !(d is FuncDecl) { return ACF_PLAIN }
+  let k = 0
+  while k < d.fnParams.length {
+    const p = nodeAt(d.fnParams[k])
+    if p is Param {
+      if p.parName == s.identName { return k + 1 }
+    }
+    k = k + 1
+  }
+  ACF_PLAIN
+}
+
+// Whether the arms being checked belong to a `match` over an open parameter type.
+let matchOpenScrutLive = false
 
 // Types each type pattern's own read of the scrutinee (a place or `$scrut` copy, D14538) in the
 // scrutinee's scope. An error-typed scrutinee has already reported, so its copies are left
