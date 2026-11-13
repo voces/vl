@@ -10,7 +10,8 @@ next cut. Emit only.
   does the annotation's text mention a generic-alias parameter name as a whole token. They now
   ask `annMentionsGaParam(node)`: does the annotation's declared type (`declAnnTyOf`) or its
   recorded type (`nodeTyIxOf`) mention a type variable with that name.
-  `nameMentionsGenAliasParam` has no other caller and is deleted.
+  `nameMentionsGenAliasParam` has no other caller and is deleted, and so is the whole-token
+  matcher it alone used (`tyname.nameMentionsIdent`).
 - `gaeCollectDecls`, `typeDeclMintsRow` and `collectNestedFieldShapes`'s `ownsRow` split
   `s.tdName` (`annGenAppSpanEnds`, `gaeLtAt`, `gaeHeadNameOf`, `gaeArgsTextOf`). They now read
   the parser's record of the declaration's own parameters (`declGpBaseOf`, `declGpParamsOf`).
