@@ -118,6 +118,7 @@ import {
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
   tyIsOneStrLit,
+  tyMayHoldFn,
   tyMutEpoch,
   tyNestedArrLeafRenders,
   tyNomNameCycled,
@@ -844,14 +845,11 @@ export function uFieldMapShape(vi: i32, fj: i32): i32 {
 // recorded type: -1 when the slot is out of range or the element has no inner row.
 export function rlElemInnerSlot(slot: i32): i32 { rlInnerSlotOfElem(slot) }
 
-// The struct-table row of a ref-list element, in four rungs: arena identity through the
-// `sTyIx` sidecar, the canon-key row off the recorded type, the row the recorded type is stored
-// at, then the name's row for an element whose type finds none. Declining is not neutral:
-// `mAssignTypeIndices` then writes a 0 heap (D208).
+// The struct-table row of a ref-list element, read off its recorded type: arena identity through
+// the `sTyIx` sidecar, the canon-key row, the row the type is stored at, then the row of its
+// tagged form. Declining is not neutral: `mAssignTypeIndices` then writes a 0 heap (D208).
 export function rlElemStructRow(slot: i32): i32 {
   if slot < 0 || slot >= rlElemName.length { return -1 }
-  const ln = nonNulBaseOf(rlElemName[slot])
-  const bn = structIndexByName(ln)
   // An element whose type is a declared arm has no struct-table row, its heap being
   // `variantHeap(vi)`, so every rung below declines (D32). The arm and its same-shape twins
   // share that heap (D280), so the element's type, not its spelling, decides.
@@ -862,8 +860,41 @@ export function rlElemStructRow(slot: i32): i32 {
   if cr >= 0 { return cr }
   const tr = structRowOfRecordTy(rlElemNonNulTyAt(slot))
   if tr >= 0 { return tr }
-  bn
+  // A record holding tagged function values is stored at its form with each set as its id.
+  const gr = structRowOfRecordTy(tagRepTyFn(rlElemNonNulTyAt(slot)))
+  if gr >= 0 { return gr }
+  rlElemStructRowOfName(slot)
 }
+
+// The rows an element's type cannot find: a literal's `#anonN` handle row, minted after the
+// list that holds it, and, by name, a generic instance's function-holding element minted at
+// the body's function-value set rather than the instance's (D16040). Any other is a recorder
+// that left its type unrecorded.
+function rlElemStructRowOfName(slot: i32): i32 {
+  const nt = rlElemNonNulTyAt(slot)
+  if nt < 0 { return rlElemAnonHandleRow(rlElemName[slot]) }
+  if !tyMayHoldFn(nt, 0) {
+    emitFail(RL_ELEM_STRUCT_UNTYPED_MSG)
+    return -1
+  }
+  structIndexByName(nonNulBaseOf(rlElemName[slot]))
+}
+
+// The row of an untyped element named by a literal's `#anonN` handle (`anonPinRow`), else -1.
+function rlElemAnonHandleRow(nm: string): i32 {
+  if !(nm.length >= 5 && nm.slice(0, 5) == "#anon") {
+    emitFail(RL_ELEM_STRUCT_UNTYPED_MSG)
+    return -1
+  }
+  anonPinRow(nm, -1)
+}
+
+const RL_ELEM_STRUCT_UNTYPED_MSG = "a ref-list element's recorded type finds no struct row"
+
+// The stored form of a record holding tagged function values, `monoTagMapRepTy`'s answer,
+// installed by `emitProgram` since its home sits above this module; a read before that traps.
+function tagRepTyUnset(_ty: i32): i32 { __trap__() }
+export let tagRepTyFn: (ty: i32) => i32 = tagRepTyUnset
 
 // The variant-table row of the same element, the other side of `rlElemStructRow`'s floor: the
 // arm row of the element's type when that type is a declared arm, else -1.
