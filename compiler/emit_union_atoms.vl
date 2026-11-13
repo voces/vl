@@ -61,7 +61,6 @@ import {
   tyEqSoftLits,
   tyIsLitUnion,
   tyIxIsFunc,
-  tyMayHoldFn,
   tyReachesCycle,
   tySame,
   tyToEmitName,
@@ -145,7 +144,6 @@ import {
   sigRowHasNoArmTwin,
   sigRowHasNoTwin,
   structRowOfRecordTy,
-  tyIsFuncOrNulFunc,
   tyIsRefArray,
   unionOfVariant,
   variantFieldLayoutEq,
@@ -258,7 +256,7 @@ import {
   vbU8ArmUsed,
   vbV128Used,
 } from "./emit_state"
-import { rlDeclTwinTy } from "./emit_struct_order"
+import { rlDeclTwinTy, rlElemTyIxAt } from "./emit_struct_order"
 import { mapArmShapeOfTy, mapPinnedParamTyOf, mapTyPeel } from "./emit_ty_canon"
 import {
   isUNameAB,
@@ -587,8 +585,7 @@ function mvShapeOfValNameArmTyGo(
   if kind == MVK_STRUCT {
     // An arm value is keyed by the arm's name and type (D34), since `sNames[vsi]` is the
     // inline-shape row minted from the arm's field set, over the wrong heap. A row is keyed by
-    // its minted type, where closed (`rlKeyTyOf`); one holding a function inside a
-    // record is keyed by the function-value sets its name carries.
+    // its minted type, where closed (`rlKeyTyOf`).
     let armNm = mvValArmName(armTy)
     let armNmTy = armTy
     if armNm == "" {
@@ -660,12 +657,11 @@ export function rlInternOfTy(tyIn: i32) {
 // name `rlRowNameOfTy` gives, so a declared record mints under its own name.
 export function rlMintNameOfTy(ty: i32): string { rlRowNameOfTy(ty, false) }
 
-// Element type `ty` as a ref-list row's key: a closed type, else -1. A type holding a type
-// parameter waits for its instance, and one holding a function inside a record or list is keyed
-// by its function-value sets, which the name's row carries.
+// Element type `ty` as a ref-list row's key: a closed type, else -1, since a type holding a type
+// parameter waits for its instance. A record holding functions is keyed by its type here too: its
+// function-value sets choose its struct row (D16040), not its ref-list row.
 export function rlKeyTyOf(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return -1 }
-  if tyMayHoldFn(ty, 0) && !tyIsFuncOrNulFunc(ty) { return -1 }
   ty
 }
 
@@ -2338,9 +2334,10 @@ function unionRefArrayArmSlotForElemAtom(u: i32, elemAtom: string) {
     const slot = unMemRefArrArmSlot(mems[i])
     if slot >= 0 && rlElemKindAt(slot) == RLK_UNION {
       if elemAtom == "" { return slot }
-      const en = rlElemUnionName(slot)
       const eAtoms: string[] = []
-      unionArmsOf(en, eAtoms)
+      if !unionArmsOfRow(elemUnionRowOf(slot), eAtoms) {
+        unionArmsOf(rlElemUnionName(slot), eAtoms)
+      }
       let j = 0
       while j < eAtoms.length {
         if eAtoms[j] == elemAtom { return slot }
@@ -2349,18 +2346,30 @@ function unionRefArrayArmSlotForElemAtom(u: i32, elemAtom: string) {
       // R3's boxed-member rule: a litunion member of a value union rides the box as the
       // `string` atom. Without this leg a `(K | i32)[]` arm is invisible to a
       // string-element literal — invalid wasm.
-      if elemAtom == "string" && elemUnionHasLitUnionMember(en) { return slot }
+      if elemAtom == "string" && elemUnionHasLitUnionMember(slot) {
+        return slot
+      }
     }
     i = i + 1
   }
   -1
 }
 
-// True when the element union row `en` has a literal-union member. A row with no recorded
-// members fails loudly: every union element's row records them.
-function elemUnionHasLitUnionMember(en: string): boolean {
+// The row ref-list slot `slot`'s element union type keys to, or -1 (D16032).
+function elemUnionRowOf(slot: i32): i32 { unRowOfTyKey(rlElemTyIxAt(slot)) }
+
+// The member types of ref-list slot `slot`'s element union into `out`: its type's row where it
+// records them, else the row its name is bound to.
+function elemUnionMemberTys(slot: i32, out: i32[]): boolean {
+  if unionMemberTysOfRow(elemUnionRowOf(slot), out) { return true }
+  unionMemberTysOf(rlElemUnionName(slot), out)
+}
+
+// True when ref-list slot `slot`'s element union has a literal-union member. A union with no
+// recorded members fails loudly: every union element's row records them.
+function elemUnionHasLitUnionMember(slot: i32): boolean {
   const ms: i32[] = []
-  if !unionMemberTysOf(en, ms) {
+  if !elemUnionMemberTys(slot, ms) {
     emitFail("emitProgram: a list arm's element union has no recorded members")
     return false
   }
@@ -2370,11 +2379,11 @@ function elemUnionHasLitUnionMember(en: string): boolean {
   false
 }
 
-// True when the element union row `en` has a list member. A row with no recorded members fails
-// loudly: every union element's row records them.
-function elemUnionHasArrayMember(en: string): boolean {
+// True when ref-list slot `slot`'s element union has a list member. A union with no recorded
+// members fails loudly: every union element's row records them.
+function elemUnionHasArrayMember(slot: i32): boolean {
   const ms: i32[] = []
-  if !unionMemberTysOf(en, ms) {
+  if !elemUnionMemberTys(slot, ms) {
     emitFail("emitProgram: a list arm's element union has no recorded members")
     return false
   }
@@ -2405,7 +2414,7 @@ export function unionRefArrayArmSlotForNestedElem(u: i32, wantMap: boolean) {
         )
         return -1
       } else {
-        if elemUnionHasArrayMember(rlElemName[slot]) { return slot }
+        if elemUnionHasArrayMember(slot) { return slot }
       }
     }
     i = i + 1
