@@ -52,9 +52,11 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 
 | lane | sites |
 | --- | --- |
-| E / F (D6 re-key) | the walk key `shapeWalkKeyOf(kn, ty)` decides in two places: `tyIsDeclaredNominal` (#7740: `cUserTypes[tyToNominalName(ty)] || nameIsGenAppDecl`) and `shapeWalkSplitsUnion` (`cUserTypes[ln]`); E's type-side `tyIsDeclaredNominal` (`structNameOfTy`, `genAppNameOfTy`, a union alias that is not a numeric literal union) is in its sweep. `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`) |
-| F | D16040 (filed, #7735; 6 programs): `rlElemStructRowOfName` finds a generic instance's function-holding record by `structIndexByName(nonNulBaseOf(nm))`. Not on the carried list (coordinator), so it closes before the close |
-| B | `variantIndexOf` as a name producer (w324-vio) |
+| E | `tyIsDeclaredNominal` (#7740: `cUserTypes[tyToNominalName(ty)] || nameIsGenAppDecl`); E's type-side form (`structNameOfTy`, `genAppNameOfTy`, a union alias that is not a numeric literal union) is gating |
+| F | `shapeWalkSplitsUnion`'s `cUserTypes[ln]` and the walk's value-union arm, after E's predicate lands |
+| A | `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`), after E's step (d), which waits on F's last `ftxt` readers in `shapeFieldElemName` |
+| D | D16040 (filed, #7735; 6 programs; bundled with D16020 in D's PR 2, after #7742): `rlElemStructRowOfName` finds a generic instance's function-holding record by `structIndexByName(nonNulBaseOf(nm))`. Not on the carried list (coordinator), so it closes before the close |
+| B | `variantIndexOf` as a name producer: #7737, open |
 
 ## Floors held by a filed row
 
