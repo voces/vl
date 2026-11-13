@@ -29,7 +29,7 @@ program reaches, and the change moves its decision from the spelling to the type
 - Refresh ×2: fixpoint.
 - Sweep with fixpoint seeds on both sides, master `c85dfd6f` against the candidate: 24,202 same,
   0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
-- `scripts/gate.sh`: all 23 rows pass.
+- `scripts/gate.sh`: all 23 rows pass, on the branch and on the tree merged with master `704a8ae6`.
 - Render-parse: unchanged at 2 parses. `nonNulBaseOf` keeps its other callers:
   - the 7 interner key producers and `genAppRidesTyParam`, which re-key with D6 step 2, lane E;
   - `elemNameIsDeclared` ×2 in `emit_union_atoms`, a label choice between two spellings of one
