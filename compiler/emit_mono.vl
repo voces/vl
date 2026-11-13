@@ -2538,7 +2538,7 @@ function monoSubstLetType(
   // A copy of a parameter takes the type the elaboration closes that parameter at.
   const ct = elabCopyTyOwn(letIx)
   if ct >= 0 && tyAt(ct) is TyFunc {
-    return monoSynthPinRef(monoPinOfClosedTy(ct), ct)
+    return monoSynthPinRef(monoPinOfClosedTy(ct), ct, -1)
   }
   const tn = nodeAt(letType)
   if tn is TypeRef {
@@ -8555,7 +8555,11 @@ function monoMakeInstanceHit(
                   // clone arm types it. Equivalent to the clone arm only while this
                   // caller's column is all -1.
                   const hty = if hp < pinTys.length { pinTys[hp] } else { -1 }
-                  hpp.parType = monoSynthPinRef(pinned[hp], hty)
+                  hpp.parType = monoSynthPinRef(
+                    pinned[hp],
+                    hty,
+                    monoPinRepTyOf(hty),
+                  )
                 }
               }
               hp = hp + 1
@@ -8573,14 +8577,23 @@ function monoMakeInstanceHit(
 // The parameter annotation for pin `name`, typed by `ty`, the type the pin denotes. A closed `ty`
 // spells the node itself (`monoPinSpellOf`). Only an open `ty` reads the name: a list of a
 // literal's `#anon` row takes the row's list (D4710), and any other closes in the spelling.
-function monoSynthPinRef(name: string, ty: i32): i32 {
+function monoSynthPinRef(name: string, ty: i32, held: i32): i32 {
   if ty >= 0 && !tyHasTyVar(ty) {
     const sp = monoPinSpellOf(ty)
     return synthTypeRefTy(if sp != "" { sp } else { name }, -1, ty)
   }
   const alt = monoAnonRowListTy(name, ty)
   if alt >= 0 { return synthTypeRefOfTy(alt, -1) }
-  synthTypeRefFb(name, -1, ty)
+  synthTypeRefFb(name, -1, ty, held)
+}
+
+// The closed type a pin of type `pt` is spelled at when that spelling is its stored rep: a tagged
+// set or a list of its ids at its id rep, a map of ids at its stored map. -1 for any other type.
+function monoPinRepTyOf(pt: i32): i32 {
+  if pt < 0 || pt >= T.tys.length { return -1 }
+  if fnTagTyIsTagged(pt) || fnTagListTy(pt) { return fnTagRepTyOf(pt) }
+  if monoTagMapTy(pt) { return monoTagMapRepTy(pt, [], []) }
+  -1
 }
 
 // The instance's parameters, cloned with each one's pinned annotation: pushes one cloned
@@ -8642,6 +8655,7 @@ function monoMakeInstanceParams(
           nt = monoSynthPinRef(
             pinName,
             if pj < pinOwn.length { pinOwn[pj] } else { -1 },
+            monoPinRepTyOf(pinTys[pj]),
           )
           if monoPinRowNamesOtherTy(nodeTyIxOf(nt), pinTys[pj]) {
             nt = anonPinLitCarry(nt, synthTypeRefTy(pinName, -1, pinTys[pj]))
@@ -8675,7 +8689,11 @@ function monoMakeInstanceParams(
         nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
         synthed = true
       } else if annotateI32 || pinned[pj] != "i32" {
-        nt = monoSynthPinRef(pinned[pj], monoPinWidenTy(pinTys[pj]))
+        nt = monoSynthPinRef(
+          pinned[pj],
+          monoPinWidenTy(pinTys[pj]),
+          monoPinRepTyOf(pinTys[pj]),
+        )
         // The pin name renders inline literal members as `string`; a union box holding them
         // keeps the argument's own members, which its narrowed reads are keyed on (D8181).
         if (
@@ -20494,6 +20512,8 @@ function monoPinHoleParam(
   )
   let an = ""
   let anTy = -1
+  // The closed type the rep cascade spelled `an` at, where it spelled it.
+  let anRep = -1
   let guessed = false
   if elTy >= 0 {
     const ept = elabCallParamTy(monoCallTplOf(callIx), i)
@@ -20594,7 +20614,9 @@ function monoPinHoleParam(
     }
     if an == "" {
       // Kept for an argument the elaboration leaves open at this call.
-      an = monoArgPinName(args[i], ctx, [0 - 1])
+      const anOut = [0 - 1]
+      an = monoArgPinName(args[i], ctx, anOut)
+      anRep = anOut[0]
       // The rep cascade's `i32` floor is not a pin for a hole the elaboration binds to another
       // closed type: that demand would key an instance no call has.
       if an == "i32" && monoFloorDisagrees(setTy) {
@@ -20651,6 +20673,10 @@ function monoPinHoleParam(
     if an == "" && guessed { return 1 }
     if an == "" { return monoArgTyFail(p.parName, fn.fnName) }
     if anTy < 0 { anTy = monoArgPinTyAt(args[i], ctx) }
+    // An open pin type keys no instance; the type its spelling was minted at does.
+    if anRep >= 0 && !tyHasTyVar(anRep) && (anTy < 0 || tyHasTyVar(anTy)) {
+      anTy = anRep
+    }
   }
   pinned.push(an)
   pinTys.push(anTy)
