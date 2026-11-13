@@ -24,6 +24,10 @@ different keys, so there is none, and `monoTagMapRepTy`'s reach is unchanged:
    becomes `rowOfTyUpToFnSets`: the first declared or shape row whose recorded type is `tySame`
    to the element's type.
 
+4. **`nonNulBaseOf` is deleted** (`emit_map_value_slots.vl`). Its only caller was D16040's name
+   lookup. It held the emitter's last type-string parse, so the render-parse census reads
+   **0 type-string parses** (was 1) and 8 `tyToEmitName` calls, and the baseline is lowered.
+
 ## Decision tables
 
 All are `MPROBE` builds over the 24,070-record population, unarmed.
