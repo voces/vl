@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Step 7 L6: union `==` names its operands from their types.** `emitUnionUnionEq` named each operand from the expression's spelling (`unionNameOfExpr`). It now names each from the union its box type is built into, else from the declared alias its type is, and refuses loudly a union-typed operand neither names. The last spelling-based arm test (`unionHasAtomAB`) becomes a loud floor; no program reaches it. Of the 187 programs that reach union `==`, 185 are unchanged. Two literal-union alias fixtures now name one union on both sides, evaluate each operand once, and shrink (one by 1,002 bytes) with the same output.
