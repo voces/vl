@@ -37,9 +37,9 @@ Two floors keep a parse as their condition: `annGenAppSpanEnds` in `sTyIxOfNameT
 `nameIsShapeSpanEnds` in `slotRowTyOf`. A name with no type has nothing else to test. Each is
 now a refusal, not a resolution.
 
-`nameFieldCodeTy`'s spelling parameter is unread now (`_t`). It has 8 callers across
-`emit_classify`, `emit_collect` and `emit_shape_intern`. Dropping it is a follow-up for after
-lane E's step (d).
+`nameFieldCodeTy` no longer reads its spelling, so the parameter is dropped at all 8 callers in
+`emit_classify`, `emit_collect` and `emit_shape_intern`, with lane E's agreement.
+`internShapeAs`'s raw field texts now feed only its refusal message.
 
 ## Not taken: functions other lanes hold
 
