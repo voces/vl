@@ -1,6 +1,6 @@
 # Step 7 L6 (lane G, cut 9a): a field read's union box is named off its element type, 2026-11-13
 
-The base is master `ce4e98ce`. `memberUnionFieldNameRead` names the union box a field read yields.
+The base is master `739db770`. `memberUnionFieldNameRead` names the union box a field read yields.
 It has six consumers: `memReadBoxedAtomKind`, `exprUnion`'s member rung, `unionNameOfExprGo`,
 the shared-field plan, `memReadBoxedAtomKinds` and `coalBoxFieldScalarKind`.
 
@@ -34,5 +34,9 @@ that type. It ran over the sweep list (24,170 programs, 194,934 calls).
 
 ## Proof
 
-- **Seed:** fixpoint.
+- **Seed:** fixpoint, before and after merging master (one comment hunk beside lane B's
+  `memberUnionFieldRowRead`, both kept).
+- **Locally:** lint-self, regress (no runs lost), rep-fuzz (exact), check-filed-witnesses `--strict`
+  (4,865 graded, 0 moved), late-demands (8, baseline 8), seed-size (+1.8%), and the comment,
+  ladder, sentinel and scan budgets.
 - **The full sweep:** CI's `sweep` label. The 191 respellings are graded on its movers.
