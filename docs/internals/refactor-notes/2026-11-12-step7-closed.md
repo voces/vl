@@ -35,23 +35,26 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | `sNameIx` maps a row's own name (an identifier or an `#anonN` handle) to the row, #7685 | §3.3 registries | `anonRowTyOfName`, `anonPinRow`, `retStructRowIndex`'s `#anon` rung | #7414, #7546; D15646, D2762 |
 | the spelling index resolves a source name to its row | §3.3 registries | `unNameAdoptTyKeyRow`, `annShapeIndexOf` (untyped shapes) | `2026-11-12-step7-union-reg-riu-value-union.md`, `2026-11-12-step7-shape-layout-id.md` |
 | a type parameter's name is an identifier; shadowing is a scoping question | §3.3 registries | `monoElabCompositeTy` | lane D, 2026-11-12 |
+| no row key needs declaration identity: an inline field and its `tySame` twin share a row, except `flat` and differing function sets (coordinator, #7306) | §3.3 | the shape interner's rows | #7306, #7669 |
+| mono's anon-pin discriminator decides by the pin's type (coordinator, ruling (a)) | §3.3 | `monoAnonPinDiscrim` | lane D |
 | `tySame` plus the function sets | §3.3 registries | `sRowElemRepSame`, `fnSetsAgree` | `2026-11-12-step7-struct-name-producers-cut-2.md` |
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `e0d8c7f1`, 2026-11-13 00:40)
+## Still failing at this draft (master `54b68c07`, 2026-11-13 01:20)
 
 The close is opened when this list is empty, or holds only items with an open PR. Closed since
-the 23:00 draft: lane D's mono rows (#7681, #7688), lane F's `sFieldRefSlot` fallback (#7683) and
-lane H's `variantNestedRow` lookup (#7679). Then lane B's `structRowOfSpelling` chain (#7687), and lane D's instance registries (#7699).
+the 23:00 draft: lane D's mono rows (#7681, #7688, #7699, #7708), lane F's `sFieldRefSlot`
+fallback (#7683), lane H's `variantNestedRow` lookup (#7679) and `printUnionPlanCode` (#7690),
+lane B's `structRowOfSpelling` chain (#7687), lane G's `utkAtomText` (#7704, so `sNameIx`'s
+contract carries no exception), and lane E's field-set spelling key (#7707).
 
 | lane | sites |
 | --- | --- |
-| E | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; all in the D6 re-key (E and F co-own; F's step 1a is #7689; E on 2b, nested and arm rows by type, F on the walk), with the D6 interner's `nm` input, which `variantNestedRow` and `armFieldStructRowMinted` hand it |
-| G | `unionNameOfCall`; `unionNameOfExpr`'s 7 call sites: 4 in its own producer (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2), `printUnionPlanCode` (#7690); `emitUnionUnionEq` ×2 (moved from lane A: a literal set needs a widened rep, a union-type question) |
-| D | mono's typed instance key (#7699 merged: the four instance registries are off spellings, leaving `sNameIx` the one spelling-keyed registry): #7708 (merged): `monoSigPinDiscrim` becomes an `emitFail` assertion (its control fires only with `monoPinRespell` off: `call1(inc, 4)`), and `monoTypedExtra` keys explicit bindings by type, an open binding's text kept as a floor (22 decisions, 12 programs) under §3.4's type-parameter contract, witness `generics/param-copied-into-two-type-params-called-apart.vl`; `monoAnonPinDiscrim` converts to the pin's own type, ruled (a), PR to come (probe: 0 merges, 7 splits, 37 programs byte-identical) |
-| G | `utkAtomText`, the last `sNameIx` reader with a spelling (convert or contract, #7685's note) |
-| H | `printUnionPlanCode`'s name fallbacks: #7690, open (24 → 2; the 2 filed as D16060) |
+| E / F (D6 re-key) | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; the `nm` input `variantNestedRow` and `armFieldStructRowMinted` hand `internInlineShapeTy` |
+| G | `unionNameOfCall`; `unionNameOfExpr`'s producer-internal calls (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2) and `emitUnionUnionEq` ×2 |
+| D | `monoAnonPinDiscrim`, converting to the pin's type (ruled), PR to come |
+| ruling asked | `printUnionPlanCode`'s D16060 fallback: a field read through an un-annotated parameter is typed at the hole, so only the name rung knows the members. A checker-side gap, as D16010 was ruled, or a step-7 item |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
 

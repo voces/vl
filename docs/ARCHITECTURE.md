@@ -286,6 +286,10 @@ Two types `tySame` equates can still need different rows. A tagged function set 
 index (`fnTagSetOfTy`), and neither `tySame` nor `repCanonId` compares it, so a row decision that
 compares types compares the sets too (`fnSetsAgree`).
 
+No row key needs declaration identity (#7306). An inline-spelled record field and its `tySame`
+declared twin share one row, except a `flat` record, and twins whose function positions carry
+different sets. Mono's anonymous-pin discriminator decides by the pin's type, not its text.
+
 **Type equality.** "Are these two types one?" has seven answers, each a contract. Each draws its
 line on purpose, and two of them disagree on a pair only where their lines differ ([notes](internals/refactor-notes/2026-11-12-step7-registries-and-equality.md),
 [the three vectors graded](internals/refactor-notes/2026-11-12-step7-equality-vectors-graded.md)).
