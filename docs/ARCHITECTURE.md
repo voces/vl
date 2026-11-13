@@ -259,6 +259,39 @@ Two distinct mechanisms carry "the same type" across the phases, and they must n
 names in the module, diagnostics, and keys that must be printable. It is not a way to ask a
 question about a type ([§4.1](#41-one-producer-per-fact)).
 
+The emitter keeps these renders, each for output, and parses no render back into a type. The
+exceptions are the carried floors in `scripts/render-parse-floors.txt`, each held by a filed row
+for a gap with no closed type to read. `scripts/render-parse-budget-baseline.json` holds the renders:
+
+- **Diagnostics:** a message names a type for a person (`cloCallSigRejectWhat`,
+  `nulNicheIsTestImpossible`, `mapSoftTwinTagFail`, `emitMapUnionPayloadTail`).
+- **The `clo:` link key** (`cloSigNameOfTy`): the closure slot's printable name across the link,
+  rendered from its type.
+- **Recorded TypeRef texts** (`synthTypeRefOfTy`, `lvSpellOf`): a synthesized annotation is source
+  text, checked again as source.
+
+A registry is keyed by a type key, an identifier, literal content or an index memo, never by a
+type's spelling (`scripts/registry-census.vl`). `cloSigPosBy` is keyed by the `$fnsig` key built
+from rep tokens, so it is a type key. Three keys look like spellings and are not:
+
+- **`sNameIx`** maps a struct row's own name to the row: a declared record's name, an identifier,
+  or the `#anonN` handle a record literal's mint gave it, which is the row's own key, not a
+  spelling of a type (`anonRowTyOfName`, `anonPinRow`)
+  ([contract](internals/refactor-notes/2026-11-12-step7-snameix-contract.md)).
+- **The spelling index** (`unNameAdoptTyKeyRow`, `annShapeIndexOf`) resolves a source name to the
+  row its type found. It answers an identifier, never a type question.
+- **A type parameter's name** is an identifier. Whether a declared record shadows it is a scoping
+  question, asked before the parameter has a type (`monoElabCompositeTy`).
+
+Two types `tySame` equates can still need different rows. A tagged function set rides on the type
+index (`fnTagSetOfTy`), and neither `tySame` nor `repCanonId` compares it, so a row decision that
+compares types compares the sets too (`fnSetsAgree`).
+
+No row key needs declaration identity (#7306). An inline-spelled record field and its `tySame`
+declared twin share one row, except a `flat` record, and twins whose function positions carry
+different sets. Two separately declared records keep their own rows, linked as layout twins that
+share one heap type (D732), so declaration identity separates compiler rows, never runtime storage. Mono's anonymous-pin discriminator decides by the pin's type, not its text.
+
 **Type equality.** "Are these two types one?" has seven answers, each a contract. Each draws its
 line on purpose, and two of them disagree on a pair only where their lines differ ([notes](internals/refactor-notes/2026-11-12-step7-registries-and-equality.md),
 [the three vectors graded](internals/refactor-notes/2026-11-12-step7-equality-vectors-graded.md)).
@@ -290,6 +323,18 @@ Contract: a value's rep is a function of its **checked type** (per instance, aft
 monomorphization) and of nothing else. Two positions that deliver the same type agree on its rep.
 A box's tag numbering is positional in the union's member sequence, so a member set is never
 deduplicated or reordered once registered.
+
+A classifier reads its rep from one producer, the type (`scripts/rep-classifier-census.vl`). A
+name it reads is a label, never a second producer: a key rendered from the same type
+(`monoTagMapRepName`), or a test of whether an annotation is written (`annTyIsRefList`). A row is
+found by its type: no struct, variant, ref-list or union row is looked up by a spelling.
+
+Two rows have no closed type to be found by:
+
+- **A function-value-set row** has no element type, so it is keyed by its set (`rlKeyTyOf`).
+- **A type that holds a type parameter is not a rep.** A template's row is keyed by its open type
+  and each instance's by its closed type. A body the checker does not instantiate is emitted once,
+  its type parameters open, and builds at the open row, whose field layout comes from its code.
 
 Detail: `docs/internals/rep-descriptor-campaign.md`, `docs/internals/litunion-compact-rep-design.md`,
 `docs/internals/unboxed-union-rep-design.md`, `docs/internals/per-rep-ladder-audit.md`.
@@ -516,8 +561,6 @@ line in the PR that closes it. The order in which they are closed is
 
 | contract | deviation | item |
 | --- | --- | --- |
-| §2.4, §3.4, §4.1 | The emitter answers type questions by rendering and re-parsing the spelling: **37** `tyToEmitName` calls and **60** type-string parses stand in `scripts/render-parse-budget-baseline.json` (2026-11-11, `1d517770`; 50 / 86 on 2026-10-25). The renders are mostly mono's (`emit_mono.vl` 18); the parses are `emit_shape_rows.vl`'s 22, `emit_base.vl`'s 22 and `emit_mono.vl`'s 6 ([census](internals/refactor-notes/2026-11-11-step7-closing-census-2.md)). The 2026-10-25 classification of the floor and the key producers is in [render-parse-residue-2026-10.md](internals/render-parse-residue-2026-10.md). Rep classifiers read two producers for one answer (arena with name, spelling, table or frame). Rep from type: stage 3 is done. Every syntactic list-rep rung is deleted, and a node's list rep is its column; the monomorphizer pins an empty `[]` at an open `T[]` itself (D12581). Stage 2 is partial: a ref-list element key is unique by type at every depth (`repSlotOfElemTy`), the three row producers and the ref-list mint keyed by type name their rows by type (`rlRowNameOfTy`), an annotation reads its ref-list slot from the list type (`rlSlotOfTyOrTwin`) and the element kind is asked of the type (`refListElemKindOfTy`), but every row is still minted under a name, and the spelling stays the floor for a missing type or a hole. A `K | null` niche field records its union's alias from the field's type (a written alias, or an inline set's hidden `#luN`). | [L2](internals/code-quality-2026-10.md#L2) |
-| §3.3, §4.1 | Seven emitter registries are keyed by a type's spelling: `sNameIx` and `sitnMemo` (struct rows by name), mono's instance keys (`instKeyFirst`, `monoTypedKeys`, `monoKeyEk`, `monoKeyPins`), and `cloSigPosBy`, the `clo:` link key and a floor. The other 70 string-keyed maps are keyed by identifiers, literal content, index memos or a type key by construction (`scripts/registry-census.vl`, 2026-11-12; [notes](internals/refactor-notes/2026-11-12-step7-registries-and-equality.md)). Struct-row lookups by name: `structIndexByName` has 36 live call sites (the 2026-10-25 count of 81 took in more entries), and the slot layer has 15 name-keyed producers, 10 of them struct rows ([census](internals/refactor-notes/2026-11-11-step7-closing-census-2.md)). The union registry's 36 name-taking entries are all still defined, with 272 static call sites; its cut order's items 5b–6 remain. The typed reader (`structIndexOfTypeNameTy`) asks the type first (its own row, then an undeclared record's canonical-key row), and a declared record with no row of its own still misses. An inline union's registry row, its key (`canonUnionKeyOfName`, 21 live hits) and its box tags are its name (`registerInlineUnionAt` 10, `mintInlineUnion` 2). Every value-union registration but two (`nliInferLet` and the anon-literal merged set) now hands over its type, and union-row readers and the member-set compare ask by type (`isUName` and `unionSetArmTys` are deleted). The inline-shape interner (`internShapeDeepTy`, `internFuncTypeShapesTy`) keys a declared type by its declaration's name (D6), and field readers resolve a union by the field's type. The narrowing member sets are asked by the declared union's type; `narrowVariantRowFor` keeps its spelling fallback by design, because variant rows are matched by arena node. An mv slot is keyed by the held map type where the caller has one (`mvShapeOfMapHeldTy`), and the map closure-result walk (`forceCloResultMapTypes`) walks the node's type, and every mv-slot caller now does: the spelling is the floor only for a value over an unbound type parameter, and the key kind of a hole-face `Map()` still follows its spelling (D1748). The union-key licence is gated by `tests/vl_union_key_licence_test.ts`. | [L6](internals/code-quality-2026-10.md#L6) |
 | §4.6 | On a development build the seed resolves from the working directory and std from the executable's tree. | owner ruling pending (September row 19, [status](internals/code-quality-2026-10.md#september-status)) |
 
 Two placements in §2 differ from how the phases are often described, and are the contract, not
