@@ -44,12 +44,7 @@ import {
   fnTagSetIsTagged,
   fnTagSetOfTy,
 } from "./check_elab_cap"
-import {
-  groupInnerOf,
-  nameIsFuncTypeAtom,
-  nameIsShapeOpen,
-  peelGroupParens,
-} from "./tyname"
+import { groupInnerOf, nameIsFuncTypeAtom, peelGroupParens } from "./tyname"
 import {
   ambientCtorCalls,
   gaParamNames,
@@ -876,6 +871,7 @@ import {
   tyMapHeld,
   tyMapValOf,
   tyPeelNul,
+  tyReachesHole,
   tyStepElem,
   tyStepRet,
 } from "./tyquery"
@@ -890,6 +886,7 @@ import {
   tyIsValueUnionBox,
   tyMapKeyKindSpan,
   valueAtomKind,
+  valueUnionTyVerdict,
 } from "./check_ty_rep"
 import { valueUnionRetName } from "./check_ret_names"
 import {
@@ -925,8 +922,8 @@ function markInferredJoinAtoms(ty: i32) {
   }
   if !joinBoxes { return 0 }
   if unRowOfCanonFolded(ty) >= 0 { return 0 }
-  const nm = arenaEmitName(ty)
-  if nm == "" { return 0 }
+  // A join still holding an inference hole or an unresolved part is no join yet.
+  if tyReachesHole(ty, 64) { return 0 }
   uDeclared = true
   markValueUnionAtoms(ty)
 }
@@ -5420,7 +5417,8 @@ function collectARefArrayAnn(i: i32, _nd: TypeRef): i32 {
   // A value-union element and a struct or heterogeneous element box as usual.
   if raKind == RLK_UNION {
     const nicheTy = annNicheNulElemInner(i)
-    if nicheTy >= 0 && !isValueUnionName(ren) {
+    const vu = valueUnionTyVerdict(raTy)
+    if nicheTy >= 0 && !(vu == 1 || (vu < 0 && isValueUnionName(ren))) {
       return emitFail(
         "emitProgram: a nullable-"
           + tyToStr(nicheTy)
@@ -8361,6 +8359,12 @@ function collectTyMembersReach(
   0
 }
 
+// Whether a record's first member is an index operator (`"[]"`, `"[]="`), as an object that
+// declares one leads with it.
+function objLeadsWithIndexOp(names: string[]): boolean {
+  names.length > 0 && names[0].length > 0 && names[0][0] == '['
+}
+
 // True if a closure whose result arena type is `retIx` is not yet representable through the
 // value ABI, so the arena sig walk must skip interning its sig — synthesizing one the concrete
 // producer declines would let a value call resolve past its clean reject into invalid emit.
@@ -8372,13 +8376,16 @@ function funcRetUnrepresentable(retIx: i32): boolean {
   // heterogeneous value union, and a new arena variant with a third must say so here.
   match t {
     TyObj => {
-      // `arenaEmitName` is the module's one render-then-canon hop; a `""` render fails
-      // `nameIsShapeOpen` without entering the rewriter.
-      const nm = arenaEmitName(retIx)
-      // `nameIsShapeOpen` bounds the name at 2, avoiding an out-of-bounds `nm[1]` read that a
-      // bare `length > 0` test would trap on for the single name `"{"`.
-      if nameIsShapeOpen(nm) { return !funcTypeShapeLowerable(retIx) }
-      return false
+      // Only an inline result record can be the hole: a declared struct or generic application
+      // lowers by name, one still holding a hole is not settled, and an operator-bearing object
+      // (its first member `"[]"` or `"[]="`) is no record shape.
+      if structNameOfTy(retIx) != "" || genAppNameOfTy(retIx) != "" {
+        return false
+      }
+      if tyReachesHole(retIx, 64) || objLeadsWithIndexOp(t.objFieldNames) {
+        return false
+      }
+      return !funcTypeShapeLowerable(retIx)
     }
     TyUnion => {
       const members = t.uMembers
@@ -8517,15 +8524,10 @@ function collectTyReachCloSigsArm(tyIx: i32, depth: i32): i32 {
       // Interns this closure's sig from its arena render, the key the value-call site and a
       // concrete lambda both derive; a mixed-union unregistered result is skipped so the call rejects loudly.
       if !funcRetUnrepresentable(t.fnRet) {
-        // `sigKeyOfTy(tyIx)` gets the key directly off the type rather than parsing it back out of
-        // the render `arenaEmitName` would produce; the render is asked only whether it exists.
+        // `sigKeyOfTy(tyIx)` gets the key directly off the type.
         const kAr = sigKeyOfTy(tyIx)
-        if kAr != "" && !cloResultMaybeMixed(tyIx) {
-          internCloSigKey(kAr, -1)
-        } else {
-          const nm = arenaEmitName(tyIx)
-          if nm != "" { internCloSigOfArmTy(kAr, tyIx) }
-        }
+        if kAr != "" && !cloResultMaybeMixed(tyIx) { internCloSigKey(kAr, -1) }
+        else if !tyReachesHole(tyIx, 64) { internCloSigOfArmTy(kAr, tyIx) }
       }
       // Descend params + result to reach closures nested inside them (a result struct's
       // closure field, a param closure, a closure arm of a field union).
