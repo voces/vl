@@ -37,7 +37,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a type parameter's name is an identifier; shadowing is a scoping question | §3.3 registries | `monoElabCompositeTy` | lane D, 2026-11-12 |
 | `tySame` plus the function sets | §3.3 registries | `sRowElemRepSame`, `fnSetsAgree` | `2026-11-12-step7-struct-name-producers-cut-2.md` |
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
-| a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
+| a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
 ## Still failing at this draft (master `e0d8c7f1`, 2026-11-13 00:40)
 
@@ -49,7 +49,7 @@ lane H's `variantNestedRow` lookup (#7679). Then lane B's `structRowOfSpelling` 
 | --- | --- |
 | E | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; all in the D6 re-key (E and F co-own; F's step 1a is #7689; E on 2b, nested and arm rows by type, F on the walk), with the D6 interner's `nm` input, which `variantNestedRow` and `armFieldStructRowMinted` hand it |
 | G | `unionNameOfCall`; `unionNameOfExpr`'s 7 call sites: 4 in its own producer (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2), `printUnionPlanCode` (#7690); `emitUnionUnionEq` ×2 (moved from lane A: a literal set needs a widened rep, a union-type question) |
-| D | mono's typed instance key (#7699 merged: the four instance registries are off spellings, leaving `sNameIx` the one spelling-keyed registry): #7708 (open): `monoSigPinDiscrim` becomes an `emitFail` assertion (its control fires only with `monoPinRespell` off: `call1(inc, 4)`), and `monoTypedExtra` keys explicit bindings by type, an open binding's text kept as a floor (22 decisions, 12 programs; contract to be cited); `monoAnonPinDiscrim` converts, ruled (a), D's next cut |
+| D | mono's typed instance key (#7699 merged: the four instance registries are off spellings, leaving `sNameIx` the one spelling-keyed registry): #7708 (open): `monoSigPinDiscrim` becomes an `emitFail` assertion (its control fires only with `monoPinRespell` off: `call1(inc, 4)`), and `monoTypedExtra` keys explicit bindings by type, an open binding's text kept as a floor (22 decisions, 12 programs) under §3.4's type-parameter contract, witness `generics/param-copied-into-two-type-params-called-apart.vl`; `monoAnonPinDiscrim` converts, ruled (a), D's next cut |
 | G | `utkAtomText`, the last `sNameIx` reader with a spelling (convert or contract, #7685's note) |
 | H | `printUnionPlanCode`'s name fallbacks: #7690, open (24 → 2; the 2 filed as D16060) |
 
