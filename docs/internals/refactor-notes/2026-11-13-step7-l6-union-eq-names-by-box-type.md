@@ -15,7 +15,8 @@ A union-typed operand that neither rung names is refused with `emitFail`.
 
 The arm intersection's last rung, `unionHasAtomAB(25, rname, …)`, asked the right operand's name
 for an atom when neither its member set nor its box type gave its arms. That rung is now refused
-loudly too. `unionHasAtomAB` has no caller left in `wasmEmit.vl`; lane G deletes it.
+loudly too. That was the last caller of `unionHasAtomAB` and of its helper `unionHasAtomRow`
+(`emit_union_registry.vl`), so both are deleted, with lane G's agreement.
 
 ## Measured
 
@@ -66,13 +67,13 @@ The two movers:
 ## Counts
 
 - `unionNameOfExpr` calls in `wasmEmit.vl`: 2 → 0.
-- `unionHasAtomAB` callers in `wasmEmit.vl`: 1 → 0.
+- `unionHasAtomAB` and `unionHasAtomRow`: deleted.
 
 ## Proof
 
 - **Locally:**
   - refresh to a fixpoint;
   - `lint-self.sh` clean;
-  - `scripts/gate.sh`;
-  - `mono-tyaram-grid.sh`.
+  - `scripts/gate.sh`: all gates pass;
+  - `mono-tyaram-grid.sh`: 0 BAD.
 - **CI's sweep** should report the two bytes-only movers above, and nothing else.
