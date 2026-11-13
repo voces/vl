@@ -43,11 +43,13 @@ and all are byte-identical. The seed is about 950 bytes smaller.
 
 - `code0SpellingFitsRow`: deleted.
 - `shapeFieldParse` in `anonHandleTyIx`: gone.
+- The layout walk no longer takes the interner's field texts. `layoutRowWalk`,
+  `annShapeLayoutRowOf` and `layoutFirstRowOf` each lose their `texts` parameter.
 
 ## Proof
 
 - **Locally:**
   - refresh to a fixpoint;
   - `lint-self.sh` clean;
-  - `scripts/gate.sh`.
+  - `scripts/gate.sh`: all gates pass.
 - **CI's sweep** should report no movers.
