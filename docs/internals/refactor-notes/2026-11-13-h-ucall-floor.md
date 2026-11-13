@@ -23,4 +23,14 @@ The rowless exit is now `callNameFloor("a declared callee whose call type keys n
 annotation")`. That is a loud `emitFail` naming the contract, returning "" with no row, so no
 name without a row leaves this rung. The matching exit is unchanged.
 
-Sweep, master fixpoint against candidate fixpoint: see the PR. The census is unchanged.
+Sweep with the floor alone, master fixpoint against candidate fixpoint: 24,247 same, 0 bytes-only
+movers, 0 output movers. The census is unchanged.
+
+## The `??` arm compares rows
+
+`unionNameOfExpr`'s `??` arm returned `cln` when the two operands' names were equal
+(`crn == cln`). It now compares the rows `unionNameRowOfExpr` reports for them
+(`cRows[0] == cRows[2]`, a real row). A probe logged each reach. Of 18,913 programs that emit, 2
+enter the arm, and the compare runs in none: one has a non-nullable default, and the other has no
+union name on its left. Four hand-written `??` witnesses (two declared unions, a literal union, a
+union-valued map read, and a call) are named by earlier rungs and print the same before and after.
