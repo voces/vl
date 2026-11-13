@@ -32,7 +32,7 @@ fired at the twin sites before the cut.
 | sweep | programs | same | bytes-only movers | output movers | runs → not-runs | new compiler traps |
 |---|---|---|---|---|---|---|
 | plain | 24,209 | 24,209 | 0 | 0 | 0 | 0 |
-| armed (`VL_OPAQUE_SNAMES=1`) | ARMED_RESULT |
+| armed (`VL_OPAQUE_SNAMES=1`) | 24,209 | 24,209 | 0 | 0 | 0 | 0 |
 
 The three storage-widened programs move neither output nor bytes. The armed sweep ran on a host
 built after #7661: D12340's witness builds to different bytes armed and unarmed, and prints `6`
