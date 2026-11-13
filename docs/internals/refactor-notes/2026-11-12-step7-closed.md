@@ -150,7 +150,18 @@ is the checker's job. A checker parse reached from emit whose input the emitter 
 then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
 §3.3's sentence "parses no type spelling back" waits on that.
 
-**On master `ad5abe1b`:** 29 render or synthesized parses (28 failing beside D16022's floor), 7 source, 17 unclassified; 96 renders and 42 display renders. D16002 closed (#7798), P6 closed (#7785, #7793). The failing parses by owner: B 4 (P5 and `identFnTypeAnnNameOfRead`); E/F 9 (the shape grammar, #7800 pending); E 2 (`iisPushFieldElem`); G 15 (`valueAtomKind` over rendered atoms ×12, `msAtomIdOf`, `unionHasAtom` ×2). The renders a content decision reads: D's `monoRecordNominalPin`, `monoSubstAnnNode`, `monoTagRecordPinKind` and `monoNarrowedPinName` (#7805 pending), and E's `arenaEmitName`. Another 17 renders are tested only for emptiness or the decline sentinel; whether that is a presence test (a floor) is put to the coordinator.
+**On master `ad5abe1b`:** 29 render or synthesized parses (28 failing beside D16022's floor), 7 source, 17 unclassified; 96 renders and 42 display renders. D16002 closed (#7798), P6 closed (#7785, #7793). The failing parses by owner: B 4 (P5 and `identFnTypeAnnNameOfRead`); E/F 9 (the shape grammar, #7800 pending); E 2 (`iisPushFieldElem`); G 15 (`valueAtomKind` over rendered atoms ×12, `msAtomIdOf`, `unionHasAtom` ×2). The renders a content decision reads: D's `monoRecordNominalPin`, `monoSubstAnnNode`, `monoTagRecordPinKind` and `monoNarrowedPinName` (#7805 pending), and E's `arenaEmitName`. Another 17 renders are tested only for emptiness or for the decline sentinel. That is a **presence test, and a floor** (coordinator, 2026-11-13): the answer is whether the type has a rendering, never anything in the text. Each family's test stands for:
+
+- `rlRowNameOfTy(…) == ""` (`arrLitFrameRefTy`, `arrLitStoredElemName`, `collectARefArrayAnn`, `ensureRefElemTys`): the element has no arena type, so it has no ref-list row to name;
+- a mono pin spelling `== ""` (`monoNicheWidenedPinName`, `monoArgTyNameRep`, `monoLitUnionPinOfTy`, `monoPinNominalSpelling`, `monoNoteBindDeliveryCall`): the pin speller cannot spell the type (an open or unpinnable type);
+- `tyToNominalName(…) == ""` (`fnElemNominalName`, `nulRefElemEmitName`, `fieldElemRowName`): the type has no finite nominal name (a cycle, or a type variable);
+- `unionSpellingOfTy(…) == UNION_SPELLING_DECLINE` (`coalesceResultUnionName`, `valueUnionNameOfTy`): the speller declines a type that is not a value union;
+- `canonUnionKeyTextOfTy(…) == ""` (`valueUnionKeyTextOfTy`, `unRowOfTyWide`): the type keys no union;
+- `cloSigNameOfTy(…) == ""` (`unionPartSpelling`): the member is not a closure signature.
+
+None of the 17 hands its string to a compare or a parse elsewhere in its body. The one parse in `monoArgTyNameRep` is D16022's carried floor.
+
+Owners (coordinator, 2026-11-13): `collectDeclaredUnion` ×2 and `identFnTypeAnnNameOfRead` (#7804) go to H; `internShapeAs` to E; `recordClonedNodeTyFb` to F (the pin-type carry, with D); `repElemTyOfName` to B; `monoNarrowedPinName` to D. D16061 leaves the carried list when lane A's #7806 lands.
 
 **On master `09aede4a`:** 33 render or synthesized parses, 7 source, 19 unclassified; 99 renders and 44 display renders. D16050 and D16051 closed (#7797: member slices bank `boxTagOfTy`). `shapeWalkKeyOf` is deleted (#7794: the walk's key is two bits of walk state). What blocks the close (coordinator, 2026-11-13): the render-origin parses (F the shape family; B, D, E and G the rest), the renders that feed a decision (`arenaEmitName`, E; mono's R1 pin decisions, D), and D16002 (A, unfiled at this draft).
 
