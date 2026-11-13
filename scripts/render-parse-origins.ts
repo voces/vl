@@ -222,7 +222,8 @@ const producerOf = (text: string, callAt: number, arg: string): string => {
 };
 
 // What the value spanning text[from, to) flows into, one hop: `kind: detail`. Kinds: key (an index
-// or a get/set/has/delete argument), push, compare, arg, return, concat, store, bind, other.
+// or a get/set/has/delete argument), push, compare, scan (the string itself indexed or measured),
+// arg, return (a return or a block's tail value), discarded, concat, store, bind, other.
 const contextOf = (text: string, from: number, to: number): string => {
   const before = text.slice(Math.max(0, from - 160), from).replace(/\s+$/, "");
   const after = text.slice(to, to + 160).replace(/^\s+/, "");
@@ -231,8 +232,17 @@ const contextOf = (text: string, from: number, to: number): string => {
     return `compare: ${line(after.replace(/^(==|!=)\s*/, "")) || "…"}`;
   }
   if (/^\+(?!=)/.test(after) || /[^+]\+$/.test(before)) return "concat";
+  if (
+    /^(\[|\.length\b|\.slice\(|\.indexOf\(|\.startsWith\(|\.endsWith\()/.test(
+      after,
+    )
+  ) {
+    return `scan: ${line(after)}`;
+  }
   if (/(^|[^A-Za-z0-9_])return$/.test(before)) return "return";
-  const bind = before.match(/(?:const|let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=$/);
+  const bind = before.match(
+    /(?:const|let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=]+)?=$/,
+  );
   if (bind) return `bind: ${bind[1]}`;
   const store = before.match(/([A-Za-z_][A-Za-z0-9_.]*(?:\[[^\]]*\])?)\s*=$/);
   if (store && !/[=!<>]=$/.test(before)) return `store: ${store[1]}`;
@@ -254,11 +264,70 @@ const contextOf = (text: string, from: number, to: number): string => {
       if (c === "[") return `key: ${callee}[…]`;
       if (/\.(get|set|has|delete)$/.test(callee)) return `key: ${callee}(…)`;
       if (/(^|\.)push$|Push$/.test(callee)) return `push: ${callee}(…)`;
-      return `arg: ${callee || "(group)"}(…)`;
+      // The argument's position: depth-0 commas between the `(` and the value.
+      let pos = 0;
+      let d2 = 0;
+      for (let j = i + 1; j < from; j++) {
+        const cj = text[j];
+        if (cj === "(" || cj === "[" || cj === "{") d2++;
+        else if (cj === ")" || cj === "]" || cj === "}") d2--;
+        else if (cj === "," && d2 === 0) pos++;
+      }
+      return `arg: ${callee || "(group)"}(…)#${pos}`;
     }
   }
-  if (/[{\n]$/.test(before) && /^[\n}]/.test(after)) return "return";
+  // A value that starts its own statement: the block's tail value when the block ends next, else
+  // a value nothing reads.
+  const stmtStart = /(^|[{};]|=>)$/.test(before) ||
+    text.slice(Math.max(0, from - 160), from).search(/\n[ \t]*$/) >= 0;
+  if (stmtStart) {
+    if (/^(}|[A-Za-z_][A-Za-z0-9_]*\s*(\|[^=]*)?=>)/.test(after)) {
+      return "return";
+    }
+    return "discarded";
+  }
   return `other: ${line(before.split("\n").pop() ?? "")}`;
+};
+
+// Every compiler function's parameter names and body, for the keyed-through-a-callee test.
+const FNS = new Map<string, { params: string[]; body: string }>();
+const loadFns = () => {
+  for (const e of Deno.readDirSync("compiler")) {
+    if (!e.name.endsWith(".vl")) continue;
+    const t = Deno.readTextFileSync(`compiler/${e.name}`);
+    const re = /\n(?:export )?function ([A-Za-z_][A-Za-z0-9_]*)\(([^)]*)\)/g;
+    const ms = [...t.matchAll(re)];
+    ms.forEach((m, j) => {
+      const end = j + 1 < ms.length ? ms[j + 1].index! : t.length;
+      const params = m[2].split(",").map((x) => x.split(":")[0].trim())
+        .filter((x) => x);
+      FNS.set(m[1], { params, body: t.slice(m.index!, end) });
+    });
+  }
+};
+
+// Whether the callee keys a table with parameter `pos` (an index, or a get/set/has/delete argument)
+// or pushes it into a column, following the parameter into the callees it is passed to, four deep.
+const keyedVia = (callee: string, pos: number, depth = 4): string => {
+  const f = FNS.get(callee.split(".").pop() ?? "");
+  if (!f || pos >= f.params.length || depth <= 0) return "";
+  const p = f.params[pos];
+  let found = "";
+  const re = new RegExp(`(?<![A-Za-z0-9_.])${p}(?![A-Za-z0-9_])`, "g");
+  for (const m of f.body.matchAll(re)) {
+    const at = m.index!;
+    if (at < f.body.indexOf("{")) continue;
+    const c = contextOf(f.body, at, at + p.length);
+    if (c.startsWith("key: ")) return "key";
+    if (c.startsWith("push: ")) found = "push";
+    const a = c.match(/^arg: ([A-Za-z_][A-Za-z0-9_.]*)\(…\)#(\d+)$/);
+    if (a && a[1] !== callee) {
+      const v = keyedVia(a[1], Number(a[2]), depth - 1);
+      if (v === "key") return "key";
+      if (v === "push") found = "push";
+    }
+  }
+  return found;
 };
 
 // A render's consumer: its context, or for a value bound to a name, each use's context in the
@@ -271,8 +340,16 @@ const consumerOf = (text: string, from: number, to: number): string => {
   const fnEnd = rest.search(/\n(?:export )?function /);
   const body = fnEnd >= 0 ? rest.slice(0, fnEnd) : rest;
   const uses = new Set<string>();
-  for (const m of body.matchAll(new RegExp(`(?<![A-Za-z0-9_.])${name}(?![A-Za-z0-9_])`, "g"))) {
+  for (
+    const m of body.matchAll(
+      new RegExp(`(?<![A-Za-z0-9_.])${name}(?![A-Za-z0-9_])`, "g"),
+    )
+  ) {
     const at = to + m.index!;
+    // A reassignment of the name is not a read of the render.
+    if (/^\s*=(?!=)/.test(text.slice(at + name.length, at + name.length + 4))) {
+      continue;
+    }
     uses.add(contextOf(text, at, at + name.length));
     if (uses.size >= 3) break;
   }
@@ -496,6 +573,7 @@ const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const main = async () => {
   const sites = await sitesOf();
   const rsites = await renderSitesOf();
+  loadFns();
   const tmp = await Deno.makeTempDir({ prefix: "vl_rp_origins_" });
   try {
     const wasm = await buildProbe(sites, rsites, tmp);
@@ -691,18 +769,29 @@ const main = async () => {
         "| --- | --- | --- | --- | --- | --- | --- | --- |\n" +
         rsites.map((s, k) => {
           const c = s.producer;
+          const via = [
+            ...c.matchAll(/arg: ([A-Za-z_][A-Za-z0-9_.]*)\(…\)#(\d+)/g),
+          ]
+            .map((m) => [m[1], keyedVia(m[1], Number(m[2]))] as const)
+            .filter(([, v]) => v);
           const keyed = /key: /.test(c)
             ? "yes"
-            : /push: /.test(c)
+            : via.some(([, v]) => v === "key")
+            ? `yes, via ${
+              via.filter(([, v]) => v === "key").map(([f]) => f).join(", ")
+            }`
+            : /push: /.test(c) || via.length > 0
             ? "push"
             : /compare: /.test(c)
             ? "compare"
             : "no";
           return `| ${s.file.replace("compiler/", "")}:${s.line} | ${
             s.key.split("\t")[1]
-          } | ${s.key.split("\t")[2]} | \`${cell(c).slice(0, 110)}\` | ${keyed} | ${
-            rProgs[k]
-          } | ${rWitness[k][0]} | \`${cell(rWitness[k][1]).slice(0, 50)}\` |`;
+          } | ${s.key.split("\t")[2]} | \`${
+            cell(c.replace(/#\d+/g, "")).slice(0, 110)
+          }\` | ${keyed} | ${rProgs[k]} | ${rWitness[k][0]} | \`${
+            cell(rWitness[k][1]).slice(0, 50)
+          }\` |`;
         }).join("\n") +
         `\n\n## The census's sites no program reaches\n\n` +
         unreached.map((s) =>
