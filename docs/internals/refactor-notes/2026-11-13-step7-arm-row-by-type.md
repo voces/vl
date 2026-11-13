@@ -1,0 +1,73 @@
+# `internArmShapeRow` answers the row its type already has, 2026-11-13
+
+Lane A, census 5's last site. It follows lane E's step (d) (#7756), after which
+`internInlineShapeFieldsTy` reads an arm's fields off its type and `nm` is only the row's
+label. Emit only.
+
+**The change.** Before minting, `internArmShapeRow` asks `repStructRowOfTy(aty)`. When the
+type has a row, that row is the arm's row and nothing is minted. Otherwise the arm mints under
+its rendered label as before. The memo write is factored into `iasNote`.
+
+**What it changes, by the decision table in
+`2026-11-13-step7-arm-mint-softening-floored.md`.** The mint used to deduplicate by its rendered
+label. In 7 sites across 5 programs, that label landed on another declared type's row while
+`repStructRowOfTy(aty)` gave the arm's own row. The disagreements were:
+- **Storage-widened twins:** `soundness/is-containing-record-always-fits`,
+  `unions/layout-family-literal-set-beside-string` and `unions/union-variant-field-reps-equality`;
+- **Structural twins:** `unions/arms-name-one-record-shape-twice` and
+  `generics/alias-to-generic-application-field-positions`. Two separately declared records
+  sharing a row was only ever a by-name accident, never a ruling (#7306 merges an inline field
+  with its declared twin, at recording). These two now take their own rows too.
+
+At every one of those sites, `repStructRowOfTy(aty)` answers the same row before and after the
+mint (the arm's recorded row, `structRowRecordingTy`). So the dedupe does not depend on whether
+the mint has run.
+
+**Probe** (master after #7756, the full sweep population): a loud `emitFail` wherever a fresh mint
+still lands on a row `repStructRowOfTy` disagrees with. It fired at 0 sites. The same comparison
+fired at the twin sites before the cut.
+
+**Sweeps.** Fixpoint seeds on both sides.
+
+| sweep | programs | same | bytes-only movers | output movers | runs → not-runs | new compiler traps |
+|---|---|---|---|---|---|---|
+| plain | 24,209 | 24,209 | 0 | 0 | 0 | 0 |
+| armed (`VL_OPAQUE_SNAMES=1`) | 24,209 | 24,209 | 0 | 0 | 0 | 0 |
+
+The three storage-widened programs move neither output nor bytes. The armed sweep ran on a host
+built after #7661: D12340's witness builds to different bytes armed and unarmed, and prints `6`
+both ways. A host from before #7661 reads the switch as absent, and its armed sweep measures
+nothing.
+
+**What the base did with these twins.** The row dump of
+`tests/cases/soundness/generic-identity-literal-into-union-beside-own-row.vl` shows the
+difference:
+- In the base, `J`'s type has two rows: a heapless `#ref1` and the `{r:i32|null}` row the arm
+  minted by label, which holds the heap.
+- After the cut, `#ref1` alone holds the heap, which the arm shares. The duplicate is gone.
+
+The arm's named twin (`variantStructHeapTwinAt`) now answers -1, because that lookup knows
+declared rows and `#anon` literal rows, not `#ref` rows. Pointing it at the type's own row
+instead left the twin heapless and produced an invalid module, so it is unchanged. Both sweeps
+show no module moves. `tests/vl_row_classes_test.ts`'s `rowOf` therefore falls back to the row
+whose heap type the arm shares, which is the module-level fact it pins.
+
+**The surviving render.** `tyToEmitName(aty)` (and `armMintRenderOf`) survives only on a fresh
+mint, when the arm's type has no row yet. There it is the new row's label, and
+`internInlineShapeFieldsTy` checks it with its `nameIsShapeSpanEnds` guard; no row choice reads
+it. Lane I grades it as a floor.
+
+**The arm's named twin.** `variantStructHeapTwinAt` answers -1 for 17 arms after the cut, all
+of them `J` in the generic-identity-literal family. Over the full population there are 0 other
+movers: no twin is gained or moved to another row. Their twin was the label-minted duplicate row
+the cut removes, so -1 is the honest answer: no other type's row shares `J`'s heap, only the
+arm's own `#ref` row (`uVarRow`). Falling back to `uVarRow[vi]` there would answer a different
+question ("the arm's own row") for 5,073 arms in 3,132 programs that have no cross-table twin in
+the base either, so the function is unchanged.
+
+The callers that write through the twin are the literal-field re-lays (`relayLitFieldToString`,
+`demoteLitFieldToString`). They would miss `#ref1` only for a `J` whose inline literal-set field is
+re-laid. That case is not reachable: a literal spelled for it infers `{r: string}`, so it never
+lands on `J`'s arm, and no program in the population has it. If a witness ever reaches it, the fix
+belongs in those re-lay readers, reading `uVarRow[vi]` as "the row sharing the arm's heap". It
+does not belong in `variantStructHeapTwinAt`.

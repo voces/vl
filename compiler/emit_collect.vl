@@ -44,7 +44,7 @@ import {
   fnTagSetIsTagged,
   fnTagSetOfTy,
 } from "./check_elab_cap"
-import { groupInnerOf, nameIsFuncTypeAtom, peelGroupParens } from "./tyname"
+import { nameIsFuncTypeAtom, peelGroupParens } from "./tyname"
 import {
   ambientCtorCalls,
   gaParamNames,
@@ -206,14 +206,11 @@ import {
   declStructIndexBuild,
   declStructNodeOf,
   fnLetOfRead,
-  isStructAtom,
   listIsTestedIdent,
   monoAnnHasTyParam,
   nameIsClosureArrayTy,
-  nameIsShapeSpanEnds,
   nodeIsTypeDecl,
   nulLitUnionInnerNameOfTy,
-  shapeInnerFieldSplit,
   strLess,
   tyIsFuncType,
   tyNameOf,
@@ -555,6 +552,7 @@ import {
   rlElemKindAt,
   sTyIxOfName,
   structCanonIxReset,
+  valueBoxOfTy,
 } from "./emit_rep"
 import { repSigRetTokOfTy, repSlotOfKind } from "./emit_rep_slot"
 import { RS_TAG, relSkew } from "./emit_reloc"
@@ -886,7 +884,6 @@ import {
   tyIsValueUnionBox,
   tyMapKeyKindSpan,
   valueAtomKind,
-  valueUnionTyVerdict,
 } from "./check_ty_rep"
 import { valueUnionRetName } from "./check_ret_names"
 import {
@@ -5417,8 +5414,7 @@ function collectARefArrayAnn(i: i32, _nd: TypeRef): i32 {
   // A value-union element and a struct or heterogeneous element box as usual.
   if raKind == RLK_UNION {
     const nicheTy = annNicheNulElemInner(i)
-    const vu = valueUnionTyVerdict(raTy)
-    if nicheTy >= 0 && !(vu == 1 || (vu < 0 && isValueUnionName(ren))) {
+    if nicheTy >= 0 && !valueBoxOfTy(raTy) {
       return emitFail(
         "emitProgram: a nullable-"
           + tyToStr(nicheTy)
@@ -7100,53 +7096,39 @@ export function collectS(stmts: i32[]) {
 }
 
 // ── union collection (G1) ─────────────────────────────────────────────────────
-// Parse the inline-shape variant `nm` (`{x:i32,y:string}`) into the flat
-// union-variant field tables — the variant-table twin of `collectAnnShapes`'s
-// field split (same depth-aware `,`/`:` grammar).
-function collectShapeVariantFields(nm: string, shapeTy: i32) {
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  // The group-interior cut at its home (`tyname.groupInnerOf`, W1). The guard is the
-  // caller's — `collectVariantFields` gates on `nameIsShapeSpanEnds`.
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
+// Records the fields of the undeclared record variant `shapeTy` into the flat union-variant
+// field tables, read off its type: names in canonical order (D622), each coded from its type.
+function collectShapeVariantFields(shapeTy: i32) {
+  const shp = tyAt(shapeTy)
+  if !(shp is TyObj) {
+    return emitFail("emitProgram: malformed inline union-variant shape")
+  }
+  const fnames = shp.objFieldNames
+  const ftys = shp.objFieldTypes
   uFieldStart.push(armStageNames.length)
-  // D622 — the canonical field order, needed here too: cross-table twin tests compare codes
-  // positionally, so a declaration-order arm can merge into a canonical twin's opposite slots.
+  // Cross-table twin tests compare codes positionally, so the order is the canonical one.
   const cOrd = fieldNameOrder(fnames)
   let cnt = 0
   let fx = 0
   while fx < fnames.length {
     const fi = cOrd[fx]
-    if fnames[fi] == "" {
+    const fldTy = ftys[fi]
+    if fnames[fi] == "" || fldTy < 0 {
       return emitFail("emitProgram: malformed inline union-variant shape")
-    }
-    const ftxt = ftexts[fi]
-    // The arena rung, where the shape's own type supplies the field's recorded type; the length
-    // guard keeps the correspondence legitimate — a count mismatch means `fi` is not the same field.
-    let fldTy = -1
-    if shapeTy >= 0 {
-      const shp = tyAt(shapeTy)
-      if shp is TyObj {
-        if shp.objFieldTypes.length == ftexts.length {
-          fldTy = shp.objFieldTypes[fi]
-        }
-      }
     }
     const fc = nameFieldCodeTy(fldTy)
     if fc < 0 {
-      // D1518 — `fieldTypeRefusalMsg`'s sentence, one table over: what reaches here is an
-      // arm-typed field whose arm has no cross-table heap twin.
-      return emitFail(fieldTypeRefusalMsg(ftxt, fldTy))
+      // An arm-typed field whose arm has no cross-table heap twin (D1518).
+      return emitFail(fieldTypeRefusalMsg("", fldTy))
     }
-    // `pushFieldRow`'s variant-table row; this recorder derives the elem name from the field's
-    // type text (no `FieldDef` node exists here), and has no `sFieldCloSig` twin, hence the "" tail.
+    // The variant table has no `sFieldCloSig` twin, hence the "" tail.
     pushFieldRow(
       true,
       fc,
       shapeFieldElemName(fc, fldTy),
       tyMapKeyKindSpan(fldTy),
       fnames[fi],
-      variantFieldIdText(ftxt, fldTy),
+      variantFieldIdText(tyToNominalName(fldTy), fldTy),
       fieldElemHintOfRow(fldTy, fldTy, fc),
       fldTy,
       "",
@@ -7165,24 +7147,20 @@ function fieldNamesDeclRecord(stmts: i32[], ft: i32): boolean {
   dn != "" && declStructNodeOf(stmts, dn) >= 0
 }
 
-// Record the field names + per-field wasm-type codes of the `TypeDecl` named `name` into the
+// Record the field names + per-field wasm-type codes of record variant `ty` into the
 // flat `armFieldNames`/`uFieldStart`/`uFieldCount`/`armFieldTypes` table (declaration order = wasm
 // field index). The struct must exist among the top-level statements and every field must
 // carry a code, else fails loudly. Returns 0, or -1 (via `emitFail`).
-function collectVariantFields(stmts: i32[], name: string, ty: i32) {
-  // An inline-shape variant (`{x:i32}` inside `{x:i32}|{y:i32}`) carries its
-  // fields in its own text — parse them (the annotation-shape field grammar)
-  // instead of looking for a TypeDecl. `ty` is the arm's own type, whose literal fields the
-  // text spells as their base.
-  if nameIsShapeSpanEnds(name) { return collectShapeVariantFields(name, ty) }
-  // The declaration this variant names, from the index `collectU` built — the forward scan
-  // this replaces took the FIRST `TypeDecl` spelling `name` and the index records the same
-  // one. A miss is the refusal at the tail, reached the same way an exhausted scan reached it.
-  const dsIx = declStructNodeOf(stmts, name)
-  if dsIx >= 0 {
+function collectVariantFields(stmts: i32[], ty: i32) {
+  // The arm's type decides: a declared struct records its declaration's fields, found by the
+  // type's declared name; any other record (inline, or an intersection) records its type's.
+  const dn = structNameOfTy(ty)
+  const dsIx = if dn != "" { declStructNodeOf(stmts, dn) } else { -1 }
+  if dsIx < 0 { return collectShapeVariantFields(ty) }
+  {
     const s = nodeAt(dsIx)
     if s is TypeDecl {
-      if s.tdName == name {
+      if s.tdName == dn {
         uFieldStart.push(armStageNames.length)
         const fields0 = s.tdFields
         // D622 — the canonical field order: cross-table twin tests compare field codes
@@ -7673,7 +7651,7 @@ function registerInlineUnionGo(
   if isUNameKeyAB(site, ty) && unNameAdoptTyKeyRow(name, ty) { return 0 }
   // A value union (`i32 | null`, `i32 | f64`) registers the name alone: its members are scalar
   // atoms riding shared value boxes, so it owns no variant structs and its slice is empty.
-  if isValueUnionTyOr(sty) == 1 || riuValueOfBases(sty) {
+  if valueBoxOfTy(sty) || riuValueOfBases(sty) {
     return registerValueUnionOfTy(55, sty)
   }
   // A map member of a 2+-member union rides the variant box, registered via `isVariantBoxUnion`
@@ -8903,7 +8881,7 @@ export function collectU(stmts: i32[]) {
   repDeclRowsPending([])
   // The declared-struct-name index, rebuilt here rather than memoised: a second module in the
   // same instance can present a statement list of the same length, which the index's own
-  // stamp cannot see. Every `isStructAtom` ask in this pass and in mono's reads it.
+  // stamp cannot see. Every struct-variant ask in this pass and in mono's reads it.
   declStructIndexBuild(stmts)
   // The first emit pass, so this is the first thing in the emitter that would walk a
   // declared type — reject the ones no renderer can finish before any of them tries.
@@ -8989,7 +8967,7 @@ export function collectU(stmts: i32[]) {
         // A `??` that joins into a value union (`x ?? 2.5` over `i64 | null`) spells that union
         // nowhere, and a consumer with no annotation of its own reads the box (D3513).
         const cty = nodeTyIxOf(ipu)
-        if cty >= 0 && tyAt(cty) is TyUnion && isValueUnionTyOr(cty) == 1 {
+        if cty >= 0 && tyAt(cty) is TyUnion && valueBoxOfTy(cty) {
           if collectTyReachRegister(stmts, cty, 16, false) < 0 { return -1 }
         }
         // A hole's `??` reads at each instance's binding, which no node records, so its join is
@@ -9167,17 +9145,17 @@ function mintVariantRows(
   // Only struct members occupy variant slots; a `null` rides the tag and a value-atom tags
   // via `scalarTagOfKind` into the shared value boxes.
   let nStructs = 0
-  for n in names {
-    if n != "null" && isStructAtom(stmts, n) { nStructs = nStructs + 1 }
+  for t in tys {
+    if t >= 0 && tyAt(t) is TyObj { nStructs = nStructs + 1 }
   }
   unVarCount.push(nStructs)
   let i = 0
   while i < names.length {
-    if names[i] != "null" && isStructAtom(stmts, names[i]) {
+    if tys[i] >= 0 && tyAt(tys[i]) is TyObj {
       uVariantsPush(names[i])
       uVarTyIx.push(tys[i])
       uVarMemPos.push(pos[i])
-      if collectVariantFields(stmts, names[i], tys[i]) < 0 { return -1 }
+      if collectVariantFields(stmts, tys[i]) < 0 { return -1 }
       if armsAdopted {
         if armAdopt(uVariants.length - 1, sNames.length) < 0 { return -1 }
         armStageClear()
@@ -9279,7 +9257,7 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   if dty >= 0 {
     const kr = unRowOfTyKey(dty)
     if kr >= 0 {
-      const plain = isValueUnionTyOr(dty) == 1 || tyIsLitUnion(dty)
+      const plain = valueBoxOfTy(dty) || tyIsLitUnion(dty)
       if (
         (plain && unVarCount[kr] == 0)
         || (!plain && unionArmsAreRecordsOrScalars(dty) && declArmsMatchRow(s, kr))
@@ -9691,7 +9669,7 @@ function nulCloMixedUnionUnregisteredTy(ty: i32) {
   }
   if !hasScalar || !hasComposite { return false }
   if unRowOfTyKey(rt) >= 0 { return false }
-  if isValueUnionTyOr(rt) == 1 { return false }
+  if valueBoxOfTy(rt) { return false }
   if tyIsMapMemberUnion(rt) { return false }
   true
 }
