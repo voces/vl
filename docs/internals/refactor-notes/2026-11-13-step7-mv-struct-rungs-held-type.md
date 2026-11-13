@@ -34,5 +34,5 @@ these rows are records.
 
 | instrument | result |
 | --- | --- |
-| full sweep, base `baaf17797` against this change, both fixpoint seeds | SWEEP_RESULT |
-| fast set on the same tree | FASTSET_RESULT |
+| full sweep, base `baaf17797` against this change, both fixpoint seeds | 24,224 same; 0 bytes-only movers; 0 output movers; 0 runs → not-runs; 0 new traps |
+| fast set on the same tree | all green (lint-self clean, regress, filed witnesses, late demands, seed size, comment, ladder, sentinel, scan, render-parse and export ratchets); `vl_row_classes` 19 passed |
