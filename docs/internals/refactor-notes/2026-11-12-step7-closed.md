@@ -42,7 +42,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `32ab5241`, 2026-11-13 08:15)
+## Still failing at this draft (master `23e03fce`, 2026-11-13 09:10)
 
 The close is opened when this list is empty, or holds only items with an open PR. Closed since
 the 23:00 draft: lane D's mono rows (#7681, #7688, #7699, #7708, #7710), lane F's `sFieldRefSlot`
@@ -75,7 +75,7 @@ graded:
 The census's other five renders are all in one function, `nodeArrayElemName`
 (check_emit_queries:742, 764, 768, 772, 791). It renders an array literal's element type to a name,
 and emit_shape_rows' `arrLitBoxElemName` (2 callers) and `arrLitElemRender` (8 callers) consume
-that name. Graded a floor under the spelling-index contract by lane A's canonical-key probe (#7760, pending): no duplicate row carries its key. It moves to the floors when #7760 lands. The probe's one-type-two-rows cases are filed as D16000 (`unNames`, lane G) and D16001 (ref-list, lane A), and both block the close.
+that name. Graded a floor under the spelling-index contract by lane A's canonical-key probe (#7760, merged): no duplicate row carries its key. The probe's one-type-two-rows cases are filed as D16000 (`unNames`, lane G) and D16001 (ref-list, lane A), and both block the close.
 
 Of the 13 renders, six are floors and seven block the close.
 
@@ -118,6 +118,8 @@ is the checker's job. A checker parse reached from emit whose input the emitter 
 (`synthTypeRefFb` → `recordClonedNodeTyFb`) is in scope, whatever file holds the parser. Lane I
 then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
 §3.3's sentence "parses no type spelling back" waits on that.
+
+**On master `23e03fce`:** 47 render or synthesized parses, 12 source, 40 unclassified, 13 renders. Since 08:15: P1 parts 1 and 2 (#7752, #7770), P4's `gaeEnsure` and gates (#7757), P6 (#7761, #7769), `arenaEmitName` down to 4 callers (#7763), G's literal-arm question (#7766), and `nodeArrayElemName` graded a floor (#7760; D16000 and D16001 filed).
 
 **On master `32ab5241`:** 61 render or synthesized parses, 12 source, 52 unclassified, 13 renders (#7751 P4, #7754 G's literal-arm column, #7755, #7756 E's field split, #7758 B since 07:15). `shapeWalkKeyOf` still decides: `ln == kn` picks the by-declaration path, and `ln` reaches `gaeEnsure`'s parse and the interner's key. It goes to F for deletion after A's #7757 lands `gaeEnsure(ty)`; #7757's note gives the replacement for the `kn` guard.
 
