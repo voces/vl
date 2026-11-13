@@ -1,3 +1,0 @@
-## Type system (Track A)
-
-- **A cloned pin's node is typed by the type its spelling was minted at, not by parsing the spelling (step 7, D6).** For a tagged set, a list of its ids or an id map, the type is derived from the pin's own type. A hole parameter keeps the type `monoArgPinName` already computed, which it used to discard. `recordClonedNodeTyFb` no longer calls `nameToTy`. A plain pin with no carried type is now a loud floor, and withholding the derived type makes it fire in 127 programs. D16022's carried fallback keeps its one parse, at its own arm. No behaviour change: all 24,221 sweep programs are byte-identical.
