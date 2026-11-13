@@ -814,7 +814,6 @@ import {
   mvValRep,
   nestedNameBySid,
   rlElemName,
-  rlElemNullable,
   rlElemTyIx,
   rlListOfRowMint,
   sFieldCount,
@@ -939,7 +938,6 @@ import {
   sidOfNode,
   sidText,
 } from "./symbols"
-import { peelGroupParens } from "./tyname"
 import { recNarrowRecordOf, recRepWidens } from "./check_bind_adopt"
 import {
   recEnclosingFn,
@@ -13534,9 +13532,10 @@ export function identLetOfRead(readIx: i32, fnIx: i32) {
   -1
 }
 
-// The function-type annotation name (`(f64)=>f64`) of the `let`/`const`/global binding the read
-// `readIx` in `fnIx` resolves to, or "" when it is not a function-typed binding.
-export function identFnTypeAnnNameOfRead(readIx: i32, fnIx: i32) {
+// Whether the `let`/`const`/global binding the read `readIx` in `fnIx` resolves to is
+// function-typed: by annotation, by a nullable-closure annotation, by an init the arena types as
+// a function and can spell, or as a closure element of a ref list.
+export function identReadIsFnAnnotated(readIx: i32, fnIx: i32): boolean {
   if fnIx >= 0 && readIx >= 0 {
     const fn = nodeAt(fnIx)
     if fn is FuncDecl {
@@ -13548,49 +13547,36 @@ export function identFnTypeAnnNameOfRead(readIx: i32, fnIx: i32) {
       if li >= 0 {
         const d = nodeAt(li)
         if d is LetDecl {
-          if tyIsFuncType(d.letType) { return tyNameOf(d.letType) }
-          // A nullable-closure annotation (kind 19): return its name so a narrowed call
-          // through a null-seeded binding resolves its sig even with no closure value to trace.
-          if nulCloFlag(d.letType) == 1 { return tyNameOf(d.letType) }
+          if tyIsFuncType(d.letType) { return true }
+          // A nullable-closure annotation (kind 19) counts, so a narrowed call through a
+          // null-seeded binding resolves its sig even with no closure value to trace.
+          if nulCloFlag(d.letType) == 1 { return true }
           // An un-annotated closure local from a call result: recover the function type from
           // the checker's recorded init type — a bare lambda instead trusts its own lifted sig.
           if d.letType < 0 && d.letInit >= 0 {
             const ini = nodeAt(d.letInit)
             if ini is Call {
-              // The arena test before the render: the two conditions are ANDed, so this builds
-              // the name only for an init the arena already agreed is a function type.
+              // A function type the arena holds but cannot spell is not one a call can resolve
+              // a sig through: it falls to the arms below rather than answering here.
               if nodeTyIsFunc(d.letInit) {
-                const itn = nodeTyName(d.letInit)
-                if itn != "" { return itn }
+                if nodeTyName(d.letInit) != "" { return true }
               }
             }
             // A copy of another closure binding: the init is a bare Ident, so its checked type
             // is authoritative (unlike a lambda's inferred return, which can disagree).
             if ini is BinExpr {
               if ini.binOp == "??" {
-                // The arena test before the render, as the Call arm above: builds the name
-                // only for an init the arena already agreed is a function type.
-                if nodeTyIsFunc(d.letInit) {
-                  const jtn = nodeTyName(d.letInit)
-                  if jtn != "" { return jtn }
-                }
+                if nodeTyIsFunc(d.letInit) { return true }
               }
             }
-            // An un-annotated binding read from a closure-element ref list: the kind-5 slot's
-            // element name is the function type — return it so a call resolves the element's real sig.
+            // An un-annotated binding read from a closure-element ref list: the kind-5 slot
+            // holds the element's function type, which a call resolves its real sig through.
             if ini is Index {
               if exprRefArray(ini.idxArr, fnIx) {
                 const islot = refListSlotOfExpr(ini.idxArr, fnIx)
                 if islot >= 0 && islot < rlElemTyIx.length {
                   if rlElemKindAt(islot) == RLK_CLOSURE {
-                    const enm = rlElemName[islot]
-                    if (
-                      islot < rlElemNullable.length
-                      && rlElemNullable[islot] == 1
-                    ) {
-                      return enm
-                    }
-                    return peelGroupParens(enm)
+                    return rlElemName[islot] != ""
                   }
                 }
               }
@@ -13606,12 +13592,12 @@ export function identFnTypeAnnNameOfRead(readIx: i32, fnIx: i32) {
   if gi >= 0 {
     const gd = nodeAt(gi)
     if gd is LetDecl {
-      if tyIsFuncType(gd.letType) { return tyNameOf(gd.letType) }
+      if tyIsFuncType(gd.letType) { return true }
       // The dual of the local nulclosure-annotation arm above.
-      if nulCloFlag(gd.letType) == 1 { return tyNameOf(gd.letType) }
+      if nulCloFlag(gd.letType) == 1 { return true }
     }
   }
-  ""
+  false
 }
 
 // The identifier node the un-annotated binding the read `readIx` resolves to copies, or -1: the
@@ -13684,8 +13670,7 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   // Positioned throughout (D2316): two sibling FUNCTION-scoped blocks binding one name are as
   // ambiguous unpositioned as two sibling module-scoped ones (D1751).
   const csid = sid
-  const an = identFnTypeAnnNameOfRead(atIx, fnIx)
-  if an != "" {
+  if identReadIsFnAnnotated(atIx, fnIx) {
     // The arena builds the key where the binding carries a plain annotation; `cloNameSigKeyTy`
     // is the fall-through over the joined or callee type. B255.
     const jnd = identFnTypeAnnNodeOfRead(atIx, fnIx)
