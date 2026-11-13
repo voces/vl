@@ -32,6 +32,8 @@ lanes' armed instruments still read them.
 ## Proof
 
 - **Seed:** fixpoint; 355 lines deleted.
-- **Locally:** lint-self, the dead-export scan (0), regress, rep-fuzz.
+- **Locally:** lint-self, the dead-export scan (0), regress (no runs lost), rep-fuzz (exact),
+  check-filed-witnesses `--strict` (4,867 graded, 0 moved), late-demands (8, baseline 8), seed-size
+  (+1.6%, down from +1.8%), and the comment, ladder, sentinel and scan budgets.
 - **The full sweep:** CI's `sweep` label. Unarmed, every deleted path was a no-op, so the
   expectation is identity.
