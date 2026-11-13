@@ -1,6 +1,6 @@
 import { mapStoredTyOf } from "./check_fn_tag_facts"
 import { cUserTypes } from "./check_types"
-import { widenLitTy } from "./check_relate_core"
+import { storageNormTy, widenLitTy } from "./check_relate_core"
 import { unionTyArms } from "./emit_map_twins"
 import { REC_STORE_DEPTH } from "./check_ty_relate"
 import { registeredUnionRowOfTy } from "./emit_start_block"
@@ -367,6 +367,7 @@ import {
   elabHoldsRecordAnywhere,
   elabHoleFnClosed,
   elabKeyAtPos,
+  elabListFnElemTy,
   elabNarrowedFromAt,
   elabNodeTyAt,
   elabPlaceRecordAt,
@@ -644,7 +645,9 @@ import {
   arrLitNominalElemName,
   arrLitNominalRowTy,
   arrLitNulRefElemName,
+  deepDeclRecName,
   emptyArrLitIxOf,
+  fnElemNominalName,
   heldListElemTy,
   mapCtorShapeOf,
   mapFindShapeOfNodeTy,
@@ -665,6 +668,7 @@ import {
   rlSlotOfTyOrTwin,
   sFieldMapShape,
   sFieldRefSlot,
+  sigFuncDeeperThan,
   structIndexOfNullPartTy,
   structRowOfRecordTy,
   structRowOfValueTy,
@@ -7130,8 +7134,8 @@ function arrLitElemNameTpl(arrIx: i32): string {
 }
 
 // The type `arrLitElemName(arrIx, -1)`'s answer is built from, where its template rung builds the
-// name from a type it holds; -1 where the name itself keeps the row key: a struct row's handle, a
-// closure, nested-list or nullable render that normalizes the type (D16013), or an outer rung.
+// name from a type it holds; a render rung answers that type normalized as its render normalizes
+// it (`storageNormTy`). -1 where the name keeps the row key: a struct row's handle or an outer rung.
 export function arrLitElemKeyTy(arrIx: i32): i32 {
   if arrLitArenaRecElem(arrIx) >= 0 || arrLitFrameRefTy(arrIx, -1) >= 0 {
     return -1
@@ -7145,7 +7149,10 @@ export function arrLitElemKeyTy(arrIx: i32): i32 {
 // `arrLitElemNameTpl`'s ladder, rung for rung, answering the type a rung's name denotes.
 function arrLitElemKeyTyTpl(arrIx: i32): i32 {
   const a = nodeAt(arrIx)
-  if !(a is ArrayLit) || arrElemIsClosureTy(arrIx, -1) { return -1 }
+  if !(a is ArrayLit) { return -1 }
+  if arrElemIsClosureTy(arrIx, -1) {
+    return storageNormTy(arrLitClosureElemTy(arrIx))
+  }
   if a.arrElems.length >= 1 {
     const e0 = nodeAt(a.arrElems[0])
     if e0 is ArrayLit {
@@ -7197,7 +7204,37 @@ function arrLitElemKeyTyTpl(arrIx: i32): i32 {
   }
   const ann = arrLitNominalElemName(arrIx, -1)
   if ann != "" { return cUserTypes[ann] ?? -1 }
+  if arrLitNestedElemName(arrIx, -1) != "" {
+    const held = heldListElemTy(arrIx)
+    return storageNormTy(
+      if held >= 0 { held } else { tyArrayElemIx(nodeTyAt(arrIx, -1)) },
+    )
+  }
+  if arrLitNulRefElemName(arrIx, -1) != "" {
+    return storageNormTy(tyArrayElemIx(nodeTyAt(arrIx, -1)))
+  }
   -1
+}
+
+// The function type `arrLitElemRender` renders a closure element of list literal `arrIx` from: the
+// element type, else the signature every instance builds it at, else the opaque stub (D1794, D4123).
+function arrLitClosureElemTy(arrIx: i32): i32 {
+  const ty = nodeTyAt(arrIx, -1)
+  if ty >= 0 && ty < T.tys.length {
+    const t = tyAt(ty)
+    if t is TyArray {
+      if deepDeclRecName(t.aElem) != "" { return t.aElem }
+      if tyIsFuncOrNulFunc(t.aElem) && sigFuncDeeperThan(t.aElem, 8) {
+        if fnElemNominalName(t.aElem) != "" { return t.aElem }
+      }
+    }
+  }
+  const e = tyArrayElemIx(nodeTyIxOf(arrIx))
+  if e < 0 || e >= T.tys.length || !(tyAt(e) is TyFunc) { return e }
+  if !tyHasTyVar(e) { return e }
+  const fe = elabListFnElemTy(arrIx)
+  if fe >= 0 { return fe }
+  mkFuncTy([], TY_VOID)
 }
 
 // The list type a `scalarListRowOfElem` row name denotes, one of its four answers.
