@@ -2,17 +2,31 @@
 // under different tags fit each other.
 
 import { i32ToStr } from "./ast"
+import { emitFail } from "./emit_bytes"
 import {
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
   TyMap,
+  TyNeg,
+  TyNullable,
   TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  litBaseTy,
+  nomNameOfTy,
   tyAt,
   tyEqSoftLits,
   tyFieldTyOf,
   tyIsLitUnionOrLit,
+  tyIsPrimNamed,
   tyIsRecord,
   tyPrimNameOf,
-  tyToStr,
+  tySame,
 } from "./check_types"
+import { armDeclSame } from "./emit_rep"
 import {
   armRowIsPlainI32,
   armRowIsStr,
@@ -25,7 +39,6 @@ import {
   armFieldElemSame,
   armFieldLitTyIx,
   armFieldNames,
-  armFieldTyText,
   armFieldTypes,
   uFieldCount,
   uFieldStart,
@@ -180,9 +193,9 @@ function variantRowsTagEqual(a: i32, b: i32): boolean {
     const fa = variantFieldArenaBase(a, name)
     const fb = variantFieldArenaBase(b, name)
     if fa < 0 || fb < 0 {
-      if variantFieldBaseKey(a, ra) != variantFieldBaseKey(b, rb) {
-        return false
-      }
+      // Every variant row has a record type since rows are minted by type (D16030).
+      emitFail(VARIANT_FIELD_UNTYPED_MSG)
+      return false
     } else if tyFitKind(fa, fb) != 1 || tyFitKind(fb, fa) != 1 {
       if !fieldTysRolledAlike(a, b, fa, fb) { return false }
     }
@@ -342,21 +355,6 @@ function recvCanHold(holds: i32[], yTy: i32): boolean {
   false
 }
 
-// The base half of one field row's tag key: a literal set's softened scalar, else the row's type text.
-function variantFieldBaseKey(vi: i32, r: i32): string {
-  if r < 0 || r >= armFieldTyText().length { return "" }
-  if r < armFieldLitTyIx().length && armFieldLitTyIx()[r] >= 0 {
-    const b = litSetBaseTy(armFieldLitTyIx()[r])
-    if b >= 0 { return tyToStr(b) }
-  }
-  if vi >= 0 && vi < uVarTyIx.length && r < armFieldNames().length {
-    const ft = tyFieldTyOf(uVarTyIx[vi], armFieldNames()[r])
-    const ab = litSetBaseTy(ft)
-    if ab >= 0 { return tyToStr(ab) }
-  }
-  armFieldTyText()[r]
-}
-
 // Can variant field ROW `ix` carry the interned-atom rep? Code 0 already does; code 3 is the
 // inline spelling of the same members and can be made to. Any other code is a different
 // storage entirely and is not this seam.
@@ -366,15 +364,138 @@ export function litFieldRowIsAtomisable(ix: i32): boolean {
   tyIsLitUnionOrLit(armFieldLitTyIx()[ix])
 }
 
-// Is variant field row `ix` a plain `string` — the base a string literal set softens to?
-// Three columns, since no one alone says it: the code is shared with every string-slot
-// field, the discriminant column parts a set from a non-set, and the identity column keeps
-// a nominal `type Id = new string` from being read as the base its brand is distinct from.
+const VARIANT_FIELD_UNTYPED_MSG = "emitProgram: a union variant's field has no arena type to compare its rows by"
+
+// The variant whose field run holds row `r`, or -1.
+function rowVariantOf(r: i32): i32 {
+  let v = 0
+  while v < uFieldStart.length && v < uFieldCount.length {
+    if r >= uFieldStart[v] && r < uFieldStart[v] + uFieldCount[v] { return v }
+    v = v + 1
+  }
+  -1
+}
+
+// Whether field type `ft` is the plain `string` base, not a nominal `type Id = new string`.
+export function tyIsPlainString(ft: i32): boolean {
+  tyIsPrimNamed(ft, "string") && nomNameOfTy(ft) == ""
+}
+
+// Whether variant field rows `ra` and `rb` are identical fields: fields are identical when they
+// store alike, and a number literal inside a union or nullable stores as its base (`1 | 2` as
+// `i32`). A lone literal and a string set keep their identity.
+export function variantRowFieldTysSame(ra: i32, rb: i32): boolean {
+  const fa = variantRowFieldTy(ra)
+  const fb = variantRowFieldTy(rb)
+  if fa < 0 || fb < 0 {
+    emitFail(VARIANT_FIELD_UNTYPED_MSG)
+    return false
+  }
+  if fa == fb { return true }
+  if !fieldTysSoftenAlike(fa, fb) { return oneFieldTy(fa, fb) }
+  const ma: i32[] = []
+  const mb: i32[] = []
+  softMembersInto(fa, ma, 8)
+  softMembersInto(fb, mb, 8)
+  if ma.length != mb.length { return false }
+  for x in ma {
+    if !softMemberIn(x, mb) { return false }
+  }
+  true
+}
+
+// Row `r`'s field type in its variant's record type, or -1.
+function variantRowFieldTy(r: i32): i32 {
+  const vi = rowVariantOf(r)
+  if vi < 0 || vi >= uVarTyIx.length || r >= armFieldNames().length {
+    return -1
+  }
+  if uVarTyIx[vi] < 0 { return -1 }
+  tyFieldTyOf(uVarTyIx[vi], armFieldNames()[r])
+}
+
+// One type under one declaration: twin records are one shape but two declarations.
+function oneFieldTy(a: i32, b: i32): boolean {
+  a == b || tySame(a, b) && armDeclSame(a, b)
+}
+
+// Whether field types `a` and `b` compare member by member with number literals softened: one
+// is a union or nullable, a number literal sits in either, and neither is a lone literal.
+function fieldTysSoftenAlike(a: i32, b: i32): boolean {
+  if !tyHasUnionShape(a) && !tyHasUnionShape(b) { return false }
+  if !tyHasNumLit(a, 8) && !tyHasNumLit(b, 8) { return false }
+  !(tyAt(a) is TyLit) && !(tyAt(b) is TyLit)
+}
+
+// Whether `ty` is a union or a nullable.
+function tyHasUnionShape(ty: i32): boolean {
+  match tyAt(ty) {
+    TyUnion | TyNullable => true
+    TyLit | TyPrim | TyFunc | TyObj | TyArray | TyMap | TyNeg | TyVar | TyErr => false
+  }
+}
+
+// Whether a non-string literal sits in `ty` or, through unions and nullables, its members.
+function tyHasNumLit(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyLit => t.litKind != "str"
+    TyNullable => tyHasNumLit(t.nInner, depth - 1)
+    TyUnion => {
+      for m in t.uMembers {
+        if tyHasNumLit(m, depth - 1) { return true }
+      }
+      false
+    }
+    TyPrim | TyFunc | TyObj | TyArray | TyMap | TyNeg | TyVar | TyErr => false
+  }
+}
+
+// `ty`'s members into `out`, flattened through unions and nullables, a number literal read as
+// its base and null as -2, each type once.
+function softMembersInto(ty: i32, out: i32[], depth: i32): i32 {
+  if ty < 0 || depth <= 0 { return 0 }
+  const t = tyAt(ty)
+  let m = ty
+  match t {
+    TyUnion => {
+      for u in t.uMembers { softMembersInto(u, out, depth - 1) }
+      return 0
+    }
+    TyNullable => {
+      softMembersInto(t.nInner, out, depth - 1)
+      m = -2
+    }
+    TyLit => {
+      if t.litKind != "str" { m = litBaseTy(t) }
+    }
+    TyPrim | TyFunc | TyObj | TyArray | TyMap | TyNeg | TyVar | TyErr => {}
+  }
+  if !softMemberIn(m, out) { out.push(m) }
+  0
+}
+
+// Whether softened member `m` is among `ms`, -2 matching only itself.
+function softMemberIn(m: i32, ms: i32[]): boolean {
+  for o in ms {
+    if o == m || o >= 0 && m >= 0 && oneFieldTy(o, m) { return true }
+  }
+  false
+}
+
+// Is variant field row `ix` a plain `string` — the base a string literal set softens to? The
+// code is shared with every string-slot field, the discriminant column parts a set from a
+// non-set, and the field's type parts a nominal `type Id = new string` from its base.
 function litFieldRowIsPlainString(ix: i32): boolean {
   if ix < 0 || ix >= armFieldTypes().length { return false }
   if !armRowIsStr(ix, false) { return false }
   if armFieldLitTyIx()[ix] >= 0 { return false }
-  armFieldTyText()[ix] == "string"
+  const vi = rowVariantOf(ix)
+  if vi < 0 || vi >= uVarTyIx.length || ix >= armFieldNames().length {
+    return false
+  }
+  tyIsPlainString(tyFieldTyOf(uVarTyIx[vi], armFieldNames()[ix]))
 }
 
 // The wasm struct field index of `field` within variant `vi` (declaration order), or
