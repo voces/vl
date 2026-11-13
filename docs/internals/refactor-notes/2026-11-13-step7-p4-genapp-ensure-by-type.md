@@ -33,6 +33,16 @@ there would re-enter the same walk without end, so the walk tests the fresh-walk
 type alone. The 6 are cyclic applications `genAppNameOfTy` declines; the collect caller keeps
 that gate, so they are unchanged.
 
+**What `kn != ""` stands for.** The guard still reads `kn`, the key hint `shapeWalkKeyOf`
+renders from, so that render cannot be deleted while the guard needs it. As a fact rather than
+a spelling, `kn` is `""` exactly when the type is already on `shapeWalkStack` from an outer
+frame (`shapeWalkName`): the walk is a re-entry under the structural key. Otherwise `kn` is
+the type's nominal name, which for a registered application is its application name and is
+`""` only for a cyclic one (`genAppNameOfTy` declines). The third source, the function-type
+walker's union delegate, hands its own non-empty key. So whoever deletes `shapeWalkKeyOf`
+replaces the guard with: `ty` is a registered, finite application and is not already on
+`shapeWalkStack` below this frame.
+
 **Sweep** (fixpoint seeds both sides, 24,207 programs): 24,207 same, 0 bytes-only movers,
 0 output movers, 0 runs → not-runs, 0 new compiler traps.
 
