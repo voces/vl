@@ -1473,8 +1473,8 @@ import {
   nliNameOf,
   unRowOfRecordTy,
   unionArmTyOfAtomTy,
-  unionClosureArmName,
   unionClosureArmTyOfRow,
+  unionClosureArmTyOfTy,
   unionHasMapArmSlot,
   unionHasRefArrayArmSlot,
   unionNestedArrayArmSlot,
@@ -8612,19 +8612,22 @@ function emitUnionNestedListLit(
   0
 }
 
-// The function type a closure carrier boxed into `unionName` tags as — the box side of
-// `cloArmTagOfTy`, whose test side is `isArmTagOfTy`.
-
-// The value's own checked type is the answer, not the union's arm: a union may carry several
-// function-typed arms, and taking the arm makes every one of them box under the first arm's tag
-// (D6). The union's own arm is the fallback, for a carrier the checker banked no function type
-// for; a union with one function arm tags the same either way. `u` is the union's row, or -1.
-function cloBoxArmTy(exprIx: i32, u: i32, unionName: string, fnIx: i32): i32 {
+// The function type a closure carrier boxes under (`cloArmTagOfTy`): its own checked type, not the
+// union's arm, since several function arms would otherwise all tag as the first (D6). -1 when the
+// checker banked none, and the caller falls back to the union's first function arm.
+function cloBoxOwnFnTy(exprIx: i32, fnIx: i32): i32 {
   const vt = nodeTyAt(exprIx, fnIx)
   if tyIxIsFunc(vt) { return vt }
   const bt = nodeTyAt(unwrapParen(exprIx), fnIx)
   if tyIxIsFunc(bt) { return bt }
-  unionClosureArmTyOfRow(u, unionName)
+  -1
+}
+
+// `cloBoxOwnFnTy`, else the first function-typed member of the union (row `u`, else `uname`).
+function cloBoxEqArmTy(exprIx: i32, u: i32, uname: string, fnIx: i32): i32 {
+  const own = cloBoxOwnFnTy(exprIx, fnIx)
+  if own >= 0 { return own }
+  unionClosureArmTyOfRow(u, uname)
 }
 
 // `emitUnionCoerce` lowers an expression coerced into the boxed union's representation (a
@@ -9679,9 +9682,10 @@ function emitUnionCoerceList(
   // box anyref directly, tagged by the closure arm's `scalarTagOf` (value-atom kind 11).
   // Checked before the ladder below, whose scalar branches would store the ref in a value box.
   if unionName != "" && exprIsClosure(exprIx, fnIx) {
-    const clArm = unionClosureArmName(unionName, uTy)
-    if clArm != "" {
-      fbI32Rel(RS_TAG, cloArmTagOfTy(cloBoxArmTy(exprIx, -1, unionName, fnIx)))
+    const clArm = unionClosureArmTyOfTy(unionName, uTy)
+    if clArm >= 0 {
+      const own = cloBoxOwnFnTy(exprIx, fnIx)
+      fbI32Rel(RS_TAG, cloArmTagOfTy(if own >= 0 { own } else { clArm }))
       if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx) // { tag, closure fat-pointer ref }
       return 0
@@ -10993,11 +10997,11 @@ function emitUnionConcreteEq(
   if eqOnce { fbLocalTee(eqStash) }
   fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
   // The CONCRETE operand's own arm type, through the very composition the BOX site uses
-  // (`cloBoxArmTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
+  // (`cloBoxOwnFnTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
   // actually writes.
   fbI32Rel(
     RS_TAG,
-    unionEqTagOfArmTy(eak, cloBoxArmTy(otherIx, unr[0], uname, fnIx)),
+    unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], uname, fnIx)),
   )
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
@@ -11033,7 +11037,7 @@ function emitUnionConcreteEq(
 
 // The tag has one home — `cloArmTagOfTy`, whose box side is `emitUnionCoerce` and whose test
 // side is `isArmTagOfTy`. This routes the compare through it too, so all three derive an arm's
-// tag from one render of one arena type; `cloBoxArmTy` names the caller split.
+// tag from one render of one arena type; `cloBoxOwnFnTy` names the caller split.
 function unionEqTagOfArmTy(k: i32, armTy: i32): i32 {
   if k == 11 { return cloArmTagOfTy(armTy) }
   scalarTagOfKind(k)
