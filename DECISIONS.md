@@ -938,6 +938,11 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   cross-brand `===` rejects like every mixed-brand operator. A list's identity is its
   `{backing, len, cap}` header's — §VL.7's header-less rep inherits that as a
   constraint. (A15)
+  **Reconfirmed by the owner 2026-11-13**, after the "VL has no `===`" diagnostic
+  (DV-1214) had told users otherwise: build `===`/`!==` as ruled, after step 7. `string`
+  stays refused — a string has no identity a program can rely on (literal sharing and
+  concatenation results are compiler choices), so `===` on it is a check error pointing
+  at `==`; any future identity on strings is a named std helper, never `===`. (D15975)
 - **Keys: `Map`/`Set` keys are STRUCTURAL, and key-eligible = `==`-comparable.** Every
   field kind `==` accepts keys — `f64`, lists, nested structs included; the key hash and
   `==` share ONE lowering (D1017 is why). Consequences recorded rather than
