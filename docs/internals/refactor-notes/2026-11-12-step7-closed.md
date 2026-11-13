@@ -42,7 +42,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `6b9f3f3c`, 2026-11-13 11:10)
+## Still failing at this draft (master `bf693a80`, 2026-11-13 12:10)
 
 **Closing census 5's failing column is empty** (coordinator, 2026-11-13). `internArmShapeRow`'s render is a floor: since #7768 it answers its type's row first, and the render only labels a row it mints, which no row choice reads. The rows below are the L2 work and the blockers filed since.
 
@@ -152,6 +152,14 @@ is the checker's job. A checker parse reached from emit whose input the emitter 
 then lists (a) and (b), renders included, by owner with counts, for the coordinator to split.
 §3.3's sentence "parses no type spelling back" waits on that.
 
+**On master `bf693a80`:** 36 render or synthesized parses, 7 source, 20 unclassified; 99 renders and 44 display renders. Since 11:10:
+- D16062 closed (#7789, PR 2).
+- The variant rows choose their fields by the arm's type and close D16030 (#7787). The arm's spelling (`uVariants[i]`) fails the canonical-key test in both directions, but nothing reads the table by name since #7737, so the spelling is a per-union position label and the table grades floor. `isStructAtom` is deleted.
+- `unionArmsAllSame` compares declarations, not renders (#7788, #7790: `armDeclSame`).
+- An arm mint interns its row at the arm's type (#7786).
+- Lane F deleted the census's unreached parse sites behind loud floors (#7759).
+- D16012 is filed (#7791). D16063 is filed, checker-only and carried past step 7 (#7792): three inferred-return namers decide value-union-ness by parsing the name they render, at check time.
+
 **On master `6b9f3f3c`:** 38 render or synthesized parses, 13 source, 37 unclassified; 100 renders and 44 display renders. Lane A's canonical-key test (#7782, `2026-11-13-step7-canonical-key-tests.md`) grades five render-keyed tables floor: ref-list (`rlElem*`, keyed by rep id), `unNames`, the mv slot keys, mono's instance keys, and the shape_rows element names (R4d). The variant-row table (`uVariants`) is lane E's, in E's PR. D16062 PR 1 (#7783) and `recordClonedIsVarTy`'s deletion (#7779) landed. `internArmShapeRow` (#7768) answers the row its type already has, and renders only to label a row it mints.
 
 **On master `39f3f015`:** 44 render or synthesized parses, 12 source, 36 unclassified; with #7764's widened render set, 101 renders and 44 display renders. D16000 (#7772) and D16001 (#7775) are closed. D16022 is filed (#7762). Lane H's #7776 counts programs that end in a refusal: `mapSoftTwinTagFail` now shows 2 programs (`generics/error-literal-union-map-twin-through-one-instance-plain-first.vl`), which settles the conflict; `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` stay at 0. New rows D16050 and D16051 (#7777): a union member's box code is a fact about its spelling. They block the close (coordinator: a rep decided by a spelling is what step 7 forbids) and close in lane G's later PR that switches the member-slice producer to `boxTagOfTy` together with its readers. Across #7776 the sites table moved in 197 rows, by reach counts and example strings only; no site changed origin class, and `mapSoftTwinTagFail` is the one site whose reach rose from 0.
@@ -223,7 +231,7 @@ The armed control is now byte-level. D12340's witness (7 lines) builds to a diff
 than unarmed (`cmp` differs), and both run correctly. The spares are D14739, D15099, D15151,
 D15241 and D15298. The close quotes that `cmp` on its own master, with a post-#7661 host and seed.
 
-## A spelling-keyed registry still standing: variant rows by the arm's spelling (lane E, a refuted swap)
+## A spelling-keyed registry graded: variant rows by the arm's spelling (lane E)
 
 `mintVariantRows` (emit_collect) counts and mints a variant row for each struct member with
 `isStructAtom(stmts, names[i])`, the spelling test (a declared struct name or an inline `{…}`). It
@@ -241,7 +249,7 @@ the spelling and an intersection spelling names no struct.
 
 The variant-row key passes lane A's canonical-key test or is re-keyed by type (position and type,
 as `variantIndexOf`'s retirement did). The owner follows from that result, likely lane B.
-`isStructAtom` and its emit_base spelling test go with it. So does `collectVariantFields` → `collectShapeVariantFields`: it dispatches on `nameIsShapeSpanEnds` of the arm's spelling and splits that spelling's fields, and although the record type supplies each field's name and type, `variantFieldIdText(ftxt, fldTy)` stores the field text as the variant table's identity column. It re-keys with `uVariantsPush(names[i])`, not apart from it. Ruling pending.
+`isStructAtom` and its emit_base spelling test go with it. So does `collectVariantFields` → `collectShapeVariantFields`: it dispatches on `nameIsShapeSpanEnds` of the arm's spelling and splits that spelling's fields, and although the record type supplies each field's name and type, `variantFieldIdText(ftxt, fldTy)` stores the field text as the variant table's identity column. It re-keys with `uVariantsPush(names[i])`, not apart from it. Resolved by #7787: the rows choose their fields by type, and the spelling is a position label nothing reads by name (floor).
 
 ## Floors held by a filed row
 
@@ -255,7 +263,8 @@ its witness runs as filed on master `54b68c07`. The close carries them forward.
 | [D16010](../inventory/D16010.md) | `sLitMintRow` | a hole instance's record literal has no elaborated type, so it builds at its minted row |
 | [D16060](../inventory/D16060.md) | `printUnionPlanCode`'s name fallback | a field read through an un-annotated parameter stays typed at the hole in its instance |
 | [D16061](../inventory/D16061.md) | the field recorder | an anonymous record handed to an un-annotated parameter keeps its field typed at the hole, so the recorder resolves the element's name |
-| [D16012](../inventory/D16012.md) (lands with lane B's PR; not on master at this draft) | `letDeclResolveAnnot`'s residual re-parse | it re-parses only when two bound type parameters share a name or a type variable survives `substTyDeep`, where substitution by name can answer a concrete but wrong type; a checker gap (`generics/nested-generic-shadowed-param-capture.vl`) |
+| [D16012](../inventory/D16012.md) | `letDeclResolveAnnot`'s residual re-parse | it re-parses only when two bound type parameters share a name or a type variable survives `substTyDeep`, where substitution by name can answer a concrete but wrong type; a checker gap (`generics/nested-generic-shadowed-param-capture.vl`) |
+| [D16063](../inventory/D16063.md) | three inferred-return namers (check time) | they decide value-union-ness by parsing the name they just rendered; checker-only |
 | [D16022](../inventory/D16022.md) | `monoArgTyNameRep`'s residual census site | a record-list literal argument with an open element type (a hole function or a type parameter) pins by its element's name; the pin must be chosen after the callee instance resolves, a mono reorder beyond step 7 (7 programs, all running, the scope loud) |
 
 ## The scoreboard re-baselined (exit criteria, coordinator rulings 2026-11-11)
