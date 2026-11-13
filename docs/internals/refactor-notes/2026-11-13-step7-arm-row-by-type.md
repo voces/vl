@@ -38,3 +38,21 @@ The three storage-widened programs move neither output nor bytes. The armed swee
 built after #7661: D12340's witness builds to different bytes armed and unarmed, and prints `6`
 both ways. A host from before #7661 reads the switch as absent, and its armed sweep measures
 nothing.
+
+**What the base did with these twins.** The row dump of
+`tests/cases/soundness/generic-identity-literal-into-union-beside-own-row.vl` shows the
+difference:
+- In the base, `J`'s type has two rows: a heapless `#ref1` and the `{r:i32|null}` row the arm
+  minted by label, which holds the heap.
+- After the cut, `#ref1` alone holds the heap, which the arm shares. The duplicate is gone.
+
+The arm's named twin (`variantStructHeapTwinAt`) now answers -1, because that lookup knows
+declared rows and `#anon` literal rows, not `#ref` rows. Pointing it at the type's own row
+instead left the twin heapless and produced an invalid module, so it is unchanged. Both sweeps
+show no module moves. `tests/vl_row_classes_test.ts`'s `rowOf` therefore falls back to the row
+whose heap type the arm shares, which is the module-level fact it pins.
+
+**The surviving render.** `tyToEmitName(aty)` (and `armMintRenderOf`) survives only on a fresh
+mint, when the arm's type has no row yet. There it is the new row's label, and
+`internInlineShapeFieldsTy` checks it with its `nameIsShapeSpanEnds` guard; no row choice reads
+it. Lane I grades it as a floor.
