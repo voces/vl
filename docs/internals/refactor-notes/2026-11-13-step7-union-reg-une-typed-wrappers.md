@@ -43,5 +43,8 @@ union. The other 613 are the function-value nullable, and 3 are named only by th
 
 ## Proof
 
-- **Seed:** fixpoint.
+- **Seed:** fixpoint, before and after merging #7714.
+- **Locally:** lint-self, regress (no runs lost), rep-fuzz (exact), check-filed-witnesses `--strict`
+  (4,865 graded, 0 moved), late-demands (8, baseline 8), seed-size (+1.9%), and the comment,
+  ladder, sentinel and scan budgets.
 - **The full sweep:** CI's `sweep` label. Movers expected among the 109; graded by output.
