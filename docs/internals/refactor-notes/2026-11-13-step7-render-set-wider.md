@@ -35,7 +35,7 @@ beside it. By renderer:
 | renderer | calls |
 | --- | --- |
 | `monoPinSpellShaped` | 35 |
-| `tyToNominalName` | 24 |
+| `tyToNominalName` | 22 |
 | `rlRowNameOfTy` | 15 |
 | `tyToEmitName` | 12 |
 | `unionSpellingOfTy` | 4 |
@@ -47,3 +47,25 @@ beside it. By renderer:
 By file, `emit_mono` has 37, the pin spellings. A renderer's own internal helpers outside its
 `At`/`Go` variants (`unionSpellingOfTy`'s member walk, say) are counted where they render; they
 are named here rather than exempted by a guess.
+
+## Regenerating the origins and the sites table at a fold
+
+From the checkout root, after `scripts/refresh-compiler.sh` has built `build/vl-compiler.wasm` from
+the folded tree (the script runs `sweep.vl -- list`, which writes the witnesses it probes):
+
+```sh
+deno run -A scripts/render-parse-origins.ts --seed build/vl-compiler.wasm --jobs 4
+```
+
+It writes `scripts/render-parse-origins.txt` and `docs/internals/render-parse-sites.md`. Then
+`deno run -A scripts/render-parse-origins.ts --check` exits 0, and the budget is rewritten from the
+regraded census:
+
+```sh
+vl run scripts/render-parse-census.vl --compiler build/vl-compiler.wasm -- --out "$TMPDIR/rp.json"
+vl check --budget scripts/render-parse-budget-baseline.json --findings "$TMPDIR/rp.json" --write-baseline
+```
+
+A regrade can move a site between `ty-string-parse` and `ty-parse-unclassified`, so the rewrite is
+part of the same commit.
+
