@@ -7864,9 +7864,9 @@ export function monoTagMapRepName(
 ): string {
   if t < 0 || t >= T.tys.length { return "" }
   const m = tyAt(t)
-  if m is TyMap { return "{[" + tyToStr(m.mKey) + "]: i32}" }
+  if m is TyMap { return monoPinSpellShaped(mapStoredTyOf(t)) }
   if !(m is TyObj) || !fnTagHoldsTy(t, 8) { return "" }
-  let k = "{"
+  const sts: i32[] = []
   let i = 0
   while i < m.objFieldNames.length && i < m.objFieldTypes.length {
     const f = m.objFieldTypes[i]
@@ -7894,10 +7894,10 @@ export function monoTagMapRepName(
     if sp == "" { return "" }
     codes.push(fieldCodeOfTy(st))
     texts.push(sp)
-    k = k + (if i > 0 { ", " } else { "" }) + m.objFieldNames[i] + ": " + sp
+    sts.push(st)
     i = i + 1
   }
-  k + "}"
+  monoPinSpellShaped(mkObjTy(m.objFieldNames, sts))
 }
 
 // Whether `t` is a map whose values are a tagged set's ids.
@@ -9415,7 +9415,7 @@ function monoMakeInstanceKeyOf(
 
 // `k.key` with each pin's spelling replaced by its kind and the canonical key of the type the
 // clone resolved it to, so two spellings of one type (`i32|string`, `string|i32`) share an
-// instance. A pin with no resolved type keeps its spelling.
+// instance. A pin the clone resolved no type for is refused.
 function monoTypedInstKey(
   origFe: i32,
   k: MonoInstKey,
@@ -9428,7 +9428,7 @@ function monoTypedInstKey(
   const heads: string[] = []
   let pk = 0
   while pk < pinned.length {
-    let pin = "S:" + pinned[pk]
+    let pin = ""
     if pk < pinnedTyIx.length && pk < pinKinds.length {
       if pinnedTyIx[pk] >= 0 {
         pin = i32ToStr(pinKinds[pk])
@@ -9443,6 +9443,12 @@ function monoTypedInstKey(
     if ht >= 0 && pk < pinKinds.length {
       const np = i32ToStr(pinKinds[pk]) + ":" + tyCanonKey(ht, TY_WALK_DEPTH)
       pin = np
+    }
+    if pin == "" {
+      emitFail(
+        "emitProgram: monomorphize: a pinned parameter has no resolved type to key its instance by",
+      )
+      return ""
     }
     heads.push(pin)
     pk = pk + 1
@@ -9590,12 +9596,12 @@ function monoSigPinHeadTy(t: i32): i32 {
   if monoPinTyIsFnSig(t) && monoTyClosedFn(t) { t } else { -1 }
 }
 
-// Typed instance key → the registry key of the instance first minted under it.
-let monoTypedKeys: {[string]: string} = Map()
+// Typed instance key → the registry row of the instance first minted under it.
+let monoTypedKeys: {[string]: i32} = Map()
 
-// Registry key → the instance its function is elaborated at, and its parameter pins.
-let monoKeyEk: {[string]: i32} = Map()
-let monoKeyPins: {[string]: i32[]} = Map()
+// Instance slot → the instance its function is elaborated at, and its parameter pins.
+let monoInstEk: {[i32]: i32} = Map()
+let monoInstPins: {[i32]: i32[]} = Map()
 
 // Binds each enclosing pin that has a spelling, and returns the key text naming them.
 function monoBindEnclosingPins(
@@ -9846,13 +9852,12 @@ function monoMakeInstanceGo(
           shValKey,
           tplCall,
           monoOrigNode[origFe],
-          monoKeyEk[hitAt] ?? -1,
+          monoInstEk.get(monoLastInstFe) ?? -1,
         )
       }
       return monoCadNoteInstance(
         origFe,
         monoLastInstFe,
-        k.key,
         cadDel,
         cadEncl,
         cbFnNames,
@@ -9900,13 +9905,14 @@ function monoMakeInstanceGo(
       pinnedTyIx,
     )
     k.key = instKey
-    const typedHit = monoTypedKeys.get(typedKey) ?? ""
+    const typedRow = monoTypedKeys.get(typedKey) ?? -1
+    const typedFe = if typedRow >= 0 && typedRow < monoInstFe.length { monoInstFe[typedRow] } else { -1 }
     // The instance registered under the typed key serves this request only where the two name the
     // same elaborated instance when both are known: one rep can carry two types whose bodies differ.
     const reqKey = if callKey >= 0 { callKey } else if valueKey >= 0 { valueKey } else { pinKey }
-    const hitKey = if typedHit != "" { monoKeyEk[typedHit] ?? -1 } else { -1 }
+    const hitKey = if typedFe >= 0 { monoInstEk.get(typedFe) ?? -1 } else { -1 }
     if (
-      typedHit != ""
+      typedFe >= 0
       && (reqKey < 0
         || hitKey < 0
         || elabInstSpelling(hitKey) == elabInstSpelling(reqKey))
@@ -9914,7 +9920,7 @@ function monoMakeInstanceGo(
       monoShPendFlush(shAt)
       if (
         monoMakeInstanceHit(
-          typedHit,
+          monoKeys[typedRow],
           origFe,
           pinned,
           pinTys,
@@ -9936,7 +9942,6 @@ function monoMakeInstanceGo(
         return monoCadNoteInstance(
           origFe,
           monoLastInstFe,
-          typedHit,
           cadDel,
           cadEncl,
           cbFnNames,
@@ -10116,10 +10121,12 @@ function monoMakeInstanceGo(
     if instFe < 0 { return monoBuildPop() - 1 }
     // REGISTER before walking the body, so a recursive self-call at the same
     // shape resolves here instead of recursing (the host's discipline).
-    if !monoTypedKeys.has(typedKey) { monoTypedKeys.set(typedKey, k.key) }
+    if !monoTypedKeys.has(typedKey) {
+      monoTypedKeys.set(typedKey, monoKeys.length)
+    }
     monoMakeInstanceRegister(k.key, origFe, instName, instFe, twoListTy)
     elabSlotNote(instFe, ek)
-    monoKeyEk[k.key] = ek
+    monoInstEk[instFe] = ek
     instKeyNote(
       origFe,
       fn.fnName,
@@ -10128,7 +10135,7 @@ function monoMakeInstanceGo(
       pinnedTyIx,
       callFrame,
       cbFnNames,
-      k.key,
+      instFe,
     )
     if repShadowOn && tplCall >= 0 {
       repABNote(
@@ -10137,8 +10144,8 @@ function monoMakeInstanceGo(
         if valueHalf { "value " + fn.fnName } else { "call" },
       )
     }
-    monoKeyPins[k.key] = pinnedTyIx
-    monoCadNoteInstance(origFe, instFe, k.key, cadDel, cadEncl, cbFnNames)
+    monoInstPins[instFe] = pinnedTyIx
+    monoCadNoteInstance(origFe, instFe, cadDel, cadEncl, cbFnNames)
     monoArmRowNote(calleeIx, instFe)
     monoNoteOpenArgs(calleeIx, instFe)
     if monoRegisterInstance() < 0 { return monoBuildPop() - 1 }
@@ -16834,7 +16841,7 @@ function monoCellValueTakeAt(
   // signature, so taking the write again agrees or wants a second type (D4843).
   const ife = monoLamInstanceNamed(x, ctx)
   if ife >= 0 {
-    if monoSlotSig(ife) == "" { return 2 }
+    if !monoSlotIsFn(ife) { return 2 }
     const had = mkFuncTy(monoInstParamPinTys(ife), TY_VOID)
     if monoFnTyParamsSame(had, tnameTy) { return 0 }
     return 1
@@ -22014,15 +22021,13 @@ function monoCellCall(
   if !viaAlias && cfe >= 0 && cfe < monoGen.length && monoGen[cfe] == 1 {
     monoLastInstFe = -1
     const rc = monoInstantiate(cfe, ix, ctx)
-    if monoLastInstFe >= 0 {
-      monoNoteBindSig(at, cctx, monoSlotSig(monoLastInstFe))
-    }
+    if monoSlotIsFn(monoLastInstFe) { monoNoteBindSig(at, cctx) }
     if rc < 0 { return -1 }
     return 1
   }
   // A cell seeded with a named generic is called at the instance this call's arguments take
   // of the seed, since retyping the cell rewrites the callee's recorded type (D3939, D3957).
-  let ctn = ""
+  let ctnOk = false
   let ctnTys: i32[] = []
   let ctnTy = -1
   const sfe = monoCellSeedGenFe(at, cctx)
@@ -22036,7 +22041,7 @@ function monoCellCall(
     const sr = monoInstantiate(sfe, ix, ctx)
     monoWriteCoercedCall = -1
     if sr < 0 { return -1 }
-    ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
+    ctnOk = monoSlotIsFn(monoLastInstFe)
     ctnTys = monoInstParamPinTys(monoLastInstFe)
     // The cell takes the instance's type: its recorded one, else its pins and elaborated result.
     const ifd = fnStmts[monoLastInstFe]
@@ -22051,13 +22056,23 @@ function monoCellCall(
       ctnTy = if r >= 0 { mkFuncTy(ctnTys, r) } else { -1 }
     }
   }
-  if ctn != "" && (live || sfe >= 0) {
+  if ctnOk && (live || sfe >= 0) {
     monoCoerceWrittenCell(at, cctx, ctnTys, ctnTy)
   }
-  // One cell holds one signature: a second call type is the binding conflict, refused.
-  let rc = 0
-  if ctn != "" && sfe >= 0 { rc = monoNoteBindDeliveryAt(at, ctn, cctx, -1) }
-  if rc < 0 { return -1 }
+  // The cell's call reaches it by name, which the coercion above retyped; one reaching no name
+  // has no binding to note the signature on.
+  if (
+    ctnOk
+    && sfe >= 0
+    && at >= 0
+    && monoIdentNameOf(at) == ""
+    && monoCellReadName(at) == ""
+  ) {
+    emitFail(
+      "emitProgram: monomorphize: a seeded cell's call reaches no binding to note its signature on",
+    )
+    return -1
+  }
   0
 }
 
@@ -23043,9 +23058,7 @@ function monoWalkIdentCall(
       const ri = monoInstantiate(fe, ix, ctx)
       monoWriteCoercedCall = -1
       monoArmCall = -1
-      if monoLastInstFe >= 0 {
-        monoNoteBindSig(n.callFn, ctx, monoSlotSig(monoLastInstFe))
-      }
+      if monoSlotIsFn(monoLastInstFe) { monoNoteBindSig(n.callFn, ctx) }
       // The call keeps its `call_ref` through a written `let`, so each generic written to it
       // takes the signature the elaboration instanced it at through this call (D3961).
       if ri >= 0 && !direct && monoLastInstFe >= 0 {
@@ -23670,7 +23683,7 @@ function monoNoteBindDeliveryCall(
     fe >= 0
     && fe < monoGen.length
     && monoGen[fe] == 1
-    && monoSlotSig(fe) != sig + ";"
+    && !monoSlotParamsAre(fe, sigTys)
     && monoWriteNamesLam(at, fe, ctx)
   ) {
     // One pinned at another signature: the delivered name takes the instance at this one, minted
@@ -23679,7 +23692,7 @@ function monoNoteBindDeliveryCall(
       return -1
     }
   }
-  monoNoteBindSig(at, ctx, sig + ";")
+  monoNoteBindSig(at, ctx)
 }
 
 // A hole lambda written as a literal where function type `annTy` is delivered is pinned there in
@@ -24180,8 +24193,7 @@ let monoDeliveredArgs: i32[] = []
 
 // Marks the binding read at `at` (a name or a capture cell's `d[0]`) in frame `ctx`, and every
 // binding its initializer chain names, as called, when the call has signature `sig`.
-function monoNoteBindSig(at: i32, ctx: i32, sig: string) {
-  if sig == "" { return 0 }
+function monoNoteBindSig(at: i32, ctx: i32) {
   let ax = at
   let fr = ctx
   let hops = 0
@@ -24913,22 +24925,13 @@ function monoRenameInitAt(
   if ce >= 0 { iv = ce }
   const fe = monoLamValueFe(iv, fx)
   if fe < 0 || fe >= nDecl || !monoWriteNamesLam(iv, fe, fx) { return 0 }
-  if monoInstantiatedAny(fe) && monoSlotSig(fe) == target { return 0 }
+  const targetTys = monoFnTyParamTys(targetTy)
+  if monoInstantiatedAny(fe) && monoSlotParamsAre(fe, targetTys) { return 0 }
   monoLastInstFe = -1
-  if (
-    monoInstanceFor(
-      fe,
-      monoSigPins(target),
-      iv,
-      -1,
-      [],
-      monoFnTyParamTys(targetTy),
-    )
-    < 0
-  ) {
+  if (monoInstanceFor(fe, monoSigPins(target), iv, -1, [], targetTys) < 0) {
     return -1
   }
-  if monoLastInstFe < 0 || monoSlotSig(monoLastInstFe) != target {
+  if monoLastInstFe < 0 || !monoSlotParamsAre(monoLastInstFe, targetTys) {
     emitFail(
       "monoRenameInitAt: the lambda this binding is initialized with has no instance at the signature it is called at",
     )
@@ -24975,13 +24978,38 @@ function monoWriteNamesLam(vx: i32, fe: i32, fx: i32): boolean {
   false
 }
 
-// The first-instance signature of lambda slot `fe`, as `p1,p2,;`.
-function monoSlotSig(fe: i32): string {
-  const pins: string[] = []
-  if !monoSlotParamPins(fe, pins) { return "" }
-  let out = ""
-  for pn in pins { out = out + pn + "," }
-  out + ";"
+// Whether slot `fe` is a function whose parameters are all plain parameters.
+function monoSlotIsFn(fe: i32): boolean {
+  if fe < 0 || fe >= fnStmts.length { return false }
+  const fn = nodeAt(fnStmts[fe])
+  if !(fn is FuncDecl) { return false }
+  for p in fn.fnParams {
+    if !(nodeAt(p) is Param) { return false }
+  }
+  true
+}
+
+// Whether slot `fe`'s parameters are typed exactly `tys`, an un-annotated one as `i32`. A parameter
+// whose annotation has no type is refused.
+function monoSlotParamsAre(fe: i32, tys: i32[]): boolean {
+  if !monoSlotIsFn(fe) { return false }
+  const fn = nodeAt(fnStmts[fe])
+  if !(fn is FuncDecl) { return false }
+  if fn.fnParams.length != tys.length { return false }
+  let i = 0
+  while i < fn.fnParams.length {
+    const p = nodeAt(fn.fnParams[i])
+    const t = if p is Param && p.parType >= 0 { nodeTyIxOf(p.parType) } else { TY_I32 }
+    if t < 0 {
+      emitFail(
+        "emitProgram: monomorphize: an instance's parameter annotation has no type to compare a signature with",
+      )
+      return false
+    }
+    if !tySame(t, tys[i]) { return false }
+    i = i + 1
+  }
+  true
 }
 
 // The parameter pins one `p1,p2,;` signature spells.
@@ -25223,34 +25251,6 @@ function monoLiftedDescendants(slot: i32): i32[] {
   out
 }
 
-// The concrete parameter spellings a lifted slot's declaration carries, appended to `out`
-// — an instance's pins, read the way `monoPinnedSigsOf` reads them, with `"i32"` for the
-// hole a count-0 all-i32 clone deliberately leaves un-annotated. false when the slot is
-// not a function declaration at all.
-function monoSlotParamPins(fe: i32, out: string[]) {
-  if fe < 0 || fe >= fnStmts.length { return false }
-  const fn = nodeAt(fnStmts[fe])
-  if fn is FuncDecl {
-    const ps = fn.fnParams
-    let i = 0
-    while i < ps.length {
-      const p = nodeAt(ps[i])
-      if p is Param {
-        if p.parType >= 0 {
-          out.push(tyNameOf(p.parType))
-        } else {
-          out.push("i32")
-        }
-      } else {
-        return false
-      }
-      i = i + 1
-    }
-    return true
-  }
-  false
-}
-
 // The built-closure row: one entry per closure mono builds, keyed by its creation site, the
 // instance whose body holds that site (-1 for none) and the closed signature it is built at,
 // answering the emitted slot. Columns are parallel; `monoCadRowWrite` is the only writer.
@@ -25450,7 +25450,6 @@ function monoCadBaked(cbFnNames: string[]): boolean {
 function monoCadNoteInstance(
   origFe: i32,
   fe: i32,
-  key: string,
   delivery: i32,
   encl: i32,
   cbFnNames: string[],
@@ -25466,9 +25465,9 @@ function monoCadNoteInstance(
   if lamInst < -1 { return 0 }
   let sig = cadFeSig.get(fe) ?? 0 - 2
   if sig < -1 {
-    let ret = elabRetOf(monoKeyEk.get(key) ?? -1)
+    let ret = elabRetOf(monoInstEk.get(fe) ?? -1)
     if ret < 0 { ret = monoCadCheckedRet(tpl) }
-    sig = monoCadSigOf(fe, monoKeyPins.get(key) ?? [], ret)
+    sig = monoCadSigOf(fe, monoInstPins.get(fe) ?? [], ret)
   }
   if lam { return monoCadRowWrite(elabSrcDecl(tpl), lamInst, sig, fe) }
   monoCadRowWrite(delivery, encl, sig, fe)
@@ -25589,9 +25588,9 @@ export function monomorphize(stmts: i32[]) {
   fnPosIndexDrop()
   monoKeys = []
   monoTypedKeys = Map()
-  monoKeyEk = Map()
+  monoInstEk = Map()
   instKeyReset()
-  monoKeyPins = Map()
+  monoInstPins = Map()
   monoInstOrig = []
   monoInstName = []
   monoInstFe = []
