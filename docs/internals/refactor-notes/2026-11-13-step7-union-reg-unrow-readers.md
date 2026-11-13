@@ -17,7 +17,9 @@ and the three this cut removes.
 
 ## Changed
 
-The three removals above. Unarmed, the emitted program is unchanged except where a caller passed
+The three removals above. They were the last callers of the A/B tally's writer, so `unABProbe`
+and `unABBump` (and the `UNAB_NOTY` code) are deleted too. The harness's report side
+(`unionRegistryABSweep`) stays, and now tallies nothing. Unarmed, the emitted program is unchanged except where a caller passed
 a spelling of the type's row other than its registered name; `boxDstName` now always answers
 the registered name.
 
