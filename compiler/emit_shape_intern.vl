@@ -56,7 +56,7 @@ import {
   shapeInnerFieldSplit,
 } from "./emit_base"
 import { emitFail } from "./emit_bytes"
-import { code0SpellingFitsRow, fieldCodeForMatch } from "./emit_field_codes"
+import { code0FieldsFitRow, fieldCodeForMatch } from "./emit_field_codes"
 import {
   fieldCloSigOf,
   fieldCloSigOfTy,
@@ -70,7 +70,7 @@ import {
   unionSetArmTysAB,
   unionTyArms,
 } from "./emit_map_twins"
-import { exactArmRowOfTy, variantIndexOf } from "./emit_local_slots"
+import { exactArmRowOfTy } from "./emit_local_slots"
 import { isNulScalarListFieldCode } from "./emit_nullable_rets"
 import {
   anonRowServes,
@@ -95,7 +95,6 @@ import {
   forceScalarListField,
   mapTyValKindLowerable,
   nameIsGenAppDecl,
-  nameIsStructDecl,
   nulRefListFieldCodeOfTy,
   repStructRowIsOrTwin,
   shapeFieldElemName,
@@ -379,11 +378,10 @@ function funcTypeFieldCodeSafe(c: i32): boolean {
 // `funcTypeShapeLowerable`. A nullable-struct element admits too, as the kind-1 struct niche.
 function structElemArrayLowerable(ty: i32): boolean {
   const eTy = tyPeelNul(tyStepElem(ty))
-  if eTy < 0 { return false }
-  let ln = tyToNominalName(eTy)
-  if ln == "" { ln = shapeWalkKeyOf("", eTy) }
-  if nameIsShapeOpen(ln) { return funcTypeShapeLowerable(eTy) }
-  nameIsStructDecl(ln) && variantIndexOf(ln) < 0
+  if eTy < 0 || !(tyAt(eTy) is TyObj) { return false }
+  if exactArmRowOfTy(eTy) >= 0 { return false }
+  if (cUserTypes[tyToNominalName(eTy)] ?? -1) >= 0 { return true }
+  funcTypeShapeLowerable(eTy)
 }
 
 // Whether record type `ty` lowers as a closure result or param with no unsupported composite
@@ -909,14 +907,18 @@ function iisPushFieldElem(
       codes[pi],
       shapeFieldRowOf(fieldsTy, names[pi]),
     )
-    // The field's own row, projected per code: the element's type, never its stored name,
-    // decides its row (D6).
+    // The field's own row, projected per code, else a `| null` literal union's non-null part:
+    // the element's type, never its stored name, decides its row (D6).
     let enTy = -1
     if en != "" {
-      enTy = shapeFieldElemRow(
-        shapeFieldRowOf(if tyIx >= 0 { tyIx } else { fieldsTy }, names[pi]),
-        codes[pi],
+      const enRow = shapeFieldRowOf(
+        if tyIx >= 0 { tyIx } else { fieldsTy },
+        names[pi],
       )
+      enTy = shapeFieldElemRow(enRow, codes[pi])
+      if enTy < 0 && tyIsLitUnionOrLit(tyPeelNul(enRow)) {
+        enTy = tyPeelNul(enRow)
+      }
     }
     sFieldElemName.push(en)
     recordSFieldElemRowTy(en, fkK, enTy) // D5 + B6b
@@ -1054,7 +1056,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
   let existing = -1
   if fieldsTy >= 0 { existing = structRowOfRecordTy(fieldsTy) }
   if existing < 0 {
-    existing = annShapeLayoutRowOf(names, codes, texts, tyIx, fieldsTy)
+    existing = annShapeLayoutRowOf(names, codes, tyIx, fieldsTy)
     // A field with no storage type has no layout key, and no spelling key stands in for it.
     if existing == -2 { return emitFail(IIS_SHAPE_FIELD_NO_LAYOUT_MSG) }
   }
@@ -1385,11 +1387,10 @@ function lSetSync() {
 function annShapeLayoutRowOf(
   names: string[],
   codes: i32[],
-  texts: string[],
   tyIx: i32,
   fieldsTy: i32,
 ): i32 {
-  layoutRowWalk(names, codes, texts, tyIx, fieldsTy)
+  layoutRowWalk(names, codes, tyIx, fieldsTy)
 }
 
 // The first row of shape `fieldsTy`'s layout, whoever's literal minted it: the row a field-set
@@ -1397,10 +1398,9 @@ function annShapeLayoutRowOf(
 export function layoutFirstRowOf(
   names: string[],
   codes: i32[],
-  texts: string[],
   fieldsTy: i32,
 ): i32 {
-  layoutRowWalk(names, codes, texts, -1, fieldsTy)
+  layoutRowWalk(names, codes, -1, fieldsTy)
 }
 
 // The first stored row of the layout typed shape `fieldsTy` has, in row order, keeping the
@@ -1409,7 +1409,6 @@ export function layoutFirstRowOf(
 function layoutRowWalk(
   names: string[],
   codes: i32[],
-  texts: string[],
   ownTy: i32,
   fieldsTy: i32,
 ): i32 {
@@ -1447,7 +1446,7 @@ function layoutRowWalk(
       }
       j = j + 1
     }
-    if ok && !code0SpellingFitsRow(names, texts, si) { ok = false }
+    if ok && !code0FieldsFitRow(fieldsTy, si) { ok = false }
     if ok && ownTy >= 0 && !anonRowServes(si, ownTy) { ok = false }
     if ok { return si }
     si = lSetNext[si]
