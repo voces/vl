@@ -163,6 +163,13 @@ the census does not count. It joins the render count, so there are 14 renders an
 Its six emit_collect callers go to E with P3 and D6, and `monoInstanceRetSpelling` goes to D with
 P6. `slotRowTyOf` (emit_rep:2780) goes to B with P5 (coordinator, 2026-11-13).
 
+## The opaque-sname arm (`VL_OPAQUE_SNAMES=1`)
+
+With the arm on, `runs → not-runs` is 0 (coordinator, 2026-11-13): no known program traps armed.
+The armed control is now byte-level. D12340's witness (7 lines) builds to a different module armed
+than unarmed (`cmp` differs), and both run correctly. The spares are D14739, D15099, D15151,
+D15241 and D15298. The close quotes that `cmp` on its own master, with a post-#7661 host and seed.
+
 ## Floors held by a filed row
 
 Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the site reads a name
