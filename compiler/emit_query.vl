@@ -5,8 +5,6 @@
 
 import { nodeTyIsMap, nodeTyIxOf, nodeTyPrimName } from "./check_node_tys"
 import { tyHasTyVar } from "./tyquery"
-import { inferRetFnKey } from "./check_side_rows"
-import { inferRetNameOf, inferRetTyIxOf } from "./check_infer_ret"
 import {
   T,
   TyArray,
@@ -69,7 +67,6 @@ import { cexLitPeel, intLitIsNegated } from "./check_num_lits"
 import {
   ALLOC_LIT_CHUNK,
   isConstInit,
-  pushUniqueAtom,
   setShapeOfTy,
   tyIsFuncType,
   tyNameOf,
@@ -78,11 +75,7 @@ import {
 import { nodeTyAt, numLitWidth } from "./emit_capture_frames"
 import { globalIndexBySid, globalStmts } from "./emit_state"
 import { declOrigOf, identDeclOf, sidArrGet, sidOfNode } from "./symbols"
-import {
-  boxAtomKindOfMemberTy,
-  nodeRepIs,
-  nodeTyIsNulScalarBox,
-} from "./emit_rep"
+import { nodeRepIs, nodeTyIsNulScalarBox } from "./emit_rep"
 
 // True if the read `readIx` is of a parameter of `fnIx` that is a nullable function value
 // (`fn | null`, kind 19).
@@ -740,123 +733,6 @@ export function globalHasTypeAnn(letIx: i32) {
   const d = nodeAt(letIx)
   if d is LetDecl { return d.letType >= 0 }
   false
-}
-// Function name -> the first `FuncDecl` the arena holds with it, over arena nodes
-// [0, `nliFnIndexLen`).
-let nliFnIndex: {[string]: i32} = Map()
-let nliFnIndexLen = 0
-
-// Empties the name index, for a new program.
-export function nliFnIndexReset() {
-  nliFnIndex = Map()
-  nliFnIndexLen = 0
-}
-
-// The first `FuncDecl` in the arena named `name`, or -1. The index covers an arena prefix and
-// extends as the arena grows; a hit whose node does not name `name` rebuilds it.
-function nliFirstFnNamed(name: string): i32 {
-  if nliFnIndexLen > P.nodes.length { nliFnIndexReset() }
-  const hit = nliFnIndex.get(name) ?? -1
-  if hit >= 0 {
-    const f = nodeAt(hit)
-    if f is FuncDecl && f.fnName == name { return hit }
-    nliFnIndexReset()
-  }
-  while nliFnIndexLen < P.nodes.length {
-    const f = nodeAt(nliFnIndexLen)
-    if f is FuncDecl && !nliFnIndex.has(f.fnName) {
-      nliFnIndex[f.fnName] = nliFnIndexLen
-    }
-    nliFnIndexLen = nliFnIndexLen + 1
-  }
-  nliFnIndex.get(name) ?? -1
-}
-
-// The value-union atom name of an if-arm's value ("i32", "boolean", "string",
-// "f64", "i64"), or "" when it is not classifiable at collection time (an ident, a
-// member read, …). A call RHS is classified by the callee's return type, read from the
-// arena since the fn tables are not built yet; its spelling is the atom returned.
-export function nliAtomOfExpr(exprIx: i32) {
-  if exprIx < 0 { return "" }
-  const e = nodeAt(unwrapParen(exprIx))
-  match e {
-    NumLit => {
-      return numLitWidth(unwrapParen(exprIx), -1)
-    }
-    StrLit => {
-      return "string"
-    }
-    BoolLit => {
-      return "boolean"
-    }
-    Call => {
-      if e.callFn < 0 || e.callFn >= P.nodes.length { return "" }
-      const callee = nodeAt(e.callFn)
-      if callee is Ident {
-        const ti = nliFirstFnNamed(callee.identName)
-        if ti < 0 { return "" }
-        const f = nodeAt(ti)
-        if f is FuncDecl {
-          let rn = tyNameOf(f.fnRet)
-          // An un-annotated callee is not an unknown callee: `tyNameOf` answers "" both
-          // for "no return type" and for "checker inferred one" (`inferRetIdx`, filled by
-          // `elaborateInferRets`), so falling back to `inferRetNameOf` here recovers the
-          // inferred name — `registerValueUnionName` is name-keyed, so a name is what it needs.
-          if rn == "" { rn = inferRetNameOf(inferRetFnKey(ti, f.fnName)) }
-          const rt = if f.fnRet >= 0 { nodeTyIxOf(f.fnRet) } else { inferRetTyIxOf(inferRetFnKey(ti, f.fnName)) }
-          const rk = if rt >= 0 { boxAtomKindOfMemberTy(rt) } else { -1 }
-          if rk >= 0 && rk != 6 { return rn }
-          return ""
-        }
-      }
-    }
-    // not classifiable at collection time
-    CharLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
-  }
-  ""
-}
-// Classifies one if-expression arm (`blockIx`, a one-statement Block) at registration
-// time — a static pre-pass, so only literal or annotated-call atoms resolve. Returns 1
-// for a bare `null` arm, 0 for a classified atom (pushed onto `atoms`), or -2 if the
-// arm is unclassifiable.
-function collectArmAtom(blockIx: i32, atoms: string[]) {
-  const v = ifArmValueExpr(blockIx)
-  if v < 0 { return -2 }
-  const bare = nodeAt(unwrapParen(v))
-  if bare is NullLit { return 1 }
-  const atom = nliAtomOfExpr(v)
-  if atom == "" { return -2 }
-  pushUniqueAtom(atoms, atom)
-  0
-}
-// Gathers the value atoms of every arm of the if-expression at `ifIx` into `atoms`
-// (deduped), recursing through an `else if` chain. Returns -2 if any arm is
-// unclassifiable, else 0/1 for whether a `null` arm or an else-less false path exists.
-export function ifExprCollectAtoms(ifIx: i32, atoms: string[]) {
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-  let hasNull = 0
-  let cur = ifIx
-  while cur >= 0 {
-    const s = nodeAt(unwrapParen(cur))
-    cur = -1
-    if s is IfStmt {
-      const t = collectArmAtom(s.ifThen, atoms)
-      if t == -2 { return -2 }
-      if t == 1 { hasNull = 1 }
-      if s.ifElse < 0 {
-        return 1 // else-less: the false path is null
-      }
-      if nodeAt(s.ifElse) is IfStmt {
-        cur = s.ifElse
-      } else {
-        const e = collectArmAtom(s.ifElse, atoms)
-        if e == -2 { return -2 }
-        if e == 1 { hasNull = 1 }
-        return hasNull
-      }
-    }
-  }
-  -2
 }
 // The node a parameter's type is read from: its annotation, else the parameter itself, whose
 // recorded type the checker inferred; -1 for an un-annotated parameter left an open hole.
