@@ -37,3 +37,12 @@ Each new floor has a forced control build that fires its message:
 
 Master vs PR over every program reaching any of the three sites, plus the spread tests: **1,627
 of 1,627 identical** (1,603 SAME, 24 SAME refusal).
+
+## Census
+
+- Type-string parses go from 36 to 35.
+- Ungraded parses stay at 36: two leave (the spread and `T[]` fallbacks), and the census moves
+  `arrElemSuffixed(aen)` (the D16022 floor) into this code.
+- `annSplitParams`' `tyTopLevelSplit` leaves.
+- Renders hold at 100. The slot pin's existing inline-record branch merges into the new by-type
+  spelling, so no render is added.
