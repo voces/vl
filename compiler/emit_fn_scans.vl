@@ -1,4 +1,4 @@
-import { unionTyArms } from "./emit_map_twins"
+import { unionTyMemberTys } from "./emit_map_twins"
 import { unMemIsMap } from "./emit_union_registry"
 import { emitFail } from "./emit_bytes"
 import { unionArmKindRowsOfExpr } from "./emit_classify"
@@ -82,6 +82,7 @@ import {
   tyIsLitUnionOrLit,
   tyIsNullableLitUnion,
   tyNulInnerTy,
+  tySame,
 } from "./check_types"
 import {
   listGetStagesOperand,
@@ -144,8 +145,7 @@ import {
   structIndexOfExpr,
   tyIsBareStrLit,
   unionBoxTyIxOfExpr,
-  unionNameOfExpr,
-  unionNameOfRead,
+  unionNameOfExprRow,
   unionNameRowOfRead,
 } from "./emit_classify"
 import {
@@ -192,7 +192,9 @@ import {
 import { ifArmValueExpr, paramTypeNodeOfRead } from "./emit_query"
 import { TK_STR, rlSlotIsKindList, tyKindOf } from "./emit_ref_list_kinds"
 import {
+  armDeclSame,
   boxAtomKindOfMemberTy,
+  boxTagOfTy,
   msMemberValKindsOf,
   nodeRepIs,
   nullValKind,
@@ -202,7 +204,7 @@ import {
 import {
   coalesceChainLeftmost,
   coalesceResultIsBox,
-  coalesceResultUnionName,
+  coalesceResultUnionNameRow,
   unionDeclTyIxOfExpr,
   unionTyIxOfIdentAt,
 } from "./emit_start_block"
@@ -224,8 +226,8 @@ import {
   armPathArenaDeclined,
   nodeTyUnionHasMapArm,
   unionArmTysOfRow,
-  unionHasMapArm,
-  unionHasMapArrayArm,
+  unionHasMapArmOfRow,
+  unionHasMapArrayArmOfRow,
 } from "./emit_union_atoms"
 import { StashWant, structIdxHasReboxVariant } from "./emit_union_casts"
 import {
@@ -234,20 +236,20 @@ import {
   msMemberAtomsOfSet,
   msMemberCount,
   msMemberTysOfSet,
+  msSetOfRowOr,
   msSetOfTy,
   msSetOfTyAny,
-  msSetOfUnion,
   msSetTakesAtomAsStr,
   printNarrowKeepsBox,
-  printNarrowLiveAtoms,
+  printNarrowLiveTys,
   printPlanNullPinned,
   printPlanPinNull,
   tyDeclTakesAtomAsStr,
   tyTakesAtomAsStr,
   unRowHasMapArm,
+  unionArmsOfRow,
   unionMemberAtomsOf,
 } from "./emit_union_registry"
-import { strListHas } from "./listutil"
 import { tyIsFnArmUnion, tyIsListUnion, tyStepElem, tyStepRet } from "./tyquery"
 
 // Classify the `.push` or `.pop` receiver at `objIx` into its PushKind bits with one classifier
@@ -1342,13 +1344,9 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
         if exprIsLitAtom(e.binRight, fnIx) { return true }
         if coalesceRetypedAtomToStr(exprIx, fnIx) { return true }
         // An atom operand boxed into a join holding it as its string, as the `if` arm below.
-        if (
-          msSetTakesAtomAsStr(
-            msSetOfUnion(coalesceResultUnionName(exprIx, fnIx)),
-          )
-        ) {
-          return true
-        }
+        const cr: i32[] = []
+        const cn = coalesceResultUnionNameRow(exprIx, fnIx, cr)
+        if msSetTakesAtomAsStr(msSetOfRowOr(cr[0], cn)) { return true }
       }
       if exprHasStrOp(e.binLeft, fnIx) { return true }
       return exprHasStrOp(e.binRight, fnIx)
@@ -1391,11 +1389,15 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
       // The same widening reached through the arms, where the join records one arm's type.
       if ifJoinAtomMeetsString(exprIx, fnIx) { return true }
       // An atom arm boxed into a join whose union holds it as its string (`K|i32`, D2952).
-      if (
-        gLitUnionUsed != 0
-        && msSetTakesAtomAsStr(msSetOfUnion(coalesceResultUnionName(exprIx, fnIx)))
-      ) {
-        if ifChainHasAtomArm(exprIx, fnIx) { return true }
+      if gLitUnionUsed != 0 {
+        const jr: i32[] = []
+        const jn = coalesceResultUnionNameRow(exprIx, fnIx, jr)
+        if (
+          msSetTakesAtomAsStr(msSetOfRowOr(jr[0], jn))
+          && ifChainHasAtomArm(exprIx, fnIx)
+        ) {
+          return true
+        }
       }
       if blockHasStrOp(e.ifThen, fnIx) { return true }
       if e.ifElse < 0 { return false }
@@ -2197,16 +2199,16 @@ export function unionMapArmIdent(exprIx: i32, fnIx: i32) {
     const dr = if dt >= 0 { unRowOfTyKey(dt) } else { -1 }
     if dr >= 0 { return unRowHasMapArm(dr) }
     // A row-less union's own members answer, as the row's would.
-    const ra: string[] = []
     const rt: i32[] = []
-    if dt >= 0 && unionTyArms(dt, ra, rt) {
+    if dt >= 0 && unionTyMemberTys(dt, rt) {
       for m in rt {
         if unMemIsMap(m) { return true }
       }
       return false
     }
-    const un = unionNameOfRead(unwrapParen(exprIx), fnIx)
-    if un != "" { return unionHasMapArm(un) }
+    const unr: i32[] = []
+    const un = unionNameRowOfRead(unwrapParen(exprIx), fnIx, unr)
+    if un != "" { return unionHasMapArmOfRow(unr[0], un) }
     // The typed-IR fallback: a union binding whose name the syntactic resolution cannot
     // render still records the union on its node type. The emitter lowers the narrowed map
     // read regardless, so the frame pre-pass must reserve the map scratch from the same
@@ -2398,8 +2400,9 @@ export function unionMapArrayElemIndex(exprIx: i32, fnIx: i32) {
   if e is Index {
     const arr = nodeAt(unwrapParen(e.idxArr))
     if arr is Ident {
-      const un = unionNameOfRead(unwrapParen(e.idxArr), fnIx)
-      if un != "" { return unionHasMapArrayArm(un) }
+      const unr: i32[] = []
+      const un = unionNameRowOfRead(unwrapParen(e.idxArr), fnIx, unr)
+      if un != "" { return unionHasMapArrayArmOfRow(unr[0], un) }
     }
   }
   false
@@ -2487,6 +2490,29 @@ function printPlanSetTys(s: i32, n: i32, out: i32[]): boolean {
   false
 }
 
+// Whether member type `t` (`null` as -1) is one of the narrowing's live members: the same box
+// arm, read off the value box tag where both have one (a literal union rides its base's arm),
+// else the same type under the same declaration.
+function printPlanTyLive(live: i32[], t: i32): boolean {
+  const tk = printPlanArmTag(t)
+  for l in live {
+    const lk = printPlanArmTag(l)
+    if tk >= 0 || lk >= 0 {
+      if tk == lk { return true }
+    } else if tySame(l, t) && armDeclSame(l, t) {
+      return true
+    }
+  }
+  false
+}
+
+// The value box tag member type `t` rides under (`null`, spelled -1 or as its primitive, is 6),
+// or -1 for a member with no value tag (a record, a map, a list of records).
+function printPlanArmTag(t: i32): i32 {
+  if t < 0 { return 6 }
+  boxTagOfTy(t)
+}
+
 function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   // A read narrowed to `null` is printed from its box's tag, so the reservation scan and the
   // handler both plan the whole box with the narrowing lifted (D2801).
@@ -2510,10 +2536,11 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   if (!msMemberAtomsOfSet(sid, atoms) && !msMemberAtomsOfSet(storeSet, atoms)) {
     // D16060: a field read through an un-annotated parameter is typed at the hole, so only the
     // name rung that read the arms knows the members.
-    const nm = unionNameOfExpr(exprIx, fnIx)
+    const unr: i32[] = []
+    const nm = unionNameOfExprRow(exprIx, fnIx, unr)
     if nm == "" { return 0 }
-    unionMemberAtomsOf(nm, atoms)
-    nameSet = msSetOfUnion(nm)
+    if !unionArmsOfRow(unr[0], atoms) { unionMemberAtomsOf(nm, atoms) }
+    nameSet = msSetOfRowOr(unr[0], nm)
   }
   if atoms.length < 2 { return 0 }
   // The member types, index-parallel to `atoms`: the set's own, else the declared type's
@@ -2555,13 +2582,17 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   let bad = false
   let pinSkipped = 0
   const seen: i32[] = []
-  const live: string[] = []
-  printNarrowLiveAtoms(exprIx, fnIx, live)
+  const live: i32[] = []
+  const narrowed = printNarrowLiveTys(exprIx, fnIx, live)
   let i = 0
   while i < kinds.length {
     let k = kinds[i]
-    // A member the narrowing excluded is no arm of this read.
-    if live.length > 0 && !strListHas(live, atoms[i]) {
+    // A member the narrowing excluded is no arm of this read; past the member types is the
+    // appended map-miss `null`.
+    if (
+      narrowed
+      && !printPlanTyLive(live, if i < mtys.length { mtys[i] } else { -1 })
+    ) {
       i = i + 1
       continue
     }

@@ -683,7 +683,7 @@ import {
 } from "./emit_lit_atoms"
 import {
   mapTwinDropSlots,
-  unionTyArms,
+  unionTyMemberTys,
   variantFirstLayoutDisagreeField,
   variantLitRepMismatch,
   variantLitRepUnifiable,
@@ -814,7 +814,7 @@ import {
   mvShapeOfMapNodeTy,
   mvShapeOfValTyMint,
   refRowIndexReset,
-  registerValueUnionName,
+  registerAnonUnionField,
   registerValueUnionNameAB,
   registerValueUnionOfTy,
   rlInternNameTy,
@@ -883,7 +883,6 @@ import {
   oneListUnionAliasName,
   tyIsValueUnionBox,
   tyMapKeyKindSpan,
-  valueAtomKind,
 } from "./check_ty_rep"
 import { valueUnionRetName } from "./check_ret_names"
 import {
@@ -6469,6 +6468,7 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
     const elemNames: string[] = []
     const elemRowTys: i32[] = []
     const elemKeys: i32[] = []
+    const elemUnionTys: i32[] = []
     let ok = true
     let fi = 0
     while fi < fields.length {
@@ -6487,6 +6487,11 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         if code < 0 && fnIx >= 0 { code = anonInstPrimCode(f.fiValue, fnIx) }
         const nullBox = if code == FC_NUL_NONE { anonNullFieldBox(ai, f.fiName) } else { "" }
         if nullBox != "" { code = FC_UNION }
+        // The type a union field's box name is rendered from (`anonNullFieldBox`,
+        // `anonUnionFieldName`), so its mint reads the type rather than the name.
+        elemUnionTys.push(
+          if nullBox != "" { recFieldTyOf(nodeTyIxOf(ai), f.fiName) } else if code == FC_UNION { nodeTyIxOf(f.fiValue) } else { -1 },
+        )
         if code == FC_MAP && !anonMapFieldDestAdmits(ai, f.fiName) { code = -1 }
         if code < 0 { ok = false }
         codes.push(code)
@@ -6570,7 +6575,12 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
       // leaf set is named nowhere else, so without it `struct.new` builds a raw scalar, not a box.
       let rj = 0
       while rj < codes.length {
-        if codes[rj] == FC_UNION { registerValueUnionName(elemNames[rj]) }
+        if (
+          codes[rj] == FC_UNION
+          && registerAnonUnionField(elemNames[rj], elemUnionTys[rj]) < 0
+        ) {
+          return -1
+        }
         rj = rj + 1
       }
     }
@@ -7979,7 +7989,7 @@ function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
   // A ref-array arm interns its element shape and reflist slot, the twin of the value-atom
   // marking above; this early call ensures the element struct is in `sNames` before heap assignment.
   markRefArrayArms(mintTyIx)
-  if registerRefArrayArmUnions(stmts, atoms, atomTys) < 0 { return -1 }
+  if registerRefArrayArmUnions(stmts, atomTys) < 0 { return -1 }
   // A map arm interns its value shape and forces the shared map heap flags, the map twin of
   // the ref-array marking; this keeps the inline and named spellings identical.
   markMapUnionArms(mintTyIx)
@@ -7987,18 +7997,14 @@ function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
 }
 
 // `mintInlineUnion`'s ref-array arms: an arm whose element is itself a union of two or more
-// registers that inner union, `atomTys[i]` being atom `i`'s arena row. Returns 0, or -1 once failed.
-function registerRefArrayArmUnions(
-  stmts: i32[],
-  atoms: string[],
-  atomTys: i32[],
-): i32 {
+// registers that inner union, unless the arm is a list a box tags directly. Returns 0, or -1 once failed.
+function registerRefArrayArmUnions(stmts: i32[], atomTys: i32[]): i32 {
   // A list arm whose element is itself a union registers that inner union too, the
   // arm-position twin of the whole-type list-element recursion above.
   let rai = 0
-  while rai < atoms.length && rai < atomTys.length {
+  while rai < atomTys.length {
     const el = tyStepElem(atomTys[rai])
-    if (el >= 0 && tyIsUnionOrNullable(el) && valueAtomKind(atoms[rai]) < 0) {
+    if (el >= 0 && tyIsUnionOrNullable(el) && boxTagOfTy(atomTys[rai]) < 0) {
       if registerInlineUnionOfChild(stmts, el, 40) < 0 { return -1 }
     }
     rai = rai + 1
@@ -9076,21 +9082,16 @@ function unionDeclStructAlias(sx: i32, s: UnionDecl): boolean {
   true
 }
 
-// The row member position of the declared union's arm `vs[vi]`: the member spelled alike at the
-// same occurrence, since twin arms that differ only in a numeric tag share one spelling. -1 for
-// an arm the row does not spell (an expanded alias), which resolves its own name.
-function declVariantPos(vs: string[], vi: i32, atoms: string[]): i32 {
-  let nth = 0
-  let j = 0
-  while j < vi {
-    if vs[j] == vs[vi] { nth = nth + 1 }
-    j = j + 1
-  }
+// The row member position of a declared union's arm of type `ty`: the first member of that type
+// no earlier arm took, so twin arms keep their order. -1 for an arm the row holds under no member
+// of its type, which keeps its own type.
+function declVariantPos(ty: i32, memTys: i32[], taken: i32[]): i32 {
+  if ty < 0 { return -1 }
   let k = 0
-  while k < atoms.length {
-    if atoms[k] == vs[vi] {
-      if nth == 0 { return k }
-      nth = nth - 1
+  while k < memTys.length {
+    if memTys[k] >= 0 && !i32ListHas(taken, k) && tySame(memTys[k], ty) {
+      taken.push(k)
+      return k
     }
     k = k + 1
   }
@@ -9262,8 +9263,10 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   let udSet = ""
   // The variant names: a nullable alias member names its own members, as the flat spelling does (D4040).
   const vsx: string[] = []
-  // Each `vsx` entry's type, from the member's resolution or the arm `unionTyArms` read off it.
+  // Each `vsx` entry's type, from the member's resolution or the arm `unionTyMemberTys` read off
+  // it. An arm of an expanded member is named after the row is recorded, from its row member.
   const vsxTys: i32[] = []
+  const vsxNamed: boolean[] = []
   let usj = 0
   while usj < vs.length {
     let udMem = vs[usj]
@@ -9272,30 +9275,32 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
     const udExp = unionAliasMembers(udMem)
     const at = declMemberTy(stmtIx, usj)
     if udExp != "" {
-      const xAtoms: string[] = []
       const xTys: i32[] = []
-      if !unionTyArms(at, xAtoms, xTys) {
+      if !unionTyMemberTys(at, xTys) {
         return emitFail(
           "emitProgram: a declared union's alias member has no resolved arms",
         )
       }
-      if xAtoms.length > 1 && !tyIsLitUnion(at) { udMem = udExp }
+      if xTys.length > 1 && !tyIsLitUnion(at) { udMem = udExp }
     }
-    const vAtoms: string[] = []
     const vTys0: i32[] = []
     if at >= 0 && at < T.tys.length && tyAt(at) is TyNullable {
-      if !unionTyArms(at, vAtoms, vTys0) {
+      if !unionTyMemberTys(at, vTys0) {
         return emitFail(
           "emitProgram: a declared union's nullable member has no resolved arms",
         )
       }
     }
-    if vAtoms.length > 1 {
-      for a in vAtoms { vsx.push(a) }
-      for t in vTys0 { vsxTys.push(t) }
+    if vTys0.length > 1 {
+      for t in vTys0 {
+        vsx.push("")
+        vsxTys.push(t)
+        vsxNamed.push(false)
+      }
     } else {
       vsx.push(vs[usj])
       vsxTys.push(at)
+      vsxNamed.push(true)
     }
     // A function-type member is grouped in the join, as the inline union's name is: bare,
     // `(i32)=>i32|string` reads as one arrow returning `i32|string`. Canon spells the member bare.
@@ -9326,9 +9331,22 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   unTyKeyPushRow()
   const vTys: i32[] = []
   const vPos: i32[] = []
+  const taken: i32[] = []
   while vPos.length < vsx.length {
-    const k = declVariantPos(vsx, vPos.length, memAtoms)
-    vTys.push(if k >= 0 { memTys[k] } else { vsxTys[vPos.length] })
+    const i = vPos.length
+    const k = declVariantPos(vsxTys[i], memTys, taken)
+    if !vsxNamed[i] {
+      if k >= 0 {
+        vsx[i] = memAtoms[k]
+      } else if vsxTys[i] < 0 {
+        vsx[i] = "null"
+      } else {
+        return emitFail(
+          "emitProgram: a declared union's expanded arm is no member of its row",
+        )
+      }
+    }
+    vTys.push(if k >= 0 { memTys[k] } else { vsxTys[i] })
     vPos.push(k)
   }
   if mintVariantRows(stmts, vsx, vTys, vPos) < 0 { return -1 }

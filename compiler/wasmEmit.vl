@@ -1304,6 +1304,7 @@ import {
   tyIsAtomLeafList,
   unionTyArms,
   unionTyHasAtom,
+  unionTyMemberTys,
   variantDiscrimFieldNeeded,
   variantFieldLitLexes,
   variantHasDiscrimField,
@@ -1473,7 +1474,7 @@ import {
   unRowOfRecordTy,
   unionArmTyOfAtomTy,
   unionClosureArmName,
-  unionClosureArmTy,
+  unionClosureArmTyOfRow,
   unionHasMapArmSlot,
   unionHasRefArrayArmSlot,
   unionNestedArrayArmSlot,
@@ -4107,9 +4108,8 @@ function unionBoxLacksTag(recvIx: i32, tag: i32, fnIx: i32): boolean {
   if tag < uVariants.length { return false }
   if !exprUnion(recvIx, fnIx) { return false }
   const uTy = unionBoxTyOfRead(recvIx, fnIx)
-  const atoms: string[] = []
   const arms: i32[] = []
-  if !unionTyArms(uTy, atoms, arms) || arms.length == 0 { return false }
+  if !unionTyMemberTys(uTy, arms) || arms.length == 0 { return false }
   const u = unRowOfTyKey(uTy)
   let i = 0
   while i < arms.length {
@@ -5076,8 +5076,7 @@ function emitListEmptyFitArms(
   // A box's arms are the ones it registered, which the receiver's type need not spell.
   const armTys: i32[] = []
   if boxed {
-    const atoms: string[] = []
-    if (!unionTyArms(unionBoxTyOfRead(nd.isObj, fnIx), atoms, armTys)) {
+    if (!unionTyMemberTys(unionBoxTyOfRead(nd.isObj, fnIx), armTys)) {
       return 0
     }
   } else {
@@ -6118,9 +6117,8 @@ function emitVariantDiscrimTest(body: u8[], recvIx: i32, vi: i32, fnIx: i32) {
 function isPatUnionArmTy(recvIx: i32, patTy: i32, fnIx: i32): i32 {
   if patTy < 0 || !unMemIsMap(patTy) { return patTy }
   if !exprUnion(recvIx, fnIx) { return patTy }
-  const atoms: string[] = []
   const arms: i32[] = []
-  unionTyArms(unionBoxTyOfRead(recvIx, fnIx), atoms, arms)
+  unionTyMemberTys(unionBoxTyOfRead(recvIx, fnIx), arms)
   let same = -1
   let i = 0
   while i < arms.length {
@@ -6145,8 +6143,7 @@ function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
   flattenVariantsInto(patTy, pat)
   const arms: i32[] = []
   if exprUnion(recvIx, fnIx) {
-    const atoms: string[] = []
-    unionTyArms(unionBoxTyOfRead(recvIx, fnIx), atoms, arms)
+    unionTyMemberTys(unionBoxTyOfRead(recvIx, fnIx), arms)
   }
   const pins: i32[] = []
   instancePinnedMaps(fnIx, pins)
@@ -8621,13 +8618,13 @@ function emitUnionNestedListLit(
 // The value's own checked type is the answer, not the union's arm: a union may carry several
 // function-typed arms, and taking the arm makes every one of them box under the first arm's tag
 // (D6). The union's own arm is the fallback, for a carrier the checker banked no function type
-// for; a union with one function arm tags the same either way.
-function cloBoxArmTy(exprIx: i32, unionName: string, fnIx: i32): i32 {
+// for; a union with one function arm tags the same either way. `u` is the union's row, or -1.
+function cloBoxArmTy(exprIx: i32, u: i32, unionName: string, fnIx: i32): i32 {
   const vt = nodeTyAt(exprIx, fnIx)
   if tyIxIsFunc(vt) { return vt }
   const bt = nodeTyAt(unwrapParen(exprIx), fnIx)
   if tyIxIsFunc(bt) { return bt }
-  unionClosureArmTy(unionName)
+  unionClosureArmTyOfRow(u, unionName)
 }
 
 // `emitUnionCoerce` lowers an expression coerced into the boxed union's representation (a
@@ -8658,9 +8655,8 @@ function mapBoxTagOf(sh: i32, unionTy: i32, exprIx: i32, fnIx: i32): i32 {
   let arm = -1
   let only = -1
   let n = 0
-  const atoms: string[] = []
   const mems: i32[] = []
-  if unionTyArms(unionTy, atoms, mems) {
+  if unionTyMemberTys(unionTy, mems) {
     let i = 0
     while i < mems.length {
       const m = mems[i]
@@ -9685,7 +9681,7 @@ function emitUnionCoerceList(
   if unionName != "" && exprIsClosure(exprIx, fnIx) {
     const clArm = unionClosureArmName(unionName, uTy)
     if clArm != "" {
-      fbI32Rel(RS_TAG, cloArmTagOfTy(cloBoxArmTy(exprIx, unionName, fnIx)))
+      fbI32Rel(RS_TAG, cloArmTagOfTy(cloBoxArmTy(exprIx, -1, unionName, fnIx)))
       if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx) // { tag, closure fat-pointer ref }
       return 0
@@ -10926,6 +10922,7 @@ function emitUnionConcreteEq(
       otherIx,
       eak,
       isNe,
+      unr[0],
       uname,
       fnIx,
     )
@@ -10998,7 +10995,10 @@ function emitUnionConcreteEq(
   // The CONCRETE operand's own arm type, through the very composition the BOX site uses
   // (`cloBoxArmTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
   // actually writes.
-  fbI32Rel(RS_TAG, unionEqTagOfArmTy(eak, cloBoxArmTy(otherIx, uname, fnIx)))
+  fbI32Rel(
+    RS_TAG,
+    unionEqTagOfArmTy(eak, cloBoxArmTy(otherIx, unr[0], uname, fnIx)),
+  )
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
   if eqOnce { fbLocalGet(eqStash) }
@@ -11353,24 +11353,31 @@ function emitUnionBoxEqStagedX(
   0
 }
 
-// `emitUnionConcreteEq` where the box's union has no arm of the operand's number kind `eak` but
-// has arms of a kind it widens to or from: the box and then the operand are evaluated once, and
-// each such arm compares the two values at the wider kind; any other arm is unequal. Returns 1
-// handled, 0 when no arm qualifies, -1 on error.
+// `emitUnionConcreteEq` where the box's union (row `u`, else `uname`) has no arm of number kind
+// `eak` but arms of a kind it widens to or from: box and operand are evaluated once and each such
+// arm compares at the wider kind; any other arm is unequal. Returns 1 handled, 0 when no arm
+// qualifies, -1 on error.
 function emitUnionConcreteNumCross(
   body: u8[],
   boxIx: i32,
   otherIx: i32,
   eak: i32,
   isNe: boolean,
+  u: i32,
   uname: string,
   fnIx: i32,
 ): i32 {
-  const atoms: string[] = []
-  unionArmsOf(uname, atoms)
+  const kinds: i32[] = []
+  const tys: i32[] = []
+  if u >= 0 && unionMemberTysOfRow(u, tys) {
+    for t in tys { kinds.push(boxAtomKindOfMemberTy(t)) }
+  } else {
+    const atoms: string[] = []
+    unionArmsOf(uname, atoms)
+    for a in atoms { kinds.push(valueAtomKind(a)) }
+  }
   const kas: i32[] = []
-  for a in atoms {
-    const ka = valueAtomKind(a)
+  for ka in kinds {
     if ka != eak && numEqOpOfKind(wideKindOf(ka, eak)) >= 0 { kas.push(ka) }
   }
   if kas.length == 0 { return 0 }
