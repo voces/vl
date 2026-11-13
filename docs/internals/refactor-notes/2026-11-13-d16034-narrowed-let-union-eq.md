@@ -29,6 +29,12 @@ the value is stored as, the step 7 direction. The box itself is read as before.
   On the base seed the file is refused at emit.
 - `identity-eq-record-union` `==` control matrix: 65 → 66 of 66 (`local_assign` annotated moves to
   RUNS), nothing lost.
-- Sweep with fixpoint seeds on both sides: SWEEP.
-- Render-parse census: CENSUS.
+- Sweep with fixpoint seeds on both sides, master `3ff308e0` against the candidate:
+  - 24,233 same;
+  - 2 output movers, the D16034 witness and the new test file, both `emit_reject` → runs;
+  - 1 bytes-only mover, D15058's witness. It prints `true` on both seeds. Its narrowed `const q`
+    operand had compared over its one narrowed arm and now compares over the stored union's two,
+    so a tag test guards the payload cast (`wasm-dis`, 13 lines added);
+  - 0 `runs → not-runs`, 0 new compiler traps.
+- Render-parse census: within budget, no entry moves.
 - `scripts/gate.sh`: all rows pass.
