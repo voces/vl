@@ -74,7 +74,6 @@ import {
   mapTwinUnionMember,
   mapTyValIsLitUnion,
   mapTyValIsNulLitUnion,
-  nameIsInlineLitUnion,
   nulNumLitUnionBaseName,
 } from "./check_ty_rep"
 import {
@@ -126,6 +125,7 @@ import {
   tyToNominalName,
   tyToNominalNameAt,
   tyVarRenames,
+  unionAliasDeclNameOfTy,
 } from "./check_types"
 import {
   code0KindOf,
@@ -1752,7 +1752,7 @@ export function fieldRefElemName(tyIx: i32, code: i32) {
     // deferred since `collectU` runs before the struct table exists (D1293).
     let fTy = nodeTyIxOf(tyIx)
     if canonRewroteNode(tyIx) { fTy = canonTyIxOf(tyIx) }
-    return shapeFieldElemName(ty.tyName, code, fTy)
+    return shapeFieldElemName(code, fTy)
   }
   ""
 }
@@ -2880,13 +2880,19 @@ export function fieldElemRowName(ty: i32): string {
   n
 }
 
-// The element or target name a shape-text field records in `armFieldElemName`: a ref-list
-// field its element name, a nested-struct field its non-null target name, a value-union
-// field its atom-set name; "" otherwise. `fty` is the field's arena type (-1 for none).
+// The element or target name a shape field of code `code` and type `fty` (-1 for none) records
+// in `armFieldElemName`: a ref-list or map field its element row's name, a value-union field its
+// union's name, a literal-union field its set's name; "" otherwise. All read off the type.
 const SHAPE_STRUCT_FIELD_NO_TY_MSG = "a shape's nested-record field recorded no type to name its row"
+const SHAPE_UNION_FIELD_NO_TY_MSG = "a shape's value-union field recorded no type to name its union"
+
+// The name a value union of type `ty` is registered under (`valueUnionKeyTextOfTy`, else the
+// registry's `regUnionNameOfTy`), installed by `emitProgram` since both sit above this module.
+function unionFieldNameUnset(_ty: i32): string { __trap__() }
+export let unionFieldNameFn: (ty: i32) => string = unionFieldNameUnset
 const SHAPE_MAP_FIELD_NO_TY_MSG = "a shape field of map type recorded no type to name its value row"
 
-export function shapeFieldElemName(ftxt: string, code: i32, fty: i32) {
+export function shapeFieldElemName(code: i32, fty: i32) {
   const tn = shapeFieldElemNameOfTy(code, fty)
   if tn != "" { return tn }
   // A nested record field's target row is read off its element type (`sFieldTgtStructIdx`), so
@@ -2895,7 +2901,14 @@ export function shapeFieldElemName(ftxt: string, code: i32, fty: i32) {
     if fty < 0 { emitFail(SHAPE_STRUCT_FIELD_NO_TY_MSG) }
     return ""
   }
-  if code == FC_UNION { return ftxt }
+  // A value-union field records the name its union is registered under, read off its type.
+  if code == FC_UNION {
+    if fty < 0 {
+      emitFail(SHAPE_UNION_FIELD_NO_TY_MSG)
+      return ""
+    }
+    return unionFieldNameFn(fty)
+  }
   // A map field records its value's row name, which its type gives above; one with no type
   // has no value row to name.
   if code == FC_MAP || code == FC_NUL_MAP {
@@ -2906,11 +2919,24 @@ export function shapeFieldElemName(ftxt: string, code: i32, fty: i32) {
   // so the variant tables recover the rep and membership — without it construction emitted
   // the raw member string into the i32 atom slot. An inline litunion field (code 3) records
   // its member set for the same reason, since code 3 is layout-shared with a plain string field.
-  if code == FC_STR && nameIsInlineLitUnion(ftxt) { return ftxt }
-  if code == FC_I32 && fty >= 0 && (tyIsLitUnion(fty) || tyIsOneStrLit(fty)) {
-    return ftxt
+  if (
+    code == FC_STR
+    && fty >= 0
+    && tyIsLitUnion(fty)
+    && unionAliasDeclNameOfTy(fty) == ""
+  ) {
+    return litUnionInlineNameOfTy(fty)
   }
-  if code == FC_I32_LIST && tyIsStrLitSetList(fty) { return ftxt }
+  if code == FC_I32 && fty >= 0 && (tyIsLitUnion(fty) || tyIsOneStrLit(fty)) {
+    const al = litUnionAliasNameOfTy(fty)
+    if al != "" { return al }
+    const il = litUnionInlineNameOfTy(fty)
+    if il != "" { return il }
+    return oneStrLitSpelling(fty)
+  }
+  if code == FC_I32_LIST && tyIsStrLitSetList(fty) {
+    return tyToNominalName(fty)
+  }
   if code == FC_I32_LIST { return "" }
   // A NULLABLE-litunion niche field (code 30): the non-null union name, the
   // code-0 recording over the `| null`-stripped part.
