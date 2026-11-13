@@ -87,7 +87,28 @@ ones. The criterion "renders down to the floor" is graded against that set once 
 - (b) a dictionary key: a floor only if its table passes lane A's canonical-key test (every mint and
   lookup renders alike), else it fails;
 - (c) a label, output text or a diagnostic: a floor;
-- (d) unreached: deleted. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
+- (d) unreached: deleted.
+
+Lane I's triage of #7774's 97 consumer rows (H counts 101; the other four are display
+renders), by renderer family. Reach is summed over each family's rows:
+
+| family | sites | reach | grade | owner |
+| --- | --- | --- | --- | --- |
+| F0 TypeRef text (`synthTypeRefOfTy`, `lvSpellOf`), the `clo:` link key (`cloSigTagSlotOfTy`), `nodeArrayElemName` (#7760) | 9 | 4,609 | floor | — |
+| R1 mono pin spellings (`monoPinSpellShaped`/`NoAnon`, mono's `tyToNominalName`; `tagRepNameOfTy`, `registerRetJoinUnions`) | 40 | 26,056 | mostly labels under the pin-naming rule; (a) where the text decides (`monoRecordNominalPin` scans it, `monoTagRecordPinKind` and `monoSubstAnnNode` compare it); (b) where it is pushed into `pinned`, `pnames` or `tvV` | D grades per site |
+| R2 ref-list row names (`rlRowNameOfTy`) | 15 | 16,692 | (b) through `rlInternNameTy`, which fails the canonical-key test while D16001 stands; (a) at `collectARefArrayAnn` (→ `isValueUnionName`) | A, with F |
+| R3 union key text (`canonUnionKeyTextOfTy`, `unionSpellingOfTy`, `canonUnionKeyAtomOfTy`, `cloSigNameOfTy` in `specPart`/`unionPartSpelling`) | 10 | 38,571 | (b) into the union registry, failing while D16000 stands; (a) where it reaches `isValueUnionName` | G, with H for the P1 reads |
+| R4a collect nominal (`arenaEmitName`, `reachRegisterName`, `registerInferredUnionTy`, `tyNomRenderLoops`) | 5 | 31,407 | (a) `arenaEmitName` re-canons a render; (b) `registerInferredUnionTy` into `unNameAdoptTyKeyRow` and `registerInlineUnionAt`; `tyNomRenderLoops` is a discarded cycle probe (floor) | E, with G |
+| R4b mv slot keys (`mvDeepArmKeyName`, `mvDeepDeclKeyName`, `mvDeclNameOfValTy`) | 3 | 3,617 | (b), the canonical-key test owed | H |
+| R4c `unionArmsAllSame` | 2 | 11,866 | (a): it compares two renders for equality, where `tyEq` or the canon key is the question | G |
+| R4d shape_rows element names | 9 | 2,327 | (b), row keys with the canonical-key test owed; `fieldTypeRefusalMsg` is a diagnostic (floor) and unreached | A, with F |
+| R6 the shape walk key (`shapeWalkKeyOf`, `shapeWalkName`) and `internArmShapeRow` | 4 | 45,618 | (a) | F deletes the walk key; A |
+
+Unreached (d): `arrLitElemName` (emit_classify:6909), `memReadBoxNarrowName` and
+`fieldTypeRefusalMsg`. H also lists `nulNicheIsTestImpossible`, `mapSoftTwinTagFail` and
+`emitMapUnionPayloadTail` at 0 programs during emit, but census 5 named
+`generics/error-literal-union-map-twin-through-one-instance.vl` as `mapSoftTwinTagFail`'s witness.
+That conflict is checked at the close. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
 
 ## The census's coverage (lane H, #7748, open)
 
