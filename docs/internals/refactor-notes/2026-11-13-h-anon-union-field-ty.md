@@ -42,4 +42,10 @@ A probe at the caller compared the twin against the parse of the name:
   (`i32 | {f: i32}`, `{x: i32} | string`) under a different arena id.
 - All 6 produce the same output on master and the candidate.
 
-Sweep, master fixpoint against candidate fixpoint: see the PR.
+A second probe dumped the final union-row table (`unNames` with each row's type) on master and
+the candidate for all 42 programs that reach the caller: identical in every one, so the two
+different-id mints land on the row master mints, under the same name, with no second row.
+
+Sweep, master fixpoint (7032eb67d) against candidate fixpoint: 24,229 same, 0 bytes-only movers,
+0 output movers, no runs lost, no new compiler traps. The candidate seed is byte-identical
+before and after the comment edits.
