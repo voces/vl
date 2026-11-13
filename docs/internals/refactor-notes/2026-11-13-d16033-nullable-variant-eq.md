@@ -26,6 +26,8 @@ is read.
 - `tests/cases/operators/nullable-record-eq-variant-record.vl`: eight cells. They cover both operand
   orders, a null side, differing values, `!=`, and a `let` reassigned between a record and `null`.
   On the base seed the file is refused at emit.
-- Sweep with fixpoint seeds on both sides: SWEEP.
-- Render-parse census: CENSUS.
+- Sweep with fixpoint seeds on both sides, master `255d3a58` against the candidate: 24,231 same, 0
+  bytes-only movers, 2 output movers (the D16033 witness and the new test file, both `emit_reject` →
+  runs), 0 `runs → not-runs`, 0 new compiler traps.
+- Render-parse census: within budget, no entry moves.
 - `scripts/gate.sh`: all rows pass.
