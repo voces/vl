@@ -28,6 +28,7 @@ import {
   Paren,
   RetStmt,
   TypeRef,
+  Unary,
   WhileStmt,
   annTsOf,
   arenaSetNode,
@@ -962,6 +963,13 @@ export function checkIfStmtNode(ix: i32) {
   res
 }
 
+// Whether `if` condition `c` is a `!` over its test, through parentheses.
+function ifCondIsNot(c: i32): boolean {
+  const e = nodeAt(parenPeelIx(c))
+  if e is Unary { return e.unOp == "!" }
+  false
+}
+
 // Registers the `is`-guard alternatives of the then-narrows `tnPlaces`/`tnTys` that refine a
 // hole: a new row goes to both `altRows` and `guardRows`, one a previous pass registered to
 // `guardRows` alone, since the guarded-return marking must fire on every pass.
@@ -1134,8 +1142,13 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   const rwA0 = elabCapAlwaysTests
   ifCheckCondNarrows(n, tnPlaces, tnTys, enPlaces, enTys)
   // An elaboration marks the arm of a test its instance makes dead.
+  // Under `!(…)` the arms swap: a test the instance makes always true leaves the `then` arm
+  // dead, and one it makes dead leaves the `else` arm dead (D16007).
+  const condNot = ifCondIsNot(n.ifCond)
+  const negElseDead = condNot && elabCapLive() && elabCapDeadTests > rwT0
+  const neverHolds = T.diags.length > rwD0 || elabCapDeadTests > rwT0
   const rwDead = elabCapLive()
-    && (T.diags.length > rwD0 || elabCapDeadTests > rwT0)
+    && (if condNot { elabCapAlwaysTests > rwA0 } else { neverHolds })
   // What each tested place held on entry, before either arm's fact: the arm join's start for a
   // path that carries no fact of its own.
   const tnEnt = narKeysNowTys(tnPlaces)
@@ -1150,6 +1163,21 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // guarded-return marking must fire on every pass, since the real pass witnesses the call site.
   const guardRows: i32[] = []
   ifNoteGuardAlts(tnPlaces, tnTys, altRows, guardRows)
+  // A closed else-narrow of a hole (`!(p is A)`'s `A`) is the alternative the `else` arm takes;
+  // an open one (a deferred remainder) names no type an argument could be held to (D16007).
+  const elseAltRows: i32[] = []
+  const enAltPlaces: i32[] = []
+  const enAltTys: i32[] = []
+  let ei = 0
+  while ei < enPlaces.length {
+    if enTys[ei] >= 0 && !tyHasTyVar(enTys[ei]) {
+      enAltPlaces.push(enPlaces[ei])
+      enAltTys.push(enTys[ei])
+    }
+    ei = ei + 1
+  }
+  const elseGuardRows: i32[] = []
+  ifNoteGuardAlts(enAltPlaces, enAltTys, elseAltRows, elseGuardRows)
   const guardedRet = ifEnterThenArm(ifTail, tnPlaces, tnTys, guardRows)
   // The arm's OWN statement depth: its block pushes one scope, so a write recorded at exactly
   // this depth runs whenever the arm does and a deeper one is conditional (D1846).
@@ -1166,7 +1194,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   const thenExits = stmtAlwaysExits(n.ifThen)
   // A test always true at the pin leaves its `else` arm dead, and when its arm always exits
   // and it has none, the rest of the block.
-  const elseDead = elabCapLive() && elabCapAlwaysTests > rwA0
+  const elseDead = if condNot { negElseDead } else { elabCapLive() && elabCapAlwaysTests > rwA0 }
   if elseDead && thenExits && n.ifElse < 0 { elabCapDeadRestSet(true) }
   if guardedRet { guardAltStackPop() }
   retTailPosSet(false)
@@ -1226,6 +1254,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
     enTys: enTys,
     enEnt: enEnt,
     altRows: altRows,
+    elseAltRows: elseAltRows,
     thenOwnDepth: thenOwnDepth,
     thenLo: thenLo,
     thenHi: thenHi,
