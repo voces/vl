@@ -253,6 +253,27 @@ The variant-row key passes lane A's canonical-key test or is re-keyed by type (p
 as `variantIndexOf`'s retirement did). The owner follows from that result, likely lane B.
 `isStructAtom` and its emit_base spelling test go with it. So does `collectVariantFields` → `collectShapeVariantFields`: it dispatches on `nameIsShapeSpanEnds` of the arm's spelling and splits that spelling's fields, and although the record type supplies each field's name and type, `variantFieldIdText(ftxt, fldTy)` stores the field text as the variant table's identity column. It re-keys with `uVariantsPush(names[i])`, not apart from it. Resolved by #7787: the rows choose their fields by type, and the spelling is a position label nothing reads by name (floor).
 
+## Where the emitter's type hint and the name-derived type disagree (lane A's probe)
+
+Every disagreement is `tySame` true and `tyEq` false, and in each the emitter's type hint wins, so
+no program reads a wrong answer:
+
+- **A stale twin-row label (a layout fold, not a defect).**
+  `closures/twin-fieldset-closure-field-string-vs-bool-result.vl`: the field
+  `{f: (i32,i32,i32) => boolean}` carries the `=> string` twin's name, because two layout-identical
+  closure records fold to one heap type and the name is the folded twin's. It prints `false`, as
+  filed.
+- **A newtype's name resolves to its unbranded base** (D16003, a refutation pin, runs today):
+  `memory/newtype-struct-reflist-key-population.vl` (`PView`),
+  `maps/newtype-struct-map-value-struct-field.vl` (`EView`), and
+  `types/newtype-over-litunion-alias.vl` (`NK = new K`). `declTyIxOfName` answers from
+  `cUserTypes`, which holds the newtype's base, while the brand is the arena index in `nwTyIxs`.
+  So a type read back off the name is `tySame` with the brand but not `tyEq`. The two are
+  rep-identical, so no run reads the difference.
+- **The classes already graded floors by the coordinator:** a hole function against a scalar
+  name; an alias against its structural expansion (`D`, `U`, `I`, `Json|null`); a literal against
+  its widening (`1|2|null` against `i32|null`).
+
 ## Floors held by a filed row
 
 Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the site reads a name
