@@ -174,6 +174,7 @@ import {
   TyUnion,
   TyVar,
   listArmFitAcrossReps,
+  memberTySame,
   mkArrayTy,
   mkNullableTyOf,
   numLitUnionBaseName,
@@ -201,6 +202,7 @@ import {
   tyMayHoldFn,
   tyNulLitUnionInner,
   tyNulNumScalarValKind,
+  tyPrimNameIs,
   tyPrimNameOf,
   tySame,
   tyScalarBasePrim,
@@ -1228,7 +1230,7 @@ import {
   listOpKindOfBin,
   listOpSlotOfBin,
   memberLenWidensAtom,
-  msSetHasAtom,
+  msSetHasPrimKind,
   printUnionArmsUnrenderable,
   printUnionPlan,
   tailIsValueOrNever,
@@ -1303,8 +1305,7 @@ import {
   mapTwinSame,
   refArrSlotTag,
   tyIsAtomLeafList,
-  unionTyArms,
-  unionTyHasAtom,
+  unionTyHasBoxKind,
   unionTyMemberTys,
   variantDiscrimFieldNeeded,
   variantFieldLitLexes,
@@ -1473,7 +1474,6 @@ import {
   mapValueTyOf,
   nliNameOf,
   unRowOfRecordTy,
-  unionArmTyOfAtomTy,
   unionClosureArmTyOfRow,
   unionClosureArmTyOfTy,
   unionHasMapArmSlot,
@@ -1521,9 +1521,9 @@ import {
 import {
   isUNameAB,
   msHasNull,
-  msMemberAtomsOfSet,
+  msMemberCount,
   msMemberTysOfSet,
-  msSetOfRowOr,
+  msSetOfRow,
   msSetOfTy,
   msSetOfTyAny,
   msSetOfUnion,
@@ -4561,7 +4561,7 @@ function litMembershipRecvOk(recvIx: i32, fnIx: i32) {
     const bxr: i32[] = []
     const bxNm = unionNameRowOfExpr(recvIx, fnIx, bxr)
     if bxNm == "" { return false }
-    const bxs = msSetOfRowOr(bxr[0], bxNm)
+    const bxs = msSetOfRow(bxr[0])
     if isValueUnionOfSet(bxs, bxr[1]) { return true }
     return unionCarriesLitUnionArmOfSet(bxs, bxr[1])
   }
@@ -6349,9 +6349,8 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   if isTestsNull(isIx) || !exprUnion(nd.isObj, fnIx) { return 0 }
   const chk = isVarTyIxOf(isIx)
   if tyArrayElemIx(chk) < 0 { return 0 }
-  const atoms: string[] = []
   const arms: i32[] = []
-  if (!unionTyArms(unionBoxTyOfRead(nd.isObj, fnIx), atoms, arms)) { return 0 }
+  if (!unionTyMemberTys(unionBoxTyOfRead(nd.isObj, fnIx), arms)) { return 0 }
   const chkTag = isArmTagOfTy(chk)
   const chkLeaf = listLeafTyOf(chk)
   const tags: i32[] = []
@@ -6766,10 +6765,7 @@ function emitIsTestLitArms(body: u8[], isIx: i32, nd0: IsExpr, fnIx: i32) {
   }
   const lur: i32[] = []
   const luNm = unionNameRowOfExpr(nd0.isObj, fnIx, lur)
-  if (
-    luNm != ""
-    && unionCarriesLitUnionArmOfSet(msSetOfRowOr(lur[0], luNm), lur[1])
-  ) {
+  if (luNm != "" && unionCarriesLitUnionArmOfSet(msSetOfRow(lur[0]), lur[1])) {
     const luTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
     if luTexts.length > 0 && unionEqOperandOk(nd0.isObj) {
       let luI = 0
@@ -6793,8 +6789,8 @@ function emitIsTestLitArms(body: u8[], isIx: i32, nd0: IsExpr, fnIx: i32) {
       const nbNm = unionNameRowOfExpr(nd0.isObj, fnIx, nbr)
       if (
         nbNm != ""
-        && (isValueUnionOfSet(msSetOfRowOr(nbr[0], nbNm), nbr[1])
-          || unionCarriesLitUnionArmOfSet(msSetOfRowOr(nbr[0], nbNm), nbr[1]))
+        && (isValueUnionOfSet(msSetOfRow(nbr[0]), nbr[1])
+          || unionCarriesLitUnionArmOfSet(msSetOfRow(nbr[0]), nbr[1]))
       ) {
         let nbI = 0
         while nbI < nbTexts.length {
@@ -7136,11 +7132,8 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
     const boxNo = exprUnion(nd.isObj, fnIx)
       && tyIsRecord(isVarTyIxOf(isIx))
       && boxNm != ""
-      && (isValueUnionOfSet(msSetOfRowOr(boxr[0], boxNm), boxr[1])
-      || unionCarriesLitUnionArmOfSet(
-      msSetOfRowOr(boxr[0], boxNm),
-      boxr[1],
-    ))
+      && (isValueUnionOfSet(msSetOfRow(boxr[0]), boxr[1])
+      || unionCarriesLitUnionArmOfSet(msSetOfRow(boxr[0]), boxr[1]))
     // Only a join the checker kept apart over declared parameters reaches here by design.
     if (
       (nlNo || boxNo)
@@ -8019,16 +8012,36 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
       fbEnd()
       return 0
     }
+    // A MAP leaf: `{[K]: V} | null` is the field's map struct's own nullable ref, the list
+    // arm's shape over the struct `sFieldMapShape` names.
+    if oKind == "map" || oKind == "nulmap" {
+      const msh = sFieldMapShape(osi, ofi)
+      if msh == -3 {
+        return emitFailAt(
+          "emitProgram: a standalone `?.` map leaf's value type is still open",
+          exprIx,
+        )
+      }
+      const mHeap = mapTypeIdxOf(msh)
+      if emitOptChainIsNull(body, exprIx, fnIx) < 0 { return -1 }
+      fbIfRefNul(mHeap, true)
+      fbRefNull(mHeap)
+      fbElse()
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
+      fbStructGet(sHeapIdx[osi], ofi)
+      fbEnd()
+      return 0
+    }
     // The leaf reps this arm can build, in the order the arms below take them: a nullable
-    // REF (a list, a nested struct, a string), the scalar box (i32/boolean/f64/i64/f32),
-    // and the value-union box. A map or closure leaf reaches neither and is named as such.
+    // REF (a list, a map, a nested struct, a string), the scalar box (i32/boolean/f64/i64/f32),
+    // and the value-union box. A closure leaf reaches neither and is named as such.
     if (
       !optChainLeafBoxable(oKind)
       && fieldRowNumKind(oRow) < 0
       && oRefHeap < 0
     ) {
       return emitFailAt(
-        "emitProgram: a standalone `?.` has no rep for a map or closure leaf field — read it through a `!= null` guard",
+        "emitProgram: a standalone `?.` has no rep for a closure leaf field — read it through a `!= null` guard",
         exprIx,
       )
     }
@@ -8622,11 +8635,11 @@ function cloBoxOwnFnTy(exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// `cloBoxOwnFnTy`, else the first function-typed member of the union (row `u`, else `uname`).
-function cloBoxEqArmTy(exprIx: i32, u: i32, uname: string, fnIx: i32): i32 {
+// `cloBoxOwnFnTy`, else the first function-typed member of union row `u`.
+function cloBoxEqArmTy(exprIx: i32, u: i32, fnIx: i32): i32 {
   const own = cloBoxOwnFnTy(exprIx, fnIx)
   if own >= 0 { return own }
-  unionClosureArmTyOfRow(u, uname)
+  unionClosureArmTyOfRow(u)
 }
 
 // `emitUnionCoerce` lowers an expression coerced into the boxed union's representation (a
@@ -8780,9 +8793,7 @@ function emitCoalesceMapJoin(
 // value atom beside another member) that has no registry row, so no arm of it can be tagged.
 function unionBoxHasNoRow(unionName: string, unionTy: i32): boolean {
   if unionName == "" || unionRowKeyAB(84, unionTy) >= 0 { return false }
-  const atoms: string[] = []
-  msMemberAtomsOfSet(msSetOfTyAny(unionTy), atoms)
-  if atoms.length < 2 { return false }
+  if msMemberCount(msSetOfTyAny(unionTy)) < 2 { return false }
   emitFail(
     "emitProgram: a record delivered into a rowless union box has no typed member test",
   )
@@ -9474,7 +9485,7 @@ function emitUnionCoerceUnder(
   emitUnionCoerceRecord(
     body,
     unionName,
-    msSetOfRowOr(ur, unionNameIn),
+    msSetOfRow(ur),
     unionTy,
     exprIx,
     bareIx,
@@ -10073,8 +10084,7 @@ function wideRetagPairs(
 ) {
   const fa: i32[] = []
   const sty = unionBoxTyIxOfExpr(exprIx, fnIx)
-  const sa: string[] = []
-  if sty >= 0 && armRowsOfUnionTy(sty, sa, fa) {
+  if sty >= 0 && armRowsOfUnionTy(sty, fa) {
     if tySame(sty, unionTy) { return 0 }
   } else {
     // A union whose arms do not resolve by type is a row-less value union: no record arm to retag.
@@ -10123,8 +10133,7 @@ function emitWideRetagChain(fromTags: i32[], toTags: i32[]) {
 
 // `armRowsOfUnionTy` of `unionName`'s type `unionTy`, else the rows its arms' spellings name.
 function unionArmRowsOfTy(unionName: string, unionTy: i32, rows: i32[]) {
-  const ta: string[] = []
-  if unionTy >= 0 && armRowsOfUnionTy(unionTy, ta, rows) { return 0 }
+  if unionTy >= 0 && armRowsOfUnionTy(unionTy, rows) { return 0 }
   const atoms: string[] = []
   unionArmsOfTy(unionName, unionTy, atoms)
   for a in atoms { rows.push(exactArmRowOfTy(cUserTypes[a] ?? -1)) }
@@ -10995,10 +11004,7 @@ function emitUnionConcreteEq(
   // The CONCRETE operand's own arm type, through the very composition the BOX site uses
   // (`cloBoxOwnFnTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
   // actually writes.
-  fbI32Rel(
-    RS_TAG,
-    unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], uname, fnIx)),
-  )
+  fbI32Rel(RS_TAG, unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], fnIx)))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
   if eqOnce { fbLocalGet(eqStash) }
@@ -11173,7 +11179,7 @@ function emitStructUnionEq(
   uty: i32,
   fnIx: i32,
 ) {
-  const arms: string[] = []
+  const arms: i32[] = []
   const vis: i32[] = []
   const aks: i32[] = []
   if !unionBoxEqColumns(uty, arms, vis, aks) { return -1 }
@@ -11183,7 +11189,7 @@ function emitStructUnionEq(
   // function and re-uses the two slots. The evaluation order is unchanged: left, then right.
   if emitExpr(body, lIx, fnIx) < 0 { return -1 }
   if emitExpr(body, rIx, fnIx) < 0 { return -1 }
-  emitUnionBoxEqStaged(body, arms, vis, aks, isNe, uty, fnIx)
+  emitUnionBoxEqStaged(body, arms, vis, aks, isNe, fnIx)
 }
 
 // The element type of field row `ufi` (`sFieldElemTyIx`), or -1 out of range.
@@ -11191,21 +11197,20 @@ function sFieldElemTyIxOfRow(ufi: i32): i32 {
   if ufi >= 0 && ufi < sFieldElemTyIx.length { sFieldElemTyIx[ufi] } else { -1 }
 }
 
-// The arm columns of a box `==` over union type `uty`, index-parallel to `arms`: a struct arm
+// The arm columns of a box `==` over union type `uty`, index-parallel to its member types `tys`: a struct arm
 // carries its variant row in `vis` and -1 in `aks`, a scalar arm the reverse. False declines
 // before any byte is written, so an arm set the lowering cannot serve keeps its caller's loud refusal.
 const UNION_BOX_EQ_NO_ARMS_MSG = "emitProgram: a union box compared with `==` has no type to read its arms from"
 
 function unionBoxEqColumns(
   uty: i32,
-  arms: string[],
+  tys: i32[],
   vis: i32[],
   aks: i32[],
 ): boolean {
   const rows: i32[] = []
-  const tys: i32[] = []
   const urows: i32[] = []
-  if uty >= 0 && armRowTysOfUnionTy(uty, arms, tys, urows) {
+  if uty >= 0 && armRowTysOfUnionTy(uty, tys, urows) {
     // A struct arm's columns are keyed by the first row of its type, as each frame it stages is.
     let k = 0
     while k < tys.length {
@@ -11216,9 +11221,9 @@ function unionBoxEqColumns(
     emitFail(UNION_BOX_EQ_NO_ARMS_MSG)
     return false
   }
-  if arms.length < 2 { return false }
+  if tys.length < 2 { return false }
   let i = 0
-  while i < arms.length {
+  while i < tys.length {
     const vi = rows[i]
     if vi < 0 {
       // NOT A VARIANT: the arm is servable exactly when it is a value ATOM whose payload
@@ -11262,26 +11267,24 @@ function unionBoxEqColumns(
 // copies of the dispatch.
 function emitUnionBoxEqStaged(
   body: u8[],
-  arms: string[],
+  armTys: i32[],
   vis: i32[],
   aks: i32[],
   isNe: boolean,
-  uty: i32,
   fnIx: i32,
 ) {
-  emitUnionBoxEqStagedX(body, arms, vis, aks, aks, isNe, uty, fnIx)
+  emitUnionBoxEqStagedX(body, armTys, vis, aks, aks, isNe, fnIx)
 }
 
 // `emitUnionBoxEqStaged` where the right operand's union has number arms of kinds `rAks`, which
 // a left number arm of another width compares against by value (D15090).
 function emitUnionBoxEqStagedX(
   body: u8[],
-  arms: string[],
+  armTys: i32[],
   vis: i32[],
   aks: i32[],
   rAks: i32[],
   isNe: boolean,
-  uty: i32,
   fnIx: i32,
 ) {
   const sl = unionEqStashSlot()
@@ -11300,7 +11303,7 @@ function emitUnionBoxEqStagedX(
   while a < vis.length - 1 {
     fbLocalGet(sl)
     fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, unionArmTagOf(vis[a], aks[a], uty, arms[a]))
+    fbI32Rel(RS_TAG, unionArmTagOf(vis[a], aks[a], armTys[a]))
     fbI32Bin(70)
     fbIf(127)
     if emitUnionArmEq(body, sl, sr, vis[a], aks[a], fnIx) < 0 { return -1 }
@@ -11329,9 +11332,9 @@ function emitUnionBoxEqStagedX(
   if numPairs < 0 { return -1 }
   if unionCloArmCount(aks) >= 2 {
     // A function value's identity is its declaration, whichever function-type arm holds it.
-    emitUnionCloTagIn(sl, vis, aks, uty, arms)
+    emitUnionCloTagIn(sl, vis, aks, armTys)
     fbIf(127)
-    emitUnionCloTagIn(sr, vis, aks, uty, arms)
+    emitUnionCloTagIn(sr, vis, aks, armTys)
     fbIf(127)
     if emitUnionArmEq(body, sl, sr, -1, 11, fnIx) < 0 { return -1 }
     fbElse()
@@ -11540,20 +11543,14 @@ function unionCloArmCount(aks: i32[]): i32 {
 }
 
 // Pushes whether the box parked in `slot` sits in one of the union's function-value arms.
-function emitUnionCloTagIn(
-  slot: i32,
-  vis: i32[],
-  aks: i32[],
-  uty: i32,
-  arms: string[],
-) {
+function emitUnionCloTagIn(slot: i32, vis: i32[], aks: i32[], armTys: i32[]) {
   fbI32Const(0)
   let a = 0
   while a < aks.length {
     if aks[a] == 11 {
       fbLocalGet(slot)
       fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, unionArmTagOf(vis[a], aks[a], uty, arms[a]))
+      fbI32Rel(RS_TAG, unionArmTagOf(vis[a], aks[a], armTys[a]))
       fbI32Bin(70)  // 0x46 i32.eq
       fbI32Bin(114) // 0x72 i32.or
     }
@@ -11633,7 +11630,7 @@ function variantFieldComparable(vi: i32, ufi: i32): boolean {
 function variantBoxFieldComparable(ufi: i32): boolean {
   const bty = sFieldElemTyIxOfRow(ufi)
   if bty < 0 { return false }
-  const bArms: string[] = []
+  const bArms: i32[] = []
   const bVis: i32[] = []
   const bAks: i32[] = []
   unionBoxEqColumns(bty, bArms, bVis, bAks)
@@ -11664,26 +11661,9 @@ function variantRefListFieldSlot(ufi: i32): i32 {
 // D1061 — the box tag of one arm of a mixed struct/scalar union, from whichever of the two
 // per-arm columns holds it. The two tag spaces are disjoint by construction: a variant tag is an
 // index into `uVariants` and `scalarTagOfKind(k)` is `uVariants.length + k`.
-function unionArmTagOf(vi: i32, ak: i32, uty: i32, atom: string): i32 {
+function unionArmTagOf(vi: i32, ak: i32, armTy: i32): i32 {
   if vi >= 0 { return uTags[vi] }
-  unionEqTagOfArmTy(ak, armTyOfUnionTy(uty, atom))
-}
-
-// The member type of union type `uty`'s arm spelled `atom`, read off the type's own arms (the
-// ones `unionBoxEqColumns` named); an arm it lacks is a compile failure.
-function armTyOfUnionTy(uty: i32, atom: string): i32 {
-  const as: string[] = []
-  const ts: i32[] = []
-  if unionTyArms(uty, as, ts) {
-    let i = 0
-    while i < as.length && i < ts.length {
-      if as[i] == atom { return ts[i] }
-      i = i + 1
-    }
-  }
-  emitFail(
-    "emitProgram: a union `==` arm is missing from its union type's arms",
-  )
+  unionEqTagOfArmTy(ak, armTy)
 }
 
 // D1061 — one arm of a mixed struct/scalar union, dispatched on which column named it. The
@@ -11855,21 +11835,13 @@ function emitVariantFieldEqCoreAt(
   }
   if c == "union" {
     if ufi < 0 { return -1 }
-    const vbArms: string[] = []
+    const vbArms: i32[] = []
     const vbVis: i32[] = []
     const vbAks: i32[] = []
     if !unionBoxEqColumns(sFieldElemTyIxOfRow(ufi), vbArms, vbVis, vbAks) {
       return -1
     }
-    return emitUnionBoxEqStaged(
-      body,
-      vbArms,
-      vbVis,
-      vbAks,
-      false,
-      sFieldElemTyIxOfRow(ufi),
-      fnIx,
-    )
+    return emitUnionBoxEqStaged(body, vbArms, vbVis, vbAks, false, fnIx)
   }
   const lk = eqVariantListKind(c)
   if lk >= 0 { return emitListEqAnyRep(body, lk, 0, fnIx) }
@@ -11980,7 +11952,7 @@ function emitUnionUnionEq(
     // An operand that cannot be re-read is evaluated once and compared by the staged core,
     // over the left union's arms: tags are per atom, so a right-hand arm the left lacks
     // fails the tag test, and a shared tag names the same payload rep on both sides.
-    const sArms: string[] = []
+    const sArms: i32[] = []
     const sVis: i32[] = []
     const sAks: i32[] = []
     if (
@@ -11996,16 +11968,7 @@ function emitUnionUnionEq(
       }
       if emitExpr(body, lIx, fnIx) < 0 { return -1 }
       if emitExpr(body, rIx, fnIx) < 0 { return -1 }
-      return emitUnionBoxEqStagedX(
-        body,
-        sArms,
-        sVis,
-        sAks,
-        rKs,
-        isNe,
-        lUTy,
-        fnIx,
-      )
+      return emitUnionBoxEqStagedX(body, sArms, sVis, sAks, rKs, isNe, fnIx)
     }
     return emitFail(
       "emitProgram: union `==` over a non-binding union value is not supported yet",
@@ -12028,47 +11991,32 @@ function emitUnionUnionEq(
       "emitProgram: `==` over a struct union is not supported yet",
     )
   }
-  // The shared non-null arms, matched by atom, since atoms tag globally. Both operands' member
-  // lists come from the recorded member columns when the pool covers them — `msMemberAtomsOf`
-  // hands back exactly the atoms `splitUnionAtoms` would, in the row's recorded box-tag order —
-  // so the intersection walks two recorded lists. Each side declines independently.
-
-  // The membership compare stays the verbatim spelling compare `unionHasAtom` performs, not the
-  // keyword-primitive test of `unMemHasAtomRow`: an arm spelled `(() => i64)` or a litunion alias
-  // is a member here and answers no there. The left row's banked value-atom codes travel with the
-  // surviving arms, index-parallel to the atom column; an uncovered row marks its arms -2.
-  const lAtoms: string[] = []
+  // The shared non-null arms, matched by member type (`memberTySame`): each operand's member types
+  // come from its recorded member set, else from the union its read holds, and each side declines
+  // independently. The left set's banked kinds travel with the surviving arms, index-parallel to
+  // its member types; an uncovered set marks its arms -2.
   const lTys: i32[] = []
-  if msMemberAtomsOfSet(lsid, lAtoms) {
-    msMemberTysOfSet(lsid, lTys)
-  } else {
-    // The arms of the union the left read holds (`unionTyArms`); none when it covers none.
-    unionTyArms(unionBoxTyOfRead(lIx, fnIx), lAtoms, lTys)
+  if !msMemberTysOfSet(lsid, lTys) {
+    unionTyMemberTys(unionBoxTyOfRead(lIx, fnIx), lTys)
   }
   const lKinds: i32[] = []
   let lKindsOk = msMemberValKindsOf(lsid, lKinds)
-  if lKinds.length != lAtoms.length { lKindsOk = false }
-  const rAtoms: string[] = []
+  if lKinds.length != lTys.length { lKindsOk = false }
   const rTys: i32[] = []
-  let rOk = msMemberAtomsOfSet(rsid, rAtoms)
-  if rOk { msMemberTysOfSet(rsid, rTys) }
+  let rOk = msMemberTysOfSet(rsid, rTys)
   if !rOk {
-    // The right list needs the same alias expansion as the left. Without it the intersection
-    // below falls to `unionHasAtom(rname, …)`, which answers false for a declared union's own
-    // atoms, every arm is filtered out, and the loop emits nothing — so control reaches the
-    // tag-only fallback and `==` compares just the two tags (D989).
-    if (unionTyArms(unionBoxTyOfRead(rIx, fnIx), rAtoms, rTys)) { rOk = true }
+    // A right side with no recorded set still has its type's members; without them every arm
+    // would filter out and `==` would compare just the two tags (D989).
+    rOk = unionTyMemberTys(unionBoxTyOfRead(rIx, fnIx), rTys)
   }
-  const arms: string[] = []
+  const arms: i32[] = []
   const armKinds: i32[] = []
   let ai = 0
-  while ai < lAtoms.length {
+  while ai < lTys.length {
     let inR = false
     if rOk {
-      let rj = 0
-      while rj < rAtoms.length {
-        if rAtoms[rj] == lAtoms[ai] { inR = true }
-        rj = rj + 1
+      for rt in rTys {
+        if memberTySame(lTys[ai], rt) { inR = true }
       }
     } else {
       // The right operand's arms come from its member set or its box type; one with neither has
@@ -12077,29 +12025,26 @@ function emitUnionUnionEq(
         "emitProgram: union `==`: the right operand's arms are known from neither its member set nor its type",
       )
     }
-    if lAtoms[ai] != "null" && inR {
-      arms.push(lAtoms[ai])
+    const isNull = lTys[ai] < 0 || tyPrimNameIs(lTys[ai], "null")
+    if !isNull && inR {
+      arms.push(lTys[ai])
       if lKindsOk { armKinds.push(lKinds[ai]) } else { armKinds.push(-2) }
     }
     ai = ai + 1
   }
-  // The READ half of the banked-kind pair: the arm's recorded code, or a per-atom derivation
-  // where the bank did not cover the row. Both sides read the LEFT union's arm type — the
-  // intersection above matched the two arms by verbatim SPELLING, so they render the same
-  // signature and claim the same slot.
+  // The READ half of the banked-kind pair: the arm's recorded code, refined by its member type.
+  // Both sides read the LEFT union's arm type; the intersection above matched the two arms as the
+  // same member, so they claim the same slot.
   const armKs: i32[] = []
   const armTys: i32[] = []
   const cloTags: i32[] = []
-  const lTy = nodeTyAt(unwrapParen(lIx), fnIx)
   let ki = 0
   while ki < arms.length {
     let armK = armKinds[ki]
     if armK == -2 {
-      return emitFail(
-        "emitProgram: a union == arm has no banked kind: " + arms[ki],
-      )
+      return emitFail("emitProgram: a union == arm has no banked kind")
     }
-    const armTy = unionArmTyOfAtomTy(lname, lTy, arms[ki])
+    const armTy = arms[ki]
     armK = boxArmKindOfTy(armK, armTy)
     armKs.push(armK)
     armTys.push(armTy)
@@ -15150,8 +15095,8 @@ function emitMapGetOrUnionBox(
   // The map value union's members come from its type's member set. One resolution of the
   // set feeds both this walk and the residual-kind code below, so the two cannot disagree.
   const uvsid = msSetOfTy(mvValTyIxAt(mslot))
-  const atoms: string[] = []
-  if !msMemberAtomsOfSet(uvsid, atoms) {
+  const mtys: i32[] = []
+  if !msMemberTysOfSet(uvsid, mtys) {
     return emitFail(
       "emitProgram: a union-valued map's value type has no member set",
     )
@@ -15176,7 +15121,7 @@ function emitMapGetOrUnionBox(
   // A `scalar | null` value (exactly one non-null scalar member) peels to the RAW scalar — take
   // the default on the null tag, else unbox the scalar payload. A nullable default keeps the
   // result `scalar | null`, the box itself, so it takes the multi-member arm below (D2253).
-  if atoms.length == 2 && !defExprNullable(defIx) {
+  if mtys.length == 2 && !defExprNullable(defIx) {
     // `ak` is the residual member's banked ABI code; when unresolved (-2) it re-parses
     // the rendered atom instead. That fallback is unreached on the corpus and fuzz
     // corpora (`docs/internals/destringify-types-program.md` P-RCH/P-SITE) because an
@@ -15540,7 +15485,8 @@ function emitMapGetOrScalarJoin(
   const vb = vbHeapIdxOfKind(ak)
   if (
     vb < 0
-    || !unionTyHasAtom(boxDstTyOf(e.binRight, fnIx), scalarAtomNameOfKind(ak))
+    || scalarAtomNameOfKind(ak) == ""
+    || !unionTyHasBoxKind(boxDstTyOf(e.binRight, fnIx), ak)
   ) {
     return emitFailAt(
       "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
@@ -15731,7 +15677,7 @@ function emitScalarMapReadBoxEq(
   if bn is Index { return 0 }
   const bxs = msSetOfTy(unionBoxTyOfRead(boxIx, fnIx))
   if !exprUnion(boxIx, fnIx) || bxs < 0 || !msHasNull(bxs) { return 0 }
-  if !msSetHasAtom(bxs, scalarAtomNameOfKind(k)) { return 0 }
+  if scalarAtomNameOfKind(k) == "" || !msSetHasPrimKind(bxs, k) { return 0 }
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
   pushMapScr(body, 5)     // entry
   fbIf(127)               // i32 result
@@ -20108,7 +20054,7 @@ function emitListEqGCore(body: u8[], kind: i32, slot: i32, fnIx: i32) {
     // EQUALITY.
     "union" => {
       const un = if slot >= 0 && slot < rlElemName.length { rlElemUnionName(slot) } else { "" }
-      const uArms: string[] = []
+      const uArms: i32[] = []
       const uVis: i32[] = []
       const uAks: i32[] = []
       if (
@@ -20119,18 +20065,7 @@ function emitListEqGCore(body: u8[], kind: i32, slot: i32, fnIx: i32) {
           "emitProgram: list compare over a union element with no arm columns",
         )
       }
-      if (
-        emitUnionBoxEqStaged(
-          body,
-          uArms,
-          uVis,
-          uAks,
-          false,
-          rlElemTyIxAt(slot),
-          fnIx,
-        )
-        < 0
-      ) {
+      if (emitUnionBoxEqStaged(body, uArms, uVis, uAks, false, fnIx) < 0) {
         return -1
       }
       fbI32Eqz() // 0x45
@@ -20344,10 +20279,10 @@ function xrepElemEq(
         "emitProgram: list compare over a union element with no row",
       )
     }
-    const armsA: string[] = []
+    const armsA: i32[] = []
     const visA: i32[] = []
     const aksA: i32[] = []
-    const armsB: string[] = []
+    const armsB: i32[] = []
     const visB: i32[] = []
     const aksB: i32[] = []
     if (
@@ -20360,16 +20295,7 @@ function xrepElemEq(
     }
     xrepElemRead(fA + 0, i, wA, bA, true)
     xrepElemRead(fB + 1, i, wB, bB, true)
-    return emitUnionBoxEqStagedX(
-      body,
-      armsA,
-      visA,
-      aksA,
-      aksB,
-      false,
-      rlElemTyIxAt(sA),
-      fnIx,
-    )
+    return emitUnionBoxEqStagedX(body, armsA, visA, aksA, aksB, false, fnIx)
   }
   // A box against a number, the box read first whichever side holds it.
   let boxSlot = sA
@@ -20390,7 +20316,7 @@ function xrepElemEq(
   }
   const os = numCrossEqSlot(numKind)
   fbLocalSet(os)
-  const arms: string[] = []
+  const arms: i32[] = []
   const vis: i32[] = []
   const aks: i32[] = []
   if (!unionBoxEqColumns(rlElemTyIxAt(boxSlot), arms, vis, aks)) {
@@ -21285,21 +21211,13 @@ function emitStructEqFieldAt(
     // core cannot serve declines before any byte is written and reaches the loud refusal below (D1290).
     const bxTy = sFieldElemTyIxAt(si, fi)
     if bxTy >= 0 {
-      const bxArms: string[] = []
+      const bxArms: i32[] = []
       const bxVis: i32[] = []
       const bxAks: i32[] = []
       if (unionBoxEqColumns(bxTy, bxArms, bxVis, bxAks)) {
         if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
         if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-        return emitUnionBoxEqStaged(
-          body,
-          bxArms,
-          bxVis,
-          bxAks,
-          false,
-          bxTy,
-          fnIx,
-        )
+        return emitUnionBoxEqStaged(body, bxArms, bxVis, bxAks, false, fnIx)
       }
     }
   }
@@ -22134,7 +22052,9 @@ function boxRetagArmsOfTys(
   tt: i32[],
 ): boolean {
   if fromTy < 0 || toTy < 0 { return false }
-  if !unionTyArms(fromTy, [], ft) || !unionTyArms(toTy, [], tt) { return false }
+  if !unionTyMemberTys(fromTy, ft) || !unionTyMemberTys(toTy, tt) {
+    return false
+  }
   for pt in ft {
     if boxAtomRetagKind(pt, tt, ft) >= 0 { return true }
   }
@@ -38070,7 +37990,7 @@ function njMembersOf(ix: i32, fnIx: i32): i32[] {
   const name = unionNameRowOfExpr(ix, fnIx, nr)
   if name == "" { return none }
   const out: i32[] = []
-  for k in njKindsOfUnion(nr[0], name) {
+  for k in njKindsOfUnion(nr[0]) {
     if k == 6 {
       // Skipped: an operator reaches a type parameter's box only past a check that excluded
       // `null` (the template's narrowing), whatever member set the instance's name spells.
@@ -38316,7 +38236,7 @@ function njBoxHoldsNull(ix: i32, fnIx: i32): boolean {
   const nr: i32[] = []
   const name = unionNameRowOfExpr(ix, fnIx, nr)
   if name == "" { return false }
-  for k in njKindsOfUnion(nr[0], name) {
+  for k in njKindsOfUnion(nr[0]) {
     if k == 6 { return true }
   }
   false
@@ -38437,11 +38357,11 @@ function njConvertArm(ms: i32[], i: i32, bs: i32, to: i32) {
   0
 }
 
-// The value-atom kinds of the members of union `unionName` whose row is `u`: the row's banked
-// kinds. A row with none is a compile failure.
-function njKindsOfUnion(u: i32, unionName: string): i32[] {
+// The value-atom kinds of the members of union row `u`: the row's banked kinds. A row with none is
+// a compile failure.
+function njKindsOfUnion(u: i32): i32[] {
   const ks: i32[] = []
-  if msMemberValKindsOf(msSetOfRowOr(u, unionName), ks) { return ks }
+  if msMemberValKindsOf(msSetOfRow(u), ks) { return ks }
   emitFail("emitProgram: a numeric union's row has no banked member kinds")
   ks
 }
@@ -40215,11 +40135,7 @@ function coalNicheBoxTag(joinTy: i32, lhsIx: i32, heapIx: i32, fnIx: i32): i32 {
   }
   const ak = coalNicheAtomKind(lhsIx, fnIx)
   if ak >= 0 {
-    const en = refAtomElemName(ak)
-    if en == "" { return -1 }
-    if !unionTyHasAtom(joinTy, if ak != 2 { en + "[]" } else { en }) {
-      return -1
-    }
+    if refAtomElemName(ak) == "" || !unionTyHasBoxKind(joinTy, ak) { return -1 }
     return scalarTagOfKind(ak)
   }
   const vi = unionArmVariantWithHeap(joinTy, heapIx)
@@ -40398,7 +40314,7 @@ function emitCoalesceNulBoolJoin(
   }
   const joinTy = boxDstTyOf(e.binRight, fnIx)
   const bvb = vbHeapIdxOfKind(1)
-  if bvb < 0 || !unionTyHasAtom(joinTy, "boolean") {
+  if bvb < 0 || !unionTyHasBoxKind(joinTy, 1) {
     return emitFailAt(
       "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
       exprIx,
@@ -41974,6 +41890,14 @@ function emitCoalesceOptNulRecord(
   if nfKind == "union" {
     return emitOptCoalesceBoxLeaf(body, e, lhs, nHeap, nfi, exprIx, fnIx)
   }
+  // A map leaf is the standalone `?.`'s nullable map ref, so the nullable-map core takes it.
+  if nfKind == "map" || nfKind == "nulmap" {
+    const nms = sFieldMapShape(nsi, nfi)
+    if nms == -3 {
+      return emitFail("emitProgram: `?.` map leaf's value type is still open")
+    }
+    return emitCoalesceNulRef(body, e, exprIx, mapTypeIdxOf(nms), fnIx)
+  }
   const nfLeaf = optLeafKindOf(
     fieldRowNumKind(nfRow),
     fieldRowIsStr(nfRow, false),
@@ -42076,14 +42000,15 @@ function emitCoalesceOptMapField(
   if omFi < 0 {
     return emitFail("emitProgram: `?.` field is not on the map's value struct")
   }
-  if omNum != 0 {
+  const omLeaf = optLeafKindOf(omNum, false)
+  if omLeaf == null {
     return emitFail(
-      "emitProgram: `?.` over a map read supports only i32/boolean fields",
+      "emitProgram: `?.` over a map read has no `if` blocktype for this field's rep",
     )
   }
   if emitMapPrep(body, omInner.idxArr, omInner.idxIndex, fnIx) < 0 { return -1 }
   pushMapScr(body, 5)          // entry
-  fbIf(127)                    // if (entry != 0 → hit), i32 blocktype
+  fbIfForOptLeaf(omLeaf)       // if (entry != 0 → hit), at the field's blocktype
   pushMapVals(body)
   fbStructGet(cmValsWrap(), 0) // vals backing
   pushMapScr(body, 5)          // entry
@@ -42093,7 +42018,7 @@ function emitCoalesceOptMapField(
   fbRefAsNonNull()             // a live entry's value is non-null
   fbStructGet(omHeap, omFi)    // .f — the arm's `variantHeap` row or the struct's
   fbElse()                     // else
-  if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+  if emitOptLeafDefault(body, e.binRight, omLeaf, fnIx) < 0 { return -1 }
   fbEnd()                      // end (if)
   return 0
 }
@@ -42111,7 +42036,7 @@ function emitCoalesceOptMember(
   // The null-safe field read `m[k]?.f ?? d` over a struct-valued map is the fused form: probe;
   // on a hit read the field off the (non-null) value struct, else push the default. A live
   // entry's value slot is never null, so the `?.` null test coincides with the probe's hit
-  // test. Scalar (i32/boolean) fields only (a value-typed `if` blocktype carries them).
+  // test. A field whose rep has an `if` blocktype only (`optLeafKindOf`).
   if lhs is OptMember {
     const omInner = nodeAt(lhs.omObj)
     if omInner is Index {
