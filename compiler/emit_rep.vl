@@ -133,6 +133,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  cStructFirstPos,
   cUserTypes,
   cUserTypesVer,
   cVariantMemberTyIxs,
@@ -155,7 +156,6 @@ import {
   tyIxIsVariantMember,
   tyMutEpoch,
   tySame,
-  tyToNominalName,
   tyToStrUser,
 } from "./check_types"
 import { sidOf } from "./symbols"
@@ -2103,11 +2103,13 @@ export function sTyIxOfNameTy(nm: string, tyIx: i32): i32 {
   // arena types per call (the #961 runaway shape), but the annotation-name memo keeps
   // the cost in the noise. A name resolving through neither path stays -1, and `slotCanonId` falls through to its existing name behaviour.
   if nameIsShapeSpanEnds(nm) { return resolveAnnot(nm, repNoTyparams) }
-  // The generic-application fallback (`Box<i32>`), one spelling wider: `gaeEnsure`
-  // mints a row for every concrete application and records the sidecar through this
-  // function. Safe by construction: `resolveAnnot` is the same resolution the checker
-  // performed at that spelling, so the recorded index is not a new equivalence — `buildStructTwins`'s second gate (`structFieldCodesEq`) still has to agree.
-  if annGenAppSpanEnds(nm) { return resolveAnnot(nm, repNoTyparams) }
+  // A generic application (`Box<i32>`) is minted with its type, so a spelled one here has none.
+  if annGenAppSpanEnds(nm) {
+    emitFail(
+      "emitProgram: a generic application's row was minted with no type: " + nm,
+    )
+    return -1
+  }
   -1
 }
 
@@ -2427,10 +2429,8 @@ export function msMaskIsEmpty(m: i32[]): boolean {
   true
 }
 
-// The banked value-atom kind of the single member of interned member set `s` — what
-// every `valueAtomKind(removeAtomFromSet(set, "null"))` consumer is really asking,
-// since a residual with 0 or 2+ members renders as `""`/`"a|b"` and `valueAtomKind`
-// answers -1 for both. -1 for a non-singleton set (the same answer the rendered form gives); -2 only when the pool or bank does not cover the set.
+// The banked value-atom kind of the single member of interned member set `s`. -1 for a
+// non-singleton set; -2 only when the pool or bank does not cover the set.
 export function msSoloValKind(s: i32): i32 {
   if s < 0 || s >= msSetRow.length { return -2 }
   if msSetGen[s] != msGen.at { return -2 }
@@ -2824,11 +2824,13 @@ export function slotRowTyOf(si: i32): i32 {
   // returns a non-"" key on the corpus, so the fall-through is not decoration. Two of
   // its properties stay invisible to the corpus, stated rather than banked as a zero.
   const nm = sNames[si]
-  let di = cUserTypes[nm] ?? -1
-  if di < 0 {
-    // The inline-shape fallback: only a bare `{...}` spelling (not a map `{[`)
-    // resolves; the checker memoizes shape resolution, so this stays cheap.
-    if nameIsShapeSpanEnds(nm) { di = resolveAnnot(nm, repNoTyparams) }
+  const di = cUserTypes[nm] ?? -1
+  // An inline record row is minted with its type (rung 1), so a spelled one here has none.
+  if di < 0 && nameIsShapeSpanEnds(nm) {
+    emitFail(
+      "emitProgram: an inline record's row was minted with no type: " + nm,
+    )
+    return -1
   }
   if di >= 0 {
     const t = tyAt(di)
@@ -3433,23 +3435,6 @@ export function valueBoxOfTy(ty: i32): boolean {
   true
 }
 
-// `valueBoxOfTy` for a site that registers rows: a numeric literal set with `null` (`N | null`
-// over `N = 1 | 2`) is boxed, but no row is registered under it yet, so these sites say no (D16062).
-export function valueBoxRowOfTy(ty: i32): boolean {
-  !nulNumLitSetTy(ty) && valueBoxOfTy(ty)
-}
-
-// Whether `ty` is a numeric literal set with `null` (`N | null` over `N = 1 | 2`).
-function nulNumLitSetTy(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  const t = tyAt(ty)
-  if !(t is TyNullable) || t.nInner < 0 { return false }
-  const b = numLitUnionBaseTy(t.nInner)
-  if b < 0 || b == t.nInner { return false }
-  const bt = tyAt(b)
-  bt is TyPrim && bt.primName != "string" && bt.primName != "boolean"
-}
-
 // Whether the rep tree lowers `ty` as a union box or a boxed nullable, read off the same
 // classifiers `rtOfUnion` and `rtOfNullable` build from.
 function repBoxesTy(ty: i32, depth: i32): boolean {
@@ -3912,15 +3897,27 @@ function repNeverCanonGo(ty: i32, depth: i32) {
   }
 }
 
-// Are the arms `ms` all one type: one member, or members alike in structure and in name?
+// Are the arms `ms` all one type: one member, or members alike in structure and in declaration?
+// Twin records under two declared names (`Cat | Kot`) are two arms, as are two brands of one base.
 function unionArmsAllSame(ms: i32[]): boolean {
   if ms.length < 1 { return false }
   if ms.length == 1 { return true }
-  const n0 = tyToNominalName(ms[0])
   for m in ms {
-    if !tySame(m, ms[0]) || tyToNominalName(m) != n0 { return false }
+    if !tySame(m, ms[0]) || !armDeclSame(m, ms[0]) { return false }
   }
   true
+}
+
+// Whether `a` and `b` name the same declaration: the same declared struct position and the same
+// nominal brand. Two undeclared types answer true, so a caller pairs it with `tySame`.
+export function armDeclSame(a: i32, b: i32): boolean {
+  armDeclPos(a) == armDeclPos(b) && nomNameOfTy(a) == nomNameOfTy(b)
+}
+
+// The declared struct position arena type `m` records, or -1 for a type no declaration names.
+function armDeclPos(m: i32): i32 {
+  if m < 0 || m >= cStructFirstPos.length { return -1 }
+  cStructFirstPos[m]
 }
 
 // The niche of `S | null` for object type `S`: `nulvariant`, the `(ref null $variantHeap(vi))`
