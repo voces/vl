@@ -100,7 +100,6 @@ import {
   fieldElemTyIxOfName,
   mapShapeKeyKind,
   mvSlotOfTyKArm,
-  mvValTyIxOfNameRow,
   nodeMapValTyIx,
   recordMvValTyIx,
   recordUnMemTys,
@@ -117,6 +116,7 @@ import {
 import {
   elemTyIsNominal,
   fnTagListRepName,
+  fnTagListRepTy,
   mapNodeValName,
   mvCanonRepOf,
   mvCanonValNameTy,
@@ -293,15 +293,28 @@ import {
 // arena cannot name has no slot: `-3`.
 export function mvShapeOfMapHeldTy(heldTy: i32, armTy: i32, valTy: i32) {
   const m = tyMapHeld(heldTy)
-  const vn = mvDeclNameOfValTy(tyMapValOf(m))
+  const vt = tyMapValOf(m)
+  const vn = mvDeclNameOfValTy(vt)
   if vn == "" { return -3 }
-  mvShapeOfMapValKey(vn, tyMapKeyKind(m), armTy, valTy)
+  mvShapeOfMapValKey(
+    vn,
+    tyMapKeyKind(m),
+    if armTy >= 0 { armTy } else { vt },
+    armTy,
+    valTy,
+  )
 }
 
-// The mv shape of a map whose value is keyed `valName` under key kind `ki`: the value's slot,
-// or the mono sentinel of `ki` for a value that needs none.
-function mvShapeOfMapValKey(valName: string, ki: i32, armTy: i32, valTy: i32) {
-  const sh = mvShapeOfValNameTys(valName, ki, armTy, armTy, valTy)
+// The mv shape of a map whose value is keyed `valName` (of type `rowTy`) under key kind `ki`:
+// the value's slot, or the mono sentinel of `ki` for a value that needs none.
+function mvShapeOfMapValKey(
+  valName: string,
+  ki: i32,
+  rowTy: i32,
+  armTy: i32,
+  valTy: i32,
+) {
+  const sh = mvShapeOfValNameTys(valName, ki, rowTy, armTy, valTy)
   // A mono value — i32, boolean, a literal-union atom or a nullable atom — rides the shared
   // i32 `vals` list and needs no per-value struct, so it is the `-1` string-keyed or `-4`
   // i32-keyed sentinel every value-blind classifier already reads as the mono rep.
@@ -319,7 +332,7 @@ export function mvShapeOfMapNodeTy(ix: i32) {
   // A `Map()` whose values the checker builds at another record mints that record's slot.
   const bv = recBuildElemTyOfInit(ix)
   if bv >= 0 && mvDeclNameOfValTy(bv) != "" {
-    return mvShapeOfMapValKey(mvDeclNameOfValTy(bv), ki, bv, bv)
+    return mvShapeOfMapValKey(mvDeclNameOfValTy(bv), ki, bv, bv, bv)
   }
   if nodeTyMapValIsLitUnion(ix) { return mapMonoShapeOfKey(ki) }
   if nodeTyMapValIsNulLitUnion(ix) { return mapMonoShapeOfKey(ki) }
@@ -334,7 +347,13 @@ export function mvShapeOfMapNodeTy(ix: i32) {
   if sigFuncDeeperThan(nodeMapValTyIx(ix), 8) {
     const dn = mvDeclNameOfValTy(nodeMapValTyIx(ix))
     if dn != "" {
-      return mvShapeOfMapValKey(dn, ki, nodeMapValTyIx(ix), nodeMapValTyIx(ix))
+      return mvShapeOfMapValKey(
+        dn,
+        ki,
+        nodeMapValTyIx(ix),
+        nodeMapValTyIx(ix),
+        nodeMapValTyIx(ix),
+      )
     }
   }
   const sh = mvShapeOfValNameArmTy(
@@ -424,6 +443,12 @@ export function mvShapeOfValTyMint(ty: i32, keyK: i32): i32 {
   mvShapeOfValNameTys(vn, keyK, ty, ty, ty)
 }
 
+// The arena type union row `u` holds (`unTyIx`), or -1.
+function unRowTyAt(u: i32): i32 {
+  if u < 0 || u >= unTyIx.length { return -1 }
+  unTyIx[u]
+}
+
 function mvShapeOfValNameArmTyGo(
   valNameInRaw: string,
   keyK: i32,
@@ -433,12 +458,13 @@ function mvShapeOfValNameArmTyGo(
 ) {
   const valNameIn = mvArmKeyName(valNameInRaw, armTy)
   // A caller with no type classifies by the type the slot banks, so kind and key agree.
-  let kindTy = kindTyIn
-  if kindTy < 0 { kindTy = mvValTyIxOfNameRow(valNameIn, rowTy) }
+  const kindTy = if kindTyIn >= 0 { kindTyIn } else { rowTy }
   // A value of maps nothing can tell apart is stored as their one map.
   const twin = mapTwinUnionMember(kindTy)
   if twin >= 0 { return mvShapeOfValTyK(twin, keyK, armTy) }
   let valName = mvCanonValNameTy(valNameIn, kindTy)
+  // The type a rewritten `valName` denotes, banked in place of a resolution of its spelling.
+  let valNameTy = if valName == valNameIn { -1 } else { fnTagListRepTy(kindTy) }
   const kind = mvValKindOfTy(kindTy)
   if kind == MVK_MONO { return -1 }
   if kind < 0 { return -3 }
@@ -449,9 +475,13 @@ function mvShapeOfValNameArmTyGo(
     const tr = if kindTy >= 0 { unRowOfTyAB(53, kindTy) } else { -1 }
     if tr >= 0 {
       valName = unNames[tr]
+      valNameTy = unRowTyAt(tr)
     } else {
-      const cu = unRowOfTyKey(mvValTyIxOfNameRow(valNameIn, rowTy))
-      if cu >= 0 { valName = unNames[cu] }
+      const cu = unRowOfTyKey(rowTy)
+      if cu >= 0 {
+        valName = unNames[cu]
+        valNameTy = unRowTyAt(cu)
+      }
     }
   }
   // A niche-nullable value name resolves its struct or map identity — and keys its vals
@@ -470,11 +500,10 @@ function mvShapeOfValNameArmTyGo(
     if valueBoxOfTy(kindTy) { registerValueUnionOfTy(60, kindTy) }
     markMapUnionArms(kindTy)
   }
-  // The slot's identity is structural — `repMvValKey` over the value's arena type — paired
-  // with the key rep, not the recorded spelling; the name scan is the fall-through for a
-  // spelling the arena does not resolve. Held rather than consumed, because the row this call
-  // may push records the very same index.
-  const vTy = mvValTyIxOfNameRow(valNameIn, rowTy)
+  // The slot's identity is structural — `repMvValKey` over the value's arena type `rowTy` —
+  // paired with the key rep, not the recorded spelling. Held rather than consumed, because the
+  // row this call may push records the very same index.
+  const vTy = rowTy
   // The arm is part of what is being looked up (D48). Asking the hint at the two find rungs is
   // not the better-answer-at-a-mint the interner rule forbids: it never makes a find succeed
   // where it failed, only decline a slot whose arm is not this value's, so the mint below runs
@@ -518,9 +547,8 @@ function mvShapeOfValNameArmTyGo(
   // `valNameIn` through the same resolver and `resolveAnnot` memoizes per spelling with no
   // invalidation of a positive entry. The one thing that can make the two inputs differ is
   // `mvCanonValNameTy` rewriting the spelling, and there the bank is withheld.
-  let vBank = -1
-  if valName == valNameIn { vBank = vTy }
-  recordMvValTyIx(valName, vBank)
+  const vBank = if valName == valNameIn { vTy } else { valNameTy }
+  recordMvValTyIx(vBank)
   // The row that line just banked: `recordMvValTyIx` holds `valName`'s arena index over the
   // very spelling the two `valName` interns below key on. A mint may be fronted only with a
   // banked input provably the one it would have computed. The kind-6 site above is not

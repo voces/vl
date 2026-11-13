@@ -9,6 +9,17 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-h-ud-member-bank](2026-11-13-h-ud-member-bank.md): Step 7, lane H: declared-union members read the checker's resolution, 2026-11-13
+- [2026-11-13-step7-d16013-storage-norm](2026-11-13-step7-d16013-storage-norm.md): Step 7: D16013 closed, a typed normalizer for the list element's key, 2026-11-13
+- [2026-11-13-step7-decl-name-callers](2026-11-13-step7-decl-name-callers.md): Four `declTyIxOfName` callers graded by origin; the mv name fallbacks are deleted, 2026-11-13
+- [2026-11-13-step7-field-elem-hint-fallback-deleted](2026-11-13-step7-field-elem-hint-fallback-deleted.md): The field recorder's name fallback is deleted, 2026-11-13
+- [2026-11-13-step7-l2-mono-narrowed-pin-typed](2026-11-13-step7-l2-mono-narrowed-pin-typed.md): Step 7 L2, mono: the pin-acceptance test reads the type, not an echoed spelling, 2026-11-13
+- [2026-11-13-step7-l2-mono-r1a-text-decisions](2026-11-13-step7-l2-mono-r1a-text-decisions.md): Step 7 L2, mono, R1 (a): three pin decisions read the type, not their text, 2026-11-13
+- [2026-11-13-step7-lane-e-arena-emit-name](2026-11-13-step7-lane-e-arena-emit-name.md): Step 7: `arenaEmitName`'s renders graded by what they feed, 2026-11-13
+- [2026-11-13-step7-lane-e-drop-fieldtext](2026-11-13-step7-lane-e-drop-fieldtext.md): Step 7: the variant field identity spelling column is deleted, 2026-11-13
+- [2026-11-13-step7-lane-e-intern-shape-as](2026-11-13-step7-lane-e-intern-shape-as.md): Step 7: `internShapeAs` reads the alias's fields off its record type, 2026-11-13
+- [2026-11-13-step7-shared-field-kind-by-type](2026-11-13-step7-shared-field-kind-by-type.md): Step 7 L6 (lane G, #13 P2 step 2b): a shared field's box kind is read off its type, 2026-11-13
+- [2026-11-13-w311-d6-pin-rep-ty](2026-11-13-w311-d6-pin-rep-ty.md): Step 7 D6: a cloned pin carries the type its spelling was minted at, 2026-11-13
 - [2026-11-13-h-decl-rung](2026-11-13-h-decl-rung.md): Step 7, lane H: two `declTyIxOfName` callers stop running the annotation grammar, 2026-11-13
 - [2026-11-13-h-unreached-renders](2026-11-13-h-unreached-renders.md): Step 7, lane H: three unreached renders floored, 2026-11-13
 - [2026-11-13-step7-l2-mono-p6-pin-union-typed](2026-11-13-step7-l2-mono-p6-pin-union-typed.md): Step 7 L2, mono, P6 cut 4: union pins and instance returns are spelled from their types, 2026-11-13

@@ -64,7 +64,7 @@ import {
   optCallRetNameAt,
   optCallRetNodeAt,
 } from "./check_call_resolve"
-import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
+import { canonRewroteNode, canonTyIxOf, udMemberTyAt } from "./check_canon_raw"
 import { collectRetValues, unionAliasMembers } from "./check_nj_join"
 import { declAnnRawTyName, declAnnTyOf } from "./check_gen_alias_anns"
 import { fieldNameOrder } from "./check_obj_shape"
@@ -9153,12 +9153,14 @@ function unionArmsAreScalarsOrContainers(ty: i32): boolean {
 // Whether each record arm `s` names is a variant of row `kr`: by its own name, or as a layout
 // twin of one of the row's arms (`V = D | S` beside `U = C | S`, `D` typed as `C`). Twins are one
 // set (D1712), so a twin takes the first such arm no other arm of `s` names or has taken.
-function declArmsMatchRow(s: UnionDecl, kr: i32): boolean {
+function declArmsMatchRow(s: UnionDecl, sx: i32, kr: i32): boolean {
   const lo = unVarStart[kr]
   const hi = lo + unVarCount[kr]
   const taken: i32[] = []
-  for m in s.udVariants {
-    const mt = declTyIxOfName(m)
+  let mi = 0
+  while mi < s.udVariants.length {
+    const mt = declMemberTy(sx, mi)
+    mi = mi + 1
     if mt >= 0 && tyAt(mt) is TyObj {
       let hit = -1
       let v = lo
@@ -9178,6 +9180,17 @@ function declArmsMatchRow(s: UnionDecl, kr: i32): boolean {
     }
   }
   true
+}
+
+// The type member `mi` of the union declared at node `sx` resolved to when the checker filled
+// it. Every declaration the checker accepts banks its members, so a miss fails loudly.
+function declMemberTy(sx: i32, mi: i32): i32 {
+  const t = udMemberTyAt(sx, mi)
+  if t < 0 {
+    emitFail("emitProgram: a declared union member has no checked type")
+    return -1
+  }
+  t
 }
 
 // Register the declared union `s` (at statement `stmtIx`): its row, member set and key, its
@@ -9212,7 +9225,9 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
       const plain = valueBoxOfTy(dty) || tyIsLitUnion(dty)
       if (
         (plain && unVarCount[kr] == 0)
-        || (!plain && unionArmsAreRecordsOrScalars(dty) && declArmsMatchRow(s, kr))
+        || (!plain
+          && unionArmsAreRecordsOrScalars(dty)
+          && declArmsMatchRow(s, stmtIx, kr))
       ) {
         unNameBindRow(s.udName, kr)
         return 0
@@ -9234,13 +9249,15 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   let udSet = ""
   // The variant names: a nullable alias member names its own members, as the flat spelling does (D4040).
   const vsx: string[] = []
+  // Each `vsx` entry's type, from the member's resolution or the arm `unionTyArms` read off it.
+  const vsxTys: i32[] = []
   let usj = 0
   while usj < vs.length {
     let udMem = vs[usj]
     // Asked of the arena row (knows both numeric and string litunion bases); only an alias of
     // more than one arm is expanded, never a literal union's, and never deduped (box-tag ABI).
     const udExp = unionAliasMembers(udMem)
-    const at = declTyIxOfName(vs[usj])
+    const at = declMemberTy(stmtIx, usj)
     if udExp != "" {
       const xAtoms: string[] = []
       const xTys: i32[] = []
@@ -9252,8 +9269,8 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
       if xAtoms.length > 1 && !tyIsLitUnion(at) { udMem = udExp }
     }
     const vAtoms: string[] = []
+    const vTys0: i32[] = []
     if at >= 0 && at < T.tys.length && tyAt(at) is TyNullable {
-      const vTys0: i32[] = []
       if !unionTyArms(at, vAtoms, vTys0) {
         return emitFail(
           "emitProgram: a declared union's nullable member has no resolved arms",
@@ -9262,8 +9279,10 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
     }
     if vAtoms.length > 1 {
       for a in vAtoms { vsx.push(a) }
+      for t in vTys0 { vsxTys.push(t) }
     } else {
       vsx.push(vs[usj])
+      vsxTys.push(at)
     }
     // A function-type member keeps its grouping parens in the join, as the inline union's
     // name does: bare, `(i32)=>i32|string` reads as one arrow returning `i32|string`.
@@ -9296,7 +9315,7 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   const vPos: i32[] = []
   while vPos.length < vsx.length {
     const k = declVariantPos(vsx, vPos.length, memAtoms)
-    vTys.push(if k >= 0 { memTys[k] } else { declTyIxOfName(vsx[vPos.length]) })
+    vTys.push(if k >= 0 { memTys[k] } else { vsxTys[vPos.length] })
     vPos.push(k)
   }
   if mintVariantRows(stmts, vsx, vTys, vPos) < 0 { return -1 }
