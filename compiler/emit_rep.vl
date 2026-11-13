@@ -21,7 +21,6 @@ import { nodeTyAt } from "./emit_capture_frames"
 import { i32ToStr } from "./ast"
 import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { emitFail } from "./emit_bytes"
-import { peelGroupParens } from "./tyname"
 import {
   FC_NUL_REF_LIST,
   FC_REF_LIST,
@@ -41,9 +40,6 @@ import {
   armStageElemKeyKind,
   armStageElemName,
   armStageElemTyIx,
-  msAtomIds,
-  msAtomTexts,
-  msFreeAtomIds,
   msFreeAtoms,
   msFreeByTy,
   msFreeChain,
@@ -84,7 +80,6 @@ import {
   uVarTyIx,
   uVarTyIxResets,
   uVariants,
-  unMemAtomIds,
   unMemAtoms,
   unMemKinds,
   unMemTyCount,
@@ -1114,13 +1109,11 @@ export function repMvValKey(ty: i32): string { repKeyOf(ty, "mv") }
 const repMvKeyStack: i32[] = []
 const repRowKeyStack: i32[] = []
 
-// Record the arena type of the map value name just pushed onto `mvValName`, padded
-// with -1 so a site that skips this self-heals to uncovered. `rowTy` is the caller's
-// own resolution of this spelling (the slot find that ran before the push resolved
-// the same string); -1 means the caller's resolution and this one had different inputs — for the one intern site, that canon rewrote the spelling.
-export function recordMvValTyIx(nm: string, rowTy: i32) {
+// Record `ty`, the arena type of the map value name just pushed onto `mvValName`, padded
+// with -1 so a site that skips this self-heals to uncovered.
+export function recordMvValTyIx(ty: i32) {
   while mvValTyIx.length + 1 < mvValName.length { mvValTyIx.push(-1) }
-  mvValTyIx.push(mvValTyIxOfNameRow(nm, rowTy))
+  mvValTyIx.push(ty)
   0
 }
 
@@ -1199,15 +1192,6 @@ export function tyMapKeyKind(ty: i32): i32 {
   const mt = mapTwinUnionMember(ty)
   if mt >= 0 { return tyMapKeyKind(mt) }
   MAP_KEY_STR
-}
-
-// The arena type a map-value spelling denotes — the rung the name bridge sits on,
-// and the one place a caller's own resolution of that spelling replaces it. `rowTy
-// >= 0` replaces the bridge rather than fronting it: a hint that is merely a better
-// answer may only be tried first, while a hint that is the same input deletes the resolution outright (safe since `resolveAnnot` never invalidates a positive entry).
-export function mvValTyIxOfNameRow(nm: string, rowTy: i32): i32 {
-  if rowTy >= 0 { return rowTy }
-  fieldElemTyIxOfName(nm)
 }
 
 // The (`| null`-peeled) `TyMap` arena index an annotation/expression node denotes,
@@ -2191,20 +2175,6 @@ function recordFieldElemRow(
   0
 }
 
-// The interned id of a union member's atom spelling, after `peelGroupParens` (applied
-// to both sides, so a `(() => i64)` member and an `is () => i64` test are the same
-// reference). Two references are
-// equal iff their ids are, so membership and subtraction are integer work. Ids are pure text identities with no arena content, so the table lives across programs.
-export function msAtomIdOf(atom: string): i32 {
-  const p = peelGroupParens(atom)
-  const hit = msAtomIds[p] ?? -1
-  if hit >= 0 { return hit }
-  const id = msAtomTexts.length
-  msAtomTexts.push(p)
-  msAtomIds[p] = id
-  id
-}
-
 // What a union member is, recorded beside its arena type: 0 the `null` keyword, 1
 // nominal (a declared alias/struct/variant name, whose identity is the name), 2 a
 // scalar primitive, 3 a composite, -1 unresolved. `ty` is the member's already-
@@ -2285,9 +2255,21 @@ export function msSliceAtom(u: i32, i: i32): string {
   msFreeAtoms[msFreeStart[-2 - u] + i]
 }
 
-export function msSliceAtomId(u: i32, i: i32): i32 {
-  if u >= 0 { return unMemAtomIds[unMemRowStart(u) + i] }
-  msFreeAtomIds[msFreeStart[-2 - u] + i]
+// Whether members `i` and `j` of slice `u` are one member: a literal arm reads as its base, so
+// two literal arms on one base are alike; one shape under two declarations is two members.
+function msSliceMembersAlike(u: i32, i: i32, j: i32): boolean {
+  const a = litArmBaseTy(msSliceTy(u, i))
+  const b = litArmBaseTy(msSliceTy(u, j))
+  if a < 0 || b < 0 { return a == b }
+  a == b || tySame(a, b) && armDeclSame(a, b)
+}
+
+// Member type `t` with a literal read as its base; `t` itself otherwise, -1 for `null`.
+function litArmBaseTy(t: i32): i32 {
+  if t < 0 { return t }
+  const x = tyAt(t)
+  if x is TyLit { return litBaseTy(x) }
+  t
 }
 
 export function msSliceKind(u: i32, i: i32): i32 {
@@ -2329,7 +2311,6 @@ export function msFreeSlicePush(
     const a = atoms[i]
     msFreeTys.push(tys[i])
     msFreeAtoms.push(a)
-    msFreeAtomIds.push(msAtomIdOf(a))
     msFreeKinds.push(unMemKindOf(a, tys[i]))
     msFreeValKind.push(if tys[i] < 0 { 6 } else { boxTagOfTy(tys[i]) })
     msFreeLitArm.push(i < lits.length && lits[i])
@@ -2514,11 +2495,7 @@ export function msSetCarriesLitUnionArm(s: i32): i32 {
       let first = true
       let j = 0
       while j < n {
-        if (
-          j != i
-          && msSetHas(s, j)
-          && msSliceAtomId(u, j) == msSliceAtomId(u, i)
-        ) {
+        if (j != i && msSetHas(s, j) && msSliceMembersAlike(u, i, j)) {
           if la != 1 || msSliceLitArm(u, j) != 1 { return -1 }
           twin = true
           if j < i { first = false }
@@ -2715,7 +2692,6 @@ export function msPoolReset() {
   msFreeChain = []
   msFreeTys = []
   msFreeAtoms = []
-  msFreeAtomIds = []
   msFreeKinds = []
   msFreeValKind = []
   msFreeLitArm = []
@@ -2735,7 +2711,6 @@ export function recordUnMemTys(set: string) {
   // (an over-long column is the signature: only this function appends, in lock-step).
   if unMemAtoms.length > unMemTys.length {
     unMemAtoms = []
-    unMemAtomIds = []
     unMemKinds = []
     msPoolReset()
   }
@@ -2779,7 +2754,6 @@ export function recordUnMemTys(set: string) {
     const ty = tys[i]
     unMemTys.push(ty)
     unMemAtoms.push(a)
-    unMemAtomIds.push(msAtomIdOf(a))
     unMemKinds.push(unMemKindOf(a, ty))
     unMemValKind.push(if ty < 0 { 6 } else { boxTagOfTy(ty) })
     unMemLitArm.push(i < lits.length && lits[i])
