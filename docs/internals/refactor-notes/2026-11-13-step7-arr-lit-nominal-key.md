@@ -28,4 +28,5 @@ marks reset per compiled program, over 24,170 programs on master `088d205f5`:
 | instrument | result |
 | --- | --- |
 | full sweep, base master against this change, both fixpoint seeds | 24,235 same; 0 bytes-only movers; 0 output movers; 0 runs → not-runs; 0 new traps |
+| the same on master `12fc8bc25`, after #7870 widened `rlKeyTyOf` | 24,240 same; 0 bytes-only movers; 0 output movers; 0 runs → not-runs; 0 new traps |
 | fast set on the same tree | all green (fixpoint, lint-self clean, regress, filed witnesses, late demands, seed size, comment, ladder, sentinel, scan, render-parse and export ratchets); `vl_row_classes` 19 passed |
