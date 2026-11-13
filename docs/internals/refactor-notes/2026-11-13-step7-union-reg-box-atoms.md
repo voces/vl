@@ -37,5 +37,7 @@ the next cut. The rest are other lanes' slices or the registry's own wrappers.
 ## Proof
 
 - **Seed:** fixpoint.
-- **Locally:** see the PR.
+- **Locally:** lint-self, regress (no runs lost), rep-fuzz (exact), check-filed-witnesses `--strict`
+  (4,864 graded, 0 moved), late-demands (8, baseline 8), seed-size (+1.9%), and the comment,
+  ladder, sentinel and scan budgets.
 - **The full sweep:** CI's `sweep` label. Expected identity.
