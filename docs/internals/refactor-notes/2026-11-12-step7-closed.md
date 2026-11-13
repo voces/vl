@@ -42,19 +42,18 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `1efa7398`, 2026-11-13 04:25)
+## Still failing at this draft (master `641ad71b`, 2026-11-13 05:00)
 
 The close is opened when this list is empty, or holds only items with an open PR. Closed since
 the 23:00 draft: lane D's mono rows (#7681, #7688, #7699, #7708, #7710), lane F's `sFieldRefSlot`
 fallback (#7683), lane H's `variantNestedRow` lookup (#7679) and `printUnionPlanCode` (#7690),
 lane B's `structRowOfSpelling` chain (#7687), lane G's `utkAtomText` (#7704, so `sNameIx`'s
-contract carries no exception), lane E's field-set spelling key (#7707), E/F's `internShapeDeepOfTy` render (#7705, the shape walk takes a type), `emitUnionUnionEq`'s two name reads (#7714), the union-name wrappers' 12 consumers (#7720, G's cut 8a), `variantNestedRow`'s spelling mint (#7724: the stored row, else a loud failure), the `unionNameOfExpr` producer's alias-spelling calls (#7723: keyed by the non-null part's resolved type), and `armFieldStructRowMinted`'s spelling input (it interns by type and records the row's name as a label). After #7727, `unionNameOfExpr` has two callers: the function-value-set floor and D16060's.
+contract carries no exception), lane E's field-set spelling key (#7707), E/F's `internShapeDeepOfTy` render (#7705, the shape walk takes a type), `emitUnionUnionEq`'s two name reads (#7714), the union-name wrappers' 12 consumers (#7720, G's cut 8a), `variantNestedRow`'s spelling mint (#7724: the stored row, else a loud failure), the `unionNameOfExpr` producer's alias-spelling calls (#7723: keyed by the non-null part's resolved type), `armFieldStructRowMinted`'s spelling input (it interns by type and records the row's name as a label), `structElemArrayLowerable` (#7738: `structNameOfTy`), and `unionSetAtomsOf` (#7736, deleted). After #7727, `unionNameOfExpr` has two callers: the function-value-set floor and D16060's.
 
 | lane | sites |
 | --- | --- |
-| E / F (D6 re-key) | `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds` on `shapeWalkKeyOf`); `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`); `structElemArrayLowerable` asks `cUserTypes[tyToNominalName(eTy)]`; `tyToNominalName` renders a non-nominal record structurally, so a spelling reaches the lookup (it can only miss); a type-side `structNameOfTy(eTy) != ""` is proposed |
+| E / F (D6 re-key) | `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds` on `shapeWalkKeyOf`); `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`); `tyIsDeclaredNominal` (#7740) asks `cUserTypes[tyToNominalName(ty)]` and `nameIsGenAppDecl` of the render, the pattern #7738 removed (type-side: `structNameOfTy`, `unionAliasDeclNameOfTy`, `tyIsGenAppInstance`) |
 | F | `nonNulBaseOf` at emit_map_value_slots:653; D16040 (`rlElemStructRow`'s class A, the held-rep key), a floor not on the carried list, so it closes before the close |
-| A | `unionSetAtomsOf` at emit_union_registry:200, A's next cut |
 | B | `variantIndexOf` as a name producer (w324-vio) |
 
 ## Floors held by a filed row
