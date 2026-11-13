@@ -44,7 +44,7 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 ## Still failing at this draft (master `54b68c07`, 2026-11-13 01:20)
 
 The close is opened when this list is empty, or holds only items with an open PR. Closed since
-the 23:00 draft: lane D's mono rows (#7681, #7688, #7699, #7708), lane F's `sFieldRefSlot`
+the 23:00 draft: lane D's mono rows (#7681, #7688, #7699, #7708, #7710), lane F's `sFieldRefSlot`
 fallback (#7683), lane H's `variantNestedRow` lookup (#7679) and `printUnionPlanCode` (#7690),
 lane B's `structRowOfSpelling` chain (#7687), lane G's `utkAtomText` (#7704, so `sNameIx`'s
 contract carries no exception), and lane E's field-set spelling key (#7707).
@@ -54,7 +54,6 @@ contract carries no exception), and lane E's field-set spelling key (#7707).
 | E / F (D6 re-key) | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; the `nm` input `variantNestedRow` and `armFieldStructRowMinted` hand `internInlineShapeTy` |
 | A | `unionNameOfCall` |
 | G | `unionNameOfExpr`'s producer-internal calls (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2) and `emitUnionUnionEq` ×2 |
-| D | `monoAnonPinDiscrim`, converting to the pin's type (ruled), PR to come |
 
 ## Floors held by a filed row
 
