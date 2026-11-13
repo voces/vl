@@ -71,8 +71,14 @@ const expectEq = (what: string, want: unknown, got: unknown) => {
   if (w !== g) throw new Error(`${what}\n  want: ${w}\n  got:  ${g}`);
 };
 
+// A code's total: the sum of its file rows, which is all a baseline stores.
+const totalOf = (
+  b: { files: Record<string, Record<string, number>> },
+  c: string,
+) => Object.values(b.files).reduce((n, r) => n + (r[c] ?? 0), 0);
+
 type Baseline = {
-  total: Record<string, number>;
+  codes: string[];
   files: Record<string, Record<string, number>>;
   entries: [string, string, number][];
   [k: string]: unknown;
@@ -93,7 +99,7 @@ Deno.test({
       }
       const text = await Deno.readTextFile(full);
       const base: Baseline = JSON.parse(text);
-      const total = base.total[CODE];
+      const total = totalOf(base, CODE);
       if (!(total > 0)) {
         throw new Error(
           `the tree carries no ${CODE} finding, so this check is vacuous`,
@@ -120,7 +126,6 @@ Deno.test({
         throw new Error(`${DOCTORED_FILE} has no ${CODE} finding to doctor`);
       }
       doc.files[DOCTORED_FILE][CODE] = was - 1;
-      doc.total[CODE] = total - 1;
       const drop = doc.entries.findIndex((e) =>
         e[1].startsWith(`${DOCTORED_FILE}: `)
       );
@@ -186,7 +191,10 @@ Deno.test({
     const dir = await Deno.makeTempDir({ prefix: "vl_budget_sentinel_" });
     try {
       await Deno.mkdir(`${dir}/compiler`);
-      await Deno.writeTextFile(`${dir}/${SENTINEL_FIXTURE}`, SENTINEL_FIXTURE_SRC);
+      await Deno.writeTextFile(
+        `${dir}/${SENTINEL_FIXTURE}`,
+        SENTINEL_FIXTURE_SRC,
+      );
       const full = `${dir}/full.json`;
       await Deno.copyFile(path, full);
       const [w, ex] = await Promise.all([
@@ -200,7 +208,9 @@ Deno.test({
       ];
       expectEq(
         "--exempt-codes",
-        Object.keys(committed.total).filter((c) => committed.total[c] > 0).join(
+        (committed.codes as string[]).filter((c: string) =>
+          totalOf(committed, c) > 0
+        ).join(
           " ",
         ) + "\n",
         ex.out,
@@ -210,7 +220,7 @@ Deno.test({
       const want = (await Deno.readTextFile(path)).split("\n");
       const got = (await Deno.readTextFile(full)).split("\n");
       const header = (t: string[]) =>
-        t.slice(0, t.findIndex((l) => l.startsWith('"total"')))
+        t.slice(0, t.findIndex((l) => l.startsWith('"codes"')))
           .filter((l) => !l.startsWith('"commit"'));
       expectEq("a write keeps the header", header(want), header(got));
       expectEq(
@@ -224,16 +234,24 @@ Deno.test({
           .map((l) => l.replace(/,$/, "")),
       );
       expectEq(
-        "a write's total line",
-        `"total": {"${u}": 2, "${s}": 0},`,
-        got.find((l) => l.startsWith('"total"')),
+        "a write names its codes, and stores no total",
+        [`"codes": ["${u}", "${s}"],`, undefined],
+        [
+          got.find((l) => l.startsWith('"codes"')),
+          got.find((l) => l.startsWith('"total"')),
+        ],
       );
       // The hold reads a report at exactly the written baseline: the walk is the write's to prove.
       const atBaseline = `${dir}/at-baseline.json`;
       await Deno.writeTextFile(
         atBaseline,
         JSON.stringify(
-          [1, 2].map((line) => ({ file: SENTINEL_FIXTURE, code: u, line, col: 1 })),
+          [1, 2].map((line) => ({
+            file: SENTINEL_FIXTURE,
+            code: u,
+            line,
+            col: 1,
+          })),
         ),
       );
       const check = await vl(["--budget", full, "--findings", atBaseline]);
@@ -267,11 +285,12 @@ Deno.test({
     try {
       // The committed baseline is at zero; a copy owing three reads in one file is the hold.
       const base = JSON.parse(
-        await Deno.readTextFile(`${ROOT}/scripts/sentinel-budget-baseline.json`),
+        await Deno.readTextFile(
+          `${ROOT}/scripts/sentinel-budget-baseline.json`,
+        ),
       );
       const file = "compiler/emit_mono.vl";
       const was = 3;
-      base.total[code] = was;
       base.files[file] = { [code]: was, "sentinel-index-strict-untested": 0 };
       const baselinePath = `${dir}/baseline.json`;
       await Deno.writeTextFile(baselinePath, JSON.stringify(base));
