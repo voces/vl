@@ -60,6 +60,13 @@ with 0 moved and 0 output mismatches. Each carried row reads `runs  runs  as fil
   read where a name read was, and an invariant `emitFail` where a silent default was. It is graded
   by the name ladders deleted.
 
+**The diagnostic renders' reach.** `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` render
+only inside an `emitFailAt` refusal arm. A scratch build trapped at the top of each arm and swept the
+24,243-program population: 0 reaches for either. The one compiler trap was D12131, a filed checker
+stack overflow, not the probe. The same trap at the entry of `mapSoftTwinTagFail` fired on its known
+program, which validates the mechanism. A trap at each function's entry fires in 204 and 5 programs,
+so both functions are live. Only their refusals are unreached, and they stay loud floors.
+
 `goal-scoreboard.vl` reports 1 cell against the goal: a function-value call with no interned
 signature, an emit reject outside step 7's lines.
 
@@ -178,7 +185,7 @@ Routing (coordinator, 2026-11-13):
 - the R2 and R3 (a) sites that run through `isValueUnionName` go to lane H's D16062 PRs, which
   replace that predicate;
 - R4a goes to lane E, R4c to lane G, R6 to lanes F and A;
-- the (d) unreached sites go to lane F as deletions. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; check that `scripts/render-parse-floors.txt` (the census's `ty-carried-floor` code, from #7815) names exactly the carried rows' sites (D16022 ×2, D16032 ×1 and D16052 ×1 at `8c4de865`), and that the census reports no `ty-string-parse`. Read the counts off `render-parse-census.vl --list` or by value, because a baseline row that reaches zero stays at zero since #7859; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches. The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
+- the (d) unreached sites go to lane F as deletions. Before the close opens (in the close PR): re-run every floor witness on the then-current master and quote its output; check that `scripts/render-parse-floors.txt` (the census's `ty-carried-floor` code, from #7815) names exactly the carried rows' sites (D16022 ×2, D16032 ×1 and D16052 ×1 at `8c4de865`), and that the census reports no `ty-string-parse`. Read the counts off `render-parse-census.vl --list` or by value, because a baseline row that reaches zero stays at zero since #7859; probe `nulNicheIsTestImpossible` and `emitMapUnionPayloadTail` across the sweep (scratch build, a firing control) to show 0 reaches (done at the close: "The diagnostic renders' reach", above). The one parse, `nonNulBaseOf`, is D16040's (lane D's PR 2).
 
 ## The census's coverage (lane H, #7748, open)
 
