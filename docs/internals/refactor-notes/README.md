@@ -9,6 +9,16 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-13-w311-d6-walk-union-tests-by-type](2026-11-13-w311-d6-walk-union-tests-by-type.md): Step 7 L2 D6: the shape walk's union tests read the type, 2026-11-13
+- [2026-11-13-w311-d6-sfe-reads-no-text](2026-11-13-w311-d6-sfe-reads-no-text.md): Step 7 L2 D6: a shape field's element name reads no field text, 2026-11-13
+- [2026-11-13-step7-unrow-readers-lane-b](2026-11-13-step7-unrow-readers-lane-b.md): Step 7 L6: lane B's half of the `unRowOfName` readers, 2026-11-13
+- [2026-11-13-step7-union-reg-lit-arm-column](2026-11-13-step7-union-reg-lit-arm-column.md): Step 7 L6 (lane G, #13 step 1): member slices bank a literal-arm column, 2026-11-13
+- [2026-11-13-step7-render-parse-census-coverage](2026-11-13-step7-render-parse-census-coverage.md): Step 7, lane H: what the render-parse census sees, 2026-11-13
+- [2026-11-13-step7-p4-genapp-ensure-by-type](2026-11-13-step7-p4-genapp-ensure-by-type.md): P4, second cut: `gaeEnsure`, `nameIsGenAppDecl` and `gaeParamShadowed` ask the type, 2026-11-13
+- [2026-11-13-step7-p4-genalias-gates-by-type](2026-11-13-step7-p4-genalias-gates-by-type.md): P4: the generic-alias gates read the node and the type, 2026-11-13
+- [2026-11-13-step7-lane-e-d6-field-split-gone](2026-11-13-step7-lane-e-d6-field-split-gone.md): Step 7 D6 (d): the inline-shape interner reads its fields off the record type, 2026-11-13
+- [2026-11-13-step7-l2-mono-tagged-record-rows-by-type](2026-11-13-step7-l2-mono-tagged-record-rows-by-type.md): Step 7 L2, mono: tagged records and literal pins read their rows by type (2026-11-13)
+- [2026-11-13-step7-l2-mono-anon-pin-no-label](2026-11-13-step7-l2-mono-anon-pin-no-label.md): Step 7 L2, mono: no `#anonN` pin is read by its label (2026-11-13)
 - [2026-11-13-w311-d6-rl-elem-struct-row-tagged](2026-11-13-w311-d6-rl-elem-struct-row-tagged.md): Step 7 L2 D6: a ref-list element's struct row is read off its tagged form, 2026-11-13
 - [2026-11-13-w311-d6-fcstruct-records-no-name](2026-11-13-w311-d6-fcstruct-records-no-name.md): Step 7 L2 D6: a typed nested-record field records no element name, 2026-11-13
 - [2026-11-13-step7-vkind-mono-union-annotation-by-type](2026-11-13-step7-vkind-mono-union-annotation-by-type.md): Step 7, lane H: two armed traps at a generic instance's union annotation, 2026-11-13
