@@ -41,18 +41,18 @@ Each is a site that reads a name or keys a row without a closed type, and passes
 | a function-value-set row is keyed by its set | §3.4 | `rlKeyTyOf`'s declines, `rlElemStructRow`'s name rung | #7636; D15552, D15804, D15922 |
 | a type holding a type parameter is not a rep; an open body builds at the open row | §3.4 | the 40 type-parameter-row programs; `monoTypedExtra`'s open-binding text (#7708) | #7654; `2026-11-12-step7-vkind-uncovered-storage-rows.md` |
 
-## Still failing at this draft (master `54b68c07`, 2026-11-13 01:20)
+## Still failing at this draft (master `283177f3`, 2026-11-13 01:40)
 
 The close is opened when this list is empty, or holds only items with an open PR. Closed since
 the 23:00 draft: lane D's mono rows (#7681, #7688, #7699, #7708, #7710), lane F's `sFieldRefSlot`
 fallback (#7683), lane H's `variantNestedRow` lookup (#7679) and `printUnionPlanCode` (#7690),
 lane B's `structRowOfSpelling` chain (#7687), lane G's `utkAtomText` (#7704, so `sNameIx`'s
-contract carries no exception), and lane E's field-set spelling key (#7707).
+contract carries no exception), lane E's field-set spelling key (#7707), and E/F's `internShapeDeepOfTy` render (#7705, the shape walk takes a type).
 
 | lane | sites |
 | --- | --- |
-| E / F (D6 re-key) | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internShapeDeepOfTy`, `internArmShapeRow` renders; the `nm` input `variantNestedRow` and `armFieldStructRowMinted` hand `internInlineShapeTy` |
-| A | `unionNameOfCall` |
+| E / F (D6 re-key) | `structElemArrayLowerable` (`nameIsStructDecl`, `variantIndexOf` on the rendered name; the `nameIsShapeOpen` gate graded against #7668's note); `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds`); E3's `internArmShapeRow` render (`tyToEmitName(aty)` into `armMintShapeName`); the `nm` input `variantNestedRow` and `armFieldStructRowMinted` hand `internInlineShapeTy` |
+| A | `unionNameOfCall`: #7711 records the row beside the name (`unNameRowLast`), but still returns `tyNameOf(fn.fnRet)` and reads `isValueUnionName` on an inferred return's name; it feeds `unionNameOfExpr`, so it closes with G's last consumers or as its own conversion (asked) |
 | G | `unionNameOfExpr`'s producer-internal calls (`letUnionNameOfGo`, `unionNameRowOfExpr`, `unionNameOfExprGo` ×2) and `emitUnionUnionEq` ×2 |
 
 ## Floors held by a filed row
