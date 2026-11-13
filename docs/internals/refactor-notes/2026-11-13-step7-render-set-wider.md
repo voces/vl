@@ -29,7 +29,7 @@ is only measured if every render entry point is counted.
 
 ## The count
 
-`ty-render` rises from 13 to 100, the same code counted honestly; 44 display renders are reported
+`ty-render` rises from 13 to 98 (at master 3eb0db25), the same code counted honestly; 44 display renders are reported
 beside it. By renderer:
 
 | renderer | calls |
