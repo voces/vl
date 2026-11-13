@@ -397,7 +397,6 @@ import {
   sidText,
 } from "./symbols"
 import {
-  annSplitParams,
   drwDispatchOp,
   exprEffectFree,
   fnLetOfRead,
@@ -20958,10 +20957,16 @@ function monoPinAnnotatedParam(
     }
     if !tpBare {
       // A `T[]` pin is the list of the element type `T` binds, spelled from that type; a `T`
-      // bound by spelling alone keeps its spelling.
+      // bound by an explicit argument's spelling alone takes the argument's own closed list type.
       const pet = if bound { boundTy } else { bindTy }
-      const pls = if pet >= 0 { monoPinSpellShaped(mkArrayTy(pet)) } else { "" }
-      pinned.push(if pls != "" { pls } else { arrElemSuffixed(bind) })
+      const plt = if pet >= 0 { mkArrayTy(pet) } else if an2Ty >= 0 && !tyHasTyVar(an2Ty) { an2Ty } else { -1 }
+      const pls = if plt >= 0 { monoPinSpellShaped(plt) } else { "" }
+      if pls == "" {
+        return emitFail(
+          "emitProgram: monomorphize: a `T[]` parameter's list type has no closed spelling",
+        )
+      }
+      pinned.push(pls)
       pinTys.push(monoArgPinTyAt(args[i], ctx))
       const lpat = monoParamPatTy(
         params,
@@ -24054,9 +24059,8 @@ function monoSlotPinNameTys(
 }
 
 // The function type spelling pin `sig` of slot `path` of binding frame `lf` names, returning
-// `ret`, so the name parses as a type: a function-value pin (`=>k`) names only a wasm signature
-// and is spelled as the closed parameter type the pin is taken at, and an inline record pin
-// takes the spelling its shape is interned under (D9381, D9431).
+// `ret`, spelled from the closed parameter types the pin is taken at: a function-value pin (`=>k`)
+// by its concrete function type, any other by the naming rule (D9381, D9431).
 function monoSlotPinAnn(
   lf: i32[],
   path: string[],
@@ -24064,31 +24068,26 @@ function monoSlotPinAnn(
   ret: string,
 ): string {
   const fts = monoPinFnParamTys(lf[1], path, sig)
+  if sig != "" && fts.length == 0 {
+    emitFail(
+      "emitProgram: monomorphize: a slot's pin list has no closed parameter types to spell",
+    )
+    return ""
+  }
   let out = "("
   let k = 0
-  for pn in monoSigPinsTop(sig) {
+  while k < fts.length {
     if k > 0 { out = out + "," }
     if fts.length > 0 && monoPinTyIsFnSig(fts[k]) {
       out = out + "(" + monoConcreteFnTyName(fts[k]) + ")"
     } else if fts.length > 0 && monoConcreteNulFnTyName(fts[k]) != "" {
       out = out + monoConcreteNulFnTyName(fts[k])
-    } else if k < fts.length && monoTyIsInlineRecord(fts[k]) {
-      out = out + monoPinSpellShaped(fts[k])
     } else {
-      out = out + pn
+      out = out + monoPinSpellShaped(fts[k])
     }
     k = k + 1
   }
   out + ")=>" + ret
-}
-
-// The pins of pin list `sig` (`p1,p2,`), split at its top-level commas so a pin spelling a
-// nullable function type keeps its own parameter list.
-function monoSigPinsTop(sig: string): string[] {
-  const out: string[] = []
-  annSplitParams(sig, out)
-  if out.length > 0 { out.pop() }
-  out
 }
 
 // `monoSlotPinNameTys` with a function-value pin left as its wasm signature, which a hole lambda
@@ -24112,7 +24111,6 @@ function monoSlotRetName(lf: i32[], path: string[]): string {
 // otherwise.
 function monoPinFnParamTys(d: i32, path: string[], sig: string): i32[] {
   const none: i32[] = []
-  const ps = monoSigPinsTop(sig)
   let tys: i32[] = none
   for t in elabSlotDeliveries(d, path, -1) {
     const ft = tyAt(t)
@@ -24120,9 +24118,8 @@ function monoPinFnParamTys(d: i32, path: string[], sig: string): i32[] {
       tys = ft.fnParamTypes
     }
   }
-  if tys.length != ps.length { return none }
   let k = 0
-  while k < ps.length {
+  while k < tys.length {
     if monoPinTyIsFnSig(tys[k]) && monoConcreteFnTyName(tys[k]) == "" {
       return none
     }
