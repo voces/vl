@@ -64,7 +64,7 @@ import {
   optCallRetNameAt,
   optCallRetNodeAt,
 } from "./check_call_resolve"
-import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
+import { canonRewroteNode, canonTyIxOf, udMemberTyAt } from "./check_canon_raw"
 import { collectRetValues, unionAliasMembers } from "./check_nj_join"
 import { declAnnRawTyName, declAnnTyOf } from "./check_gen_alias_anns"
 import { fieldNameOrder } from "./check_obj_shape"
@@ -280,7 +280,6 @@ import {
   armStageLitTyIx,
   armStageNames,
   armStageStoreTy,
-  armStageTyText,
   armStageTypes,
   armStructRowMintOn,
   armsAdopted,
@@ -457,7 +456,6 @@ import {
   sFieldNames,
   sFieldStart,
   sFieldStoreTy,
-  sFieldTyText,
   sFieldTypes,
   sHeapIdx,
   sLateRowsOff,
@@ -1041,17 +1039,6 @@ function unionArmsMixed(ms: i32[]): boolean {
 function fdRowOf(fdType: i32) {
   if canonRewroteNode(fdType) { return canonTyIxOf(fdType) }
   nodeTyIxOf(fdType)
-}
-
-// The variant identity column's literal rung: a bare literal annotation (`kind: "circle"`)
-// renders through canon as a softened `string`, so two variants differing only in their tag
-// record a character-identical row and fold as layout-equal twins. Every `TyLit` kind; the
-// quotes keep a literal `"i32"` tag from colliding with the type `i32` in a text column.
-function variantFieldIdText(txt: string, tyIx: i32) {
-  if tyIx < 0 { return txt }
-  const t = tyAt(tyIx)
-  if t is TyLit { return "\"" + t.litText + "\"" }
-  txt
 }
 
 // The discriminant column's cell for a field whose annotation resolved to arena type `tyIx`:
@@ -6801,7 +6788,6 @@ function pushFieldRow(
   elemNm: string,
   keyK: i32,
   fName: string,
-  tyText: string,
   elemTyHint: i32,
   litTyIx: i32,
   cloSig: string,
@@ -6813,7 +6799,6 @@ function pushFieldRow(
       fieldStoreTyOf(code, litTyIx),
     )
     armStageTypes.push(code)
-    armStageTyText.push(tyText)
     // D1023 — the discriminant column: the field's own arena type when it is a literal set, -1
     // otherwise. Pushed here, not per recorder, so no column drifts out of parallel across the three.
     armStageLitTyIx.push(litSetTyIxOf(litTyIx))
@@ -6907,7 +6892,6 @@ function structTableReset() {
   sFieldCloSig = []
   sFieldElemTyIx = []
   sFieldElemKeyKind = []
-  sFieldTyText = []
   sFieldLitTyIx = []
   sFieldStoreTy = []
   famRelayReset()
@@ -6966,7 +6950,7 @@ export function collectS(stmts: i32[]) {
     if s is UnionDecl {
       const aliasShape = unionDeclStructAlias(s)
       if aliasShape != "" {
-        if internShapeAs(s.udName, aliasShape) < 0 { return -1 }
+        if internShapeAs(s.udName) < 0 { return -1 }
       }
     }
     // A union variant `TypeDecl` belongs to the variant table, not here; a generic alias
@@ -7033,7 +7017,6 @@ export function collectS(stmts: i32[]) {
               recNm,
               nodeTyMapKeyKindSpan(fnode.fdType),
               fnode.fdName,
-              "",
               fieldElemHintOf(fnode.fdType, code),
               nodeTyIxOf(fnode.fdType),
               fieldCloSigOfTy(code, nodeTyIxOf(fnode.fdType)),
@@ -7119,7 +7102,6 @@ function collectShapeVariantFields(shapeTy: i32) {
       shapeFieldElemName(fc, fldTy),
       tyMapKeyKindSpan(fldTy),
       fnames[fi],
-      variantFieldIdText(tyToNominalName(fldTy), fldTy),
       fieldElemHintOfRow(fldTy, fldTy, fc),
       fldTy,
       "",
@@ -7183,7 +7165,6 @@ function collectVariantFields(stmts: i32[], ty: i32) {
         while fi < fields.length {
           const fnode = nodeAt(fields[fi])
           if fnode is FieldDef {
-            const ftxt = tyNameOf(fnode.fdType)
             const typeCode = nameFieldCodeTy(recFieldTyOf(ty, fnode.fdName))
             let code = typeCode
             // A field naming a declared record, the arm itself included, waits the same way: the
@@ -7210,13 +7191,10 @@ function collectVariantFields(stmts: i32[], ty: i32) {
               elemNm,
               nodeTyMapKeyKindSpan(fnode.fdType),
               fnode.fdName,
-              variantFieldIdText(ftxt, nodeTyIxOf(fnode.fdType)),
               fieldElemHintOf(fnode.fdType, code),
               nodeTyIxOf(fnode.fdType),
               "",
             )
-            // `fnode` is still in scope here, so the arena node is passed directly rather
-            // than re-deriving it from `ftxt`'s string form.
             cnt = cnt + 1
           } else {
             return emitFail("emitProgram: malformed union-variant field")
@@ -9056,7 +9034,6 @@ function collectUReset() {
   cloSigTagIds = []
   armStageNames = []
   armStageTypes = []
-  armStageTyText = []
   armStageLitTyIx = []
   armStageStoreTy = []
   armStageElemName = []
@@ -9178,12 +9155,14 @@ function unionArmsAreScalarsOrContainers(ty: i32): boolean {
 // Whether each record arm `s` names is a variant of row `kr`: by its own name, or as a layout
 // twin of one of the row's arms (`V = D | S` beside `U = C | S`, `D` typed as `C`). Twins are one
 // set (D1712), so a twin takes the first such arm no other arm of `s` names or has taken.
-function declArmsMatchRow(s: UnionDecl, kr: i32): boolean {
+function declArmsMatchRow(s: UnionDecl, sx: i32, kr: i32): boolean {
   const lo = unVarStart[kr]
   const hi = lo + unVarCount[kr]
   const taken: i32[] = []
-  for m in s.udVariants {
-    const mt = declTyIxOfName(m)
+  let mi = 0
+  while mi < s.udVariants.length {
+    const mt = declMemberTy(sx, mi)
+    mi = mi + 1
     if mt >= 0 && tyAt(mt) is TyObj {
       let hit = -1
       let v = lo
@@ -9203,6 +9182,17 @@ function declArmsMatchRow(s: UnionDecl, kr: i32): boolean {
     }
   }
   true
+}
+
+// The type member `mi` of the union declared at node `sx` resolved to when the checker filled
+// it. Every declaration the checker accepts banks its members, so a miss fails loudly.
+function declMemberTy(sx: i32, mi: i32): i32 {
+  const t = udMemberTyAt(sx, mi)
+  if t < 0 {
+    emitFail("emitProgram: a declared union member has no checked type")
+    return -1
+  }
+  t
 }
 
 // Register the declared union `s` (at statement `stmtIx`): its row, member set and key, its
@@ -9237,7 +9227,9 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
       const plain = valueBoxOfTy(dty) || tyIsLitUnion(dty)
       if (
         (plain && unVarCount[kr] == 0)
-        || (!plain && unionArmsAreRecordsOrScalars(dty) && declArmsMatchRow(s, kr))
+        || (!plain
+          && unionArmsAreRecordsOrScalars(dty)
+          && declArmsMatchRow(s, stmtIx, kr))
       ) {
         unNameBindRow(s.udName, kr)
         return 0
@@ -9259,13 +9251,15 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   let udSet = ""
   // The variant names: a nullable alias member names its own members, as the flat spelling does (D4040).
   const vsx: string[] = []
+  // Each `vsx` entry's type, from the member's resolution or the arm `unionTyArms` read off it.
+  const vsxTys: i32[] = []
   let usj = 0
   while usj < vs.length {
     let udMem = vs[usj]
     // Asked of the arena row (knows both numeric and string litunion bases); only an alias of
     // more than one arm is expanded, never a literal union's, and never deduped (box-tag ABI).
     const udExp = unionAliasMembers(udMem)
-    const at = declTyIxOfName(vs[usj])
+    const at = declMemberTy(stmtIx, usj)
     if udExp != "" {
       const xAtoms: string[] = []
       const xTys: i32[] = []
@@ -9277,8 +9271,8 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
       if xAtoms.length > 1 && !tyIsLitUnion(at) { udMem = udExp }
     }
     const vAtoms: string[] = []
+    const vTys0: i32[] = []
     if at >= 0 && at < T.tys.length && tyAt(at) is TyNullable {
-      const vTys0: i32[] = []
       if !unionTyArms(at, vAtoms, vTys0) {
         return emitFail(
           "emitProgram: a declared union's nullable member has no resolved arms",
@@ -9287,8 +9281,10 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
     }
     if vAtoms.length > 1 {
       for a in vAtoms { vsx.push(a) }
+      for t in vTys0 { vsxTys.push(t) }
     } else {
       vsx.push(vs[usj])
+      vsxTys.push(at)
     }
     // A function-type member keeps its grouping parens in the join, as the inline union's
     // name does: bare, `(i32)=>i32|string` reads as one arrow returning `i32|string`.
@@ -9321,7 +9317,7 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   const vPos: i32[] = []
   while vPos.length < vsx.length {
     const k = declVariantPos(vsx, vPos.length, memAtoms)
-    vTys.push(if k >= 0 { memTys[k] } else { declTyIxOfName(vsx[vPos.length]) })
+    vTys.push(if k >= 0 { memTys[k] } else { vsxTys[vPos.length] })
     vPos.push(k)
   }
   if mintVariantRows(stmts, vsx, vTys, vPos) < 0 { return -1 }

@@ -1,6 +1,6 @@
 import { mapStoredTyOf } from "./check_fn_tag_facts"
 import { cUserTypes } from "./check_types"
-import { widenLitTy } from "./check_relate_core"
+import { storageNormTy, widenLitTy } from "./check_relate_core"
 import { unionTyArms } from "./emit_map_twins"
 import { REC_STORE_DEPTH } from "./check_ty_relate"
 import { registeredUnionRowOfTy } from "./emit_start_block"
@@ -367,6 +367,7 @@ import {
   elabHoldsRecordAnywhere,
   elabHoleFnClosed,
   elabKeyAtPos,
+  elabListFnElemTy,
   elabNarrowedFromAt,
   elabNodeTyAt,
   elabPlaceRecordAt,
@@ -644,7 +645,9 @@ import {
   arrLitNominalElemName,
   arrLitNominalRowTy,
   arrLitNulRefElemName,
+  deepDeclRecName,
   emptyArrLitIxOf,
+  fnElemNominalName,
   heldListElemTy,
   mapCtorShapeOf,
   mapFindShapeOfNodeTy,
@@ -665,6 +668,7 @@ import {
   rlSlotOfTyOrTwin,
   sFieldMapShape,
   sFieldRefSlot,
+  sigFuncDeeperThan,
   structIndexOfNullPartTy,
   structRowOfRecordTy,
   structRowOfValueTy,
@@ -813,7 +817,6 @@ import {
   mvValRep,
   nestedNameBySid,
   rlElemName,
-  rlElemNullable,
   rlElemTyIx,
   rlListOfRowMint,
   sFieldCount,
@@ -938,7 +941,6 @@ import {
   sidOfNode,
   sidText,
 } from "./symbols"
-import { peelGroupParens } from "./tyname"
 import { recNarrowRecordOf, recRepWidens } from "./check_bind_adopt"
 import {
   recEnclosingFn,
@@ -7130,8 +7132,8 @@ function arrLitElemNameTpl(arrIx: i32): string {
 }
 
 // The type `arrLitElemName(arrIx, -1)`'s answer is built from, where its template rung builds the
-// name from a type it holds; -1 where the name itself keeps the row key: a struct row's handle, a
-// closure, nested-list or nullable render that normalizes the type (D16013), or an outer rung.
+// name from a type it holds; a render rung answers that type normalized as its render normalizes
+// it (`storageNormTy`). -1 where the name keeps the row key: a struct row's handle or an outer rung.
 export function arrLitElemKeyTy(arrIx: i32): i32 {
   if arrLitArenaRecElem(arrIx) >= 0 || arrLitFrameRefTy(arrIx, -1) >= 0 {
     return -1
@@ -7145,7 +7147,10 @@ export function arrLitElemKeyTy(arrIx: i32): i32 {
 // `arrLitElemNameTpl`'s ladder, rung for rung, answering the type a rung's name denotes.
 function arrLitElemKeyTyTpl(arrIx: i32): i32 {
   const a = nodeAt(arrIx)
-  if !(a is ArrayLit) || arrElemIsClosureTy(arrIx, -1) { return -1 }
+  if !(a is ArrayLit) { return -1 }
+  if arrElemIsClosureTy(arrIx, -1) {
+    return storageNormTy(arrLitClosureElemTy(arrIx))
+  }
   if a.arrElems.length >= 1 {
     const e0 = nodeAt(a.arrElems[0])
     if e0 is ArrayLit {
@@ -7197,7 +7202,37 @@ function arrLitElemKeyTyTpl(arrIx: i32): i32 {
   }
   const ann = arrLitNominalElemName(arrIx, -1)
   if ann != "" { return cUserTypes[ann] ?? -1 }
+  if arrLitNestedElemName(arrIx, -1) != "" {
+    const held = heldListElemTy(arrIx)
+    return storageNormTy(
+      if held >= 0 { held } else { tyArrayElemIx(nodeTyAt(arrIx, -1)) },
+    )
+  }
+  if arrLitNulRefElemName(arrIx, -1) != "" {
+    return storageNormTy(tyArrayElemIx(nodeTyAt(arrIx, -1)))
+  }
   -1
+}
+
+// The function type `arrLitElemRender` renders a closure element of list literal `arrIx` from: the
+// element type, else the signature every instance builds it at, else the opaque stub (D1794, D4123).
+function arrLitClosureElemTy(arrIx: i32): i32 {
+  const ty = nodeTyAt(arrIx, -1)
+  if ty >= 0 && ty < T.tys.length {
+    const t = tyAt(ty)
+    if t is TyArray {
+      if deepDeclRecName(t.aElem) != "" { return t.aElem }
+      if tyIsFuncOrNulFunc(t.aElem) && sigFuncDeeperThan(t.aElem, 8) {
+        if fnElemNominalName(t.aElem) != "" { return t.aElem }
+      }
+    }
+  }
+  const e = tyArrayElemIx(nodeTyIxOf(arrIx))
+  if e < 0 || e >= T.tys.length || !(tyAt(e) is TyFunc) { return e }
+  if !tyHasTyVar(e) { return e }
+  const fe = elabListFnElemTy(arrIx)
+  if fe >= 0 { return fe }
+  mkFuncTy([], TY_VOID)
 }
 
 // The list type a `scalarListRowOfElem` row name denotes, one of its four answers.
@@ -13484,9 +13519,10 @@ export function identLetOfRead(readIx: i32, fnIx: i32) {
   -1
 }
 
-// The function-type annotation name (`(f64)=>f64`) of the `let`/`const`/global binding the read
-// `readIx` in `fnIx` resolves to, or "" when it is not a function-typed binding.
-export function identFnTypeAnnNameOfRead(readIx: i32, fnIx: i32) {
+// Whether the `let`/`const`/global binding the read `readIx` in `fnIx` resolves to is
+// function-typed: by annotation, by a nullable-closure annotation, by an init the arena types as
+// a function and can spell, or as a closure element of a ref list.
+export function identReadIsFnAnnotated(readIx: i32, fnIx: i32): boolean {
   if fnIx >= 0 && readIx >= 0 {
     const fn = nodeAt(fnIx)
     if fn is FuncDecl {
@@ -13498,49 +13534,36 @@ export function identFnTypeAnnNameOfRead(readIx: i32, fnIx: i32) {
       if li >= 0 {
         const d = nodeAt(li)
         if d is LetDecl {
-          if tyIsFuncType(d.letType) { return tyNameOf(d.letType) }
-          // A nullable-closure annotation (kind 19): return its name so a narrowed call
-          // through a null-seeded binding resolves its sig even with no closure value to trace.
-          if nulCloFlag(d.letType) == 1 { return tyNameOf(d.letType) }
+          if tyIsFuncType(d.letType) { return true }
+          // A nullable-closure annotation (kind 19) counts, so a narrowed call through a
+          // null-seeded binding resolves its sig even with no closure value to trace.
+          if nulCloFlag(d.letType) == 1 { return true }
           // An un-annotated closure local from a call result: recover the function type from
           // the checker's recorded init type — a bare lambda instead trusts its own lifted sig.
           if d.letType < 0 && d.letInit >= 0 {
             const ini = nodeAt(d.letInit)
             if ini is Call {
-              // The arena test before the render: the two conditions are ANDed, so this builds
-              // the name only for an init the arena already agreed is a function type.
+              // A function type the arena holds but cannot spell is not one a call can resolve
+              // a sig through: it falls to the arms below rather than answering here.
               if nodeTyIsFunc(d.letInit) {
-                const itn = nodeTyName(d.letInit)
-                if itn != "" { return itn }
+                if nodeTyName(d.letInit) != "" { return true }
               }
             }
             // A copy of another closure binding: the init is a bare Ident, so its checked type
             // is authoritative (unlike a lambda's inferred return, which can disagree).
             if ini is BinExpr {
               if ini.binOp == "??" {
-                // The arena test before the render, as the Call arm above: builds the name
-                // only for an init the arena already agreed is a function type.
-                if nodeTyIsFunc(d.letInit) {
-                  const jtn = nodeTyName(d.letInit)
-                  if jtn != "" { return jtn }
-                }
+                if nodeTyIsFunc(d.letInit) { return true }
               }
             }
-            // An un-annotated binding read from a closure-element ref list: the kind-5 slot's
-            // element name is the function type — return it so a call resolves the element's real sig.
+            // An un-annotated binding read from a closure-element ref list: the kind-5 slot
+            // holds the element's function type, which a call resolves its real sig through.
             if ini is Index {
               if exprRefArray(ini.idxArr, fnIx) {
                 const islot = refListSlotOfExpr(ini.idxArr, fnIx)
                 if islot >= 0 && islot < rlElemTyIx.length {
                   if rlElemKindAt(islot) == RLK_CLOSURE {
-                    const enm = rlElemName[islot]
-                    if (
-                      islot < rlElemNullable.length
-                      && rlElemNullable[islot] == 1
-                    ) {
-                      return enm
-                    }
-                    return peelGroupParens(enm)
+                    return rlElemName[islot] != ""
                   }
                 }
               }
@@ -13556,12 +13579,12 @@ export function identFnTypeAnnNameOfRead(readIx: i32, fnIx: i32) {
   if gi >= 0 {
     const gd = nodeAt(gi)
     if gd is LetDecl {
-      if tyIsFuncType(gd.letType) { return tyNameOf(gd.letType) }
+      if tyIsFuncType(gd.letType) { return true }
       // The dual of the local nulclosure-annotation arm above.
-      if nulCloFlag(gd.letType) == 1 { return tyNameOf(gd.letType) }
+      if nulCloFlag(gd.letType) == 1 { return true }
     }
   }
-  ""
+  false
 }
 
 // The identifier node the un-annotated binding the read `readIx` resolves to copies, or -1: the
@@ -13634,8 +13657,7 @@ function calleeCloSigKeyOfRead(atIx: i32, fnIx: i32): string {
   // Positioned throughout (D2316): two sibling FUNCTION-scoped blocks binding one name are as
   // ambiguous unpositioned as two sibling module-scoped ones (D1751).
   const csid = sid
-  const an = identFnTypeAnnNameOfRead(atIx, fnIx)
-  if an != "" {
+  if identReadIsFnAnnotated(atIx, fnIx) {
     // The arena builds the key where the binding carries a plain annotation; `cloNameSigKeyTy`
     // is the fall-through over the joined or callee type. B255.
     const jnd = identFnTypeAnnNodeOfRead(atIx, fnIx)
