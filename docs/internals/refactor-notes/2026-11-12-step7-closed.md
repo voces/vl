@@ -52,7 +52,7 @@ contract carries no exception), lane E's field-set spelling key (#7707), E/F's `
 
 | lane | sites |
 | --- | --- |
-| E / F (D6 re-key) | `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds` on `shapeWalkKeyOf`); `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`); `structElemArrayLowerable` now asks `cUserTypes[tyToNominalName(eTy)]`, whether the element is a declared type (graded as an identifier read unless the coordinator rules otherwise) |
+| E / F (D6 re-key) | `internFuncTypeShapesTyGo` (`isValueUnionName`, `nameIsShapeSpanEnds` on `shapeWalkKeyOf`); `internArmShapeRow`'s render (`tyToEmitName(aty)` into `armMintShapeName`); `structElemArrayLowerable` asks `cUserTypes[tyToNominalName(eTy)]`; `tyToNominalName` renders a non-nominal record structurally, so a spelling reaches the lookup (it can only miss); a type-side `structNameOfTy(eTy) != ""` is proposed |
 | F | `nonNulBaseOf` at emit_map_value_slots:653; D16040 (`rlElemStructRow`'s class A, the held-rep key), a floor not on the carried list, so it closes before the close |
 | A | `unionSetAtomsOf` at emit_union_registry:200, A's next cut |
 | B | `variantIndexOf` as a name producer (w324-vio) |
