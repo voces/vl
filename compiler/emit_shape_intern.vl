@@ -18,6 +18,7 @@ import {
   arrSpineLeafTy,
   isValueUnionName,
   tyMapKeyKindSpan,
+  valueRowKind,
 } from "./check_ty_rep"
 import {
   T,
@@ -239,9 +240,11 @@ function internShapeArms(arms: string[], armTys: i32[]) {
 
 // Whether the walk splits union `ty`, keyed `ln`, into its `n` arms: a declared union, a
 // literal set and a numeric literal union are one leaf, as their keys spell one atom.
-function shapeWalkSplitsUnion(ln: string, ty: i32, n: i32): boolean {
+function shapeWalkSplitsUnion(byDecl: boolean, ty: i32, n: i32): boolean {
   if n < 2 { return false }
-  if (cUserTypes[ln] ?? -1) >= 0 { return false }
+  if byDecl && (structNameOfTy(ty) != "" || unionAliasDeclNameOfTy(ty) != "") {
+    return false
+  }
   if tyIsLitUnionOrLit(ty) { return false }
   numLitUnionBaseTy(ty) < 0
 }
@@ -315,7 +318,9 @@ function internShapeDeepTyGo(kn: string, ty: i32) {
   const t = tyAt(ty)
   const ln = shapeWalkKeyOf(kn, ty)
   if ln == "" { return -1 }
-  if isValueUnionName(ln) {
+  // Whether the walk keys `ty` by its declaration's name, under which it is one leaf.
+  const byDecl = kn != "" && ln == kn
+  if !(byDecl && tyIsDeclaredNominal(ty)) && walkValueUnionTy(ty) {
     registerValueUnionOfTy(7, ty)
     // A closure member may bury inline shapes in its params or result, unreachable through the
     // box registration alone; the functype interner keeps an unsupported-field shape un-interned.
@@ -337,7 +342,7 @@ function internShapeDeepTyGo(kn: string, ty: i32) {
     const uTys: i32[] = []
     if (
       unionTyArms(ty, uArms, uTys)
-      && shapeWalkSplitsUnion(ln, ty, uArms.length)
+      && shapeWalkSplitsUnion(byDecl, ty, uArms.length)
     ) {
       internShapeArms(uArms, uTys)
       return -1
@@ -455,6 +460,58 @@ function internFuncTypeShapesTyAs(kn: string, ty: i32): i32 {
   r
 }
 
+// Whether the walk registers `ty` as a value union: a union or `| null` whose spelling is one
+// and whose members include no declared type, which names its member rather than spelling its
+// atoms. Asked once per type per program, since a deep member's spelling is costly.
+function walkValueUnionTy(ty: i32): boolean {
+  while walkVuMemo.length <= ty { walkVuMemo.push(0) }
+  if walkVuMemo[ty] == 0 {
+    walkVuMemo[ty] = if walkValueUnionTyGo(ty) { 1 } else { 2 }
+  }
+  walkVuMemo[ty] == 1
+}
+
+// `walkValueUnionTy`'s answer by type id: 0 unasked, 1 yes, 2 no.
+let walkVuMemo: i32[] = []
+
+function walkValueUnionTyGo(ty: i32): boolean {
+  const t = tyAt(ty)
+  match t {
+    TyNullable => walkAtomsAreValueUnion(ty, [t.nInner], true)
+    TyUnion => walkAtomsAreValueUnion(ty, t.uMembers, false)
+    TyPrim | TyObj | TyArray | TyMap | TyFunc | TyVar | TyLit | TyNeg | TyErr => false
+  }
+}
+
+// `isValueUnionName`'s count over member types `mems` of union `ty` (`nul` for a `| null` it
+// adds): two non-null value atoms, or one scalar beside `null`. A declared member is no atom; a
+// member the typed atom kinds do not claim (a nested set, a literal) is asked of the spelling.
+function walkAtomsAreValueUnion(ty: i32, mems: i32[], nul: boolean): boolean {
+  let nonNull = 0
+  let hasNull = nul
+  let solo = -1
+  for m in mems {
+    if m < 0 || tyIsDeclaredNominal(m) { return false }
+    const tm = tyAt(m)
+    if tm is TyUnion || tm is TyLit || tm is TyNullable {
+      return valueUnionNameOfTy(ty) != ""
+    }
+    const k = valueRowKind(m)
+    if k == -2 { return valueUnionNameOfTy(ty) != "" }
+    if k < 0 { return false }
+    if k == 6 {
+      hasNull = true
+    } else {
+      nonNull = nonNull + 1
+      solo = k
+    }
+  }
+  if nonNull >= 2 { return true }
+  nonNull == 1
+    && hasNull
+    && (solo == 0 || solo == 3 || solo == 4 || solo == 5 || solo == 14)
+}
+
 // Whether `ty` is a declaration the walk keys by name: a declared struct, a finite generic
 // application, or a union alias other than a numeric literal union (whose atom is its base
 // scalar, so it has no alias identity). A brand is not such a declaration.
@@ -488,7 +545,7 @@ function internFuncTypeShapesTyGo(kn: string, ty: i32): i32 {
       const fTys: i32[] = []
       if (
         unionTyArms(ty, fArms, fTys)
-        && shapeWalkSplitsUnion(ln, ty, fArms.length)
+        && shapeWalkSplitsUnion(kn != "" && ln == kn, ty, fArms.length)
       ) {
         internShapeDeepTyAs(ln, ty)
       }
@@ -1223,6 +1280,7 @@ export function shapeSetIxReset() {
   lSetLen = 0
   // A walk that trapped mid-compile must not leave its types marked for the next one.
   shapeWalkStack = []
+  walkVuMemo = []
   0
 }
 
