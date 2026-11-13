@@ -683,7 +683,7 @@ import {
 } from "./emit_lit_atoms"
 import {
   mapTwinDropSlots,
-  unionTyArms,
+  unionTyMemberTys,
   variantFirstLayoutDisagreeField,
   variantLitRepMismatch,
   variantLitRepUnifiable,
@@ -9071,21 +9071,16 @@ function unionDeclStructAlias(sx: i32, s: UnionDecl): boolean {
   true
 }
 
-// The row member position of the declared union's arm `vs[vi]`: the member spelled alike at the
-// same occurrence, since twin arms that differ only in a numeric tag share one spelling. -1 for
-// an arm the row does not spell (an expanded alias), which resolves its own name.
-function declVariantPos(vs: string[], vi: i32, atoms: string[]): i32 {
-  let nth = 0
-  let j = 0
-  while j < vi {
-    if vs[j] == vs[vi] { nth = nth + 1 }
-    j = j + 1
-  }
+// The row member position of a declared union's arm of type `ty`: the first member of that type
+// no earlier arm took, so twin arms keep their order. -1 for an arm the row holds under no member
+// of its type, which keeps its own type.
+function declVariantPos(ty: i32, memTys: i32[], taken: i32[]): i32 {
+  if ty < 0 { return -1 }
   let k = 0
-  while k < atoms.length {
-    if atoms[k] == vs[vi] {
-      if nth == 0 { return k }
-      nth = nth - 1
+  while k < memTys.length {
+    if memTys[k] >= 0 && !i32ListHas(taken, k) && tySame(memTys[k], ty) {
+      taken.push(k)
+      return k
     }
     k = k + 1
   }
@@ -9257,8 +9252,10 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   let udSet = ""
   // The variant names: a nullable alias member names its own members, as the flat spelling does (D4040).
   const vsx: string[] = []
-  // Each `vsx` entry's type, from the member's resolution or the arm `unionTyArms` read off it.
+  // Each `vsx` entry's type, from the member's resolution or the arm `unionTyMemberTys` read off
+  // it. An arm of an expanded member is named after the row is recorded, from its row member.
   const vsxTys: i32[] = []
+  const vsxNamed: boolean[] = []
   let usj = 0
   while usj < vs.length {
     let udMem = vs[usj]
@@ -9267,30 +9264,32 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
     const udExp = unionAliasMembers(udMem)
     const at = declMemberTy(stmtIx, usj)
     if udExp != "" {
-      const xAtoms: string[] = []
       const xTys: i32[] = []
-      if !unionTyArms(at, xAtoms, xTys) {
+      if !unionTyMemberTys(at, xTys) {
         return emitFail(
           "emitProgram: a declared union's alias member has no resolved arms",
         )
       }
-      if xAtoms.length > 1 && !tyIsLitUnion(at) { udMem = udExp }
+      if xTys.length > 1 && !tyIsLitUnion(at) { udMem = udExp }
     }
-    const vAtoms: string[] = []
     const vTys0: i32[] = []
     if at >= 0 && at < T.tys.length && tyAt(at) is TyNullable {
-      if !unionTyArms(at, vAtoms, vTys0) {
+      if !unionTyMemberTys(at, vTys0) {
         return emitFail(
           "emitProgram: a declared union's nullable member has no resolved arms",
         )
       }
     }
-    if vAtoms.length > 1 {
-      for a in vAtoms { vsx.push(a) }
-      for t in vTys0 { vsxTys.push(t) }
+    if vTys0.length > 1 {
+      for t in vTys0 {
+        vsx.push("")
+        vsxTys.push(t)
+        vsxNamed.push(false)
+      }
     } else {
       vsx.push(vs[usj])
       vsxTys.push(at)
+      vsxNamed.push(true)
     }
     // A function-type member is grouped in the join, as the inline union's name is: bare,
     // `(i32)=>i32|string` reads as one arrow returning `i32|string`. Canon spells the member bare.
@@ -9321,9 +9320,22 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   unTyKeyPushRow()
   const vTys: i32[] = []
   const vPos: i32[] = []
+  const taken: i32[] = []
   while vPos.length < vsx.length {
-    const k = declVariantPos(vsx, vPos.length, memAtoms)
-    vTys.push(if k >= 0 { memTys[k] } else { vsxTys[vPos.length] })
+    const i = vPos.length
+    const k = declVariantPos(vsxTys[i], memTys, taken)
+    if !vsxNamed[i] {
+      if k >= 0 {
+        vsx[i] = memAtoms[k]
+      } else if vsxTys[i] < 0 {
+        vsx[i] = "null"
+      } else {
+        return emitFail(
+          "emitProgram: a declared union's expanded arm is no member of its row",
+        )
+      }
+    }
+    vTys.push(if k >= 0 { memTys[k] } else { vsxTys[i] })
     vPos.push(k)
   }
   if mintVariantRows(stmts, vsx, vTys, vPos) < 0 { return -1 }
