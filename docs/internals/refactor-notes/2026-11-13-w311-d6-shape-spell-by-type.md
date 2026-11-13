@@ -30,6 +30,8 @@ reads a union declaration's source spellings (origin (c), not a render).
 
 - **Sweep:** fixpoint seeds, master `653319b0` → this: all 24,218 the same (0 bytes-only
   movers, 0 output movers, 0 runs → not-runs, 0 new traps).
-- **Render-parse census:** ty-string-parse goes from 36 to 34 (`tyGroupWrapsWhole`'s walk and
-  `sTyIxOfNameTy`'s shape resolution), and ty-parse-unclassified from 20 to 19 (the
-  generic-application floor). The baseline is lowered.
+- **Render-parse census on the tree merged with master `e39d632e`:** ty-string-parse goes from
+  33 to 30, and ty-parse-unclassified from 19 to 18. Two string-parse entries leave,
+  `tyGroupWrapsWhole`'s walk and `sTyIxOfNameTy`'s shape resolution, and the shared
+  `nameIsShapeSpanEnds` entry loses the callers that left. The unclassified entry is the
+  generic-application floor. The baseline is lowered.

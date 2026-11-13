@@ -2,16 +2,18 @@
 // under different tags fit each other.
 
 import { i32ToStr } from "./ast"
+import { emitFail } from "./emit_bytes"
 import {
   TyMap,
   TyObj,
+  nomNameOfTy,
   tyAt,
   tyEqSoftLits,
   tyFieldTyOf,
   tyIsLitUnionOrLit,
+  tyIsPrimNamed,
   tyIsRecord,
   tyPrimNameOf,
-  tyToStr,
 } from "./check_types"
 import {
   armRowIsPlainI32,
@@ -25,7 +27,6 @@ import {
   armFieldElemSame,
   armFieldLitTyIx,
   armFieldNames,
-  armFieldTyText,
   armFieldTypes,
   uFieldCount,
   uFieldStart,
@@ -180,9 +181,9 @@ function variantRowsTagEqual(a: i32, b: i32): boolean {
     const fa = variantFieldArenaBase(a, name)
     const fb = variantFieldArenaBase(b, name)
     if fa < 0 || fb < 0 {
-      if variantFieldBaseKey(a, ra) != variantFieldBaseKey(b, rb) {
-        return false
-      }
+      // Every variant row has a record type since rows are minted by type (D16030).
+      emitFail(VARIANT_FIELD_UNTYPED_MSG)
+      return false
     } else if tyFitKind(fa, fb) != 1 || tyFitKind(fb, fa) != 1 {
       if !fieldTysRolledAlike(a, b, fa, fb) { return false }
     }
@@ -342,21 +343,6 @@ function recvCanHold(holds: i32[], yTy: i32): boolean {
   false
 }
 
-// The base half of one field row's tag key: a literal set's softened scalar, else the row's type text.
-function variantFieldBaseKey(vi: i32, r: i32): string {
-  if r < 0 || r >= armFieldTyText().length { return "" }
-  if r < armFieldLitTyIx().length && armFieldLitTyIx()[r] >= 0 {
-    const b = litSetBaseTy(armFieldLitTyIx()[r])
-    if b >= 0 { return tyToStr(b) }
-  }
-  if vi >= 0 && vi < uVarTyIx.length && r < armFieldNames().length {
-    const ft = tyFieldTyOf(uVarTyIx[vi], armFieldNames()[r])
-    const ab = litSetBaseTy(ft)
-    if ab >= 0 { return tyToStr(ab) }
-  }
-  armFieldTyText()[r]
-}
-
 // Can variant field ROW `ix` carry the interned-atom rep? Code 0 already does; code 3 is the
 // inline spelling of the same members and can be made to. Any other code is a different
 // storage entirely and is not this seam.
@@ -366,15 +352,35 @@ export function litFieldRowIsAtomisable(ix: i32): boolean {
   tyIsLitUnionOrLit(armFieldLitTyIx()[ix])
 }
 
-// Is variant field row `ix` a plain `string` — the base a string literal set softens to?
-// Three columns, since no one alone says it: the code is shared with every string-slot
-// field, the discriminant column parts a set from a non-set, and the identity column keeps
-// a nominal `type Id = new string` from being read as the base its brand is distinct from.
+const VARIANT_FIELD_UNTYPED_MSG = "emitProgram: a union variant's field has no arena type to compare its rows by"
+
+// The variant whose field run holds row `r`, or -1.
+function rowVariantOf(r: i32): i32 {
+  let v = 0
+  while v < uFieldStart.length && v < uFieldCount.length {
+    if r >= uFieldStart[v] && r < uFieldStart[v] + uFieldCount[v] { return v }
+    v = v + 1
+  }
+  -1
+}
+
+// Whether field type `ft` is the plain `string` base, not a nominal `type Id = new string`.
+export function tyIsPlainString(ft: i32): boolean {
+  tyIsPrimNamed(ft, "string") && nomNameOfTy(ft) == ""
+}
+
+// Is variant field row `ix` a plain `string` — the base a string literal set softens to? The
+// code is shared with every string-slot field, the discriminant column parts a set from a
+// non-set, and the field's type parts a nominal `type Id = new string` from its base.
 function litFieldRowIsPlainString(ix: i32): boolean {
   if ix < 0 || ix >= armFieldTypes().length { return false }
   if !armRowIsStr(ix, false) { return false }
   if armFieldLitTyIx()[ix] >= 0 { return false }
-  armFieldTyText()[ix] == "string"
+  const vi = rowVariantOf(ix)
+  if vi < 0 || vi >= uVarTyIx.length || ix >= armFieldNames().length {
+    return false
+  }
+  tyIsPlainString(tyFieldTyOf(uVarTyIx[vi], armFieldNames()[ix]))
 }
 
 // The wasm struct field index of `field` within variant `vi` (declaration order), or
