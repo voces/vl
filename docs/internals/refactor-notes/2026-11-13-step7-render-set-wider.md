@@ -29,22 +29,23 @@ is only measured if every render entry point is counted.
 
 ## The count
 
-`ty-render` rises from 13 to 98 (at master 3eb0db25), the same code counted honestly; 44 display renders are reported
+`ty-render` rises from 13 to 101 (at master 23e03fce), the same code counted honestly; 44 display renders are reported
 beside it. By renderer:
 
 | renderer | calls |
 | --- | --- |
-| `monoPinSpellShaped` | 35 |
+| `monoPinSpellShaped` | 36 |
 | `tyToNominalName` | 22 |
 | `rlRowNameOfTy` | 15 |
 | `tyToEmitName` | 12 |
 | `unionSpellingOfTy` | 4 |
 | `canonUnionKeyTextOfTy` | 3 |
-| `cloSigNameOfTy` | 2 |
+| `cloSigNameOfTy` | 3 |
 | `monoPinSpellNoAnon` | 2 |
-| `tyToNominalNameAt`, `canonUnionKeyAtomOfTy`, `canonEmitNameOfTy` | 1 each |
+| `canonUnionKeyAtomOfTy` | 2 |
+| `tyToNominalNameAt`, `canonEmitNameOfTy` | 1 each |
 
-By file, `emit_mono` has 37, the pin spellings. A renderer's own internal helpers outside its
+By file, `emit_mono` has 38, the pin spellings. A renderer's own internal helpers outside its
 `At`/`Go` variants (`unionSpellingOfTy`'s member walk, say) are counted where they render; they
 are named here rather than exempted by a guess.
 
