@@ -34,6 +34,10 @@ that names the rep.
   - i32, boolean and string fields as controls.
 
   On the base seed the file is refused at emit.
-- Sweep with fixpoint seeds on both sides: SWEEP.
-- Render-parse census: CENSUS.
+- Sweep with fixpoint seeds on both sides, master `8dbcac16` against the candidate:
+  - 24,240 same;
+  - 0 bytes-only movers, so every field that ran before emits the same bytes;
+  - 2 output movers, the D3459 witness and the new test file, both `emit_reject` → runs;
+  - 0 `runs → not-runs`, 0 new compiler traps.
+- Render-parse census: within budget. The change adds and removes no entry.
 - `scripts/gate.sh`: all rows pass.
