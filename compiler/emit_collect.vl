@@ -1,4 +1,4 @@
-import { nomNameOfTy } from "./check_types"
+import { PrimName, nomNameOfTy } from "./check_types"
 import { unionArmKindRowsOfExpr } from "./emit_classify"
 import { rlElemNonNulTyAt } from "./emit_map_value_slots"
 
@@ -4262,7 +4262,6 @@ export function mAssignTypeIndices(_n: i32) {
   mvKeysAtMint = false
   mResetTypeIntern()
   mAssignStructHeaps()
-  mAssignPackedFields()
   mAssignUnionHeaps()
   // An `i32[][]` row keys its twin signature by the i32 wrapper, so it mints here; any other
   // reader mints it on first ask.
@@ -4354,34 +4353,37 @@ function rlPairsLate(n: i32): i32 {
   0
 }
 
-// Mint the standalone struct heap types, in `structEmitOrder`, into `sHeapIdx`; a structural
-// twin (`sTwin[i] < i`) shares its representative's index and mints nothing.
-// Records each struct row's sub-word fields as packed (D15978): a `u8`/`i8` field is `i8`
-// storage, a `u16`/`i16` one `i16`, read back with `struct.get_u` or `struct.get_s` by signedness.
-function mAssignPackedFields() {
-  packedFieldsReset()
-  let si = 0
-  while si < sNames.length {
-    const h = if si < sHeapIdx.length { sHeapIdx[si] } else { -1 }
-    if h >= 0 && !sIsRefRow(si) {
-      let fj = 0
-      while fj < sFieldCount[si] {
-        const r = sFieldStart[si] + fj
-        const p = primNameOf(
-          if r < sFieldStoreTy.length { sFieldStoreTy[r] } else { -1 },
-        )
-        if p == "u8" { packedFieldSet(h, fj, 0x78, 0x04) }
-        if p == "i8" { packedFieldSet(h, fj, 0x78, 0x03) }
-        if p == "u16" { packedFieldSet(h, fj, 0x77, 0x04) }
-        if p == "i16" { packedFieldSet(h, fj, 0x77, 0x03) }
-        fj = fj + 1
-      }
-    }
-    si = si + 1
+// The packed field code (`packedFieldSet`) of a field stored at prim `p`: a `u8`/`i8` field is
+// `i8` storage and a `u16`/`i16` one `i16`, read by `struct.get_u` or `struct.get_s` by
+// signedness (D15978); 0 for a field that is not packed.
+function subWordPacking(p: PrimName | null): i32 {
+  match p {
+    "u8" => 0x78 * 16 + 4
+    "i8" => 0x78 * 16 + 3
+    "u16" => 0x77 * 16 + 4
+    "i16" => 0x77 * 16 + 3
+    "i32" | "i64" | "f32" | "f64" | "boolean" | "string" | "void" | "null" | "never" | "v128" | null => 0
+  }
+}
+
+// Records struct row `si`'s sub-word fields as packed fields of heap type `h`.
+function packRowFields(si: i32, h: i32) {
+  let fj = 0
+  while fj < sFieldCount[si] {
+    const r = sFieldStart[si] + fj
+    const code = subWordPacking(
+      primNameOf(
+        if r < sFieldStoreTy.length { sFieldStoreTy[r] } else { -1 },
+      ),
+    )
+    if code > 0 { packedFieldSet(h, fj, code) }
+    fj = fj + 1
   }
   0
 }
 
+// Mint the standalone struct heap types, in `structEmitOrder`, into `sHeapIdx`; a structural
+// twin (`sTwin[i] < i`) shares its representative's index and mints nothing.
 function mAssignStructHeaps() {
   // Standalone structs occupy the first indices, one heap type per distinct structure:
   // structural twins share a slot's heap index rather than minting a fresh one, so a `B`-value
@@ -4399,9 +4401,12 @@ function mAssignStructHeaps() {
     shi = shi + 1
   }
   const sOrd = structEmitOrder()
+  packedFieldsReset()
   let soi = 0
   while soi < sOrd.length {
     sHeapIdx[sOrd[soi]] = mAllocType(TSK_STRUCT, sOrd[soi])
+    // A twin shares this heap type and stores its fields alike, so the representative decides.
+    if !sIsRefRow(sOrd[soi]) { packRowFields(sOrd[soi], sHeapIdx[sOrd[soi]]) }
     soi = soi + 1
   }
   // Twins take their representative's index; the representative is always in `sOrd`, so it
