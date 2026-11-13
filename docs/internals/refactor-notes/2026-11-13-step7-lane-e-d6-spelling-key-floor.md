@@ -42,7 +42,7 @@ unreachable.
 - Refresh ×2: fixpoint, 6,710,697 bytes. The base is 6,716,949.
 - Sweep with fixpoint seeds on both sides, master `e0d8c7f1` against the candidate: 24,203 same,
   0 bytes-only movers, 0 output movers, 0 `runs → not-runs`, 0 new compiler traps.
-- `scripts/gate.sh`: all 23 rows pass.
+- `scripts/gate.sh`: all 23 rows pass, on the branch and on the tree merged with master `fd1aea03`.
 - Render-parse: unchanged at 2 parses. `nonNulBaseOf` still has callers.
 
 ## What the probe leaves to the rest of D6
