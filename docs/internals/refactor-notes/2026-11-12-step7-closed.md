@@ -138,6 +138,23 @@ once imported modules' declaration names grade as source, and 67 on master after
 
 So 10 of the 20 fail. P2 grows to 21 sites, and the census-scope total of failing parses is 77.
 
+A `TyPrim`'s own name read off the type is an identity keyword, not a rendered structure, so it
+passes (coordinator ruling, 2026-11-13).
+
+**H's section 2, the checker-file sites reached during emit**, graded by the emit-side entry that
+feeds each one. About 130 rows sit inside parser bodies, and each inherits its entry's origin:
+
+| emit entry | check_* sites it feeds | grade | owner |
+| --- | --- | --- | --- |
+| `canonEmitName` (`monoPinUnionName`, mono:7942) and `canonEmitNameOfTy` via `arenaEmitName` (emit_collect:8143) | check_program's `canonEmitNameTs`, `canonShapeName`, `canonGenAppName`, `canonArrayName`, `canonFuncTypeName`, `canonEmitUnionName`, the `nulLit*` helpers, `canonSameShapeRecord`, `nameIsGenAppOfDecl`, `nameIsOneStrLit`; check_lit_union_spell (about 60 rows; up to 4,529 programs) | fails: the input is a render | D (P6) and the `arenaEmitName` callers |
+| `resolveAnnot` (emit_rep:1104, 2092, 2097, 2148, 2780) and `nameToTy` (check_emit_queries:694, 713) | `annotResolve`, `applyGenAliasArgs` (with the bare `nameToTy(argNames[ai])`, 303 programs), `nameToTyReal` (with the bare `nameToTy(mapSpellKeyName(name))`, 606), `nameUnionTy`, `nameFuncTy`, `nameObjTy`, `retNameToTy`, `litMemberTy` (about 40 rows) | fails: each bare name is a piece the parser cut from a rendered spelling (a generic argument, or a map key) | B (P5) and D (`recordClonedIsVarTy`) |
+| `valueAtomKind` (50 emit call sites) | check_ty_rep's `valueAtomKindSpan` ×8, `nulElemListAtomKind` ×7, `litUnionArrayElemOf` ×2 | fails where the caller passes a rendered atom (P2); passes for a primitive name | G (P2) |
+| none from emit | `letDeclResolveAnnot` (check_statements:393, 3 programs), `wsOrigTyOf` (check_demands:858), `litUnionArmValueUnionRetName` (check_ret_names:345–346, which renders with `tyToEmitName` inside the checker) | needs a ruling: the checker's own render or a re-checked synthesized TypeRef | — |
+
+`arenaEmitName` is a render (`tyToNominalName` then `canonEmitNameOfTy`) that the census does not
+count among the 13 `tyToEmitName` renders. It has 7 callers: emit_collect ×6 and
+`monoInstanceRetSpelling`.
+
 ## Floors held by a filed row
 
 Each is a checker-side gap outside step 7's exit (coordinator, 2026-11-12): the site reads a name
