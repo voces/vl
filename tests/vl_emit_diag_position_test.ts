@@ -153,13 +153,13 @@ Deno.test({
 // into nodes minted after parsing, and the anchor is the line they were rebuilt from, line 7
 // inside `take`, in the module that declares it (D15155, D15157). The last shape reaches the
 // instance through a generic.
-const INSTANCE_WITNESS = `type R = { m: () => i32 }
-const mm = () => 1
-const u: R | null = { m: mm }
+const INSTANCE_WITNESS = `type R = { m: {[string]: i32} }
+const mm: {[string]: i32} = Map()
+const u: R = { m: mm }
 const two = 2
 function take(a) {
   print(1)
-  const n = a?.m ?? (() => 2)
+  const n = a.m["zz"] as? i32
   print(two)
 }
 `;
@@ -211,7 +211,7 @@ Deno.test({
         if (!r.out.includes("emit error")) {
           throw new Error(
             `${s.name}: the instance witness no longer reaches an emit refusal, so this guard ` +
-              `is measuring nothing — replace INSTANCE_WITNESS (D3373 closed?).\n${r.out}`,
+              `is measuring nothing — replace INSTANCE_WITNESS (D2467 closed?).\n${r.out}`,
           );
         }
         const blk = errorBlock(r.out);

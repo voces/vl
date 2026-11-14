@@ -9,6 +9,19 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-sweep-owed-refusals](2026-11-14-sweep-owed-refusals.md): The sweep accepts an owed refusal, 2026-11-14
+- [2026-11-13-step7-d16032-arm-rows-closure-arm](2026-11-13-step7-d16032-arm-rows-closure-arm.md): Step 7 (lane D, D16032): the arm-row and closure-arm readers read rows, 2026-11-13
+- [2026-11-13-h-d16005-eq-else-hole](2026-11-13-h-d16005-eq-else-hole.md): lane H: an `==` test's else over a hole defers its literal remainder (D16005), 2026-11-13
+- [2026-11-13-h-d1486-ne-narrow](2026-11-13-h-d1486-ne-narrow.md): lane H: a `!=` on a literal discriminant narrows both branches (D1486), 2026-11-13
+- [2026-11-13-g37-member-union-field-tys](2026-11-13-g37-member-union-field-tys.md): D16052 / D16032: `memberUnionFieldName` probes a union's member types, not its label, 2026-11-13
+- [2026-11-13-g36-arm-tys-no-atoms](2026-11-13-g36-arm-tys-no-atoms.md): D16052: the union arm-type producers stop appending atoms, 2026-11-13
+- [2026-11-13-d2171-return-write-spill](2026-11-13-d2171-return-write-spill.md): D2171: a `return` or `let` that yields a field or element write, 2026-11-13
+- [2026-11-13-d16036-optchain-fn-leaf](2026-11-13-d16036-optchain-fn-leaf.md): D16036: a standalone `?.` function-value leaf is the closure's own nullable ref, 2026-11-13
+- [2026-11-13-d16007-negated-guard-alternative](2026-11-13-d16007-negated-guard-alternative.md): D16007: a negated `is` guard registers its `else` arm's alternative, 2026-11-13
+- [2026-11-13-d16006b-dead-else-at-pin](2026-11-13-d16006b-dead-else-at-pin.md): D16006(b): a deferred demand under an emptied `is` remainder is vacuous at the pin, 2026-11-13
+- [2026-11-13-d16004-union-argument-meets-demand-by-member](2026-11-13-d16004-union-argument-meets-demand-by-member.md): D16004 / D3234: a union argument meets a hole's demand member by member, 2026-11-13
+- [2026-11-13-d15978-flat-sub-word-build](2026-11-13-d15978-flat-sub-word-build.md): D15978 build: a `flat` record's sub-word field has storage semantics, 2026-11-13
+- [2026-11-13-d1108-inferred-nullable-map-key](2026-11-13-d1108-inferred-nullable-map-key.md): D1108: an inferred nullable map return is named at every map key kind, 2026-11-13
 - [2026-11-13-w311-d6-tagged-list-rep-hint](2026-11-13-w311-d6-tagged-list-rep-hint.md): Step 7 D6: a map value's tagged function list is keyed by its `i32` list type, 2026-11-13
 - [2026-11-13-step7-d16060-nul-scalar-box-row](2026-11-13-step7-d16060-nul-scalar-box-row.md): Step 7 (lane D, D16032/D16060): the hole binding's `T | null` box carries its row, 2026-11-13
 - [2026-11-13-step7-d16052-member-tys-lane-a](2026-11-13-step7-d16052-member-tys-lane-a.md): Step 7, D16052: seven union-arm readers test member types, not atoms, 2026-11-13
@@ -466,7 +479,7 @@ Newest first:
 - [2026-11-12-d15746-copy-of-copy](2026-11-12-d15746-copy-of-copy.md): D15746 closes: a copy of a copy of a bundle holder holds its record, 2026-11-12
 - [2026-11-12-d15744-lambda-returner-in-function](2026-11-12-d15744-lambda-returner-in-function.md): D15744, half (b): a lambda bound inside a function, returning a bundle, runs, 2026-11-12
 - [2026-11-12-d15042-union-arm-literal-at-instance](2026-11-12-d15042-union-arm-literal-at-instance.md): D15042: a literal whose own type holds the type parameter picks its union arm by that type at the instance, 2026-11-12
-- [2026-11-11-w323-l2-fuel-bisect](2026-11-11-w323-l2-fuel-bisect.md): 2026-11-11 — w323: the L2 self-compile fuel, 70.45 G to 82.65 G, bisected
+- [2026-11-11-w323-l2-fuel-bisect](2026-11-11-w323-l2-fuel-bisect.md): w323: the L2 self-compile fuel, 70.45 G to 82.65 G, bisected
 - [2026-11-11-w320-shared-field-record-or-null](2026-11-11-w320-shared-field-record-or-null.md): A shared read of a field stored as a record or `null` across a union's members, 2026-11-11
 - [2026-11-11-w320-fresh-call-copy](2026-11-11-w320-fresh-call-copy.md): A maker's call is copied where it lands wider, so nothing is kept, 2026-11-11
 - [2026-11-11-w320-d15718-store-mismatch](2026-11-11-w320-d15718-store-mismatch.md): A literal binding built wider, stored into a container pinned at its own type, is that container's type mismatch, 2026-11-11
