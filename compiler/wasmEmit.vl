@@ -28300,7 +28300,17 @@ function emitIdxStoreValue(
 
 // `emitAssignUnder`'s arm over an index target `xs[i] = v`: a map store or a list element
 // store. Returns 0 lowered, -1 failed.
+// The local the last element or field store parked its value in, the stored cell's own rep, or
+// -1 for a store that parked none or truncates the value it stores (a byte list). A field store
+// parks only while `asgParkWanted` is set; an element store always parks.
+let asgParkedSlot = -1
+// Whether that local holds a reference, which a local declares nullable.
+let asgParkedRef = false
+let asgParkWanted = false
+
 function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
+  asgParkedSlot = -1
+  asgParkedRef = false
   // G8: a map store `m[k] = v` — scan for `k`; overwrite `vals[hit]` on a hit, else
   // append `keys.push(k); vals.push(v)`. Checked BEFORE the list path (a map index
   // is not an array index).
@@ -28362,6 +28372,10 @@ function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
   armClose(iaSeat, iaOwed, iaHeap, a.binRight, fnIx)
   const storeValSlot = listIdxValSlot(st.mfKind, st.slot)
   fbLocalSet(storeValSlot) // 0x21 — park the value under the guard operands
+  if !st.isU8 {
+    asgParkedSlot = storeValSlot
+    asgParkedRef = st.isRef || st.isStr
+  }
   // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
   // [backing, safeIndex] resolved AFTER the value ran.
   if stHz >= 0 {
@@ -28564,8 +28578,36 @@ function emitAssignMember(
     fbRefAsNonNull()
   }
   // the scalar covariant copy at the field-store boundary, the construct's twin (D2163)
+  if asgParkWanted { asgParkField(sFieldStoreKind(si, fieldIdx)) }
   fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
   return 0
+}
+
+// Tees the field value on the stack into a scratch local of its own rep for the assignment's
+// value (`asgParkedSlot`); a field of any other kind parks nothing.
+function asgParkField(k: VKind | null) {
+  let lk: ListKind = "list"
+  if k == null {
+    return 0
+  } else if k == "i32" {
+  } else if k == "f64" {
+    lk = "f64list"
+  } else if k == "i64" {
+    lk = "i64list"
+  } else if k == "f32" {
+    lk = "f32list"
+  } else if k == "str" {
+    lk = "strlist"
+  } else {
+    return 0
+  }
+  const slot = listIdxValSlot(lk, 0)
+  fbLocalTee(slot)
+  // A tee yields the local's nullable type; the string it holds was non-null.
+  if k == "str" { fbRefAsNonNull() }
+  asgParkedSlot = slot
+  asgParkedRef = k == "str"
+  0
 }
 
 // `emitAssign`'s body: an arm applies its target's context and leaves it for the exit to undo.
@@ -38852,6 +38894,23 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if assignTargetReReads(exprIx, fnIx) {
       return emitAsgValue(body, exprIx, fnIx, asgReadUnwidenOp(exprIx, fnIx))
     }
+    if asgYieldsParkedCell(exprIx, fnIx) {
+      asgParkedSlot = -1
+      asgParkWanted = true
+      const pRc = emitAssign(body, exprIx, fnIx)
+      asgParkWanted = false
+      if pRc < 0 { return -1 }
+      if asgParkedSlot < 0 {
+        return emitFail(
+          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
+        )
+      }
+      fbLocalGet(asgParkedSlot)
+      if asgParkedRef && !tyBearsNull(nodeTyAt(exprIx, fnIx)) { fbRefAsNonNull() }
+      const pOp = asgReadUnwidenOp(exprIx, fnIx)
+      if pOp >= 0 { wU8(pOp) }
+      return 0
+    }
     return emitFail(
       "emitProgram: only an identifier assignment is a value expression",
     )
@@ -42401,4 +42460,19 @@ function litSetHasValueAtom(m: i32): boolean {
     if readAtomKindOfTy(softenLitTy(u)) >= 0 { return true }
   }
   false
+}
+
+// Whether the write at `asgIx` yields the cell it parks before its store: a list (not a map)
+// element or a field whose type is the assignment's, so the stored cell is the value.
+function asgYieldsParkedCell(asgIx: i32, fnIx: i32): boolean {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) || a.binOp != "=" { return false }
+  const t = nodeAt(unwrapParen(a.binLeft))
+  if t is Index {
+    if exprMap(t.idxArr, fnIx) { return false }
+  } else if !(t is Member) {
+    return false
+  }
+  const tt = nodeTyAt(a.binLeft, fnIx)
+  tt >= 0 && tySame(tt, nodeTyAt(asgIx, fnIx))
 }
