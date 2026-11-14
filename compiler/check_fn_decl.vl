@@ -13,10 +13,12 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  Node,
   Param,
   RetStmt,
   TypeRef,
   annTsOf,
+  arenaSetNode,
   blockTailIsDead,
   fnTpBoundOf,
   i32ToStr,
@@ -25,7 +27,12 @@ import {
   stmtAlwaysExits,
   tsMentionsAnyName,
 } from "./ast"
-import { resolveAnnotAt, resolveRetAnnotAt } from "./check_annot_resolve"
+import {
+  fvaAnnot,
+  fvaAnnotMinted,
+  resolveAnnotAt,
+  resolveRetAnnotAt,
+} from "./check_annot_resolve"
 import { assignableExpr, fsbRecheckFrom } from "./check_assignable"
 import {
   collapsedTy,
@@ -96,7 +103,12 @@ import {
   paramSolveProbe,
   paramSolveProbeSet,
 } from "./check_exp_obs"
-import { cbExpectedFor, cbExpectedRetFor, seedExpected } from "./check_expected"
+import {
+  cbExpectedFor,
+  cbExpectedRetFor,
+  cbExpectedRetOpen,
+  seedExpected,
+} from "./check_expected"
 import {
   constrainEmptyExpr,
   inferRetF32Join,
@@ -195,7 +207,7 @@ import {
   oerDeclRefusals,
   refuseOpenElemRet,
 } from "./check_node_rules"
-import { nodeTyIx, nodeTyOf, nodeTySet } from "./check_node_tys"
+import { nodeTyIx, nodeTyOf, nodeTySet, nodeTySetGrow } from "./check_node_tys"
 import { lbiPinnedReads } from "./check_num_lit_state"
 import { inlayHole, joinTypedByWant } from "./check_redundant_annot"
 import { recordRedundantRet } from "./check_redundant_ret"
@@ -258,6 +270,7 @@ import {
   tyEq,
   tyHasHole,
   tyMutEpoch,
+  tyReachesUnion,
   tyToStr,
 } from "./check_types"
 import {
@@ -533,6 +546,45 @@ function checkTailArmsAgainst(ix: i32, ret: i32) {
   0
 }
 
+// A lambda with no result annotation delivered to a closed function type holding a union is
+// checked as its annotated twin: the delivered result is written as its return annotation, so
+// every value its body returns is built at the rep its callers read (D16310). A plain result is
+// adopted after the body (`finishInferredReturn`), where an equal one stays redundant.
+function lamDeliveredRet(n: FuncDecl, fnIx: i32): FuncDecl {
+  if inferQuiet || n.fnRet >= 0 || n.fnName != "" { return n }
+  const r = cbExpectedRetFor(fnIx)
+  if (
+    r < 0
+    || cbExpectedRetOpen(fnIx)
+    || !tyReachesUnion(r, 8)
+    || r == TY_ERR
+    || isVoidTy(r)
+    || isNeverTy(r)
+    || tyHasTyVar(r)
+    || tyHasHole(r)
+  ) {
+    return n
+  }
+  const sp = fvaAnnot(r, -1, n.pos)
+  const tr = if sp >= 0 { sp } else { fvaAnnotMinted(r, -1, n.pos) }
+  if tr < 0 { return n }
+  nodeTySetGrow(tr, r)
+  const nf: Node = {
+    fnName: n.fnName,
+    fnTyParams: n.fnTyParams,
+    fnParams: n.fnParams,
+    fnRet: tr,
+    fnBody: n.fnBody,
+    pos: n.pos,
+  }
+  arenaSetNode(fnIx, nf)
+  // The destination's annotation supplied this result, so it is load-bearing (D1442).
+  cbSeedUsedSet(cbSeedUsed + 1)
+  const out = nodeAt(fnIx)
+  if out is FuncDecl { return out }
+  n
+}
+
 // A function declaration: resolves param/return annotations, binds the signature, and checks
 // the body in a fresh scope. An un-annotated return is inferred from the body's returns and
 // trailing expression (`noteInferredRet`, under a `-2` pending `curRet`), then patched into
@@ -553,7 +605,7 @@ export function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     if T.diags.length > wsDiags { wsBodyErr[fnIx] = true }
   } else {
     lamCheckDepth = lamCheckDepth + 1
-    r = checkFuncDeclNodeReal(n, fnIx)
+    r = checkFuncDeclNodeReal(lamDeliveredRet(n, fnIx), fnIx)
     lamCheckDepth = lamCheckDepth - 1
   }
   lpBaseSet(lpSaved)
