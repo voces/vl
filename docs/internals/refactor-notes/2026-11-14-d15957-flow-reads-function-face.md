@@ -15,43 +15,50 @@ Lane D. This builds the face that `2026-11-12-flow-reads-function-face-measured.
   - a join of two rows naming different functions is the binding's storage (`narJoinTys`);
   - any write in a loop body retires the row at the loop head (`crLoopLeavingWrite`);
   - a write target takes storage (`letWriteTargetTy`).
-- **Which bindings qualify (`letFnWriteNarrows`):**
-  - two or more members, all declared generics, which agree on returning a value (B2, D15015);
+- **Which bindings qualify (`letFnWriteNarrows`, `cwLetWritesStraight`):**
+  - two or more members, all declared generics whose parameters are all their own type
+    parameters (`fnParamsAllTyParams`), agreeing on returning a value (B2, D15015);
   - every write is a statement of the declaring block, storing the name of a function or a read
     of a `let`;
-  - no nested function names the binding (`cwLetWritesStraight`, check_write_scan).
-- **When it applies.** `compileSrc` and `checkSrc` (driver) retry a program that failed with a
-  type error under `fnFlowReadsForce` when the first check met a qualifying binding. A program
-  the whole-set typing accepts checks exactly as before. Both typings run the same function at a
-  read, so only acceptance moves. The retry is needed because the narrowed reading exposes gaps
-  in direct-name spellings that the whole-set path covers, and those would otherwise be
-  `runs → not-runs` (below). If the retry fails too, the first typing's diagnostics are
-  reported.
+  - no nested function names the binding and no read of it is a call argument.
+
+  Any other binding keeps its whole set, exactly as before.
+
+## Why those two exclusions
+
+The first cut narrowed every binding. Graded against master over the population, it moved 5
+programs from `runs` to not. In each, the read renamed to one function hit a spelling the
+whole-set path covers:
+- a generic with a fixed `i32 | string` or record parameter delivered at a narrower closed type,
+  where the direct name is refused on master (D16111);
+- a read handed to a generic parameter called at two types, which reached mono's one-closure
+  refusal (D16112);
+- `retV` delivered at a `void` type, now kept out by the B2 test.
+
+A binding with a concrete-parameter member, or with a read passed as an argument, is tested
+locally from its own declarations and occurrences and stays on the whole set. A driver-level
+retry that applied the narrowing only to refused programs was tried and dropped: it made a
+binding's typing depend on errors elsewhere in the program.
 
 ## Measured
 
 Against master's fixpoint over 19,769 programs (`tests/cases` plus distilled `cells/` and
 `named/`), before the new fixtures:
 - 0 `runs → not-runs`, 0 output differences.
-- **`error-fn-set-list-shared-by-mutable-closed-list.vl` now runs.** It prints `ss`, `2` and
-  `82`, the same as naming `dbl` directly, which master runs. It is legal by the flow-read ruling.
-  The fixture is restated with the write in a branch, so D15133's refusal of a function set is
-  still pinned. Its straight-line spelling is the new run fixture
+- **`error-fn-set-list-shared-by-mutable-closed-list.vl` now runs.** It prints `ss`, `2` and `82`,
+  as naming `dbl` directly does on master, so it is legal by the flow-read ruling. The fixture is
+  restated with the write in a branch, which keeps D15133's refusal of a function set pinned. Its
+  straight-line spelling is the new run fixture
   `let-of-generics-repointed-list-shared-by-mutable-closed-list.vl`.
-- **`error-void-seeded-let-written-value-fn-result-read.vl` stays refused.** Owner ruling B2
-  (D15015) refuses reading the result of a void-seeded binding, so members that disagree on
-  returning a value leave the binding unqualified.
-- The seven `error-let-of-generic-written-*` fixtures keep their messages.
+- **`error-void-seeded-let-written-value-fn-result-read.vl` stays refused**, by B2.
+- **Four `error-let-of-generic-written-*` fixtures keep refusing, with the message of the one
+  function the read holds:**
+  - `delivered-in-array-literal` and `delivered-in-record-field`: `plus` is not closed by
+    `boolean`;
+  - `generic-params-by-position`: argument 1, the `true` that reaches `b + 1`;
+  - `repeated-tparam-argument-misfit`: argument 1 against `w`'s shared `A`.
 
-**What the always-on cut cost.** Before the retry was added, the narrowing applied to every
-program. It moved 32 programs from `runs` to not, then 5 once the qualification gate was in. Each
-exposed a direct-name gap the whole-set path covers:
-- `midT(other)` with a generic handed to a generic parameter called at two types;
-- `retV` delivered at a `void` function type;
-- a generic with a fixed `i32 | string` parameter delivered at `(i32, boolean) => void`;
-- a call literal with an undeclared field, which the direct name refuses by design.
-
-Those spellings are refused on master too. They are not regressions of this change.
+  Their `@error` lines are updated.
 
 ## Not done
 
