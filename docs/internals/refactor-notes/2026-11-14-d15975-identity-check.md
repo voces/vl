@@ -39,4 +39,8 @@ The emitter (PR 2) and `==` on functions (PR 3) follow.
   - `error-identity-eq-operands.vl` is new.
   - The `check --fix` case keeps its output and is renamed.
 - **Sites.** `emit-refusal-sites`: +1 call site (the bridge). `--live-sites`: 2 of 2 LIVE.
-- **Sweep.** SWEEP.
+- **Sweep** (fixpoint seeds on both sides): 24,286 programs.
+  - 0 `runs → not-runs`, 0 bytes-only movers, 0 new traps.
+  - 3 output movers, all by design:
+    - D15975's witness: `check_reject` → `emit_reject`, now the bridge's message.
+    - The two identity cases: the parser's old "VL has no `===`" → the ruled check messages.
