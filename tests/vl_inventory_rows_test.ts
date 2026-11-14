@@ -588,6 +588,58 @@ Deno.test("a status's first clause carries the row's state, not a later clause",
   }
 });
 
+// A STATUS THAT RECORDS A MOVED OUTCOME SAYS WHETHER IT CLOSED. `now a loud check reject` and
+// `by design` read the same whether the refusal is the one the design owes (the row closed) or
+// the price of an open row, and `ls.vl` cannot tell them apart: 31 closed rows listed as open
+// until each took a `closed <date> · ` prefix. Such a status settles in its first clause or says
+// `open`.
+/** Whether a status records a moved outcome or a design verdict and says neither closed nor open. */
+function movedUnsaid(status: string, words: string[]): boolean {
+  const low = status.toLowerCase().replace(/^[*\s]+/, "");
+  if (!low.startsWith("now ") && !/\bby design\b/.test(low)) return false;
+  if (firstClauseSettled(low, words)) return false;
+  return !/(^|[^a-z0-9_-])open($|[^a-z0-9_-])/.test(low);
+}
+
+const MOVED_SPECIMENS: Array<[string, boolean, string]> = [
+  ["now a loud check reject · filed 2026-09-06", true, "a move that says nothing"],
+  ["loud check reject · by design (the getter contract)", true, "a verdict that says nothing"],
+  ["closed 2026-09-06 · now a loud check reject", false, "closed first"],
+  ["now a loud check reject (fixed) — the program stays illegal", false, "fixed first clause"],
+  ["open · now a loud emit reject · clause 2", false, "open first"],
+  ["now a loud emit reject · clause 2 · open · silently wrong before", false, "open later"],
+  ["loud check reject · clause 2 · filed 2026-10-01", false, "no move, no verdict"],
+];
+
+Deno.test("a status that records a moved outcome says whether the row closed", async () => {
+  const words = settledWords(await Deno.readTextFile(LS));
+  for (const [status, want, why] of MOVED_SPECIMENS) {
+    const got = movedUnsaid(status, words);
+    if (got !== want) {
+      throw new Error(
+        `specimen (${why}): want ${want}, got ${got} for ${JSON.stringify(status)}`,
+      );
+    }
+  }
+  const bad: string[] = [];
+  for (const dir of DIRS) {
+    for (const doc of await docsOf(dir)) {
+      for (const r of parseRows(await Deno.readTextFile(doc))) {
+        if (!movedUnsaid(r.status ?? "", words)) continue;
+        bad.push(
+          `${doc}:${r.line}  ${r.id} — a moved outcome that says neither closed nor open\n` +
+            `      want: \`closed <date> · \` when the refusal is the design's, \`open · \` when ` +
+            `it is the price of an open row\n` +
+            `      got:  ${(r.status ?? "").slice(0, 120)}`,
+        );
+      }
+    }
+  }
+  if (bad.length > 0) {
+    throw new Error(`${bad.length} row(s) leave their state unsaid:\n${bad.join("\n")}`);
+  }
+});
+
 Deno.test("a `Want:` block is an indented block directly under its label", () => {
   const bad: string[] = [];
   for (const [name, want, labels, body] of WANT_SPECIMENS) {
