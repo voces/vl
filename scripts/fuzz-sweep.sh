@@ -8,9 +8,11 @@
 #   declared  — --branching --multiobs --declared, report-only
 # Legs run sequentially (each already saturates the cores); per-leg out-dirs land under ONE
 # sweep dir with the same layout the workflow artifacted (seed_*.tsv / keep_* / summary.md).
+# Each unsound finding then gets a ready-to-file row draft, `keep_<seed>/case_N.row.md`
+# (scripts/fuzz-draft-rows.sh: minimised, de-duplicated, with a family guess); `--no-drafts` skips it.
 #
 # USAGE: scripts/fuzz-sweep.sh [--seeds N] [--count M] [--depths "4 5 6"] [--jobs J]
-#                              [--out-dir DIR] [--legs "plain branching multiobs declared"]
+#                              [--out-dir DIR] [--legs "plain branching multiobs declared"] [--no-drafts]
 # Requires a fresh seed: bash scripts/refresh-compiler.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -21,6 +23,7 @@ DEPTHS="4 5 6"
 JOBS=""
 OUT=""
 LEGS="plain branching multiobs declared"
+DRAFTS=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --seeds) SEEDS="$2"; shift 2 ;;
@@ -29,6 +32,7 @@ while [ $# -gt 0 ]; do
     --jobs) JOBS="$2"; shift 2 ;;
     --out-dir) OUT="$2"; shift 2 ;;
     --legs) LEGS="$2"; shift 2 ;;
+    --no-drafts) DRAFTS=0; shift ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
@@ -67,6 +71,12 @@ echo "==== fuzz-sweep: combined summary ===="
 for leg in $LEGS; do
   [ -f "$OUT/$leg/summary.md" ] && { echo "-- $leg --"; cat "$OUT/$leg/summary.md"; echo; }
 done
+
+if [ "$DRAFTS" -eq 1 ]; then
+  echo
+  echo "==== fuzz-sweep: row drafts ===="
+  ./scripts/fuzz-draft-rows.sh "$OUT"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "fuzz-sweep: GATING LEG FAILED (non-baselined unsound findings above; keep dirs in $OUT)"
