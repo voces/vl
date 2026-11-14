@@ -25,8 +25,14 @@ operator, by the instance's re-check.
     call);
   - the run face is `identity-eq-generic-call-sites.vl` (eleven answers at a record or list,
     `!==` included).
-  - Through a hole parameter the anchor is the function argument handed in, since that is the
-    argument the constraint binds.
+  - **Anchor.** The refusal sits on the argument whose type has no identity (`identityArgOf`,
+    else the call's own arguments): "argument 1: `===` compares identity, and `i32` has none —
+    use `==` (`same` hands it to a body that applies `===`, directly or through a parameter)".
+    The constraint binds a parameter, but the value is what the user fixes.
+  - **A generic passed as a value** (`viaHole(same, 1, 2)`) is instantiated where it is passed,
+    and no table reaches the enclosing call's arguments from there. The refusal stays at `same`,
+    and its sentence names the type and the route: "`same` is passed here as a value and
+    instantiated at `i32`, where its body applies `===`". The precise anchor is filed as D16110.
 - **Regression:** the nine `identity-eq-*` position matrices run 66 of 66, and the identity cases
   pass.
 - **Sweep.** SWEEP.
