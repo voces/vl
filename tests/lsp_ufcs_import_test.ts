@@ -41,6 +41,7 @@ import {
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { makeWorkspaceReader } from "../lsp/src/moduleGraph.ts";
 import { STD_SOURCES } from "../std/embedded.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const assert = (cond: boolean, msg: string): void => {
   if (!cond) throw new Error(msg);
@@ -361,14 +362,7 @@ Deno.test("quick-fix: two candidate modules yield two actions and no preferred o
 // ---- seed-backed: the real checker query -------------------------------------
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 
 const checkerAndReader = (extra?: (key: string) => string | undefined) => {
