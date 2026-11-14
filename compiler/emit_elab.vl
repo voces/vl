@@ -10142,7 +10142,6 @@ function elabArmHandsSet(a: i32, ad: i32): boolean {
 export function elabRun() {
   elabRunDone = false
   elabRunKeyEnd = -1
-  elabLamClosedTys = Map()
   elabHoleLamClosed = Map()
   elabHoleLamsAt = -1
   elabTpDefaultsPrime()
@@ -12550,7 +12549,12 @@ function elabRowByLamGenResults(ix: i32, tys: i32[]): i32[] {
     const lam = parenPeelIx(a)
     const at = if lam >= 0 && lam < P.nodes.length && nodeAt(lam) is FuncDecl { nodeTyIxOf(lam) } else { -1 }
     const af = if at >= 0 && at < T.tys.length { tyAt(at) } else { cn }
-    if af is TyFunc && tysClosed(af.fnParamTypes) && tyHasHole(af.fnRet) {
+    if (
+      af is TyFunc
+      && tysClosed(af.fnParamTypes)
+      && tyHasHole(af.fnRet)
+      && elabLamSoleArg(lam)
+    ) {
       const rt = elabLamGenResultTy(lam)
       if rt >= 0 {
         const closed = mkFuncTy(af.fnParamTypes, rt)
@@ -12558,7 +12562,6 @@ function elabRowByLamGenResults(ix: i32, tys: i32[]): i32[] {
         while q < out.length {
           if tySame(out[q], at) {
             out[q] = closed
-            elabLamClosedTys[lam] = closed
             moved = true
           }
           q = q + 1
@@ -12589,7 +12592,12 @@ function elabHoleLamsGather() {
     if n is FuncDecl && n.fnRet < 0 {
       const t = nodeTyIxOf(ix)
       const f = if t >= 0 && t < T.tys.length { tyAt(t) } else { n }
-      if f is TyFunc && tysClosed(f.fnParamTypes) && tyHasHole(f.fnRet) {
+      if (
+        f is TyFunc
+        && tysClosed(f.fnParamTypes)
+        && tyHasHole(f.fnRet)
+        && elabLamSoleArg(ix)
+      ) {
         elabHoleLams.push(ix)
         elabHoleLamTys.push(t)
       }
@@ -12597,6 +12605,30 @@ function elabHoleLamsGather() {
     ix = ix + 1
   }
   0
+}
+
+// Whether lambda `lam` is an argument, and the only one any call hands its callee's parameter: a
+// parameter handed several functions holds a set of them, which this closing does not build
+// (D16130).
+function elabLamSoleArg(lam: i32): boolean {
+  if !cwIxCovers(lam) || cwIxUpKind[lam] != CW_UP_ARG { return false }
+  const c = cwIxUp[lam]
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) { return false }
+  const ai = cwIxUpAux[lam]
+  const ds = elabCalleeFns(cn)
+  if ds.length != 1 { return false }
+  let ix = 0
+  while ix < P.nodes.length {
+    const on = nodeAt(ix)
+    if ix != c && on is Call && on.callFn >= 0 {
+      for d in elabCalleeFns(on) {
+        if d == ds[0] && ai < on.callArgs.length { return false }
+      }
+    }
+    ix = ix + 1
+  }
+  true
 }
 
 function elabLamHoleTysClose(tys: i32[]) {
@@ -12656,17 +12688,7 @@ function elabHoleLamClosedOf(lam: i32): i32 {
   }
   // A lambda with no answer yet is asked again: its delivery may not be walked yet.
   elabHoleLamClosed[lam] = if c >= 0 { c } else { -3 }
-  if c >= 0 { elabLamClosedTys[lam] = c }
   c
-}
-
-// The closed type `elabRowByLamGenResults` gave each lambda argument, for mono to pin its callee by.
-let elabLamClosedTys: {[i32]: i32} = Map()
-
-// The closed type the elaboration gave lambda `lam` where its own type is open only in its result;
-// -1 for none.
-export function elabLamClosedTyOf(lam: i32): i32 {
-  elabLamClosedTys.get(lam) ?? -1
 }
 
 // The closed result of lambda `lam` that returns one read of a generic function delivered at one
@@ -12683,9 +12705,20 @@ function elabLamGenResultTy(lam: i32): i32 {
   const gs = if g >= 0 && g < P.nodes.length { nodeTyIxOf(g) } else { -1 }
   const gf = if gs >= 0 && gs < T.tys.length { tyAt(gs) } else { fn }
   if !(gf is TyFunc) || elabTyClosed(gs, 0) { return -1 }
+  // Deliveries agreeing on their parameters pin one instance; two parameter lists are two.
   const ds = elabSlotDeliveries(x, [], -1)
-  if ds.length != 1 { return -1 }
+  if ds.length == 0 { return -1 }
   const dt = tyAt(ds[0])
+  for o in ds {
+    const of = tyAt(o)
+    if (
+      !(dt is TyFunc)
+      || !(of is TyFunc)
+      || !tyListSameAll(of.fnParamTypes, dt.fnParamTypes)
+    ) {
+      return -1
+    }
+  }
   if !(dt is TyFunc) || dt.fnParamTypes.length != gf.fnParamTypes.length {
     return -1
   }
