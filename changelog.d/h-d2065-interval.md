@@ -5,7 +5,7 @@
   delivers to `Lane4` (`0 | 1 | 2 | 3`) because every value it takes is a lane. The loop-variable
   half of the owner's 2026-09-22 ruling (D-Q2). The ends and step must be integer literals or
   `const`s initialised by one, and the body must never write the variable. `to` and a negative
-  step are covered. A data-bounded or empty range, one reaching past the destination's literals,
-  and arithmetic over the variable stay `i32` and keep the refusal. The variable's type and rep
-  are unchanged everywhere else. The getter half, bounded loops inside a getter, is filed as
-  D16065.
+  step are covered, and an un-annotated `const` bound to the variable carries its range. A
+  data-bounded or empty range, one reaching past the destination's literals, and arithmetic over
+  the variable stay `i32` and keep the refusal. The variable's type and rep are unchanged
+  everywhere else. The getter half, bounded loops inside a getter, is filed as D16065.
