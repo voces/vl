@@ -1,6 +1,10 @@
 import { cUserTypes, unionAliasDeclNameOfTy } from "./check_types"
 import { exactArmRowOfTy } from "./emit_local_slots"
-import { armRowTysOfUnionTy, armRowsOfUnionTy } from "./emit_classify"
+import {
+  armRowTysOfUnionTy,
+  armRowsOfUnionTy,
+  nulScalarBoxRowOf,
+} from "./emit_classify"
 import { unMemPeelAliasWrapper } from "./emit_union_tykey_text"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { unionArmRowOfTy } from "./emit_local_slots"
@@ -1534,7 +1538,7 @@ import {
   tyBoxTakesAtomAsStr,
   unMemIsMap,
   unMemIsRefElemArray,
-  unionArmsOfTy,
+  unionArmsOfRow,
   unionHasAtomOfTy,
   unionMemberSetOfRow,
   unionMemberTysOfRow,
@@ -8032,16 +8036,27 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
       fbEnd()
       return 0
     }
+    // A function-value leaf: `F | null` is the closure fat pointer's own nullable ref.
+    if oKind == "closure" || oKind == "nulclosure" {
+      if emitOptChainIsNull(body, exprIx, fnIx) < 0 { return -1 }
+      fbIfRefNul(cloStructIdx, true)
+      fbRefNull(cloStructIdx)
+      fbElse()
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
+      fbStructGet(sHeapIdx[osi], ofi)
+      fbEnd()
+      return 0
+    }
     // The leaf reps this arm can build, in the order the arms below take them: a nullable
-    // REF (a list, a map, a nested struct, a string), the scalar box (i32/boolean/f64/i64/f32),
-    // and the value-union box. A closure leaf reaches neither and is named as such.
+    // REF (a list, a map, a function value, a nested struct, a string), the scalar box
+    // (i32/boolean/f64/i64/f32), and the value-union box. Any other leaf is named as such.
     if (
       !optChainLeafBoxable(oKind)
       && fieldRowNumKind(oRow) < 0
       && oRefHeap < 0
     ) {
       return emitFailAt(
-        "emitProgram: a standalone `?.` has no rep for a closure leaf field — read it through a `!= null` guard",
+        "emitProgram: a standalone `?.` has no rep for this leaf field — read it through a `!= null` guard",
         exprIx,
       )
     }
@@ -8959,10 +8974,8 @@ function emitUnionCoerce(
     )
   }
   boxDstShadowEnter()
-  let r = emitUnionWideRetag(body, unionNameIn, unionTy, exprIx, fnIx)
-  if r == 0 {
-    r = emitUnionWideArmBox(body, unionNameIn, unionTy, exprIx, fnIx)
-  }
+  let r = emitUnionWideRetag(body, unionTy, exprIx, fnIx)
+  if r == 0 { r = emitUnionWideArmBox(body, unionTy, exprIx, fnIx) }
   if r == 1 {
     r = 0
   } else if r == 0 {
@@ -9687,7 +9700,7 @@ function emitUnionCoerceList(
   // box anyref directly, tagged by the closure arm's `scalarTagOf` (value-atom kind 11).
   // Checked before the ladder below, whose scalar branches would store the ref in a value box.
   if unionName != "" && exprIsClosure(exprIx, fnIx) {
-    const clArm = unionClosureArmTyOfTy(unionName, uTy)
+    const clArm = unionClosureArmTyOfTy(uTy)
     if clArm >= 0 {
       const own = cloBoxOwnFnTy(exprIx, fnIx)
       fbI32Rel(RS_TAG, cloArmTagOfTy(if own >= 0 { own } else { clArm }))
@@ -9963,7 +9976,7 @@ function emitUnionBoxArgGo(
         if mvValKindAt(bxSh) == "union" {
           const mgFrom: i32[] = []
           const mgTo: i32[] = []
-          wideRetagPairs(exprIx, fnIx, unionName, unionTy, mgFrom, mgTo)
+          wideRetagPairs(exprIx, fnIx, unionTy, mgFrom, mgTo)
           if emitMapGetUnionBox(body, bxIdx.idxArr, bxIdx.idxIndex, fnIx) < 0 {
             return -1
           }
@@ -9976,7 +9989,7 @@ function emitUnionBoxArgGo(
   const bxMap = emitUnionMapArmBox(body, unionName, unionTy, exprIx, fnIx)
   if bxMap < 0 { return -1 }
   if bxMap == 1 { return 0 }
-  const bxArm = emitUnionArmValueBox(body, unionName, unionTy, exprIx, fnIx)
+  const bxArm = emitUnionArmValueBox(body, unionTy, exprIx, fnIx)
   if bxArm < 0 { return -1 }
   if bxArm == 1 { return 0 }
   emitUnionCoerce(body, unionName, unionTy, exprIx, fnIx)
@@ -9987,7 +10000,6 @@ function emitUnionBoxArgGo(
 // arm of another union is such a record too. Returns 1 handled, 0 not such a record, -1 on error.
 function emitUnionWideArmBox(
   body: u8[],
-  unionName: string,
   unionTy: i32,
   exprIx: i32,
   fnIx: i32,
@@ -10002,7 +10014,7 @@ function emitUnionWideArmBox(
   }
   const vty = nodeTyAt(unwrapParen(exprIx), fnIx)
   const atoms: i32[] = []
-  unionArmRowsOfTy(unionName, unionTy, atoms)
+  unionArmRowsOfTy(unionTy, atoms)
   // A nullable record: its null is the union's, else it boxes as the record does.
   if tyBearsNull(vty) {
     if exprUnion(exprIx, fnIx) { return 0 }
@@ -10052,12 +10064,11 @@ function emitUnionWideArmBox(
   1
 }
 
-// A box of another union with record arms wider than arms of `unionName`: each such arm is
+// A box of another union with record arms wider than arms of `unionTy`: each such arm is
 // re-boxed under the arm its row subtypes, and every other member keeps its tag (D15057).
 // Returns 1 handled, 0 when no arm needs it, -1 on error.
 function emitUnionWideRetag(
   body: u8[],
-  unionName: string,
   unionTy: i32,
   exprIx: i32,
   fnIx: i32,
@@ -10065,19 +10076,18 @@ function emitUnionWideRetag(
   if !exprUnion(exprIx, fnIx) { return 0 }
   const fromTags: i32[] = []
   const toTags: i32[] = []
-  wideRetagPairs(exprIx, fnIx, unionName, unionTy, fromTags, toTags)
+  wideRetagPairs(exprIx, fnIx, unionTy, fromTags, toTags)
   if fromTags.length == 0 { return 0 }
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   emitWideRetagChain(fromTags, toTags)
   1
 }
 
-// The tags of `exprIx`'s union whose arm is wider than an arm of `unionName` into `fromTags`,
+// The tags of `exprIx`'s union whose arm is wider than an arm of `unionTy` into `fromTags`,
 // and that arm's tag beside each into `toTags`.
 function wideRetagPairs(
   exprIx: i32,
   fnIx: i32,
-  unionName: string,
   unionTy: i32,
   fromTags: i32[],
   toTags: i32[],
@@ -10091,7 +10101,7 @@ function wideRetagPairs(
     return 0
   }
   const ta: i32[] = []
-  unionArmRowsOfTy(unionName, unionTy, ta)
+  unionArmRowsOfTy(unionTy, ta)
   for vi in fa {
     if vi >= 0 && vi < uTags.length && !armsHoldHeap(ta, variantHeap(vi)) {
       const w = wideArmOfRow(variantRowOf(vi), ta)
@@ -10131,11 +10141,16 @@ function emitWideRetagChain(fromTags: i32[], toTags: i32[]) {
   0
 }
 
-// `armRowsOfUnionTy` of `unionName`'s type `unionTy`, else the rows its arms' spellings name.
-function unionArmRowsOfTy(unionName: string, unionTy: i32, rows: i32[]) {
+// `armRowsOfUnionTy` of union type `unionTy`, else the rows its arms' spellings name, read off
+// the row `unionTy` boxes in: a hole's scalar `T | null` box has no member set of its own.
+function unionArmRowsOfTy(unionTy: i32, rows: i32[]) {
   if unionTy >= 0 && armRowsOfUnionTy(unionTy, rows) { return 0 }
   const atoms: string[] = []
-  unionArmsOfTy(unionName, unionTy, atoms)
+  if !unionArmsOfRow(nulScalarBoxRowOf(unionTy), atoms) {
+    return emitFail(
+      "emitProgram: a union's arm rows were asked of a type no row holds",
+    )
+  }
   for a in atoms { rows.push(exactArmRowOfTy(cUserTypes[a] ?? -1)) }
   0
 }
@@ -10173,13 +10188,12 @@ function wideArmOfRow(si: i32, arms: i32[]): i32 {
 // `emitUnionCoerce` alone passes an arm value raw, which fits only a variant cell (D1606).
 function emitUnionArmValueBox(
   body: u8[],
-  unionName: string,
   unionTy: i32,
   exprIx: i32,
   fnIx: i32,
 ): i32 {
   if exprUnion(exprIx, fnIx) { return 0 }
-  const wide = emitUnionWideArmBox(body, unionName, unionTy, exprIx, fnIx)
+  const wide = emitUnionWideArmBox(body, unionTy, exprIx, fnIx)
   if wide != 0 { return wide }
   // A read that can still be null (a record-valued map's miss) is the niche below even where
   // `exprVariantIndex` names its arm: tagging it with the arm boxes the miss as a record (D10170).
@@ -22043,7 +22057,7 @@ function emitBoxAmbiguousFail(memIx: i32) {
 }
 
 // Whether a box held at union type `fromTy` needs a retag to be read at `toTy`, filling the
-// member types of each (`unionTyArms`). False where either type is -1 or names no arms: a box
+// member types of each (`unionTyMemberTys`). False where either type is -1 or names no arms: a box
 // whose union no type covers is read as built.
 function boxRetagArmsOfTys(
   fromTy: i32,
@@ -33003,7 +33017,7 @@ function emitLetInitValue(
     if letUTy < 0 { letUTy = letBindTy(stmtIx, fnIx) }
     let letArmBoxed = 0
     if slotKind == "union" {
-      letArmBoxed = emitUnionArmValueBox(body, letUNm, letUTy, s.letInit, fnIx)
+      letArmBoxed = emitUnionArmValueBox(body, letUTy, s.letInit, fnIx)
       if letArmBoxed < 0 { return -1 }
     }
     if letArmBoxed == 0 {
@@ -41903,8 +41917,9 @@ function emitCoalesceOptNulRecord(
     fieldRowIsStr(nfRow, false),
   )
   if nfLeaf == null {
-    return emitFail(
+    return emitFailAt(
       "emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep",
+      exprIx,
     )
   }
   if emitOptRecvBase(body, lhs.omObj, fnIx, false) < 0 { return -1 }

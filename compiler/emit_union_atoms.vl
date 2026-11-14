@@ -1,12 +1,7 @@
 import { mkUnionTy } from "./check_union_mint"
 import { exactArmRowOfTy } from "./emit_local_slots"
-import { sFieldElemSame, unMemAtoms } from "./emit_state"
-import {
-  repShadowAddReason,
-  repShadowOn,
-  unMemRowStart,
-  valueBoxOfTy,
-} from "./emit_rep"
+import { sFieldElemSame } from "./emit_state"
+import { repShadowAddReason, repShadowOn, valueBoxOfTy } from "./emit_rep"
 
 // `emit_union_atoms.vl` — which value unions carry atoms or map arms, the
 // map-value shapes they intern, and the twins a variant is built with.
@@ -89,7 +84,6 @@ import {
   tyIsAtomLeafList,
   unionRowArmTys,
   unionSetArmTysAB,
-  unionTyArms,
   unionTyMemberTys,
 } from "./emit_map_twins"
 import {
@@ -1818,11 +1812,10 @@ export function markValueUnionAtoms(ty: i32) {
 
 // `markValueUnionAtoms` over registered row `u`'s own members.
 export function markValueUnionAtomsRow(u: i32) {
-  const atoms: string[] = []
   const mems: i32[] = []
   let ty = -1
   if u >= 0 && u < unTyIx.length { ty = unTyIx[u] }
-  markValueUnionArms(mems, unionRowArmTys(u, atoms, mems), ty)
+  markValueUnionArms(mems, unionRowArmTys(u, mems), ty)
 }
 
 // The usage bits one arm of box tag `k` forces. Bits: 1 i32, 2 string array, 4 i64, 8 f64, 16 f32,
@@ -1935,26 +1928,21 @@ export function markAtomLeafListArms(mems: i32[]) {
 // heap flags and interns the arm's value shape via `mvShapeOfValNameTys`; a mono/atom value
 // interns no slot (rides -1), a typed value gets a distinct mv slot and `mapSlotTag`.
 export function markMapUnionArms(ty: i32) {
-  const atoms: string[] = []
   const mems: i32[] = []
-  markMapUnionArmsOf(atoms, mems, unionSetArmTysAB(102, ty, atoms, mems))
+  markMapUnionArmsOf(mems, unionSetArmTysAB(102, ty, mems))
 }
 
 // `markMapUnionArms` over registered row `u`'s own members.
 export function markMapUnionArmsRow(u: i32) {
-  const atoms: string[] = []
   const mems: i32[] = []
-  markMapUnionArmsOf(atoms, mems, unionRowArmTys(u, atoms, mems))
+  markMapUnionArmsOf(mems, unionRowArmTys(u, mems))
 }
 
-// The map-arm interning for one union's `atoms`, read through member types `mems` when `cov`.
-function markMapUnionArmsOf(atoms: string[], mems: i32[], cov: boolean) {
-  // D-UNION: a map arm is a `TyMap` member (`unMemIsMap`), not a `{[`-prefixed
-  // rendering. The arm's stored atom TEXT still keys the (name-keyed) map-value slot
-  // layer below (`mapValNameOf` → `mvShapeOfValNameTys`).
+// The map-arm interning for one union's member types `mems`, when `cov`.
+function markMapUnionArmsOf(mems: i32[], cov: boolean) {
+  // A map arm is a `TyMap` member (`unMemIsMap`).
   let i = 0
-  while i < atoms.length {
-    // An arm with no member type is not taken for a map by its spelling.
+  while i < mems.length {
     const isMap = cov && unMemIsMap(mems[i])
     if isMap {
       let held = -1
@@ -2250,13 +2238,17 @@ export function identChainTyBoxedUnion(
 // over-reservation is a harmless spare and an under-reservation is invalid wasm.
 export function armPathArenaDeclined(): boolean { true }
 
-// The first function-typed member of union `name` of type `ty` (the row `ty` keys first), or -1
-// when it has none: the bare-closure arm `emitUnionCoerce` gates its closure-carrier box on, and
-// the fallback type that box is tagged by (`cloBoxOwnFnTy`).
-export function unionClosureArmTyOfTy(name: string, ty: i32): i32 {
+// The first function-typed member of union type `ty` (the row `ty` keys, else a row-less type's
+// own members), or -1 when it has none: the bare-closure arm `emitUnionCoerce` gates its
+// closure-carrier box on, and the fallback type that box is tagged by (`cloBoxOwnFnTy`).
+export function unionClosureArmTyOfTy(ty: i32): i32 {
   const atoms: string[] = []
   const mems: i32[] = []
-  if unionArmTysOfTy(name, ty, atoms, mems) {
+  const u = unRowOfTyKey(ty)
+  if (
+    unionArmTysOfRow(u, atoms, mems)
+    || (u < 0 && unionTyMemberTys(ty, mems))
+  ) {
     for m in mems {
       if tyIxIsFunc(m) { return m }
     }
@@ -2641,56 +2633,6 @@ export function unionNameOfVariant(vi: i32) {
   const u = unionOfVariant(vi)
   if u >= 0 { return unNames[u] }
   ""
-}
-
-// `unionArmTys` for a caller holding the union's type `ty` (-1 for none): a spelling no row is
-// bound to reads the atoms and member types of the row `ty` keys to, recorded together, not the
-// row of its member-set text.
-function unionArmTysOfTy(
-  name: string,
-  ty: i32,
-  atoms: string[],
-  tys: i32[],
-): boolean {
-  if ty >= 0 {
-    const u = unRowOfTyKey(ty)
-    if u >= 0 && unionRowArmsInto(u, atoms, tys) { return true }
-    // A row-less union reads its own members, never its spelling.
-    if u < 0 && unRowOfName(name) < 0 { return unionTyArms(ty, atoms, tys) }
-  }
-  unionArmTys(name, atoms, tys)
-}
-
-// Appends row `u`'s recorded atoms and member types, index-parallel; false, appending nothing,
-// when the row records no member slice.
-function unionRowArmsInto(u: i32, atoms: string[], tys: i32[]): boolean {
-  const st = unMemRowStart(u)
-  if st < 0 || u >= unMemTyCount.length { return false }
-  const n = unMemTyCount[u]
-  if st + n > unMemAtoms.length || st + n > unMemTys.length { return false }
-  let i = 0
-  while i < n {
-    atoms.push(unMemAtoms[st + i])
-    tys.push(unMemTys[st + i])
-    i = i + 1
-  }
-  true
-}
-
-// Resolves `name`'s arm spellings via `unionArmsOf` into `atoms`, then fills `tys` with their
-// arena types in the row's box-tag ABI order — true only when the row covers all of them 1:1.
-// `atoms` and `tys` stay index-parallel either way; on `false`, `tys` is left untouched and
-// the caller keeps its own spelling-based fallback.
-export function unionArmTys(
-  name: string,
-  atoms: string[],
-  tys: i32[],
-): boolean {
-  const nm = unionArmsOf(name, atoms)
-  // A name bound to a row reads that row's members, not the member-set text it resolves to.
-  const u = unRowOfName(name)
-  if u >= 0 { return unionMemberTysOfRow(u, tys) && tys.length == atoms.length }
-  unionMemberTysOf(nm, tys) && tys.length == atoms.length
 }
 
 // Row `u`'s atoms and member types, index-parallel; false, appending no member types, where `u` is -1
