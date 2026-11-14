@@ -383,6 +383,7 @@ import {
 import { nullableFlatInner, substUnionNullFolded } from "./check_subst_fold"
 import { demangleName, isBuiltinTyName } from "./check_suggest"
 import {
+  holeNameIsParamOf,
   joinTyParamNull,
   markTpJoinApart,
   noteHoleTpJoin,
@@ -8400,6 +8401,12 @@ function holeCallInstOf(
     const r = holeSetCallRetOf(c, fnTagSetOfTy(vt), ats, false)
     return if r >= 0 { mkFuncTy(ats, r) } else { -1 }
   }
+  // A declared hole function bound here is called as a direct call of it is: each lambda argument
+  // at the types its body calls that parameter at, then its body at the closed arguments (D16335).
+  const d = holeDeclOfFnTy(vt)
+  if d >= 0 && lams.length > 0 {
+    return holeDeclCallInst(d, n, vNames, vTys, calleeFn, depth)
+  }
   for lj in lams {
     const p = vf.fnParamTypes[lj]
     if !holeLamBind(p, n.callArgs[lj], vNames, vTys, oNames, oTys) { return -1 }
@@ -8407,6 +8414,139 @@ function holeCallInstOf(
   const inst = substTyDeep(vt, oNames, oTys)
   if inst < 0 || tyHasTyVar(inst) { return -1 }
   inst
+}
+
+// The un-annotated declared function whose own open signature `vt` is, read off the hole its first
+// parameter names, which is that function's own; -1 when `vt` is no such signature.
+function holeDeclOfFnTy(vt: i32): i32 {
+  if vt < 0 || vt >= T.tys.length { return -1 }
+  const vf = tyAt(vt)
+  if !(vf is TyFunc) || vf.fnParamTypes.length == 0 { return -1 }
+  const p0 = vf.fnParamTypes[0]
+  if p0 < 0 || p0 >= T.tys.length { return -1 }
+  const pv = tyAt(p0)
+  if !(pv is TyVar) { return -1 }
+  const nm = pv.tvName
+  if nm.length < 2 || nm[0] != '?' { return -1 }
+  let e = 1
+  while e < nm.length && nm[e] != '.' && nm[e] != '@' { e = e + 1 }
+  const d = fnDeclIx[nm.slice(1, e)] ?? -1
+  if !directHoleDecl(d) { return -1 }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return -1 }
+  if f.fnParams.length != vf.fnParamTypes.length { return -1 }
+  if !holeNameIsParamOf(nm, f.fnName, d, f.fnParams.length) { return -1 }
+  d
+}
+
+// Call `n` of declared hole function `d` through a parameter bound to it, typed as the direct call
+// of `d` at `n`'s arguments: a lambda argument at the closed types `d`'s body calls its parameter
+// at, every argument closed, then `d`'s body at them; -1 when one stays open.
+function holeDeclCallInst(
+  d: i32,
+  n: Call,
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  depth: i32,
+): i32 {
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnParams.length != n.callArgs.length { return -1 }
+  const ats: i32[] = []
+  let j = 0
+  while j < n.callArgs.length {
+    let at = -1
+    if holeArgIsLam(n.callArgs[j]) {
+      const pts = holeParamCalledAt(f, j)
+      if pts.length == 0 && !holeParamCalledNullary(f, j) { return -1 }
+      const r = holeLamRetAt(
+        parenPeelIx(n.callArgs[j]),
+        mkFuncTy(pts, TY_I32),
+        vNames,
+        vTys,
+      )
+      if r < 0 { return -1 }
+      at = mkFuncTy(pts, r)
+    } else {
+      at = holeCallNodeTy(n.callArgs[j], vNames, vTys, calleeFn, depth + 1)
+    }
+    if at < 0 || tyHasTyVar(at) { return -1 }
+    ats.push(at)
+    j = j + 1
+  }
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(d, mkFuncTy(ats, TY_I32), noN, noT)
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  mkFuncTy(ats, r)
+}
+
+// The closed argument types every call of parameter `j` of `f` in its body passes, when each call
+// passes the same ones; [] when there is none, they disagree, or one stays open.
+function holeParamCalledAt(f: FuncDecl, j: i32): i32[] {
+  const calls = holeParamCalls(f, j)
+  if calls.length == 0 { return [] }
+  const out: i32[] = []
+  let first = true
+  for c in calls {
+    const cn = nodeAt(c)
+    if !(cn is Call) { return [] }
+    const ts: i32[] = []
+    for a in cn.callArgs {
+      const t = widenLitTy(nodeTyOf(a))
+      if t < 0 || tyHasTyVar(t) { return [] }
+      ts.push(t)
+    }
+    if first {
+      for t in ts { out.push(t) }
+      first = false
+    } else {
+      if ts.length != out.length { return [] }
+      let i = 0
+      while i < ts.length {
+        if !tySame(ts[i], out[i]) { return [] }
+        i = i + 1
+      }
+    }
+  }
+  out
+}
+
+// Whether `f`'s body calls parameter `j` and every such call passes nothing.
+function holeParamCalledNullary(f: FuncDecl, j: i32): boolean {
+  const calls = holeParamCalls(f, j)
+  if calls.length == 0 { return false }
+  for c in calls {
+    const cn = nodeAt(c)
+    if !(cn is Call) || cn.callArgs.length > 0 { return false }
+  }
+  true
+}
+
+// The calls in `f`'s body, outside nested functions, whose callee is a read of parameter `j`.
+function holeParamCalls(f: FuncDecl, j: i32): i32[] {
+  const out: i32[] = []
+  if j < 0 || j >= f.fnParams.length { return out }
+  const p = nodeAt(f.fnParams[j])
+  if !(p is Param) { return out }
+  const todo: i32[] = [f.fnBody]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is Call {
+        const cf = parenPeelIx(n.callFn)
+        if cf >= 0 && cf < P.nodes.length {
+          const cn = nodeAt(cf)
+          if cn is Ident && cn.identName == p.parName { out.push(ix) }
+        }
+      }
+      if !(n is FuncDecl) {
+        for ch in nodeChildren(ix) { todo.push(ch) }
+      }
+    }
+  }
+  out
 }
 
 // Whether hole call argument `a` is a lambda literal whose type is still open.
