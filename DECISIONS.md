@@ -5194,7 +5194,7 @@ cover: a RECURSIVE local type inside a GENERIC function that mentions the type p
 becomes a recursive generic alias and inherits the pre-existing module-scope refusal
 `recursive generic type … is not supported — its expansion has no finite type name`. The
 module-scope spelling refuses identically, so the local spelling inherits the gap rather than
-introducing one; both build since D3328 closed (2026-11-14). **(d)** The build also had to reach `vl fmt`, which the ruling never
+introducing one. Residue (c) is closed by D3328 (2026-11-14): the local and the module-scope spellings both build and run, no longer refused (`generics/recursive-local-type-in-generic-fn.vl`). **(d)** The build also had to reach `vl fmt`, which the ruling never
 mentions: the formatter prints an `Ident`, an `is` check-type and an `as` target from the NODE
 rather than the source span, so a parser-side rename leaks into a file `vl fmt -w` writes
 back — `TV$b1.size`, `11 as Id$b1`, neither of which re-parses. Demangled at those three
