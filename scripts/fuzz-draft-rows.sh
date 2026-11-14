@@ -138,7 +138,7 @@ for root in "$@"; do
       fi
       out="${f%.vl}.row.md"
       {
-        echo "### D<id> — (draft; take an id with `ls.vl -- --next`) name the MECHANISM once ablated, not the message"
+        echo "### D<id> — (draft: take an id with inventory/ls.vl --next) name the MECHANISM once ablated, not the message"
         echo
         echo "**$(status_of "$cls") · clause 1 · found by fuzz-sweep, leg \`$leg\`, seed $seed, $(basename "$f") · filed against master \`$(git rev-parse --short HEAD)\`**"
         echo
