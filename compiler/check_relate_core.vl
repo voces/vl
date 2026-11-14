@@ -458,6 +458,7 @@ import {
   gaAppTyIxSet,
   gaAppTyIxs,
   genAppNameOfTy,
+  genAppRowCyclic,
   genAppRowOf,
   litBaseTy,
   litMemberTy,
@@ -2665,6 +2666,27 @@ export function applyGenAlias(head: string, inner: string) {
 const gaOpenGi: i32[] = []
 const gaOpenStart: i32[] = []
 const gaOpenFlat: i32[] = []
+// The instance each open application resolves to, parallel to `gaOpenGi`.
+const gaOpenRes: i32[] = []
+
+// The instance of an open application of alias `gi` whose arguments equal `args` structurally,
+// or -1.
+function gaOpenEqualRes(gi: i32, args: i32[]): i32 {
+  let f = 0
+  while f < gaOpenGi.length {
+    if gaOpenGi[f] == gi && f < gaOpenRes.length {
+      let eq = true
+      let k = 0
+      while k < args.length && eq {
+        eq = tySame(args[k], gaOpenFlat[gaOpenStart[f] + k])
+        k = k + 1
+      }
+      if eq { return gaOpenRes[f] }
+    }
+    f = f + 1
+  }
+  -1
+}
 
 // How many applications of one alias may be open at once before the expansion counts as endless,
 // whatever its arguments look like.
@@ -2809,10 +2831,6 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
     }
     return builtinCtorTyLeafFail(head)
   }
-  // The declared parameter names, read as a slice of the flat column — split once when the alias
-  // registered (D-GAPARAM), not re-split here per application. `pcount` is the declared arity.
-  const pstart = gaParamStart[gi]
-  const pcount = gaParamCount[gi]
   const argTys: i32[] = []
   if appIx >= 0 {
     const astart = tsKidStart[appIx]
@@ -2840,6 +2858,16 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
       ai = ai + 1
     }
   }
+  applyGenAliasTys(head, gi, argTys)
+}
+
+// The instance of generic alias `gi` (spelled `head`) at argument types `argTys`: the memoized
+// arena index when one exists, else a fresh placeholder filled from the declaration's fields.
+function applyGenAliasTys(head: string, gi: i32, argTys: i32[]): i32 {
+  // The declared parameter names, read as a slice of the flat column — split once when the alias
+  // registered (D-GAPARAM), not re-split here per application. `pcount` is the declared arity.
+  const pstart = gaParamStart[gi]
+  const pcount = gaParamCount[gi]
   if argTys.length != pcount {
     tErr(
       "`"
@@ -2860,6 +2888,10 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   }
   const cuHit = cUserTypes[memoKey]
   if cuHit is i32 { return cuHit }
+  // An argument equal to an open application's, under another arena index (a closed nullable
+  // re-wrapped, `(T | null) | null`), is that application, not a new instance (D16068).
+  const same = gaOpenEqualRes(gi, argTys)
+  if same >= 0 { return same }
   // A non-regular alias needs a larger application at every unfolding, which no finite set of
   // instances satisfies (D12131); refused here rather than recursed into without bound.
   if gaGrowsOpen(gi, argTys) {
@@ -2872,6 +2904,7 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   const fnames: string[] = []
   const ftys: i32[] = []
   const resIx = mkObjTy(fnames, ftys)
+  gaOpenRes.push(resIx)
   cUserTypes[memoKey] = resIx
   cUserTypesVer = cUserTypesVer + 1 // new declared-name resolution registered
   // Bank the fact that this arena index is the application `head<argTys>`. Recorded on the memo
@@ -2943,6 +2976,7 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   while gaOpenFlat.length > openAt { gaOpenFlat.pop() }
   gaOpenGi.pop()
   gaOpenStart.pop()
+  gaOpenRes.pop()
   resIx
 }
 
@@ -9706,6 +9740,8 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     if b >= 0 { return b }
     return tyIx
   }
+  const cyc = substCyclicApp(tyIx, bNames, bTys)
+  if cyc >= 0 { return cyc }
   if substOnSeenStack(tyIx) || substSkipsForeignSig(tyIx) { return tyIx }
   // A tagged set is an id: its signature names its members' own parameters, never the instance's.
   if t is TyFunc && fnTagTyIsTagged(tyIx) { return tyIx }
@@ -9738,6 +9774,31 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   // fresh arena index the provenance bank does not know about unless re-banked here, or the same type renders under two different names depending which door it came through.
   genAppCarry(tyIx, res, bNames, bTys)
   res
+}
+
+// A recursive generic instance substituted as its alias applied to the substituted arguments:
+// the one shared instance, where a field walk would meet the open instance at the cycle and
+// keep it. An argument still open (a hole) yields an open instance, re-substituted once bound.
+// -1 for any other type, or when no argument moves.
+function substCyclicApp(tyIx: i32, bNames: string[], bTys: i32[]): i32 {
+  const i = genAppRowOf(tyIx)
+  if i < 0 || !genAppRowCyclic(i) { return -1 }
+  const gi = gaIndexOf(gaAppHeads[i])
+  if gi < 0 { return -1 }
+  const st = gaAppArgStart[i]
+  const cn = gaAppArgCount[i]
+  const subbed: i32[] = []
+  let moved = false
+  let a = 0
+  while a < cn {
+    const s = substTyDeep(gaAppArgFlat[st + a], bNames, bTys)
+    if s < 0 { return -1 }
+    if s != gaAppArgFlat[st + a] { moved = true }
+    subbed.push(s)
+    a = a + 1
+  }
+  if !moved { return -1 }
+  applyGenAliasTys(gaAppHeads[i], gi, subbed)
 }
 
 // `substTyDeep` of an instance binding: `bNames` are the type parameters of top-level generic
