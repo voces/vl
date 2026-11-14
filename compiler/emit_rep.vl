@@ -41,6 +41,7 @@ import {
   armStageElemKeyKind,
   armStageElemName,
   armStageElemTyIx,
+  emitPhaseReached,
   msFreeByTy,
   msFreeChain,
   msFreeCount,
@@ -60,7 +61,11 @@ import {
   mvValArmSig,
   mvValName,
   mvValTyIx,
+  pkKindOfRow,
+  pkRowOfKind,
   pkRowOfPrim,
+  pkTwinCodeOfRow,
+  pkTwinRows,
   rlElemTyIx,
   rvSrcSlot,
   sAnonOwnTy,
@@ -2590,9 +2595,28 @@ export function msIsValueUnion(s: i32): i32 {
 
 // The globally-stable box TAG of a value atom, from its KIND — the one home of the
 // kind→tag table. Struct variants take the dense ranks `0 .. uVariants.length-1`; atom
-// kinds claim the fixed slots above them, stable across every union in the module.
+// kinds claim the fixed slots above them, stable across every union in the module. A packed
+// twin's kind names its row, whose code is minted on first use (`pkTwinCodeOfRow`).
 export function scalarTagOfKind(k: i32): i32 {
+  const row = pkRowOfKind(k)
+  if row > PK_U8 {
+    return uVariants.length + pkTwinCodeOfRow(pkTwinNote(row)) + relSkew(RS_TAG)
+  }
   uVariants.length + k + relSkew(RS_TAG)
+}
+
+// Registers packed row `row` as a union arm with its own code, returning the row. A row first
+// met once the arena is final would move codes already written, so that fails loudly.
+export function pkTwinNote(row: i32): i32 {
+  if pkTwinCodeOfRow(row) >= 0 { return row }
+  if emitPhaseReached("arenaFinal") {
+    emitFail(
+      "emitProgram: a packed list union arm was not collected before emission",
+    )
+    return row
+  }
+  pkTwinRows.push(row)
+  row
 }
 
 // The value-atom kind of the `null` member — a constant of the box ABI, not a
@@ -3721,7 +3745,7 @@ function btOfPrimList(p: PrimName | null): i32 {
       return 12
     }
     "u8" | "i8" | "u16" | "i16" => {
-      return 13
+      return pkKindOfRow(pkRowOfPrim(p))
     }
     "null" => {
       return 18
@@ -3744,7 +3768,13 @@ function btOfList(arr: i32, e: i32): i32 {
       return 7
     }
     const ep = primNameOf(e)
-    if ep == "f64" || ep == "i64" || ep == "f32" || ep == "u8" || ep == "null" {
+    if (
+      ep == "f64"
+      || ep == "i64"
+      || ep == "f32"
+      || pkRowOfPrim(ep) >= 0
+      || ep == "null"
+    ) {
       return btOfPrimList(ep)
     }
     if tyIsStrLeafElem(e) { return 9 }
@@ -4773,17 +4803,7 @@ function rtOfObjAs(memoTy: i32, objTy: i32, disc: i32, fieldTys: i32[]): i32 {
 function rtOfUnion(ty: i32, members: i32[]): i32 {
   // A union box tags a list member by its type's tag, and only `u8[]` among the packed lists
   // has one, so a union holding another packed list is refused here, before any row mints.
-  for m in members {
-    const pw = tyPackedElem(m)
-    if pw != null && pw != "u8" {
-      emitFail(
-        "emitProgram: a union with member `"
-          + primNameStr(pw)
-          + "[]` — of the packed lists only `u8[]` has a union box tag, so this union cannot be boxed",
-      )
-      return rtLeafOf("unsup", 0, "union:packed", ty)
-    }
-  }
+
   const c = unionRepClassOfTy(ty)
   // A string literal union is the interned i32 atom, whatever its spelling.
   if c == URC_ATOM { return rtLeafOf("atom", 0, "", ty) }

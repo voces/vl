@@ -53,7 +53,7 @@ import {
   recCopyTyOf,
   recordJoinSeen,
 } from "./check_core_state"
-import { canonEmitNameOfTy, canonUnionMembersInto } from "./check_program"
+import { canonUnionMembersInto } from "./check_program"
 import { recAdAnnDropped } from "./check_rec_adopt_rows"
 import { assignable, substTyDeep } from "./check_relate_core"
 import { isListArmNodes, isVarTyIxOf } from "./check_list_union"
@@ -433,6 +433,7 @@ import {
   nliLetIxs,
   nliNames,
   pkBackIdx,
+  pkTwinRows,
   pkWrapIdx,
   rlArmRowMintOn,
   rlBackIdx,
@@ -656,6 +657,7 @@ import {
   mfCbResultIsStrList,
 } from "./emit_closure_sites"
 import {
+  atomEqSlotOfKind,
   eqKindIsRecord,
   eqRowFieldCount,
   eqRowFieldKind,
@@ -3631,7 +3633,7 @@ function leqNoteUnionArms(exprIx: i32, fnIx: i32) {
   let ui = 0
   while ui < kinds.length {
     const lk = leqCoreKindOfAtomKind(kinds[ui])
-    if lk >= 0 { leqgNoteRep(lk, 0, 0) }
+    if lk >= 0 { leqgNoteRep(lk, atomEqSlotOfKind(kinds[ui]), 0) }
     // D1096 — a list field of a struct arm needs a frame for the same reason a list arm does:
     // the arm's own compare walks its variant row field by field, so a list-repped field runs
     // the ordinary list core one level in. The scan above only sees the arm atoms.
@@ -3809,19 +3811,18 @@ export function leqScanExpr(exprIx: i32, fnIx: i32) {
       if arithRegionSeen && e.binRegion != 0 && !bcOpen {
         return leqScanExprHeld(exprIx, fnIx)
       }
-      // Both note functions claim only `==`, `!=` and `+`, and so does every classifier they
-      // ask, so a binary of any other operator reserves nothing. Read the operator once here
-      // rather than re-reading it inside each of the six — a new classifier that claims a
-      // fourth operator has to widen this gate with it.
-      if (
+      // Both note functions claim only `==`, `!=` and `+`, as every classifier they ask does, so a
+      // new operator widens this one gate. An identity compare takes no structural frame, only the
+      // closure frame a function operand's `==` lowering compares through.
+      if e.binIdent != 0 {
+        cloEqNoteBin(exprIx, fnIx)
+      } else if (
         (e.binOp == "==" || e.binOp == "!=" || e.binOp == "+")
         && !leqBinIsScalar(e, exprIx)
       ) {
         leqNoteBin(exprIx, fnIx)
         cloEqNoteBin(exprIx, fnIx)
       }
-      // An identity compare reserves only the closure frame its function operands take.
-      if e.binOp == "===" || e.binOp == "!==" { cloEqNoteBin(exprIx, fnIx) }
       leqScanExpr(e.binLeft, fnIx)
       return leqScanExpr(e.binRight, fnIx)
     }
@@ -8074,15 +8075,9 @@ function nliInferOptChainLet(walk: i32[], i: i32) {
   0
 }
 
-// ── the one render-then-canon hop in this module (W9) ──────────────────────────
-// The emitter-vocabulary name of an arena type: `tyToNominalName`'s source-faithful spelling,
-// then `canonEmitName` applied once over the whole render — the same rewrites every source
-// annotation gets — so an arena-derived key equals the name-walk's key for the same type.
-export function arenaEmitName(tyIx: i32): string {
-  const nom = tyToNominalName(tyIx)
-  if nom == "" { return "" }
-  canonEmitNameOfTy(tyIx, nom)
-}
+// The registry label of an arena type: its nominal render, spelled from the type. Registration
+// is keyed by type (`unRowOfTyKey`); the label names the row and decides nothing.
+export function arenaEmitName(tyIx: i32): string { tyToNominalName(tyIx) }
 
 // The name-walk key for a reachable union, honoring the position-dependent litunion
 // softening that `canonEmitName` bakes in — see `arenaEmitName` above for the rule and
@@ -8719,11 +8714,49 @@ function collectInlineUnionsBlock(stmts: i32[], blockIx: i32) {
 // resolving its fields, so a self-application lands on its own index rather than recursing
 // forever — but a generic instance has no name to short-circuit a renderer, which then traps.
 
-// Would a name-faithful render of arena type `ix` fail to terminate? The render itself is
-// the test (`renderEmit` banks the cut in `tyNomNameCycled`), not a hand-written copy of it.
-function tyNomRenderLoops(ix: i32): boolean {
-  tyToNominalName(ix)
-  tyNomNameCycled()
+// Whether type `ix` reaches itself through union and nullable wrappers alone: a value of infinite
+// size, which no layout holds. A cycle through a record, list or map passes a heap reference and
+// is finite, as a declared recursive struct is (D3328).
+function tyCycleSkipsRecord(ix: i32): boolean {
+  if ix < 0 || ix >= T.tys.length { return false }
+  const seen: boolean[] = []
+  tcsrReaches(ix, ix, seen, 0)
+}
+
+// Whether `t` reaches `goal` without entering a record, list or map, `depth` bounding the walk.
+function tcsrReaches(t: i32, goal: i32, seen: boolean[], depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth > 64 { return false }
+  while seen.length <= t { seen.push(false) }
+  if depth > 0 && t == goal { return true }
+  if seen[t] { return false }
+  seen[t] = true
+  const ty = tyAt(t)
+  match ty {
+    TyObj => {
+      return false
+    }
+    TyArray => {
+      return false
+    }
+    TyMap => {
+      return false
+    }
+    TyNullable => {
+      return tcsrReaches(ty.nInner, goal, seen, depth + 1)
+    }
+    TyUnion => {
+      for m in ty.uMembers {
+        if tcsrReaches(m, goal, seen, depth + 1) { return true }
+      }
+    }
+    TyFunc => {}
+    TyPrim => {}
+    TyErr => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+  }
+  false
 }
 
 // The source spelling of the first annotation whose resolved type is `ix` (`L<i32>`),
@@ -8750,7 +8783,7 @@ function guardFiniteUserTypes(): i32 {
   let i = 0
   while i < ks.length {
     const v = cUserTypes[ks[i]] ?? (-1)
-    if tyNomRenderLoops(v) {
+    if tyCycleSkipsRecord(v) {
       let shown = annSpellingOfTyIx(v)
       if shown == "" { shown = ks[i] }
       return emitFail(
@@ -8997,6 +9030,7 @@ function collectUReset() {
   mTwinShapes = []
   mTwinCodes = []
   mTwinExtra = 0
+  pkTwinRows = []
   mTwinSettled = false
   unNames = []
   unTyIx = []
