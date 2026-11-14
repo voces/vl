@@ -82,7 +82,8 @@ docs/internals/inventory/D16044.md#D16044 D16044
 * the cited row exists in `docs/internals/inventory/` or `inventory-2/`, and its status line says
   `clause 1`;
 * the entry is used. A listed key that did not move from `runs` to `check_reject` fails as stale,
-  so the list cannot rot.
+  so the list cannot rot. A key the base already refuses at check is inert: the fix has merged,
+  and the entry waits for the fold without failing other PRs' diffs.
 
 An entry lives only in the PR that earns it, and the orchestrator clears the file at each fold.
 `diff` prints the accepted cells under "owed refusals accepted", and `--owed <file>` reads
