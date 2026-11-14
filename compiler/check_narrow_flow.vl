@@ -10,6 +10,7 @@ import { parenPeelIx } from "./check_places"
 import {
   declareSlot,
   fnWriteAliasNote,
+  fnWriteAliasOf,
   identDepthOf,
   identFnAliasOf,
   identFnDeclOf,
@@ -451,7 +452,13 @@ import {
   nodeTyOf,
   nodeTySet,
 } from "./check_node_tys"
-import { elabCapLive, elabCapNarrowNote, elabFnLetMembers } from "./check_elab_cap"
+import {
+  elabCapLive,
+  elabCapNarrowNote,
+  elabFnJoinTy,
+  elabFnLetMembers,
+  elabFnWriteTy,
+} from "./check_elab_cap"
 import {
   flushNullHoles,
   lpColSet,
@@ -647,6 +654,14 @@ import {
 // `i32 | f64`, not `f64`, which is how the value is stored (D2627). Otherwise `joinTys`.
 function narJoinTys(a: i32, b: i32): i32 {
   if a < 0 || b < 0 { return joinTys(a, b) }
+  // Two function values written apart join to a type naming neither write: the read may hold either.
+  const fa = fnWriteAliasOf(a)
+  const fb = fnWriteAliasOf(b)
+  if fa != fb && (fa >= 0 || fb >= 0) {
+    const j = elabFnJoinTy(joinTys(a, b), a, b)
+    if fnWriteAliasOf(j) < 0 { return j }
+    return elabFnJoinTy(j, b, a)
+  }
   if numericVariantUncovered(a, b) || numericVariantUncovered(b, a) {
     return joinVariantTys(a, b)
   }
@@ -2636,13 +2651,23 @@ export function letFnWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
 // (`letFnWriteNarrows`), noting the function declaration `rhs` names as theirs. Returns 0.
 export function letFnWriteRow(s: i32, dcl: i32, rhs: i32, m: i32) {
   if !letFnWriteNarrows(s, dcl, m) { return 0 }
-  noteNarShadow(s, NAR_KIND_ASG)
-  narLayerNote(s, T.frames.length - 1, m)
   const r = parenPeelIx(rhs)
   if r < 0 || !(nodeAt(r) is Ident) { return 0 }
   let fd = identFnDeclOf(r)
   if fd < 0 { fd = identFnAliasOf(r) }
-  fnWriteAliasNote(m, fd)
+  if fd < 0 { return 0 }
+  const wt = elabFnWriteTy(m, fd, r)
+  // A write under a branch or loop ends the function an outer row names: past that statement the
+  // read may hold either, which the arm join or storage then answers.
+  const top = T.frames.length - 1
+  for i in narBankRowsOf(s) {
+    if npKind[i] == NAR_KIND_ASG && narRowLive(i) && npDepth[i] < top && npTys[i] >= 0 {
+      narSetScope(npDepth[i], s, dcl)
+    }
+  }
+  noteNarShadow(s, NAR_KIND_ASG)
+  narLayerNote(s, T.frames.length - 1, wt)
+  fnWriteAliasNote(wt, fd)
 }
 
 // The type a bare name reads at after an accepted write retired its narrowing: the sole member
@@ -3907,6 +3932,8 @@ function crLoopLeavingWrite(ix: i32, s: i32): i32 {
     if n.binOp == "=" && placeKeyOf(n.binLeft) == slotNameOf(s) {
       const store = narWriteStorage(s)
       const pre = declTyOf(s)
+      // A function the binding's row names is ended by any write: the read may then hold another.
+      if pre >= 0 && fnWriteAliasOf(pre) >= 0 { return ix }
       let vt = loopWritePeekTy(n.binRight, store)
       if vt >= 0 && store >= 0 && pre >= 0 {
         if !isLitBearing(store) { vt = litPeekBaseTy(vt) }
