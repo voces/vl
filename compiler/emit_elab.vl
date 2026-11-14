@@ -21170,49 +21170,97 @@ export function elabCallKeyBinding(
 // A place is (declaration, instance) with a child per step (`e`, `v`, `f.<name>`, `r`); edges come
 // from the write index's consumer column. A container edge unifies two places, a function value's
 // edge copies it (members flow forward, calls back); a leaf closes where its calls agree.
-let eplKey: {[string]: i32} = Map()
-let eplPar: i32[] = []
-let eplKids: {[string]: i32}[] = []
-let eplMembers: i32[][] = []
-let eplCalls: i32[][] = []
-let eplPending: i32[] = []
+type EplTables = {
+  // Places by key, and per place its union-find parent, children by step, member functions and
+  // the calls through it (indices into `callNode`/`callKey`); `pending` is the union worklist.
+  key: {[string]: i32},
+  par: i32[],
+  kids: {[string]: i32}[],
+  members: i32[][],
+  calls: i32[][],
+  pending: i32[],
+  // Per class: its bound once asked (-2 before), the node it comes from, and that node's instance.
+  bound: i32[],
+  boundSrc: i32[],
+  boundK: i32[],
+  // The instance whose edges are drawn or read (-1 for the program); per call, its node and key.
+  k: i32,
+  callNode: i32[],
+  callKey: i32[],
+  // The key count at the classes' last ask, and whether they are built for it: the build is
+  // deferred to the first holder that needs it, and sees no key minted after the ask.
+  limit: i32,
+  stale: boolean,
+  // Per function, its non-guess instance keys, filed once per build.
+  insts: {[i32]: i32[]},
+  // Function-value copies as flow edges, and their adjacency by class root as of `adjN` edges.
+  flowSrc: i32[],
+  flowDst: i32[],
+  fwd: {[i32]: i32[]},
+  bwd: {[i32]: i32[]},
+  adjN: i32,
+  // Per class root (times two, plus one forward), the classes `eplReach` found once unions end;
+  // per class root, `eplOneCall`'s answer.
+  reachMemo: {[i32]: i32[]},
+  oneMemo: {[i32]: i32},
+}
 
-// Per class: its bound once asked (-2 before), the node it comes from, and that node's instance.
-let eplBound: i32[] = []
-let eplBoundSrc: i32[] = []
-let eplBoundK: i32[] = []
+function eplFresh(): EplTables {
+  {
+    key: Map(),
+    par: [],
+    kids: [],
+    members: [],
+    calls: [],
+    pending: [],
+    bound: [],
+    boundSrc: [],
+    boundK: [],
+    k: -1,
+    callNode: [],
+    callKey: [],
+    limit: -1,
+    stale: true,
+    insts: Map(),
+    flowSrc: [],
+    flowDst: [],
+    fwd: Map(),
+    bwd: Map(),
+    adjN: -1,
+    reachMemo: Map(),
+    oneMemo: Map(),
+  }
+}
+
+let EPL: EplTables = eplFresh()
 
 function eplNew(): i32 {
-  const id = eplPar.length
-  eplBound.push(-2)
-  eplBoundSrc.push(-1)
-  eplBoundK.push(-1)
-  eplPar.push(id)
-  eplKids.push(Map())
-  eplMembers.push([])
-  eplCalls.push([])
+  const id = EPL.par.length
+  EPL.bound.push(-2)
+  EPL.boundSrc.push(-1)
+  EPL.boundK.push(-1)
+  EPL.par.push(id)
+  EPL.kids.push(Map())
+  EPL.members.push([])
+  EPL.calls.push([])
   id
 }
 
 function eplFind(a: i32): i32 {
   let r = a
-  while eplPar[r] != r { r = eplPar[r] }
+  while EPL.par[r] != r { r = EPL.par[r] }
   let x = a
-  while eplPar[x] != r {
-    const nx = eplPar[x]
-    eplPar[x] = r
+  while EPL.par[x] != r {
+    const nx = EPL.par[x]
+    EPL.par[x] = r
     x = nx
   }
   r
 }
 
-let eplK = -1
-let eplCallNode: i32[] = []
-let eplCallKey: i32[] = []
-
 function eplRoot(n: i32): i32 { eplRootK(n, eplKeyFor(n)) }
 
-// The instance a declaration's place is keyed at while edges of instance `eplK` are drawn.
+// The instance a declaration's place is keyed at while edges of instance `EPL.k` are drawn.
 function eplKeyFor(d: i32): i32 {
   const fd = if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl { d } else { recEnclosingFn(d) }
   eplKeyOfFn(fd)
@@ -21233,7 +21281,7 @@ function eplFrameOf(fd: i32): i32 {
 function eplKeyOfFn(fd0: i32): i32 {
   const fd = eplFrameOf(fd0)
   if fd < 0 { return -1 }
-  let kk = eplK
+  let kk = EPL.k
   let guard = 0
   while kk >= 0 && kk < ekDecl.length && ekDecl[kk] != fd && guard < 64 {
     kk = ekParent[kk]
@@ -21243,35 +21291,26 @@ function eplKeyOfFn(fd0: i32): i32 {
   -2
 }
 
-// The key count at the classes' last ask, and whether they are built for it: the
-// build is deferred to the first holder that needs it, and sees no key minted after the ask.
-let eplLimit = -1
-let eplStale = true
-
 function eplStaleAt() {
-  eplLimit = ekDecl.length
-  eplStale = true
+  EPL.limit = ekDecl.length
+  EPL.stale = true
   0
 }
 
-// Per function, its non-guess instance keys, filed once per build.
-let eplInsts: {[i32]: i32[]} = Map()
-
 function eplInstsFile() {
-  eplInsts = Map()
   let k = 0
-  while k < ekDecl.length && k < eplLimit {
+  while k < ekDecl.length && k < EPL.limit {
     if !(elabGuessKeys.get(k) ?? false) {
-      const ks = eplInsts[ekDecl[k]] ?? []
+      const ks = EPL.insts[ekDecl[k]] ?? []
       ks.push(k)
-      eplInsts[ekDecl[k]] = ks
+      EPL.insts[ekDecl[k]] = ks
     }
     k = k + 1
   }
   0
 }
 
-function eplHasInst(fd: i32): boolean { (eplInsts[fd] ?? []).length > 0 }
+function eplHasInst(fd: i32): boolean { (EPL.insts[fd] ?? []).length > 0 }
 
 // The callee instance call `c` runs from instance `k`; -1 for a callee with no instances.
 function eplCallTarget(c: i32, fd: i32, k: i32): i32 {
@@ -21282,7 +21321,7 @@ function eplCallTarget(c: i32, fd: i32, k: i32): i32 {
     if (
       row[i] == k
       && row[i + 1] >= 0
-      && row[i + 1] < eplLimit
+      && row[i + 1] < EPL.limit
       && ekDecl[row[i + 1]] == fd
     ) {
       return row[i + 1]
@@ -21299,7 +21338,7 @@ function eplValueTarget(x: i32, k: i32): i32 {
   const row = elabValueKeys[x] ?? []
   let i = 0
   while i + 1 < row.length {
-    if row[i] == k && row[i + 1] >= 0 && row[i + 1] < eplLimit {
+    if row[i] == k && row[i + 1] >= 0 && row[i + 1] < EPL.limit {
       return row[i + 1]
     }
     i = i + 2
@@ -21307,17 +21346,17 @@ function eplValueTarget(x: i32, k: i32): i32 {
   -2
 }
 
-// The declaration the elaboration ran call `c` at from instance `eplK`, for a callee the call's
+// The declaration the elaboration ran call `c` at from instance `EPL.k`, for a callee the call's
 // spelling does not name (a method-spelled call of a free function).
 function eplKeyedCallee(c: i32): i32[] {
   const row = elabCallKeys[c] ?? []
   let i = 0
   while i + 1 < row.length {
     if (
-      row[i] == eplK
+      row[i] == EPL.k
       && row[i + 1] >= 0
       && row[i + 1] < ekDecl.length
-      && row[i + 1] < eplLimit
+      && row[i + 1] < EPL.limit
     ) {
       return [ekDecl[row[i + 1]]]
     }
@@ -21329,7 +21368,7 @@ function eplKeyedCallee(c: i32): i32[] {
 // Whether call record `ci` is a call at parameter types `ps`.
 function eplSigIs(ci: i32, ps: i32[]): boolean {
   if ci < 0 { return false }
-  const cn = nodeAt(eplCallNode[ci])
+  const cn = nodeAt(EPL.callNode[ci])
   if !(cn is Call) || cn.callArgs.length != ps.length { return false }
   let i = 0
   while i < ps.length {
@@ -21358,12 +21397,12 @@ function eplMethodCallee(cf: i32): i32[] {
 function eplRootK(n: i32, kk: i32): i32 {
   if kk == -2 { return -1 }
   const k = i32ToStr(n) + "|" + i32ToStr(kk)
-  const have = eplKey[k] ?? -1
+  const have = EPL.key[k] ?? -1
   if have >= 0 { return eplFind(have) }
   const id = eplNew()
-  eplKey[k] = id
-  if id >= 0 && id < eplBoundSrc.length && eplAnnotated(n) {
-    eplBoundSrc[id] = n
+  EPL.key[k] = id
+  if id >= 0 && id < EPL.boundSrc.length && eplAnnotated(n) {
+    EPL.boundSrc[id] = n
   }
   id
 }
@@ -21377,59 +21416,59 @@ function eplAnnotated(n: i32): boolean {
 // Class `r`'s bound: the closed type of its annotated holder or of a call result the elaboration
 // closed, asked once per class; -1 for none.
 function eplBoundOf(r: i32): i32 {
-  if r < 0 || r >= eplBound.length { return -1 }
-  if eplBound[r] != -2 { return eplBound[r] }
-  const x = eplBoundSrc[r]
+  if r < 0 || r >= EPL.bound.length { return -1 }
+  if EPL.bound[r] != -2 { return EPL.bound[r] }
+  const x = EPL.boundSrc[r]
   const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
-  const te = if xn is Call { elabNodeTy(x, eplBoundK[r]) } else { -1 }
+  const te = if xn is Call { elabNodeTy(x, EPL.boundK[r]) } else { -1 }
   const t = if te >= 0 { te } else if x >= 0 { nodeTyIxOf(x) } else { -1 }
   const ok = t >= 0
     && t < T.tys.length
     && !tyHasTyVar(t)
     && !tyReachesHole(t, 16)
-  eplBound[r] = if ok { t } else { -1 }
-  eplBound[r]
+  EPL.bound[r] = if ok { t } else { -1 }
+  EPL.bound[r]
 }
 
 function eplChild(p: i32, step: string): i32 {
   if p < 0 { return -1 }
   const r = eplFind(p)
-  const have = eplKids[r][step] ?? -1
+  const have = EPL.kids[r][step] ?? -1
   if have >= 0 { return eplFind(have) }
   const id = eplNew()
-  eplKids[r][step] = id
+  EPL.kids[r][step] = id
   id
 }
 
 function eplUnion(a0: i32, b0: i32) {
   if a0 < 0 || b0 < 0 { return 0 }
-  eplPending.push(a0)
-  eplPending.push(b0)
-  while eplPending.length >= 2 {
-    const b = eplFind(eplPending[eplPending.length - 1])
-    eplPending.pop()
-    const a = eplFind(eplPending[eplPending.length - 1])
-    eplPending.pop()
+  EPL.pending.push(a0)
+  EPL.pending.push(b0)
+  while EPL.pending.length >= 2 {
+    const b = eplFind(EPL.pending[EPL.pending.length - 1])
+    EPL.pending.pop()
+    const a = eplFind(EPL.pending[EPL.pending.length - 1])
+    EPL.pending.pop()
     if a != b && a >= 0 && b >= 0 {
-      eplPar[b] = a
-      if eplBoundSrc[a] < 0 {
-        eplBoundSrc[a] = eplBoundSrc[b]
-        eplBoundK[a] = eplBoundK[b]
+      EPL.par[b] = a
+      if EPL.boundSrc[a] < 0 {
+        EPL.boundSrc[a] = EPL.boundSrc[b]
+        EPL.boundK[a] = EPL.boundK[b]
       }
-      for m in eplMembers[b] {
-        if !i32ListHas(eplMembers[a], m) { eplMembers[a].push(m) }
+      for m in EPL.members[b] {
+        if !i32ListHas(EPL.members[a], m) { EPL.members[a].push(m) }
       }
-      for c in eplCalls[b] {
-        if !i32ListHas(eplCalls[a], c) { eplCalls[a].push(c) }
+      for c in EPL.calls[b] {
+        if !i32ListHas(EPL.calls[a], c) { EPL.calls[a].push(c) }
       }
-      for st in eplKids[b].keys() {
-        const cb = eplKids[b][st] ?? -1
-        const ca = eplKids[a][st] ?? -1
+      for st in EPL.kids[b].keys() {
+        const cb = EPL.kids[b][st] ?? -1
+        const ca = EPL.kids[a][st] ?? -1
         if ca >= 0 {
-          eplPending.push(ca)
-          eplPending.push(cb)
+          EPL.pending.push(ca)
+          EPL.pending.push(cb)
         } else {
-          eplKids[a][st] = cb
+          EPL.kids[a][st] = cb
         }
       }
     }
@@ -21461,16 +21500,6 @@ function eplFnOf(a0: i32): i32 {
   identFnDeclOf(a)
 }
 
-let eplFlowSrc: i32[] = []
-let eplFlowDst: i32[] = []
-let eplFwd: {[i32]: i32[]} = Map()
-let eplBwd: {[i32]: i32[]} = Map()
-let eplAdjN = -1
-// Per class root (times two, plus one forward), the classes `eplReach` found, once unions end.
-let eplReachMemo: {[i32]: i32[]} = Map()
-// Per class root, `eplOneCall`'s answer.
-let eplOneMemo: {[i32]: i32} = Map()
-
 // A value edge from `src` to `dst`: a function value is copied (its members flow forward, the
 // calls through the copy flow back); any other value is shared, so the two places unify.
 function eplEdge(src: i32, dst: i32, val: i32) {
@@ -21481,32 +21510,32 @@ function eplEdgeTy(src: i32, dst: i32, t0: i32) {
   if src < 0 || dst < 0 { return 0 }
   const t = if t0 >= 0 && t0 < T.tys.length { nonNullTy(t0) } else { -1 }
   if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc {
-    eplFlowSrc.push(src)
-    eplFlowDst.push(dst)
+    EPL.flowSrc.push(src)
+    EPL.flowDst.push(dst)
     return 0
   }
   eplUnion(src, dst)
 }
 
 function eplAdj() {
-  if eplAdjN == eplFlowSrc.length { return 0 }
-  eplFwd = Map()
-  eplBwd = Map()
+  if EPL.adjN == EPL.flowSrc.length { return 0 }
+  EPL.fwd = Map()
+  EPL.bwd = Map()
   let i = 0
-  while i < eplFlowSrc.length {
-    const a = eplFind(eplFlowSrc[i])
-    const b = eplFind(eplFlowDst[i])
+  while i < EPL.flowSrc.length {
+    const a = eplFind(EPL.flowSrc[i])
+    const b = eplFind(EPL.flowDst[i])
     if a != b {
-      const f = eplFwd[a] ?? []
+      const f = EPL.fwd[a] ?? []
       f.push(b)
-      eplFwd[a] = f
-      const g = eplBwd[b] ?? []
+      EPL.fwd[a] = f
+      const g = EPL.bwd[b] ?? []
       g.push(a)
-      eplBwd[b] = g
+      EPL.bwd[b] = g
     }
     i = i + 1
   }
-  eplAdjN = eplFlowSrc.length
+  EPL.adjN = EPL.flowSrc.length
   0
 }
 
@@ -21515,19 +21544,19 @@ function eplReach(p: i32, fwd: boolean): i32[] {
   eplAdj()
   const r0 = eplFind(p)
   const key = if fwd { r0 * 2 + 1 } else { r0 * 2 }
-  const memo = eplReachMemo.get(key)
+  const memo = EPL.reachMemo.get(key)
   if memo != null { return memo }
   const out: i32[] = [r0]
   let i = 0
   while i < out.length && out.length < 256 {
-    const nx = if fwd { eplFwd[out[i]] ?? [] } else { eplBwd[out[i]] ?? [] }
+    const nx = if fwd { EPL.fwd[out[i]] ?? [] } else { EPL.bwd[out[i]] ?? [] }
     for n0 in nx {
       const n = eplFind(n0)
       if !i32ListHas(out, n) { out.push(n) }
     }
     i = i + 1
   }
-  eplReachMemo[key] = out
+  EPL.reachMemo[key] = out
   out
 }
 
@@ -21535,7 +21564,7 @@ function eplReach(p: i32, fwd: boolean): i32[] {
 function eplCallsStar(p: i32): i32[] {
   const out: i32[] = []
   for c in eplReach(p, true) {
-    for ci in eplCalls[c] { out.push(ci) }
+    for ci in EPL.calls[c] { out.push(ci) }
   }
   out
 }
@@ -21544,7 +21573,7 @@ function eplCallsStar(p: i32): i32[] {
 function eplMembersStar(p: i32): i32[] {
   const out: i32[] = []
   for c in eplReach(p, false) {
-    for m in eplMembers[c] {
+    for m in EPL.members[c] {
       if !i32ListHas(out, m) { out.push(m) }
     }
   }
@@ -21570,7 +21599,7 @@ function eplPlaceOf(x0: i32, depth: i32): i32 {
     }
     const p = eplRoot(x)
     if p >= 0 && d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
-      if !i32ListHas(eplMembers[p], d) { eplMembers[p].push(d) }
+      if !i32ListHas(EPL.members[p], d) { EPL.members[p].push(d) }
     }
     return p
   }
@@ -21580,7 +21609,7 @@ function eplPlaceOf(x0: i32, depth: i32): i32 {
       x,
       if own == -2 { eplKeyFor(recEnclosingFn(x)) } else { own },
     )
-    if p >= 0 && !i32ListHas(eplMembers[p], x) { eplMembers[p].push(x) }
+    if p >= 0 && !i32ListHas(EPL.members[p], x) { EPL.members[p].push(x) }
     return p
   }
   if n is Index {
@@ -21610,9 +21639,9 @@ function eplPlaceOf(x0: i32, depth: i32): i32 {
     // A call result the elaboration already closed is built at that type, as a written one is.
     const cp = eplCallPlace(n, x, cf)
     const rc = if cp >= 0 { eplFind(cp) } else { -1 }
-    if rc >= 0 && eplBoundSrc[rc] < 0 {
-      eplBoundSrc[rc] = x
-      eplBoundK[rc] = eplK
+    if rc >= 0 && EPL.boundSrc[rc] < 0 {
+      EPL.boundSrc[rc] = x
+      EPL.boundK[rc] = EPL.k
     }
     return cp
   }
@@ -21626,7 +21655,7 @@ function eplCallPlace(n: Call, x: i32, cf: i32): i32 {
   const fds1 = if fds0.length > 0 { fds0 } else { eplMethodCallee(cf) }
   const fds = if fds1.length > 0 { fds1 } else { eplKeyedCallee(x) }
   if fds.length == 1 {
-    return eplChild(eplRootK(fds[0], eplCallTarget(x, fds[0], eplK)), "r")
+    return eplChild(eplRootK(fds[0], eplCallTarget(x, fds[0], EPL.k)), "r")
   }
   eplRoot(x)
 }
@@ -21640,20 +21669,20 @@ function eplEdges() {
     const fr = eplFrameOf(recEnclosingFn(u))
     let drew = false
     if eplInstanced(fr) {
-      for kk in eplInsts[fr] ?? [] {
-        eplK = kk
+      for kk in EPL.insts[fr] ?? [] {
+        EPL.k = kk
         eplEdgeAt(u)
         drew = true
       }
     }
     if !drew {
-      eplK = -1
+      EPL.k = -1
       eplEdgeAt(u)
     }
     eplTyParamShare(u)
     u = u + 1
   }
-  eplK = -1
+  EPL.k = -1
   0
 }
 
@@ -21664,8 +21693,8 @@ function eplTyParamShare(fx: i32) {
   if !(fd is FuncDecl) || fd.fnTyParams.length == 0 || fd.fnParams.length < 2 {
     return 0
   }
-  for kk in eplInsts[fx] ?? [] {
-    eplK = kk
+  for kk in EPL.insts[fx] ?? [] {
+    EPL.k = kk
     let i = 0
     while i < fd.fnParams.length {
       const ti = nodeTyIxOf(fd.fnParams[i])
@@ -21684,7 +21713,7 @@ function eplTyParamShare(fx: i32) {
       i = i + 1
     }
   }
-  eplK = -1
+  EPL.k = -1
   0
 }
 
@@ -21739,7 +21768,7 @@ function eplEdgeAt(u: i32) {
           const pi = if cn.memProp == "reduce" { 1 } else { 0 }
           if lf is FuncDecl && pi < lf.fnParams.length {
             const rp = eplPlaceOf(cn.memObj, 0)
-            const lk = eplValueTarget(lam, eplK)
+            const lk = eplValueTarget(lam, EPL.k)
             eplEdge(
               eplChild(rp, eplStepOfRecv(cn.memObj)),
               eplRootK(lf.fnParams[pi], lk),
@@ -21763,7 +21792,7 @@ function eplEdgeAt(u: i32) {
             if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
               eplEdge(
                 eplPlaceOf(u, 0),
-                eplRootK(fn.fnParams[ai], eplCallTarget(up, fd, eplK)),
+                eplRootK(fn.fnParams[ai], eplCallTarget(up, fd, EPL.k)),
                 u,
               )
             }
@@ -21774,9 +21803,9 @@ function eplEdgeAt(u: i32) {
         if p0 >= 0 {
           const p = eplFind(p0)
           if p < 0 { return 0 }
-          eplCallNode.push(up)
-          eplCallKey.push(eplK)
-          eplCalls[p].push(eplCallNode.length - 1)
+          EPL.callNode.push(up)
+          EPL.callKey.push(EPL.k)
+          EPL.calls[p].push(EPL.callNode.length - 1)
         }
       }
     }
@@ -21786,7 +21815,7 @@ function eplEdgeAt(u: i32) {
 
 // The argument type of call record `ci`'s argument `a`, at the instance it ran in.
 function eplArgTy(ci: i32, a: i32): i32 {
-  const k = eplCallKey[ci]
+  const k = EPL.callKey[ci]
   const t = if k >= 0 { elabNodeTy(a, k) } else { -1 }
   if t >= 0 { t } else { nodeTyIxOf(a) }
 }
@@ -21795,17 +21824,17 @@ function eplArgTy(ci: i32, a: i32): i32 {
 // nothing calls it, -3 for an open argument, -4 for two signatures.
 function eplOneCall(c: i32): i32 {
   const rc = eplFind(c)
-  const m = eplOneMemo.get(rc)
+  const m = EPL.oneMemo.get(rc)
   if m != null { return m }
   const r = eplOneCallGo(c)
-  eplOneMemo[rc] = r
+  EPL.oneMemo[rc] = r
   r
 }
 
 function eplOneCallGo(c: i32): i32 {
   let one = -1
   for ci in eplCallsStar(c) {
-    const cn = nodeAt(eplCallNode[ci])
+    const cn = nodeAt(EPL.callNode[ci])
     if !(cn is Call) { return -2 }
     for a in cn.callArgs {
       const t = eplArgTy(ci, a)
@@ -21814,7 +21843,7 @@ function eplOneCallGo(c: i32): i32 {
       }
     }
     if one >= 0 {
-      const on = nodeAt(eplCallNode[one])
+      const on = nodeAt(EPL.callNode[one])
       if on is Call {
         if on.callArgs.length != cn.callArgs.length { return -4 }
         let i = 0
@@ -21836,8 +21865,8 @@ function eplOneCallGo(c: i32): i32 {
 
 // The result of member `m` with no instances of its own, at the frame instance being read.
 function eplFrameResult(m: i32, arity: i32): i32 {
-  if eplK < 0 || eplFrameOf(m) == m { return -1 }
-  const t = elabNodeTy(m, eplK)
+  if EPL.k < 0 || eplFrameOf(m) == m { return -1 }
+  const t = elabNodeTy(m, EPL.k)
   const o = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
   if o is TyFunc && o.fnParamTypes.length == arity && elabTyClosed(o.fnRet, 0) {
     return o.fnRet
@@ -21900,7 +21929,7 @@ function eplRebuildLeaf(p: i32, t: i32): i32 {
   const one = eplOneCall(p)
   if one == -1 { return -1 }
   if one < 0 { return -1 }
-  const cn = nodeAt(eplCallNode[one])
+  const cn = nodeAt(EPL.callNode[one])
   if !(cn is Call) { return -1 }
   const ps: i32[] = []
   for a in cn.callArgs { ps.push(eplArgTy(one, a)) }
@@ -21947,39 +21976,25 @@ function eplRebuildLeaf(p: i32, t: i32): i32 {
 
 // Builds the place classes over the elaborated program as it stands: every instance settled so far.
 function eplBuild() {
-  eplKey = Map()
-  eplPar = []
-  eplKids = []
-  eplMembers = []
-  eplCalls = []
-  eplPending = []
-  eplBound = []
-  eplBoundSrc = []
-  eplBoundK = []
-  eplCallNode = []
-  eplCallKey = []
-  eplFlowSrc = []
-  eplFlowDst = []
-  eplAdjN = -1
-  eplReachMemo = Map()
-  eplOneMemo = Map()
+  const limit = EPL.limit
+  EPL = eplFresh()
+  EPL.limit = limit
   eplInstsFile()
-  eplK = -1
   eplEdges()
 }
 
 // The closed type holder `ix`'s value is built at in instance `k` (-1 for the program): its checked
 // type with each open function leaf closed by its class; -1 where a leaf stays open.
 function eplHolderTy(ix: i32, k: i32): i32 {
-  if eplStale {
+  if EPL.stale {
     eplBuild()
-    eplStale = false
+    EPL.stale = false
   }
-  eplK = k
+  EPL.k = k
   const te = if k >= 0 { elabNodeTy(ix, k) } else { -1 }
   const t = if te >= 0 && tyHasTyVar(te) { te } else { nodeTyIxOf(ix) }
   const root = eplRoot(ix)
   const r = if root >= 0 { eplRebuild(root, t, 0) } else { -1 }
-  eplK = -1
+  EPL.k = -1
   r
 }
