@@ -69,6 +69,7 @@ import {
   nodeValueSpineChildren,
 } from "./ast"
 import { tErr } from "./check_relate_core"
+import { i32ListHas } from "./listutil"
 import { parseProgram } from "./parser"
 import { vcDgPush, vcLoadToks, vcParseBlocked } from "./tok_load"
 import {
@@ -110,6 +111,11 @@ let jwFail = "false"
 let jwRecvTy = -1
 let jwArrSpell = ""
 let jwMapSpell = ""
+// The types the walk is inside, the target being generated, and the recursive types other than
+// the target it calls, each walked by a function pair of its own.
+let jwOpen: i32[] = []
+let jwTgtK = 0
+let jwRecTys: i32[] = []
 
 function jwFresh(p: string): string {
   jwCtr = jwCtr + 1
@@ -228,6 +234,33 @@ function jwWalk(ty: i32, src: string, out: string[]): string {
   // The JSON union itself is the wildcard leaf: it matches anything and is taken by
   // reference — no walk, no copy (`docs/serde-design.md`, the "Deep" clause).
   if jsonSelfRef(ty, jwRecvTy) { return jwWildcard(src) }
+  // A type the walk is already inside is walked by its own function, called (D1198).
+  if i32ListHas(jwOpen, ty) { return jwWalkRec(ty, src, out) }
+  jwOpen.push(ty)
+  const r = jwWalkIn(ty, src, out)
+  jwOpen.pop()
+  r
+}
+
+// A call of the function pair walking recursive type `ty`: the target's own, else one generated
+// for `ty`. The builder is called only once its predicate held, so the call cannot fail.
+function jwWalkRec(ty: i32, src: string, out: string[]): string {
+  const root = ty == jwTgtTy[jwTgtK]
+  if !root && !i32ListHas(jwRecTys, ty) { jwRecTys.push(ty) }
+  const pn = if root { jwPredName(jwTgtK) } else { jwRecPredName(jwTgtK, ty) }
+  if !jwBuild {
+    out.push("if !" + pn + "(" + src + ") { return " + jwFail + " }")
+    return ""
+  }
+  const gn = if root { jwWalkerName(jwTgtK) } else { jwRecGetName(jwTgtK, ty) }
+  const g = jwFresh("__vjr")
+  out.push("if !" + pn + "(" + src + ") { return " + jwFail + " }")
+  out.push("const " + g + " = " + gn + "(" + src + ")")
+  g
+}
+
+// `jwWalk` at a type it is not yet inside.
+function jwWalkIn(ty: i32, src: string, out: string[]): string {
   const nin = jwNullableInner(ty)
   if nin >= 0 {
     // S3: an absent key and an explicit JSON `null` are the same fact here — a map
@@ -406,6 +439,44 @@ function jwWalkObj(
 // clause-1 defect (D1197).
 function jwWalkerName(k: i32): string { "__vlJsonGet_" + i32ToStr(k) }
 function jwPredName(k: i32): string { "__vlJsonIs_" + i32ToStr(k) }
+function jwRecGetName(k: i32, ty: i32): string {
+  jwWalkerName(k) + "_" + i32ToStr(ty)
+}
+function jwRecPredName(k: i32, ty: i32): string {
+  jwPredName(k) + "_" + i32ToStr(ty)
+}
+
+// The predicate `pn` and builder `gn` walking type `ty`, spelled `spell`, from receiver spelling
+// `recv`.
+function jwPairSource(
+  ty: i32,
+  recv: string,
+  spell: string,
+  pn: string,
+  gn: string,
+): string {
+  jwBuild = false
+  jwFail = "false"
+  const chk: string[] = []
+  jwWalk(ty, "v", chk)
+  const head = "function " + pn + "(v: " + recv + "): boolean {\n"
+  const pred = head + jwJoin(chk) + "true\n}\n"
+  jwBuild = true
+  jwFail = jwDefault(ty)
+  const bld: string[] = []
+  const val = jwWalk(ty, "v", bld)
+  pred
+    + "function "
+    + gn
+    + "(v: "
+    + recv
+    + "): "
+    + spell
+    + " {\n"
+    + jwJoin(bld)
+    + val
+    + "\n}\n"
+}
 
 function jwJoin(lines: string[]): string {
   let s = ""
@@ -420,6 +491,9 @@ function jwJoin(lines: string[]): string {
 // The whole fragment: one predicate + one builder per recorded target.
 function jwGenerateSource(): string {
   let src = ""
+  jwTgtK = 0
+  jwOpen = []
+  jwRecTys = []
   let k = 0
   while k < jwTgtSpell.length {
     // The root type, not the parameter: the walk's tests and its wildcard leaf are
@@ -430,35 +504,22 @@ function jwGenerateSource(): string {
     const tgt = jwTgtTy[k]
     const recv = jwTgtRecv[k]
     const spell = jwTgtSpell[k]
-
-    jwBuild = false
-    jwFail = "false"
-    const chk: string[] = []
-    jwWalk(tgt, "v", chk)
-    src = src
-      + "function "
-      + jwPredName(k)
-      + "(v: "
-      + recv
-      + "): boolean {\n"
-      + jwJoin(chk)
-      + "true\n}\n"
-
-    jwBuild = true
-    jwFail = jwDefault(tgt)
-    const bld: string[] = []
-    const val = jwWalk(tgt, "v", bld)
-    src = src
-      + "function "
-      + jwWalkerName(k)
-      + "(v: "
-      + recv
-      + "): "
-      + spell
-      + " {\n"
-      + jwJoin(bld)
-      + val
-      + "\n}\n"
+    jwTgtK = k
+    jwRecTys = []
+    src = src + jwPairSource(tgt, recv, spell, jwPredName(k), jwWalkerName(k))
+    let r = 0
+    while r < jwRecTys.length {
+      const rt = jwRecTys[r]
+      src = src
+        + jwPairSource(
+        rt,
+        recv,
+        tyToStr(rt),
+        jwRecPredName(k, rt),
+        jwRecGetName(k, rt),
+      )
+      r = r + 1
+    }
     k = k + 1
   }
   // Every `$` in the text came from a merge-mangled type name, and the lexer cannot take
@@ -634,6 +695,61 @@ function jwSubst(ix: i32, key: string, name: string) {
   0
 }
 
+// Substitutes the place in block `blk`'s statements up to the first that rebinds or writes it,
+// where the narrowing ends: a `place = e` or `let root = e` still reads `e` under it, an `if`
+// substitutes its test and each arm the same way, and a loop that writes it reads it unnarrowed.
+// The reads after keep the declared type. False when a write sits where no order is known.
+function jwSubstScoped(
+  blk: i32,
+  key: string,
+  root: string,
+  name: string,
+): boolean {
+  const b = if blk >= 0 { nodeAt(blk) } else { null }
+  if !(b is Block) { return false }
+  for st in b.blkStmts {
+    if !jwArmDisturbs(st, key, root) {
+      jwSubst(st, key, name)
+    } else {
+      return jwSubstAtWrite(st, key, root, name)
+    }
+  }
+  true
+}
+
+// `jwSubstScoped` for statement `st`, which rebinds or writes the place.
+function jwSubstAtWrite(
+  st: i32,
+  key: string,
+  root: string,
+  name: string,
+): boolean {
+  const sn = nodeAt(st)
+  let rhs = -1
+  if sn is BinExpr && sn.binOp == "=" {
+    const lk = jwPlaceKey(sn.binLeft)
+    if lk == key || lk == root { rhs = sn.binRight }
+  } else if sn is LetDecl && sn.letName == root {
+    if sn.letInit < 0 { return true }
+    rhs = sn.letInit
+  } else if sn is IfStmt {
+    if jwArmDisturbs(sn.ifCond, key, root) { return false }
+    jwSubst(sn.ifCond, key, name)
+    if !jwSubstScoped(sn.ifThen, key, root, name) { return false }
+    if sn.ifElse < 0 { return true }
+    const en = nodeAt(sn.ifElse)
+    if en is IfStmt { return jwSubstAtWrite(sn.ifElse, key, root, name) }
+    return jwSubstScoped(sn.ifElse, key, root, name)
+  } else if sn is Block {
+    return jwSubstScoped(st, key, root, name)
+  } else if sn is WhileStmt || sn is ForIn || sn is ForRange {
+    return true
+  }
+  if rhs < 0 || jwArmDisturbs(rhs, key, root) { return false }
+  jwSubst(rhs, key, name)
+  true
+}
+
 // Does the arm rebind or write the place? Either would make a blanket substitution
 // wrong (the checker retires a narrowing for exactly these), so the rewrite refuses
 // loudly instead of guessing.
@@ -779,14 +895,13 @@ function jwRewriteSite(siteIx: i32, k: i32): string {
     // call result has none, so the test there is a plain boolean.
     if arm >= 0 && key != "" {
       const root = jwKeyRoot(key)
-      if jwArmDisturbs(arm, key, root) {
-        return "a deep `is` arm that rebinds or writes `"
-          + key
-          + "` is not supported yet — bind the converted value first"
-      }
       jwVarCtr = jwVarCtr + 1
       const vname = "__vljv" + i32ToStr(jwVarCtr)
-      jwSubst(arm, key, vname)
+      if !jwSubstScoped(arm, key, root, vname) {
+        return "a deep `is` arm that rebinds or writes `"
+          + key
+          + "` inside an expression is not supported yet — write it as its own statement, or bind the converted value first"
+      }
       const cp = jwCopyPlace(recvIx, tok)
       if cp < 0 { return "internal: deep `is` receiver has no copyable place" }
       const gid = jwSetTok(mkIdent(jwWalkerName(k), -1), tok)

@@ -10,6 +10,7 @@
 import { filePath } from "./support/filePath.ts";
 import { inlayHintsFromWasm } from "../lsp/src/typeFeatures.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
@@ -25,14 +26,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
 // the TS path. Seed-gated; self-ignores when the seed is absent.
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const noSiblings = () => undefined;
 

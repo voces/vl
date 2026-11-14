@@ -16,16 +16,10 @@ import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { organizeImportEdits } from "../lsp/src/typeFeatures.ts";
 import { codeActionsAt } from "../lsp/src/features.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 
 // The filter `codeActionsAt` applies, named once so the test and the handler cannot drift.

@@ -44,7 +44,7 @@
 # fixed point.
 #
 # --fuel-stash=<dir>: also warm the two `$VL_FUEL=1` sidecars of the seed that SHIPS, and leave
-# them in <dir> rather than beside it, so a cache of the seed alone stays lean. Each rung's
+# them in <dir> rather than in the seed cache, so a cache of the seed alone stays lean. Each rung's
 # candidate is warmed in the background while the next compile runs (single-threaded past its
 # own JIT), and only the shipped rung's pair is kept; the others cost CPU, never a sidecar.
 set -euo pipefail
@@ -76,17 +76,28 @@ WORK="$(mktemp -d)"
 # shell would orphan the `vl` it launched, still writing into $WORK.
 EARLY_WARM=""
 FUEL_WARMS=""
-trap '[ -z "$EARLY_WARM$FUEL_WARMS" ] || wait $EARLY_WARM $FUEL_WARMS 2>/dev/null; rm -rf "$WORK"' EXIT
+# A candidate that does not ship leaves its compiled forms in the seed cache, keyed by content;
+# they are dropped on exit, except any it shares with $OUT (a fixpoint's rungs are identical).
+drop_candidates() {
+  local keep c f
+  keep="$("$VL" seed --cache-files --compiler "$OUT" 2>/dev/null || true)"
+  for c in "$WORK"/*.wasm; do
+    [ -f "$c" ] || continue
+    for f in $("$VL" seed --cache-files --compiler "$c" 2>/dev/null || true); do
+      printf '%s\n' "$keep" | grep -qxF "$f" || rm -f "$f"
+    done
+  done
+}
+trap '[ -z "$EARLY_WARM$FUEL_WARMS" ] || wait $EARLY_WARM $FUEL_WARMS 2>/dev/null; drop_candidates; rm -rf "$WORK"' EXIT
 
-# --fuel-stash: warm the fuel pair of candidate <wasm> as rung <n>, on a link to it named like
-# $OUT in its own directory, so each sidecar already carries the name it will have beside $OUT.
+# --fuel-stash: warm the fuel pair of candidate <wasm> as rung <n> into a seed cache of its own,
+# so only the shipped rung's pair reaches the stash. Sidecars are content-keyed, so the pair a
+# candidate warms is the pair of $OUT once that candidate ships.
 fuel_warm() {
   [ -n "$FUEL_STASH" ] || return 0
-  local dir="$WORK/fuel-$2" name
-  name="$(basename "$OUT")"
-  mkdir -p "$dir"
-  ln -f "$1" "$dir/$name" 2>/dev/null || cp -f "$1" "$dir/$name"
-  VL="$VL" nice -n 10 scripts/warm-seed.sh --fuel-only "$dir/$name" &
+  local dir="$WORK/fuel-$2"
+  mkdir -p -m 700 "$dir"
+  VL_SEED_CACHE_DIR="$dir" VL="$VL" nice -n 10 scripts/warm-seed.sh --fuel-only "$1" &
   FUEL_WARMS="$FUEL_WARMS $!"
 }
 FUEL_RUNG=next
@@ -165,8 +176,7 @@ fi
 
 # SHIP is the artifact that becomes $OUT. Without --prove-fixpoint it is the
 # self-compile output; with it, the ladder below may climb further (and the
-# one-compile rung ships the on-disk seed itself, keeping its mtime — so the
-# `.cwasm` sidecar wasmtime cache beside it stays fresh for every later run).
+# one-compile rung ships the on-disk seed itself).
 SHIP="$WORK/next.wasm"
 if [ "$PROVE" = 0 ]; then fuel_warm "$SHIP" next; fi
 
@@ -255,21 +265,6 @@ if [ "$SHIP" = "$SEED" ]; then
   [ "$SEED" = "$OUT" ] || cp "$SEED" "$OUT"
 else
   mv "$SHIP" "$OUT"
-  # The sanity run (and any ladder rung that compiled WITH $SHIP) left fresh `.cwasm`
-  # sidecars beside it — the host's cached wasmtime compilations, ONE PER ENGINE
-  # CONFIGURATION (`$OUT.<seed key>.<engine tag>.cwasm`: the self-compile's, the null-collector compile, the
-  # copying engine `vl build`/`vl run` and `vl check`/`fmt`/`test` share, and the fuel
-  # engines each keep their own file, and none evicts another). Move them all along so
-  # the next `vl` invocation deserializes instead of re-JITing, after clearing whatever sat beside
-  # $OUT — a sidecar the move does not replace is stale, and the host would detect +
-  # rebuild it anyway; removing it just keeps the set coherent on disk.
-  rm -f "$OUT".cwasm "$OUT".*.cwasm
-  # An unmatched glob stays literal, so every iteration re-tests for a real file.
-  for side in "$SHIP".*.cwasm; do
-    if [ -f "$side" ]; then
-      mv "$side" "$OUT.${side#"$SHIP".}"
-    fi
-  done
 fi
 
 # WARM EVERY ENGINE TAG, not just the one this script happened to make: each keeps its own
@@ -289,10 +284,10 @@ if [ -n "$FUEL_STASH" ]; then
     fi
   done
 fi
-sidecars=0
-for side in "$OUT".*.cwasm; do
-  if [ -f "$side" ]; then sidecars=$((sidecars + 1)); fi
-done
+# Compiled forms live in the seed cache, keyed by content, never beside the seed (DECISIONS.md,
+# "The seed sidecar lives only in the user's private cache"); one left there by an older `vl`
+# is never read, so it is removed.
+rm -f "$OUT".cwasm "$OUT".*.cwasm
 # RECORD WHAT THIS SEED WAS BUILT FROM. A grade taken against `$OUT` is a grade of these
 # sources and nothing else could say so: a timestamp cannot, because `git archive`, `cp`, a
 # rebase and a checkout all hand a stale artifact a fresh mtime — CLAUDE.md's cargo rule,
@@ -302,4 +297,4 @@ done
 # grades against whatever tree is checked out. `record-seed-provenance.sh` runs that VL script
 # with the seed just built ($OUT exists and is warm here); `set -e` carries its refusal out.
 VL="$VL" "$(dirname "$0")/record-seed-provenance.sh" "$OUT"
-echo "refreshed $OUT ($(wc -c < "$OUT") bytes) from current compiler/*.vl; $sidecars engine-tag sidecar(s) warm"
+echo "refreshed $OUT ($(wc -c < "$OUT") bytes) from current compiler/*.vl; compiled forms warm in $("$VL" seed --cache-dir 2>/dev/null || echo 'no seed cache')"
