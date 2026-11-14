@@ -10244,6 +10244,11 @@ function monoInstanceFor(
   deliveryTys: i32[],
   pinTyCol: i32[],
 ) {
+  if origFe < 0 || origFe >= monoOrigNode.length {
+    return emitFail(
+      "emitProgram: monomorphize: an instance was asked for at no template slot",
+    )
+  }
   // A value a call through its set already instanced keeps that instance.
   if (monoElemAtSet[letInitIx] ?? false) && !monoTysHoldSet(deliveryTys) {
     return 0
@@ -10251,10 +10256,21 @@ function monoInstanceFor(
   const fn = nodeAt(monoOrigNode[origFe])
   if fn is FuncDecl {
     const params = fn.fnParams
-    // A pin list shorter than the parameters builds no instance. One caller relies on it:
-    // `monoCoerceFnValueTys` delivering a generic value nothing calls at a destination whose
-    // function type names no parameters (D16074).
-    if params.length != pinnedNames.length { return 0 }
+    // A pin per parameter: a caller with fewer has no instance to ask for (D16074).
+    if params.length != pinnedNames.length {
+      return emitFail(
+        "emitProgram: monomorphize: `"
+          + monoSlotName(origFe)
+          + "` takes "
+          + i32ToStr(params.length)
+          + " parameter"
+          + pluralS(params.length)
+          + " but its instance was asked for at "
+          + i32ToStr(pinnedNames.length)
+          + " pinned type"
+          + pluralS(pinnedNames.length),
+      )
+    }
     // No argument node on this path: the pins are the parameter types of the function type the
     // checker recorded for the value, else the destination's, else the delivery's (D2755).
     let vty = monoFnValueParamTys(nodeTyIxOf(letInitIx), pinnedNames.length)
@@ -10593,7 +10609,12 @@ function monoCoerceFnValueTys(
         if monoGen[gfe] == 1 {
           const pnames: string[] = []
           // A nullable function slot (`((t: T) => void) | null`) takes the function's instance (D3932).
-          if (monoFnTyPinNames(tnameTy, pnames)) {
+          // A destination whose function type names no parameters pins none, so it builds no
+          // instance: nothing calls the value there (D16074).
+          if (
+            monoFnTyPinNames(tnameTy, pnames)
+            && !monoPinsNoneFor(gfe, pnames)
+          ) {
             // A capturing nested generic's value is this frame's instance, as a call is (D3902).
             monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
             monoInstanceRetTy = if monoInstanceWidenRet { monoFnTyRet(tnameTy) } else { -1 }
@@ -10617,6 +10638,12 @@ function monoCoerceFnValueTys(
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   0
+}
+
+// Whether `pins` is empty for template slot `fe`, which takes parameters.
+function monoPinsNoneFor(fe: i32, pins: string[]): boolean {
+  const fn = if fe >= 0 && fe < monoOrigNode.length { nodeAt(monoOrigNode[fe]) } else { null }
+  pins.length == 0 && fn is FuncDecl && fn.fnParams.length > 0
 }
 
 // Whether slot `fe`'s template is a maker (`fvaIsMaker`): one delivered at a closed function type
@@ -25049,6 +25076,7 @@ const MONO_BIND_SIG_POST = "` holds functions called at more than one argument t
 // elaboration delivers it at (a callback's contextual type), so a generic its body calls is pinned
 // there rather than at the hole's default (D3820). 0 when it declines, -1 on a failed mint.
 function monoPinLamAtDelivery(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return 0 }
   const fn = nodeAt(fnStmts[fe])
   if fn is FuncDecl {
     const rowTy: i32[] = []
