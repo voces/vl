@@ -107,6 +107,7 @@ sources (`compiler/`, `std/`) are not listed: they report nothing on other progr
 | `map-has-guard-reread` | info | a `has` test guarding a read of the same key, `m[k]` or `m[k] as!` |
 | `union-let-no-melt` | info | a union-typed `let` written on more than one path inside a loop |
 | `redundant-type` | hint | an annotation equal to what the checker infers |
+| `identity-null-test` | hint | `x === null` or `x !== null`, a null test that `==` spells |
 | `float-list-as-vector` | hint | a 2-to-4-element float list used only at fixed indexes |
 | `shift-mask-is-logical-shift` | hint | `(x >> k) & mask` that is exactly `x >>> k` |
 | `inferred-export-param` | hint | an uncalled export's parameter type inferred from its body |
