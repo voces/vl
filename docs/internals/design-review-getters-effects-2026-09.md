@@ -430,6 +430,8 @@ recorded in DECISIONS.md. Game-perf's 16-trip figure is the reference point.
 
 Why: steps close D2061 and D2063 with one computable rule, and 16 covers the widest lane shape.
 
+**Built (2026-11-14).** The loop variable's interval is D2065 and the getter loop is D16065. One reading the ruling's text leaves open is fixed there: **each trip costs at least one step**, so a loop costs its trips times its body or its trips, whichever is more. Without the floor, a long loop with no calls would cost nothing and the budget would bound nothing. The floor also holds a getter's loops within the emitter's unroll limit of 16, so a getter, and every function it calls, lowers with no loop.
+
 **D-Q3. Setters (8–1, game-perf dissenting).**
 (a) keep "none" (eight lenses, most with a condition: Swift's `withX` write-back, TS and C#'s
 private fields first, type-theory's no-narrowing, Rust's no hidden calls on `+=`); (b) narrow to

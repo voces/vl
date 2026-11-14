@@ -526,7 +526,7 @@ fixCase(
 );
 
 fixCase(
-  "JavaScript's `!==` and `===` become VL's `!=` and `==`, which are already strict (DV-1214)",
+  "`===` and `!==` on a number, which has no identity, become `==` and `!=` (DV-1214)",
   {
     "main.vl": "function f(n: i32): boolean {\n  return n !== 2 && n === 3\n}\nprint(f(1))\n",
   },
