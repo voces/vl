@@ -9,6 +9,17 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-d16047-unwritten-collection-is](2026-11-14-d16047-unwritten-collection-is.md): D16047: an unwritten collection fits every `is`; writes through a narrowing pin it (2026-11-14)
+- [2026-11-14-d16105-wider-write-value-cast](2026-11-14-d16105-wider-write-value-cast.md): D16105: a wider record's write value under a short-circuit
+- [2026-11-14-d16124-open-map-result-shape](2026-11-14-d16124-open-map-result-shape.md): An un-annotated map result recorded open takes its calls' shape (D16124), 2026-11-14
+- [2026-11-14-d16133-class-late-decisions](2026-11-14-d16133-class-late-decisions.md): D16133's class: a decision made after its consumer — design proposal, 2026-11-14
+- [2026-11-14-d16160-late-field-of-element-split](2026-11-14-d16160-late-field-of-element-split.md): D16160, layer 1: a call through a field of a handed-on element splits the set
+- [2026-11-14-g47-map-cell-deliveries](2026-11-14-g47-map-cell-deliveries.md): D15940: a map binding delivered to an annotated holder instances its stored functions there, 2026-11-14
+- [2026-11-14-g48-contain-map-of-maps-trap](2026-11-14-g48-contain-map-of-maps-trap.md): Contain a clause-1 trap that D15941's map-of-maps pin let through, 2026-11-14
+- [2026-11-14-g49-d16121-close](2026-11-14-g49-d16121-close.md): D16121: a value set into an un-annotated map is delivered where that map's values are, 2026-11-14
+- [2026-11-14-g50-d16200-for-map](2026-11-14-g50-d16200-for-map.md): D16200: a `for` loop variable over a map of maps reads its inner map's values at the map's type, 2026-11-14
+- [2026-11-14-global-cell-anchor](2026-11-14-global-cell-anchor.md): The global section arms the declaration cursor, 2026-11-14
+- [2026-11-14-unknown-type-part-caret](2026-11-14-unknown-type-part-caret.md): The unknown-type caret names the component, 2026-11-14
 - [2026-11-14-d16099-call-result-fn-to-generic-param](2026-11-14-d16099-call-result-fn-to-generic-param.md): D16099: a call result holding an un-annotated function, handed to a generic parameter, 2026-11-14
 - [2026-11-14-d16102-write-after-receiver-rebind](2026-11-14-d16102-write-after-receiver-rebind.md): D16102 — a field write's narrowing outlives a call that rebinds its receiver (2026-11-14)
 - [2026-11-14-d16104-wider-record-write-after-read](2026-11-14-d16104-wider-record-write-after-read.md): D16104 / D16103 — a wider record write after an operand its right-hand side changes (2026-11-14)
