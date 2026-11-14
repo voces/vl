@@ -60,6 +60,7 @@ BEFORE column is `origin/master` at 9f11c9c9f; CORRECT SCOPE is what this change
 | `range-inclusive-length` | LANGUAGE | `0 to xs.length`, a likely off-by-one | none | everywhere |
 | `unconditional-recursion` | LANGUAGE | a call with no exit before it | none | everywhere |
 | `unused-pure-expression` | LANGUAGE | a discarded pure value | none | everywhere |
+| `identity-null-test` | LANGUAGE | `=== null` spelling a null test | none | everywhere |
 | `map-has-guard-reread` | LANGUAGE (decided) | see below | none | everywhere |
 | `union-let-no-melt` | LANGUAGE (decided) | see below | none | everywhere |
 | `shadowed-local` | LANGUAGE | a block-scoped binding hiding one of the same function (D3579) | n/a (new) | everywhere |
