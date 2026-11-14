@@ -30,9 +30,9 @@ The first cut narrowed every binding. Graded against master over the population,
 programs from `runs` to not. In each, the read renamed to one function hit a spelling the
 whole-set path covers:
 - a generic with a fixed `i32 | string` or record parameter delivered at a narrower closed type,
-  where the direct name is refused on master (D16111);
+  where the direct name is refused on master (D16181);
 - a read handed to a generic parameter called at two types, which reached mono's one-closure
-  refusal (D16112);
+  refusal (D16182);
 - `retV` delivered at a `void` type, now kept out by the B2 test.
 
 A binding with a concrete-parameter member, or with a read passed as an argument, is tested
@@ -62,4 +62,4 @@ Against master's fixpoint over 19,769 programs (`tests/cases` plus distilled `ce
 
 ## Not done
 
-D16110, the hole-lambda spelling: a lambda has no name to rename a read to.
+D16180, the hole-lambda spelling: a lambda has no name to rename a read to.
