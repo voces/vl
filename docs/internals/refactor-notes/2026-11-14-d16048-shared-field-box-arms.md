@@ -30,3 +30,5 @@ Master `1b5ee5499` fixpoint seed against this branch's fixpoint seed:
   `runs -> not-runs`, 0 silent.
 - #7976's 14 `shared-nullable-lit-field-*` templates: 72 of 72 before and after.
 - D16130 replaces D16049 as the top-level field-access witness in `selfhost_native_diag_pos_test.ts`.
+- Sweep, the same two seeds: 24,375 the same, 0 bytes-only movers, 3 output movers (the D16048 and
+  D16049 witnesses and the new case, `emit_reject -> runs`), 0 `runs -> not-runs`, 0 new compiler traps.
