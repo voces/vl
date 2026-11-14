@@ -503,6 +503,11 @@ let ekRetWide: {[i32]: i32} = Map()
 let ekKids: {[string]: i32[]} = Map()
 // Node → [key, type, key, type, ...] over every elaborated instance.
 export let elabNodeTys: {[i32]: i32[]} = Map()
+// Which nodes `elabNodeTys` and `elabNodeNarrowed` hold a row for, by node (`elabRowNote`), so a
+// reader asks a column rather than a map. A negative key is the maps' alone.
+let elabTyRowCol: boolean[] = []
+let elabNarRowCol: boolean[] = []
+let elabRowNegs = false
 // Literal → [key, type, ...]: the type each instance's elaboration stamped it to be built at.
 let elabNodeReps: {[i32]: i32[]} = Map()
 // Literal → [key, union, ...]: the union each instance's elaboration adopted it into an arm of.
@@ -3336,6 +3341,7 @@ function elabOneAt(k: i32) {
     ps.push(k)
     ps.push(elabCapTy[ix] ?? -1)
     elabNodeTys[ix] = ps
+    elabRowNote(elabTyRowCol, ix)
   }
   // A stamp that only repeats the literal's own anonymous type there names no destination: not
   // banked; a named or generic-application record is a row of its own.
@@ -3381,6 +3387,7 @@ function elabOneAt(k: i32) {
     ns.push(k)
     ns.push(st)
     elabNodeNarrowed[ix] = ns
+    elabRowNote(elabNarRowCol, ix)
   }
   for ix in elabCapNarrowArm.keys() {
     const at = elabCapNarrowArm[ix] ?? -1
@@ -9934,6 +9941,7 @@ function elabNodeTyFill(ix: i32, k: i32, t: i32) {
     if ps[i] == k {
       if !elabTyClosed(ps[i + 1], 0) { ps[i + 1] = t }
       elabNodeTys[ix] = ps
+      elabRowNote(elabTyRowCol, ix)
       return 0
     }
     i = i + 2
@@ -9941,6 +9949,7 @@ function elabNodeTyFill(ix: i32, k: i32, t: i32) {
   ps.push(k)
   ps.push(t)
   elabNodeTys[ix] = ps
+  elabRowNote(elabTyRowCol, ix)
   0
 }
 
@@ -10383,6 +10392,9 @@ export function elabRun() {
   elabWalkKeys = []
   elabSlotKeys = Map()
   elabNodeTys = Map()
+  elabTyRowCol = []
+  elabNarRowCol = []
+  elabRowNegs = false
   elabCalleeTys = Map()
   elabNodeReps = Map()
   elabSlotTys = Map()
@@ -20840,7 +20852,10 @@ export function elabStampAt(ix: i32, fnIx: i32): i32 {
 // Gives the copy `to` of the read `from` the narrowings every instance recorded for `from`.
 export function elabNarrowedCarry(from: i32, to: i32) {
   const ns = elabNodeNarrowed[from] ?? []
-  if ns.length > 0 { elabNodeNarrowed[to] = ns }
+  if ns.length > 0 {
+    elabNodeNarrowed[to] = ns
+    elabRowNote(elabNarRowCol, to)
+  }
   const as = elabNodeNarrowArms[from] ?? []
   if as.length > 0 { elabNodeNarrowArms[to] = as }
   0
@@ -20868,9 +20883,7 @@ export function elabNodeNumPairAt(ix: i32, fnIx: i32): i32 {
 // that instance reads it unnarrowed, or -2 where no instance re-checked the read.
 export function elabNarrowedFromAt(ix: i32, fnIx: i32): i32 {
   // -2 before the instance-key walk: a node no instance re-checked has no entry in either bank.
-  if !elabHasPairs(elabNodeTys, ix) && !elabHasPairs(elabNodeNarrowed, ix) {
-    return -2
-  }
+  if !elabTyRecorded(ix) && !elabNarRecorded(ix) { return -2 }
   const k = if fnIx >= 0 { elabKeyAt(fnIx) } else { -1 }
   if k < 0 { return -2 }
   const st = elabPairIn(elabNodeNarrowed, ix, k)
@@ -20906,10 +20919,35 @@ export function isStorageRead(ix: i32): boolean {
   ix >= 0 && parenPeelIx(ix) == storageReadIx
 }
 
-// Whether `ix` (or the node it copies) has any instance's entry in a `[key, type, ...]` bank.
-function elabHasPairs(bank: {[i32]: i32[]}, ix: i32): boolean {
-  if (bank[ix] ?? elabFnNone).length > 0 { return true }
-  (bank[nodeSrc[ix] ?? -1] ?? elabFnNone).length > 0
+// Marks node `ix` as holding a row in the bank `col` shadows.
+function elabRowNote(col: boolean[], ix: i32) {
+  if ix < 0 {
+    elabRowNegs = true
+    return 0
+  }
+  while col.length <= ix { col.push(false) }
+  col[ix] = true
+  0
+}
+
+// Whether the bank `col` shadows (`bank`) holds a row for node `ix`.
+function elabRowAt(col: boolean[], bank: {[i32]: i32[]}, ix: i32): boolean {
+  if ix < 0 { return elabRowNegs && bank.has(ix) }
+  ix < col.length && col[ix]
+}
+
+// Whether some instance recorded node `ix`, or the node it copies, in `elabNodeTys`.
+export function elabTyRecorded(ix: i32): boolean {
+  if elabTyRowCol.length == 0 && !elabRowNegs { return false }
+  if elabRowAt(elabTyRowCol, elabNodeTys, ix) { return true }
+  elabRowAt(elabTyRowCol, elabNodeTys, nodeSrc[ix] ?? -1)
+}
+
+// `elabTyRecorded` for `elabNodeNarrowed`.
+function elabNarRecorded(ix: i32): boolean {
+  if elabNarRowCol.length == 0 && !elabRowNegs { return false }
+  if elabRowAt(elabNarRowCol, elabNodeNarrowed, ix) { return true }
+  elabRowAt(elabNarRowCol, elabNodeNarrowed, nodeSrc[ix] ?? -1)
 }
 
 // Instance `k`'s entry for node `ix` (or the node it copies) in a `[key, type, ...]` bank; -1
