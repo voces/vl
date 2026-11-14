@@ -8,10 +8,11 @@ The precedents are cranelift-interpreter with cranelift-fuzzgen, the Wasm spec i
 in wasmtime's differential fuzzing, and Miri.
 
 **Headline.** The prototype runs **96.0% of the distilled corpus (11,449 of 11,929 cells)**
-and **4,000 of 4,000 rep-fuzz programs**. It found **four compiler bugs**, filed as
-[D16370](../inventory/D16370.md), [D16371](../inventory/D16371.md),
-[D16372](../inventory/D16372.md) and [D16373](../inventory/D16373.md). Each has a witness of
-three lines or fewer, and D16373's is `const y: i64 = if c { 7 } else { 9 }`. Every other
+and **4,000 of 4,000 rep-fuzz programs**. It found **four compiler bugs**. Three are filed as
+[D16370](../inventory/D16370.md), [D16371](../inventory/D16371.md) and
+[D16373](../inventory/D16373.md). The fourth, a postfix `x++` value on an i64 binding, is the
+bug lane I's #8094 fixes, independently found there. Each has a witness of three lines or
+fewer, and D16373's is `const y: i64 = if c { 7 } else { 9 }`. Every other
 disagreement was the oracle's own bug, now fixed, or a spec gap, listed in (c) as an owner
 question.
 
@@ -178,7 +179,7 @@ them yields a verdict until it is ruled.
 | --- | --- | --- |
 | `const a: A \| null = { v: 3 }; a is C` (C has a field `s` that `a` lacks) | compiler bug | **D16370**, check-clean silently wrong: prints `then`. 3 distilled cells, whose manifest records the wrong answer |
 | `print(if true { 4294967296 } else { (1) })` | compiler bug | **D16371**, check-clean invalid wasm |
-| `let x: i64 = 5; print(x++)` | compiler bug | **D16372**, check-clean invalid wasm |
+| `let x: i64 = 5; print(x++)` | compiler bug | check-clean invalid wasm; the bug #8094 (lane I) fixes, so not filed again |
 | `const y: i64 = if c { 7 } else { 9 }` | compiler bug | **D16373**, check-clean invalid wasm |
 | the 7 questions in (c) | spec gap | owner questions, declined by the oracle |
 
@@ -196,7 +197,7 @@ outputs still differed. Fourteen of them were oracle bugs:
 * a lambda's result delivered to a declared function type.
 
 On the final runs, the 4,000 rep programs all agree. Of the 2,000 arithmetic programs, 1,224
-agree, and 116 pass check but build no module. 70 of the 116 carry D16372's spelling, a
+agree, and 116 pass check but build no module. 70 of the 116 carry #8094's spelling, a
 value-position postfix on a wide binding. That is a spelling count, but the 19 such programs
 of the first batch were reduced to it. The other 46 were reduced line by line: 38 leave an
 `if` whose parenthesised arm meets a wider arm (D16371), and 8 leave an `if` of narrow
