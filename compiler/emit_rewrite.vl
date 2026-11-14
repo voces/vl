@@ -2481,9 +2481,9 @@ export function dispatchRewrite(stmts: i32[]) {
       const drwBody = drwWalk(fn.fnBody, fnStmts[fe])
       if drwBody != fn.fnBody { bodyRebuiltFrom.set(drwBody, fn.fnBody) }
       fn.fnBody = drwBody
-      if fe < fRetVoid.length && fRetVoid[fe] == 0 {
-        spillTail(fn.fnBody, fnStmts[fe])
-      }
+      const yields = fe < fRetVoid.length && fRetVoid[fe] == 0
+      spillValueWrites(fn.fnBody, yields)
+      if yields { spillTail(fn.fnBody, fnStmts[fe]) }
     }
     fe = fe + 1
   }
@@ -2494,6 +2494,78 @@ export function dispatchRewrite(stmts: i32[]) {
 // An assignment yields its right-hand side, which a re-read of the target delivers at the
 // value's rep only for a name. So in a function that yields a value, a tail `o[i] = r` becomes
 // `const o2 = o; const i2 = i; const v = r; o2[i2] = v; v`, in source order (D1510).
+
+// Spills each field or element write that a `return` (in a function that yields) or a `let`
+// initializer yields, anywhere in the block at `ix`: the spills and the write go before that
+// statement, which then yields the spilled value. Nothing else is evaluated in either position.
+function spillValueWrites(ix: i32, yields: boolean) {
+  if ix < 0 { return 0 }
+  const n = nodeAt(ix)
+  if n is Block {
+    const stmts: i32[] = []
+    let edited = false
+    for st in n.blkStmts {
+      const sn = nodeAt(st)
+      let asg = -1
+      if sn is RetStmt {
+        if yields && sn.retArg >= 0 { asg = unwrapParen(sn.retArg) }
+      } else if sn is LetDecl {
+        if sn.letInit >= 0 { asg = unwrapParen(sn.letInit) }
+      } else {
+        spillValueWritesIn(st, yields)
+      }
+      const out: i32[] = []
+      const val = if asg >= 0 { spillWrite(asg, out) } else { -1 }
+      if val >= 0 {
+        nodeSrcNote(val, asg)
+        for o in out { stmts.push(o) }
+        stmts.push(asg)
+        if sn is RetStmt { sn.retArg = val }
+        if sn is LetDecl { sn.letInit = val }
+        edited = true
+      }
+      stmts.push(st)
+    }
+    if edited {
+      n.blkStmts = stmts
+      capMemoNoteEdit()
+      plCacheBust()
+    }
+  }
+  0
+}
+
+// `spillValueWrites` over the blocks statement `ix` holds: an `if`'s arms and a loop's body.
+function spillValueWritesIn(ix: i32, yields: boolean) {
+  const n = nodeAt(ix)
+  match n {
+    Block => spillValueWrites(ix, yields)
+    IfStmt => {
+      // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+      let cur = ix
+      while cur >= 0 {
+        const c = nodeAt(cur)
+        cur = -1
+        if c is IfStmt {
+          spillValueWrites(c.ifThen, yields)
+          if c.ifElse >= 0 {
+            if nodeAt(c.ifElse) is IfStmt {
+              cur = c.ifElse
+            } else {
+              spillValueWrites(c.ifElse, yields)
+            }
+          }
+        }
+      }
+    }
+    WhileStmt => spillValueWrites(n.whileBody, yields)
+    ForRange => spillValueWrites(n.frBody, yields)
+    ForIn => spillValueWrites(n.fiBody, yields)
+    // An expression statement, a declaration or a jump holds no block of statements.
+    Ident | NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Index | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread | LoopVar => 0
+  }
+  0
+}
 
 // Spills the value-position tail of the block at `blockIx`: its last statement, or every arm
 // of a last `if` the checker says yields a value.
