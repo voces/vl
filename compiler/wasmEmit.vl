@@ -1420,6 +1420,7 @@ import {
   sFieldRefSlot,
   structRowFieldStoresAtom,
   structRowOfAnnTy,
+  structRowOfRecordTy,
   uFieldTgtStructIdx,
   variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
@@ -1726,6 +1727,7 @@ import {
   MAP_KEY_I32,
   MAP_KEY_I64,
   MAP_KEY_STR,
+  isValueUnionBox,
   mapTwinUnionMember,
   mapTyValIsBool,
   mapTyValIsLitUnion,
@@ -39199,6 +39201,42 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       if pOp >= 0 { wU8(pOp) }
       return 0
     }
+    const nnc = asgNonNullCell(exprIx, fnIx)
+    if nnc == 1 {
+      if emitAsgValue(body, exprIx, fnIx, -1) < 0 { return -1 }
+      fbRefAsNonNull()
+      return 0
+    }
+    if nnc == 2 {
+      const nnWant = asgParkWanted
+      asgParkWanted = true
+      const nnRc = emitAssign(body, exprIx, fnIx)
+      asgParkWanted = nnWant
+      if nnRc < 0 { return -1 }
+      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
+        return emitFail(
+          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
+        )
+      }
+      fbLocalGet(asgParkedSlot)
+      fbRefAsNonNull()
+      return 0
+    }
+    if asgYieldsBoxedArm(exprIx, fnIx) {
+      const savedWant = asgParkWanted
+      asgParkWanted = true
+      const bRc = emitAssign(body, exprIx, fnIx)
+      asgParkWanted = savedWant
+      if bRc < 0 { return -1 }
+      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft || !asgParkedRef {
+        return emitFail(
+          "emitProgram: an assignment used as a value stores a box no local can hold its value from",
+        )
+      }
+      fbLocalGet(asgParkedSlot)
+      fbRefAsNonNull()
+      return emitUnionUnboxTail(boxTagOfTy(nodeTyAt(exprIx, fnIx)))
+    }
     return emitFail(
       "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",
     )
@@ -42756,6 +42794,44 @@ function litSetHasValueAtom(m: i32): boolean {
     if readAtomKindOfTy(softenLitTy(u)) >= 0 { return true }
   }
   false
+}
+
+// How the write at `asgIx` of a record into an `R` or `R | null` place yields its value, where `R`
+// is the record the value is built at: 1 by a re-read of the place (a field of a name), 2 by the
+// cell its store parks (a list element), each short only of the null the cell admits; 0 neither.
+function asgNonNullCell(asgIx: i32, fnIx: i32): i32 {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) || a.binOp != "=" { return 0 }
+  const tt = nodeTyAt(a.binLeft, fnIx)
+  const vt = nodeTyAt(asgIx, fnIx)
+  if tt < 0 || vt < 0 || !tyIsRecord(vt) { return 0 }
+  // The place may read back narrowed past its `null`; the stored cell is the record either way.
+  const inner = if tyBearsNull(tt) { nonNullTy(tt) } else { tt }
+  if inner < 0 || !tyIsRecord(inner) { return 0 }
+  const row = structRowOfRecordTy(inner)
+  // A value with a row of its own is that record only when the row is the place's.
+  const vRow = structRowOfRecordTy(vt)
+  if row < 0 || (vRow >= 0 && vRow != row) { return 0 }
+  const t = nodeAt(unwrapParen(a.binLeft))
+  match t {
+    Member => if nodeAt(t.memObj) is Ident && !exprMap(t.memObj, fnIx) { 1 } else { 0 }
+    Index => if !exprMap(t.idxArr, fnIx) && exprRefArray(t.idxArr, fnIx) { 2 } else { 0 }
+    // A name's re-read is the re-read rung's; no other node is a place.
+    Ident | NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => 0
+  }
+}
+
+// Whether the write at `asgIx` stores a member of a boxed union into a list element or map entry of
+// that union: its store parks the box, and the member's own value is the box's payload.
+function asgYieldsBoxedArm(asgIx: i32, fnIx: i32): boolean {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) || a.binOp != "=" { return false }
+  const t = nodeAt(unwrapParen(a.binLeft))
+  if !(t is Index) { return false }
+  let tt = nodeTyAt(a.binLeft, fnIx)
+  if exprMap(t.idxArr, fnIx) { tt = tyMapValOf(mapRecvTyIn(t.idxArr, fnIx)) }
+  const vt = nodeTyAt(asgIx, fnIx)
+  tt >= 0 && vt >= 0 && isValueUnionBox(tt) && boxTagOfTy(vt) >= 0
 }
 
 // Whether the write at `asgIx` stores into a byte list, which keeps only the value's low byte.
