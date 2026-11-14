@@ -17,11 +17,12 @@
 in `memberCallMapFilterTy`, option (i); the build table is empty there. The elaboration runs
 after the post-pass, so the fact is decided before it is read, with no extra pass.
 
-**Measured.** `callback-over-built-list.matrix.vl` (new, 26 cells, both faces), master `a5624eb2d`
-fixpoint against this branch's fixpoint: 0 runs → not-runs, 0 silent; 16 un-annotated cells
-move from a check or emit reject to runs, and two annotated cells from check-clean invalid wasm
-(D16212) to runs. `kept-maker-delivery-null-field.matrix.vl`: `filter_lambda` un-annotated moves
-to runs, nothing else moves.
+**Measured.** `callback-over-built-list.matrix.vl` (new, 25 cells, both faces), master `293074baf`
+fixpoint against this branch's fixpoint: 0 runs → not-runs, 0 silent. 18 un-annotated cells move
+to runs, 15 from the check's floor, one from an emit reject and two from check-clean invalid wasm
+(D16212); two annotated cells move to runs, one of them from check-clean invalid wasm.
+`kept-maker-delivery-null-field.matrix.vl`: `filter_lambda` un-annotated moves to runs, nothing
+else moves. Guest fuel on `plumb-shape-cost.vl`'s tail: +3.6% against its baseline (bar +5%).
 
 **Left.** D16210 (a field receiver) and D16211 (the floor: a parameter annotated at the element
 type, a `map` result holding the record). Stage 2 is D16137.
