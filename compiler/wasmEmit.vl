@@ -132,7 +132,11 @@ import {
   tyProvesNonNull,
 } from "./check_relate_core"
 import { listDisjointDepth, listFitLitLeafOf } from "./check_type_shape"
-import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
+import {
+  inferRetFnKey,
+  isDeadArm,
+  mapDeliveryRecorded,
+} from "./check_side_rows"
 import { litNumUnionBasesOf, u8LexValue } from "./check_literals"
 import { isPatTyIxOf, isVarTyIxOf, luIsTyOf } from "./check_list_union"
 import {
@@ -22229,6 +22233,40 @@ function readMayBeNulUnit(ix: i32): boolean {
   t < 0 || isNullTy(t) || tyHasTyVar(t)
 }
 
+// Whether expression `ix` computes no value because a dead arm's `never` operand feeds it: a name
+// read checked `never`, or an expression one feeds. A call that is itself `never` (a function that
+// does not return) feeds nothing here, so its own effect is still emitted.
+function exprReadsDeadNever(ix: i32, fnIx: i32): boolean {
+  deadNeverAt(ix, fnIx, 0)
+}
+
+function deadNeverAt(ix: i32, fnIx: i32, depth: i32): boolean {
+  if depth > 16 { return false }
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = nodeAt(u)
+  if n is Ident { return nodeTyAt(u, fnIx) == TY_NEVER }
+  if n is Call {
+    for a in n.callArgs {
+      if deadNeverAt(a, fnIx, depth + 1) { return true }
+    }
+    const f = nodeAt(unwrapParen(n.callFn))
+    return f is Member && deadNeverAt(f.memObj, fnIx, depth + 1)
+  }
+  if nodeTyAt(u, fnIx) != TY_NEVER { return false }
+  if n is BinExpr {
+    return deadNeverAt(n.binLeft, fnIx, depth + 1)
+      || deadNeverAt(n.binRight, fnIx, depth + 1)
+  }
+  if n is Member { return deadNeverAt(n.memObj, fnIx, depth + 1) }
+  if n is Index {
+    return deadNeverAt(n.idxArr, fnIx, depth + 1)
+      || deadNeverAt(n.idxIndex, fnIx, depth + 1)
+  }
+  if n is Unary { return deadNeverAt(n.unArg, fnIx, depth + 1) }
+  false
+}
+
 export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // Stop after a recorded failure: `emitFail` banks the first message and returns -1 but
   // does not halt the pass, so a caller that drops the -1 keeps emitting over invalidated
@@ -22236,6 +22274,11 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // diagnostic prints. Checking the flag at the two recursion roots makes a failure terminal wherever it happened, instead of relying on every caller in between to thread -1 outward.
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
+  // A dead arm's operand reads as `never`, and so does what it feeds: no value reaches here (D16006).
+  if exprReadsDeadNever(exprIx, fnIx) {
+    fbUnreachable()
+    return 0
+  }
   if exprIx != coerceHeld {
     const ck = coerceKindAt(exprIx, fnIx)
     if ck != "none" { return emitCoerced(body, exprIx, fnIx, ck) }
@@ -34148,13 +34191,18 @@ function emitIfLinkStmt(
   // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
   // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
   // outer narrowing around the branch so nesting and the else-branch are unaffected.
-  if staticGuard != 0 {
+  if isDeadArm(s.ifThen) {
+    // A covering test's dead arm was never collected, so it owns no slots (D16006).
+    fbUnreachable()
+  } else if staticGuard != 0 {
     if emitTailArm(body, s.ifThen, fnIx, tail) < 0 { return -1 }
   } else {
     // D932 — the skipped arm's `let`s still own their collect-allocated slots.
     cursorAdvance(cursorSlotsUnder(s.ifThen))
   }
-  if s.ifElse >= 0 && staticGuard != 1 {
+  if s.ifElse >= 0 && isDeadArm(s.ifElse) {
+    // The dead `else` arm: uncollected, so neither emitted nor counted (D16006).
+  } else if s.ifElse >= 0 && staticGuard != 1 {
     fbElse() // 0x05 else
     // The then narrowing does not hold in the else-branch, where the guard is false: a value
     // union narrows to the complement set instead (`is T` removes `T`).
