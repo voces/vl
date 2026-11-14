@@ -515,7 +515,6 @@ import {
   unMemTys,
   unMemberSet,
   unNames,
-  unRowBySid,
   unTyIx,
   unTyKey,
   unTyKeyFirstRow,
@@ -844,25 +843,18 @@ import {
   rlMintNameOfTy,
   rlRowNameOfTy,
   uVariantsPush,
-  unNameBindRow,
-  unNameShareTyKeyRow,
   unNamesPush,
   variantRowFieldsMatch,
   variantRowOrMint,
 } from "./emit_union_atoms"
 import { mfRecordDst, mfRecordSrc } from "./emit_union_casts"
-import {
-  unNameAdoptTyKeyRow,
-  unRowOfTyKey,
-  unTyKeyPushRow,
-} from "./emit_union_tykey"
+import { unRowOfTyKey, unTyKeyHasRow, unTyKeyPushRow } from "./emit_union_tykey"
 import {
   isUNameAB,
   isUNameKeyAB,
   tyIsBareMap,
   tyIsNulMap,
   unABOn,
-  unNameBound,
   unRowOfCanonFolded,
 } from "./emit_union_registry"
 import { arrLitElemKind, arrLitInferUnionElemName } from "./emit_value_sites"
@@ -5781,9 +5773,7 @@ function internJoinedRecordRow(ix: i32) {
 
 export function collectAnnShapes() {
   const joins = recordJoinSeen()
-  if monoGradualRetPinned && emitPhaseReached("monomorphized") {
-    shareObjLitFieldUnionRows()
-  }
+  if monoGradualRetPinned && emitPhaseReached("monomorphized") {}
   let ti = 0
   while ti < P.nodes.length {
     const tn = nodeAt(ti)
@@ -5826,30 +5816,6 @@ export function collectAnnShapes() {
       if nodeAt(li) is ObjLit { mintUnionFieldObjRow(li) }
       li = li + 1
     }
-  }
-  0
-}
-
-// Names each union annotation's spelling onto the registered row of the same union, ahead of
-// any pass that codes a record's fields (D4930).
-function shareObjLitFieldUnionRows() {
-  const nLim = P.nodes.length
-  let li = 0
-  while li < nLim {
-    const tr = nodeAt(li)
-    if tr is TypeRef {
-      const at = nodeTyIxOf(li)
-      if (
-        at >= 0
-        && at < T.tys.length
-        && tyAt(at) is TyUnion
-        && !tyHasTyVar(at)
-        && !tyIsLitUnion(at)
-      ) {
-        if !unNameBound(tr.tyName) { unNameShareTyKeyRow(tr.tyName, at) }
-      }
-    }
-    li = li + 1
   }
   0
 }
@@ -7653,11 +7619,9 @@ function registerInlineUnionGo(
   ty: i32,
   sty: i32,
 ) {
-  // A spelling that names a row skips the mint, and so does one whose type keys to a row.
-  if sty >= 0 && unRowOfTyKey(sty) >= 0 && unNameAdoptTyKeyRow(name, sty) {
-    return 0
-  }
-  if isUNameKeyAB(site, ty) && unNameAdoptTyKeyRow(name, ty) { return 0 }
+  // A spelling whose type keys to a row names that row and skips the mint.
+  if unTyKeyHasRow(sty) { return 0 }
+  if isUNameKeyAB(site, ty) && unTyKeyHasRow(ty) { return 0 }
   // A value union (`i32 | null`, `i32 | f64`) registers the name alone: its members are scalar
   // atoms riding shared value boxes, so it owns no variant structs and its slice is empty.
   if valueBoxOfTy(sty) || riuValueOfBases(sty) {
@@ -7689,7 +7653,7 @@ function registerInlineUnionGo(
     )
   }
   // A recursive union's member walk above can mint this type's row itself; one row per type.
-  if unRowOfTyKey(ty) >= 0 && unNameAdoptTyKeyRow(name, ty) { return 0 }
+  if unTyKeyHasRow(ty) { return 0 }
   mintInlineUnion(stmts, name, ty)
 }
 
@@ -8577,7 +8541,7 @@ function registerInferredUnionTy(stmts: i32[], ity: i32) {
   const inm = tyToNominalName(ity)
   if inm == "" { return 0 }
   if tyNomNameCycled() { return 0 }
-  if isUNameAB(46, ity) && unNameAdoptTyKeyRow(inm, ity) { return 0 }
+  if isUNameAB(46, ity) && unTyKeyHasRow(ity) { return 0 }
   if collectTyMembersReach(stmts, ity, 15, false) < 0 { return -1 }
   registerInlineUnionAt(stmts, inm, 46, ity, ity)
 }
@@ -8588,7 +8552,7 @@ function registerInferredUnionTy(stmts: i32[], ity: i32) {
 // spelling. The atom count comes from the name producer (`recordInferRet`), never a type walk.
 function registerInferRetNominalUnion(stmts: i32[], nm: string, row: i32) {
   const rty = inferRetTyIxAt(row)
-  if unNameAdoptTyKeyRow(nm, rty) { return 0 }
+  if unTyKeyHasRow(rty) { return 0 }
   // A genuine union spelling the arena walk left unregistered is the anonymous-nominal
   // residual; a single-atom name has no top-level union to register.
   if inferRetAtomCountAt(row) >= 2 {
@@ -8654,7 +8618,6 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
         const hty = letNullHoleFilledTy(walk[i])
         if collectTyReachRegister(stmts, hty, 16, false) < 0 { return -1 }
       }
-      annAdoptRegisteredName(letTy)
       // An unannotated binding still has a type that can be a union (`const v = m["k"]` infers
       // `i32 | null`), so this mints the box here; idempotent, since an annotated binding just no-ops the second walk.
       if letTy < 0 {
@@ -8739,24 +8702,6 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
     }
     i = i + 1
   }
-  0
-}
-
-// A binding's inline union annotation spelled in an order the walk above did not register
-// (`Circle | null | string`, registered as `Circle|string|null`) takes the registered spelling,
-// so every name-keyed reader of the binding finds the one row its value is boxed at (D3099).
-function annAdoptRegisteredName(annIx: i32) {
-  if annIx < 0 { return 0 }
-  const lt = nodeAt(annIx)
-  if !(lt is TypeRef) { return 0 }
-  if unNameBound(lt.tyName) { return 0 }
-  const ty = nodeTyIxOf(annIx)
-  if ty < 0 { return 0 }
-  const tt = tyAt(ty)
-  if !(tt is TyNullable || tt is TyUnion) { return 0 }
-  const an = reachRegisterName(ty, false)
-  if an == "" || !unNameBound(an) { return 0 }
-  lt.tyName = an
   0
 }
 
@@ -8904,7 +8849,7 @@ export function collectU(stmts: i32[]) {
       const aeu = arrLitInferUnionElemName(iau, -1)
       if aeu != "" {
         const aety = arrLitElemTyIxOf(iau)
-        if !(isUNameAB(24, aety) && unNameAdoptTyKeyRow(aeu, aety)) {
+        if !(isUNameAB(24, aety) && unTyKeyHasRow(aety)) {
           if collectTyMembersReach(stmts, aety, 15, false) < 0 { return -1 }
           if registerInlineUnionAt(stmts, aeu, 45, aety, aety) < 0 { return -1 }
         }
@@ -9053,7 +8998,6 @@ function collectUReset() {
   mTwinExtra = 0
   mTwinSettled = false
   unNames = []
-  unRowBySid = []
   unTyIx = []
   unTyKey = []
   unTyKeyFirstRow = []
@@ -9272,11 +9216,9 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
           && unionArmsAreRecordsOrScalars(dty)
           && declArmsMatchRow(s, stmtIx, kr))
       ) {
-        unNameBindRow(s.udName, kr)
         return 0
       }
       if !plain && unVarCount[kr] == 0 && unionArmsAreScalarsOrContainers(dty) {
-        unNameBindRow(s.udName, kr)
         markValueUnionAtoms(dty)
         markRefArrayArms(dty)
         markMapUnionArms(dty)
