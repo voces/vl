@@ -69,6 +69,7 @@ import {
   nodeValueSpineChildren,
 } from "./ast"
 import { tErr } from "./check_relate_core"
+import { i32ListHas } from "./listutil"
 import { parseProgram } from "./parser"
 import { vcDgPush, vcLoadToks, vcParseBlocked } from "./tok_load"
 import {
@@ -110,6 +111,11 @@ let jwFail = "false"
 let jwRecvTy = -1
 let jwArrSpell = ""
 let jwMapSpell = ""
+// The types the walk is inside, the target being generated, and the recursive types other than
+// the target it calls, each walked by a function pair of its own.
+let jwOpen: i32[] = []
+let jwTgtK = 0
+let jwRecTys: i32[] = []
 
 function jwFresh(p: string): string {
   jwCtr = jwCtr + 1
@@ -228,6 +234,33 @@ function jwWalk(ty: i32, src: string, out: string[]): string {
   // The JSON union itself is the wildcard leaf: it matches anything and is taken by
   // reference — no walk, no copy (`docs/serde-design.md`, the "Deep" clause).
   if jsonSelfRef(ty, jwRecvTy) { return jwWildcard(src) }
+  // A type the walk is already inside is walked by its own function, called (D1198).
+  if i32ListHas(jwOpen, ty) { return jwWalkRec(ty, src, out) }
+  jwOpen.push(ty)
+  const r = jwWalkIn(ty, src, out)
+  jwOpen.pop()
+  r
+}
+
+// A call of the function pair walking recursive type `ty`: the target's own, else one generated
+// for `ty`. The builder is called only once its predicate held, so the call cannot fail.
+function jwWalkRec(ty: i32, src: string, out: string[]): string {
+  const root = ty == jwTgtTy[jwTgtK]
+  if !root && !i32ListHas(jwRecTys, ty) { jwRecTys.push(ty) }
+  const pn = if root { jwPredName(jwTgtK) } else { jwRecPredName(jwTgtK, ty) }
+  if !jwBuild {
+    out.push("if !" + pn + "(" + src + ") { return " + jwFail + " }")
+    return ""
+  }
+  const gn = if root { jwWalkerName(jwTgtK) } else { jwRecGetName(jwTgtK, ty) }
+  const g = jwFresh("__vjr")
+  out.push("if !" + pn + "(" + src + ") { return " + jwFail + " }")
+  out.push("const " + g + " = " + gn + "(" + src + ")")
+  g
+}
+
+// `jwWalk` at a type it is not yet inside.
+function jwWalkIn(ty: i32, src: string, out: string[]): string {
   const nin = jwNullableInner(ty)
   if nin >= 0 {
     // S3: an absent key and an explicit JSON `null` are the same fact here — a map
@@ -406,6 +439,44 @@ function jwWalkObj(
 // clause-1 defect (D1197).
 function jwWalkerName(k: i32): string { "__vlJsonGet_" + i32ToStr(k) }
 function jwPredName(k: i32): string { "__vlJsonIs_" + i32ToStr(k) }
+function jwRecGetName(k: i32, ty: i32): string {
+  jwWalkerName(k) + "_" + i32ToStr(ty)
+}
+function jwRecPredName(k: i32, ty: i32): string {
+  jwPredName(k) + "_" + i32ToStr(ty)
+}
+
+// The predicate `pn` and builder `gn` walking type `ty`, spelled `spell`, from receiver spelling
+// `recv`.
+function jwPairSource(
+  ty: i32,
+  recv: string,
+  spell: string,
+  pn: string,
+  gn: string,
+): string {
+  jwBuild = false
+  jwFail = "false"
+  const chk: string[] = []
+  jwWalk(ty, "v", chk)
+  const head = "function " + pn + "(v: " + recv + "): boolean {\n"
+  const pred = head + jwJoin(chk) + "true\n}\n"
+  jwBuild = true
+  jwFail = jwDefault(ty)
+  const bld: string[] = []
+  const val = jwWalk(ty, "v", bld)
+  pred
+    + "function "
+    + gn
+    + "(v: "
+    + recv
+    + "): "
+    + spell
+    + " {\n"
+    + jwJoin(bld)
+    + val
+    + "\n}\n"
+}
 
 function jwJoin(lines: string[]): string {
   let s = ""
@@ -420,6 +491,9 @@ function jwJoin(lines: string[]): string {
 // The whole fragment: one predicate + one builder per recorded target.
 function jwGenerateSource(): string {
   let src = ""
+  jwTgtK = 0
+  jwOpen = []
+  jwRecTys = []
   let k = 0
   while k < jwTgtSpell.length {
     // The root type, not the parameter: the walk's tests and its wildcard leaf are
@@ -430,35 +504,22 @@ function jwGenerateSource(): string {
     const tgt = jwTgtTy[k]
     const recv = jwTgtRecv[k]
     const spell = jwTgtSpell[k]
-
-    jwBuild = false
-    jwFail = "false"
-    const chk: string[] = []
-    jwWalk(tgt, "v", chk)
-    src = src
-      + "function "
-      + jwPredName(k)
-      + "(v: "
-      + recv
-      + "): boolean {\n"
-      + jwJoin(chk)
-      + "true\n}\n"
-
-    jwBuild = true
-    jwFail = jwDefault(tgt)
-    const bld: string[] = []
-    const val = jwWalk(tgt, "v", bld)
-    src = src
-      + "function "
-      + jwWalkerName(k)
-      + "(v: "
-      + recv
-      + "): "
-      + spell
-      + " {\n"
-      + jwJoin(bld)
-      + val
-      + "\n}\n"
+    jwTgtK = k
+    jwRecTys = []
+    src = src + jwPairSource(tgt, recv, spell, jwPredName(k), jwWalkerName(k))
+    let r = 0
+    while r < jwRecTys.length {
+      const rt = jwRecTys[r]
+      src = src
+        + jwPairSource(
+        rt,
+        recv,
+        tyToStr(rt),
+        jwRecPredName(k, rt),
+        jwRecGetName(k, rt),
+      )
+      r = r + 1
+    }
     k = k + 1
   }
   // Every `$` in the text came from a merge-mangled type name, and the lexer cannot take
