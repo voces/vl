@@ -96,6 +96,7 @@ import {
   cwOccWalk,
   cwOccWalkSpelled,
   cwSlotWrittenValues,
+  cwSoleReadInit,
   cwUseCaptures,
   fnDeclIx,
 } from "./check_write_scan"
@@ -1632,9 +1633,8 @@ function ftScan(
         }
         // A binding of the set written: what the write stores is an id of it.
         if pn is BinExpr && ftIsStore(pn) && pn.binLeft == x {
-          if !ftJoinAt(pn.binRight, nodeTyIxOf(x), s, ds, leaves, ids) {
-            return false
-          }
+          const wv = ftWrittenNamedSource(pn.binRight, nodeTyIxOf(x))
+          if !ftJoinAt(wv, nodeTyIxOf(x), s, ds, leaves, ids) { return false }
         }
       }
       // A record literal written whole into a binding the field widener widened, or a field or
@@ -1645,6 +1645,22 @@ function ftScan(
       if ftHolds(x, s) && rw is BinExpr && ftIsStore(rw) && rw.binLeft == x {
         const wls: i32[] = []
         tailValueLeaves(rw.binRight, wls)
+        // A read of a binding read nowhere else writes its initialiser's literals (D15308).
+        let wi = 0
+        while wi < wls.length && wi < 64 {
+          const bi = cwSoleReadInit(wls[wi])
+          const bl: i32[] = []
+          if bi >= 0 { tailValueLeaves(bi, bl) }
+          let fw = false
+          for b in bl {
+            if recAsgFnWidenedTy(parenPeelIx(b)) >= 0 { fw = true }
+          }
+          if fw {
+            ftWrittenSourceAt(wls[wi], nodeTyIxOf(x))
+            for b in bl { wls.push(b) }
+          }
+          wi = wi + 1
+        }
         for wl in wls {
           const wx = parenPeelIx(wl)
           if (
@@ -2626,6 +2642,61 @@ function ftJoinAt(
     }
   }
   ftValuesOk(vs, s, ds, leaves, ids)
+}
+
+// The value a write of `v` into a binding of type `t` stores: where `v` reads a binding read
+// nowhere else (`cwSoleReadInit`) that names a top-level function, that name, with the read and
+// the binding re-typed to `t` (D15308); else `v`. Only outside an instanced function, and where
+// the read and the binding are in one function, so no instance or capture sees the binding.
+function ftWrittenNamedSource(v: i32, t: i32): i32 {
+  let x = parenPeelIx(v)
+  const own = if x >= 0 && x < P.nodes.length { recEnclosingFn(x) } else { -2 }
+  if own < -1 || own >= 0 && ftInstancedFnOrIn(own) { return v }
+  let hops = 0
+  while hops < 8 {
+    const bi = cwSoleReadInit(x)
+    const xd = if bi >= 0 { identDeclOf(x) } else { -1 }
+    if bi < 0 || recEnclosingFn(xd) != own {
+      hops = 8
+    } else if ftNamedFn(bi) >= 0 {
+      ftWrittenSourceAt(v, t)
+      return bi
+    } else if bi < P.nodes.length && nodeAt(bi) is Ident {
+      x = bi
+    } else {
+      hops = 8
+    }
+    hops = hops + 1
+  }
+  v
+}
+
+// Whether function `f` is generic or open, or declared inside one (`ftWithinInstancedFn`).
+function ftInstancedFnOrIn(f: i32): boolean {
+  const fd = nodeAt(f)
+  fd is FuncDecl && fd.fnTyParams.length > 0
+    || ftOpenFn(f)
+    || ftWithinInstancedFn(f)
+}
+
+// Re-types the read `v` of a binding `cwSoleReadInit` answers, and that binding, to `t`, through
+// bindings of bindings. True.
+function ftWrittenSourceAt(v: i32, t: i32): boolean {
+  let x = parenPeelIx(v)
+  let hops = 0
+  while hops < 8 && x >= 0 && x < P.nodes.length && nodeAt(x) is Ident {
+    const bi = cwSoleReadInit(x)
+    if bi < 0 { return true }
+    for j in [x, identDeclOf(x)] {
+      if !i32ListHas(ftRespine, j) {
+        ftRespine.push(j)
+        ftRespineTy.push(t)
+      }
+    }
+    x = bi
+    hops = hops + 1
+  }
+  true
 }
 
 // Splits join `x` into the joins it is made of, `sp`, and the values they hand on, `vs`: the arms
