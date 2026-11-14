@@ -1,6 +1,8 @@
 // The return type an un-annotated function infers from its returns, once its body is
 // checked, with the object-literal returns widened to the record they adopt.
 
+import { fvaAnnot } from "./check_annot_resolve"
+import { inferRetWroteNote } from "./check_infer_ret"
 import { noteOpenUnionRows } from "./check_hole_links"
 import { openMemberRows } from "./check_leaf_steps"
 import { declTyOf } from "./check_nar_store"
@@ -12,10 +14,12 @@ import {
   FieldInit,
   FuncDecl,
   IfStmt,
+  Node,
   NumLit,
   ObjLit,
   P,
   Paren,
+  arenaSetNode,
   i32ToStr,
   nodeAt,
 } from "./ast"
@@ -65,7 +69,13 @@ import {
 } from "./check_leaf_steps"
 import { a20RetWalk } from "./check_nj_gate"
 import { gRootStmts } from "./check_nj_join"
-import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
+import {
+  nodeTyIx,
+  nodeTyIxOf,
+  nodeTyOf,
+  nodeTySet,
+  nodeTySetGrow,
+} from "./check_node_tys"
 import { numLitAdoptDeep } from "./check_num_adopt"
 import { cexLitPeel, isF32AdoptingLitExpr } from "./check_num_lits"
 import { isClassifiableRetName } from "./check_redundant_ret"
@@ -770,16 +780,16 @@ function inferRetEmptyListFloor(n: FuncDecl, inferred: i32, expRet: i32) {
   }
 }
 
-// D16047: the functions whose inferred return held an unwritten collection, floored once the
+// D16047: the functions whose inferred return held an unwritten collection, lowered once the
 // program's end settled it.
 let deferredFloorFns: FuncDecl[] = []
 let deferredFloorTys: i32[] = []
 
-// Runs the inferred-return floor on the returns held back for their unwritten members, now settled.
+// Lowers the inferred returns held back for their unwritten members, now settled.
 export function flushDeferredRetFloors() {
   let i = 0
   while i < deferredFloorFns.length {
-    inferRetFloorUnsupported(deferredFloorFns[i], deferredFloorTys[i])
+    inferRetAsAnnotation(deferredFloorFns[i], deferredFloorTys[i])
     i = i + 1
   }
   deferredFloorFns = []
@@ -787,9 +797,9 @@ export function flushDeferredRetFloors() {
   0
 }
 
-// Reports a named function's inferred union or nullable return that the emitter cannot
-// lower un-annotated; every shape the emitter registers passes silently.
-function inferRetFloorUnsupported(n: FuncDecl, inferred: i32) {
+// Lowers a named function's inferred union or nullable return as its annotated twin when no
+// recorder names it for the emitter: the inferred type is written as the return annotation.
+function inferRetAsAnnotation(n: FuncDecl, inferred: i32) {
   // A union or nullable whose unwritten collection the program's end settles is named then,
   // by the A20 loop, as its annotated twin is (D16047).
   if (
@@ -816,14 +826,14 @@ function inferRetFloorUnsupported(n: FuncDecl, inferred: i32) {
     // A variant-box union (`{w: i32} | i32`, and its nullable form) lowers un-annotated: the
     // A20 loop records `variantBoxUnionRetName` and the emitter boxes it exactly like the
     // annotated spelling. Checked before the `TyUnion`/`TyNullable` arms below (it spans
-    // both), so the floor accepts exactly the box the emitter registers.
+    // both), since it is a box the emitter registers itself.
     if litUnionAliasNameOfTy(inferred) != "" {
       // A pure literal union with a declared alias (`type K = "a" | "b"`) lowers
       // un-annotated as the interned i32 atom: the A20 loop records the alias name and the
       // emitter's return classification reads the same rep the annotated `: K` spelling
-      // reaches. An inline litunion (no alias to record) still floors below.
+      // reaches.
     } else if variantBoxUnionRetName(inferred) != "" {
-      // lowers un-annotated — no floor
+      // lowers un-annotated, boxed by its recorder
     } else if mapUnionRetName(inferred) != "" {
       // A map-member union lowers un-annotated through the recorder's map-union rung (D2666).
     } else if tyIsLitUnion(inferred) {
@@ -837,29 +847,21 @@ function inferRetFloorUnsupported(n: FuncDecl, inferred: i32) {
       // `softenLitTy` states everywhere) and this arm accepts exactly what it banks. The
       // string litunion two arms up is the shape that keeps an identity (the interned atom), which is why it is a separate question.
     } else if itt is TyUnion {
-      // No floor for a union the emitter lowers as its annotation: a struct union it can register
-      // (`structUnionRetName`), a union of lists or with a function member it pins (D2768,
-      // D4349), and a union over a type parameter, decided per instance where `T` is bound.
+      // A struct union the emitter registers (`structUnionRetName`), a union of lists or with a
+      // function member it pins (D2768, D4349), and a union over a type parameter, decided per
+      // instance, keep their own lowering; any other union is written as its annotation.
       if (
         structUnionRetName(inferred, gRootStmts) == ""
         && !tyHasTyVar(inferred)
         && !tyUnionAllLists(inferred)
         && !tyIsFnArmUnion(inferred)
       ) {
-        tErrUnsupported(
-          "'"
-            + n.fnName
-            + "' infers the union return type "
-            + tyToStr(inferred)
-            + " — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type",
-          n.fnBody,
-        )
+        inferRetAnnotate(n, inferred)
       }
     } else if itt is TyNullable {
-      // The niche nullables (`boolean | null` / `string | null` / `K | null`), a nullable
-      // numeric literal union, a nullable struct, a nullable list, and a never-filled infer-null hole
-      // (`nInner < 0`, whose only value is `null`) all lower un-annotated — each named by its
-      // own recorder for the emitter to seed from — so none of them floor (D1576).
+      // The niche nullables, a nullable numeric literal union, struct or list, and a never-filled
+      // infer-null hole (`nInner < 0`) each have a recorder the emitter seeds from (D1576); any
+      // other nullable is written as its annotation.
       if (
         itt.nInner >= 0
         && !(tyAt(itt.nInner) is TyVar)
@@ -871,19 +873,31 @@ function inferRetFloorUnsupported(n: FuncDecl, inferred: i32) {
         && nullableRetName(inferred, gRootStmts) == ""
         && nulListRetName(inferred) == ""
       ) {
-        // `T | null` over a type parameter is decided per instance, where `T` is bound.
-
-        tErrUnsupported(
-          "'"
-            + n.fnName
-            + "' infers the nullable return type "
-            + tyToStr(inferred)
-            + " — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type",
-          n.fnBody,
-        )
+        inferRetAnnotate(n, inferred)
       }
     }
   }
+}
+
+// Writes `inferred` as top-level function `n`'s return annotation, a node of no source token;
+// the emitter then reads the function as its annotated twin (D4160, D16171).
+function inferRetAnnotate(n: FuncDecl, inferred: i32) {
+  const ix = fnDeclIx[n.fnName] ?? -1
+  if ix < 0 { return 0 }
+  inferRetWroteNote(ix)
+  const tr = fvaAnnot(inferred, -1, n.pos)
+  if tr < 0 { return 0 }
+  nodeTySetGrow(tr, inferred)
+  const nf: Node = {
+    fnName: n.fnName,
+    fnTyParams: n.fnTyParams,
+    fnParams: n.fnParams,
+    fnRet: tr,
+    fnBody: n.fnBody,
+    pos: n.pos,
+  }
+  arenaSetNode(ix, nf)
+  0
 }
 
 // The emitter-format name an anonymous lambda's union, nullable or list return records
@@ -1345,12 +1359,12 @@ export function finishInferredReturn(
     if inferred != preAdopt { cbSeedUsedSet(cbSeedUsed + 1) }
   }
   // A `const` literal returned is the `string` it is stored as, so a join with `null`, a number
-  // or a record meets the return floors below exactly as that string does (D2157).
+  // or a record is lowered below exactly as that string's is (D2157).
   inferred = widenLitTy(inferred)
   // Permissive fall-through (totality): an un-annotated function that can fall off the end
   // implicitly yields `null` there, so its inferred return widens to `T | null`. A box-able
   // value type lowers un-annotated via the `uBoxIdx` box; a niche (`boolean`/`string`) widens
-  // too but stays floored below until A20 carries the niche seed. A void/error return is exempt.
+  // too and is lowered below. A void/error return is exempt.
   if (
     !bodyTotalForRet
     && inferred >= 0
@@ -1360,11 +1374,9 @@ export function finishInferredReturn(
     const inT = tyAt(inferred)
     if !(inT is TyNullable) { inferred = mkNullableTy(inferred) }
   }
-  // Robustness floor: an un-annotated function whose returns join to a union/nullable now
-  // infers the correct type, but must still be annotated when the emitter cannot yet lower
-  // it un-annotated — a value union/nullable already lowers via the `uBoxIdx` box and does
-  // not floor; a deferred join (a per-call-site placeholder) is not a shape to floor either, since it collapses to one arm at each call site.
-  inferRetFloorUnsupported(n, inferred)
+  // A union/nullable return no recorder names is lowered as its annotated twin; a deferred join
+  // (a per-call-site placeholder) collapses to one arm at each call site and is left alone.
+  inferRetAsAnnotation(n, inferred)
   // A lambda's join of its enclosing body's type parameters is that body's kept-apart join, so
   // the lambda's instance and every caller re-join it at the pin alike (D3520, D3521). A call's
   // join it relays is the callee's, which a gated callee widens.
