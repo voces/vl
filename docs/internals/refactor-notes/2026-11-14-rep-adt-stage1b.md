@@ -30,3 +30,13 @@ What does not change:
   which 1b's first item delivers.
 
 Order: 1b → 2 → 3, and H's stage 4 → 3½ → 4 → 5. Stage 6 can follow 3½ at any point.
+
+## Acceptance rows
+
+Lane L froze D4089 to these stages (via the coordinator, 2026-11-14).
+
+| row | outcome | what closes it | stage |
+|---|---|---|---|
+| [D4089](../inventory/D4089.md) | open. Since lane L's partial-fit check the `is` test runs, but narrowing to `B` stays refused. | After `r is B` over `r: A \| C`, a read of `r.x` at `B` must read a value stored as arm `A`. The narrowed read needs a checker-recorded fact, "`r` is stored as arm `A`", in place of `emitVariantCoerce`/`exprVariantIndex`, which know arms only. 1b records the arm status from the checker (the `RRecord` arm of the storage type). Stage 2 is the first stage where emit reads a node's rep from that fact, at every narrowed-read site. | the arm fact in 1b; the reads in 2 |
+
+The grading list is the row's: the repro; `r: A | C | null`; and the `match` spelling (D4087).
