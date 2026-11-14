@@ -611,6 +611,7 @@ import {
   isVoidTy,
   nhOpen,
   nonNullTy,
+  nulFoldMemberTy,
   numericRepsApart,
   primIsSubWord,
   primNameOf,
@@ -3003,14 +3004,17 @@ function gaFillUnionInstance(declIx: i32, resIx: i32) {
 
 // A union alias instance that filled to one member (`T | null` folds to `T?`) is that member,
 // as the inline spelling is, so binding `O<T>` against `O<i32>` meets `T?` against `i32?`.
-// A recursive instance keeps its placeholder, which its own members already point at.
 function gaUnionUnwrap(resIx: i32, memoKey: string): i32 {
   const u = tyAt(resIx)
-  if !(u is TyUnion) || u.uMembers.length != 1 || tyReachesSelf(resIx) {
-    return resIx
-  }
+  if !(u is TyUnion) || u.uMembers.length != 1 { return resIx }
   const m = u.uMembers[0]
   if m < 0 { return resIx }
+  // A recursive one: a null fold is tied to its nullable first (`nulFoldTieRecord`), which no
+  // longer reaches the placeholder; any other keeps the placeholder its members point at.
+  if tyReachesSelf(resIx) {
+    if nulFoldMemberTy(resIx) < 0 { return resIx }
+    nulFoldTieRecord(m)
+  }
   cUserTypes[memoKey] = m
   cUserTypesVer = cUserTypesVer + 1
   // Only a member this fill minted carries the application's name; an existing type (`A<i32>`
@@ -10793,6 +10797,63 @@ export function fillTypeDeclAt(sx: i32) {
     }
   }
   0
+}
+
+// A recursive record alias spelled with `| null` (`type L = { n: L } | null`) folds to a union
+// wrapping `{ n: L }?`. Once every declaration is filled, a field of a recursive one naming such a
+// wrapper, directly, as a list element or under `| null`, is re-pointed at the wrapper's nullable,
+// so a read of it is the nullable record every reader handles, not a second type for one value.
+export function nulFoldTieKnots(stmts: i32[]) {
+  // Which wrappers are recursive is decided before any is tied: tying one re-routes the cycle
+  // of its partner in a mutual pair through the nullable, which then misses the wrapper.
+  const tie: i32[] = []
+  for sx in stmts {
+    const sd = nodeAt(sx)
+    if sd is UnionDecl {
+      const w = cUserTypes[sd.udName] ?? -1
+      const m = nulFoldMemberTy(w)
+      if m >= 0 && tyReachesSelf(w) { tie.push(m) }
+    }
+  }
+  for m in tie { nulFoldTieRecord(m) }
+  0
+}
+
+// Re-points the wrapper-typed fields of the record nullable `m` holds (`nulFoldTieKnots`).
+function nulFoldTieRecord(m: i32) {
+  const mt = tyAt(m)
+  if !(mt is TyNullable) || mt.nInner < 0 { return 0 }
+  const rec = tyAt(mt.nInner)
+  if !(rec is TyObj) { return 0 }
+  let i = 0
+  while i < rec.objFieldTypes.length {
+    rec.objFieldTypes[i] = nulFoldTiedTy(rec.objFieldTypes[i])
+    i = i + 1
+  }
+  tyMutEpoch = tyMutEpoch + 1
+  0
+}
+
+// Field type `f` with a null-fold wrapper in it replaced by the wrapper's nullable: the field
+// itself, a list's element, or the inner of a `| null`, which folds into it.
+function nulFoldTiedTy(f: i32): i32 {
+  const fm = nulFoldMemberTy(f)
+  if fm >= 0 { return fm }
+  if f < 0 { return f }
+  const ft = tyAt(f)
+  match ft {
+    TyNullable => {
+      const im = nulFoldMemberTy(ft.nInner)
+      if im >= 0 { return im }
+    }
+    TyArray => {
+      const em = nulFoldMemberTy(ft.aElem)
+      if em >= 0 { ft.aElem = em }
+    }
+    // Any other field type holds no wrapper this tie reaches.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {}
+  }
+  f
 }
 
 // Fills declaration `name` now, when pass 0b is running and has not reached it yet. Inert
