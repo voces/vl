@@ -72,9 +72,11 @@ Three consequences:
 block body's last statement is today's implicit return, it inserts `return ` before it. The
 census below used the same rule. It is idempotent by construction, since a tail that is a
 `return` is not flagged.
-- **Edge spellings to prove before the switch:** `return if …`, `return match …`,
-  `return @B { … }`, `return x = e` and `return { … }` all parse today. A value-carrying loop at
-  a body tail is a parse question for `return while …`, to check first.
+- **Edge spellings, checked on master:** `return if … else …`, `return match …`,
+  `return @B { … }`, `return x = e`, `return { id }`, the else-less `return if c { 5 }`, and
+  `return while …` with a `break` value all parse and run on their own lines. One does not
+  parse: the else-less `if` on a single line, `{ return if c { 5 } }`. Either the parser learns
+  it, or the codemod breaks the line.
 - **Proof on the whole tree** (step b):
   - the codemod applied twice changes nothing the second time;
   - `refresh-compiler.sh` gives a byte-identical seed, since `return e` and the implicit tail
