@@ -20,7 +20,7 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, nativeEnv, privateSeedCache } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -198,20 +198,14 @@ test("an edited std module the program imports misses; one it does not import hi
 });
 
 test("the seed's bytes are keyed, not its path", async () => {
-  // Copied with its Cranelift sidecars (content-keyed, so they still apply), then
+  // Copied (its compiled forms are keyed by content, so they still apply), then
   // overwritten in place. The lookup runs before the seed loads, so a seed that cannot load
   // still shows the miss.
   const { tmp, p, cache } = await setup();
   try {
     const seed = `${tmp}/seed.wasm`;
     await Deno.copyFile(COMPILER, seed);
-    const dir = COMPILER.replace(/\/[^/]*$/, ""), base = COMPILER.slice(dir.length + 1);
-    for (const e of Deno.readDirSync(dir)) {
-      if (e.name.startsWith(`${base}.`) && e.name.endsWith(".cwasm")) {
-        await Deno.copyFile(`${dir}/${e.name}`, `${tmp}/seed.wasm${e.name.slice(base.length)}`);
-      }
-    }
-    const env = { VL_COMPILER_WASM: seed };
+    const env = { VL_COMPILER_WASM: seed, VL_SEED_CACHE_DIR: privateSeedCache(`${tmp}/seed-cache`) };
     expect((await vl(RUN, p, cache, env)).trace, ["miss", "stored"], "cold");
     expect((await vl(RUN, p, cache, env)).trace, ["hit"], "warm");
     await Deno.writeFile(seed, new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]));

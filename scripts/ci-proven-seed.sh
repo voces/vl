@@ -5,11 +5,12 @@
 #   scripts/ci-proven-seed.sh pack           (pull request, after the fixpoint ladder)
 #   scripts/ci-proven-seed.sh fetch <name>   (any other run, after an exact seed-key miss)
 #
-# `pack` writes build/proven-seed.tar.zst: the seed, its `.src`, its `.cwasm` sidecars and a
-# sha256 manifest of them. ci.yml uploads it as artifact <name>. `fetch` takes the newest
-# artifact <name> whose run passes every provenance check below, verifies the manifest, and
-# installs it as build/vl-compiler.wasm* for `refresh-compiler.sh --prove-fixpoint` to start
-# from. A miss or a failed check leaves build/ untouched and exits 0: it costs the ladder.
+# `pack` writes build/proven-seed.tar.zst: the seed, its `.src`, its `.cwasm` sidecars from the
+# seed cache (`vl seed --cache-files`) and a sha256 manifest of them. ci.yml uploads it as
+# artifact <name>. `fetch` takes the newest artifact <name> whose run passes every provenance
+# check below, verifies the manifest, and installs the seed as build/vl-compiler.wasm* and its
+# sidecars into the seed cache, for `refresh-compiler.sh --prove-fixpoint` to start from. A
+# miss or a failed check leaves build/ untouched and exits 0: it costs the ladder.
 #
 # Provenance, all required: the artifact's run is a same-repository `pull_request` run of
 # .github/workflows/ci.yml whose `seed` job concluded `success`. A fork's run is refused,
@@ -20,17 +21,26 @@ cd "$(dirname "$0")/.."
 
 MANIFEST=proven-seed.sha256
 BUNDLE=proven-seed.tar.zst
+VL="${VL:-scripts/vl-host/target/release/vl}"
+# A sidecar's name in the seed cache: `seed-<seed key>-<engine tag>.cwasm`.
+SIDECAR_RE='seed-[0-9a-f]+-[0-9a-f]+\.cwasm'
 
 pack() {
-  cd build
-  shopt -s nullglob
-  local files=(vl-compiler.wasm vl-compiler.wasm.src vl-compiler.wasm.*.cwasm)
-  [ -f vl-compiler.wasm ] || { echo "pack: no build/vl-compiler.wasm" >&2; exit 1; }
-  sha256sum "${files[@]}" > "$MANIFEST"
-  cat "$MANIFEST"
-  tar -I 'zstd -T0 -3' -cf "$BUNDLE" "$MANIFEST" "${files[@]}"
-  rm -f "$MANIFEST"
-  echo "packed build/$BUNDLE ($(wc -c < "$BUNDLE") bytes)"
+  [ -f build/vl-compiler.wasm ] || { echo "pack: no build/vl-compiler.wasm" >&2; exit 1; }
+  local side
+  # Global, not local: the EXIT trap runs after this function has returned.
+  STAGE=$(mktemp -d)
+  trap 'rm -rf "$STAGE"' EXIT
+  local stage=$STAGE
+  cp build/vl-compiler.wasm "$stage/"
+  [ -f build/vl-compiler.wasm.src ] && cp build/vl-compiler.wasm.src "$stage/"
+  while IFS= read -r side; do
+    [ -f "$side" ] && cp "$side" "$stage/"
+  done < <("$VL" seed --cache-files --compiler build/vl-compiler.wasm)
+  (cd "$stage" && sha256sum * > "$MANIFEST" && cat "$MANIFEST" \
+    && tar -I 'zstd -T0 -3' -cf "$BUNDLE" "$MANIFEST" $(ls | grep -vx "$MANIFEST"))
+  mv "$stage/$BUNDLE" build/
+  echo "packed build/$BUNDLE ($(wc -c < "build/$BUNDLE") bytes)"
 }
 
 # Why the run may not hand over its artifact; empty when it may.
@@ -55,7 +65,7 @@ verify() { # <bundle> <dir>
   listed=$(cut -c67- "$dir/$MANIFEST" | sort)
   present=$(cd "$dir" && ls | { grep -vx "$MANIFEST" || true; } | sort)
   if [ "$listed" != "$present" ] || ! grep -qx vl-compiler.wasm <<< "$listed" \
-      || grep -qvx 'vl-compiler\.wasm[A-Za-z0-9._-]*' <<< "$listed"; then
+      || grep -Eqvx "vl-compiler\.wasm(\.src)?|$SIDECAR_RE" <<< "$listed"; then
     echo "the bundle's files do not match its manifest" >&2; return 1
   fi
   echo "$listed"
@@ -85,8 +95,15 @@ fetch() { # <artifact name>
     fi
     mkdir -p build
     rm -f build/vl-compiler.wasm build/vl-compiler.wasm.src build/vl-compiler.wasm.*.cwasm
-    for f in $names; do mv "$TMP/x/$f" "build/$f"; done
-    echo "installed the seed run $run proved: $(wc -c < build/vl-compiler.wasm) bytes, $(grep -c '\.cwasm$' <<< "$names") sidecar(s)"
+    local cache
+    cache=$("$VL" seed --cache-dir 2>/dev/null || true)
+    for f in $names; do
+      case "$f" in
+        *.cwasm) if [ -n "$cache" ]; then mv "$TMP/x/$f" "$cache/$f"; fi ;;
+        *) mv "$TMP/x/$f" "build/$f" ;;
+      esac
+    done
+    echo "installed the seed run $run proved: $(wc -c < build/vl-compiler.wasm) bytes, $(grep -c '\.cwasm$' <<< "$names") sidecar(s) into ${cache:-no seed cache}"
     if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "run=$run" >> "$GITHUB_OUTPUT"; fi
     return 0
   done
