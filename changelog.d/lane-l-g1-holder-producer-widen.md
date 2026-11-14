@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **D15274, D15302, D15308 closed:** every producer of a holder whose function field a write widens is built at the holder's row. A value `if` of record literals whose field is then written another function (`const r = if c { { f: id1 } } else { { f: id1 } }; r.f = id0`), a binding read only where it is written whole into a widened one (`const q = { f: id2 }; let r = { f: id1 }; r = q`, and the bare `const q = id2; let r = id1; r = q`), and a second maker's record holding a member of a widened field's set, called directly beside it, now run at two call types where they were emit rejects. A bare `const` source read again after the write (D16220), and a source declared in another function than its read (D16221), are still refused.
