@@ -1637,7 +1637,7 @@ a recommendation. The spec's own questions are in `docs/spec/OPEN-QUESTIONS.md`.
   erasure design. Brief: `docs/internals/newtype-design.md`.
 - **A10, const generics.** No grammar or semantics is recorded for a value type parameter.
 - **A13, a `"+"`-named struct field.** Is such a field spellable? Today it is a parse error.
-- **D12131, non-regular generic aliases.** Is `type L<T> = { v: T, next: L<L<T>> | null }` legal? Its expansion needs a larger instance at every level, so it needs polymorphic recursion, which a uniform generic representation could support and per-instance monomorphization cannot. Nothing rules on it. Since 2026-11-14 the checker refuses it with a provisional sentence naming the mechanism (it used to trap). D2721 refuses a generic function that recurses at a growing type argument on the same grounds, also unruled. Recommendation: rule both together; refusing matches what the compiler can build.
+- **D12131, non-regular generic aliases.** Graded DESIGN 2026-11-14: VL monomorphizes, so `type L<T> = { v: T, next: L<L<T>> | null }` needs infinitely many instances and the checker refuses it (it used to trap), on the same ground D2721 refuses a generic function that recurses at a growing type argument. Neither has an owner ruling. Both would reopen together only if the owner chose a uniform generic representation, which would support polymorphic recursion.
 - **H4.1, a `u8` value type.** Brief: `docs/internals/selfhost-gaps.md` §H4.1.
 - **A-destructure.** Object, array and parameter destructuring (`const { x, y } = p`,
   `function f({ x, y }: Pt)`). List destructuring is bounded by the no-tuples ruling.
