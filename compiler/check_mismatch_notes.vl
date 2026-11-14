@@ -6,12 +6,14 @@
 // `mismatchNotesReset` clears both per program; nothing here imports the checker.
 import {
   ArrayLit,
+  Block,
   Call,
   CharLit,
   FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
+  IfStmt,
   ImportDecl,
   Index,
   LetDecl,
@@ -20,12 +22,15 @@ import {
   P,
   Param,
   StrLit,
+  Unary,
   annTsWrittenOf,
   i32ToStr,
   nodeAt,
   tsFnParamNames,
 } from "./ast"
 import { callDeclFnIx, calleeNameOf } from "./check_callee"
+import { lambdaBodyTail } from "./check_expected"
+import { numLexIsFloat } from "./emit_bignum"
 import { nodeTyIxOf } from "./check_node_tys"
 import { fillIsLitZero } from "./check_num_lits"
 import { parenPeelIx } from "./check_places"
@@ -407,10 +412,18 @@ function litMemberAt(srcIx: i32, want: i32, depth: i32, path: string): string {
     }
     return ""
   }
+  // A tail `if` delivers each arm's value, so the first arm that misses is named.
+  if n is IfStmt {
+    const r = litMemberAt(lambdaBodyTail(n.ifThen), want, depth - 1, path)
+    if r != "" || n.ifElse < 0 { return r }
+    const e = if nodeAt(n.ifElse) is Block { lambdaBodyTail(n.ifElse) } else { n.ifElse }
+    return litMemberAt(e, want, depth - 1, path)
+  }
   if !(w is TyUnion) { return "" }
   let kind = ""
   let text = ""
   let shown = ""
+  let isFloat = false
   if n is StrLit {
     kind = "str"
     shown = n.strText
@@ -419,6 +432,15 @@ function litMemberAt(srcIx: i32, want: i32, depth: i32, path: string): string {
     kind = "int"
     shown = n.numText
     text = canonIntLexeme(n.numText)
+    isFloat = numLexIsFloat(n.numText)
+  } else if n is Unary && n.unOp == "-" {
+    // A negated literal is never a member: a literal union spells no negative member.
+    const a = nodeAt(parenPeelIx(n.unArg))
+    if !(a is NumLit) { return "" }
+    kind = "int"
+    shown = "-" + a.numText
+    text = shown
+    isFloat = numLexIsFloat(a.numText)
   } else {
     return ""
   }
@@ -426,10 +448,12 @@ function litMemberAt(srcIx: i32, want: i32, depth: i32, path: string): string {
   let members = ""
   let listed = 0
   let lits = 0
+  let intLits = 0
   for m in w.uMembers {
     const mt = tyAt(m)
     if mt is TyLit {
-      if mt.litKind == kind && mt.litText == text { return "" }
+      if !isFloat && mt.litKind == kind && mt.litText == text { return "" }
+      if mt.litKind == "int" { intLits = intLits + 1 }
       lits = lits + 1
       if listed < 8 {
         if members != "" { members = members + " | " }
@@ -456,6 +480,16 @@ function litMemberAt(srcIx: i32, want: i32, depth: i32, path: string): string {
   }
   let at = ""
   if path != "" { at = " (at `" + path + "`)" }
+  // A float literal against integer members is a kind mismatch, whatever its value.
+  if isFloat && intLits > 0 {
+    return " — `"
+      + shown
+      + "` is an `f64` literal, and the members of "
+      + named
+      + members
+      + " are integers"
+      + at
+  }
   " — `" + shown + "` is not one of " + named + members + at
 }
 

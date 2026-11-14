@@ -159,7 +159,7 @@ const u: R | null = { m: mm }
 const two = 2
 function take(a) {
   print(1)
-  const n = a?.m
+  const n = a?.m ?? (() => 2)
   print(two)
 }
 `;
@@ -211,7 +211,7 @@ Deno.test({
         if (!r.out.includes("emit error")) {
           throw new Error(
             `${s.name}: the instance witness no longer reaches an emit refusal, so this guard ` +
-              `is measuring nothing — replace INSTANCE_WITNESS (D16036 closed?).\n${r.out}`,
+              `is measuring nothing — replace INSTANCE_WITNESS (D3373 closed?).\n${r.out}`,
           );
         }
         const blk = errorBlock(r.out);
