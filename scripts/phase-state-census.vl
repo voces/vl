@@ -1,0 +1,714 @@
+// The phase-state ratchet: compiler state that crosses a phase, globals used as hidden arguments,
+// and the checker symbols other phases import (L5, refactor-notes/2026-11-14-phase-products-design.md).
+//
+//     vl run scripts/phase-state-census.vl [-- --check | --write-baseline | --list] [--root DIR]
+//
+// Per compiler module it counts three things. `hidden`: the module's `let`s some function saves
+// (`const L = G`) and then writes, so that the global carries an argument or a dynamic scope.
+// `cross`: the module's state written in one phase and read in another, or written by two phases.
+// `surface`: for a non-checker module, the distinct checker symbols it imports. `--check` exits 1
+// when any count is above `scripts/phase-state-baseline.txt`, or a module it does not list has
+// one; a count that fell prints and passes. `--write-baseline` records the current counts.
+// Phases are assigned by file name (`phaseOf`). Run it from the checkout root.
+
+import { IoError, writeTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { exit } from "std:process"
+import { parseI32 } from "std:fmt"
+import { join, split, startsWith, trim } from "std:str"
+import { sort } from "std:array"
+import { die } from "./lib/common"
+import {
+  Fn,
+  cutComment,
+  functions,
+  isWord,
+  modules,
+  readOrDie,
+  strip,
+} from "./lib/ladder-walk"
+
+const TOOL = "phase-state-census"
+const BASELINE = "scripts/phase-state-baseline.txt"
+const METRICS = ["hidden", "cross", "surface"]
+
+// One compiler module: its name (`ast.vl`), phase, comment-cut lines, top-level functions, and
+// its imports from sibling modules, local name to `[module, exported name]`.
+type Mod = {
+  file: string,
+  phase: string,
+  lines: string[],
+  fns: Fn[],
+  imp: {[string]: string[]},
+}
+
+// One module-scope declaration that holds state.
+type Decl = {
+  name: string,
+  mod: i32,
+  line: i32,
+  isLet: boolean,
+  writes: i32[][],
+  writePh: string[],
+  readPh: string[],
+}
+
+function has(xs: readonly string[], x: string): boolean {
+  for y in xs {
+    if y == x { return true }
+  }
+  false
+}
+
+function addUniq(xs: string[], x: string) {
+  if !has(xs, x) { xs.push(x) }
+}
+
+function strLess(a: string, b: string): boolean { a < b }
+
+function hasPrefix(b: string, ps: readonly string[]): boolean {
+  for p in ps {
+    if startsWith(b, p) { return true }
+  }
+  false
+}
+
+// The phase a module belongs to, by its file name.
+function phaseOf(file: string): string {
+  const b = file.slice(0, file.length - 3)
+  if (
+    has(
+      [
+        "lexer", "parser", "parse_bank", "parse_image", "tok_load", "ast",
+        "extents", "srcmap", "const_lets",
+      ],
+      b,
+    )
+  ) {
+    return "parse"
+  }
+  if (
+    has(
+      ["bind", "symbols", "intern", "ident_audit", "modid", "missing_import"],
+      b,
+    )
+  ) {
+    return "resolve"
+  }
+  if has(["emit_elab", "elab_fn_id", "elab_stub", "value_reach"], b) {
+    return "elab"
+  }
+  if (
+    has(
+      [
+        "emit_mono", "emit_inst_key", "pin_spell", "call_bind_shadow",
+        "mfr_shadow",
+      ],
+      b,
+    )
+  ) {
+    return "mono"
+  }
+  if (
+    has(
+      [
+        "emit_lift", "emit_rewrite", "emit_collect", "emit_fn_scans",
+        "emit_local_scope",
+      ],
+      b,
+    )
+  ) {
+    return "rewrite"
+  }
+  if (
+    hasPrefix(b, ["check_"])
+    || has(
+      [
+        "typecheck", "tyquery", "tyname", "const_exact", "record_rows",
+        "std_receivers", "memo", "fn_ret_shadow", "box_dst_shadow",
+      ],
+      b,
+    )
+  ) {
+    return "check"
+  }
+  if (
+    hasPrefix(b, ["emit_", "wasm_"])
+    || has(["wasmEmit", "id_shadow_state", "opaque_snames_state"], b)
+  ) {
+    return "emit"
+  }
+  if hasPrefix(b, ["opt_"]) { return "opt" }
+  if (
+    has(
+      ["driver", "entry", "cli", "cli_budget", "cli_util", "iface_hash", "link"],
+      b,
+    )
+  ) {
+    return "driver"
+  }
+  if has(["lint", "format", "fmt_util"], b) { return "tools" }
+  "util"
+}
+
+function isIdStart(c: i32): boolean { isWord(c) && !(c >= '0' && c <= '9') }
+
+// The identifier starting at `i`, or "".
+function identAt(s: string, i: i32): string {
+  if i >= s.length || !isIdStart(s[i]) { return "" }
+  let j = i + 1
+  while j < s.length && isWord(s[j]) { j = j + 1 }
+  s.slice(i, j)
+}
+
+function skipSp(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && (s[j] == ' ' || s[j] == '\t') { j = j + 1 }
+  j
+}
+
+// The sibling imports of a module: every `import { a, b as c } from "./m"`, one or many lines.
+function importsOf(raw: readonly string[]): {[string]: string[]} {
+  const out: {[string]: string[]} = Map()
+  let i = 0
+  while i < raw.length {
+    if startsWith(raw[i], "import ") {
+      const parts: string[] = []
+      let j = i
+      let done = false
+      while j < raw.length && !done {
+        parts.push(cutComment(raw[j]))
+        if raw[j].indexOf("from ") >= 0 { done = true } else { j = j + 1 }
+      }
+      const text = join(parts, " ")
+      const q = text.indexOf("from \"./")
+      const a = text.indexOf("{")
+      const b = text.indexOf("}")
+      if q >= 0 && a >= 0 && b > a {
+        const rest = text.slice(q + 8, text.length)
+        const e = rest.indexOf("\"")
+        const from = rest.slice(0, e) + ".vl"
+        for item in split(text.slice(a + 1, b), ",") {
+          const ws = split(trim(item), " ")
+          const clean: string[] = []
+          for w in ws {
+            if w != "" { clean.push(w) }
+          }
+          if clean.length == 1 { out[clean[0]] = [from, clean[0]] }
+          if clean.length == 3 && clean[1] == "as" {
+            out[clean[2]] = [from, clean[0]]
+          }
+        }
+      }
+      i = j + 1
+    } else {
+      i = i + 1
+    }
+  }
+  out
+}
+
+// Whether line `n` of `raw` is inside an import clause (its first line included).
+function inImport(raw: readonly string[], n: i32): boolean {
+  let j = n
+  while j >= 0 {
+    const l = raw[j]
+    if startsWith(l, "import ") { return true }
+    if j < n && raw[j].indexOf("from ") >= 0 { return false }
+    if l.length > 0 && l[0] != ' ' && l[0] != '\t' && l[0] != '}' {
+      return false
+    }
+    j = j - 1
+  }
+  false
+}
+
+// Per module, each identifier's occurrences as `[line, col]`, skipping a property name (after `.`).
+function wordIndex(lines: readonly string[]): {[string]: i32[][]} {
+  const ix: {[string]: i32[][]} = Map()
+  let n = 0
+  while n < lines.length {
+    const s = lines[n]
+    let i = 0
+    while i < s.length {
+      const c = s[i]
+      if c == '"' || c == '\'' {
+        i = i + 1
+        while i < s.length && s[i] != c {
+          if s[i] == '\\' { i = i + 1 }
+          i = i + 1
+        }
+        i = i + 1
+      } else if (
+        isIdStart(c)
+        && (i == 0 || (!isWord(s[i - 1]) && s[i - 1] != '.' && s[i - 1] != '$'))
+      ) {
+        const w = identAt(s, i)
+        const at = ix[w] ?? []
+        at.push([n, i])
+        ix[w] = at
+        i = i + w.length
+      } else {
+        i = i + 1
+      }
+    }
+    n = n + 1
+  }
+  ix
+}
+
+const MUTATORS = [
+  "push", "pop", "set", "delete", "clear", "insert", "splice", "shift",
+  "unshift",
+]
+
+// Whether the occurrence of `name` at column `i` of `s` is a write: `G =`, `G[…] =`, `G.f =`, or a
+// mutator call on `G` or a field path under it.
+function isWriteAt(s: string, i: i32, name: string): boolean {
+  let j = i + name.length
+  let last = ""
+  let more = true
+  while more && j < s.length {
+    if s[j] == '.' {
+      last = identAt(s, j + 1)
+      if last == "" { more = false } else { j = j + 1 + last.length }
+    } else if s[j] == '[' {
+      let d = 1
+      j = j + 1
+      while j < s.length && d > 0 {
+        if s[j] == '[' { d = d + 1 }
+        if s[j] == ']' { d = d - 1 }
+        j = j + 1
+      }
+      last = ""
+    } else {
+      more = false
+    }
+  }
+  if j < s.length && s[j] == '(' && last != "" && has(MUTATORS, last) {
+    return true
+  }
+  const k = skipSp(s, j)
+  k < s.length && s[k] == '=' && (k + 1 >= s.length || s[k + 1] != '=')
+}
+
+// The column-0 declaration on `s`: `[name, "let"|"const"]`, or [].
+function declOn(s: string): string[] {
+  let i = 0
+  if startsWith(s, "export ") { i = 7 }
+  let kind = ""
+  if s.slice(i, i + 4) == "let " { kind = "let" }
+  if s.slice(i, i + 6) == "const " { kind = "const" }
+  if kind == "" { return [] }
+  const name = identAt(s, i + kind.length + 1)
+  if name == "" { return [] }
+  [name, kind]
+}
+
+// The top-level function holding line `n`, or -1.
+function fnAt(fns: readonly Fn[], n: i32): i32 {
+  let k = 0
+  while k < fns.length {
+    if n >= fns[k].lo && n <= fns[k].hi { return k }
+    k = k + 1
+  }
+  -1
+}
+
+// Whether module `m` may name decl `d`: its own module, or a module importing it from there.
+function sees(mods: readonly Mod[], d: Decl, m: i32): boolean {
+  if m == d.mod { return true }
+  const im = mods[m].imp[d.name] ?? []
+  im.length == 2 && im[0] == mods[d.mod].file && im[1] == d.name
+}
+
+function isLiteralReset(rhs: string): boolean {
+  has(["-1", "0 - 1", "0", "\"\"", "false", "[]", "Map()"], rhs)
+}
+
+// The counts, per metric then per module.
+type Counts = { by: {[string]: {[string]: i32}}, list: string[], distinct: i32 }
+
+function census(root: string): Counts {
+  const mods: Mod[] = []
+  const raws: string[][] = []
+  for pair in modules(TOOL, root) {
+    const file = pair[0].slice(9, pair[0].length)
+    const raw = split(readOrDie(TOOL, pair[1]), "\n")
+    const lines: string[] = []
+    for l in raw { lines.push(cutComment(l)) }
+    mods.push(
+      {
+        file: file,
+        phase: phaseOf(file),
+        lines: lines,
+        fns: functions(raw),
+        imp: importsOf(raw),
+      },
+    )
+    raws.push(raw)
+  }
+  const ixs: {[string]: i32[][]}[] = []
+  for m in mods { ixs.push(wordIndex(m.lines)) }
+  const modIx: {[string]: i32} = Map()
+  let mi = 0
+  while mi < mods.length {
+    modIx[mods[mi].file] = mi
+    mi = mi + 1
+  }
+  // Declarations, and the modules that see each.
+  const decls: Decl[] = []
+  const seers: i32[][] = []
+  mi = 0
+  while mi < mods.length {
+    let n = 0
+    while n < mods[mi].lines.length {
+      const dk = declOn(mods[mi].lines[n])
+      if dk.length == 2 {
+        decls.push(
+          {
+            name: dk[0],
+            mod: mi,
+            line: n,
+            isLet: dk[1] == "let",
+            writes: [],
+            writePh: [],
+            readPh: [],
+          },
+        )
+      }
+      n = n + 1
+    }
+    mi = mi + 1
+  }
+  for d in decls {
+    const vis: i32[] = [d.mod]
+    let m = 0
+    while m < mods.length {
+      if m != d.mod && sees(mods, d, m) { vis.push(m) }
+      m = m + 1
+    }
+    seers.push(vis)
+  }
+  // Writes, then setters (an exported function of at most three body lines that writes a decl).
+  let di = 0
+  while di < decls.length {
+    const d = decls[di]
+    for m in seers[di] {
+      for at in ixs[m][d.name] ?? [] {
+        const n = at[0]
+        if (
+          !(m == d.mod && n == d.line)
+          && !inImport(raws[m], n)
+          && isWriteAt(mods[m].lines[n], at[1], d.name)
+        ) {
+          d.writes.push([m, n])
+        }
+      }
+    }
+    di = di + 1
+  }
+  const setterOf: {[string]: i32} = Map()
+  di = 0
+  while di < decls.length {
+    for w in decls[di].writes {
+      const k = fnAt(mods[w[0]].fns, w[1])
+      if k >= 0 {
+        const f = mods[w[0]].fns[k]
+        if f.hi - f.lo - 1 <= 3 && startsWith(raws[w[0]][f.lo], "export ") {
+          setterOf[mods[w[0]].file + "#" + f.name] = di
+        }
+      }
+    }
+    di = di + 1
+  }
+  for key in setterOf.keys() {
+    const parts = split(key, "#")
+    const d = decls[setterOf[key] ?? 0]
+    let m = 0
+    while m < mods.length {
+      const im = mods[m].imp[parts[1]] ?? []
+      if im.length == 2 && im[0] == parts[0] && im[1] == parts[1] {
+        for at in ixs[m][parts[1]] ?? [] {
+          const s = mods[m].lines[at[0]]
+          const e = skipSp(s, at[1] + parts[1].length)
+          if (
+            e < s.length
+            && s[e] == '('
+            && !inImport(raws[m], at[0])
+            && fnHeadAt(raws[m][at[0]]) == ""
+          ) {
+            d.writes.push([m, at[0]])
+          }
+        }
+      }
+      m = m + 1
+    }
+  }
+  // State is every `let`, and every `const` some module writes; then reads and phases.
+  const state: i32[] = []
+  di = 0
+  while di < decls.length {
+    const d = decls[di]
+    if d.isLet || d.writes.length > 0 {
+      state.push(di)
+      for w in d.writes { addUniq(d.writePh, mods[w[0]].phase) }
+      for m in seers[di] {
+        for at in ixs[m][d.name] ?? [] {
+          const n = at[0]
+          if (
+            !(m == d.mod && n == d.line)
+            && !inImport(raws[m], n)
+            && !isWriteAt(mods[m].lines[n], at[1], d.name)
+          ) {
+            addUniq(d.readPh, mods[m].phase)
+          }
+        }
+      }
+    }
+    di = di + 1
+  }
+  const by: {[string]: {[string]: i32}} = Map()
+  for k in METRICS { by[k] = Map() }
+  const list: string[] = []
+  const cross = by["cross"] ?? Map()
+  for si in state {
+    const d = decls[si]
+    let isCross = d.writePh.length > 1
+    for w in d.writePh {
+      for r in d.readPh {
+        if w != r { isCross = true }
+      }
+    }
+    if isCross {
+      const f = mods[d.mod].file
+      cross[f] = (cross[f] ?? 0) + 1
+      list.push(
+        "cross\t\{f}:\{d.line + 1}\t\{d.name}\tw[\{join(d.writePh, ",")}] r[\{join(d.readPh, ",")}]",
+      )
+    }
+  }
+  // Hidden arguments: `const L = G` in a function, G a state `let` the module sees, then `G = …`.
+  const hidden = by["hidden"] ?? Map()
+  const hiddenSeen: {[string]: boolean} = Map()
+  const letByName: {[string]: i32[]} = Map()
+  for si in state {
+    if decls[si].isLet {
+      const at = letByName[decls[si].name] ?? []
+      at.push(si)
+      letByName[decls[si].name] = at
+    }
+  }
+  mi = 0
+  while mi < mods.length {
+    const md = mods[mi]
+    for f in md.fns {
+      let n = f.lo + 1
+      while n < f.hi {
+        const s = md.lines[n]
+        const t = strip(s)
+        if startsWith(t, "const ") {
+          const loc = identAt(t, 6)
+          const k = skipSp(t, 6 + loc.length)
+          if loc != "" && k + 1 < t.length && t[k] == '=' && t[k + 1] == ' ' {
+            const g = trim(t.slice(k + 1, t.length))
+            if identAt(g, 0) == g && g != "" {
+              let dsel = -1
+              for c in letByName[g] ?? [] {
+                if dsel < 0 && sees(mods, decls[c], mi) { dsel = c }
+              }
+              if dsel >= 0 {
+                const verdict = hiddenShape(md.lines, n, f.hi, g, loc)
+                if verdict != "" {
+                  const key = decls[dsel].name
+                    + "@"
+                    + mods[decls[dsel].mod].file
+                  if !(hiddenSeen[key] ?? false) {
+                    hiddenSeen[key] = true
+                    const df = mods[decls[dsel].mod].file
+                    hidden[df] = (hidden[df] ?? 0) + 1
+                  }
+                  list.push(
+                    "hidden\t\{df2(mods, decls[dsel])}\t\{g}\t\{verdict} in \{f.name} \{md.file}:\{n + 1}",
+                  )
+                }
+              }
+            }
+          }
+        }
+        n = n + 1
+      }
+    }
+    mi = mi + 1
+  }
+  // The checker's surface: distinct checker symbols each non-checker module imports.
+  const surface = by["surface"] ?? Map()
+  const syms: {[string]: boolean} = Map()
+  for md in mods {
+    if md.phase != "check" {
+      let c = 0
+      for local in md.imp.keys() {
+        const im = md.imp[local] ?? []
+        const src = modIx[im[0]] ?? -1
+        if src >= 0 && mods[src].phase == "check" {
+          c = c + 1
+          syms[im[0] + "#" + im[1]] = true
+        }
+      }
+      if c > 0 { surface[md.file] = c }
+    }
+  }
+  let distinct = 0
+  for _ in syms.keys() { distinct = distinct + 1 }
+  { by: by, list: list, distinct: distinct }
+}
+
+function df2(mods: readonly Mod[], d: Decl): string {
+  "\{mods[d.mod].file}:\{d.line + 1}"
+}
+
+// A column-0 function header's name, or "".
+function fnHeadAt(s: string): string {
+  let i = 0
+  if startsWith(s, "export ") { i = 7 }
+  if s.slice(i, i + 9) != "function " { return "" }
+  identAt(s, i + 9)
+}
+
+// `consumed` when the first write of `g` after line `n` is a literal reset within three lines,
+// `scoped` when some later write is not, "" when `g` is never written again before `hi`.
+function hiddenShape(
+  lines: readonly string[],
+  n: i32,
+  hi: i32,
+  g: string,
+  loc: string,
+): string {
+  let j = n + 1
+  let first = ""
+  let gap = 0
+  let any = false
+  while j < hi {
+    const t = strip(lines[j])
+    if startsWith(t, g) && identAt(t, 0) == g {
+      const k = skipSp(t, g.length)
+      if k < t.length && t[k] == '=' && (k + 1 >= t.length || t[k + 1] != '=') {
+        const rhs = trim(t.slice(k + 1, t.length))
+        any = true
+        if rhs != loc && first == "" {
+          first = rhs
+          gap = j - n
+        }
+      }
+    }
+    j = j + 1
+  }
+  if !any { return "" }
+  if first != "" && isLiteralReset(first) && gap <= 3 { return "consumed" }
+  "scoped"
+}
+
+function totalOf(m: {[string]: i32}): i32 {
+  let t = 0
+  for k in m.keys() { t = t + (m[k] ?? 0) }
+  t
+}
+
+function baselineText(c: Counts): string {
+  const out: string[] = [
+    "# phase-state counts per module: vl run scripts/phase-state-census.vl -- --write-baseline",
+  ]
+  for k in METRICS {
+    const m = c.by[k] ?? Map()
+    const files: string[] = []
+    for f in m.keys() { files.push(f) }
+    sort(files, strLess)
+    for f in files { out.push("\{k}\t\{m[f] ?? 0}\t\{f}") }
+  }
+  join(out, "\n") + "\n"
+}
+
+function readBaseline(path: string): {[string]: i32} {
+  const out: {[string]: i32} = Map()
+  for l in split(readOrDie(TOOL, path), "\n") {
+    if l != "" && l[0] != '#' {
+      const p = split(l, "\t")
+      if p.length == 3 {
+        const n = parseI32(p[1])
+        out[p[0] + "\t" + p[2]] = if n is i32 { n } else { 0 }
+      }
+    }
+  }
+  out
+}
+
+function main() {
+  const args = programArgs()
+  if args is Utf8Error {
+    die("\{TOOL}: an argument is not UTF-8", 2)
+    return
+  }
+  let root = "."
+  let mode = "summary"
+  let i = 0
+  while i < args.length {
+    const a = args[i]
+    if a == "--root" && i + 1 < args.length {
+      root = args[i + 1]
+      i = i + 1
+    } else if a == "--check" || a == "--write-baseline" || a == "--list" {
+      mode = a
+    } else {
+      die("\{TOOL}: unknown argument \{a}", 2)
+    }
+    i = i + 1
+  }
+  const c = census(root)
+  const path = "\{root}/\{BASELINE}"
+  print("hidden \{totalOf(c.by["hidden"] ?? Map())} globals")
+  print("cross \{totalOf(c.by["cross"] ?? Map())} tables")
+  print(
+    "surface \{totalOf(c.by["surface"] ?? Map())} imports of \{c.distinct} distinct checker symbols",
+  )
+  if mode == "--list" {
+    for l in c.list { print(l) }
+    return
+  }
+  if mode == "--write-baseline" {
+    const w = writeTextFile(path, baselineText(c))
+    if w is IoError { die("\{TOOL}: cannot write \{path} (\{w.msg})", 2) }
+    print("\{TOOL}: wrote \{path}")
+    return
+  }
+  if mode != "--check" { return }
+  const base = readBaseline(path)
+  let rose = 0
+  for k in METRICS {
+    const m = c.by[k] ?? Map()
+    for f in m.keys() {
+      const now = m[f] ?? 0
+      const was = base[k + "\t" + f] ?? 0
+      if now > was {
+        print(
+          "\{TOOL}: \{k} rose in compiler/\{f}: \{was} -> \{now} (vl run scripts/phase-state-census.vl -- --list names each)",
+        )
+        rose = rose + 1
+      }
+    }
+  }
+  for key in base.keys() {
+    const p = split(key, "\t")
+    const now = (c.by[p[0]] ?? Map())[p[1]] ?? 0
+    const was = base[key] ?? 0
+    if now < was {
+      print(
+        "\{TOOL}: \{p[0]} fell in compiler/\{p[1]}: \{was} -> \{now}; run --write-baseline in this PR",
+      )
+    }
+  }
+  if rose > 0 { exit(1) }
+  print("\{TOOL}: ok")
+}
+
+main()
