@@ -13290,6 +13290,10 @@ function elabHeldClosedTyAt(
       return mkObjTy(names, tys)
     }
     TyMap => {
+      // A fresh `Map()` here holds what the writes into this slot of the holder store (D16201).
+      if vals.length > 0 && holder >= 0 && elabAllFreshMaps(vals) {
+        return elabFreshMapSlotTy(o, depth, holder, path, k)
+      }
       // A binding stored here is built at its own type, which a reader settles before asking.
       if vals.length > 0 { return -1 }
       const hm = elabHoleMapClosed(t)
@@ -13311,6 +13315,62 @@ function elabHeldClosedTyAt(
       return -1
     }
   }
+}
+
+// Whether every value of `vals` is a fresh `Map()` call with no arguments.
+function elabAllFreshMaps(vals: i32[]): boolean {
+  for v in vals {
+    const x = parenPeelIx(v)
+    if x < 0 || x >= P.nodes.length { return false }
+    const c = nodeAt(x)
+    if !(c is Call) || c.callArgs.length != 0 || c.callFn < 0 { return false }
+    const f = parenPeelIx(c.callFn)
+    if f < 0 || f >= P.nodes.length { return false }
+    const fn = nodeAt(f)
+    if !(fn is Ident) || fn.identName != "Map" || identDeclOf(f) >= 0 {
+      return false
+    }
+  }
+  true
+}
+
+// The closed type of map `o` a fresh `Map()` at slot `path` of `holder` takes from the values the
+// holder's writes store there; -1 where none is written, a write is not followed, or one does not
+// close.
+function elabFreshMapSlotTy(
+  o: TyMap,
+  depth: i32,
+  holder: i32,
+  path: string[],
+  k: i32,
+): i32 {
+  const cp: string[] = []
+  for st in path {
+    if st == "e" || st == "v" {
+      cp.push("[]")
+    } else if st.length > 2 && st.slice(0, 2) == "f." {
+      cp.push(st.slice(2, st.length))
+    } else {
+      return -1
+    }
+  }
+  cp.push("[]")
+  const mv: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(holder, cp, mv, ats) < 0 || mv.length == 0 {
+    return -1
+  }
+  const v = elabHeldClosedTyAt(
+    o.mVal,
+    mv,
+    depth + 1,
+    holder,
+    elabPathPlus(path, "v"),
+    k,
+  )
+  if v < 0 || tyHasTyVar(v) { return -1 }
+  const kt = if tyHasInferHole(o.mKey, 0) { TY_STR } else { o.mKey }
+  if tyHasTyVar(kt) { -1 } else { mkMapTy(kt, v, o.mSet) }
 }
 
 // Adds the functions stored value `x` holds to `ds`: a declaration, or one a name reads; any other
@@ -18295,6 +18355,61 @@ export function litRepTyOneClosed(ix: i32): i32 {
     i = i + 2
   }
   one
+}
+
+// The closed record the elaboration's slot fact gives record literal `ix`, the initialiser of an
+// un-annotated `const` binding or a record field nested in it, where the literal's own type is
+// open and the record holds a map; -1 otherwise (D16201).
+export function elabLitBindingFact(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is ObjLit) { return -1 }
+  const own = nodeTyIxOf(ix)
+  if own < 0 || own >= T.tys.length || !tyReachesHole(own, 16) { return -1 }
+  cwIxWant()
+  // A literal nested as a field of the initialiser is that field's slot of the binding.
+  const steps: string[] = []
+  let u = ix
+  while cwIxCovers(u) && cwIxUpKind[u] == CW_UP_FIELD && steps.length < 8 {
+    const fi = nodeAt(cwIxUpAux[u])
+    if !(fi is FieldInit) { return -1 }
+    steps.push("f." + fi.fiName)
+    u = cwIxUp[u]
+    if u < 0 || u >= P.nodes.length || !(nodeAt(u) is ObjLit) { return -1 }
+  }
+  if !cwIxCovers(u) || cwIxUpKind[u] != CW_UP_LETINIT { return -1 }
+  const d = cwIxUp[u]
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return -1 }
+  const path: string[] = []
+  let j = steps.length - 1
+  while j >= 0 {
+    path.push(steps[j])
+    j = j - 1
+  }
+  const t = elabSlotTyAt(d, path, -1)
+  if (
+    t < 0
+    || t >= T.tys.length
+    || !(tyAt(t) is TyObj)
+    || tyHasTyVar(t)
+    || tyReachesHole(t, 16)
+    || fnTagHoldsTy(t, 4)
+    || !elabObjHoldsMap(t, 0)
+  ) {
+    return -1
+  }
+  t
+}
+
+// Whether record type `t` holds a map in a field, through nested records.
+function elabObjHoldsMap(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth > 8 { return false }
+  const o = tyAt(t)
+  if !(o is TyObj) { return false }
+  for ft in o.objFieldTypes {
+    const f = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+    if f is TyMap || elabObjHoldsMap(ft, depth + 1) { return true }
+  }
+  false
 }
 
 // The type literal `ix` (or its copy source) is built at in emitted function `fnIx`'s instance:
