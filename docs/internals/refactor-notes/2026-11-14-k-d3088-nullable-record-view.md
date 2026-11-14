@@ -1,6 +1,6 @@
 # D3088: a nullable record row delivered as a readonly union list is its twin's view, 2026-11-14
 
-Lane K, bucket (f). Closes D3088. Files D16334 and D16335 (clause 1), found grading D16310.
+Lane K, bucket (f). Closes D3088.
 
 ## Mechanism
 
@@ -27,15 +27,6 @@ Fixpoint seeds on both sides, `--before` master `4b94dbf0`.
 - **New `nullable-record-list-as-readonly-union-view.matrix.vl`:** the six capture cells (an
   annotated and an un-annotated lambda, and a write after the delivery, in both faces) move to
   RUNS. 56 of 56 graded, with 0 runs→not-runs and 0 silent.
-- **The 20 templates naming `readonly`, `regress.vl`, deno and the fast gates:** see the PR.
-
-## Found on the way (clause 1, not fixed here)
-
-- **D16334:** a result of `use(lap)`, where `lap` calls its own parameter, set into an
-  un-annotated map and bound, reads back `null`.
-- **D16335:** the same result is accepted at any annotated type. `const s: boolean = use(lap)` is
-  check-clean and prints `true`.
-
-The check leaves the call's result an open hole when the lambda argument's parameter is fixed only
-by the callee's own body. A direct call `lap((a) => a * 10)` is typed `i32`. Handed to the
-coordinator, since it is the elaboration's typing of a call through a value of one known member.
+- **The 26 templates naming `readonly`:** 0 runs→not-runs.
+- **`regress.vl`:** 0 of 12,013 distilled cells change class.
+- **Other gates:** `deno task test` 8,946 / 0. rep-fuzz is exact, and lint-self is clean.
