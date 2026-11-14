@@ -1,6 +1,7 @@
 import { identTyOf } from "./check_nar_store"
 import { slotNameOf } from "./check_scopes"
 import { elabCapReset } from "./check_elab_cap"
+import { fnFlowReadsForce, fnFlowReadsSeen } from "./check_narrow_flow"
 import {
   cpAccEmpty,
   cpAccLoad,
@@ -1168,7 +1169,17 @@ function pipelineReset(): i32 {
 }
 
 // 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error.
-export function compileSrc(): i32 { compileSrcOnce() }
+export function compileSrc(): i32 {
+  fnFlowReadsForce(false)
+  const rc = compileSrcOnce()
+  if rc != 2 || !fnFlowReadsSeen() { return rc }
+  // A program the whole-set typing of a re-pointed function `let` refused compiles again with
+  // each read taking that binding's most recent write (D15956, D15957).
+  fnFlowReadsForce(true)
+  const again = compileSrcOnce()
+  fnFlowReadsForce(false)
+  again
+}
 
 function compileSrcOnce(): i32 {
   plusLinksClear()
@@ -1272,11 +1283,23 @@ export function rbyteStore(off: i32, count: i32): i32 {
 // valid program the emitter cannot yet lower — an emit-coverage gap is not a check
 // failure. Shares the diagnostic stores (`diagLen`/`diagAt`) with `compileSrc`.
 export function checkSrc(): i32 {
+  fnFlowReadsForce(false)
+  const rc = checkSrcGo()
+  if rc != 2 || !fnFlowReadsSeen() { return rc }
+  // As `compileSrc` retries a refused program under the narrowed reads.
+  fnFlowReadsForce(true)
+  const again = checkSrcGo()
+  fnFlowReadsForce(false)
+  again
+}
+
+// `checkSrc` under the current read narrowing.
+function checkSrcGo(): i32 {
   // Instances' diagnostics are the program's only when they belong to the program a build
   // keeps: where they arise, the build decides, and a clean build checks again without them.
   const rc = checkSrcOnce()
   if elabErrorCount() == 0 { return rc }
-  const built = compileSrc()
+  const built = compileSrcOnce()
   elabErrorsMuteSet(built == 0)
   const again = checkSrcOnce()
   // The diagnostics that stand are type errors, which a caller reads only on a non-zero rc.

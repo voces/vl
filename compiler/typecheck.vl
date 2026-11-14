@@ -10,10 +10,12 @@
 
 import { idShadowNote } from "./id_shadow_state"
 import { identReadFnOfWrite, identTyOf, narTyAtDepth } from "./check_nar_store"
-import { letReadFnNote } from "./check_write_scan"
+import { cwFrameReset, letReadFnNote } from "./check_write_scan"
 import { identDepthOf, identFnDeclOf } from "./check_scopes"
 import {
   ArrayLit,
+  arenaSetNode,
+  Node,
   AsExpr,
   BinExpr,
   Block,
@@ -159,7 +161,7 @@ import {
   letDeclBoundRecord,
 } from "./check_statements"
 import { symUse } from "./check_sym_occ"
-import { identDeclOf } from "./symbols"
+import { identDeclOf, sidNoteNodeName } from "./symbols"
 import { nodeTyIxOf } from "./check_node_tys"
 import { checkProgramNode } from "./check_top_level"
 import {
@@ -294,6 +296,9 @@ function checkNumLitNode(n: NumLit, ix: i32): i32 {
 // A bare-name read's type: a parameter default's module-frame read, a literal `const`'s
 // literal, or the scope's binding with its use, capture and definite-assignment notes.
 // An unbound name is the undeclared-identifier floor.
+// The read a re-pointed `let`'s rewrite last renamed: its occurrence is the binding's, recorded once.
+let idRewroteRead = -1
+
 function checkIdentNode(n: Ident, ix: i32): i32 {
   // A marked parameter default resolves in the declaration's scope — for the one name form
   // v1 admits, the module frame. Checked once at the declaration and again at every call
@@ -340,9 +345,25 @@ function checkIdentNode(n: Ident, ix: i32): i32 {
   }
   let ty = identTyOf(ix, n.identName)
   if ix == daWriteTarget { ty = letWriteTargetTy(ix, n.identName, ty) }
-  // An instance's re-check reads at its own binding; the program's read keeps what it holds.
+  // A read of a re-pointed `let` that holds one declared function alone, the one its most recent
+  // write stored, is that function's name (D15956, D15957). An instance's re-check reads at its
+  // own binding, so only the program's read is rewritten.
   if ix != daWriteTarget && !elabCapLive() {
-    letReadFnNote(ix, identDeclOf(ix), identReadFnOfWrite(ix, ty))
+    const rf = identReadFnOfWrite(ix, ty)
+    if rf >= 0 {
+      letReadFnNote(ix, identDeclOf(ix), rf)
+      const rfn = nodeAt(rf)
+      if rfn is FuncDecl && rfn.fnName != "" {
+        if symEnabled != 0 { symUse(ix, n.identName, ty) }
+        const nn: Node = { identName: rfn.fnName, pos: n.pos }
+        arenaSetNode(ix, nn)
+        sidNoteNodeName(ix, rf)
+        // The occurrence index filed this read under the binding's name.
+        cwFrameReset()
+        idRewroteRead = ix
+        return checkNodeReal(ix)
+      }
+    }
   }
   // A module name declared as both a function and a value is refused as redeclared; which
   // of the two a read means is unknowable, so the read is that error's cascade.
@@ -370,7 +391,7 @@ function checkIdentNode(n: Ident, ix: i32): i32 {
   }
   // `ty` is this use's type as the checker resolved it — narrowed when the use
   // sits inside a guarded arm. Threaded in so the occurrence retains it.
-  if symEnabled != 0 { symUse(ix, n.identName, ty) }
+  if symEnabled != 0 && ix != idRewroteRead { symUse(ix, n.identName, ty) }
   if ovSetMod.length > 0 && ix != ckCalleeIx {
     ovNoteFnValue(ix, n.identName, ty)
   }
