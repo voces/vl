@@ -11903,3 +11903,20 @@ type L<T> = { v: T, next: L<L<T>> | null }                                // ref
 **Later.** Supporting them through a uniform (boxed) representation for exactly the generics the
 growth test flags is backlogged in ROADMAP.md, not rejected. Capping the nesting depth was not
 taken: whether a program ran would depend on its input, not its types.
+
+## The seed sidecar is trusted by its directory, not by a digest (2026-11-14) — engineering review 2026-11, Small 1
+
+The on-disk seed's `.cwasm` sidecar is handed to `Module::deserialize_file` only when its
+directory passes the user-module cache's `private_cache_dir` (owned by this user, not writable by
+group or others). A directory that fails it runs the seed uncached, with one stderr line naming
+why, so the cost is visible.
+
+The module cache's full envelope (SHA-256 of the artifact checked before every load) was built and
+measured first. The seed's sidecar is 46 MB, and hashing it costs 36 ms on a SHA-NI box. A warm
+`vl run hello.vl` went from 21.7 to 120.4 ms (median of 15, interleaved) and peak RSS from 58 to
+98 MB, because the file is read and copied rather than mapped. Compile time ranks first, so the
+envelope was not taken.
+
+Neither the check nor a digest defends a sidecar committed to a checkout the user cloned: the user
+owns those files, and a digest is not a MAC. That needs a key the checkout cannot hold, which is
+the open ruling "The seed sidecar's trust" in `docs/internals/open-rulings.md`.
