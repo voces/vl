@@ -396,6 +396,20 @@ The order is forced:
 
 Stage 0 is a separate small PR so that lane E can build on it the same day.
 
+### 3.1 Amendments after the first stages
+
+- **1e is deferred to L1** (coordinator ruling). Mono binds type-parameter *names* to spellings:
+  49 functions take the `tvN`/`tvV` lists, with 334 references in `emit_mono.vl`. So
+  `tyVarRenameRow` and the `__sh` shadow alias retire only when mono instantiates into IR.
+- **Fit with L5** (`2026-11-14-phase-products-design.md` §3–4):
+  - **Intern resets.** From stage 3, the intern table has exactly two entry points,
+    `internSessionReset` and `internProgramReset`, and no other code clears it.
+  - **`DeclKey`.** Nominal keys (stage 3) and type-parameter binders (stage 1's `tvBinder`) go
+    through one `declKeyOf(node)` function. Stage 2b routes the existing binders through it. L5's
+    step 6 re-points it from `NodeId` to `SymId`.
+  - **Order.** Stage 2 precedes L5 step 3 (`CheckRun`), and L5 step 1 (`InstReq`) precedes stage 5,
+    so the id-vector instance key reads `InstReq`.
+
 ## 4. Measured cost
 
 ### 4.1 Today

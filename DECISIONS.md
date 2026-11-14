@@ -11904,12 +11904,21 @@ type L<T> = { v: T, next: L<L<T>> | null }                                // ref
 growth test flags is backlogged in ROADMAP.md, not rejected. Capping the nesting depth was not
 taken: whether a program ran would depend on its input, not its types.
 
-## The seed sidecar is trusted by its directory, not by a digest (2026-11-14) — engineering review 2026-11, Small 1
+## The seed sidecar lives only in the user's private cache (2026-11-14) — engineering review 2026-11, Small 1
 
-The on-disk seed's `.cwasm` sidecar is handed to `Module::deserialize_file` only when its
-directory passes the user-module cache's `private_cache_dir` (owned by this user, not writable by
-group or others). A directory that fails it runs the seed uncached, with one stderr line naming
-why, so the cost is visible.
+**Ruled by the owner 2026-11-14: option C.** The on-disk seed's compiled `.cwasm` is read and
+written only in the seed cache, `$VL_SEED_CACHE_DIR` (default `seed/` under the user cache root),
+named `seed-<content key>-<engine tag>.cwasm`, and never beside the seed. It is handed to
+`Module::deserialize_file` only when that directory passes `private_cache_dir` (owned by this user,
+not writable by group or others). A directory that fails it runs the seed uncached, with one stderr
+line naming why, so the cost is visible. A `.cwasm` committed to a checkout the user cloned is
+never read, because nothing looks in the checkout.
+
+The seed cache is separate from `$VL_CACHE_DIR` so a test or tool that isolates its module cache
+does not recompile the seed on every run. Entries are keyed by content, so every copy of a seed
+shares them, and the eight most recently used seeds are kept. CI points `$VL_SEED_CACHE_DIR` at
+`$RUNNER_TEMP/vl-seed-cache` and caches that directory. `vl seed --cache-dir` and
+`--cache-files` name the directory and a seed's entries for scripts.
 
 The module cache's full envelope (SHA-256 of the artifact checked before every load) was built and
 measured first. The seed's sidecar is 46 MB, and hashing it costs 36 ms on a SHA-NI box. A warm
@@ -11917,9 +11926,10 @@ measured first. The seed's sidecar is 46 MB, and hashing it costs 36 ms on a SHA
 98 MB, because the file is read and copied rather than mapped. Compile time ranks first, so the
 envelope was not taken.
 
-Neither the check nor a digest defends a sidecar committed to a checkout the user cloned: the user
-owns those files, and a digest is not a MAC. That needs a key the checkout cannot hold, which is
-the open ruling "The seed sidecar's trust" in `docs/internals/open-rulings.md`.
+Neither the directory check nor a digest could defend a sidecar committed to a checkout the user
+cloned: the user owns those files, and a digest is not a MAC. Option B, a per-user HMAC key and a
+`.seal` beside each sidecar, was the alternative; C closes the hole with no key and no new file,
+at the price of a first-run JIT in a fresh cache (measured ~12 s for one engine configuration).
 
 ## A record-typed parameter is row-polymorphic, specialised per concrete row (2026-11-14) — engineering review 2026-11, L3
 

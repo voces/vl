@@ -281,10 +281,14 @@ Deno.test("enumerateWorkspaceFiles: lists .vl files and skips excluded dirs", ()
   //       lib.vl
   //     sub/
   //       helper.vl
+  //     dist/ reference/ ← a user's own dirs, walked as `vl check` walks them
+  //       a.vl
   const tree: Record<string, string[]> = {
-    "/proj": ["main.vl", "util.vl", "node_modules", "sub"],
+    "/proj": ["main.vl", "util.vl", "node_modules", "sub", "dist", "reference"],
     "/proj/node_modules": ["lib.vl"],
     "/proj/sub": ["helper.vl"],
+    "/proj/dist": ["a.vl"],
+    "/proj/reference": ["a.vl"],
   };
   const listDir = (dir: string): string[] => tree[dir] ?? [];
   const isDir = (path: string): boolean => path in tree;
@@ -295,6 +299,8 @@ Deno.test("enumerateWorkspaceFiles: lists .vl files and skips excluded dirs", ()
   assert(names.includes("main.vl"), "main.vl should be found");
   assert(names.includes("util.vl"), "util.vl should be found");
   assert(names.includes("sub/helper.vl"), "sub/helper.vl should be found");
+  assert(names.includes("dist/a.vl"), "dist/a.vl should be found");
+  assert(names.includes("reference/a.vl"), "reference/a.vl should be found");
   assert(
     !names.some((n) => n.includes("node_modules")),
     "node_modules must be skipped",
