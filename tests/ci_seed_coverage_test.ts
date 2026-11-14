@@ -38,10 +38,12 @@ const namesSeed = (src: string): boolean =>
   src.includes("vl-compiler.wasm") || /\bCOMPILER\b/.test(src);
 
 // A file is seed-backed if it NAMES the seed AND gates on its presence (the
-// `statSync`/`exists(` self-ignore). Both must hold so a passing mention (e.g. a
-// comment) doesn't count.
+// `statSync`/`exists(`/`seedPresent(` self-ignore). Both must hold so a passing
+// mention (e.g. a comment) doesn't count.
 const isSeedBacked = (src: string): boolean =>
-  namesSeed(src) && (src.includes("statSync") || src.includes("exists("));
+  namesSeed(src) &&
+  (src.includes("statSync") || src.includes("exists(") ||
+    src.includes("seedPresent("));
 
 // A test whose driver lives in `tests/support/` INHERITS its seed-backing. The
 // corpus-oracle shards are three lines each (`registerCorpusOracle(k, n)`) and
