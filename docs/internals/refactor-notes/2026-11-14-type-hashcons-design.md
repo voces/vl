@@ -243,6 +243,14 @@ That is a mutable cell spelled as a sentinel. Instead:
   which every id it holds is final. Mono's instance re-checks mint their own holes (their own
   binder), so solving those never changes a sealed id. The one emit-phase bump measured, in
   `scripts/dup-census.vl`, is stage 2's first acceptance check.
+- **Emit-phase pins are not rare on generic programs.** The self-compile has no type parameters.
+  Lane E's stage-0 count on the distilled corpus found 107 `tyMutEpoch` moves in 103 programs, all
+  in the monomorphizing phase. So stage 2 does not seal globally. Instead:
+  - Each mono instance re-check gets its own hole binders, scoped to that instance.
+  - The seal covers ids minted before emit.
+  - A pin during emit solves only instance-scoped holes.
+  - Stage 2's acceptance is that the 103 programs' bumps all land on instance-scoped holes. A bump
+    that lands on a pre-emit row is a named finding, fixed before stage 4 drops the epoch.
 
 ### 2.3 Nominal rows are keyed by their declaration
 
