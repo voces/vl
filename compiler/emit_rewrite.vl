@@ -2828,6 +2828,15 @@ function spillTypeByTarget(decl: i32, rd: i32, t: i32) {
 // The declarations read, in evaluation order, by operands the walk has already passed; a write
 // the walk moves ahead of them must not change what they read.
 let asvReads: i32[] = []
+// The operand slot each `asvReads` entry was read from, in step, so a spill read can replace it:
+// kind 1 is a binary operator's left, 2 an element's receiver, 3 entry `asvRdPos` of the list
+// `asvRdLists`, 4 a field's receiver, 5 an element's index; 0 is a slot the walk does not rewrite.
+let asvRdNode: i32[] = []
+let asvRdKind: i32[] = []
+let asvRdOwner: i32[] = []
+let asvRdPos: i32[] = []
+let asvRdLists: i32[][] = []
+const asvNoList: i32[] = []
 // Set once the walk passes an operand that it cannot prove the moved write leaves alone.
 let asvStop = false
 // Whether the statement walked is a top-level binding, which has room for one moved write.
@@ -2835,16 +2844,39 @@ let asvTopLet = false
 
 // Records the operand at `ix` as passed: a name's declaration joins `asvReads`, and any operand
 // other than a name or a literal (`exprReReadable` of a leaf) ends the walk.
-function asvPassOperand(ix: i32) {
+function asvPassOperand(ix: i32) { asvPassSlot(ix, 0, -1, asvNoList, -1) }
+
+// `asvPassOperand` for the operand at `ix`, read from the slot `kind`/`owner`/`list`/`pos` names.
+function asvPassSlot(ix: i32, kind: i32, owner: i32, list: i32[], pos: i32) {
   const u = unwrapParen(ix)
   if u < 0 { return 0 }
   if nodeAt(u) is Ident {
     asvReads.push(identDeclOf(u))
+    asvRdNode.push(ix)
+    asvRdKind.push(kind)
+    asvRdOwner.push(owner)
+    asvRdPos.push(pos)
+    asvRdLists.push(list)
     return 0
   }
-  if !asvIsLeaf(u) { asvStop = true }
+  if asvIsLeaf(u) { return 0 }
+  // Any other operand in a slot the walk rewrites is kept for a spill: a write moved past it
+  // must spill it first (`ASV_OPAQUE`). Anywhere else it ends the walk.
+  if kind == 0 {
+    asvStop = true
+    return 0
+  }
+  asvReads.push(ASV_OPAQUE)
+  asvRdNode.push(ix)
+  asvRdKind.push(kind)
+  asvRdOwner.push(owner)
+  asvRdPos.push(pos)
+  asvRdLists.push(list)
   0
 }
+
+// The `asvReads` entry of a passed operand that is no name: it may read or write anything.
+const ASV_OPAQUE = -3
 
 // A literal or a name: an operand whose evaluation neither writes nor depends on order.
 function asvIsLeaf(ix: i32): boolean {
@@ -2883,18 +2915,21 @@ function asvMoves(asgIx: i32): boolean {
   let i = 0
   let spilled = true
   while i < asvReads.length {
-    if asvReads[i] == td { return false }
+    if asvReads[i] == td || asvReads[i] == ASV_OPAQUE { return false }
     if !asvIsSpill(asvReads[i]) { spilled = false }
     i = i + 1
   }
   spilled || !asvMayWrite(a.binRight)
 }
 
-// Whether declaration `d` is a spill `spillLocal` minted, which no write can reach.
+// Whether declaration `d` is one no write can reach: a spill `spillLocal` minted, or a `const`,
+// whose read is the same value wherever a moved write runs.
 function asvIsSpill(d: i32): boolean {
   if d < 0 { return false }
   const dn = nodeAt(d)
-  if dn is LetDecl { return dn.letName.slice(0, 4) == "asg#" }
+  if dn is LetDecl {
+    return dn.letKw == "const" || dn.letName.slice(0, 4) == "asg#"
+  }
   false
 }
 
@@ -3002,7 +3037,7 @@ function asvWalk(ix: i32, out: i32[], isValue: boolean): i32 {
   if n is BinExpr {
     if n.binOp == "=" { return asvWalkWrite(ix, n, out, isValue) }
     n.binLeft = asvWalk(n.binLeft, out, true)
-    asvPassOperand(n.binLeft)
+    asvPassSlot(n.binLeft, 1, ix, asvNoList, -1)
     if n.binOp == "&&" || n.binOp == "||" || n.binOp == "??" { asvStop = true }
     n.binRight = asvWalk(n.binRight, out, true)
     return ix
@@ -3044,7 +3079,7 @@ function asvWalk(ix: i32, out: i32[], isValue: boolean): i32 {
   }
   if n is Index {
     n.idxArr = asvWalk(n.idxArr, out, true)
-    asvPassOperand(n.idxArr)
+    asvPassSlot(n.idxArr, 2, ix, asvNoList, -1)
     n.idxIndex = asvWalk(n.idxIndex, out, true)
     return ix
   }
@@ -3071,7 +3106,7 @@ function asvWalkList(xs: i32[], out: i32[]) {
   let i = 0
   while i < xs.length {
     xs[i] = asvWalk(xs[i], out, true)
-    asvPassOperand(xs[i])
+    asvPassSlot(xs[i], 3, -1, xs, i)
     i = i + 1
   }
   0
@@ -3110,10 +3145,10 @@ function asvWalkObj(ix: i32, n: ObjLit, out: i32[]): i32 {
 function asvPassTarget(ti: i32) {
   if ti < 0 { return asvHalt(ti) }
   const t = nodeAt(ti)
-  if t is Member { return asvPassOperand(t.memObj) }
+  if t is Member { return asvPassSlot(t.memObj, 4, ti, asvNoList, -1) }
   if t is Index {
-    asvPassOperand(t.idxArr)
-    return asvPassOperand(t.idxIndex)
+    asvPassSlot(t.idxArr, 2, ti, asvNoList, -1)
+    return asvPassSlot(t.idxIndex, 5, ti, asvNoList, -1)
   }
   if t is Ident { return 0 }
   asvHalt(ti)
@@ -3131,7 +3166,12 @@ function asvWalkWrite(ix: i32, n: BinExpr, out: i32[], isValue: boolean): i32 {
   if !(nodeAt(n.binLeft) is Ident) {
     return asvMovePlace(ix, n, out, readsBefore, outBefore)
   }
-  if !asvMoves(ix) { return ix }
+  if !asvMoves(ix) {
+    if out.length != outBefore || !asvTypeMoves(ix) { return ix }
+    if !asvSpillPassed(asvReads.length, ix, out, n.pos) || !asvMoves(ix) {
+      return ix
+    }
+  }
   if asvTopLet { asvStop = true }
   const v = spillLocal(n.binRight, ix, "nv", out, n.pos)
   n.binRight = v
@@ -3152,11 +3192,15 @@ function asvMovePlace(
   if out.length != outBefore || !asvTypeMoves(ix) { return ix }
   let spilled = true
   let i = 0
+  let opaque = false
   while i < readsBefore {
     if !asvIsSpill(asvReads[i]) { spilled = false }
+    if asvReads[i] == ASV_OPAQUE { opaque = true }
     i = i + 1
   }
-  if !spilled && asvMayWrite(n.binRight) { return ix }
+  if opaque || (!spilled && asvMayWrite(n.binRight)) {
+    if !asvSpillPassed(readsBefore, ix, out, n.pos) { return ix }
+  }
   const val = spillWrite(ix, out)
   if val < 0 { return ix }
   if asvTopLet { asvStop = true }
@@ -3164,10 +3208,56 @@ function asvMovePlace(
   val
 }
 
+// Spills the name reads passed before entry `upTo` onto `out`, in order, and points each slot at
+// its spill, so a write moved ahead of them runs after them still (D16103, D16104). Spills nothing
+// and answers false when one sits in a slot the walk does not rewrite.
+function asvSpillPassed(upTo: i32, asgIx: i32, out: i32[], pos: i32): boolean {
+  let i = 0
+  while i < upTo {
+    if !asvIsSpill(asvReads[i]) && asvRdKind[i] == 0 { return false }
+    i = i + 1
+  }
+  i = 0
+  while i < upTo {
+    if !asvIsSpill(asvReads[i]) {
+      const rd = spillLocal(asvRdNode[i], asgIx, "p" + i32ToStr(i), out, pos)
+      asvRdPut(i, rd)
+      asvReads[i] = identDeclOf(rd)
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Puts the spill read `rd` in the slot passed read `i` came from.
+function asvRdPut(i: i32, rd: i32) {
+  const k = asvRdKind[i]
+  if k == 3 {
+    asvRdLists[i][asvRdPos[i]] = rd
+    return 0
+  }
+  const o = nodeAt(asvRdOwner[i])
+  if k == 1 && o is BinExpr { o.binLeft = rd }
+  if k == 2 && o is Index { o.idxArr = rd }
+  if k == 4 && o is Member { o.memObj = rd }
+  if k == 5 && o is Index { o.idxIndex = rd }
+  0
+}
+
+// Empties `asvReads` and the slots beside it, for a new statement.
+function asvReadsReset() {
+  asvReads = []
+  asvRdNode = []
+  asvRdKind = []
+  asvRdOwner = []
+  asvRdPos = []
+  asvRdLists = []
+}
+
 // The statement at `ix` with its leading value-position writes moved onto `out`: a binding's
 // initialiser, a return's value, an `if`'s condition, a `match`'s subject, or the expression.
 function asvStmt(ix: i32, out: i32[]) {
-  asvReads = []
+  asvReadsReset()
   asvStop = false
   const s = nodeAt(ix)
   if s is LetDecl {
@@ -3260,7 +3350,7 @@ function asvTail(blockIx: i32) {
     return 0
   }
   if !(nodeAt(tx) is BinExpr) { return 0 }
-  asvReads = []
+  asvReadsReset()
   asvStop = false
   asvTopLet = false
   const out: i32[] = []
