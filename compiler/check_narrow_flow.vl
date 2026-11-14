@@ -1,3 +1,13 @@
+import {
+  noteSettledRow,
+  openUnionRows,
+  settledRows,
+  vacIsLo,
+  vacIsNode,
+  vacIsOpen,
+  vacIsRow,
+} from "./check_hole_links"
+import { isOpenMemberOf } from "./check_leaf_steps"
 import { objSigSame } from "./check_union_arm_msgs"
 
 // Flow narrowing: the narrowing ledger (`nar*`) and its joins at an `if`, the facts a test
@@ -239,6 +249,7 @@ import {
   holeLinkClosure,
   holeLinkDstTop,
   holeLinkSrcTop,
+  noteNarPin,
 } from "./check_hole_links"
 import {
   HD_GNOT,
@@ -316,7 +327,12 @@ import {
   tvWriteTy,
   unresolvedHole,
 } from "./check_leaf_steps"
-import { luIsTyOf, luWriteTgt, recordClonedIsVarTyIx } from "./check_list_union"
+import {
+  isVarTyIxSetAt,
+  luIsTyOf,
+  luWriteTgt,
+  recordClonedIsVarTyIx,
+} from "./check_list_union"
 import { allLitMembers } from "./check_lit_never_msgs"
 import { litMembersBaseTy } from "./check_literals"
 import {
@@ -1187,6 +1203,40 @@ function calleeWritePin(ty: i32): boolean {
   false
 }
 
+// D16047: at the program's end, an `is` test that met a union's unwritten collection tests that
+// member's arm, whatever the member settles to; then every member no write pinned takes the
+// unbound default, as an unwritten binding does.
+export function settleOpenUnionRows() {
+  for r in openUnionRows {
+    if unresolvedHole(r) {
+      const t = tyAt(r)
+      if t is TyArray && t.aElem < 0 {
+        t.aElem = unboundDefaultTy()
+      } else if t is TyMap {
+        if t.mKey < 0 { t.mKey = unboundDefaultTy() }
+        if t.mVal < 0 { t.mVal = unboundDefaultTy() }
+      }
+      tyMutEpoch = tyMutEpoch + 1 // in-place pin — canonical keys change
+      noteSettledRow(r)
+    }
+  }
+  // A test stays vacuous when no write pinned a row unwritten at the test.
+  let i = 0
+  while i < vacIsNode.length {
+    const hi = if i + 1 < vacIsLo.length { vacIsLo[i + 1] } else { vacIsOpen.length }
+    let vac = true
+    let j = vacIsLo[i]
+    while j < hi {
+      const r = vacIsOpen[j]
+      if !unresolvedHole(r) && !i32ListHas(settledRows, r) { vac = false }
+      j = j + 1
+    }
+    if vac { isVarTyIxSetAt(vacIsNode[i], vacIsRow[i]) }
+    i = i + 1
+  }
+  0
+}
+
 // Give every open list element and map or set key or value `ty` holds, through records, lists,
 // map values, function results and `| null`, the unbound default (a read's key, for a key): no
 // write fixes it, so no value of it exists. With `apply` false, only whether a read reached one.
@@ -1200,6 +1250,7 @@ function defaultOpenHoles(ty: i32, depth: i32, apply: boolean): boolean {
       if apply {
         t.aElem = unboundDefaultTy()
         tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+        noteSettledRow(ty)
       }
       false
     }
@@ -1213,6 +1264,7 @@ function defaultOpenHoles(ty: i32, depth: i32, apply: boolean): boolean {
           }
           if t.mVal < 0 { t.mVal = unboundDefaultTy() }
           tyMutEpoch = tyMutEpoch + 1 // in-place key/value pin — canonical keys change
+          noteSettledRow(ty)
         }
       }
       defaultOpenHoles(t.mVal, depth - 1, apply)
@@ -4485,6 +4537,14 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
         let tIdx = isTypeTyRead(cond.isVariant, condIx)
         // An overlapping literal set narrows to the overlap, as `checkIsExprNode` tests it.
         const isCur = isTestCurTy(isPl, places, tys)
+        // An unwritten collection member fits every test of its kind, and narrows to its own
+        // row, so a write through the narrowed name pins it as a direct write does (D16047).
+        const openM = isOpenMemberOf(isCur, tIdx)
+        if openM >= 0 {
+          noteNarPin(tIdx, openM)
+          pushNarrowFact(isPl, tIdx, places, tys)
+          return 0
+        }
         let meet = litSetMeetTy(isCur, tIdx)
         if meet < 0 { meet = recFitMeetTy(isCur, tIdx) }
         if meet >= 0 { tIdx = meet }
