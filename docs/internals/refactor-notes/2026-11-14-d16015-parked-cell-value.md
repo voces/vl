@@ -55,5 +55,5 @@ Hand cells:
 
 | instrument | result |
 | --- | --- |
-| full sweep, base master against this change, both fixpoint seeds | SWEEP_RESULT |
-| fast set | FASTSET_RESULT |
+| full sweep, base master against this change, both fixpoint seeds | output movers, all intended: D16015's witness and the new test `emit_reject` → `runs`; D16018's witness `44` → `300` (the clause-1 fix); D16016, D16017 and D2632 keep refusing under the narrower message; 0 runs → not-runs; 0 new traps |
+| fast set | all green (fixpoint, lint-self clean, regress, filed witnesses, late demands, seed size, comment, ladder, sentinel, scan, render-parse and export ratchets); native deep-chain and scaling (`SELFHOST_NATIVE_ALIGN=1`) 98 passed |
