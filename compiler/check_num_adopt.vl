@@ -145,6 +145,27 @@ export function valueTailSplit(ix: i32, spine: i32[], leaves: i32[]) {
   0
 }
 
+// Types each parenthesis the value `if`, `match` or block at `ix` yields a tail through as the
+// node it wraps, which the emitter reads in the tail's place once the tail adopted (D16371).
+function tailParensSync(ix: i32) {
+  if inferQuiet { return 0 }
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = todo.pop() ?? -1
+    const an = if at >= 0 && at < P.nodes.length { nodeAt(at) } else { null }
+    if an is Paren {
+      todo.push(an.parInner)
+      const it = nodeTyOf(cwPeel(at))
+      if it >= 0 && at < nodeTyIx.length { nodeTySet(at, it) }
+    } else if at >= 0 && at < P.nodes.length {
+      if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
+        tailPushBlockTail(at, todo)
+      }
+    }
+  }
+  0
+}
+
 // `ix` past parentheses when it is a value `if`, `match` or block; else -1.
 export function valueJoinAt(ix: i32): i32 {
   const lix = parenPeelIx(ix)
@@ -381,6 +402,7 @@ export function numLitAdoptJoin(ix: i32, t: i32): i32 {
   if ix < 0 || t < 0 || !stampsStand() || !tyHoldsNonI32Num(t, 8) { return 0 }
   if nodeAt(ix) is ArrayLit { return numLitAdoptBody(ix, t, 6) }
   for lf in valueTailLeaves(ix) { numLitAdoptPart(lf, t, 6) }
+  tailParensSync(ix)
   0
 }
 
@@ -420,6 +442,7 @@ export function numLitAdoptTails(ix: i32, prim: i32) {
       if sp < nodeTyIx.length { nodeTySet(sp, prim) }
     }
   }
+  tailParensSync(lix)
 }
 
 // Types the parens and negations from `ix` down to its literal as `t`. Answers `t`.
@@ -458,9 +481,7 @@ export function numLitAdoptDeep(ix: i32, dstTy: i32, depth: i32): i32 {
   // literal is its own one part.
   const e = nodeAt(at)
   if e is IfStmt || e is MatchExpr || e is Block {
-    if stampsStand() {
-      for lf in valueTailLeaves(ix) { numLitAdoptPart(lf, dstTy, depth) }
-    }
+    if stampsStand() { numLitAdoptDeepJoin(at, dstTy, depth) }
     return 0
   }
   // A literal adopts from `ix`, so the parentheses around it are typed with it.
@@ -482,6 +503,29 @@ export function numLitAdoptDeep(ix: i32, dstTy: i32, depth: i32): i32 {
     return numLitAdoptDeep(e.binRight, dstTy, depth - 1)
   }
   numLitPartOpaque()
+}
+
+// The tails of value join `at` delivered to `dstTy`: when every one is a literal adopting one type
+// there, the join is built at it with them (`numLitAdoptTails`, D16373); else a literal tail keeps
+// the join's own type, and only a list or record literal's parts adopt their destinations.
+function numLitAdoptDeepJoin(at: i32, dstTy: i32, depth: i32) {
+  const leaves = valueTailLeaves(at)
+  let t = -1
+  let allLit = leaves.length > 0
+  for lf in leaves {
+    const lt = numLitDstTy(lf, dstTy)
+    if lt < 0 || t >= 0 && lt != t { allLit = false }
+    t = lt
+  }
+  if allLit {
+    numLitAdoptTails(at, t)
+    return 0
+  }
+  for lf in leaves {
+    const ln = nodeAt(lf)
+    if ln is ArrayLit || ln is ObjLit { numLitAdoptPart(lf, dstTy, depth) }
+  }
+  0
 }
 
 // One already-checked delivered value of `numLitAdoptDeep`. One whose recorded type is its

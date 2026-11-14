@@ -23,10 +23,9 @@ rules there apply here, and `tests/roadmap_honest_test.ts` gates this file too.
     effects summary (function-effects-design.md §G6).
   - **Stage B.** A stored witness narrows too (`const f = bar(x); if f is null` narrows `x`). It
     holds until `callMayWrite` says a call may write `x` or `f`.
-- **A6c. Narrowing across calls.** Three cases:
+- **A6c. Narrowing across calls.** Two cases:
   1. Keep a narrowing when the writer can only write a member it admits. This needs A6b's per-path W.
-  2. D2408: a bare-name re-test inside an arm whose condition's call ended the narrowing.
-  3. The owner's deferred ideal: keep a narrowing across an escaping closure when no write of the
+  2. The owner's deferred ideal: keep a narrowing across an escaping closure when no write of the
      path can run first.
 
   Still open: ban side effects in operator overloads, or let one modify only its operands.
