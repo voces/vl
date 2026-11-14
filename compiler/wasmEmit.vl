@@ -307,6 +307,7 @@ import {
   UnionDecl,
   WhileStmt,
   adoptNodeTok,
+  arenaSetNode,
   arithRegionSeen,
   binderNameAt,
   blockTailIsDead,
@@ -345,7 +346,6 @@ import {
   spreadArgOf,
   stmtAlwaysExits,
   ufcsAliasAtSite,
-  arenaSetNode,
 } from "./ast"
 // `wasmEmit.vl` — the emitter's lowering core: the statement and expression lowerers
 // (`emitStmt` / `emitExpr` and the per-node `emit*` families — calls, assignment,
@@ -1405,9 +1405,9 @@ import {
   sFieldRefSlot,
   structRowFieldStoresAtom,
   structRowOfAnnTy,
+  tyIsFuncOrNulFunc,
   uFieldTgtStructIdx,
   variantRowFieldStoresAtom,
-  tyIsFuncOrNulFunc,
 } from "./emit_shape_rows"
 import {
   identCellSlot,
@@ -38856,7 +38856,10 @@ function emitAsgRadixAs(
 // is a reference compared by `ref.eq`, a union box by its payload, never the box itself.
 function emitIdentityBin(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   const ne = e.binOp == "!=="
-  if identityOperandIsFn(e.binLeft, fnIx) || identityOperandIsFn(e.binRight, fnIx) {
+  if (
+    identityOperandIsFn(e.binLeft, fnIx)
+    || identityOperandIsFn(e.binRight, fnIx)
+  ) {
     const saved = nodeAt(exprIx)
     const eq: BinExpr = {
       binOp: if ne { "!=" } else { "==" },
@@ -38881,15 +38884,25 @@ function emitIdentityBin(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
 
 // Whether identity operand `ix` holds a function value, nullable or not.
 function identityOperandIsFn(ix: i32, fnIx: i32): boolean {
-  exprIsClosure(ix, fnIx) || tyIsFuncOrNulFunc(nodeTyInOf(unwrapParen(ix), fnIx))
+  exprIsClosure(ix, fnIx)
+    || tyIsFuncOrNulFunc(nodeTyInOf(unwrapParen(ix), fnIx))
+}
+
+// Whether `ty`, a nullable peeled, is a union, whose values are boxes.
+function identityTyIsUnion(ty: i32): boolean {
+  const t = nonNullTy(ty)
+  t >= 0 && tyAt(t) is TyUnion
 }
 
 // Emit identity operand `ix` as an `eqref`: the reference itself, or a union box's payload, cast
 // down from `anyref` (a `null` arm's payload is null, which `ref.eq` holds equal to null).
 function emitIdentityOperand(body: u8[], ix: i32, fnIx: i32): i32 {
   if emitExpr(body, ix, fnIx) < 0 { return -1 }
-  const ty = nonNullTy(nodeTyInOf(unwrapParen(ix), fnIx))
-  if ty >= 0 && tyAt(ty) is TyUnion {
+  // A read narrowed out of a union's storage still pushes the box (`unionBoxStoreTyOf`).
+  if (
+    identityTyIsUnion(nodeTyInOf(unwrapParen(ix), fnIx))
+    || identityTyIsUnion(unionBoxStoreTyOf(ix, fnIx))
+  ) {
     fbStructGet(uBoxIdx, 1)
     fbRefCastNull(-19) // the abstract `eq` heap type
   }
