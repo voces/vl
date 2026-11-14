@@ -883,7 +883,7 @@ export class Interp {
         }
         throw new TypeFault("index into " + show(o));
       }
-      case "call": return this.call(e, env, exp);
+      case "call": return this.call(e, env);
       case "as": return this.cast(e, env);
       case "is": {
         const v = this.eval(e.e, env, null);
@@ -1158,7 +1158,7 @@ export class Interp {
     throw new TypeFault(`member '${name}' of ${show(o)}`);
   }
 
-  call(e: Extract<Expr, { k: "call" }>, env: Env, exp: Ty | null = null): Val {
+  call(e: Extract<Expr, { k: "call" }>, env: Env): Val {
     if (e.f.k === "member") {
       const recvE = e.f.e, name = e.f.name;
       const recv = this.eval(recvE, env, null);
