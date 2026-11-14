@@ -1,3 +1,4 @@
+import { settledRows } from "./check_hole_links"
 import { isWideLitJoin } from "./check_wide_lits"
 import { nodeCtxTyIxOf } from "./check_core_state"
 // Steps the checker core calls that do not call back into it: refusal and note texts,
@@ -396,6 +397,91 @@ export function unresolvedHole(ty: i32) {
     TyMap => t.mKey < 0 || t.mVal < 0
     // Every other row holds no collection hole of its own.
     TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => false
+  }
+}
+
+// The member of `cur` (itself, a nullable's inner, or a union arm) whose shape fits `target`
+// only through an unwritten collection, which fits every element (D16047); -1 for none.
+export function isOpenMemberOf(cur: i32, target: i32): i32 {
+  if cur < 0 || cur >= T.tys.length || target < 0 || target >= T.tys.length {
+    return -1
+  }
+  const c = tyAt(cur)
+  if c is TyNullable { return isOpenMemberOf(c.nInner, target) }
+  if c is TyUnion {
+    for m in c.uMembers {
+      const r = isOpenMemberOf(m, target)
+      if r >= 0 { return r }
+    }
+    return -1
+  }
+  if openFit(cur, target, 8) == 1 { cur } else { -1 }
+}
+
+// The member of `dst` (itself, a nullable's inner, or a union arm) that `m` fits only through an
+// unwritten collection, which a delivery of `m` there pins to; -1 for none.
+export function openFitArmOf(m: i32, dst: i32): i32 {
+  if dst < 0 || dst >= T.tys.length { return -1 }
+  const d = tyAt(dst)
+  if d is TyNullable { return openFitArmOf(m, d.nInner) }
+  if d is TyUnion {
+    for dm in d.uMembers {
+      if openFit(m, dm, 8) == 1 { return dm }
+    }
+    return -1
+  }
+  if openFit(m, dst, 8) == 1 { dst } else { -1 }
+}
+
+// Whether `m` fits `g`: -1 apart, 0 alike with no unwritten collection, 1 alike only through one
+// (a list with no element, a map or set with no key or value).
+function openFit(m: i32, g: i32, depth: i32): i32 {
+  if m < 0 || g < 0 || m >= T.tys.length || g >= T.tys.length || depth <= 0 {
+    return -1
+  }
+  const a = tyAt(m)
+  const b = tyAt(g)
+  // A row the unbound default settled, not a write, is still unwritten.
+  if i32ListHas(settledRows, m) {
+    if a is TyArray && b is TyArray { return 1 }
+    if a is TyMap && b is TyMap && a.mSet == b.mSet { return 1 }
+  }
+  if a is TyArray && b is TyArray {
+    if a.aElem < 0 { return 1 }
+    return openFit(a.aElem, b.aElem, depth - 1)
+  }
+  if a is TyMap && b is TyMap {
+    if a.mSet != b.mSet { return -1 }
+    const k = if a.mKey < 0 { 1 } else if tyEq(a.mKey, b.mKey) { 0 } else { -1 }
+    const v = if a.mVal < 0 { 1 } else { openFit(a.mVal, b.mVal, depth - 1) }
+    if k < 0 || v < 0 { return -1 }
+    return if k == 1 || v == 1 { 1 } else { 0 }
+  }
+  if tyEq(m, g) { 0 } else { -1 }
+}
+
+// Collects into `out` every unwritten collection row `ty` holds as itself, a nullable's inner,
+// a union arm, a list's element or a map's value: the rows settled at the program's end (D16047).
+export function openMemberRows(ty: i32, out: i32[]) { openRowsAt(ty, out, 8) }
+
+function openRowsAt(ty: i32, out: i32[], depth: i32) {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 0 }
+  if unresolvedHole(ty) {
+    out.push(ty)
+    return 0
+  }
+  const t = tyAt(ty)
+  match t {
+    // An unwritten `[]` or `Map()` beside `null` alone closes for its rep only, keeping its hole.
+    TyNullable => if unresolvedHole(t.nInner) { 0 } else { openRowsAt(t.nInner, out, depth - 1) }
+    TyUnion => {
+      for m in t.uMembers { openRowsAt(m, out, depth - 1) }
+      0
+    }
+    TyArray => openRowsAt(t.aElem, out, depth - 1)
+    TyMap => openRowsAt(t.mVal, out, depth - 1)
+    // A record's fields, a function's result and a scalar are no union member's collection.
+    TyPrim | TyErr | TyObj | TyFunc | TyVar | TyLit | TyNeg => 0
   }
 }
 
