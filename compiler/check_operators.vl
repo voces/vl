@@ -3,7 +3,14 @@
 
 import { isOpenMemberOf, openMemberRows } from "./check_leaf_steps"
 import { arrDefRowServed, noteVacuousIs } from "./check_hole_links"
-import { mapFitBuild, recPartFitBuild } from "./check_annot_resolve"
+import {
+  luDecl,
+  luTs,
+  luTyTest,
+  mapFitBuild,
+  recPartFitArm,
+  recPartFitBuild,
+} from "./check_annot_resolve"
 import { strListIndexOf } from "./listutil"
 import { callBindNote, recordCollapsedIsAt } from "./check_bind_rows"
 import {
@@ -31,6 +38,7 @@ import {
   LoopVar,
   MatchExpr,
   Member,
+  Node,
   NullLit,
   NumLit,
   OP_INDEX_GET,
@@ -49,7 +57,14 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  arenaSetNode,
+  i32ToStr,
+  mkBlock,
+  mkCall,
+  mkIf,
+  mkNull,
   nodeAt,
+  valueIfAdd,
 } from "./ast"
 import {
   narrowedFromTySet,
@@ -231,6 +246,11 @@ import {
   isVarTyIxOf,
   isVarTyIxPush,
   isVarTyIxSetAt,
+  luAt,
+  luGrow,
+  luRef,
+  luTrap,
+  luValueAt,
   luWriteTgtPut,
   monoRecheckDepth,
 } from "./check_list_union"
@@ -2156,6 +2176,9 @@ function checkCastUnionArm(
   const meet = tyTestMeet(argU, target0)
   const target = if meet >= 0 { meet } else { target0 }
   if meet < 0 && !tyTestNamesMembers(argU, target) {
+    // A record target one member may fit by its fields' values casts as `is` tests (D4087).
+    const pf = castPartFitAt(n, ix, argU, target)
+    if pf != -1 { return pf }
     // A gradual union's parameter may hold the target at a pin: the cast is parked on the
     // parameter and re-asked there, as over a bare one (D2906).
     if unionHasDeclaredParam(argT.uMembers) {
@@ -2210,6 +2233,58 @@ function checkCastUnionArm(
   // goes. A pending return (-2) is refused rather than joined into.
   if !castPropagationFits(rest, n.asTy, ix, T.curRet, -1) { return TY_ERR }
   target
+}
+
+// `x as? B` or `x as! B` over union `argU` where one record member `A` may fit `B` by its
+// fields' values (`recPartFitArm`), rewritten in place to `if x is B { const $rh: A = x; $rh }
+// else { null }` (`__trap__()` for `as!`), `x` bound once first unless it is a name: the value
+// is the `A` the test narrows to. -1 for any other cast, which propagates or has no such member.
+function castPartFitAt(n: AsExpr, ix: i32, argU: i32, target: i32): i32 {
+  const arm = recPartFitArm(argU, target)
+  if arm < 0 || n.asMode != "null" && n.asMode != "trap" { return -1 }
+  if inferQuiet {
+    return if n.asMode == "null" { mkNullableTy(arm) } else { arm }
+  }
+  // The operand's own type spells where the cast's flattened union may not.
+  const recvTy = if luTs(argU) >= 0 { argU } else { nodeTyIxOf(n.asObj) }
+  if luTs(recvTy) < 0 || luTs(arm) < 0 || luTs(target) < 0 { return -1 }
+  const pos = n.pos
+  // A name is read again in place; any other operand is bound once first.
+  const ox = parenPeelIx(n.asObj)
+  const named = ox >= 0 && nodeAt(ox) is Ident && identDeclOf(ox) >= 0
+  const recv = if named { identDeclOf(ox) } else { luDecl("const", "$rc" + i32ToStr(ix), recvTy, n.asObj, ix, pos) }
+  // The hit is delivered through a binding at the arm, which unboxes it.
+  const hit = luDecl(
+    "const",
+    "$rh" + i32ToStr(ix),
+    arm,
+    luRef(recv, ix, pos),
+    ix,
+    pos,
+  )
+  const thenStmts: i32[] = []
+  thenStmts.push(hit)
+  thenStmts.push(luRef(hit, ix, pos))
+  const miss = if n.asMode == "null" { mkNull("null", pos) } else { mkCall(luTrap(ix, pos), [], pos) }
+  const elseStmts: i32[] = []
+  elseStmts.push(luAt(miss, ix))
+  const test = luTyTest(luRef(recv, ix, pos), target, ix, pos)
+  const thenB = luAt(mkBlock(thenStmts, pos), ix)
+  const elseB = luAt(mkBlock(elseStmts, pos), ix)
+  if named {
+    const w: Node = { ifCond: test, ifThen: thenB, ifElse: elseB, pos: pos }
+    arenaSetNode(ix, w)
+    valueIfAdd(ix)
+    luGrow()
+    return checkNodeHook(ix)
+  }
+  const pick = luAt(mkIf(test, thenB, elseB, pos), ix)
+  valueIfAdd(pick)
+  const stmts: i32[] = []
+  stmts.push(recv)
+  stmts.push(pick)
+  luValueAt(ix, stmts, pos)
+  checkNodeHook(ix)
 }
 
 // The member of `mems` a value of the record `target` may be held as while it stores some field
