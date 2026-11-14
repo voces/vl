@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **D4160, D16171 closed: an inferred union or nullable return lowers as its annotated twin.** The inferred-return floor (`'f' infers the … return type … — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type`) is gone. A union or nullable inferred return that no recorder names for the emitter is now written as the function's return annotation (`inferRetAsAnnotation`), so `"a" | null`, `{[i32]: i32}[] | i32` and `{q: i32}[] | i32` run without the annotation the message asked for. On a 67-shape grid of inferred returns against their annotated twins, the inferred face goes 53 → 61 runs and now matches the annotated face cell for cell.
