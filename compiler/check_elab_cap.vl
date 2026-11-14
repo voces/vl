@@ -23,8 +23,10 @@ import {
   cwFollowedRetAt,
   cwFollowedRets,
   cwFramedNode,
+  cwIxBuild,
   cwIxKind,
   cwIxNode,
+  cwIxParent,
   cwIxUp,
   cwIxUpKind,
   cwKeyOfDecl,
@@ -3190,6 +3192,13 @@ let fnRetRecSrcTo: i32[] = []
 let fnRetRecSrcFrom: i32[] = []
 let fnFieldWidenedName: string[] = []
 let fnLetVeto: i32[] = []
+// The choices of functions a judge left to the tag decision (`fnChoiceWideNote`), beside their
+// types; those whose set the decision left untagged, which the next check refuses.
+let fnChoiceWide: i32[] = []
+let fnChoiceWideAt: i32[] = []
+let fnChoiceVeto: i32[] = []
+// The arguments this check handed to a parameter whose function type the callee leaves open.
+let fnOpenHandSites: i32[] = []
 // The list literals whose open element signature the functions written into their binding closed.
 let fnListClosedLits: i32[] = []
 
@@ -3324,6 +3333,9 @@ export function fnTyFactsReset() {
   fnRetLeaves = Map()
   fnLetWide = []
   fnLetWideAt = []
+  fnChoiceWide = []
+  fnChoiceWideAt = []
+  fnOpenHandSites = []
   fnLetOpenHands = []
   fnLetOpenHandBds = []
   fnParamHands = Map()
@@ -3352,6 +3364,9 @@ export function fnTagEtaReset() {
   fnTagEscapeDsts = []
   fnLetWide = []
   fnLetWideAt = []
+  fnChoiceWide = []
+  fnChoiceWideAt = []
+  fnOpenHandSites = []
   fnLetOpenHands = []
   fnLetOpenHandBds = []
   fnParamHands = Map()
@@ -3369,6 +3384,7 @@ export function fnTagEtaReset() {
   fnRetRecSrcFrom = []
   fnListClosedLits = []
   fnLetVeto = []
+  fnChoiceVeto = []
 }
 
 // Notes delivery `site` for the decision that may build it, once the set its value or its
@@ -3442,6 +3458,12 @@ export function fnTagEtaWant(site: i32, s: i32): boolean {
   true
 }
 
+// Notes `site`, an argument handed to a function parameter whose type is still open at the call.
+export function fnOpenHandNote(site: i32) {
+  if !i32ListHas(fnOpenHandSites, site) { fnOpenHandSites.push(site) }
+  0
+}
+
 // Notes `site`, a read handed to a function parameter whose type is still open at the call, when
 // it reads a `let` this check widened.
 export function fnLetOpenHandNote(site: i32) {
@@ -3497,6 +3519,43 @@ export function fnLetOpenHandAt(site: i32): boolean {
   i32ListHas(fnLetOpenHands, site)
 }
 
+// Notes choice `at` of type `t`, whose judge left its refusal to the tag decision: an untagged set
+// is refused by the next check (`fnTagEtaAgain`).
+export function fnChoiceWideNote(t: i32, at: i32) {
+  if fnTagEtaRan || t < 0 || i32ListHas(fnChoiceWideAt, at) { return 0 }
+  fnChoiceWide.push(t)
+  fnChoiceWideAt.push(at)
+  0
+}
+
+// Whether choice `at` reaches only parameters whose function type their callee leaves open, and
+// calls: handed itself, or initialising a binding each read of which is one of those.
+function fnChoiceHandedOnly(at: i32): boolean {
+  if i32ListHas(fnOpenHandSites, at) { return true }
+  cwIxBuild()
+  let bd = if at >= 0 && at < cwIxParent.length { cwIxParent[at] } else { -1 }
+  while bd >= 0 && bd < P.nodes.length && nodeAt(bd) is Paren {
+    bd = cwIxParent[bd]
+  }
+  const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
+  if !(bn is LetDecl) || parenPeelIx(bn.letInit) != at { return false }
+  const w = cwOccWalk(bd)
+  while cwOccNext(w) {
+    const u = cwIxNode[w.row]
+    if cwIxKind[w.row] == CW_OCC_USE && !i32ListHas(fnOpenHandSites, u) {
+      const up = if u >= 0 && u < cwIxParent.length { cwIxParent[u] } else { -1 }
+      const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+      if !(un is Call) || parenPeelIx(un.callFn) != u { return false }
+    }
+  }
+  true
+}
+
+// Whether choice `at` is refused because the decision left its set untagged.
+export function fnChoiceVetoed(at: i32): boolean {
+  i32ListHas(fnChoiceVeto, at)
+}
+
 // Whether `t` is the type a `let` written with other functions than its initialiser gives its reads.
 export function fnLetIsWide(t: i32): boolean { i32ListHas(fnLetWide, t) }
 
@@ -3514,7 +3573,23 @@ export function fnTagEtaAgain(): boolean {
     if !fnTagTyIsTagged(fnLetWide[i]) && !late { fnLetVeto.push(bd) }
     i = i + 1
   }
-  if fnTagEtaSites.length == 0 && fnLetVeto.length == 0 { return false }
+  // A choice has no initialiser to fall back to: one whose set stayed untagged is refused, unless
+  // only open parameters and calls read it, decided after the instances as such a `let` is.
+  i = 0
+  while i < fnChoiceWide.length && i < fnChoiceWideAt.length {
+    const at = fnChoiceWideAt[i]
+    if !fnTagTyIsTagged(fnChoiceWide[i]) && !fnChoiceHandedOnly(at) {
+      fnChoiceVeto.push(at)
+    }
+    i = i + 1
+  }
+  if (
+    fnTagEtaSites.length == 0
+    && fnLetVeto.length == 0
+    && fnChoiceVeto.length == 0
+  ) {
+    return false
+  }
   fnTagEtaRan = true
   true
 }
