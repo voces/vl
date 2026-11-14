@@ -5,6 +5,7 @@
 // vocabulary. It sits above `typecheck.vl`, which never calls it.
 import { cwCallRetsFn, cwIxCovers } from "./check_write_scan"
 import { recDropAdopt } from "./check_rec_drop"
+import { constRangeTrips } from "./check_range_var"
 import { paramCopyBuild, paramCopyReset } from "./check_elab_cap"
 import { declTyOf } from "./check_nar_store"
 import { recListLitsBuild, recStoreSpreadsApart } from "./check_bind_adopt"
@@ -199,7 +200,10 @@ import {
   esCost,
   esCounter,
   esDecl,
+  esEdgeFrom,
+  esEdgeTo,
   esFrame,
+  esGetterReach,
   esHost,
   esHostVia,
   esKeyIx,
@@ -1781,15 +1785,14 @@ export function canonUnionMembersInto(
   canonUnionMembersWalk(ty, out, atoms, true, [])
 }
 
-// `canonUnionMembersInto` that also appends to `lits`, index-parallel to `out`, whether each
-// member is a literal arm softened to its base scalar.
-export function canonUnionMembersLitsInto(
+// The canonical member types of `ty` into `out` and, index-parallel, whether each is a literal
+// arm softened to its base scalar into `lits`; the walk's member labels stay inside it.
+export function canonUnionMemberLitsOf(
   ty: i32,
   out: i32[],
-  atoms: string[],
   lits: boolean[],
 ): boolean {
-  canonUnionMembersWalk(ty, out, atoms, true, lits)
+  canonUnionMembersWalk(ty, out, [], true, lits)
 }
 
 function canonUnionMembersWalk(
@@ -5102,11 +5105,34 @@ function gwWalk(ix: i32) {
   if n is IfStmt { return gwIf(n, ix) }
   if n is MatchExpr { return gwMatch(n, ix) }
   if n is RetStmt { return gwWalk(n.retArg) }
-  if n is WhileStmt || n is ForRange || n is ForIn {
-    return getterContractErr("contains a loop", GW_LOOP, ix)
+  if n is ForRange && constRangeTrips(ix, GETTER_STEP_CAP) >= 0 {
+    return gwForRange(n)
   }
+  if n is WhileStmt {
+    return getterContractErr("contains a `while` loop", GW_LOOP, ix)
+  }
+  if n is ForIn {
+    return getterContractErr(
+      "loops over a collection with `for … in`",
+      GW_LOOP,
+      ix,
+    )
+  }
+  if n is ForRange {
+    return getterContractErr(
+      "loops over a range whose ends or step are not literals or `const`s, or whose variable is written",
+      GW_LOOP,
+      ix,
+    )
+  }
+  if n is BreakStmt && gwLoopTargetOk(n.brkLabel) { return 0 }
+  if n is ContinueStmt && gwLoopTargetOk(n.contLabel) { return 0 }
   if n is BreakStmt || n is ContinueStmt {
-    return getterContractErr("contains a loop", GW_LOOP, ix)
+    return getterContractErr(
+      "leaves a block that is no constant-range loop",
+      GW_LOOP,
+      ix,
+    )
   }
   if n is FuncDecl {
     return getterContractErr("declares a function, a closure", GW_ALLOC, ix)
@@ -5134,6 +5160,36 @@ function gwWalk(ix: i32) {
     GW_OTHER,
     ix,
   )
+}
+
+// The labels of the constant-range loops the getter walk is inside, innermost last.
+const gwRangeLabels: string[] = []
+
+// A `for` over a constant range (`constRangeTrips`): its bounds and body are walked, with the
+// variable one of the getter's locals; the cost walk charges its trips against the budget.
+function gwForRange(n: ForRange) {
+  gwWalk(n.frFrom)
+  gwWalk(n.frTo)
+  gwWalk(n.frStep)
+  const mark = gwLocals.length
+  gwLocalsPush(n.frVar)
+  gwRangeLabels.push(n.frLabel)
+  gwDiscardPush(n.frBody)
+  gwWalk(n.frBody)
+  gwRangeLabels.pop()
+  while gwLocals.length > mark { gwLocalsPop() }
+  0
+}
+
+// Whether a `break` or `continue` naming `label` ("" for the innermost loop) leaves a
+// constant-range loop the getter walk admitted.
+function gwLoopTargetOk(label: string): boolean {
+  if gwRangeLabels.length == 0 { return false }
+  if label == "" { return true }
+  for l in gwRangeLabels {
+    if l == label { return true }
+  }
+  false
 }
 
 // A field read `n` at `ix`: a read through another getter records the edge between the two
@@ -5519,16 +5575,7 @@ function gcNode(r: i32, ix: i32): i32 {
     gcNode(r, n.whileBody)
     return esUnbound(r, "it loops (`while`" + esAtLine(ix) + ")", -1)
   }
-  if n is ForRange {
-    gcNode(r, n.frFrom)
-    gcNode(r, n.frTo)
-    gcNode(r, n.frStep)
-    const mark = esScopeNames.length
-    esScopePush(n.frVar, 1)
-    gcNode(r, n.frBody)
-    esScopeTruncate(mark)
-    return esUnbound(r, "it loops (`for`" + esAtLine(ix) + ")", -1)
-  }
+  if n is ForRange { return gcForRange(r, n, ix) }
   if n is ForIn {
     gcNode(r, n.fiIter)
     const mark = esScopeNames.length
@@ -5629,6 +5676,41 @@ function gcMember(r: i32, n: Member, ix: i32): i32 {
   }
   c
 }
+
+// A `for` over a constant range costs its trips times its body, each trip at least one step;
+// any other range is unbounded. The trail repeats the body's calls, to a cap, so the
+// over-budget sentence counts them per trip.
+function gcForRange(r: i32, n: ForRange, ix: i32): i32 {
+  let c = gcAdd(gcNode(r, n.frFrom), gcNode(r, n.frTo))
+  c = gcAdd(c, gcNode(r, n.frStep))
+  const mark = esScopeNames.length
+  esScopePush(n.frVar, 1)
+  const tmark = gcTrail.length
+  let body = gcNode(r, n.frBody)
+  esScopeTruncate(mark)
+  const trips = constRangeTrips(ix, GETTER_STEP_CAP)
+  if trips < 0 {
+    return esUnbound(r, "it loops (`for`" + esAtLine(ix) + ")", -1)
+  }
+  if body >= ES_UNBOUNDED { return ES_UNBOUNDED }
+  if body < 1 { body = 1 }
+  const per = gcTrail.slice(tmark, gcTrail.length)
+  if trips == 0 {
+    while gcTrail.length > tmark { gcTrail.pop() }
+  }
+  let k = 1
+  while k < trips && k < GC_TRAIL_TRIPS {
+    for e in per { gcTrail.push(e) }
+    k = k + 1
+  }
+  if trips > 0 && body > GETTER_STEP_CAP / trips {
+    return gcAdd(c, GETTER_STEP_CAP)
+  }
+  gcAdd(c, trips * body)
+}
+
+// How many trips of a constant loop the cost trail spells out; past it the count is a floor.
+const GC_TRAIL_TRIPS = 64
 
 // A binary expression: an assignment's write, the operators whose lowering allocates or
 // loops, a string-literal compare at the literal's length, and a user operator as a call.
@@ -5753,7 +5835,10 @@ function gcCallDecl(r: i32, d: i32, args: i32[], ix: i32): i32 {
       -1,
     )
   }
-  gcCharge(r, esCalleeRow(r, d, args))
+  const c = esCalleeRow(r, d, args)
+  esEdgeFrom.push(r)
+  esEdgeTo.push(c)
+  gcCharge(r, c)
 }
 
 // The row call arguments `args` from row `r` pin declaration `d` at: each type parameter bound
@@ -5823,6 +5908,27 @@ function gcMatch(r: i32, n: MatchExpr): i32 {
 // Refuses every getter over the step budget that no other getter over the budget reads, so a
 // chain is one error at its top, naming the path that made the total. A getter with no bound
 // at all is refused where the unbounded construct is, by the body walk or its call check.
+// Marks every declaration the getter rows `rows` reach through direct calls in `esGetterReach`.
+function esMarkGetterReach(rows: i32[]) {
+  const seen: {[i32]: boolean} = Map()
+  const work: i32[] = []
+  for r in rows { work.push(r) }
+  while work.length > 0 {
+    const r = work[work.length - 1]
+    work.pop()
+    if r >= 0 && r < esDecl.length && !(seen[r] ?? false) {
+      seen[r] = true
+      esGetterReach[esDecl[r]] = true
+      let k = 0
+      while k < esEdgeFrom.length {
+        if esEdgeFrom[k] == r { work.push(esEdgeTo[k]) }
+        k = k + 1
+      }
+    }
+  }
+  0
+}
+
 function getterBudgetCheck() {
   gcCostSet([])
   const rows: i32[] = []
@@ -5833,6 +5939,7 @@ function getterBudgetCheck() {
     gcCostPush(gcCostSoFar(row))
     i = i + 1
   }
+  esMarkGetterReach(rows)
   let r = 0
   while r < getFns.length {
     if gcIsOver(gcCost[r]) && !gcReadByOver(r) {
