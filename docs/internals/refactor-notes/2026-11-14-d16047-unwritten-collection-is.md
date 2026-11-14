@@ -29,7 +29,8 @@ the way:
 - A delivery of such a union into a concrete union pins the member it fits only through the hole
   (`openFitArmOf`, `constrainEmptyD`'s union-source arm).
 - The inferred-return floor for a union with an unwritten member runs after settlement
-  (`flushDeferredRetFloors`). An if-expression binding's union name is exported then too
+  (`flushDeferredRetFloors`), so a settled shape the emitter cannot lower keeps its hole-free twin's
+  refusal (filed as D16171 and D16172). An if-expression binding's union name is exported then too
   (`settleOpenLetNames`).
 
 ## Not taken, pending the owner
