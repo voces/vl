@@ -81,6 +81,7 @@ import {
   cwBindingWrittenValues,
   cwCalleeDeclOf,
   cwDeclWriteValues,
+  cwFnValueDeclOf,
   cwIxBuild,
   cwIxCovers,
   cwIxKind,
@@ -2389,9 +2390,9 @@ function ftSetWithin(a: i32, b: i32): boolean {
   true
 }
 
-// Whether write value `x` is a leaf `fnTagWriteLeavesOf` took for a set wider than `s`, planned
-// with it or tagged: the write stores that set's id, and its own value is the same id.
-function ftWiderWriteLeaf(x: i32, s: i32): boolean {
+// Whether write value `x` is a leaf `fnTagWriteLeavesOf` takes for `s`, or took for a wider set
+// planned with it or tagged: the write stores that set's id, and its own value is the same id.
+function ftWriteLeafOf(x: i32, s: i32): boolean {
   let k = 0
   while k < ftPlS.length {
     const o = ftPlS[k]
@@ -2401,23 +2402,15 @@ function ftWiderWriteLeaf(x: i32, s: i32): boolean {
     k = k + 1
   }
   const t = fnTagLeafSetOf(x)
-  t >= 0 && t != s && fnTagSetIsTagged(t) && ftSetWithin(s, t)
-}
-
-// Whether the list `arr` is written holds a tagged set other than `s` with every member of `s`:
-// the write stores an id of that set, which its own decision covers.
-function ftStoreInWider(arr: i32, s: i32): boolean {
-  const ht = nodeTyIxOf(arr)
-  if ht < 0 || ht >= T.tys.length { return false }
-  const a = tyAt(ht)
-  if !(a is TyArray) { return false }
-  const o = fnTagSetOfTy(a.aElem)
-  if o < 0 || o == s || !fnTagSetIsTagged(o) { return false }
-  const om = fnTagMembers(o)
-  for d in fnTagMembers(s) {
-    if !i32ListHas(om, d) { return false }
+  if t >= 0 && t != s && fnTagSetIsTagged(t) && ftSetWithin(s, t) {
+    return true
   }
-  true
+  const d = cwFnValueDeclOf(x)
+  const out: i32[] = []
+  const with: i32[] = []
+  d >= 0
+    && fnTagWriteLeavesOf(d, s, ftHeldCur, out, with) >= 0
+    && i32ListHas(out, x)
 }
 
 // Whether `x` is a list literal whose elements each carry set `s` or name one of its members
@@ -4088,7 +4081,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       return (ftParamOfSet(pn, x, s) && ftLateParamOk(pn, x, s))
         || ftMethodTyParamArg(p, x, s)
         || ftListCallHoleArg(pn, x, s)
-        || ftSlotWriteArg(pn, x, s, fn)
+        || ftSlotWriteArg(pn, x, s)
         || ftLateArgOfSet(pn, x, s)
     }
     // A binding's annotation delivers the value to a declared function type, a closure.
@@ -4160,15 +4153,14 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       }
       if pn.binRight != x { return false }
       if ftIsS(pn.binLeft, s) { return true }
-      if ftWiderWriteLeaf(x, s) { return true }
       if ftSeededHolds(pn.binLeft, s) { return true }
       if ftHeldWider(nodeTyIxOf(pn.binLeft), s) { return true }
+      if ftWriteLeafOf(x, s) { return true }
       const ln = nodeAt(pn.binLeft)
       // `h[k] = v` stores into the slot `h.set(k, v)` does, so the holder's type decides (D15116).
       if ln is Member { return ftSlotHoldsSet(ln.memObj, ln.memProp, s) }
       return ln is Index
         && (ftSlotHoldsSet(ln.idxArr, "", s)
-        || ftStoreInWider(ln.idxArr, s)
         || ftNamedFnValue(x) && ftParamHolderHolds(ln.idxArr, s, fn))
     }
     FuncDecl => {
@@ -4598,16 +4590,14 @@ function ftHoleCallback(v: i32): boolean {
 
 // Whether argument `x` of call `c` is a value `m.set(k, v)` or `xs.push(v)` stores into a
 // holder of set `s`.
-function ftSlotWriteArg(c: Call, x: i32, s: i32, encl: i32): boolean {
+function ftSlotWriteArg(c: Call, x: i32, s: i32): boolean {
   const f = parenPeelIx(c.callFn)
   if f < 0 { return false }
   const fn = nodeAt(f)
   if !(fn is Member) { return false }
   const k = ftHoldKind(nodeTyIxOf(fn.memObj), s, FT_HOLD_DEPTH)
   if k == 1 && fn.memProp == "push" { return i32ListHas(c.callArgs, x) }
-  (ftSlotHoldsSet(fn.memObj, "", s)
-    || k == 5
-    || ftNamedFnValue(x) && ftParamHolderHolds(fn.memObj, s, encl))
+  (ftSlotHoldsSet(fn.memObj, "", s) || k == 5 || ftWriteLeafOf(x, s))
     && fn.memProp == "set"
     && c.callArgs.length == 2
     && c.callArgs[1] == x
