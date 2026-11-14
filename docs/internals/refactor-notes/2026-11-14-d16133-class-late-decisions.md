@@ -1,5 +1,7 @@
 # D16133's class: a decision made after its consumer — design proposal, 2026-11-14
 
+**Ruled 2026-11-14: (ii), staged; (iii) is D16133's fallback.**
+
 A design note for the coordinator's ruling. It makes no compiler change. It covers D16133,
 D16134, D16137 and D16077(b), and proposes one close for all four. Measured against master
 `114c78e48`.
