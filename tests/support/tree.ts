@@ -123,6 +123,10 @@ export const privateSeedCache = (dir: string): string => {
   return dir;
 };
 
+/** What a spawn of `vl` needs to share the seed's compiled forms: the ISA pin and the seed
+ * cache, which a spawn that clears its environment would otherwise lose. */
+export const seedEnv = (): Record<string, string> => ({ ...isaEnv(), VL_SEED_CACHE_DIR: SEED_CACHE });
+
 /**
  * The environment a native `vl` spawn takes: `RUST_BACKTRACE` holds a host panic
  * to one line, and `VL_STD` / `VL_COMPILER_WASM` pin both resolutions to THIS
@@ -144,7 +148,6 @@ export const nativeEnv = (
   RUST_BACKTRACE: "0",
   VL_STD: STD,
   VL_COMPILER_WASM: COMPILER,
-  VL_SEED_CACHE_DIR: SEED_CACHE,
-  ...isaEnv(),
+  ...seedEnv(),
   ...extra,
 });
