@@ -247,8 +247,9 @@ export type CrossFileSource = {
 /** Maximum `.vl` files read in a single on-disk crawl (cost bound). */
 export const MAX_DISK_FILES = 500;
 
-/** Dirs never descended during the workspace crawl. */
-const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".claude", "reference"]);
+/** Dirs never descended during the workspace crawl: `vl check`'s skips (`cliSkipDir`,
+ * compiler/cli_util.vl) plus `.claude`, whose agent worktrees are copies of the project. */
+const SKIP_DIRS = new Set([".git", "node_modules", ".claude"]);
 
 /**
  * The sentinel file names whose presence in a directory marks it as a project
