@@ -25,4 +25,12 @@ loudly (D16105) instead of validated as the wrong record.
 - New matrix `scripts/capability-probes/matrix/wider-record-write-after-read.matrix.vl`: 0 of 54
   to 54 of 54 (before = the D16102 head, fixpoint). Before, 52 cells were silent, check-clean
   invalid modules. 0 silent, 0 runs → not-runs.
-- RESULTS-PENDING
+- Sweep against the D16102 head (both fixpoint seeds):
+  - output movers: D16103 emit reject → runs, D16104 compiler trap (invalid module) → runs, the
+    new case emit reject → runs;
+  - D16105 compiler trap (invalid module) → emit reject: clause 1 becomes clause 2;
+  - 3 bytes-only movers: D2512, `assign-value-keeps-evaluation-order.vl`,
+    `assign-value-widened-call.vl`. These are numeric widening writes that now move ahead with
+    their operands spilled, instead of re-reading the name and narrowing back. Same output;
+  - 0 runs → not-runs, 0 new compiler traps.
+- The other seven value matrices are unchanged, 0 silent.
