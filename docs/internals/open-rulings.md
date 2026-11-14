@@ -1637,7 +1637,9 @@ a recommendation. The spec's own questions are in `docs/spec/OPEN-QUESTIONS.md`.
   erasure design. Brief: `docs/internals/newtype-design.md`.
 - **A10, const generics.** No grammar or semantics is recorded for a value type parameter.
 - **A13, a `"+"`-named struct field.** Is such a field spellable? Today it is a parse error.
-- **D12131, non-regular generic aliases.** Graded DESIGN 2026-11-14: VL monomorphizes, so `type L<T> = { v: T, next: L<L<T>> | null }` needs infinitely many instances and the checker refuses it (it used to trap), on the same ground D2721 refuses a generic function that recurses at a growing type argument. Neither has an owner ruling. Both would reopen together only if the owner chose a uniform generic representation, which would support polymorphic recursion.
+- **D12131 / D2721, polymorphic recursion.** RULED (owner) 2026-11-14: refused for now (a); a
+  uniform boxed representation for the generics the growth test flags (b) is backlogged in ROADMAP.md.
+  A depth cap was not taken. DECISIONS "Polymorphic recursion is refused for now…" carries it.
 - **H4.1, a `u8` value type.** Brief: `docs/internals/selfhost-gaps.md` §H4.1.
 - **A-destructure.** Object, array and parameter destructuring (`const { x, y } = p`,
   `function f({ x, y }: Pt)`). List destructuring is bounded by the no-tuples ruling.
@@ -1939,3 +1941,9 @@ produces the `i32`.
 - **D16006(a), the dead arm of a covering test.** RULED (owner) 2026-11-14: the dead arm narrows
   its operand to `never`, a true bottom (uses allowed), and the arm gets a warning; any-use-is-an-
   error was not taken. DECISIONS "A dead arm narrows its operand to `never`…" carries it.
+
+
+- **D16047, an element type nothing writes.** RULED (owner) 2026-11-14 (a1): a collection whose
+  element no write fixes satisfies every `is T[]`; a write through a narrowing pins the element like
+  any write (two element types join). Read-only narrowing (a2) and first-test settling (c) were not
+  taken. DECISIONS "A collection whose element nothing writes fits every `is T[]`…" carries it.

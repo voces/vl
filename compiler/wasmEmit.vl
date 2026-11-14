@@ -1,3 +1,5 @@
+import { identityBinIsMixed } from "./emit_fn_scans"
+import { identityArmSlot } from "./emit_if_arm_values"
 import { sharedFieldArmSetTexts } from "././emit_obj_lit_fits"
 import { armFieldElemTyIx } from "././emit_state"
 import { cUserTypes, unionAliasDeclNameOfTy } from "./check_types"
@@ -11993,6 +11995,36 @@ function unionEqNameOf(ix: i32, fnIx: i32): string {
   ""
 }
 
+// Of union types `a` and `b`, the one that carries `null` when the two have the same
+// non-null members (`memberTySame`) and only one carries it; -1 for any other pair.
+function unionNulTwinTy(a: i32, b: i32): i32 {
+  const am: i32[] = []
+  const bm: i32[] = []
+  const an = nonNullVariantsInto(a, am)
+  const bn = nonNullVariantsInto(b, bm)
+  if an == bn || am.length != bm.length || am.length == 0 { return -1 }
+  for x in am {
+    let hit = false
+    for y in bm {
+      if memberTySame(x, y) { hit = true }
+    }
+    if !hit { return -1 }
+  }
+  if an { return a }
+  b
+}
+
+// Appends the non-null variants of `ty` to `out`, answering whether it has a `null` one.
+function nonNullVariantsInto(ty: i32, out: i32[]): boolean {
+  const vs: i32[] = []
+  flattenVariantsInto(ty, vs)
+  let had = false
+  for v in vs {
+    if isNullTy(v) { had = true } else { out.push(v) }
+  }
+  had
+}
+
 // Union against union: equal iff the same arm (tag) holds and the unboxed payloads value-compare
 // equal per that arm. Folded as a nested value-typed `if` chain over the shared non-null arms,
 // bottoming out at bare tag equality — which covers the `null` arm and any non-shared arm. The
@@ -12014,6 +12046,22 @@ function emitUnionUnionEq(
       lname = unNames[lr]
       rname = lname
       lUTy = nodeTyAt(unwrapParen(lIx), fnIx)
+    }
+  }
+  // A union beside its own `| null` twin is one box, `null` one more tag of it: the compare
+  // reads the arms of the side that carries `null`.
+  if lname != rname {
+    const nt = unionNulTwinTy(
+      nodeTyAt(unwrapParen(lIx), fnIx),
+      nodeTyAt(unwrapParen(rIx), fnIx),
+    )
+    if nt >= 0 {
+      if nt == nodeTyAt(unwrapParen(lIx), fnIx) {
+        rname = lname
+      } else {
+        lname = rname
+      }
+      lUTy = nt
     }
   }
   // D973 — the struct-union path is tried before the re-readability gate, because it does not
@@ -39245,7 +39293,40 @@ function emitIdentityOperand(body: u8[], ix: i32, fnIx: i32): i32 {
   0
 }
 
+// Identity over a union of record and function arms (A15): each operand's payload is staged
+// as an `eqref`; two closures compare by declaration and environment, anything else by
+// `ref.eq`, which already holds a record against a function, or either against `null`, apart.
+function emitIdentityMixed(body: u8[], e: BinExpr, fnIx: i32) {
+  const a = identityArmSlot(0)
+  const b = identityArmSlot(1)
+  if emitIdentityOperand(body, e.binLeft, fnIx) < 0 { return -1 }
+  fbLocalSet(a)
+  if emitIdentityOperand(body, e.binRight, fnIx) < 0 { return -1 }
+  fbLocalSet(b)
+  fbLocalGet(a)
+  fbRefTest(cloStructIdx)
+  fbLocalGet(b)
+  fbRefTest(cloStructIdx)
+  fbI32Bin(113) // 0x71 i32.and
+  fbIf(127) // (result i32)
+  fbLocalGet(a)
+  fbRefCast(cloStructIdx)
+  fbLocalGet(b)
+  fbRefCast(cloStructIdx)
+  if emitCloEqCore(body) < 0 { return -1 }
+  fbElse()
+  fbLocalGet(a)
+  fbLocalGet(b)
+  fbRefEq()
+  fbEnd()
+  if e.binOp == "!=" { fbI32Eqz() }
+  0
+}
+
 function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
+  if e.binIdent != 0 && identityBinIsMixed(e, fnIx) {
+    return emitIdentityMixed(body, e, fnIx)
+  }
   if e.binIdent != 0 && emitIdentityIsRefEq(e, fnIx) {
     return emitIdentityBin(body, e, exprIx, fnIx)
   }

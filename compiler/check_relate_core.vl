@@ -23,6 +23,7 @@ import {
   fnChoiceVetoed,
   fnChoiceWideNote,
   fnLetIsWide,
+  fnLetKeptWide,
   fnTagCallNote,
   fnTagCallRefusal,
   fnTagMembers,
@@ -497,6 +498,7 @@ import {
   tyMutEpoch,
   tyNulInnerTy,
   tyPrintsAsRef,
+  tyReachesSelf,
   tySame,
   tyToStr,
   tyToStrUser,
@@ -609,6 +611,7 @@ import {
   isVoidTy,
   nhOpen,
   nonNullTy,
+  nulFoldMemberTy,
   numericRepsApart,
   primIsSubWord,
   primNameOf,
@@ -2903,7 +2906,10 @@ function applyGenAliasTys(head: string, gi: i32, argTys: i32[]): i32 {
   for at in argTys { gaOpenFlat.push(at) }
   const fnames: string[] = []
   const ftys: i32[] = []
-  const resIx = mkObjTy(fnames, ftys)
+  // A union alias's placeholder is a union, filled in place by the declaration's own rules.
+  const umems: i32[] = []
+  const unionDecl = gaDeclIsUnion(gaDeclIxs[gi])
+  const resIx = if unionDecl { mkUnionTy(umems) } else { mkObjTy(fnames, ftys) }
   gaOpenRes.push(resIx)
   cUserTypes[memoKey] = resIx
   cUserTypesVer = cUserTypesVer + 1 // new declared-name resolution registered
@@ -2926,6 +2932,7 @@ function applyGenAliasTys(head: string, gi: i32, argTys: i32[]): i32 {
     tpEnvTys.push(argTys[bi])
     bi = bi + 1
   }
+  if unionDecl { gaFillUnionInstance(gaDeclIxs[gi], resIx) }
   const decl = nodeAt(gaDeclIxs[gi])
   if decl is TypeDecl {
     const dfields = decl.tdFields
@@ -2977,7 +2984,47 @@ function applyGenAliasTys(head: string, gi: i32, argTys: i32[]): i32 {
   gaOpenGi.pop()
   gaOpenStart.pop()
   gaOpenRes.pop()
+  if unionDecl { return gaUnionUnwrap(resIx, memoKey) }
   resIx
+}
+
+// Whether generic alias declaration `declIx` is a union (`type O<T> = T | null`), not a record.
+function gaDeclIsUnion(declIx: i32): boolean { nodeAt(declIx) is UnionDecl }
+
+// Fills union placeholder `resIx` from union declaration `declIx`'s members, under the bindings
+// already pushed.
+function gaFillUnionInstance(declIx: i32, resIx: i32) {
+  const d = nodeAt(declIx)
+  const pu = tyAt(resIx)
+  if d is UnionDecl && pu is TyUnion {
+    fillUnionDeclMembers(declIx, d, pu.uMembers)
+  }
+  0
+}
+
+// A union alias instance that filled to one member (`T | null` folds to `T?`) is that member,
+// as the inline spelling is, so binding `O<T>` against `O<i32>` meets `T?` against `i32?`.
+function gaUnionUnwrap(resIx: i32, memoKey: string): i32 {
+  const u = tyAt(resIx)
+  if !(u is TyUnion) || u.uMembers.length != 1 { return resIx }
+  const m = u.uMembers[0]
+  if m < 0 { return resIx }
+  // A recursive one: a null fold is tied to its nullable first (`nulFoldTieRecord`), which no
+  // longer reaches the placeholder; any other keeps the placeholder its members point at.
+  if tyReachesSelf(resIx) {
+    if nulFoldMemberTy(resIx) < 0 { return resIx }
+    nulFoldTieRecord(m)
+  }
+  cUserTypes[memoKey] = m
+  cUserTypesVer = cUserTypesVer + 1
+  // Only a member this fill minted carries the application's name; an existing type (`A<i32>`
+  // over `type A<T> = T` is `i32`) is shared and keeps its own.
+  if m > resIx {
+    const none: string[] = []
+    const noTys: i32[] = []
+    genAppCarry(resIx, m, none, noTys)
+  }
+  m
 }
 
 // ── the three leaf rungs both resolvers bottom out at ────────────────────────
@@ -5862,6 +5909,26 @@ export function holeSetSplitsAt(s: i32, pts: i32[]): boolean {
   false
 }
 
+// Whether every member of set `s`, called at the closed parameter types `pts`, gives a result
+// assignable to `ret`; false where one stays open or cannot be read.
+export function holeSetFitsRetAt(s: i32, pts: i32[], ret: i32): boolean {
+  const ds = fnTagMembers(s)
+  if ds.length == 0 || ret < 0 || tyHasTyVar(ret) { return false }
+  const wp: i32[] = []
+  for pt in pts {
+    if pt < 0 || tyHasTyVar(pt) { return false }
+    wp.push(widenLitTy(pt))
+  }
+  const ft = mkFuncTy(wp, TY_I32)
+  for d in ds {
+    const rd = setMemberRetAt(d, ft)
+    if rd < 0 || tyHasTyVar(rd) || !assignable(widenLitTy(rd), ret) {
+      return false
+    }
+  }
+  true
+}
+
 // Whether set member `d` is a lambda the check has not reached yet, so it has no type.
 function setMemberUnchecked(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
@@ -6207,7 +6274,7 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
       // the member it holds, and one it leaves a closure is re-checked at the initialiser's type,
       // where this refuses (D16009). A call through it judged at its pin is refused here.
       if (
-        fnLetIsWide(nodeTyIxOf(ix))
+        (fnLetIsWide(nodeTyIxOf(ix)) || fnLetKeptWide(bd))
         && rs[k] != HOLE_RET_VOID
         && !holeJudgingCall
       ) {
@@ -10730,6 +10797,63 @@ export function fillTypeDeclAt(sx: i32) {
     }
   }
   0
+}
+
+// A recursive record alias spelled with `| null` (`type L = { n: L } | null`) folds to a union
+// wrapping `{ n: L }?`. Once every declaration is filled, a field of a recursive one naming such a
+// wrapper, directly, as a list element or under `| null`, is re-pointed at the wrapper's nullable,
+// so a read of it is the nullable record every reader handles, not a second type for one value.
+export function nulFoldTieKnots(stmts: i32[]) {
+  // Which wrappers are recursive is decided before any is tied: tying one re-routes the cycle
+  // of its partner in a mutual pair through the nullable, which then misses the wrapper.
+  const tie: i32[] = []
+  for sx in stmts {
+    const sd = nodeAt(sx)
+    if sd is UnionDecl {
+      const w = cUserTypes[sd.udName] ?? -1
+      const m = nulFoldMemberTy(w)
+      if m >= 0 && tyReachesSelf(w) { tie.push(m) }
+    }
+  }
+  for m in tie { nulFoldTieRecord(m) }
+  0
+}
+
+// Re-points the wrapper-typed fields of the record nullable `m` holds (`nulFoldTieKnots`).
+function nulFoldTieRecord(m: i32) {
+  const mt = tyAt(m)
+  if !(mt is TyNullable) || mt.nInner < 0 { return 0 }
+  const rec = tyAt(mt.nInner)
+  if !(rec is TyObj) { return 0 }
+  let i = 0
+  while i < rec.objFieldTypes.length {
+    rec.objFieldTypes[i] = nulFoldTiedTy(rec.objFieldTypes[i])
+    i = i + 1
+  }
+  tyMutEpoch = tyMutEpoch + 1
+  0
+}
+
+// Field type `f` with a null-fold wrapper in it replaced by the wrapper's nullable: the field
+// itself, a list's element, or the inner of a `| null`, which folds into it.
+function nulFoldTiedTy(f: i32): i32 {
+  const fm = nulFoldMemberTy(f)
+  if fm >= 0 { return fm }
+  if f < 0 { return f }
+  const ft = tyAt(f)
+  match ft {
+    TyNullable => {
+      const im = nulFoldMemberTy(ft.nInner)
+      if im >= 0 { return im }
+    }
+    TyArray => {
+      const em = nulFoldMemberTy(ft.aElem)
+      if em >= 0 { ft.aElem = em }
+    }
+    // Any other field type holds no wrapper this tie reaches.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {}
+  }
+  f
 }
 
 // Fills declaration `name` now, when pass 0b is running and has not reached it yet. Inert
