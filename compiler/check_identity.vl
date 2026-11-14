@@ -1,0 +1,123 @@
+// The checker's rule for `===` and `!==`, reference identity (DECISIONS A15): which operands
+// carry an identity, and the refusal when one does not. `check_operators.vl` dispatches here
+// after both operands are checked, with literal operands already widened.
+// Does not lower anything; the emitter's arm is separate.
+import { P, STRICT_EQ_CODE } from "./ast"
+import { assignable, tErr, tErrPushTok } from "./check_relate_core"
+import { nomBinMixes } from "./check_type_shape"
+import {
+  T,
+  TY_BOOL,
+  TY_ERR,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyAt,
+  tyToStr,
+} from "./check_types"
+import { nodeLastTok } from "./fmt_util"
+import { isNullTy } from "./tyquery"
+
+// Whether a value of type `ty` has an identity `===` can compare: a record, a list, a map, a
+// function, a nullable of one, or a union whose arms are all records. A type parameter answers
+// true, so the refusal it meets names the missing lowering rather than a missing identity.
+export function tyHasIdentity(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = tyAt(ty)
+  match t {
+    TyObj | TyFunc | TyArray | TyMap | TyVar => {
+      return true
+    }
+    TyNullable => {
+      return tyHasIdentity(t.nInner)
+    }
+    TyUnion => {
+      let arms = 0
+      for m in t.uMembers {
+        if !isNullTy(m) {
+          if m < 0 || !(tyAt(m) is TyObj) { return false }
+          arms = arms + 1
+        }
+      }
+      return arms > 0
+    }
+    TyPrim | TyErr | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// The operator token of identity compare `ix`: the token after its left operand's last one,
+// when that token spells `op`, else -1.
+function identityOpTok(leftIx: i32, op: string): i32 {
+  const lastL = nodeLastTok(leftIx)
+  if lastL < 0 || lastL + 1 >= P.toks.length { return -1 }
+  if P.toks[lastL + 1].text != op { return -1 }
+  lastL + 1
+}
+
+// Raise `msg` at the operator token of compare `ix` (left operand `leftIx`), else at the node.
+function identityErr(
+  msg: string,
+  ix: i32,
+  leftIx: i32,
+  op: string,
+  code: string,
+) {
+  const tk = identityOpTok(leftIx, op)
+  if tk >= 0 { return tErrPushTok(msg, ix, tk, code, "") }
+  tErr(msg, ix)
+  0
+}
+
+// Checks `left op right` (at `ix`) for `op` of `===` or `!==`, over operand types `lt` and `rt`;
+// answers `boolean`. An operand with no identity is refused with the `==` spelling, which
+// `check --fix` writes; operands no value can share are refused as `==` refuses them.
+export function checkIdentityBinNode(
+  ix: i32,
+  leftIx: i32,
+  rightIx: i32,
+  op: string,
+  lt: i32,
+  rt: i32,
+): i32 {
+  if lt == TY_ERR || rt == TY_ERR { return TY_BOOL }
+  const eqOp = op.slice(0, 2)
+  const sides = [lt, rt]
+  for s in sides {
+    if s >= 0 && !isNullTy(s) && !tyHasIdentity(s) {
+      identityErr(
+        "`"
+          + op
+          + "` compares identity, and `"
+          + tyToStr(s)
+          + "` has none — use `"
+          + eqOp
+          + "`",
+        ix,
+        leftIx,
+        op,
+        STRICT_EQ_CODE,
+      )
+      return TY_BOOL
+    }
+  }
+  if lt >= 0 && rt >= 0 && !isNullTy(lt) && !isNullTy(rt) {
+    if (
+      nomBinMixes(lt, rt, leftIx, rightIx)
+      || !(assignable(lt, rt) || assignable(rt, lt))
+    ) {
+      tErr("cannot compare " + tyToStr(lt) + " and " + tyToStr(rt), ix)
+      return TY_BOOL
+    }
+  }
+  TY_BOOL
+}
