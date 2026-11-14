@@ -101,6 +101,7 @@ import {
   nodeSpineChildren,
 } from "./ast"
 import { fvaRetRowsNote, monoRecheckBegin } from "./check_assignable"
+import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
 import {
   recBuildCount,
   recBuildTable,
@@ -171,6 +172,7 @@ import {
   recEnclosingFn,
   recHoleIdentityArg,
   recordRepTyAdopt,
+  repStampListBuilt,
 } from "./check_fit_rules"
 import { recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
 import { recSolePinArg } from "./check_record_origins"
@@ -286,6 +288,7 @@ import {
 import {
   REC_REBUILT_DEPTH,
   callArgRepTy,
+  recArgBuiltTyIn,
   recListRepWidens,
   recRebuiltLeafRow,
   recRepWidens,
@@ -360,6 +363,7 @@ import {
   mintScopeTysOf,
   mintSeedNote,
   mintSetPartialNote,
+  mintStoreNote,
 } from "./check_mint"
 import {
   T,
@@ -3385,6 +3389,7 @@ function elabOneAt(k: i32) {
     }
     c = c + 1
   }
+  for oc in elabCbOpenCalls[decl] ?? [] { elabCbAtBuild(oc, k) }
   let b = 0
   while b < elabCbD.length {
     if tysClosed(elabCbT[b]) {
@@ -9601,6 +9606,40 @@ function elabMintOuterSlotFactAt(c: Call, ix: i32, k: i32, sc: i32): boolean {
   true
 }
 
+// Notes, for a call through a field of a `let` alias of a parameter at set `set`, each record
+// literal written to the alias as stored at that set, and the alias as read as the parameter.
+function elabMintStoresAt(cf: i32, set: i32) {
+  const cn = nodeAt(cf)
+  if !(cn is Member) { return 0 }
+  const o = parenPeelIx(cn.memObj)
+  const d = if o >= 0 && o < P.nodes.length && nodeAt(o) is Ident { identDeclOf(o) } else { -1 }
+  const ls = elabLetLitWrites(d)
+  if ls.length == 0 { return 0 }
+  for l in ls {
+    if !elabLitFnsWithin(l, set) { return 0 }
+  }
+  mintAliasNote(d)
+  for l in ls { mintStoreNote(l, set) }
+  0
+}
+
+// Whether every field of record literal `l` naming a function names a member of set `set`.
+function elabLitFnsWithin(l: i32, set: i32): boolean {
+  const ln = nodeAt(l)
+  if !(ln is ObjLit) { return false }
+  const ms = fnTagMembers(set)
+  for fx in ln.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit {
+      const v = parenPeelIx(f.fiValue)
+      const fd = if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident { identFnDeclOf(v) } else { -1 }
+      if fd >= 0 && !i32ListHas(ms, fd) { return false }
+      if v >= 0 && v < P.nodes.length && nodeAt(v) is FuncDecl { return false }
+    }
+  }
+  true
+}
+
 // Notes the fact for call `c` at `ix` in instance `k` when its callee is an element or a `get`
 // read out of a parameter of `decl`, directly or by a `const` bound to that read, and the
 // instance types the callee at a set the check's typing of the body could not see.
@@ -9639,6 +9678,7 @@ function elabMintParamRowFactAt(
   const st = nonNullTy(elabNodeTy(cf, k))
   const set = fnTagSetOfTy(st)
   if set < 0 || fnTagSetOfTy(nonNullTy(nodeTyIxOf(cf))) >= 0 { return false }
+  elabMintStoresAt(cf, set)
   const ds = fnTagMembers(set)
   if ds.length == 0 { return false }
   const wp: i32[] = []
@@ -9730,6 +9770,25 @@ function elabConstParamAlias(d: i32, fn: FuncDecl): i32 {
   if pd >= 0 && i32ListHas(fn.fnParams, pd) { pd } else { -1 }
 }
 
+// The record literals written to `let` `b` after its initializer, where every such write is one
+// and nothing in a nested function writes it; else [].
+function elabLetLitWrites(b: i32): i32[] {
+  const out: i32[] = []
+  const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { null }
+  if !(bn is LetDecl) || bn.letKw != "let" { return out }
+  cwIxWant()
+  const vs = cwBindingWrittenValues(b)
+  if vs.length < 2 || cwLetWrittenInClosure(b) { return out }
+  for v in vs {
+    const x = parenPeelIx(v)
+    if v != bn.letInit {
+      if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) { return [] }
+      out.push(x)
+    }
+  }
+  out
+}
+
 // `elabConstParamAlias` for a parameter of any function.
 function elabConstParamAliasAny(d: i32): i32 {
   let b = d
@@ -9738,7 +9797,13 @@ function elabConstParamAliasAny(d: i32): i32 {
     const bn = nodeAt(b)
     if bn is Param { return if hops > 0 { b } else { -1 } }
     if !(bn is LetDecl) || bn.letType >= 0 || bn.letInit < 0 { return -1 }
-    if bn.letKw != "const" && !cwLetUnwritten(b) { return -1 }
+    if (
+      bn.letKw != "const"
+      && !cwLetUnwritten(b)
+      && elabLetLitWrites(b).length == 0
+    ) {
+      return -1
+    }
     const i = parenPeelIx(bn.letInit)
     if i < 0 || i >= P.nodes.length || !(nodeAt(i) is Ident) { return -1 }
     b = identDeclOf(i)
@@ -10271,6 +10336,7 @@ export function elabRun() {
   const setLams: i32[] = []
   const annDelivs: i32[] = []
   elabCalls = []
+  elabCbOpenCalls = Map()
   elabResultScanReset()
   while g < P.nodes.length {
     elabGenTy.push(nodeTyIxOf(g))
@@ -10386,10 +10452,17 @@ export function elabRun() {
   }
   // A call of a module binding above its declaration, at its arguments' own types.
   for ec in elabEarlyCalls { elabEarlyCallRows(ec) }
-  // A generic named as a list method's callback, at the element.
+  for c in elabCalls {
+    elabSameSlotsAtBuild(c)
+    elabCbAtBuild(c, -1)
+  }
+  // A generic named as a list method's callback, at the element, unless it is at a build.
   let cb = 0
   while cb < elabCbRootD.length {
-    if tysClosed(elabCbRootT[cb]) {
+    if (
+      tysClosed(elabCbRootT[cb])
+      && elabValueKeys.get(elabCbRootX[cb]) == null
+    ) {
       const cbk = elabEnqueue(
         elabCbRootD[cb],
         elabCbRootN[cb],
@@ -15523,6 +15596,119 @@ function elabCallbackParamAt(m: string): i32 {
   }
   if m == "reduce" { return 1 }
   -1
+}
+
+// The callback of `map` or `filter` at call `c` under instance `from`, over a list whose elements
+// are stored at a record other than its element type, is instanced with its parameter delivered
+// at that record, the `#r.0` entry of its key: a lambda, or a hole function it names (D16134). A
+// lambda an open declaration encloses is noted for that declaration's instances instead.
+function elabCbAtBuild(c: i32, from: i32) {
+  const cn = nodeAt(c)
+  if !(cn is Call) || cn.callFn < 0 || cn.callArgs.length != 1 { return 0 }
+  const m = nodeAt(parenPeelIx(cn.callFn))
+  if !(m is Member) || (m.memProp != "map" && m.memProp != "filter") {
+    return 0
+  }
+  const x = cn.callArgs[0]
+  const ax = parenPeelIx(x)
+  const an = if ax >= 0 && ax < P.nodes.length { nodeAt(ax) } else { null }
+  const fd = if an is Ident { identFnDeclOf(ax) } else if an is FuncDecl { ax } else { -1 }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnParams.length != 1 || f.fnTyParams.length > 0 {
+    return 0
+  }
+  if an is FuncDecl && f.fnName != "" { return 0 }
+  const p = nodeAt(f.fnParams[0])
+  if !(p is Param) || p.parType >= 0 { return 0 }
+  const lt = nodeTyIxOf(m.memObj)
+  const la = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+  if !(la is TyArray) || la.aElem < 0 || !elabTyClosed(la.aElem, 0) { return 0 }
+  const bt = elabListElemBuild(m.memObj, 0)
+  if (
+    bt < 0
+    || !(tyAt(bt) is TyObj)
+    || fieldStorageEq(la.aElem, bt, REC_STORE_DEPTH)
+    || elabDeliveredRowClassFn(bt) == ""
+  ) {
+    return 0
+  }
+  const names: string[] = []
+  const tys: i32[] = []
+  if an is Ident {
+    names.push("?" + f.fnName + ".0")
+    tys.push(la.aElem)
+  } else if (
+    from < 0
+    && (elabEncl[fd] ?? -1) >= 0
+    && declOpen(elabEncl[fd] ?? -1)
+  ) {
+    const e = elabEncl[fd] ?? -1
+    const cs = elabCbOpenCalls[e] ?? []
+    if !i32ListHas(cs, c) { cs.push(c) }
+    elabCbOpenCalls[e] = cs
+    return 0
+  }
+  names.push("#r.0")
+  tys.push(bt)
+  const k = elabEnqueue(fd, names, tys, from)
+  if k < 0 { return 0 }
+  elabValueKeyNote(ax, from, k)
+  if ax != x { elabValueKeyNote(x, from, k) }
+  elabReachNote(from, k, -1)
+  0
+}
+
+// The `map` and `filter` calls `elabCbAtBuild` defers to each instance of their lambda's open
+// enclosing declaration: declaration → calls.
+let elabCbOpenCalls: {[i32]: i32[]} = Map()
+
+// The record the elements of list `x` are stored at, by the builds after the check: a binding's,
+// a list built at a wider record, or the receiver of a method handing back its own elements; -1
+// for none.
+function elabListElemBuild(x0: i32, depth: i32): i32 {
+  const x = parenPeelIx(x0)
+  if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
+  const n = nodeAt(x)
+  if n is Ident {
+    const d = recHeldDecl(x)
+    if d >= 0 { return recBuildTyIn(recBuildTable(), d, true) }
+    return -1
+  }
+  const lb = if n is Call && nodeRepStamped(x) { nodeRepTyIxOf(x) } else { recArgBuiltTyIn(x, nodeTyIxOf(x), recBuildTable()) }
+  const lbt = if lb >= 0 && lb < T.tys.length { tyAt(lb) } else { null }
+  if lbt is TyArray { lbt.aElem } else { -1 }
+}
+
+// Stamps a `filter` or `slice` call `c` with the list of the record its receiver's elements are
+// stored at, where that is another than its element type: the result holds the same elements.
+function elabSameSlotsAtBuild(c: i32) {
+  const cn = nodeAt(c)
+  if !(cn is Call) || cn.callFn < 0 { return 0 }
+  const m = nodeAt(parenPeelIx(cn.callFn))
+  if !(m is Member) || (m.memProp != "filter" && m.memProp != "slice") {
+    return 0
+  }
+  const lt = nodeTyIxOf(c)
+  const la = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+  if !(la is TyArray) || la.aElem < 0 || !elabTyClosed(la.aElem, 0) { return 0 }
+  const bt = elabListElemBuild(m.memObj, 0)
+  if (
+    bt < 0
+    || !(tyAt(bt) is TyObj)
+    || fieldStorageEq(la.aElem, bt, REC_STORE_DEPTH)
+  ) {
+    return 0
+  }
+  repStampListBuilt(c, mkArrayTy(bt))
+  0
+}
+
+// The record the list callback `x` (a lambda, or a name of `decl`) takes its parameter at under
+// the instance being walked (`elabCbAtBuild`), read at `x` or the node a clone copied; else -1.
+export function elabCbParamRowTy(x: i32, decl: i32): i32 {
+  let k = elabWalkKeyOf(x, false, decl)
+  if k < 0 { k = elabWalkKeyOf(nodeSrc[x] ?? -1, false, decl) }
+  elabKeyRowAt(k, 0)
 }
 
 // Whether list method `m` hands back a list of the receiver's own elements.
