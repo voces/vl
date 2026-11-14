@@ -194,13 +194,15 @@ function population(name: string, wdir: string): Prog[] {
 // ── grading one chunk: `--grade-chunk <file>` ──────────────────────────────────────
 
 // What one program did: the outcome, the exit code of the last stage that ran, the first
-// message normalised, and the files whose bytes are its stdout and its module ("" for none).
+// message normalised, the files whose bytes are its stdout and its module ("" for none), and
+// for a trap the last line it printed, where a `__trap__` puts its sentence ("" otherwise).
 type Got = {
   outcome: string,
   code: i32,
   msg: string,
   stdout: string,
   module: string,
+  said: string,
 }
 
 // What a chunk worker needs: the binary, the seed, `std/`, the scratch root whose path is
@@ -272,7 +274,14 @@ function fromCheck(c: Ctx, r: JsonMap, kept: string): Got {
 
 // A grade the check settled: nothing ran, so there is no stdout.
 function checked(outcome: string, code: i32, msg: string, module: string): Got {
-  { outcome: outcome, code: code, msg: msg, stdout: "", module: module }
+  {
+    outcome: outcome,
+    code: code,
+    msg: msg,
+    stdout: "",
+    module: module,
+    said: "",
+  }
 }
 
 // `vl check --batch --json --codegen` over `files`, keeping modules under `kd`: the record
@@ -343,13 +352,29 @@ function runFailed(
   else if contains(text, COMPILER_TRAPPED) { outcome = "compiler_trap" }
   else if anyIn(text, INVALID) { outcome = "invalid_wasm" }
   else if anyIn(text, TRAP) { outcome = "trap" }
+  let said = ""
+  if outcome == "trap" && out != "" && exists(out) {
+    said = lastLine(readText(out))
+  }
   {
     outcome: outcome,
     code: code,
     msg: message(c, cause(text)),
     stdout: out,
     module: module,
+    said: said,
   }
+}
+
+// The last non-blank line of `text`, or "".
+function lastLine(text: string): string {
+  const ls = splitLines(text)
+  let i = ls.length - 1
+  while i >= 0 {
+    if lstripWs(ls[i]) != "" { return ls[i] }
+    i = i - 1
+  }
+  ""
 }
 
 // Run one check-clean program alone, from its module when there is one, else its source.
@@ -360,7 +385,14 @@ function runSolo(c: Ctx, f: string, module: string, sd: string): Got {
   const out = sd + "/" + base(what) + ".solo.out"
   writeText(out, r.out)
   if r.code == 0 {
-    return { outcome: "runs", code: 0, msg: "", stdout: out, module: module }
+    return {
+      outcome: "runs",
+      code: 0,
+      msg: "",
+      stdout: out,
+      module: module,
+      said: "",
+    }
   }
   runFailed(c, r.code, r.err + r.out, out, module)
 }
@@ -389,6 +421,7 @@ function gradeGroup(c: Ctx, progs: Prog[], sub: string, res: Map<string, Got>) {
           msg: "check timeout",
           stdout: "",
           module: "",
+          said: "",
         }
       } else {
         res[p.key] = {
@@ -397,6 +430,7 @@ function gradeGroup(c: Ctx, progs: Prog[], sub: string, res: Map<string, Got>) {
           msg: message(c, cause(t.err + t.out)),
           stdout: "",
           module: "",
+          said: "",
         }
       }
     } else {
@@ -448,6 +482,7 @@ function gradeGroup(c: Ctx, progs: Prog[], sub: string, res: Map<string, Got>) {
             msg: "",
             stdout: o,
             module: wasms[i],
+            said: "",
           }
         }
       }
@@ -479,7 +514,7 @@ function hashes(files: string[]): Map<string, string> {
 
 // A chunk file is five header lines (vl, seed, std, scratch root, chunk scratch) and then
 // one `key\tfile\trun` line per program. The answer goes to `<file>.out`, one
-// `key\toutcome\texit\tstdout\tmodule\tmsg` line per program.
+// `key\toutcome\texit\tstdout\tmodule\tmsg\tsaid` line per program.
 function gradeChunk(file: string) {
   const lines = readText(file).split("\n")
   const c: Ctx = {
@@ -526,13 +561,20 @@ function gradeChunk(file: string) {
   const out: string[] = []
   for p in progs {
     const r = res[p.key]
-      ?? { outcome: "", code: 0, msg: "", stdout: "", module: "" }
+      ?? {
+      outcome: "",
+      code: 0,
+      msg: "",
+      stdout: "",
+      module: "",
+      said: "",
+    }
     let so = ""
     if r.stdout != "" { so = h[r.stdout] ?? "?" }
     let mo = ""
     if r.module != "" { mo = h[r.module] ?? "?" }
     out.push(
-      "\{p.key}\t\{r.outcome}\t\{toString(r.code)}\t\{so}\t\{mo}\t\{r.msg}\n",
+      "\{p.key}\t\{r.outcome}\t\{toString(r.code)}\t\{so}\t\{mo}\t\{r.msg}\t\{r.said}\n",
     )
   }
   writeText(file + ".out", join(out, ""))
@@ -578,6 +620,8 @@ function recordOf(f: string[]): JsonMap {
   rec["stdout"] = f[3]
   rec["module"] = f[4]
   rec["msg"] = f[5]
+  // Only a trap's line carries what it said, which only the owed check reads.
+  if f.length > 6 && f[6] != "" { rec["said"] = f[6] }
   rec
 }
 
@@ -825,8 +869,9 @@ function listFirst(title: string, keys: string[]) {
   }
 }
 
-// The owed refusals a PR lists, `<cell key> <D-id>` per line (scripts/sweep.md, "Owed
-// refusals"): a clause-1 row's witness that ran wrong and is now refused at check, by design.
+// The owed refusals a PR lists, `<cell key> <D-id>` per line, or `<cell key> <D-id> trap:
+// <sentence>` (scripts/sweep.md, "Owed refusals"): a clause-1 row's witness that ran wrong and
+// is now refused at check, or stops at the `__trap__` that prints that sentence, by design.
 const OWED = "scripts/sweep-owed.txt"
 
 // The status line of inventory row `id` (its first `**` line), or "" when no row file exists.
@@ -840,6 +885,24 @@ function rowStatus(id: string): string {
     }
   }
   ""
+}
+
+// The outcome an owed entry lists: a check refusal, or a trap where it names a sentence.
+function owedTarget(says: string): string {
+  if says == "" { return "check_reject" }
+  "trap"
+}
+
+// Whether recording line `y` is the outcome an owed entry naming `says` allows: a check
+// refusal, or a `__trap__` (the wasm `unreachable` it lowers to) whose last printed line holds
+// `says`. Any other trap is what a compiler defect looks like, so it still blocks.
+function owedReached(says: string, y: JsonMap): boolean {
+  const yo = strField(y, "outcome")
+  if says == "" { return yo == "check_reject" }
+  if yo != "trap" || findFrom(strField(y, "msg"), "unreachable", 0) < 0 {
+    return false
+  }
+  findFrom(strField(y, "said"), says, 0) >= 0
 }
 
 function hasStr(xs: string[], x: string): boolean {
@@ -866,20 +929,30 @@ function diff(argsIn: string[]): i32 {
     print(USAGE)
     return 2
   }
-  // Each listed key with its row, refused when the row is missing or not clause 1.
+  // Each listed key with its row and, for a designed trap, the sentence it must print; refused
+  // when the row is missing or not clause 1.
   const owedKey: string[] = []
   const owedRow: string[] = []
+  const owedSays: string[] = []
   const owedBad: string[] = []
   if exists(owedPath) {
     for l in splitLines(univNl(readText(owedPath))) {
-      const t = lstripWs(l)
+      let t = lstripWs(l)
       if t == "" || startsWith(t, "#") { continue }
+      let says = ""
+      const tp = findFrom(t, " trap: ", 0)
+      if tp >= 0 {
+        says = lstripWs(t.slice(tp + 7, t.length))
+        t = t.slice(0, tp)
+      }
       const parts: string[] = []
       for w in split(t, " ") {
         if w != "" { parts.push(w) }
       }
-      if parts.length != 2 {
-        owedBad.push("    \{t}  (want `<cell key> <D-id>`)")
+      if parts.length != 2 || (tp >= 0 && says == "") {
+        owedBad.push(
+          "    \{lstripWs(l)}  (want `<cell key> <D-id>` or `<cell key> <D-id> trap: <sentence>`)",
+        )
         continue
       }
       const st = rowStatus(parts[1])
@@ -892,6 +965,7 @@ function diff(argsIn: string[]): i32 {
       } else {
         owedKey.push(parts[0])
         owedRow.push(parts[1])
+        owedSays.push(says)
       }
     }
   }
@@ -918,18 +992,19 @@ function diff(argsIn: string[]): i32 {
     const ch = changes(x, y)
     const xo = strField(x, "outcome")
     const yo = strField(y, "outcome")
-    if xo == "check_reject" && yo == "check_reject" && hasStr(owedKey, c) {
+    let oi = -1
+    let ok = 0
+    while ok < owedKey.length {
+      if owedKey[ok] == c { oi = ok }
+      ok = ok + 1
+    }
+    if oi >= 0 && xo != "runs" && xo == yo && owedTarget(owedSays[oi]) == yo {
       owedLanded.push(c)
     }
     if xo == "runs" && yo != "runs" {
-      // A listed clause-1 witness may stop running only into a check refusal.
-      let oi = -1
-      let ok = 0
-      while ok < owedKey.length {
-        if owedKey[ok] == c { oi = ok }
-        ok = ok + 1
-      }
-      if oi >= 0 && yo == "check_reject" {
+      // A listed clause-1 witness may stop running only into a check refusal, or into the
+      // `__trap__` whose sentence it lists.
+      if oi >= 0 && owedReached(owedSays[oi], y) {
         owedUsed.push("    \{c}  (\{owedRow[oi]})  \{ch}")
       } else {
         lost.push("    \{c}  \{ch}")
@@ -984,7 +1059,7 @@ function diff(argsIn: string[]): i32 {
     }
     if !used {
       owedBad.push(
-        "    \{k}  (listed, but it did not move from runs to check_reject)",
+        "    \{k}  (listed, but it did not move from runs to the outcome it lists)",
       )
     }
   }
