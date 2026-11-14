@@ -11,13 +11,18 @@ The refusal and its sentence are unchanged except for the `argument N:` head.
 ## D16150: one type parameter, many rows
 
 Each annotation a generic resolves mints its own `TyVar` row for `T`. `tyEq` matches type
-variables by name, but `tySame` matches them by index, so an `is` spelling never matched the
+variables by name, but `tySame` matched them by index, so an `is` spelling never matched the
 parameter's arm. A new `tyVarDeclOwner` column records the declaration whose parameter a row
-names, where signatures (`resolveAnnotTs`) and bodies (`fnDeclPushTyParams`) mint them.
-`tySameDecl` reads that column and is used only by `recIsFitsAcrossTags`. A global change to
-`tySame` was tried and refused: it moves a nested generic's redeclared `T` off its `argument 1:`
-head (`error-nested-redeclared-param-called-with-outer-value-operator.vl`). It also moved D4155
-to `runs`, which the narrow form does not; D4155 stays filed.
+names, where signatures (`resolveAnnotTs`) and bodies (`fnDeclPushTyParams`) mint them, and
+`tySame` now compares type variables by that column. An unrecorded row is still only its own
+index.
+
+One reader depended on the old index rule: `cstrPinBinding` drops the binding of an enclosing
+generic's parameter from a call that names no declaration, and it matched that parameter by name.
+A nested generic that redeclares `T` is such a call (nested declarations are not in
+`fnDeclIx`), so its own binding was dropped. It is kept now when the called declaration
+redeclares the name. The file bisect over every `tySame` caller found this one site
+(`check_calls.vl`). D4155 (`as? T[]` in a generic body) runs with the same change.
 
 `tyVarOwner` moved from `check_hole_pins.vl` to `check_types.vl`, where `tySame` can read the
 new column without an import cycle. Its readers import it from there.

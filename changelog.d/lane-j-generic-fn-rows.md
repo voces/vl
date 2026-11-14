@@ -7,3 +7,4 @@
   element of its narrowed list arm.
 - **D16110 closed:** `===` in a generic passed as a value is refused at the enclosing call's argument
   that has no identity, as a direct call is.
+- **D4155 closed:** `as? T[]` inside a generic body names the operand's written `T[]` arm.
