@@ -450,7 +450,9 @@ import {
   LBK_UNION,
   ListKind,
   PK_I16,
+  PK_I8,
   PK_U16,
+  PK_U8,
   RLK_CLOSURE,
   RLK_F32_LIST,
   RLK_F64_LIST,
@@ -693,9 +695,13 @@ import {
   optRecvSlot,
   optRecvStagedIx,
   optRecvStagedSet,
+  pkElemNameOfRow,
+  pkKindOfRow,
   pkPushBase,
+  pkRowOfKind,
   pkRowOfPrim,
   pkRowOfWrap,
+  pkTwinCodeOfRow,
   pushScratchBase,
   rlBackIdx,
   rlElemHeap,
@@ -1193,6 +1199,7 @@ import {
   unionEqAtomKindOf,
 } from "./emit_closure_sites"
 import {
+  atomEqSlotOfKind,
   eqKindIsRecord,
   eqRowFieldCount,
   eqRowFieldKind,
@@ -8254,6 +8261,13 @@ function listWrapHeapOfKind(k: i32) {
     if !vbU8ArmUsed { return -1 }
     return bl8Ty()
   }
+  // A wider or signed packed list rides its own row's wrapper; its code exists only once a
+  // union arm registered the row.
+  const pr = pkRowOfKind(k)
+  if pr > PK_U8 {
+    if pkTwinCodeOfRow(pr) < 0 { return -1 }
+    return pkWrapAt(pr)
+  }
   -1
 }
 
@@ -9323,11 +9337,10 @@ function coerceValueAtomKind(
   } else if exprI64Array(exprIx, fnIx) {
     cak = 10 // "i64[]"
   } else if exprU8Array(exprIx, fnIx) {
-    // Checked before the i32-list arm for the same reason the f32 arm precedes the f64 one: a
-    // `u8[]` element reads as an i32 everywhere (`array.get_u` widens it), so the generic array
-    // arm below would claim it and tag the box `i32[]` over a one-byte backing. Without this
-    // arm a `u8[]` carrier falls past the whole ladder and boxes its wrapper ref as an i32.
-    cak = 13 // "u8[]"
+    // Before the i32-list arm: a packed element reads as an i32, so that arm would claim it and
+    // tag the box `i32[]` over a packed backing. Every packed width classifies here, and its row
+    // picks `u8[]`'s code or its own twin's.
+    cak = pkKindOfRow(exprPackedRow(exprIx, fnIx))
   } else if exprArray(exprIx, fnIx) {
     cak = 7 // "i32[]"
     // "boolean[]" (17) or "(boolean | null)[]" (18), read at this instance's pin
@@ -9393,6 +9406,16 @@ function coerceValueAtomKind(
   cak
 }
 
+// The value-atom kind of union type `uTy`'s packed list arm, the first width in row order, or
+// -1 when it has none.
+function unionPackedListKindOfTy(uTy: i32): i32 {
+  if unionHasAtomOfTy(uTy, "u8", true) { return 13 }
+  if unionHasAtomOfTy(uTy, "i8", true) { return pkKindOfRow(PK_I8) }
+  if unionHasAtomOfTy(uTy, "u16", true) { return pkKindOfRow(PK_U16) }
+  if unionHasAtomOfTy(uTy, "i16", true) { return pkKindOfRow(PK_I16) }
+  -1
+}
+
 // The list widening of the atom code `cak0` entering union type `uTy`: a list literal whose
 // union holds it as a wider or packed list takes that arm's code, and builds at that arm's type.
 function coerceListAtomOf(cak0: i32, uTy: i32, bareIx: i32, fnIx: i32): i32 {
@@ -9413,9 +9436,10 @@ function coerceListAtomOf(cak0: i32, uTy: i32, bareIx: i32, fnIx: i32): i32 {
       cak = 8 // "f64[]"
     } else if unionHasAtomOfTy(uTy, "f32", true) {
       cak = 12 // "f32[]"
-    } else if unionHasAtomOfTy(uTy, "u8", true) {
+    } else {
       // An empty `[]` classifies `i32[]` too: into `u8[] | Buf` it is the packed list.
-      cak = 13 // "u8[]"
+      const pk = unionPackedListKindOfTy(uTy)
+      if pk >= 0 { cak = pk }
     }
   }
   // A float-element literal classifies `f64[]`; where the union's only float-list atom is
@@ -10841,7 +10865,7 @@ function emitUnionAtomPayloadEq(body: u8[], k: i32, fnIx: i32) {
   // own frame (`cloEqNoteBin`), and this ladder is where the arm reaches it.
   if k == 11 { return emitCloEqCore(body) }
   const lk = leqCoreKindOfAtomKind(k)
-  if lk >= 0 { return emitListEqAnyRep(body, lk, 0, fnIx) }
+  if lk >= 0 { return emitListEqAnyRep(body, lk, atomEqSlotOfKind(k), fnIx) }
   // D-EQOPCODE: the scalar payload compare's opcode is another projection of the same code
   // that chose the tag and the unbox, not a fresh question about the arm's spelling.
   fbI32Bin(atomEqOpcodeOfKind(k))
@@ -40503,13 +40527,16 @@ function coalNicheAtomKind(lhsIx: i32, fnIx: i32): i32 {
     return 7
   }
   const nsk = exprNulScalarListKind(lhsIx, fnIx)
+  if nsk == "nulu8list" {
+    // One kind of list holds every packed width; the operand's row picks the arm.
+    return pkKindOfRow(tyPackedRow(nodeTyIxOf(unwrapParen(lhsIx))))
+  }
   if nsk != null { return nulScalarListAtomKind(nsk) }
   -1
 }
 
-// The element spelling a ref value-atom code names — `valueAtomKind`'s inverse over exactly
-// the codes a nullable-ref niche can carry, for the union-membership test below. The code is
-// an array atom unless it is 2 (`string`), so the caller derives the array flag from it.
+// The element spelling of ref value-atom kind `k`, over exactly the kinds a nullable-ref niche
+// can carry, or "" for any other kind. The kind is an array atom unless it is 2 (`string`).
 function refAtomElemName(k: i32): string {
   if k == 2 { return "string" }
   if k == 7 { return "i32" }
@@ -40518,7 +40545,8 @@ function refAtomElemName(k: i32): string {
   if k == 9 { return "string" }
   if k == 10 { return "i64" }
   if k == 12 { return "f32" }
-  if k == 13 { return "u8" }
+  const pr = pkRowOfKind(k)
+  if pr >= 0 { return pkElemNameOfRow(pr) }
   ""
 }
 
