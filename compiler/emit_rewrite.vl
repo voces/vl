@@ -1840,6 +1840,8 @@ function drwWalk(ix: i32, ctx: i32) {
   const atStmt = drwAtStmt
   drwAtStmt = false
   if !atStmt && drwCompoundValueRunsTwice(ix, ctx) {
+    const sp = drwCompoundValueSpill(ix, ctx)
+    if sp >= 0 { return drwWalk(sp, ctx) }
     emitFail(
       "emitProgram: a compound write (`++p`, `p++`, `p op= v`) used as a value reads and writes a place whose receiver or index has an effect, which would run twice; write it as its own statement",
     )
@@ -2716,6 +2718,38 @@ function drwCompoundRecvRunsTwice(t: i32, ctx: i32): boolean {
   const tn = nodeAt(t)
   if tn is Member { return !cpReReadable(tn.memObj, ctx) }
   false
+}
+
+// The compound write `ix` in a value position, as `if true { <spills> ix } else { <zero> }`: its
+// receiver and index run once before the write, as at a statement. -1 for a write whose type has
+// no literal to stand in the arm that never runs.
+function drwCompoundValueSpill(ix: i32, ctx: i32): i32 {
+  const ty = nodeTyIxOf(ix)
+  const prim = tyPrimNameOf(ty)
+  const wn = nodeAt(ix)
+  const pos = if wn is Unary { wn.pos } else if wn is BinExpr { wn.pos } else { -1 }
+  let z = -1
+  if ty == TY_STR {
+    z = mkStr("", pos)
+  } else if prim == "i32" || prim == "i64" || prim == "f32" || prim == "f64" {
+    z = nssZero(ty, pos)
+  }
+  if z < 0 { return -1 }
+  nodeTyRecord(z, ty)
+  const st: i32[] = []
+  spillCompoundPlace(ix, st, ctx)
+  st.push(ix)
+  const thenB = mkBlock(st, pos)
+  nodeTyRecord(thenB, ty)
+  const elseSt: i32[] = [z]
+  const elseB = mkBlock(elseSt, pos)
+  nodeTyRecord(elseB, ty)
+  const cond = mkBool(1, -1)
+  nodeTyRecord(cond, lvTyBool())
+  const w = mkIf(cond, thenB, elseB, pos)
+  nodeTyRecord(w, ty)
+  valueIfAdd(w)
+  w
 }
 
 // A compound write `p op= v` (or `++p`) reads its place through the same target node it
