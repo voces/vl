@@ -28,5 +28,5 @@ before the store narrows it. That is D16019.
 
 | instrument | result |
 | --- | --- |
-| full sweep, base master against this change, both fixpoint seeds | SWEEP_RESULT |
-| fast set | FASTSET_RESULT |
+| full sweep, base master against this change, both fixpoint seeds | 3 output movers, all `emit_reject` → `runs` (D16016's and D2632's witnesses and the new test); 0 bytes-only movers; 0 runs → not-runs; 0 new traps |
+| fast set | all green (fixpoint, lint-self clean, regress, filed witnesses, late demands, seed size, comment, ladder, sentinel, scan, render-parse and export ratchets); native deep-chain, scaling and emitter-state audit (`SELFHOST_NATIVE_ALIGN=1`) 105 passed |
