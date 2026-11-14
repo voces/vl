@@ -4,13 +4,13 @@ This is the first half of a pair.
 - **2a (this PR)** lands the engine described in
   [`2026-11-14-slot-store-design.md`](2026-11-14-slot-store-design.md) §3. The engine closes the
   binding slot facts the value cascade leaves open, replacing the delivery-led closer
-  (`elabSlotFromDeliveries`). Net **+NET_LINES** compiler lines.
+  (`elabSlotFromDeliveries`). Net **+732 (1,005 added, 273 deleted)** compiler lines.
 - **2b** switches the delivery walk's readers (listed below) to the engine and deletes the walk,
   about −1,300 lines. That makes the pair net negative.
 
 The engine is final: 2b only switches readers and deletes.
 
-**2a is not the finished design.** It is +NET_LINES only as half of the pair. 2b owes three
+**2a is not the finished design.** It is +732 (1,005 added, 273 deleted) only as half of the pair. 2b owes three
 things:
 1. **Delete the delivery walk.** Every reader in the table below switches to the classes.
 2. **Move demand ordering into the engine.** Today the value cascade (`elabBindingWholeTy`,
@@ -20,7 +20,7 @@ things:
    deletes the cascade too.
 3. **Show order-freedom.** The 38 cells of D16301's named set stop moving in `decl-order-ab.vl`.
 
-Expected net for 2b: about −1,300 (the walk) and about −700 (the cascade), so about −1,400 for the
+Expected net for 2b: about −1,300 (the walk) and about −700 (the cascade), so about −1,270 for the
 pair. If 2b cannot delete the value cascade, the coordinator hears that before 2b is written.
 
 ## What changed
@@ -77,7 +77,7 @@ in a new file so that about twelve elaboration internals need no export.
 
 ## Readings
 
-All readings are on fixpoint seeds: master `MASTER_SHA` and this PR, each byte-identical on a
+All readings are on fixpoint seeds: master `b45a06ef3` and this PR, each byte-identical on a
 second refresh.
 
 | check | reading |
@@ -87,12 +87,12 @@ second refresh.
 | `decl-order-ab.vl` | 38 clause-1 movers, the same 38 as master's, 0 new |
 | D16301 named set (38) | **0 of 38 stop moving** |
 | emit_mono functions (`pin-helper-budget-baseline.json`) | 908 → 908 (unchanged; 2a touches no mono reader) |
-| seed size | SEED_LINE |
-| generated-code cost (`plumb-shape-cost.vl --check`) | PLUMB_LINE |
-| late demands (`late-demands.vl --check`) | LATE_LINE |
-| self-compile guest fuel / peak RSS | FUEL_LINE |
-| `scripts/gate.sh` | GATE_LINE |
-| `rep-fuzz-check.sh` | FUZZ_LINE |
+| seed size | 6,841,074 bytes: +19,606 (+0.3%) over master's fixpoint, +1.9% against the baseline (gate: ok) |
+| generated-code cost (`plumb-shape-cost.vl --check`) | ok (guest fuel within +5%; peak RSS not graded here: no `/usr/bin/time` in this container) |
+| late demands (`late-demands.vl --check`) | 4 in 4 files, of 6,834 built; baseline 4 (ok) |
+| self-compile guest fuel / peak RSS | `self-compile time` ok (within 1.5× the guest-fuel baseline); peak RSS not graded here |
+| `scripts/gate.sh` | every row ok but `ci-native`'s `vl_seed_sidecar_dir_test`, which fails on master's fixpoint seed too in this container (it runs as root, so a group-writable directory is still trusted); the filed witnesses read 5,017 of 5,017 as filed, provenance match |
+| `rep-fuzz-check.sh` | exact (0 baselined failures) |
 
 **Why 0 of 38 stop moving.** The engine is order-free by construction: it unifies over the whole
 write index before deciding. But 2a puts it behind the value-led close, which still reads the
