@@ -20,9 +20,8 @@ import {
 } from "./check_scopes"
 import {
   ArrayLit,
-  BinExpr,
-  fnNameIsLambda,
   AsExpr,
+  BinExpr,
   Block,
   BoolLit,
   BreakStmt,
@@ -62,6 +61,7 @@ import {
   UnionDecl,
   WhileStmt,
   elseIfLink,
+  fnNameIsLambda,
   getDeclLabel,
   i32ToStr,
   nodeAt,
@@ -2666,6 +2666,8 @@ export function letFnWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
   const d = nodeAt(s)
   if !(d is LetDecl) || d.letKw != "let" { return false }
   if !(tyAt(dcl) is TyFunc) || !(tyAt(m) is TyFunc) { return false }
+  // Taken before the members' types, which an early check of the body may not have yet.
+  const straight = letWritesStraightOnce(s)
   // Each function written is a declared generic a read can name, and each write is a statement
   // of the declaring block: a branch, a loop or a capture keeps the binding's whole set.
   // They agree on returning a value: a binding seeded with one returning nothing drops what a
@@ -2674,7 +2676,11 @@ export function letFnWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
   let voids = 0
   for f in ms {
     const fn = nodeAt(f)
-    if !(fn is FuncDecl) || fnNameIsLambda(fn.fnName) || !fnParamsAllTyParams(fn) {
+    if (
+      !(fn is FuncDecl)
+      || fnNameIsLambda(fn.fnName)
+      || !fnParamsAllTyParams(fn)
+    ) {
       return false
     }
     const fti = nodeTyIxOf(f)
@@ -2683,7 +2689,18 @@ export function letFnWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
     if ft is TyFunc && ft.fnRet == TY_VOID { voids = voids + 1 }
   }
   if voids != 0 && voids != ms.length { return false }
-  ms.length >= 2 && cwLetWritesStraight(s)
+  ms.length >= 2 && straight
+}
+
+// Each `let` slot's `cwLetWritesStraight`, taken on its first write and kept for the program:
+// an adapter that later moves a read out of a call argument does not re-decide it.
+let letStraightMemo: {[i32]: i32} = Map()
+function letWritesStraightOnce(s: i32): boolean {
+  const have = letStraightMemo[s] ?? -1
+  if have >= 0 { return have == 1 }
+  const st = cwLetWritesStraight(s)
+  letStraightMemo[s] = if st { 1 } else { 0 }
+  st
 }
 
 // Whether the `Ident` `r` reads a `let` binding, whose writes a declaration-level alias ignores.
@@ -2702,7 +2719,9 @@ function fnParamsAllTyParams(fn: FuncDecl): boolean {
     const pn = nodeAt(p)
     if !(pn is Param) || pn.parType < 0 { return false }
     const tn = nodeAt(pn.parType)
-    if !(tn is TypeRef) || !strListHas(fn.fnTyParams, tn.tyName) { return false }
+    if !(tn is TypeRef) || !strListHas(fn.fnTyParams, tn.tyName) {
+      return false
+    }
   }
   true
 }
@@ -2713,7 +2732,7 @@ export function letFnWriteRow(s: i32, dcl: i32, rhs: i32, m: i32) {
   if !letFnWriteNarrows(s, dcl, m) { return 0 }
   const r = parenPeelIx(rhs)
   // A name of a declared function, or a read of a binding: what that read holds, never the
-  // function the binding was declared with.
+  // binding's seed.
   let fd = -1
   if r >= 0 && nodeAt(r) is Ident {
     fd = identFnDeclOf(r)
@@ -4219,7 +4238,11 @@ export function letWriteTargetTy(ix: i32, name: string, ty: i32): i32 {
   if s == -1 || narGuardSlot(s) >= 0 { return ty }
   const st = asgRowStoreTy(s)
   // A write stores into the binding's storage, whatever one function a row says its reads hold.
-  if st >= 0 && (letUnionWriteNarrows(s, st, ty) || fnWriteAliasOf(ty) >= 0) { st } else { ty }
+  if st >= 0 && (letUnionWriteNarrows(s, st, ty) || fnWriteAliasOf(ty) >= 0) {
+    st
+  } else {
+    ty
+  }
 }
 
 // The storage of the read `op` of a `let` a write narrowed (no guard over it), else -1.
@@ -4516,9 +4539,10 @@ function litSoleHolderIn(u: i32, lit: i32): boolean {
 let scWrPlaces: {[i32]: i32[]} = Map()
 let scWrTys: {[i32]: i32[]} = Map()
 const scWrOpen: i32[] = []
-// Empties the by-node write log and the dead-arm reasons, so the next program reads none of
-// this one's.
+// Empties the by-node write log, the dead-arm reasons and the narrowing eligibility, so the next
+// program reads none of this one's.
 export function scWrReset() {
+  letStraightMemo = Map()
   scWrPlaces = Map()
   scWrTys = Map()
   deadElseWhy = []

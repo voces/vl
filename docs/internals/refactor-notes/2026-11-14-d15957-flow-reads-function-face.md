@@ -60,6 +60,40 @@ Against master's fixpoint over 19,769 programs (`tests/cases` plus distilled `ce
 
   Their `@error` lines are updated.
 
+## Graded on the merged tree
+
+Merged with master `de4cfa15`. Fixpoint seeds on both sides.
+
+- **A loss the earlier measurement missed, fixed here.** Master's
+  `written-let-of-generics-handed-to-generic-callback-between-writes.vl` (D3942) stopped running.
+  In a generic body, `fvaAdapt` moves the argument `k` of `callT(k, x)` into a `const` copy. The
+  instance re-check then saw no call argument, so the binding became eligible halfway through
+  the compile. `cwLetWritesStraight` is now taken once per binding, at its first write
+  (`letWritesStraightOnce`). The members' types are still read on every write: an on-demand
+  check of an un-annotated `return k` body runs before the nested generics have types.
+- **`tests/cases`, all 8,008 files:** 0 `runs → not-runs`, 0 output changes among programs that
+  run. Three programs now run (the new fixtures). Six refusals keep refusing with a moved
+  message: the four restated `@error` lines, plus two whose `@error` substring still matches.
+- **The four restated D3968 fixtures** refuse on both seeds. Each new message is
+  byte-identical to master's refusal of the direct name (`[plus]`, `{ f: plus }`,
+  `w(true, 5)`, `w(5, true)`), so each expectation was wrong under the ruling. No working
+  program was lost.
+- **Matrix:** `fn-let-read-after-repoint-generic.matrix.vl` is new, the generic re-point beside
+  the lambda one. It runs 40 of 46 after and 0 before. The six open cells are `argument`,
+  `array_push` and `map_set`, in both faces: a read handed to a call, D16182. Over the 71 templates
+  that hold a `let` written with functions: 0 `runs → not-runs`, and no cell moved to silent or
+  trap. In `written-fn-binding-*`, 10 cells now run, 6 of them silent on master.
+- **regress.vl:** 0 lost. The grades are identical to master's: the distilled corpus has no
+  re-pointed generic `let`.
+- **L2 self-compile fuel:** 82,536,402,471 against master's 82,330,058,123, which is +0.25%.
+  Seed size: +4,835 bytes.
+- **Late demands rose, from 0 to 4, 7 and 1,** in `fn-set-list-copied-into-closed-list-slots`,
+  `-copied-into-holders` and `-mutable-alias-controls`. Output is unchanged. The minimal
+  trigger is a call `f("s")` plus a copy of `[f]` into a closed list. The key the emitter
+  demands late is a `<lambda>`. The direct-name spelling `[dbl]` mints none, so the renamed read
+  is not yet planned the way the name is. A guard that skips `fvaListSetCopy` for a write-row
+  element changed nothing. Not located.
+
 ## Not done
 
 D16180, the hole-lambda spelling: a lambda has no name to rename a read to.
