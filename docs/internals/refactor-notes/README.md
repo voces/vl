@@ -9,6 +9,14 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-step7-union-eq-sets-from-types](2026-11-14-step7-union-eq-sets-from-types.md): `emitUnionUnionEq` reads its operands' member sets from their types, 2026-11-14
+- [2026-11-14-step7-shared-field-plan-member-types](2026-11-14-step7-shared-field-plan-member-types.md): `sharedUnionFieldPlan` reads member types, not atoms, 2026-11-14
+- [2026-11-14-g41-close-d16052](2026-11-14-g41-close-d16052.md): D16052 closed: a row-less member slice has no atom column, 2026-11-14
+- [2026-11-14-d16064-written-let-dispatch](2026-11-14-d16064-written-let-dispatch.md): D16064: a call through a written `let` of functions whose results differ dispatches, 2026-11-14
+- [2026-11-14-d16043-sub-word-lists](2026-11-14-d16043-sub-word-lists.md): D16043: sub-word lists on the packed `u8[]` path, 2026-11-14
+- [2026-11-14-d16015-parked-cell-value](2026-11-14-d16015-parked-cell-value.md): D16015: an element or field write used as a value yields the cell its store parks, 2026-11-14
+- [2026-11-14-d15975-identity-check](2026-11-14-d15975-identity-check.md): D15975 PR 1: `===`/`!==` parse as operators and the checker applies the ruling, 2026-11-14
+- [2026-11-14-d14803-union-of-type-params-binds-every-candidate](2026-11-14-d14803-union-of-type-params-binds-every-candidate.md): D14803: an argument only a union of type parameters admits binds every candidate, 2026-11-14
 - [2026-11-14-test-emit-refusal-hook](2026-11-14-test-emit-refusal-hook.md): The `--test-emit-refusal` hook: a stable witness for the instance-position guard, 2026-11-14
 - [2026-11-14-one-callee-rule](2026-11-14-one-callee-rule.md): one rule for "the function a call through a binding runs" (D16072, lane I), 2026-11-14
 - [2026-11-14-instance-position-witness](2026-11-14-instance-position-witness.md): A stable witness for the instance-position guard: a proposal, 2026-11-14
