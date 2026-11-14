@@ -943,6 +943,13 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   stays refused — a string has no identity a program can rely on (literal sharing and
   concatenation results are compiler choices), so `===` on it is a check error pointing
   at `==`; any future identity on strings is a named std helper, never `===`. (D15975)
+  **Reconfirmed and extended by the owner 2026-11-14:** `==` on two functions is a check error
+  pointing at `===`, landing with `===`. The rule is: `==` is refused exactly when both operands
+  can hold a function in the same position — a union arm, a nullable's inner type, a record field
+  or a list element. `u == 5` and `cb == null` stay legal; `u == v` over two function-holding
+  unions is refused (narrow first, or `===`); a list of functions refuses `==` as a record with a
+  function field does. Go, Rust, Swift and Haskell reject value equality on functions; JS,
+  Python and Java fall back to identity, the reading A15 rejected. (D15975)
 - **Keys: `Map`/`Set` keys are STRUCTURAL, and key-eligible = `==`-comparable.** Every
   field kind `==` accepts keys — `f64`, lists, nested structs included; the key hash and
   `==` share ONE lowering (D1017 is why). Consequences recorded rather than
@@ -10889,6 +10896,14 @@ D4551's default and its own declaration-time refusal; this rule does not touch i
 **What it leaves open.** `F<A, B>(v: A | B): boolean { v }` called as `F(5)` reads `never | never`,
 which every destination accepts. Whether `5` binds `A`, binds both, or is refused as ambiguous is the
 owner's ruling, filed as D14803.
+
+**Ruled by the owner 2026-11-14 (D14803): an argument that only a union of type parameters
+admits binds EVERY candidate parameter to the argument's type.** `F(5)` against `F<A, B>(v: A | B)`
+reads as `F<i32, i32>(5)`, so the return check then refuses `i32` into `boolean`, and
+`G<A, B>(v: A | B): A | B { v }` called as `G(5)` runs, returning `i32`. Refusing the call as
+ambiguous was the alternative; it was not taken because it refuses programs like `G(5)` that the
+design permits, and the binding is sound (each parameter gets the only type the program gives it).
+A caller who means the parameters to differ writes the type arguments.
 ## A plain build drops the functions no root reaches (2026-10-23)
 
 **The rule.** `vl build` and `vl run` emit, for every function no root reaches, a three-byte
@@ -11800,3 +11815,29 @@ widened back to `i32`.
 given 300 both read back 44. The rejected options were a layout-only width (the field holds any
 `i32`, so the declared width is not what a read sees) and refusing `flat` values with sub-word
 fields (a refusal the design does not owe).
+
+## A dead arm narrows its operand to `never`, a true bottom, and is warned (2026-11-14) — D16006
+
+**Ruled by the owner 2026-11-14.** When an `is` (or `==`) test covers its operand's whole type, the
+arm that cannot run narrows the operand to `never`. `never` is a true bottom type: every use of it
+type-checks (`p + "!"` with `p: never` is `never`), because the code cannot execute. The arm itself
+gets a **warning**, "this `else` can never run (`p` is always `i32`)", so dead code is reported once,
+on the branch. Only the tested operand becomes `never`; every other expression in the arm is
+checked as usual.
+
+```vl
+function a(p: i32, q: i32) {
+  if p is i32 { print(p) } else {
+    print(p + "!")   // accepted: `p` is `never`
+    print(q + "!")   // still refused: `q` is i32
+  }
+  // warning on the `else`: it can never run
+}
+```
+
+**Why.** It makes `if`, `match` (whose dead `_` arm was already unchecked) and every parameter kind
+agree; the instance elaboration and D16006(b) already treated a dead arm this way. Checking a dead
+arm at the pre-test type made acceptance depend on which type it fell back to. Widening the operand
+later revives the arm, and it is then checked against its real type. The alternative, making any
+use of a `never` operand an error, was not taken: it refuses dead final `else`s after `is` chains,
+`match`'s defensive `_`, and `else { panic("unexpected " + p) }`, all of which compile today.
