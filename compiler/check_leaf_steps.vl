@@ -230,10 +230,14 @@ import {
   TY_ERR,
   TY_F32,
   TY_F64,
+  TY_I16,
   TY_I32,
   TY_I64,
+  TY_I8,
   TY_NEVER,
   TY_NULL,
+  TY_U16,
+  TY_U8,
   TyArray,
   TyErr,
   TyFunc,
@@ -979,15 +983,13 @@ export function pushNarrowFact(
 // the fact — the complement of an equality, where only an arm pinned to that literal is ruled out.
 export type DiscrimMode = "intersect" | "exclude"
 
-// May the else arm of `if <hole> is T` carry a deferred remainder (`HD_GNOT`)? Two exclusions,
-// neither a design rule. A literal-bearing `T` is the emitter's reach: `litElseNarrow` reads the
-// pin's softened spelling, so the literal matches no member and the arm reads the raw box (D1412).
-// A shape `T` would re-base the hole's field demands onto a derived hole no argument check sees.
-export function holeElseRemainderOk(tIdx: i32): boolean {
+// May the else arm of `if <hole> is T` carry a deferred remainder (`HD_GNOT`)? For a record `T`
+// only when `recordOk`: a test of a hole by name, whose field reads off the remainder demand their
+// field of the base hole and so stay on the argument check (D16008). On a field path the hole
+// stays the fact, so a write that ends the remainder re-asks the reads after it (D3420).
+export function holeElseRemainderOk(tIdx: i32, recordOk: boolean): boolean {
   if tIdx < 0 { return false }
-  const t = tyAt(tIdx)
-  if t is TyObj { return false }
-  true
+  recordOk || !(tyAt(tIdx) is TyObj)
 }
 
 // Is `ix` a `const` with no annotation and a list, object or `Map()`/`Set()` initializer? A
@@ -1343,10 +1345,18 @@ export function negInAnnotationMsg(spelling: string) {
 // the same channel the union rep-clash uses — so every `unknownTyText` caller reports why without
 // gaining an arm, and returns the -1 that poisons the enclosing annotation exactly as an unresolved
 // name does. The message names the rule: wasm has i8 as a storage type only, and VL mirrors that.
-export function storageTyLeafFail() {
-  unkTyClashSet(
-    "`u8` is a storage type, not a value type — it may be an array element (`u8[]`), but a local, parameter, return, field, map value or generic argument is a value, and values are `i32`",
-  )
+export function storageTyLeafFail(name: string) {
+  if name == "u8" {
+    unkTyClashSet(
+      "`u8` is a storage type, not a value type — it may be an array element (`u8[]`), but a local, parameter, return, field, map value or generic argument is a value, and values are `i32`",
+    )
+  } else {
+    unkTyClashSet(
+      "`"
+        + name
+        + "` is a storage type, not a value type — it may be a `flat` record's field, but a local, parameter, return, list element, map value or generic argument is a value, and values are `i32`",
+    )
+  }
   -1
 }
 
@@ -1417,14 +1427,25 @@ export function aliasRefIsPlainRoot(root: i32) {
   k == TS_NAME || k == TS_APP || k == TS_NULL
 }
 
-// The byte width a sub-word storage spelling names as a `flat` FIELD, or 0. `u8`/`i8` are one
-// byte, `u16`/`i16` two — a flat-field-only storage width (like a `u8[]` element), read back as
-// `i32` through `loadU8`/`loadI16`/... . `u32`/`u64` are excluded: they do not widen losslessly
-// into a value type, so the ruling stops byte-multiples at 16 bits.
-export function flatStorageSpellWidth(name: string) {
-  if name == "u8" || name == "i8" { return 1 }
-  if name == "u16" || name == "i16" { return 2 }
-  0
+// The sub-word storage type a leaf spelling names, legal only as a `flat` field, or -1. `u32` and
+// `u64` are absent: they do not widen losslessly into a value type, so storage stops at 16 bits.
+export function subWordTyOfName(name: string): i32 {
+  let i = 0
+  while i < SUB_WORD_NAMES.length {
+    if SUB_WORD_NAMES[i] == name { return subWordTyAt(i) }
+    i = i + 1
+  }
+  -1
+}
+
+const SUB_WORD_NAMES = ["u8", "i8", "u16", "i16"]
+
+// The storage type `SUB_WORD_NAMES[i]` names.
+function subWordTyAt(i: i32): i32 {
+  if i == 0 { return TY_U8 }
+  if i == 1 { return TY_I8 }
+  if i == 2 { return TY_U16 }
+  TY_I16
 }
 
 // The declared type spelling of a `FieldDef`'s annotation, or "" when it has none. The

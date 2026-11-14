@@ -79,7 +79,9 @@ import {
   TY_BOOL,
   TY_I32,
   TY_I64,
+  TY_NEVER,
   TY_NULL,
+  TY_STR,
   TY_VOID,
   TyArray,
   TyFunc,
@@ -271,6 +273,7 @@ import {
   identFrom,
   identFromDecl,
   identRedirect,
+  identSet,
   lvCarrierNote,
   memberDeclOf,
   memberMethodOf,
@@ -3352,6 +3355,9 @@ function cboxFrameReset() {
   cboxDletSeen = Map()
   cboxCellTy = Map()
   cboxVecCells = Map()
+  cboxUnsetCells = Map()
+  cboxNestCells = Map()
+  cboxBareStmt = -1
   cboxKind = Map()
   cboxLoopUp = []
   cboxLoopAt = -1
@@ -3939,14 +3945,23 @@ function cboxBoxLet(ix: i32, key: i32) {
       // A composite element (`i32 | string`, `S | null`, a function type) is parenthesized,
       // since `nm + "[]"` would bind to its last atom.
       const elemTy = nodeTyIxOf(n.letType)
+      const unset = (cboxUnsetCells[key] ?? 0) == 1
+      const nest = (cboxNestCells[key] ?? 0) == 1
       let boxedTy = -1
-      if elemTy >= 0 { boxedTy = mkArrayTy(elemTy) }
-      if boxedTy >= 0 { cboxCellTy[key] = boxedTy }
-      const elemName = cboxElemName(n.letType, lt.tyName, elemTy)
-      let cellName = elemName + "[]"
-      if cboxElemNeedsParens(n.letType, elemTy) {
-        cellName = "(" + elemName + ")[]"
+      if elemTy >= 0 {
+        let slotTy = elemTy
+        if nest { slotTy = mkArrayTy(slotTy) }
+        if unset { slotTy = mkNullableTyOf(slotTy) }
+        boxedTy = mkArrayTy(slotTy)
       }
+      if boxedTy >= 0 { cboxCellTy[key] = boxedTy }
+      let elemName = cboxElemName(n.letType, lt.tyName, elemTy)
+      if cboxElemNeedsParens(n.letType, elemTy) {
+        elemName = "(" + elemName + ")"
+      }
+      if nest { elemName = elemName + "[]" }
+      if unset { elemName = "(" + elemName + "|null)" }
+      const cellName = elemName + "[]"
       n.letType = synthTypeRefTy(cellName, -1, boxedTy)
     }
   }
@@ -4010,6 +4025,13 @@ function cboxElemNeedsParens(ann: i32, elemTy: i32): boolean {
 // A vector has no list backing, so its cell is a list of `v128 | null` boxes: every read
 // unboxes with `as!`, and a store boxes (D2826). Keeps such a cell in `cboxVecCells`.
 let cboxVecCells: {[i32]: i32} = Map()
+// The shared `let`s with no init, by declaration: their cell is `T | null`.
+let cboxUnsetCells: {[i32]: i32} = Map()
+// Of those, the ones whose type admits `null`: the cell holds `null` until the first write, then
+// a one-element list holding the value, so an unassigned binding is not its own `null`.
+let cboxNestCells: {[i32]: i32} = Map()
+// The block statement `cboxWalk` is at, when it is not its block's last: its value is unread.
+let cboxBareStmt = -1
 // Set while `cboxWalk` rewrites the bare target of an `=`, which a vector cell stores into
 // rather than unboxes.
 let cboxStoreTarget = false
@@ -4188,6 +4210,7 @@ function cboxWalk(ix: i32, boxed: i32[]) {
       const bs = n.blkStmts
       let i = 0
       while i < bs.length {
+        if i < bs.length - 1 { cboxBareStmt = bs[i] }
         bs[i] = cboxWalk(bs[i], boxed)
         i = i + 1
       }
@@ -4322,6 +4345,21 @@ function cboxWalkIdent(ix: i32, n: Ident, boxed: i32[]): i32 {
       nodeSrcNote(un, ix)
       return un
     }
+    const nest = (cboxNestCells[bd] ?? 0) == 1
+    if (
+      (cboxUnsetCells[bd] ?? 0) == 1
+      && !cboxStoreTarget
+      && (nest || !cboxReadNarrowed(rty, cellTy))
+    ) {
+      return cboxUnsetRead(
+        rd,
+        ix,
+        n.identName,
+        tyArrayElemIx(cellTy),
+        rty,
+        nest,
+      )
+    }
     if rd >= 0 && rty >= 0 { cboxReadTy[rd] = rty }
     if rd >= 0 && cboxStoreTarget { cboxStoreCells[rd] = 1 }
     if rd >= 0 && rty >= 0 && !cboxStoreTarget && !(tyAt(rty) is TyFunc) {
@@ -4350,6 +4388,29 @@ function cboxWalkBin(ix: i32, n: BinExpr, boxed: i32[]): i32 {
   // from its operand's type (a closure may have written the cell since any narrowing), and
   // an assignment re-reads its target as its value only where that type is the value's.
   // A literal-union cell stays untyped: its re-read is the atom whatever the member (D2168).
+  if leftDecl >= 0 && (cboxUnsetCells[leftDecl] ?? 0) == 1 {
+    // A read is already typed at the binding's type; a store into a nested cell wraps its value.
+    if n.binOp == "=" {
+      const slotTy = tyArrayElemIx(cboxCellTy[leftDecl] ?? -1)
+      nodeTyRecord(unwrapParen(n.binLeft), slotTy)
+      if (cboxNestCells[leftDecl] ?? 0) == 1 {
+        const els: i32[] = []
+        els.push(n.binRight)
+        const wrap = mkArrayLit(els, -1)
+        nodeTyRecord(wrap, nonNullTy(slotTy))
+        n.binRight = wrap
+        // A store whose value is read yields the list it stored, so the read takes its element.
+        if ix != cboxBareStmt {
+          nodeTyRecord(unwrapParen(n.binLeft), nonNullTy(slotTy))
+          nodeTyRecord(ix, nonNullTy(slotTy))
+          const v = mkIndex(ix, mkNumTyped("0", -1, TY_I32), -1)
+          nodeTyRecord(v, tyArrayElemIx(nonNullTy(slotTy)))
+          return v
+        }
+      }
+    }
+    return ix
+  }
   if leftDecl >= 0 {
     const elemTy = tyArrayElemIx(cboxCellTy[leftDecl] ?? -1)
     if n.binOp == "??" || !tyIsLitUnionOrLit(elemTy) {
@@ -4425,28 +4486,72 @@ function cboxWalkForIn(ix: i32, n: ForIn, boxed: i32[]): i32 {
   return ix
 }
 
-// A zero value for a `let` annotated `letType` that has no init, typed at the annotation, or
-// -1 where the type has none to offer; the box needs something to hold before the first
-// assignment (a read before it is a definite-assignment error).
-function cboxZeroInit(letType: i32) {
+// The seed of a shared `let` `d` annotated `letType` that has no init: the
+// `null` that marks its cell unassigned (`cboxUnsetCells`), whose reads trap until the first
+// write; a type that admits `null` holds its value one list deep. -1 with no annotated type.
+function cboxUnsetInit(d: i32, letType: i32): i32 {
   if letType < 0 { return -1 }
-  const lt = nodeAt(letType)
-  if !(lt is TypeRef) { return -1 }
-  const nm = tyPrimNameOf(nodeTyIxOf(letType))
-  let lit = -1
-  if nm == "i32" || nm == "i64" || nm == "u8" {
-    lit = mkNumTyped("0", -1, nodeTyIxOf(letType))
+  const ty = nodeTyIxOf(letType)
+  if ty < 0 { return -1 }
+  const nl = mkNull("null", -1)
+  cboxUnsetCells[d] = 1
+  if tyBearsNull(ty) {
+    cboxNestCells[d] = 1
+    nodeTyRecord(nl, mkNullableTyOf(mkArrayTy(ty)))
+    return nl
   }
-  if nm == "f64" || nm == "f32" {
-    lit = mkNumTyped("0.0", -1, nodeTyIxOf(letType))
-  }
-  if nm == "boolean" { lit = mkBool(0, -1) }
-  if nm == "string" { lit = mkStr("", -1) }
-  if lit >= 0 { nodeTyRecord(lit, nodeTyIxOf(letType)) }
-  lit
+  nodeTyRecord(nl, mkNullableTyOf(ty))
+  nl
 }
 
-// The refusal for shared binding `nm` whose type has no zero value (D2340). Built in two
+// Whether a read typed `rty` of the `T | null` cell typed `cellTy` is narrowed below `T`: the
+// test that narrowed it read the cell first, and a write never stores `null`.
+function cboxReadNarrowed(rty: i32, cellTy: i32): boolean {
+  if rty < 0 { return false }
+  const t = nonNullTy(tyArrayElemIx(cellTy))
+  t >= 0 && !tySame(rty, t)
+}
+
+// A read `rd` of the `T | null` cell of shared binding `name`, read at `ix` with type `rty`:
+// `rd ?? __trap__(…)`, so a read the closure runs before the first write traps naming it.
+function cboxUnsetRead(
+  rd: i32,
+  ix: i32,
+  name: string,
+  elemTy: i32,
+  rty: i32,
+  nest: boolean,
+): i32 {
+  nodeTyRecord(rd, elemTy)
+  // A literal's text is its raw spelling, quotes included.
+  const msg = mkStr("\"`" + name + "` read before it is assigned\"", -1)
+  nodeTyRecord(msg, TY_STR)
+  const trapFn = mkIdent("__trap__", -1)
+  identSet(trapFn, IDENT_BUILTIN)
+  const args: i32[] = []
+  args.push(msg)
+  const trap = mkCall(trapFn, args, -1)
+  nodeTyRecord(trap, TY_NEVER)
+  markCallNever(trap)
+  const co = mkBinary("??", rd, trap, -1)
+  if nest {
+    nodeTyRecord(co, nonNullTy(elemTy))
+    const v = mkIndex(co, mkNumTyped("0", -1, TY_I32), -1)
+    nodeTyRecord(
+      v,
+      if rty >= 0 { rty } else { tyArrayElemIx(nonNullTy(elemTy)) },
+    )
+    narrowedFromTyCopy(ix, v)
+    nodeSrcNote(v, ix)
+    return v
+  }
+  nodeTyRecord(co, if rty >= 0 { rty } else { nonNullTy(elemTy) })
+  narrowedFromTyCopy(ix, co)
+  nodeSrcNote(co, ix)
+  co
+}
+
+// The refusal for shared binding `nm` with no init and no annotated type to build a cell of. Built in two
 // short chains: an interpolated string in the compiler source leaves the seed importing `print`.
 function cboxNoInitMsg(nm: string) {
   const q = "`" + nm + "`"
@@ -4457,8 +4562,8 @@ function cboxNoInitMsg(nm: string) {
 }
 
 // The frame's bindings `cboxByRef` says a closure must share, from `dlets`. A `let` with no
-// init takes a zero value to box; one whose type has none cannot be boxed and is refused,
-// since capturing it by value would be silently wrong. A declaration in `unboxed` stays a local.
+// init takes a cell whose reads trap until the first write; one with no type to build it of is
+// refused, since capturing it by value would be silently wrong. One in `unboxed` stays a local.
 function cboxPick(dlets: i32[], alam: i32[], unboxed: i32[]) {
   const boxed: i32[] = []
   let di = 0
@@ -4470,7 +4575,7 @@ function cboxPick(dlets: i32[], alam: i32[], unboxed: i32[]) {
       if isLet {
         const ld = nodeAt(d)
         if ld is LetDecl {
-          if ld.letInit < 0 { ld.letInit = cboxZeroInit(ld.letType) }
+          if ld.letInit < 0 { ld.letInit = cboxUnsetInit(d, ld.letType) }
           if ld.letInit < 0 {
             emitFailAt(cboxNoInitMsg(ld.letName), d)
             ok = false
@@ -4503,7 +4608,8 @@ function cboxScalarLets(
     const d = dlets[di]
     if (cboxKind[d] ?? CBOX_LET) == CBOX_LET && cboxByRef(d, alam) {
       const ld = nodeAt(d)
-      if ld is LetDecl {
+      // A `let` with no init takes a cell whose reads trap until the first write (D16023).
+      if ld is LetDecl && ld.letInit >= 0 {
         let ty = -1
         if ld.letType >= 0 {
           ty = nodeTyIxOf(ld.letType)
