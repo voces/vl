@@ -258,7 +258,7 @@ Deno.test({
     // any other failure it raises lands on the statement instead of on a stale function.
     //
     // The witness is a top-level shared read of a field the records store as nullable records
-    // of different types, still a loud field-access reject (D16130). The earlier witnesses lower
+    // of different types, still a loud field-access reject (D16170). The earlier witnesses lower
     // since D15314, D15882 (D4266) and D16049.
     const dir = await makeTempDir({ prefix: "vl_diag_pos_top_" });
     try {
