@@ -9,6 +9,14 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-d15801-map-entry-fn-fields](2026-11-14-d15801-map-entry-fn-fields.md): D15801: function fields of a map's entry literals, 2026-11-14
+- [2026-11-14-d16019-wider-record-write-value](2026-11-14-d16019-wider-record-write-value.md): D16019 — a wider record written into a narrower place, used as a value, 2026-11-14
+- [2026-11-14-d16039-identity-mixed](2026-11-14-d16039-identity-mixed.md): D16039: identity over a union of record and function arms, 2026-11-14
+- [2026-11-14-d16048-shared-field-box-arms](2026-11-14-d16048-shared-field-box-arms.md): D16048 + D16049: boxing shared-field members that store the field beside `null`, 2026-11-14
+- [2026-11-14-d16098-let-to-generic-param](2026-11-14-d16098-let-to-generic-param.md): D16098: a re-pointed `let` handed to a generic function parameter dispatches, 2026-11-14
+- [2026-11-14-g44-struct-union-null-twin-eq](2026-11-14-g44-struct-union-null-twin-eq.md): D16038: a record union `==` beside its own `| null` twin, 2026-11-14
+- [2026-11-14-g45-map-of-maps-pin](2026-11-14-g45-map-of-maps-pin.md): D15941: an un-annotated map of maps of a hole function is pinned, 2026-11-14
+- [2026-11-14-identity-generic-call-site](2026-11-14-identity-generic-call-site.md): A generic body's `===` is refused at the call, on the argument, 2026-11-14
 - [2026-11-14-d15882-shared-nullable-lit-field](2026-11-14-d15882-shared-nullable-lit-field.md): D15882 + D16031: literal-set-or-`null` fields through a union of records, 2026-11-14
 - [2026-11-14-d15975-fn-eq-refusal](2026-11-14-d15975-fn-eq-refusal.md): D15975 PR 3: `==` on functions is a check error, 2026-11-14
 - [2026-11-14-d15975-identity-flag](2026-11-14-d15975-identity-flag.md): D15975: identity rides an equality node (`BinExpr.binIdent`), 2026-11-14
