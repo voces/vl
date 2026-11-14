@@ -11866,3 +11866,19 @@ print(s is string[])               // false
 wrong, and pinning by writes is how element types are inferred everywhere else. Refusing writes
 through such a narrowing (a2) was not taken: it rejects a program the design can run. Settling the
 hole to the first tested `T` (c) was not taken: two tests would disagree about one empty list.
+
+## Polymorphic recursion is refused for now; a uniform representation is backlogged (2026-11-14) — D2721, D12131
+
+**Ruled by the owner 2026-11-14: (a) now, (b) later.** A generic function that calls itself at a type
+built from its own parameter (D2721) and a generic alias that names itself at a larger argument
+(D12131) stay check errors: VL compiles one specialised instance per type, and these need infinitely
+many.
+
+```vl
+function f<T>(u: T | null, n: i32) { if n > 0 { f<T[]>(null, n - 1) } }  // refused
+type L<T> = { v: T, next: L<L<T>> | null }                                // refused
+```
+
+**Later.** Supporting them through a uniform (boxed) representation for exactly the generics the
+growth test flags is backlogged in ROADMAP.md, not rejected. Capping the nesting depth was not
+taken: whether a program ran would depend on its input, not its types.
