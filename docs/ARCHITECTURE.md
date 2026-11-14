@@ -251,7 +251,7 @@ Two distinct mechanisms carry "the same type" across the phases, and they must n
   them. It also records which annotation nodes it rewrote and the arena type each spelling stands
   for. Canon is a spelling rewrite, not an interner.
 - **Interned ids** (in the emitter): `emit_rep.vl` hash-conses types in its `hc*` table
-  (`hcIntern`, reset by `hcReset`), which gives `repCanonId` its ids; it interns rep trees in
+  (`internId` in `intern.vl`, reset by `hcReset`), which gives `repCanonId` its ids; it interns rep trees in
   `rtIntern`, keyed by `rtInternKeyOf`; and the collect pass interns record shapes. An interned id is the emitter's structural identity
   for a type.
 
