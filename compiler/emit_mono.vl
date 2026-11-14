@@ -15379,6 +15379,71 @@ function monoLetWholeWrites(at: i32): i32[] {
   out
 }
 
+// Whether stored map `sx`, of closed type `t`, reads a binding whose functions nothing calls, through
+// the maps it stores: they close at the uncalled default, so a call reaching them only through an
+// outer map has no instance at its signature (D16121).
+function monoStoredMapFnsUncalled(sx: i32, t: i32): boolean {
+  if sx < 0 || !(nodeAt(sx) is Ident) || t < 0 || t >= T.tys.length { return false }
+  const bd = identDeclOf(sx)
+  if bd < 0 { return false }
+  const vt = tyMapValOf(t)
+  if vt < 0 || vt >= T.tys.length { return false }
+  const vo = tyAt(vt)
+  if vo is TyFunc { return elabSlotUncalled(bd, ["v"]) }
+  if !(vo is TyMap) { return false }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwKeyOfDecl(bd), ["[]"], vals, ats) < 0 { return false }
+  for v in vals {
+    if monoStoredMapFnsUncalled(unwrapParen(v), vt) { return true }
+  }
+  false
+}
+
+// Whether frame `ctx` reads a value of the map held by the binding `name` declared at `at` (or
+// its field `fld`) and then reads a value of that, directly or through a `const` bound to it.
+function monoMapValuesRead(name: string, fld: string, ctx: i32, at: i32): boolean {
+  const nodes = monoFrameNodes(ctx)
+  const reads: i32[] = []
+  for ix in nodes {
+    if monoIsMapValueRead(ix, name, fld, ctx, at) { reads.push(ix) }
+  }
+  // The `const`s bound to such a read, or to one of those, hold the inner map.
+  const holders: i32[] = []
+  let grew = true
+  while grew {
+    grew = false
+    for ix in nodes {
+      const n = nodeAt(ix)
+      if n is LetDecl && n.letKw == "const" && n.letInit >= 0 && !i32ListHas(holders, ix) {
+        const init = unwrapParen(n.letInit)
+        let hit = i32ListHas(reads, init)
+        for h in holders {
+          const hn = nodeAt(h)
+          if hn is LetDecl && monoReadsBinding(init, hn.letName, ctx, h) { hit = true }
+        }
+        if hit {
+          holders.push(ix)
+          grew = true
+        }
+      }
+    }
+  }
+  for ix in nodes {
+    const n = nodeAt(ix)
+    let recv = monoMethodCallRecv(ix, "get")
+    if n is Index { recv = n.idxArr }
+    if recv >= 0 {
+      if i32ListHas(reads, unwrapParen(recv)) { return true }
+      for h in holders {
+        const hn = nodeAt(h)
+        if hn is LetDecl && monoReadsBinding(recv, hn.letName, ctx, h) { return true }
+      }
+    }
+  }
+  false
+}
+
 // The value type of the map (no set) the expression `mx` takes, when that type is open; -1
 // otherwise.
 function monoOpenMapValTy(mx: i32): i32 {
@@ -15505,6 +15570,12 @@ function monoPinMapSlot(mx: i32, at: i32, ctx: i32, fld: string): i32 {
         return -1
       }
       if nv >= 0 && !tyEq(nv, t) { return -1 }
+      if (
+        monoStoredMapFnsUncalled(unwrapParen(s[0]), t)
+        && monoMapValuesRead(d.letName, fld, ctx, at)
+      ) {
+        return -1
+      }
       nv = t
     }
     if nv < 0 { return -1 }
