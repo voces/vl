@@ -34,6 +34,7 @@ type Rec = {
   stdout?: string;
   module?: string;
   msg?: string;
+  said?: string;
 };
 
 const line = (cell: string, r: Rec) =>
@@ -44,6 +45,7 @@ const line = (cell: string, r: Rec) =>
     msg: r.msg ?? "",
     outcome: r.outcome,
     stdout: r.stdout ?? "s",
+    ...(r.said === undefined ? {} : { said: r.said }),
   }) + "\n";
 
 const write = (dir: string, name: string, recs: Record<string, Rec>) => {
@@ -216,6 +218,112 @@ Deno.test({
         refused,
         "--owed",
         owed("owed D10042\n"),
+      ]);
+      if (landed.code !== 0) {
+        throw new Error(
+          `landed: want exit 0, got ${landed.code}:\n${landed.out}`,
+        );
+      }
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "sweep diff: an owed trap passes only for a listed clause-1 witness's __trap__ with its sentence",
+  ignore: !ENABLED,
+  async fn() {
+    const dir = Deno.makeTempDirSync();
+    try {
+      const UNREACHABLE = "wasm trap: wasm `unreachable` instruction executed";
+      const SAYS = "`u` read before it is assigned";
+      const rec = (owed: Rec) =>
+        write(dir, `y${Math.random()}.jsonl`, {
+          owed,
+          still: { outcome: "runs" },
+        });
+      const base = write(dir, "base.jsonl", {
+        owed: { outcome: "runs" },
+        still: { outcome: "runs" },
+      });
+      const designed = rec({
+        outcome: "trap",
+        exit: 1,
+        msg: UNREACHABLE,
+        said: SAYS,
+      });
+      const owed = (lines: string) => {
+        const p = `${dir}/owed.txt`;
+        Deno.writeTextFileSync(p, lines);
+        return p;
+      };
+      const ENTRY = "owed D10042 trap: read before it is assigned\n";
+      const diff = (y: string, list: string) =>
+        sweep(["diff", base, y, "--owed", owed(list)]);
+
+      // The listed clause-1 witness stops at the `__trap__` that prints its sentence.
+      const ok = await diff(designed, ENTRY);
+      if (ok.code !== 0) {
+        throw new Error(`want exit 0, got ${ok.code}:\n${ok.out}`);
+      }
+      want(ok.out, "runs -> not-runs  (blocking)", 0);
+      want(ok.out, "owed refusals accepted", 1);
+
+      // Negated controls, each of which must still block.
+      const blocks = async (what: string, y: string, list: string) => {
+        const r = await diff(y, list);
+        if (r.code !== 1) {
+          throw new Error(`${what}: want exit 1, got ${r.code}:\n${r.out}`);
+        }
+      };
+      await blocks(
+        "another sentence",
+        rec({
+          outcome: "trap",
+          exit: 1,
+          msg: UNREACHABLE,
+          said: "index 9 out of range",
+        }),
+        ENTRY,
+      );
+      await blocks(
+        "a bare unreachable",
+        rec({ outcome: "trap", exit: 1, msg: UNREACHABLE }),
+        ENTRY,
+      );
+      await blocks(
+        "another wasm trap",
+        rec({
+          outcome: "trap",
+          exit: 1,
+          msg: "wasm trap: out of bounds memory access",
+          said: SAYS,
+        }),
+        ENTRY,
+      );
+      await blocks("unlisted", designed, "");
+      await blocks("listed as a check refusal", designed, "owed D10042\n");
+      const stale = await diff(
+        designed,
+        ENTRY + "still D10042 trap: read before it is assigned\n",
+      );
+      if (
+        stale.code !== 1 ||
+        !stale.out.includes("still  (listed, but it did not move")
+      ) {
+        throw new Error(
+          `stale: want exit 1 naming the entry, got ${stale.code}:\n${stale.out}`,
+        );
+      }
+      // Once the fix is in the base, the entry is inert until the fold clears it.
+      const landed = await sweep([
+        "diff",
+        designed,
+        designed,
+        "--owed",
+        owed(ENTRY),
       ]);
       if (landed.code !== 0) {
         throw new Error(

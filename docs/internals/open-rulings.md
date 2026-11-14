@@ -1642,8 +1642,10 @@ a recommendation. The spec's own questions are in `docs/spec/OPEN-QUESTIONS.md`.
   `function f({ x, y }: Pt)`). List destructuring is bounded by the no-tuples ruling.
 - **A15, reference identity and equality.** RECONFIRMED (owner) 2026-11-13: `===`/`!==` are built as
   ruled 2026-09-01 (DECISIONS.md), after step 7; `string` stays a check error pointing at `==`.
-  Design and matrices: D15975 (#7857). Open: whether `==` on two functions becomes a check error
-  now (asked 2026-11-13).
+  Design and matrices: D15975 (#7857). RULED (owner) 2026-11-14: `==` on two functions is a check
+  error pointing at `===`, landing with `===`; refused exactly when both operands can hold a
+  function in the same position (union arm, nullable inner, record field, list element), so
+  `u == 5` and `cb == null` stay legal (DECISIONS A15).
 
 **Json**
 
@@ -1927,3 +1929,12 @@ representation" rather than an ad-hoc refusal.
 as the documented workaround (`vl-test-design.md:166`, filed as a follow-up at `ROADMAP.md:746`).
 Void-return covariance retires both, without disturbing the assignment-is-an-expression rule that
 produces the `i32`.
+
+- **D14803, an argument only a union of type parameters admits.** RULED (owner) 2026-11-14: it
+  binds every candidate parameter to the argument's type (`F(5)` against `F<A, B>(v: A | B)` reads
+  as `F<i32, i32>(5)`), not refused as ambiguous. DECISIONS "A parameter a call leaves open is
+  `never`…" carries it.
+
+- **D16006(a), the dead arm of a covering test.** RULED (owner) 2026-11-14: the dead arm narrows
+  its operand to `never`, a true bottom (uses allowed), and the arm gets a warning; any-use-is-an-
+  error was not taken. DECISIONS "A dead arm narrows its operand to `never`…" carries it.
