@@ -1023,6 +1023,26 @@ export function subtractTy(ty: i32, removed: i32) {
   res
 }
 
+// Whether removing `removed` from closed type `ty` leaves nothing: the case `subtractTy` answers
+// with -1 as it does for nothing removed. The arm reading that remainder is dead, and its
+// operand reads as `never` (D16006).
+export function subtractLeavesNothing(ty: i32, removed: i32): boolean {
+  if ty < 0 || removed < 0 || tyHasTyVar(ty) || tyIsHole(ty) { return false }
+  const drop: i32[] = []
+  flattenVariantsInto(removed, drop)
+  const vars: i32[] = []
+  flattenVariantsInto(ty, vars)
+  if vars.length == 0 { return false }
+  for v in vars {
+    let hit = false
+    for d in drop {
+      if sameVariantTy(v, d) { hit = true }
+    }
+    if !hit { return false }
+  }
+  true
+}
+
 // `A & !B` under an intersection fold: drop B's variants from A. It differs from the narrowing
 // `subtractTy` in its edges — nothing concrete dropped leaves A unchanged (open-world negation,
 // `i32 & !2`), everything dropped folds to `never`, an empty intersection.
@@ -2637,6 +2657,141 @@ export function applyGenAlias(head: string, inner: string) {
   applyGenAliasArgs(head, inner, -1)
 }
 
+// The generic alias applications being resolved, outermost first: the alias index and a slice of
+// `gaOpenFlat` holding its argument types.
+const gaOpenGi: i32[] = []
+const gaOpenStart: i32[] = []
+const gaOpenFlat: i32[] = []
+
+// How many applications of one alias may be open at once before the expansion counts as endless,
+// whatever its arguments look like.
+const GA_OPEN_MAX = 32
+
+// Whether applying alias `gi` to `args` while an application of it is still open grows: an
+// argument holds the open one's argument at that position under a constructor, or the nesting
+// passed `GA_OPEN_MAX`.
+function gaGrowsOpen(gi: i32, args: i32[]): boolean {
+  let open = 0
+  let f = 0
+  while f < gaOpenGi.length {
+    if gaOpenGi[f] == gi {
+      open = open + 1
+      let k = 0
+      while k < args.length {
+        const old = gaOpenFlat[gaOpenStart[f] + k]
+        if args[k] != old && gaArgHolds(args[k], old, 8, false) { return true }
+        k = k + 1
+      }
+    }
+    f = f + 1
+  }
+  open >= GA_OPEN_MAX
+}
+
+// Whether `t` holds `old` under at least one list, map, record, function or alias application
+// (`under`): a union or nullable alone collapses back to a finite set, as in D2721.
+function gaArgHolds(t: i32, old: i32, depth: i32, under: boolean): boolean {
+  if t == old { return under }
+  if t < 0 || t >= T.tys.length || depth <= 0 { return false }
+  if cTyIxSetHas(gaAppTyIxSet, t) {
+    let ai = 0
+    while ai < gaAppTyIxs.length {
+      if gaAppTyIxs[ai] == t {
+        let k = 0
+        while k < gaAppArgCount[ai] {
+          if (
+            gaArgHolds(
+              gaAppArgFlat[gaAppArgStart[ai] + k],
+              old,
+              depth - 1,
+              true,
+            )
+          ) {
+            return true
+          }
+          k = k + 1
+        }
+      }
+      ai = ai + 1
+    }
+  }
+  const ty = tyAt(t)
+  match ty {
+    TyObj => {
+      for ft in ty.objFieldTypes {
+        if gaArgHolds(ft, old, depth - 1, true) { return true }
+      }
+    }
+    TyArray => {
+      return gaArgHolds(ty.aElem, old, depth - 1, true)
+    }
+    TyMap => {
+      return gaArgHolds(ty.mKey, old, depth - 1, true)
+        || gaArgHolds(ty.mVal, old, depth - 1, true)
+    }
+    TyFunc => {
+      for pt in ty.fnParamTypes {
+        if gaArgHolds(pt, old, depth - 1, true) { return true }
+      }
+      return gaArgHolds(ty.fnRet, old, depth - 1, true)
+    }
+    TyUnion => {
+      for m in ty.uMembers {
+        if gaArgHolds(m, old, depth - 1, under) { return true }
+      }
+    }
+    TyNullable => {
+      return gaArgHolds(ty.nInner, old, depth - 1, under)
+    }
+    TyPrim => {}
+    TyErr => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+  }
+  false
+}
+
+// `t` spelled for the growth refusal: an alias application by its head and arguments, since
+// the one being expanded is a record still being filled in; any other type by `tyToStr`.
+function gaArgStr(t: i32, depth: i32): string {
+  if depth > 0 && t >= 0 && cTyIxSetHas(gaAppTyIxSet, t) {
+    let ai = 0
+    while ai < gaAppTyIxs.length {
+      if gaAppTyIxs[ai] == t {
+        let s = gaAppHeads[ai] + "<"
+        let k = 0
+        while k < gaAppArgCount[ai] {
+          if k > 0 { s = s + ", " }
+          s = s + gaArgStr(gaAppArgFlat[gaAppArgStart[ai] + k], depth - 1)
+          k = k + 1
+        }
+        return s + ">"
+      }
+      ai = ai + 1
+    }
+  }
+  tyToStr(t)
+}
+
+// The refusal of a growing application of alias `head` at `args`.
+function gaGrowMsg(head: string, args: i32[]): string {
+  let at = ""
+  let k = 0
+  while k < args.length {
+    if k > 0 { at = at + ", " }
+    at = at + gaArgStr(args[k], 4)
+    k = k + 1
+  }
+  "the generic type `"
+    + head
+    + "` uses itself at a larger type argument (`"
+    + head
+    + "<"
+    + at
+    + ">`) inside its own definition, so each instance needs a bigger one and they never end: every instance of a generic type is compiled separately, and this one has no finite set of them"
+}
+
 // The body of `applyGenAlias`, with the argument list taken from either source: `appIx >= 0` is a
 // `TS_APP` spelling node whose kids are the arguments, and `inner` is then unused; `appIx < 0`
 // splits `inner` at its top-level commas. Everything after the argument list is one body precisely
@@ -2702,6 +2857,15 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   }
   const cuHit = cUserTypes[memoKey]
   if cuHit is i32 { return cuHit }
+  // A non-regular alias needs a larger application at every unfolding, which no finite set of
+  // instances satisfies (D12131); refused here rather than recursed into without bound.
+  if gaGrowsOpen(gi, argTys) {
+    tErr(gaGrowMsg(head, argTys), annotDiagAt)
+    return TY_ERR
+  }
+  gaOpenGi.push(gi)
+  gaOpenStart.push(gaOpenFlat.length)
+  for at in argTys { gaOpenFlat.push(at) }
   const fnames: string[] = []
   const ftys: i32[] = []
   const resIx = mkObjTy(fnames, ftys)
@@ -2772,6 +2936,10 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
     tpEnvTys.pop()
     pj = pj + 1
   }
+  const openAt = gaOpenStart[gaOpenStart.length - 1]
+  while gaOpenFlat.length > openAt { gaOpenFlat.pop() }
+  gaOpenGi.pop()
+  gaOpenStart.pop()
   resIx
 }
 
@@ -7614,6 +7782,36 @@ function holeCallRetAt(f: i32, c: i32, bNames: string[], bTys: i32[]): i32 {
   r
 }
 
+// The join of what each member of the set function type `f` carries returns at hole call `c`'s
+// own arguments under the call's bindings; -1 when `f` names no set of several or an argument
+// stays open.
+function holeSetPinRetAt(f: i32, c: i32, bNames: string[], bTys: i32[]): i32 {
+  if f < 0 || f >= T.tys.length || c < 0 || c >= P.nodes.length { return -1 }
+  const n = nodeAt(c)
+  if !(n is Call) { return -1 }
+  const fs = fnTagSetOfTy(f)
+  if fs < 0 || fnTagMembers(fs).length < 2 { return -1 }
+  const sts: i32[] = []
+  for a in n.callArgs {
+    const at = substTyDeep(nodeTyOf(a), bNames, bTys)
+    if at < 0 || tyHasTyVar(at) { sts.push(-1) } else { sts.push(at) }
+  }
+  // A call forwarded through another function's holes reads them unbound here; the pinned
+  // signature's own parameters are the types its members are called at.
+  const ft = tyAt(f)
+  if ft is TyFunc && ft.fnParamTypes.length == sts.length {
+    let k = 0
+    while k < sts.length {
+      if sts[k] < 0 { sts[k] = ft.fnParamTypes[k] }
+      k = k + 1
+    }
+  }
+  for t in sts {
+    if t < 0 || tyHasTyVar(t) { return -1 }
+  }
+  holeSetCallRetOf(-1, fs, sts, false)
+}
+
 // The result of open signature `f` of a hole function or an un-annotated lambda, read out of a
 // hole (`fs[0](3)`), at hole call `c`'s own arguments under the call's bindings, as a direct call
 // of it types (D6601); -1 when `f` is no such signature or the result stays open.
@@ -8565,6 +8763,10 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
             const lam = holeOpenFnRetAt(fi, hdAlt[row], bNames, bTys)
             if lam >= 0 { return lam }
           }
+          // A parameter pinned to a set of several runs the member it holds: the set's join, as
+          // the instance's own call gives it, not the first member's signature (D16091).
+          const sj = holeSetPinRetAt(fi, hdAlt[row], bNames, bTys)
+          if sj >= 0 { return sj }
           return it.fnRet
         }
       }
@@ -8793,6 +8995,25 @@ function bindGenUnionRest(
       bindGenWalk(pms[j], ams[j], bNames, bTys)
       j = j + 1
     }
+    return true
+  }
+  // Two or more open members and an argument no concrete member admits whole: every open member
+  // binds to the members only they admit (D14803).
+  if opens >= 2 {
+    const rest: i32[] = []
+    for a in ams {
+      let covered = false
+      for m in pms {
+        if !covered && !tyHasTyVar(m) && tyEq(m, a) { covered = true }
+      }
+      if !covered { rest.push(a) }
+    }
+    if rest.length > 0 {
+      const r = tyOfMembers(rest)
+      for m in pms {
+        if tyHasTyVar(m) { bindGenWalk(m, r, bNames, bTys) }
+      }
+    }
   }
   true
 }
@@ -8885,6 +9106,13 @@ function bindParamUnionLate(p: i32, at: i32, bNames: string[], bTys: i32[]) {
       bNames.push(open[k])
       bTys.push(rest[k])
       k = k + 1
+    }
+  } else {
+    // An argument only the union's parameters admit binds every one of them to it (D14803).
+    const r = tyOfMembers(rest)
+    for o in open {
+      bNames.push(o)
+      bTys.push(r)
     }
   }
   0

@@ -475,6 +475,7 @@ import {
   joinVariantTys,
   recArmFitKind,
   sameVariantTy,
+  subtractLeavesNothing,
   subtractTy,
   tErr,
   tErrCoded,
@@ -576,6 +577,7 @@ import {
   T,
   TY_ERR,
   TY_I32,
+  TY_NEVER,
   TY_NULL,
   TY_VOID,
   TyArray,
@@ -601,6 +603,7 @@ import {
   tyMutEpoch,
   tySame,
   tyToStr,
+  tyToStrUser,
 } from "./check_types"
 import { mkUnionTy } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
@@ -4340,6 +4343,11 @@ function pushLitEqFactAt(
     }
     return true
   }
+  if !elabCapLive() && subtractLeavesNothing(cur, lit) {
+    deadElseNote(place, cur)
+    pushNarrowFact(place, TY_NEVER, places, tys)
+    return true
+  }
   pushNarrowFact(place, subtractTy(cur, lit), places, tys)
   true
 }
@@ -4378,10 +4386,12 @@ function litSoleHolderIn(u: i32, lit: i32): boolean {
 let scWrPlaces: {[i32]: i32[]} = Map()
 let scWrTys: {[i32]: i32[]} = Map()
 const scWrOpen: i32[] = []
-// Empties the by-node write log, so a node of the next program reads none of this one's.
+// Empties the by-node write log and the dead-arm reasons, so the next program reads none of
+// this one's.
 export function scWrReset() {
   scWrPlaces = Map()
   scWrTys = Map()
+  deadElseWhy = []
 }
 
 export function scWrEnter(ix: i32) {
@@ -4638,6 +4648,26 @@ function isTestMemberAnswer(m: i32, t: i32, depth: i32): i32 {
   -1
 }
 
+// Why each else-narrow collected since the last `deadElseMark` leaves its arm nothing: the
+// operand's spelling and closed type, for the arm's dead-test warning (D16006).
+let deadElseWhy: string[] = []
+
+function deadElseNote(objIx: i32, cur: i32) {
+  const name = narRowText(objIx)
+  if name == "" { return 0 }
+  deadElseWhy.push("`" + name + "` is always `" + tyToStrUser(cur) + "`")
+}
+
+// The mark `deadElseSince` reads from.
+export function deadElseMark(): i32 { deadElseWhy.length }
+
+// The first reason noted since `mark`, or "" for none; drops them.
+export function deadElseSince(mark: i32): string {
+  const r = if deadElseWhy.length > mark { deadElseWhy[mark] } else { "" }
+  while deadElseWhy.length > mark { deadElseWhy.pop() }
+  r
+}
+
 // `subtractTy` for an `is` test's else arm. A concrete tested type stays apart from a type
 // parameter's list, as in a return set: the else of `is i32[]` over `T[] | i32[]` is `T[]`, the
 // arm each instance's emitter reads there. The else of `is T[]` reads as the whole union here and
@@ -4691,6 +4721,12 @@ function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
         const tIdx = isTypeTyRead(cond.isVariant, condIx)
         if tIdx >= 0 {
           let sub = elseRemainderTy(cur, tIdx)
+          // A test the operand's whole closed type passes leaves the else arm nothing: `never`.
+          if sub < 0 && !elabCapLive() && subtractLeavesNothing(cur, tIdx) {
+            deadElseNote(cond.isObj, cur)
+            pushNarrowFact(isPl, TY_NEVER, places, tys)
+            return 0
+          }
           // A hole has no member list to subtract from, so the remainder is deferred to the pin
           // rather than lost. Without it the `else` arm of `if a is string` over an un-annotated
           // parameter reads `a` at the full pinned union and `a * 2` refuses a program whose

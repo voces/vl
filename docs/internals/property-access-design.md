@@ -512,7 +512,9 @@ consumers.
 >   lane, a packed field, a flat-row column); anything else is a method (`std-api-review.md`).
 > - **What is built**: the step budget, string-literal compares and the f64 `%` refusal
 >   (D2061–D2063), the intrinsic set (D2064), and the callee rule (D2135): a getter may call an
->   ordinary function whose per-function summary qualifies (below). Every loop is still
+>   ordinary function whose per-function summary qualifies (below). The loop variable's
+>   interval (D2065) and the constant-range loop, costed at its trips times its body with each
+>   trip at least one step (D16065), are built; `while`, `for … in` and any other range are
 >   refused. The bullets below are the v1 text, amended where marked.
 
 A getter body is refused unless it is:

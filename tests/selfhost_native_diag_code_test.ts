@@ -96,36 +96,15 @@ Deno.test({
   ignore,
 }, () => {
   const exp = instantiate();
-  // An INFERRED nullable SET return is type-valid; codegen cannot lower it un-annotated (the
-  // annotated `: Set<i32> | null` spelling of the same function builds and runs).
-  //
-  // THE WITNESS HAS MOVED TWICE, AND WHY IS THE POINT OF THE TEST. It was
-  // `print(pick(true))` over an `i32 | string`, which now RUNS — D712 built the box-tag
-  // dispatch, because every arm of that union is inside `print`'s declared domain. It was
-  // then an inferred nullable-STRUCT return, which now runs too — D887 recorded that shape's
-  // inferred-return row so the A20 pass and `emitReturnValue` could take the arms the
-  // annotated path already had. What this test pins is the CHANNEL (a capability admission
-  // carries a stable code), so any still-open capability gap serves as its witness.
-  // D956 closed the string-keyed MAP at every value type and it moved a FOURTH time, to
-  // `i64[] | null`; D1062 closed the nullable LIST at every element type, which is why it
-  // has moved a FIFTH. What still floors here is the i32-KEYED map — `nullableRetName`'s
-  // map arm requires a `string` key — and its annotated twin runs, so it is a capability
-  // gap and this will move again. D1108 closed the i32- and i64-keyed map, so it has moved a
-  // SIXTH time, to the nullable `Set` (D16037), which that arm still excludes.
-  // `scripts/capability-probes/inferred-nullable-container-return.vl` and
-  // `inferred-nullable-list-return.vl` are the standing probes for the closed halves; when
-  // the rest closes, this moves again.
+  // A test-only capability refusal (`setTestUnsupported`, unreachable from a user program): what
+  // this pins is the CHANNEL, that a capability admission carries a stable code. A real open gap
+  // as the witness moved every time its gap closed (seven times, the last D16037).
+  exp.setTestUnsupported(1);
   const { rc, diags } = check(
     exp,
     [
-      "function pick(c: boolean) {",
-      "  if c { return null }",
-      "  const m: Set<i32> = Set()",
-      "  m",
-      "}",
       "function go() {",
-      "  const r = pick(true)",
-      "  if r == null { print(0) } else { print(1) }",
+      "  __vl_test_unsupported__()",
       "}",
       "go()",
       "",
