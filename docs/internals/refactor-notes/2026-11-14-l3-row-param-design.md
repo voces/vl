@@ -50,12 +50,24 @@ accessor-view half the ruling defers.
 result storage is the parameter's row where the body returns the parameter, a second fact the
 same key carries (`ekRetWide`, the wider-result note, exists for this).
 
-**The cap.** The elaboration counts distinct `#r.<i>` rows per declaration and parameter as it
-enqueues. The ninth refuses loudly, naming the cap ("a record parameter is specialised at most 8
-rows; this is the 9th"), until the view lands. **A ruling is needed first:** `nine_rows` runs
-today through D3992, which has no cap, so a hard cap turns a running program into a refusal
-(runs → not-runs). Either the cap starts above what the corpus reaches (measure with the
-census), or the ninth row keeps D3992's path until the view exists.
+**The cap.** Ruled: at least twice the corpus maximum. Measured with a counter build (not
+committed) over `tests/cases`, the distilled census cells and the capability probes, about
+20,000 programs: 11 reach D3992's width instances, and the most distinct rows one parameter is
+instanced at is 4 (`records-of-generics-at-two-types-into-one-narrower-param.vl`,
+`record-with-generic-fn-field-into-narrower-declared-param.vl`). The cap is 16: twice that would
+be 8, which refuses the template's `nine_rows` cell, a program that runs today. The elaboration
+counts distinct `#r.<i>` rows per declaration and parameter as it enqueues, and the 17th row is
+refused by a sentence naming the contract: a record-typed parameter is specialised at most 16
+concrete rows.
+
+**Three mechanisms exist, and this folds two.** Beside D622's prefix edge and D3992's rewrite,
+D14532 already instances a declared record parameter per rep: `recAnnArgTakesRep`
+(`check_fit_rules.vl`) notes the argument's rep (`recArgRepNote`), and `monoIsGenericDecl` makes the
+callee a template (`recRepFnHas`). Its note is per argument node, so a call inside a generic or a
+hole instance, whose one template argument carries a different row per instance, cannot use it.
+The `#r.<i>` entry is per instance. Mono's template test then reads "the elaboration keyed an
+instance of this declaration by a row" in place of `recRepFnHas`, and the D15173 pin arm
+(`monoPinHoleParam`) reads the entry for an annotated parameter too.
 
 **What it deletes.** Once the entry serves every call position: `check_width.vl` (the parameter
 face of D3992) and its `width` pin phase, the `wsSuppress` path of `callFtyArgAssign`, and the
