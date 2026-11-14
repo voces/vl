@@ -31,9 +31,13 @@ Fixpoint seeds on both sides, `--before` master `4b94dbf0`.
 
 - **The witnesses:** D16334 prints `11`. D16335's binding is refused with `cannot assign i32 to 's'
   of type boolean`. The `string` spelling was invalid wasm and is now refused the same way.
-- **New `hole-call-through-declared-hole-fn.matrix.vl`:** 16 cells move and 0 are lost.
-  - Four silently wrong cells (a bound map, `m.set`) and two SILENT ones (built-in map
-    positions) now run, as do the record field, list push and two built-in emit refusals.
-  - The wrong-type binding moves from wrong output to the owed refusal.
-  - The cells cover direct, two hops, a map, `m.set`, a record field, a list push and a loop.
+- **New `hole-call-through-declared-hole-fn.matrix.vl`:** `runs 60 of 60 graded · 2 owed
+  refusals · 20 skipped · 0 silent`; 14 cells move and 0 are lost.
+  - Four WRONG cells (`bound_map` printed `null`, `bound_map_set` printed nothing) now run.
+  - Two SILENT cells (built-in `map_value`, `map_set`, invalid wasm) now run.
+  - Six emit refusals (`struct_field_init`, `array_element`, `record_field` ×2, `list_push` ×2)
+    now run.
+  - `wrong_annotation`, both faces, moves from `WRONG true` to the owed refusal.
+- **Every `*hole*` matrix (184), fixpoint seeds both sides:** `runs -> not-runs 0` in each.
+  `hole-lambda-arg-through-hole-callee` also gains `map_value`/`map_set` (SILENT to RUNS).
 - **The other gates:** see the PR.
