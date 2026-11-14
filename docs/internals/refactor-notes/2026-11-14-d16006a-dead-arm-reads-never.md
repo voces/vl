@@ -22,6 +22,8 @@ collector uses it at the `is` complement and the `==` complement over a closed o
   at one pin is live at another, and D932's static guard already folds it at emit. A post-guard
   `never` residue is not applied past the `if` (`ifTailApplyGuards`): an exhaustive chain's
   fall-through stays `ifChainExhausts`'s.
+* **Inference.** A function inside a dead arm whose tail is `never` infers `never`, not
+  D1972's trap-only `void`, so a use of its result checks too.
 * **Hover** shows `never` for the operand in the dead arm (`tests/lsp_wasm_checker_test.ts`).
 
 **Matrix** (master → now; every "now" case also carries the warning):
@@ -38,7 +40,7 @@ collector uses it at the `is` complement and the `==` complement over a closed o
 | `match` `_` after every member | `5`, no warning | `5` |
 | another name in the arm (`q + "!"`) | refused | refused |
 | live arm (`p: i32 \| string`) | runs | unchanged, no warning |
-| lambda in the arm reading `p`, result used | `5` | refused — D16092 |
+| lambda in the arm reading `p`, result used | `5` | `5` |
 
 29 existing run cells now carry the warning, many over a local the checker flow-narrowed to one
 member (`const x: i32 | string = 5; if x is i32 … else …`). Each declares it with `@warning`.
