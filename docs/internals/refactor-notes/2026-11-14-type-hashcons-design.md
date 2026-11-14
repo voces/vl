@@ -23,7 +23,8 @@ stage 1 starts.
 - **Rows are written after they are minted** at 43 `tyMutEpoch` bumps in 13 files, and 40
   epoch-stamped memo reads depend on that. 33 of the 43 bumps pin an empty collection's element,
   key or value (§1.2). In the self-compile, **all 25,648 bumps happen before emit begins, and none
-  during emit** (§4.2). So the arena can be frozen after checking.
+  during emit** (§4.2). On the distilled corpus, monomorphizing re-checks do pin during emit (lane
+  E counted 107 moves in 103 programs), so the seal is scoped per instance (§2.2).
 - **The design** is one intern table (the emitter's existing `hcIntern`, moved down) and holes as
   first-class rows with a solution column, so no row is ever written after it is minted. A nominal
   id becomes part of each row's key, and each old comparer becomes `proj(a) == proj(b)` over a
@@ -243,6 +244,14 @@ That is a mutable cell spelled as a sentinel. Instead:
   which every id it holds is final. Mono's instance re-checks mint their own holes (their own
   binder), so solving those never changes a sealed id. The one emit-phase bump measured, in
   `scripts/dup-census.vl`, is stage 2's first acceptance check.
+- **Emit-phase pins are not rare on generic programs.** The self-compile has no type parameters.
+  Lane E's stage-0 count on the distilled corpus found 107 `tyMutEpoch` moves in 103 programs, all
+  in the monomorphizing phase. So stage 2 does not seal globally. Instead:
+  - Each mono instance re-check gets its own hole binders, scoped to that instance.
+  - The seal covers ids minted before emit.
+  - A pin during emit solves only instance-scoped holes.
+  - Stage 2's acceptance is that the 103 programs' bumps all land on instance-scoped holes. A bump
+    that lands on a pre-emit row is a named finding, fixed before stage 4 drops the epoch.
 
 ### 2.3 Nominal rows are keyed by their declaration
 
