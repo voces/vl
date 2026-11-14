@@ -112,6 +112,29 @@ export const isaEnv = (): Record<string, string> => {
   return isa ? { VL_ISA: isa } : {};
 };
 
+/** The seed cache every native spawn shares: `$VL_SEED_CACHE_DIR`, else the host's default for
+ * this process's environment, pinned so a test's private `$VL_CACHE_DIR` does not make each run
+ * recompile the seed. A test of the seed cache itself overrides it. */
+const env = (k: string) => Deno.env.get(k) || undefined;
+const cacheRoot = (): string => {
+  const xdg = env("XDG_CACHE_HOME"), home = env("HOME"), local = env("LOCALAPPDATA");
+  if (env("VL_CACHE_DIR")) return env("VL_CACHE_DIR")!;
+  if (xdg) return `${xdg}/vl`;
+  if (home) return `${home}/.cache/vl`;
+  return `${local ?? Deno.makeTempDirSync()}/vl`;
+};
+export const SEED_CACHE = env("VL_SEED_CACHE_DIR") ?? `${cacheRoot()}/seed`;
+
+/** A 0700 seed cache at `dir` linking every entry of SEED_CACHE, for a case that compiles a
+ * throwaway seed: its entry lands there instead of taking a slot in the user's cache. */
+export const privateSeedCache = (dir: string): string => {
+  Deno.mkdirSync(dir, { mode: 0o700 });
+  for (const e of Deno.readDirSync(SEED_CACHE)) {
+    Deno.symlinkSync(`${SEED_CACHE}/${e.name}`, `${dir}/${e.name}`);
+  }
+  return dir;
+};
+
 /**
  * The environment a native `vl` spawn takes: `RUST_BACKTRACE` holds a host panic
  * to one line, and `VL_STD` / `VL_COMPILER_WASM` pin both resolutions to THIS
@@ -133,6 +156,7 @@ export const nativeEnv = (
   RUST_BACKTRACE: "0",
   VL_STD: STD,
   VL_COMPILER_WASM: COMPILER,
+  VL_SEED_CACHE_DIR: SEED_CACHE,
   ...isaEnv(),
   ...extra,
 });
