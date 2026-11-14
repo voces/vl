@@ -1,3 +1,5 @@
+import { tyFnPosition } from "./check_identity"
+import { nodeTyInOf } from "./emit_ty_canon"
 import { unionTyMemberTys } from "./emit_map_twins"
 import { unMemIsMap } from "./emit_union_registry"
 import { emitFail } from "./emit_bytes"
@@ -859,7 +861,7 @@ function tailStmtWidensAtomToStr(stmtIx: i32, fnIx: i32) {
 export function exprIsStrEq(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    if e.binOp == "==" || e.binOp == "!=" {
+    if (e.binOp == "==" || e.binOp == "!=") && e.binIdent == 0 {
       // A comparison with `null` is a null check, handled by the nullable `ref.is_null` paths,
       // never element-wise string equality — a `string | null` operand would otherwise be
       // element-compared against `null`.
@@ -903,7 +905,7 @@ function strOrderOperandIsText(ix: i32, fnIx: i32) {
 function exprIsUnionStrEq(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    if e.binOp == "==" || e.binOp == "!=" {
+    if (e.binOp == "==" || e.binOp == "!=") && e.binIdent == 0 {
       const lU = exprUnion(e.binLeft, fnIx)
       const rU = exprUnion(e.binRight, fnIx)
       if lU && rU {
@@ -939,7 +941,7 @@ function exprIsUnionStrEq(binIx: i32, fnIx: i32) {
 export function binEqVariantRow(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    if e.binOp == "==" || e.binOp == "!=" {
+    if (e.binOp == "==" || e.binOp == "!=") && e.binIdent == 0 {
       const lvi = exprVariantIndex(e.binLeft, fnIx)
       if lvi >= 0 && lvi == exprVariantIndex(e.binRight, fnIx) { return lvi }
     }
@@ -954,7 +956,7 @@ export function binEqVariantRow(binIx: i32, fnIx: i32) {
 export function binEqNulVariantRow(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    if e.binOp == "==" || e.binOp == "!=" {
+    if (e.binOp == "==" || e.binOp == "!=") && e.binIdent == 0 {
       const lvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
       if lvi >= 0 && lvi == nulVariantIdxOfExpr(e.binRight, fnIx) { return lvi }
     }
@@ -966,7 +968,7 @@ export function binEqNulVariantRow(binIx: i32, fnIx: i32) {
 export function binEqStructRow(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    if e.binOp == "==" || e.binOp == "!=" {
+    if (e.binOp == "==" || e.binOp == "!=") && e.binIdent == 0 {
       const lsi = binEqSideRow(e.binLeft, fnIx)
       const rsi = binEqSideRow(e.binRight, fnIx)
       if lsi >= 0 && lsi == rsi { return lsi }
@@ -1106,7 +1108,7 @@ export function eqgListKindOfExpr(exprIx: i32, fnIx: i32) {
 export function eqgListKindOfBin(binIx: i32, fnIx: i32, lopK: EqCore) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    if e.binOp == "==" || e.binOp == "!=" {
+    if (e.binOp == "==" || e.binOp == "!=") && e.binIdent == 0 {
       // A bare `null` operand is a null test, not a value compare.
       if nodeAt(unwrapParen(e.binLeft)) is NullLit { return -1 }
       if nodeAt(unwrapParen(e.binRight)) is NullLit { return -1 }
@@ -1157,7 +1159,10 @@ export function listOpSlotOfBin(binIx: i32, fnIx: i32) {
 export function listOpKindOfBin(binIx: i32, fnIx: i32): EqCore {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    if e.binOp == "==" || e.binOp == "!=" || e.binOp == "+" {
+    if (
+      (e.binOp == "==" || e.binOp == "!=") && e.binIdent == 0
+      || e.binOp == "+"
+    ) {
       const lk = listOpKindOf(e.binLeft, fnIx)
       if lk == "none" { return "none" }
       const rk = listOpKindOf(e.binRight, fnIx)
@@ -1180,6 +1185,14 @@ export function eqCoreKindOfBin(binIx: i32, fnIx: i32, lopK: EqCore): EqCore {
   const e = nodeAt(binIx)
   if e is BinExpr {
     if e.binOp == "==" || e.binOp == "!=" {
+      // An identity compare takes a core only for a function operand (`identityOperandIsFn`).
+      if (
+        e.binIdent != 0
+        && !identityOperandIsFn(e.binLeft, fnIx)
+        && !identityOperandIsFn(e.binRight, fnIx)
+      ) {
+        return "none"
+      }
       // A bare `null` operand makes this a null test, which consumes no compare core at all.
       // Claiming one here would reserve a compare frame for every `xs != null` guard in the
       // language and shift every local index after it.
@@ -1248,15 +1261,18 @@ export function eqCmpKindOfOperand(exprIx: i32, fnIx: i32): EqCmpKind {
   exprNulNicheKind(exprIx, fnIx)
 }
 
+// Whether identity operand `ix` can hold a function value, itself, through a nullable, or as a
+// union arm: function identity (declaration and environment) is the `==` lowering's (A15).
+export function identityOperandIsFn(ix: i32, fnIx: i32): boolean {
+  if exprIsClosure(ix, fnIx) { return true }
+  const fp = tyFnPosition(nodeTyInOf(unwrapParen(ix), fnIx), [])
+  fp == "fn" || fp == "arm"
+}
+
 export function cloEqNoteBin(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    // An identity compare of two functions is lowered as their `==` (`emitIdentityBin`).
-    const eqOp = e.binOp == "=="
-      || e.binOp == "!="
-      || e.binOp == "==="
-      || e.binOp == "!=="
-    if eqOp {
+    if e.binOp == "==" || e.binOp == "!=" {
       if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
         fnUsesCloEq = true
         return 0
