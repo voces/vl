@@ -10896,6 +10896,14 @@ D4551's default and its own declaration-time refusal; this rule does not touch i
 **What it leaves open.** `F<A, B>(v: A | B): boolean { v }` called as `F(5)` reads `never | never`,
 which every destination accepts. Whether `5` binds `A`, binds both, or is refused as ambiguous is the
 owner's ruling, filed as D14803.
+
+**Ruled by the owner 2026-11-14 (D14803): an argument that only a union of type parameters
+admits binds EVERY candidate parameter to the argument's type.** `F(5)` against `F<A, B>(v: A | B)`
+reads as `F<i32, i32>(5)`, so the return check then refuses `i32` into `boolean`, and
+`G<A, B>(v: A | B): A | B { v }` called as `G(5)` runs, returning `i32`. Refusing the call as
+ambiguous was the alternative; it was not taken because it refuses programs like `G(5)` that the
+design permits, and the binding is sound (each parameter gets the only type the program gives it).
+A caller who means the parameters to differ writes the type arguments.
 ## A plain build drops the functions no root reaches (2026-10-23)
 
 **The rule.** `vl build` and `vl run` emit, for every function no root reaches, a three-byte
