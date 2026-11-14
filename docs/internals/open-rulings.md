@@ -1685,6 +1685,17 @@ a recommendation. The spec's own questions are in `docs/spec/OPEN-QUESTIONS.md`.
   Brief: `docs/internals/incremental-compilation-design.md`.
 - **J2.** Which runner hosts the surviving JS-side tests, Node or another?
 - **`--strip-locations` for release builds.** It was recommended on 2026-09-01 and never ruled.
+- **The seed sidecar's trust (engineering review 2026-11, Small 1).** A `.cwasm` committed to a
+  checkout the user cloned is loaded and run as native code: the directory check (DECISIONS "The
+  seed sidecar is trusted by its directory") rejects only another user's directory. The option
+  on the table is (B) a per-user HMAC key in the private cache root and a small `.seal` beside each
+  sidecar, holding HMAC(seed id, engine tag, length, inode/ctime stamp, artifact digest). A warm
+  run then costs a stat plus ~100 bytes of HMAC. A copied sidecar is re-hashed once (36 ms for the
+  46 MB artifact) and resealed. A sidecar from another machine or a checkout is recompiled, which
+  is ~9 s per engine configuration for every CI job with a fresh `$HOME` unless CI caches
+  `$VL_CACHE_DIR` instead of `build/vl-compiler.wasm.*.cwasm`, a path in 13 cache steps (10 in
+  ci.yml, one each in sweep.yml, fuzz-nightly.yml and publish-seed.yml). Rejected for now: the full
+  envelope, measured 21.7 → 120.4 ms warm `vl run hello.vl` and 58 → 98 MB peak RSS.
 
 ## Dismissed — filed as owner rulings, verified NOT open
 

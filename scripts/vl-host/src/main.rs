@@ -2481,9 +2481,8 @@ fn std_cmd(rest: &[String]) -> Result<()> {
 /// that caches the Cranelift compilation (the dominant fixed cost of every
 /// invocation), keyed by the seed's CONTENT and by engine configuration (a separate
 /// sidecar per one). Shared by every subcommand that
-/// drives the seed (`compile_vl_located`, the pump). `deserialize_file` is unsafe because a
-/// corrupt/forged artifact is UB — we only ever load a sidecar this same binary wrote
-/// next to the module it was derived from.
+/// drives the seed (`compile_vl_located`, the pump). `deserialize_file` runs the file as
+/// native code; what stands between it and a forged file is `cached_module`'s SAFETY note.
 ///
 /// Under `$VL_PROFILE_GUEST` this is also where the sampler starts and where the store
 /// is armed — before instantiation, since the module's start function is guest code an
@@ -2569,8 +2568,24 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
                 seed_identity(compiler_path).map_err(|e| Error::from(e).context(loading()))?;
             let sidecar =
                 std::path::PathBuf::from(format!("{compiler_path}.{}.{tag}.cwasm", ids.key));
-            let hit = sidecar.exists();
-            let module = cached_module(engine, Some(&sidecar), hit, || {
+            // The user-module cache's directory check: a seed directory another user owns or
+            // can write runs uncached, loudly, since a file planted there would be run.
+            let dir = match sidecar.parent() {
+                Some(d) if !d.as_os_str().is_empty() => d,
+                _ => std::path::Path::new("."),
+            };
+            let trusted = match private_cache_dir(dir) {
+                Ok(()) => true,
+                Err(why) => {
+                    eprintln!(
+                        "vl: not caching the compiler beside `{compiler_path}`: its directory is {why}"
+                    );
+                    false
+                }
+            };
+            let hit = trusted && sidecar.exists();
+            let cache = trusted.then_some(sidecar.as_path());
+            let module = cached_module(engine, cache, hit, || {
                 let bytes =
                     seed_bytes(compiler_path).map_err(|e| Error::from(e).context(loading()))?;
                 // The memo vouched for the file as it was when it was stat'ed; bytes that
@@ -2590,7 +2605,7 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
             // Only after a MISS — the one invocation that just published a new key, and
             // so the only one that can have orphaned an old seed's entries. Keeping it
             // off the hit path keeps the warm case at zero directory reads.
-            if !hit {
+            if trusted && !hit {
                 prune_seed_sidecars(compiler_path, &sidecar);
             }
             module
@@ -2616,8 +2631,11 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
 /// here. What still reaches it is a file at our path that is truncated, foreign, or
 /// otherwise unreadable.
 ///
-/// `deserialize_file` is unsafe because a corrupt or forged artifact is UB — we only
-/// ever read a file this same binary wrote for this same module.
+/// SAFETY of `deserialize_file`: a forged or corrupt artifact is native code execution or UB,
+/// and nothing here reads the bytes before wasmtime does (a full digest would cost every warm
+/// run more than the run itself; DECISIONS.md, "The seed sidecar is trusted by its directory").
+/// The caller's `private_cache_dir` rules out another user's file. It does NOT rule out one
+/// this user put there: a sidecar committed to a checkout the user cloned is loaded and run.
 fn cached_module(
     engine: &Engine,
     cache: Option<&std::path::Path>,
