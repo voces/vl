@@ -19,8 +19,9 @@ host.
   `coreTypes.ts`/`diagnostics.ts`, imported by the LSP + browser playground.
 - `scripts/vl-host/` — the native Rust host that embeds the wasm seed and exposes the `vl` CLI.
 - `lsp/` — VS Code extension + LSP server over the seed (`lsp/src/server.ts`).
-- `tests/` — the `.vl` corpus (`tests/cases/**`) + the runner (`tests/run.ts`).
-- `docs/`, `reference/` (retired ts-interpreter, excluded from lint/test).
+- `tests/` — the `.vl` corpus (`tests/cases/**`) and its Deno harnesses (`tests/*_test.ts`; the
+  corpus oracle is `tests/cases_wasm_*_test.ts` over `tests/support/casesWasmOracle.ts`).
+- `docs/`.
 
 The parser is **hand-written** (`compiler/lexer.vl` + `compiler/parser.vl`) — no antlr, no grammar
 file; the lexer/parser are the grammar.
@@ -29,7 +30,7 @@ file; the lexer/parser are the grammar.
 
 - **Gate (run after changes):**
   - `deno check compiler/*.ts` — type-check the TS leaves (`coreTypes.ts`/`diagnostics.ts`).
-  - `deno lint` — lint (excludes `reference/`).
+  - `deno lint` — lint.
   - `deno task test` — the test suite, including the `.vl` corpus (`tests/cases_wasm_*_test.ts`, the behavior oracle).
   - After a `compiler/*.vl` change: `scripts/refresh-compiler.sh` (rebuild the seed),
     `scripts/native-fixpoint.sh` (byte-exact self-compile), `scripts/lint-self.sh`
