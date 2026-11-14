@@ -9,8 +9,10 @@
 # `$VL_FUEL=1` tags the cost rows compile under; `--fuel-only` warms just those two (for
 # refresh-compiler.sh `--fuel-stash`). The self-compile's own tag (scripts/self-compile-gc.sh)
 # is left to refresh-compiler.sh's sanity run, which compiles under it.
-# `--stash <dir>` places every sidecar in <dir> beside the seed first, then places every
-# sidecar this run created into <dir>, so a CI cache of <dir> carries them to the next job.
+# Sidecars live in the seed cache (`vl seed --cache-dir`: `$VL_SEED_CACHE_DIR`, else seed/ under
+# the user cache), keyed by the seed's content, never beside the seed. `--stash <dir>` places
+# every sidecar in <dir> into that cache first, then places every sidecar this run created into
+# <dir>, so a CI cache of <dir> carries them to the next job.
 #
 # A sidecar's tag includes the host CPU's features unless `$VL_ISA` pins a level, so one
 # written on another machine (a CI cache restored on a different runner) can miss here and
@@ -38,12 +40,13 @@ printf 'print(6 * 7)\n' > "$WORK/hello.vl"
 
 # A hard link where the two paths share a filesystem, a copy where they do not.
 place() { ln -f "$1" "$2/" 2>/dev/null || cp -f "$1" "$2/"; }
-if [ -n "$STASH" ] && [ -d "$STASH" ]; then
+CACHE="$("$VL" seed --cache-dir 2>/dev/null || true)"
+if [ -n "$STASH" ] && [ -d "$STASH" ] && [ -n "$CACHE" ]; then
   for f in "$STASH"/*.cwasm; do
-    if [ -e "$f" ]; then place "$f" "$(dirname "$SEED")"; fi
+    if [ -e "$f" ]; then place "$f" "$CACHE"; fi
   done
 fi
-before="$(ls "$SEED".*.cwasm 2>/dev/null || true)"
+before="$( [ -n "$CACHE" ] && ls "$CACHE"/*.cwasm 2>/dev/null || true)"
 
 note() { echo "  note: could not warm the $1 sidecar — its first use re-JITs the seed" >&2; }
 # Each warm names its whole configuration, so a `$VL_COMPILE_GC_HEAP` the caller exported
@@ -66,8 +69,8 @@ if [ "$FUEL" != 0 ]; then warm_fuel copying & warm_fuel null & fi
 wait
 
 # Only a sidecar this run created goes into the stash, so a restored stash adds nothing to save.
-if [ -n "$STASH" ]; then
-  for f in "$SEED".*.cwasm; do
+if [ -n "$STASH" ] && [ -n "$CACHE" ]; then
+  for f in "$CACHE"/*.cwasm; do
     [ -e "$f" ] || continue
     if printf '%s\n' "$before" | grep -qxF "$f"; then continue; fi
     mkdir -p "$STASH"
