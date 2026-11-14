@@ -96,25 +96,15 @@ Deno.test({
   ignore,
 }, () => {
   const exp = instantiate();
-  // An INFERRED union return of a list and a map is type-valid; codegen cannot lower it
-  // un-annotated (the annotated `: {[string]: i32} | i32[]` spelling builds and runs, D16024).
-  //
-  // What this test pins is the CHANNEL (a capability admission carries a stable code), so any
-  // still-open capability gap serves as its witness, and the witness moves whenever its gap
-  // closes. It has moved seven times; the last was D16037, which closed the nullable `Set`.
-  // `scripts/capability-probes/inferred-nullable-container-return.vl` and
-  // `inferred-nullable-list-return.vl` are the standing probes for the closed halves.
+  // A test-only capability refusal (`setTestUnsupported`, unreachable from a user program): what
+  // this pins is the CHANNEL, that a capability admission carries a stable code. A real open gap
+  // as the witness moved every time its gap closed (seven times, the last D16037).
+  exp.setTestUnsupported(1);
   const { rc, diags } = check(
     exp,
     [
-      "function pick(c: boolean) {",
-      "  if c { return [1] }",
-      "  const m: {[string]: i32} = Map()",
-      "  return m",
-      "}",
       "function go() {",
-      "  const r = pick(false)",
-      "  print(1)",
+      "  __vl_test_unsupported__()",
       "}",
       "go()",
       "",
