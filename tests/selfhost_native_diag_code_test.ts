@@ -39,13 +39,20 @@ import type { VLDiagnosticData } from "../compiler/diagnostics.ts";
 
 type Exports = Record<string, (...args: number[]) => number>;
 
-type Diag = { message: string; code: string; data: VLDiagnosticData; raw: string };
+type Diag = {
+  message: string;
+  code: string;
+  data: VLDiagnosticData;
+  raw: string;
+};
 
 // One compiled Module for the file, a FRESH Instance per test. Compiling is the
 // expensive half and a `WebAssembly.Module` is immutable, so hoisting it changes
 // nothing a test can observe — every test still gets its own store, which is what
 // keeps `modReset`/`srcReset` honest. The same split is `tests/support/sharedInstance.ts`.
-const module = seedExists ? new WebAssembly.Module(Deno.readFileSync(SEED)) : undefined;
+const module = seedExists
+  ? new WebAssembly.Module(Deno.readFileSync(SEED))
+  : undefined;
 
 const instantiate = (): Exports => {
   if (!module) throw new Error(`no seed at ${SEED}`);
@@ -65,7 +72,10 @@ const readString = (len: number, at: (j: number) => number): string =>
  *  `raw` is the payload's undecoded bytes, kept so a format change is visible in
  *  the failure message rather than only in a decoded field going missing. */
 const diagAt = (exp: Exports, i: number): Diag => {
-  const dataBytes = readBytes(exp.diagDataLen(i), (j) => exp.diagDataByte(i, j));
+  const dataBytes = readBytes(
+    exp.diagDataLen(i),
+    (j) => exp.diagDataByte(i, j),
+  );
   return {
     message: readString(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j)),
     code: readString(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j)),
@@ -92,29 +102,29 @@ const check = (
 };
 
 Deno.test({
-  name: "diag-code: an emitter-capability rejection carries `unsupported-lowering`",
+  name:
+    "diag-code: an emitter-capability rejection carries `unsupported-lowering`",
   ignore,
 }, () => {
   const exp = instantiate();
-  // An INFERRED union return of a list and a map is type-valid; codegen cannot lower it
-  // un-annotated (the annotated `: {[string]: i32} | i32[]` spelling builds and runs, D16024).
+  // An INFERRED nullable literal-union return is type-valid; codegen cannot lower it
+  // un-annotated (D4160).
   //
   // What this test pins is the CHANNEL (a capability admission carries a stable code), so any
   // still-open capability gap serves as its witness, and the witness moves whenever its gap
-  // closes. It has moved seven times; the last was D16037, which closed the nullable `Set`.
+  // closes. It has moved eight times; the last was D16024, which closed the list-and-map union.
   // `scripts/capability-probes/inferred-nullable-container-return.vl` and
   // `inferred-nullable-list-return.vl` are the standing probes for the closed halves.
   const { rc, diags } = check(
     exp,
     [
-      "function pick(c: boolean) {",
-      "  if c { return [1] }",
-      "  const m: {[string]: i32} = Map()",
-      "  return m",
+      "function f(b: boolean) {",
+      '  let s: "a" | null = null',
+      '  if b { s = "a" }',
+      "  return s",
       "}",
       "function go() {",
-      "  const r = pick(false)",
-      "  print(1)",
+      '  print(f(false) ?? "n")',
       "}",
       "go()",
       "",
@@ -267,12 +277,18 @@ Deno.test({
 // and does not depend on anything under `std/`.
 
 /** Fail unless `got` deep-equals `want` (both plain string→string[] records). */
-const sameData = (got: VLDiagnosticData, want: VLDiagnosticData, where: string) => {
+const sameData = (
+  got: VLDiagnosticData,
+  want: VLDiagnosticData,
+  where: string,
+) => {
   const norm = (d: VLDiagnosticData) =>
     JSON.stringify(Object.keys(d).sort().map((k) => [k, d[k]]));
   if (norm(got) !== norm(want)) {
     throw new Error(
-      `${where}: expected data ${JSON.stringify(want)}, got ${JSON.stringify(got)}`,
+      `${where}: expected data ${JSON.stringify(want)}, got ${
+        JSON.stringify(got)
+      }`,
     );
   }
 };
@@ -300,7 +316,9 @@ const checkGraph = (
     if (n === 0) break;
     const keys: string[] = [];
     for (let i = 0; i < n; i++) {
-      keys.push(readString(exp.modPendingLen(i), (j) => exp.modPendingAt(i, j)));
+      keys.push(
+        readString(exp.modPendingLen(i), (j) => exp.modPendingAt(i, j)),
+      );
     }
     for (const key of keys) commit(key, mods[key]);
   }
@@ -341,7 +359,8 @@ const MORE_SRC = [
 ].join("\n");
 
 Deno.test({
-  name: "diag-code: an un-imported UFCS method carries `ufcs-not-imported` + payload",
+  name:
+    "diag-code: an un-imported UFCS method carries `ufcs-not-imported` + payload",
   ignore,
 }, () => {
   const exp = instantiate();
@@ -441,7 +460,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "diag-code: a member with no self-function anywhere keeps the plain sentence",
+  name:
+    "diag-code: a member with no self-function anywhere keeps the plain sentence",
   ignore,
 }, () => {
   const exp = instantiate();
@@ -477,7 +497,8 @@ Deno.test({
 // disagree by two. A reader that split on any character, or that sliced a JS
 // string by the wire length, gets a different answer than the compiler wrote.
 Deno.test({
-  name: "diag-code: a payload holding `;` `,` `|` `\"` and non-ASCII round-trips exactly",
+  name:
+    'diag-code: a payload holding `;` `,` `|` `"` and non-ASCII round-trips exactly',
   ignore,
 }, () => {
   const exp = instantiate();
@@ -524,7 +545,8 @@ Deno.test({
 // no consumer has to parse the sentence, which is free to improve.
 
 Deno.test({
-  name: "diag-code: a non-`self` first parameter carries `ufcs-not-method` + payload",
+  name:
+    "diag-code: a non-`self` first parameter carries `ufcs-not-method` + payload",
   ignore,
 }, () => {
   const exp = instantiate();
@@ -579,7 +601,8 @@ Deno.test({
 // `declCol` name a position in the OTHER file.
 
 Deno.test({
-  name: "diag-code: the `self`-name payload survives a merge (declaration in the entry)",
+  name:
+    "diag-code: the `self`-name payload survives a merge (declaration in the entry)",
   ignore,
 }, () => {
   const exp = instantiate();
@@ -622,7 +645,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "diag-code: the `self`-name payload points into the DEPENDENCY that declares it",
+  name:
+    "diag-code: the `self`-name payload points into the DEPENDENCY that declares it",
   ignore,
 }, () => {
   const exp = instantiate();
@@ -666,7 +690,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "diag-code: a `self` of another type reports `receiver`, not a missing field",
+  name:
+    "diag-code: a `self` of another type reports `receiver`, not a missing field",
   ignore,
 }, () => {
   const exp = instantiate();
@@ -739,7 +764,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "diag-code: `ufcs-not-imported` still wins when the name is not in scope",
+  name:
+    "diag-code: `ufcs-not-imported` still wins when the name is not in scope",
   ignore,
 }, () => {
   const exp = instantiate();
@@ -757,7 +783,9 @@ Deno.test({
     throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
   }
   if (diags[0].code !== "ufcs-not-imported") {
-    throw new Error(`D1230 must keep winning, got: ${JSON.stringify(diags[0])}`);
+    throw new Error(
+      `D1230 must keep winning, got: ${JSON.stringify(diags[0])}`,
+    );
   }
 });
 
@@ -770,20 +798,34 @@ Deno.test({
 // would actually do, and those are deliberately different.
 
 Deno.test({
-  name: "diag-code: a never-running constant range carries `range-never-runs` + from/to/step",
+  name:
+    "diag-code: a never-running constant range carries `range-never-runs` + from/to/step",
   ignore,
 }, () => {
   const exp = instantiate();
-  const { rc, diags } = check(exp, "let n = 0\nfor i in 3 to 0 { n = n + i }\nprint(n)\n");
+  const { rc, diags } = check(
+    exp,
+    "let n = 0\nfor i in 3 to 0 { n = n + i }\nprint(n)\n",
+  );
   if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
   if (diags.length !== 1) {
     throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
   }
   if (diags[0].code !== "range-never-runs") {
-    throw new Error(`expected the D1588 category, got: ${JSON.stringify(diags[0])}`);
+    throw new Error(
+      `expected the D1588 category, got: ${JSON.stringify(diags[0])}`,
+    );
   }
-  sameData(diags[0].data, { from: ["3"], to: ["0"], step: ["1"] }, "defaulted step");
-  if (!diags[0].message.startsWith("this range never runs: `3 to 0` counts up (step 1)")) {
+  sameData(
+    diags[0].data,
+    { from: ["3"], to: ["0"], step: ["1"] },
+    "defaulted step",
+  );
+  if (
+    !diags[0].message.startsWith(
+      "this range never runs: `3 to 0` counts up (step 1)",
+    )
+  ) {
     throw new Error(`unexpected sentence: ${JSON.stringify(diags[0])}`);
   }
 });
@@ -806,7 +848,9 @@ Deno.test({
     throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
   }
   if (diags[0].code !== "range-never-runs") {
-    throw new Error(`expected the D1588 category, got: ${JSON.stringify(diags[0])}`);
+    throw new Error(
+      `expected the D1588 category, got: ${JSON.stringify(diags[0])}`,
+    );
   }
   sameData(diags[0].data, { step: ["0"] }, "non-constant bounds");
   if (diags[0].message !== "a range with `step 0` never advances") {
@@ -827,7 +871,9 @@ Deno.test({
     exp,
     "let lo = 3\nlet hi = 0\nlet n = 0\nfor i in lo to hi { n = n + 1 }\nprint(n)\n",
   );
-  if (rc !== 0) throw new Error(`expected rc 0, got ${rc}: ${JSON.stringify(diags)}`);
+  if (rc !== 0) {
+    throw new Error(`expected rc 0, got ${rc}: ${JSON.stringify(diags)}`);
+  }
 });
 
 // ── the decoder itself, with no seed ─────────────────────────────────────────
@@ -848,7 +894,9 @@ Deno.test("diag-data: a value may hold the framing characters", () => {
   // `3:,` is a field whose entire value is a comma; `1::` one that is a colon.
   const got = decodeDiagData(enc("1:a,3:x,y,1:b,1::,"));
   if (JSON.stringify(got) !== JSON.stringify({ a: ["x,y"], b: [":"] })) {
-    throw new Error(`expected the literal values back, got ${JSON.stringify(got)}`);
+    throw new Error(
+      `expected the literal values back, got ${JSON.stringify(got)}`,
+    );
   }
 });
 
@@ -865,24 +913,27 @@ Deno.test("diag-data: a repeated key is a list, in wire order", () => {
 // compiler never named. Every one of these yields `{}`.
 Deno.test("diag-data: a malformed payload decodes to nothing at all", () => {
   const bad = [
-    "6:member",                 // no terminator
-    "6:member,4:area",          // unterminated final field
-    "6:member,4:area,4:recv,",  // odd field count — a key with no value
-    ":x,",                      // empty length
-    "x:1,",                     // non-digit length
-    "9:short,",                 // length past the end
-    "3:abcX",                   // wrong terminator
+    "6:member", // no terminator
+    "6:member,4:area", // unterminated final field
+    "6:member,4:area,4:recv,", // odd field count — a key with no value
+    ":x,", // empty length
+    "x:1,", // non-digit length
+    "9:short,", // length past the end
+    "3:abcX", // wrong terminator
   ];
   for (const b of bad) {
     const got = decodeDiagData(enc(b));
     if (Object.keys(got).length !== 0) {
-      throw new Error(`${JSON.stringify(b)} must decode to {}, got ${JSON.stringify(got)}`);
+      throw new Error(
+        `${JSON.stringify(b)} must decode to {}, got ${JSON.stringify(got)}`,
+      );
     }
   }
 });
 
 Deno.test({
-  name: "diag-code: a read a call un-narrowed carries `narrowing-ended-by-call` (D2390)",
+  name:
+    "diag-code: a read a call un-narrowed carries `narrowing-ended-by-call` (D2390)",
   ignore,
 }, () => {
   // Two faces of one code: a type error in a later statement gains a note naming the call, and
@@ -933,22 +984,29 @@ Deno.test({
     }
     if (diags[0].code !== "narrowing-ended-by-call") {
       throw new Error(
-        `expected code "narrowing-ended-by-call", got: ${JSON.stringify(diags[0])}`,
+        `expected code "narrowing-ended-by-call", got: ${
+          JSON.stringify(diags[0])
+        }`,
       );
     }
     if (!diags[0].message.includes(c.want)) {
       throw new Error(
-        `want a message holding ${JSON.stringify(c.want)}, got: ${diags[0].message}`,
+        `want a message holding ${JSON.stringify(c.want)}, got: ${
+          diags[0].message
+        }`,
       );
     }
     if (diags[0].raw !== "") {
-      throw new Error(`expected no payload, got: ${JSON.stringify(diags[0].raw)}`);
+      throw new Error(
+        `expected no payload, got: ${JSON.stringify(diags[0].raw)}`,
+      );
     }
   }
 });
 
 Deno.test({
-  name: "diag-code: a `self`-function a member shadows carries `self-fn-shadowed` (D2475)",
+  name:
+    "diag-code: a `self`-function a member shadows carries `self-fn-shadowed` (D2475)",
   ignore,
 }, () => {
   // One code for both earlier rungs; `rung` says which one owns the name, so a quick-fix
@@ -971,9 +1029,13 @@ Deno.test({
       throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
     }
     if (diags[0].code !== "self-fn-shadowed") {
-      throw new Error(`expected code "self-fn-shadowed", got: ${JSON.stringify(diags[0])}`);
+      throw new Error(
+        `expected code "self-fn-shadowed", got: ${JSON.stringify(diags[0])}`,
+      );
     }
-    if (!diags[0].message.includes("would never call this function — rename it")) {
+    if (
+      !diags[0].message.includes("would never call this function — rename it")
+    ) {
       throw new Error(`unexpected message: ${diags[0].message}`);
     }
     sameData(diags[0].data, c.want, c.src);
