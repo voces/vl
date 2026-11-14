@@ -48,8 +48,12 @@ restore() {
   git checkout -q -- compiler/
   cp "$PRISTINE" build/vl-compiler.wasm
   for x in src key; do [ -f "$PRISTINE.$x" ] && cp "$PRISTINE.$x" "build/vl-compiler.wasm.$x"; done
-  # A mutant seed's engine sidecars are ~220 MB each; keep only the pristine seed's.
-  find build -name 'vl-compiler.wasm.*.cwasm' -newer "$PRISTINE" -delete 2>/dev/null
+  # A mutant seed's engine sidecars are ~220 MB each; drop every seed cache entry made since
+  # the run began except the pristine seed's.
+  local vl=scripts/vl-host/target/release/vl cache keep
+  cache=$("$vl" seed --cache-dir 2>/dev/null) || return 0
+  keep=$("$vl" seed --cache-files --compiler "$PRISTINE" 2>/dev/null || true)
+  find "$cache" -name 'seed-*.cwasm' -newer "$PRISTINE" 2>/dev/null | grep -vxF "${keep:-/}" | xargs -r rm -f
 }
 trap restore EXIT
 

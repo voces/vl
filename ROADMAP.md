@@ -102,6 +102,8 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   names itself at a larger argument stay check errors. When this is built, the checker's
   growth test picks those generics out and they compile once with their type parameter boxed, beside
   the monomorphized ones. DECISIONS.md §"Polymorphic recursion is refused for now".
+- **Homebrew formula, once a release process exists** (owner ruling 2026-11-14). The draft
+  `Formula/vl.rb` was deleted; a formula is written against a real tag and its checksums.
 
 ## Consumers
 
@@ -130,8 +132,8 @@ Each consumer keeps its own list. Re-run an ask before scheduling it.
 
 ### Track C — CLI
 
-- **C5, distribution.** `release.yml` and `Formula/vl.rb` are drafts. The publish job, a release tag,
-  the brew tap and the sha256 bump remain, and they wait on the owner.
+- **C5, distribution.** `release.yml` is a draft that builds and checksums each target. The publish
+  job and a release tag remain, and they wait on the owner; the Homebrew formula is backlogged.
 - **C-test-cache.** It is built opt-in. Two things remain:
   - the owner's call on flipping the default once the trial ends (`VL_NO_COMPILE_CACHE`,
     `--no-cache`, `vl cache clean`);

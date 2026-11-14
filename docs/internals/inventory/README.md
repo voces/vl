@@ -235,7 +235,8 @@ and the merged run is a real re-run on the rebased tree rather than an addition 
 deltas.
 
 **A WARNING ABOUT MEASURING THE BASELINE — IT COST TWO WRONG SWEEPS IN ONE SESSION.** The
-host caches a compiled seed as `build/vl-compiler.wasm.<hash>.cwasm` NEXT TO the seed, and
+host cached a compiled seed as `build/vl-compiler.wasm.<hash>.cwasm` NEXT TO the seed (it now
+lives in the seed cache, `vl seed --cache-dir`), and
 **a SYMLINKED seed is not re-keyed when you retarget the link**: point the symlink at a
 different seed and the run silently reuses the cached module for the previous target.
 Proven both ways — with the symlink moved to the OLD seed and the NEW seed's `.cwasm` still
