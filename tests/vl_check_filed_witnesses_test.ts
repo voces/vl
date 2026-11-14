@@ -708,3 +708,32 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    "check-filed-witnesses: a $VL_COMPILER_WASM naming another seed is refused, not ignored",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_cfw_seed_" });
+    try {
+      const doc = `${dir}/rows.md`;
+      await Deno.writeTextFile(
+        doc,
+        `### D1 — runs\n**closed**\n\nRepro:\n\n${ind("print(1)")}\n`,
+      );
+      const other = `${dir}/other.wasm`;
+      await Deno.writeFile(other, new Uint8Array([0, 97, 115, 109]));
+      const got = await port(["--strict", doc], { VL_COMPILER_WASM: other });
+      if (
+        got.code !== 2 ||
+        !got.out.includes("REFUSING — $VL_COMPILER_WASM names")
+      ) {
+        throw new Error(
+          `want exit 2 and the refusal, got ${got.code}:\n${got.out}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
