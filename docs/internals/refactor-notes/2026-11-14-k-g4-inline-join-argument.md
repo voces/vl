@@ -39,7 +39,7 @@ Fixpoint seeds on both sides, `--before` master `293074baf`.
 - `record-fn-field-two-results.matrix.vl`: its six `arg_*` cells moved to RUNS in both faces (12 cells),
   0 runs→not-runs.
 - The 26 other templates that hand records to an un-annotated `take`/`g`/`show`: 0 runs→not-runs,
-  0 new silent. One SILENT cell is the same on master and is filed as D16221.
+  0 new silent. One SILENT cell is the same on master and is filed as D16251.
 - `regress.vl`: 0 of 11,929 distilled cells differ between the two seeds.
 - The forwarded spelling `fwd(if …)` still refuses at check, as `fwd(q)` does.
 
@@ -48,7 +48,7 @@ Fixpoint seeds on both sides, `--before` master `293074baf`.
 - **D15431**: its bound twin, `const a = get3(true); show(a)`, refuses too, and the probe stops at
   `ftMemberSeenAtArms`, not the holder check. Running without the `show` parameter is a different
   ablation.
-- **D16220**: record literals handed to `take2` beside a bound join refuse whether they are bound or
+- **D16250**: record literals handed to `take2` beside a bound join refuse whether they are bound or
   inline. Split off D15809's ablation.
 - **Sub-shape (b)**, D15334 and D15900, a literal argument. D15334's set is tried only before the
   elaboration, where the holder check refuses a literal. D15900's set is tried again after the
