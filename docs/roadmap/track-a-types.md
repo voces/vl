@@ -76,7 +76,7 @@ rules there apply here, and `tests/roadmap_honest_test.ts` gates this file too.
   take one.
 - **Deep `is` over Json.** Two open rows:
   - D1198: a recursive JSON shape target has no walker;
-  - D1190: a deep `is` arm that rebinds or writes the tested place refuses.
+  - D16274: a closure in a deep `is` arm that writes the tested place refuses.
 
   The `as` trio over Json needs four things: the S4 ruling (open-rulings §E), `"shape"` in
   `JsonError.kind` (std-api-reviewer), a JSON-pointer path in the walker, and a position matrix
