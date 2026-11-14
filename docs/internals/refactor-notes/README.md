@@ -9,6 +9,12 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-utk-shadow-delete](2026-11-14-utk-shadow-delete.md): The type-key shadow harness deleted, 2026-11-14
+- [2026-11-14-d16091-set-handed-to-open-param](2026-11-14-d16091-set-handed-to-open-param.md): D16091: a set of functions handed to an open parameter gives the caller its join, 2026-11-14
+- [2026-11-14-d16024-list-map-union](2026-11-14-d16024-list-map-union.md): D16024: an inferred list-and-map union return, 2026-11-14
+- [2026-11-14-d16017-map-entry-value](2026-11-14-d16017-map-entry-value.md): D16017: a map entry write used as a value yields its set's value stash, 2026-11-14
+- [2026-11-14-d16006a-dead-arm-reads-never](2026-11-14-d16006a-dead-arm-reads-never.md): D16006(a): a covering test's dead arm reads its operand as `never`, 2026-11-14
+- [2026-11-14-d15975-identity-emit](2026-11-14-d15975-identity-emit.md): D15975 PR 2: `===`/`!==` lower to reference identity, 2026-11-14
 - [2026-11-14-step7-union-eq-sets-from-types](2026-11-14-step7-union-eq-sets-from-types.md): `emitUnionUnionEq` reads its operands' member sets from their types, 2026-11-14
 - [2026-11-14-step7-shared-field-plan-member-types](2026-11-14-step7-shared-field-plan-member-types.md): `sharedUnionFieldPlan` reads member types, not atoms, 2026-11-14
 - [2026-11-14-g41-close-d16052](2026-11-14-g41-close-d16052.md): D16052 closed: a row-less member slice has no atom column, 2026-11-14
