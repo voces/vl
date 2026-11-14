@@ -25,8 +25,12 @@ too.
 
 The remaining refusal now names its case:
 - a value typed apart from its target (D16016, and D2632);
-- a map entry (D16017);
-- a byte-list element, whose yielded value is not ruled (D16018).
+- a map entry (D16017).
+
+A byte-list element (D16018) always takes the parked cell, never the re-read. Its store parks the
+right-hand side before truncating it, which is what DECISIONS rules an assignment yields. That
+moves one spelling's output on purpose: `print(b[1] = x)` with `x` 300 printed `44`, a clause-1
+wrong value, and now prints `300`.
 
 ## Graded
 
