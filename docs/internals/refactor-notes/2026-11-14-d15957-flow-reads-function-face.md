@@ -62,7 +62,7 @@ Against master's fixpoint over 19,769 programs (`tests/cases` plus distilled `ce
 
 ## Graded on the merged tree
 
-Merged with master `de4cfa15`. Fixpoint seeds on both sides.
+Merged with master `de4cfa15`, then `c522f8dd`. Fixpoint seeds on both sides.
 
 - **A loss the earlier measurement missed, fixed here.** Master's
   `written-let-of-generics-handed-to-generic-callback-between-writes.vl` (D3942) stopped running.
@@ -93,9 +93,10 @@ Merged with master `de4cfa15`. Fixpoint seeds on both sides.
   `{dbl}`. So does the `dbl` that `f = dbl` stores. In `ftCtxOk` that store needs the binding's
   wider set `{id, dbl}` tagged, and no call through `f` remains to try it, so `{dbl}` stayed
   untagged. The emitter then read the list as open, closed it with `elabWrittenValueTy`, and
-  instanced the `.map` adapter `fvaListSetCopy` builds at `i32`, after the plan. A store into a
-  binding of a wider undecided set is now decided with it, as a join's tail is
-  (`ftWiderJoinNeed`, check_fn_tag). The first two files read 0.
+  instanced the `.map` adapter `fvaListSetCopy` builds at `i32`, after the plan. `ftHeldWider`
+  (check_fn_tag) took a store into a place of a wider set only once that set was tagged or
+  assumed. It now decides an undecided one with `s`, as a join's tail is. That is one rule for
+  every place a write stores into, with no new case, and the first two files read 0.
   `-mutable-alias-controls` reads 1, and its direct-name spelling (`[dbl]` for `[f]`) reads 1 on
   master. The scan refuses `{dbl}` there because a list holding a set's ids may only be read by
   index, and the copy reads it through `.map`.
