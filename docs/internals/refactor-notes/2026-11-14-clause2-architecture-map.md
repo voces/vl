@@ -264,7 +264,7 @@ Several (f) rows share a fix, and each such family should be closed together:
 - A `??` whose default is a literal of another storage (`xs ?? [1]` over `boolean[]`) builds an invalid module.
 - This happens when a `const` binding the call's result comes before the function's declaration.
 - With the declaration first, the program runs and prints `1`.
-- It is an order dependence, filed in lane J's reserved block `D16300-D16309`.
+- It is an order dependence, filed in lane J's reserved block of ten ids from D16300.
 
 ## Limits
 
