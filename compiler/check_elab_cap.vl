@@ -105,7 +105,7 @@ import {
   restoreSlot,
   scopeVisibleSnapshot,
 } from "./check_scopes"
-import { tyHasTyVar } from "./tyquery"
+import { nonNullTy, tyHasTyVar } from "./tyquery"
 import {
   i32ListHas,
   i32ListIndexOf,
@@ -3771,6 +3771,10 @@ function fnTagPlaceRep(v: i32): i32 {
     } else if cwSliceRecv(x) >= 0 {
       // A slice holds its receiver's own elements.
       x = parenPeelIx(cwSliceRecv(x))
+    } else if fnTagGetRecv(x) >= 0 {
+      // A `get` reads one slot, `| null`.
+      steps.push("?")
+      x = parenPeelIx(fnTagGetRecv(x))
     } else {
       // Any other node is the root: a name reads its binding's stamp.
       const d = identDeclOf(x)
@@ -3779,12 +3783,34 @@ function fnTagPlaceRep(v: i32): i32 {
     }
     hops = hops + 1
   }
+  // Each step reads through a narrowed `| null`; an index step on a map reads its value, which
+  // the read answers `| null` (D15801).
   let k = steps.length - 1
   while k >= 0 && t >= 0 {
-    t = if steps[k] == "" { tyArrayElemIx(t) } else { tyFieldTyOf(t, steps[k]) }
+    const tn = nonNullTy(t)
+    const isMap = tn >= 0 && tn < T.tys.length && T.tys[tn] is TyMap
+    if steps[k] == "?" {
+      const mt = if tn >= 0 && tn < T.tys.length { T.tys[tn] } else { null }
+      t = if mt is TyMap { mt.mVal } else { tyArrayElemIx(tn) }
+      if t >= 0 { t = mkNullableTy(t) }
+    } else if steps[k] == "" && isMap {
+      const mt = T.tys[tn]
+      t = if mt is TyMap { mt.mVal } else { -1 }
+      if k == 0 && t >= 0 { t = mkNullableTy(t) }
+    } else {
+      t = if steps[k] == "" { tyArrayElemIx(tn) } else { tyFieldTyOf(tn, steps[k]) }
+    }
     k = k - 1
   }
   t
+}
+
+// The receiver of `x` when it is a one-argument `get` call, or -1.
+function fnTagGetRecv(x: i32): i32 {
+  const n = nodeAt(x)
+  if !(n is Call) || n.callArgs.length != 1 || n.callFn < 0 { return -1 }
+  const f = nodeAt(parenPeelIx(n.callFn))
+  if f is Member && f.memProp == "get" { f.memObj } else { -1 }
 }
 
 // Whether record type `t` has a field of a tagged set itself, not a list of one.

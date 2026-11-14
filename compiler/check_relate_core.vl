@@ -544,6 +544,8 @@ import {
   cwFramedNode,
   cwGetRecv,
   cwHeldFnOf,
+  cwIxCovers,
+  cwIxUp,
   cwIxWant,
   cwKeyOfDecl,
   cwKeyOfRoot,
@@ -6359,10 +6361,19 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
   }
   if !(nodeAt(bd) is LetDecl) { return false }
   const init = parenPeelIx(cwBoundInitOf(cwBindingOf(root)))
+  // A map's key step reads its value, so a place through a map is lifted as its value's own
+  // path is, with the map's writes as its values (D15801).
+  const mapRoot = holeSlotRootIsMap(root) && path.length > 0 && path[0] == "[]"
+  const liftPath = if mapRoot { path.slice(1, path.length) } else { path }
   // A callback's element is not lifted: the built-in hands it the list's own records.
   const lift = elem
     || !(an is Param)
-    && holeSlotFieldLift(a, init, path, cwBindingOf(root))
+    && holeSlotFieldLift(
+    a,
+    if mapRoot { -1 } else { init },
+    liftPath,
+    cwBindingOf(root),
+  )
   const rets: i32[] = []
   let called = false
   if init >= 0 && init < P.nodes.length {
@@ -6396,8 +6407,64 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     pts,
     lift
       && (nW == 0 || !elem || holeSlotWidenLift(bd, cwBindingOf(root), path))
-      && holeSlotSetHolds(a, vals),
+      && holeSlotSetHolds(a, vals)
+      && (!mapRoot
+      || elem
+      || holeSlotMapLitWrites(cwBindingOf(root), vals) && !holeSlotReadsOpt(a)),
   )
+}
+
+// Whether each of `vals`, the functions stored through map binding `b`, sits in a literal written
+// whole to an entry, `m[k] = lit` or `m.set(k, lit)`: such a literal is built at the map's value
+// row, while a named record or a store through a read of an entry is not.
+function holeSlotMapLitWrites(b: i32, vals: i32[]): boolean {
+  const ents: i32[] = []
+  const eats: i32[] = []
+  if cwSlotWrittenValues(b, ["[]"], ents, eats) < 0 { return false }
+  const lits: i32[] = []
+  for e in ents { lits.push(cwPeel(e)) }
+  for v in vals {
+    let x = cwPeel(v)
+    let hit = false
+    let hops = 0
+    while !hit && x >= 0 && cwIxCovers(x) && hops < 32 {
+      if i32ListHas(lits, x) {
+        hit = true
+      } else {
+        const up = cwIxUp[x]
+        const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+        if !(un is FieldInit || un is ObjLit || un is ArrayLit || un is Paren) {
+          return false
+        }
+        x = up
+      }
+      hops = hops + 1
+    }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether the read `a` reaches its place through a `?.`, whose guarded call through a map's entry
+// the tag decision builds no member call for.
+function holeSlotReadsOpt(a: i32): boolean {
+  let x = cwPeel(a)
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 16 {
+    const n = nodeAt(x)
+    if n is OptMember { return true }
+    if n is Member { x = cwPeel(n.memObj) }
+    else if n is Index { x = cwPeel(n.idxArr) }
+    else { hops = 16 }
+    hops = hops + 1
+  }
+  false
+}
+
+// Whether the binding the name `root` reads is a map, whose index step reads a value.
+function holeSlotRootIsMap(root: i32): boolean {
+  const t = nonNullTy(nodeTyIxOf(root))
+  t >= 0 && t < T.tys.length && T.tys[t] is TyMap
 }
 
 // Whether the set the read `a`'s type carries holds every function among `vals`; true where
