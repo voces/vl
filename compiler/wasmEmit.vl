@@ -1,3 +1,5 @@
+import { sharedFieldArmSetTexts } from "././emit_obj_lit_fits"
+import { armFieldElemTyIx } from "././emit_state"
 import { cUserTypes, unionAliasDeclNameOfTy } from "./check_types"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import {
@@ -12379,10 +12381,9 @@ function sharedFieldPlanDispatchable(
   if code == FC_NUL_STR { return true }
   // A record-or-`null` read is the record's nullable ref (`sharedFieldNulStructPlan`).
   if code == FC_STRUCT && sharedFieldPlanHasNull(vis, fis) { return true }
-  // An atom-set read with `null` members is one `i32` (`sharedFieldLitSetPlan`).
-  if code == FC_NUL_LIT_UNION && sharedFieldPlanHasNull(vis, fis) {
-    return true
-  }
+  // An atom-set read with `null` is one `i32`, whether members store `null`, the set or the set
+  // with `null` (`sharedFieldLitSetPlan`): atoms are interned program-wide, so every arm agrees.
+  if code == FC_NUL_LIT_UNION { return true }
   if (
     code == FC_STR
     || code == FC_I32
@@ -12412,12 +12413,21 @@ function sharedFieldPlanDispatchable(
     if (
       code == FC_UNION
       && !armFieldElemSame(elem0, uFieldStart[vis[i]] + fis[i])
+      && !armFieldsBoxAlike(elem0, uFieldStart[vis[i]] + fis[i])
     ) {
       return false
     }
     i = i + 1
   }
   true
+}
+
+// Whether arm-field slots `a` and `b` both store a value-union box. Box tags are global per atom
+// kind and a literal rides its base scalar's tag, so either box is a box of the read's join.
+function armFieldsBoxAlike(a: i32, b: i32): boolean {
+  const tys = armFieldElemTyIx()
+  if a < 0 || b < 0 || a >= tys.length || b >= tys.length { return false }
+  tys[a] >= 0 && tys[b] >= 0 && valueBoxOfTy(tys[a]) && valueBoxOfTy(tys[b])
 }
 
 // Whether the plan `code` boxes member `vi0`'s field rather than reading it as stored: the
@@ -12478,6 +12488,13 @@ function emitSharedFieldArm(
   if (code == FC_I32 || code == FC_STR) && sharedFieldArmNull(vi, fi) {
     fbUnreachable()
     return 0
+  }
+  const own = variantFieldTypeAt(vi, fi)
+  if (
+    (code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32))
+    || (code == FC_STR && own == FC_NUL_LIT_UNION)
+  ) {
+    return emitSharedFieldSetToStr(body, code, own, vi, fi, recvIx, fnIx, slot)
   }
   const converts = sharedFieldArmConverts(code, vi, fi)
   let texts = sharedFieldArmLitTexts(vi, fi)
@@ -12579,6 +12596,45 @@ function emitSharedFieldArm(
   if code == FC_STR && fieldRowIsStr(uFieldStart[vi] + fi, true) {
     fbRefAsNonNull()
   }
+  0
+}
+
+// A string literal set stored at the atom (`own`, `FC_I32` or its `-1` niche) read as the
+// string or `string | null` the shared read is typed as (`code`): the atom widens through its
+// members, the niche's `-1` is `null`, unreachable under a read narrowed past it.
+function emitSharedFieldSetToStr(
+  body: u8[],
+  code: i32,
+  own: i32,
+  vi: i32,
+  fi: i32,
+  recvIx: i32,
+  fnIx: i32,
+  slot: i32,
+) {
+  const texts = sharedFieldArmSetTexts(vi, fi)
+  if texts.length == 0 {
+    return emitFail(
+      "emitProgram: a shared field read widens a literal set with no members",
+    )
+  }
+  if emitSharedFieldRecv(body, recvIx, fnIx, slot) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(variantHeap(vi))
+  fbStructGet(variantHeap(vi), fi)
+  const idSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
+  fbLocalSet(idSlot)
+  if own != FC_NUL_LIT_UNION {
+    return emitAtomToStrChain(body, texts, 0, idSlot)
+  }
+  fbLocalGet(idSlot)
+  fbI32Const(0 - 1)
+  fbI32Bin(70) // 0x46 i32.eq — the niche's `null`
+  fbIfRefNul(sTy(), code == FC_NUL_STR)
+  if code == FC_NUL_STR { fbRefNullNone() } else { fbUnreachable() }
+  fbElse()
+  if emitAtomToStrChain(body, texts, 0, idSlot) < 0 { return -1 }
+  fbEnd()
   0
 }
 
@@ -12734,6 +12790,11 @@ function sharedFieldTysIdentical(vis: i32[], fis: i32[]): boolean {
 // `fbIfForSharedField` for a plan `sharedFieldPlanDispatchable` admitted: a reference field's
 // blocktype is its member's storage valtype, written by `pushFieldStorage`.
 function fbIfForSharedPlan(code: i32, vi: i32, fi: i32) {
+  // A value arm stored at the atom still delivers the nullable string ref the read is typed as.
+  const own = variantFieldTypeAt(vi, fi)
+  if code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32) {
+    return fbIfRefNul(sTy(), true)
+  }
   if (
     sharedFieldCodeDispatchable(code)
     || code == FC_NUL_LIT_UNION
@@ -42637,12 +42698,25 @@ function coalBoxFieldScalarKind(lhsIx: i32, fnIx: i32): i32 {
     return -1
   }
   const un = memberUnionFieldNameRead(lhsIx, fnIx)
-  if un == "" { return -1 }
+  if un == "" && !sharedReadDeliversBox(lhsIx, fnIx) { return -1 }
   const sid = msSetOfTy(nodeTyAt(lhsIx, fnIx))
   if !setHasNullAtom(sid) { return -1 }
   const k = unionResidualSoloKindOfSet(sid)
   if nulBoxScalarValtype(k) < 0 || vbHeapIdxOfKind(k) < 0 { return -1 }
   k
+}
+
+// Whether member read `memIx` is a shared-field dispatch whose arms each deliver their stored
+// value-union box, so the read is a box although no one field row names its union.
+function sharedReadDeliversBox(memIx: i32, fnIx: i32): boolean {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, vis, fis)
+  code == FC_UNION
+    && !sharedFieldAnyArmBoxes(code, vis, fis)
+    && sharedFieldPlanDispatchable(code, vis, fis)
 }
 
 // `f ?? d` over a field read `f` yielding a `scalar | null` box of atom kind `fk`: the box is
