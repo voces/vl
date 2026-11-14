@@ -68,13 +68,39 @@ caller reads the value.
 
 ## Readings: the distilled corpus (`cells/` + `named/`)
 
-CORPUS_TABLE
+These are the 8,583 programs that reach emit, out of 11,934 cells. The rest stop in the checker.
+
+| table | agree | `noTy` | disagree |
+|---|---|---|---|
+| local/let | 72,643 | 619 | 6 `variant tree=struct` (5 programs) |
+| local/loopVar | 239 | 2,378 (a string, map or range iterable) | 0 |
+| param | 51,398 | 143 | 0 |
+| result | 43,922 | 183 | 4 `i32 tree=closure` (`__lambda_0` ×2, `g` ×2); 6 `uncovered` (3 programs) |
+| global | 16,187 | 1,035 | 0 |
+
+That is 184,389 agreements and 16 disagreements.
+
+| rebuild cause | rebuilds | programs | nodes |
+|---|---|---|---|
+| first | 8,583 | 8,583 | 16,508 |
+| variants (`rvsSync`'s key: pass or `uVarTyIxResets` moved) | 20,179 | — | 123,840 |
+| variantBit (`rvsAdd` set a new bit) | 12,733 | — | 64,288 |
+| declRows | 2,656 | 2,107 | 5,242 |
+| **tyMutEpoch** | **107** | **103** | 229, all in the `monomorphizing` phase |
+| **cUserTypesVer** | **0** | 0 | 0 |
+
+That is 44,258 rebuilds, a median of 5 per program and a maximum of 13, and 210,107 nodes.
+
+Byte identity on the corpus: every 15th cell (795 programs) was built with the master seed and
+with this seed, comparing exit code and module bytes. 575 of them build a module. Zero differ.
 
 ## What this decides
 
 **Stage 2's gate.** The coordinator ruled the gate as all three rebuild axes at 0 during emit.
 - `cUserTypesVer` is 0 everywhere.
-- `tyMutEpoch` is 0 on the self-build. CORPUS_TYMUT
+- `tyMutEpoch` is 0 on the self-build. On the corpus it is 107, in 103 of 8,583 programs, all in the
+  `monomorphizing` phase, inside `emitProgram`. Lane H's stage 4 seals the arena after checking,
+  which removes it.
 - **The variant-shape axis is not 0, and lane H's hash-consing does not remove it.** `rvsSync`
   drops the tree whenever a record shape gains a variant bit. The bits come from three sources
   (`emit_rep.vl:4069–4079`):
@@ -91,13 +117,14 @@ measurement the cost of not deciding it is small (12% extra nodes on the self-bu
 cost is correctness: a rep read before a later variant registration is stale.
 
 **Stage 2's movers.** Where the shadow disagrees, stage 2 moves a byte. The full list:
-- the 15 compiler setters, and the corpus's `i32 tree=closure` results. The legacy table holds a
+- the 15 compiler setters, and the corpus's 4 `i32 tree=closure` results (`d15199_run_function_field`,
+  `d15220_run_coerced_holder`, `d511_coal_fn_{match,nomatch}_ret_none_direct`). The legacy table holds a
   void result, and the tree reads the tail's function type. The result value is unread, so the
   mover is expected to be none. That is to be confirmed when the site converts.
-- `variant tree=struct` locals, CORPUS_VARIANT. A record literal that the legacy path types as a
+- `variant tree=struct` locals, 6 in 5 cells (`b000017`, `b000057`, `b000058`, `b000418` ×2, `b000498`). A record literal that the legacy path types as a
   union arm (the delivery decides), while the tree types it as a plain struct. This is the
   `rArm` decision above, from the other side.
-- `uncovered` results, CORPUS_UNCOV. The tree has no top kind for these results; the three
+- `uncovered` results, 6 in 3 named cells. The tree has no top kind for these results; the three
   `d947_price_*` cells return `boolean | null`, a record or `null`, and `string | null` through
   `std:test`. Stage 1 owes the tree an answer for them.
 
@@ -105,7 +132,7 @@ cost is correctness: a rep read before a later variant registration is stale.
 
 | | |
 |---|---|
-| net compiler lines | +168 (`emit_rep.vl` +85, `emit_sections.vl` +0 net, the new `emit_vk_shadow.vl` +83) |
+| net compiler lines | +168 (`emit_rep.vl` +79, `emit_sections.vl` +6, the new `emit_vk_shadow.vl` +83) |
 | pin-helper delta | 0 (baseline 908) |
 | unarmed guest fuel and peak RSS | measured by the gate's `plumb-shape cost` row: GATE_PLUMB |
 | seed size | +0.06% |
