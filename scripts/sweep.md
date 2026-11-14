@@ -30,6 +30,7 @@ these fields:
 | `stdout` | the first 16 hex digits of the sha256 of what the program printed, or `""` when it did not run |
 | `msg` | the first error, normalised as `regress.vl` normalises one (offsets, function indices and source positions erased). For a failed run it is the line under `Caused by:`, so a backtrace's mangled names do not count. |
 | `module` | the first 16 hex digits of the sha256 of the module `vl check --codegen` kept, or `""` |
+| `said` | on a `trap` line only: the last line the program printed, where a `__trap__` puts its sentence. Only the owed check reads it. |
 
 Programs are graded in chunks of 100. For each chunk the tool runs one
 `vl check --batch --json --codegen` and one `vl run --batch` of the modules the check kept,
@@ -67,23 +68,29 @@ compiler trap, and exits 0 otherwise. Every other movement is printed for a pers
 
 ## Owed refusals
 
-A clause-1 fix can turn a program that ran WRONG into a check refusal the design owes: its
-witness was check-clean and printed a wrong answer, and the fix refuses it. That is a
-`runs → not-runs`, and the one the veto allows. The PR that earns it lists the cell in
-`scripts/sweep-owed.txt`, one line each:
+A clause-1 fix can turn a program that ran WRONG into an outcome the design owes: its witness
+was check-clean and printed a wrong answer, and the fix refuses it at check, or makes it stop at
+the run-time error the design gives it (a read before the first write traps and names the
+binding, spec S3.2). That is a `runs → not-runs`, and the one the veto allows. The PR that earns
+it lists the cell in `scripts/sweep-owed.txt`, one line each, naming the outcome:
 
 ```text
 docs/internals/inventory/D16044.md#D16044 D16044
+docs/internals/inventory/D16023.md#D16023 D16023 trap: read before it is assigned
 ```
 
 `diff` then accepts that cell's `runs → not-runs` only when **all** of these hold:
 
-* the new outcome is `check_reject`. A trap, an emit refusal or any other outcome still blocks;
+* the new outcome is the listed one. A line with no `trap:` allows only `check_reject`. A line
+  with `trap: <sentence>` allows only a `trap` that is a `__trap__` (its message is the wasm
+  `unreachable` it lowers to) and whose last printed line (`said`) contains the sentence. A trap
+  with another sentence or none, any other wasm trap, an emit refusal or any other outcome still
+  blocks, since a trap is also what a compiler defect looks like;
 * the cited row exists in `docs/internals/inventory/` or `inventory-2/`, and its status line says
   `clause 1`;
-* the entry is used. A listed key that did not move from `runs` to `check_reject` fails as stale,
-  so the list cannot rot. A key the base already refuses at check is inert: the fix has merged,
-  and the entry waits for the fold without failing other PRs' diffs.
+* the entry is used. A listed key that did not move from `runs` to its listed outcome fails as
+  stale, so the list cannot rot. A key the base already has at that outcome is inert: the fix has
+  merged, and the entry waits for the fold without failing other PRs' diffs.
 
 An entry lives only in the PR that earns it, and the orchestrator clears the file at each fold.
 `diff` prints the accepted cells under "owed refusals accepted", and `--owed <file>` reads
