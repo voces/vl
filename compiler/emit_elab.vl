@@ -9700,7 +9700,8 @@ function elabElemRead(x: i32, depth: i32): boolean {
   if n is Member && depth == 0 {
     const o = parenPeelIx(n.memObj)
     const od = if o >= 0 && o < P.nodes.length && nodeAt(o) is Ident { identDeclOf(o) } else { -1 }
-    return od >= 0 && od < P.nodes.length && nodeAt(od) is Param
+    if od < 0 || od >= P.nodes.length { return false }
+    return nodeAt(od) is Param || elabConstParamAliasAny(od) >= 0
   }
   if n is Paren { return elabElemRead(parenPeelIx(n.parInner), depth) }
   if n is Call {
@@ -9716,6 +9717,30 @@ function elabElemRead(x: i32, depth: i32): boolean {
     && dn.letKw == "const"
     && dn.letInit >= 0
     && elabElemRead(parenPeelIx(dn.letInit), depth + 1)
+}
+
+// The parameter of `fn` the un-annotated binding `d`, a `const` or a `let` nothing re-points, is
+// bound to, directly or through a chain of such bindings; else -1.
+function elabConstParamAlias(d: i32, fn: FuncDecl): i32 {
+  const pd = elabConstParamAliasAny(d)
+  if pd >= 0 && i32ListHas(fn.fnParams, pd) { pd } else { -1 }
+}
+
+// `elabConstParamAlias` for a parameter of any function.
+function elabConstParamAliasAny(d: i32): i32 {
+  let b = d
+  let hops = 0
+  while b >= 0 && b < P.nodes.length && hops < 8 {
+    const bn = nodeAt(b)
+    if bn is Param { return if hops > 0 { b } else { -1 } }
+    if !(bn is LetDecl) || bn.letType >= 0 || bn.letInit < 0 { return -1 }
+    if bn.letKw != "const" && !cwLetUnwritten(b) { return -1 }
+    const i = parenPeelIx(bn.letInit)
+    if i < 0 || i >= P.nodes.length || !(nodeAt(i) is Ident) { return -1 }
+    b = identDeclOf(i)
+    hops = hops + 1
+  }
+  -1
 }
 
 // The parameter of `fn` the read `x` is taken out of through fields, elements, a map's `get` and
@@ -9743,6 +9768,9 @@ function elabParamRowRoot(x: i32, fn: FuncDecl, depth: i32): i32 {
       const d = identDeclOf(r)
       if d < 0 || d >= P.nodes.length { return -1 }
       if i32ListHas(fn.fnParams, d) { return if steps > 0 { d } else { -1 } }
+      // A read through an alias of the parameter is taken out of the parameter (D15920).
+      const ap = elabConstParamAlias(d, fn)
+      if steps > 0 && ap >= 0 { return ap }
       const dn = nodeAt(d)
       if (
         !(dn is LetDecl)
