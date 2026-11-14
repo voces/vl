@@ -1,0 +1,145 @@
+// The interval a constant-range loop variable ranges over, and the deliveries it admits. A
+// `for i in <a> until|to <b> [step <s>]` whose ends and step are integer literals, or `const`s
+// initialised by one, and whose variable is never written, types `i` (and an un-annotated
+// `const` bound to it) as `i32` everywhere but at a destination `i32` does not fit: there it
+// fits where every value of `[lo, hi)` is an integer literal the destination admits (`Lane4`
+// from `0 until 4`). Nothing here mints a type.
+
+import {
+  BinExpr,
+  ForRange,
+  Ident,
+  LetDecl,
+  P,
+  Paren,
+  nodeAt,
+  nodeChildren,
+} from "./ast"
+import { constIntExprIs, constIntExprVal } from "./check_literals"
+import { TY_I32, TyLit, tyAt } from "./check_types"
+import { i32ListHas } from "./listutil"
+import { numLexFitsI32, parseI32 } from "./emit_bignum"
+import { identDeclOf } from "./symbols"
+import { flattenVariantsInto } from "./tyquery"
+
+// How many `const` hops a bound may take to reach its literal.
+const RV_CONST_DEPTH = 4
+
+// Whether `ix` folds to an integer: a literal (`constIntExprIs`) or a `const` initialised by
+// one, through at most `depth` hops.
+function rvConstIs(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth < 0 { return false }
+  if constIntExprIs(ix) { return true }
+  const e = nodeAt(ix)
+  if e is Paren { return rvConstIs(e.parInner, depth) }
+  if !(e is Ident) { return false }
+  const d = identDeclOf(ix)
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letKw != "const" { return false }
+  rvConstIs(n.letInit, depth - 1)
+}
+
+// The value of a node `rvConstIs` accepted at the same `depth`.
+function rvConstVal(ix: i32, depth: i32): i32 {
+  if constIntExprIs(ix) { return constIntExprVal(ix) }
+  const e = nodeAt(ix)
+  if e is Paren { return rvConstVal(e.parInner, depth) }
+  const n = nodeAt(identDeclOf(ix))
+  if n is LetDecl { return rvConstVal(n.letInit, depth - 1) }
+  0
+}
+
+// Whether anything under `ix` assigns the loop variable declared by the `for` at `loop`.
+function rvWritten(ix: i32, loop: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is BinExpr && n.binOp == "=" {
+    const t = nodeAt(n.binLeft)
+    if t is Ident && identDeclOf(n.binLeft) == loop { return true }
+  }
+  for k in nodeChildren(ix) {
+    if rvWritten(k, loop) { return true }
+  }
+  false
+}
+
+// The `[lo, hi)` the loop variable read at `srcExpr` ranges over, as `[lo, hi]` with `hi > lo`,
+// or `[]` where `srcExpr` is no such read or the range is empty, unbounded or written.
+export function rangeVarInterval(srcExpr: i32): i32[] {
+  rvIntervalAt(srcExpr, RV_CONST_DEPTH)
+}
+
+// `rangeVarInterval`, following an un-annotated `const` bound to a bare read through at most
+// `depth` hops, since the interval is the variable's type and a `const` keeps its initialiser's.
+function rvIntervalAt(srcExpr: i32, depth: i32): i32[] {
+  const none: i32[] = []
+  if srcExpr < 0 || srcExpr >= P.nodes.length || depth < 0 { return none }
+  const e = nodeAt(srcExpr)
+  if e is Paren { return rvIntervalAt(e.parInner, depth) }
+  if !(e is Ident) { return none }
+  const loop = identDeclOf(srcExpr)
+  if loop < 0 || loop >= P.nodes.length { return none }
+  const f = nodeAt(loop)
+  if f is LetDecl {
+    if f.letKw != "const" || f.letType >= 0 { return none }
+    return rvIntervalAt(f.letInit, depth - 1)
+  }
+  if !(f is ForRange) { return none }
+  if (
+    !rvConstIs(f.frFrom, RV_CONST_DEPTH)
+    || !rvConstIs(f.frTo, RV_CONST_DEPTH)
+  ) {
+    return none
+  }
+  let step = 1
+  if f.frStep >= 0 {
+    if !rvConstIs(f.frStep, RV_CONST_DEPTH) { return none }
+    step = rvConstVal(f.frStep, RV_CONST_DEPTH)
+  }
+  if step == 0 || rvWritten(f.frBody, loop) { return none }
+  const a = rvConstVal(f.frFrom, RV_CONST_DEPTH)
+  const b = rvConstVal(f.frTo, RV_CONST_DEPTH)
+  // The values visited lie between the start and the end, the end itself only for `to`.
+  let lo = a
+  let hi = b
+  if step > 0 {
+    if !f.frExcl { hi = b + 1 }
+  } else {
+    lo = b
+    hi = a + 1
+    if f.frExcl { lo = b + 1 }
+  }
+  // `b + 1` wraps at the i32 limit; an empty or wrapped interval admits nothing.
+  if hi <= lo { return none }
+  [lo, hi]
+}
+
+// Whether the read at `srcExpr`, typed `srcTy`, delivers to `dstTy` because every value of its
+// loop's interval is an integer literal `dstTy` admits. Asked only after `assignable` refused.
+export function rangeVarFits(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  if srcTy != TY_I32 || dstTy < 0 { return false }
+  const members: i32[] = []
+  flattenVariantsInto(dstTy, members)
+  const vals: i32[] = []
+  for m in members {
+    if m >= 0 {
+      const t = tyAt(m)
+      if t is TyLit && t.litKind == "int" && numLexFitsI32(t.litText) {
+        vals.push(parseI32(t.litText))
+      }
+    }
+  }
+  if vals.length == 0 { return false }
+  const iv = rangeVarInterval(srcExpr)
+  if iv.length != 2 { return false }
+  // A wrapped width is negative: no destination holds that many literals.
+  const w = iv[1] - iv[0]
+  if w <= 0 || w > vals.length { return false }
+  let v = iv[0]
+  while v < iv[1] {
+    if !i32ListHas(vals, v) { return false }
+    v = v + 1
+  }
+  true
+}
