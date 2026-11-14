@@ -890,6 +890,10 @@ const readBytes = (len: number, at: (j: number) => number): Uint8Array => {
  * this checker stages into, so each check banks its result per entry and a
  * {@link WasmChecker.recheck} serves the modules an edit did not reach. Only a
  * long-lived host passes it (the Node server); the playground does not.
+ *
+ * `testUnsupported` is a test harness's opt-in only: it arms the seed's test-only capability
+ * refusal (`setTestUnsupported`), so a test pins the `unsupported-lowering` channel without
+ * leaning on an open gap. No host passes it.
  */
 export const createWasmChecker = (
   instantiate: () => Exports | undefined,
@@ -897,6 +901,7 @@ export const createWasmChecker = (
   resolveVlRoot?: (entryKey: string) => string | undefined,
   resolveModuleRoot?: (key: string) => string,
   checkSkip = false,
+  testUnsupported = false,
 ): WasmChecker => {
   // The instance the skip was last armed on: a replaced seed starts unarmed.
   let armedExp: Exports | undefined;
@@ -943,6 +948,9 @@ export const createWasmChecker = (
     if (checkSkip && armedExp !== exp && typeof exp.checkSkipArm === "function") {
       exp.checkSkipArm(1);
       armedExp = exp;
+    }
+    if (testUnsupported && typeof exp.setTestUnsupported === "function") {
+      exp.setTestUnsupported(1);
     }
     exp.modReset();
     // Re-staged every call (cheap, and memoized in `vlRootFor` itself): an older

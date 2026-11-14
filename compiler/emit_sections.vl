@@ -1,3 +1,4 @@
+import { repSlotOfKind } from "./emit_rep_slot"
 import { spellTyShadowSweep } from "./emit_union_atoms"
 import { monoPinSpellShaped } from "./pin_spell"
 import { tagRepNameFn } from "./emit_shape_intern"
@@ -103,10 +104,11 @@ import {
   repNodeScalarMask,
   repReset,
   repShadowSweep,
-  repSigTokHasSlot,
   repVariantShapeRowOf,
   repVariantShapesPrime,
   rlElemKindAt,
+  sigTokBareSlot,
+  sigTokSlotAt,
   structLateTwinOf,
 } from "./emit_rep"
 import {
@@ -230,6 +232,8 @@ import {
   MVK_F64,
   MVK_I64,
   MVK_STR,
+  PK_I16,
+  PK_U16,
   RLK_UNION,
   SYNTH_CLOSURE,
   SYNTH_CONST_LIST,
@@ -357,11 +361,11 @@ import {
   fnUsesMapVals,
   fnUsesNulStrPush,
   fnUsesOptRecv,
+  fnUsesPackedPush,
   fnUsesPush,
   fnUsesRefPush,
   fnUsesStrOp,
   fnUsesStrPush,
-  fnUsesU8Push,
   fnUsesUnionLetSink,
   fnUsesUnionSink,
   fnUsesVariantRebox,
@@ -675,6 +679,8 @@ import {
   mvValElemHeapOf,
   mvValsBackOf,
   packedStorageOf,
+  pkBackAt,
+  pkWrapAt,
   pushFieldStorageKind,
   ropeAt,
   ropePush,
@@ -1159,7 +1165,7 @@ function resetFnScratchFlags() {
   fnUsesF64Push = false
   fnUsesI64Push = false
   fnUsesF32Push = false
-  fnUsesU8Push = false
+  fnUsesPackedPush = 0
   fnUsesAtomStage = false
   fnUsesStrOp = false
   fnUsesArrNew = false
@@ -2057,7 +2063,7 @@ function startFnDetectFrames() {
   fnUsesF64Push = false
   fnUsesF32Push = false
   fnUsesI64Push = false
-  // `fnUsesU8Push` and `fnUsesMapVals` are not reset here: the sweep sets them for this body like
+  // `fnUsesPackedPush` and `fnUsesMapVals` are not reset here: the sweep sets them for this body like
   // any other, and a stale true from this compile only reserves an unused frame.
   // `emitStateReset` clears both per compile.
   fnUsesAtomStage = false
@@ -2402,7 +2408,7 @@ function emitInitFnCode(out: u8[], k: i32) {
   emitCurFnPos = -1
   nodeTyInstEnter(-1)
   startWalkWindows(ifW0[k], ifW1[k])
-  fnUsesU8Push = false
+  fnUsesPackedPush = 0
   fnUsesMapVals = false
   const rc = emitStartBodyCode(out, k)
   rc
@@ -8002,12 +8008,6 @@ function synthSigIdxAt(key: string, i: i32, outNext: i32[]) {
   idx
 }
 
-// True if a `$fnsig` token char carries a `;`-terminated index — the ref shapes whose
-// functype valtype needs a heap slot. Decodes through the ONE token vocabulary
-// (`repKindOfSigTok` → `repSigTokHasSlot`), so a new slot-carrying kind cannot be added
-// to the encoders without this parser skipping its digits correctly.
-function synthSigTokHasIdx(c: i32) { repSigTokHasSlot(repKindOfSigTok(c)) }
-
 // Emit ONE `$fnsig` functype — pool position `sai`'s bytes, and nothing else. Split out
 // of `emitTypeSection`'s pool loop so that loop can render an entry, MEASURE it, and
 // compare it against the entries already written (D351's twin column) without a second
@@ -8064,7 +8064,7 @@ function emitSynthCloSig(key: string) {
   let nparams = 0
   let ci = 0
   while ci < gi {
-    if synthSigTokHasIdx(key[ci]) {
+    if sigTokSlotAt(key, ci) {
       ci = ci + 1
       while ci < gi && key[ci] != ';' { ci = ci + 1 }
       ci = ci + 1 // skip ';'
@@ -8083,8 +8083,8 @@ function emitSynthCloSig(key: string) {
     const pk = repKindOfSigTok(pc)
     let pkc: VKind = "i32"
     if pk != null { pkc = pk }
-    let pidx = -1
-    if synthSigTokHasIdx(pc) {
+    let pidx = sigTokBareSlot(key, pi)
+    if sigTokSlotAt(key, pi) {
       const nx: i32[] = []
       pidx = synthSigIdxAt(key, pi + 1, nx)
       pi = nx[0]
@@ -8103,8 +8103,8 @@ function emitSynthCloSig(key: string) {
     const rk = repKindOfSigTok(rc)
     let rkc: VKind = "i32"
     if rk != null { rkc = rk }
-    let ridx = -1
-    if synthSigTokHasIdx(rc) {
+    let ridx = sigTokBareSlot(key, ri)
+    if sigTokSlotAt(key, ri) {
       const rnx: i32[] = []
       ridx = synthSigIdxAt(key, ri + 1, rnx)
     }
@@ -8181,6 +8181,8 @@ function emitOneFuncType(ti: i32) {
         infKind == "struct"
         || infKind == "nulstruct"
         || infKind == "nulreflist"
+        || infKind == "u8list"
+        || infKind == "nulu8list"
       ) {
         infSlot = fRetStructIdx[ti]
       }
@@ -8218,6 +8220,10 @@ function emitOneFuncType(ti: i32) {
       const isRec = retKind == "struct" || retKind == "nulstruct"
       let retSlot = if isRec && ti < fRetStructIdx.length { fRetStructIdx[ti] } else { retStructRowIndex(fn.fnRet) }
       if retKind == "reflist" { retSlot = tyAnnRefListSlot(fn.fnRet) }
+      // A packed list's slot is its row.
+      if retKind == "u8list" || retKind == "nulu8list" {
+        retSlot = repSlotOfKind(retKind, nodeTyIxOf(fn.fnRet))
+      }
       // A NULLABLE ref-array return (`<ref-array> | null`, kind 18) — its slot is the INNER
       // ref-list element wrapper (`tyAnnRefListSlot` strips the `| null` before resolving), so the
       // `(ref null $wrapper)` result valtype selects THIS function's element wrapper.
@@ -8685,13 +8691,16 @@ function tsF32List() {
   tsListWrapBody(fa32TypeIdx)
 }
 
-// The `u8[]` backing is the emitter's first packed storage type: `0x78` is not a valtype, so
-// `array.get` is invalid on it and `fbArrayGet` dispatches to `array.get_u` off this index.
-function tsU8Array() { tsArray(ba8Ty(), "u8 array", 120) }
+// A packed list row's backing: `0x78` (`i8`) or `0x77` (`i16`) storage is not a valtype, so
+// `array.get` is invalid on it and `fbArrayGet` picks `_s` or `_u` off this index.
+function tsPackedArray(row: i32) {
+  const st = if row == PK_U16 || row == PK_I16 { 119 } else { 120 }
+  tsArray(pkBackAt(row), "packed array", st)
+}
 
-function tsU8List() {
-  tsEntryAt(bl8Ty(), "u8 list wrapper")
-  tsListWrapBody(ba8Ty())
+function tsPackedList(row: i32) {
+  tsEntryAt(pkWrapAt(row), "packed list wrapper")
+  tsListWrapBody(pkBackAt(row))
 }
 
 function tsClosure() {
@@ -8844,8 +8853,8 @@ function tsEmitEntry(kind: i32, slot: i32) {
   if kind == TSK_I64_LIST { return tsI64List() }
   if kind == TSK_F32_ARRAY { return tsF32Array() }
   if kind == TSK_F32_LIST { return tsF32List() }
-  if kind == TSK_U8_ARRAY { return tsU8Array() }
-  if kind == TSK_U8_LIST { return tsU8List() }
+  if kind == TSK_U8_ARRAY { return tsPackedArray(slot) }
+  if kind == TSK_U8_LIST { return tsPackedList(slot) }
   if kind == TSK_SV_VIEW { return tsSvView(slot) }
   if kind == TSK_RV_VIEW { return tsRvView(slot) }
   if kind == TSK_CLOSURE { return tsClosure() }

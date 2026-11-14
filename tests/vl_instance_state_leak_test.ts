@@ -127,8 +127,16 @@ const PROGRAMS: Program[] = [
     path: "arrays/u8-union-tag-band.vl",
   },
   { id: "u8-for-in", family: "ba8Used", path: "arrays/u8-for-in.vl" },
-  { id: "u8-packed-list", family: "fnUsesU8Push (D1006)", path: "arrays/u8-packed-list.vl" },
-  { id: "utf8-bytes", family: "ba8Used via scanPrintUse", path: "strings/utf8-bytes.vl" },
+  {
+    id: "u8-packed-list",
+    family: "fnUsesPackedPush (D1006)",
+    path: "arrays/u8-packed-list.vl",
+  },
+  {
+    id: "utf8-bytes",
+    family: "ba8Used via scanPrintUse",
+    path: "strings/utf8-bytes.vl",
+  },
   // ── wide scalars: `fa64Used`/`fl64TypeIdx`, `ia64Used`/`il64TypeIdx`, `fa32TypeIdx` ──
   { id: "f64-elems", family: "fa64Used", path: "arrays/f64-elems.vl" },
   {
@@ -185,7 +193,11 @@ const PROGRAMS: Program[] = [
     family: "uBoxIdx + vb*Used",
     path: "unions/variant-arm-ref-field-literal.vl",
   },
-  { id: "union-map-member", family: "uBoxIdx + mUsed", path: "unions/map-member-shapes.vl" },
+  {
+    id: "union-map-member",
+    family: "uBoxIdx + mUsed",
+    path: "unions/map-member-shapes.vl",
+  },
   {
     id: "variant-litunion-field",
     family: "uBoxIdx × gLitUnionUsed",
@@ -209,13 +221,17 @@ const PROGRAMS: Program[] = [
     id: "as-memo-arm",
     family: "lazy union-as + num-cast rows",
     src:
-      "function pick(b: boolean): i32 | string {\n  if b { return 1 }\n  return \"s\"\n}\n" +
+      'function pick(b: boolean): i32 | string {\n  if b { return 1 }\n  return "s"\n}\n' +
       "const u = pick(false)\nconst s = u as? string\n" +
       'if s != null { print(s) } else { print("none") }\n' +
       "let d = 2.5\nconst n = d as? i32\nif n != null { print(n) } else { print(0) }\n",
   },
   // ── maps: `mUsed`/`mStructIdx`, `mI32Used`/`mStructI32Idx` ──
-  { id: "map-nullable-value", family: "mUsed", path: "maps/nullable-value-map.vl" },
+  {
+    id: "map-nullable-value",
+    family: "mUsed",
+    path: "maps/nullable-value-map.vl",
+  },
   {
     id: "map-values-forin",
     family: "fnUsesMapVals (D1007)",
@@ -250,13 +266,25 @@ const PROGRAMS: Program[] = [
     family: "memUsed",
     path: "memory/store-narrow-widths-round-trip.vl",
   },
-  { id: "mem-bulk-copy", family: "memUsed", path: "memory/bulk-copy-and-fill.vl" },
+  {
+    id: "mem-bulk-copy",
+    family: "memUsed",
+    path: "memory/bulk-copy-and-fill.vl",
+  },
   // ── one generic turns on the flow table and the mono walk, whose whole-program tables
   // (`monoProgTop`, `monoProgNames`, the flow slot sets and pin-key memo) are banked per
   // compile (D4942). The pair has one shape and differs only in its writers' names, so a names
   // table carried over from the other says this program's writers are never called.
-  { id: "field-writers-main", family: "mono program tables (D4942)", src: fieldWriters("main", "set") },
-  { id: "field-writers-mn", family: "mono program tables (D4942)", src: fieldWriters("mn", "put") },
+  {
+    id: "field-writers-main",
+    family: "mono program tables (D4942)",
+    src: fieldWriters("main", "set"),
+  },
+  {
+    id: "field-writers-mn",
+    family: "mono program tables (D4942)",
+    src: fieldWriters("mn", "put"),
+  },
 
   // ── the checker's loop-exit log (`lpExits`): a labelled block's exits, keyed by node, outlived
   // its program, so the next program's box record stamped an argument with an unrelated union
@@ -307,7 +335,8 @@ const PROGRAMS: Program[] = [
   {
     id: "bare-union-atom",
     family: "NONE (union band, no u8)",
-    src: 'type Tag = "a" | "b"\nconst t: Tag = "b"\nif t == "b" { print(1) } else { print(0) }\n',
+    src:
+      'type Tag = "a" | "b"\nconst t: Tag = "b"\nif t == "b" { print(1) } else { print(0) }\n',
   },
 ];
 
@@ -320,7 +349,7 @@ const PROGRAMS: Program[] = [
 //
 // Both are one mechanism: `startFnDetectScratch` (`emit_sections.vl`) is the start
 // function's analogue of `emitFuncCode`'s per-function frame detection, and it clears 20 of
-// the 24 `fnUses*` frame flags. `fnUsesU8Push` and `fnUsesMapVals` are two of the four it
+// the 24 `fnUses*` frame flags. `fnUsesPackedPush` and `fnUsesMapVals` are two of the four it
 // misses — and each is written TWICE IN A ROW inside `emitFuncCode` (lines 872/873 and
 // 904/905), which is what the second copy was for. So a program that pushes to a `u8[]`, or
 // reads `m.values()`, leaves its flag set, and the NEXT program's start function reserves a
@@ -420,7 +449,9 @@ const buildOracle = (): void => {
 };
 
 const describe = (r: Result): string =>
-  r.rc === 0 ? `rc 0, ${r.bytes!.length} bytes` : `rc ${r.rc}: ${r.diags.join(" | ")}`;
+  r.rc === 0
+    ? `rc 0, ${r.bytes!.length} bytes`
+    : `rc ${r.rc}: ${r.diags.join(" | ")}`;
 
 /** The first differing byte offset, or -1. Lengths may differ. */
 const firstDiff = (a: Uint8Array, b: Uint8Array): number => {
@@ -482,16 +513,24 @@ const runSequence = (name: string, steps: Step[]): void => {
       found.push({ step: i, id: p.id, note, prev, what });
 
     if (got.rc !== want.rc) {
-      record(`rc ${got.rc} on the shared instance, rc ${want.rc} fresh — ${describe(got)}`);
+      record(
+        `rc ${got.rc} on the shared instance, rc ${want.rc} fresh — ${
+          describe(got)
+        }`,
+      );
     } else if (got.rc !== 0) {
       const a = got.diags.join(" | ");
       const b = want.diags.join(" | ");
-      if (a !== b) record(`diagnostics differ\n      shared: ${a}\n      fresh : ${b}`);
+      if (a !== b) {
+        record(`diagnostics differ\n      shared: ${a}\n      fresh : ${b}`);
+      }
     } else if (!WebAssembly.validate(got.bytes!)) {
       // Belt and braces: name invalid wasm AS invalid wasm, which is the sentence D986
       // needed. `WebAssembly.validate` is a pure function of the bytes.
       record(
-        `the shared instance emitted a module V8 REJECTS (${got.bytes!.length} bytes); ` +
+        `the shared instance emitted a module V8 REJECTS (${
+          got.bytes!.length
+        } bytes); ` +
           `the fresh-instance module is ${
             WebAssembly.validate(want.bytes!) ? "valid" : "ALSO invalid"
           }`,
@@ -500,8 +539,12 @@ const runSequence = (name: string, steps: Step[]): void => {
       const d = firstDiff(got.bytes!, want.bytes!);
       if (d >= 0) {
         record(
-          `emitted bytes differ at offset ${d} (shared ${got.bytes!.length} bytes, fresh ` +
-            `${want.bytes!.length}); the module is valid, so this is a silent codegen ` +
+          `emitted bytes differ at offset ${d} (shared ${
+            got.bytes!.length
+          } bytes, fresh ` +
+            `${
+              want.bytes!.length
+            }); the module is valid, so this is a silent codegen ` +
             `difference`,
         );
       }
@@ -511,7 +554,9 @@ const runSequence = (name: string, steps: Step[]): void => {
 
   if (found.length === 0) return;
   const first = found[0];
-  const rest = found.slice(1).map((d) => `    step ${d.step} ${d.id} — ${d.note}`);
+  const rest = found.slice(1).map((d) =>
+    `    step ${d.step} ${d.id} — ${d.note}`
+  );
   throw new Error(
     `INSTANCE STATE LEAK — sequence "${name}": ${found.length} of ${steps.length} ` +
       `compiles diverged from their fresh-instance oracle.\n` +
@@ -531,7 +576,8 @@ const runSequence = (name: string, steps: Step[]): void => {
 // ── the tests ──────────────────────────────────────────────────────────────────────────
 
 Deno.test({
-  name: "instance-leak oracle: every program compiles and its module instantiates under V8",
+  name:
+    "instance-leak oracle: every program compiles and its module instantiates under V8",
   ignore,
   fn: async () => {
     buildOracle();
@@ -547,7 +593,9 @@ Deno.test({
       try {
         await runWasm(r.bytes!);
       } catch (e) {
-        bad.push(`${p.id}: the fresh-instance module did not instantiate/run — ${e}`);
+        bad.push(
+          `${p.id}: the fresh-instance module did not instantiate/run — ${e}`,
+        );
       }
     }
     if (bad.length > 0) {
@@ -586,7 +634,9 @@ Deno.test({
   fn: () => {
     const TARGET = "print(1)\n";
     const base = compile(freshInstance(), TARGET);
-    if (base.rc !== 0) throw new Error("`print(1)` no longer compiles — fixture is stale");
+    if (base.rc !== 0) {
+      throw new Error("`print(1)` no longer compiles — fixture is stale");
+    }
     const wrong: string[] = [];
     for (const leak of OPEN_LEAKS) {
       const exp = freshInstance();
@@ -634,7 +684,8 @@ Deno.test({
 //
 // Both are graded against a FRESH checker, which is the same oracle the sequences use.
 Deno.test({
-  name: "instance-leak: the LSP checker surface is not contaminated by an earlier file",
+  name:
+    "instance-leak: the LSP checker surface is not contaminated by an earlier file",
   ignore,
   fn: async () => {
     const log = () => {};
@@ -655,11 +706,14 @@ Deno.test({
     const gotDiags = await shared.check(AFTER, "/tmp/after.vl", noSiblings);
     const gotCompile = await shared.compile(AFTER, "/tmp/after.vl", noSiblings);
 
-    const fmt = (ds: { message: string }[]) => ds.map((d) => d.message).join(" | ");
+    const fmt = (ds: { message: string }[]) =>
+      ds.map((d) => d.message).join(" | ");
     if (fmt(gotDiags) !== fmt(wantDiags)) {
       throw new Error(
         `LSP CHECK SURFACE LEAK — the same file reports different diagnostics after another ` +
-          `file was checked on the same server instance.\n  fresh : ${fmt(wantDiags)}\n` +
+          `file was checked on the same server instance.\n  fresh : ${
+            fmt(wantDiags)
+          }\n` +
           `  shared: ${fmt(gotDiags)}`,
       );
     }
@@ -693,12 +747,19 @@ Deno.test({
   name: "instance-leak: the program set still covers both halves of the shape",
   fn: () => {
     if (minters.length < 20) {
-      throw new Error(`expected >= 20 minting programs, have ${minters.length}`);
+      throw new Error(
+        `expected >= 20 minting programs, have ${minters.length}`,
+      );
     }
     if (nonMinters.length < 3) {
-      throw new Error(`expected >= 3 non-minting programs, have ${nonMinters.length}`);
+      throw new Error(
+        `expected >= 3 non-minting programs, have ${nonMinters.length}`,
+      );
     }
-    const ids = new Set([...PROGRAMS.map((p) => p.id), ...OPEN_LEAKS.map((l) => l.id)]);
+    const ids = new Set([
+      ...PROGRAMS.map((p) => p.id),
+      ...OPEN_LEAKS.map((l) => l.id),
+    ]);
     if (ids.size !== PROGRAMS.length + OPEN_LEAKS.length) {
       throw new Error("duplicate program id");
     }
@@ -741,22 +802,28 @@ Deno.test({
 // never invalidates; revert-then-check catches one that invalidated by dropping the
 // dependency's entry and cannot get the original answer back.
 const IMPORTER_KEY = "/proj/main.vl";
-const IMPORTER = 'import { pick } from "./util"\nconst r: i32 = pick()\nprint(r)\n';
+const IMPORTER =
+  'import { pick } from "./util"\nconst r: i32 = pick()\nprint(r)\n';
 const DEP_I32 = "export function pick(): i32 {\n  1\n}\n";
 const DEP_F64 = "export function pick(): f64 {\n  1.5\n}\n";
 
 Deno.test({
-  name: "instance-leak: a dependency edit reaches the LSP checker, and reverting it comes back",
+  name:
+    "instance-leak: a dependency edit reaches the LSP checker, and reverting it comes back",
   ignore,
   fn: async () => {
     const c = loadWasmChecker(SEED, () => {})!;
     let dep = DEP_I32;
     const read = (key: string) => key.endsWith("util.vl") ? dep : undefined;
     const msgs = async () =>
-      (await c.check(IMPORTER, IMPORTER_KEY, read)).map((d) => d.message).join(" | ");
+      (await c.check(IMPORTER, IMPORTER_KEY, read)).map((d) => d.message).join(
+        " | ",
+      );
 
     const clean = await msgs();
-    if (clean !== "") throw new Error(`the importer starts clean, got: ${clean}`);
+    if (clean !== "") {
+      throw new Error(`the importer starts clean, got: ${clean}`);
+    }
 
     // The importer's own text is untouched; only the sibling on "disk" moved.
     dep = DEP_F64;
@@ -765,7 +832,9 @@ Deno.test({
     if (!broken.includes("f64")) {
       throw new Error(
         `STALE DEPENDENCY — after the sibling's return type changed to f64 the importer ` +
-          `must not still type-check. want a diagnostic naming f64, got: ${broken || "(none)"}`,
+          `must not still type-check. want a diagnostic naming f64, got: ${
+            broken || "(none)"
+          }`,
       );
     }
 
@@ -782,7 +851,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "instance-leak: the same two directions on the raw module protocol the LSP drives",
+  name:
+    "instance-leak: the same two directions on the raw module protocol the LSP drives",
   ignore,
   fn: () => {
     const exp = new WebAssembly.Instance(
@@ -812,7 +882,9 @@ Deno.test({
         if (n === 0) break;
         const keys: string[] = [];
         for (let i = 0; i < n; i++) {
-          keys.push(readStr(exp.modPendingLen(i), (j) => exp.modPendingAt(i, j)));
+          keys.push(
+            readStr(exp.modPendingLen(i), (j) => exp.modPendingAt(i, j)),
+          );
         }
         for (const k of keys) commit(k, dep);
       }
@@ -826,7 +898,9 @@ Deno.test({
       return out.join(" | ");
     };
     const clean = check(DEP_I32);
-    if (clean !== "") throw new Error(`the importer starts clean, got: ${clean}`);
+    if (clean !== "") {
+      throw new Error(`the importer starts clean, got: ${clean}`);
+    }
     const broken = check(DEP_F64);
     if (!broken.includes("f64")) {
       throw new Error(
@@ -852,32 +926,45 @@ Deno.test({
 // value. The editor's lint is not paired with a check, so it must judge only a chain that
 // opens with a string literal, which no operator can take (#3105 review).
 
-const PI_ENTRY = 'import { mk } from "./w"\nconst v = mk("x") + "a" + "bb" + "ccc"\nprint(v)\n' +
+const PI_ENTRY =
+  'import { mk } from "./w"\nconst v = mk("x") + "a" + "bb" + "ccc"\nprint(v)\n' +
   'print("<" + "a" + "b" + "c" + ">")\n';
-const PI_ALIAS = 'export type Widget = string\nexport function mk(s: string): Widget { s }\n';
+const PI_ALIAS =
+  "export type Widget = string\nexport function mk(s: string): Widget { s }\n";
 const PI_OWN_PLUS = "export type Widget = new { s: string }\n" +
   "export function mk(s: string): Widget {\n  const r: Widget = { s: s }\n  return r\n}\n" +
   'function "+"(self: Widget, other: string): Widget {\n  const r: Widget = { s: other }\n  return r\n}\n';
 
 Deno.test({
-  name: "instance-leak: the editor's lint never reuses another check's typed `+` links",
+  name:
+    "instance-leak: the editor's lint never reuses another check's typed `+` links",
   ignore,
   fn: async () => {
     const c = loadWasmChecker(SEED, () => {})!;
     const interp = () =>
-      c.lint(PI_ENTRY).filter((d) => d.code === "prefer-interpolation").map((d) => d.range.start.line);
-    const reader = (dep: string) => (key: string) => key.endsWith("w.vl") ? dep : undefined;
+      c.lint(PI_ENTRY).filter((d) => d.code === "prefer-interpolation").map((
+        d,
+      ) => d.range.start.line);
+    const reader = (dep: string) => (key: string) =>
+      key.endsWith("w.vl") ? dep : undefined;
 
     await c.check(PI_ENTRY, "/proj/main.vl", reader(PI_OWN_PLUS));
     const own = interp();
     // The byte-identical entry, checked where `Widget` is a string alias.
     await c.check(PI_ENTRY, "/other/main.vl", reader(PI_ALIAS));
     const after = interp();
-    for (const [what, lines] of [["after the own-`+` check", own], ["after the alias check", after]] as const) {
+    for (
+      const [what, lines] of [["after the own-`+` check", own], [
+        "after the alias check",
+        after,
+      ]] as const
+    ) {
       // Line 3 is the literal-led chain, which is concatenation whatever `Widget` is.
       if (JSON.stringify(lines) !== JSON.stringify([3])) {
         throw new Error(
-          `${what}: want only the literal-led chain (line 3), got lines ${JSON.stringify(lines)} — ` +
+          `${what}: want only the literal-led chain (line 3), got lines ${
+            JSON.stringify(lines)
+          } — ` +
             `a finding on line 1 is the Widget chain judged by a bank from another check`,
         );
       }
@@ -911,7 +998,11 @@ Deno.test({
     const c = loadWasmChecker(SEED, () => {})!;
     const bad = c.lint(UNPARSEABLE, "compiler/bad.vl");
     if (bad.length !== 0) {
-      throw new Error(`precondition: an unparseable file should lint empty, got ${JSON.stringify(bad)}`);
+      throw new Error(
+        `precondition: an unparseable file should lint empty, got ${
+          JSON.stringify(bad)
+        }`,
+      );
     }
     const after = c.lint(UNRELATED_CHAIN); // no path — the next, unrelated document
     const interp = after.filter((d) => d.code === "prefer-interpolation");

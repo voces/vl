@@ -1,7 +1,7 @@
 import { constLitNeverMsg } from "./check_lit_never_msgs"
 import { identIsConst } from "./check_scopes"
 import { parenPeelIx } from "./check_places"
-import { recordDeadTest } from "./check_side_rows"
+import { deadArmNote, recordDeadTest } from "./check_side_rows"
 
 // A `match` expression: integer and literal arms, type arms with their bindings, and the
 // type the arms join to.
@@ -140,6 +140,7 @@ import {
   tyIsCompositePat,
   tyIsHole,
   tyToStr,
+  tyToStrUser,
 } from "./check_types"
 import {
   flattenVariantsInto,
@@ -497,6 +498,10 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   // read by pass 3 as well as by the exhaustiveness report at the end.
   let exhaustive = hasWild
   if !hasWild { exhaustive = matchAllCovered(covered) }
+  // A `_` after arms naming every member never runs: a warning, as a dead `else` is (D16006).
+  if hasWild && matchAllCovered(covered) && !elabCapLive() {
+    matchWildDeadWarn(n, st)
+  }
   // Pass 2 (chain order): the progressive else narrowings, folded into `accNames`/`accTys`.
   const elseArm = matchElseArmOf(n.matchPats, n.matchArmStart, n.matchArmCount)
   const accNames: i32[] = []
@@ -943,6 +948,33 @@ function matchElseArmAcc(
   }
   if elseArm >= 0 { armAcc[elseArm] = accNames.length }
   armAcc
+}
+
+// Marks the `_` arm of `n` dead, its arms already naming every member of scrutinee type `st`,
+// and warns at its pattern.
+function matchWildDeadWarn(n: MatchExpr, st: i32) {
+  let ai = 0
+  while ai < n.matchArmStart.length {
+    let pj = 0
+    while pj < n.matchArmCount[ai] {
+      const p = n.matchPats[n.matchArmStart[ai] + pj]
+      if matchPatIsWild(p) {
+        deadArmNote(n.matchBodies[ai])
+        if !inferQuiet {
+          recordDeadTest(
+            p,
+            "this `_` arm can never run (every member of `"
+              + tyToStrUser(st)
+              + "` is already matched)",
+          )
+        }
+        return 0
+      }
+      pj = pj + 1
+    }
+    ai = ai + 1
+  }
+  0
 }
 
 // Refuses a type match at `ix` that leaves a member of `uMems` uncovered. `_` is allowed but

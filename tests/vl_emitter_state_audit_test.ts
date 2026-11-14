@@ -29,7 +29,7 @@
 // @test-timing native
 
 import { builtScript } from "./support/builtScript.ts";
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
 const SCRIPT = `${ROOT}/scripts/emitter-state-audit.vl`;
 const EMIT_SECTIONS = `${ROOT}/compiler/emit_sections.vl`;
@@ -45,16 +45,20 @@ const INDEX_CONTROL_NAME = "ssArmRhs";
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
 if (GATED && !ENABLED) {
-  console.warn("[vl-emitter-state-audit] skipped — missing vl binary or seed wasm.");
+  console.warn(
+    "[vl-emitter-state-audit] skipped — missing vl binary or seed wasm.",
+  );
 }
 
 /** The rows whose flag is genuinely never reset on the start-fn side. */
 const OPEN = new Map([
-  ["fnUsesU8Push", "D1006"],
+  ["fnUsesPackedPush", "D1006"],
   ["fnUsesMapVals", "D1007"],
 ]);
 
-const audit = async (args: string[]): Promise<{ code: number; out: string }> => {
+const audit = async (
+  args: string[],
+): Promise<{ code: number; out: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: ["run", await builtScript(SCRIPT, { cwd: ROOT }), "--", ...args],
     cwd: ROOT,
@@ -71,11 +75,17 @@ const roots = (): string[] => {
   const src = Deno.readTextFileSync(SCRIPT);
   const m = src.match(/^const FRAME_ROOTS\s*=\s*\[([^\]]*)\]/m);
   if (!m) {
-    throw new Error(`no FRAME_ROOTS list in ${SCRIPT} — did the audit's anchors move?`);
+    throw new Error(
+      `no FRAME_ROOTS list in ${SCRIPT} — did the audit's anchors move?`,
+    );
   }
-  const names = [...m[1].matchAll(/"([A-Za-z_][A-Za-z0-9_]*)"/g)].map((x) => x[1]);
+  const names = [...m[1].matchAll(/"([A-Za-z_][A-Za-z0-9_]*)"/g)].map((x) =>
+    x[1]
+  );
   if (names.length < 2) {
-    throw new Error(`FRAME_ROOTS names ${names.length} builder(s), want the two: ${m[1]}`);
+    throw new Error(
+      `FRAME_ROOTS names ${names.length} builder(s), want the two: ${m[1]}`,
+    );
   }
   return names;
 };
@@ -100,18 +110,24 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const { code, out } = await audit([]);
-    if (code !== 0) throw new Error(`emitter-state-audit.vl exited ${code}:\n${out}`);
+    if (code !== 0) {
+      throw new Error(`emitter-state-audit.vl exited ${code}:\n${out}`);
+    }
     const line = out.split("\n").find((l) => / of \d+ asymmetric: /.test(l));
     if (!line) {
       throw new Error(`no "N of M asymmetric" summary line in:\n${out}`);
     }
     const listed = line.slice(line.indexOf(": ") + 2).trim();
-    const got = listed === "none" ? [] : listed.split(", ").map((s) => s.trim());
+    const got = listed === "none"
+      ? []
+      : listed.split(", ").map((s) => s.trim());
     const want = [...OPEN.keys()].sort();
     if ([...got].sort().join(",") !== want.join(",")) {
       const rows = [...OPEN].map(([f, r]) => `${f} (${r})`).join(", ");
       throw new Error(
-        `frame-flag asymmetries: want exactly the open rows ${rows}, got [${got.join(", ")}].\n` +
+        `frame-flag asymmetries: want exactly the open rows ${rows}, got [${
+          got.join(", ")
+        }].\n` +
           `A NEW name means a flag one builder clears and the other does not — file it, ` +
           `it leaks into the next program's start function. A MISSING name means either the ` +
           `row closed (drop it here and from OPEN_LEAKS in ` +
@@ -123,15 +139,20 @@ Deno.test({
 });
 
 Deno.test({
-  name: "emitter-state-audit: --check holds at zero and reds when one reset's clears are ignored",
+  name:
+    "emitter-state-audit: --check holds at zero and reds when one reset's clears are ignored",
   ignore: !ENABLED,
   fn: async () => {
     const held = await audit(["--check"]);
     if (held.code !== 0) {
-      throw new Error(`--check on the tree: want exit 0, got ${held.code}\n${held.out}`);
+      throw new Error(
+        `--check on the tree: want exit 0, got ${held.code}\n${held.out}`,
+      );
     }
     if (!/never-cleared module state 0 of \d+ mutables/.test(held.out)) {
-      throw new Error(`no "never-cleared module state 0 of N" line in:\n${held.out}`);
+      throw new Error(
+        `no "never-cleared module state 0 of N" line in:\n${held.out}`,
+      );
     }
     const red = await audit(["--check", "--without-reset", CONTROL_RESET]);
     if (
@@ -147,16 +168,25 @@ Deno.test({
 });
 
 Deno.test({
-  name: "emitter-state-audit: --check reds on an index register whose per-program reset is gone",
+  name:
+    "emitter-state-audit: --check reds on an index register whose per-program reset is gone",
   ignore: !ENABLED,
   fn: async () => {
     const held = await audit(["--check"]);
-    if (held.code !== 0 || !/unguarded inner index registers 0\b/.test(held.out)) {
-      throw new Error(`--check on the tree: want exit 0 and 0 unguarded, got ${held.code}\n${held.out}`);
+    if (
+      held.code !== 0 || !/unguarded inner index registers 0\b/.test(held.out)
+    ) {
+      throw new Error(
+        `--check on the tree: want exit 0 and 0 unguarded, got ${held.code}\n${held.out}`,
+      );
     }
     // D11770's shape: `ssArmRhs` keeps its inner clear in `strSiteArm`, so without
     // the reset's clear it is no NEVER row, and only the index rule can see it.
-    const red = await audit(["--check", "--without-reset", INDEX_CONTROL_RESET]);
+    const red = await audit([
+      "--check",
+      "--without-reset",
+      INDEX_CONTROL_RESET,
+    ]);
     if (
       red.code !== 1 || !red.out.includes("unguarded inner index registers") ||
       !red.out.includes(`  ${INDEX_CONTROL_NAME} `)
@@ -170,26 +200,37 @@ Deno.test({
 });
 
 Deno.test({
-  name: "emitter-state-audit: --check holds on const containers and reds when their clear is ignored",
+  name:
+    "emitter-state-audit: --check holds on const containers and reds when their clear is ignored",
   ignore: !ENABLED,
   fn: async () => {
     const held = await audit(["--check"]);
-    if (held.code !== 0 || !/never-cleared const containers 0 of \d+ written/.test(held.out)) {
-      throw new Error(`--check on the tree: want exit 0 and 0 const containers, got ${held.code}\n${held.out}`);
+    if (
+      held.code !== 0 ||
+      !/never-cleared const containers 0 of \d+ written/.test(held.out)
+    ) {
+      throw new Error(
+        `--check on the tree: want exit 0 and 0 const containers, got ${held.code}\n${held.out}`,
+      );
     }
     // ast.vl's brace tables are `const` lists that only `dgLosslessReset` empties.
     const red = await audit(["--check", "--without-reset", "dgLosslessReset"]);
     if (
       red.code !== 1 || !red.out.includes("never-cleared const containers") ||
-      !["stmtBraceNodes", "stmtBraceTails", "braceNameStmts"].every((n) => red.out.includes(`  ${n} `))
+      !["stmtBraceNodes", "stmtBraceTails", "braceNameStmts"].every((n) =>
+        red.out.includes(`  ${n} `)
+      )
     ) {
-      throw new Error(`--check --without-reset dgLosslessReset: want exit 1 naming the brace tables, got ${red.code}\n${red.out}`);
+      throw new Error(
+        `--check --without-reset dgLosslessReset: want exit 1 naming the brace tables, got ${red.code}\n${red.out}`,
+      );
     }
   },
 });
 
 Deno.test({
-  name: "emitter-state-audit: --check names #6759's lpExits when its reset is reverted",
+  name:
+    "emitter-state-audit: --check names #6759's lpExits when its reset is reverted",
   ignore: !ENABLED,
   fn: async () => {
     // The leak #6759 fixed, rebuilt in a copy of compiler/: a module `const` map nothing resets.
@@ -198,19 +239,27 @@ Deno.test({
       await Deno.mkdir(`${dir}/compiler`);
       for (const e of Deno.readDirSync(`${ROOT}/compiler`)) {
         if (e.isFile && e.name.endsWith(".vl")) {
-          await Deno.copyFile(`${ROOT}/compiler/${e.name}`, `${dir}/compiler/${e.name}`);
+          await Deno.copyFile(
+            `${ROOT}/compiler/${e.name}`,
+            `${dir}/compiler/${e.name}`,
+          );
         }
       }
       const f = `${dir}/compiler/check_if_value.vl`;
       const src = Deno.readTextFileSync(f);
-      const reverted = src.replace(/^let lpExits(.*)$/m, "const lpExits$1").replace("\n  lpExits = Map()\n", "\n");
+      const reverted = src.replace(/^let lpExits(.*)$/m, "const lpExits$1")
+        .replace("\n  lpExits = Map()\n", "\n");
       if (reverted === src || !/^const lpExits/m.test(reverted)) {
-        throw new Error("the control's anchor moved: no `let lpExits` and its reset in check_if_value.vl");
+        throw new Error(
+          "the control's anchor moved: no `let lpExits` and its reset in check_if_value.vl",
+        );
       }
       Deno.writeTextFileSync(f, reverted);
       const red = await audit(["--check", "--dir", `${dir}/compiler`]);
       if (red.code !== 1 || !red.out.includes("  lpExits check_if_value.vl:")) {
-        throw new Error(`--check on the reverted tree: want exit 1 naming lpExits, got ${red.code}\n${red.out}`);
+        throw new Error(
+          `--check on the reverted tree: want exit 1 naming lpExits, got ${red.code}\n${red.out}`,
+        );
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
@@ -219,13 +268,19 @@ Deno.test({
 });
 
 Deno.test({
-  name: "emitter-state-audit: the let half reads the checker and reds when a checker reset is dropped",
+  name:
+    "emitter-state-audit: the let half reads the checker and reds when a checker reset is dropped",
   ignore: !ENABLED,
   fn: async () => {
     // `initChecker` is the checker's per-program reset; ignoring it must leave its lets uncleared.
     const red = await audit(["--check", "--without-reset", "initChecker"]);
-    if (red.code !== 1 || !red.out.includes("never-cleared module state") || !red.out.includes("  TY_I32 check_types.vl:")) {
-      throw new Error(`--check --without-reset initChecker: want exit 1 naming TY_I32, got ${red.code}\n${red.out}`);
+    if (
+      red.code !== 1 || !red.out.includes("never-cleared module state") ||
+      !red.out.includes("  TY_I32 check_types.vl:")
+    ) {
+      throw new Error(
+        `--check --without-reset initChecker: want exit 1 naming TY_I32, got ${red.code}\n${red.out}`,
+      );
     }
     // A checker `let` whose one clear is in `crReset`, rebuilt in a copy of compiler/ without it.
     const dir = await Deno.makeTempDir({ prefix: "vl-state-audit-let-" });
@@ -233,19 +288,29 @@ Deno.test({
       await Deno.mkdir(`${dir}/compiler`);
       for (const e of Deno.readDirSync(`${ROOT}/compiler`)) {
         if (e.isFile && e.name.endsWith(".vl")) {
-          await Deno.copyFile(`${ROOT}/compiler/${e.name}`, `${dir}/compiler/${e.name}`);
+          await Deno.copyFile(
+            `${ROOT}/compiler/${e.name}`,
+            `${dir}/compiler/${e.name}`,
+          );
         }
       }
       const f = `${dir}/compiler/check_capture_rows.vl`;
       const src = Deno.readTextFileSync(f);
       const dropped = src.replace("\n  crCapLossAny = false\n", "\n");
       if (dropped === src) {
-        throw new Error("the control's anchor moved: no `crCapLossAny = false` reset in check_capture_rows.vl");
+        throw new Error(
+          "the control's anchor moved: no `crCapLossAny = false` reset in check_capture_rows.vl",
+        );
       }
       Deno.writeTextFileSync(f, dropped);
       const cut = await audit(["--check", "--dir", `${dir}/compiler`]);
-      if (cut.code !== 1 || !cut.out.includes("  crCapLossAny check_capture_rows.vl:")) {
-        throw new Error(`--check with crCapLossAny's reset dropped: want exit 1 naming it, got ${cut.code}\n${cut.out}`);
+      if (
+        cut.code !== 1 ||
+        !cut.out.includes("  crCapLossAny check_capture_rows.vl:")
+      ) {
+        throw new Error(
+          `--check with crCapLossAny's reset dropped: want exit 1 naming it, got ${cut.code}\n${cut.out}`,
+        );
       }
     } finally {
       await Deno.remove(dir, { recursive: true });

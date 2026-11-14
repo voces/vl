@@ -131,7 +131,8 @@ export const seedModule = (bytes: Uint8Array): WebAssembly.Module => {
  * results forever.
  *
  * A `path` rung is re-read when its mtime changes; an `exec` rung is loaded once.
- * `checkSkip` arms the module-check skip on every instance (`createWasmChecker`).
+ * `checkSkip` arms the module-check skip on every instance (`createWasmChecker`);
+ * `testUnsupported` is a test harness's opt-in only (`createWasmChecker`).
  */
 export const loadWasmChecker = (
   /**
@@ -144,6 +145,7 @@ export const loadWasmChecker = (
   getStdDir?: () => string | undefined,
   onOrigin?: (origin: SeedOrigin | undefined) => void,
   checkSkip = false,
+  testUnsupported = false,
 ): WasmChecker | undefined => {
   const ladder: SeedSource[] = typeof sources === "string"
     ? [{ kind: "path", label: "seed", path: sources, explicit: true }]
@@ -207,5 +209,6 @@ export const loadWasmChecker = (
     vlRootFor,
     projectRootFor,
     checkSkip,
+    testUnsupported,
   );
 };
