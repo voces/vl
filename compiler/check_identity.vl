@@ -3,6 +3,7 @@
 // after both operands are checked, with literal operands already widened.
 // Does not lower anything; the emitter's arm is separate.
 import { P, STRICT_EQ_CODE } from "./ast"
+import { CODE_UNSUPPORTED_LOWERING } from "./check_messages"
 import { assignable, tErr, tErrPushTok } from "./check_relate_core"
 import { nomBinMixes } from "./check_type_shape"
 import {
@@ -27,8 +28,8 @@ import { nodeLastTok } from "./fmt_util"
 import { isNullTy } from "./tyquery"
 
 // Whether a value of type `ty` has an identity `===` can compare: a record, a list, a map, a
-// function, a nullable of one, or a union whose arms are all records. A type parameter answers
-// true, so the refusal it meets names the missing lowering rather than a missing identity.
+// function, a nullable of one, or a union whose arms are all records or all functions. A type
+// parameter answers true, so an instance's re-check decides it at the concrete type.
 export function tyHasIdentity(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
@@ -40,19 +41,42 @@ export function tyHasIdentity(ty: i32): boolean {
       return tyHasIdentity(t.nInner)
     }
     TyUnion => {
-      let arms = 0
+      // All records (compared by payload) or all functions (by declaration and environment).
+      let recs = 0
+      let fns = 0
       for m in t.uMembers {
         if !isNullTy(m) {
-          if m < 0 || !(tyAt(m) is TyObj) { return false }
-          arms = arms + 1
+          if m >= 0 && tyAt(m) is TyObj { recs = recs + 1 }
+          else if m >= 0 && tyAt(m) is TyFunc { fns = fns + 1 }
+          else { return false }
         }
       }
-      return arms > 0
+      return (recs > 0) != (fns > 0)
     }
     TyPrim | TyErr | TyLit | TyNeg => {
       return false
     }
   }
+}
+
+// Whether `ty`, a nullable peeled, is a union with both record and function arms and no other.
+function tyIsRecordFnMix(ty: i32): boolean {
+  let t = ty
+  if t >= 0 && t < T.tys.length {
+    const n = tyAt(t)
+    if n is TyNullable { t = n.nInner }
+  }
+  if t < 0 || t >= T.tys.length { return false }
+  const u = tyAt(t)
+  if !(u is TyUnion) { return false }
+  let recs = 0
+  let fns = 0
+  for m in u.uMembers {
+    if m >= 0 && tyAt(m) is TyObj { recs = recs + 1 }
+    else if m >= 0 && tyAt(m) is TyFunc { fns = fns + 1 }
+    else if !isNullTy(m) { return false }
+  }
+  recs > 0 && fns > 0
 }
 
 // The operator token of identity compare `ix`: the token after its left operand's last one,
@@ -80,7 +104,7 @@ function identityErr(
 
 // Checks `left op right` (at `ix`) for `op` of `===` or `!==`, over operand types `lt` and `rt`;
 // answers `boolean`. An operand with no identity is refused with the `==` spelling, which
-// `check --fix` writes; operands no value can share are refused as `==` refuses them.
+// `check --fix` writes; operands no value can share answer -1, the caller's to refuse.
 export function checkIdentityBinNode(
   ix: i32,
   leftIx: i32,
@@ -93,6 +117,19 @@ export function checkIdentityBinNode(
   const eqOp = op.slice(0, 2)
   const sides = [lt, rt]
   for s in sides {
+    if s >= 0 && tyIsRecordFnMix(s) {
+      identityErr(
+        "`"
+          + op
+          + "` over a union of records and functions is not supported yet — narrow both to "
+          + "one arm first",
+        ix,
+        leftIx,
+        op,
+        CODE_UNSUPPORTED_LOWERING,
+      )
+      return TY_BOOL
+    }
     if s >= 0 && !isNullTy(s) && !tyHasIdentity(s) {
       identityErr(
         "`"
@@ -115,9 +152,47 @@ export function checkIdentityBinNode(
       nomBinMixes(lt, rt, leftIx, rightIx)
       || !(assignable(lt, rt) || assignable(rt, lt))
     ) {
-      tErr("cannot compare " + tyToStr(lt) + " and " + tyToStr(rt), ix)
-      return TY_BOOL
+      return -1
     }
   }
   TY_BOOL
+}
+
+// Where a value of type `ty` can hold a function, by the ruling's positions: "fn" for a function
+// or a nullable of one, "arm" for a union arm, "field" for a record field, "elem" for a list
+// element; "" when it can hold none. `seen` guards a recursive type.
+export function tyFnPosition(ty: i32, seen: i32[]): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  for sv in seen {
+    if sv == ty { return "" }
+  }
+  seen.push(ty)
+  const t = tyAt(ty)
+  match t {
+    TyFunc => {
+      return "fn"
+    }
+    TyNullable => {
+      return tyFnPosition(t.nInner, seen)
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if tyFnPosition(m, seen) != "" { return "arm" }
+      }
+      return ""
+    }
+    TyObj => {
+      for f in t.objFieldTypes {
+        if tyFnPosition(f, seen) != "" { return "field" }
+      }
+      return ""
+    }
+    TyArray => {
+      if tyFnPosition(t.aElem, seen) != "" { return "elem" }
+      return ""
+    }
+    TyPrim | TyErr | TyLit | TyNeg | TyVar | TyMap => {
+      return ""
+    }
+  }
 }
