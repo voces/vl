@@ -43,6 +43,8 @@ import { inferQuiet, tpEnvNames } from "./check_cursor"
 import { elabCapIsNote, elabCapLive } from "./check_elab_cap"
 import { matchUnknownTypeMsg } from "./check_diag_text"
 import {
+  TT_COVERED,
+  TT_PARTLY,
   adoptJoinArmAt,
   atomReadStamp,
   binOperandsStamp,
@@ -51,6 +53,9 @@ import {
   matchArmTally,
   matchF32Join,
   tpApartJoinOf,
+  tyTestIsMember,
+  tyTestMeet,
+  tyTestMemberFit,
 } from "./check_fit_rules"
 import {
   f32ArmPlainTy,
@@ -107,7 +112,6 @@ import {
   collectThenNarrows,
   isOperandAtStorage,
   letWriteNarrowedStore,
-  markUnionCover,
   matchRestNarrows,
   matchValPatFact,
   operandDeclaredTy,
@@ -718,16 +722,20 @@ function matchTypePatCover(
     )
     return true
   }
+  // The pattern tests what `is` would (`tyTestMeet`): a member, or the members it contains.
+  const meet = tyTestMeet(st, pt)
+  const tested = if meet >= 0 { meet } else { pt }
   // Banks the resolved check type on the pattern node (the `isVarTyIx` row the emitter
   // reads) instead of re-checking, which would duplicate the scrutinee's diagnostics.
   if patIx < isVarTyIxCap {
     while isVarTyIx.length <= patIx { isVarTyIxPush(-1) }
-    isVarTyIxSetAt(patIx, pt)
+    isVarTyIxSetAt(patIx, tested)
   }
   isPatTyIxPut(patIx, pt)
-  elabCapIsNote(patIx, pt, pt)
+  elabCapIsNote(patIx, tested, pt)
   if patIx < nodeTyIx.length { nodeTySet(patIx, TY_BOOL) }
-  const hit = markUnionCover(uMems, covered, pt)
+  const hit = matchPatCover(uMems, covered, pt, meet >= 0)
+  if hit == 2 { return false }
   if hit == 0 && matchFlowStore >= 0 && tyMembersMeet(matchFlowStore, pt) {
     recordDeadTest(
       patIx,
@@ -751,6 +759,34 @@ function matchTypePatCover(
   const twin = mapTwinTestMsg(uMems, pt, "a `match` arm")
   if twin != "" { tErr(twin, patIx) }
   false
+}
+
+// Marks the members `uMems` that arm pattern type `pt` covers (`tyTestMemberFit`) in the
+// parallel `covered` flags: those it is, the type parameter it names, or, with `meet`, those it
+// contains. 1 when it covered a new member, -1 when all it covers already are, 2 when it covers
+// none but a type parameter member may be it, 0 when it can match no member.
+function matchPatCover(
+  uMems: i32[],
+  covered: i32[],
+  pt: i32,
+  meet: boolean,
+): i32 {
+  let found = 0
+  let fresh = 0
+  let open = false
+  let j = 0
+  while j < uMems.length {
+    const f = tyTestMemberFit(uMems[j], pt)
+    if f == TT_COVERED && (meet || tyTestIsMember(uMems[j], pt)) {
+      found = found + 1
+      if covered[j] == 0 { fresh = fresh + 1 }
+      covered[j] = 1
+    }
+    open = open || f == TT_PARTLY && tyAt(uMems[j]) is TyVar
+    j = j + 1
+  }
+  if found == 0 { return if open { 2 } else { 0 } }
+  if fresh == 0 { -1 } else { 1 }
 }
 
 // The index in `uMems` of the literal member value pattern `patIx` names: a string or integer
