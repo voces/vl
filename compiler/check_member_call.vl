@@ -240,10 +240,12 @@ import {
   tyEq,
   tyFieldTyOf,
   tyHasHole,
+  tyHasInferHole,
   tyIsNonIndexableScalar,
   tyIsPrimNamed,
   tyIxIsView,
   tyMayHoldFn,
+  tyMentionsTyVarNamed,
   tyMutEpoch,
   tyRefusesArrayDemand,
   tyRefusesArrayWrite,
@@ -256,7 +258,7 @@ import {
   fnDeclIx,
   fnDeclParamsOf,
 } from "./check_write_scan"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import { memberDeclOf, memberDeclSet, methodFnOfDecl } from "./symbols"
 import {
   arrElemValueTy,
@@ -312,6 +314,8 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
     why = "the receiver is not a parameter of the function the call sits in"
   }
   const argc = n.callArgs.length
+  const argTys: i32[] = []
+  for a in n.callArgs { argTys.push(checkNodeHook(a)) }
   for c in ovSetCands[row] {
     if why == "" && declFirstParamIsSelf(c) {
       const fty = moduleNameTyOf(c)
@@ -325,16 +329,15 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
           const req = fnRequiredArity(fnDeclParamsOf(c))
           if argc + 1 > ft.fnParamTypes.length || argc + 1 < req {
             why = "the candidates take different numbers of arguments"
-          } else if (
-            ft.fnRet < 0
-            || tyHasHole(ft.fnRet)
-            || tyHasTyVar(ft.fnRet)
-          ) {
-            why = "a candidate's return type depends on its receiver"
-          } else if ret >= 0 && !tyEq(ret, ft.fnRet) {
-            why = "the candidates return different types"
           } else {
-            ret = ft.fnRet
+            const r = ovArgBoundRet(c, ft, argTys)
+            if r < 0 {
+              why = "a candidate's return type depends on its receiver"
+            } else if ret >= 0 && !tyEq(ret, r) {
+              why = "the candidates return different types"
+            } else {
+              ret = r
+            }
           }
         }
       }
@@ -354,10 +357,38 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
     )
     return TY_ERR
   }
-  for a in n.callArgs { checkNodeHook(a) }
   noteUfcsCstr(recvTy, prop, ix, -1)
   if !i32ListHas(ovHoleSites, ix) { ovHoleSitesPush(ix) }
   ret
+}
+
+// The return type of candidate `c`, of type `ft`, with its type parameters bound from the
+// explicit arguments' types `argTys`; -1 when the return is open or one of its type parameters is
+// left to the receiver, unbound by an argument or named by `self`.
+function ovArgBoundRet(c: string, ft: TyFunc, argTys: i32[]): i32 {
+  if ft.fnRet < 0 || tyHasInferHole(ft.fnRet, 0) { return -1 }
+  if !tyHasTyVar(ft.fnRet) { return ft.fnRet }
+  const d = fnDeclIx[c] ?? -1
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) { return -1 }
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  let i = 0
+  while i < argTys.length && i + 1 < ft.fnParamTypes.length {
+    bindGenWalk(ft.fnParamTypes[i + 1], argTys[i], bNames, bTys)
+    i = i + 1
+  }
+  for tp in dn.fnTyParams {
+    if tyMentionsTyVarNamed(ft.fnRet, tp, 8) {
+      if (
+        !strListHas(bNames, tp)
+        || tyMentionsTyVarNamed(ft.fnParamTypes[0], tp, 8)
+      ) {
+        return -1
+      }
+    }
+  }
+  substTyDeep(ft.fnRet, bNames, bTys)
 }
 
 // The receiver's argument-seam verdict at `self`: the dispatch gate asked bare `assignable`,
