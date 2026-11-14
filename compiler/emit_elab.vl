@@ -106,6 +106,8 @@ import {
   recBuildCount,
   recBuildTable,
   recBuildTyIn,
+  recParamRowOf,
+  recRowFnNote,
   recKeptFnDecl,
   recKeptFnDstOf,
 } from "./check_rec_rows"
@@ -153,6 +155,7 @@ import {
   cwKeyOfRoot,
   cwLetUnwritten,
   cwLetWrittenInClosure,
+  cwUfcsDeclOf,
   cwMethodCalls,
   cwOccNext,
   cwOccWalk,
@@ -3397,6 +3400,7 @@ function elabOneAt(k: i32) {
     c = c + 1
   }
   for oc in elabCbOpenCalls[decl] ?? [] { elabCbAtBuild(oc, k) }
+  for rc in elabRowOpenCalls[decl] ?? [] { elabRowParamAt(rc, k) }
   let b = 0
   while b < elabCbD.length {
     if tysClosed(elabCbT[b]) {
@@ -10353,6 +10357,8 @@ export function elabRun() {
   const annDelivs: i32[] = []
   elabCalls = []
   elabCbOpenCalls = Map()
+  elabRowOpenCalls = Map()
+  elabRowsSeen = Map()
   mintLamsClosedReset()
   elabResultScanReset()
   while g < P.nodes.length {
@@ -10472,6 +10478,7 @@ export function elabRun() {
   for c in elabCalls {
     elabSameSlotsAtBuild(c)
     elabCbAtBuild(c, -1)
+    elabRowParamAt(c, -1)
   }
   // A generic named as a list method's callback, at the element, unless it is at a build.
   let cb = 0
@@ -15864,6 +15871,84 @@ function elabCallbackParamAt(m: string): i32 {
 // are stored at a record other than its element type, is instanced with its parameter delivered
 // at that record, the `#r.0` entry of its key: a lambda, or a hole function it names (D16134). A
 // lambda an open declaration encloses is noted for that declaration's instances instead.
+// A call at `c` under instance `from` handing a declared record parameter a wider row than its
+// record (`recParamRowOf`) instances the callee at that row, the `#r.<i>` entry of its key; a call an
+// open declaration encloses is keyed under that declaration's instances (L3). This is the one
+// producer of a parameter's row; the check's width rewrite (D3992) is retired behind it.
+function elabRowParamAt(c: i32, from: i32) {
+  const cn = nodeAt(c)
+  if !(cn is Call) || cn.callFn < 0 { return 0 }
+  const cf = parenPeelIx(cn.callFn)
+  const fs = elabCalleeFns(cn)
+  const uf = if fs.length == 0 { cwUfcsDeclOf(cf) } else { -1 }
+  const fd = if fs.length == 1 { fs[0] } else { uf }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) { return 0 }
+  const args: i32[] = []
+  const cm = nodeAt(cf)
+  if uf >= 0 && cm is Member { args.push(cm.memObj) }
+  for a in cn.callArgs { args.push(a) }
+  const e = elabEncl[c] ?? recEnclosingFn(c)
+  if from < 0 && e >= 0 && declOpen(e) {
+    const cs = elabRowOpenCalls[e] ?? []
+    if !i32ListHas(cs, c) { cs.push(c) }
+    elabRowOpenCalls[e] = cs
+    return 0
+  }
+  const names: string[] = []
+  const tys: i32[] = []
+  let i = 0
+  while i < args.length {
+    const at0 = if from >= 0 { elabNodeTy(args[i], from) } else { -1 }
+    const at = if at0 >= 0 { at0 } else { nodeTyIxOf(args[i]) }
+    const row = recParamRowOf(fd, i, at)
+    if row >= 0 {
+      if !elabRowCapOk(fd, i, row, c) { return 0 }
+      names.push("#r." + i32ToStr(i))
+      tys.push(row)
+    }
+    i = i + 1
+  }
+  if names.length == 0 { return 0 }
+  recRowFnNote(fd)
+  elabReachNote(from, elabEnqueue(fd, names, tys, from), c)
+  0
+}
+
+// The calls `elabRowParamAt` defers to each instance of their open enclosing declaration.
+let elabRowOpenCalls: {[i32]: i32[]} = Map()
+// "decl|param" → the distinct rows `elabRowParamAt` instanced it at.
+let elabRowsSeen: {[string]: string[]} = Map()
+
+// The most rows one record-typed parameter is specialised at: four times the corpus's most.
+const ELAB_ROW_CAP = 16
+
+// Whether parameter `i` of `fd` may take `row` as one more specialised row, refusing call `c` loudly
+// at the one past the cap.
+function elabRowCapOk(fd: i32, i: i32, row: i32, c: i32): boolean {
+  const key = i32ToStr(fd) + "|" + i32ToStr(i)
+  const rs = elabRowsSeen[key] ?? []
+  const r = elabCanonStr(row, 8)
+  if strListHas(rs, r) { return true }
+  if rs.length >= ELAB_ROW_CAP {
+    elabErrorNote({
+      tmsg: "a record-typed parameter is specialised at most "
+        + i32ToStr(ELAB_ROW_CAP)
+        + " concrete rows, and this call hands it another: annotate the argument with the parameter's record type",
+      tat: c,
+      tline: 0,
+      tcol: 0,
+      tendTok: -1,
+      tcode: "",
+      tdata: "",
+    })
+    return false
+  }
+  rs.push(r)
+  elabRowsSeen[key] = rs
+  true
+}
+
 function elabCbAtBuild(c: i32, from: i32) {
   const cn = nodeAt(c)
   if !(cn is Call) || cn.callFn < 0 || cn.callArgs.length != 1 { return 0 }
