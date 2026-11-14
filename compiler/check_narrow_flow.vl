@@ -7,10 +7,12 @@ import { objSigSame } from "./check_union_arm_msgs"
 
 import { decDigitsOf } from "./strutil"
 import { parenPeelIx } from "./check_places"
+import { cwLetWritesStraight, letReadFnOf } from "./check_write_scan"
 import {
   declareSlot,
   fnWriteAliasNote,
   fnWriteAliasOf,
+  fnWriteStoreOf,
   identDepthOf,
   identFnAliasOf,
   identFnDeclOf,
@@ -21,7 +23,6 @@ import {
   BinExpr,
   fnNameIsLambda,
   AsExpr,
-  BinExpr,
   Block,
   BoolLit,
   BreakStmt,
@@ -455,7 +456,6 @@ import {
 import {
   elabCapLive,
   elabCapNarrowNote,
-  elabFnJoinTy,
   elabFnLetMembers,
   elabFnWriteTy,
 } from "./check_elab_cap"
@@ -654,13 +654,12 @@ import {
 // `i32 | f64`, not `f64`, which is how the value is stored (D2627). Otherwise `joinTys`.
 function narJoinTys(a: i32, b: i32): i32 {
   if a < 0 || b < 0 { return joinTys(a, b) }
-  // Two function values written apart join to a type naming neither write: the read may hold either.
+  // Two function values written apart join to the binding's storage: the read may hold either.
   const fa = fnWriteAliasOf(a)
   const fb = fnWriteAliasOf(b)
   if fa != fb && (fa >= 0 || fb >= 0) {
-    const j = elabFnJoinTy(joinTys(a, b), a, b)
-    if fnWriteAliasOf(j) < 0 { return j }
-    return elabFnJoinTy(j, b, a)
+    const st = if fa >= 0 { fnWriteStoreOf(a) } else { fnWriteStoreOf(b) }
+    if st >= 0 { return st }
   }
   if numericVariantUncovered(a, b) || numericVariantUncovered(b, a) {
     return joinVariantTys(a, b)
@@ -2638,13 +2637,23 @@ export function letFnWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
   const d = nodeAt(s)
   if !(d is LetDecl) || d.letKw != "let" { return false }
   if !(tyAt(dcl) is TyFunc) || !(tyAt(m) is TyFunc) { return false }
-  // Each function written is a declaration a read can name; a lambda is not one.
+  // Each function written is a declared generic a read can name, and each write is a statement
+  // of the declaring block: a branch, a loop or a capture keeps the binding's whole set.
   const ms = elabFnLetMembers(s)
   for f in ms {
     const fn = nodeAt(f)
-    if !(fn is FuncDecl) || fnNameIsLambda(fn.fnName) { return false }
+    if !(fn is FuncDecl) || fnNameIsLambda(fn.fnName) || fn.fnTyParams.length == 0 {
+      return false
+    }
   }
-  ms.length >= 2
+  ms.length >= 2 && cwLetWritesStraight(s)
+}
+
+// Whether the `Ident` `r` reads a `let` binding, whose writes a declaration-level alias ignores.
+function identReadsLet(r: i32): boolean {
+  const d = identDeclOf(r)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  dn is LetDecl && dn.letKw == "let"
 }
 
 // Narrows the reads of function `let` slot `s` after a write of `rhs`, a value of type `m`, to `m`
@@ -2653,8 +2662,11 @@ export function letFnWriteRow(s: i32, dcl: i32, rhs: i32, m: i32) {
   if !letFnWriteNarrows(s, dcl, m) { return 0 }
   const r = parenPeelIx(rhs)
   if r < 0 || !(nodeAt(r) is Ident) { return 0 }
+  // A name of a declared function, or a read of a binding: what that read holds, never the
+  // function the binding was declared with.
   let fd = identFnDeclOf(r)
-  if fd < 0 { fd = identFnAliasOf(r) }
+  if fd < 0 { fd = letReadFnOf(r) }
+  if fd < 0 && !identReadsLet(r) { fd = identFnAliasOf(r) }
   if fd < 0 { return 0 }
   const wt = elabFnWriteTy(m, fd, r)
   // A write under a branch or loop ends the function an outer row names: past that statement the
@@ -2667,7 +2679,7 @@ export function letFnWriteRow(s: i32, dcl: i32, rhs: i32, m: i32) {
   }
   noteNarShadow(s, NAR_KIND_ASG)
   narLayerNote(s, T.frames.length - 1, wt)
-  fnWriteAliasNote(wt, fd)
+  fnWriteAliasNote(wt, fd, dcl)
 }
 
 // The type a bare name reads at after an accepted write retired its narrowing: the sole member
