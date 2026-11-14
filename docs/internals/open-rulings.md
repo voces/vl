@@ -1929,3 +1929,8 @@ representation" rather than an ad-hoc refusal.
 as the documented workaround (`vl-test-design.md:166`, filed as a follow-up at `ROADMAP.md:746`).
 Void-return covariance retires both, without disturbing the assignment-is-an-expression rule that
 produces the `i32`.
+
+- **D14803, an argument only a union of type parameters admits.** RULED (owner) 2026-11-14: it
+  binds every candidate parameter to the argument's type (`F(5)` against `F<A, B>(v: A | B)` reads
+  as `F<i32, i32>(5)`), not refused as ambiguous. DECISIONS "A parameter a call leaves open is
+  `never`…" carries it.
