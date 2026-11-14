@@ -674,6 +674,32 @@ Deno.test({
   }
 });
 
+// A covering test's dead arm reads its operand as `never` (D16006), and hover says so.
+const DEAD_ARM_SRC = "function take(p: i32) {\n" +
+  "  if p is i32 {\n" +
+  "    print(p + 1)\n" +
+  "  } else {\n" +
+  "    print(p)\n" +
+  "  }\n" +
+  "}\n" +
+  "take(4)\n";
+
+Deno.test({
+  name: "wasm-symbols: hover in a covering test's dead arm shows never",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // Line 4 `    print(p)` — the `p` at col 10 sits in the `else` that `p is i32` leaves dead.
+  const dead = await checker.hoverTypeAt(DEAD_ARM_SRC, "/tmp/x.vl", noSiblings, 4, 10);
+  if (dead !== "never") {
+    throw new Error(`want never in the dead arm, got ${JSON.stringify(dead)}`);
+  }
+  const live = await checker.hoverTypeAt(DEAD_ARM_SRC, "/tmp/x.vl", noSiblings, 2, 10);
+  if (live !== "i32") {
+    throw new Error(`want i32 in the live arm, got ${JSON.stringify(live)}`);
+  }
+});
+
 // A binding's hover type is FLOW-SENSITIVE: inside `if r is string { … }` the very
 // same `r` is a `string`, and `symBindType` (one slot per binding, last write wins)
 // cannot hold that as well as the declared union. The checker's own narrowed type is

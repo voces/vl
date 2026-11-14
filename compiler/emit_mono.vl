@@ -10250,6 +10250,9 @@ function monoInstanceFor(
   const fn = nodeAt(monoOrigNode[origFe])
   if fn is FuncDecl {
     const params = fn.fnParams
+    // A pin list shorter than the parameters builds no instance. One caller relies on it:
+    // `monoCoerceFnValueTys` delivering a generic value nothing calls at a destination whose
+    // function type names no parameters (D16074).
     if params.length != pinnedNames.length { return 0 }
     // No argument node on this path: the pins are the parameter types of the function type the
     // checker recorded for the value, else the destination's, else the delivery's (D2755).
@@ -10646,12 +10649,29 @@ function monoMakerTwin(
   ) {
     return 0
   }
+  // A maker's annotated parameters are its pins when it returns a hole lambda: each twin takes
+  // the arguments its calls pass. A maker with parameters returning no hole lambda builds no
+  // twin and keeps its set's closure, as its annotated spelling does (D3975).
+  const pins: string[] = []
+  const pts: i32[] = []
+  const mfn = nodeAt(monoOrigNode[fe])
+  const holeRet = monoRetsReachHoleLam(monoOrigNode[fe], [])
+  if mfn is FuncDecl && mfn.fnParams.length > 0 && !holeRet { return 0 }
+  if mfn is FuncDecl && holeRet {
+    for p in mfn.fnParams {
+      const pn = nodeAt(p)
+      const pt = if pn is Param && pn.parType >= 0 { nodeTyIxOf(pn.parType) } else { -1 }
+      const ps = if pt >= 0 { monoPinOfClosedTy(pt) } else { "" }
+      if ps == "" { return 0 }
+      pins.push(ps)
+      pts.push(pt)
+    }
+  }
   monoInstRetWidenKey = tyToStr(ret)
   monoInstRetWidenTy = ret
   // A maker capturing its encloser's locals is this frame's instance, as a call is.
   monoCallFrameSlot = monoNestedCallFrame(fe, ctx)
-  const none: string[] = []
-  const r = monoInstanceFor(fe, none, at, mkFuncTy([], ret), delTys, [])
+  const r = monoInstanceFor(fe, pins, at, mkFuncTy(pts, ret), delTys, pts)
   monoCallFrameSlot = -1
   monoInstRetWidenTy = 0 - 1
   r
@@ -23198,6 +23218,18 @@ function monoDeliverCallRets(at: i32, fd: i32, annTy: i32): i32 {
   const prev = monoRetDeliveredAt[fd] ?? -1
   // The same function type can sit at two indices, so a second delivery is compared as a type.
   if prev >= 0 && (prev == at2 || tySame(prev, at2)) { return 0 }
+  // A maker the elaboration twins at this type returns a fresh closure from that twin, which its
+  // call builds (`monoMakerTwin`), so a second type is the twin's own delivery (D12234).
+  const dfe = fnStmtsPosOf(fd)
+  if (
+    prev >= 0
+    && monoIsMakerFe(dfe)
+    && elabMakerOpen(fd)
+    && elabMakerTwinHeld(fd, at2)
+    && elabMakerTwinHeld(fd, prev)
+  ) {
+    return 0
+  }
   if prev >= 0 {
     return emitFailAt(
       "emitProgram: `"
