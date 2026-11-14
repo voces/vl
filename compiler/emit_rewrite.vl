@@ -1839,6 +1839,12 @@ function drwWalk(ix: i32, ctx: i32) {
   if ix < 0 { return ix }
   const atStmt = drwAtStmt
   drwAtStmt = false
+  if !atStmt && drwCompoundValueRunsTwice(ix, ctx) {
+    emitFail(
+      "emitProgram: a compound write (`++p`, `p++`, `p op= v`) used as a value reads and writes a place whose receiver or index has an effect, which would run twice; write it as its own statement",
+    )
+    return ix
+  }
   const n = nodeAt(ix)
   match n {
     Call => {
@@ -2688,10 +2694,29 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
   -1
 }
 
+// Whether `ix`, a compound write or a postfix one over it, targets a place whose receiver or
+// index is not re-readable: as a value it is not spilled, so the place would run twice (D16217).
+function drwCompoundValueRunsTwice(ix: i32, ctx: i32): boolean {
+  const w = nodeAt(ix)
+  const a0 = if w is Unary && (w.unOp == "p+" || w.unOp == "p-") { w.unArg } else { ix }
+  const a = nodeAt(a0)
+  if !(a is BinExpr) || a.binCompound == "" || a.binOp != "=" { return false }
+  const t = unwrapParen(a.binLeft)
+  const tn = if t >= 0 { nodeAt(t) } else { null }
+  if tn is Index {
+    return !cpReReadable(tn.idxArr, ctx) || !cpReReadable(tn.idxIndex, ctx)
+  }
+  if tn is Member { return !cpReReadable(tn.memObj, ctx) }
+  false
+}
+
 // A compound write `p op= v` (or `++p`) reads its place through the same target node it
 // writes, so a receiver or index that is not re-readable would run twice. Spills each such
 // operand once, receiver first, onto `out` and points the target at the spill; true if any.
-function spillCompoundPlace(asgIx: i32, out: i32[], ctx: i32): boolean {
+function spillCompoundPlace(asgIx0: i32, out: i32[], ctx: i32): boolean {
+  // A postfix `p++` is its compound write under the wrapper that yields the old value.
+  const w = nodeAt(asgIx0)
+  const asgIx = if w is Unary && (w.unOp == "p+" || w.unOp == "p-") { w.unArg } else { asgIx0 }
   const a = nodeAt(asgIx)
   if a is BinExpr {
     if a.binCompound == "" || a.binOp != "=" { return false }
