@@ -35,3 +35,8 @@ code 13). `rtOfUnion` refused a union holding `i8[]`, `u16[]` or `i16[]`.
 - `scripts/capability-probes/matrix/packed-list-union-arm-{u8,i8,u16,i16}.matrix.vl`: one
   template per width, covering `is`, the narrowed read, `==`, `as!`, `??` through the nullable
   niche, a second width, a map, closure and struct arm, and an empty `[]`.
+  On the refreshed seed, each width runs 80 of its 82 cells. The other two are `return_inferred`
+  in both faces: the checker's union-return refusal, which `u8` gets as well.
+- Byte-identity: a program with no non-`u8` packed union arm never registers a twin, so
+  `pkCodeBase()` is 13 or 14 exactly where the old `atomListCode()` was. The `sweep` run on this
+  PR is the proof.
