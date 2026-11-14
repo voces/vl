@@ -1939,3 +1939,9 @@ produces the `i32`.
 - **D16006(a), the dead arm of a covering test.** RULED (owner) 2026-11-14: the dead arm narrows
   its operand to `never`, a true bottom (uses allowed), and the arm gets a warning; any-use-is-an-
   error was not taken. DECISIONS "A dead arm narrows its operand to `never`…" carries it.
+
+
+- **D16047, an element type nothing writes.** RULED (owner) 2026-11-14 (a1): a collection whose
+  element no write fixes satisfies every `is T[]`; a write through a narrowing pins the element like
+  any write (two element types join). Read-only narrowing (a2) and first-test settling (c) were not
+  taken. DECISIONS "A collection whose element nothing writes fits every `is T[]`…" carries it.
