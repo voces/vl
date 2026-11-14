@@ -35,4 +35,7 @@ operator, by the instance's re-check.
     instantiated at `i32`, where its body applies `===`". The precise anchor is filed as D16110.
 - **Regression:** the nine `identity-eq-*` position matrices run 66 of 66, and the identity cases
   pass.
-- **Sweep.** SWEEP.
+- **Sweep** (fixpoint seeds on both sides, against master `7104a7b0e`): 24,376 programs.
+  - 0 `runs → not-runs`, 0 bytes-only movers, 0 new traps.
+  - 2 output movers, both the message moving to the call: the new refusal case, and D16110's
+    witness.
