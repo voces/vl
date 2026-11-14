@@ -4600,7 +4600,7 @@ function isTestValuePrimName(ity: i32) {
       return "string"
     }
     // Not a value primitive a niche member can be confused with, or not a primitive at all.
-    "void" | "null" | "never" | "u8" | "v128" | null => {}
+    "void" | "null" | "never" | "u8" | "i8" | "u16" | "i16" | "v128" | null => {}
   }
   ""
 }
@@ -8036,16 +8036,27 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
       fbEnd()
       return 0
     }
+    // A function-value leaf: `F | null` is the closure fat pointer's own nullable ref.
+    if oKind == "closure" || oKind == "nulclosure" {
+      if emitOptChainIsNull(body, exprIx, fnIx) < 0 { return -1 }
+      fbIfRefNul(cloStructIdx, true)
+      fbRefNull(cloStructIdx)
+      fbElse()
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
+      fbStructGet(sHeapIdx[osi], ofi)
+      fbEnd()
+      return 0
+    }
     // The leaf reps this arm can build, in the order the arms below take them: a nullable
-    // REF (a list, a map, a nested struct, a string), the scalar box (i32/boolean/f64/i64/f32),
-    // and the value-union box. A closure leaf reaches neither and is named as such.
+    // REF (a list, a map, a function value, a nested struct, a string), the scalar box
+    // (i32/boolean/f64/i64/f32), and the value-union box. Any other leaf is named as such.
     if (
       !optChainLeafBoxable(oKind)
       && fieldRowNumKind(oRow) < 0
       && oRefHeap < 0
     ) {
       return emitFailAt(
-        "emitProgram: a standalone `?.` has no rep for a closure leaf field — read it through a `!= null` guard",
+        "emitProgram: a standalone `?.` has no rep for this leaf field — read it through a `!= null` guard",
         exprIx,
       )
     }
@@ -40846,6 +40857,13 @@ function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   ifIx
 }
 
+// Whether `ty` is a function type with `null`: `F | null`.
+function tyIsNullableFn(ty: i32): boolean {
+  if ty < 0 || !tyBearsNull(ty) { return false }
+  const nn = nonNullTy(ty)
+  nn >= 0 && tyAt(nn) is TyFunc
+}
+
 // `if true { l } else { d }` for an instance's `l ?? d` whose operand it typed without `null` at
 // a type the `??`'s join widens, so the dead default still shapes the join the arms deliver
 // into; -1 when the operand bears `null`, matches the join, or either type is a hole.
@@ -41906,8 +41924,9 @@ function emitCoalesceOptNulRecord(
     fieldRowIsStr(nfRow, false),
   )
   if nfLeaf == null {
-    return emitFail(
+    return emitFailAt(
       "emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep",
+      exprIx,
     )
   }
   if emitOptRecvBase(body, lhs.omObj, fnIx, false) < 0 { return -1 }
@@ -42238,6 +42257,14 @@ function emitCoalesceNullableRefs(
   // A record union's shared `scalar | null` field reads as its box (D13280).
   const fk = coalBoxFieldScalarKind(lhsIx, fnIx)
   if fk >= 0 { return emitCoalesceBoxFieldScalar(body, e, exprIx, fk, fnIx) }
+  // A re-readable nullable closure, a captured list's element among them, is its null test.
+  if (
+    lhsIx >= 0
+    && exprReReadable(lhsIx)
+    && tyIsNullableFn(nodeTyAt(lhsIx, fnIx))
+  ) {
+    return emitExpr(body, coalNullTestIf(e, exprIx, fnIx), fnIx)
+  }
   emitFail(
     "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
   )

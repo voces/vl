@@ -65,11 +65,14 @@ async function docsOf(dir: string): Promise<string[]> {
       if (e.isFile && /^D\d.*\.md$/.test(e.name)) rows.push(`${dir}/${e.name}`);
     }
   } catch {
-    throw new Error(`${dir}: not readable — the inventory directory must exist`);
+    throw new Error(
+      `${dir}: not readable — the inventory directory must exist`,
+    );
   }
   if (rows.length > 0) {
     return rows.sort((a, b) =>
-      Number(a.match(/D(\d+)/)![1]) - Number(b.match(/D(\d+)/)![1]) || a.localeCompare(b)
+      Number(a.match(/D(\d+)/)![1]) - Number(b.match(/D(\d+)/)![1]) ||
+      a.localeCompare(b)
     );
   }
   const readme = await Deno.readTextFile(`${dir}/README.md`);
@@ -94,7 +97,8 @@ async function docsOf(dir: string): Promise<string[]> {
 // headings and fail on any `SEC` misses, so the next id shape nobody anticipated reds
 // instead of vanishing. A parser that silently drops what it does not recognise cannot be
 // checked by reading its output.
-const SEC = /^#{2,4}\s+(D\d+(?:-?[A-Za-z][A-Za-z0-9]*)?|[A-Z]\d+)\s+[—-]\s+(.*)$/;
+const SEC =
+  /^#{2,4}\s+(D\d+(?:-?[A-Za-z][A-Za-z0-9]*)?|[A-Z]\d+)\s+[—-]\s+(.*)$/;
 const ROWHEAD = /^#{2,4}\s+D\d/;
 // ANY heading, row or not — a row's scope must END at one. `SEC` alone only closes a row at
 // the NEXT ROW, so the last row of a doc absorbed everything after it, including the whole
@@ -122,9 +126,13 @@ function vocabulary(src: string): string[] {
         `moved, and this test reads it from there so the two cannot drift. Update the parse.`,
     );
   }
-  const phrases = [...block.split("\n]")[0].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  const phrases = [...block.split("\n]")[0].matchAll(/"([^"]+)"/g)].map((m) =>
+    m[1]
+  );
   if (phrases.length === 0) {
-    throw new Error(`${CHECKER}: parsed \`DECLARED_NEEDLE\` but found no phrases in it`);
+    throw new Error(
+      `${CHECKER}: parsed \`DECLARED_NEEDLE\` but found no phrases in it`,
+    );
   }
   return phrases;
 }
@@ -153,7 +161,11 @@ function blockFollows(lines: string[], at: number): boolean {
     !/^#{2,4}\s/.test(lines[j]);
     n++
   ) j++;
-  for (; j < lines.length && (lines[j].startsWith("    ") || lines[j].trim() === ""); j++) {
+  for (
+    ;
+    j < lines.length && (lines[j].startsWith("    ") || lines[j].trim() === "");
+    j++
+  ) {
     if (lines[j].trim() !== "") return true;
   }
   return false;
@@ -272,9 +284,13 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
       text.split("\n").forEach((ln, n) => {
         if (ROWHEAD.test(ln) && !SEC.test(ln)) {
           bad.push(
-            `${doc}:${n + 1}  — row heading this parser did NOT recognise, so the row is ` +
+            `${doc}:${
+              n + 1
+            }  — row heading this parser did NOT recognise, so the row is ` +
               `in no check above\n      want: \`SEC\` to match every \`### D…\` heading\n` +
-              `      got:  ${JSON.stringify(ln.trim().slice(0, 90))}. Widen \`SEC\`'s id ` +
+              `      got:  ${
+                JSON.stringify(ln.trim().slice(0, 90))
+              }. Widen \`SEC\`'s id ` +
               `pattern to admit the suffix (and \`scripts/lib/inventory.vl\`'s), or ` +
               `rename the row.`,
           );
@@ -294,7 +310,9 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
         if (!phrases.some((p) => status.includes(p))) {
           bad.push(
             `${doc}:${r.line}  ${r.id} — status line names no known outcome\n` +
-              `      want: a status containing one of [${phrases.join(", ")}]\n` +
+              `      want: a status containing one of [${
+                phrases.join(", ")
+              }]\n` +
               `      got:  ${r.status ?? "(no **bold** status line at all)"}`,
           );
         }
@@ -368,7 +386,9 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
 
   if (total === 0) {
     throw new Error(
-      `parsed 0 rows from ${DIRS.join(", ")} — the heading shape moved and this test ` +
+      `parsed 0 rows from ${
+        DIRS.join(", ")
+      } — the heading shape moved and this test ` +
         `would now pass vacuously. want: > 0 rows, got: 0`,
     );
   }
@@ -391,15 +411,35 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
 // no files planted, no compiler.
 const SHAPE_SPECIMENS: Array<[string, boolean, string]> = [
   ["a plain VL witness", true, "Repro:\n\n    print(6 * 7)\n"],
-  ["prose alone", false, "  1. **Why.** `i32[]`,\n     `boolean[]` share one kind, and\n"],
-  ["prose ABOVE a real block", true, "  1. **Why.** `i32[]`,\n     `boolean[]` share it\n" +
-    "\nRepro:\n\n    print(6 * 7)\n"],
-  ["a `// directive` first line", true, "Repro:\n\n    // @hint x\n    print(1)\n"],
+  [
+    "prose alone",
+    false,
+    "  1. **Why.** `i32[]`,\n     `boolean[]` share one kind, and\n",
+  ],
+  [
+    "prose ABOVE a real block",
+    true,
+    "  1. **Why.** `i32[]`,\n     `boolean[]` share it\n" +
+    "\nRepro:\n\n    print(6 * 7)\n",
+  ],
+  [
+    "a `// directive` first line",
+    true,
+    "Repro:\n\n    // @hint x\n    print(1)\n",
+  ],
   // THE RETIRED FALLBACK, pinned: a perfectly good program with no label is not a witness.
   ["an unlabelled program block", false, "\n    print(6 * 7)\n"],
   // ... and the label alone is not one either, which is what makes the rule about the BLOCK.
-  ["a `Repro:` label with no block", false, "Repro (prints 42):\n\nand then prose.\n"],
-  ["a parenthesised lead-in", true, "Repro (now runs, printing `42`):\n\n    print(6 * 7)\n"],
+  [
+    "a `Repro:` label with no block",
+    false,
+    "Repro (prints 42):\n\nand then prose.\n",
+  ],
+  [
+    "a parenthesised lead-in",
+    true,
+    "Repro (now runs, printing `42`):\n\n    print(6 * 7)\n",
+  ],
 ];
 
 // THE `Want:` RULE, SEEN TO FIRE. (specimen, hasWant predicted, wantLabels predicted).
@@ -424,7 +464,9 @@ const LS = "scripts/inventory/ls.vl";
 function settledWords(src: string): string[] {
   const m = /const SETTLED_WORDS = \[([^\]]*)\]/.exec(src);
   if (m === null) {
-    throw new Error(`${LS}: no \`const SETTLED_WORDS = [\` list found — update this parse`);
+    throw new Error(
+      `${LS}: no \`const SETTLED_WORDS = [\` list found — update this parse`,
+    );
   }
   return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
 }
@@ -432,7 +474,9 @@ function settledWords(src: string): string[] {
 /** Whether a status's first clause (up to ` · `) names a settled word, as `rowSettled` reads. */
 function firstClauseSettled(status: string, words: string[]): boolean {
   const low = status.toLowerCase().split(" · ")[0];
-  return words.some((w) => new RegExp(`(^|[^a-z0-9_-])${w}($|[^a-z0-9_-])`).test(low));
+  return words.some((w) =>
+    new RegExp(`(^|[^a-z0-9_-])${w}($|[^a-z0-9_-])`).test(low)
+  );
 }
 
 Deno.test("a row titled `[CLOSED …]` has a status line `ls.vl` counts as settled", async () => {
@@ -445,7 +489,9 @@ Deno.test("a row titled `[CLOSED …]` has a status line `ls.vl` counts as settl
         if (!firstClauseSettled(r.status ?? "", words)) {
           bad.push(
             `${doc}:${r.line}  ${r.id} — titled closed, but \`ls.vl --status open\` lists it\n` +
-              `      want: the status line's first clause to say ${words.join(" / ")} ` +
+              `      want: the status line's first clause to say ${
+                words.join(" / ")
+              } ` +
               `(prefix \`closed <date> · \`)\n` +
               `      got:  ${(r.status ?? "(no status line)").slice(0, 120)}`,
           );
@@ -453,13 +499,100 @@ Deno.test("a row titled `[CLOSED …]` has a status line `ls.vl` counts as settl
       }
     }
   }
-  if (bad.length > 0) throw new Error(`${bad.length} closed row(s) list as open:\n${bad.join("\n")}`);
+  if (bad.length > 0) {
+    throw new Error(
+      `${bad.length} closed row(s) list as open:\n${bad.join("\n")}`,
+    );
+  }
+});
+
+/** Whether a status's first clause reads open while a later ` · ` clause starts with a settled word. */
+function laterClauseSettles(status: string, words: string[]): boolean {
+  if (firstClauseSettled(status, words)) return false;
+  return status.toLowerCase().split(" · ").slice(1).some((c) =>
+    words.some((w) => new RegExp(`^\\s*\\**\\s*${w}($|[^a-z0-9_-])`).test(c))
+  );
+}
+
+const LATER_SETTLED_SPECIMENS: Array<[string, boolean, string]> = [
+  [
+    "now a loud check reject · closed 2026-09-05 · was loud emit reject",
+    true,
+    "closed in the second clause",
+  ],
+  [
+    "loud check reject · ruled close (owner): build the interval type",
+    true,
+    "a ruling, second clause",
+  ],
+  [
+    "now a loud check reject · fixed with D2977",
+    true,
+    "fixed in the second clause",
+  ],
+  [
+    "closed 2026-09-05 · now a loud check reject",
+    false,
+    "settled first clause",
+  ],
+  [
+    "loud check reject · not closed: the residue is open",
+    false,
+    "a negated later clause",
+  ],
+  [
+    "open · half closed 2026-10-24 by lane L3",
+    false,
+    "a part closed, not the row",
+  ],
+  [
+    "loud check reject · the price was closed elsewhere",
+    false,
+    "the word mid-clause",
+  ],
+];
+
+Deno.test("a status's first clause carries the row's state, not a later clause", async () => {
+  const words = settledWords(await Deno.readTextFile(LS));
+  for (const [status, want, why] of LATER_SETTLED_SPECIMENS) {
+    const got = laterClauseSettles(status, words);
+    if (got !== want) {
+      throw new Error(
+        `specimen (${why}): want ${want}, got ${got} for ${
+          JSON.stringify(status)
+        }`,
+      );
+    }
+  }
+  const bad: string[] = [];
+  for (const dir of DIRS) {
+    for (const doc of await docsOf(dir)) {
+      for (const r of parseRows(await Deno.readTextFile(doc))) {
+        if (!laterClauseSettles(r.status ?? "", words)) continue;
+        bad.push(
+          `${doc}:${r.line}  ${r.id} — a later clause says ${
+            words.join(" / ")
+          }, but ` +
+            `\`ls.vl\` reads only the first\n` +
+            `      want: the first clause to say the row's state (\`closed <date> · \` when it is, ` +
+            `what is still open when it is not)\n` +
+            `      got:  ${(r.status ?? "").slice(0, 120)}`,
+        );
+      }
+    }
+  }
+  if (bad.length > 0) {
+    throw new Error(
+      `${bad.length} row(s) settle in a later clause only:\n${bad.join("\n")}`,
+    );
+  }
 });
 
 Deno.test("a `Want:` block is an indented block directly under its label", () => {
   const bad: string[] = [];
   for (const [name, want, labels, body] of WANT_SPECIMENS) {
-    const text = `### D1 — specimen\n**closed**\n\nRepro:\n\n    print(4)\n\n${body}`;
+    const text =
+      `### D1 — specimen\n**closed**\n\nRepro:\n\n    print(4)\n\n${body}`;
     const rows = parseRows(text);
     if (rows.length !== 1) {
       bad.push(`${name}: want 1 parsed row, got ${rows.length}`);
@@ -471,10 +604,16 @@ Deno.test("a `Want:` block is an indented block directly under its label", () =>
           `got ${rows[0].hasWant} / ${rows[0].wantLabels}`,
       );
     }
-    if (!rows[0].hasRepro) bad.push(`${name}: the Want: block cost the row its repro`);
+    if (!rows[0].hasRepro) {
+      bad.push(`${name}: the Want: block cost the row its repro`);
+    }
   }
-  const above = parseRows("### D1 — s\n**closed**\n\nWant:\n\n    4\n\nRepro:\n\n    print(4)\n");
-  if (!above[0]?.wantBeforeRepro) bad.push("a Want: above the Repro: was not flagged");
+  const above = parseRows(
+    "### D1 — s\n**closed**\n\nWant:\n\n    4\n\nRepro:\n\n    print(4)\n",
+  );
+  if (!above[0]?.wantBeforeRepro) {
+    bad.push("a Want: above the Repro: was not flagged");
+  }
   if (bad.length > 0) {
     throw new Error(`the Want: rule misroutes:\n  ${bad.join("\n  ")}`);
   }
@@ -506,7 +645,9 @@ const STATUS_SPECIMENS: Array<[string, boolean, string]> = [
   ["a one-line status", true, "**closed 2026-09-07 — the witness prints `2`**"],
   ["a two-line wrap", true, "**closed 2026-09-07 — the witness\nprints `2`**"],
   // The row this PR exists for: eight lines, which the old cap refused at the sixth.
-  ["an eight-line wrap", true,
+  [
+    "an eight-line wrap",
+    true,
     "**closed 2026-09-07 — the witness prints `2` · was a loud emit reject,\n" +
     "`monomorphize: unsupported argument type` · clause 2 · 2 of the 64 cells\n" +
     "of the `pop-union-box-element` matrix (`argument` and `early_return_guard`,\n" +
@@ -514,11 +655,20 @@ const STATUS_SPECIMENS: Array<[string, boolean, string]> = [
     "D1881's close; resolved against `1a67d7811` · fixtures\n" +
     "`tests/cases/unions/pop-union-box-generic-pin.vl` and its `-annotated`\n" +
     "twin, both of which run · byte identity over `tests/cases` 0 differing\n" +
-    "files, seed +130 bytes**"],
+    "files, seed +130 bytes**",
+  ],
   // The two stops that replace the cap. An opener that never closes must not swallow the
   // prose below it, nor the row below THAT.
-  ["an opener closed by a blank line", false, "**closed 2026-09-07 — never closed\n\nprose"],
-  ["an opener closed by the next heading", false, "**closed — never closed\n#### Mechanism"],
+  [
+    "an opener closed by a blank line",
+    false,
+    "**closed 2026-09-07 — never closed\n\nprose",
+  ],
+  [
+    "an opener closed by the next heading",
+    false,
+    "**closed — never closed\n#### Mechanism",
+  ],
 ];
 
 Deno.test("a wrapped status line joins to its paragraph, whatever its length", () => {
@@ -547,7 +697,9 @@ Deno.test("a wrapped status line joins to its paragraph, whatever its length", (
       "Repro:\n\n    print(1)\n",
   );
   if (two.length !== 2) {
-    bad.push(`an opener running into the next row: want 2 parsed rows, got ${two.length}`);
+    bad.push(
+      `an opener running into the next row: want 2 parsed rows, got ${two.length}`,
+    );
   }
   if (bad.length > 0) {
     throw new Error(`the status-line join misroutes:\n  ${bad.join("\n  ")}`);
@@ -565,7 +717,9 @@ Deno.test("no reserved inventory range is stale, overlapping, or misnamed", asyn
   const files: string[] = [];
   try {
     for await (const e of Deno.readDir(dir)) {
-      if (e.isFile && e.name.endsWith(".md") && e.name !== "README.md") files.push(e.name);
+      if (e.isFile && e.name.endsWith(".md") && e.name !== "README.md") {
+        files.push(e.name);
+      }
     }
   } catch {
     return; // no reservations directory is a valid state: nothing is reserved.
@@ -589,7 +743,9 @@ Deno.test("no reserved inventory range is stale, overlapping, or misnamed", asyn
     const m = lines.length === 1 ? lines[0].match(RANGE) : null;
     // A line ls.vl cannot parse is a range it does not skip, so the file must be exactly one.
     if (m === null) {
-      bad.push(`${name}: want exactly one \`D<lo>-D<hi>  <holder>  <date>  <note>\` line`);
+      bad.push(
+        `${name}: want exactly one \`D<lo>-D<hi>  <holder>  <date>  <note>\` line`,
+      );
       continue;
     }
     const lo = Number(m[1]), hi = Number(m[2]);
@@ -599,17 +755,23 @@ Deno.test("no reserved inventory range is stale, overlapping, or misnamed", asyn
     let all = true;
     for (let n = lo; n <= hi; n++) if (!filed.has(n)) all = false;
     if (all) {
-      stale.push(`D${lo}-D${hi} (${m[3]}, ${m[4]}) — every id filed; release it with ` +
-        `vl run scripts/inventory/ls.vl -- --release D${lo}-D${hi}`);
+      stale.push(
+        `D${lo}-D${hi} (${m[3]}, ${m[4]}) — every id filed; release it with ` +
+          `vl run scripts/inventory/ls.vl -- --release D${lo}-D${hi}`,
+      );
     }
   }
   ranges.sort((a, b) => a.lo - b.lo || a.hi - b.hi);
   for (let i = 1; i < ranges.length; i++) {
     const p = ranges[i - 1], q = ranges[i];
-    if (q.lo <= p.hi) bad.push(`${q.name} overlaps ${p.name}: release one and re-reserve`);
+    if (q.lo <= p.hi) {
+      bad.push(`${q.name} overlaps ${p.name}: release one and re-reserve`);
+    }
   }
   if (files.length > 0 && ranges.length === 0) {
-    throw new Error(`${dir}: ${files.length} files but none parsed — every check is vacuous`);
+    throw new Error(
+      `${dir}: ${files.length} files but none parsed — every check is vacuous`,
+    );
   }
   if (bad.length > 0) {
     throw new Error(`malformed reservations:\n  ${bad.join("\n  ")}`);
@@ -629,7 +791,9 @@ const WANT_BASELINE = "scripts/inventory/want-baseline.txt";
 function stringList(src: string, name: string): string[] {
   const block = src.split(new RegExp(`(?:export )?const ${name} = \\[`))[1];
   if (block === undefined) {
-    throw new Error(`${CHECKER}: no \`const ${name} = [\` list found — the parse here moved with it`);
+    throw new Error(
+      `${CHECKER}: no \`const ${name} = [\` list found — the parse here moved with it`,
+    );
   }
   return [...block.split("]")[0].matchAll(/"([^"]*)"/g)].map((m) => m[1]);
 }
@@ -698,5 +862,7 @@ Deno.test("a running row declares its output in a `Want:` block, or is on the ba
       );
     }
   }
-  if (bad.length > 0) throw new Error(`${bad.length} row(s):\n\n${bad.join("\n\n")}`);
+  if (bad.length > 0) {
+    throw new Error(`${bad.length} row(s):\n\n${bad.join("\n\n")}`);
+  }
 });
