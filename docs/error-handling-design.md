@@ -389,7 +389,7 @@ is per-`T` — a nullable REF for a string/struct/sub-union arm, a value NICHE f
 scalar. Its lowering emits correct bytes; what remains is the binding and consumer
 classifiers seeing through the cast to the NULLABLE kind, per rep. Since `as?` is
 the member this section itself calls lossy ("it DESTROYS the error value"), nothing
-load-bearing waits on it.
+load-bearing waits on it. **Since built**: `as?` lowers and runs at each rep (re-verified 2026-11-14).
 
 **A `T | null` SOURCE (2026-09-06).** The trio's operand may be a nullable, not only a
 multi-arm union. A `T | null` whose `T` is a scalar BOXES, so it takes the ordinary tag
@@ -400,7 +400,10 @@ already reps as. Lowered for the string, list and union-variant cells, graded at
 delivery positions in both faces. Still refused: the standalone-struct, map and closure
 cells, whose consumers read the CAST node for the rep and find none, and the propagating
 bare `as`, whose sad path returns the enclosing function's null and so needs the operand
-staged at its own heap type. `docs/internals/inventory/D1812.md`.
+staged at its own heap type. `docs/internals/inventory/D1812.md`. **Since then**: the struct cell (D1812) and the map cell (D12460) are lowered for `as!` and
+`as?`, and the propagating `as` over a `string | null` is lowered (D12461). Still refused: the
+propagating `as` over a nullable struct, list or map (`docs/internals/inventory/D16066.md`), and
+the closure cell under all three forms (`docs/internals/inventory/D16067.md`).
 
 ### The unified `as` principle
 
