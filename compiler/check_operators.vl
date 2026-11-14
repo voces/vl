@@ -185,7 +185,6 @@ import {
   numDeliverStamp,
   radixLitAdoptPeer64,
   recContainerReadFresh,
-  recFitMeetTy,
   recJoinFixed,
   recordBoxTy,
   recordContainedIsAt,
@@ -194,6 +193,9 @@ import {
   stampNullUnitCell,
   storeWritePush,
   strLitSetsDisjoint,
+  tyTestMayFit,
+  tyTestMeet,
+  tyTestNamesMembers,
 } from "./check_fit_rules"
 import { HD_BINOP, HD_ELEM, elemValueHoleBase } from "./check_hole_pins"
 import {
@@ -332,7 +334,6 @@ import {
   constrainEmpty,
   eqKeepsWideLit,
   eqNonNullMutual,
-  fnSlotRetWidens,
   joinArmLit,
   joinTys,
   keepListStorage,
@@ -368,7 +369,6 @@ import {
 } from "./check_tp_join"
 import {
   eqRefusals,
-  isWidenNotVariant,
   mapTwinTestMsg,
   mixesNumeric,
   widerNumeric,
@@ -439,8 +439,6 @@ import {
   tyHasTyVar,
   tyIsV128Brand,
   tyMapValOfHeld,
-  tyUnionCovers,
-  unionCoversTy,
 } from "./tyquery"
 
 // Re-binds `name` to `ty` as a layer over slot `s`; an unresolved name gets a slot of its own.
@@ -2137,7 +2135,7 @@ function checkCastUnionArm(
   ix: i32,
   argU: i32,
   argT: TyUnion,
-  target: i32,
+  target0: i32,
   isU8Cast: boolean,
 ): i32 {
   // `as u8` narrows a number, it does not pick an arm (D1587) — a union operand taking
@@ -2153,8 +2151,12 @@ function checkCastUnionArm(
   }
   // A numeric union converts at whichever member it holds when no member's conversion
   // can fail, as each member alone would.
-  if numUnionAsConverts(argU, target) { return target }
-  if !unionCoversTy(argT, target) {
+  if numUnionAsConverts(argU, target0) { return target0 }
+  // The cast picks what `is` would test (`tyTestMeet`): the members it names, or the members a
+  // record target contains, which it hands back as they are (D2677, D4085).
+  const meet = tyTestMeet(argU, target0)
+  const target = if meet >= 0 { meet } else { target0 }
+  if meet < 0 && !tyTestNamesMembers(argU, target) {
     // A gradual union's parameter may hold the target at a pin: the cast is parked on the
     // parameter and re-asked there, as over a bare one (D2906).
     if unionHasDeclaredParam(argT.uMembers) {
@@ -2535,7 +2537,7 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
   let meet = litSetMeetTy(objTy, chkTy)
   if meet == -1 && n.isVariant != "null" { meet = litBaseMeetTy(objTy, chkTy) }
   if meet == -1 { meet = litPrimMeetTy(objTy, chkTy) }
-  if meet == -1 { meet = recFitMeetTy(objTy, chkTy) }
+  if meet == -1 { meet = tyTestMeet(objTy, chkTy) }
   // A `const` literal tests as the compare does: against a literal it never equals the
   // test is refused, and against anything else it is the `string` it is (D2198).
   if chkTy >= 0 && isWideLitJoin(objTy) {
@@ -2626,12 +2628,7 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
       }
     } else if meet >= 0 {
       0
-    } else if (
-      (!assignable(chkTy, baseTy)
-        || isWidenNotVariant(chkTy, baseTy)
-        || fnSlotRetWidens(chkTy, baseTy))
-      && !(!inUnion && tyUnionCovers(chkTy, baseTy))
-    ) {
+    } else if !tyTestMayFit(baseTy, chkTy) {
       if deadArm && isListFitsWhenEmpty(chkTy, baseTy) {
         // An empty list fits every list type, so the instance's arm is live and is checked: what
         // it delivers the list to is answered there (ruling (c), D4981).

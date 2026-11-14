@@ -1,0 +1,309 @@
+// Declaration-order A/B: run every single-file `@run` case of `tests/cases` as written and with
+// its top-level `function` blocks moved after the rest of the file, and report the cases whose
+// outcome moves. Functions are hoisted, so any movement is an order dependence (D16301).
+//
+//     vl run scripts/decl-order-ab.vl -- [--compiler SEED] [--write-baseline] [--keep DIR]
+//
+// Exits 1 when a case moves to a clause-1 outcome (a trap, an invalid module, another answer)
+// that `scripts/decl-order-ab-baseline.txt` does not already record for it. Run from the checkout
+// root; `$JOBS` cases at a time (default 6), `$VL_PROBE_TIMEOUT` (default 120) bounds a `vl` call.
+// `--keep DIR` copies each clause-1 mover's reordered program to `DIR`.
+// Left out: a case with an import, an expected error, args or stdin, or a brace-less function.
+
+import { IoError, listDir, readFile, writeTextFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { toString } from "std:fmt"
+import { join, split, startsWith } from "std:str"
+import {
+  die,
+  envOr,
+  fanOutArgv,
+  findFrom,
+  isDir,
+  stripWs,
+  univNl,
+} from "./lib/common"
+import { grade, spawn } from "./lib/probe-grade"
+
+const CASES = "tests/cases"
+const SELF = "scripts/decl-order-ab.vl"
+const BASELINE = "scripts/decl-order-ab-baseline.txt"
+const COMPILER = "build/vl-compiler.wasm"
+const USAGE = "usage: vl run scripts/decl-order-ab.vl -- [--compiler SEED] [--write-baseline] [--keep DIR]"
+
+function contains(s: string, needle: string): boolean {
+  findFrom(s, needle, 0) >= 0
+}
+
+function readText(path: string): string {
+  const t = readFile(path)
+  if t is IoError {
+    die("decl-order-ab: cannot read \{path} (\{t.msg})", 1)
+    return ""
+  }
+  univNl(decodeUtf8Lossy(t))
+}
+
+function writeText(path: string, text: string) {
+  const w = writeTextFile(path, text)
+  if w != null { die("decl-order-ab: cannot write \{path} (\{w.msg})", 1) }
+}
+
+// Every `.vl` file under `dir`, recursively, as paths relative to the checkout.
+function walk(dir: string, out: string[]) {
+  const names = listDir(dir)
+  if names is IoError {
+    die("decl-order-ab: cannot list \{dir} (\{names.msg})", 1)
+    return
+  }
+  for n in names {
+    const p = dir + "/" + n
+    if isDir(p) {
+      walk(p, out)
+    } else if n.length > 3 && n.slice(n.length - 3, n.length) == ".vl" {
+      out.push(p)
+    }
+  }
+}
+
+function startsFn(l: string): boolean {
+  startsWith(l, "function ") || startsWith(l, "export function ")
+}
+
+function braces(l: string): i32 {
+  let d = 0
+  let i = 0
+  while i < l.length {
+    if l[i] == 123 { d = d + 1 }
+    if l[i] == 125 { d = d - 1 }
+    i = i + 1
+  }
+  d
+}
+
+// The case with every top-level function block moved last, or "" when it is out of scope or
+// the move changes nothing. A block runs from its `function` line until its braces balance.
+function reordered(src: string): string {
+  const head = split(src, "\n")
+  let top = ""
+  let k = 0
+  while k < 3 && k < head.length {
+    top = top + head[k]
+    k = k + 1
+  }
+  if !contains(top, "// @run") { return "" }
+  for bad in ["import ", "@error", "@args", "@stdin", "@env"] {
+    if contains(src, bad) { return "" }
+  }
+  const rest: string[] = []
+  const fns: string[] = []
+  let i = 0
+  while i < head.length {
+    const l = head[i]
+    if startsFn(l) {
+      if !contains(l, "{") { return "" }
+      let j = i
+      let d = 0
+      let done = false
+      while j < head.length && !done {
+        d = d + braces(head[j])
+        if d <= 0 { done = true } else { j = j + 1 }
+      }
+      if j >= head.length { return "" }
+      fns.push(join(head.slice(i, j + 1), "\n"))
+      i = j + 1
+    } else {
+      rest.push(l)
+      i = i + 1
+    }
+  }
+  if fns.length == 0 { return "" }
+  const out = join(rest, "\n") + "\n" + join(fns, "\n") + "\n"
+  if stripWs(out) == stripWs(src) { return "" }
+  out
+}
+
+// The class of a movement from `a` to `b`, or "" when the outcome held.
+function movement(av: string, aout: string, bv: string, bout: string): string {
+  if av == bv && (av != "RUNS" || aout == bout) { return "" }
+  if bv == "RUNS" && av == "RUNS" { return "wrong" }
+  if startsWith(bv, "TRAP") { return "trap" }
+  if startsWith(bv, "SILENT") { return "silent" }
+  if startsWith(bv, "COMPILER TRAP") { return "compiler-trap" }
+  if bv == "RUNS" { return "now-runs" }
+  if startsWith(bv, "check") { return "check" }
+  if startsWith(bv, "emit") { return "emit" }
+  "other"
+}
+
+function clause1(c: string): boolean {
+  c == "wrong" || c == "trap" || c == "silent" || c == "compiler-trap"
+}
+
+// One worker: grade the original and the reordered case a job file names, into `<job>.out`.
+function gradeOne(file: string) {
+  const l = split(readText(file), "\n")
+  const a = grade(
+    { vl: l[0], seed: l[1], std: l[2], probe: l[3], secs: l[5] },
+    null,
+  )
+  const b = grade(
+    { vl: l[0], seed: l[1], std: l[2], probe: l[4], secs: l[5] },
+    null,
+  )
+  writeText(
+    file + ".out",
+    movement(a.verdict, a.out, b.verdict, b.out) + "\t" + b.detail,
+  )
+}
+
+function baselineOf(path: string): Map<string, string> {
+  const m: Map<string, string> = Map()
+  const t = readFile(path)
+  if t is IoError { return m }
+  for ln in split(univNl(decodeUtf8Lossy(t)), "\n") {
+    const tab = findFrom(ln, "\t", 0)
+    if tab > 0 { m[ln.slice(0, tab)] = ln.slice(tab + 1, ln.length) }
+  }
+  m
+}
+
+function main(args: string[]): i32 {
+  if args.length == 2 && args[0] == "--grade-one" {
+    gradeOne(args[1])
+    return 0
+  }
+  const pwd = spawn("pwd", ["-P"])
+  const abs = stripWs(pwd.out)
+  let seed = abs + "/" + COMPILER
+  let write = false
+  let keep = ""
+  let i = 0
+  while i < args.length {
+    if args[i] == "--compiler" && i + 1 < args.length {
+      seed = args[i + 1]
+      i = i + 1
+    } else if args[i] == "--keep" && i + 1 < args.length {
+      keep = args[i + 1]
+      i = i + 1
+    } else if args[i] == "--write-baseline" {
+      write = true
+    } else {
+      print(USAGE)
+      return 2
+    }
+    i = i + 1
+  }
+  const all: string[] = []
+  walk(CASES, all)
+  const mk = spawn("mktemp", ["-d"])
+  if mk.code != 0 { die("decl-order-ab: mktemp -d failed: " + mk.err, 1) }
+  const root = stripWs(mk.out)
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  const secs = envOr("VL_PROBE_TIMEOUT", "120")
+  const names: string[] = []
+  const jobs: string[] = []
+  for p in all {
+    const r = reordered(readText(p))
+    if r == "" { continue }
+    const k = toString(names.length)
+    writeText(root + "/" + k + ".vl", r)
+    const job = root + "/" + k + ".job"
+    writeText(
+      job,
+      join(
+        [
+          abs + "/scripts/vl-host/target/release/vl",
+          seed,
+          abs + "/std",
+          abs + "/" + p,
+          root + "/" + k + ".vl",
+          secs,
+        ],
+        "\n",
+      ),
+    )
+    names.push(p.slice(CASES.length + 1, p.length))
+    jobs.push(job)
+  }
+  const grader = root + "/grader.wasm"
+  const b = spawn(vl, ["build", SELF, "--compiler", COMPILER, "-o", grader])
+  if b.code != 0 {
+    spawn("rm", ["-rf", root])
+    die("decl-order-ab: cannot build \{SELF}:\n" + b.out + b.err, 1)
+  }
+  writeText(root + "/jobs", join(jobs, "\n") + "\n")
+  const x = spawn(
+    "sh",
+    fanOutArgv(
+      root + "/jobs",
+      envOr("JOBS", "6"),
+      [vl, "run", grader, "--", "--grade-one"],
+    ),
+  )
+  if x.code != 0 {
+    spawn("rm", ["-rf", root])
+    die("decl-order-ab: a grading worker failed:\n" + x.out + x.err, 1)
+  }
+  const base = baselineOf(BASELINE)
+  const now: string[] = []
+  let moved = 0
+  let c1 = 0
+  let fresh = 0
+  let k = 0
+  while k < names.length {
+    const o = readText(jobs[k] + ".out")
+    const tab = findFrom(o, "\t", 0)
+    const c = if tab >= 0 { o.slice(0, tab) } else { o }
+    if c != "" {
+      moved = moved + 1
+      now.push(names[k] + "\t" + c)
+      if clause1(c) {
+        c1 = c1 + 1
+        if keep != "" {
+          writeText(
+            keep + "/" + join(split(names[k], "/"), "__"),
+            readText(root + "/" + toString(k) + ".vl"),
+          )
+        }
+        const was = base[names[k]] ?? ""
+        if !clause1(was) {
+          fresh = fresh + 1
+          print("NEW \{c}  \{names[k]}  \{o.slice(tab + 1, o.length)}")
+        }
+      }
+    }
+    k = k + 1
+  }
+  for n, was in base {
+    if clause1(was) && !includesStr(now, n + "\t" + was) {
+      print("moved off \{was}: \{n}")
+    }
+  }
+  spawn("rm", ["-rf", root])
+  print(
+    "decl-order-ab: \{toString(moved)} of \{toString(names.length)} cases move when their functions come last; \{toString(c1)} to a clause-1 outcome, \{toString(fresh)} not in the baseline",
+  )
+  if write {
+    writeText(BASELINE, join(now, "\n") + "\n")
+    print("wrote \{BASELINE}")
+    return 0
+  }
+  if fresh > 0 { 1 } else { 0 }
+}
+
+function includesStr(xs: string[], s: string): boolean {
+  for x in xs {
+    if x == s { return true }
+  }
+  false
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("decl-order-ab: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
