@@ -29,8 +29,10 @@ stays too, since an argument is not a callee. Bisected one group at a time.
 
 ## Measured
 
-- **The change as landed:** two refreshes cmp-identical. Sweep against #7905's head: 24,265 of
-  24,265 programs the same, 0 bytes-only movers, 0 `runs -> not-runs`, 0 new compiler traps.
+- **The change as landed, merged with master `b1999185`:** two refreshes cmp-identical. Sweep
+  against that master's fixpoint seed: 24,286 of 24,286 programs the same, 0 bytes-only movers,
+  0 output movers, 0 `runs -> not-runs`, 0 new compiler traps. Against #7905's head before the
+  merge, 24,265 of 24,265 were the same.
 - **The position matrix** (`hole-lambda-returned-by-{lambda,function}-at-two-types`): unchanged at
   33/48 and 39/48. D16072's six cells are a pin-path gap, not a resolver gap (see the row).
 
