@@ -101,7 +101,7 @@ import {
   nodeSpineChildren,
 } from "./ast"
 import { fvaRetRowsNote, monoRecheckBegin } from "./check_assignable"
-import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
+import { REC_STORE_DEPTH, fieldStorageEq, numWidens } from "./check_ty_relate"
 import {
   recBuildCount,
   recBuildTable,
@@ -6652,6 +6652,7 @@ let elabResCopies: {[i32]: i32[]} = Map()
 let elabLambdaBound: {[i32]: i32} = Map()
 let elabResTypedReads: {[i32]: i32[]} = Map()
 let elabTypedReadMembers: {[i32]: i32[]} = Map()
+let elabAnyTypedRead = false
 // Per holder, the `return` statements that return it.
 let elabResRets: {[i32]: i32[]} = Map()
 let elabRecParams: {[i32]: boolean} = Map()
@@ -6687,6 +6688,7 @@ function elabResultScanReset() {
   elabLambdaBound = Map()
   elabResTypedReads = Map()
   elabTypedReadMembers = Map()
+  elabAnyTypedRead = false
   elabResAsgFrom = Map()
   elabResAsgTo = Map()
   elabResRets = Map()
@@ -7904,6 +7906,7 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
     if tn is LetDecl {
       const tm = elabRecIndexOf(rec, nodeTyIxOf(tn.letType))
       elabTriplePut(elabTypedReadMembers, t, from, tm)
+      elabAnyTypedRead = true
     }
   }
   // Each copy holds the same record, each call through it takes its member, and each hand of
@@ -7915,6 +7918,7 @@ function elabHolderRecordWith(h: i32, from: i32, rec: i32[], c: i32) {
       if tn is LetDecl {
         const tm = elabRecIndexOf(rec, nodeTyIxOf(tn.letType))
         elabTriplePut(elabTypedReadMembers, t, from, tm)
+        elabAnyTypedRead = true
       }
     }
     for t in elabResThrough.get(w) ?? [] {
@@ -8391,6 +8395,9 @@ export function elabCallKeepsRecordAt(c: i32, k: i32): boolean {
 }
 
 // The member of its holder's record call `c` through it calls under instance `k`, or -1.
+// Whether any annotated binding takes a member of its holder's record (`elabTypedReadMemberAt`).
+export function elabHasTypedReads(): boolean { elabAnyTypedRead }
+
 // The member of its holder's record annotated binding `d`, initialised with the holder's read,
 // takes under instance `k`; -1 for none.
 export function elabTypedReadMemberAt(d: i32, k: i32): i32 {
@@ -11098,6 +11105,9 @@ export function elabArgDeliveredTy(a: i32, from: i32): i32 {
   if erArgConv[at] >= 0 { return erArgConv[at] }
   const rep = erArgRep[at]
   const pt = elabCallParamTyFrom(ix, i, from)
+  // A number the parameter's type widens losslessly is delivered at that wider number (D16206).
+  const own = elabNodeTy(a, from)
+  if pt >= 0 && own >= 0 && numWidens(own, pt) { return pt }
   if (
     rep >= 0
     && pt >= 0
@@ -17396,6 +17406,30 @@ export function elabLitSlotCallees() {
   0
 }
 
+// How many elaboration instances function declaration `d` is built at; 0 for `d` -1.
+function elabDeclKeyCount(d: i32): i32 {
+  if d < 0 { return 0 }
+  let n = 0
+  for x in ekDecl {
+    if x == d { n = n + 1 }
+  }
+  n
+}
+
+// Whether node `x`, or the source an instance copied it from, lies inside function `f`.
+function elabNodeWithinFn(x: i32, f: i32): boolean {
+  if f < 0 { return false }
+  const x0 = if x >= cwIxCoveredLen() { nodeSrc[x] ?? x } else { x }
+  let cur = recEnclosingFn(x0)
+  let hops = 0
+  while cur >= 0 && hops < 64 {
+    if cur == f { return true }
+    cur = recEnclosingFn(cur)
+    hops = hops + 1
+  }
+  false
+}
+
 // `elabLitSlotCallees` for slot `step` of literal `a`, of type `st`: only an open function type
 // that is not a tagged set is recorded.
 function elabLitSlotCalleesAt(a: i32, st: i32, step: string) {
@@ -17411,9 +17445,14 @@ function elabLitSlotCalleesAt(a: i32, st: i32, step: string) {
     if cn is Call {
       const ft = nodeTyIxOf(cn.callFn)
       if ft >= 0 && (tyHasTyVar(ft) || tyReachesHole(ft, 16)) {
-        // Two slots reaching one callee at different types give it no one type.
+        // Two slots reaching one callee at different types give it no one type, and neither
+        // does a call in a function built at two instances that the literal lies outside of,
+        // since the other instances' values reach it too.
         const was = elabCalleeTys[cn.callFn] ?? -1
-        elabCalleeTys[cn.callFn] = if was == -1 || was >= 0 && tySame(was, ct) { ct } else { -2 }
+        const cf = recEnclosingFn(c)
+        const one = (was == -1 || was >= 0 && tySame(was, ct))
+          && (elabDeclKeyCount(cf) < 2 || elabNodeWithinFn(a, cf))
+        elabCalleeTys[cn.callFn] = if one { ct } else { -2 }
       }
     }
   }

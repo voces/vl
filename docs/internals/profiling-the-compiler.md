@@ -58,6 +58,8 @@ Notes, each of which cost something to learn:
   immediate PARENT frame of every sample whose leaf is a given function, to find whose loop
   it is. `profile-callers.vl -- <profile.json>` charges every helper sample to its first
   non-helper ancestor instead, which is the caller a cut has to change.
+* **`-O` hides the compile from the sampler**: a profiled `-O` build records only the in-guest
+  optimizer's store, so profile a plumb unit without `-O`.
 * **`VL_STD=<worktree>/std`** on every worktree probe — the host resolves `std:` from the
   BINARY's checkout, which is the main repo's.
 

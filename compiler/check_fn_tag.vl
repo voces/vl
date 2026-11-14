@@ -81,6 +81,7 @@ import {
   cwBindingWrittenValues,
   cwCalleeDeclOf,
   cwDeclWriteValues,
+  cwFnValueDeclOf,
   cwIxBuild,
   cwIxCovers,
   cwIxKind,
@@ -127,7 +128,6 @@ import {
   mkArrayTy,
   tyAt,
   tyFieldTyOf,
-  tyHasHole,
   tySame,
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
@@ -207,11 +207,11 @@ import {
   fnTagHeldNote,
   fnTagHeldRecs,
   fnTagHeldRepOf,
+  fnTagHeldWrittenInner,
   fnTagJoinFromOf,
   fnTagJoinsWith,
   fnTagLeafSetOf,
   fnTagListJoinSet,
-  fnTagMapWriteLeavesOf,
   fnTagMark,
   fnTagMembers,
   fnTagOwnTyParamJoins,
@@ -638,6 +638,14 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     repStampHeldRead(ftStoreLits[sl], fnTagRepTyOf(ftStoreLitTys[sl]))
     sl = sl + 1
   }
+  // A list literal written whole into a held list of lists is built at the holder's element.
+  let ww = 0
+  while ww + 1 < ftWrittenWhole.length {
+    const hr = fnTagHeldRepOf(ftWrittenWhole[ww + 1])
+    const ho = if hr >= 0 && hr < T.tys.length { tyAt(hr) } else { null }
+    if ho is TyArray { fnTagHeldWrittenInner(ftWrittenWhole[ww], ho.aElem, 0) }
+    ww = ww + 2
+  }
   // A record literal of an inner list is built at that list's record, so it shares its row.
   let q2 = 0
   while q2 + 1 < fnTagHeldRecs.length {
@@ -676,6 +684,31 @@ function ftWrittenInitNote(x: i32, wl: i32) {
   0
 }
 
+// Whether `x` is a list literal of record literals, or of such lists, written whole (D15357).
+function ftWholeRecListLit(x: i32, depth: i32): boolean {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is ArrayLit) || n.arrElems.length == 0 || depth > 8 { return false }
+  for el in n.arrElems {
+    const ex = parenPeelIx(el)
+    const en = if ex >= 0 && ex < P.nodes.length { nodeAt(ex) } else { null }
+    if !(en is ObjLit) && !ftWholeRecListLit(ex, depth + 1) { return false }
+  }
+  true
+}
+
+// Notes list literal `l` as written whole into holder `h`, a read of a held `let`.
+function ftWrittenWholeNote(l: i32, h: i32) {
+  const d = if h >= 0 && h < P.nodes.length && nodeAt(h) is Ident { identDeclOf(h) } else { -1 }
+  if d >= 0 && !i32ListHas(ftWrittenWhole, l) {
+    ftWrittenWhole.push(l)
+    ftWrittenWhole.push(d)
+  }
+  0
+}
+
+// List literals written whole into a held list of lists, each beside the holder's declaration.
+let ftWrittenWhole: i32[] = []
+
 // Notes record literal `l` as written into a holder of the plan in progress.
 function ftWrittenNote(l: i32) {
   if recAsgFnWidenedTy(l) >= 0 && !i32ListHas(ftWrittenLits, l) {
@@ -712,6 +745,7 @@ let ftWrittenInits: i32[] = []
 function ftPlReset() {
   ftWrittenLits = []
   ftWrittenInits = []
+  ftWrittenWhole = []
   ftPlS = []
   ftPlLeaves = []
   ftPlIds = []
@@ -1023,39 +1057,24 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
       if ids[k] == d { t = nodeTyIxOf(leaves[k]) }
       k = k + 1
     }
-    // A member written only through a callee's parameter has the write the list's widening
-    // recorded as its leaf, typed as the list's element where the callee's hole types it (D14648).
-    if t < 0 {
-      const wvs: i32[] = []
-      const wsets: i32[] = []
-      const et = fnTagWriteLeavesOf(d, s, wvs, wsets)
-      // The write's own value is the leaf's id too, so the set it carries is decided with `s`.
-      for o in wsets {
-        if ftSetWithin(o, s) && !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
-      }
-      if et >= 0 {
-        for wv in wvs {
+    // A member written into a container of the set, through a callee's parameter included, has
+    // each write as a leaf too, however else it is read (D14648, D15531), typed as the container's
+    // slot.
+    const wvs: i32[] = []
+    const wsets: i32[] = []
+    const et = fnTagWriteLeavesOf(d, s, ftHeldCur, wvs, wsets)
+    // The write's own value is the leaf's id too, so the set it carries is decided with `s`.
+    for o in wsets {
+      if ftSetWithin(o, s) && !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
+    }
+    if et >= 0 {
+      for wv in wvs {
+        if !i32ListHas(leaves, wv) {
           leaves.push(wv)
           ids.push(d)
         }
-        t = nodeTyIxOf(wvs[0])
-        if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || tyHasHole(t) {
-          t = et
-        }
       }
-    }
-    // A member written through a callee's parameter into a held map of the set has that write as
-    // a leaf too, whose value carries only its own set, however else the member is read (D15531).
-    const mvs: i32[] = []
-    const mt = fnTagMapWriteLeavesOf(d, s, ftHeldCur, mvs)
-    if mt >= 0 {
-      for mv in mvs {
-        if !i32ListHas(leaves, mv) {
-          leaves.push(mv)
-          ids.push(d)
-        }
-      }
-      if t < 0 { t = mt }
+      if t < 0 { t = et }
     }
     // A member only a smaller set's read brings has its leaf in that set's plan.
     if t < 0 && ftSubNeed.length == 0 { return false }
@@ -2429,9 +2448,9 @@ function ftSetWithin(a: i32, b: i32): boolean {
   true
 }
 
-// Whether write value `x` is a leaf `fnTagWriteLeavesOf` took for a set wider than `s`, planned
-// with it or tagged: the write stores that set's id, and its own value is the same id.
-function ftWiderWriteLeaf(x: i32, s: i32): boolean {
+// Whether write value `x` is a leaf `fnTagWriteLeavesOf` takes for `s`, or took for a wider set
+// planned with it or tagged: the write stores that set's id, and its own value is the same id.
+function ftWriteLeafOf(x: i32, s: i32): boolean {
   let k = 0
   while k < ftPlS.length {
     const o = ftPlS[k]
@@ -2441,23 +2460,15 @@ function ftWiderWriteLeaf(x: i32, s: i32): boolean {
     k = k + 1
   }
   const t = fnTagLeafSetOf(x)
-  t >= 0 && t != s && fnTagSetIsTagged(t) && ftSetWithin(s, t)
-}
-
-// Whether the list `arr` is written holds a tagged set other than `s` with every member of `s`:
-// the write stores an id of that set, which its own decision covers.
-function ftStoreInWider(arr: i32, s: i32): boolean {
-  const ht = nodeTyIxOf(arr)
-  if ht < 0 || ht >= T.tys.length { return false }
-  const a = tyAt(ht)
-  if !(a is TyArray) { return false }
-  const o = fnTagSetOfTy(a.aElem)
-  if o < 0 || o == s || !fnTagSetIsTagged(o) { return false }
-  const om = fnTagMembers(o)
-  for d in fnTagMembers(s) {
-    if !i32ListHas(om, d) { return false }
+  if t >= 0 && t != s && fnTagSetIsTagged(t) && ftSetWithin(s, t) {
+    return true
   }
-  true
+  const d = cwFnValueDeclOf(x)
+  const out: i32[] = []
+  const with: i32[] = []
+  d >= 0
+    && fnTagWriteLeavesOf(d, s, ftHeldCur, out, with) >= 0
+    && i32ListHas(out, x)
 }
 
 // Whether `x` is a list literal whose elements each carry set `s` or name one of its members
@@ -2549,7 +2560,7 @@ function ftRecWriteJoins(
   const lx = parenPeelIx(lit)
   const ln = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
   if (
-    !(ln is ObjLit)
+    !(ln is ObjLit || ln is ArrayLit)
     || depth > FT_HOLD_DEPTH
     || dst < 0
     || dst >= T.tys.length
@@ -2557,7 +2568,20 @@ function ftRecWriteJoins(
     return true
   }
   const dt = tyAt(dst)
-  if !(dt is TyObj) { return true }
+  // A list literal of records written whole stores each at the list's element (D15357).
+  if ln is ArrayLit && dt is TyArray {
+    if !i32ListHas(ftRespine, lx) {
+      ftRespine.push(lx)
+      ftRespineTy.push(dst)
+    }
+    for el in ln.arrElems {
+      if !ftRecWriteJoins(el, dt.aElem, s, ds, leaves, ids, depth + 1) {
+        return false
+      }
+    }
+    return true
+  }
+  if !(dt is TyObj) || !(ln is ObjLit) { return true }
   for fx in ln.objFields {
     const f = nodeAt(fx)
     if f is FieldInit {
@@ -4183,7 +4207,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       return (ftParamOfSet(pn, x, s) && ftLateParamOk(pn, x, s))
         || ftMethodTyParamArg(p, x, s)
         || ftListCallHoleArg(pn, x, s)
-        || ftSlotWriteArg(pn, x, s, fn)
+        || ftSlotWriteArg(pn, x, s)
         || ftLateArgOfSet(pn, x, s)
     }
     // A binding's annotation delivers the value to a declared function type, a closure.
@@ -4255,15 +4279,14 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       }
       if pn.binRight != x { return false }
       if ftIsS(pn.binLeft, s) { return true }
-      if ftWiderWriteLeaf(x, s) { return true }
       if ftSeededHolds(pn.binLeft, s) { return true }
       if ftHeldWider(nodeTyIxOf(pn.binLeft), s) { return true }
+      if ftWriteLeafOf(x, s) { return true }
       const ln = nodeAt(pn.binLeft)
       // `h[k] = v` stores into the slot `h.set(k, v)` does, so the holder's type decides (D15116).
       if ln is Member { return ftSlotHoldsSet(ln.memObj, ln.memProp, s) }
       return ln is Index
         && (ftSlotHoldsSet(ln.idxArr, "", s)
-        || ftStoreInWider(ln.idxArr, s)
         || ftNamedFnValue(x) && ftParamHolderHolds(ln.idxArr, s, fn))
     }
     FuncDecl => {
@@ -4659,9 +4682,17 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
     const c = nodeAt(g)
     if !(c is Call) || c.callArgs.length == 0 { return false }
     for a in c.callArgs {
-      if recAsgFnWidenedTy(parenPeelIx(a)) < 0 { return false }
+      const ax = parenPeelIx(a)
+      if recAsgFnWidenedTy(ax) < 0 && !ftWholeRecListLit(ax, 0) { return false }
     }
-    for a in c.callArgs { ftWrittenNote(parenPeelIx(a)) }
+    for a in c.callArgs {
+      const ax = parenPeelIx(a)
+      if ftWholeRecListLit(ax, 0) {
+        ftWrittenWholeNote(ax, x)
+      } else {
+        ftWrittenNote(ax)
+      }
+    }
     return true
   }
   // A slice of such a list of records copies its records, built at the holder's record; a `get`
@@ -4693,16 +4724,14 @@ function ftHoleCallback(v: i32): boolean {
 
 // Whether argument `x` of call `c` is a value `m.set(k, v)` or `xs.push(v)` stores into a
 // holder of set `s`.
-function ftSlotWriteArg(c: Call, x: i32, s: i32, encl: i32): boolean {
+function ftSlotWriteArg(c: Call, x: i32, s: i32): boolean {
   const f = parenPeelIx(c.callFn)
   if f < 0 { return false }
   const fn = nodeAt(f)
   if !(fn is Member) { return false }
   const k = ftHoldKind(nodeTyIxOf(fn.memObj), s, FT_HOLD_DEPTH)
   if k == 1 && fn.memProp == "push" { return i32ListHas(c.callArgs, x) }
-  (ftSlotHoldsSet(fn.memObj, "", s)
-    || k == 5
-    || ftNamedFnValue(x) && ftParamHolderHolds(fn.memObj, s, encl))
+  (ftSlotHoldsSet(fn.memObj, "", s) || k == 5 || ftWriteLeafOf(x, s))
     && fn.memProp == "set"
     && c.callArgs.length == 2
     && c.callArgs[1] == x
