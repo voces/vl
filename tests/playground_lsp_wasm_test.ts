@@ -12,6 +12,7 @@ import { createWasmChecker, type Exports, type WasmChecker } from "../lsp/src/wa
 import * as lsp from "../playground/src/lspAdapter.ts";
 import { runProgram } from "../playground/src/playground.ts";
 import { vlHostImports } from "../compiler/vlHostImports.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
@@ -20,14 +21,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
 };
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 
 // One compiled Module for the file, a FRESH Instance per call below. Compiling is

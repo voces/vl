@@ -9,6 +9,42 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-assignable-negative-sentinel-census](2026-11-14-assignable-negative-sentinel-census.md): `assignable` reads a negative type as "accept": the census, 2026-11-14
+- [2026-11-14-assignable-pending-result](2026-11-14-assignable-pending-result.md): Shape C of the negative-type sentinel: a pending function result, 2026-11-14
+- [2026-11-14-clause2-architecture-map](2026-11-14-clause2-architecture-map.md): The open clause-2 rows, mapped onto the architecture item that closes them, 2026-11-14
+- [2026-11-14-d16133-refute-closed-lambda](2026-11-14-d16133-refute-closed-lambda.md): D16133: a set whose member the elaboration closed is refuted after it — D16133's ruling, stage 3
+- [2026-11-14-d16134-callback-at-build](2026-11-14-d16134-callback-at-build.md): D16134: a list callback's instance keyed by its receiver's build — D16133's ruling, stage 1
+- [2026-11-14-d16137-store-fact](2026-11-14-d16137-store-fact.md): D16137: a literal written over a hole-parameter alias, keyed by the elaboration's store fact — D16133's ruling, stage 2
+- [2026-11-14-d16215-restart-slot-types](2026-11-14-d16215-restart-slot-types.md): D16215: a check restart clears the slot types its previous pass noted
+- [2026-11-14-d16221-callee-ty-per-instance](2026-11-14-d16221-callee-ty-per-instance.md): A literal slot's callee type is not given to a call two instances share (D16221), 2026-11-14
+- [2026-11-14-d16230-write-value-result](2026-11-14-d16230-write-value-result.md): D16230: the value of a write leaf is decided with the container's set, 2026-11-14
+- [2026-11-14-d16313-paren-list-box](2026-11-14-d16313-paren-list-box.md): A union-coerced list is classified by the literal under its parens (D16313), 2026-11-14
+- [2026-11-14-export-freeze-census](2026-11-14-export-freeze-census.md): Freezing exports at the module boundary: the population it moves, and whether a `const` copy is visible, 2026-11-14
+- [2026-11-14-fuzz-soundness-census](2026-11-14-fuzz-soundness-census.md): Fuzz-sweep soundness census: 16 unsound findings, four clause-1 families, all bucket (f), 2026-11-14
+- [2026-11-14-g3-write-leaves-per-place](2026-11-14-g3-write-leaves-per-place.md): G3: write leaves per place path, and an uncalled function builds no instance (D15136, D15190), 2026-11-14
+- [2026-11-14-g5-returned-held-container](2026-11-14-g5-returned-held-container.md): A returned held container of functions is built at its result's row (G5), 2026-11-14
+- [2026-11-14-g51-d16162-nested-record-map](2026-11-14-g51-d16162-nested-record-map.md): D16162: a stored record's field holding a record literal is pinned as a stored record, 2026-11-14
+- [2026-11-14-g52-d16201-record-field-map](2026-11-14-g52-d16201-record-field-map.md): D16201: a `const` record's fresh map field takes its slot fact from its writes, and its literal that fact's row, 2026-11-14
+- [2026-11-14-g53-d16170-shared-nullable-records](2026-11-14-g53-d16170-shared-nullable-records.md): D16170: a shared read of nullable records of different types boxes as the records or `null`, 2026-11-14
+- [2026-11-14-g56-d16206](2026-11-14-g56-d16206.md): D16206: a number delivered to a wider numeric parameter is delivered at that parameter's type, 2026-11-14
+- [2026-11-14-g59-d16205](2026-11-14-g59-d16205.md): D16205: a number literal an integer binding cannot hold asks the widening join, 2026-11-14
+- [2026-11-14-generic-fn-rows](2026-11-14-generic-fn-rows.md): Generic-function rows D16110, D16150, D16151, 2026-11-14
+- [2026-11-14-k-g4-inline-join-argument](2026-11-14-k-g4-inline-join-argument.md): G4 (a): an inline record join handed to an un-annotated parameter is decided as a binding's, 2026-11-14
+- [2026-11-14-lane-l-g1-holder-producers](2026-11-14-lane-l-g1-holder-producers.md): Producers of a function-widened holder, built at its row — 2026-11-14
+- [2026-11-14-lane-l-g2-written-whole-inner](2026-11-14-lane-l-g2-written-whole-inner.md): Whole literals written into a held container, built at its row — 2026-11-14
+- [2026-11-14-lane-l-record-partial-fit](2026-11-14-lane-l-record-partial-fit.md): The partial record fit over a union, as a minted check — 2026-11-14
+- [2026-11-14-lane-l-type-test-one-predicate](2026-11-14-lane-l-type-test-one-predicate.md): One type-test predicate for `is`, `as` and `match` — 2026-11-14
+- [2026-11-14-lane-n-clause1-regressions](2026-11-14-lane-n-clause1-regressions.md): Three clause-1 regressions of closed rows, 2026-11-14
+- [2026-11-14-perf-plumb-drift](2026-11-14-perf-plumb-drift.md): The plumb-shape fuel drift since #7060, and four emit queries that answer first, 2026-11-14
+- [2026-11-14-rep-adt-design](2026-11-14-rep-adt-design.md): `Rep` as an algebraic type: design note, 2026-11-14 (lane E)
+- [2026-11-14-rep-adt-stage0-shadow](2026-11-14-rep-adt-stage0-shadow.md): Rep ADT stage 0: the `VKind` shadow and the tree-rebuild counter, 2026-11-14 (lane E)
+- [2026-11-14-slot-store-design](2026-11-14-slot-store-design.md): One producer for a function-holding slot's storage: design note, 2026-11-14 (lane S)
+- [2026-11-14-slot-store-inventory-elab](2026-11-14-slot-store-inventory-elab.md): Inventory: the function-holding-slot facts in the elaboration (read-only survey, 2026-11-14)
+- [2026-11-14-slot-store-inventory-mono](2026-11-14-slot-store-inventory-mono.md): emit_mono.vl — who decides a function-holding slot's storage (inventory, master @ 498e6419+, 2026-11-14)
+- [2026-11-14-slot-store-shadow-measurement](2026-11-14-slot-store-shadow-measurement.md): Slot store: the class rule measured beside today's slot facts, 2026-11-14 (lane S)
+- [2026-11-14-type-hashcons-design](2026-11-14-type-hashcons-design.md): Hash-consed types with binder identity: design note, 2026-11-14 (lane H)
+- [2026-11-14-type-hashcons-s0-intern-module](2026-11-14-type-hashcons-s0-intern-module.md): Type hash-cons stage 0: the intern table becomes its own module (lane H), 2026-11-14
+- [2026-11-14-write-leaf-fold](2026-11-14-write-leaf-fold.md): One write-leaf walk: maps folded into the place paths, the store checks onto the producer, 2026-11-14
 - [2026-11-14-d16047-unwritten-collection-is](2026-11-14-d16047-unwritten-collection-is.md): D16047: an unwritten collection fits every `is`; writes through a narrowing pin it (2026-11-14)
 - [2026-11-14-d16105-wider-write-value-cast](2026-11-14-d16105-wider-write-value-cast.md): D16105: a wider record's write value under a short-circuit
 - [2026-11-14-d16124-open-map-result-shape](2026-11-14-d16124-open-map-result-shape.md): An un-annotated map result recorded open takes its calls' shape (D16124), 2026-11-14

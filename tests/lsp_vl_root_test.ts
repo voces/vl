@@ -13,9 +13,9 @@
 
 import { isVlCheckoutRoot, lintPathFor, resetVlRootCache, vlRootFor } from "../lsp/src/vlRoot.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
-import { COMPILER, exists } from "./support/tree.ts";
+import { COMPILER, seedPresent } from "./support/tree.ts";
 
-const ENABLED = exists(COMPILER);
+const ENABLED = seedPresent(COMPILER);
 if (!ENABLED) {
   console.warn("[lsp-vl-root] end-to-end test skipped — no build/vl-compiler.wasm.");
 }
