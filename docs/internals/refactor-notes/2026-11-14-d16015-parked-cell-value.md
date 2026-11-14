@@ -13,6 +13,12 @@ assignment's (`asgYieldsParkedCell`), it emits the store and reads the parked lo
 tees its value into such a local only when the rung asks (`asgParkField`: the `i32`, `f64`, `i64`,
 `f32` and string kinds), so no other program's bytes move.
 
+Each park records the target node of its own assignment (`asgParkedOwner`), and the rung reads the
+park only when it is its own. A write nested in another write's right-hand side runs its own store
+first, so without that check a field store that parks nothing could read the inner write's value.
+The "across functions" cell `getR().x = (na[j] = 4) + dbl(1)` did exactly that, printing `4` for
+`6`, before the owner check.
+
 Nothing is hoisted, so the siblings of a write keep source order. A tee was rejected for D2171
 because it cannot deliver a value typed apart from its target; that population is D16016 here
 too.
@@ -27,7 +33,7 @@ The remaining refusal now names its case:
 | matrix | base | candidate |
 | --- | --- | --- |
 | `element-write-value` (`(ws[wi] = 5)`) | 12 of 50 run (after D2171) | 50 of 50 run, 0 silent |
-| `field-write-value` (`(fwGet().x = 5)`, receiver evaluated once) | 0 of 48 run | 48 of 48 run, 0 silent |
+| `field-write-value` (`(fwGet().x = 5)`, the receiver evaluated once, a write nested in the right-hand side) | 0 of 50 run | 50 of 50 run, 0 silent |
 
 Two invalid modules turned up while grading the prototype, and both were fixed before any matrix
 ran:
@@ -37,7 +43,9 @@ ran:
 Hand cells:
 - `f(next(), xs[i] = next() + 4, next())` prints `163`;
 - string, record, list-of-list and `f64` elements run;
-- a nullable element written `null` is unchanged.
+- a nullable element written `null` is unchanged;
+- a write nested in another (`xs[i] = ys[j] = 5`), two in one expression
+  (`(xs[i] = 8) + (ys[j] = 9)`), and a write in a callee run inside a field write's right-hand side.
 
 ## Measured
 

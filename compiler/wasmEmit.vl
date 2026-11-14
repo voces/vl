@@ -28307,6 +28307,9 @@ let asgParkedSlot = -1
 // Whether that local holds a reference, which a local declares nullable.
 let asgParkedRef = false
 let asgParkWanted = false
+// The target node of the assignment whose store parked into `asgParkedSlot`: a nested write runs
+// its own store inside the right-hand side, so a read checks the park is its own.
+let asgParkedOwner = -1
 
 function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
   asgParkedSlot = -1
@@ -28374,6 +28377,7 @@ function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
   fbLocalSet(storeValSlot) // 0x21 — park the value under the guard operands
   asgParkedSlot = storeValSlot
   asgParkedRef = st.isRef || st.isStr
+  asgParkedOwner = a.binLeft
   // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
   // [backing, safeIndex] resolved AFTER the value ran.
   if stHz >= 0 {
@@ -28576,14 +28580,14 @@ function emitAssignMember(
     fbRefAsNonNull()
   }
   // the scalar covariant copy at the field-store boundary, the construct's twin (D2163)
-  if asgParkWanted { asgParkField(sFieldStoreKind(si, fieldIdx)) }
+  if asgParkWanted { asgParkField(sFieldStoreKind(si, fieldIdx), a.binLeft) }
   fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
   return 0
 }
 
 // Tees the field value on the stack into a scratch local of its own rep for the assignment's
 // value (`asgParkedSlot`); a field of any other kind parks nothing.
-function asgParkField(k: VKind | null) {
+function asgParkField(k: VKind | null, owner: i32) {
   let lk: ListKind = "list"
   if k == null {
     return 0
@@ -28605,6 +28609,7 @@ function asgParkField(k: VKind | null) {
   if k == "str" { fbRefAsNonNull() }
   asgParkedSlot = slot
   asgParkedRef = k == "str"
+  asgParkedOwner = owner
   0
 }
 
@@ -38893,12 +38898,12 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       return emitAsgValue(body, exprIx, fnIx, asgReadUnwidenOp(exprIx, fnIx))
     }
     if asgYieldsParkedCell(exprIx, fnIx) {
-      asgParkedSlot = -1
+      const savedWant = asgParkWanted
       asgParkWanted = true
       const pRc = emitAssign(body, exprIx, fnIx)
-      asgParkWanted = false
+      asgParkWanted = savedWant
       if pRc < 0 { return -1 }
-      if asgParkedSlot < 0 {
+      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
         return emitFail(
           "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
         )
