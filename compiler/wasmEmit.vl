@@ -11,6 +11,7 @@ import { unionArmRowOfTy } from "./emit_local_slots"
 import { unionTyOfRecv } from "./emit_obj_lit_fits"
 import { recKeptFnDstOf } from "./check_rec_rows"
 import { isTestAnswer } from "./check_narrow_flow"
+import { constRangeParts, constRangeTrips } from "./check_range_var"
 import { primTyIxOfName } from "./check_decl_scan"
 import {
   armHeapOfTy,
@@ -319,6 +320,7 @@ import {
   externGlobalLinkOfNode,
   externLinkOf,
   externParamAt,
+  getDeclPropOf,
   hasNamedArgs,
   hasSpreadItem,
   i32ToStr,
@@ -34374,8 +34376,14 @@ function emitForRangeStmt(body: u8[], s: ForRange, stmtIx: i32, fnIx: i32) {
   if aConst && bConst && !dynStep {
     trips = rangeUnrollTrips(s, aVal, bVal, stepK, fnIx)
   }
+  // A getter's constant range is always unrolled, so its lowering holds no loop (§D3a): the step
+  // budget charges a trip at least one step, which keeps it within `UNROLL_MAX_TRIPS`.
+  const gTrips = getterRangeTrips(stmtIx, fnIx)
   let rc = 0
-  if trips > 0 {
+  if gTrips >= 0 {
+    const parts = constRangeParts(stmtIx)
+    rc = emitRangeUnrolled(body, s, fnIx, vIdx, parts[0], parts[2], gTrips)
+  } else if trips > 0 {
     rc = emitRangeUnrolled(body, s, fnIx, vIdx, aVal, stepK, trips)
   } else {
     const rt: RangeTest = {
@@ -34781,6 +34789,17 @@ function emitRangeUnrolled(
   loopBrkDepth.pop()
   loopBrkLabel.pop()
   0
+}
+
+// The trips of the range loop at `stmtIx` when it is a constant range in a getter body, which
+// the getter step budget holds within `UNROLL_MAX_TRIPS`; -1 for any other loop.
+function getterRangeTrips(stmtIx: i32, fnIx: i32): i32 {
+  if fnIx < 0 || fnIx >= P.nodes.length { return -1 }
+  const f = nodeAt(fnIx)
+  if !(f is FuncDecl) || getDeclPropOf(f.fnName) == "" { return -1 }
+  const t = constRangeTrips(stmtIx, UNROLL_MAX_TRIPS + 1)
+  if t > UNROLL_MAX_TRIPS { return -1 }
+  t
 }
 
 // The innermost unrolled copy whose loop var is local `idx`, or -1.
