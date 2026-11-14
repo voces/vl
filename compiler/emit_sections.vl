@@ -1,3 +1,4 @@
+import { repSlotOfKind } from "./emit_rep_slot"
 import { spellTyShadowSweep } from "./emit_union_atoms"
 import { monoPinSpellShaped } from "./pin_spell"
 import { tagRepNameFn } from "./emit_shape_intern"
@@ -230,6 +231,8 @@ import {
   MVK_F64,
   MVK_I64,
   MVK_STR,
+  PK_I16,
+  PK_U16,
   RLK_UNION,
   SYNTH_CLOSURE,
   SYNTH_CONST_LIST,
@@ -361,7 +364,7 @@ import {
   fnUsesRefPush,
   fnUsesStrOp,
   fnUsesStrPush,
-  fnUsesU8Push,
+  fnPackedPushRows,
   fnUsesUnionLetSink,
   fnUsesUnionSink,
   fnUsesVariantRebox,
@@ -531,6 +534,8 @@ import {
   mvValRep,
   mvValTyIx,
   nestedNameBySid,
+  pkBackTy,
+  pkWrapTy,
   reExpName,
   reExpTarget,
   refPushBaseBySlot,
@@ -1159,7 +1164,7 @@ function resetFnScratchFlags() {
   fnUsesF64Push = false
   fnUsesI64Push = false
   fnUsesF32Push = false
-  fnUsesU8Push = false
+  fnPackedPushRows = 0
   fnUsesAtomStage = false
   fnUsesStrOp = false
   fnUsesArrNew = false
@@ -2057,7 +2062,7 @@ function startFnDetectFrames() {
   fnUsesF64Push = false
   fnUsesF32Push = false
   fnUsesI64Push = false
-  // `fnUsesU8Push` and `fnUsesMapVals` are not reset here: the sweep sets them for this body like
+  // `fnPackedPushRows` and `fnUsesMapVals` are not reset here: the sweep sets them for this body like
   // any other, and a stale true from this compile only reserves an unused frame.
   // `emitStateReset` clears both per compile.
   fnUsesAtomStage = false
@@ -2402,7 +2407,7 @@ function emitInitFnCode(out: u8[], k: i32) {
   emitCurFnPos = -1
   nodeTyInstEnter(-1)
   startWalkWindows(ifW0[k], ifW1[k])
-  fnUsesU8Push = false
+  fnPackedPushRows = 0
   fnUsesMapVals = false
   const rc = emitStartBodyCode(out, k)
   rc
@@ -8181,6 +8186,8 @@ function emitOneFuncType(ti: i32) {
         infKind == "struct"
         || infKind == "nulstruct"
         || infKind == "nulreflist"
+        || infKind == "u8list"
+        || infKind == "nulu8list"
       ) {
         infSlot = fRetStructIdx[ti]
       }
@@ -8218,6 +8225,10 @@ function emitOneFuncType(ti: i32) {
       const isRec = retKind == "struct" || retKind == "nulstruct"
       let retSlot = if isRec && ti < fRetStructIdx.length { fRetStructIdx[ti] } else { retStructRowIndex(fn.fnRet) }
       if retKind == "reflist" { retSlot = tyAnnRefListSlot(fn.fnRet) }
+      // A packed list's slot is its row.
+      if retKind == "u8list" || retKind == "nulu8list" {
+        retSlot = repSlotOfKind(retKind, nodeTyIxOf(fn.fnRet))
+      }
       // A NULLABLE ref-array return (`<ref-array> | null`, kind 18) — its slot is the INNER
       // ref-list element wrapper (`tyAnnRefListSlot` strips the `| null` before resolving), so the
       // `(ref null $wrapper)` result valtype selects THIS function's element wrapper.
@@ -8685,13 +8696,16 @@ function tsF32List() {
   tsListWrapBody(fa32TypeIdx)
 }
 
-// The `u8[]` backing is the emitter's first packed storage type: `0x78` is not a valtype, so
-// `array.get` is invalid on it and `fbArrayGet` dispatches to `array.get_u` off this index.
-function tsU8Array() { tsArray(ba8Ty(), "u8 array", 120) }
+// A packed list row's backing: `0x78` (`i8`) or `0x77` (`i16`) storage is not a valtype, so
+// `array.get` is invalid on it and `fbArrayGet` picks `_s` or `_u` off this index.
+function tsPackedArray(row: i32) {
+  const st = if row == PK_U16 || row == PK_I16 { 119 } else { 120 }
+  tsArray(pkBackTy(row), "packed array", st)
+}
 
-function tsU8List() {
-  tsEntryAt(bl8Ty(), "u8 list wrapper")
-  tsListWrapBody(ba8Ty())
+function tsPackedList(row: i32) {
+  tsEntryAt(pkWrapTy(row), "packed list wrapper")
+  tsListWrapBody(pkBackTy(row))
 }
 
 function tsClosure() {
@@ -8844,8 +8858,8 @@ function tsEmitEntry(kind: i32, slot: i32) {
   if kind == TSK_I64_LIST { return tsI64List() }
   if kind == TSK_F32_ARRAY { return tsF32Array() }
   if kind == TSK_F32_LIST { return tsF32List() }
-  if kind == TSK_U8_ARRAY { return tsU8Array() }
-  if kind == TSK_U8_LIST { return tsU8List() }
+  if kind == TSK_U8_ARRAY { return tsPackedArray(slot) }
+  if kind == TSK_U8_LIST { return tsPackedList(slot) }
   if kind == TSK_SV_VIEW { return tsSvView(slot) }
   if kind == TSK_RV_VIEW { return tsRvView(slot) }
   if kind == TSK_CLOSURE { return tsClosure() }

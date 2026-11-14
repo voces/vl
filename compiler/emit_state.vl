@@ -1,8 +1,8 @@
-import { i32ListHas, u8ListEq } from "./listutil"
+import { i32ListHas, i32ListIndexOf, u8ListEq } from "./listutil"
 import { memoGenAdvance, memoGenNew, memoKeyNew, memoMoved } from "./memo"
 import { declOrigOf, identDeclOf } from "./symbols"
 import { fnTagHeldRepOf } from "./check_elab_cap"
-import { TyPrim, tyAt, tySame } from "./check_types"
+import { PrimName, TyPrim, tyAt, tySame } from "./check_types"
 
 // `emit_state.vl` — the emitter's shared mutable state: the output buffer (`W`),
 // WasmGC type-index globals, the collection tables, scratch-slot bases, and
@@ -712,11 +712,28 @@ export let fnUsesI64Push = false // `i64[]`: val i64, backing/recvRef $ia64/$il6
 export let i64PushScratchBase = 0
 export let fnUsesF32Push = false // `f32[]`: val f32, backing/recvRef $fa32/$fl32
 export let f32PushScratchBase = 0
-// `u8[]`: val i32 (a byte VALUE is an i32 — only the backing is packed), backing/recvRef
-// $ba8/$bl8. It needs its OWN quad rather than riding the i32 one for exactly that
-// reason: the value slot matches, the two ref slots do not.
-export let fnUsesU8Push = false
+// The packed lists: one quad per row pushed, val i32 (a stored VALUE is an i32, only the
+// backing is packed) and the row's backing/recvRef. Not the i32 quad: the value slot matches,
+// the two ref slots do not. `fnPackedPushRows` is the row bitmask, bit `r` for row `r`.
+export let fnPackedPushRows = 0
 export let u8PushScratchBase = 0
+
+// The push-kind bit a `.push` onto packed row `row` sets: 128 for `u8`, then 1024, 2048, 4096.
+export function pkPushBit(row: i32): i32 {
+  if row <= 0 { return 128 }
+  1024 * (1 << (row - 1))
+}
+
+// The base of packed row `row`'s push quad: the quads sit in row order from `u8PushScratchBase`.
+export function pkPushBase(row: i32): i32 {
+  let n = 0
+  let r = 0
+  while r < row {
+    if (fnPackedPushRows & (1 << r)) != 0 { n = n + 1 }
+    r = r + 1
+  }
+  u8PushScratchBase + 4 * n
+}
 export let strPushScratchBase = 0
 // Per-function string-op scratch locals (G6: `+`/`==`/`!=`/`.slice`): the remaining
 // string ops (slice, ordering, indexOf, charCodeAt) lower inline and need temporaries
@@ -1271,11 +1288,15 @@ export let il64TypeIdx = -1
 // The f32-list pair, minted on first ask by `fa32Ty`/`fl32Ty`; -1 while the module has none.
 export let fa32TypeIdx = -1
 export let fl32TypeIdx = -1
-// The packed byte list (`u8[]`): a `(array (mut i8))` backing under the scalar list wrapper,
-// read by `array.get_u` (`fbArrayGet` dispatches on the heap index). Minted on first ask by
-// `ba8Ty`/`bl8Ty`; -1 while the module has none.
-export let ba8TypeIdx = -1
-export let bl8TypeIdx = -1
+// The packed lists, one row per storage width (`PK_U8` .. `PK_I16`): an `(array (mut i8))` or
+// `(mut i16)` backing under the scalar list wrapper, which `fbArrayGet` reads with the row's
+// sign. Minted on first ask by `pkBackTy`/`pkWrapTy`; -1 while the module has none.
+export let pkBackIdx: i32[] = [-1, -1, -1, -1]
+export let pkWrapIdx: i32[] = [-1, -1, -1, -1]
+export const PK_U8 = 0
+export const PK_I8 = 1
+export const PK_U16 = 2
+export const PK_I16 = 3
 // Linear-memory intrinsics (`__store_i32__`/`__load_i32__`/`__log__`): `memUsed` gates
 // the module-defined memory; `memLogUsed` additionally gates the synthetic `__log__`
 // decoder. The native runner provides neither host import, so the native module
@@ -2194,26 +2215,59 @@ export function fl32Ty(): i32 {
 export function isFl32Ty(w: i32): boolean {
   fl32TypeIdx >= 0 && w == fl32TypeIdx
 }
-// The packed byte list's backing array type, minting the pair on first ask.
-export function ba8Ty(): i32 {
-  if ba8TypeIdx < 0 {
-    ba8TypeIdx = mAllocType(TSK_U8_ARRAY, 0)
-    bl8TypeIdx = mAllocType(TSK_U8_LIST, 0)
+// Packed list row `row`'s backing array type, minting the row's pair on first ask; -1 for a
+// row that names no width, which a caller reports (`pkRowOfTy` fails before it gets here).
+export function pkBackTy(row: i32): i32 {
+  if row < 0 || row >= pkBackIdx.length { return -1 }
+  if pkBackIdx[row] < 0 {
+    pkBackIdx[row] = mAllocType(TSK_U8_ARRAY, row)
+    pkWrapIdx[row] = mAllocType(TSK_U8_LIST, row)
   }
-  ba8TypeIdx
+  pkBackIdx[row]
 }
 
-// The packed byte list's wrapper struct type, minting the pair on first ask.
-export function bl8Ty(): i32 {
-  ba8Ty()
-  bl8TypeIdx
+// Packed list row `row`'s wrapper struct type, minting the row's pair on first ask.
+export function pkWrapTy(row: i32): i32 {
+  const b = pkBackTy(row)
+  if b < 0 { return b }
+  pkWrapIdx[row]
 }
 
-// Whether heap type `h` is the packed byte list's backing; false while the pair is unminted.
-export function isBa8Ty(h: i32): boolean { ba8TypeIdx >= 0 && h == ba8TypeIdx }
+// The packed row whose backing is heap type `h`, or -1 when `h` is no packed backing.
+export function pkRowOfBack(h: i32): i32 {
+  if h < 0 { return -1 }
+  i32ListIndexOf(pkBackIdx, h)
+}
 
-// Whether heap type `w` is the packed byte list's wrapper; false while the pair is unminted.
-export function isBl8Ty(w: i32): boolean { bl8TypeIdx >= 0 && w == bl8TypeIdx }
+// The packed row whose wrapper is heap type `w`, or -1 when `w` is no packed wrapper.
+export function pkRowOfWrap(w: i32): i32 {
+  if w < 0 { return -1 }
+  i32ListIndexOf(pkWrapIdx, w)
+}
+
+// The packed row storing element primitive `p`, or -1 for a value primitive.
+export function pkRowOfPrim(p: PrimName | null): i32 {
+  match p {
+    "u8" => PK_U8
+    "i8" => PK_I8
+    "u16" => PK_U16
+    "i16" => PK_I16
+    "i32" | "i64" | "f32" | "f64" | "boolean" | "string" | "void" | "null" | "never" | "v128" | null => -1
+  }
+}
+
+// Slot `si` as a packed row, the `u8` row when the caller carries none. A wrong row is never
+// silent: each row is its own rec-group type, so a mismatch fails wasm validation.
+export function pkRowOr(si: i32): i32 {
+  if si >= 0 && si < pkBackIdx.length { return si }
+  PK_U8
+}
+
+// The `u8[]` row's backing, the one `string.bytes()` and the byte intrinsics share.
+export function ba8Ty(): i32 { pkBackTy(PK_U8) }
+
+// The `u8[]` row's wrapper.
+export function bl8Ty(): i32 { pkWrapTy(PK_U8) }
 export const TSK_STRUCT = 0    // declared struct, slot = struct row
 export const TSK_VARIANT = 1   // union variant struct, slot = variant row
 export const TSK_UNION_BOX = 2
@@ -2610,8 +2664,8 @@ export function emitStateReset() {
   aTypeIdx = 0
   arrNewScratchBase = 0
   atomStageSlot = 0
-  ba8TypeIdx = -1
-  bl8TypeIdx = -1
+  pkBackIdx = [-1, -1, -1, -1]
+  pkWrapIdx = [-1, -1, -1, -1]
   cloEqScratchBase = 0
   cloSigBase = 0
   cloStructIdx = 0
@@ -2635,7 +2689,7 @@ export function emitStateReset() {
   fl32TypeIdx = -1
   fl64TypeIdx = -1
   fnUsesMapVals = false
-  fnUsesU8Push = false
+  fnPackedPushRows = 0
   gConstExprEmit = false
   gHelpSvGet = []
   gHelpSvLen = []
