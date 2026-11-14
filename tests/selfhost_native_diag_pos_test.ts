@@ -578,7 +578,7 @@ Deno.test({
 // delivery points at `zs`, and a copy that is accepted reports nothing about the synthesized nodes.
 const FN_SET_LIST = "function id<T>(x: T): T { return x }\n" +
   "function dbl<T>(x: T): T { return x + x }\n" +
-  'let f = id\nf = dbl\nprint(f("s"))\nprint(f(1))\nconst zs = [f]\n';
+  'let f = id\nif "a".length > 0 { f = dbl }\nprint(f("s"))\nprint(f(1))\nconst zs = [f]\n';
 
 Deno.test({
   name:
@@ -622,7 +622,8 @@ Deno.test({
     "native-diag-pos: a mutable list sharing a fn-set list points at the user's source",
   ignore: !ENABLED,
   fn: async () => {
-    // D15133: the refusal names the delivered `zs`, not the literal its `const` names.
+    // D15133: the refusal names the delivered `zs`, not the literal its `const` names. The write
+    // is in a branch, so `f` holds both functions (D15956).
     await assertPositioned(
       FN_SET_LIST + "const ys: ((x: i32) => i32)[] = zs\nprint(ys[0](41))\n",
       "type",
