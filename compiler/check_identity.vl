@@ -22,10 +22,11 @@ import {
   TyUnion,
   TyVar,
   tyAt,
+  tyMentionsErr,
   tyToStr,
 } from "./check_types"
 import { nodeLastTok } from "./fmt_util"
-import { isNullTy } from "./tyquery"
+import { isNullTy, nonNullTy } from "./tyquery"
 
 // Whether a value of type `ty` has an identity `===` can compare: a record, a list, a map, a
 // function, a nullable of one, or a union whose arms are all records or all functions. A type
@@ -195,4 +196,57 @@ export function tyFnPosition(ty: i32, seen: i32[]): string {
       return ""
     }
   }
+}
+
+// The first field of record `ty` (a nullable peeled) that can hold a function, or "".
+function fnFieldName(ty: i32): string {
+  const t = tyAt(nonNullTy(ty))
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length {
+      if tyFnPosition(t.objFieldTypes[i], []) != "" {
+        return t.objFieldNames[i]
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// Refuses `==`/`!=` (at `ix`, operand types `lt`/`rt`) when both operands can hold a function,
+// which has no value to compare (DECISIONS A15); true when refused. A null or scalar operand
+// cannot, so `cb == null` and `u == 5` stay legal; an operand an earlier error typed is skipped.
+export function fnEqRefused(ix: i32, op: string, lt: i32, rt: i32): boolean {
+  if tyMentionsErr(lt, 8) || tyMentionsErr(rt, 8) { return false }
+  const lp = tyFnPosition(lt, [])
+  if lp == "" || tyFnPosition(rt, []) == "" { return false }
+  let advice = "use `" + op + "=` for identity"
+  if lp == "arm" && !(tyHasIdentity(lt) && tyHasIdentity(rt)) {
+    advice = "narrow both to the same arm first"
+  }
+  let what = "a function"
+  if lp == "field" {
+    what = "`"
+      + tyToStr(lt)
+      + "`'s field `"
+      + fnFieldName(lt)
+      + "`, a function,"
+    advice = "compare the other fields, or " + advice
+  }
+  if lp == "elem" { what = "a list of functions" }
+  if lp == "arm" { what = "a union with a function arm" }
+  tErr(
+    "`"
+      + op
+      + "` compares values, and "
+      + what
+      + " has none: `"
+      + tyToStr(lt)
+      + "` and `"
+      + tyToStr(rt)
+      + "` can both hold a function — "
+      + advice,
+    ix,
+  )
+  true
 }
