@@ -18,7 +18,7 @@ further templates, filed the same way. The 24 cells are the named set
 | D16364 | 1 | function declared before a module-level `[]` that later top-level code pins | open |
 | D16365 | 1 | un-annotated parameter handed `[]`, two records of an empty-list field | open |
 
-## Change (net compiler lines +6; pin-helper delta 0)
+## Change (net compiler lines +8; pin-helper delta 0)
 
 - D16360 (`check_member_call`): every later write into a container slot is checked with
   `assignableExpr`, which records the value's delivery at the slot (`recordCtxTy`). The first
