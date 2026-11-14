@@ -12,6 +12,7 @@ import { unionArmRowOfTy } from "./emit_local_slots"
 import { unionTyOfRecv } from "./emit_obj_lit_fits"
 import { recKeptFnDstOf } from "./check_rec_rows"
 import { isTestAnswer } from "./check_narrow_flow"
+import { tyFnPosition } from "./check_identity"
 import { constRangeParts, constRangeTrips } from "./check_range_var"
 import { esGetterReach } from "./check_effect_rows"
 import { primTyIxOfName } from "./check_decl_scan"
@@ -1257,6 +1258,7 @@ import {
   SPREAD_NUL_REF,
   chainHasPrelude,
   exprIsNullLike,
+  exprIsNullLit,
   fnTagIdSlot,
   ifChainAllBareNull,
   ifLinkYieldsNull,
@@ -1415,7 +1417,6 @@ import {
   sFieldRefSlot,
   structRowFieldStoresAtom,
   structRowOfAnnTy,
-  tyIsFuncOrNulFunc,
   uFieldTgtStructIdx,
   variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
@@ -39029,41 +39030,29 @@ function emitAsgRadixAs(
   0
 }
 
-// `a === b` / `a !== b`, reference identity (DECISIONS A15). Two function values compare as `==`
-// compares them, which is already identity (declaration and environment); every other operand
-// is a reference compared by `ref.eq`, a union box by its payload, never the box itself.
-function emitIdentityBin(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
-  const ne = e.binOp == "!=="
-  if (
-    identityOperandIsFn(e.binLeft, fnIx)
-    || identityOperandIsFn(e.binRight, fnIx)
-  ) {
-    const saved = nodeAt(exprIx)
-    const eq: BinExpr = {
-      binOp: if ne { "!=" } else { "==" },
-      binLeft: e.binLeft,
-      binRight: e.binRight,
-      pos: e.pos,
-      binCompound: e.binCompound,
-      binTpl: e.binTpl,
-      binRegion: e.binRegion,
-    }
-    arenaSetNode(exprIx, eq)
-    const rc = emitBinExprNode(body, eq, exprIx, fnIx)
-    arenaSetNode(exprIx, saved)
-    return rc
-  }
+// Whether identity compare `e` lowers to `ref.eq`: not when an operand is `null` or holds a
+// function, whose `==` lowering is already identity (declaration and environment).
+function emitIdentityIsRefEq(e: BinExpr, fnIx: i32): boolean {
+  if exprIsNullLit(e.binLeft) || exprIsNullLit(e.binRight) { return false }
+  !identityOperandIsFn(e.binLeft, fnIx)
+    && !identityOperandIsFn(e.binRight, fnIx)
+}
+
+// `a === b` / `a !== b` over references, `ref.eq`, a union box by its payload, never the box.
+function emitIdentityBin(body: u8[], e: BinExpr, _exprIx: i32, fnIx: i32) {
   if emitIdentityOperand(body, e.binLeft, fnIx) < 0 { return -1 }
   if emitIdentityOperand(body, e.binRight, fnIx) < 0 { return -1 }
   fbRefEq()
-  if ne { fbI32Eqz() }
+  if e.binOp == "!=" { fbI32Eqz() }
   0
 }
 
-// Whether identity operand `ix` holds a function value, nullable or not.
+// Whether identity operand `ix` can hold a function value, itself, through a nullable, or as a
+// union arm: function identity (declaration and environment) is the `==` lowering's.
 function identityOperandIsFn(ix: i32, fnIx: i32): boolean {
-  exprIsClosure(ix, fnIx)
-    || tyIsFuncOrNulFunc(nodeTyInOf(unwrapParen(ix), fnIx))
+  if exprIsClosure(ix, fnIx) { return true }
+  const fp = tyFnPosition(nodeTyInOf(unwrapParen(ix), fnIx), [])
+  fp == "fn" || fp == "arm"
 }
 
 // Whether `ty`, a nullable peeled, is a union, whose values are boxes.
@@ -39088,7 +39077,7 @@ function emitIdentityOperand(body: u8[], ix: i32, fnIx: i32): i32 {
 }
 
 function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
-  if e.binOp == "===" || e.binOp == "!==" {
+  if e.binIdent != 0 && emitIdentityIsRefEq(e, fnIx) {
     return emitIdentityBin(body, e, exprIx, fnIx)
   }
   // A mask that only zero-extends a load is the zero-extending load itself (`zextLoadOf`).
