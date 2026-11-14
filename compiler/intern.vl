@@ -1,29 +1,48 @@
 // `intern.vl` — the structural intern table: `(tag, args)` to one `i32` id, so two keys with the
 // same tag and the same argument ids are one id. The caller owns what a tag means and keeps the
 // argument ids canonical; a key compares shallowly, so the table never recurses. Each id carries
-// one caller-supplied `len` column. Imports nothing; `internReset` empties it.
+// one caller-supplied `len` column. Imports nothing. A table is an `Interner` value; the module's
+// own instance serves `internId` and its siblings, and a caller with a second id space mints one
+// with `internNew`.
 
-let inTag: i32[] = []
-let inArgStart: i32[] = []
-let inArgCount: i32[] = []
-let inArgs: i32[] = []
-let inHashV: i32[] = []
-let inLen: i32[] = []
-let inNext: i32[] = []
-let inBucket: i32[] = []
-let inMask = -1
+export type Interner = {
+  inTag: i32[],
+  inArgStart: i32[],
+  inArgCount: i32[],
+  inArgs: i32[],
+  inHashV: i32[],
+  inLen: i32[],
+  inNext: i32[],
+  inBucket: i32[],
+  inMask: i32,
+}
 
-// Empties the table; every id minted before it means nothing after it.
-export function internReset() {
-  inTag = []
-  inArgStart = []
-  inArgCount = []
-  inArgs = []
-  inHashV = []
-  inLen = []
-  inNext = []
-  inBucket = []
-  inMask = -1
+// A new, empty table.
+export function internNew(): Interner {
+  {
+    inTag: [],
+    inArgStart: [],
+    inArgCount: [],
+    inArgs: [],
+    inHashV: [],
+    inLen: [],
+    inNext: [],
+    inBucket: [],
+    inMask: -1,
+  }
+}
+
+// Empties table `t`; every id it minted before means nothing after.
+export function internResetIn(t: Interner) {
+  t.inTag = []
+  t.inArgStart = []
+  t.inArgCount = []
+  t.inArgs = []
+  t.inHashV = []
+  t.inLen = []
+  t.inNext = []
+  t.inBucket = []
+  t.inMask = -1
   0
 }
 
@@ -40,82 +59,107 @@ function internHash(tag: i32, args: i32[]): i32 {
   h & 0x3fffffff
 }
 
-function internGrow() {
+function internGrow(t: Interner) {
   let cap = 16
-  while cap < inTag.length * 2 { cap = cap * 2 }
-  inBucket = []
+  while cap < t.inTag.length * 2 { cap = cap * 2 }
+  const bucket: i32[] = []
   let i = 0
   while i < cap {
-    inBucket.push(-1)
+    bucket.push(-1)
     i = i + 1
   }
-  inMask = cap - 1
+  t.inBucket = bucket
+  t.inMask = cap - 1
   let id = 0
-  while id < inTag.length {
-    const b = inHashV[id] & inMask
-    inNext[id] = inBucket[b]
-    inBucket[b] = id
+  while id < t.inTag.length {
+    const b = t.inHashV[id] & t.inMask
+    t.inNext[id] = t.inBucket[b]
+    t.inBucket[b] = id
     id = id + 1
   }
   0
 }
 
-// The id of key `(tag, args)`, minting it with length `len` when new; a hit keeps the first
-// mint's length.
-export function internId(tag: i32, args: i32[], len: i32): i32 {
-  if inMask < 0 { internGrow() }
+// The id of key `(tag, args)` in table `t`, minting it with length `len` when new; a hit keeps
+// the first mint's length.
+export function internIdIn(t: Interner, tag: i32, args: i32[], len: i32): i32 {
+  if t.inMask < 0 { internGrow(t) }
   const h = internHash(tag, args)
-  let b = inBucket[h & inMask]
+  let b = t.inBucket[h & t.inMask]
   while b >= 0 {
-    if inHashV[b] == h && inTag[b] == tag && inArgCount[b] == args.length {
+    if (
+      t.inHashV[b] == h
+      && t.inTag[b] == tag
+      && t.inArgCount[b] == args.length
+    ) {
       let ok = true
-      const st = inArgStart[b]
+      const st = t.inArgStart[b]
       let i = 0
       while i < args.length {
-        if inArgs[st + i] != args[i] { ok = false }
+        if t.inArgs[st + i] != args[i] { ok = false }
         i = i + 1
       }
       if ok { return b }
     }
-    b = inNext[b]
+    b = t.inNext[b]
   }
-  const id = inTag.length
-  inTag.push(tag)
-  inArgStart.push(inArgs.length)
-  inArgCount.push(args.length)
-  inHashV.push(h)
-  inLen.push(len)
-  inNext.push(-1)
+  const id = t.inTag.length
+  t.inTag.push(tag)
+  t.inArgStart.push(t.inArgs.length)
+  t.inArgCount.push(args.length)
+  t.inHashV.push(h)
+  t.inLen.push(len)
+  t.inNext.push(-1)
   let j = 0
   while j < args.length {
-    inArgs.push(args[j])
+    t.inArgs.push(args[j])
     j = j + 1
   }
   // Grow after the push so the rebuild chains the new entry too; otherwise insert it.
-  if inTag.length * 4 > (inMask + 1) * 3 {
-    internGrow()
+  if t.inTag.length * 4 > (t.inMask + 1) * 3 {
+    internGrow(t)
   } else {
-    const bi = h & inMask
-    inNext[id] = inBucket[bi]
-    inBucket[bi] = id
+    const bi = h & t.inMask
+    t.inNext[id] = t.inBucket[bi]
+    t.inBucket[bi] = id
   }
   id
 }
 
-// The length minted with id `i`, or -1 for no such id.
-export function internLen(i: i32): i32 {
-  if i < 0 || i >= inLen.length { return -1 }
-  inLen[i]
+// The length minted with id `i` in table `t`, or -1 for no such id.
+export function internLenIn(t: Interner, i: i32): i32 {
+  if i < 0 || i >= t.inLen.length { return -1 }
+  t.inLen[i]
 }
 
-// The tag of id `i`, or -1 for no such id.
-export function internTag(i: i32): i32 {
-  if i < 0 || i >= inTag.length { return -1 }
-  inTag[i]
+// The tag of id `i` in table `t`, or -1 for no such id.
+export function internTagIn(t: Interner, i: i32): i32 {
+  if i < 0 || i >= t.inTag.length { return -1 }
+  t.inTag[i]
 }
 
-// Argument `k` of id `i`, or -1 when `i` has no such id or argument.
-export function internArg(i: i32, k: i32): i32 {
-  if i < 0 || i >= inTag.length || k < 0 || k >= inArgCount[i] { return -1 }
-  inArgs[inArgStart[i] + k]
+// Argument `k` of id `i` in table `t`, or -1 when `i` has no such id or argument.
+export function internArgIn(t: Interner, i: i32, k: i32): i32 {
+  if i < 0 || i >= t.inTag.length || k < 0 || k >= t.inArgCount[i] { return -1 }
+  t.inArgs[t.inArgStart[i] + k]
 }
+
+// The module's own table, which the five functions below read and write.
+const own: Interner = internNew()
+
+// Empties the module's table; every id minted before it means nothing after it.
+export function internReset() { internResetIn(own) }
+
+// The id of key `(tag, args)` in the module's table (`internIdIn`).
+export function internId(tag: i32, args: i32[], len: i32): i32 {
+  internIdIn(own, tag, args, len)
+}
+
+// The length minted with id `i` in the module's table, or -1 for no such id.
+export function internLen(i: i32): i32 { internLenIn(own, i) }
+
+// The tag of id `i` in the module's table, or -1 for no such id.
+export function internTag(i: i32): i32 { internTagIn(own, i) }
+
+// Argument `k` of id `i` in the module's table, or -1 when there is no such id or argument.
+export function internArg(i: i32, k: i32): i32 { internArgIn(own, i, k) }
