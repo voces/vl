@@ -14077,7 +14077,11 @@ function elabSlotFacts() {
     elabSlotUnfacted = []
     for h in left {
       const ft = eplHolderTy(h, -1)
-      if ft >= 0 { elabSlotTys[elabSlotKey(h, -1)] = ft } else { elabSlotUnfacted.push(h) }
+      if ft >= 0 {
+        elabSlotTys[elabSlotKey(h, -1)] = ft
+      } else {
+        elabSlotUnfacted.push(h)
+      }
     }
   }
   elabSlotInstFacts(inst, instFn)
@@ -21141,11 +21145,16 @@ let eplMembers: i32[][] = []
 let eplCalls: i32[][] = []
 let eplPending: i32[] = []
 
+// Per class: its bound once asked (-2 before), the node it comes from, and that node's instance.
 let eplBound: i32[] = []
+let eplBoundSrc: i32[] = []
+let eplBoundK: i32[] = []
 
 function eplNew(): i32 {
   const id = eplPar.length
-  eplBound.push(-1)
+  eplBound.push(-2)
+  eplBoundSrc.push(-1)
+  eplBoundK.push(-1)
   eplPar.push(id)
   eplKids.push(Map())
   eplMembers.push([])
@@ -21222,13 +21231,15 @@ function eplCallTarget(c: i32, fd: i32, k: i32): i32 {
   const row = elabCallKeys[c] ?? []
   let i = 0
   while i + 1 < row.length {
-    if row[i] == k && row[i + 1] >= 0 && ekDecl[row[i + 1]] == fd { return row[i + 1] }
+    if row[i] == k && row[i + 1] >= 0 && ekDecl[row[i + 1]] == fd {
+      return row[i + 1]
+    }
     i = i + 2
   }
   -2
 }
 
-// The instance a callback or function-value argument `x` was instanced at from instance `k`;
+// The instance the elaboration builds callback or function-value argument `x` at from instance `k`;
 // -1 for a function with no instances.
 function eplValueTarget(x: i32, k: i32): i32 {
   if !eplInstanced(x) || !eplHasInst(x) { return eplKeyOfFn(x) }
@@ -21247,7 +21258,9 @@ function eplKeyedCallee(c: i32): i32[] {
   const row = elabCallKeys[c] ?? []
   let i = 0
   while i + 1 < row.length {
-    if row[i] == eplK && row[i + 1] >= 0 && row[i + 1] < ekDecl.length { return [ekDecl[row[i + 1]]] }
+    if row[i] == eplK && row[i + 1] >= 0 && row[i + 1] < ekDecl.length {
+      return [ekDecl[row[i + 1]]]
+    }
     i = i + 2
   }
   []
@@ -21271,7 +21284,14 @@ function eplMethodCallee(cf: i32): i32[] {
   const cn = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
   if !(cn is Member) { return [] }
   const d = memberDeclOf(cf)
-  if d < 0 || d >= P.nodes.length || methodFnOfDecl(d) != d || !(nodeAt(d) is FuncDecl) { return [] }
+  if (
+    d < 0
+    || d >= P.nodes.length
+    || methodFnOfDecl(d) != d
+    || !(nodeAt(d) is FuncDecl)
+  ) {
+    return []
+  }
   [d]
 }
 
@@ -21282,19 +21302,35 @@ function eplRootK(n: i32, kk: i32): i32 {
   if have >= 0 { return eplFind(have) }
   const id = eplNew()
   eplKey[k] = id
-  eplBound[id] = eplWrittenTy(n)
+  if id >= 0 && id < eplBoundSrc.length && eplAnnotated(n) {
+    eplBoundSrc[id] = n
+  }
   id
 }
 
-// The closed type a holder's written annotation gives it, which bounds its whole class; -1 for an
-// un-annotated holder or an annotation that stays open.
-function eplWrittenTy(n: i32): i32 {
+// Whether holder `n` is written with an annotation, which bounds its whole class.
+function eplAnnotated(n: i32): boolean {
   const nd = if n >= 0 && n < P.nodes.length { nodeAt(n) } else { null }
-  const ann = if nd is LetDecl { nd.letType >= 0 } else if nd is Param { nd.parType >= 0 } else { false }
-  if !ann { return -1 }
-  const t = nodeTyIxOf(n)
-  if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyReachesHole(t, 16) { return -1 }
-  t
+  if nd is LetDecl { nd.letType >= 0 }
+  else if nd is Param { nd.parType >= 0 }
+  else { false }
+}
+
+// Class `r`'s bound: the closed type of its annotated holder or of a call result the elaboration
+// closed, asked once per class; -1 for none.
+function eplBoundOf(r: i32): i32 {
+  if r < 0 || r >= eplBound.length { return -1 }
+  if eplBound[r] != -2 { return eplBound[r] }
+  const x = eplBoundSrc[r]
+  const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  const te = if xn is Call { elabNodeTy(x, eplBoundK[r]) } else { -1 }
+  const t = if te >= 0 { te } else if x >= 0 { nodeTyIxOf(x) } else { -1 }
+  const ok = t >= 0
+    && t < T.tys.length
+    && !tyHasTyVar(t)
+    && !tyReachesHole(t, 16)
+  eplBound[r] = if ok { t } else { -1 }
+  eplBound[r]
 }
 
 function eplChild(p: i32, step: string): i32 {
@@ -21316,11 +21352,18 @@ function eplUnion(a0: i32, b0: i32) {
     eplPending.pop()
     const a = eplFind(eplPending[eplPending.length - 1])
     eplPending.pop()
-    if a != b {
+    if a != b && a >= 0 && b >= 0 {
       eplPar[b] = a
-      if eplBound[a] < 0 { eplBound[a] = eplBound[b] }
-      for m in eplMembers[b] { if !i32ListHas(eplMembers[a], m) { eplMembers[a].push(m) } }
-      for c in eplCalls[b] { if !i32ListHas(eplCalls[a], c) { eplCalls[a].push(c) } }
+      if eplBoundSrc[a] < 0 {
+        eplBoundSrc[a] = eplBoundSrc[b]
+        eplBoundK[a] = eplBoundK[b]
+      }
+      for m in eplMembers[b] {
+        if !i32ListHas(eplMembers[a], m) { eplMembers[a].push(m) }
+      }
+      for c in eplCalls[b] {
+        if !i32ListHas(eplCalls[a], c) { eplCalls[a].push(c) }
+      }
       for st in eplKids[b].keys() {
         const cb = eplKids[b][st] ?? -1
         const ca = eplKids[a][st] ?? -1
@@ -21342,7 +21385,14 @@ function eplInstanced(fd: i32): boolean {
 }
 
 function eplCbMethod(m: string): boolean {
-  m == "map" || m == "filter" || m == "forEach" || m == "find" || m == "findIndex" || m == "some" || m == "every" || m == "reduce"
+  m == "map"
+    || m == "filter"
+    || m == "forEach"
+    || m == "find"
+    || m == "findIndex"
+    || m == "some"
+    || m == "every"
+    || m == "reduce"
 }
 
 // The function a callback argument names: a lambda literal or a named declaration.
@@ -21358,6 +21408,10 @@ let eplFlowDst: i32[] = []
 let eplFwd: {[i32]: i32[]} = Map()
 let eplBwd: {[i32]: i32[]} = Map()
 let eplAdjN = -1
+// Per class root (times two, plus one forward), the classes `eplReach` found, once unions end.
+let eplReachMemo: {[i32]: i32[]} = Map()
+// Per class root, `eplOneCall`'s answer.
+let eplOneMemo: {[i32]: i32} = Map()
 
 // A value edge from `src` to `dst`: a function value is copied (its members flow forward, the
 // calls through the copy flow back); any other value is shared, so the two places unify.
@@ -21401,7 +21455,11 @@ function eplAdj() {
 // The classes reachable from `p`'s class along flow edges, forward or backward, `p`'s own first.
 function eplReach(p: i32, fwd: boolean): i32[] {
   eplAdj()
-  const out: i32[] = [eplFind(p)]
+  const r0 = eplFind(p)
+  const key = if fwd { r0 * 2 + 1 } else { r0 * 2 }
+  const memo = eplReachMemo.get(key)
+  if memo != null { return memo }
+  const out: i32[] = [r0]
   let i = 0
   while i < out.length && out.length < 256 {
     const nx = if fwd { eplFwd[out[i]] ?? [] } else { eplBwd[out[i]] ?? [] }
@@ -21411,20 +21469,27 @@ function eplReach(p: i32, fwd: boolean): i32[] {
     }
     i = i + 1
   }
+  eplReachMemo[key] = out
   out
 }
 
 // The calls through `p` or any copy it flows into.
 function eplCallsStar(p: i32): i32[] {
   const out: i32[] = []
-  for c in eplReach(p, true) { for ci in eplCalls[c] { out.push(ci) } }
+  for c in eplReach(p, true) {
+    for ci in eplCalls[c] { out.push(ci) }
+  }
   out
 }
 
 // The functions `p` or any place flowing into it holds.
 function eplMembersStar(p: i32): i32[] {
   const out: i32[] = []
-  for c in eplReach(p, false) { for m in eplMembers[c] { if !i32ListHas(out, m) { out.push(m) } } }
+  for c in eplReach(p, false) {
+    for m in eplMembers[c] {
+      if !i32ListHas(out, m) { out.push(m) }
+    }
+  }
   out
 }
 
@@ -21442,7 +21507,9 @@ function eplPlaceOf(x0: i32, depth: i32): i32 {
   const n = nodeAt(x)
   if n is Ident {
     const d = identDeclOf(x)
-    if d >= 0 && d < P.nodes.length && !(nodeAt(d) is FuncDecl) { return eplRoot(d) }
+    if d >= 0 && d < P.nodes.length && !(nodeAt(d) is FuncDecl) {
+      return eplRoot(d)
+    }
     const p = eplRoot(x)
     if p >= 0 && d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl {
       if !i32ListHas(eplMembers[p], d) { eplMembers[p].push(d) }
@@ -21451,32 +21518,43 @@ function eplPlaceOf(x0: i32, depth: i32): i32 {
   }
   if n is FuncDecl {
     const own = eplKeyOfFn(x)
-    const p = eplRootK(x, if own == -2 { eplKeyFor(recEnclosingFn(x)) } else { own })
+    const p = eplRootK(
+      x,
+      if own == -2 { eplKeyFor(recEnclosingFn(x)) } else { own },
+    )
     if p >= 0 && !i32ListHas(eplMembers[p], x) { eplMembers[p].push(x) }
     return p
   }
-  if n is Index { return eplChild(eplPlaceOf(n.idxArr, depth + 1), eplStepOfRecv(n.idxArr)) }
-  if n is Member { return eplChild(eplPlaceOf(n.memObj, depth + 1), "f." + n.memProp) }
-  if n is OptMember { return eplChild(eplPlaceOf(n.omObj, depth + 1), "f." + n.omProp) }
+  if n is Index {
+    return eplChild(eplPlaceOf(n.idxArr, depth + 1), eplStepOfRecv(n.idxArr))
+  }
+  if n is Member {
+    return eplChild(eplPlaceOf(n.memObj, depth + 1), "f." + n.memProp)
+  }
+  if n is OptMember {
+    return eplChild(eplPlaceOf(n.omObj, depth + 1), "f." + n.omProp)
+  }
   if n is Call {
     const cf = parenPeelIx(n.callFn)
     const cn = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
     if cn is Member {
       const m = cn.memProp
       if m == "pop" || m == "get" || m == "at" || m == "find" || m == "shift" {
-        return eplChild(eplPlaceOf(cn.memObj, depth + 1), eplStepOfRecv(cn.memObj))
+        return eplChild(
+          eplPlaceOf(cn.memObj, depth + 1),
+          eplStepOfRecv(cn.memObj),
+        )
       }
       if m == "slice" || m == "filter" || m == "reverse" || m == "concat" {
         return eplPlaceOf(cn.memObj, depth + 1)
       }
     }
     // A call result the elaboration already closed is built at that type, as a written one is.
-    const cp = eplCallPlace(n, x, cf, depth)
-    const te0 = elabNodeTy(x, eplK)
-    const tc0 = if te0 >= 0 { te0 } else { nodeTyIxOf(x) }
-    if cp >= 0 && tc0 >= 0 && tc0 < T.tys.length && !tyHasTyVar(tc0) && !tyReachesHole(tc0, 16) {
-      const rc = eplFind(cp)
-      if eplBound[rc] < 0 { eplBound[rc] = tc0 }
+    const cp = eplCallPlace(n, x, cf)
+    const rc = if cp >= 0 { eplFind(cp) } else { -1 }
+    if rc >= 0 && eplBoundSrc[rc] < 0 {
+      eplBoundSrc[rc] = x
+      eplBoundK[rc] = eplK
     }
     return cp
   }
@@ -21485,11 +21563,13 @@ function eplPlaceOf(x0: i32, depth: i32): i32 {
 
 // The place call `x` (`n`, callee `cf`) yields: its declared callee's result in the instance it
 // runs, else the call itself.
-function eplCallPlace(n: Call, x: i32, cf: i32, depth: i32): i32 {
+function eplCallPlace(n: Call, x: i32, cf: i32): i32 {
   const fds0 = elabCalleeFns(n)
   const fds1 = if fds0.length > 0 { fds0 } else { eplMethodCallee(cf) }
   const fds = if fds1.length > 0 { fds1 } else { eplKeyedCallee(x) }
-  if fds.length == 1 { return eplChild(eplRootK(fds[0], eplCallTarget(x, fds[0], eplK)), "r") }
+  if fds.length == 1 {
+    return eplChild(eplRootK(fds[0], eplCallTarget(x, fds[0], eplK)), "r")
+  }
   eplRoot(x)
 }
 
@@ -21527,7 +21607,9 @@ function eplEdges() {
 // set or bundle that parameter binds is shared, so their places unify (architecture-target §2.4).
 function eplTyParamShare(fx: i32) {
   const fd = nodeAt(fx)
-  if !(fd is FuncDecl) || fd.fnTyParams.length == 0 || fd.fnParams.length < 2 { return 0 }
+  if !(fd is FuncDecl) || fd.fnTyParams.length == 0 || fd.fnParams.length < 2 {
+    return 0
+  }
   let kk = 0
   while kk < ekDecl.length {
     if ekDecl[kk] == fx && !(elabGuessKeys.get(kk) ?? false) {
@@ -21536,7 +21618,12 @@ function eplTyParamShare(fx: i32) {
       while i < fd.fnParams.length {
         const ti = nodeTyIxOf(fd.fnParams[i])
         let j = i + 1
-        while j < fd.fnParams.length && ti >= 0 && ti < T.tys.length && tyAt(ti) is TyVar {
+        while (
+          j < fd.fnParams.length
+          && ti >= 0
+          && ti < T.tys.length
+          && tyAt(ti) is TyVar
+        ) {
           if tySame(ti, nodeTyIxOf(fd.fnParams[j])) {
             eplUnion(eplRoot(fd.fnParams[i]), eplRoot(fd.fnParams[j]))
           }
@@ -21558,30 +21645,36 @@ function eplEdgeAt(u: i32) {
     if up >= 0 && up < P.nodes.length {
       const un = nodeAt(up)
       if k == CW_UP_LETINIT {
-        const pa = eplPlaceOf(u, 0)
-        const pb = eplRoot(up)
-        const un0 = nodeAt(parenPeelIx(u))
-        const kd = if un0 is Member { "Member" } else if un0 is Call { "Call" } else if un0 is Ident { "Ident" } else if un0 is ObjLit { "Obj" } else if un0 is ArrayLit { "Arr" } else { "other" }
-        eplEdge(pa, pb, u)
+        eplEdge(eplPlaceOf(u, 0), eplRoot(up), u)
       } else if k == CW_UP_ASG_RHS && un is BinExpr {
         eplEdge(eplPlaceOf(u, 0), eplPlaceOf(un.binLeft, 0), u)
       } else if k == CW_UP_ELEM {
         eplEdge(eplPlaceOf(u, 0), eplChild(eplRoot(up), "e"), u)
       } else if k == CW_UP_FIELD {
         const fi = nodeAt(cwIxUpAux[u])
-        if fi is FieldInit { eplEdge(eplPlaceOf(u, 0), eplChild(eplRoot(up), "f." + fi.fiName), u) }
+        if fi is FieldInit {
+          eplEdge(eplPlaceOf(u, 0), eplChild(eplRoot(up), "f." + fi.fiName), u)
+        }
       } else if k == CW_UP_COAL || k == CW_UP_ARM {
         eplEdge(eplPlaceOf(u, 0), eplRoot(up), u)
       } else if k == CW_UP_RET || k == CW_UP_TAIL {
         const f = if k == CW_UP_RET { cwFrameOfDecl(up) } else { up }
-        if f >= 0 { eplEdge(eplPlaceOf(u, 0), eplChild(eplRootK(f, eplKeyOfFn(f)), "r"), u) }
+        if f >= 0 {
+          eplEdge(
+            eplPlaceOf(u, 0),
+            eplChild(eplRootK(f, eplKeyOfFn(f)), "r"),
+            u,
+          )
+        }
       } else if k == CW_UP_ITER && un is ForIn {
         const st = eplStepOfRecv(u)
         const b = if st == "v" && un.fiDecl2 >= 0 { un.fiDecl2 } else { un.fiDecl1 }
         if b >= 0 { eplEdge(eplChild(eplPlaceOf(u, 0), st), eplRoot(b), b) }
       } else if k == CW_UP_SPREAD {
         const lit = if cwIxCovers(up) && cwIxUpKind[up] == CW_UP_ELEM { cwIxUp[up] } else { -1 }
-        if lit >= 0 { eplUnion(eplChild(eplPlaceOf(u, 0), "e"), eplChild(eplRoot(lit), "e")) }
+        if lit >= 0 {
+          eplUnion(eplChild(eplPlaceOf(u, 0), "e"), eplChild(eplRoot(lit), "e"))
+        }
       } else if k == CW_UP_ARG && un is Call {
         const ai = cwIxUpAux[u]
         const cf = parenPeelIx(un.callFn)
@@ -21597,12 +21690,20 @@ function eplEdgeAt(u: i32) {
           if lf is FuncDecl && pi < lf.fnParams.length {
             const rp = eplPlaceOf(cn.memObj, 0)
             const lk = eplValueTarget(lam, eplK)
-            eplEdge(eplChild(rp, eplStepOfRecv(cn.memObj)), eplRootK(lf.fnParams[pi], lk), lf.fnParams[pi])
+            eplEdge(
+              eplChild(rp, eplStepOfRecv(cn.memObj)),
+              eplRootK(lf.fnParams[pi], lk),
+              lf.fnParams[pi],
+            )
             if cn.memProp == "map" {
               const mt = nodeTyIxOf(up)
               const mo = if mt >= 0 && mt < T.tys.length { tyAt(nonNullTy(mt)) } else { null }
               const et = if mo is TyArray { mo.aElem } else { -1 }
-              eplEdgeTy(eplChild(eplRootK(lam, lk), "r"), eplChild(eplRoot(up), "e"), et)
+              eplEdgeTy(
+                eplChild(eplRootK(lam, lk), "r"),
+                eplChild(eplRoot(up), "e"),
+                et,
+              )
             }
             if cn.memProp == "filter" { eplUnion(eplRoot(up), rp) }
           }
@@ -21610,7 +21711,11 @@ function eplEdgeAt(u: i32) {
           for fd in elabCalleeFns(un) {
             const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
             if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
-              eplEdge(eplPlaceOf(u, 0), eplRootK(fn.fnParams[ai], eplCallTarget(up, fd, eplK)), u)
+              eplEdge(
+                eplPlaceOf(u, 0),
+                eplRootK(fn.fnParams[ai], eplCallTarget(up, fd, eplK)),
+                u,
+              )
             }
           }
         }
@@ -21618,6 +21723,7 @@ function eplEdgeAt(u: i32) {
         const p0 = eplPlaceOf(u, 0)
         if p0 >= 0 {
           const p = eplFind(p0)
+          if p < 0 { return 0 }
           eplCallNode.push(up)
           eplCallKey.push(eplK)
           eplCalls[p].push(eplCallNode.length - 1)
@@ -21638,13 +21744,24 @@ function eplArgTy(ci: i32, a: i32): i32 {
 // The call record whose closed argument types every call through class `c` agrees on; -1 when
 // nothing calls it, -3 for an open argument, -4 for two signatures.
 function eplOneCall(c: i32): i32 {
+  const rc = eplFind(c)
+  const m = eplOneMemo.get(rc)
+  if m != null { return m }
+  const r = eplOneCallGo(c)
+  eplOneMemo[rc] = r
+  r
+}
+
+function eplOneCallGo(c: i32): i32 {
   let one = -1
   for ci in eplCallsStar(c) {
     const cn = nodeAt(eplCallNode[ci])
     if !(cn is Call) { return -2 }
     for a in cn.callArgs {
       const t = eplArgTy(ci, a)
-      if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyReachesHole(t, 8) { return -3 }
+      if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyReachesHole(t, 8) {
+        return -3
+      }
     }
     if one >= 0 {
       const on = nodeAt(eplCallNode[one])
@@ -21652,7 +21769,11 @@ function eplOneCall(c: i32): i32 {
         if on.callArgs.length != cn.callArgs.length { return -4 }
         let i = 0
         while i < cn.callArgs.length {
-          if !tySame(eplArgTy(one, on.callArgs[i]), eplArgTy(ci, cn.callArgs[i])) { return -4 }
+          if (
+            !tySame(eplArgTy(one, on.callArgs[i]), eplArgTy(ci, cn.callArgs[i]))
+          ) {
+            return -4
+          }
           i = i + 1
         }
       }
@@ -21668,7 +21789,9 @@ function eplFrameResult(m: i32, arity: i32): i32 {
   if eplK < 0 || eplFrameOf(m) == m { return -1 }
   const t = elabNodeTy(m, eplK)
   const o = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-  if o is TyFunc && o.fnParamTypes.length == arity && elabTyClosed(o.fnRet, 0) { return o.fnRet }
+  if o is TyFunc && o.fnParamTypes.length == arity && elabTyClosed(o.fnRet, 0) {
+    return o.fnRet
+  }
   -1
 }
 
@@ -21676,74 +21799,100 @@ function eplFrameResult(m: i32, arity: i32): i32 {
 // has no single closed signature, or a member has no instance there.
 function eplRebuild(p: i32, t: i32, depth: i32): i32 {
   if t < 0 || t >= T.tys.length || depth > 8 || p < 0 { return -1 }
-  const bd = eplBound[eplFind(p)]
+  const bd = eplBoundOf(eplFind(p))
   if bd >= 0 { return bd }
   if !tyHasTyVar(t) { return t }
   const o = tyAt(t)
-  if o is TyFunc {
-    // A copy of a value the elaboration already closed is built at that type: the nearest such
-    // source is where the conversion happens, and what lies before it does not reach this leaf.
-    for c in eplReach(p, false) {
-      if eplBound[c] >= 0 { return eplBound[c] }
+  match o {
+    TyFunc => eplRebuildLeaf(p, t)
+    TyNullable => {
+      const i = eplRebuild(p, o.nInner, depth + 1)
+      if i < 0 { -1 } else { mkNullableTy(i) }
     }
-    const one = eplOneCall(p)
-    if one == -1 { return -1 }
-    if one < 0 { return -1 }
-    const cn = nodeAt(eplCallNode[one])
-    if !(cn is Call) { return -1 }
-    const ps: i32[] = []
-    for a in cn.callArgs { ps.push(eplArgTy(one, a)) }
-    // A copy converts nothing yet: every class whose functions reach this one is called at
-    // the same signature, or the leaf stays open.
-    for c in eplReach(p, false) {
-      if !eplSigIs(eplOneCall(c), ps) { return -1 }
+    TyArray => {
+      if o.aRead != 0 { return -1 }
+      const e = eplRebuild(eplChild(p, "e"), o.aElem, depth + 1)
+      if e < 0 { -1 } else { mkArrayTy(e) }
     }
-    const ms = eplMembersStar(p)
-    if ms.length == 0 { return -1 }
-    const noNames: string[] = []
-    const noTys: i32[] = []
-    let ret = -1
-    let same = true
-    for m in ms {
-      const mk = elabKeyAtPins(elabSrcDecl(m), noNames, noTys, ps, -1)
-      // Only an instance the run already holds answers; a member with instances of its own
-      // and none at these parameters leaves the leaf open.
-      const rt = if mk >= 0 { elabResultOf(mk) } else if eplInstanced(m) { -1 } else { eplFrameResult(m, ps.length) }
-      if rt < 0 { return -1 }
-      if ret >= 0 && !tySame(ret, rt) { same = false }
-      ret = if ret < 0 { rt } else { joinTys(ret, rt) }
+    TyMap => {
+      if tyHasTyVar(o.mKey) { return -1 }
+      const v = eplRebuild(eplChild(p, "v"), o.mVal, depth + 1)
+      if v < 0 { -1 } else { mkMapTy(o.mKey, v, o.mSet) }
     }
-    // Members returning different types share one closure only through the tag's dispatch.
-    if !same && !fnTagTyIsTagged(t) { return -1 }
-    if ret < 0 || tyHasTyVar(ret) || tyReachesHole(ret, 16) { return -1 }
-    return mkFuncTy(ps, ret)
-  }
-  if o is TyNullable {
-    const i = eplRebuild(p, o.nInner, depth + 1)
-    return if i < 0 { -1 } else { mkNullableTy(i) }
-  }
-  if o is TyArray {
-    if o.aRead != 0 { return -1 }
-    const e = eplRebuild(eplChild(p, "e"), o.aElem, depth + 1)
-    return if e < 0 { -1 } else { mkArrayTy(e) }
-  }
-  if o is TyMap {
-    if tyHasTyVar(o.mKey) { return -1 }
-    const v = eplRebuild(eplChild(p, "v"), o.mVal, depth + 1)
-    return if v < 0 { -1 } else { mkMapTy(o.mKey, v, o.mSet) }
-  }
-  if o is TyObj {
-    const fs: i32[] = []
-    let i = 0
-    while i < o.objFieldNames.length && i < o.objFieldTypes.length {
-      const f = eplRebuild(eplChild(p, "f." + o.objFieldNames[i]), o.objFieldTypes[i], depth + 1)
-      if f < 0 { return -1 }
-      fs.push(f)
-      i = i + 1
+    TyObj => {
+      const fs: i32[] = []
+      let i = 0
+      while i < o.objFieldNames.length && i < o.objFieldTypes.length {
+        const f = eplRebuild(
+          eplChild(p, "f." + o.objFieldNames[i]),
+          o.objFieldTypes[i],
+          depth + 1,
+        )
+        if f < 0 { return -1 }
+        fs.push(f)
+        i = i + 1
+      }
+      mkObjTy(o.objFieldNames, fs)
     }
-    return mkObjTy(o.objFieldNames, fs)
+    // An open union, literal, negation or type variable holds no slot the classes close.
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => -1
   }
-  -1
+}
+
+// Function leaf type `t` at place `p`, closed by its class; -1 where it stays open.
+function eplRebuildLeaf(p: i32, t: i32): i32 {
+  // A copy of a value the elaboration already closed is built at that type: the nearest such
+  // source is where the conversion happens, and what lies before it does not reach this leaf.
+  for c in eplReach(p, false) {
+    const bc = eplBoundOf(c)
+    if bc >= 0 { return bc }
+  }
+  const one = eplOneCall(p)
+  if one == -1 { return -1 }
+  if one < 0 { return -1 }
+  const cn = nodeAt(eplCallNode[one])
+  if !(cn is Call) { return -1 }
+  const ps: i32[] = []
+  for a in cn.callArgs { ps.push(eplArgTy(one, a)) }
+  // A copy converts nothing yet: every class whose functions reach this one is called at
+  // the same signature, or the leaf stays open.
+  for c in eplReach(p, false) {
+    if !eplSigIs(eplOneCall(c), ps) { return -1 }
+  }
+  const ms = eplMembersStar(p)
+  if ms.length == 0 { return -1 }
+  const noNames: string[] = []
+  const noTys: i32[] = []
+  let ret = -1
+  let same = true
+  // The leaf takes the members' instances' own parameters: an argument a parameter converts
+  // (a lambda handed to a nullable function parameter) is not the slot's type.
+  let pin: i32[] = ps
+  let pinSet = false
+  for m in ms {
+    const mk = elabKeyAtPins(elabSrcDecl(m), noNames, noTys, ps, -1)
+    // Only an instance the run already holds answers; a member with instances of its own
+    // and none at these parameters leaves the leaf open.
+    const rt = if mk >= 0 { elabResultOf(mk) } else if eplInstanced(m) { -1 } else { eplFrameResult(m, ps.length) }
+    if rt < 0 { return -1 }
+    if mk >= 0 {
+      const st = elabSubstClosed(nodeTyIxOf(elabSrcDecl(m)), mk)
+      const so = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
+      if !(so is TyFunc) || so.fnParamTypes.length != ps.length { return -1 }
+      if pinSet && !elabTysSame(pin, so.fnParamTypes) { return -1 }
+      pin = so.fnParamTypes
+      pinSet = true
+    }
+    if ret >= 0 && !tySame(ret, rt) { same = false }
+    ret = if ret < 0 { rt } else { joinTys(ret, rt) }
+  }
+  // Members returning different types share one closure only through the tag's dispatch.
+  if !same && !fnTagTyIsTagged(t) { return -1 }
+  if ret < 0 || tyHasTyVar(ret) || tyReachesHole(ret, 16) { return -1 }
+  for q in pin {
+    if q < 0 || tyHasTyVar(q) || tyReachesHole(q, 16) { return -1 }
+  }
+  return mkFuncTy(pin, ret)
 }
 
 // Builds the place classes over the elaborated program as it stands: every instance settled so far.
@@ -21755,11 +21904,15 @@ function eplBuild() {
   eplCalls = []
   eplPending = []
   eplBound = []
+  eplBoundSrc = []
+  eplBoundK = []
   eplCallNode = []
   eplCallKey = []
   eplFlowSrc = []
   eplFlowDst = []
   eplAdjN = -1
+  eplReachMemo = Map()
+  eplOneMemo = Map()
   eplHasMemo = Map()
   eplK = -1
   eplEdges()

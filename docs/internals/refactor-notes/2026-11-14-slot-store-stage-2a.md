@@ -10,6 +10,19 @@ This is the first half of a pair.
 
 The engine is final: 2b only switches readers and deletes.
 
+**2a is not the finished design.** It is +NET_LINES only as half of the pair. 2b owes three
+things:
+1. **Delete the delivery walk.** Every reader in the table below switches to the classes.
+2. **Move demand ordering into the engine.** Today the value cascade (`elabBindingWholeTy`,
+   `elabSlotClose(Whole)`, `elabSlotFromSources`) orders instances other holders read: in D15754,
+   `m2` needs `half@f64` because `fnMap`'s close demanded it. 2b gives that order to the engine,
+   which demands each member at its class's signature in one pass after the build, and then
+   deletes the cascade too.
+3. **Show order-freedom.** The 38 cells of D16301's named set stop moving in `decl-order-ab.vl`.
+
+Expected net for 2b: about −1,300 (the walk) and about −700 (the cascade), so about −1,400 for the
+pair. If 2b cannot delete the value cascade, the coordinator hears that before 2b is written.
+
 ## What changed
 
 **The engine** is a section of `emit_elab.vl` ("Place classes"), `epl*`. It lives there and not
