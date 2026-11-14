@@ -1,14 +1,27 @@
-# D15943: a list literal of pinned maps of hole functions takes their type, 2026-11-14
+# D15943: a list literal pushed onto an annotated list of maps takes the holder's type, 2026-11-14
 
 Lane G, stacked on D15941. Mono pins an un-annotated map of hole functions (`monoPinMapValues`)
-and retypes its reads (`monoRetypeMapReads`). A list literal holding those reads,
-`xs.push([m2, fnMap])`, kept the checker's open type `{[string]: (_) => _}[]`. So `arrRefSlotOf`
-found no list row and refused it.
+and retypes its reads. A list literal holding those reads, `xs.push([m2, fnMap])`, kept the
+checker's open type `{[string]: (_) => _}[]`, so `arrRefSlotOf` found no list row and refused it.
 
-`monoCloseMapListLits` runs once a pinned map's reads are retyped. It types each open list
-literal in the frame whose elements all carry one closed map type (`monoListOfMaps`) at the list
-of that map, then repeats, so an enclosing literal of such literals closes too. It touches only a
-literal the checker left open, and only over maps.
+## Where the type comes from
+
+The literal's type is the holder's: `xs` is annotated `({[string]: (a: f64) => f64}[])[]`, and a
+value pushed onto it is delivered at its element type. A probe at the refusal showed that neither
+the check nor the elaboration records that delivery on the literal: `nodeCtxTyIxOf` and
+`elabNodeCtxAt` are both -1. The elaboration does compute the holder's element type for a pushed
+read (`elabReadStampsAt`, D15942), but only to collect function types. It banks no stamp for a
+literal argument.
+
+So `monoCloseMapListLits` reads the receiver's checked type rather than inferring anything:
+- for each `recv.push(lit)` or `recv.set(k, lit)` whose receiver type is closed, it takes the
+  element or value type;
+- when that type is a list of maps and the literal is still open, `monoCloseListLitAt` records
+  the literal at it, and each open list literal element at the element type.
+
+Nothing is derived from the literal's own elements. A first version did that, and was replaced on
+the coordinator's review. The step that makes this unnecessary in mono is for the elaboration to
+bank a literal argument's destination, as the check does for a bare argument.
 
 ## Grading
 
