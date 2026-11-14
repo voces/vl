@@ -24,3 +24,8 @@ Grading:
   with the right values, and the call runs once.
 * `(a = nb()).y` under `&&` was an `unknown struct field` emit reject on the base too, and it now
   runs.
+* New template `wider-record-name-write-value.matrix.vl`: the name-target twin of D16019's
+  `wider-record-write-value`, with cells for `&&`, `||`, a skipped operand, a `while` condition
+  and a field read under `&&`. Before (B's branch head, fixpoint) and after (this branch,
+  fixpoint): 56 of 56, the ten cells moving from emit refusal to RUNS. 0 `runs → not-runs` and
+  0 silent, here and over the seven other wider-record templates.
