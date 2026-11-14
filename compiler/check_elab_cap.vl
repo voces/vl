@@ -22,6 +22,7 @@ import {
   cwFnValueTargets,
   cwFollowedRetAt,
   cwFollowedRets,
+  cwFrameOfDecl,
   cwFramedNode,
   cwIxBuild,
   cwIxKind,
@@ -93,6 +94,7 @@ import {
   Paren,
   TypeRef,
   annTsOf,
+  declExported,
   i32ToStr,
   nodeAt,
   nodeChildren,
@@ -1890,6 +1892,8 @@ export function elabFnFieldTy(
   }
   fnFieldWidened.push(bd)
   fnFieldWidenedName.push(name)
+  fnFieldWidenedPath.push(path)
+  fnFieldWidenedElem.push(fresh)
   const lt = if ta is TyMap { mkMapTy(ta.mKey, fresh, 0) } else if listed { mkArrayTy(fresh) } else { fresh }
   fnJoinMemo[key] = lt
   lt
@@ -2125,28 +2129,63 @@ export function elabFnListLetTy(bd: i32, t: i32, closedAt: i32): i32 {
   lt
 }
 
-// Appends to `out` each value a slot write of a list widened to set `s` stores that names member
-// `d`, a write a callee makes through a parameter included, and returns the list's element type,
-// or -1 when no such write lands only in lists of `s` (D14648).
+// Appends to `out` each value a slot write of a list or record field widened to set `s` stores
+// that names member `d`, a write a callee makes through a parameter included, and returns the
+// slot's function type, or -1 when no such write lands only at that place of such containers.
 export function fnTagWriteLeavesOf(d: i32, s: i32, out: i32[]): i32 {
   let et = -1
   let i = 0
   while i < fnListWidened.length {
-    const vals: i32[] = []
-    const ats: i32[] = []
-    if (
-      fnTagSetOfTy(fnListWidenedElem[i]) == s
-      && cwSlotWrittenValues(cwKeyOfDecl(fnListWidened[i]), ["[]"], vals, ats) >= 0
-    ) {
-      for v in vals {
-        if cwFnValueDeclOf(v) == d && !i32ListHas(out, v) {
-          if !fnWriteOnlyInto(v, fnListWidened[i]) { return -1 }
-          out.push(v)
-          et = fnListWidenedElem[i]
-        }
-      }
-    }
+    const r = fnWriteLeavesAt(
+      d,
+      s,
+      fnListWidened[i],
+      ["[]"],
+      fnListWidenedElem[i],
+      out,
+    )
+    if r == -2 { return -1 }
+    if r >= 0 { et = r }
     i = i + 1
+  }
+  i = 0
+  while i < fnFieldWidened.length {
+    const r = fnWriteLeavesAt(
+      d,
+      s,
+      fnFieldWidened[i],
+      fnFieldWidenedPath[i],
+      fnFieldWidenedElem[i],
+      out,
+    )
+    if r == -2 { return -1 }
+    if r >= 0 { et = r }
+    i = i + 1
+  }
+  et
+}
+
+// `fnTagWriteLeavesOf` for one container, binding `bd` whose functions at `path` have type `elem`:
+// `elem` when a write of `d` is stored there, -1 for none, -2 when one may be stored elsewhere too.
+function fnWriteLeavesAt(
+  d: i32,
+  s: i32,
+  bd: i32,
+  path: string[],
+  elem: i32,
+  out: i32[],
+): i32 {
+  if fnTagSetOfTy(elem) != s { return -1 }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwKeyOfDecl(bd), path, vals, ats) < 0 { return -1 }
+  let et = -1
+  for v in vals {
+    if cwFnValueDeclOf(v) == d && !i32ListHas(out, v) {
+      if !fnWriteOnlyInto(v, bd, path) { return -2 }
+      out.push(v)
+      et = elem
+    }
   }
   et
 }
@@ -2228,25 +2267,31 @@ function fnMapArgOnlyOf(d: i32, s: i32, depth: i32): boolean {
   true
 }
 
-// Whether the store of write value `v` lands only in lists widened to `bd`'s set: its target
-// roots at one, or at a parameter every call hands one or another such parameter. The leaf then emits its id at
-// every instance of the writing function.
-function fnWriteOnlyInto(v: i32, bd: i32): boolean {
+// Whether the store of write value `v` lands only at `path` of containers like `bd`: its target
+// is that place of `bd`, or of a parameter every call hands `bd`, a list widened to its set, or
+// another such parameter. The leaf then emits its id at every instance of the writing function.
+function fnWriteOnlyInto(v: i32, bd: i32, path: string[]): boolean {
   if v < 0 || !cwIxCovers(v) { return false }
   const p = cwIxUp[v]
   if p < 0 { return false }
   const pn = nodeAt(p)
   let tgt = -1
+  let pushed = false
   if pn is BinExpr && pn.binOp == "=" && parenPeelIx(pn.binRight) == v {
     tgt = pn.binLeft
   } else if pn is Call {
     const f = nodeAt(parenPeelIx(pn.callFn))
-    if f is Member && f.memProp == "push" { tgt = f.memObj }
+    if f is Member && f.memProp == "push" {
+      tgt = f.memObj
+      pushed = true
+    }
   }
   if tgt < 0 { return false }
-  const path: string[] = []
-  const root = cwSlotPath(tgt, path)
+  const at: string[] = []
+  const root = cwSlotPath(tgt, at)
   if root < 0 || !(nodeAt(root) is Ident) { return false }
+  if pushed { at.push("[]") }
+  if fnFieldPathKey(at) != fnFieldPathKey(path) { return false }
   fnArgOnlyFrom(identDeclOf(root), bd, 0)
 }
 
@@ -2265,8 +2310,9 @@ function fnArgOnlyFrom(d: i32, bd: i32, depth: i32): boolean {
   if d == bd || fnWidenedSameSet(d, bd) { return true }
   if d < 0 || depth > 8 || !(nodeAt(d) is Param) { return false }
   const args: i32[] = []
-  // An uncalled function's body is still built, at its parameters' defaults.
-  if !cwParamArgs(d, args) || args.length == 0 { return false }
+  if !cwParamArgs(d, args) { return false }
+  // A function nothing calls builds no instance of what it calls, so its parameter hands none.
+  if args.length == 0 && declExported(cwFrameOfDecl(d)) { return false }
   for a in args {
     const ap = parenPeelIx(a)
     if ap < 0 || !(nodeAt(ap) is Ident) { return false }
@@ -3214,6 +3260,9 @@ let fnWidenSrcFrom: i32[] = []
 let fnRetRecSrcTo: i32[] = []
 let fnRetRecSrcFrom: i32[] = []
 let fnFieldWidenedName: string[] = []
+// Beside each, the place path of the field's functions from the binding and their joined type.
+let fnFieldWidenedPath: string[][] = []
+let fnFieldWidenedElem: i32[] = []
 let fnLetVeto: i32[] = []
 // The `let`s the first check widens, kept for the re-check (`fnLetKeptWide`).
 let fnLetWideKept: i32[] = []
@@ -3372,6 +3421,8 @@ export function fnTyFactsReset() {
   fnSlotWidened = []
   fnFieldWidened = []
   fnFieldWidenedName = []
+  fnFieldWidenedPath = []
+  fnFieldWidenedElem = []
   fnWidenSrcTo = []
   fnWidenSrcFrom = []
   fnRetRecSrcTo = []
@@ -3403,6 +3454,8 @@ export function fnTagEtaReset() {
   fnSlotWidened = []
   fnFieldWidened = []
   fnFieldWidenedName = []
+  fnFieldWidenedPath = []
+  fnFieldWidenedElem = []
   fnWidenSrcTo = []
   fnWidenSrcFrom = []
   fnRetRecSrcTo = []
