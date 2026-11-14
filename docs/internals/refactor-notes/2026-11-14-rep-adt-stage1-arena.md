@@ -66,8 +66,30 @@ So no inventory row is filed. The two stage-1 fixes, both on the tree side, are:
 - Corpus: every 7th cell (1,707 programs) was built armed by both seeds. 0 differ in module bytes
   and 0 differ in shadow report.
 
-**Lines.** Net compiler lines for 1a: `emit_rep.vl` −8, `intern.vl` +44.
-- The design's −250 for stage 1 assumed the projections (`repTreeAtomOf`, `repTreeNulOf`,
-  `repTreeListElemName`) would go. They remain, because their callers read `RepDesc`, which
-  stage 2 retires.
-- 1a is the change of shape that stage 2's deletions need. It does not pay for itself.
+**Cost.**
+
+| | |
+|---|---|
+| net compiler lines | +77: `emit_rep.vl` −8, `intern.vl` +44, `lint.vl` +5 (the closed-set tables name `RpPrim` and `RepNode`), `emit_vk_shadow.vl` +36 (the uncovered note names its type's shape and function) |
+| pin-helper delta | 0 (baseline 908) |
+| guest fuel (`plumb-shape-cost.vl`, `SEED=` stage-0 seed vs this one) | main 9,231,902,279 → 9,244,316,932 (+0.13%), tail 6,688,467,286 → 6,696,925,955 (+0.13%): the interner's record fields and the key argument vectors, in place of one string concat per node |
+| peak live heap | unchanged (120,044 / 79,995 KiB) |
+| seed size | 6,823,464 → 6,828,658 bytes (+0.08%) on the merged tree |
+| gate | `GATE_IN_WORKTREE=1 scripts/gate.sh`: all rows pass, on the tree merged with master |
+
+The design's −250 for stage 1 assumed the projections (`repTreeAtomOf`, `repTreeNulOf`,
+`repTreeListElemName`) would go. They remain, because their callers read `RepDesc`, which stage 2
+retires. Stage 1a is the change of shape that stage 2's deletions need; on its own it does not
+delete code.
+
+## Still owed by stage 1, as stage 1b
+
+These two change the tree's answers, so they are not in this byte-identical PR. Each will be
+graded on the stage-0 shadow (the disagreement must go and no agreement may be lost), and each
+byte mover will be named.
+- **Union-arm status from the checker.** `RRecord.rrVariant` comes from `repTyIsVariant`, whose
+  input includes the emitter's own union-variant rows (`uVarTyIx`, bit 2 of `rvsAdd`). Stage 1b
+  reads the checker's union membership alone, which retires the `variantBit` rebuild axis. That
+  axis is stage 2's gate (stage 0 note).
+- **A no-value result.** `void` and `never` results get an answer instead of an `unsup` leaf,
+  which fixes the 3 `d947` cells' disagreement.
