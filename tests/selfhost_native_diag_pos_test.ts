@@ -253,33 +253,34 @@ Deno.test({
     // that had nothing to do with the failure.
     //
     // Two things fix it and this pins both: the field-access floors are NODE-anchored
-    // (`emitFailAt`, the `Member` node → its property token, 0-based col 20 of line 9,
-    // printed 1-based as 9:21), and the start function arms a top-level STATEMENT cursor so
+    // (`emitFailAt`, the `Member` node → its property token, 0-based col 8 of line 9,
+    // printed 1-based as 9:9), and the start function arms a top-level STATEMENT cursor so
     // any other failure it raises lands on the statement instead of on a stale function.
     //
-    // The witness is a top-level then-arm read of a field the `is` arms store differently,
-    // still a loud field-access reject (D4266). The earlier witness, a record field stored at
-    // a different shape per member, lowers since D15314.
+    // The witness is a top-level shared read of a field the records store as nullable lists
+    // of different element types, still a loud field-access reject (D16049). The earlier
+    // witnesses, a record field stored at a different shape per member and the then-arm read
+    // of a cross-arm `is` (D4266), lower since D15314 and D15882.
     const dir = await makeTempDir({ prefix: "vl_diag_pos_top_" });
     try {
       const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
         path,
-        'type A = { v: "a" | "b" }\n' +
-          "type B = { v: string | null }\n" +
+        "type A = { v: i32[] | null }\n" +
+          "type B = { v: string[] | null }\n" +
           "function pad(x: i32): i32 {\n" +
           "  return x + 1\n" +
           "}\n" +
           "print(pad(1))\n" +
-          'const b: B = { v: "a" }\n' +
+          "const b: B = { v: null }\n" +
           "const u: A | B = b\n" +
-          'if u is A { print(u.v) } else { print("B") }\n',
+          "print(u.v == null)\n",
       );
       const r = await build(path);
       if (r.code === 0) {
         throw new Error("expected emit-stage rejection, got exit 0");
       }
-      const needle = `${path}:9:21:`;
+      const needle = `${path}:9:9:`;
       if (!r.err.includes(needle)) {
         throw new Error(
           `expected stderr to contain "${needle}", got:\n${r.err}`,
