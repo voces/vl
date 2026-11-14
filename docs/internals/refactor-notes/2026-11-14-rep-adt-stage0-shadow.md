@@ -36,7 +36,7 @@ unchanged.
 - The master seed and this tree's seed compile this tree's `compiler/*.vl` to identical bytes:
   `refresh-compiler.sh` run twice, compared with `cmp`.
 - That self-compile is the identity proof for the unarmed instrument over a 403k-line program.
-- Seed size: 6,819,233 → 6,823,395 bytes, +4,162 (+0.06%).
+- Seed size: 6,819,233 → 6,823,464 bytes, +4,231 (+0.06%).
 
 ## Readings: the self-build (`vl build compiler/entry.vl`)
 
@@ -132,9 +132,10 @@ cost is correctness: a rep read before a later variant registration is stale.
 
 | | |
 |---|---|
-| net compiler lines | +168 (`emit_rep.vl` +79, `emit_sections.vl` +6, the new `emit_vk_shadow.vl` +83) |
+| net compiler lines | +179 (`emit_rep.vl` +85, `emit_sections.vl` +6, the new `emit_vk_shadow.vl` +88) |
 | pin-helper delta | 0 (baseline 908) |
-| unarmed guest fuel and peak RSS | measured by the gate's `plumb-shape cost` row: GATE_PLUMB |
+| unarmed guest fuel (`plumb-shape-cost.vl`, `SEED=` the master seed vs this one) | main unit +3,121 (9,231,899,118 → 9,231,902,239, +0.00003%), tail +862; the row's +2.9% and +1.8% against its baseline are already on master |
+| peak live heap (the same runs) | +2 KiB main, +1 KiB tail; peak RSS is not graded on this box (no GNU `time`) |
 | seed size | +0.06% |
 
 Stage 0 is the one stage that adds lines. They are an instrument, and they leave with stage 2,
