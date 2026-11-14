@@ -87,12 +87,18 @@ Merged with master `de4cfa15`. Fixpoint seeds on both sides.
   re-pointed generic `let`.
 - **L2 self-compile fuel:** 82,536,402,471 against master's 82,330,058,123, which is +0.25%.
   Seed size: +4,835 bytes.
-- **Late demands rose, from 0 to 4, 7 and 1,** in `fn-set-list-copied-into-closed-list-slots`,
-  `-copied-into-holders` and `-mutable-alias-controls`. Output is unchanged. The minimal
-  trigger is a call `f("s")` plus a copy of `[f]` into a closed list. The key the emitter
-  demands late is a `<lambda>`. The direct-name spelling `[dbl]` mints none, so the renamed read
-  is not yet planned the way the name is. A guard that skips `fvaListSetCopy` for a write-row
-  element changed nothing. Not located.
+- **Late demands: a renamed read now plans what its name plans.** Before this fix the count rose
+  from 0 to 4, 7 and 1 in `fn-set-list-copied-into-closed-list-slots`, `-copied-into-holders` and
+  `-mutable-alias-controls`. The literal `[f]`, renamed to `[dbl]`, carries the one-member set
+  `{dbl}`. So does the `dbl` that `f = dbl` stores. In `ftCtxOk` that store needs the binding's
+  wider set `{id, dbl}` tagged, and no call through `f` remains to try it, so `{dbl}` stayed
+  untagged. The emitter then read the list as open, closed it with `elabWrittenValueTy`, and
+  instanced the `.map` adapter `fvaListSetCopy` builds at `i32`, after the plan. A store into a
+  binding of a wider undecided set is now decided with it, as a join's tail is
+  (`ftWiderJoinNeed`, check_fn_tag). The first two files read 0.
+  `-mutable-alias-controls` reads 1, and its direct-name spelling (`[dbl]` for `[f]`) reads 1 on
+  master. The scan refuses `{dbl}` there because a list holding a set's ids may only be read by
+  index, and the copy reads it through `.map`.
 
 ## Not done
 
