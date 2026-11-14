@@ -18,20 +18,25 @@ The emitter (PR 2) and `==` on functions (PR 3) follow.
   - Operands no value can share (neither assignable to the other, or mixed brands) are refused
     as `==` refuses them: "cannot compare P and Q".
   - Every accepted compare (records, lists, maps, functions, a nullable of one, a union of
-    records, `null`, a type parameter) is refused under `unsupported-lowering`: "`===`
-    (reference identity) is not lowered yet". The emitter is never reached, so no accepted
-    program can meet an emitter that does not know the op. PR 2 removes this refusal and adds
-    the `x === null` hint and narrowing together with the lowering.
+    records, `null`, a type parameter) passes `vl check`.
+- **Emitter: the bridge.** `emitBinExprNode` refuses `===`/`!==` at the compare with one
+  `emitFailAt`, "emitProgram: reference identity (`===` / `!==`) is not lowered yet". It goes
+  through the counted channel: `emit-refusal-sites` sees it, it has a `live-sites.json` row
+  (D15975), and the probe `scripts/capability-probes/identity-eq-record.vl` reaches it.
+  `===` is a parse error on master, so nothing regresses. Per the orchestrator, this refusal
+  is a bridge only: PR 2 (the lowering) is lane E's next PR, and it deletes this site and adds
+  the `x === null` hint and narrowing.
 
 ## Measured
 
-- **Witness.** `check-filed-witnesses --strict`: D15975 is `check_reject`, as filed. The row's
-  repro now names the check error.
+- **Witness.** `check-filed-witnesses --strict`: D15975 is `emit_reject`, as filed. The row's
+  status and repro now name the emit refusal.
 - **Position matrices.** All six `identity-eq-*` matrices: 0 `runs → not-runs`, 0 silent, 0
-  program traps. Every cell is still refused, now by the checker.
+  program traps. Every cell is still refused, now by the emitter's bridge site.
 - **Tests.**
   - The DV-1214 parser case moves to
     `tests/cases/operators/error-identity-eq-no-identity.vl` with the ruled message.
-  - `error-identity-eq-not-lowered.vl` is new.
+  - `error-identity-eq-operands.vl` is new.
   - The `check --fix` case keeps its output and is renamed.
+- **Sites.** `emit-refusal-sites`: +1 call site (the bridge). `--live-sites`: 2 of 2 LIVE.
 - **Sweep.** SWEEP.
