@@ -64,6 +64,62 @@ function rvWritten(ix: i32, loop: i32): boolean {
   false
 }
 
+// The start, end and step of the `for` at `loop`, or `[]` unless all three fold and its body
+// never writes the variable: the constant range the owner's ruling bounds.
+function rvLoopParts(loop: i32): i32[] {
+  const none: i32[] = []
+  if loop < 0 || loop >= P.nodes.length { return none }
+  const f = nodeAt(loop)
+  if !(f is ForRange) { return none }
+  if (
+    !rvConstIs(f.frFrom, RV_CONST_DEPTH)
+    || !rvConstIs(f.frTo, RV_CONST_DEPTH)
+  ) {
+    return none
+  }
+  let step = 1
+  if f.frStep >= 0 {
+    if !rvConstIs(f.frStep, RV_CONST_DEPTH) { return none }
+    step = rvConstVal(f.frStep, RV_CONST_DEPTH)
+  }
+  if step == 0 || rvWritten(f.frBody, loop) { return none }
+  [
+    rvConstVal(f.frFrom, RV_CONST_DEPTH),
+    rvConstVal(f.frTo, RV_CONST_DEPTH),
+    step,
+  ]
+}
+
+// How many times the body of the `for` at `loop` runs, saturating at `cap`; -1 unless its range
+// is constant (`rvLoopParts`). An empty range runs it 0 times.
+export function constRangeTrips(loop: i32, cap: i32): i32 {
+  const parts = rvLoopParts(loop)
+  if parts.length != 3 { return -1 }
+  const f = nodeAt(loop)
+  if !(f is ForRange) { return -1 }
+  const a = parts[0]
+  const b = parts[1]
+  const s = parts[2]
+  // `hi` and `lo` bound the values visited; their difference may pass the i32 range.
+  let hi = b
+  let lo = a
+  if s > 0 {
+    if f.frExcl { hi = b - 1 }
+  } else {
+    hi = a
+    lo = b
+    if f.frExcl { lo = b + 1 }
+  }
+  if hi < lo { return 0 }
+  const span = hi - lo
+  if span < 0 { return cap }
+  const mag = if s > 0 { s } else { 0 - s }
+  if mag <= 0 { return cap }
+  const q = span / mag
+  if q >= cap - 1 { return cap }
+  q + 1
+}
+
 // The `[lo, hi)` the loop variable read at `srcExpr` ranges over, as `[lo, hi]` with `hi > lo`,
 // or `[]` where `srcExpr` is no such read or the range is empty, unbounded or written.
 export function rangeVarInterval(srcExpr: i32): i32[] {
@@ -86,20 +142,11 @@ function rvIntervalAt(srcExpr: i32, depth: i32): i32[] {
     return rvIntervalAt(f.letInit, depth - 1)
   }
   if !(f is ForRange) { return none }
-  if (
-    !rvConstIs(f.frFrom, RV_CONST_DEPTH)
-    || !rvConstIs(f.frTo, RV_CONST_DEPTH)
-  ) {
-    return none
-  }
-  let step = 1
-  if f.frStep >= 0 {
-    if !rvConstIs(f.frStep, RV_CONST_DEPTH) { return none }
-    step = rvConstVal(f.frStep, RV_CONST_DEPTH)
-  }
-  if step == 0 || rvWritten(f.frBody, loop) { return none }
-  const a = rvConstVal(f.frFrom, RV_CONST_DEPTH)
-  const b = rvConstVal(f.frTo, RV_CONST_DEPTH)
+  const parts = rvLoopParts(loop)
+  if parts.length != 3 { return none }
+  const a = parts[0]
+  const b = parts[1]
+  const step = parts[2]
   // The values visited lie between the start and the end, the end itself only for `to`.
   let lo = a
   let hi = b
