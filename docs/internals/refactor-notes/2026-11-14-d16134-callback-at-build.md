@@ -22,7 +22,9 @@ fixpoint against this branch's fixpoint: 0 runs → not-runs, 0 silent. 18 un-an
 to runs, 15 from the check's floor, one from an emit reject and two from check-clean invalid wasm
 (D16212); two annotated cells move to runs, one of them from check-clean invalid wasm.
 `kept-maker-delivery-null-field.matrix.vl`: `filter_lambda` un-annotated moves to runs, nothing
-else moves. Guest fuel on `plumb-shape-cost.vl`'s tail: +3.6% against its baseline (bar +5%).
+else moves. Guest fuel on `plumb-shape-cost.vl`, this branch against master `293074baf`: main
+9,394,793,146 against 9,390,001,365 and tail 6,801,876,885 against 6,798,577,568, both +0.05%.
+The check's +3.6% (tail) and +4.7% (main) are master's against a stale baseline.
 
 **Left.** D16210 (a field receiver) and D16211 (the floor: a parameter annotated at the element
 type, a `map` result holding the record). Stage 2 is D16137.
