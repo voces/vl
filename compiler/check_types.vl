@@ -3965,11 +3965,45 @@ export function tyIsLitUnionAlias(ty: i32): boolean {
   tyIsLitUnion(ty)
 }
 
+// The declaring function of each `TyVar` row. A pin is keyed on it, so two generics that both
+// call their variable `T` cannot poison each other's row.
+export let tyVarOwner: {[i32]: string} = Map()
+// The declaration whose parameter a row names, recorded where a signature or a body mints it: a
+// body's rows are owned by the code around it, so the owner column cannot say.
+let tyVarDeclOwner: {[i32]: string} = Map()
+export function tyVarDeclOwnerSet(ix: i32, owner: string) {
+  tyVarDeclOwner[ix] = owner
+}
+export function tyVarOwnerReset() {
+  tyVarOwner = Map()
+  tyVarDeclOwner = Map()
+}
+
+// The declaring function recorded for a `TyVar` row, or "" when unrecorded.
+export function tyVarOwnerOf(tyIx: i32): string {
+  if tyIx < 0 { return "" }
+  tyVarOwner[tyIx] ?? ""
+}
+
+// The declaration type-variable row `ix` is recorded as a parameter of, for `tySame`, or "".
+function tyVarDeclOwnerOf(ix: i32): string { tyVarDeclOwner[ix] ?? "" }
+
 // Structural type equality over the arena, depth-bounded: two indices are the same type when
 // their rows have the same variant and their components are recursively the same, with union
 // layers flattened in order. Index equality is construction identity, not type identity, and
 // this is no replacement for it where identity is nominal (a declared union's declaration).
 export function tySame(a: i32, b: i32): boolean { tySameAt(a, b, 24) }
+
+// `tySame`, where two rows one declaration minted for one of its type parameters are the same: an
+// `is` spelling in a generic body names the parameter its signature does (D16150).
+let tySameByDecl = false
+export function tySameDecl(a: i32, b: i32): boolean {
+  const was = tySameByDecl
+  tySameByDecl = true
+  const r = tySameAt(a, b, 24)
+  tySameByDecl = was
+  r
+}
 
 function tySameAt(a: i32, b: i32, depth: i32): boolean {
   if a == b { return true }
@@ -4069,8 +4103,20 @@ function tySameAt(a: i32, b: i32, depth: i32): boolean {
         }
       }
     }
-    // An error, a type variable, a literal or a negation is the same only as its own index.
-    TyErr | TyVar | TyLit | TyNeg => {}
+    // Under `tySameDecl`, one declaration's type parameter is one type however many annotations
+    // minted a row for it; otherwise a type variable is only its own index. A hole is only itself.
+    TyVar => {
+      if y is TyVar && tySameByDecl {
+        if x.tvName == "" || x.tvName[0] == '?' || x.tvName != y.tvName {
+          return false
+        }
+        const ow = tyVarDeclOwnerOf(a)
+        return ow != "" && ow == tyVarDeclOwnerOf(b)
+      }
+      return false
+    }
+    // An error, a literal or a negation is the same only as its own index.
+    TyErr | TyLit | TyNeg => {}
   }
   false
 }
