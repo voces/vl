@@ -16106,7 +16106,57 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
     }
   }
   monoRetypeCallsAt(nodes, reads, ft)
+  if isMap { monoCloseMapListLits(ctx, nodes) }
   0
+}
+
+// Types each list literal among `nodes` in frame `ctx` that the checker left open and that is
+// pushed onto, or set into, a holder whose checked type is closed: at that holder's element or
+// value type, a list of maps. A pure read of the receiver's type; nested open literals follow.
+function monoCloseMapListLits(ctx: i32, nodes: i32[]) {
+  for ix in nodes {
+    const c = nodeAt(ix)
+    if !(c is Call) { continue }
+    let recv = monoMethodCallRecv(ix, "push")
+    let ai = 0
+    if recv < 0 {
+      recv = monoMethodCallRecv(ix, "set")
+      ai = 1
+    }
+    if recv < 0 || ai >= c.callArgs.length { continue }
+    const lit = unwrapParen(c.callArgs[ai])
+    const ht = nodeTyIxOf(recv)
+    if lit < 0 || ht < 0 || ht >= T.tys.length || monoTyOpen(ht) { continue }
+    const dt = if ai == 0 { tyArrayElemIx(ht) } else { tyMapValOf(ht) }
+    if dt >= 0 && monoListOfMaps(dt) { monoCloseListLitAt(lit, dt, ctx) }
+  }
+  0
+}
+
+// Types list literal `lit`, when the checker left it open, at list type `t`, and each open list
+// literal element of it at `t`'s element type.
+function monoCloseListLitAt(lit: i32, t: i32, ctx: i32) {
+  const a = nodeAt(lit)
+  if !(a is ArrayLit) || !monoTyOpen(nodeTyIxOf(lit)) { return 0 }
+  monoRecordOpen(lit, t, ctx)
+  const et = tyArrayElemIx(t)
+  if et < 0 { return 0 }
+  for e in a.arrElems {
+    const ex = unwrapParen(e)
+    if ex >= 0 && tyAt(et) is TyArray { monoCloseListLitAt(ex, et, ctx) }
+  }
+  0
+}
+
+// Whether `t` is a map, or a list nesting lists of maps.
+function monoListOfMaps(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const n = tyAt(t)
+  match n {
+    TyMap => true
+    TyArray => monoListOfMaps(n.aElem)
+    TyPrim | TyFunc | TyObj | TyUnion | TyNullable | TyNeg | TyVar | TyLit | TyErr => false
+  }
 }
 
 // Types each read `root.f` among `nodes` in frame `ctx`, where `root` holds record `rt`, at the
@@ -24515,6 +24565,14 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
       }
       if monoListElemTy(jt) >= 0 { return 0 }
     }
+    // A join no tagged result covers, of list literals only, delivers each as a returned literal
+    // is, as its arms written as `return`s do (D15925).
+    if jt < 0 && leaves.length > 0 && monoLeavesAllLists(leaves) {
+      for t in leaves {
+        if monoCoerceRetAtPin(t, ctx) < 0 { return -1 }
+      }
+      return 0
+    }
   }
   if nodeAt(x) is ArrayLit || nodeAt(x) is ObjLit {
     const ft = monoRetFnListTy(x, ctx)
@@ -24577,6 +24635,14 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
   monoInstanceWidenRet = false
   if cr < 0 { return -1 }
   monoRetypePinCalls(d, noPath)
+}
+
+// Whether every node in `leaves` is a list literal.
+function monoLeavesAllLists(leaves: i32[]): boolean {
+  for t in leaves {
+    if !(nodeAt(t) is ArrayLit) { return false }
+  }
+  true
 }
 
 // The element type the returned list literal `x` of functions, or of such lists, in frame `ctx`
