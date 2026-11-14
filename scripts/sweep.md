@@ -65,6 +65,30 @@ and programs recorded on one side only. It lists every output mover and every `r
 by key, then the first 20 bytes-only movers. It **exits 1** on any `runs → not-runs` or new
 compiler trap, and exits 0 otherwise. Every other movement is printed for a person to read.
 
+## Owed refusals
+
+A clause-1 fix can turn a program that ran WRONG into a check refusal the design owes: its
+witness was check-clean and printed a wrong answer, and the fix refuses it. That is a
+`runs → not-runs`, and the one the veto allows. The PR that earns it lists the cell in
+`scripts/sweep-owed.txt`, one line each:
+
+```text
+docs/internals/inventory/D16044.md#D16044 D16044
+```
+
+`diff` then accepts that cell's `runs → not-runs` only when **all** of these hold:
+
+* the new outcome is `check_reject`. A trap, an emit refusal or any other outcome still blocks;
+* the cited row exists in `docs/internals/inventory/` or `inventory-2/`, and its status line says
+  `clause 1`;
+* the entry is used. A listed key that did not move from `runs` to `check_reject` fails as stale,
+  so the list cannot rot.
+
+An entry lives only in the PR that earns it, and the orchestrator clears the file at each fold.
+`diff` prints the accepted cells under "owed refusals accepted", and `--owed <file>` reads
+another list (the test's). Keep the `sweep` label on such a PR: removing it would turn the gate
+green the same way an admin merge does.
+
 A local proof against master looks like this:
 
 ```sh
