@@ -80,7 +80,6 @@ const SCOPE = /^compiler\/(emit_[^/]*|wasmEmit|check_emit_queries)\.vl$/;
 // construction, so a reach is graded render without reading an argument.
 const RENDERS_INSIDE = new Set([
   "canonUnionMembersInto",
-  "canonUnionMembersLitsInto",
 ]);
 
 // The census's parse sites, keyed as the census keys them.
