@@ -31,5 +31,5 @@ Hand cells:
 
 | instrument | result |
 | --- | --- |
-| full sweep, base master against this change, both fixpoint seeds | SWEEP_RESULT |
-| fast set | FASTSET_RESULT |
+| full sweep, base master against this change, both fixpoint seeds | base the D16015 tip against this change: 24,303 same; 2 output movers, both `emit_reject` → `runs` (D16017's witness and the new test); 0 bytes-only movers; 0 runs → not-runs; 0 new traps |
+| fast set | on the merged tree: all green (fixpoint, lint-self clean, regress, filed witnesses, late demands, seed size, comment, ladder, sentinel, scan, render-parse and export ratchets); native deep-chain, scaling and emitter-state audit (`SELFHOST_NATIVE_ALIGN=1`) pass |
