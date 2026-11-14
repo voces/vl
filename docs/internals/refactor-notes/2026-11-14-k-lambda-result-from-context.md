@@ -41,6 +41,9 @@ of the contextual result. The round runs only in a program with a queued lambda.
   (+0.06%). The script's +12% against its baseline is master's own.
 - **`vl_scaling_shape_test.ts`:** 90 passed. plumb-shape cost ok.
 
+The phase is a deletion target for L1: IR lowering can seed the delivered result directly, and the
+re-check round goes with it.
+
 The rule keys on the lambda's result and the values it hands back (every `return` and an
 expression body), not on a block tail, so it holds under the hybrid return rule.
 
