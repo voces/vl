@@ -27,9 +27,11 @@ SIDECAR_RE='seed-[0-9a-f]+-[0-9a-f]+\.cwasm'
 
 pack() {
   [ -f build/vl-compiler.wasm ] || { echo "pack: no build/vl-compiler.wasm" >&2; exit 1; }
-  local stage side
-  stage=$(mktemp -d)
-  trap 'rm -rf "$stage"' EXIT
+  local side
+  # Global, not local: the EXIT trap runs after this function has returned.
+  STAGE=$(mktemp -d)
+  trap 'rm -rf "$STAGE"' EXIT
+  local stage=$STAGE
   cp build/vl-compiler.wasm "$stage/"
   [ -f build/vl-compiler.wasm.src ] && cp build/vl-compiler.wasm.src "$stage/"
   while IFS= read -r side; do
