@@ -9,6 +9,13 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-d16009-let-handed-to-open-param](2026-11-14-d16009-let-handed-to-open-param.md): D16009: a re-pointed `let` handed to an open parameter dispatches, 2026-11-14
+- [2026-11-14-d16016-union-and-record-place-value](2026-11-14-d16016-union-and-record-place-value.md): D16016: a write into a union or `R | null` place used as a value, 2026-11-14
+- [2026-11-14-d16025-one-row-per-key](2026-11-14-d16025-one-row-per-key.md): One union row per type key: the label index deleted (D16025), 2026-11-14
+- [2026-11-14-d16073-lambda-name-sites](2026-11-14-d16073-lambda-name-sites.md): D16073: the emitter's lambda tests after the rename, 2026-11-14
+- [2026-11-14-d16090-let-of-lambdas-dispatch](2026-11-14-d16090-let-of-lambdas-dispatch.md): D16090: a call through a re-pointed `let` of lambdas whose results differ dispatches, 2026-11-14
+- [2026-11-14-d16094-choice-handed-on](2026-11-14-d16094-choice-handed-on.md): D16094: a choice of functions handed to an open parameter dispatches, 2026-11-14
+- [2026-11-14-g42-packed-list-union-arms](2026-11-14-g42-packed-list-union-arms.md): D16046: every packed list width is a union arm, 2026-11-14
 - [2026-11-14-utk-shadow-delete](2026-11-14-utk-shadow-delete.md): The type-key shadow harness deleted, 2026-11-14
 - [2026-11-14-d16091-set-handed-to-open-param](2026-11-14-d16091-set-handed-to-open-param.md): D16091: a set of functions handed to an open parameter gives the caller its join, 2026-11-14
 - [2026-11-14-d16024-list-map-union](2026-11-14-d16024-list-map-union.md): D16024: an inferred list-and-map union return, 2026-11-14
