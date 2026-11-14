@@ -405,6 +405,27 @@ jobs:
           BASE: ${{ needs.plan.outputs.base }}
           HEAD: ${{ needs.plan.outputs.head }}
 
+      # The independent oracle (scripts/oracle/, docs/internals/refactor-notes/2026-11-14-oracle-design.md)
+      # re-runs the distilled cells as a definitional interpreter and compares stdout hashes with
+      # the head recording: no compiles, a 30 s budget, red on a disagreement known.txt does not list.
+      - id: setup-deno-oracle
+        continue-on-error: true
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version-file: .dvmrc
+      - if: steps.setup-deno-oracle.outcome == 'failure'
+        run: npm i -g deno@$(tr -d ' \r\nv' < .dvmrc) && deno --version
+      - name: Oracle
+        run: |
+          set +e
+          timeout 60 deno run -A scripts/oracle/oracle.ts recording out/head.jsonl \
+            --population scripts/silent-sweep/distilled/ --budget-ms 30000 > out/oracle.txt
+          rc=$?
+          set -e
+          cat out/oracle.txt
+          { echo "## Oracle (exit $rc)"; echo; echo '```'; tail -c 200000 out/oracle.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "$rc" > out/oracle-exit
+
       - uses: actions/upload-artifact@v5
         with:
           name: sweep-result
@@ -412,7 +433,11 @@ jobs:
           retention-days: 14
 
       - name: Verdict
-        run: exit "$(cat out/exit)"
+        run: |
+          d="$(cat out/exit)"; o="$(cat out/oracle-exit)"
+          echo "sweep diff exit $d, oracle exit $o"
+          [ "$d" = 0 ] || exit "$d"
+          exit "$o"
 
   # The required status. A pull_request run's checks attach to the PR head SHA. `always()`, not
   # `!cancelled()`: a skipped job counts as passing, so a cancelled labelled sweep must fail.
