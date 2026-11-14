@@ -11841,3 +11841,44 @@ arm at the pre-test type made acceptance depend on which type it fell back to. W
 later revives the arm, and it is then checked against its real type. The alternative, making any
 use of a `never` operand an error, was not taken: it refuses dead final `else`s after `is` chains,
 `match`'s defensive `_`, and `else { panic("unexpected " + p) }`, all of which compile today.
+
+## A collection whose element nothing writes fits every `is T[]`; a write through a narrowing pins it (2026-11-14) — D16047
+
+**Ruled by the owner 2026-11-14 (a1).** An empty `[]`, `Map()` or `Set()` whose element type no
+write anywhere fixes is a collection that can never hold an element, so it satisfies `is T[]` (and
+`is {[K]: V}`, `is Set<T>`) for every `T`; at run time that test is only "is it a list" (map, set).
+A write through a narrowed name is a write like any other: `r.push(1)` inside `if r is i32[]` joins
+`i32` into the element type the whole program infers, so a list written at two element types is
+`(i32 | string)[]` from its creation and its `is` tests are the ordinary ones.
+
+```vl
+function pick(c: boolean) { if c { return [] } return 1 }
+const r = pick(true)               // _[] | i32, nothing writes an element
+print(r is i32[])                  // true
+print(r is string[])               // true
+
+const s = pick(true)
+if s is i32[] { s.push(1) }        // pins s's element: s is i32[] | i32
+print(s is string[])               // false
+```
+
+**Why.** The vacuous answer is only reachable while no element exists, so it cannot be observed
+wrong, and pinning by writes is how element types are inferred everywhere else. Refusing writes
+through such a narrowing (a2) was not taken: it rejects a program the design can run. Settling the
+hole to the first tested `T` (c) was not taken: two tests would disagree about one empty list.
+
+## Polymorphic recursion is refused for now; a uniform representation is backlogged (2026-11-14) — D2721, D12131
+
+**Ruled by the owner 2026-11-14: (a) now, (b) later.** A generic function that calls itself at a type
+built from its own parameter (D2721) and a generic alias that names itself at a larger argument
+(D12131) stay check errors: VL compiles one specialised instance per type, and these need infinitely
+many.
+
+```vl
+function f<T>(u: T | null, n: i32) { if n > 0 { f<T[]>(null, n - 1) } }  // refused
+type L<T> = { v: T, next: L<L<T>> | null }                                // refused
+```
+
+**Later.** Supporting them through a uniform (boxed) representation for exactly the generics the
+growth test flags is backlogged in ROADMAP.md, not rejected. Capping the nesting depth was not
+taken: whether a program ran would depend on its input, not its types.
