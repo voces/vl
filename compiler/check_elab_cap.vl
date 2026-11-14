@@ -94,6 +94,7 @@ import {
   P,
   Param,
   Paren,
+  Program,
   TypeRef,
   annTsOf,
   declExported,
@@ -2138,43 +2139,46 @@ export function elabFnListLetTy(bd: i32, t: i32, closedAt: i32): i32 {
   lt
 }
 
-// Appends to `out` each value a slot write of a list or record field widened to set `s` stores
-// that names member `d`, a write a callee makes through a parameter included, and to `with` each
-// other set such a write's own value carries, which holds the leaf's id too. Returns the slot's
-// function type, or -1 when no such write lands only at that place of such containers.
+// Appends to `out` each write naming member `d` into a container of set `s` (a widened list or
+// record field, or a map of `held`), through a callee's parameter too, and to `with` each other
+// set its own value carries. Returns the slot's function type, or -1 when no such write lands
+// only at that place of such containers.
 export function fnTagWriteLeavesOf(
   d: i32,
   s: i32,
+  held: i32[],
   out: i32[],
   with: i32[],
 ): i32 {
-  let et = -1
+  const bds: i32[] = []
+  const paths: string[][] = []
+  const elems: i32[] = []
   let i = 0
   while i < fnListWidened.length {
-    const r = fnWriteLeavesAt(
-      d,
-      s,
-      fnListWidened[i],
-      ["[]"],
-      fnListWidenedElem[i],
-      out,
-      with,
-    )
-    if r == -2 { return -1 }
-    if r >= 0 { et = r }
+    bds.push(fnListWidened[i])
+    paths.push(["[]"])
+    elems.push(fnListWidenedElem[i])
     i = i + 1
   }
   i = 0
   while i < fnFieldWidened.length {
-    const r = fnWriteLeavesAt(
-      d,
-      s,
-      fnFieldWidened[i],
-      fnFieldWidenedPath[i],
-      fnFieldWidenedElem[i],
-      out,
-      with,
-    )
+    bds.push(fnFieldWidened[i])
+    paths.push(fnFieldWidenedPath[i])
+    elems.push(fnFieldWidenedElem[i])
+    i = i + 1
+  }
+  for hb in held {
+    const mt = fnMapBindValTy(hb)
+    if mt >= 0 {
+      bds.push(hb)
+      paths.push(["[]"])
+      elems.push(mt)
+    }
+  }
+  let et = -1
+  i = 0
+  while i < bds.length {
+    const r = fnWriteLeavesAt(d, s, bds[i], paths[i], elems[i], out, with)
     if r == -2 { return -1 }
     if r >= 0 { et = r }
     i = i + 1
@@ -2200,7 +2204,7 @@ function fnWriteLeavesAt(
   let et = -1
   for v in vals {
     if cwFnValueDeclOf(v) == d && !i32ListHas(out, v) {
-      if !fnWriteOnlyInto(v, bd, path) { return -2 }
+      if !fnWriteOnlyInto(v, s, path) { return -2 }
       out.push(v)
       et = elem
       const o = fnWriteValueSetOf(v)
@@ -2208,35 +2212,6 @@ function fnWriteLeavesAt(
     }
   }
   et
-}
-
-// Appends to `out` each value a slot write into a map binding of `held` whose value carries set `s`
-// stores that names member `d`, a write a callee makes through a parameter included, and returns
-// that map's value type; -1 when no such write lands only in maps of `s` (D15531).
-export function fnTagMapWriteLeavesOf(
-  d: i32,
-  s: i32,
-  held: i32[],
-  out: i32[],
-): i32 {
-  let vt = -1
-  for hb in held {
-    const mt = fnMapBindValTy(hb)
-    if mt >= 0 && fnTagSetOfTy(mt) == s {
-      const vals: i32[] = []
-      const ats: i32[] = []
-      if cwSlotWrittenValues(cwKeyOfDecl(hb), ["[]"], vals, ats) >= 0 {
-        for v in vals {
-          if cwFnValueDeclOf(v) == d && !i32ListHas(out, v) {
-            if !fnWriteOnlyIntoMap(v, s) { return -1 }
-            out.push(v)
-            vt = mt
-          }
-        }
-      }
-    }
-  }
-  vt
 }
 
 // The value type of map binding `hb`, a `let` whose initialiser or own type is a map; -1 otherwise.
@@ -2249,44 +2224,6 @@ function fnMapBindValTy(hb: i32): i32 {
   if m is TyMap { m.mVal } else { -1 }
 }
 
-// Whether the store of write value `v` lands only in maps whose value carries set `s`: its target
-// roots at one, or at a parameter every call hands only such maps or such parameters.
-function fnWriteOnlyIntoMap(v: i32, s: i32): boolean {
-  if v < 0 || !cwIxCovers(v) { return false }
-  const p = cwIxUp[v]
-  if p < 0 { return false }
-  const pn = nodeAt(p)
-  let tgt = -1
-  if pn is BinExpr && pn.binOp == "=" && parenPeelIx(pn.binRight) == v {
-    tgt = pn.binLeft
-  } else if pn is Call {
-    const f = nodeAt(parenPeelIx(pn.callFn))
-    if f is Member && f.memProp == "set" { tgt = f.memObj }
-  }
-  if tgt < 0 { return false }
-  const path: string[] = []
-  const root = cwSlotPath(tgt, path)
-  if root < 0 || !(nodeAt(root) is Ident) { return false }
-  fnMapArgOnlyOf(identDeclOf(root), s, 0)
-}
-
-// Whether declaration `d` is a map binding whose value carries set `s`, or a parameter every call
-// hands only such bindings through such parameters.
-function fnMapArgOnlyOf(d: i32, s: i32, depth: i32): boolean {
-  if d < 0 || d >= P.nodes.length || depth > 8 { return false }
-  const mt = fnMapBindValTy(d)
-  if mt >= 0 { return fnTagSetOfTy(mt) == s }
-  if !(nodeAt(d) is Param) { return false }
-  const args: i32[] = []
-  if !cwParamArgs(d, args) || args.length == 0 { return false }
-  for a in args {
-    const ap = parenPeelIx(a)
-    if ap < 0 || !(nodeAt(ap) is Ident) { return false }
-    if !fnMapArgOnlyOf(identDeclOf(ap), s, depth + 1) { return false }
-  }
-  true
-}
-
 // The set the assignment storing write value `v` yields as its own value carries, where that
 // value is read: inside an expression, or as the tail of a function whose result is consumed.
 // -1 for a write whose value is discarded.
@@ -2296,6 +2233,7 @@ function fnWriteValueSetOf(v: i32): i32 {
   if !(pn is BinExpr) || pn.binOp != "=" || !cwIxCovers(p) { return -1 }
   const q = cwIxParent[p]
   const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
+  if qn is Program { return -1 }
   if qn is Block {
     const st = qn.blkStmts
     if st.length == 0 || st[st.length - 1] != p || !cwIxCovers(q) { return -1 }
@@ -2308,47 +2246,60 @@ function fnWriteValueSetOf(v: i32): i32 {
   fnTagSetOfTy(nodeTyIxOf(p))
 }
 
-// Whether the store of write value `v` lands only at `path` of containers like `bd`: its target
-// is that place of `bd`, or of a parameter every call hands `bd`, a list widened to its set, or
-// another such parameter. The leaf then emits its id at every instance of the writing function.
-function fnWriteOnlyInto(v: i32, bd: i32, path: string[]): boolean {
+// Whether the store of write value `v` lands only at `path` of containers of set `s`: its target
+// is that place of one, or of a parameter every call hands one or another such parameter. A
+// `push` or a map's `set` stores at the element. The leaf then emits its id at every instance of
+// the writing function.
+function fnWriteOnlyInto(v: i32, s: i32, path: string[]): boolean {
   if v < 0 || !cwIxCovers(v) { return false }
   const p = cwIxUp[v]
   if p < 0 { return false }
   const pn = nodeAt(p)
   let tgt = -1
-  let pushed = false
+  let elem = false
   if pn is BinExpr && pn.binOp == "=" && parenPeelIx(pn.binRight) == v {
     tgt = pn.binLeft
   } else if pn is Call {
     const f = nodeAt(parenPeelIx(pn.callFn))
-    if f is Member && f.memProp == "push" {
+    if f is Member && (f.memProp == "push" || f.memProp == "set") {
       tgt = f.memObj
-      pushed = true
+      elem = true
     }
   }
   if tgt < 0 { return false }
   const at: string[] = []
   const root = cwSlotPath(tgt, at)
   if root < 0 || !(nodeAt(root) is Ident) { return false }
-  if pushed { at.push("[]") }
+  if elem { at.push("[]") }
   if fnFieldPathKey(at) != fnFieldPathKey(path) { return false }
-  fnArgOnlyFrom(identDeclOf(root), bd, 0)
+  fnArgOnlyFrom(identDeclOf(root), s, 0)
 }
 
-// Whether `d` and `bd` are both widened list bindings of one set.
-function fnWidenedSameSet(d: i32, bd: i32): boolean {
-  const i = i32ListIndexOf(fnListWidened, d)
-  const j = i32ListIndexOf(fnListWidened, bd)
-  i >= 0
-    && j >= 0
-    && fnTagSetOfTy(fnListWidenedElem[i]) == fnTagSetOfTy(fnListWidenedElem[j])
+// Whether binding `d` is a container of set `s`: a list or record widened to it, or a map binding
+// whose values carry it.
+function fnHoldsSet(d: i32, s: i32): boolean {
+  let i = 0
+  while i < fnListWidened.length {
+    if fnListWidened[i] == d && fnTagSetOfTy(fnListWidenedElem[i]) == s {
+      return true
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < fnFieldWidened.length {
+    if fnFieldWidened[i] == d && fnTagSetOfTy(fnFieldWidenedElem[i]) == s {
+      return true
+    }
+    i = i + 1
+  }
+  const mt = fnMapBindValTy(d)
+  mt >= 0 && fnTagSetOfTy(mt) == s
 }
 
-// Whether declaration `d` is `bd` or a list widened to its set, or a parameter every call hands
-// only such bindings through such parameters.
-function fnArgOnlyFrom(d: i32, bd: i32, depth: i32): boolean {
-  if d == bd || fnWidenedSameSet(d, bd) { return true }
+// Whether declaration `d` is a container of set `s`, or a parameter every call hands only such
+// bindings through such parameters.
+function fnArgOnlyFrom(d: i32, s: i32, depth: i32): boolean {
+  if fnHoldsSet(d, s) { return true }
   if d < 0 || depth > 8 || !(nodeAt(d) is Param) { return false }
   const args: i32[] = []
   if !cwParamArgs(d, args) { return false }
@@ -2357,7 +2308,7 @@ function fnArgOnlyFrom(d: i32, bd: i32, depth: i32): boolean {
   for a in args {
     const ap = parenPeelIx(a)
     if ap < 0 || !(nodeAt(ap) is Ident) { return false }
-    if !fnArgOnlyFrom(identDeclOf(ap), bd, depth + 1) { return false }
+    if !fnArgOnlyFrom(identDeclOf(ap), s, depth + 1) { return false }
   }
   true
 }
@@ -3939,6 +3890,35 @@ function fnTagHasTaggedField(t: i32): boolean {
   false
 }
 
+// Stamps list literal `v`, written whole into a held list of lists whose element rep is `r`, at
+// `r`, its inner list literals at `r`'s elements, and queues each record literal at its record
+// there, as `fnTagHeldInner` does an initialiser's (D15357).
+export function fnTagHeldWrittenInner(v: i32, r: i32, depth: i32) {
+  const vx = if v >= 0 && v < P.nodes.length { parenPeelIx(v) } else { -1 }
+  const vn = if vx >= 0 && vx < P.nodes.length { nodeAt(vx) } else { null }
+  const ro = if r >= 0 && r < T.tys.length { T.tys[r] } else { null }
+  if depth > 8 { return 0 }
+  if vn is ArrayLit && ro is TyArray {
+    if r != nodeTyIxOf(vx) { fnTagHeldRep[vx] = r }
+    for el in vn.arrElems { fnTagHeldWrittenInner(el, ro.aElem, depth + 1) }
+  } else {
+    fnTagHeldWrittenRec(vx, r)
+  }
+  0
+}
+
+// Queues record literal `x` of a list written whole to be built at record rep `r`; any other
+// value is a read, which keeps its own rep.
+function fnTagHeldWrittenRec(x: i32, r: i32) {
+  const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  const ro = if r >= 0 && r < T.tys.length { T.tys[r] } else { null }
+  if xn is ObjLit && ro is TyObj {
+    fnTagHeldRecs.push(x)
+    fnTagHeldRecs.push(r)
+  }
+  0
+}
+
 // The record literals `fnTagHeldInner` found built at another record, each beside that record;
 // the tag pass stamps and drains them.
 export let fnTagHeldRecs: i32[] = []
@@ -4123,6 +4103,17 @@ export function fnTagBindNote(b: i32, s: i32) {
 
 // Whether `let` declaration `b` holds a tagged set, so its cell is an id and not a closure.
 export function fnTagBindHolds(b: i32): boolean { (fnTagBind[b] ?? -1) >= 0 }
+
+// The tagged set whose id node `e` reads out of a `let` or `const` cell holding one, by name;
+// -1 for any other node.
+export function fnTagBindReadSet(e: i32): i32 {
+  const x = parenPeelIx(e)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const b = identDeclOf(x)
+  if b < 0 || b >= P.nodes.length || !(nodeAt(b) is LetDecl) { return -1 }
+  const s = fnTagBind[b] ?? -1
+  if s >= 0 && (fnTagged[s] ?? false) { s } else { -1 }
+}
 
 // Whether `d` is a function declared under the name `name`.
 export function fnDeclNameIs(d: i32, name: string): boolean {

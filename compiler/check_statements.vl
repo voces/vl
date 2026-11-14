@@ -367,6 +367,7 @@ import {
   cwFollowCalls,
   cwFollowEnd,
   cwLetUnwritten,
+  cwSoleReadInit,
   fnDeclIx,
 } from "./check_write_scan"
 import { identDeclOf, identFromDecl, identRedirect } from "./symbols"
@@ -616,7 +617,7 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     // a generic the signature is the instance's, which one node cannot record.
     const litInit = nodeAt(parenPeelIx(n.letInit)) is ArrayLit
     let wm: i32[] = []
-    if litInit && tpEnvNames.length == 0 {
+    if litInit && tpEnvNames.length == 0 && letFnListLitNamesFns(n.letInit) {
       wm = elabFnListOpenWideMembers(ix, bound)
     }
     const closedAt = letFnListClosedSig(wm)
@@ -1974,6 +1975,27 @@ export function checkBlockNode(n: Block, ix: i32) {
   return TY_VOID
 }
 
+// Whether every element of list literal `init` is a lambda or names a function declaration. A
+// binding listed there keeps the representation its own flow chose, which a closed literal's
+// closure elements do not convert from.
+function letFnListLitNamesFns(init: i32): boolean {
+  const ln = nodeAt(parenPeelIx(init))
+  if !(ln is ArrayLit) { return false }
+  for e in ln.arrElems {
+    const pe = parenPeelIx(e)
+    if pe < 0 || pe >= P.nodes.length { return false }
+    const en = nodeAt(pe)
+    if !(en is FuncDecl) {
+      if !(en is Ident) { return false }
+      const d = identDeclOf(pe)
+      if d < 0 || d >= P.nodes.length || !(nodeAt(d) is FuncDecl) {
+        return false
+      }
+    }
+  }
+  true
+}
+
 // The one closed signature the functions of `ms` share: a plain named one's, else a generic one's
 // bound at the annotated parameters of a written lambda, whose result the write is then checked
 // against. -1 when a plain one is open, two disagree, or a generic one does not fit.
@@ -2125,6 +2147,21 @@ function recLitNamesFns(o: ObjLit): boolean {
   true
 }
 
+// The list literal initialising the binding the read `v` names, where `v` is its one read
+// (`cwSoleReadInit`) and `ft`, its type, a list of functions; else -1.
+function letFnListSoleSource(v: i32, ft: i32): i32 {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return -1 }
+  const fa = if ft >= 0 && ft < T.tys.length { T.tys[ft] } else { T.tys[TY_ERR] }
+  const fe = if fa is TyArray && fa.aElem >= 0 && fa.aElem < T.tys.length { T.tys[fa.aElem] } else { T.tys[TY_ERR] }
+  if !(fe is TyFunc) { return -1 }
+  const src = cwSoleReadInit(v)
+  if src >= 0 && src < P.nodes.length && nodeAt(src) is ArrayLit {
+    src
+  } else {
+    -1
+  }
+}
+
 // The tail values of a `let` initialiser `init`, peeled.
 function letInitLeaves(init: i32): i32[] {
   const ls: i32[] = []
@@ -2261,6 +2298,16 @@ function letFieldListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
           w = letLitListsWidenAt(bd, v, ft, steps)
         } else if nodeAt(v) is ObjLit {
           w = letFieldListsWidenAt(bd, v, ft, steps)
+        } else if letFnListSoleSource(v, ft) >= 0 {
+          // A list binding read only here is this field's producer: its literal takes the
+          // functions written into the field too, and is built at the field (D15392).
+          const none: i32[] = []
+          w = elabFnFieldTy(bd, steps, ft, none)
+          if w != ft {
+            const src = letFnListSoleSource(v, ft)
+            nodeTySetGrow(identDeclOf(v), w)
+            nodeTySetGrow(src, w)
+          }
         } else if (
           ft >= 0
           && ft < T.tys.length
