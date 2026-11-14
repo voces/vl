@@ -31,6 +31,7 @@ import {
   unionObjArmForLit,
 } from "./tyquery"
 import {
+  T,
   TyArray,
   TyFunc,
   TyNullable,
@@ -67,11 +68,33 @@ export let callDstTy: {[i32]: i32} = Map()
 // Whether `callDstTy` holds any row, so a program with no generic call never asks it.
 export let callDstAny = false
 
-// Record `retTy` as the expected return type of the lambda at `nodeIx` (latest wins).
+// Record `retTy` as the expected return type of the lambda at `nodeIx` (latest wins), and whether
+// it is a guess: a union's function arm picked by arity, or a generic parameter's type under the
+// bindings so far, neither of which the lambda's result is held to.
 function recordCbExpectedRet(nodeIx: i32, retTy: i32) {
   cbExpRetNode.push(nodeIx)
   cbExpRetTy.push(retTy)
+  cbExpRetGuess.push(cbSeedGuessing > 0)
   0
+}
+
+export let cbExpRetGuess: boolean[] = []
+// Above zero while `seedExpected` seeds from a guess (`recordCbExpectedRet`).
+export let cbSeedGuessing = 0
+export function cbSeedGuessingAdd(d: i32) {
+  cbSeedGuessing = cbSeedGuessing + d
+}
+
+// Whether the newest expected return recorded for the lambda at `nodeIx` holds it: a return is
+// recorded for it, and that return is no guess.
+export function cbExpectedRetHeld(nodeIx: i32): boolean {
+  let held = false
+  let i = 0
+  while i < cbExpRetNode.length {
+    if cbExpRetNode[i] == nodeIx { held = !(cbExpRetGuess[i] ?? true) }
+    i = i + 1
+  }
+  held
 }
 
 // The expected return type recorded for the lambda at `nodeIx` — the last recorded one, the real
@@ -177,7 +200,13 @@ export function seedExpected(exprIx: i32, expectedTy: i32) {
         // adopts the union. Without it the lambda infers its own `() => i32` and the assignment
         // is a loud type error. Arity-matched, so a wrong-arity arm falls to assignability.
         const arm = unionFuncArmForArity(et, en.fnParams.length)
-        if arm >= 0 { did = seedExpected(u, arm) }
+        if arm >= 0 {
+          // With one function arm the arm is the lambda's only destination; with several, a guess.
+          const guess = unionFuncArmCount(et) > 1
+          if guess { cbSeedGuessingAdd(1) }
+          did = seedExpected(u, arm)
+          if guess { cbSeedGuessingAdd(-1) }
+        }
       }
     }
   } else if en is Call {
@@ -328,6 +357,8 @@ export function expectedReset() {
   cbExpPool = []
   cbExpRetNode = []
   cbExpRetTy = []
+  cbExpRetGuess = []
+  cbSeedGuessing = 0
   callDstTy = Map()
   callDstAny = false
   joinWantAt = Map()
@@ -350,4 +381,13 @@ export function cbExpTruncate(m: i32[]) {
     cbExpRetTy.pop()
   }
   0
+}
+
+// How many of union `u`'s members are function types.
+function unionFuncArmCount(u: TyUnion): i32 {
+  let k = 0
+  for m in u.uMembers {
+    if m >= 0 && m < T.tys.length && tyAt(m) is TyFunc { k = k + 1 }
+  }
+  k
 }
