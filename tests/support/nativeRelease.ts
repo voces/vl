@@ -69,8 +69,8 @@
 //     tail-call enable that way, and the flag lists are read OUT OF `main.rs` so the
 //     test cannot drift from what ships.
 //
-// A missing `wasm-opt` stays a SOFT NO-OP for `-O3` exactly as for `-O`, which is
-// its own case below (exit 0, a note on stderr, the unoptimized module on disk).
+// A missing `wasm-opt` FAILS `-O3` exactly as `-O`: exit 1, no module on disk
+// (`selfhost_native_release_test.ts` pins it).
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`, shared with the alignment suite)
 // AND requires the vl binary + seed wasm + `wasm-opt` + `wasm-dis`; absent any,

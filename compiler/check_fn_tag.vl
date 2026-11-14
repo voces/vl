@@ -96,6 +96,7 @@ import {
   cwOccWalk,
   cwOccWalkSpelled,
   cwSlotWrittenValues,
+  cwSoleReadInit,
   cwUseCaptures,
   fnDeclIx,
 } from "./check_write_scan"
@@ -165,6 +166,7 @@ import {
   mintSeedWideOfBind,
   mintSeedWideOfParam,
   mintSetPartial,
+  mintStoreSetOf,
 } from "./check_mint"
 import { fnDeclParent } from "./check_decl_scan"
 import { identDeclOf, identFromDecl } from "./symbols"
@@ -207,6 +209,7 @@ import {
   fnTagHeldRepOf,
   fnTagJoinFromOf,
   fnTagJoinsWith,
+  fnTagLeafSetOf,
   fnTagListJoinSet,
   fnTagMapWriteLeavesOf,
   fnTagMark,
@@ -558,6 +561,20 @@ export function fnTagRedecide(rootIx: i32): i32 {
   if now.length > ftWas.length { 1 } else { 0 }
 }
 
+// The record literals the plan in progress takes as written into a holder of its set
+// (`ftStoredAt`), beside the holder's type.
+let ftStoreLits: i32[] = []
+let ftStoreLitTys: i32[] = []
+
+// Whether, after the elaboration, record literal `v` is written into a binding an instance holds
+// set `s` in (`mintStoreNote`), or a set the plan decides `s` with, so its function fields are
+// leaves of that set (D16137).
+function ftStoredAt(v: i32, s: i32): boolean {
+  if !ftLate { return false }
+  const st = mintStoreSetOf(parenPeelIx(v))
+  st == s || st >= 0 && i32ListHas(ftAssume, st) && ftSetWithin(s, st)
+}
+
 // The sets a decision after the elaboration left untagged once an earlier one had tagged them:
 // they stay untagged, so the rounds settle where tagging a set refutes itself (D15484).
 let ftLateRefused: i32[] = []
@@ -574,6 +591,8 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   ftMapRecLit = []
   ftMapRecMap = []
   ftMapRecFn = []
+  ftStoreLits = []
+  ftStoreLitTys = []
   ftSubNeed = []
   ftAssume = [s]
   ftNamedRecLits = []
@@ -612,6 +631,12 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     const rr = ftMapRecRep(ftMapRecMap[mr], ftMapRecFn[mr])
     if rr >= 0 { repStampHeldRead(ftMapRecLit[mr], rr) }
     mr = mr + 1
+  }
+  // A record literal an instance writes into a holder of the set is built at the holder's rep.
+  let sl = 0
+  while sl < ftStoreLits.length {
+    repStampHeldRead(ftStoreLits[sl], fnTagRepTyOf(ftStoreLitTys[sl]))
+    sl = sl + 1
   }
   // A record literal of an inner list is built at that list's record, so it shares its row.
   let q2 = 0
@@ -1002,7 +1027,12 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
     // recorded as its leaf, typed as the list's element where the callee's hole types it (D14648).
     if t < 0 {
       const wvs: i32[] = []
-      const et = fnTagWriteLeavesOf(d, s, wvs)
+      const wsets: i32[] = []
+      const et = fnTagWriteLeavesOf(d, s, wvs, wsets)
+      // The write's own value is the leaf's id too, so the set it carries is decided with `s`.
+      for o in wsets {
+        if ftSetWithin(o, s) && !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
+      }
       if et >= 0 {
         for wv in wvs {
           leaves.push(wv)
@@ -1610,9 +1640,8 @@ function ftScan(
         }
         // A binding of the set written: what the write stores is an id of it.
         if pn is BinExpr && ftIsStore(pn) && pn.binLeft == x {
-          if !ftJoinAt(pn.binRight, nodeTyIxOf(x), s, ds, leaves, ids) {
-            return false
-          }
+          const wv = ftWrittenNamedSource(pn.binRight, nodeTyIxOf(x))
+          if !ftJoinAt(wv, nodeTyIxOf(x), s, ds, leaves, ids) { return false }
         }
       }
       // A record literal written whole into a binding the field widener widened, or a field or
@@ -1623,13 +1652,33 @@ function ftScan(
       if ftHolds(x, s) && rw is BinExpr && ftIsStore(rw) && rw.binLeft == x {
         const wls: i32[] = []
         tailValueLeaves(rw.binRight, wls)
+        // A read of a binding read nowhere else writes its initialiser's literals (D15308).
+        let wi = 0
+        while wi < wls.length && wi < 64 {
+          const bi = cwSoleReadInit(wls[wi])
+          const bl: i32[] = []
+          if bi >= 0 { tailValueLeaves(bi, bl) }
+          let fw = false
+          for b in bl {
+            if recAsgFnWidenedTy(parenPeelIx(b)) >= 0 { fw = true }
+          }
+          if fw {
+            ftWrittenSourceAt(wls[wi], nodeTyIxOf(x))
+            for b in bl { wls.push(b) }
+          }
+          wi = wi + 1
+        }
         for wl in wls {
           const wx = parenPeelIx(wl)
           if (
-            recAsgFnWidenedTy(wx) >= 0
+            (recAsgFnWidenedTy(wx) >= 0 || ftStoredAt(wx, s))
             && !ftRecWriteJoins(wx, nodeTyIxOf(x), s, ds, leaves, ids, 0)
           ) {
             return false
+          }
+          if ftStoredAt(wx, s) {
+            ftStoreLits.push(wx)
+            ftStoreLitTys.push(nodeTyIxOf(x))
           }
           ftWrittenNote(wx)
           if recAsgFnWidenedTy(wx) >= 0 { ftWrittenInitNote(x, wx) }
@@ -2380,6 +2429,21 @@ function ftSetWithin(a: i32, b: i32): boolean {
   true
 }
 
+// Whether write value `x` is a leaf `fnTagWriteLeavesOf` took for a set wider than `s`, planned
+// with it or tagged: the write stores that set's id, and its own value is the same id.
+function ftWiderWriteLeaf(x: i32, s: i32): boolean {
+  let k = 0
+  while k < ftPlS.length {
+    const o = ftPlS[k]
+    if o != s && ftSetWithin(s, o) && i32ListHas(ftPlLeaves[k], x) {
+      return true
+    }
+    k = k + 1
+  }
+  const t = fnTagLeafSetOf(x)
+  t >= 0 && t != s && fnTagSetIsTagged(t) && ftSetWithin(s, t)
+}
+
 // Whether the list `arr` is written holds a tagged set other than `s` with every member of `s`:
 // the write stores an id of that set, which its own decision covers.
 function ftStoreInWider(arr: i32, s: i32): boolean {
@@ -2585,6 +2649,61 @@ function ftJoinAt(
     }
   }
   ftValuesOk(vs, s, ds, leaves, ids)
+}
+
+// The value a write of `v` into a binding of type `t` stores: where `v` reads a binding read
+// nowhere else (`cwSoleReadInit`) that names a top-level function, that name, with the read and
+// the binding re-typed to `t` (D15308); else `v`. Only outside an instanced function, and where
+// the read and the binding are in one function, so no instance or capture sees the binding.
+function ftWrittenNamedSource(v: i32, t: i32): i32 {
+  let x = parenPeelIx(v)
+  const own = if x >= 0 && x < P.nodes.length { recEnclosingFn(x) } else { -2 }
+  if own < -1 || own >= 0 && ftInstancedFnOrIn(own) { return v }
+  let hops = 0
+  while hops < 8 {
+    const bi = cwSoleReadInit(x)
+    const xd = if bi >= 0 { identDeclOf(x) } else { -1 }
+    if bi < 0 || recEnclosingFn(xd) != own {
+      hops = 8
+    } else if ftNamedFn(bi) >= 0 {
+      ftWrittenSourceAt(v, t)
+      return bi
+    } else if bi < P.nodes.length && nodeAt(bi) is Ident {
+      x = bi
+    } else {
+      hops = 8
+    }
+    hops = hops + 1
+  }
+  v
+}
+
+// Whether function `f` is generic or open, or declared inside one (`ftWithinInstancedFn`).
+function ftInstancedFnOrIn(f: i32): boolean {
+  const fd = nodeAt(f)
+  fd is FuncDecl && fd.fnTyParams.length > 0
+    || ftOpenFn(f)
+    || ftWithinInstancedFn(f)
+}
+
+// Re-types the read `v` of a binding `cwSoleReadInit` answers, and that binding, to `t`, through
+// bindings of bindings. True.
+function ftWrittenSourceAt(v: i32, t: i32): boolean {
+  let x = parenPeelIx(v)
+  let hops = 0
+  while hops < 8 && x >= 0 && x < P.nodes.length && nodeAt(x) is Ident {
+    const bi = cwSoleReadInit(x)
+    if bi < 0 { return true }
+    for j in [x, identDeclOf(x)] {
+      if !i32ListHas(ftRespine, j) {
+        ftRespine.push(j)
+        ftRespineTy.push(t)
+      }
+    }
+    x = bi
+    hops = hops + 1
+  }
+  true
 }
 
 // Splits join `x` into the joins it is made of, `sp`, and the values they hand on, `vs`: the arms
@@ -4136,6 +4255,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       }
       if pn.binRight != x { return false }
       if ftIsS(pn.binLeft, s) { return true }
+      if ftWiderWriteLeaf(x, s) { return true }
       if ftSeededHolds(pn.binLeft, s) { return true }
       if ftHeldWider(nodeTyIxOf(pn.binLeft), s) { return true }
       const ln = nodeAt(pn.binLeft)
@@ -4772,10 +4892,11 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         // A record literal into a map of the set's records is noted first, for its row.
         return ftRecIntoMapSlot(x, pn.binLeft, s, fn)
           || ftDstTakes(nodeTyIxOf(pn.binLeft), x, s)
+          || ftStoredAt(x, s)
           || ftDstTakes(ftMapEntryOf(pn.binLeft, s), x, s)
       }
       if ftIsStore(pn) && pn.binLeft == x {
-        return ftDstTakes(tx, pn.binRight, s)
+        return ftDstTakes(tx, pn.binRight, s) || ftStoredAt(pn.binRight, s)
       }
       // A holder compared with `null` is read for presence alone.
       if pn.binOp == "==" || pn.binOp == "!=" {
