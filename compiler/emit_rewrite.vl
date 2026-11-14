@@ -58,7 +58,11 @@ import {
   voidCoerceValCount,
   voidCoerceValNameAt,
 } from "./check_side_rows"
-import { asgAnyWiderStore, asgStoreTyOf } from "./check_asg_rows"
+import {
+  asgAnyWiderStore,
+  asgRhsBuiltAtPlace,
+  asgStoreTyOf,
+} from "./check_asg_rows"
 import { ifYieldsNoValue } from "./check_if_value"
 import { isPatTyIxOf, isVarTyIxOf } from "./check_list_union"
 import {
@@ -2910,7 +2914,7 @@ function asvTypeMoves(asgIx: i32): boolean {
   const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
   if a.binOp != "=" || a.binCompound != "" { return false }
-  if !(nodeAt(a.binLeft) is Ident) { return false }
+  if !(nodeAt(a.binLeft) is Ident) { return asvPlaceRecordMoves(a, asgIx) }
   if nodeAt(unwrapParen(a.binRight)) is NullLit { return false }
   // A number literal's value is built where it is read (`asgLitWidth`), so it stays in place.
   if asvLitValue(a.binRight) { return false }
@@ -2926,6 +2930,34 @@ function asvTypeMoves(asgIx: i32): boolean {
   // An open write moves only as a bare type parameter into a union holding it, whose instances
   // store the two apart; any other open value keeps the place's own read (D2439).
   tyAt(vt) is TyVar && tyAt(lt) is TyUnion
+}
+
+// A named record value written into a list element or a field whose record is another (D16019):
+// the place holds its own record, so the value moves ahead and is read at its own type. A
+// literal is built at the place, and a map entry or an open type keeps the ladder's lowering.
+function asvPlaceRecordMoves(a: BinExpr, asgIx: i32): boolean {
+  if asgRhsBuiltAtPlace(a.binRight) { return false }
+  const t = unwrapParen(a.binLeft)
+  if t < 0 { return false }
+  const vt = nodeTyIxOf(asgIx)
+  const lt = nodeTyIxOf(t)
+  if vt < 0 || lt < 0 { return false }
+  const pt = nonNullTy(lt)
+  if pt < 0 || !(tyAt(vt) is TyObj) || !(tyAt(pt) is TyObj) || tySame(vt, pt) {
+    return false
+  }
+  if tyHasTyVar(vt) || tyHasTyVar(pt) { return false }
+  if tyHasInferHole(vt, 0) || tyHasInferHole(pt, 0) { return false }
+  const tn = nodeAt(t)
+  match tn {
+    Member => true
+    Index => {
+      const rt = nodeTyIxOf(tn.idxArr)
+      rt >= 0 && tyAt(nonNullTy(rt)) is TyArray
+    }
+    // A name target is `asvTypeMoves`'s own; no other node is a place.
+    Ident | NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => false
+  }
 }
 
 // The type the binding name `ix` reads is declared at, a `let`'s annotation or a parameter's;
@@ -3091,14 +3123,45 @@ function asvPassTarget(ti: i32) {
 // write `asvMoves` accepts becomes `const v = e; a = v` on `out` and the read of `v`. A field
 // or element target is walked only when its receiver and index are names or literals.
 function asvWalkWrite(ix: i32, n: BinExpr, out: i32[], isValue: boolean): i32 {
+  const readsBefore = asvReads.length
+  const outBefore = out.length
   asvPassTarget(unwrapParen(n.binLeft))
   n.binRight = asvWalk(n.binRight, out, true)
-  if asvStop || !isValue || !asvMoves(ix) { return ix }
+  if asvStop || !isValue { return ix }
+  if !(nodeAt(n.binLeft) is Ident) {
+    return asvMovePlace(ix, n, out, readsBefore, outBefore)
+  }
+  if !asvMoves(ix) { return ix }
   if asvTopLet { asvStop = true }
   const v = spillLocal(n.binRight, ix, "nv", out, n.pos)
   n.binRight = v
   out.push(ix)
   spillRead(v)
+}
+
+// A field or element write `asvPlaceRecordMoves` accepts, moved onto `out` as `spillWrite`
+// spills it: receiver, index and value in source order, then the store. Only operands passed
+// before the target constrain it, and nothing moves past a write the right side moved first.
+function asvMovePlace(
+  ix: i32,
+  n: BinExpr,
+  out: i32[],
+  readsBefore: i32,
+  outBefore: i32,
+): i32 {
+  if out.length != outBefore || !asvTypeMoves(ix) { return ix }
+  let spilled = true
+  let i = 0
+  while i < readsBefore {
+    if !asvIsSpill(asvReads[i]) { spilled = false }
+    i = i + 1
+  }
+  if !spilled && asvMayWrite(n.binRight) { return ix }
+  const val = spillWrite(ix, out)
+  if val < 0 { return ix }
+  if asvTopLet { asvStop = true }
+  out.push(ix)
+  val
 }
 
 // The statement at `ix` with its leading value-position writes moved onto `out`: a binding's
@@ -3227,11 +3290,27 @@ function asvChainHasElse(ix: i32): boolean {
   false
 }
 
+// Whether any of the first `n` nodes is a write `asvPlaceRecordMoves` accepts, which the
+// checker's wider-store record does not note.
+function asvAnyPlaceRecordWrite(n: i32): boolean {
+  let i = 0
+  while i < n {
+    const a = nodeAt(i)
+    if a is BinExpr {
+      if a.binOp == "=" && a.binCompound == "" && asvPlaceRecordMoves(a, i) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // The pass: every statement list in the arena, before collection reads the module's bindings.
 export function assignValueSpill(stmts: i32[]) {
   const n = P.nodes.length
   // A program whose every write stores its right side's own type has nothing to move.
-  if !asgAnyWiderStore() { return 0 }
+  if !asgAnyWiderStore() && !asvAnyPlaceRecordWrite(n) { return 0 }
   let i = 0
   while i < n {
     const nd = nodeAt(i)
