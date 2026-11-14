@@ -540,8 +540,8 @@ All commands were run from the worktree root at `3b431fbbb`.
 ### B.3 The script
 
 The script is 312 lines of Node, quoted below so that the figures re-run from this note:
-`node phase-census.mjs compiler --json census.json` from the checkout root. Step 0 has it ported to
-`scripts/phase-state-census.vl` as a ratchet, and that port must reproduce this note's figures at
+`node phase-census.mjs compiler --json census.json` from the checkout root. Step 0 makes it a ratchet,
+to be ported to `scripts/phase-state-census.vl`; that port must reproduce this note's figures at
 `3b431fbbb` before it gates anything.
 
 <details><summary><code>phase-census.mjs</code></summary>
