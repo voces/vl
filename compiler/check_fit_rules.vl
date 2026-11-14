@@ -264,6 +264,7 @@ import {
   nodeTyIx,
   nodeTyIxOf,
   nodeTyOf,
+  nodeTyRecord,
   nodeTySet,
 } from "./check_node_tys"
 import {
@@ -377,6 +378,7 @@ import {
   assignable,
   bindGenWalk,
   constrainEmpty,
+  fnSlotRetWidens,
   joinArmFits,
   joinArmLit,
   joinArmTail,
@@ -445,6 +447,7 @@ import {
   containerWidenServed,
   containerWidenWhy,
   fieldStorageEq,
+  isWidenNotVariant,
   listJoinStorageDiffers,
   listPairNeedsCopy,
   objFieldNameSetsEq,
@@ -618,6 +621,7 @@ import {
   nonNullTy,
   nulFoldMemberTy,
   nullableInnerOrNone,
+  primIsSubWord,
   primNameOf,
   tyAdmitsNull,
   tyHasNullMember,
@@ -8488,6 +8492,30 @@ export function litAtDstStorage(x: i32, dstTy: i32): boolean {
   false
 }
 
+// Whether `x` is a `.map` over a list whose fresh result, a list of sub-word values, meets a list
+// of that sub-word element: it is built at its destination's storage, as a literal of computed
+// values is, and takes the destination's type where stamps stand.
+export function freshMapAtDstStorage(x: i32, srcTy: i32, dstTy: i32): boolean {
+  const c = parenPeelIx(x)
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) || cn.callFn < 0 { return false }
+  const f = nodeAt(cn.callFn)
+  if !(f is Member) || f.memProp != "map" { return false }
+  const rt = nodeTyIxOf(f.memObj)
+  if rt < 0 || rt >= T.tys.length || !(tyAt(rt) is TyArray) { return false }
+  const s = if srcTy >= 0 && srcTy < T.tys.length { tyAt(srcTy) } else { null }
+  const d = if dstTy >= 0 && dstTy < T.tys.length { tyAt(dstTy) } else { null }
+  if !(s is TyArray) || !(d is TyArray) || d.aRead == 1 && s.aRead != 1 {
+    return false
+  }
+  if d.aElem < 0 || d.aElem >= T.tys.length { return false }
+  if !primIsSubWord(primNameOf(d.aElem)) || s.aElem != arrElemValueTy(d.aElem) {
+    return false
+  }
+  if stampsStand() { nodeTyRecord(c, dstTy) }
+  true
+}
+
 // Whether `x`, past parentheses, is a fresh value (`freshLitValue`), or a value `if`, `match`,
 // block or `??` one of whose arms is: the sources a rep stamp can adopt.
 export function repStampableLit(x: i32): boolean {
@@ -9764,34 +9792,104 @@ export function litPrimMeetTy(obj: i32, chk: i32): i32 {
   mkUnionTy(keep)
 }
 
-// The part of `obj` that always fits the record type `chk`, where `chk` names none of `obj`'s
-// members: `b is A` over `b: B` or `B | null` with every `B` an `A` tests as `is B`, and over
-// `B | C` with no `C` able to fit `A` it tests the `B` (D4062). -1 otherwise.
-export function recFitMeetTy(obj: i32, chk: i32): i32 {
-  if obj < 0 || chk < 0 { return -1 }
+// `tyTestMemberFit`'s three answers.
+export const TT_NONE = 0
+export const TT_PARTLY = 1
+export const TT_COVERED = 2
+
+// What a type test of `chk` answers for a value of one operand member `m`, the one rule `is`,
+// `as` and `match` share: covered where every value of `m` fits `chk` (`m` is `chk`, the type
+// parameter it names, or a record it contains), partly where some may (`chk` fits `m`, or `m` is
+// a parameter a pin may bind to `chk`), else none. A union `chk` answers its best member.
+export function tyTestMemberFit(m: i32, chk: i32): i32 {
+  if m < 0 || chk < 0 || m >= T.tys.length || chk >= T.tys.length {
+    return TT_NONE
+  }
   const ct = tyAt(chk)
-  if !(ct is TyObj) { return -1 }
-  let base = obj
-  const ot = tyAt(obj)
-  if ot is TyNullable { base = ot.nInner }
-  if base < 0 { return -1 }
-  const bt = tyAt(base)
-  if bt is TyObj {
-    if recContainedIn(base, chk) { return base }
-    return -1
-  }
-  if !(bt is TyUnion) { return -1 }
-  let fit = -1
-  for m in bt.uMembers {
-    if m < 0 || tySame(m, chk) { return -1 }
-    if recContainedIn(m, chk) {
-      if fit >= 0 { return -1 }
-      fit = m
-    } else if !recNeverFits(m, ct) {
-      return -1
+  if ct is TyUnion || ct is TyNullable {
+    let best = TT_NONE
+    for c in tyTestMembers(chk) {
+      const f = if c == chk { TT_NONE } else { tyTestMemberFit(m, c) }
+      if f > best { best = f }
     }
+    return best
   }
-  fit
+  if tyTestIsMember(m, chk) || recContainedIn(m, chk) { return TT_COVERED }
+  if tyAt(m) is TyVar { return TT_PARTLY }
+  if (
+    assignable(chk, m)
+    && !isWidenNotVariant(chk, m)
+    && !fnSlotRetWidens(chk, m)
+  ) {
+    return TT_PARTLY
+  }
+  TT_NONE
+}
+
+// Whether operand member `m` is the tested type `c` itself: the same variant, or the type
+// parameter `c` names.
+export function tyTestIsMember(m: i32, c: i32): boolean {
+  if m < 0 || c < 0 { return false }
+  const mt = tyAt(m)
+  const ct = tyAt(c)
+  if mt is TyVar { return ct is TyVar && ct.tvName == mt.tvName }
+  m == c || sameVariantTy(m, c)
+}
+
+// The members of `t`, a union or nullable flattened, `null` among them.
+function tyTestMembers(t: i32): i32[] {
+  const ms: i32[] = []
+  if t >= 0 { flattenVariantsInto(t, ms) }
+  ms
+}
+
+// Whether a test of `chk` over `obj` can be true: each member of `chk` may fit some member of
+// `obj`, or `obj`, one type, is covered by `chk`.
+export function tyTestMayFit(obj: i32, chk: i32): boolean {
+  const ms = tyTestMembers(obj)
+  const cs = tyTestMembers(chk)
+  if cs.length == 0 || ms.length == 0 { return false }
+  if ms.length == 1 && tyTestMemberFit(ms[0], chk) == TT_COVERED { return true }
+  for c in cs {
+    let hit = false
+    for m in ms { hit = hit || tyTestMemberFit(m, c) != TT_NONE }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether every member of `chk` is a member of `obj` (`tyTestIsMember`): a cast to `chk` picks
+// those arms.
+export function tyTestNamesMembers(obj: i32, chk: i32): boolean {
+  const ms = tyTestMembers(obj)
+  const cs = tyTestMembers(chk)
+  if cs.length == 0 { return false }
+  for c in cs {
+    let hit = false
+    for m in ms { hit = hit || tyTestIsMember(m, c) }
+    if !hit { return false }
+  }
+  true
+}
+
+// What a test of record `chk` over `obj` tests where `chk` is no member but contains some and
+// no other can fit: those members, so `b is A` over `B | D` with every `B` and `D` an `A` tests
+// `B | D` (D4062, D4085). -1 otherwise.
+export function tyTestMeet(obj: i32, chk: i32): i32 {
+  const ct = if chk >= 0 { tyAt(chk) } else { null }
+  if !(ct is TyObj) { return -1 }
+  const keep: i32[] = []
+  for m in tyTestMembers(obj) {
+    const f = tyTestMemberFit(m, chk)
+    if f == TT_PARTLY || tyTestIsMember(m, chk) || tySame(m, chk) { return -1 }
+    // A record answered none must be one no value of which fits, not one wider in fields.
+    const mo = tyAt(m)
+    if f == TT_NONE && mo is TyObj && !recNeverFits(m, ct) { return -1 }
+    if f == TT_COVERED { keep.push(m) }
+  }
+  if keep.length == 0 { return -1 }
+  if keep.length == 1 { return keep[0] }
+  mkUnionTy(keep)
 }
 
 // Whether every value of record `a` fits record `b` and not the reverse, the two declaring the

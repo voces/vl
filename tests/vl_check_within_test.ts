@@ -973,7 +973,7 @@ const CASES: Case[] = [
       "main.vl": 'import { d } from "./mid"\nconst s: string = d(null)\nprint(s)\n',
       "mid.vl": "type Json = null | boolean | f64 | string | Json[] | { [string]: Json }\n" +
         "export function d(r: Json): i32 {\n  if r is string[] {\n    const n = r[0].length\n" +
-        "    r = null\n    return n\n  }\n  0\n}\n",
+        "    const c = () => { r = null }\n    c()\n    return n\n  }\n  0\n}\n",
     },
     target: "mid.vl",
     want: "dirty",

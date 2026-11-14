@@ -219,6 +219,7 @@ import { noteArrayWriteDemand } from "./check_subst"
 import { symMemMethod } from "./check_sym_occ"
 import { tpGradualView } from "./check_tp_join"
 import {
+  RET_PENDING,
   T,
   TY_BOOL,
   TY_ERR,
@@ -1122,6 +1123,8 @@ function checkListPushArgs(
         )
         tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
         numSlotStamp(margs[mi], pat, rt.aElem)
+        // The first value is delivered at the slot it pinned, as a later one is (D16360).
+        recordCtxTy(margs[mi], rt.aElem)
       } else {
         cnhFill(rt.aElem, nullReadHoleTy(margs[mi], pat))
         // A later push joins the first one's function sets (D15929).
@@ -1231,14 +1234,14 @@ function memberCallMapFilterTy(
   // un-annotated function-literal argument infers its param instead of erroring — only
   // when the arg is an anonymous literal and the element type is known, else cleared below.
   const cbArg = nodeAt(cargs[0])
+  // The callback's parameter is one element read, so a sub-word element is its `i32` value.
+  const el = arrElemValueTy(rt.aElem)
   // A named callback is typed by the element, which a refused function value names.
-  if cbArg is Ident && ovSetMod.length > 0 { ovCbElemSetAt(cargs[0], rt.aElem) }
+  if cbArg is Ident && ovSetMod.length > 0 { ovCbElemSetAt(cargs[0], el) }
   // An intrinsic named as the callback is a minted lambda; the element picks its width.
-  if cbArg is Paren && rt.aElem >= 0 { ivSeedWidth(cbArg.parInner, [rt.aElem]) }
+  if cbArg is Paren && el >= 0 { ivSeedWidth(cbArg.parInner, [el]) }
   if cbArg is FuncDecl {
-    if cbArg.fnName == "" && rt.aElem >= 0 {
-      recordCbExpected(cargs[0], [rt.aElem])
-    }
+    if cbArg.fnName == "" && el >= 0 { recordCbExpected(cargs[0], [el]) }
     if !cbElemNarrowFor(recvIx, cargs[0]) { efLeaf[cargs[0]] = -1 }
   }
   const cbTy = checkNodeHook(cargs[0])
@@ -1248,7 +1251,7 @@ function memberCallMapFilterTy(
       const cbParams = cb.fnParamTypes
       // Each generic or hole function the callback may be is instanced at the element, by its
       // own signature.
-      if cbParams.length == 1 && elabTyClosed(rt.aElem, 0) {
+      if cbParams.length == 1 && elabTyClosed(el, 0) {
         const cbds: i32[] = []
         if cbArg is Ident {
           // A binding holding a function, as the function itself.
@@ -1269,7 +1272,7 @@ function memberCallMapFilterTy(
           ) {
             const eNames: string[] = []
             const eTys: i32[] = []
-            bindGenWalk(cbf.fnParamTypes[0], rt.aElem, eNames, eTys)
+            bindGenWalk(cbf.fnParamTypes[0], el, eNames, eTys)
             elabCbNote(cbd, cargs[0], eNames, eTys)
           }
         }
@@ -1284,16 +1287,16 @@ function memberCallMapFilterTy(
       // judged there as a direct call's are (D8944).
       let cbRet = cb.fnRet
       if cbParams.length == 1 && holeFnArgDecls(cargs[0]).length > 0 {
-        holeLetWritesDisagree(cargs[0], [rt.aElem])
+        holeLetWritesDisagree(cargs[0], [el])
         if tyHasTyVar(cbRet) {
-          const hr = holeFnArgRetAtParams(cargs[0], [rt.aElem])
+          const hr = holeFnArgRetAtParams(cargs[0], [el])
           if hr >= 0 {
             cbRet = hr
           } else {
-            cbRet = holeCbRetAtElem(cargs[0], cbTy, rt.aElem, cbRet)
+            cbRet = holeCbRetAtElem(cargs[0], cbTy, el, cbRet)
           }
         }
-        const want = mkFuncTy([rt.aElem], cbRet)
+        const want = mkFuncTy([el], cbRet)
         if elabTyClosed(want, 0) && !assignableExpr(cargs[0], cbTy, want) {
           tErr(
             prop
@@ -1304,21 +1307,21 @@ function memberCallMapFilterTy(
             ix,
           )
         }
-      } else if cbParams.length == 1 && tyHasTyVar(cbRet) && rt.aElem >= 0 {
+      } else if cbParams.length == 1 && tyHasTyVar(cbRet) && el >= 0 {
         // A declared generic's type parameters are bound by the element (D9004).
         const bNames: string[] = []
         const bTys: i32[] = []
-        bindGenWalk(cbParams[0], rt.aElem, bNames, bTys)
+        bindGenWalk(cbParams[0], el, bNames, bTys)
         if bNames.length > 0 { cbRet = substTyDeep(cbRet, bNames, bTys) }
         // A value of a set of functions escapes here at the element's closed signature.
-        const at = mkFuncTy([rt.aElem], cbRet)
+        const at = mkFuncTy([el], cbRet)
         if fnTagChoiceOfTy(cbTy) && elabTyClosed(at, 0) {
           fvaAdapt(cargs[0], cbTy, at)
         }
       } else if (
         cbParams.length == 1
-        && rt.aElem >= 0
-        && !assignableExpr(cargs[0], cbTy, mkFuncTy([rt.aElem], cbRet))
+        && el >= 0
+        && !assignableExpr(cargs[0], cbTy, mkFuncTy([el], cbRet))
       ) {
         // The callback is delivered at the element's signature, as an argument is.
         tErr(
@@ -1326,13 +1329,14 @@ function memberCallMapFilterTy(
             + " callback: parameter expects "
             + tyToStr(cbParams[0])
             + ", got "
-            + tyToStr(rt.aElem),
+            + tyToStr(el),
           ix,
         )
       }
       checkFnValueRetTyParamBound(cargs[0], cbTy)
       if prop == "filter" {
-        if !assignable(cbRet, TY_BOOL) {
+        // A predicate still being inferred is judged at the call's re-check, not here.
+        if cbRet != RET_PENDING && !assignable(cbRet, TY_BOOL) {
           tErr("filter predicate must yield boolean, got " + tyToStr(cbRet), ix)
         }
         return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
@@ -1507,6 +1511,7 @@ function memberCallMapTy(
         tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
         if rt.mVal == v0 { recOwnPend(margs2[1], v0) }
         numSlotStamp(margs2[1], v0, rt.mVal)
+        recordCtxTy(margs2[1], rt.mVal)
         elabSlotRecLitGrow(margs2[1], rt.mVal)
       } else {
         cnhFill(rt.mVal, nullReadHoleTy(margs2[1], v0))

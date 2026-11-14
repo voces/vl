@@ -25,6 +25,7 @@ import {
 } from "../lsp/src/moduleGraph.ts";
 import { STD_SOURCES } from "../std/embedded.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const assert = (cond: boolean, msg: string): void => {
   if (!cond) throw new Error(msg);
@@ -38,14 +39,7 @@ const memoryReader = (files: Record<string, string>): ModuleReader =>
 // find-refs tests self-ignore via `refsIgnore` — the convention of the rest of the
 // wasm suite. The go-to-def tests use the TS module-graph helpers and need no seed.
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const refsIgnore = !((() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})());
+const refsIgnore = !seedPresent(SEED);
 const checker = refsIgnore ? undefined : loadWasmChecker(SEED, () => {});
 const xref = (
   name: string,
