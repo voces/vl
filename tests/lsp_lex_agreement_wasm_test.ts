@@ -20,17 +20,11 @@ import { filePath } from "./support/filePath.ts";
 import { lineStarts, tokenize } from "../lsp/src/vlLex.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import type { WasmChecker } from "../lsp/src/wasmChecker.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const CASES = filePath(new URL("./cases", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 
 interface Span {
   a: number;
