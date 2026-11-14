@@ -205,6 +205,7 @@ import {
   fnTagHeldNote,
   fnTagHeldRecs,
   fnTagHeldRepOf,
+  fnTagHeldWrittenInner,
   fnTagJoinFromOf,
   fnTagJoinsWith,
   fnTagListJoinSet,
@@ -613,6 +614,14 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     if rr >= 0 { repStampHeldRead(ftMapRecLit[mr], rr) }
     mr = mr + 1
   }
+  // A list literal written whole into a held list of lists is built at the holder's element.
+  let ww = 0
+  while ww + 1 < ftWrittenWhole.length {
+    const hr = fnTagHeldRepOf(ftWrittenWhole[ww + 1])
+    const ho = if hr >= 0 && hr < T.tys.length { tyAt(hr) } else { null }
+    if ho is TyArray { fnTagHeldWrittenInner(ftWrittenWhole[ww], ho.aElem, 0) }
+    ww = ww + 2
+  }
   // A record literal of an inner list is built at that list's record, so it shares its row.
   let q2 = 0
   while q2 + 1 < fnTagHeldRecs.length {
@@ -651,6 +660,31 @@ function ftWrittenInitNote(x: i32, wl: i32) {
   0
 }
 
+// Whether `x` is a list literal of record literals, or of such lists, written whole (D15357).
+function ftWholeRecListLit(x: i32, depth: i32): boolean {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is ArrayLit) || n.arrElems.length == 0 || depth > 8 { return false }
+  for el in n.arrElems {
+    const ex = parenPeelIx(el)
+    const en = if ex >= 0 && ex < P.nodes.length { nodeAt(ex) } else { null }
+    if !(en is ObjLit) && !ftWholeRecListLit(ex, depth + 1) { return false }
+  }
+  true
+}
+
+// Notes list literal `l` as written whole into holder `h`, a read of a held `let`.
+function ftWrittenWholeNote(l: i32, h: i32) {
+  const d = if h >= 0 && h < P.nodes.length && nodeAt(h) is Ident { identDeclOf(h) } else { -1 }
+  if d >= 0 && !i32ListHas(ftWrittenWhole, l) {
+    ftWrittenWhole.push(l)
+    ftWrittenWhole.push(d)
+  }
+  0
+}
+
+// List literals written whole into a held list of lists, each beside the holder's declaration.
+let ftWrittenWhole: i32[] = []
+
 // Notes record literal `l` as written into a holder of the plan in progress.
 function ftWrittenNote(l: i32) {
   if recAsgFnWidenedTy(l) >= 0 && !i32ListHas(ftWrittenLits, l) {
@@ -687,6 +721,7 @@ let ftWrittenInits: i32[] = []
 function ftPlReset() {
   ftWrittenLits = []
   ftWrittenInits = []
+  ftWrittenWhole = []
   ftPlS = []
   ftPlLeaves = []
   ftPlIds = []
@@ -2494,7 +2529,7 @@ function ftRecWriteJoins(
   const lx = parenPeelIx(lit)
   const ln = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
   if (
-    !(ln is ObjLit)
+    !(ln is ObjLit || ln is ArrayLit)
     || depth > FT_HOLD_DEPTH
     || dst < 0
     || dst >= T.tys.length
@@ -2502,7 +2537,20 @@ function ftRecWriteJoins(
     return true
   }
   const dt = tyAt(dst)
-  if !(dt is TyObj) { return true }
+  // A list literal of records written whole stores each at the list's element (D15357).
+  if ln is ArrayLit && dt is TyArray {
+    if !i32ListHas(ftRespine, lx) {
+      ftRespine.push(lx)
+      ftRespineTy.push(dst)
+    }
+    for el in ln.arrElems {
+      if !ftRecWriteJoins(el, dt.aElem, s, ds, leaves, ids, depth + 1) {
+        return false
+      }
+    }
+    return true
+  }
+  if !(dt is TyObj) || !(ln is ObjLit) { return true }
   for fx in ln.objFields {
     const f = nodeAt(fx)
     if f is FieldInit {
@@ -4603,9 +4651,17 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
     const c = nodeAt(g)
     if !(c is Call) || c.callArgs.length == 0 { return false }
     for a in c.callArgs {
-      if recAsgFnWidenedTy(parenPeelIx(a)) < 0 { return false }
+      const ax = parenPeelIx(a)
+      if recAsgFnWidenedTy(ax) < 0 && !ftWholeRecListLit(ax, 0) { return false }
     }
-    for a in c.callArgs { ftWrittenNote(parenPeelIx(a)) }
+    for a in c.callArgs {
+      const ax = parenPeelIx(a)
+      if ftWholeRecListLit(ax, 0) {
+        ftWrittenWholeNote(ax, x)
+      } else {
+        ftWrittenNote(ax)
+      }
+    }
     return true
   }
   // A slice of such a list of records copies its records, built at the holder's record; a `get`
