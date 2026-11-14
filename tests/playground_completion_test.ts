@@ -18,16 +18,10 @@
 import { filePath } from "./support/filePath.ts";
 import { type CompletionItem, completion, initLsp } from "../playground/src/lspAdapter.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 
 // One compiled Module for the file, a FRESH Instance per call. Compiling is the
