@@ -42,13 +42,13 @@ import {
   LBK_STR_LIST,
   LBK_U8_LIST,
   ListKind,
+  PK_I16,
+  PK_I8,
   VKind,
   W,
   aTy,
   arrNewScratchBase,
   atomStageSlot,
-  ba8Ty,
-  bl8Ty,
   callRefDepth,
   cloEqScratchBase,
   cloStructIdx,
@@ -111,17 +111,16 @@ import {
   fnUsesMapVals,
   fnUsesNulStrPush,
   fnUsesOptRecv,
+  fnUsesPackedPush,
   fnUsesPush,
   fnUsesStrOp,
   fnUsesStrPush,
-  fnUsesU8Push,
   fnUsesUnionLetSink,
   fnUsesUnionSink,
   fnUsesVariantRebox,
   i64PushScratchBase,
   ia64Ty,
   il64Ty,
-  isBa8Ty,
   isSBackTy,
   lTy,
   lcatBases,
@@ -170,6 +169,10 @@ import {
   optRecvSlot,
   optRecvStagedIx,
   optRecvStagedSet,
+  pkBackTy,
+  pkRowIn,
+  pkRowOfBack,
+  pkWrapTy,
   pushScratchBase,
   refPushBaseBySlot,
   refPushScratchBase,
@@ -284,6 +287,7 @@ const GC_ARRAY_GET = 0x0b // array.get
 // zero-extends; `u8[]` is unsigned by name and by the 0..255 range its element type
 // claims, so only the `_u` form appears. (An `i8[]` storage type, if VL ever grows one,
 // is the same machinery with 0x0c — see the report.)
+const GC_ARRAY_GET_S = 0x0c // array.get_s
 const GC_ARRAY_GET_U = 0x0d // array.get_u
 const GC_ARRAY_SET = 0x0e // array.set
 const GC_ARRAY_LEN = 0x0f // array.len
@@ -1215,18 +1219,16 @@ export function fbArrayInitData(heapIdx: i32, seg: i32) {
   0
 }
 // The packed-read dispatch, and the one place it lives: `array.get` is invalid on a
-// packed-storage element, since a byte read must say whether it sign- or zero-extends.
-// `u8[]` and the string backing (both `(array (mut i8))`) zero-extend, so every element
-// read routes through here. Keyed on the heap index, which every reader already passes.
-function heapIsPacked(heapIdx: i32) {
-  if isBa8Ty(heapIdx) { return true }
-  isSBackTy(heapIdx)
-}
-
+// packed-storage element, since a read must say whether it sign- or zero-extends. `i8[]` and
+// `i16[]` sign-extend; `u8[]`, `u16[]` and the string backing zero-extend. Keyed on the heap
+// index, which every reader already passes.
 export function fbArrayGet(heapIdx: i32) {
-  if heapIsPacked(heapIdx) {
+  const row = pkRowOfBack(heapIdx)
+  if row >= 0 || isSBackTy(heapIdx) {
     wU8(GC_PREFIX)
-    wU8(GC_ARRAY_GET_U) // 0x0d array.get_u — zero-extend the byte into an i32
+    wU8(
+      if row == PK_I8 || row == PK_I16 { GC_ARRAY_GET_S } else { GC_ARRAY_GET_U },
+    )
     wULEB(heapIdx)
     return 0
   }
@@ -1335,6 +1337,22 @@ export function fbRefTest(heapIdx: i32) {
 // Record an unsupported-shape failure: keep the first message and drop any bytes
 // emitted so far, so a partial/garbage module can never reach instantiation.
 // Returns -1, the sentinel `emitProgram` propagates so callers can branch on it.
+// Packed list row `row`'s wrapper, failing loudly when the row did not resolve from the type.
+export function pkWrapAt(row: i32): i32 {
+  const w = pkWrapTy(pkRowIn(row))
+  if w < 0 { return emitFail(PK_ROW_MSG) }
+  w
+}
+
+// Packed list row `row`'s backing, failing loudly when the row did not resolve from the type.
+export function pkBackAt(row: i32): i32 {
+  const b = pkBackTy(pkRowIn(row))
+  if b < 0 { return emitFail(PK_ROW_MSG) }
+  b
+}
+
+const PK_ROW_MSG = "emitProgram: a packed list's storage width did not resolve from its checked type"
+
 export function emitFail(msg: string) {
   // Anchor the diagnostic at the function currently being lowered (if any), so
   // the emit failure carries a source span instead of rendering positionless. Inside the
@@ -1452,7 +1470,7 @@ export function catWrapIdxOf(kind: i32, slot: i32) {
   if kind == LBK_F64_LIST { return fl64Ty() }
   if kind == LBK_I64_LIST { return il64Ty() }
   if kind == LBK_F32_LIST { return fl32Ty() }
-  if kind == LBK_U8_LIST { return bl8Ty() }
+  if kind == LBK_U8_LIST { return pkWrapAt(slot) }
   lTy()
 }
 
@@ -1467,7 +1485,7 @@ export function catBackIdxOf(kind: i32, slot: i32) {
   if kind == LBK_F64_LIST { return fa64Ty() }
   if kind == LBK_I64_LIST { return ia64Ty() }
   if kind == LBK_F32_LIST { return fa32Ty() }
-  if kind == LBK_U8_LIST { return ba8Ty() }
+  if kind == LBK_U8_LIST { return pkBackAt(slot) }
   aTy()
 }
 // Reserve `n` wasm locals at the current cursor, returning the frame's base index
@@ -1525,10 +1543,14 @@ function fbReservePushFrames() {
   // f32-list push quad (val f32 / cap / backing / recvRef).
   f32PushScratchBase = fbScratchCur
   if fnUsesF32Push { fbReserve(4) }
-  // `u8[]` push quad (val i32 / cap / backing / recvRef). LAST among the push quads, so
-  // every earlier frame base is unchanged in a program with no `u8[]`.
+  // The packed push quads (val i32 / cap / backing / recvRef), one per row in row order. LAST
+  // among the push quads, so every earlier frame base is unchanged in a program with none.
   u8PushScratchBase = fbScratchCur
-  if fnUsesU8Push { fbReserve(4) }
+  let pr = 0
+  while pr < 4 {
+    if (fnUsesPackedPush & (1 << pr)) != 0 { fbReserve(4) }
+    pr = pr + 1
+  }
 }
 // `fbBeginFunc`'s string-op, map, closure-call and `.map`/`.filter` frames, then the
 // per-mv-slot map frames.
@@ -1959,15 +1981,18 @@ function fbEmitPushFrames() {
     fbRefRun(fl32Ty())
   }
   fbFrameAt(u8PushScratchBase, "u8-push")
-  // `u8[]` push quad: pushU8Val i32, pushU8Cap i32, pushU8Backing (ref $ba8TypeIdx),
-  // pushU8RecvRef (ref $bl8TypeIdx). The VALUE slot is a plain i32 — a byte value is an
-  // i32 in wasm, and the truncation to one byte happens in `array.set` on the packed
-  // backing, not in this local.
-  if fnUsesU8Push {
-    fbI32Run()
-    fbI32Run()
-    fbRefRun(ba8Ty())
-    fbRefRun(bl8Ty())
+  // The packed push quads, one per row in row order: val i32, cap i32, the row's backing and
+  // wrapper refs. The VALUE slot is a plain i32: the truncation to the row's width happens in
+  // `array.set` on the packed backing, not in this local.
+  let pq = 0
+  while pq < 4 {
+    if (fnUsesPackedPush & (1 << pq)) != 0 {
+      fbI32Run()
+      fbI32Run()
+      fbRefRun(pkBackTy(pq))
+      fbRefRun(pkWrapTy(pq))
+    }
+    pq = pq + 1
   }
 }
 // One string-op slot: the string header (or, with `back`, its backing), nullable with `nul`. A
@@ -2071,7 +2096,7 @@ function fbEmitMapFilterFrames() {
       "reflist" => fbRefRun(rlWrapIdx[mfSrcSlots[mfv]])
       "strlist" => fbRefRun(mkListTy())
       "list" => fbRefRun(lTy())
-      "u8list" => fbRefRun(bl8Ty())
+      "u8list" => fbRefRun(pkWrapAt(mfSrcSlots[mfv]))
     }
     mfv = mfv + 1
   }
@@ -2086,7 +2111,7 @@ function fbEmitMapFilterFrames() {
       "reflist" => fbRefRun(rlBackIdx[mfDstSlots[mfw]])
       "strlist" => fbRefRun(mkArrTy())
       "list" => fbRefRun(aTy())
-      "u8list" => fbRefRun(ba8Ty())
+      "u8list" => fbRefRun(pkBackAt(mfDstSlots[mfw]))
     }
     mfw = mfw + 1
   }
@@ -2224,7 +2249,7 @@ function fbLazyListKindRun(lk: ListKind, lix: i32) {
       "reflist" => fbRefNullRun(rlBackIdx[liSlots[lix]])
       "strlist" => fbRefNullRun(mkArrTy())
       "list" => fbRefNullRun(aTy())
-      "u8list" => fbRefNullRun(ba8Ty())
+      "u8list" => fbRefNullRun(pkBackAt(liSlots[lix]))
     }
   } else if liBack[lix] == 4 {
     fbI32Run()
@@ -2248,7 +2273,7 @@ function fbLazyListKindRun(lk: ListKind, lix: i32) {
       "reflist" => fbRefNullRun(rlWrapIdx[liSlots[lix]])
       "strlist" => fbRefNullRun(mkListTy())
       "list" => fbRefNullRun(lTy())
-      "u8list" => fbRefNullRun(bl8Ty())
+      "u8list" => fbRefNullRun(pkWrapAt(liSlots[lix]))
     }
   }
 }
@@ -2324,7 +2349,7 @@ function fbLazyListSlotRun(lix: i32) {
       "i64list" => fbRefNullRun(il64Ty())
       "f32list" => fbRefNullRun(fl32Ty())
       "list" => fbRefNullRun(lTy())
-      "u8list" => fbRefNullRun(bl8Ty())
+      "u8list" => fbRefNullRun(pkWrapAt(gr))
       "reflist" => fbRefNullRun(rlWrapIdx[gr])
       "strlist" => fbRefNullRun(mkListTy())
     }
@@ -2336,7 +2361,7 @@ function fbLazyListSlotRun(lix: i32) {
       "i64list" => fbRefNullRun(ia64Ty())
       "f32list" => fbRefNullRun(fa32Ty())
       "list" => fbRefNullRun(aTy())
-      "u8list" => fbRefNullRun(ba8Ty())
+      "u8list" => fbRefNullRun(pkBackAt(gb))
       "reflist" => fbRefNullRun(rlBackIdx[gb])
       "strlist" => fbRefNullRun(mkArrTy())
     }
@@ -2350,7 +2375,7 @@ function fbLazyListSlotRun(lix: i32) {
       "i64list" => fbRefNullRun(il64Ty())
       "f32list" => fbRefNullRun(fl32Ty())
       "list" => fbRefNullRun(lTy())
-      "u8list" => fbRefNullRun(bl8Ty())
+      "u8list" => fbRefNullRun(pkWrapAt(liSlots[lix]))
       "reflist" => fbRefNullRun(rlWrapIdx[liSlots[lix]])
       "strlist" => fbRefNullRun(mkListTy())
     }
@@ -2363,7 +2388,7 @@ function fbLazyListSlotRun(lix: i32) {
       "i64list" => fbRefNullRun(ia64Ty())
       "f32list" => fbRefNullRun(fa32Ty())
       "list" => fbRefNullRun(aTy())
-      "u8list" => fbRefNullRun(ba8Ty())
+      "u8list" => fbRefNullRun(pkBackAt(liSlots[lix]))
       "reflist" => fbRefNullRun(rlBackIdx[liSlots[lix]])
       "strlist" => fbRefNullRun(mkArrTy())
     }
@@ -2598,7 +2623,7 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
       wSLEB(fl32Ty())
     }
     "u8list" | "nulu8list" => {
-      wSLEB(bl8Ty()) // the `u8[]` wrapper struct heap type (packed backing)
+      wSLEB(pkWrapAt(structIdx)) // the packed list wrapper, its row in the slot
     }
     "closure" | "nulclosure" => {
       wSLEB(cloStructIdx) // the closure fat-pointer struct heap type
@@ -2618,7 +2643,7 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
 }
 // The wrapper heap-type index a nullable-scalar-list VKind's value stores/reads through (the SAME
 // wrapper the non-null leaf list uses), or -1 if `kind` is not a nullable scalar list.
-export function nulScalarListWrapHeap(kind: VKind): i32 {
+export function nulScalarListWrapHeap(kind: VKind, row: i32): i32 {
   match kind {
     "nulstrlist" => {
       return mkListTy()
@@ -2633,7 +2658,7 @@ export function nulScalarListWrapHeap(kind: VKind): i32 {
       return fl32Ty()
     }
     "nulu8list" => {
-      return bl8Ty()
+      return pkWrapAt(row)
     }
     // every other kind is not a nullable scalar list
     "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
@@ -2644,12 +2669,12 @@ export function nulScalarListWrapHeap(kind: VKind): i32 {
 // `f64[]|null`, 33 `i64[]|null`, 34 `f32[]|null`, 36 `u8[]|null`) instead of the binding VKind, for the
 // field position's `pushFieldStorage`/omitted-null/value-seed lookup. Kept beside the
 // type indices so the byte layer needs no classifier import.
-export function nulScalarListFieldWrapHeap(code: i32): i32 {
+export function nulScalarListFieldWrapHeap(code: i32, row: i32): i32 {
   if code == FC_NUL_STR_LIST { return mkListTy() }
   if code == FC_NUL_F64_LIST { return fl64Ty() }
   if code == FC_NUL_I64_LIST { return il64Ty() }
   if code == FC_NUL_F32_LIST { return fl32Ty() }
-  if code == FC_NUL_U8_LIST { return bl8Ty() }
+  if code == FC_NUL_U8_LIST { return pkWrapAt(row) }
   -1
 }
 // The wasm storage valtype of a struct/union-variant field, from the field's type code
@@ -2700,7 +2725,7 @@ export function pushFieldStorage(code: i32, refSlot: i32) {
     // D1008 — the packed byte list field: a non-null ref to the u8 list WRAPPER, the same
     // heap type the `u8[]` global / param / return / binding already store.
     wU8(100)
-    wSLEB(bl8Ty())
+    wSLEB(pkWrapAt(refSlot))
   } else if code == FC_F64_LIST {
     wU8(100)
     wSLEB(fl64Ty())
@@ -2713,9 +2738,9 @@ export function pushFieldStorage(code: i32, refSlot: i32) {
   } else if code == FC_NUL_I32_LIST {
     wU8(99)
     wSLEB(lTy())
-  } else if nulScalarListFieldWrapHeap(code) >= 0 {
+  } else if nulScalarListFieldWrapHeap(code, refSlot) >= 0 {
     wU8(99)
-    wSLEB(nulScalarListFieldWrapHeap(code))
+    wSLEB(nulScalarListFieldWrapHeap(code, refSlot))
   } else if code == FC_NUL_REF_LIST {
     if refSlot < 0 || refSlot >= rlWrapIdx.length {
       wU8(127)
@@ -2909,11 +2934,11 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
     }
     "nulu8list" => {
       wU8(RT_REF_NULL) // `u8[] | null` — the PACKED byte list's wrapper, made nullable
-      wSLEB(bl8Ty())
+      wSLEB(pkWrapAt(structIdx))
     }
     "u8list" => {
       wU8(RT_REF_NULL)
-      wSLEB(bl8Ty()) // the `u8[]` wrapper struct heap-type index (packed backing)
+      wSLEB(pkWrapAt(si)) // the packed list wrapper, its row in the slot
     }
     "closure" => {
       wU8(RT_REF_NULL) // 0x63 (ref null) — nullable closure ref (lambdas)
@@ -3037,10 +3062,10 @@ export function fbRefNullOfKind(kind: VKind, structIdx: i32) {
       fbRefNull(fl32Ty())
     }
     "nulu8list" => {
-      fbRefNull(bl8Ty())
+      fbRefNull(pkWrapAt(structIdx))
     }
     "u8list" => {
-      fbRefNull(bl8Ty())
+      fbRefNull(pkWrapAt(structIdx))
     }
     "closure" => {
       fbRefNull(cloStructIdx)
@@ -3153,7 +3178,7 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     }
     "u8list" => {
       wU8(RT_REF)
-      wSLEB(bl8Ty()) // the `u8[]` wrapper struct heap-type index (packed backing)
+      wSLEB(pkWrapAt(si)) // the packed list wrapper, its row in the slot
     }
     "closure" => {
       wU8(RT_REF)
@@ -3197,7 +3222,7 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     }
     "nulu8list" => {
       wU8(RT_REF_NULL)
-      wSLEB(bl8Ty())
+      wSLEB(pkWrapAt(structIdx))
     }
     "nulmap" => {
       // `{[string]: V} | null` — the map struct ref made NULLABLE (`0x63`). The heap
