@@ -36,3 +36,38 @@ The shadow now names the type and the function of an `uncovered` answer, which t
 So no inventory row is filed. The two stage-1 fixes, both on the tree side, are:
 - record arm status from the checker;
 - a no-value result for `void` and `never`.
+
+## Stage 1a: the tree as `RepNode` records
+
+**What moves.**
+- The rep tree's eight parallel columns (`rtKind`, `rtDisc`, `rtChild`, `rtReason`, `rtKidStart`,
+  `rtKidCount`, `rtKids`, and the `rtIntern` string map) become one arena of `RepNode` records:
+  `RPrim`, `RAtom`, `RList`, `RMap`, `RBox`, `RClosure`, `RRecord`, `RNullable` and `RUnsup`.
+- Every reader matches the record type exhaustively, with no `_` arm. The scalar leaves' `RpPrim`
+  set takes an inner `match`.
+- The 17-member `RtKind` string set is gone.
+- The hash-cons key is a `(tag, args)` id in a second `Interner`, in place of a rendered string.
+  The arguments are the discriminators, the child node indices and (for records) field-name ids,
+  so a key is as injective as the string was.
+- `rtTy` stays as provenance, since five readers consult it, as they did before.
+
+**`intern.vl`.**
+- The table becomes an `Interner` record, with `internNew`, `internResetIn`, `internIdIn`,
+  `internLenIn`, `internTagIn` and `internArgIn`.
+- The module-level `internId` family keeps the module's own instance, so lane H's callers and
+  their ids are unchanged.
+- The rep tree holds the second instance, which lane H agreed (their note §6).
+
+**Byte identity.**
+- Fixpoint: the stage-0 seed compiles this tree, and the result compiles this tree to identical
+  bytes. So the new tree emits exactly what the old one did on the compiler.
+- Shadow, armed, on the self-build: the 53-line report (agreements, rebuild and node counts,
+  unsup reasons, hash-cons tallies) is identical to the stage-0 seed's, line for line.
+- Corpus: every 7th cell (1,707 programs) was built armed by both seeds. 0 differ in module bytes
+  and 0 differ in shadow report.
+
+**Lines.** Net compiler lines for 1a: `emit_rep.vl` −8, `intern.vl` +44.
+- The design's −250 for stage 1 assumed the projections (`repTreeAtomOf`, `repTreeNulOf`,
+  `repTreeListElemName`) would go. They remain, because their callers read `RepDesc`, which
+  stage 2 retires.
+- 1a is the change of shape that stage 2's deletions need. It does not pay for itself.
