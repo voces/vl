@@ -605,6 +605,7 @@ import {
   gStrPoolIx,
   gStrPoolTexts,
   gTailFnRows,
+  gTestEmitRefusal,
   globalStmtOrd,
   globalStmts,
   heldRepOf,
@@ -23997,10 +23998,11 @@ function emitAsNulNiche(body: u8[], e: AsExpr, fnIx: i32) {
   const obj = e.asObj
   const payload = nulRefNichePayloadTy(nodeTyIxOf(obj))
   if payload < 0 {
-    return emitFail(
+    return emitFailAt(
       "emitProgram: `as "
         + e.asTy
         + "` needs a BOXED union operand or a nullable-REF one; this `| null` is a value niche whose null is a spare scalar, with neither a tag nor a ref to test",
+      obj,
     )
   }
   if !nulNicheCastWiredTy(payload) {
@@ -26221,7 +26223,25 @@ function emitAtomicIntrinsic(body: u8[], c: Call, name: string, fnIx: i32) {
 // A call, followed by `unreachable` when its type is `never`: the callee leaves nothing, and
 // the stack-polymorphic `unreachable` is what lets that stand in any value position (D1972).
 // `__trap__` lowers to its own `unreachable`, so it needs no second one.
+// The refusal a test pins under `--test-emit-refusal`: no capability, so no fix moves it.
+export const TEST_EMIT_REFUSAL_MSG = "emitProgram: test-only refusal (--test-emit-refusal)"
+
 function emitCall(body: u8[], callIx: i32, fnIx: i32) {
+  if gTestEmitRefusal != 0 {
+    const tc = nodeAt(callIx)
+    if tc is Call && tc.callFn >= 0 {
+      const tf = nodeAt(tc.callFn)
+      // Bare in one file; a module build suffixes every top-level name with `$m<id>` (modid).
+      const hook = "__vl_test_emit_refusal__"
+      if (
+        tf is Ident
+        && (tf.identName == hook
+          || tf.identName.slice(0, hook.length + 2) == hook + "$m")
+      ) {
+        return emitFailAt(TEST_EMIT_REFUSAL_MSG, callIx)
+      }
+    }
+  }
   // A hole function's closure read that its shared lifted body cannot carry (D2878).
   const cloRef = cloTailRefusal(callIx, fnIx)
   if cloRef != "" { return emitFail(cloRef) }
@@ -40899,13 +40919,6 @@ function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   ifIx
 }
 
-// Whether `ty` is a function type with `null`: `F | null`.
-function tyIsNullableFn(ty: i32): boolean {
-  if ty < 0 || !tyBearsNull(ty) { return false }
-  const nn = nonNullTy(ty)
-  nn >= 0 && tyAt(nn) is TyFunc
-}
-
 // `if true { l } else { d }` for an instance's `l ?? d` whose operand it typed without `null` at
 // a type the `??`'s join widens, so the dead default still shapes the join the arms deliver
 // into; -1 when the operand bears `null`, matches the join, or either type is a hole.
@@ -41271,6 +41284,10 @@ function emitCoalesceNiche(
   // nullable struct below — placed before the sentinel-free ref paths as `emitNulIsNullTest` orders its niches, since the wrapper heap type is what distinguishes the families.
   const cnclw = nulCollWrapHeap(e.binLeft, fnIx)
   if cnclw >= 0 { return emitCoalesceNulRef(body, e, exprIx, cnclw, fnIx) }
+  // A nullable function value is the closure's own `(ref null $clo)`, the same core (D3373).
+  if exprNulClosure(e.binLeft, fnIx) {
+    return emitCoalesceNulRef(body, e, exprIx, cloStructIdx, fnIx)
+  }
   // `<e> ?? d` over a `string | null` niche (an ident binding, a `string | null` struct field,
   // or a `(string | null)[]` element read): the cell is a `(ref null $sTypeIdx)`, so it takes
   // the same `br_on_non_null` core as the nullable struct/collections — one evaluation of the
@@ -41953,6 +41970,10 @@ function emitCoalesceOptNulRecord(
   if nfKind == "union" {
     return emitOptCoalesceBoxLeaf(body, e, lhs, nHeap, nfi, exprIx, fnIx)
   }
+  // A function-value leaf is the standalone `?.`'s nullable closure ref, so that core takes it.
+  if nfKind == "closure" || nfKind == "nulclosure" {
+    return emitCoalesceNulRef(body, e, exprIx, cloStructIdx, fnIx)
+  }
   // A map leaf is the standalone `?.`'s nullable map ref, so the nullable-map core takes it.
   if nfKind == "map" || nfKind == "nulmap" {
     const nms = sFieldMapShape(nsi, nfi)
@@ -42299,14 +42320,6 @@ function emitCoalesceNullableRefs(
   // A record union's shared `scalar | null` field reads as its box (D13280).
   const fk = coalBoxFieldScalarKind(lhsIx, fnIx)
   if fk >= 0 { return emitCoalesceBoxFieldScalar(body, e, exprIx, fk, fnIx) }
-  // A re-readable nullable closure, a captured list's element among them, is its null test.
-  if (
-    lhsIx >= 0
-    && exprReReadable(lhsIx)
-    && tyIsNullableFn(nodeTyAt(lhsIx, fnIx))
-  ) {
-    return emitExpr(body, coalNullTestIf(e, exprIx, fnIx), fnIx)
-  }
   emitFail(
     "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
   )

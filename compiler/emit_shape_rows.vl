@@ -1,3 +1,4 @@
+import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import { tyIsVariantMember } from "./check_node_tys"
 import { mapStoredTyOf } from "./check_fn_tag_facts"
@@ -123,6 +124,7 @@ import {
   tyMutEpoch,
   tyNestedArrLeafRenders,
   tyNomNameCycled,
+  tyPrimNameIs,
   tySame,
   tyToNominalName,
   tyToNominalNameAt,
@@ -308,9 +310,11 @@ import {
   isUNameAB,
   isUNameDeclAB,
   isUNameKeyAB,
+  msMemberTysOfSet,
+  msSetOfTyAny,
   nulArmTyOf,
   tyIsBareMap,
-  unionArmsOfTy,
+  unionMemberTysOfRow,
   unionSetHasNullTy,
 } from "./emit_union_registry"
 import {
@@ -346,37 +350,37 @@ import {
   tyStepRet,
 } from "./tyquery"
 
-// Whether the last `nulRefMapValInnerOfTy` call's member is a closure.
+// Whether the last `nulRefMapValHasInner` call's member is a closure.
 let nrmInnerClosure = false
 
-// The single non-null member of a niche-nullable map value name (`{f: …} | null` yields the
-// struct member), or "" when there is not exactly one the nullable-value map rep covers, so the
-// slot shares its vals rep with the non-null twin. `ty` is the arena type or -1, and the member's
-// kind is read off its inner; no top-level `null` is "". Sets `nrmInnerClosure`.
-export function nulRefMapValInnerOfTy(valName: string, ty: i32): string {
+// Whether a niche-nullable map value has exactly one non-null member the nullable-value map rep
+// covers (`{f: …} | null` its struct member), so the slot shares its vals rep with the non-null
+// twin. `ty` is the arena type or -1; the members are its type's row's, else its set's, and the
+// member's kind is read off `ty`'s inner. Sets `nrmInnerClosure`.
+export function nulRefMapValHasInner(valName: string, ty: i32): boolean {
   nrmInnerClosure = false
-  if !mvValHasNull(valName, ty) { return "" }
-  const atoms: string[] = []
-  unionArmsOfTy(valName, ty, atoms)
-  let nonNull = 0
-  let inner = ""
-  let i = 0
-  while i < atoms.length {
-    if atoms[i] != "null" {
-      nonNull = nonNull + 1
-      inner = atoms[i]
-    }
-    i = i + 1
+  if !mvValHasNull(valName, ty) { return false }
+  const tys: i32[] = []
+  if !unionMemberTysOfRow(unRowOfTyKey(ty), tys) {
+    msMemberTysOfSet(msSetOfTyAny(ty), tys)
   }
-  if nonNull != 1 { return "" }
-  if inner == "string" { return inner }
+  let nonNull = 0
+  let inner = -1
+  for t in tys {
+    if !(t < 0 || tyPrimNameIs(t, "null")) {
+      nonNull = nonNull + 1
+      inner = t
+    }
+  }
+  if nonNull != 1 { return false }
+  if tyPrimNameIs(inner, "string") { return true }
   const innerTy = tyPeelNul(ty)
-  if tyIsBareMap(innerTy) { return inner }
+  if tyIsBareMap(innerTy) { return true }
   // A closure member's fat pointer rides the same `(ref null $cloStruct)` vals element a
   // non-null closure uses.
   if tyIsFuncArena(innerTy) {
     nrmInnerClosure = true
-    return inner
+    return true
   }
   // A list member rides the same vals rep its non-null twin does, since a ref-valued map's
   // vals element is `(ref null <elem>)` for every value kind — the wrapper element, not the
@@ -386,12 +390,12 @@ export function nulRefMapValInnerOfTy(valName: string, ty: i32): string {
     // `u8[]` names itself here, ahead of the shared scalar-list classifier and for D1008's
     // reason, so the niche admits exactly the element reps its non-null twin does.
     const slrK = repOfTy(innerTy).rdKind
-    if vkListClass(slrK) == 1 && slrK != "reflist" { return inner }
-    if tyIsRefArray(innerTy) { return inner }
-    return ""
+    if vkListClass(slrK) == 1 && slrK != "reflist" { return true }
+    if tyIsRefArray(innerTy) { return true }
+    return false
   }
-  if structRowOfValueTy(ty) >= 0 { return inner }
-  ""
+  if structRowOfValueTy(ty) >= 0 { return true }
+  false
 }
 
 // True when the interned mv slot's value is a niche-nullable ref value: the vals element
@@ -401,7 +405,7 @@ export function mvSlotNullable(slot: i32) {
   if slot < 0 { return false }
   const ar = mvValNulRefNicheAt(slot)
   if ar >= 0 { return ar == 1 }
-  nulRefMapValInnerOfTy(mvValName[slot], mvValTyIxAt(slot)) != ""
+  nulRefMapValHasInner(mvValName[slot], mvValTyIxAt(slot))
 }
 
 // Whether a map type's value lowers, asked of the arena: `mvValLowersTy`, then
@@ -2716,8 +2720,7 @@ export function rlSlotsLayoutTwin(a: i32, b: i32): i32 {
 // peel too, or the comparator refuses a pair whose vals slot it already made identical.
 function mvValTwinCanonId(slot: i32): i32 {
   const vt = mvValTyIxAt(slot)
-  const nin = nulRefMapValInnerOfTy(mvValName[slot], vt)
-  if nin == "" { return mvValCanonId(slot) }
+  if !nulRefMapValHasInner(mvValName[slot], vt) { return mvValCanonId(slot) }
   const it = tyPeelNul(vt)
   if it < 0 { return -1 }
   repCanonId(it)
