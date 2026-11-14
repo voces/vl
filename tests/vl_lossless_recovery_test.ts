@@ -182,9 +182,9 @@ Deno.test({
       const errs = await errorsOf(
         dir,
         "mixed",
-        'const c = true\nif c print(1)\nconst n: i32 = "hi"\nlet o = { x: 1 }\no.x++\n',
+        'const c = true\nif c print(1)\nconst n: i32 = "hi"\nlet o = { x: 1 }\n(1)++\n',
       );
-      const want = [BRACES, "postfix `++` target must be an identifier"];
+      const want = [BRACES, "postfix `++` target must be a name, a field or an element"];
       if (errs.length !== want.length) {
         throw new Error(
           `want exactly the ${want.length} PARSE diagnostics, got ${errs.length}: ${
@@ -202,7 +202,7 @@ Deno.test({
         }
       }
       // The CONTROL for this case is the payoff test above: the identical type
-      // error IS reported once the lossy `o.x++` is removed.
+      // error IS reported once the lossy `(1)++` is removed.
     });
   },
 });
@@ -476,7 +476,7 @@ Deno.test({
     await withDir(async (dir) => {
       const F2 = "function f(a: i32, b: i32) { a + b }\n";
       const TE = 'const n: i32 = "hi"\n';
-      // The retired pin's own program, minus the unrelated lossy `o.x++`.
+      // The retired pin's own program, minus the unrelated lossy `(1)++`.
       await gradeSpelling(
         dir,
         "call2",
