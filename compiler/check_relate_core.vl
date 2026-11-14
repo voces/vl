@@ -458,6 +458,7 @@ import {
   gaAppTyIxSet,
   gaAppTyIxs,
   genAppNameOfTy,
+  genAppRowCyclic,
   genAppRowOf,
   litBaseTy,
   litMemberTy,
@@ -2830,10 +2831,6 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
     }
     return builtinCtorTyLeafFail(head)
   }
-  // The declared parameter names, read as a slice of the flat column — split once when the alias
-  // registered (D-GAPARAM), not re-split here per application. `pcount` is the declared arity.
-  const pstart = gaParamStart[gi]
-  const pcount = gaParamCount[gi]
   const argTys: i32[] = []
   if appIx >= 0 {
     const astart = tsKidStart[appIx]
@@ -2861,6 +2858,16 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
       ai = ai + 1
     }
   }
+  applyGenAliasTys(head, gi, argTys)
+}
+
+// The instance of generic alias `gi` (spelled `head`) at argument types `argTys`: the memoized
+// arena index when one exists, else a fresh placeholder filled from the declaration's fields.
+function applyGenAliasTys(head: string, gi: i32, argTys: i32[]): i32 {
+  // The declared parameter names, read as a slice of the flat column — split once when the alias
+  // registered (D-GAPARAM), not re-split here per application. `pcount` is the declared arity.
+  const pstart = gaParamStart[gi]
+  const pcount = gaParamCount[gi]
   if argTys.length != pcount {
     tErr(
       "`"
@@ -5831,6 +5838,28 @@ export function holeSetCallRetOf(
     fnTagCallNote(ix, s, key, split, rs)
   }
   r
+}
+
+// Whether the members of set `s`, called at the closed parameter types `pts`, give two or more
+// results; false where one stays open or cannot be read.
+export function holeSetSplitsAt(s: i32, pts: i32[]): boolean {
+  const ds = fnTagMembers(s)
+  if ds.length < 2 { return false }
+  const wp: i32[] = []
+  for pt in pts {
+    if pt < 0 || tyHasTyVar(pt) { return false }
+    wp.push(widenLitTy(pt))
+  }
+  const ft = mkFuncTy(wp, TY_I32)
+  let r0 = -1
+  for d in ds {
+    const rd = setMemberRetAt(d, ft)
+    if rd < 0 || tyHasTyVar(rd) { return false }
+    const w = widenLitTy(rd)
+    if r0 < 0 { r0 = w }
+    else if !tySame(w, r0) { return true }
+  }
+  false
 }
 
 // Whether set member `d` is a lambda the check has not reached yet, so it has no type.
@@ -9733,6 +9762,8 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     if b >= 0 { return b }
     return tyIx
   }
+  const cyc = substCyclicApp(tyIx, bNames, bTys)
+  if cyc >= 0 { return cyc }
   if substOnSeenStack(tyIx) || substSkipsForeignSig(tyIx) { return tyIx }
   // A tagged set is an id: its signature names its members' own parameters, never the instance's.
   if t is TyFunc && fnTagTyIsTagged(tyIx) { return tyIx }
@@ -9765,6 +9796,31 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   // fresh arena index the provenance bank does not know about unless re-banked here, or the same type renders under two different names depending which door it came through.
   genAppCarry(tyIx, res, bNames, bTys)
   res
+}
+
+// A recursive generic instance substituted as its alias applied to the substituted arguments:
+// the one shared instance, where a field walk would meet the open instance at the cycle and
+// keep it. An argument still open (a hole) yields an open instance, re-substituted once bound.
+// -1 for any other type, or when no argument moves.
+function substCyclicApp(tyIx: i32, bNames: string[], bTys: i32[]): i32 {
+  const i = genAppRowOf(tyIx)
+  if i < 0 || !genAppRowCyclic(i) { return -1 }
+  const gi = gaIndexOf(gaAppHeads[i])
+  if gi < 0 { return -1 }
+  const st = gaAppArgStart[i]
+  const cn = gaAppArgCount[i]
+  const subbed: i32[] = []
+  let moved = false
+  let a = 0
+  while a < cn {
+    const s = substTyDeep(gaAppArgFlat[st + a], bNames, bTys)
+    if s < 0 { return -1 }
+    if s != gaAppArgFlat[st + a] { moved = true }
+    subbed.push(s)
+    a = a + 1
+  }
+  if !moved { return -1 }
+  applyGenAliasTys(gaAppHeads[i], gi, subbed)
 }
 
 // `substTyDeep` of an instance binding: `bNames` are the type parameters of top-level generic
