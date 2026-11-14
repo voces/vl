@@ -62,7 +62,7 @@ Against master's fixpoint over 19,769 programs (`tests/cases` plus distilled `ce
 
 ## Graded on the merged tree
 
-Merged with master `de4cfa15`, then `c522f8dd`. Fixpoint seeds on both sides.
+Merged with master `de4cfa15`, then `c522f8dd`, then `037e00bb`. Fixpoint seeds on both sides.
 
 - **A loss the earlier measurement missed, fixed here.** Master's
   `written-let-of-generics-handed-to-generic-callback-between-writes.vl` (D3942) stopped running.
@@ -87,19 +87,30 @@ Merged with master `de4cfa15`, then `c522f8dd`. Fixpoint seeds on both sides.
   re-pointed generic `let`.
 - **L2 self-compile fuel:** 82,536,402,471 against master's 82,330,058,123, which is +0.25%.
   Seed size: +4,835 bytes.
-- **Late demands: a renamed read now plans what its name plans.** Before this fix the count rose
-  from 0 to 4, 7 and 1 in `fn-set-list-copied-into-closed-list-slots`, `-copied-into-holders` and
-  `-mutable-alias-controls`. The literal `[f]`, renamed to `[dbl]`, carries the one-member set
-  `{dbl}`. So does the `dbl` that `f = dbl` stores. In `ftCtxOk` that store needs the binding's
-  wider set `{id, dbl}` tagged, and no call through `f` remains to try it, so `{dbl}` stayed
-  untagged. The emitter then read the list as open, closed it with `elabWrittenValueTy`, and
-  instanced the `.map` adapter `fvaListSetCopy` builds at `i32`, after the plan. `ftHeldWider`
-  (check_fn_tag) took a store into a place of a wider set only once that set was tagged or
-  assumed. It now decides an undecided one with `s`, as a join's tail is. That is one rule for
-  every place a write stores into, with no new case, and the first two files read 0.
-  `-mutable-alias-controls` reads 1, and its direct-name spelling (`[dbl]` for `[f]`) reads 1 on
-  master. The scan refuses `{dbl}` there because a list holding a set's ids may only be read by
-  index, and the copy reads it through `.map`.
+- **Late demands read 4, the baseline, by generalising two fn-tag rules.** Before them the count
+  rose from 0 to 4, 7 and 1 in `fn-set-list-copied-into-closed-list-slots`, `-copied-into-holders`
+  and `-mutable-alias-controls`. The literal `[f]`, renamed to `[dbl]`, carries the one-member set
+  `{dbl}`, and so does the `dbl` that `f = dbl` stores. While `{dbl}` stayed untagged, the emitter
+  read the list as open, closed it with `elabWrittenValueTy`, and instanced the `.map` adapter
+  `fvaListSetCopy` builds at `i32`, after the plan. Two refusals kept it untagged:
+  - **The store.** `ftHeldWider` took a store into a place of a wider set only once that set was
+    tagged or assumed, and no call through `f` remains to try `{id, dbl}`. It now decides an
+    undecided wider set with `s`, as a join's tail is: the dual of `ftWiderWriteLeaf` (D16230).
+  - **The annotated literal.** `const typed: ((x: i32) => i32)[] = [dbl]` failed the holder
+    test, because `ftLitRecsAtClosed` took only records holding members. As `ftLitAtClosed` it
+    also takes a bare member, or the adapter the check built over one, at a closed element type.
+    The direct-name spelling minted the same late key on master, and now mints none.
+
+## Lines
+
+Net compiler lines against master: +265. Pin-helper delta: 0, since `emit_mono.vl` is untouched.
+
+Both exclusions were tried for deletion now that the fn-tag rules are general, and each still
+guards a running program:
+- Without the call-argument test (D16182), D16182's witness and the `push` cell run, but
+  `generic-fn-value-hole-written-binding-at-two-types.vl` reaches mono's one-closure refusal.
+- Without `fnParamsAllTyParams` (D16181), `written-let-of-generics-copied-into-another-let.vl`
+  is refused at check.
 
 ## Not done
 
