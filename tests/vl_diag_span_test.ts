@@ -414,6 +414,28 @@ const GRID: Row[] = [
     underlines: "a & b",
     first: true,
   },
+  // ── exception 4: an unknown type's COMPONENT, the name the message quotes ──
+  // D1590: `unknown type 'bool' within '{[i32]:bool}'` underlines `bool`, not the annotation.
+  {
+    // `const seen: {[i32]: bool} = Map()` — `bool` at 21..24.
+    name: "unknown type: a map value's component is the span",
+    src: "const seen: {[i32]: bool} = Map()\nprint(seen.length)\n",
+    frag: "unknown type 'bool' within",
+    line: 1,
+    col: 21,
+    endCol: 25,
+    underlines: "bool",
+  },
+  {
+    // `const q: (i32) => bool = (n: i32) => true` — `bool` at 19..22.
+    name: "unknown type: a function type's return component is the span",
+    src: "const q: (i32) => bool = (n: i32) => true\nprint(1)\n",
+    frag: "unknown type 'bool' within",
+    line: 1,
+    col: 19,
+    endCol: 23,
+    underlines: "bool",
+  },
   // ── the three findings raised on the CHECKER side with `stage: "type"` ────
   // Not on `T.diags` at all — each is its own side table that `cli.vl` turns into a
   // diagnostic, and all three hard-coded `endCol = col + 1` there.
