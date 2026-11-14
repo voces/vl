@@ -11332,6 +11332,10 @@ function monoListLitLength(v: i32): i32 {
 // Whether the read `ix` under frame `fx` (-1 for the module) is of the binding declared at
 // `decl`.
 function monoReadIsBinding(ix: i32, fx: i32, decl: i32): boolean {
+  // A loop variable is read by name in its loop's body only.
+  if decl >= 0 && decl < P.nodes.length && nodeAt(decl) is LoopVar {
+    return identDeclOf(ix) == decl
+  }
   let fr = monoTopFrameOf(ix)
   if fx >= 0 { fr = monoFrameOfNode(ix, fx) }
   // A read in a lambda a module-scope `const` holds is in the lambda's frame (D9102).
@@ -15674,6 +15678,15 @@ function monoPinStoredRecords(
     const name = v.objFieldNames[k]
     let fty = v.objFieldTypes[k]
     const lfv = monoStoredFnListLits(stored, name, fty)
+    // The field's values, and whether each stored value holds a record literal there.
+    const nest = monoMapStoredFields(stored, name)
+    let nestLits = nest.length == stored.length && stored.length > 0
+    for fv in nest {
+      const fx = unwrapParen(fv[0])
+      if fx < 0 || fx >= P.nodes.length || !(nodeAt(fx) is ObjLit) {
+        nestLits = false
+      }
+    }
     if lfv.length > 0 {
       // A field holding an inline list of functions takes its element slot's pin (D9301).
       const elems: i32[][] = []
@@ -15691,6 +15704,20 @@ function monoPinStoredRecords(
       if ft < 0 { return ft }
       fty = mkArrayTy(ft)
       for fv in lfv { listLits.push([unwrapParen(fv[0]), fty, fv[1]]) }
+    } else if (
+      monoTyOpen(fty)
+      && fty >= 0
+      && fty < T.tys.length
+      && tyAt(fty) is TyObj
+      && nestLits
+    ) {
+      // A field holding a record literal in every stored value pins it as a stored record (D16162).
+      const fo = tyAt(fty)
+      const fpath: string[] = []
+      for p in path { fpath.push(p) }
+      fpath.push("f." + name)
+      if fo is TyObj { fty = monoPinStoredRecords(lf, fpath, fo, nest) }
+      if fty < 0 { return fty }
     } else if (
       monoTyOpen(fty)
       && fty >= 0
@@ -15999,7 +16026,10 @@ function monoUncalledSlotFnTy(at: i32, path: string[], vals: i32[][]): i32 {
 function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
   const d = nodeAt(at)
   // A function holder's reads are of its calls (`()`).
-  const dn = if d is LetDecl { d.letName } else if d is FuncDecl { d.fnName } else { "" }
+  // A loop variable's name is its loop's.
+  const lp = if d is LoopVar && d.lvLoop >= 0 { nodeAt(d.lvLoop) } else { null }
+  const lvn = if lp is ForIn && d is LoopVar { if d.lvSlot == 0 { lp.fiVar } else { lp.fiVar2 } } else { "" }
+  const dn = if d is LetDecl { d.letName } else if d is FuncDecl { d.fnName } else { lvn }
   if dn == "" { return 0 }
   const isMap = nt >= 0 && nt < T.tys.length && tyAt(nt) is TyMap
   let rt = ft
@@ -16101,6 +16131,10 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
               nodeTyRecord(ix, ft)
             }
           }
+        }
+        // A map value's own values are read through the loop variable as through an alias.
+        if ft >= 0 && ft < T.tys.length && tyAt(ft) is TyMap {
+          monoRetypeMapReads(ctx, vd, ft, tyMapValOf(ft), "")
         }
       }
     }
