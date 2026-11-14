@@ -332,7 +332,7 @@ provisional.
 
 **Rows in flight** (named so that a stage does not claim them):
 - D15753 and D15755, in lane B's #8034;
-- D16201, in lane G's #8037, which also files unfiled: D16203 and unfiled: D16204.
+- D16201, in lane G's #8037, which also files D16203 and D16204.
 
 | group | mechanism (one-ingredient ablation) | open rows | what the producer makes of it | stage |
 |---|---|---|---|---|
@@ -344,7 +344,7 @@ provisional.
 | **G6** | A record field whose value is a non-literal list of function-carrying records gets no struct row ("ref valtype with no interned shape"). It runs as a list holder, or where the results agree. | D15923, D15303 (tentative) | The field's place `(w, f.f)` has a closed `ty` with its set, so the record mint keys its field by type. Lane G's finding is the ordering constraint: the closed row and the closure-list row it needs are produced together (stage 3). | 3 |
 | **G7** | (check) A *bound* record of an un-annotated function, delivered to a parameter annotated with a closed function field, is refused; the inline literal runs. | D15332 | The annotated parameter is a `bound` on the argument's class (§3.3 rule 1), but the checker refuses before the elaboration runs. It needs the checker to defer this delivery to the class, the shape of D16133's ruling, close (iii). | 6 (named risk) |
 | **G8** | One un-annotated parameter receives two bound lists of one type at two reps (one tagged, one uniform). | D16144 | The parameter's place is per instance, and an instance's key includes the argument class's storage, not only its type. | 4 |
-| **G9** | An index store of a nested record holding an uncalled function. Closed by #8028. | D16201 in #8037; unfiled: D16203 (a record of a fresh map reaching its holder through a call result or a list element) | D16203 is the case #8037's literal-only fact cannot reach: a return edge and an element edge into the same class. | 3 + 5 |
+| **G9** | An index store of a nested record holding an uncalled function. Closed by #8028. | D16201 in #8037; D16203 (a record of a fresh map reaching its holder through a call result or a list element) | D16203 is the case #8037's literal-only fact cannot reach: a return edge and an element edge into the same class. | 3 + 5 |
 | X1 | Capture cell: the cell takes the checked hole type (`i32`) while a closure is stored. | D3851, D12230 | The cell `e` is a place, joined by a capture edge. | 4 |
 | X2 | An argument to a hole or generic parameter, instanced from the callee's own pins, not from calls per caller instance. | D14888, D15014, D3956, D12218, D12233, D16143, D14433, D15776, D15777 | argument edges per caller instance | 4 |
 | X3 | A result delivered back to the caller: a generic returned through a hole parameter has no instance (D16077's family). | D16077, D16079, D16130, D16131, D16133, D12454 | return edges both ways, plus D16133's ruled close (ii) | 5 (+6 for D16133) |
@@ -417,7 +417,7 @@ discovery pass.
 |---|---|---|---|---|---|---|
 | **1. Places and edges** | `slotHolderOf`, `placeOf`, the edge table (§3.1–3.2) in a new `compiler/elab_place.vl`; `elabSlotDeliveries` and `elabSlotHeldFns` become queries over it | mono F11 (7 / 178); elab F delivery walk (30 / 1,276) and H held sets (8 / 172), less the shared walkers kept | −7 → 901 | about −1,000 (+550 new) | none; this is a refactor stage. Acceptance is 0 runs → not-runs and a byte-identical `regress.vl` | `elab_place.vl` (new), `emit_elab.vl`, `emit_mono.vl` F11, `check_write_scan.vl`'s slot readers |
 | **2. Classes and the one decision** | union-find classes, member flow, the §3.3 rule and the fixpoint (§3.4); `elabSlotTyAt` reads `slotStore` | elab C holder close (21 / 697), D leaf signature (14 / 322), E value-side close (9 / 249), I uncalled (9 / 125); mono F1 slot pin (19 / 349) and F2's type half (3 / 90) switch to reading, then go | −22 → 879 | about −1,500 (+450) | X4 (D14401, D14437, D14782) | `elab_place.vl`, `emit_elab.vl`, `emit_mono.vl` F1/F2 |
-| **3. Containers read the store** | mono writes the place's `ty` where F3/F4 wrote theirs: one copy function, `monoApplyPlaceStore`, until stage 7 | mono F3 container storage (15 / 1,071), F4 elab-built held (14 / 419) | −28 → 851 | about −1,450 (+40) | G1 (rows), G2, G6, X4 (D16202, D16280), G9 (unfiled: D16203, with stage 5) | `emit_mono.vl` L13855–16600 |
+| **3. Containers read the store** | mono writes the place's `ty` where F3/F4 wrote theirs: one copy function, `monoApplyPlaceStore`, until stage 7 | mono F3 container storage (15 / 1,071), F4 elab-built held (14 / 419) | −28 → 851 | about −1,450 (+40) | G1 (rows), G2, G6, X4 (D16202, D16280), G9 (D16203, with stage 5) | `emit_mono.vl` L13855–16600 |
 | **4. Arguments and instances** | argument edges per caller instance; `instOf(member)` is the delivered instance; F9's parameter types are the parameter's place | mono F6 delivery instancing (15 / 532), F8 cells (4 / 212), F9 lambda params (7 / 311); elab L value → instance keys (20 / 387), G call reach (18 / 560) | −26 → 825 | about −1,800 (+200) | G4 (D15334, D15900, D15431's call), G8, X1, X2 | `emit_mono.vl` L3500–5000, L19000–26500; `emit_elab.vl` L/G |
 | **5. Results** | `r` places per instance, and return edges both ways | mono F5 results (6 / 285), F7 read retyping (15 / 495), F10 (5 / 61) | −26 → 799 | about −750 (+100) | G3 (D16230), G5 (D16136, D16221), X3 (less D16133) | `emit_mono.vl` L14300–14450, L16000–16550, L24000–24600 |
 | **6. The tag decision reads classes** | `ftHoldCtxOk` / `ftScan`'s shape arms become "the place's class holds set *s*"; `fnTagHeldRep` is keyed by `(place, k)`, not by node; the late round refutes a set by class (D16133's ruling, close (ii)) | `ftHoldCtxOk`'s per-shape arms, `ftInnerLit`, `ftHandedHolder`; elab J written lambda / param (10 / 267), K record-of-members (14 / 460), M checker joins (7 / 216), `elabHeldKeepSets` | about −3 | about −900 (+150) | G1 (the set's tag), G7 (check defers, a named risk), D16133, D16137 | `check_fn_tag.vl`, `check_elab_cap.vl`, `emit_elab.vl` J/K |
@@ -434,7 +434,7 @@ discovery pass.
     function, leaves first. It deletes that limit, and `elabFreshMapSlotTy`, `elabLitBindingFact`
     and `anonMintLiteral`'s `internShapeDeepTy(fact)` call.
   - Lane G's assert becomes stage 3's invariant: a record row is recorded at the place's closed
-    type, never aliased onto a row recorded at an open one (unfiled: D16204). Today it fires on 4
+    type, never aliased onto a row recorded at an open one (D16204). Today it fires on 4
     running cells: `distilled/named/d15204_run_record_field.vl`, `_set`,
     `d15220_cell_bound_record.vl` and `d15221_nest_dbl.vl`. All four are in stage 3's acceptance
     set and must keep running with the assert on.
