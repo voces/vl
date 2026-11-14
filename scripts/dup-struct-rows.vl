@@ -6,7 +6,9 @@
 //     vl run scripts/dup-struct-rows.vl -- --rev 33f3280a6    # instrument an older compiler
 //
 // It patches a copy of `compiler/` so the end of `emitProgram` refuses with the row count and,
-// for every row that `repStructSlotRep` folds onto an earlier one, that earlier row's spelling.
+// for every row that `repStructSlotRep` folds onto an earlier one, that earlier row's spelling,
+// and every pair of rows holding no function or set id that it keeps apart whose recorded types
+// are `tySame`: a copy of one type, which a fold by type cannot see. A copy exits 1.
 // A program that printed no `DUPROWS` line never reached the end of emit and counts nothing.
 // `--jobs` (default `$JOBS`, else 6) builds run at once. Run from the checkout root.
 
@@ -42,8 +44,15 @@ const PROBE = join(
     "    if r != si && r >= 0 && r < si {", "      nDup = nDup + 1",
     "      if !seen[r] {", "        seen[r] = true", "        nTy = nTy + 1",
     "        names = names + \"\\nDUPTYPE \" + sNames[r]", "      }", "    }",
-    "    si = si + 1", "  }",
-    "  \"DUPROWS rows=\" + i32ToStr(sNames.length) + \" dup=\" + i32ToStr(nDup) + names",
+    "    si = si + 1", "  }", "  let nSame = 0", "  let sj = 1",
+    "  while sj < sNames.length && sj < sTyIx.length {", "    let sk = 0",
+    "    while sk < sj {", "      const a = sTyIx[sk]",
+    "      const b = sTyIx[sj]",
+    "      if a >= 0 && b >= 0 && a != b && sFieldCount[sk] == sFieldCount[sj] && repStructSlotRep(sj) != repStructSlotRep(sk) && !dsrHoldsFn(a, 8) && !dsrHoldsFn(b, 8) && !dsrHoldsIds(a, 8) && !dsrHoldsIds(b, 8) && tySame(a, b) {",
+    "        nSame = nSame + 1",
+    "        names = names + \"\\nSAMETY \" + sNames[sk] + \" ~ \" + sNames[sj]",
+    "      }", "      sk = sk + 1", "    }", "    sj = sj + 1", "  }",
+    "  \"DUPROWS rows=\" + i32ToStr(sNames.length) + \" dup=\" + i32ToStr(nDup) + \" same=\" + i32ToStr(nSame) + names",
     "}", "",
   ],
   "\n",
@@ -65,7 +74,15 @@ function countOf(s: string, needle: string): i32 {
 // the reason the tree could not be instrumented.
 function instrument(src: string): string {
   const rep = src + "/emit_rep.vl"
-  writeText(rep, readText(rep) + PROBE)
+  // A record holding functions, or a tagged set's ids, keeps a row per set, which `tySame` does
+  // not tell apart.
+  writeText(
+    rep,
+    "import { tyMayHoldFn as dsrHoldsFn } from \"./check_types\"\n"
+      + "import { fnTagHoldsTy as dsrHoldsIds } from \"./check_elab_cap\"\n"
+      + readText(rep)
+      + PROBE,
+  )
   const es = src + "/emit_sections.vl"
   const e = readText(es)
   if countOf(e, HOOK) != 1 {
@@ -81,7 +98,13 @@ function instrument(src: string): string {
 }
 
 // One program's census: `rows` is -1 when it printed none.
-type Census = { rows: i32, dup: i32, types: string[] }
+type Census = {
+  rows: i32,
+  dup: i32,
+  types: string[],
+  same: i32,
+  pairs: string[],
+}
 
 function numAfter(s: string, key: string): i32 {
   const at = findFrom(s, key, 0)
@@ -99,13 +122,16 @@ function numAfter(s: string, key: string): i32 {
 }
 
 function readCensus(out: string): Census {
-  const c: Census = { rows: -1, dup: 0, types: [] }
+  const c: Census = { rows: -1, dup: 0, types: [], same: 0, pairs: [] }
   for line in splitLines(out) {
     if startsWith(line, "DUPTYPE ") {
       c.types.push(line.slice(8, line.length))
+    } else if startsWith(line, "SAMETY ") {
+      c.pairs.push(line.slice(7, line.length))
     } else if findFrom(line, "DUPROWS rows=", 0) >= 0 {
       c.rows = numAfter(line, "DUPROWS rows=")
       c.dup = numAfter(line, " dup=")
+      c.same = numAfter(line, " same=")
     }
   }
   c
@@ -203,8 +229,10 @@ function finish(work: string, keep: boolean, code: i32): i32 {
 }
 
 // Prints one population's totals and its most frequent duplicated spellings.
-function report(label: string, progs: string[], cs: Census[], show: i32) {
+function report(label: string, progs: string[], cs: Census[], show: i32): i32 {
   let reached = 0
+  let same = 0
+  let withSame = 0
   let withDup = 0
   let dup = 0
   let types = 0
@@ -215,6 +243,8 @@ function report(label: string, progs: string[], cs: Census[], show: i32) {
     reached = reached + 1
     if c.dup > 0 { withDup = withDup + 1 }
     dup = dup + c.dup
+    if c.same > 0 { withSame = withSame + 1 }
+    same = same + c.same
     types = types + c.types.length
     for t in c.types {
       let j = 0
@@ -244,6 +274,21 @@ function report(label: string, progs: string[], cs: Census[], show: i32) {
     print("  \{counts[best]} programs  \{keys[best]}")
     k = k + 1
   }
+  print(
+    "\{label}: \{withSame} programs hold two struct rows for one type under two arena indices; \{same} such pairs",
+  )
+  let shown = 0
+  let pi = 0
+  while pi < cs.length && shown < show {
+    for pr in cs[pi].pairs {
+      if shown < show {
+        print("  \{progs[pi]}  \{pr}")
+        shown = shown + 1
+      }
+    }
+    pi = pi + 1
+  }
+  same
 }
 
 function run(o: Opts): i32 {
@@ -355,6 +400,7 @@ function run(o: Opts): i32 {
   }
   let at = 0
   let si = 0
+  let copies = 0
   while si < sets.length {
     const cs: Census[] = []
     for _p in sets[si] {
@@ -362,14 +408,14 @@ function run(o: Opts): i32 {
       if isFile(f) {
         cs.push(readCensus(readText(f)))
       } else {
-        cs.push({ rows: -1, dup: 0, types: [] })
+        cs.push({ rows: -1, dup: 0, types: [], same: 0, pairs: [] })
       }
       at = at + 1
     }
-    report(labels[si], sets[si], cs, o.show)
+    copies = copies + report(labels[si], sets[si], cs, o.show)
     si = si + 1
   }
-  finish(work, o.keep, 0)
+  finish(work, o.keep, if copies > 0 { 1 } else { 0 })
 }
 
 const argv = programArgs()

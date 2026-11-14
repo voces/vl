@@ -9615,7 +9615,10 @@ function elabMintParamRowFactAt(
   const dn = nodeAt(decl)
   if !(dn is FuncDecl) { return false }
   const prr = elabParamRowRoot(cf, dn, 0)
-  if !elabElemRead(cf, 0) || prr < 0 { return false }
+  // A field of such an element (`v[1].f`) is read out of the parameter too (D16160).
+  const cfn = nodeAt(cf)
+  const fieldOfElem = cfn is Member && elabElemRead(parenPeelIx(cfn.memObj), 0)
+  if (!elabElemRead(cf, 0) && !fieldOfElem) || prr < 0 { return false }
   // A field of a parameter its callers forward a hole into reads the set the forward note gives.
   const pri = i32ListIndexOf(dn.fnParams, prr)
   if (
@@ -9700,7 +9703,8 @@ function elabElemRead(x: i32, depth: i32): boolean {
   if n is Member && depth == 0 {
     const o = parenPeelIx(n.memObj)
     const od = if o >= 0 && o < P.nodes.length && nodeAt(o) is Ident { identDeclOf(o) } else { -1 }
-    return od >= 0 && od < P.nodes.length && nodeAt(od) is Param
+    if od < 0 || od >= P.nodes.length { return false }
+    return nodeAt(od) is Param || elabConstParamAliasAny(od) >= 0
   }
   if n is Paren { return elabElemRead(parenPeelIx(n.parInner), depth) }
   if n is Call {
@@ -9716,6 +9720,30 @@ function elabElemRead(x: i32, depth: i32): boolean {
     && dn.letKw == "const"
     && dn.letInit >= 0
     && elabElemRead(parenPeelIx(dn.letInit), depth + 1)
+}
+
+// The parameter of `fn` the un-annotated binding `d`, a `const` or a `let` nothing re-points, is
+// bound to, directly or through a chain of such bindings; else -1.
+function elabConstParamAlias(d: i32, fn: FuncDecl): i32 {
+  const pd = elabConstParamAliasAny(d)
+  if pd >= 0 && i32ListHas(fn.fnParams, pd) { pd } else { -1 }
+}
+
+// `elabConstParamAlias` for a parameter of any function.
+function elabConstParamAliasAny(d: i32): i32 {
+  let b = d
+  let hops = 0
+  while b >= 0 && b < P.nodes.length && hops < 8 {
+    const bn = nodeAt(b)
+    if bn is Param { return if hops > 0 { b } else { -1 } }
+    if !(bn is LetDecl) || bn.letType >= 0 || bn.letInit < 0 { return -1 }
+    if bn.letKw != "const" && !cwLetUnwritten(b) { return -1 }
+    const i = parenPeelIx(bn.letInit)
+    if i < 0 || i >= P.nodes.length || !(nodeAt(i) is Ident) { return -1 }
+    b = identDeclOf(i)
+    hops = hops + 1
+  }
+  -1
 }
 
 // The parameter of `fn` the read `x` is taken out of through fields, elements, a map's `get` and
@@ -9743,6 +9771,9 @@ function elabParamRowRoot(x: i32, fn: FuncDecl, depth: i32): i32 {
       const d = identDeclOf(r)
       if d < 0 || d >= P.nodes.length { return -1 }
       if i32ListHas(fn.fnParams, d) { return if steps > 0 { d } else { -1 } }
+      // A read through an alias of the parameter is taken out of the parameter (D15920).
+      const ap = elabConstParamAlias(d, fn)
+      if steps > 0 && ap >= 0 { return ap }
       const dn = nodeAt(d)
       if (
         !(dn is LetDecl)
@@ -15728,6 +15759,9 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
       // A `.map` callback's result is an element of the list the call builds.
       const mc = elabMapCallOf(f)
       if mc >= 0 { elabSlotClimb(mc, ["e"], out, seen) }
+      // A lambda bound or handed where a written function type closes its result is delivered
+      // at that result (D16075).
+      elabLamWrittenRetAdd(f, out)
     }
   } else if (
     k == CW_UP_ARG
@@ -16078,6 +16112,39 @@ function elabValueCalls(x: i32, calls: i32[], depth: i32) {
         }
       }
     }
+  }
+  0
+}
+
+// Adds to `out` the closed result of the function type written where lambda `f` is bound (a
+// `let` with a written type) or handed (a parameter with one).
+function elabLamWrittenRetAdd(f: i32, out: i32[]) {
+  if !cwIxCovers(f) { return 0 }
+  const k = cwIxUpKind[f]
+  const up = cwIxUp[f]
+  if up < 0 || up >= P.nodes.length { return 0 }
+  let wt = -1
+  const un = nodeAt(up)
+  if k == CW_UP_LETINIT && un is LetDecl && elabLetTypeWritten(un.letType) {
+    wt = nodeTyIxOf(un.letType)
+  } else if k == CW_UP_ARG && un is Call && un.callFn >= 0 {
+    const ai = cwIxUpAux[f]
+    for fd in elabCalleeFns(un) {
+      const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+      if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
+        const pn = nodeAt(fn.fnParams[ai])
+        if pn is Param && pn.parType >= 0 { wt = nodeTyIxOf(pn.parType) }
+      }
+    }
+  }
+  const ft = if wt >= 0 && wt < T.tys.length { tyAt(wt) } else { null }
+  if (
+    ft is TyFunc
+    && ft.fnRet >= 0
+    && !tyHasTyVar(ft.fnRet)
+    && tyAt(ft.fnRet) is TyFunc
+  ) {
+    elabRetsAdd(out, ft.fnRet)
   }
   0
 }

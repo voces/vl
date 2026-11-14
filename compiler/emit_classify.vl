@@ -1,3 +1,5 @@
+import { tyHasNullMember } from "./tyquery"
+import { sharedFieldArmNulSet } from "./emit_obj_lit_fits"
 import { unRowOfNullableKey } from "./emit_union_tykey_text"
 import { valueRowKind } from "./check_ty_rep"
 import { numPrimTyOfKind } from "./tyquery"
@@ -93,7 +95,7 @@ import {
   spreadArgOf,
   ufcsAliasAtSite,
 } from "./ast"
-import { asgStoreTyOf } from "./check_asg_rows"
+import { asgRhsBuiltAtPlace, asgStoreTyOf } from "./check_asg_rows"
 import { recBuildElemTyOf, recBuildTyOf } from "./check_rec_rows"
 import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
 import { a20RetWalk } from "./check_nj_gate"
@@ -2289,6 +2291,9 @@ function letHeldTyOf(letIx: i32, init: i32, fnIx: i32): i32 {
   }
   // A function value whose own type's set is tagged is held as that set's id (D15039).
   if fnTagTyIsTagged(own) { return own }
+  // A map read the checker stamped as a held list of a tagged set's records holds that rep.
+  const hr = heldRepOf(letIx)
+  if hr >= 0 && hr < T.tys.length && tyAt(hr) is TyNullable { return hr }
   // The checker's record solve builds the binding at another record's storage.
   const rb = recBuildTyOf(letIx)
   if rb >= 0 { return rb }
@@ -6069,6 +6074,21 @@ export function forInMapRecv(iterIx: i32, fnIx: i32) {
   -1
 }
 
+// Whether the name assignment `asgIx` writes a named record into a name stored at another record,
+// whose re-read is not the value at the value's own record (D16104). A literal is built at the
+// name's record, and its re-read is the value.
+function asgNameHoldsOtherRecord(asgIx: i32, fnIx: i32): boolean {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return false }
+  if asgRhsBuiltAtPlace(a.binRight) { return false }
+  const st = asgStoreTyOf(asgIx)
+  const vt = nodeTyAt(asgIx, fnIx)
+  if st < 0 || vt < 0 { return false }
+  const pt = nonNullTy(st)
+  if pt < 0 || tySame(pt, vt) { return false }
+  tyAt(pt) is TyObj && tyAt(vt) is TyObj
+}
+
 // Whether the assignment at `asgIx` lowers as a value by storing and re-reading its target: a
 // name, a captured literal-union cell (`c[0]`, which the capture rewrite leaves untyped), or
 // a literal-index / field write on a named non-map place whose re-read is the assignment's type
@@ -6081,7 +6101,7 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   let recv = -1
   match tgt {
     Ident => {
-      return true
+      return !asgNameHoldsOtherRecord(asgIx, fnIx)
     }
     Index => {
       if !(nodeAt(tgt.idxIndex) is NumLit) { return false }
@@ -8596,6 +8616,22 @@ function asgCellOf(ix: i32, fnIx: i32): i32 {
   -1
 }
 
+// `r`, else the row of the field or element an assignment at `ix` writes: its value is that
+// place's cell, whose row a row-less right-hand side does not name.
+function asgPlaceRowOr(r: i32, ix: i32, fnIx: i32): i32 {
+  if r >= 0 { return r }
+  const e = nodeAt(ix)
+  if e is BinExpr {
+    if e.binOp == "=" && asgLitWidth(ix, fnIx) == "" {
+      const t = unwrapParen(e.binLeft)
+      if t < 0 { return r }
+      const tn = nodeAt(t)
+      if tn is Member || tn is Index { return structIndexOfExpr(t, fnIx) }
+    }
+  }
+  r
+}
+
 // Expression `exprIx` is a nullable union variant: it holds a `(ref null $variantHeap(vi))`
 // niche, which is `nulVariantIdxOfExpr` naming its row (before mono, its checked rep). Strict
 // beside `exprNullableStruct`, since the two kinds index different heap tables; a null test
@@ -9157,7 +9193,11 @@ function structIndexOfExprGo(exprIx: i32, fnIx: i32): i32 {
     ObjLit => structIndexOfObjCtx(exprIx, fnIx)
     Paren => structIndexOfExpr(e.parInner, fnIx)
     IfStmt => structIndexOfIfJoin(exprIx, fnIx)
-    BinExpr => structIndexOrRep(structIndexOfJoinStore(e, exprIx, fnIx), exprIx, fnIx)
+    BinExpr => asgPlaceRowOr(
+      structIndexOrRep(structIndexOfJoinStore(e, exprIx, fnIx), exprIx, fnIx),
+      exprIx,
+      fnIx,
+    )
     Ident => structIndexOrRep(structIndexOfIdentStore(e, exprIx, fnIx), exprIx, fnIx)
     Member => structIndexOrRep(structIndexOfMemberStore(e, exprIx, fnIx), exprIx, fnIx)
     Index => structIndexOrRep(structIndexOfIndexStore(e, exprIx, fnIx), exprIx, fnIx)
@@ -11322,11 +11362,15 @@ function sharedReadBoxesSetArm(
   let i = 0
   while i < vis.length && i < fis.length {
     if sharedFieldArmBoxesAtomSet(vis[i], fis[i]) { sets = true }
+    if sharedFieldArmNulSet(vis[i], fis[i]) { sets = true }
     i = i + 1
   }
   if !sets { return true }
   if readIx < 0 { return false }
-  valueUnionNameOfSoftTy(nodeTyInOf(readIx, fnIx)) != ""
+  // A join holding `null` names its box by its key, which a `null` member leaves the soft name without.
+  const rt = nodeTyInOf(readIx, fnIx)
+  valueUnionNameOfSoftTy(rt) != ""
+    || (tyHasNullMember(rt) && valueUnionKeyTextOfTy(rt) != "")
 }
 
 // Whether the record field read `readIx` is narrowed to one record (`if w.c is C`), keeping in

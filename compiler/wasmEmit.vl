@@ -1,3 +1,11 @@
+import { identityBinIsMixed } from "./emit_fn_scans"
+import { identityArmSlot } from "./emit_if_arm_values"
+import {
+  sharedFieldArmNulListKind,
+  sharedFieldArmNulSet,
+  sharedFieldArmSetTexts,
+} from "./emit_obj_lit_fits"
+import { armFieldElemTyIx } from "./emit_state"
 import { cUserTypes, unionAliasDeclNameOfTy } from "./check_types"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import {
@@ -314,7 +322,6 @@ import {
   UnionDecl,
   WhileStmt,
   adoptNodeTok,
-  arenaSetNode,
   arithRegionSeen,
   binderNameAt,
   blockTailIsDead,
@@ -1252,6 +1259,7 @@ import {
   exprNulNicheKind,
   exprPopBits,
   identSlotIsUnionBox,
+  identityOperandIsFn,
   ifArmIsValue,
   lastStmtIsValueIf,
   listOpKindOfBin,
@@ -1268,6 +1276,7 @@ import {
   SPREAD_NUL_REF,
   chainHasPrelude,
   exprIsNullLike,
+  exprIsNullLit,
   fnTagIdSlot,
   ifChainAllBareNull,
   ifLinkYieldsNull,
@@ -1427,7 +1436,6 @@ import {
   structRowFieldStoresAtom,
   structRowOfAnnTy,
   structRowOfRecordTy,
-  tyIsFuncOrNulFunc,
   uFieldTgtStructIdx,
   variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
@@ -4375,6 +4383,12 @@ function emitNulIsNullTest(
       && isNullTy(nodeTyAt(unwrapParen(refIx), fnIx))
     if nulFold {
       if invert { fbI32Const(0) } else { fbI32Const(1) }
+      return 1
+    }
+    // A value the checker types `null` is null whatever rep its storage has: a row-less
+    // record's `null` field read through the row of the place that stores it.
+    if isNullTy(nodeTyAt(unwrapParen(refIx), fnIx)) {
+      if emitDeadNullTest(body, refIx, !invert, fnIx) < 0 { return -1 }
       return 1
     }
   }
@@ -11985,6 +11999,36 @@ function unionEqNameOf(ix: i32, fnIx: i32): string {
   ""
 }
 
+// Of union types `a` and `b`, the one that carries `null` when the two have the same
+// non-null members (`memberTySame`) and only one carries it; -1 for any other pair.
+function unionNulTwinTy(a: i32, b: i32): i32 {
+  const am: i32[] = []
+  const bm: i32[] = []
+  const an = nonNullVariantsInto(a, am)
+  const bn = nonNullVariantsInto(b, bm)
+  if an == bn || am.length != bm.length || am.length == 0 { return -1 }
+  for x in am {
+    let hit = false
+    for y in bm {
+      if memberTySame(x, y) { hit = true }
+    }
+    if !hit { return -1 }
+  }
+  if an { return a }
+  b
+}
+
+// Appends the non-null variants of `ty` to `out`, answering whether it has a `null` one.
+function nonNullVariantsInto(ty: i32, out: i32[]): boolean {
+  const vs: i32[] = []
+  flattenVariantsInto(ty, vs)
+  let had = false
+  for v in vs {
+    if isNullTy(v) { had = true } else { out.push(v) }
+  }
+  had
+}
+
 // Union against union: equal iff the same arm (tag) holds and the unboxed payloads value-compare
 // equal per that arm. Folded as a nested value-typed `if` chain over the shared non-null arms,
 // bottoming out at bare tag equality — which covers the `null` arm and any non-shared arm. The
@@ -12006,6 +12050,22 @@ function emitUnionUnionEq(
       lname = unNames[lr]
       rname = lname
       lUTy = nodeTyAt(unwrapParen(lIx), fnIx)
+    }
+  }
+  // A union beside its own `| null` twin is one box, `null` one more tag of it: the compare
+  // reads the arms of the side that carries `null`.
+  if lname != rname {
+    const nt = unionNulTwinTy(
+      nodeTyAt(unwrapParen(lIx), fnIx),
+      nodeTyAt(unwrapParen(rIx), fnIx),
+    )
+    if nt >= 0 {
+      if nt == nodeTyAt(unwrapParen(lIx), fnIx) {
+        rname = lname
+      } else {
+        lname = rname
+      }
+      lUTy = nt
     }
   }
   // D973 — the struct-union path is tried before the re-readability gate, because it does not
@@ -12405,10 +12465,9 @@ function sharedFieldPlanDispatchable(
   if code == FC_NUL_STR { return true }
   // A record-or-`null` read is the record's nullable ref (`sharedFieldNulStructPlan`).
   if code == FC_STRUCT && sharedFieldPlanHasNull(vis, fis) { return true }
-  // An atom-set read with `null` members is one `i32` (`sharedFieldLitSetPlan`).
-  if code == FC_NUL_LIT_UNION && sharedFieldPlanHasNull(vis, fis) {
-    return true
-  }
+  // An atom-set read with `null` is one `i32`, whether members store `null`, the set or the set
+  // with `null` (`sharedFieldLitSetPlan`): atoms are interned program-wide, so every arm agrees.
+  if code == FC_NUL_LIT_UNION { return true }
   if (
     code == FC_STR
     || code == FC_I32
@@ -12438,12 +12497,21 @@ function sharedFieldPlanDispatchable(
     if (
       code == FC_UNION
       && !armFieldElemSame(elem0, uFieldStart[vis[i]] + fis[i])
+      && !armFieldsBoxAlike(elem0, uFieldStart[vis[i]] + fis[i])
     ) {
       return false
     }
     i = i + 1
   }
   true
+}
+
+// Whether arm-field slots `a` and `b` both store a value-union box. Box tags are global per atom
+// kind and a literal rides its base scalar's tag, so either box is a box of the read's join.
+function armFieldsBoxAlike(a: i32, b: i32): boolean {
+  const tys = armFieldElemTyIx()
+  if a < 0 || b < 0 || a >= tys.length || b >= tys.length { return false }
+  tys[a] >= 0 && tys[b] >= 0 && valueBoxOfTy(tys[a]) && valueBoxOfTy(tys[b])
 }
 
 // Whether the plan `code` boxes member `vi0`'s field rather than reading it as stored: the
@@ -12505,6 +12573,13 @@ function emitSharedFieldArm(
     fbUnreachable()
     return 0
   }
+  const own = variantFieldTypeAt(vi, fi)
+  if (
+    (code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32))
+    || (code == FC_STR && own == FC_NUL_LIT_UNION)
+  ) {
+    return emitSharedFieldSetToStr(body, code, own, vi, fi, recvIx, fnIx, slot)
+  }
   const converts = sharedFieldArmConverts(code, vi, fi)
   let texts = sharedFieldArmLitTexts(vi, fi)
   if converts && code == FC_I32 {
@@ -12538,6 +12613,13 @@ function emitSharedFieldArm(
     return 0
   }
   const bk = sharedFieldArmAtomKind(vi, fi)
+  if boxes && bk < 0 && sharedFieldArmNulSet(vi, fi) {
+    return emitSharedFieldNulSetBox(body, vi, fi, recvIx, fnIx, slot)
+  }
+  const lk = if boxes && bk < 0 { sharedFieldArmNulListKind(vi, fi) } else { -1 }
+  if lk >= 0 {
+    return emitSharedFieldNulListBox(body, lk, vi, fi, recvIx, fnIx, slot)
+  }
   const nulStr = boxes && bk < 0 && sharedFieldArmNulStr(vi, fi)
   // A string literal set stored at the atom boxes as the string it names (D14750).
   const setStr = boxes && bk < 0 && sharedFieldArmBoxesAtomSet(vi, fi)
@@ -12605,6 +12687,114 @@ function emitSharedFieldArm(
   if code == FC_STR && fieldRowIsStr(uFieldStart[vi] + fi, true) {
     fbRefAsNonNull()
   }
+  0
+}
+
+// A string literal set stored at the atom (`own`, `FC_I32` or its `-1` niche) read as the
+// string or `string | null` the shared read is typed as (`code`): the atom widens through its
+// members, the niche's `-1` is `null`, unreachable under a read narrowed past it.
+function emitSharedFieldSetToStr(
+  body: u8[],
+  code: i32,
+  own: i32,
+  vi: i32,
+  fi: i32,
+  recvIx: i32,
+  fnIx: i32,
+  slot: i32,
+) {
+  const texts = sharedFieldArmSetTexts(vi, fi)
+  if texts.length == 0 {
+    return emitFail(
+      "emitProgram: a shared field read widens a literal set with no members",
+    )
+  }
+  if emitSharedFieldRecv(body, recvIx, fnIx, slot) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(variantHeap(vi))
+  fbStructGet(variantHeap(vi), fi)
+  const idSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
+  fbLocalSet(idSlot)
+  if own != FC_NUL_LIT_UNION {
+    return emitAtomToStrChain(body, texts, 0, idSlot)
+  }
+  fbLocalGet(idSlot)
+  fbI32Const(0 - 1)
+  fbI32Bin(70) // 0x46 i32.eq — the niche's `null`
+  fbIfRefNul(sTy(), code == FC_NUL_STR)
+  if code == FC_NUL_STR { fbRefNullNone() } else { fbUnreachable() }
+  fbElse()
+  if emitAtomToStrChain(body, texts, 0, idSlot) < 0 { return -1 }
+  fbEnd()
+  0
+}
+
+// A string literal set beside `null` stored at the atom niche, boxed for a read whose join
+// holds other atoms: the niche's `-1` is the null-tagged box, any other atom its string's box.
+function emitSharedFieldNulSetBox(
+  body: u8[],
+  vi: i32,
+  fi: i32,
+  recvIx: i32,
+  fnIx: i32,
+  slot: i32,
+) {
+  const texts = sharedFieldArmSetTexts(vi, fi)
+  if texts.length == 0 {
+    return emitFail(
+      "emitProgram: a shared field read boxes a literal set with no members",
+    )
+  }
+  if emitSharedFieldRecv(body, recvIx, fnIx, slot) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(variantHeap(vi))
+  fbStructGet(variantHeap(vi), fi)
+  const idSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
+  fbLocalSet(idSlot)
+  fbLocalGet(idSlot)
+  fbI32Const(0 - 1)
+  fbI32Bin(70) // 0x46 i32.eq — the niche's `null`
+  fbIfRefNul(uBoxIdx, false)
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbRefNullNone()
+  fbStructNew(uBoxIdx)
+  fbElse()
+  fbI32Rel(RS_TAG, scalarTagOfKind(2))
+  if emitAtomToStrChain(body, texts, 0, idSlot) < 0 { return -1 }
+  fbStructNew(uBoxIdx)
+  fbEnd()
+  0
+}
+
+// A nullable list ref, boxed for a read whose join holds other arms: a null ref is the
+// null-tagged box, any other the list's wrapper under its kind `k`'s tag.
+function emitSharedFieldNulListBox(
+  body: u8[],
+  k: i32,
+  vi: i32,
+  fi: i32,
+  recvIx: i32,
+  fnIx: i32,
+  slot: i32,
+) {
+  if emitSharedFieldRecv(body, recvIx, fnIx, slot) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(variantHeap(vi))
+  fbStructGet(variantHeap(vi), fi)
+  const c = variantFieldTypeAt(vi, fi)
+  const refSlot = objOrderStashSlot(null, c, uFieldStorageSlot(vi, fi))
+  fbLocalSet(refSlot)
+  fbLocalGet(refSlot)
+  fbRefIsNull()
+  fbIfRefNul(uBoxIdx, false)
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbRefNullNone()
+  fbStructNew(uBoxIdx)
+  fbElse()
+  fbI32Rel(RS_TAG, scalarTagOfKind(k))
+  fbLocalGet(refSlot)
+  fbStructNew(uBoxIdx)
+  fbEnd()
   0
 }
 
@@ -12760,6 +12950,11 @@ function sharedFieldTysIdentical(vis: i32[], fis: i32[]): boolean {
 // `fbIfForSharedField` for a plan `sharedFieldPlanDispatchable` admitted: a reference field's
 // blocktype is its member's storage valtype, written by `pushFieldStorage`.
 function fbIfForSharedPlan(code: i32, vi: i32, fi: i32) {
+  // A value arm stored at the atom still delivers the nullable string ref the read is typed as.
+  const own = variantFieldTypeAt(vi, fi)
+  if code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32) {
+    return fbIfRefNul(sTy(), true)
+  }
   if (
     sharedFieldCodeDispatchable(code)
     || code == FC_NUL_LIT_UNION
@@ -39140,41 +39335,21 @@ function emitAsgRadixAs(
   0
 }
 
-// `a === b` / `a !== b`, reference identity (DECISIONS A15). Two function values compare as `==`
-// compares them, which is already identity (declaration and environment); every other operand
-// is a reference compared by `ref.eq`, a union box by its payload, never the box itself.
-function emitIdentityBin(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
-  const ne = e.binOp == "!=="
-  if (
-    identityOperandIsFn(e.binLeft, fnIx)
-    || identityOperandIsFn(e.binRight, fnIx)
-  ) {
-    const saved = nodeAt(exprIx)
-    const eq: BinExpr = {
-      binOp: if ne { "!=" } else { "==" },
-      binLeft: e.binLeft,
-      binRight: e.binRight,
-      pos: e.pos,
-      binCompound: e.binCompound,
-      binTpl: e.binTpl,
-      binRegion: e.binRegion,
-    }
-    arenaSetNode(exprIx, eq)
-    const rc = emitBinExprNode(body, eq, exprIx, fnIx)
-    arenaSetNode(exprIx, saved)
-    return rc
-  }
+// Whether identity compare `e` lowers to `ref.eq`: not when an operand is `null` or holds a
+// function, whose `==` lowering is already identity (declaration and environment).
+function emitIdentityIsRefEq(e: BinExpr, fnIx: i32): boolean {
+  if exprIsNullLit(e.binLeft) || exprIsNullLit(e.binRight) { return false }
+  !identityOperandIsFn(e.binLeft, fnIx)
+    && !identityOperandIsFn(e.binRight, fnIx)
+}
+
+// `a === b` / `a !== b` over references, `ref.eq`, a union box by its payload, never the box.
+function emitIdentityBin(body: u8[], e: BinExpr, _exprIx: i32, fnIx: i32) {
   if emitIdentityOperand(body, e.binLeft, fnIx) < 0 { return -1 }
   if emitIdentityOperand(body, e.binRight, fnIx) < 0 { return -1 }
   fbRefEq()
-  if ne { fbI32Eqz() }
+  if e.binOp == "!=" { fbI32Eqz() }
   0
-}
-
-// Whether identity operand `ix` holds a function value, nullable or not.
-function identityOperandIsFn(ix: i32, fnIx: i32): boolean {
-  exprIsClosure(ix, fnIx)
-    || tyIsFuncOrNulFunc(nodeTyInOf(unwrapParen(ix), fnIx))
 }
 
 // Whether `ty`, a nullable peeled, is a union, whose values are boxes.
@@ -39198,8 +39373,41 @@ function emitIdentityOperand(body: u8[], ix: i32, fnIx: i32): i32 {
   0
 }
 
+// Identity over a union of record and function arms (A15): each operand's payload is staged
+// as an `eqref`; two closures compare by declaration and environment, anything else by
+// `ref.eq`, which already holds a record against a function, or either against `null`, apart.
+function emitIdentityMixed(body: u8[], e: BinExpr, fnIx: i32) {
+  const a = identityArmSlot(0)
+  const b = identityArmSlot(1)
+  if emitIdentityOperand(body, e.binLeft, fnIx) < 0 { return -1 }
+  fbLocalSet(a)
+  if emitIdentityOperand(body, e.binRight, fnIx) < 0 { return -1 }
+  fbLocalSet(b)
+  fbLocalGet(a)
+  fbRefTest(cloStructIdx)
+  fbLocalGet(b)
+  fbRefTest(cloStructIdx)
+  fbI32Bin(113) // 0x71 i32.and
+  fbIf(127) // (result i32)
+  fbLocalGet(a)
+  fbRefCast(cloStructIdx)
+  fbLocalGet(b)
+  fbRefCast(cloStructIdx)
+  if emitCloEqCore(body) < 0 { return -1 }
+  fbElse()
+  fbLocalGet(a)
+  fbLocalGet(b)
+  fbRefEq()
+  fbEnd()
+  if e.binOp == "!=" { fbI32Eqz() }
+  0
+}
+
 function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
-  if e.binOp == "===" || e.binOp == "!==" {
+  if e.binIdent != 0 && identityBinIsMixed(e, fnIx) {
+    return emitIdentityMixed(body, e, fnIx)
+  }
+  if e.binIdent != 0 && emitIdentityIsRefEq(e, fnIx) {
     return emitIdentityBin(body, e, exprIx, fnIx)
   }
   // A mask that only zero-extends a load is the zero-extending load itself (`zextLoadOf`).
@@ -42703,12 +42911,25 @@ function coalBoxFieldScalarKind(lhsIx: i32, fnIx: i32): i32 {
     return -1
   }
   const un = memberUnionFieldNameRead(lhsIx, fnIx)
-  if un == "" { return -1 }
+  if un == "" && !sharedReadDeliversBox(lhsIx, fnIx) { return -1 }
   const sid = msSetOfTy(nodeTyAt(lhsIx, fnIx))
   if !setHasNullAtom(sid) { return -1 }
   const k = unionResidualSoloKindOfSet(sid)
   if nulBoxScalarValtype(k) < 0 || vbHeapIdxOfKind(k) < 0 { return -1 }
   k
+}
+
+// Whether member read `memIx` is a shared-field dispatch whose arms each deliver their stored
+// value-union box, so the read is a box although no one field row names its union.
+function sharedReadDeliversBox(memIx: i32, fnIx: i32): boolean {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, vis, fis)
+  code == FC_UNION
+    && !sharedFieldAnyArmBoxes(code, vis, fis)
+    && sharedFieldPlanDispatchable(code, vis, fis)
 }
 
 // `f ?? d` over a field read `f` yielding a `scalar | null` box of atom kind `fk`: the box is

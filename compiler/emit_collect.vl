@@ -3811,19 +3811,18 @@ export function leqScanExpr(exprIx: i32, fnIx: i32) {
       if arithRegionSeen && e.binRegion != 0 && !bcOpen {
         return leqScanExprHeld(exprIx, fnIx)
       }
-      // Both note functions claim only `==`, `!=` and `+`, and so does every classifier they
-      // ask, so a binary of any other operator reserves nothing. Read the operator once here
-      // rather than re-reading it inside each of the six — a new classifier that claims a
-      // fourth operator has to widen this gate with it.
-      if (
+      // Both note functions claim only `==`, `!=` and `+`, as every classifier they ask does, so a
+      // new operator widens this one gate. An identity compare takes no structural frame, only the
+      // closure frame a function operand's `==` lowering compares through.
+      if e.binIdent != 0 {
+        cloEqNoteBin(exprIx, fnIx)
+      } else if (
         (e.binOp == "==" || e.binOp == "!=" || e.binOp == "+")
         && !leqBinIsScalar(e, exprIx)
       ) {
         leqNoteBin(exprIx, fnIx)
         cloEqNoteBin(exprIx, fnIx)
       }
-      // An identity compare reserves only the closure frame its function operands take.
-      if e.binOp == "===" || e.binOp == "!==" { cloEqNoteBin(exprIx, fnIx) }
       leqScanExpr(e.binLeft, fnIx)
       return leqScanExpr(e.binRight, fnIx)
     }
@@ -5730,11 +5729,14 @@ function collectAHeldRep(i: i32): i32 {
   heldRepMintDone[i] = true
   // A map binding held as a map of a tagged set's records is read at that rep, so its value row
   // and mv slot are interned here, beside the map's own type's.
-  const hr = fnTagHeldRepOf(i)
+  // A binding of a map read holds its value `| null`, read at the value's own rep (D15801).
+  const hr0 = fnTagHeldRepOf(i)
+  const hr = if hr0 >= 0 { nonNullTy(hr0) } else { -1 }
   // A held list's record element row is minted from the rep's type, ahead of the literals it
   // is built from, so which literal mints first never decides the row its elements share.
   if hr >= 0 && hr < T.tys.length && tyAt(hr) is TyArray {
     internShapeDeepTy(hr)
+    heldListElemAlias(i, hr)
   }
   if hr >= 0 { arrLitMintTrees([i], false) }
   const hv = if hr >= 0 && hr < T.tys.length && tyAt(hr) is TyMap { tyMapValOf(hr) } else { -1 }
@@ -5742,10 +5744,41 @@ function collectAHeldRep(i: i32): i32 {
     internShapeDeepTy(hv)
     mvShapeOfMapHeldTy(hr, hv, hv)
   }
+  // A map whose value is a list of a tagged set's records: the list's rows and its mv slot.
+  if hv >= 0 && tyAt(hv) is TyArray {
+    internShapeDeepTy(hv)
+    forceListLeafRepsOfTy(hv)
+    mvShapeOfMapHeldTy(hr, hv, hv)
+  }
   // A list held so as a list of flat records is read at that rep too: the element's row and
   // the list's ref-list slot (D15552). A nested element's rows are minted where it is built.
   const he = if hr >= 0 && hr < T.tys.length { tyArrayElemIx(hr) } else { -1 }
   if heldElemIsFlatRecord(he) { forceListLeafRepsOfTy(hr) }
+  0
+}
+
+// Aliases the record element of held binding `i`'s own list type to the row its stamped rep `hr`
+// stores it at, so an instance the binding is handed to, bound at that type, reads the row
+// (D16160).
+function heldListElemAlias(i: i32, hr: i32) {
+  const n = nodeAt(i)
+  const own = if n is LetDecl && n.letInit >= 0 { nodeTyIxOf(n.letInit) } else { nodeTyIxOf(i) }
+  const oe = if own >= 0 && own < T.tys.length { tyArrayElemIx(own) } else { -1 }
+  const he = tyArrayElemIx(hr)
+  if (
+    oe < 0
+    || he < 0
+    || oe == he
+    || !(tyAt(oe) is TyObj)
+    || !(tyAt(he) is TyObj)
+  ) {
+    return 0
+  }
+  if structIndexOfTy(oe) >= 0 { return 0 }
+  const row = structIndexOfTy(he)
+  if row < 0 { return 0 }
+  structTyMarkAliasable(oe)
+  structTyIxAlias(oe, row)
   0
 }
 
@@ -6966,7 +6999,7 @@ export function collectS(stmts: i32[]) {
     const s = nodeAt(stmts[i])
     // A struct-alias union decl (a single inline-shape variant) is a plain named struct: intern
     // it here, since `collectU` skipped it.
-    if s is UnionDecl {
+    if s is UnionDecl && declGpBaseOf(stmts[i]) == "" {
       if unionDeclStructAlias(stmts[i], s) {
         if internShapeAs(s.udName) < 0 { return -1 }
       }
@@ -8715,11 +8748,49 @@ function collectInlineUnionsBlock(stmts: i32[], blockIx: i32) {
 // resolving its fields, so a self-application lands on its own index rather than recursing
 // forever — but a generic instance has no name to short-circuit a renderer, which then traps.
 
-// Would a name-faithful render of arena type `ix` fail to terminate? The render itself is
-// the test (`renderEmit` banks the cut in `tyNomNameCycled`), not a hand-written copy of it.
-function tyNomRenderLoops(ix: i32): boolean {
-  tyToNominalName(ix)
-  tyNomNameCycled()
+// Whether type `ix` reaches itself through union and nullable wrappers alone: a value of infinite
+// size, which no layout holds. A cycle through a record, list or map passes a heap reference and
+// is finite, as a declared recursive struct is (D3328).
+function tyCycleSkipsRecord(ix: i32): boolean {
+  if ix < 0 || ix >= T.tys.length { return false }
+  const seen: boolean[] = []
+  tcsrReaches(ix, ix, seen, 0)
+}
+
+// Whether `t` reaches `goal` without entering a record, list or map, `depth` bounding the walk.
+function tcsrReaches(t: i32, goal: i32, seen: boolean[], depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth > 64 { return false }
+  while seen.length <= t { seen.push(false) }
+  if depth > 0 && t == goal { return true }
+  if seen[t] { return false }
+  seen[t] = true
+  const ty = tyAt(t)
+  match ty {
+    TyObj => {
+      return false
+    }
+    TyArray => {
+      return false
+    }
+    TyMap => {
+      return false
+    }
+    TyNullable => {
+      return tcsrReaches(ty.nInner, goal, seen, depth + 1)
+    }
+    TyUnion => {
+      for m in ty.uMembers {
+        if tcsrReaches(m, goal, seen, depth + 1) { return true }
+      }
+    }
+    TyFunc => {}
+    TyPrim => {}
+    TyErr => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+  }
+  false
 }
 
 // The source spelling of the first annotation whose resolved type is `ix` (`L<i32>`),
@@ -8746,7 +8817,7 @@ function guardFiniteUserTypes(): i32 {
   let i = 0
   while i < ks.length {
     const v = cUserTypes[ks[i]] ?? (-1)
-    if tyNomRenderLoops(v) {
+    if tyCycleSkipsRecord(v) {
       let shown = annSpellingOfTyIx(v)
       if shown == "" { shown = ks[i] }
       return emitFail(
@@ -8828,7 +8899,9 @@ export function collectU(stmts: i32[]) {
     // any function body arms one; a failure freezes it, so early returns cannot leak a stale anchor.
     emitCurStmtIx = stmts[i]
     const s = nodeAt(stmts[i])
-    if s is UnionDecl {
+    // A generic union alias has no members of its own: each application is a union type
+    // that the annotation walks register by type, as an inline union is.
+    if s is UnionDecl && declGpBaseOf(stmts[i]) == "" {
       if collectDeclaredUnion(stmts, stmts[i], s) < 0 { return -1 }
     }
     i = i + 1

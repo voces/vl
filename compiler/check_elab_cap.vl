@@ -105,7 +105,7 @@ import {
   restoreSlot,
   scopeVisibleSnapshot,
 } from "./check_scopes"
-import { tyHasTyVar } from "./tyquery"
+import { nonNullTy, tyHasTyVar } from "./tyquery"
 import {
   i32ListHas,
   i32ListIndexOf,
@@ -115,7 +115,12 @@ import {
 import { identArmNote, identDeclOf, identIsArm, nodeSrc } from "./symbols"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
 import { hdBase, hdRowOf } from "./check_hole_pins"
-import { mintReset } from "./check_mint"
+import {
+  mintFactRows,
+  mintFactRsOf,
+  mintFactSetOf,
+  mintReset,
+} from "./check_mint"
 import { elabFnSetTy, fnTagged, fvaListCopyReset } from "./check_fn_tag_facts"
 export { fnTagTyIsTagged } from "./check_fn_tag_facts"
 
@@ -1606,6 +1611,7 @@ export function elabFnLetTy(bd: i32, t: i32): i32 {
   if !fnTagEtaRan {
     fnLetWide.push(fresh)
     fnLetWideAt.push(bd)
+    if !i32ListHas(fnLetWideKept, bd) { fnLetWideKept.push(bd) }
   }
   fresh
 }
@@ -3037,6 +3043,23 @@ export function fnTagSetSplits(s: i32): boolean {
       if cs == s || fnSetHoldsAll(fnSets[cs], fnSets[s]) { return true }
     }
   }
+  // So does an instance's call the elaboration noted, whose members' results differ (D16160).
+  for r in mintFactRows() {
+    const ms = mintFactSetOf(r)
+    if (
+      ms < 0
+      || ms >= fnSets.length
+      || (ms != s && !fnSetHoldsAll(fnSets[ms], fnSets[s]))
+    ) {
+      continue
+    }
+    const rs = mintFactRsOf(r)
+    let k = 1
+    while k < rs.length {
+      if !tySame(rs[k], rs[0]) { return true }
+      k = k + 1
+    }
+  }
   false
 }
 
@@ -3213,6 +3236,8 @@ let fnRetRecSrcTo: i32[] = []
 let fnRetRecSrcFrom: i32[] = []
 let fnFieldWidenedName: string[] = []
 let fnLetVeto: i32[] = []
+// The `let`s the first check widens, kept for the re-check (`fnLetKeptWide`).
+let fnLetWideKept: i32[] = []
 // The choices of functions a judge left to the tag decision (`fnChoiceWideNote`), beside their
 // types; those whose set the decision left untagged, which the next check refuses.
 let fnChoiceWide: i32[] = []
@@ -3405,6 +3430,7 @@ export function fnTagEtaReset() {
   fnRetRecSrcFrom = []
   fnListClosedLits = []
   fnLetVeto = []
+  fnLetWideKept = []
   fnChoiceVeto = []
 }
 
@@ -3575,6 +3601,12 @@ function fnChoiceHandedOnly(at: i32): boolean {
 // Whether choice `at` is refused because the decision left its set untagged.
 export function fnChoiceVetoed(at: i32): boolean {
   i32ListHas(fnChoiceVeto, at)
+}
+
+// Whether `let` node `bd` is one the first check widens and its decision does not veto: the
+// re-check reads it at its whole set, as the first check does.
+export function fnLetKeptWide(bd: i32): boolean {
+  fnTagEtaRan && i32ListHas(fnLetWideKept, bd) && !i32ListHas(fnLetVeto, bd)
 }
 
 // Whether `t` is the type a `let` written with other functions than its initialiser gives its reads.
@@ -3782,6 +3814,10 @@ function fnTagPlaceRep(v: i32): i32 {
     } else if cwSliceRecv(x) >= 0 {
       // A slice holds its receiver's own elements.
       x = parenPeelIx(cwSliceRecv(x))
+    } else if fnTagGetRecv(x) >= 0 {
+      // A `get` reads one slot, `| null`.
+      steps.push("?")
+      x = parenPeelIx(fnTagGetRecv(x))
     } else {
       // Any other node is the root: a name reads its binding's stamp.
       const d = identDeclOf(x)
@@ -3790,12 +3826,34 @@ function fnTagPlaceRep(v: i32): i32 {
     }
     hops = hops + 1
   }
+  // Each step reads through a narrowed `| null`; an index step on a map reads its value, which
+  // the read answers `| null` (D15801).
   let k = steps.length - 1
   while k >= 0 && t >= 0 {
-    t = if steps[k] == "" { tyArrayElemIx(t) } else { tyFieldTyOf(t, steps[k]) }
+    const tn = nonNullTy(t)
+    const isMap = tn >= 0 && tn < T.tys.length && T.tys[tn] is TyMap
+    if steps[k] == "?" {
+      const mt = if tn >= 0 && tn < T.tys.length { T.tys[tn] } else { null }
+      t = if mt is TyMap { mt.mVal } else { tyArrayElemIx(tn) }
+      if t >= 0 { t = mkNullableTy(t) }
+    } else if steps[k] == "" && isMap {
+      const mt = T.tys[tn]
+      t = if mt is TyMap { mt.mVal } else { -1 }
+      if k == 0 && t >= 0 { t = mkNullableTy(t) }
+    } else {
+      t = if steps[k] == "" { tyArrayElemIx(tn) } else { tyFieldTyOf(tn, steps[k]) }
+    }
     k = k - 1
   }
   t
+}
+
+// The receiver of `x` when it is a one-argument `get` call, or -1.
+function fnTagGetRecv(x: i32): i32 {
+  const n = nodeAt(x)
+  if !(n is Call) || n.callArgs.length != 1 || n.callFn < 0 { return -1 }
+  const f = nodeAt(parenPeelIx(n.callFn))
+  if f is Member && f.memProp == "get" { f.memObj } else { -1 }
 }
 
 // Whether record type `t` has a field of a tagged set itself, not a list of one.

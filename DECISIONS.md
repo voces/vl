@@ -5194,7 +5194,7 @@ cover: a RECURSIVE local type inside a GENERIC function that mentions the type p
 becomes a recursive generic alias and inherits the pre-existing module-scope refusal
 `recursive generic type … is not supported — its expansion has no finite type name`. The
 module-scope spelling refuses identically, so the local spelling inherits the gap rather than
-introducing one. **(d)** The build also had to reach `vl fmt`, which the ruling never
+introducing one. Residue (c) is closed by D3328 (2026-11-14): the local and the module-scope spellings both build and run, no longer refused (`generics/recursive-local-type-in-generic-fn.vl`). **(d)** The build also had to reach `vl fmt`, which the ruling never
 mentions: the formatter prints an `Ident`, an `is` check-type and an `as` target from the NODE
 rather than the source span, so a parser-side rename leaks into a file `vl fmt -w` writes
 back — `TV$b1.size`, `11 as Id$b1`, neither of which re-parses. Demangled at those three
@@ -11841,3 +11841,65 @@ arm at the pre-test type made acceptance depend on which type it fell back to. W
 later revives the arm, and it is then checked against its real type. The alternative, making any
 use of a `never` operand an error, was not taken: it refuses dead final `else`s after `is` chains,
 `match`'s defensive `_`, and `else { panic("unexpected " + p) }`, all of which compile today.
+
+## A collection whose element nothing writes fits every `is T[]`; a write through a narrowing pins it (2026-11-14) — D16047
+
+**Ruled by the owner 2026-11-14 (a1), refined the same day.** An empty `[]`, `Map()` or `Set()`
+whose element type no write anywhere fixes can never hold an element, so it satisfies `is T[]`
+(and `is {[K]: V}`, `is Set<T>`) for every `T`; at run time that test is only "is it a list" (map,
+set). A write through a narrowed name is a write like any other: it fixes the element type program-
+wide, by the rules direct writes already follow. A second write at a different type is refused as
+`xs.push(1); xs.push("a")` is, and calls to one non-generic function share its result's element.
+Once a write fixes the type, an `is` that can no longer match is a warning (see the next section).
+
+```vl
+const r = if c() { [] } else { 1 }   // nothing writes r's element
+print(r is i32[])                    // true
+print(r is string[])                 // true
+
+const s = if c() { [] } else { 1 }   // a separate value
+if s is i32[] { s.push(1) }          // pins s's element: s is i32[] | i32
+print(s[0])                          // 1
+```
+
+**Why.** The vacuous answer is only reachable while no element exists, so it cannot be observed
+wrong, and pinning by writes is how element types are inferred everywhere else. Refusing writes
+through such a narrowing was not taken: it rejects a program the design can run. Settling the hole
+to the first tested `T` was not taken: two tests would disagree about one empty list. Joining two
+writes into `(i32 | string)[]` is not part of this ruling; it would change direct writes too.
+
+## An `is` that can never match is a warning, and its branch reads the operand as `never` (2026-11-14) — D16047
+
+**Ruled by the owner 2026-11-14.** An `is` test whose type can never match its operand is a
+**warning**, not an error, the twin of D16006's dead `else`. The branch that cannot run narrows the
+tested operand to `never` (uses type-check, as in D16006), and the warning names why, including the
+write that fixed an inferred element type.
+
+```vl
+const b: i32 = 1
+if b is string { print(b + "!") }   // warning: this branch can never run (`b` is always `i32`)
+
+const s = if c() { [] } else { 1 }
+if s is i32[] { s.push(1) }
+if s is string[] { s.push("x") }    // warning: can never run (`s` holds `i32[]`, fixed by the push above)
+```
+
+**Why.** Both directions of a dead branch are now treated alike. With element types inferred from
+writes anywhere, an error at the `is` would surface far from its cause. Kotlin, Java and Go make it
+an error; Swift, C# (`is`) and Scala warn; the owner took the warning.
+
+## Polymorphic recursion is refused for now; a uniform representation is backlogged (2026-11-14) — D2721, D12131
+
+**Ruled by the owner 2026-11-14: (a) now, (b) later.** A generic function that calls itself at a type
+built from its own parameter (D2721) and a generic alias that names itself at a larger argument
+(D12131) stay check errors: VL compiles one specialised instance per type, and these need infinitely
+many.
+
+```vl
+function f<T>(u: T | null, n: i32) { if n > 0 { f<T[]>(null, n - 1) } }  // refused
+type L<T> = { v: T, next: L<L<T>> | null }                                // refused
+```
+
+**Later.** Supporting them through a uniform (boxed) representation for exactly the generics the
+growth test flags is backlogged in ROADMAP.md, not rejected. Capping the nesting depth was not
+taken: whether a program ran would depend on its input, not its types.

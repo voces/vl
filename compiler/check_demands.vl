@@ -3,6 +3,7 @@
 // overload resolution, cast pins, bare-brace delivery and the inferred-return notes. Each
 // reads what the core checker recorded and reports through the relation core.
 
+import { identityCstrOffender, identityCstrRefusal } from "./check_identity"
 import { cwIxCovers } from "./check_write_scan"
 import { cbaParamRepTransparent } from "./check_bind_adopt"
 import { declTyOf, npInvBy, npKeys, npPlace, npTys } from "./check_nar_store"
@@ -2798,6 +2799,56 @@ function binCstrOpRefusal(
   0
 }
 
+// The index into `hArgNode` of the first argument typed `off` (its literal widened), the value
+// with no identity, or -1. A route through a function parameter binds the constraint to that
+// parameter, and the argument the user fixes is the value.
+function identityArgOf(off: i32, hArgNode: i32[]): i32 {
+  if off < 0 { return -1 }
+  const want = tyToStr(widenLitTy(off))
+  let k = 0
+  while k < hArgNode.length {
+    const a = hArgNode[k]
+    if a >= 0 && tyToStr(widenLitTy(nodeTyIxOf(a))) == want { return k }
+    k = k + 1
+  }
+  -1
+}
+
+// The position of the first argument of call `ix` typed `off`, for a call whose arguments bind no
+// tracked hole (a route through a function parameter), or -1.
+function identityCallArgOf(off: i32, ix: i32): i32 {
+  if off < 0 || ix < 0 || ix >= P.nodes.length { return -1 }
+  const c = nodeAt(ix)
+  if !(c is Call) { return -1 }
+  const want = tyToStr(widenLitTy(off))
+  let k = 0
+  while k < c.callArgs.length {
+    if tyToStr(widenLitTy(nodeTyIxOf(c.callArgs[k]))) == want { return k }
+    k = k + 1
+  }
+  -1
+}
+
+// Raises identity refusal `msg` at argument `argNo` (node `at`) of a call of `who`.
+function identityArgRefusal(
+  msg: string,
+  op: string,
+  who: string,
+  argNo: i32,
+  at: i32,
+) {
+  let route = "the call's argument types"
+  if who != "" {
+    route = "`"
+      + who
+      + "` hands it to a body that applies `"
+      + op
+      + "`, directly or through a parameter"
+  }
+  tErr("argument " + i32ToStr(argNo) + ": " + msg + " (" + route + ")", at)
+  0
+}
+
 // Re-validates every deferred binary-op constraint this call resolves: substitutes the holes
 // to the call's concrete argument types and checks the operator is defined for them — the one
 // rule numeric, string and relational operators all reduce to. Re-defers when a hole
@@ -2848,7 +2899,53 @@ export function validateBinCstrs(
         crt = softenBareLitTy(crt)
       }
       if !tyHasHole(clt) && !litHolds && !tyHasHole(crt) {
-        if !binCstrEqRefused(ci, clt, crt, who, ix) {
+        if binCstr.op[ci] == "===" || binCstr.op[ci] == "!==" {
+          // Identity: no operator table answers it, the identity rule does (DECISIONS A15).
+          const idRefusal = identityCstrRefusal(binCstr.op[ci], clt, crt)
+          if idRefusal != "" {
+            const off = identityCstrOffender(clt, crt)
+            const k = identityArgOf(off, hArgNode)
+            if k >= 0 {
+              identityArgRefusal(
+                idRefusal,
+                binCstr.op[ci],
+                who,
+                hArgNo[k],
+                hArgNode[k],
+              )
+            } else if identityCallArgOf(off, ix) >= 0 {
+              const ck = identityCallArgOf(off, ix)
+              const cn = nodeAt(ix)
+              if cn is Call {
+                identityArgRefusal(
+                  idRefusal,
+                  binCstr.op[ci],
+                  who,
+                  ck + 1,
+                  cn.callArgs[ck],
+                )
+              }
+            } else if ix >= 0 && ix < P.nodes.length && !(nodeAt(ix) is Call) {
+              // A generic passed as a value: the scalar is an argument of the enclosing call,
+              // which no table here reaches (D16110), so the sentence names type and route.
+              let fnWho = "a generic function"
+              if who != "" { fnWho = "`" + who + "`" }
+              tErr(
+                idRefusal
+                  + " ("
+                  + fnWho
+                  + " is passed here as a value and instantiated at `"
+                  + tyToStr(widenLitTy(off))
+                  + "`, where its body applies `"
+                  + binCstr.op[ci]
+                  + "`)",
+                ix,
+              )
+            } else {
+              binCstrOpRefusal(ci, idRefusal, who, ix, hNames, hArgNo, hArgNode)
+            }
+          }
+        } else if !binCstrEqRefused(ci, clt, crt, who, ix) {
           if !binOpDefinedFor(binCstr.op[ci], clt, crt) {
             const refusal = binCstrRefusalText(ci, clt, crt)
             binCstrOpRefusal(ci, refusal, who, ix, hNames, hArgNo, hArgNode)

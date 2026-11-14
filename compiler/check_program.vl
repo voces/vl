@@ -619,6 +619,7 @@ import {
 import {
   nonNulTyOf,
   nonNullTy,
+  nulFoldMemberTy,
   primNameOf,
   tyHasTyVar,
   tyStepElem,
@@ -688,6 +689,7 @@ import {
   tyIsTwinRecordUnion,
   tyNameAtoms,
   tyPrimNameIs,
+  tyReachesSelf,
   tySame,
   tyToEmitName,
   tyToEmitNameAt,
@@ -717,6 +719,8 @@ import {
   CW_UP_RET,
   CW_UP_SPREAD,
   CW_UP_TAIL,
+  cwBindingOf,
+  cwBindingWrittenValues,
   cwBuildFrames,
   cwCalleeDeclOf,
   cwFnCalls,
@@ -740,10 +744,12 @@ import {
   cwPeel,
   cwPeelValue,
   cwPicksFinalSet,
+  cwSlotWrittenValues,
   fnDeclIx,
   rcwBlockTail,
 } from "./check_write_scan"
 import { numLexFitsI32 } from "./emit_bignum"
+import { identDeclOf } from "./symbols"
 import {
   callBuiltTy,
   storeCoalescesResolve,
@@ -2266,12 +2272,23 @@ let canonTwinTy = -1
 // lone-literal arms re-parses to one record, so the spelling's own type stands in for it.
 function canonBankTyOf(spelling: string, root: i32, c: string): i32 {
   if canonTwinTy >= 0 && canonTwinText == c { return canonTwinTy }
+  // A recursive record's render closes its cycle on a name, so parsing it back builds a second
+  // copy of the record, and a second struct row for it: the spelling's own type is banked.
+  const own = annotResolve(spelling, root)
+  if own >= 0 && canonOwnRecordCycle(own) { return own }
   const ct = nameToTy(c)
   if ct >= 0 && tyAt(nonNullTy(ct)) is TyObj {
     const st = annotResolve(spelling, root)
     if tyIsTwinRecordUnion(st) { return st }
   }
   ct
+}
+
+// Whether `ty` is a record, or a null-fold wrapper or nullable over one, that reaches itself.
+function canonOwnRecordCycle(ty: i32): boolean {
+  const fm = nulFoldMemberTy(ty)
+  const r = nonNullTy(if fm >= 0 { fm } else { ty })
+  r >= 0 && r < T.tys.length && tyAt(r) is TyObj && tyReachesSelf(ty)
 }
 
 // The top-level union arm of `canonEmitNameTs`: `name` at position `ctx` split on `|`, each
@@ -4147,6 +4164,7 @@ function recKeptConflicts() {
         k >= 0
         && recArgRepOf(u) < 0
         && !recArmLandsAt(u, recKeptDst[k])
+        && !recLandsAtSameBuild(u, d)
       ) {
         recAdRaising = true
         // One delivery in a generic body reaches the value at two instances' types.
@@ -4190,6 +4208,70 @@ function recKeptConflicts() {
   }
   for u in recOwnSrc { recBuiltReadRefuse(u) }
   0
+}
+
+// Whether `u`, a value built by kept maker `d`, is assigned to a binding every value of which is
+// built by `d` too: the binding holds that build, so handing `u` on to it is no other type (D15933).
+function recLandsAtSameBuild(u: i32, d: i32): boolean {
+  if recPushLandsAtSameBuild(u, d) { return true }
+  if !cwIxCovers(u) || cwIxUpKind[u] != CW_UP_ASG_RHS { return false }
+  const a = cwIxUp[u]
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if !(an is BinExpr) || an.binOp != "=" { return false }
+  const l = parenPeelIx(an.binLeft)
+  if l < 0 || l >= P.nodes.length || !(nodeAt(l) is Ident) { return false }
+  const b = identDeclOf(l)
+  const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { null }
+  if !(bn is LetDecl) || bn.letType >= 0 { return false }
+  const vals = cwBindingWrittenValues(b)
+  if vals.length == 0 { return false }
+  for v in vals {
+    if recFreshOriginDecl(v, 6) != d { return false }
+  }
+  true
+}
+
+// Whether `u`, a value built by kept maker `d`, is pushed onto a list reached from a binding through
+// fields, every element of which, through any alias, is built by `d` too (D15933).
+function recPushLandsAtSameBuild(u: i32, d: i32): boolean {
+  if !cwIxCovers(u) || cwIxUpKind[u] != CW_UP_ARG { return false }
+  const a = cwIxUp[u]
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if !(an is Call) || an.callFn < 0 || an.callArgs.length != 1 { return false }
+  const f = nodeAt(parenPeelIx(an.callFn))
+  if !(f is Member) || f.memProp != "push" { return false }
+  // The receiver's root binding and the fields from it, outermost first.
+  const rev: string[] = []
+  let r = parenPeelIx(f.memObj)
+  let steps = 0
+  while r >= 0 && r < P.nodes.length && nodeAt(r) is Member && steps < 8 {
+    const m = nodeAt(r)
+    if m is Member {
+      rev.push(m.memProp)
+      r = parenPeelIx(m.memObj)
+    }
+    steps = steps + 1
+  }
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return false }
+  const path: string[] = []
+  let i = rev.length - 1
+  while i >= 0 {
+    path.push(rev[i])
+    i = i - 1
+  }
+  path.push("[]")
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if (
+    cwSlotWrittenValues(cwBindingOf(r), path, vals, ats) < 0
+    || vals.length == 0
+  ) {
+    return false
+  }
+  for v in vals {
+    if recFreshOriginDecl(v, 6) != d { return false }
+  }
+  true
 }
 
 // A function value: its result covariant, its parameters contravariant.

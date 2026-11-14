@@ -23,6 +23,7 @@ import {
   fnChoiceVetoed,
   fnChoiceWideNote,
   fnLetIsWide,
+  fnLetKeptWide,
   fnTagCallNote,
   fnTagCallRefusal,
   fnTagMembers,
@@ -458,6 +459,7 @@ import {
   gaAppTyIxSet,
   gaAppTyIxs,
   genAppNameOfTy,
+  genAppRowCyclic,
   genAppRowOf,
   litBaseTy,
   litMemberTy,
@@ -496,6 +498,7 @@ import {
   tyMutEpoch,
   tyNulInnerTy,
   tyPrintsAsRef,
+  tyReachesSelf,
   tySame,
   tyToStr,
   tyToStrUser,
@@ -541,6 +544,8 @@ import {
   cwFramedNode,
   cwGetRecv,
   cwHeldFnOf,
+  cwIxCovers,
+  cwIxUp,
   cwIxWant,
   cwKeyOfDecl,
   cwKeyOfRoot,
@@ -608,6 +613,7 @@ import {
   isVoidTy,
   nhOpen,
   nonNullTy,
+  nulFoldMemberTy,
   numericRepsApart,
   primIsSubWord,
   primNameOf,
@@ -2830,10 +2836,6 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
     }
     return builtinCtorTyLeafFail(head)
   }
-  // The declared parameter names, read as a slice of the flat column — split once when the alias
-  // registered (D-GAPARAM), not re-split here per application. `pcount` is the declared arity.
-  const pstart = gaParamStart[gi]
-  const pcount = gaParamCount[gi]
   const argTys: i32[] = []
   if appIx >= 0 {
     const astart = tsKidStart[appIx]
@@ -2861,6 +2863,16 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
       ai = ai + 1
     }
   }
+  applyGenAliasTys(head, gi, argTys)
+}
+
+// The instance of generic alias `gi` (spelled `head`) at argument types `argTys`: the memoized
+// arena index when one exists, else a fresh placeholder filled from the declaration's fields.
+function applyGenAliasTys(head: string, gi: i32, argTys: i32[]): i32 {
+  // The declared parameter names, read as a slice of the flat column — split once when the alias
+  // registered (D-GAPARAM), not re-split here per application. `pcount` is the declared arity.
+  const pstart = gaParamStart[gi]
+  const pcount = gaParamCount[gi]
   if argTys.length != pcount {
     tErr(
       "`"
@@ -2896,7 +2908,10 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   for at in argTys { gaOpenFlat.push(at) }
   const fnames: string[] = []
   const ftys: i32[] = []
-  const resIx = mkObjTy(fnames, ftys)
+  // A union alias's placeholder is a union, filled in place by the declaration's own rules.
+  const umems: i32[] = []
+  const unionDecl = gaDeclIsUnion(gaDeclIxs[gi])
+  const resIx = if unionDecl { mkUnionTy(umems) } else { mkObjTy(fnames, ftys) }
   gaOpenRes.push(resIx)
   cUserTypes[memoKey] = resIx
   cUserTypesVer = cUserTypesVer + 1 // new declared-name resolution registered
@@ -2919,6 +2934,7 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
     tpEnvTys.push(argTys[bi])
     bi = bi + 1
   }
+  if unionDecl { gaFillUnionInstance(gaDeclIxs[gi], resIx) }
   const decl = nodeAt(gaDeclIxs[gi])
   if decl is TypeDecl {
     const dfields = decl.tdFields
@@ -2970,7 +2986,47 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   gaOpenGi.pop()
   gaOpenStart.pop()
   gaOpenRes.pop()
+  if unionDecl { return gaUnionUnwrap(resIx, memoKey) }
   resIx
+}
+
+// Whether generic alias declaration `declIx` is a union (`type O<T> = T | null`), not a record.
+function gaDeclIsUnion(declIx: i32): boolean { nodeAt(declIx) is UnionDecl }
+
+// Fills union placeholder `resIx` from union declaration `declIx`'s members, under the bindings
+// already pushed.
+function gaFillUnionInstance(declIx: i32, resIx: i32) {
+  const d = nodeAt(declIx)
+  const pu = tyAt(resIx)
+  if d is UnionDecl && pu is TyUnion {
+    fillUnionDeclMembers(declIx, d, pu.uMembers)
+  }
+  0
+}
+
+// A union alias instance that filled to one member (`T | null` folds to `T?`) is that member,
+// as the inline spelling is, so binding `O<T>` against `O<i32>` meets `T?` against `i32?`.
+function gaUnionUnwrap(resIx: i32, memoKey: string): i32 {
+  const u = tyAt(resIx)
+  if !(u is TyUnion) || u.uMembers.length != 1 { return resIx }
+  const m = u.uMembers[0]
+  if m < 0 { return resIx }
+  // A recursive one: a null fold is tied to its nullable first (`nulFoldTieRecord`), which no
+  // longer reaches the placeholder; any other keeps the placeholder its members point at.
+  if tyReachesSelf(resIx) {
+    if nulFoldMemberTy(resIx) < 0 { return resIx }
+    nulFoldTieRecord(m)
+  }
+  cUserTypes[memoKey] = m
+  cUserTypesVer = cUserTypesVer + 1
+  // Only a member this fill minted carries the application's name; an existing type (`A<i32>`
+  // over `type A<T> = T` is `i32`) is shared and keeps its own.
+  if m > resIx {
+    const none: string[] = []
+    const noTys: i32[] = []
+    genAppCarry(resIx, m, none, noTys)
+  }
+  m
 }
 
 // ── the three leaf rungs both resolvers bottom out at ────────────────────────
@@ -5436,6 +5492,18 @@ export function holeFnArgDecls(a: i32): i32[] {
   const ix = parenPeelIx(a)
   if ix < 0 || ix >= P.nodes.length { return [] }
   const n = nodeAt(ix)
+  // A call's result holds the functions its type's set names (D16099).
+  if n is Call {
+    const cs = fnTagMembers(fnTagSetOfTy(nodeTyIxOf(ix)))
+    if cs.length == 0 { return [] }
+    for t in cs {
+      const f = nodeAt(t)
+      if !directHoleDecl(t) || !(f is FuncDecl) || f.fnTyParams.length > 0 {
+        return []
+      }
+    }
+    return cs
+  }
   // A name reaches `cwFnValueTargets`, which builds the index.
   if n is Ident { cwIxWant() }
   if !cwFramedNode(ix) || !(n is Ident) { return [] }
@@ -5833,6 +5901,48 @@ export function holeSetCallRetOf(
   r
 }
 
+// Whether the members of set `s`, called at the closed parameter types `pts`, give two or more
+// results; false where one stays open or cannot be read.
+export function holeSetSplitsAt(s: i32, pts: i32[]): boolean {
+  const ds = fnTagMembers(s)
+  if ds.length < 2 { return false }
+  const wp: i32[] = []
+  for pt in pts {
+    if pt < 0 || tyHasTyVar(pt) { return false }
+    wp.push(widenLitTy(pt))
+  }
+  const ft = mkFuncTy(wp, TY_I32)
+  let r0 = -1
+  for d in ds {
+    const rd = setMemberRetAt(d, ft)
+    if rd < 0 || tyHasTyVar(rd) { return false }
+    const w = widenLitTy(rd)
+    if r0 < 0 { r0 = w }
+    else if !tySame(w, r0) { return true }
+  }
+  false
+}
+
+// Whether every member of set `s`, called at the closed parameter types `pts`, gives a result
+// assignable to `ret`; false where one stays open or cannot be read.
+export function holeSetFitsRetAt(s: i32, pts: i32[], ret: i32): boolean {
+  const ds = fnTagMembers(s)
+  if ds.length == 0 || ret < 0 || tyHasTyVar(ret) { return false }
+  const wp: i32[] = []
+  for pt in pts {
+    if pt < 0 || tyHasTyVar(pt) { return false }
+    wp.push(widenLitTy(pt))
+  }
+  const ft = mkFuncTy(wp, TY_I32)
+  for d in ds {
+    const rd = setMemberRetAt(d, ft)
+    if rd < 0 || tyHasTyVar(rd) || !assignable(widenLitTy(rd), ret) {
+      return false
+    }
+  }
+  true
+}
+
 // Whether set member `d` is a lambda the check has not reached yet, so it has no type.
 function setMemberUnchecked(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
@@ -6178,7 +6288,7 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
       // the member it holds, and one it leaves a closure is re-checked at the initialiser's type,
       // where this refuses (D16009). A call through it judged at its pin is refused here.
       if (
-        fnLetIsWide(nodeTyIxOf(ix))
+        (fnLetIsWide(nodeTyIxOf(ix)) || fnLetKeptWide(bd))
         && rs[k] != HOLE_RET_VOID
         && !holeJudgingCall
       ) {
@@ -6263,10 +6373,19 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
   }
   if !(nodeAt(bd) is LetDecl) { return false }
   const init = parenPeelIx(cwBoundInitOf(cwBindingOf(root)))
+  // A map's key step reads its value, so a place through a map is lifted as its value's own
+  // path is, with the map's writes as its values (D15801).
+  const mapRoot = holeSlotRootIsMap(root) && path.length > 0 && path[0] == "[]"
+  const liftPath = if mapRoot { path.slice(1, path.length) } else { path }
   // A callback's element is not lifted: the built-in hands it the list's own records.
   const lift = elem
     || !(an is Param)
-    && holeSlotFieldLift(a, init, path, cwBindingOf(root))
+    && holeSlotFieldLift(
+    a,
+    if mapRoot { -1 } else { init },
+    liftPath,
+    cwBindingOf(root),
+  )
   const rets: i32[] = []
   let called = false
   if init >= 0 && init < P.nodes.length {
@@ -6300,8 +6419,64 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
     pts,
     lift
       && (nW == 0 || !elem || holeSlotWidenLift(bd, cwBindingOf(root), path))
-      && holeSlotSetHolds(a, vals),
+      && holeSlotSetHolds(a, vals)
+      && (!mapRoot
+      || elem
+      || holeSlotMapLitWrites(cwBindingOf(root), vals) && !holeSlotReadsOpt(a)),
   )
+}
+
+// Whether each of `vals`, the functions stored through map binding `b`, sits in a literal written
+// whole to an entry, `m[k] = lit` or `m.set(k, lit)`: such a literal is built at the map's value
+// row, while a named record or a store through a read of an entry is not.
+function holeSlotMapLitWrites(b: i32, vals: i32[]): boolean {
+  const ents: i32[] = []
+  const eats: i32[] = []
+  if cwSlotWrittenValues(b, ["[]"], ents, eats) < 0 { return false }
+  const lits: i32[] = []
+  for e in ents { lits.push(cwPeel(e)) }
+  for v in vals {
+    let x = cwPeel(v)
+    let hit = false
+    let hops = 0
+    while !hit && x >= 0 && cwIxCovers(x) && hops < 32 {
+      if i32ListHas(lits, x) {
+        hit = true
+      } else {
+        const up = cwIxUp[x]
+        const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+        if !(un is FieldInit || un is ObjLit || un is ArrayLit || un is Paren) {
+          return false
+        }
+        x = up
+      }
+      hops = hops + 1
+    }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether the read `a` reaches its place through a `?.`, whose guarded call through a map's entry
+// the tag decision builds no member call for.
+function holeSlotReadsOpt(a: i32): boolean {
+  let x = cwPeel(a)
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 16 {
+    const n = nodeAt(x)
+    if n is OptMember { return true }
+    if n is Member { x = cwPeel(n.memObj) }
+    else if n is Index { x = cwPeel(n.idxArr) }
+    else { hops = 16 }
+    hops = hops + 1
+  }
+  false
+}
+
+// Whether the binding the name `root` reads is a map, whose index step reads a value.
+function holeSlotRootIsMap(root: i32): boolean {
+  const t = nonNullTy(nodeTyIxOf(root))
+  t >= 0 && t < T.tys.length && T.tys[t] is TyMap
 }
 
 // Whether the set the read `a`'s type carries holds every function among `vals`; true where
@@ -9218,6 +9393,13 @@ function bgRebind(bNames: string[], bTys: i32[], name: string, t: i32) {
   0
 }
 
+// Whether `t` is an inference hole (a `?`-named variable), not a type parameter in scope.
+function bgInferHole(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const v = tyAt(t)
+  v is TyVar && v.tvName.length > 0 && v.tvName.slice(0, 1) == "?"
+}
+
 // Generic call-site binding, deep: walks an expected parameter type against the argument's
 // actual type and binds every `TyVar` leaf on first use. Later uses are checked by the caller
 // against the substituted expected type, so disagreeing uses still error. Nested positions
@@ -9238,6 +9420,10 @@ export function bindGenWalk(
     if have < 0 {
       bNames.push(e.tvName)
       bTys.push(widenLitTy(atIx))
+    } else if bgCallArg && bgInferHole(have) && !tyHasTyVar(atIx) {
+      // An open hole an earlier argument bound (a call result's own parameter) is no binding;
+      // a later argument's closed type fixes the variable (D16099).
+      bgRebind(bNames, bTys, e.tvName, widenLitTy(atIx))
     } else if bgCallArg && bgJoinsSets(have, atIx) {
       // Two arguments of two function sets bind one variable to their union, as two arms do.
       bgRebind(bNames, bTys, e.tvName, elabFnJoinDeepTy(have, have, atIx, 0))
@@ -9733,6 +9919,8 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     if b >= 0 { return b }
     return tyIx
   }
+  const cyc = substCyclicApp(tyIx, bNames, bTys)
+  if cyc >= 0 { return cyc }
   if substOnSeenStack(tyIx) || substSkipsForeignSig(tyIx) { return tyIx }
   // A tagged set is an id: its signature names its members' own parameters, never the instance's.
   if t is TyFunc && fnTagTyIsTagged(tyIx) { return tyIx }
@@ -9765,6 +9953,31 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   // fresh arena index the provenance bank does not know about unless re-banked here, or the same type renders under two different names depending which door it came through.
   genAppCarry(tyIx, res, bNames, bTys)
   res
+}
+
+// A recursive generic instance substituted as its alias applied to the substituted arguments:
+// the one shared instance, where a field walk would meet the open instance at the cycle and
+// keep it. An argument still open (a hole) yields an open instance, re-substituted once bound.
+// -1 for any other type, or when no argument moves.
+function substCyclicApp(tyIx: i32, bNames: string[], bTys: i32[]): i32 {
+  const i = genAppRowOf(tyIx)
+  if i < 0 || !genAppRowCyclic(i) { return -1 }
+  const gi = gaIndexOf(gaAppHeads[i])
+  if gi < 0 { return -1 }
+  const st = gaAppArgStart[i]
+  const cn = gaAppArgCount[i]
+  const subbed: i32[] = []
+  let moved = false
+  let a = 0
+  while a < cn {
+    const s = substTyDeep(gaAppArgFlat[st + a], bNames, bTys)
+    if s < 0 { return -1 }
+    if s != gaAppArgFlat[st + a] { moved = true }
+    subbed.push(s)
+    a = a + 1
+  }
+  if !moved { return -1 }
+  applyGenAliasTys(gaAppHeads[i], gi, subbed)
 }
 
 // `substTyDeep` of an instance binding: `bNames` are the type parameters of top-level generic
@@ -10674,6 +10887,91 @@ export function fillTypeDeclAt(sx: i32) {
     }
   }
   0
+}
+
+// A recursive record alias spelled with `| null` (`type L = { n: L } | null`) folds to a union
+// wrapping `{ n: L }?`. Once every declaration is filled, a field of a recursive one naming such a
+// wrapper, directly, as a list element or under `| null`, is re-pointed at the wrapper's nullable,
+// so a read of it is the nullable record every reader handles, not a second type for one value.
+export function nulFoldTieKnots(stmts: i32[]) {
+  // Which wrappers are recursive is decided before any is tied: tying one re-routes the cycle
+  // of its partner in a mutual pair through the nullable, which then misses the wrapper.
+  const tie: i32[] = []
+  for sx in stmts {
+    const sd = nodeAt(sx)
+    if sd is UnionDecl {
+      const w = cUserTypes[sd.udName] ?? -1
+      const m = nulFoldMemberTy(w)
+      if m >= 0 && tyReachesSelf(w) { tie.push(m) }
+    }
+  }
+  for m in tie { nulFoldTieRecord(m) }
+  0
+}
+
+// Re-points the wrapper-typed fields of the record nullable `m` holds (`nulFoldTieKnots`).
+function nulFoldTieRecord(m: i32) {
+  const seen: i32[] = []
+  nulFoldTieRecordGo(m, seen)
+  tyMutEpoch = tyMutEpoch + 1
+  0
+}
+
+// Ties the record nullable `m` holds and, through its tied fields, every nullable record it
+// reaches: a generic mutual pair's partner is tied before this wrapper has a member to tie to.
+function nulFoldTieRecordGo(m: i32, seen: i32[]) {
+  if m < 0 || i32ListHas(seen, m) { return 0 }
+  seen.push(m)
+  const mt = tyAt(m)
+  if !(mt is TyNullable) || mt.nInner < 0 { return 0 }
+  const rec = tyAt(mt.nInner)
+  if !(rec is TyObj) { return 0 }
+  let i = 0
+  while i < rec.objFieldTypes.length {
+    const tied = nulFoldTiedTy(rec.objFieldTypes[i])
+    rec.objFieldTypes[i] = tied
+    nulFoldTieRecordGo(nulFoldTieReach(tied), seen)
+    i = i + 1
+  }
+  0
+}
+
+// The nullable record a tied field type leads to, through lists and `| null`s; -1 otherwise.
+function nulFoldTieReach(f: i32): i32 {
+  if f < 0 || f >= T.tys.length { return -1 }
+  const ft = tyAt(f)
+  match ft {
+    TyArray => nulFoldTieReach(ft.aElem)
+    TyNullable => if ft.nInner >= 0 && tyAt(ft.nInner) is TyObj { f } else { nulFoldTieReach(ft.nInner) }
+    // No other field type leads to a tied record.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => -1
+  }
+}
+
+// Field type `f` with a null-fold wrapper in it replaced by the wrapper's nullable: the field
+// itself, or one held in lists and `| null`s at any depth; a `| null` of the wrapper folds into it.
+function nulFoldTiedTy(f: i32): i32 { nulFoldTiedTyAt(f, 8) }
+
+function nulFoldTiedTyAt(f: i32, depth: i32): i32 {
+  const fm = nulFoldMemberTy(f)
+  if fm >= 0 { return fm }
+  if f < 0 || depth <= 0 { return f }
+  const ft = tyAt(f)
+  match ft {
+    TyNullable => {
+      const im = nulFoldTiedTyAt(ft.nInner, depth - 1)
+      if im != ft.nInner {
+        if im >= 0 && tyAt(im) is TyNullable { return im }
+        ft.nInner = im
+      }
+    }
+    TyArray => {
+      ft.aElem = nulFoldTiedTyAt(ft.aElem, depth - 1)
+    }
+    // Any other field type holds no wrapper this tie reaches.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {}
+  }
+  f
 }
 
 // Fills declaration `name` now, when pass 0b is running and has not reached it yet. Inert

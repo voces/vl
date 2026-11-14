@@ -9,6 +9,28 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-d16099-call-result-fn-to-generic-param](2026-11-14-d16099-call-result-fn-to-generic-param.md): D16099: a call result holding an un-annotated function, handed to a generic parameter, 2026-11-14
+- [2026-11-14-d16102-write-after-receiver-rebind](2026-11-14-d16102-write-after-receiver-rebind.md): D16102 — a field write's narrowing outlives a call that rebinds its receiver (2026-11-14)
+- [2026-11-14-d16104-wider-record-write-after-read](2026-11-14-d16104-wider-record-write-after-read.md): D16104 / D16103 — a wider record write after an operand its right-hand side changes (2026-11-14)
+- [2026-11-14-d16160-held-list-row-alias](2026-11-14-d16160-held-list-row-alias.md): D16160, layer 2: a held list of records handed on is read at its stored row, 2026-11-14
+- [2026-11-14-d16161-map-record-list-floor](2026-11-14-d16161-map-record-list-floor.md): D16161: the default instance for a map of record lists, 2026-11-14
+- [2026-11-14-g46-map-list-literal-close](2026-11-14-g46-map-list-literal-close.md): D15943: a list literal pushed onto an annotated list of maps takes the holder's type, 2026-11-14
+- [2026-11-14-d15801-map-entry-fn-fields](2026-11-14-d15801-map-entry-fn-fields.md): D15801: function fields of a map's entry literals, 2026-11-14
+- [2026-11-14-d16019-wider-record-write-value](2026-11-14-d16019-wider-record-write-value.md): D16019 — a wider record written into a narrower place, used as a value, 2026-11-14
+- [2026-11-14-d16039-identity-mixed](2026-11-14-d16039-identity-mixed.md): D16039: identity over a union of record and function arms, 2026-11-14
+- [2026-11-14-d16048-shared-field-box-arms](2026-11-14-d16048-shared-field-box-arms.md): D16048 + D16049: boxing shared-field members that store the field beside `null`, 2026-11-14
+- [2026-11-14-d16098-let-to-generic-param](2026-11-14-d16098-let-to-generic-param.md): D16098: a re-pointed `let` handed to a generic function parameter dispatches, 2026-11-14
+- [2026-11-14-g44-struct-union-null-twin-eq](2026-11-14-g44-struct-union-null-twin-eq.md): D16038: a record union `==` beside its own `| null` twin, 2026-11-14
+- [2026-11-14-g45-map-of-maps-pin](2026-11-14-g45-map-of-maps-pin.md): D15941: an un-annotated map of maps of a hole function is pinned, 2026-11-14
+- [2026-11-14-identity-generic-call-site](2026-11-14-identity-generic-call-site.md): A generic body's `===` is refused at the call, on the argument, 2026-11-14
+- [2026-11-14-d15882-shared-nullable-lit-field](2026-11-14-d15882-shared-nullable-lit-field.md): D15882 + D16031: literal-set-or-`null` fields through a union of records, 2026-11-14
+- [2026-11-14-d15975-fn-eq-refusal](2026-11-14-d15975-fn-eq-refusal.md): D15975 PR 3: `==` on functions is a check error, 2026-11-14
+- [2026-11-14-d15975-identity-flag](2026-11-14-d15975-identity-flag.md): D15975: identity rides an equality node (`BinExpr.binIdent`), 2026-11-14
+- [2026-11-14-d16032-label-from-type](2026-11-14-d16032-label-from-type.md): The union label spelled from its type (D16032), 2026-11-14
+- [2026-11-14-d16093-set-slot-to-generic-param](2026-11-14-d16093-set-slot-to-generic-param.md): D16093, D16097: a set's element or field handed to a generic function parameter dispatches, 2026-11-14
+- [2026-11-14-d16100-field-read-off-record-assignment](2026-11-14-d16100-field-read-off-record-assignment.md): D16100 / D16101 — reading a field off a record assignment's value, 2026-11-14
+- [2026-11-14-g43-packed-inferred-return](2026-11-14-g43-packed-inferred-return.md): D16120: an inferred union return may hold a packed list arm, 2026-11-14
+- [2026-11-14-restore-closure-arm-identity-case](2026-11-14-restore-closure-arm-identity-case.md): Restore D1098's closure-arm compare case under `===`, 2026-11-14
 - [2026-11-14-d16009-let-handed-to-open-param](2026-11-14-d16009-let-handed-to-open-param.md): D16009: a re-pointed `let` handed to an open parameter dispatches, 2026-11-14
 - [2026-11-14-d16016-union-and-record-place-value](2026-11-14-d16016-union-and-record-place-value.md): D16016: a write into a union or `R | null` place used as a value, 2026-11-14
 - [2026-11-14-d16025-one-row-per-key](2026-11-14-d16025-one-row-per-key.md): One union row per type key: the label index deleted (D16025), 2026-11-14
