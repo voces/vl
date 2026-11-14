@@ -32,9 +32,10 @@ if (GATED && !ENABLED) {
 const checkCodegen = async (
   target: string,
   cwd: string,
+  extra: string[] = [],
 ): Promise<{ code: number; out: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: ["check", "--codegen", target, "--compiler", COMPILER],
+    args: ["check", "--codegen", ...extra, target, "--compiler", COMPILER],
     cwd,
     stdout: "piped",
     stderr: "piped",
@@ -148,22 +149,21 @@ Deno.test({
   },
 });
 
-// A refusal raised while a hole parameter's instance is lowered (D1680, a standalone `?.` whose
-// leaf field is a map, inside an un-annotated parameter's body): the instance's body is rebuilt
-// into nodes minted after parsing, and the anchor is the line they were rebuilt from, line 7
-// inside `take`, in the module that declares it (D15155, D15157). The last shape reaches the
-// instance through a generic.
-const INSTANCE_WITNESS = `type R = { m: {[string]: i32} }
-const mm: {[string]: i32} = Map()
-const u: R = { m: mm }
+// A refusal raised while a hole parameter's instance is lowered: the instance's body is rebuilt into
+// nodes minted after parsing, and the anchor is the line they were rebuilt from, line 7 inside
+// `take`, in the module that declares it (D15155, D15157). The refusal is the harness's own
+// (`--test-emit-refusal` refuses a call to `__vl_test_emit_refusal__`), so no capability fix can
+// move it. The last shape reaches the instance through a generic.
+const INSTANCE_WITNESS = `function __vl_test_emit_refusal__() {}
+const u = 5
 const two = 2
+const pad = 0
 function take(a) {
   print(1)
-  const n = a.m["zz"] as? i32
-  print(two)
+  __vl_test_emit_refusal__()
+  print(two + a + pad)
 }
 `;
-
 Deno.test({
   name:
     "vl-emit-diag-position: a refusal inside a parameter's instance names its body line, in its own module",
@@ -207,17 +207,18 @@ Deno.test({
         const r = await checkCodegen(
           s.main === null ? "lib.vl" : "main.vl",
           dir,
+          ["--test-emit-refusal"],
         );
-        if (!r.out.includes("emit error")) {
+        if (!r.out.includes("test-only refusal")) {
           throw new Error(
-            `${s.name}: the instance witness no longer reaches an emit refusal, so this guard ` +
-              `is measuring nothing — replace INSTANCE_WITNESS (D2467 closed?).\n${r.out}`,
+            `${s.name}: \`--test-emit-refusal\` no longer refuses the hook call, so this guard ` +
+              `is measuring nothing.\n${r.out}`,
           );
         }
         const blk = errorBlock(r.out);
-        if (!/at \S*lib\.vl:7:\d+/.test(blk)) {
+        if (!/at \S*lib\.vl:7:28\b/.test(blk)) {
           throw new Error(
-            `${s.name}: want the anchor at lib.vl:7 (the refused field read in \`take\`), got:\n${blk}`,
+            `${s.name}: want the anchor at lib.vl:7:28 (the hook call in \`take\`), got:\n${blk}`,
           );
         }
       } finally {
