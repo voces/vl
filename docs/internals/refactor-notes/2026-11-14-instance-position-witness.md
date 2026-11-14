@@ -1,6 +1,8 @@
 # A stable witness for the instance-position guard: a proposal, 2026-11-14
 
-Lane E, at the orchestrator's ask, while closing D3373. This note is a proposal only; no code.
+Lane E, at the orchestrator's ask, while closing D3373. This note is a proposal only; no code. The
+orchestrator approved it in principle, to be built as its own small PR after D3373, under the two
+conditions below.
 
 ## The problem
 
@@ -40,11 +42,16 @@ call and accepts it anywhere a statement is legal. The emitter refuses it with
 
 - **Stable.** It is no capability, so no fix closes it, and the guard measures only the anchoring.
 - **Exact.** The refusal is at a known node, so the test can assert the column as well as the line.
-- **Contained.** The double-underscore spelling matches the existing internal names
-  (`__memory_shared__`). It can be refused by the checker outside `tests/` and the probes if the
-  owner wants it unreachable from user code. A `std:` export is not needed.
-- **Cost.** One checker rung and one emitter rung. It is an emit refusal by design, so
-  `scripts/emit-refusal-sites.vl` and the scoreboard should exempt its literal.
+- **Cost.** One checker rung and one emitter rung.
+
+## The two conditions
+
+1. **No user program can reach it.** The name resolves only under a flag that the test harness
+   alone passes; anywhere else it is the ordinary `undeclared identifier`. It is not in `std:`, the
+   language docs, LSP completions or the playground.
+2. **It is never counted.** It is a refusal by construction, not a gap, so
+   `scripts/emit-refusal-sites.vl`, `scripts/capability-probes.vl` (`live-sites.json`) and
+   `scripts/goal-scoreboard.vl` exclude its literal.
 
 An alternative is a host hook: the native `vl` injects a refusal at a named function through an
 environment variable. It needs a host change and a compiler import, and the seed must load with no
