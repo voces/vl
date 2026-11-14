@@ -63,6 +63,9 @@ const CI_RUNS: Record<string, string[]> = {
   "late demands": [
     "vl run scripts/late-demands.vl --compiler build/vl-compiler.wasm -- --check --seed build/vl-compiler.wasm",
   ],
+  "phase state": [
+    "vl run scripts/phase-state-census.vl --compiler build/vl-compiler.wasm -- --check",
+  ],
   "no-python": ["vl run scripts/no-python.vl"],
   "kind-ladder sets": [
     "vl run scripts/ladder-sets.vl --compiler build/vl-compiler.wasm",

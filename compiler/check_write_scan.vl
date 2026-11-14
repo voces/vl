@@ -76,6 +76,53 @@ import { demangleName } from "./check_suggest"
 // A top-level function's name to its `FuncDecl` arena index, so a forward call can infer the
 // callee on demand and a call site here can name its callee. The checker fills and resets it.
 export let fnDeclIx: {[string]: i32} = Map()
+// Whether every write of `let` declaration `bd` is a statement of the block that declares it,
+// storing the name of a function declaration or a read of another `let`, and no function nested in
+// that frame names it: each read then follows one most recent write in straight-line order, and
+// none waits for a call.
+export function cwLetWritesStraight(bd: i32): boolean {
+  const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
+  if !(bn is LetDecl) || !cwWritesNamedFn(bn.letInit) { return false }
+  cwIxBuild()
+  if bd >= cwIxParent.length { return false }
+  const blk = cwIxParent[bd]
+  const fr = cwFrameOfDecl(bd)
+  const ow = cwOccWalk(bd)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] != CW_OCC_CALL && cwIxFr[r] != fr { return false }
+    // A read handed to a call is bound to the callee's parameter at the whole set (D16182).
+    const u = cwIxNode[r]
+    if (
+      cwIxKind[r] == CW_OCC_USE
+      && u >= 0
+      && u < cwIxUpKind.length
+      && cwIxUpKind[u] == CW_UP_ARG
+    ) {
+      return false
+    }
+    if cwIxKind[r] == CW_OCC_ASG {
+      const at = cwIxNode[r]
+      if at < 0 || at >= cwIxParent.length || cwIxParent[at] != blk {
+        return false
+      }
+      const an = nodeAt(at)
+      if an is BinExpr && !cwWritesNamedFn(an.binRight) { return false }
+    }
+  }
+  true
+}
+
+// Whether `v` is the name of a function declaration or a read of a `let`, which a narrowed read
+// names in turn; a parameter's value is neither.
+function cwWritesNamedFn(v: i32): boolean {
+  const p = cwPeel(v)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return false }
+  const d = identDeclOf(p)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if dn is FuncDecl { return true }
+  dn is LetDecl && dn.letKw == "let"
+}
 
 // The enclosing function frame of every arena node: a `FuncDecl` index, `CW_FR_MOD` at module
 // scope, `CW_FR_UNKNOWN` for a node no `Program` reaches. A frame says whether the walk reached a

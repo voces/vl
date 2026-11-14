@@ -843,6 +843,11 @@ the language are one artifact: this command is how an editor asks an installed
        vl seed --out <path>       {d}write to a file; prints nothing{r}
        vl seed --path             {d}print where the seed comes from: a
                                   filesystem path, or the literal `embedded`{r}
+       vl seed --cache-dir        {d}print the directory its compiled form is
+                                  cached in: $VL_SEED_CACHE_DIR, else seed/
+                                  under the user cache directory{r}
+       vl seed --cache-files      {d}print this seed's cached compiled forms,
+                                  one per engine configuration{r}
 
 {b}Flags:{r}
   {c}--out{r} <path>        Write the seed to <path> (parent dirs are created)
@@ -2045,41 +2050,31 @@ fn seed_content_key(bytes: &[u8]) -> String {
     format!("{acc:016x}")
 }
 
-/// Delete the on-disk seed's sidecars that belong to a DIFFERENT seed (and the
-/// mtime-era `<seed>.<tag>.cwasm` names, which belong to no key at all).
-///
-/// Content keys mean a new seed lands at a new path instead of overwriting, so
-/// without this every rebuild would leave ~16 MB per engine tag behind for ever. Ours
-/// is every name under `<seed>.<our key>.`, which is one file per engine tag —
-/// they are worth exactly as long as the seed is, so they retire as a unit.
-/// Best-effort: a read-only directory is not an error, just a cache that does not
-/// shrink.
-fn prune_seed_sidecars(compiler_path: &str, ours: &std::path::Path) {
-    let path = std::path::Path::new(compiler_path);
-    let (Some(dir), Some(stem)) = (path.parent(), path.file_name()) else {
-        return;
+/// The on-disk seed's compilation cache directory: `$VL_SEED_CACHE_DIR`, else `seed/` under
+/// the user cache root. Never beside the seed: a checkout the user cloned could ship a
+/// sidecar there, and a sidecar is native code. Both levels must pass `private_cache_dir`; a
+/// directory that fails runs the seed uncached, with one line saying why. Separate from the
+/// root so a test's private `$VL_CACHE_DIR` (the module cache) still shares one warm seed.
+fn seed_cache_dir() -> Option<std::path::PathBuf> {
+    let var = std::env::var_os("VL_SEED_CACHE_DIR").filter(|v| !v.is_empty());
+    let (dirs, dir) = match var {
+        Some(d) => {
+            let d = std::path::PathBuf::from(d);
+            (vec![d.clone()], d)
+        }
+        None => {
+            let root = user_cache_root()?;
+            let d = root.join("seed");
+            (vec![root, d.clone()], d)
+        }
     };
-    let keep = match ours.file_name().and_then(|n| n.to_str()) {
-        Some(n) => match n.rfind('.').and_then(|i| n[..i].rfind('.')) {
-            Some(i) => n[..i + 1].to_string(), // `<stem>.<key>.`
-            None => return,
-        },
-        None => return,
-    };
-    let prefix = format!("{}.", stem.to_string_lossy());
-    let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() {
-        std::path::Path::new(".")
-    } else {
-        dir
-    }) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with(".cwasm") && !name.starts_with(&keep) {
-            let _ = std::fs::remove_file(e.path());
+    for d in &dirs {
+        if let Err(why) = private_cache_dir(d) {
+            eprintln!("vl: not caching the compiler in `{}`: {why}", d.display());
+            return None;
         }
     }
+    Some(dir)
 }
 
 /// Where the EMBEDDED seed's compilation cache lives — the sidecar's counterpart for
@@ -2119,7 +2114,7 @@ fn seed_cache_path_impl(tag: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     let ours = dir.join(format!("seed-{}-{tag}.cwasm", env!("VL_SEED_KEY")));
-    prune_seed_cache(&dir, &ours);
+    prune_seed_cache(&dir, &ours, 3);
     Some(ours)
 }
 
@@ -2180,7 +2175,6 @@ fn private_cache_dir(dir: &std::path::Path) -> std::result::Result<(), &'static 
 /// name. One seed owns one entry per engine configuration, and they are worth exactly
 /// as long as the seed is, so pruning treats them as a unit. A name carrying no tag is
 /// its own group.
-#[cfg(feature = "embed-seed")]
 fn seed_group_key(path: &std::path::Path) -> Option<String> {
     let name = path.file_name()?.to_string_lossy().into_owned();
     let stem = name.strip_prefix("seed-")?.strip_suffix(".cwasm")?;
@@ -2195,19 +2189,17 @@ fn seed_group_key(path: &std::path::Path) -> Option<String> {
 /// new seed adds a group (~9 MB per engine configuration in it) and nothing retires
 /// the old ones — an upgrade treadmill would grow the user's cache dir without limit.
 ///
-/// Policy: keep the `KEEP` most-recently-written SEEDS plus our own, delete the rest.
+/// Policy: keep the `keep` most-recently-written SEEDS plus our own, delete the rest.
 /// Seeds rather than files, because one seed legitimately owns several files (one per
 /// engine configuration) and a file count would let a two-configuration workload evict
 /// a live seed on every other run — reinstating the recompile the per-configuration
 /// keying exists to remove. A COUNT rather than an age, because an entry in daily use
 /// is only ever READ — its mtime stays as old as the day it was written, so any age
-/// rule would evict exactly the entries that are working. `KEEP > 1` so a dev checkout
+/// rule would evict exactly the entries that are working. `keep > 1` so a dev checkout
 /// and a released `vl` sharing a cache dir do not evict each other on alternate runs.
 /// Evicting a live entry is survivable regardless — the next run recompiles and
 /// republishes it — which is why every step here is best-effort and silent.
-#[cfg(feature = "embed-seed")]
-fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path) {
-    const KEEP: usize = 3;
+fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -2229,7 +2221,7 @@ fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path) {
             None => seeds.push((key, mtime, vec![path])),
         }
     }
-    if seeds.len() <= KEEP {
+    if seeds.len() <= keep {
         return;
     }
     // Our own seed survives whatever its mtime says: `ours` has not been written yet
@@ -2237,7 +2229,7 @@ fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path) {
     // engine configurations of the very seed this process is about to use.
     let ours_key = seed_group_key(ours);
     seeds.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
-    for (key, _, files) in seeds.into_iter().skip(KEEP) {
+    for (key, _, files) in seeds.into_iter().skip(keep) {
         if Some(&key) == ours_key.as_ref() {
             continue;
         }
@@ -2353,6 +2345,36 @@ fn seed_cmd(rest: &[String]) -> Result<()> {
         .and_then(|i| rest.get(i + 1))
         .cloned();
     let source = resolve_compiler(explicit);
+    if rest.iter().any(|a| a == "--cache-files") {
+        // This seed's compiled forms, one per engine configuration, for a script to pack.
+        let (Some(dir), CompilerSource::Path(p)) = (seed_cache_dir(), &source) else {
+            return Ok(());
+        };
+        let key = seed_identity(p)
+            .map_err(|e| Error::from(e).context(format!("reading seed `{p}`")))?
+            .key;
+        let prefix = format!("seed-{key}-");
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(&prefix) && n.ends_with(".cwasm"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        for f in files {
+            println!("{}", dir.join(f).display());
+        }
+        return Ok(());
+    }
+    if rest.iter().any(|a| a == "--cache-dir") {
+        match seed_cache_dir() {
+            Some(d) => println!("{}", d.display()),
+            None => bail!("no usable seed cache directory (set $VL_SEED_CACHE_DIR, or $HOME)"),
+        }
+        return Ok(());
+    }
     if rest.iter().any(|a| a == "--path") {
         match &source {
             CompilerSource::Path(p) => println!("{p}"),
@@ -2550,14 +2572,10 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
                     .map_err(|e| e.context("loading the embedded compiler seed"))
             })?
         }
-        // On-disk seed: the sidecar sits next to it and is CONTENT-KEYED, exactly as
-        // the embedded path above — `<seed>.<seed key>.<engine tag>.cwasm`. It used to
-        // be keyed by mtime, which made every byte-identical rewrite of the seed a full
-        // Cranelift recompile: a `cp` between worktrees, a `fetch-seed.sh`, a CI cache
-        // restore. Content keys have no freshness question to ask (different bytes ⇒
-        // different file), so those all HIT, and two seeds can be alternated without
-        // evicting each other. The key comes from `seed_identity`, so a warm run reads
-        // the seed's stat memo instead of the seed; the bytes are read only to compile.
+        // On-disk seed: CONTENT-KEYED like the embedded one, `seed-<seed key>-<engine
+        // tag>.cwasm` in `seed_cache_dir`, so a copy of the seed anywhere hits and two seeds
+        // alternate without evicting each other. The key comes from `seed_identity`, so a
+        // warm run reads the seed's stat memo instead of the seed.
         CompilerSource::Path(compiler_path) => {
             let loading = || {
                 format!(
@@ -2566,25 +2584,12 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
             };
             let ids =
                 seed_identity(compiler_path).map_err(|e| Error::from(e).context(loading()))?;
-            let sidecar =
-                std::path::PathBuf::from(format!("{compiler_path}.{}.{tag}.cwasm", ids.key));
-            // The user-module cache's directory check: a seed directory another user owns or
-            // can write runs uncached, loudly, since a file planted there would be run.
-            let dir = match sidecar.parent() {
-                Some(d) if !d.as_os_str().is_empty() => d,
-                _ => std::path::Path::new("."),
-            };
-            let trusted = match private_cache_dir(dir) {
-                Ok(()) => true,
-                Err(why) => {
-                    eprintln!(
-                        "vl: not caching the compiler beside `{compiler_path}`: its directory is {why}"
-                    );
-                    false
-                }
-            };
-            let hit = trusted && sidecar.exists();
-            let cache = trusted.then_some(sidecar.as_path());
+            let dir = seed_cache_dir();
+            let sidecar = dir
+                .as_ref()
+                .map(|d| d.join(format!("seed-{}-{tag}.cwasm", ids.key)));
+            let hit = sidecar.as_ref().is_some_and(|p| p.exists());
+            let cache = sidecar.as_deref();
             let module = cached_module(engine, cache, hit, || {
                 let bytes =
                     seed_bytes(compiler_path).map_err(|e| Error::from(e).context(loading()))?;
@@ -2605,8 +2610,10 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
             // Only after a MISS — the one invocation that just published a new key, and
             // so the only one that can have orphaned an old seed's entries. Keeping it
             // off the hit path keeps the warm case at zero directory reads.
-            if trusted && !hit {
-                prune_seed_sidecars(compiler_path, &sidecar);
+            if let (Some(d), Some(p), false) = (dir.as_ref(), sidecar.as_ref(), hit) {
+                // More than the embedded cache keeps: a development box alternates seeds
+                // (worktrees, a baseline beside a candidate), and an eviction costs seconds.
+                prune_seed_cache(d, p, 8);
             }
             module
         }
@@ -2633,9 +2640,10 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
 ///
 /// SAFETY of `deserialize_file`: a forged or corrupt artifact is native code execution or UB,
 /// and nothing here reads the bytes before wasmtime does (a full digest would cost every warm
-/// run more than the run itself; DECISIONS.md, "The seed sidecar is trusted by its directory").
-/// The caller's `private_cache_dir` rules out another user's file. It does NOT rule out one
-/// this user put there: a sidecar committed to a checkout the user cloned is loaded and run.
+/// run more than the run itself). Every `cache` a caller passes is a file this binary wrote in
+/// a directory `private_cache_dir` vouched for (`seed_cache_dir`, the embedded seed's cache
+/// root), never a path inside a checkout, so no repository can ship one. DECISIONS.md, "The
+/// seed sidecar lives only in the user's private cache".
 fn cached_module(
     engine: &Engine,
     cache: Option<&std::path::Path>,

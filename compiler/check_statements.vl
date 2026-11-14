@@ -5,6 +5,7 @@ import { noteOpenUnionRows } from "./check_hole_links"
 import { openMemberRows } from "./check_leaf_steps"
 import { gnotRecordBase } from "./check_hole_pins"
 import { strListHas, strListIndexOf } from "./listutil"
+import { exprIsCollCtorCall } from "./check_list_origin"
 import {
   nodeTyIx,
   nodeTyIxOf,
@@ -244,6 +245,7 @@ import {
   defaultReadOnlyContainer,
   elemFactFor,
   elemOnlyKeyOf,
+  letFnWriteRow,
   letUnionWriteNarrows,
   lpPopResult,
   narConvListDelivery,
@@ -324,6 +326,7 @@ import {
   declareDecl,
   identFnAliasOf,
   identFnDeclOf,
+  slotTyAt,
 } from "./check_scopes"
 import {
   deadArmNote,
@@ -342,6 +345,7 @@ import {
   TY_ERR,
   TY_I32,
   TY_NEVER,
+  TY_OPEN,
   TY_VOID,
   TyArray,
   TyErr,
@@ -566,6 +570,38 @@ function letDeclMarkLitBindings(n: LetDecl, ix: i32, bound: i32) {
   0
 }
 
+// The container the hoist declared module binding `ix` at, where its initializer is a `[]`,
+// `Map()` or `Set()` and both are still open: a body declared above the binding reads the
+// hoisted one, so the binding keeps it, and later top-level pins reach that body (D16364).
+function letHoistedOpenCtn(ix: i32, init: i32, initTy: i32): i32 {
+  const lit = parenPeelIx(init)
+  if lit < 0 || lit >= P.nodes.length { return initTy }
+  if !(nodeAt(lit) is ArrayLit) && !exprIsCollCtorCall(lit) { return initTy }
+  const h = slotTyAt(ix, 0)
+  if (
+    h < 0
+    || initTy < 0
+    || h == initTy
+    || h >= T.tys.length
+    || initTy >= T.tys.length
+  ) {
+    return initTy
+  }
+  const a = tyAt(h)
+  const b = tyAt(initTy)
+  const openList = b is TyArray && a is TyArray && a.aElem < 0 && b.aElem < 0
+  const openMap = b is TyMap
+    && a is TyMap
+    && a.mSet == b.mSet
+    && a.mKey < 0
+    && a.mVal < 0
+    && b.mKey < 0
+    && b.mVal < 0
+  if !openList && !openMap { return initTy }
+  nodeTySet(lit, h)
+  h
+}
+
 export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   if curFnDeclIx >= 0 { letDeclFnPut(ix, curFnDeclIx) }
   if n.letInit >= 0 {
@@ -598,6 +634,9 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     initTy = checkNodeHook(n.letInit)
   }
   if keptJoin >= 0 && initTy >= 0 { initTy = keptJoin }
+  if annot < 0 && T.frames.length == 1 && (moduleGlobals[n.letName] ?? false) {
+    initTy = letHoistedOpenCtn(ix, n.letInit, initTy)
+  }
   initTy = letDeclInitVerdicts(n, ix, annot, initTy, seedMark)
   let bound = TY_ERR
   if annot >= 0 {
@@ -721,6 +760,8 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     noteNarShadow(ix, NAR_KIND_ASG)
     narLayerNote(ix, T.frames.length - 1, initTy)
   }
+  // A function `let` re-pointed later reads its initialiser's function until the first write.
+  if annot < 0 { letFnWriteRow(ix, bound, n.letInit, initTy) }
   if recAdOrigDecl.length > 0 && (recAdPinned[ix] ?? false) {
     recAdBound.push(bound)
   }
@@ -870,7 +911,7 @@ function letDeclInferredBound(n: LetDecl, ix: i32, initTy: i32): i32 {
   // A-infer-null: an un-annotated `let x = null` binds a nullable with an open inner hole;
   // the first non-null assignment fills it in place (the `=` arm), so `x` becomes `T | null`.
   if isNullTy(initTy) {
-    bound = mkNullableTy(-1)
+    bound = mkNullableTy(TY_OPEN)
     // ...and record the hole, so scope close can say whether anything ever filled it. A
     // hole nothing fills is the `null` type and has a rep (D1576).
     noteNullHole(bound, ix)
@@ -2060,7 +2101,9 @@ function letFnLambdaParamTys(m: i32): i32[] {
     const at = if pn is Param { pn.parType } else { -1 }
     if at >= 0 {
       const tn = nodeAt(at)
-      if tn is TypeRef { t = resolveAnnotAt(tn.tyName, d.fnTyParams, at, "") }
+      if tn is TypeRef {
+        t = resolveAnnotAt(tn.tyName, d.fnTyParams, at, "", m)
+      }
     }
     if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyReachesHole(t, 8) {
       inferQuiet = savedQuiet

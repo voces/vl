@@ -24,7 +24,7 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, ROOT, SEED_CACHE, VL, exists, nativeEnv, privateSeedCache } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -136,12 +136,12 @@ const seedContentKey = (bytes: Uint8Array): string => {
   return acc.toString(16).padStart(16, "0");
 };
 
-/** `[path, engine tag]` of each `<seed>.<key>.<tag>.cwasm` sidecar beside `seed`. */
-const cwasmSidecars = (seed: string, key: string): [string, string][] => {
-  const dir = seed.replace(/\/[^/]*$/, ""), stem = `${seed.slice(dir.length + 1)}.${key}.`;
-  return [...Deno.readDirSync(dir)].map((e) => e.name)
+/** `[path, engine tag]` of each `seed-<key>-<tag>.cwasm` entry in the seed cache. */
+const cwasmSidecars = (key: string): [string, string][] => {
+  const stem = `seed-${key}-`;
+  return [...Deno.readDirSync(SEED_CACHE)].map((e) => e.name)
     .filter((n) => n.startsWith(stem) && n.endsWith(".cwasm"))
-    .map((n) => [`${dir}/${n}`, n.slice(stem.length, -".cwasm".length)]);
+    .map((n) => [`${SEED_CACHE}/${n}`, n.slice(stem.length, -".cwasm".length)]);
 };
 
 const test = (name: string, fn: () => Promise<void>) =>
@@ -239,20 +239,14 @@ test("the token after -o is still a flag: `-o --names` and `-o --initial-memory=
 });
 
 test("the seed's bytes are keyed, not its path", async () => {
-  // The seed is copied with its Cranelift sidecars (content-keyed, so they still apply),
+  // The seed is copied (its compiled forms are keyed by content, so they still apply),
   // and then overwritten in place: the path and every variable stay the same. The lookup
   // runs before the seed loads, so a seed that cannot load still shows the miss.
   const { tmp, p } = await setup();
   try {
     const seed = `${tmp}/seed.wasm`;
     await Deno.copyFile(COMPILER, seed);
-    const dir = COMPILER.replace(/\/[^/]*$/, ""), base = COMPILER.slice(dir.length + 1);
-    for (const e of Deno.readDirSync(dir)) {
-      if (e.name.startsWith(`${base}.`) && e.name.endsWith(".cwasm")) {
-        await Deno.copyFile(`${dir}/${e.name}`, `${tmp}/seed.wasm${e.name.slice(base.length)}`);
-      }
-    }
-    const env = { VL_COMPILER_WASM: seed };
+    const env = { VL_COMPILER_WASM: seed, VL_SEED_CACHE_DIR: privateSeedCache(`${tmp}/seed-cache`) };
     expect((await vl(BUILD, p, env)).trace, ["miss", "stored"], "cold");
     expect((await vl(BUILD, p, env)).trace, ["hit"], "warm");
     await Deno.writeFile(seed, new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]));
@@ -547,6 +541,7 @@ testOpt("-O3: each chain input misses; -o without --source-map does not", async 
 
 testOpt("-O3: the seed is a chain input, since its optPipeStart reads the rung's input", async () => {
   const { tmp, p } = await setup();
+  let ported: string[][] = [];
   try {
     // The same compiler with one empty custom section appended: every emitted byte is the
     // same, so only the seed's own key can make the chain miss.
@@ -555,12 +550,13 @@ testOpt("-O3: the seed is a chain input, since its optPipeStart reads the rung's
     await Deno.writeFile(seed, seedBytes);
     // `--compiler`, not `$VL_COMPILER_WASM`: a `VL_*` variable is keyed on its own.
     const a = await vl(["build", "main.vl", "-O3", "-o", "a.wasm", "--compiler", COMPILER], p);
-    // The section changes no code, so COMPILER's compiled sidecars serve the new seed under
+    // The section changes no code, so COMPILER's compiled forms serve the new seed under
     // its own key, and the host skips a whole-seed Cranelift compile.
-    const sidecars = cwasmSidecars(COMPILER, seedContentKey(await Deno.readFile(COMPILER)));
+    const sidecars = cwasmSidecars(seedContentKey(await Deno.readFile(COMPILER)));
     expect(sidecars.length > 0, true, "the ported seed key names COMPILER's own sidecar");
     const key = seedContentKey(seedBytes);
-    for (const [path, tag] of sidecars) await Deno.copyFile(path, `${seed}.${key}.${tag}.cwasm`);
+    ported = sidecars.map(([path, tag]) => [path, `${SEED_CACHE}/seed-${key}-${tag}.cwasm`]);
+    for (const [from, to] of ported) await Deno.copyFile(from, to);
     const b = await vl(["build", "main.vl", "-O3", "-o", "b.wasm", "--compiler", seed], p);
     expect(
       [a.code, optTrace(a.trace), b.code, optTrace(b.trace)],
@@ -569,6 +565,7 @@ testOpt("-O3: the seed is a chain input, since its optPipeStart reads the rung's
     );
     expect(await Deno.readFile(`${p}/b.wasm`), await Deno.readFile(`${p}/a.wasm`), "same module");
   } finally {
+    for (const [, to] of ported) await Deno.remove(to).catch(() => {});
     await Deno.remove(tmp, { recursive: true });
   }
 });
@@ -598,6 +595,7 @@ testOpt("-O3: an explain variable bypasses the chain, stores nothing", async () 
 // never stores, and the rep-shadow, check-stats and keep-modules paths, which are bypasses).
 // A new export or command joins this table only by someone deciding which it is.
 const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
+  asgNegCount: "uncached",
   checkEntryPathCommit: "input", checkEntryPathPush: "input", cliArgCommit: "input",
   cliArgPush: "input", cliArgReset: "input", cliCheckNextRoot: "input",
   cliCheckParentOf: "input", cliCheckPoolStage: "input", cliCheckPooledCommit: "input",

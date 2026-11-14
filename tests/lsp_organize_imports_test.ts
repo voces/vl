@@ -15,6 +15,7 @@
 import { filePath } from "./support/filePath.ts";
 import { organizeImportEdits } from "../lsp/src/typeFeatures.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 type LspPosition = { line: number; character: number };
 type LspRange = { start: LspPosition; end: LspPosition };
@@ -231,14 +232,7 @@ Deno.test("organize: side-effect and empty-brace imports are never touched", () 
 // ---- seed-backed: the real lint + the real formatter -------------------------
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 
 Deno.test({

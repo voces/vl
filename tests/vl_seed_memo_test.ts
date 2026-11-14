@@ -7,9 +7,9 @@
 //      read, refused loudly, and deleted, so the next run recovers.
 //   4. A memo whose stat does not match is ignored, and rewritten from the bytes.
 //
-// The seed is COPIED (a hard link would move the real seed's ctime) and its sidecars are
-// symlinked, so no case compiles the seed. DECISIONS.md, "The seed's identity is memoised
-// by its stat".
+// The seed is COPIED (a hard link would move the real seed's ctime); its sidecars live in the
+// seed cache keyed by content, so the copy shares them and no case compiles the seed.
+// DECISIONS.md, "The seed's identity is memoised by its stat".
 //
 // The `vl_` prefix puts this in `ci-native` (tests/ci_seed_coverage_test.ts). Gated on
 // `SELFHOST_NATIVE_ALIGN=1` plus a built binary and seed; the memo is Unix only.
@@ -59,12 +59,6 @@ Deno.test({
     try {
       const bytes = await Deno.readFile(COMPILER);
       await Deno.writeFile(`${dir}/seed.wasm`, bytes);
-      const seedDir = COMPILER.replace(/\/[^/]*$/, ""), stem = COMPILER.slice(seedDir.length + 1);
-      const sidecars = [...Deno.readDirSync(seedDir)].map((e) => e.name)
-        .filter((n) => n.startsWith(`${stem}.`) && n.endsWith(".cwasm"));
-      for (const n of sidecars) {
-        await Deno.symlink(`${seedDir}/${n}`, `${dir}/seed.wasm.${n.slice(stem.length + 1)}`);
-      }
       await Deno.writeTextFile(`${dir}/main.vl`, "print(1 + 2)\n");
 
       const fresh = await check(dir);
@@ -81,10 +75,16 @@ Deno.test({
         "2: a settled seed gets a memo of its stat and SHA-256",
       );
       const key = m![8];
+      const listed = new TextDecoder().decode((await new Deno.Command(VL, {
+        args: ["seed", "--cache-files", "--compiler", `${dir}/seed.wasm`],
+        stdout: "piped",
+        stderr: "piped",
+        env: nativeEnv(),
+      }).output()).stdout).trim().split("\n");
       expect(
-        sidecars.some((n) => n.startsWith(`${stem}.${key}.`)),
+        listed.some((p) => p.includes(`/seed-${key}-`)),
         true,
-        `2: the memo's key ${key} names the seed's sidecars`,
+        `2: the memo's key ${key} names the seed's entries in the seed cache`,
       );
 
       const forged = [...m!];

@@ -128,7 +128,7 @@ import {
   voidStoreRefuse,
 } from "./check_relate_core"
 import { identConstDeclOf } from "./check_scopes"
-import { joinClashMsgSet, mkTyVarOwned } from "./check_subst"
+import { joinClashMsgSet, mkTyVarSlot } from "./check_subst"
 import { fvaFnMayDiffer } from "./check_ty_relate"
 import { flatScalarWidth, mapKeyTySupported } from "./check_ty_rep"
 import { flatFieldTyOf, recNeverFits } from "./check_type_shape"
@@ -137,9 +137,11 @@ import {
   TY_BOOL,
   TY_ERR,
   TY_NEVER,
+  TY_NULL,
   TyArray,
   TyFunc,
   TyMap,
+  TyNullable,
   TyObj,
   TyUnion,
   cUserTypes,
@@ -153,7 +155,7 @@ import {
   tyToStr,
   tyToStrUser,
   tyToTs,
-  tyVarDeclOwnerSet,
+  tyVarOwner,
 } from "./check_types"
 import { identDeclOf, sidNoteNodeName } from "./symbols"
 import {
@@ -481,7 +483,7 @@ export function collCtorTyArgsTy(ctor: string, ix: i32) {
 }
 
 export function resolveAnnot(name: string, typarams: string[]) {
-  resolveAnnotTs(name, typarams, -1, "")
+  resolveAnnotTs(name, typarams, -1, "", -1)
 }
 
 // `resolveAnnot`, with the annotation's spelling root threaded to the three legs that
@@ -493,6 +495,7 @@ function resolveAnnotTs(
   typarams: string[],
   root: i32,
   owner: string,
+  binder: i32,
 ) {
   if typarams.length == 0 {
     if tpEnvNames.length == 0 {
@@ -535,8 +538,9 @@ function resolveAnnotTs(
   let i = 0
   while i < typarams.length {
     tpEnvNames.push(typarams[i])
-    tpEnvTys.push(mkTyVarOwned(typarams[i], owner))
-    if owner != "" { tyVarDeclOwnerSet(tpEnvTys[tpEnvTys.length - 1], owner) }
+    const tv = mkTyVarSlot("param", binder, i, typarams[i])
+    tyVarOwner[tv] = owner
+    tpEnvTys.push(tv)
     i = i + 1
   }
   const r = annotResolve(name, root)
@@ -556,9 +560,10 @@ export function resolveRetAnnotAt(
   typarams: string[],
   at: i32,
   owner: string,
+  binder: i32,
 ) {
   if spellsNever(name) { return TY_NEVER }
-  resolveAnnotAt(name, typarams, at, owner)
+  resolveAnnotAt(name, typarams, at, owner, binder)
 }
 
 // `resolveAnnot` with resolution diagnostics anchored at node `at` (the
@@ -568,12 +573,13 @@ export function resolveAnnotAt(
   typarams: string[],
   at: i32,
   owner: string,
+  binder: i32,
 ) {
   const minted = mintedAnnTy(at)
   if minted >= 0 { return minted }
   const saved = annotDiagAt
   annotDiagAtSet(at)
-  const r = resolveAnnotTs(name, typarams, annTsOf(at), owner)
+  const r = resolveAnnotTs(name, typarams, annTsOf(at), owner, binder)
   annotDiagAtSet(saved)
   if name.length > 0 && name.slice(0, 1) == "{" { recAnnObjs.push(r) }
   // A container of vectors named by an annotation alone (a param, a field of a struct only
@@ -899,13 +905,16 @@ export function recPartFitArm(objTy: i32, chkTy: i32): i32 {
     return -1
   }
   const ct = tyAt(chkTy)
-  if !(ct is TyObj) || !(tyAt(objTy) is TyUnion) { return -1 }
+  const ot = tyAt(objTy)
+  if !(ct is TyObj) || !(ot is TyUnion || ot is TyNullable) { return -1 }
   const ms: i32[] = []
   flattenVariantsInto(objTy, ms)
   let arm = -1
   for m in ms {
     const f = tyTestMemberFit(m, chkTy)
     const mo = tyAt(m)
+    // A `null` member never fits a record.
+    if m == TY_NULL { continue }
     if !(mo is TyObj) { return -1 }
     if f == TT_PARTLY {
       if arm >= 0 { return -1 }
@@ -921,7 +930,7 @@ export function recPartFitArm(objTy: i32, chkTy: i32): i32 {
 }
 
 // `v is t`, minted at `site`, banked at `t`.
-function luTyTest(v: i32, t: i32, site: i32, pos: i32): i32 {
+export function luTyTest(v: i32, t: i32, site: i32, pos: i32): i32 {
   const root = luTs(t)
   const test = luAt(mkIsExpr(v, tsToName(root), pos), site)
   setAnnTs(test, root)
