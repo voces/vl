@@ -11,3 +11,7 @@
   (partly closed) now lead with what is still open. `--status open` falls from 273 to 237. The new
   guard in `tests/vl_inventory_rows_test.ts` refuses a row whose first clause reads open while a
   later clause starts with a settled word, and a negated clause (`not closed`) is exempt.
+- **D16064 filed: D13966's open half now has a row of its own.** A call through a `let`
+  re-pointed between functions whose results differ is still refused at check, though a list
+  element holding the same two now dispatches. D13966 leads with its closed clause-1 trap and names
+  D16064 as residue.
