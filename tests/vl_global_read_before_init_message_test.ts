@@ -40,12 +40,32 @@ const runCase = async (
 // the program would have printed from the zero default reaches the output.
 const CASES: [string, string][] = [
   [
-    "closures/shared-let-without-zero-value-read-early-traps.vl",
+    "closures/shared-let-read-early-traps-record.vl",
     "`p` read before it is assigned\n",
   ],
   [
-    "closures/shared-fn-let-called-early-traps.vl",
+    "closures/shared-let-read-early-traps-function.vl",
     "`f` read before it is assigned\n",
+  ],
+  [
+    "closures/shared-let-read-early-traps-union.vl",
+    "`u` read before it is assigned\n",
+  ],
+  [
+    "closures/shared-let-read-early-traps-value-union.vl",
+    "`u` read before it is assigned\n",
+  ],
+  [
+    "closures/shared-let-read-early-traps-list.vl",
+    "`u` read before it is assigned\n",
+  ],
+  [
+    "closures/shared-let-read-early-traps-map.vl",
+    "`u` read before it is assigned\n",
+  ],
+  [
+    "closures/shared-let-read-early-traps-nullable.vl",
+    "`u` read before it is assigned\n",
   ],
   [
     "globals/read-before-init-scalar-traps.vl",
