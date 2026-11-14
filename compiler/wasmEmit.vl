@@ -16250,16 +16250,38 @@ function emitMapSetV(
     }
   }
   cmSlot = mslot // re-pin: inner map ops in the value expr clobber it
+  // A set whose value the assignment yields keeps it in the value stash.
+  const park = asgParkWanted && !valConst1 && !msHelp
   // [mapRef, key, value] are the shape's store helper's params, in order.
   const setFn = mapSetFnOf(mslot)
   if setFn >= 0 {
+    if park { fbLocalTee(mapSetValStashLocal(mslot)) }
     fbCall(setFn)
+    if park { mapSetParked(mslot) }
     return 0
   }
   if setMapSetValStash(body, mslot) < 0 { return -1 }
   fbLocalSet(cmKeyLocal()) // the target key (popped off the stack)
   setMapRef(body)          // mapRef
-  emitMapSetStore(body, mslot)
+  const stRc = emitMapSetStore(body, mslot)
+  if park { mapSetParked(mslot) }
+  stRc
+}
+
+// The local a set's value stash is, outside a store helper: an mv slot's own, else the map
+// frame's slot 14.
+function mapSetValStashLocal(mslot: i32): i32 {
+  if mslot >= 0 { return fnMvValStashLocal(mslot) }
+  mapScratchBase + 14
+}
+
+// Records the set's value stash as the parked value of the assignment that asked for it; an mv
+// slot's stash is a nullable reference unless its values are scalars.
+function mapSetParked(mslot: i32) {
+  asgParkedSlot = mapSetValStashLocal(mslot)
+  asgParkedRef = mslot >= 0 && mvScalarValKind(mslot) == null
+  mapSetDidPark = true
+  0
 }
 
 // The function a set over map shape `sh` calls: its row's store helper, given the next functype
@@ -28328,6 +28350,8 @@ let asgParkWanted = false
 // The target node of the assignment whose store parked into `asgParkedSlot`: a nested write runs
 // its own store inside the right-hand side, so a read checks the park is its own.
 let asgParkedOwner = -1
+// Whether the last map set parked its value, so the index store that ran it owns the park.
+let mapSetDidPark = false
 
 // `emitAssignUnder`'s arm over an index target `xs[i] = v`: a map store or a list element
 // store. Returns 0 lowered, -1 failed.
@@ -28338,7 +28362,17 @@ function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
   // append `keys.push(k); vals.push(v)`. Checked BEFORE the list path (a map index
   // is not an array index).
   if exprMap(target.idxArr, fnIx) {
-    return emitMapSet(body, target.idxArr, target.idxIndex, a.binRight, fnIx)
+    mapSetDidPark = false
+    const msRc = emitMapSet(
+      body,
+      target.idxArr,
+      target.idxIndex,
+      a.binRight,
+      fnIx,
+    )
+    if mapSetDidPark { asgParkedOwner = a.binLeft }
+    mapSetDidPark = false
+    return msRc
   }
   // indexed store `a[i] = v`: evaluate the wrapper + index, guard `i u< len` and
   // unwrap to the backing, then the value, then `array.set`. A ref list stores a
@@ -38947,7 +38981,9 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       if pOp >= 0 { wU8(pOp) }
       return 0
     }
-    return emitFail(asgValueRefusal(exprIx, fnIx))
+    return emitFail(
+      "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",
+    )
   }
   // G8: nullish-coalescing `m[k] ?? d` — a FUSED map get-with-default: scan `m` for
   // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
@@ -42504,20 +42540,6 @@ function litSetHasValueAtom(m: i32): boolean {
   false
 }
 
-// Why the write at `asgIx` has no value lowering, the case named.
-function asgValueRefusal(asgIx: i32, fnIx: i32): string {
-  const a = nodeAt(asgIx)
-  if a is BinExpr {
-    const t = nodeAt(unwrapParen(a.binLeft))
-    if t is Index {
-      if exprMap(t.idxArr, fnIx) {
-        return "emitProgram: a map entry write used as a value has no value lowering"
-      }
-    }
-  }
-  "emitProgram: an assignment used as a value whose type is not its target's has no value lowering"
-}
-
 // Whether the write at `asgIx` stores into a byte list, which keeps only the value's low byte.
 function asgIsByteElem(asgIx: i32, fnIx: i32): boolean {
   const a = nodeAt(asgIx)
@@ -42532,11 +42554,11 @@ function asgYieldsParkedCell(asgIx: i32, fnIx: i32): boolean {
   const a = nodeAt(asgIx)
   if !(a is BinExpr) || a.binOp != "=" { return false }
   const t = nodeAt(unwrapParen(a.binLeft))
+  if !(t is Index) && !(t is Member) { return false }
+  // A map entry is stored at the map's value type; a read of it is that or null.
+  let tt = nodeTyAt(a.binLeft, fnIx)
   if t is Index {
-    if exprMap(t.idxArr, fnIx) { return false }
-  } else if !(t is Member) {
-    return false
+    if exprMap(t.idxArr, fnIx) { tt = tyMapValOf(mapRecvTyIn(t.idxArr, fnIx)) }
   }
-  const tt = nodeTyAt(a.binLeft, fnIx)
   tt >= 0 && tySame(tt, nodeTyAt(asgIx, fnIx))
 }
