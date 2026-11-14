@@ -66,3 +66,17 @@ Deno.test("oracle: verdicts", () => {
   ];
   for (const [got, want] of cases) if (got !== want) throw new Error(`verdict: want ${want}, got ${got}`);
 });
+
+// Programs the oracle once got wrong, with the stdout the compiler and the spec agree on.
+Deno.test("oracle: pinned regressions", () => {
+  const pins: [string, string][] = [
+    ["print((-2147483648) - 0x7fffffff)", "1"], // a radix tree at i32: `-2147483648` is an i32 literal
+    ["print(7 + 0xFFFFFFFF)", "6"],
+    ["print(0x1_0000_0000)", "4294967296"],
+    ["print(0.1 + 0.2)", "0.3"],
+  ];
+  for (const [src, want] of pins) {
+    const o = interpret(src + "\n");
+    if (o.kind !== "ok" || o.out.join("\n") !== want) throw new Error(`${src}: want ${want}, got ${o.kind} ${JSON.stringify(o.out)} ${o.msg}`);
+  }
+});

@@ -836,7 +836,7 @@ export class Interp {
         const v = this.eval(e.e, env, exp);
         if (e.op === "!") return !this.asBool(v, "operand of !");
         if (e.op === "-") {
-          if (v instanceof Lit && v.i !== null) { const n = new Lit(-v.i, null, v.radix); n.wideDec = v.wideDec || -v.i < BigInt(I32_MIN); return n; }
+          if (v instanceof Lit && v.i !== null) { const n = new Lit(-v.i, null, v.radix); n.wideDec = e.e.k === "int" ? !v.radix && (-v.i < BigInt(I32_MIN) || -v.i > BigInt(I32_MAX)) : v.wideDec; return n; } // `-2147483648` is an i32 literal (T2.1), the minus folded in
           if (v instanceof Lit) return v.i !== null ? new Lit(-v.i, null, v.radix) : new Lit(null, -v.f!, false, v.q ? [-v.q[0], v.q[1]] : null);
           if (v instanceof Flt) return new Flt(-v.v, v.w);
           return arith("-", typeof v === "bigint" ? 0n : 0, v);
