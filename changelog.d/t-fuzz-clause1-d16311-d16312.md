@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **D16311, D16312 closed (clause 1, from the 2026-11-14 fuzz census):** `{f: [null]}` at a record field of `(boolean | null)[]` (or any niche element) builds each `null` as the element's sentinel, the null of the list it is built at, where it was built as a null ref into an `i32` list. An element read of a `(string[] | i32 | null)[]` inside a function recovers its non-null union box, since that union's null is a tag, not a null ref. Both were check-clean invalid wasm. Five `matrix/` templates grade them: the niche field 31 invalid → RUNS, the boxed read 30 invalid → RUNS, 0 `runs → not-runs`.

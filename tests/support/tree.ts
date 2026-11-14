@@ -94,6 +94,18 @@ export const exists = (p: string): boolean => {
   }
 };
 
+/** Whether the seed at `p` exists, for a seed-backed test's `ignore`. A fresh clone skips;
+ * under `SELFHOST_NATIVE_ALIGN=1` a missing seed throws, because that run promised to test it. */
+export const seedPresent = (p: string): boolean => {
+  if (exists(p)) return true;
+  if (Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1") {
+    throw new Error(
+      `SELFHOST_NATIVE_ALIGN=1 but the seed is missing: ${p}. Build it with scripts/refresh-compiler.sh; a gated run does not skip.`,
+    );
+  }
+  return false;
+};
+
 /** `{ VL_ISA }` when the run pins the seed engine's ISA, else `{}`. */
 export const isaEnv = (): Record<string, string> => {
   const isa = Deno.env.get("VL_ISA");
