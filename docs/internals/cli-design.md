@@ -728,6 +728,17 @@ temp-file + rename. `tests/vl_module_cache_test.ts` pins hit, each rejection, op
 pruning order and throttle; the safety argument is DECISIONS.md §"A user module's
 Cranelift compile is cached".
 
+### The seed cache (host)
+
+An on-disk seed (`build/vl-compiler.wasm`, `--compiler`, `$VL_COMPILER_WASM`) is Cranelift-compiled
+once per engine configuration and kept as `<seed cache>/seed-<content key>-<engine tag>.cwasm`,
+never beside the seed. The seed cache is `$VL_SEED_CACHE_DIR`, else `seed/` under the cache dir
+above; it is separate so a run that isolates `$VL_CACHE_DIR` does not recompile the seed. It passes
+the same `private_cache_dir` check or the seed runs uncached with a stderr note, and keeps the
+eight most recently used seeds. `vl seed --cache-dir` prints the directory and `vl seed
+--cache-files` this seed's entries. DECISIONS.md §"The seed sidecar lives only in the user's
+private cache"; `tests/vl_seed_sidecar_dir_test.ts`.
+
 ### The compile cache (host, opt-in)
 
 `VL_COMPILE_CACHE=1` keeps the module a `vl build`, a `vl run` of a source file, or a pooled `vl test` file, emitted under

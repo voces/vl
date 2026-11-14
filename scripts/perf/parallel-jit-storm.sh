@@ -14,12 +14,12 @@ export VL_STD="$PWD/std" SELFHOST_NATIVE_ALIGN=1
 V=./scripts/vl-host/target/release/vl
 T="$OUT/w"; mkdir -p "$T"; printf 'print(1)\n' > "$T/tiny.vl"
 arm() { local n="$1"
-  ls build/*.cwasm 2>/dev/null | sed "s|.*/|$n sidecar: |"
+  "$V" seed --cache-files --compiler build/vl-compiler.wasm 2>/dev/null | sed "s|.*/|$n sidecar: |"
   /usr/bin/time -f "$n\twall=%e\tuser=%U\tsys=%S" -o "$OUT/$n.time" \
     deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts \
     > "$OUT/$n.log" 2>&1
   printf '%s\tload %s\n' "$(cat "$OUT/$n.time")" "$(uptime | sed 's/.*average: //')"; }
-reset_post_refresh() { rm -f build/vl-compiler.wasm.*.cwasm
+reset_post_refresh() { "$V" seed --cache-files --compiler build/vl-compiler.wasm | xargs -r rm -f
   "$V" run "$T/tiny.vl" --compiler build/vl-compiler.wasm >/dev/null 2>&1; }
 reset_warm() { "$V" check "$T/tiny.vl" --compiler build/vl-compiler.wasm >/dev/null 2>&1; }
 reset_post_refresh;            arm post-refresh
