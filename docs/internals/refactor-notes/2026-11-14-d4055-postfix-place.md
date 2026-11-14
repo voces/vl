@@ -16,3 +16,5 @@ branch's: 0 runs → not-runs, 0 silent; 11 cells move from the parse refusal to
 
 **Tests.** Four parser-recovery fixtures and two TS recovery tests used `o.x++` as their stock
 postfix error; they now use `(1)++`, which stays one.
+
+**Size.** +53 net compiler lines (3 files); pin-helper delta 0.
