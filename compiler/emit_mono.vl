@@ -325,6 +325,7 @@ import {
   callIsNever,
   declNameTokOf,
   elseIfLink,
+  fnNameIsLambda,
   hasNamedArgs,
   i32ToStr,
   isExprKid,
@@ -756,11 +757,10 @@ import {
 } from "./emit_elab"
 import {
   tyIsBareMap,
-  unNameBound,
   unRowOfCanonFolded,
   unionRowKeyAB,
 } from "./emit_union_registry"
-import { unNameAdoptTyKeyRow, unRowOfTyKey } from "./emit_union_tykey"
+import { unRowOfTyKey, unTyKeyHasRow } from "./emit_union_tykey"
 import {
   assignTags,
   buildFnMap,
@@ -8021,7 +8021,7 @@ function monoPinMintedUnion(name: string, ty: i32, own: i32): string {
   } else if !wu || monoPinCanonKind(wt) == 2 {
     return name
   }
-  if !monoTyHoldsRefArm(ty) || unNameBound(name) { return name }
+  if !monoTyHoldsRefArm(ty) { return name }
   // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
   if pun != "" {
     // The registered type is the whole annotation's (`own`) at the rep its spelling collapses to.
@@ -8107,13 +8107,8 @@ function monoRegisterPinUnion(name: string, ty: i32) {
   // A pin minted at a union or a nullable needs a box row; any other pin registers nothing.
   const ut = if ty >= 0 && ty < T.tys.length { tyAt(ty) } else { tyAt(0) }
   if ty < 0 || !(ut is TyUnion || ut is TyNullable) { return 0 }
-  // A union type already holding a row binds this spelling to it; only a new type mints one.
-  if (
-    unNameBound(name)
-    || (unRowOfTyKey(ty) >= 0 && unNameAdoptTyKeyRow(name, ty))
-  ) {
-    return 0
-  }
+  // A union type already holding a row is named by it; only a new type mints one.
+  if unTyKeyHasRow(ty) { return 0 }
   const before = uVariants.length
   if registerInlineUnionOfTy(monoProgStmts, name, ty) < 0 { return -1 }
   // Re-rank only when a variant is pushed: `assignTags` ranks variants globally and a value
@@ -10249,6 +10244,11 @@ function monoInstanceFor(
   deliveryTys: i32[],
   pinTyCol: i32[],
 ) {
+  if origFe < 0 || origFe >= monoOrigNode.length {
+    return emitFail(
+      "emitProgram: monomorphize: an instance was asked for at no template slot",
+    )
+  }
   // A value a call through its set already instanced keeps that instance.
   if (monoElemAtSet[letInitIx] ?? false) && !monoTysHoldSet(deliveryTys) {
     return 0
@@ -10256,10 +10256,21 @@ function monoInstanceFor(
   const fn = nodeAt(monoOrigNode[origFe])
   if fn is FuncDecl {
     const params = fn.fnParams
-    // A pin list shorter than the parameters builds no instance. One caller relies on it:
-    // `monoCoerceFnValueTys` delivering a generic value nothing calls at a destination whose
-    // function type names no parameters (D16074).
-    if params.length != pinnedNames.length { return 0 }
+    // A pin per parameter: a caller with fewer has no instance to ask for (D16074).
+    if params.length != pinnedNames.length {
+      return emitFail(
+        "emitProgram: monomorphize: `"
+          + monoSlotName(origFe)
+          + "` takes "
+          + i32ToStr(params.length)
+          + " parameter"
+          + pluralS(params.length)
+          + " but its instance was asked for at "
+          + i32ToStr(pinnedNames.length)
+          + " pinned type"
+          + pluralS(pinnedNames.length),
+      )
+    }
     // No argument node on this path: the pins are the parameter types of the function type the
     // checker recorded for the value, else the destination's, else the delivery's (D2755).
     let vty = monoFnValueParamTys(nodeTyIxOf(letInitIx), pinnedNames.length)
@@ -10598,7 +10609,12 @@ function monoCoerceFnValueTys(
         if monoGen[gfe] == 1 {
           const pnames: string[] = []
           // A nullable function slot (`((t: T) => void) | null`) takes the function's instance (D3932).
-          if (monoFnTyPinNames(tnameTy, pnames)) {
+          // A destination whose function type names no parameters pins none, so it builds no
+          // instance: nothing calls the value there (D16074).
+          if (
+            monoFnTyPinNames(tnameTy, pnames)
+            && !monoPinsNoneFor(gfe, pnames)
+          ) {
             // A capturing nested generic's value is this frame's instance, as a call is (D3902).
             monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
             monoInstanceRetTy = if monoInstanceWidenRet { monoFnTyRet(tnameTy) } else { -1 }
@@ -10622,6 +10638,12 @@ function monoCoerceFnValueTys(
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   0
+}
+
+// Whether `pins` is empty for template slot `fe`, which takes parameters.
+function monoPinsNoneFor(fe: i32, pins: string[]): boolean {
+  const fn = if fe >= 0 && fe < monoOrigNode.length { nodeAt(monoOrigNode[fe]) } else { null }
+  pins.length == 0 && fn is FuncDecl && fn.fnParams.length > 0
 }
 
 // Whether slot `fe`'s template is a maker (`fvaIsMaker`): one delivered at a closed function type
@@ -11799,7 +11821,7 @@ function monoFlowCopyHanded(u: i32, calls: i32[]): boolean {
 // un-annotated parameter (a hole function, D6603).
 function monoFlowTyParamGen(s: i32): boolean {
   const fn = nodeAt(s)
-  if !(fn is FuncDecl) || fn.fnName == "" { return false }
+  if !(fn is FuncDecl) || fnNameIsLambda(fn.fnName) { return false }
   fn.fnTyParams.length > 0 || monoFlowHasHoleParam(s)
 }
 
@@ -15473,7 +15495,7 @@ function monoPinMapSlot(mx: i32, at: i32, ctx: i32, fld: string): i32 {
         if (
           a is FuncDecl
           && a.fnRet < 0
-          && a.fnName != ""
+          && !fnNameIsLambda(a.fnName)
           && !i32ListHas(held, ix)
         ) {
           let rets = 0
@@ -25054,6 +25076,7 @@ const MONO_BIND_SIG_POST = "` holds functions called at more than one argument t
 // elaboration delivers it at (a callback's contextual type), so a generic its body calls is pinned
 // there rather than at the hole's default (D3820). 0 when it declines, -1 on a failed mint.
 function monoPinLamAtDelivery(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return 0 }
   const fn = nodeAt(fnStmts[fe])
   if fn is FuncDecl {
     const rowTy: i32[] = []
@@ -25902,7 +25925,7 @@ function monoPruneTemplates(nDecl: i32) {
     if fnStmts[gc] == monoOrigNode[gc] {
       const cfn = nodeAt(fnStmts[gc])
       if cfn is FuncDecl {
-        if cfn.fnTyParams.length == 0 && monoGen[gc] == 1 && cfn.fnName != "" {
+        if cfn.fnTyParams.length == 0 && monoGen[gc] == 1 {
           if !criFnIsAnonLambda(gc) {
             if !monoNameIsExported(cfn.fnName) {
               cndFe.push(gc)

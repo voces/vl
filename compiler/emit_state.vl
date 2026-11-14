@@ -1639,11 +1639,6 @@ export const LBK_NUL_U8_LIST = 13       // `u8[] | null`, the packed backing in 
 // narrowed `n.f` casts `struct.get $box 1` to `(ref $A)` and reads the field.
 export let uDeclared = false
 export let unNames: string[] = []
-// Union-name lookup for `unRowOfName`, O(1): an interned name's sid to its first `unNames`
-// row. First wins because a name can be registered twice (`unionSweep/name-dup` counts it),
-// which is what the scan it replaces answered. `unNamesPush` is the only writer; the index is
-// emptied with the table in `collectU`, and re-keyed with the sid space in `sidKeyedTablesReset`.
-export let unRowBySid: i32[] = []
 // The arena index the union row at the same position registers for, or -1 where the
 // registration entry point receives only a name (the union-registry twin of `sTyIx`,
 // destringify B-1 step 1). -1 is expected, not a bug: `registerValueUnionNameTy` takes a
@@ -1794,6 +1789,10 @@ export let mTwinExtra = 0
 // Whether the value-slot rows have been grouped by the struct they emit (`mapTwinSettle`); a
 // slot's struct is known only once collection ends.
 export let mTwinSettled = false
+// The packed rows other than `u8[]`'s among the module's union arms, in the order collect met
+// them. A packed list arm's value-atom kind is `pkKindOfRow(row)`, and row `pkTwinRows[k]` tags
+// at code `pkCodeBase() + k`, above the map-twin codes; `u8[]` keeps kind and code 13.
+export let pkTwinRows: i32[] = []
 export let vbI32Idx = 0
 export let vbI64Idx = 0
 export let vbF32Idx = 0
@@ -2244,6 +2243,52 @@ export function pkRowOfBack(h: i32): i32 {
   i32ListIndexOf(pkBackIdx, h)
 }
 
+// The value-atom kind base of the packed rows other than `u8[]`'s: row `r` is kind
+// `PK_KIND_BASE + r`, above every other kind, so no comparison against a fixed kind matches it.
+export const PK_KIND_BASE = 64
+
+// The value-atom kind of a list arm stored in packed row `row`: 13 for `u8[]`, else
+// `PK_KIND_BASE + row`; -1 for no row.
+export function pkKindOfRow(row: i32): i32 {
+  if row == PK_U8 { return 13 }
+  if row > PK_U8 && row <= PK_I16 { return PK_KIND_BASE + row }
+  -1
+}
+
+// The packed row a value-atom kind stores its list in, or -1 for a kind that is no packed list.
+export function pkRowOfKind(k: i32): i32 {
+  if k == 13 { return PK_U8 }
+  if k > PK_KIND_BASE && k <= PK_KIND_BASE + PK_I16 { return k - PK_KIND_BASE }
+  -1
+}
+
+// The first map-twin code: 17, or the first code above the boolean-leaf list codes.
+export function mTwinCodeBase(): i32 {
+  if vbBoolListTop >= 0 { return 19 + vbBoolListTop }
+  17
+}
+
+// The first packed-twin code: the first code above every value-atom and map-twin code. A union
+// with a packed twin keeps code 13 free for `u8[]`, so a code never names two arms.
+export function pkCodeBase(): i32 {
+  if mTwinExtra > 0 { return mTwinCodeBase() + mTwinExtra }
+  if vbBoolListTop >= 0 { return mTwinCodeBase() }
+  if mIntMonoArmUsed { return 17 }
+  if vbV128Used { return 15 }
+  if vbU8ArmUsed || pkTwinRows.length > 0 { return 14 }
+  13
+}
+
+// The code of the atom-leaf list arm: the first code above every packed-twin code.
+export function atomListCodeOf(): i32 { pkCodeBase() + pkTwinRows.length }
+
+// The tag code of packed row `row`'s twin, or -1 when no union arm registered it.
+export function pkTwinCodeOfRow(row: i32): i32 {
+  const k = i32ListIndexOf(pkTwinRows, row)
+  if k < 0 { return -1 }
+  pkCodeBase() + k
+}
+
 // The packed row whose wrapper is heap type `w`, or -1 when `w` is no packed wrapper.
 export function pkRowOfWrap(w: i32): i32 {
   if w < 0 { return -1 }
@@ -2259,6 +2304,15 @@ export function pkRowOfPrim(p: PrimName | null): i32 {
     "i16" => PK_I16
     "i32" | "i64" | "f32" | "f64" | "boolean" | "string" | "void" | "null" | "never" | "v128" | null => -1
   }
+}
+
+// The element primitive name packed row `row` stores, or "" for no row.
+export function pkElemNameOfRow(row: i32): string {
+  if row == PK_U8 { return "u8" }
+  if row == PK_I8 { return "i8" }
+  if row == PK_U16 { return "u16" }
+  if row == PK_I16 { return "i16" }
+  ""
 }
 
 // Slot `si` as a packed row, or -1 when it names none. There is no default width: a caller

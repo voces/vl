@@ -151,6 +151,7 @@ import {
   elabDeadRestClose,
   elabDeadRestOpen,
   elabEncl,
+  elabFnLetMembers,
   elabFnSetOf,
   elabLiveTyOf,
   elabMakerBlock,
@@ -207,6 +208,7 @@ import {
   ctnCutKills,
   ctnWrDeclOf,
   ctnWrUnreachedBy,
+  wrDstDecl,
   wrUnreachedBy,
 } from "./check_decl_scan"
 import {
@@ -266,6 +268,7 @@ import {
   hdRowOf,
   holePinHeldSet,
 } from "./check_hole_pins"
+import { holeSetEarlyLamHas } from "./check_hole_rows"
 import { nodeLineOf } from "./check_capture_loss"
 import { lbiNoteDelivery } from "./check_lbi_notes"
 import {
@@ -495,6 +498,7 @@ import {
 import { numLexIsFloat } from "./emit_bignum"
 import {
   i32ListEq,
+  i32ListHas,
   i32ListIndexOf,
   strListHas,
   strListIndexOf,
@@ -3120,6 +3124,25 @@ function lambdaCopyOnly(got: i32, want: i32): boolean {
   !tyHasHole(substTyDeep(got, bn, bt))
 }
 
+// Whether row `ci` writes a lambda to a `let` that call `c` calls directly: the call dispatches
+// on the function the binding holds and types the members' join, so it does not ask this row.
+// One typed ahead of the lambda's check cannot, and a binding handed on is judged by the row.
+function letLamJudgedAtCall(ci: i32, c: i32): boolean {
+  const lx = letCstr.ix[ci]
+  const ln = nodeAt(lx)
+  if !(ln is FuncDecl) || ln.fnName != "" || holeSetEarlyLamHas(lx) {
+    return false
+  }
+  const bd = wrDstDecl.get(lx) ?? -1
+  if bd < 0 || !(nodeAt(bd) is LetDecl) || c < 0 || c >= P.nodes.length {
+    return false
+  }
+  const cn = nodeAt(c)
+  if !(cn is Call) || identDeclOf(parenPeelIx(cn.callFn)) != bd { return false }
+  const ms = elabFnLetMembers(bd)
+  ms.length > 1 && i32ListHas(ms, lx)
+}
+
 // `validateRetCstrs` for a `let`/`const` binding rather than a return (D572 is why the two
 // need separate tables). Same re-deferral rule; the message is `letAssignMsg`'s, verbatim,
 // with the attribution appended since the reader wrote no assignment.
@@ -3160,7 +3183,10 @@ export function validateLetCstrs(
       // A function whose own parameters are still open fits no destination that holds no
       // function, whatever they become, so it is judged now rather than deferred (D14979).
       const clash = tyHasHole(lg) && !tyHasHole(lw) && fnShapeClash(lg, lw, 0)
-      if !tyHasHole(lg) && !tyHasHole(lw) || clash {
+      if (
+        (!tyHasHole(lg) && !tyHasHole(lw) || clash)
+        && !letLamJudgedAtCall(ci, ix)
+      ) {
         if clash || !litPinAssignable(letCstr.ix[ci], lg, lw, bNames, bTys) {
           // A destination one member of a value called at several signatures fits (D15146).
           const member = !clash
@@ -3964,7 +3990,7 @@ export function fvaMakerCallRows() {
     if sig >= 0 && mc >= 0 {
       const c = nodeAt(mc)
       if c is Call {
-        const m = identDeclOf(parenPeelIx(c.callFn))
+        const m = fvaMakerOfBinding(identDeclOf(parenPeelIx(c.callFn)))
         elabMakerRowNote(m, sig)
         elabMakerCallNote(mc, sig)
       }
@@ -3992,17 +4018,36 @@ function fvaMakerOfBindingIn(d: i32, memo: {[i32]: i32}): i32 {
   r
 }
 
-// Lambda `m`, unless it returns a call.
+// Lambda `m`, unless it returns a call's result, directly or through un-annotated `const` copies.
 function fvaMakerLambdaOf(m: i32): i32 {
   const fn = nodeAt(m)
   if !(fn is FuncDecl) { return -1 }
   const rets: i32[] = []
   collectRetValues(fn.fnBody, rets)
   for r in rets {
-    const x = parenPeelIx(r)
-    if x >= 0 && nodeAt(x) is Call { return -1 }
+    if fvaValueIsCallResult(r, 0) { return -1 }
   }
   m
+}
+
+// Whether value `v` is a call's result: a call, or a read of an un-annotated `const` holding one.
+function fvaValueIsCallResult(v: i32, depth: i32): boolean {
+  const x = parenPeelIx(v)
+  if x < 0 || x >= P.nodes.length || depth > 8 { return false }
+  const n = nodeAt(x)
+  if n is Call { return true }
+  if !(n is Ident) { return false }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit < 0
+  ) {
+    return false
+  }
+  fvaValueIsCallResult(dn.letInit, depth + 1)
 }
 
 // Withdraws the call notes of each maker one of whose reads takes no instance of its own: the
