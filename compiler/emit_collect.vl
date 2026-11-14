@@ -20,6 +20,7 @@ import { chainHasPrelude } from "./emit_if_arm_values"
 import { arrNewAtTop, arrNewInFn } from "./check_decl_scan"
 import {
   elabListFnElemTy,
+  elabLitBindingFact,
   elabLitInstTys,
   elabNodeInstTys,
   elabNodeTyAt,
@@ -4145,6 +4146,19 @@ export function mfScan(ix: i32, fnIx: i32) {
       mfScan(n.idxIndex, fnIx)
       return 0
     }
+    // A test's or a conversion's operand, and a match's scrutinee and arm bodies, are evaluated
+    // in place (D10351).
+    IsExpr => {
+      return mfScan(n.isObj, fnIx)
+    }
+    AsExpr => {
+      return mfScan(n.asObj, fnIx)
+    }
+    MatchExpr => {
+      mfScan(n.matchScrut, fnIx)
+      for b in n.matchBodies { mfScan(b, fnIx) }
+      return 0
+    }
     ObjLit => {
       const fields = n.objFields
       let i = 0
@@ -4168,7 +4182,7 @@ export function mfScan(ix: i32, fnIx: i32) {
       return mfScan(n.spdArg, fnIx)
     }
     // No other node holds a list builder.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | LoopVar => {}
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ImportDecl | LoopVar => {}
   }
   0
 }
@@ -6379,6 +6393,10 @@ function anonMintLiteral(ai: i32) {
   // that supplied the argument itself.
   if nodeTyIxOf(ai) < 0 { return 0 }
   anonMintInstanceRows(ai)
+  // A literal a `const` binding's slot fact closes is built at that record's row, interned first
+  // so the literal's open type finds it rather than minting one of its own (D16201).
+  const fact = elabLitBindingFact(ai)
+  if fact >= 0 { internShapeDeepTy(fact) }
   const adopted = nodeRepTyIxOf(ai)
   if (
     adopted >= 0
@@ -8998,12 +9016,19 @@ export function collectU(stmts: i32[]) {
     }
     // A field read over a union whose members store the field as different records is the box
     // of the union it is typed as, which nothing else in the program may spell.
+    // Read as records or `null`, it is the box of the union inside the nullable (D16170).
+    const prt = if pn is Member { nodeTyIxOf(ipu) } else { -1 }
+    const prn = if prt >= 0 && prt < T.tys.length { tyAt(prt) } else { null }
+    const pru = if prn is TyNullable { prn.nInner } else { prt }
     if (
       pn is Member
-      && nodeTyIsUnionRow(ipu)
+      && pru >= 0
+      && pru < T.tys.length
+      && tyAt(pru) is TyUnion
       && nodeTyIsUnionRow(unwrapParen(pn.memObj))
     ) {
-      if collectTyReachRegister(stmts, nodeTyIxOf(ipu), 16, false) < 0 {
+      if collectTyReachRegister(stmts, pru, 16, false) < 0 { return -1 }
+      if pru != prt && collectTyReachRegister(stmts, prt, 16, false) < 0 {
         return -1
       }
     }

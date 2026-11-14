@@ -19,7 +19,9 @@ import {
   TyVar,
   addTy,
   mkObjTy,
-  tvNestOf,
+  nestParentOf,
+  nestParentOfReset,
+  tvNestDeclOf,
   tyAt,
   tyIsHole,
   tyMutEpoch,
@@ -27,7 +29,7 @@ import {
 import { fnDeclIx } from "./check_write_scan"
 import { tyHasTyVarGo } from "./tyquery"
 import { nodeTyIxOf } from "./check_node_tys"
-import { tyVarOwner, tyVarOwnerOf } from "./check_hole_pins"
+import { TvKind, tyVarOwner, tyVarOwnerOf } from "./check_types"
 import { cstrOwnerStack, inferQuiet } from "./check_cursor"
 import { CSTR_DELIVERY_ONLY, memCstr } from "./check_cstr_rows"
 import { holeWriteKey, noteArrayDemand } from "./check_hole_rows"
@@ -42,11 +44,6 @@ export const CSTR_ANYFN = -2
 // Solving the hole to what its usage demands makes it match the annotated spelling exactly.
 export let solvedParamTys: {[string]: i32} = Map()
 export function solvedParamTysSetAt(k: string, v: i32) { solvedParamTys[k] = v }
-
-// Each such nested generic's enclosing declaration node, and whether that body names the
-// generic other than as a callee (1) or not (0), found on first use.
-export let nestParentOf: {[i32]: i32} = Map()
-export function nestParentOfPut(k: i32, v: i32) { nestParentOf.set(k, v) }
 
 export let nestEscapeMemo: {[i32]: i32} = Map()
 
@@ -79,8 +76,16 @@ export function stSeenStackPush(v: i32) { stSeenStack.push(v) }
 // existing ones, so while this is 0 no arena type holds a type variable.
 export let tyVarRowsMinted = 0
 
+// A type-variable row named `name` whose slot its site did not pass: a hole when the name is a
+// hole's (`?`-prefixed), else a parameter.
 export function mkTyVar(name: string) {
-  const t: Ty = { tvName: name }
+  const kind: TvKind = if name.length > 0 && name[0] == '?' { "hole" } else { "param" }
+  mkTyVarSlot(kind, -1, -1, name)
+}
+
+// The type-variable row of kind `kind` for declaration slot `(binder, idx)`, spelled `name`.
+export function mkTyVarSlot(kind: TvKind, binder: i32, idx: i32, name: string) {
+  const t: Ty = { tvName: name, tvKind: kind, tvBinder: binder, tvIdx: idx }
   const ix = addTy(t)
   tyVarRowsMinted = tyVarRowsMinted + 1
   // The ambient body owns the row unless a site knows better (`mkTyVarOwned`).
@@ -404,7 +409,7 @@ export function topFnOwnerOf(d: i32): string {
 // generic its enclosing body names other than as a callee binds by name everywhere (D3853).
 export function substBindsNestRow(row: i32, name: string): boolean {
   if substNestMode == SUBST_HOLES { return name != "" && name[0] == '?' }
-  const nd = tvNestOf.get(row) ?? -1
+  const nd = tvNestDeclOf(row)
   if nd >= 0 {
     if substNestMode == SUBST_NESTED { return nd == substNestDecl }
     return nestEscapes(nd)
@@ -463,7 +468,7 @@ function nestTyHas(ty: i32, nd: i32, depth: i32): boolean {
   const t = tyAt(ty)
   match t {
     TyVar => {
-      return (tvNestOf.get(ty) ?? -1) == nd
+      return tvNestDeclOf(ty) == nd
     }
     TyArray => {
       return nestTyHas(t.aElem, nd, depth + 1)
@@ -758,7 +763,7 @@ export function substReset() {
   tyVarRowsMinted = 0
   stSeenStack = []
   solvedParamTys = Map()
-  nestParentOf = Map()
+  nestParentOfReset()
   nestEscapeMemo = Map()
   nestLoMemo = Map()
   substNestMode = SUBST_ALL

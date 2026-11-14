@@ -835,6 +835,8 @@ import {
   sLitMintFn,
   sLitMintRow,
   sNames,
+  sSuperAt,
+  sTwin,
   sTyIx,
   scopeSlotOf,
   uDeclared,
@@ -1151,8 +1153,17 @@ export function cloRetValSlot(fe: i32): i32 {
   const k = cloRetValKind(fe)
   const t = cloRetResultTy(fe)
   if t < 0 { return -1 }
-  // A map result is keyed by its map shape, -1 where its type names none.
+  // A map result is keyed by its map shape, -1 where its type names none. An un-annotated result
+  // recorded open takes the shape its calls read (`inferredRetMapSlot`), its tail's closed one.
   if k == "map" || k == "nulmap" {
+    const ofd = nodeAt(fnStmts[fe])
+    if (
+      ofd is FuncDecl
+      && ofd.fnRet < 0
+      && (tyHasTyVar(t) || tyHasInferHole(t, 0))
+    ) {
+      return inferredRetMapSlot(fe)
+    }
     const ms = mapShapeOfTyPeeled(t)
     return if ms == -3 { -1 } else { ms }
   }
@@ -2975,7 +2986,12 @@ function inferredRetMapSlotCore(ti: i32) {
   }
   const mrx = fnRetExprOf(fnStmts[ti])
   if mrx < 0 { return -1 }
-  const sh = mapShapeOfTyPeeled(nodeTyAt(mrx, fnStmts[ti]))
+  const mt = nodeTyAt(mrx, fnStmts[ti])
+  // A tail typed open is read at the shape it is built at.
+  if mt >= 0 && (tyHasTyVar(mt) || tyHasInferHole(mt, 0)) {
+    return mapShapeOfExpr(mrx, fnStmts[ti])
+  }
+  const sh = mapShapeOfTyPeeled(mt)
   if sh == -3 { return -1 }
   sh
 }
@@ -8604,6 +8620,39 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
 
 // The node standing for the value of the assignment at `ix` when its target is a name, whose
 // re-read is how the value is lowered (`asgReadNode`); -1 for any other node or target.
+// The struct row of the record assignment `asgIx` yields, when its target is a name whose binding
+// holds a narrower record on that row's `sub` chain, which a store keeps as the same object; -1.
+export function asgNameWiderRow(asgIx: i32, fnIx: i32): i32 {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) || a.binOp != "=" { return -1 }
+  const tx = unwrapParen(a.binLeft)
+  if tx < 0 || !(nodeAt(tx) is Ident) { return -1 }
+  const d = identDeclOf(tx)
+  if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return -1 }
+  const vt = nodeTyAt(asgIx, fnIx)
+  if vt < 0 || vt >= T.tys.length || !(tyAt(vt) is TyObj) { return -1 }
+  const bt = nonNullTy(letBindTy(d, fnIx))
+  if bt < 0 || bt >= T.tys.length || !(tyAt(bt) is TyObj) { return -1 }
+  const vr = structRowOfRecordTy(vt)
+  const br = sTwinRepOf(structRowOfRecordTy(bt))
+  if vr < 0 || vr >= sHeapIdx.length || br < 0 { return -1 }
+  let x = sTwinRepOf(sSuperAt(sTwinRepOf(vr)))
+  let guard = 0
+  while x >= 0 && guard < 64 {
+    if x == br { return vr }
+    x = sTwinRepOf(sSuperAt(x))
+    guard = guard + 1
+  }
+  -1
+}
+
+// The representative of struct row `r`'s heap (`sTwin`), or -1 for none.
+function sTwinRepOf(r: i32): i32 {
+  if r < 0 { return -1 }
+  if r < sTwin.length { return sTwin[r] }
+  r
+}
+
 function asgCellOf(ix: i32, fnIx: i32): i32 {
   const e = nodeAt(ix)
   if e is BinExpr {
@@ -9186,6 +9235,9 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32): i32 {
 function structIndexOfExprGo(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return -1 }
   const e = nodeAt(exprIx)
+  // A name taking a wider record yields that record, whose row its re-read is cast to (D16105).
+  const wsr = asgNameWiderRow(exprIx, fnIx)
+  if wsr >= 0 { return wsr }
   const asgCell = asgCellOf(exprIx, fnIx)
   if asgCell >= 0 { return structIndexOfExpr(asgCell, fnIx) }
   match e {
@@ -14417,9 +14469,14 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32): i32 {
       return exprPackedRow(callee.memObj, fnIx)
     }
     if mfRecvKindOf(callee.memObj, fnIx) != "reflist" { return -1 }
-    // The call type's row; a result whose type keys none, a hole-function list, is built at
-    // its receiver's.
-    const ts = rlSlotOfTyOrTwin(tyArrayElemIx(nodeTyInOf(callIx, fnIx)))
+    // The row of the list the checker stamps the call built at, else of its type; a result
+    // whose type keys none, a hole-function list, is built at its receiver's.
+    const st = if nodeRepStamped(callIx) { nodeRepTyAt(callIx, fnIx) } else { -1 }
+    const ts = rlSlotOfTyOrTwin(
+      tyArrayElemIx(
+        if st >= 0 { st } else { nodeTyInOf(callIx, fnIx) },
+      ),
+    )
     if ts >= 0 { return ts }
     return refListSlotOfExpr(callee.memObj, fnIx)
   }

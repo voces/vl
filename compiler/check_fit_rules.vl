@@ -264,6 +264,7 @@ import {
   nodeTyIx,
   nodeTyIxOf,
   nodeTyOf,
+  nodeTyRecord,
   nodeTySet,
 } from "./check_node_tys"
 import {
@@ -377,6 +378,7 @@ import {
   assignable,
   bindGenWalk,
   constrainEmpty,
+  fnSlotRetWidens,
   joinArmFits,
   joinArmLit,
   joinArmTail,
@@ -409,7 +411,7 @@ import {
   recordListWidenRetag,
   unionElemMemberWidens,
 } from "./check_retag_rows"
-import { identBoundFnDeclOf } from "./check_scopes"
+import { identBoundFnDeclOf, identFnDeclOf } from "./check_scopes"
 import { placeDecl } from "./check_place_ids"
 import {
   mapDeliveryRecordedSet,
@@ -427,7 +429,7 @@ import {
   isvalType,
 } from "./check_state"
 import { curFnOwner, joinClashMsg, joinClashMsgSet } from "./check_subst"
-import { tyVarOwnerOf } from "./check_hole_pins"
+import { tyVarOwnerOf } from "./check_types"
 import { demangleName } from "./check_suggest"
 import { placeElemTy, tpBoundOfName } from "./check_tp_bound"
 import {
@@ -445,6 +447,7 @@ import {
   containerWidenServed,
   containerWidenWhy,
   fieldStorageEq,
+  isWidenNotVariant,
   listJoinStorageDiffers,
   listPairNeedsCopy,
   objFieldNameSetsEq,
@@ -596,6 +599,7 @@ import {
   cwPeelValue,
   cwSlotPath,
   cwSlotWrittenValues,
+  cwSoleReadInit,
 } from "./check_write_scan"
 import {
   Cex,
@@ -617,6 +621,7 @@ import {
   nonNullTy,
   nulFoldMemberTy,
   nullableInnerOrNone,
+  primIsSubWord,
   primNameOf,
   tyAdmitsNull,
   tyHasNullMember,
@@ -1180,21 +1185,19 @@ export function listFieldWidenDst(srcExpr: i32, dstTy: i32): i32 {
   -1
 }
 
-// D581 — the element's source type for the array-literal recursion, and the one place this function
-// reads the container instead of the element node. The element node's own recorded type is the
-// precise answer at the body's first ask, but at the pin it is stale — it still says `T`, so
-// `assignable(T, string)` waves every element past. Gated on the element's record being hole-bearing.
+// The element's source type for the array-literal recursion: its own record, else the container's
+// element. A record still saying `T` at a pin would let `assignable(T, string)` wave every element
+// past (D581), and a quiet pre-pass leaves none, whose sentinel would fit anything (D16300).
 export function litElemSrcTy(elemIx: i32, srcTy: i32) {
   const nt = nodeTyIxOf(elemIx)
-  if nt < 0 { return nt }
-  if !tyHasHole(nt) { return nt }
+  if nt >= 0 && !tyHasHole(nt) { return nt }
   // Under a pin's re-check the element's own type is substituted: a literal joining `T` with a
   // concrete element is a gradual union, wider than its own `T` element (D2906).
-  if litPinN.length > 0 {
+  if nt >= 0 && litPinN.length > 0 {
     const pe = substTyDeep(nt, litPinN, litPinT)
     if pe >= 0 && !tyHasHole(pe) { return pe }
   }
-  if srcTy < 0 { return nt }
+  if srcTy < 0 || srcTy >= T.tys.length { return nt }
   const s = tyAt(srcTy)
   if s is TyArray {
     if s.aElem >= 0 {
@@ -3937,10 +3940,11 @@ export function recAsgFnWidenedTy(p: i32): i32 {
   if p < 0 || p >= P.nodes.length || !(nodeAt(p) is ObjLit) { return -1 }
   // The place, a binding or a field or element slot of one, and the binding it is rooted at;
   // `steps` is the slot's path from the place inward.
-  let x = recAsgPlaceOf(p)
+  const at = recSoleReadOfInit(p, 0)
+  let x = recAsgPlaceOf(at)
   // A literal pushed onto a list is a write of one of its elements (D15336).
   const pushed = x < 0
-  if pushed { x = recLitPushReceiverOf(p) }
+  if pushed { x = recLitPushReceiverOf(at) }
   const steps: string[] = []
   let hops = 0
   while x >= 0 && x < P.nodes.length && hops < 16 {
@@ -3986,6 +3990,33 @@ export function recAsgFnWidenedTy(p: i32): i32 {
   // function fields alone, each element field a closed type or another set.
   if !widened && !recFnFieldsWiden(nodeTyIxOf(p), t) { return -1 }
   if t >= 0 && t < T.tys.length && tyAt(t) is TyObj { t } else { -1 }
+}
+
+// The read a value `p` reaches when `p` is a tail of the initialiser of a binding read only
+// there (`cwSoleReadInit`), through bindings of bindings; else `p`. That read is where `p` is
+// written.
+function recSoleReadOfInit(p: i32, depth: i32): i32 {
+  cwIxBuild()
+  let x = p
+  let hops = 0
+  while x >= 0 && cwIxCovers(x) && cwIxUpKind[x] == CW_UP_ARM && hops < 16 {
+    x = cwIxUp[x]
+    hops = hops + 1
+  }
+  if depth > 8 || x < 0 || !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_LETINIT {
+    return p
+  }
+  const d = cwIxUp[x]
+  const w = cwOccWalk(d)
+  let u = -1
+  while cwOccNext(w) {
+    if cwIxKind[w.row] == CW_OCC_USE { u = cwIxNode[w.row] }
+  }
+  if u < 0 || cwSoleReadInit(u) != x { return p }
+  const leaves: i32[] = []
+  tailValueLeaves(x, leaves)
+  if !i32ListHas(leaves, p) { return p }
+  recSoleReadOfInit(u, depth + 1)
 }
 
 // Whether record `w` is record `own` with at least one function field holding a set that `w`'s
@@ -4937,8 +4968,8 @@ function recBuiltReadErr(
 }
 
 // Refuses each read of the list binding `md`, built at another record, that is the receiver of a
-// `map` or `filter`: the callback takes the list's own element type, which stores a field
-// differently from the build (D15697).
+// `map` or `filter` whose callback the elaboration cannot instance at the build: a closure value,
+// or a parameter annotated at another type (D15697, D16134).
 export function recBuiltCallbackRefuse(md: i32) {
   const bt = recBuildPassAt(md)
   if bt < 0 || bt >= T.tys.length { return 0 }
@@ -4958,11 +4989,31 @@ export function recBuiltCallbackRefuse(md: i32) {
       && ot is TyArray
       && ot.aElem >= 0
       && !fieldStorageEq(ot.aElem, bt, REC_STORE_DEPTH)
+      && !recCbTakesBuild(cwIxUp[m], mn.memProp == "map")
     ) {
       recBuiltReadErr(u, own, ot.aElem, bt, true)
     }
   }
   0
+}
+
+// Whether call `c`'s one argument is a function the elaboration instances at its receiver's
+// build: a lambda, or a function named by its declaration, of one un-annotated parameter. A
+// `map` result holding a record is not: only the parameter is keyed by the build.
+function recCbTakesBuild(c: i32, isMap: boolean): boolean {
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) || cn.callArgs.length != 1 { return false }
+  const ax = parenPeelIx(cn.callArgs[0])
+  const an = if ax >= 0 && ax < P.nodes.length { nodeAt(ax) } else { null }
+  const fd = if an is Ident { identFnDeclOf(ax) } else if an is FuncDecl { ax } else { -1 }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnParams.length != 1 || f.fnTyParams.length > 0 {
+    return false
+  }
+  if an is FuncDecl && f.fnName != "" { return false }
+  if isMap && tyHoldsObjDeep(nodeTyIxOf(c)) { return false }
+  const p = nodeAt(f.fnParams[0])
+  p is Param && p.parType < 0
 }
 
 // The element record the stores into the list or map binding `x` names build, else -1. This
@@ -8441,6 +8492,30 @@ export function litAtDstStorage(x: i32, dstTy: i32): boolean {
   false
 }
 
+// Whether `x` is a `.map` over a list whose fresh result, a list of sub-word values, meets a list
+// of that sub-word element: it is built at its destination's storage, as a literal of computed
+// values is, and takes the destination's type where stamps stand.
+export function freshMapAtDstStorage(x: i32, srcTy: i32, dstTy: i32): boolean {
+  const c = parenPeelIx(x)
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) || cn.callFn < 0 { return false }
+  const f = nodeAt(cn.callFn)
+  if !(f is Member) || f.memProp != "map" { return false }
+  const rt = nodeTyIxOf(f.memObj)
+  if rt < 0 || rt >= T.tys.length || !(tyAt(rt) is TyArray) { return false }
+  const s = if srcTy >= 0 && srcTy < T.tys.length { tyAt(srcTy) } else { null }
+  const d = if dstTy >= 0 && dstTy < T.tys.length { tyAt(dstTy) } else { null }
+  if !(s is TyArray) || !(d is TyArray) || d.aRead == 1 && s.aRead != 1 {
+    return false
+  }
+  if d.aElem < 0 || d.aElem >= T.tys.length { return false }
+  if !primIsSubWord(primNameOf(d.aElem)) || s.aElem != arrElemValueTy(d.aElem) {
+    return false
+  }
+  if stampsStand() { nodeTyRecord(c, dstTy) }
+  true
+}
+
 // Whether `x`, past parentheses, is a fresh value (`freshLitValue`), or a value `if`, `match`,
 // block or `??` one of whose arms is: the sources a rep stamp can adopt.
 export function repStampableLit(x: i32): boolean {
@@ -9130,7 +9205,8 @@ function repStamp(ix: i32, t: i32): i32 {
   1
 }
 
-// Stamps the list literal `l` with the list type `ty` its elements are built as; 1.
+// Stamps the list literal, or the call handing back a list's own elements, `l` with the list
+// type `ty` its elements are built as; 1.
 export function repStampListBuilt(l: i32, ty: i32): i32 { repStamp(l, ty) }
 
 // Stamps the returned read `x` with the record `t` its container builds it at; 1.
@@ -9716,34 +9792,104 @@ export function litPrimMeetTy(obj: i32, chk: i32): i32 {
   mkUnionTy(keep)
 }
 
-// The part of `obj` that always fits the record type `chk`, where `chk` names none of `obj`'s
-// members: `b is A` over `b: B` or `B | null` with every `B` an `A` tests as `is B`, and over
-// `B | C` with no `C` able to fit `A` it tests the `B` (D4062). -1 otherwise.
-export function recFitMeetTy(obj: i32, chk: i32): i32 {
-  if obj < 0 || chk < 0 { return -1 }
+// `tyTestMemberFit`'s three answers.
+export const TT_NONE = 0
+export const TT_PARTLY = 1
+export const TT_COVERED = 2
+
+// What a type test of `chk` answers for a value of one operand member `m`, the one rule `is`,
+// `as` and `match` share: covered where every value of `m` fits `chk` (`m` is `chk`, the type
+// parameter it names, or a record it contains), partly where some may (`chk` fits `m`, or `m` is
+// a parameter a pin may bind to `chk`), else none. A union `chk` answers its best member.
+export function tyTestMemberFit(m: i32, chk: i32): i32 {
+  if m < 0 || chk < 0 || m >= T.tys.length || chk >= T.tys.length {
+    return TT_NONE
+  }
   const ct = tyAt(chk)
-  if !(ct is TyObj) { return -1 }
-  let base = obj
-  const ot = tyAt(obj)
-  if ot is TyNullable { base = ot.nInner }
-  if base < 0 { return -1 }
-  const bt = tyAt(base)
-  if bt is TyObj {
-    if recContainedIn(base, chk) { return base }
-    return -1
-  }
-  if !(bt is TyUnion) { return -1 }
-  let fit = -1
-  for m in bt.uMembers {
-    if m < 0 || tySame(m, chk) { return -1 }
-    if recContainedIn(m, chk) {
-      if fit >= 0 { return -1 }
-      fit = m
-    } else if !recNeverFits(m, ct) {
-      return -1
+  if ct is TyUnion || ct is TyNullable {
+    let best = TT_NONE
+    for c in tyTestMembers(chk) {
+      const f = if c == chk { TT_NONE } else { tyTestMemberFit(m, c) }
+      if f > best { best = f }
     }
+    return best
   }
-  fit
+  if tyTestIsMember(m, chk) || recContainedIn(m, chk) { return TT_COVERED }
+  if tyAt(m) is TyVar { return TT_PARTLY }
+  if (
+    assignable(chk, m)
+    && !isWidenNotVariant(chk, m)
+    && !fnSlotRetWidens(chk, m)
+  ) {
+    return TT_PARTLY
+  }
+  TT_NONE
+}
+
+// Whether operand member `m` is the tested type `c` itself: the same variant, or the type
+// parameter `c` names.
+export function tyTestIsMember(m: i32, c: i32): boolean {
+  if m < 0 || c < 0 { return false }
+  const mt = tyAt(m)
+  const ct = tyAt(c)
+  if mt is TyVar { return ct is TyVar && ct.tvName == mt.tvName }
+  m == c || sameVariantTy(m, c)
+}
+
+// The members of `t`, a union or nullable flattened, `null` among them.
+function tyTestMembers(t: i32): i32[] {
+  const ms: i32[] = []
+  if t >= 0 { flattenVariantsInto(t, ms) }
+  ms
+}
+
+// Whether a test of `chk` over `obj` can be true: each member of `chk` may fit some member of
+// `obj`, or `obj`, one type, is covered by `chk`.
+export function tyTestMayFit(obj: i32, chk: i32): boolean {
+  const ms = tyTestMembers(obj)
+  const cs = tyTestMembers(chk)
+  if cs.length == 0 || ms.length == 0 { return false }
+  if ms.length == 1 && tyTestMemberFit(ms[0], chk) == TT_COVERED { return true }
+  for c in cs {
+    let hit = false
+    for m in ms { hit = hit || tyTestMemberFit(m, c) != TT_NONE }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether every member of `chk` is a member of `obj` (`tyTestIsMember`): a cast to `chk` picks
+// those arms.
+export function tyTestNamesMembers(obj: i32, chk: i32): boolean {
+  const ms = tyTestMembers(obj)
+  const cs = tyTestMembers(chk)
+  if cs.length == 0 { return false }
+  for c in cs {
+    let hit = false
+    for m in ms { hit = hit || tyTestIsMember(m, c) }
+    if !hit { return false }
+  }
+  true
+}
+
+// What a test of record `chk` over `obj` tests where `chk` is no member but contains some and
+// no other can fit: those members, so `b is A` over `B | D` with every `B` and `D` an `A` tests
+// `B | D` (D4062, D4085). -1 otherwise.
+export function tyTestMeet(obj: i32, chk: i32): i32 {
+  const ct = if chk >= 0 { tyAt(chk) } else { null }
+  if !(ct is TyObj) { return -1 }
+  const keep: i32[] = []
+  for m in tyTestMembers(obj) {
+    const f = tyTestMemberFit(m, chk)
+    if f == TT_PARTLY || tyTestIsMember(m, chk) || tySame(m, chk) { return -1 }
+    // A record answered none must be one no value of which fits, not one wider in fields.
+    const mo = tyAt(m)
+    if f == TT_NONE && mo is TyObj && !recNeverFits(m, ct) { return -1 }
+    if f == TT_COVERED { keep.push(m) }
+  }
+  if keep.length == 0 { return -1 }
+  if keep.length == 1 { return keep[0] }
+  mkUnionTy(keep)
 }
 
 // Whether every value of record `a` fits record `b` and not the reverse, the two declaring the

@@ -144,7 +144,6 @@ import {
   inRetArg,
   inRetArgSet,
   inferRetNextLitSet,
-  markNestRows,
   noteInferRetWitness,
   pushInferRetHoles,
   retInfluencedByAnnot,
@@ -217,6 +216,7 @@ import { declareDecl, scopeHideEnter, scopeHideLeave } from "./check_scopes"
 import {
   inDeadArm,
   isValBindLambda,
+  noteRetBareLambda,
   noteVoidCtxLambda,
 } from "./check_side_rows"
 import { symEnabled } from "./check_state"
@@ -227,8 +227,7 @@ import {
   curFnOwner,
   curFnOwnerSet,
   fnOwnerKey,
-  mkTyVar,
-  nestParentOfPut,
+  mkTyVarSlot,
   solvedParamTys,
   solvedParamTysSetAt,
   unannotParamTy,
@@ -250,7 +249,7 @@ import {
   TyFunc,
   TyVar,
   mkFuncTy,
-  tvNestOf,
+  nestParentOfPut,
   tyAt,
   tyBearsNull,
   tyEq,
@@ -605,7 +604,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   if (fnDeclIx[n.fnName] ?? -1) != fnIx {
     elabNestNote(fnIx, curFnDeclIx, n.fnTyParams.length, paramTys)
   }
-  const nestedDecl = fnDeclMarkNested(n, fnIx, paramTys, ret)
+  fnDeclMarkNested(n, fnIx)
   // Save the inference accumulators (a demand-inference can nest inside another
   // function's body check) and the enclosing return type.
   const saved = fnDeclSaveInference()
@@ -621,7 +620,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   fnDeclEnterBodyScope(n, fnIx)
   const fsbCallsAt = fsbCallIx.length
   const cstrOwnerPushed = fnDeclPushCstrOwner(n, fnIx)
-  fnDeclPushTyParams(n, fnIx, nestedDecl)
+  fnDeclPushTyParams(n, fnIx)
   // Definite-assignment: a function body is its own flow context — it runs at call time,
   // not at the declaration site, so a nested function capturing an outer still-unassigned
   // `let x` must not be flagged (the call may happen after `x` is written). The body checks in
@@ -736,23 +735,14 @@ function fnDeclCheckSelfParam(
   0
 }
 
-// Whether `n` is a generic nested in another function, which owns its parameter rows (D3853);
-// when it is, its parameter and return types `paramTys` and `ret` are marked as its own.
-function fnDeclMarkNested(
-  n: FuncDecl,
-  fnIx: i32,
-  paramTys: i32[],
-  ret: i32,
-): boolean {
-  const nestedDecl = n.fnName != ""
+// Registers `n` with its enclosing declaration when it is a generic nested in another function,
+// which then owns its parameter rows (D3853).
+function fnDeclMarkNested(n: FuncDecl, fnIx: i32) {
+  const nested = n.fnName != ""
     && n.fnTyParams.length > 0
     && (fnDeclIx[n.fnName] ?? -1) != fnIx
-  if nestedDecl {
-    nestParentOfPut(fnIx, curFnDeclIx)
-    for pt in paramTys { markNestRows(pt, n.fnTyParams, fnIx, 0) }
-    markNestRows(ret, n.fnTyParams, fnIx, 0)
-  }
-  nestedDecl
+  if nested { nestParentOfPut(fnIx, curFnDeclIx) }
+  0
 }
 
 // Starts this body's return accumulators empty; an inferring body is pushed on the infer stack under `inferKey`.
@@ -1057,6 +1047,7 @@ function fnDeclResolveParams(
             n.fnTyParams,
             pNode.parType,
             fnOwnerKey(n.fnName, fnIx),
+            fnIx,
           )
           if pt >= 0 && pt == collapsedTy { ptCollapsed = true }
           if pt < 0 {
@@ -1147,6 +1138,7 @@ function fnDeclResolveRet(
           n.fnTyParams,
           n.fnRet,
           fnOwnerKey(n.fnName, fnIx),
+          fnIx,
         )
         // D1048's second hint: a declared return whose spelling collapsed marks the
         // DECLARATION, so an un-annotated `const r = f(…)` can inherit the provenance.
@@ -1204,12 +1196,11 @@ function fnDeclPushCstrOwner(n: FuncDecl, fnIx: i32): boolean {
 // Keeps the type parameters of `fnIx` in scope for its whole body, each as an opaque `TyVar`
 // with its bound row (pushed even when unbounded, so an unbounded `<T>` shadows an enclosing
 // bounded `T`). `fnDeclPopTyParams` pops them; the emitter substitutes per instance.
-function fnDeclPushTyParams(n: FuncDecl, fnIx: i32, nestedDecl: boolean) {
+function fnDeclPushTyParams(n: FuncDecl, fnIx: i32) {
   let tpBody = 0
   while tpBody < n.fnTyParams.length {
     tpEnvNames.push(n.fnTyParams[tpBody])
-    tpEnvTys.push(mkTyVar(n.fnTyParams[tpBody]))
-    if nestedDecl { tvNestOf.set(tpEnvTys[tpEnvTys.length - 1], fnIx) }
+    tpEnvTys.push(mkTyVarSlot("param", fnIx, tpBody, n.fnTyParams[tpBody]))
     tpBoundNamesPush(n.fnTyParams[tpBody])
     tpBoundAnnsPush(fnTpBoundOf(fnIx, tpBody))
     tpBody = tpBody + 1
@@ -1410,6 +1401,7 @@ function fnDeclCheckBody(
         }
         if tailIsReturn && inferring {
           retTailPosSet(true)
+          noteRetBareLambda(stmts[s])
         } else {
           retTailPosSet(false)
         }

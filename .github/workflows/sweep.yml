@@ -86,6 +86,11 @@ jobs:
       matrix:
         side: [base, head]
     steps:
+      # The seed's compiled forms live in a private cache outside the checkout (DECISIONS.md,
+      # "The seed sidecar lives only in the user's private cache"); the seed cache steps save it.
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
         with:
           ref: ${{ matrix.side == 'base' && needs.plan.outputs.base || needs.plan.outputs.head }}
@@ -128,7 +133,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: ${{ steps.keys.outputs.seed }}
           restore-keys: |
             vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
@@ -139,11 +144,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      # Only the proven seed's compiled forms go into the seed cache entry, not every rung's.
+      - name: Trim the seed cache to the proven seed
+        # A base side older than the seed cache keeps its sidecars beside the seed instead.
+        run: if [ -x scripts/seed-cache-trim.sh ]; then ./scripts/seed-cache-trim.sh; fi
+
       - name: Pack the side
         run: |
           mkdir -p side
           cp scripts/vl-host/target/release/vl side/vl
-          cp build/vl-compiler.wasm build/vl-compiler.wasm.*.cwasm side/ 2>/dev/null || cp build/vl-compiler.wasm side/
+          cp build/vl-compiler.wasm side/
+          # The seed's compiled forms: from the seed cache, or beside the seed on an older side.
+          for f in $(scripts/vl-host/target/release/vl seed --cache-files --compiler build/vl-compiler.wasm 2>/dev/null) build/vl-compiler.wasm.*.cwasm; do
+            if [ -f "$f" ]; then cp "$f" side/; fi
+          done
           cp -r std side/std
           git rev-parse HEAD > side/commit
           tar -I 'zstd -T0 -3' -cf side.tar.zst side
@@ -179,6 +193,9 @@ jobs:
       run: ${{ steps.find.outputs.run }}
       sides: ${{ steps.find.outputs.sides }}
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.plan.outputs.head }}
@@ -194,7 +211,8 @@ jobs:
           mkdir -p sides/head scripts/vl-host/target/release build
           tar -I zstd -xf side.tar.zst -C sides/head --strip-components=1
           cp sides/head/vl scripts/vl-host/target/release/vl
-          cp sides/head/vl-compiler.wasm sides/head/vl-compiler.wasm.*.cwasm build/ 2>/dev/null || cp sides/head/vl-compiler.wasm build/
+          cp sides/head/vl-compiler.wasm build/
+          mkdir -p -m 700 "$VL_SEED_CACHE_DIR" && cp sides/*/seed-*.cwasm "$VL_SEED_CACHE_DIR"/ 2>/dev/null || true
           tool=$RUNNER_TEMP/sweep.wasm
           scripts/vl-host/target/release/vl build scripts/sweep.vl --compiler build/vl-compiler.wasm -o "$tool"
           {
@@ -263,6 +281,9 @@ jobs:
         side: ${{ fromJSON(needs.base-cache.outputs.sides) }}
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.plan.outputs.head }}
@@ -276,7 +297,8 @@ jobs:
           for s in base head; do mkdir -p "sides/$s" && tar -I zstd -xf "sweep-side-$s/side.tar.zst" -C "sides/$s" --strip-components=1; done
           mkdir -p scripts/vl-host/target/release build
           cp sides/head/vl scripts/vl-host/target/release/vl
-          cp sides/head/vl-compiler.wasm sides/head/vl-compiler.wasm.*.cwasm build/ 2>/dev/null || cp sides/head/vl-compiler.wasm build/
+          cp sides/head/vl-compiler.wasm build/
+          mkdir -p -m 700 "$VL_SEED_CACHE_DIR" && cp sides/*/seed-*.cwasm "$VL_SEED_CACHE_DIR"/ 2>/dev/null || true
 
       - name: Record shard ${{ matrix.shard }}/8 of ${{ matrix.side }}
         run: |
@@ -300,6 +322,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.plan.outputs.head }}
@@ -340,7 +365,8 @@ jobs:
           mkdir -p sides/head scripts/vl-host/target/release build
           tar -I zstd -xf side.tar.zst -C sides/head --strip-components=1
           cp sides/head/vl scripts/vl-host/target/release/vl
-          cp sides/head/vl-compiler.wasm sides/head/vl-compiler.wasm.*.cwasm build/ 2>/dev/null || cp sides/head/vl-compiler.wasm build/
+          cp sides/head/vl-compiler.wasm build/
+          mkdir -p -m 700 "$VL_SEED_CACHE_DIR" && cp sides/*/seed-*.cwasm "$VL_SEED_CACHE_DIR"/ 2>/dev/null || true
           vl=scripts/vl-host/target/release/vl
           mkdir -p out base-rec
           $vl run scripts/sweep.vl -- merge --out out/base.jsonl recs/rec-base-*.jsonl

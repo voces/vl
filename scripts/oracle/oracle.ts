@@ -58,10 +58,17 @@ export function judge(o: Outcome, c: Compiled, expect: string[] | null): { v: Ve
     return { v: "DISAGREE", why: `oracle traps (${o.msg}); compiled ${c.cls}` + (c.out ? ` printing ${JSON.stringify(c.out)}` : "") };
   }
   // the oracle ran
-  if (c.cls === "runs" || c.cls === "wrong") {
+  if (c.cls === "runs") {
     const got = c.out ?? expect ?? [];
-    if (same(o.out, got)) return { v: c.cls === "wrong" ? "DISAGREE" : "AGREE", why: c.cls === "wrong" ? "oracle agrees with the compiled output, not the expectation" : "" };
-    return { v: c.cls === "wrong" ? "COMPILED-BAD" : "DISAGREE", why: `oracle ${JSON.stringify(o.out)} compiled ${JSON.stringify(got)}` };
+    if (same(o.out, got)) return { v: "AGREE", why: "" };
+    return { v: "DISAGREE", why: `oracle ${JSON.stringify(o.out)} compiled ${JSON.stringify(got)}` };
+  }
+  // `wrong`: the compiled stdout differs from the expectation. With the stdout in hand compare to
+  // it; without it, an oracle that prints the expectation confirms the compiled side is wrong.
+  if (c.cls === "wrong") {
+    if (c.out && same(o.out, c.out)) return { v: "DISAGREE", why: "oracle agrees with the compiled output, not the expectation" };
+    if (expect && same(o.out, expect)) return { v: "COMPILED-BAD", why: "compiled a wrong value; the oracle prints the expectation" };
+    return { v: "DISAGREE", why: `oracle ${JSON.stringify(o.out)} matches neither the expectation nor the compiled output` };
   }
   return { v: "COMPILED-BAD", why: `compiled ${c.cls}; oracle ran ${JSON.stringify(o.out)}` };
 }

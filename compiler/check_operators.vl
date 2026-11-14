@@ -1,7 +1,9 @@
 // The type of an operator expression: binary and assignment operators (with a declared
 // operator function), `in`, unary operators, `as` casts and `is` tests.
 
-import { mapFitBuild } from "./check_annot_resolve"
+import { isOpenMemberOf, openMemberRows } from "./check_leaf_steps"
+import { arrDefRowServed, noteVacuousIs } from "./check_hole_links"
+import { mapFitBuild, recPartFitBuild } from "./check_annot_resolve"
 import { strListIndexOf } from "./listutil"
 import { callBindNote, recordCollapsedIsAt } from "./check_bind_rows"
 import {
@@ -183,7 +185,6 @@ import {
   numDeliverStamp,
   radixLitAdoptPeer64,
   recContainerReadFresh,
-  recFitMeetTy,
   recJoinFixed,
   recordBoxTy,
   recordContainedIsAt,
@@ -192,6 +193,9 @@ import {
   stampNullUnitCell,
   storeWritePush,
   strLitSetsDisjoint,
+  tyTestMayFit,
+  tyTestMeet,
+  tyTestNamesMembers,
 } from "./check_fit_rules"
 import { HD_BINOP, HD_ELEM, elemValueHoleBase } from "./check_hole_pins"
 import {
@@ -330,11 +334,11 @@ import {
   constrainEmpty,
   eqKeepsWideLit,
   eqNonNullMutual,
-  fnSlotRetWidens,
   joinArmLit,
   joinTys,
   keepListStorage,
   nameToTyAt,
+  narPinWriteAt,
   nhFillLinked,
   njFixSet,
   numScalarMixMsg,
@@ -350,7 +354,6 @@ import {
   widenLitTy,
 } from "./check_relate_core"
 import {
-  inDeadArm,
   nhLink,
   recordDeadNullTest,
   recordDeadTest,
@@ -365,7 +368,6 @@ import {
 } from "./check_tp_join"
 import {
   eqRefusals,
-  isWidenNotVariant,
   mapTwinTestMsg,
   mixesNumeric,
   widerNumeric,
@@ -418,7 +420,6 @@ import {
   tyIsNumUnion,
 } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
-import { arrDefRowServed } from "./check_hole_links"
 import { cwUseInOtherFrame, fnDeclIx } from "./check_write_scan"
 import { identDeclOf, sidOfNode } from "./symbols"
 import {
@@ -437,8 +438,6 @@ import {
   tyHasTyVar,
   tyIsV128Brand,
   tyMapValOfHeld,
-  tyUnionCovers,
-  unionCoversTy,
 } from "./tyquery"
 
 // Re-binds `name` to `ty` as a layer over slot `s`; an unresolved name gets a slot of its own.
@@ -931,6 +930,7 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       if hmw >= 0 { arrTy0 = hmw }
     }
     const arrT0 = tyAt(arrTy0)
+    narPinWriteAt(arrTy0, ix)
     if arrT0 is TyArray {
       // An index write is a write to the list's own shape, so a view refuses it. Ahead of
       // the element pin below, which would otherwise infer a hole from a store that never
@@ -1855,12 +1855,16 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   if op == "??" { pushScope(-1) }
   const rt = binCheckRightOperand(n, ix, op, lt, savedLbiTgt)
   if op == "??" { popScope() }
-  // In a dead arm `never` is a bottom: an operator over an operand no value has has none (D16006).
+  // `never` is a bottom: an operator over an operand no value has has none (D16006, D14420). A
+  // short-circuit operator's right operand may not run, and a string concatenation already takes
+  // `never` as a string, so neither is one.
   if (
     op != "="
     && op != "??"
+    && op != "&&"
+    && op != "||"
     && (lt == TY_NEVER || rt == TY_NEVER)
-    && inDeadArm(ix)
+    && !(op == "+" && (concatsAsStr(lt) || concatsAsStr(rt)))
   ) {
     while ltOut.length > 0 { ltOut.pop() }
     return TY_NEVER
@@ -2130,7 +2134,7 @@ function checkCastUnionArm(
   ix: i32,
   argU: i32,
   argT: TyUnion,
-  target: i32,
+  target0: i32,
   isU8Cast: boolean,
 ): i32 {
   // `as u8` narrows a number, it does not pick an arm (D1587) — a union operand taking
@@ -2146,8 +2150,12 @@ function checkCastUnionArm(
   }
   // A numeric union converts at whichever member it holds when no member's conversion
   // can fail, as each member alone would.
-  if numUnionAsConverts(argU, target) { return target }
-  if !unionCoversTy(argT, target) {
+  if numUnionAsConverts(argU, target0) { return target0 }
+  // The cast picks what `is` would test (`tyTestMeet`): the members it names, or the members a
+  // record target contains, which it hands back as they are (D2677, D4085).
+  const meet = tyTestMeet(argU, target0)
+  const target = if meet >= 0 { meet } else { target0 }
+  if meet < 0 && !tyTestNamesMembers(argU, target) {
     // A gradual union's parameter may hold the target at a pin: the cast is parked on the
     // parameter and re-asked there, as over a bare one (D2906).
     if unionHasDeclaredParam(argT.uMembers) {
@@ -2528,7 +2536,7 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
   let meet = litSetMeetTy(objTy, chkTy)
   if meet == -1 && n.isVariant != "null" { meet = litBaseMeetTy(objTy, chkTy) }
   if meet == -1 { meet = litPrimMeetTy(objTy, chkTy) }
-  if meet == -1 { meet = recFitMeetTy(objTy, chkTy) }
+  if meet == -1 { meet = tyTestMeet(objTy, chkTy) }
   // A `const` literal tests as the compare does: against a literal it never equals the
   // test is refused, and against anything else it is the `string` it is (D2198).
   if chkTy >= 0 && isWideLitJoin(objTy) {
@@ -2549,7 +2557,8 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
   }
   // A map tested against a narrower map is decided by its contents at runtime (D2701).
   if chkTy >= 0 && objTy >= 0 && !inferQuiet && n.isFit < 0 {
-    const mfb = mapFitBuild(n.isObj, ix, objTy, chkTy, n.pos)
+    let mfb = mapFitBuild(n.isObj, ix, objTy, chkTy, n.pos)
+    if mfb < 0 { mfb = recPartFitBuild(n.isObj, ix, objTy, chkTy, n.pos) }
     if mfb >= 0 {
       n.isFit = mfb
       checkNodeHook(mfb)
@@ -2562,10 +2571,17 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
       if ix < isVarTyIxCap {
         while isVarTyIx.length <= ix { isVarTyIxPush(-1) }
         const tested = if meet >= 0 { meet } else { chkTy }
-        const rt = isRecvMemberOf(objTy, tested)
+        // An unwritten collection fits every test of its kind (D16047): one the default already
+        // settled tests its own arm now, an open one once the program's end settles it.
+        const om = isOpenMemberOf(objTy, chkTy)
+        const omRows: i32[] = []
+        if om >= 0 { openMemberRows(om, omRows) }
+        const settledNow = om >= 0 && omRows.length == 0
+        const rt = if settledNow { om } else { isRecvMemberOf(objTy, tested) }
         isVarTyIxSetAt(ix, rt)
         isPatTyIxPut(ix, chkTy)
         elabCapIsNote(ix, rt, chkTy)
+        if om >= 0 && !settledNow { noteVacuousIs(ix, om, omRows) }
       }
     }
   }
@@ -2612,12 +2628,7 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
       }
     } else if meet >= 0 {
       0
-    } else if (
-      (!assignable(chkTy, baseTy)
-        || isWidenNotVariant(chkTy, baseTy)
-        || fnSlotRetWidens(chkTy, baseTy))
-      && !(!inUnion && tyUnionCovers(chkTy, baseTy))
-    ) {
+    } else if !tyTestMayFit(baseTy, chkTy) {
       if deadArm && isListFitsWhenEmpty(chkTy, baseTy) {
         // An empty list fits every list type, so the instance's arm is live and is checked: what
         // it delivers the list to is answered there (ruling (c), D4981).

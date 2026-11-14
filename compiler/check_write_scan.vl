@@ -76,6 +76,53 @@ import { demangleName } from "./check_suggest"
 // A top-level function's name to its `FuncDecl` arena index, so a forward call can infer the
 // callee on demand and a call site here can name its callee. The checker fills and resets it.
 export let fnDeclIx: {[string]: i32} = Map()
+// Whether every write of `let` declaration `bd` is a statement of the block that declares it,
+// storing the name of a function declaration or a read of another `let`, and no function nested in
+// that frame names it: each read then follows one most recent write in straight-line order, and
+// none waits for a call.
+export function cwLetWritesStraight(bd: i32): boolean {
+  const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
+  if !(bn is LetDecl) || !cwWritesNamedFn(bn.letInit) { return false }
+  cwIxBuild()
+  if bd >= cwIxParent.length { return false }
+  const blk = cwIxParent[bd]
+  const fr = cwFrameOfDecl(bd)
+  const ow = cwOccWalk(bd)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] != CW_OCC_CALL && cwIxFr[r] != fr { return false }
+    // A read handed to a call is bound to the callee's parameter at the whole set (D16182).
+    const u = cwIxNode[r]
+    if (
+      cwIxKind[r] == CW_OCC_USE
+      && u >= 0
+      && u < cwIxUpKind.length
+      && cwIxUpKind[u] == CW_UP_ARG
+    ) {
+      return false
+    }
+    if cwIxKind[r] == CW_OCC_ASG {
+      const at = cwIxNode[r]
+      if at < 0 || at >= cwIxParent.length || cwIxParent[at] != blk {
+        return false
+      }
+      const an = nodeAt(at)
+      if an is BinExpr && !cwWritesNamedFn(an.binRight) { return false }
+    }
+  }
+  true
+}
+
+// Whether `v` is the name of a function declaration or a read of a `let`, which a narrowed read
+// names in turn; a parameter's value is neither.
+function cwWritesNamedFn(v: i32): boolean {
+  const p = cwPeel(v)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return false }
+  const d = identDeclOf(p)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if dn is FuncDecl { return true }
+  dn is LetDecl && dn.letKw == "let"
+}
 
 // The enclosing function frame of every arena node: a `FuncDecl` index, `CW_FR_MOD` at module
 // scope, `CW_FR_UNKNOWN` for a node no `Program` reaches. A frame says whether the walk reached a
@@ -1577,6 +1624,41 @@ export function cwLetUnwritten(bd: i32): boolean {
   cwBindingWrittenValues(bd).length == 1
 }
 
+// The peeled initialiser of the un-annotated binding the read `v` names, where `v` is that
+// binding's one occurrence besides its declaration: the value `v` hands on is the initialiser's
+// alone, so a place `v` is written into decides it. Both sit in one function, so no capture reads
+// the binding. Else -1.
+export function cwSoleReadInit(v: i32): i32 {
+  const x = cwPeelValue(v)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  if cwFrameOfDecl(d) == CW_FR_UNKNOWN { return -1 }
+  cwIxBuild()
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const r = ow.row
+    const u = cwIxNode[r]
+    const bind = cwIxKind[r] == CW_OCC_BIND && u == d
+    if !bind && !(cwIxKind[r] == CW_OCC_USE && u == x) { return -1 }
+  }
+  if cwEnclosingFnOf(x) != cwEnclosingFnOf(d) { return -1 }
+  cwPeel(dn.letInit)
+}
+
+// The function declaration nearest above node `x`, -1 at module scope.
+function cwEnclosingFnOf(x: i32): i32 {
+  let cur = if x >= 0 && x < cwIxParent.length { cwIxParent[x] } else { -1 }
+  let guard = 0
+  while cur >= 0 && cur < P.nodes.length && guard < 4096 {
+    if nodeAt(cur) is FuncDecl { return cur }
+    cur = if cur < cwIxParent.length { cwIxParent[cur] } else { -1 }
+    guard = guard + 1
+  }
+  -1
+}
+
 // Whether the `let` node `bd` is written from another function than the one that declares it, a
 // module binding included: a cell every function reading it sees after the write. True where the
 // frames do not model the write.
@@ -2673,7 +2755,7 @@ export function cwParamArgs(pIx: i32, out: i32[]): boolean {
 }
 
 // `cwParamArgs`, with the call each value is handed by pushed to `calls` beside it.
-export function cwParamArgCalls(pIx: i32, out: i32[], calls: i32[]): boolean {
+function cwParamArgCalls(pIx: i32, out: i32[], calls: i32[]): boolean {
   const pn = nodeAt(pIx)
   if !(pn is Param) { return false }
   if pn.parRest == 1 { return false }

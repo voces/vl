@@ -1,3 +1,4 @@
+import { asgNameWiderRow, cloRetValSlot } from "./emit_classify"
 import { identityBinIsMixed } from "./emit_fn_scans"
 import { identityArmSlot } from "./emit_if_arm_values"
 import {
@@ -84,6 +85,7 @@ import {
   elabCallKeepsRecordAt,
   elabDeliveredBundleSigs,
   elabDeliveredBundles,
+  elabHasTypedReads,
   elabInstTyAt,
   elabNestedCopyOnChain,
   elabNodeRepAt,
@@ -1399,6 +1401,7 @@ import {
   sharedFieldArmBoxesAtomSet,
   sharedFieldArmConverts,
   sharedFieldArmLitTexts,
+  sharedFieldArmNulRecord,
   sharedFieldArmNulStr,
   sharedFieldArmNull,
   sharedFieldArmStructTag,
@@ -6293,8 +6296,18 @@ function emitIs(body: u8[], isIx: i32, fnIx: i32) {
       }
     }
     // A non-union operand whose type is a member of the tested union fits it: the operand is
-    // evaluated for its effects and the test is true (D3360).
+    // evaluated for its effects and the test is true (D3360). So does a union operand every
+    // member of which the checker found the tested type contains (`tyTestMeet`, D4085).
     const covOp = nodeTyAt(nd0.isObj, fnIx)
+    if (
+      exprUnion(nd0.isObj, fnIx)
+      && isTestedEveryMember(covOp, isVarTyIxOf(isIx))
+    ) {
+      if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+      fbDrop()
+      fbI32Const(1)
+      return 0
+    }
     if (
       covOp >= 0
       && !isUnionOfTy(covOp)
@@ -6338,6 +6351,21 @@ function emitIs(body: u8[], isIx: i32, fnIx: i32) {
     }
   }
   emitIsTest(body, isIx, fnIx)
+}
+
+// Whether every member of union operand type `op` is a member of the tested type `t`, the
+// meet the checker recorded for the test.
+function isTestedEveryMember(op: i32, t: i32): boolean {
+  if op < 0 || t < 0 || op >= T.tys.length || t >= T.tys.length { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(op, ms)
+  const ts: i32[] = []
+  flattenVariantsInto(t, ts)
+  if ms.length < 2 { return false }
+  for m in ms {
+    if !i32ListHas(ts, m) { return false }
+  }
+  true
 }
 
 // Whether closed record or list type `op` is the tested type `t` itself.
@@ -9338,24 +9366,26 @@ function coerceValueAtomKind(
     cak = d209k
   } else if exprString(exprIx, fnIx) {
     cak = 2 // "string"
-  } else if exprStringArray(exprIx, fnIx) {
+  } else if exprStringArray(bareIx, fnIx) {
+    // A list is classified by the literal under any parens, which is the node that adopts the
+    // destination's element (a paren keeps the literal's own type).
     cak = 9 // "string[]" — a list member rides as a wrapper ref (like a string)
-  } else if exprF32Array(exprIx, fnIx) {
+  } else if exprF32Array(bareIx, fnIx) {
     // Checked BEFORE the f64 arm: an f32-typed list value (an `f32[]` local/param/
     // narrowed read) must not be mis-claimed as `f64[]`. A bare float LITERAL still
     // classifies f64 (`exprF32Array` never claims it) — the `f64[]` → `f32[]`
     // re-encode below retargets it when only the f32 arm exists.
     cak = 12 // "f32[]"
-  } else if exprF64Array(exprIx, fnIx) {
+  } else if exprF64Array(bareIx, fnIx) {
     cak = 8 // "f64[]"
-  } else if exprI64Array(exprIx, fnIx) {
+  } else if exprI64Array(bareIx, fnIx) {
     cak = 10 // "i64[]"
-  } else if exprU8Array(exprIx, fnIx) {
+  } else if exprU8Array(bareIx, fnIx) {
     // Before the i32-list arm: a packed element reads as an i32, so that arm would claim it and
     // tag the box `i32[]` over a packed backing. Every packed width classifies here, and its row
     // picks `u8[]`'s code or its own twin's.
-    cak = pkKindOfRow(exprPackedRow(exprIx, fnIx))
-  } else if exprArray(exprIx, fnIx) {
+    cak = pkKindOfRow(exprPackedRow(bareIx, fnIx))
+  } else if exprArray(bareIx, fnIx) {
     cak = 7 // "i32[]"
     // "boolean[]" (17) or "(boolean | null)[]" (18), read at this instance's pin
     const bcode = exprBoolListCode(bareIx, fnIx)
@@ -10489,10 +10519,37 @@ function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
     && !narrowedNulStructArm(exprIx, fnIx)
     && !exprTyIsRecord(exprIx, false, fnIx)
     && !exprTyIsRecord(exprIx, true, fnIx)
+    && exprRecordArmsTy(exprIx, fnIx) < 0
   ) {
     return false
   }
   exprUnion(exprIx, fnIx)
+}
+
+// Whether `exprIx` is a union of records each stored at heap `heapIdx` (`exprRecordArmsTy`).
+function exprRecordArmsAt(exprIx: i32, fnIx: i32, heapIdx: i32): boolean {
+  const ru = exprRecordArmsTy(exprIx, fnIx)
+  if ru < 0 || heapIdx < 0 || heapIdx == uBoxIdx { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(ru, ms)
+  for m in ms {
+    if armHeapOfTy(m) != heapIdx { return false }
+  }
+  true
+}
+
+// The checker's union type of `exprIx` where every member is a record, which the checker let a
+// record slot take because each member fits it (D16321); -1 otherwise.
+function exprRecordArmsTy(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const ty = nodeTyAt(unwrapParen(exprIx), fnIx)
+  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyUnion) { return -1 }
+  const ms: i32[] = []
+  flattenVariantsInto(ty, ms)
+  for m in ms {
+    if !tyIsRecord(m) { return -1 }
+  }
+  ty
 }
 
 // Whether the checker typed `exprIx` as one record, or as `record | null` when `nullable`.
@@ -10510,6 +10567,17 @@ function exprTyIsRecord(exprIx: i32, nullable: boolean, fnIx: i32): boolean {
 // stack. A negative `heapIdx` emits nothing: a destination whose table slot never resolved has
 // no cast target, and `ref.cast -1` would put a garbage heap index in the module.
 function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32, fnIx: i32) {
+  // A union of records is unboxed into one record slot only where every arm is stored at that
+  // slot's heap; one built at the slot's own record (D15719) is no box and casts nothing.
+  if (
+    !exprRecordArmsAt(exprIx, fnIx, heapIdx)
+    && narrowedStructArmVi(exprIx, fnIx) < 0
+    && !narrowedNulStructArm(exprIx, fnIx)
+    && !exprTyIsRecord(exprIx, false, fnIx)
+    && !exprTyIsRecord(exprIx, true, fnIx)
+  ) {
+    return 0
+  }
   armSrcShadowNote(heapIdx, exprIx, fnIx)
   emitArmUnboxCast(heapIdx, armUnboxNullable(exprIx, fnIx))
 }
@@ -12628,8 +12696,11 @@ function emitSharedFieldArm(
   if boxes && bk < 0 && !nulStr && !setStr {
     recTag = if readIx >= 0 { sharedFieldArmStructTag(vi, fi, nodeTyAt(readIx, fnIx)) } else { -1 }
   }
-  if recTag >= 0 {
+  const nulRec = recTag >= 0 && sharedFieldArmNulRecord(vi, fi)
+  if recTag >= 0 && !nulRec {
     fbI32Rel(RS_TAG, recTag)
+  } else if nulRec {
+    // The tag is chosen once the ref is read: a null ref boxes under the null tag (D16170).
   } else if setStr {
     fbI32Rel(RS_TAG, scalarTagOfKind(sharedFieldArmBoxKind(vi, fi)))
   } else if boxes && !nulStr {
@@ -12661,6 +12732,22 @@ function emitSharedFieldArm(
     const idSlot = objOrderStashSlot("i32", FC_I32, uFieldStorageSlot(vi, fi))
     fbLocalSet(idSlot)
     return emitAtomToStrChain(body, texts, 0, idSlot)
+  }
+  if nulRec {
+    const rSlot = objOrderStashSlot(
+      "nulstruct",
+      FC_STRUCT,
+      uFieldStorageSlot(vi, fi),
+    )
+    fbLocalSet(rSlot)
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbI32Rel(RS_TAG, recTag)
+    fbLocalGet(rSlot)
+    fbRefIsNull()
+    fbSelect()
+    fbLocalGet(rSlot)
+    fbStructNew(uBoxIdx)
+    return 0
   }
   if nulStr {
     // A `string | null` field boxes under the null tag when its ref is null, else the string tag.
@@ -28005,7 +28092,7 @@ function emitBundleMemberArg(body: u8[], arg: i32, fnIx: i32): i32 {
 // An annotated binding `letIx` initialised with a bundle holder's read: the member its type
 // names, picked off the holder's record. 0, -1, or 1 where the binding is no such one.
 export function emitTypedHolderInit(body: u8[], letIx: i32, fnIx: i32): i32 {
-  const tm = elabTypedReadMemberAt(nodeSrc[letIx] ?? letIx, elabKeyOfFn(fnIx))
+  const tm = if elabHasTypedReads() { elabTypedReadMemberAt(nodeSrc[letIx] ?? letIx, elabKeyOfFn(fnIx)) } else { -1 }
   const ln = nodeAt(letIx)
   if tm < 0 || !(ln is LetDecl) { return 1 }
   emitBundleMemberPick(body, ln.letInit, tm, fnIx)
@@ -32615,7 +32702,9 @@ function retStorageMismatch(retArg: i32, fnIx: i32): boolean {
     return false
   }
   const rd = repOfFnSlot(fe)
-  if tyAt(rt) is TyMap { return mapShapeOfExpr(retArg, fnIx) != rd.rdSlot }
+  if tyAt(rt) is TyMap {
+    return mapShapeOfExpr(retArg, fnIx) != cloRetValSlot(fe)
+  }
   // A list is built at its own kind; a ref list at another kind than the result's misses it, and
   // one at the result's kind misses it where its row differs.
   const lk = exprListRep(retArg, fnIx)
@@ -38154,6 +38243,11 @@ function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
   if own == NULL_OWN_NONE && d.rdKind == "nulnone" {
     own = nullOwnOfTy(nodeCtxTyIxOf(parenPeelIx(exprIx)))
   }
+  // A list element is the null of the element its list literal is built at (D16311).
+  if own == NULL_OWN_NONE && d.rdKind == "nulnone" {
+    const lo = ctxElemOwnerOf(parenPeelIx(exprIx))
+    if lo >= 0 { own = listElemNullOwn(nodeTyAt(lo, fnIx)) }
+  }
   // An instance's stamp can be an inner join's, which a delivery at a wider type outlives: the
   // instance's contextual type, where closed, names the null its storage holds (D14640).
   // A template stamp that names a type parameter names no null of its own either (`V | null`).
@@ -38162,6 +38256,17 @@ function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
     if co != NULL_OWN_NONE { own = co }
   }
   own
+}
+
+// The null the element of list type `t` (through `| null`) names, as `nullOwnOfTy` does.
+function listElemNullOwn(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return NULL_OWN_NONE }
+  const n0 = tyAt(t)
+  const u = if n0 is TyNullable { n0.nInner } else { t }
+  if u < 0 { return NULL_OWN_NONE }
+  const n = tyAt(u)
+  if n is TyArray { return nullOwnOfTy(n.aElem) }
+  NULL_OWN_NONE
 }
 
 // The null type `t` names by its rep: the boolean, atom or string niche, else `NULL_OWN_NONE`.
@@ -39488,6 +39593,14 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       fbLocalGet(asgParkedSlot)
       fbRefAsNonNull()
       return emitUnionUnboxTail(boxTagOfTy(nodeTyAt(exprIx, fnIx)))
+    }
+    // A name whose record the right side's wider record extends by its row's `sub` chain stores
+    // that record itself, so the re-read cast back to its row is the value (D16105).
+    const wsr = asgNameWiderRow(exprIx, fnIx)
+    if wsr >= 0 {
+      if emitAsgValue(body, exprIx, fnIx, -1) < 0 { return -1 }
+      fbRefCast(sHeapIdx[wsr])
+      return 0
     }
     return emitFail(
       "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",

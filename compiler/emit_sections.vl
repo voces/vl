@@ -1,3 +1,4 @@
+import { vkShadowLocals, vkShadowSweep } from "./emit_vk_shadow"
 import { repSlotOfKind } from "./emit_rep_slot"
 import { spellTyShadowSweep } from "./emit_union_atoms"
 import { monoPinSpellShaped } from "./pin_spell"
@@ -314,7 +315,7 @@ import {
   emitFnSpanStart,
   emitFnSpanTag,
   emitLetCursor,
-  emitPhase,
+  emitPhaseSet,
   emitRootIx,
   emitStateReset,
   envCacheFes,
@@ -1102,7 +1103,11 @@ function buildLocals(fnIx: i32) {
   // balanced/empty), then the emit pass rebuilds it in lockstep.
   localRegistryReset()
   const fn = nodeAt(fnIx)
-  if fn is FuncDecl { return collectLocals(fn.fnBody, fnIx) }
+  if fn is FuncDecl {
+    const rc = collectLocals(fn.fnBody, fnIx)
+    vkShadowLocals(fnIx)
+    return rc
+  }
   emitFail("emitProgram: not a function declaration")
 }
 
@@ -7571,7 +7576,7 @@ function emitProgramReset(rootIx: i32) {
   // Back to the start of the timeline: the capture cache is only valid for a FINAL AST, and a
   // phase left by the previous program on a shared instance would arm every later-phase reader
   // over this program's whole pass table. See `EmitPhase`.
-  emitPhase = "passes"
+  emitPhaseSet("passes")
   capMemoArmed = false
   // The in-flight map-return stack holds `fnStmts` positions, the same arena-keyed index this
   // block exists to stop leaking across programs. It is push/pop-balanced
@@ -7759,17 +7764,17 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
       )
     }
     capMemoArmed = passKeepsCaptures(pname)
-    if pname == "monomorphize" { emitPhase = "monomorphizing" }
+    if pname == "monomorphize" { emitPhaseSet("monomorphizing") }
     const prc = runEmitPass(pname, stmts, rootIx)
     capMemoArmed = false
     if prc < 0 { return -1 }
     identAuditMark(pname)
     // The phases a pass row advances; see `EmitPhase`.
     if pname == "monomorphize" {
-      emitPhase = "monomorphized"
+      emitPhaseSet("monomorphized")
       copiedDeclTysCarry()
     }
-    if pname == "capCacheBuild" { emitPhase = "capsCached" }
+    if pname == "capCacheBuild" { emitPhaseSet("capsCached") }
     passDone.push(pname)
     // The generation a cross-pass classifier memo stamps: a row that fills a table the
     // ladder reads is invisible to an arena-shaped staleness test, so an answer may not
@@ -7901,7 +7906,7 @@ function emitProgramRun(rootIx: i32) {
     // The last row has run, so nothing rewrites the arena from here on and a whole-program
     // index is safe to build. Its own contract is on the declaration.
     mapTwinSettle()
-    emitPhase = "arenaFinal"
+    emitPhaseSet("arenaFinal")
     // After the arena is final, so a literal binding re-seated at a join's row is seen there.
     if auditRecordJoinLeaves() < 0 { return -1 }
     // The expected-type context every emitter threads, unseeded.
@@ -7917,6 +7922,7 @@ function emitProgramRun(rootIx: i32) {
     spellTyShadowSweep()
     // The ladder-vs-descriptor agreement oracle, same arming and window: what every converted
     // classifier site answered beside what `repOfTy` would have. A no-op unless armed.
+    vkShadowSweep()
     repLadderABSweep()
     return rc
   }
@@ -9562,6 +9568,8 @@ function emitGlobalSection() {
         gi = gi + 1
         continue
       }
+      // The cell's declaration is the anchor (`emitCurStmtIx`): no body is being lowered here.
+      emitCurStmtIx = globalStmts[gi]
       const g = nodeAt(globalStmts[gi])
       if g is LetDecl {
         if globalIsNonConst(globalStmts[gi]) {
@@ -9599,6 +9607,7 @@ function emitGlobalSection() {
       }
       gi = gi + 1
     }
+    emitCurStmtIx = -1
     // The heap window last: base then limit, immutable, at `gHeapGlobalIdx` and the next index.
     if nHeap == 2 {
       wU8(127) // 0x7f i32

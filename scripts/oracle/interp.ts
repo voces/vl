@@ -472,7 +472,7 @@ export class Interp {
   // compiler answers from the type it was built at: an owner question, so no verdict here.
   isTest(v: Val, t: Ty, env: Env): boolean {
     // a type parameter is erased here, while the compiler tests the instance's type
-    if (t.k === "name" && env.lookupTy(t.name) === "param") throw new Unsupported("`is` on a type parameter");
+    if (mentionsParam(t, env)) throw new Unsupported("`is` on a type parameter");
     const r = this.fits(v, t, env, new Set(), true);
     if ((Array.isArray(v) && v.length === 0) || (v instanceof VMap && v.m.size === 0)) {
       const arms = (() => { const x = this.resolve(t, env); return x.k === "union" ? x.arms : [x]; })();
@@ -1345,6 +1345,18 @@ export class Interp {
 // ── builtins and the std subset ────────────────────────────────────────────────────
 
 const STD_METHOD = new Set(["reverse", "concat", "insert", "indexOf", "includes", "lastIndexOf", "toString", "filled"]);
+
+function mentionsParam(t: Ty, env: Env): boolean {
+  switch (t.k) {
+    case "name": return env.lookupTy(t.name) === "param" || t.args.some((a) => mentionsParam(a, env));
+    case "list": return mentionsParam(t.el, env);
+    case "map": return mentionsParam(t.key, env) || mentionsParam(t.val, env);
+    case "union": return t.arms.some((a) => mentionsParam(a, env));
+    case "rec": return t.fields.some((f) => mentionsParam(f.ty, env));
+    case "fn": return t.params.some((a) => mentionsParam(a, env)) || mentionsParam(t.ret, env);
+    default: return false;
+  }
+}
 
 function isNumLit(e: Expr): boolean {
   return e.k === "int" || e.k === "float" || (e.k === "un" && e.op === "-" && isNumLit(e.e));

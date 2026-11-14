@@ -1685,6 +1685,9 @@ a recommendation. The spec's own questions are in `docs/spec/OPEN-QUESTIONS.md`.
   Brief: `docs/internals/incremental-compilation-design.md`.
 - **J2.** Which runner hosts the surviving JS-side tests, Node or another?
 - **`--strip-locations` for release builds.** It was recommended on 2026-09-01 and never ruled.
+- **The seed sidecar's trust (engineering review 2026-11, Small 1) — RULED 2026-11-14, option
+  C.** The seed's `.cwasm` lives only in the private seed cache, never beside the seed in a
+  checkout. DECISIONS.md, "The seed sidecar lives only in the user's private cache".
 
 ## Dismissed — filed as owner rulings, verified NOT open
 
