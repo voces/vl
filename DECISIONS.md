@@ -943,6 +943,13 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   stays refused — a string has no identity a program can rely on (literal sharing and
   concatenation results are compiler choices), so `===` on it is a check error pointing
   at `==`; any future identity on strings is a named std helper, never `===`. (D15975)
+  **Reconfirmed and extended by the owner 2026-11-14:** `==` on two functions is a check error
+  pointing at `===`, landing with `===`. The rule is: `==` is refused exactly when both operands
+  can hold a function in the same position — a union arm, a nullable's inner type, a record field
+  or a list element. `u == 5` and `cb == null` stay legal; `u == v` over two function-holding
+  unions is refused (narrow first, or `===`); a list of functions refuses `==` as a record with a
+  function field does. Go, Rust, Swift and Haskell reject value equality on functions; JS,
+  Python and Java fall back to identity, the reading A15 rejected. (D15975)
 - **Keys: `Map`/`Set` keys are STRUCTURAL, and key-eligible = `==`-comparable.** Every
   field kind `==` accepts keys — `f64`, lists, nested structs included; the key hash and
   `==` share ONE lowering (D1017 is why). Consequences recorded rather than
