@@ -777,8 +777,7 @@ Deno.test({
       COL_CALLEE,
       DROP_NONE,
       true,
-      // `lap(id)` is typed through `id`'s set at check, so `w`'s result no longer moves (D16209).
-      "post moved: unmoved: agree i32 | __lambda_0=1; post seed: agree i32 | __lambda_0=1; post settled: agree i32 | __lambda_0=1",
+      "post moved: moved: agree str | w$1=1; post moved: moved: agree str | w=1; post moved: unmoved: agree i32 | __lambda_0=1; post seed: agree i32 | __lambda_0=1; post seed: kind str vs i32 | w$1=1; post seed: kind str vs i32 | w=1; post settled: agree i32 | __lambda_0=1; post settled: agree str | w$1=1; post settled: agree str | w=1",
       "col",
     );
     expectRows(
