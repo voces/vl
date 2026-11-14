@@ -9,6 +9,14 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-test-emit-refusal-hook](2026-11-14-test-emit-refusal-hook.md): The `--test-emit-refusal` hook: a stable witness for the instance-position guard, 2026-11-14
+- [2026-11-14-one-callee-rule](2026-11-14-one-callee-rule.md): one rule for "the function a call through a binding runs" (D16072, lane I), 2026-11-14
+- [2026-11-14-instance-position-witness](2026-11-14-instance-position-witness.md): A stable witness for the instance-position guard: a proposal, 2026-11-14
+- [2026-11-14-g40-nrm-typed](2026-11-14-g40-nrm-typed.md): D16052: a niche-nullable map value's inner member is read by type, 2026-11-14
+- [2026-11-14-g39-elem-union-row-only](2026-11-14-g39-elem-union-row-only.md): D16032 / D16052: a list arm's element union is read from its row only, 2026-11-14
+- [2026-11-14-d3373-coalesce-nullable-fn](2026-11-14-d3373-coalesce-nullable-fn.md): D3373: `??` over a nullable function value is the closure's own nullable ref, 2026-11-14
+- [2026-11-13-g38-print-plan-count](2026-11-13-g38-print-plan-count.md): D16052: `printUnionPlanCode` counts member types, not atoms, 2026-11-13
+- [2026-11-13-d16008-record-else-remainder](2026-11-13-d16008-record-else-remainder.md): D16008: a record `is` test's `else` arm over an un-annotated parameter reads its remainder, 2026-11-13
 - [2026-11-14-sweep-owed-refusals](2026-11-14-sweep-owed-refusals.md): The sweep accepts an owed refusal, 2026-11-14
 - [2026-11-13-step7-d16032-arm-rows-closure-arm](2026-11-13-step7-d16032-arm-rows-closure-arm.md): Step 7 (lane D, D16032): the arm-row and closure-arm readers read rows, 2026-11-13
 - [2026-11-13-h-d16005-eq-else-hole](2026-11-13-h-d16005-eq-else-hole.md): lane H: an `==` test's else over a hole defers its literal remainder (D16005), 2026-11-13

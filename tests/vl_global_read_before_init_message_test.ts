@@ -1,6 +1,6 @@
 // The SENTENCE a module global read or written before its initializer ran prints before it
-// aborts (D2652, D2654), and the one a closure-shared local with no zero value prints when a
-// closure reads it before its first write (D2340).
+// aborts (D2652, D2654), and the one a closure-shared local with no initializer prints when a
+// closure reads it before its first write (D2340, D16023).
 //
 // The corpus `@trap` directive sees only the abort, and before the guard a non-null reference
 // global already aborted (an anonymous `null reference`), so its fixture reads the same either
@@ -65,6 +65,14 @@ const CASES: [string, string][] = [
   ],
   [
     "closures/shared-let-read-early-traps-nullable.vl",
+    "`u` read before it is assigned\n",
+  ],
+  [
+    "closures/shared-let-read-early-traps-i32.vl",
+    "`u` read before it is assigned\n",
+  ],
+  [
+    "closures/shared-let-read-early-traps-string.vl",
     "`u` read before it is assigned\n",
   ],
   [
