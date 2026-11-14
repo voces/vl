@@ -1649,6 +1649,7 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   const names: string[] = []
   const tys: i32[] = []
   if !elabCanon(decl, names0, tys0, names, tys) { return -1 }
+  elabLamHoleTysClose(tys)
   const parent = elabParentFor(decl, from)
   if parent == 0 - 2 { return -1 }
   const key = i32ToStr(parent) + "^" + elabKeyOf(decl, names, tys)
@@ -10141,6 +10142,9 @@ function elabArmHandsSet(a: i32, ad: i32): boolean {
 export function elabRun() {
   elabRunDone = false
   elabRunKeyEnd = -1
+  elabLamClosedTys = Map()
+  elabHoleLamClosed = Map()
+  elabHoleLamsAt = -1
   elabTpDefaultsPrime()
   elabLateNames = []
   elabPinsClosedSet(false)
@@ -10287,7 +10291,9 @@ export function elabRun() {
   while r < n {
     const ix = callBindIxAt(r)
     rowed[ix] = true
-    const tys = elabSetArgBind(ix, callBindNamesAt(r), elabRowTys(r), -1)
+    const tys0 = elabSetArgBind(ix, callBindNamesAt(r), elabRowTys(r), -1)
+    const tl = elabRowByLamGenResults(ix, tys0)
+    const tys = if tl.length > 0 { tl } else { tys0 }
     elabSetCallRows(ix, callBindNamesAt(r), tys, -1, -1)
     if elabRowClosedOrSet(tys) {
       const d = elabCallDeclOf(ix)
@@ -12528,6 +12534,177 @@ function elabRowByFnResults(ix: i32, names: string[], tys: i32[]): i32[] {
     i = i + 1
   }
   if tysClosed(out) { out } else { [] }
+}
+
+// Row `tys` of call `ix` with each hole bound to a lambda argument's type closed, where that type
+// leaves only its result to holes and the lambda returns one generic read the walk delivers at one closed
+// function type: the generic is instanced there and the lambda's result is its result (D16077).
+// [] when the row stays open.
+function elabRowByLamGenResults(ix: i32, tys: i32[]): i32[] {
+  if ix < 0 || ix >= P.nodes.length { return [] }
+  const cn = nodeAt(ix)
+  if !(cn is Call) { return [] }
+  const out = tys.slice(0, tys.length)
+  let moved = false
+  for a in cn.callArgs {
+    const lam = parenPeelIx(a)
+    const at = if lam >= 0 && lam < P.nodes.length && nodeAt(lam) is FuncDecl { nodeTyIxOf(lam) } else { -1 }
+    const af = if at >= 0 && at < T.tys.length { tyAt(at) } else { cn }
+    if af is TyFunc && tysClosed(af.fnParamTypes) && tyHasHole(af.fnRet) {
+      const rt = elabLamGenResultTy(lam)
+      if rt >= 0 {
+        const closed = mkFuncTy(af.fnParamTypes, rt)
+        let q = 0
+        while q < out.length {
+          if tySame(out[q], at) {
+            out[q] = closed
+            elabLamClosedTys[lam] = closed
+            moved = true
+          }
+          q = q + 1
+        }
+      }
+    }
+  }
+  if moved && tysClosed(out) { out } else { [] }
+}
+
+// The lambdas whose type leaves only its result to holes, beside that type, gathered once a run.
+let elabHoleLams: i32[] = []
+let elabHoleLamTys: i32[] = []
+let elabHoleLamsAt = -1
+// Each such lambda's closed type, -2 while it is being worked out.
+let elabHoleLamClosed: {[i32]: i32} = Map()
+
+// Replaces in `tys` each type a lambda's own type is, where that type leaves only its result to
+// holes, by the closed type `elabLamGenResultTy` gives the lambda (D16077).
+function elabHoleLamsGather() {
+  if elabHoleLamsAt == P.nodes.length { return 0 }
+  elabHoleLamsAt = P.nodes.length
+  elabHoleLams = []
+  elabHoleLamTys = []
+  let ix = 0
+  while ix < P.nodes.length {
+    const n = nodeAt(ix)
+    if n is FuncDecl && n.fnRet < 0 {
+      const t = nodeTyIxOf(ix)
+      const f = if t >= 0 && t < T.tys.length { tyAt(t) } else { n }
+      if f is TyFunc && tysClosed(f.fnParamTypes) && tyHasHole(f.fnRet) {
+        elabHoleLams.push(ix)
+        elabHoleLamTys.push(t)
+      }
+    }
+    ix = ix + 1
+  }
+  0
+}
+
+function elabLamHoleTysClose(tys: i32[]) {
+  let i = 0
+  while i < tys.length {
+    const t = tys[i]
+    const f = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    if f is TyFunc && tyHasHole(f.fnRet) {
+      elabHoleLamsGather()
+      // Holes are no type to compare by, so a lambda matches on its parameters; every lambda
+      // matching must close at one type.
+      let one = -1
+      let j = 0
+      while j < elabHoleLams.length {
+        const lf = tyAt(elabHoleLamTys[j])
+        if lf is TyFunc && tyListSameAll(lf.fnParamTypes, f.fnParamTypes) {
+          const c = elabHoleLamClosedOf(elabHoleLams[j])
+          if c < 0 || (one >= 0 && !tySame(one, c)) {
+            one = -2
+            j = elabHoleLams.length
+          } else {
+            one = c
+          }
+        }
+        j = j + 1
+      }
+      if one >= 0 { tys[i] = one }
+    }
+    i = i + 1
+  }
+  0
+}
+
+function tyListSameAll(a: i32[], b: i32[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if !tySame(a[i], b[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Lambda `lam`'s closed type (`elabHoleLamsGather`), worked out once; -1 for none.
+function elabHoleLamClosedOf(lam: i32): i32 {
+  const have = elabHoleLamClosed.get(lam) ?? -3
+  if have >= 0 { return have }
+  if have == -2 { return -1 }
+  elabHoleLamClosed[lam] = -2
+  const t = nodeTyIxOf(lam)
+  const f = tyAt(t)
+  const rt = elabLamGenResultTy(lam)
+  let c = if rt >= 0 && f is TyFunc { mkFuncTy(f.fnParamTypes, rt) } else { -1 }
+  // One closed type per shape, so two lambdas closing alike key one instance.
+  for o in elabHoleLamClosed.values() {
+    if c >= 0 && o >= 0 && tySame(o, c) { c = o }
+  }
+  // A lambda with no answer yet is asked again: its delivery may not be walked yet.
+  elabHoleLamClosed[lam] = if c >= 0 { c } else { -3 }
+  if c >= 0 { elabLamClosedTys[lam] = c }
+  c
+}
+
+// The closed type `elabRowByLamGenResults` gave each lambda argument, for mono to pin its callee by.
+let elabLamClosedTys: {[i32]: i32} = Map()
+
+// The closed type the elaboration gave lambda `lam` where its own type is open only in its result;
+// -1 for none.
+export function elabLamClosedTyOf(lam: i32): i32 {
+  elabLamClosedTys.get(lam) ?? -1
+}
+
+// The closed result of lambda `lam` that returns one read of a generic function delivered at one
+// closed function type: that type with the generic's instance there as its result; -1 otherwise.
+function elabLamGenResultTy(lam: i32): i32 {
+  const fn = nodeAt(lam)
+  if !(fn is FuncDecl) { return -1 }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  if rets.length != 1 { return -1 }
+  const x = parenPeelIx(rets[0])
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const g = identFnDeclOf(x)
+  const gs = if g >= 0 && g < P.nodes.length { nodeTyIxOf(g) } else { -1 }
+  const gf = if gs >= 0 && gs < T.tys.length { tyAt(gs) } else { fn }
+  if !(gf is TyFunc) || elabTyClosed(gs, 0) { return -1 }
+  const ds = elabSlotDeliveries(x, [], -1)
+  if ds.length != 1 { return -1 }
+  const dt = tyAt(ds[0])
+  if !(dt is TyFunc) || dt.fnParamTypes.length != gf.fnParamTypes.length {
+    return -1
+  }
+  if !tysClosed(dt.fnParamTypes) { return -1 }
+  const mn: string[] = []
+  const mt: i32[] = []
+  let i = 0
+  while i < dt.fnParamTypes.length {
+    bindGenWalk(gf.fnParamTypes[i], dt.fnParamTypes[i], mn, mt)
+    i = i + 1
+  }
+  if mn.length == 0 { return -1 }
+  const n0 = ekDecl.length
+  const k = elabEnqueue(g, mn, mt, -1)
+  elabReachNote(-1, k, -1)
+  elabSettle(n0)
+  const r = if k >= 0 { elabResultOf(k) } else { -1 }
+  if r < 0 || !elabTyClosed(r, 0) { return -1 }
+  mkFuncTy(dt.fnParamTypes, widenLitTy(r))
 }
 
 // Enqueues each generic or hole function the callee of call `ix` may hold, bound by its signature
