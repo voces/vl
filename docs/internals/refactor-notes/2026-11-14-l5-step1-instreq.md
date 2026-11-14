@@ -51,13 +51,22 @@ is where it becomes an argument.
 **Dead state.** `monoCgcTvN` and `monoCgcTvV` were written at four sites and never read. They are
 deleted, together with `monoLamCloneGenericCalls`'s two parameters that existed only to feed them.
 
+**Two helpers retire, so the pin-helper count stays at 908.** The request constructor `instReqAt`
+and the forwarding `monoInstanceFor` are new functions. To pay for them, the two readers of the old
+globals are inlined at their callers:
+
+- `monoSubstInst`, which was `substTyDeepOf(t, bN, bT, monoInstOwn)`, at its 6 callers;
+- `monoInstBindTyOf`, at its 1 caller.
+
+`tests/budget_pin_helper_test.ts` stays at its baseline.
+
 Lane S's pin-walk globals and the key-staging tables (`monoKeyExtra*`, `monoExplicitBN`/`BT`, which
 the pin walk also writes) are untouched. They follow lane S's stages 3–5.
 
 ## Gate
 
 - **Seeds:** A is a fixpoint built from `git archive 1cece3a2b` (the master merged in). D is a
-  fixpoint built from this branch (two `refresh-compiler.sh` runs `cmp`-equal, sha256 `118f68c2…`).
+  fixpoint built from this branch (two `refresh-compiler.sh` runs `cmp`-equal, sha256 `c41f0d1c…`).
 - **Identity:** `deno run -A scripts/probe-rollback-census.ts --fingerprint` (rc, diagnostics and
   emitted bytes per program) over `tests/cases`, `distilled/cells` and `distilled/named`. That is
   **20,064 programs, 0 different**.
@@ -67,10 +76,12 @@ the pin walk also writes) are untouched. They follow lane S's stages 3–5.
   - `scripts/mono-tyaram-grid.sh`: 252 OK, 9 REJECT, 0 BAD, the same as A.
   - `distilled/regress.vl`: no runs lost.
   - `lint-self.sh`: clean, with every budget at or below its baseline.
+  - `budget_pin_helper_test.ts`: 908, at its baseline.
 
 ## Lines and ratchet
 
-- **Lines:** `compiler/emit_mono.vl` is **+153 / −169, net −16**.
+- **Lines:** `compiler/emit_mono.vl` is **+169 / −184, net −15**. Its function count is unchanged
+  at 908.
 - **Ratchet:** `phase-state-census.vl` reads `hidden` **188 → 175**, with `emit_mono.vl` going from
   31 to 18. `scripts/phase-state-baseline.txt` is rewritten in this PR. `cross` and `surface` are
   unchanged at 593 and 1,166, because every deleted global was private to mono.
