@@ -3,7 +3,6 @@
 // after both operands are checked, with literal operands already widened.
 // Does not lower anything; the emitter's arm is separate.
 import { P, STRICT_EQ_CODE } from "./ast"
-import { CODE_UNSUPPORTED_LOWERING } from "./check_messages"
 import { assignable, tErr, tErrPushTok } from "./check_relate_core"
 import { nomBinMixes } from "./check_type_shape"
 import {
@@ -29,8 +28,8 @@ import { nodeLastTok } from "./fmt_util"
 import { isNullTy, nonNullTy } from "./tyquery"
 
 // Whether a value of type `ty` has an identity `===` can compare: a record, a list, a map, a
-// function, a nullable of one, or a union whose arms are all records or all functions. A type
-// parameter answers true, so an instance's re-check decides it at the concrete type.
+// function, a nullable of one, or a union whose arms are records or functions. A type parameter
+// answers true, so an instance's re-check decides it at the concrete type.
 export function tyHasIdentity(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
@@ -42,17 +41,18 @@ export function tyHasIdentity(ty: i32): boolean {
       return tyHasIdentity(t.nInner)
     }
     TyUnion => {
-      // All records (compared by payload) or all functions (by declaration and environment).
-      let recs = 0
-      let fns = 0
+      // Records compare by payload, functions by declaration and environment, a mix per arm.
+      let arms = 0
       for m in t.uMembers {
         if !isNullTy(m) {
-          if m >= 0 && tyAt(m) is TyObj { recs = recs + 1 }
-          else if m >= 0 && tyAt(m) is TyFunc { fns = fns + 1 }
-          else { return false }
+          if m >= 0 && (tyAt(m) is TyObj || tyAt(m) is TyFunc) {
+            arms = arms + 1
+          } else {
+            return false
+          }
         }
       }
-      return (recs > 0) != (fns > 0)
+      return arms > 0
     }
     TyPrim | TyErr | TyLit | TyNeg => {
       return false
@@ -60,8 +60,9 @@ export function tyHasIdentity(ty: i32): boolean {
   }
 }
 
-// Whether `ty`, a nullable peeled, is a union with both record and function arms and no other.
-function tyIsRecordFnMix(ty: i32): boolean {
+// Whether `ty`, a nullable peeled, is a union with both record and function arms, whose identity
+// compares each arm its own way.
+export function tyIdentityMixesArms(ty: i32): boolean {
   let t = ty
   if t >= 0 && t < T.tys.length {
     const n = tyAt(t)
@@ -75,7 +76,6 @@ function tyIsRecordFnMix(ty: i32): boolean {
   for m in u.uMembers {
     if m >= 0 && tyAt(m) is TyObj { recs = recs + 1 }
     else if m >= 0 && tyAt(m) is TyFunc { fns = fns + 1 }
-    else if !isNullTy(m) { return false }
   }
   recs > 0 && fns > 0
 }
@@ -118,19 +118,6 @@ export function checkIdentityBinNode(
   const eqOp = op.slice(0, 2)
   const sides = [lt, rt]
   for s in sides {
-    if s >= 0 && tyIsRecordFnMix(s) {
-      identityErr(
-        "`"
-          + op
-          + "` over a union of records and functions is not supported yet — narrow both to "
-          + "one arm first",
-        ix,
-        leftIx,
-        op,
-        CODE_UNSUPPORTED_LOWERING,
-      )
-      return TY_BOOL
-    }
     if s >= 0 && !isNullTy(s) && !tyHasIdentity(s) {
       identityErr(
         "`"
@@ -196,6 +183,34 @@ export function tyFnPosition(ty: i32, seen: i32[]): string {
       return ""
     }
   }
+}
+
+// The refusal of identity constraint `op` over a call's substituted operand types `lt`/`rt`, in
+// the direct spelling's words, or "" when both have an identity.
+export function identityCstrRefusal(op: string, lt: i32, rt: i32): string {
+  const sides = [lt, rt]
+  for s in sides {
+    if s >= 0 && !isNullTy(s) && !tyHasIdentity(s) {
+      return "`"
+        + op
+        + "` compares identity, and `"
+        + tyToStr(s)
+        + "` has none — use `"
+        + op.slice(0, 2)
+        + "`"
+    }
+  }
+  ""
+}
+
+// The operand type that fails identity constraint over `lt`/`rt` (the one `identityCstrRefusal`
+// names), or -1.
+export function identityCstrOffender(lt: i32, rt: i32): i32 {
+  const sides = [lt, rt]
+  for s in sides {
+    if s >= 0 && !isNullTy(s) && !tyHasIdentity(s) { return s }
+  }
+  -1
 }
 
 // The first field of record `ty` (a nullable peeled) that can hold a function, or "".
