@@ -2657,6 +2657,141 @@ export function applyGenAlias(head: string, inner: string) {
   applyGenAliasArgs(head, inner, -1)
 }
 
+// The generic alias applications being resolved, outermost first: the alias index and a slice of
+// `gaOpenFlat` holding its argument types.
+const gaOpenGi: i32[] = []
+const gaOpenStart: i32[] = []
+const gaOpenFlat: i32[] = []
+
+// How many applications of one alias may be open at once before the expansion counts as endless,
+// whatever its arguments look like.
+const GA_OPEN_MAX = 32
+
+// Whether applying alias `gi` to `args` while an application of it is still open grows: an
+// argument holds the open one's argument at that position under a constructor, or the nesting
+// passed `GA_OPEN_MAX`.
+function gaGrowsOpen(gi: i32, args: i32[]): boolean {
+  let open = 0
+  let f = 0
+  while f < gaOpenGi.length {
+    if gaOpenGi[f] == gi {
+      open = open + 1
+      let k = 0
+      while k < args.length {
+        const old = gaOpenFlat[gaOpenStart[f] + k]
+        if args[k] != old && gaArgHolds(args[k], old, 8, false) { return true }
+        k = k + 1
+      }
+    }
+    f = f + 1
+  }
+  open >= GA_OPEN_MAX
+}
+
+// Whether `t` holds `old` under at least one list, map, record, function or alias application
+// (`under`): a union or nullable alone collapses back to a finite set, as in D2721.
+function gaArgHolds(t: i32, old: i32, depth: i32, under: boolean): boolean {
+  if t == old { return under }
+  if t < 0 || t >= T.tys.length || depth <= 0 { return false }
+  if cTyIxSetHas(gaAppTyIxSet, t) {
+    let ai = 0
+    while ai < gaAppTyIxs.length {
+      if gaAppTyIxs[ai] == t {
+        let k = 0
+        while k < gaAppArgCount[ai] {
+          if (
+            gaArgHolds(
+              gaAppArgFlat[gaAppArgStart[ai] + k],
+              old,
+              depth - 1,
+              true,
+            )
+          ) {
+            return true
+          }
+          k = k + 1
+        }
+      }
+      ai = ai + 1
+    }
+  }
+  const ty = tyAt(t)
+  match ty {
+    TyObj => {
+      for ft in ty.objFieldTypes {
+        if gaArgHolds(ft, old, depth - 1, true) { return true }
+      }
+    }
+    TyArray => {
+      return gaArgHolds(ty.aElem, old, depth - 1, true)
+    }
+    TyMap => {
+      return gaArgHolds(ty.mKey, old, depth - 1, true)
+        || gaArgHolds(ty.mVal, old, depth - 1, true)
+    }
+    TyFunc => {
+      for pt in ty.fnParamTypes {
+        if gaArgHolds(pt, old, depth - 1, true) { return true }
+      }
+      return gaArgHolds(ty.fnRet, old, depth - 1, true)
+    }
+    TyUnion => {
+      for m in ty.uMembers {
+        if gaArgHolds(m, old, depth - 1, under) { return true }
+      }
+    }
+    TyNullable => {
+      return gaArgHolds(ty.nInner, old, depth - 1, under)
+    }
+    TyPrim => {}
+    TyErr => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+  }
+  false
+}
+
+// `t` spelled for the growth refusal: an alias application by its head and arguments, since
+// the one being expanded is a record still being filled in; any other type by `tyToStr`.
+function gaArgStr(t: i32, depth: i32): string {
+  if depth > 0 && t >= 0 && cTyIxSetHas(gaAppTyIxSet, t) {
+    let ai = 0
+    while ai < gaAppTyIxs.length {
+      if gaAppTyIxs[ai] == t {
+        let s = gaAppHeads[ai] + "<"
+        let k = 0
+        while k < gaAppArgCount[ai] {
+          if k > 0 { s = s + ", " }
+          s = s + gaArgStr(gaAppArgFlat[gaAppArgStart[ai] + k], depth - 1)
+          k = k + 1
+        }
+        return s + ">"
+      }
+      ai = ai + 1
+    }
+  }
+  tyToStr(t)
+}
+
+// The refusal of a growing application of alias `head` at `args`.
+function gaGrowMsg(head: string, args: i32[]): string {
+  let at = ""
+  let k = 0
+  while k < args.length {
+    if k > 0 { at = at + ", " }
+    at = at + gaArgStr(args[k], 4)
+    k = k + 1
+  }
+  "the generic type `"
+    + head
+    + "` uses itself at a larger type argument (`"
+    + head
+    + "<"
+    + at
+    + ">`) inside its own definition, so each instance needs a bigger one and they never end: every instance of a generic type is compiled separately, and this one has no finite set of them"
+}
+
 // The body of `applyGenAlias`, with the argument list taken from either source: `appIx >= 0` is a
 // `TS_APP` spelling node whose kids are the arguments, and `inner` is then unused; `appIx < 0`
 // splits `inner` at its top-level commas. Everything after the argument list is one body precisely
@@ -2722,6 +2857,15 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   }
   const cuHit = cUserTypes[memoKey]
   if cuHit is i32 { return cuHit }
+  // A non-regular alias needs a larger application at every unfolding, which no finite set of
+  // instances satisfies (D12131); refused here rather than recursed into without bound.
+  if gaGrowsOpen(gi, argTys) {
+    tErr(gaGrowMsg(head, argTys), annotDiagAt)
+    return TY_ERR
+  }
+  gaOpenGi.push(gi)
+  gaOpenStart.push(gaOpenFlat.length)
+  for at in argTys { gaOpenFlat.push(at) }
   const fnames: string[] = []
   const ftys: i32[] = []
   const resIx = mkObjTy(fnames, ftys)
@@ -2792,6 +2936,10 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
     tpEnvTys.pop()
     pj = pj + 1
   }
+  const openAt = gaOpenStart[gaOpenStart.length - 1]
+  while gaOpenFlat.length > openAt { gaOpenFlat.pop() }
+  gaOpenGi.pop()
+  gaOpenStart.pop()
   resIx
 }
 
