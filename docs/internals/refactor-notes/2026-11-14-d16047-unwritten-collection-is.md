@@ -49,3 +49,8 @@ Master `a1e5fe53d` fixpoint seed against this branch's fixpoint seed:
   maps or `null`; un-annotated vacuous-test cells and write-through-narrowing cells): 358 of 358 run
   after, 0 before, 0 `runs -> not-runs`, 0 silent.
 - D16024's eight `inferred-*-union` templates: 66 of 66 before and after.
+- Sweep: 24,433 the same. 2 output movers, `check_reject -> runs`: D16047's witness and the new case.
+  2 bytes-only movers, D5470's witness and `structs/record-lit-empty-list-field-is.vl`: their
+  `is K[]` over an unwritten record field (the D4771 ruling) now folds to `i32.const 1` in place of
+  a runtime emptiness test, sound because no write anywhere reaches the list (633 to 505 bytes).
+  0 `runs -> not-runs`, 0 new compiler traps.
