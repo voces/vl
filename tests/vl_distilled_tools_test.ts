@@ -112,7 +112,13 @@ const NO_ROW = INCOMPLETE +
   "  1 cell(s) on disk with NO row: fx_new\n" +
   "    fix: vl run scripts/silent-sweep/distilled/index.vl -- --set <named-set> --missing   (a curated set),\n" +
   "         or vl run scripts/silent-sweep/distilled/redistil.vl                        (a derived cell),\n" +
-  "         or regress.vl -- <seed.wasm> --write-baseline --set <named-set> in one move.\n";
+  "         or regress.vl -- <seed.wasm> --write-baseline --set <named-set> in one move.\n" +
+  "  1 cell(s) with no `manifest.json` expectation, which the grader never runs: fx_new\n" +
+  "    fix: add each cell's correct stdout under `expect` in its directory's manifest.json.\n";
+// An indexed cell its manifest names no expected stdout for: the grader would skip it unseen.
+const NO_EXPECT = INCOMPLETE +
+  "  1 cell(s) with no `manifest.json` expectation, which the grader never runs: fx_new\n" +
+  "    fix: add each cell's correct stdout under `expect` in its directory's manifest.json.\n";
 const NO_CELL = INCOMPLETE +
   "  1 row(s) with NO cell: fx_new\n" +
   "    fix: vl run scripts/silent-sweep/distilled/index.vl -- --prune, or restore the missing `.vl`.\n";
@@ -335,7 +341,12 @@ Deno.test({
       await Deno.writeTextFile(`${dir}/stale.jsonl`, stale);
       want(
         "a stale --verify-fresh",
-        await regress([seed, "--verify-fresh", "--baseline", `${dir}/stale.jsonl`]),
+        await regress([
+          seed,
+          "--verify-fresh",
+          "--baseline",
+          `${dir}/stale.jsonl`,
+        ]),
         1,
         HEAD +
           "  runs -> NOT-RUNS  (blocking)    0 classes  (     0 of 1325 census cells)\n" +
@@ -365,6 +376,16 @@ Deno.test({
         1,
         "index: `nosuchset` has no `named/sources.json` entry. A curated set carries its provenance there — what named it and what it cost — before it carries index rows.\n",
       );
+      // A new cell is graded only once its manifest names its stdout, so the one-move add writes
+      // that first; the baseline then holds the cell.
+      const man = `${dir}/${D}/named/manifest.json`;
+      const mj = JSON.parse(await Deno.readTextFile(man));
+      mj.expect.fx_new = "3";
+      await Deno.writeTextFile(man, JSON.stringify(mj, null, 1));
+      await Deno.writeTextFile(
+        `${dir}/${D}/named/fx_new.vl`,
+        "//! run-out: 3\\n\n",
+      );
       want(
         "--write-baseline --set",
         await regress([
@@ -376,15 +397,25 @@ Deno.test({
           `${dir}/b2.jsonl`,
         ]),
         0,
-        "distilled: index — wrote 1 curated row(s) at block fx-set\n" + wrote,
+        "distilled: index — wrote 1 curated row(s) at block fx-set\n" +
+          `distilled: wrote baseline for 11 cells from ${seed}\n`,
       );
       const withNew = rows.replace(
         `{"cell": "fx_reject"`,
         `{"cell": "fx_new", "block": "fx-set", "represents": 1}\n{"cell": "fx_reject"`,
       );
       await sameFile("--write-baseline --set", index, withNew);
-      await sameFile("--write-baseline --set", `${dir}/b2.jsonl`, BASELINE);
+      await sameFile(
+        "--write-baseline --set",
+        `${dir}/b2.jsonl`,
+        BASELINE.replace(
+          `{"cell": "fx_reject"`,
+          `{"cell": "fx_new", "class": "runs", "msg": ""}\n{"cell": "fx_reject"`,
+        ),
+      );
       await Deno.remove(`${dir}/${D}/named/fx_new.vl`);
+      delete mj.expect.fx_new;
+      await Deno.writeTextFile(man, JSON.stringify(mj, null, 1));
       want("an orphan row", await regress([seed]), 2, NO_CELL);
       want(
         "--write-baseline prunes an orphan",
@@ -447,6 +478,12 @@ Deno.test({
         await idx(["--set", "fx-set", "--missing"]),
         0,
         "index: wrote 1 row(s) at block fx-set\n",
+      );
+      want(
+        "--check of an indexed cell with no manifest expectation",
+        await idx(["--check"]),
+        2,
+        NO_EXPECT,
       );
       await Deno.remove(`${dir}/${D}/named/fx_new.vl`);
       want(

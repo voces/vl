@@ -318,14 +318,14 @@ Deno.test({
   want("same diagnostics as `checkSrc`", got.join("\n"), plainCheckDiags(twoErrors).join("\n"));
 
   // The one diagnostic the symbol check did NOT used to report: a deep-`is` arm
-  // that writes its own receiver refuses in the SECOND pass, which only
+  // whose closure writes its own receiver refuses in the SECOND pass, which only
   // `checkSrc` ran. A `checkSrcSym` without it publishes a clean file for a
   // program `vl build` refuses — the reason the parity is a compiler change and
   // not a host one.
   const deepIs = `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
 type Cfg = { port: i32, host: string | null }
 let g: Json = null
-function a(): i32 { if g is Cfg { g = null  return 1 }  0 }
+function a(): i32 { if g is Cfg { const c = () => { g = null }  c()  return 1 }  0 }
 print(a())
 `;
   const deep = await c.check(deepIs, ENTRY_KEY, read);
