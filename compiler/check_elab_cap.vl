@@ -7,6 +7,7 @@ import { decDigitsOf } from "./strutil"
 import { parenPeelIx } from "./check_places"
 import { a20RetWalk } from "./check_nj_gate"
 import {
+  fnResultUnconsumed,
   tailPushBlockTail,
   tailPushIfArms,
   tailPushMatchArms,
@@ -79,6 +80,7 @@ import { declTyOf } from "./check_nar_store"
 import {
   ArrayLit,
   BinExpr,
+  Block,
   Call,
   FieldInit,
   FuncDecl,
@@ -2137,9 +2139,15 @@ export function elabFnListLetTy(bd: i32, t: i32, closedAt: i32): i32 {
 }
 
 // Appends to `out` each value a slot write of a list or record field widened to set `s` stores
-// that names member `d`, a write a callee makes through a parameter included, and returns the
-// slot's function type, or -1 when no such write lands only at that place of such containers.
-export function fnTagWriteLeavesOf(d: i32, s: i32, out: i32[]): i32 {
+// that names member `d`, a write a callee makes through a parameter included, and to `with` each
+// other set such a write's own value carries, which holds the leaf's id too. Returns the slot's
+// function type, or -1 when no such write lands only at that place of such containers.
+export function fnTagWriteLeavesOf(
+  d: i32,
+  s: i32,
+  out: i32[],
+  with: i32[],
+): i32 {
   let et = -1
   let i = 0
   while i < fnListWidened.length {
@@ -2150,6 +2158,7 @@ export function fnTagWriteLeavesOf(d: i32, s: i32, out: i32[]): i32 {
       ["[]"],
       fnListWidenedElem[i],
       out,
+      with,
     )
     if r == -2 { return -1 }
     if r >= 0 { et = r }
@@ -2164,6 +2173,7 @@ export function fnTagWriteLeavesOf(d: i32, s: i32, out: i32[]): i32 {
       fnFieldWidenedPath[i],
       fnFieldWidenedElem[i],
       out,
+      with,
     )
     if r == -2 { return -1 }
     if r >= 0 { et = r }
@@ -2181,6 +2191,7 @@ function fnWriteLeavesAt(
   path: string[],
   elem: i32,
   out: i32[],
+  with: i32[],
 ): i32 {
   if fnTagSetOfTy(elem) != s { return -1 }
   const vals: i32[] = []
@@ -2192,6 +2203,8 @@ function fnWriteLeavesAt(
       if !fnWriteOnlyInto(v, bd, path) { return -2 }
       out.push(v)
       et = elem
+      const o = fnWriteValueSetOf(v)
+      if o >= 0 && o != s && !i32ListHas(with, o) { with.push(o) }
     }
   }
   et
@@ -2272,6 +2285,27 @@ function fnMapArgOnlyOf(d: i32, s: i32, depth: i32): boolean {
     if !fnMapArgOnlyOf(identDeclOf(ap), s, depth + 1) { return false }
   }
   true
+}
+
+// The set the assignment storing write value `v` yields as its own value carries, where that
+// value is read: inside an expression, or as the tail of a function whose result is consumed.
+// -1 for a write whose value is discarded.
+function fnWriteValueSetOf(v: i32): i32 {
+  const p = if v >= 0 && cwIxCovers(v) { cwIxUp[v] } else { -1 }
+  const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if !(pn is BinExpr) || pn.binOp != "=" || !cwIxCovers(p) { return -1 }
+  const q = cwIxParent[p]
+  const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
+  if qn is Block {
+    const st = qn.blkStmts
+    if st.length == 0 || st[st.length - 1] != p || !cwIxCovers(q) { return -1 }
+    const f = cwIxParent[q]
+    const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+    if !(fn is FuncDecl) || fn.fnBody != q || fnResultUnconsumed(f) {
+      return -1
+    }
+  }
+  fnTagSetOfTy(nodeTyIxOf(p))
 }
 
 // Whether the store of write value `v` lands only at `path` of containers like `bd`: its target

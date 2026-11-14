@@ -8,9 +8,11 @@ quick-fixes, semantic highlighting, and a **Run Current File** command for `.vl`
 files, plus **per-test click-to-run** (VS Code's Testing API — gutter run icons
 and a Test Explorer tree) for `*.test.vl` files.
 
-The server type-checks via the TypeScript compiler core by default, or via the
-self-hosted compiler wasm seed — selectable with the `vital.checker` setting
-(`ts` | `wasm` | `both`).
+Every feature runs on the self-hosted compiler's wasm seed; there is no TypeScript
+checker. With no seed found, the server's handlers return empty results. The seed
+is resolved from `vital.compilerWasm`, then `$VL_COMPILER_WASM`, the workspace's
+`build/vl-compiler.wasm`, `vl seed` from an installed CLI, then the copy bundled
+with the extension.
 
 ## How it's wired
 
@@ -155,5 +157,6 @@ folder. You still need steps 1–2 above (the dev host loads `dist/`).
 
 | Setting | Default | Description |
 |---|---|---|
-| `vital.checker` | `ts` | Which compiler produces diagnostics: `ts` (TS core), `wasm` (self-hosted seed, experimental), `both` (publish TS, log divergence). Requires a window reload. |
-| `vital.compilerWasm` | `""` | Path to the self-hosted compiler wasm. Empty → `<workspace>/build/vl-compiler.wasm`. |
+| `vital.compilerWasm` | `""` | Path to a `vl-compiler.wasm` seed; overrides every other source. Empty → resolved as above. |
+| `vital.compilerPath` | `""` | The `vl` binary used by **Run Current File** and by `vl seed`. Empty → `vl` on `PATH`. |
+| `vital.lint.showHeld` | `false` | Also show lint findings a committed ratchet baseline already holds, as greyed hints. |
