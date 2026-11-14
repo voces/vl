@@ -757,20 +757,10 @@ import {
 } from "./emit_elab"
 import {
   tyIsBareMap,
-  unABOn,
-  unNameBound,
   unRowOfCanonFolded,
   unionRowKeyAB,
 } from "./emit_union_registry"
-import {
-  unNameAdoptTyKeyRow,
-  unRowOfTyKey,
-  unTyKeyShadow,
-  unTyKeyTagArm,
-  unTyKeyTagLet,
-  unTyKeyTagParam,
-  unTyKeyTagParamList,
-} from "./emit_union_tykey"
+import { unRowOfTyKey, unTyKeyHasRow } from "./emit_union_tykey"
 import {
   assignTags,
   buildFnMap,
@@ -2611,7 +2601,7 @@ function monoSubstLetType(
       }
       const sub = if sty >= 0 { monoPinSpellNoAnon(sty) } else { "" }
       if sub != "" && sub != tn.tyName {
-        const subC = monoPinMintedUnion(sub, sty, sty, unTyKeyTagLet())
+        const subC = monoPinMintedUnion(sub, sty, sty)
         // Spelled by the registered union an assignment's `letUnionNameOf` resolves (D2676), and
         // typed at the substitution, never by parsing that spelling back: an arm may be spelled
         // by its row label, which names no type.
@@ -8009,12 +7999,7 @@ function monoPinCanonIsUnion(ty: i32): boolean {
 // map or a record (`V | {[K]: i32}` at `V := {[K]: boolean}`), registered under the canon key a
 // direct spelling reuses (D2657) and typed by `own`, the whole annotation (-1: `ty`). One that
 // collapses at the pin is spelled as its survivor (D7044). `shTag` names the shadow root.
-function monoPinMintedUnion(
-  name: string,
-  ty: i32,
-  own: i32,
-  shTag: i32,
-): string {
+function monoPinMintedUnion(name: string, ty: i32, own: i32): string {
   // A list whose element is a union boxes each element, whether the union is spelled inline or
   // named by an alias: one set, one row. A nullable `boolean`, `string` or literal union element
   // is a niche, not a box.
@@ -8036,70 +8021,17 @@ function monoPinMintedUnion(
   } else if !wu || monoPinCanonKind(wt) == 2 {
     return name
   }
-  if !monoTyHoldsRefArm(ty) || unNameBound(name) { return name }
+  if !monoTyHoldsRefArm(ty) { return name }
   // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
   if pun != "" {
-    monoShStage(unTyKeyTagParamList(), tyStepElem(ty))
     // The registered type is the whole annotation's (`own`) at the rep its spelling collapses to.
     const elemTy = if own >= 0 { monoAnnPinTy(tyStepElem(own)) } else { tyStepElem(ty) }
     if monoRegisterPinUnion(pun, elemTy) < 0 { return name }
     return "(" + pun + ")[]"
   }
   if !wu { return name }
-  monoShStage(shTag, ty)
   monoRegisterPinUnion(name, if own >= 0 { monoAnnPinTy(own) } else { ty })
   name
-}
-
-// The type-key shadow's stage for the next `monoRegisterPinUnion`: the root's tag (0 for none)
-// and the type that root hands over. Written only while the shadow is armed.
-let monoShTag = 0
-let monoShTy = -1
-
-function monoShStage(tag: i32, ty: i32) {
-  if unABOn() == 0 { return 0 }
-  monoShTag = tag
-  monoShTy = ty
-  0
-}
-
-// A parameter's pins are classified once the instance's binding is whole: while
-// `monoShParNode` names the annotation being pinned, each pin is held here instead.
-let monoShParNode = -1
-const monoShPendTag: i32[] = []
-const monoShPendName: string[] = []
-const monoShPendNode: i32[] = []
-
-// Hands the pins held since `from` to the shadow, then drops them. Each is typed by its
-// annotation; a list pin by that type's element.
-function monoShPendFlush(from: i32) {
-  let i = from
-  while i < monoShPendTag.length {
-    let ty = nodeTyIxOf(monoShPendNode[i])
-    if ty >= 0 && tyHasTyVar(ty) { ty = -1 }
-    if monoShPendTag[i] == unTyKeyTagParamList() { ty = tyStepElem(ty) }
-    unTyKeyShadow(monoShPendTag[i], monoShPendName[i], ty)
-    i = i + 1
-  }
-  while monoShPendTag.length > from {
-    monoShPendTag.pop()
-    monoShPendName.pop()
-    monoShPendNode.pop()
-  }
-  0
-}
-
-// Offers the row `name` names to the shadow under root `shTag` (0 for none): held while a
-// parameter is being pinned, else compared with the staged type `ty` at once. Returns 0.
-function monoShOffer(shTag: i32, name: string, ty: i32) {
-  if shTag <= 0 { return 0 }
-  if monoShParNode >= 0 {
-    monoShPendTag.push(shTag)
-    monoShPendName.push(name)
-    monoShPendNode.push(monoShParNode)
-    return 0
-  }
-  unTyKeyShadow(shTag, name, ty)
 }
 
 // Whether union `ty` has a literal-union arm beside a non-literal one (`K | i32`), as a member
@@ -8172,23 +8104,13 @@ function monoTyIsRefElem(e: i32): boolean {
 // concrete `T` has no row and every consumer of the box hits its floor. The registration self-gates
 // on the union key's row, which keeps one row per union — a box's tags are that row's, positionally.
 function monoRegisterPinUnion(name: string, ty: i32) {
-  const shTag = monoShTag
-  monoShTag = 0
-  const shTy = monoShTy
-  monoShTy = -1
   // A pin minted at a union or a nullable needs a box row; any other pin registers nothing.
   const ut = if ty >= 0 && ty < T.tys.length { tyAt(ty) } else { tyAt(0) }
   if ty < 0 || !(ut is TyUnion || ut is TyNullable) { return 0 }
-  // A union type already holding a row binds this spelling to it; only a new type mints one.
-  if (
-    unNameBound(name)
-    || (unRowOfTyKey(ty) >= 0 && unNameAdoptTyKeyRow(name, ty))
-  ) {
-    return monoShOffer(shTag, name, shTy)
-  }
+  // A union type already holding a row is named by it; only a new type mints one.
+  if unTyKeyHasRow(ty) { return 0 }
   const before = uVariants.length
   if registerInlineUnionOfTy(monoProgStmts, name, ty) < 0 { return -1 }
-  monoShOffer(shTag, name, shTy)
   // Re-rank only when a variant is pushed: `assignTags` ranks variants globally and a value
   // union pushes none, so unconditional re-ranking would be quadratic.
   if uVariants.length != before { return assignTags() }
@@ -8304,8 +8226,6 @@ export function monoStateReset() {
   monoPinHoleT = []
   monoPinInLit = false
   monoPinLetReaches = false
-  monoShParNode = -1
-  monoShTy = -1
   monoWriteCoercedCall = -1
   structTyAliasableReset()
   0
@@ -8694,12 +8614,10 @@ function monoMakeInstanceParams(
             const pst = monoSubstInst(nodeTyIxOf(p3.parType), exBN, exBT)
             if pst >= 0 && !tyHasTyVar(pst) { gateTy = pst }
           }
-          if unABOn() > 0 { monoShParNode = p3.parType }
           const pinName = monoPinMintedUnion(
             pinned[pj],
             gateTy,
             if pj < pinOwn.length { pinOwn[pj] } else { -1 },
-            unTyKeyTagParam(),
           )
           nt = monoSynthPinRef(
             pinName,
@@ -8718,10 +8636,8 @@ function monoMakeInstanceParams(
           // A literal-union arm beside a scalar (`T | i32` at `T := K`) boxes under a row too,
           // and no direct spelling minted one (D5310).
           if monoTyHoldsLitUnionArm(nodeTyIxOf(nt)) {
-            monoShStage(unTyKeyTagArm(), nodeTyIxOf(nt))
             monoRegisterPinUnion(pinName, nodeTyIxOf(nt))
           }
-          monoShParNode = -1
           if pinTys[pj] >= 0 { monoParamPinTy.set(nt, pinTys[pj]) }
           synthed = true
         }
@@ -9957,7 +9873,6 @@ function monoMakeInstanceGo(
     // resolvable type). This is the column the speculative-inference windows below take:
     // the pin is resolved once, here at the clone, and never re-resolved from its spelling.
     const pinnedTyIx: i32[] = []
-    const shAt = monoShPendTag.length
     const paramsOk = monoMakeInstanceParams(
       fn,
       params,
@@ -9972,10 +9887,7 @@ function monoMakeInstanceGo(
       nps,
       pinnedTyIx,
     )
-    if paramsOk < 0 {
-      monoShPendFlush(shAt)
-      return -1
-    }
+    if paramsOk < 0 { return -1 }
     // A spelling missed but the resolved pin types name an instance already minted: reuse it,
     // dropping the clone's staged writes.
     const instKey = k.key
@@ -10002,7 +9914,6 @@ function monoMakeInstanceGo(
         || hitKey < 0
         || elabInstSpelling(hitKey) == elabInstSpelling(reqKey))
     ) {
-      monoShPendFlush(shAt)
       if (
         monoMakeInstanceHit(
           monoKeys[typedRow],
@@ -10073,7 +9984,6 @@ function monoMakeInstanceGo(
       )
     }
     monoShAliasBind(origFe, letBN, letBT)
-    monoShPendFlush(shAt)
     let shHole = if fromKey { "key" } else { "none" }
     if (
       !fromKey
@@ -10341,6 +10251,9 @@ function monoInstanceFor(
   const fn = nodeAt(monoOrigNode[origFe])
   if fn is FuncDecl {
     const params = fn.fnParams
+    // A pin list shorter than the parameters builds no instance. One caller relies on it:
+    // `monoCoerceFnValueTys` delivering a generic value nothing calls at a destination whose
+    // function type names no parameters (D16074).
     if params.length != pinnedNames.length { return 0 }
     // No argument node on this path: the pins are the parameter types of the function type the
     // checker recorded for the value, else the destination's, else the delivery's (D2755).
@@ -10737,12 +10650,29 @@ function monoMakerTwin(
   ) {
     return 0
   }
+  // A maker's annotated parameters are its pins when it returns a hole lambda: each twin takes
+  // the arguments its calls pass. A maker with parameters returning no hole lambda builds no
+  // twin and keeps its set's closure, as its annotated spelling does (D3975).
+  const pins: string[] = []
+  const pts: i32[] = []
+  const mfn = nodeAt(monoOrigNode[fe])
+  const holeRet = monoRetsReachHoleLam(monoOrigNode[fe], [])
+  if mfn is FuncDecl && mfn.fnParams.length > 0 && !holeRet { return 0 }
+  if mfn is FuncDecl && holeRet {
+    for p in mfn.fnParams {
+      const pn = nodeAt(p)
+      const pt = if pn is Param && pn.parType >= 0 { nodeTyIxOf(pn.parType) } else { -1 }
+      const ps = if pt >= 0 { monoPinOfClosedTy(pt) } else { "" }
+      if ps == "" { return 0 }
+      pins.push(ps)
+      pts.push(pt)
+    }
+  }
   monoInstRetWidenKey = tyToStr(ret)
   monoInstRetWidenTy = ret
   // A maker capturing its encloser's locals is this frame's instance, as a call is.
   monoCallFrameSlot = monoNestedCallFrame(fe, ctx)
-  const none: string[] = []
-  const r = monoInstanceFor(fe, none, at, mkFuncTy([], ret), delTys, [])
+  const r = monoInstanceFor(fe, pins, at, mkFuncTy(pts, ret), delTys, pts)
   monoCallFrameSlot = -1
   monoInstRetWidenTy = 0 - 1
   r
@@ -23289,6 +23219,18 @@ function monoDeliverCallRets(at: i32, fd: i32, annTy: i32): i32 {
   const prev = monoRetDeliveredAt[fd] ?? -1
   // The same function type can sit at two indices, so a second delivery is compared as a type.
   if prev >= 0 && (prev == at2 || tySame(prev, at2)) { return 0 }
+  // A maker the elaboration twins at this type returns a fresh closure from that twin, which its
+  // call builds (`monoMakerTwin`), so a second type is the twin's own delivery (D12234).
+  const dfe = fnStmtsPosOf(fd)
+  if (
+    prev >= 0
+    && monoIsMakerFe(dfe)
+    && elabMakerOpen(fd)
+    && elabMakerTwinHeld(fd, at2)
+    && elabMakerTwinHeld(fd, prev)
+  ) {
+    return 0
+  }
   if prev >= 0 {
     return emitFailAt(
       "emitProgram: `"

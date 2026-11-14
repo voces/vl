@@ -7,7 +7,12 @@ import { rangeVarFits } from "./check_range_var"
 import { cwIxCovers, cwPeelValue } from "./check_write_scan"
 import { recFreshDeclOf } from "./check_rec_fresh"
 import { identTyOf } from "./check_nar_store"
-import { declareDecl, identBoundFnDeclOf, identFnDeclOf } from "./check_scopes"
+import {
+  calleeFnOfDecl,
+  declareDecl,
+  identBoundFnDeclOf,
+  identFnDeclOf,
+} from "./check_scopes"
 import {
   ArrayLit,
   AsExpr,
@@ -363,7 +368,7 @@ import {
   holeGenericParamAt,
   holeLamRetAt,
   holeLetWritesDisagree,
-  holeLetWritesDisagreeAt,
+  holeLetWritesDisagreeAtCall,
   holeSlotDeliveryJudge,
   joinLitsFitAt,
   litLeafFitting,
@@ -2387,8 +2392,7 @@ function validateChoiceCstr(ci: i32, rat: i32, calleeFn: i32) {
   }
   const ft = tyAt(rat)
   if !(ft is TyFunc) { return 0 }
-  const none: i32[] = []
-  holeLetWritesDisagreeAt(argCstr.node[ci], ft.fnParamTypes, none)
+  holeLetWritesDisagreeAtCall(argCstr.node[ci], ft.fnParamTypes)
   0
 }
 
@@ -3855,15 +3859,15 @@ export function fvaIsMaker(decl: i32): boolean {
     const pn = nodeAt(p)
     if !(pn is Param) || pn.parType < 0 { return false }
   }
-  // A nested maker reading its encloser's bindings is built with that frame, which a twin
-  // checked at the root does not have.
-  const e = elabEncl.get(decl) ?? -1
-  if e >= 0 && fvaReadsWithin(decl, fn.fnBody, e) { return false }
   const st = nodeTyIxOf(decl)
   if st < 0 || st >= T.tys.length { return false }
   const f = tyAt(st)
   if !(f is TyFunc) || f.fnRet < 0 || f.fnRet >= T.tys.length { return false }
-  tyHasTyVar(f.fnRet) && tyAt(f.fnRet) is TyFunc
+  if !tyHasTyVar(f.fnRet) || !(tyAt(f.fnRet) is TyFunc) { return false }
+  // A nested maker reading its encloser's bindings is built with that frame, which a twin
+  // checked at the root does not have.
+  const e = elabEncl.get(decl) ?? -1
+  !(e >= 0 && fvaReadsWithin(decl, fn.fnBody, e))
 }
 
 // Whether a read in the subtree at `ix` names a binding declared inside `e` but outside `d`.
@@ -3921,13 +3925,16 @@ export function fvaMakerCallRows() {
     ix = ix + 1
   }
   // A maker call delivered where the destination's type closes the result is built at it.
+  const makerOf: {[i32]: i32} = Map()
   ix = 0
   while ix < P.nodes.length {
     const n = nodeAt(ix)
     if (
       n is Call
       && n.callFn >= 0
-      && fvaIsMaker(identDeclOf(parenPeelIx(n.callFn)))
+      && fvaIsMaker(
+        fvaMakerOfBindingIn(identDeclOf(parenPeelIx(n.callFn)), makerOf),
+      )
     ) {
       const t = nodeTyIxOf(ix)
       const dt = nodeCtxTyIxOf(ix)
@@ -3942,7 +3949,10 @@ export function fvaMakerCallRows() {
         && fvaMakerResultAt(ix, dt) >= 0
         && assignable(fvaMakerResultAt(ix, dt), dt)
       ) {
-        elabMakerRowNote(identDeclOf(parenPeelIx(n.callFn)), dt)
+        elabMakerRowNote(
+          fvaMakerOfBinding(identDeclOf(parenPeelIx(n.callFn))),
+          dt,
+        )
         elabMakerCallNote(ix, dt)
       }
     }
@@ -3963,16 +3973,49 @@ export function fvaMakerCallRows() {
   fvaMakerCoverCheck()
 }
 
+// The maker a call through binding `d` runs: `d`, or the lambda an un-annotated `const` binds,
+// unless that lambda returns a call, whose bundle the top-level lambda's own path builds (D15744).
+function fvaMakerOfBinding(d: i32): i32 {
+  const m = calleeFnOfDecl(d)
+  if m < 0 || m == d { return m }
+  fvaMakerLambdaOf(m)
+}
+
+// The maker a call through binding `d` runs, -1 when it runs none, through `memo`: a walk asks
+// it once per read, and both tests walk a body.
+function fvaMakerOfBindingIn(d: i32, memo: {[i32]: i32}): i32 {
+  const had = memo.get(d) ?? -2
+  if had > -2 { return had }
+  const m = fvaMakerOfBinding(d)
+  const r = if fvaIsMaker(m) { m } else { -1 }
+  memo[d] = r
+  r
+}
+
+// Lambda `m`, unless it returns a call.
+function fvaMakerLambdaOf(m: i32): i32 {
+  const fn = nodeAt(m)
+  if !(fn is FuncDecl) { return -1 }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  for r in rets {
+    const x = parenPeelIx(r)
+    if x >= 0 && nodeAt(x) is Call { return -1 }
+  }
+  m
+}
+
 // Withdraws the call notes of each maker one of whose reads takes no instance of its own: the
 // root it reaches shares its body with the instances, which retype that body's returned read.
 function fvaMakerCoverCheck() {
   const reads: {[i32]: i32} = Map()
   const covered: {[i32]: i32} = Map()
+  const makerOf: {[i32]: i32} = Map()
   let ix = 0
   while ix < P.nodes.length {
     if nodeAt(ix) is Ident {
-      const m = identDeclOf(ix)
-      if m >= 0 && m != ix && fvaIsMaker(m) {
+      const m = fvaMakerOfBindingIn(identDeclOf(ix), makerOf)
+      if m >= 0 && m != ix {
         reads[m] = (reads.get(m) ?? 0) + 1
         if fvaMakerReadCovered(ix) { covered[m] = (covered.get(m) ?? 0) + 1 }
       }
@@ -4002,7 +4045,7 @@ function fvaMakerCallOf(ln: LetDecl): i32 {
   if mc < 0 || mc >= P.nodes.length { return -1 }
   const c = nodeAt(mc)
   if !(c is Call) || c.callFn < 0 { return -1 }
-  const m = identDeclOf(parenPeelIx(c.callFn))
+  const m = fvaMakerOfBinding(identDeclOf(parenPeelIx(c.callFn)))
   if !fvaIsMaker(m) { return -1 }
   const t = nodeTyIxOf(mc)
   if t < 0 || t >= T.tys.length || !tyHasTyVar(t) { return -1 }

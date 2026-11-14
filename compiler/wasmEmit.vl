@@ -314,6 +314,7 @@ import {
   UnionDecl,
   WhileStmt,
   adoptNodeTok,
+  arenaSetNode,
   arithRegionSeen,
   binderNameAt,
   blockTailIsDead,
@@ -1418,6 +1419,7 @@ import {
   sFieldRefSlot,
   structRowFieldStoresAtom,
   structRowOfAnnTy,
+  tyIsFuncOrNulFunc,
   uFieldTgtStructIdx,
   variantRowFieldStoresAtom,
 } from "./emit_shape_rows"
@@ -39112,13 +39114,67 @@ function emitAsgRadixAs(
   0
 }
 
+// `a === b` / `a !== b`, reference identity (DECISIONS A15). Two function values compare as `==`
+// compares them, which is already identity (declaration and environment); every other operand
+// is a reference compared by `ref.eq`, a union box by its payload, never the box itself.
+function emitIdentityBin(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
+  const ne = e.binOp == "!=="
+  if (
+    identityOperandIsFn(e.binLeft, fnIx)
+    || identityOperandIsFn(e.binRight, fnIx)
+  ) {
+    const saved = nodeAt(exprIx)
+    const eq: BinExpr = {
+      binOp: if ne { "!=" } else { "==" },
+      binLeft: e.binLeft,
+      binRight: e.binRight,
+      pos: e.pos,
+      binCompound: e.binCompound,
+      binTpl: e.binTpl,
+      binRegion: e.binRegion,
+    }
+    arenaSetNode(exprIx, eq)
+    const rc = emitBinExprNode(body, eq, exprIx, fnIx)
+    arenaSetNode(exprIx, saved)
+    return rc
+  }
+  if emitIdentityOperand(body, e.binLeft, fnIx) < 0 { return -1 }
+  if emitIdentityOperand(body, e.binRight, fnIx) < 0 { return -1 }
+  fbRefEq()
+  if ne { fbI32Eqz() }
+  0
+}
+
+// Whether identity operand `ix` holds a function value, nullable or not.
+function identityOperandIsFn(ix: i32, fnIx: i32): boolean {
+  exprIsClosure(ix, fnIx)
+    || tyIsFuncOrNulFunc(nodeTyInOf(unwrapParen(ix), fnIx))
+}
+
+// Whether `ty`, a nullable peeled, is a union, whose values are boxes.
+function identityTyIsUnion(ty: i32): boolean {
+  const t = nonNullTy(ty)
+  t >= 0 && tyAt(t) is TyUnion
+}
+
+// Emit identity operand `ix` as an `eqref`: the reference itself, or a union box's payload, cast
+// down from `anyref` (a `null` arm's payload is null, which `ref.eq` holds equal to null).
+function emitIdentityOperand(body: u8[], ix: i32, fnIx: i32): i32 {
+  if emitExpr(body, ix, fnIx) < 0 { return -1 }
+  // A read narrowed out of a union's storage still pushes the box (`unionBoxStoreTyOf`).
+  if (
+    identityTyIsUnion(nodeTyInOf(unwrapParen(ix), fnIx))
+    || identityTyIsUnion(unionBoxStoreTyOf(ix, fnIx))
+  ) {
+    fbStructGet(uBoxIdx, 1)
+    fbRefCastNull(-19) // the abstract `eq` heap type
+  }
+  0
+}
+
 function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
-  // Reference identity (DECISIONS A15) is checked but not yet lowered (D15975).
   if e.binOp == "===" || e.binOp == "!==" {
-    return emitFailAt(
-      "emitProgram: reference identity (`===` / `!==`) is not lowered yet",
-      exprIx,
-    )
+    return emitIdentityBin(body, e, exprIx, fnIx)
   }
   // A mask that only zero-extends a load is the zero-extending load itself (`zextLoadOf`).
   if e.binOp == "&" {
