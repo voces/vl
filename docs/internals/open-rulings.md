@@ -1642,8 +1642,10 @@ a recommendation. The spec's own questions are in `docs/spec/OPEN-QUESTIONS.md`.
   `function f({ x, y }: Pt)`). List destructuring is bounded by the no-tuples ruling.
 - **A15, reference identity and equality.** RECONFIRMED (owner) 2026-11-13: `===`/`!==` are built as
   ruled 2026-09-01 (DECISIONS.md), after step 7; `string` stays a check error pointing at `==`.
-  Design and matrices: D15975 (#7857). Open: whether `==` on two functions becomes a check error
-  now (asked 2026-11-13).
+  Design and matrices: D15975 (#7857). RULED (owner) 2026-11-14: `==` on two functions is a check
+  error pointing at `===`, landing with `===`; refused exactly when both operands can hold a
+  function in the same position (union arm, nullable inner, record field, list element), so
+  `u == 5` and `cb == null` stay legal (DECISIONS A15).
 
 **Json**
 
