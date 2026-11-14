@@ -11,6 +11,10 @@ pin. Two things keep D16004's argument check intact, which the refuted first att
   then-arm reads the remainder, and an open alternative accepts any argument
   (`error-hole-param-is-negated-guard-not-covered.vl` caught this).
 
+* `gnotDeadAtPin` (D16006(b)) also skips a print constraint, and follows an operator result
+  (`HD_BINOP`) as well as a field read to the remainder, so a dead arm's `print(h + 1)` is not
+  checked at a pin whose every member is the record.
+
 A field path keeps the hole as its fact (D3420).
 
 **Position matrix** (un-annotated / annotated control), argument `A | i32` unless stated:
@@ -30,6 +34,7 @@ A field path keeps the hole as its fact (D3420).
 | `A \| string`: `h * 2`, `needI(h)` | refused | refused, names the remainder | refused |
 | `A \| B`: `print(h)`, `h.length` | refused | refused | refused |
 | `A \| B \| null`: `h.w` | refused | refused | refused |
-| pin `A` only, arm dead | refused | refused — D16006(b) | `p: A` refuses — D16006(a) |
+| pins `4` and `A`: `print(h + 1)` | refused | `5 9` | `5 9` |
+| pin `A` only, arm dead | refused | `9` | `h: A` refuses — D16006(a) |
 
 The soundness net keeps its three refusals; D3420's field-path cell still runs.
