@@ -1945,5 +1945,8 @@ produces the `i32`.
 
 - **D16047, an element type nothing writes.** RULED (owner) 2026-11-14 (a1): a collection whose
   element no write fixes satisfies every `is T[]`; a write through a narrowing pins the element like
-  any write (two element types join). Read-only narrowing (a2) and first-test settling (c) were not
+  any write (a second element type is refused, as for direct writes). Read-only narrowing (a2) and first-test settling (c) were not
   taken. DECISIONS "A collection whose element nothing writes fits every `is T[]`…" carries it.
+  Refined 2026-11-14: a write through a narrowing follows direct-write rules (a second type is
+  refused); an `is` that can never match is a **warning** whose branch reads the operand as `never`.
+  DECISIONS "An `is` that can never match is a warning…" carries it.
