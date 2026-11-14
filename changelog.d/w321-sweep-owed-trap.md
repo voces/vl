@@ -1,4 +1,4 @@
-## Tooling & tests
+## Infrastructure (Track F)
 
 - **The sweep's owed list accepts a designed trap.** A clause-1 fix whose witness ran wrong and
   now stops at the run-time error the design gives it (a `__trap__` with a sentence, such as
