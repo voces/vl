@@ -247,8 +247,8 @@ const buildAt = async (fixture: string, flag: string | null, out: string): Promi
   if (flag) args.push(flag);
   const p = await new Deno.Command(VL, {
     args,
-    // Without this `-O3` finds no wasm-opt, prints a note and writes the
-    // UNOPTIMIZED module with exit 0 — which reads as a total optimization win.
+    // The suite's own binaryen, so `-O3` never resolves a different `wasm-opt`
+    // (or none, which fails the build) from PATH.
     env: nativeEnv({ VL_WASM_OPT: WASM_OPT }),
     stdout: "piped",
     stderr: "piped",
