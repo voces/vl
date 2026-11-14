@@ -30,6 +30,11 @@ function field refused at the nullable-record arm (``no `if` blocktype for this 
   - the witness, and a `let` reassigned from null to a function;
   - `?.f ?? (() => d)`, hit and miss;
   - a named-function default, and a capturing default.
-- Sweep with fixpoint seeds on both sides: SWEEP.
-- Render-parse census: CENSUS.
+- Sweep with fixpoint seeds on both sides, master `7b679c9f` against the candidate:
+  - 24,263 same, **0 bytes-only movers**;
+  - 5 output movers, each `emit_reject` → runs: D3373, the new test, and D3170, D3245 and D4341.
+    Those three rows are also closed by D's #7912 (D2340), which lands first, so this PR closes
+    only D3373;
+  - 0 `runs → not-runs`, 0 new compiler traps.
+- Render-parse census: within budget, at the baseline. No entry entered or left.
 - `scripts/gate.sh`: all rows pass.
