@@ -123,6 +123,11 @@ const NO_CELL = INCOMPLETE +
   "  1 row(s) with NO cell: fx_new\n" +
   "    fix: vl run scripts/silent-sweep/distilled/index.vl -- --prune, or restore the missing `.vl`.\n";
 
+// A manifest expectation with no cell: the grader would grade a program that does not exist.
+const NO_CELL_EXPECT =
+  "  1 `manifest.json` expectation(s) with NO cell: fx_new\n" +
+  "    fix: delete the `expect` entry, or restore the missing `.vl`.\n";
+
 const want = (label: string, got: Out, code: number, out: string) => {
   if (got.code !== code || got.out !== out) {
     throw new Error(
@@ -414,6 +419,12 @@ Deno.test({
         ),
       );
       await Deno.remove(`${dir}/${D}/named/fx_new.vl`);
+      want(
+        "an orphan row whose manifest expectation outlived its cell",
+        await regress([seed]),
+        2,
+        NO_CELL + NO_CELL_EXPECT,
+      );
       delete mj.expect.fx_new;
       await Deno.writeTextFile(man, JSON.stringify(mj, null, 1));
       want("an orphan row", await regress([seed]), 2, NO_CELL);
