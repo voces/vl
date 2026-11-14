@@ -632,7 +632,7 @@ import {
   wePartTextOf,
   weTargetShape,
 } from "./check_write_effects"
-import { i32ListHas, i32ListWith } from "./listutil"
+import { i32ListHas, i32ListWith, strListHas } from "./listutil"
 import { declOutermostOf, declShadowOf, identDeclOf, sidOf } from "./symbols"
 import {
   arrElemValueTy,
@@ -2629,32 +2629,6 @@ export function letUnionWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
   tyAt(dcl) is TyUnion
 }
 
-// Whether reads of a re-pointed function `let` take its most recent write: on only in the compile
-// a program's whole-set typing refused (`fnFlowReadsForce`), so a program that typing accepts is
-// checked as before. A read narrowed to one function runs that function either way; only which
-// programs check moves.
-let fnFlowForced = false
-let fnFlowOn = false
-// Whether the last check met a binding whose reads the narrowing would take.
-let fnFlowSeen = false
-
-// Sets whether the next compiles narrow such reads; the driver's retry of a refused program.
-export function fnFlowReadsForce(on: boolean) {
-  fnFlowForced = on
-  0
-}
-
-// Resets the narrowing for a new check: on only under `fnFlowReadsForce`, and no binding met.
-export function fnFlowReadsReset() {
-  fnFlowOn = fnFlowForced
-  fnFlowSeen = false
-  0
-}
-
-// Whether the last check met a binding whose reads the narrowing would take, so a refused program
-// may check under it.
-export function fnFlowReadsSeen(): boolean { fnFlowSeen }
-
 // Whether a write of function type `m` to `let` slot `s`, whose reads carry a set of the functions
 // written to it (`dcl`), narrows its reads to `m`: the read after it calls or delivers the
 // function stored, not every function ever written (D15956, D15957).
@@ -2671,7 +2645,7 @@ export function letFnWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
   let voids = 0
   for f in ms {
     const fn = nodeAt(f)
-    if !(fn is FuncDecl) || fnNameIsLambda(fn.fnName) || fn.fnTyParams.length == 0 {
+    if !(fn is FuncDecl) || fnNameIsLambda(fn.fnName) || !fnParamsAllTyParams(fn) {
       return false
     }
     const fti = nodeTyIxOf(f)
@@ -2680,9 +2654,7 @@ export function letFnWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
     if ft is TyFunc && ft.fnRet == TY_VOID { voids = voids + 1 }
   }
   if voids != 0 && voids != ms.length { return false }
-  if ms.length < 2 || !cwLetWritesStraight(s) { return false }
-  fnFlowSeen = true
-  fnFlowOn
+  ms.length >= 2 && cwLetWritesStraight(s)
 }
 
 // Whether the `Ident` `r` reads a `let` binding, whose writes a declaration-level alias ignores.
@@ -2690,6 +2662,20 @@ function identReadsLet(r: i32): boolean {
   const d = identDeclOf(r)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   dn is LetDecl && dn.letKw == "let"
+}
+
+// Whether generic `fn` annotates each parameter with one of its own type parameters: a concrete
+// parameter is delivered through the binding's adapter at its set's types, which a read naming
+// the function has no counterpart of (D16111).
+function fnParamsAllTyParams(fn: FuncDecl): boolean {
+  if fn.fnTyParams.length == 0 { return false }
+  for p in fn.fnParams {
+    const pn = nodeAt(p)
+    if !(pn is Param) || pn.parType < 0 { return false }
+    const tn = nodeAt(pn.parType)
+    if !(tn is TypeRef) || !strListHas(fn.fnTyParams, tn.tyName) { return false }
+  }
+  true
 }
 
 // Narrows the reads of function `let` slot `s` after a write of `rhs`, a value of type `m`, to `m`
