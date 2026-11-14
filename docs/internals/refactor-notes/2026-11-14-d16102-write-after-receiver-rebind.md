@@ -16,4 +16,11 @@ covers the one the write itself makes after it.
 - New matrix `scripts/capability-probes/matrix/write-after-receiver-rebind.matrix.vl`: 12 of 56
   to 56 of 56. Before, the other 44 cells passed `vl check` and trapped (clause 1). 0 silent,
   0 runs → not-runs. Before = the D16019 head, fixpoint.
-- RESULTS-PENDING
+- Sweep against the D16019 head (both fixpoint seeds), over 24,379 programs:
+  - 2 output movers, each trap → runs: the D16102 witness and the new case;
+  - 0 bytes-only movers, 0 check-reject movers, 0 runs → not-runs, 0 new compiler traps;
+  - so the skipped narrowing turns no other program into a check refusal.
+- The wider-record, record-field-read, field and element matrices are unchanged at 54, 54, 50
+  and 50, 0 silent.
+- Also files [D16103](../inventory/D16103.md) and [D16104](../inventory/D16104.md), the write
+  D16019's move declines: an operand read before the target that the right-hand side changes.
