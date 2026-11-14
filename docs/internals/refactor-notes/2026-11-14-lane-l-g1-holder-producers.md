@@ -37,12 +37,12 @@ literal written whole into it. This change makes the other producers reach the s
   (6 moved emit refuses → runs, all un-annotated), `if-arm-record-fn-field-written-two-types`
   30 of 46 (13 moved), `sibling-maker-record-beside-fn-widened-binding` 18 of 46 (12 moved).
   The slot positions (`struct_field_assign`, `array_*`, `map_*`) stay refused: D15307's family.
-  The bound source's capture positions stay refused: D16221.
+  The bound source's capture positions stay refused: D16241.
 - `rep-fuzz-check.sh`: exact, 0 new, 0 stale.
 - Witnesses and ablations with distinct functions (`a + 1`, `a * 10`, `a + 100`), so a wrong
   member's dispatch prints a wrong value.
 
 ## Residue
 
-D16220: a bare `const` source read again after the write keeps its own value. D16221: a
+D16240: a bare `const` source read again after the write keeps its own value. D16241: a
 source declared in another function than its read keeps its own row.
