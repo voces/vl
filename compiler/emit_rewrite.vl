@@ -4025,7 +4025,7 @@ function cboxElemNeedsParens(ann: i32, elemTy: i32): boolean {
 // A vector has no list backing, so its cell is a list of `v128 | null` boxes: every read
 // unboxes with `as!`, and a store boxes (D2826). Keeps such a cell in `cboxVecCells`.
 let cboxVecCells: {[i32]: i32} = Map()
-// The shared `let`s with no init and no zero value, by declaration: their cell is `T | null`.
+// The shared `let`s with no init, by declaration: their cell is `T | null`.
 let cboxUnsetCells: {[i32]: i32} = Map()
 // Of those, the ones whose type admits `null`: the cell holds `null` until the first write, then
 // a one-element list holding the value, so an unassigned binding is not its own `null`.
@@ -4486,28 +4486,7 @@ function cboxWalkForIn(ix: i32, n: ForIn, boxed: i32[]): i32 {
   return ix
 }
 
-// A zero value for a `let` annotated `letType` that has no init, typed at the annotation, or
-// -1 where the type has none to offer; the box needs something to hold before the first
-// assignment (a read before it is a definite-assignment error).
-function cboxZeroInit(letType: i32) {
-  if letType < 0 { return -1 }
-  const lt = nodeAt(letType)
-  if !(lt is TypeRef) { return -1 }
-  const nm = tyPrimNameOf(nodeTyIxOf(letType))
-  let lit = -1
-  if nm == "i32" || nm == "i64" || nm == "u8" {
-    lit = mkNumTyped("0", -1, nodeTyIxOf(letType))
-  }
-  if nm == "f64" || nm == "f32" {
-    lit = mkNumTyped("0.0", -1, nodeTyIxOf(letType))
-  }
-  if nm == "boolean" { lit = mkBool(0, -1) }
-  if nm == "string" { lit = mkStr("", -1) }
-  if lit >= 0 { nodeTyRecord(lit, nodeTyIxOf(letType)) }
-  lit
-}
-
-// The seed of a shared `let` `d` annotated `letType` that has no init and no zero value: the
+// The seed of a shared `let` `d` annotated `letType` that has no init: the
 // `null` that marks its cell unassigned (`cboxUnsetCells`), whose reads trap until the first
 // write; a type that admits `null` holds its value one list deep. -1 with no annotated type.
 function cboxUnsetInit(d: i32, letType: i32): i32 {
@@ -4572,7 +4551,7 @@ function cboxUnsetRead(
   co
 }
 
-// The refusal for shared binding `nm` whose type has no zero value (D2340). Built in two
+// The refusal for shared binding `nm` with no init and no annotated type to build a cell of. Built in two
 // short chains: an interpolated string in the compiler source leaves the seed importing `print`.
 function cboxNoInitMsg(nm: string) {
   const q = "`" + nm + "`"
@@ -4583,8 +4562,8 @@ function cboxNoInitMsg(nm: string) {
 }
 
 // The frame's bindings `cboxByRef` says a closure must share, from `dlets`. A `let` with no
-// init takes a zero value to box; one whose type has none cannot be boxed and is refused,
-// since capturing it by value would be silently wrong. A declaration in `unboxed` stays a local.
+// init takes a cell whose reads trap until the first write; one with no type to build it of is
+// refused, since capturing it by value would be silently wrong. One in `unboxed` stays a local.
 function cboxPick(dlets: i32[], alam: i32[], unboxed: i32[]) {
   const boxed: i32[] = []
   let di = 0
@@ -4596,7 +4575,6 @@ function cboxPick(dlets: i32[], alam: i32[], unboxed: i32[]) {
       if isLet {
         const ld = nodeAt(d)
         if ld is LetDecl {
-          if ld.letInit < 0 { ld.letInit = cboxZeroInit(ld.letType) }
           if ld.letInit < 0 { ld.letInit = cboxUnsetInit(d, ld.letType) }
           if ld.letInit < 0 {
             emitFailAt(cboxNoInitMsg(ld.letName), d)
@@ -4630,7 +4608,8 @@ function cboxScalarLets(
     const d = dlets[di]
     if (cboxKind[d] ?? CBOX_LET) == CBOX_LET && cboxByRef(d, alam) {
       const ld = nodeAt(d)
-      if ld is LetDecl {
+      // A `let` with no init takes a cell whose reads trap until the first write (D16023).
+      if ld is LetDecl && ld.letInit >= 0 {
         let ty = -1
         if ld.letType >= 0 {
           ty = nodeTyIxOf(ld.letType)
