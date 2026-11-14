@@ -14,4 +14,9 @@ Lane B, the consumer side of D16016.
 
 - New matrix `scripts/capability-probes/matrix/assignment-record-field-read.matrix.vl`: 0 of 54
   to 54 of 54 (before = the D16016 head, fixpoint), 0 silent, 0 runs → not-runs.
-- RESULTS-PENDING
+- Sweep against the D16016 head (both fixpoint seeds), over 24,345 programs:
+  - 3 output movers, each emit reject → runs: the D16100 and D16101 witnesses and the new case;
+  - 22 bytes-only movers (same outcome and output, different module bytes);
+  - 0 runs → not-runs, 0 new compiler traps.
+- The element, field, map and union-target matrices are unchanged at 50, 50, 50 and 52 of their graded
+  cells, 0 silent.
