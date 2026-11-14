@@ -298,12 +298,12 @@ Deno.test({
       const { diags } = await diagsOf(
         dir,
         "continues",
-        "const c = true\nif c print(1)\nfor x 0 to 3 { print(x) }\nlet o = { x: 1 }\no.x++\n",
+        "const c = true\nif c print(1)\nfor x 0 to 3 { print(x) }\nlet o = { x: 1 }\n(1)++\n",
       );
       const want = [
         "an `if` body requires braces: `if cond { … }`",
         "expected `in` in for-loop",
-        "postfix `++` target must be an identifier",
+        "postfix `++` target must be a name, a field or an element",
       ];
       if (diags.length !== want.length) {
         throw new Error(
@@ -487,12 +487,12 @@ Deno.test({
       const { diags } = await diagsOf(
         dir,
         "else-continues",
-        "const c = false\nif c { print(1) } else print(2)\nfor x 0 to 3 { print(x) }\nlet o = { x: 1 }\no.x++\n",
+        "const c = false\nif c { print(1) } else print(2)\nfor x 0 to 3 { print(x) }\nlet o = { x: 1 }\n(1)++\n",
       );
       const want = [
         "an `else` body requires braces: `else { … }`",
         "expected `in` in for-loop",
-        "postfix `++` target must be an identifier",
+        "postfix `++` target must be a name, a field or an element",
       ];
       if (diags.length !== want.length) {
         throw new Error(
