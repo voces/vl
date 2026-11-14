@@ -1191,12 +1191,11 @@ export class Interp {
     }
     const f = this.eval(e.f, env, null);
     // E2.7 keeps an operand's width, and E9.1 does not make min/max/abs of constants a
-    // constant: a constant argument takes the destination's type, else its default.
+    // constant: a constant argument adapts to a typed one, else takes its own default; the
+    // destination does not reach it.
     if (f instanceof Bi && ["min", "max", "abs"].includes(f.name)) {
-      let expK: string | null = null;
-      if (exp) { try { const x = this.resolve(exp, env); if (x.k === "name" && NUMERIC.has(x.name)) expK = x.name; } catch { /* none */ } }
-      const args = this.evalArgs(e.args, env).map((a) => a instanceof Lit && expK && litHolds(a, expK) ? litTo(a, expK) : a);
-      const typed = args.find((a) => !(a instanceof Lit) && numKind(a));
+      const args = this.evalArgs(e.args, env);
+      const typed = args.some((a) => !(a instanceof Lit) && numKind(a) !== null);
       return f.call(args.map((a) => a instanceof Lit && !typed ? litDefault(a) : a), this);
     }
     return this.callValue(f, e.args, env, e.line);
