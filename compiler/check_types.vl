@@ -114,10 +114,18 @@ export type TyArray = { aElem: i32, aRead: i32 }
 // but exposes only `.add`/`.has`/`.delete`/`.length`/`.values()`.
 export type TyMap = { mKey: i32, mVal: i32, mSet: i32 }
 
-// A generic type parameter (`T` in `function id<T>(x: T): T`): opaque inside the generic
-// body (assignable both ways, like the err hole); at a call site each TyVar param binds to
-// its argument's type and the return substitutes through.
-export type TyVar = { tvName: string }
+// A type parameter (`T` in `id<T>`) or an inference hole (`tvKind`): opaque inside its body, bound
+// per call to its argument's type. `(tvBinder, tvIdx)` is the declaration slot it names, -1 for a
+// row minted before its site passed one (`mkTyVar`); `tvName` is its spelling, for rendering.
+export type TyVar = {
+  tvName: string,
+  tvKind: TvKind,
+  tvBinder: i32,
+  tvIdx: i32,
+}
+
+// What a type variable stands for: a declared type parameter, or an inference hole.
+export type TvKind = "param" | "hole"
 
 // The literal-member vocabulary — a closed set, so every producer is a literal
 // `mkLitTy("str"/"int", …)` and a member outside it is a hard type error. There is no float
@@ -351,7 +359,14 @@ export function tyLitUnionHashesI32(k: i32): boolean {
 // emitter's way to tell apart two declared parameters one name spells.
 export function tyVarRenameRow(ix: i32, name: string) {
   if ix < 0 || ix >= T.tys.length || !(tyAt(ix) is TyVar) { return 0 }
-  const t: Ty = { tvName: name }
+  const old = tyAt(ix)
+  if !(old is TyVar) { return 0 }
+  const t: Ty = {
+    tvName: name,
+    tvKind: old.tvKind,
+    tvBinder: old.tvBinder,
+    tvIdx: old.tvIdx,
+  }
   T.tys[ix] = t
   tyVarRenames = tyVarRenames + 1
   0
@@ -919,6 +934,8 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       // must never join the LSP's absence filter (`ABSENT_TYPE_MARKERS`): as a substring of
       // ordinary identifiers it would delete hints from healthy code (`{foo_bar: i32}`).
       if t.tvName[0] == '?' { return "_" }
+      const shown = tvSlotShownAs(t.tvBinder, t.tvIdx)
+      if shown >= 0 { return tyToStrAt(shown, nominal) }
       return t.tvName
     }
     TyLit => {
@@ -3977,6 +3994,8 @@ export function tyVarDeclOwnerSet(ix: i32, owner: string) {
 export function tyVarOwnerReset() {
   tyVarOwner = Map()
   tyVarDeclOwner = Map()
+  tvSlotBounds = Map()
+  tvSlotShown = Map()
 }
 
 // The declaring function recorded for a `TyVar` row, or "" when unrecorded.
@@ -4845,4 +4864,51 @@ function memberNumSoft(t: i32): i32 {
   const s = softenLitTy(t)
   if s == t || s == TY_STR { return t }
   s
+}
+
+// Per declaration slot `(binder, idx)`, keyed by the binder node: its bound as an arena type, and
+// whether a rendering shows the bound in the variable's place (a row variable reads as its record).
+// Emptied with the owner tables, since a restart re-mints the arena the bounds index.
+let tvSlotBounds: {[i32]: i32[]} = Map()
+let tvSlotShown: {[i32]: boolean[]} = Map()
+
+// Records slot `(binder, idx)`'s bound `bound` (-1 for none) and whether it renders as it.
+export function tvSlotSet(
+  binder: i32,
+  idx: i32,
+  bound: i32,
+  printAsBound: boolean,
+) {
+  if binder < 0 || idx < 0 { return 0 }
+  const bs = tvSlotBounds.get(binder) ?? []
+  const ps = tvSlotShown.get(binder) ?? []
+  while bs.length <= idx {
+    bs.push(-1)
+    ps.push(false)
+  }
+  bs[idx] = bound
+  ps[idx] = printAsBound
+  tvSlotBounds[binder] = bs
+  tvSlotShown[binder] = ps
+  0
+}
+
+// The bound recorded for slot `(binder, idx)`, or -1 where none is.
+export function tvSlotBound(binder: i32, idx: i32): i32 {
+  const bs = tvSlotBounds.get(binder)
+  if bs == null || idx < 0 || idx >= bs.length { return -1 }
+  bs[idx]
+}
+
+// Whether slot `(binder, idx)` renders as its bound.
+export function tvSlotPrintsAsBound(binder: i32, idx: i32): boolean {
+  const ps = tvSlotShown.get(binder)
+  if ps == null || idx < 0 || idx >= ps.length { return false }
+  ps[idx]
+}
+
+// The type a rendering of slot `(binder, idx)` shows in its place, or -1 to show its name.
+function tvSlotShownAs(binder: i32, idx: i32): i32 {
+  if !tvSlotPrintsAsBound(binder, idx) { return -1 }
+  tvSlotBound(binder, idx)
 }
