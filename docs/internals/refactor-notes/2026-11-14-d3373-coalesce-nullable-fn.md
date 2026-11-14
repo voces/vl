@@ -31,9 +31,9 @@ function field refused at the nullable-record arm (``no `if` blocktype for this 
   D2467, D15155 and D15157 grade `emit_reject` as filed.
 - **Position matrices:**
   - `scripts/capability-probes/matrix/coalesce-nullable-fn.matrix.vl`, whose proof calls the
-    result: 0 → 48 of 48 graded positions run.
-  - `uninit-let-shared-with-closure` (#7912's) stays at 124 of 124. The 18 skipped are the discrimination
-  positions, which a non-nullable result has none of.
+    result: 0 → 48 of 48 graded positions run. The 18 skipped are the discrimination positions,
+    which a non-nullable result has none of.
+  - `uninit-let-shared-with-closure` (#7912's) stays at 124 of 124.
 - **Test:** `tests/cases/expressions/coalesce-nullable-function.vl`, ten cells:
   - the witness, and a `let` reassigned from null to a function;
   - `?.f ?? (() => d)`, hit and miss;
