@@ -48,6 +48,22 @@ A first cut of the `inlineConstRecArgs` pre-check looked only for a record liter
 `icraInline` also takes a `const` choice (D15773), so four programs went `runs → emit_reject`. The
 sweep caught them, and that is why the pre-check now calls `icraInline`'s own head.
 
+## Time, memory and size
+
+Same pair (`c522f8dd` against the candidate, both fixpoints). CPU is user+sys, median of 10 warm
+runs over two interleaved rounds, on a 4-core VM where one build varies ±10% run to run. Peak RSS
+is `getrusage` of the build, and peak live is `VL_GC_STATS=1`. Plumb runs with `-O`, `wasm-opt`
+stubbed and `VL_COMPILE_GC_GROW=off`.
+
+| unit | fuel | CPU | peak RSS | peak live |
+| --- | ---: | ---: | ---: | ---: |
+| plumb main | −1.99% | 3.24 → 2.90 s | 311.8 → 311.8 MB | 117.4 → 117.4 MiB |
+| plumb tail | −1.91% | 1.80 → 1.61 s | 311.7 → 311.7 MB | 82.2 → 79.5 MiB |
+| L2 self-compile | −0.71% | 24.9 → 24.1 s | 4,150 → 4,124 MB | 950.9 → 951.0 MiB |
+
+The CPU deltas run the fuel's way, but they are no larger than this box's noise. The seed grows
+6,801,817 → 6,802,106 bytes (+289, +0.004%).
+
 ## The baselines
 
 Neither fuel ratchet is rewritten. Main still reads +2.7% and tail +1.7% against #7060's baseline,
