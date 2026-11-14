@@ -278,6 +278,14 @@ const driveCase = (
   // and the instance is shared across cases, so don't trust `diagCount` on a
   // success: a stale emit failure could still be sitting in its store.
   const diags = rc === 0 ? [] : readDiags(exp);
+  // A clean compile never asks `assignable` about a negative type (no record, a pending result):
+  // each such question was answered `false` on a guess the checker should not have made.
+  const neg = rc === 0 && exp.asgNegCount ? exp.asgNegCount() : 0;
+  if (neg > 0) {
+    throw new Error(
+      `${entryKey}: want 0 negative-type assignable questions on a clean compile, got ${neg}`,
+    );
+  }
   // All three TYPE-INFORMED finding streams, read HERE while this compile's token
   // table is still standing: `redunModuleAt` / `rcoalModuleAt` / `isvalModuleAt`
   // resolve each finding's owner through `modOfTok`, and the later `lintSrc`
