@@ -6,14 +6,18 @@ import { objSigSame } from "./check_union_arm_msgs"
 // checks an expression.
 
 import { decDigitsOf } from "./strutil"
+import { parenPeelIx } from "./check_places"
 import {
   declareSlot,
+  fnWriteAliasNote,
   identDepthOf,
+  identFnAliasOf,
   identFnDeclOf,
   identStoreTyOf,
 } from "./check_scopes"
 import {
   ArrayLit,
+  BinExpr,
   AsExpr,
   BinExpr,
   Block,
@@ -446,7 +450,7 @@ import {
   nodeTyOf,
   nodeTySet,
 } from "./check_node_tys"
-import { elabCapLive, elabCapNarrowNote } from "./check_elab_cap"
+import { elabCapLive, elabCapNarrowNote, elabFnLetMembers } from "./check_elab_cap"
 import {
   flushNullHoles,
   lpColSet,
@@ -2561,6 +2565,8 @@ function retireNameNarrowing(tgtIx: i32, rt: i32, atIx: i32, preAsgTy: i32) {
         noteNarShadow(s, NAR_KIND_ASG)
         narLayerNote(s, T.frames.length - 1, keptEnd)
       }
+      const an = nodeAt(atIx)
+      if an is BinExpr { letFnWriteRow(s, dcl, an.binRight, rt) }
       if !retires && pre >= 0 && !assignable(keptEnd, pre) { keptEnd = pre }
       // Every write joins, retiring or not: an arm that wrote a member the narrowing already
       // allowed still ENDS at that member, and the first arm's in-place retirement is what
@@ -2606,6 +2612,30 @@ export function letUnionWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
   if !(d is LetDecl) { return false }
   if d.letKw != "let" { return false }
   tyAt(dcl) is TyUnion
+}
+
+// Whether a write of function type `m` to `let` slot `s`, whose reads carry a set of the functions
+// written to it (`dcl`), narrows its reads to `m`: the read after it calls or delivers the
+// function stored, not every function ever written (D15956, D15957).
+export function letFnWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
+  if s < 0 || s >= P.nodes.length || m < 0 || dcl < 0 { return false }
+  const d = nodeAt(s)
+  if !(d is LetDecl) || d.letKw != "let" { return false }
+  if !(tyAt(dcl) is TyFunc) || !(tyAt(m) is TyFunc) { return false }
+  elabFnLetMembers(s).length >= 2
+}
+
+// Narrows the reads of function `let` slot `s` after a write of `rhs`, a value of type `m`, to `m`
+// (`letFnWriteNarrows`), noting the function declaration `rhs` names as theirs. Returns 0.
+export function letFnWriteRow(s: i32, dcl: i32, rhs: i32, m: i32) {
+  if !letFnWriteNarrows(s, dcl, m) { return 0 }
+  noteNarShadow(s, NAR_KIND_ASG)
+  narLayerNote(s, T.frames.length - 1, m)
+  const r = parenPeelIx(rhs)
+  if r < 0 || !(nodeAt(r) is Ident) { return 0 }
+  let fd = identFnDeclOf(r)
+  if fd < 0 { fd = identFnAliasOf(r) }
+  fnWriteAliasNote(m, fd)
 }
 
 // The type a bare name reads at after an accepted write retired its narrowing: the sole member
