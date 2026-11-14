@@ -5077,10 +5077,6 @@ function monoPinMapLambdas(ix: i32, pNames: string[]) {
 // bake reads; -1 outside one.
 let monoBakeSpecK = -1
 
-// The key of the keyed decision whose `monoMakeInstance` comes next, which `monoMakeInstanceGo`
-// takes and clears; -1 for any other build.
-let monoSpecGoK = -1
-
 // Extend the name→index map over the instances minted since the last call, which the walk
 // resolves by name before collection runs.
 function monoRegisterInstance() {
@@ -6006,11 +6002,6 @@ function monoShAliasBind(origFe: i32, ns: string[], ts: i32[]) {
   0
 }
 
-// The enclosing-frame instance `monoInstantiate` hands `monoMakeInstance` for a capturing nested
-// generic called from it, consumed (and cleared) where the key is built; -1 for none.
-let monoCallFrameSlot = 0 - 1
-// The call node the next `monoMakeInstance` builds for, or -1; consumed by it.
-let monoMakeCallIx = 0 - 1
 // Callee identifiers resolved through a `let` alias chain: their calls are never re-spelled to
 // the lambda's instance, since the alias may hold another value at run time (D3849).
 let monoNoRename: i32[] = []
@@ -6113,9 +6104,6 @@ let monoKeyExtraS: string[] = []
 // type parameter no parameter mentions (D2676).
 let monoExplicitBN: string[] = []
 let monoExplicitBT: i32[] = []
-// Which arguments of the direct call being instantiated are object literals, consumed beside
-// `monoKeyExtra`: only a literal's own type is certain of its field values (D2762).
-let monoPinArgLit: boolean[] = []
 
 // Binds `typarams` to the call's explicit type arguments (their canonical spellings) in `tvN`
 // / `tvV`, and stages as the key suffix the bindings of the parameters no value parameter
@@ -8202,7 +8190,6 @@ function monoExactPinTys(pinTys: i32[], ctx: i32) {
 // no binding, pin or callee frame of an earlier program's walk is read by this one.
 export function monoStateReset() {
   cadRowReset()
-  monoCallFrameSlot = 0 - 1
   monoCellAliasListOk = 0 - 1
   monoCgcGenAliasNames = []
   monoCgcGenAliasDecls = []
@@ -8216,10 +8203,7 @@ export function monoStateReset() {
   monoElemAtSet = Map()
   monoTopStmts = []
   monoInstIsFirst = false
-  monoInstRetWidenTy = 0 - 1
-  monoInstanceRetTy = 0 - 1
   monoLastInstFe = 0 - 1
-  monoMakeCallIx = 0 - 1
   monoOpenLamD = []
   monoOpenLamT = []
   monoOpenLamDefer = 0 - 1
@@ -8270,11 +8254,51 @@ function monoNoteOpenArgs(calleeIx: i32, instFe: i32) {
 let monoActiveDepth: i32[] = []
 const MONO_NEST_MAX = 32
 
+// What an instance build is asked beside its pins: the enclosing-frame instance (`frame`), the call
+// and value delivery it answers, the keyed decision (`specK`), the result a delivery widens it to
+// (`retWidenTy`, D9282) and the one a widened return reproduces (`retTy`), and which call arguments
+// are object literals (`argLit`); -1 or empty for none.
+type InstReq = {
+  frame: i32,
+  call: i32,
+  delivery: i32,
+  specK: i32,
+  retWidenTy: i32,
+  retTy: i32,
+  argLit: boolean[],
+}
+
+// `monoInstanceForReq` with no request.
+function monoInstanceFor(
+  fe: i32,
+  ps: string[],
+  at: i32,
+  et: i32,
+  dt: i32[],
+  pt: i32[],
+): i32 {
+  monoInstanceForReq(instReqAt(-1), fe, ps, at, et, dt, pt)
+}
+
+// A request that names only the enclosing-frame instance.
+function instReqAt(frame: i32): InstReq {
+  {
+    frame: frame,
+    call: -1,
+    delivery: -1,
+    specK: -1,
+    retWidenTy: -1,
+    retTy: -1,
+    argLit: [],
+  }
+}
+
 // The instance-creation core shared by `monoInstantiate` (call-driven) and
 // `monoInstanceFor` (annotation-driven): clone or reuse the instance of generic `origFe`
 // for the already-built `pinned` names and point `calleeIx` at it. `annotateI32` annotates
 // an i32-pinned param too; `cbFnNames` bakes a concrete callback in. Returns 0, or -1.
 function monoMakeInstance(
+  req: InstReq,
   origFe: i32,
   pinned: string[],
   pinKinds: i32[],
@@ -8301,6 +8325,7 @@ function monoMakeInstance(
   const bakedWas = cadInBaked
   cadInBaked = monoCadBaked(cbFnNames)
   const rc = monoMakeInstanceGo(
+    req,
     origFe,
     pinned,
     pinKinds,
@@ -9354,6 +9379,7 @@ function monoMakeInstanceKeyOf(
   tvN: string[],
   tvV: string[],
   cbFnNames: string[],
+  argLit: boolean[],
 ): MonoInstKey {
   // A nested generic's instance binds what its enclosing instance binds too, so a signature
   // or a capture naming the enclosing type parameter lowers at that pin (D3829, D3831).
@@ -9371,10 +9397,8 @@ function monoMakeInstanceKeyOf(
   const exBN = monoExplicitBN
   const exBT = monoExplicitBT
   key = key + monoBindEnclosingPins(outerN, outerT, tps, exBN, exBT, tvN, tvV)
-  const argLit = monoPinArgLit
   monoExplicitBN = []
   monoExplicitBT = []
-  monoPinArgLit = []
   // The exact-type binding the key names, read again by the body rewrite.
   const exSubN: string[] = []
   const exSubT: i32[] = []
@@ -9697,6 +9721,7 @@ function monoPinColsMisalignedFail(
 
 // `monoMakeInstance` itself.
 function monoMakeInstanceGo(
+  req: InstReq,
   origFe: i32,
   pinned: string[],
   pinKinds: i32[],
@@ -9708,21 +9733,16 @@ function monoMakeInstanceGo(
   annotateI32: boolean,
   cbFnNames: string[],
 ) {
-  const callFrame = monoCallFrameSlot
-  monoCallFrameSlot = -1
-  const specK = monoSpecGoK
-  monoSpecGoK = -1
+  const callFrame = req.frame
+  const specK = req.specK
   // The delivery this build answers, read in the instance being walked before this one's.
-  const cadDel = cadDelivery
-  cadDelivery = -1
+  const cadDel = req.delivery
   const cadEncl = cadInstTop()
-  const makeCall = monoMakeCallIx
-  monoMakeCallIx = -1
-  const retWidenKey = monoInstRetWidenKey
-  const retWidenTy = monoInstRetWidenTy
+  const makeCall = req.call
+  const retWidenTy = req.retWidenTy
   const retWiden = retWidenTy >= 0
-  monoInstRetWidenKey = ""
-  monoInstRetWidenTy = 0 - 1
+  // A widened result keys its instance by its type's spelling (D14941).
+  const retWidenKey = if retWiden { tyToStr(retWidenTy) } else { "" }
   if monoPinColsMisalignedFail(pinned, pinTys, pinOwn) < 0 { return -1 }
   // Every caller bounds `origFe` by `monoGen`, which `monoOrigNode` stays parallel to.
   if origFe < 0 || origFe >= monoOrigNode.length {
@@ -9749,6 +9769,7 @@ function monoMakeInstanceGo(
       tvN,
       tvV,
       cbFnNames,
+      req.argLit,
     )
     if retWiden { k.key = k.key + "=>" + retWidenKey }
     // Mono's own spelling, which the typed fallback below slices at `k`'s recorded offsets.
@@ -10196,8 +10217,6 @@ function monoFnTyParamTys(t: i32): i32[] {
   none
 }
 
-// The result `monoInstanceFor` must reproduce while a widened return is delivered, or -1 for any.
-let monoInstanceRetTy = 0 - 1
 // The instances built returning a result their template's only converts to (D9282): a generic
 // value they return is built at that result too.
 let monoRetWidenFns: {[i32]: boolean} = Map()
@@ -10205,13 +10224,6 @@ let monoRetWidenFns: {[i32]: boolean} = Map()
 // Set while a generic is delivered past a return at the flow table's pin: an instance whose
 // result only converts to the pin's result is built returning the pin's (D9282).
 let monoInstanceWidenRet = false
-
-// The spelling a widened result keys its instance by: an emit name softens a literal union to its
-// base, which would key two results with different reps alike (D14941).
-let monoInstRetWidenKey = ""
-// The result the next instance `monoMakeInstance` builds is returned at, when that delivery's
-// own result only converts to it; -1 for the substituted result.
-let monoInstRetWidenTy = 0 - 1
 
 // Whether `ty` is a record no declaration names: an inline record, spelled by its shape.
 function monoTyIsInlineRecord(ty: i32): boolean {
@@ -10240,7 +10252,8 @@ function monoPinNamesTy(pty: i32, ty: i32): boolean {
 // `pinnedNames`, pointing `letInitIx` at it, so an escaping binding is `call_ref`'d at that type.
 // `deliveryTys` are the delivery's parameter types where the caller holds them, else [];
 // `pinTyCol` the types the pins are spelled from, which are never parsed back from the names.
-function monoInstanceFor(
+function monoInstanceForReq(
+  req: InstReq,
   origFe: i32,
   pinnedNames: string[],
   letInitIx: i32,
@@ -10353,11 +10366,11 @@ function monoInstanceFor(
       }
       v = v + 1
     }
-    if (monoInstanceWidenRet && fn.fnRet >= 0 && monoInstanceRetTy >= 0) {
+    if (monoInstanceWidenRet && fn.fnRet >= 0 && req.retTy >= 0) {
       // A result that only converts to the slot's own result is returned at it (D9282), and
       // keyed by that result's type.
       let want = monoFnTyRet(expTy)
-      if want < 0 { want = monoInstanceRetTy }
+      if want < 0 { want = req.retTy }
       const rsTy = substTyDeepOf(nodeTyIxOf(fn.fnRet), tvN, tvT, own)
       if (
         rsTy >= 0
@@ -10365,8 +10378,7 @@ function monoInstanceFor(
         && !tyEq(rsTy, want)
         && elabWidenedRet(rsTy, want) >= 0
       ) {
-        monoInstRetWidenKey = tyToStr(want)
-        monoInstRetWidenTy = want
+        req.retWidenTy = want
       }
     }
     // A type parameter the boundary binds nothing defaults as at an inferred call, so the
@@ -10415,9 +10427,10 @@ function monoInstanceFor(
       oj = oj + 1
     }
     monoPinRespell(pinned, pinTys, params, pinOwn)
-    cadDelivery = if cadDeliveryAt >= 0 { cadDeliveryAt } else { letInitIx }
+    if req.delivery < 0 { req.delivery = letInitIx }
     instKeyDstSet(expTy, deliveryTys)
     const made = monoMakeInstance(
+      req,
       origFe,
       pinned,
       pinKinds,
@@ -10430,7 +10443,6 @@ function monoInstanceFor(
       true,
       noCb,
     )
-    cadDelivery = -1
     instKeyDstSet(-1, [])
     return made
   }
@@ -10620,9 +10632,10 @@ function monoCoerceFnValueTys(
             && !monoPinsNoneFor(gfe, pnames)
           ) {
             // A capturing nested generic's value is this frame's instance, as a call is (D3902).
-            monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
-            monoInstanceRetTy = if monoInstanceWidenRet { monoFnTyRet(tnameTy) } else { -1 }
-            const vr = monoInstanceFor(
+            const req = instReqAt(monoNestedCallFrame(gfe, ctx))
+            req.retTy = if monoInstanceWidenRet { monoFnTyRet(tnameTy) } else { -1 }
+            const vr = monoInstanceForReq(
+              req,
               gfe,
               pnames,
               exprIx,
@@ -10632,7 +10645,6 @@ function monoCoerceFnValueTys(
                 if tyNulFuncInner(tnameTy) >= 0 { tyNulFuncInner(tnameTy) } else { tnameTy },
               ),
             )
-            monoCallFrameSlot = -1
             return vr
           }
         }
@@ -10699,13 +10711,11 @@ function monoMakerTwin(
       pts.push(pt)
     }
   }
-  monoInstRetWidenKey = tyToStr(ret)
-  monoInstRetWidenTy = ret
   // A maker capturing its encloser's locals is this frame's instance, as a call is.
-  monoCallFrameSlot = monoNestedCallFrame(fe, ctx)
-  const r = monoInstanceFor(fe, pins, at, mkFuncTy(pts, ret), delTys, pts)
-  monoCallFrameSlot = -1
-  monoInstRetWidenTy = 0 - 1
+  const req = instReqAt(monoNestedCallFrame(fe, ctx))
+  req.retWidenTy = ret
+  const fty = mkFuncTy(pts, ret)
+  const r = monoInstanceForReq(req, fe, pins, at, fty, delTys, pts)
   r
 }
 
@@ -17163,9 +17173,15 @@ function monoCellLamTakeAt(
   const had = monoInstantiatedAny(lfe)
   if !had {
     monoLastInstFe = -1
-    monoCallFrameSlot = monoNestedCallFrame(lfe, ctx)
-    const r = monoInstanceFor(lfe, pnames, x, -1, delTys, pinTys)
-    monoCallFrameSlot = -1
+    const r = monoInstanceForReq(
+      instReqAt(monoNestedCallFrame(lfe, ctx)),
+      lfe,
+      pnames,
+      x,
+      -1,
+      delTys,
+      pinTys,
+    )
     if r < 0 || monoLastInstFe < 0 { return 2 }
   }
   if lfe < 0 || lfe >= fnStmts.length { return 2 }
@@ -20031,21 +20047,20 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       const pinKinds: i32[] = []
       monoBuildPinCol(pinned, pinTys, pinKinds)
       monoPinRespell(pinned, pinTys, params, pinOwn)
-      monoPinArgLit = []
-      let li = 0
-      while li < args.length {
-        monoPinArgLit.push(nodeAt(unwrapParen(args[li])) is ObjLit)
-        li = li + 1
-      }
-      monoCallFrameSlot = monoNestedCallFrame(origFe, ctx)
-      monoMakeCallIx = callIx
+      const argLit: boolean[] = []
+      for a in args { argLit.push(nodeAt(unwrapParen(a)) is ObjLit) }
+      const frame = monoNestedCallFrame(origFe, ctx)
       monoOpenLamOwner = callIx
       monoOpenLamDefer = -1
       const specKeys0 = monoKeys.length
       const specKWas = monoBakeSpecK
       monoBakeSpecK = elabSpecKeyOf(specAt)
-      monoSpecGoK = monoBakeSpecK
+      const req = instReqAt(frame)
+      req.call = callIx
+      req.specK = monoBakeSpecK
+      req.argLit = argLit
       const made = monoMakeInstance(
+        req,
         origFe,
         pinned,
         pinKinds,
@@ -20059,7 +20074,6 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
         cbFnNames,
       )
       monoBakeSpecK = specKWas
-      monoSpecGoK = -1
       const specFe = if monoKeys.length > specKeys0 { monoInstFe[specKeys0] } else { monoLastInstFe }
       elabSpecMonoGroup(specAt, i32ToStr(specFe))
       elabSpecMonoSlot(specAt, specFe)
@@ -25485,10 +25499,6 @@ let cadInstMissed = 0
 let cadFeSig: {[i32]: i32} = Map()
 // The instance being walked when each per-instance lambda clone is minted.
 let cadCloneInst: {[i32]: i32} = Map()
-// The value node a delivery asks `monoMakeInstance` to build a closure for, or -1; and the
-// delivery node standing for a value `monoInstanceFor` is handed as a fresh read, or -1.
-let cadDelivery = 0 - 1
-let cadDeliveryAt = 0 - 1
 // Whether the instance being built has a callback baked in, so what it mints is a call's
 // specialization rather than a closure at a signature.
 let cadInBaked = false
@@ -25521,8 +25531,6 @@ function cadRowReset() {
   cadInstMissed = 0
   cadFeSig = Map()
   cadCloneInst = Map()
-  cadDelivery = 0 - 1
-  cadDeliveryAt = 0 - 1
   cadInBaked = false
   cadWalkFn = []
   cadPendRows = []
@@ -25761,8 +25769,11 @@ function monoCloCoerceBuild(): i32 {
         const rd = mkIdent(monoSlotName(gfe), nodePos(ix))
         monoLastInstFe = -1
         const none: i32[] = []
-        cadDeliveryAt = ix
-        const made = monoInstanceFor(
+        // The delivery is the member's node, not the fresh read standing for it.
+        const req = instReqAt(-1)
+        req.delivery = ix
+        const made = monoInstanceForReq(
+          req,
           gfe,
           pnames,
           rd,
@@ -25770,7 +25781,6 @@ function monoCloCoerceBuild(): i32 {
           none,
           monoFnTyParamTys(t),
         )
-        cadDeliveryAt = -1
         if made < 0 { return -1 }
         if monoLastInstFe < 0 { return emitFailAt(fail, ix) }
         fes.push(monoLastInstFe)
@@ -25856,7 +25866,6 @@ export function monomorphize(stmts: i32[]) {
   monoArmCall = -1
   monoArmCtx = -1
   monoBakeSpecK = -1
-  monoSpecGoK = -1
   monoAliasCallDecl = Map()
   monoRetWidenFns = Map()
   monoWrittenLetHanded = Map()
