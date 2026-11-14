@@ -237,6 +237,8 @@ import {
   collectThenNarrows,
   crLoopPreRetire,
   crStmtLeave,
+  deadElseMark,
+  deadElseSince,
   defaultReadOnlyContainer,
   elemFactFor,
   elemOnlyKeyOf,
@@ -322,9 +324,12 @@ import {
   identFnDeclOf,
 } from "./check_scopes"
 import {
+  deadArmNote,
+  inDeadArm,
   notePending,
   notePendingNulList,
   noteValBindLambda,
+  recordDeadTest,
 } from "./check_side_rows"
 import { symDecl, symNameIsMinted } from "./check_sym_occ"
 import { mapKeyTySupported, nomBaseTyIx } from "./check_ty_rep"
@@ -812,7 +817,8 @@ function letDeclInitVerdicts(
   }
   // A `never` initializer leaves nothing to bind, and an un-annotated binding would take a type
   // no value has; a declared type gives the dead binding a real one (D1972).
-  if n.letInit >= 0 && annot < 0 && initTy == TY_NEVER && initTy >= 0 {
+  // In a dead arm the operand reads as `never`, and every use of it checks (D16006).
+  if n.letInit >= 0 && annot < 0 && initTy == TY_NEVER && !inDeadArm(ix) {
     tErr(
       "`"
         + n.letName
@@ -1069,8 +1075,27 @@ function ifCheckCondNarrows(
   }
   // Narrowing over a simple identifier: `is T` refines to the variant, `!= null`/`== null`
   // refine a nullable. Union-complement narrowing after `is T` is deliberately excluded — it missed real errors.
+  const thenMark = deadElseMark()
   collectThenNarrows(n.ifCond, tnPlaces, tnTys)
+  const whyThen = deadElseSince(thenMark)
+  const deadMark = deadElseMark()
   collectElseNarrows(n.ifCond, enPlaces, enTys)
+  // A test the operand's closed type always passes leaves the `else` arm dead (the `then` arm under
+  // `!`): a warning, and the operand reads as `never` there (D16006). An instance's dead arm is
+  // the elaboration's.
+  const why = deadElseSince(deadMark)
+  if !elabCapLive() {
+    if why != "" && n.ifElse >= 0 { deadArmNote(n.ifElse) }
+    if whyThen != "" { deadArmNote(n.ifThen) }
+  }
+  if !inferQuiet && !elabCapLive() {
+    if why != "" && n.ifElse >= 0 {
+      recordDeadTest(n.ifElse, "this `else` can never run (" + why + ")")
+    }
+    if whyThen != "" {
+      recordDeadTest(n.ifThen, "this branch can never run (" + whyThen + ")")
+    }
+  }
   0
 }
 
