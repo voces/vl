@@ -1,3 +1,0 @@
-## Type system (Track A)
-
-- **D16134 closed:** a `map` or `filter` callback over a list a kept maker's build stores at a wider record runs: a lambda, a named hole function, a chain, a list literal receiver and a lambda in a generic body. `const xs = [mk2()]; xs.filter((y) => y.f == null)` prints `null`, where it was a check reject. The elaboration keys the callback's instance by the list's build. **D16212 closed** with it: a `slice` or `filter` of such a list beside a list of the element's own row, check-clean invalid wasm, runs. A parameter annotated at the element type and a `map` result holding the record are still refused (D16211); a field receiver is an emit reject (D16210).

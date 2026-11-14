@@ -1,3 +1,0 @@
-## Infrastructure (Track F)
-
-- **Hygiene from the 2026-11 review (Small 11, 12):** deleted the tracked 0-byte `a.out` and `reference/ts-interpreter` (it imported an `antlr/` directory that no longer exists, and nothing called it), with `deno.json`'s excludes for it; `AGENTS.md` no longer cites the missing `tests/run.ts`; `lsp/README.md` no longer describes a TypeScript checker or the retired `vital.checker` setting. A `SELFHOST_NATIVE_ALIGN=1` run with no `vl` binary or no seed now FAILS `tests/vl_seed_present_test.ts` instead of passing with every seed-backed suite skipped; without the variable it stays ignored, since the `ci` job runs `deno task test` seedless by design.
