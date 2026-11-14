@@ -23997,11 +23997,12 @@ function emitAsNulNiche(body: u8[], e: AsExpr, fnIx: i32) {
     fbRefAsNonNull()
     return 0
   }
-  // The propagating `as` over a nullable string: a present value leaves the block at its own
-  // non-null heap type, and a null returns the function's own null, as an explicit
-  // `if x == null { return null }` does. Read once, into no scratch slot (D1812).
-  if tyPrimNameOf(payload) == "string" && fnRetNullBearing(fnIx) {
-    fbBlockRefNul(sTy(), false)
+  // The propagating `as`: a present value leaves the block at its own non-null heap type, and a
+  // null returns the function's own null, as an explicit `if x == null { return null }` does.
+  // Read once, into no scratch slot (D1812, D16066).
+  const heap = nulNicheHeapOf(obj, payload, fnIx)
+  if heap >= 0 && fnRetNullBearing(fnIx) {
+    fbBlockRefNul(heap, false)
     if emitExpr(body, obj, fnIx) < 0 { return -1 }
     fbBrOnNonNull(0)
     if emitNullForRet(body, fnIx) < 0 { return -1 }
@@ -24017,6 +24018,27 @@ function emitAsNulNiche(body: u8[], e: AsExpr, fnIx: i32) {
       + e.asTy
       + " | null` propagates the null to the caller, and only the trapping and coalescing forms are lowered for that operand — write `as!`, `as?`, or the explicit `if x == null { return null }`",
   )
+}
+
+// The heap type of the nullable-ref niche operand `obj` whose payload is `payload`, the cell
+// `br_on_non_null` hands back non-null: a string, a list wrapper, a record, a union variant or a
+// map. -1 for a payload with no such cell.
+function nulNicheHeapOf(obj: i32, payload: i32, fnIx: i32): i32 {
+  if tyPrimNameOf(payload) == "string" { return sTy() }
+  const wrap = nulCollWrapHeap(obj, fnIx)
+  if wrap >= 0 { return wrap }
+  const vi = nulVariantIdxOfExpr(obj, fnIx)
+  if vi >= 0 && vi < uVarRow.length { return variantHeap(vi) }
+  if exprNullableStruct(obj, fnIx) {
+    const si = structIndexOfExpr(obj, fnIx)
+    if si >= 0 && si < sHeapIdx.length { return sHeapIdx[si] }
+  }
+  if exprNullableMap(obj, fnIx) {
+    let ms = mapShapeOfExpr(obj, fnIx)
+    if ms == -3 { ms = mapShapeOfTyPeeled(nodeTyIxOf(obj)) }
+    if ms != -3 { return mapTypeIdxOf(ms) }
+  }
+  -1
 }
 
 // `m[k] as! V` over a scalar-boxed map read `amRef`: the fused probe, trapping on a missing
