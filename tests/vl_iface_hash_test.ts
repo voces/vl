@@ -501,9 +501,10 @@ const CASES: Case[] = [
     '  if b { return { k: "a", n: 1 } }',
     '  const r: A | B = { k: "a", n: 1 }\n  if b { return r }',
   ),
+  // A returned hole lambda is checked at each call through the result, so its body is interface.
   one(
     "rep: lambda with an untyped parameter",
-    "hit",
+    "miss",
     `export function f() { (x) => x + 1 }\n`,
     "print(f()(2))",
     "(x) => x + 1",
@@ -511,7 +512,7 @@ const CASES: Case[] = [
   ),
   one(
     "rep: lambda with an untyped parameter, string",
-    "hit",
+    "miss",
     `export function f() { (x) => x }\n`,
     'print(f()("s"))',
     "(x) => x",
@@ -519,7 +520,7 @@ const CASES: Case[] = [
   ),
   one(
     "rep: lambda body refused at the dependent's argument",
-    "hit",
+    "miss",
     `export function f() { (x) => x }\n`,
     'print(f()("s"))',
     "(x) => x",
@@ -527,7 +528,7 @@ const CASES: Case[] = [
   ),
   one(
     "rep: lambda body member at the dependent's argument",
-    "hit",
+    "miss",
     `export function f() { (x) => x }\n`,
     "print(f()(1))",
     "(x) => x",
