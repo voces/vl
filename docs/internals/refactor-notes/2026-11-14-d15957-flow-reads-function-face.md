@@ -71,7 +71,7 @@ Merged with master `de4cfa15`, then `c522f8dd`, then `037e00bb`. Fixpoint seeds 
   the compile. `cwLetWritesStraight` is now taken once per binding, at its first write
   (`letWritesStraightOnce`). The members' types are still read on every write: an on-demand
   check of an un-annotated `return k` body runs before the nested generics have types.
-- **`tests/cases`, all 8,008 files:** 0 `runs → not-runs`, 0 output changes among programs that
+- **`tests/cases`, all 8,025 files:** 0 `runs → not-runs`, 0 output changes among programs that
   run. Three programs now run (the new fixtures). Six refusals keep refusing with a moved
   message: the four restated `@error` lines, plus two whose `@error` substring still matches.
 - **The four restated D3968 fixtures** refuse on both seeds. Each new message is
@@ -80,13 +80,14 @@ Merged with master `de4cfa15`, then `c522f8dd`, then `037e00bb`. Fixpoint seeds 
   program was lost.
 - **Matrix:** `fn-let-read-after-repoint-generic.matrix.vl` is new, the generic re-point beside
   the lambda one. It runs 40 of 46 after and 0 before. The six open cells are `argument`,
-  `array_push` and `map_set`, in both faces: a read handed to a call, D16182. Over the 71 templates
-  that hold a `let` written with functions: 0 `runs → not-runs`, and no cell moved to silent or
-  trap. In `written-fn-binding-*`, 10 cells now run, 6 of them silent on master.
+  `array_push` and `map_set`, in both faces: a read handed to a call, D16182. Over all 1,294
+  templates: 0 `runs → not-runs`, 66 cells newly run. The 100 silent or trap cells in 32
+  templates are identical on master. A hand-picked subset of 71 missed four lost cells in
+  `fn-set-list-converting-copy{,-generic}`, which only the full sweep showed. This tree runs them.
 - **regress.vl:** 0 lost. The grades are identical to master's: the distilled corpus has no
   re-pointed generic `let`.
-- **L2 self-compile fuel:** 82,536,402,471 against master's 82,330,058,123, which is +0.25%.
-  Seed size: +4,835 bytes.
+- **L2 self-compile fuel:** 83,509,447,750 against master's 83,300,633,457, which is +0.25%.
+  Seed size: +5,147 bytes. Plumb-shape main fuel: +3.0% on its baseline, against master's +2.7%.
 - **Late demands read 4, the baseline, by generalising two fn-tag rules.** Before them the count
   rose from 0 to 4, 7 and 1 in `fn-set-list-copied-into-closed-list-slots`, `-copied-into-holders`
   and `-mutable-alias-controls`. The literal `[f]`, renamed to `[dbl]`, carries the one-member set
