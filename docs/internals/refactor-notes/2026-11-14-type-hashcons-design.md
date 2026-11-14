@@ -28,6 +28,9 @@ stage 1 starts.
   first-class rows with a solution column, so no row is ever written after it is minted. A nominal
   id becomes part of each row's key, and each old comparer becomes `proj(a) == proj(b)` over a
   small set of memoized projections.
+- **Restarts stop re-minting the arena.** `checkRestart` re-mints the arena today, which is the D16215
+  class: a type id held across a restart goes stale, and 236 type-holding tables (lower bound) rely
+  on hand-kept resets. Interned ids survive a restart (§1.7, §2.7).
 - **Six stages, each deleting code:** binder identity, holes leave the rows, interning, epoch-free
   memos, id-vector instance keys, depth caps. The estimated net is **about −2,000 compiler lines**
   (§5), with emit_mono's pin-helper count down by about 10 at stage 5.
@@ -161,6 +164,23 @@ Mono's registry key is a **string**. There are 16 builders, 430 lines, in `emit_
 
 There are 9 `tyCanonKey` calls in `emit_mono.vl` and 2 in `emit_inst_key.vl`. Each key's equality
 is string equality over renders of types, which is the destringify program's last large key.
+
+### 1.7 Restarts re-mint the arena: the D16215 class
+
+`checkRestart` (`check_core_state.vl:1360`) runs `initChecker`, which empties `T.tys` and re-mints
+it from the builtins. There are 3 calls, all in `check_pins.vl`; the pass after `fnTagEtaAgain` is
+one of them. So every type id a table holds across a restart then indexes a different type.
+- **D16215** (#8061) was exactly this: `fnTyFactsReset` (`check_elab_cap.vl:3383`) did not clear
+  `fnSlotCallAt`, `fnSlotCallArgs` or `fnSlotAnnTys`.
+- **The reset list is kept by hand.** `fnTyFactsReset` clears 35 tables directly and calls 16
+  resetters. `check_elab_cap.vl` and `check_fn_tag*.vl` alone declare 150 `i32`-valued module
+  tables, and nothing records which of them hold type ids or which reset clears each.
+- **One survivor is deliberate.** `elabHoleRowsKeepStable` (`:3314`) keeps a banked row only when
+  "every type it names is … an index below the fresh arena", meaning a builtin. That filter is a
+  hand-written guard against this same class.
+- **The population.** By name alone, 236 module tables hold type ids (145 checker-side, 91
+  emit-side): `rg '^(export )?(let|const) \w*(Ty|Tys|TyIx|TyIxs)\w*: (i32[]|{[…]: i32…})'`. That is a
+  lower bound, since a table whose name does not say `Ty` is not counted.
 
 ## 2. The design
 
@@ -311,6 +331,29 @@ under the flags that are in the key.
   spellings that exist only to feed a key are deleted.
 - Instance **names** in the module stay spelled. Only the key changes.
 
+### 2.7 Ids survive a restart
+
+Once interned, an id names its content, not its position in a pass. So a restart no longer clears
+the intern table:
+- **Structural ids** mean the same type in the next pass. Nominal ids are keyed by declaration
+  nodes, which a restart keeps, since the parse is kept.
+- **Hole binders** are `(node, slot)`, interned, so the next pass mints the same hole ids. Only
+  `holeSol` is cleared, which is the right meaning for a fresh walk: same holes, nothing solved yet.
+- **`initChecker`** clears the intern table only between programs (`check_core_state.vl:946`'s
+  per-program case), as `hcReset` does today.
+
+What this removes, and what it does not:
+- **Index staleness is impossible by construction.** A type id held across a restart cannot point
+  at a different type. So D16215's three tables, and `elabHoleRowsKeepStable`'s "below the fresh
+  arena" filter, are no longer needed for correctness. The filter deletes at stage 3.
+- **Fact staleness is not affected.** A table can still hold an answer that the previous pass
+  decided and the next pass must decide again. That is a per-walk reset, and it needs one registry
+  of per-walk tables instead of a hand-kept list. That registry is L5's session value and the
+  review's small item on `RB_*` masks. It is not proposed here.
+
+Stage 3's acceptance: D16215's witness still runs, and the fix's three lines are reverted in the
+shadow PR. If the witness still runs, the restart-staleness class is shown closed for type ids.
+
 ## 3. Migration order
 
 The gate for every stage:
@@ -318,6 +361,9 @@ The gate for every stage:
 - **Output identity**: the candidate and its predecessor emit byte-identical modules for the corpus
   and for the L2 compiler build, which is the merge queue's identity diff. A byte that moves is a
   named mover with its witness.
+
+Each stage PR reports five things: net compiler lines, the pin-helper delta, L2 and plumb guest fuel,
+peak RSS, and every byte mover with its witness.
 
 Each stage that changes an answer runs first as a **shadow**. The old and new answers are compared
 at every call through the existing `repABNote` channel, over the corpus and the self-compile. The
@@ -329,7 +375,7 @@ same PR as the switch.
 | **0. Move `hcIntern`** | Pure move into its own module, shared with lane E (§6). | 0 net (a move) | none: same code |
 | **1. Binder identity** | §2.4. `TyVar` gains `tvKind`/`tvBinder`/`tvIdx`; hole-name keys become `i32`. | `tyVarOwner`/`DeclOwner`/`tvNestOf`/`tyVarRenameRow`/`tyVarRenames`, the owner arms of `tySame`/`tyEq`, and the owner scan in `callFtyPinCstrs`. About **−150 to −250**. | Expected none. Named risk: `tyVarRenameRow` exists to tell two parameters' instances apart. If a name it produced reaches a module name, `--names` output moves. That is checked with `--names` on both arms. |
 | **2. Holes leave the rows** | §2.2. Hole rows, `holeSolve`, `tyAt` reads through `zonk1`, `holeSealAll` at the end of checking. | 43 bumps become 1; the in-place-write comments; `nulFoldTieRecordGo`'s rewrite. About **−50 to −100** (it adds about +80 for the column). | Expected none. Named risk: code that compares two children by raw index where both were pinned to one id. `zonk1` covers reads through `tyAt`, but a direct `T.tys[x]` read does not. The 175 such reads route through `tyAt` first, which is a mechanical rewrite at no line cost. |
-| **3. Interning and projections** | §2.1, §2.3, §2.5. The shadow runs each comparer against its projection. | The `tyEq` family (194 lines), the `tySame` family (154), the `tySameSpelled`/`tySameSet` families (about 250 of `emit_ty_canon.vl`'s 325), and the sidecars' maintenance code. About **−500 to −700**. | Named risk: **arena order**. Interning removes about 90% of rows, so every later index shifts. Any output ordered by arena index (`emit_type_order.vl` and anything sorting by `ty`) moves the type section. The shadow stage first logs every ordering that reads an index, and those orderings move to first-ask order **before** the switch. A second risk: `tySame`'s depth-24 `false` and `tyCanonKey`'s budget fallbacks. Each disagreement the shadow finds there is a case where today's answer is wrong, and it is filed as a row. |
+| **3. Interning and projections** | §2.1, §2.3, §2.5, §2.7. The shadow runs each comparer against its projection. A restart keeps the intern table. | `elabHoleRowsKeepStable`'s arena filter; the `tyEq` family (194 lines), the `tySame` family (154), the `tySameSpelled`/`tySameSet` families (about 250 of `emit_ty_canon.vl`'s 325), and the sidecars' maintenance code. About **−500 to −700**. | Named risk: **arena order**. Interning removes about 90% of rows, so every later index shifts. Any output ordered by arena index (`emit_type_order.vl` and anything sorting by `ty`) moves the type section. The shadow stage first logs every ordering that reads an index, and those orderings move to first-ask order **before** the switch. A second risk: `tySame`'s depth-24 `false` and `tyCanonKey`'s budget fallbacks. Each disagreement the shadow finds there is a case where today's answer is wrong, and it is filed as a row. |
 | **4. Memos lose the epoch** | The 40 epoch reads become id-indexed arrays. Emit-side memos (27) are unconditional after the seal. `assignable` gets its persistent memo. | `tyMutEpoch`, the stamp columns (`tdStamp`, `hhStamp`, `utkShapeStamp`, `utkMemoStamp`, …) and `memoMoved` plumbing on the epoch. About **−150**. Lane E's `rtSync` epoch goes in its own stage (§6). | None: memo hits return what a recompute would |
 | **5. Instance keys** | §2.6, with the string key and the id key in shadow. | The key builders (430 lines down to about 80); `tyCanonKey`; key-only spellings in `pin_spell.vl`. About **−400 to −500**, and emit_mono's pin-helper count goes from 908 to about 898. | Expected none: the instance order is the first-demand order, unchanged. A merge that the string key prevented and the id key allows, or the reverse, moves bytes, and the shadow lists each one. |
 | **6. Depth caps** | Remove the `depth` parameter from the 322 walkers. The order is guards that answer a verdict (72) first, then the 188 that only pass the depth on. A per-cap counter tells which caps ever fire on the corpus and the self-compile. | About **−600 to −700** (guard line, parameter, cap constants) | A cap that never fires deletes byte-identically. A cap that fires is a mover: a deep type got today's exhaustion answer. It is filed with its witness, and is usually a clause-1 bug. |
@@ -447,14 +493,42 @@ stage 5.
 
 ## 6. Fit with lane E (Rep as an ADT, `2026-11-14-rep-adt-design.md`)
 
-- E §6.3 says the two designs compose, and that E's stage 2 "waits on the epoch measurement". §4.2
-  is that measurement: in the self-compile the epoch never moves during emit. So
-  `rtSync`'s drop-on-epoch costs nothing there today, and goes away after H's stage 4.
-- **Shared file:** both designs touch `emit_rep.vl`'s `hc*` block. H's stage 0 moves `hcIntern` out
-  as a pure move. E's stage 1 then builds its `RepNode` arena on the same table, and H's stage 3 uses
-  it for `TY`. Before either lane edits `emit_rep.vl`, this needs the coordinator's ordering.
-- After H's stage 3, E's `repOf` memo is an array indexed by `TyId`. Its four `hc` modes (`canon`,
-  `elem`, `mv`, `row`) are E's to replace with `RepId`, and they are not counted here.
+**Order** (the coordinator's ruling):
+- H's stage 0 lands first.
+- E's stage 0 shadow runs in parallel with it.
+- E's stage 1 (the `RepNode` arena) builds on H's stage 0 module.
+
+**One interning primitive.** It lives in `compiler/intern.vl`, which imports nothing. Its shape:
+- an `Interner` record holding today's `hc*` columns (tag, argument start/count, flat arguments,
+  hash, chain, buckets, mask);
+- `internNew()`;
+- `intern(t, tag, args) → i32`;
+- the readers `internTag(t, id)` and `internArg(t, id, k)`.
+
+There are no string keys. `hcLen` (a rendered-length column that only the rep key needs) stays in
+`emit_rep.vl` beside its caller. The arena (`TY`, stage 3) and E's `RepNode` arena (`RP`) are two
+instances of it. E's `rtIntern` string key goes in E's stage 1.
+
+**The epoch.**
+- After H's stage 2, `tyMutEpoch` is one counter, `holeGen`, which only `holeSolve` advances.
+- At H's stage 4 it is gone. Emit runs over sealed ids.
+- E §6.3 has stage 2 waiting on the epoch measurement, and §4.2 is it: in the self-compile all
+  25,648 bumps happen before emit, and none during emit. So `rtSync`'s drop-on-epoch does not fire
+  during emit there today. After H's stage 4, `repOf` is an array indexed by `TyId` and never
+  invalidates. `cUserTypesVer` is a name-registry counter, not an arena one; it stays until E's
+  `rtSync` stops reading it.
+
+**Who owns what.**
+- `hcIntern` and its table are H's to move, at stage 0.
+- The rep **modes** built on it, `repIdOf`'s `canon`, `elem`, `mv` and `row` ids
+  (`repCanonId`/`repRowId`/`repElemId`), and the string `repCanonKey`/`repKeyOf` family are rep
+  keys. They are E's to replace with `RepId`. This note does not count their deletion.
+- The type-side projections in §2.5 are H's.
+
+**One cycle discipline.** After stage 3, a cyclic type always passes through a nominal id (§2.3).
+Both the type projections and `repOf` cut a cycle at a nominal id they have already met, and
+`HC_BACK` stays only for a projection that erases the nominal (§2.5). So a rep cycle follows the
+type's own cycle.
 
 ## 7. Not claimed
 
