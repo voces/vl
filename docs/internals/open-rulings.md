@@ -1934,3 +1934,7 @@ produces the `i32`.
   binds every candidate parameter to the argument's type (`F(5)` against `F<A, B>(v: A | B)` reads
   as `F<i32, i32>(5)`), not refused as ambiguous. DECISIONS "A parameter a call leaves open is
   `never`…" carries it.
+
+- **D16006(a), the dead arm of a covering test.** RULED (owner) 2026-11-14: the dead arm narrows
+  its operand to `never`, a true bottom (uses allowed), and the arm gets a warning; any-use-is-an-
+  error was not taken. DECISIONS "A dead arm narrows its operand to `never`…" carries it.

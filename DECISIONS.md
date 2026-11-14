@@ -11815,3 +11815,29 @@ widened back to `i32`.
 given 300 both read back 44. The rejected options were a layout-only width (the field holds any
 `i32`, so the declared width is not what a read sees) and refusing `flat` values with sub-word
 fields (a refusal the design does not owe).
+
+## A dead arm narrows its operand to `never`, a true bottom, and is warned (2026-11-14) — D16006
+
+**Ruled by the owner 2026-11-14.** When an `is` (or `==`) test covers its operand's whole type, the
+arm that cannot run narrows the operand to `never`. `never` is a true bottom type: every use of it
+type-checks (`p + "!"` with `p: never` is `never`), because the code cannot execute. The arm itself
+gets a **warning**, "this `else` can never run (`p` is always `i32`)", so dead code is reported once,
+on the branch. Only the tested operand becomes `never`; every other expression in the arm is
+checked as usual.
+
+```vl
+function a(p: i32, q: i32) {
+  if p is i32 { print(p) } else {
+    print(p + "!")   // accepted: `p` is `never`
+    print(q + "!")   // still refused: `q` is i32
+  }
+  // warning on the `else`: it can never run
+}
+```
+
+**Why.** It makes `if`, `match` (whose dead `_` arm was already unchecked) and every parameter kind
+agree; the instance elaboration and D16006(b) already treated a dead arm this way. Checking a dead
+arm at the pre-test type made acceptance depend on which type it fell back to. Widening the operand
+later revives the arm, and it is then checked against its real type. The alternative, making any
+use of a `never` operand an error, was not taken: it refuses dead final `else`s after `is` chains,
+`match`'s defensive `_`, and `else { panic("unexpected " + p) }`, all of which compile today.
