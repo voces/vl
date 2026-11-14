@@ -48,6 +48,7 @@ import {
   armStageElemKeyKind,
   armStageElemName,
   armStageElemTyIx,
+  emitPhase,
   emitPhaseReached,
   msFreeByTy,
   msFreeChain,
@@ -3924,7 +3925,7 @@ export function repDeclRowsPending(tys: i32[]) {
   rvsDeclPending = Map()
   for t in tys { rvsDeclPending[t] = true }
   rvsAnsGen = rvsAnsGen + 1
-  repTreeDrop()
+  repTreeDrop("declRows")
 }
 
 // Canonical shape id → source bits of the registered variant members, extended in place as
@@ -3969,7 +3970,7 @@ function rvsSync() {
     rvsPreUpTo = 0
     rvsRowUpTo = 0
     rvsBuilds = rvsBuilds + 1
-    repTreeDrop()
+    repTreeDrop("variants")
   }
   while rvsChkUpTo < cVariantMemberTyIxs.length {
     rvsAdd(cVariantMemberTyIxs[rvsChkUpTo], 1)
@@ -3997,7 +3998,7 @@ function rvsAdd(ty: i32, bit: i32): i32 {
   if hit != null { b = hit }
   if (b | bit) != b {
     rvsBits[c] = b | bit
-    repTreeDrop()
+    repTreeDrop("variantBit")
   }
   c
 }
@@ -4261,6 +4262,7 @@ let repMaskMemo: i32[] = []
 let repGen = 0
 
 export function repReset() {
+  rtCountReset()
   rvsPreTys = []
   rvsPreUpTo = 0
   rvsAnswered = Map()
@@ -4282,7 +4284,7 @@ export function repReset() {
   memoKeyClear(repSlotCacheGenKey)
   // The recursive rep TREE (below) is arena-index-keyed too — force its next
   // `rtSync` to rebuild from scratch.
-  repTreeDrop()
+  repTreeDrop("reset")
   0
 }
 
@@ -4437,11 +4439,90 @@ let rtWalkN = 0
 let rtEpoch = -1
 let rtUserVer = -1
 
-// Invalidate the tree (the `repReset` hook): the next `rtSync` rebuilds.
-function repTreeDrop() {
+// Invalidate the tree, naming why for the rebuild counter: the next `rtSync` rebuilds.
+function repTreeDrop(cause: string) {
   rtEpoch = -1
   rtUserVer = -1
+  rtDropCause = cause
   0
+}
+
+// The rebuild counter, armed with the shadow: per (emit phase, cause) bucket, the count of
+// whole-tree rebuilds and the nodes they allocate. A cause is the first axis that moved since
+// the previous build (`tyMutEpoch`, then `cUserTypesVer`), else the drop's own.
+let rtDropCause = "first"
+let rtBuiltAny = false
+let rtBuiltEpoch = -1
+let rtBuiltUserVer = -1
+let rtCountKeys: string[] = []
+let rtCountN: i32[] = []
+let rtCountIx: {[string]: i32} = Map()
+let rtNodesKey = ""
+let rtNodesCur = 0
+
+function rtCountAdd(k: string, n: i32) {
+  if n <= 0 { return 0 }
+  const i = rtCountIx[k] ?? -1
+  if i >= 0 {
+    rtCountN[i] = rtCountN[i] + n
+    return 0
+  }
+  rtCountIx[k] = rtCountKeys.length
+  rtCountKeys.push(k)
+  rtCountN.push(n)
+  0
+}
+
+// Closes the running build's node tally under its own bucket.
+function rtNodesClose() {
+  if rtNodesKey != "" { rtCountAdd("rtNodes/" + rtNodesKey, rtNodesCur) }
+  rtNodesCur = 0
+  0
+}
+
+// Records one whole-tree rebuild, called by `rtSync` just before it clears the columns.
+function rtRebuildNote() {
+  let cause = rtDropCause
+  if !rtBuiltAny { cause = "first" }
+  else if tyMutEpoch != rtBuiltEpoch { cause = "tyMutEpoch" }
+  else if cUserTypesVer != rtBuiltUserVer { cause = "cUserTypesVer" }
+  rtNodesClose()
+  rtNodesKey = emitPhase + "/" + cause
+  rtCountAdd("rtRebuild/" + rtNodesKey, 1)
+  rtBuiltAny = true
+  rtBuiltEpoch = tyMutEpoch
+  rtBuiltUserVer = cUserTypesVer
+  0
+}
+
+// Forgets the previous build, at the start of each program's emit.
+function rtCountReset() {
+  rtDropCause = "first"
+  rtBuiltAny = false
+  rtBuiltEpoch = -1
+  rtBuiltUserVer = -1
+  rtCountClear()
+}
+
+// Empties the counter, discarding what it holds.
+function rtCountClear() {
+  rtCountKeys = []
+  rtCountN = []
+  rtCountIx = Map()
+  rtNodesKey = ""
+  rtNodesCur = 0
+  0
+}
+
+// Moves the counter into the shadow's reason buckets, after `repShadowSweep` reset them.
+function rtCountFlush() {
+  rtNodesClose()
+  let i = 0
+  while i < rtCountKeys.length {
+    repShadowAddReason(rtCountKeys[i], rtCountN[i])
+    i = i + 1
+  }
+  rtCountClear()
 }
 
 // Lifetime: generation-stamped on the checker axes of the flat layer's memos
@@ -4451,6 +4532,7 @@ function repTreeDrop() {
 function rtSync() {
   rvsSync()
   if (rtEpoch == tyMutEpoch && rtUserVer == cUserTypesVer) { return 0 }
+  if repShadowOn { rtRebuildNote() }
   rtKind = []
   rtDisc = []
   rtChild = []
@@ -4479,6 +4561,7 @@ function rtAlloc(
   kidCount: i32,
 ): i32 {
   const ix = rtKind.length
+  if repShadowOn { rtNodesCur = rtNodesCur + 1 }
   rtKind.push(kind)
   rtDisc.push(disc)
   rtChild.push(-1)
@@ -5278,7 +5361,7 @@ export function repShadowSweep() {
   // interning (`sNames` growth is not an invalidation axis, see lifetime), so
   // nodes built mid-emit may carry slot claims from before the table finished. The
   // sweep's slot assertions must run over a tree built against the final table.
-  repTreeDrop()
+  repTreeDrop("sweep")
   repShadowMsgs = []
   repShadowTys = 0
   repShadowReal = 0
@@ -5293,6 +5376,7 @@ export function repShadowSweep() {
   hcSplitBad = 0
   hcLenBad = 0
   hcMemoBad = 0
+  rtCountFlush()
   // Run after the message/tally reset above (or it would discard what this reports)
   // and before the loop below, whose first `repElemKey` call runs `repElemMemoSync`
   // and clears both id memos if the generation moved during emit — checking after that would validate a memo just rebuilt, a tautology, not a test.
@@ -5306,7 +5390,8 @@ export function repShadowSweep() {
     repShadowCheckTy(ty)
     ty = ty + 1
   }
-  0
+  // The sweep's own rebuild is not the compile's.
+  rtCountClear()
 }
 
 // Add `n` to a bucket in one step. `repShadowBumpReason` counts an EVENT; a probe that
