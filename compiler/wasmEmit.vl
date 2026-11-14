@@ -28323,9 +28323,22 @@ function emitIdxStoreValue(
   0
 }
 
+// The local the last element or field store parked its value in, the stored cell's own rep, or
+// -1 for a store that parked none. A field store parks only while `asgParkWanted` is set; an
+// element store always parks.
+let asgParkedSlot = -1
+// Whether that local holds a reference, which a local declares nullable.
+let asgParkedRef = false
+let asgParkWanted = false
+// The target node of the assignment whose store parked into `asgParkedSlot`: a nested write runs
+// its own store inside the right-hand side, so a read checks the park is its own.
+let asgParkedOwner = -1
+
 // `emitAssignUnder`'s arm over an index target `xs[i] = v`: a map store or a list element
 // store. Returns 0 lowered, -1 failed.
 function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
+  asgParkedSlot = -1
+  asgParkedRef = false
   // G8: a map store `m[k] = v` — scan for `k`; overwrite `vals[hit]` on a hit, else
   // append `keys.push(k); vals.push(v)`. Checked BEFORE the list path (a map index
   // is not an array index).
@@ -28387,6 +28400,9 @@ function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
   armClose(iaSeat, iaOwed, iaHeap, a.binRight, fnIx)
   const storeValSlot = listIdxValSlot(st.mfKind, st.slot)
   fbLocalSet(storeValSlot) // 0x21 — park the value under the guard operands
+  asgParkedSlot = storeValSlot
+  asgParkedRef = st.isRef || st.isStr
+  asgParkedOwner = a.binLeft
   // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
   // [backing, safeIndex] resolved AFTER the value ran.
   if stHz >= 0 {
@@ -28589,8 +28605,46 @@ function emitAssignMember(
     fbRefAsNonNull()
   }
   // the scalar covariant copy at the field-store boundary, the construct's twin (D2163)
+  if asgParkWanted { asgParkField(sFieldStoreKind(si, fieldIdx), a.binLeft) }
   fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
   return 0
+}
+
+// A field of a kind no scratch local of `asgParkField`'s holds (a record, list, map, union or
+// nullable cell) parks nothing, so the assignment's value rung refuses it.
+function asgParkNone() { 0 }
+
+// Tees the field value on the stack into a scratch local of its own rep for the assignment's
+// value (`asgParkedSlot`); a field of any other kind parks nothing.
+function asgParkField(k: VKind | null, owner: i32) {
+  if k == null { return asgParkNone() }
+  let lk: ListKind = "list"
+  match k {
+    "i32" => {}
+    "f64" => {
+      lk = "f64list"
+    }
+    "i64" => {
+      lk = "i64list"
+    }
+    "f32" => {
+      lk = "f32list"
+    }
+    "str" => {
+      lk = "strlist"
+    }
+    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" | "u8list" => {
+      return asgParkNone()
+    }
+  }
+  const slot = listIdxValSlot(lk, 0)
+  fbLocalTee(slot)
+  // A tee yields the local's nullable type; the string it holds is non-null.
+  if k == "str" { fbRefAsNonNull() }
+  asgParkedSlot = slot
+  asgParkedRef = k == "str"
+  asgParkedOwner = owner
+  0
 }
 
 // `emitAssign`'s body: an arm applies its target's context and leaves it for the exit to undo.
@@ -36325,6 +36379,10 @@ function initBitOf(gi: i32): i32 {
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
   coerceHeld = -1
+  asgParkedSlot = -1
+  asgParkedRef = false
+  asgParkWanted = false
+  asgParkedOwner = -1
   rcElemSrc = -1
   rcElemDst = -1
   rcElemSL = -1
@@ -38956,12 +39014,31 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       if emitAssign(body, exprIx, fnIx) < 0 { return -1 }
       return emitExpr(body, e.binRight, fnIx)
     }
-    if assignTargetReReads(exprIx, fnIx) {
+    // A byte-list cell holds the low byte, so its re-read is not the right-hand side the
+    // assignment yields; the value its store parks is.
+    if !asgIsByteElem(exprIx, fnIx) && assignTargetReReads(exprIx, fnIx) {
       return emitAsgValue(body, exprIx, fnIx, asgReadUnwidenOp(exprIx, fnIx))
     }
-    return emitFail(
-      "emitProgram: only an identifier assignment is a value expression",
-    )
+    if asgYieldsParkedCell(exprIx, fnIx) {
+      const savedWant = asgParkWanted
+      asgParkWanted = true
+      const pRc = emitAssign(body, exprIx, fnIx)
+      asgParkWanted = savedWant
+      if pRc < 0 { return -1 }
+      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
+        return emitFail(
+          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
+        )
+      }
+      fbLocalGet(asgParkedSlot)
+      if asgParkedRef && !tyBearsNull(nodeTyAt(exprIx, fnIx)) {
+        fbRefAsNonNull()
+      }
+      const pOp = asgReadUnwidenOp(exprIx, fnIx)
+      if pOp >= 0 { wU8(pOp) }
+      return 0
+    }
+    return emitFail(asgValueRefusal(exprIx, fnIx))
   }
   // G8: nullish-coalescing `m[k] ?? d` — a FUSED map get-with-default: scan `m` for
   // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
@@ -42516,4 +42593,41 @@ function litSetHasValueAtom(m: i32): boolean {
     if readAtomKindOfTy(softenLitTy(u)) >= 0 { return true }
   }
   false
+}
+
+// Why the write at `asgIx` has no value lowering, the case named.
+function asgValueRefusal(asgIx: i32, fnIx: i32): string {
+  const a = nodeAt(asgIx)
+  if a is BinExpr {
+    const t = nodeAt(unwrapParen(a.binLeft))
+    if t is Index {
+      if exprMap(t.idxArr, fnIx) {
+        return "emitProgram: a map entry write used as a value has no value lowering"
+      }
+    }
+  }
+  "emitProgram: an assignment used as a value whose type is not its target's has no value lowering"
+}
+
+// Whether the write at `asgIx` stores into a byte list, which keeps only the value's low byte.
+function asgIsByteElem(asgIx: i32, fnIx: i32): boolean {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) { return false }
+  const t = nodeAt(unwrapParen(a.binLeft))
+  t is Index && exprU8Array(t.idxArr, fnIx)
+}
+
+// Whether the write at `asgIx` yields the cell it parks before its store: a list (not a map)
+// element or a field whose type is the assignment's, so the stored cell is the value.
+function asgYieldsParkedCell(asgIx: i32, fnIx: i32): boolean {
+  const a = nodeAt(asgIx)
+  if !(a is BinExpr) || a.binOp != "=" { return false }
+  const t = nodeAt(unwrapParen(a.binLeft))
+  if t is Index {
+    if exprMap(t.idxArr, fnIx) { return false }
+  } else if !(t is Member) {
+    return false
+  }
+  const tt = nodeTyAt(a.binLeft, fnIx)
+  tt >= 0 && tySame(tt, nodeTyAt(asgIx, fnIx))
 }
