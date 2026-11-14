@@ -14032,6 +14032,8 @@ function elabSlotFacts() {
   const n0 = ekDecl.length
   elabSlotUnfacted = []
   eplStaleAt()
+  eplDemand = true
+  eplLate = false
   const inst: i32[] = []
   const instFn: i32[] = []
   let ix = 0
@@ -14078,14 +14080,14 @@ function elabSlotFacts() {
     }
     ix = ix + 1
   }
-  if ekDecl.length > n0 {
-    elabSettle(0)
-    // The instances the classes demanded add edges; a holder they left open is asked again.
-    eplStaleAt()
-    for h in elabSlotUnfacted {
-      const ft = eplHolderTy(h, -1)
-      if ft >= 0 { elabSlotTys[elabSlotKey(h, -1)] = ft }
-    }
+  eplDemand = false
+  if ekDecl.length > n0 { elabSettle(0) }
+  eplLate = true
+  // The instances the classes demanded add edges; a holder they left open is asked again.
+  eplStaleAt()
+  for h in elabSlotUnfacted {
+    const ft = eplHolderTy(h, -1)
+    if ft >= 0 { elabSlotTys[elabSlotKey(h, -1)] = ft }
   }
   elabSlotInstFacts(inst, instFn)
   0
@@ -21178,6 +21180,9 @@ type EplTables = {
   bound: i32[],
   boundSrc: i32[],
   boundK: i32[],
+  // Per class, the (parent, step) links of its places, for a bound a parent's holder gives it.
+  upPar: i32[][],
+  upStep: string[][],
   // The instance whose edges are drawn or read (-1 for the program); per call, its node and key.
   k: i32,
   callNode: i32[],
@@ -21211,6 +21216,8 @@ function eplFresh(): EplTables {
     bound: [],
     boundSrc: [],
     boundK: [],
+    upPar: [],
+    upStep: [],
     k: -1,
     callNode: [],
     callKey: [],
@@ -21229,11 +21236,74 @@ function eplFresh(): EplTables {
 
 let EPL: EplTables = eplFresh()
 
+// Demand mode: a closed leaf's top-level members are demanded at its parameters. Late mode: after
+// the demands settle, an uncalled class closes at its members' one agreed instance.
+let eplDemand = false
+let eplLate = false
+
+function eplDemandAt(m: i32, ps: i32[]) {
+  const d = elabSrcDecl(m)
+  if !eplDemand || d < 0 || !elabTopFn(d) || !eplInstanced(d) { return 0 }
+  const noNames: string[] = []
+  const noTys: i32[] = []
+  if elabKeyAtPins(d, noNames, noTys, ps, -1) >= 0 { return 0 }
+  elabResultAtParams(d, ps)
+  0
+}
+
+// Demands each function leaf of bound type `t` at place `p` of its members.
+function eplDemandTy(p: i32, t0: i32, depth: i32) {
+  if !eplDemand || p < 0 || t0 < 0 || t0 >= T.tys.length || depth > 8 { return 0 }
+  const o = tyAt(t0)
+  if o is TyFunc {
+    for m in eplMembersStar(p) { eplDemandAt(m, o.fnParamTypes) }
+  } else if o is TyNullable {
+    eplDemandTy(p, o.nInner, depth + 1)
+  } else if o is TyArray {
+    eplDemandTy(eplChild(p, "e"), o.aElem, depth + 1)
+  } else if o is TyMap {
+    eplDemandTy(eplChild(p, "v"), o.mVal, depth + 1)
+  } else if o is TyObj {
+    let i = 0
+    while i < o.objFieldNames.length && i < o.objFieldTypes.length {
+      eplDemandTy(eplChild(p, "f." + o.objFieldNames[i]), o.objFieldTypes[i], depth + 1)
+      i = i + 1
+    }
+  }
+  0
+}
+
+// The one closed signature every instance of `p`'s members agrees on, the D9100 default when none
+// has one; -1 where they disagree or only some have one.
+function eplUncalled(p: i32, t: i32): i32 {
+  let sig = -1
+  let bare = 0
+  const ms = eplMembersStar(p)
+  if ms.length == 0 { return -1 }
+  for m in ms {
+    const d = elabSrcDecl(m)
+    const ks = EPL.insts[d] ?? []
+    if ks.length == 0 {
+      bare = bare + 1
+    }
+    for k in ks {
+      const st = elabSubstClosed(nodeTyIxOf(d), k)
+      if st < 0 || (sig >= 0 && !tySame(sig, st)) { return -1 }
+      sig = st
+    }
+  }
+  if bare == ms.length { return elabHoleFnClosed(t) }
+  if bare > 0 { return -1 }
+  sig
+}
+
 function eplNew(): i32 {
   const id = EPL.par.length
   EPL.bound.push(-2)
   EPL.boundSrc.push(-1)
   EPL.boundK.push(-1)
+  EPL.upPar.push([])
+  EPL.upStep.push([])
   EPL.par.push(id)
   EPL.kids.push(Map())
   EPL.members.push([])
@@ -21414,6 +21484,21 @@ function eplBoundOf(r: i32): i32 {
   if r < 0 || r >= EPL.bound.length { return -1 }
   if EPL.bound[r] != -2 { return EPL.bound[r] }
   const x = EPL.boundSrc[r]
+  if x < 0 {
+    // A place with no holder of its own takes the step of a bounded parent.
+    EPL.bound[r] = -1
+    let u = 0
+    while u < EPL.upPar[r].length {
+      const pb = eplBoundOf(eplFind(EPL.upPar[r][u]))
+      const st = if pb >= 0 { eplStepTy(pb, EPL.upStep[r][u]) } else { -1 }
+      if st >= 0 && !tyHasTyVar(st) && !tyReachesHole(st, 16) {
+        EPL.bound[r] = st
+        return st
+      }
+      u = u + 1
+    }
+    return -1
+  }
   const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
   const te = if xn is Call { elabNodeTy(x, EPL.boundK[r]) } else { -1 }
   const t = if te >= 0 { te } else if x >= 0 { nodeTyIxOf(x) } else { -1 }
@@ -21432,7 +21517,28 @@ function eplChild(p: i32, step: string): i32 {
   if have >= 0 { return eplFind(have) }
   const id = eplNew()
   EPL.kids[r][step] = id
+  EPL.upPar[id].push(r)
+  EPL.upStep[id].push(step)
   id
+}
+
+// The type step `step` of bound `t` holds; -1 where `t` has no such step.
+function eplStepTy(t0: i32, step: string): i32 {
+  if t0 < 0 || t0 >= T.tys.length { return -1 }
+  const t = nonNullTy(t0)
+  const o = tyAt(t)
+  if step == "e" { return if o is TyArray { o.aElem } else { -1 } }
+  if step == "v" { return if o is TyMap { o.mVal } else { -1 } }
+  if step == "r" { return if o is TyFunc { o.fnRet } else { -1 } }
+  if o is TyObj && step.length > 2 && step.slice(0, 2) == "f." {
+    const nm = step.slice(2, step.length)
+    let i = 0
+    while i < o.objFieldNames.length && i < o.objFieldTypes.length {
+      if o.objFieldNames[i] == nm { return o.objFieldTypes[i] }
+      i = i + 1
+    }
+  }
+  -1
 }
 
 function eplUnion(a0: i32, b0: i32) {
@@ -21455,6 +21561,12 @@ function eplUnion(a0: i32, b0: i32) {
       }
       for c in EPL.calls[b] {
         if !i32ListHas(EPL.calls[a], c) { EPL.calls[a].push(c) }
+      }
+      let u = 0
+      while u < EPL.upPar[b].length {
+        EPL.upPar[a].push(EPL.upPar[b][u])
+        EPL.upStep[a].push(EPL.upStep[b][u])
+        u = u + 1
       }
       for st in EPL.kids[b].keys() {
         const cb = EPL.kids[b][st] ?? -1
@@ -21656,7 +21768,7 @@ function eplCallPlace(n: Call, x: i32, cf: i32): i32 {
 }
 
 function eplEdges() {
-  cwIxWant()
+  cwIxBuild()
   let u = 0
   while u < cwIxCoveredLen() && u < P.nodes.length {
     // A closure with no instances of its own is drawn once per instance of the nearest
@@ -21874,7 +21986,10 @@ function eplFrameResult(m: i32, arity: i32): i32 {
 function eplRebuild(p: i32, t: i32, depth: i32): i32 {
   if t < 0 || t >= T.tys.length || depth > 8 || p < 0 { return -1 }
   const bd = eplBoundOf(eplFind(p))
-  if bd >= 0 { return bd }
+  if bd >= 0 {
+    eplDemandTy(p, bd, 0)
+    return bd
+  }
   if !tyHasTyVar(t) { return t }
   const o = tyAt(t)
   match o {
@@ -21919,10 +22034,13 @@ function eplRebuildLeaf(p: i32, t: i32): i32 {
   // source is where the conversion happens, and what lies before it does not reach this leaf.
   for c in eplReach(p, false) {
     const bc = eplBoundOf(c)
-    if bc >= 0 { return bc }
+    if bc >= 0 {
+      eplDemandTy(p, bc, 0)
+      return bc
+    }
   }
   const one = eplOneCall(p)
-  if one == -1 { return -1 }
+  if one == -1 { return if eplLate { eplUncalled(p, t) } else { -1 } }
   if one < 0 { return -1 }
   const cn = nodeAt(EPL.callNode[one])
   if !(cn is Call) { return -1 }
@@ -21944,6 +22062,7 @@ function eplRebuildLeaf(p: i32, t: i32): i32 {
   let pin: i32[] = ps
   let pinSet = false
   for m in ms {
+    eplDemandAt(m, ps)
     const mk = elabKeyAtPins(elabSrcDecl(m), noNames, noTys, ps, -1)
     // Only an instance the run already holds answers; a member with instances of its own
     // and none at these parameters leaves the leaf open.
