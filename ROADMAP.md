@@ -98,6 +98,11 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   causes. Routing each trap kind through a named function kept out of inlining (wasm-opt
   `--no-inline`), or reading a source-map row at the trap, would name the one that fired.
   DECISIONS.md §"An optimized build's `unreachable` banner names what it may stand for".
+- **Polymorphic recursion through a uniform representation** (owner ruling 2026-11-14: refuse now,
+  support later). A generic function that recurses at a growing type argument and an alias that
+  names itself at a larger argument stay check errors. When this is built, the checker's
+  growth test picks those generics out and they compile once with their type parameter boxed, beside
+  the monomorphized ones. DECISIONS.md §"Polymorphic recursion is refused for now".
 
 ## Consumers
 
