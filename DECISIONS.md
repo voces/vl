@@ -11844,28 +11844,49 @@ use of a `never` operand an error, was not taken: it refuses dead final `else`s 
 
 ## A collection whose element nothing writes fits every `is T[]`; a write through a narrowing pins it (2026-11-14) — D16047
 
-**Ruled by the owner 2026-11-14 (a1).** An empty `[]`, `Map()` or `Set()` whose element type no
-write anywhere fixes is a collection that can never hold an element, so it satisfies `is T[]` (and
-`is {[K]: V}`, `is Set<T>`) for every `T`; at run time that test is only "is it a list" (map, set).
-A write through a narrowed name is a write like any other: `r.push(1)` inside `if r is i32[]` joins
-`i32` into the element type the whole program infers, so a list written at two element types is
-`(i32 | string)[]` from its creation and its `is` tests are the ordinary ones.
+**Ruled by the owner 2026-11-14 (a1), refined the same day.** An empty `[]`, `Map()` or `Set()`
+whose element type no write anywhere fixes can never hold an element, so it satisfies `is T[]`
+(and `is {[K]: V}`, `is Set<T>`) for every `T`; at run time that test is only "is it a list" (map,
+set). A write through a narrowed name is a write like any other: it fixes the element type program-
+wide, by the rules direct writes already follow. A second write at a different type is refused as
+`xs.push(1); xs.push("a")` is, and calls to one non-generic function share its result's element.
+Once a write fixes the type, an `is` that can no longer match is a warning (see the next section).
 
 ```vl
-function pick(c: boolean) { if c { return [] } return 1 }
-const r = pick(true)               // _[] | i32, nothing writes an element
-print(r is i32[])                  // true
-print(r is string[])               // true
+const r = if c() { [] } else { 1 }   // nothing writes r's element
+print(r is i32[])                    // true
+print(r is string[])                 // true
 
-const s = pick(true)
-if s is i32[] { s.push(1) }        // pins s's element: s is i32[] | i32
-print(s is string[])               // false
+const s = if c() { [] } else { 1 }   // a separate value
+if s is i32[] { s.push(1) }          // pins s's element: s is i32[] | i32
+print(s[0])                          // 1
 ```
 
 **Why.** The vacuous answer is only reachable while no element exists, so it cannot be observed
 wrong, and pinning by writes is how element types are inferred everywhere else. Refusing writes
-through such a narrowing (a2) was not taken: it rejects a program the design can run. Settling the
-hole to the first tested `T` (c) was not taken: two tests would disagree about one empty list.
+through such a narrowing was not taken: it rejects a program the design can run. Settling the hole
+to the first tested `T` was not taken: two tests would disagree about one empty list. Joining two
+writes into `(i32 | string)[]` is not part of this ruling; it would change direct writes too.
+
+## An `is` that can never match is a warning, and its branch reads the operand as `never` (2026-11-14) — D16047
+
+**Ruled by the owner 2026-11-14.** An `is` test whose type can never match its operand is a
+**warning**, not an error, the twin of D16006's dead `else`. The branch that cannot run narrows the
+tested operand to `never` (uses type-check, as in D16006), and the warning names why, including the
+write that fixed an inferred element type.
+
+```vl
+const b: i32 = 1
+if b is string { print(b + "!") }   // warning: this branch can never run (`b` is always `i32`)
+
+const s = if c() { [] } else { 1 }
+if s is i32[] { s.push(1) }
+if s is string[] { s.push("x") }    // warning: can never run (`s` holds `i32[]`, fixed by the push above)
+```
+
+**Why.** Both directions of a dead branch are now treated alike. With element types inferred from
+writes anywhere, an error at the `is` would surface far from its cause. Kotlin, Java and Go make it
+an error; Swift, C# (`is`) and Scala warn; the owner took the warning.
 
 ## Polymorphic recursion is refused for now; a uniform representation is backlogged (2026-11-14) — D2721, D12131
 
