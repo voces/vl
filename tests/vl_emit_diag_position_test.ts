@@ -58,18 +58,16 @@ const errorBlock = (out: string): string => {
   return lines.slice(start, end).join("\n");
 };
 
-// A BODY-phase refusal: a `let` with no initializer whose type has no zero value, shared with a
-// closure (D2340), anchored at that `let` on line 7.
+// A BODY-phase refusal: a literal binding delivered to a record whose nested record drops a field,
+// then that field read (D3431), anchored at the read on line 7.
 const BODY_WITNESS = `function twice(n: i32) {
   n * 2
 }
-type P = { x: i32 }
 function main() {
-  print(twice(1))
-  let p: P
-  const g = () => p.x
-  p = { x: 7 }
-  print(g())
+  const sv = { pet: { legs: 4, purr: true } }
+  const u: { pet: { legs: i32 } } = sv
+  print(sv.pet.purr)
+  print(twice(u.pet.legs))
 }
 main()
 `;
