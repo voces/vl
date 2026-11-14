@@ -2,7 +2,7 @@
 // licence, and the callee a parked cast on a hole speaks for.
 // Does not import the checker.
 import { BinExpr, FuncDecl, Ident, LetDecl, P, Param, nodeAt } from "./ast"
-import { TyArray, tyAt } from "./check_types"
+import { TyArray, TyMap, tyAt, tyEq, tyMutEpoch } from "./check_types"
 import {
   CW_OCC_ASG,
   CW_OCC_BIND,
@@ -258,8 +258,115 @@ export function holeCastReachedDecls(callFnIx: i32): i32[] {
   out
 }
 
+// D16047: the row an `is` test narrowed an unwritten collection to, and that collection's own
+// row, one pair per test. A write through the narrowed row pins the unwritten one to it.
+let narPinTgt: i32[] = []
+let narPinOpen: i32[] = []
+
+// Records that `is` target row `tgt` narrows unwritten collection row `open`.
+export function noteNarPin(tgt: i32, open: i32) {
+  narPinTgt.push(tgt)
+  narPinOpen.push(open)
+  0
+}
+
+// A write through row `recv`: pins every unwritten collection an `is` test narrowed to it to
+// that row's element. 0 when nothing applied or every pin agrees, else the row already pinned
+// to another element, which the caller refuses as a direct second write is refused.
+export function narPinWrite(recv: i32): i32 {
+  let i = 0
+  while i < narPinTgt.length {
+    if narPinTgt[i] == recv {
+      const r = narPinOne(recv, narPinOpen[i])
+      if r != 0 { return r }
+    }
+    i = i + 1
+  }
+  0
+}
+
+function narPinOne(tgt: i32, open: i32): i32 {
+  if tgt < 0 || open < 0 { return 0 }
+  const g = tyAt(tgt)
+  const o = tyAt(open)
+  if g is TyArray && o is TyArray {
+    if o.aElem < 0 {
+      o.aElem = g.aElem
+      tyMutEpoch = tyMutEpoch + 1 // a write through an `is` narrowing pinned the element
+      return 0
+    }
+    if tyEq(o.aElem, g.aElem) { return 0 }
+    return narPinInner(g.aElem, o.aElem, open)
+  }
+  if g is TyMap && o is TyMap {
+    if o.mKey < 0 {
+      o.mKey = g.mKey
+      tyMutEpoch = tyMutEpoch + 1 // a write through an `is` narrowing pinned the key
+    } else if !tyEq(o.mKey, g.mKey) {
+      return open
+    }
+    if o.mVal < 0 {
+      o.mVal = g.mVal
+      tyMutEpoch = tyMutEpoch + 1 // a write through an `is` narrowing pinned the value
+      return 0
+    }
+    if tyEq(o.mVal, g.mVal) { return 0 }
+    return narPinInner(g.mVal, o.mVal, open)
+  }
+  if tyEq(tgt, open) { 0 } else { open }
+}
+
+// `narPinOne` one level in, where a mismatch names the outer row `outer`.
+function narPinInner(tgt: i32, open: i32, outer: i32): i32 {
+  const r = narPinOne(tgt, open)
+  if r != 0 { outer } else { 0 }
+}
+
+// D16047: `is` nodes whose operand held an unwritten collection of the tested kind, with that
+// collection's row, and the unwritten rows union members are, settled at the program's end.
+export let vacIsNode: i32[] = []
+export let vacIsRow: i32[] = []
+// Per vacuous node, its unwritten rows at test time: `vacIsOpen[vacIsLo[i] .. vacIsLo[i + 1]]`.
+export let vacIsLo: i32[] = []
+export let vacIsOpen: i32[] = []
+export let openUnionRows: i32[] = []
+
+// Records that `is` node `ix` tests unwritten collection row `open`.
+export function noteVacuousIs(ix: i32, open: i32, rows: i32[]) {
+  vacIsNode.push(ix)
+  vacIsRow.push(open)
+  vacIsLo.push(vacIsOpen.length)
+  for r in rows { vacIsOpen.push(r) }
+  0
+}
+
+// Rows the unbound default settled rather than a write pinned: an `is` test of one stays vacuous.
+export let settledRows: i32[] = []
+
+// Records that the unbound default settled row `r`.
+export function noteSettledRow(r: i32) {
+  if !i32ListHas(settledRows, r) { settledRows.push(r) }
+  0
+}
+
+// Records the unwritten rows `rows` a union's members are.
+export function noteOpenUnionRows(rows: i32[]) {
+  for r in rows {
+    if !i32ListHas(openUnionRows, r) { openUnionRows.push(r) }
+  }
+  0
+}
+
 // Clears this module's tables (called from `initChecker`).
 export function holeLinksReset() {
+  vacIsNode = []
+  vacIsRow = []
+  vacIsLo = []
+  vacIsOpen = []
+  openUnionRows = []
+  settledRows = []
+  narPinTgt = []
+  narPinOpen = []
   holeCastNames = []
   arrDefCallTy = []
   holeLinkA = []
