@@ -11920,3 +11920,41 @@ envelope was not taken.
 Neither the check nor a digest defends a sidecar committed to a checkout the user cloned: the user
 owns those files, and a digest is not a MAC. That needs a key the checkout cannot hold, which is
 the open ruling "The seed sidecar's trust" in `docs/internals/open-rulings.md`.
+
+## A record-typed parameter is row-polymorphic, specialised per concrete row (2026-11-14) — engineering review 2026-11, L3
+
+**Ruled by the owner 2026-11-14: option A.** A wider record passed to a narrower record-typed
+parameter runs whatever its field names, because the parameter is specialised per concrete row
+rather than relying on the WasmGC prefix-subtype chain, which only works when the extra fields sort
+last.
+
+```vl
+type Cat = { name: string, age: i32 }
+function name(a: { name: string }): string { a.name }
+print(name(c))   // runs; before, it ran only if the extra field sorted after `name`
+```
+
+The mechanism is a row variable: `function f(p: P)` is checked as `f<R extends P>(p: R)`, once in
+the signature, and the elaboration binds `R` per call, so every call spelling (direct, method,
+forwarded, returned, in a lambda) gets it with no per-position wiring. Diagnostics, hover and
+printed signatures show `P`, never `R`. A function takes at most 16 distinct rows (the corpus
+maximum is 4); a 17th is refused with a sentence naming that contract. A storage slot (a list
+element, a field) holding records of several shapes uses prefix subtyping when every shape is a
+prefix, and otherwise an accessor view, which keeps identity so a write through the slot is seen
+through the original. The view half rides on the slot-store engine.
+
+Taken over a uniform field-map representation (every read slowed, as JS engines do without a JIT)
+and over row polymorphism without subsumption (Roc, Elm: `[cat, dog]` as `{ name }[]` would be a
+type error, narrowing what the spec promises). Swift's witness tables and Go's itabs are the
+precedent for specialising where possible and carrying a table where not.
+
+## Spot fixes stop on rows an architecture item closes (2026-11-14) — engineering review 2026-11, Order
+
+**Ruled by the owner 2026-11-14: option B.** A clause-2 row (a program the design permits that VL
+refuses) whose ablated mechanism `docs/internals/refactor-notes/2026-11-14-clause2-architecture-map.md`
+assigns to the slot store, L3, L2, L1 or the Rep and hash-consed-type items is not fixed on its
+own; it becomes an acceptance row for that item. Spot fixes are for the map's local-fix bucket and
+for any clause-1 defect (a program `vl check` accepts that then builds or runs wrong), which always
+comes first. The measured split was 111 of 152 clause-2 rows closed by an architecture item and 33
+local; a spot fix in the first group is code the item later deletes. The prerequisites (hash-consed
+types, then `Rep` as an algebraic type) come before the typed IR, as the review orders them.
