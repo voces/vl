@@ -23,10 +23,9 @@ rules there apply here, and `tests/roadmap_honest_test.ts` gates this file too.
     effects summary (function-effects-design.md §G6).
   - **Stage B.** A stored witness narrows too (`const f = bar(x); if f is null` narrows `x`). It
     holds until `callMayWrite` says a call may write `x` or `f`.
-- **A6c. Narrowing across calls.** Three cases:
+- **A6c. Narrowing across calls.** Two cases:
   1. Keep a narrowing when the writer can only write a member it admits. This needs A6b's per-path W.
-  2. D2408: a bare-name re-test inside an arm whose condition's call ended the narrowing.
-  3. The owner's deferred ideal: keep a narrowing across an escaping closure when no write of the
+  2. The owner's deferred ideal: keep a narrowing across an escaping closure when no write of the
      path can run first.
 
   Still open: ban side effects in operator overloads, or let one modify only its operands.
@@ -74,9 +73,8 @@ rules there apply here, and `tests/roadmap_honest_test.ts` gates this file too.
 - **`[null]`, the later target** (spec Q3). Infer the element from the first non-null use.
 - **Variadics.** A rest parameter is deliberately not part of a function type, and an `extern` cannot
   take one.
-- **Deep `is` over Json.** Two open rows:
-  - D1198: a recursive JSON shape target has no walker;
-  - D16274: a closure in a deep `is` arm that writes the tested place refuses.
+- **Deep `is` over Json.** One open row: D16274, a closure in a deep `is` arm that writes the
+  tested place refuses.
 
   The `as` trio over Json needs four things: the S4 ruling (open-rulings §E), `"shape"` in
   `JsonError.kind` (std-api-reviewer), a JSON-pointer path in the walker, and a position matrix
