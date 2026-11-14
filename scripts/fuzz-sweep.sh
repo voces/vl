@@ -13,6 +13,9 @@
 #
 # USAGE: scripts/fuzz-sweep.sh [--seeds N] [--count M] [--depths "4 5 6"] [--jobs J]
 #                              [--out-dir DIR] [--legs "plain branching multiobs declared"] [--no-drafts]
+#                              [--filed FILE] [--gate-all]
+#   --filed FILE  unsound findings an open inventory row already files (fuzz-nightly.sh --filed)
+#   --gate-all    every leg gates on a new unsound finding, not only `plain`
 # Requires a fresh seed: bash scripts/refresh-compiler.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -24,6 +27,8 @@ JOBS=""
 OUT=""
 LEGS="plain branching multiobs declared"
 DRAFTS=1
+FILED=""
+GATE_ALL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --seeds) SEEDS="$2"; shift 2 ;;
@@ -33,6 +38,8 @@ while [ $# -gt 0 ]; do
     --out-dir) OUT="$2"; shift 2 ;;
     --legs) LEGS="$2"; shift 2 ;;
     --no-drafts) DRAFTS=0; shift ;;
+    --filed) FILED="$2"; shift 2 ;;
+    --gate-all) GATE_ALL=1; shift ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
@@ -51,17 +58,21 @@ run_leg() {
     --seeds "$SEEDS" --count "$COUNT" --depths "$DEPTHS" \
     ${JOBS:+--jobs "$JOBS"} \
     --baseline scripts/rep-fuzz-baseline.txt \
+    ${FILED:+--filed "$FILED"} \
     --out-dir "$OUT/$name" "$@"; then
     fail=1
   fi
 }
 
+# A report leg passes --experimental unless --gate-all asks every leg to gate.
+REPORT="--experimental"
+[ "$GATE_ALL" -eq 0 ] || REPORT=""
 for leg in $LEGS; do
   case "$leg" in
     plain) run_leg plain ;;
-    branching) run_leg branching --branching --experimental ;;
-    multiobs) run_leg multiobs --branching --multiobs --experimental ;;
-    declared) run_leg declared --branching --multiobs --declared --experimental ;;
+    branching) run_leg branching --branching $REPORT ;;
+    multiobs) run_leg multiobs --branching --multiobs $REPORT ;;
+    declared) run_leg declared --branching --multiobs --declared $REPORT ;;
     *) echo "unknown leg: $leg"; exit 2 ;;
   esac
 done
@@ -79,7 +90,11 @@ if [ "$DRAFTS" -eq 1 ]; then
 fi
 
 if [ "$fail" -ne 0 ]; then
-  echo "fuzz-sweep: GATING LEG FAILED (non-baselined unsound findings above; keep dirs in $OUT)"
+  echo "fuzz-sweep: GATING LEG FAILED (unfiled unsound findings above; keep dirs in $OUT)"
   exit 1
 fi
-echo "fuzz-sweep: OK (gating leg clean; report legs are survey-only)"
+if [ "$GATE_ALL" -eq 1 ]; then
+  echo "fuzz-sweep: OK (no leg found an unfiled unsound finding)"
+else
+  echo "fuzz-sweep: OK (gating leg clean; report legs are survey-only)"
+fi
