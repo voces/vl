@@ -379,27 +379,15 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
 });
 
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
-  const checker = loadWasmChecker(SEED, log)!;
-  // Type-valid, but codegen cannot lower an INFERRED union return of a list and a map — raised
-  // on the distinct channel whose `unsupported-lowering` code rides the `diagCodeLen`/
-  // `diagCodeByte` ABI into `VLDiagnostic.code`. (The annotated `: {[string]: i32} | i32[]`
-  // spelling lowers and runs, which makes this a capability admission and not a type error,
-  // D16024.)
-  //
-  // What this asserts is the CHANNEL, not the gap, so the witness moves whenever its gap
-  // closes. It has moved seven times; the last was D16037, which closed the nullable `Set`.
-  // `scripts/capability-probes/inferred-nullable-container-return.vl` and
-  // `inferred-nullable-list-return.vl` are the standing probes for the closed halves.
+  const checker = loadWasmChecker(SEED, log, undefined, undefined, false, true)!;
+  // A test-only capability refusal (the checker's `testUnsupported` opt-in, unreachable from a
+  // user program) raised on the distinct channel whose `unsupported-lowering` code rides the
+  // `diagCodeLen`/`diagCodeByte` ABI into `VLDiagnostic.code`. What this asserts is the
+  // CHANNEL; a real open gap as the witness moved every time its gap closed (seven times).
   const diags = await checker.check(
     [
-      "function pick(c: boolean) {",
-      "  if c { return [1] }",
-      "  const m: {[string]: i32} = Map()",
-      "  return m",
-      "}",
       "function go() {",
-      "  const r = pick(false)",
-      "  print(1)",
+      "  __vl_test_unsupported__()",
       "}",
       "go()",
       "",
@@ -683,6 +671,32 @@ Deno.test({
   const freeTy = await checker.hoverTypeAt(free, "/tmp/x.vl", noSiblings, 0, 15);
   if (freeTy !== "_") {
     throw new Error(`expected _ for an unconstrained hole, got ${JSON.stringify(freeTy)}`);
+  }
+});
+
+// A covering test's dead arm reads its operand as `never` (D16006), and hover says so.
+const DEAD_ARM_SRC = "function take(p: i32) {\n" +
+  "  if p is i32 {\n" +
+  "    print(p + 1)\n" +
+  "  } else {\n" +
+  "    print(p)\n" +
+  "  }\n" +
+  "}\n" +
+  "take(4)\n";
+
+Deno.test({
+  name: "wasm-symbols: hover in a covering test's dead arm shows never",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // Line 4 `    print(p)` — the `p` at col 10 sits in the `else` that `p is i32` leaves dead.
+  const dead = await checker.hoverTypeAt(DEAD_ARM_SRC, "/tmp/x.vl", noSiblings, 4, 10);
+  if (dead !== "never") {
+    throw new Error(`want never in the dead arm, got ${JSON.stringify(dead)}`);
+  }
+  const live = await checker.hoverTypeAt(DEAD_ARM_SRC, "/tmp/x.vl", noSiblings, 2, 10);
+  if (live !== "i32") {
+    throw new Error(`want i32 in the live arm, got ${JSON.stringify(live)}`);
   }
 });
 

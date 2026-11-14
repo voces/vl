@@ -135,7 +135,11 @@ import {
   tyProvesNonNull,
 } from "./check_relate_core"
 import { listDisjointDepth, listFitLitLeafOf } from "./check_type_shape"
-import { inferRetFnKey, mapDeliveryRecorded } from "./check_side_rows"
+import {
+  inferRetFnKey,
+  isDeadArm,
+  mapDeliveryRecorded,
+} from "./check_side_rows"
 import { litNumUnionBasesOf, u8LexValue } from "./check_literals"
 import { isPatTyIxOf, isVarTyIxOf, luIsTyOf } from "./check_list_union"
 import {
@@ -1541,7 +1545,6 @@ import {
   msSetOfRow,
   msSetOfTy,
   msSetOfTyAny,
-  msSetOfUnion,
   msSetTakesAtomAsStr,
   msSubNull,
   printPlanPinNull,
@@ -11981,7 +11984,7 @@ function emitUnionUnionEq(
   // need it: it evaluates each operand once into its own slot and reads the slots. The gate
   // exists for the value-union lowering below, which re-reads both sides per arm.
   if lname != "" && lname == rname {
-    if !isValueUnionOfSet(msSetOfUnion(lname), lUTy) {
+    if !isValueUnionOfSet(msSetOfTyAny(lUTy), lUTy) {
       if emitStructUnionEq(body, lIx, rIx, isNe, lUTy, fnIx) == 0 { return 0 }
     }
   }
@@ -12011,10 +12014,10 @@ function emitUnionUnionEq(
       "emitProgram: union `==` over a non-binding union value is not supported yet",
     )
   }
-  // Both operands' member sets are resolved once, here, and every later reader takes the id —
-  // rather than the gate re-splitting the rendering and each consumer resolving it again.
-  const lsid = msSetOfUnion(lname)
-  const rsid = msSetOfUnion(rname)
+  // Both operands' member sets are resolved once, from their types, and every later reader takes
+  // the id.
+  const lsid = msSetOfTyAny(lUTy)
+  const rsid = msSetOfTyAny(unionEqOperandTy(rIx, fnIx))
   // A literal-union arm rides a value box as its member string, so it compares as one (D3347).
   const lVal = isValueUnionOfSet(lsid, unionEqOperandTy(lIx, fnIx))
     || unionCarriesLitUnionArmOfSet(lsid, unionEqOperandTy(lIx, fnIx))
@@ -16280,16 +16283,38 @@ function emitMapSetV(
     }
   }
   cmSlot = mslot // re-pin: inner map ops in the value expr clobber it
+  // A set whose value the assignment yields keeps it in the value stash.
+  const park = asgParkWanted && !valConst1 && !msHelp
   // [mapRef, key, value] are the shape's store helper's params, in order.
   const setFn = mapSetFnOf(mslot)
   if setFn >= 0 {
+    if park { fbLocalTee(mapSetValStashLocal(mslot)) }
     fbCall(setFn)
+    if park { mapSetParked(mslot) }
     return 0
   }
   if setMapSetValStash(body, mslot) < 0 { return -1 }
   fbLocalSet(cmKeyLocal()) // the target key (popped off the stack)
   setMapRef(body)          // mapRef
-  emitMapSetStore(body, mslot)
+  const stRc = emitMapSetStore(body, mslot)
+  if park { mapSetParked(mslot) }
+  stRc
+}
+
+// The local a set's value stash is, outside a store helper: an mv slot's own, else the map
+// frame's slot 14.
+function mapSetValStashLocal(mslot: i32): i32 {
+  if mslot >= 0 { return fnMvValStashLocal(mslot) }
+  mapScratchBase + 14
+}
+
+// Records the set's value stash as the parked value of the assignment that asked for it; an mv
+// slot's stash is a nullable reference unless its values are scalars.
+function mapSetParked(mslot: i32) {
+  asgParkedSlot = mapSetValStashLocal(mslot)
+  asgParkedRef = mslot >= 0 && mvScalarValKind(mslot) == null
+  mapSetDidPark = true
+  0
 }
 
 // The function a set over map shape `sh` calls: its row's store helper, given the next functype
@@ -22284,6 +22309,41 @@ function readMayBeNulUnit(ix: i32): boolean {
   t < 0 || isNullTy(t) || tyHasTyVar(t)
 }
 
+// Whether expression `ix` computes no value because a dead arm's `never` operand feeds it: a name
+// read checked `never`, or an expression one feeds. A call that is itself `never` (a function that
+// does not return) feeds nothing here, so its own effect is still emitted.
+function exprReadsDeadNever(ix: i32, fnIx: i32): boolean {
+  deadNeverAt(ix, fnIx, 0)
+}
+
+function deadNeverAt(ix: i32, fnIx: i32, depth: i32): boolean {
+  if depth > 16 { return false }
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = nodeAt(u)
+  if n is Ident { return nodeTyAt(u, fnIx) == TY_NEVER }
+  // A call checked `never` on its own is a function that does not return; one handed a dead
+  // operand computes nothing. Every other kind is its operands' (`deadNeverKids`).
+  if n is Call {
+    for a in n.callArgs {
+      if deadNeverAt(a, fnIx, depth + 1) { return true }
+    }
+    const f = nodeAt(unwrapParen(n.callFn))
+    return f is Member && deadNeverAt(f.memObj, fnIx, depth + 1)
+  }
+  deadNeverKids(u, fnIx, depth)
+}
+
+// Whether expression `u`, of any kind but a name or a call, is `never` and has an operand a dead
+// read feeds.
+function deadNeverKids(u: i32, fnIx: i32, depth: i32): boolean {
+  if nodeTyAt(u, fnIx) != TY_NEVER { return false }
+  for k in nodeSpineChildren(u) {
+    if deadNeverAt(k, fnIx, depth + 1) { return true }
+  }
+  false
+}
+
 export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // Stop after a recorded failure: `emitFail` banks the first message and returns -1 but
   // does not halt the pass, so a caller that drops the -1 keeps emitting over invalidated
@@ -22291,6 +22351,11 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // diagnostic prints. Checking the flag at the two recursion roots makes a failure terminal wherever it happened, instead of relying on every caller in between to thread -1 outward.
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
+  // A dead arm's operand reads as `never`, and so does what it feeds: no value reaches here (D16006).
+  if exprReadsDeadNever(exprIx, fnIx) {
+    fbUnreachable()
+    return 0
+  }
   if exprIx != coerceHeld {
     const ck = coerceKindAt(exprIx, fnIx)
     if ck != "none" { return emitCoerced(body, exprIx, fnIx, ck) }
@@ -28408,6 +28473,8 @@ let asgParkWanted = false
 // The target node of the assignment whose store parked into `asgParkedSlot`: a nested write runs
 // its own store inside the right-hand side, so a read checks the park is its own.
 let asgParkedOwner = -1
+// Whether the last map set parked its value, so the index store that ran it owns the park.
+let mapSetDidPark = false
 
 // `emitAssignUnder`'s arm over an index target `xs[i] = v`: a map store or a list element
 // store. Returns 0 lowered, -1 failed.
@@ -28418,7 +28485,17 @@ function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
   // append `keys.push(k); vals.push(v)`. Checked BEFORE the list path (a map index
   // is not an array index).
   if exprMap(target.idxArr, fnIx) {
-    return emitMapSet(body, target.idxArr, target.idxIndex, a.binRight, fnIx)
+    mapSetDidPark = false
+    const msRc = emitMapSet(
+      body,
+      target.idxArr,
+      target.idxIndex,
+      a.binRight,
+      fnIx,
+    )
+    if mapSetDidPark { asgParkedOwner = a.binLeft }
+    mapSetDidPark = false
+    return msRc
   }
   // indexed store `a[i] = v`: evaluate the wrapper + index, guard `i u< len` and
   // unwrap to the backing, then the value, then `array.set`. A ref list stores a
@@ -34301,13 +34378,18 @@ function emitIfLinkStmt(
   // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
   // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
   // outer narrowing around the branch so nesting and the else-branch are unaffected.
-  if staticGuard != 0 {
+  if isDeadArm(s.ifThen) {
+    // A covering test's dead arm is not collected, so it owns no slots (D16006).
+    fbUnreachable()
+  } else if staticGuard != 0 {
     if emitTailArm(body, s.ifThen, fnIx, tail) < 0 { return -1 }
   } else {
     // D932 — the skipped arm's `let`s still own their collect-allocated slots.
     cursorAdvance(cursorSlotsUnder(s.ifThen))
   }
-  if s.ifElse >= 0 && staticGuard != 1 {
+  if s.ifElse >= 0 && isDeadArm(s.ifElse) {
+    // The dead `else` arm: uncollected, so neither emitted nor counted (D16006).
+  } else if s.ifElse >= 0 && staticGuard != 1 {
     fbElse() // 0x05 else
     // The then narrowing does not hold in the else-branch, where the guard is false: a value
     // union narrows to the complement set instead (`is T` removes `T`).
@@ -36479,6 +36561,7 @@ export function wasmEmitStateReset() {
   asgParkedRef = false
   asgParkWanted = false
   asgParkedOwner = -1
+  mapSetDidPark = false
   rcElemSrc = -1
   rcElemDst = -1
   rcElemSL = -1
@@ -39080,7 +39163,9 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       if pOp >= 0 { wU8(pOp) }
       return 0
     }
-    return emitFail(asgValueRefusal(exprIx, fnIx))
+    return emitFail(
+      "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",
+    )
   }
   // G8: nullish-coalescing `m[k] ?? d` — a FUSED map get-with-default: scan `m` for
   // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
@@ -42637,20 +42722,6 @@ function litSetHasValueAtom(m: i32): boolean {
   false
 }
 
-// Why the write at `asgIx` has no value lowering, the case named.
-function asgValueRefusal(asgIx: i32, fnIx: i32): string {
-  const a = nodeAt(asgIx)
-  if a is BinExpr {
-    const t = nodeAt(unwrapParen(a.binLeft))
-    if t is Index {
-      if exprMap(t.idxArr, fnIx) {
-        return "emitProgram: a map entry write used as a value has no value lowering"
-      }
-    }
-  }
-  "emitProgram: an assignment used as a value whose type is not its target's has no value lowering"
-}
-
 // Whether the write at `asgIx` stores into a byte list, which keeps only the value's low byte.
 function asgIsByteElem(asgIx: i32, fnIx: i32): boolean {
   const a = nodeAt(asgIx)
@@ -42665,11 +42736,11 @@ function asgYieldsParkedCell(asgIx: i32, fnIx: i32): boolean {
   const a = nodeAt(asgIx)
   if !(a is BinExpr) || a.binOp != "=" { return false }
   const t = nodeAt(unwrapParen(a.binLeft))
+  if !(t is Index) && !(t is Member) { return false }
+  // A map entry is stored at the map's value type; a read of it is that or null.
+  let tt = nodeTyAt(a.binLeft, fnIx)
   if t is Index {
-    if exprMap(t.idxArr, fnIx) { return false }
-  } else if !(t is Member) {
-    return false
+    if exprMap(t.idxArr, fnIx) { tt = tyMapValOf(mapRecvTyIn(t.idxArr, fnIx)) }
   }
-  const tt = nodeTyAt(a.binLeft, fnIx)
   tt >= 0 && tySame(tt, nodeTyAt(asgIx, fnIx))
 }
