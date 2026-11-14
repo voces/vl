@@ -19,7 +19,7 @@ identity, so the refusal was a clause-2 floor.
 
 ## Measured
 
-Master `f1933c5aa` fixpoint seed against this branch's fixpoint seed:
+Master `7104a7b0e` fixpoint seed against this branch's fixpoint seed:
 
 - `matrix/identity-eq-mixed-union.matrix.vl` (a declared function arm) and
   `identity-eq-mixed-union-closure.matrix.vl` (a closure over a captured environment): 0 of 66
@@ -28,3 +28,7 @@ Master `f1933c5aa` fixpoint seed against this branch's fixpoint seed:
 - `tests/cases/operators/identity-eq-mixed-record-fn-union.vl` covers `!==`, two closures from one
   maker (unequal), one closure held twice (equal), a nullable of the mix, and a union with two
   record arms beside the function.
+- D1098's `unions/union-closure-arm-equality.vl` regains the closure-arm-beside-record section
+  #7980 cut, respelled to `===`: a structurally equal record built elsewhere is not identical.
+- Sweep: 24,371 the same, 0 bytes-only movers, 3 output movers (D16039's witness and the two
+  cases above, `check_reject -> runs`), 0 `runs -> not-runs`, 0 new compiler traps.
