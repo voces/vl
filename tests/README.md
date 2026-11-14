@@ -26,6 +26,7 @@ of each row, backticked, `*` = any run of characters).
 | `fetch_seed_test.ts` | `scripts/fetch-seed.sh` installs a seed only when its checksum (and `seed-v0`'s committed hash) matches; offline, against a `file://` release | `deno task test` | `ci` |
 | `roadmap_*_test.ts` | `ROADMAP.md` and `docs/roadmap/` stay an index of open work: no closed `D<id>`, no done marker, no effort estimate, no broken link. Reads files only | `deno task test` | `ci`, and its docs-only step |
 | `cli_*_test.ts`, `budget_*_test.ts`, `keyword_*_test.ts`, `module_*_test.ts`, `std_*_test.ts`, `tests_*_test.ts` | Single-file cross-checks of one table or one vocabulary against its twin (CLI vs host, budget targets, keywords, module gate, embedded std, this index) | `deno task test` | `ci` |
+| `oracle_*_test.ts` | The independent oracle (`scripts/oracle/`): every `docs/spec/` example that says what it prints, run in the definitional interpreter and compared, plus its verdict table. Reads files only | `deno task test` | `ci`, and its docs-only step |
 
 `deno task test` (`deno.json`) runs every file in `tests/` that the other rows do not claim.
 `scripts/ci-shard.sh native|release <k> <n>` is the partition of the `ci-native` and
