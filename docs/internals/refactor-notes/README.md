@@ -9,6 +9,12 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-d16099-call-result-fn-to-generic-param](2026-11-14-d16099-call-result-fn-to-generic-param.md): D16099: a call result holding an un-annotated function, handed to a generic parameter, 2026-11-14
+- [2026-11-14-d16102-write-after-receiver-rebind](2026-11-14-d16102-write-after-receiver-rebind.md): D16102 — a field write's narrowing outlives a call that rebinds its receiver (2026-11-14)
+- [2026-11-14-d16104-wider-record-write-after-read](2026-11-14-d16104-wider-record-write-after-read.md): D16104 / D16103 — a wider record write after an operand its right-hand side changes (2026-11-14)
+- [2026-11-14-d16160-held-list-row-alias](2026-11-14-d16160-held-list-row-alias.md): D16160, layer 2: a held list of records handed on is read at its stored row, 2026-11-14
+- [2026-11-14-d16161-map-record-list-floor](2026-11-14-d16161-map-record-list-floor.md): D16161: the default instance for a map of record lists, 2026-11-14
+- [2026-11-14-g46-map-list-literal-close](2026-11-14-g46-map-list-literal-close.md): D15943: a list literal pushed onto an annotated list of maps takes the holder's type, 2026-11-14
 - [2026-11-14-d15801-map-entry-fn-fields](2026-11-14-d15801-map-entry-fn-fields.md): D15801: function fields of a map's entry literals, 2026-11-14
 - [2026-11-14-d16019-wider-record-write-value](2026-11-14-d16019-wider-record-write-value.md): D16019 — a wider record written into a narrower place, used as a value, 2026-11-14
 - [2026-11-14-d16039-identity-mixed](2026-11-14-d16039-identity-mixed.md): D16039: identity over a union of record and function arms, 2026-11-14
