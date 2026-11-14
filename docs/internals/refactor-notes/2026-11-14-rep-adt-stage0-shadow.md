@@ -1,0 +1,114 @@
+# Rep ADT stage 0: the `VKind` shadow and the tree-rebuild counter, 2026-11-14 (lane E)
+
+This is stage 0 of [the Rep ADT design](2026-11-14-rep-adt-design.md) §3. Everything it adds is an
+instrument, armed by `$VL_REP_SHADOW`, the existing rep-shadow switch. Unarmed, it changes no
+emitted byte. It was measured at master `fe9585a72`.
+
+## What it adds
+
+**The rebuild counter** (`emit_rep.vl`):
+- Every `repTreeDrop` now names its cause: `declRows`, `variants`, `variantBit`, `reset` or
+  `sweep`.
+- Every whole-tree rebuild in `rtSync` is counted in a bucket keyed by emit phase and cause, as
+  `rtRebuild/<phase>/<cause>`. The nodes each build allocates are counted as
+  `rtNodes/<phase>/<cause>`.
+- A cause is the first axis that moved since the last build, in this order: `tyMutEpoch`, then
+  `cUserTypesVer`, then the drop's own cause.
+- The sweep's own rebuild is discarded, so the counts are the compile's.
+
+**The `VKind` shadow** (`emit_vk_shadow.vl`):
+- For every entry of the kind tables, it compares the kind the table holds with
+  `repOfTy(type).rdKind` for the same type. The tables are:
+  - locals, by declaration;
+  - loop variables, at their list's element type;
+  - results (`fRetKind` against `fRecRetTy`);
+  - parameters (`vtKindOfParam`);
+  - globals (`globalCellKind`).
+- Each comparison lands in a `repAB/vkind <table> -> agree | noTy | uncovered | <legacy> tree=<kind>`
+  bucket. A disagreement on a result or a parameter names its function.
+- Struct field codes are left to stage 3, since they are not `VKind`.
+
+Both surface through the existing report (`rep-shadow[...]: unsup <bucket> x<n>`). The host is
+unchanged.
+
+## Byte identity
+
+- The master seed and this tree's seed compile this tree's `compiler/*.vl` to identical bytes:
+  `refresh-compiler.sh` run twice, compared with `cmp`.
+- That self-compile is the identity proof for the unarmed instrument over a 403k-line program.
+- Seed size: 6,819,233 → 6,823,395 bytes, +4,162 (+0.06%).
+
+## Readings: the self-build (`vl build compiler/entry.vl`)
+
+| bucket | rebuilds | nodes built |
+|---|---|---|
+| `passes/first` | 1 | 2 |
+| `passes/variantBit` | 51 | 938 |
+| `passes/declRows` | 2 | 49 |
+| `monomorphized/variantBit` | 6 | 2,639 |
+| `arenaFinal/variantBit` | 1 | 29,391 |
+| **`tyMutEpoch`, any phase** | **0** | 0 |
+| **`cUserTypesVer`, any phase** | **0** | 0 |
+
+That is 61 rebuilds and 33,019 nodes, of which the final tree holds 29,391. Rebuilding costs
+3,628 extra nodes, which is 12% over one build.
+
+| table | agree | other |
+|---|---|---|
+| local/let | 48,142 | 0 |
+| local/loopVar | 3,490 | 26 `noTy` (a non-list iterable) |
+| param | 31,976 | 0 |
+| result | 16,953 | 15 `i32 tree=closure` |
+| global | 6,159 | 0 |
+
+The 15 result disagreements are all one shape. Each is a hook setter, such as `heldRepMintOn(f)`
+(`emit_state.vl:1150`), whose tail expression assigns a function to a global. The recorded
+result type is therefore that function type, while `fRetKind` holds the void result's `i32`. No
+caller reads the value.
+
+## Readings: the distilled corpus (`cells/` + `named/`)
+
+CORPUS_TABLE
+
+## What this decides
+
+**Stage 2's gate.** The coordinator ruled the gate as all three rebuild axes at 0 during emit.
+- `cUserTypesVer` is 0 everywhere.
+- `tyMutEpoch` is 0 on the self-build. CORPUS_TYMUT
+- **The variant-shape axis is not 0, and lane H's hash-consing does not remove it.** `rvsSync`
+  drops the tree whenever a record shape gains a variant bit. The bits come from three sources
+  (`emit_rep.vl:4069–4079`):
+  - the checker's declared variant members (`cVariantMemberTyIxs`, bit 1);
+  - pre-registered shapes (`rvsPreTys`, bit 4);
+  - the emitter's own union-variant rows (`uVarTyIx`, bit 2).
+
+  The third source makes a record's rep depend on emit-time registration, so the rep is not a
+  function of its type. In the ADT, `RRecord.rArm` must come from the checker alone.
+
+So stage 2 does not wait for lane H. It waits on one decision, made in stage 1: `rArm` is read from
+the checker's union membership, and bit 2 of `rvsAdd` stops dropping the tree. On this
+measurement the cost of not deciding it is small (12% extra nodes on the self-build). The real
+cost is correctness: a rep read before a later variant registration is stale.
+
+**Stage 2's movers.** Where the shadow disagrees, stage 2 moves a byte. The full list:
+- the 15 compiler setters, and the corpus's `i32 tree=closure` results. The legacy table holds a
+  void result, and the tree reads the tail's function type. The result value is unread, so the
+  mover is expected to be none. That is to be confirmed when the site converts.
+- `variant tree=struct` locals, CORPUS_VARIANT. A record literal that the legacy path types as a
+  union arm (the delivery decides), while the tree types it as a plain struct. This is the
+  `rArm` decision above, from the other side.
+- `uncovered` results, CORPUS_UNCOV. The tree has no top kind for these results; the three
+  `d947_price_*` cells return `boolean | null`, a record or `null`, and `string | null` through
+  `std:test`. Stage 1 owes the tree an answer for them.
+
+## Cost
+
+| | |
+|---|---|
+| net compiler lines | +168 (`emit_rep.vl` +85, `emit_sections.vl` +0 net, the new `emit_vk_shadow.vl` +83) |
+| pin-helper delta | 0 (baseline 908) |
+| unarmed guest fuel and peak RSS | measured by the gate's `plumb-shape cost` row: GATE_PLUMB |
+| seed size | +0.06% |
+
+Stage 0 is the one stage that adds lines. They are an instrument, and they leave with stage 2,
+when the legacy tables they compare against are gone.
