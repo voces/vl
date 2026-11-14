@@ -1673,6 +1673,14 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   ok
 }
 
+// Whether `x` is a plain `=` store whose target is typed `dstTy`.
+function asgStoredAt(x: i32, dstTy: i32): boolean {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(parenPeelIx(x)) } else { null }
+  if !(n is BinExpr) || n.binOp != "=" || dstTy < 0 { return false }
+  const lt = nodeTyIxOf(n.binLeft)
+  lt >= 0 && tySame(lt, dstTy)
+}
+
 function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if narConvListDelivery(srcExpr, srcTy, dstTy) > 0 { return true }
   if freshMapAtDstStorage(srcExpr, srcTy, dstTy) { return true }
@@ -1697,6 +1705,8 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       if cexDeliver(srcExpr, dstTy) { return true }
     }
   }
+  // A store delivered where its target's own type is wanted hands over what it stored (D3785).
+  if asgStoredAt(srcExpr, dstTy) { return true }
   // A value already of its destination's type holds its literals at that width.
   if srcTy != dstTy {
     if numLitReadopt(srcExpr, srcTy, dstTy) { return true }
@@ -4253,13 +4263,24 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   }
   if !(s is TyFunc) || !(d is TyFunc) {
     // A function inside a container is not rewritten on the way, so a call through the
-    // destination's function type would reach it at another signature.
-    if (
-      fvaNestedFnDiffers(srcTy, dstTy, 0, 8)
-      || recordHolder(srcTy) && fvaHeldHoleFnDiffers(srcTy, dstTy, 8)
-    ) {
-      fvaRefuseNested(srcExpr, srcTy, dstTy)
-      return true
+    // destination's function type would reach it at another signature. A union delivers the
+    // container to each arm it is assignable to, so each is such a destination (D16296).
+    const dsts: i32[] = []
+    if d is TyUnion && !(s is TyUnion) {
+      for m in d.uMembers {
+        if assignable(srcTy, m) { dsts.push(m) }
+      }
+    } else {
+      dsts.push(dstTy)
+    }
+    for dm in dsts {
+      if (
+        fvaNestedFnDiffers(srcTy, dm, 0, 8)
+        || recordHolder(srcTy) && fvaHeldHoleFnDiffers(srcTy, dm, 8)
+      ) {
+        fvaRefuseNested(srcExpr, srcTy, dm)
+        return true
+      }
     }
     return false
   }

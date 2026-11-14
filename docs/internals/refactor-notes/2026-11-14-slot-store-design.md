@@ -246,15 +246,25 @@ Each class then holds:
 membership.
 1. If the class has an annotated `bound`, its storage is that type's rep. Every member is
    instanced at the bound's signature (a coercion record per member).
-2. Otherwise, each member `m` is instanced at each call tuple in `calls`. These are demands on the
-   instance worklist, so the producer owns the instances (`callTarget` of the coercion).
-3. The storage is:
-   - a **singleton** when the class has one member and every escape is a direct call;
-   - a **closure** of signature `S` when every call tuple agrees on `S` and the tag decision does
-     not tag the class's set;
-   - otherwise a **tagged set id**, with per-call dispatch to `member@tuple`. This is D3975's
-     per-call-type instance record. A set id always coerces to a closure at an annotated escape,
-     so no spelling here needs a refusal: the design forbids none of them.
+2. Otherwise, each member `m` is instanced at each call tuple in `calls`. *Corrected at stage 2a:*
+   the class producer demands nothing. The values-decide close in front of it makes today's
+   demands, and a demand from the producer changed a hole lambda's bundle
+   (`bundle_copy_closure_returned`, runs → invalid wasm). The demand moves to the producer only
+   when the values-decide close is deleted.
+3. The storage is one of four kinds (*corrected at stage 2a*, after the full two-signature census
+   of [`2026-11-14-slot-store-shadow-measurement.md`](2026-11-14-slot-store-shadow-measurement.md)):
+   - **Direct(member)**: one member, every escape a direct call, one instance per call (the 16
+     `d3204_r3_gm_*` cells);
+   - **Closure(S)**: every call tuple agrees on `S` and the tag decision does not tag the set;
+   - **SetId(set)**: two or more members with per-call dispatch to `member@tuple` (1,042 leaves);
+   - **Bundle(member, sigs)**: one member delivered by value and called at several signatures.
+     This is D3975's existing per-call-type instance record, not a new one (the
+     `bundle_copy_closure_*` cells).
+
+   A set id or a bundle always coerces to a closure at an annotated escape, so no spelling here
+   needs a refusal: the design forbids none of them. Until stage 4's coercion records exist, a
+   copy converts nothing, so a leaf closes only where every class upstream of it agrees, or where
+   the nearest upstream source is a call result the elaboration already closed.
 4. A class with members and no calls takes the **uncalled rule**: each member at its default
    instance, the one `elabUncalledSlotTy` / D9100 apply today. It is stated once, not per holder
    kind.
