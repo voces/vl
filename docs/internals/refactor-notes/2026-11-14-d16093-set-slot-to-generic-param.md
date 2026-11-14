@@ -11,7 +11,9 @@
   * a field built an instance whose call returned that member's `i32` where `R` was the join
     (D16097, clause 1).
 * **The rule.** An escape whose site is an element or field read now also dispatches when
-  `ftWideEscOk` holds for its set (a member is generic or un-annotated).
+  `ftWideEscOk` holds for its set (a member is generic or un-annotated) and the members' results
+  differ at the destination's parameters (`holeSetSplitsAt`). Agreeing members keep the closure,
+  byte for byte, as D3975's `tests/vl_fn_set_rep_test.ts` pins.
 * **The scope.** It is limited to `Index` and `Member` reads. Applied to a bound `let`, it also
   tagged a binding the veto then re-typed, which added a second refusal to D9003's cell.
 * **The monomorphizer.** The first diagnosis, that `monoHoleGenFnPin` pins one member, was wrong.
