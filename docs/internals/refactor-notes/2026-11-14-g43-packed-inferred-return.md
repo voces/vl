@@ -17,4 +17,7 @@ changes.
   An inferred `W[] | null` also runs, and so does one inferred union holding `u8[]`, `i16[]`
   and `u16[]`.
 - The `return_inferred` cells of `packed-list-union-arm-{u8,i8,u16,i16}.matrix.vl` were refused
-  in both faces before this change.
+  in both faces before this change. On the refreshed seed every width runs 82 of 82 cells.
+- Gates: fixpoint, `lint-self`, `regress` (no runs lost), `rep-fuzz` (exact),
+  `check-filed-witnesses --strict` (4933 as filed), late demands 8/8, seed size +0.5%, and every
+  budget at or below baseline.
