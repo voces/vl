@@ -18,6 +18,7 @@ import {
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { makeWorkspaceReader } from "../lsp/src/moduleGraph.ts";
 import { STD_SOURCES } from "../std/embedded.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const assert = (cond: boolean, msg: string): void => {
   if (!cond) throw new Error(msg);
@@ -222,14 +223,7 @@ Deno.test("auto-import: a re-exporter is offered when it is the only provider", 
 // ---- seed-backed: real formatter spelling + the native scopeAt filter --------
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 
 Deno.test({ name: "auto-import: the seed's formatter sorts the merged specifiers", ignore }, () => {

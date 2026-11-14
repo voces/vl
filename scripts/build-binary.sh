@@ -12,7 +12,7 @@
 #   scripts/build-binary.sh --target <T>    # one target   → dist/vl-<T>[.exe]
 #   scripts/build-binary.sh --all           # every target → dist/vl-<T>[.exe]
 #
-# Targets (kept in lockstep with .github/workflows/release.yml + Formula/vl.rb):
+# Targets (kept in lockstep with .github/workflows/release.yml):
 #   x86_64-unknown-linux-gnu   aarch64-unknown-linux-gnu
 #   x86_64-apple-darwin        aarch64-apple-darwin
 #   x86_64-pc-windows-msvc
