@@ -1652,7 +1652,11 @@ function ftScan(
         const rec = hk == 6 && xt is TyArray || hk == 8 && xt is TyMap
         // A list's or a map's record slot takes the written record's fields as its own.
         const recTy = if xt is TyArray { xt.aElem } else if xt is TyMap { xt.mVal } else { -1 }
-        if rec && !ftRecWriteJoins(v, recTy, s, ds, leaves, ids, 0) {
+        // A map's entry literal, a record or a list of records, is built at the map's value row.
+        if rec && xt is TyMap && !ftMapEntryLitJoins(v, recTy, s, ds, leaves, ids) {
+          return false
+        }
+        if rec && !(xt is TyMap) && !ftRecWriteJoins(v, recTy, s, ds, leaves, ids, 0) {
           return false
         }
         if hk == 7 && xt is TyArray {
@@ -2487,6 +2491,34 @@ function ftRecWriteJoins(
         return false
       }
     }
+  }
+  true
+}
+
+// `ftRecWriteJoins` over the literal `v` a map entry of value type `vt` takes, a record or a list
+// of records, each literal re-typed to its place in `vt`.
+function ftMapEntryLitJoins(
+  v: i32,
+  vt: i32,
+  s: i32,
+  ds: i32[],
+  leaves: i32[],
+  ids: i32[],
+): boolean {
+  const vx = parenPeelIx(v)
+  if vx < 0 || vx >= P.nodes.length || vt < 0 || vt >= T.tys.length { return true }
+  const n = nodeAt(vx)
+  const t = tyAt(vt)
+  if n is ArrayLit && t is TyArray {
+    for el in n.arrElems {
+      if !ftMapEntryLitJoins(el, t.aElem, s, ds, leaves, ids) { return false }
+    }
+  } else if !ftRecWriteJoins(vx, vt, s, ds, leaves, ids, 0) {
+    return false
+  }
+  if (n is ArrayLit || n is ObjLit) && !i32ListHas(ftRespine, vx) {
+    ftRespine.push(vx)
+    ftRespineTy.push(vt)
   }
   true
 }
@@ -4400,6 +4432,12 @@ function ftSlotWrites(x: i32, p: i32, g: i32, s: i32): i32[] {
   if p < 0 || g < 0 { return none }
   const pn = nodeAt(p)
   const gn = nodeAt(g)
+  // An entry store into a map of records writes the record as `set` does.
+  if pn is Index && pn.idxArr == x && gn is BinExpr && ftIsStore(gn) && gn.binLeft == p {
+    const xt = nodeTyIxOf(x)
+    if ftHoldKind(xt, s, FT_HOLD_DEPTH) == 8 && tyAt(xt) is TyMap { return [gn.binRight] }
+    return none
+  }
   if (
     !(pn is Member && pn.memObj == x && gn is Call && parenPeelIx(gn.callFn) == p)
   ) {
@@ -4574,7 +4612,7 @@ function ftSlotHoldsSet(h: i32, prop: string, s: i32): boolean {
 }
 
 // The value type of the map `m.set(k, x)` writes `x` into, when that map's value holds set `s`
-// in a list (kind 5); -1 otherwise.
+// in a list or a record (kinds 5 and 8); -1 otherwise.
 function ftMapSetValTy(c: Call, x: i32, s: i32): i32 {
   if c.callArgs.length != 2 || c.callArgs[1] != x { return -1 }
   const f = parenPeelIx(c.callFn)
@@ -4582,9 +4620,8 @@ function ftMapSetValTy(c: Call, x: i32, s: i32): i32 {
   const fn = nodeAt(f)
   if !(fn is Member) || fn.memProp != "set" { return -1 }
   const mt = nodeTyIxOf(fn.memObj)
-  if mt < 0 || mt >= T.tys.length || ftHoldKind(mt, s, FT_HOLD_DEPTH) != 5 {
-    return -1
-  }
+  const mk = if mt >= 0 && mt < T.tys.length { ftHoldKind(mt, s, FT_HOLD_DEPTH) } else { 0 }
+  if mk != 5 && mk != 8 { return -1 }
   const m = tyAt(mt)
   if m is TyMap { return m.mVal }
   -1
