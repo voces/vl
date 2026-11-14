@@ -15,8 +15,9 @@ The coordinator checks the note before any stage starts.
 - **The open queue.** `inventory/ls.vl -- --status open` over both inventories lists 76
   `emit_reject` rows. Forty of them hold an un-annotated function in a place: a list element, a
   map value, a record field, a binding, a capture cell, a parameter or a result. They are listed in
-  §4. All 40 re-run as filed on this seed (`check-filed-witnesses.vl --strict`: 40 graded, 40 as
-  filed, provenance match). #8031 then closed D15333 and D15809, so **38 are open**.
+  §4. All 40 re-ran as filed on a fixpoint seed of `42c79fce6` (`check-filed-witnesses.vl --strict`:
+  40 graded, 40 as filed, provenance match). #8031 then closed D15333 and D15809. The other 38
+  re-run as filed on the `94f5055d4` fixpoint seed, so **38 are open**.
 - **Fixes add spellings.** Of the last 45 commits on master, 14 closed a row in this family, and
   every one of them added a case:
   - in `emit_mono.vl`: D16162 +23, D16200 +12, D15943 +50, D15925 +16, D16161 +24, D15941 +15, and
@@ -314,21 +315,50 @@ census rows show the evidence:
 
 ## 4. The rows, by mechanism
 
-These are the 38 open rows of §0, grouped by the **Mechanism paragraph each row files**. Lane S
-has not ablated them. Lane B's G1–G9 numbering, which was not received in time for this note, is
-to be reconciled onto this table. Group G3 (lane M, #8030) and G4 (lane K, #8031) are already
-closed on master.
+**Population.** The rows are the 38 open `emit_reject` rows of §0, plus three more:
+- D16221 (check-clean invalid wasm);
+- D15332 (a check reject, lane B's G7);
+- D16280 (filed by this note).
 
-| group | mechanism (as filed) | rows | closes at stage |
-|---|---|---|---|
-| **P1** no place for the holder kind or path | the slot fact exists for a `let` but not for a field, map in a field, stored binding, cell, or a list written whole | D16201, D16202, D14401, D3851, D12230, D15392, D15357, D14437, D14782 | 2 (the decision), confirmed at 3 |
-| **P2** the argument → parameter delivery is not an edge | the value handed to an un-annotated or hole parameter is instanced from the callee's own pins, not from the calls through the parameter per caller instance | D15334, D15900, D15776, D15777, D14888, D15014, D3956, D12218, D12233, D16143, D14433 | 4 |
-| **P3** the result → call-site delivery is not an edge | a returned value's slot is not delivered back to the caller's reads; a returned container is built at another storage | D16077, D16079, D16130, D16131, D15753, D15755, D16136, D15923, D12454 | 5 |
-| **P4** the storage is decided by node shape or per node, not per class | the tag scan and the per-node stamp see the node in front of them, not the class it is in | D15274, D15302, D15303, D15308, D16137, D16144, D15431, D16230, D16133 | 6 |
+On the `94f5055d4` fixpoint seed, the 38 rows and D16280 re-run as filed (39 graded, 39 as filed,
+provenance match). Lane S did not re-grade D16221 or D15332; lane B graded D15332 with its census.
 
-These are 9 + 11 + 9 + 9 = 38 rows. "Closes at stage" is a prediction, graded by re-running each
-row's witness when its stage lands. A row that does not move is re-filed under the mechanism its
-ablation then shows. It is not counted as closed.
+**Groups G1–G9** are lane B's census: 22 rows, from about 110 one-ingredient ablations ("runs
+when …" defines each group). Lane B ran it on master `005bf5ee0`, 22/22 as filed.
+
+**Groups X1–X4** hold the rows outside lane B's census. They are grouped by the Mechanism
+paragraph each row files. **Lane S has not ablated them**, so they are message-adjacent and
+provisional.
+
+**Rows in flight** (named so that a stage does not claim them):
+- D15753 and D15755, in lane B's #8034;
+- D16201, in lane G's #8037, which also files unfiled: D16203 and unfiled: D16204.
+
+| group | mechanism (one-ingredient ablation) | open rows | what the producer makes of it | stage |
+|---|---|---|---|---|
+| **G1** | A write widens a holder's member set, but another producer of the holder (a sibling literal, a value-`if` arm's literal, a bound source `r = q`) keeps its narrower row. It needs the write and a second call signature; D15308 fails with bare functions too. | D15274, D15302, D15308 | Every producer of a holder is in the holder's class (store and join edges), so all of them take the one storage. | 3 (containers), 6 (the set's tag) |
+| **G2** | A whole container literal written into a held container (`xs.push([{f}])`, `r = {f: [id2]}`) keeps its inner literals off the holder's row. Initialising with both runs. | D15357, D15392 | A store edge unifies the written literal with `holder.e` / `holder.f.f` at every path below it, so a written literal and an initialiser are the same edge. | 3 |
+| **G3** | A function written through an un-annotated parameter into a container. Closed by #8030. | D16230 (clause 1, residue) | The assignment's value is a place. Its spill local takes `ty(k, node)` (the leaf's id), not the check type. | 5 |
+| **G4** | A non-name argument (inline `if`, inline literal, a call's joined result) at an un-annotated parameter, where the bound twin runs. Sub-shape (a) was closed by #8031. | D15334, D15900; D15431 is a different mechanism (a call through a *field* of a hole parameter, recorded nowhere) | The argument edge goes from whatever place the argument is, never from its node shape (lane K: `ftHoldCtxOk`'s Call arm, `ftCtxOk`'s FieldInit arm). D15431's call is `calls((o, f.f, k))`. | 4; D15431 4 + 6 |
+| **G5** | An un-annotated function returns a *held* binding of a function container, bound at an annotated type ("returned container … built at another storage"). Returning a literal runs. | D16136 (its no-`if` spelling), D16221; D15753 and D15755 in #8034 | The result place `(fn, r, k)` is in the returned binding's class. Lane B measured that for G5 lists the elaboration's slot fact already is the answer; the gap is emit-side row-mint order. | 5 |
+| **G6** | A record field whose value is a non-literal list of function-carrying records gets no struct row ("ref valtype with no interned shape"). It runs as a list holder, or where the results agree. | D15923, D15303 (tentative) | The field's place `(w, f.f)` has a closed `ty` with its set, so the record mint keys its field by type. Lane G's finding is the ordering constraint: the closed row and the closure-list row it needs are produced together (stage 3). | 3 |
+| **G7** | (check) A *bound* record of an un-annotated function, delivered to a parameter annotated with a closed function field, is refused; the inline literal runs. | D15332 | The annotated parameter is a `bound` on the argument's class (§3.3 rule 1), but the checker refuses before the elaboration runs. It needs the checker to defer this delivery to the class, the shape of D16133's ruling, close (iii). | 6 (named risk) |
+| **G8** | One un-annotated parameter receives two bound lists of one type at two reps (one tagged, one uniform). | D16144 | The parameter's place is per instance, and an instance's key includes the argument class's storage, not only its type. | 4 |
+| **G9** | An index store of a nested record holding an uncalled function. Closed by #8028. | D16201 in #8037; unfiled: D16203 (a record of a fresh map reaching its holder through a call result or a list element) | D16203 is the case #8037's literal-only fact cannot reach: a return edge and an element edge into the same class. | 3 + 5 |
+| X1 | Capture cell: the cell takes the checked hole type (`i32`) while a closure is stored. | D3851, D12230 | The cell `e` is a place, joined by a capture edge. | 4 |
+| X2 | An argument to a hole or generic parameter, instanced from the callee's own pins, not from calls per caller instance. | D14888, D15014, D3956, D12218, D12233, D16143, D14433, D15776, D15777 | argument edges per caller instance | 4 |
+| X3 | A result delivered back to the caller: a generic returned through a hole parameter has no instance (D16077's family). | D16077, D16079, D16130, D16131, D16133, D12454 | return edges both ways, plus D16133's ruled close (ii) | 5 (+6 for D16133) |
+| X4 | No fact for the holder kind or path: a map value of a generic at two instances, a list delivered whole to a closed function-list type, a nested list, a stored binding. | D14401, D14437, D14782, D16202, D16280 | places for every holder kind and path (stage 2's decision) | 2–3 |
+
+**Count.** The population is 41 rows: the 38 of §0, plus D16221, D15332 and D16280.
+- 3 are in flight: D15753, D15755 and D16201.
+- G1–G8 hold 15: 3 + 2 + 1 + 3 + 2 + 2 + 1 + 1.
+- X1–X4 hold 22: 2 + 9 + 6 + 5.
+- D16137 (D16133's class, ruled close (ii)) goes to stage 6.
+
+That is 3 + 15 + 22 + 1 = 41. Each stage claims only the rows whose witness its PR re-runs to
+`runs`. A row that does not move is re-ablated and re-filed under the mechanism its ablation shows.
+It is not counted as closed.
 
 ## 5. Stages
 
@@ -386,12 +416,34 @@ discovery pass.
 | stage | builds | deletes (mono / elab) | Δ emit_mono fns | Δ compiler lines | closes | files (for splitting across lanes) |
 |---|---|---|---|---|---|---|
 | **1. Places and edges** | `slotHolderOf`, `placeOf`, the edge table (§3.1–3.2) in a new `compiler/elab_place.vl`; `elabSlotDeliveries` and `elabSlotHeldFns` become queries over it | mono F11 (7 / 178); elab F delivery walk (30 / 1,276) and H held sets (8 / 172), less the shared walkers kept | −7 → 901 | about −1,000 (+550 new) | none; this is a refactor stage. Acceptance is 0 runs → not-runs and a byte-identical `regress.vl` | `elab_place.vl` (new), `emit_elab.vl`, `emit_mono.vl` F11, `check_write_scan.vl`'s slot readers |
-| **2. Classes and the one decision** | union-find classes, member flow, the §3.3 rule and the fixpoint (§3.4); `elabSlotTyAt` reads `slotStore` | elab C holder close (21 / 697), D leaf signature (14 / 322), E value-side close (9 / 249), I uncalled (9 / 125); mono F1 slot pin (19 / 349) and F2's type half (3 / 90) switch to reading, then go | −22 → 879 | about −1,500 (+450) | P1 (9) | `elab_place.vl`, `emit_elab.vl`, `emit_mono.vl` F1/F2 |
-| **3. Containers read the store** | mono writes the place's `ty` where F3/F4 wrote theirs: one copy function, `monoApplyPlaceStore`, until stage 7 | mono F3 container storage (15 / 1,071), F4 elab-built held (14 / 419) | −28 → 851 | about −1,450 (+40) | P1 confirmed; D16201/D16202 by construction | `emit_mono.vl` L13855–16600 |
-| **4. Arguments and instances** | argument edges per caller instance; `instOf(member)` is the delivered instance; F9's parameter types are the parameter's place | mono F6 delivery instancing (15 / 532), F8 cells (4 / 212), F9 lambda params (7 / 311); elab L value → instance keys (20 / 387), G call reach (18 / 560) | −26 → 825 | about −1,800 (+200) | P2 (11) | `emit_mono.vl` L3500–5000, L19000–26500; `emit_elab.vl` L/G |
-| **5. Results** | `r` places per instance, and return edges both ways | mono F5 results (6 / 285), F7 read retyping (15 / 495), F10 (5 / 61) | −26 → 799 | about −750 (+100) | P3 (9) | `emit_mono.vl` L14300–14450, L16000–16550, L24000–24600 |
-| **6. The tag decision reads classes** | `ftHoldCtxOk` / `ftScan`'s shape arms become "the place's class holds set *s*"; `fnTagHeldRep` is keyed by `(place, k)`, not by node; the late round refutes a set by class (D16133's ruling, close (ii)) | `ftHoldCtxOk`'s per-shape arms, `ftInnerLit`, `ftHandedHolder`; elab J written lambda / param (10 / 267), K record-of-members (14 / 460), M checker joins (7 / 216), `elabHeldKeepSets` | about −3 | about −900 (+150) | P4 (9) | `check_fn_tag.vl`, `check_elab_cap.vl`, `emit_elab.vl` J/K |
+| **2. Classes and the one decision** | union-find classes, member flow, the §3.3 rule and the fixpoint (§3.4); `elabSlotTyAt` reads `slotStore` | elab C holder close (21 / 697), D leaf signature (14 / 322), E value-side close (9 / 249), I uncalled (9 / 125); mono F1 slot pin (19 / 349) and F2's type half (3 / 90) switch to reading, then go | −22 → 879 | about −1,500 (+450) | X4 (D14401, D14437, D14782) | `elab_place.vl`, `emit_elab.vl`, `emit_mono.vl` F1/F2 |
+| **3. Containers read the store** | mono writes the place's `ty` where F3/F4 wrote theirs: one copy function, `monoApplyPlaceStore`, until stage 7 | mono F3 container storage (15 / 1,071), F4 elab-built held (14 / 419) | −28 → 851 | about −1,450 (+40) | G1 (rows), G2, G6, X4 (D16202, D16280), G9 (unfiled: D16203, with stage 5) | `emit_mono.vl` L13855–16600 |
+| **4. Arguments and instances** | argument edges per caller instance; `instOf(member)` is the delivered instance; F9's parameter types are the parameter's place | mono F6 delivery instancing (15 / 532), F8 cells (4 / 212), F9 lambda params (7 / 311); elab L value → instance keys (20 / 387), G call reach (18 / 560) | −26 → 825 | about −1,800 (+200) | G4 (D15334, D15900, D15431's call), G8, X1, X2 | `emit_mono.vl` L3500–5000, L19000–26500; `emit_elab.vl` L/G |
+| **5. Results** | `r` places per instance, and return edges both ways | mono F5 results (6 / 285), F7 read retyping (15 / 495), F10 (5 / 61) | −26 → 799 | about −750 (+100) | G3 (D16230), G5 (D16136, D16221), X3 (less D16133) | `emit_mono.vl` L14300–14450, L16000–16550, L24000–24600 |
+| **6. The tag decision reads classes** | `ftHoldCtxOk` / `ftScan`'s shape arms become "the place's class holds set *s*"; `fnTagHeldRep` is keyed by `(place, k)`, not by node; the late round refutes a set by class (D16133's ruling, close (ii)) | `ftHoldCtxOk`'s per-shape arms, `ftInnerLit`, `ftHandedHolder`; elab J written lambda / param (10 / 267), K record-of-members (14 / 460), M checker joins (7 / 216), `elabHeldKeepSets` | about −3 | about −900 (+150) | G1 (the set's tag), G7 (check defers, a named risk), D16133, D16137 | `check_fn_tag.vl`, `check_elab_cap.vl`, `emit_elab.vl` J/K |
 | **7. Emit reads `ty(k, node)`** | emit's readers of a synthesized `letType` read the node's elaborated type | `monoApplyPlaceStore`, `monoFieldReadTys`, the 11 `synthTypeRefOfTy` write sites | −5 → about 794 | about −200 | none new; the family's output channel to emit is gone | `emit_classify.vl`, `emit_collect.vl`, `emit_rewrite.vl`, `emit_mono.vl` |
+
+**Stage notes.**
+- **Stage 3: the order of row mints** (lane G, from #8037).
+  - Interning a record's closed row before mono is safe only where every leaf it closes already has
+    its rep. Lane G's general version lost 3 running cells, `d15204_run_record_field`, `_set` and
+    `d15220_cell_bound_record` (`a late closure list row has no closure struct`): the closed
+    `((i32) => i32)[]` field's closure struct is minted only after mono. #8037 therefore narrows
+    the fact to records that hold a map (`elabObjHoldsMap`), a spelling-shaped limit.
+  - Stage 3 produces a place's row and every row it needs below it (the closure-list rows) in one
+    function, leaves first. It deletes that limit, and `elabFreshMapSlotTy`, `elabLitBindingFact`
+    and `anonMintLiteral`'s `internShapeDeepTy(fact)` call.
+  - Lane G's assert becomes stage 3's invariant: a record row is recorded at the place's closed
+    type, never aliased onto a row recorded at an open one (unfiled: D16204). Today it fires on 4
+    running cells: `distilled/named/d15204_run_record_field.vl`, `_set`,
+    `d15220_cell_bound_record.vl` and `d15221_nest_dbl.vl`. All four are in stage 3's acceptance
+    set and must keep running with the assert on.
+- **Stage 4: parameter instances.** The instance key gains the argument class's storage (G8). It
+  stays a type-id vector, and the storage is one more id (the review's medium-1, hash-consed keys, §7).
+- **Stage 6: G7 is a checker refusal.** It needs the check to abstain on a delivery whose class
+  the elaboration decides. That is close (iii) of D16133's ruling, applied to one delivery. It is
+  named as the stage's risk: if it churns the check's own readers (`fnTagEtaAgain`,
+  `recordClosedHoles`, `callBindAdoptReps`), G7 is split out and re-filed, not forced.
 
 **Total, estimated.**
 - `emit_mono.vl` loses 112 functions (908 → about 796; the shared helpers that become dead
@@ -434,15 +486,67 @@ discovery pass.
 | `emit_mono.vl` lines | 26,879 | about 22,900 |
 | `mono*Pin*` functions | 170 | about 131 |
 | compiler lines (`compiler/*.vl`) | 401,987 | about 394,500 |
-| open rows in this family (§4 population) | 38 | 0 |
+| open rows in this family (§4's 41, less the 3 in flight) | 38 | 0 |
 | core matrix set, cells that run (both faces) | 409 of 697 graded, 0 `SILENT`, 1 program trap (D16280) | every cell that runs on master, plus each stage's rows' cells |
 | `runs → not-runs` on any matrix or `regress.vl` | 0 | 0 |
 
-## 7. Not claimed
+## 7. The engineering review's L1 and medium-2
 
-- **The row grouping.** The §4 groups are read from the rows' filed Mechanism paragraphs, which
-  are message-adjacent. Lane S ablated none of them. A stage that closes rows grades them by
-  witness, and lane B's G numbering supersedes this one where they disagree.
+The outside review (`engineering-review-2026-11.md`, PR open) reaches the same diagnosis from the
+emitter's end:
+- **L1** is a typed mid-level IR in which every node carries a closed rep, and the emitter is a
+  total (op × rep) function.
+- **Medium-2** is `Rep` as an algebraic type in place of about 32 enumerated tags.
+
+The owner has not ruled on L1–L4. This section says how the producer is the first slice of that
+path rather than another table beside mono, and what survives either ruling.
+
+**(a) The first slice.**
+- **A place is an IR variable; an edge is an IR move.** Store, copy, argument, return, loop and
+  callback edges (§3.2) are exactly the def-use graph a mid-level IR makes explicit. A leaf edge's
+  coercion record is an IR coercion node (closure construction from a set id, D3975's delivery by
+  value). Building the edge table from the elaborated program per instance is "instantiate into
+  IR", restricted to data flow. It is the same input L1's IR builder needs, computed in the same
+  phase.
+- **`slotStore(place).rep` is a `Rep` value, not a tag.** Stage 2 defines the output as a tree:
+  - `Fn(Closure(sig) | SetId(set) | Direct(member))`;
+  - `List(Rep)`, `Map(KeyRep, Rep)` and `Record(row, [Rep])`;
+  - nullable and union nodes over those.
+
+  It is computed structurally per path. This is medium-2's ADT, scoped to the function-holding
+  family. Today's tags (`fnTagHeldRep`'s `i32` list, closure-list rows, `"…list"` names) become
+  derived views of it, read by the existing emitters. A place's rep is total by construction: a
+  class always has a decision (§3.3), so "no rep for …" is not a reachable answer for a place.
+- **The emitter's half of L1 then has its input.** An (op × rep) emitter needs the rep of every
+  operand. For function-holding values that is `slotStore(placeOf(node, k)).rep`, the first family
+  for which every node's rep is produced in one place.
+
+**(b) What survives each ruling.**
+
+| stage | if the owner picks L1 | if the owner keeps the AST and emitter |
+|---|---|---|
+| 1 places and edges | **survives**: becomes the IR builder's data-flow input, or a pass over the IR's def-use chains | survives |
+| 2 classes and the decision | **survives**: storage inference is needed whatever carries the reps; a mutable slot's storage is a whole-program fact, not a node's | survives |
+| 3 containers read the store | the mono deletions survive (deleting a decision is never throw-away); `monoApplyPlaceStore` is throw-away (about 40 lines) | survives; the shim goes at stage 7 |
+| 4 arguments and instances | **survives**: "mono becomes instantiate into IR" needs the elaboration to own every instance, which stage 4 finishes for delivered functions | survives |
+| 5 results | **survives**, for the same reason | survives |
+| 6 the tag decision reads classes | **survives**: the tag bit is part of the `Rep` | survives |
+| 7 emit reads `ty(k, node)` | **throw-away**: under L1 the emitter reads IR node reps, not `ty(k, node)`; switching the 90-plus `.letType` readers would be redone | survives |
+
+So stages 1–6 are on L1's path and are about 95% of the deleted lines. Stage 7 is the one stage
+whose work an L1 ruling would discard. **Recommendation:** run stages 1–6, and hold stage 7 until
+the owner rules. If L1 is chosen, the IR builder is the shim's first and only reader, and stage 7
+is not done.
+
+**L2** (an inferred interface per un-annotated function) changes rule 2 of §3.3. A member would be
+instanced from its inferred signature, not per call tuple. The class analysis, and with it storage,
+is unchanged by it.
+
+## 8. Not claimed
+
+- **The row grouping.** G1–G9 are lane B's ablated census. X1–X4 are read from the rows' filed
+  Mechanism paragraphs, which are message-adjacent: lane S ablated none of them. A stage that
+  closes rows grades them by witness.
 - **The deltas.** Every delta is an estimate from line counts. None was prototyped.
 - **The cost.** The fixpoint's cost is argued (§3.4), not measured.
 - **The `.letType` readers.** Stage 7's emit readers (90 `.letType` reads in `emit_classify.vl`
