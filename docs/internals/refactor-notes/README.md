@@ -9,6 +9,14 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-14-d15882-shared-nullable-lit-field](2026-11-14-d15882-shared-nullable-lit-field.md): D15882 + D16031: literal-set-or-`null` fields through a union of records, 2026-11-14
+- [2026-11-14-d15975-fn-eq-refusal](2026-11-14-d15975-fn-eq-refusal.md): D15975 PR 3: `==` on functions is a check error, 2026-11-14
+- [2026-11-14-d15975-identity-flag](2026-11-14-d15975-identity-flag.md): D15975: identity rides an equality node (`BinExpr.binIdent`), 2026-11-14
+- [2026-11-14-d16032-label-from-type](2026-11-14-d16032-label-from-type.md): The union label spelled from its type (D16032), 2026-11-14
+- [2026-11-14-d16093-set-slot-to-generic-param](2026-11-14-d16093-set-slot-to-generic-param.md): D16093, D16097: a set's element or field handed to a generic function parameter dispatches, 2026-11-14
+- [2026-11-14-d16100-field-read-off-record-assignment](2026-11-14-d16100-field-read-off-record-assignment.md): D16100 / D16101 — reading a field off a record assignment's value, 2026-11-14
+- [2026-11-14-g43-packed-inferred-return](2026-11-14-g43-packed-inferred-return.md): D16120: an inferred union return may hold a packed list arm, 2026-11-14
+- [2026-11-14-restore-closure-arm-identity-case](2026-11-14-restore-closure-arm-identity-case.md): Restore D1098's closure-arm compare case under `===`, 2026-11-14
 - [2026-11-14-d16009-let-handed-to-open-param](2026-11-14-d16009-let-handed-to-open-param.md): D16009: a re-pointed `let` handed to an open parameter dispatches, 2026-11-14
 - [2026-11-14-d16016-union-and-record-place-value](2026-11-14-d16016-union-and-record-place-value.md): D16016: a write into a union or `R | null` place used as a value, 2026-11-14
 - [2026-11-14-d16025-one-row-per-key](2026-11-14-d16025-one-row-per-key.md): One union row per type key: the label index deleted (D16025), 2026-11-14
