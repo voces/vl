@@ -44,5 +44,5 @@ this test rather than moved to another gap.
 - Without the flag the hook program compiles and runs (`vl check --codegen` clean; `vl run` prints
   the hook's body). With it, the refusal fires once, at the call, in one file and through an import.
 - The emitter-state audit is clean (`NEVER 0`).
-- Sweep with fixpoint seeds on both sides: SWEEP.
+- Sweep with fixpoint seeds on both sides (base e66f502aa): 24,286 programs, 0 output movers, 0 bytes-only movers, 0 `runs → not-runs`, 0 new traps; without the flag behaviour is unchanged.
 - `scripts/gate.sh`: all rows pass.
