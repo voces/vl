@@ -379,38 +379,15 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
 });
 
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
-  const checker = loadWasmChecker(SEED, log)!;
-  // Type-valid, but codegen cannot lower an INFERRED nullable SET return — raised on the
-  // distinct channel whose `unsupported-lowering` code rides the `diagCodeLen`/`diagCodeByte`
-  // ABI into `VLDiagnostic.code`. (The annotated `: Set<i32> | null` spelling of the same
-  // function lowers and runs, which is what makes this a capability admission and not a type
-  // error.)
-  //
-  // THE WITNESS HAS MOVED TWICE NOW, AND THAT IS THE POINT OF THE TEST. It was
-  // `print(pick(true))` over an `i32 | string` until D712 built the box-tag dispatch; it was
-  // an inferred nullable-STRUCT return until D887 recorded that shape's row and gave the A20
-  // pass and `emitReturnValue` the arms the annotated path already had. Any still-open
-  // capability gap serves; what this asserts is the CHANNEL, not the gap.
-  // D956 CLOSED THE STRING-KEYED MAP ENTIRELY, so the witness moved a FOURTH time — to
-  // `i64[] | null`. D1062 then closed the nullable LIST at every element type, which is why
-  // it has moved a FIFTH. What still floors
-  // on this channel is the i32-KEYED map: `nullableRetName`'s map arm requires a `string`
-  // key. The annotated twin runs, so it is a capability gap and the witness will move again.
-  // D1108 closed the i32- and i64-keyed map, so it has moved a SIXTH time, to the nullable `Set`
-  // (D16037), which that arm still excludes.
-  // `scripts/capability-probes/inferred-nullable-container-return.vl` and
-  // `inferred-nullable-list-return.vl` are the standing probes for the closed halves; when
-  // the rest closes, this witness moves again.
+  const checker = loadWasmChecker(SEED, log, undefined, undefined, false, true)!;
+  // A test-only capability refusal (the checker's `testUnsupported` opt-in, unreachable from a
+  // user program) raised on the distinct channel whose `unsupported-lowering` code rides the
+  // `diagCodeLen`/`diagCodeByte` ABI into `VLDiagnostic.code`. What this asserts is the
+  // CHANNEL; a real open gap as the witness moved every time its gap closed (seven times).
   const diags = await checker.check(
     [
-      "function pick(c: boolean) {",
-      "  if c { return null }",
-      "  const m: Set<i32> = Set()",
-      "  m",
-      "}",
       "function go() {",
-      "  const r = pick(true)",
-      "  if r == null { print(0) } else { print(1) }",
+      "  __vl_test_unsupported__()",
       "}",
       "go()",
       "",
@@ -694,6 +671,32 @@ Deno.test({
   const freeTy = await checker.hoverTypeAt(free, "/tmp/x.vl", noSiblings, 0, 15);
   if (freeTy !== "_") {
     throw new Error(`expected _ for an unconstrained hole, got ${JSON.stringify(freeTy)}`);
+  }
+});
+
+// A covering test's dead arm reads its operand as `never` (D16006), and hover says so.
+const DEAD_ARM_SRC = "function take(p: i32) {\n" +
+  "  if p is i32 {\n" +
+  "    print(p + 1)\n" +
+  "  } else {\n" +
+  "    print(p)\n" +
+  "  }\n" +
+  "}\n" +
+  "take(4)\n";
+
+Deno.test({
+  name: "wasm-symbols: hover in a covering test's dead arm shows never",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // Line 4 `    print(p)` — the `p` at col 10 sits in the `else` that `p is i32` leaves dead.
+  const dead = await checker.hoverTypeAt(DEAD_ARM_SRC, "/tmp/x.vl", noSiblings, 4, 10);
+  if (dead !== "never") {
+    throw new Error(`want never in the dead arm, got ${JSON.stringify(dead)}`);
+  }
+  const live = await checker.hoverTypeAt(DEAD_ARM_SRC, "/tmp/x.vl", noSiblings, 2, 10);
+  if (live !== "i32") {
+    throw new Error(`want i32 in the live arm, got ${JSON.stringify(live)}`);
   }
 });
 

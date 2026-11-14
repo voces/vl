@@ -25,6 +25,7 @@ import {
   FC_NUL_REF_LIST,
   FC_REF_LIST,
   FC_STRUCT,
+  PK_U8,
   RLK_CLOSURE,
   RLK_F32_LIST,
   RLK_F64_LIST,
@@ -59,6 +60,7 @@ import {
   mvValArmSig,
   mvValName,
   mvValTyIx,
+  pkRowOfPrim,
   rlElemTyIx,
   rvSrcSlot,
   sAnonOwnTy,
@@ -154,6 +156,7 @@ import {
 import { sidOf } from "./symbols"
 import {
   isNullTy,
+  primIsSubWord,
   primNameOf,
   tyEmitElemNulPrimOf,
   tyEmitElemPrimOf,
@@ -161,6 +164,8 @@ import {
   tyEmitPrimOf,
   tyHasTyVar,
   tyMapValOf,
+  tyPackedElem,
+  tyPeelNul,
   tyStepElem,
 } from "./tyquery"
 import {
@@ -357,6 +362,8 @@ export function repSigTokHasSlot(kind: VKind | null): boolean {
     || kind == "nulreflist"
     || kind == "map"
     || kind == "nulmap"
+    || kind == "u8list"
+    || kind == "nulu8list"
 }
 
 // Mint a slot-carrying `$fnsig` token: the kind's token char followed by the
@@ -364,9 +371,34 @@ export function repSigTokHasSlot(kind: VKind | null): boolean {
 // slot renders its `sTwin`-canonical representative (`repStructSlotRep`), not the raw
 // row, so two spelling-twin rows key one `$fnsig`; computed from `slotCanonId`, never `sTwin[]`.
 export function repSigSlotTokOfKind(kind: VKind | null, slot: i32): string {
+  // A packed list at the `u8` row writes no slot, so a `u8[]` token reads as it always has.
+  if (kind == "u8list" || kind == "nulu8list") && slot == 0 {
+    return repSigTokOfKind(kind)
+  }
   let s = slot
   if kind == "struct" || kind == "nulstruct" { s = repStructSlotRep(slot) }
   repSigTokOfKind(kind) + i32ToStr(s) + ";"
+}
+
+// Whether the `$fnsig` token starting at `key[i]` carries a `;`-terminated slot. A packed
+// list's is optional: the bare token is the `u8` row (`repSigSlotTokOfKind`).
+export function sigTokSlotAt(key: string, i: i32): boolean {
+  if i < 0 || i >= key.length { return false }
+  const k = repKindOfSigTok(key[i])
+  if !repSigTokHasSlot(k) { return false }
+  if k == "u8list" || k == "nulu8list" {
+    return i + 1 < key.length && key[i + 1] >= '0' && key[i + 1] <= '9'
+  }
+  true
+}
+
+// The slot a token starting at `key[i]` reads when it writes none: the `u8` row for a packed
+// list's bare token, -1 for every other kind.
+export function sigTokBareSlot(key: string, i: i32): i32 {
+  if i < 0 || i >= key.length { return -1 }
+  const k = repKindOfSigTok(key[i])
+  if k == "u8list" || k == "nulu8list" { return PK_U8 }
+  -1
 }
 
 // The inverse projection: a `$fnsig` token character back to its `VKind`, or `null`
@@ -2991,7 +3023,18 @@ export function rowsStoreAlikeIn(
   if da == null || db == null || ka == null || kb == null {
     return codeA == codeB
   }
-  ka == kb && da.rdNul == db.rdNul
+  if ka != kb || da.rdNul != db.rdNul { return false }
+  // Two packed list fields store alike only at one row (`u8[]` beside `i16[]` does not).
+  if ka == "u8list" || ka == "nulu8list" {
+    return tyPackedRow(ta[a]) == tyPackedRow(tb[b])
+  }
+  true
+}
+
+// The packed row of list type `ty` (`u8[]`, `i16[] | null`): its element's storage width,
+// -1 for any other type.
+export function tyPackedRow(ty: i32): i32 {
+  pkRowOfPrim(tyPackedElem(tyPeelNul(ty)))
 }
 
 // Whether struct-table flat row `r` stores a ref whose heap is named rather than pinned by its
@@ -4667,11 +4710,10 @@ function rtOfPrim(pn: PrimName, ty: i32): i32 {
   if pn == "f64" { return rtLeafOf("f64", 0, "", ty) }
   if pn == "f32" { return rtLeafOf("f32", 0, "", ty) }
   if pn == "string" { return rtLeafOf("str", 0, "", ty) }
-  // `u8` — a STORAGE leaf, not a value leaf. It reaches this function only as an array
-  // ELEMENT (the checker admits `u8` nowhere else), and `rtListVKind` is the only reader
-  // that answers for it; a `u8` in any other tree position has no rep and correctly
-  // finds none.
-  if pn == "u8" { return rtLeafOf("u8", 0, "", ty) }
+  // A storage width — a STORAGE leaf, not a value leaf, its packed row in `disc`. It reaches
+  // here as a list element or a `flat` field, and `rtListVKind` is the only reader that
+  // answers for it; in any other tree position it has no rep and correctly finds none.
+  if primIsSubWord(pn) { return rtLeafOf("u8", pkRowOfPrim(pn), "", ty) }
   if pn == "void" { return rtLeafOf("i32", 0, "", ty) }
   if pn == "null" { return rtLeafOf("null", 0, "", ty) }
   if pn == "v128" { return rtLeafOf("v128", 0, "", ty) }
@@ -4729,6 +4771,19 @@ function rtOfObjAs(memoTy: i32, objTy: i32, disc: i32, fieldTys: i32[]): i32 {
 }
 
 function rtOfUnion(ty: i32, members: i32[]): i32 {
+  // A union box tags a list member by its type's tag, and only `u8[]` among the packed lists
+  // has one, so a union holding another packed list is refused here, before any row mints.
+  for m in members {
+    const pw = tyPackedElem(m)
+    if pw != null && pw != "u8" {
+      emitFail(
+        "emitProgram: a union with member `"
+          + primNameStr(pw)
+          + "[]` — of the packed lists only `u8[]` has a union box tag, so this union cannot be boxed",
+      )
+      return rtLeafOf("unsup", 0, "union:packed", ty)
+    }
+  }
   const c = unionRepClassOfTy(ty)
   // A string literal union is the interned i32 atom, whatever its spelling.
   if c == URC_ATOM { return rtLeafOf("atom", 0, "", ty) }

@@ -163,6 +163,7 @@ import {
   inStrFix,
 } from "./check_diag_text"
 import { seedExpected } from "./check_expected"
+import { checkIdentityBinNode } from "./check_identity"
 import {
   adoptLitAt,
   atomHitStamp,
@@ -349,6 +350,7 @@ import {
   widenLitTy,
 } from "./check_relate_core"
 import {
+  inDeadArm,
   nhLink,
   recordDeadNullTest,
   recordDeadTest,
@@ -379,6 +381,7 @@ import {
   TY_F64,
   TY_I32,
   TY_I64,
+  TY_NEVER,
   TY_NULL,
   TY_STR,
   TyArray,
@@ -426,6 +429,7 @@ import {
   isNumericPrimTy,
   isStringTy,
   nonNullTy,
+  primIsSubWord,
   primNameOf,
   sameNumeric,
   tyAdmitsNull,
@@ -957,9 +961,9 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
         numDeliverStamp(n.binRight, rt, arrElemValueTy(arrT0.aElem))
       }
       cnhNullNote(n.binRight, arrT0.aElem)
-      // A `u8[]` store checks against the element type directly: `checkIndexNode` types a
-      // `u8[]` read as `i32` (the widened value), so `lt` above can't see the out-of-range rule.
-      if primNameOf(arrT0.aElem) == "u8" {
+      // A sub-word list store checks against the element type directly: `checkIndexNode` types
+      // the read as `i32` (the widened value), so `lt` above can't see the out-of-range rule.
+      if primIsSubWord(primNameOf(arrT0.aElem)) {
         assignableExpr(n.binRight, rt, arrT0.aElem)
       }
     }
@@ -1825,11 +1829,25 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   if op == "&&" || op == "||" { return checkLogicalBinNode(n, ix) }
   const savedLbiTgt = lbiWriteTgt
   const lt = binCheckLeftOperand(n, op)
+  if op == "===" || op == "!==" {
+    const irt = widenLitTy(binCheckRightOperand(n, ix, op, lt, savedLbiTgt))
+    return checkIdentityBinNode(ix, n.binLeft, n.binRight, op, lt, irt)
+  }
   ltOut.push(lt)
   // A `??` default may not run, so a write in it narrows nothing after the operator (D2451).
   if op == "??" { pushScope(-1) }
   const rt = binCheckRightOperand(n, ix, op, lt, savedLbiTgt)
   if op == "??" { popScope() }
+  // In a dead arm `never` is a bottom: an operator over an operand no value has has none (D16006).
+  if (
+    op != "="
+    && op != "??"
+    && (lt == TY_NEVER || rt == TY_NEVER)
+    && inDeadArm(ix)
+  ) {
+    while ltOut.length > 0 { ltOut.pop() }
+    return TY_NEVER
+  }
   binTyOfSides(n, ix, lt, rt, ltOut)
 }
 
