@@ -5,6 +5,12 @@
 
 import { identTyOf } from "./check_nar_store"
 import {
+  TT_NONE,
+  TT_PARTLY,
+  recFitNarrowedFields,
+  tyTestMemberFit,
+} from "./check_fit_rules"
+import {
   FieldDef,
   ForIn,
   Ident,
@@ -42,6 +48,7 @@ import {
   tsLeaf,
   tsMkKids,
   tsToName,
+  valueIfAdd,
 } from "./ast"
 import {
   annotCollapsed,
@@ -124,7 +131,7 @@ import { identConstDeclOf } from "./check_scopes"
 import { joinClashMsgSet, mkTyVarOwned } from "./check_subst"
 import { fvaFnMayDiffer } from "./check_ty_relate"
 import { flatScalarWidth, mapKeyTySupported } from "./check_ty_rep"
-import { flatFieldTyOf } from "./check_type_shape"
+import { flatFieldTyOf, recNeverFits } from "./check_type_shape"
 import {
   T,
   TY_BOOL,
@@ -133,6 +140,7 @@ import {
   TyArray,
   TyFunc,
   TyMap,
+  TyObj,
   TyUnion,
   cUserTypes,
   cUserTypesVer,
@@ -150,6 +158,7 @@ import {
 import { identDeclOf, sidNoteNodeName } from "./symbols"
 import {
   arrElemValueTy,
+  flattenVariantsInto,
   isVoidTy,
   litPeekBaseTy,
   luAnyTyVar,
@@ -832,6 +841,91 @@ function luIsTest(recv: i32, ms: i32[], k: i32, site: i32, pos: i32): i32 {
   const test = luAt(mkIsExpr(luRef(recv, site, pos), nm, pos), site)
   if root >= 0 { setAnnTs(test, root) }
   luIsTyPut(test, ms[k])
+  test
+}
+
+// The minted check for `x is chk` over union `objTy` where one record member `arm` may hold a
+// value fitting `chk` by its fields' literal values and no other member ever does:
+// `{ const $rf = x; if $rf is arm { const $ra: arm = $rf; $ra is chk } else { false } }`, the
+// arm's tag and then its fields (D4089). -1 for any other test.
+export function recPartFitBuild(
+  isObj: i32,
+  ix: i32,
+  objTy: i32,
+  chkTy: i32,
+  pos: i32,
+): i32 {
+  const arm = recPartFitArm(objTy, chkTy)
+  if arm < 0 || luTs(arm) < 0 || luTs(chkTy) < 0 || luTs(objTy) < 0 {
+    return -1
+  }
+  const site = ix
+  const recv = luDecl("const", "$rf" + i32ToStr(ix), objTy, isObj, site, pos)
+  const isArm = luTyTest(luRef(recv, site, pos), arm, site, pos)
+  const own = luDecl(
+    "const",
+    "$ra" + i32ToStr(ix),
+    arm,
+    luRef(recv, site, pos),
+    site,
+    pos,
+  )
+  const isChk = luTyTest(luRef(own, site, pos), chkTy, site, pos)
+  const thenStmts: i32[] = []
+  thenStmts.push(own)
+  thenStmts.push(isChk)
+  const elseStmts: i32[] = []
+  elseStmts.push(luAt(mkBool(0, pos), site))
+  const pick = luAt(
+    mkIf(
+      isArm,
+      luAt(mkBlock(thenStmts, pos), site),
+      luAt(mkBlock(elseStmts, pos), site),
+      pos,
+    ),
+    site,
+  )
+  valueIfAdd(pick)
+  const stmts: i32[] = []
+  stmts.push(recv)
+  stmts.push(pick)
+  luValueNode(site, stmts, pos)
+}
+
+// The one record member of union `objTy` record `chk` partly fits, by literal-set fields
+// (`recFitNarrowedFields`), where every other member is a record that never fits; else -1.
+export function recPartFitArm(objTy: i32, chkTy: i32): i32 {
+  if objTy < 0 || chkTy < 0 || tyHasTyVar(objTy) || tyHasTyVar(chkTy) {
+    return -1
+  }
+  const ct = tyAt(chkTy)
+  if !(ct is TyObj) || !(tyAt(objTy) is TyUnion) { return -1 }
+  const ms: i32[] = []
+  flattenVariantsInto(objTy, ms)
+  let arm = -1
+  for m in ms {
+    const f = tyTestMemberFit(m, chkTy)
+    const mo = tyAt(m)
+    if !(mo is TyObj) { return -1 }
+    if f == TT_PARTLY {
+      if arm >= 0 { return -1 }
+      arm = m
+    } else if f != TT_NONE || !recNeverFits(m, ct) {
+      return -1
+    }
+  }
+  const names: string[] = []
+  const sets: i32[] = []
+  if arm < 0 || recFitNarrowedFields(arm, chkTy, names, sets) != 1 { return -1 }
+  arm
+}
+
+// `v is t`, minted at `site`, banked at `t`.
+function luTyTest(v: i32, t: i32, site: i32, pos: i32): i32 {
+  const root = luTs(t)
+  const test = luAt(mkIsExpr(v, tsToName(root), pos), site)
+  setAnnTs(test, root)
+  luIsTyPut(test, t)
   test
 }
 

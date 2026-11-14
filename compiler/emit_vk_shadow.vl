@@ -1,0 +1,88 @@
+// The `VKind` shadow: what each kind table holds beside what the rep tree's descriptor
+// (`repOfTy`) answers for the same type, one `repAB` bucket per (table, legacy, tree) answer.
+// Armed with the rep shadow (`$VL_REP_SHADOW`); unarmed, every entry point is one boolean test.
+// It reads tables and types and writes only its own buckets, so it moves no emitted byte.
+
+import { FuncDecl, LetDecl, LoopVar, Param, nodeAt } from "./ast"
+import { T } from "./check_types"
+import { tyHasTyVar, tyStepElem } from "./tyquery"
+import { nodeTyAt } from "./emit_capture_frames"
+import { globalCellKind } from "./emit_classify"
+import { repABNote, vtKindOfParam } from "./emit_nullable_rets"
+import { repOfTy, repShadowOn } from "./emit_rep"
+import {
+  VKind,
+  fRecRetTy,
+  fRetKind,
+  fnStmts,
+  globalStmts,
+  localDeclIx,
+  localIsRef,
+  localLoopIter,
+} from "./emit_state"
+
+// Notes one table entry: `legacy` is the kind the table holds for a value of type `ty`; a
+// disagreement names `who` (a function, or "") so a reader can find the site.
+function vkShadowNote(table: string, legacy: VKind, ty: i32, who: string) {
+  if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) {
+    return repABNote("vkind", table, "noTy")
+  }
+  const d = repOfTy(ty)
+  if d.rdCovered == 0 { return repABNote("vkind", table, "uncovered") }
+  if d.rdKind == legacy { return repABNote("vkind", table, "agree") }
+  const at = if who == "" { "" } else { " in " + who }
+  repABNote("vkind", table, legacy + " tree=" + d.rdKind + at)
+}
+
+// The locals of the frame `buildLocals` just built for the function at `fnIx`, by declaration.
+export function vkShadowLocals(fnIx: i32) {
+  if !repShadowOn { return 0 }
+  let i = 0
+  for dx in localDeclIx {
+    if dx >= 0 && i < localIsRef.length {
+      const d = nodeAt(dx)
+      if d is LoopVar {
+        // A loop variable's type is its list's element; another iterable stays `noTy`.
+        const it = if i < localLoopIter.length { localLoopIter[i] } else { -1 }
+        const ety = if it >= 0 { tyStepElem(nodeTyAt(it, fnIx)) } else { -1 }
+        vkShadowNote("local/loopVar", localIsRef[i], ety, "")
+      } else {
+        const table = if d is LetDecl { "local/let" } else { "local/other" }
+        vkShadowNote(table, localIsRef[i], nodeTyAt(dx, fnIx), "")
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The whole-program tables, once the module is final: results, parameters and globals.
+export function vkShadowSweep() {
+  if !repShadowOn { return 0 }
+  let fe = 0
+  for fx in fnStmts {
+    if fx >= 0 {
+      const f = nodeAt(fx)
+      if f is FuncDecl {
+        if fe < fRetKind.length && fe < fRecRetTy.length && fRecRetTy[fe] >= 0 {
+          vkShadowNote("result", fRetKind[fe], fRecRetTy[fe], f.fnName)
+        }
+        for pix in f.fnParams {
+          if nodeAt(pix) is Param {
+            vkShadowNote(
+              "param",
+              vtKindOfParam(pix),
+              nodeTyAt(pix, fx),
+              f.fnName,
+            )
+          }
+        }
+      }
+    }
+    fe = fe + 1
+  }
+  for gx in globalStmts {
+    vkShadowNote("global", globalCellKind(gx), nodeTyAt(gx, -1), "")
+  }
+  0
+}
