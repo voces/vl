@@ -6,16 +6,18 @@
 #   branching — --branching, report-only (--experimental)
 #   multiobs  — --branching --multiobs, report-only
 #   declared  — --branching --multiobs --declared, report-only
+#   oracle    — scripts/oracle/fuzz.sh: arithmetic and rep programs run compiled and in the
+#               independent oracle; GATES on a disagreement scripts/oracle/known.txt does not list
 # Legs run sequentially (each already saturates the cores); per-leg out-dirs land under ONE
 # sweep dir with the same layout the workflow artifacted (seed_*.tsv / keep_* / summary.md).
 # Each unsound finding then gets a ready-to-file row draft, `keep_<seed>/case_N.row.md`
 # (scripts/fuzz-draft-rows.sh: minimised, de-duplicated, with a family guess); `--no-drafts` skips it.
 #
 # USAGE: scripts/fuzz-sweep.sh [--seeds N] [--count M] [--depths "4 5 6"] [--jobs J]
-#                              [--out-dir DIR] [--legs "plain branching multiobs declared"] [--no-drafts]
+#                              [--out-dir DIR] [--legs "plain branching multiobs declared oracle"] [--no-drafts]
 #                              [--filed FILE] [--gate-all]
 #   --filed FILE  unsound findings an open inventory row already files (fuzz-nightly.sh --filed)
-#   --gate-all    every leg gates on a new unsound finding, not only `plain`
+#   --gate-all    the three report legs gate on a new unsound finding too, beside `plain` and `oracle`
 # Requires a fresh seed: bash scripts/refresh-compiler.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -25,7 +27,7 @@ COUNT=200
 DEPTHS="4 5 6"
 JOBS=""
 OUT=""
-LEGS="plain branching multiobs declared"
+LEGS="plain branching multiobs declared oracle"
 DRAFTS=1
 FILED=""
 GATE_ALL=0
@@ -73,6 +75,12 @@ for leg in $LEGS; do
     branching) run_leg branching --branching $REPORT ;;
     multiobs) run_leg multiobs --branching --multiobs $REPORT ;;
     declared) run_leg declared --branching --multiobs --declared $REPORT ;;
+    oracle)
+      echo; echo "==== leg: oracle ===="
+      mkdir -p "$OUT/oracle"
+      if ! ./scripts/oracle/fuzz.sh --seeds "$SEEDS" --count "$COUNT" --keep "$OUT/oracle" | tee "$OUT/oracle/summary.md"; then
+        fail=1
+      fi ;;
     *) echo "unknown leg: $leg"; exit 2 ;;
   esac
 done

@@ -595,6 +595,7 @@ testOpt("-O3: an explain variable bypasses the chain, stores nothing", async () 
 // never stores, and the rep-shadow, check-stats and keep-modules paths, which are bypasses).
 // A new export or command joins this table only by someone deciding which it is.
 const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
+  asgNegCount: "uncached",
   checkEntryPathCommit: "input", checkEntryPathPush: "input", cliArgCommit: "input",
   cliArgPush: "input", cliArgReset: "input", cliCheckNextRoot: "input",
   cliCheckParentOf: "input", cliCheckPoolStage: "input", cliCheckPooledCommit: "input",
