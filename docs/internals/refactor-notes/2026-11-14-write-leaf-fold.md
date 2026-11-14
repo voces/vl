@@ -34,7 +34,9 @@ read value. Once the producer was asked for every member, that made two map fixt
 
 - Fixpoint seeds on both sides, `--before` master `f302cddec`, which this merges.
 - Every `@run` fixture under `tests/cases/closures`, `tests/cases/maps` and `tests/cases/*/*fn*`
-  (2,782 programs) gives the same first lines as the step before. `scripts/gate.sh` passes.
+  (2,782 programs) gives the same first lines as the step before. `scripts/gate.sh` passes on the
+  merged tree except `vl_seed_sidecar_dir_test.ts`, which tests #8047's host change against a
+  shared `vl` binary built before it; this PR touches no host code.
 - 26 grids, with 0 runs→not-runs and 0 silent on each, and the same counts as master:
   - the 16 G3 / write-result / family grids of #8030 and #8039;
   - `fn-map-written-two-results` (15) and its `-generic` (16);
