@@ -245,13 +245,25 @@ function mid<F>(a: F, b: F, n: i32) {
 mid(same, same, 1)
 `;
 
+// A refusal raised while the global section writes a cell (D15158): no body is lowered there, so
+// the anchor is the cell's declaration, `const p` on line 2 (D14082's witness, `P` reaching the
+// cell with no interned shape).
+const GLOBAL_CELL_WITNESS = `type P = {a: i32}
+const p: P = {a: 1}
+function len<T>(f: () => T | string) {
+  7
+}
+print(len(() => p))
+`;
+
 Deno.test({
   name:
-    "vl-emit-diag-position: a refusal raised before any body is lowered names the call",
+    "vl-emit-diag-position: a refusal raised before any body is lowered names its call or declaration",
   ignore: !ENABLED,
   fn: async () => {
     const cases: { name: string; src: string; line: number }[] = [
       { name: "monomorphize", src: MONO_WITNESS, line: 9 },
+      { name: "global cell", src: GLOBAL_CELL_WITNESS, line: 2 },
     ];
     for (const c of cases) {
       const dir = await Deno.makeTempDir({ prefix: "vl_emit_early_" });
