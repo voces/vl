@@ -1,5 +1,5 @@
 import { PrimName, nomNameOfTy } from "./check_types"
-import { unionArmKindRowsOfExpr } from "./emit_classify"
+import { exprPackedRow, unionArmKindRowsOfExpr } from "./emit_classify"
 import { rlElemNonNulTyAt } from "./emit_map_value_slots"
 
 // `emit_collect.vl` — the emitter's collection passes: the pre-lowering walks that fill
@@ -248,6 +248,7 @@ import {
   LBK_I32_LIST,
   LBK_REF,
   LBK_STR_LIST,
+  LBK_U8_LIST,
   MVK_CLOSURE,
   MVK_REF,
   MVK_STRUCT,
@@ -296,9 +297,6 @@ import {
   arrLitMintOff,
   arrLitMintOn,
   arrLitRlSlot,
-  ba8TypeIdx,
-  bl8Ty,
-  bl8TypeIdx,
   cloCellIdx,
   cloCellUsed,
   cloLiftCapN,
@@ -430,6 +428,8 @@ import {
   nestedNameBySid,
   nliLetIxs,
   nliNames,
+  pkBackIdx,
+  pkWrapIdx,
   rlArmRowMintOn,
   rlBackIdx,
   rlElemHeap,
@@ -539,6 +539,7 @@ import {
   emitFailAt,
   packedFieldSet,
   packedFieldsReset,
+  pkWrapAt,
 } from "./emit_bytes"
 import { fnTagTyIsTagged } from "./check_fn_tag_facts"
 import {
@@ -564,6 +565,7 @@ import {
   rlElemKindAt,
   sTyIxOfName,
   structCanonIxReset,
+  tyPackedRow,
   valueBoxOfTy,
 } from "./emit_rep"
 import { repSigRetTokOfTy, repSlotOfKind } from "./emit_rep_slot"
@@ -585,6 +587,7 @@ import {
   structTyIxAlias,
   structTyIxReset,
   structTyMarkAliasable,
+  variantFieldPackedRow,
 } from "./emit_atom_kinds"
 import { nodeTyAt } from "./emit_capture_frames"
 import {
@@ -653,6 +656,7 @@ import {
   eqKindIsRecord,
   eqRowFieldCount,
   eqRowFieldKind,
+  eqRowFieldPackedRow,
   eqRowTgtStructIdx,
   eqScalarListKind,
   eqVariantListKind,
@@ -791,6 +795,7 @@ import {
   ArrNewKind,
   arrNewFillTyIx,
   rlDeclTwinTy,
+  rlElemTyIxAt,
   rlSlotOfTy,
   setSFieldElemRowTy,
   setUFieldElemRowTy,
@@ -2067,7 +2072,12 @@ function buildFnMapRowOfRetAnn(li: i32, ann: i32) {
   let sidx = -1
   if rsk == "struct" || rsk == "nulstruct" {
     sidx = retStructRowIndex(ann)
-  } else if rsk == "variant" || rsk == "nulvariant" {
+  } else if (
+    rsk == "variant"
+    || rsk == "nulvariant"
+    || rsk == "u8list"
+    || rsk == "nulu8list"
+  ) {
     sidx = repSlotOfKind(rsk, ty)
   }
   const lr = if rsk == "reflist" { repSlotOfKind(rsk, ty) } else { -1 }
@@ -2590,6 +2600,8 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
       fiLs = refListSlotOfExpr(s.fiIter, fnIx)
     }
   }
+  // A packed walk's temp is typed at the iterable's row.
+  if fiLk == "u8list" { fiLs = exprPackedRow(s.fiIter, fnIx) }
   addLocalSlot(fiLk, fiLs)
   // The SECOND binding, minted LAST so a one-name loop keeps its three-slot shape byte for
   // byte. An index binds a dense i32 counter of body executions rather than the cursor — a
@@ -3534,6 +3546,7 @@ function leqxNoteSide(ix: i32, fnIx: i32) {
   if k < 0 { return 0 }
   let sl = 0
   if k == LBK_REF { sl = refListSlotOfExpr(ix, fnIx) }
+  if k == LBK_U8_LIST { sl = exprPackedRow(ix, fnIx) }
   leqxNoteRep(k, sl, 0)
   0
 }
@@ -3657,7 +3670,13 @@ function leqNoteVariantFields(vi: i32) {
         if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
       }
       const lk = eqVariantListKind(c)
-      if lk >= 0 { leqgNoteRep(lk, 0, 0) }
+      if lk >= 0 {
+        leqgNoteRep(
+          lk,
+          if lk == LBK_U8_LIST { variantFieldPackedRow(vi, j) } else { 0 },
+          0,
+        )
+      }
     }
     j = j + 1
   }
@@ -3687,7 +3706,13 @@ export function leqNoteStructRowFields(row: i32, seen: i32[]) {
     }
     // A scalar-backed list field (`string[]`, `f64[]`, `i64[]`, `f32[]`, `u8[]`) too (D1020).
     const eqSk = eqScalarListKind(fjc)
-    if eqSk >= 0 { leqgNoteRep(eqSk, 0, 0) }
+    if eqSk >= 0 {
+      leqgNoteRep(
+        eqSk,
+        if eqSk == LBK_U8_LIST { eqRowFieldPackedRow(row, fj) } else { 0 },
+        0,
+      )
+    }
     fj = fj + 1
   }
   0
@@ -3976,6 +4001,7 @@ export function mfScan(ix: i32, fnIx: i32) {
                 if rk == "reflist" {
                   slot = refListSlotOfExpr(callee.memObj, fnIx)
                 }
+                if rk == "u8list" { slot = exprPackedRow(callee.memObj, fnIx) }
                 mfRecordSrc(rk, slot)
                 const resK = mfResultKindOf(ix, fnIx)
                 if resK != null { mfRecordDst(resK, mfResultSlotOf(ix, fnIx)) }
@@ -3994,6 +4020,7 @@ export function mfScan(ix: i32, fnIx: i32) {
                 if rk == "reflist" {
                   slot = refListSlotOfExpr(callee.memObj, fnIx)
                 }
+                if rk == "u8list" { slot = exprPackedRow(callee.memObj, fnIx) }
                 mfRecordSrc(rk, slot)
                 mfRecordDst(rk, slot)
               }
@@ -4175,8 +4202,8 @@ function mResetTypeIntern() {
   lTypeIdx = -1
   mkArrIdx = -1
   mkListIdx = -1
-  ba8TypeIdx = -1
-  bl8TypeIdx = -1
+  pkBackIdx = [-1, -1, -1, -1]
+  pkWrapIdx = [-1, -1, -1, -1]
   mStructIdx = -1
   mStructI32Idx = -1
   mStructI64Idx = -1
@@ -4316,11 +4343,17 @@ export function mAssignTypeIndices(_n: i32) {
 // A nested scalar-list element's heap: the inner list's wrapper, minted on this ask.
 function rlInnerListHeap(rs: i32) {
   const k = rlElemKindAt(rs)
-  if k == RLK_STR_LIST { rlElemHeap[rs] = mkListTy() }
-  else if k == RLK_F64_LIST { rlElemHeap[rs] = fl64Ty() }
-  else if k == RLK_F32_LIST { rlElemHeap[rs] = fl32Ty() }
-  else if k == RLK_I64_LIST { rlElemHeap[rs] = il64Ty() }
-  else if k == RLK_U8_LIST { rlElemHeap[rs] = bl8Ty() }
+  if k == RLK_STR_LIST {
+    rlElemHeap[rs] = mkListTy()
+  } else if k == RLK_F64_LIST {
+    rlElemHeap[rs] = fl64Ty()
+  } else if k == RLK_F32_LIST {
+    rlElemHeap[rs] = fl32Ty()
+  } else if k == RLK_I64_LIST {
+    rlElemHeap[rs] = il64Ty()
+  } else if k == RLK_U8_LIST {
+    rlElemHeap[rs] = pkWrapAt(tyPackedRow(rlElemTyIxAt(rs)))
+  }
 }
 
 // The rows below `n` that the pair assignment did not cover: each takes its twin and pair, and
@@ -5506,7 +5539,7 @@ function annArrayRungsSkip(i: i32): boolean {
 }
 
 // Whether annotation `i` is an array `checkArrTy` must not validate: an `f64`, `i64`, `f32` or
-// `u8` list, whose pair mints on first read, or an array over a type parameter, which its
+// packed list, whose pair mints on first read, or an array over a type parameter, which its
 // instances re-collect at pinned names.
 function annScalarOrOpenArray(i: i32): boolean {
   const er = nodeTyArrayElemRepName(i)
@@ -5514,6 +5547,9 @@ function annScalarOrOpenArray(i: i32): boolean {
     || er == "i64"
     || er == "f32"
     || er == "u8"
+    || er == "i8"
+    || er == "u16"
+    || er == "i16"
     || annArrOverTyParam(i)
 }
 
