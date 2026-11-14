@@ -24,6 +24,7 @@ import {
   envOr,
   exists,
   fanOutArgv,
+  findFrom,
   lstripWs,
   splitLines,
   univNl,
@@ -824,11 +825,70 @@ function listFirst(title: string, keys: string[]) {
   }
 }
 
-function diff(args: string[]): i32 {
+// The owed refusals a PR lists, `<cell key> <D-id>` per line (scripts/sweep.md, "Owed
+// refusals"): a clause-1 row's witness that ran wrong and is now refused at check, by design.
+const OWED = "scripts/sweep-owed.txt"
+
+// The status line of inventory row `id` (its first `**` line), or "" when no row file exists.
+function rowStatus(id: string): string {
+  for dir in ["docs/internals/inventory", "docs/internals/inventory-2"] {
+    const p = "\{dir}/\{id}.md"
+    if exists(p) {
+      for l in splitLines(univNl(readText(p))) {
+        if startsWith(l, "**") { return l }
+      }
+    }
+  }
+  ""
+}
+
+function diff(argsIn: string[]): i32 {
+  let owedPath = OWED
+  const args: string[] = []
+  let ai = 0
+  while ai < argsIn.length {
+    if argsIn[ai] == "--owed" && ai + 1 < argsIn.length {
+      owedPath = argsIn[ai + 1]
+      ai = ai + 2
+    } else {
+      args.push(argsIn[ai])
+      ai = ai + 1
+    }
+  }
   if args.length != 2 {
     print(USAGE)
     return 2
   }
+  // Each listed key with its row, refused when the row is missing or not clause 1.
+  const owedKey: string[] = []
+  const owedRow: string[] = []
+  const owedBad: string[] = []
+  if exists(owedPath) {
+    for l in splitLines(univNl(readText(owedPath))) {
+      const t = lstripWs(l)
+      if t == "" || startsWith(t, "#") { continue }
+      const parts: string[] = []
+      for w in split(t, " ") {
+        if w != "" { parts.push(w) }
+      }
+      if parts.length != 2 {
+        owedBad.push("    \{t}  (want `<cell key> <D-id>`)")
+        continue
+      }
+      const st = rowStatus(parts[1])
+      if st == "" {
+        owedBad.push("    \{parts[0]}  (\{parts[1]} has no inventory row)")
+      } else if findFrom(st, "clause 1", 0) < 0 {
+        owedBad.push(
+          "    \{parts[0]}  (\{parts[1]}'s status line does not say clause 1)",
+        )
+      } else {
+        owedKey.push(parts[0])
+        owedRow.push(parts[1])
+      }
+    }
+  }
+  const owedUsed: string[] = []
   const a = loadCells(args[0])
   const b = loadCells(args[1])
   let same = 0
@@ -850,7 +910,20 @@ function diff(args: string[]): i32 {
     const ch = changes(x, y)
     const xo = strField(x, "outcome")
     const yo = strField(y, "outcome")
-    if xo == "runs" && yo != "runs" { lost.push("    \{c}  \{ch}") }
+    if xo == "runs" && yo != "runs" {
+      // A listed clause-1 witness may stop running only into a check refusal.
+      let oi = -1
+      let ok = 0
+      while ok < owedKey.length {
+        if owedKey[ok] == c { oi = ok }
+        ok = ok + 1
+      }
+      if oi >= 0 && yo == "check_reject" {
+        owedUsed.push("    \{c}  (\{owedRow[oi]})  \{ch}")
+      } else {
+        lost.push("    \{c}  \{ch}")
+      }
+    }
     if isTrap(y) && !isTrap(x) { traps.push("    \{c}  \{ch}") }
     if ch != "" {
       movers.push("    \{c}  \{ch}")
@@ -875,6 +948,7 @@ function diff(args: string[]): i32 {
   }
   count("output movers", movers.length)
   count("runs -> not-runs  (blocking)", lost.length)
+  count("owed refusals accepted", owedUsed.length)
   count("new compiler traps  (blocking)", traps.length)
   count("only in base", onlyA.length)
   count("only in candidate", onlyB.length)
@@ -886,6 +960,26 @@ function diff(args: string[]): i32 {
     print("\nnew compiler traps:")
     for l in traps { print(l) }
   }
+  if owedUsed.length > 0 {
+    print("\nowed refusals accepted (\{OWED}):")
+    for l in owedUsed { print(l) }
+  }
+  // A listed key that did not move into a check refusal is stale: the list may not rot.
+  for k in owedKey {
+    let used = false
+    for u in owedUsed {
+      if startsWith(u, "    " + k + "  ") { used = true }
+    }
+    if !used {
+      owedBad.push(
+        "    \{k}  (listed, but it did not move from runs to check_reject)",
+      )
+    }
+  }
+  if owedBad.length > 0 {
+    print("\nowed-refusal entries refused:")
+    for l in owedBad { print(l) }
+  }
   if movers.length > 0 {
     print("\noutput movers:")
     for l in movers { print(l) }
@@ -893,9 +987,9 @@ function diff(args: string[]): i32 {
   listFirst("bytes-only movers", bytes)
   listFirst("only in base", onlyA)
   listFirst("only in candidate", onlyB)
-  if lost.length > 0 || traps.length > 0 {
+  if lost.length > 0 || traps.length > 0 || owedBad.length > 0 {
     print(
-      "\nsweep: REGRESSION — \{toString(lost.length)} program(s) stopped running, \{toString(traps.length)} new compiler trap(s)",
+      "\nsweep: REGRESSION — \{toString(lost.length)} program(s) stopped running, \{toString(traps.length)} new compiler trap(s), \{toString(owedBad.length)} owed-refusal entr(ies) refused",
     )
     return 1
   }
@@ -903,7 +997,7 @@ function diff(args: string[]): i32 {
   0
 }
 
-const USAGE = "usage: vl run scripts/sweep.vl -- record --compiler <seed> --out <file.jsonl> [--shard K/N]\n           [--population all|cases|distilled|inventory] [--std <dir>] [--vl <bin>]\n       vl run scripts/sweep.vl -- merge --out <file.jsonl> [--population P] <shard.jsonl>...\n       vl run scripts/sweep.vl -- diff <base.jsonl> <cand.jsonl>\n       vl run scripts/sweep.vl -- list [--population P] [--shard K/N]\nRun from the checkout root (scripts/sweep.md)."
+const USAGE = "usage: vl run scripts/sweep.vl -- record --compiler <seed> --out <file.jsonl> [--shard K/N]\n           [--population all|cases|distilled|inventory] [--std <dir>] [--vl <bin>]\n       vl run scripts/sweep.vl -- merge --out <file.jsonl> [--population P] <shard.jsonl>...\n       vl run scripts/sweep.vl -- diff <base.jsonl> <cand.jsonl> [--owed <file>]\n       vl run scripts/sweep.vl -- list [--population P] [--shard K/N]\nRun from the checkout root (scripts/sweep.md)."
 
 function main(args: string[]): i32 {
   if args.length == 2 && args[0] == "--grade-chunk" {
