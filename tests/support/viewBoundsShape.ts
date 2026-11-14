@@ -253,8 +253,8 @@ const buildShape = async (fixture: string, flag: string | null): Promise<Counts>
     if (flag) args.push(flag);
     const b = await new Deno.Command(VL, {
       args,
-      // Without this `-O3` finds no wasm-opt, prints a note and writes the
-      // UNOPTIMIZED module with exit 0 — three identical rungs, silently.
+      // The suite's own binaryen, so `-O3` never resolves a different `wasm-opt`
+      // (or none, which fails the build) from PATH.
       env: nativeEnv({ VL_WASM_OPT: WASM_OPT }),
       stdout: "piped",
       stderr: "piped",
