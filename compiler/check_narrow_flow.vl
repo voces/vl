@@ -122,6 +122,7 @@ import {
   crOpCall,
   crPendCalls,
   crPendDepths,
+  crPendFrames,
   crPendNames,
   crPendNarTys,
   crProgRoot,
@@ -3027,6 +3028,7 @@ export function crStmtLeave() {
     crPendCalls.pop()
     crPendNarTys.pop()
     crPendDepths.pop()
+    crPendFrames.pop()
   }
   const rb = crStmtRd[top]
   while crRdRet.length > rb {
@@ -4135,8 +4137,22 @@ export function crNoteRhsRetired(
   0
 }
 
-// Drop the facts collected since `mark` that a call inside the condition may falsify:
-// the test ran before the call. Banked at the condition for the emitter's matching decline.
+// Whether slot `s` holds a narrowing on a scope frame opened after a call that ran with `frames`
+// frames open: the call's retire re-typed every row it could see, so that row is newer.
+function narNewerThan(s: i32, frames: i32): boolean {
+  const ds = narChainDepths(s)
+  ds.length > 0 && ds[0] >= frames
+}
+
+// Whether node `ix` is the binary operator `op`.
+function isShortCircuitOp(ix: i32, op: string): boolean {
+  const n = nodeAt(ix)
+  n is BinExpr && n.binOp == op
+}
+
+// Drop the facts collected since `mark` that a call inside `condIx` may falsify: their tests ran
+// before it. A short circuit filters its left side's facts against its right side only, since
+// a fact its right side makes holds after every call its left side ran (D3251).
 function crFilterCond(condIx: i32, places: i32[], tys: i32[], mark: i32) {
   if places.length <= mark { return 0 }
   let w = mark
@@ -4178,6 +4194,8 @@ export function crReadHook(name: string, ix: i32): i32 {
   let p = crPendNames.length - 1
   while p >= 0 {
     if crPendNames[p] == name {
+      // A re-test after the call narrowed the binding again, on a frame the call did not see.
+      if narNewerThan(identSlotOf(ix, name), crPendFrames[p]) { return -1 }
       let tail = " earlier in this statement may reassign it — read '"
         + name
         + "' in a statement after the call, and re-test it there"
@@ -4640,7 +4658,7 @@ function scWrFacts(condIx: i32, places: i32[], tys: i32[]) {
 export function collectThenNarrows(condIx: i32, places: i32[], tys: i32[]) {
   const mark = places.length
   collectThenNarrowsRaw(condIx, places, tys)
-  crFilterCond(condIx, places, tys, mark)
+  if !isShortCircuitOp(condIx, "&&") { crFilterCond(condIx, places, tys, mark) }
 }
 
 function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
@@ -4720,6 +4738,7 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
       if cond.binOp == "&&" {
         const lmark = places.length
         collectThenNarrows(cond.binLeft, places, tys)
+        crFilterCond(cond.binRight, places, tys, lmark)
         crFilterRhsRetired(condIx, places, tys, lmark)
         scWrFacts(condIx, places, tys)
         collectThenNarrows(cond.binRight, places, tys)
@@ -4915,7 +4934,7 @@ function elseRemainderTy(cur: i32, tIdx: i32): i32 {
 export function collectElseNarrows(condIx: i32, places: i32[], tys: i32[]) {
   const mark = places.length
   collectElseNarrowsRaw(condIx, places, tys)
-  crFilterCond(condIx, places, tys, mark)
+  if !isShortCircuitOp(condIx, "||") { crFilterCond(condIx, places, tys, mark) }
 }
 
 function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
@@ -4976,6 +4995,7 @@ function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
       if cond.binOp == "||" {
         const lmark = places.length
         collectElseNarrows(cond.binLeft, places, tys)
+        crFilterCond(cond.binRight, places, tys, lmark)
         crFilterRhsRetired(condIx, places, tys, lmark)
         scWrFacts(condIx, places, tys)
         collectElseNarrows(cond.binRight, places, tys)
