@@ -5,7 +5,7 @@
   needs: `elabValueCalls` follows an argument into the callee's calls of the parameter by name
   (`elabParamNameCalls`), and `elabLamHoleTysClose`, called from `elabEnqueue`, closes a
   hole-result lambda's type at its returned generic's delivery. New: it notes each lambda it
-  closes (`mintLamClosedNote`).
+  closes (`mintLamClosedNote`), keyed by the lambda and the instance key that closed it.
 - `check_mint.vl`: `mintLamClosedNote` / `mintLamClosed`, reset by each `elabRun`, since the
   notes are made during the elaboration, before `mintReset`.
 - `check_fn_tag.vl`: `ftPlan`, after the elaboration, declines a set with such a member. A set the
@@ -23,7 +23,7 @@ lambda runs no extra round; `tests/vl_scaling_shape_test.ts` passes.
 fixpoint against this branch's fixpoint: 0 runs → not-runs, 0 silent; `hole_param_inline` and
 `hole_param_two_calls_one_type` move from an emit reject to runs.
 
-**Size.** +249 net compiler lines (3 files), almost all of it D16077's elaboration; pin-helper
+**Size.** +266 net compiler lines (3 files), almost all of it D16077's elaboration; pin-helper
 delta 0.
 
 **Left.** D16079, D16130, D16131.
