@@ -409,7 +409,7 @@ import {
   recordListWidenRetag,
   unionElemMemberWidens,
 } from "./check_retag_rows"
-import { identBoundFnDeclOf } from "./check_scopes"
+import { identBoundFnDeclOf, identFnDeclOf } from "./check_scopes"
 import { placeDecl } from "./check_place_ids"
 import {
   mapDeliveryRecordedSet,
@@ -596,6 +596,7 @@ import {
   cwPeelValue,
   cwSlotPath,
   cwSlotWrittenValues,
+  cwSoleReadInit,
 } from "./check_write_scan"
 import {
   Cex,
@@ -3937,10 +3938,11 @@ export function recAsgFnWidenedTy(p: i32): i32 {
   if p < 0 || p >= P.nodes.length || !(nodeAt(p) is ObjLit) { return -1 }
   // The place, a binding or a field or element slot of one, and the binding it is rooted at;
   // `steps` is the slot's path from the place inward.
-  let x = recAsgPlaceOf(p)
+  const at = recSoleReadOfInit(p, 0)
+  let x = recAsgPlaceOf(at)
   // A literal pushed onto a list is a write of one of its elements (D15336).
   const pushed = x < 0
-  if pushed { x = recLitPushReceiverOf(p) }
+  if pushed { x = recLitPushReceiverOf(at) }
   const steps: string[] = []
   let hops = 0
   while x >= 0 && x < P.nodes.length && hops < 16 {
@@ -3986,6 +3988,33 @@ export function recAsgFnWidenedTy(p: i32): i32 {
   // function fields alone, each element field a closed type or another set.
   if !widened && !recFnFieldsWiden(nodeTyIxOf(p), t) { return -1 }
   if t >= 0 && t < T.tys.length && tyAt(t) is TyObj { t } else { -1 }
+}
+
+// The read a value `p` reaches when `p` is a tail of the initialiser of a binding read only
+// there (`cwSoleReadInit`), through bindings of bindings; else `p`. That read is where `p` is
+// written.
+function recSoleReadOfInit(p: i32, depth: i32): i32 {
+  cwIxBuild()
+  let x = p
+  let hops = 0
+  while x >= 0 && cwIxCovers(x) && cwIxUpKind[x] == CW_UP_ARM && hops < 16 {
+    x = cwIxUp[x]
+    hops = hops + 1
+  }
+  if depth > 8 || x < 0 || !cwIxCovers(x) || cwIxUpKind[x] != CW_UP_LETINIT {
+    return p
+  }
+  const d = cwIxUp[x]
+  const w = cwOccWalk(d)
+  let u = -1
+  while cwOccNext(w) {
+    if cwIxKind[w.row] == CW_OCC_USE { u = cwIxNode[w.row] }
+  }
+  if u < 0 || cwSoleReadInit(u) != x { return p }
+  const leaves: i32[] = []
+  tailValueLeaves(x, leaves)
+  if !i32ListHas(leaves, p) { return p }
+  recSoleReadOfInit(u, depth + 1)
 }
 
 // Whether record `w` is record `own` with at least one function field holding a set that `w`'s
@@ -4937,8 +4966,8 @@ function recBuiltReadErr(
 }
 
 // Refuses each read of the list binding `md`, built at another record, that is the receiver of a
-// `map` or `filter`: the callback takes the list's own element type, which stores a field
-// differently from the build (D15697).
+// `map` or `filter` whose callback the elaboration cannot instance at the build: a closure value,
+// or a parameter annotated at another type (D15697, D16134).
 export function recBuiltCallbackRefuse(md: i32) {
   const bt = recBuildPassAt(md)
   if bt < 0 || bt >= T.tys.length { return 0 }
@@ -4958,11 +4987,31 @@ export function recBuiltCallbackRefuse(md: i32) {
       && ot is TyArray
       && ot.aElem >= 0
       && !fieldStorageEq(ot.aElem, bt, REC_STORE_DEPTH)
+      && !recCbTakesBuild(cwIxUp[m], mn.memProp == "map")
     ) {
       recBuiltReadErr(u, own, ot.aElem, bt, true)
     }
   }
   0
+}
+
+// Whether call `c`'s one argument is a function the elaboration instances at its receiver's
+// build: a lambda, or a function named by its declaration, of one un-annotated parameter. A
+// `map` result holding a record is not: only the parameter is keyed by the build.
+function recCbTakesBuild(c: i32, isMap: boolean): boolean {
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) || cn.callArgs.length != 1 { return false }
+  const ax = parenPeelIx(cn.callArgs[0])
+  const an = if ax >= 0 && ax < P.nodes.length { nodeAt(ax) } else { null }
+  const fd = if an is Ident { identFnDeclOf(ax) } else if an is FuncDecl { ax } else { -1 }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnParams.length != 1 || f.fnTyParams.length > 0 {
+    return false
+  }
+  if an is FuncDecl && f.fnName != "" { return false }
+  if isMap && tyHoldsObjDeep(nodeTyIxOf(c)) { return false }
+  const p = nodeAt(f.fnParams[0])
+  p is Param && p.parType < 0
 }
 
 // The element record the stores into the list or map binding `x` names build, else -1. This
@@ -9130,7 +9179,8 @@ function repStamp(ix: i32, t: i32): i32 {
   1
 }
 
-// Stamps the list literal `l` with the list type `ty` its elements are built as; 1.
+// Stamps the list literal, or the call handing back a list's own elements, `l` with the list
+// type `ty` its elements are built as; 1.
 export function repStampListBuilt(l: i32, ty: i32): i32 { repStamp(l, ty) }
 
 // Stamps the returned read `x` with the record `t` its container builds it at; 1.
