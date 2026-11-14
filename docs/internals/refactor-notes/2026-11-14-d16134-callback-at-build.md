@@ -8,8 +8,8 @@
   call with the list of the build, since the result holds the receiver's elements.
   `elabListElemBuild` is the one answer for a receiver's element build: a binding's build
   (`recBuildTable`), a stamped call, else `recArgBuiltTyIn`.
-- `emit_mono.vl`: `monoListCbLamAtRow` and the named-callback arm of `monoCoerceListCbArg` read
-  `elabCbParamRowTy`. No decision.
+- `emit_mono.vl`: the lambda and named-callback arms of `monoCoerceListCbArg` read
+  `elabCbParamRowTy` in place. No decision, and no new function: the pin-helper count stays 908.
 - `emit_classify.vl`: `mfResultSlotOf` reads the call's stamp before its type.
 - `check_fit_rules.vl`: `recBuiltCallbackRefuse` skips a callback `recCbTakesBuild` accepts.
 
@@ -25,6 +25,8 @@ to runs, 15 from the check's floor, one from an emit reject and two from check-c
 else moves. Guest fuel on `plumb-shape-cost.vl`, this branch against master `293074baf`: main
 9,394,793,146 against 9,390,001,365 and tail 6,801,876,885 against 6,798,577,568, both +0.05%.
 The check's +3.6% (tail) and +4.7% (main) are master's against a stale baseline.
+
+**Size.** +164 net compiler lines (4 files); pin-helper delta 0.
 
 **Left.** D16210 (a field receiver) and D16211 (the floor: a parameter annotated at the element
 type, a `map` result holding the record). Stage 2 is D16137.
