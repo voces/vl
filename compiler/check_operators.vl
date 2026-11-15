@@ -321,6 +321,9 @@ import {
   numLitAdoptDst,
   numLitAdoptTails,
   radixTreeF64Pair,
+  shiftKeepsLeft,
+  shiftLitAdopt,
+  shiftWidensLit,
   valueJoinAt,
   valueTailLeaves,
 } from "./check_num_adopt"
@@ -403,6 +406,7 @@ import {
   fieldStorageEq,
   mapTwinTestMsg,
   mixesNumeric,
+  recEqSide,
   widerNumeric,
   xrepListPair,
 } from "./check_ty_relate"
@@ -1379,18 +1383,6 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   return TY_BOOL
 }
 
-// The record a `==` operand of type `ty` compares as: `ty` itself, or a nullable's inner record;
-// -1 for anything else.
-function recEqSide(ty: i32): i32 {
-  if ty < 0 || ty >= T.tys.length { return -1 }
-  const inner = nonNullTy(ty)
-  if inner >= 0 && inner < T.tys.length && tyAt(inner) is TyObj {
-    inner
-  } else {
-    -1
-  }
-}
-
 // `l == r` over two records of one field set stored apart, rewritten in place to
 // `{ const $el = l; const $er = r; $el.f == $er.f && … }` under a null guard for a nullable
 // side, so each field pair reaches its own `==` and a nested pair is rewritten in turn (D16394).
@@ -1700,6 +1692,8 @@ function checkBinNumTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
   }
   // A radix tree computed at 64 bits beside an `f64` converts to it (D16390).
   if radixTreeF64Pair(n, lt, rt) { return TY_F64 }
+  // A shift is typed at its left operand; its count never types it (owner ruling Q8).
+  if shiftKeepsLeft(op, lt, rt) { return lt }
   // A mixed-numeric op widens the narrower operand to the wider one (`i32 op i64` -> i64, ...),
   // done before the same-type check so a compatible mixed pair is accepted (B2).
   if mixesNumeric(lt, rt) { return widerNumeric(lt, rt) }
@@ -1957,11 +1951,16 @@ function binRadixAdoptSides(n: BinExpr, op: string, sides: i32[]) {
     const rj = numJoinPrim(rt)
     if lj >= 0 && rj >= 0 {
       if rLit && lj != TY_I32 { numLitAdoptTails(n.binRight, lj) }
-      if lLit && rj != TY_I32 { numLitAdoptTails(n.binLeft, rj) }
+      if lLit && rj != TY_I32 && !binShiftOp(op) {
+        numLitAdoptTails(n.binLeft, rj)
+      }
     }
   }
-  if radixLitAdoptPeer64(n.binLeft, rt) == 1 { lt = TY_I64 }
-  if radixLitAdoptPeer64(n.binRight, lt) == 1 { rt = TY_I64 }
+  // A shift's count is no peer of its operand, nor its operand of the count (owner ruling Q8).
+  if !binShiftOp(op) {
+    if radixLitAdoptPeer64(n.binLeft, rt) == 1 { lt = TY_I64 }
+    if radixLitAdoptPeer64(n.binRight, lt) == 1 { rt = TY_I64 }
+  }
   if lt == TY_I32 && rt == TY_I64 && op != "??" {
     const lpa = litTreeAdoptDst(n.binLeft, rt)
     if lpa >= 0 { lt = lpa }
@@ -2086,6 +2085,10 @@ function binTyOfSides(n: BinExpr, ix: i32, lt0: i32, rt0: i32, ltOut: i32[]) {
     binRadixAdoptSides(n, op, sides)
     lt = sides[0]
     rt = sides[1]
+  }
+  // An untyped literal shifted by a constant count of 32 to 63 is an `i64` (owner ruling Q8).
+  if binShiftOp(op) && lt == TY_I32 && shiftWidensLit(ix) {
+    lt = shiftLitAdopt(ix, TY_I64)
   }
   // A re-check pushes the node again; `checkShiftCounts` grades each once.
   if (
