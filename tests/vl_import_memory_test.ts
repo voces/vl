@@ -139,18 +139,18 @@ const WRITER = `import { Buffer, storeI32 } from "std:buffer"
 export function put(v: i32): i32 {
   const b = Buffer(16)
   b.storeI32(0, v)
-  b.base
+  return b.base
 }
 `;
 const READER = `import { Buf, Buffer, loadI32, storeI32 } from "std:buffer"
 export function peek(addr: i32): i32 {
   const b: Buf = { base: addr, length: 16 }
-  b.loadI32(0)
+  return b.loadI32(0)
 }
 export function own(v: i32): i32 {
   const b = Buffer(16)
   b.storeI32(0, v)
-  b.base
+  return b.base
 }
 `;
 
@@ -190,7 +190,7 @@ Deno.test({
     "import-memory: a module that touches no linear memory is byte-identical with or without the flag",
   ignore: !ENABLED,
   fn: async () => {
-    const src = `export function add(a: i32, b: i32): i32 { a + b }\n`;
+    const src = `export function add(a: i32, b: i32): i32 { return a + b }\n`;
     const a = await build(src);
     const b = await build(src, ["--import-memory"]);
     if (a.length !== b.length || a.some((x, i) => x !== b[i])) {
@@ -377,7 +377,7 @@ Deno.test({
 export function go(off: i32): i32 {
   const b = Buffer(16)
   bufferRelease(b.base + off)
-  b.base
+  return b.base
 }
 `,
         ["--import-memory", "--heap-base=0x10000", "--heap-limit=0x10100"],

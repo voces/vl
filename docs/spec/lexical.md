@@ -21,7 +21,7 @@ which attaches to the declaration that follows it (`docs/guide/doc-comments.md`)
 
 ```vl
 /// adds one
-function inc(x: i32): i32 { x + 1 }   // trailing comment
+function inc(x: i32): i32 { return x + 1 }   // trailing comment
 print(inc(1))                         // prints 2
 ```
 
@@ -98,7 +98,7 @@ follows the `-`. A `-` touching its operand starts a new statement.
 function f(): i32 {
   const a = 10
     - 2          // binary: a is 8
-  -a             // a new statement, the block's value
+  return -a             // a new statement, the block's value
 }
 print(f())       // prints -8
 ```

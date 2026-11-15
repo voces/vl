@@ -113,7 +113,7 @@ function other<V>(v: V) { print("O"); print(v) }
 function main() {
   inner(3)
   let k = other
-  const w = () => { k = inner }
+  const w = () => { return k = inner }
   w()
   k(true)
 }
@@ -188,7 +188,7 @@ nestedLambda()
 
 // A `for` loop whose value is used moves to a fresh node; its variable's uses follow it.
 const L1 = `function firstOver(xs: i32[], n: i32): i32 | null {
-  for x in xs { if x > n { break x } }
+  return for x in xs { if x > n { break x } }
 }
 print(firstOver([1, 5, 9], 4) ?? 0)
 const v = for i in 0 until 10 { if i * i > 20 { break i } } ?? -1

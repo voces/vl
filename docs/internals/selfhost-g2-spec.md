@@ -81,7 +81,7 @@ function bump(a: i32, b: i32): i32 {
   let p: Point = { x: a, y: b }
   p.x = p.x + 10      // ← struct.set field 0
   p.y = b             // ← struct.set field 1
-  p.x + p.y
+  return p.x + p.y
 }
 ```
 
@@ -234,7 +234,7 @@ VL equivalent:
 let g = 0                 // module global
 function inc(): i32 {
   g = g + 1               // global.set after global.get
-  g                       // global.get
+  return g                       // global.get
 }
 ```
 
