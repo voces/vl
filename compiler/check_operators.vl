@@ -4,6 +4,7 @@
 import { isOpenMemberOf, openMemberRows } from "./check_leaf_steps"
 import { arrDefRowServed, noteVacuousIs } from "./check_hole_links"
 import {
+  litSetSplitBuild,
   luDecl,
   luTs,
   luTyTest,
@@ -411,6 +412,7 @@ import {
   TY_STR,
   TyArray,
   TyFunc,
+  TyLit,
   TyMap,
   TyNullable,
   TyObj,
@@ -2230,7 +2232,25 @@ function checkCastUnionArm(
 // const $rh: A = $rc; $rh } else { null } }` (`__trap__()` for `as!`): the value is the `A` the
 // test narrows to. -1 for any other cast, which propagates or has no such member.
 function castPartFitAt(n: AsExpr, ix: i32, argU: i32, target: i32): i32 {
-  castFitAt(n, ix, argU, recPartFitArm(argU, target), target)
+  const arm = recPartFitArm(argU, target)
+  castFitAt(
+    n,
+    ix,
+    argU,
+    if arm >= 0 { arm } else { castLitSetArm(argU, target) },
+    target,
+  )
+}
+
+// `target` when it is a literal set a value of `arg` may hold, which the cast's test narrows
+// its operand to and so hands back as itself; else -1.
+function castLitSetArm(arg: i32, target: i32): i32 {
+  let lits = 0
+  for m in tyTestMembers(target) {
+    if tyAt(m) is TyLit { lits = lits + 1 }
+    else if m != TY_NULL { return -1 }
+  }
+  if lits > 0 && tyTestMayFit(arg, target) { target } else { -1 }
 }
 
 // A record `x` cast to record `target` it is contained in or may be by its fields' values
@@ -2367,7 +2387,10 @@ function checkCastScalar(n: AsExpr, ix: i32, arg: i32, target: i32): i32 {
       return target
     }
     if redundantCastRaise(n, arg, target, ix) { return TY_ERR }
-    const rf = castRecordFitAt(n, ix, arg, target)
+    let rf = castRecordFitAt(n, ix, arg, target)
+    if rf == -1 {
+      rf = castFitAt(n, ix, arg, castLitSetArm(arg, target), target)
+    }
     if rf != -1 { return rf }
     tErr(
       "`as` supports numeric conversions only" + emptyArrCastHint(n.asObj, target),
@@ -2674,6 +2697,7 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
   // A map tested against a narrower map is decided by its contents at runtime (D2701).
   if chkTy >= 0 && objTy >= 0 && !inferQuiet && n.isFit < 0 {
     let mfb = mapFitBuild(n.isObj, ix, objTy, chkTy, n.pos)
+    if mfb < 0 { mfb = litSetSplitBuild(n.isObj, ix, objTy, chkTy, n.pos) }
     if mfb < 0 { mfb = recPartFitBuild(n.isObj, ix, objTy, chkTy, n.pos) }
     if mfb < 0 && !isStoreWiderArm(n.isObj, objTy) {
       mfb = recFieldFitBuild(n.isObj, ix, objTy, chkTy, n.pos)
@@ -2751,7 +2775,7 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
       }
     } else if meet >= 0 {
       0
-    } else if !tyTestMayFit(baseTy, chkTy) {
+    } else if !tyTestMayFit(objTy, chkTy) {
       if deadArm && isListFitsWhenEmpty(chkTy, baseTy) {
         // An empty list fits every list type, so the instance's arm is live and is checked: what
         // it delivers the list to is answered there (ruling (c), D4981).
