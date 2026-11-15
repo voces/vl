@@ -41,3 +41,21 @@ populated, every leg exited 0 on that run's own findings (4 + 2 + 3 + 7 filed), 
 
 The list the workflow reads, and the triage that populated it, are the separate fuzz-triage
 refactor note of 2026-11-14.
+
+## Dry run on master, 2026-11-15
+
+The owner approved the nightly at `17 4 * * *`. A dry run on master `bded2f56d` (#8169's `--gen
+all` oracle included) used the workflow's own arguments: 50 seeds, count 200, depths `4 5 6`,
+`--gate-all`, `--filed scripts/fuzz-filed.txt`, `--jobs 3`. It took 1,939 s on a 4-CPU box.
+
+- **Fuzz legs.** plain, multiobs and declared: 0 unfiled unsound findings. branching: 2
+  unfiled INVALID-WASM findings, one shape at two positions, filed as D16398 with two
+  `fuzz-filed.txt` lines. With those lines the leg has 0.
+- **Oracle leg:** `oracle: 50000 cells, 46826 in subset (93.7%), AGREE 38908, COMPILED-BAD 7917,
+  DISAGREE 1, SKIP 3174; 0 new disagreement(s)`. The one DISAGREE is in `known.txt`. 7,912 of the
+  COMPILED-BAD cells are the higher-order generator's programs refused at emit (for example
+  `monomorphize: unsupported argument type`), which the oracle reports and does not gate.
+
+A red oracle leg now lists each new cell with the commands that regenerate and re-judge it
+locally, copies its case into the artifact's `oracle/keep_new/`, and writes the cells to the job
+summary. The fuzz legs already printed a `scripts/fuzz-vl.sh --seed … ` repro and a keep dir.
