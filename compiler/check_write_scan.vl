@@ -89,7 +89,7 @@ export let fnDeclIx: {[string]: i32} = Map()
 // storing the name of a function declaration or a read of another `let`, and no function nested in
 // that frame names it: each read then follows one most recent write in straight-line order, and
 // none waits for a call.
-export function cwLetWritesStraight(bd: i32): boolean {
+export function cwLetWritesStraight(bd: i32, annTy: (ix: i32) => i32): boolean {
   const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
   if !(bn is LetDecl) || !cwWritesNamedFn(bn.letInit) { return false }
   cwIxBuild()
@@ -108,7 +108,7 @@ export function cwLetWritesStraight(bd: i32): boolean {
       && cwIxCovers(u)
       && cwIxUpKind[u] == CW_UP_ARG
     ) {
-      if !cwArgToClosedFnParam(u) { return false }
+      if !cwArgToClosedFnParam(u, annTy) { return false }
     }
     if cwIxKind[r] == CW_OCC_ASG {
       const at = cwIxNode[r]
@@ -122,20 +122,45 @@ export function cwLetWritesStraight(bd: i32): boolean {
   true
 }
 
-// Whether call argument `u` is delivered to a parameter of a non-generic callee annotated with a
-// closed function type; false where the callee, the parameter or its type is not known.
-function cwArgToClosedFnParam(u: i32): boolean {
+// Whether call argument `u` is delivered to one closed function type: a non-generic callee's
+// annotated parameter, or the element a `.push` or the value a `.set` stores into an annotated
+// receiver. False where the callee, the parameter or its type is not known.
+function cwArgToClosedFnParam(u: i32, annTy: (ix: i32) => i32): boolean {
   const up = cwIxUp[u]
   const n = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
   if !(n is Call) || hasNamedArgs(n.callArgNames) { return false }
+  const t = cwArgDstTy(n, cwIxUpAux[u], annTy)
+  t >= 0 && t < T.tys.length && tyAt(t) is TyFunc && !tyHasHole(t)
+}
+
+// The written type argument `ai` of call `n` is stored at, through `annTy`'s answer for an
+// annotation node, or -1 where none is known.
+function cwArgDstTy(n: Call, ai: i32, annTy: (ix: i32) => i32): i32 {
+  const cf = nodeAt(n.callFn)
+  if cf is Member {
+    const rt = cwWrittenTyOf(cf.memObj, annTy)
+    const r = if rt >= 0 && rt < T.tys.length { tyAt(rt) } else { null }
+    if cf.memProp == "push" && ai == 0 && r is TyArray { return r.aElem }
+    if cf.memProp == "set" && ai == 1 && r is TyMap { return r.mVal }
+  }
   const cd = cwCalleeDeclOf(n.callFn)
   const cn = if cd >= 0 && cd < P.nodes.length { nodeAt(cd) } else { null }
-  if !(cn is FuncDecl) || cn.fnTyParams.length > 0 { return false }
-  const p = cwParamOfDecl(cd, cwIxUpAux[u] + cwCalleeArgOff(n.callFn))
+  if !(cn is FuncDecl) || cn.fnTyParams.length > 0 { return -1 }
+  const p = cwParamOfDecl(cd, ai + cwCalleeArgOff(n.callFn))
   const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
-  if !(pn is Param) || pn.parType < 0 { return false }
-  const t = nodeTyIxOf(pn.parType)
-  t >= 0 && t < T.tys.length && tyAt(t) is TyFunc && !tyHasHole(t)
+  if !(pn is Param) || pn.parType < 0 { return -1 }
+  annTy(pn.parType)
+}
+
+// The written annotation type of the binding the bare name `x` reads, or -1.
+function cwWrittenTyOf(x: i32, annTy: (ix: i32) => i32): i32 {
+  const p = cwPeel(x)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return -1 }
+  const d = identDeclOf(p)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if dn is LetDecl && dn.letType >= 0 { return annTy(dn.letType) }
+  if dn is Param && dn.parType >= 0 { return annTy(dn.parType) }
+  -1
 }
 
 // Whether `v` is the name of a function declaration or a read of a `let`, which a narrowed read
