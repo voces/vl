@@ -2505,7 +2505,7 @@ export function dispatchRewrite(stmts: i32[]) {
       fn.fnBody = drwBody
       const yields = fe < fRetVoid.length && fRetVoid[fe] == 0
       spillValueWrites(fn.fnBody, yields)
-      if yields { spillTail(fn.fnBody, fnStmts[fe]) }
+      if yields { spillTail(fn.fnBody) }
     }
     fe = fe + 1
   }
@@ -2531,8 +2531,11 @@ function spillValueWrites(ix: i32, yields: boolean) {
       let asg = -1
       if sn is RetStmt {
         if yields && sn.retArg >= 0 { asg = unwrapParen(sn.retArg) }
-        // A returned value `if` yields its arm tails, as the tail `if` does.
-        if asg >= 0 && nodeAt(asg) is IfStmt { spillIfTail(asg, -1) }
+        // A returned value `if` yields each arm's tail, which spills as a body's tail `if` does.
+        if asg >= 0 && nodeAt(asg) is IfStmt {
+          spillTailIf(asg)
+          asg = -1
+        }
       } else if sn is LetDecl {
         if sn.letInit >= 0 { asg = unwrapParen(sn.letInit) }
       } else {
@@ -2593,14 +2596,14 @@ function spillValueWritesIn(ix: i32, yields: boolean) {
 
 // Spills the value-position tail of the block at `blockIx`: its last statement, or every arm
 // of a last `if` the checker says yields a value.
-function spillTail(blockIx: i32, fnIx: i32) {
+function spillTail(blockIx: i32) {
   if blockIx < 0 { return 0 }
   const b = nodeAt(blockIx)
   if b is Block {
     const n = b.blkStmts.length
     if n == 0 { return 0 }
     const last = b.blkStmts[n - 1]
-    if nodeAt(last) is IfStmt { return spillIfTail(last, fnIx) }
+    if nodeAt(last) is IfStmt { return spillTailIf(last) }
     const out: i32[] = []
     const val = spillWrite(last, out)
     if val < 0 { return 0 }
@@ -2620,19 +2623,19 @@ function spillTail(blockIx: i32, fnIx: i32) {
   0
 }
 
-// Spills every arm tail of the value `if` at `ifIx`; one yielding no value is left alone.
-function spillIfTail(ifIx: i32, fnIx: i32) {
+// Spills the tail of each arm of the value `if` at `ifIx`, unless an arm yields no value.
+function spillTailIf(ifIx: i32) {
   if ifYieldsNoValue(ifIx) { return 0 }
   let cur = ifIx
   while cur >= 0 {
     const c = nodeAt(cur)
     cur = elseIfLink(cur)
     if c is IfStmt {
-      spillTail(c.ifThen, fnIx)
-      if cur < 0 { spillTail(c.ifElse, fnIx) }
+      spillTail(c.ifThen)
+      if cur < 0 { spillTail(c.ifElse) }
     }
   }
-  0
+  return 0
 }
 
 // Rewrites the field or element write at `asgIx` to store a spilled value into a spilled place,
@@ -3446,7 +3449,7 @@ function asvTail(blockIx: i32) {
 }
 
 // Whether the `else if` chain from the `if` at `ix` ends in an `else`, which a value needs.
-export function asvChainHasElse(ix: i32): boolean {
+function asvChainHasElse(ix: i32): boolean {
   let cur = ix
   let last = ix
   while cur >= 0 {
@@ -4088,21 +4091,78 @@ function cboxYieldTail(blockIx: i32, boxed: i32[]) {
     }
     return cboxYieldTail(tn.ifElse, boxed)
   }
-  if !(tn is BinExpr) { return 0 }
+  const out = cboxYieldWrite(tx, boxed)
+  if out.length == 0 { return 0 }
+  st.pop()
+  for o in out { st.push(o) }
+  plCacheBust()
+  0
+}
+
+// Every `return v = e` of the block at `ix` and the blocks its statements hold, nested functions
+// aside, split as a tail write is (`cboxYieldWrite`): the write goes before the `return`, which
+// returns what the write yields.
+function cboxYieldRets(ix: i32, boxed: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if n is Block {
+    const st: i32[] = []
+    let edited = false
+    for s in n.blkStmts {
+      const r = nodeAt(s)
+      const out = if r is RetStmt && r.retArg >= 0 { cboxYieldWrite(r.retArg, boxed) } else { [] }
+      if r is RetStmt && out.length > 0 {
+        let k = 0
+        while k < out.length - 1 {
+          st.push(out[k])
+          k = k + 1
+        }
+        r.retArg = out[out.length - 1]
+        edited = true
+      } else {
+        cboxYieldRets(s, boxed)
+      }
+      st.push(s)
+    }
+    if edited {
+      n.blkStmts = st
+      plCacheBust()
+    }
+    return 0
+  }
+  match n {
+    Block => 0
+    IfStmt => {
+      cboxYieldRets(n.ifThen, boxed)
+      cboxYieldRets(n.ifElse, boxed)
+    }
+    WhileStmt => cboxYieldRets(n.whileBody, boxed)
+    ForRange => cboxYieldRets(n.frBody, boxed)
+    ForIn => cboxYieldRets(n.fiBody, boxed)
+    // An expression, a declaration, a jump or a nested function holds no `return` of this body.
+    Ident | NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Index | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread | LoopVar => 0
+  }
+  return 0
+}
+
+// The statements that stand for the value-position write `tx` to a boxed cell whose element type
+// is not the write's: the write, then a copy of its literal, or `const t = e`, the write of `t`
+// and `t` read at the write's type. Empty where the write needs no split.
+function cboxYieldWrite(tx: i32, boxed: i32[]): i32[] {
+  const tn = nodeAt(tx)
+  if !(tn is BinExpr) { return [] }
   const bd = cboxTypedLeftDecl(tn, boxed)
-  if bd < 0 || tn.binOp != "=" { return 0 }
-  if nodeAt(unwrapParen(tn.binRight)) is NullLit { return 0 }
+  if bd < 0 || tn.binOp != "=" { return [] }
+  if nodeAt(unwrapParen(tn.binRight)) is NullLit { return [] }
   const elemTy = tyArrayElemIx(cboxCellTy[bd] ?? -1)
   const valTy = nodeTyIxOf(tx)
-  if elemTy < 0 || valTy < 0 || tySame(elemTy, valTy) { return 0 }
-  if tyIsLitUnionOrLit(elemTy) { return 0 }
+  if elemTy < 0 || valTy < 0 || tySame(elemTy, valTy) { return [] }
+  if tyIsLitUnionOrLit(elemTy) { return [] }
   const lit = cboxLitCopy(tn.binRight)
   if lit >= 0 {
     nodeTyRecord(lit, valTy)
     rwNumOwn(lit)
-    st.push(lit)
-    plCacheBust()
-    return 0
+    return [tx, lit]
   }
   const tname = "__cbv" + i32ToStr(cboxYieldCtr)
   cboxYieldCtr = cboxYieldCtr + 1
@@ -4122,11 +4182,7 @@ function cboxYieldTail(blockIx: i32, boxed: i32[]) {
   identFromDecl(yielded, tlet)
   nodeTyRecord(yielded, heldTy)
   numDeliverStamp(yielded, heldTy, valTy)
-  st[st.length - 1] = tlet
-  st.push(tx)
-  st.push(cboxYieldAs(yielded, heldTy, valTy))
-  plCacheBust()
-  0
+  [tlet, tx, cboxYieldAs(yielded, heldTy, valTy)]
 }
 
 // The tail read `rd` of a temp held at `heldTy` as the write's value `valTy`: a radix literal its
@@ -4450,6 +4506,7 @@ function cboxWalk(ix: i32, boxed: i32[]) {
     FuncDecl => {
       if n.fnRet < 0 && !lambdaVoidAdoptedAt(ix) {
         cboxYieldTail(n.fnBody, boxed)
+        cboxYieldRets(n.fnBody, boxed)
       }
       n.fnBody = cboxWalk(n.fnBody, boxed)
       return ix
