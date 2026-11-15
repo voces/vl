@@ -2423,8 +2423,8 @@ are not frozen at the module boundary".
 **Q4. Should an exported function's signature be frozen at the module boundary?**
 
 ```vl
-export function twice(x) { x * 2 }            // today: a generic; its body is its interface
-export function twice(x: i32): i32 { x * 2 }  // a frozen interface
+export function twice(x) { return x * 2 }            // today: a generic; its body is its interface
+export function twice(x: i32): i32 { return x * 2 }  // a frozen interface
 ```
 
 - **(A) No rule.** S5's interface hash includes the bodies of exported generics and of
