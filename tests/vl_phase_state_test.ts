@@ -143,3 +143,53 @@ Deno.test({
     }
   },
 });
+
+// The type-arena accessors are the session's interner, not checker facts: an import of one is
+// counted as `arena`, not `surface`, and a listed accessor the module does not export stops the
+// census.
+const ARENA = `export function tyPinElem(t: i32, v: i32): i32 { t + v }
+export function tyPinKey(t: i32, v: i32): i32 { t + v }
+export function tyPinVal(t: i32, v: i32): i32 { t + v }
+export function judge(t: i32): i32 { t }
+`;
+const ARENA_USER = `import { judge, tyPinElem } from "./check_types"
+
+export function use(): i32 { judge(tyPinElem(1, 2)) }
+`;
+
+Deno.test({
+  name: "phase-state ratchet: a type-arena accessor is not checker surface",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_phase_state_arena_" });
+    try {
+      await Deno.mkdir(`${dir}/compiler`);
+      await Deno.mkdir(`${dir}/scripts`);
+      await Deno.writeTextFile(`${dir}/compiler/check_types.vl`, ARENA);
+      await Deno.writeTextFile(`${dir}/compiler/emit_user.vl`, ARENA_USER);
+      const r = await census(["--root", dir]);
+      want(
+        r.code === 0 &&
+          r.out.includes(
+            "surface 1 imports of 1 distinct checker symbols, beside 1 imports of the type-arena accessors",
+          ),
+        "the accessor counted as arena and the judgement as surface",
+        r.out,
+      );
+
+      // A listed accessor the module no longer exports stops the census.
+      await Deno.writeTextFile(
+        `${dir}/compiler/check_types.vl`,
+        ARENA.replace(/^export function tyPinKey.*\n/m, ""),
+      );
+      const stale = await census(["--root", dir]);
+      want(
+        stale.code === 2 && stale.out.includes("TY_ARENA_API lists tyPinKey"),
+        "a stale TY_ARENA_API entry to exit 2 naming it",
+        stale.out,
+      );
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
