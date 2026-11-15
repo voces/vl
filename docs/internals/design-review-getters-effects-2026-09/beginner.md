@@ -77,8 +77,8 @@ with a readable `x`' asks for the method `{ x(): f32 }` instead."* I tried it (p
 
 ```vl
 type Pt = new { x: f64, y: f64 }
-get x2(self: Pt): f64 { self.x * 2.0 }
-function useX<T: { x2(): f64 }>(t: T): f64 { t.x2() }
+get x2(self: Pt): f64 { return self.x * 2.0 }
+function useX<T: { x2(): f64 }>(t: T): f64 { return t.x2() }
 ```
 ```
 p18_method_bound.vl:5:7: Pt does not satisfy `{x2():f64}`: no `x2(): f64` — the bound needs a
@@ -138,7 +138,7 @@ the Python experience with better errors. Two concerns:
 ### 1. The first getter a learner writes, a vector length, is refused: `sqrt`, `abs`, `min`/`max` aren't allowed
 ```vl
 type Pt = new { x: f64, y: f64 }
-get len(self: Pt): f64 { sqrt(self.x * self.x + self.y * self.y) }
+get len(self: Pt): f64 { return sqrt(self.x * self.x + self.y * self.y) }
 ```
 ```
 p24_sqrt.vl:2:26: the getter `len` on Pt calls `sqrt`, which is neither a pure intrinsic nor a

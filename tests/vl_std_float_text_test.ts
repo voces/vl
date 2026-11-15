@@ -108,7 +108,7 @@ const RANDOM_VECTORS = 5000;
 const SEED = "88172645463325252";
 
 const PRELUDE = `
-function mk(hi: i64, lo: i64): i64 { (hi << 32) | lo }
+function mk(hi: i64, lo: i64): i64 { return (hi << 32) | lo }
 
 const SPECIAL: i64[] = [${SPECIAL_PAIRS}]
 
@@ -119,7 +119,7 @@ function nextBits(): i64 {
   seed = seed ^ (seed << 13)
   seed = seed ^ (seed >>> 7)
   seed = seed ^ (seed << 17)
-  seed
+  return seed
 }
 `;
 

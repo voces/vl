@@ -52,8 +52,8 @@ by that measure, while the actual work doubles at every level:
 
 ```vl
 type C = new i32
-get g0(self: C): i32 { (self as! i32) & 1 }
-get g1(self: C): i32 { self.g0 + self.g0 }
+get g0(self: C): i32 { return (self as! i32) & 1 }
+get g1(self: C): i32 { return self.g0 + self.g0 }
 // … g2 … g31, each reading the previous one twice
 print((3 as! C).g31)
 ```
@@ -184,7 +184,7 @@ the load-bearing number.
 
 ```vl
 type N = new { name: string, k: i32 }
-get isZ(self: N): boolean { self.name is "z" || self.name is "y" }
+get isZ(self: N): boolean { return self.name is "z" || self.name is "y" }
 ```
 
 This passes the contract, and the wasm of `N.isZ` is two `call $__str_eq__`, a two-loop helper
@@ -204,7 +204,7 @@ which keeps acceptance rep-independent while catching drift the first time a fix
 
 ```vl
 type V2 = new { x: f64, y: f64 }
-get len(self: V2): f64 { sqrt(self.x * self.x + self.y * self.y) }
+get len(self: V2): f64 { return sqrt(self.x * self.x + self.y * self.y) }
 ```
 
 This is refused with `calls sqrt, which is neither a pure intrinsic nor a getter` (`h4.vl`, `h9.vl`).
