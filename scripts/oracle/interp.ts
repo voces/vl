@@ -212,6 +212,15 @@ function litHolds(l: Lit, k: string): boolean {
   return true;
 }
 
+// Owner ruling 4.3 (T3.6): a literal joined with a typed numeric value adopts that type when it
+// fits: an integer literal when the type holds it exactly, a float literal at f32 or f64.
+function joinFits(l: Lit, k: string): boolean {
+  if (!litHolds(l, k)) return false;
+  if (l.i === null || l.radix || (k !== "f32" && k !== "f64")) return true;
+  const n = k === "f32" ? Math.fround(Number(l.i)) : Number(l.i);
+  return Number.isFinite(n) && BigInt(n) === l.i;
+}
+
 function dblOp(op: string, x: number, y: number): number {
   return op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : op === "/" ? x / y : x % y;
 }
@@ -932,7 +941,8 @@ export class Interp {
         const c = this.asBool(this.eval(e.c, env, null), "if-condition");
         // E9.1 does not list `if`, so with no context its value is typed, not a constant.
         const v = c ? this.blockValue(e.t, env, exp) : e.f ? this.blockValue(e.f, env, exp) : VOID;
-        if (exp) return v instanceof Lit ? asJoin(v) : v;
+        // A generic's erased parameter (`any`) is no context: the join settles here.
+        if (exp && !(exp.k === "name" && exp.name === "any")) return v instanceof Lit ? asJoin(v) : v;
         // T3.6 at an `if` join: a constant arm adapts to the other arm's type, read from its
         // declaration since that arm did not run; one that cannot widens the join.
         const other = c ? e.f : e.t;
@@ -941,14 +951,14 @@ export class Interp {
         if (v instanceof Lit) {
           if (!kOther && ok && ok.k === "expr" && isConstTree(ok.e)) return asJoin(v);
           if (!kOther) return litDefault(v);
-          if (litHolds(v, kOther)) { try { return litTo(v, kOther); } catch { /* the default */ } }
+          if (joinFits(v, kOther)) { try { return litTo(v, kOther); } catch { /* the default */ } }
           const d = litDefault(v), dk = numKind(d)!;
           return WIDENS[kOther]?.includes(dk) ? d : WIDENS[dk]?.includes(kOther) ? toKind(d, kOther) : d;
         }
         const kv = numKind(v);
         if (kv && ok && ok.k === "expr" && isConstTree(ok.e)) {
           const lit = this.eval(ok.e, env, null) as Lit;
-          if (!litHolds(lit, kv)) { const dk = numKind(litDefault(lit))!; if (WIDENS[kv]?.includes(dk)) return toKind(v, dk); }
+          if (!joinFits(lit, kv)) { const dk = numKind(litDefault(lit))!; if (WIDENS[kv]?.includes(dk)) return toKind(v, dk); }
         }
         return v;
       }
@@ -1026,12 +1036,12 @@ export class Interp {
   settleLits(xs: Val[]): Val[] {
     if (!xs.some((x) => x instanceof Lit)) return xs;
     const kinds = new Set(xs.filter((x) => !(x instanceof Lit)).map(numKind).filter((k) => k));
-    // T3.6: a literal element adapts to the join instead of widening it.
-    // With one typed member it takes that member when exact. With several, it keeps its default
-    // type, absorbed into a member that type widens into (T2.6). The second half matches the
-    // compiler and is an owner question: T3.6 does not say which member a literal adapts to.
+    // T3.6 (ruling 4.3): a literal element beside one typed member adopts it when it fits. With
+    // several members it keeps its default type, absorbed into a member that type widens into
+    // (T2.6); the ruling names one typed value, so that half follows today's compiler.
     const fit = (l: Lit) => {
-      if (kinds.size === 1) { try { return litTo(l, [...kinds][0]!); } catch { /* falls to the default */ } }
+      const k = kinds.size === 1 ? [...kinds][0]! : null;
+      if (k && joinFits(l, k)) { try { return litTo(l, k); } catch { /* falls to the default */ } }
       const d = litDefault(l), dk = numKind(d)!;
       if (kinds.has(dk)) return d;
       const into = WIDENS[dk]?.find((w) => kinds.has(w));
@@ -1075,13 +1085,15 @@ export class Interp {
         const k = numKind(l);
         if (!litR || !k) return l;
         const lit = this.eval(e.r, env, null) as Lit;
-        try { litTo(lit, k); return l; } catch { return toKind(l, wider(numKind(litDefault(lit))!, k)); }
+        if (joinFits(lit, k)) return l;
+        const dk = numKind(litDefault(lit))!;
+        return WIDENS[dk]?.includes(k) || WIDENS[k]?.includes(dk) ? toKind(l, wider(dk, k)) : l;
       }
       if (!litR) return this.eval(e.r, env, exp);
       const lit = this.eval(e.r, env, null) as Lit;
       const dl = this.declTy(e.l, env);
       const t = dl ? this.numTarget(lit, dl, env) : null;
-      if (t) { try { return litTo(lit, t); } catch { /* the join widens */ } }
+      if (t && joinFits(lit, t)) { try { return litTo(lit, t); } catch { /* the join widens */ } }
       return exp ? lit : litDefault(lit);
     }
     // A numeric context flows into both operands of arithmetic (a literal tree adopts it).
