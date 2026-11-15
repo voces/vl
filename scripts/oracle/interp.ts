@@ -1057,6 +1057,10 @@ export class Interp {
           return v instanceof Lit ? asJoin(v) : v;
         }
         if (v instanceof Lit) {
+          // A float arm makes the join a float context, where a radix arm is its digits' value (4.1).
+          if (v.radix && v.i !== null && !kOther && ok && ok.k === "expr" && isConstTree(ok.e) && treeHas(ok.e, "float")) {
+            return v.lone ? radixFloat(v.i, 64, false) : new Flt(Number(wrap64(v.i)), 64);
+          }
           if (!kOther && ok && ok.k === "expr" && isConstTree(ok.e)) return asJoin(v);
           if (!kOther) return litDefault(v);
           if (joinFits(v, kOther)) { try { return litTo(v, kOther); } catch { /* the default */ } }

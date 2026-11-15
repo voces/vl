@@ -1,4 +1,4 @@
-# Eight radix-width cells from the first fuzz nightly, delta-debugged into four families, 2026-11-15
+# Eight radix-width cells from the first fuzz nightly, delta-debugged into four families, plus one oracle case, 2026-11-15
 
 Lane O. Lane B's triage of fuzz-nightly run 43686086648 (#8280) left 8 radix-width cells. Each was
 regenerated (`gen.ts --seed S --count 200`), reduced by hand one ingredient at a time against both
@@ -8,6 +8,7 @@ the compiler and the oracle, and grouped by the ablation, not the message.
 | --- | --- | --- | --- | --- | --- |
 | O1 | oracle | `ar_s25_0085`, `ar_s7_0127` | a join arm `min(-1, 2)` beside `-255`, then `- (if c { 1 } else { 0xFFFFFFFF })` at `i64`; `(255 >> v) + max(9223372036854775807, 1)` | the oracle's `staticKind` gave `min`/`max`/`abs` over constants no type, and an `if` under a destination ignored its typed arm | the call is typed at the wider of its arguments' defaults (E9.1), and a constant arm takes the typed arm's type under a destination too (T3.6); a shift of a constant takes a typed peer's type (Q8) |
 | O2 | oracle | `ar_s32_0022`, `ar_s29_0063` | `p * (0xFFFFFFFF % 9)`, `p: i32`, at an `i64` destination | the oracle read the radix tree at the destination | under an integer destination, a radix tree or shifted constant beside a typed integer peer takes the peer's width when its constant fits it (D3043), else the destination's |
+| O3 | oracle | lane B's extra case | `if c { 1.5 } else { 0xFFFFFFFF }` printed `-1` | a radix arm beside a float-literal arm stayed an untyped join | a float arm makes the join a float context, where the radix arm is its digits' value (4.1) |
 | C1 | compiler | `ar_s31_0104`, `ar_s43_0072` | `((-1) - 0xFFFFFFFF) as f64` printed `0` | the cast typed its operand as the `i32` tree | **D16491**: an `as f64` cast reads a radix tree at `i64` |
 | C2 | compiler | `ar_s30_0123`, `ar_s44_0020` | `0xFFFFFFFF & 3000000000` printed `-1294967296` | the fold read a pattern's result at 32 bits beside an `i64` operand | **D16492**: a pattern beside a tree spelling an `i64` decimal is no constant; the typed check reads it zero-extended |
 
