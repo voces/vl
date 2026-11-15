@@ -83,6 +83,12 @@ Deno.test("oracle: pinned regressions", () => {
     ["print(0x1_0000_0001 as f32)", "4294967296"],
     ["print(1.5 + 0xFFFFFFFF)", "4294967296.5"],
     ["print(0xFFFFFFFF)", "-1"], // an integer context keeps the pattern
+    // ruling 4.2: a radix tree read at an f64 computes at 64 bits with integer division
+    ["const y: f64 = 0xFFFFFFFF / 2\nprint(y)", "2147483647"],
+    ["const c: f64 = 0x7FFFFFFF << 2\nprint(c)", "8589934588"],
+    ["print(2.0 * (0x80000000 >> 1))", "2147483648"],
+    ["print((0xFFFFFFFF % 1_000) as i64)", "295"],
+    ["print(0xFFFFFFFF / 2)", "0"], // no use: the 32-bit pattern
   ];
   for (const [src, want] of pins) {
     const o = interpret(src + "\n");
