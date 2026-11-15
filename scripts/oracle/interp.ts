@@ -1275,6 +1275,8 @@ export class Interp {
           try { lit = this.eval(ok.e, env, null) as Lit; } catch (x) { if (x instanceof Trap) return v; throw x; }
           if (!joinFits(lit, kv)) { const dk = numKind(litDefault(lit))!; if (WIDENS[kv]?.includes(dk)) return toKind(v, dk); }
         }
+        // T3.6: a typed arm beside a wider typed arm widens to it, whichever arm ran
+        if (kv && kOther && kOther !== kv && WIDENS[kv]?.includes(kOther)) return toKind(v, kOther);
         return v;
       }
       case "block": return this.execBlock(e.body, new Env(env));
@@ -1340,7 +1342,12 @@ export class Interp {
         if (!["+", "-", "*", "/", "%", "&", "|", "^"].includes(e.op)) return null;
         const a = this.staticKind(e.l, env), b = this.staticKind(e.r, env);
         if (a && b) { try { return wider(a, b); } catch { return null; } }
-        return a ?? b;
+        // D3043: a constant that does not fit its typed i32 peer makes the operator i64
+        const k = a ?? b, cst = a ? e.r : e.l;
+        if (k === "i32" && isConstTree(cst)) {
+          try { const v = this.eval(cst, env, null); if (v instanceof Lit && v.i !== null && !litHolds(v, "i32")) return "i64"; } catch { /* the default */ }
+        }
+        return k;
       }
       case "if": {
         // a join is its arms' wider kind; a constant arm has none here and takes the other's,
