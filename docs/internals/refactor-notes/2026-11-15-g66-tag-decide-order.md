@@ -40,6 +40,9 @@ lowers at one signature.
     change 165 of 5139 move and 17 are clause-1, again with no new clause-1 mover. D16301 keeps
     #8165's witness, which still traps.
   - The one case outside the baseline, on both seeds, is D16209's fixture, filed as D16369.
+  - D16281's witness runs, with three more of its 15 open cells; 11 move. It takes the last part of
+    `written-let-handed-only-to-open-param-at-two-types` as its witness. Without that part's
+    re-point the program refuses in either order, filed as D16420.
 - 298 function-set templates, as written: 0 runs→not-runs, 0 new silent.
 - `regress.vl`: 0 runs→not-runs. 12 `dord*` named cells move from a trap or an invalid module
   to runs, and their baseline lines are rewritten.
