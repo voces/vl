@@ -455,8 +455,8 @@ operator (types.md §T2.3).
 > (lane O's spec question 9): float constants fold in IEEE, which reverses that ruling's
 > float half.
 
-> Status: the fold rounds every float operation to a double; at an `f32` use it then rounds
-> once more to `f32`, which differs from `f32` arithmetic in rare double-rounding cases.
+> Status: a tree initialising a binding annotated `f32` folds in `f32` arithmetic; at any other
+> `f32` use the fold computes in doubles and rounds once more to `f32` (D16414).
 
 ## E10. Evaluation order
 

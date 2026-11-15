@@ -9752,9 +9752,9 @@ tree read stays an editor reference.
   0.30000000000000004, `1.5 % 0.1` is 0.09999999999999992, `(1.5 % 0.1) / (2.5 % 0.1)` is
   1.0000000000000007, and `1.0 + 1.0/9007199254740992.0` is `1.0`. A float zero keeps its sign
   (`0.0 * -1.0` is `-0`). The integer part of a mixed tree still folds exactly, and a float
-  result at an integer destination is still refused unless it is whole. At an `f32` use the
-  double result rounds once more to `f32`, which can differ from `f32` arithmetic by a double
-  rounding; the fold sees no use type (open).
+  result at an integer destination is still refused unless it is whole. A tree initialising a
+  binding annotated `f32` folds in `f32` arithmetic; at any other `f32` use the fold sees no use
+  type, so the double result rounds once more to `f32` (D16414, open).
 * **Precision.** Integers are exact to 512 bits, past which the expression is a check error
   (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound.
 * **A refusal names the constant and the destination** at an integer, float or union
