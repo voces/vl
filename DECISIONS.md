@@ -9785,8 +9785,12 @@ tree read stays an editor reference.
   division and then converts: `let x: f64 = 0xFFFFFFFF + 1000` is 4294968295 and
   `(0xFFFFFFFF + 1000) + p` with `p: f64` adds 4294968295. This reverses D14990's reading, which
   computed such a tree at 32 bits (`const c: f64 = 0x7FFFFFFF << 2` was -4, now 8589934588).
-  The bare pattern is unchanged: `0xFFFFFFFF as f32` reads the 32-bit pattern (-1.0) and
-  `as f64` the 64-bit one; an `f32` use and no context keep their 32 bits (D16390).
+  An `f32` use and no context keep their 32 bits (D16390).
+* **In a float context a radix literal is the value its digits spell (owner, 2026-11-15, ruling
+  4.1, as clarified).** At an `f32` or `f64` destination, or beside a float, the float must hold
+  that value exactly, as it must a decimal integer literal (`const b: f32 = 0x7FFFFFFF` is
+  refused); `as f32` / `as f64` rounds it, so `0xFFFFFFFF as f32` is 4294967296 where it was -1.0,
+  the pattern's signed value. An integer context keeps the bit pattern.
 * **A float division by zero, and a float constant past the largest double, are not folded.**
   `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE computation they were, which gives the same
   Infinity or NaN; Go refuses both.
