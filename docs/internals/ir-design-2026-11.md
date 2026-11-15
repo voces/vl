@@ -485,6 +485,15 @@ covers v128 inside containers (I2/I7), the converting copy into nested or nullab
 the union-holding rules (I4) and the un-annotated-parameter return (I4/I6). A literal that asks a
 typing question rather than a lowering one is graded case by case, per the plainest-program rule.
 
+### 6.3 Acceptance rows parked for the IR
+
+Rows whose fix in today's emitter would change a structure the IR replaces. Each one closes at
+the step named, with its own grade:
+
+| row | outcome | mechanism | closes at |
+|---|---|---|---|
+| [D16294](inventory/D16294.md) | emit, "this lambda is handed on at two different function types" | a maker twin shares the root's body nodes, so a returned lambda literal has no per-twin return slot to re-pin | **I9**: `irInstantiate` builds each instance's body, so each twin's literal is its own |
+
 ### 6.2 What deletes: the 850 emit refusal sites
 
 By **message** (§A.4), not ablated:
