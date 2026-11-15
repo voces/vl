@@ -311,11 +311,10 @@ Deno.test({
   want("two errors", got.length, 2);
   want("same diagnostics as `checkSrc`", got.join("\n"), plainCheckDiags(twoErrors).join("\n"));
 
-  // The one diagnostic the symbol check did NOT used to report: a read of a
-  // deep-`is` receiver after a guard that returns when the test fails (D16477)
-  // refuses in the SECOND pass, which only `checkSrc` ran. A `checkSrcSym` without it publishes
-  // a clean file for a program `vl build` refuses — the reason the parity is a
-  // compiler change and not a host one.
+  // A deep-`is` program runs a SECOND pass over its rewritten walkers, which only
+  // `checkSrc` used to run. The rewrite now raises no diagnostic of its own (D16477
+  // closed its last), so the symbol check must agree with the plain one on a clean file:
+  // none, both ways.
   const deepIs = `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
 type Cfg = { port: i32, host: string | null }
 let g: Json = null
@@ -323,12 +322,8 @@ function a(): i32 { if !(g is Cfg) { return 0 }  g.port }
 print(a())
 `;
   const deep = await c.check(deepIs, ENTRY_KEY, read);
-  want("the deep-\`is\` refusal reaches the editor", deep.length, 1);
-  want(
-    "and it is the plain check's",
-    `${deep[0].range.start.line + 1}:${deep[0].range.start.character}:${deep[0].message}`,
-    plainCheckDiags(deepIs).join("\n"),
-  );
+  want("a clean deep-\`is\` file is clean in the editor", deep.length, 0);
+  want("and in the plain check", plainCheckDiags(deepIs).length, 0);
 });
 
 Deno.test({

@@ -968,15 +968,14 @@ const CASES: Case[] = [
     want: "dirty",
   },
   {
-    name: "a deep-is site in a clean G beside an error outside it declines the target",
+    name: "a deep-is site in a clean G beside an error outside it is served: the rewrite's pass adds nothing",
     graph: {
       "main.vl": 'import { d } from "./mid"\nconst s: string = d(null)\nprint(s)\n',
       "mid.vl": "type Json = null | boolean | f64 | string | Json[] | { [string]: Json }\n" +
         "export function d(r: Json): i32 {\n  if !(r is string[]) { return 0 }\n  r.length\n}\n",
     },
     target: "mid.vl",
-    want: "dirty",
-    mask: NO_OUTSIDE,
+    want: "served",
   },
   {
     name: "a warning-only target is served with its rows",
