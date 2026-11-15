@@ -436,6 +436,13 @@ export function checkProgramNode(n: Program) {
   }
   const done: boolean[] = []
   for _ in stmts { done.push(false) }
+  // The functions on a call cycle, which keep the fixpoint's order however a statement reaches them.
+  const topFns: i32[] = []
+  for st in stmts {
+    if nodeAt(st) is FuncDecl { topFns.push(st) }
+  }
+  const onCycle: {[i32]: boolean} = Map()
+  for f in inferCycleMembers(topFns) { onCycle[f] = true }
   modLetNames = Map()
   for st in stmts {
     const sn = nodeAt(st)
@@ -443,7 +450,7 @@ export function checkProgramNode(n: Program) {
   }
   let j = 0
   while j < stmts.length {
-    if !done[j] { progCheckCalleeFirst(stmts, j, stmtAt, done, false) }
+    if !done[j] { progCheckCalleeFirst(stmts, j, stmtAt, onCycle, done, false) }
     j = j + 1
   }
   // A function whose return never resolved (a genuinely base-case-less recursive
@@ -474,6 +481,7 @@ function progCheckCalleeFirst(
   stmts: i32[],
   j: i32,
   stmtAt: {[i32]: i32},
+  onCycle: {[i32]: boolean},
   done: boolean[],
   eagerIn: boolean,
 ) {
@@ -490,7 +498,7 @@ function progCheckCalleeFirst(
     // A function checked ahead of the code that names it takes its callees with it, as their
     // declarations first would: their parameters are its calls' to solve, not the statement's.
     // A function on a call cycle keeps the fixpoint's order.
-    const free = k >= 0 && !done[k] && !fnReachesSelf(d, stmtAt)
+    const free = k >= 0 && !done[k] && !(onCycle[d] ?? false)
     const lifted = free
       && eagerIn
       && nodeAt(stmts[j]) is FuncDecl
@@ -499,11 +507,19 @@ function progCheckCalleeFirst(
       && !done[k]
       && (all
       || lifted
-      || (own && ((eager && free) || retPending(d) || weSummaryUnsettled(d)))
+      || (own
+      && ((eager && free) || retPending(d) || weSummaryUnsettled(d)))
       || (k > j && fnWritesHoleParam(d)))
     crAskForSet(-1)
     if first {
-      progCheckCalleeFirst(stmts, k, stmtAt, done, all || lifted || (eager && own))
+      progCheckCalleeFirst(
+        stmts,
+        k,
+        stmtAt,
+        onCycle,
+        done,
+        all || lifted || (eager && own),
+      )
     }
   }
   cstrProbeBefore(stmts[j])
@@ -553,20 +569,6 @@ function eagerCheckable(
   }
   path.pop()
   true
-}
-
-// Whether top-level function `d` calls itself through the functions it reaches.
-function fnReachesSelf(d: i32, stmtAt: {[i32]: i32}): boolean {
-  const seen: {[i32]: boolean} = Map()
-  const todo: i32[] = weFnRefs(d, false)
-  while todo.length > 0 {
-    const c = todo.pop() ?? -1
-    if c == d { return true }
-    if c < 0 || (seen[c] ?? false) || !stmtAt.has(c) { continue }
-    seen[c] = true
-    for n in weFnRefs(c, false) { todo.push(n) }
-  }
-  false
 }
 
 // The body of function declaration `d`, or -1.
