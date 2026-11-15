@@ -360,12 +360,7 @@ import {
   fnParent,
   fnPosIndexDrop,
   fnStmts,
-  fnUsesListEqI,
-  fnUsesListEqS,
-  fnUsesMapFilter,
-  fnUsesMapKeys,
-  fnUsesMapVals,
-  fnUsesStrOp,
+  fnUses,
   fnValUsed,
   gCellIdx,
   gFoldAt,
@@ -2032,8 +2027,11 @@ function buildFnMapBankPrefix() {
 // Bank row `li`'s return columns from annotation `ann` (-1 for none), read off the declared
 // type's rep as an un-annotated row's are off its recorded one. A record's row is the one its
 // signature is emitted at (`retStructRowIndex`), which a same-shape twin need not share.
-function buildFnMapRowOfRetAnn(li: i32, ann: i32) {
-  const rsk = vtKindOfType(ann)
+function buildFnMapRowOfRetAnn(li: i32, ann: i32, generic: boolean) {
+  // A generic's annotation still open is the template's own: it has no rep until an instance
+  // binds it, and the instance's row replaces this one, so it banks the scalar default unasked.
+  const own = if generic && ann >= 0 { nodeTyIxOf(ann) } else { -1 }
+  const rsk: VKind = if own >= 0 && tyHasTyVar(own) { "i32" } else { vtKindOfType(ann) }
   const t0 = if ann >= 0 { nodeRepTyIxOf(ann) } else { -1 }
   const ty = if t0 >= 0 || ann < 0 { t0 } else { nodeTyIxOf(ann) }
   // A bare annotation is its rows' first reader, so they are minted here, ahead of the read; a
@@ -2077,7 +2075,9 @@ export function buildFnMap(_stmts: i32[]) {
     while d < fmDirtySlots.length {
       const ds = fmDirtySlots[d]
       const dn = nodeAt(fnStmts[ds])
-      if dn is FuncDecl { buildFnMapRowOfRetAnn(ds, dn.fnRet) }
+      if dn is FuncDecl {
+        buildFnMapRowOfRetAnn(ds, dn.fnRet, dn.fnTyParams.length > 0)
+      }
       d = d + 1
     }
   } else {
@@ -2109,7 +2109,7 @@ export function buildFnMap(_stmts: i32[]) {
       if (i < fnParent.length && fnParent[i] >= 0) || lfBlockOf(i) >= 0 {
         sidArrPut(nestedNameBySid, fsid, 1)
       }
-      buildFnMapRowOfRetAnn(fRetKind.length, s.fnRet)
+      buildFnMapRowOfRetAnn(fRetKind.length, s.fnRet, s.fnTyParams.length > 0)
     }
     i = i + 1
   }
@@ -2134,7 +2134,7 @@ export function fnStmtsAppendTop(fn: i32) {
   if lfBlockOf(li) >= 0 { sidArrPut(nestedNameBySid, fsid, 1) }
   const s = nodeAt(fn)
   if s is FuncDecl && li == fRetKind.length {
-    buildFnMapRowOfRetAnn(li, s.fnRet)
+    buildFnMapRowOfRetAnn(li, s.fnRet, s.fnTyParams.length > 0)
   }
   li
 }
@@ -2170,7 +2170,9 @@ export function recordedVoidFns() {
   let i = 0
   while i < fnStmts.length {
     const af = nodeAt(fnStmts[i])
-    if post && af is FuncDecl { buildFnMapRowOfRetAnn(i, af.fnRet) }
+    if post && af is FuncDecl {
+      buildFnMapRowOfRetAnn(i, af.fnRet, af.fnTyParams.length > 0)
+    }
     if fRetVoid[i] == 0 {
       const fn = nodeAt(fnStmts[i])
       if fn is FuncDecl {
@@ -3350,7 +3352,7 @@ export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
   match e {
     Call => {
       // D1592 — a ref-list `.push` in value position needs the same typed frame as the `.pop`
-      // beside it. `fnUsesRefPush` is inert in `fbBeginFunc`, where ref frames come from
+      // beside it. `fnUses.refPush` is inert in `fbBeginFunc`, where ref frames come from
       // `fnRefPushSlots`, so teaching only the kind bits reserves nothing here.
       if (
         callIsMemberPopKind(exprIx, fnIx, "ref")
@@ -3396,7 +3398,7 @@ export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
     }
     // The node set below is the one `exprHasScratch` (emit_query.vl) carries: a ref-list
     // `.pop` in an `is` guard, an `as` operand, an array-literal element, an object-literal field
-    // value or an if-expression arm records its slot here. `fnUsesRefPush` is inert in
+    // value or an if-expression arm records its slot here. `fnUses.refPush` is inert in
     // `fbBeginFunc`, so without this the frame is never reserved and the build fails.
     IsExpr => {
       return collectMemberPopRefSlotsExpr(isExprKid(e), fnIx)
@@ -3546,19 +3548,19 @@ function leqxNoteRep(k: i32, sl: i32, depth: i32) {
 function leqgNoteRep(kind: i32, slot: i32, depth: i32) {
   if depth > 32 { return 0 }
   if kind == LBK_I32_LIST {
-    fnUsesListEqI = true
+    fnUses.listEqI = true
     return 0
   }
   if kind == LBK_STR_LIST {
-    fnUsesListEqS = true
+    fnUses.listEqS = true
     // The per-element string compares stage operands in the string-op frame.
-    fnUsesStrOp = true
+    fnUses.strOp = true
     return 0
   }
   if kind == LBK_REF && slot >= 0 && slot < rlElemTyIx.length {
     if rlElemKindAt(slot) == RLK_I32_LIST {
       // The `i32[][]` core, which recurses into the i32 one.
-      fnUsesListEqI = true
+      fnUses.listEqI = true
       if !i32ListHas(fnListEqRSlots, slot) { fnListEqRSlots.push(slot) }
       return 0
     }
@@ -3572,7 +3574,7 @@ function leqgNoteRep(kind: i32, slot: i32, depth: i32) {
     // operand may still widen an atom into the string-op frame, the same reason `leqNoteBin`'s
     // `k == 5` arm sets it.
     "string" => {
-      fnUsesStrOp = true
+      fnUses.strOp = true
     }
     "list" => {
       return leqgNoteRep(eqgInnerKind(slot), eqgInnerSlot(slot), depth + 1)
@@ -3583,7 +3585,7 @@ function leqgNoteRep(kind: i32, slot: i32, depth: i32) {
       const nk: i32[] = []
       const ns: i32[] = []
       if eqgStructElemNeeds(eqgElemEqRow(slot), 0, nk, ns) {
-        fnUsesStrOp = true
+        fnUses.strOp = true
       }
       let ni = 0
       while ni < nk.length {
@@ -3707,19 +3709,19 @@ function leqNoteBin(binIx: i32, fnIx: i32) {
   const lopK = listOpKindOfBin(binIx, fnIx)
   let k = lopK
   if k == "none" { k = eqCoreKindOfBin(binIx, fnIx, lopK) }
-  if k == "i32list" { fnUsesListEqI = true }
+  if k == "i32list" { fnUses.listEqI = true }
   if k == "strlist" {
-    fnUsesListEqS = true
+    fnUses.listEqS = true
     // The per-element string compares stage operands in the string-op frame.
-    fnUsesStrOp = true
+    fnUses.strOp = true
   }
   // The string-eq helper stages nothing itself, but a nullable-string compare the string-op
   // scan (`exprHasStrOp` → `exprIsStrEq`) does not claim still reaches this core through the
   // banked type, and its operands may widen an atom into the string-op frame.
-  if k == "str" { fnUsesStrOp = true }
+  if k == "str" { fnUses.strOp = true }
   if k == "reflist" {
     // The nested element compare recurses into the i32-list frame.
-    fnUsesListEqI = true
+    fnUses.listEqI = true
     const e = nodeAt(binIx)
     if e is BinExpr {
       // Either operand may be the one whose rep resolves a slot — a mixed pairing
@@ -3952,7 +3954,7 @@ function tyIsMapOrMapUnion(ty: i32): boolean {
 }
 
 // Walk the statement or expression tree at `ix`, recording every `.map` and `.filter` call over
-// a list receiver into the scratch-frame requirement lists above and setting `fnUsesMapFilter`.
+// a list receiver into the scratch-frame requirement lists above and setting `fnUses.mapFilter`.
 // Walks every statement and expression kind; a nested `FuncDecl` is not descended, since its own
 // body's sites are detected when that lifted function is emitted.
 export function mfScan(ix: i32, fnIx: i32) {
@@ -3967,7 +3969,7 @@ export function mfScan(ix: i32, fnIx: i32) {
             if n.callArgs.length == 1 {
               const rk = mfRecvKindOf(callee.memObj, fnIx)
               if rk != null {
-                fnUsesMapFilter = true
+                fnUses.mapFilter = true
                 let slot = -1
                 if rk == "reflist" {
                   slot = refListSlotOfExpr(callee.memObj, fnIx)
@@ -3986,7 +3988,7 @@ export function mfScan(ix: i32, fnIx: i32) {
             if n.callArgs.length == 1 || n.callArgs.length == 2 {
               const rk = mfRecvKindOf(callee.memObj, fnIx)
               if rk != null {
-                fnUsesMapFilter = true
+                fnUses.mapFilter = true
                 let slot = -1
                 if rk == "reflist" {
                   slot = refListSlotOfExpr(callee.memObj, fnIx)
@@ -4003,7 +4005,7 @@ export function mfScan(ix: i32, fnIx: i32) {
               exprMap(callee.memObj, fnIx)
               || tyIsMapOrMapUnion(nodeTyAt(callee.memObj, fnIx))
             ) {
-              fnUsesMapKeys = true
+              fnUses.mapKeys = true
             }
           }
           // `m.values()` builds a fresh live-value list. A mono map uses the self-contained
@@ -4013,24 +4015,24 @@ export function mfScan(ix: i32, fnIx: i32) {
             if exprMap(callee.memObj, fnIx) {
               const vsh = mapShapeOfExpr(callee.memObj, fnIx)
               if vsh == -1 {
-                fnUsesMapVals = true
+                fnUses.mapVals = true
               } else if vsh == -4 || vsh == -6 {
                 // The i32-keyed map's values are the mono i32 list — the same self-contained
                 // `mapValsBase` frame the string-keyed mono map uses.
-                fnUsesMapVals = true
+                fnUses.mapVals = true
               } else if vsh == -5 || vsh == -7 || vsh == -2 {
                 // A `Set`'s `.values()` are its keys, so the bound form is built by the key-list
                 // path and needs that frame, at either key rep. A Set's shape is neither the mono
                 // `-1` nor an mv slot, so the arms either side of this one both miss it.
-                fnUsesMapKeys = true
+                fnUses.mapKeys = true
               } else if vsh >= 0 {
-                fnUsesMapVals = true
-                fnUsesMapKeys = true
+                fnUses.mapVals = true
+                fnUses.mapKeys = true
               }
             } else if tyIsMapOrMapUnion(nodeTyAt(callee.memObj, fnIx)) {
               // An `is`-narrowed arm of a union of maps, whose shape is not read here.
-              fnUsesMapVals = true
-              fnUsesMapKeys = true
+              fnUses.mapVals = true
+              fnUses.mapKeys = true
             }
           }
         }
