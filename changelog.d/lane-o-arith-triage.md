@@ -10,3 +10,6 @@
   - D16498's radix `+` face.
 
   The oracle's subset on those seeds rises from 93% to 99%.
+- **The nightly's arith oracle leg reports and does not gate** (`fuzz.sh --report-only arith`)
+  until its filed families are emulated or closed. The other generators, and every refusal
+  ceiling, still gate. The arith ceiling is 8%; a 400-case sample reached 6.25%.
