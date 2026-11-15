@@ -236,7 +236,7 @@ function exhaustive(k: K): i32 {
     split: [],
     says: {
       code: INCOMPLETE,
-      text: "matches 2 of 32 VKind kinds and its `_` arm names none of the rest",
+      text: "matches 2 of 33 VKind kinds and its `_` arm names none of the rest",
     },
   },
   {
