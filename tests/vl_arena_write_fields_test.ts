@@ -12,15 +12,14 @@ import { filePath } from "./support/filePath.ts";
 const ROOT = filePath(new URL("../", import.meta.url)).replace(/[\\/]$/, "");
 const read = (rel: string): string => Deno.readTextFileSync(`${ROOT}/${rel}`);
 
-/** The quoted entries of `const <name> = [ … ]` in a VL source. */
-const vlList = (src: string, name: string): string[] => {
-  const m = new RegExp(`^const ${name} = \\[\\n([\\s\\S]*?)^\\]$`, "m").exec(
-    src,
-  );
+/** The space-separated names of `const <name> = " … " + " … "` in a VL source. */
+const vlWords = (src: string, name: string): string[] => {
+  const m = new RegExp(`^const ${name} = ([\\s\\S]*?)\\n\\n`, "m").exec(src);
   if (m === null) {
-    throw new Error(`compiler/lint.vl has no \`const ${name} = [\``);
+    throw new Error(`compiler/lint.vl has no \`const ${name} = "…"\``);
   }
-  return [...m[1].matchAll(/"([^"]*)"/g)].map((x) => x[1]);
+  return [...m[1].matchAll(/"([^"]*)"/g)].flatMap((x) => x[1].split(" "))
+    .filter((w) => w !== "");
 };
 
 /** The top-level field names of a `{ … }` body, one line or many. */
@@ -55,7 +54,10 @@ const recordFields = (): Map<string, string[]> => {
         if (src[i] === "{") depth++;
         else if (src[i] === "}" && --depth === 0) break;
       }
-      out.set(t[1], fieldsOf(src.slice(open + 1, i).replace(/\/\/[^\n]*/g, "")));
+      out.set(
+        t[1],
+        fieldsOf(src.slice(open + 1, i).replace(/\/\/[^\n]*/g, "")),
+      );
     }
   }
   return out;
@@ -80,7 +82,7 @@ Deno.test("arena-write: awFields is every Node variant field no other record dec
     for (const f of fs) if (nodeFields.has(f)) shared.add(f);
   }
   const want = [...nodeFields].filter((f) => !shared.has(f)).sort();
-  const got = vlList(read("compiler/lint.vl"), "awFields").slice().sort();
+  const got = vlWords(read("compiler/lint.vl"), "awFields").slice().sort();
   const missing = want.filter((f) => !got.includes(f));
   const extra = got.filter((f) => !want.includes(f));
   if (missing.length !== 0 || extra.length !== 0) {

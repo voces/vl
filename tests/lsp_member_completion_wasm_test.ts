@@ -287,7 +287,7 @@ Deno.test({
   const util = [
     "export type Pair = { a: i32, b: i32 }",
     "export type Box = { inner: Pair }",
-    "export function mkBox(): Box { { inner: { a: 1, b: 2 } } }",
+    "export function mkBox(): Box { return { inner: { a: 1, b: 2 } } }",
     "",
   ].join("\n");
   // Repaired (dot stripped) source: `b` is a bare expression on line 2 (0-based).
