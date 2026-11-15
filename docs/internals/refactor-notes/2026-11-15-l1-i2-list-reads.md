@@ -22,7 +22,8 @@ moves.
     wrapper slot is found without being handed out.
 - **Member reads (`irMemberHook`)** are routed by the receiver's rep. Every one is a named miss
   in this slice: `list length`, `list member`, `string member`, `member <rep>`. A record's
-  `length` field never reaches a list arm.
+  `length` field never reaches a list arm. **`.length` is not built:** there is no `RListLen`
+  yet, and it is its own follow-up (below).
 - **Rule 8 (`ir_verify_bounds.vl`).** An `RListGet` must directly follow an `SBoundsCheck` over the
   same list and index in its body, and every check must be followed by its read.
   - The failing control is `irRefCorrupt(5)`, which drops every check, and the verifier must then
@@ -41,10 +42,14 @@ inside the loop. Once the function is lowered no row is live, so the decision ca
 again. The copy therefore refuses a read when any hoist row matches the binding, live or not. That
 can lose coverage, but it never admits a read legacy hoisted.
 
-The shared form lands later. Legacy will bank the arm it took per `Index` node (`idxPlainAt`),
-`emitIndexScalarList` will call it, the copy will delete, and the armed build will be quoted as
-byte-identical. Lane I's I1b uses the same bank-per-decision shape for the tail call. Until then no
-function holding an `RListGet` may be claimed (the IR lane's condition).
+The shared form lands later. It is a **pure** `listIdxRead(idxIx, fnIx, hoistRow)` that both
+sides call, and the copy here deletes.
+- **Legacy** passes `lhLive`'s row.
+- **The IR** passes the hoist row of its enclosing `SLoop`, taken from the same analysis.
+
+Neither side keeps a per-node bank. A recorded per-node decision exists only under the shadow, as
+a `context mismatch` cross-check between the two calls. Until the shared form lands, no function
+holding an `RListGet` may be claimed (the IR lane's condition).
 
 ## Gate
 
@@ -79,16 +84,24 @@ function holding an `RListGet` may be claimed (the IR lane's condition).
   and `vl_compile_cache_test.ts` pass. Rule 8's control trips. `lint-self.sh` is clean, the
   armed seed has 0 imports, and nothing is claimed.
 
-## Known mismatches, owned by lane I's I1b
+## Three I1 decisions, now named builder misses
 
-Each is an I1 decision that this slice only makes reachable from more functions:
+This slice made each of these reachable from more functions, where it showed as a dual-emit
+mismatch. Each is now a named miss in `ir_build.vl`, and lane I's I1b deletes it:
 
-1. **An instance's parameter read.** `identDeclOf` gives the template's `Param`, so the read
-   becomes an unslotted local (`unmapped slot`).
-2. **A never-returning callee.** Legacy writes `call; unreachable` (`callIsNever`), where the IR
-   writes `return_call`.
-3. **A reference global's `ref.as_non_null`** (`emitGlobalReadRecover`). This becomes
-   `userGlobalRead`'s `plainNonNull`.
+1. **`instance parameter read`.** `identDeclOf` gives the template's `Param`, whose variable
+   has no slot here (it was `unmapped slot`).
+2. **`never-returning callee`.** Legacy writes `call; unreachable` (`callIsNever`), where the IR
+   wrote `return_call`.
+3. **`reference global read (non-null)`.** Legacy may follow the read with `ref.as_non_null`
+   (`emitGlobalReadRecover`). This is conservative: every reference global read misses until
+   `userGlobalRead`'s `plainNonNull` lands.
+
+## Follow-ups
+
+- **After I1b:** the shared `listIdxRead` predicate, which deletes `listIdxPlainWhy`.
+- **`RListLen`:** `.length` on a list.
+- **The hoisted guard:** legacy's `lhLive` arm.
 
 ## Files
 

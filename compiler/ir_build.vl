@@ -23,6 +23,7 @@ import {
   RetStmt,
   Unary,
   WhileStmt,
+  callIsNever,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
@@ -317,6 +318,10 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if (dn is LetDecl || dn is Param) && localIndexOf(ibFnIx, ix) >= 0 {
     const v = irBDeclVar(d)
     if v < 0 { return irBMiss("local rep") }
+    // A parameter's variable always has a slot; an instance's read reaches the template's.
+    if dn is Param && ib.irVars[v].vSlot < 0 {
+      return irBMiss("instance parameter read")
+    }
     if ib.irVars[v].vRep != rep { return irBMiss("narrowed read") }
     const o: Opnd = { ov: v }
     return o
@@ -324,6 +329,8 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   const g = globalIndexOfSid(sidOfNode(ix))
   if dn is LetDecl && g >= 0 {
     if globalRep(g, d) != rep { return irBMiss("global read coercion") }
+    // Legacy may follow a reference global's read with `ref.as_non_null` (`emitGlobalReadRecover`).
+    if !repIsScalar(rep) { return irBMiss("reference global read (non-null)") }
     return irBLetTemp(b, { ggSym: g }, ix, rep)
   }
   irBMiss("read of " + n.identName)
@@ -482,6 +489,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
   }
   if n is Call {
+    if callIsNever(ix) { return irBMiss("never-returning callee") }
     const rhs = callRhs(b, n)
     if ibMiss != "" { return irBMiss("call") }
     return irBLetTemp(b, rhs, ix, rep)
@@ -674,6 +682,8 @@ function stmtIn(b: i32[], ix: i32) {
     return 0
   }
   if n is Call {
+    // Legacy writes `unreachable` after a call that never returns, and never tail-calls it.
+    if callIsNever(ix) { return skip("never-returning callee") }
     const rhs = callRhs(b, n)
     if ibMiss != "" { return 0 }
     irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
