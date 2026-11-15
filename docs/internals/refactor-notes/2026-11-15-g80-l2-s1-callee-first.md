@@ -38,7 +38,7 @@ Three variants, each against the master seed:
     `closures/fn-list-pop-get-through-hole-param.vl` as written. Both fail with "parameter is used
     as a map but nothing in the body pins its key or value". It also builds an invalid module for
     `closures/hole-fn-generic-map-stored-through-parameter.vl` with its declarations last. That
-    happens whenever either of its two map-storing callees is checked early (D16620).
+    happens whenever either of its two map-storing callees is checked early (D16630).
   - The map exception alone refuses `closures/written-let-seeded-generic-written-hole-param-at-two-types.vl`
     with its declarations last ("a generic function taken as a value reaches no call that fixes its
     type").
@@ -78,4 +78,4 @@ exit code.
 - `compiler/check_top_level.vl`: +57 −7. The predicate is 33 lines, its comment and the two
   predicates' comments the rest.
 - The seed grows 6,375,036 → 6,377,118 bytes (+0.03%). Two refreshes are byte-identical.
-- Three fixtures, one row (D16620), and the decl-order baseline: 57 → 16 lines.
+- Three fixtures, one row (D16630), and the decl-order baseline: 57 → 16 lines.

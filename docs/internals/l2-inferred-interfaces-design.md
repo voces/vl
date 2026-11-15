@@ -197,7 +197,8 @@ S1 retires it for every parameter except one whose calls decide it (`callDecides
 parameter used as a map, or one written into a binding. A call closes a map parameter's open key or
 value, and `holeDemandOk` refuses to pin a demand the body was already checked against, since the
 body's node types would be stale. A binding written a parameter holds a function set's id only when
-every call hands it a member (D15053). Both are the solver at the call, so that exemption goes at S3. A call cycle keeps source order and today's fixpoint in
+every call hands it a member (D15053). Both are the solver at the call, so that exemption goes at S3,
+with D16630 as its acceptance witness. A call cycle keeps source order and today's fixpoint in
 S1, so choice 3 (§9) does not gate it. Measured in `refactor-notes/2026-11-15-g80-l2-s1-callee-first.md`.
 
 ### 3.2 What a body check records
