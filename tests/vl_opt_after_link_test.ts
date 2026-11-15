@@ -82,6 +82,8 @@ const FLAVOUR_READERS = [
   "wasmEmit:emitMapProbe gOptimized",
   // A push grows through `__grow_<row>__` in a plain build and inline under `-O`.
   "wasmEmit:emitPushAppend gOptimized",
+  // A failing list-index guard reads the shared empty backing in a plain build; `-O` keeps its trap.
+  "wasmEmit:emitListIdxTrapOf gOptimized",
   // `--low-memory-unused` (only with `-O`) folds an address's constant into the memarg.
   "wasmEmit:emitCallCoreUserFn gLowMemUnused",
   "wasmEmit:emitLowMemAccessorCall gLowMemUnused",

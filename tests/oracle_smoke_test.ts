@@ -3,7 +3,7 @@
 // oracle has not learned, or an oracle edit that breaks the spec, fails here. The examples it
 // cannot run yet are listed in SPEC_SKIPS by their first line, so the count can only grow.
 
-import { distilledExpectations, interpret, judge, judgeRecording } from "../scripts/oracle/oracle.ts";
+import { distilledExpectations, interpret, judge, judgeRecording, knownRefusals } from "../scripts/oracle/oracle.ts";
 import { grid } from "../scripts/oracle/join-grid.ts";
 import { grid as rulingGrid } from "../scripts/oracle/ruling-grid.ts";
 
@@ -86,6 +86,10 @@ Deno.test("oracle: pinned regressions", () => {
     ["print(0x1_0000_0001 as f32)", "4294967296"],
     ["print(1.5 + 0xFFFFFFFF)", "4294967296.5"],
     ["print(0xFFFFFFFF)", "-1"], // an integer context keeps the pattern
+    // D3053 ruling (A): `as% i64` reads a radix literal, and a negation chain over one, at its value
+    ["print(0xFFFFFFFF as% i64)", "4294967295"],
+    ["print((-(-(-0xFFFFFFFF))) as% i64)", "-4294967295"],
+    ["print(0xFFFFFFFF as% i32)", "-1"],
     // ruling 4.2: a radix tree read at an f64 computes at 64 bits with integer division
     ["const y: f64 = 0xFFFFFFFF / 2\nprint(y)", "2147483647"],
     ["const c: f64 = 0x7FFFFFFF << 2\nprint(c)", "8589934588"],
@@ -106,6 +110,12 @@ Deno.test("oracle: pinned regressions", () => {
     ["print(9 << (7 % 0xFFFFFFFF))", "9"], // a shift count keeps its own reading (Q8)
     ["const c: boolean = false\nprint(if c { 4294967296 } else { 0xFFFFFFFF })", "4294967295"],
     ["const t: i64 = 5\nconst s: i32 = 4\nprint(min(t, 0xFFFFFFFF << s))", "5"],
+    // 4.3 with Q9: a float constant arm that adopts an f32 arm folds in f32 arithmetic
+    ["const f: f32 = 0.1\nconst c: boolean = false\nprint(if c { f } else { 16777217.0 % 1.5 })", "1"],
+    // Q8: a constant count of 32 to 63 makes the radix left i64, beside an i32 peer too
+    ["const v8: i32 = 5\nprint((-v8) * (0xFFFFFFFF >>> 51))", "0"],
+    // 4.1 / D1890: `as f32` rounds an integer constant once
+    ["print(9000000003 as f32)", "9000000512"],
   ];
   for (const [src, want] of pins) {
     const o = interpret(src + "\n");
@@ -145,4 +155,10 @@ Deno.test("oracle: a known wrong-value cell in a recording is not a disagreement
   } finally {
     Deno.removeSync(dir, { recursive: true });
   }
+});
+
+Deno.test("oracle: a known.txt row line files a refusal; a cell line does not", () => {
+  const got = JSON.stringify(knownRefusals(["ar_s1_0001", "D16412  monomorphize: unsupported argument type for `", "D1  x  y"]));
+  const want = JSON.stringify([{ row: "D16412", fragment: "monomorphize: unsupported argument type for `" }, { row: "D1", fragment: "x  y" }]);
+  if (got !== want) throw new Error(`want ${want}, got ${got}`);
 });

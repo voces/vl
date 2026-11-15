@@ -60,6 +60,7 @@ const WANT_GLOBALS = [
   "(mut i32) (i32.const 0)", // S: its initializer runs in the start function
   "(mut i32) (i32.const -4)", // H: a `let` is mutable
   "i32 (i32.const 9)", // P: exported, so its immutable cell stays
+  "(ref $", // the empty backing `F[0]`'s and `F[1]`'s failing guards read (a plain build)
 ];
 
 // The immediates `use` reads its folded consts as, in source order; the sign of -0 and both
@@ -77,8 +78,9 @@ const WANT_IMMEDIATES = [
   "(i64.const -9223372036854775808)",
   "(i32.const 9)",
 ];
-// `use` still loads F, H (twice) and S: the cells nothing folds.
-const WANT_USE_GLOBAL_GETS = 4;
+// `use` still loads F, H (twice) and S: the cells nothing folds. The fifth is `F[1]`'s failing
+// guard, which reads the shared empty backing in a plain build.
+const WANT_USE_GLOBAL_GETS = 5;
 
 Deno.test({
   name: "immutable const global: a scalar-literal module const is read as its immediate",
