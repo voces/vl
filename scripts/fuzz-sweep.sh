@@ -7,7 +7,7 @@
 #   multiobs  — --branching --multiobs, report-only
 #   declared  — --branching --multiobs --declared, report-only
 #   oracle    — scripts/oracle/fuzz.sh --gen all: arithmetic, data and rep programs run compiled and in the
-#               independent oracle; GATES on a disagreement scripts/oracle/known.txt does not list
+#               independent oracle; GATES on a disagreement or COMPILED-BAD cell known.txt does not list
 # Legs run sequentially (each already saturates the cores); per-leg out-dirs land under ONE
 # sweep dir with the same layout the workflow artifacted (seed_*.tsv / keep_* / summary.md).
 # Each unsound finding then gets a ready-to-file row draft, `keep_<seed>/case_N.row.md`
@@ -66,14 +66,15 @@ run_leg() {
   fi
 }
 
-# The oracle leg's new DISAGREE/UNSOUND cells (not in scripts/oracle/known.txt): each case copied
-# to <dir>/keep_new/ (the artifact uploads it) with the commands that regenerate and re-judge it.
+# The oracle leg's new DISAGREE, UNSOUND and COMPILED-BAD cells (not in scripts/oracle/known.txt):
+# each case copied to <dir>/keep_new/ (the artifact uploads it) with the commands that regenerate
+# and re-judge it.
 oracle_new_cells() {
   local dir="$1" cell verdict gen seed path
   mkdir -p "$dir/keep_new"
   echo; echo "oracle: new cells (case files in the artifact's oracle/keep_new/):"
-  grep -E '"verdict":"(DISAGREE|UNSOUND)"' "$dir/verdicts.jsonl" 2>/dev/null \
-    | sed -E 's/.*"cell":"([^"]*)".*"verdict":"([A-Z]+)".*/\1 \2/' | while read -r cell verdict; do
+  grep -E '"verdict":"(DISAGREE|UNSOUND|COMPILED-BAD)"' "$dir/verdicts.jsonl" 2>/dev/null \
+    | sed -E 's/.*"cell":"([^"]*)".*"verdict":"([A-Z-]+)".*/\1 \2/' | while read -r cell verdict; do
       grep -qxF "$cell" <(sed 's/#.*//; s/[[:space:]]*$//' scripts/oracle/known.txt) && continue
       cp "$dir/cases/$cell.vl" "$dir/keep_new/" 2>/dev/null
       seed="$(sed -E 's/^[a-z]+_s([0-9]+)_.*/\1/' <<< "$cell")"
