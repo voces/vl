@@ -5,6 +5,7 @@
 
 import { distilledExpectations, interpret, judge, judgeRecording } from "../scripts/oracle/oracle.ts";
 import { grid } from "../scripts/oracle/join-grid.ts";
+import { grid as rulingGrid } from "../scripts/oracle/ruling-grid.ts";
 
 type Example = { where: string; src: string; want: string[] };
 
@@ -111,6 +112,16 @@ Deno.test("oracle: the T3.6 join grid", () => {
   for (const c of grid()) {
     const o = interpret(c.src);
     if (o.kind !== "ok" || o.out.join("\n") !== c.want) throw new Error(`${c.name}: want ${c.want}, got ${o.kind} ${JSON.stringify(o.out)} ${o.msg}`);
+  }
+});
+
+// D16410 and D16293 (a): the oracle gives every case of the ruling grid what the ruling gives, and
+// a check refusal (`refused`) is the oracle's type fault.
+Deno.test("oracle: the D16410 and D16293 (a) ruling grid", () => {
+  for (const c of rulingGrid()) {
+    const o = interpret(c.src);
+    const got = o.kind === "fault" ? "refused" : o.kind === "ok" ? o.out.join("\n") : `${o.kind} ${o.msg}`;
+    if (got !== c.want) throw new Error(`${c.name}: want ${JSON.stringify(c.want)}, got ${JSON.stringify(got)}`);
   }
 });
 
