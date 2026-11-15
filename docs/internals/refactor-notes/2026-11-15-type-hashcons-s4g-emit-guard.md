@@ -30,6 +30,9 @@ in the same change.
 
 | reading | value |
 |---|---|
-| net compiler lines, this PR | see the PR |
-| net compiler lines, #8400 + this | see the PR |
-| identity | see the PR |
+| control | the guard fires: a scratch seed whose `inferRetPublish` passes no row makes its write visible, and `closures/alias-of-fn-param-litunion-arg.vl` then fails with the internal error |
+| seed | fixpoint |
+| identity | 19,780 of 19,780 files byte-identical against #8400's fixpoint (all of `tests/cases` outside `modules/`, `distilled/cells`, `distilled/named` and `compiler/entry.vl`) |
+| seed size | 6,363,419 → 6,363,650 bytes (+231) |
+| net compiler lines, this PR | +35 (`check_types.vl` +20: the window and its two functions; `emit_sections.vl` +15: the opens and the `emitFail`) |
+| net compiler lines, #8400 + this | **+107** (+72 and +35): an enforced invariant, not deletions. The estimate had been +82 |
