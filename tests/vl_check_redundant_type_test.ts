@@ -155,7 +155,7 @@ Deno.test({
       // dep has its own redundant annotation (`let z: i32 = 9`) — must NOT be touched.
       await Deno.writeTextFile(
         `${dir}/dep.vl`,
-        "export function f(): i32 {\n  let z: i32 = 9\n  z\n}\n",
+        "export function f(): i32 {\n  let z: i32 = 9\n  return z\n}\n",
       );
       await Deno.writeTextFile(
         `${dir}/entry.vl`,
@@ -209,11 +209,11 @@ Deno.test({
     // from a load-bearing local (`const xs: string[] = []`, whose bare-`[]` init keeps
     // its annotation) — the RETURN annotation is redundant but the LOCAL is not.
     const src =
-      "function f(a: i32, b: i32): i32 { b }\n" +
-      "function g(): string { \"hi\" }\n" +
-      "function ss(): string[] {\n  const xs: string[] = []\n  xs.push(\"a\")\n  xs\n}\n" +
-      "function widen(): i64 { 5 }\n" +
-      "function gen(self): i32 { self.x }\n" +
+      "function f(a: i32, b: i32): i32 { return b }\n" +
+      "function g(): string { return \"hi\" }\n" +
+      "function ss(): string[] {\n  const xs: string[] = []\n  xs.push(\"a\")\n  return xs\n}\n" +
+      "function widen(): i64 { return 5 }\n" +
+      "function gen(self): i32 { return self.x }\n" +
       "print(f(1, 2) + g().length + ss().length + widen() + gen({x: 1}))\n";
     const hits = redundantLines((await check(src)).err);
     if (hits.length !== 3) {
@@ -264,10 +264,10 @@ Deno.test({
     // the render goes through the user pathway (`tyToStrUser`), so the messages
     // must carry the SOURCE names.
     const util = "export type Pair = { a: i32, b: i32 }\n" +
-      "export function mk(): Pair { { a: 1, b: 2 } }\n";
+      "export function mk(): Pair { return { a: 1, b: 2 } }\n";
     const entry = 'import { mk } from "./util"\n' +
       "type P = { a: i32 }\n" +
-      "function mkP(): P { { a: 1 } }\n" +
+      "function mkP(): P { return { a: 1 } }\n" +
       "const q: P = mkP()\n" + // redundant: inferred `P` (was `P$m0`)
       "const p2 = mk()\n" +
       "const r = p2 ?? p2\n" + // dead ??: `Pair` is never null (was `Pair$m1`)

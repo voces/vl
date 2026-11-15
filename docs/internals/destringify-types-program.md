@@ -4523,7 +4523,7 @@ So the shipped predicate gates on an OPEN `<`:
 export function tyGtIsClose(name: string, i: i32, angOpen: i32) {
   if angOpen <= 0 { return false }        // no `<` open — this `>` closes nothing
   if i > 0 { return name[i - 1] != '=' }  // the arrow's tail, inside a generic argument
-  true
+  return true
 }
 ```
 
@@ -5385,7 +5385,7 @@ field name in the same module:
 export type v = i32
 export type Q = { q: string }
 export type AB = Q | { v: i32 }
-export function mk(): AB { const a: AB = { v: 7 }  a }
+export function mk(): AB { const a: AB = { v: 7 }  return a }
 ```
 → `cannot assign {v: i32} to 'a' of type {q: string} | {v: i32}` — two types that RENDER
 identically, because the diagnostic demangler strips the `$m1` the FIELD name grew. The `is`
@@ -7337,7 +7337,7 @@ binding tested through the **alias name** reaches the site with the scan false:
 
 ```vl
 type F = (i32) => i32
-function inc(a: i32): i32 { a + 1 }
+function inc(a: i32): i32 { return a + 1 }
 function go() {
   const h: ((i32) => i32) | null = inc
   if h is F { print(1) } else { print(0) }                 // master: emit REJECT
@@ -7507,7 +7507,7 @@ a node.**
    that is a LIVE INVALID-WASM miscompile.** Measured on `fd411bd`, unchanged by this slice:
    ```vl
    type F = (i32) => i32
-   function inc(a: i32): i32 { a + 1 }
+   function inc(a: i32): i32 { return a + 1 }
    const h: F | null = inc                              // the DECLARATION carries the alias
    if h is (i32) => i32 { print(1) } else { print(0) }
    ```
@@ -8273,7 +8273,7 @@ and `compiler/emit_sections.vl` (unowned by any of this cycle's three partitions
 
 ```vl
 type F = (i32) => i32
-function inc(x: i32) { x + 1 }
+function inc(x: i32) { return x + 1 }
 const h: F | null = inc
 print(1)
 ```
@@ -9592,8 +9592,8 @@ why the defect survived: the diagnostic prints the type the user expected.
 
 ```vl
 type F = (i32) => i32
-function inc(a: i32) { a + 1 }
-function mk(): F | null { inc }     // declared, NEVER CALLED
+function inc(a: i32) { return a + 1 }
+function mk(): F | null { return inc }     // declared, NEVER CALLED
 print(1)
 ```
 
@@ -17618,7 +17618,7 @@ top of the shared ladder, and the walk does not need to exist:
 export function tyGroupWrapsWhole(name: string) {
   const e = tyGroupEndIndex(name, 1)
   if e < 0 { return true }
-  e == name.length - 1
+  return e == name.length - 1
 }
 ```
 
@@ -18657,7 +18657,7 @@ function tyPrintsAsRef(pt: i32, depth: i32) {
     }
     return false
   }
-  false
+  return false
 }
 ```
 
@@ -18909,7 +18909,7 @@ this slice's file) with a marker and a blank line so it cannot read as `internSh
    // tests/cases/closures/print-closure-rejected.vl
    // @check
    // @error print of (i32) -> i32 is type-valid but not yet supported by codegen
-   function id(x: i32): i32 { x }
+   function id(x: i32): i32 { return x }
    const g: (i32) => i32 = id
    print(g)
    ```
@@ -19233,7 +19233,7 @@ as a clean bill of health.
    export function nameIsWholeSpanShape(name: string) {
      if name.length < 2 { return false }
      if name[0] != '{' || name[1] == '[' || name[name.length - 1] != '}' { return false }
-     tyGroupWrapsWhole(name)
+     return tyGroupWrapsWhole(name)
    }
    ```
    **0 disagreements over 105,652 invocations** (10,514 corpus + 95,138 fuzz), with **299
@@ -19821,7 +19821,7 @@ export function nameIsWholeSpanShape(name: string) {
   if name[0] != '{' || name[1] == '[' || name[name.length - 1] != '}' {
     return false
   }
-  tyGroupWrapsWhole(name)
+  return tyGroupWrapsWhole(name)
 }
 ```
 
@@ -20608,7 +20608,7 @@ The 44-program census turned up a defect the capture error had been **hiding** i
 positions. It reproduces byte-identically on master and on this PR, so it is not this slice's:
 
 ```vl
-function w(): f32 { __load_f32__(0) }   // → Invalid input WebAssembly code: type mismatch: expected i32, found f32
+function w(): f32 { return __load_f32__(0) }   // → Invalid input WebAssembly code: type mismatch: expected i32, found f32
 const v: f32 = __load_f32__(0)          // → same
 ```
 
@@ -21484,7 +21484,7 @@ what the defect was**, and finding that out is most of the work below.
 **1. A call ARGUMENT inherited the enclosing f32 context → SILENT INVALID WASM at 8 positions.**
 
 ```vl
-function g(v: i32): f32 { 1.5 }
+function g(v: i32): f32 { return 1.5 }
 const r: f32 = g(1)          // f32.const 1 ; call $g   where $g is (param i32)
 ```
 
@@ -32299,7 +32299,7 @@ because the code reads like it must disagree.*
 function arenaEmitName(tyIx: i32): string {
   const nom = tyToNominalName(tyIx)
   if nom == "" { return "" }
-  canonEmitName(nom)
+  return canonEmitName(nom)
 }
 ```
 
@@ -32809,7 +32809,7 @@ the two `$fnsig` producers on opposite sides of every closure:
 
 ```vl
 type Z = 0 | 1
-function mk(x: i32): Z { 1 }                                   // annotation canons -> i32
+function mk(x: i32): Z { return 1 }                                   // annotation canons -> i32
 function run(m: (i32) => Z): i32 { const v = m(1); return v }   // annotation stayed  -> Z
 print(run(mk))    // master: INVALID MODULE
                   // type mismatch: expected i32, found (ref $type)
@@ -44718,7 +44718,7 @@ union of function types that COLLAPSES to one member leaves a bare `TyFunc` in t
 at depth 1. The name scan says no; the arena says yes.
 
 ```vl
-function apply(f: ((i32) => i32) | ((i32) => i32), x: i32): i32 { f(x) }
+function apply(f: ((i32) => i32) | ((i32) => i32), x: i32): i32 { return f(x) }
 ```
 
 251 bytes before, 270 after: the mono pass now runs on a class where it was skipped entirely —
@@ -44905,7 +44905,7 @@ different kind of defect from the three it was filed with — which is the findi
 ### 1. THE TWO NULLABLE SLOTS
 
 ```vl
-function pick(b: boolean, r: R): string | null { if b { return r.f } null }  // sink 2
+function pick(b: boolean, r: R): string | null { if b { return r.f } return null }  // sink 2
 const xs: (string | null)[] = []; xs.push(r.f)                               // sink 3
 ```
 
@@ -49260,7 +49260,7 @@ the string by concatenating with `"|"`.
 function annSpelledUnion(ix: i32): boolean {
   const root = annTsOf(ix)
   if root < 0 { return false }
-  tsKind[root] == TS_UNION
+  return tsKind[root] == TS_UNION
 }
 ```
 
@@ -56347,7 +56347,7 @@ function internCloSigOfAtomTy(atom: string, kIn: string) {
   if k == "" { k = unionArmSigKey(atom) }   // unhinted callers unchanged
   if k == "" { return 0 }
   if nulCloMixedUnionUnregistered(atom) { return 0 }   // still runs, always
-  internCloSigKey(k, -1)
+  return internCloSigKey(k, -1)
 }
 ```
 
