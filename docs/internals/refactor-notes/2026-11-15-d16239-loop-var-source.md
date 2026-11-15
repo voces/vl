@@ -18,9 +18,17 @@ type of it (`elabNodeTy(u, k)`, as `eplStepOfRecv` read). It returns:
   for a map walk's second variable or a `.values()` element;
 - -1 for a list walk's index, a map walk's key, or `.keys()`.
 
-The write scan's three loop sites read it through `cwForInRecvOf`. The slot store's ITER arm calls
-it once per variable, and its own step choice is deleted. `eplStepOfRecv` stays for `Index`, `.get`
-and the other projections.
+It has five readers, each of which had its own copy of the choice:
+
+- **The write scan's three loop sites,** through `cwForInRecvOf`.
+- **The slot store's ITER arm,** once per variable. Its own step choice is deleted.
+- **The delivery climb** (`elabSlotClimb`'s ITER arm and its receiver step, through
+  `elabLoopViewDeliveries`). It reaches a loop from a receiver whose view (`.values()`) the loop
+  walks, and nothing outside the classifier names the method.
+- **`monoRetypeMapReads`,** which typed a loop's value variable at a pinned map value by choosing
+  `fiDecl1` or `fiDecl2` itself.
+
+`eplStepOfRecv` stays for `Index`, `.get` and the other projections.
 
 This also corrects one-variable map walks. In `for x in m`, `x` is the key, and both sides had read
 it as the map's value.
@@ -29,5 +37,6 @@ Left alone, on purpose: `eplPlaceOf`'s projection list (`pop/get/at/find/shift`)
 (`slice/filter/reverse/concat`). They describe reads, not loop iterables. They are the next place a
 second answer lives.
 
-The phase-state surface of emit_elab.vl rises by one, 337 to 338: the classifier's import, which
-replaces the slot store's re-derivation. The baseline is re-written in this PR.
+The phase-state surface rises by one each in emit_elab.vl and emit_mono.vl: the classifier's import,
+which replaces each module's own re-derivation. The baseline is re-written in this PR. emit_mono's
+function count is unchanged.
