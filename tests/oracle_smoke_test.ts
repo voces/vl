@@ -64,6 +64,8 @@ Deno.test("oracle: verdicts", () => {
     [judge({ kind: "fault", out: [], msg: "x" }, { cls: "runs", out: [] }, null).v, "UNSOUND"],
     [judge({ kind: "fault", out: [], msg: "x" }, { cls: "rejected", out: null }, null).v, "AGREE"],
     [judge(ok, { cls: "invalid", out: null }, null).v, "COMPILED-BAD"],
+    [judge(ok, { cls: "rejected", out: null }, null).v, "REFUSED"],
+    [judge({ kind: "trap", out: [], msg: "x" }, { cls: "rejected", out: null }, null).v, "REFUSED"],
     [judge({ kind: "unsupported", out: [], msg: "x" }, { cls: "runs", out: [] }, null).v, "SKIP"],
   ];
   for (const [got, want] of cases) if (got !== want) throw new Error(`verdict: want ${want}, got ${got}`);
