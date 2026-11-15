@@ -33,3 +33,7 @@ builds two record rows.
   rewritten. Master's baseline is behind the master seed on 11 `dord*` cells, the same on both
   seeds.
 - `check-filed-witnesses --strict`: all as filed.
+- 445 templates (hole, inferred, record, empty): 0 runs→not-runs. 35 cells move SILENT→runs: 34
+  in `hole-param-record-empty-list-field` and `argument` (un-annotated) of
+  `empty-list-shared-record`, the cell D16365 was found in.
+- `decl-order-ab.vl` on the merged tree: master's baseline, unchanged.
