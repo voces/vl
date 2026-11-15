@@ -40,3 +40,72 @@ Lane L froze D4089 to these stages (via the coordinator, 2026-11-14).
 | [D4089](../inventory/D4089.md) | open. Since lane L's partial-fit check the `is` test runs, but narrowing to `B` stays refused. | After `r is B` over `r: A \| C`, a read of `r.x` at `B` must read a value stored as arm `A`. The narrowed read needs a checker-recorded fact, "`r` is stored as arm `A`", in place of `emitVariantCoerce`/`exprVariantIndex`, which know arms only. 1b records the arm status from the checker (the `RRecord` arm of the storage type). Stage 2 is the first stage where emit reads a node's rep from that fact, at every narrowed-read site. | the arm fact in 1b; the reads in 2 |
 
 The grading list is the row's: the repro; `r: A | C | null`; and the `match` spelling (D4087).
+
+## Stage 1b: what it did, measured
+
+### 1. A record's arm status comes from the checker and elaboration alone
+
+**Before.** `repTyIsVariant` answered "variant" when the checker's member set held the type, or
+when its canonical shape carried any of three bits (`rvsAdd`):
+- bit 1, the checker's members (`cVariantMemberTyIxs`);
+- bit 2, the emitter's own variant rows (`uVarTyIx`, minted by `mintVariantRows`);
+- bit 4, elaboration's union-arm types (`elabInstUnionArmTys`, primed before emit).
+
+Bit 2 made a record's rep depend on emit-time registration. Every bit-2 registration also
+dropped the tree.
+
+**Measured first.** An armed probe tallied, per record type, whether the arm answer held without
+bit 2.
+- On the self-build, all 175 arm types were backed by bit 1 or bit 4. All 67 `variantBit`
+  rebuilds were bit 2. Bit 2 dropped the tree without ever changing an answer.
+- On the corpus, 58 programs had an arm answer on bit 2 alone. These were record literals stored
+  as arms:
+  - a union nested inside a list, map or field type (`d361e*`, `d223e*`, with arms such as
+    `{r: {c2: i32}}`), which elaboration's node scan did not descend into;
+  - a union boxing a record beside a non-record (`d2781_*`: `{a: string | i32} | string`;
+    `fz_a_*`: a record beside a function), which the scan's two-records rule excluded.
+
+**The change.**
+- Elaboration's prime walks every node type to depth 4 (`elabBoxedUnionsInto`) and counts a
+  value box holding a record beside any other member (`elabBoxesARecord`).
+- `repTyIsVariant` reads bits 1 and 4 only, and a bit-2 registration no longer drops the tree.
+- `mintVariantRows` still keeps its rows, which `repVariantShapeRowOf` reads for which row,
+  not whether it is an arm.
+
+**Result.**
+- Self-build: byte-identical (fixpoint). Rebuilds fall from 70 to 12. The 9 remaining variant
+  drops are bit 4, elaboration's pre-emit set applied lazily.
+- Corpus, all 12,013 cells built by the seed before and after: 0 exit codes changed and 0 module
+  bytes changed. The probe finds 0 emitter-only arms.
+
+What remains on the variant axis during emit:
+- The bit-1 and bit-4 drops, which are pre-emit facts applied lazily when the bits are first read.
+- `rvsSync`'s whole reset (the `variants` cause, 18,657 corpus rebuilds after the `passes` phase),
+  keyed on the pass and `uVarTyIxResets`.
+
+With bit 2 no tree input, a reset keyed on `uVarTyIx` no longer needs to drop the tree. That is
+the next cut, and stage 2's gate. It is left out of this PR because its keying also serves
+`repVariantShapeRowOf`'s rows, and splitting the two needs its own measurement.
+
+### 2. `never` is a node of its own
+
+`never` builds an `RNoValue` node in place of the `unsup` leaf `prim:never`. Every projection
+answers for it as it answered for `unsup`, so no flat answer moves. The shadow now reports the
+three `d947` cells' `std:test` results as `noValue`, not `uncovered`.
+
+### Shadow, after 1b (corpus, 8,662 programs reaching emit)
+
+- 185,243 entries agree, and 6 results read `noValue`.
+- The 6 `variant tree=struct` locals from the stage-1a triage remain. They are a literal's
+  recorded type, stage 2's input.
+- New since stage 0, and present with the pre-1b seed too: cells master added in the meantime,
+  all already-filed defects.
+  - `d16364_ies_two_instances_unann` (invalid wasm) reads `f64list tree=list`, the very list type
+    the validator rejects.
+  - `dord037` (invalid wasm in `mkStruct`) reads `uncovered map` for that result, where the flat
+    `i32` default meets a map ref.
+  - `dord032` (wrong value) reads `struct tree=variant` on two parameters.
+  - `dord003` and `dord029` (traps) read `i32 tree=closure` results.
+
+  The shadow localizes these defects to a kind disagreement. They are stage 2's to grade, where
+  the tree's answer becomes the one emitted.
