@@ -25,7 +25,20 @@ Owner ruling L3, option A (a record-typed parameter is specialised per concrete 
 
 ## Measured
 
-MEASURED_TABLE
+Each figure is master's fixpoint (`3d526470a`) against this branch's fixpoint (both verified):
+
+| reading | value |
+| --- | --- |
+| `record-param-width-before` | 24 of 30 graded run (master 21): `ufcs` and `returned_inferred`, annotated face; 0 runs → not-runs, 0 silent |
+| `record-param-width-between` | the same 24 of 30 |
+| `record-param-width-after` | 30 of 30, unchanged |
+| L2 self-compile guest fuel | 86,025,202,983 → 86,052,137,950 (+0.03%) |
+| seed | 6,873,417 → 6,875,622 bytes (+2,205) |
+| compiler functions rewritten | none: the compiler passes no wider non-prefix row |
+| `regress.vl` | 0 runs → not-runs, 0 → silent, 0 other movement; the 8 new cells graded |
+| capability probes | 238 of 240, as on master |
+| `check-filed-witnesses --strict` | 5057 as filed, 0 MOVED |
+| late demands | 4, the baseline |
 
 ## What eager desugaring showed (not shipped)
 
@@ -62,4 +75,4 @@ pins them: with the candidate test disabled, `regress.vl` blocks on 3 of them (`
 
 ## Size
 
-NET_LINES net compiler lines; pin-helper delta 0 (`emit_mono.vl` untouched).
+91 net compiler lines; pin-helper delta 0 (`emit_mono.vl` untouched).
