@@ -9596,7 +9596,8 @@ parenthesised — is re-typed only by:
   map value or other stored place, a nullable number slot (its number), an annotated return, a
   list index (`i32`), a map key;
 * STORES into it (`s = e`, `s += e`), where `e`'s type counts, joined with the literal's own type
-  (so storing an `f32` into `let x = 0.5` keeps `f64`); a stored literal, whole or in the stored
+  (a float literal adopts the float stored into it: storing an `f32` into `let x = 0.5` makes it
+  `f32`, D16490); a stored literal, whole or in the stored
   expression (`y += 3000000000`), bounds it to the types that hold that literal (`y = 3000000000`
   needs a 64-bit type; `y = 0xFFFFFFFF` is `-1` at `i32` and 4294967295 at `i64`, the width the
   other uses choose);
@@ -9624,8 +9625,10 @@ Rules:
 * **A float stored into an integer literal `let` joins it** (owner ruling, 2026-11-15, reversing
   the clause above for stores: ruling 4.3's one join rule applied to a literal `let`'s stores). A
   store of a typed float that holds the literal exactly makes the binding that float — `let t =
-  0; t = t + 1.5` is `f64`, `t = f` with `f: f32` is `f32`; a stored float literal makes it
-  `f64`. A float that does not hold the literal exactly keeps the refusal (`let t = 16777217; t
+  0; t = t + 1.5` is `f64`, `t = f` with `f: f32` is `f32`. A float literal stored, whole or
+  beside the binding (`t = t - 0.1`), adopts a typed float stored there and makes it `f64` only
+  where none is (`t = f; t = t - 0.1` is `f32`, D16490). A float that does not hold the literal
+  exactly keeps the refusal (`let t = 16777217; t
   = f`). In an un-annotated generic, a store of the parameter's hole (`t = t + xs[i]`, `for x in
   xs { t = t + x }`) types the binding as that hole, so each call's pin decides: `sum([1, 2])` is
   `i32`, `sum([1.5, 2.5])` is `f64` (D16293). Integer-only stores keep the integer widening.
@@ -10817,6 +10820,9 @@ the default set is versioned, or if agents keep retrying imports after the recei
 
 ## Exported signatures are not frozen at the module boundary (owner ruling, incremental-compilation Q4 (A), 2026-10-17)
 
+**Superseded 2026-11-15** by "Exports are frozen at the module boundary" below: an export's
+interface is its inferred signature, not its body. The no-annotation clause stands.
+
 **The rule.** An exported function may leave its parameters and return unannotated, as any
 function may. `export function twice(x) { x * 2 }` stays a generic whose body is its
 interface. Nothing requires an annotation on an export so that a build can be faster.
@@ -10830,7 +10836,8 @@ return, and an edit to one re-checks its importers
 
 ## Record adoption crosses module boundaries (owner ruling, incremental-compilation Q1 (B), 2026-10-07)
 
-**Superseded 2026-11-14** by "An exported binding takes its type from its own module" below.
+**Superseded 2026-11-14** by "An exported binding takes its type from its own module" below, and
+for every export by "Exports are frozen at the module boundary" (2026-11-15).
 
 **The rule.** An exported record binding without an annotation takes the field types its
 importers deliver it to, as it would in one file. `export let pt = { x: 1, y: 2 }` passed by
@@ -12166,6 +12173,12 @@ exactly; a float literal at `f32` as `let x: f32 = 0.1` does), and otherwise kee
 the join widens. `if c { 5 } else { f }` with `f: f32` is `f32`, `[5, f]` is `f32[]`, and
 `if c { 9000000000 } else { f }` is `i64 | f32`.
 
+The join decides a literal's context before its destination does (coordinator's reading of 4.3,
+2026-11-15): a radix tail beside a typed `i32` arm is the `i32` pattern, and only then is the join
+widened, so `(if c { 0xFFFFFFFF } else { v }) * k` with `v: i32`, `k: i64` is -1, as it is with
+the join bound first. A join of literals alone, or with a 64-bit arm, still reads a radix tail at
+its destination's width (D2617), and a pattern wider than 32 bits still widens the join.
+
 ## An empty container's element type is fixed by its annotation (2026-11-15) — spec 4.4, refines D16047
 
 **Ruled by the owner 2026-11-15.** `is` on an empty list, map or set decides by the type it was
@@ -12232,3 +12245,30 @@ binding may now become a float.
 as the same cast written at the instance's types. A pin whose operand holds no member the target
 could take is a miss, not a refusal: `as?` is `null`, `as!` traps, and a bare `as` propagates.
 D16323 closed this way (`size<string>("ab")` prints `0`).
+
+## Exports are frozen at the module boundary (2026-11-15) — engineering review 2026-11, L2
+
+**Ruled by the owner 2026-11-15: yes.** From the review's L2: "freeze exports at the module
+boundary: an export's types and layouts are inferred from its own module alone, which reverses the
+ruling behind the `half()` result in §3.1. No annotation is required of the user; `vl` can print
+the inferred signature."
+
+- An exported function's interface is the signature inferred from its own module. An importer's call
+  is checked against that signature and reported at the call site. It never re-checks or re-types the
+  exporter's body.
+- This reverses "Exported signatures are not frozen at the module boundary" (Q4 (A), 2026-10-17),
+  where an exported generic's body was its interface. Q4's other half stands: nothing requires an
+  annotation on an export.
+- It extends "An exported binding takes its type from its own module" (2026-11-14), which ruled the
+  same for exported bindings and reversed "Record adoption crosses module boundaries" (Q1 (B)), the
+  ruling behind `half()`. So `half()` prints `0` whether or not a program also passes `origin`
+  to a `{ x: f64, y: f64 }` parameter.
+
+```vl
+// lib.vl
+export let origin = { x: 1, y: 2 }
+export function half() { origin.x / 2 }   // () => i32, from lib.vl alone
+```
+
+Why: a module then has a meaning on its own, the precondition for separate compilation, a
+query-based LSP and a specifiable inference algorithm (engineering-review-2026-11.md §6, L2).

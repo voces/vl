@@ -291,6 +291,7 @@ import {
   cexRewrite,
   cexTreeShape,
   lbiIsInlined,
+  readsLitConst,
 } from "./check_num_lit_state"
 import {
   cexFitsAt,
@@ -301,6 +302,7 @@ import {
   cexShownFrom,
   dstIntWidth,
   intLitIsNegated,
+  litTreeOps,
   numLitOwnTy,
   radixLeafAmong,
 } from "./check_num_lits"
@@ -309,13 +311,10 @@ import { parenPeelIx } from "./check_places"
 import { rcwMembersOf } from "./check_rcw"
 import { recAdRecOf } from "./check_rec_adopt"
 import {
-  recAdDecl,
-  recAdForced,
-  recAdForcedDecl,
-  recAdNoAdopt,
+  recAdPass,
   recAdPinInit,
+  recAdProg,
   recAdRaising,
-  recAdWidth,
 } from "./check_rec_adopt_rows"
 import {
   recBindOrigin,
@@ -616,7 +615,6 @@ import {
 } from "./check_write_scan"
 import {
   Cex,
-  cexAtF32,
   cexDecText,
   cexLexeme,
   cexNeg,
@@ -925,17 +923,6 @@ export function cexTryFold(ix: i32): i32 {
   if cexNotTree.length > 0 && (cexNotTree[ix] ?? false) { return 0 }
   if !cexRootShape(ix) || cexTreeShape(ix, 0) != 1 { return 0 }
   cexFoldAt(ix)
-}
-
-// `cexTryFold` for the initializer `init` of a binding annotated `f32`: the tree folds where it
-// stands in `f32` arithmetic, as it runs there (E9.1).
-export function cexTryFoldF32(init: i32): i32 {
-  const p = parenPeelIx(init)
-  if p < 0 { return 0 }
-  cexAtF32(true)
-  const r = cexTryFold(p)
-  cexAtF32(false)
-  r
 }
 
 // `cexTryFold` for the operator `e` at `ix`, whose operator the caller has already admitted.
@@ -1384,6 +1371,9 @@ function radixLitAdoptTails(src: i32, dstTy: i32) {
     }
     si = si + 1
   }
+  // A typed 32-bit tail decides the join, whose literals adopt it before the join meets its
+  // destination (ruling 4.3): `if c { 0xFFFFFFFF } else { v: i32 }` is -1 at an `i64`.
+  if all32 && radixJoinTyped32(leaves) { return 0 }
   let reTy = -1
   let rc = 0
   const fpn = primNameOf(nonNullTy(dstTy))
@@ -1413,6 +1403,21 @@ function radixLitAdoptTails(src: i32, dstTy: i32) {
     tailParensSync(src)
   }
   rc
+}
+
+// Whether a tail among `leaves` is a value of a 32-bit integer type, not an integer literal, an
+// operator tree over them or a read of a literal `const`.
+function radixJoinTyped32(leaves: i32[]): boolean {
+  for lf in leaves {
+    if (
+      litTreeOps(lf, 8) < 0
+      && !readsLitConst(lf)
+      && dstIntWidth(nodeTyOf(lf), 3) == 32
+    ) {
+      return true
+    }
+  }
+  false
 }
 
 // The f32 a value `match` at `ix` typed `matchTy` takes when its arms are an f32 value and
@@ -5585,7 +5590,7 @@ export function recAdoptUnionList(
   const lit = parenPeelIx(letInitAt(decl))
   const was = if lit < nodeRepTyIx.length { nodeRepTyIx[lit] } else { -1 }
   const wasEl = if was >= 0 { tyArrayElemIx(was) } else { -1 }
-  if !recAdNoAdopt.has(decl) && (wasEl < 0 || !(tyAt(wasEl) is TyUnion)) {
+  if !recAdProg.noAdopt.has(decl) && (wasEl < 0 || !(tyAt(wasEl) is TyUnion)) {
     adoptLitAt(lit, recAdLandingList(nonNulTyOf(dstTy)))
   }
   true
@@ -6139,7 +6144,7 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       )
     }
     recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), false, p)
-    if recAdNoAdopt.has(decl) {
+    if recAdProg.noAdopt.has(decl) {
       recBuildArmDropRefuse(letInitAt(decl), nonNulTyOf(dstTy), 6)
     }
     return 0
@@ -6524,15 +6529,15 @@ export function recAdForce(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   ) {
     return false
   }
-  const before = recAdDecl.length
+  const before = recAdPass.decl.length
   recAdoptNote(srcExpr, srcTy, dstTy)
   let any = false
   let i = before
-  while i < recAdDecl.length {
-    if recAdWidth.has(recAdDecl[i]) {
+  while i < recAdPass.decl.length {
+    if recAdProg.width.has(recAdPass.decl[i]) {
       any = true
-      recAdForced.push(p)
-      recAdForcedDecl.push(recAdDecl[i])
+      recAdPass.forced.push(p)
+      recAdPass.forcedDecl.push(recAdPass.decl[i])
     }
     i = i + 1
   }
@@ -7983,6 +7988,45 @@ export function litJoinOf(ix: i32, join: i32, arms: i32[], tys: i32[]): i32 {
   }
   if nul { return mkNullableTy(jw) }
   jw
+}
+
+// The record type every held arm of a join holds, when each fresh record-literal arm fits it,
+// or -1: a fresh literal adapts to its held sibling, as a numeric literal does (owner ruling
+// 4.3), so the held record is never asked to fit the literal's widened fields. A join over a
+// type parameter is left to its re-check at each pin.
+export function heldRecJoinOf(join: i32, arms: i32[], tys: i32[]): i32 {
+  if join < 0 || join >= T.tys.length || !(tyAt(join) is TyObj) { return -1 }
+  // The shape first, which most joins fail: one held arm and one fresh record literal.
+  let held = -1
+  let fresh = false
+  let i = 0
+  while i < arms.length {
+    const t = tys[i]
+    if t < 0 || t >= T.tys.length || !(tyAt(t) is TyObj) { return -1 }
+    const tail = joinArmTail(arms[i])
+    if tail >= 0 && nodeAt(tail) is ObjLit { fresh = true }
+    else if held < 0 { held = t }
+    i = i + 1
+  }
+  if held < 0 || !fresh || held == join { return -1 }
+  i = 0
+  while i < arms.length {
+    const t = tys[i]
+    if tyHasTyVar(t) { return -1 }
+    const tail = joinArmTail(arms[i])
+    const lit = tail >= 0 && nodeAt(tail) is ObjLit
+    if !lit && t != held && !tyEq(held, t) { return -1 }
+    i = i + 1
+  }
+  if tyEq(held, join) { return -1 }
+  i = 0
+  while i < arms.length {
+    const tail = joinArmTail(arms[i])
+    const lit = tail >= 0 && nodeAt(tail) is ObjLit
+    if lit && !joinArmFits(arms[i], tys[i], held) { return -1 }
+    i = i + 1
+  }
+  held
 }
 
 // Delivers the tail of an arm a join adopted `jw` for, when its own type does not already fit,
@@ -10019,7 +10063,7 @@ function recContainerDeliver(
   if e is Ident {
     const d = recFreshMapDeclOf(p)
     if d >= 0 {
-      if recAdNoAdopt.has(d) { return false }
+      if recAdProg.noAdopt.has(d) { return false }
       if apply { recMapDeclDeliver(d, p, dst) }
       return true
     }

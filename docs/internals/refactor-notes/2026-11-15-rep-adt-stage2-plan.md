@@ -165,3 +165,114 @@ Net compiler lines: +7. Pin-helper delta: 0.
 
 **What 2a has left.** 258 bare open queries in 157 programs, a fraction of the start. 2b handles
 `never` (559), `nul:unclassified` (5) and the one list hole, after which 2c's deletions can begin.
+
+## 2b, measured: every uncovered answer is a "no value"
+
+A scratch seed counted every `rdCovered` read, by site and by the reason the descriptor was
+uncovered, on all 12,037 corpus cells. The instrument is not committed.
+
+| uncovered answer | queries | what it is | what the consumer does |
+|---|---|---|---|
+| no node, no name | 620,851 | index -1, a name that resolves to nothing, a node with no recorded type | answers "no" |
+| `never` | 1,050 in 49 programs | an expression typed `never`, such as `fail(…)` | answers "no": not a string, not an atom, no list kind |
+| an open type | 341 | bare `T` (281), `T \| null` (26), `T \| string` (19), `_[]` (15) | 2a's class |
+
+So the tree answers every closed type emit asks about. The rows 2b planned to answer are each
+of them an open type, one level down:
+- `nul:unclassified` is `T | null`;
+- `union:open` is `T | string`;
+- `list:hole` is `_[]` at a generic call.
+
+The three `nul:unclassified` cells with no generic of their own (`d16377`, `d16290`, `d16403`)
+ask for the `$fnsig` key of a function whose nullable record parameter the checker gives an
+implicit type parameter, bounded by the record. Their cells run correctly. No checker refusal is
+owed, and no row is filed.
+
+The `never` answer is also correct. Every consumer reads it as "no". `readCallStoreKind`'s
+fallback asks `callIsNulNone` and `exprUnionCall`, which are also "no" for a call with no value.
+
+**`dord032`.** Lane H's layout-id shadow merges list types whose element records differ only in
+`rrVariant`. Two probes were ablated:
+- a declared `P[]` concatenated with a literal list, read through `P | i32`;
+- a generic `T | i32` instanced at `P` and at the literal `{x}`, mixed in one list.
+
+Both print the right values, so no mechanism reproduces.
+
+## 2c, step 1: the `null` kind replaces `rdCovered`
+
+`RepDesc.rdKind` is `VKind | null`, and `null` is the answer for no value. `rdCovered` and the
+uncovered descriptor's `i32` default are deleted. `repUncovered` folds into `repDescNone`.
+- **Mechanical rewrite, exact by construction:** `rdCovered == 1` becomes `rdKind != null`, and
+  `rdCovered == 0` becomes `rdKind == null`. A guard followed by a test the `null` kind already
+  fails is dropped.
+- **`repSigKindOfTy`'s tree fallback is deleted.** It asked the tree the question `repOfTy` had
+  just answered `null`.
+- **Unguarded reads of the default.** A second scratch counter covered all 153 `rdKind` reads.
+  An uncovered descriptor reached eight of them, and two read its `i32`. Each now answers `null`
+  explicitly, as the `i32` did:
+  - `emit_collect.vl`'s join-box test boxes a nullable whose inner has no rep;
+  - `mvValKindOfTy` rides the mono map.
+
+  The other six compare against a kind `null` also fails.
+- **Where the type checker refused a `VKind | null`,** the site either cannot see `null` or says
+  what `null` means there:
+  - a binding's cell claim implies a kind;
+  - the numeric prim types always have one;
+  - a field-storage `match` gains a `null` arm.
+
+**Measured.** The seed built from master `6f020f1a` is compared with this one.
+
+| | master | this change |
+|---|---|---|
+| corpus exit codes / module bytes changed (12,037 cells) | | **0 / 0** |
+| self-build | | fixpoint; the master seed's first refresh equals the second |
+| L2 self-compile fuel | 87,521,907,129 | 87,502,061,740 (−0.023%) |
+| `plumb-shape-cost` main / tail fuel | 9,108,706,790 / 6,598,313,949 | 9,106,968,768 / 6,597,111,223 (−0.02%) |
+| peak live heap | 120,085 / 84,109 KiB | unchanged |
+| seed size | 6,388,478 | 6,388,307 (−171 bytes) |
+
+Net compiler lines: +4. Pin-helper delta: 0. Binding a type-checked `null` costs about the lines
+the default saved.
+
+**What 2c has left: the fallback arms.** A site of the form `if d.rdKind != null { return d.rdKind }`
+followed by more code still has an arm behind it. Uncovered answers are only no value, so each
+arm runs only for no node, `never` or an open type. Deleting one changes behaviour on exactly
+those inputs. Each deletion is graded by the per-site counter, site by site.
+
+## 2c, step 2: the fallback arms
+
+Read site by site, the 44 guards on the `null` kind are almost all type narrowing: the callee
+takes a `VKind`, so the guard is not an arm. Only two branches compute an answer the `null` kind
+does not give. Both are field-code fallbacks for a field whose storage type is recorded but has no
+rep (a hole or a type parameter):
+- `readCellKind`, which reads `fieldCodeCellKind`;
+- `sFieldStoreKind`, which reads `fieldCodeVKind`.
+
+Both now answer `null` there. The field code still answers where no storage type is recorded.
+
+Six readers that restated `rdKind` behind a `null` test now return it directly:
+- `fnSigKindOfTy`, `fnRetIsRecordRow`, `readLoopElemRepKind` and `annRepKindOf`;
+- the shadow's report word;
+- `coveredKindOfTy`, which is deleted and inlined at its one caller.
+
+Two candidates are not arms, because they also run for a covered type, so they stay:
+- `tyListRepKind`'s ref-list row lookup;
+- `exprListRep`'s `tyListRep`.
+
+**Measured.** Both seeds are fixpoints of master `258ea049`, one with step 2 and one without.
+
+| | master | step 2 |
+|---|---|---|
+| corpus exit codes / module bytes changed (12,037 cells) | | **0 / 0** |
+| L2 self-compile fuel | 88,169,899,820 | 88,158,721,010 (−0.013%) |
+| `plumb-shape-cost` main / tail fuel | 9,120,204,666 / 6,606,487,334 | 9,118,733,896 / 6,605,493,768 (−0.02%) |
+| peak live heap | 120,086 / 84,110 KiB | unchanged |
+| seed size | 6,396,780 | 6,396,616 (−164 bytes) |
+
+Net compiler lines: −17. Pin-helper delta: 0.
+
+**What remains is not 2c's.** With the coverage protocol and its arms gone, `RepDesc` is the
+tree's projection onto `VKind` plus a null discipline, a slot and two vocabularies. Retiring it
+means consumers read `RepNode` directly. That is stage 3: the slot store, the field codes and the
+`FC_*` family derived from the tree. The other field-code reads still answer for types that have a
+rep, so they are not fallbacks either.
