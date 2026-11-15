@@ -113,6 +113,7 @@ import {
   nodeContains,
   nodeSpineChildren,
   nodeValueChildren,
+  objLitFieldValue,
   tsKind,
   tsMentionsAnyName,
   tsText,
@@ -1735,18 +1736,7 @@ export function binOpcodeF32(op: string) {
 // `objIx`, or -1 if the literal does not set that field.
 export function objFieldVal(objIx: i32, fieldName: string) {
   const o = nodeAt(objIx)
-  if o is ObjLit {
-    const fields = o.objFields
-    let i = 0
-    while i < fields.length {
-      const f = nodeAt(fields[i])
-      if f is FieldInit {
-        if f.fiName == fieldName { return f.fiValue }
-      }
-      i = i + 1
-    }
-  }
-  return -1
+  return if o is ObjLit { objLitFieldValue(o, fieldName) } else { -1 }
 }
 // True when evaluating `exprIx` cannot be observed by anything evaluated around it: it calls
 // nothing and writes nothing. Reads qualify (permuting reads changes nothing when none of
@@ -1804,6 +1794,41 @@ export function exprEffectFree(ix: i32): boolean {
 // exclude; `MatchExpr` and the statement kinds reaching expression position carry control
 // flow this predicate does not walk. Fails closed on purpose: an unclassified kind must never have its literal silently reordered.
 function exprEffectFreeUnclassified(): boolean { return false }
+// Past this many slots, a layout span's names are matched through a map built for the call.
+const SPAN_IX_MIN = 8
+
+// What `spanSlots` hands a span short enough to scan; never written.
+const SPAN_SCANNED: {[string]: i32} = Map()
+
+// The first slot of each name in `names[start .. start + cnt)`, built only past `SPAN_IX_MIN`.
+function spanSlots(names: string[], start: i32, cnt: i32): {[string]: i32} {
+  if cnt <= SPAN_IX_MIN { return SPAN_SCANNED }
+  const m: {[string]: i32} = Map()
+  let k = 0
+  while k < cnt {
+    if !m.has(names[start + k]) { m[names[start + k]] = k }
+    k = k + 1
+  }
+  return m
+}
+
+// The first slot `k` of `name` in the span `spanSlots` built `m` for, or -1.
+function spanSlotOf(
+  names: string[],
+  start: i32,
+  cnt: i32,
+  m: {[string]: i32},
+  name: string,
+): i32 {
+  if cnt > SPAN_IX_MIN { return m[name] ?? -1 }
+  let k = 0
+  while k < cnt {
+    if names[start + k] == name { return k }
+    k = k + 1
+  }
+  return -1
+}
+
 // The layout field indices of `objIx`'s initialisers, ordered by source position — the
 // order D1510's stash pass evaluates in. `names`/`start`/`cnt` is the layout name span
 // (`sFieldNames` + `sFieldStart[si]` for a struct row, `armFieldNames` + `uFieldStart[vi]`
@@ -1817,18 +1842,13 @@ export function objFieldSrcOrder(
   const ord: i32[] = []
   const o = nodeAt(objIx)
   if o is ObjLit {
-    const fs = o.objFields
-    let j = 0
-    while j < fs.length {
-      const f = nodeAt(fs[j])
+    const m = spanSlots(names, start, cnt)
+    for fx in o.objFields {
+      const f = nodeAt(fx)
       if f is FieldInit {
-        let k = 0
-        while k < cnt {
-          if names[start + k] == f.fiName { ord.push(k) }
-          k = k + 1
-        }
+        const k = spanSlotOf(names, start, cnt, m, f.fiName)
+        if k >= 0 { ord.push(k) }
       }
-      j = j + 1
     }
   }
   return ord
@@ -1845,16 +1865,11 @@ export function objFieldSrcPairs(
   const out: i32[] = []
   const o = nodeAt(objIx)
   if o is ObjLit {
+    const m = spanSlots(names, start, cnt)
     for fx in o.objFields {
       const f = nodeAt(fx)
       if f is FieldInit {
-        let slot = -1
-        let k = 0
-        while k < cnt && slot < 0 {
-          if names[start + k] == f.fiName { slot = k }
-          k = k + 1
-        }
-        out.push(slot)
+        out.push(spanSlotOf(names, start, cnt, m, f.fiName))
         out.push(f.fiValue)
       }
     }
@@ -1872,15 +1887,11 @@ export function objLitDropsField(
 ): boolean {
   const o = nodeAt(objIx)
   if o is ObjLit {
+    const m = spanSlots(names, start, cnt)
     for fx in o.objFields {
       const f = nodeAt(fx)
       if f is FieldInit {
-        let lay = false
-        let k = 0
-        while k < cnt && !lay {
-          if names[start + k] == f.fiName { lay = true }
-          k = k + 1
-        }
+        const lay = spanSlotOf(names, start, cnt, m, f.fiName) >= 0
         if !lay && !isConstInit(f.fiValue) { return true }
       }
     }

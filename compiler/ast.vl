@@ -201,7 +201,13 @@ export type TypeDecl = {
   tdFlat: i32,
 } // type Name = { f: T, ... }
 export type FieldInit = { fiName: string, fiValue: i32, pos: i32 } // x: 7    (in an object literal)
-export type ObjLit = { objFields: i32[], pos: i32 }                // { x: 7, y: 9 }
+// { x: 7, y: 9 }; `objFieldIx` is `objLitFieldAt`'s cache over the first `objFieldIxLen` fields.
+export type ObjLit = {
+  objFields: i32[],
+  pos: i32,
+  objFieldIx: {[string]: i32},
+  objFieldIxLen: i32,
+}
 
 // An array literal `[e, e, …]` constructing a fixed-length WasmGC array, and an index
 // access `a[i]` (a read, or a write when it is the left side of a `=`). Prefixes: `arr`
@@ -3318,8 +3324,58 @@ export function mkFieldInit(name: string, value: i32, pos: i32) {
 }
 
 export function mkObjLit(fields: i32[], pos: i32) {
-  const n: Node = { objFields: fields, pos: pos }
+  const n: Node = {
+    objFields: fields,
+    pos: pos,
+    objFieldIx: Map(),
+    objFieldIxLen: 0,
+  }
   return addNode(n)
+}
+
+// Up to this many fields a by-name read of a literal scans; past it, it reads the name index.
+const OBJ_LIT_IX_MIN = 8
+
+// The position in `o.objFields` of the first initialiser named `name`, or -1. Past
+// `OBJ_LIT_IX_MIN` fields the index is built on the first ask and extended when the fields grew;
+// each read checks the slot it names, so a slot a rewrite overwrote makes the read scan.
+export function objLitFieldAt(o: ObjLit, name: string): i32 {
+  const fs = o.objFields
+  if fs.length > OBJ_LIT_IX_MIN {
+    const ix = o.objFieldIx
+    let j = o.objFieldIxLen
+    while j < fs.length {
+      const f = nodeAt(fs[j])
+      if f is FieldInit {
+        if !ix.has(f.fiName) { ix[f.fiName] = j }
+      }
+      j = j + 1
+    }
+    o.objFieldIxLen = fs.length
+    const at = ix[name] ?? -1
+    if at < 0 { return -1 }
+    const g = nodeAt(fs[at])
+    if g is FieldInit {
+      if g.fiName == name { return at }
+    }
+  }
+  let i = 0
+  while i < fs.length {
+    const f = nodeAt(fs[i])
+    if f is FieldInit {
+      if f.fiName == name { return i }
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The value of `o`'s first initialiser named `name`, or -1 when it sets no such field.
+export function objLitFieldValue(o: ObjLit, name: string): i32 {
+  const i = objLitFieldAt(o, name)
+  if i < 0 { return -1 }
+  const f = nodeAt(o.objFields[i])
+  return if f is FieldInit { f.fiValue } else { -1 }
 }
 
 export function mkUnionDecl(
