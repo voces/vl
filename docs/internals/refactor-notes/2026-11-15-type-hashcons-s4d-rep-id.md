@@ -33,5 +33,19 @@ Graded one-way against `repTreeOfTy`, as in 4a. A merge is one id meeting two no
 
 | reading | 4a (layout, arm bit at the top only) | 4d (`tyRepId`) |
 |---|---|---|
-| merge | 20, in `dord032` | see the PR |
-| split (finer, safe) | 42,261 | see the PR |
+| merge | 20, in `dord032` | **0** |
+| split (finer, safe) | 42,261 | 42,034 |
+
+1,839 files, the same population as 4a.
+
+## Measurements
+
+The base is 4c (#8298) built to its own fixpoint.
+
+| reading | value |
+|---|---|
+| seed | fixpoint |
+| identity, shadow off | 19,779 of 19,779 files byte-identical: all of `tests/cases` outside `modules/`, plus `distilled/cells` and `distilled/named` |
+| seed size | 6,386,137 → 6,386,555 bytes (+418) |
+| net compiler lines | +53 (`emit_ty_seal.vl` +52: the arm argument, the strict and provisional ids, the ready flag and the function slot; `emit_sections.vl` +2; `emit_rep.vl` −1: `rtArmBitOf` goes, the reset and the ready test come) |
+| pin helpers (`emit_mono.vl`) | 908 → 908 |
