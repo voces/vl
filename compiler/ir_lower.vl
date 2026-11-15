@@ -135,12 +135,15 @@ import {
 } from "./wasmEmit"
 import { RpPrim } from "./emit_rep"
 import {
+  bankSpanRow,
   ctrlDepth,
   dfeCallee,
   emitFnSpanEnd,
   emitFnSpanKind,
   emitFnSpanNode,
   emitFnSpanStart,
+  fnStmts,
+  gCellIdx,
   gHelpF64Rem,
   gImports,
 } from "./emit_state"
@@ -406,6 +409,11 @@ function floatRem(a: Opnd[], atF32: boolean) {
   return 0
 }
 
+// Whether global `g` has the cell a pre-pass assigned before any body was emitted.
+function globalMinted(g: i32): boolean {
+  return g >= 0 && g < gCellIdx.length && gCellIdx[g] >= 0
+}
+
 function opRepOf(o: Opnd): i32 {
   return match o {
     OVar => if o.ov >= 0 && o.ov < lw.irVars.length { lw.irVars[o.ov].vRep } else { -1 }
@@ -417,6 +425,10 @@ function opRepOf(o: Opnd): i32 {
 // A call, in its tail form when `tail` and the callee returns; a never-returning callee's call is
 // followed by `unreachable` instead.
 function call(c: RCall, tail: boolean) {
+  // A claimed function's legacy never runs, so every index it names must already exist.
+  if c.caCallee < 0 || c.caCallee >= fnStmts.length {
+    return irLMiss("callee index")
+  }
   if c.caArgs.length == 0 { leaf() }
   for a in c.caArgs { irLOpnd(a) }
   if tail && !c.caNever {
@@ -434,6 +446,7 @@ function rhs(r: Rhs, tail: boolean) {
     RGlobalGet => {
       match userGlobalReadClass(r.ggSym, lwGlobalCtx) {
         "plain" => {
+          if !globalMinted(r.ggSym) { return irLMiss("global index") }
           leaf()
           fbGlobalGet(userGlobalIdx(r.ggSym))
           if r.ggNonNull { fbRefAsNonNull() }
@@ -546,6 +559,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     SGlobalSet => {
       match userGlobalWriteClass(n.gsSym, lwGlobalCtx) {
         "plain" => {
+          if !globalMinted(n.gsSym) { return irLMiss("global index") }
           cond(n.gsSrc, pending)
           fbGlobalSet(userGlobalIdx(n.gsSym))
           const bit = initBitOf(n.gsSym)
@@ -844,8 +858,7 @@ function entry(f: IrFn, ctx: GlobalCtx, firstLocal: i32): u8[] {
   lwRowTo = []
   const locals = localsVec(firstLocal)
   lwBuf = []
-  // The builders keep the emitter's control depth and callee list; both go back as found.
-  const callees0 = dfeCallee.length
+  // The builders keep the emitter's control depth; it goes back as found.
   const prev = wTarget(lwBuf)
   const valued = !repIsNoValue(f.irRetRep)
   body(f.irBody, !valued, -1)
@@ -855,7 +868,6 @@ function entry(f: IrFn, ctx: GlobalCtx, firstLocal: i32): u8[] {
   // Every frame a builder opened is closed, so the one depth not given back is the function's
   // own `end`'s, which opened none.
   ctrlDepth = ctrlDepth + 1
-  while dfeCallee.length > callees0 { dfeCallee.pop() }
   const code: u8[] = []
   for x in locals { code.push(x) }
   const bodyAt = code.length
@@ -873,6 +885,32 @@ function entry(f: IrFn, ctx: GlobalCtx, firstLocal: i32): u8[] {
     r = r + 1
   }
   return out
+}
+
+// Lowers claimed function `f` (at `fnStmts` slot `fnPos`) onto `out` in legacy's place: its code
+// entry, its statement rows, and its callees kept for dead-function elimination. "" when written,
+// else the miss, with nothing written.
+export function irLowerClaim(
+  f: IrFn,
+  ctx: GlobalCtx,
+  firstLocal: i32,
+  fnPos: i32,
+  out: u8[],
+): string {
+  const callees0 = dfeCallee.length
+  const got = entry(f, ctx, firstLocal)
+  if lwMiss != "" {
+    while dfeCallee.length > callees0 { dfeCallee.pop() }
+    return lwMiss
+  }
+  const at = out.length
+  for x in got { out.push(x) }
+  let r = 0
+  while r < lwRowAst.length {
+    bankSpanRow(lwRowAst[r], fnPos, lwRowFrom[r] + at, lwRowTo[r] + at, 5, "")
+    r = r + 1
+  }
+  return ""
 }
 
 function endsInReturn(f: IrFn): boolean {
@@ -894,7 +932,10 @@ export function irDualEmit(
   spanShift: i32,
   skew: i32,
 ): string {
+  // The lowering's calls note their callees as legacy's did; the shadow takes its own back.
+  const callees0 = dfeCallee.length
   const got = entry(f, ctx, firstLocal)
+  while dfeCallee.length > callees0 { dfeCallee.pop() }
   lwGot = got
   if lwMiss != "" { return "unlowered: " + lwMiss }
   // The comparison's own controls: 1 adds a byte to the lowering, 2 drops its first span row.
