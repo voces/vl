@@ -44,8 +44,19 @@ Three variants, each against the master seed:
     type").
 - **`fnWritesHoleParam` is not subsumed.** With its trigger removed as well, movers rise from 16 to
   25 on this PR's variant (14 to 23 on the map-only one), so it stays.
-- **D16301's witness runs** (`5.5`; master traps), and D16301 closes. D16368 is unchanged: it reads
-  a module `let`, which is a separate exemption.
+- D16301's witness runs (`5.5`). #8384 closed D16301 on master at the same time, by a different
+  rule in `progCheckCalleeFirst`. This PR keeps that rule and adds a fixture. D16368 is unchanged:
+  it reads a module `let`, which is a separate exemption.
+
+### Re-measured after merging master `5ea62674` (#8384)
+
+#8384 checks a callee ahead of top-level code with the functions it reaches (`lifted`, `onCycle`).
+The merge keeps it beside this PR's predicates. Both seeds are fixpoints.
+
+- `tests/cases` as written: 0 of 6,450 `@run` files differ.
+- decl-order movers 58 → 16, 0 clause-1. Against master's baseline (56 lines), 40 close and 0 are new.
+- `regress.vl`: no cell changed class.
+- The matrices are in §Matrices below.
 
 The capability matrices are §Matrices below.
 

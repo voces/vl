@@ -28,7 +28,7 @@ const assert = (cond: boolean, msg: string): void => {
 const memoryReader = (files: Record<string, string>): ModuleReader =>
   (key: string) => files[key];
 
-const util = "export function add(a: i32, b: i32): i32 {\n  a + b\n}\n";
+const util = "export function add(a: i32, b: i32): i32 {\n  return a + b\n}\n";
 const main = 'import { add } from "./util"\n\nprint(add(2, 3))\nprint(add(4, 5))\n';
 
 Deno.test({

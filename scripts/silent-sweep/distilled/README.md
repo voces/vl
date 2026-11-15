@@ -155,6 +155,21 @@ so `runs` still means "printed what the generator said it should" and a wrong-va
 still visible as one. Grading shares `scripts/lib/census-grade.vl` with `census/gradecensus.vl` rather than
 reimplementing the outcome vocabulary — the two instruments cannot drift apart.
 
+### The IR shadow over the same cells
+
+```sh
+vl run scripts/silent-sweep/distilled/ir-shadow.vl
+vl run scripts/silent-sweep/distilled/ir-shadow.vl -- --write-baseline
+```
+
+This builds every cell through `vl check --codegen` with `$VL_IR_SHADOW=1` and sums the IR
+shadow's rows. It prints covered and matched, and each dual-emit mismatch class with its count.
+- **Exit 1:** a verifier failure, or a mismatch class above `ir-shadow-baseline.txt`.
+- **Exit 2:** the harness itself failing.
+- A count that fell prints and passes.
+
+It is the IR's claiming gate in waiting, and it is not in `gate.sh`.
+
 ## What the census is still for
 
 Finding new work. Run a full sweep when you want a new population measured — a new axis, a new

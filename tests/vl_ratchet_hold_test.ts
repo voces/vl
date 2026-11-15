@@ -255,7 +255,7 @@ Deno.test({
     const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
     // Real interpolation (`\{x}`), not a `+` chain — this is the OTHER rule, the
     // hard refusal, not the advisory one asserted above.
-    const planted = 'export function f(x: i32): string {\n  "n=\\{x}"\n}\n';
+    const planted = 'export function f(x: i32): string {\n  return "n=\\{x}"\n}\n';
 
     const under = checker.lint(planted, "compiler/probe.vl");
     const forbidden = under.filter((d) => d.code === "compiler-no-interpolation");
