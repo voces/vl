@@ -629,17 +629,21 @@ import {
   objFieldType,
   tyAt,
   tyBearsNull,
+  tyElemOf,
+  tyElemOpen,
   tyFieldTyOf,
   tyHasHole,
   tyIsHole,
+  tyKeyOpen,
   tyMemberWithin,
-  tyOpen,
   tyPinElem,
   tyPinKey,
   tyPinVal,
   tySame,
   tyToStr,
   tyToStrUser,
+  tyValOf,
+  tyValOpen,
 } from "./check_types"
 import { mkUnionTy } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
@@ -1016,7 +1020,7 @@ function arrDefHoleToI32(ty: i32) {
   if !arrDefRowIsCall(ty) { return false }
   const t = tyAt(ty)
   if t is TyArray {
-    if tyOpen(t.aElem) {
+    if tyElemOpen(t) {
       arrDefPinHoleElem(ty)
       return true
     }
@@ -1113,8 +1117,8 @@ function idxStoreNote(ix: i32, st: i32, rows: i32[], elems: i32[]) {
   if v < 0 || !(n is BinExpr) { return 0 }
   const d = idxStoreDstRow(n.binLeft)
   const vt = tyAt(v)
-  if d >= 0 && vt is TyArray && !tyOpen(vt.aElem) {
-    const el = if tyHasHole(vt.aElem) { -2 } else { vt.aElem }
+  if d >= 0 && vt is TyArray && !tyElemOpen(vt) {
+    const el = if tyHasHole(tyElemOf(vt)) { -2 } else { tyElemOf(vt) }
     let k = 0
     while k < rows.length && rows[k] != d { k = k + 1 }
     if k == rows.length {
@@ -1136,7 +1140,7 @@ function idxStoreHolePin(lit: i32, d: i32, rows: i32[], elems: i32[]) {
   if !(lt is TyArray) { return 0 }
   const dt = tyAt(d)
   if !(dt is TyArray) { return 0 }
-  let el = if !tyOpen(dt.aElem) && !tyHasHole(dt.aElem) { dt.aElem } else { -1 }
+  let el = if !tyElemOpen(dt) && !tyHasHole(tyElemOf(dt)) { tyElemOf(dt) } else { -1 }
   if el < 0 {
     let k = 0
     while k < rows.length && rows[k] != d { k = k + 1 }
@@ -1164,7 +1168,7 @@ export function asgReadElemPin(exprIx: i32, vt: i32) {
     if nodeTyIxOf(e.idxArr) != asgOpenElemRow { return -1 }
     const t = tyAt(asgOpenElemRow)
     if t is TyArray {
-      if !tyOpen(t.aElem) { return -1 }
+      if !tyElemOpen(t) { return -1 }
       tyPinElem(t, widenLitTy(vt))
       // The read's recorded type is `resolveOpenElemReads`'s. A compound store's read is also
       // its write target, which `checkIndexNode` does not bank, so it is banked here.
@@ -1184,14 +1188,14 @@ export function arrDefPinHoleElem(ty: i32) {
   resolveHoleLinks()
   const t = tyAt(ty)
   if t is TyArray {
-    if tyOpen(t.aElem) {
+    if tyElemOpen(t) {
       // A literal-union element is stored at its base primitive, whose zero the intrinsic
       // writes; the `i32` default only when no callee wrote the row.
       let el = litMembersBaseTy(calleeWrittenElem(ty))
       if el < 0 { el = TY_I32 }
       tyPinElem(t, el)
     }
-    return t.aElem
+    return tyElemOf(t)
   }
   -1
 }
@@ -1217,7 +1221,7 @@ function calleeWritePin(ty: i32): boolean {
   if ty < 0 { return false }
   const t = tyAt(ty)
   if t is TyArray {
-    if !tyOpen(t.aElem) { return false }
+    if !tyElemOpen(t) { return false }
     const el = calleeWrittenElem(ty)
     if el < 0 { return false }
     tyPinElem(t, el)
@@ -1233,11 +1237,11 @@ export function settleOpenUnionRows() {
   for r in openUnionRows {
     if unresolvedHole(r) {
       const t = tyAt(r)
-      if t is TyArray && tyOpen(t.aElem) {
+      if t is TyArray && tyElemOpen(t) {
         tyPinElem(t, unboundDefaultTy())
       } else if t is TyMap {
-        if tyOpen(t.mKey) { tyPinKey(t, unboundDefaultTy()) }
-        if tyOpen(t.mVal) { tyPinVal(t, unboundDefaultTy()) }
+        if tyKeyOpen(t) { tyPinKey(t, unboundDefaultTy()) }
+        if tyValOpen(t) { tyPinVal(t, unboundDefaultTy()) }
       }
       noteSettledRow(r)
     }
@@ -1267,7 +1271,9 @@ function defaultOpenHoles(ty: i32, depth: i32, apply: boolean): boolean {
   const t = tyAt(ty)
   match t {
     TyArray => {
-      if !tyOpen(t.aElem) { return defaultOpenHoles(t.aElem, depth - 1, apply) }
+      if !tyElemOpen(t) {
+        return defaultOpenHoles(tyElemOf(t), depth - 1, apply)
+      }
       if openReadHas(ty) { return true }
       if apply {
         tyPinElem(t, unboundDefaultTy())
@@ -1276,21 +1282,21 @@ function defaultOpenHoles(ty: i32, depth: i32, apply: boolean): boolean {
       false
     }
     TyMap => {
-      if tyOpen(t.mKey) || tyOpen(t.mVal) {
+      if tyKeyOpen(t) || tyValOpen(t) {
         if openReadHas(ty) { return true }
         if apply {
-          if tyOpen(t.mKey) {
+          if tyKeyOpen(t) {
             const rk = openKeyReadIx(ty)
             tyPinKey(
               t,
               if rk >= 0 { openKeyTyAt(rk) } else { unboundDefaultTy() },
             )
           }
-          if tyOpen(t.mVal) { tyPinVal(t, unboundDefaultTy()) }
+          if tyValOpen(t) { tyPinVal(t, unboundDefaultTy()) }
           noteSettledRow(ty)
         }
       }
-      defaultOpenHoles(t.mVal, depth - 1, apply)
+      defaultOpenHoles(tyValOf(t), depth - 1, apply)
     }
     TyObj => {
       let read = false
@@ -1331,12 +1337,12 @@ export function defaultReadOnlyContainer(ty: i32): boolean {
   if arrDefRowIsCall(ty) { return false }
   const t = tyAt(ty)
   if t is TyArray {
-    if !tyOpen(t.aElem) { return false }
+    if !tyElemOpen(t) { return false }
     tyPinElem(t, unboundDefaultTy())
   } else if t is TyMap {
-    if !tyOpen(t.mKey) && !tyOpen(t.mVal) { return false }
-    if tyOpen(t.mVal) { tyPinVal(t, unboundDefaultTy()) }
-    if tyOpen(t.mKey) { readOnlyKeyRows.push(ty) }
+    if !tyKeyOpen(t) && !tyValOpen(t) { return false }
+    if tyValOpen(t) { tyPinVal(t, unboundDefaultTy()) }
+    if tyKeyOpen(t) { readOnlyKeyRows.push(ty) }
   } else {
     return false
   }
@@ -1350,7 +1356,7 @@ export function pinReadKey(row: i32, kt: i32) {
     return 0
   }
   const t = tyAt(row)
-  if t is TyMap && tyOpen(t.mKey) { tyPinKey(t, kt) }
+  if t is TyMap && tyKeyOpen(t) { tyPinKey(t, kt) }
   0
 }
 
@@ -1462,10 +1468,10 @@ function tyHoldsOpenMap(ty: i32, depth: i32): boolean {
   if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
   const t = tyAt(ty)
   match t {
-    TyMap => tyOpen(t.mKey) || tyOpen(t.mVal) || tyHoldsOpenMap(t.mVal, depth - 1)
+    TyMap => tyKeyOpen(t) || tyValOpen(t) || tyHoldsOpenMap(tyValOf(t), depth - 1)
     TyFunc => tyHoldsOpenMap(t.fnRet, depth - 1)
     TyNullable => tyHoldsOpenMap(t.nInner, depth - 1)
-    TyArray => tyHoldsOpenMap(t.aElem, depth - 1)
+    TyArray => tyHoldsOpenMap(tyElemOf(t), depth - 1)
     TyObj => {
       for f in t.objFieldTypes {
         if tyHoldsOpenMap(f, depth - 1) { return true }
@@ -1484,15 +1490,15 @@ function pinCalleeWrittenLists(ty: i32, depth: i32) {
   const t = tyAt(ty)
   match t {
     TyArray => {
-      if tyOpen(t.aElem) {
+      if tyElemOpen(t) {
         calleeWritePin(ty)
       } else {
-        pinCalleeWrittenLists(t.aElem, depth - 1)
+        pinCalleeWrittenLists(tyElemOf(t), depth - 1)
       }
     }
     TyFunc => pinCalleeWrittenLists(t.fnRet, depth - 1)
     TyNullable => pinCalleeWrittenLists(t.nInner, depth - 1)
-    TyMap => pinCalleeWrittenLists(t.mVal, depth - 1)
+    TyMap => pinCalleeWrittenLists(tyValOf(t), depth - 1)
     // No other row holds a list the argument built.
     TyPrim | TyErr | TyObj | TyUnion | TyVar | TyLit | TyNeg => {}
   }
@@ -2053,7 +2059,7 @@ function placeReadStoreTy(ix: i32): i32 {
     const rt = placeCurTy(n.idxArr, noPlaces, noTys)
     if rt >= 0 {
       const rm = tyAt(rt)
-      if rm is TyMap { return mkNullableTy(rm.mVal) }
+      if rm is TyMap { return mkNullableTy(tyValOf(rm)) }
     }
   }
   placeStoreTy(ix)
@@ -2201,7 +2207,7 @@ function mapCellStaysPresent(p: i32) {
   const m = tyAt(nt)
   if m is TyMap {
     npKeysPush(p)
-    npTysPush(m.mVal)
+    npTysPush(tyValOf(m))
     npInvByPush(-1)
     npEpochsPush(narFnEpoch)
     npSettlePush(-2)
@@ -3189,7 +3195,7 @@ export function narListDeliveryErr(
     if !(da is TyArray) { return false }
     let hit = false
     for e in s.arrElems {
-      if narListDeliveryErr(e, nodeTyOf(e), da.aElem) { hit = true }
+      if narListDeliveryErr(e, nodeTyOf(e), tyElemOf(da)) { hit = true }
     }
     return hit
   }
@@ -4944,7 +4950,7 @@ function isTestMemberAnswer(m: i32, t: i32, depth: i32): i32 {
     return if k == 1 { 1 } else if k == 0 { 0 } else { -1 }
   }
   if mt is TyArray && tt is TyArray {
-    return isTestMemberAnswer(mt.aElem, tt.aElem, depth - 1)
+    return isTestMemberAnswer(tyElemOf(mt), tyElemOf(tt), depth - 1)
   }
   if mt is TyFunc && tt is TyFunc { return if tySame(m, t) { 1 } else { 0 } }
   -1
