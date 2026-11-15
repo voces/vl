@@ -14089,10 +14089,7 @@ function elabSlotFacts() {
     const ft = eplHolderTy(h, -1)
     if ft >= 0 { elabSlotTys[elabSlotKey(h, -1)] = ft }
   }
-  // An instance's own slots demand their members as the program's do.
-  eplDemand = true
   elabSlotInstFacts(inst, instFn)
-  eplDemand = false
   0
 }
 
@@ -21996,7 +21993,7 @@ function eplRebuild(p: i32, t: i32, depth: i32): i32 {
   if !tyHasTyVar(t) { return t }
   const o = tyAt(t)
   match o {
-    TyFunc => eplRebuildLeaf(p, t)
+    TyFunc => eplRebuildLeaf(p, t, depth)
     TyNullable => {
       const i = eplRebuild(p, o.nInner, depth + 1)
       if i < 0 { -1 } else { mkNullableTy(i) }
@@ -22031,37 +22028,34 @@ function eplRebuild(p: i32, t: i32, depth: i32): i32 {
   }
 }
 
-// Member `d`'s instance at parameter types `ps`: the one keyed there, else one under any parent
-// whose own parameters are `ps` (a nested lambda's instances sit under its frame's); -1 for none.
-function eplMemberAt(d: i32, ps: i32[]): i32 {
-  const noNames: string[] = []
-  const noTys: i32[] = []
-  const k0 = elabKeyAtPins(d, noNames, noTys, ps, -1)
-  if k0 >= 0 { return k0 }
-  for k in EPL.insts[d] ?? [] {
-    const st = elabSubstClosed(nodeTyIxOf(d), k)
-    const so = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
-    if so is TyFunc && elabTysSame(so.fnParamTypes, ps) { return k }
+// A nested member's one instance under the frame instance being read whose parameters are `ps`;
+// -1 for none or two.
+function eplUnderFrame(d: i32, ps: i32[]): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if EPL.k < 0 || elabTopFn(d) || !(dn is FuncDecl) || dn.fnParams.length != ps.length {
+    return -1
   }
-  eplUnderFrame(d)
-}
-
-// A nested member's one instance under the frame instance being read, which the call through
-// the slot instanced; -1 for none or two.
-function eplUnderFrame(d: i32): i32 {
-  if EPL.k < 0 || elabTopFn(d) { return -1 }
   let one = -1
   for k in EPL.insts[d] ?? [] {
     if k >= 0 && k < ekParent.length && ekParent[k] == EPL.k {
-      if one >= 0 { return -1 }
-      one = k
+      let i = 0
+      let at = true
+      while i < ps.length && at {
+        const q = elabNodeTy(dn.fnParams[i], k)
+        if q < 0 || !tySame(q, ps[i]) { at = false }
+        i = i + 1
+      }
+      if at {
+        if one >= 0 { return -1 }
+        one = k
+      }
     }
   }
   one
 }
 
 // Function leaf type `t` at place `p`, closed by its class; -1 where it stays open.
-function eplRebuildLeaf(p: i32, t: i32): i32 {
+function eplRebuildLeaf(p: i32, t: i32, depth: i32): i32 {
   // A copy of a value the elaboration already closed is built at that type: the nearest such
   // source is where the conversion happens, and what lies before it does not reach this leaf.
   for c in eplReach(p, false) {
@@ -22095,12 +22089,15 @@ function eplRebuildLeaf(p: i32, t: i32): i32 {
   let pinSet = false
   for m in ms {
     eplDemandAt(m, ps)
-    const mk = eplMemberAt(elabSrcDecl(m), ps)
+    // A member copied in from an upstream class may answer by its instance under the frame.
+    const own = i32ListHas(EPL.members[eplFind(p)], m)
+    const mu = if own || depth == 0 { -1 } else { eplUnderFrame(elabSrcDecl(m), ps) }
+    const mk = if mu >= 0 { mu } else { elabKeyAtPins(elabSrcDecl(m), noNames, noTys, ps, -1) }
     // Only an instance the run already holds answers; a member with instances of its own
     // and none at these parameters leaves the leaf open.
     const rt = if mk >= 0 { elabResultOf(mk) } else if eplInstanced(m) { -1 } else { eplFrameResult(m, ps.length) }
     if rt < 0 { return -1 }
-    if mk >= 0 && mk != eplUnderFrame(elabSrcDecl(m)) {
+    if mk >= 0 && mk != mu {
       const st = elabSubstClosed(nodeTyIxOf(elabSrcDecl(m)), mk)
       const so = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
       if !(so is TyFunc) || so.fnParamTypes.length != ps.length { return -1 }
