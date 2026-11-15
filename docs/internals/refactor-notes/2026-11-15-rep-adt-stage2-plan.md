@@ -125,3 +125,17 @@ reads +0.98% over its baseline before this batch. Lane P owns the re-baseline, p
 - `tyRepsAsNulAtom` (73);
 - `mvValKindOfTy` (51);
 - `markInferredJoinAtoms` (17).
+
+## 2a, batch 2: four more sites
+
+Each site answers a template's own bare type parameter as the uncovered tree answered it,
+without asking. All four are equivalent by construction.
+
+| site | file | answer for a bare `TyVar` |
+|---|---|---|
+| `forceCloListOfTy` | `emit_union_atoms.vl` | forces nothing; `forceCloFnPositions` was a no-op on a non-function |
+| `readMayBeString` | `emit_classify.vl` | `false`; the node's type is read once and reused for the literal-union test |
+| `tyRepsAsNulAtom` | `wasmEmit.vl` | `false` |
+| `mvValKindOfTy` | `emit_shape_rows.vl` | `MVK_MONO`, after its three earlier tests, which is what the uncovered descriptor's kind `i32` gave |
+
+The measurements are below.
