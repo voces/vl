@@ -1145,6 +1145,13 @@ export class Interp {
         }
         if (e.op === "~") {
           if (v instanceof Lit && v.i !== null && !v.radix) { const n = new Lit(-v.i - 1n, null, false); n.join = v.join; n.derived = true; n.wideDec = v.wideDec; return n; }
+          // a radix constant's `~` keeps the pattern exact, so its use's width reads it (ruling A)
+          if (v instanceof Lit && v.i !== null) {
+            const n = new Lit(~v.i, null, v.radix);
+            n.join = v.join; n.derived = true; n.wideDec = v.wideDec; n.trap64 = v.trap64;
+            if (v.w64 !== null) n.w64 = ~v.w64;
+            return n;
+          }
           if (typeof v === "number") return ~v;
           if (typeof v === "bigint") return wrap64(~v);
           throw new Unsupported("~ on " + show(v));
@@ -1274,11 +1281,24 @@ export class Interp {
         if (!["+", "-", "*", "/", "%", "&", "|", "^"].includes(e.op)) return null;
         const a = this.staticKind(e.l, env), b = this.staticKind(e.r, env);
         if (a && b) { try { return wider(a, b); } catch { return null; } }
-        return a ?? b;
+        // D3043: a constant that does not fit its typed i32 peer makes the operator i64
+        const k = a ?? b, cst = a ? e.r : e.l;
+        if (k === "i32" && isConstTree(cst)) {
+          try { const v = this.eval(cst, env, null); if (v instanceof Lit && v.i !== null && !litHolds(v, "i32")) return "i64"; } catch { /* the default */ }
+        }
+        return k;
       }
       case "if": {
-        // a join is its arms' wider kind; a constant arm has none here and takes the other's
-        const arm = (b: Stmt[] | null) => { const t = b && b.length ? b[b.length - 1] : null; return t && t.k === "expr" ? this.staticKind(t.e, env) : null; };
+        // a join is its arms' wider kind; a constant arm has none here and takes the other's,
+        // unless it is outside i32, which makes the join i64 (4.3)
+        const wideConst = (x: Expr): boolean => {
+          if (!isConstTree(x)) return false;
+          try { const v = this.eval(x, env, null); return v instanceof Lit && v.i !== null && !litHolds(v, "i32"); } catch { return false; }
+        };
+        const arm = (b: Stmt[] | null) => {
+          const t = b && b.length ? b[b.length - 1] : null;
+          return t && t.k === "expr" ? this.staticKind(t.e, env) ?? (wideConst(t.e) ? "i64" : null) : null;
+        };
         const a = arm(e.t), b = arm(e.f);
         if (a && b) { try { return wider(a, b); } catch { return a; } }
         return a ?? b;
@@ -1394,12 +1414,12 @@ export class Interp {
         : typeof left === "number" && typeof rv === "bigint" ? Number(BigInt.asIntN(32, rv)) : rv;
       return arith(op, left, count);
     }
-    // D16492: a radix shift of a constant by a run-time count, alone or in a tree of constants,
-    // beside a constant outside i32 reads its pattern at i64, as a radix tree beside one does.
+    // D16492: a shift of a constant by a run-time count, alone or in a tree of constants, beside a
+    // constant outside i32 computes at i64, a radix left read at its pattern there.
     if (arithOp && !exp && !["<<", ">>", ">>>"].includes(op)) {
       // A tree of constants and such shifts, holding at least one shift.
       const radixShift = (x: Expr): boolean => {
-        if (x.k === "bin" && ["<<", ">>", ">>>"].includes(x.op)) return isConstTree(x.l) && treeHas(x.l, "radix") && !isConstTree(x.r);
+        if (x.k === "bin" && ["<<", ">>", ">>>"].includes(x.op)) return constShift(x);
         if (x.k === "un" && (x.op === "-" || x.op === "~")) return radixShift(x.e);
         if (x.k !== "bin" || !["+", "-", "*", "&", "|", "^"].includes(x.op)) return false;
         return (radixShift(x.l) && (isConstTree(x.r) || radixShift(x.r))) || (isConstTree(x.l) && radixShift(x.r));
@@ -1934,6 +1954,8 @@ export class Interp {
       try { lit = this.eval(ok.e, env, null) as Lit; } catch (x) { if (x instanceof Trap) return v; throw x; }
       if (!joinFits(lit, kv)) { const dk = numKind(litDefault(lit))!; if (WIDENS[kv]?.includes(dk)) return toKind(v, dk); }
     }
+    // T3.6: a typed arm beside a wider typed arm widens to it, whichever arm ran
+    if (kv && kOther && kOther !== kv && WIDENS[kv]?.includes(kOther)) return toKind(v, kOther);
     return v;
   }
 
