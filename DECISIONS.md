@@ -9779,6 +9779,13 @@ tree read stays an editor reference.
   `^`, `>>>`, and `<<` within 32 bits (`0xFFFF0000 | 0xFF` is -65281 at `i32` and 4294902015 at
   `i64`; `0xFF << 24` is `0xFF000000`). A decimal literal is a number: `1 << 31` at `i32` is
   refused as Go refuses `int32(1 << 31)`; `0x1 << 31` is the pattern.
+* **At an `f64` the use's width is 64 (owner, 2026-11-15, spec question 4.2).** A radix tree
+  delivered to an `f64`, or beside an `f64` operator peer, computes at 64 bits with integer
+  division and then converts: `let x: f64 = 0xFFFFFFFF + 1000` is 4294968295 and
+  `(0xFFFFFFFF + 1000) + p` with `p: f64` adds 4294968295. This reverses D14990's reading, which
+  computed such a tree at 32 bits (`const c: f64 = 0x7FFFFFFF << 2` was -4, now 8589934588).
+  The bare pattern is unchanged: `0xFFFFFFFF as f32` reads the 32-bit pattern (-1.0) and
+  `as f64` the 64-bit one; an `f32` use and no context keep their 32 bits (D16390).
 * **A float division by zero, and a float constant past the largest double, are not folded.**
   VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
   computation they were; Go refuses both.
