@@ -447,7 +447,8 @@ Replies received 2026-11-15:
       decides it.
     - Storage has one decider: the tag-decision layer (`fnTagDecide`, `check_fn_tag.vl`). Its re-run
       after the elaboration (`fnTagRedecide`, `emit_sections.vl`) is a second decision. The goal is
-      that it goes before L2 S3, so S3 never decides storage. That is the tag layer's work.
+      that it goes before L2 S3, so S3 never decides storage. Owner: lane G. `fnTagRedecide` is
+      removed in its own PR before S3.
     - S3's solver produces the closed per-shape signatures of a hole function parameter's calls.
       The bundle-or-not decision over them is storage.
     - The discriminators H plans to fold into nominal `TyId`s (`monoAnonPinDiscrim`, the set and
