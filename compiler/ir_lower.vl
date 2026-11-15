@@ -115,6 +115,7 @@ import {
   fbLocalGet,
   fbLocalSet,
   fbLoop,
+  fbRefAsNonNull,
   fbReturn,
   fbReturnCall,
   fbUnreachable,
@@ -122,7 +123,12 @@ import {
   wU8,
   wULEB,
 } from "./emit_bytes"
-import { userGlobalIdx, userGlobalPlain } from "./wasmEmit"
+import {
+  initBitOf,
+  userGlobalIdx,
+  userGlobalReadClass,
+  userGlobalWriteClass,
+} from "./wasmEmit"
 import { RpPrim } from "./emit_rep"
 import {
   cloLiftWriteCount,
@@ -147,6 +153,8 @@ let lwTempDef: boolean[] = []
 let lwTempUsed: boolean[] = []
 // Locals a valued `if` left on the stack, read once as a temp is.
 let lwStackVal: boolean[] = []
+// How many of those values are on the stack, not yet read.
+let lwStackLive = 0
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -174,7 +182,7 @@ function tempDefined(v: i32): boolean {
 
 function tempRhs(v: i32): Rhs {
   if v >= 0 && v < lwTempRhs.length { return lwTempRhs[v] }
-  const none: Rhs = { ggSym: -1 }
+  const none: Rhs = { ggSym: -1, ggNonNull: false }
   return none
 }
 
@@ -192,12 +200,14 @@ function isTemp(v: i32): boolean {
 // Writes operand `o`: a variable's `local.get`, an immediate's constant, or a temp's own
 // right-hand side, written here at its one use.
 export function irLOpnd(o: Opnd) {
+  const live = lwStackLive
   match o {
     OVar => {
       const v = o.ov
       if v >= 0 && v < lwStackVal.length && lwStackVal[v] {
         if !takeUse(v) { return irLMiss("non-stack temp: used twice") }
         lwSeq.push(v)
+        lwStackLive = lwStackLive - 1
         return 0
       }
       if isTemp(v) {
@@ -205,15 +215,20 @@ export function irLOpnd(o: Opnd) {
         if !takeUse(v) { return irLMiss("non-stack temp: used twice") }
         rhs(tempRhs(v), false)
         lwSeq.push(v)
-        return 0
+      } else {
+        const s = varSlot(v)
+        if s < 0 { return irLMiss("unmapped slot") }
+        fbLocalGet(s)
       }
-      const s = varSlot(v)
-      if s < 0 { return irLMiss("unmapped slot") }
-      fbLocalGet(s)
     }
     OImm => imm(o)
     OStr => irLMiss("string operand")
   }
+  // An operand that read no valued `if`'s value while one waits lands above it, out of order.
+  if live > 0 && lwStackLive == live {
+    irLMiss("operand above a valued if's value")
+  }
+  return 0
 }
 
 function imm(o: OImm) {
@@ -386,10 +401,15 @@ function rhs(r: Rhs, tail: boolean) {
     RPrimOp => primOp(r)
     RCall => call(r, tail)
     RGlobalGet => {
-      if !userGlobalPlain(r.ggSym, false) {
-        return irLMiss("global read with a guard or a fold")
+      match userGlobalReadClass(r.ggSym) {
+        "plain" => {
+          fbGlobalGet(userGlobalIdx(r.ggSym))
+          if r.ggNonNull { fbRefAsNonNull() }
+        }
+        "fold" => irLMiss("folded global read")
+        "promo" => irLMiss("promoted global read")
+        "guard" => irLMiss("guarded global read")
       }
-      fbGlobalGet(userGlobalIdx(r.ggSym))
     }
     RListGet | RListLen => irLowerListHook(r)
     RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RMapOp | RStrOp | RMakeClo | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
@@ -501,11 +521,20 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       fbLocalSet(s)
     }
     SGlobalSet => {
-      if !userGlobalPlain(n.gsSym, true) {
-        return irLMiss("global write with a guard or a bit")
+      match userGlobalWriteClass(n.gsSym) {
+        "plain" => {
+          cond(n.gsSrc, pending)
+          fbGlobalSet(userGlobalIdx(n.gsSym))
+          const bit = initBitOf(n.gsSym)
+          if bit >= 0 {
+            fbI32Const(1)
+            fbGlobalSet(bit)
+          }
+        }
+        "promo" => irLMiss("promoted global write")
+        "immutable" => irLMiss("immutable global write")
+        "guard" => irLMiss("guarded global write")
       }
-      cond(n.gsSrc, pending)
-      fbGlobalSet(userGlobalIdx(n.gsSym))
     }
     SEffect => {
       lwSeq = []
@@ -612,6 +641,7 @@ function valuedIf(n: SIf, pending: i32[]) {
   lwFrames.pop()
   fbEnd()
   lwStackVal[t] = true
+  lwStackLive = lwStackLive + 1
   pending.push(t)
   return 0
 }
@@ -773,7 +803,8 @@ function entry(f: IrFn, firstLocal: i32): u8[] {
   lwTempDef = []
   lwTempUsed = []
   lwStackVal = []
-  const none: Rhs = { ggSym: -1 }
+  lwStackLive = 0
+  const none: Rhs = { ggSym: -1, ggNonNull: false }
   for _v in f.irVars {
     lwTempRhs.push(none)
     lwTempDef.push(false)

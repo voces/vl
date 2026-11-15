@@ -35835,15 +35835,28 @@ export function userGlobalIdx(gi: i32) {
   return nImp + gStrPoolTexts.length + gCellIdx[gi]
 }
 
-// Whether `emitUserGlobalGet` (or, `write`, `emitUserGlobalSet`) writes global `gi` as one
-// `global.get`/`global.set` of `userGlobalIdx(gi)`: no folded immediate, promoted local, init
-// guard or init bit. The IR lowering asks, so the decision stays this chokepoint's.
-export function userGlobalPlain(gi: i32, write: boolean): boolean {
-  if gi < 0 { return false }
-  if gi < gFoldOk.length && gFoldOk[gi] == 1 { return false }
-  if gi < gPromoOk.length && gPromoOk[gi] == 1 { return false }
-  if write && (globalCellIsImmutable(gi) || initBitOf(gi) >= 0) { return false }
-  return !initGuardNeeded(gi, write)
+// How a read of module global `gi` is stored: its folded immediate, its promoted local, a
+// `global.get` behind an init guard, or a plain `global.get`. `emitUserGlobalGet` and the IR
+// lowering both match on it, so the storage class stays one decision.
+export type GlobalReadClass = "fold" | "promo" | "guard" | "plain"
+export function userGlobalReadClass(gi: i32): GlobalReadClass {
+  if gi >= 0 && gi < gFoldOk.length && gFoldOk[gi] == 1 { return "fold" }
+  if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 { return "promo" }
+  if initGuardNeeded(gi, false) { return "guard" }
+  return "plain"
+}
+
+// How a write of module global `gi` is stored: its promoted local, a refused store to an
+// immutable cell, a `global.set` behind an init guard, or a plain one; any of the last two is
+// followed by its init bit when `initBitOf(gi)` has one.
+export type GlobalWriteClass = "promo" | "immutable" | "guard" | "plain"
+export function userGlobalWriteClass(gi: i32): GlobalWriteClass {
+  if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 { return "promo" }
+  if globalCellIsImmutable(gi) { return "immutable" }
+  // A write a function can make before the initializer ran would be overwritten by it (D2654);
+  // the start function's own writes are its initializers and the checker orders the rest.
+  if !gPromoInStart && initGuardNeeded(gi, true) { return "guard" }
+  return "plain"
 }
 
 // the storage-class chokepoint for a user top-level binding: every user cell's `0x23`/`0x24`
@@ -35851,20 +35864,23 @@ export function userGlobalPlain(gi: i32, write: boolean): boolean {
 // A promoted binding read outside the start function's frame is rejected loudly; a folded
 // const is its immediate, never uninitialised, so it takes no guard.
 export function emitUserGlobalGet(gi: i32) {
-  if gi >= 0 && gi < gFoldOk.length && gFoldOk[gi] == 1 {
-    return emitFoldedConstRead(gi)
-  }
-  if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 {
-    if !gPromoInStart || gPromoSlot[gi] < 0 {
-      return emitFail(
-        "emitProgram: promoted top-level binding read outside the top-level statement list",
-      )
+  match userGlobalReadClass(gi) {
+    "fold" => {
+      return emitFoldedConstRead(gi)
     }
-    fbLocalGet(gPromoSlot[gi])
-    return 0
-  }
-  if initGuardNeeded(gi, false) {
-    if emitInitGuard(gi, "read") < 0 { return -1 }
+    "promo" => {
+      if !gPromoInStart || gPromoSlot[gi] < 0 {
+        return emitFail(
+          "emitProgram: promoted top-level binding read outside the top-level statement list",
+        )
+      }
+      fbLocalGet(gPromoSlot[gi])
+      return 0
+    }
+    "guard" => {
+      if emitInitGuard(gi, "read") < 0 { return -1 }
+    }
+    "plain" => {}
   }
   fbGlobalGet(userGlobalIdx(gi))
   return 0
@@ -36053,23 +36069,24 @@ function emitInitGuard(gi: i32, verb: string) {
 // The write half of the chokepoint above — `local.set` into the start function's frame
 // for a promoted binding, else `global.set` of its cell.
 export function emitUserGlobalSet(gi: i32) {
-  if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 {
-    if !gPromoInStart || gPromoSlot[gi] < 0 {
-      return emitFail(
-        "emitProgram: promoted top-level binding written outside the top-level statement list",
-      )
+  match userGlobalWriteClass(gi) {
+    "promo" => {
+      if !gPromoInStart || gPromoSlot[gi] < 0 {
+        return emitFail(
+          "emitProgram: promoted top-level binding written outside the top-level statement list",
+        )
+      }
+      fbLocalSet(gPromoSlot[gi])
+      return 0
     }
-    fbLocalSet(gPromoSlot[gi])
-    return 0
-  }
-  // An immutable cell is written only by its constexpr; a store here would be invalid wasm.
-  if globalCellIsImmutable(gi) {
-    return emitFail("emitProgram: a store to an immutable module const")
-  }
-  // A write a function can make before the initializer ran would be overwritten by it (D2654);
-  // the start function's own writes are its initializers and the checker orders the rest.
-  if !gPromoInStart && initGuardNeeded(gi, true) {
-    if emitInitGuard(gi, "written") < 0 { return -1 }
+    // An immutable cell is written only by its constexpr; a store here would be invalid wasm.
+    "immutable" => {
+      return emitFail("emitProgram: a store to an immutable module const")
+    }
+    "guard" => {
+      if emitInitGuard(gi, "written") < 0 { return -1 }
+    }
+    "plain" => {}
   }
   fbGlobalSet(userGlobalIdx(gi))
   const bit = initBitOf(gi)
@@ -36081,7 +36098,7 @@ export function emitUserGlobalSet(gi: i32) {
 }
 
 // The assigned bit of global `gi`, or -1 when it has none.
-function initBitOf(gi: i32): i32 {
+export function initBitOf(gi: i32): i32 {
   if gi < 0 || gi >= gInitBitIdx.length || gInitBitBase < 0 { return -1 }
   const o = gInitBitIdx[gi]
   if o < 0 { return -1 }
@@ -36916,19 +36933,14 @@ function emitCharLitNode(e: CharLit, _exprIx: i32, _fnIx: i32) {
   return 0
 }
 
-// The recovery a read of module global `isid` owes after its `global.get`, shared by an
-// identifier read and a substituted parameter default. A kind-16 `string | null` cell is
-// always a nullable ref; a non-const ref cell is start-initialised, so it is nullable in
-// wasm and recovered unless its kind legitimately holds null or is not a ref at all.
-function emitGlobalReadRecover(isid: i32, readIx: i32, fnIx: i32) {
+// Whether a read of module global `isid` at `readIx` in `fnIx` is followed by `ref.as_non_null`,
+// for an identifier read and a substituted parameter default alike. A kind-16 `string | null`
+// cell recovers when the read's type bears no null; a non-const ref cell is start-initialised,
+// so nullable in wasm, and recovers unless its kind legitimately holds null.
+export function globalReadRecovers(isid: i32, readIx: i32, fnIx: i32): boolean {
   const gck0 = globalCellKind(globalLetOfSid(isid))
-  if gck0 == "nulstr" {
-    if nulStrReadRecovers(readIx, fnIx) { fbRefAsNonNull() }
-    return 0
-  }
-  if !globalNameIsNonConstSid(isid) { return 0 }
-  if vkIsNonNullRef(gck0) { fbRefAsNonNull() }
-  return 0
+  if gck0 == "nulstr" { return nulStrReadRecovers(readIx, fnIx) }
+  return globalNameIsNonConstSid(isid) && vkIsNonNullRef(gck0)
 }
 
 // the densest single-identifier site in the compiler: one identifier read resolves
@@ -36975,7 +36987,7 @@ function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
     if dgIdx >= 0 {
       if emitUserGlobalGet(dgIdx) < 0 { return -1 }
       // the same recovery the argument spelling of this read gets (D3510)
-      emitGlobalReadRecover(isid, exprIx, fnIx)
+      if globalReadRecovers(isid, exprIx, fnIx) { fbRefAsNonNull() }
       return 0
     }
   }
@@ -37092,7 +37104,7 @@ function emitIdentNonLocalRead(e: Ident, isid: i32, exprIx: i32, fnIx: i32) {
   const gIdx = globalIndexOfSid(isid)
   if gIdx >= 0 {
     if emitUserGlobalGet(gIdx) < 0 { return -1 }
-    emitGlobalReadRecover(isid, exprIx, fnIx)
+    if globalReadRecovers(isid, exprIx, fnIx) { fbRefAsNonNull() }
     return 0
   }
   return emitFail(
