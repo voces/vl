@@ -202,7 +202,7 @@ to guess which one a hole means.
 **The interface-by-bound route does not work for built-in methods today.**
 
 ```vl
-function look<M: { get(i32): i32 | null }>(c: M, k: i32): i32 { c.get(k) ?? -1 }
+function look<M: { get(i32): i32 | null }>(c: M, k: i32): i32 { return c.get(k) ?? -1 }
 look(m, 1)
 // {[i32]: i32} does not satisfy `{get(i32):i32|null}`: no `get(): i32 | null` — the bound
 // needs a field of that type or a `get(self: {[i32]: i32}, …)` function in scope

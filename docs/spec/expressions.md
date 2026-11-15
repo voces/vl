@@ -54,7 +54,7 @@ In the first line `-m` is negated at `i32` and wraps, and then it is widened.
 the whole test: `!x is T` is `!(x is T)`, and `x as T is U` is `(x as T) is U`.
 
 ```vl
-function f(x: i32 | string): boolean { !x is i32 }
+function f(x: i32 | string): boolean { return !x is i32 }
 print(f(1))     // prints false
 print(f("a"))   // prints true
 ```
@@ -96,7 +96,7 @@ print(a + b)   // refused: operator '+' mixes i64 and f64
 Integer `/` and `%` trap on a zero divisor and on `MIN / -1` (types.md §T1.2).
 
 ```vl
-function div(a: i32, b: i32): i32 { a / b }
+function div(a: i32, b: i32): i32 { return a / b }
 print(div(-7, 2))   // prints -3
 ```
 
@@ -256,7 +256,7 @@ print(1.0 & 2)   // refused: operator '&' is integer-only, got f64 and i32
 known only at run time is taken modulo the width.
 
 ```vl
-function sh(x: i32, n: i32): i32 { x << n }
+function sh(x: i32, n: i32): i32 { return x << n }
 print(sh(1, 33))   // prints 2
 ```
 
@@ -328,7 +328,7 @@ integer type cannot fail.
 A bare `as` that can fail is legal only in a function whose return type admits `null`.
 
 ```vl
-function q(d: f64): i32 | null { d as? i32 }
+function q(d: f64): i32 | null { return d as? i32 }
 print(q(3.9))            // prints null
 print(q(3.0))            // prints 3
 print(q(5000000000.0))   // prints null
@@ -409,7 +409,7 @@ union of numbers to a type that every member converts to without failing (a floa
 `i64` over integer members) converts the value.
 
 ```vl
-function f(u: string | i32): i32 { (u as? i32) ?? -1 }
+function f(u: string | i32): i32 { return (u as? i32) ?? -1 }
 print(f(4))     // prints 4
 print(f("x"))   // prints -1
 ```
@@ -484,7 +484,7 @@ effects can both trap, either one may be the one that traps.
 must match, except for parameters that are optional or have defaults (types.md §T8.2).
 
 ```vl
-function f(a: i32): i32 { a }
+function f(a: i32): i32 { return a }
 print(f(1, 2))   // refused: wrong number of arguments: expected 1, got 2
 ```
 
@@ -495,7 +495,7 @@ named argument may not name a parameter a positional one already filled. In `x.f
 receiver is position 0.
 
 ```vl
-function box(w: i32, h: i32): i32 { w * 10 + h }
+function box(w: i32, h: i32): i32 { return w * 10 + h }
 print(box(h: 2, w: 3))   // prints 32
 print(box(3, h: 2))      // prints 32
 print(box(w: 3, 2))      // prints 32
@@ -512,13 +512,13 @@ resolve where the function is declared, and it is evaluated at each call.
 
 ```vl
 const SEP = "-"
-function join2(a: string, b: string, sep: string = SEP): string { a + sep + b }
+function join2(a: string, b: string, sep: string = SEP): string { return a + sep + b }
 print(join2("a", "b"))        // prints a-b
 print(join2("a", "b", "+"))   // prints a+b
 ```
 
 ```vl
-function j(a: string, b: string = a): string { a + b }   // refused: a default value must be a literal, a module-level `const`, or `__callsite__`
+function j(a: string, b: string = a): string { return a + b }   // refused: a default value must be a literal, a module-level `const`, or `__callsite__`
 print(j("x"))
 ```
 
@@ -536,7 +536,7 @@ function must be imported. The compiler itself provides only the storage operati
 (`push`, `pop`, `length`, indexing, and the map and set operations).
 
 ```vl
-function double(self: i32): i32 { self * 2 }
+function double(self: i32): i32 { return self * 2 }
 const n = 4
 print(n.double())   // prints 8
 ```
@@ -563,7 +563,7 @@ print(xs.includes(2))   // prints true
 
 ```vl
 type Color = new i32
-get r(self: Color): i32 { ((self as! i32) >> 16) & 255 }
+get r(self: Color): i32 { return ((self as! i32) >> 16) & 255 }
 const c = 0x123456 as! Color
 print(c.r)   // prints 18
 ```
@@ -595,7 +595,7 @@ type is their join. An `if` without `else`, used as a value, has type `T | null`
 its arm's type.
 
 ```vl
-function f(c: boolean): string | null { if c { "hi" } }
+function f(c: boolean): string | null { return if c { "hi" } }
 print(f(true))    // prints hi
 print(f(false))   // prints null
 ```
@@ -608,7 +608,7 @@ print(f(false))   // prints null
 
 ```vl
 function name(n: i32): string {
-  match n {
+  return match n {
     0 => "zero",
     1 => "one",
     _ => "many",
@@ -639,7 +639,7 @@ print(v)   // prints 1
 A parameter's type may be left out when the lambda is delivered to a known function type.
 
 ```vl
-function apply(f: (x: i32) => i32, v: i32): i32 { f(v) }
+function apply(f: (x: i32) => i32, v: i32): i32 { return f(v) }
 print(apply((x) => x * 2, 5))   // prints 10
 ```
 
@@ -697,7 +697,7 @@ print(xs.length)   // prints 4
 ```
 
 ```vl
-function f(a: i32, b: i32): i32 { a + b }
+function f(a: i32, b: i32): i32 { return a + b }
 print(f(...[1, 2]))   // refused: `...` unpacks a list into a rest parameter, and `f` has none
 ```
 

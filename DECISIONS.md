@@ -5439,7 +5439,7 @@ const w = a * 3.0
 
 function f(): i32 {
   g()
-  -x               // two statements: the block's value is -x
+  return -x               // two statements: the block's value is -x
 }
 ```
 
@@ -10599,7 +10599,7 @@ position 0. The principle: a positional argument always lands at its written ind
 Kotlin's rule since 1.4.
 
 ```vl
-function box(w: i32, h: i32): i32 { w * 10 + h }
+function box(w: i32, h: i32): i32 { return w * 10 + h }
 box(w: 3, 2)   // ok: `w` is in position 0, so 2 lands at position 1 — 32
 box(h: 3, 2)   // refused: `h` is not in its own position
 box(3, w: 2)   // refused: `w` is given twice
@@ -10628,7 +10628,7 @@ runtime declared-type tag.
 ```vl
 type A = { x: i32 }
 type B = { x: 1 | 2 }
-function f(v: A | B): string { if v is B { return "B" } "A" }
+function f(v: A | B): string { if v is B { return "B" } return "A" }
 const a: A = { x: 1 }
 print(f(a))   // B
 ```
@@ -10733,7 +10733,7 @@ structural test.
 ```vl
 type A = { v: i32 }
 type B = { v: boolean }
-function f(u: A | B): i32 { if u is A { 1 } else { 2 } }
+function f(u: A | B): i32 { return if u is A { 1 } else { 2 } }
 print(f({ v: true }))   // prints 2
 ```
 
@@ -10757,7 +10757,7 @@ then-branch, in the else-branch, after an exiting guard, and with `!=` reversed.
 
 ```vl
 type K = "a" | "b" | "c"
-function f(k: K): i32 { if k == "a" { return 1 } if k == "b" { return 2 } 3 }
+function f(k: K): i32 { if k == "a" { return 1 } if k == "b" { return 2 } return 3 }
 ```
 
 **Why.** The guide already said it, and `x is L` reads as `x == L` with narrowing. One
@@ -10771,7 +10771,7 @@ spelling that narrows and one that does not was a trap. The checker does not do 
 type. Compiler intrinsics (`__name__`) stay refused.
 
 ```vl
-function print(s: string): i32 { 7 }
+function print(s: string): i32 { return 7 }
 print("x")   // calls the program's own `print`, typed by its own signature
 ```
 
@@ -10929,7 +10929,7 @@ deferred return check reads each such open parameter as `never`, the type no val
 refuses exactly a body that would return a value the open parameter must hold:
 
 ```vl
-function G<A>(v: A | i32): A { v }
+function G<A>(v: A | i32): A { return v }
 const y: boolean = G(5)
 // refused: return type mismatch: expected never, got never | i32 (the return of `G` at the
 // call's argument types; the call binds no type to `A`, so give it an explicit type argument)
@@ -11621,7 +11621,7 @@ element of a literal. The error names the copy, `{ x: a.x }`.
 type A = { x: i32 }
 type B = { x: 1 | 2 }
 const keep: B[] = []
-function stash(a: A) { if a is B { keep.push({ x: a.x }) } }
+function stash(a: A) { return if a is B { keep.push({ x: a.x }) } }
 ```
 
 An un-annotated copy (`const c = a`) binds at the declared type (D4133). `as B` from a union
@@ -11679,7 +11679,7 @@ read-only. This supersedes "the imported name is read-only" in decided direction
 ```vl
 // file: c.vl
 export let count = 0
-export function get(): i32 { count }
+export function get(): i32 { return count }
 // file: main.vl
 import { count, get } from "./c"
 count = 5
@@ -12009,7 +12009,7 @@ last.
 
 ```vl
 type Cat = { name: string, age: i32 }
-function name(a: { name: string }): string { a.name }
+function name(a: { name: string }): string { return a.name }
 print(name(c))   // runs; before, it ran only if the extra field sorted after `name`
 ```
 
@@ -12258,7 +12258,7 @@ the inferred signature."
 ```vl
 // lib.vl
 export let origin = { x: 1, y: 2 }
-export function half() { origin.x / 2 }   // () => i32, from lib.vl alone
+export function half() { return origin.x / 2 }   // () => i32, from lib.vl alone
 ```
 
 Why: a module then has a meaning on its own, the precondition for separate compilation, a

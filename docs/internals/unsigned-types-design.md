@@ -505,7 +505,7 @@ refusal is a clause-2 debt, recorded as such, and is not to be left as a silent 
 
    ```vl
    type U = new i32
-   function f(c: boolean, a: U, b: i32) { if c { a } else { b } }
+   function f(c: boolean, a: U, b: i32) { return if c { a } else { b } }
    const r = f(false, 5 as U, 7)
    print(r is U)
    ```
@@ -612,15 +612,15 @@ available alongside it (U12).
 
 ```vl
 // (a) lossless edges implicit, everything else `as`
-function f(u: u32): i64 { u }          // ok — zero-extends
+function f(u: u32): i64 { return u }          // ok — zero-extends
 function g(i: i32): u32 { i }          // error — write `i as u32` or `i as% u32`
 
 // (b) nothing implicit (Rust / Swift)
-function f(u: u32): i64 { u as i64 }   // required
+function f(u: u32): i64 { return u as i64 }   // required
 
 // (c) AssemblyScript: any target with as many bits, "regardless of interpretation/signedness"
 function g(i: i32): u32 { i }          // ok — -1 becomes 4294967295 silently
-function h(x: i64): f64 { x }          // ok — rounds silently
+function h(x: i64): f64 { return x }          // ok — rounds silently
 ```
 
 **Ruled: (a), owner 2026-10-03.**
@@ -679,7 +679,7 @@ print(q as% i32)                   // -1                     — low 32 bits
 let big: i64 = 9007199254740993
 print(big as f64)                  // 9007199254740992       — i64 → f64 rounds
 print(big as? f64)                 // 9007199254740992       — and as? does not refuse it
-function g(c: boolean, a: i32, x: i64) { if c { a } else { x } }
+function g(c: boolean, a: i32, x: i64) { return if c { a } else { x } }
 print(g(true, 1, 5) is i32)        // true                   — a mixed numeric join is a union
 print(__trunc_sat_f64_u_i32__(3.0e9))   // -1294967296       — the u32 bits, typed i32
 let i = 300
@@ -699,7 +699,7 @@ diderven's `src/rng.vl` both hash and xorshift over `i32` with `>>>`.
 a different number type, what is the result's type?
 
 ```vl
-function pick(c: boolean, u: u32, i: i32) { if c { u } else { i } }
+function pick(c: boolean, u: u32, i: i32) { return if c { u } else { i } }
 
 // (a) a union, as the numeric-join ruling does for i32 and f64 (and i32 and i64 today)
 const r = pick(true, 7, 9)       // r: i32 | u32
@@ -712,7 +712,7 @@ const r = pick(true, 7, 9)       // r: i64
 print(r is u32)                  // error: r is i64, not a union
 
 // (c) refused, as Rust, Go and Zig refuse arms of different type
-function pick(c: boolean, u: u32, i: i32) { if c { u } else { i } }
+function pick(c: boolean, u: u32, i: i32) { return if c { u } else { i } }
 // error: the arms are u32 and i32 — write `i as u32` or annotate the result
 ```
 
@@ -985,7 +985,7 @@ function next(r: Rng): i64 {
   let z = r.state
   z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9
   z = (z ^ (z >>> 27)) * 0x94D049BB133111EB
-  z ^ (z >>> 31)
+  return z ^ (z >>> 31)
 }
 const r: Rng = { state: 0 }
 print(next(r))                                   // -2152535657050944081
@@ -1009,8 +1009,8 @@ function next(r: Rng): u64 {
   z = (z ^ (z >> 27)) * 0x94D049BB133111EB
   z ^ (z >> 31)
 }
-function unit(r: Rng): f64 { (next(r) >> 11) as f64 / 9007199254740992.0 }
-function small(r: Rng): i32 { next(r) as% i32 }
+function unit(r: Rng): f64 { return (next(r) >> 11) as f64 / 9007199254740992.0 }
+function small(r: Rng): i32 { return next(r) as% i32 }
 ```
 
 **Rulings it needs.** U1 to U4 are ruled and cover it: the type (U1), `as`/`as%` to `f64`
