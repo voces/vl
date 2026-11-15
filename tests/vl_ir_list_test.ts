@@ -55,11 +55,11 @@ const failures = (rows: Map<string, number>) =>
 
 // Element reads of an i32 and an f64 list, a parameter's and a call result's, and a `str`
 // held and passed.
-const LISTS = `function first(xs: i32[]): i32 { xs[0] }
-function at(xs: f64[], i: i32): f64 { xs[i] }
-function mk(): i32[] { [3, 4, 5] }
-function third(): i32 { mk()[2] }
-function pass(s: string): string { s }
+const LISTS = `function first(xs: i32[]): i32 { return xs[0] }
+function at(xs: f64[], i: i32): f64 { return xs[i] }
+function mk(): i32[] { return [3, 4, 5] }
+function third(): i32 { return mk()[2] }
+function pass(s: string): string { return s }
 print(first([7, 8]))
 print(at([1.5, 2.5], 1))
 print(third())
