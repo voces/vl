@@ -291,6 +291,12 @@ following.
 8. **Bounds.** Every `RListGet`/`SListSet` is preceded on every path by an `SBoundsCheck` of the
    same `(list, index)`, or carries a proof tag that a BCE pass wrote. A pass that deletes a check
    must leave the tag.
+   - In phase A a check sits immediately before its access, and is **fused**: it lowers as nothing,
+     and the access lowers both the guard and the read, which is legacy's shape.
+   - The check's operand reads do not consume. They do not count against a temp's single use, so
+     `f()[i]` stays one temp, consumed by the access.
+   - A check that a pass separates from its access (LICM, I10) must name non-temp `Var`s. It then
+     lowers as a standalone guard.
 9. **No trap moves past an effect.** An `SBoundsCheck`, an `RCast` with `"trap"` or an `STrap`
    that a pass moved keeps every earlier effect (a call, a store, a print) ahead of it on every
    path. The exception is a check that the pass proved can never trap, and that check carries the

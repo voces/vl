@@ -11,7 +11,7 @@ conditional operator; an `if` with an `else` is an expression and narrows as N3.
 
 ```vl
 function f(x: i32 | null): i32 {
-  if x != null { x } else { 0 }
+  return if x != null { x } else { 0 }
 }
 print(f(5))   // prints 5
 ```
@@ -26,7 +26,7 @@ at a computed index, `xs[i]`, is not a place and does not narrow.
 type O = { v: i32 | null }
 function f(o: O): i32 {
   if o.v != null { return o.v + 1 }
-  0
+  return 0
 }
 print(f({ v: 4 }))   // prints 5
 ```
@@ -34,7 +34,7 @@ print(f({ v: 4 }))   // prints 5
 ```vl
 function f(xs: (i32 | null)[], i: i32): i32 {
   if xs[i] != null { return xs[i] + 1 }   // refused: operator '+' is not defined for i32 | null and i32
-  0
+  return 0
 }
 ```
 
@@ -49,7 +49,7 @@ accepts: a write is checked against the declared type (N4.1).
 ```vl
 function len(s: string | null): i32 {
   if s == null { return 0 }
-  s.length
+  return s.length
 }
 print(len("abc"))   // prints 3
 ```
@@ -59,7 +59,7 @@ and to the members left over where it fails. `x !is T` is the same test reversed
 
 ```vl
 function f(x: i32 | string): i32 {
-  if x is i32 { x + 1 } else { x.length }
+  return if x is i32 { x + 1 } else { x.length }
 }
 print(f("abc"))   // prints 3
 ```
@@ -72,7 +72,7 @@ settled by the ruling (D4062).
 ```vl
 type A = { x: i32 }
 type B = { x: 1 | 2 }
-function f(v: A | B): string { if v is B { return "B" } "A" }
+function f(v: A | B): string { if v is B { return "B" } return "A" }
 const a: A = { x: 1 }
 print(f(a))   // prints B
 ```
@@ -94,7 +94,7 @@ type K = "a" | "b" | "c"
 function f(k: K): string {
   if k is "a" { return "A" }
   const j: "b" | "c" = k
-  j
+  return j
 }
 print(f("c"))   // prints c
 ```
@@ -113,7 +113,7 @@ type M = { kind: "m", x: i32 }
 type Q = { kind: "q" }
 function f(c: M | Q): i32 {
   if c.kind == "m" { return c.x }
-  0
+  return 0
 }
 print(f({ kind: "m", x: 6 }))   // prints 6
 ```
@@ -126,7 +126,7 @@ and holds the facts of both where it is true. `a || b` checks and runs `b` with 
 type P = { y: i32 | null }
 function f(x: P | null): i32 {
   if x != null && x.y != null && x.y > 0 { return x.y }
-  0
+  return 0
 }
 print(f({ y: 4 }))   // prints 4
 ```
@@ -134,7 +134,7 @@ print(f({ y: 4 }))   // prints 4
 ```vl
 function f(a: i32 | null, b: i32 | null): i32 {
   if a == null || b == null { return 0 }
-  a + b
+  return a + b
 }
 print(f(2, 3))   // prints 5
 ```
@@ -146,7 +146,7 @@ narrows `x` to non-null and `x.y` to its type without `null`.
 type I = { y: i32 | string }
 function f(x: I | null): i32 {
   if x?.y is i32 { return x.y + 1 }
-  0
+  return 0
 }
 print(f({ y: 4 }))   // prints 5
 ```
@@ -155,7 +155,7 @@ print(f({ y: 4 }))   // prints 5
 type I = { y: i32 | null }
 function f(x: I | null): i32 {
   if x?.y != null { return x.y + 1 }
-  0
+  return 0
 }
 print(f({ y: 4 }))   // prints 5
 ```
@@ -165,7 +165,7 @@ print(f({ y: 4 }))   // prints 5
 ```vl
 function pick<T>(x: T, y: T | null): T {
   if y is T { return y }
-  x
+  return x
 }
 print(pick(1, null))   // prints 1
 print(pick(1, 5))      // prints 5
@@ -188,7 +188,7 @@ type C = { kind: "c", z: i32 }
 function f(u: A | B | C): i32 {
   if u is A { return u.n }
   if u is B { return u.s.length }
-  u.z
+  return u.z
 }
 print(f({ kind: "c", z: 9 }))   // prints 9
 ```
@@ -223,7 +223,7 @@ path past its last branch. A function may end in such a chain without a final va
 type A = { kind: "a", n: i32 }
 type B = { kind: "b" }
 function f(u: A | B): i32 {
-  if u is A { u.n } else if u is B { 0 }
+  return if u is A { u.n } else if u is B { 0 }
 }
 print(f({ kind: "a", n: 3 }))   // prints 3
 ```
@@ -235,7 +235,7 @@ any call that may change `k`, ends that fact.
 ```vl
 function f(k: i32[]): i32 {
   if k.length > 0 { return k.pop() + 1 }
-  0
+  return 0
 }
 print(f([4]))   // prints 5
 ```
@@ -274,7 +274,7 @@ that skips its branch, and that path keeps the place as it was before the `if`.
 function f(s: string | null): i32 {
   let t = s
   if t == null { t = "fresh" }
-  t.length
+  return t.length
 }
 print(f(null))   // prints 5
 ```
@@ -286,7 +286,7 @@ function f(c: boolean): boolean {
     if c { x = true }
     return x   // refused: return type mismatch: expected boolean, got i64 | boolean
   }
-  false
+  return false
 }
 ```
 
@@ -304,7 +304,7 @@ until a new test.
 
 ```vl
 let v: f64 | boolean = 1.5
-const k = () => { v = true }
+const k = () => { return v = true }
 if v is f64 {
   k()
   print(v * 2.0)   // refused: operator '*' is not defined for f64 | boolean and f64 — 'v' is no longer narrowed to f64: the call to 'k' on line 4 may reassign it
@@ -313,7 +313,7 @@ if v is f64 {
 
 ```vl
 let v: f64 | boolean = 1.5
-const k = () => { v = true }
+const k = () => { return v = true }
 if v is f64 {
   k()
   if v is f64 { print(v) } else { print("flipped") }
@@ -329,7 +329,7 @@ function f(o: O): i32 {
     clr(o)
     return o.v + 1   // refused: 'o.v' is no longer narrowed to i32: the call to 'clr' on line 5 may reassign it
   }
-  0
+  return 0
 }
 ```
 
@@ -342,19 +342,19 @@ function f(): i32 {
     outer()
     return v + 1   // refused: 'v' is no longer narrowed to i32: the call to 'outer' on line 6 may reassign it
   }
-  0
+  return 0
 }
 ```
 
 ```vl
 let v: i32 | null = 1
-function noop(): i32 { 3 }
+function noop(): i32 { return 3 }
 function f(): i32 {
   if v != null {
     noop()
     return v + 1
   }
-  0
+  return 0
 }
 print(f())   // prints 2
 ```
@@ -379,7 +379,7 @@ function f(x: i32 | null): i32 {
     }
     return t
   }
-  0
+  return 0
 }
 ```
 
@@ -394,7 +394,7 @@ function f(o: O): i32 {
     const g = () => o.v + 1
     return g()
   }
-  0
+  return 0
 }
 print(f({ v: 1 }))   // prints 2
 ```
@@ -405,7 +405,7 @@ function f(o: O): () => i32 {
   if o.v != null {
     return (): i32 => o.v + 1   // refused: 'o.v' is not narrowed inside the function on line 4
   }
-  (): i32 => 0
+  return (): i32 => 0
 }
 ```
 

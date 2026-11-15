@@ -94,7 +94,7 @@ const none: string[] = []
 function text(bytes: u8[]): string {
   const t = decodeUtf8(bytes)
   if t is Utf8Error { return "<not utf-8>" }
-  t
+  return t
 }
 `;
 

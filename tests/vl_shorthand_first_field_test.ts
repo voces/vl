@@ -1,6 +1,6 @@
-// D3475 (sunpa SP-001) — BRACES OPENING `{ name, …` ARE AN OBJECT LITERAL IN EVERY BODY POSITION:
-// a function body, statements then a tail, an `if`/`else` branch, a `match` arm and a lambda body,
-// with a keyed second field, all shorthand, a trailing comma, across lines and nested.
+// D3475 (sunpa SP-001) — BRACES OPENING `{ name, …` ARE AN OBJECT LITERAL IN EVERY VALUE POSITION:
+// a `return`, after statements, an `if`/`else` branch, a `match` arm and an arrow body, with a keyed
+// second field, all shorthand, a trailing comma, across lines and nested.
 //
 // `vl fmt` keeps a shorthand field as written (D3478), including the comma that makes a lone
 // `{ id, }` an object rather than a block; the formatted source must be a fixed point and print
@@ -19,37 +19,37 @@ const SRC = [
   "type Q = { id: i32 }",
   "type N = { id: i32, p: P }",
   "function make(id: i32, x: f64): P {",
-  "  { id, x: x }",
+  "  return { id, x: x }",
   "}",
   "function makeShort(id: i32, x: f64): P {",
-  "  { id, x }",
+  "  return { id, x }",
   "}",
   "function makeTrailing(id: i32): Q {",
-  "  { id, }",
+  "  return { id, }",
   "}",
   "function makeLines(id: i32, x: f64): P {",
-  "  {",
+  "  return {",
   "    id,",
   "    x,",
   "  }",
   "}",
   "function makeAfterStmt(id: i32, x: f64): P {",
   "  const y = x * 2.0",
-  "  { id, x: y }",
+  "  return { id, x: y }",
   "}",
   "function pick(id: i32, x: f64, b: boolean): P {",
-  "  if b { id, x } else { id, x: 0.0 }",
+  "  return if b { id, x } else { id, x: 0.0 }",
   "}",
   "function arm(id: i32, x: f64, k: i32): P {",
-  "  match k {",
+  "  return match k {",
   "    1 => { id, x: 1.0 },",
   "    _ => { id, x },",
   "  }",
   "}",
   "function nest(id: i32, x: f64): N {",
-  "  { id, p: { id, x } }",
+  "  return { id, p: { id, x } }",
   "}",
-  'function show(p: P) { "\\{p.id} \\{p.x}" }',
+  'function show(p: P) { return "\\{p.id} \\{p.x}" }',
   "const id = 7",
   "const x = 2.5",
   "print(show(make(id, x)))",
@@ -66,7 +66,7 @@ const SRC = [
   "const lam = (id: i32, x: f64): P => { id, x }",
   "print(show(lam(1, 1.5)))",
   "const lamLines = (id: i32, x: f64): P => {",
-  "  {",
+  "  return {",
   "    id,",
   "    x: x + 1.0,",
   "  }",
@@ -116,7 +116,7 @@ const vl = async (
 };
 
 Deno.test({
-  name: "D3475: a body opening with a shorthand field is an object, and its formatted form agrees",
+  name: "D3475: a value opening with a shorthand field is an object, and its formatted form agrees",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_shorthand_first_" });
@@ -132,7 +132,7 @@ Deno.test({
       }
       const f = await vl(["fmt"], SRC);
       if (f.code !== 0) throw new Error(`vl fmt rejected it (rc ${f.code}):\n${f.err}`);
-      for (const kept of ["{ id, x: x }", "{ { id, } }", "{ { id, p: { id, x } } }", "=> { id, x }"]) {
+      for (const kept of ["{ id, x: x }", "return { id, }", "return { id, p: { id, x } }", "=> { id, x }"]) {
         if (!f.out.includes(kept)) {
           throw new Error(`want the formatted source to hold \`${kept}\`, got:\n${f.out}`);
         }

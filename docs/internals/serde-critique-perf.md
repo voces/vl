@@ -673,7 +673,7 @@ taken.
 
 ```vl
 function enc(r: Rec): string {
-  "{\"a\":\"\{r.a}\",\"b\":\"\{r.b}\",\"c\":\"\{r.c}\",\"count\":\{toString(r.count)},\"id\":\{toString(r.id)},\"kind\":\"\{r.kind}\",\"level\":\{toString(r.level)},\"name\":\"\{r.name}\",\"note\":\"\{r.note}\",\"tag\":\"\{r.tag}\"}"
+  return "{\"a\":\"\{r.a}\",\"b\":\"\{r.b}\",\"c\":\"\{r.c}\",\"count\":\{toString(r.count)},\"id\":\{toString(r.id)},\"kind\":\"\{r.kind}\",\"level\":\{toString(r.level)},\"name\":\"\{r.name}\",\"note\":\"\{r.note}\",\"tag\":\"\{r.tag}\"}"
 }
 const s = enc(r) ; total = total + s.length
 ```
@@ -699,7 +699,7 @@ function enc(r: Rec): u8[] {           // fields in SORTED NAME order, per fact 
   wStr(buf, r.a) ; wStr(buf, r.b) ; wStr(buf, r.c)
   wI32(buf, r.count) ; wI32(buf, r.id) ; wStr(buf, r.kind)
   wI32(buf, r.level) ; wStr(buf, r.name) ; wStr(buf, r.note) ; wStr(buf, r.tag)
-  buf
+  return buf
 }
 ```
 

@@ -439,7 +439,7 @@ function nextBits(): i64 {
   seed = seed ^ (seed << 13)
   seed = seed ^ (seed >>> 7)
   seed = seed ^ (seed << 17)
-  seed
+  return seed
 }
 
 // Two lines per value: what \`toString\` rendered, and what \`parseI64\` read back
