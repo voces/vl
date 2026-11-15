@@ -112,7 +112,8 @@ export function half() { origin.x / 2 }
 
 `half()` prints `0` in a program that only imports `half`, and `0.5` in a program that also passes
 `origin` to a `{ x: f64, y: f64 }` parameter. This is ruled behaviour, not a bug. It means a module
-has no meaning on its own, which rules out separate compilation and stable library APIs.
+has no meaning on its own, which rules out separate compilation and stable library APIs. (The
+ruling is reversed: for exported bindings on 2026-11-14 and for every export on 2026-11-15, L2.)
 
 ### 3.2 Width subtyping depends on field-name spelling **[ran]**
 
@@ -372,7 +373,8 @@ reviewer estimates 15–25k lines). With it, **freeze exports at the module boun
 types and layouts are inferred from its own module alone, which reverses the ruling behind the
 `half()` result in §3.1. No annotation is required of the user; `vl` can print the inferred
 signature. This is the precondition for separate compilation, a query-based LSP and a specifiable
-inference algorithm. It is an owner ruling.
+inference algorithm. It is an owner ruling: **decided 2026-11-15, yes** (DECISIONS.md, "Exports are
+frozen at the module boundary").
 
 **L3. Decide the representation of width subtyping.** Recommended: treat a record-typed parameter as
 row-polymorphic and monomorphize per concrete row (the "wider rows" machinery exists and keeps direct
@@ -450,7 +452,8 @@ seed hash in git and document a replayable chain from `seed-v0`.
 
 ### Order
 
-Decide L2's export ruling and L3 first, since both change what the IR must carry. Then medium 1–3
+Decide L2's export ruling and L3 first, since both change what the IR must carry. (L2's export
+ruling: decided 2026-11-15, exports are frozen at the module boundary.) Then medium 1–3
 (they are prerequisites of L1 and L2 and each pays for itself), then L1 and L5 together, then L2 and
 L4. Do the small security and trust items now. Consider pausing new defect lanes for any family that
 maps to a known IR or interface gap, and spending that capacity on L1 and L2.
