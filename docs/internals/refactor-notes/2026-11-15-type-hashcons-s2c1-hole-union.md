@@ -13,6 +13,9 @@ The first slice of stage 2c (`2026-11-14-type-hashcons-design.md` §2.2).
   derived hole, and moving it to one body solution is L2's work.
 
 **What it fixes, on top of master after #8186.**
+- **D16340 closes** (lane L's): `let v = Set(); v = Set()` built an invalid module, because the
+  reassignment met two unwritten sets with independent open keys. They are now one hole, and the
+  witness prints `1`.
 - Three D16301 declaration-order cells, `dord026`, `dord027` and `dord028`, go from `trap_loads`
   (`indirect call type mismatch`) to `runs`, each with its exact `@log` output.
 - Measured before #8186, the union also fixed `dord018` to `dord023` and `dord025`. #8186 fixes all
