@@ -34,3 +34,19 @@ The COMPILED-BAD cell is D16496's `ar_s42_0050`, closed by #8451.
 The 23 DISAGREE and 3 UNSOUND cells are not explained by any filed row. That is 0.19% of cases,
 about four per 2,000-case nightly arith leg. They are the next triage, as either oracle gaps or
 new rows.
+
+## Nightly: arith reports until it is triaged
+
+- `fuzz.sh --report-only <gens>` lists those generators' new DISAGREE, UNSOUND and COMPILED-BAD
+  cells (`oracle: report-only …`), and they do not set the exit code. The other generators'
+  cells still do, and so does every refusal ceiling.
+- `fuzz-sweep.sh`'s oracle leg passes `--report-only arith`, and now lists new cells with their
+  regenerate commands on every run, not only on a failing one. The workflow says the leg gates
+  again once seeds 31-100 show 0 unexplained cells.
+- Controls on this container's pre-#8314 host, whose `ar_s2_0103` float print disagrees,
+  `--seeds 2 --count 200 --gen arith`:
+  - no flag: rc 1;
+  - `--report-only arith`: rc 0, with the cell listed;
+  - `--report-only data`: rc 1.
+- The arith ceiling is 8%, up from #8441's 6%. Seeds 1-2 refuse 25 of 400 (6.25%); 2,000-case
+  samples measure 3.6-4.9%. A drifted template shows 50-100%, so 8% still catches one.
