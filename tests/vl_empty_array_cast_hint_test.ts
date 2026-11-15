@@ -60,7 +60,7 @@ Deno.test({
       eq(
         await errorsOf(
           dir,
-          "function f(m: u8[], off: i32): u8[] { if off < 0 { return [] as u8[] } m.slice(off, off + 2) }\n" +
+          "function f(m: u8[], off: i32): u8[] { if off < 0 { return [] as u8[] } return m.slice(off, off + 2) }\n" +
             "const b: u8[] = [1, 2, 3, 4]\nprint(f(b, 1).length)\n",
         ),
         [HINTED],
@@ -71,7 +71,7 @@ Deno.test({
       eq(
         await errorsOf(
           dir,
-          "function f(m: u8[], off) { if off < 0 { return [] as u8[] } m.slice(off, off + 2) }\n" +
+          "function f(m: u8[], off) { if off < 0 { return [] as u8[] } return m.slice(off, off + 2) }\n" +
             "const b: u8[] = [1, 2, 3, 4]\nprint(f(b, 1).length)\n",
         ),
         [HINTED],

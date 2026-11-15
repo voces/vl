@@ -23,61 +23,61 @@ if (!ENABLED) console.warn("[zext-load-fold] skipped — missing vl, the seed or
 const CASES: Record<string, [string, string[], string[]]> = {
   // plumb's guest load, exactly.
   plumbLoad: [
-    "export function f(p: i32): i64 { (__load_i32__(p, 8) as% i64) & 4294967295 }",
+    "export function f(p: i32): i64 { return (__load_i32__(p, 8) as% i64) & 4294967295 }",
     ["(i64.load32_u offset=8 (local.get $0) )"],
     ["i64.and", "extend", "load32_s"],
   ],
   // plumb's generated chunks mask twice; the mask names an i64 const in its runtime.
   twiceByConst: [
     "const M32: i64 = 4294967295\n" +
-    "export function f(p: i32): i64 { (((__load_i32__(p, 12) as% i64) & M32)) & M32 }",
+    "export function f(p: i32): i64 { return (((__load_i32__(p, 12) as% i64) & M32)) & M32 }",
     ["(i64.load32_u offset=12 (local.get $0) )"],
     ["i64.and", "extend"],
   ],
   // The plain cast and the mask on the left.
   propLeft: [
-    "export function f(p: i32): i64 { 0xffff_ffff & (__load_i32__(p) as i64) }",
+    "export function f(p: i32): i64 { return 0xffff_ffff & (__load_i32__(p) as i64) }",
     ["(i64.load32_u (local.get $0) )"],
     ["i64.and", "extend"],
   ],
   // An unsigned narrow load under a mask that covers its width.
   u8Masked: [
-    "export function f(p: i32): i64 { ((__load_u8__(p, 3) as% i64)) & 4294967295 }",
+    "export function f(p: i32): i64 { return ((__load_u8__(p, 3) as% i64)) & 4294967295 }",
     ["(i64.load8_u offset=3 (local.get $0) )"],
     ["i64.and", "extend"],
   ],
   u16Masked: [
-    "export function f(p: i32): i64 { (__load_u16__(p, 6) as% i64) & 65535 }",
+    "export function f(p: i32): i64 { return (__load_u16__(p, 6) as% i64) & 65535 }",
     ["(i64.load16_u offset=6 (local.get $0) )"],
     ["i64.and", "extend"],
   ],
   // An unsigned narrow load widened with no mask at all.
   u16Bare: [
-    "export function f(p: i32): i64 { __load_u16__(p) as i64 }",
+    "export function f(p: i32): i64 { return __load_u16__(p) as i64 }",
     ["(i64.load16_u (local.get $0) )"],
     ["extend"],
   ],
   // The intrinsics, spelled directly.
   intrinsics: [
-    "export function f(p: i32): i64 { __load_u32_i64__(p) + __load_u16_i64__(p, 2) + __load_u8_i64__(p, 3) }",
+    "export function f(p: i32): i64 { return __load_u32_i64__(p) + __load_u16_i64__(p, 2) + __load_u8_i64__(p, 3) }",
     ["i64.load32_u", "i64.load16_u offset=2", "i64.load8_u offset=3"],
     ["extend", "i64.and"],
   ],
   // DECLINES. A mask that drops a bit is not a zero-extend.
   dropBitStays: [
-    "export function f(p: i32): i64 { (__load_i32__(p) as% i64) & 4294967294 }",
+    "export function f(p: i32): i64 { return (__load_i32__(p) as% i64) & 4294967294 }",
     ["i64.and", "(i64.const 4294967294)"],
     ["load32_u"],
   ],
   // A mask narrower than the load keeps its `and`; the widening under it still folds.
   narrowMaskStays: [
-    "export function f(p: i32): i64 { (__load_u16__(p) as% i64) & 255 }",
+    "export function f(p: i32): i64 { return (__load_u16__(p) as% i64) & 255 }",
     ["(i64.and (i64.load16_u (local.get $0) ) (i64.const 255) )"],
     [],
   ],
   // A sign-extended i32 load with no mask stays signed.
   signedStays: [
-    "export function f(p: i32): i64 { __load_i32__(p) as i64 }",
+    "export function f(p: i32): i64 { return __load_i32__(p) as i64 }",
     [],
     ["load32_u"],
   ],

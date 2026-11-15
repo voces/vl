@@ -106,9 +106,9 @@ const RUNS: { row: string; src: string; want: string[] }[] = [
 type Showable = { toString(): string }
 function toString(self: Circle) {
   if self.r > 0.0 { return "C" }
-  "c"
+  return "c"
 }
-function describe<T: Showable>(x: T) { "<" + x.toString() + ">" }
+function describe<T: Showable>(x: T) { return "<" + x.toString() + ">" }
 print(describe({ r: 1.0 }))
 `,
     want: ["<C>"],
@@ -117,7 +117,7 @@ print(describe({ r: 1.0 }))
     row: "D10271",
     src: `function len<T>(f: () => T | null) {
   const t = f()
-  if t == null { 0 } else { 1 }
+  return if t == null { 0 } else { 1 }
 }
 function outer<T>(x: T) {
   print(len(() => x))

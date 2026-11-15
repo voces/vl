@@ -91,7 +91,7 @@ import { toString } from "std:fmt"
 function expand(s: string): string {
   const a = s.replaceAll("~T~", "\\t")
   const b = a.replaceAll("~N~", "\\n")
-  b.replaceAll("~R~", "\\r")
+  return b.replaceAll("~R~", "\\r")
 }
 
 function rend(v: Json): string {
@@ -99,7 +99,7 @@ function rend(v: Json): string {
   if t is JsonError {
     return "RENDER " + t.kind + " " + toString(t.at) + " " + t.path
   }
-  "OK " + t
+  return "OK " + t
 }
 
 const txt = readTextFile("${dir}/cases.txt")
@@ -471,7 +471,7 @@ function show(v: Json): string {
   if t is JsonError {
     return "ERR " + t.kind + " " + toString(t.at) + " " + t.path
   }
-  "OK " + t
+  return "OK " + t
 }
 
 // A list nested \`n\` deep: [[[…]]].
@@ -484,7 +484,7 @@ function nest(n: i32): Json {
     cur = outer
     i = i + 1
   }
-  cur
+  return cur
 }
 
 const nan = 0.0 / 0.0

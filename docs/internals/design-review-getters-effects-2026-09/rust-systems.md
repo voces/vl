@@ -145,8 +145,8 @@ What is missing or wrong:
 
 ```vl
 type C = new i32
-get a0(self: C): i32 { (self as! i32) + 1 }
-get a1(self: C): i32 { self.a0 + self.a0 + self.a0 + self.a0 }
+get a0(self: C): i32 { return (self as! i32) + 1 }
+get a1(self: C): i32 { return self.a0 + self.a0 + self.a0 + self.a0 }
 // … a2 through a13, each four reads of the previous
 print(c.a13)   // 268435456: 4^13 ≈ 67M getter calls behind one `.a13`
 ```

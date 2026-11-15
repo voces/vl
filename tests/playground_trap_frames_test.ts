@@ -51,7 +51,7 @@ const TRAP_SRC = [
   "  // line 4",
   "  const xs = [1, 2]",
   "  // line 6",
-  "  xs[n]",
+  "  return xs[n]",
   "}",
   "// line 9",
   "print(boom(0))",
@@ -71,7 +71,7 @@ Deno.test({
     }
     assertEquals(
       result.sourceFrames,
-      ["at main.vl:7:3  in `boom`", "at main.vl:11:1  in `__start__`"],
+      ["at main.vl:7:10  in `boom`", "at main.vl:11:1  in `__start__`"],
       "resolved trap frames",
     );
   },
