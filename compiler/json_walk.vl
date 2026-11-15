@@ -80,6 +80,8 @@ import {
   jwTgtSpell,
   jwTgtTy,
 } from "./check_side_rows"
+import { crRetCalls, crRetNames } from "./check_capture_rows"
+import { nodeTyOf } from "./check_node_tys"
 import { jsonSelfRef, jsonUnionMembers } from "./check_json_shape"
 import {
   PrimName,
@@ -96,6 +98,7 @@ import {
   TyVar,
   tyAt,
   tyElemOf,
+  tySame,
   tyToStr,
   tyValOf,
 } from "./check_types"
@@ -669,6 +672,10 @@ function jwCopyIndex(ix: i32, tok: i32): i32 {
 // which the second check pass reports as a type error rather than dropping silently.
 function jwSubst(ix: i32, key: string, name: string) {
   if ix < 0 { return 0 }
+  // A closure that writes the place reads it unnarrowed, as the checker types it there.
+  if nodeAt(ix) is FuncDecl && jwWritesPlace(ix, key, jwKeyRoot(key)) {
+    return 0
+  }
   if jwPlaceKey(ix) == key {
     const nd: Node = { identName: name, pos: -1 }
     arenaSetNode(ix, nd)
@@ -689,7 +696,7 @@ function jwSubst(ix: i32, key: string, name: string) {
 }
 
 // Substitutes the place in block `blk`'s statements up to the first that rebinds or writes it,
-// where the narrowing ends: a `place = e` or `let root = e` still reads `e` under it, an `if`
+// or calls what may, where the narrowing ends: a `place = e` or `let root = e` still reads `e` under it, an `if`
 // substitutes its test and each arm the same way, and a loop that writes it reads it unnarrowed.
 // The reads after keep the declared type. False when a write sits where no order is known.
 function jwSubstScoped(
@@ -697,6 +704,7 @@ function jwSubstScoped(
   key: string,
   root: string,
   name: string,
+  tgt: i32,
 ): boolean {
   const b = if blk >= 0 { nodeAt(blk) } else { null }
   if !(b is Block) { return false }
@@ -704,7 +712,7 @@ function jwSubstScoped(
     if !jwArmDisturbs(st, key, root) {
       jwSubst(st, key, name)
     } else {
-      return jwSubstAtWrite(st, key, root, name)
+      return jwSubstAtWrite(st, key, root, name, tgt)
     }
   }
   true
@@ -716,6 +724,7 @@ function jwSubstAtWrite(
   key: string,
   root: string,
   name: string,
+  tgt: i32,
 ): boolean {
   const sn = nodeAt(st)
   let rhs = -1
@@ -728,62 +737,136 @@ function jwSubstAtWrite(
   } else if sn is IfStmt {
     if jwArmDisturbs(sn.ifCond, key, root) { return false }
     jwSubst(sn.ifCond, key, name)
-    if !jwSubstScoped(sn.ifThen, key, root, name) { return false }
+    if !jwSubstScoped(sn.ifThen, key, root, name, tgt) { return false }
     if sn.ifElse < 0 { return true }
     const en = nodeAt(sn.ifElse)
-    if en is IfStmt { return jwSubstAtWrite(sn.ifElse, key, root, name) }
-    return jwSubstScoped(sn.ifElse, key, root, name)
+    if en is IfStmt { return jwSubstAtWrite(sn.ifElse, key, root, name, tgt) }
+    return jwSubstScoped(sn.ifElse, key, root, name, tgt)
   } else if sn is Block {
-    return jwSubstScoped(st, key, root, name)
+    return jwSubstScoped(st, key, root, name, tgt)
   } else if sn is WhileStmt || sn is ForIn || sn is ForRange {
     return true
   }
-  if rhs < 0 || jwArmDisturbs(rhs, key, root) { return false }
+  // A call the checker ended the narrowing at: each read it still typed narrowed is the copy.
+  if rhs < 0 {
+    if jwWritesOutsideFns(st, key, root) { return false }
+    jwSubstTyped(st, key, name, tgt)
+    return true
+  }
+  if jwArmDisturbs(rhs, key, root) { return false }
   jwSubst(rhs, key, name)
   true
 }
 
-// Does the arm rebind or write the place? Either would make a blanket substitution
-// wrong (the checker retires a narrowing for exactly these), so the rewrite refuses
-// loudly instead of guessing.
+// Does the arm rebind or write the place, or call what the checker says may? Either ends the
+// narrowing, so a blanket substitution past it would be wrong. A closure's own writes run at
+// its call, so its definition disturbs only by naming a parameter after the root.
 function jwArmDisturbs(ix: i32, key: string, root: string): boolean {
   if ix < 0 { return false }
   const n = nodeAt(ix)
-  if n is LetDecl {
-    if n.letName == root { return true }
-  } else if n is ForIn {
-    if n.fiVar == root { return true }
-    if n.fiVar2 == root { return true }
-  } else if n is ForRange {
-    if n.frVar == root { return true }
-  } else if n is FuncDecl {
-    let p = 0
-    while p < n.fnParams.length {
-      const pn = nodeAt(n.fnParams[p])
-      if pn is Param {
-        if pn.parName == root { return true }
-      }
-      p = p + 1
-    }
-  } else if n is BinExpr {
-    if n.binOp == "=" {
-      const lk = jwPlaceKey(n.binLeft)
-      if lk == key { return true }
-      if lk == root { return true }
-    }
-  }
+  if n is FuncDecl { return jwFnShadows(n, root) }
+  if n is Call && jwCallRetires(ix, key, root) { return true }
+  if jwNodeWrites(n, key, root) { return true }
+  jwAnyChild(ix, key, root, false)
+}
+
+// Whether the subtree at `ix` rebinds or writes the place, closures' bodies included.
+function jwWritesPlace(ix: i32, key: string, root: string): boolean {
+  if ix < 0 { return false }
+  const n = nodeAt(ix)
+  if n is FuncDecl && jwFnShadows(n, root) { return true }
+  if jwNodeWrites(n, key, root) { return true }
+  jwAnyChild(ix, key, root, true)
+}
+
+// Whether `ix`'s children answer `jwWritesPlace` (`deep`) or `jwArmDisturbs`.
+function jwAnyChild(
+  ix: i32,
+  key: string,
+  root: string,
+  deep: boolean,
+): boolean {
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ix
   while cur >= 0 {
     const ks = nodeValueSpineChildren(cur)
     let i = 0
     while i < ks.length {
-      if jwArmDisturbs(ks[i], key, root) { return true }
+      const hit = if deep { jwWritesPlace(ks[i], key, root) } else { jwArmDisturbs(ks[i], key, root) }
+      if hit { return true }
       i = i + 1
     }
     cur = elseIfLink(cur)
   }
   false
+}
+
+// Whether node `n` itself binds the root or assigns the place.
+function jwNodeWrites(n: Node, key: string, root: string): boolean {
+  if n is LetDecl { return n.letName == root }
+  if n is ForIn { return n.fiVar == root || n.fiVar2 == root }
+  if n is ForRange { return n.frVar == root }
+  if n is BinExpr && n.binOp == "=" {
+    const lk = jwPlaceKey(n.binLeft)
+    return lk == key || lk == root
+  }
+  false
+}
+
+// Whether function `n` names a parameter after the root.
+function jwFnShadows(n: FuncDecl, root: string): boolean {
+  for p in n.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parName == root { return true }
+  }
+  false
+}
+
+// Whether the checker ended the narrowing of the place at call `ix`.
+function jwCallRetires(ix: i32, key: string, root: string): boolean {
+  let i = 0
+  while i < crRetCalls.length {
+    if crRetCalls[i] == ix && (crRetNames[i] == key || crRetNames[i] == root) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether the subtree at `ix` rebinds or writes the place outside every closure.
+function jwWritesOutsideFns(ix: i32, key: string, root: string): boolean {
+  if ix < 0 || nodeAt(ix) is FuncDecl { return false }
+  if jwNodeWrites(nodeAt(ix), key, root) { return true }
+  let cur = ix
+  while cur >= 0 {
+    for c in nodeValueSpineChildren(cur) {
+      if jwWritesOutsideFns(c, key, root) { return true }
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// `jwSubst` of only the reads the check typed `tgt`: those evaluated before the narrowing ends.
+function jwSubstTyped(ix: i32, key: string, name: string, tgt: i32) {
+  if ix < 0 { return 0 }
+  if nodeAt(ix) is FuncDecl && jwWritesPlace(ix, key, jwKeyRoot(key)) {
+    return 0
+  }
+  if jwPlaceKey(ix) == key {
+    const t = nodeTyOf(ix)
+    if t >= 0 && tySame(t, tgt) {
+      arenaSetNode(ix, { identName: name, pos: -1 })
+    }
+    return 0
+  }
+  let cur = ix
+  while cur >= 0 {
+    for c in nodeValueSpineChildren(cur) { jwSubstTyped(c, key, name, tgt) }
+    cur = elseIfLink(cur)
+  }
+  0
 }
 
 // Where does the site sit in `c0`? 1 = a positive position (the then arm sees the
@@ -890,7 +973,7 @@ function jwRewriteSite(siteIx: i32, k: i32): string {
       const root = jwKeyRoot(key)
       jwVarCtr = jwVarCtr + 1
       const vname = "__vljv" + i32ToStr(jwVarCtr)
-      if !jwSubstScoped(arm, key, root, vname) {
+      if !jwSubstScoped(arm, key, root, vname, jwTgtTy[k]) {
         return "a deep `is` arm that rebinds or writes `"
           + key
           + "` inside an expression is not supported yet — write it as its own statement, or bind the converted value first"
