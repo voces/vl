@@ -155,7 +155,7 @@ hard-coded `* 10`, so it cannot read a radix-prefixed lexeme at all (see §5), a
 question here — does an exact integer survive? — is not the question it answers — how does
 a decimal *fraction* round?
 
-### `isExactF32IntLitExpr` / `isF32AdoptingLitExpr` (`compiler/typecheck.vl`)
+### `intLitTakesF32` / `isF32AdoptingLitExpr` (`compiler/typecheck.vl`)
 
 `isFloatLitExpr` already existed with five grant sites. Rather than add a sixth predicate
 at each, both halves now funnel through one `isF32AdoptingLitExpr`, so the float and
@@ -308,7 +308,7 @@ lattice's `i32 -> f64` edge, and that edge stops at 2^31. So every integer liter
 an f64 target while the **strictly less precise f32 accepted it**, because f32's predicate
 reads the LEXEME and spans the whole integer range.
 
-The twin is `isExactF64IntLitExpr` over `intLexemeIsExactF64`, and it needs no float half: a
+The twin is `intLitTakesF64` over `intLexemeIsExactF64`, and it needs no float half: a
 `.`-literal already types f64. Both halves of the pair now share one walk each —
 `intLitLexemeOf` for what counts as an integer literal, `intLexemeIsExactFloat(t, sigBits,
 maxWidth)` for exactness, `dstAdmitsPrim(dstTy, prim)` for the destination — so a future width
