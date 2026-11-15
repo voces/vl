@@ -4752,42 +4752,35 @@ fn report_rep_shadow(inst: &Instance, store: &mut Store<()>, path: &str) -> Resu
     Ok(())
 }
 
-/// The SHORTEST round-tripping decimal for `v` in `{:e}` layout, with the spec's tie-break.
+/// The SHORTEST round-tripping decimal for `v` in `{:e}` layout, chosen as ECMA-262
+/// `Number::toString` step 5 chooses it: the fewest digits that round-trip, then the candidate
+/// closest to `v`, then on an exact tie the even last digit.
 ///
-/// `format!("{:e}", v)` is also shortest-round-tripping, but on an EXACT TIE — two candidate
-/// digit strings equidistant from `v` — Rust's shortest formatter chooses the odd last digit
-/// where ECMA-262 `Number::toString` step 5 chooses the even one. Measured over 50,000
-/// pseudo-random doubles against V8: 14 disagreements, every one an exact tie
-/// (silent-class-inventory D1011).
-///
-/// Asking for an EXPLICIT precision takes a different path: Rust's exact-precision float
-/// formatting rounds half-to-EVEN, which is the spec's rule. So walking precisions upward and
-/// taking the first that round-trips yields the shortest digit string under the spec's
-/// tie-break rather than under Rust's. Verified before relying on it: `{:.0}` renders 0.5→0,
-/// 1.5→2, 2.5→2, 3.5→4 and `{:.2}` renders 0.125→0.12, 0.375→0.38 — ties to even at every
-/// probe.
-///
-/// 17 significant digits always round-trips an f64, so the loop terminates; the fallback is
-/// unreachable and exists so this function has no panic path.
+/// `format!("{:e}", v)` gives the fewest digits, `k`, but on an exact tie Rust's shortest
+/// formatter takes the odd last digit (D1011). `{:.*e}` at precision `k` is the correctly
+/// rounded, half-to-even candidate, so when it round-trips it is the closest and the spec's
+/// choice. When it does not, the other neighbour at `k` digits is the one that does, and that
+/// is the one `{:e}` produced. 2^-24 is such a case: its 16-digit half-to-even candidate
+/// `…062` falls in the narrower gap below a power of two and does not round-trip (D16472).
 fn shortest_sci(v: f64) -> String {
-    for k in 1..=17 {
-        let s = format!("{:.*e}", k - 1, v);
-        if s.parse::<f64>() == Ok(v) {
-            return s;
-        }
+    let shortest = format!("{:e}", v);
+    let mant = shortest.split('e').next().unwrap_or("");
+    let k = mant.bytes().filter(|b| b.is_ascii_digit()).count().max(1);
+    let even = format!("{:.*e}", k - 1, v);
+    if even.parse::<f64>() == Ok(v) {
+        even
+    } else {
+        shortest
     }
-    format!("{:e}", v)
 }
 
-/// Render an f64 exactly as JS `String(v)` does (ECMA-262 `Number::toString`, radix
-/// 10) — the rule this host's float print sinks have always CLAIMED to follow, since
-/// `tests/support/runWasm.ts` and `playground/src/runtime.ts` both sink through
-/// `String(v)` and a corpus `@log` line has to match under either host.
+/// Render an f64 exactly as JS `String(v)` does (ECMA-262 `Number::toString`, radix 10). The JS
+/// hosts (`tests/support/runWasm.ts`, `playground/src/runtime.ts`) sink through `String(v)`, so a
+/// corpus `@log` line reads the same under either host; `tests/vl_host_float_print_test.ts`
+/// compares the two over every power of two, the subnormal boundaries and a random sample.
 ///
-/// Rust's `{}` Display already produces the SHORTEST round-tripping digit string,
-/// which is the same digit string JS produces — the two disagree only on FORMATTING,
-/// in four places. Each was measured against Deno on the same wasm module, not
-/// inferred:
+/// The digit string is `shortest_sci`'s, the spec's step 5. This function is the layout, where
+/// Rust's `{}` differs from JS in four places:
 ///
 /// | value           | Rust `{}`                | JS `String(v)` |
 /// | --------------- | ------------------------ | -------------- |
@@ -4795,36 +4788,6 @@ fn shortest_sci(v: f64) -> String {
 /// | `1e21`          | `1000000000000000000000`  | `1e+21`        |
 /// | `1e-7`          | `0.0000001`               | `1e-7`         |
 /// | `f64::INFINITY` | `inf`                     | `Infinity`     |
-///
-/// Only the first was filed; the census that verified it found the other three. The
-/// old comment here said Display "matches JS `String(v)` for the corpus values",
-/// which was true of the corpus and false of the rule.
-///
-/// The digits come from `{:e}` (`<d>[.<ddd>]e<exp>`), whose mantissa is that same
-/// shortest representation and whose exponent is the spec's `n - 1`.
-///
-/// ⚠ AND THAT LAST SENTENCE IS THE NEXT ONE THAT WAS TRUE OF THE CORPUS AND FALSE OF
-/// THE RULE. This function is a RE-FORMAT, so it inherits whatever `{:e}` chose, and
-/// `{:e}`'s shortest representation is not always JS's. ECMA-262 `Number::toString`
-/// step 5 takes the shortest digit string, then the one CLOSEST to the value, and on
-/// an exact tie the one whose last digit is EVEN; Rust's shortest formatter breaks
-/// that tie the other way. Measured 2026-09-01 over 50,000 pseudo-random doubles
-/// against V8: **14 disagreements, every one an exact tie**. Smallest witness: bits
-/// `4835952189745799117`, exactly 2023347301156851.25, whose two 17-digit candidates
-/// `…851.2` and `…851.3` are equidistant — V8 prints the even one, this prints the odd
-/// one. So the same VL program prints differently under the two hosts for those values,
-/// which is exactly what the table above exists to prevent.
-///
-/// THE FIX IS NOT A FIFTH LAYOUT ARM — the four rows above are layout and this is the
-/// DIGIT STRING, so it needs a shortest-with-ties-to-even producer. Cheapest correct
-/// route: `for k in 1..=17 { let s = format!("{:.*e}", k - 1, v); if s.parse::<f64>()
-/// == Ok(v) { take it } }` — exact-precision formatting rounds correctly, so the first
-/// `k` that round-trips is the shortest digit string under the spec's rule. VERIFY
-/// Rust's exact-precision rounding is half-to-EVEN before relying on that.
-/// `std:fmt`'s `toString` already implements the rule in pure VL (Burger–Dybvig with the
-/// spec's final digit choice) and agrees with V8 on 50,000 of 50,000;
-/// `tests/vl_std_float_text_test.ts` pins the divergent set by bit pattern, so fixing
-/// this flips a test rather than passing unnoticed.
 fn js_number_to_string(v: f64) -> String {
     if v.is_nan() {
         return "NaN".to_string();
@@ -6507,12 +6470,8 @@ fn instantiate_program(
     linker.func_wrap("imports", "__print_i64__", move |v: i64| {
         palette.emit(&s, &v.to_string())
     })?;
-    // f64: rendered through `js_number_to_string`, which is JS `String(v)` EXCEPT AT AN
-    // EXACT DECIMAL TIE — the JS hosts (`tests/support/runWasm.ts`,
-    // `playground/src/runtime.ts`) sink through `String(v)`, so a corpus `@log` line has
-    // to read the same under either, and at 14 values in 50,000 it does not. Display
-    // alone diverges on negative zero, on magnitudes outside 1e-7..1e21, and on the
-    // infinities; see that function, whose doc comment carries the tie defect. (Slice 3.)
+    // f64: rendered through `js_number_to_string`, which is JS `String(v)`: the JS hosts sink
+    // through `String(v)`, so a corpus `@log` line reads the same under either.
     let s = sink.clone();
     linker.func_wrap("imports", "__print_f64__", move |v: f64| {
         palette.emit(&s, &js_number_to_string(v))
