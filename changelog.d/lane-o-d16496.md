@@ -1,4 +1,4 @@
-## Compiler
+## Type system (Track A)
 
 - **D16496 closed:** a join whose constant arm does not fit `i32` (or is a float), beside a
   nested join of a typed `i32` arm and a literal arm, no longer builds invalid wasm. Such a
