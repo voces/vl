@@ -6,10 +6,15 @@ union members flattened, sorted and deduplicated, and any other kind by its `tyT
 `"#" + tyCanonSet(ty)`, and `"?"` for no type.
 
 **The 29 disagreements 3b measured.** In 13 files, 27 struct-name splits and 2 Sets inside
-`Box<…>` had looked like a semantic choice per caller. The test settled it: with every key part
-taken as the set id, all 1,839 corpus files and the compiler's own build are byte-identical. No
-instance those keys separated or merged changes the emitted module, so one rule serves every
-caller and no caller needs its own.
+`Box<…>` had looked like a semantic choice per caller. With every key part taken as the set id,
+those 13 files are byte-identical, so one rule serves every caller.
+
+**One byte mover, an intended one.** Over 19,779 files (all of `tests/cases` outside `modules/`,
+plus `distilled/cells` and `distilled/named`), 19,778 are byte-identical. The one that moves is
+`tests/cases/generics/instance-call-of-literal-union-field-function.vl`, 3,333 → 3,181 bytes, and it
+prints the same. Mono's old keys spelled one instance twice there, `F$m1294891004`, with identical
+bodies. That pair was `vl_inst_key_shadow_test.ts`'s documented merge, and mono's own key now makes
+it, so the test lists the file as `SETTLED` (the shadow still runs there and reports no merge).
 
 **Deleted:**
 - `tyCanonKey`'s walk, its cycle stack, its 100,000-type budget, its string memo and the
@@ -31,7 +36,7 @@ The base is 4b (2ddf7f4f) built to its own fixpoint.
 | reading | value |
 |---|---|
 | seed | fixpoint |
-| identity | 1,839 corpus files plus `compiler/entry.vl`: same module and diagnostics |
-| seed size | see the PR |
+| identity | 19,778 of 19,779 files the same module and diagnostics, plus `compiler/entry.vl`; the one mover is above |
+| seed size | 6,385,951 → 6,381,941 bytes (−0.06%) |
 | net compiler lines | −156 (`emit_ty_canon.vl` −99, `emit_ty_seal.vl` −46, `emit_mono.vl` −9, `emit_inst_key.vl` −2) |
 | pin helpers (`emit_mono.vl`) | 908 → 908 |
