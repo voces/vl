@@ -56,7 +56,9 @@ Every differing call is function-valued. Of the 100 listed (at most three per fu
 The 19 covered functions with a differing call are set and bundle calls. Their decisions live in
 `check_fn_tag.vl` (`fnTagDecide`), whose functions are not named `hole*`, so part 2's probe did not
 count them. Function-set decisions belong to family group 1, function-valued holes, whose true count
-is above part 2's figure. Each family PR measures with `fnTag*` included.
+is above part 2's figure. Each family PR measures with `fnTag*` included. The re-run is part 2's
+addendum: in part 2's attribution the tagger adds nothing, because it runs with no owner. Charged to
+the program, it adds 146 programs to group 1.
 
 ## Commands
 
@@ -72,5 +74,18 @@ the recorded side is a union containing it.
 
 - The compiler module and the `entry.vl` export: +180.
 - The host: +37.
-- The test: +70.
+- The test: +70, plus the two exports' row in `vl_compile_cache_test.ts`.
 - The seed grows 6,468,881 → 6,474,330 bytes (+0.08%).
+
+## Cost when unarmed
+
+Nothing calls `ifaceDumpBuild` unless `$VL_IFACES=1`. With it unset, `$VL_FUEL=1` guest fuel, base
+seed against this one:
+
+| compile | base | this PR | delta |
+|---|---|---|---|
+| a 2-line program | 2,656,566 | 2,656,817 | +251 |
+| `compiler/entry.vl` | 89,624,019,541 | 89,624,019,792 | +251 |
+
+The same +251 on both inputs is the new module's start-up, its `ifaceText` global. No per-function or
+per-call work is added.
