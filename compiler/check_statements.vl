@@ -108,7 +108,8 @@ import {
   markObjLitBinding,
 } from "./check_bind_rows"
 import { strLitRecvTy } from "./check_builtin_methods"
-import { coalPinTy, mkDerivedHole } from "./check_coal"
+import { coalPinTy, hdMint, mkDerivedHole } from "./check_coal"
+import { mkTyVarOwned, unannotParamTy } from "./check_subst"
 import {
   brkPrevIxSet,
   brkPrevTySet,
@@ -164,7 +165,6 @@ import { noteNaturalRet, refuseLocalNomEscape } from "./check_demands"
 import { bareRetVoidNote } from "./check_diag_text"
 import { seedExpected } from "./check_expected"
 import {
-  cexTryFoldF32,
   constStrLitBound,
   constrainEmptyExpr,
   recordCtxTy,
@@ -294,6 +294,9 @@ import {
 import { noteNullHole } from "./check_null_holes"
 import {
   lbiDeferRedundant,
+  lbiHoleFields,
+  lbiHoleKinds,
+  lbiHoleRoot,
   lbiIsSynth,
   lbiKeepName,
   lbiMark,
@@ -302,12 +305,7 @@ import {
 } from "./check_num_lit_state"
 import { cexLitPeel, lbiNumTy, numLitBindCandidateTy } from "./check_num_lits"
 import { parenPeelIx } from "./check_places"
-import {
-  recAdBound,
-  recAdOrigDecl,
-  recAdPinInit,
-  recAdPinned,
-} from "./check_rec_adopt_rows"
+import { recAdPass, recAdPinInit, recAdProg } from "./check_rec_adopt_rows"
 import { recordRedundantAnnot } from "./check_redundant_annot"
 import {
   assignable,
@@ -352,7 +350,6 @@ import {
   T,
   TY_BOOL,
   TY_ERR,
-  TY_F32,
   TY_I32,
   TY_NEVER,
   TY_OPEN,
@@ -410,6 +407,22 @@ type LetAnnot = {
   collapsedHere: boolean,
 }
 
+// The hole the literal solve wrote as annotation `ann`, minted again off its root, or -1 when
+// `ann` is no such annotation or its root has been solved to a type.
+function lbiHolePinTy(ann: i32): i32 {
+  const root = lbiHoleRoot[ann] ?? []
+  if root.length < 2 { return -1 }
+  let t = if root[0] == root[1] { unannotParamTy(root[0]) } else { mkTyVarOwned(root[0], root[1]) }
+  const kinds = lbiHoleKinds[ann] ?? []
+  const fields = lbiHoleFields[ann] ?? []
+  let j = kinds.length - 1
+  while j >= 0 && t >= 0 && j < fields.length {
+    t = hdMint(kinds[j], fields[j], -1, -1, false, t)
+    j = j - 1
+  }
+  t
+}
+
 // The type annotation node `ann` already holds from an earlier check of the same body, at this
 // pass's type-parameter bindings; -1 when it holds none, a type variable survives, or two bound
 // parameters share a name, which substitution by name cannot tell apart (D16012).
@@ -446,7 +459,8 @@ function letDeclResolveAnnot(n: LetDecl): LetAnnot {
     if tn is TypeRef {
       // A binding the list-union rewrite minted is typed as the rewrite typed it, since a
       // written `T[] | i32[]` resolves to one list (D2876).
-      const lua = mintedAnnTy(n.letType)
+      const hp = lbiHolePinTy(n.letType)
+      const lua = if hp >= 0 { hp } else { mintedAnnTy(n.letType) }
       if lua >= 0 {
         annot = lua
       } else {
@@ -493,7 +507,7 @@ function letDeclGradeAnnotated(n: LetDecl, ix: i32, annot: i32, initTy: i32) {
   // second "cannot assign ... of type <empty>" at every use site.
   const neverAnnot = isNeverTy(annot)
   const savedPin = recAdPinInit
-  recAdPinInit = recAdPinned[ix] ?? false
+  recAdPinInit = recAdProg.pinned[ix] ?? false
   const fits = neverAnnot || assignableExpr(n.letInit, initTy, annot)
   recAdPinInit = savedPin
   if !fits {
@@ -508,6 +522,14 @@ function letDeclGradeAnnotated(n: LetDecl, ix: i32, annot: i32, initTy: i32) {
     // The check above is vacuous whenever a side is a hole — record the pair for the pin to
     // re-ask under substitution, only on the PASSING side (a failing one already reported, D572).
     noteLetCstr(coalPinTy(n.letInit, initTy), annot, n.letInit, n.letName)
+    // The literal of a binding the solve gave a hole is built at each instance's pin.
+    if (
+      tyIsHole(annot)
+      && lbiIsSynth(n.letType, ix)
+      && cexLitPeel(n.letInit) >= 0
+    ) {
+      nodeTySet(cexLitPeel(n.letInit), annot)
+    }
     // And the slots of a literal source too, but only when the pair above carried no hole —
     // that is exactly when the literal's own element join dropped one, so nothing is recorded.
     if !tyHasHole(initTy) {
@@ -649,7 +671,6 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   const keptJoin = if annot < 0 { letKeptJoinAtPin(n.letInit) } else { -1 }
   if n.letInit >= 0 {
     if tpEnvNames.length > 0 { tpIfMarkOk(n.letInit) }
-    if annot == TY_F32 { cexTryFoldF32(n.letInit) }
     initTy = checkNodeHook(n.letInit)
   }
   if keptJoin >= 0 && initTy >= 0 { initTy = keptJoin }
@@ -781,8 +802,8 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   }
   // A function `let` re-pointed later reads its initialiser's function until the first write.
   if annot < 0 { letFnWriteRow(ix, bound, n.letInit, initTy) }
-  if recAdOrigDecl.length > 0 && (recAdPinned[ix] ?? false) {
-    recAdBound.push(bound)
+  if recAdProg.origDecl.length > 0 && (recAdProg.pinned[ix] ?? false) {
+    recAdPass.bound.push(bound)
   }
   crNoteSoleRef(n, ix)
   getLetBank(ix, bound)
@@ -1954,15 +1975,6 @@ export function checkRetStmtNode(n: RetStmt, ix: i32) {
     }
     if voidValueSlotErr(got, n.retArg, "return", ix) { return TY_VOID }
   }
-  // Redundant-return rule: witness the explicit return's natural type (before
-  // constrainEmpty); an annotation-influenced return disqualifies the function.
-  if retInfluencedByAnnot(n.retArg) || retSiteTypedByAnnot(n.retArg, got) {
-    retNaturalErrSet(true)
-  }
-  noteNaturalRet(got)
-  // An explicit `return inner` of an empty collection pins its element from the
-  // declared return type — usage-driven inference clearing the floor.
-  constrainEmptyExpr(n.retArg, got, want)
   // A returned `if` is graded as one value, as it lowers. One whose join does not fit but whose
   // every arm does is graded arm by arm, as a tail one is; an else-less one that can fall through
   // is a value with `null`.
@@ -1997,6 +2009,14 @@ export function checkRetStmtNode(n: RetStmt, ix: i32) {
     // re-ask under substitution, only on the passing side (D551 body / D561 declared side).
     noteRetCstr(coalPinTy(n.retArg, got), want, n.retArg)
   }
+  // Redundant-return rule: witness the explicit return's natural type (before
+  // constrainEmpty); an annotation-influenced return disqualifies the function.
+  if retInfluencedByAnnot(n.retArg) || retSiteTypedByAnnot(n.retArg, got) {
+    retNaturalErrSet(true)
+  }
+  noteNaturalRet(got)
+  // An empty collection pins its element from the declared return once graded, as a tail's does.
+  constrainEmptyExpr(n.retArg, got, want)
   return TY_VOID
 }
 // ── block ─────────────────────────────────────────────────────────────────

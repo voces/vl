@@ -10,7 +10,7 @@
 // overwrites it at top level without reading it: the compile prologue, a pass, a frame
 // builder, some inner function. A `let` none clears is safe by shape (`letShape`), by a
 // reviewed list (LSTAMPED, LSCOPED, LINSTANCE), or NEVER. The frame-builder table lists the
-// `fnUses*` flags one of the two frame builders resets and the other does not (D1006/D1007).
+// `fnUses` frame fields one of the two frame builders resets and the other does not (D1006/D1007).
 //
 // `--check` is an invariant, not a ratchet: it exits 1 naming every NEVER row, every emitter
 // inner integer register holding a per-program id (D11770) that GUARDED does not cover, and
@@ -949,9 +949,100 @@ type Audit = {
   writes: i32[],
   assigned: string[][],
   sides: string[][],
+  frameFields: string[],
+  sideClears: string[][],
   index: boolean[],
   guards: string[],
   cont: CAudit,
+}
+
+// The frame record's fields, read off `export type FnUses = {` in emit_state.vl.
+function frameFieldsOf(srcs: Src[]): string[] {
+  const out: string[] = []
+  for x in srcs {
+    if x.file == "emit_state.vl" {
+      let inType = false
+      for l in x.lines {
+        if startsWith(l, "export type FnUses = {") {
+          inType = true
+        } else if inType && startsWith(l, "}") {
+          inType = false
+        } else if inType {
+          const t = stripWs(l)
+          const c = t.indexOf(":")
+          if c > 0 { out.push(t.slice(0, c)) }
+        }
+      }
+    }
+  }
+  if out.length == 0 {
+    die(
+      "emit_state.vl declares no `export type FnUses`; the frame record moved",
+      2,
+    )
+  }
+  out
+}
+
+// The fields a helper named `name` copies from its argument (`u.F = was.F`).
+function carriedBy(name: string, srcs: Src[]): string[] {
+  const out: string[] = []
+  for x in srcs {
+    let n = 0
+    while n < x.lines.length {
+      if x.lineFn[n] == name {
+        const t = stripWs(x.lines[n])
+        const d = t.indexOf(".")
+        const e = t.indexOf(" = ")
+        if (
+          startsWith(t, "u.")
+          && d == 1
+          && e > 2
+          && t.indexOf("was." + t.slice(2, e)) == e + 3
+        ) {
+          out.push(t.slice(2, e))
+        }
+      }
+      n = n + 1
+    }
+  }
+  out
+}
+
+// Per frame-builder side, the record fields its functions clear: every field at
+// `fnUses = fnUsesNone()`, every field a helper does not carry at `fnUses = HELPER(…)`, and each
+// field `fnUses.F = …` writes.
+function sideClearsOf(
+  sides: string[][],
+  srcs: Src[],
+  fields: string[],
+): string[][] {
+  const out: string[][] = []
+  for side in sides {
+    const got: string[] = []
+    for x in srcs {
+      let n = 0
+      while n < x.lines.length {
+        if inList(side, x.lineFn[n]) {
+          const t = stripWs(x.lines[n])
+          if startsWith(t, "fnUses = ") {
+            const call = t.slice(9, t.length)
+            const p = call.indexOf("(")
+            const keep = if call == "fnUsesNone()" { [] } else { carriedBy(call.slice(0, p), srcs) }
+            for fl in fields {
+              if !inList(keep, fl) { addUnique(got, fl) }
+            }
+          } else if startsWith(t, "fnUses.") {
+            const e = t.indexOf(" = ")
+            if e > 7 { addUnique(got, t.slice(7, e)) }
+          }
+        }
+        n = n + 1
+      }
+    }
+    out.push(got)
+  }
+  out
 }
 
 function addUnique(xs: string[], x: string) {
@@ -1129,6 +1220,8 @@ function audit(without: string): Audit {
     writes: writes,
     assigned: assigned,
     sides: sides,
+    frameFields: frameFieldsOf(srcs),
+    sideClears: sideClearsOf(sides, srcs, frameFieldsOf(srcs)),
     index: index,
     guards: guards,
     cont: contAudit(srcs, without, prologue, pass, frame, letHomes, letKinds),
@@ -1811,14 +1904,11 @@ function report(a: Audit, names: boolean) {
   }
   print("")
   const bad: string[] = []
-  const flags = sortedIx(
-    a,
-    (i: i32): boolean => startsWith(a.decls[i].name, "fnUses"),
-  )
-  for i in flags {
-    const n = a.decls[i].name
-    const sa = anyIn(a.assigned[i], a.sides[0])
-    const sb = anyIn(a.assigned[i], a.sides[1])
+  const flags = a.frameFields
+  for fl in flags {
+    const n = "fnUses." + fl
+    const sa = inList(a.sideClears[0], fl)
+    const sb = inList(a.sideClears[1], fl)
     let tail = ""
     if sa != sb {
       bad.push(n)

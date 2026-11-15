@@ -87,6 +87,7 @@ import {
   fnNameIsLambda,
   hasSpreadItem,
   i32ToStr,
+  identNameAt,
   isExprKid,
   loopVarLoop,
   memberCallRungOf,
@@ -867,7 +868,6 @@ import {
   sFieldIndex,
 } from "./emit_struct_order"
 import {
-  TY_WALK_DEPTH,
   coalResultTyOf,
   coalesceKeepsScalarBox,
   coalesceNicheLhs,
@@ -877,7 +877,6 @@ import {
   fnInPinnedInstance,
   forInWalksMapValues,
   holeOperandTyOf,
-  identNameOrEmpty,
   instanceTyOf,
   mapArmShapeOfTy,
   mapRecvTyIn,
@@ -4301,7 +4300,7 @@ function pinKindFitsTy(
   // A scalar and a reference share no slot, and two references one only as one type.
   const pRef = tyIsRefShaped(pin)
   const rRef = tyIsRefShaped(rowTy)
-  if pRef && rRef { return tySameSet(pin, rowTy, TY_WALK_DEPTH) }
+  if pRef && rRef { return tySameSet(pin, rowTy) }
   if pRef { return rk == 0 }
   if rRef { return lk == 0 }
   true
@@ -5878,7 +5877,7 @@ export function coalesceMapReadJoins(exprIx: i32, fnIx: i32): boolean {
   if !coalesceResultIsBox(ix, fnIx) { return false }
   const vt = tyPeelNul(tyMapValOf(mapRecvTyIn(recv, fnIx)))
   if vt < 0 { return false }
-  !tySameSet(vt, tyPeelNul(nodeTyAt(ix, fnIx)), TY_WALK_DEPTH)
+  !tySameSet(vt, tyPeelNul(nodeTyAt(ix, fnIx)))
 }
 
 // The one nullability decision for the `??` reps: a non-null default collapses to the
@@ -6163,6 +6162,9 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
       return asgReadUnwidenOp(asgIx, fnIx) >= 0
     }
   }
+  // A `K | null` niche place holds the atom of the member written, which its re-read yields
+  // (D16343).
+  if exprNulLitUnion(a.binLeft, fnIx) { return true }
   // A place wider than the right side is re-read and taken back to the right side's rep, as a
   // name's is (D14820).
   asgReadUnwidenOp(asgIx, fnIx) >= 0
@@ -8170,6 +8172,8 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       // when that target is one whose members are known (D2168).
       if e.binOp == "=" {
         if !assignTargetReReads(unwrapParen(exprIx), fnIx) { return false }
+        // A `K | null` niche target holds the atom of the member written (D16184).
+        if exprNulLitUnion(e.binLeft, fnIx) { return true }
         if litAtomMemberTy(e.binLeft, fnIx) < 0 { return false }
         return exprIsLitAtom(e.binLeft, fnIx)
       }
@@ -8486,7 +8490,7 @@ export function holeOrCapturedTyOf(ix: i32, fnIx: i32): i32 {
 // captured through, ending at the one that declares it; empty for anything but a captured name.
 function captureDeclFrames(ix: i32, fnIx: i32): i32[] {
   const out: i32[] = []
-  const name = identNameOrEmpty(unwrapParen(ix))
+  const name = identNameAt(unwrapParen(ix))
   if name == "" { return out }
   let cur = fnIx
   while out.length < 8 && identIsEnvCapture(cur, name) {
@@ -8663,7 +8667,7 @@ export function asgNameWiderRow(asgIx: i32, fnIx: i32): i32 {
 }
 
 // The representative of struct row `r`'s heap (`sTwin`), or -1 for none.
-function sTwinRepOf(r: i32): i32 {
+export function sTwinRepOf(r: i32): i32 {
   if r < 0 { return -1 }
   if r < sTwin.length { return sTwin[r] }
   r
@@ -12548,12 +12552,29 @@ export function exprListRep(exprIx: i32, fnIx: i32): VKind | null {
   // The checked-rep column at its instance's type, or at its receiver's list for a read an
   // `is K[]` narrowed (D4916). Only a node's own type read through its hole asks the node.
   const nrt = listNarrowRecvTyOf(exprIx, fnIx)
-  const ty = if nrt >= 0 { nrt } else { nodeTyInOf(exprIx, fnIx) }
+  const nl = nullLitDeliveredTy(exprIx, fnIx)
+  const ty = if nrt >= 0 { nrt } else if nl >= 0 { nl } else { nodeTyInOf(exprIx, fnIx) }
   if nodeHoleElemOf(exprIx) >= 0 && ty == nodeTyIxOf(exprIx) {
     const d = repOfNodeAt(exprIx, ty)
     return if d.rdCovered == 1 { listOfKind(d.rdKind) } else { null }
   }
   tyListRep(ty)
+}
+
+// The list a null-only list literal `ix` is built at, the one its delivery stamped, which names
+// the element its own `null[]` does not (D16314); -1 for any other node, or where no delivery
+// named an element. Every reader classifying a list's atoms asks it before the node's own type.
+export function nullLitDeliveredTy(ix: i32, fnIx: i32): i32 {
+  if (
+    ix < 0
+    || !(nodeAt(ix) is ArrayLit)
+    || !isNullTy(tyArrayElemIx(nodeTyInOf(ix, fnIx)))
+  ) {
+    return -1
+  }
+  const r = litRepTyAt(ix, fnIx)
+  if r < 0 || r >= T.tys.length || isNullTy(tyArrayElemIx(r)) { return -1 }
+  if tyAt(r) is TyArray { r } else { -1 }
 }
 
 // The list rep a value of type `ty` holds, or null when it is no list.
@@ -13187,12 +13208,15 @@ function kindIn(k: string, ks: string[]): boolean {
 }
 
 // Whether the read at `exprIx` may read a string ref: typed a string or a nullable string, or a
-// literal union, which a box narrowed to that arm holds as its member string.
+// literal union, which a box narrowed to that arm holds as its member string. A template's own
+// type parameter reads none.
 function readMayBeString(exprIx: i32, fnIx: i32): boolean {
-  const d = repOfNode(exprIx, fnIx)
+  const ty = nodeTyAt(exprIx, fnIx)
+  if ty >= 0 && ty < T.tys.length && tyAt(ty) is TyVar { return false }
+  const d = repOfNodeAt(exprIx, ty)
   if d.rdCovered != 1 { return false }
   if d.rdKind == "str" || d.rdKind == "nulstr" { return true }
-  d.rdKind == "i32" && tyIsLitUnion(nodeTyAt(exprIx, fnIx))
+  d.rdKind == "i32" && tyIsLitUnion(ty)
 }
 
 // Whether read rep `rr` reads a string ref: 1 or 0, or -1 where it has no answer (no read rep,

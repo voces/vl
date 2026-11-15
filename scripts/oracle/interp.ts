@@ -308,8 +308,8 @@ function litArith(op: string, a: Lit, b: Lit, expK: string | null = null): Val {
   } else {
     // E9.1 (owner ruling 2026-11-15): a float constant folds in IEEE, as at run time; an integer
     // operand converts to the nearest double first. JS numbers are IEEE doubles, `%` is `fmod`.
-    // The tree of a binding annotated `f32` folds in f32 arithmetic instead (`f32Fold`).
-    const at = f32Fold ? Math.fround : (v: number) => v;
+    // A tree used at `f32` folds in f32 arithmetic instead (`expK`, or `f32Fold` at a binding).
+    const at = f32Fold || expK === "f32" ? Math.fround : (v: number) => v;
     const x = at(a.f ?? Number(a.i)), y = at(b.f ?? Number(b.i));
     switch (op) {
       case "+": return new Lit(null, at(x + y), false);
@@ -866,6 +866,25 @@ export class Interp {
     }
   }
 
+  // A type parameter no argument's parameter names is bound by the call's destination type
+  // (D16410); with no destination the call is refused. A generic function passed bare still binds
+  // (D16411: a later call of the result binds it).
+  unboundTyParam(d: FnDecl, args: { name: string | null; e: Expr }[], exp: Ty | null) {
+    if (!d.tparams.length || (exp && !mentions(exp, "any"))) return;
+    const bound = new Set<string>();
+    const pos = args.filter((a) => a.name === null);
+    let pi = 0;
+    for (const p of d.params) {
+      const named = args.find((x) => x.name === p.name);
+      const got = named ? [named] : p.rest ? pos.slice(pi) : pi < pos.length ? [pos[pi]] : [];
+      if (!named) pi = p.rest ? pos.length : pi + got.length;
+      if (!p.ty || !got.length) continue;
+      for (const t of d.tparams) if (mentions(p.ty, t)) bound.add(t);
+    }
+    const free = d.tparams.find((t) => !bound.has(t));
+    if (free) throw new TypeFault(`cannot infer type parameter \`${free}\` of ${d.name}: no argument binds it and the call has no destination type`);
+  }
+
   callValue(f: Val, args: { name: string | null; e: Expr }[], env: Env, line: number): Val {
     if (f instanceof Fn) return this.callFn(f, args.map((a) => ({ name: a.name, v: null, e: a.e })), env, line);
     if (f instanceof Bi) return f.call(this.evalArgs(args, env), this);
@@ -996,7 +1015,7 @@ export class Interp {
         }
         throw new TypeFault("index into " + show(o));
       }
-      case "call": return this.call(e, env);
+      case "call": return this.call(e, env, exp);
       case "as": return this.cast(e, env);
       case "is": {
         const v = this.eval(e.e, env, null);
@@ -1205,6 +1224,17 @@ export class Interp {
       const k = numKind(l);
       r = this.eval(e.r, env, rExp ?? (arithOp && !exp && k && isConstTree(e.r) && !["<<", ">>", ">>>"].includes(op) ? { k: "name", name: k, args: [] } : null));
     }
+    // E9.1: a float constant tree that adopts an `f32` peer folds in f32 arithmetic, whatever
+    // destination is outside the operator. A tree is pure, so it is evaluated again.
+    if (arithOp && !["<<", ">>", ">>>"].includes(op) && !f32Fold) {
+      const atF32 = (te: Expr, v: Val, peer: Val): Val => {
+        if (!(v instanceof Lit) || v.f === null || !isConstTree(te) || numKind(peer) !== "f32") return v;
+        f32Fold = true;
+        try { return this.eval(te, env, null); } finally { f32Fold = false; }
+      };
+      l = atF32(e.l, l, r);
+      r = atF32(e.r, r, l);
+    }
     // An operator function (`function "+"(self: V, other: V)`) applies to its own types.
     const opFns = env.lookupFns(op);
     if (opFns && !(l instanceof Lit) && numKind(l) === null && typeof l !== "string" && typeof l !== "boolean" && l !== null) {
@@ -1226,7 +1256,7 @@ export class Interp {
       if (op === ">>>" && l.i !== null && l.i < 0n && !l.radix && expK === "i64") return arith(">>>", litTo(l, "i64"), litDefault(r));
       // E9.1: the exact constant is computed first and typed at its use.
       if (l.join || r.join) return arith(op, l, r, expK);
-      return litArith(op, l, r, expK);
+      return litArith(op, l, r, expK ?? (this.isF32(exp, env) ? "f32" : null));
     }
     return arith(op, l, r, expK);
   }
@@ -1243,13 +1273,24 @@ export class Interp {
       // E7.2: a compound assignment evaluates its target's object and index once.
       const target = this.freeze(e.target, env);
       const cur = this.eval(target, env, null);
-      v = arith(e.op.slice(0, -1), cur, this.eval(e.e, env, null));
+      // E9.1: a constant tree beside an `f32` target folds in f32 arithmetic, as at run time.
+      f32Fold = isConstTree(e.e) && numKind(cur) === "f32";
+      let rhs: Val;
+      try { rhs = this.eval(e.e, env, null); } finally { f32Fold = false; }
+      v = arith(e.op.slice(0, -1), cur, rhs);
       this.store(target, v, env);
       return v;
     }
   }
+  // Whether `t`'s one number member is `f32` (`f32`, `f32 | null`, `F | string` with `F = f32`):
+  // the member a constant tree adopts (E9.1). Each arm is resolved through its aliases.
   isF32(t: Ty, env: Env): boolean {
-    try { const r = this.resolve(t, env); return r.k === "name" && r.name === "f32"; } catch { return false; }
+    try {
+      const r = this.resolve(t, env);
+      const arms = (r.k === "union" ? r.arms : [r]).map((a) => this.resolve(a, env));
+      const nums = arms.filter((a) => a.k === "name" && NUMERIC.has(a.name));
+      return nums.length === 1 && nums[0].k === "name" && nums[0].name === "f32";
+    } catch { return false; }
   }
   freeze(t: Expr, env: Env): Expr {
     if (t.k === "index") return { k: "index", e: { k: "val", v: this.eval(t.e, env, null) }, i: { k: "val", v: this.eval(t.i, env, null) } };
@@ -1332,7 +1373,7 @@ export class Interp {
     throw new TypeFault(`member '${name}' of ${show(o)}`);
   }
 
-  call(e: Extract<Expr, { k: "call" }>, env: Env): Val {
+  call(e: Extract<Expr, { k: "call" }>, env: Env, exp: Ty | null = null): Val {
     if (e.f.k === "member") {
       const recvE = e.f.e, name = e.f.name;
       const recv = this.eval(recvE, env, null);
@@ -1359,17 +1400,27 @@ export class Interp {
             f = this.pickOverload(fns, first, env);
             return this.callFn(f, [{ name: null, v: first, e: null }, ...e.args.slice(1).map((a) => ({ name: a.name, v: null, e: a.e }))], env, e.line);
           }
+          this.unboundTyParam(f.decl, e.args, exp);
           return this.callFn(f, e.args.map((a) => ({ name: a.name, v: null, e: a.e })), env, e.line);
         }
       }
     }
     const f = this.eval(e.f, env, null);
+    if (f instanceof Fn) this.unboundTyParam(f.decl, e.args, exp);
     // E2.7 keeps an operand's width, and E9.1 does not make min/max/abs of constants a
     // constant: a constant argument adapts to a typed one, else takes its own default; the
     // destination does not reach it.
     if (f instanceof Bi && ["min", "max", "abs"].includes(f.name)) {
       const args = this.evalArgs(e.args, env);
       const typed = args.some((a) => !(a instanceof Lit) && numKind(a) !== null);
+      // E9.1: a constant tree beside an `f32` argument folds in f32 arithmetic; a tree is pure.
+      if (args.some((a) => !(a instanceof Lit) && numKind(a) === "f32")) {
+        args.forEach((a, i) => {
+          if (!(a instanceof Lit) || !isConstTree(e.args[i].e)) return;
+          f32Fold = true;
+          try { args[i] = this.eval(e.args[i].e, env, null); } finally { f32Fold = false; }
+        });
+      }
       const lits = args.filter((a) => a instanceof Lit) as Lit[];
       return f.call(args.map((a) => a instanceof Lit && !typed ? (lits.length === 2 ? pairDefault(a, lits[0] === a ? lits[1] : lits[0]) : litDefault(a)) : a), this);
     }
@@ -1537,6 +1588,19 @@ function mentionsParam(t: Ty, env: Env): boolean {
 
 function isNumLit(e: Expr): boolean {
   return e.k === "int" || e.k === "float" || (e.k === "un" && e.op === "-" && isNumLit(e.e));
+}
+
+// Whether the type `t` names `name` anywhere in it.
+function mentions(t: Ty, name: string): boolean {
+  switch (t.k) {
+    case "name": return (t.name === name && t.args.length === 0) || t.args.some((a) => mentions(a, name));
+    case "list": return mentions(t.el, name);
+    case "map": return mentions(t.key, name) || mentions(t.val, name);
+    case "union": return t.arms.some((a) => mentions(a, name));
+    case "rec": return t.fields.some((f) => mentions(f.ty, name));
+    case "fn": return t.params.some((a) => mentions(a, name)) || mentions(t.ret, name);
+    case "lit": case "null": return false;
+  }
 }
 
 function subst(t: Ty, m: Map<string, Ty>): Ty {

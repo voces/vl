@@ -692,38 +692,102 @@ export let loopBrkLabel: string[] = []
 // absolute depth and its result binding's wasm local, so a `break v` into it hands the value over.
 export let lvFrameDepth: i32[] = []
 export let lvFrameLocal: i32[] = []
+// Which scratch frames the function being laid out needs, one field per frame: the two frame
+// builders start each function from `fnUsesNone()`. `packedPush` is a row bitmask, bit `r` for
+// row `r`; every other field is a flag.
+export type FnUses = {
+  push: boolean,
+  refPush: boolean,
+  strPush: boolean,
+  nulStrPush: boolean,
+  f64Push: boolean,
+  i64Push: boolean,
+  f32Push: boolean,
+  packedPush: i32,
+  strOp: boolean,
+  listEqI: boolean,
+  listEqS: boolean,
+  cloEq: boolean,
+  arrNew: boolean,
+  coalesceCall: boolean,
+  variantRebox: boolean,
+  unionSink: boolean,
+  unionLetSink: boolean,
+  mapFrame: boolean,
+  mapKeys: boolean,
+  mapVals: boolean,
+  optRecv: boolean,
+  listGet: boolean,
+  atomStage: boolean,
+  mapFilter: boolean,
+}
+
+export function fnUsesNone(): FnUses {
+  {
+    push: false,
+    refPush: false,
+    strPush: false,
+    nulStrPush: false,
+    f64Push: false,
+    i64Push: false,
+    f32Push: false,
+    packedPush: 0,
+    strOp: false,
+    listEqI: false,
+    listEqS: false,
+    cloEq: false,
+    arrNew: false,
+    coalesceCall: false,
+    variantRebox: false,
+    unionSink: false,
+    unionLetSink: false,
+    mapFrame: false,
+    mapKeys: false,
+    mapVals: false,
+    optRecv: false,
+    listGet: false,
+    atomStage: false,
+    mapFilter: false,
+  }
+}
+
+export let fnUses: FnUses = fnUsesNone()
+
+// The start function's frames: fresh, but for the four fields its builder never clears. The sweep
+// sets `packedPush` and `mapVals` for this body like any other, and a stale true from this compile
+// only reserves an unused frame (`emitStateReset` clears both per compile); each caller decides
+// the two sink flags after this.
+export function fnUsesForStart(was: FnUses): FnUses {
+  const u = fnUsesNone()
+  u.packedPush = was.packedPush
+  u.mapVals = was.mapVals
+  u.unionSink = was.unionSink
+  u.unionLetSink = was.unionLetSink
+  u
+}
+
 // Per-function scratch frames: `fbBeginFunc` (emit_bytes) owns the layout, walking
 // frames in a fixed order after params+locals and reserving each only when its
-// `fnUses*` flag is set — a new frame is appended last so an unused function keeps
+// `fnUses` field is set — a new frame is appended last so an unused function keeps
 // its layout. `.push(x)` lowers inline, so each list kind needs its own typed quad.
-export let fnUsesPush = false    // i32 list: backing `(ref $aTypeIdx)`
-export let pushScratchBase = 0
-export let fnUsesRefPush = false // ref list (G7-ref): backing over the element row's `(ref null $elem)`
-export let refPushScratchBase = 0
+export let pushScratchBase = 0 // i32 list: backing `(ref $aTypeIdx)`
+export let refPushScratchBase = 0 // ref list (G7-ref): backing over the element row's `(ref null $elem)`
 // A function pushing onto distinct ref-list element types needs a separately-typed
 // quad per element type. `fnRefPushSlots` lists the table slots it pushes onto
 // (first-seen order); `refPushBaseBySlot[k]` is the k-th quad's base, and
 // `refPushScratchBaseFor` maps a table slot to its base (`refPushScratchBase` aliases the first).
 export let fnRefPushSlots: i32[] = []
 export let refPushBaseBySlot: i32[] = []
-// `string[]`: val + backing are `(ref $sTypeIdx)` / `(ref $mkArrIdx)`, recvRef `(ref
-// $mkListIdx)`. Its base is `strPushScratchBase`, declared at the end of this group.
-export let fnUsesStrPush = false
-// A `(string | null)[]` push shares that quad — the niche's backing IS the string list — but
-// its VALUE slot must be `(ref null $aTypeIdx)`, because the pushed value may be `null`. The
-// ref-push frame carries the same distinction per element slot (`rlElemNullable`); the string
-// quad has one flag because there is one string backing. ADDITIVE to `fnUsesStrPush`.
-export let fnUsesNulStrPush = false
-export let fnUsesF64Push = false // `f64[]`: val f64, backing/recvRef $fa64/$fl64
-export let f64PushScratchBase = 0
-export let fnUsesI64Push = false // `i64[]`: val i64, backing/recvRef $ia64/$il64
-export let i64PushScratchBase = 0
-export let fnUsesF32Push = false // `f32[]`: val f32, backing/recvRef $fa32/$fl32
-export let f32PushScratchBase = 0
+// `string[]` (`fnUses.strPush`): val + backing `(ref $sTypeIdx)` / `(ref $mkArrIdx)`, recvRef
+// `(ref $mkListIdx)`, based at `strPushScratchBase`. A `(string | null)[]` push (`nulStrPush`, set
+// beside `strPush`) shares that quad, the niche's backing being the string list, but its value slot
+// is `(ref null $aTypeIdx)`, as the ref-push frame distinguishes per slot (`rlElemNullable`).
+export let f64PushScratchBase = 0 // `f64[]`: val f64, backing/recvRef $fa64/$fl64
+export let i64PushScratchBase = 0 // `i64[]`: val i64, backing/recvRef $ia64/$il64
+export let f32PushScratchBase = 0 // `f32[]`: val f32, backing/recvRef $fa32/$fl32
 // The packed lists: one quad per row pushed, val i32 (a stored VALUE is an i32, only the
 // backing is packed) and the row's backing/recvRef. Not the i32 quad: the value slot matches,
-// the two ref slots do not. `fnUsesPackedPush` is the row bitmask, bit `r` for row `r`.
-export let fnUsesPackedPush = 0
+// the two ref slots do not. `fnUses.packedPush` is the row bitmask, bit `r` for row `r`.
 export let u8PushScratchBase = 0
 
 // The push-kind bit a `.push` onto packed row `row` sets: 128 for `u8`, then 1024, 2048, 4096.
@@ -737,7 +801,7 @@ export function pkPushBase(row: i32): i32 {
   let n = 0
   let r = 0
   while r < row {
-    if (fnUsesPackedPush & (1 << r)) != 0 { n = n + 1 }
+    if (fnUses.packedPush & (1 << r)) != 0 { n = n + 1 }
     r = r + 1
   }
   u8PushScratchBase + 4 * n
@@ -747,15 +811,12 @@ export let strPushScratchBase = 0
 // string ops (slice, ordering, indexOf, charCodeAt) lower inline and need temporaries
 // to stash operand strings, so each is evaluated once and an element loop can run.
 // One shared frame (`strScratchBase` + 12 slots) covers them all, reserved by `fnHasStrOp`.
-export let fnUsesStrOp = false
 export let strScratchBase = 0
 // Per-function list `==`/`!=`/`+` scratch frames (collections-design section VL.4/6), one
 // typed frame per receiver list kind so a nested compare never clobbers its outer loop:
 //   LEQI (5): A/B `(ref $lTypeIdx)`, out `(ref $aTypeIdx)` (concat), n, i . LEQS (4):
 //   A/B `(ref $mkListIdx)`, n, i (strScr) . LEQR (4, per ref-list slot): A/B `(ref $rlWrapIdx[slot])`, n, i
-export let fnUsesListEqI = false
 export let leqIScratchBase = 0
-export let fnUsesListEqS = false
 export let leqSScratchBase = 0
 export let fnListEqRSlots: i32[] = []
 export let leqRBases: i32[] = []
@@ -777,19 +838,16 @@ export let leqgBases: i32[] = []
 // struct equality whose shape carries a function-typed field) stages both closure
 // fat-pointers in a 2-slot `(ref $cloStruct)` frame so each operand's id+env fields
 // read off one evaluation. Flagged by `cloEqNoteBin` riding the leq scan.
-export let fnUsesCloEq = false
 export let cloEqScratchBase = 0
 // Per-function array-intrinsic scratch (std-design D1): `__array_new__(n, fill)` and
 // `__array_new_default__(n)` stage the runtime length `n` in one i32 slot, feeding the
 // allocation size and the list wrapper's len/cap fields. Flagged by `fnScratchMisses`;
 // `__array_copy__`/`__trap__` need no scratch.
-export let fnUsesArrNew = false
 export let arrNewScratchBase = 0
 // `f(x) ?? d` (call-LHS null-coalesce) frame: stashes the call's result once so the
 // null test and recovery read the same evaluation. Three slots, one per rep the call
 // may return (a value-union box, a `string | null` niche, a `boolean | null` niche).
 // Flagged by `fnScratchMisses`, which over-approximates any call-LHS `??`.
-export let fnUsesCoalesceCall = false
 export let coalesceCallSlot = 0
 export let coalesceCallStrSlot = 0
 export let coalesceCallBoolSlot = 0
@@ -797,14 +855,11 @@ export let coalesceCallBoolSlot = 0
 // result — non-re-readable, multi-field) that must be re-boxed field-by-field into a
 // variant-box union arm is stashed once in a `(ref null struct)` slot so each field
 // re-reads it. A re-readable or single-field source needs no stash. Flagged by `fnHasVariantRebox`.
-export let fnUsesVariantRebox = false
 export let variantReboxSlot = 0
 // Union-box sink: a value whose rep is the shared union box, produced on two branches,
 // gets one construction site per branch — binaryen's Heap2Local scalarizes per site, so
 // two sites merging into one value melt neither and the box survives. The sink gives the
-// merge one frame (tag, payload), written once for a `return` (`fnUsesUnionSink`) or a binding (`fnUsesUnionLetSink`).
-export let fnUsesUnionSink = false
-export let fnUsesUnionLetSink = false
+// merge one frame (tag, payload), written once for a `return` (`fnUses.unionSink`) or a binding (`fnUses.unionLetSink`).
 export let unionSinkBase = 0
 // How many `return`s took the sink in the function being lowered. Reset per function;
 // read AFTER the body is lowered to decide whether the exit block is emitted at all.
@@ -1924,17 +1979,14 @@ export function armStageClear() {
   armStageStoreTy = []
   0
 }
-export let fnUsesMap = false
 export let mapScratchBase = 0
 // `m.keys()` / `for k in m` build a fresh string list of LIVE keys: a 6-slot frame —
 // outBack (ref $mkArrIdx), keysBack (ref $mkArrIdx), live (ref $aTypeIdx), then i/j/count
-// (3 i32). Reserved when the function builds a map's key list (`fnUsesMapKeys`).
-export let fnUsesMapKeys = false
+// (3 i32). Reserved when the function builds a map's key list (`fnUses.mapKeys`).
 export let mapKeysBase = 0
 // `m.values()` over a MONO i32 map builds a fresh i32 list of LIVE values: a 6-slot frame —
 // outBack (ref $aTypeIdx), valsBack (ref $aTypeIdx), live (ref $aTypeIdx), then i/j/count
 // (3 i32). The i32 sibling of the key-list frame.
-export let fnUsesMapVals = false
 export let mapValsBase = 0
 // How many function-value calls are open around the one being lowered, i.e. whose closure
 // is stashed and whose id is not yet read (D2329). Each depth has its own lazy slot; a call
@@ -1944,7 +1996,6 @@ export let callRefDepth = 0
 // for the field read, so a base that is not a re-readable place (a call) is evaluated ONCE
 // into this `(ref null struct)` local and every re-read is a `ref.cast` off it.
 // `optRecvStagedIx` is the arena index staged right now, -1 when none is.
-export let fnUsesOptRecv = false
 export let optRecvSlot = 0
 export let optRecvStagedIx = -1
 export let optRecvStagedSet = false
@@ -1952,7 +2003,6 @@ export let optRecvStagedSet = false
 // the bounds compare and again for the element read, so an operand that is not a re-readable
 // place is evaluated ONCE into these locals. `…StagedIx` is the arena index staged right now,
 // -1 when none is; `…StagedSet` says the tee has been written.
-export let fnUsesListGet = false
 export let listGetIdxSlot = 0
 export let listGetRecvSlot = 0
 export let listGetIdxStagedIx = -1
@@ -1963,7 +2013,6 @@ export let listGetRecvStagedSet = false
 // an atom-typed destination whose value is not re-readable (a call) stashes the
 // value's string once, non-null `(ref $sTypeIdx)`, so the narrow's select-tower
 // re-reads the slot. One slot, two claimants — `callPushBits` and `exprPopBits` — both setting the same flag.
-export let fnUsesAtomStage = false
 export let atomStageSlot = 0
 // A non-null list rep: the element class a list's builds, copies and frame slots key on.
 export type ListKind = "list"
@@ -1978,7 +2027,6 @@ export type ListKind = "list"
 // `j`), one typed source slot per distinct receiver list type, one typed dest slot per
 // distinct result element kind. The closure slot is lazy (`mfCallbackLocal`).
 // Reserved only in a function whose body holds a `.map`/`.filter` (`mfScan`).
-export let fnUsesMapFilter = false
 export let mfScratchBase = 0
 export let mfSrcKinds: ListKind[] = []
 export let mfSrcSlots: i32[] = []
@@ -2787,8 +2835,8 @@ export function emitStateReset() {
   fitGrowFn = -1
   fl32TypeIdx = -1
   fl64TypeIdx = -1
-  fnUsesMapVals = false
-  fnUsesPackedPush = 0
+  fnUses.mapVals = false
+  fnUses.packedPush = 0
   gConstExprEmit = false
   gHelpSvGet = []
   gHelpSvLen = []

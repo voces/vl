@@ -71,6 +71,7 @@ import {
   callHasTyArgs,
   callTyArgsOf,
   i32ToStr,
+  letInitAt,
   nodeAt,
   nodeToks,
   spreadArgOf,
@@ -281,6 +282,7 @@ import {
 import {
   cexConverted,
   cexEvalAt,
+  cexFoldedFrom,
   cexIsDerived,
   cexKeepWhole,
   cexNotTree,
@@ -296,7 +298,7 @@ import {
   cexMisfitMsg,
   cexPastF64,
   cexRootShape,
-  cexShown,
+  cexShownFrom,
   dstIntWidth,
   intLitIsNegated,
   numLitOwnTy,
@@ -307,13 +309,10 @@ import { parenPeelIx } from "./check_places"
 import { rcwMembersOf } from "./check_rcw"
 import { recAdRecOf } from "./check_rec_adopt"
 import {
-  recAdDecl,
-  recAdForced,
-  recAdForcedDecl,
-  recAdNoAdopt,
+  recAdPass,
   recAdPinInit,
+  recAdProg,
   recAdRaising,
-  recAdWidth,
 } from "./check_rec_adopt_rows"
 import {
   recBindOrigin,
@@ -357,7 +356,6 @@ import {
   recAtPinnedArg,
   recBindDeclOf,
   recCoalesceOperands,
-  recDeclInit,
   recElemPinLit,
   recIndexBase,
   recIsJoin,
@@ -615,7 +613,6 @@ import {
 } from "./check_write_scan"
 import {
   Cex,
-  cexAtF32,
   cexDecText,
   cexLexeme,
   cexNeg,
@@ -630,6 +627,7 @@ import {
   arrElemValueTy,
   flattenVariantsInto,
   isNullTy,
+  nhOpen,
   nonNulTyOf,
   nonNullTy,
   nulFoldMemberTy,
@@ -640,6 +638,7 @@ import {
   tyHasNullMember,
   tyHasTyVar,
   tyHoldsNumericPrim,
+  tyIsListTy,
   tyLitSetMemberLexes,
   tyNulLitUnionMemberTexts,
   tyReachesHole,
@@ -653,16 +652,8 @@ import {
 export function nullReadHoleTy(ix: i32, ty: i32): i32 {
   if !isNullTy(ty) || ix < 0 || !(nodeAt(ix) is Ident) { return ty }
   const st = narrowedFromTyOf(ix)
-  if tyIsOpenNullHole(st) { return st }
+  if nhOpen(st) { return st }
   ty
-}
-
-// Whether `ty` is a `let x = null` hole no write has filled.
-function tyIsOpenNullHole(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  const t = tyAt(ty)
-  if t is TyNullable { return t.nInner < 0 }
-  false
 }
 
 // `constrainEmpty` at a position that holds the source expression — the form every site that
@@ -674,7 +665,7 @@ export function constrainEmptyExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     recordRepTyAdopt(srcExpr, dstTy, 6)
   }
   if inferQuiet || srcExpr < 0 { return constrainEmpty(srcTy, dstTy) }
-  const src = if tyReachesEmptyHole(dstTy, 8) || tyIsOpenNullHole(dstTy) { nullReadHoleTy(srcExpr, srcTy) } else { srcTy }
+  const src = if tyReachesEmptyHole(dstTy, 8) || nhOpen(dstTy) { nullReadHoleTy(srcExpr, srcTy) } else { srcTy }
   noteNullHoleDelivery(src, dstTy, srcExpr)
   holeLinkSiteSet(srcExpr, src, dstTy)
   constrainEmpty(src, dstTy)
@@ -932,17 +923,6 @@ export function cexTryFold(ix: i32): i32 {
   cexFoldAt(ix)
 }
 
-// `cexTryFold` for the initializer `init` of a binding annotated `f32`: the tree folds where it
-// stands in `f32` arithmetic, as it runs there (E9.1).
-export function cexTryFoldF32(init: i32): i32 {
-  const p = parenPeelIx(init)
-  if p < 0 { return 0 }
-  cexAtF32(true)
-  const r = cexTryFold(p)
-  cexAtF32(false)
-  r
-}
-
 // `cexTryFold` for the operator `e` at `ix`, whose operator the caller has already admitted.
 export function cexTryFoldBin(e: BinExpr, ix: i32): i32 {
   if cexNotTree.length > 0 && (cexNotTree[ix] ?? false) { return 0 }
@@ -1025,7 +1005,7 @@ export function cexDeliver(srcExpr: i32, dstTy: i32): boolean {
     return true
   }
   cexReported[lit] = true
-  tErr(cexMisfitMsg(v, tyToStr(dstTy), kind == 2), srcExpr)
+  tErr(cexMisfitMsg(v, tyToStr(dstTy), kind == 2, cexFoldedFrom(lit)), srcExpr)
   true
 }
 
@@ -1043,7 +1023,10 @@ function cexDeliverUnion(v: Cex, lit: i32, srcExpr: i32, dstTy: i32): boolean {
   if !numeric { return false }
   cexReported[lit] = true
   tErr(
-    "constant " + cexShown(v) + " fits no member of " + tyToStr(dstTy),
+    "constant "
+      + cexShownFrom(v, cexFoldedFrom(lit))
+      + " fits no member of "
+      + tyToStr(dstTy),
     srcExpr,
   )
   true
@@ -3504,7 +3487,7 @@ export function recAdoptMapNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     // A list literal binding is delivered as its literal is.
     const ld = recFreshDeclOf(p)
     if ld >= 0 && dt is TyArray {
-      const li = parenPeelIx(recDeclInit(ld))
+      const li = parenPeelIx(letInitAt(ld))
       if li >= 0 && nodeAt(li) is ArrayLit {
         recAdoptMapNote(li, nodeTyIxOf(li), dstTy)
       }
@@ -5577,17 +5560,17 @@ export function recAdoptUnionList(
   }
   if !(e is Ident) { return false }
   const decl = recFreshDeclOf(p)
-  if decl < 0 || !(nodeAt(parenPeelIx(recDeclInit(decl))) is ArrayLit) {
+  if decl < 0 || !(nodeAt(parenPeelIx(letInitAt(decl))) is ArrayLit) {
     return false
   }
   const de = tyArrayElemIx(recAdLandingList(nonNulTyOf(dstTy)))
   if de < 0 || !(tyAt(de) is TyUnion) { return false }
   recAdPushUnionList(decl, tyArrayElemIx(srcTy), de, p)
   // Its literal is built at the first such list, which a disagreeing later one aliases (D853).
-  const lit = parenPeelIx(recDeclInit(decl))
+  const lit = parenPeelIx(letInitAt(decl))
   const was = if lit < nodeRepTyIx.length { nodeRepTyIx[lit] } else { -1 }
   const wasEl = if was >= 0 { tyArrayElemIx(was) } else { -1 }
-  if !recAdNoAdopt.has(decl) && (wasEl < 0 || !(tyAt(wasEl) is TyUnion)) {
+  if !recAdProg.noAdopt.has(decl) && (wasEl < 0 || !(tyAt(wasEl) is TyUnion)) {
     adoptLitAt(lit, recAdLandingList(nonNulTyOf(dstTy)))
   }
   true
@@ -5924,7 +5907,7 @@ function recElemBesideOwn(c: i32, own: i32): boolean {
     }
     const sv = if pn is Spread { cwPeelValue(pn.spdArg) } else { -1 }
     const d = if sv >= 0 && nodeAt(sv) is Ident { recFreshDeclOf(sv) } else { -1 }
-    const iv = if d >= 0 { parenPeelIx(recDeclInit(d)) } else { -1 }
+    const iv = if d >= 0 { parenPeelIx(letInitAt(d)) } else { -1 }
     if iv >= 0 && nodeAt(iv) is ArrayLit {
       const et = tyArrayElemIx(recLitBuiltTy(iv))
       if et >= 0 && fieldStorageEq(et, own, REC_STORE_DEPTH) { return true }
@@ -6112,13 +6095,13 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if (
         od >= 0
         && nodeAt(od) is LetDecl
-        && nodeAt(parenPeelIx(recDeclInit(od))) is ObjLit
+        && nodeAt(parenPeelIx(letInitAt(od))) is ObjLit
       ) {
         recBuildPush(od, srcTy, nonNulTyOf(dstTy), false)
       }
       return 0
     }
-    const iv = nodeAt(parenPeelIx(recDeclInit(decl)))
+    const iv = nodeAt(parenPeelIx(letInitAt(decl)))
     if iv is ArrayLit {
       if recAdoptUnionList(srcExpr, srcTy, dstTy) { return 0 }
       // A list of record lists is built at the destination by its literal's stamp, keeping its
@@ -6126,7 +6109,7 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       const land = recAdLandingList(nonNulTyOf(dstTy))
       const se = tyArrayElemIx(srcTy)
       if se >= 0 && se < T.tys.length && tyAt(se) is TyArray && land >= 0 {
-        adoptLitAt(parenPeelIx(recDeclInit(decl)), land)
+        adoptLitAt(parenPeelIx(letInitAt(decl)), land)
         recApartDecl.push(decl)
         recApartDst.push(land)
         recApartAt.push(p)
@@ -6141,8 +6124,8 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       )
     }
     recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), false, p)
-    if recAdNoAdopt.has(decl) {
-      recBuildArmDropRefuse(recDeclInit(decl), nonNulTyOf(dstTy), 6)
+    if recAdProg.noAdopt.has(decl) {
+      recBuildArmDropRefuse(letInitAt(decl), nonNulTyOf(dstTy), 6)
     }
     return 0
   }
@@ -6152,7 +6135,7 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
     const bn = nodeAt(b)
     if bn is Ident {
       const decl = recFreshDeclOf(b)
-      if decl >= 0 && nodeAt(parenPeelIx(recDeclInit(decl))) is ArrayLit {
+      if decl >= 0 && nodeAt(parenPeelIx(letInitAt(decl))) is ArrayLit {
         return recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), true, p)
       }
     }
@@ -6422,7 +6405,7 @@ function recFreshListRead(x: i32): boolean {
   if bn is ArrayLit || recListRetDecl(b) >= 0 { return true }
   if !(bn is Ident) { return false }
   const decl = recFreshDeclOf(b)
-  if decl >= 0 && nodeAt(parenPeelIx(recDeclInit(decl))) is ArrayLit {
+  if decl >= 0 && nodeAt(parenPeelIx(letInitAt(decl))) is ArrayLit {
     return true
   }
   const hc = recHeldCallOrigin(b)
@@ -6526,15 +6509,15 @@ export function recAdForce(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   ) {
     return false
   }
-  const before = recAdDecl.length
+  const before = recAdPass.decl.length
   recAdoptNote(srcExpr, srcTy, dstTy)
   let any = false
   let i = before
-  while i < recAdDecl.length {
-    if recAdWidth.has(recAdDecl[i]) {
+  while i < recAdPass.decl.length {
+    if recAdProg.width.has(recAdPass.decl[i]) {
       any = true
-      recAdForced.push(p)
-      recAdForcedDecl.push(recAdDecl[i])
+      recAdPass.forced.push(p)
+      recAdPass.forcedDecl.push(recAdPass.decl[i])
     }
     i = i + 1
   }
@@ -9496,11 +9479,6 @@ export function stampNullUnitCell(src: i32, dst: i32): boolean {
   true
 }
 
-// Whether `t` is a list type.
-function tyIsListTy(t: i32): boolean {
-  t >= 0 && t < T.tys.length && tyAt(t) is TyArray
-}
-
 // Stamps the destination type `dstTy` onto literal `srcExpr` (recursively, into `ObjLit` fields /
 // `ArrayLit` elements) in the `nodeRepTyIx` sidecar, or the instance's while an elaboration
 // re-checks one. Nullable wrappers are peeled; `depth` bounds the walk. A quiet probe and a pin's
@@ -10026,7 +10004,7 @@ function recContainerDeliver(
   if e is Ident {
     const d = recFreshMapDeclOf(p)
     if d >= 0 {
-      if recAdNoAdopt.has(d) { return false }
+      if recAdProg.noAdopt.has(d) { return false }
       if apply { recMapDeclDeliver(d, p, dst) }
       return true
     }

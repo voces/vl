@@ -104,6 +104,14 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   the monomorphized ones. DECISIONS.md §"Polymorphic recursion is refused for now".
 - **Homebrew formula, once a release process exists** (owner ruling 2026-11-14). The draft
   `Formula/vl.rb` was deleted; a formula is written against a real tag and its checksums.
+- **L2: exports frozen at the module boundary** (owner ruling 2026-11-15). An export's types and
+  layouts are inferred from its own module alone, and an importer's call is checked against that
+  signature; `vl` may print it, and no annotation is required. This is built with L2's inferred
+  interfaces (engineering-review-2026-11.md §6). DECISIONS.md §"Exports are frozen at the module
+  boundary".
+- **AE-004: an unaliased record field reassigned in place** (2026-11-15, not active work). When
+  nothing else holds `r.f`, the assignment `r.f = { … }` of a fresh record lowers to `struct.set`s
+  on the record already there, not a new allocation.
 
 ## Consumers
 

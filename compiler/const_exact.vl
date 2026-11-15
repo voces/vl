@@ -4,7 +4,7 @@
 // little-endian base-2^16 `i32[]` limbs, trimmed, zero written `[0]`. An integer is capped at
 // `CEX_INT_BITS` and a fraction's numerator and denominator at `CEX_FRAC_BITS`. A leaf.
 
-import { bigCmp, bigIsZero, numLexBaseAt } from "./emit_bignum"
+import { bigBitLen, bigCmp, bigIsZero, numLexBaseAt } from "./emit_bignum"
 
 // One constant value. `cxErr` non-empty: the expression is a check error saying so. `cxNo`: not
 // a constant this fold computes, left to the ordinary check. `cxPat`: a radix literal, or a
@@ -143,17 +143,6 @@ function cxmShr(a: i32[], k: i32): i32[] {
     i = i + 1
   }
   cxmTrim(out)
-}
-
-function cxmBitLen(a: i32[]): i32 {
-  if bigIsZero(a) { return 0 }
-  let top = a[a.length - 1]
-  let bits = (a.length - 1) * 16
-  while top != 0 {
-    bits = bits + 1
-    top = top >>> 1
-  }
-  bits
 }
 
 // Quotient and remainder of `n / d` for `d` nonzero, as `[q, r]`.
@@ -401,6 +390,77 @@ function cxI32Str(v: i32): string {
   fromCodePoints(cps)
 }
 
+// ── the shortest round-trip spelling ─────────────────────────────────────────
+
+// `v * 10^s` truncated, its remainder, and the divisor the remainder is against.
+function cxScaled10(v: Cex, s: i32): i32[][] {
+  if s >= 0 { return cxQr(cxmMul(v.cxNum, cxmPow10(s)), v.cxDen) }
+  cxQr(v.cxNum, cxmMul(v.cxDen, cxmPow10(0 - s)))
+}
+
+function cxQr(n: i32[], d: i32[]): i32[][] {
+  const qr = cxmDivmod(n, d)
+  [qr[0], qr[1], d]
+}
+
+// The fewest significant digits that read back as the double the float constant `v` holds
+// (E9.1), laid out as `print` lays a float out, with `.0` on a whole value.
+export function cexShortest(v: Cex): string {
+  let sign = ""
+  if v.cxNeg { sign = "-" }
+  if bigIsZero(v.cxNum) { return sign + "0.0" }
+  // `e`, the decimal exponent of the first digit: estimated from the bit lengths, then exact.
+  let e = ((bigBitLen(v.cxNum) - bigBitLen(v.cxDen) - 1) * 30103) / 100000
+  while !bigIsZero(cxScaled10(v, 0 - e - 1)[0]) { e = e + 1 }
+  while bigIsZero(cxScaled10(v, 0 - e)[0]) { e = e - 1 }
+  let n = 1
+  while n <= 17 {
+    const s = n - 1 - e
+    const qr = cxScaled10(v, s)
+    let q = qr[0]
+    const c = bigCmp(cxmShl(qr[1], 1), qr[2])
+    if c > 0 || (c == 0 && (q[0] & 1) == 1) { q = cxmAdd(q, cxmOne()) }
+    let back = cxRoundFloat(q, cxmPow10(s), 53, 1074, 1024)
+    if s < 0 {
+      back = cxRoundFloat(cxmMul(q, cxmPow10(0 - s)), cxmOne(), 53, 1074, 1024)
+    }
+    if back.length == 2 {
+      const b = cexFracExact(false, back[0], back[1])
+      if bigCmp(b.cxNum, v.cxNum) == 0 && bigCmp(b.cxDen, v.cxDen) == 0 {
+        return sign + cxDecLayout(cxmToDec(q), s)
+      }
+    }
+    n = n + 1
+  }
+  sign + cexLexeme(v)
+}
+
+// `digits * 10^-s` as JS prints a number: positional from 1e-6 below 1e21, else `d.ddde+X`.
+function cxDecLayout(digits: string, s: i32): string {
+  let d = digits
+  let sc = s
+  while d.length > 1 && d[d.length - 1] == '0' {
+    d = d.slice(0, d.length - 1)
+    sc = sc - 1
+  }
+  const pt = d.length - sc
+  if pt > 21 || pt <= 0 - 6 {
+    let m = d.slice(0, 1)
+    if d.length > 1 { m = m + "." + d.slice(1, d.length) }
+    if pt >= 1 { return m + "e+" + cxI32Str(pt - 1) }
+    return m + "e-" + cxI32Str(1 - pt)
+  }
+  if pt >= d.length { return d + cxZeros(pt - d.length) + ".0" }
+  if pt > 0 { return d.slice(0, pt) + "." + d.slice(pt, d.length) }
+  "0." + cxZeros(0 - pt) + d
+}
+
+function cxZeros(n: i32): string {
+  let z = ""
+  while z.length < n { z = z + "0" }
+  z
+}
+
 // ── values ──────────────────────────────────────────────────────────────────
 
 function cexMake(
@@ -450,7 +510,7 @@ export function cexNotConst(): Cex { CEX_NOT_CONST }
 export function cexOk(v: Cex): boolean { v.cxErr == "" && !v.cxNo }
 
 function cexInt(neg: boolean, mag: i32[], pat: boolean): Cex {
-  if cxmBitLen(mag) > CEX_INT_BITS {
+  if bigBitLen(mag) > CEX_INT_BITS {
     return cexError(
       "constant overflows the "
         + cxI32Str(CEX_INT_BITS)
@@ -496,9 +556,9 @@ function cxRoundFloat(
   minStep: i32,
   maxExp: i32,
 ): i32[][] {
-  let s = sig - (cxmBitLen(num) - cxmBitLen(den))
+  let s = sig - (bigBitLen(num) - bigBitLen(den))
   let qr = cxScaledDivmod(num, den, s)
-  if cxmBitLen(qr[0]) > sig {
+  if bigBitLen(qr[0]) > sig {
     s = s - 1
     qr = cxScaledDivmod(num, den, s)
   }
@@ -509,7 +569,7 @@ function cxRoundFloat(
   let q = qr[0]
   const c = bigCmp(cxmShl(qr[1], 1), qr[2])
   if c > 0 || (c == 0 && (q[0] & 1) == 1) { q = cxmAdd(q, cxmOne()) }
-  if cxmBitLen(q) - s > maxExp { return [] }
+  if bigBitLen(q) - s > maxExp { return [] }
   if s >= 0 { return [q, cxmShl(cxmOne(), s)] }
   [cxmShl(q, 0 - s), cxmOne()]
 }
@@ -526,7 +586,7 @@ function cexFracExact(neg: boolean, num: i32[], den: i32[]): Cex {
       d = cxmDivmod(d, g)[0]
     }
   }
-  if cxmBitLen(n) > CEX_FRAC_BITS || cxmBitLen(d) > CEX_FRAC_BITS {
+  if bigBitLen(n) > CEX_FRAC_BITS || bigBitLen(d) > CEX_FRAC_BITS {
     return cexError(
       "constant needs more than "
         + cxI32Str(CEX_FRAC_BITS)
@@ -693,14 +753,14 @@ function cexPatRingOk(a: Cex, b: Cex): boolean {
   if a.cxFloat || b.cxFloat || cexWidePattern(a) || cexWidePattern(b) {
     return false
   }
-  if !a.cxPat && cxmBitLen(a.cxNum) > 31 { return false }
-  !(!b.cxPat && cxmBitLen(b.cxNum) > 31)
+  if !a.cxPat && bigBitLen(a.cxNum) > 31 { return false }
+  !(!b.cxPat && bigBitLen(b.cxNum) > 31)
 }
 
 // The pattern of the exact result `neg`, `mag` of a ring operation over a pattern, or no constant
 // when it needs more than 32 bits: such a result is a different bit pattern at each width.
 function cexPatResult(neg: boolean, mag: i32[]): Cex {
-  if cxmBitLen(mag) > 32 { return cexNotConst() }
+  if bigBitLen(mag) > 32 { return cexNotConst() }
   cexInt(neg, mag, true)
 }
 
@@ -818,7 +878,7 @@ export function cexShift(a: Cex, b: Cex, op: string): Cex {
     return cexError("shift count -" + cxmToDec(b.cxNum) + " is negative")
   }
   // A count past every width is refused, as at a typed `i64` operand (owner ruling Q8).
-  if cxmBitLen(b.cxNum) > 6 {
+  if bigBitLen(b.cxNum) > 6 {
     return cexError(
       "shift count "
         + cxmToDec(b.cxNum)
@@ -835,7 +895,7 @@ export function cexShift(a: Cex, b: Cex, op: string): Cex {
     const sh = cxmShl(a.cxNum, k)
     // A pattern shifted past 32 bits is a different bit pattern at each width, so it is left to
     // the width of its use.
-    if a.cxPat && cxmBitLen(sh) > 32 { return cexNotConst() }
+    if a.cxPat && bigBitLen(sh) > 32 { return cexNotConst() }
     return cexInt(a.cxNeg, sh, a.cxPat)
   }
   if a.cxNeg && op == ">>>" { return cexNotConst() }
@@ -847,13 +907,13 @@ export function cexShift(a: Cex, b: Cex, op: string): Cex {
 
 // Whether `v` is a pattern wider than 32 bits, which an `i32` use does not hold at all: an
 // operation over it is computed at its use's width, where master refused it at `i32`.
-function cexWidePattern(v: Cex): boolean { v.cxPat && cxmBitLen(v.cxNum) > 32 }
+function cexWidePattern(v: Cex): boolean { v.cxPat && bigBitLen(v.cxNum) > 32 }
 
 // Whether `v` is a pattern whose top bit is set at its own width, 32 or 64 bits: a negative number
 // at that width and a positive one at a wider, so `>>` and `~` over it depend on where it is read.
 function cexAmbiguous(v: Cex): boolean {
   if v.cxFloat || !v.cxPat || v.cxNeg { return false }
-  const b = cxmBitLen(v.cxNum)
+  const b = bigBitLen(v.cxNum)
   b == 32 || b == 64
 }
 
@@ -870,29 +930,29 @@ export function cexFitsSigned(v: Cex, bits: i32): boolean {
 // Whether the pattern `v` fits a `bits`-wide destination: its magnitude needs at most `bits`
 // bits, as a radix literal's digits do.
 export function cexPatFits(v: Cex, bits: i32): boolean {
-  cxmBitLen(v.cxNum) <= bits
+  bigBitLen(v.cxNum) <= bits
 }
 
 // The hex literal whose bit pattern at a `bits`-wide integer is `v`, when `v` is a whole
 // non-negative integer whose top bit is that width's sign bit; else "".
 export function cexPatternHex(v: Cex, bits: i32): string {
-  if v.cxFloat || v.cxPat || v.cxNeg || cxmBitLen(v.cxNum) != bits { return "" }
+  if v.cxFloat || v.cxPat || v.cxNeg || bigBitLen(v.cxNum) != bits { return "" }
   cxmToHex(v.cxNum)
 }
 
 // About log2 of `v`'s magnitude: its numerator's bit length less its denominator's, within one.
 export function cexScaleBits(v: Cex): i32 {
-  cxmBitLen(v.cxNum) - cxmBitLen(v.cxDen)
+  bigBitLen(v.cxNum) - bigBitLen(v.cxDen)
 }
 
 // Whether the integer `v` is exact in a binary float of `sigBits` significand bits whose
 // magnitude stays below 2^`maxWidth`.
 export function cexIntExactAt(v: Cex, sigBits: i32, maxWidth: i32): boolean {
   if bigIsZero(v.cxNum) { return true }
-  if cxmBitLen(v.cxNum) > maxWidth { return false }
+  if bigBitLen(v.cxNum) > maxWidth { return false }
   let tz = 0
   while ((v.cxNum[tz >>> 4] >>> (tz & 15)) & 1) == 0 { tz = tz + 1 }
-  cxmBitLen(v.cxNum) - tz <= sigBits
+  bigBitLen(v.cxNum) - tz <= sigBits
 }
 
 // Whether the fraction `v` is a whole number.
