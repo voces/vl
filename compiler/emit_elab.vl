@@ -9880,7 +9880,9 @@ function elabParamRowRoot(x: i32, fn: FuncDecl, depth: i32): i32 {
         const pr = elabParamRowRoot(it, fn, depth + 1)
         if pr >= 0 { return pr }
         const pi = if it < P.nodes.length && nodeAt(it) is Ident { identDeclOf(it) } else { -1 }
-        return if i32ListHas(fn.fnParams, pi) { pi } else { -1 }
+        if i32ListHas(fn.fnParams, pi) { return pi }
+        // A loop over an alias of the parameter walks the parameter (D15920).
+        return if pi >= 0 { elabConstParamAlias(pi, fn) } else { -1 }
       }
       // A read through an alias of the parameter is taken out of the parameter (D15920).
       const ap = elabConstParamAlias(d, fn)
@@ -14316,14 +14318,11 @@ export function elabRetFnListLitTy(lit: i32, k: i32): i32 {
   }
   const per = elabSlotPerInstance(lit, path)
   if per && k < 0 { return -1 }
-  let ft = -1
-  for dt in elabSlotDeliveries(lit, path, if per { k } else { -1 }) {
-    if tyAt(dt) is TyFunc {
-      if ft >= 0 && !tySame(ft, dt) { return -1 }
-      ft = dt
-    }
+  const none: i32[] = []
+  const ft = eplSlotSig(lit, path, if per { k } else { -1 }, none)
+  if ft < 0 || !(tyAt(ft) is TyFunc) || !elabTyClosed(ft, 0) || tyHasTyVar(ft) {
+    return -1
   }
-  if ft < 0 || !elabTyClosed(ft, 0) || tyHasTyVar(ft) { return -1 }
   let lt = ft
   let w = 0
   while w < path.length {
@@ -21271,10 +21270,25 @@ function eplInstsFile() {
 
 function eplHasInst(fd: i32): boolean { (EPL.insts[fd] ?? []).length > 0 }
 
-// The callee instance call `c` runs from instance `k`; -1 for a callee with no instances.
+// The callee instance call `c` runs from instance `k`; -1 for a callee with no instances. A call
+// the elaboration keyed nowhere runs the instance at its arguments' types, as mono builds it.
 function eplCallTarget(c: i32, fd: i32, k: i32): i32 {
   if !eplInstanced(fd) || !eplHasInst(fd) { return eplKeyOfFn(fd) }
   const row = elabCallKeys[c] ?? []
+  if row.length == 0 {
+    const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+    if !(cn is Call) { return -2 }
+    const ps: i32[] = []
+    for a in cn.callArgs {
+      const t = if k >= 0 { elabNodeTy(a, k) } else { nodeTyIxOf(a) }
+      if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return -2 }
+      ps.push(t)
+    }
+    const noNames: string[] = []
+    const noTys: i32[] = []
+    const kk = elabKeyAtPins(fd, noNames, noTys, ps, -1)
+    return if kk >= 0 && kk < EPL.limit && ekDecl[kk] == fd { kk } else { -2 }
+  }
   let i = 0
   while i + 1 < row.length {
     if (
@@ -21288,6 +21302,18 @@ function eplCallTarget(c: i32, fd: i32, k: i32): i32 {
     i = i + 2
   }
   -2
+}
+
+// The callee instances call `c` from instance `k` reaches: its target, or for a call the
+// elaboration keyed nowhere (an argument still open), every instance the classes hold.
+function eplCallTargets(c: i32, fd: i32, k: i32): i32[] {
+  const t = eplCallTarget(c, fd, k)
+  if t != -2 || (elabCallKeys[c] ?? []).length > 0 { return [t] }
+  const out: i32[] = []
+  for kk in EPL.insts[fd] ?? [] {
+    if kk >= 0 && kk < EPL.limit { out.push(kk) }
+  }
+  out
 }
 
 // The instance of function `fd` read at node `x` (the function itself for a lambda, the name for
@@ -21851,11 +21877,9 @@ function eplEdgeAt(u: i32) {
           for fd in elabCalleeFns(un) {
             const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
             if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
-              eplEdge(
-                eplPlaceOf(u, 0),
-                eplRootK(fn.fnParams[ai], eplCallTarget(up, fd, EPL.k)),
-                u,
-              )
+              for ck in eplCallTargets(up, fd, EPL.k) {
+                eplEdge(eplPlaceOf(u, 0), eplRootK(fn.fnParams[ai], ck), u)
+              }
             }
           }
         }
@@ -22470,8 +22494,14 @@ function eplSlotPlace(holder0: i32, path: string[], k: i32): i32 {
     eplBuild()
     EPL.stale = false
   }
-  EPL.k = k
-  let p = eplRoot(holder)
+  // A function's value is placed in the frame that creates it, whose instance is its own's parent.
+  const own = holder < P.nodes.length
+    && nodeAt(holder) is FuncDecl
+    && k >= 0
+    && k < ekDecl.length
+    && ekDecl[k] == holder
+  EPL.k = if own && k < ekParent.length { ekParent[k] } else { k }
+  let p = if holder < P.nodes.length && nodeAt(holder) is FuncDecl { eplPlaceOf(holder, 0) } else { eplRoot(holder) }
   for step in path { p = eplChild(p, step) }
   p
 }

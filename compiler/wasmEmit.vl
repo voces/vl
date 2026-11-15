@@ -13790,17 +13790,17 @@ function arrLitRefSlotAtTy(arrIx: i32, fnIx: i32): i32 {
 }
 
 // The packed `u8[]` arm of `emitArrUnder`: each element as a plain i32 truncated into the
-// byte backing, or one data segment when the literal is too long for `array.new_fixed`.
-// Returns 0 once the list is on the stack, -1 on failure.
+// byte backing. Past `array.new_fixed`'s cap: one data segment when every element is a
+// literal, else a chunked build. Returns 0 once the list is on the stack, -1 on failure.
 function emitArrU8(elems: i32[], fnIx: i32, row: i32) {
+  let dstU8 = -1
+  let coffU8 = 0
   if elems.length > NEW_FIXED_MAX {
     const dForm = if row == PK_U16 || row == PK_I16 { ALD_U16 } else { ALD_U8 }
     const dU8 = arrLitDataBuild(elems, fnIx, dForm, pkBackAt(row))
     if dU8 < 0 { return -1 }
     if dU8 == 1 { return arrLitWrap(elems.length, pkWrapAt(row)) }
-    return emitFail(
-      "emitProgram: u8 array literal is too long for one array.new_fixed",
-    )
+    dstU8 = arrLitChunkStart("u8list", row, pkBackAt(row), elems.length, false)
   }
   let iu8 = 0
   while iu8 < elems.length {
@@ -13809,11 +13809,19 @@ function emitArrU8(elems: i32[], fnIx: i32, row: i32) {
     }
     if emitExpr(elems[iu8], fnIx) < 0 { return -1 }
     iu8 = iu8 + 1
+    if dstU8 >= 0 {
+      coffU8 = arrLitChunkFlush(dstU8, pkBackAt(row), coffU8, iu8, elems.length)
+    }
   }
-  fbBacking(pkBackAt(row), elems.length) // builds the packed backing
-  fbI32Const(elems.length)               // len
-  fbI32Const(elems.length)               // cap
-  fbStructNew(pkWrapAt(row))             // the packed list wrapper
+  if dstU8 >= 0 {
+    fbLocalGet(dstU8)
+    fbRefAsNonNull() // the chunk-built packed backing
+  } else {
+    fbBacking(pkBackAt(row), elems.length) // builds the packed backing
+  }
+  fbI32Const(elems.length)   // len
+  fbI32Const(elems.length)   // cap
+  fbStructNew(pkWrapAt(row)) // the packed list wrapper
   return 0
 }
 
@@ -41025,7 +41033,8 @@ function emitCoalesceBoolPop(e: BinExpr, fnIx: i32): i32 {
 
 // The banked ABI code of the one member left when `null` is removed from the read `lhsIx`'s
 // value union, or -1 when its type is not a value union holding `null`. A negative answer, or
-// the null kind itself, means the arm declines.
+// the null kind itself, means the arm declines. Never the string kind: `string | null` is a
+// niche, not a box, and a narrowed string read takes the `nulstr` arm before this one.
 function coalValUnionResidualKind(lhsIx: i32, fnIx: i32): i32 {
   // D-VALUNION resolves the declared union's set; the narrowing table's id below answers a
   // different question (the set surviving the narrow), so both stay resolved, and the null
@@ -41067,7 +41076,7 @@ function coalResultBoxName(exprIx: i32, fnIx: i32): string {
 
 // `x ?? d` over the binding read at `lhsIx`, of nullable value union `cunm`, whose residual member is kind
 // `cak`: a box when the checker typed the `??` as a union, else the scalar at the result's
-// kind. Returns 0, or -1 when an operand fails or the residual is a string.
+// kind. Returns 0, or -1 when an operand fails.
 function emitCoalesceValUnionIdent(
   e: BinExpr,
   lhsIx: i32,
@@ -41076,11 +41085,6 @@ function emitCoalesceValUnionIdent(
   cak: i32,
   fnIx: i32,
 ): i32 {
-  if cak == 2 {
-    return emitFail(
-      "emitProgram: `??` over a string|null union is not supported yet",
-    )
-  }
   // The result is a BOX exactly when the checker typed this `??` as a union — a
   // nullable default keeps `T | null`, another type joins to `T | U`. The default is
   // coerced into the RESULT union, not the operand's, which has no tag for it; the
@@ -41235,11 +41239,6 @@ function emitCoalesceCallStash(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
           )
         }
         if kak >= 0 && kak != nullValKind() {
-          if kak == 2 {
-            return emitFail(
-              "emitProgram: `??` over a string|null call result is not supported yet",
-            )
-          }
           // D1250 — an if-expression operand arrives through `emitUnionCoerce`, not
           // `emitExpr`. `emitIfExpr` picks the join's blocktype off the arms' scalar ladder,
           // so a `T | null` if-expression came back as a bare i32; the coerce's own `IfStmt`
@@ -41435,11 +41434,6 @@ function emitCoalesceUnionField(
           )
         }
         if mak >= 0 && mak != nullValKind() {
-          if mak == 2 {
-            return emitFail(
-              "emitProgram: `??` over a string|null union field is not supported yet",
-            )
-          }
           // A union result or a NULLABLE default keeps the result boxed — the SAME decision
           // the ident and call arms make; the else arm re-reads the field's own box rather
           // than unboxing it, and the default is coerced into the result's union.
