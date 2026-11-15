@@ -8,7 +8,10 @@ import {
   RR_A3,
   rrMigrate,
   rrNote,
+  rrNoteFix,
   rrNotePure,
+  rrRefusedIs,
+  rrRefusedSet,
 } from "./return_rule"
 import { nodePos, nodeStartTok } from "./fmt_util"
 import { tySame } from "./check_types"
@@ -705,7 +708,8 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   if n.fnRet >= 0 && lamRetWrittenAt(fnIx) { cbSeedUsedSet(cbSeedUsed + 1) }
   refuseVoidRetsFrom(saved.voidRetLen, ret)
   inferRetLogTruncate(saved.retLogLen)
-  fnDeclRefuseFallOff(n, fnIx, ret, bodyTotalForRet)
+  // The return rule's own refusal of the tail says what the fall-off sentence would.
+  if !rrRefusedIs(fnIx) { fnDeclRefuseFallOff(n, fnIx, ret, bodyTotalForRet) }
   fnDeclNoteRedundantRet(n, fnIx, ret, inferring, saved.pinnedReads)
   retNaturalSet(saved.retNatural)
   retNaturalErrSet(saved.retNaturalErr)
@@ -1485,7 +1489,9 @@ function fnDeclCheckBody(
         if tailIsReturn && rrMigrate && !isVoidTy(stTy) {
           rrNoteTail(n.fnBody, stmts[s], fnIx, rrTok)
         }
-        if ruleTail && !inferring { rrRuleTail(n, fnIx, stmts[s], ret, rrTok) }
+        if ruleTail {
+          rrRuleTail(n, fnIx, stmts[s], if inferring { -1 } else { ret }, rrTok)
+        }
         if tailIsReturn {
           if !inferring { fnTailGradeAgainstRet(stmts[s], stTy, ret) }
           if inferring {
@@ -1820,17 +1826,14 @@ function rrNoteTail(body: i32, tl: i32, fnIx: i32, tok: i32) {
 }
 
 // A block body's last statement under the return rule: a value expression where the function
-// declares a value is refused, `null`-admitting included, since falling off would return `null`
-// in its place; a pure one where it declares none is noted for the A2 warning.
+// returns a value is refused, `null`-admitting included, since falling off would return `null` in
+// its place; a pure one where it returns none is noted for the A2 warning. Both take `--fix`.
 function rrRuleTail(n: FuncDecl, fnIx: i32, tl: i32, ret: i32, tok: i32) {
   if !rrTailIsValue(tl) || stmtAlwaysExits(tl) { return 0 }
-  if (
-    n.fnRet >= 0
-    && ret >= 0
-    && !isVoidTy(ret)
-    && ret != TY_NEVER
-    && ret != TY_ERR
-  ) {
+  // The decided result, annotated or from context (A3: a lambda the context wants a value from).
+  if ret >= 0 && !isVoidTy(ret) && ret != TY_NEVER && ret != TY_ERR {
+    rrNoteFix(tok)
+    rrRefusedSet(fnIx)
     tErr(
       fnWhoOf(fnIx, "`")
         + " returns "
@@ -1844,11 +1847,21 @@ function rrRuleTail(n: FuncDecl, fnIx: i32, tl: i32, ret: i32, tok: i32) {
   0
 }
 
+// Whether some arm of `if` `tl` ends in a value it yields, rather than every arm exiting.
+function rrSomeLeafYields(tl: i32): boolean {
+  const leaves: i32[] = []
+  tailValueLeaves(tl, leaves)
+  for lf in leaves {
+    if !isStmtNode(lf) && !stmtAlwaysExits(lf) { return true }
+  }
+  false
+}
+
 // Whether statement `tl`, ending a block body, is that body's value under today's rule; the
 // statement kinds `isStmtNode` names are values only as a value `if`, `match` or loop.
 function rrTailIsValue(tl: i32): boolean {
   const t = nodeAt(tl)
-  if t is IfStmt { return !ifYieldsNoValue(tl) && !stmtAlwaysExits(tl) }
+  if t is IfStmt { return !ifYieldsNoValue(tl) && rrSomeLeafYields(tl) }
   if t is WhileStmt { return t.whileBlk == 1 || loopCarriesValue(tl) }
   if t is MatchExpr { return !stmtAlwaysExits(tl) }
   !isStmtNode(tl)
