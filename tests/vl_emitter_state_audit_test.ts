@@ -1,6 +1,6 @@
 // THE EMITTER-STATE AUDIT: ITS FRAME-BUILDER ANCHORS, ITS ASYMMETRIC SET AND ITS INVARIANT.
 //
-// `scripts/emitter-state-audit.vl` asks which `fnUses*` frame flag one builder clears and
+// `scripts/emitter-state-audit.vl` asks which `fnUses` frame field one builder clears and
 // the other does not — the shape of D1006/D1007. It reaches the start-fn side through
 // `FRAME_ROOTS`, and an anchor pinned to one refactor is how the instrument went quiet:
 // D1595 split the start-fn builder, the resets moved to `startFnDetectFrames`, and the
@@ -52,8 +52,8 @@ if (GATED && !ENABLED) {
 
 /** The rows whose flag is genuinely never reset on the start-fn side. */
 const OPEN = new Map([
-  ["fnUsesPackedPush", "D1006"],
-  ["fnUsesMapVals", "D1007"],
+  ["fnUses.packedPush", "D1006"],
+  ["fnUses.mapVals", "D1007"],
 ]);
 
 const audit = async (

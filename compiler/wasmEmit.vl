@@ -1,4 +1,4 @@
-import { asgNameWiderRow, cloRetValSlot } from "./emit_classify"
+import { asgNameWiderRow, cloRetValSlot, sTwinRepOf } from "./emit_classify"
 import { identityBinIsMixed } from "./emit_fn_scans"
 import { identityArmSlot } from "./emit_if_arm_values"
 import {
@@ -87,6 +87,7 @@ import {
   elabDeliveredBundles,
   elabHasTypedReads,
   elabInstTyAt,
+  elabKeyAt,
   elabNestedCopyOnChain,
   elabNodeRepAt,
   elabSlotRecordListSigs,
@@ -113,6 +114,7 @@ import {
 import { lbiKeptDeclUnread } from "./check_num_lit_state"
 import { intMatchHeadAt } from "./check_match_heads"
 import {
+  asInstMisses,
   asMissNullOf,
   condProvenTrue,
   ctxElemOwnerOf,
@@ -342,6 +344,8 @@ import {
   hasNamedArgs,
   hasSpreadItem,
   i32ToStr,
+  identCalleeAt,
+  identNameAt,
   isDefaultGlobalRef,
   isExprKid,
   mkArrayLit,
@@ -413,7 +417,6 @@ import {
   objFieldVal,
   objLitDropsField,
   objLitNeedsOrderStash,
-  placeNarrowKeyOf,
   quoteLex,
   retF32Flag,
   retF64Flag,
@@ -551,16 +554,7 @@ import {
   fnNestUsed,
   fnParent,
   fnStmts,
-  fnUsesAtomStage,
-  fnUsesListGet,
-  fnUsesMapFilter,
-  fnUsesMapKeys,
-  fnUsesMapVals,
-  fnUsesOptRecv,
-  fnUsesStrOp,
-  fnUsesUnionLetSink,
-  fnUsesUnionSink,
-  fnUsesVariantRebox,
+  fnUses,
   fsIdxAt,
   gCellIdx,
   gConstExprEmit,
@@ -740,7 +734,6 @@ import {
   sHeapIdx,
   sIsRefRow,
   sSuperAt,
-  sTwin,
   sTy,
   startStmts,
   strCatSlotIx,
@@ -1488,7 +1481,6 @@ import {
   forRangeStepIsConst,
   holeOperandTyOf,
   holePinProvesNonNull,
-  identNameOrEmpty,
   instancePinnedMaps,
   instanceTyOf,
   mapArmShapeOfTy,
@@ -3322,7 +3314,7 @@ function emitRecCopyFields(
     || (dNames.length == 1
     && !rcHasNested(ssi, dRow, dTy, dNames, dFieldRows))
   if !reReadable {
-    if !fnUsesVariantRebox {
+    if !fnUses.variantRebox {
       return emitFail(
         "emitProgram: a multi-field record from a call is copied with no scratch slot reserved",
       )
@@ -4823,7 +4815,7 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
   }
   // A receiver that is not a re-readable place (a call) is evaluated once into the `?.` stash.
   const staged = !unionEqOperandOk(recv)
-  if staged && !fnUsesOptRecv {
+  if staged && !fnUses.optRecv {
     return emitFailAt("emitProgram: `is` receiver stash not reserved", recv)
   }
   let heap = -1
@@ -5383,7 +5375,7 @@ function listFitShadowIsRef(recv: i32, fnIx: i32): boolean {
 // that list is the receiver's place: a later test fits it and a `.length` reads it.
 function listFitGrowRow(rIx: i32, kTy: i32, fnIx: i32): i32 {
   if !listIsTestedIdent(rIx) { return -1 }
-  const name = identNameOrEmpty(rIx)
+  const name = identNameAt(rIx)
   if fitGrowFn != fnIx { listFitGrowScan(fnIx) }
   let i = 0
   while i < fitGrowName.length {
@@ -6462,33 +6454,30 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   const chkLeaf = listLeafTyOf(chk)
   const tags: i32[] = []
   const fits: i32[] = []
-  const wraps: i32[] = []
   const slotsAt: i32[][] = []
-  let own = false
   let other = false
   for a in arms {
     if tyArrayElemIx(a) >= 0 {
       const t = isArmTagOfTy(a)
       if t < 0 { return 0 }
+      // A ref-element arm's list row is minted here, where the test is lowered: the branch the
+      // test narrows reads that arm's elements through it.
+      if unMemIsRefElemArray(a) { unMemRefArrArmSlot(a) }
       let k = if tySame(a, chk) { LIST_ARM_OWN } else { listArmFitAcrossReps(a, chk) }
       const slots: i32[] = []
       if k == 0 {
-        if t != chkTag {
-          // An arm whose element type is fixed apart from the test's never fits, empty or not.
-          if tyFitKind(a, chk) == 0 { continue }
-          k = LIST_ARM_EMPTY
-        } else {
-          k = listArmSharedTagFit(a, chk, slots)
-          if k == 0 { return 0 }
-        }
+        // An arm with another tag holds a list whose element type is fixed apart from the
+        // test's: it never fits, empty or not (the D16047 refinement).
+        if t != chkTag { continue }
+        k = listArmSharedTagFit(a, chk, slots)
+        if k == 0 { return 0 }
       }
-      if tySame(a, chk) { own = true } else { other = true }
+      if !tySame(a, chk) { other = true }
       let j = tags.length - 1
       while j >= 0 && tags[j] != t { j = j - 1 }
       if j < 0 {
         tags.push(t)
         fits.push(k)
-        wraps.push(listArmWrapOfTy(a))
         slotsAt.push(slots)
       } else if fits[j] != k {
         // Only `L` itself and an arm whose elements may fit `L` share a tag, and the element
@@ -6509,15 +6498,6 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
     }
   }
   if !other { return 0 }
-  let empties = false
-  let i = 0
-  while i < fits.length {
-    if fits[i] == LIST_ARM_EMPTY {
-      if !own || chkTag < 0 || wraps[i] < 0 { return 0 }
-      empties = true
-    }
-    i = i + 1
-  }
   const slot = sharedFieldRecvSlot()
   if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
   fbLocalSet(slot)
@@ -6532,7 +6512,7 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   }
   const lexes = tyLitMemberTexts(chkLeaf)
   fbI32Const(0)
-  i = 0
+  let i = 0
   while i < tags.length {
     fbLocalGet(slot)
     fbRefAsNonNull()
@@ -6545,11 +6525,7 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
       fbLocalGet(slot)
       fbRefAsNonNull()
       fbStructGet(uBoxIdx, 1)
-      if k == LIST_ARM_EMPTY {
-        fbRefCast(wraps[i])
-        fbStructGet(wraps[i], 1) // len
-        fbI32Eqz()
-      } else if k == LIST_ARM_NULLS {
+      if k == LIST_ARM_NULLS {
         if emitUnionPayloadUnbox(body, 7) < 0 { return -1 }
         const nulls = ["2"]
         if (
@@ -6606,19 +6582,15 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
     i = i + 1
   }
   if nullable { fbEnd() }
-  if empties {
-    return emitListIsRebox(body, nd.isObj, slot, chk, chkTag, tags, fits, fnIx)
-  }
   1
 }
 
 // How `emitListIsAcrossReps` tests one tag: by the tag alone (`L`, or an arm every element of
-// which fits), a `string[]` arm's strings, an empty disjoint-rep arm, an atom arm's atoms, a
+// which fits), a `string[]` arm's strings, an atom arm's atoms, a
 // `(boolean | null)[]` arm tested as `null[]` (every element the null sentinel 2), or a
 // `(string | null)[]` arm tested as `string[]` (no element null).
 const LIST_ARM_OWN = 1
 const LIST_ARM_STRS = 2
-const LIST_ARM_EMPTY = 3
 const LIST_ARM_ATOMS = 4
 const LIST_ARM_NULLS = 5
 const LIST_ARM_NONNULL = 6
@@ -6681,130 +6653,6 @@ function atomArmSlots(a: i32, depth: i32, slots: i32[]): boolean {
     k = k + 1
   }
   true
-}
-
-// The wrapper heap type list arm `a` rides a box's payload in, or -1.
-function listArmWrapOfTy(a: i32): i32 {
-  const lw = listWrapHeapOfKind(boxTagOfTy(a))
-  if lw >= 0 { return lw }
-  if !unMemIsRefElemArray(a) { return -1 }
-  const sl = unMemRefArrArmSlot(a)
-  if sl < 0 || sl >= rlWrapIdx.length { return -1 }
-  rlWrapIdx[sl]
-}
-
-// With an `is L` answer on the stack, re-boxes receiver `recv` (staged in `slot`) as an empty
-// `L` when it fitted as an empty list of another arm, and stores the box back into `recv`, so
-// the narrowed branch reads and writes an `L` (D4949). The place takes a new list rather than
-// the old one changing rep: a reference typed as the other arm must never hold an `L` element.
-function emitListIsRebox(
-  body: u8[],
-  recv: i32,
-  slot: i32,
-  chk: i32,
-  chkTag: i32,
-  tags: i32[],
-  fits: i32[],
-  fnIx: i32,
-): i32 {
-  const chkWrap = listArmWrapOfTy(chk)
-  const chkBack = if chkWrap < 0 { -1 } else { listBackOfWrap(chkWrap) }
-  const st = listIsStoreBackOf(recv, fnIx)
-  // A place with no store-back reads an empty `L` stand-in, and a push into it traps (D4939).
-  if chkBack < 0 || st.kind == LIS_NONE { return 1 }
-  const res = listFitSlot("list", 0, 4)
-  fbLocalTee(res)
-  fbIf(64)
-  fbI32Const(0)
-  let i = 0
-  while i < tags.length {
-    if fits[i] == LIST_ARM_EMPTY {
-      fbLocalGet(slot)
-      fbRefAsNonNull()
-      fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, tags[i])
-      fbI32Bin(70) // 0x46 i32.eq
-      fbI32Bin(114) // 0x72 i32.or
-    }
-    i = i + 1
-  }
-  fbIf(64)
-  if st.obj >= 0 && emitExpr(body, st.obj, fnIx) < 0 { return -1 }
-  if st.kind == LIS_ELEM {
-    fbStructGet(rlWrapIdx[st.at], 0) // the backing; the read just made proved the index
-    if emitExpr(body, st.idx, fnIx) < 0 { return -1 }
-  }
-  fbI32Rel(RS_TAG, chkTag)
-  fbBacking(chkBack, 0)
-  fbI32Const(0)
-  fbI32Const(0)
-  fbStructNew(chkWrap)
-  fbStructNew(uBoxIdx)
-  if st.kind == LIS_LOCAL {
-    fbLocalSet(st.at)
-  } else if st.kind == LIS_GLOBAL {
-    if emitUserGlobalSet(st.at) < 0 { return -1 }
-  } else if st.kind == LIS_FIELD {
-    fbStructSet(sHeapIdx[st.at], st.field)
-  } else {
-    fbArraySet(rlBackIdx[st.at])
-  }
-  fbEnd()
-  fbEnd()
-  fbLocalGet(res)
-  1
-}
-
-// Where `emitListIsRebox` stores its box: nowhere, a local, a mutable global, a field of a
-// record row, or an element of a list of boxes.
-const LIS_NONE = 0
-const LIS_LOCAL = 1
-const LIS_GLOBAL = 2
-const LIS_FIELD = 3
-const LIS_ELEM = 4
-type ListIsStore = { kind: i32, at: i32, field: i32, obj: i32, idx: i32 }
-
-function listIsStore(
-  kind: i32,
-  at: i32,
-  field: i32,
-  obj: i32,
-  idx: i32,
-): ListIsStore {
-  { kind: kind, at: at, field: field, obj: obj, idx: idx }
-}
-
-// The store-back `emitListIsRebox` can make into `recv`: `at` is the local, global, struct row
-// or ref-list slot, `field` the struct field, `obj` and `idx` the container and index to
-// re-evaluate. A capture `captureBoxRewrite` turned into a cell arrives as that cell's element.
-function listIsStoreBackOf(recv: i32, fnIx: i32): ListIsStore {
-  const rn = nodeAt(unwrapParen(recv))
-  if rn is Ident {
-    const li = localIndexOf(fnIx, unwrapParen(recv))
-    if li >= 0 && identSlotIsUnionBox(fnIx, unwrapParen(recv)) {
-      return listIsStore(LIS_LOCAL, li, -1, -1, -1)
-    }
-    const g = if li >= 0 || capturedIsUnionBox(fnIx, rn.identName) { -1 } else { globalIndexOf(rn.identName) }
-    if g >= 0 && !globalCellIsImmutable(g) {
-      return listIsStore(LIS_GLOBAL, g, -1, -1, -1)
-    }
-  } else if placeNarrowKeyOf(recv) != "" {
-    // Only a place the narrowing names is re-read, so re-evaluating its path has no effect.
-    if rn is Member {
-      const si = structIndexOfExpr(rn.memObj, fnIx)
-      const fi = if si < 0 || si >= sHeapIdx.length { -1 } else { sFieldIndex(si, rn.memProp) }
-      if fi >= 0 && sFieldIsUnionBox(si, fi) {
-        return listIsStore(LIS_FIELD, si, fi, rn.memObj, -1)
-      }
-    } else if rn is Index {
-      const rs = if exprMap(rn.idxArr, fnIx) || !exprRefArray(rn.idxArr, fnIx) { -1 } else { refListSlotOfExpr(rn.idxArr, fnIx) }
-      if rs >= 0 && rs < rlWrapIdx.length && rlElemKindAt(rs) == RLK_UNION {
-        return listIsStore(LIS_ELEM, rs, -1, rn.idxArr, rn.idxIndex)
-      }
-    }
-  }
-  // Any other operand, or a place whose storage is not a union box, keeps no store.
-  listIsStore(LIS_NONE, -1, -1, -1, -1)
 }
 
 // The scalar and literal rungs of `emitIsTest`, in order: a scalar map read, a nullable niche,
@@ -7820,7 +7668,7 @@ function emitOptRecvBase(body: u8[], exprIx: i32, fnIx: i32, asRef: boolean) {
   if optRecvStagedSet {
     fbLocalGet(optRecvSlot)
   } else {
-    if !fnUsesOptRecv {
+    if !fnUses.optRecv {
       return emitFailAt("emitProgram: `?.` receiver stash not reserved", exprIx)
     }
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
@@ -8044,7 +7892,7 @@ function emitListGetIdx(body: u8[], idxIx: i32, fnIx: i32) {
     fbLocalGet(listGetIdxSlot)
     return 0
   }
-  if !fnUsesListGet {
+  if !fnUses.listGet {
     return emitFailAt("emitProgram: `.get` operand stash not reserved", idxIx)
   }
   if emitExpr(body, idxIx, fnIx) < 0 { return -1 }
@@ -8063,7 +7911,7 @@ function emitListGetRecv(body: u8[], objIx: i32, fnIx: i32, heap: i32) {
   if listGetRecvStagedSet {
     fbLocalGet(listGetRecvSlot)
   } else {
-    if !fnUsesListGet {
+    if !fnUses.listGet {
       return emitFailAt("emitProgram: `.get` operand stash not reserved", objIx)
     }
     if emitExpr(body, objIx, fnIx) < 0 { return -1 }
@@ -13870,22 +13718,15 @@ function rlRowElemSubOf(s: i32, d: i32): boolean {
   const sr = rlElemStructRow(s)
   const dr = rlElemStructRow(d)
   if sr < 0 || dr < 0 { return false }
-  const dh = structTwinRep(dr)
-  let x = structTwinRep(sr)
+  const dh = sTwinRepOf(dr)
+  let x = sTwinRepOf(sr)
   let guard = 0
   while x >= 0 && guard < 64 {
     if x == dh { return true }
-    x = structTwinRep(sSuperAt(x))
+    x = sTwinRepOf(sSuperAt(x))
     guard = guard + 1
   }
   false
-}
-
-// The representative of struct row `r`'s heap (`sTwin`), or -1 for none.
-function structTwinRep(r: i32): i32 {
-  if r < 0 { return -1 }
-  if r < sTwin.length { return sTwin[r] }
-  r
 }
 
 // Join a spread literal's item groups, each a list in its own frame slot, of (`kk`, `row`) or,
@@ -16164,7 +16005,7 @@ function emitMapKeys(body: u8[], recvIx: i32, fnIx: i32) {
   if !exprMap(recvIx, fnIx) {
     return emitFail("emitProgram: .keys() receiver is not a map")
   }
-  if !fnUsesMapKeys {
+  if !fnUses.mapKeys {
     return emitFail("emitProgram: .keys() scratch frame not reserved")
   }
   const shape0 = mapShapeOfExpr(recvIx, fnIx)
@@ -16277,7 +16118,7 @@ function emitMapValues(body: u8[], recvIx: i32, fnIx: i32) {
     return emitMapKeys(body, recvIx, fnIx)
   }
   if shape == -3 { return failMapValueType() }
-  if !fnUsesMapVals {
+  if !fnUses.mapVals {
     return emitFail("emitProgram: .values() scratch frame not reserved")
   }
   const mapTy = mapTypeIdxOf(shape)
@@ -19325,7 +19166,7 @@ function strAccScan(blockIx: i32, fnIx: i32) {
   saResetRows()
   saFnIx = fnIx
   saKnownOnly = false
-  if !fnUsesStrOp { return 0 }
+  if !fnUses.strOp { return 0 }
   strAccWalk(blockIx, fnIx, 0, false)
   ssWalk(blockIx, fnIx, 0)
   0
@@ -19671,7 +19512,7 @@ export function strAccScanStart() {
   saResetRows()
   saFnIx = -1
   saKnownOnly = false
-  if !fnUsesStrOp { return 0 }
+  if !fnUses.strOp { return 0 }
   let si = 0
   while si < startStmts.length {
     ssWalk(startStmts[si], -1, 0)
@@ -20085,7 +19926,7 @@ function emitStrBytesEq(bytes: i32[]) {
 // The operand waits in the string-op frame's last slot; without that frame it is the bare call.
 function emitStrEqLit(body: u8[], litIx: i32, fnIx: i32) {
   const n = strLitLenOf(litIx)
-  if n < 0 || !fnUsesStrOp {
+  if n < 0 || !fnUses.strOp {
     if emitStrValue(body, litIx, fnIx) < 0 { return -1 }
     return emitStrEqCore(body)
   }
@@ -24111,7 +23952,7 @@ export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32) {
 // `valBlockTypeOfKind`'s blocktype: i64/f64/f32 route through their widening helper,
 // every other kind (i32, boolean, the ref atoms) through `emitExpr`. Kept beside that
 // ladder so the two halves of "what rep does this arm produce" move together.
-function emitExprAsKind(body: u8[], exprIx: i32, k: i32, fnIx: i32) {
+export function emitExprAsKind(body: u8[], exprIx: i32, k: i32, fnIx: i32) {
   if k == 3 { return emitExprAsI64(body, exprIx, fnIx) }
   if k == 4 { return emitExprAsF64(body, exprIx, fnIx) }
   if k == 5 { return emitExprAsF32(body, exprIx, fnIx) }
@@ -24265,6 +24106,43 @@ function omittedFieldNullNode(objIx: i32, name: string): i32 {
   emitFail(
     "emitProgram: internal: an omitted record field reached emit with no `null` its check minted",
   )
+}
+
+// A cast's miss at an instance whose operand it can never hit: `as?` evaluates the operand and
+// is its own `null`, `as!` traps after it, and a bare `as` returns the operand as the remainder.
+function emitAsInstMiss(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
+  if e.asMode != "null" && e.asMode != "trap" {
+    if emitReturnValue(body, e.asObj, fnIx) < 0 { return -1 }
+    fbReturn()
+    return 0
+  }
+  if emitExpr(body, e.asObj, fnIx) < 0 { return -1 }
+  fbDrop()
+  if e.asMode == "trap" {
+    fbUnreachable()
+    return 0
+  }
+  const mt = nodeTyIxOf(exprIx)
+  if repOfTy(mt).rdKind == "union" {
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx)
+    return 0
+  }
+  emitNullOwn(nullOwnOfTy(mt))
+}
+
+// The cast node `exprIx` copies, through a mono copy's source nodes (`nodeSrc`).
+function asCastRoot(exprIx: i32): i32 {
+  let at = exprIx
+  let depth = 0
+  while depth < 8 {
+    const up = nodeSrc[at] ?? -1
+    if up < 0 { return at }
+    at = up
+    depth = depth + 1
+  }
+  at
 }
 
 // The `null` node bare `as` cast `exprIx` hands `emitReturnValue` on a miss: the one its check
@@ -25014,6 +24892,10 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   // A boxed `v128 | null` or union operand takes the union arm below instead.
   if tgt == "v128" && !exprUnion(obj, fnIx) { return emitExpr(body, obj, fnIx) }
   if e.asMode == "wrap" { return emitNumWrapCast(body, e, _exprIx, fnIx) }
+  // A cast this instance's operand can never hit misses, as the instance's re-check found.
+  if asInstMisses(asCastRoot(_exprIx), elabKeyAt(fnIx)) {
+    return emitAsInstMiss(body, e, _exprIx, fnIx)
+  }
   if asExprLitAtomCast(_exprIx, fnIx) {
     return emitAsLitAtom(body, e, _exprIx, fnIx)
   }
@@ -25356,13 +25238,6 @@ const OP_F64_REINTERPRET_I64 = 0xbf
 // success (0) and its failure (-1) — the caller falls through to its own error.
 const NUM_INTR_NONE = -2
 
-// One single-BYTE numeric instruction: the whole encoding IS the opcode byte (no
-// immediates), so writing the byte writes the instruction.
-function fbNumOp(op: i32) {
-  wU8(op)
-  0
-}
-
 // Lower `f32bits` / `f64bits` / `f32fromBits` / `f64fromBits`: push the argument at
 // the source type, then the one reinterpret instruction. Returns `NUM_INTR_NONE` when
 // `name` is not one of them. The operand goes out at the bitcast's own
@@ -25389,18 +25264,18 @@ function emitBitcastIntr(body: u8[], callIx: i32, fnIx: i32, name: string) {
     const arg = c.callArgs[0]
     if name == "f32bits" {
       if emitExprAsKind(body, arg, 5, fnIx) < 0 { return -1 }
-      return fbNumOp(OP_I32_REINTERPRET_F32) // 0xbc i32.reinterpret_f32
+      return fbI32Bin(OP_I32_REINTERPRET_F32) // 0xbc i32.reinterpret_f32
     }
     if name == "f64bits" {
       if emitExprAsKind(body, arg, 4, fnIx) < 0 { return -1 }
-      return fbNumOp(OP_I64_REINTERPRET_F64) // 0xbd i64.reinterpret_f64
+      return fbI32Bin(OP_I64_REINTERPRET_F64) // 0xbd i64.reinterpret_f64
     }
     if name == "f32fromBits" {
       if emitExprAsKind(body, arg, 0, fnIx) < 0 { return -1 }
-      return fbNumOp(OP_F32_REINTERPRET_I32) // 0xbe f32.reinterpret_i32
+      return fbI32Bin(OP_F32_REINTERPRET_I32) // 0xbe f32.reinterpret_i32
     }
     if emitExprAsKind(body, arg, 3, fnIx) < 0 { return -1 }
-    return fbNumOp(OP_F64_REINTERPRET_I64) // 0xbf f64.reinterpret_i64
+    return fbI32Bin(OP_F64_REINTERPRET_I64) // 0xbf f64.reinterpret_i64
   }
   NUM_INTR_NONE
 }
@@ -25516,8 +25391,8 @@ function emitFloatIntr(body: u8[], callIx: i32, fnIx: i32, name: string) {
       if emitExprAsKind(body, args[j], fiK, fnIx) < 0 { return -1 }
       j = j + 1
     }
-    if useF32 { return fbNumOp(opF32) }
-    return fbNumOp(floatIntrOpF64(name))
+    if useF32 { return fbI32Bin(opF32) }
+    return fbI32Bin(floatIntrOpF64(name))
   }
   NUM_INTR_NONE
 }
@@ -25555,7 +25430,7 @@ function emitIntMinMax(
   fbLocalGet(s1)
   fbLocalGet(s0)
   fbLocalGet(s1)
-  fbNumOp(cmp)
+  fbI32Bin(cmp)
   fbSelect() // → the first operand when the compare holds
   0
 }
@@ -25580,12 +25455,12 @@ function emitIntAbs(body: u8[], callIx: i32, fnIx: i32, wide: boolean) {
   if wide { fbI64Const(0, 0) } else { fbI32Const(0) }
   fbLocalGet(s0)
   // i32.sub 0x6b · i64.sub 0x7d
-  if wide { fbNumOp(0x7d) } else { fbNumOp(0x6b) }
+  if wide { fbI32Bin(0x7d) } else { fbI32Bin(0x6b) }
   fbLocalGet(s0)
   fbLocalGet(s0)
   if wide { fbI64Const(0, 0) } else { fbI32Const(0) }
   // i32.lt_s 0x48 · i64.lt_s 0x53
-  if wide { fbNumOp(0x53) } else { fbNumOp(0x48) }
+  if wide { fbI32Bin(0x53) } else { fbI32Bin(0x48) }
   fbSelect() // → the negation when the operand is negative
   0
 }
@@ -25614,8 +25489,8 @@ function emitIntIntr(body: u8[], callIx: i32, fnIx: i32, name: string) {
       if emitExprAsKind(body, args[j], iiK, fnIx) < 0 { return -1 }
       j = j + 1
     }
-    if useI64 { return fbNumOp(intIntrOpI64(name)) }
-    return fbNumOp(opI32)
+    if useI64 { return fbI32Bin(intIntrOpI64(name)) }
+    return fbI32Bin(opI32)
   }
   NUM_INTR_NONE
 }
@@ -25772,17 +25647,6 @@ function zextLoadCallAt(ix: i32, fnIx: i32): i32 {
   -1
 }
 
-// The callee name of a call node `zextLoadCallAt` answered.
-function zextLoadCallName(callIx: i32): string {
-  const e = nodeAt(callIx)
-  if e is Call {
-    if e.callFn < 0 { return "" }
-    const f = nodeAt(e.callFn)
-    if f is Ident { return f.identName }
-  }
-  ""
-}
-
 // An i64 `&` mask operand's value when it is 0xff, 0xffff or 0xffffffff — an integer literal,
 // or a top-level i64 `const` bound to one — else -1. An i32 const is refused: widening it
 // sign-extends, so its 0xffffffff is an all-ones i64.
@@ -25811,7 +25675,7 @@ function zextLoadOf(ix: i32, fnIx: i32): i32 {
   if e is Call {
     const c = zextLoadCallAt(x, fnIx)
     if c < 0 { return -1 }
-    const cn = zextLoadCallName(c)
+    const cn = identCalleeAt(c)
     if cn == "__load_u8_i64__" || cn == "__load_u16_i64__" { return c }
     if cn == "__load_u32_i64__" { return c }
     return -1
@@ -25821,7 +25685,7 @@ function zextLoadOf(ix: i32, fnIx: i32): i32 {
     if e.asMode != "prop" && e.asMode != "wrap" { return -1 }
     const ac = zextLoadCallAt(e.asObj, fnIx)
     if ac < 0 { return -1 }
-    if zextLoadCallName(ac) == "__load_i32__" { return -1 }
+    if identCalleeAt(ac) == "__load_i32__" { return -1 }
     return ac
   }
   zextLoadMasked(x, fnIx)
@@ -25857,7 +25721,7 @@ function zextLoadMasked(x: i32, fnIx: i32): i32 {
     if m < 0 { return -1 }
     const inner = zextLoadOf(other, fnIx)
     if inner >= 0 {
-      const w = zextLoadWidth(zextLoadCallName(inner))
+      const w = zextLoadWidth(identCalleeAt(inner))
       if m == MEM_OFFSET_MAX || w == 8 || (w == 16 && m == 0xffff) {
         return inner
       }
@@ -25869,7 +25733,7 @@ function zextLoadMasked(x: i32, fnIx: i32): i32 {
       if o.asTy != "i64" { return -1 }
       if o.asMode != "prop" && o.asMode != "wrap" { return -1 }
       const sc = zextLoadCallAt(o.asObj, fnIx)
-      if sc >= 0 && zextLoadCallName(sc) == "__load_i32__" { return sc }
+      if sc >= 0 && identCalleeAt(sc) == "__load_i32__" { return sc }
     }
   }
   -1
@@ -25880,7 +25744,7 @@ function zextLoadMasked(x: i32, fnIx: i32): i32 {
 function emitZextLoad(body: u8[], callIx: i32, fnIx: i32) {
   const c = nodeAt(callIx)
   if c is Call {
-    const w = zextLoadWidth(zextLoadCallName(callIx))
+    const w = zextLoadWidth(identCalleeAt(callIx))
     let nm = "__load_u32_i64__"
     if w == 8 { nm = "__load_u8_i64__" }
     if w == 16 { nm = "__load_u16_i64__" }
@@ -30613,7 +30477,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       const dstBack = dst.dstBack
       const srcL = mfSrcLocalFor(recvK, srcSlot)
       const dstL = mfDstLocalFor(resK, dstSlot)
-      if !fnUsesMapFilter || srcL < 0 || dstL < 0 {
+      if !fnUses.mapFilter || srcL < 0 || dstL < 0 {
         return emitFail("emitProgram: .map/.filter scratch frame not reserved")
       }
       const iL = mfScratchBase
@@ -31927,7 +31791,7 @@ function emitArrSlice(body: u8[], callIx: i32, fnIx: i32) {
       }
       const srcL = mfSrcLocalFor(recvK, srcSlot)
       const dstL = mfDstLocalFor(recvK, srcSlot)
-      if !fnUsesMapFilter || srcL < 0 || dstL < 0 {
+      if !fnUses.mapFilter || srcL < 0 || dstL < 0 {
         return emitFail("emitProgram: .slice scratch frame not reserved")
       }
       // The `.map`/`.filter` frame's first 3 slots are i32 (i, n, j); slot +3 is a
@@ -32974,7 +32838,7 @@ export function emitVoidTailCall(fnIx: i32) {
 // The tail-call rewrite in a lifted function that hands captures back: only a call to itself
 // returns what the function itself would, so its write-back is dropped with it (D3664).
 function emitLiftSelfTailRet(fnIx: i32) {
-  if fnUsesUnionSink || tailCallIdx < 0 || tailCallEnd < 0 { return false }
+  if fnUses.unionSink || tailCallIdx < 0 || tailCallEnd < 0 { return false }
   if tailCallTable >= 0 || liftWbEnd != wLen() { return false }
   const fnPos = fnStmtsPosOf(fnIx)
   if fnPos < 0 || tailCallIdx != gImports + fnPos { return false }
@@ -32990,7 +32854,7 @@ function emitLiftSelfTailRet(fnIx: i32) {
 // taking the sink — the two `local.set`s and branch to the exit block. A peephole: when
 // the last instruction written is `struct.new $uBox`, popping its operands into the exit locals is observably identical.
 export function emitUnionRetSink(fnIx: i32) {
-  if fnUsesUnionSink {
+  if fnUses.unionSink {
     if uBoxNewIsLast() {
       uBoxSinkToPair()
       fbBr(ctrlDepth) // 0x0c br to the function's single exit block
@@ -33044,7 +32908,7 @@ function emitTailReturnExit(body: u8[], stmtIx: i32, fnIx: i32) {
 // terminator can never be paired differently. The one exception is a returned
 // if-expression in a sinking function, split into per-arm exits below.
 function emitReturnExit(body: u8[], retArg: i32, fnIx: i32) {
-  if fnUsesUnionSink {
+  if fnUses.unionSink {
     const bare = nodeAt(unwrapParen(retArg))
     // A join typed one wider number is that number, boxed once, as at every other delivery (D3656).
     if bare is IfStmt && !retIfIsOneNumber(unwrapParen(retArg), fnIx) {
@@ -33061,7 +32925,7 @@ function emitReturnExit(body: u8[], retArg: i32, fnIx: i32) {
 // which is built at that number as its hoisted twin builds it (D3571; owner ruling, D3657).
 // Runtime tails alone keep their members (D3656).
 function retIfIsOneNumber(ifIx: i32, fnIx: i32): boolean {
-  if !fnUsesUnionSink || ifIx < 0 || ifIx >= P.nodes.length { return false }
+  if !fnUses.unionSink || ifIx < 0 || ifIx >= P.nodes.length { return false }
   if !ifJoinAdaptsScalar(ifIx, fnIx) { return false }
   for lf in valueTailLeaves(ifIx) {
     if cexLitPeel(lf) >= 0 { return true }
@@ -33718,7 +33582,7 @@ function emitLetIfInit(body: u8[], s: LetDecl, slot: i32, idx: i32, fnIx: i32) {
     // the binding sink: with every arm writing the shared pair and ONE `struct.new`
     // after the `if`, the arms' construction sites collapse to that one — and the
     // pre-seed below goes with them, because the single store dominates every read.
-    if nulRep == 0 && fnUsesUnionLetSink {
+    if nulRep == 0 && fnUses.unionLetSink {
       if unionIfBindingAllBox(s.letInit, fnIx) {
         if (
           emitUnionIfBindingSink(body, s.letInit, idx, nulNm, nulTy, fnIx)
@@ -37166,7 +37030,7 @@ function emitPrintUnionArm(body: u8[], slot: i32, k: i32) {
     // `exprHasStrOp`'s print arm asked `printUnionHasStrArm`, the SAME plan this dispatch
     // walked. A guard rather than an assumption: without the frame `strScratchBase + 0` is
     // some other local and the module fails to parse.
-    if !fnUsesStrOp {
+    if !fnUses.strOp {
       return emitFail(
         "emitProgram: print of a union with a string arm but no string scratch frame",
       )
@@ -37469,7 +37333,7 @@ function emitStrToAtom(body: u8[], ix: i32, fnIx: i32) {
     // evaluated once into `atomStageSlot`, then re-read per member (`emitAtomToStr`'s id
     // stash mirrored). Reached through `emitExpr`'s single atom hook, so every
     // atom-typed destination is served by one arm (D13).
-    if !fnUsesAtomStage {
+    if !fnUses.atomStage {
       // the reservation scan claims a strict superset of what this arm stages, so reaching
       // here means the two have drifted. Keep the loud refusal rather than `local.set` an
       // index the locals vector never declared.
@@ -37605,7 +37469,7 @@ function emitDestStrToAtom(body: u8[], valIx: i32, fnIx: i32, luTy: i32) {
     const rr = emitStrToAtomChain(body, ix, texts, 0, fnIx)
     return rr
   }
-  if !fnUsesAtomStage {
+  if !fnUses.atomStage {
     // The reservation scan claims a strict SUPERSET of what this arm stages, so reaching here
     // means the two have drifted. Fail loudly rather than `local.set` an index the locals
     // vector never declared — that is invalid wasm with `vl check` rc 0.
@@ -38398,6 +38262,8 @@ let nulAtomTyMemo: {[i32]: boolean} = Map()
 function tyRepsAsNulAtom(t: i32): boolean {
   const m = nulAtomTyMemo.get(t)
   if m != null { return m }
+  // A template's own type parameter has no rep, so it is no niche.
+  if t >= 0 && t < T.tys.length && tyAt(t) is TyVar { return false }
   const d = repOfTy(t)
   const r = d.rdCovered == 1 && d.rdNul == 3
   nulAtomTyMemo[t] = r
@@ -41153,7 +41019,7 @@ function emitCoalesceNulRefJoin(
       exprIx,
     )
   }
-  if !fnUsesOptRecv {
+  if !fnUses.optRecv {
     return emitFailAt("emitProgram: `??` operand stash not reserved", exprIx)
   }
   if emitExpr(body, e.binLeft, fnIx) < 0 {
@@ -41499,21 +41365,6 @@ function nulBoxScalarValtype(kind: i32) {
   -1
 }
 
-// The `?? d` default at the atom kind the present arm unboxes to, so the two arms of the
-// `if` agree: an i64/f64/f32 destination re-encodes its literal exactly as a union-box
-// argument does.
-function emitCoalesceScalarDefault(
-  body: u8[],
-  defIx: i32,
-  kind: i32,
-  fnIx: i32,
-) {
-  if kind == 3 { return emitExprAsI64(body, defIx, fnIx) }
-  if kind == 4 { return emitExprAsF64(body, defIx, fnIx) }
-  if kind == 5 { return emitExprAsF32(body, defIx, fnIx) }
-  emitExpr(body, defIx, fnIx)
-}
-
 // `x ?? d` over a nullable value box read with its narrowing lifted: the box's tag decides, the
 // present arm unboxed at the coalesce's rep (a numeric scalar, or the value box itself).
 function emitCoalesceBoxRuntime(
@@ -41546,7 +41397,7 @@ function emitCoalesceBoxRuntime(
     fbRefCast(bVb)
     fbStructGet(bVb, 0)
     fbElse()
-    if emitCoalesceScalarDefault(body, e.binRight, bk, fnIx) < 0 { return -1 }
+    if emitExprAsKind(body, e.binRight, bk, fnIx) < 0 { return -1 }
     fbEnd()
     return 0
   }
@@ -41599,7 +41450,7 @@ function emitOptCoalesceBoxLeaf(
   if emitOptChainIsNull(body, lhsIx, fnIx) < 0 { return -1 }
   if bNm == "" {
     fbIf(bVt)
-    if emitCoalesceScalarDefault(body, e.binRight, bk, fnIx) < 0 { return -1 }
+    if emitExprAsKind(body, e.binRight, bk, fnIx) < 0 { return -1 }
   } else {
     fbIfRef(uBoxIdx)
     if (emitUnionBoxOwed(body, bNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
@@ -42343,9 +42194,7 @@ function emitCoalesceElemBox(
       fbStructGet(nbVb, 0)
       emitScalarWiden(nbElem, nbKind)
       fbElse()
-      if emitCoalesceScalarDefault(body, e.binRight, nbKind, fnIx) < 0 {
-        return -1
-      }
+      if emitExprAsKind(body, e.binRight, nbKind, fnIx) < 0 { return -1 }
       fbEnd()
       return 0
     }
@@ -43189,7 +43038,7 @@ function emitCoalesceBoxFieldScalar(
   fbStructGet(vb, 0)
   if coalWidenUnboxed(fk, rk) < 0 { return -1 }
   fbElse()
-  if emitCoalesceScalarDefault(body, e.binRight, rk, fnIx) < 0 { return -1 }
+  if emitExprAsKind(body, e.binRight, rk, fnIx) < 0 { return -1 }
   fbEnd()
   0
 }
