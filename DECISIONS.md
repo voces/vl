@@ -9790,8 +9790,14 @@ tree read stays an editor reference.
 * An annotated `const` is a typed constant (owner, 2026-09-30): its annotation is the tree's
   destination, so `const x: i32 = 2147483647 + 1` is refused rather than wrapped.
 * An integer literal past the `i64` range is refused wherever no float holds it exactly
-  (D3425), where it used to keep its low 64 bits; a constant past it (`1 << 64`) is refused at
-  the use, not where it is declared, so `(1 << 70) >> 60` is 1024.
+  (D3425), where it used to keep its low 64 bits; a constant past it (`(1 << 62) * 4`) is refused
+  at the use, not where it is declared, so `((1 << 62) * 4) >> 60` is 16.
+* **A constant shift count decides an untyped literal operand's width (owner, 2026-11-15, Q8).**
+  A count of 0 to 31 leaves the literal `i32`; a count of 32 to 63 makes it `i64`, so
+  `(-3) >>> (40 + 1)` and `0xFFFFFFFF >> (40 + 1)` compute at 64 bits; a count of 64 or more is
+  refused with E6.2's sentence (`4294967296 >> 65535`, `1 << 64`). An operand whose type is fixed,
+  a declared `x: i32` or an `i32` destination (`const c: i32 = (-3) >>> (40 + 1)`), keeps E6.2's
+  refusal for a count past its width. The count may be a literal or a constant tree (D16378).
 * In a generic body, an `i64` operand beside a type-parameter operand records a constraint
   (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit operand it meets`),
   since the body alone cannot see the width (D2712, D3426);

@@ -23,16 +23,21 @@ import { nodeTyIx, nodeTyOf, nodeTySet } from "./check_node_tys"
 import {
   binFloatOperandPair,
   binIntOnlyOp,
+  cexCountBelow,
   cmpF32LitAdopts,
   isExactF64IntLitExpr,
   isF32AdoptingLitExpr,
   isFloatLitExpr,
+  litTreeOps,
   litTreeWideTy,
   numLitDstTy,
   numLitOwnTy,
   numUnionMembersOf,
 } from "./check_num_lits"
 import { parenPeelIx } from "./check_places"
+import { cexEvalAt } from "./check_num_lit_state"
+import { cexDecText, cexOk } from "./const_exact"
+import { numLexFitsI32 } from "./emit_bignum"
 import { mixesNumeric, widerNumeric } from "./check_ty_relate"
 import {
   isNumericPrimTy,
@@ -332,6 +337,32 @@ function litTreeAdopt(ix: i32, ty: i32): i32 {
     return litTreeAdopt(e.binRight, ty)
   }
   litTreeAdoptLeaf(ix, ty)
+}
+
+// Whether `ix` shifts a literal tree by a constant count of 32 to 63, which makes that untyped
+// operand an `i64` (owner ruling Q8, D16378).
+export function shiftWidensLit(ix: i32): boolean {
+  const e = nodeAt(parenPeelIx(ix))
+  if !(e is BinExpr) || !binShiftOp(e.binOp) || litTreeOps(e.binLeft, 32) < 0 {
+    return false
+  }
+  const cv = cexEvalAt(e.binRight, 0)
+  if !cexOk(cv) || cv.cxFloat || cv.cxNeg { return false }
+  const lex = cexDecText(cv)
+  numLexFitsI32(lex) && cexCountBelow(lex, 64) && !cexCountBelow(lex, 32)
+}
+
+// The left operand of the shift at `ix` built at `ty`: `i64` where its count widens it, `i32` at
+// an `i32` destination, where the count is then refused.
+export function shiftLitAdopt(ix: i32, ty: i32): i32 {
+  const sx = parenPeelIx(ix)
+  if sx < 0 || sx >= P.nodes.length { return ty }
+  const e = nodeAt(sx)
+  if !(e is BinExpr) || inferQuiet { return ty }
+  litTreeAdopt(e.binLeft, ty)
+  nodeTySet(sx, ty)
+  tailParensSync(ix)
+  ty
 }
 
 // A tree's other nodes are its literals (`litTreeOps` admits no other), each recorded so a
