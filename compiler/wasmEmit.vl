@@ -15107,12 +15107,12 @@ function emitMapProbe(body: u8[], keepHash: boolean) {
 // list at any nesting, nested map, union and closure, plus each one's nullable niche.
 
 // What is left: a struct that is a member of a declared union, living in the variant table where
-// the mv slot has no variant half; a nullable closure with a literal-union result; a nullable list
-// whose element rep the layer does not name; and a value name resolving to none of these. The
-// tail clause is a second producer, for a lowerable value whose mv slot nothing interned.
+// the mv slot has no variant half; a nullable list whose element rep the layer does not name; and
+// a value name resolving to none of these. The tail clause is a second producer, for a lowerable
+// value whose mv slot nothing interned.
 function failMapValueType() {
   emitFail(
-    "emitProgram: unsupported map value type (no rep for a union-member struct, a nullable list over an unnamed element rep, or a nullable litunion-result closure; any other value type here interned no mv slot)",
+    "emitProgram: unsupported map value type (no rep for a union-member struct or a nullable list over an unnamed element rep; any other value type here interned no mv slot)",
   )
 }
 
@@ -24397,7 +24397,7 @@ function emitNumWrapCast(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
 // `ref.as_non_null`, and `as?`'s result type is the operand's own rep (D1812).
 function emitAsNulNiche(body: u8[], e: AsExpr, fnIx: i32) {
   const obj = e.asObj
-  const payload = nulRefNichePayloadTy(nodeTyIxOf(obj))
+  const payload = nulRefNichePayloadTy(nodeTyAt(obj, fnIx))
   if payload < 0 {
     return emitFailAt(
       "emitProgram: `as "
@@ -24464,7 +24464,7 @@ function nulNicheHeapOf(obj: i32, payload: i32, fnIx: i32): i32 {
   if exprNulClosure(obj, fnIx) { return cloStructIdx }
   if exprNullableMap(obj, fnIx) {
     let ms = mapShapeOfExpr(obj, fnIx)
-    if ms == -3 { ms = mapShapeOfTyPeeled(nodeTyIxOf(obj)) }
+    if ms == -3 { ms = mapShapeOfTyPeeled(nodeTyAt(obj, fnIx)) }
     if ms != -3 { return mapTypeIdxOf(ms) }
   }
   -1
@@ -38253,10 +38253,17 @@ function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
   if own == NULL_OWN_NONE && d.rdKind == "nulnone" {
     own = nullOwnOfTy(nodeCtxTyIxOf(parenPeelIx(exprIx)))
   }
-  // A list element is the null of the element its list literal is built at (D16311).
-  if own == NULL_OWN_NONE && d.rdKind == "nulnone" {
-    const lo = ctxElemOwnerOf(parenPeelIx(exprIx))
-    if lo >= 0 { own = listElemNullOwn(nodeTyAt(lo, fnIx)) }
+  // A list element is the null of the element its list literal is built at (D16311), whatever
+  // the element's own stamp names: a null-only literal is built at its destinations'
+  // (D16316; unfiled: D16316).
+  const lo = ctxElemOwnerOf(parenPeelIx(exprIx))
+  if lo >= 0 {
+    const lt = listLitBuiltTy(lo, fnIx)
+    if lt >= 0 {
+      own = listElemNullOwn(lt)
+    } else if own == NULL_OWN_NONE && d.rdKind == "nulnone" {
+      own = listElemNullOwn(nodeTyAt(lo, fnIx))
+    }
   }
   // An instance's stamp can be an inner join's, which a delivery at a wider type outlives: the
   // instance's contextual type, where closed, names the null its storage holds (D14640).
@@ -38266,6 +38273,25 @@ function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
     if co != NULL_OWN_NONE { own = co }
   }
   own
+}
+
+// The list type literal `lo` builds its elements at in `fnIx` when that element admits `null`
+// and is more than `null`: its own type, else its destinations' agreed one; -1 otherwise.
+function listLitBuiltTy(lo: i32, fnIx: i32): i32 {
+  for t in [nodeTyAt(lo, fnIx), tyAtInstance(arrLitDestTy(lo), fnIx)] {
+    if t >= 0 && t < T.tys.length {
+      const n = tyAt(t)
+      if (
+        n is TyArray
+        && n.aElem >= 0
+        && !isNullTy(n.aElem)
+        && tyAdmitsNull(n.aElem)
+      ) {
+        return t
+      }
+    }
+  }
+  -1
 }
 
 // The null the element of list type `t` (through `| null`) names, as `nullOwnOfTy` does.
