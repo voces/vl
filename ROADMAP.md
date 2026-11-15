@@ -102,6 +102,10 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   names itself at a larger argument stay check errors. When this is built, the checker's
   growth test picks those generics out and they compile once with their type parameter boxed, beside
   the monomorphized ones. DECISIONS.md §"Polymorphic recursion is refused for now".
+- **A user-facing `vl` command for the implicit-return migration** (external repos, AE-001). The
+  flag-day tree was migrated with `vl check --fix --migrate-return` on a pre-flag-day seed, which
+  the rule-on compiler no longer carries. A repo outside this one needs the same rewrite from the
+  `vl` it installs. DECISIONS.md §"A function's block body returns a value only through `return`".
 - **Homebrew formula, once a release process exists** (owner ruling 2026-11-14). The draft
   `Formula/vl.rb` was deleted; a formula is written against a real tag and its checksums.
 
