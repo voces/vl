@@ -165,6 +165,7 @@ import {
   cloArityRepIsWide,
   drwFieldClosure,
   mfCbRetIsBool,
+  sigKeyOfTy,
   sigKeyRetKind,
   sigKeyRetSlot,
   tyUnionHasValueUnionElemArrayArm,
@@ -187,6 +188,7 @@ import { elabClosedTyAt, holeOperandTyOf, nodeTyInOf } from "./emit_ty_canon"
 import { unionStoreAtomKindOfSet } from "./emit_union_casts"
 import { i32ListHas } from "./listutil"
 import { identDeclOf, sidOfNode } from "./symbols"
+import { parseI32 } from "./emit_bignum"
 import { primNameOf, tyEmitPrimOf, tyHasTyVar } from "./tyquery"
 
 // True when the `.map` callback at `fe` produces an element riding the string list — a
@@ -771,6 +773,70 @@ function producerCloSigKeyOfRead(readIx: i32, fnIx: i32) {
     return producerCloSigKeyOfRead(src, fnIx)
   }
   ""
+}
+
+// The node that built the closure the read `readIx` holds, when it is a call or a list
+// element reached through `const` initializers; -1 for any other read.
+function cloValueProducerOf(readIx: i32, depth: i32): i32 {
+  const r = unwrapParen(readIx)
+  if r < 0 || depth > 8 { return -1 }
+  const e = nodeAt(r)
+  if e is Call { return r }
+  if e is Index {
+    const arr = cloConstInitOf(e.idxArr)
+    const an = if arr >= 0 { nodeAt(arr) } else { nodeAt(r) }
+    const at = nodeAt(e.idxIndex)
+    if an is ArrayLit && at is NumLit {
+      const k = parseI32(at.numText)
+      if k >= 0 && k < an.arrElems.length {
+        return cloValueProducerOf(an.arrElems[k], depth + 1)
+      }
+    }
+    return -1
+  }
+  const init = cloConstInitOf(r)
+  if init >= 0 { return cloValueProducerOf(init, depth + 1) }
+  -1
+}
+
+// The initializer of the `const` the name read `ix` names, or -1.
+function cloConstInitOf(ix: i32): i32 {
+  const r = unwrapParen(ix)
+  if r < 0 || !(nodeAt(r) is Ident) { return -1 }
+  const d = identDeclOf(r)
+  if d < 0 { return -1 }
+  const dn = nodeAt(d)
+  if dn is LetDecl {
+    if dn.letKw == "const" { return dn.letInit }
+  }
+  -1
+}
+
+// The `$fnsig` key the closure call `src` hands back in instance `fnIx` was built at: its callee
+// instance's declared return there, or the key of what an un-annotated one returns; "" unknown.
+function cloCallBuiltKey(src: i32, fnIx: i32, depth: i32): string {
+  const c = nodeAt(src)
+  if !(c is Call) || depth > 8 || c.callFn < 0 { return "" }
+  const cf = unwrapParen(c.callFn)
+  if !(nodeAt(cf) is Ident) { return "" }
+  const fe = fnIndexOfAt(sidOfNode(cf), fnIx, cf)
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  const fd = nodeAt(fnStmts[fe])
+  if !(fd is FuncDecl) { return "" }
+  if fd.fnRet >= 0 { return sigKeyOfTy(nodeTyAt(fd.fnRet, fe)) }
+  const rx = cloValueProducerOf(fnRetExprOf(fnStmts[fe]), 0)
+  if rx >= 0 { cloCallBuiltKey(rx, fe, depth + 1) } else { "" }
+}
+
+// Whether value call `callIx` reads a closure a generic call built at another signature than
+// the call reads, as the default instance of a type parameter nothing bound does (D16562).
+export function cloCallBuiltAtOtherSig(callIx: i32, ckey: string, fnIx: i32): boolean {
+  const c = nodeAt(callIx)
+  if !(c is Call) || ckey == "" { return false }
+  const src = cloValueProducerOf(c.callFn, 0)
+  if src < 0 { return false }
+  const bk = cloCallBuiltKey(src, fnIx, 0)
+  bk != "" && bk != ckey && bk != sigKeyOfTy(nodeTyAt(src, fnIx))
 }
 
 // Soundness floor: a function-value call whose resolved cast `$fnsig` and its concrete
