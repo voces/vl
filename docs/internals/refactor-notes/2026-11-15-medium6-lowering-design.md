@@ -11,7 +11,7 @@ or is it "the check-time rewrites move into L1's lowering"?
 | class | what it is | where it goes |
 |---|---|---|
 | PRE | rewrites that run before checking | a small resolve-time pass of their own |
-| POST | rewrites that run after checking, mostly for the emitter | retire into L1's builder at I9 (phase B) |
+| POST | rewrites that run after checking, mostly for the emitter | retire into L1's builder at I9; I8 is the earliest possible (no legacy reader left) |
 | MID | rewrites the checker builds and then checks | become appends above the parse range, not overwrites |
 
 L1 confirms the routing (§5). Phase A (I1–I8) reads the post-rewrite tree for every construct,
@@ -74,11 +74,13 @@ later checking reads what it wrote.
     edit log) is no longer needed for PRE.
   - It must not run twice. Today `checkProgramAgain` re-runs these passes over their own output,
     which is why they must be idempotent. After the move, the re-walk starts from the lowered root.
-- **POST (12 overwrites, 19 functions)** retires into L1's builder at **I9**
-  (`ir-design-2026-11.md` §5.3), not at the I-step that first claims the construct.
-  - At I4 a desugared `match` is built as the if-chain the checker left, because `SSwitch` from the
-    source `match` moves bytes, and bytes may first move at I9.
-  - At I9 the desugar becomes the builder's own lowering: `check_match_desugar.vl` (4 functions, 16
+- **POST (12 overwrites, 19 functions)** retires into L1's builder at **I9**; I8 is the earliest
+  possible, once no legacy reader is left (`ir-design-2026-11.md` §5.3). It does not retire at the
+  I-step that first claims the construct.
+  - Until I8 the legacy emitter still lowers every unclaimed function from the rewritten tree. So at
+    I4 a desugared `match` must still exist, and a claimed function is built from the same
+    if-chain. `SSwitch` from the source `match` is a named mover after I8.
+  - At I8 or I9 the desugar becomes the builder's own lowering: `check_match_desugar.vl` (4 functions, 16
     sites), the `recEq*` rows, `voidRetRewrite`, `getterRewriteSites`, `synthInlineLitUnionDecls`
     and `ftBuildArmsAt`.
   - The stamp-only rows (`checkOptMemberNode`, `flatMemberFold`, `cexDeliver`,
@@ -116,7 +118,7 @@ identical on fixpoint seeds.
 | **6.3** | a ratchet: count the writes below `n1` after the PRE passes, field writes included, against a budget baseline that may only fall (like `scan-budget-baseline.json`). It becomes a refusal when the count reaches zero | none | +20 |
 | **6.4** | the between-pass pins become `CheckRun` facts read by the re-walk (13 functions) | step 3 (landed) | unmeasured; needs a per-function design |
 | **6.5** | the MID in-walk overwrites become parent-slot writes or builder facts (31 sites) | 6.3's residue count | unmeasured; per site |
-| **POST** | the 19 POST functions retire into L1's builder at I9 | L1 I8 | counted in L1's §7, not here |
+| **POST** | the 19 POST functions retire into L1's builder at I9 | L1 I9 (I8 earliest) | counted in L1's §7, not here |
 | **5 (L5)** | `arenaEpoch`, the edit log and the 26 epoch reads delete | 6.1–6.5, **and L1 I9** (emit_rewrite overwrites until I8, mono and the POST rewrites until I9) | −150 to −300 (design §3) |
 
 - **Steps 6.1–6.3 are near zero or growth.** They buy the boundary and the instrument, not
@@ -138,9 +140,20 @@ identical on fixpoint seeds.
   is graded byte-identical on that premise. A PRE pass that is not actually idempotent shows up
   here as a fingerprint difference, and that difference is a finding.
 - **POST and the re-walk.** See §2: each POST move is graded on the corpus, not by bytes.
-- **Overlay spans and determinism** (L1's two requirements, §5). Every node 6.2 mints above `n1`
-  carries the span of the parse node it lowers. The lowering runs once per program before check,
-  so overlay ids are the same in armed and unarmed builds.
+- **Copy-on-write conditions** (L1, §5). Copy-on-write is safe if the PRE lowering finishes before
+  any table keyed on node ids is filled (resolve, symbols, check), and every parent link points at
+  the copy, so the checker, the legacy emitter and the builder see one index per node. Three
+  conditions follow:
+  - **(a)** every node 6.2 mints above `n1` carries the span of the parse node it lowers;
+  - **(b)** the lowering runs once per program before check, so overlay ids are the same in armed
+    and unarmed builds;
+  - **(c)** nothing filled before the lowering (parse-side banks, token spans) is read through a
+    new index without remapping.
+  
+  The originals below `n1` stay frozen for the formatter and the LSP.
+- **Free tidy-up, byte-identical.** `recEqTyped`, `recEqAnd`, `recEqNullTest` and `mkNumTyped`
+  can move to emit-side files now, since only mono and `emit_rewrite` call them. They retire with
+  their callers.
 
 ## 5. L1's answers
 
