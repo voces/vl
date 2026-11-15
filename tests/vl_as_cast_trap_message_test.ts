@@ -59,12 +59,12 @@ const CASES: [string, string, string][] = [
   ],
   [
     "as-cast-integral-operand-trap-range.vl",
-    "as! i32 at 8:10: not exact",
+    "as! i32 at 8:17: not exact",
     "outside",
   ],
   [
     "as-cast-integral-operand-trap-nan.vl",
-    "as! i32 at 8:10: not exact",
+    "as! i32 at 8:17: not exact",
     "NaN or",
   ],
   [

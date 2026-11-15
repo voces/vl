@@ -159,7 +159,7 @@ class Gen {
     for (const t of ["i32", "i64", "f64", "f32"] as T[]) {
       head.push(`function tr_${t}(s: string, v: ${t}): ${t} { print(s); v }`);
     }
-    head.push(`function trb(s: string, v: boolean): boolean { print(s); v }`);
+    head.push(`function trb(s: string, v: boolean): boolean { print(s); return v }`);
     const nf = r.int(3);
     for (let i = 0; i < nf; i++) {
       const params = Array.from({ length: 1 + r.int(3) }, () => r.pick<T>(["i32", "i64", "f64", "f32"]));
@@ -169,7 +169,7 @@ class Gen {
       this.vars = params.map((t, j) => ({ name: `p${j}`, t, mut: false }));
       const body = this.expr(ret, 3);
       this.vars = saved;
-      head.push(`function ${name}(${params.map((t, j) => `p${j}: ${t}`).join(", ")}): ${ret} { ${body} }`);
+      head.push(`function ${name}(${params.map((t, j) => `p${j}: ${t}`).join(", ")}): ${ret} { return ${body} }`);
       this.fns.push({ name, params, ret });
     }
     const ns = 4 + r.int(8);

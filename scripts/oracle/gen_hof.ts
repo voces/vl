@@ -34,20 +34,20 @@ const LIT: Record<T, string[]> = {
 // The library every program may draw on. Each entry is one top-level function, with the types it
 // can be called at: a hole (un-annotated) function lists every type its body is legal at.
 const LIB: { name: string; src: string; at: T[]; arity: number }[] = [
-  { name: "hid", src: "function hid(x) { x }", at: ["i32", "i64", "f64", "string"], arity: 1 },
-  { name: "hdbl", src: "function hdbl(x) { x + x }", at: ["i32", "i64", "f64", "string"], arity: 1 },
-  { name: "hinc", src: "function hinc(x) { x + 1 }", at: ["i32", "i64", "f64"], arity: 1 },
-  { name: "gid", src: "function gid<A>(x: A): A { x }", at: ["i32", "i64", "f64", "string"], arity: 1 },
-  { name: "hpick", src: "function hpick(c, a, b) { if c { a } else { b } }", at: ["i32", "i64", "f64", "string"], arity: 3 },
+  { name: "hid", src: "function hid(x) { return x }", at: ["i32", "i64", "f64", "string"], arity: 1 },
+  { name: "hdbl", src: "function hdbl(x) { return x + x }", at: ["i32", "i64", "f64", "string"], arity: 1 },
+  { name: "hinc", src: "function hinc(x) { return x + 1 }", at: ["i32", "i64", "f64"], arity: 1 },
+  { name: "gid", src: "function gid<A>(x: A): A { return x }", at: ["i32", "i64", "f64", "string"], arity: 1 },
+  { name: "hpick", src: "function hpick(c, a, b) { return if c { a } else { b } }", at: ["i32", "i64", "f64", "string"], arity: 3 },
 ];
 const HELPERS = [
-  "function app<A, B>(f: (x: A) => B, x: A): B { f(x) }",
-  "function twice<A>(f: (x: A) => A, x: A): A { f(f(x)) }",
-  "function mapL<A, B>(xs: A[], f: (x: A) => B): B[] {\n  const out: B[] = []\n  for x in xs { out.push(f(x)) }\n  out\n}",
-  "function compose<A, B, C>(f: (x: A) => B, g: (x: B) => C): (x: A) => C { (x: A) => g(f(x)) }",
-  "function hcall(f, x) { f(x) }",
-  "function hmk(k) { (x: i32) => x * k }",
-  "function sel<A>(f: (x: A) => A): (x: A) => A { f }",
+  "function app<A, B>(f: (x: A) => B, x: A): B { return f(x) }",
+  "function twice<A>(f: (x: A) => A, x: A): A { return f(f(x)) }",
+  "function mapL<A, B>(xs: A[], f: (x: A) => B): B[] {\n  const out: B[] = []\n  for x in xs { out.push(f(x)) }\n  return out\n}",
+  "function compose<A, B, C>(f: (x: A) => B, g: (x: B) => C): (x: A) => C { return (x: A) => g(f(x)) }",
+  "function hcall(f, x) { return f(x) }",
+  "function hmk(k) { return (x: i32) => x * k }",
+  "function sel<A>(f: (x: A) => A): (x: A) => A { return f }",
 ];
 
 class Gen {

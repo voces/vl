@@ -70,9 +70,9 @@ const eq = (got: unknown, want: unknown, what: string) => {
 
 // A unit that writes and reads raw guest addresses — the shape a transliterated guest thread is.
 const POKE = `export function put(addr: i32, v: i32) { __store_i32__(addr, v) }
-export function peek(addr: i32): i32 { __load_i32__(addr) }
-export function pages(): i32 { __memory_size__() }
-export function grow(n: i32): i32 { __memory_grow__(n) }
+export function peek(addr: i32): i32 { return __load_i32__(addr) }
+export function pages(): i32 { return __memory_size__() }
+export function grow(n: i32): i32 { return __memory_grow__(n) }
 `;
 
 // ── 1. the module shape ──────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ Deno.test({
   name: "shared-memory: a module that touches no linear memory is byte-identical with the flag",
   ignore: !ENABLED,
   async fn() {
-    const src = "export function add(a: i32, b: i32): i32 { a + b }\n";
+    const src = "export function add(a: i32, b: i32): i32 { return a + b }\n";
     eq(
       Array.from(await build(src, ["--shared-memory=8"])),
       Array.from(await build(src)),
@@ -241,7 +241,7 @@ print(b.base > a.base)
 const TWO = `import { Buffer, Buf, bufferMark, bufferPeak, bufferRelease, storeI32 } from "std:buffer"
 let bumps = 0
 export function put(addr: i32, v: i32) { __store_i32__(addr, v) }
-export function peek(addr: i32): i32 { __load_i32__(addr) }
+export function peek(addr: i32): i32 { return __load_i32__(addr) }
 function fill(n: i32, stamp: i32): Buf {
   const b = Buffer(n)
   let off = 0
@@ -249,11 +249,11 @@ function fill(n: i32, stamp: i32): Buf {
     b.storeI32(off, stamp)
     off = off + 4
   }
-  b
+  return b
 }
-export function alloc(n: i32, stamp: i32): i32 { fill(n, stamp).base }
-export function mark(): i32 { bufferMark() }
-export function peak(): i32 { bufferPeak() }
+export function alloc(n: i32, stamp: i32): i32 { return fill(n, stamp).base }
+export function mark(): i32 { return bufferMark() }
+export function peak(): i32 { return bufferPeak() }
 export function release(m: i32) { bufferRelease(m) }
 export function stress(count: i32, stamp: i32): i32 {
   const rec = Buffer(count * 8)
@@ -265,11 +265,11 @@ export function stress(count: i32, stamp: i32): i32 {
     rec.storeI32(count * 4 + i * 4, n)
     i = i + 1
   }
-  rec.base
+  return rec.base
 }
 export function bump(): i32 {
   bumps = bumps + 1
-  bumps
+  return bumps
 }
 `;
 
@@ -490,7 +490,7 @@ function fill(n: i32, stamp: i32): Buf {
     b.storeI32(off, stamp)
     off = off + 4
   }
-  b
+  return b
 }
 function bad(b: Buf, n: i32, stamp: i32): i32 {
   let k = 0
@@ -499,7 +499,7 @@ function bad(b: Buf, n: i32, stamp: i32): i32 {
     if b.loadI32(off) != stamp { k = k + 1 }
     off = off + 4
   }
-  k
+  return k
 }
 export function stress(count: i32, stamp: i32): i32 {
   const rec = Buffer(count * 8)
@@ -511,10 +511,10 @@ export function stress(count: i32, stamp: i32): i32 {
     rec.storeI32(count * 4 + i * 4, n)
     i = i + 1
   }
-  rec.base
+  return rec.base
 }
 let reclaimed = 0
-export function reclaims(): i32 { reclaimed }
+export function reclaims(): i32 { return reclaimed }
 export function churn(iters: i32, stamp: i32): i32 {
   let seed = stamp & 65535
   let wrong = 0
@@ -550,7 +550,7 @@ export function churn(iters: i32, stamp: i32): i32 {
     wrong = wrong + bad(anchor, 64, stamp)
     it = it + 1
   }
-  wrong
+  return wrong
 }
 `;
 

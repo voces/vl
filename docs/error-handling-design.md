@@ -183,7 +183,7 @@ struct, phase-1 `match` dispatches it exhaustively:
 type FsErr = "not-found" | "denied" | "io"
 
 function explain(e: FsErr): string {
-  match e {
+  return match e {
     "not-found" => "no such file"
     "denied"    => "permission denied"
     "io"        => "device error"
