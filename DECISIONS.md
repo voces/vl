@@ -12173,6 +12173,12 @@ exactly; a float literal at `f32` as `let x: f32 = 0.1` does), and otherwise kee
 the join widens. `if c { 5 } else { f }` with `f: f32` is `f32`, `[5, f]` is `f32[]`, and
 `if c { 9000000000 } else { f }` is `i64 | f32`.
 
+The join decides a literal's context before its destination does (coordinator's reading of 4.3,
+2026-11-15): a radix tail beside a typed `i32` arm is the `i32` pattern, and only then is the join
+widened, so `(if c { 0xFFFFFFFF } else { v }) * k` with `v: i32`, `k: i64` is -1, as it is with
+the join bound first. A join of literals alone, or with a 64-bit arm, still reads a radix tail at
+its destination's width (D2617), and a pattern wider than 32 bits still widens the join.
+
 ## An empty container's element type is fixed by its annotation (2026-11-15) — spec 4.4, refines D16047
 
 **Ruled by the owner 2026-11-15.** `is` on an empty list, map or set decides by the type it was
