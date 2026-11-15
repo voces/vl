@@ -1226,13 +1226,16 @@ export class Interp {
             const a = arm(x.t), b = arm(x.f);
             return a && b ? [...a, ...b] : null;
           }
-          return isConstTree(x) && !treeHas(x, "radix") ? [x] : null;
+          return isConstTree(x) ? [x] : null;
         };
         const wideOther = (): boolean => {
           if (!(v instanceof Lit) || v.i === null || kOther || !ok || ok.k !== "expr") return false;
           return (tails(ok.e) ?? []).some((t) => {
             const o = this.eval(t, env, null);
-            return o instanceof Lit && o.i !== null && !o.radix && (o.i < BigInt(I32_MIN) || o.i > BigInt(I32_MAX)) && o.i >= I64_MIN && o.i <= I64_MAX;
+            if (!(o instanceof Lit) || o.i === null) return false;
+            // a radix tree is i64 when it holds a wider pattern or a decimal outside i32 (D16492)
+            if (o.radix) return o.radix === 64 || o.wideDec;
+            return (o.i < BigInt(I32_MIN) || o.i > BigInt(I32_MAX)) && o.i >= I64_MIN && o.i <= I64_MAX;
           });
         };
         if (exp && !(exp.k === "name" && exp.name === "any")) {
