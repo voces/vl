@@ -151,9 +151,11 @@ const x: f32 = 16777217   // refused: i32 doesn't fit in f32 — the conversion 
 
 **T2.3** A hex, binary or octal literal is a bit pattern. In an `i32` context, a pattern
 of 32 bits or fewer is the `i32` with those bits. In an `i64` context it is the
-zero-extended value. A wider pattern is `i64`. A radix literal in a float context (an `f32`
-or `f64` destination, a float peer, or `as f32` / `as f64`) is the value its digits spell,
-rounded to the float; the bit-pattern reading is for integer contexts only.
+zero-extended value. A wider pattern is `i64`. A radix literal in a float context is the
+value its digits spell. At a float destination or beside a float the float must hold that
+value exactly, as it must a decimal integer literal; only `as f32` / `as f64` rounds it. A
+radix constant tree read at an `f64` computes at 64 bits, with integer division, and then
+converts.
 
 ```vl
 print(0xFFFFFFFF)                // prints -1
@@ -162,6 +164,13 @@ print(m)                         // prints 4294967295
 print(0x1_0000_0000)             // prints 4294967296
 print(0xFF as f32)               // prints 255
 print(1.5 + 0xFFFFFFFF)          // prints 4294967296.5
+print(0xFFFFFFFF as f32)         // prints 4294967296
+const y: f64 = 0xFFFFFFFF / 2
+print(y)                         // prints 2147483647
+```
+
+```vl
+const b: f32 = 0xFFFFFFFF   // refused: constant 4294967295 is not exact at f32
 ```
 
 ```vl
@@ -169,13 +178,14 @@ const k: i32 = 3000000000   // refused: constant 3000000000 overflows i32 — wr
 ```
 
 > Ruling: owner 2026-09-04, DECISIONS.md §"Types & semantics" (first bullet, the hex
-> bit-pattern rule). Owner 2026-11-15 (lane O's spec question 1, revised): a float context
-> reads the digits' value.
+> bit-pattern rule). Owner 2026-11-15 (lane O's spec questions 1 and 2): a float context reads
+> the digits' value, exactly except under `as`; a tree at `f64` computes at 64 bits, which
+> reverses D14990's `f64` clause.
 
 > Status: where the float does not hold the digits' value exactly, the compiler reads the
-> pattern at `as f32` and `as f64` (`0xFFFFFFFF as f32` prints -1) and refuses the literal at
-> a float destination or beside a float (`const b: f32 = 0xFFFFFFFF`). The acceptance grid is
-> `scripts/oracle/radix-float-grid.ts`.
+> pattern at `as f32` and `as f64` (`0xFFFFFFFF as f32` prints -1). The acceptance grid is
+> `scripts/oracle/radix-float-grid.ts`; the `f64` tree rule is
+> `scripts/capability-probes/matrix/radix-tree-at-f64.matrix.vl`.
 
 **T2.4** An unannotated `const` whose initialiser is a literal, or arithmetic over
 literals and such `const`s, is an exact constant with no single type. Every read of it is
