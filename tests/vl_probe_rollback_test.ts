@@ -228,7 +228,7 @@ const probeReachMaps = () => {
       if (t) rec = held.has(t[1]) ? t[1] : "";
       else if (rec !== "" && l.startsWith("}")) rec = "";
       else if (rec !== "") {
-        const fd = /^\s+([A-Za-z0-9_]+): (?:\{\[|Map<)/.exec(l);
+        const fd = /^\s+([A-Za-z0-9_]+): (?:\{\[.*\}|Map<.*>),$/.exec(l);
         if (fd) out.push(`${m}:${rec}.${fd[1]}`);
       }
     }
