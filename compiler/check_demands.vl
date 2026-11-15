@@ -466,6 +466,7 @@ import { elemHasZero, fieldSigOf, jsonReceiverDeclTy } from "./check_type_shape"
 import {
   T,
   TY_ERR,
+  TY_I32,
   TY_I64,
   TY_NEVER,
   TY_NULL,
@@ -497,6 +498,7 @@ import {
   tyElemOf,
   tyElemOpen,
   tyEq,
+  tyFreshEnd,
   tyHasHole,
   tyIsHole,
   tyIsLitUnion,
@@ -543,7 +545,16 @@ import {
   declFirstParamIsSelf,
   fnDeclIx,
 } from "./check_write_scan"
-import { cexFitsSigned, cexOk } from "./const_exact"
+import {
+  Cex,
+  cexAdd,
+  cexDecText,
+  cexFitsSigned,
+  cexNeg,
+  cexOfLexeme,
+  cexOk,
+  cexPatFits,
+} from "./const_exact"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import {
@@ -4042,6 +4053,7 @@ export function refuseLocalNomEscape(t: i32, at: i32) {
 // and the diagnostic stream among them) back to `sv`'s mark, then restores the flags — so the
 // global checker state the emitter still reads matches its original values.
 export function monoRecheckEnd(sv: QuietRun) {
+  tyFreshEnd()
   monoRecheckDepthSet(monoRecheckDepth - 1)
   njFnIxSet(njFnStack.pop() ?? -1)
   popScope()
@@ -4444,10 +4456,18 @@ export function redundantCastRaise(
   return true
 }
 
+// The integer `v`, at most 32 bits in magnitude, read as the signed 32-bit number of its pattern.
+function cexWrap32(v: Cex): Cex {
+  let w = cexOfLexeme(cexDecText(v))
+  if v.cxNeg { w = cexNeg(w) }
+  if cexFitsSigned(w, 32) { return w }
+  return cexAdd(w, cexOfLexeme("4294967296"), !w.cxNeg)
+}
+
 // A cast over a constant tree is decided at its exact value (D3588): a value the domain holds
 // converts exactly in every mode, a value it does not hold is a check error. 0 when the operand
-// is no constant, 1 when it holds, 2 when refused. A radix pattern whose top bit is set at its
-// own width stays the width-dependent reading the ordinary cast takes.
+// is no constant, 1 when it holds, 2 when refused. A radix pattern is judged as the `i32` it is
+// in an integer domain; elsewhere one whose top bit is set keeps the ordinary cast's reading.
 export function castConstDecide(
   n: AsExpr,
   ix: i32,
@@ -4456,14 +4476,19 @@ export function castConstDecide(
 ): i32 {
   const p = parenPeelIx(n.asObj)
   if p < 0 || cexTreeShape(p, 0) != 1 { return 0 }
-  const v = cexEvalAt(p, 0)
+  let v = cexEvalAt(p, 0)
   if !cexOk(v) { return 0 }
-  if v.cxPat {
-    let bits = 32
-    if arg == TY_I64 { bits = 64 }
-    if v.cxNeg || !cexFitsSigned(v, bits) { return 0 }
-  }
   const dom = numCastDomainName(n.asTy, target)
+  if v.cxPat {
+    // Into an integer domain an `i32` operand's radix constant is its 32-bit pattern (D3053).
+    if arg == TY_I32 && (dom == "u8" || dom == "i32") && cexPatFits(v, 32) {
+      v = cexWrap32(v)
+    } else {
+      let bits = 32
+      if arg == TY_I64 { bits = 64 }
+      if v.cxNeg || !cexFitsSigned(v, bits) { return 0 }
+    }
+  }
   const why = castConstMisfit(v, dom, p, cexFoldedFrom(p))
   if why != "" {
     tErr(why + castConstModeTail(n.asMode, dom, v), ix)

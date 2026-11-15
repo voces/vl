@@ -20,7 +20,7 @@ const POSITIONS: Record<string, (h: string) => string> = {
   peeradd: (h) => `print(1.5 + ${h})`,
   peermul: (h) => `print(${h} * 0.5)`,
   bindf64: (h) => `const a: f64 = ${h}\nprint(a)`,
-  argf64: (h) => `function f(x: f64): f64 { x }\nprint(f(${h}))`,
+  argf64: (h) => `function f(x: f64): f64 { return x }\nprint(f(${h}))`,
   bindf32: (h) => `const b: f32 = ${h}\nprint(b)`,
 };
 

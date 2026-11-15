@@ -17,7 +17,7 @@ import {
   nomNameOfTy,
   tyAt,
   tyElemOf,
-  tyMutEpoch,
+  tyEmitEpoch,
   tyToStructStr,
 } from "./check_types"
 import { numLexFitsI32 } from "./emit_bignum"
@@ -131,7 +131,7 @@ function utkShapeText(ty: i32): string {
     utkShapeStamp.push(-1)
     utkShapeVer.push(-1)
   }
-  if utkShapeStamp[ty] == tyMutEpoch && utkShapeVer[ty] == cUserTypesVer {
+  if utkShapeStamp[ty] == tyEmitEpoch && utkShapeVer[ty] == cUserTypesVer {
     return utkTexts[utkShapeId[ty]]
   }
   for o in utkShapeOpen {
@@ -162,7 +162,7 @@ function utkShapeText(ty: i32): string {
     out = out + ") => #" + i32ToStr(utkIdOf(utkMemberText(t.fnRet)))
   }
   utkShapeOpen.pop()
-  utkShapeStamp[ty] = tyMutEpoch
+  utkShapeStamp[ty] = tyEmitEpoch
   utkShapeVer[ty] = cUserTypesVer
   utkShapeId[ty] = utkIdOf(out)
   return out
@@ -306,18 +306,7 @@ function utkCycNodeText(
 
 // The key text of a member multiset: the member texts sorted, never deduped.
 export function utkTextOf(texts: string[]): string {
-  const ks: string[] = []
-  for t in texts {
-    let at = 0
-    while at < ks.length && !strLess(t, ks[at]) { at = at + 1 }
-    ks.push(t)
-    let m = ks.length - 1
-    while m > at {
-      ks[m] = ks[m - 1]
-      m = m - 1
-    }
-    ks[at] = t
-  }
+  const ks = utkSorted(texts)
   let out = ""
   let j = 0
   while j < ks.length {
@@ -328,8 +317,39 @@ export function utkTextOf(texts: string[]): string {
   return out
 }
 
+// `xs` in ascending `strLess` order, by a stable bottom-up merge, so a wide union's key costs
+// its members' log, not their square.
+function utkSorted(xs: string[]): string[] {
+  let a: string[] = []
+  for x in xs { a.push(x) }
+  let w = 1
+  while w < a.length {
+    const b: string[] = []
+    let lo = 0
+    while lo < a.length {
+      const mid = if lo + w < a.length { lo + w } else { a.length }
+      const hi = if lo + w + w < a.length { lo + w + w } else { a.length }
+      let i = lo
+      let j = mid
+      while i < mid || j < hi {
+        if j >= hi || (i < mid && !strLess(a[j], a[i])) {
+          b.push(a[i])
+          i = i + 1
+        } else {
+          b.push(a[j])
+          j = j + 1
+        }
+      }
+      lo = hi
+    }
+    a = b
+    w = w + w
+  }
+  return a
+}
+
 // The key text of type `ty`'s canonical members, or "" when it has none. Memoised per arena index
-// and stamped with `tyMutEpoch` and `cUserTypesVer`, so a type many lookups share is keyed once: a record's text is
+// and stamped with `tyEmitEpoch` and `cUserTypesVer`, so a type many lookups share is keyed once: a record's text is
 // its render, which doubles with each level of a diamond.
 export function utkTyKeyText(ty: i32): string {
   if ty < 0 || ty >= T.tys.length { return "" }
@@ -341,12 +361,12 @@ export function utkTyKeyText(ty: i32): string {
     utkMemoStamp.push(-1)
     utkMemoVer.push(-1)
   }
-  if utkMemoStamp[ty] == tyMutEpoch && utkMemoVer[ty] == cUserTypesVer {
+  if utkMemoStamp[ty] == tyEmitEpoch && utkMemoVer[ty] == cUserTypesVer {
     const hit = utkMemoId[ty]
     return if hit >= 0 { utkTexts[hit] } else { "" }
   }
   const t = utkTyKeyTextGo(ty)
-  utkMemoStamp[ty] = tyMutEpoch
+  utkMemoStamp[ty] = tyEmitEpoch
   utkMemoVer[ty] = cUserTypesVer
   utkMemoId[ty] = if t == "" { -1 } else { utkIdOf(t) }
   return t
@@ -365,12 +385,23 @@ function utkTyKeyTextGo(ty: i32): string {
   if !canonUnionMemberTysOf(ty, mems) { return "" }
   const texts: string[] = []
   const wide: string[] = []
+  const inWide: {[string]: boolean} = Map()
   let widened = false
   for m in mems {
     const mt = utkMemberText(m)
     texts.push(mt)
-    if mems.length > 1 && utkLitSetBasesInto(m, wide) { widened = true }
-    else if !strListHas(wide, mt) { wide.push(mt) }
+    const w0 = wide.length
+    if mems.length > 1 && utkLitSetBasesInto(m, wide) {
+      widened = true
+      let k = w0
+      while k < wide.length {
+        inWide[wide[k]] = true
+        k = k + 1
+      }
+    } else if !(inWide[mt] ?? false) {
+      inWide[mt] = true
+      wide.push(mt)
+    }
   }
   return utkTextOf(if widened { wide } else { texts })
 }

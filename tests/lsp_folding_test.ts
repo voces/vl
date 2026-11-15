@@ -399,7 +399,7 @@ Deno.test("folding(extents): an extent evicts the bracket region sharing its sta
 });
 
 Deno.test("folding(extents): a one-line construct folds nothing", () => {
-  const src = "function id(x: i32): i32 { x }";
+  const src = "function id(x: i32): i32 { return x }";
   eq(foldsWith(src, [ext(0, 0)]), [], "header and closer on one line");
   // A two-line construct is a one-line body once its closer stays visible.
   eq(foldsWith("if x {\n}", [ext(0, 1)]), [], "nothing between header and closer");
