@@ -9786,6 +9786,14 @@ tree read stays an editor reference.
   computed such a tree at 32 bits (`const c: f64 = 0x7FFFFFFF << 2` was -4, now 8589934588).
   The bare pattern is unchanged: `0xFFFFFFFF as f32` reads the 32-bit pattern (-1.0) and
   `as f64` the 64-bit one; an `f32` use and no context keep their 32 bits (D16390).
+* **A numeric literal joined with a typed value adopts its type where it fits (owner, 2026-11-15,
+  ruling 4.3).** One rule for every join form, `if` and `match` arms, `??` and list elements: a
+  literal beside values of one numeric type takes that type when the type holds it (an integer
+  literal exactly, a float literal at `f32` as `let x: f32 = 0.1` does), and otherwise keeps its
+  own and the join widens as before. `if c { 5 } else { f }` and `[5, f]` with `f: f32` are
+  `f32`; `[0.1, f]` is `f32[]`; `if c { 9000000000 } else { f }` is `i64 | f32`. A join of two
+  typed members of different types keeps today's reading. This turns on the list half D2774
+  held back; an inferred return still keeps its reading.
 * **A float division by zero, and a float constant past the largest double, are not folded.**
   VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
   computation they were; Go refuses both.
