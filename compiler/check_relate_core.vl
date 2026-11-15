@@ -1,4 +1,4 @@
-import { udMemberTySet } from "./check_canon_raw"
+import { udMemberTyAt, udMemberTySet } from "./check_canon_raw"
 
 // The checker's type relation and what it is built from: `assignable`, the joins, type
 // substitution and generic binding, annotation resolution (`nameToTy`/`tsToTy`), and the
@@ -348,6 +348,7 @@ import {
   recAdRaising,
 } from "./check_rec_adopt_rows"
 import { rcwWhere } from "./check_record_writes"
+import { sameTypePairs } from "./check_state"
 import {
   carryRetJoin,
   fillDone,
@@ -356,6 +357,7 @@ import {
   nhLinkA,
   nhLinkB,
   noteVoidCoerceVal,
+  recordTestWarning,
 } from "./check_side_rows"
 import {
   CSTR_ANYFN,
@@ -408,6 +410,7 @@ import {
   eqRefusals,
   fvaSlotMayDiffer,
   holeArgScalarRefused,
+  isWidenNotVariant,
   joinWidensMap,
   listJoinStorageDiffers,
   litNumUnionConverts,
@@ -449,6 +452,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  asgNegHit,
   cTyIxSetHas,
   cUserTypes,
   cUserTypesVer,
@@ -508,6 +512,7 @@ import {
   tySame,
   tyToStr,
   tyToStrUser,
+  tyToStructStrUser,
   wideLitMinted,
 } from "./check_types"
 import {
@@ -632,7 +637,6 @@ import {
   tyReachesHole,
   tyStoresVoid,
   unionArmSubsumedBy,
-  unionCoversTy,
   unionDropSubsumedArms,
 } from "./tyquery"
 
@@ -1729,13 +1733,16 @@ function tyVarMemberOf(v: i32, u: i32): boolean {
 function asPinHolds(from: i32, to: i32): boolean {
   if from < 0 || to < 0 || from >= T.tys.length { return true }
   const f = tyAt(from)
-  if f is TyUnion { return unionCoversTy(f, to) }
-  // A nullable operand is a union operand, as `checkCastNode` reads it.
-  if f is TyNullable {
-    if f.nInner < 0 { return true }
-    const nu = tyAt(mkUnionTy([f.nInner, TY_NULL]))
-    if nu is TyUnion { return unionCoversTy(nu, to) }
-    return true
+  // A union or nullable operand casts to the members the type test names (`tyTestMemberFit`),
+  // as `checkCastUnionArm` asks it.
+  if f is TyUnion || f is TyNullable {
+    if f is TyNullable && f.nInner < 0 { return true }
+    const ms: i32[] = []
+    flattenVariantsInto(from, ms)
+    for m in ms {
+      if tyTestMemberFit(m, to) != TT_NONE { return true }
+    }
+    return false
   }
   if from == to || assignable(from, to) { return true }
   isNumeric(from) && isNumeric(to) && primNameOf(from) != "boolean"
@@ -3350,6 +3357,203 @@ function annUnionPushDistinctMember(members: i32[], m: i32) {
   0
 }
 
+// `annUnionPushDistinctMember` beside each kept member's spelling in `names`: a member spelled
+// another way that is the same type as a kept one adds the kept name and its own to `dups`.
+function annUnionNamedMember(
+  members: i32[],
+  names: string[],
+  dups: string[],
+  m: i32,
+  name: string,
+) {
+  const before = members.length
+  annUnionPushDistinctMember(members, m)
+  if members.length > before {
+    names.push(name)
+    return 0
+  }
+  let j = 0
+  while j < members.length && j < names.length {
+    const kept = members[j]
+    if (
+      sameVariantTy(m, kept)
+      && !annArmsPart(m, kept)
+      && names[j] != name
+      && tyAt(m) is TyObj
+    ) {
+      dups.push(names[j])
+      dups.push(name)
+      return 0
+    }
+    j = j + 1
+  }
+  0
+}
+
+// Warns at the annotation being resolved for each pair in `dups` (`annUnionNamedMember`), and
+// records the pairs against `t`, the union formed. `t`.
+function annSameTypeNote(t: i32, members: i32[], dups: string[]): i32 {
+  annSameTypeNoteAt(if inferQuiet { -1 } else { annotDiagAt }, t, members, dups)
+}
+
+// `annSameTypeNote` warning at node `at` (-1: none). The pairs are kept against the formed
+// union and, where it has one member, against that member, the type a read of it carries.
+function annSameTypeNoteAt(
+  at: i32,
+  t: i32,
+  members: i32[],
+  dups: string[],
+): i32 {
+  if dups.length == 0 || t < 0 { return t }
+  const keys: i32[] = [t]
+  if members.length == 1 && members[0] != t { keys.push(members[0]) }
+  for k in keys {
+    const was = sameTypePairs[k] ?? []
+    for d in dups { was.push(d) }
+    sameTypePairs[k] = was
+  }
+  if at < 0 { return t }
+  const one = if members.length == 1 { "this union has one member" } else { "this union holds them as one member" }
+  let i = 0
+  while i + 1 < dups.length {
+    const shape = tyToStructStrUser(nameToTy(dups[i]))
+    recordTestWarning(
+      at,
+      "same-type-members",
+      "`"
+        + dups[i + 1]
+        + "` is the same type as `"
+        + dups[i]
+        + "` ("
+        + shape
+        + "); "
+        + one
+        + ". help: add a discriminant field",
+    )
+    i = i + 2
+  }
+  t
+}
+
+// Warns at test `ix` of `chk`, spelled `name`, over an operand of declared type `obj` whose
+// union formation found `name` one type with another member: the test cannot tell them apart.
+export function sameTypeTestNote(obj: i32, name: string, ix: i32) {
+  if inferQuiet || obj < 0 { return 0 }
+  const ps = sameTypePairs[nonNullTy(obj)] ?? sameTypePairs[obj] ?? []
+  let i = 0
+  while i + 1 < ps.length {
+    const other = if ps[i] == name { ps[i + 1] } else if ps[i + 1] == name { ps[i] } else { "" }
+    if other != "" {
+      recordTestWarning(
+        ix,
+        "test-cannot-tell",
+        "`is "
+          + name
+          + "` also matches `"
+          + other
+          + "`; this test can't tell them apart",
+      )
+      return 0
+    }
+    i = i + 2
+  }
+  0
+}
+
+// `tyTestMemberFit`'s three answers.
+export const TT_NONE = 0
+export const TT_PARTLY = 1
+export const TT_COVERED = 2
+
+// What a type test of `chk` answers for a value of one operand member `m`, the one rule `is`,
+// `as` and `match` share: covered where every value of `m` fits `chk` (`m` is `chk`, the type
+// parameter it names, or a record it contains), partly where some may (`chk` fits `m`, or `m` is
+// a parameter a pin may bind to `chk`), else none. A union `chk` answers its best member.
+export function tyTestMemberFit(m: i32, chk: i32): i32 {
+  if m < 0 || chk < 0 || m >= T.tys.length || chk >= T.tys.length {
+    return TT_NONE
+  }
+  const ct = tyAt(chk)
+  if ct is TyUnion || ct is TyNullable {
+    let best = TT_NONE
+    for c in tyTestMembers(chk) {
+      const f = if c == chk { TT_NONE } else { tyTestMemberFit(m, c) }
+      if f > best { best = f }
+    }
+    return best
+  }
+  if tyTestIsMember(m, chk) || recContainedIn(m, chk) { return TT_COVERED }
+  if tyAt(m) is TyVar { return TT_PARTLY }
+  if (
+    assignable(chk, m)
+    && !isWidenNotVariant(chk, m)
+    && !fnSlotRetWidens(chk, m)
+  ) {
+    return TT_PARTLY
+  }
+  TT_NONE
+}
+
+// Whether operand member `m` is the tested type `c` itself: the same variant, or the type
+// parameter `c` names.
+export function tyTestIsMember(m: i32, c: i32): boolean {
+  if m < 0 || c < 0 { return false }
+  const mt = tyAt(m)
+  const ct = tyAt(c)
+  if mt is TyVar { return ct is TyVar && ct.tvName == mt.tvName }
+  m == c || sameVariantTy(m, c)
+}
+
+// The members of `t`, a union or nullable flattened, `null` among them.
+export function tyTestMembers(t: i32): i32[] {
+  const ms: i32[] = []
+  if t >= 0 { flattenVariantsInto(t, ms) }
+  ms
+}
+
+// Whether a test of `chk` over `obj` can be true: each member of `chk` may fit some member of
+// `obj`, or `obj`, one type, is covered by `chk`.
+export function tyTestMayFit(obj: i32, chk: i32): boolean {
+  const ms = tyTestMembers(obj)
+  const cs = tyTestMembers(chk)
+  if cs.length == 0 || ms.length == 0 { return false }
+  if ms.length == 1 && tyTestMemberFit(ms[0], chk) == TT_COVERED { return true }
+  for c in cs {
+    let hit = false
+    for m in ms { hit = hit || tyTestMemberFit(m, c) != TT_NONE }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether every member of `chk` is a member of `obj` (`tyTestIsMember`): a cast to `chk` picks
+// those arms.
+export function tyTestNamesMembers(obj: i32, chk: i32): boolean {
+  const ms = tyTestMembers(obj)
+  const cs = tyTestMembers(chk)
+  if cs.length == 0 { return false }
+  for c in cs {
+    let hit = false
+    for m in ms { hit = hit || tyTestIsMember(m, c) }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether every value of record `a` fits record `b` and not the reverse, the two declaring the
+// same field names. A record with fields the other lacks is no containment D3885 settles.
+export function recContainedIn(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  const at = tyAt(a)
+  const bt = tyAt(b)
+  if !(at is TyObj) || !(bt is TyObj) { return false }
+  if at.objFieldNames.length != bt.objFieldNames.length { return false }
+  for f in at.objFieldNames {
+    if strListIndexOf(bt.objFieldNames, f) < 0 { return false }
+  }
+  assignable(a, b) && !assignable(b, a)
+}
+
 // —— the annotation union's member list, shared by both annotation routes ——
 // `tsToTyReal` (the tree route) and `nameToTyReal` (the string route) build the same union
 // from the same members, through one shared home per rule rather than a copy per route.
@@ -3488,6 +3692,8 @@ function tsToTyReal(ix: i32) {
   // let `assignable` treat the negative sentinel as "accept anything".
   if k == TS_UNION {
     const members: i32[] = []
+    const names: string[] = []
+    const dups: string[] = []
     let hasNull = false
     let pi = 0
     while pi < cnt {
@@ -3499,11 +3705,11 @@ function tsToTyReal(ix: i32) {
         // renders "" for the string arm's `part.length > 0` check
         const m = tsToTy(kid)
         if m < 0 { return -1 }
-        annUnionPushDistinctMember(members, m)
+        annUnionNamedMember(members, names, dups, m, tsToName(kid))
       }
       pi = pi + 1
     }
-    return annUnionTy(members, hasNull)
+    return annSameTypeNote(annUnionTy(members, hasNull), members, dups)
   }
   // An intersection `A & B` — fold the operands through `intersectTy` so a finite
   // annotation simplifies to a concrete type (`(0|1|2) & !2` → `0 | 1`).
@@ -3745,6 +3951,8 @@ function nameUnionTy(name: string): i32 {
   const parts: string[] = []
   tyTopLevelSplit(name, '|', false, parts)
   const members: i32[] = []
+  const names: string[] = []
+  const dups: string[] = []
   let hasNull = false
   let pi = 0
   while pi < parts.length {
@@ -3756,13 +3964,13 @@ function nameUnionTy(name: string): i32 {
       // list would let `assignable` treat the negative sentinel as "accept anything".
       const m = nameToTy(part)
       if m < 0 { return -1 }
-      annUnionPushDistinctMember(members, m)
+      annUnionNamedMember(members, names, dups, m, part)
     }
     pi = pi + 1
   }
   // The litunion flatten and the `null` niche wrap at their shared home — the tree
   // route's mirror of `tsToTyReal`'s `TS_UNION` arm. Three routes, one rule.
-  annUnionTy(members, hasNull)
+  annSameTypeNote(annUnionTy(members, hasNull), members, dups)
 }
 
 // The intersection an `&`-joined name spells, or -1 when an operand does not resolve.
@@ -4042,7 +4250,12 @@ export function assignableOrOpen(src: i32, dst: i32): boolean {
 // `ufcsCallTy` asks of a written call — of every declared `self`-function — so the editor
 // can offer the ones whose import is missing. The export is a visibility change, not a new answer.
 export function assignable(src: i32, dst: i32) {
-  if src < 0 || dst < 0 { return true }
+  // A negative type is no type: an open component is `assignableOrOpen`'s, and anything else
+  // is refused and counted, which the corpus oracle reads after a clean compile.
+  if src < 0 || dst < 0 {
+    asgNegHit()
+    return false
+  }
   if src == dst { return true }
   let gi = asgSrcStack.length - 1
   while gi >= 0 {
@@ -6023,7 +6236,9 @@ export function setMemberRetAt(d: i32, ft: i32): i32 {
   const f = nodeAt(d)
   const sig = nodeTyOf(d)
   if !(f is FuncDecl) || f.fnRet < 0 {
-    const r = holeLamRetAt(d, ft, noN, noT)
+    // A named member is instanced at the call's signature; a lambda's arms are built at their own.
+    const named = f is FuncDecl && f.fnName != ""
+    const r = holeLamRetIn(d, ft, noN, noT, named)
     // A body that yields no value returns nothing at every binding, which its signature says.
     if r < 0 && sig >= 0 && sig < T.tys.length {
       const sf = tyAt(sig)
@@ -8506,6 +8721,18 @@ export function holeLamRetAt(
   bNames: string[],
   bTys: i32[],
 ): i32 {
+  holeLamRetIn(lx, pt, bNames, bTys, false)
+}
+
+// `holeLamRetAt`, where `sets` also takes as closed a parameter type carrying a set of functions,
+// as the call through a set does its arguments (D16209).
+function holeLamRetIn(
+  lx: i32,
+  pt: i32,
+  bNames: string[],
+  bTys: i32[],
+  sets: boolean,
+): i32 {
   if lx < 0 || lx >= P.nodes.length || pt < 0 || pt >= T.tys.length {
     return -1
   }
@@ -8522,8 +8749,9 @@ export function holeLamRetAt(
   for t in bTys { hT.push(t) }
   let k = 0
   while k < pc.fnParamTypes.length {
-    if tyHasTyVar(pc.fnParamTypes[k]) { return -1 }
-    bindGenWalk(lf.fnParamTypes[k], pc.fnParamTypes[k], hN, hT)
+    const pk = pc.fnParamTypes[k]
+    if tyHasTyVar(pk) && (!sets || fnTagSetOfTy(pk) < 0) { return -1 }
+    bindGenWalk(lf.fnParamTypes[k], pk, hN, hT)
     k = k + 1
   }
   const r = holeRetTyOf(lx, hN, hT)
@@ -10755,6 +10983,19 @@ function fillUnionDeclMembers(sx: i32, sd: UnionDecl, members: i32[]) {
         unknownTyErr(variants[vi], " in union '" + sd.udName + "'", sx)
       }
       vi = vi + 1
+    }
+    // Two variants spelled apart that are one record type (D3870) are one member.
+    const dNames: string[] = []
+    const dKept: i32[] = []
+    const dDups: string[] = []
+    let dk = 0
+    while dk < variants.length {
+      const dm = udMemberTyAt(sx, dk)
+      if dm >= 0 { annUnionNamedMember(dKept, dNames, dDups, dm, variants[dk]) }
+      dk = dk + 1
+    }
+    if !inferQuiet {
+      annSameTypeNoteAt(sx, cUserTypes[sd.udName] ?? -1, dKept, dDups)
     }
     // The declaration route's copy of `annUnionInnerTy`'s unseparable-member rule: this
     // loop builds its member list itself, so `type U = N | i32` never reaches the shared
