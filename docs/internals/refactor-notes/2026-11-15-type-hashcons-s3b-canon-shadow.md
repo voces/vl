@@ -46,8 +46,8 @@ each outermost call compares its answer with the ids:
 - `tySameSet` and `tySameSpelled` compare against `==` on `tyCanonSet` or `tyCanonSpelled`.
 - `tyCanonKey` checks that one key is one set id, and one set id is one key.
 
-`emitProgram` writes `canon <comparer> agree N true-ne N false-eq N` rows, plus up to 24 spelled
-examples per compile. Recursive calls inside a walk skip the check.
+`emitProgram` writes `canon <comparer> agree N true-ne N false-eq N` rows, plus up to 24 examples
+per compile, each naming its two rows. Recursive calls inside a walk skip the check.
 
 **Shadow readings, 1,833 corpus files** (`all2a`: the 596-cell sample, 465 empty-collection files
 and 814 generic files). The population is outermost comparisons in those compiles:
@@ -101,12 +101,12 @@ The seed's own change costs 63k fuel, so the shadow-off wrappers are free. The w
 deletions take it back.
 
 **Ratchets.**
-- **Phase-state census.** The new module's `surface` is 22: `Ty` and the eleven kinds its
-  matches name, `T`, `tyToStr`, `nomNameOfTy`, the three name readers, `tyReachesSelf`, the two
-  generation counters and `flattenVariantsInto`. `hidden` is 0: the cycle bookkeeping is a
-  column beside the walk (`canonOpenAt`), not a saved and restored global.
-- **Render-parse.** One `ty-render-display`, `canonShowTy`, which spells a disagreement for the
-  shadow's report. It goes with the shadow in stage 4. No id is built from a render.
+- **Phase-state census.** The new module's `surface` is 20: `Ty` and the eleven kinds its
+  matches name, `nomNameOfTy`, the three name readers, `tyReachesSelf`, the two generation
+  counters and `flattenVariantsInto`. `hidden` is 0: the cycle bookkeeping is a column beside the
+  walk (`canonOpenAt`), not a saved and restored global.
+- **Render-parse.** None. No id is built from a render, and the shadow's examples name rows
+  (`#<row>`) rather than spelling types.
 - **Emitter-state audit.** `canonStrIds` is a text intern (CINSTANCE): an id is a pure function
   of its text. `canonOpenAt` is pushed and popped in one function (SCOPED). The id table persists
   across compiles on purpose, since an id names content, and the per-row memo is stamped.
