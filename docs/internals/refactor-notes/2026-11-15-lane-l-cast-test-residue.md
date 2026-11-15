@@ -25,4 +25,4 @@ rule, which moves onto the shared predicate.
 - Fixture `tests/cases/narrowing/cast-and-test-residue-runs.vl`, distinct values.
 - Tried and reverted: skipping the pin re-ask for `as?` so a pin that never fits answers
   `null` (D16323) built an invalid module at that pin; the row records the fact it needs.
-- Seed fixpoint; `gate.sh`. Net compiler lines in the PR; emit_mono.vl unchanged at 908.
+- Seed fixpoint; `gate.sh`. Net compiler lines +72 (209 added, 137 removed), most of it the predicate moving modules; emit_mono.vl unchanged at 908.
