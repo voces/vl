@@ -29,6 +29,17 @@ export class Lit {
   constructor(public i: bigint | null, public f: number | null, public radix: number | boolean, public q: [bigint, bigint] | null = null) {}
 }
 export class Rec { constructor(public f: Map<string, Val>) {} }
+
+// A read of a decimal `const` is its value written in place (T2.4), so its width is the value's,
+// not its spelling's; a radix tree's read computes the tree at its own use (D14990), so it keeps it.
+function constRead(l: Lit): Lit {
+  if (l.radix || l.i === null || !l.wideDec) return l;
+  const c = new Lit(l.i, l.f, l.radix, l.q);
+  c.join = l.join;
+  c.derived = l.derived;
+  c.wideDec = l.i < BigInt(I32_MIN) || l.i > BigInt(I32_MAX);
+  return c;
+}
 export class VMap { m = new Map<string, [Val, Val]>(); }
 export class VSet { m = new Map<string, Val>(); }
 // The type a container was built at (ruling 4.4): set where it is first delivered at a declared
@@ -726,7 +737,7 @@ export class Interp {
           if (s.ty) v = this.deliver(v, s.ty, env, `binding '${s.name}'`);
           else if (v === VOID) throw new TypeFault(`binding '${s.name}' to a void value`);
         } else if (!s.ty) throw new Unsupported("let without type or initialiser");
-        const tree = s.kind === "const" && !s.ty && s.e && isConstTree(s.e) && treeHas(s.e, "float") ? s.e : undefined;
+        const tree = s.kind === "const" && !s.ty && s.e && isConstTree(s.e) && (treeHas(s.e, "float") || treeHas(s.e, "radix")) ? s.e : undefined;
         env.vars.set(s.name, { v, ty: s.ty, mut: s.kind === "let", tree });
         return;
       }
@@ -942,12 +953,14 @@ export class Interp {
         const b = env.lookup(e.name);
         // T2.5: a `let` slot holding a constant takes its type from later stores; a read
         // until then sees the default. A `const` constant is the exact value (T2.4).
+        // D14990: a read of a radix tree `const` computes the tree at that read's own width.
+        if (b?.tree && b.v instanceof Lit && b.v.radix && !b.v.lone && !f32Fold && !(exp && this.isF32(exp, env))) return this.eval(b.tree, env, exp);
         if (b?.tree && !f32Fold && exp && this.isF32(exp, env)) {
           f32Fold = true;
           try { return this.eval(b.tree, env, null); } finally { f32Fold = false; }
         }
         if (b?.tree && f32Fold) return this.eval(b.tree, env, null);
-        if (b) return b.mut && b.v instanceof Lit ? litDefault(b.v) : b.v;
+        if (b) return b.mut && b.v instanceof Lit ? litDefault(b.v) : b.v instanceof Lit ? constRead(b.v) : b.v;
         const fns = env.lookupFns(e.name);
         if (fns) { if (fns.length > 1) throw new Unsupported("overloaded function as a value"); return fns[0]; }
         if (e.name.startsWith("__")) throw new Unsupported("intrinsic " + e.name);

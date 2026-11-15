@@ -36,6 +36,7 @@ the 12 bytes were master's.
 |---|---|
 | seed | fixpoint (two refreshes byte-identical) |
 | identity | 1,839 corpus files plus `compiler/entry.vl` (the L2 input): same module and diagnostics |
+| identity, full sweep (after merge, from 4c) | 19,779 of 19,779 files byte-identical: all of `tests/cases` outside `modules/`, plus `distilled/cells` and `distilled/named` |
 | net compiler lines | −334 (`emit_ty_canon.vl` −278, `emit_ty_seal.vl` −47, `emit_obj_lit_fits.vl` −7, two import lines) |
 | pin helpers (`emit_mono.vl`) | 908 → 908 |
 | byte movers | none |
