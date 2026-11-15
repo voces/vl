@@ -8,3 +8,6 @@
   slot refusing a `void` call of a function that discards its last call names that function;
   `vl check --fix` writes the `return` for all three, which is the migration of a repository
   outside this one (AE-001).
+- **An else-less `return if` under a return type that admits `null`** is graded arm by arm, so
+  `return if c { "x" }` against `L | null` keeps its literal type (D2041's witness, which the
+  tail spelling ran and the explicit `return` spelling refused).

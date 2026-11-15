@@ -167,6 +167,26 @@ scratch build of that rule, deduplicated by location.
 - **The `std/` change is API-neutral**, since no signature changes. It needs no std review,
   only a comment-free diff.
 
+## Cost, measured on fixpoint seeds
+
+- **L2 self-compile:** 88.75G guest fuel. Master `f8de97d84` at the merge base reads 87.94G
+  on its own fixpoint seed, so the flag day costs +0.92%. The committed baseline was 87.37G,
+  so the ledger line reads +1.58%. A master seed cannot compile the migrated tree (it refuses
+  the else-less `return if` chains), so the input share of the rise is not split out. The
+  checker code this adds is under 0.1% of the profile.
+- **Seed:** 6,399,180 bytes, +0.16% on master's 6,389,307.
+- **plumb-shape:** main unit +1.55%, tail unit +0.56% guest fuel. The generator now writes
+  `return`, so both units' hashes change.
+
+## A spelling the flag day had to keep
+
+An else-less `if` tail under a return type that admits `null` ran: `if c { "x" }` against
+`L | null` (D2041's witness). Master already refused the explicit `return if c { "x" }`
+spelling, because a returned `if` was graded as one joined value and the literal widened to
+`string`. Migrating the tail would have lost the program. The returned-`if` grade now goes arm
+by arm whenever the declared return admits `null`, so the literal keeps its type and a
+non-member literal is refused at its arm.
+
 ## Rows this closes by design
 
 - **D3477** (a nested block as a body's tail): DESIGN. The bare block is a statement.
