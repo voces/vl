@@ -32,4 +32,4 @@ from its loud check reject to runs in both declaration orders; its pinning fixtu
 fixture (`width-record-through-generic-chain-runs.vl`). Seed +785 bytes; L2 self-compile guest fuel
 86,305,913,308 → 86,361,111,398 (+0.06%).
 
-**Size.** Net +42 compiler lines; pin-helper delta 0.
+**Size.** Net +53 compiler lines; pin-helper delta 0.
