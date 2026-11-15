@@ -42,8 +42,8 @@ owner's 2026-11-15 ruling that exports freeze at the module boundary.
   function has produced identical bytes. Legacy code deletes per construct, when its last claimant
   goes.
 - **Refusals (§6).** Two refusal literals are live (`live-sites.json`), and 4 of 247 capability
-  probes still refuse. The IR closes both live literals and three of the four probes. The fourth
-  needs an owner ruling (§8.1). Of the 850 sites, 443 are by message a table miss or a kind
+  probes still refuse. The IR closes both live literals and all four probes. The fourth is D16396,
+  a checker refusal of a program the field-pair rule makes legal (§6.1). Of the 850 sites, 443 are by message a table miss or a kind
   disagreement: rep-totality makes those unrepresentable, and they delete with the legacy code
   rather than "close".
 - **Lines (§7), not prototyped:** about +14k to +20k added, and about −57k to −70k deleted, for a
@@ -225,6 +225,11 @@ following.
 8. **Bounds.** Every `RListGet`/`SListSet` is preceded on every path by an `SBoundsCheck` of the
    same `(list, index)`, or carries a proof tag that a BCE pass wrote. A pass that deletes a check
    must leave the tag.
+9. **No trap moves past an effect.** An `SBoundsCheck`, an `RCast` with `"trap"` or an `STrap`
+   that a pass moved keeps every earlier effect (a call, a store, a print) ahead of it on every
+   path. The exception is a check that the pass proved can never trap, and that check carries the
+   proof tag. The builder records each check's original position, and the rule compares a pass's
+   output against it.
 
 A failure halts with the function, the node, its span and the rule. This is the "invalid module is
 found by the engine" gap (review §4.3) moved to the producer.
@@ -266,8 +271,10 @@ What phase B deletes:
   the retype and rebind family (640 lines).
 - **string pins.** `emit_mono.vl` has 634 `: string` annotations. Instance keys are H's id vectors,
   and pin spellings that only fed a key go with H stage 5.
-- **mono's hidden globals.** `InstReq` already removed 15 (Q step 1). The rest (`MonoWalk`) become
-  the builder's own context.
+- **mono's hidden globals.** `InstReq` and the `MonoBuild` frame already removed the instance
+  builder's hidden inputs (#8121). The IR builder owns both. The key-staging tables (`monoKeyExtra*`,
+  `monoExplicitBN`/`BT`) and `monoBakeSpecK` are the builder's to absorb at I9, after S's pin-walk
+  deletion.
 
 What phase B does **not** delete:
 - **the pin walk** (`Pin` family, 5,369 lines). S stages 3–5 delete that, because they decide
@@ -335,7 +342,8 @@ The lines are function lines, out of the file's total (§A.3).
 - callback specialization;
 - unrolling.
 
-The LICM rule is an owner decision (§8.1).
+Every pass keeps one invariant, which the verifier enforces (§2, rule 9): **an optimisation never
+changes observable behaviour**. In particular, a trap never moves past an earlier effect.
 
 ## 5. Migration
 
@@ -428,7 +436,7 @@ still refuse**:
 | `lambda-record-result-at-generic-union-return.vl` | emit, "ref valtype with no interned shape" (D14082, a live site) | the box's destination union was never registered | **I3**: the `RCoerce` box names its destination `RUnion` by `RepId`, and `heapOf` is total (E stage 4). The mechanism was never traced (rep-adt §7), so this is the least certain. |
 | `eq-record-generic-instances-stored-apart.vl` | emit, "struct equality is not supported yet" (D16397, a live site) | the field-wise rewrite runs in the checker, which sees only type parameters | **I5**, by construction: equality lowers per instance over closed `RRecord`s |
 | `eq-litunion-list-vs-string-list.vl` | **check**, "has no lowering: … store their elements differently" | the checker acts as the emitter's capability oracle | **I5**: an atom list compares to a string list through an element `RCoerce`. The checker literal is then deleted, and that deletion belongs to I5's PR. |
-| `eq-record-fields-widen-opposite-ways.vl` | **check**, "cannot compare {x: i32, y: i64} with {x: f64, y: i32}" | a typing rule, not a lowering | **not the IR's to close**. Whether `==` joins field types pointwise is a language decision (§8.1). Once ruled legal, I5 lowers it. |
+| `eq-record-fields-widen-opposite-ways.vl` | **check**, "cannot compare {x: i32, y: i64} with {x: f64, y: i32}" | D16396: the checker refuses a program the existing rule makes legal (records of one field set compare pair by pair, each pair at its own join: D16395). Each pair here compares bare. | **I5**: equality lowers pair by pair over the closed `RRecord`s, and the checker's refusal deletes in the same PR |
 
 **Checker-side capability literals.** Fourteen message literals in 7 `check_*.vl` files concede a
 missing lowering ("has no lowering", "not yet supported by codegen", "is not built yet", "cannot
@@ -497,28 +505,24 @@ zero is not clause 2 being met, and the probe runner stays the measurement.
 - **The deletions do not double-count E's.** E's stages 2–5 claim about −5,600 to −6,600, much of
   it in the same files. Read this table as what L1 deletes after E has landed.
 
-## 8. Risks, and choices that are the owner's
+## 8. Risks, and the settled language questions
 
-### 8.1 Owner choices: language-visible
+### 8.1 Language-visible behaviour: settled by existing rulings
 
-1. **Record `==` across opposite widenings** (`eq-record-fields-widen-opposite-ways.vl`): is
-   `{x: i32, y: i64} == {x: f64, y: i32}` legal, by comparing field by field at each field's join?
-   The probe expects `true`, and the checker refuses. This is a typing rule, so the IR only lowers
-   it once ruled.
-2. **Hoisting a check past an observable effect.** LICM or BCE can move a bounds check that traps
-   to before a `print` in the same loop, which changes the visible output before the trap. The
-   choice:
-   - (a) no check moves past an effect. This is safe, and it limits LICM to effect-free loop
-     prefixes;
-   - (b) a trap may be reported early, so a program that traps may print less.
+No step of this design needs a new owner ruling. Three language-visible questions came up, and
+existing rules decide each one:
+1. **Record `==` across opposite widenings is legal.** Records of one field set compare pair by
+   pair, each pair at its own join (D16395). So `{x: i32, y: i64} == {x: f64, y: i32}` prints
+   `true`. Today's checker refusal is D16396, a clause-2 row, and I5 closes it.
+2. **A trap never moves past an earlier effect.** An optimisation never changes observable
+   behaviour. A hoisted check has either been proved never to trap, or it stays behind the
+   effects (a print, a store, a call). This is verifier rule 9, and it limits LICM to checks it can
+   prove, or to loop prefixes with no effect.
+3. **Evaluation order is source order**, each operand exactly once (DECISIONS.md, "Evaluation order
+   is SOURCE order", D1510). ANF makes that explicit.
 
-   **Recommended: (a).** It needs no ruling unless (b) is wanted.
-3. **The I10 optimizations run by default.** That changes performance only, not semantics. None
-   of the passes in §4.2 reorders float operations, and a pass that would is out of scope, so none
-   of them needs a ruling beyond item 2.
-
-**Not an owner choice:** evaluation order. ANF evaluates each operand exactly once, in source
-order, which is the existing ruling (DECISIONS.md, "Evaluation order is SOURCE order", D1510).
+The I10 passes run by default, which changes performance and not semantics. None of them reorders
+float operations.
 
 ### 8.2 Byte identity in phase A
 
@@ -564,7 +568,9 @@ order, which is the existing ruling (DECISIONS.md, "Evaluation order is SOURCE o
 
 ## 9. Questions to the prerequisite lanes
 
-These were sent to each lane before this PR. Replies are recorded here when they arrive.
+These were sent to each lane before this PR. **Two items are pending: `RCoerce`'s payload (M3)
+and `IrCallee` (Q step 6).** They do not block this design: each is a single-type substitution
+(§1.5, §1.1). The replies received so far are recorded below.
 
 - **M3.** Is `Coercion` a recursive sum (identity, widen, box(arm), unbox, null-wrap,
   list-copy(element coercion), record-copy(field coercions), closure adapt, …)? Is it keyed by
@@ -574,8 +580,19 @@ These were sent to each lane before this PR. Replies are recorded here when they
 - **H.** Do instance types come from the same intern table, so that an instance key is an id
   vector? Which stage ends `tyMutEpoch`? Should the IR key on `tyCanon` or `tyCanonLayout`? (This
   note's answer: on neither. It stores `RepId`, §1.3.)
-- **Q.** Is `Lowered` a separate product beside `Elaborated`? Is mono's `MonoWalk` context Q's, or
-  the builder's?
+- **Q, answered.**
+  - `Lowered` is its own product, keyed per `InstId`. `Elaborated` owns the instances and is the
+    builder's input, not its container.
+  - `EmitCtx` is per output module. `FnCtx` is per emitted function: locals, frames and buffer,
+    with no seats. Its first slice (the `fnUses` record) landed, and `body: u8[]` is gone.
+  - Each seat is "this delivery owes coercion K at node N". Under the IR it becomes an explicit
+    `RCoerce` that the builder emits around the value.
+  - Mono's hidden inputs are already explicit (#8121). They are `InstReq{frame, call, delivery,
+    specK, retWidenTy, retTy, argLit}` and a `MonoBuild` frame `{own, bindN, bindT, widenRet,
+    baked}`, and the IR builder owns both.
+  - What the builder still has to absorb from mono's globals: the key-staging tables
+    (`monoKeyExtra*`, `monoExplicitBN`/`BT`, which wait on S's pin-walk deletion) and
+    `monoBakeSpecK`.
 
 ## A. Commands
 
