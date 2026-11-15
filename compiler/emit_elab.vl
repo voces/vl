@@ -21046,6 +21046,8 @@ type EplTables = {
   fwd: {[i32]: i32[]},
   bwd: {[i32]: i32[]},
   adjN: i32,
+  // Each `decl|field` a whole assignment re-points.
+  repointed: {[string]: boolean},
   // Per class root (times two, plus one forward), the classes `eplReach` found once unions end;
   // per class root, `eplOneCall`'s answer.
   reachMemo: {[i32]: i32[]},
@@ -21077,6 +21079,7 @@ function eplFresh(): EplTables {
     fwd: Map(),
     bwd: Map(),
     adjN: -1,
+    repointed: Map(),
     reachMemo: Map(),
     oneMemo: Map(),
   }
@@ -21463,6 +21466,31 @@ function eplFnOf(a0: i32): i32 {
   identFnDeclOf(a)
 }
 
+// The binding a record literal `lit` initialises and its field `name`, as `decl|name`; "" for none.
+function eplLitHolderKey(lit: i32, name: string): string {
+  if !cwIxCovers(lit) || cwIxUpKind[lit] != CW_UP_LETINIT { return "" }
+  i32ToStr(cwIxUp[lit]) + "|" + name
+}
+
+// Files each `decl|field` a whole assignment `b.field = v` re-points.
+function eplRepointsFile() {
+  let u = 0
+  while u < cwIxCoveredLen() && u < P.nodes.length {
+    const up = cwIxUp[u]
+    if cwIxUpKind[u] == CW_UP_ASG_RHS && up >= 0 && up < P.nodes.length {
+      const an = nodeAt(up)
+      const l = if an is BinExpr { parenPeelIx(an.binLeft) } else { -1 }
+      const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+      const ox = if ln is Member { parenPeelIx(ln.memObj) } else { -1 }
+      if ln is Member && ox >= 0 && ox < P.nodes.length && nodeAt(ox) is Ident {
+        EPL.repointed.set(i32ToStr(identDeclOf(ox)) + "|" + ln.memProp, true)
+      }
+    }
+    u = u + 1
+  }
+  0
+}
+
 // A value edge from `src` to `dst`: a function value is copied (its members flow forward, the
 // calls through the copy flow back); any other value is shared, so the two places unify.
 function eplEdge(src: i32, dst: i32, val: i32) {
@@ -21625,6 +21653,7 @@ function eplCallPlace(n: Call, x: i32, cf: i32): i32 {
 
 function eplEdges() {
   cwIxBuild()
+  eplRepointsFile()
   let u = 0
   while u < cwIxCoveredLen() && u < P.nodes.length {
     // A closure with no instances of its own is drawn once per instance of the nearest
@@ -21694,7 +21723,11 @@ function eplEdgeAt(u: i32) {
         eplEdge(eplPlaceOf(u, 0), eplChild(eplRoot(up), "e"), u)
       } else if k == CW_UP_FIELD {
         const fi = nodeAt(cwIxUpAux[u])
-        if fi is FieldInit {
+        // A field the program re-points no longer holds what its literal put there.
+        if (
+          fi is FieldInit
+          && !EPL.repointed.has(eplLitHolderKey(up, fi.fiName))
+        ) {
           eplEdge(eplPlaceOf(u, 0), eplChild(eplRoot(up), "f." + fi.fiName), u)
         }
       } else if k == CW_UP_COAL || k == CW_UP_ARM {
