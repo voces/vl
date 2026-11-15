@@ -53,17 +53,17 @@ let sNames: string[] = []
 // fifth line, ALWAYS SHOUTING here
 function holeOf(n: Node) {
   if n.nKid < 0 { return -1 }
-  n.nKid
+  return n.nKid
 }
 function readIt(n: Node) {
   const kid = nodes[n.nKid]
-  kid.nKid
+  return kid.nKid
 }
 function pick(k: string): i32 {
   if k == "nulbool" { return 1 }
   if k == "f64list" { return 2 }
   if k == "u8list" { return 3 }
-  -1
+  return -1
 }
 function perThing(seed: i32) {
   let i = 0
@@ -72,19 +72,19 @@ function perThing(seed: i32) {
     n = n + i
     i = i + 1
   }
-  n
+  return n
 }
-function wU8(b: i32) { b }
+function wU8(b: i32) { return b }
 const P = { nodes: nodes }
 function put(n: Node) {
   P.nodes[0] = n
-  0
+  return 0
 }
 function lower(t: { fnBody: i32 }) {
   t.fnBody = 1
-  0
+  return 0
 }
-function label(x: i32): string { "n=\\{x}" }
+function label(x: i32): string { return "n=\\{x}" }
 let total = holeOf({ nKid: 1 }) + readIt({ nKid: 0 }) + pick("x") + perThing(1) + wU8(0x7f) + put({ nKid: 2 }) + lower({ fnBody: 0 })
 print(label(total))
 `;

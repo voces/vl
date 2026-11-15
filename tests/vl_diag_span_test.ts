@@ -277,7 +277,7 @@ const GRID: Row[] = [
     // `function f(a: i32): i32 { a }` — the second `f` at 10.
     name: "declaration: a redeclaration names the declared name",
     src:
-      "function f(a: i32): i32 { a }\nfunction f(a: i32): i32 { a }\nprint(f(1))\n",
+      "function f(a: i32): i32 { return a }\nfunction f(a: i32): i32 { return a }\nprint(f(1))\n",
     frag: "redeclared f",
     line: 2,
     col: 10,

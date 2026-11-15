@@ -50,7 +50,7 @@ type Square = { s: f64 }
 export type Shape = Circle | Square
 
 export function area(s: Shape): f64 {
-  match s {
+  return match s {
     Circle => 3.0 * s.r * s.r
     Square => s.s * s.s
   }
@@ -77,7 +77,7 @@ const FLAG = `export function flagged(n: i32): i32 {
     if f(n) > 0 { break @B 7 }
     0
   }
-  v + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + n
+  return v + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + n
 }
 `;
 

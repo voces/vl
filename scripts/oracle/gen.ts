@@ -5,7 +5,11 @@
 //   deno run -A scripts/oracle/gen.ts <out-dir> [--seed S] [--count N]
 //
 // Every program is meant to pass `vl check`: types are tracked while generating, and only
-// combinations E2.2, T2.6 and E8 permit are emitted.
+// combinations E2.2, T2.6 and E8 permit are emitted. A subexpression that reads no variable is
+// typed at its use and run in the oracle before it is kept, so a constant the design refuses
+// (E8.2, E6.2, D2.3, T2.4) is regenerated; one that traps at run time is legal and stays.
+
+import { interpret } from "./oracle.ts";
 
 type T = "i32" | "i64" | "f64" | "f32";
 const INTS: T[] = ["i32", "i64"];
@@ -44,8 +48,23 @@ class Gen {
     return l.startsWith("-") ? `(${l})` : l;
   }
 
-  // An expression of exactly type t.
+  head: string[] = [];
+
+  // An expression of exactly type t; a closed one is one the oracle accepts at t.
   expr(t: T, d: number): string {
+    for (let i = 0; i < 6; i++) {
+      const e = this.expr0(t, d);
+      if (/\b[vp]\d+\b/.test(e) || this.legal(t, e)) return e;
+    }
+    return this.lit(t);
+  }
+
+  legal(t: T, e: string): boolean {
+    const o = interpret([...this.head, `const c__: ${t} = ${e}`, ""].join("\n"));
+    return o.kind === "ok" || o.kind === "trap" || (o.kind === "unsupported" && !o.msg.startsWith("literal typed from uses"));
+  }
+
+  expr0(t: T, d: number): string {
     const r = this.r;
     if (d <= 0 || r.chance(0.25)) {
       const vs = this.vars.filter((v) => v.t === t);
@@ -71,7 +90,9 @@ class Gen {
       case 4:
         if (isInt) {
           const w = t === "i32" ? 32 : 64;
-          const count = r.chance(0.5) ? String(r.int(w)) : this.expr("i32", d - 1);
+          // E6.2: a count that reads no variable is a constant, so it is a literal in range.
+          const c = r.chance(0.5) ? "" : this.expr("i32", d - 1);
+          const count = c === "" || !/\b[vp]\d+\b/.test(c) ? String(r.int(w)) : c;
           return `(${this.expr(t, d - 1)} ${r.pick(["<<", ">>", ">>>"])} ${count})`;
         }
         return `${r.pick(["trunc", "floor", "ceil", "nearest", "abs"])}(${this.expr(t, d - 1)})`;
@@ -155,9 +176,9 @@ class Gen {
 
   program(): string {
     const r = this.r;
-    const head: string[] = [];
+    const head = this.head;
     for (const t of ["i32", "i64", "f64", "f32"] as T[]) {
-      head.push(`function tr_${t}(s: string, v: ${t}): ${t} { print(s); v }`);
+      head.push(`function tr_${t}(s: string, v: ${t}): ${t} { print(s); return v }`);
     }
     head.push(`function trb(s: string, v: boolean): boolean { print(s); return v }`);
     const nf = r.int(3);

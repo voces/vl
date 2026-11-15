@@ -898,6 +898,7 @@ import {
   mapTypeIdxOf,
   mvValElemHeapOf,
   mvValsBackOf,
+  mvValsWrapOf,
   nulScalarListWrapHeap,
   pkBackAt,
   pkWrapAt,
@@ -1802,22 +1803,6 @@ export function capCacheBuild() {
   return 0
 }
 
-// The value-column wrapper struct for map slot `slot`: a scalar mv kind (f64/i64/f32)
-// resolves to that scalar's distinct-backing list wrapper, a negative slot to the base
-// i32 wrapper, and anything else to its interned ref-list wrapper (`rlWrapIdx`).
-export function mvValsWrapOf(slot: i32) {
-  if slot < 0 { return lTy() }
-  if mvValKindAt(slot) == "str" { return mkListTy() }
-  if mvValKindAt(slot) == "f64" { return fl64Ty() }
-  if mvValKindAt(slot) == "f32" { return fl32Ty() }
-  if mvValKindAt(slot) == "i64" { return il64Ty() }
-  if mvValRep[slot].mrSlot < 0 || mvValRep[slot].mrSlot >= rlWrapIdx.length {
-    emitFail("emitProgram: map value slot has no resolved vals wrapper")
-    return 0
-  }
-  return rlWrapIdx[mvValRep[slot].mrSlot]
-}
-
 // The scalar element kind (`"f64"`/`"i64"`/`"f32"`) of an mv map-value slot whose value
 // is a non-i32 scalar, else null (a ref value rides the nullable valStash instead). The
 // chokepoint the map get/set/push consult to branch scalar-store vs ref-store.
@@ -1840,7 +1825,7 @@ function scalarListKindUnlisted(fallback: i32): i32 {
 }
 
 // The wrapper struct heap type for a scalar element kind.
-function scalarListWrap(elemKind: VKind, row: i32) {
+export function scalarListWrap(elemKind: VKind, row: i32) {
   if elemKind == "u8list" { return pkWrapAt(row) }
   if elemKind == "f64" { return fl64Ty() }
   if elemKind == "i64" { return il64Ty() }
@@ -1852,7 +1837,7 @@ function scalarListWrap(elemKind: VKind, row: i32) {
 }
 
 // The backing `(array (mut <elem>))` heap type for a scalar element kind.
-function scalarListBack(elemKind: VKind, row: i32) {
+export function scalarListBack(elemKind: VKind, row: i32) {
   if elemKind == "u8list" { return pkBackAt(row) }
   if elemKind == "f64" { return fa64Ty() }
   if elemKind == "i64" { return ia64Ty() }
@@ -1885,7 +1870,7 @@ function scalarListBlocktype(elemKind: VKind) {
 // Whether the module-global list types for a scalar element kind are collected — the
 // loud-fail guard every list op shares. An unlisted kind answers false, which is the
 // caller's own loud refusal rather than a silent read at the i32 list's types.
-function scalarListUsed(elemKind: VKind) {
+export function scalarListUsed(elemKind: VKind) {
   match elemKind {
     "u8list" => {
       return true
@@ -17017,7 +17002,7 @@ function arrLitDataPut(ins: u8[], form: i32, out: u8[]): i32 {
 // index] on entry, leaves [backing, i]. One unsigned compare covers negative and past-len, and
 // a failing one traps (`emitListIdxTrap`) instead of reading the zero-init slack `.push` leaves
 // past `len`. A list whose backing this module never typed keeps the older `select` to -1.
-function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
+export function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
   const back = listBackOfWrap(lTy)
   if back >= 0 {
     fbLocalSet(listIdxScratchBase)
@@ -17161,7 +17146,7 @@ function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
 // identifier matching the row's binding, the row must be live, and its rep must match
 // the arm asking. The rep check is the backstop that makes a classifier disagreement
 // between the prologue and the access decline, rather than read a wrongly-typed local.
-function liveHoistRow(exprIx: i32, kind: ListKind, slot: i32) {
+export function liveHoistRow(exprIx: i32, kind: ListKind, slot: i32) {
   const d = hoistPathDecl(exprIx)
   if d < 0 { return 0 - 1 }
   const p = hoistPathProp(exprIx)
@@ -17183,7 +17168,7 @@ function liveHoistRow(exprIx: i32, kind: ListKind, slot: i32) {
 
 // The declaration a hoist row caches the receiver at `ix` under, with `hoistPathProp`'s field:
 // a bare identifier's, or the root identifier's of a field `b.xs`; -1 for any other receiver.
-function hoistPathDecl(ix: i32) {
+export function hoistPathDecl(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 - 1 }
   const e = nodeAt(ix)
   if e is Member { return hoistRootDecl(e.memObj) }
@@ -17191,7 +17176,7 @@ function hoistPathDecl(ix: i32) {
 }
 
 // The field a hoist row caches at `ix`: `xs` for `b.xs`, "" for the binding itself.
-function hoistPathProp(ix: i32): string {
+export function hoistPathProp(ix: i32): string {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const e = nodeAt(ix)
   if e is Member { return e.memProp }
@@ -18120,12 +18105,17 @@ function loopHoistClose(n: i32) {
   return 0
 }
 
+// A shared cell's read `c[0]` at `idxIx` whose binding's name is narrowed to `null` there.
+export function idxCellReadIsNull(idxIx: i32, fnIx: i32): boolean {
+  return cboxReadTy.has(idxIx) && isNullTy(readNarrowedTyAt(idxIx, fnIx))
+}
+
 function emitIndex(idxIx: i32, fnIx: i32) {
   const nd = nodeAt(idxIx)
   if nd is Index {
     // A shared cell's read is its binding's name read respelled, so one narrowed to `null`
     // delivers that null as `emitIdentNode` does (D15951).
-    if cboxReadTy.has(idxIx) && isNullTy(readNarrowedTyAt(idxIx, fnIx)) {
+    if idxCellReadIsNull(idxIx, fnIx) {
       if emitNullReadAtDst(idxIx, fnIx) { return 0 }
     }
     const tlm = twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx)
@@ -23513,6 +23503,24 @@ export function emitExprAsKind(exprIx: i32, k: i32, fnIx: i32) {
   return emitExpr(exprIx, fnIx)
 }
 
+// `emitExprAsKind` at a list element kind: a scalar list's value widens to its element.
+function emitExprAsElem(exprIx: i32, ek: VKind, fnIx: i32) {
+  if ek == "i64" { return emitExprAsI64(exprIx, fnIx) }
+  if ek == "f64" { return emitExprAsF64(exprIx, fnIx) }
+  if ek == "f32" { return emitExprAsF32(exprIx, fnIx) }
+  return emitExpr(exprIx, fnIx)
+}
+
+// The element kind of a list of rep `k` whose element is a non-i32 scalar (`f64`, `i64`,
+// `f32`), the lists whose ops take their own wrapper, backing and value width; null otherwise.
+function numListElemOf(k: VKind | null): VKind | null {
+  if k == null { return null }
+  if k == "f64list" || k == "i64list" || k == "f32list" {
+    return scalarListElemOfListKind(k)
+  }
+  return null
+}
+
 // ── the numeric exact-or-fail cast (D1041) ────────────────────────────────────
 // A numeric `as` to an integer target succeeds iff the value is exactly representable
 // there, else fails as the trio fails everywhere (`as?` null, `as!` traps, bare `as`
@@ -27439,6 +27447,17 @@ function emitCallRefAt(
   // the concrete `$fnsig` (the engine signature-checks the callee against it).
   let sig = -1
   if ckey != "" { sig = cloSigTypeIdxAt(cloSigPosOfKey(ckey)) }
+  // The arity type takes `i32` in every slot, and an argument the key coerced wider has no
+  // conversion into one: the closure is built at another of the value's signatures (D16531).
+  let wi = 0
+  while sig < 0 && wi < args.length {
+    if sigParamCoerceKind(ckey, wi) != null {
+      return emitFail(
+        "emitProgram: a function value is called at two signatures, and the closure it holds was built for one: this call passes a wider number than its `i32` parameter",
+      )
+    }
+    wi = wi + 1
+  }
   if sig < 0 && !cloCallArityFallbackUnsound(callIx, fnIx) {
     sig = fnSigIdxForArity(args.length)
   }
@@ -28005,9 +28024,8 @@ function emitAssignIdent(binIx: i32, fnIx: i32, a: BinExpr, lhsIx: i32) {
 type IdxStore = {
   isRef: boolean,
   isStr: boolean,
-  isF64: boolean,
-  isI64: boolean,
-  isF32: boolean,
+  // A non-i32 scalar element's kind, read off the list's rep; null for every other list.
+  sk: VKind | null,
   isU8: boolean,
   lTy: i32,
   aTy: i32,
@@ -28054,18 +28072,10 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
     st.lTy = mkListTy()
     st.aTy = mkArrTy()
     st.mfKind = "strlist"
-  } else if st.isF64 {
-    st.lTy = fl64Ty()
-    st.aTy = fa64Ty()
-    st.mfKind = "f64list"
-  } else if st.isI64 {
-    st.lTy = il64Ty()
-    st.aTy = ia64Ty()
-    st.mfKind = "i64list"
-  } else if st.isF32 {
-    st.lTy = fl32Ty()
-    st.aTy = fa32Ty()
-    st.mfKind = "f32list"
+  } else if st.sk != null {
+    st.lTy = scalarListWrap(st.sk, 0)
+    st.aTy = scalarListBack(st.sk, 0)
+    st.mfKind = listIdxKindOf(st.sk)
   } else if st.isU8 {
     // a `u8[]` store: the same unwrap + `array.set` spine over the packed backing. The
     // value takes the plain i32 path below — a `u8` element value is an i32, and
@@ -28101,14 +28111,10 @@ function emitIdxStoreValue(
     // A nested-list row store: the RHS builds as the INNER list (inert for a
     // non-literal RHS — an ident/call emits unchanged).
     if emitExpr(a.binRight, fnIx) < 0 { return -1 }
-  } else if st.isF64 {
+  } else if st.sk != null {
     // The stored value re-encodes at the element valtype (a bare-int / int-literal value
     // widens into the f64 slot, exactly as a binding / push does).
-    if emitExprAsF64(a.binRight, fnIx) < 0 { return -1 }
-  } else if st.isI64 {
-    if emitExprAsI64(a.binRight, fnIx) < 0 { return -1 }
-  } else if st.isF32 {
-    if emitExprAsF32(a.binRight, fnIx) < 0 { return -1 }
+    if emitExprAsElem(a.binRight, st.sk, fnIx) < 0 { return -1 }
   } else if arrElemLitUnionTy(arrIx, fnIx) >= 0 {
     // `xs[i] = "a"` over a literal-union array: the member RHS lowers as its atom id —
     // the store half of the boundary `exprIsLitAtom`'s Index arm reads. Without it a
@@ -28177,18 +28183,14 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
   const isStr = exprStringArray(target.idxArr, fnIx)
   // the scalar non-i32 lists: the same unwrap+`array.set` spine over their own
   // wrapper/backing, with the value coerced to the element valtype.
-  const isF64 = exprF64Array(target.idxArr, fnIx)
-  const isI64 = exprI64Array(target.idxArr, fnIx)
-  const isF32 = exprF32Array(target.idxArr, fnIx)
+  const sk = numListElemOf(exprListRep(target.idxArr, fnIx))
   // the packed byte list — an i32-element list with a one-byte backing, the one rep
   // the `else` i32 fall-through below would otherwise silently claim.
   const isU8 = exprU8Array(target.idxArr, fnIx)
   const st: IdxStore = {
     isRef: isRef,
     isStr: isStr,
-    isF64: isF64,
-    isI64: isI64,
-    isF32: isF32,
+    sk: sk,
     isU8: isU8,
     lTy: -1,
     aTy: -1,
@@ -28760,9 +28762,7 @@ function emitPush(callIx: i32, fnIx: i32, wantValue: boolean) {
       // field receiver only needs its wrapper ref materialized into `recvRef`.
       const isRef = exprRefArray(callee.memObj, fnIx)
       const isStr = exprStringArray(callee.memObj, fnIx)
-      const isF64 = exprF64Array(callee.memObj, fnIx)
-      const isI64 = exprI64Array(callee.memObj, fnIx)
-      const isF32 = exprF32Array(callee.memObj, fnIx)
+      const sk = numListElemOf(exprListRep(callee.memObj, fnIx))
       const isU8 = exprU8Array(callee.memObj, fnIx)
       // a literal-union array push (`xs.push("a")` over `xs: K[]`) rides the i32-list
       // spine, but the pushed member literal must lower as its atom id — seeded through
@@ -28783,18 +28783,14 @@ function emitPush(callIx: i32, fnIx: i32, wantValue: boolean) {
       if (
         !isRef
         && !isStr
-        && !isF64
-        && !isI64
-        && !isF32
+        && sk == null
         && !isU8
         && !exprArray(callee.memObj, fnIx)
       ) {
         return emitFail("emitProgram: .push receiver is not a list")
       }
       const pv: PushValKinds = {
-        isF64: isF64,
-        isI64: isI64,
-        isF32: isF32,
+        sk: sk,
         pushNestSlot: -1,
         isLitArr: isLitArr,
         isNbArr: isNbArr,
@@ -28880,21 +28876,12 @@ function pushSlotOf(
     ps.base = strPushScratchBase
     // A `(string | null)[]` keeps its nullable slot and stays `null` here.
     if !pv.isNsArr { ps.destKind = "str" }
-  } else if pv.isF64 {
-    // the three non-i32 scalar kinds run the identical grow/append sequence over
-    // their own wrapper/backing, staged in their own typed push quad — only the
-    // three type indices below differ.
-    ps.lTy = fl64Ty()
-    ps.aTy = fa64Ty()
-    ps.base = f64PushScratchBase
-  } else if pv.isI64 {
-    ps.lTy = il64Ty()
-    ps.aTy = ia64Ty()
-    ps.base = i64PushScratchBase
-  } else if pv.isF32 {
-    ps.lTy = fl32Ty()
-    ps.aTy = fa32Ty()
-    ps.base = f32PushScratchBase
+  } else if pv.sk != null {
+    // the non-i32 scalar kinds run the identical grow/append sequence over their own
+    // wrapper/backing, staged in their own typed push quad.
+    ps.lTy = scalarListWrap(pv.sk, 0)
+    ps.aTy = scalarListBack(pv.sk, 0)
+    ps.base = scalarPushScratchBaseOf(pv.sk, 0)
   } else if isU8 {
     // the packed byte list runs the identical grow/append sequence over its own
     // wrapper/backing and push quad. The pushed value takes the plain i32 path, and
@@ -28959,9 +28946,7 @@ function emitPushOne(
 // Which element rep a one-argument `.push` builds its value at: the scalar widths, the nested
 // list a ref list's element names, and the atom and niche seeds. A union box is the record's.
 type PushValKinds = {
-  isF64: boolean,
-  isI64: boolean,
-  isF32: boolean,
+  sk: VKind | null,
   pushNestSlot: i32,
   isLitArr: boolean,
   isNbArr: boolean,
@@ -28973,22 +28958,15 @@ type PushValKinds = {
 // The value `argIx` a `.push` onto receiver `recvIx` appends, built and coerced at the
 // element rep `pv` names. Returns -1 on a failure, else 0.
 function emitPushValue(recvIx: i32, argIx: i32, fnIx: i32, pv: PushValKinds) {
-  const isF64 = pv.isF64
-  const isI64 = pv.isI64
-  const isF32 = pv.isF32
   const pushNestSlot = pv.pushNestSlot
   const isLitArr = pv.isLitArr
   const isNbArr = pv.isNbArr
   const isNlluArr = pv.isNlluArr
   const isNsArr = pv.isNsArr
   const isStr = pv.isStr
-  if isF64 {
-    if emitExprAsF64(argIx, fnIx) < 0 { return -1 }
-  } else if isI64 {
-    if emitExprAsI64(argIx, fnIx) < 0 { return -1 }
-  } else if isF32 {
-    // an f32-list push coerces/encodes the value as f32 (a float literal re-encodes).
-    if emitExprAsF32(argIx, fnIx) < 0 { return -1 }
+  if pv.sk != null {
+    // a scalar-list push coerces/encodes the value at its element (a float literal re-encodes).
+    if emitExprAsElem(argIx, pv.sk, fnIx) < 0 { return -1 }
   } else if boxOwedAtRecord(argIx, fnIx) {
     // The checker's record decides the union box, as at every delivery that reads it.
     if emitUnionBoxAtRecord("", -1, argIx, fnIx) < 0 { return -1 }
@@ -30799,7 +30777,7 @@ function svPairOfKinds(src: VKind, dst: VKind): i32 {
 
 // The view destination a scalar list of element `k` reads as (0 `i64`, 1 `f64`), or -1 where
 // no view of that element is built: `k` is a destination exactly when an `i32` widens to it.
-function svDstOfKind(k: VKind | null): i32 {
+export function svDstOfKind(k: VKind | null): i32 {
   if svPairs == 0 || k == null { return -1 }
   const d = svPairOfKinds("i32", k)
   if d == 0 { return 0 }
@@ -36823,13 +36801,26 @@ function strLexSameValue(a: string, b: string): boolean {
 // The lexeme (quotes kept) of the member in `texts` whose value `lex` spells, else `lex` itself —
 // whose interned id then matches no member's.
 function memberLexOfValue(texts: string[], lex: string): string {
-  let i = 0
-  while i < texts.length {
-    const m = quoteLex(texts[i])
-    if strLexSameValue(m, lex) { return m }
-    i = i + 1
+  // With no backslash on either side a lexeme's value is its text between the quotes, so the
+  // compare is the raw one and nothing is decoded.
+  const plain = !strHasBackslash(lex)
+  const inner = lex.slice(1, lex.length - 1)
+  for t in texts {
+    if plain && !strHasBackslash(t) {
+      if t == inner { return quoteLex(t) }
+    } else if strLexSameValue(quoteLex(t), lex) {
+      return quoteLex(t)
+    }
   }
   return lex
+}
+
+// Whether `s` holds a backslash, the only character `decodeStr` reads as other than itself.
+function strHasBackslash(s: string): boolean {
+  for c in s {
+    if c == '\\' { return true }
+  }
+  return false
 }
 
 // Pushes the interned atom id of statically-known operand `ix` (lexeme `lex`): a literal is its

@@ -8,9 +8,9 @@
 # scripts/oracle/gen_data.ts (records, lists, maps, closures, loops, strings, evaluation order);
 # `hof` is scripts/oracle/gen_hof.ts (generics, hole functions, function values, declaration
 # order); `rep` is scripts/fuzzgen.vl's batch (the rep-composition programs fuzz-vl.sh runs); `both` is
-# arith and rep, `all` all four. Exit 1 on a new DISAGREE or UNSOUND verdict, or a COMPILED-BAD
-# one (scripts/oracle/known.txt lists the filed cells, and the filed refusals by row), 2 on
-# setup failure.
+# arith and rep, `all` all four. Exit 1 on a new DISAGREE or UNSOUND verdict, a COMPILED-BAD
+# one (scripts/oracle/known.txt lists the filed cells, and the filed refusals by row), or a
+# generator whose share of cases `vl check` refuses passes its ceiling; 2 on setup failure.
 # Requires a fresh seed (scripts/refresh-compiler.sh) and deno.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -79,4 +79,25 @@ if [ -n "$bad" ]; then
   echo "$bad" | sed 's/^/  /'
   [ "$rc" -eq 0 ] && rc=1
 fi
+# Every generator emits programs meant to pass `vl check`, and a refused case is no test, so
+# a generator whose refused share passes its ceiling fails the run: its templates have drifted
+# from the language. A ceiling above the default is a debt with a refactor note, to be lowered.
+ceiling() {
+  case "$1" in
+    ar) echo 6 ;;   # 2026-11-15-oracle-arith-legal.md: refusals left after the constant filter
+    ho) echo 7 ;;   # 2026-11-15-oracle-refused-column.md: untriaged
+    *) echo "${REFUSAL_MAX_PCT:-2}" ;;
+  esac
+}
+for g in ar da ho rep; do
+  total=$(find "$WORK/cases" -maxdepth 1 -name "${g}_*.vl" | wc -l)
+  [ "$total" -gt 0 ] || continue
+  refused=$(grep -l -E 'type error|parse error' "$WORK"/out/"${g}"_*.vl.err 2>/dev/null | wc -l)
+  pct=$((100 * refused / total))
+  echo "oracle: refused $g $refused of $total (${pct}%, ceiling $(ceiling "$g")%)"
+  if [ $((100 * refused)) -gt $(($(ceiling "$g") * total)) ]; then
+    echo "oracle-fuzz: generator $g has $refused of $total cases refused by vl check, past its $(ceiling "$g")% ceiling"
+    [ "$rc" -eq 0 ] && rc=1
+  fi
+done
 exit "$rc"

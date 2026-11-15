@@ -208,7 +208,7 @@ const TIE = `function f(n: i32) {
     u = [1]
     k = k + 1
   }
-  k
+  return k
 }
 print(f(1))
 `;
