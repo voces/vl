@@ -38,6 +38,7 @@ import {
   SBoundsCheck,
   SBr,
   SCellSet,
+  SDrop,
   SEffect,
   SGlobalSet,
   SIf,
@@ -66,7 +67,7 @@ import {
 } from "./emit_rep"
 import { repIsNoValue, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
-import { TY_BOOL, TY_I32, TY_STR } from "./check_types"
+import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { i32ToStr } from "./ast"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
@@ -143,6 +144,24 @@ function isNum(k: string): boolean {
 
 function isInt(k: string): boolean { k == "i32" || k == "i64" }
 
+// 1 when operand `o` is a variable typed at an unsigned integer, 0 at any other type, -1 for an
+// immediate, which carries no type.
+function opUnsignedTy(o: Opnd): i32 {
+  const v = opndVar(o)
+  if v < 0 || v >= vf.irVars.length { return -1 }
+  const p = tyScalarBasePrim(vf.irVars[v].vTy)
+  if p == null { return 0 }
+  const ps: string = p
+  if ps == "u32" || ps == "u64" { 1 } else { 0 }
+}
+
+function opndVar(o: Opnd): i32 {
+  match o {
+    OVar => o.ov
+    OImm | OStr => -1
+  }
+}
+
 // Rule 2 for a primitive op: its operands' reps and its result rep `dst`.
 function primSig(r: RPrimOp, dst: i32, at: i32) {
   const a = r.poArgs
@@ -167,15 +186,29 @@ function primSig(r: RPrimOp, dst: i32, at: i32) {
   const op: PrimOp = r.poOp
   const kindOk = match op {
     "add" | "sub" | "mul" | "div" | "rem" | "lt" | "le" | "gt" | "ge" | "neg" => isNum(k)
-    "shl" | "shr" | "shru" => isInt(k)
+    "divu" | "remu" | "ltu" | "leu" | "gtu" | "geu" | "shl" | "shr" | "shru" => isInt(k)
     "and" | "or" | "xor" => isInt(k) || k == "bool"
     "eq" | "ne" => isNum(k) || k == "bool"
     "not" => k == "bool"
   }
   if !kindOk { return fail(2, at, r.poOp + " has no signature over " + k) }
+  // The signed and unsigned forms must agree with the operand's type, which the rep cannot say.
+  const wantsUnsigned = match op {
+    "divu" | "remu" | "ltu" | "leu" | "gtu" | "geu" => 1
+    "div" | "rem" | "lt" | "le" | "gt" | "ge" | "shr" => 0
+    "add" | "sub" | "mul" | "shl" | "shru" | "and" | "or" | "xor" | "eq" | "ne" | "neg" | "not" => -1
+  }
+  if wantsUnsigned >= 0 {
+    for o in a {
+      const u = opUnsignedTy(o)
+      if u >= 0 && u != wantsUnsigned {
+        return fail(2, at, r.poOp + "'s signedness is not its operand's type's")
+      }
+    }
+  }
   const cmp = match op {
-    "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "not" => true
-    "add" | "sub" | "mul" | "div" | "rem" | "neg" | "shl" | "shr" | "shru" | "and" | "or" | "xor" => false
+    "eq" | "ne" | "lt" | "ltu" | "le" | "leu" | "gt" | "gtu" | "ge" | "geu" | "not" => true
+    "add" | "sub" | "mul" | "div" | "divu" | "rem" | "remu" | "neg" | "shl" | "shr" | "shru" | "and" | "or" | "xor" => false
   }
   const res = if cmp { vfBool } else { ar }
   if dst != res {
@@ -540,6 +573,7 @@ function stmt(id: i32) {
       0
     }
     STrap => 0
+    SDrop => use(n.dpV, id)
   }
 }
 
