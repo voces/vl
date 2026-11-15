@@ -291,6 +291,7 @@ import {
   cexRewrite,
   cexTreeShape,
   lbiIsInlined,
+  readsLitConst,
 } from "./check_num_lit_state"
 import {
   cexFitsAt,
@@ -301,6 +302,7 @@ import {
   cexShownFrom,
   dstIntWidth,
   intLitIsNegated,
+  litTreeOps,
   numLitOwnTy,
   radixLeafAmong,
 } from "./check_num_lits"
@@ -1369,6 +1371,9 @@ function radixLitAdoptTails(src: i32, dstTy: i32) {
     }
     si = si + 1
   }
+  // A typed 32-bit tail decides the join, whose literals adopt it before the join meets its
+  // destination (ruling 4.3): `if c { 0xFFFFFFFF } else { v: i32 }` is -1 at an `i64`.
+  if all32 && radixJoinTyped32(leaves) { return 0 }
   let reTy = -1
   let rc = 0
   const fpn = primNameOf(nonNullTy(dstTy))
@@ -1398,6 +1403,21 @@ function radixLitAdoptTails(src: i32, dstTy: i32) {
     tailParensSync(src)
   }
   rc
+}
+
+// Whether a tail among `leaves` is a value of a 32-bit integer type, not an integer literal, an
+// operator tree over them or a read of a literal `const`.
+function radixJoinTyped32(leaves: i32[]): boolean {
+  for lf in leaves {
+    if (
+      litTreeOps(lf, 8) < 0
+      && !readsLitConst(lf)
+      && dstIntWidth(nodeTyOf(lf), 3) == 32
+    ) {
+      return true
+    }
+  }
+  false
 }
 
 // The f32 a value `match` at `ix` typed `matchTy` takes when its arms are an f32 value and
@@ -7968,6 +7988,45 @@ export function litJoinOf(ix: i32, join: i32, arms: i32[], tys: i32[]): i32 {
   }
   if nul { return mkNullableTy(jw) }
   jw
+}
+
+// The record type every held arm of a join holds, when each fresh record-literal arm fits it,
+// or -1: a fresh literal adapts to its held sibling, as a numeric literal does (owner ruling
+// 4.3), so the held record is never asked to fit the literal's widened fields. A join over a
+// type parameter is left to its re-check at each pin.
+export function heldRecJoinOf(join: i32, arms: i32[], tys: i32[]): i32 {
+  if join < 0 || join >= T.tys.length || !(tyAt(join) is TyObj) { return -1 }
+  // The shape first, which most joins fail: one held arm and one fresh record literal.
+  let held = -1
+  let fresh = false
+  let i = 0
+  while i < arms.length {
+    const t = tys[i]
+    if t < 0 || t >= T.tys.length || !(tyAt(t) is TyObj) { return -1 }
+    const tail = joinArmTail(arms[i])
+    if tail >= 0 && nodeAt(tail) is ObjLit { fresh = true }
+    else if held < 0 { held = t }
+    i = i + 1
+  }
+  if held < 0 || !fresh || held == join { return -1 }
+  i = 0
+  while i < arms.length {
+    const t = tys[i]
+    if tyHasTyVar(t) { return -1 }
+    const tail = joinArmTail(arms[i])
+    const lit = tail >= 0 && nodeAt(tail) is ObjLit
+    if !lit && t != held && !tyEq(held, t) { return -1 }
+    i = i + 1
+  }
+  if tyEq(held, join) { return -1 }
+  i = 0
+  while i < arms.length {
+    const tail = joinArmTail(arms[i])
+    const lit = tail >= 0 && nodeAt(tail) is ObjLit
+    if lit && !joinArmFits(arms[i], tys[i], held) { return -1 }
+    i = i + 1
+  }
+  held
 }
 
 // Delivers the tail of an arm a join adopted `jw` for, when its own type does not already fit,
