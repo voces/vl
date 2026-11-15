@@ -488,7 +488,15 @@ function arith(op: string, a: Val, b: Val, expK: string | null = null): Val {
   // A float constant meeting an integer operand computes at f64 (E2.2 with T2.2's default).
   const floatLit = (v: Val) => v instanceof Lit && v.f !== null;
   const k = ka === "i32" && floatLit(b) ? "f64" : kb === "i32" && floatLit(a) ? "f64" : ka && kb ? (["<<", ">>", ">>>"].includes(op) ? ka : wider(ka, kb)) : (ka ?? kb)!;
-  const x = toKind(a, k), y = ["<<", ">>", ">>>"].includes(op) ? toKind(b, k === "i64" ? (kb === "i32" ? "i32" : "i64") : k) : toKind(b, k);
+  // Q8 leaves a literal-join shift count's width beside a typed left open: the compiler reads a
+  // join at its own default and a bare tree at the left's width, so a join whose readings differ is
+  // a spec gap here.
+  if (["<<", ">>", ">>>"].includes(op) && b instanceof Lit && b.join && b.i !== null && ka === "i64") {
+    const d = litDefault(b);
+    if (BigInt(d as number | bigint) !== wrap64(v64(b))) throw new Unsupported("spec gap: a literal-join shift count's width beside a typed i64 (Q8)");
+  }
+  const cnt = b;
+  const x = toKind(a, k), y = ["<<", ">>", ">>>"].includes(op) ? toKind(cnt, k === "i64" ? (kb === "i32" || numKind(cnt) === "i32" ? "i32" : "i64") : k) : toKind(b, k);
   if (k === "i32") {
     const p = x as number, q = y as number;
     switch (op) {
@@ -1471,6 +1479,9 @@ export class Interp {
     const intExp = exp && (() => { try { const x = this.resolve(exp, env); return x.k === "name" && (x.name === "i32" || x.name === "i64"); } catch { return false; } })();
     const atPeer = (x: Expr, k: string | null): boolean => {
       if (!intExp || (k !== "i32" && k !== "i64")) return false;
+      // A join of constant-like arms takes the peer's type as a constant does; its arms decide a
+      // widening themselves, and it is evaluated once.
+      if (x.k === "if" && constLike(x)) return true;
       const c = x.k === "bin" && ["<<", ">>", ">>>"].includes(x.op) && isConstTree(x.l) ? x.l : isConstTree(x) && treeHas(x, "radix") ? x : null;
       if (!c) return false;
       const v = this.eval(c, env, null);
@@ -1737,6 +1748,12 @@ export class Interp {
         ? e.args.map((a) => this.eval(a.e, env, shifted(a.e) ? { k: "name", name: pk, args: [] } : null))
         : this.evalArgs(e.args, env);
       const typed = args.some((a) => !(a instanceof Lit) && numKind(a) !== null);
+      // D3043: a constant argument that does not fit the typed `i32` beside it makes the call i64.
+      if (typed && args.some((a) => numKind(a) === "i32" && !(a instanceof Lit)) && !args.some((a) => !(a instanceof Lit) && numKind(a) !== "i32")) {
+        if (args.some((a) => a instanceof Lit && a.i !== null && !(a.join && a.derived && !a.wideDec) && !litHolds(a, "i32"))) {
+          return f.call(args.map((a) => a instanceof Lit ? litTo(a, "i64") : typeof a === "number" ? BigInt(a) : a), this);
+        }
+      }
       // E9.1: a constant tree beside an `f32` argument folds in f32 arithmetic; a tree is pure.
       if (args.some((a) => !(a instanceof Lit) && numKind(a) === "f32")) {
         args.forEach((a, i) => {
