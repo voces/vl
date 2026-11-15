@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **A list of vectors** (`F32x4[]`, `Mask32x4[]`) now compiles as a flat `v128` list. It supports literals, `push`, `pop`, index reads and writes, compound writes, `.length`, `for … in`, `slice`, spread, a list in a record field, passed and returned lists, and the generic list methods (`map`, `filter`, `reduce`, `some`, `every`, `sort` with a comparator, `concat`, `reverse` and the rest) at a vector element. This closes D1981's flat-array face. A map of vectors, `F32x4[] | null` and `F32x4[][]` are still refused at check; `includes`, `indexOf` and `==` are refused because a vector has no single `==`.

@@ -307,6 +307,10 @@ Why: [evidence](docs/internals/working-rules-evidence.md#table-read).
   every `inventory/reserved/D<lo>-D<hi>.md`, one file per range); new rows start from
   `TEMPLATE.md`. A row needs a known-outcome status line and a `Repro:` label with a block under
   it (`tests/vl_inventory_rows_test.ts`); a parse-stage outcome says `parse error`.
+* **A reservation exists once it is pushed.** `--next` and `--reserve` also skip every row or
+  range a fetched `origin/*` branch adds (naming the branch) and every row filed, reservation or
+  not; an unpushed one is invisible. So `git fetch`, `--reserve`, then commit and push the file
+  before filing any id from it.
 * A defect reachable only under a REFUSED change is filed as a refutation pin, status `runs today
   and must keep running`.
 * Every cited `D<id>` must have a row (`tests/vl_inventory_refs_test.ts`); an id cited before its row

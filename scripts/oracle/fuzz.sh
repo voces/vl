@@ -84,8 +84,8 @@ fi
 # from the language. A ceiling above the default is a debt with a refactor note, to be lowered.
 ceiling() {
   case "$1" in
-    ar) echo 62 ;;  # 2026-11-15-oracle-refused-column.md: constant folds the checker refuses
-    ho) echo 7 ;;   # same note: untriaged
+    ar) echo 6 ;;   # 2026-11-15-oracle-arith-legal.md: refusals left after the constant filter
+    ho) echo 7 ;;   # 2026-11-15-oracle-refused-column.md: untriaged
     *) echo "${REFUSAL_MAX_PCT:-2}" ;;
   esac
 }
