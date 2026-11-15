@@ -13,7 +13,9 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  Index,
   LetDecl,
+  Member,
   NumLit,
   P,
   Param,
@@ -129,7 +131,36 @@ let ibLabelN = 0
 let ibBool = -1
 let ibNoValue = -1
 
-function miss(why: string): Opnd {
+// Whether a value of rep `r` and type `ty` can be a variable, a parameter, a result or an
+// expression here: a scalar, or a reference rep the list builder admits.
+function valueRep(r: i32, ty: i32): boolean {
+  return repIsScalar(r) || irVarRepOkHook(r, ty)
+}
+
+function refRepNone(_r: i32, _ty: i32): boolean { return false }
+
+function indexUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
+  return irBMiss("index hook not installed")
+}
+
+function memberUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
+  return irBMiss("member hook not installed")
+}
+
+// The list builder's hooks (`ir_build_ref.vl`), installed before emit; the defaults leave every
+// reference rep, element read and member read outside the set.
+export let irVarRepOkHook: (r: i32, ty: i32) => boolean = refRepNone
+export let irIndexHook: (b: i32[], ix: i32, rep: i32) => Opnd = indexUnset
+export let irMemberHook: (b: i32[], ix: i32, rep: i32) => Opnd = memberUnset
+
+// The function being built, its declaration, and the rep a statement node carries.
+export function irBFn(): IrFn { return ib }
+
+export function irBFnIx(): i32 { return ibFnIx }
+
+export function irBNoValue(): i32 { return ibNoValue }
+
+export function irBMiss(why: string): Opnd {
   if ibMiss == "" { ibMiss = why }
   const o: Opnd = { ov: -1 }
   return o
@@ -137,17 +168,17 @@ function miss(why: string): Opnd {
 
 // `miss` for a statement, which yields nothing.
 function skip(why: string): i32 {
-  miss(why)
+  irBMiss(why)
   return 0
 }
 
 function missRhs(why: string): Rhs {
-  miss(why)
+  irBMiss(why)
   const r: Rhs = { ggSym: -1 }
   return r
 }
 
-function emitNode(b: i32[], n: IrNode, ty: i32, rep: i32, at: i32) {
+export function irBNode(b: i32[], n: IrNode, ty: i32, rep: i32, at: i32) {
   b.push(irNodeNew(ib, n, ty, rep, at))
   return 0
 }
@@ -164,11 +195,11 @@ function primRepOf(ix: i32): i32 {
   // The tree gives `void` an i32 leaf for the flat kinds; it is no value here.
   const t = nodeTyAt(ix, ibFnIx)
   const r = repNodeOfTy(t)
-  if isVoidTy(t) || !repIsScalar(r) { return -1 }
+  if isVoidTy(t) || !valueRep(r, t) { return -1 }
   return r
 }
 
-function opRep(o: Opnd): i32 {
+export function irBOpRep(o: Opnd): i32 {
   return match o {
     OVar => if o.ov >= 0 && o.ov < ib.irVars.length { ib.irVars[o.ov].vRep } else { -1 }
     OImm => o.oiRep
@@ -177,22 +208,22 @@ function opRep(o: Opnd): i32 {
 }
 
 // A fresh temp of `ix`'s type, defined by `rhs`.
-function letTemp(b: i32[], rhs: Rhs, ix: i32, rep: i32): Opnd {
-  const ty = nodeTyAt(ix, ibFnIx)
-  const v = irVarNew(ib, rep, ty, "temp", -1)
-  emitNode(b, { lDst: v, lRhs: rhs }, ty, rep, ix)
+export function irBLetTemp(b: i32[], rhs: Rhs, ix: i32, rep: i32): Opnd {
+  const ty = nodeTyAt(ix, irBFnIx())
+  const v = irVarNew(irBFn(), rep, ty, "temp", -1)
+  irBNode(b, { lDst: v, lRhs: rhs }, ty, rep, ix)
   const o: Opnd = { ov: v }
   return o
 }
 
 // The variable of local declaration `d` (a `LetDecl` or a `Param`), made on first use.
-function declVar(d: i32): i32 {
+export function irBDeclVar(d: i32): i32 {
   const known = ibDeclVar[d] ?? -1
   if known >= 0 { return known }
   const ty = scopeTyAt(d, ibFnIx)
   const rep = repNodeOfTy(ty)
-  if isVoidTy(ty) || !repIsScalar(rep) {
-    miss("local rep " + repWhat(rep))
+  if isVoidTy(ty) || !valueRep(rep, ty) {
+    irBMiss("local rep " + repWhat(rep))
     return -1
   }
   const s = declaredSlotOfDecl(d)
@@ -226,20 +257,20 @@ function binPrim(op: string, uns: boolean): PrimOp | null {
 
 // `a && b` / `a || b`: a local the two arms of an `if` write.
 function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
-  const l = expr(b, n.binLeft)
-  if ibMiss != "" || opRep(l) != ibBool { return miss("logical operand") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" || irBOpRep(l) != ibBool { return irBMiss("logical operand") }
   const ty = nodeTyAt(ix, ibFnIx)
   const t = irVarNew(ib, rep, ty, "local", -1)
   const rhsBody: i32[] = []
-  const r = expr(rhsBody, n.binRight)
-  if opRep(r) != ibBool { return miss("logical operand") }
-  emitNode(rhsBody, { asDst: t, asSrc: r }, -1, ibNoValue, ix)
+  const r = irBExpr(rhsBody, n.binRight)
+  if irBOpRep(r) != ibBool { return irBMiss("logical operand") }
+  irBNode(rhsBody, { asDst: t, asSrc: r }, -1, irBNoValue(), ix)
   const fixBody: i32[] = []
   const bits: i64 = if n.binOp == "&&" { 0 } else { 1 }
   const fixed: Opnd = { oiRep: ibBool, oiBits: bits }
-  emitNode(fixBody, { asDst: t, asSrc: fixed }, -1, ibNoValue, ix)
+  irBNode(fixBody, { asDst: t, asSrc: fixed }, -1, ibNoValue, ix)
   if n.binOp == "&&" {
-    emitNode(
+    irBNode(
       b,
       { siCond: l, siThen: rhsBody, siElse: fixBody, siOut: t },
       ty,
@@ -247,7 +278,7 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
       ix,
     )
   } else {
-    emitNode(
+    irBNode(
       b,
       { siCond: l, siThen: fixBody, siElse: rhsBody, siOut: t },
       ty,
@@ -272,37 +303,37 @@ function numLit(n: NumLit, rep: i32): Opnd {
     const f: Opnd = { oiRep: rep, oiBits: bits }
     return f
   }
-  if numLexIsFloat(n.numText) { return miss("float literal at an integer") }
+  if numLexIsFloat(n.numText) { return irBMiss("float literal at an integer") }
   const v = memOffsetLexValue(n.numText)
-  if v < 0 || k == "i32" && v > 2147483647 { return miss("wide literal") }
+  if v < 0 || k == "i32" && v > 2147483647 { return irBMiss("wide literal") }
   const o: Opnd = { oiRep: rep, oiBits: v }
   return o
 }
 
 function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   const d = identDeclOf(ix)
-  if d < 0 { return miss("unresolved read") }
+  if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
   if (dn is LetDecl || dn is Param) && localIndexOf(ibFnIx, ix) >= 0 {
-    const v = declVar(d)
-    if v < 0 { return miss("local rep") }
-    if ib.irVars[v].vRep != rep { return miss("narrowed read") }
+    const v = irBDeclVar(d)
+    if v < 0 { return irBMiss("local rep") }
+    if ib.irVars[v].vRep != rep { return irBMiss("narrowed read") }
     const o: Opnd = { ov: v }
     return o
   }
   const g = globalIndexOfSid(sidOfNode(ix))
   if dn is LetDecl && g >= 0 {
-    if globalRep(g, d) != rep { return miss("global read coercion") }
-    return letTemp(b, { ggSym: g }, ix, rep)
+    if globalRep(g, d) != rep { return irBMiss("global read coercion") }
+    return irBLetTemp(b, { ggSym: g }, ix, rep)
   }
-  return miss("read of " + n.identName)
+  return irBMiss("read of " + n.identName)
 }
 
 // The rep of global `g`, declared at `d`, noted in `ib`; -1 when it is no scalar.
 function globalRep(g: i32, d: i32): i32 {
   const ty = scopeTyAt(d, -1)
   const r = repNodeOfTy(ty)
-  if isVoidTy(ty) || !repIsScalar(r) { return -1 }
+  if isVoidTy(ty) || !valueRep(r, ty) { return -1 }
   irGlobalNote(ib, g, r)
   return r
 }
@@ -335,12 +366,15 @@ function calleeSig(pos: i32): boolean {
   if !(fn is FuncDecl) { return false }
   const ps: i32[] = []
   for p in fn.fnParams {
-    const r = repNodeOfTy(scopeTyAt(p, d))
-    if !repIsScalar(r) { return false }
+    const pt = scopeTyAt(p, d)
+    const r = repNodeOfTy(pt)
+    if !valueRep(r, pt) { return false }
     ps.push(r)
   }
   const rr = resultRep(pos, fn.fnRet, d)
-  if !(repIsScalar(rr) || repIsNoValue(rr)) { return false }
+  if !(valueRep(rr, resultTy(pos, fn.fnRet, d)) || repIsNoValue(rr)) {
+    return false
+  }
   irSigNote(ib, pos, ps, rr)
   return true
 }
@@ -368,9 +402,9 @@ function callRhs(b: i32[], c: Call): Rhs {
     }
     let i = 0
     while i < c.callArgs.length {
-      const a = expr(b, c.callArgs[i])
+      const a = irBExpr(b, c.callArgs[i])
       if ibMiss != "" { return missRhs("argument") }
-      if opRep(a) != repNodeOfTy(scopeTyAt(callee.fnParams[i], d)) {
+      if irBOpRep(a) != repNodeOfTy(scopeTyAt(callee.fnParams[i], d)) {
         return missRhs("argument coercion")
       }
       args.push(a)
@@ -408,13 +442,13 @@ function opUnsigned(ix: i32): boolean {
   return ps == "u32" || ps == "u64"
 }
 
-function expr(b: i32[], ix: i32): Opnd {
-  if ibMiss != "" || ix < 0 { return miss("no node") }
+export function irBExpr(b: i32[], ix: i32): Opnd {
+  if ibMiss != "" || ix < 0 { return irBMiss("no node") }
   const n = nodeAt(ix)
-  if n is Paren { return expr(b, n.parInner) }
+  if n is Paren { return irBExpr(b, n.parInner) }
   const rep = primRepOf(ix)
   if rep < 0 {
-    return miss("rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
+    return irBMiss("rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
   }
   if n is NumLit { return numLit(n, rep) }
   if n is BoolLit {
@@ -424,55 +458,57 @@ function expr(b: i32[], ix: i32): Opnd {
   }
   if n is Ident { return identRead(b, n, ix, rep) }
   if n is Unary {
-    if n.unOp != "-" && n.unOp != "!" { return miss("unary " + n.unOp) }
+    if n.unOp != "-" && n.unOp != "!" { return irBMiss("unary " + n.unOp) }
     const uw = operandWhy(n.unArg)
-    if uw != "" { return miss(uw) }
-    const a = expr(b, n.unArg)
+    if uw != "" { return irBMiss(uw) }
+    const a = irBExpr(b, n.unArg)
     if ibMiss != "" { return a }
-    if opRep(a) != rep { return miss("operand coercion") }
+    if irBOpRep(a) != rep { return irBMiss("operand coercion") }
     const op: PrimOp = if n.unOp == "-" { "neg" } else { "not" }
-    return letTemp(b, { poOp: op, poArgs: [a] }, ix, rep)
+    return irBLetTemp(b, { poOp: op, poArgs: [a] }, ix, rep)
   }
   if n is BinExpr {
     if n.binOp == "&&" || n.binOp == "||" { return shortCircuit(b, n, ix, rep) }
     const p = binPrim(n.binOp, opUnsigned(n.binLeft))
-    if p == null || n.binIdent != 0 { return miss("operator " + n.binOp) }
+    if p == null || n.binIdent != 0 { return irBMiss("operator " + n.binOp) }
     const lw = operandWhy(n.binLeft)
-    if lw != "" { return miss(lw) }
+    if lw != "" { return irBMiss(lw) }
     const rw = operandWhy(n.binRight)
-    if rw != "" { return miss(rw) }
-    const l = expr(b, n.binLeft)
-    const r = expr(b, n.binRight)
+    if rw != "" { return irBMiss(rw) }
+    const l = irBExpr(b, n.binLeft)
+    const r = irBExpr(b, n.binRight)
     if ibMiss != "" { return l }
-    if opRep(l) != opRep(r) { return miss("operand coercion") }
-    return letTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
+    if irBOpRep(l) != irBOpRep(r) { return irBMiss("operand coercion") }
+    return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
   }
   if n is Call {
     const rhs = callRhs(b, n)
-    if ibMiss != "" { return miss("call") }
-    return letTemp(b, rhs, ix, rep)
+    if ibMiss != "" { return irBMiss("call") }
+    return irBLetTemp(b, rhs, ix, rep)
   }
-  return miss("expression")
+  if n is Index { return irIndexHook(b, ix, rep) }
+  if n is Member { return irMemberHook(b, ix, rep) }
+  return irBMiss("expression")
 }
 
 function assign(b: i32[], n: BinExpr, ix: i32) {
   const t = nodeAt(n.binLeft)
   if !(t is Ident) { return skip("assignment target") }
   const d = identDeclOf(n.binLeft)
-  const src = expr(b, n.binRight)
+  const src = irBExpr(b, n.binRight)
   if ibMiss != "" { return 0 }
   if d >= 0 && localIndexOf(ibFnIx, n.binLeft) >= 0 {
-    const v = declVar(d)
-    if v < 0 || opRep(src) != ib.irVars[v].vRep {
+    const v = irBDeclVar(d)
+    if v < 0 || irBOpRep(src) != ib.irVars[v].vRep {
       return skip("assignment coercion")
     }
-    emitNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
+    irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
     return 0
   }
   const g = globalIndexOfSid(sidOfNode(n.binLeft))
   if g < 0 || d < 0 { return skip("assignment target") }
-  if globalRep(g, d) != opRep(src) { return skip("global store coercion") }
-  emitNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
+  if globalRep(g, d) != irBOpRep(src) { return skip("global store coercion") }
+  irBNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -493,11 +529,11 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   ibLoopBrk.push(brk)
   ibLoopCont.push(cont)
   const loopBody: i32[] = []
-  const c = expr(loopBody, n.whileCond)
-  if ibMiss == "" && opRep(c) != ibBool { miss("loop condition") }
+  const c = irBExpr(loopBody, n.whileCond)
+  if ibMiss == "" && irBOpRep(c) != ibBool { irBMiss("loop condition") }
   const exit: IrNode = { brLabel: brk, brHas: false, brVal: c }
   const exitBody = [irNodeNew(ib, exit, -1, ibNoValue, ix)]
-  emitNode(
+  irBNode(
     loopBody,
     { siCond: c, siThen: [], siElse: exitBody, siOut: -1 },
     -1,
@@ -510,7 +546,7 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   } else {
     stmt(loopBody, n.whileBody)
   }
-  emitNode(
+  irBNode(
     loopBody,
     { brLabel: cont, brHas: false, brVal: c },
     -1,
@@ -518,11 +554,11 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
     ix,
   )
   const blockBody: i32[] = []
-  emitNode(blockBody, { lpLabel: cont, lpBody: loopBody }, -1, ibNoValue, ix)
+  irBNode(blockBody, { lpLabel: cont, lpBody: loopBody }, -1, ibNoValue, ix)
   ibLoopName.pop()
   ibLoopBrk.pop()
   ibLoopCont.pop()
-  emitNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: -1 }, -1, ibNoValue, ix)
+  irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: -1 }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -561,22 +597,24 @@ function stmtIn(b: i32[], ix: i32) {
     return 0
   }
   if n is LetDecl {
-    const v = declVar(ix)
+    const v = irBDeclVar(ix)
     if v < 0 || n.letInit < 0 { return skip("declaration") }
-    const src = expr(b, n.letInit)
+    const src = irBExpr(b, n.letInit)
     if ibMiss != "" { return 0 }
-    if opRep(src) != ib.irVars[v].vRep { return skip("declaration coercion") }
-    emitNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
+    if irBOpRep(src) != ib.irVars[v].vRep {
+      return skip("declaration coercion")
+    }
+    irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
     return 0
   }
   if n is IfStmt {
-    const c = expr(b, n.ifCond)
-    if ibMiss != "" || opRep(c) != ibBool { return skip("condition") }
+    const c = irBExpr(b, n.ifCond)
+    if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
     const th = nodeAt(n.ifThen)
     const thenB = if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) }
     // An `else if` link is part of its chain's statement: no span of its own.
     const elseB = if n.ifElse >= 0 && nodeAt(n.ifElse) is IfStmt { chainLink(n.ifElse) } else { bodyOf(elseStmts(n.ifElse)) }
-    emitNode(
+    irBNode(
       b,
       { siCond: c, siThen: thenB, siElse: elseB, siOut: -1 },
       -1,
@@ -593,7 +631,7 @@ function stmtIn(b: i32[], ix: i32) {
     const l = loopIx(n.brkLabel)
     if l < 0 || n.brkHasVal != 0 { return skip("break") }
     const z: Opnd = { ov: -1 }
-    emitNode(
+    irBNode(
       b,
       { brLabel: ibLoopBrk[l], brHas: false, brVal: z },
       -1,
@@ -606,7 +644,7 @@ function stmtIn(b: i32[], ix: i32) {
     const l = loopIx(n.contLabel)
     if l < 0 { return skip("continue") }
     const z: Opnd = { ov: -1 }
-    emitNode(
+    irBNode(
       b,
       { brLabel: ibLoopCont[l], brHas: false, brVal: z },
       -1,
@@ -620,15 +658,15 @@ function stmtIn(b: i32[], ix: i32) {
     if n.retArg < 0 {
       if !none { return skip("bare return") }
       const z: Opnd = { ov: -1 }
-      emitNode(b, { rtHas: false, rtV: z }, -1, ibNoValue, ix)
+      irBNode(b, { rtHas: false, rtV: z }, -1, ibNoValue, ix)
       return 0
     }
     if none { return skip("void return value") }
-    const v = expr(b, n.retArg)
-    if ibMiss != "" || opRep(v) != ib.irRetRep {
+    const v = irBExpr(b, n.retArg)
+    if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
       return skip("return coercion")
     }
-    emitNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, ix)
+    irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, ix)
     return 0
   }
   if n is BinExpr && n.binOp == "=" {
@@ -638,7 +676,7 @@ function stmtIn(b: i32[], ix: i32) {
   if n is Call {
     const rhs = callRhs(b, n)
     if ibMiss != "" { return 0 }
-    emitNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
+    irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
     return 0
   }
   if (
@@ -650,9 +688,9 @@ function stmtIn(b: i32[], ix: i32) {
     || n is BinExpr
   ) {
     // Legacy evaluates a bare value and drops it.
-    const v = expr(b, ix)
+    const v = irBExpr(b, ix)
     if ibMiss != "" { return 0 }
-    emitNode(b, { dpV: v }, -1, ibNoValue, ix)
+    irBNode(b, { dpV: v }, -1, ibNoValue, ix)
     return 0
   }
   skip("statement")
@@ -676,9 +714,9 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     return 0
   }
   const n0 = b.length
-  const v = expr(b, last)
-  if ibMiss != "" || opRep(v) != ib.irRetRep { return skip("tail coercion") }
-  emitNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
+  const v = irBExpr(b, last)
+  if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
+  irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])
   return 0
 }
@@ -700,7 +738,7 @@ function build(fnIx: i32, fnPos: i32): string {
   ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
   ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
   const none = repIsNoValue(ib.irRetRep)
-  if !(repIsScalar(ib.irRetRep) || none) {
+  if !(valueRep(ib.irRetRep, ib.irRetTy) || none) {
     return "result rep " + repWhat(ib.irRetRep)
   }
   ibNoValue = if none { ib.irRetRep } else { -1 }
@@ -710,7 +748,7 @@ function build(fnIx: i32, fnPos: i32): string {
     const p = fn.fnParams[i]
     const ty = scopeTyAt(p, fnIx)
     const r = repNodeOfTy(ty)
-    if isVoidTy(ty) || !repIsScalar(r) { return "parameter rep " + repWhat(r) }
+    if isVoidTy(ty) || !valueRep(r, ty) { return "parameter rep " + repWhat(r) }
     const v = irVarNew(ib, r, ty, "param", shift + i)
     ibDeclVar[p] = v
     ib.irParams.push(v)
