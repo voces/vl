@@ -141,7 +141,7 @@ import {
   covarWriteThrough,
 } from "./check_covar_write"
 import { cstrOwnerTop } from "./check_cstr_rows"
-import { curFnDeclIx, inferQuiet, quietDepth, tpEnvNames } from "./check_cursor"
+import { curFnDeclIx, inferQuiet, tpEnvNames } from "./check_cursor"
 import { wsNoteSlotAt } from "./check_width"
 import {
   coerceRecordOpen,
@@ -193,13 +193,11 @@ import {
   constBindsLitSet,
   containerCopyGapWhy,
   ctorExprOf,
-  f32JoinRetypesRunning,
   irwExprs,
   irwMarks,
   irwTys,
   keyStepTag,
   listMutableTwin,
-  matchInRetTail,
   njApartRet,
   njApartRetSet,
   njApartSet,
@@ -269,10 +267,11 @@ import {
 } from "./check_node_tys"
 import {
   f32LitTailsAdopt,
-  floatLitTails,
+  litTailsTakeFloat,
   litTreeAdoptDst,
   numLitAdoptDeep,
   numLitAdoptDst,
+  numLitAdoptTails,
   numPairOpTy,
   tailParensSync,
   valueJoinAt,
@@ -300,6 +299,7 @@ import {
   cexShown,
   dstIntWidth,
   intLitIsNegated,
+  numLitOwnTy,
   radixLeafAmong,
 } from "./check_num_lits"
 import { objFieldWidthPair, objWidthPrefix } from "./check_obj_shape"
@@ -386,7 +386,7 @@ import {
   joinArmFits,
   joinArmLit,
   joinArmTail,
-  joinF32LitTails,
+  joinFloatLitTails,
   joinRetTys,
   joinTys,
   keepListStorage,
@@ -683,18 +683,13 @@ export function constrainEmptyExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
 
 // The inferred return `observed` of the body whose witness frame is on top, re-typed f32 when
 // some witness is an f32 value and every other is a float literal, as an
-// `if` join does (`joinF32LitTails`). Retires the frame whether or not it re-types.
+// `if` join does (`joinFloatLitTails`). Retires the frame whether or not it re-types.
 export function inferRetF32Join(inferring: boolean, observed: i32): i32 {
   if irwMarks.length == 0 { return observed }
   const mark = irwMarks[irwMarks.length - 1]
   irwMarks.pop()
   let res = observed
-  if (
-    inferring
-    && observed >= 0
-    && primNameOf(observed) != "f32"
-    && f32JoinRetypesRunning()
-  ) {
+  if (inferring && observed >= 0 && primNameOf(observed) != "f32") {
     const fTy = inferRetF32Of(mark)
     if fTy >= 0 { res = fTy }
   }
@@ -719,40 +714,58 @@ function inferRetF32Of(mark: i32): i32 {
     }
     i = i + 1
   }
-  f32LitJoinOf(es, ts)
+  floatLitJoinOf(es, ts)
 }
 
-// The f32 type a join of the values `exprs`, typed `tys`, takes when some are f32 values and
-// every other is a float literal or a join of them (`floatLitTails`); else -1. The
-// literals' `if` and `match` nodes are re-typed f32 only when the whole join qualifies.
-export function f32LitJoinOf(exprs: i32[], tys: i32[]): i32 {
-  // The common join has no f32 member; it is answered by type tests alone.
-  let j = 0
-  while j < tys.length && primNameOf(tys[j]) != "f32" { j = j + 1 }
-  if j == tys.length { return -1 }
+// The float type a join of the values `exprs`, typed `tys`, takes when every value not a literal
+// is of that one `f32` or `f64` type and every literal, or join of them, is one it takes
+// (`litTailsTakeFloat`); else -1. The literals are re-typed only when the whole join qualifies.
+export function floatLitJoinOf(exprs: i32[], tys: i32[]): i32 {
   let fTy = -1
   let lits = 0
-  const savedQuiet = inferQuiet
-  inferQuiet = true
-  quietDepth = quietDepth + 1
   let i = 0
-  while i < exprs.length && lits >= 0 {
-    if primNameOf(tys[i]) == "f32" { fTy = joinTys(fTy, tys[i]) }
-    else if floatLitTails(exprs[i]) { lits = lits + 1 }
-    else { lits = -1 }
+  while i < exprs.length {
+    if !numLitTailsOnly(exprs[i]) {
+      const pn = primNameOf(tys[i])
+      if pn != "f32" && pn != "f64" { return -1 }
+      if fTy >= 0 && !tySame(fTy, tys[i]) { return -1 }
+      fTy = tys[i]
+    }
     i = i + 1
   }
-  inferQuiet = savedQuiet
-  quietDepth = quietDepth - 1
-  if lits <= 0 || fTy < 0 || primNameOf(fTy) != "f32" { return -1 }
+  if fTy < 0 { return -1 }
+  let k = 0
+  while k < exprs.length {
+    if numLitTailsOnly(exprs[k]) {
+      if !litTailsTakeFloat(exprs[k], fTy) { return -1 }
+      lits = lits + 1
+    }
+    k = k + 1
+  }
+  if lits == 0 { return -1 }
   if !inferQuiet {
-    let k = 0
-    while k < exprs.length {
-      if primNameOf(tys[k]) != "f32" { f32LitTailsAdopt(exprs[k], TY_F32) }
-      k = k + 1
+    for e in exprs {
+      if numLitTailsOnly(e) {
+        if primNameOf(fTy) == "f32" {
+          f32LitTailsAdopt(e, TY_F32)
+        } else {
+          numLitAdoptTails(e, fTy)
+        }
+      }
     }
   }
   fTy
+}
+
+// Whether the value at `ix` is a numeric literal, or a value `if`, `match` or block every tail of
+// which is one.
+function numLitTailsOnly(ix: i32): boolean {
+  if numLitOwnTy(ix) >= 0 { return true }
+  if valueJoinAt(ix) < 0 { return false }
+  for lf in valueTailLeaves(ix) {
+    if numLitOwnTy(lf) < 0 { return false }
+  }
+  true
 }
 
 export function cellTagsMayAlias(a: string, b: string): boolean {
@@ -1406,13 +1419,11 @@ function radixLitAdoptTails(src: i32, dstTy: i32) {
 
 // The f32 a value `match` at `ix` typed `matchTy` takes when its arms are an f32 value and
 // literals, as an `if` does, else -1, with any inner join re-typed f32 handed back `matchTy`.
-export function matchF32Join(ix: i32, matchTy: i32): i32 {
+export function matchFloatJoin(ix: i32, matchTy: i32): i32 {
   if ix < 0 || matchTy < 0 { return -1 }
   let j = -1
-  if primNameOf(matchTy) == "f64" {
-    if !valDiscarded(ix) && (!matchInRetTail || f32JoinRetypesRunning()) {
-      j = joinF32LitTails(ix)
-    }
+  if primNameOf(matchTy) == "f64" || tyAt(matchTy) is TyUnion {
+    if !valDiscarded(ix) { j = joinFloatLitTails(ix) }
   }
   if j < 0 { f32JoinRevert(ix) }
   j
@@ -3610,7 +3621,7 @@ export function recStoresAgree(md: i32) {
 export function litBoxesAtDst(x: i32, dst: i32, depth: i32) {
   const n = if x >= 0 { nodeAt(x) } else { null }
   const d = nonNullTy(dst)
-  const dn = if d >= 0 && d < T.tys.length { T.tys[d] } else { null }
+  const dn = if d >= 0 && d < T.tys.length { tyAt(d) } else { null }
   if depth <= 0 { return 0 }
   if n is ArrayLit && dn is TyArray {
     for el in n.arrElems {
@@ -3625,7 +3636,7 @@ export function litBoxesAtDst(x: i32, dst: i32, depth: i32) {
 // literal is built at, into nested literals up to `depth`.
 function litFieldsBoxAt(lit: i32, st: i32, depth: i32) {
   const n = if lit >= 0 { nodeAt(lit) } else { null }
-  const so = if st >= 0 && st < T.tys.length { T.tys[st] } else { null }
+  const so = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
   if depth <= 0 || !(n is ObjLit) || !(so is TyObj) { return 0 }
   for fi in n.objFields {
     const f = nodeAt(fi)
@@ -8727,7 +8738,7 @@ function setCtorKeyNote(ix: i32, key: i32): i32 {
     return 0
   }
   const own = nodeTyIxOf(ix)
-  const ot = if own >= 0 && own < T.tys.length { T.tys[own] } else { null }
+  const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
   if ot is TyMap && (tyKeyOpen(ot) || tyAt(tyKeyOf(ot)) is TyVar) {
     setCtorKeys[ix] = key
   }
@@ -9266,7 +9277,7 @@ function numBoxStamp(ix: i32, t: i32): i32 {
 // Whether `t` is a union or a nullable type: a destination a value may be boxed into.
 function tyIsUnionDst(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
-  const d = T.tys[t]
+  const d = tyAt(t)
   d is TyUnion || d is TyNullable
 }
 

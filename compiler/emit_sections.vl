@@ -26,6 +26,7 @@ import { mfrLitsRun } from "./mfr_shadow"
 // model, per-function code emission, the opt-in name section). Sits above `wasmEmit.vl`, calling down into it for every statement/expression body.
 
 import { idShadowInstRow, idShadowSnap } from "./emit_id_shadow"
+import { canonShadowReport } from "./emit_ty_seal"
 import { elabFnIdReset, elabSpecGroupRow, elabSpecReset } from "./elab_fn_id"
 import { idShadowModeOf } from "./id_shadow_state"
 import { lamChainSnap } from "./check_lam_chain"
@@ -214,6 +215,7 @@ import {
   AS_FAIL_DOMS,
   ByteChunk,
   ByteRope,
+  HELP_LIST_GROW,
   HELP_MAP_COMPACT,
   HELP_MAP_PROBE,
   HELP_MAP_PROBE_I32,
@@ -390,6 +392,8 @@ import {
   gFoldPool,
   gFsIdx,
   gFsUse,
+  gGrowATy,
+  gGrowLTy,
   gHeapBase,
   gHeapGlobalIdx,
   gHeapLimit,
@@ -483,6 +487,7 @@ import {
   globalIndexBySid,
   globalStmtOrd,
   globalStmts,
+  growRowsReset,
   helpStrEqFn,
   helpUtf8DecFn,
   ia64Ty,
@@ -686,6 +691,7 @@ import {
   ropePush,
   ropeReset,
   wBytes,
+  wFuncTypeTag,
   wIsOneScalarConst,
   wLen,
   wName,
@@ -697,6 +703,8 @@ import {
   wTarget,
   wU8,
   wULEB,
+  wValI32,
+  wValRef,
 } from "./emit_bytes"
 import {
   RELOC_ARMED,
@@ -4297,6 +4305,63 @@ function mapCompactFuncType(sh: i32) {
   0
 }
 
+// `__grow_<row>__`'s functype: the list, as `(ref null $wrapper)`, and no result.
+function listGrowFuncType(row: i32) {
+  wFuncTypeTag()
+  wULEB(1)
+  wValRef(gGrowLTy[row], true)
+  wULEB(0)
+  0
+}
+
+// The body of `__grow_<row>__(L)`: the backing a `push` at full capacity replaces, 4 slots when
+// it has none and twice its capacity otherwise, with the live prefix copied over. The append
+// itself stays at the site (`emitPushAppend`).
+function emitListGrowFnCode(out: u8[], row: i32) {
+  const lTy = gGrowLTy[row]
+  const aTy = gGrowATy[row]
+  const body: u8[] = []
+  const prev = wTarget(body)
+  // locals: 1 the new capacity, 2 the new backing
+  wULEB(2)
+  wULEB(1)
+  wValI32()
+  wULEB(1)
+  wValRef(aTy, false)
+  fbLocalGet(0)
+  fbStructGet(lTy, 2)
+  fbI32Eqz()
+  fbIf(127)
+  fbI32Const(4)
+  fbElse()
+  fbLocalGet(0)
+  fbStructGet(lTy, 2)
+  fbI32Const(2)
+  fbI32Bin(108) // 0x6c i32.mul
+  fbEnd()
+  fbLocalSet(1)
+  fbLocalGet(1)
+  fbArrayNewDefault(aTy)
+  fbLocalSet(2)
+  fbLocalGet(2)
+  fbI32Const(0)
+  fbLocalGet(0)
+  fbStructGet(lTy, 0)
+  fbI32Const(0)
+  fbLocalGet(0)
+  fbStructGet(lTy, 1)
+  fbArrayCopy(aTy, aTy)
+  fbLocalGet(0)
+  fbLocalGet(2)
+  fbStructSet(lTy, 0)
+  fbLocalGet(0)
+  fbLocalGet(1)
+  fbStructSet(lTy, 2)
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // The type indices `__map_compact__` reads for one map shape: the map, its key kind, the keys'
 // and values' list wrappers and backing arrays, and the value element's heap type when a
 // vacated value slot is cleared to null (-1 for a numeric value).
@@ -5774,6 +5839,9 @@ function tailHelpFnCode(out: u8[], kind: i32): i32 {
   if kind == HELP_MAP_PROBE_I32 { return emitMapProbeI32FnCode(out) }
   if kind == HELP_MAP_RESIZE_I32 { return emitMapResizeI32FnCode(out) }
   if kind == HELP_MAP_PROBE_I64 { return emitMapProbeI64FnCode(out) }
+  if kind >= HELP_LIST_GROW {
+    return emitListGrowFnCode(out, kind - HELP_LIST_GROW)
+  }
   emitMapCompactFnCode(out, mapCompactRowShape(kind - HELP_MAP_COMPACT))
 }
 
@@ -5792,6 +5860,9 @@ function tailHelpName(kind: i32): string {
   if kind == HELP_MAP_PROBE_I32 { return "__map_probe_i32__" }
   if kind == HELP_MAP_RESIZE_I32 { return "__map_resize_i32__" }
   if kind == HELP_MAP_PROBE_I64 { return "__map_probe_i64__" }
+  if kind >= HELP_LIST_GROW {
+    return "__grow_" + i32ToStr(kind - HELP_LIST_GROW) + "__"
+  }
   "__map_compact_" + i32ToStr(kind - HELP_MAP_COMPACT) + "__"
 }
 
@@ -6607,6 +6678,7 @@ function assignSharedHelperIndices(helpBase: i32) {
   gMapSetTyRows = []
   gMapSetFn = []
   gTailFnRows = []
+  growRowsReset()
   gTailHelpTyN = 0
   gMapSetTyN = 0
   gMapSetTyBase = 0
@@ -7800,6 +7872,7 @@ export function emitProgram(rootIx: i32) {
   const d0 = T.diags.length
   const rc = emitProgramRun(rootIx)
   while T.diags.length > d0 { T.diags.pop() }
+  canonShadowReport()
   rc
 }
 
@@ -9139,6 +9212,7 @@ function tailHelpFuncType(kind: i32) {
   if kind == HELP_MAP_PROBE_I32 { return helpFuncType("ai", "i") }
   if kind == HELP_MAP_RESIZE_I32 { return helpFuncType("ai", "a") }
   if kind == HELP_MAP_PROBE_I64 { return helpFuncType("ajk", "i") }
+  if kind >= HELP_LIST_GROW { return listGrowFuncType(kind - HELP_LIST_GROW) }
   mapCompactFuncType(mapCompactRowShape(kind - HELP_MAP_COMPACT))
 }
 

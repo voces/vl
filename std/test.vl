@@ -236,9 +236,9 @@ function vltLocStr(loc: CallerLoc) {
 }
 
 // Assemble the failure message from already-rendered strings and abort.
-// `kind`: 0 = toEqual, 1 = toBeTrue, 2 = toBeFalse, 3 = toBeCloseTo. THE LOCATION LINE IS LAST
-// AND NOTHING MAY BE APPENDED AFTER IT — the editor reads the last match, so a
-// line added here silently re-anchors every failure. Add it BEFORE the location.
+// `kind`: 0 = toEqual, 1 = toBeTrue, 2 = toBeFalse, 3 = toBeCloseTo, 4 = toBeNear.
+// THE LOCATION LINE IS LAST AND NOTHING MAY BE APPENDED AFTER IT — the editor reads the last
+// match, so a line added here silently re-anchors every failure. Add it BEFORE the location.
 function vltFail(
   shownA: string,
   negated: boolean,
@@ -250,6 +250,7 @@ function vltFail(
   if kind == 0 { tail = "equal " + shownE }
   if kind == 2 { tail = "be false" }
   if kind == 3 { tail = "be close to " + shownE }
+  if kind == 4 { tail = "be near " + shownE }
   let sense = "to "
   if negated { sense = "not to " }
   let msg = "expected " + shownA + " " + sense + tail
@@ -275,26 +276,29 @@ export function toEqual<T>(
   vltDone()
 }
 
-// The numeric receiver is within half a unit in the `digits`-th decimal place
-// of `expected`, as jest's: `|actual - expected| < 10^-digits / 2`, so the
-// default 2 accepts a difference under 0.005. Equal infinities are close; NaN
-// and a non-numeric receiver are close to nothing, so both fail at run time.
+// The receiver as an `f64`, or null when it is not a number.
+function vltNumOf<T>(v: T): f64 | null {
+  if v is f64 { return v }
+  if v is i32 { return v as f64 }
+  if v is i64 { return v as f64 }
+  if v is f32 { return v as f64 }
+  null
+}
+
+// The numeric receiver is within half a unit in the `digits`-th decimal place of `expected`, as
+// jest's: `|actual - expected| < 10^-digits / 2`; the default 2 accepts under 0.005. `digits`
+// counts decimal places; for an absolute tolerance use `toBeNear`. NaN and a non-numeric
+// receiver fail; equal infinities are close; an i64 is compared after rounding to f64.
 export function toBeCloseTo<T>(
   self: Expectation<T>,
   expected: f64,
   digits: i32 = 2,
   caller: CallerLoc = __callsite__,
 ) {
-  const v = self.actual
-  let a = 0.0
+  const n = vltNumOf(self.actual)
   let ok = false
-  let numeric = true
-  if v is f64 { a = v }
-  else if v is i32 { a = v as f64 }
-  else if v is i64 { a = v as f64 }
-  else if v is f32 { a = v as f64 }
-  else { numeric = false }
-  if numeric {
+  if n != null {
+    const a = n
     let tol = 0.5
     let k = 0
     while k < digits && k < 400 {
@@ -313,9 +317,42 @@ export function toBeCloseTo<T>(
   if self.negated { bad = ok }
   if bad {
     let shownA = self.shown
-    if numeric { shownA = toString(a) }
+    if n != null { shownA = toString(n) }
     const within = " to " + vltI64Str(digits as! i64) + " digits"
     vltFail(shownA, self.negated, 3, toString(expected) + within, caller)
+  }
+  vltDone()
+}
+
+// The numeric receiver differs from `expected` by at most `tolerance`, compared in f64 (so `1.1`
+// is not near `1.0` within `0.1`; the failure prints the difference). A tolerance around one value,
+// not a range: `toBeNear(0.0, 10.0)` accepts -5. NaN, a non-numeric receiver and a negative or
+// NaN tolerance fail; equal infinities pass; an i64 is compared after rounding to f64.
+export function toBeNear<T>(
+  self: Expectation<T>,
+  expected: f64,
+  tolerance: f64,
+  caller: CallerLoc = __callsite__,
+) {
+  const n = vltNumOf(self.actual)
+  let ok = false
+  let shownD = ""
+  if n != null {
+    let diff = n - expected
+    if diff < 0.0 { diff = 0.0 - diff }
+    ok = tolerance >= 0.0 && (n == expected || diff <= tolerance)
+    shownD = " (differs by " + toString(diff) + ")"
+  }
+  let bad = !ok
+  if self.negated { bad = ok }
+  if bad {
+    let shownA = self.shown
+    if n != null { shownA = toString(n) }
+    const shownE = toString(expected)
+      + " within "
+      + toString(tolerance)
+      + shownD
+    vltFail(shownA, self.negated, 4, shownE, caller)
   }
   vltDone()
 }
