@@ -247,9 +247,9 @@ for (const flags of [[], ["-O"], ["-O3"], ["--names"], ["-O3", "--names"]]) {
         }
         const frame = topFrame(await trapTrace(wasm, "pick", 7));
         const got = await addr2line(wasm, frame);
-        expectLine(got, `${DIR}/pick.vl:5:7`, `${frame}`);
+        expectLine(got, `${DIR}/pick.vl:5:14`, `${frame}`);
         // An unnamed function gets no label (see the imports case).
-        const want = flags.includes("--names") ? "  in `pick`" : "5:7";
+        const want = flags.includes("--names") ? "  in `pick`" : "5:14";
         if (!got.endsWith(want)) {
           throw new Error(`want the answer to end \`${want}\`, got \`${got}\``);
         }
@@ -281,7 +281,7 @@ Deno.test({
             : `  s = (s * ${n % 7 + 2} + ${n}) % 1000003`,
         );
       }
-      lines.push("  s", "}");
+      lines.push("  return s", "}");
       Deno.writeTextFileSync(`${tmp}/big.vl`, lines.join("\n") + "\n");
       const wasm = `${tmp}/big.wasm`;
       await build(`${tmp}/big.vl`, wasm, ["-O3", "--names", "--source-map"]);
@@ -320,7 +320,7 @@ Deno.test({
         throw new Error(`want \`grab\` inlined into \`outer\`:\n${trace}`);
       }
       const got = await addr2line(wasm, topFrame(trace));
-      expectLine(got, `${DIR}/inline/helper.vl:6:3`, "inlined callee");
+      expectLine(got, `${DIR}/inline/helper.vl:6:10`, "inlined callee");
       if (!/in `outer\$m\d+`$/.test(got)) {
         throw new Error(`want the caller's frame named, got \`${got}\``);
       }
@@ -344,7 +344,7 @@ Deno.test({
       const marks = r.out.split("\n").filter((l) => l.startsWith("    => "))
         .map((l) => l.replace(/\$m\d+/g, () => "$m<id>"));
       const want = [
-        "    => " + `${DIR}/inline/helper.vl:6:3` + "  in `grab$m<id>`",
+        "    => " + `${DIR}/inline/helper.vl:6:10` + "  in `grab$m<id>`",
         "    => " + `${DIR}/inline/main.vl:5:3` + "  in `outer$m<id>`",
       ];
       if (r.code !== 0 || JSON.stringify(marks) !== JSON.stringify(want)) {
@@ -463,9 +463,9 @@ Deno.test({
       // V8 13.6 (Node 24) counts imported functions in `wasm-function[i]` and V8 15 (Deno
       // 2.9) does not, so any index addr2line printed would be wrong under one of them.
       const got = await addr2line(wasm, frame);
-      if (got !== `${DIR}/imports.vl:4:3`) {
+      if (got !== `${DIR}/imports.vl:4:10`) {
         throw new Error(
-          `want \`${DIR}/imports.vl:4:3\` and no label, got \`${got}\``,
+          `want \`${DIR}/imports.vl:4:10\` and no label, got \`${got}\``,
         );
       }
     } finally {
@@ -487,7 +487,7 @@ Deno.test({
       const frame = topFrame(await trapTrace(wasm, "pick", 7));
       expectLine(
         await addr2line(wasm, frame),
-        `${tmp}/pick.vl:5:7`,
+        `${tmp}/pick.vl:5:14`,
         "vl-src fallback",
       );
       const p = new Deno.Command(VL, {
@@ -502,7 +502,7 @@ Deno.test({
       await w.close();
       const r = await p.output();
       const out = new TextDecoder().decode(r.stdout);
-      if (r.code !== 0 || !out.includes(`=> ${tmp}/pick.vl:5:7`)) {
+      if (r.code !== 0 || !out.includes(`=> ${tmp}/pick.vl:5:14`)) {
         throw new Error(`non-UTF-8 stdin: rc ${r.code}, got:\n${out}`);
       }
     } finally {

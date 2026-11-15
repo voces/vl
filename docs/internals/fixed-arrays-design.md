@@ -1428,7 +1428,7 @@ export function bench(n: i32): f64 {
   }
   let t = s
   for k in 0 until 16 { t = t + g.pose[k] }
-  t
+  return t
 }
 ```
 
