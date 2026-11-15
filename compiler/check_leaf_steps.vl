@@ -262,6 +262,8 @@ import {
   tyAt,
   tyBearsNull,
   tyDenotesObj,
+  tyElemOf,
+  tyElemOpen,
   tyEq,
   tyEqSameHoles,
   tyHasHole,
@@ -270,6 +272,8 @@ import {
   tyIsLitUnion,
   tyIsNullableLitUnion,
   tyIsOneStrLit,
+  tyKeyOf,
+  tyKeyOpen,
   tyMapValIsLitUnion,
   tyPinElem,
   tyPinKey,
@@ -278,6 +282,8 @@ import {
   tyReachesEmptyHole,
   tySame,
   tyToStr,
+  tyValOf,
+  tyValOpen,
 } from "./check_types"
 import {
   tailPushBlockTail,
@@ -394,8 +400,8 @@ export function unresolvedHole(ty: i32) {
   if ty < 0 { return false }
   const t = tyAt(ty)
   match t {
-    TyArray => t.aElem < 0
-    TyMap => t.mKey < 0 || t.mVal < 0
+    TyArray => tyElemOpen(t)
+    TyMap => tyKeyOpen(t) || tyValOpen(t)
     // Every other row holds no collection hole of its own.
     TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => false
   }
@@ -448,13 +454,13 @@ function openFit(m: i32, g: i32, depth: i32): i32 {
     if a is TyMap && b is TyMap && a.mSet == b.mSet { return 1 }
   }
   if a is TyArray && b is TyArray {
-    if a.aElem < 0 { return 1 }
-    return openFit(a.aElem, b.aElem, depth - 1)
+    if tyElemOpen(a) { return 1 }
+    return openFit(tyElemOf(a), tyElemOf(b), depth - 1)
   }
   if a is TyMap && b is TyMap {
     if a.mSet != b.mSet { return -1 }
-    const k = if a.mKey < 0 { 1 } else if tyEq(a.mKey, b.mKey) { 0 } else { -1 }
-    const v = if a.mVal < 0 { 1 } else { openFit(a.mVal, b.mVal, depth - 1) }
+    const k = if tyKeyOpen(a) { 1 } else if tyEq(tyKeyOf(a), tyKeyOf(b)) { 0 } else { -1 }
+    const v = if tyValOpen(a) { 1 } else { openFit(tyValOf(a), tyValOf(b), depth - 1) }
     if k < 0 || v < 0 { return -1 }
     return if k == 1 || v == 1 { 1 } else { 0 }
   }
@@ -479,8 +485,8 @@ function openRowsAt(ty: i32, out: i32[], depth: i32) {
       for m in t.uMembers { openRowsAt(m, out, depth - 1) }
       0
     }
-    TyArray => openRowsAt(t.aElem, out, depth - 1)
-    TyMap => openRowsAt(t.mVal, out, depth - 1)
+    TyArray => openRowsAt(tyElemOf(t), out, depth - 1)
+    TyMap => openRowsAt(tyValOf(t), out, depth - 1)
     // A record's fields, a function's result and a scalar are no union member's collection.
     TyPrim | TyErr | TyObj | TyFunc | TyVar | TyLit | TyNeg => 0
   }
@@ -508,11 +514,11 @@ export function recOpenHolePath(ty: i32, depth: i32, at: i32[]): string {
       ""
     }
     TyArray => {
-      if tyIsOpenHole(t.aElem) {
-        at[0] = t.aElem
+      if tyIsOpenHole(tyElemOf(t)) {
+        at[0] = tyElemOf(t)
         return "[i]"
       }
-      const sub = recOpenHolePath(t.aElem, depth - 1, at)
+      const sub = recOpenHolePath(tyElemOf(t), depth - 1, at)
       if sub != "" { return "[i]" + sub }
       ""
     }
@@ -533,7 +539,7 @@ function tyIsOpenHole(ty: i32): boolean {
 function tyIsOpenMap(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const f = tyAt(ty)
-  f is TyMap && (f.mKey < 0 || f.mVal < 0)
+  f is TyMap && (tyKeyOpen(f) || tyValOpen(f))
 }
 
 // What a binding's container at a path, the open container `m`, needs: its types, spelled at
@@ -614,12 +620,12 @@ function linkPinMapFrom(s: TyMap, dst: i32): boolean {
   const d = tyAt(dst)
   if !(d is TyMap) { return false }
   let moved = false
-  if s.mKey >= 0 && d.mKey < 0 {
-    tyPinKey(d, s.mKey)
+  if !tyKeyOpen(s) && tyKeyOpen(d) {
+    tyPinKey(d, tyKeyOf(s))
     moved = true
   }
-  if s.mVal >= 0 && d.mVal < 0 {
-    tyPinVal(d, s.mVal)
+  if !tyValOpen(s) && tyValOpen(d) {
+    tyPinVal(d, tyValOf(s))
     moved = true
   }
   moved
@@ -627,11 +633,11 @@ function linkPinMapFrom(s: TyMap, dst: i32): boolean {
 
 // `holeLinkPinFrom` for a list `s`: its closed element fills `dst`'s open one.
 function linkPinListFrom(s: TyArray, dst: i32): boolean {
-  if s.aElem < 0 { return false }
+  if tyElemOpen(s) { return false }
   const d = tyAt(dst)
   if !(d is TyArray) { return false }
-  if d.aElem >= 0 { return false }
-  tyPinElem(d, s.aElem)
+  if !tyElemOpen(d) { return false }
+  tyPinElem(d, tyElemOf(s))
   true
 }
 
@@ -795,10 +801,10 @@ function narEveryInner(d: i32, n: i32, of: i32): i32 {
   const da = tyAt(d)
   const na = tyAt(n)
   const o = tyAt(of)
-  if da is TyArray && na is TyArray && o is TyArray { return o.aElem }
+  if da is TyArray && na is TyArray && o is TyArray { return tyElemOf(o) }
   if da is TyMap && na is TyMap && o is TyMap {
-    if da.mSet == 0 && na.mSet == 0 && tySame(da.mKey, na.mKey) {
-      return o.mVal
+    if da.mSet == 0 && na.mSet == 0 && tySame(tyKeyOf(da), tyKeyOf(na)) {
+      return tyValOf(o)
     }
   }
   narEveryNone(d, n)
@@ -918,7 +924,7 @@ export function cbPendForLoop(loopIx: i32) {
   const lt = placeDeclListTy(n.fiIter)
   if lt < 0 { return 0 }
   const la = tyAt(lt)
-  if !(la is TyArray) || la.aElem < 0 { return 0 }
+  if !(la is TyArray) || tyElemOpen(la) { return 0 }
   const bound: string[] = []
   fnBoundNames(loopIx, bound)
   let seen = 0
@@ -927,7 +933,7 @@ export function cbPendForLoop(loopIx: i32) {
   }
   if seen != 1 { return 0 }
   cbPendNames.push(n.fiVar)
-  cbPendTys.push(la.aElem)
+  cbPendTys.push(tyElemOf(la))
   cbPendCollect(n.fiBody, bound)
   0
 }
@@ -947,8 +953,8 @@ function placeDeclListTy(ix: i32): i32 {
   const inner = placeDeclListTy(n.idxArr)
   if inner < 0 { return -1 }
   const it = tyAt(inner)
-  if !(it is TyArray) || it.aElem < 0 { return -1 }
-  nonNullTy(it.aElem)
+  if !(it is TyArray) || tyElemOpen(it) { return -1 }
+  nonNullTy(tyElemOf(it))
 }
 
 // Whether the expression at `exprIx` (peeled through parens) is a `match` — the void-typed
@@ -1031,8 +1037,8 @@ export function pushElemReadFact(
     const na = tyAt(n)
     if da is TyArray && na is TyArray {
       depth = depth + 1
-      d = da.aElem
-      n = na.aElem
+      d = tyElemOf(da)
+      n = tyElemOf(na)
     }
   }
   if d < 0 || n < 0 || tySame(d, n) { return 0 }
@@ -1287,7 +1293,7 @@ export function noteLitElemCstrs(srcExpr: i32, dstTy: i32, depth: i32) {
     if d is TyArray {
       let i = 0
       while i < e.arrElems.length {
-        noteLitElemCstrs(e.arrElems[i], d.aElem, depth - 1)
+        noteLitElemCstrs(e.arrElems[i], tyElemOf(d), depth - 1)
         i = i + 1
       }
     }
@@ -1323,13 +1329,13 @@ export function arrLitJoinUnionElem(srcExpr: i32, dtix: i32): boolean {
   if st < 0 { return false }
   const s = tyAt(st)
   if !(s is TyArray) { return false }
-  if s.aElem < 0 { return false }
-  const se = tyAt(s.aElem)
+  if tyElemOpen(s) { return false }
+  const se = tyAt(tyElemOf(s))
   if !(se is TyUnion) { return false }
   const d = tyAt(dtix)
   if !(d is TyArray) { return false }
-  if d.aElem < 0 { return false }
-  const de = tyAt(d.aElem)
+  if tyElemOpen(d) { return false }
+  const de = tyAt(tyElemOf(d))
   if de is TyUnion { return false }
   true
 }
@@ -1343,13 +1349,13 @@ export function arrLitSoftenedUnionElem(srcExpr: i32, dtix: i32): boolean {
   const st = nodeTyIxOf(srcExpr)
   if st < 0 || st == dtix { return false }
   const d = tyAt(dtix)
-  if !(d is TyArray) || d.aElem < 0 { return false }
-  const de = tyAt(d.aElem)
+  if !(d is TyArray) || tyElemOpen(d) { return false }
+  const de = tyAt(tyElemOf(d))
   if de is TyUnion {
     for m in de.uMembers {
       const mt = tyAt(m)
       if mt is TyArray {
-        if tyIsLitUnion(mt.aElem) || tyIsNullableLitUnion(mt.aElem) {
+        if tyIsLitUnion(tyElemOf(mt)) || tyIsNullableLitUnion(tyElemOf(mt)) {
           return true
         }
       }
@@ -1743,7 +1749,7 @@ export function objDroppedFieldList(src: i32, dst: i32) {
 export function listMutableTwin(ty: i32): i32 {
   const t = tyAt(ty)
   if t is TyArray {
-    if t.aRead == 1 { return mkArrayTy(t.aElem) }
+    if t.aRead == 1 { return mkArrayTy(tyElemOf(t)) }
   }
   ty
 }
@@ -1792,7 +1798,7 @@ export function viewifyLists(src: i32, dst: i32, depth: i32): i32 {
     TyArray => {
       const sa = tyAt(sIn)
       if sa is TyArray {
-        const el = viewifyLists(sa.aElem, d.aElem, depth - 1)
+        const el = viewifyLists(tyElemOf(sa), tyElemOf(d), depth - 1)
         if el < 0 { return -1 }
         return mkArrayViewTy(el)
       }
@@ -1864,8 +1870,8 @@ export function holeMapDemandOpen(ty: i32) {
     // A hole in either half counts as open, not just the `-1` no-type-yet: `q[k] = v`
     // inside a callee whose `k`/`v` are themselves un-annotated params pins the demand to
     // those holes, a non-negative index that is still undecided.
-    if t.mKey < 0 || t.mVal < 0 { return true }
-    return tyIsHole(t.mKey) || tyIsHole(t.mVal)
+    if tyKeyOpen(t) || tyValOpen(t) { return true }
+    return tyIsHole(tyKeyOf(t)) || tyIsHole(tyValOf(t))
   }
   true
 }
@@ -1908,7 +1914,7 @@ function holdsHoleFn(ty: i32, depth: i32): boolean {
       return false
     }
     TyArray => {
-      return holdsHoleFn(t.aElem, depth + 1)
+      return holdsHoleFn(tyElemOf(t), depth + 1)
     }
     TyPrim | TyErr | TyVar | TyLit | TyNeg | TyNullable | TyUnion | TyMap => {
       return false
@@ -2606,8 +2612,8 @@ export function scalarLeafListRetName(er: i32) {
   if er < 0 { return "" }
   const t = tyAt(er)
   if t is TyArray {
-    if t.aElem < 0 { return "" }
-    const et = tyAt(t.aElem)
+    if tyElemOpen(t) { return "" }
+    const et = tyAt(tyElemOf(t))
     if et is TyPrim {
       const pn = et.primName
       if pn == "i64" || pn == "f64" || pn == "f32" { return pn + "[]" }
@@ -3176,7 +3182,7 @@ export function cbPendAdd(cbIx: i32, listTy: i32, bound: string[]) {
   if !(lt is TyArray) || !(fd is FuncDecl) || fd.fnParams.length != 1 {
     return 0
   }
-  if lt.aElem < 0 { return 0 }
+  if tyElemOpen(lt) { return 0 }
   const p = nodeAt(fd.fnParams[0])
   if !(p is Param) { return 0 }
   let seen = 0
@@ -3187,7 +3193,7 @@ export function cbPendAdd(cbIx: i32, listTy: i32, bound: string[]) {
   }
   if seen != 1 { return 0 }
   cbPendNames.push(p.parName)
-  cbPendTys.push(lt.aElem)
+  cbPendTys.push(tyElemOf(lt))
   0
 }
 
@@ -3348,15 +3354,15 @@ export function forInBindTy(iterTy: i32, second: boolean): i32 {
     if second { return TY_I32 }
     // A `u8[]` or `i16[]` loop var binds an `i32`: one iteration is one element read, and a
     // storage width in a value position is exactly what it may not be (as at an index read).
-    if primIsSubWord(primNameOf(it.aElem)) { return TY_I32 }
-    return it.aElem
+    if primIsSubWord(primNameOf(tyElemOf(it))) { return TY_I32 }
+    return tyElemOf(it)
   }
   if it is TyMap {
     // `for k in m` over a map / set iterates its keys (the key type) — like
     // `for k in m.keys()`.
-    if !second { return it.mKey }
+    if !second { return tyKeyOf(it) }
     if it.mSet == 1 { return TY_I32 }
-    return it.mVal
+    return tyValOf(it)
   }
   // `for ch in s` iterates a string's code units, each an i32, exactly as `s[i]` reads
   // one — a string is a `{backing, start, len}` view over an i32 array (Stage 2b).

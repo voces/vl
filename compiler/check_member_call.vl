@@ -240,6 +240,8 @@ import {
   mkFuncTy,
   mkNullableTy,
   tyAt,
+  tyElemOf,
+  tyElemOpen,
   tyEq,
   tyFieldTyOf,
   tyHasHole,
@@ -247,6 +249,8 @@ import {
   tyIsNonIndexableScalar,
   tyIsPrimNamed,
   tyIxIsView,
+  tyKeyOf,
+  tyKeyOpen,
   tyMayHoldFn,
   tyMentionsTyVarNamed,
   tyPinElem,
@@ -255,6 +259,8 @@ import {
   tyRefusesArrayDemand,
   tyRefusesArrayWrite,
   tyToStr,
+  tyValOf,
+  tyValOpen,
 } from "./check_types"
 import { argLitAt, wsNotePendingAt, wsSuppress } from "./check_width"
 import { peelParenIx } from "./check_write_effects"
@@ -916,9 +922,9 @@ function lmCallAt(
   let res = -1
   const argc = n.callArgs.length
   if prop == "has" && argc == 1 { res = TY_BOOL }
-  if prop == "keys" && argc == 0 { res = mkArrayTy(m0.mKey) }
+  if prop == "keys" && argc == 0 { res = mkArrayTy(tyKeyOf(m0)) }
   if prop == "values" && argc == 0 {
-    if m0.mSet == 1 { res = mkArrayTy(m0.mKey) } else { res = lmValsTy(ms) }
+    if m0.mSet == 1 { res = mkArrayTy(tyKeyOf(m0)) } else { res = lmValsTy(ms) }
   }
   if prop == "get" && argc == 1 && m0.mSet == 0 {
     const v = lmValTy(ms)
@@ -998,17 +1004,17 @@ export function checkMemberCallNode(
   if prop == "push" || prop == "unshift" || prop == "set" || prop == "add" {
     for a in n.callArgs { ctnWrRecvPut(a, recvIx) }
   }
-  if rt is TyArray && rt.aElem < 0 && prop != "push" && prop != "unshift" {
+  if (rt is TyArray && tyElemOpen(rt) && prop != "push" && prop != "unshift") {
     openReadNote(recvTy)
   }
-  if rt is TyMap && rt.mVal < 0 && (prop == "get" || prop == "values") {
+  if rt is TyMap && tyValOpen(rt) && (prop == "get" || prop == "values") {
     openReadNote(recvTy)
   }
   if rt is TyMap && prop == "keys" { pinIterKey(recvTy) }
   if rt is TyArray { return memberCallArrayTy(n, ix, recvIx, prop, recvTy, rt) }
   if rt is TyMap {
     const mr = memberCallMapTy(n, ix, recvIx, prop, recvTy, rt)
-    if mapReadHole >= 0 && prop == "get" && rt.mVal < 0 {
+    if mapReadHole >= 0 && prop == "get" && tyValOpen(rt) {
       return mkDerivedHole(HD_ELEMV, "", -1, -1, mapReadHole)
     }
     return mr
@@ -1120,11 +1126,11 @@ function checkListPushArgs(
     const spd = spreadArgOf(margs[mi])
     if spd >= 0 {
       const set = spreadElemTy(margs[mi])
-      if rt.aElem < 0 {
+      if tyElemOpen(rt) {
         if set >= 0 { tyPinElem(rt, set) }
       } else if set < 0 && emptyArrayLitAt(spd) {
         // An empty literal spread appends nothing; it is typed at the list it appends to.
-        const lt = mkArrayTy(rt.aElem)
+        const lt = mkArrayTy(tyElemOf(rt))
         recordCtxTy(peelParenIx(spd), lt)
         nodeTySetGrow(peelParenIx(spd), lt)
         if spd != peelParenIx(spd) { nodeTySetGrow(spd, lt) }
@@ -1133,16 +1139,18 @@ function checkListPushArgs(
       } else if set >= 0 && pushSpreadFreshList(spd, ix, recvTy, rt) {
         // A spread binding of a fresh list is delivered whole as the list (D15287).
       } else if set >= 0 {
-        if !bmArgOk(BM_PUSH, "push", set, rt.aElem, recvTy, spd) {
-          tErr(bmArgMsg(BM_PUSH, "push", set, rt.aElem, recvTy), ix)
+        if !bmArgOk(BM_PUSH, "push", set, tyElemOf(rt), recvTy, spd) {
+          tErr(bmArgMsg(BM_PUSH, "push", set, tyElemOf(rt), recvTy), ix)
         }
         // A spread literal appends its elements, so each is delivered to the element as a
         // pushed value is, through its adapter when the element is a closed function (D15067).
         const sl = nodeAt(peelParenIx(spd))
         // A list of a function set is copied element by element through adapters (D15131).
-        if !(sl is ArrayLit) { fvaListSetCopy(spd, nodeTyIxOf(spd), rt.aElem) }
-        if sl is ArrayLit && tyMayHoldFn(rt.aElem, 0) {
-          const lt = mkArrayTy(rt.aElem)
+        if !(sl is ArrayLit) {
+          fvaListSetCopy(spd, nodeTyIxOf(spd), tyElemOf(rt))
+        }
+        if sl is ArrayLit && tyMayHoldFn(tyElemOf(rt), 0) {
+          const lt = mkArrayTy(tyElemOf(rt))
           recordCtxTy(peelParenIx(spd), lt)
           nodeTySetGrow(peelParenIx(spd), lt)
           fvaAdaptListLit(spd, lt)
@@ -1153,46 +1161,46 @@ function checkListPushArgs(
       // `((i32) => i32)[]` seeds the lambda's param from the element function type, so an
       // un-annotated lambda infers `n` instead of erroring (mirrors the `.map`/`.filter`
       // seeding). A non-function element / non-lambda arg is left untouched by `seedExpected`.
-      if rt.aElem >= 0 { seedExpected(margs[mi], rt.aElem) }
+      if !tyElemOpen(rt) { seedExpected(margs[mi], tyElemOf(rt)) }
       const pat = checkNodeHook(margs[mi])
       // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
       // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
-      if rt.aElem < 0 { calleeWritePrePin(recvTy, pat) }
-      if rt.aElem < 0 {
+      if tyElemOpen(rt) { calleeWritePrePin(recvTy, pat) }
+      if tyElemOpen(rt) {
         tyPinElem(
           rt,
           cnhPinTy(nullReadHoleTy(margs[mi], pat), ix, recvIx, false, false),
         )
-        numSlotStamp(margs[mi], pat, rt.aElem)
+        numSlotStamp(margs[mi], pat, tyElemOf(rt))
         // The first value is delivered at the slot it pinned, as a later one is (D16360).
-        recordCtxTy(margs[mi], rt.aElem)
+        recordCtxTy(margs[mi], tyElemOf(rt))
       } else {
-        cnhFill(rt.aElem, nullReadHoleTy(margs[mi], pat))
+        cnhFill(tyElemOf(rt), nullReadHoleTy(margs[mi], pat))
         // A later push joins the first one's function sets (D15929).
-        const jr = elabFnRecJoin(rt.aElem, pat)
-        if jr != rt.aElem { tyPinElem(rt, jr) }
+        const jr = elabFnRecJoin(tyElemOf(rt), pat)
+        if jr != tyElemOf(rt) { tyPinElem(rt, jr) }
         // The pushed value's own open holes pin from the element slot — the same rule
         // `.set` / `m[k] = v` / `xs = e` apply at their own store positions.
-        constrainEmptyExpr(margs[mi], pat, rt.aElem)
-        adoptFnNameAt(margs[mi], rt.aElem)
+        constrainEmptyExpr(margs[mi], pat, tyElemOf(rt))
+        adoptFnNameAt(margs[mi], tyElemOf(rt))
         // A float literal re-encodes into an `f32` element as at a binding (D582); a hole
         // lambda takes a concrete function element's type as an element store does, so a
         // body that cannot is refused here, not lowered at the hole's default (D3867).
-        if pushHoleFnToConcrete(pat, rt.aElem) {
-          if !assignableExpr(margs[mi], pat, rt.aElem) {
+        if pushHoleFnToConcrete(pat, tyElemOf(rt)) {
+          if !assignableExpr(margs[mi], pat, tyElemOf(rt)) {
             tErrWant(
-              letAssignMsg(margs[mi], pat, rt.aElem, "", -1),
+              letAssignMsg(margs[mi], pat, tyElemOf(rt), "", -1),
               margs[mi],
-              rt.aElem,
+              tyElemOf(rt),
             )
           }
         } else if (
-          !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, margs[mi])
+          !bmArgOk(BM_PUSH, "push", pat, tyElemOf(rt), recvTy, margs[mi])
         ) {
-          tErr(bmPushMsg("push", pat, rt.aElem, recvTy, margs[mi]), ix)
+          tErr(bmPushMsg("push", pat, tyElemOf(rt), recvTy, margs[mi]), ix)
         }
       }
-      cnhNullNote(margs[mi], rt.aElem)
+      cnhNullNote(margs[mi], tyElemOf(rt))
     }
     mi = mi + 1
   }
@@ -1208,16 +1216,16 @@ function pushSpreadLitElems(
   rt: TyArray,
 ): boolean {
   const sl = nodeAt(peelParenIx(spd))
-  if !(sl is ArrayLit) || tyMayHoldFn(rt.aElem, 0) { return false }
+  if !(sl is ArrayLit) || tyMayHoldFn(tyElemOf(rt), 0) { return false }
   for el in sl.arrElems {
     if nodeAt(el) is Spread { return false }
   }
   for el in sl.arrElems {
     const pat = nodeTyIxOf(el)
-    cnhFill(rt.aElem, nullReadHoleTy(el, pat))
-    constrainEmptyExpr(el, pat, rt.aElem)
-    if !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, el) {
-      tErr(bmPushMsg("push", pat, rt.aElem, recvTy, el), ix)
+    cnhFill(tyElemOf(rt), nullReadHoleTy(el, pat))
+    constrainEmptyExpr(el, pat, tyElemOf(rt))
+    if !bmArgOk(BM_PUSH, "push", pat, tyElemOf(rt), recvTy, el) {
+      tErr(bmPushMsg("push", pat, tyElemOf(rt), recvTy, el), ix)
     }
   }
   true
@@ -1234,8 +1242,8 @@ function pushSpreadFreshList(
 ): boolean {
   const x = peelParenIx(spd)
   if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return false }
-  if tyMayHoldFn(rt.aElem, 0) { return false }
-  if rt.aElem < 0 { return false }
+  if tyMayHoldFn(tyElemOf(rt), 0) { return false }
+  if tyElemOpen(rt) { return false }
   const d = recFreshDeclOf(x)
   const dn = if d >= 0 { nodeAt(d) } else { null }
   if (
@@ -1245,9 +1253,9 @@ function pushSpreadFreshList(
   ) {
     return false
   }
-  const lt = mkArrayTy(rt.aElem)
+  const lt = mkArrayTy(tyElemOf(rt))
   if !assignableExpr(x, nodeTyIxOf(x), lt) {
-    tErr(bmArgMsg(BM_PUSH, "push", spreadElemTy(spd), rt.aElem, recvTy), ix)
+    tErr(bmArgMsg(BM_PUSH, "push", spreadElemTy(spd), tyElemOf(rt), recvTy), ix)
   }
   true
 }
@@ -1273,7 +1281,7 @@ function memberCallMapFilterTy(
   // when the arg is an anonymous literal and the element type is known, else cleared below.
   const cbArg = nodeAt(cargs[0])
   // The callback's parameter is one element read, so a sub-word element is its `i32` value.
-  const el = arrElemValueTy(rt.aElem)
+  const el = arrElemValueTy(tyElemOf(rt))
   // A named callback is typed by the element, which a refused function value names.
   if cbArg is Ident && ovSetMod.length > 0 { ovCbElemSetAt(cargs[0], el) }
   // An intrinsic named as the callback is a minted lambda; the element picks its width.
@@ -1377,7 +1385,7 @@ function memberCallMapFilterTy(
         if cbRet != RET_PENDING && !assignable(cbRet, TY_BOOL) {
           tErr("filter predicate must yield boolean, got " + tyToStr(cbRet), ix)
         }
-        return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
+        return listBuiltResultTy(recvTy, tyElemOf(rt), rt.aRead)
       }
       // A list of only `null` has no element type, as a literal of one has none.
       if isNullTy(cbRet) {
@@ -1439,7 +1447,7 @@ function memberCallArrayTy(
     }
     // The first pop under a `.length` test of this same list yields the element (D3558); an
     // element type over a type variable or hole lowers per instance, so it stays nullable.
-    const popEl = arrElemValueTy(rt.aElem)
+    const popEl = arrElemValueTy(tyElemOf(rt))
     if (
       margs.length == 0
       && !tyHasHole(popEl)
@@ -1458,7 +1466,7 @@ function memberCallArrayTy(
         tErr(bmArgMsg(BM_INDEXMUST, "get", gat, TY_I32, -1), ix)
       }
     }
-    return mkNullableTy(arrElemValueTy(rt.aElem))
+    return mkNullableTy(arrElemValueTy(tyElemOf(rt)))
   }
   if prop == "clear" {
     if margs.length != 0 {
@@ -1481,7 +1489,7 @@ function memberCallArrayTy(
         si = si + 1
       }
     }
-    return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
+    return listBuiltResultTy(recvTy, tyElemOf(rt), rt.aRead)
   }
   // UFCS `self`-method on an array receiver (`parts.join(sep)`): an array
   // carries no user FIELD, so a matching free `self`-function resolves
@@ -1527,18 +1535,18 @@ function memberCallMapTy(
       // The value argument is a store into the map's value slot, taking the same
       // contextual steps `xs.push(v)` and `m[k] = v` take: `seedExpected` first, then the
       // expression-aware `assignableExpr` — the one home the assignment path also calls, so `.set` and `m[k] = v` cannot drift apart.
-      if rt.mVal >= 0 { seedExpected(margs2[1], rt.mVal) }
+      if !tyValOpen(rt) { seedExpected(margs2[1], tyValOf(rt)) }
       const v0 = checkNodeHook(margs2[1])
       narPinWriteAt(recvTy, ix)
-      if rt.mKey < 0 {
+      if tyKeyOpen(rt) {
         tyPinKey(rt, widenLitTy(k0))
-        numSlotStamp(margs2[0], k0, rt.mKey)
-        recordCtxTy(margs2[0], rt.mKey)
-        checkInferredMapKey(rt.mKey, rt.mSet, ix)
-      } else if !bmArgOk(BM_SETKEY, "set", k0, rt.mKey, -1, margs2[0]) {
-        tErr(bmArgMsg(BM_SETKEY, "set", k0, rt.mKey, -1), ix)
+        numSlotStamp(margs2[0], k0, tyKeyOf(rt))
+        recordCtxTy(margs2[0], tyKeyOf(rt))
+        checkInferredMapKey(tyKeyOf(rt), rt.mSet, ix)
+      } else if !bmArgOk(BM_SETKEY, "set", k0, tyKeyOf(rt), -1, margs2[0]) {
+        tErr(bmArgMsg(BM_SETKEY, "set", k0, tyKeyOf(rt), -1), ix)
       }
-      if rt.mVal < 0 {
+      if tyValOpen(rt) {
         tyPinVal(
           rt,
           cnhPinTy(
@@ -1549,42 +1557,42 @@ function memberCallMapTy(
             isHoleMapDemandTy(recvTy),
           ),
         )
-        if rt.mVal == v0 { recOwnPend(margs2[1], v0) }
-        numSlotStamp(margs2[1], v0, rt.mVal)
-        recordCtxTy(margs2[1], rt.mVal)
-        elabSlotRecLitGrow(margs2[1], rt.mVal)
+        if tyValOf(rt) == v0 { recOwnPend(margs2[1], v0) }
+        numSlotStamp(margs2[1], v0, tyValOf(rt))
+        recordCtxTy(margs2[1], tyValOf(rt))
+        elabSlotRecLitGrow(margs2[1], tyValOf(rt))
       } else {
-        cnhFill(rt.mVal, nullReadHoleTy(margs2[1], v0))
+        cnhFill(tyValOf(rt), nullReadHoleTy(margs2[1], v0))
         // A later store joins the first one's function sets (D15806).
-        const jm = elabFnRecJoin(rt.mVal, v0)
-        if jm != rt.mVal { tyPinVal(rt, jm) }
+        const jm = elabFnRecJoin(tyValOf(rt), v0)
+        if jm != tyValOf(rt) { tyPinVal(rt, jm) }
         // The value argument's own open holes pin from the slot, the third step
         // this store shares with `m[k] = v` (which pins in `checkBinExprNode`'s
         // `=` arm) — without it, `m.set("a", fq())` over a `{[string]: f64[]}` reaches the emitter with an unpinned `[]`.
-        constrainEmptyExpr(margs2[1], v0, rt.mVal)
-        adoptFnNameAt(margs2[1], rt.mVal)
+        constrainEmptyExpr(margs2[1], v0, tyValOf(rt))
+        adoptFnNameAt(margs2[1], tyValOf(rt))
         // `assignableExpr` already covers the newtype literal-adoption case (`m.set("k",
         // 1)` over `{[string]: EntityId}` fires), deferring to the pin under a hole (D582).
         // A hole lambda takes a concrete function value type as `m[k] = v` and `push` do, so
         // a body that cannot is refused here (D3881).
-        if pushHoleFnToConcrete(v0, rt.mVal) {
-          if !assignableExpr(margs2[1], v0, rt.mVal) {
+        if pushHoleFnToConcrete(v0, tyValOf(rt)) {
+          if !assignableExpr(margs2[1], v0, tyValOf(rt)) {
             tErrWant(
-              letAssignMsg(margs2[1], v0, rt.mVal, "", -1),
+              letAssignMsg(margs2[1], v0, tyValOf(rt), "", -1),
               margs2[1],
-              rt.mVal,
+              tyValOf(rt),
             )
           }
-        } else if !bmArgOk(BM_SETVAL, "set", v0, rt.mVal, -1, margs2[1]) {
-          tErr(bmArgMsg(BM_SETVAL, "set", v0, rt.mVal, -1), ix)
-        } else if v0 == rt.mVal {
+        } else if !bmArgOk(BM_SETVAL, "set", v0, tyValOf(rt), -1, margs2[1]) {
+          tErr(bmArgMsg(BM_SETVAL, "set", v0, tyValOf(rt), -1), ix)
+        } else if v0 == tyValOf(rt) {
           // A later store at the slot's own type is an own-storage delivery, as the first is.
           recOwnPend(margs2[1], v0)
         }
         // A record literal holds the slot's joined record, after the adoption above (D15493).
-        elabSlotRecLitGrow(margs2[1], rt.mVal)
+        elabSlotRecLitGrow(margs2[1], tyValOf(rt))
       }
-      cnhNullNote(margs2[1], rt.mVal)
+      cnhNullNote(margs2[1], tyValOf(rt))
     }
     return TY_VOID
   }
@@ -1593,20 +1601,20 @@ function memberCallMapTy(
       tErr("get expects 1 argument, got " + i32ToStr(margs2.length), ix)
     } else {
       const k1 = checkNodeHook(margs2[0])
-      if rt.mKey < 0 {
+      if tyKeyOpen(rt) {
         openKeyReadNote(recvTy, widenLitTy(k1))
         pinReadKey(recvTy, widenLitTy(k1))
         checkInferredMapKey(widenLitTy(k1), rt.mSet, ix)
       }
-      if !bmArgOk(BM_KEYMUST, "get", k1, rt.mKey, -1, margs2[0]) {
-        tErr(bmArgMsg(BM_KEYMUST, "get", k1, rt.mKey, -1), ix)
+      if !bmArgOk(BM_KEYMUST, "get", k1, tyKeyOf(rt), -1, margs2[0]) {
+        tErr(bmArgMsg(BM_KEYMUST, "get", k1, tyKeyOf(rt), -1), ix)
       }
     }
-    return mkNullableTy(rt.mVal)
+    return mkNullableTy(tyValOf(rt))
   }
   // `.add(x)` is a Set method only: a boolean-valued map is a map, and its insert is
   // `m[k] = true` (DECISIONS.md, "`{[K]: V}` and `T[]` are concrete types").
-  if mp == "add" && rt.mSet == 0 && tyIsPrimNamed(rt.mVal, "boolean") {
+  if mp == "add" && rt.mSet == 0 && tyIsPrimNamed(tyValOf(rt), "boolean") {
     // The hint yields to a `self`-function named `add`: a map has no such member (D2477).
     const ma = ufcsCallTy(mp, recvTy, n, ix)
     if ma >= 0 {
@@ -1615,7 +1623,7 @@ function memberCallMapTy(
     }
     tErr(
       "`.add` is a `Set` method — use `m[k] = true`, or make it a `Set<"
-        + tyToStr(rt.mKey)
+        + tyToStr(tyKeyOf(rt))
         + ">`",
       ix,
     )
@@ -1627,12 +1635,12 @@ function memberCallMapTy(
     } else {
       const ka = checkNodeHook(margs2[0])
       narPinWriteAt(recvTy, ix)
-      if rt.mKey < 0 {
+      if tyKeyOpen(rt) {
         tyPinKey(rt, widenLitTy(ka))
-        recordCtxTy(margs2[0], rt.mKey)
-        checkInferredMapKey(rt.mKey, rt.mSet, ix)
-      } else if !bmArgOk(BM_ADDKEY, "add", ka, rt.mKey, -1, margs2[0]) {
-        tErr(bmArgMsg(BM_ADDKEY, "add", ka, rt.mKey, -1), ix)
+        recordCtxTy(margs2[0], tyKeyOf(rt))
+        checkInferredMapKey(tyKeyOf(rt), rt.mSet, ix)
+      } else if !bmArgOk(BM_ADDKEY, "add", ka, tyKeyOf(rt), -1, margs2[0]) {
+        tErr(bmArgMsg(BM_ADDKEY, "add", ka, tyKeyOf(rt), -1), ix)
       }
     }
     return TY_VOID
@@ -1642,13 +1650,13 @@ function memberCallMapTy(
       tErr(mp + " expects 1 argument, got " + i32ToStr(margs2.length), ix)
     } else {
       const k2 = checkNodeHook(margs2[0])
-      if rt.mKey < 0 {
+      if tyKeyOpen(rt) {
         openKeyReadNote(recvTy, widenLitTy(k2))
         pinReadKey(recvTy, widenLitTy(k2))
         checkInferredMapKey(widenLitTy(k2), rt.mSet, ix)
       }
-      if !bmArgOk(BM_KEYMUST, mp, k2, rt.mKey, -1, margs2[0]) {
-        tErr(bmArgMsg(BM_KEYMUST, mp, k2, rt.mKey, -1), ix)
+      if !bmArgOk(BM_KEYMUST, mp, k2, tyKeyOf(rt), -1, margs2[0]) {
+        tErr(bmArgMsg(BM_KEYMUST, mp, k2, tyKeyOf(rt), -1), ix)
       }
     }
     return TY_BOOL
@@ -1661,13 +1669,13 @@ function memberCallMapTy(
   }
   if mp == "keys" {
     if margs2.length != 0 { tErr("keys expects no arguments", ix) }
-    return mkArrayTy(rt.mKey)
+    return mkArrayTy(tyKeyOf(rt))
   }
   if mp == "values" {
     if margs2.length != 0 { tErr("values expects no arguments", ix) }
     // A set's `.values()` yields its ELEMENTS (the keys); a map's its values.
-    if rt.mSet == 1 { return mkArrayTy(rt.mKey) }
-    return mkArrayTy(rt.mVal)
+    if rt.mSet == 1 { return mkArrayTy(tyKeyOf(rt)) }
+    return mkArrayTy(tyValOf(rt))
   }
   // A name no map arm claims is a `self`-function call, as on every other receiver (D2477).
   const mu = ufcsCallTy(mp, recvTy, n, ix)

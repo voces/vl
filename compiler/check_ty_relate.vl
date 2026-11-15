@@ -69,10 +69,13 @@ import {
   tyArrHasEq,
   tyArrayElemIx,
   tyAt,
+  tyElemOf,
   tyEq,
+  tyKeyOf,
   tyLitUnionIsI32Backed,
   tyPrimNameIs,
   tyToStr,
+  tyValOf,
 } from "./check_types"
 import {
   intLexemeIsExactF32,
@@ -263,14 +266,24 @@ export function joinWidensMap(src: i32, dst: i32): boolean {
   const d = tyAt(dst)
   if s is TyMap {
     if d is TyMap {
-      if containerElemClassDiffers(joinStoreTy(s.mKey), joinStoreTy(d.mKey)) {
+      if (
+        containerElemClassDiffers(
+          joinStoreTy(tyKeyOf(s)),
+          joinStoreTy(tyKeyOf(d)),
+        )
+      ) {
         return true
       }
-      if containerElemClassDiffers(joinStoreTy(s.mVal), joinStoreTy(d.mVal)) {
+      if (
+        containerElemClassDiffers(
+          joinStoreTy(tyValOf(s)),
+          joinStoreTy(tyValOf(d)),
+        )
+      ) {
         return true
       }
-      if mapValBoxDiffers(s.mVal, d.mVal) { return true }
-      return joinWidensMap(s.mVal, d.mVal)
+      if mapValBoxDiffers(tyValOf(s), tyValOf(d)) { return true }
+      return joinWidensMap(tyValOf(s), tyValOf(d))
     }
   }
   false
@@ -307,7 +320,7 @@ function isEquatable(ty: i32, seen: i32[]) {
       return true
     }
     TyArray => {
-      return isEquatable(t.aElem, seen)
+      return isEquatable(tyElemOf(t), seen)
     }
     TyObj => {
       let si = 0
@@ -381,7 +394,7 @@ export function eqCmpKindOfTy(ty: i32): EqCmpKind {
   if t is TyFunc { return "closure" }
   if t is TyObj { return "struct" }
   if t is TyMap { return "none" }
-  if t is TyArray { return eqCmpKindOfArrayElem(t.aElem) }
+  if t is TyArray { return eqCmpKindOfArrayElem(tyElemOf(t)) }
   if t is TyNullable { return eqCmpKindOfNulInner(t.nInner) }
   if t is TyUnion {
     // A declared nullable alias (`type L = i32[] | null`) resolves through `UnionDecl` and
@@ -450,7 +463,7 @@ function eqStructFieldFlatTy(ty: i32, depth: i32): boolean {
       return eqStructElemFlatTy(ty, depth)
     }
     TyArray => {
-      const el = t.aElem
+      const el = tyElemOf(t)
       if el < 0 { return false }
       const et = tyAt(el)
       if et is TyObj { return eqStructElemFlatTy(el, depth + 1) }
@@ -502,7 +515,7 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
       return "none"
     }
     TyArray => {
-      const ie = e.aElem
+      const ie = tyElemOf(e)
       if ie < 0 { return "reflist" }
       const i2 = tyAt(ie)
       // A hole one hop down is unanswered, not refused — this arm answered "none" while the
@@ -604,7 +617,7 @@ function eqCmpKindOfNulInner(inner: i32): EqCmpKind {
   if it is TyObj { return "nulstruct" }
   if it is TyMap { return "none" }
   if it is TyArray {
-    const ak = eqCmpKindOfArrayElem(it.aElem)
+    const ak = eqCmpKindOfArrayElem(tyElemOf(it))
     // Exhaustive over `EqCmpKind` and `_`-less: the four list cores take their nullable-niche
     // token; every other core is not a list, and the element's own core stands (a real answer).
     match ak {
@@ -1015,8 +1028,8 @@ export function listJoinStorageDiffers(
     TyArray => {
       const de = tyStepElem(dst)
       if de < 0 { return false }
-      if containerElemClassDiffers(s.aElem, de) { return true }
-      return listJoinStorageDiffers(s.aElem, de, depth - 1)
+      if containerElemClassDiffers(tyElemOf(s), de) { return true }
+      return listJoinStorageDiffers(tyElemOf(s), de, depth - 1)
     }
     // A join reaching any other shape is not a list the join could copy.
     TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
@@ -1055,7 +1068,7 @@ export function fieldStorageEq(a: i32, b: i32, depth: i32): boolean {
   match ta {
     TyArray => {
       const eb = tyArrayElemIx(b)
-      return eb >= 0 && fieldStorageEq(ta.aElem, eb, depth - 1)
+      return eb >= 0 && fieldStorageEq(tyElemOf(ta), eb, depth - 1)
     }
     TyNullable => {
       const nb = nullableInnerOrNone(b)
@@ -1088,8 +1101,8 @@ function recObjStorageEq(ta: TyObj, a: i32, b: i32): boolean {
 function recMapStorageEq(ta: TyMap, b: i32, depth: i32): boolean {
   const tb = tyAt(b)
   if tb is TyMap {
-    return fieldStorageEq(ta.mKey, tb.mKey, depth - 1)
-      && fieldStorageEq(ta.mVal, tb.mVal, depth - 1)
+    return fieldStorageEq(tyKeyOf(ta), tyKeyOf(tb), depth - 1)
+      && fieldStorageEq(tyValOf(ta), tyValOf(tb), depth - 1)
   }
   false
 }
@@ -1209,7 +1222,7 @@ export function recNumChanges(src: i32, dst: i32, depth: i32): boolean {
     }
     TyArray => {
       const de = tyArrayElemIx(nonNulTyOf(dst))
-      return de >= 0 && recNumChanges(s.aElem, de, depth - 1)
+      return de >= 0 && recNumChanges(tyElemOf(s), de, depth - 1)
     }
     TyNullable => {
       return recNumChanges(s.nInner, nonNulTyOf(dst), depth - 1)
@@ -1243,7 +1256,7 @@ function recNumChangesFields(s: TyObj, dst: i32, depth: i32): boolean {
 // `recNumChanges` over a map's values.
 function recNumChangesMap(s: TyMap, dst: i32, depth: i32): boolean {
   const d = tyAt(nonNulTyOf(dst))
-  if d is TyMap { return recNumChanges(s.mVal, d.mVal, depth - 1) }
+  if d is TyMap { return recNumChanges(tyValOf(s), tyValOf(d), depth - 1) }
   false
 }
 
@@ -1411,7 +1424,7 @@ export function containerWidenServed(src: i32, dst: i32): boolean {
   const s = tyAt(src)
   const d = tyAt(dst)
   if s is TyArray {
-    if d is TyArray { return scalarElemWidenServed(s.aElem, d.aElem) }
+    if d is TyArray { return scalarElemWidenServed(tyElemOf(s), tyElemOf(d)) }
   }
   false
 }
@@ -1570,7 +1583,7 @@ export function fvaSlotMayDiffer(a0: i32, b0: i32, depth: i32): boolean {
     TyArray => {
       const be = fvaElemOf(b)
       if be == -2 { return true }
-      return fvaSlotMayDiffer(ta.aElem, be, depth - 1)
+      return fvaSlotMayDiffer(tyElemOf(ta), be, depth - 1)
     }
     TyNullable => {
       const bi = fvaInnerOf(b)
@@ -1611,7 +1624,7 @@ function fvaSameMembers(ms: i32[], b: i32, depth: i32): boolean {
 // The element of list type `t`, or -2 when `t` is not a list.
 function fvaElemOf(t: i32): i32 {
   const n = tyAt(t)
-  if n is TyArray { return n.aElem }
+  if n is TyArray { return tyElemOf(n) }
   -2
 }
 
@@ -1625,7 +1638,7 @@ function fvaInnerOf(t: i32): i32 {
 // The value type of map `t`, or -2 when `t` is not a map.
 function fvaValOf(t: i32): i32 {
   const n = tyAt(t)
-  if n is TyMap { return n.mVal }
+  if n is TyMap { return tyValOf(n) }
   -2
 }
 
@@ -1675,10 +1688,15 @@ export function fvaNestedFnDiffers(
       return fvaNestedFnDiffers(st.nInner, fvaInnerOf(d), level + 1, depth - 1)
     }
     TyArray => {
-      return fvaNestedFnDiffers(st.aElem, fvaElemOf(d), level + 1, depth - 1)
+      return fvaNestedFnDiffers(
+        tyElemOf(st),
+        fvaElemOf(d),
+        level + 1,
+        depth - 1,
+      )
     }
     TyMap => {
-      return fvaNestedFnDiffers(st.mVal, fvaValOf(d), level + 1, depth - 1)
+      return fvaNestedFnDiffers(tyValOf(st), fvaValOf(d), level + 1, depth - 1)
     }
     TyObj => {
       return fvaNestedFieldDiffers(st, d, level, depth)

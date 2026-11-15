@@ -495,6 +495,8 @@ import {
   tyArrayElemIx,
   tyAt,
   tyBearsNull,
+  tyElemOf,
+  tyElemOpen,
   tyEq,
   tyEqSameHoles,
   tyFieldTyOf,
@@ -504,6 +506,8 @@ import {
   tyIsHole,
   tyIsLitUnion,
   tyIsNulValueUnionBox,
+  tyKeyOf,
+  tyKeyOpen,
   tyMayHoldFn,
   tyMentionsTyVarNamed,
   tyMutEpoch,
@@ -517,6 +521,8 @@ import {
   tyToStr,
   tyToStrUser,
   tyToStructStrUser,
+  tyValOf,
+  tyValOpen,
   wideLitMinted,
 } from "./check_types"
 import {
@@ -754,7 +760,7 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
         TyUnion => {
           // An open `[]` delivered to a union is built as its first list member, the arm
           // `recordRepTyAdopt` records for a literal, so a call returning one pins the same way.
-          if s.aElem < 0 {
+          if tyElemOpen(s) {
             const vs: i32[] = []
             flattenVariantsInto(dstTy, vs)
             for v in vs {
@@ -765,17 +771,17 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
           }
         }
         TyArray => {
-          if s.aElem < 0 {
+          if tyElemOpen(s) {
             // Both sides open is not a pin but a link — `s.aElem = d.aElem` would write the `-1`
             // back and lose the fact that these two rows must agree, which `arrDefHoleToI32` needs
             // once an unpinned hole acquires a default. D1470.
-            if d.aElem < 0 {
+            if tyElemOpen(d) {
               noteHoleLink(srcTy, dstTy)
             } else {
-              tyPinElem(s, d.aElem)
+              tyPinElem(s, tyElemOf(d))
             }
           } else {
-            constrainEmptyD(s.aElem, d.aElem, depth - 1)
+            constrainEmptyD(tyElemOf(s), tyElemOf(d), depth - 1)
           }
         }
         // A list pins only into a list, or into a union's first list member.
@@ -788,20 +794,23 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
         TyMap => {
           // Both open is a link, as two open lists are (D1470): a later use pins one side, and
           // `resolveHoleLinks` hands it to the other.
-          if (s.mKey < 0 && d.mKey < 0) || (s.mVal < 0 && d.mVal < 0) {
+          if (
+            (tyKeyOpen(s) && tyKeyOpen(d))
+            || (tyValOpen(s) && tyValOpen(d))
+          ) {
             noteHoleLink(srcTy, dstTy)
           }
-          if s.mKey < 0 { tyPinKey(s, d.mKey) }
-          if s.mVal < 0 {
-            tyPinVal(s, d.mVal)
+          if tyKeyOpen(s) { tyPinKey(s, tyKeyOf(d)) }
+          if tyValOpen(s) {
+            tyPinVal(s, tyValOf(d))
           } else {
-            constrainEmptyD(s.mVal, d.mVal, depth - 1)
+            constrainEmptyD(tyValOf(s), tyValOf(d), depth - 1)
           }
         }
         // An open map or set delivered to a union is built as its first member of the same kind,
         // the arm a fresh `Map()` is pinned to at a binding (D2649).
         TyUnion => {
-          if s.mKey < 0 || s.mVal < 0 {
+          if tyKeyOpen(s) || tyValOpen(s) {
             const arm = unionMapArmOf(dstTy, s.mSet)
             if arm >= 0 { return constrainEmptyD(srcTy, arm, depth - 1) }
           }
@@ -1302,12 +1311,12 @@ function numLitAsgNoteQueue(msg: string, di: i32) {
       let fieldLit = -1
       if btt is TyArray {
         if btt.aRead != 0 || fname != "" { return 0 }
-        base = btt.aElem
+        base = tyElemOf(btt)
         list = "[]"
         if slot == "=" {
           const gt = tyAt(got)
           if !(gt is TyArray) { return 0 }
-          if gt is TyArray { gotBase = gt.aElem }
+          if gt is TyArray { gotBase = tyElemOf(gt) }
         }
       } else if btt is TyObj {
         if fname == "" { return 0 }
@@ -1475,7 +1484,7 @@ function numLitLeafFor(v: i32, want: i32, depth: i32): i32 {
   if n is ArrayLit {
     if wt is TyArray {
       for el in n.arrElems {
-        const r = numLitLeafFor(el, wt.aElem, depth - 1)
+        const r = numLitLeafFor(el, tyElemOf(wt), depth - 1)
         if r >= 0 { return r }
       }
     }
@@ -2767,11 +2776,11 @@ function gaArgHolds(t: i32, old: i32, depth: i32, under: boolean): boolean {
       }
     }
     TyArray => {
-      return gaArgHolds(ty.aElem, old, depth - 1, true)
+      return gaArgHolds(tyElemOf(ty), old, depth - 1, true)
     }
     TyMap => {
-      return gaArgHolds(ty.mKey, old, depth - 1, true)
-        || gaArgHolds(ty.mVal, old, depth - 1, true)
+      return gaArgHolds(tyKeyOf(ty), old, depth - 1, true)
+        || gaArgHolds(tyValOf(ty), old, depth - 1, true)
     }
     TyFunc => {
       for pt in ty.fnParamTypes {
@@ -3900,7 +3909,7 @@ function nameToTyReal(name: string) {
     const listIx = nameToTy(roListInnerName(name))
     if listIx < 0 { return -1 }
     const lt = tyAt(listIx)
-    if lt is TyArray { return mkArrayViewTy(lt.aElem) }
+    if lt is TyArray { return mkArrayViewTy(tyElemOf(lt)) }
     return -1
   }
   // An array type `T[]`: the parser appends a literal `[]` per array suffix to the type
@@ -4444,7 +4453,7 @@ function assignableGo(src: i32, dst: i32) {
         }
         // An empty `[]` (element `-1`) is assignable to any array; otherwise the
         // element types must be assignable.
-        return assignableOrOpen(sTail.aElem, d.aElem)
+        return assignableOrOpen(tyElemOf(sTail), tyElemOf(d))
       }
       return false
     }
@@ -4454,11 +4463,11 @@ function assignableGo(src: i32, dst: i32) {
         // invariant in its element. A bare `Map()`/`Set()` (holes, `-1`) fits its own flavor.
         if sTail.mSet != d.mSet { return false }
         if d.mSet == 1 {
-          return assignableOrOpen(sTail.mKey, d.mKey)
-            && assignableOrOpen(d.mKey, sTail.mKey)
+          return assignableOrOpen(tyKeyOf(sTail), tyKeyOf(d))
+            && assignableOrOpen(tyKeyOf(d), tyKeyOf(sTail))
         }
-        return assignableOrOpen(sTail.mKey, d.mKey)
-          && assignableOrOpen(sTail.mVal, d.mVal)
+        return assignableOrOpen(tyKeyOf(sTail), tyKeyOf(d))
+          && assignableOrOpen(tyValOf(sTail), tyValOf(d))
       }
       return false
     }
@@ -5604,8 +5613,8 @@ function holeMapNodeTy(
   if !(ra is TyArray) { return -1 }
   const cb = n.callArgs[0]
   const cbTy = nodeTyOf(cb)
-  let r = holeFnArgRetAtParams(cb, [ra.aElem])
-  if r < 0 { r = holeCbRetAtElem(cb, cbTy, ra.aElem, -1) }
+  let r = holeFnArgRetAtParams(cb, [tyElemOf(ra)])
+  if r < 0 { r = holeCbRetAtElem(cb, cbTy, tyElemOf(ra), -1) }
   if r < 0 || tyHasTyVar(r) { return -1 }
   mkArrayTy(r)
 }
@@ -7099,10 +7108,10 @@ function holeSlotElemSetAt(t: i32, steps: string[]): i32 {
   const c = T.tys[cur]
   match c {
     TyArray => {
-      return fnTagSetOfTy(c.aElem)
+      return fnTagSetOfTy(tyElemOf(c))
     }
     TyMap => {
-      return fnTagSetOfTy(c.mVal)
+      return fnTagSetOfTy(tyValOf(c))
     }
     // Only a list's or a map's element carries a set of functions written to it.
     TyObj | TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
@@ -7296,10 +7305,10 @@ export function holeSlotDeliveryJudge(v: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   const da = tyAt(dt)
-  if !(da is TyArray) || da.aElem < 0 || da.aElem >= T.tys.length {
+  if !(da is TyArray) || tyElemOpen(da) || tyElemOf(da) >= T.tys.length {
     return false
   }
-  const ef = tyAt(da.aElem)
+  const ef = tyAt(tyElemOf(da))
   if !(ef is TyFunc) { return false }
   const pts: i32[] = []
   for p in ef.fnParamTypes { pts.push(widenLitTy(p)) }
@@ -7974,8 +7983,8 @@ function holeFnRetSubstAt(ty: i32, hN: string[], hT: i32[], depth: i32): i32 {
     return b
   }
   if t is TyArray {
-    const e = holeFnRetSubstAt(t.aElem, hN, hT, depth + 1)
-    if e == t.aElem { return ty }
+    const e = holeFnRetSubstAt(tyElemOf(t), hN, hT, depth + 1)
+    if e == tyElemOf(t) { return ty }
     if t.aRead == 1 { return mkArrayViewTy(e) }
     return mkArrayTy(e)
   }
@@ -7985,9 +7994,9 @@ function holeFnRetSubstAt(ty: i32, hN: string[], hT: i32[], depth: i32): i32 {
     return mkNullableTy(nullableFlatInner(n))
   }
   if t is TyMap {
-    const k = holeFnRetSubstAt(t.mKey, hN, hT, depth + 1)
-    const v = holeFnRetSubstAt(t.mVal, hN, hT, depth + 1)
-    if k == t.mKey && v == t.mVal { return ty }
+    const k = holeFnRetSubstAt(tyKeyOf(t), hN, hT, depth + 1)
+    const v = holeFnRetSubstAt(tyValOf(t), hN, hT, depth + 1)
+    if k == tyKeyOf(t) && v == tyValOf(t) { return ty }
     return mkMapTy(k, v, t.mSet)
   }
   if t is TyObj {
@@ -8904,7 +8913,7 @@ export function fvaHeldHoleFnDiffers(s: i32, d: i32, depth: i32): boolean {
     }
     TyArray => {
       return dt is TyArray
-        && fvaHeldHoleFnDiffers(st.aElem, dt.aElem, depth - 1)
+        && fvaHeldHoleFnDiffers(tyElemOf(st), tyElemOf(dt), depth - 1)
     }
     TyNullable => {
       return fvaHeldHoleFnDiffers(st.nInner, nonNullTy(d), depth - 1)
@@ -9448,8 +9457,8 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     if innerE >= 0 {
       const itE = tyAt(innerE)
       if itE is TyArray {
-        if kind == HD_ELEMV { return arrElemValueTy(itE.aElem) }
-        return itE.aElem
+        if kind == HD_ELEMV { return arrElemValueTy(tyElemOf(itE)) }
+        return tyElemOf(itE)
       }
       // A map pin reads its value or `null`, as `holePinReadAt` answers the same read.
       if kind == HD_ELEMV {
@@ -9840,7 +9849,7 @@ export function bindGenWalk(
   ) {
     // A union of parameters alone pairs by position, as the instance's pin does (D3643).
   } else if e is TyArray {
-    if a is TyArray { bindGenWalk(e.aElem, a.aElem, bNames, bTys) }
+    if a is TyArray { bindGenWalk(tyElemOf(e), tyElemOf(a), bNames, bTys) }
   } else if e is TyNullable {
     if a is TyNullable { bindGenWalk(e.nInner, a.nInner, bNames, bTys) }
     else if atIx != TY_NULL { bindGenWalk(e.nInner, atIx, bNames, bTys) }
@@ -9884,8 +9893,8 @@ export function bindGenWalk(
     // A map/set param (`{[string]: T}`) pins `T` from the argument's value
     // type (the key position walks too, for symmetry).
     if a is TyMap {
-      bindGenWalk(e.mKey, a.mKey, bNames, bTys)
-      bindGenWalk(e.mVal, a.mVal, bNames, bTys)
+      bindGenWalk(tyKeyOf(e), tyKeyOf(a), bNames, bTys)
+      bindGenWalk(tyValOf(e), tyValOf(a), bNames, bTys)
     }
   }
   // An application's arguments bind last, so they reach only a parameter the structure left
@@ -10022,7 +10031,7 @@ export function bindGenInnerUnionArms(
     }
     TyArray => {
       bindGenInnerUnionArms(
-        e.aElem,
+        tyElemOf(e),
         tyArrayElemIx(atIx),
         uNames,
         uTys,
@@ -10044,7 +10053,13 @@ export function bindGenInnerUnionArms(
       }
     }
     TyMap => {
-      bindGenInnerUnionArms(e.mVal, tyMapValOf(atIx), uNames, uTys, depth + 1)
+      bindGenInnerUnionArms(
+        tyValOf(e),
+        tyMapValOf(atIx),
+        uNames,
+        uTys,
+        depth + 1,
+      )
     }
     TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {}
   }
@@ -10150,7 +10165,7 @@ function bindFnRetUnionDefault(
 function bindFnRetOpenDefault(open: i32, uNames: string[], uTys: i32[]) {
   if open < 0 || open >= T.tys.length { return 0 }
   let ov = tyAt(open)
-  if ov is TyArray && ov.aElem >= 0 { ov = tyAt(ov.aElem) }
+  if ov is TyArray && !tyElemOpen(ov) { ov = tyAt(tyElemOf(ov)) }
   if !(ov is TyVar) || bindOf(uNames, uTys, ov.tvName) >= 0 { return 0 }
   uNames.push(ov.tvName)
   uTys.push(TY_I32)
@@ -10353,9 +10368,9 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   stSeenStackPush(tyIx)
   let res = tyIx
   if t is TyArray {
-    const e2 = substTyDeep(t.aElem, bNames, bTys)
+    const e2 = substTyDeep(tyElemOf(t), bNames, bTys)
     // A `readonly T[]` stays a view once `T` is bound, or its covariance is lost.
-    if e2 != t.aElem {
+    if e2 != tyElemOf(t) {
       if t.aRead == 1 { res = mkArrayViewTy(e2) } else { res = mkArrayTy(e2) }
     }
   } else if t is TyNullable {
@@ -10367,9 +10382,9 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   } else if t is TyUnion {
     res = substUnionTy(tyIx, t, bNames, bTys)
   } else if t is TyMap {
-    const k2 = substTyDeep(t.mKey, bNames, bTys)
-    const v2 = substTyDeep(t.mVal, bNames, bTys)
-    if k2 != t.mKey || v2 != t.mVal { res = mkMapTy(k2, v2, t.mSet) }
+    const k2 = substTyDeep(tyKeyOf(t), bNames, bTys)
+    const v2 = substTyDeep(tyValOf(t), bNames, bTys)
+    if k2 != tyKeyOf(t) || v2 != tyValOf(t) { res = mkMapTy(k2, v2, t.mSet) }
   } else if t is TyNeg {
     const g2 = substTyDeep(t.negTy, bNames, bTys)
     if g2 != t.negTy { res = mkNegTy(g2) }
@@ -10791,7 +10806,7 @@ export function substSelfTy(p0: i32, bNames: string[], bTys: i32[]): i32 {
   const st = tyAt(sub)
   if pt is TyArray {
     if st is TyArray {
-      if pt.aRead == 1 && st.aRead == 0 { return mkArrayViewTy(st.aElem) }
+      if pt.aRead == 1 && st.aRead == 0 { return mkArrayViewTy(tyElemOf(st)) }
     }
   }
   sub
@@ -11277,7 +11292,7 @@ export function litLeafFitting(x: i32, want: i32, depth: i32): i32 {
     if wt is TyArray {
       let first = -1
       for el in xn.arrElems {
-        const lt = litLeafFitting(parenPeelIx(el), wt.aElem, depth + 1)
+        const lt = litLeafFitting(parenPeelIx(el), tyElemOf(wt), depth + 1)
         if lt < 0 { return -1 }
         if first < 0 { first = lt }
       }
@@ -11380,7 +11395,7 @@ function nulFoldTieReach(f: i32): i32 {
   if f < 0 || f >= T.tys.length { return -1 }
   const ft = tyAt(f)
   match ft {
-    TyArray => nulFoldTieReach(ft.aElem)
+    TyArray => nulFoldTieReach(tyElemOf(ft))
     TyNullable => if ft.nInner >= 0 && tyAt(ft.nInner) is TyObj { f } else { nulFoldTieReach(ft.nInner) }
     // No other field type leads to a tied record.
     TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => -1
@@ -11405,7 +11420,7 @@ function nulFoldTiedTyAt(f: i32, depth: i32): i32 {
       }
     }
     TyArray => {
-      ft.aElem = nulFoldTiedTyAt(ft.aElem, depth - 1)
+      ft.aElem = nulFoldTiedTyAt(tyElemOf(ft), depth - 1)
     }
     // Any other field type holds no wrapper this tie reaches.
     TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {}
@@ -11498,14 +11513,14 @@ function widenLitTyGo(ty: i32, depth: i32): i32 {
     }
     TyArray => {
       if t.aRead == 1 { return ty }
-      const we = widenLitTyGo(t.aElem, depth - 1)
-      if we == t.aElem { return ty }
+      const we = widenLitTyGo(tyElemOf(t), depth - 1)
+      if we == tyElemOf(t) { return ty }
       return mkArrayTy(we)
     }
     TyMap => {
-      const wk = widenLitTyGo(t.mKey, depth - 1)
-      const wv = widenLitTyGo(t.mVal, depth - 1)
-      if wk == t.mKey && wv == t.mVal { return ty }
+      const wk = widenLitTyGo(tyKeyOf(t), depth - 1)
+      const wv = widenLitTyGo(tyValOf(t), depth - 1)
+      if wk == tyKeyOf(t) && wv == tyValOf(t) { return ty }
       return mkMapTy(wk, wv, t.mSet)
     }
     TyPrim => {
@@ -11657,11 +11672,15 @@ function storageNormGo(
       }
       mkFuncTy(ps, storageNormGo(t.fnRet, depth - 1, false, false))
     }
-    TyArray => mkArrayTy(storageNormGo(t.aElem, depth - 1, false, param))
+    TyArray => mkArrayTy(storageNormGo(tyElemOf(t), depth - 1, false, param))
     TyMap => {
-      const wk = storageNormGo(t.mKey, depth - 1, false, param)
-      const wv = storageNormGo(t.mVal, depth - 1, false, param)
-      if wk == t.mKey && wv == t.mVal { ty } else { mkMapTy(wk, wv, t.mSet) }
+      const wk = storageNormGo(tyKeyOf(t), depth - 1, false, param)
+      const wv = storageNormGo(tyValOf(t), depth - 1, false, param)
+      if wk == tyKeyOf(t) && wv == tyValOf(t) {
+        ty
+      } else {
+        mkMapTy(wk, wv, t.mSet)
+      }
     }
     TyObj | TyPrim | TyErr | TyVar | TyNeg => ty
   }
