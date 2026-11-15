@@ -1087,8 +1087,6 @@ export class Interp {
       this.store(target, v, env);
       return v;
     }
-    this.store(e.target, v, env);
-    return v;
   }
   freeze(t: Expr, env: Env): Expr {
     if (t.k === "index") return { k: "index", e: { k: "val", v: this.eval(t.e, env, null) }, i: { k: "val", v: this.eval(t.i, env, null) } };
