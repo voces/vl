@@ -155,10 +155,10 @@ distinct frame, laid out by hand as running offsets off `params + declaredLocals
 
 ```vl
 pushScratchBase    = nParams + nLocals
-refPushScratchBase = nParams + nLocals + i32Scratch            // +4 if fnUsesPush
+refPushScratchBase = nParams + nLocals + i32Scratch            // +4 if fnUses.push
 strPushScratchBase = nParams + nLocals + i32Scratch + refScratch
-strScratchBase     = ... + strPushScratch                      // +4 if fnUsesStrPush
-mapScratchBase     = ... + strScratch                          // +7 if fnUsesStrOp
+strScratchBase     = ... + strPushScratch                      // +4 if fnUses.strPush
+mapScratchBase     = ... + strScratch                          // +7 if fnUses.strOp
 ```
 
 …and then the **locals vector** must be emitted with a matching count
