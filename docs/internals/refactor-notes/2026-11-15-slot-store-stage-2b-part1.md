@@ -19,7 +19,7 @@ classes. Part 2 switches the delivery walk's readers and deletes the walk.
   - The 2a estimate of about −700 for the cascade counted those shared helpers.
   - `fnSlotAnnTyOf` (`check_elab_cap.vl`), which only the cascade read, goes with its table
     `fnSlotAnnTys`. `fnSlotAnnNote` now records only the slots handed open.
-- **Ten engine rules replace what the cascade did.** Each was found by a gate witness or a `tests/cases` program. The distilled corpus alone moved none of them: the last five came from `deno task test`.
+- **Eleven engine rules replace what the cascade did.** Each was found by a gate witness or a `tests/cases` program. The distilled corpus alone moved none of them: five came from `deno task test`, and one from the late-demands gate.
 
 | rule | what it replaces | found by |
 |---|---|---|
@@ -33,6 +33,7 @@ classes. Part 2 switches the delivery walk's readers and deletes the walk.
 | A member whose own signature is closed at the leaf's parameters answers by it (an annotated lambda, which has no instances). | `elabHeldOwnResult`. | `generics/generic-value-slot-written-in-generic-body-at-two-instances` |
 | The frame rule also covers a holder that reads its function out of a container (`h = o.f`), and a nested member with no instance under the frame is demanded there. An instance under the frame whose parameter has no recorded type does not disagree. | `elabSlotClose` / `elabSlotFromSources` per instance. | `closures/written-let-in-record-field-aliased-called-in-two-instances`, `closures/returned-lambda-literal-infers-its-parameter` |
 | A field the program re-points with a whole assignment does not take its record literal's value into its class (D12239). | The walk following the most recent write. | `closures/generic-list-held-or-returned-written-lambda-called-where-it-fits` |
+| A container leaf that answers by a nested member's frame instance also demands that member at the leaf's parameters, while the run is open. That is the instance mono reads for the slot's fact. | The cascade's own demand of a nested member, which minted it in time. | late demands: without it, `record-of-written-lambda-let-in-generic-called-per-instance`, `…-returning-capture-per-instance` and `two-lambda-written-let-in-two-instances` minted it after the run |
 
 ## Readings
 
@@ -43,7 +44,7 @@ Fixpoint seeds: master `83a90988d` and this branch, each byte-identical on a sec
 | distilled corpus, per cell (class and message) | 12,036 of 12,037 identical to master. The one mover is `dord011`: `trap_loads` → loud emit reject (`a function value is called at two signatures, and the closure it holds was built for one`). That is a trap now refused, not a lost `runs` |
 | filed witnesses, `--strict`, both inventories | ok (the gate's row) |
 | `decl-order-ab.vl` | 314 of 5,136 cases move, 38 to a clause-1 outcome. Master has 39; one case not in the baseline appears on both |
-| late demands | 6 in 5 files of 6,877 built, against 4 in 4. Three files rise (`record-of-written-lambda-let-in-generic-called-per-instance`, `record-of-written-lambda-let-returning-capture-per-instance`, `two-lambda-written-let-in-two-instances`) and two fall (`error-record-field-of-generic-called-under-shadowing-name`, `error-written-record-field-of-generic-called-and-read-under-is`). The slot facts in the rising three are the same as master's. Mono now mints one nested lambda's instance late, an instance the cascade's own call produced in time. This is recorded as the price, with `--write-baseline` from this branch's fixpoint seed |
+| late demands | 2 in 2 files of 6,885 built, against master's 4 in 4: no file rises, and two fall (`error-record-field-of-generic-called-under-shadowing-name`, `error-written-record-field-of-generic-called-and-read-under-is`). The baseline is lowered for the falls only, written from this branch's fixpoint seed |
 | L2 self-compile guest fuel (`VL_FUEL=1`, each seed building its own tree) | 86.291e9 against master's 86.303e9: −0.01% |
 | seed size | 6,888,449 bytes: +3,866 (+0.06%) over master's fixpoint (gate: ok) |
 | `scripts/gate.sh` | every row ok but `ci-native`. Its 5 failures are the seed-cache and sidecar tests, which fail on master's seed too in this container (`~/.cache/vl/seed` is gone, and the container runs as root) |
