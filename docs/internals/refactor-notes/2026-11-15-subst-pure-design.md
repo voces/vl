@@ -134,3 +134,18 @@ deno run -A scripts/probe-rollback-census.ts --seed <instrumented seed> \
     placeholder still being filled looks acyclic at its own fill, and only becomes cyclic when the
     outer one fills, which bumps.
   - On the corpus, 1,680 of `applyGenAliasTys`' 1,744 bumps are acyclic, out of 136,382 bumps in all.
+
+### Correction: P3 ends the substitution steps; P4 and P5 are dropped
+
+P3 changed what quiet means for the pin notes. Before it, a quiet substitution skipped them. After
+it, a quiet substitution writes them and its quiet level drops them on leaving. That reverses the
+premise of the two steps planned after it:
+
+- **P4** (`shMemo` drops its quiet key). The memo is stamped with `inferQuiet`, so a change of mode
+  invalidates it. Without the key, a loud substitution could hit an entry a quiet one computed. It
+  would skip `substHoleTyReal`, and never write the notes that quiet level rolled back. The key now
+  guards exactly that, so it stays.
+- **P5** (delete the `callArgRepTy`/`callRetRepTy` brackets). Those brackets mean "read this
+  substitution and record nothing", which quiet plus the rollback now delivers. Deleting them would
+  record pin notes loudly at a read, the instance banked after the elaboration settled that their
+  comment forbids. They stay as read-only asks, and use `quietEnterFlat` (`2026-11-15-relate-quiet-flat.md`).

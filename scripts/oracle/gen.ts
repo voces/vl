@@ -157,7 +157,7 @@ class Gen {
     const r = this.r;
     const head: string[] = [];
     for (const t of ["i32", "i64", "f64", "f32"] as T[]) {
-      head.push(`function tr_${t}(s: string, v: ${t}): ${t} { print(s); v }`);
+      head.push(`function tr_${t}(s: string, v: ${t}): ${t} { print(s); return v }`);
     }
     head.push(`function trb(s: string, v: boolean): boolean { print(s); return v }`);
     const nf = r.int(3);
