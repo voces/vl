@@ -217,7 +217,9 @@ defaults to `i32`, as the literal does today. That is settled choice 2 (§9).
 
 At a call, the solver:
 1. instantiates the scheme with fresh variables;
-2. unifies each parameter with its argument's type (lane M3's `relate`, returning bounds as data, §10);
+2. unifies each parameter with its argument's type, pinning the scheme's variables itself. `relate` was
+   measured to pin no hole, but static paths to a pin exist, so a pin inside a fit question fails
+   loudly (§10);
 3. solves the bounds in body order.
 
 | bound | solved by |
@@ -347,8 +349,8 @@ A step marked **identical** must also reproduce its predecessor's seed byte for 
 | **S6** | Freeze exports: an importer instantiates the exporter's `Iface`, and S5's interface hash includes it | graded: the module-boundary population (`incremental-compilation-design.md` §S5's differential test) | +300, −500 |
 | **S7** | Retire `paramSolveProbe`, `cstrProbe`, `RB_SOLVE` and `RB_CSTR_PROBE` | identical | −600 to −1,000 |
 
-Order: S0 first, because it is the measurement. S1 and S2 are independent of each other. S3 needs S2,
-M3's stage C (§10), and the storage decision with lane S (§10). S4 needs S3. S5 needs S3. S6 needs S3. S7 needs S5.
+Order: S0 first, because it is the measurement. S1 and S2 are independent of each other. S3 needs S2 and
+the storage decision with lane S (§10). S4 needs S3. S5 needs S3. S6 needs S3. S7 needs S5.
 
 **S0 is the go/no-go.** If the shadow schemes cannot express a measurable share of the corpus's
 un-annotated functions (5,397 of the corpus's 28,208 named functions have one, §A.7), the bound
@@ -384,18 +386,25 @@ the condition on choice 3 can reopen one as an owner question.
 Replies received 2026-11-15:
 
 - **M3** (relate → Coercion):
-  - **Bounds as data are compatible**, within a boundary. Relate's stage C returns only the hole
-    writes a fit question would make. There are exactly two writers: the solver behind
-    `tyPinElem`/`Key`/`Val` and `holeLink` behind `tyLinkElem`/`Key`/`Val` (lane H confirmed nothing
-    else writes `holeSol`). Stage C logs them in ask mode as Fit steps `ST_PIN{hole, ty}` and
-    `ST_LINK{hole, hole}`.
-  - The demand kinds (`BK_ROW`, `BK_LOWER`, …) do not come out of `relate`. They are written by the
-    checker walk, so they are L2's solver input, from today's rows at S2. A `Bound` variant fits the
-    record, and `relate` contributes only pin and link bounds to it.
-  - **Stage C is no longer gated on lane H**, since H's stages 1 and 2 have landed. It is being
-    measured now: a per-bracket corpus bisection of the six remaining fit-question brackets. The first
-    finding is that at least one of them, the `rtStamp` re-ask, is also a re-entry guard. S3 waits for
-    that result.
+  - **Relate pins no hole, measured dynamically, not by construction** (#8323,
+    `refactor-notes/2026-11-15-relate-c1-quiet-brackets-measured.md` §3).
+    - On the 20,384-program corpus, a counter in `holeSolve`/`holeLink` saw 0 hole writes across
+      445,464 loud `assignableExpr` deliveries.
+    - It saw writes in 2,003 programs overall, which validates the counter: holes are pinned outside
+      the delivery relation.
+    - Static paths from `relate` to a pin do exist: `substTyDeep` → `substHoleTy` → `joinTys` →
+      `constrainEmpty` → `tyPin*`/`tyLink*`, and the generic-alias fill (`applyGenAliasTys`). Neither
+      was observed inside a fit question.
+  - **What L2 takes from this:**
+    - A scheme's bounds come from the deferred demand rows (`*Cstr`, `HD_*`), from today's rows at S2.
+    - The solver makes the pins itself at the call. M3 builds no ask-mode hole log.
+    - L2 does not rely on `relate` never pinning. Two things catch a pin if one happens:
+      - **S3's assertion.** While the solver asks a fit question, `holeSolve`/`holeLink` refuse a write
+        loudly, by a compiler trap with the site, and the full corpus runs under it in S3's gate.
+      - **The seal.** Lane H's stage 4 seals arena types after `arenaFinal`. L2's own seal marks a
+        closed scheme's variables, so a write to one outside the solver's instantiation fails at the
+        writer instead of retyping the scheme.
+    - If either catches a pin, M3 owns the small PR beside `holeSol` that returns it as data.
   - **Coercions stay per instance:** the IR builder asks `coercionAt(ix, inst)`, a pure query, and L2
     adds no checker-side coercion table. The four position seats (box, unbox, atomstr, numeric) are
     applied by the builder.
