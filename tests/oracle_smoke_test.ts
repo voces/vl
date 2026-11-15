@@ -106,6 +106,12 @@ Deno.test("oracle: pinned regressions", () => {
     ["print(9 << (7 % 0xFFFFFFFF))", "9"], // a shift count keeps its own reading (Q8)
     ["const c: boolean = false\nprint(if c { 4294967296 } else { 0xFFFFFFFF })", "4294967295"],
     ["const t: i64 = 5\nconst s: i32 = 4\nprint(min(t, 0xFFFFFFFF << s))", "5"],
+    // 4.3 with Q9: a float constant arm that adopts an f32 arm folds in f32 arithmetic
+    ["const f: f32 = 0.1\nconst c: boolean = false\nprint(if c { f } else { 16777217.0 % 1.5 })", "1"],
+    // Q8: a constant count of 32 to 63 makes the radix left i64, beside an i32 peer too
+    ["const v8: i32 = 5\nprint((-v8) * (0xFFFFFFFF >>> 51))", "0"],
+    // 4.1 / D1890: `as f32` rounds an integer constant once
+    ["print(9000000003 as f32)", "9000000512"],
   ];
   for (const [src, want] of pins) {
     const o = interpret(src + "\n");
