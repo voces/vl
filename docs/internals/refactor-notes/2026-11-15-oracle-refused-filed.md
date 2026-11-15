@@ -28,3 +28,15 @@ D16493 and listed by cell id. Without the two row lines the same cases give COMP
 
 The D16411 fragment is that row's full sentence, so another arm of the same "called at two
 signatures" refusal stays COMPILED-BAD until a row names it.
+
+## Two questions from #8363
+
+- **`0xFFFFFFFF as% i64`**: the compiler prints `4294967295` and the oracle printed `-1`. D3053's
+  ruling (A) says the bare literal, and every negation parity over it, is the constant the digits
+  spell, so the oracle was wrong. It now follows the ruling. Every other radix tree under `as% i64`
+  is a SKIP. The compiler disagrees with itself there: `(0xFFFFFFFF - 1) as% i64` prints
+  `4294967294` but `(0xFFFFFFFF * 2) as% i64` prints `-2`, the same 32-bit pattern. That is filed
+  as D16494 and needs a ruling. The new SKIP fires on 0 of 2,000 arith fuzz cells, because gen.ts
+  spells `i32 → i64` as `as i64`.
+- **`ar_s26_0112`** (D16472): it AGREEs on a host built from master. The shared
+  `scripts/vl-host/target/release/vl` (built 05:58 UTC, before #8314) still prints 17 digits.
