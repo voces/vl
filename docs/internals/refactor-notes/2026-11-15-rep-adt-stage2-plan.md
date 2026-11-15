@@ -49,3 +49,39 @@ never re-derive them) broken at the query, not in the tree.
 **The net-lines estimate is withdrawn until 2a's attribution.** The fallback arms are the
 deletable code, and their size is a per-site count, not the 2,500–3,500 the design guessed from
 whole-function line counts.
+
+## 2a, step 1: where the open-type queries come from
+
+**Method.** A throwaway debug seed, built with names and never committed or placed in `build/`,
+traps on the first `repOfTy` query during emit whose tree reason is `leaf:unnarrowable`. The
+engine's backtrace names the calling chain. It was run over the 2,987 corpus programs that make
+such a query. It finds the *first* site in each program, so a site behind a converted one surfaces
+only after that conversion. The tally is re-run after each batch.
+
+| first site (past the rep plumbing) | chain | programs |
+|---|---|---|
+| `repSigTokOfTy` (`emit_rep_slot.vl`) | `sigKeyOfTy` ← `sigKeyOfTyGo` (`emit_sig_tokens.vl`) | 1,559 |
+| `buildFnMapRowOfRetAnn` (`emit_collect.vl`) | `vtKindOfType` ← `annRepKindOf`, from `buildFnMap` in `runEmitPasses` | 873 |
+| `forceCloListOfTy` (`emit_union_atoms.vl`) | `forceCloResultListTypes` ← `collectTyReachCloSigsArm` | 173 |
+| `readMayBeString` (`emit_classify.vl`) | `exprString` ← `collectAArrayLit` | 166 |
+| `tyRepsAsNulAtom` (`wasmEmit.vl`) | — | 70 |
+| `repABDescWord` (`emit_ref_list_kinds.vl`) | the armed AB oracle itself (`scanPrintUse`); not a real site | 43 |
+| `mvValKindOfTy` (`emit_shape_rows.vl`) | `mvShapeOfMapNodeTy` | 41 |
+| `markInferredJoinAtoms` (`emit_collect.vl`) | `markInferredIfJoins` | 19 |
+| `rowStoreRepIn`, `structIndexOfRep` | — | 1 each |
+
+What the top two ask:
+- **`buildFnMapRowOfRetAnn`** builds a function's result row from its annotation in the
+  `passes` phase. For a generic template that annotation is its own `T`, and no instance exists
+  yet. The default `i32` it banks is overwritten when mono writes the instance into the slot.
+  Its conversion is not "ask the instance type". It is "a template has no row until it is
+  instanced", which needs every reader of a template row before mono found first.
+- **`sigKeyOfTy`** renders a signature key, and keys a template's signature at its open
+  parameter types. Its conversion is the same question. With stage 6 (signatures as `RSig` ids)
+  ahead, a key for an open signature should not be minted.
+
+**Batches**, by owning file and in this order: `emit_collect.vl` (`buildFnMapRowOfRetAnn`,
+`markInferredJoinAtoms`), `emit_sig_tokens.vl` / `emit_rep_slot.vl` (`sigKeyOfTy`),
+`emit_union_atoms.vl` (`forceCloListOfTy`), `emit_classify.vl` (`readMayBeString`),
+`emit_shape_rows.vl` (`mvValKindOfTy`), `wasmEmit.vl` (`tyRepsAsNulAtom`). Each batch is
+byte-identical over the corpus, or names its movers, and re-runs this tally.
