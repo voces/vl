@@ -41,10 +41,12 @@ import {
   irGlobalNote,
   irNodeNew,
   irSigNote,
+  irSpanNote,
   irVarNew,
 } from "./ir"
 import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { irVerify } from "./ir_verify"
+import { irDualEmit, irHexOf, irLoweredEntry } from "./ir_lower"
 import { repNodeGen, repNodeOfTy } from "./emit_rep"
 import { nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import {
@@ -54,7 +56,7 @@ import {
   localIndexOf,
 } from "./emit_classify"
 import { declaredSlotOfDecl } from "./emit_struct_order"
-import { fnStmts } from "./emit_state"
+import { fRecRetTy, fRetVoid, fnStmts } from "./emit_state"
 import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
@@ -63,18 +65,22 @@ import { isVoidTy } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
 
 let ibArmed = false
+let ibDetail = false
 let ibCorrupt = 0
 let ibRowKey: string[] = []
 let ibRowN: i32[] = []
 
-// Arms (1) or disarms (0) the shadow for the compiles that follow.
+// Arms (1) or disarms (0) the shadow for the compiles that follow; 2 also details the first
+// examples of each dual-emit mismatch class.
 export function irShadowArm(on: i32) {
   ibArmed = on != 0
+  ibDetail = on == 2
   0
 }
 
-// The shadow's failing control: 0 verifies the built function, 1 swaps the first variable's rep
-// for another, 2 deletes the first temp's definition. Either must make the verifier fail.
+// The shadow's failing controls: 0 none; 1 swaps the first variable's rep and 2 deletes the first
+// temp's definition, which the verifier must refuse; 3 adds a byte to the lowering and 4 drops a
+// span row, which the dual emit must report.
 export function irShadowCorrupt(k: i32) {
   ibCorrupt = k
   0
@@ -196,24 +202,24 @@ function declVar(d: i32): i32 {
   v
 }
 
-function binPrim(op: string): PrimOp | null {
+function binPrim(op: string, uns: boolean): PrimOp | null {
   if op == "+" { return "add" }
   if op == "-" { return "sub" }
   if op == "*" { return "mul" }
-  if op == "/" { return "div" }
-  if op == "%" { return "rem" }
+  if op == "/" { return if uns { "divu" } else { "div" } }
+  if op == "%" { return if uns { "remu" } else { "rem" } }
   if op == "&" { return "and" }
   if op == "|" { return "or" }
   if op == "^" { return "xor" }
   if op == "<<" { return "shl" }
-  if op == ">>" { return "shr" }
+  if op == ">>" { return if uns { "shru" } else { "shr" } }
   if op == ">>>" { return "shru" }
   if op == "==" { return "eq" }
   if op == "!=" { return "ne" }
-  if op == "<" { return "lt" }
-  if op == "<=" { return "le" }
-  if op == ">" { return "gt" }
-  if op == ">=" { return "ge" }
+  if op == "<" { return if uns { "ltu" } else { "lt" } }
+  if op == "<=" { return if uns { "leu" } else { "le" } }
+  if op == ">" { return if uns { "gtu" } else { "gt" } }
+  if op == ">=" { return if uns { "geu" } else { "ge" } }
   // Assignment, `&&`/`||`, `??` and every other operator are lowered by their own arms.
   null
 }
@@ -301,6 +307,25 @@ function globalRep(g: i32, d: i32): i32 {
   r
 }
 
+// The result type of the function at `fnStmts` slot `pos` (declared at `d`, annotated by `ann`):
+// its annotation, else the checker's inferred result, else its recorded type's; -1 for none.
+function resultTy(pos: i32, ann: i32, d: i32): i32 {
+  if ann >= 0 { return nodeTyAt(ann, d) }
+  const t = fnCheckedRetTy(pos)
+  if t >= 0 { return t }
+  if pos >= 0 && pos < fRecRetTy.length { fRecRetTy[pos] } else { -1 }
+}
+
+// The result rep of that function. Legacy's voidness (`fRetVoid`) decides no value, as its
+// functype does; the tree gives `void` an i32 leaf, so no value is `never`'s rep.
+function resultRep(pos: i32, ann: i32, d: i32): i32 {
+  if pos >= 0 && pos < fRetVoid.length && fRetVoid[pos] == 1 {
+    return repNodeOfTy(TY_NEVER)
+  }
+  const rt = resultTy(pos, ann, d)
+  if isVoidTy(rt) { repNodeOfTy(TY_NEVER) } else { repNodeOfTy(rt) }
+}
+
 // The parameter and result reps of `fnStmts` slot `pos`, noted in `ib`; false when one is not
 // a primitive or void rep.
 function calleeSig(pos: i32): boolean {
@@ -314,8 +339,7 @@ function calleeSig(pos: i32): boolean {
     if !repIsScalar(r) { return false }
     ps.push(r)
   }
-  const rt = if fn.fnRet >= 0 { nodeTyAt(fn.fnRet, d) } else { fnCheckedRetTy(pos) }
-  const rr = if isVoidTy(rt) { repNodeOfTy(TY_NEVER) } else { repNodeOfTy(rt) }
+  const rr = resultRep(pos, fn.fnRet, d)
   if !(repIsScalar(rr) || repIsNoValue(rr)) { return false }
   irSigNote(ib, pos, ps, rr)
   true
@@ -357,15 +381,31 @@ function callRhs(b: i32[], c: Call): Rhs {
   r
 }
 
-// Why operand `ix` is outside the set, or "": it must be typed at a signed or float primitive or
-// `boolean`. An unsigned type shares i32's or i64's rep, and a `PrimOp` carries no signedness yet.
+// Why operand `ix` is outside the set, or "": it must be typed at a numeric primitive or
+// `boolean`, whose signedness picks the op (`opUnsigned`).
 function operandWhy(ix: i32): string {
   const p = tyScalarBasePrim(nodeTyAt(ix, ibFnIx))
   if p == null { return "operand type" }
-  if p == "i32" || p == "i64" || p == "f64" || p == "f32" || p == "boolean" {
-    return ""
-  }
-  "operand at " + p
+  const ps: string = p
+  if isNumericPrim(ps) || ps == "boolean" { return "" }
+  "operand at " + ps
+}
+
+function isNumericPrim(p: string): boolean {
+  p == "i32"
+    || p == "i64"
+    || p == "f64"
+    || p == "f32"
+    || p == "u32"
+    || p == "u64"
+}
+
+// Whether operand `ix` is typed at an unsigned integer, so its op takes the unsigned form.
+function opUnsigned(ix: i32): boolean {
+  const p = tyScalarBasePrim(nodeTyAt(ix, ibFnIx))
+  if p == null { return false }
+  const ps: string = p
+  ps == "u32" || ps == "u64"
 }
 
 function expr(b: i32[], ix: i32): Opnd {
@@ -395,7 +435,7 @@ function expr(b: i32[], ix: i32): Opnd {
   }
   if n is BinExpr {
     if n.binOp == "&&" || n.binOp == "||" { return shortCircuit(b, n, ix, rep) }
-    const p = binPrim(n.binOp)
+    const p = binPrim(n.binOp, opUnsigned(n.binLeft))
     if p == null || n.binIdent != 0 { return miss("operator " + n.binOp) }
     const lw = operandWhy(n.binLeft)
     if lw != "" { return miss(lw) }
@@ -492,6 +532,12 @@ function labelNew(): i32 {
   ibLabelN - 1
 }
 
+function chainLink(e: i32): i32[] {
+  const nb: i32[] = []
+  stmtIn(nb, e)
+  nb
+}
+
 function elseStmts(e: i32): i32[] {
   if e < 0 { return [] }
   const en = nodeAt(e)
@@ -499,7 +545,15 @@ function elseStmts(e: i32): i32[] {
   [e]
 }
 
+// Builds statement `ix` onto `b`, noting the run of nodes it built for the source map.
 function stmt(b: i32[], ix: i32) {
+  const n0 = b.length
+  stmtIn(b, ix)
+  if b.length > n0 { irSpanNote(ib, ix, b[n0], b[b.length - 1]) }
+  0
+}
+
+function stmtIn(b: i32[], ix: i32) {
   if ibMiss != "" { return 0 }
   const n = nodeAt(ix)
   if n is Block {
@@ -520,7 +574,8 @@ function stmt(b: i32[], ix: i32) {
     if ibMiss != "" || opRep(c) != ibBool { return skip("condition") }
     const th = nodeAt(n.ifThen)
     const thenB = if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) }
-    const elseB = bodyOf(elseStmts(n.ifElse))
+    // An `else if` link is part of its chain's statement: no span of its own.
+    const elseB = if n.ifElse >= 0 && nodeAt(n.ifElse) is IfStmt { chainLink(n.ifElse) } else { bodyOf(elseStmts(n.ifElse)) }
     emitNode(
       b,
       { siCond: c, siThen: thenB, siElse: elseB, siOut: -1 },
@@ -594,7 +649,10 @@ function stmt(b: i32[], ix: i32) {
     || n is Unary
     || n is BinExpr
   ) {
-    expr(b, ix)
+    // Legacy evaluates a bare value and drops it.
+    const v = expr(b, ix)
+    if ibMiss != "" { return 0 }
+    emitNode(b, { dpV: v }, -1, ibNoValue, ix)
     return 0
   }
   skip("statement")
@@ -617,9 +675,11 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     if ibMiss == "" && !irBodyLeaves(ib, b) { return skip("valued tail if") }
     return 0
   }
+  const n0 = b.length
   const v = expr(b, last)
   if ibMiss != "" || opRep(v) != ib.irRetRep { return skip("tail coercion") }
   emitNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
+  irSpanNote(ib, last, b[n0], b[b.length - 1])
   0
 }
 
@@ -637,10 +697,8 @@ function build(fnIx: i32, fnPos: i32): string {
   ibLabelN = 0
   ibBool = repNodeOfTy(TY_BOOL)
   if fn.fnTyParams.length > 0 { return "template" }
-  const rt = if fn.fnRet >= 0 { nodeTyAt(fn.fnRet, fnIx) } else { fnCheckedRetTy(fnPos) }
-  ib.irRetTy = rt
-  // The tree gives `void` the i32 flat rep; the IR's no-value rep is `never`'s.
-  ib.irRetRep = if isVoidTy(rt) { repNodeOfTy(TY_NEVER) } else { repNodeOfTy(rt) }
+  ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
+  ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
   const none = repIsNoValue(ib.irRetRep)
   if !(repIsScalar(ib.irRetRep) || none) {
     return "result rep " + repWhat(ib.irRetRep)
@@ -700,8 +758,59 @@ function corrupt() {
   0
 }
 
-// The seam: builds, verifies and discards the function at `fnIx`, counting the outcome.
-export function irShadowFn(fnIx: i32, fnPos: i32) {
+// The dual emit of a verified function: its lowering against the legacy code entry `emitFuncCode`
+// wrote onto `out` from `outStart`, and the span rows it banked from `spanBase`.
+function dualEmit(fnIx: i32, out: u8[], outStart: i32, spanBase: i32) {
+  const legacy: u8[] = []
+  let i = outStart
+  while i < out.length {
+    legacy.push(out[i])
+    i = i + 1
+  }
+  const fn = nodeAt(fnIx)
+  const firstLocal = if fn is FuncDecl { fn.fnParams.length + envSlotShift(fnIx) } else { 0 }
+  const skew = if ibCorrupt == 3 { 1 } else if ibCorrupt == 4 { 2 } else { 0 }
+  const why = irDualEmit(ib, firstLocal, legacy, spanBase, outStart, skew)
+  if why == "" {
+    count("matched")
+    return 0
+  }
+  count("mismatch " + why)
+  if ibDetail && rowN("mismatch " + why) <= 3 {
+    count(
+      "detail "
+        + why
+        + " in "
+        + ib.irName
+        + "\nlegacy "
+        + irHexOf(legacy)
+        + "\nir     "
+        + irHexOf(irLoweredEntry())
+        + "\n"
+        + irFnText(ib),
+    )
+  }
+  0
+}
+
+// How many times row `key` has been counted.
+function rowN(key: string): i32 {
+  let i = 0
+  while i < ibRowKey.length {
+    if ibRowKey[i] == key { return ibRowN[i] }
+    i = i + 1
+  }
+  0
+}
+
+// The seam: builds, verifies, lowers and discards the function at `fnIx`, counting the outcome.
+export function irShadowFn(
+  fnIx: i32,
+  fnPos: i32,
+  out: u8[],
+  outStart: i32,
+  spanBase: i32,
+) {
   count("fns")
   const gen = repNodeGen()
   const why = build(fnIx, fnPos)
@@ -719,6 +828,7 @@ export function irShadowFn(fnIx: i32, fnPos: i32) {
   }
   if v.vfRule == 0 {
     count("verified")
+    dualEmit(fnIx, out, outStart, spanBase)
     return 0
   }
   count(
