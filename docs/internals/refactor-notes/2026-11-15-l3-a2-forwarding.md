@@ -27,6 +27,9 @@ trap of the refusal (`--names`) showed it raised by `validateRcwPins`, through
 
 **Measured.** `record-param-width-before` and `-between`, master fixpoint against this
 branch's: 24 → 26 of 30 graded run (`generic_fwd`, both faces). `-after` stays 30/30.
-0 runs → not-runs, 0 silent. Seed +785 bytes.
+0 runs → not-runs, 0 silent. D4020's witness, a wider record through two generic levels, moves
+from its loud check reject to runs in both declaration orders; its pinning fixture is now a run
+fixture (`width-record-through-generic-chain-runs.vl`). Seed +785 bytes; L2 self-compile guest fuel
+86,305,913,308 → 86,361,111,398 (+0.06%).
 
 **Size.** Net +42 compiler lines; pin-helper delta 0.
