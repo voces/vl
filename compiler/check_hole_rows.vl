@@ -7,6 +7,7 @@
 // roll them back for a quiet probe.
 
 import {
+  T,
   TY_BOOL,
   TY_OPEN,
   TyArray,
@@ -30,6 +31,7 @@ import {
   tyEq,
   tyIsHole,
   tyIsLitUnion,
+  tyLinkElem,
   tyToStr,
   tyValOf,
 } from "./check_types"
@@ -39,6 +41,7 @@ import { tyIsDeferredJoin } from "./check_tp_join"
 import { isNeverTy, tyReachesHole } from "./tyquery"
 import { cstrOwnerTop } from "./check_cstr_rows"
 import { i32ListHas } from "./listutil"
+import { HD_ELEM, hdBase, hdKind, hdRowOf } from "./check_hole_pins"
 
 // Demanded hole shapes: a member access on an inference-hole param (`self.x` where `self`
 // is the hole `?add.0`) records field `x` on the hole's demanded shape, a TyObj that grows
@@ -347,6 +350,49 @@ export function holeMapDemandTy(name: string, isSet: boolean) {
   holeMapNames.push(name)
   holeMapTys.push(ty)
   ty
+}
+
+// A record written to a hole receiver's derived element `elem` links each open list field to the
+// same field of the first record written there, so one pin solves both (D16365).
+export function holeElemRecLink(elem: i32, rec: i32) {
+  const row = hdRowOf(elem)
+  if row < 0 || hdKind[row] != HD_ELEM || rec < 0 || rec >= T.tys.length {
+    return 0
+  }
+  const p = tyAt(rec)
+  if !(p is TyObj) { return 0 }
+  const first = holeElemRecFirst(arrayDemandKey(hdBase[row]), rec)
+  if first == rec || first < 0 || first >= T.tys.length { return 0 }
+  const f = tyAt(first)
+  if !(f is TyObj) { return 0 }
+  let i = 0
+  while i < p.objFieldNames.length {
+    let j = 0
+    while (
+      j < f.objFieldNames.length
+      && f.objFieldNames[j] != p.objFieldNames[i]
+    ) {
+      j = j + 1
+    }
+    if j < f.objFieldNames.length {
+      const fa = tyAt(f.objFieldTypes[j])
+      const pa = tyAt(p.objFieldTypes[i])
+      if fa is TyArray && pa is TyArray { tyLinkElem(fa, pa) }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The first record written to the derived element of the hole `key` names, recording `rec` when
+// none is; it rides the map rows under a key no hole name spells, so it rolls back with them.
+function holeElemRecFirst(key: string, rec: i32): i32 {
+  const k = "!r!" + key
+  const have = holeMapOf(k)
+  if have >= 0 { return have }
+  holeMapNames.push(k)
+  holeMapTys.push(rec)
+  rec
 }
 
 // Whether any `is` guard in the body tested hole `name` — `holeAltNames` is the record, and
