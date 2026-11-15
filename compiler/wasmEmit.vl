@@ -1,4 +1,5 @@
 import { asgNameWiderRow, cloRetValSlot } from "./emit_classify"
+import { RETURN_RULE } from "./return_rule"
 import { identityBinIsMixed } from "./emit_fn_scans"
 import { identityArmSlot } from "./emit_if_arm_values"
 import {
@@ -33301,6 +33302,8 @@ function emitStmtGo(body: u8[], stmtIx: i32, fnIx: i32) {
         return 0
       }
     }
+    // A returned `if` lowers tail-aware, each arm returning its own value, as a tail one does.
+    if nodeAt(s.retArg) is IfStmt { return emitRetIf(body, s.retArg, fnIx) }
     // Seed the return context + emit the value (struct / list / union / nullable /
     // widening) and terminate the exit, via the shared helper.
     return emitReturnExit(body, s.retArg, fnIx)
@@ -33323,6 +33326,19 @@ function emitStmtGo(body: u8[], stmtIx: i32, fnIx: i32) {
     return 0
   }
   emitFail("emitProgram: unsupported statement in body")
+}
+
+// Lowers `return` of the `if` at `ifIx`: each arm returns its value, and the fall-through returns
+// `null` where the result admits it, else is unreachable, as a function's end is.
+function emitRetIf(body: u8[], ifIx: i32, fnIx: i32): i32 {
+  if emitStmtTail(body, ifIx, fnIx) < 0 { return -1 }
+  if fnRetNullBearing(fnIx) {
+    if emitNullForRet(body, fnIx) < 0 { return -1 }
+    if uSinkFired > 0 { emitUnionRetSink(fnIx) } else { fbReturn() }
+  } else {
+    fbUnreachable() // 0x00 unreachable: an exhaustive chain, which the checker proved total
+  }
+  0
 }
 
 // Whether discarded statement `stmtIx` is a list or record literal built only of constants and
@@ -36294,7 +36310,8 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32) {
     }
     let i = 0
     while i < n {
-      const isLast = i == n - 1 && !bodyIsVoid
+      // Under the return rule only an expression body's statement is its value (RETURN_RULE).
+      const isLast = i == n - 1 && !bodyIsVoid && (!RETURN_RULE || b.pos < 0)
       // Banked after whichever arm lowers it: an implicit return leaves through
       // `emitReturnExit`, so hooking the plain arm alone missed the tail statement.
       const tlAt = body.length

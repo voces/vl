@@ -1,8 +1,16 @@
 // A function declaration: its parameters and their defaults, the solve for un-annotated
 // parameters, its body and its return.
 
-import { RR_A1, rrMigrate, rrNote } from "./return_rule"
-import { nodePos } from "./fmt_util"
+import {
+  RETURN_RULE,
+  RR_A1,
+  RR_A2,
+  RR_A3,
+  rrMigrate,
+  rrNote,
+  rrNotePure,
+} from "./return_rule"
+import { nodePos, nodeStartTok } from "./fmt_util"
 import { tySame } from "./check_types"
 import { ivSeedMovedWidth } from "./check_intrinsic_values"
 import {
@@ -25,6 +33,7 @@ import {
   annTsOf,
   arenaSetNode,
   blockTailIsDead,
+  fnNameIsLambda,
   fnTpBoundOf,
   i32ToStr,
   nodeAt,
@@ -527,7 +536,7 @@ function checkParamDefaults(n: FuncDecl, params: i32[], paramTys: i32[]) {
 // Checks each value a tail `if`/`else` (or the chain a `match` desugared to) yields against
 // the declared return `ret`, at the arm that yields it — the check the bare tail expression
 // gets. An arm that exits, yields no value or already failed is left to its own rule (D2234).
-function checkTailArmsAgainst(ix: i32, ret: i32) {
+export function checkTailArmsAgainst(ix: i32, ret: i32) {
   const leaves: i32[] = []
   tailValueLeaves(ix, leaves)
   let i = 0
@@ -1428,6 +1437,9 @@ function fnDeclCheckBody(
         // `inferObserved` before a recursive sibling branch is checked.
         const savedRTPbody = retTailPos
         let tailIsReturn = s == stmts.length - 1
+        // Under the return rule a block body's last statement is a statement (RETURN_RULE).
+        const ruleTail = tailIsReturn && RETURN_RULE && nodePos(n.fnBody) >= 0
+        if ruleTail { tailIsReturn = false }
         if tailIsReturn && blockTailIsDead(stmts) {
           tailIsReturn = false
           noteDeadTailBlk(n.fnBody)
@@ -1455,6 +1467,8 @@ function fnDeclCheckBody(
         const savedSpine = spineAt
         spineAtSet(-1)
         if s == stmts.length - 1 { spineAtSet(stmts[s]) }
+        // The migration writes at the statement as written, before its check rewrites it.
+        const rrTok = if (rrMigrate && tailIsReturn) || ruleTail { nodeStartTok(stmts[s]) } else { -1 }
         const stTy = checkNodeHook(stmts[s])
         spineAtSet(savedSpine)
         crStmtLeave()
@@ -1467,7 +1481,10 @@ function fnDeclCheckBody(
         // return-type witness. With a CONCRETE annotated return, a trailing empty
         // collection (`mk(): i32[] { … inner }`) pins its element from the return
         // type here — before the body scope is popped (and `inner`'s floor checked).
-        if tailIsReturn && rrMigrate { rrNoteTail(n.fnBody, stmts[s], fnIx) }
+        if tailIsReturn && rrMigrate && !isVoidTy(stTy) {
+          rrNoteTail(n.fnBody, stmts[s], fnIx, rrTok)
+        }
+        if ruleTail && !inferring { rrRuleTail(n, fnIx, stmts[s], ret, rrTok) }
         if tailIsReturn {
           if !inferring { fnTailGradeAgainstRet(stmts[s], stTy, ret) }
           if inferring {
@@ -1779,14 +1796,42 @@ function lamLitResult(t: i32, depth: i32): boolean {
 // Records tail `tl` of body `body` for the return migration when today's rule returns it: a
 // value expression, a value `if` or `match`, a labelled block or a value loop, never a `return`.
 // A one-statement synthetic body is an expression body, unless it is an object literal (A1).
-function rrNoteTail(body: i32, tl: i32, fnIx: i32) {
+function rrNoteTail(body: i32, tl: i32, fnIx: i32, tok: i32) {
   if body < 0 || tl < 0 { return 0 }
   const t = nodeAt(tl)
   if nodePos(body) < 0 {
-    if RR_A1 && t is ObjLit { rrNote(tl, fnIx, 1) }
+    if RR_A1 && t is ObjLit { rrNote(tl, fnIx, 1, tok) }
     return 0
   }
-  if rrTailIsValue(tl) { rrNote(tl, fnIx, 0) }
+  // A3 off: a lambda keeps its tail, so the migration leaves it alone.
+  const fd = nodeAt(fnIx)
+  if !RR_A3 && fd is FuncDecl && fnNameIsLambda(fd.fnName) { return 0 }
+  if rrTailIsValue(tl) { rrNote(tl, fnIx, 0, tok) }
+  0
+}
+
+// A block body's last statement under the return rule: a value expression where the function
+// declares a value is refused, `null`-admitting included, since falling off would return `null`
+// in its place; a pure one where it declares none is noted for the A2 warning.
+function rrRuleTail(n: FuncDecl, fnIx: i32, tl: i32, ret: i32, tok: i32) {
+  if !rrTailIsValue(tl) || stmtAlwaysExits(tl) { return 0 }
+  if (
+    n.fnRet >= 0
+    && ret >= 0
+    && !isVoidTy(ret)
+    && ret != TY_NEVER
+    && ret != TY_ERR
+  ) {
+    tErr(
+      fnWhoOf(fnIx, "`")
+        + " returns "
+        + tyToStr(ret)
+        + ", but a block body returns a value only through `return`: write `return` before its last expression",
+      tl,
+    )
+  } else if RR_A2 {
+    rrNotePure(tl, tok)
+  }
   0
 }
 

@@ -8,11 +8,22 @@ import {
   strContains,
   topPathSeg,
 } from "./strutil"
-import { rrMigrateSet } from "./return_rule"
+import {
+  rrColAt,
+  rrCount,
+  rrKindAt,
+  rrLineAt,
+  rrMigrateSet,
+  rrPureCount,
+  rrPureTokAt,
+  rrTokAt,
+  rrWritesReturn,
+} from "./return_rule"
+import { srcmapModOfTok } from "./srcmap"
 import { engineFailOffset } from "./engine_msg"
 import { setTestEmitRefusal } from "./emit_state"
 import { strListHas } from "./listutil"
-import { STRICT_EQ_CODE, i32ToStr } from "./ast"
+import { P, STRICT_EQ_CODE, i32ToStr } from "./ast"
 import {
   expInfColAt,
   expInfCount,
@@ -1806,6 +1817,47 @@ function cliAddReportStreams() {
   }
 }
 
+// The return rule's rows of module `mod`: under `--migrate-return` each tail today's rule
+// returns (`info`), and under the rule a discarded pure tail (A2, `warning`).
+function cliReturnRuleRows(r: CliRows, mod: i32) {
+  let i = 0
+  while i < rrCount() {
+    if rrWritesReturn(i) && srcmapModOfTok(rrTokAt(i)) == mod {
+      const ob = rrKindAt(i) == 1
+      cliRowAdd(
+        r,
+        "info",
+        if ob { "implicit-return-object" } else { "implicit-return" },
+        rrLineAt(i),
+        rrColAt(i),
+        rrLineAt(i),
+        rrColAt(i) + 1,
+        if ob { "braces after a signature are a block: write `{ return { … } }`" } else { "a block body returns a value only through `return`" },
+      )
+    }
+    i = i + 1
+  }
+  let k = 0
+  while k < rrPureCount() {
+    const tk = rrPureTokAt(k)
+    if tk >= 0 && tk < P.toks.length && srcmapModOfTok(tk) == mod {
+      const ln = P.toks[tk].line
+      cliRowAdd(
+        r,
+        "warning",
+        "discarded-tail-value",
+        ln,
+        P.toks[tk].col,
+        ln,
+        P.toks[tk].col + 1,
+        "this value is discarded: a block body returns a value only through `return`",
+      )
+    }
+    k = k + 1
+  }
+  0
+}
+
 // The checker's rows of one module, in report order, as `cliStreamRows` reads them.
 type CliRows = {
   sev: string[],
@@ -1847,6 +1899,7 @@ function cliRowAdd(
 // graph check merges every module and only the entry's positions map onto the reported file.
 function cliStreamRows(mod: i32): CliRows {
   const r = cliRowsNew()
+  cliReturnRuleRows(r, mod)
   // Redundant explicit type annotations (a `hint`): `let x: T = e` where the initializer
   // already infers to exactly `T`. The span is `cliRedunEndCol`'s.
   let ri = 0
@@ -3433,24 +3486,7 @@ function cliCollectFixes(src: string) {
     // carries other modules' findings, whose positions do not map onto `src`.
     if cliLintModAt(k) == 0 && ln >= 0 && ln < starts.length {
       const off = starts[ln] + col
-      if code == "implicit-return" {
-        pos.push(off)
-        len.push(0)
-        txt.push("return ")
-        what.push("implicit return")
-        eln.push(ln + 1)
-        ecl.push(col)
-      } else if code == "implicit-return-object" {
-        const end = cliBraceEnd(src, off)
-        if end > off {
-          pos.push(off)
-          len.push(end - off)
-          txt.push("{ return " + src.slice(off, end) + " }")
-          what.push("implicit return")
-          eln.push(ln + 1)
-          ecl.push(col)
-        }
-      } else if code == "prefer-const" {
+      if code == "prefer-const" {
         if (
           off + 3 <= src.length
           && src[off] == 'l'
@@ -3480,6 +3516,39 @@ function cliCollectFixes(src: string) {
   }
   for lb in impLb {
     cliImportFixEdits(src, lb, impOff, starts, "unused import")
+  }
+  // `--migrate-return`: `return ` before each entry-module tail today's rule returns, or
+  // `{ return { … } }` around an object-literal body.
+  let rq = 0
+  while rq < rrCount() {
+    const rl = rrLineAt(rq) - 1
+    if (
+      rrWritesReturn(rq)
+      && srcmapModOfTok(rrTokAt(rq)) == 0
+      && rl >= 0
+      && rl < starts.length
+    ) {
+      const off = starts[rl] + rrColAt(rq)
+      if rrKindAt(rq) == 1 {
+        const end = cliBraceEnd(src, off)
+        if end > off {
+          pos.push(off)
+          len.push(end - off)
+          txt.push("{ return " + src.slice(off, end) + " }")
+          what.push("implicit return")
+          eln.push(rl + 1)
+          ecl.push(rrColAt(rq))
+        }
+      } else if off >= 0 && off < src.length {
+        pos.push(off)
+        len.push(0)
+        txt.push("return ")
+        what.push("implicit return")
+        eln.push(rl + 1)
+        ecl.push(rrColAt(rq))
+      }
+    }
+    rq = rq + 1
   }
   cliZeroBytesEdits(src, starts)
   cliCastEdits(src, starts)

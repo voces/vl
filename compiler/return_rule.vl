@@ -4,6 +4,22 @@
 // A1 braces after a signature are always a block, A2 a discarded pure tail warns, A3 a
 // callback gets no exception. `rrMigrate` is `vl check --fix --migrate-return`, which records
 // each tail today's rule returns so the fix can write its `return`.
+import {
+  ArrayLit,
+  BinExpr,
+  BoolLit,
+  CharLit,
+  Ident,
+  Index,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  P,
+  StrLit,
+  Unary,
+  nodeAt,
+} from "./ast"
 import { i32ListHas } from "./listutil"
 import { nodeTyIxOf } from "./check_node_tys"
 import { T, TY_ERR, TY_NEVER, TyFunc, tyAt } from "./check_types"
@@ -23,21 +39,39 @@ export function rrMigrateSet(v: boolean) { rrMigrate = v }
 let rrTailIx: i32[] = []
 let rrTailFn: i32[] = []
 let rrTailKind: i32[] = []
+let rrTailTok: i32[] = []
+let rrTailLine: i32[] = []
+let rrTailCol: i32[] = []
+// The discarded pure tails the A2 warning names.
+let rrPureIx: i32[] = []
+let rrPureTok: i32[] = []
 
 // Forgets the recorded tails, for a new program.
 export function rrReset() {
   rrTailIx = []
   rrTailFn = []
   rrTailKind = []
+  rrTailTok = []
+  rrTailLine = []
+  rrTailCol = []
+  rrPureIx = []
+  rrPureTok = []
   0
 }
 
-// Records tail `t` of function `fn`, of kind `k`, once.
-export function rrNote(t: i32, fn: i32, k: i32) {
+// Records tail `t` of function `fn`, of kind `k`, starting at token `tok` as written, once.
+export function rrNote(t: i32, fn: i32, k: i32, tok: i32) {
   if !rrMigrate || t < 0 || i32ListHas(rrTailIx, t) { return 0 }
   rrTailIx.push(t)
   rrTailFn.push(fn)
   rrTailKind.push(k)
+  rrTailTok.push(tok)
+  rrTailLine.push(
+    if tok >= 0 && tok < P.toks.length { P.toks[tok].line } else { 0 },
+  )
+  rrTailCol.push(
+    if tok >= 0 && tok < P.toks.length { P.toks[tok].col } else { 0 },
+  )
   0
 }
 
@@ -45,6 +79,18 @@ export function rrCount(): i32 { rrTailIx.length }
 export function rrTailAt(i: i32): i32 { rrTailIx[i] }
 export function rrFnAt(i: i32): i32 { rrTailFn[i] }
 export function rrKindAt(i: i32): i32 { rrTailKind[i] }
+export function rrTokAt(i: i32): i32 { rrTailTok[i] }
+export function rrLineAt(i: i32): i32 { rrTailLine[i] }
+export function rrColAt(i: i32): i32 { rrTailCol[i] }
+
+// Whether recorded tail `i` gets a `return`: its function's final type returns a value and the
+// tail's own does too, so a `void` call ending a value function stays a statement.
+export function rrWritesReturn(i: i32): boolean {
+  if rrTailKind[i] == 1 { return true }
+  const tt = nodeTyIxOf(rrTailIx[i])
+  if tt >= 0 && isVoidTy(tt) { return false }
+  rrFnReturnsValue(rrTailFn[i])
+}
 
 // Whether function `fn`'s final type returns a value, so its recorded tail is one.
 export function rrFnReturnsValue(fn: i32): boolean {
@@ -54,3 +100,31 @@ export function rrFnReturnsValue(fn: i32): boolean {
   if !(f is TyFunc) { return false }
   f.fnRet >= 0 && !isVoidTy(f.fnRet) && f.fnRet != TY_NEVER && f.fnRet != TY_ERR
 }
+
+// Records discarded tail `t` for the A2 warning when it is pure: a name, a literal, an operator
+// that stores nothing, a field or element read, or a record or list literal.
+export function rrNotePure(t: i32, tok: i32) {
+  if t < 0 || t >= P.nodes.length || i32ListHas(rrPureIx, t) { return 0 }
+  const n = nodeAt(t)
+  const pure = n is Ident
+    || n is NumLit
+    || n is StrLit
+    || n is CharLit
+    || n is BoolLit
+    || n is NullLit
+    || n is Member
+    || n is Index
+    || n is ObjLit
+    || n is ArrayLit
+    || n is Unary
+    || n is BinExpr && n.binOp != "="
+  if pure {
+    rrPureIx.push(t)
+    rrPureTok.push(tok)
+  }
+  0
+}
+
+export function rrPureCount(): i32 { rrPureIx.length }
+export function rrPureAt(i: i32): i32 { rrPureIx[i] }
+export function rrPureTokAt(i: i32): i32 { rrPureTok[i] }
