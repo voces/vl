@@ -217,7 +217,9 @@ defaults to `i32`, as the literal does today. That is settled choice 2 (§9).
 
 At a call, the solver:
 1. instantiates the scheme with fresh variables;
-2. unifies each parameter with its argument's type, pinning the scheme's variables itself (`relate` pins no hole, §10);
+2. unifies each parameter with its argument's type, pinning the scheme's variables itself. `relate` was
+   measured to pin no hole, but static paths to a pin exist, so a pin inside a fit question fails
+   loudly (§10);
 3. solves the bounds in body order.
 
 | bound | solved by |
@@ -384,18 +386,25 @@ the condition on choice 3 can reopen one as an owner question.
 Replies received 2026-11-15:
 
 - **M3** (relate → Coercion):
-  - **Relate pins no hole in practice** (measured in #8323,
-    `refactor-notes/2026-11-15-relate-c1-quiet-brackets-measured.md` §3). On the 20,384-program
-    corpus, a counter in `holeSolve`/`holeLink` saw 0 hole writes across 445,464 loud `assignableExpr`
-    deliveries. It saw writes in 2,003 programs overall, which validates the counter. Holes are pinned
-    outside the delivery relation.
-  - The one path by which a fit question could reach a pin is substitution: `substTyDeep` →
-    `substHoleTy` → `joinTys` → `constrainEmpty` → `tyPin*`/`tyLink*`, plus the generic-alias fill
-    (`applyGenAliasTys`). Both are statically reachable and were never observed inside a fit question.
-  - So a scheme's bounds come entirely from the deferred demand rows (`*Cstr`, `HD_*`), from today's
-    rows at S2. `relate` contributes no bound, and L2's solver makes the pins itself at the call. M3
-    builds no ask-mode hole log (`ST_PIN`/`ST_LINK`), and L2 does not need one. If S3 finds a pin
-    inside a fit question after all, M3 owns that small PR beside `holeSol`.
+  - **Relate pins no hole, measured dynamically, not by construction** (#8323,
+    `refactor-notes/2026-11-15-relate-c1-quiet-brackets-measured.md` §3).
+    - On the 20,384-program corpus, a counter in `holeSolve`/`holeLink` saw 0 hole writes across
+      445,464 loud `assignableExpr` deliveries.
+    - It saw writes in 2,003 programs overall, which validates the counter: holes are pinned outside
+      the delivery relation.
+    - Static paths from `relate` to a pin do exist: `substTyDeep` → `substHoleTy` → `joinTys` →
+      `constrainEmpty` → `tyPin*`/`tyLink*`, and the generic-alias fill (`applyGenAliasTys`). Neither
+      was observed inside a fit question.
+  - **What L2 takes from this:**
+    - A scheme's bounds come from the deferred demand rows (`*Cstr`, `HD_*`), from today's rows at S2.
+    - The solver makes the pins itself at the call. M3 builds no ask-mode hole log.
+    - L2 does not rely on `relate` never pinning. Two things catch a pin if one happens:
+      - **S3's assertion.** While the solver asks a fit question, `holeSolve`/`holeLink` refuse a write
+        loudly, by a compiler trap with the site, and the full corpus runs under it in S3's gate.
+      - **The seal.** Lane H's stage 4 seals arena types after `arenaFinal`. L2's own seal marks a
+        closed scheme's variables, so a write to one outside the solver's instantiation fails at the
+        writer instead of retyping the scheme.
+    - If either catches a pin, M3 owns the small PR beside `holeSol` that returns it as data.
   - **Coercions stay per instance:** the IR builder asks `coercionAt(ix, inst)`, a pure query, and L2
     adds no checker-side coercion table. The four position seats (box, unbox, atomstr, numeric) are
     applied by the builder.
