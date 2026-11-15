@@ -699,7 +699,7 @@ re-linked through `emitLinkSection` equals the direct output:
 | `tests/cases`, 5,086 modules | 6,099 | 84,642 | 56,250 | 0 |
 
 **What `-O` still changes in the emitter.** Before emission the host calls `setOptimized(1)`
-and, with `--low-memory-unused`, `setLowMemoryUnused`. Seven functions read the two flags:
+and, with `--low-memory-unused`, `setLowMemoryUnused`. Eight functions read the two flags:
 
 | reader | flag | plain | `-O` |
 | --- | --- | --- | --- |
@@ -707,6 +707,7 @@ and, with `--low-memory-unused`, `setLowMemoryUnused`. Seven functions read the 
 | `strFillPlan` (`emit_sections.vl`) | `gOptimized` | long pooled strings fill from a passive segment | each is built inline |
 | `emitPushAppend` (`wasmEmit.vl`) | `gOptimized` | a push grows through `__grow_<row>__` | the grow is inline, where binaryen can melt or drop it |
 | `emitListIdxTrapOf` (`wasmEmit.vl`) | `gOptimized` | a failing list-index guard reads index 0 of the shared empty backing | the trap is inline, where binaryen shares it between checks of one index |
+| `emitMapProbe` (`wasmEmit.vl`) | `gOptimized` | a get or has probes through `__map_entry*__`, which answers the entry | the slot probe and the index read stay at the site |
 | `emitMemAddr`, `emitLowMemAccessorCall`, `emitCallCoreUserFn` (`wasmEmit.vl`) | `gLowMemUnused` | the address is computed | its constant folds into the memarg |
 
 Over the 4,315 single-file cases, the `-O` flavour changes 782 modules: 694 by the map-set
