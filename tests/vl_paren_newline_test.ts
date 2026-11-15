@@ -51,7 +51,7 @@ Deno.test({
         f,
         "const x = (\n  1 + 2\n)\n" +
           "function f(a: i32, b: i32): i32 {\n" +
-          "  if (\n    a == 1 &&\n    b == 2\n  ) {\n    return 1\n  }\n  0\n}\n" +
+          "  if (\n    a == 1 &&\n    b == 2\n  ) {\n    return 1\n  }\n  return 0\n}\n" +
           "print(x)\n" +
           "print(f(1, 2))\n",
       );
@@ -78,7 +78,7 @@ Deno.test({
         "function f(aaaaaaaa: i32, bbbbbbbb: i32, cccccccc: i32, dddddddd: i32, eeeeeeee: i32): i32 {\n" +
           "  if aaaaaaaa == 1 && bbbbbbbb == 2 && cccccccc == 3 && dddddddd == 4 && eeeeeeee == 5 {\n" +
           "    return 1\n" +
-          "  }\n  0\n}\n",
+          "  }\n  return 0\n}\n",
       );
       const fmt = await runVL("fmt", f);
       if (fmt.code !== 0) throw new Error(`fmt failed: ${fmt.err}`);
@@ -114,7 +114,7 @@ Deno.test({
         "const ok = (a == 1\n  || b == 2)\n" +
         "const xs = [a * 4\n  + 8, 99]\n" +
         "const obj = { v: a\n  + 1 }\n" +
-        "const sep = (x: i32) => {\n  let v = x\n  v\n  -v\n}\n" +
+        "const sep = (x: i32) => {\n  let v = x\n  v\n  return -v\n}\n" +
         "print(ok)\nprint(xs[0])\nprint(obj.v)\nprint(sep(1))\n";
       const f = `${dir}/a.vl`;
       await Deno.writeTextFile(f, src);
@@ -159,7 +159,7 @@ Deno.test({
       const f = `${dir}/s.vl`;
       await Deno.writeTextFile(
         f,
-        "function f() {\n  let a = 1\n  a\n  -a\n}\nprint(f())\n",
+        "function f() {\n  let a = 1\n  a\n  return -a\n}\nprint(f())\n",
       );
       const r = await runVL("run", f);
       if (r.code !== 0) throw new Error(`statement-level probe failed: ${r.err}`);
@@ -206,24 +206,24 @@ Deno.test({
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_leadminus_" });
     try {
-      const src = "function note(t: string) {\n  print(t)\n  100\n}\n" +
+      const src = "function note(t: string) {\n  print(t)\n  return 100\n}\n" +
         "function cam(alphaLonger: f64, betaLonger: f64, gammaLonger: f64) {\n" +
         "  const w = alphaLonger * 3.0 - betaLonger * 3.5 - gammaLonger * 1.25 + alphaLonger * 2.0\n" +
-        "  w\n}\n" +
-        "function joined(a: i32, b: i32) {\n  a\n  - b\n}\n" +
-        "function tight(x: i32) {\n  note(\"n\")\n  -x\n}\n" +
-        "function neg2(x: i32) {\n  note(\"m\")\n  - -x\n}\n" +
-        "function neg1(x: i32) {\n  - -x\n}\n" +
-        "function tabbed(a: i32, b: i32) {\n  const r = a\n\t-\tb\n  r\n}\n" +
-        "function commented(a: i32, b: i32) {\n  const r = a\n    // the subtrahend\n    - b\n  r\n}\n" +
+        "  return w\n}\n" +
+        "function joined(a: i32, b: i32) {\n  return a\n  - b\n}\n" +
+        "function tight(x: i32) {\n  note(\"n\")\n  return -x\n}\n" +
+        "function neg2(x: i32) {\n  return note(\"m\")\n  - -x\n}\n" +
+        "function neg1(x: i32) {\n  return - -x\n}\n" +
+        "function tabbed(a: i32, b: i32) {\n  const r = a\n\t-\tb\n  return r\n}\n" +
+        "function commented(a: i32, b: i32) {\n  const r = a\n    // the subtrahend\n    - b\n  return r\n}\n" +
         "function ret(a: i32, b: i32) {\n  return a\n    - b\n}\n" +
-        "function inParens(a: i32, b: i32) {\n  (a\n    -b)\n}\n" +
-        "function spacedOne(a: i32) {\n  const x = a\n  x\n  - 1\n}\n" +
-        "function arm(x: i32) {\n  match x {\n    1 => 10\n    - 1 => 20\n    _ => 30\n  }\n}\n" +
+        "function inParens(a: i32, b: i32) {\n  return (a\n    -b)\n}\n" +
+        "function spacedOne(a: i32) {\n  const x = a\n  return x\n  - 1\n}\n" +
+        "function arm(x: i32) {\n  return match x {\n    1 => 10\n    - 1 => 20\n    _ => 30\n  }\n}\n" +
         // A multi-line or-pattern, spaced at statement level and tight inside a call (D3699).
-        "function orSpaced(x: i32) {\n  match x {\n    3 => 10\n    - 1 |\n    - 2 => 20\n    _ => 30\n  }\n}\n" +
+        "function orSpaced(x: i32) {\n  return match x {\n    3 => 10\n    - 1 |\n    - 2 => 20\n    _ => 30\n  }\n}\n" +
         "const orY = -2\n" +
-        "function orTight() {\n  print(\n    match orY {\n      3 => 10\n      -1 |\n      -2 => 40\n      _ => 30\n    },\n  )\n  0\n}\n" +
+        "function orTight() {\n  print(\n    match orY {\n      3 => 10\n      -1 |\n      -2 => 40\n      _ => 30\n    },\n  )\n  return 0\n}\n" +
         "print(\"\\{cam(2.0, 1.0, 4.0)}\")\nprint(joined(9, 4))\nprint(tight(5))\nprint(neg2(5))\n" +
         "print(neg1(5))\nprint(tabbed(6, 2))\nprint(commented(6, 2))\nprint(ret(5, 2))\n" +
         "print(inParens(5, 2))\nprint(spacedOne(4))\nprint(arm(-1))\n" +
@@ -239,7 +239,7 @@ Deno.test({
       if (!fmt.out.includes("\n    - betaLonger * 3.5\n") || !fmt.out.includes("\n    - gammaLonger * 1.25\n")) {
         throw new Error(`fmt did not lead the broken \`-\` chain with \`- b\`:\n${fmt.out}`);
       }
-      if (!fmt.out.includes("\n  -x\n")) throw new Error(`fmt changed the \`-x\` statement:\n${fmt.out}`);
+      if (!fmt.out.includes("\n  return -x\n")) throw new Error(`fmt changed the \`-x\` statement:\n${fmt.out}`);
       if (!fmt.out.includes("\n  - b\n") && !fmt.out.includes("a - b")) {
         throw new Error(`fmt lost the joined subtraction:\n${fmt.out}`);
       }
@@ -286,13 +286,13 @@ Deno.test({
         "const meth = xs\n  .map((v) => v * 2)\n" +
         "const miss: Box = { inner: null }\n" +
         "const opt = miss\n  .inner\n  ?.n\n" +
-        "function mk(): A | B { { a: 4 } }\n" +
+        "function mk(): A | B { return { a: 4 } }\n" +
         "const v = mk()\n" +
         "const isA = v\n  is A\n" +
-        "function widen(n: i32) {\n  n\n    as i64\n}\n" +
+        "function widen(n: i32) {\n  return n\n    as i64\n}\n" +
         "const big: i64 = 9\n" +
         "const nar = big\n  as! i32\n" +
-        "function tryNarrow(n: i64) {\n  n\n    as? i32\n}\n" +
+        "function tryNarrow(n: i64) {\n  return n\n    as? i32\n}\n" +
         "const wrapped = 300\n  as% u8\n" +
         "print(fld)\nprint(meth[2])\nprint(opt)\nprint(isA)\n" +
         "print(widen(5))\nprint(nar)\nprint(tryNarrow(11))\nprint(wrapped)\n";
@@ -351,7 +351,7 @@ Deno.test({
         "const o2 = miss\n  .inner\n\n\n  ?.n\n" +
         "const o3 = hit\n  .inner\n\n  ?.n\n" +
         "type Held = { inner: Inner }\n" +
-        "function none(): Held | null { null }\n" +
+        "function none(): Held | null { return null }\n" +
         "const o4 = none()\n  ?.inner\n  // still guarded by the `?.` above\n  .n\n" +
         "print(c1)\nprint(c2)\nprint(o1)\nprint(o2)\nprint(o3)\nprint(o4)\n";
       const f = `${dir}/a.vl`;

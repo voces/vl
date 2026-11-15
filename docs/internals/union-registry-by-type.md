@@ -529,7 +529,7 @@ Left, measured:
 ```vl
 type A = {x: i32}
 type B = {x: i32}
-function f(v: A | B): i32 { v.x }     // t43d.vl: f(v: A), const a: A
+function f(v: A | B): i32 { return v.x }     // t43d.vl: f(v: A), const a: A
 const a: A | B = {x: 3}
 print(f(a))
 ```
@@ -555,11 +555,11 @@ type A = { a: i32 }
 type B = { b: string }
 function f(v: A | B): string {
   if v is A { return "A" }
-  "B"
+  return "B"
 }
 function g(v: B | A): string {
   if v is B { return "B" }
-  "A"
+  return "A"
 }
 const x: A | B = { b: "s" }
 const y: B | A = x
@@ -588,9 +588,9 @@ function take(v: boolean | i32 | null): string {
     return "i"
   }
   if v is boolean { return "b" }
-  "n"
+  return "n"
 }
-function back(v: boolean | i32 | null): boolean | null | i32 { v }
+function back(v: boolean | i32 | null): boolean | null | i32 { return v }
 const xs: (boolean | null | i32)[] = [mk(0), mk(1), mk(2)]
 for x in xs {
   print(take(x))

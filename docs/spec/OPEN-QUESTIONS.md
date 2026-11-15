@@ -98,7 +98,7 @@ type A = { x: i32 }
 type B = { x: i32, y: i32 }
 function f(v: A | B): i32 {
   if v is A { return 1 }
-  2
+  return 2
 }
 print(f({ x: 1, y: 2 }))   // prints 2
 ```
@@ -160,7 +160,7 @@ was formed, unless some field was literal-typed in both arms. The refusal fired 
 ```vl
 type A = { v: i32 }
 type B = { v: boolean }
-function f(u: A | B): i32 { 1 }   // was refused: arms `A` and `B` share a field-name set and no literal-typed field distinguishes them — add a discriminant field
+function f(u: A | B): i32 { return 1 }   // was refused: arms `A` and `B` share a field-name set and no literal-typed field distinguishes them — add a discriminant field
 ```
 
 The 2026-09-02 ruling that this refusal came from is amended by D3870 (same-shape records
@@ -175,7 +175,7 @@ admitted, because its sets are disjoint.
 ```vl
 type A = { v: i32, kind: "a" }
 type B = { v: boolean, kind: "b" }
-function f(u: A | B): i32 { if u is A { 1 } else { 2 } }
+function f(u: A | B): i32 { return if u is A { 1 } else { 2 } }
 print(f({ v: true, kind: "b" }))   // would print 2
 ```
 
@@ -189,7 +189,7 @@ refused with the same advice to add a discriminant field.
 ```vl
 type A = { v: i32 }
 type B = { v: boolean }
-function show(u: A | B): string { if u.v is i32 { "int" } else { "bool" } }
+function show(u: A | B): string { return if u.v is i32 { "int" } else { "bool" } }
 print(show({ v: true }))   // would print bool
 ```
 
@@ -202,7 +202,7 @@ runtime tags" rules that out for records. Where the representations differ (`i32
 ```vl
 type A = { v: i32 }
 type B = { v: boolean }
-function f(u: A | B): i32 { if u is A { 1 } else { 2 } }
+function f(u: A | B): i32 { return if u is A { 1 } else { 2 } }
 print(f({ v: true }))   // would print 2
 ```
 
@@ -328,7 +328,7 @@ argument may follow a named one, and a positional argument written first can lan
 later parameter:
 
 ```vl
-function box(w: i32, h: i32): i32 { w * 10 + h }
+function box(w: i32, h: i32): i32 { return w * 10 + h }
 print(box(w: 3, 2))   // prints 32
 print(box(h: 3, 2))   // prints 23
 print(box(3, w: 2))   // prints 23
@@ -414,7 +414,7 @@ type K = "a" | "b" | "c"
 function f(k: K): string {
   if k == "a" { return "A" }
   const j: "b" | "c" = k   // refused: cannot assign K to 'j' of type "b" | "c"
-  j
+  return j
 }
 ```
 
@@ -426,7 +426,7 @@ type K = "a" | "b" | "c"
 function f(k: K): string {
   if k == "a" { return "A" }
   const j: "b" | "c" = k   // would run: `k` is "b" | "c" here
-  j
+  return j
 }
 ```
 
@@ -437,7 +437,7 @@ type K = "a" | "b" | "c"
 function f(k: K): string {
   if k is "a" { return "A" }
   const j: "b" | "c" = k
-  j
+  return j
 }
 ```
 
@@ -456,7 +456,7 @@ again would stop compiling:
 type K = "a" | "b" | "c"
 function f(k: K): string {
   if k is "a" { return "A" }
-  match k { "a" => "x", "b" => "y", "c" => "z" }   // refused: match pattern "a" is not a member of "b" | "c"
+  return match k { "a" => "x", "b" => "y", "c" => "z" }   // refused: match pattern "a" is not a member of "b" | "c"
 }
 ```
 
@@ -484,7 +484,7 @@ intrinsics. They fare differently when a program declares one:
   lambda is not reached at all.
 
 ```vl
-function print(x: i32): i32 { x + 100 }
+function print(x: i32): i32 { return x + 100 }
 const y: i32 = print(3)   // refused: cannot bind the void result of 'y'
 ```
 
@@ -499,14 +499,14 @@ privileged and "not a prelude", and says nothing about declaring its names.
 **(a) Refuse the declaration.** An ambient name is reserved in every scope.
 
 ```vl
-function print(x: i32): i32 { x }   // would be refused: `print` is an ambient name
+function print(x: i32): i32 { return x }   // would be refused: `print` is an ambient name
 ```
 
 **(b) A declaration shadows the ambient name** in its scope, for the call and its type
 alike, as a declaration shadows any outer binding (modules.md §M5.2).
 
 ```vl
-function print(x: i32): i32 { x + 100 }
+function print(x: i32): i32 { return x + 100 }
 const y: i32 = print(3)   // would run: y is 103
 ```
 
@@ -584,7 +584,7 @@ lint that shipped is a warning. A float divisor of `0.0` gets nothing, and gives
 infinity or NaN.
 
 ```vl
-function f(a: i32): i32 { a / 0 }   // warns: `/ 0` traps at run time
+function f(a: i32): i32 { return a / 0 }   // warns: `/ 0` traps at run time
 print(f(4))                          // traps: integer divide by zero
 ```
 
@@ -592,14 +592,14 @@ print(f(4))                          // traps: integer divide by zero
 appears, as `step 0` is.
 
 ```vl
-function f(a: i32): i32 { a / 0 }   // would be refused: integer division by zero
+function f(a: i32): i32 { return a / 0 }   // would be refused: integer division by zero
 ```
 
 **(b) A warning, as today.** The division is legal, the warning names the trap, and a
 program that reaches it traps.
 
 ```vl
-function f(a: i32): i32 { a / 0 }   // warns, builds, traps if called
+function f(a: i32): i32 { return a / 0 }   // warns, builds, traps if called
 ```
 
 **Recommendation: (a).** The expression can never produce a value, so no correct program

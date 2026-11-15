@@ -76,12 +76,12 @@ const namesOf = (bytes: Uint8Array): string[] => {
 const LIB = [
   "export type Pt = { x: i32, y: i32 }",
   "export let count = 3",
-  "export function hello(n: i32): i32 { n + count }",
-  "export function mk(): Pt { { x: hello(1), y: 2 } }",
+  "export function hello(n: i32): i32 { return n + count }",
+  "export function mk(): Pt { return { x: hello(1), y: 2 } }",
 ].join("\n");
-const OTHER = "export function other(): i32 { 7 }";
+const OTHER = "export function other(): i32 { return 7 }";
 const VIA =
-  'import { hello } from "./lib"\nexport function via(): i32 { hello(5) }';
+  'import { hello } from "./lib"\nexport function via(): i32 { return hello(5) }';
 
 // Each entry imports `lib.vl` (directly or through `via.vl`) at a different discovery position.
 const GRAPHS: [string, string][] = [
