@@ -537,9 +537,9 @@ function progCheckCalleeFirst(
 }
 
 // Whether unchecked top-level function `d` may be checked ahead of the statement that names it:
-// no fact it needs comes from that statement. Not when a parameter is un-annotated (a call solves
-// it), it reads a module `let` (a later write narrows it), it is on a call cycle (the fixpoint
-// orders it), or a function it reaches unchecked may not.
+// no fact it needs comes from that statement. Not when an un-annotated parameter's calls decide
+// it (`callDecidesParam`), it reads a module `let` (a later write narrows it), it is on a call
+// cycle (the fixpoint orders it), or a function it reaches unchecked may not.
 function eagerCheckable(
   d: i32,
   stmtAt: {[i32]: i32},
@@ -551,7 +551,13 @@ function eagerCheckable(
   if !(fd is FuncDecl) { return false }
   for p in fd.fnParams {
     const pn = nodeAt(p)
-    if pn is Param && pn.parType < 0 { return false }
+    if (
+      pn is Param
+      && pn.parType < 0
+      && callDecidesParam(fd.fnBody, pn.parName)
+    ) {
+      return false
+    }
   }
   if readsModuleLet(fd.fnBody) { return false }
   path.push(d)
@@ -569,22 +575,66 @@ function eagerCheckable(
   return true
 }
 
-// The body of function declaration `d`, or -1.
+// The body of function declaration `d`, or -1.// The body of function declaration `d`, or -1.
 function fnBodyOf(d: i32): i32 {
   const fd = nodeAt(d)
   return if fd is FuncDecl { fd.fnBody } else { -1 }
 }
 
-// Whether top-level function `d` itself needs no fact from the statement that names it: every
-// parameter annotated and no module `let` read. Unlike `eagerCheckable`, it asks nothing of `d`'s callees.
+// Whether top-level function `d` itself needs no fact from the statement that names it: no
+// un-annotated parameter its calls decide and no module `let` read. Unlike `eagerCheckable`, it asks
+// nothing of `d`'s callees.
 function ownFactsStand(d: i32): boolean {
   const fd = nodeAt(d)
   if !(fd is FuncDecl) { return false }
   for p in fd.fnParams {
     const pn = nodeAt(p)
-    if pn is Param && pn.parType < 0 { return false }
+    if (
+      pn is Param
+      && pn.parType < 0
+      && callDecidesParam(fd.fnBody, pn.parName)
+    ) {
+      return false
+    }
   }
   return !readsModuleLet(fd.fnBody)
+}
+
+// Whether the body at `root` uses parameter `nm` where only its calls decide it: as a map (a
+// `get`, `set`, `has` or `delete` on it, a store at a string key; `holeDemandOk` cannot pin an
+// open demand after the body) or written into a binding (D15053 reads every call). S3 retires it.
+function callDecidesParam(root: i32, nm: string): boolean {
+  const todo: i32[] = [root]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix < 0 || ix >= P.nodes.length { continue }
+    const n = nodeAt(ix)
+    if n is Call && n.callFn >= 0 && n.callFn < P.nodes.length {
+      const f = nodeAt(n.callFn)
+      if f is Member {
+        const o = nodeAt(f.memObj)
+        if (
+          o is Ident
+          && o.identName == nm
+          && strListHas(["get", "set", "has", "delete"], f.memProp)
+        ) {
+          return true
+        }
+      }
+    }
+    if n is BinExpr && n.binOp == "=" {
+      const l = nodeAt(n.binLeft)
+      if l is Index {
+        const o = nodeAt(l.idxArr)
+        const k = nodeAt(l.idxIndex)
+        if o is Ident && o.identName == nm && k is StrLit { return true }
+      }
+      const r = nodeAt(n.binRight)
+      if l is Ident && r is Ident && r.identName == nm { return true }
+    }
+    nodeChildrenPush(ix, todo)
+  }
+  return false
 }
 
 // The names of the module's `let` bindings, set before pass 2; `readsModuleLet` matches by name,

@@ -221,6 +221,30 @@ print(k(2, true, false))
   },
 });
 
+// An unannotated parameter's type stays open until a call instances it: the builder leaves that
+// function uncovered rather than handing the verifier an open-typed variable (rule 1).
+Deno.test({
+  name: "ir shadow: an open-typed parameter is uncovered, never a verifier failure",
+  ignore,
+  fn: () => {
+    const src = `function k<T>(x: T): T { return x }
+function fw(f) { return f }
+function main() {
+  const o = fw(k)
+  print(o(6))
+}
+main()
+`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
+    if (!rows.has("uncovered open parameter type")) {
+      throw new Error(`want an "uncovered open parameter type" row, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The verifier's own cases (`compiler/ir_selftest.vl`): hand-built IR breaking each of rules
 // 1-7 is refused under that rule, as are a fall-through and a mismatched global store, and the
 // unbroken function holds.

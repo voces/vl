@@ -323,6 +323,10 @@ export function parseRat(s: string): [bigint, bigint] {
 // True while the constant tree initialising a binding annotated `f32` is evaluated (E9.1).
 let f32Fold = false
 
+// Filed defects whose compiled reading the oracle reproduces when asked (`oracle.ts diff` asks,
+// to tell a disagreement a filed row explains from a new one). Empty for every other run.
+export const emulating = new Set<string>();
+
 // E9.1 / ruling 4.2: a radix constant is a bit pattern at its use's width under every operator.
 // The width is 64 at an i64 or f64 use, 32 at an i32 one, and with no use the tree's default
 // (T2.3). Ring operators commute with wrapping, so only these need the width before they run.
@@ -1171,6 +1175,9 @@ export class Interp {
         // 4.3 with Q9: a float constant arm that adopts an `f32` arm folds in f32 arithmetic, as
         // at run time; a constant tree is pure, so the taken arm is evaluated again.
         const taken = c ? e.t : e.f, tk = taken && taken.length ? taken[taken.length - 1] : null;
+        const d16498 = (v: Lit): bigint | null =>
+          emulating.has("D16498") && v.radix && !v.lone && v.i !== null && tk && tk.k === "expr" && tk.e.k === "bin" && ["/", "%", "<<", ">>"].includes(tk.e.op)
+            ? BigInt.asIntN(32, v.i) : null;
         if (v instanceof Lit && v.f !== null && kOther === "f32" && !f32Fold && tk && tk.k === "expr" && isConstTree(tk.e)) {
           f32Fold = true;
           let r: Val;
@@ -1193,7 +1200,7 @@ export class Interp {
           if (v.i !== null && !kOther && ok && ok.k === "expr" && isConstTree(ok.e) && !treeHas(ok.e, "radix")) {
             const o = this.eval(ok.e, env, null);
             const wide = o instanceof Lit && o.i !== null && !o.radix && (o.i < BigInt(I32_MIN) || o.i > BigInt(I32_MAX)) && o.i >= I64_MIN && o.i <= I64_MAX;
-            if (wide) return litTo(v, "i64");
+            if (wide) return d16498(v) ?? litTo(v, "i64");
           }
           if (!kOther && ok && ok.k === "expr" && isConstTree(ok.e)) {
             const j = asJoin(v);
@@ -1201,6 +1208,7 @@ export class Interp {
             return j;
           }
           if (!kOther) return litDefault(v);
+          if (kOther === "i64" && d16498(v) !== null) return d16498(v)!;
           if (joinFits(v, kOther)) { try { return litTo(v, kOther); } catch { /* the default */ } }
           const d = litDefault(v), dk = numKind(d)!;
           return WIDENS[kOther]?.includes(dk) ? d : WIDENS[dk]?.includes(kOther) ? toKind(d, kOther) : d;
@@ -1458,6 +1466,7 @@ export class Interp {
     if ((arithOp || ["<", "<=", ">", ">=", "==", "!="].includes(op)) && !["<<", ">>", ">>>"].includes(op) && !f32Fold) {
       const atF32 = (te: Expr, v: Val, peer: Val): Val => {
         if (v instanceof Lit && v.f !== null && v.join && v.derived && numKind(peer) === "f32") {
+          if (emulating.has("D16497")) return litDefault(v);
           throw new Unsupported("spec gap: a float tree over a literal join beside an f32 (D16497)");
         }
         if (v instanceof Lit && v.f !== null && v.arm && numKind(peer) === "f32") te = v.arm;
@@ -1691,6 +1700,9 @@ export class Interp {
           f32Fold = true;
           try { args[i] = this.eval(e.args[i].e, env, null); } finally { f32Fold = false; }
         });
+      }
+      if (emulating.has("D16497") && args.some((a) => a instanceof Lit && a.join && a.f !== null) && args.some((a) => a instanceof Flt && a.w === 32)) {
+        return f.call(args.map((a) => a instanceof Lit ? litDefault(a) : a instanceof Flt ? new Flt(a.v, 64) : a), this);
       }
       const lits = args.filter((a) => a instanceof Lit) as Lit[];
       return f.call(args.map((a) => a instanceof Lit && !typed ? (lits.length === 2 ? pairDefault(a, lits[0] === a ? lits[1] : lits[0]) : litDefault(a)) : a), this);
