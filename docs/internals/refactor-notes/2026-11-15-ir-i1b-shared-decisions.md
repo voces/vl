@@ -40,13 +40,13 @@ yet: claiming is I1b-2. Measured on fixpoint seeds of this branch and of its mas
 
 | reading | master base | this branch |
 |---|---|---|
-| self-compile, armed: functions | 17,594 | 17,597 |
-| covered and verified | 1,827 | 2,126 |
-| matched (entry bytes and statement spans) | 1,825 | 2,123 |
+| self-compile, armed: functions | 17,594 | 17,600 |
+| covered and verified | 1,827 | 2,125 |
+| matched (entry bytes and statement spans) | 1,825 | 2,122 |
 | byte or span mismatches | 0 | 0 |
 | unlowered, named | 2 (`global read with a guard or a fold`) | 3 (2 `folded global read`, 1 `operand above a valued if's value`) |
 | armed self-build byte-identical to the seed | yes | yes |
-| unarmed self-compile guest fuel (base compiler, then this branch's, same source) | 89,679,406,376 | 89,680,545,432 (+0.0013%) |
+| unarmed self-compile guest fuel (base compiler, then this branch's before the master merge, same source) | 89,679,406,376 | 89,680,545,432 (+0.0013%) |
 
 Rows are first-miss only, so a deleted miss shows up only where nothing else stopped the function. Each deletion
 has a witness in `tests/vl_ir_shadow_test.ts`, which is covered and matched on this branch and
