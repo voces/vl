@@ -184,8 +184,7 @@ const k: i32 = 3000000000   // refused: constant 3000000000 overflows i32 — wr
 
 > Status: where the float does not hold the digits' value exactly, the compiler reads the
 > pattern at `as f32` and `as f64` (`0xFFFFFFFF as f32` prints -1). The acceptance grid is
-> `scripts/oracle/radix-float-grid.ts`; the `f64` tree rule is
-> `scripts/capability-probes/matrix/radix-tree-at-f64.matrix.vl`.
+> `scripts/oracle/radix-float-grid.ts`.
 
 **T2.4** An unannotated `const` whose initialiser is a literal, or arithmetic over
 literals and such `const`s, is an exact constant with no single type. Every read of it is
