@@ -114,6 +114,11 @@ census below used the same rule. It is idempotent by construction, since a tail 
   DECISIONS' own L2 example, `function add<U>(a: U, b: f64) { a + b }`, is a block body with a
   value tail, so it becomes `{ return a + b }`. Fences go through the same lint as a file. The
   witness check grades the rows; `vl_doc_script_paths_test` already walks every `.md`.
+- **As landed**, the codemod was a whole-tree `--migrate-return` mode on a pre-fold seed. The
+  fold deleted it with the flag. What stays is ordinary `vl check --fix`: the
+  `discarded-tail-value` warning, the `missing-return` error, and the
+  `void-callee-missing-return` caller error, whose fix edits the callee's file when that file is
+  in the same run.
 - **The switchover PR** (step c) applies the codemod to every tree, then lands the checker
   change, while you quiet the queue. In-flight branches re-run `vl check --fix` after merging
   master.
@@ -134,8 +139,31 @@ scratch build of that rule, deduplicated by location.
 | `scripts/` tools | 1,679 | 51 |
 | `bench/` | 91 | 12 of 94 |
 
-- **Filed `Repro:` blocks** in `docs/internals/inventory*` are not counted yet. The codemod has
-  to rewrite them too, and `check-filed-witnesses` will grade them.
+- **This census over-counts.** The scratch rule counted a nested tail once per enclosing
+  candidate. The landed migration below is the real number.
+
+## Migration as landed, on `lane-d-return-rule`
+
+`return` keywords added by the flag-day diff, net of those removed, counted from
+`git diff <merge-base> HEAD`. The compiler figure includes the second codemod pass that the
+`emit_elab` cascade needed (4,372) and 64 hand edits. `std/embedded.ts` and
+`std_embedded.rs` are regenerated, not counted.
+
+| tree | `return`s added | files touched |
+| --- | ---: | ---: |
+| `compiler/` | 15,896 | 265 |
+| `std/*.vl` | 131 | 14 |
+| `tests/cases` | 8,819 | 3,046 |
+| `scripts/silent-sweep` | 3,011 | 1,929 |
+| `scripts/capability-probes` | 643 | 388 |
+| other `scripts/` (tools, oracle) | 1,646 | 85 |
+| `bench/` | 58 | 6 |
+| docs (fences and filed `Repro:` blocks) | 2,435 | 1,619 |
+| VL inside `tests/*.ts` | 569 | 43 |
+
+- The `.ts`-embedded VL was migrated per literal: a capture of every source the tests hand the
+  compiler, the codemod over each, then a mapping back to the literal. Template literals with
+  `${}` mapped only where every candidate agreed. The rest was edited by hand.
 - **The `std/` change is API-neutral**, since no signature changes. It needs no std review,
   only a comment-free diff.
 
