@@ -65,7 +65,7 @@ const lenInstances = (src: string): string[] => {
 
 const LEN = `function len<T>(f: () => T | null) {
   const t = f()
-  if t == null { 0 } else { 1 }
+  return if t == null { 0 } else { 1 }
 }
 function outer<U>(x: U) { print(len(() => x)) }
 function outerAnn<U>(x: U) { print(len((): U | null => x)) }

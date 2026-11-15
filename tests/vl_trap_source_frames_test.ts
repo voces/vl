@@ -167,7 +167,7 @@ Deno.test({
         "  // line 4",
         "  const xs = [1, 2]",
         "  // line 6",
-        "  xs[n]",
+        "  return xs[n]",
         "}",
         "// line 9",
         "print(boom(0))",
@@ -175,7 +175,7 @@ Deno.test({
         "",
       ].join("\n"),
     }, "m.vl", [
-      "at m.vl:7:3  in `boom`",
+      "at m.vl:7:10  in `boom`",
       "at m.vl:11:1  in `__start__`",
     ], "inside a function"),
 });
@@ -193,11 +193,11 @@ Deno.test({
         "  const f = (k: i32) => {",
         "    // line 6",
         "    const y = xs[k]",
-        "    y",
+        "    return y",
         "  }",
         // Not a tail call: `f` is lambda-lifted (D3663), and a direct call in tail position
         // is a `return_call`, which leaves `outer` off the backtrace as for any function.
-        "  f(9) + 0",
+        "  return f(9) + 0",
         "}",
         "",
         "print(outer())",
@@ -223,7 +223,7 @@ Deno.test({
         "export function boom(n: i32): i32 {",
         "  const xs = [1, 2]",
         "  // line 5",
-        "  xs[n]",
+        "  return xs[n]",
         "}",
         "",
       ].join("\n"),
@@ -236,7 +236,7 @@ Deno.test({
         "",
       ].join("\n"),
     }, "entry.vl", [
-      "at lib.vl:6:3  in `boom$m<id>`",
+      "at lib.vl:6:10  in `boom$m<id>`",
       "at entry.vl:5:1  in `__start__`",
     ], "two files"),
 });

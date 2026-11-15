@@ -115,7 +115,7 @@ whenever it answers:
 ```vl
 export function nulFoldAliasNameOf(ix: i32): string {
   if nulFoldWrapperTyIxOf(ix) >= 0 { return nulFoldWrapperNameOf(ix) }
-  ""
+  return ""
 }
 ```
 

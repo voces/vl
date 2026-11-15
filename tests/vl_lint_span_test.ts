@@ -99,7 +99,7 @@ Deno.test({
       "bytes.vl",
       [
         "type Named = { name: string }",
-        "function glyphOf(cp: i32) { cp }",
+        "function glyphOf(cp: i32) { return cp }",
         "function f(r: Named) { glyphOf(r.name[1]) + fromCodePoint(r.name[0]).length }",
         "print(f({ name: \"Hrímey\" }))",
         "",
@@ -422,7 +422,7 @@ Deno.test({
     const { src, diags } = await run(
       "interp.vl",
       [
-        "function hex(i: i32) { \"\\{i}\" }",
+        "function hex(i: i32) { return \"\\{i}\" }",
         "const id = hex(1) + \"-\" + hex(2) + \"-\" + hex(3) + \"-\" + hex(4)   // trailing",
         "const two = \"x\" +",
         "  hex(1) + \"y\" + hex(2) + \"z\"",

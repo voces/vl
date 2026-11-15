@@ -127,9 +127,9 @@ would take, so one `const` can be an `f32` in one place and an `i64` in another:
 
 ```vl
 const h = 0.5
-function lerp(a: f32): f32 { a * h + 7.0 }   // h is the f32 0.5 here
+function lerp(a: f32): f32 { return a * h + 7.0 }   // h is the f32 0.5 here
 const K = 7
-function take64(x: i64): i64 { x }
+function take64(x: i64): i64 { return x }
 print(take64(K) * 1000000000)                 // 7000000000 — K is an i64 7 here
 print(K * 1000000000)                         // 7000000000 — a tree of constants is computed exactly
 ```
@@ -268,7 +268,7 @@ fourth, `as%`, cannot fail at all and has its own section below:
 | `x as T` | `T` | returns `null` from the enclosing function, which must return `\| null` |
 
 ```vl
-function toI32(d: f64): i32 | null { d as? i32 }
+function toI32(d: f64): i32 | null { return d as? i32 }
 print(toI32(3.9))                  // null — 3.9 is not an integer
 print(toI32(3.0))                  // 3
 print(toI32(5000000000.0))         // null — out of i32's range
@@ -378,7 +378,7 @@ const w = a * 3.0
 
 function f(): i32 {
   work()
-  -x                       // the block's value is `-x`; NOT `work() - x`
+  return -x                       // the block's value is `-x`; NOT `work() - x`
 }
 ```
 
