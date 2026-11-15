@@ -293,7 +293,7 @@ function writeStore(n: i32): IoError | null {
     const e = writeFile(dataPath(i), buf.window(0, used))
     if e != null { return e }
   }
-  null
+  return null
 }
 ```
 

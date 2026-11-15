@@ -941,8 +941,14 @@ export class Interp {
       let r: Val;
       try {
         // the body's last expression is delivered to the return type, so it is its context
-        r = Array.isArray(d.body) ? this.execBlock(d.body, env, d.ret) : this.eval(d.body, env, d.ret);
-        // E13.1: a body's value is its last expression; a void function discards it.
+        // A block body returns a value only through `return`; an expression body is its value
+        // (DECISIONS, "A function's block body returns a value only through `return`").
+        if (Array.isArray(d.body)) {
+          this.execBlock(d.body, env, d.ret);
+          r = VOID;
+        } else {
+          r = this.eval(d.body, env, d.ret);
+        }
         if (d.ret && d.ret.k === "name" && d.ret.name === "void") r = VOID;
         // spec gap (owner question): S8.1 says every path returns; the compiler lets a body whose
         // return type admits null fall off its end, and the result is null.
@@ -1130,7 +1136,8 @@ export class Interp {
       case "if": {
         const c = this.asBool(this.eval(e.c, env, null), "if-condition");
         // E9.1 does not list `if`, so with no context its value is typed, not a constant.
-        const v = c ? this.blockValue(e.t, env, exp) : e.f ? this.blockValue(e.f, env, exp) : VOID;
+        // An else-less `if` in value position is `T | null`: a false condition yields `null`.
+        const v = c ? this.blockValue(e.t, env, exp) : e.f ? this.blockValue(e.f, env, exp) : null;
         // T3.6 at an `if` join: a constant arm adapts to the other arm's type, read from its
         // declaration since that arm did not run; one that cannot widens the join.
         const other = c ? e.f : e.t;

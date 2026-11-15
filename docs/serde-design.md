@@ -2516,8 +2516,8 @@ print(`f64=\{x} i32=\{n} i64=\{i} bool=\{b}`)
 // FACT 3 / OQ-2 — union member order carries no type identity.
 type A = i32 | string
 type B = string | i32
-function fromA(v: A): string { if v is string { return v } "int" }
-function fromB(v: B): string { if v is string { return v } "int" }
+function fromA(v: A): string { if v is string { return v } return "int" }
+function fromB(v: B): string { if v is string { return v } return "int" }
 const a: A = "hi"
 const b: B = "hi"
 print(fromB(a))                         // hi — an A passes as a B
@@ -2783,7 +2783,7 @@ function esc(s: string): string {
     else { buf.push(ch) }
     i = i + 1
   }
-  fromCodePoints(buf)
+  return fromCodePoints(buf)
 }
 
 function render(v: Json): string {
@@ -2816,12 +2816,12 @@ function render(v: Json): string {
     }
     return out + "}"
   }
-  "null"
+  return "null"
 }
 
 // ---------------------------------------------------------------- parse
 function at(lx: Lex): i32 {
-  if lx.pos < lx.src.length { lx.src[lx.pos] } else { 0 }
+  return if lx.pos < lx.src.length { lx.src[lx.pos] } else { 0 }
 }
 
 function ws(lx: Lex) {
@@ -2836,11 +2836,11 @@ function eat(lx: Lex, ch: i32): boolean {
     lx.pos = lx.pos + 1
     return true
   }
-  false
+  return false
 }
 
 function isNum(c: i32): boolean {
-  (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E'
+  return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E'
 }
 
 function pstring(lx: Lex): string {   // the opening quote is already eaten
@@ -2864,7 +2864,7 @@ function pstring(lx: Lex): string {   // the opening quote is already eaten
       lx.pos = lx.pos + 1
     }
   }
-  fromCodePoints(buf)
+  return fromCodePoints(buf)
 }
 
 function pvalue(lx: Lex): Json {       // the annotation is load-bearing: residue (a)
@@ -2919,12 +2919,12 @@ function pvalue(lx: Lex): Json {       // the annotation is load-bearing: residu
   while lx.pos < lx.src.length && isNum(at(lx)) { lx.pos = lx.pos + 1 }
   const n = parseF64(lx.src.slice(s, lx.pos))
   if n == null { return null }
-  n
+  return n
 }
 
 function parse(src: string): Json {
   const lx: Lex = { src: src, pos: 0 }
-  pvalue(lx)
+  return pvalue(lx)
 }
 
 // ---------------------------------------------------------------- round trip
@@ -3111,12 +3111,12 @@ function field(v: Json, k: string): Json {
     if c == null { return null }
     return c
   }
-  null
+  return null
 }
-function num(v: Json): f64 { if v is f64 { return v } 0.0 }
-function str(v: Json): string { if v is string { return v } "" }
+function num(v: Json): f64 { if v is f64 { return v } return 0.0 }
+function str(v: Json): string { if v is string { return v } return "" }
 function decodeCircle(v: Json): Circle {
-  { r: num(field(v, "r")), tag: str(field(v, "tag")) }
+  return { r: num(field(v, "r")), tag: str(field(v, "tag")) }
 }
 
 const m: { [string]: Json } = Map()
