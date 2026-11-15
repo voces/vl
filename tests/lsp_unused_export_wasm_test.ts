@@ -169,7 +169,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  const src = "function f(): i32 {\n  1\n}\nprint(f())\n";
+  const src = "function f(): i32 {\n  return 1\n}\nprint(f())\n";
   const key = "/proj/noexport.vl";
   const readNone = (k: string): string | undefined => k === key ? src : undefined;
   const useMap = await buildUnusedExportUseMap([key], readNone, checker);

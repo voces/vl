@@ -309,7 +309,7 @@ type B = "z" | "w"
 function probe(u: A | B) {
   if u is "x" { print("lit:yes") } else { print("lit:no") }       // lit:yes    ✅
   if u is A   { print("aliasA:yes") } else { print("aliasA:no") } // aliasA:no  ❌
-  0
+  return 0
 }
 probe("x")
 ```
@@ -604,7 +604,7 @@ identical type a plain scalar local. It fails at emit **with no `is` in the prog
 
 ```vl
 type K = 1 | 2
-function probe(x: K | i32) { 0 }
+function probe(x: K | i32) { return 0 }
 probe(1)          // emitProgram: union box atom test on a union with no recorded members: i32
 ```
 
@@ -940,7 +940,7 @@ type F = (i32) => i32
 type G = (string) => i32
 function probe(x: F | G) {
   if x is F { const y: F = x }   // TAKEN for a G value. `vl check` rc 0, `vl build` rc 0
-  0
+  return 0
 }
 probe((s: string) => 7)
 ```
