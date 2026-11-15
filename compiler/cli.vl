@@ -425,6 +425,14 @@ type CliSpanCols = { line: i32[], col: i32[], endLine: i32[], endCol: i32[] }
 const cliZb: CliSpanCols = { line: [], col: [], endLine: [], endCol: [] }
 // The value tails this file's block bodies refused, each at its statement's start (`cliNoteReturnFix`).
 const cliMr: CliSpanCols = { line: [], col: [], endLine: [], endCol: [] }
+// The `return ` inserts this run owes another of its files, the path as the text: a callee there
+// ends in a call a caller here uses. Each is applied when the run fixes that file, once: its line
+// is negated when taken.
+const cliFx: CliSiteCols = { line: [], col: [], text: [] }
+// The files whose report waits for such an insert, checked again once after it, by path key.
+let cliFxWait: string[] = []
+// Whether the current file's check owes another file an insert, so its report waits.
+let cliFxOwes = false
 // The spans this file's fixes shorten to a prefix (`cliNoteCastFix`, `cliNoteStrictEqFix`), as
 // `CliSpanCols`: how many characters from each span's start the fix keeps, and the fix's name.
 type CliCutCols = {
@@ -652,6 +660,9 @@ export function cliArgReset() {
   cliFmtResult = ""
   cliFix = 0
   cliFixCount = 0
+  cliSitesClear(cliFx)
+  cliFxWait = []
+  cliFxOwes = false
   cliFixDeclined = 0
   cliLintGraphed = 0
   cliFileFixed = 0
@@ -1595,6 +1606,17 @@ function cliCheckCurFileRest() {
   }
 
   // ── report ──────────────────────────────────────────────────────────────────
+  // A file that owes another an insert is reported from its check after that one, once.
+  const waitKey = cliPathKey(cliCurFile)
+  if cliFxOwes && !strListHas(cliFxWait, waitKey) {
+    cliFxOwes = false
+    cliFxWait.push(waitKey)
+    cliFiles.push(cliCurFile)
+    cliFileFromDir.push(cliDirMode)
+    cliFileIdx = cliFileIdx + 1
+    return cliStartFile()
+  }
+  cliFxOwes = false
   cliAddReportStreams()
 
   cliSrcLines = cliSplitLines(cliEntrySrc)
@@ -2115,16 +2137,13 @@ function cliFinishSummary() {
   }
   let summary = ""
   if cliErrors == 0 && cliWarnings == 0 {
+    const nf = cliDistinctFiles()
     let noun = "files"
-    if cliFiles.length == 1 { noun = "file" }
+    if nf == 1 { noun = "file" }
     summary = cliAnsi(
       cliColor,
       "2",
-      "Checked "
-        + i32ToStr(cliFiles.length)
-        + " "
-        + noun
-        + ", no errors.",
+      "Checked " + i32ToStr(nf) + " " + noun + ", no errors.",
     )
   } else {
     let parts = cliPlural(cliErrors, "error")
@@ -3469,6 +3488,20 @@ function cliCollectFixes(src: string) {
   }
   // `return ` before each value tail a block body refused, and each discarded pure one, at the
   // statement's start: before its label or the parentheses that open it.
+  // The inserts another file of this run owes this one, taken once.
+  const fxKey = cliPathKey(cliCurFile)
+  let fx = 0
+  while fx < cliFx.line.length {
+    const fl = cliFx.line[fx] - 1
+    if cliPathKey(cliFx.text[fx]) == fxKey && fl >= 0 && fl < starts.length {
+      const fo = starts[fl] + cliFx.col[fx]
+      if !i32ListHas(cliFixEdit.pos, fo) {
+        cliPushFixRepl(fo, 0, "return ", "missing return", starts)
+      }
+      cliFx.line[fx] = -cliFx.line[fx]
+    }
+    fx = fx + 1
+  }
   let mr = 0
   while mr < cliMr.line.length {
     const ml = cliMr.line[mr] - 1
@@ -3848,11 +3881,15 @@ function cliNoteReturnFix(i: i32) {
   let ln = diagLine(i)
   let cl = diagCol(i)
   if vcDiagCode(i) == "void-callee-missing-return" {
+    const mv = cliDataVals(vcDiagData(i), "mod")
     const lv = cliDataVals(vcDiagData(i), "line")
     const cv = cliDataVals(vcDiagData(i), "col")
-    if lv.length != 1 || cv.length != 1 { return 0 }
+    if mv.length != 1 || lv.length != 1 || cv.length != 1 { return 0 }
+    const m = cliDecOf(mv[0])
     ln = cliDecOf(lv[0])
     cl = cliDecOf(cv[0])
+    if m > 0 { return cliOweReturn(m, ln, cl) }
+    if m < 0 { return 0 }
   } else if vcDiagCode(i) != "missing-return" {
     return 0
   }
@@ -3867,6 +3904,62 @@ function cliNoteReturnFix(i: i32) {
   cliMr.endLine.push(ln)
   cliMr.endCol.push(cl)
   0
+}
+
+// Owes a `return ` at line `ln`, column `cl` of module `m`'s file when the run checks that file,
+// once; the file is checked again when the run already passed it. Outside the run it is a note.
+function cliOweReturn(m: i32, ln: i32, cl: i32) {
+  // A `--batch` record is one per named file, so the run checks none of them twice.
+  if (
+    cliBatch != 0
+    || cliModMode == 0
+    || m >= cliModKeys.length
+    || ln < 0
+    || cl < 0
+  ) {
+    return 0
+  }
+  const key = cliPathKey(cliModKeys[m])
+  let at = -1
+  let f = 0
+  while f < cliFiles.length {
+    if cliPathKey(cliFiles[f]) == key { at = f }
+    f = f + 1
+  }
+  if at < 0 { return 0 }
+  let k = 0
+  while k < cliFx.line.length {
+    const kl = cliFx.line[k]
+    if (
+      (kl == ln || kl == -ln)
+      && cliFx.col[k] == cl
+      && cliPathKey(cliFx.text[k]) == key
+    ) {
+      return 0
+    }
+    k = k + 1
+  }
+  cliFx.line.push(ln)
+  cliFx.col.push(cl)
+  cliFx.text.push(cliFiles[at])
+  cliFxOwes = true
+  // The run fixed that file already: it is checked again, after the files still to come.
+  if at <= cliFileIdx {
+    cliFiles.push(cliFiles[at])
+    cliFileFromDir.push(cliFileFromDir[at])
+  }
+  0
+}
+
+// How many distinct files the run checked: a file checked again after an insert it waited for
+// counts once.
+function cliDistinctFiles(): i32 {
+  const seen: string[] = []
+  for f in cliFiles {
+    const k = cliPathKey(f)
+    if !strListHas(seen, k) { seen.push(k) }
+  }
+  seen.length
 }
 
 // The decimal `s` spells, or -1 for an empty or non-digit spelling.
@@ -4421,8 +4514,15 @@ function cliFixCommit() {
   cliFixRound = cliFixRound + 1
   cliSitesClear(cliFixDecl)
   // Keep the per-run source cache coherent with the rewrite the host is
-  // about to perform, so later files that import this one see the fix.
+  // about to perform, so later files that import this one see the fix, under
+  // whichever spelling of its path they read it by.
   cliSrcCachePut(cliCurFile, out, 1)
+  const outKey = cliPathKey(cliCurFile)
+  let ck = 0
+  while ck < cliSrcCacheKeys.length {
+    if cliPathKey(cliSrcCacheKeys[ck]) == outKey { cliSrcCacheSrcs[ck] = out }
+    ck = ck + 1
+  }
   cliCmdPath = cliCurFile
   cliCmdData = out
   cliState = ST_FIX_WROTE
