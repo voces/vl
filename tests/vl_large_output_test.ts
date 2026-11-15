@@ -74,8 +74,8 @@ Deno.test({
       const n = 4_500_000;
       await Deno.writeTextFile(
         `${dir}/m.vl`,
-        `export function f0(): string { "${"a".repeat(n)}" }\n` +
-          `export function f1(): string { "${"b".repeat(n)}" }\n`,
+        `export function f0(): string { return "${"a".repeat(n)}" }\n` +
+          `export function f1(): string { return "${"b".repeat(n)}" }\n`,
       );
       await Deno.writeTextFile(prog, `import { f0, f1 } from "./m"\nprint(f0().length + f1().length)\n`);
       const out = `${dir}/big.wasm`;
@@ -100,7 +100,7 @@ Deno.test({
     await withDir(async (dir) => {
       const prog = `${dir}/main.vl`;
       const n = 2_850_000;
-      await Deno.writeTextFile(`${dir}/m.vl`, `export function f0(): string { "${"a".repeat(n)}" }\n`);
+      await Deno.writeTextFile(`${dir}/m.vl`, `export function f0(): string { return "${"a".repeat(n)}" }\n`);
       await Deno.writeTextFile(prog, `import { f0 } from "./m"\nprint(f0().length)\n`);
       const out = `${dir}/body.wasm`;
       const r = await vl(["build", prog, "-o", out]);

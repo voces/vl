@@ -222,7 +222,7 @@ export type Finding = {
 export function check(path: string, text: string): Finding[] {
   const out: Finding[] = []
   // … the same line walk `commentBudget` does today …
-  out
+  return out
 }
 ```
 

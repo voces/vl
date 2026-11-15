@@ -71,7 +71,7 @@ for n in 0 until 256 {
 function crc32(b: u8[], from: i32) {
   let c = -1
   for i in from until b.length { c = CRC[(c ^ b[i]) & 0xff] ^ (c >>> 8) }
-  c ^ -1
+  return c ^ -1
 }
 
 // One chunk: length, type, data, then the CRC of type and data.
@@ -98,7 +98,7 @@ function zlibStored(raw: u8[]): u8[] {
     b = (b + a) % 65521
   }
   put32be(z, (b << 16) | a)
-  z
+  return z
 }
 
 // A 2×2 RGB image: red, green / blue, white. Each row starts with filter type 0.
@@ -142,9 +142,9 @@ let out = Buffer(16)
 export function build(): i32 {
   out = Buffer(verts.length)
   storeBytes(out, 0, verts)
-  out.length
+  return out.length
 }
-export function outPtr(): i32 { out.base }
+export function outPtr(): i32 { return out.base }
 ```
 
 The host reads them as `new Uint8Array(instance.exports.memory.buffer, outPtr(), len)`. Take

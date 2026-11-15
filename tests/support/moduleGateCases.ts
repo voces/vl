@@ -71,7 +71,7 @@ export const GATE_CASES: readonly GateCase[] = [
   // — the `{` is what separates a dependency from a plain declaration —
   {
     name: "exported function is NOT a module edge",
-    source: "export function twice(n: i32): i32 { n * 2 }\nprint(twice(2))\n",
+    source: "export function twice(n: i32): i32 { return n * 2 }\nprint(twice(2))\n",
     arms: false,
     native: "clean",
   },
