@@ -142,3 +142,24 @@ print(first([4]))
     if (unc.length === 0) throw new Error(`want uncovered rows, got ${JSON.stringify([...rows])}`);
   },
 });
+
+// The verifier's own cases (`compiler/ir_selftest.vl`): hand-built IR breaking each of rules
+// 1-7 is refused under that rule, and the unbroken function holds.
+Deno.test({
+  name: "ir shadow: each hand-built case fails the rule it breaks, and the control holds",
+  ignore,
+  fn: () => {
+    const exp = new WebAssembly.Instance(compiled!, {})
+      .exports as unknown as Exports;
+    // Any compile initialises the checker's primitives the cases are typed at.
+    exp.modReset();
+    exp.srcReset();
+    for (const ch of "print(1)\n") exp.srcPush(ch.codePointAt(0)!);
+    if (exp.compileSrc() !== 0) throw new Error("want the priming compile to pass");
+    for (let k = 0; k <= 7; k++) {
+      const got = exp.irVerifySelfTest(k);
+      if (got !== k) throw new Error(`case ${k}: want rule ${k}, got rule ${got}`);
+    }
+  },
+});
+

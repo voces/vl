@@ -1,8 +1,8 @@
-// The IR verifier (ir-design-2026-11.md §2): one linear walk over an `IrFn` that checks closed
-// reps, rep agreement, types against reps, definitions before uses, control, calls, switch
-// coverage and bounds checks. It answers the first rule a function breaks, with the node; it
-// never reports through the emitter's failure channel. Rule 9 waits for the first pass that
-// moves a check.
+// The IR verifier (ir-design-2026-11.md §2): one linear walk over an `IrFn` that checks rules
+// 1-7: closed reps, rep agreement, types against reps, definitions before uses, control, calls
+// and switch coverage. It answers the first rule a function breaks, with the node; it never
+// reports through the emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
+// builder, and trap order (rule 9) with the first pass that moves a check.
 import {
   IrFn,
   IrNode,
@@ -17,7 +17,6 @@ import {
   RCast,
   RCellGet,
   RCellNew,
-  RCoerce,
   RFnId,
   RGetField,
   RGlobalGet,
@@ -83,7 +82,6 @@ let vfDefined: boolean[] = []
 let vfDefLog: i32[] = []
 let vfLabels: i32[] = []
 let vfLabelOut: i32[] = []
-let vfChecked: string[] = []
 let vfBool = -1
 let vfI32 = -1
 let vfStr = -1
@@ -248,13 +246,6 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RCallHost => uses(r.chArgs, at)
-    RCoerce => {
-      use(r.coV, at)
-      if dst >= 0 && repIdOfTy(r.coAt) != dst {
-        return fail(2, at, "a coercion's target is not its destination's rep")
-      }
-      0
-    }
     RTest => {
       use(r.teV, at)
       if dst >= 0 && dst != vfBool { return fail(2, at, "`is` yields bool") }
@@ -336,7 +327,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 && kidAt(l, 0) != dst {
         return fail(2, at, "an element's rep is not its destination's")
       }
-      boundsUse(r.lgV, r.lgIx, at)
+      0
     }
     RListLen => {
       use(r.llV, at)
@@ -354,23 +345,6 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCellGet => use(r.cgCell, at)
     RGlobalGet => 0
   }
-}
-
-function opndKey(o: Opnd): string {
-  match o {
-    OVar => "v" + i32ToStr(o.ov)
-    OImm => "i" + i32ToStr(o.oiBits as% i32)
-    OStr => "s" + i32ToStr(o.osText)
-  }
-}
-
-// Rule 8: an element access follows a bounds check of the same list and index in scope.
-function boundsUse(l: Opnd, ix: Opnd, at: i32) {
-  const k = opndKey(l) + "/" + opndKey(ix)
-  for c in vfChecked {
-    if c == k { return 0 }
-  }
-  fail(8, at, "an element access no bounds check covers")
 }
 
 // Whether node `id` leaves its body: a branch, a return or a trap.
@@ -393,16 +367,14 @@ function endsWriting(body: i32[], out: i32, at: i32) {
   fail(5, at, "an arm leaves v" + i32ToStr(out) + " unwritten")
 }
 
-// Walks a nested body: temps it defines and checks it makes are out of scope after it.
+// Walks a nested body: the temps it defines are out of scope after it.
 function nested(body: i32[]) {
   const nDefs = vfDefLog.length
-  const nChecked = vfChecked.length
   for id in body { stmt(id) }
   while vfDefLog.length > nDefs {
     const d = vfDefLog.pop() ?? -1
     if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
   }
-  while vfChecked.length > nChecked { vfChecked.pop() }
   0
 }
 
@@ -475,7 +447,7 @@ function stmt(id: i32) {
       ) {
         return fail(2, id, "an element write's reps do not match the list")
       }
-      boundsUse(n.lsV, n.lsIx, id)
+      0
     }
     SCellSet => {
       use(n.csCell, id)
@@ -485,7 +457,6 @@ function stmt(id: i32) {
     SBoundsCheck => {
       use(n.bcV, id)
       use(n.bcIx, id)
-      vfChecked.push(opndKey(n.bcV) + "/" + opndKey(n.bcIx))
       0
     }
     SEffect => rhsCheck(n.efRhs, -1, id)
@@ -611,7 +582,6 @@ export function irVerify(f: IrFn): IrVerdict {
   vfMsg = ""
   vfLabels = []
   vfLabelOut = []
-  vfChecked = []
   vfBool = repIdOfTy(TY_BOOL)
   vfI32 = repIdOfTy(TY_I32)
   vfStr = repIdOfTy(TY_STR)
