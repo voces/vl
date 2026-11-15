@@ -54,6 +54,7 @@ import {
   ovFnHead,
   ovInstPick,
   ovInstRecv,
+  ovInstRecvTy,
   ovInstSite,
   ovSetCands,
   ovSiteSetOf,
@@ -65,9 +66,11 @@ import {
   tsKids,
   tsKind,
   tsText,
+  ufcsExportedScopeIn,
   ufcsImpMangled,
   ufcsImpName,
   ufcsImpSpec,
+  ufcsSiteRoot,
 } from "./ast"
 import { flatLayoutPinMsg, resolveAnnot } from "./check_annot_resolve"
 import {
@@ -185,6 +188,7 @@ import {
   cvPick,
   isCstr,
   letCstr,
+  memCalleeIs,
   memCstr,
   nestCstr,
   noteArgCstr,
@@ -224,7 +228,7 @@ import {
   sharedUnionFieldTy,
   tpMemberFloorMsg,
 } from "./check_fit_rules"
-import { getterDemandNote } from "./check_getter_effects"
+import { getterDemandNote, homeModuleOf } from "./check_getter_effects"
 import { getterNarrowNote } from "./check_getter_walk"
 import { holeCastNames } from "./check_hole_links"
 import {
@@ -480,6 +484,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  cUserTypes,
   mkArrayTy,
   mkMapTy,
   mkNullableTy,
@@ -488,6 +493,7 @@ import {
   primNameStr,
   softenLitTy,
   strLitAsSet,
+  structNameOfTy,
   tyAt,
   tyBuiltinIndexable,
   tyElemOf,
@@ -781,8 +787,9 @@ export function wsCandidateAt(
     return ""
   }
   const pn = nodeAt(fd.fnParams[i])
-  if (!(pn is Param) || pn.parType < 0 || pn.parRest == 1) { return "" }
-  const name = wsAnnRecName(pn.parType)
+  if (!(pn is Param) || pn.parRest == 1) { return "" }
+  // A hole parameter its body inferred at a declared record is that record's (D16403).
+  const name = if pn.parType >= 0 { wsAnnRecName(pn.parType) } else { wsHoleRecName(ex) }
   if name == "" { return "" }
   if pre is TyVar {
     if rowParamRecordOf(pre.tvName) == "" { return "" }
@@ -865,6 +872,13 @@ function wsAnnRecName(ann: i32) {
   ""
 }
 
+// The declared record `ex` a hole parameter's inferred type holds, or "" for an anonymous one.
+function wsHoleRecName(ex: i32) {
+  const nm = structNameOfTy(ex)
+  if nm == "" || (cUserTypes[nm] ?? -1) != ex { return "" }
+  nm
+}
+
 // The declared record type a rewritten parameter `i` of the declaration call `n` names had, or -1
 // when it is no rewritten one.
 export function wsOrigTyOf(n: Call, i: i32): i32 {
@@ -872,7 +886,7 @@ export function wsOrigTyOf(n: Call, i: i32): i32 {
   const d = wsCalleeDecl(n)
   if d < 0 { return -1 }
   const r = wsRowOf(d, i)
-  if r < 0 { return -1 }
+  if r < 0 || wsOrigAnn[r] < 0 { return -1 }
   const a = nodeAt(wsOrigAnn[r])
   if a is TypeRef { return resolveAnnot(a.tyName, []) }
   -1
@@ -1223,7 +1237,7 @@ function rcwPinWidthNote(i: i32, sx: i32, sub: i32): boolean {
   if d < 0 || inferQuiet { return false }
   const name = wsCandidateAt(d, rcwPinPi[i], sx, sub, rcwPinDstTy[i])
   if name == "" { return false }
-  wsNotePendingAt(d, rcwPinPi[i], name)
+  wsNotePendingAt(d, rcwPinPi[i], name, rcwPinDstTy[i])
   true
 }
 
@@ -1830,7 +1844,25 @@ export function memCstrMsg(recv: i32, prop: string, site: i32) {
       prop.slice(MC_LAYOUT_MARK.length, prop.length),
     )
   }
-  memberFloorMsg(recv, prop)
+  const fm = memberFloorMsg(recv, prop)
+  if fm != "" && memCalleeIs(site) && typeBoundSelfFnOf(recv, prop) != "" {
+    return ""
+  }
+  fm
+}
+
+// The `self`-function `prop` the receiver type's declaring module exports for `recv`, or "": the
+// type-bound rung a member call reaches when the caller's scope binds no such function (§C).
+export function typeBoundSelfFnOf(recv: i32, prop: string): string {
+  const hm = homeModuleOf(recv)
+  if hm < 0 { return "" }
+  const name = ufcsExportedScopeIn(hm, prop)
+  if name == "" { return "" }
+  const d = fnDeclIx[name] ?? -1
+  if methodFnOfDecl(d) < 0 { return "" }
+  const fnTy = declTyOf(d)
+  if fnTy < 0 || !ufcsSelfAccepts(name, fnTy, recv) { return "" }
+  name
 }
 
 // The direct `?.prop` refusal for a receiver pinned at `recv`, or "" when it reads: a record or
@@ -3475,6 +3507,26 @@ export function ovPickFor(row: i32, recvTy: i32): string {
   found
 }
 
+// Records that member call `site` took `pick` at receiver `recvTy`, once per (site, receiver).
+export function ovInstNote(
+  site: i32,
+  recvTy: i32,
+  recvStr: string,
+  pick: string,
+) {
+  const at = ufcsSiteRoot(site)
+  let k = 0
+  while k < ovInstSite.length {
+    if ovInstSite[k] == at && ovInstRecvTy[k] == recvTy { return 0 }
+    k = k + 1
+  }
+  ovInstSite.push(at)
+  ovInstRecv.push(recvStr)
+  ovInstPick.push(pick)
+  ovInstRecvTy.push(recvTy)
+  0
+}
+
 // One instance's answer for the overloaded member call `site`, whose receiver this pin
 // binds to `ur`: the candidate its head selects, its receiver and arguments checked under the
 // pin, and the choice recorded per instance (`ovInstSite`) for the editor.
@@ -3501,18 +3553,7 @@ function ovPinCheck(
     pick = ""
   }
   // Recorded refused or not ("" picks nothing), so the site is not also reported unpinned.
-  const urS = tyToStrUser(ur)
-  let seen = false
-  let k = 0
-  while k < ovInstSite.length {
-    if ovInstSite[k] == site && ovInstRecv[k] == urS { seen = true }
-    k = k + 1
-  }
-  if !seen {
-    ovInstSite.push(site)
-    ovInstRecv.push(urS)
-    ovInstPick.push(pick)
-  }
+  ovInstNote(site, ur, tyToStrUser(ur), pick)
   if pick == "" { return 0 }
   const ft = tyAt(moduleNameTyOf(pick))
   const c = nodeAt(site)

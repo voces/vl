@@ -70,11 +70,12 @@ sites (`struct.new*` / `array.new*`) surviving in the module**, read out of
 | `union-box-call` | `i64 \| boolean` from a helper, `is`-narrowed in the loop | 3 | **0** | **0** |
 | `union-box-payload-read` | same, with the narrowed payload READ | 3 | 2 | **2** |
 | `union-box-branch-local` | same box via a `let` written on two SEPARATE statements | 4 | 4 | **2** |
-| `list-wrapper-push` | scratch list GROWN by `.push` each trip | 5 | 3 | **2** |
-| `list-wrapper-push-reserved` | same three pushes, unconditional, so reserved (D3623) | 6 | **0** | **0** |
+| `list-wrapper-push` | scratch list GROWN by `.push` each trip | 3 | 3 | **2** |
+| `list-wrapper-push-reserved` | same three pushes, unconditional, so reserved (D3623) | 4 | **0** | **0** |
 
 The count is over the whole module, which is the honest upper bound: unoptimized,
-some sites live in helpers the loop calls; optimized, everything reachable has
+some sites live in helpers the loop calls (a push's grow is one `__grow_<row>__` per list
+shape, inline again at `-O`); optimized, everything reachable has
 been inlined into the one loop, so the module IS the loop. The `(none)` column counts
 only reachable code too: a plain build writes an `unreachable` stub for every function
 no root reaches (DECISIONS.md, "A plain build drops the functions no root reaches"),

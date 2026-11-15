@@ -9703,8 +9703,9 @@ seed-size baseline is rewritten with it.
 
 **The ruling.** A `const` whose initialiser is literal arithmetic — numeric literals, other such
 `const`s, parentheses, unary minus, `~`, `+ - * / %`, `& | ^`, `<< >> >>>`, with integer and
-float literals — is computed EXACTLY, like Go's untyped constants or Zig's `comptime_int`, and
-typed at each use. A use whose destination cannot hold the exact value is a check error
+float literals — is folded and typed at each use. Its integer arithmetic is EXACT, like Go's
+untyped constants or Zig's `comptime_int`; its float arithmetic is IEEE-754, as at run time
+(owner, 2026-11-15, below). A use whose destination cannot hold the exact value is a check error
 (`constant 2147483648 overflows i32`), never a silent wrap. It extends ruling C (a bare literal
 `const` is its literal at every read). A tree that reads a variable, calls a function, or names a
 `let` is untouched, and so is an annotated `const` except as below.
@@ -9743,19 +9744,19 @@ tree read stays an editor reference.
   element — is that integer when it is a whole number (`2.5 * 4` is `10` at `i64`); otherwise it
   is refused as any float there is.
 * An integer constant at `f32` or `f64` is taken as an integer literal is: when that float holds
-  it exactly, and refused otherwise (D1890's rule; a VL integer literal does not round). A float
-  constant is exact until its use: `0.1 + 0.2` is the `f64` nearest 0.3 and the `f32` nearest
-  0.3, not the sum of two rounded values.
+  it exactly, and refused otherwise (D1890's rule; a VL integer literal does not round).
+* **A float constant folds in IEEE-754 (owner, 2026-11-15, lane O's spec question 9; this
+  reverses ruling A's float half).** Folding never changes a float result: each float literal is
+  its nearest double, each float operation rounds to the nearest double, ties to even, and an
+  integer operand converts to the nearest double as it enters one. So `0.1 + 0.2` is
+  0.30000000000000004, `1.5 % 0.1` is 0.09999999999999992, `(1.5 % 0.1) / (2.5 % 0.1)` is
+  1.0000000000000007, and `1.0 + 1.0/9007199254740992.0` is `1.0`. A float zero keeps its sign
+  (`0.0 * -1.0` is `-0`). The integer part of a mixed tree still folds exactly, and a float
+  result at an integer destination is still refused unless it is whole. A tree initialising a
+  binding annotated `f32` folds in `f32` arithmetic; at any other `f32` use the fold sees no use
+  type, so the double result rounds once more to `f32` (D16414, open).
 * **Precision.** Integers are exact to 512 bits, past which the expression is a check error
-  (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound. A
-  float constant is an exact fraction whose numerator and denominator are each held to 4096
-  bits, enough for every finite double and its reciprocal. It reaches its use as a decimal
-  literal: exact when its expansion terminates within 400 characters, otherwise to 800
-  significant digits and a sticky last digit when anything is cut. Every rounding boundary of
-  an `f32` or `f64` has fewer significant digits than that, so the use rounds the literal as it
-  would the exact value (`1.0 + 1.0/9007199254740992.0 + 1.0/3.0/1e70` is the double above 1,
-  where 60 digits read a tie and rounded to 1). A float zero keeps its sign, as IEEE does:
-  `0.0 * -1.0` is `-0`, and `-0.0 + 0.0` is `+0`.
+  (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound.
 * **A refusal names the constant and the destination** at an integer, float or union
   destination: `constant 2147483648 overflows i32`, `constant 123456789000 is not exact at f32`,
   `constant 1.5 is not a whole number, so i64 cannot hold it`, `constant 2147483648 fits no
@@ -9784,11 +9785,15 @@ tree read stays an editor reference.
   division and then converts: `let x: f64 = 0xFFFFFFFF + 1000` is 4294968295 and
   `(0xFFFFFFFF + 1000) + p` with `p: f64` adds 4294968295. This reverses D14990's reading, which
   computed such a tree at 32 bits (`const c: f64 = 0x7FFFFFFF << 2` was -4, now 8589934588).
-  The bare pattern is unchanged: `0xFFFFFFFF as f32` reads the 32-bit pattern (-1.0) and
-  `as f64` the 64-bit one; an `f32` use and no context keep their 32 bits (D16390).
+  An `f32` use and no context keep their 32 bits (D16390).
+* **In a float context a radix literal is the value its digits spell (owner, 2026-11-15, ruling
+  4.1, as clarified).** At an `f32` or `f64` destination, or beside a float, the float must hold
+  that value exactly, as it must a decimal integer literal (`const b: f32 = 0x7FFFFFFF` is
+  refused); `as f32` / `as f64` rounds it, so `0xFFFFFFFF as f32` is 4294967296 where it was -1.0,
+  the pattern's signed value. An integer context keeps the bit pattern.
 * **A float division by zero, and a float constant past the largest double, are not folded.**
-  VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
-  computation they were; Go refuses both.
+  `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE computation they were, which gives the same
+  Infinity or NaN; Go refuses both.
 * `>>>` of a negative constant depends on the width it runs at, so it is not folded either, and
   a tree containing one keeps the literal-tree reading at its destination's width (D2709).
 * A `u8` element takes a constant as it takes the literal (past 255 refused, a negative one
@@ -9797,8 +9802,19 @@ tree read stays an editor reference.
 * An annotated `const` is a typed constant (owner, 2026-09-30): its annotation is the tree's
   destination, so `const x: i32 = 2147483647 + 1` is refused rather than wrapped.
 * An integer literal past the `i64` range is refused wherever no float holds it exactly
-  (D3425), where it used to keep its low 64 bits; a constant past it (`1 << 64`) is refused at
-  the use, not where it is declared, so `(1 << 70) >> 60` is 1024.
+  (D3425), where it used to keep its low 64 bits; a constant past it (`(1 << 62) * 4`) is refused
+  at the use, not where it is declared, so `((1 << 62) * 4) >> 60` is 16.
+* **A constant shift count decides an untyped literal operand's width (owner, 2026-11-15, Q8).**
+  A count of 0 to 31 leaves the literal `i32`; a count of 32 to 63 makes it `i64`, so
+  `(-3) >>> (40 + 1)` and `0xFFFFFFFF >> (40 + 1)` compute at 64 bits; a count of 64 or more is
+  refused with E6.2's sentence (`4294967296 >> 65535`, `1 << 64`). An operand whose type is fixed,
+  a declared `x: i32` or an `i32` destination (`const c: i32 = (-3) >>> (40 + 1)`), keeps E6.2's
+  refusal for a count past its width. The count may be a literal or a constant tree (D16378).
+  A shift is typed at its left operand, and a count never types it: an untyped literal takes its
+  destination's or peer's width first, then a constant count's widening, so
+  `(0xFFFFFFFF << 31) << c` at an `i64` is -17179869184 whether `c` is `i32` or `i64`; a variable
+  count widens nothing (`1 << c` with `c: i64` is an `i32`), and `x <<= w` with `x: i32` and an
+  `i64` count is legal.
 * In a generic body, an `i64` operand beside a type-parameter operand records a constraint
   (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit operand it meets`),
   since the body alone cannot see the width (D2712, D3426);
@@ -12085,3 +12101,94 @@ a warning for a discarded pure tail, and whether callbacks get an exception.
 - **L5** (phase products and a session value): a design note comes before any code.
 - **L6** (an independent oracle): an external tool, adding 0 bytes to the binary. Its CI step runs
   only under the `sweep` label and stays within 30 s.
+
+## The hybrid return rule's details (2026-11-15) — return rule A1, A2, A3
+
+**Ruled by the owner 2026-11-15**, completing the 2026-11-14 hybrid ruling above.
+- **A1, braces.** After a `function` signature, `{` always begins a block: `function f() { x: 3 }`
+  is refused, and `return { x: 3 }` is the spelling. After `=>`, `{` begins an object literal when
+  what follows is a valid field list (`name`, `name: expr`, `...spread`, comma-separated), and a
+  block otherwise. An empty `{}` after `=>` is an empty block. The choice is syntactic only.
+  ```vl
+  () => { x: 3 }      // object
+  (x) => { x }        // object { x: x }
+  () => {}            // empty block (a no-op callback)
+  () => ({})          // empty object
+  ```
+- **A2.** A pure expression (no call, assignment or other effect) left as the last statement of a
+  function's block body, with its value discarded, is a warning with a `--fix` that inserts
+  `return`. A call at the tail is never warned.
+- **A3.** No callback exception: a lambda's block body returns a value only through `return`.
+  Where the expected function type wants a value, the valueless block is a type error at the tail,
+  with the same `--fix`.
+
+## A radix literal is a bit pattern in an integer context and its value in a float context (2026-11-15) — spec 4.1, 4.2, D16390
+
+**Ruled by the owner 2026-11-15.** The 2026-09-04 bit-pattern rule stands for every integer
+destination. In a float context (an `f32`/`f64` destination, peer or `as`), a radix literal is the
+value its digits spell. As a decimal integer literal does (D1890), it is legal at a float
+destination only when the float holds it exactly; an explicit `as` rounds to the nearest float.
+A radix constant tree at an `f64` destination or peer computes at 64 bits, which reverses
+D14990's f64 clause.
+
+```vl
+0x80000000 as f32                // 2147483648.0
+0xFFFFFFFF as f32                // 4294967296.0 (nearest f32)
+const b: f32 = 0xFFFFFFFF        // refused: constant 4294967295 is not exact at f32
+let x: f64 = 0xFFFFFFFF + 1000   // 4294968295
+```
+
+Why: hex in a float context has no pattern meaning; C, Go, JS and Rust's `u32` read the value, and
+games use hex for integer bits (colours, hashes, masks), never for float arithmetic.
+
+## A numeric literal joined with a typed value adopts its type when it fits (2026-11-15) — spec 4.3, T3.6
+
+**Ruled by the owner 2026-11-15.** One rule for `if`/`match` arms, `??` and list elements: a
+numeric literal beside a typed numeric value takes that value's type when it fits (an integer
+exactly; a float literal at `f32` as `let x: f32 = 0.1` does), and otherwise keeps its default and
+the join widens. `if c { 5 } else { f }` with `f: f32` is `f32`, `[5, f]` is `f32[]`, and
+`if c { 9000000000 } else { f }` is `i64 | f32`.
+
+## An empty container's element type is fixed by its annotation (2026-11-15) — spec 4.4, refines D16047
+
+**Ruled by the owner 2026-11-15.** `is` on an empty list, map or set decides by the type it was
+built at, and an annotation fixes that type as a write does: `const m: i32[] = []` makes
+`(m as i32[] | f64[]) is f64[]` false. An empty literal delivered straight into a union takes the
+first matching arm, as D16276 does for `Map()`. D16047's vacuous answer remains only for an empty
+container nothing types: no annotation, no write. A map's `.length` is its entry count (4.6).
+
+## A shift count past 31 makes an untyped literal operand i64 (2026-11-15) — Q8, D16378
+
+**Ruled by the owner 2026-11-15.** A constant shift count from 32 to 63 makes an untyped literal
+operand `i64` (`1 << 40` is 1099511627776); a count of 64 or more is refused with E6.2's sentence.
+An operand whose type is already fixed (a declared `x: i32`, an `i32` destination) keeps E6.2's
+refusal for a count past its width.
+
+## Float constants fold in IEEE at their use type (2026-11-15) — Q9
+
+**Ruled by the owner 2026-11-15**, reversing the float half of "Exact constant arithmetic"
+(2026-09-30); integer constants stay exact. A float constant expression computes in IEEE at the
+type it is used at, identical to the same expression at run time: `0.1 + 0.2` is
+`0.30000000000000004`, `1.0 / 0.0` is Infinity. A float `/` or `%` whose divisor is literally zero
+is a warning. Why: refactoring a constant into a variable must not change a result; C, Rust, Java,
+Swift and JS fold floats this way.
+
+## Generic newtypes are branded per instance and erased (2026-11-15) — A14, D2031
+
+**Ruled by the owner 2026-11-15: option (a).** `type Handle<T> = new i32` gives each application
+its own compile-time brand, so `Handle<Texture>` and `Handle<Mesh>` are distinct and neither
+accepts a bare `i32`; `type Box<T> = new { … }` is branded per instance, so getters key on it and a
+structural value is refused. Brands are erased at run time; an `is` that would need to tell a
+newtype from its base at run time stays refused.
+
+## `==` between records needs one field set; a union compares its arm first (2026-11-15) — D16395
+
+**Ruled by the owner 2026-11-15.** `==` between two record types with different field sets is a
+check error. Comparing a union with one of its members tests the arm first, and a different arm is
+`false`, even when its fields are a superset. D1180's refusal of `==` between two general unions
+stands.
+
+## Nightly fuzzing runs on Actions (2026-11-15) — #8112
+
+**Ruled by the owner 2026-11-15.** The fuzz sweep with the oracle runs nightly on GitHub Actions
+(public repository, no minute cost) and fails only on a finding not already filed or known.
