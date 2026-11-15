@@ -20956,6 +20956,8 @@ type EplTables = {
   upStep: string[][],
   // The instance whose edges are drawn or read (-1 for the program); per call, its node and key.
   k: i32,
+  // The holder being read (-1 between asks), for the slots it hands open.
+  holder: i32,
   callNode: i32[],
   callKey: i32[],
   // The key count at the classes' last ask, and whether they are built for it: the build is
@@ -20990,6 +20992,7 @@ function eplFresh(): EplTables {
     upPar: [],
     upStep: [],
     k: -1,
+    holder: -1,
     callNode: [],
     callKey: [],
     limit: -1,
@@ -21762,7 +21765,7 @@ function eplFrameResult(m: i32, arity: i32): i32 {
 
 // Holder type `t` at place `p` with each open function leaf closed by its class; -1 where a leaf
 // has no single closed signature, or a member has no instance there.
-function eplRebuild(p: i32, t: i32, depth: i32): i32 {
+function eplRebuild(p: i32, t: i32, depth: i32, path: string[]): i32 {
   if t < 0 || t >= T.tys.length || depth > 8 || p < 0 { return -1 }
   const bd = eplBoundOf(eplFind(p))
   if bd >= 0 {
@@ -21772,19 +21775,29 @@ function eplRebuild(p: i32, t: i32, depth: i32): i32 {
   if !tyHasTyVar(t) { return t }
   const o = tyAt(t)
   match o {
-    TyFunc => eplRebuildLeaf(p, t, depth)
+    TyFunc => eplRebuildLeaf(p, t, path)
     TyNullable => {
-      const i = eplRebuild(p, o.nInner, depth + 1)
+      const i = eplRebuild(p, o.nInner, depth + 1, path)
       if i < 0 { -1 } else { mkNullableTy(i) }
     }
     TyArray => {
       if o.aRead != 0 { return -1 }
-      const e = eplRebuild(eplChild(p, "e"), o.aElem, depth + 1)
+      const e = eplRebuild(
+        eplChild(p, "e"),
+        o.aElem,
+        depth + 1,
+        eplPathPlus(path, "e"),
+      )
       if e < 0 { -1 } else { mkArrayTy(e) }
     }
     TyMap => {
       if tyHasTyVar(o.mKey) { return -1 }
-      const v = eplRebuild(eplChild(p, "v"), o.mVal, depth + 1)
+      const v = eplRebuild(
+        eplChild(p, "v"),
+        o.mVal,
+        depth + 1,
+        eplPathPlus(path, "v"),
+      )
       if v < 0 { -1 } else { mkMapTy(o.mKey, v, o.mSet) }
     }
     TyObj => {
@@ -21795,6 +21808,7 @@ function eplRebuild(p: i32, t: i32, depth: i32): i32 {
           eplChild(p, "f." + o.objFieldNames[i]),
           o.objFieldTypes[i],
           depth + 1,
+          eplPathPlus(path, "f." + o.objFieldNames[i]),
         )
         if f < 0 { return -1 }
         fs.push(f)
@@ -21885,8 +21899,19 @@ function eplUnderFrame(d: i32, ps: i32[]): i32 {
   one
 }
 
-// Function leaf type `t` at place `p`, closed by its class; -1 where it stays open.
-function eplRebuildLeaf(p: i32, t: i32, depth: i32): i32 {
+// `path` and one more step.
+function eplPathPlus(path: string[], step: string): string[] {
+  const out: string[] = []
+  for q in path { out.push(q) }
+  out.push(step)
+  out
+}
+
+// Function leaf type `t` at place `p`, slot `path` of the holder, closed by its class; -1 where it
+// stays open.
+function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
+  // A slot handed to an open function parameter is delivered at each call's own signature.
+  if EPL.holder >= 0 && fnSlotHandedOpen(EPL.holder, path) { return -1 }
   // A copy of a value the elaboration already closed is built at that type: the nearest such
   // source is where the conversion happens, and what lies before it does not reach this leaf.
   for c in eplReach(p, false) {
@@ -21897,7 +21922,10 @@ function eplRebuildLeaf(p: i32, t: i32, depth: i32): i32 {
     }
   }
   const one = eplOneCall(p)
-  if one == -1 { return if eplLate { eplUncalled(p, t) } else { -1 } }
+  // An uncalled function binding is handed on or unread, and its own type stays open.
+  if one == -1 {
+    return if eplLate && path.length > 0 { eplUncalled(p, t) } else { -1 }
+  }
   if one < 0 { return -1 }
   const cn = nodeAt(EPL.callNode[one])
   if !(cn is Call) { return -1 }
@@ -21922,7 +21950,7 @@ function eplRebuildLeaf(p: i32, t: i32, depth: i32): i32 {
     eplDemandAt(m, ps)
     // A member copied in from an upstream class may answer by its instance under the frame.
     const own = i32ListHas(EPL.members[eplFind(p)], m)
-    const mu = if own || (depth == 0 && !eplReadsContainer(p)) { -1 } else { eplFrameMember(elabSrcDecl(m), ps) }
+    const mu = if own || (path.length == 0 && !eplReadsContainer(p)) { -1 } else { eplFrameMember(elabSrcDecl(m), ps) }
     const mk = if mu >= 0 { mu } else { elabKeyAtPins(elabSrcDecl(m), noNames, noTys, ps, -1) }
     // A member whose own signature is closed at `ps` answers by it.
     const so0 = eplOwnSigAt(elabSrcDecl(m), ps)
@@ -21970,7 +21998,10 @@ function eplHolderTy(ix: i32, k: i32): i32 {
   const te = if k >= 0 { elabNodeTy(ix, k) } else { -1 }
   const t = if te >= 0 && tyHasTyVar(te) { te } else { nodeTyIxOf(ix) }
   const root = eplRoot(ix)
-  const r = if root >= 0 { eplRebuild(root, t, 0) } else { -1 }
+  const none: string[] = []
+  EPL.holder = ix
+  const r = if root >= 0 { eplRebuild(root, t, 0, none) } else { -1 }
+  EPL.holder = -1
   EPL.k = -1
   r
 }
