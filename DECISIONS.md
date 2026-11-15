@@ -9791,6 +9791,14 @@ tree read stays an editor reference.
   that value exactly, as it must a decimal integer literal (`const b: f32 = 0x7FFFFFFF` is
   refused); `as f32` / `as f64` rounds it, so `0xFFFFFFFF as f32` is 4294967296 where it was -1.0,
   the pattern's signed value. An integer context keeps the bit pattern.
+* **A numeric literal joined with a typed value adopts its type where it fits (owner, 2026-11-15,
+  ruling 4.3).** One rule for every join form, `if` and `match` arms, `??` and list elements: a
+  literal beside values of one numeric type takes that type when the type holds it (an integer
+  literal exactly, a float literal at `f32` as `let x: f32 = 0.1` does), and otherwise keeps its
+  own and the join widens as before. `if c { 5 } else { f }` and `[5, f]` with `f: f32` are
+  `f32`; `[0.1, f]` is `f32[]`; `if c { 9000000000 } else { f }` is `i64 | f32`. A join of two
+  typed members of different types keeps today's reading. An un-annotated function's returns
+  are a join too, so `if c { return 5 } return fv` infers `f32` (D2774).
 * **A float division by zero, and a float constant past the largest double, are not folded.**
   `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE computation they were, which gives the same
   Infinity or NaN; Go refuses both.

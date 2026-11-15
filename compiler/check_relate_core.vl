@@ -296,7 +296,13 @@ import {
 } from "./check_mismatch_notes"
 import { collectRetValues, isTopLevelStmt, joinArmIsLit } from "./check_nj_join"
 import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
-import { numCmpOp, numPairTy, valueTailSplit } from "./check_num_adopt"
+import {
+  litTakesFloat,
+  numCmpOp,
+  numLitAdoptDst,
+  numPairTy,
+  valueTailSplit,
+} from "./check_num_adopt"
 import {
   cexReported,
   cexWideConstNote,
@@ -330,11 +336,13 @@ import {
   cexMisfitMsg,
   exprNegatedArg,
   intLitIsNegated,
+  intLitMisfitAtFloat,
   isFloatLitExpr,
   numLitAnnotNote,
   numLitArithOp,
   numLitFitsStore,
   numLitListIsBytes,
+  numLitOwnTy,
   numLitReadIdent,
   numLitText,
   numLitValuesFit,
@@ -2626,30 +2634,47 @@ export function fnValVoidCoerce(srcExpr: i32, srcTy: i32, dstTy: i32) {
   false
 }
 
-// The type of the value `if` or `match` at `ix` when some tail is an `f32` value and every other
-// is a float literal, which adopts f32 as it does beside an operator (`raw * 2.0`); else -1. Its
-// `if`/`match` nodes are re-typed f32, so each literal re-encodes at single precision (D2775).
-export function joinF32LitTails(ix: i32): i32 {
+// The type of the value `if` or `match` at `ix` when its value tails are of one `f32` or `f64`
+// type and every other tail is a literal that type takes (`litTakesFloat`, owner ruling 4.3), as
+// it does beside an operator; else -1. Its `if`/`match` nodes are re-typed, so each literal is
+// built at that type; at `f32` a float literal re-encodes at single precision (D2775).
+export function joinFloatLitTails(ix: i32): i32 {
   const spine: i32[] = []
   const leaves: i32[] = []
   valueTailSplit(ix, spine, leaves)
   let fTy = -1
-  let lits = 0
   let i = 0
   while i < leaves.length {
-    const lt = nodeTyOf(leaves[i])
-    if isFloatLitExpr(leaves[i]) { lits = lits + 1 }
-    else if lt >= 0 && primNameOf(lt) == "f32" { fTy = joinTys(fTy, lt) }
-    else { return -1 }
+    if numLitOwnTy(leaves[i]) < 0 {
+      const lt = nodeTyOf(leaves[i])
+      const pn = primNameOf(lt)
+      if pn != "f32" && pn != "f64" { return -1 }
+      if fTy >= 0 && !tySame(fTy, lt) { return -1 }
+      fTy = lt
+    }
     i = i + 1
   }
-  if lits == 0 || fTy < 0 || primNameOf(fTy) != "f32" { return -1 }
+  if fTy < 0 { return -1 }
+  let lits = 0
+  for lf in leaves {
+    if numLitOwnTy(lf) >= 0 {
+      if !litTakesFloat(lf, fTy) { return -1 }
+      lits = lits + 1
+    }
+  }
+  if lits == 0 { return -1 }
+  for lf in leaves {
+    if numLitOwnTy(lf) >= 0 && !isFloatLitExpr(lf) { numLitAdoptDst(lf, fTy) }
+  }
+  const f32 = primNameOf(fTy) == "f32"
   // Flagged on every pass: an inference pass records the `if`'s value type too.
   let s = 0
   while s < spine.length {
     if !inferQuiet && spine[s] < nodeTyIx.length { nodeTySet(spine[s], fTy) }
-    f32JoinAdoptedSetAt(spine[s], true)
-    f32JoinAdoptCountSet(f32JoinAdoptCount + 1)
+    if f32 {
+      f32JoinAdoptedSetAt(spine[s], true)
+      f32JoinAdoptCountSet(f32JoinAdoptCount + 1)
+    }
     s = s + 1
   }
   fTy
@@ -4578,7 +4603,8 @@ export function argMismatchErr(
   argIx: i32,
   pName: string = "",
 ) {
-  const msg = "argument "
+  const litMsg = intLitMisfitAtFloat(argIx, expected)
+  const msg = if litMsg != "" { "argument " + i32ToStr(argN) + ": " + litMsg } else { "argument "
     + i32ToStr(argN)
     + ": expected "
     + tyToStr(expected)
@@ -4589,7 +4615,7 @@ export function argMismatchErr(
     + fracForIntParamNote(at, expected, pName)
     + numUnionLossNote(at, expected)
     + storageListNote(argIx, at, expected)
-    + litMemberNote(argIx, expected, 8)
+    + litMemberNote(argIx, expected, 8) }
   if argIx >= 0 && argIx < P.nodes.length {
     const n = nodeAt(argIx)
     if n is FuncDecl {
