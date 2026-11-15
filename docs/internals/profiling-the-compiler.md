@@ -669,7 +669,11 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   regression is caught by.
 * **`scripts/self-compile-time.sh`** — the candidate compiling the compiler, in guest FUEL
   against `scripts/self-compile-baseline.json`, tripping past 1.5×. Fires when the other two
-  missed it. It was CPU seconds against a 6.3 s idle baseline at 4×, half of the factor paying
+  missed it. Since 2026-11-15 it also reds on a rise past the baseline's per-PR **tier** (+1%).
+  A PR accepts such a rise by rewriting the baseline from a fixpoint seed and adding one line to
+  `scripts/self-compile-ledger.txt` (fuel, commit, PR, mechanism). A baseline that the ledger's
+  last line does not name also reds. The 1.5× line let +3.4% through in one afternoon (#8072,
+  #8080), and a 1% tier would have stopped it at the first of those PRs. It was CPU seconds against a 6.3 s idle baseline at 4×, half of the factor paying
   for contention, and it still flaked: docs-only PRs whose seed WAS master's fixpoint read
   26.8 s and 27.6 s at load 40–50 against a 25.2 s line. Fuel is identical run to run, so the
   factor now pays only for the compiler growing between re-baselines. The line is coarse: one

@@ -94,7 +94,7 @@ sources (`compiler/`, `std/`) are not listed: they report nothing on other progr
 | `duplicate-import` | warning | a name imported twice from one module |
 | `unreachable-code` | warning | a statement after `return`, `break` or a diverging branch |
 | `constant-condition` | warning | an `if` or `while` whose condition is a literal boolean that makes a branch dead |
-| `divide-by-zero` | warning | `/` or `%` by a literal `0`, also beside the error when the dividend is constant (D2.3) |
+| `divide-by-zero` | warning | `/` or `%` by a literal `0`, also beside the error when the dividend is constant (D2.3); a float `/` or `%` by a zero literal (D6.3) |
 | `range-inclusive-length` | warning | `0 to xs.length`, one step past the last index |
 | `unconditional-recursion` | warning | a function every path of which calls itself again |
 | `unused-pure-expression` | warning | a value computed and dropped, not the last statement of its block |
@@ -255,11 +255,15 @@ failure with a reason returns a union of the result and the error. A trap is for
 | `__trap__(msg)`, or a call that returns `never` | statements.md §S8.2 |
 
 **D6.3** Float division by zero does not trap. It gives the IEEE result (expressions.md
-§E2.4).
+§E2.4). A float `/` or `%` whose divisor is a zero literal (`0.0`, `-0.0`, a parenthesised
+zero) is a warning (`divide-by-zero`): "dividing by `0.0` gives Infinity or NaN". A named
+or computed divisor never warns, and `std:math`'s `INFINITY` and `NAN` spell the values.
 
 ```vl
 print(1.0 / 0.0)   // prints Infinity
 ```
+
+> Ruling: owner 2026-11-15 (lane O's spec question 9): the float zero-divisor warning.
 
 **D6.4** An integer `/` or `%` whose divisor is the literal `0` and whose dividend is not
 constant is a warning (`divide-by-zero`), and traps when it runs (D6.1). When both

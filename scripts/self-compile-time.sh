@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # THE L2 TRIPWIRE: the candidate compiling the compiler, in guest FUEL, against a committed
-# baseline. Fails past the baseline's factor (1.5x), and when the live set nears the heap's cap.
+# baseline. Fails past the baseline's per-PR tier (+1%), past its factor (1.5x), and when the live
+# set nears the heap's cap. A rise is accepted by `--write-baseline` in the same PR together with a
+# line in scripts/self-compile-ledger.txt naming the PR and the mechanism; the check refuses a
+# baseline whose fuel the ledger's last line does not name.
 #
 # It is a tripwire, not a measurement. A cost regression does not slow the SOURCE, it
 # slows the compiler BUILT from it — stage 3 runs the old compiler and stays fast, so an
@@ -39,9 +42,12 @@ VL="${VL:-scripts/vl-host/target/release/vl}"
 SEED="${SEED:-build/vl-compiler.wasm}"
 SRC="${SRC:-compiler/entry.vl}"
 BASELINE="${BASELINE:-scripts/self-compile-baseline.json}"
+LEDGER="${LEDGER:-scripts/self-compile-ledger.txt}"
 # Read from the baseline file, so the committed number and the committed band travel
 # together and `--write-baseline` cannot silently change the band.
 FACTOR="${FACTOR:-$(awk -F'[:,]' '/"factor"/{gsub(/[^0-9.]/, "", $2); print $2}' "$BASELINE")}"
+TIER="${TIER:-$(awk -F'[:,]' '/"tier"/{gsub(/[^0-9.]/, "", $2); print $2}' "$BASELINE")}"
+[ -n "$TIER" ] || TIER=0.01
 
 [ -x "$VL" ] || { echo "missing vl binary: $VL (cd scripts/vl-host && cargo build --release)"; exit 1; }
 [ -f "$SEED" ] || { echo "missing seed: $SEED (scripts/refresh-compiler.sh)"; exit 1; }
@@ -92,13 +98,22 @@ fi
 
 if [ "$WRITE" = 1 ]; then
   COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
-  printf '{\n"fuel": %s,\n"factor": %s,\n"commit": "%s",\n"note": "candidate compiles the compiler, VL_FUEL=1 guest fuel: a count, so load cannot move it. Re-baseline when the cost really changes: scripts/self-compile-time.sh --write-baseline"\n}\n' \
-    "$FUEL" "$FACTOR" "$COMMIT" > "$BASELINE"
+  printf '{\n"fuel": %s,\n"factor": %s,\n"tier": %s,\n"commit": "%s",\n"note": "candidate compiles the compiler, VL_FUEL=1 guest fuel: a count, so load cannot move it. A rise past the tier is accepted with scripts/self-compile-time.sh --write-baseline and a line in scripts/self-compile-ledger.txt; write it from a fixpoint seed"\n}\n' \
+    "$FUEL" "$FACTOR" "$TIER" "$COMMIT" > "$BASELINE"
   echo "wrote $BASELINE: fuel $FUEL (${CPU}s CPU, not recorded)"
+  echo "now add its line to $LEDGER: $FUEL<TAB>$COMMIT<TAB><PR><TAB><delta and mechanism>"
   exit 0
 fi
 
 BASE=$(awk -F'[:,]' '/"fuel"/{gsub(/[^0-9]/, "", $2); print $2}' "$BASELINE")
+# The ledger's last entry must be the baseline's own: a baseline rewritten without a line saying
+# why is refused, whatever the fuel reads.
+LAST=$(awk -F'\t' '!/^#/ && NF >= 4 {f = $1} END {print f}' "$LEDGER" 2>/dev/null || true)
+if [ "$LAST" != "$BASE" ]; then
+  echo "SELF-COMPILE LEDGER: $BASELINE holds fuel $BASE, but the last line of $LEDGER names"
+  echo "  '${LAST:-nothing}'. A baseline rewrite carries one ledger line: fuel, commit, PR, mechanism."
+  exit 1
+fi
 LIMIT=$(awk -v b="$BASE" -v f="$FACTOR" 'BEGIN{printf "%.0f", b * f}')
 PCT=$(awk -v c="$FUEL" -v b="$BASE" 'BEGIN{printf "%+.1f", 100 * (c - b) / b}')
 echo "L2 self-compile fuel $FUEL (${PCT}% on baseline $BASE, trips past $LIMIT = ${FACTOR}x); ${CPU}s CPU, not graded"
@@ -112,4 +127,14 @@ awk -v c="$FUEL" -v l="$LIMIT" 'BEGIN{exit !(c > l)}' && {
   echo "  scripts/self-compile-time.sh --write-baseline"
   exit 1
 }
+TIERLIM=$(awk -v b="$BASE" -v t="$TIER" 'BEGIN{printf "%.0f", b * (1 + t)}')
+awk -v c="$FUEL" -v l="$TIERLIM" 'BEGIN{exit !(c > l)}' && {
+  echo "SELF-COMPILE FUEL ROSE ${PCT}% (per-PR tier +$(awk -v t="$TIER" 'BEGIN{printf "%g", 100 * t}')%): fuel $FUEL against"
+  echo "  the $BASE baseline. Find the mechanism (profile the self-compile, docs/internals/"
+  echo "  profiling-the-compiler.md) and fix it, or accept it in this PR: run, from a fixpoint seed,"
+  echo "  scripts/self-compile-time.sh --write-baseline, and add its line to $LEDGER."
+  exit 1
+}
+awk -v c="$FUEL" -v b="$BASE" -v t="$TIER" 'BEGIN{exit !(c < b * (1 - t))}' &&
+  echo "  fell ${PCT}%: the PR that earned it may lower the baseline (--write-baseline and a ledger line)"
 echo "self-compile time ok"

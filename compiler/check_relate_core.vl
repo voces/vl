@@ -259,7 +259,9 @@ import {
   annRegisterVariantMembers,
   cFillStmtIx,
   cTyIxSetAdd,
+  isNewtypeName,
   nwBrand,
+  nwBrandRow,
   registerInlineLitUnion,
 } from "./check_inline_lit_union"
 import { luAnnTy, tpRetJoinFixed, tpRetJoinTys } from "./check_list_union"
@@ -2915,7 +2917,7 @@ function applyGenAliasTys(head: string, gi: i32, argTys: i32[]): i32 {
     mi = mi + 1
   }
   const cuHit = cUserTypes[memoKey]
-  if cuHit is i32 { return cuHit }
+  if cuHit is i32 { return gaBrand(head, argTys, cuHit) }
   // An argument equal to an open application's, under another arena index (a closed nullable
   // re-wrapped, `(T | null) | null`), is that application, not a new instance (D16068).
   const same = gaOpenEqualRes(gi, argTys)
@@ -3009,8 +3011,34 @@ function applyGenAliasTys(head: string, gi: i32, argTys: i32[]): i32 {
   gaOpenGi.pop()
   gaOpenStart.pop()
   gaOpenRes.pop()
-  if unionDecl { return gaUnionUnwrap(resIx, memoKey) }
-  resIx
+  if unionDecl { return gaBrand(head, argTys, gaUnionUnwrap(resIx, memoKey)) }
+  gaBrand(head, argTys, resIx)
+}
+
+// The instance `base` of generic alias `head` at `argTys`, branded by its spelling when `head`
+// is declared `new`: two instances over one base (`Handle<A>`, `Handle<B>` over `i32`) stay
+// distinct. Erased like any brand; `cUserTypes` keeps the un-branded instance.
+function gaBrand(head: string, argTys: i32[], base: i32): i32 {
+  if base < 0 || base == TY_ERR || !isNewtypeName(head) { return base }
+  let nm = head + "<"
+  let k = 0
+  while k < argTys.length {
+    if k > 0 { nm = nm + ", " }
+    nm = nm + tyToStr(argTys[k])
+    k = k + 1
+  }
+  const ix = nwBrandRow(nm + ">", base)
+  // The brand's own application row, so inference binds its arguments and substitution
+  // re-applies it; a scalar base is shared by every instance and has none to carry.
+  if genAppRowOf(ix) < 0 {
+    cTyIxSetAdd(gaAppTyIxs, gaAppTyIxSet, ix)
+    gaAppHeads.push(head)
+    gaAppArgStart.push(gaAppArgFlat.length)
+    gaAppArgCount.push(argTys.length)
+    gaAppFinite.push(-1)
+    for at in argTys { gaAppArgFlat.push(at) }
+  }
+  ix
 }
 
 // Whether generic alias declaration `declIx` is a union (`type O<T> = T | null`), not a record.
@@ -3501,10 +3529,21 @@ export function tyTestMemberFit(m: i32, chk: i32): i32 {
     assignable(chk, m)
     && !isWidenNotVariant(chk, m)
     && !fnSlotRetWidens(chk, m)
+    && !listElemNeverFits(m, chk)
   ) {
     return TT_PARTLY
   }
   TT_NONE
+}
+
+// Whether lists `m` and `chk` store elements no value of which fits the other's: a list's
+// element type is fixed by its annotation or its writes, so an empty one fits no other.
+function listElemNeverFits(m: i32, chk: i32): boolean {
+  const a = tyAt(m)
+  const c = tyAt(chk)
+  a is TyArray
+    && c is TyArray
+    && tyTestMemberFit(tyElemOf(a), tyElemOf(c)) == TT_NONE
 }
 
 // Whether operand member `m` is the tested type `c` itself: the same variant, or the type
@@ -6135,7 +6174,8 @@ export function holeSetCallRetOf(
   let split = false
   const rs: i32[] = []
   for d in ds {
-    const rd = setMemberRetAt(d, ft)
+    let rd = setMemberRetAt(d, ft)
+    if rd < 0 && setMemberInfer(d) { rd = setMemberRetAt(d, ft) }
     // A lambda written after this call is not checked yet; the call is decided with the set,
     // typed by its own callee, and each arm takes its member's result when it is instanced.
     if rd < 0 && setMemberUnchecked(d) {
@@ -6202,6 +6242,19 @@ export function holeSetFitsRetAt(s: i32, pts: i32[], ret: i32): boolean {
       return false
     }
   }
+  true
+}
+
+// Checks un-annotated top-level member `d`'s body now when pass 2 has not reached it, as a forward
+// direct call does, so a call through its set ahead of the declaration reads what it returns
+// (D16381). True when it checked it.
+function setMemberInfer(d: i32): boolean {
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || !directHoleDecl(d) || onInferStack(f.fnName) {
+    return false
+  }
+  if nodeTyOf(d) >= 0 || (fnDeclIx[f.fnName] ?? -1) != d { return false }
+  checkerForceFn(0, d, -1, -1)
   true
 }
 
@@ -10398,11 +10451,13 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
 
 // A recursive generic instance substituted as its alias applied to the substituted arguments:
 // the one shared instance, where a field walk would meet the open instance at the cycle and
-// keep it. An argument still open (a hole) yields an open instance, re-substituted once bound.
+// keep it; a branded instance likewise. An argument still open (a hole) yields an open instance, re-substituted once bound.
 // -1 for any other type, or when no argument moves.
 function substCyclicApp(tyIx: i32, bNames: string[], bTys: i32[]): i32 {
   const i = genAppRowOf(tyIx)
-  if i < 0 || !genAppRowCyclic(i) { return -1 }
+  if i < 0 { return -1 }
+  // A generic `new` instance is re-applied too, which is what brands the substituted one.
+  if !genAppRowCyclic(i) && nomNameOfTy(tyIx) == "" { return -1 }
   const gi = gaIndexOf(gaAppHeads[i])
   if gi < 0 { return -1 }
   const st = gaAppArgStart[i]
