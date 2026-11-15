@@ -20,6 +20,7 @@ import {
   elabFnSlotWidened,
   elabHolePinNote,
   elabPinBindingIs,
+  elabTyClosed,
   fnChoiceVetoed,
   fnChoiceWideNote,
   fnLetIsWide,
@@ -56,6 +57,7 @@ import {
   Param,
   Paren,
   RetStmt,
+  Spread,
   StrLit,
   TS_APP,
   TS_ARR,
@@ -84,6 +86,7 @@ import {
   i32ToStr,
   nodeAt,
   nodeChildren,
+  nodeChildrenPush,
   stmtAlwaysExits,
   tsKidCount,
   tsKidStart,
@@ -385,6 +388,7 @@ import {
 import { nullableFlatInner, substUnionNullFolded } from "./check_subst_fold"
 import { demangleName, isBuiltinTyName } from "./check_suggest"
 import {
+  holeNameIsParamOf,
   joinTyParamNull,
   markTpJoinApart,
   noteHoleTpJoin,
@@ -8626,6 +8630,12 @@ function holeCallInstOf(
     const r = holeSetCallRetOf(c, fnTagSetOfTy(vt), ats, false)
     return if r >= 0 { mkFuncTy(ats, r) } else { -1 }
   }
+  // A declared hole function bound here is called as a direct call of it is: each lambda argument
+  // at the types its body calls that parameter at, then its body at the closed arguments (D16335).
+  const d = holeDeclOfFnTy(vt)
+  if d >= 0 && lams.length > 0 {
+    return holeDeclCallInst(d, n, vNames, vTys, calleeFn, depth)
+  }
   for lj in lams {
     const p = vf.fnParamTypes[lj]
     if !holeLamBind(p, n.callArgs[lj], vNames, vTys, oNames, oTys) { return -1 }
@@ -8633,6 +8643,221 @@ function holeCallInstOf(
   const inst = substTyDeep(vt, oNames, oTys)
   if inst < 0 || tyHasTyVar(inst) { return -1 }
   inst
+}
+
+// The un-annotated declared function whose own open signature `vt` is: the lone member of its
+// function set, else the function whose own hole its first parameter names; -1 when neither.
+function holeDeclOfFnTy(vt: i32): i32 {
+  if vt < 0 || vt >= T.tys.length { return -1 }
+  const vf = tyAt(vt)
+  if !(vf is TyFunc) { return -1 }
+  const ms = fnTagMembers(fnTagSetOfTy(vt))
+  if ms.length == 1 { return holeDeclChecked(ms[0], vf) }
+  if vf.fnParamTypes.length == 0 { return -1 }
+  const p0 = vf.fnParamTypes[0]
+  if p0 < 0 || p0 >= T.tys.length { return -1 }
+  const pv = tyAt(p0)
+  if !(pv is TyVar) { return -1 }
+  const nm = pv.tvName
+  if nm.length < 2 || nm[0] != '?' { return -1 }
+  let e = 1
+  while e < nm.length && nm[e] != '.' && nm[e] != '@' { e = e + 1 }
+  const d = holeDeclChecked(fnDeclIx[nm.slice(1, e)] ?? -1, vf)
+  if d < 0 { return -1 }
+  const f = nodeAt(d)
+  if (
+    !(f is FuncDecl)
+    || !holeNameIsParamOf(nm, f.fnName, d, f.fnParams.length)
+  ) {
+    return -1
+  }
+  d
+}
+
+// Declared function `d` when it is an un-annotated, non-generic function of `vf`'s arity; -1 else.
+function holeDeclChecked(d: i32, vf: TyFunc): i32 {
+  if d < 0 || d >= P.nodes.length || !directHoleDecl(d) { return -1 }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return -1 }
+  if f.fnParams.length != vf.fnParamTypes.length { return -1 }
+  d
+}
+
+// Call `n` of declared hole function `d` through a parameter bound to it, typed as the direct call
+// of `d` at `n`'s arguments: a lambda argument at the closed types `d`'s body calls its parameter
+// at, every argument closed, then `d`'s body at them; -1 when one stays open.
+function holeDeclCallInst(
+  d: i32,
+  n: Call,
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  depth: i32,
+): i32 {
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnParams.length != n.callArgs.length { return -1 }
+  const ats: i32[] = []
+  let j = 0
+  while j < n.callArgs.length {
+    let at = -1
+    if holeArgIsLam(n.callArgs[j]) {
+      const lx = parenPeelIx(n.callArgs[j])
+      if lx < 0 || lx >= P.nodes.length { return -1 }
+      const lam = nodeAt(lx)
+      const raw: i32[] = []
+      if (
+        !(lam is FuncDecl)
+        || holeParamCallsAt(f.fnBody, f.fnParams[j], lam.fnParams.length, raw) <= 0
+      ) {
+        return -1
+      }
+      const pts: i32[] = []
+      for t in raw { pts.push(widenLitTy(t)) }
+      const r = holeLamRetAt(lx, mkFuncTy(pts, TY_I32), vNames, vTys)
+      if r < 0 { return -1 }
+      at = mkFuncTy(pts, r)
+    } else {
+      at = holeCallNodeTy(n.callArgs[j], vNames, vTys, calleeFn, depth + 1)
+    }
+    if at < 0 || tyHasTyVar(at) { return -1 }
+    ats.push(at)
+    j = j + 1
+  }
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(d, mkFuncTy(ats, TY_I32), noN, noT)
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  mkFuncTy(ats, r)
+}
+
+// Whether parameter `q` is read under `body`, and only as the callee of positional calls of `n`
+// arguments whose types are closed and match `at`'s, which the first such call fills.
+export function ftParamOnlyCalledAt(
+  body: i32,
+  q: i32,
+  n: i32,
+  at: i32[],
+): boolean {
+  const calls = ftParamCallsAt(body, q, n, at)
+  calls > 0 && ftParamReads(body, q) == calls
+}
+
+// How many calls under `body`, nested functions included, have parameter `q` as their callee,
+// each positional with `n` closed arguments whose types match `at`'s (the first fills it); -1
+// when one does not.
+function ftParamCallsAt(body: i32, q: i32, n: i32, at: i32[]): i32 {
+  let calls = 0
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length {
+      const yn = nodeAt(y)
+      if yn is Call && identDeclOf(parenPeelIx(yn.callFn)) == q {
+        calls = calls + 1
+        if yn.callArgs.length != n || !ftArgIsParam(yn, n - 1) && n > 0 {
+          return -1
+        }
+        let k = 0
+        while k < n {
+          const t = nodeTyIxOf(yn.callArgs[k])
+          if t < 0 || t >= T.tys.length || !elabTyClosed(t, 0) { return -1 }
+          if at.length < n { at.push(t) }
+          else if !tySame(at[k], t) { return -1 }
+          k = k + 1
+        }
+      }
+      nodeChildrenPush(y, todo)
+    }
+  }
+  calls
+}
+
+// `ftParamCallsAt` over parameter `q` and every binding under `body` initialised to `q` or to
+// another such binding and never stored to, the calls agreeing on `at`; -1 when one does not.
+function holeParamCallsAt(body: i32, q: i32, n: i32, at: i32[]): i32 {
+  const names: i32[] = [q]
+  let i = 0
+  while i < names.length {
+    const todo: i32[] = [body]
+    while todo.length > 0 {
+      const y = todo.pop() ?? -1
+      if y >= 0 && y < P.nodes.length {
+        const yn = nodeAt(y)
+        if (
+          yn is LetDecl
+          && yn.letInit >= 0
+          && (yn.letKw == "const" || !holeLetStored(body, y))
+        ) {
+          const v = parenPeelIx(yn.letInit)
+          if (
+            v >= 0
+            && v < P.nodes.length
+            && nodeAt(v) is Ident
+            && identDeclOf(v) == names[i]
+            && !i32ListHas(names, y)
+          ) {
+            names.push(y)
+          }
+        }
+        nodeChildrenPush(y, todo)
+      }
+    }
+    i = i + 1
+  }
+  let calls = 0
+  for d in names {
+    const c = ftParamCallsAt(body, d, n, at)
+    if c < 0 { return -1 }
+    calls = calls + c
+  }
+  calls
+}
+
+// Whether a plain or compound store under `body` writes binding `d`.
+function holeLetStored(body: i32, d: i32): boolean {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length {
+      const yn = nodeAt(y)
+      if (
+        yn is BinExpr
+        && yn.binOp == "="
+        && identDeclOf(parenPeelIx(yn.binLeft)) == d
+      ) {
+        return true
+      }
+      nodeChildrenPush(y, todo)
+    }
+  }
+  false
+}
+
+// How many reads of parameter `q` lie under `body`.
+function ftParamReads(body: i32, q: i32): i32 {
+  let reads = 0
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length {
+      if nodeAt(y) is Ident && identDeclOf(y) == q { reads = reads + 1 }
+      nodeChildrenPush(y, todo)
+    }
+  }
+  reads
+}
+
+// Whether argument `i` of call `c` is parameter `i`: positional, unnamed, with no spread at or
+// before it.
+export function ftArgIsParam(c: Call, i: i32): boolean {
+  if i < 0 || i >= c.callArgs.length { return false }
+  if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
+  let j = 0
+  while j <= i {
+    if nodeAt(parenPeelIx(c.callArgs[j])) is Spread { return false }
+    j = j + 1
+  }
+  true
 }
 
 // Whether hole call argument `a` is a lambda literal whose type is still open.
@@ -8793,17 +9018,18 @@ function holeCallOfArg(calleeFn: i32, a: i32, pj: i32): i32 {
 }
 
 // The index in `vNames` of the hole parameter of declared function `calleeFn` that call `n`
-// calls by name, or -1.
+// calls, matched by declaration so a shadowing binding is not it; -1 when none.
 function holeParamIndexOfCall(n: Call, vNames: string[], calleeFn: i32): i32 {
   if calleeFn < 0 || calleeFn >= P.nodes.length || n.callFn < 0 { return -1 }
   if n.callFn >= P.nodes.length { return -1 }
   const f = nodeAt(calleeFn)
-  const cf = nodeAt(n.callFn)
+  const cf = nodeAt(parenPeelIx(n.callFn))
   if !(f is FuncDecl) || !(cf is Ident) { return -1 }
+  const q = identDeclOf(parenPeelIx(n.callFn))
   let pi = 0
   while pi < f.fnParams.length {
     const p = nodeAt(f.fnParams[pi])
-    if p is Param && p.parName == cf.identName && p.parType < 0 {
+    if p is Param && f.fnParams[pi] == q && p.parType < 0 {
       let i = 0
       const hn = paramHoleName(f.fnName, calleeFn, pi)
       while i < vNames.length {

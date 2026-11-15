@@ -3,7 +3,6 @@
 // declines them, restoring a parameter an instance refused. The checker decides candidates and
 // writes the per-pass rows; `check_pins.vl`'s width phase drives `wsStep`. Every answer is a
 // rewrite of the node arena or a read of the scope chain; nothing here reports a diagnostic.
-import { declTyOf } from "./check_nar_store"
 import {
   Call,
   FuncDecl,
@@ -14,7 +13,6 @@ import {
   TypeRef,
   annTsOf,
   arenaSetNode,
-  i32ToStr,
   mkTypeRef,
   nodeAt,
   setAnnTs,
@@ -28,17 +26,19 @@ import {
   tsToName,
 } from "./ast"
 import { identDepthOf } from "./check_scopes"
-import { T, TyFunc, tyAt, tyIsPrimIx } from "./check_types"
 import { fnDeclIx } from "./check_write_scan"
 import { i32ListHas } from "./listutil"
+import { rowParamName } from "./check_row_param"
 
-// D3992 — a record of a wider shape passed to a function's parameter of a declared record type
-// is legal (no field changes type, so the shared value keeps every invariant), and is lowered by
-// making that parameter generic: the function is re-checked as `f<__W0>(p: __W0)` and each
-// instance takes its argument's own layout. Every call is still held to the declared type.
+// D3992 — a wider record to a declared record parameter is legal (no field changes type) and is
+// lowered by re-checking the function with the parameter at its row slot (`check_row_param.vl`):
+// each instance takes its argument's layout, and every call, a receiver included, is still held
+// to the declared type.
 export let wsDecl: i32[] = []
 let wsParam: i32[] = []
 export let wsOrigAnn: i32[] = []
+// The type parameter each rewrite row added, the row slot `rowParamName` spells.
+let wsTpName: string[] = []
 // Declarations declined a rewrite, whose calls keep the width refusal.
 export let wsNoDecl: i32[] = []
 export let wsPendDecl: i32[] = []
@@ -73,6 +73,7 @@ export function wsReset() {
   wsDecl = []
   wsParam = []
   wsOrigAnn = []
+  wsTpName = []
   wsNoDecl = []
   wsPassReset()
 }
@@ -152,7 +153,7 @@ function wsUndoInstErr(): i32 {
           }
           arenaSetNode(pi, nn)
         }
-        const nm = "__W" + i32ToStr(wsParam[k])
+        const nm = wsTpName[k]
         const tps: string[] = []
         const cur = nodeAt(d)
         if cur is FuncDecl {
@@ -181,18 +182,21 @@ function wsUndoInstErr(): i32 {
     const kd: i32[] = []
     const kp: i32[] = []
     const ka: i32[] = []
+    const kn: string[] = []
     let r = 0
     while r < wsDecl.length {
       if wsDecl[r] >= 0 {
         kd.push(wsDecl[r])
         kp.push(wsParam[r])
         ka.push(wsOrigAnn[r])
+        kn.push(wsTpName[r])
       }
       r = r + 1
     }
     wsDecl = kd
     wsParam = kp
     wsOrigAnn = ka
+    wsTpName = kn
   }
   done
 }
@@ -269,10 +273,11 @@ function wsApplyPending(): i32 {
         const pi = fd.fnParams[i]
         const pn = nodeAt(pi)
         if pn is Param {
-          const nm = "__W" + i32ToStr(i)
           const tps: string[] = []
           for t in fd.fnTyParams { tps.push(t) }
+          const nm = rowParamName(d, tps.length, wsPendName[k])
           tps.push(nm)
+          wsTpName.push(nm)
           wsDecl.push(d)
           wsParam.push(i)
           wsOrigAnn.push(pn.parType)
@@ -340,20 +345,13 @@ export function wsCalleeDecl(n: Call): i32 {
   -1
 }
 
-// Whether the un-annotated return of top-level function `name` is inferred as a primitive. Any
-// other return may carry the parameter's record out, which the rewrite would retype.
-export function wsInferredRetPrim(name: string): boolean {
-  if name == "" { return false }
-  const h = declTyOf(fnDeclIx[name] ?? -1)
-  if h < 0 || h >= T.tys.length { return false }
-  const ht = tyAt(h)
-  if ht is TyFunc { return tyIsPrimIx(ht.fnRet) }
-  false
-}
-
 // Record parameter `i` of the declaration call `n` names, written `name`, for a rewrite.
 export function wsNotePending(n: Call, i: i32, name: string) {
-  const d = wsCalleeDecl(n)
+  wsNotePendingAt(wsCalleeDecl(n), i, name)
+}
+
+// `wsNotePending` for parameter `i` of the declaration `d`.
+export function wsNotePendingAt(d: i32, i: i32, name: string) {
   let k = 0
   while k < wsPendDecl.length {
     if wsPendDecl[k] == d && wsPendParam[k] == i { return 0 }
