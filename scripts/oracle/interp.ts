@@ -34,6 +34,16 @@ export class Lit {
 }
 export class Rec { constructor(public f: Map<string, Val>) {} }
 
+// The f32 nearest the integer `n`, ties to even, rounded once (a double first would round twice).
+function bigToF32(n: bigint): number {
+  const m = n < 0n ? -n : n;
+  if (m < 1n << 53n) return Math.fround(Number(n));
+  const sh = BigInt(m.toString(2).length - 24), q = m >> sh, r = m - (q << sh), half = 1n << (sh - 1n);
+  const up = r > half || (r === half && (q & 1n) === 1n);
+  const v = Math.fround(Number((up ? q + 1n : q) << sh));
+  return n < 0n ? -v : v;
+}
+
 // The 64-bit reading of an integer constant: its `w64` when the tree depends on its width.
 function v64(l: Lit): bigint {
   if (l.trap64) throw new Trap("integer divide by zero");
@@ -257,6 +267,11 @@ function isConstTree(e: Expr): boolean {
   return e.k === "bin" && ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"].includes(e.op) && isConstTree(e.l) && isConstTree(e.r);
 }
 
+function negatedRadix(e: Expr): boolean {
+  if (e.k === "un" && e.op === "-") return negatedRadix(e.e);
+  return e.k === "int" && !!e.radix;
+}
+
 // Whether a constant tree holds a radix literal, or a float literal.
 function treeHas(e: Expr, what: "radix" | "float"): boolean {
   if (e.k === "int") return what === "radix" && !!e.radix;
@@ -300,9 +315,10 @@ let f32Fold = false
 function radixWidth(op: string, a: Lit, b: Lit, expK: string | null): 32 | 64 {
   if (expK === "i64" || expK === "f64") return 64;
   if (expK === "f32") throw new Unsupported("spec gap: a radix constant tree at f32");
-  if (expK) return 32;
-  // Q8: with no use, a constant shift count of 32 to 63 makes the left operand i64.
+  // Q8: a constant shift count of 32 to 63 makes the untyped left operand i64, beside a peer
+  // too (an i32 destination refuses it at check, E6.2).
   if (["<<", ">>", ">>>"].includes(op) && b.i !== null && b.i >= 32n && b.i <= 63n) return 64;
+  if (expK) return 32;
   return a.radix === 64 || b.radix === 64 || a.wideDec || b.wideDec ? 64 : 32;
 }
 function radixAtWidth(op: string, a: Lit, b: Lit, expK: string | null): Lit {
@@ -310,6 +326,7 @@ function radixAtWidth(op: string, a: Lit, b: Lit, expK: string | null): Lit {
   const at = (w: 32 | 64, p: bigint, q: bigint): bigint => {
     const W = BigInt(w), x = BigInt.asIntN(w, p), y = BigInt.asIntN(w, q), n = y & (W - 1n);
     if ((op === "/" || op === "%") && y === 0n) throw new Trap("integer divide by zero");
+    if (op === "/" && y === -1n && x === -(1n << (W - 1n))) throw new Trap("integer overflow");
     const r = op === "/" ? x / y : op === "%" ? x % y : op === "&" ? x & y : op === "|" ? x | y : op === "^" ? x ^ y
       : op === "<<" ? x << n : op === ">>" ? x >> n : BigInt.asUintN(w, x) >> n;
     return BigInt.asIntN(w, r);
@@ -1104,6 +1121,15 @@ export class Interp {
         const other = c ? e.f : e.t;
         const ok = other && other.length ? other[other.length - 1] : null;
         const kOther = ok && ok.k === "expr" ? this.staticKind(ok.e, env) : null;
+        // 4.3 with Q9: a float constant arm that adopts an `f32` arm folds in f32 arithmetic, as
+        // at run time; a constant tree is pure, so the taken arm is evaluated again.
+        const taken = c ? e.t : e.f, tk = taken && taken.length ? taken[taken.length - 1] : null;
+        if (v instanceof Lit && v.f !== null && kOther === "f32" && !f32Fold && tk && tk.k === "expr" && isConstTree(tk.e)) {
+          f32Fold = true;
+          let r: Val;
+          try { r = this.eval(tk.e, env, null); } finally { f32Fold = false; }
+          return r instanceof Lit ? litTo(r, "f32") : r;
+        }
         // A generic's erased parameter (`any`) is no context: the join settles here. With a
         // context, a constant arm beside a typed one still takes that type when it fits.
         if (exp && !(exp.k === "name" && exp.name === "any")) {
@@ -1292,7 +1318,9 @@ export class Interp {
       if (exp) { try { const x = this.resolve(exp, env); if (x.k === "name" && (x.name === "i32" || x.name === "i64")) k = x.name; } catch { /* none */ } }
       const lv = this.eval(e.l, env, k ? exp : null);
       const rv = this.eval(e.r, env, null);
-      const left = lv instanceof Lit ? (k ? litTo(lv, k) : litDefault(lv)) : lv;
+      // A radix pattern Q8 made 64 bits wide stays i64 under an i32 context.
+      const q8Wide = lv instanceof Lit && !!lv.radix && (lv.radix === 64 || lv.wideDec);
+      const left = lv instanceof Lit ? (k && !(k === "i32" && q8Wide) ? litTo(lv, k) : litDefault(lv)) : lv;
       // The count is masked to the left's width (E6.2), so it converts to that width's integer.
       const count = typeof left === "bigint" && typeof rv === "number" ? BigInt(rv)
         : typeof left === "number" && typeof rv === "bigint" ? Number(BigInt.asIntN(32, rv)) : rv;
@@ -1660,8 +1688,16 @@ export class Interp {
     // a radix tree as wide as i64 (a pattern over 32 bits, or a decimal leaf outside i32) is read
     // at i64 before an integer cast checks its range
     if (v instanceof Lit && v.radix && (v.radix === 64 || v.wideDec) && k !== "f64" && k !== "f32" && e.mode !== "as%") v = litTo(v, "i64");
+    // 4.1 / D1890: `as f32` / `as f64` rounds an integer constant to the nearest float, once.
+    if (v instanceof Lit && v.i !== null && !v.radix && (k === "f32" || k === "f64")) return k === "f64" ? new Flt(Number(v.i), 64) : new Flt(bigToF32(v.i), 32);
     if (v instanceof Lit && e.mode !== "as%") {
       try { return litTo(v, k === "u8" || k === "u16" ? "i32" : k); } catch (x) { if (!(x instanceof LitFault)) throw x; return this.castFail(e, "not exact"); }
+    }
+    // D3053 ruling (A): under `as% i64` a radix literal, or a chain of negations over one, is the
+    // constant its digits spell; another radix tree there has no ruling (D16494).
+    if (v instanceof Lit && v.radix && e.mode === "as%" && k === "i64") {
+      if (v.lone || negatedRadix(e.e)) return wrap64(v.i!);
+      if (v.radix !== 64 && !v.wideDec) throw new Unsupported("spec gap: a radix constant tree under `as% i64` (D16494)");
     }
     if (v instanceof Lit) v = litDefault(v);
     const src = numKind(v);

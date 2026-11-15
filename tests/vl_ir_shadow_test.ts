@@ -97,6 +97,10 @@ Deno.test({
     if (covered < 6 || verified !== covered) {
       throw new Error(`want at least 6 covered, all verified; got covered ${covered}, verified ${verified}`);
     }
+    const matched = armed.rows.get("matched") ?? 0;
+    if (matched !== covered) {
+      throw new Error(`want every covered function to match legacy's bytes, got ${matched} of ${covered}`);
+    }
     const plain = run(COVERED, false);
     if (plain.rows.size !== 0) throw new Error(`want no rows unarmed, got ${plain.rows.size}`);
     if (plain.out.length !== armed.out.length || plain.out.some((b, i) => b !== armed.out[i])) {
@@ -119,6 +123,25 @@ for (const [mode, rule] of [[1, 3], [2, 4]] as const) {
       }
       if (named.length !== fails.length) {
         throw new Error(`want only rule ${rule}, got: ${fails.map((k) => k.split("\n")[0]).join("; ")}`);
+      }
+    },
+  });
+}
+
+// The dual emit's controls: a byte added to the lowering, and a span row dropped from it, must
+// each turn every match into a mismatch of that class. Without these a comparison that compared
+// nothing would pass.
+for (const [mode, cls] of [[3, "mismatch bytes"], [4, "mismatch spans"]] as const) {
+  Deno.test({
+    name: `ir shadow: the dual emit's control ${mode} reports a ${cls.slice(9)} mismatch`,
+    ignore,
+    fn: () => {
+      const { rc, rows } = run(COVERED, true, mode);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      const got = [...rows].filter(([k]) => k.startsWith(cls)).reduce((n, [, c]) => n + c, 0);
+      const covered = rows.get("covered") ?? 0;
+      if ((rows.get("matched") ?? 0) !== 0 || got !== covered) {
+        throw new Error(`want all ${covered} covered as "${cls}", got ${JSON.stringify([...rows])}`);
       }
     },
   });
