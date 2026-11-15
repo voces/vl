@@ -669,6 +669,8 @@ function jwCopyIndex(ix: i32, tok: i32): i32 {
 // which the second check pass reports as a type error rather than dropping silently.
 function jwSubst(ix: i32, key: string, name: string) {
   if ix < 0 { return 0 }
+  // A closure that writes the place reads it unnarrowed, as the checker types it there.
+  if jwIsWriter(ix, key, jwKeyRoot(key)) { return 0 }
   if jwPlaceKey(ix) == key {
     const nd: Node = { identName: name, pos: -1 }
     arenaSetNode(ix, nd)
@@ -689,7 +691,7 @@ function jwSubst(ix: i32, key: string, name: string) {
 }
 
 // Substitutes the place in block `blk`'s statements up to the first that rebinds or writes it,
-// where the narrowing ends: a `place = e` or `let root = e` still reads `e` under it, an `if`
+// or calls what may, where the narrowing ends: a `place = e` or `let root = e` still reads `e` under it, an `if`
 // substitutes its test and each arm the same way, and a loop that writes it reads it unnarrowed.
 // The reads after keep the declared type. False when a write sits where no order is known.
 function jwSubstScoped(
@@ -738,25 +740,44 @@ function jwSubstAtWrite(
   } else if sn is WhileStmt || sn is ForIn || sn is ForRange {
     return true
   }
-  if rhs < 0 || jwArmDisturbs(rhs, key, root) { return false }
+  // A call the checker ended the narrowing at: the reads that end before it are the copy's.
+  if rhs < 0 {
+    const cut = jwFirstRetire(st, key, root)
+    if cut < 0 || jwArmWalk(st, key, root, JW_WRITES_OUTSIDE_FNS) {
+      return false
+    }
+    return jwSubstBefore(st, key, name, nodeToks[cut])
+  }
+  if jwArmDisturbs(rhs, key, root) { return false }
   jwSubst(rhs, key, name)
   true
 }
 
-// Does the arm rebind or write the place? Either would make a blanket substitution
-// wrong (the checker retires a narrowing for exactly these), so the rewrite refuses
-// loudly instead of guessing.
+// The checker's retirements (`crRows.retCalls`, `crRows.retNames`), handed to `jwExpand`: the
+// calls that ended a narrowing of a place, by the place's text.
+let jwRetCalls: i32[] = []
+let jwRetNames: string[] = []
+
+// What `jwArmWalk` asks of a subtree. Each asks whether the place is rebound or written; they differ
+// in what a closure and a call answer.
+const JW_DISTURBS = 0
+const JW_WRITES_DEEP = 1
+const JW_WRITES_OUTSIDE_FNS = 2
+
+// Does the arm rebind or write the place, or call what the checker ended its narrowing at?
+// Either ends the narrowing, so a blanket substitution past it would be wrong.
 function jwArmDisturbs(ix: i32, key: string, root: string): boolean {
+  jwArmWalk(ix, key, root, JW_DISTURBS)
+}
+
+// `ask` over the subtree at `ix`. A closure's own writes run at its call, so for `JW_DISTURBS`
+// its definition counts only by naming a parameter after the root, and the checker's retiring
+// call counts instead; `JW_WRITES_DEEP` walks into closures, `JW_WRITES_OUTSIDE_FNS` skips them.
+function jwArmWalk(ix: i32, key: string, root: string, ask: i32): boolean {
   if ix < 0 { return false }
   const n = nodeAt(ix)
-  if n is LetDecl {
-    if n.letName == root { return true }
-  } else if n is ForIn {
-    if n.fiVar == root { return true }
-    if n.fiVar2 == root { return true }
-  } else if n is ForRange {
-    if n.frVar == root { return true }
-  } else if n is FuncDecl {
+  if n is FuncDecl {
+    if ask == JW_WRITES_OUTSIDE_FNS { return false }
     let p = 0
     while p < n.fnParams.length {
       const pn = nodeAt(n.fnParams[p])
@@ -765,6 +786,16 @@ function jwArmDisturbs(ix: i32, key: string, root: string): boolean {
       }
       p = p + 1
     }
+    if ask == JW_DISTURBS { return false }
+  } else if n is Call {
+    if ask == JW_DISTURBS && jwCallRetires(ix, key, root) { return true }
+  } else if n is LetDecl {
+    if n.letName == root { return true }
+  } else if n is ForIn {
+    if n.fiVar == root { return true }
+    if n.fiVar2 == root { return true }
+  } else if n is ForRange {
+    if n.frVar == root { return true }
   } else if n is BinExpr {
     if n.binOp == "=" {
       const lk = jwPlaceKey(n.binLeft)
@@ -778,8 +809,77 @@ function jwArmDisturbs(ix: i32, key: string, root: string): boolean {
     const ks = nodeValueSpineChildren(cur)
     let i = 0
     while i < ks.length {
-      if jwArmDisturbs(ks[i], key, root) { return true }
+      if jwArmWalk(ks[i], key, root, ask) { return true }
       i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Whether `ix` is a closure that writes the place, whose body the checker types unnarrowed.
+function jwIsWriter(ix: i32, key: string, root: string): boolean {
+  ix >= 0 && nodeAt(ix) is FuncDecl && jwArmWalk(ix, key, root, JW_WRITES_DEEP)
+}
+
+// Whether the checker ended the narrowing of the place at call `ix`.
+function jwCallRetires(ix: i32, key: string, root: string): boolean {
+  let i = 0
+  while i < jwRetCalls.length {
+    if jwRetCalls[i] == ix && (jwRetNames[i] == key || jwRetNames[i] == root) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The first call in `ix`, outside closures, the checker ended the place's narrowing at, or -1.
+function jwFirstRetire(ix: i32, key: string, root: string): i32 {
+  if ix < 0 || nodeAt(ix) is FuncDecl { return -1 }
+  if nodeAt(ix) is Call && jwCallRetires(ix, key, root) { return ix }
+  let best = -1
+  let cur = ix
+  while cur >= 0 {
+    for c in nodeValueSpineChildren(cur) {
+      const f = jwFirstRetire(c, key, root)
+      if f >= 0 && (best < 0 || nodeToks[f] < nodeToks[best]) { best = f }
+    }
+    cur = elseIfLink(cur)
+  }
+  best
+}
+
+// `jwSubst` of the reads that end before token `cut`, which run before the call ending there.
+// False when a closure other than a writer reads the place: it may run on either side.
+function jwSubstBefore(ix: i32, key: string, name: string, cut: i32): boolean {
+  if ix < 0 { return true }
+  const root = jwKeyRoot(key)
+  if jwIsWriter(ix, key, root) { return true }
+  if nodeAt(ix) is FuncDecl { return !jwMentions(ix, key, root) }
+  if jwPlaceKey(ix) == key {
+    if nodeToks[ix] < cut { arenaSetNode(ix, { identName: name, pos: -1 }) }
+    return true
+  }
+  let cur = ix
+  while cur >= 0 {
+    for c in nodeValueSpineChildren(cur) {
+      if !jwSubstBefore(c, key, name, cut) { return false }
+    }
+    cur = elseIfLink(cur)
+  }
+  true
+}
+
+// Whether the subtree at `ix` names the place or its root.
+function jwMentions(ix: i32, key: string, root: string): boolean {
+  if ix < 0 { return false }
+  const pk = jwPlaceKey(ix)
+  if pk == key || pk == root { return true }
+  let cur = ix
+  while cur >= 0 {
+    for c in nodeValueSpineChildren(cur) {
+      if jwMentions(c, key, root) { return true }
     }
     cur = elseIfLink(cur)
   }
@@ -961,7 +1061,9 @@ function jwSplice(root: i32, frag: i32): boolean {
 // Generates the walkers for the recorded targets, parses them onto the token stream, splices
 // them into program `root` and rewrites every site; the first generated token, or -1 when there
 // is nothing to generate or a diagnostic stopped it. Every node the author wrote keeps its index.
-export function jwExpand(root: i32): i32 {
+export function jwExpand(root: i32, retCalls: i32[], retNames: string[]): i32 {
+  jwRetCalls = retCalls
+  jwRetNames = retNames
   // The stream grows before the arena does, so a replay must not read the banked tree off it.
   arenaEpochBump()
   const gen = jwGenerateSource()
