@@ -5,4 +5,5 @@
   whose bounds are today's deferred demands (the 11 constraint tables and 15 derived-hole kinds),
   inferred once in callee-first order and checked at each call by one solver, with exports frozen
   at the module boundary. It maps the 34 bucket-(c) rows to the element that closes each, measures
-  what retires, gives an eight-step migration and lists five owner questions.
+  what retires, gives an eight-step migration, and records the five language-visible choices as
+  settled from existing rulings.

@@ -63,7 +63,8 @@ It builds on four other lanes' designs:
   - S5 deletes the judges.
   - S6 freezes exports.
   - S7 retires the probes.
-- **Owner questions (§9):** five language-visible choices.
+- **Language-visible choices (§9):** five, each settled from an existing ruling or the review's text.
+  One, monomorphic recursion within an SCC, stays conditional on S0's measurement.
 
 ## 1. What a hole is today
 
@@ -176,7 +177,7 @@ a call.
   meets the parameter's `BK_ARROW` bounds, one per call shape. That is today's tag decision with its
   inputs named. D16209's relay sets are `BK_ARROW` bounds whose result is a variable another bound
   reads.
-- **No annotation is required anywhere.** `vl` prints a scheme (§9 Q5). It never asks for one.
+- **No annotation is required anywhere.** `vl` prints a scheme (§9, choice 5). It never asks for one.
 
 ## 3. Inference: checking a body once
 
@@ -208,7 +209,7 @@ The last rule is what instance-local generalization means. D16423's inner `[]` i
 
 `let t = 0; t = t + x` makes `t` a variable bounded below by the literal `0` and by the type of
 `t + x`. The scheme leaves it open. At a call over `f64` it solves to `f64`; with no other bound it
-defaults to `i32`, as the literal does today. That changes what programs mean (§9 Q2).
+defaults to `i32`, as the literal does today. That is settled choice 2 (§9).
 
 ## 4. Checking a call
 
@@ -237,7 +238,7 @@ a `BK_LOWER` from the first push precedes the reads that depend on it.
 
 A bound that fails reports at the call, naming the parameter and the bound, against the printed
 signature. For example: "`sum` needs `xs` to be a list of numbers; got `string[]`". This replaces "the
-body of `f` at the call's argument types" (review §3.1, §9 Q1). The solved instantiation is a vector
+body of `f` at the call's argument types" (review §3.1, §9, choice 1). The solved instantiation is a vector
 of `TyId`s, which is H stage 5's instance key and lane Q's `InstReq` type part (§10).
 
 ## 5. Exports
@@ -285,7 +286,7 @@ These are the 34 rows whose status names bucket (c), plus D16342. The commands a
 
   They need §3.1's order and §3.2's local solving, not a scheme.
 - **Annotating does not fix it:** D4719, D3286 and D16342. Their mechanism is a body check that L2
-  makes generic. They must be re-ablated at S3 before being claimed.
+  makes generic. They are re-ablated before S0's go/no-go, and are claimed only on that ablation.
 - **D16411** has no hole. Its ingredient is an unbound `A` at the call. It needs §4.1's instantiation
   of a generic function value, which today's mono does not do.
 - **D15161** has no ablation table, so it must be ablated before S3 grades it.
@@ -341,51 +342,88 @@ A step marked **identical** must also reproduce its predecessor's seed byte for 
 | **S1** | SCC order: check un-annotated bodies callee-first, retire `eagerCheckable`'s un-annotated-parameter exemption | graded: the ORDER rows | +200 to +400, −100 |
 | **S2** | The scheme is the record: the table writers append `Bound`s to the owning `Iface`, and the validators read them back in today's order | identical | +500, −1,500 |
 | **S3** | One solver at the call: `callFtyPinCstrs`'s replay becomes §4.1's loop, and a failure reports at the call | graded: container, row, arrow and narrowing rows; diagnostics move | +1,200, −4,000 to −6,000 |
-| **S4** | Instance-local generalization (§3.2) and literal bounds (§3.3, after Q2) | graded: the instance rows | +400, −300 |
+| **S4** | Instance-local generalization (§3.2) and literal bounds (§3.3, settled choice 2) | graded: the instance rows | +400, −300 |
 | **S5** | Delete the `hole*` judges the solver subsumes, one prefix family per PR (`holeSlot`, `holeBind`, `holeLet`, `holeFn`, `holeSet`, …) | identical per PR where possible, else graded | −5,000 to −8,000 |
 | **S6** | Freeze exports: an importer instantiates the exporter's `Iface`, and S5's interface hash includes it | graded: the module-boundary population (`incremental-compilation-design.md` §S5's differential test) | +300, −500 |
 | **S7** | Retire `paramSolveProbe`, `cstrProbe`, `RB_SOLVE` and `RB_CSTR_PROBE` | identical | −600 to −1,000 |
 
-Order: S0 first, because it is the measurement. S1 and S2 are independent of each other. S3 needs S2
-and lane M3's stage C (§10). S4 needs S3 and the owner's Q2. S5 needs S3. S6 needs S3. S7 needs S5.
+Order: S0 first, because it is the measurement. S1 and S2 are independent of each other. S3 needs S2,
+M3's stage C (§10), and the storage decision with lane S (§10). S4 needs S3. S5 needs S3. S6 needs S3. S7 needs S5.
 
 **S0 is the go/no-go.** If the shadow schemes cannot express a measurable share of the corpus's
 un-annotated functions (5,397 of the corpus's 28,208 named functions have one, §A.7), the bound
-alphabet is incomplete. S0 names the missing kind before any table moves.
+alphabet is incomplete. S0 names the missing kind before any table moves. Before the go/no-go,
+D4719, D3286 and D16342 are re-ablated (§6.2). S0 also counts the corpus programs that run today and
+recurse polymorphically through an un-annotated function: choice 3's condition (§9).
 
-## 9. Owner questions: language-visible choices
+## 9. Language-visible choices, settled
 
-1. **Where a failure is reported.** Today a caller gets "the body of `f` at the call's argument types",
-   with a body position. Under L2 it gets the bound, at the call. Recommended: the call site, with the
-   bound's body site as a note.
-2. **Literal defaulting in an un-annotated body.** `function sum(xs) { let t = 0 … t = t + x … }` over
-   `[1.5, 2.5]` is refused today (review §3.1). Under §3.3 it returns `f64` at that call and `i32` at
-   an `i32` call, so the same body has a different result type per instance. Recommended: yes. It is
-   what `<T>` would give, and the review asks for it. It interacts with rulings 4.1 and 4.3 on literal
-   adoption, which lane N owns.
-3. **Recursion in a component is monomorphic.** A recursive un-annotated function called at two types
-   inside its own body is refused under HM's rule, unless an annotation makes it polymorphic. Today
-   the re-check can sometimes run it. S0 measures how many corpus programs depend on this before the
-   rule is fixed.
-4. **A hole function parameter called at two shapes** (`g(1, 2) + g("ab", "c").length`, D16209). Its
-   scheme has two `BK_ARROW` bounds: a function argument must satisfy both, and a generic one does by
-   instantiating twice. Recommended: keep it, since today's sets already run it. The alternative, one
-   arrow per parameter, would refuse programs that run today.
-5. **The printed signature.** `vl` "can print the inferred signature" (L2). Bounds need a spelling,
-   such as `sum(xs: List<N>) → N where N: Num` or `{x: f64, ..r}`. Recommended: printable, not
-   writable in v1. A bound annotation syntax is a separate language decision.
+Each choice follows from an existing ruling or from the review's text (coordinator, 2026-11-15). Only
+the condition on choice 3 can reopen one as an owner question.
+
+1. **A failure is reported at the call**, with the bound's body site as a note. Review §6 L2 says
+   "check calls against it and report at the call site". Today a caller gets "the body of `f` at the
+   call's argument types".
+2. **`let t = 0` in an un-annotated body is per instance** (§3.3). At a call over `f64` it solves to
+   `f64`, and with no other bound it defaults to `i32`. This is D16293 (a) together with ruling 4.3.
+   #8250 already makes `sum([1.5, 2.5])` print `4`, and L2 states the rule as a bound.
+3. **Recursion inside a strongly connected component is monomorphic**, as in HM. This holds on one
+   condition: S0's measurement must show that no program that runs today depends on polymorphic
+   recursion through an un-annotated function. If one does, that program is the owner question, and
+   S1 does not land until it is answered.
+4. **One `BK_ARROW` bound per call shape of a hole function parameter.** For example,
+   `g(1, 2) + g("ab", "c").length` (D16209) gives two bounds, which a generic argument satisfies by
+   instantiating twice. This preserves what runs today; one arrow per parameter would lose runs, which
+   the gates veto.
+5. **The inferred signature is printable, not writable, in v1.** It uses a spelling such as
+   `sum(xs: List<N>) → N where N: Num` or `{x: f64, ..r}`. A bound annotation syntax is a separate
+   language decision.
 
 ## 10. Coordination
 
-- **M3** (relate → Coercion): asked whether `relate` can return a bound as data (a `Fit` step), not
-  a pin. That is its stage C, on lane H's stages 1 and 2, and S3 depends on it. Also asked to confirm
-  that coercions stay `coercionAt(ix, inst)` per instance, so that L2 adds no checker-side coercion
-  table. *Reply pending.*
-- **IR lane** (L1): asked whether `InstReq`'s type part takes the solved instantiation (a `TyId`
-  vector), and whether phase A reads an importer-side pin of an exported body. *Reply pending.*
-- **H**: type variables are `TyId`s, and S2 depends on H's binder identity (stage 1).
-- **S**: function sets meet `BK_ARROW` bounds (§2.3), and lane J's D16278 rooting work in
-  `fnTagDecide` is unaffected until S3.
+Replies received 2026-11-15:
+
+- **M3** (relate → Coercion):
+  - **Bounds as data are compatible**, within a boundary. Relate's stage C returns only the hole
+    writes a fit question would make. There are exactly two writers: the solver behind
+    `tyPinElem`/`Key`/`Val` and `holeLink` behind `tyLinkElem`/`Key`/`Val` (lane H confirmed nothing
+    else writes `holeSol`). Stage C logs them in ask mode as Fit steps `ST_PIN{hole, ty}` and
+    `ST_LINK{hole, hole}`.
+  - The demand kinds (`BK_ROW`, `BK_LOWER`, …) do not come out of `relate`. They are written by the
+    checker walk, so they are L2's solver input, from today's rows at S2. A `Bound` variant fits the
+    record, and `relate` contributes only pin and link bounds to it.
+  - **Stage C is no longer gated on lane H**, since H's stages 1 and 2 have landed. It is being
+    measured now: a per-bracket corpus bisection of the six remaining fit-question brackets. The first
+    finding is that at least one of them, the `rtStamp` re-ask, is also a re-entry guard. S3 waits for
+    that result.
+  - **Coercions stay per instance:** the IR builder asks `coercionAt(ix, inst)`, a pure query, and L2
+    adds no checker-side coercion table. The four position seats (box, unbox, atomstr, numeric) are
+    applied by the builder.
+  - **Caveat for L2 and L1:** the per-instance records come today from mono's re-check of each
+    instance body (`RB_MONO`). "Checked once, generically" moves where those records come from. S3
+    must keep producing them per instance, either from the solver's instantiation or from a retained
+    instance re-check, until L1 builds from the template (phase B).
+- **IR lane** (L1):
+  - **The instance key is the scheme's solved instantiation**, with one caveat. The key is
+    (template `SymId`, argument `TyId[]`), plus the importer `ModId` for an exported `const` copy
+    only. That is H's stage-5 id-vector key, as long as H's pins are exactly the scheme variables'
+    solutions.
+  - Under L2, `InstReq`'s call-site facts leave the key. `delivery` and `argLit` become coercions on
+    the call edge. `retTy` and `retWidenTy` become part of the scheme, or a coercion at the result.
+    `frame` and `call` stay as provenance. So no new field is needed.
+  - **Open: storage versus type identity.** Two calls with the same `TyId` vector can need different
+    storage for a function-typed parameter: lane S's `RClosure`, `RSetId` or `RDirect`. Either the key
+    includes S's per-parameter storage decision, or the scheme makes storage a function of the type
+    alone. That is for L2 and S to decide before S3, because `BK_ARROW`'s solution must say which. The
+    discriminators H plans to fold into nominal `TyId`s (`monoAnonPinDiscrim`, the set and
+    literal-union discriminators) are part of the same question.
+  - **Order hazard: IR I9 after S6.** Phase A lowers mono's instance set as it is, including instances
+    of an exported un-annotated function pinned from an importer's call. S6 changes that set, so the
+    function section moves, and the cause is L2. If I9 (phase B, per-module `Lowered`) lands before S6,
+    its key for an un-annotated export must carry the importer's `ModId` until S6.
+- **H**: type variables are `TyId`s, and binder identity (stage 1) has landed.
+- **S**: function sets meet `BK_ARROW` bounds (§2.3), and the storage question above is open with S.
+  Lane J's D16278 rooting work in `fnTagDecide` is unaffected until S3.
 
 ## A. Commands
 
