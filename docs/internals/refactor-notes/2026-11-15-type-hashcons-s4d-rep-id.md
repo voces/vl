@@ -16,9 +16,16 @@ rebuilds from either bit). So an id read before then is provisional. `rtSync`'s 
 tree it describes. The flag is read only at the start of a walk, because `repTyIsVariant` can
 itself reach `rtSync` in the middle of one.
 
+**Strict before final.** At lane E's request, `tyRepId` refuses through `emitFail` until
+`canonRepFinal(repTyIsVariant)` runs, right after `repVariantShapesPrime` in `elabPrepareRun`.
+`repReset`, the per-program reset, calls `canonRepUnready`. `tyRepIdProvisional` is the early
+answer, with every record read as no arm, and the shadow uses it until the ids are final. "Final"
+means the arm facts are fixed. It does not mean rows stop moving: mono's instance re-checks still
+bump `tyMutEpoch`, and the stale flag re-derives the ids after each rebuild.
+
 **No import cycle.** `emit_rep.vl` imports this module, so the arm test arrives through a function
-slot, `canonArmFn`, which `emitProgram` binds to `repTyIsVariant`, as `fnRecordedRetTyFn` is bound.
-Unbound, no record is an arm.
+slot, `canonArmFn`, which `canonRepFinal` binds to `repTyIsVariant`. Unbound, no record is an
+arm.
 
 ## Shadow
 
