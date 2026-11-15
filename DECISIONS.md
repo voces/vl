@@ -10633,7 +10633,8 @@ the tag gives the structural answer: a `string[]` arm tested `is S[]` also tests
 and the then-branch keeps the union, as D4056 keeps a record union's (D4779). A list of
 string-literal atoms beside an `i32[]` arm holds its own tag (D4906), at every list depth
 (D4914), and two atom-list arms sharing a tag test their atoms (D4938). An arm in a disjoint
-rep fits when it is empty (D4915).
+rep fitted when empty (D4915) until the D16047 refinement (2026-11-15): an arm whose element
+type is fixed is tested by its tag alone.
 
 **An `is` that fits that way stores a new empty list back into the place (D4949).** The
 local, global, record field, list element or captured variable it tested now holds an empty
@@ -11878,6 +11879,26 @@ wrong, and pinning by writes is how element types are inferred everywhere else. 
 through such a narrowing was not taken: it rejects a program the design can run. Settling the hole
 to the first tested `T` was not taken: two tests would disagree about one empty list. Joining two
 writes into `(i32 | string)[]` is not part of this ruling; it would change direct writes too.
+
+**Refined by the owner 2026-11-15.** The vacuous answer is for a genuinely open collection only:
+no annotation and no write fixes its element type, as in the examples above.
+
+* **An annotation fixes an empty collection's element type, as a write does.** An empty `i32[]`
+  delivered into `i32[] | f64[]` is tested by its arm: `is f64[]` is false and `is i32[]` true.
+  The same holds for a map (`{[i32]: boolean}` is not `{[i32]: i32}`) and a set.
+* **An empty literal delivered straight into a union takes the first arm it fits**, as D16276
+  does for `Map()`: `const p: i32[] | f64[] = []` holds an `i32[]`.
+
+```vl
+const m: i32[] = []
+const n: i32[] | f64[] = m
+print(n is f64[])   // false
+print(n is i32[])   // true
+```
+
+The type-test predicate answers a list partly only where its element may fit, and the list test
+over a union drops an arm whose element type is fixed apart from the test's, so this replaces the
+"fits when empty" answer of D4915 and the store-back of D4949 for such arms.
 
 ## An `is` that can never match is a warning, and its branch reads the operand as `never` (2026-11-14) — D16047
 
