@@ -66,6 +66,30 @@ run_leg() {
   fi
 }
 
+# The oracle leg's new DISAGREE/UNSOUND cells (not in scripts/oracle/known.txt): each case copied
+# to <dir>/keep_new/ (the artifact uploads it) with the commands that regenerate and re-judge it.
+oracle_new_cells() {
+  local dir="$1" cell verdict gen seed path
+  mkdir -p "$dir/keep_new"
+  echo; echo "oracle: new cells (case files in the artifact's oracle/keep_new/):"
+  grep -E '"verdict":"(DISAGREE|UNSOUND)"' "$dir/verdicts.jsonl" 2>/dev/null \
+    | sed -E 's/.*"cell":"([^"]*)".*"verdict":"([A-Z]+)".*/\1 \2/' | while read -r cell verdict; do
+      grep -qxF "$cell" <(sed 's/#.*//; s/[[:space:]]*$//' scripts/oracle/known.txt) && continue
+      cp "$dir/cases/$cell.vl" "$dir/keep_new/" 2>/dev/null
+      seed="$(sed -E 's/^[a-z]+_s([0-9]+)_.*/\1/' <<< "$cell")"
+      path="/tmp/oc/$cell.vl"
+      case "$cell" in
+        ar_*) gen="deno run -A scripts/oracle/gen.ts /tmp/oc --seed $seed --count $COUNT" ;;
+        da_*) gen="deno run -A scripts/oracle/gen_data.ts /tmp/oc --seed $seed --count $COUNT" ;;
+        ho_*) gen="deno run -A scripts/oracle/gen_hof.ts /tmp/oc --seed $seed --count $COUNT" ;;
+        *) gen="scripts/oracle/fuzz.sh --seeds $seed --count $COUNT --gen rep --keep /tmp/oc"; path="/tmp/oc/cases/$cell.vl" ;;
+      esac
+      echo "✗ $verdict $cell"
+      echo "    regenerate: mkdir -p /tmp/oc && $gen"
+      echo "    compare:    scripts/vl-host/target/release/vl run $path; deno run -A scripts/oracle/oracle.ts run $path"
+    done
+}
+
 # A report leg passes --experimental unless --gate-all asks every leg to gate.
 REPORT="--experimental"
 [ "$GATE_ALL" -eq 0 ] || REPORT=""
@@ -80,6 +104,12 @@ for leg in $LEGS; do
       mkdir -p "$OUT/oracle"
       if ! ./scripts/oracle/fuzz.sh --seeds "$SEEDS" --count "$COUNT" --gen all --keep "$OUT/oracle" | tee "$OUT/oracle/summary.md"; then
         fail=1
+        oracle_new_cells "$OUT/oracle" | tee -a "$OUT/oracle/summary.md"
+      fi
+      if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        { echo "### oracle leg"; echo; echo '```'
+          grep -E '^(oracle:|✗|    (regenerate|compare):)' "$OUT/oracle/summary.md"; echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
       fi ;;
     *) echo "unknown leg: $leg"; exit 2 ;;
   esac
