@@ -111,14 +111,8 @@ Deno.test({ name: "exact-const hover: a float constant", ignore }, async () => {
   const FLOAT = "float constant; typed at each use";
   await want(4, 6, "const F = 0.1", FLOAT, "F decl");
   await want(16, 6, "F = 0.1", FLOAT, "F use");
-  // 1/3 has no terminating decimal, so it shows at f64 precision and says so.
-  await want(
-    5,
-    6,
-    "const T = 0.3333333333333333",
-    "float constant (shown at f64 precision); typed at each use",
-    "T decl",
-  );
+  // A float constant folds in IEEE (E9.1): 1 / 3 is the double it shows, exactly.
+  await want(5, 6, "const T = 0.3333333333333333", FLOAT, "T decl");
 });
 
 // The type shown at a use is the one the read COMPILES at, or none. Each destination below
@@ -199,10 +193,12 @@ Deno.test({ name: "exact-const hover: beside an operand it does not fit, no type
 Deno.test({ name: "exact-const hover: a float at a typed use shows the value it computes with", ignore }, async () => {
   const FLOAT = "float constant; typed at each use";
   await want(8, 15, "F: f32 = 0.10000000149011612", "float constant (its f32 value here); typed at each use", "F at f32", OPEN);
-  await want(12, 15, "T: f64 = 0.3333333333333333", "float constant (its f64 value here); typed at each use", "T at f64", OPEN);
-  // A long exact decimal with a short exact spelling is shown by it, and is not rounded.
+  // E9.1: a float constant is the double it names, so at f64 it is not rounded.
+  await want(12, 15, "T: f64 = 0.3333333333333333", FLOAT, "T at f64", OPEN);
+  // A float constant is the double its tree folds to, shown by its shortest spelling.
   await want(9, 6, "const E = 1e30", FLOAT, "E decl", OPEN);
-  await want(10, 6, "const Z = 1e-400", FLOAT, "Z decl", OPEN);
+  // E9.1: 1e-400 is below the least double, so the constant is the double 0.0.
+  await want(10, 6, "const Z = 0.0", FLOAT, "Z decl", OPEN);
 });
 
 Deno.test({ name: "exact-const hover: other bindings keep their one type", ignore }, async () => {
