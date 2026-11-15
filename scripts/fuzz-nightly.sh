@@ -35,6 +35,9 @@
 #                   mixed declared/inline seam (PR #911's dup-heap shapes). A frontier the inline-only
 #                   pinned net never samples — pair with --experimental. Composes with --branching/
 #                   --multiobs.
+#   --filed FILE    unsound findings already filed: `D<id><TAB>CLASS<TAB>SHAPE` lines. A finding listed
+#                   under a row `ls.vl --status open` names is reported as filed and does not fail
+#                   the run; under a closed row it is a regression and does. Default: none.
 #   --experimental  report-only: classify + print non-baselined unsound findings but ALWAYS exit 0
 #                   (never fail the job). For a survey leg still surfacing many holes (e.g.
 #                   --branching), so the frontier is measured and artifacted without gating.
@@ -47,6 +50,7 @@ COUNT=200
 DEPTHS="4 5 6"
 BASELINE="scripts/rep-fuzz-baseline.txt"
 OUT_DIR=""
+FILED=""
 BRANCHING=""
 MULTIOBS=""
 DECLARED=""
@@ -65,6 +69,7 @@ while [ $# -gt 0 ]; do
     --depths) DEPTHS="$2"; shift 2 ;;
     --baseline) BASELINE="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
+    --filed) FILED="$2"; shift 2 ;;
     --branching) BRANCHING="--branching"; shift ;;
     --multiobs) MULTIOBS="--multiobs"; shift ;;
     --declared) DECLARED="--declared"; shift ;;
@@ -143,6 +148,25 @@ cat "$OUT_DIR"/seed_*.tsv 2>/dev/null | sort -u > "$OUT_DIR/cur.txt" || : > "$OU
 comm -23 "$OUT_DIR/cur.txt" "$OUT_DIR/base.txt" > "$OUT_DIR/new.txt" || : > "$OUT_DIR/new.txt"
 
 unsound_new="$(grep -vP '^REJECT\t' "$OUT_DIR/new.txt" || true)"
+
+# Split off the unsound findings an OPEN inventory row already names (--filed). A filed line
+# whose row has closed stays in unsound_new: the closed row's defect is back.
+unsound_filed=""
+if [ -n "$FILED" ] && [ -n "$unsound_new" ]; then
+  VL="${VL:-scripts/vl-host/target/release/vl}"
+  "$VL" run scripts/inventory/ls.vl -- --status open | awk '{print $1}' | sort -u > "$OUT_DIR/open_ids.txt" \
+    || { echo "fuzz-nightly: cannot list open inventory rows for --filed"; exit 2; }
+  grep -P '^D[0-9]+\t' "$FILED" | sort -u > "$OUT_DIR/filed.txt" || : > "$OUT_DIR/filed.txt"
+  printf '%s\n' "$unsound_new" > "$OUT_DIR/unsound_new.txt"
+  # Each unsound line -> "D<id>\tCLASS\tSHAPE" when an open row files it, else kept as new.
+  awk -F'\t' -v OFS='\t' 'FILENAME == ARGV[1] { open[$1] = 1; next }
+    FILENAME == ARGV[2] { if (open[$1]) filed[$2 FS $3] = $1; next }
+    $0 != "" { k = $1 FS $2; if (k in filed) print filed[k], $1, $2 > "/dev/stderr"; else print }' \
+    "$OUT_DIR/open_ids.txt" "$OUT_DIR/filed.txt" "$OUT_DIR/unsound_new.txt" \
+    > "$OUT_DIR/unsound_unfiled.txt" 2> "$OUT_DIR/unsound_filed.txt"
+  unsound_new="$(cat "$OUT_DIR/unsound_unfiled.txt")"
+  unsound_filed="$(cat "$OUT_DIR/unsound_filed.txt")"
+fi
 reject_new="$(grep -P '^REJECT\t' "$OUT_DIR/new.txt" || true)"
 
 # Family = the shape with its `p<pos><variant>` position/role prefix stripped, so the same
@@ -162,6 +186,14 @@ family_summary() {
     echo "**UNSOUND — $(printf '%s\n' "$unsound_new" | grep -c .) non-baselined finding(s) (INVALID-WASM/TRAP/MISMATCH). $verdict**"
   else
     echo "No non-baselined unsound (INVALID-WASM/TRAP/MISMATCH) findings."
+  fi
+  if [ -n "$unsound_filed" ]; then
+    echo
+    echo "$(printf '%s\n' "$unsound_filed" | grep -c .) unsound finding(s) an open row already files (report-only):"
+    echo
+    echo '```'
+    printf '%s\n' "$unsound_filed"
+    echo '```'
   fi
   if [ -n "$reject_new" ]; then
     n_reject=$(printf '%s\n' "$reject_new" | grep -c .)

@@ -1,3 +1,0 @@
-## Type system (Track A)
-
-- **D16322, D16320 closed:** a field read straight off `as! B` of a partly fitting record (`(r as! B).x`) runs, as does a second cast of the same operand after one; a record cast to a record it is contained in or may be by its fields' values (`a as? B` over `a: A`, `b as! A` over `b: B`) tests that record where it was refused as "`as` supports numeric conversions only"; and `b is A` over `B | D | C`, where `B` and `D` share a tag told apart by a field's value, answers by the tag. The pin's re-ask of a cast now asks the same type-test predicate as the cast (D16323 stays open).

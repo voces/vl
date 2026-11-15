@@ -9,6 +9,29 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-15-zero-sites-probes](2026-11-15-zero-sites-probes.md): Probes for five unprobed ZERO rows of `goal-scoreboard.vl --sites`, 2026-11-15
+- [2026-11-15-type-hashcons-s2b-hole-column](2026-11-15-type-hashcons-s2b-hole-column.md): Type hash-cons stage 2b: an open collection child is a hole, and a pin solves it (lane H), 2026-11-15
+- [2026-11-15-top-level-callee-first](2026-11-15-top-level-callee-first.md): Top-level statements checked callee-first: four arms, none shipped, 2026-11-15
+- [2026-11-15-rep-adt-stage2-gate](2026-11-15-rep-adt-stage2-gate.md): Rep ADT: stage 2's gate, the variant axis at zero during emit, 2026-11-15 (lane E)
+- [2026-11-15-rep-adt-declrows](2026-11-15-rep-adt-declrows.md): Rep ADT: declared rows no longer rebuild the rep tree, 2026-11-15 (lane E)
+- [2026-11-15-phase-state-arena-api](2026-11-15-phase-state-arena-api.md): The phase-state census does not count the type arena's accessors as checker surface, 2026-11-15 (lane Q)
+- [2026-11-15-oracle-radix-float](2026-11-15-oracle-radix-float.md): A radix literal in a float context is the value its digits spell (ruling 4.1, 2026-11-15)
+- [2026-11-15-oracle-o1-o8](2026-11-15-oracle-o1-o8.md): Oracle fixes O1–O8, from lane B's 50-seed triage (2026-11-15)
+- [2026-11-15-oracle-hof-generator](2026-11-15-oracle-hof-generator.md): The oracle's third generator: generics and higher-order code (2026-11-15)
+- [2026-11-15-oracle-fuzz-triage](2026-11-15-oracle-fuzz-triage.md): Triage of a 50-seed oracle fuzz: 51 new disagreements, three compiler rows, eight oracle bugs, 2026-11-15
+- [2026-11-15-oracle-data-generator](2026-11-15-oracle-data-generator.md): The oracle's second generator: data, not arithmetic (2026-11-15)
+- [2026-11-15-lane-l-record-field-fit](2026-11-15-lane-l-record-field-fit.md): A record `is` narrowing a non-literal field, D4082 — 2026-11-15
+- [2026-11-15-lane-l-mixed-literal-set](2026-11-15-lane-l-mixed-literal-set.md): A literal set over two kinds, D16326 — 2026-11-15
+- [2026-11-15-lane-l-cast-test-residue](2026-11-15-lane-l-cast-test-residue.md): The cast and test residue, D16322 and D16320 — 2026-11-15
+- [2026-11-15-l3-pr-a-row-slot](2026-11-15-l3-pr-a-row-slot.md): L3 PR A: the record-width rewrite gives a record parameter a bound row slot
+- [2026-11-15-k-d3530-literal-box-into-nullable-float](2026-11-15-k-d3530-literal-box-into-nullable-float.md): D3530: a two-width literal union into a nullable float, 2026-11-15
+- [2026-11-15-k-d2539-refused-call-is-an-error](2026-11-15-k-d2539-refused-call-is-an-error.md): D2539: a call refused for an unbound return type parameter is an error, 2026-11-15
+- [2026-11-15-g65-d16364](2026-11-15-g65-d16364.md): D16364: a copy of a later-declared module container shares its row, 2026-11-15
+- [2026-11-15-g63-d16366-67](2026-11-15-g63-d16366-67.md): D16366, D16367: a lone literal is its one-member set at a list field and a map key, 2026-11-15
+- [2026-11-15-d16394-record-eq-field-storage](2026-11-15-d16394-record-eq-field-storage.md): D16394: record `==` over fields stored apart, 2026-11-15
+- [2026-11-15-d16391-u8-null-mix](2026-11-15-d16391-u8-null-mix.md): D16391: a `u8[]` spread joined with `null` is refused as every other `u8` mix is, 2026-11-15
+- [2026-11-14-rep-adt-stage1b](2026-11-14-rep-adt-stage1b.md): Rep ADT stage 1b, and the stage plan after lane Q's L5 design, 2026-11-14 (lane E)
+- [2026-11-14-k-d16335-hole-call-through-declared-fn](2026-11-14-k-d16335-hole-call-through-declared-fn.md): D16334, D16335: a call through a parameter bound to a declared hole function is that function's call, 2026-11-14
 - [2026-11-15-d16316-null-only-list-sibling](2026-11-15-d16316-null-only-list-sibling.md): 2026-11-15 — a list element's null is its built list's, whatever its own stamp says (D16316)
 - [2026-11-14-fuzz-triage-d16314](2026-11-14-fuzz-triage-d16314.md): Triage of a 50-seed fuzz sweep: 16 unsound shapes, four new rows (D16314-D16317), 2026-11-14
 - [2026-11-14-type-hashcons-s2a-pin-sites](2026-11-14-type-hashcons-s2a-pin-sites.md): Type hash-cons stage 2a: every empty-collection pin goes through one writer (lane H), 2026-11-14

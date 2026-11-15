@@ -1,3 +1,0 @@
-## Type system (Track A)
-
-- **L3, the parameter half (option A), first step:** a record wider than a declared record parameter, with its extra field anywhere in the layout, now runs when it is a member call's receiver (`w.f()` for `f(self: P)`) or comes back through an un-annotated return (`function f(p: P) { p }` hands back the wider row). The record-width rewrite gives the parameter a row slot bound by `P`, which every message and hover prints as `P`. **D16218 closed:** the editor hovered such a parameter as `__W0`. Still refused, each filed: forwarding through a generic or hole (D16219), a lambda's parameter (D16400), a declared `: P` return (D16401), a record field holding the row (D16402).
