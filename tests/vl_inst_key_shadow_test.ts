@@ -16,10 +16,12 @@ const POOL = 4;
 // The instances two of mono's keys spell, each pair with identical bodies.
 const MERGES: Record<string, string[]> = {
   "tests/cases/closures/generic-returned-record-param.vl": ["deliver"],
-  "tests/cases/generics/instance-call-of-literal-union-field-function.vl": [
-    "F$m1294891004",
-  ],
 };
+// Pairs mono's own key now spells once, since a key part is a type's set id (type hash-cons
+// stage 4c): the shadow must still run there and report no merge.
+const SETTLED = [
+  "tests/cases/generics/instance-call-of-literal-union-field-function.vl",
+];
 // Controls: instances the key must keep apart (callback specialization; one nested generic per
 // enclosing call frame; one helper handed two tagged sets of one signature).
 const CONTROLS = [
@@ -79,7 +81,7 @@ Deno.test({
     const full = Deno.env.get("VL_INST_KEY_FULL") === "1";
     const list = full
       ? walk("tests/cases", []).sort()
-      : [...Object.keys(MERGES), ...CONTROLS];
+      : [...Object.keys(MERGES), ...SETTLED, ...CONTROLS];
     const dir = await Deno.makeTempDir({ prefix: "vl_inst_key_" });
     try {
       const bad: string[] = [];
@@ -91,7 +93,9 @@ Deno.test({
           const { code, made, merges } = await sweep(rel, dir, i);
           const want = [...(MERGES[rel] ?? [])].sort();
           if (
-            made === 0 && (!full || want.length > 0 || CONTROLS.includes(rel))
+            made === 0 &&
+            (!full || want.length > 0 || CONTROLS.includes(rel) ||
+              SETTLED.includes(rel))
           ) {
             bad.push(
               `${rel}: no instKey report (exit ${code}), the shadow did not run`,
