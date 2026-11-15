@@ -5,7 +5,15 @@
 // halves that read the type arena; nothing here reads a type or the scope chain.
 // This module imports `./ast`, `./symbols`, `./listutil` and `./check_suggest`.
 import { nodeTyIxOf } from "./check_node_tys"
-import { T, TyArray, TyLit, TyMap, TyPrim, tyAt } from "./check_types"
+import {
+  T,
+  TyArray,
+  TyLit,
+  TyMap,
+  TyNullable,
+  TyPrim,
+  tyAt,
+} from "./check_types"
 import {
   ArrayLit,
   AsExpr,
@@ -2018,12 +2026,10 @@ export function cwSlotPath(a: i32, path: string[]): i32 {
   let ix = cwPeel(a)
   while ix >= 0 && ix < P.nodes.length && rev.length < 16 {
     const n = nodeAt(ix)
-    const fi = cwForInBinderOf(ix)
-    if fi >= 0 {
-      const fl = nodeAt(fi)
-      if !(fl is ForIn) { return -1 }
+    const fr = cwForInRecvOf(ix)
+    if fr >= 0 {
       rev.push("[]")
-      ix = cwPeel(fl.fiIter)
+      ix = fr
     } else if n is Ident && cwElemCallbackRecvOfRead(ix) >= 0 {
       rev.push("[]")
       ix = cwPeel(cwElemCallbackRecvOfRead(ix))
@@ -2522,8 +2528,8 @@ function cwSlotWritesThrough(
   return true
 }
 
-// The `for` loop whose element variable the read `ix` names, a map walk's value variable
-// included, or -1.
+// The `for` loop whose variable the read `ix` names, where that variable reads a place
+// (`cwLoopVarSource`); -1 otherwise.
 export function cwForInBinderOf(ix: i32): i32 {
   const p = cwPeel(ix)
   if p < 0 || p >= P.nodes.length || !cwFramedNode(p) { return -1 }
@@ -2531,16 +2537,63 @@ export function cwForInBinderOf(ix: i32): i32 {
   const d = identDeclOf(p)
   const lp = loopVarLoop(d)
   if lp < 0 || lp >= P.nodes.length { return -1 }
-  const l = nodeAt(lp)
-  if l is ForIn {
-    if l.fiDecl1 == d { return lp }
-    // A map walk's second variable is its value; a list walk's is its index.
-    const it = nodeTyIxOf(cwPeel(l.fiIter))
-    if l.fiVar2 != "" && l.fiDecl2 == d && it >= 0 && tyAt(it) is TyMap {
-      return lp
-    }
+  const st: string[] = []
+  return if cwLoopVarSource(lp, d, -1, st) >= 0 { lp } else { -1 }
+}
+
+// The receiver the read `ix` of a `for` loop's variable is one step below (`cwLoopVarSource`);
+// -1 where `ix` names no such variable.
+export function cwForInRecvOf(ix: i32): i32 {
+  const lp = cwForInBinderOf(ix)
+  if lp < 0 { return -1 }
+  const st: string[] = []
+  return cwLoopVarSource(lp, identDeclOf(cwPeel(ix)), -1, st)
+}
+
+// The receiver variable `d` of `for` loop `lp` reads one step below, with the step pushed onto
+// `step`: `e` an element of a list or set, `v` a value of a map, a map's `.values()` included.
+// `lt` is the type of what the loop walks, -1 for its node's own. -1 where the variable reads no
+// place: a list walk's index, a map walk's key, `.keys()`.
+export function cwLoopVarSource(lp: i32, d: i32, lt: i32, step: string[]): i32 {
+  const l = if lp >= 0 && lp < P.nodes.length { nodeAt(lp) } else { null }
+  if !(l is ForIn) || d < 0 { return -1 }
+  const first = l.fiDecl1 == d
+  const second = l.fiVar2 != "" && l.fiDecl2 == d
+  if !first && !second { return -1 }
+  const it = cwPeel(l.fiIter)
+  const vals = cwMapViewOf(it, "values")
+  if vals >= 0 {
+    if !first { return -1 }
+    step.push("v")
+    return vals
   }
-  return -1
+  if cwMapViewOf(it, "keys") >= 0 { return -1 }
+  if cwMapTyAt(if lt >= 0 { lt } else { nodeTyIxOf(it) }) {
+    if !second { return -1 }
+    step.push("v")
+    return it
+  }
+  if !first { return -1 }
+  step.push("e")
+  return it
+}
+
+// The map `ix` lists the values or the keys of, as `prop` says: a `.values()` or `.keys()` call
+// on one; -1 otherwise.
+function cwMapViewOf(ix: i32, prop: string): i32 {
+  const c = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+  if !(c is Call) || c.callArgs.length != 0 || c.callFn < 0 { return -1 }
+  const m = nodeAt(cwPeel(c.callFn))
+  if !(m is Member) || m.memProp != prop { return -1 }
+  return if cwMapTyAt(nodeTyIxOf(m.memObj)) { cwPeel(m.memObj) } else { -1 }
+}
+
+// Whether type `t` is a map, or a nullable one.
+function cwMapTyAt(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const o = tyAt(t)
+  if o is TyNullable { return cwMapTyAt(o.nInner) }
+  return o is TyMap
 }
 
 // Whether every step of `p` is the step of `path` at its position.
