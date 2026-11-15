@@ -1,0 +1,57 @@
+# Slot store, stage 2b part 2b(ii): the last mono probe row closes, and one more elab reader reads the classes (lane S, 2026-11-15)
+
+Part 2b(i) ([`2026-11-15-slot-store-stage-2b-part2-sig.md`](2026-11-15-slot-store-stage-2b-part2-sig.md))
+switched `monoSlotDeliveryTy` onto `eplSlotSig`, leaving one probe row where the walk delivered
+and the classes did not. This PR closes it, switches `elabRetFnListLitTy`, and adds the two reads
+the remaining readers need.
+
+## What changed
+
+- **A call the elaboration keyed nowhere reaches every instance of its callee** (`eplCallTargets`).
+  `bound(g)`, with `g` still typed `((_) => _)[]` at the call, has no call key, and the classes
+  dropped its argument edge, so the annotated `k` inside `bound` never bounded `g`. The walk
+  follows such a call into every instance. A call with closed arguments and no key takes the
+  instance at its arguments' types (`eplCallTarget`).
+- **A function holder is placed in the frame that creates it** (`eplSlotPlace`). A lambda read at
+  its own instance looked up a place keyed at that instance, where its value's edges are drawn at
+  its parent's.
+- **`eplSlotDelivered(holder, path, k, omit)`**: whether a bound or any call outside `omit`
+  delivers the slot. **`eplSlotParams(holder, path, k)`**: the one closed parameter list the slot
+  is delivered at, from its bound or from the argument types every call through it agrees on.
+- **`elabRetFnListLitTy` reads `eplSlotSig`** in place of the walk.
+
+## Parity
+
+The mono probe: the walk and `eplSlotSig` at every `monoSlotDeliveryTy` call over `tests/cases`
+now differ at one call, `closures/hole-fn-list-map-callback-generic-call-loop-alias`, where the
+classes answer `(i32) => i32` and the walk answers nothing; the program runs.
+
+A second probe ran the walk and the class read side by side at five elab readers over
+`tests/cases` and the distilled corpus, and logged every call where they differ:
+
+| reader | differing calls | this PR |
+|---|---|---|
+| `elabRetFnListLitTy` | 0 | switched |
+| `elabLamDeliveredParams` | 0, once a lambda is placed in its frame and a callback takes its own instance's parameters | stays on the walk: [D16560](../inventory/D16560.md) |
+| `elabSlotUncalledOmitting` | 16 | stays: `omit` lists reads, and the classes keep no edge per read |
+| `elabLamGenResultTy` | 3, all in `closures/generic-returned-by-maker-through-hole-param-runs` | stays: a function returned through a function value's own result does not reach the caller's call in the classes |
+| `elabSlotUncalled` | 2 | stays: not yet narrowed |
+
+`elabLamDeliveredParams` answers the walk's parameters at every call, but switching it refuses
+[D4661](../inventory/D4661.md)'s witness, traps the compiler on one case and raises late demands:
+the walk call demands the instances the lambda's calls reach. The pin is D16560.
+
+## Walk code this makes dead
+
+None yet. The walk's callers in `emit_elab.vl` fall from nine to eight readers. Every walk function
+still has a reader, so the part that deletes the walk's paths comes once the readers above move.
+
+## Readings
+
+¶READINGS
+
+## Next
+
+Part 2b(iii), net-negative: make `elabLamDeliveredParams` demand at the delivered parameters,
+carry a returned function through a function value's result, give the classes an omit by read,
+switch the readers above, and delete the walk paths none of them uses.
