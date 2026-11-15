@@ -25,11 +25,9 @@ literals.
 | 9: `ar_s10_0190`, `ar_s14_0106`, `ar_s36_0129`, `ar_s40_0048`, `ar_s48_0169`, `ar_s6_0075`, `ar_s9_0140`, `ar_s9_0188`, `ar_s9_0189` | the D2617 class: with every radix literal replaced by its 64-bit value, the oracle prints what the compiled program prints | `known.txt` (this PR) |
 | `ar_s35_0009` | **D16471** (compiler): `>>` over a negated radix literal above `0x80000000` computes at 64 bits, so a `2 % v1` that must trap runs | row + `known.txt` (this PR) |
 | `ar_s26_0112` | **D16472** (native host): `shortest_sci` prints 2⁻²⁴ with 17 digits | row + `known.txt` (this PR) |
-| `ar_s7_0127` | oracle: `(255 >> v2) + max(i64…)` shifted at 32 bits; Q8 types the untyped `255` by its `i64` peer | lane O |
-| `ar_s29_0063` | `0xFFFFFFFF >> v2` under an `i32` peer at an `i64` destination; the old oracle agreed with the compiler, the new one reads the destination | lane O |
-| `ar_s25_0085`, `ar_s31_0104`, `ar_s32_0022`, `ar_s44_0020` | the compiler keeps a radix literal's 32-bit pattern where the oracle reads its value: `((-1) - 0xFFFFFFFF) as f64`, and `0xFFFFFFFF & …` beside an `i64` at an `i64` destination | the owner of rulings 4.1/4.2 |
-| `ar_s30_0123`, `ar_s43_0072` | radix width, neither substitution alone explains it | the owner of rulings 4.1/4.2 |
-| `ar_s41_0106` | does ruling 4.1's float context reach a radix literal through a join (`(if c { 2147483647 } else { 0xFFFFFFFF }) as f64 as! i32`)? The oracle traps; the compiler reads `-1` | a spec question |
+| `ar_s7_0127`, `ar_s29_0063`, `ar_s25_0085`, `ar_s31_0104`, `ar_s32_0022`, `ar_s44_0020`, `ar_s30_0123`, `ar_s43_0072` | radix and shift width: `(255 >> v2) + max(i64…)` shifted at 32 bits beside an `i64`; `0xFFFFFFFF >> v2` under an `i32` peer at an `i64` destination; the compiler's 32-bit pattern where the oracle reads a value (`((-1) - 0xFFFFFFFF) as f64`, `0xFFFFFFFF & …` beside an `i64`) | lane O |
+| `ar_s41_0106` | **D16473** (compiler): under 4.3's one join rule and 4.1, the float context of `as f64` reaches a literal join's radix arm, which is 4294967295; the compiler reads `-1` | row + `known.txt` (this PR) |
 
-With this PR, 11 of the 20 are filed or known. Tonight's run stays red on the other 9 until lane O
-and the ruling's owner decide them.
+With this PR, 12 of the 20 are filed or known. Tonight's run stays red on the other 8 until lane O
+decides them. The oracle also prints `-1` for `if c { 1.5 } else { 0xFFFFFFFF }`, where the compiler
+prints 4294967295; that was passed to lane O too.
