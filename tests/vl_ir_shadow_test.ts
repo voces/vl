@@ -154,10 +154,10 @@ Deno.test({
   fn: () => {
     // A tail `if` that yields its arms' values (I1's `siOut`) is outside the set too.
     const src = `function greet(s: string): string { s + "!" }
-function first(xs: i32[]): i32 { xs[0] }
+function fx(p: { x: i32 }): i32 { p.x }
 function sel(c: boolean): i32 { if c { 1 } else { 2 } }
 print(greet("a"))
-print(first([4]))
+print(fx({ x: 4 }))
 print(sel(true))
 `;
     const { rc, rows } = run(src, true);

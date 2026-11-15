@@ -1,0 +1,140 @@
+// `ir_build_ref.vl` — the IR builder's reference values and list reads (ir-design-2026-11.md
+// §5.3, I2's list half). A `str` or a list of unpacked primitives may be a variable, parameter
+// or result. A list read on legacy's plain guarded path builds `SBoundsCheck` then `RListGet`
+// over the same operands, and binds the lazy list frame's rows, legacy's own scratch slots, as
+// variables. Every other element or member read is a named miss. `irRefInstall` sets the hooks.
+
+import { Index, Member, nodeAt } from "./ast"
+import { OVar, Opnd, irVarNew, repPrim, repWhat } from "./ir"
+import {
+  irBExpr,
+  irBFn,
+  irBFnIx,
+  irBLetTemp,
+  irBMiss,
+  irBNoValue,
+  irBNode,
+  irIndexHook,
+  irMemberHook,
+  irVarRepOkHook,
+} from "./ir_build"
+import {
+  irLowerBoundsHook,
+  irLowerListHook,
+  irRefValtypeHook,
+} from "./ir_lower"
+import { irBoundsRuleHook } from "./ir_verify"
+import {
+  irLowerRefBounds,
+  irLowerRefList,
+  irLowerRefValtype,
+  irRefGetNote,
+  irRefNotesFor,
+  irRefScratchNote,
+  listIdxPlainWhy,
+} from "./ir_lower_ref"
+import { irBoundsRule } from "./ir_verify_bounds"
+import { RList, repNodeAt, repNodeOfTy } from "./emit_rep"
+import { nodeTyAt } from "./emit_capture_frames"
+import { exprPackedRow } from "./emit_classify"
+import { scalarListElemKind } from "./emit_value_sites"
+import { liKinds, listIdxScratchBase } from "./emit_state"
+import { TY_I32 } from "./check_types"
+
+// The corrupt mode that drops every bounds check, rule 8's failing control, and the mode armed.
+const CORRUPT_DROP_BOUNDS = 5
+let refCorrupt = 0
+
+// Arms corrupt mode `k` for the list builder (0 none), as `irShadowCorrupt` does for the shadow.
+export function irRefCorrupt(k: i32) {
+  refCorrupt = k
+  0
+}
+
+// Whether rep `r` is a reference value this slice admits: a string, or a list of unpacked
+// primitives (a packed `u8` element is no primitive here).
+function refRepOk(r: i32, _ty: i32): boolean {
+  if repPrim(r) == "str" { return true }
+  const n = repNodeAt(r)
+  if n is RList {
+    const e = repPrim(n.rlsElem)
+    return e == "i32" || e == "i64" || e == "f64" || e == "f32" || e == "bool"
+  }
+  false
+}
+
+function missed(o: Opnd): boolean { o is OVar && o.ov < 0 }
+
+// The variable bound to local slot `slot`, minted with rep `rep` when none is yet.
+function slotVar(slot: i32, rep: i32, ty: i32): i32 {
+  const f = irBFn()
+  let i = 0
+  while i < f.irVars.length {
+    if f.irVars[i].vKind == "local" && f.irVars[i].vSlot == slot { return i }
+    i = i + 1
+  }
+  irVarNew(f, rep, ty, "local", slot)
+}
+
+// Binds the lazy list frame legacy declared: its i32 index stash, then one row per kind.
+function bindScratchFrame(listTy: i32) {
+  const listRep = repNodeOfTy(listTy)
+  if liKinds.length == 0 { return 0 }
+  slotVar(listIdxScratchBase, repNodeOfTy(TY_I32), TY_I32)
+  let k = 0
+  while k < liKinds.length {
+    const before = irBFn().irVars.length
+    const v = slotVar(listIdxScratchBase + 1 + k, listRep, listTy)
+    if v >= before { irRefScratchNote(v, k) }
+    k = k + 1
+  }
+  0
+}
+
+function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
+  const n = nodeAt(ix)
+  if !(n is Index) { return irBMiss("expression") }
+  const fnIx = irBFnIx()
+  irRefNotesFor(irBFn().irAt, irBFn().irName)
+  const why = listIdxPlainWhy(ix, fnIx)
+  if why != "" { return irBMiss(why) }
+  const ek = scalarListElemKind(n.idxArr, fnIx)
+  if ek == null { return irBMiss("index string") }
+  const v = irBExpr(b, n.idxArr)
+  const i = irBExpr(b, n.idxIndex)
+  if missed(v) || missed(i) { return irBMiss("index operand") }
+  if !(v is OVar) { return irBMiss("index receiver") }
+  bindScratchFrame(nodeTyAt(n.idxArr, fnIx))
+  if refCorrupt != CORRUPT_DROP_BOUNDS {
+    irBNode(b, { bcV: v, bcIx: i }, -1, irBNoValue(), ix)
+  }
+  irRefGetNote(v.ov, ek, exprPackedRow(n.idxArr, fnIx))
+  irBLetTemp(b, { lgV: v, lgIx: i }, ix, rep)
+}
+
+// A member read, routed by its receiver's rep: a record's own `length` field never reaches a
+// list or string arm.
+function buildMember(_b: i32[], ix: i32, _rep: i32): Opnd {
+  const n = nodeAt(ix)
+  if !(n is Member) { return irBMiss("expression") }
+  const r = repNodeOfTy(nodeTyAt(n.memObj, irBFnIx()))
+  if repNodeAt(r) is RList {
+    return irBMiss(
+      if n.memProp == "length" { "list length" } else { "list member" },
+    )
+  }
+  if repPrim(r) == "str" { return irBMiss("string member") }
+  irBMiss("member " + repWhat(r))
+}
+
+// Installs the list builder, lowering and rule 8; run once before emit.
+export function irRefInstall() {
+  irVarRepOkHook = refRepOk
+  irIndexHook = buildIndex
+  irMemberHook = buildMember
+  irLowerListHook = irLowerRefList
+  irLowerBoundsHook = irLowerRefBounds
+  irRefValtypeHook = irLowerRefValtype
+  irBoundsRuleHook = irBoundsRule
+  0
+}

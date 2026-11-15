@@ -1,0 +1,110 @@
+// `ir_verify_bounds.vl` — the IR verifier's rule 8 (ir-design-2026-11.md §2): in phase A every
+// element read is guarded by the bounds check fused into it. An `RListGet` must follow an
+// `SBoundsCheck` over the same list and index in its body, and every such check must be followed
+// by that read.
+
+import { i32ToStr } from "./ast"
+import {
+  IrFn,
+  OImm,
+  OStr,
+  OVar,
+  Opnd,
+  RListGet,
+  SAssign,
+  SBlock,
+  SBoundsCheck,
+  SBr,
+  SCellSet,
+  SDrop,
+  SEffect,
+  SGlobalSet,
+  SIf,
+  SLet,
+  SListSet,
+  SLoop,
+  SReturn,
+  SSetField,
+  SSwitch,
+  STrap,
+} from "./ir"
+
+function sameOpnd(a: Opnd, b: Opnd): boolean {
+  match a {
+    OVar => b is OVar && a.ov == b.ov
+    OImm => b is OImm && a.oiRep == b.oiRep && a.oiBits == b.oiBits
+    OStr => false
+  }
+}
+
+// The `RListGet` that node `id` binds, as its list and index; null for any other node.
+function getAt(f: IrFn, id: i32): Opnd[] | null {
+  if id < 0 || id >= f.irNodes.length { return null }
+  const n = f.irNodes[id]
+  if !(n is SLet) { return null }
+  const r = n.lRhs
+  if !(r is RListGet) { return null }
+  [r.lgV, r.lgIx]
+}
+
+function checkAt(f: IrFn, id: i32): SBoundsCheck | null {
+  if id < 0 || id >= f.irNodes.length { return null }
+  const n = f.irNodes[id]
+  if n is SBoundsCheck { return n }
+  null
+}
+
+// The first broken pairing in `body` and the bodies under it, or "".
+function bodyRule(f: IrFn, body: i32[]): string {
+  let i = 0
+  while i < body.length {
+    const id = body[i]
+    const g = getAt(f, id)
+    if g != null {
+      const c = if i > 0 { checkAt(f, body[i - 1]) } else { null }
+      if c == null || !sameOpnd(c.bcV, g[0]) || !sameOpnd(c.bcIx, g[1]) {
+        return "node "
+          + i32ToStr(id)
+          + ": an element read with no bounds check fused before it"
+      }
+    }
+    const c2 = checkAt(f, id)
+    if c2 != null {
+      const g2 = if i + 1 < body.length { getAt(f, body[i + 1]) } else { null }
+      if g2 == null || !sameOpnd(c2.bcV, g2[0]) || !sameOpnd(c2.bcIx, g2[1]) {
+        return "node "
+          + i32ToStr(id)
+          + ": a bounds check with no element read after it"
+      }
+    }
+    const inner = innerRule(f, id)
+    if inner != "" { return inner }
+    i = i + 1
+  }
+  ""
+}
+
+function innerRule(f: IrFn, id: i32): string {
+  if id < 0 || id >= f.irNodes.length { return "" }
+  const n = f.irNodes[id]
+  match n {
+    SBlock => bodyRule(f, n.bkBody)
+    SLoop => bodyRule(f, n.lpBody)
+    SIf => {
+      const t = bodyRule(f, n.siThen)
+      if t != "" { return t }
+      bodyRule(f, n.siElse)
+    }
+    SSwitch => {
+      for a in n.swArms {
+        const s = bodyRule(f, a.swBody)
+        if s != "" { return s }
+      }
+      ""
+    }
+    SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBr | SReturn | STrap | SDrop => ""
+  }
+}
+
+// Rule 8 over `f`: "" when every element read is fused with its bounds check, else what broke.
+export function irBoundsRule(f: IrFn): string { bodyRule(f, f.irBody) }
