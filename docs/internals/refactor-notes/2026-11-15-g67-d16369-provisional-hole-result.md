@@ -39,3 +39,10 @@ annotation, and pass 2 has not checked its body (`fnInferredUnchecked`), as it a
     reduced (`c4([dbl], 2.5)` builds an invalid module, and a returned closure over `[inc0, half]`
     traps).
   - `check-filed-witnesses --strict`: 5099 graded, all as filed.
+- On top of #8211 (master `c7fa64f1`), from a fixpoint seed:
+  - `decl-order-ab.vl`: 70 of 5155 cases move, 1 of them clause-1 (D16281's cell). The baseline is
+    rewritten.
+  - `regress.vl`: 0 runs→not-runs, and the baseline is rewritten.
+  - D16430 and D16431, lane J's rows, close with this change.
+  - D16301 keeps its bare-list witness. Its corpus cell runs since #8211.
+  - `check-filed-witnesses --strict`: 5102 graded, all as filed.
