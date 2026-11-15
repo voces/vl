@@ -8,3 +8,5 @@
 
   Before, the first two computed at `f64`, and the `f32` destination refused the program. A bare join is now a `min`/`max` operand that adapts to `f32`, as it already was beside a binary operator.
 - The oracle gives `match` the same literal-join rule as `if`. It reads a radix tree in a float join at 64 bits, and it now folds a float tree over a join beside an `f32` instead of reporting a spec gap.
+- **D16671 closed:** a unary `-` over a value join of literals now adopts the typed peer or destination beside it, as `~` and the bare join already did. The `i64` face `(-(if c { 0xFFFFFFFF } else { 46341 })) + w` is `-4294967290`, not `6`. The `f32` face `const z: f32 = -(if c { 0.1 } else { 1.5 })` used to be refused and now runs.
+- The oracle no longer emulates D16497 and D16498, now that both rows are closed.
