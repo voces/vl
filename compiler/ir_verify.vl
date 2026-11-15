@@ -1,0 +1,644 @@
+// The IR verifier (ir-design-2026-11.md §2): one linear walk over an `IrFn` that checks rules
+// 1-7: closed reps, rep agreement, types against reps, definitions before uses, control, calls
+// and switch coverage. It answers the first rule a function breaks, with the node; it never
+// reports through the emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
+// builder, and trap order (rule 9) with the first pass that moves a check. Until steps I2-I7
+// build them, the arms for records, lists, casts, tags, maps and closures have no input.
+import {
+  IrFn,
+  IrNode,
+  OImm,
+  OStr,
+  OVar,
+  Opnd,
+  PrimOp,
+  RCall,
+  RCallHost,
+  RCallRef,
+  RCast,
+  RCellGet,
+  RCellNew,
+  RFnId,
+  RGetField,
+  RGlobalGet,
+  RListGet,
+  RListLen,
+  RListNew,
+  RMakeClo,
+  RMakeList,
+  RMakeRec,
+  RMapOp,
+  RPrimOp,
+  RStrOp,
+  RTagOf,
+  RTest,
+  Rhs,
+  SAssign,
+  SBlock,
+  SBoundsCheck,
+  SBr,
+  SCellSet,
+  SEffect,
+  SGlobalSet,
+  SIf,
+  SLet,
+  SListSet,
+  SLoop,
+  SReturn,
+  SSetField,
+  SSwitch,
+  STrap,
+  irBodyLeaves,
+  irFnNew,
+  irGlobalRepOf,
+  irSigOf,
+} from "./ir"
+import {
+  RBox,
+  RClosure,
+  RList,
+  RNullable,
+  RRecord,
+  RUnsup,
+  repNodeAt,
+  repNodeKids,
+  repNodeOfTy,
+} from "./emit_rep"
+import { repIsNoValue, repWhat } from "./ir"
+import { tyHasTyVar } from "./tyquery"
+import { TY_BOOL, TY_I32, TY_STR } from "./check_types"
+import { i32ToStr } from "./ast"
+
+// A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
+// (-1 for a variable or the header), with the reason.
+export type IrVerdict = { vfRule: i32, vfNode: i32, vfMsg: string }
+
+let vf: IrFn = irFnNew(-1, "")
+let vfRule = 0
+let vfAt = -1
+let vfMsg = ""
+let vfDefined: boolean[] = []
+// The temps defined in the open bodies, in order, so a body's exit undoes its own.
+let vfDefLog: i32[] = []
+let vfLabels: i32[] = []
+let vfLabelOut: i32[] = []
+let vfBool = -1
+let vfI32 = -1
+let vfStr = -1
+
+function fail(rule: i32, at: i32, msg: string) {
+  if vfRule == 0 {
+    vfRule = rule
+    vfAt = at
+    vfMsg = msg
+  }
+  0
+}
+
+function varRep(v: i32): i32 {
+  if v < 0 || v >= vf.irVars.length { return -1 }
+  vf.irVars[v].vRep
+}
+
+function opRep(o: Opnd): i32 {
+  match o {
+    OVar => varRep(o.ov)
+    OImm => o.oiRep
+    OStr => vfStr
+  }
+}
+
+// Rule 4 at a use: a temp is read only once its one definition is in scope.
+function use(o: Opnd, at: i32) {
+  match o {
+    OVar => {
+      if o.ov < 0 || o.ov >= vf.irVars.length {
+        return fail(
+          4,
+          at,
+          "reads v" + i32ToStr(o.ov) + ", which does not exist",
+        )
+      }
+      if vf.irVars[o.ov].vKind == "temp" && !vfDefined[o.ov] {
+        return fail(
+          4,
+          at,
+          "reads temp v" + i32ToStr(o.ov) + " before its definition",
+        )
+      }
+      0
+    }
+    OImm | OStr => 0
+  }
+}
+
+function uses(os: Opnd[], at: i32) {
+  for o in os { use(o, at) }
+  0
+}
+
+function isNum(k: string): boolean {
+  k == "i32" || k == "i64" || k == "f64" || k == "f32"
+}
+
+function isInt(k: string): boolean { k == "i32" || k == "i64" }
+
+// Rule 2 for a primitive op: its operands' reps and its result rep `dst`.
+function primSig(r: RPrimOp, dst: i32, at: i32) {
+  const a = r.poArgs
+  const unary = r.poOp == "neg" || r.poOp == "not"
+  const want = if unary { 1 } else { 2 }
+  if a.length != want {
+    return fail(
+      2,
+      at,
+      r.poOp
+        + " takes "
+        + i32ToStr(want)
+        + " operands, got "
+        + i32ToStr(a.length),
+    )
+  }
+  const ar = opRep(a[0])
+  if !unary && opRep(a[1]) != ar {
+    return fail(2, at, r.poOp + "'s operands differ in rep")
+  }
+  const k = repWhat(ar)
+  const op: PrimOp = r.poOp
+  const kindOk = match op {
+    "add" | "sub" | "mul" | "div" | "rem" | "lt" | "le" | "gt" | "ge" | "neg" => isNum(k)
+    "shl" | "shr" | "shru" => isInt(k)
+    "and" | "or" | "xor" => isInt(k) || k == "bool"
+    "eq" | "ne" => isNum(k) || k == "bool"
+    "not" => k == "bool"
+  }
+  if !kindOk { return fail(2, at, r.poOp + " has no signature over " + k) }
+  const cmp = match op {
+    "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "not" => true
+    "add" | "sub" | "mul" | "div" | "rem" | "neg" | "shl" | "shr" | "shru" | "and" | "or" | "xor" => false
+  }
+  const res = if cmp { vfBool } else { ar }
+  if dst != res {
+    return fail(2, at, r.poOp + "'s result is not its destination's rep")
+  }
+  0
+}
+
+// Rules 2 and 6 for a call of callee `fnPos` with `args` into a destination of rep `dst`
+// (-1 for an effect, which keeps no result).
+function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
+  const si = irSigOf(vf, fnPos)
+  if si < 0 {
+    return fail(6, at, "calls f" + i32ToStr(fnPos) + ", which has no signature")
+  }
+  const ps = vf.irSigParams[si]
+  if ps.length != args.length {
+    return fail(
+      6,
+      at,
+      "passes "
+        + i32ToStr(args.length)
+        + " arguments to "
+        + i32ToStr(ps.length)
+        + " parameters",
+    )
+  }
+  let i = 0
+  while i < ps.length {
+    if opRep(args[i]) != ps[i] {
+      return fail(
+        6,
+        at,
+        "argument " + i32ToStr(i) + "'s rep is not its parameter's",
+      )
+    }
+    i = i + 1
+  }
+  if dst >= 0 && dst != vf.irSigRet[si] {
+    return fail(6, at, "the result rep is not the callee's")
+  }
+  0
+}
+
+function kidAt(r: i32, i: i32): i32 {
+  const ks = repNodeKids(r)
+  if i < 0 || i >= ks.length { return -1 }
+  ks[i]
+}
+
+// Rule 2: `r`'s operands and its result rep against destination rep `dst` (-1 for an effect).
+function rhsCheck(r: Rhs, dst: i32, at: i32) {
+  match r {
+    RPrimOp => {
+      uses(r.poArgs, at)
+      primSig(r, dst, at)
+    }
+    RCall => {
+      uses(r.caArgs, at)
+      callSig(r.caCallee, r.caArgs, dst, at)
+    }
+    RCallRef => {
+      use(r.crFn, at)
+      uses(r.crArgs, at)
+      if !(repNodeAt(opRep(r.crFn)) is RClosure) {
+        return fail(2, at, "call_ref of a non-closure")
+      }
+      0
+    }
+    RCallHost => uses(r.chArgs, at)
+    RTest => {
+      use(r.teV, at)
+      if dst >= 0 && dst != vfBool { return fail(2, at, "`is` yields bool") }
+      0
+    }
+    RCast => {
+      use(r.ctV, at)
+      if dst < 0 { return 0 }
+      const ok = if r.ctOnFail == "trap" { dst == r.ctTarget } else { repNodeAt(dst) is RNullable && kidAt(dst, 0) == r.ctTarget }
+      if !ok { return fail(2, at, "a cast's result is not its target's rep") }
+      0
+    }
+    RTagOf => {
+      use(r.tgV, at)
+      if !(repNodeAt(opRep(r.tgV)) is RBox) {
+        return fail(2, at, "a tag of a non-box")
+      }
+      if dst >= 0 && dst != vfI32 { return fail(2, at, "a tag is an i32") }
+      0
+    }
+    RMakeRec => {
+      uses(r.mrFields, at)
+      if dst < 0 { return 0 }
+      const ks = repNodeKids(dst)
+      if !(repNodeAt(dst) is RRecord) || ks.length != r.mrFields.length {
+        return fail(2, at, "a record's fields do not match its rep")
+      }
+      let i = 0
+      while i < ks.length {
+        if opRep(r.mrFields[i]) != ks[i] {
+          return fail(2, at, "field " + i32ToStr(i) + "'s rep differs")
+        }
+        i = i + 1
+      }
+      0
+    }
+    RGetField => {
+      use(r.gfV, at)
+      const v = opRep(r.gfV)
+      if !(repNodeAt(v) is RRecord) {
+        return fail(2, at, "a field read of a non-record")
+      }
+      if dst >= 0 && kidAt(v, r.gfIx) != dst {
+        return fail(2, at, "a field's rep is not its destination's")
+      }
+      0
+    }
+    RMakeList => {
+      uses(r.mlElems, at)
+      if dst < 0 { return 0 }
+      if !(repNodeAt(dst) is RList) {
+        return fail(2, at, "a list literal of a non-list rep")
+      }
+      for e in r.mlElems {
+        if opRep(e) != kidAt(dst, 0) {
+          return fail(2, at, "an element's rep is not the list's")
+        }
+      }
+      0
+    }
+    RListNew => {
+      use(r.lnLen, at)
+      use(r.lnFill, at)
+      if opRep(r.lnLen) != vfI32 {
+        return fail(2, at, "a list length is an i32")
+      }
+      if dst >= 0 && opRep(r.lnFill) != kidAt(dst, 0) {
+        return fail(2, at, "the fill's rep is not the element's")
+      }
+      0
+    }
+    RListGet => {
+      use(r.lgV, at)
+      use(r.lgIx, at)
+      const l = opRep(r.lgV)
+      if !(repNodeAt(l) is RList) || opRep(r.lgIx) != vfI32 {
+        return fail(2, at, "an element read takes a list and an i32")
+      }
+      if dst >= 0 && kidAt(l, 0) != dst {
+        return fail(2, at, "an element's rep is not its destination's")
+      }
+      0
+    }
+    RListLen => {
+      use(r.llV, at)
+      if !(repNodeAt(opRep(r.llV)) is RList) {
+        return fail(2, at, "a length of a non-list")
+      }
+      if dst >= 0 && dst != vfI32 { return fail(2, at, "a length is an i32") }
+      0
+    }
+    RMapOp => uses(r.mpArgs, at)
+    RStrOp => uses(r.soArgs, at)
+    RMakeClo => uses(r.mcEnv, at)
+    RFnId => if dst >= 0 && dst != vfI32 { fail(2, at, "a function id is an i32") } else { 0 }
+    RCellNew => use(r.cnInit, at)
+    RCellGet => use(r.cgCell, at)
+    RGlobalGet => {
+      const g = irGlobalRepOf(vf, r.ggSym)
+      if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
+      if dst >= 0 && dst != g {
+        return fail(2, at, "a global's rep is not its destination's")
+      }
+      0
+    }
+  }
+}
+
+// Whether node `id` leaves its body: a branch, a return or a trap.
+function exits(id: i32): boolean {
+  if id < 0 || id >= vf.irNodes.length { return false }
+  const n = vf.irNodes[id]
+  n is SBr || n is SReturn || n is STrap
+}
+
+// Rule 5's fall-through: a body with out-variable `out` ends by writing it, or by leaving.
+function endsWriting(body: i32[], out: i32, at: i32) {
+  if out < 0 { return 0 }
+  if body.length == 0 {
+    return fail(5, at, "an arm leaves v" + i32ToStr(out) + " unwritten")
+  }
+  const last = body[body.length - 1]
+  if exits(last) { return 0 }
+  const n = vf.irNodes[last]
+  if n is SAssign && n.asDst == out { return 0 }
+  fail(5, at, "an arm leaves v" + i32ToStr(out) + " unwritten")
+}
+
+// Walks a nested body: the temps it defines are out of scope after it.
+function nested(body: i32[]) {
+  const nDefs = vfDefLog.length
+  for id in body { stmt(id) }
+  while vfDefLog.length > nDefs {
+    const d = vfDefLog.pop() ?? -1
+    if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
+  }
+  0
+}
+
+function labelled(label: i32, out: i32, body: i32[]) {
+  vfLabels.push(label)
+  vfLabelOut.push(out)
+  nested(body)
+  vfLabels.pop()
+  vfLabelOut.pop()
+  0
+}
+
+function stmt(id: i32) {
+  if vfRule != 0 { return 0 }
+  if id < 0 || id >= vf.irNodes.length {
+    return fail(5, id, "a body names no node")
+  }
+  nodeRepClosed(id)
+  const n: IrNode = vf.irNodes[id]
+  match n {
+    SLet => {
+      const d = n.lDst
+      if d < 0 || d >= vf.irVars.length {
+        return fail(4, id, "defines no variable")
+      }
+      rhsCheck(n.lRhs, vf.irVars[d].vRep, id)
+      if vf.irVars[d].vKind == "temp" {
+        if vfDefined[d] {
+          return fail(4, id, "defines temp v" + i32ToStr(d) + " twice")
+        }
+        vfDefined[d] = true
+        vfDefLog.push(d)
+      }
+      if vf.irNodeRep[id] != vf.irVars[d].vRep {
+        return fail(2, id, "the node's rep is not its destination's")
+      }
+      0
+    }
+    SAssign => {
+      use(n.asSrc, id)
+      if n.asDst < 0 || n.asDst >= vf.irVars.length {
+        return fail(4, id, "assigns no variable")
+      }
+      if vf.irVars[n.asDst].vKind == "temp" {
+        return fail(4, id, "assigns temp v" + i32ToStr(n.asDst))
+      }
+      if opRep(n.asSrc) != vf.irVars[n.asDst].vRep {
+        return fail(2, id, "an assignment needs a coercion")
+      }
+      0
+    }
+    SSetField => {
+      use(n.sfV, id)
+      use(n.sfSrc, id)
+      const r = opRep(n.sfV)
+      if !(repNodeAt(r) is RRecord) || kidAt(r, n.sfIx) != opRep(n.sfSrc) {
+        return fail(2, id, "a field write's rep is not the field's")
+      }
+      0
+    }
+    SListSet => {
+      use(n.lsV, id)
+      use(n.lsIx, id)
+      use(n.lsSrc, id)
+      const l = opRep(n.lsV)
+      if (
+        !(repNodeAt(l) is RList)
+        || opRep(n.lsIx) != vfI32
+        || kidAt(l, 0) != opRep(n.lsSrc)
+      ) {
+        return fail(2, id, "an element write's reps do not match the list")
+      }
+      0
+    }
+    SCellSet => {
+      use(n.csCell, id)
+      use(n.csSrc, id)
+    }
+    SGlobalSet => {
+      use(n.gsSrc, id)
+      const g = irGlobalRepOf(vf, n.gsSym)
+      if g < 0 { return fail(2, id, "writes a global with no recorded rep") }
+      if opRep(n.gsSrc) != g {
+        return fail(2, id, "a global store needs a coercion")
+      }
+      0
+    }
+    SBoundsCheck => {
+      use(n.bcV, id)
+      use(n.bcIx, id)
+      0
+    }
+    SEffect => rhsCheck(n.efRhs, -1, id)
+    SBlock => {
+      labelled(n.bkLabel, n.bkOut, n.bkBody)
+      endsWriting(n.bkBody, n.bkOut, id)
+    }
+    SLoop => labelled(n.lpLabel, -1, n.lpBody)
+    SIf => {
+      use(n.siCond, id)
+      if opRep(n.siCond) != vfBool {
+        return fail(2, id, "an `if` tests a bool")
+      }
+      nested(n.siThen)
+      nested(n.siElse)
+      endsWriting(n.siThen, n.siOut, id)
+      endsWriting(n.siElse, n.siOut, id)
+    }
+    SSwitch => switchCheck(n, id)
+    SBr => {
+      let i = vfLabels.length - 1
+      while i >= 0 {
+        if vfLabels[i] == n.brLabel {
+          const out = vfLabelOut[i]
+          if out < 0 && n.brHas {
+            return fail(
+              5,
+              id,
+              "a branch carries a value its label has no place for",
+            )
+          }
+          if out >= 0 {
+            if !n.brHas {
+              return fail(5, id, "a branch to a valued label carries none")
+            }
+            use(n.brVal, id)
+            if opRep(n.brVal) != varRep(out) {
+              return fail(5, id, "a branch's value is not its label's rep")
+            }
+          }
+          return 0
+        }
+        i = i - 1
+      }
+      fail(
+        5,
+        id,
+        "a branch to L" + i32ToStr(n.brLabel) + ", which does not enclose it",
+      )
+    }
+    SReturn => {
+      const none = repIsNoValue(vf.irRetRep)
+      if n.rtHas == none {
+        return fail(
+          5,
+          id,
+          "a return's value does not match the function's result",
+        )
+      }
+      if n.rtHas {
+        use(n.rtV, id)
+        if opRep(n.rtV) != vf.irRetRep {
+          return fail(2, id, "a return's rep is not the result's")
+        }
+      }
+      0
+    }
+    STrap => 0
+  }
+}
+
+// Rule 7: each arm of the scrutinee's box is covered once, or a default names what it excludes.
+function switchCheck(n: SSwitch, id: i32) {
+  const on = varRep(n.swOn)
+  if !(repNodeAt(on) is RBox) { return fail(7, id, "a switch over a non-box") }
+  const nArms = repNodeKids(on).length
+  const seen: boolean[] = []
+  let i = 0
+  while i < nArms {
+    seen.push(false)
+    i = i + 1
+  }
+  let dflt = false
+  for a in n.swArms {
+    if a.swArm < 0 {
+      if a.swWhy == "" {
+        return fail(7, id, "a default arm names nothing it excludes")
+      }
+      if dflt { return fail(7, id, "a second default arm") }
+      dflt = true
+    } else if a.swArm >= nArms || seen[a.swArm] {
+      return fail(
+        7,
+        id,
+        "arm " + i32ToStr(a.swArm) + " is out of range or repeated",
+      )
+    } else {
+      seen[a.swArm] = true
+    }
+    nested(a.swBody)
+    endsWriting(a.swBody, n.swOut, id)
+  }
+  if dflt { return 0 }
+  for s in seen {
+    if !s { return fail(7, id, "an arm of the scrutinee is not covered") }
+  }
+  0
+}
+
+// Rule 1: whether `r` is a node of the tree and not an unsupported one.
+function closedRep(r: i32): boolean {
+  const n = repNodeAt(r)
+  if n == null { return false }
+  !(n is RUnsup)
+}
+
+// Rule 1 for a node: its rep is a closed one in the tree.
+function nodeRepClosed(id: i32) {
+  const r = vf.irNodeRep[id]
+  if !closedRep(r) {
+    return fail(1, id, "the node's rep is " + repWhat(r) + ", not a closed rep")
+  }
+  0
+}
+
+// Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
+export function irVerify(f: IrFn): IrVerdict {
+  vf = f
+  vfRule = 0
+  vfAt = -1
+  vfMsg = ""
+  vfLabels = []
+  vfLabelOut = []
+  vfBool = repNodeOfTy(TY_BOOL)
+  vfI32 = repNodeOfTy(TY_I32)
+  vfStr = repNodeOfTy(TY_STR)
+  vfDefined = []
+  vfDefLog = []
+  let i = 0
+  while i < f.irVars.length {
+    const v = f.irVars[i]
+    vfDefined.push(false)
+    if !closedRep(v.vRep) {
+      fail(
+        1,
+        -1,
+        "v" + i32ToStr(i) + "'s rep is " + repWhat(v.vRep) + ", not a closed rep",
+      )
+    } else if v.vTy < 0 || tyHasTyVar(v.vTy) {
+      fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
+    } else if repNodeOfTy(v.vTy) != v.vRep {
+      fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
+    }
+    i = i + 1
+  }
+  if !closedRep(f.irRetRep) {
+    fail(
+      1,
+      -1,
+      "the result's rep is " + repWhat(f.irRetRep) + ", not a closed rep",
+    )
+  }
+  for id in f.irBody { stmt(id) }
+  // Rule 5 at the end: a function with a result leaves its body on every path.
+  if !repIsNoValue(f.irRetRep) && !irBodyLeaves(f, f.irBody) {
+    fail(5, -1, "a valued function falls off its end")
+  }
+  const v: IrVerdict = { vfRule: vfRule, vfNode: vfAt, vfMsg: vfMsg }
+  v
+}

@@ -53,8 +53,8 @@ const INERT: &[&str] = &[
 /// computes during the compile, so it is one too, as is `VL_CHECK_STATS` (read off the
 /// instances after a check). `VL_CHECK_KEEP_MODULES` writes files a hit would not write, and
 /// `VL_LATE_DEMANDS` prints the elaboration work the compile asked for after the run, and
-/// `VL_ID_SHADOW` prints the identity shadow's rows (its mode 2 also moves the output), and
-/// `VL_CLS_CENSUS` prints the classifier phase census.
+/// `VL_ID_SHADOW` prints the identity shadow's rows (its mode 2 also moves the output),
+/// `VL_CLS_CENSUS` prints the classifier phase census, and `VL_IR_SHADOW` the IR shadow's rows.
 fn is_bypass(k: &str) -> bool {
     matches!(
         k,
@@ -69,6 +69,7 @@ fn is_bypass(k: &str) -> bool {
             | "VL_LATE_DEMANDS"
             | "VL_ID_SHADOW"
             | "VL_CLS_CENSUS"
+            | "VL_IR_SHADOW"
     ) || k.starts_with("VL_PROFILE")
         || k.ends_with("_DUMP")
         || k.ends_with("_EXPLAIN")

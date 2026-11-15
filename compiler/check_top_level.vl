@@ -2,15 +2,19 @@
 // any body is checked, the generic-constraint probe, then each declaration in order.
 
 import { declTyOf } from "./check_nar_store"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import { declFnAliasSet } from "./check_scopes"
 import { globalInitRecordsFnSetsSet } from "./check_elab_cap"
 import {
+  BinExpr,
   BoolLit,
+  Call,
   CharLit,
   FuncDecl,
   Ident,
+  Index,
   LetDecl,
+  Member,
   NumLit,
   OP_INDEX_GET,
   OP_INDEX_SET,
@@ -82,7 +86,6 @@ import {
   cstrProbeWalk,
 } from "./check_cstr_probe"
 import { markCtnLitBinding } from "./check_ctn_lit_bind"
-import { inferQuiet, quietDepth } from "./check_cursor"
 import {
   cBoundDeclsSetAt,
   lbiScanModLits,
@@ -146,12 +149,10 @@ import {
   RB_GLOBAL_INIT,
   RB_LINT,
   RB_RETURNS,
-  checkMark,
-  checkRollback,
-  prbArmed,
-  prbEnter,
-  prbLeave,
   prbSkip,
+  quietRunDrop,
+  quietRunEnd,
+  quietRunOpen,
 } from "./check_rollback"
 import { declareDecl } from "./check_scopes"
 import {
@@ -221,12 +222,7 @@ function preInferOne(dIx: i32) {
 // ones iterate to a fixpoint until the tentative set stops shrinking, and what remains is genuinely base-case-less.
 function inferReturnsPrePass() {
   if topUnannotFns.length == 0 { return 0 }
-  if prbArmed { prbEnter() }
-  inferQuiet = true
-  quietDepth = quietDepth + 1
-  const m = checkMark()
-  const savedSym = symEnabled
-  symEnabled = 0
+  const run = quietRunOpen()
   for f in inferCycleMembers(topUnannotFns) { preInferOne(f) }
   let shrinking = true
   let rounds = 0
@@ -252,15 +248,9 @@ function inferReturnsPrePass() {
     unresolvedFns.push(inferTentative[u])
     u = u + 1
   }
-  symEnabled = savedSym
-  if prbSkip == 1 {
-    checkRollback(m, RB_LINT)
-  } else {
-    checkRollback(m, RB_RETURNS)
-  }
-  inferQuiet = false
-  quietDepth = quietDepth - 1
-  if prbArmed { prbLeave("inferReturnsPrePass") }
+  quietRunEnd(run)
+  const set = if prbSkip == 1 { RB_LINT } else { RB_RETURNS }
+  quietRunDrop(run, set, "inferReturnsPrePass")
   0
 }
 
@@ -270,13 +260,7 @@ function inferReturnsPrePass() {
 // `never` or a hole other than a function's, keeps the placeholder for pass 2.
 function globalInitPrePass(lets: i32[]) {
   if lets.length == 0 { return 0 }
-  if prbArmed { prbEnter() }
-  const savedQuiet = inferQuiet
-  const savedSym = symEnabled
-  const m = checkMark()
-  inferQuiet = true
-  quietDepth = quietDepth + 1
-  symEnabled = 0
+  const r = quietRunOpen()
   for li in lets {
     const ln = nodeAt(li)
     // A lambda with an un-annotated parameter is marked first, as pass 2 marks it, so its
@@ -317,11 +301,8 @@ function globalInitPrePass(lets: i32[]) {
       }
     }
   }
-  inferQuiet = savedQuiet
-  quietDepth = quietDepth - 1
-  symEnabled = savedSym
-  checkRollback(m, RB_GLOBAL_INIT)
-  if prbArmed { prbLeave("globalInitPrePass") }
+  quietRunEnd(r)
+  quietRunDrop(r, RB_GLOBAL_INIT, "globalInitPrePass")
   0
 }
 
@@ -348,13 +329,7 @@ function cstrProbeBefore(stmt: i32) {
   // The statement itself is checked for real next, so outside a cycle it needs no probe.
   if !cyc && order.length > 0 && order[order.length - 1] == stmt { order.pop() }
   if order.length == 0 { return 0 }
-  if prbArmed { prbEnter() }
-  const m = checkMark()
-  const savedSym = symEnabled
-  const savedQuiet = inferQuiet
-  symEnabled = 0
-  inferQuiet = true
-  quietDepth = quietDepth + 1
+  const r = quietRunOpen()
   cstrProbeSet(true)
   let rounds = 0
   let growing = true
@@ -368,11 +343,8 @@ function cstrProbeBefore(stmt: i32) {
     growing = cyc && cstrRowCount() > before
   }
   cstrProbeSet(false)
-  inferQuiet = savedQuiet
-  quietDepth = quietDepth - 1
-  symEnabled = savedSym
-  checkRollback(m, RB_CSTR_PROBE)
-  if prbArmed { prbLeave("cstrProbeBefore") }
+  quietRunEnd(r)
+  quietRunDrop(r, RB_CSTR_PROBE, "cstrProbeBefore")
   0
 }
 
@@ -516,7 +488,9 @@ function progCheckCalleeFirst(
     const own = !all && k > j && (!eager || ownFactsStand(d))
     const first = k >= 0
       && !done[k]
-      && (all || (own && (retPending(d) || weSummaryUnsettled(d))))
+      && (all
+      || (own && (retPending(d) || weSummaryUnsettled(d)))
+      || (k > j && fnWritesHoleParam(d)))
     crAskForSet(-1)
     if first { progCheckCalleeFirst(stmts, k, stmtAt, done, all) }
   }
@@ -1058,4 +1032,53 @@ function progHoistValues(stmts: i32[]): i32[] {
     mi = mi + 1
   }
   phLets
+}
+
+// Whether top-level function `d` writes an element into an un-annotated parameter by name: a
+// `push`/`unshift`/`add`/`set` on it or a store into one of its cells, the first write that
+// decides the element (D2218), so a call's replay of it needs the body checked first.
+function fnWritesHoleParam(d: i32): boolean {
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) { return false }
+  const names: string[] = []
+  for p in fd.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { names.push(pn.parName) }
+  }
+  if names.length == 0 { return false }
+  const todo: i32[] = [fd.fnBody]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix < 0 || ix >= P.nodes.length { continue }
+    const n = nodeAt(ix)
+    if n is Call && addsTo(n.callFn, names) { return true }
+    if n is BinExpr && n.binOp == "=" && storesInto(n.binLeft, names) {
+      return true
+    }
+    nodeChildrenPush(ix, todo)
+  }
+  false
+}
+
+// Whether callee `ix` is a cell write on one of `names`: `p.push`, `unshift`, `add` or `set`.
+function addsTo(ix: i32, names: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const t = nodeAt(ix)
+  if !(t is Member) { return false }
+  const p = t.memProp
+  (p == "push" || p == "unshift" || p == "add" || p == "set")
+    && identIn(t.memObj, names)
+}
+
+// Whether store target `ix` is a cell of one of `names`, `p[k]`.
+function storesInto(ix: i32, names: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const t = nodeAt(ix)
+  t is Index && identIn(t.idxArr, names)
+}
+
+function identIn(ix: i32, names: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  n is Ident && strListHas(names, n.identName)
 }
