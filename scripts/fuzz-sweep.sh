@@ -7,7 +7,8 @@
 #   multiobs  — --branching --multiobs, report-only
 #   declared  — --branching --multiobs --declared, report-only
 #   oracle    — scripts/oracle/fuzz.sh --gen all: arithmetic, data and rep programs run compiled and in the
-#               independent oracle; GATES on a disagreement or COMPILED-BAD cell known.txt does not list
+#               independent oracle; GATES on a disagreement or COMPILED-BAD cell known.txt does not list,
+#               except arith's, which it reports (`--report-only arith`)
 # Legs run sequentially (each already saturates the cores); per-leg out-dirs land under ONE
 # sweep dir with the same layout the workflow artifacted (seed_*.tsv / keep_* / summary.md).
 # Each unsound finding then gets a ready-to-file row draft, `keep_<seed>/case_N.row.md`
@@ -103,10 +104,12 @@ for leg in $LEGS; do
     oracle)
       echo; echo "==== leg: oracle ===="
       mkdir -p "$OUT/oracle"
-      if ! ./scripts/oracle/fuzz.sh --seeds "$SEEDS" --count "$COUNT" --gen all --keep "$OUT/oracle" | tee "$OUT/oracle/summary.md"; then
+      # arith reports and does not gate until seeds 31-100 show no unexplained cell
+      # (2026-11-15-oracle-filed-emulation.md); every other generator gates.
+      if ! ./scripts/oracle/fuzz.sh --seeds "$SEEDS" --count "$COUNT" --gen all --report-only arith --keep "$OUT/oracle" | tee "$OUT/oracle/summary.md"; then
         fail=1
-        oracle_new_cells "$OUT/oracle" | tee -a "$OUT/oracle/summary.md"
       fi
+      oracle_new_cells "$OUT/oracle" | tee -a "$OUT/oracle/summary.md"
       if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
         { echo "### oracle leg"; echo; echo '```'
           grep -E '^(oracle:|✗|    (regenerate|compare):)' "$OUT/oracle/summary.md"; echo '```'

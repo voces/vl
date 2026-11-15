@@ -632,6 +632,7 @@ import {
   helpMapCompactFn,
   helpMapEntryFn,
   helpMapEntryI32Fn,
+  helpMapGetFn,
   helpMapProbeFn,
   helpMapProbeI32Fn,
   helpMapProbeI64Fn,
@@ -3575,9 +3576,14 @@ function rcRecListsApart(st: i32, dt: i32): boolean {
   const sa = tyAt(st)
   const da = tyAt(dt)
   if !(sa is TyArray) || !(da is TyArray) { return false }
-  const se = tyElemOf(sa)
-  const de = tyElemOf(da)
+  const se0 = tyElemOf(sa)
+  const de0 = tyElemOf(da)
+  // A list of nullable records is copied as its records, each null kept (D16613).
+  const nul = nullableInnerOrNone(se0) >= 0 && nullableInnerOrNone(de0) >= 0
+  const se = if nul { nullableInnerOrNone(se0) } else { se0 }
+  const de = if nul { nullableInnerOrNone(de0) } else { de0 }
   if se < 0 || de < 0 || !(tyAt(de) is TyObj) { return false }
+  if nul && !(tyAt(se) is TyObj) { return false }
   // A list of a union of records is copied arm by arm (`emitRowUnionElemCopy`).
   if tyAt(se) is TyUnion {
     return rcRowOfTy(de) >= 0 && rcArmRows(se).length > 0
@@ -3615,8 +3621,12 @@ function emitRecListCopyTop(
 ): i32 {
   const sa = tyAt(st)
   const da = tyAt(dt)
-  const se = if sa is TyArray { tyElemOf(sa) } else { -1 }
-  const de = if da is TyArray { tyElemOf(da) } else { -1 }
+  const se0 = if sa is TyArray { tyElemOf(sa) } else { -1 }
+  const de0 = if da is TyArray { tyElemOf(da) } else { -1 }
+  // A nullable element is copied as its record, a null stored as the destination's null.
+  const nul = nullableInnerOrNone(se0) >= 0 && nullableInnerOrNone(de0) >= 0
+  const se = if nul { nullableInnerOrNone(se0) } else { se0 }
+  const de = if nul { nullableInnerOrNone(de0) } else { de0 }
   const arms = if se >= 0 && se < T.tys.length && tyAt(se) is TyUnion { rcArmRows(se) } else { [] }
   const ssi = if arms.length > 0 { variantRowOf(arms[0]) } else { rcRowOfTy(se) }
   const dsi = rcRowOfTy(de)
@@ -3655,6 +3665,16 @@ function emitRecListCopyTop(
   emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
   fbLocalGet(dL)
   fbLocalGet(iL)
+  if nul {
+    fbLocalGet(sL)
+    fbStructGet(srcWrap, 0)
+    fbLocalGet(iL)
+    fbArrayGet(srcBack)
+    fbRefIsNull()
+    fbIfRefNul(sHeapIdx[dsi], true)
+    fbRefNull(sHeapIdx[dsi])
+    fbElse()
+  }
   const was = rcElem
   rcElem = rcElemNone()
   rcElem.src = se
@@ -3681,6 +3701,7 @@ function emitRecListCopyTop(
   rcElem = was
   if r < 0 { return -1 }
   if arms.length == 0 { fbStructNew(sHeapIdx[dsi]) }
+  if nul { fbEnd() }
   fbArraySet(dstBack)
   emitCopyLoopClose(iL, dL, nL, dstWrap)
   return 0
@@ -14955,8 +14976,12 @@ function defExprNullable(ix: i32) {
 // reads a map through `?? -1`, so this is the primary get. `rk` is the `??`'s own atom kind
 // (-1 none): a scalar value it is wider than is read and widened to it (D10091).
 function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
-  if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
   const wvk = mapRecvScalarKindInst(recvIx, fnIx)
+  if !(wvk >= 0 && coalWidens(wvk, rk)) {
+    const miss = mapGetOrHelperMiss(recvIx, defIx, fnIx)
+    if miss.length == 1 { return emitMapGetCall(recvIx, keyIx, fnIx, miss[0]) }
+  }
+  if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
   if wvk >= 0 && coalWidens(wvk, rk) && !defExprNullable(defIx) {
     pushMapScr(5)                // entry
     fbIf(valBlockTypeOfKind(rk)) // if (entry != 0 → found), the result's blocktype
@@ -15250,8 +15275,80 @@ function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
 // `0` when absent. The checker never uses a bare map get (always `?? -1`); provided for
 // completeness so `m[k]` in value position is total (0 default).
 function emitMapGet(recvIx: i32, keyIx: i32, fnIx: i32) {
+  if mapGetHelperShape(recvIx, fnIx) != 0 {
+    return emitMapGetCall(recvIx, keyIx, fnIx, mapGetMissOf(recvIx, fnIx))
+  }
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
   return emitMapGetTail(recvIx, fnIx)
+}
+
+// `recvIx[keyIx]` through `__map_get_<row>__`, `miss` on a miss; `mapGetHelperShape` is nonzero.
+function emitMapGetCall(recvIx: i32, keyIx: i32, fnIx: i32, miss: i32) {
+  const sh = mapGetHelperShape(recvIx, fnIx)
+  const strKey = mapShapeKeyKind(sh) == MAP_KEY_STR
+  // The helper's own calls are minted here, while the tail rows are still open.
+  if strKey {
+    helpStrHashFn()
+    helpStrEqFn()
+  }
+  const fi = helpMapGetFn(sh, miss, strKey)
+  if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
+  return fbCall(fi)
+}
+
+// `[d]` when `recvIx[k] ?? defIx` can read through `__map_get_<row>__` with `d` as its miss: a
+// mono-valued map with no null sentinel, and a default that lowers to one `i32.const d`. Else [].
+function mapGetOrHelperMiss(recvIx: i32, defIx: i32, fnIx: i32): i32[] {
+  if mapGetHelperShape(recvIx, fnIx) == 0 { return [] }
+  const mt = mapRecvTyIn(recvIx, fnIx)
+  if (
+    mapTyValIsNulLitUnion(mt)
+    || mapTyValIsNulBool(mt)
+    || mapTyValIsNullUnit(mt)
+  ) {
+    return []
+  }
+  if mapTyValLitUnionTexts(mt).length > 0 { return [] }
+  const d = nodeAt(unwrapParen(defIx))
+  let lit = d is NumLit
+  if d is Unary { lit = nodeAt(unwrapParen(d.unArg)) is NumLit }
+  if !lit { return [] }
+  const ins: u8[] = []
+  const prev = wTarget(ins)
+  const rc = emitMonoMapDefault(recvIx, defIx, fnIx)
+  wTarget(prev)
+  if rc < 0 || !isOneConstIns(ins) || (ins[0] as i32) != 0x41 { return [] }
+  return [slebI32At(ins, 1)]
+}
+
+// The signed LEB128 i32 at `at` in `b`.
+function slebI32At(b: u8[], at: i32): i32 {
+  let v = 0
+  let sh = 0
+  let i = at
+  while i < b.length {
+    const x = b[i] as i32
+    v = v | ((x & 127) << sh)
+    sh = sh + 7
+    i = i + 1
+    if (x & 128) == 0 {
+      if sh < 32 && (x & 64) != 0 { v = v | (0 - (1 << sh)) }
+      return v
+    }
+  }
+  return v
+}
+
+// The mono-valued map shape a plain build reads `recvIx[k]` through `__map_get_<row>__` with, or
+// 0 to probe at the site: `-O` keeps the read inline for binaryen, an i64 key and a valued map
+// (an mv slot, `>= 0`) keep their own reads.
+function mapGetHelperShape(recvIx: i32, fnIx: i32): i32 {
+  if gOptimized != 0 || !exprMap(recvIx, fnIx) { return 0 }
+  const sh0 = mapShapeOfExpr(recvIx, fnIx)
+  if sh0 == -3 { return 0 }
+  const sh = mapShapeFoldSet(sh0)
+  if sh >= 0 || mapShapeKeyKind(sh) == MAP_KEY_I64 { return 0 }
+  return sh
 }
 
 // The value half of `emitMapGet`, after `emitMapPrep`: the stored value on a hit, the rep's
@@ -15291,29 +15388,30 @@ function emitMapGetTail(recvIx: i32, fnIx: i32) {
   fbI32Const(1)
   fbI32Bin(107) // i32.sub (entry - 1)
   fbArrayGet(aTy())
-  fbElse()      // else — a miss reads as the rep's empty value. For a NICHE-BEARING
-  // A niche-bearing value map (`K`/`K | null` atoms, `boolean`/`boolean | null`) reads
-  // a miss as its sentinel (`-1` litunion, `2` boolean) at both the nullable and the
-  // non-nullable spelling — yielding plain `0` there would collide with a real member
-  // (atom id 0, or `false`) and make `m[missing] == <that value>` silently true.
+  fbElse()      // else — a miss reads as the rep's empty value (`mapGetMissOf`)
+  fbI32Const(mapGetMissOf(recvIx, fnIx))
+  fbEnd()       // end
+  return 0
+}
+
+// The i32 a mono-valued map read `recvIx[k]` yields on a miss. A niche-bearing value map (`K`/`K |
+// null` atoms, `boolean`/`boolean | null`) reads its sentinel (`-1` litunion, `2` boolean), since a
+// plain `0` would collide with a real member (atom id 0, or `false`); any other value reads 0.
+function mapGetMissOf(recvIx: i32, fnIx: i32): i32 {
   let gtMt = mapRecvTyIn(recvIx, fnIx)
   // A type parameter's value takes its sentinel from the instance's binding of it (D10360).
   if gtMt >= 0 && tyHasTyVar(gtMt) {
     const inst = nodeTyInOf(unwrapParen(recvIx), fnIx)
     if inst >= 0 && inst < T.tys.length && tyAt(inst) is TyMap { gtMt = inst }
   }
-  if mapTyValIsNulLitUnion(gtMt) || mapTyValIsLitUnion(gtMt) {
-    fbI32Const(0 - 1)
-  } else if (
+  if mapTyValIsNulLitUnion(gtMt) || mapTyValIsLitUnion(gtMt) { return 0 - 1 }
+  if (
     mapTyValIsNulBool(gtMt)
     || mapTyValIsBool(gtMt)
     || mapTyValIsNullUnit(gtMt)
   ) {
-    fbI32Const(2)
-  } else {
-    fbI32Const(0) // i32.const 0
+    return 2
   }
-  fbEnd() // end
   return 0
 }
 
@@ -28505,10 +28603,13 @@ function asgParkField(k: VKind | null, owner: i32) {
     "f32" => {
       lk = "f32list"
     }
+    "v128" => {
+      lk = "v128list"
+    }
     "str" => {
       lk = "strlist"
     }
-    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" | "u8list" => {
+    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
       return asgParkNone()
     }
   }
