@@ -23,7 +23,6 @@ import {
   RetStmt,
   Unary,
   WhileStmt,
-  callIsNever,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
@@ -50,7 +49,7 @@ import {
 import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { irVerify } from "./ir_verify"
 import { irDualEmit, irHexOf, irLoweredEntry } from "./ir_lower"
-import { globalReadRecovers } from "./wasmEmit"
+import { callEndsNever, globalReadRecovers } from "./wasmEmit"
 import { repNodeGen, repNodeOfTy } from "./emit_rep"
 import { nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import {
@@ -316,13 +315,11 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   const d = identDeclOf(ix)
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
-  if (dn is LetDecl || dn is Param) && localIndexOf(ibFnIx, ix) >= 0 {
-    const v = irBDeclVar(d)
+  const w = localIndexOf(ibFnIx, ix)
+  if (dn is LetDecl || dn is Param) && w >= 0 {
+    // A parameter is found by its wasm index: an instance's read resolves to the template's.
+    const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
     if v < 0 { return irBMiss("local rep") }
-    // A parameter's variable always has a slot; an instance's read reaches the template's.
-    if dn is Param && ib.irVars[v].vSlot < 0 {
-      return irBMiss("instance parameter read")
-    }
     if ib.irVars[v].vRep != rep { return irBMiss("narrowed read") }
     const o: Opnd = { ov: v }
     return o
@@ -339,6 +336,14 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     )
   }
   return irBMiss("read of " + n.identName)
+}
+
+// The parameter variable holding wasm local `w`, or -1.
+function paramVarAt(w: i32): i32 {
+  for v in ib.irParams {
+    if ib.irVars[v].vSlot == w { return v }
+  }
+  return -1
 }
 
 // The rep of global `g`, declared at `d`, noted in `ib`; -1 when it is no scalar.
@@ -391,8 +396,8 @@ function calleeSig(pos: i32): boolean {
   return true
 }
 
-// A direct call of a declared, capture-free function by name; its arguments by position.
-function callRhs(b: i32[], c: Call): Rhs {
+// A direct call `ix` of a declared, capture-free function by name; its arguments by position.
+function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callFn < 0 || hasNamedArgs(c.callArgNames) {
     return missRhs("named call")
   }
@@ -423,7 +428,7 @@ function callRhs(b: i32[], c: Call): Rhs {
       i = i + 1
     }
   }
-  const r: Rhs = { caCallee: pos, caArgs: args }
+  const r: Rhs = { caCallee: pos, caArgs: args, caNever: callEndsNever(ix) }
   return r
 }
 
@@ -494,8 +499,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
   }
   if n is Call {
-    if callIsNever(ix) { return irBMiss("never-returning callee") }
-    const rhs = callRhs(b, n)
+    const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return irBMiss("call") }
     return irBLetTemp(b, rhs, ix, rep)
   }
@@ -687,9 +691,7 @@ function stmtIn(b: i32[], ix: i32) {
     return 0
   }
   if n is Call {
-    // Legacy writes `unreachable` after a call that never returns, and never tail-calls it.
-    if callIsNever(ix) { return skip("never-returning callee") }
-    const rhs = callRhs(b, n)
+    const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return 0 }
     irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
     return 0
