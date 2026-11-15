@@ -3400,6 +3400,8 @@ function parseFuncBodyAndBuild(
   const lblBlkSaved = lblIsBlk
   lblNames = []
   lblIsBlk = []
+  arrowBody = arrowNext
+  arrowNext = false
   const fix = parseFuncBodyInner(name, typarams, params, ret, nameTok, funcPos)
   lblNames = lblSaved
   lblIsBlk = lblBlkSaved
@@ -3444,8 +3446,10 @@ function parseFuncBodyInner(
     snl = kindAt(scan) == "NEWLINE"
   }
   const emptyBraces = kindAt(scan) == "RBRACE"
-  // A1: under the return rule, braces after a signature are always a block.
-  if !emptyBraces && !(RETURN_RULE && RR_A1) && looksLikeObject(P.pos) {
+  // A1: under the return rule a `function` body's braces are a block, and an arrow's are an
+  // object exactly when they hold a field list (`looksLikeFieldList`).
+  const objBody = if RETURN_RULE && RR_A1 { arrowBody && looksLikeFieldList(P.pos) } else { !emptyBraces && looksLikeObject(P.pos) }
+  if objBody {
     const oe = parseExpr()
     const ostmts: i32[] = []
     ostmts.push(oe)
@@ -3624,6 +3628,7 @@ function parseArrowLambda(p0: i32) {
   expect("EQUAL") // the `=` of `=>`
   expect("GT")    // the `>` of `=>`
   const noTyParams: string[] = []
+  arrowNext = true
   const f = parseFuncBodyAndBuild("", noTyParams, params, ret, -1, p0)
   // `=> { name }` is a body yielding the name, never a record, as in JavaScript.
   if f >= 0 && f < P.nodes.length {
@@ -4809,6 +4814,58 @@ function oldLabelFieldNote(keyTok: i32) {
 // newlines: `}`, IDENT or STRING then `:`, IDENT then `,`, or IDENT then a balanced `( … )`
 // and `{` is an object; a statement keyword or anything else is a block. A label is `@name`,
 // so `{ name: … }` and `{ name, … }` are objects wherever a body admits one.
+// Whether the next body parsed follows `=>` (`arrowNext`, set by `parseArrowLambda`), and whether
+// the body being decided does: there braces may open an object (A1). Read before any nested body.
+let arrowNext = false
+let arrowBody = false
+
+// Whether the `{` at token `bracePos` opens a field list: comma-separated `name`, `name: expr` or
+// `...expr`, with an optional trailing comma. Tokens only; `{}` is not one, it is a block.
+function looksLikeFieldList(bracePos: i32): boolean {
+  let i = nlSkipFrom(bracePos + 1)
+  if kindAt(i) == "RBRACE" { return false }
+  while true {
+    const k = kindAt(i)
+    if k == "IDENT" {
+      i = nlSkipFrom(i + 1)
+      if kindAt(i) == "COLON" { i = skipFieldExpr(i + 1) }
+    } else if k == "ELLIPSIS" {
+      i = skipFieldExpr(i + 1)
+    } else {
+      return false
+    }
+    if i < 0 { return false }
+    i = nlSkipFrom(i)
+    if kindAt(i) == "RBRACE" { return true }
+    if kindAt(i) != "COMMA" { return false }
+    i = nlSkipFrom(i + 1)
+    if kindAt(i) == "RBRACE" { return true }
+  }
+  false
+}
+
+// The first token at or after `i` that is not a line break.
+function nlSkipFrom(i: i32): i32 {
+  let j = i
+  while kindAt(j) == "NEWLINE" { j = j + 1 }
+  j
+}
+
+// The token ending a field's expression from `i`: the `,` or `}` at bracket depth 0, or -1.
+function skipFieldExpr(i: i32): i32 {
+  let j = i
+  let d = 0
+  while true {
+    const t = kindAt(j)
+    if t == "EOF" { return -1 }
+    if d == 0 && (t == "COMMA" || t == "RBRACE") { return j }
+    if t == "LBRACE" || t == "LBRACK" || t == "LPAREN" { d = d + 1 }
+    if t == "RBRACE" || t == "RBRACK" || t == "RPAREN" { d = d - 1 }
+    j = j + 1
+  }
+  -1
+}
+
 function looksLikeObject(bracePos: i32) {
   let i = bracePos + 1
   let going = kindAt(i) == "NEWLINE"
