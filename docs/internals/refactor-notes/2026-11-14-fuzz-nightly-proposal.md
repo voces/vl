@@ -39,5 +39,5 @@ populated, every leg exited 0 on that run's own findings (4 + 2 + 3 + 7 filed), 
 
 ## The filed list
 
-`scripts/fuzz-filed.txt` and the triage that populated it (D16314–D16317, named set
-`fuzz-2026-11-14b`) are in [2026-11-14-fuzz-triage-d16314](2026-11-14-fuzz-triage-d16314.md).
+The list the workflow reads, and the triage that populated it, are the separate fuzz-triage
+refactor note of 2026-11-14.

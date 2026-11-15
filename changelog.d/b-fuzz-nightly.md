@@ -1,3 +1,3 @@
 ## Infrastructure (Track F)
 
-- **fuzz-nightly, proposed nightly:** one `fuzz-sweep.sh` over every leg at 50 seeds on a 4-vCPU runner, each leg gating, red only on an unsound finding no open row files (`--filed scripts/fuzz-filed.txt`; `--gate-all`); row drafts ship in the artifact.
+- **fuzz-nightly, proposed nightly:** one `fuzz-sweep.sh` over every leg at 50 seeds on a 4-vCPU runner, each leg gating, red only on an unsound finding no open row files (`fuzz-nightly.sh --filed`, `fuzz-sweep.sh --gate-all`); row drafts ship in the artifact.
