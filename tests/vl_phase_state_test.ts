@@ -150,6 +150,7 @@ Deno.test({
 const ARENA = `export function tyPinElem(t: i32, v: i32): i32 { t + v }
 export function tyPinKey(t: i32, v: i32): i32 { t + v }
 export function tyPinVal(t: i32, v: i32): i32 { t + v }
+export function tyAt(t: i32): i32 { t }
 export function tyLinkElem(a: i32, b: i32): boolean { a == b }
 export function tyLinkKey(a: i32, b: i32): boolean { a == b }
 export function tyLinkVal(a: i32, b: i32): boolean { a == b }
