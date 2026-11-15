@@ -152,6 +152,13 @@ export function tyPinKey(t: i32, v: i32): i32 { t + v }
 export function tyPinVal(t: i32, v: i32): i32 { t + v }
 export function tyOpen(t: i32): boolean { t < 0 }
 export function declKeyOf(t: i32): i32 { t }
+export function holeReset(): i32 { 0 }
+export function tyElemOf(t: i32): i32 { t }
+export function tyKeyOf(t: i32): i32 { t }
+export function tyValOf(t: i32): i32 { t }
+export function tyElemOpen(t: i32): boolean { t < 0 }
+export function tyKeyOpen(t: i32): boolean { t < 0 }
+export function tyValOpen(t: i32): boolean { t < 0 }
 export function judge(t: i32): i32 { t }
 `;
 const ARENA_USER = `import { judge, tyPinElem } from "./check_types"

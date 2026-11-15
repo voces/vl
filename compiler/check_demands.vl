@@ -161,9 +161,11 @@ import {
   voidRetRwRet,
 } from "./check_core_state"
 import {
+  rcwPinDecl,
   rcwPinDstTy,
   rcwPinFn,
-  rcwPinNote,
+  rcwPinNoteAt,
+  rcwPinPi,
   rcwPinSrc,
   rcwPinSrcTy,
 } from "./check_covar_pins"
@@ -488,13 +490,15 @@ import {
   strLitAsSet,
   tyAt,
   tyBuiltinIndexable,
+  tyElemOf,
+  tyElemOpen,
   tyEq,
   tyHasHole,
   tyIsHole,
   tyIsLitUnion,
+  tyKeyOf,
   tyMentionsErr,
   tyMentionsTyVarNamed,
-  tyOpen,
   tyPinElem,
   tyPinVal,
   tyPrintsAsRef,
@@ -502,6 +506,8 @@ import {
   tySame,
   tyToStr,
   tyToStrUser,
+  tyValOf,
+  tyValOpen,
 } from "./check_types"
 import { unionFieldGapNote } from "./check_union_arm_msgs"
 import { mkUnionTy } from "./check_union_mint"
@@ -510,6 +516,7 @@ import {
   wsDecl,
   wsIsIdent,
   wsNoDecl,
+  wsNotePendingAt,
   wsOrigAnn,
   wsRowOf,
 } from "./check_width"
@@ -801,7 +808,7 @@ function wsInnerRec(t: i32) {
       return tt.nInner
     }
     TyArray => {
-      return tt.aElem
+      return tyElemOf(tt)
     }
     TyObj | TyVar => {
       return t
@@ -820,7 +827,7 @@ function wsInnerArg(at: i32, expected: i32) {
   const a = tyAt(at)
   match et {
     TyArray => {
-      return if a is TyArray { a.aElem } else { -1 }
+      return if a is TyArray { tyElemOf(a) } else { -1 }
     }
     TyNullable => {
       return if a is TyNullable { a.nInner } else { at }
@@ -1172,7 +1179,13 @@ export function validateRcwPins(
       if sub >= 0 && sub != rcwPinSrcTy[i] {
         if tyHasHole(sub) {
           if tyAt(sub) is TyVar && cstrOwnerTop() >= 0 {
-            rcwPinNote(rcwPinSrc[i], sub, rcwPinDstTy[i])
+            rcwPinNoteAt(
+              rcwPinSrc[i],
+              sub,
+              rcwPinDstTy[i],
+              rcwPinDecl[i],
+              rcwPinPi[i],
+            )
           }
         } else if !inferQuiet && assignable(sub, rcwPinDstTy[i]) {
           // The delivery seam's two record rules, in its order: a shape stored differently,
@@ -1183,6 +1196,8 @@ export function validateRcwPins(
           // built at its field's destination (D15184).
           if pinLitFieldArgs(rcwPinSrc[i], sub, rcwPinDstTy[i], at) {
             // handled field by field
+          } else if rcwPinWidthNote(i, sx, sub) {
+            // a wider row into a declared record parameter, made generic after this pass (D16219)
           } else if objShapeAdapterlessAt(sx, sub, rcwPinDstTy[i]) {
             objShapeAdapterlessErr(rcwPinSrc[i], sub, rcwPinDstTy[i])
           } else {
@@ -1201,6 +1216,17 @@ export function validateRcwPins(
   0
 }
 
+// Notes pin `i`'s delivery of `sx`, typed `sub` at this call, as a width candidate when it fills a
+// declared record parameter that refuses `sub` only for its extra fields; true if it did.
+function rcwPinWidthNote(i: i32, sx: i32, sub: i32): boolean {
+  const d = rcwPinDecl[i]
+  if d < 0 || inferQuiet { return false }
+  const name = wsCandidateAt(d, rcwPinPi[i], sx, sub, rcwPinDstTy[i])
+  if name == "" { return false }
+  wsNotePendingAt(d, rcwPinPi[i], name)
+  true
+}
+
 // `srcExpr < 0` (a dispatch probe with no argument node — a UFCS receiver, an operator
 // operand) checks the type alone, so the literal-aware / rep-sidecar recording in
 // `assignableExpr` is not driven by a node index it does not have.
@@ -1216,10 +1242,10 @@ function holeMapNullValAt(hm: i32, at: i32): i32 {
   const d = tyAt(hm)
   const a = tyAt(at)
   if d is TyMap {
-    if !cnhIsOpen(d.mVal) { return hm }
+    if !cnhIsOpen(tyValOf(d)) { return hm }
     if a is TyMap {
-      if !tyOpen(a.mVal) && assignable(TY_NULL, a.mVal) {
-        return mkMapTy(d.mKey, a.mVal, d.mSet)
+      if !tyValOpen(a) && assignable(TY_NULL, tyValOf(a)) {
+        return mkMapTy(tyKeyOf(d), tyValOf(a), d.mSet)
       }
     }
   }
@@ -1233,9 +1259,9 @@ function holeMapArgNullPin(hm: i32, at: i32, srcExpr: i32) {
   const d = tyAt(hm)
   const a = tyAt(at)
   if d is TyMap {
-    if !cnhIsOpen(d.mVal) { return 0 }
+    if !cnhIsOpen(tyValOf(d)) { return 0 }
     if a is TyMap {
-      if tyOpen(a.mVal) {
+      if tyValOpen(a) {
         tyPinVal(a, cnhPinTy(TY_NULL, srcExpr, srcExpr, true, false))
       }
     }
@@ -1261,7 +1287,7 @@ export function holeKidMapDemands(hole: i32, at: i32, depth: i32) {
       if ao is TyObj { sub = objFieldType(ao, hdField[row]) }
     } else if row >= 0 && (hdKind[row] == HD_ELEM || hdKind[row] == HD_ELEMV) {
       const aa = tyAt(at)
-      if aa is TyArray { sub = aa.aElem }
+      if aa is TyArray { sub = tyElemOf(aa) }
     } else {
       sub = nonNullTy(at)
     }
@@ -1905,10 +1931,10 @@ export function validateArrDefCstrs(
       const lt = arrDefCstr.ty[ci]
       const l = tyAt(lt)
       if l is TyArray {
-        if !tyOpen(l.aElem) && tyHasHole(l.aElem) {
-          const el = substTyDeep(l.aElem, bNames, bTys)
+        if !tyElemOpen(l) && tyHasHole(tyElemOf(l)) {
+          const el = substTyDeep(tyElemOf(l), bNames, bTys)
           if tyHasHole(el) {
-            if el != l.aElem && calleeFn >= 0 {
+            if el != tyElemOf(l) && calleeFn >= 0 {
               noteArrDefCstr(mkArrayTy(el), arrDefCstr.ix[ci])
             }
           } else if (
@@ -2090,12 +2116,12 @@ function cnhPinBmElem(
   }
   const a = tyAt(arr)
   if a is TyArray {
-    if tyOpen(a.aElem) {
+    if tyElemOpen(a) {
       let pin = got
       if !nhOpen(got) { pin = cnhPinTy(got, at, -1, false, false) }
       tyPinElem(a, pin)
     } else if !nhOpen(got) {
-      cnhFill(a.aElem, got)
+      cnhFill(tyElemOf(a), got)
     }
   }
   0
@@ -3386,10 +3412,12 @@ function stdRecvFitsOne(
     if t is TyArray {
       if !ro && t.aRead != 0 { return false }
       const inner = sp.slice(0, sp.length - 2)
-      if strListHas(tps, inner) { return !primIsSubWord(primNameOf(t.aElem)) }
-      if tyOpen(t.aElem) { return false }
-      return stdRecvFitsOne(inner, tps, t.aElem, false)
-        && stdRecvLeafExact(inner, t.aElem)
+      if strListHas(tps, inner) {
+        return !primIsSubWord(primNameOf(tyElemOf(t)))
+      }
+      if tyElemOpen(t) { return false }
+      return stdRecvFitsOne(inner, tps, tyElemOf(t), false)
+        && stdRecvLeafExact(inner, tyElemOf(t))
     }
     return false
   }
@@ -3695,7 +3723,7 @@ function bareBraceDeliverElems(elems: i32[], dstTy: i32, depth: i32): boolean {
   let any = false
   let k = 0
   while k < elems.length {
-    if bareBraceDeliver(elems[k], aa.aElem, depth - 1, false) { any = true }
+    if bareBraceDeliver(elems[k], tyElemOf(aa), depth - 1, false) { any = true }
     k = k + 1
   }
   any
