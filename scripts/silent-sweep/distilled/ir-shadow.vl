@@ -1,0 +1,210 @@
+// The IR shadow over the distilled corpus: every cell in `cells/` and `named/` is built with
+// `$VL_IR_SHADOW=1` and the shadow's `[ir]` rows are summed.
+//
+//     vl run scripts/silent-sweep/distilled/ir-shadow.vl -- [--seed P] [--write-baseline]
+//
+// It prints covered and matched, and every mismatch class with its count. It exits 1 on a
+// verifier failure, or on a mismatch class whose count is above `ir-shadow-baseline.txt` (a
+// class the baseline does not list counts as 0 there). A count that fell prints and passes,
+// and `--write-baseline` records the current counts. Exit 2 is the harness failing: a chunk
+// trapped or timed out, or the host printed no rows. Run it from the checkout root; chunks
+// run `$JOBS` at a time (default 4).
+
+import { IoError, readTextFile, writeTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { parseI32, toString } from "std:fmt"
+import { join, split, startsWith, trim } from "std:str"
+import { sort } from "std:array"
+import { die, envOr, fanOutArgv, hasFlag } from "../../lib/common"
+import { cellsIn, makeTempDir, spawn, writeText } from "../../lib/corpus"
+
+const HERE = "scripts/silent-sweep/distilled"
+const BASELINE = "scripts/silent-sweep/distilled/ir-shadow-baseline.txt"
+const PREFIX = "[ir] "
+const CHUNK = 200
+
+// The value after `flag` in the arguments, or `dflt`.
+function argOr(args: readonly string[], flag: string, dflt: string): string {
+  let i = 0
+  while i + 1 < args.length {
+    if args[i] == flag { return args[i + 1] }
+    i = i + 1
+  }
+  return dflt
+}
+
+// Every cell's path, sorted.
+function corpus(): string[] {
+  const out: string[] = []
+  for part in ["cells", "named"] {
+    for n in cellsIn(HERE + "/" + part) { out.push(HERE + "/" + part + "/" + n + ".vl") }
+  }
+  sort(out, (a: string, b: string) => a < b)
+  return out
+}
+
+// One row class and its count summed over the corpus.
+type Row = { key: string, n: i32 }
+
+// What a run measured: the rows by class, the cells that printed any, and the chunks that
+// did not finish (a trap or a timeout, as `vl check`'s exit code says).
+type Measured = { rows: Row[], cells: i32, broken: string[] }
+
+function bump(rows: Row[], key: string, n: i32) {
+  for r in rows {
+    if r.key == key {
+      r.n = r.n + n
+      return 0
+    }
+  }
+  rows.push({ key: key, n: n })
+  return 0
+}
+
+function countOf(rows: Row[], key: string): i32 {
+  for r in rows {
+    if r.key == key { return r.n }
+  }
+  return 0
+}
+
+// Adds the `[ir] <path>: <n>\t<row>` lines of one chunk's stderr into `m`. A verifier failure's
+// row carries its function's IR on the lines after it; only its first line is the class.
+function addRows(m: Measured, text: string) {
+  let last = ""
+  for line in split(text, "\n") {
+    if !startsWith(line, PREFIX) { continue }
+    const c = line.indexOf(": ")
+    const t = line.indexOf("\t")
+    if c < 0 || t < c { continue }
+    const path = line.slice(PREFIX.length, c)
+    const n = parseI32(trim(line.slice(c + 2, t)))
+    if n == null { continue }
+    if path != last {
+      m.cells = m.cells + 1
+      last = path
+    }
+    bump(m.rows, line.slice(t + 1, line.length), n ?? 0)
+  }
+  return 0
+}
+
+// Builds every cell under the armed shadow, `jobs` chunks at a time.
+function measure(paths: string[], seed: string, jobs: string): Measured {
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  const root = makeTempDir()
+  const chunks: string[] = []
+  let i = 0
+  while i < paths.length {
+    const f = root + "/chunk-" + toString(chunks.length)
+    const end = if i + CHUNK < paths.length { i + CHUNK } else { paths.length }
+    writeText(f, join(paths.slice(i, end), "\n") + "\n")
+    chunks.push(f)
+    i = end
+  }
+  writeText(root + "/chunks", join(chunks, "\n") + "\n")
+  // `$0` is the host, `$1` the seed and `$2` the chunk; each chunk's exit code lands beside it.
+  const sh = "VL_IR_SHADOW=1 timeout 1200 \"$0\" check --codegen --compiler \"$1\" $(cat \"$2\")"
+    + " > /dev/null 2> \"$2.err\"; echo $? > \"$2.rc\""
+  const x = spawn("sh", fanOutArgv(root + "/chunks", jobs, ["sh", "-c", sh, vl, seed]))
+  const m: Measured = { rows: [], cells: 0, broken: [] }
+  if x.code != 0 {
+    spawn("rm", ["-rf", root])
+    die("ir-shadow: the chunk fan-out failed (rc=\{x.code})\n\{x.err}", 2)
+  }
+  for f in chunks {
+    const rc = parseI32(trim(readOr(f + ".rc")))
+    // 0 and 1 are `vl check` grading the chunk; anything else is the chunk not finishing.
+    if rc != 0 && rc != 1 { m.broken.push(f + " (rc=\{toString(rc ?? -1)})") }
+    addRows(m, readOr(f + ".err"))
+  }
+  spawn("rm", ["-rf", root])
+  return m
+}
+
+function readOr(path: string): string {
+  const t = readTextFile(path)
+  if t is IoError { return "" }
+  return t
+}
+
+// The committed mismatch counts, one `<n>\t<class>` line each.
+function loadBaseline(): Row[] {
+  const rows: Row[] = []
+  const text = readTextFile(BASELINE)
+  if text is IoError { return rows }
+  for line in split(text, "\n") {
+    if line == "" || startsWith(line, "#") { continue }
+    const t = line.indexOf("\t")
+    if t < 0 { die("ir-shadow: \{BASELINE}: no tab in `\{line}`", 2) }
+    const n = parseI32(line.slice(0, t))
+    if n == null { die("ir-shadow: \{BASELINE}: no count in `\{line}`", 2) }
+    rows.push({ key: line.slice(t + 1, line.length), n: n ?? 0 })
+  }
+  return rows
+}
+
+// The rows whose class starts with `head`, by class.
+function classes(rows: Row[], head: string): Row[] {
+  const out: Row[] = []
+  for r in rows {
+    if startsWith(r.key, head) && r.n > 0 { out.push(r) }
+  }
+  sort(out, (a: Row, b: Row) => a.key < b.key)
+  return out
+}
+
+function writeBaseline(mm: Row[]) {
+  let text = "# IR shadow mismatches over the distilled corpus: vl run scripts/silent-sweep/distilled/ir-shadow.vl -- --write-baseline\n"
+  for r in mm { text = text + "\{r.n}\t\{r.key}\n" }
+  const w = writeTextFile(BASELINE, text)
+  if w != null { die("ir-shadow: cannot write \{BASELINE} (\{w.msg})", 2) }
+  print("wrote \{BASELINE}: \{mm.length} mismatch classes")
+  return 0
+}
+
+function main() {
+  const args = programArgs()
+  const seed = argOr(args, "--seed", "build/vl-compiler.wasm")
+  const paths = corpus()
+  if paths.length == 0 { die("ir-shadow: no cells under \{HERE}", 2) }
+  const m = measure(paths, seed, envOr("JOBS", "4"))
+  for b in m.broken { print("ir-shadow: chunk did not finish: \{b}") }
+  if m.cells == 0 {
+    die("ir-shadow: no `[ir]` rows; the seed or the host predates `$VL_IR_SHADOW`", 2)
+  }
+  print(
+    "ir shadow: \{m.cells} of \{paths.length} cells built; \{countOf(m.rows, "fns")} functions, \{countOf(m.rows, "covered")} covered, \{countOf(m.rows, "verified")} verified, \{countOf(m.rows, "matched")} matched",
+  )
+  const mm = classes(m.rows, "mismatch ")
+  const fails = classes(m.rows, "fail ")
+  for r in mm { print("  \{r.n}\t\{r.key}") }
+  for r in fails { print("  \{r.n}\t\{r.key}") }
+  if m.broken.length > 0 { exit(2) }
+  if hasFlag(args, "--write-baseline") {
+    if fails.length > 0 { die("ir-shadow: a verifier failure is never a baseline", 1) }
+    writeBaseline(mm)
+    return 0
+  }
+  const base = loadBaseline()
+  let red = fails.length > 0
+  for r in mm {
+    const was = countOf(base, r.key)
+    if r.n > was {
+      print("ir-shadow: \{r.key} rose: \{was} -> \{r.n}")
+      red = true
+    }
+  }
+  for b in base {
+    const now = countOf(mm, b.key)
+    if now < b.n {
+      print("ir-shadow: \{b.key} fell: \{b.n} -> \{now} (re-run with --write-baseline)")
+    }
+  }
+  if red { exit(1) }
+  print("ir-shadow: ok")
+  return 0
+}
+
+main()
