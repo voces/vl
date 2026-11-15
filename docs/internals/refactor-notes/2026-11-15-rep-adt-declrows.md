@@ -38,17 +38,23 @@ without.
 | corpus (12,037 cells, 8,684 reach emit): rebuilds after `passes` | 1,500 (1,393 `declRows`, 107 `tyMutEpoch`) | **107**, all `tyMutEpoch` |
 | corpus exit codes / module bytes changed | — | **0 / 0** |
 | self-build bytes | — | identical (fixpoint) |
-| guest fuel (`plumb-shape-cost.vl`) | FUEL_BEFORE | FUEL_AFTER |
+| guest fuel (`plumb-shape-cost.vl`) | 9,057,147,556 / 6,561,305,444 | 9,060,877,394 (+0.04%) / 6,563,841,022 (+0.04%) |
+| peak live heap | 120,046 / 84,103 KiB | 120,049 / 84,104 KiB |
 
 After this change, no emit-state input rebuilds the rep tree. The only cause left after `passes`
 is `tyMutEpoch` during monomorphization, in 103 programs, which lane H's per-instance holes
 (#8073) remove.
 
-Net compiler lines: +22 (`emit_rep.vl`). Pin-helper delta: 0.
+Net compiler lines: +24 (`emit_rep.vl`). Pin-helper delta: 0.
 
-## Not done here
+## The shared-instance trap, caught by the gate
 
-The four raw child reads from #8151 stay: three in `elabBoxedUnionsInto` and `rtGo`'s
-`t.aElem`. Master has `tyOpen` (#8155) but not yet the child accessors `tyElemOf`, `tyKeyOf`
-and `tyValOf`, which are still on lane H's hole-rows branch. These reads are child reads, not
-openness tests.
+The first version cleared `rtDeclSeen` only when the tree was rebuilt. A shared instance compiling
+a second program (the `cases_wasm` oracle, the instance-leak tests) reached `repDeclRowsPending`
+before its first rebuild. It then read the previous program's type indices: an array access out of
+bounds inside the compiler. Now:
+- every `repTreeDrop` clears the map, since a dropped tree's answers mean nothing;
+- a type index outside the arena reads as moved.
+
+The child reads in `elabBoxedUnionsInto` and `rtGo` came from master with #8162, already on
+`tyElemOf`, `tyKeyOf` and `tyValOf`.
