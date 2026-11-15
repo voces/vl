@@ -962,7 +962,9 @@ function wantFor(t: Tpl, pos: string, face: string): string {
   return w
 }
 
-type Cell = { verdict: string, detail: string }
+// `returnRule` is whether a refusal's whole text names the return rule; the detail is
+// only a slice of it.
+type Cell = { verdict: string, detail: string, returnRule: boolean }
 
 type Run = {
   vl: string,
@@ -993,7 +995,7 @@ function gradeAll(t: Tpl, seed: string, r: Run): Map<string, Cell> {
       if !b.ok {
         let reason = b.skip
         if reason == "" { reason = "no reason given" }
-        cells[key] = { verdict: "skipped", detail: reason }
+        cells[key] = { verdict: "skipped", detail: reason, returnRule: false }
         continue
       }
       const cid = "\{t.name}_\{pos}_\{face}"
@@ -1022,7 +1024,11 @@ function gradeAll(t: Tpl, seed: string, r: Run): Map<string, Cell> {
       ) {
         verdict = "OWED"
       }
-      cells[key] = { verdict: verdict, detail: detail }
+      cells[key] = {
+        verdict: verdict,
+        detail: detail,
+        returnRule: returnRuleRefusal(verdict, g.err),
+      }
     }
   }
   return cells
@@ -1039,8 +1045,29 @@ function short(c: Cell): string {
   return v + ": " + cpPrefix(replaceAll(c.detail, "\n", " "), 64)
 }
 
+// The return-rule diagnostics: a cell refused with one of these was refused for
+// the template's own spelling (a bare tail where `return` is owed), not for the
+// position it was meant to grade.
+const RETURN_RULE_MARKS = [
+  "only through `return`",
+  "with no `return`",
+  "write `return` before",
+  "cannot bind the void result",
+  "did you mean `return",
+]
+
+function returnRuleRefusal(verdict: string, err: string): boolean {
+  if !startsWith(verdict, "check refuses") && !startsWith(verdict, "emit refuses") {
+    return false
+  }
+  for m in RETURN_RULE_MARKS {
+    if contains(err, m) { return true }
+  }
+  return false
+}
+
 function cellAt(cells: Map<string, Cell>, key: string): Cell {
-  return cells[key] ?? { verdict: "", detail: "" }
+  return cells[key] ?? { verdict: "", detail: "", returnRule: false }
 }
 
 function table(
@@ -1228,6 +1255,7 @@ function main(args: string[]): i32 {
   let owedN = 0
   let other = 0
   let total = 0
+  let returnRuleN = 0
   const lostKeys: string[] = []
   const silentKeys: string[] = []
   const trapKeys: string[] = []
@@ -1249,6 +1277,7 @@ function main(args: string[]): i32 {
       } else {
         other = other + 1
         if c.verdict == "TRAP (program)" { trapKeys.push(key) }
+        if c.returnRule { returnRuleN = returnRuleN + 1 }
       }
       if hasBefore {
         if cellAt(before, key).verdict == "RUNS" && c.verdict != "RUNS" {
@@ -1290,7 +1319,21 @@ function main(args: string[]): i32 {
       "\nA TRAP (program) cell passed check and its built program trapped: clause 1.",
     )
   }
-  if lost.length > 0 || silent.length > 0 || traps.length > 0 { return 1 }
+  const graded = total - skippedN - owedN
+  const vacuous = graded > 0 && runs == 0 && returnRuleN == graded
+  if returnRuleN > 0 && !vacuous {
+    print(
+      "\n\{toString(returnRuleN)} cells are refused by the return rule: the template, not the position, is what they grade.",
+    )
+  }
+  if vacuous {
+    print(
+      "\ntemplate measures nothing: all \{toString(graded)} graded cells are refused by the return rule. Write `return` in its prelude and cells.",
+    )
+  }
+  if lost.length > 0 || silent.length > 0 || traps.length > 0 || vacuous {
+    return 1
+  }
   return 0
 }
 

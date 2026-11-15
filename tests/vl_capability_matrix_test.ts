@@ -432,6 +432,53 @@ Deno.test({
   },
 });
 
+// A template written before the return rule: the prelude's maker ends in a bare tail, so every
+// cell in both faces is refused at check for the template's spelling, not the position. A run
+// where before == after would otherwise exit 0 having measured nothing.
+const VACUOUS_TEMPLATE = `// A maker with a bare tail.
+// @@PRELUDE@@
+function __mk(): i32[] { [7] }
+// @@VALUE@@
+__mk()
+// @@TYPE@@
+i32[]
+// @@PROOF@@
+print(v[0])
+// @@WANT@@
+7
+`;
+
+Deno.test({
+  name: "matrix: a template whose every cell the return rule refuses measures nothing and exits 1",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_capability_matrix_vacuous_" });
+    try {
+      const t = `${dir}/vacuous.matrix.vl`;
+      await Deno.writeTextFile(t, VACUOUS_TEMPLATE);
+      const { code, cells, out } = await runMatrix(t, "binding,argument");
+      for (const c of cells) {
+        if (verdictOf(c.grade) !== "check refuses") {
+          throw new Error(`${c.position}/${c.face}: want check refuses, got ${c.grade}`);
+        }
+      }
+      if (!out.includes("template measures nothing")) {
+        throw new Error(`want "template measures nothing" in the summary, got:\n${out}`);
+      }
+      if (code !== 1) throw new Error(`want exit 1 on a vacuous template, got ${code}`);
+      const fixed = VACUOUS_TEMPLATE.replace("{ [7] }", "{ return [7] }");
+      await Deno.writeTextFile(t, fixed);
+      CACHE.clear();
+      const again = await runMatrix(t, "binding,argument");
+      if (again.out.includes("template measures nothing") || again.code !== 0) {
+        throw new Error(`want the migrated template to grade clean, got ${again.code}:\n${again.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
 // The control for the output contract: a want that is only a substring of what ran, a `twice`
 // that printed once, and a line beside the wanted one are each WRONG, never RUNS.
 Deno.test({
