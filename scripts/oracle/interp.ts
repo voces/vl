@@ -879,6 +879,25 @@ export class Interp {
     }
   }
 
+  // A type parameter no argument's parameter names is bound by the call's destination type
+  // (D16410); with no destination the call is refused. A generic function passed bare still binds
+  // (D16411: a later call of the result binds it).
+  unboundTyParam(d: FnDecl, args: { name: string | null; e: Expr }[], exp: Ty | null) {
+    if (!d.tparams.length || (exp && !mentions(exp, "any"))) return;
+    const bound = new Set<string>();
+    const pos = args.filter((a) => a.name === null);
+    let pi = 0;
+    for (const p of d.params) {
+      const named = args.find((x) => x.name === p.name);
+      const got = named ? [named] : p.rest ? pos.slice(pi) : pi < pos.length ? [pos[pi]] : [];
+      if (!named) pi = p.rest ? pos.length : pi + got.length;
+      if (!p.ty || !got.length) continue;
+      for (const t of d.tparams) if (mentions(p.ty, t)) bound.add(t);
+    }
+    const free = d.tparams.find((t) => !bound.has(t));
+    if (free) throw new TypeFault(`cannot infer type parameter \`${free}\` of ${d.name}: no argument binds it and the call has no destination type`);
+  }
+
   callValue(f: Val, args: { name: string | null; e: Expr }[], env: Env, line: number): Val {
     if (f instanceof Fn) return this.callFn(f, args.map((a) => ({ name: a.name, v: null, e: a.e })), env, line);
     if (f instanceof Bi) return f.call(this.evalArgs(args, env), this);
@@ -1014,7 +1033,7 @@ export class Interp {
         }
         throw new TypeFault("index into " + show(o));
       }
-      case "call": return this.call(e, env);
+      case "call": return this.call(e, env, exp);
       case "as": return this.cast(e, env);
       case "is": {
         const v = this.eval(e.e, env, null);
@@ -1375,7 +1394,7 @@ export class Interp {
     throw new TypeFault(`member '${name}' of ${show(o)}`);
   }
 
-  call(e: Extract<Expr, { k: "call" }>, env: Env): Val {
+  call(e: Extract<Expr, { k: "call" }>, env: Env, exp: Ty | null = null): Val {
     if (e.f.k === "member") {
       const recvE = e.f.e, name = e.f.name;
       const recv = this.eval(recvE, env, null);
@@ -1402,11 +1421,13 @@ export class Interp {
             f = this.pickOverload(fns, first, env);
             return this.callFn(f, [{ name: null, v: first, e: null }, ...e.args.slice(1).map((a) => ({ name: a.name, v: null, e: a.e }))], env, e.line);
           }
+          this.unboundTyParam(f.decl, e.args, exp);
           return this.callFn(f, e.args.map((a) => ({ name: a.name, v: null, e: a.e })), env, e.line);
         }
       }
     }
     const f = this.eval(e.f, env, null);
+    if (f instanceof Fn) this.unboundTyParam(f.decl, e.args, exp);
     // E2.7 keeps an operand's width, and E9.1 does not make min/max/abs of constants a
     // constant: a constant argument adapts to a typed one, else takes its own default; the
     // destination does not reach it.
@@ -1588,6 +1609,19 @@ function mentionsParam(t: Ty, env: Env): boolean {
 
 function isNumLit(e: Expr): boolean {
   return e.k === "int" || e.k === "float" || (e.k === "un" && e.op === "-" && isNumLit(e.e));
+}
+
+// Whether the type `t` names `name` anywhere in it.
+function mentions(t: Ty, name: string): boolean {
+  switch (t.k) {
+    case "name": return (t.name === name && t.args.length === 0) || t.args.some((a) => mentions(a, name));
+    case "list": return mentions(t.el, name);
+    case "map": return mentions(t.key, name) || mentions(t.val, name);
+    case "union": return t.arms.some((a) => mentions(a, name));
+    case "rec": return t.fields.some((f) => mentions(f.ty, name));
+    case "fn": return t.params.some((a) => mentions(a, name)) || mentions(t.ret, name);
+    case "lit": case "null": return false;
+  }
 }
 
 function subst(t: Ty, m: Map<string, Ty>): Ty {
