@@ -3,7 +3,7 @@
 // oracle has not learned, or an oracle edit that breaks the spec, fails here. The examples it
 // cannot run yet are listed in SPEC_SKIPS by their first line, so the count can only grow.
 
-import { interpret, judge } from "../scripts/oracle/oracle.ts";
+import { distilledExpectations, interpret, judge, judgeRecording } from "../scripts/oracle/oracle.ts";
 
 type Example = { where: string; src: string; want: string[] };
 
@@ -78,5 +78,21 @@ Deno.test("oracle: pinned regressions", () => {
   for (const [src, want] of pins) {
     const o = interpret(src + "\n");
     if (o.kind !== "ok" || o.out.join("\n") !== want) throw new Error(`${src}: want ${want}, got ${o.kind} ${JSON.stringify(o.out)} ${o.msg}`);
+  }
+});
+
+// A distilled cell the corpus already grades `runs but wrong value` is COMPILED-BAD in a sweep
+// recording, never a new disagreement: the oracle prints the manifest's expectation.
+Deno.test("oracle: a known wrong-value cell in a recording is not a disagreement", async () => {
+  const cell = "scripts/silent-sweep/distilled/named/dord022.vl";
+  const dir = Deno.makeTempDirSync();
+  try {
+    const rec = `${dir}/rec.jsonl`;
+    Deno.writeTextFileSync(rec, JSON.stringify({ cell, outcome: "runs", stdout: "0000000000000000" }) + "\n");
+    const rows = await judgeRecording(rec, "", 0, Date.now(), distilledExpectations());
+    const got = rows?.map((r) => r.verdict).join(",");
+    if (got !== "COMPILED-BAD") throw new Error(`want COMPILED-BAD, got ${got}`);
+  } finally {
+    Deno.removeSync(dir, { recursive: true });
   }
 });
