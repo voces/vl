@@ -26,10 +26,12 @@ const compiled = ignore
   ? undefined
   : new WebAssembly.Module(Deno.readFileSync(COMPILER));
 
-/** Compiles `src` on a fresh instance; the shadow's rows when `arm` is set, and the output. */
-const run = (src: string, arm: boolean, corrupt = 0) => {
-  const exp = new WebAssembly.Instance(compiled!, {})
-    .exports as unknown as Exports;
+const fresh = () =>
+  new WebAssembly.Instance(compiled!, {}).exports as unknown as Exports;
+
+/** Compiles `src` on `exp` (a fresh instance by default); the shadow's rows when `arm` is set,
+ * and the output. */
+const run = (src: string, arm: boolean, corrupt = 0, exp = fresh()) => {
   exp.irShadowArm(arm ? 1 : 0);
   exp.irShadowCorrupt(0);
   exp.irRefCorrupt(corrupt);
@@ -121,6 +123,36 @@ Deno.test({
         `want only rule 8, got: ${
           fails.map((k) => k.split("\n")[0]).join("; ")
         }`,
+      );
+    }
+  },
+});
+
+// Two programs compiled on one instance, as `vl check --codegen` does over several files: each
+// holds a `take` at the same node, and the second must not read the first's list-read notes.
+Deno.test({
+  name: "ir list: a second compile on one instance reads none of the first's notes",
+  ignore,
+  fn: () => {
+    const exp = fresh();
+    run(
+      "function take(xs: f64[]): f64 { return xs[1] }\nprint(take([1.5, 2.5]))\n",
+      true,
+      0,
+      exp,
+    );
+    const { rc, rows } = run(
+      "function take(xs: i32[]): i32 { return xs[1] }\nprint(take([7, 3]))\n",
+      true,
+      0,
+      exp,
+    );
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const covered = rows.get("covered") ?? 0;
+    const matched = rows.get("matched") ?? 0;
+    if (covered !== 1 || matched !== 1) {
+      throw new Error(
+        `want the second take covered and matched, got ${JSON.stringify([...rows])}`,
       );
     }
   },
