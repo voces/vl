@@ -58,35 +58,39 @@ switch of `monoSlotDeliveryTy`.
 
 Lane M's probe: the walk and `eplSlotSig` both answer at every `monoSlotDeliveryTy` call while
 `tests/cases` builds, and the probe compares the two answers. The 18 `tests/cases` programs
-that the first switch broke all run and print their `@log` lines. Three answers still differ;
+that the first switch broke all run and print their `@log` lines. Two answers still differ;
 every one of those programs runs:
 
 | program | slot | walk | `eplSlotSig` | why |
 |---|---|---|---|---|
-| `closures/generic-list-literal-of-generic-read-out-of-list-to-generic` | `xs` elements, program | `(i32) => i32` | -5 | one call agrees, but its members have no closed type there; not yet narrowed |
 | `closures/hole-fn-inline-list-to-param-bound-annotated` | `g` elements, program | `(i32) => i32` | -1 | the slot's class reaches no other class (`eplReach` holds it alone), so the annotated `k` inside `bound` never bounds it; not yet narrowed |
 | `closures/hole-fn-list-map-callback-generic-call-loop-alias` | `v` elements, program | none | `(i32) => i32` | the classes see the call through `v.map(ap)`; the walk does not |
 
-In the first two rows `monoSlotDeliveryTy` answers -1, as it does for an undelivered slot. In the
-third it pins the signature the program's calls are made at. Part 2b, which deletes the walk, has to bring
-the first two to the walk's answer.
+In the first row `monoSlotDeliveryTy` answers -1, as it does for an undelivered slot. In the
+second it pins the signature the program's calls are made at. A third,
+`closures/generic-list-literal-of-generic-read-out-of-list-to-generic` (walk `(i32) => i32`, -5),
+agrees since a holder written in a generic is bounded at its instance. Lane M's independent probe
+at `ba9d22477` counted 209 calls over `tests/cases`, 206 the same, and no output movement in the
+74 files that make one. Part 2b, which deletes the walk, has to bring
+the first row to the walk's answer.
 
 ## Readings
 
-All on fixpoint seeds. Master `6015bf3ed`, built to a fixpoint from its own seed; the
-candidate is that master plus this branch, built to a fixpoint from master's.
+All on fixpoint seeds. The per-cell corpus and `decl-order-ab` comparisons ran against master
+`6015bf3ed`, built to a fixpoint from its own seed, with the candidate built to a fixpoint from
+master's. The rest ran at the final head, merged with master `64a0f4dac`.
 
 | check | reading |
 |---|---|
-| distilled corpus, per cell | 12,101 of 12,101 identical to master |
-| `decl-order-ab.vl` | 71 of 5,166 cases move, 1 to clause 1: the same as master |
+| distilled corpus, per cell | 12,101 of 12,101 identical to master `6015bf3ed`; at the final head, no cell changes class against the committed baseline |
+| `decl-order-ab.vl` | 71 of 5,166 cases move, 1 to clause 1, the same as master; at the final head, 0 movers outside the baseline |
 | late demands | 2 in 2 files: the baseline |
-| L2 self-compile fuel | 87.673e9 against the baseline's 87.367e9: +0.4% |
-| L2 peak live set | 1,006 MiB, 49% of the 2 GiB heap |
-| seed size | 6,393,260 bytes, +0.2% on the baseline |
+| L2 self-compile fuel | 88.028e9 against the baseline's 87.367e9: +0.8% |
+| L2 peak live set | 1,007 MiB, 49% of the 2 GiB heap |
+| seed size | 6,395,955 bytes, +0.3% on the baseline |
 | plumb-shape cost | ok |
-| `deno task test` cases (`cases_wasm_0`, `_1`) | 3,920 passed, 0 failed |
-| filed witnesses (`--strict`, both inventories) | every row as filed |
+| `deno task test` cases (`cases_wasm_0`, `_1`) | 3,932 passed, 0 failed |
+| filed witnesses (`--strict`, both inventories) | 5,133 of 5,133 as filed |
 | `scripts/gate.sh` | every row ok but `ci-native`'s 5 seed-cache and sidecar tests, which fail on master's seed too in this container |
 
 ## Next: part 2b
