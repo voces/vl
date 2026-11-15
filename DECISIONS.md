@@ -10817,6 +10817,9 @@ the default set is versioned, or if agents keep retrying imports after the recei
 
 ## Exported signatures are not frozen at the module boundary (owner ruling, incremental-compilation Q4 (A), 2026-10-17)
 
+**Superseded 2026-11-15** by "Exports are frozen at the module boundary" below: an export's
+interface is its inferred signature, not its body. The no-annotation clause stands.
+
 **The rule.** An exported function may leave its parameters and return unannotated, as any
 function may. `export function twice(x) { x * 2 }` stays a generic whose body is its
 interface. Nothing requires an annotation on an export so that a build can be faster.
@@ -10830,7 +10833,8 @@ return, and an edit to one re-checks its importers
 
 ## Record adoption crosses module boundaries (owner ruling, incremental-compilation Q1 (B), 2026-10-07)
 
-**Superseded 2026-11-14** by "An exported binding takes its type from its own module" below.
+**Superseded 2026-11-14** by "An exported binding takes its type from its own module" below, and
+for every export by "Exports are frozen at the module boundary" (2026-11-15).
 
 **The rule.** An exported record binding without an annotation takes the field types its
 importers deliver it to, as it would in one file. `export let pt = { x: 1, y: 2 }` passed by
@@ -12232,3 +12236,30 @@ binding may now become a float.
 as the same cast written at the instance's types. A pin whose operand holds no member the target
 could take is a miss, not a refusal: `as?` is `null`, `as!` traps, and a bare `as` propagates.
 D16323 closed this way (`size<string>("ab")` prints `0`).
+
+## Exports are frozen at the module boundary (2026-11-15) — engineering review 2026-11, L2
+
+**Ruled by the owner 2026-11-15: yes.** From the review's L2: "freeze exports at the module
+boundary: an export's types and layouts are inferred from its own module alone, which reverses the
+ruling behind the `half()` result in §3.1. No annotation is required of the user; `vl` can print
+the inferred signature."
+
+- An exported function's interface is the signature inferred from its own module. An importer's call
+  is checked against that signature and reported at the call site. It never re-checks or re-types the
+  exporter's body.
+- This reverses "Exported signatures are not frozen at the module boundary" (Q4 (A), 2026-10-17),
+  where an exported generic's body was its interface. Q4's other half stands: nothing requires an
+  annotation on an export.
+- It extends "An exported binding takes its type from its own module" (2026-11-14), which ruled the
+  same for exported bindings and reversed "Record adoption crosses module boundaries" (Q1 (B)), the
+  ruling behind `half()`. So `half()` prints `0` whether or not a program also passes `origin`
+  to a `{ x: f64, y: f64 }` parameter.
+
+```vl
+// lib.vl
+export let origin = { x: 1, y: 2 }
+export function half() { origin.x / 2 }   // () => i32, from lib.vl alone
+```
+
+Why: a module then has a meaning on its own, the precondition for separate compilation, a
+query-based LSP and a specifiable inference algorithm (engineering-review-2026-11.md §6, L2).
