@@ -2,15 +2,19 @@
 // any body is checked, the generic-constraint probe, then each declaration in order.
 
 import { declTyOf } from "./check_nar_store"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import { declFnAliasSet } from "./check_scopes"
 import { globalInitRecordsFnSetsSet } from "./check_elab_cap"
 import {
+  BinExpr,
   BoolLit,
+  Call,
   CharLit,
   FuncDecl,
   Ident,
+  Index,
   LetDecl,
+  Member,
   NumLit,
   OP_INDEX_GET,
   OP_INDEX_SET,
@@ -484,7 +488,9 @@ function progCheckCalleeFirst(
     const own = !all && k > j && (!eager || ownFactsStand(d))
     const first = k >= 0
       && !done[k]
-      && (all || (own && (retPending(d) || weSummaryUnsettled(d))))
+      && (all
+      || (own && (retPending(d) || weSummaryUnsettled(d)))
+      || (k > j && fnWritesHoleParam(d)))
     crAskForSet(-1)
     if first { progCheckCalleeFirst(stmts, k, stmtAt, done, all) }
   }
@@ -1026,4 +1032,53 @@ function progHoistValues(stmts: i32[]): i32[] {
     mi = mi + 1
   }
   phLets
+}
+
+// Whether top-level function `d` writes an element into an un-annotated parameter by name: a
+// `push`/`unshift`/`add`/`set` on it or a store into one of its cells, the first write that
+// decides the element (D2218), so a call's replay of it needs the body checked first.
+function fnWritesHoleParam(d: i32): boolean {
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) { return false }
+  const names: string[] = []
+  for p in fd.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { names.push(pn.parName) }
+  }
+  if names.length == 0 { return false }
+  const todo: i32[] = [fd.fnBody]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix < 0 || ix >= P.nodes.length { continue }
+    const n = nodeAt(ix)
+    if n is Call && addsTo(n.callFn, names) { return true }
+    if n is BinExpr && n.binOp == "=" && storesInto(n.binLeft, names) {
+      return true
+    }
+    nodeChildrenPush(ix, todo)
+  }
+  false
+}
+
+// Whether callee `ix` is a cell write on one of `names`: `p.push`, `unshift`, `add` or `set`.
+function addsTo(ix: i32, names: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const t = nodeAt(ix)
+  if !(t is Member) { return false }
+  const p = t.memProp
+  (p == "push" || p == "unshift" || p == "add" || p == "set")
+    && identIn(t.memObj, names)
+}
+
+// Whether store target `ix` is a cell of one of `names`, `p[k]`.
+function storesInto(ix: i32, names: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const t = nodeAt(ix)
+  t is Index && identIn(t.idxArr, names)
+}
+
+function identIn(ix: i32, names: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  n is Ident && strListHas(names, n.identName)
 }
