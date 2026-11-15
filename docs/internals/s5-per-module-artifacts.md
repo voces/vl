@@ -705,6 +705,7 @@ and, with `--low-memory-unused`, `setLowMemoryUnused`. Five functions read the t
 | --- | --- | --- | --- |
 | `assignSharedHelperIndices` (`emit_sections.vl`) | `gOptimized` | a map set calls `__map_set_<row>__` | the store is inline, where binaryen can scalarise the map |
 | `strFillPlan` (`emit_sections.vl`) | `gOptimized` | long pooled strings fill from a passive segment | each is built inline |
+| `emitPushAppend` (`wasmEmit.vl`) | `gOptimized` | a push grows through `__grow_<row>__` | the grow is inline, where binaryen can melt or drop it |
 | `emitMemAddr`, `emitLowMemAccessorCall`, `emitCallCoreUserFn` (`wasmEmit.vl`) | `gLowMemUnused` | the address is computed | its constant folds into the memarg |
 
 Over the 4,315 single-file cases, the `-O` flavour changes 782 modules: 694 by the map-set
