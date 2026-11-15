@@ -112,6 +112,7 @@ import {
   crCapRecDepths,
   crCapRecFns,
   crCapRecHandles,
+  crCapRecPlaces,
   crCapRecSlots,
   crCapRecTys,
   crCapWidenBank,
@@ -420,6 +421,7 @@ import {
   crLoopRdSlots,
   crMayBeWritten,
   crNameAssigned,
+  crNoteLoopRead,
   crRetire,
   crRetireAt,
   crSubtreeAssigns,
@@ -1914,11 +1916,17 @@ export function writeStorageTy(ix: i32) {
     Member => {
       const slot = narrowedPathIx(placeAt(ix))
       if slot < 0 { return -1 }
-      // An already-retired narrowing still answers, and bailing on `npInvBy[slot] >= 0` here is an
-      // ordering bug inside one statement: `lt` is read off the target before the right-hand side is
-      // checked, so a callee that retires the path mid-statement would leave `asgLt` at a type the
-      // storage never had. A retired narrowing means the place reads at its declared type.
-      if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
+      // A retired narrowing still answers: `lt` is read before the right-hand side, so a callee
+      // retiring the path mid-statement must not leave it at a type the storage never had. A nested
+      // function checked since holds the write to the narrowing only if it read the path under it,
+      // which a re-test does not (D16297).
+      if (
+        npEpochs[slot] != narFnEpoch
+        && npAsg[slot] != 1
+        && npCapBy[slot] >= 0
+      ) {
+        return -1
+      }
       if !npInsideBarrier(slot) { return -1 }
       const noPlaces: i32[] = []
       const noTys: i32[] = []
@@ -1935,7 +1943,13 @@ export function writeStorageTy(ix: i32) {
     Index => {
       const slot = narrowedPathIx(placeAt(ix))
       if slot < 0 { return -1 }
-      if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
+      if (
+        npEpochs[slot] != narFnEpoch
+        && npAsg[slot] != 1
+        && npCapBy[slot] >= 0
+      ) {
+        return -1
+      }
       if !npInsideBarrier(slot) { return -1 }
       const noPlaces: i32[] = []
       const noTys: i32[] = []
@@ -2889,8 +2903,44 @@ export function crNoteCaptureRead(p: i32) {
   if nf >= 2 && slot >= crFnNpBases[nf - 2] {
     if crCallbackKeeps(crFnIxs[crFnIxs.length - 1], p, key) { return 0 }
   }
+  // A reader its parent calls only by handle is checked at each call, as a bare name is (D16380).
+  const parentBase = if nf >= 2 { crFnNpBases[nf - 2] } else { 0 }
+  if nf >= 1 && slot >= parentBase && crPathCapRec(p, slot) { return 0 }
   if npCapBy[slot] < 0 { npCapBySetAt(slot, crFnIxs[crFnIxs.length - 1]) }
   0
+}
+
+// Records the innermost nested function as a reader of path place `p`, narrowed in its parent as
+// overlay slot `slot`, for `crCapRecCheck`; false when it has no handle, escapes, or writes the path.
+function crPathCapRec(p: i32, slot: i32): boolean {
+  const fx = crFnIxs[crFnIxs.length - 1]
+  const hd = crLambdaHandle(fx)
+  if hd < 0 || crLambdaEscapes(fx) != 0 { return false }
+  const fd = nodeAt(fx)
+  if !(fd is FuncDecl) || crSubtreeAssigns(fd.fnBody, npKeys[slot]) {
+    return false
+  }
+  if crFirstWritingCall(fd.fnBody, p, npKeys[slot]) >= 0 { return false }
+  const d = crFnBases.length - 1
+  let r = 0
+  while r < crCapRecHandles.length {
+    if (
+      crCapRecHandles[r] == hd
+      && crCapRecPlaces[r] == p
+      && crCapRecDepths[r] == d
+    ) {
+      return true
+    }
+    r = r + 1
+  }
+  crCapRecDepths.push(d)
+  crCapRecHandles.push(hd)
+  crCapRecCount[hd] = (crCapRecCount[hd] ?? 0) + 1
+  crCapRecSlots.push(-1)
+  crCapRecTys.push(npTys[slot])
+  crCapRecFns.push(fx)
+  crCapRecPlaces.push(p)
+  true
 }
 
 // A read of a path whose captured narrowing `crPathCaptureLost` dropped, for the note a refusal
@@ -3444,6 +3494,7 @@ export function crCaptureWiden(fnIx: i32) {
             crCapRecSlots.push(s)
             crCapRecTys.push(declTyOf(s))
             crCapRecFns.push(fnIx)
+            crCapRecPlaces.push(-1)
           } else {
             crDeclareWidened(s, wide)
             crCapWidenBank[fnIx] = i32ListWith(
@@ -3515,10 +3566,17 @@ export function crCapRecCheck(callIx: i32) {
   while r < crCapRecHandles.length {
     if crCapRecHandles[r] == hd && crCapRecDepths[r] == crFnBases.length {
       const cs = crCapRecSlots[r]
-      const nm = slotNameOf(cs)
-      if !tySame(declTyOf(cs), crCapRecTys[r]) {
+      const cp = crCapRecPlaces[r]
+      const nm = if cp >= 0 { placeText(cp) } else { slotNameOf(cs) }
+      const now = if cp >= 0 { narrowedPathTy(cp) } else { declTyOf(cs) }
+      // A call in a loop reads the path again on the next iteration, as a direct read does (D2403).
+      if cp >= 0 && now >= 0 && tySame(now, crCapRecTys[r]) {
+        crNoteLoopRead(cp, callIx)
+      }
+      if now < 0 || !tySame(now, crCapRecTys[r]) {
         let by = "a write"
-        if crMayBeWritten(cs) { by = "a call" }
+        if cp >= 0 { by = "a write or a call" }
+        else if crMayBeWritten(cs) { by = "a call" }
         tErrCoded(
           "'"
             + h
