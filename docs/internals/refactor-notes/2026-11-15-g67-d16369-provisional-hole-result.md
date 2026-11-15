@@ -14,11 +14,27 @@ type, printing `32` alone instead of `6`, `32`. It needs `const n = pick(false)`
   the pending `-2`, so `checkCallOnFuncTy` did not check `pick`'s body.
 - A probe after the pre-pass's rollback read `pick.fnRet` as the hole.
 
-## Change (`check_calls`, net compiler lines +3; pin-helper delta 0)
+## Change (`check_calls`, net compiler lines +7; pin-helper delta 0)
 
-`checkCallOnFuncTy` checks the callee first when its result holds a hole and pass 2 has not
-checked its body (`nodeTyOf(dIx) < 0`), as it already does for `-2`. A hole relay's own `_`,
-published by pass 2, is final, and is not re-checked.
+`checkCallOnFuncTy` checks the callee first when its result holds a hole, it has no return
+annotation, and pass 2 has not checked its body (`fnInferredUnchecked`), as it already does for
+`-2`. A hole relay's own `_`, published by pass 2, is final and is not checked again.
+- The first version left out the annotation test. An annotated generic's `U` holds a hole, so a
+  recursive one (`rec<U>` in the d2567 named cells) re-entered its own body without end. Regress
+  showed it as a hang, not a red cell.
+
+## Grading
+
+`--before`: the seed of #8186's branch.
+
+- D16369 prints `6`, `32`. D16381's witness, D6322 and D15596 hold.
+- 574 hole, inferred, return, fn and generic templates (the first version): 0 runs→not-runs, no
+  cell changed. The cells that are SILENT or TRAP are the same on both seeds.
+- `regress.vl` on the merged tree: 0 runs→not-runs. 14 `dord*` cells move to runs, and their
+  baseline lines are rewritten.
+- `decl-order-ab.vl`: 17 clause-1 movers fall to 12, none new. 153 of 5147 cases move. The
+  baseline is rewritten. Two of the five closed are D16281's, so 9 of its cells still move.
+- `check-filed-witnesses --strict`: 5091 graded, all as filed.
 
 Tried and dropped:
 - Not publishing a hole result in quiet mode: an invalid module, because `pick` read `TY_ERR`.
