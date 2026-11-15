@@ -238,3 +238,41 @@ the default saved.
 followed by more code still has an arm behind it. Uncovered answers are only no value, so each
 arm runs only for no node, `never` or an open type. Deleting one changes behaviour on exactly
 those inputs. Each deletion is graded by the per-site counter, site by site.
+
+## 2c, step 2: the fallback arms
+
+Read site by site, the 44 guards on the `null` kind are almost all type narrowing: the callee
+takes a `VKind`, so the guard is not an arm. Only two branches compute an answer the `null` kind
+does not give. Both are field-code fallbacks for a field whose storage type is recorded but has no
+rep (a hole or a type parameter):
+- `readCellKind`, which reads `fieldCodeCellKind`;
+- `sFieldStoreKind`, which reads `fieldCodeVKind`.
+
+Both now answer `null` there. The field code still answers where no storage type is recorded.
+
+Six readers that restated `rdKind` behind a `null` test now return it directly:
+- `fnSigKindOfTy`, `fnRetIsRecordRow`, `readLoopElemRepKind` and `annRepKindOf`;
+- the shadow's report word;
+- `coveredKindOfTy`, which is deleted and inlined at its one caller.
+
+Two candidates are not arms, because they also run for a covered type, so they stay:
+- `tyListRepKind`'s ref-list row lookup;
+- `exprListRep`'s `tyListRep`.
+
+**Measured.** Both seeds are fixpoints of master `258ea049`, one with step 2 and one without.
+
+| | master | step 2 |
+|---|---|---|
+| corpus exit codes / module bytes changed (12,037 cells) | | **0 / 0** |
+| L2 self-compile fuel | 88,169,899,820 | 88,158,721,010 (−0.013%) |
+| `plumb-shape-cost` main / tail fuel | 9,120,204,666 / 6,606,487,334 | 9,118,733,896 / 6,605,493,768 (−0.02%) |
+| peak live heap | 120,086 / 84,110 KiB | unchanged |
+| seed size | 6,396,780 | 6,396,616 (−164 bytes) |
+
+Net compiler lines: −17. Pin-helper delta: 0.
+
+**What remains is not 2c's.** With the coverage protocol and its arms gone, `RepDesc` is the
+tree's projection onto `VKind` plus a null discipline, a slot and two vocabularies. Retiring it
+means consumers read `RepNode` directly. That is stage 3: the slot store, the field codes and the
+`FC_*` family derived from the tree. The other field-code reads still answer for types that have a
+rep, so they are not fallbacks either.

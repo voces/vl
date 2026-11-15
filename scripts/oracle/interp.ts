@@ -25,10 +25,42 @@ export class Lit {
   join = false;
   derived = false; // computed by an operator, not written
   lone = false; // a radix literal as written, not a tree of them (owner ruling 4.1 is about these)
+  // A radix tree whose value depends on its width and that no use has fixed yet carries its
+  // 64-bit reading too: `i` is the 32-bit one (ruling A: it computes at the use's width).
+  w64: bigint | null = null;
+  trap64 = false; // its 64-bit reading divides by zero
 
   constructor(public i: bigint | null, public f: number | null, public radix: number | boolean, public q: [bigint, bigint] | null = null) {}
 }
 export class Rec { constructor(public f: Map<string, Val>) {} }
+
+// The f32 nearest the integer `n`, ties to even, rounded once (a double first would round twice).
+function bigToF32(n: bigint): number {
+  const m = n < 0n ? -n : n;
+  if (m < 1n << 53n) return Math.fround(Number(n));
+  const sh = BigInt(m.toString(2).length - 24), q = m >> sh, r = m - (q << sh), half = 1n << (sh - 1n);
+  const up = r > half || (r === half && (q & 1n) === 1n);
+  const v = Math.fround(Number((up ? q + 1n : q) << sh));
+  return n < 0n ? -v : v;
+}
+
+// The 64-bit reading of an integer constant: its `w64` when the tree depends on its width.
+function v64(l: Lit): bigint {
+  if (l.trap64) throw new Trap("integer divide by zero");
+  return l.w64 ?? l.i!;
+}
+function widthDep(l: Lit): boolean { return l.w64 !== null || l.trap64; }
+
+// A read of a decimal `const` is its value written in place (T2.4), so its width is the value's,
+// not its spelling's; a radix tree's read computes the tree at its own use (D14990), so it keeps it.
+function constRead(l: Lit): Lit {
+  if (l.radix || l.i === null || !l.wideDec) return l;
+  const c = new Lit(l.i, l.f, l.radix, l.q);
+  c.join = l.join;
+  c.derived = l.derived;
+  c.wideDec = l.i < BigInt(I32_MIN) || l.i > BigInt(I32_MAX);
+  return c;
+}
 export class VMap { m = new Map<string, [Val, Val]>(); }
 export class VSet { m = new Map<string, Val>(); }
 // The type a container was built at (ruling 4.4): set where it is first delivered at a declared
@@ -132,12 +164,12 @@ function litTo(l: Lit, k: string): Val {
         if (x < BigInt(I32_MIN) || x > BigInt(I32_MAX)) throw new LitFault(`literal typed from uses: constant ${x} overflows i32`);
         return Number(x);
       case "i64":
-        if (l.radix) return wrap64(x);
+        if (l.radix) return wrap64(v64(l));
         if (x < I64_MIN || x > I64_MAX) throw new LitFault(`literal typed from uses: constant ${x} overflows i64`);
         return x;
       case "f64":
         if (l.radix && l.lone) return radixFloat(x, 64, false);
-        if (l.radix) return new Flt(Number(wrap64(x)), 64); // ruling 4.2: a radix tree computes at 64 bits
+        if (l.radix) return new Flt(Number(wrap64(v64(l))), 64); // ruling 4.2: a radix tree computes at 64 bits
         return new Flt(intAtFloat(x, Number(x), "f64"), 64);
       case "f32":
         if (l.radix && l.lone) return radixFloat(x, 32, false);
@@ -170,7 +202,7 @@ function litDefault(l: Lit): Val {
   const x = l.i!;
   // T2.3: a pattern of 32 bits or fewer is the i32 with those bits; a wider one is i64.
   // T2.3: a tree of patterns of 32 bits or fewer is the i32 with those bits; a wider one is i64.
-  if (l.radix) return l.radix === 64 || l.wideDec ? wrap64(x) : wrap32(x);
+  if (l.radix) return l.radix === 64 || l.wideDec ? wrap64(v64(l)) : wrap32(x);
   if (x >= BigInt(I32_MIN) && x <= BigInt(I32_MAX)) return Number(x);
   return litTo(l, "i64");
 }
@@ -223,6 +255,8 @@ function pairDefault(l: Lit, other: Lit): Val {
 function asJoin(l: Lit): Lit {
   const j = new Lit(l.i, l.f, l.radix, l.q);
   j.wideDec = l.wideDec;
+  j.w64 = l.w64;
+  j.trap64 = l.trap64;
   j.join = true;
   return j;
 }
@@ -231,6 +265,11 @@ function isConstTree(e: Expr): boolean {
   if (isNumLit(e)) return true;
   if (e.k === "un") return (e.op === "-" || e.op === "~") && isConstTree(e.e);
   return e.k === "bin" && ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"].includes(e.op) && isConstTree(e.l) && isConstTree(e.r);
+}
+
+function negatedRadix(e: Expr): boolean {
+  if (e.k === "un" && e.op === "-") return negatedRadix(e.e);
+  return e.k === "int" && !!e.radix;
 }
 
 // Whether a constant tree holds a radix literal, or a float literal.
@@ -276,36 +315,65 @@ let f32Fold = false
 function radixWidth(op: string, a: Lit, b: Lit, expK: string | null): 32 | 64 {
   if (expK === "i64" || expK === "f64") return 64;
   if (expK === "f32") throw new Unsupported("spec gap: a radix constant tree at f32");
-  if (expK) return 32;
-  // Q8: with no use, a constant shift count of 32 to 63 makes the left operand i64.
+  // Q8: a constant shift count of 32 to 63 makes the untyped left operand i64, beside a peer
+  // too (an i32 destination refuses it at check, E6.2).
   if (["<<", ">>", ">>>"].includes(op) && b.i !== null && b.i >= 32n && b.i <= 63n) return 64;
+  if (expK) return 32;
   return a.radix === 64 || b.radix === 64 || a.wideDec || b.wideDec ? 64 : 32;
 }
 function radixAtWidth(op: string, a: Lit, b: Lit, expK: string | null): Lit {
-  const w = radixWidth(op, a, b, expK), W = BigInt(w);
-  const x = BigInt.asIntN(w, a.i!), y = BigInt.asIntN(w, b.i!), n = y & (W - 1n);
-  const r = op === "/" ? x / y : op === "%" ? x % y : op === "&" ? x & y : op === "|" ? x | y : op === "^" ? x ^ y
-    : op === "<<" ? x << n : op === ">>" ? x >> n : BigInt.asUintN(w, x) >> n;
-  const l = new Lit(BigInt.asIntN(w, r), null, w);
+  const w = radixWidth(op, a, b, expK);
+  const at = (w: 32 | 64, p: bigint, q: bigint): bigint => {
+    const W = BigInt(w), x = BigInt.asIntN(w, p), y = BigInt.asIntN(w, q), n = y & (W - 1n);
+    if ((op === "/" || op === "%") && y === 0n) throw new Trap("integer divide by zero");
+    if (op === "/" && y === -1n && x === -(1n << (W - 1n))) throw new Trap("integer overflow");
+    const r = op === "/" ? x / y : op === "%" ? x % y : op === "&" ? x & y : op === "|" ? x | y : op === "^" ? x ^ y
+      : op === "<<" ? x << n : op === ">>" ? x >> n : BigInt.asUintN(w, x) >> n;
+    return BigInt.asIntN(w, r);
+  };
+  // A shift count is typed by itself, never by the left operand (Q8): it keeps its own reading.
+  const shift = op === "<<" || op === ">>" || op === ">>>";
+  const cnt = (): bigint => b.radix === 64 || b.wideDec ? v64(b) : b.i!;
+  const q64 = (): bigint => shift ? cnt() : v64(b);
+  const l = new Lit(w === 64 ? at(64, v64(a), q64()) : at(32, a.i!, b.i!), null, w);
   l.derived = true;
+  // No use has fixed the width: keep the 64-bit reading for a use that turns out to be i64.
+  if (w === 32 && !expK) {
+    try {
+      const r = at(64, v64(a), q64());
+      if (r !== l.i) l.w64 = r;
+    } catch (x) {
+      if (!(x instanceof Trap)) throw x;
+      l.trap64 = true;
+    }
+  }
   return l;
 }
 
 function litArith(op: string, a: Lit, b: Lit, expK: string | null = null): Val {
   // a radix literal meeting a float constant is the value its digits spell (T2.3); a radix tree
   // beside that f64 computes at 64 bits (ruling 4.2)
-  const atFloat = (x: Lit) => x.lone ? radixFloat(x.i!, 64, false) : new Flt(Number(wrap64(x.i!)), 64);
+  const atFloat = (x: Lit) => x.lone ? radixFloat(x.i!, 64, false) : new Flt(Number(wrap64(v64(x))), 64);
   if ((a.f !== null && b.radix) || (b.f !== null && a.radix)) return arith(op, a.radix ? atFloat(a) : a, b.radix ? atFloat(b) : b);
   if (a.i !== null && b.i !== null) {
     const x = a.i, y = b.i, radix = Math.max(Number(a.radix), Number(b.radix));
     const L = (r: bigint) => { const l = new Lit(r, null, radix); l.wideDec = a.wideDec || b.wideDec; return l; };
+    // A ring operator commutes with wrapping, so it carries an operand's 64-bit reading through.
+    const ring = (f: (p: bigint, q: bigint) => bigint): Lit => {
+      const l = L(f(x, y));
+      if (widthDep(a) || widthDep(b)) {
+        try { const r = f(v64(a), v64(b)); if (r !== l.i) l.w64 = r; } catch (t) { if (!(t instanceof Trap)) throw t; l.trap64 = true; }
+      }
+      return l;
+    };
     switch (op) {
-      case "+": return L(x + y);
-      case "-": return L(x - y);
-      case "*": return L(x * y);
-      // the checker refuses a decimal tree's zero divisor; what reaches here runs, and traps (T1.2)
-      case "/": if (y === 0n) throw new Trap("integer divide by zero"); if (radix) return radixAtWidth(op, a, b, expK); return L(x / y);
-      case "%": if (y === 0n) throw new Trap("integer divide by zero"); if (radix) return radixAtWidth(op, a, b, expK); return L(x % y);
+      case "+": return ring((p, q) => p + q);
+      case "-": return ring((p, q) => p - q);
+      case "*": return ring((p, q) => p * q);
+      // the checker refuses a decimal tree's zero divisor; what reaches here runs, and traps (T1.2);
+      // a radix tree's divisor is read at its width, which may make it zero (ruling A)
+      case "/": if (radix) return radixAtWidth(op, a, b, expK); if (y === 0n) throw new Trap("integer divide by zero"); return L(x / y);
+      case "%": if (radix) return radixAtWidth(op, a, b, expK); if (y === 0n) throw new Trap("integer divide by zero"); return L(x % y);
       case "&": case "|": case "^": case "<<": case ">>": case ">>>":
         if (radix) return radixAtWidth(op, a, b, expK);
         if (op === "&") return L(x & y);
@@ -671,7 +739,13 @@ export class Interp {
     const prog = parse(src);
     const env = new Env(null);
     installBuiltins(env);
-    this.execBlock(prog, env);
+    try {
+      this.execBlock(prog, env);
+    } catch (x) {
+      // E8.2: a bare `as` propagates null, which the module's top level has no function to return.
+      if (x instanceof NullOut) throw new TypeFault("a bare `as` failed at the top level, where nothing returns its null");
+      throw x;
+    }
     return this.out;
   }
 
@@ -726,7 +800,7 @@ export class Interp {
           if (s.ty) v = this.deliver(v, s.ty, env, `binding '${s.name}'`);
           else if (v === VOID) throw new TypeFault(`binding '${s.name}' to a void value`);
         } else if (!s.ty) throw new Unsupported("let without type or initialiser");
-        const tree = s.kind === "const" && !s.ty && s.e && isConstTree(s.e) && treeHas(s.e, "float") ? s.e : undefined;
+        const tree = s.kind === "const" && !s.ty && s.e && isConstTree(s.e) && (treeHas(s.e, "float") || treeHas(s.e, "radix")) ? s.e : undefined;
         env.vars.set(s.name, { v, ty: s.ty, mut: s.kind === "let", tree });
         return;
       }
@@ -818,14 +892,15 @@ export class Interp {
   }
 
   // ── calls ──
-  callFn(fn: Fn, args: { name: string | null; v: Val | null; e: Expr | null }[], callerEnv: Env | null, _line: number): Val {
+  callFn(fn: Fn, args: { name: string | null; v: Val | null; e: Expr | null }[], callerEnv: Env | null, _line: number, bind: Map<string, Ty> | null = null): Val {
     const d = fn.decl;
     if (++this.depth > 400) throw new Unsupported("recursion depth (oracle)");
     try {
       const env = new Env(fn.env);
-      for (const p of d.tparams) env.types.set(p, "param");
+      // A type parameter the destination binds (D3539) is that type in the body.
+      for (const p of d.tparams) env.types.set(p, bind?.has(p) ? { params: [], ty: bind.get(p)! } : "param");
       // An argument is typed in the caller's scope, where the callee's type parameters are erased.
-      const erased = new Map(d.tparams.map((p) => [p, ANY]));
+      const erased = new Map(d.tparams.map((p) => [p, bind?.get(p) ?? ANY]));
       const argTy = (t: Ty | null) => t && erased.size ? subst(t, erased) : t;
       env.vars.set(" ret", { v: { ty: d.ret } as unknown as Val, ty: null, mut: false });
       const pos = args.filter((a) => a.name === null);
@@ -904,8 +979,8 @@ export class Interp {
     if (free) throw new TypeFault(`cannot infer type parameter \`${free}\` of ${d.name}: no argument binds it and the call has no destination type`);
   }
 
-  callValue(f: Val, args: { name: string | null; e: Expr }[], env: Env, line: number): Val {
-    if (f instanceof Fn) return this.callFn(f, args.map((a) => ({ name: a.name, v: null, e: a.e })), env, line);
+  callValue(f: Val, args: { name: string | null; e: Expr }[], env: Env, line: number, bind: Map<string, Ty> | null = null): Val {
+    if (f instanceof Fn) return this.callFn(f, args.map((a) => ({ name: a.name, v: null, e: a.e })), env, line, bind);
     if (f instanceof Bi) return f.call(this.evalArgs(args, env), this);
     throw new TypeFault("call of " + show(f));
   }
@@ -948,12 +1023,14 @@ export class Interp {
         const b = env.lookup(e.name);
         // T2.5: a `let` slot holding a constant takes its type from later stores; a read
         // until then sees the default. A `const` constant is the exact value (T2.4).
+        // D14990: a read of a radix tree `const` computes the tree at that read's own width.
+        if (b?.tree && b.v instanceof Lit && b.v.radix && !b.v.lone && !f32Fold && !(exp && this.isF32(exp, env))) return this.eval(b.tree, env, exp);
         if (b?.tree && !f32Fold && exp && this.isF32(exp, env)) {
           f32Fold = true;
           try { return this.eval(b.tree, env, null); } finally { f32Fold = false; }
         }
         if (b?.tree && f32Fold) return this.eval(b.tree, env, null);
-        if (b) return b.mut && b.v instanceof Lit ? litDefault(b.v) : b.v;
+        if (b) return b.mut && b.v instanceof Lit ? litDefault(b.v) : b.v instanceof Lit ? constRead(b.v) : b.v;
         const fns = env.lookupFns(e.name);
         if (fns) { if (fns.length > 1) throw new Unsupported("overloaded function as a value"); return fns[0]; }
         if (e.name.startsWith("__")) throw new Unsupported("intrinsic " + e.name);
@@ -992,7 +1069,7 @@ export class Interp {
         const v = this.eval(e.e, env, exp);
         if (e.op === "!") return !this.asBool(v, "operand of !");
         if (e.op === "-") {
-          if (v instanceof Lit && v.i !== null) { const n = new Lit(-v.i, null, v.radix); n.wideDec = e.e.k === "int" ? !v.radix && (-v.i < BigInt(I32_MIN) || -v.i > BigInt(I32_MAX)) : v.wideDec; n.join = v.join; return n; } // `-2147483648` is an i32 literal (T2.1), the minus folded in
+          if (v instanceof Lit && v.i !== null) { const n = new Lit(-v.i, null, v.radix); n.wideDec = e.e.k === "int" ? !v.radix && (-v.i < BigInt(I32_MIN) || -v.i > BigInt(I32_MAX)) : v.wideDec; n.join = v.join; n.w64 = v.w64 === null ? null : -v.w64; n.trap64 = v.trap64; return n; } // `-2147483648` is an i32 literal (T2.1), the minus folded in
           if (v instanceof Lit) { const n = new Lit(null, -v.f!, false, v.q ? [-v.q[0], v.q[1]] : null); n.join = v.join; return n; }
           if (v instanceof Flt) return new Flt(-v.v, v.w);
           return arith("-", typeof v === "bigint" ? 0n : 0, v);
@@ -1057,6 +1134,15 @@ export class Interp {
         const other = c ? e.f : e.t;
         const ok = other && other.length ? other[other.length - 1] : null;
         const kOther = ok && ok.k === "expr" ? this.staticKind(ok.e, env) : null;
+        // 4.3 with Q9: a float constant arm that adopts an `f32` arm folds in f32 arithmetic, as
+        // at run time; a constant tree is pure, so the taken arm is evaluated again.
+        const taken = c ? e.t : e.f, tk = taken && taken.length ? taken[taken.length - 1] : null;
+        if (v instanceof Lit && v.f !== null && kOther === "f32" && !f32Fold && tk && tk.k === "expr" && isConstTree(tk.e)) {
+          f32Fold = true;
+          let r: Val;
+          try { r = this.eval(tk.e, env, null); } finally { f32Fold = false; }
+          return r instanceof Lit ? litTo(r, "f32") : r;
+        }
         // A generic's erased parameter (`any`) is no context: the join settles here. With a
         // context, a constant arm beside a typed one still takes that type when it fits.
         if (exp && !(exp.k === "name" && exp.name === "any")) {
@@ -1067,6 +1153,12 @@ export class Interp {
           // A float arm makes the join a float context, where a radix arm is its digits' value (4.1).
           if (v.radix && v.i !== null && !kOther && ok && ok.k === "expr" && isConstTree(ok.e) && treeHas(ok.e, "float")) {
             return v.lone ? radixFloat(v.i, 64, false) : new Flt(Number(wrap64(v.i)), 64);
+          }
+          // A radix arm beside a decimal arm outside i32 is the pair's i64 (T2.3, as `pairDefault`).
+          if (v.radix && !kOther && ok && ok.k === "expr" && isConstTree(ok.e) && !treeHas(ok.e, "radix")) {
+            const o = this.eval(ok.e, env, null);
+            const wide = o instanceof Lit && o.i !== null && !o.radix && (o.i < BigInt(I32_MIN) || o.i > BigInt(I32_MAX)) && o.i >= I64_MIN && o.i <= I64_MAX;
+            if (wide) return litTo(v, "i64");
           }
           if (!kOther && ok && ok.k === "expr" && isConstTree(ok.e)) return asJoin(v);
           if (!kOther) return litDefault(v);
@@ -1239,7 +1331,9 @@ export class Interp {
       if (exp) { try { const x = this.resolve(exp, env); if (x.k === "name" && (x.name === "i32" || x.name === "i64")) k = x.name; } catch { /* none */ } }
       const lv = this.eval(e.l, env, k ? exp : null);
       const rv = this.eval(e.r, env, null);
-      const left = lv instanceof Lit ? (k ? litTo(lv, k) : litDefault(lv)) : lv;
+      // A radix pattern Q8 made 64 bits wide stays i64 under an i32 context.
+      const q8Wide = lv instanceof Lit && !!lv.radix && (lv.radix === 64 || lv.wideDec);
+      const left = lv instanceof Lit ? (k && !(k === "i32" && q8Wide) ? litTo(lv, k) : litDefault(lv)) : lv;
       // The count is masked to the left's width (E6.2), so it converts to that width's integer.
       const count = typeof left === "bigint" && typeof rv === "number" ? BigInt(rv)
         : typeof left === "number" && typeof rv === "bigint" ? Number(BigInt.asIntN(32, rv)) : rv;
@@ -1336,6 +1430,30 @@ export class Interp {
       this.store(target, v, env);
       return v;
     }
+  }
+  // D3539: a generic whose result is its bare type parameter `T`, every argument at a bare `T`
+  // a constant tree of the destination's kind (a float tree at a float, an integer one at an
+  // integer, D4024), takes `T` from a numeric destination, as a literal written there would.
+  dstBindLits(d: FnDecl, args: { name: string | null; e: Expr }[], exp: Ty | null, env: Env): Map<string, Ty> | null {
+    if (!exp || !d.ret || d.ret.k !== "name" || !d.tparams.includes(d.ret.name)) return null;
+    const t = d.ret.name;
+    let k: string | null = null;
+    try { const x = this.resolve(exp, env); if (x.k === "name" && NUMERIC.has(x.name)) k = x.name; } catch { return null; }
+    if (!k) return null;
+    const pos = args.filter((a) => a.name === null);
+    let pi = 0, any = false;
+    for (const p of d.params) {
+      const a = args.find((x) => x.name === p.name) ?? (p.rest ? null : pos[pi++] ?? null);
+      if (!p.ty || p.ty.k !== "name" || p.ty.name !== t) {
+        if (p.ty && mentions(p.ty, t)) return null;
+        continue;
+      }
+      if (!a || !this.foldsAt(a.e, env)) return null;
+      const float = a.e.k === "id" || treeHas(a.e, "float");
+      if (float !== (k === "f32" || k === "f64")) return null;
+      any = true;
+    }
+    return any ? new Map([[t, exp]]) : null;
   }
   // Whether `e` is a constant tree, or a read of a `const` holding one, which folds at its use.
   foldsAt(e: Expr, env: Env): boolean {
@@ -1460,17 +1578,24 @@ export class Interp {
             return this.callFn(f, [{ name: null, v: first, e: null }, ...e.args.slice(1).map((a) => ({ name: a.name, v: null, e: a.e }))], env, e.line);
           }
           this.unboundTyParam(f.decl, e.args, exp);
-          return this.callFn(f, e.args.map((a) => ({ name: a.name, v: null, e: a.e })), env, e.line);
+          return this.callFn(f, e.args.map((a) => ({ name: a.name, v: null, e: a.e })), env, e.line, this.dstBindLits(f.decl, e.args, exp, env));
         }
       }
     }
     const f = this.eval(e.f, env, null);
     if (f instanceof Fn) this.unboundTyParam(f.decl, e.args, exp);
+    const bind = f instanceof Fn ? this.dstBindLits(f.decl, e.args, exp, env) : null;
     // E2.7 keeps an operand's width, and E9.1 does not make min/max/abs of constants a
     // constant: a constant argument adapts to a typed one, else takes its own default; the
     // destination does not reach it.
     if (f instanceof Bi && ["min", "max", "abs"].includes(f.name)) {
-      const args = this.evalArgs(e.args, env);
+      // A shift of a constant takes a typed argument's width as a constant does (Q8), read from
+      // the declarations so each argument still runs once, in order.
+      const shifted = (x: Expr) => x.k === "bin" && ["<<", ">>", ">>>"].includes(x.op) && isConstTree(x.l) && !isConstTree(x.r);
+      const pk = e.args.map((a) => shifted(a.e) || isConstTree(a.e) ? null : this.staticKind(a.e, env)).find((k) => k === "i32" || k === "i64") ?? null;
+      const args = pk && e.args.some((a) => shifted(a.e)) && !e.args.some((a) => a.name || a.e.k === "spread")
+        ? e.args.map((a) => this.eval(a.e, env, shifted(a.e) ? { k: "name", name: pk, args: [] } : null))
+        : this.evalArgs(e.args, env);
       const typed = args.some((a) => !(a instanceof Lit) && numKind(a) !== null);
       // E9.1: a constant tree beside an `f32` argument folds in f32 arithmetic; a tree is pure.
       if (args.some((a) => !(a instanceof Lit) && numKind(a) === "f32")) {
@@ -1483,7 +1608,7 @@ export class Interp {
       const lits = args.filter((a) => a instanceof Lit) as Lit[];
       return f.call(args.map((a) => a instanceof Lit && !typed ? (lits.length === 2 ? pairDefault(a, lits[0] === a ? lits[1] : lits[0]) : litDefault(a)) : a), this);
     }
-    return this.callValue(f, e.args, env, e.line);
+    return this.callValue(f, e.args, env, e.line, bind);
   }
 
   // The built-in storage operations (E11.4; std.md STD1.3 and its "not yet in force" list).
@@ -1568,6 +1693,8 @@ export class Interp {
       return this.castFail(e, "not a member");
     }
     const k = t.name;
+    // T1.1/T1.3: `u8` is the one narrow width with a value domain; the others are storage only.
+    if (k === "u16" || k === "u32" || k === "i8" || k === "i16") throw new TypeFault(`\`${k}\` is not a value type`);
     if (typeof v === "boolean") v = v ? 1 : 0; // E8.5
     // T2.4: a constant operand takes the cast's target as its context, so `0xFFFFFFFF as i64`
     // is 4294967295; one the target cannot hold is a failed cast.
@@ -1576,8 +1703,20 @@ export class Interp {
     // a radix tree as wide as i64 (a pattern over 32 bits, or a decimal leaf outside i32) is read
     // at i64 before an integer cast checks its range
     if (v instanceof Lit && v.radix && (v.radix === 64 || v.wideDec) && k !== "f64" && k !== "f32" && e.mode !== "as%") v = litTo(v, "i64");
+    // 4.1 / D1890: `as f32` / `as f64` rounds an integer constant to the nearest float, once.
+    if (v instanceof Lit && v.i !== null && !v.radix && (k === "f32" || k === "f64")) return k === "f64" ? new Flt(Number(v.i), 64) : new Flt(bigToF32(v.i), 32);
     if (v instanceof Lit && e.mode !== "as%") {
-      try { return litTo(v, k === "u8" || k === "u16" ? "i32" : k); } catch (x) { if (!(x instanceof LitFault)) throw x; return this.castFail(e, "not exact"); }
+      let r: Val;
+      try { r = litTo(v, k === "u8" ? "i32" : k); } catch (x) { if (!(x instanceof LitFault)) throw x; return this.castFail(e, "not exact"); }
+      // E8.3: `as u8` checks the 0..255 domain; a radix constant is its 32-bit pattern there.
+      if (k === "u8" && ((r as number) < 0 || (r as number) > 255)) return this.castFail(e, "not exact");
+      return r;
+    }
+    // D3053 ruling (A): under `as% i64` a radix literal, or a chain of negations over one, is the
+    // constant its digits spell; another radix tree there has no ruling (D16494).
+    if (v instanceof Lit && v.radix && e.mode === "as%" && k === "i64") {
+      if (v.lone || negatedRadix(e.e)) return wrap64(v.i!);
+      if (v.radix !== 64 && !v.wideDec) throw new Unsupported("spec gap: a radix constant tree under `as% i64` (D16494)");
     }
     if (v instanceof Lit) v = litDefault(v);
     const src = numKind(v);

@@ -1,0 +1,407 @@
+// The typed mid-level IR (docs/internals/ir-design-2026-11.md §1): structured control, operands
+// in ANF, mutable locals rather than SSA. One `IrFn` holds one function's arena, so it can be
+// built, verified and printed in isolation. Ids are i32 indices into that arena; a rep is an
+// `emit_rep.vl` tree node (`repNodeOfTy`), valid only within the rebuild epoch that produced it,
+// and a type a checker arena index. Conversions arrive as one coercion node with `coercionAt`
+// (step I3).
+import { i32ToStr } from "./ast"
+import {
+  RAtom,
+  RBox,
+  RClosure,
+  RList,
+  RMap,
+  RNoValue,
+  RNullable,
+  RPrim,
+  RRecord,
+  RUnsup,
+  RpPrim,
+  repNodeAt,
+} from "./emit_rep"
+
+// An operand: a variable, an immediate of a primitive rep, or an interned string.
+export type OVar = { ov: i32 }
+export type OImm = { oiRep: i32, oiBits: i64 }
+export type OStr = { osText: i32 }
+export type Opnd = OVar | OImm | OStr
+
+// The primitive operations, per `PrimRep`; the verifier gives each its operand signature.
+// Signedness lives on the op: `u32`/`u64` share i32's and i64's reps, so the unsigned forms
+// (`divu` … `geu`, `shru`) are chosen from the operand's type.
+export type PrimOp = "add" | "sub" | "mul" | "div" | "divu" | "rem" | "remu" | "and" | "or"
+  | "xor" | "shl" | "shr" | "shru" | "eq" | "ne" | "lt" | "ltu" | "le" | "leu" | "gt" | "gtu"
+  | "ge" | "geu" | "neg" | "not"
+export type MapOp = "get" | "has" | "set" | "delete" | "keys"
+export type StrOp = "concat" | "len" | "at" | "slice" | "eq"
+export type CastFail = "trap" | "null"
+
+// The right-hand side of an `SLet`; the result rep is its destination's.
+export type RPrimOp = { poOp: PrimOp, poArgs: Opnd[] }
+export type RCall = { caCallee: i32, caArgs: Opnd[] }
+export type RCallRef = { crFn: Opnd, crSig: i32, crArgs: Opnd[] }
+export type RCallHost = { chImport: i32, chArgs: Opnd[] }
+export type RTest = { teV: Opnd, teTarget: i32 }
+export type RCast = { ctV: Opnd, ctTarget: i32, ctOnFail: CastFail }
+export type RTagOf = { tgV: Opnd }
+export type RMakeRec = { mrFields: Opnd[] }
+export type RGetField = { gfV: Opnd, gfIx: i32 }
+export type RMakeList = { mlElems: Opnd[] }
+export type RListNew = { lnLen: Opnd, lnFill: Opnd }
+export type RListGet = { lgV: Opnd, lgIx: Opnd }
+export type RListLen = { llV: Opnd }
+export type RMapOp = { mpOp: MapOp, mpArgs: Opnd[] }
+export type RStrOp = { soOp: StrOp, soArgs: Opnd[] }
+export type RMakeClo = { mcFn: i32, mcEnv: Opnd[] }
+export type RFnId = { fiMember: i32 }
+export type RCellNew = { cnInit: Opnd }
+export type RCellGet = { cgCell: Opnd }
+export type RGlobalGet = { ggSym: i32 }
+export type Rhs = RPrimOp | RCall | RCallRef | RCallHost | RTest | RCast | RTagOf
+  | RMakeRec | RGetField | RMakeList | RListNew | RListGet | RListLen | RMapOp | RStrOp
+  | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet
+
+// A `match` arm: union arm `swArm` (-1 for the default, which names what it excludes in
+// `swWhy`), and its body.
+export type SwitchArm = { swArm: i32, swWhy: string, swBody: i32[] }
+
+// The statements. A body is a list of node ids; an `SIf`'s or `SBlock`'s out-variable (-1 for
+// none) is written by an `SAssign` that ends each arm, or by each `SBr` to the block's label.
+export type SLet = { lDst: i32, lRhs: Rhs }
+export type SAssign = { asDst: i32, asSrc: Opnd }
+export type SSetField = { sfV: Opnd, sfIx: i32, sfSrc: Opnd }
+export type SListSet = { lsV: Opnd, lsIx: Opnd, lsSrc: Opnd }
+export type SCellSet = { csCell: Opnd, csSrc: Opnd }
+export type SGlobalSet = { gsSym: i32, gsSrc: Opnd }
+export type SBoundsCheck = { bcV: Opnd, bcIx: Opnd }
+export type SEffect = { efRhs: Rhs }
+export type SBlock = { bkLabel: i32, bkBody: i32[], bkOut: i32 }
+export type SLoop = { lpLabel: i32, lpBody: i32[] }
+export type SIf = { siCond: Opnd, siThen: i32[], siElse: i32[], siOut: i32 }
+export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
+export type SBr = { brLabel: i32, brHas: boolean, brVal: Opnd }
+export type SReturn = { rtHas: boolean, rtV: Opnd }
+export type STrap = { tpWhy: i32 }
+// A value evaluated and discarded, as legacy writes a bare value statement. Migration only: it
+// goes, with every use, once bytes may move.
+export type SDrop = { dpV: Opnd }
+export type IrNode = SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet
+  | SBoundsCheck | SEffect | SBlock | SLoop | SIf | SSwitch | SBr | SReturn | STrap | SDrop
+
+export type VarKind = "param" | "local" | "temp"
+// A variable: its rep (fixed at its definition), type, kind and wasm local index (-1 unset).
+export type IrVar = { vRep: i32, vTy: i32, vKind: VarKind, vSlot: i32 }
+
+// One function: the node arena with each node's type, rep and source node, the variables, the
+// top-level body, the parameters and result, and the signatures of the functions and the reps of
+// the globals it uses, and the source statement that built each run of nodes (`irSpan*`).
+export type IrFn = {
+  irNodes: IrNode[],
+  irNodeTy: i32[],
+  irNodeRep: i32[],
+  irNodeAt: i32[],
+  irVars: IrVar[],
+  irBody: i32[],
+  irParams: i32[],
+  irRetRep: i32,
+  irRetTy: i32,
+  irAt: i32,
+  irName: string,
+  irSigFn: i32[],
+  irSigParams: i32[][],
+  irSigRet: i32[],
+  irGlobalSym: i32[],
+  irGlobalRep: i32[],
+  irSpanAst: i32[],
+  irSpanFirst: i32[],
+  irSpanLast: i32[],
+}
+
+export function irFnNew(at: i32, name: string): IrFn {
+  const f: IrFn = {
+    irNodes: [],
+    irNodeTy: [],
+    irNodeRep: [],
+    irNodeAt: [],
+    irVars: [],
+    irBody: [],
+    irParams: [],
+    irRetRep: -1,
+    irRetTy: -1,
+    irAt: at,
+    irName: name,
+    irSigFn: [],
+    irSigParams: [],
+    irSigRet: [],
+    irGlobalSym: [],
+    irGlobalRep: [],
+    irSpanAst: [],
+    irSpanFirst: [],
+    irSpanLast: [],
+  }
+  f
+}
+
+// Appends a variable to `f` and returns its id.
+export function irVarNew(
+  f: IrFn,
+  rep: i32,
+  ty: i32,
+  kind: VarKind,
+  slot: i32,
+): i32 {
+  f.irVars.push({ vRep: rep, vTy: ty, vKind: kind, vSlot: slot })
+  f.irVars.length - 1
+}
+
+// Appends node `n` with its header fields to `f`'s arena and returns its id; the caller places
+// the id in a body.
+export function irNodeNew(f: IrFn, n: IrNode, ty: i32, rep: i32, at: i32): i32 {
+  f.irNodes.push(n)
+  f.irNodeTy.push(ty)
+  f.irNodeRep.push(rep)
+  f.irNodeAt.push(at)
+  f.irNodes.length - 1
+}
+
+// The signature `f` records for callee `fnPos`: its index into `irSig*`, or -1 for none.
+export function irSigOf(f: IrFn, fnPos: i32): i32 {
+  let i = 0
+  while i < f.irSigFn.length {
+    if f.irSigFn[i] == fnPos { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Records callee `fnPos`'s parameter and result reps once.
+export function irSigNote(f: IrFn, fnPos: i32, params: i32[], ret: i32) {
+  if irSigOf(f, fnPos) >= 0 { return 0 }
+  f.irSigFn.push(fnPos)
+  f.irSigParams.push(params)
+  f.irSigRet.push(ret)
+  0
+}
+
+// Records that source statement `ast` built the nodes from `first` to `last` of one body.
+export function irSpanNote(f: IrFn, ast: i32, first: i32, last: i32) {
+  f.irSpanAst.push(ast)
+  f.irSpanFirst.push(first)
+  f.irSpanLast.push(last)
+  0
+}
+
+// The rep `f` records for global `sym`, or -1 for none.
+export function irGlobalRepOf(f: IrFn, sym: i32): i32 {
+  let i = 0
+  while i < f.irGlobalSym.length {
+    if f.irGlobalSym[i] == sym { return f.irGlobalRep[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// Records global `sym`'s rep once.
+export function irGlobalNote(f: IrFn, sym: i32, rep: i32) {
+  if irGlobalRepOf(f, sym) >= 0 { return 0 }
+  f.irGlobalSym.push(sym)
+  f.irGlobalRep.push(rep)
+  0
+}
+
+// Whether `body` leaves on every path: it ends in a branch, a return or a trap, or in an `if`
+// both of whose arms leave. A loop is never counted as leaving.
+export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
+  if body.length == 0 { return false }
+  const last = body[body.length - 1]
+  if last < 0 || last >= f.irNodes.length { return false }
+  const n = f.irNodes[last]
+  match n {
+    SBr | SReturn | STrap => true
+    SIf => irBodyLeaves(f, n.siThen) && irBodyLeaves(f, n.siElse)
+    SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBlock | SLoop | SSwitch | SDrop => false
+  }
+}
+
+// Rep `r`'s primitive when it is an unpacked primitive leaf, else null.
+export function repPrim(r: i32): RpPrim | null {
+  const n = repNodeAt(r)
+  if n == null { return null }
+  match n {
+    RPrim => if n.rpPacked != 0 { null } else { n.rpK }
+    RAtom | RList | RMap | RBox | RClosure | RRecord | RNullable | RUnsup | RNoValue => null
+  }
+}
+
+// Whether rep `r` is a value rep a variable may hold: a primitive I1 lowers.
+export function repIsScalar(r: i32): boolean {
+  const p = repPrim(r)
+  p == "i32" || p == "i64" || p == "f64" || p == "f32" || p == "bool"
+}
+
+export function repIsNoValue(r: i32): boolean { repNodeAt(r) is RNoValue }
+
+// Rep `r` for a reader: its primitive or its node's kind, `?` outside the tree.
+export function repWhat(r: i32): string {
+  const n = repNodeAt(r)
+  if n == null { return "?" }
+  match n {
+    RPrim => n.rpK
+    RAtom => "atom"
+    RList => "list"
+    RMap => "map"
+    RBox => "box"
+    RClosure => "closure"
+    RRecord => "record"
+    RNullable => "nullable"
+    RUnsup => "unsup"
+    RNoValue => "novalue"
+  }
+}
+
+function repText(r: i32): string { repWhat(r) + "#" + i32ToStr(r) }
+
+function opndText(o: Opnd): string {
+  match o {
+    OVar => "v" + i32ToStr(o.ov)
+    OImm => {
+      const b = o.oiBits
+      if b >= -2147483648 && b <= 2147483647 {
+        return repWhat(o.oiRep) + " " + i32ToStr(b as% i32)
+      }
+      repWhat(o.oiRep) + " <wide>"
+    }
+    OStr => "str" + i32ToStr(o.osText)
+  }
+}
+
+function opndsText(os: Opnd[]): string {
+  let s = ""
+  for o in os {
+    if s != "" { s = s + ", " }
+    s = s + opndText(o)
+  }
+  s
+}
+
+function rhsText(r: Rhs): string {
+  match r {
+    RPrimOp => r.poOp + "(" + opndsText(r.poArgs) + ")"
+    RCall => "call f" + i32ToStr(r.caCallee) + "(" + opndsText(r.caArgs) + ")"
+    RCallRef => "call_ref " + opndText(r.crFn) + "(" + opndsText(r.crArgs) + ")"
+    RCallHost => "call_host " + i32ToStr(r.chImport) + "(" + opndsText(r.chArgs) + ")"
+    RTest => "is " + opndText(r.teV) + " " + repText(r.teTarget)
+    RCast => "as " + opndText(r.ctV) + " " + repText(r.ctTarget) + " " + r.ctOnFail
+    RTagOf => "tag " + opndText(r.tgV)
+    RMakeRec => "record(" + opndsText(r.mrFields) + ")"
+    RGetField => "field " + opndText(r.gfV) + "." + i32ToStr(r.gfIx)
+    RMakeList => "list(" + opndsText(r.mlElems) + ")"
+    RListNew => "list_new(" + opndText(r.lnLen) + ", " + opndText(r.lnFill) + ")"
+    RListGet => "get " + opndText(r.lgV) + "[" + opndText(r.lgIx) + "]"
+    RListLen => "len " + opndText(r.llV)
+    RMapOp => "map." + r.mpOp + "(" + opndsText(r.mpArgs) + ")"
+    RStrOp => "str." + r.soOp + "(" + opndsText(r.soArgs) + ")"
+    RMakeClo => "closure f" + i32ToStr(r.mcFn) + "(" + opndsText(r.mcEnv) + ")"
+    RFnId => "fn_id " + i32ToStr(r.fiMember)
+    RCellNew => "cell " + opndText(r.cnInit)
+    RCellGet => "cell_get " + opndText(r.cgCell)
+    RGlobalGet => "global " + i32ToStr(r.ggSym)
+  }
+}
+
+function indent(d: i32): string {
+  let s = ""
+  let i = 0
+  while i < d {
+    s = s + "  "
+    i = i + 1
+  }
+  s
+}
+
+function bodyText(f: IrFn, body: i32[], d: i32): string {
+  let s = ""
+  for id in body { s = s + nodeText(f, id, d) }
+  s
+}
+
+function outText(v: i32): string {
+  if v < 0 { return "" }
+  " -> v" + i32ToStr(v)
+}
+
+function nodeText(f: IrFn, id: i32, d: i32): string {
+  if id < 0 || id >= f.irNodes.length {
+    return indent(d) + "<node " + i32ToStr(id) + ">\n"
+  }
+  const n = f.irNodes[id]
+  const p = indent(d)
+  match n {
+    SLet => p + "v" + i32ToStr(n.lDst) + " = " + rhsText(n.lRhs) + "\n"
+    SAssign => p + "v" + i32ToStr(n.asDst) + " := " + opndText(n.asSrc) + "\n"
+    SSetField => p + opndText(n.sfV) + "." + i32ToStr(n.sfIx) + " := " + opndText(n.sfSrc) + "\n"
+    SListSet => p
+      + opndText(n.lsV)
+      + "["
+      + opndText(n.lsIx)
+      + "] := "
+      + opndText(n.lsSrc)
+      + "\n"
+    SCellSet => p + "cell " + opndText(n.csCell) + " := " + opndText(n.csSrc) + "\n"
+    SGlobalSet => p + "global " + i32ToStr(n.gsSym) + " := " + opndText(n.gsSrc) + "\n"
+    SBoundsCheck => p + "check " + opndText(n.bcV) + "[" + opndText(n.bcIx) + "]\n"
+    SEffect => p + rhsText(n.efRhs) + "\n"
+    SBlock => p
+      + "block L"
+      + i32ToStr(n.bkLabel)
+      + outText(n.bkOut)
+      + "\n"
+      + bodyText(f, n.bkBody, d + 1)
+    SLoop => p + "loop L" + i32ToStr(n.lpLabel) + "\n" + bodyText(f, n.lpBody, d + 1)
+    SIf => {
+      let s = p
+        + "if "
+        + opndText(n.siCond)
+        + outText(n.siOut)
+        + "\n"
+        + bodyText(f, n.siThen, d + 1)
+      if n.siElse.length > 0 {
+        s = s + p + "else\n" + bodyText(f, n.siElse, d + 1)
+      }
+      s
+    }
+    SSwitch => {
+      let s = p + "switch v" + i32ToStr(n.swOn) + outText(n.swOut) + "\n"
+      for a in n.swArms {
+        s = s
+          + p
+          + "arm "
+          + i32ToStr(a.swArm)
+          + "\n"
+          + bodyText(f, a.swBody, d + 1)
+      }
+      s
+    }
+    SBr => {
+      if n.brHas {
+        return p + "br L" + i32ToStr(n.brLabel) + " " + opndText(n.brVal) + "\n"
+      }
+      p + "br L" + i32ToStr(n.brLabel) + "\n"
+    }
+    SReturn => if n.rtHas { p + "return " + opndText(n.rtV) + "\n" } else { p + "return\n" }
+    STrap => p + "trap " + i32ToStr(n.tpWhy) + "\n"
+    SDrop => p + "drop " + opndText(n.dpV) + "\n"
+  }
+}
+
+// `f` as text: a header naming each variable's kind and rep, then the body, one node a line.
+export function irFnText(f: IrFn): string {
+  let s = "fn " + f.irName + " -> " + repText(f.irRetRep) + "\n"
+  let i = 0
+  while i < f.irVars.length {
+    const v = f.irVars[i]
+    s = s + "  v" + i32ToStr(i) + ": " + v.vKind + " " + repText(v.vRep) + "\n"
+    i = i + 1
+  }
+  s + bodyText(f, f.irBody, 1)
+}

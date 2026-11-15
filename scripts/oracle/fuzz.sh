@@ -8,8 +8,9 @@
 # scripts/oracle/gen_data.ts (records, lists, maps, closures, loops, strings, evaluation order);
 # `hof` is scripts/oracle/gen_hof.ts (generics, hole functions, function values, declaration
 # order); `rep` is scripts/fuzzgen.vl's batch (the rep-composition programs fuzz-vl.sh runs); `both` is
-# arith and rep, `all` all four. Exit 1 on a new
-# DISAGREE or UNSOUND verdict (scripts/oracle/known.txt lists the filed ones), 2 on setup failure.
+# arith and rep, `all` all four. Exit 1 on a new DISAGREE or UNSOUND verdict, or a COMPILED-BAD
+# one (scripts/oracle/known.txt lists the filed cells, and the filed refusals by row), 2 on
+# setup failure.
 # Requires a fresh seed (scripts/refresh-compiler.sh) and deno.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -65,3 +66,17 @@ find "$WORK/cases" -maxdepth 1 -name '*.vl' -print0 | sort -z \
   | xargs -0 -n 2000 "$VL" run --batch --out-dir "$WORK/out" --compiler "$SEED_WASM" >/dev/null \
   || { echo "oracle-fuzz: vl run --batch failed"; exit 2; }
 deno run -A scripts/oracle/oracle.ts diff "$WORK/cases" "$WORK/out" --json "$WORK/verdicts.jsonl"
+rc=$?
+# A COMPILED-BAD cell (the compiled program traps, fails to load or prints a wrong value where the
+# oracle runs) fails the run too, unless known.txt lists it: the oracle's own exit counts only
+# disagreements, and a red cell must not pass a green run. A compile that fails with a refusal a
+# known.txt row names is REFUSED-FILED, not COMPILED-BAD; a line's first word is its cell or row id.
+known_cells=$(awk '{ sub(/#.*/, ""); if ($1 != "") print $1 }' scripts/oracle/known.txt)
+bad=$(grep '"verdict":"COMPILED-BAD"' "$WORK/verdicts.jsonl" | sed -e 's/.*"cell":"\([^"]*\)".*/\1/' \
+  | grep -vxF -e "$known_cells" -e '' || true)
+if [ -n "$bad" ]; then
+  echo "oracle-fuzz: $(echo "$bad" | wc -l) COMPILED-BAD cell(s) known.txt does not list:"
+  echo "$bad" | sed 's/^/  /'
+  [ "$rc" -eq 0 ] && rc=1
+fi
+exit "$rc"

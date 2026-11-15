@@ -3,6 +3,7 @@
 // function-slot bookkeeping (`fsb*`) a stored function value is checked against.
 
 import { identDepthOf, identFnAliasOf, identFnDeclOf } from "./check_scopes"
+import { strListHas } from "./listutil"
 import {
   ArrayLit,
   BinExpr,
@@ -97,6 +98,7 @@ import {
   adoptJoinArmAt,
   boundMemberList,
   boundMembersOf,
+  heldRecJoinOf,
   inferRetJoin,
   litJoinOf,
   objShapeAdapterlessAt,
@@ -747,14 +749,15 @@ export function checkBoundSubsumes(
 export let rtpRefusals = 0
 
 // Refuses, and answers true, when a type parameter the callee's RETURN or a function its body
-// declares names is in none of its PARAMETER annotations: no argument binds it. Callers skip
-// explicit type arguments. A DECLARED return is read by its spelling, an INFERRED one by
-// `retTy`, the result the call site holds (D1819).
+// declares names is in none of its PARAMETER annotations and not in `bound`, the names the call's
+// destination bound (D9073). Callers skip explicit type arguments. A DECLARED return is read by
+// its spelling, an INFERRED one by `retTy`, the result the call site holds (D1819).
 export function checkRetTyParamBound(
   declIx: i32,
   who: string,
   ix: i32,
   retTy: i32,
+  bound: string[],
 ): boolean {
   if inferQuiet { return false }
   if declIx < 0 { return false }
@@ -773,7 +776,10 @@ export function checkRetTyParamBound(
         named = tyMentionsTyVarNamed(retTy, dn.fnTyParams[k], 8)
       }
       if named {
-        if !anyParamMentionsTyParam(dn.fnParams, one) {
+        if (
+          !anyParamMentionsTyParam(dn.fnParams, one)
+          && !strListHas(bound, dn.fnTyParams[k])
+        ) {
           let w = "the callee"
           if who != "" { w = "`" + who + "`" }
           let what = "'s return type names it"
@@ -898,7 +904,7 @@ export function checkFnValueRetTyParamBound(arg: i32, fnTy: i32) {
   if a is Ident && ft is TyFunc {
     let d = identFnDeclOf(parenPeelIx(arg))
     if d < 0 { d = identFnAliasOf(parenPeelIx(arg)) }
-    checkRetTyParamBound(d, a.identName, arg, ft.fnRet)
+    checkRetTyParamBound(d, a.identName, arg, ft.fnRet, [])
   }
   return 0
 }
@@ -1383,6 +1389,10 @@ function ifTailBankValTy(
     }
   }
   if f32Join >= 0 { valTy = f32Join }
+  if !f.thenExits && !el.diverges && valTy >= 0 {
+    const held = heldRecJoinOf(valTy, [n.ifThen, n.ifElse], [f.thenTy, el.ty])
+    if held >= 0 { valTy = held }
+  }
   if bareArm { ifValTyAtSetAt(ix, -1) } else { ifValTyAtSetAt(ix, valTy) }
   // A fresh literal arm is built at the join's type, as one delivered to it would be.
   if !bareArm && valTy >= 0 {
@@ -1696,6 +1706,12 @@ function ifTailElseJoin(
   // takes that type instead, and a destination that holds each arm's value types the `if`, so
   // `if ok { a.look } else { "none" }` is a `Look` (DV-1207).
   if !thenExits && !daElseDiverges {
+    const held = heldRecJoinOf(
+      plainJoin,
+      [n.ifThen, n.ifElse],
+      [thenPlain, elsePlain],
+    )
+    if held >= 0 { plainJoin = held }
     const lj = litJoinOf(
       ix,
       plainJoin,

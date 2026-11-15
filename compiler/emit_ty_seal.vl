@@ -37,6 +37,7 @@ import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 import { Interner, internIdIn, internNew } from "./intern"
 import { flattenVariantsInto } from "./tyquery"
 import { fnTagTyIsTagged } from "./check_fn_tag_facts"
+import { emitFail } from "./emit_bytes"
 
 // The id kinds. `CK_UNION` is a member set or list per equality, `CK_SEQ` `tyEq`'s ordered union,
 // `CK_BRAND` a newtype over its base, `CK_BACK` a cycle's back reference and `CK_NOM` a recursive
@@ -59,7 +60,6 @@ const CK_PARAM = 16
 const CK_LIT = 17
 const CK_BRAND = 18
 const CK_ALIAS = 19
-const CK_ARM = 20
 
 // The four equalities: union members as a set; as the spelling renders them, in order with a
 // Set spelled as its boolean map; `tyEq`'s, every child compared as `tyEq` compares it; and the
@@ -92,9 +92,48 @@ export function tyCanonSet(ty: i32): i32 { return canonOf(ty, CF_SET) }
 // The id of type `ty` up to `tySameSpelled`: union members in order, a Set as its boolean map.
 export function tyCanonSpelled(ty: i32): i32 { return canonOf(ty, CF_SPELLED) }
 
-// The id of type `ty` up to its layout: as `tyCanonSpelled`, but a union alias, a nullable and a
-// newtype brand each keep their own id. Two types of one id share a rep; one rep may have two.
-export function tyCanonLayout(ty: i32): i32 { return canonOf(ty, CF_LAYOUT) }
+// The id of type `ty`'s rep: as `tyCanonSpelled`, but a union alias, a nullable, a newtype brand
+// and a record's arm status each keep their own id. Two types of one id share a rep; one rep may
+// have two. Refused before the variant shapes are primed (`canonRepFinal`), when a record's arm
+// status is not yet known; `tyRepIdProvisional` is that early answer.
+export function tyRepId(ty: i32): i32 {
+  if !canonRepReady {
+    emitFail(
+      "internal: tyRepId before the variant shapes are primed; use tyRepIdProvisional",
+    )
+  }
+  canonOf(ty, CF_LAYOUT)
+}
+
+// `tyRepId` before the variant shapes are primed: every record read as no union arm.
+export function tyRepIdProvisional(ty: i32): i32 { canonOf(ty, CF_LAYOUT) }
+
+// Whether the rep ids are final for this program: the variant shapes are primed.
+export function canonRepIsReady(): boolean { canonRepReady }
+
+// Marks the rep ids final, with `arm` the rep tree's union-arm test: called once the variant
+// shapes are primed.
+export function canonRepFinal(arm: (ty: i32) => boolean) {
+  canonArmFn = arm
+  canonRepReady = true
+  canonRepStale = true
+  0
+}
+
+// Starts a program's rep ids afresh: provisional until `canonRepFinal`.
+export function canonRepUnready() {
+  canonArmFn = canonArmUnset
+  canonRepReady = false
+  canonRepStale = true
+  0
+}
+
+// Marks the rep ids stale: the rep tree dropped its nodes, and a record's arm status may have
+// moved with them. The next outermost id walk forgets them.
+export function canonRepDirty() {
+  canonRepStale = true
+  0
+}
 
 function canonStr(s: string): i32 {
   const have = canonStrIds.get(s)
@@ -104,7 +143,21 @@ function canonStr(s: string): i32 {
   return id
 }
 
+// Whether record type `ty` is a union arm, as the rep tree stores it: `canonRepFinal` binds it to
+// `repTyIsVariant`, which this module cannot import; unbound, no record is an arm.
+let canonArmFn: (ty: i32) => boolean = canonArmUnset
+let canonRepReady = false
+
+function canonArmUnset(_ty: i32): boolean { false }
+
+// Whether the rep ids must be forgotten at the next outermost walk (`canonRepDirty`).
+let canonRepStale = false
+
 function canonSync() {
+  if canonRepStale {
+    canonRepStale = false
+    canonMemo[CF_LAYOUT] = []
+  }
   if canonEpoch == tyMutEpoch && canonRenames == tyVarRenames { return 0 }
   canonEpoch = tyMutEpoch
   canonRenames = tyVarRenames
@@ -208,9 +261,11 @@ function canonOfGo(ty: i32, fl: i32): i32 {
   }
 }
 
-// A record's id: its newtype brand, then each field's name and id in order.
+// A record's id: its newtype brand, then each field's name and id in order; a rep id also keys
+// whether the record is a union arm (`repTyIsVariant`), which stores it apart.
 function canonObj(x: i32, t: TyObj, fl: i32): i32 {
   const args: i32[] = [canonStr(nomNameOfTy(x)), t.objFieldNames.length]
+  if fl == CF_LAYOUT { args.push(if canonArmFn(x) { 1 } else { 0 }) }
   let f = 0
   while f < t.objFieldNames.length {
     args.push(canonStr(t.objFieldNames[f]))
@@ -424,12 +479,9 @@ let clAgree = 0
 let clMerge = 0
 let clSplit = 0
 
-// Notes that the rep tree built node `node` for type `ty` of layout id `lid`; `arm` is the node's
-// record arm bit, or -1 for no record. The bit is a program fact, not the type's, so it rides
-// beside the id.
-export function canonShadowLayout(ty: i32, lid: i32, node: i32, arm: i32) {
+// Notes that the rep tree built node `node` for type `ty` of rep id `id`.
+export function canonShadowLayout(ty: i32, id: i32, node: i32) {
   if ty < 0 || node < 0 { return 0 }
-  const id = if arm < 0 { lid } else { internIdIn(canonTab, CK_ARM, [lid, arm], 0) }
   const had = clNodeOf.get(id)
   const hadId = clIdOf.get(node)
   if had == null {

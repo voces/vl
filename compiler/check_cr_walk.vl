@@ -12,37 +12,7 @@ import {
   nodeSpineChildren,
 } from "./ast"
 import { T, tyIsHole } from "./check_types"
-import {
-  crAskProg,
-  crEscNames,
-  crFnBases,
-  crFnIxs,
-  crPendNames,
-  crProgRoot,
-  crRdIx,
-  crRdRet,
-  crRetCalls,
-  crRetLoops,
-  crRetNames,
-  crRetNarTys,
-  crRetRoots,
-  crRetWideTys,
-  crRhsBys,
-  crRhsOps,
-  crRhsPlaces,
-  crRhsRetired,
-  crSoleDecls,
-  crSoleDepths,
-  crSoleRoots,
-  crSoleTys,
-  crStmtFns,
-  crStmtIxs,
-  crStmtPend,
-  crStmtRd,
-  crStmtScopes,
-  crWideDepths,
-  crWideSlots,
-} from "./check_capture_rows"
+import { crAskProg, crRows } from "./check_capture_rows"
 import { crEscWalk, crwBindDeclOf, crwEnsure } from "./check_capture_walks"
 import {
   declTyOf,
@@ -56,11 +26,14 @@ import { i32ListHas } from "./listutil"
 
 // Drop the records of the scope being left, at depth `d` and deeper.
 export function crPopSoleTo(d: i32) {
-  while crSoleDepths.length > 0 && crSoleDepths[crSoleDepths.length - 1] >= d {
-    crSoleDecls.pop()
-    crSoleDepths.pop()
-    crSoleRoots.pop()
-    crSoleTys.pop()
+  while (
+    crRows.soleDepths.length > 0
+    && crRows.soleDepths[crRows.soleDepths.length - 1] >= d
+  ) {
+    crRows.soleDecls.pop()
+    crRows.soleDepths.pop()
+    crRows.soleRoots.pop()
+    crRows.soleTys.pop()
   }
   return 0
 }
@@ -70,8 +43,8 @@ export function crPopSoleTo(d: i32) {
 // declared-type read settled here would be carried into that check against types it never saw.
 export function crInHoleTemplate(): boolean {
   let f = 0
-  while f < crFnIxs.length {
-    const fd = nodeAt(crFnIxs[f])
+  while f < crRows.fnIxs.length {
+    const fd = nodeAt(crRows.fnIxs[f])
     if fd is FuncDecl {
       let i = 0
       while i < fd.fnParams.length {
@@ -90,12 +63,12 @@ export function crInHoleTemplate(): boolean {
 // Enter and leave one statement of a block. Leaving drops the statement's pending names — the
 // emitter has retired them by then — and its read rows.
 export function crStmtEnter(stmtIx: i32) {
-  crStmtIxs.push(stmtIx)
-  crStmtFns.push(crFnBases.length)
-  crStmtPend.push(crPendNames.length)
-  crStmtRd.push(crRdRet.length)
-  crStmtScopes.push(T.frames.length)
-  return 0
+  crRows.stmtIxs.push(stmtIx)
+  crRows.stmtFns.push(crRows.fnBases.length)
+  crRows.stmtPend.push(crRows.pendNames.length)
+  crRows.stmtRd.push(crRows.rdRet.length)
+  crRows.stmtScopes.push(T.frames.length)
+  0
 }
 
 // The visible slots of the names narrowed in the current function, one per name.
@@ -120,10 +93,10 @@ export function crLiveSlots(): i32[] {
 
 // The innermost open statement that holds the scope at depth `d`, or -1.
 export function crStmtHolding(d: i32): i32 {
-  let i = crStmtIxs.length - 1
+  let i = crRows.stmtIxs.length - 1
   while i >= 0 {
-    if crStmtFns[i] != crFnBases.length { return -1 }
-    if crStmtScopes[i] <= d { return crStmtIxs[i] }
+    if crRows.stmtFns[i] != crRows.fnBases.length { return -1 }
+    if crRows.stmtScopes[i] <= d { return crRows.stmtIxs[i] }
     i = i - 1
   }
   return -1
@@ -132,9 +105,9 @@ export function crStmtHolding(d: i32): i32 {
 // Whether `name` is bound in the innermost scope only by `crDeclareWidened`.
 export function crWidenedInTop(name: string): boolean {
   const d = T.frames.length - 1
-  let i = crWideSlots.length - 1
-  while i >= 0 && crWideDepths[i] >= d {
-    if crWideDepths[i] == d && slotNameOf(crWideSlots[i]) == name {
+  let i = crRows.wideSlots.length - 1
+  while i >= 0 && crRows.wideDepths[i] >= d {
+    if crRows.wideDepths[i] == d && slotNameOf(crRows.wideSlots[i]) == name {
       return true
     }
     i = i - 1
@@ -145,10 +118,10 @@ export function crWidenedInTop(name: string): boolean {
 // A declaration of `name` in the innermost scope replaces its `crDeclareWidened` binding.
 export function crUnwidenTop(name: string) {
   const d = T.frames.length - 1
-  let i = crWideSlots.length - 1
-  while i >= 0 && crWideDepths[i] >= d {
-    if crWideDepths[i] == d && slotNameOf(crWideSlots[i]) == name {
-      crWideSlots[i] = -1
+  let i = crRows.wideSlots.length - 1
+  while i >= 0 && crRows.wideDepths[i] >= d {
+    if crRows.wideDepths[i] == d && slotNameOf(crRows.wideSlots[i]) == name {
+      crRows.wideSlots[i] = -1
     }
     i = i - 1
   }
@@ -171,9 +144,9 @@ export function crLambdaHandle(fnIx: i32): i32 {
 export function crLambdaEscapes(fnIx: i32): i32 {
   const h = crLambdaHandle(fnIx)
   if h < 0 { return 1 }
-  let body = crProgRoot
-  if crFnIxs.length >= 2 {
-    const pf = nodeAt(crFnIxs[crFnIxs.length - 2])
+  let body = crRows.progRoot
+  if crRows.fnIxs.length >= 2 {
+    const pf = nodeAt(crRows.fnIxs[crRows.fnIxs.length - 2])
     if pf is FuncDecl { body = pf.fnBody }
   }
   if crEscapesIn(body, h) { return 1 }
@@ -183,12 +156,12 @@ export function crLambdaEscapes(fnIx: i32): i32 {
 // Whether the binding declared at `decl` is read in `body` other than as its own callee, from one
 // walk per body.
 export function crEscapesIn(body: i32, decl: i32): boolean {
-  if body == crProgRoot { crAskProg("e", decl) }
-  let esc = crEscNames[body]
+  if body == crRows.progRoot { crAskProg("e", decl) }
+  let esc = crRows.escNames[body]
   if esc == null {
     const got: {[i32]: boolean} = Map()
     crEscWalk(body, false, got)
-    crEscNames[body] = got
+    crRows.escNames[body] = got
     esc = got
   }
   return (esc ?? crNoEsc).has(decl)
@@ -199,9 +172,9 @@ const crNoEsc: {[i32]: boolean} = Map()
 // Whether the binding declared at `decl` is read in the body being checked other than as its own
 // callee.
 export function crDeclEscapesHere(decl: i32): boolean {
-  let body = crProgRoot
-  if crFnIxs.length >= 1 {
-    const pf = nodeAt(crFnIxs[crFnIxs.length - 1])
+  let body = crRows.progRoot
+  if crRows.fnIxs.length >= 1 {
+    const pf = nodeAt(crRows.fnIxs[crRows.fnIxs.length - 1])
     if pf is FuncDecl { body = pf.fnBody }
   }
   return crEscapesIn(body, decl)
@@ -211,9 +184,11 @@ const crNoPlaces: i32[] = []
 
 // The node that retired place `pl` in the right operand of the `&&`/`||` at `opIx`, or -1.
 function crRhsRetiredBy(opIx: i32, pl: i32): i32 {
-  let i = crRhsOps.length - 1
+  let i = crRows.rhsOps.length - 1
   while i >= 0 {
-    if crRhsOps[i] == opIx && crRhsPlaces[i] == pl { return crRhsBys[i] }
+    if crRows.rhsOps[i] == opIx && crRows.rhsPlaces[i] == pl {
+      return crRows.rhsBys[i]
+    }
     i = i - 1
   }
   return -1
@@ -222,10 +197,10 @@ function crRhsRetiredBy(opIx: i32, pl: i32): i32 {
 // Whether a `&&`/`||` in the condition at `condIx` had its right operand retire place `pl`: the
 // condition's arms then hold no fact about it, and no join below the `if` may install one.
 export function crCondRetired(condIx: i32, pl: i32): boolean {
-  if crRhsRetired.length == 0 || condIx < 0 || condIx >= P.nodes.length {
+  if crRows.rhsRetired.length == 0 || condIx < 0 || condIx >= P.nodes.length {
     return false
   }
-  const r = crRhsRetired[condIx] ?? crNoPlaces
+  const r = crRows.rhsRetired[condIx] ?? crNoPlaces
   if i32ListHas(r, pl) { return true }
   let cur = condIx
   while cur >= 0 {
@@ -248,8 +223,8 @@ export function crFilterRhsRetired(
   tys: i32[],
   mark: i32,
 ) {
-  if crRhsRetired.length == 0 { return 0 }
-  const gone = crRhsRetired[opIx] ?? crNoPlaces
+  if crRows.rhsRetired.length == 0 { return 0 }
+  const gone = crRows.rhsRetired[opIx] ?? crNoPlaces
   if gone.length == 0 { return 0 }
   let w = mark
   let i = mark
@@ -257,12 +232,12 @@ export function crFilterRhsRetired(
     if i32ListHas(gone, places[i]) {
       const by = crRhsRetiredBy(opIx, places[i])
       if by >= 0 {
-        crRetNames.push(placeText(places[i]))
-        crRetCalls.push(by)
-        crRetNarTys.push(tys[i])
-        crRetWideTys.push(placeNameTy(places[i]))
-        crRetRoots.push(crCurRoot())
-        crRetLoops.push(false)
+        crRows.retNames.push(placeText(places[i]))
+        crRows.retCalls.push(by)
+        crRows.retNarTys.push(tys[i])
+        crRows.retWideTys.push(placeNameTy(places[i]))
+        crRows.retRoots.push(crCurRoot())
+        crRows.retLoops.push(false)
       }
     } else {
       places[w] = places[i]
@@ -281,14 +256,14 @@ export function crFilterRhsRetired(
 // The path twin of `crReadHook`'s note half: a read of `key` with no narrowing left, after a
 // condition dropped a fact about it, is remembered so a diagnostic spanning it names the cause.
 export function crPathDropRead(key: string, ix: i32) {
-  if crRetNames.length == 0 || crStmtIxs.length == 0 { return 0 }
+  if crRows.retNames.length == 0 || crRows.stmtIxs.length == 0 { return 0 }
   const root = crCurRoot()
-  let r = crRetNames.length - 1
+  let r = crRows.retNames.length - 1
   while r >= 0 {
-    if crRetNames[r] == key && crRetRoots[r] == root {
-      if crRetWideTys[r] < 0 {
-        crRdRet.push(r)
-        crRdIx.push(ix)
+    if crRows.retNames[r] == key && crRows.retRoots[r] == root {
+      if crRows.retWideTys[r] < 0 {
+        crRows.rdRet.push(r)
+        crRows.rdIx.push(ix)
       }
       return 0
     }

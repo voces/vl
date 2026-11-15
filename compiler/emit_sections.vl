@@ -1,4 +1,5 @@
 import { vkShadowLocals, vkShadowSweep } from "./emit_vk_shadow"
+import { fcShadowSweep } from "./emit_fc_shadow"
 import { repSlotOfKind } from "./emit_rep_slot"
 import { spellTyShadowSweep } from "./emit_union_atoms"
 import { monoPinSpellShaped } from "./pin_spell"
@@ -26,13 +27,14 @@ import { mfrLitsRun } from "./mfr_shadow"
 // model, per-function code emission, the opt-in name section). Sits above `wasmEmit.vl`, calling down into it for every statement/expression body.
 
 import { idShadowInstRow, idShadowSnap } from "./emit_id_shadow"
-import { canonShadowReport } from "./emit_ty_seal"
+import { canonRepFinal, canonShadowReport } from "./emit_ty_seal"
 import { elabFnIdReset, elabSpecGroupRow, elabSpecReset } from "./elab_fn_id"
 import { idShadowModeOf } from "./id_shadow_state"
 import { lamChainSnap } from "./check_lam_chain"
 import { recordRowClassOf, recordRowsRun } from "./record_rows"
 import { fvaMakerCallRows } from "./check_assignable"
 import { boxDstShadowBegin } from "./box_dst_shadow"
+import { irShadowArmed, irShadowBegin, irShadowFn } from "./ir_build"
 import { canonShowCanon, canonShowWritten } from "./check_canon_raw"
 import {
   nodeTyCarry,
@@ -106,6 +108,7 @@ import {
   repNodeScalarMask,
   repReset,
   repShadowSweep,
+  repTyIsVariant,
   repVariantShapeRowOf,
   repVariantShapesPrime,
   rlElemKindAt,
@@ -218,6 +221,8 @@ import {
   ByteRope,
   HELP_LIST_GROW,
   HELP_MAP_COMPACT,
+  HELP_MAP_ENTRY,
+  HELP_MAP_ENTRY_I32,
   HELP_MAP_PROBE,
   HELP_MAP_PROBE_I32,
   HELP_MAP_PROBE_I64,
@@ -382,6 +387,8 @@ import {
   gHelpF64Rem,
   gHelpInitFail,
   gHelpMapCompact,
+  gHelpMapEntry,
+  gHelpMapEntryI32,
   gHelpMapProbe,
   gHelpMapProbeI32,
   gHelpMapProbeI64,
@@ -1290,6 +1297,7 @@ function envCacheOpen(fnPos: i32) {
 function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
+    const irOutStart = out.length
     // Anchors any emit failure raised while lowering this body at its declaration (`emitFail`
     // snapshots `emitCurFnIx`). Sequential emission means the cursor's value at failure time is
     // the offending function; `fnPos` is the caller's own `fnStmts` loop index, which `fnStmtsPosOf` reads instead of scanning.
@@ -1397,6 +1405,10 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     rebaseStmtSpans(stmtSpanBase, bodyInOut, exprInBody)
     wBytes(body)
     wTarget(outPrev)
+    // The IR shadow reads this function's frame after its lowering; it writes no byte.
+    if irShadowArmed() {
+      irShadowFn(fnIx, fnPos, out, irOutStart, stmtSpanBase)
+    }
     return 0
   }
   return emitFail("emitProgram: not a function declaration")
@@ -3687,7 +3699,7 @@ function emitMapProbeBackEdge(startL: i32) {
 // `__map_probe__(keyHash, index, hashes, live, keysBacking, key) -> i32`: wrapping linear probe
 // of a string-keyed index to the slot holding the key's entry or the free slot ending its chain.
 // A dead entry is a probe marker, never a hit; only a module that deletes has one to test.
-function emitMapProbeFnCode(out: u8[]) {
+function emitMapProbeFnCode(out: u8[], entry: boolean) {
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
@@ -3750,13 +3762,13 @@ function emitMapProbeFnCode(out: u8[]) {
   fbI32Const(1)
   fbI32Bin(106)
   fbLocalGet(6)
-  fbI32Bin(113) // 0x71 i32.and
+  fbI32Bin(113)                         // 0x71 i32.and
   fbLocalTee(7)
   emitMapProbeBackEdge(9)
-  fbEnd()       // end (loop)
-  fbEnd()       // end (probe block)
-  fbLocalGet(7) // the probe slot
-  fbEnd()       // end (function)
+  fbEnd()                               // end (loop)
+  fbEnd()                               // end (probe block)
+  fbLocalGet(if entry { 8 } else { 7 }) // the slot's entry (`__map_entry__`), else the slot
+  fbEnd()                               // end (function)
   wTarget(prev)
   return helpFrameBody(out, body)
 }
@@ -3764,7 +3776,7 @@ function emitMapProbeFnCode(out: u8[]) {
 // `__map_probe_i32__(index, key) -> slot`: the i32-keyed probe over (key, entry) pairs, placed
 // by `fbMapSlotOf`, to the pair slot holding the key or the free one ending its chain. It reads
 // the index alone; a deleted pair (entry -1) is never a hit, and only a module that deletes has one.
-function emitMapProbeI32FnCode(out: u8[]) {
+function emitMapProbeI32FnCode(out: u8[], entry: boolean) {
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
@@ -3819,7 +3831,7 @@ function emitMapProbeI32FnCode(out: u8[]) {
   emitMapProbeBackEdge(5)
   fbEnd() // end (loop)
   fbEnd() // end (probe block)
-  fbLocalGet(3)
+  fbLocalGet(if entry { 4 } else { 3 }) // the pair's entry (`__map_entry_i32__`), else the slot
   fbEnd() // end (function)
   wTarget(prev)
   return helpFrameBody(out, body)
@@ -5764,10 +5776,12 @@ function tailHelpFnCode(out: u8[], kind: i32): i32 {
   if kind == HELP_UTF8_ENC { return emitUtf8EncFnCode(out) }
   if kind == HELP_UTF8_CPLEN { return emitUtf8CpLenFnCode(out) }
   if kind == HELP_STR_BYTES { return emitStrBytesFnCode(out) }
-  if kind == HELP_MAP_PROBE { return emitMapProbeFnCode(out) }
+  if kind == HELP_MAP_PROBE { return emitMapProbeFnCode(out, false) }
+  if kind == HELP_MAP_ENTRY { return emitMapProbeFnCode(out, true) }
+  if kind == HELP_MAP_ENTRY_I32 { return emitMapProbeI32FnCode(out, true) }
   if kind == HELP_MAP_RESIZE { return emitMapResizeFnCode(out) }
   if kind == HELP_MAP_RESYNC { return emitMapResyncFnCode(out) }
-  if kind == HELP_MAP_PROBE_I32 { return emitMapProbeI32FnCode(out) }
+  if kind == HELP_MAP_PROBE_I32 { return emitMapProbeI32FnCode(out, false) }
   if kind == HELP_MAP_RESIZE_I32 { return emitMapResizeI32FnCode(out) }
   if kind == HELP_MAP_PROBE_I64 { return emitMapProbeI64FnCode(out) }
   if kind >= HELP_LIST_GROW {
@@ -5789,6 +5803,8 @@ function tailHelpName(kind: i32): string {
   if kind == HELP_MAP_RESIZE { return "__map_resize__" }
   if kind == HELP_MAP_RESYNC { return "__map_resync__" }
   if kind == HELP_MAP_PROBE_I32 { return "__map_probe_i32__" }
+  if kind == HELP_MAP_ENTRY { return "__map_entry__" }
+  if kind == HELP_MAP_ENTRY_I32 { return "__map_entry_i32__" }
   if kind == HELP_MAP_RESIZE_I32 { return "__map_resize_i32__" }
   if kind == HELP_MAP_PROBE_I64 { return "__map_probe_i64__" }
   if kind >= HELP_LIST_GROW {
@@ -6517,6 +6533,8 @@ function assignSharedHelperIndices(helpBase: i32) {
   gHelpMapResize = -1
   gHelpMapResizeI32 = -1
   gHelpMapProbeI64 = -1
+  gHelpMapEntry = -1
+  gHelpMapEntryI32 = -1
   gHelpF64Rem = -1
   let nHelpers = 0
   // The float remainder helper (D1586), last for the reason its neighbour above gives: no
@@ -7745,6 +7763,7 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
   monoSubTablesReset()
   callBindShadowBegin()
   boxDstShadowBegin()
+  irShadowBegin()
   tyHasFnMemoReset()
   identAuditBegin()
   const passDone: EmitPass[] = []
@@ -7877,6 +7896,7 @@ function elabPrepareRun(rootIx: i32) {
   elabDeliveredRowClassFn = recordRowClassOf
   elabRun()
   repVariantShapesPrime(elabInstUnionArmTys())
+  canonRepFinal(repTyIsVariant)
   // Before any emit rewrite mints a node the write index does not cover.
   mfrLitsRun()
   canonShowCanon()
@@ -7920,6 +7940,7 @@ function emitProgramRun(rootIx: i32) {
     // The ladder-vs-descriptor agreement oracle, same arming and window: what every converted
     // classifier site answered beside what `repOfTy` would have. A no-op unless armed.
     vkShadowSweep()
+    fcShadowSweep()
     repLadderABSweep()
     return rc
   }
@@ -9132,10 +9153,12 @@ function tailHelpFuncType(kind: i32) {
   if kind == HELP_STR_BYTES { return helpFuncType("s", "y") }
   // (keyHash, index, hashes, live, keysBacking, key) -> slot
   if kind == HELP_MAP_PROBE { return helpFuncType("iaaams", "i") }
+  if kind == HELP_MAP_ENTRY { return helpFuncType("iaaams", "i") }
   if kind == HELP_MAP_RESIZE { return helpFuncType("aaaii", "a") }
   if kind == HELP_MAP_RESYNC { return mapResyncFuncType() }
   // (index, key i32) -> slot; (index, count) -> index'; (index, key i64, keysBacking) -> slot
   if kind == HELP_MAP_PROBE_I32 { return helpFuncType("ai", "i") }
+  if kind == HELP_MAP_ENTRY_I32 { return helpFuncType("ai", "i") }
   if kind == HELP_MAP_RESIZE_I32 { return helpFuncType("ai", "a") }
   if kind == HELP_MAP_PROBE_I64 { return helpFuncType("ajk", "i") }
   if kind >= HELP_LIST_GROW { return listGrowFuncType(kind - HELP_LIST_GROW) }

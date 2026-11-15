@@ -173,7 +173,8 @@ Deno.test({
 
 // Every module-level keyed map a quiet probe can reach is classified in
 // `scripts/probe-map-classes.tsv`, so a new one fails here until someone says why a probe may
-// leave it standing (ARCHITECTURE §4.3). The reach is the import closure of the probe sites.
+// leave it standing (ARCHITECTURE §4.3). The reach is the import closure of the probe sites, the
+// modules that call `prbEnter()` or open a `quietRunOpen()`.
 const CLASSES = new Set([
   "undo",
   "node-column",
@@ -200,7 +201,7 @@ const probeReachMaps = () => {
   const todo = [...Deno.readDirSync(dir)]
     .filter((e) => e.name.endsWith(".vl"))
     .map((e) => e.name.slice(0, -3))
-    .filter((m) => read(m)!.includes("prbEnter()"));
+    .filter((m) => /prbEnter\(\)|quietRunOpen\(\)/.test(read(m)!));
   const seen = new Map<string, string>();
   while (todo.length > 0) {
     const m = todo.pop()!;
@@ -228,7 +229,7 @@ const probeReachMaps = () => {
       if (t) rec = held.has(t[1]) ? t[1] : "";
       else if (rec !== "" && l.startsWith("}")) rec = "";
       else if (rec !== "") {
-        const fd = /^\s+([A-Za-z0-9_]+): (?:\{\[|Map<)/.exec(l);
+        const fd = /^\s+([A-Za-z0-9_]+): (?:\{\[.*\}|Map<.*>),$/.exec(l);
         if (fd) out.push(`${m}:${rec}.${fd[1]}`);
       }
     }

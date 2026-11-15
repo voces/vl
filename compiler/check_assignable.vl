@@ -133,6 +133,7 @@ import {
   cbSeedUsedSet,
   checkNodeHook,
   cstrProbe,
+  dstOpenBindsBump,
   fvaBuilt,
   fvaDone,
   fvaNamesGeneric,
@@ -198,6 +199,8 @@ import {
   inferQuiet,
   njFnStack,
   quietDepth,
+  quietEnter,
+  quietLeave,
   tpEnvNames,
   tpEnvTyOfName,
   tpEnvTys,
@@ -338,6 +341,7 @@ import {
 import {
   f32LitTailsAdopt,
   f64ExactJoinLeaves,
+  floatTreeAdoptDst,
   litTreeAdoptDst,
   mapDeliveryMayRecord,
   numLitAdoptDeep,
@@ -391,16 +395,16 @@ import {
 } from "./check_relate_core"
 import { recordListWidenRetag } from "./check_retag_rows"
 import {
-  MonoSave,
+  QuietRun,
   RB_PINNED,
   checkMark,
   checkRollback,
   prbArmed,
   prbEnter,
   prbLeave,
+  quietRunOpen,
 } from "./check_rollback"
 import { recordWidenRetagTails, valBindLambda } from "./check_side_rows"
-import { symEnabled } from "./check_state"
 import {
   CSTR_ANYFN,
   SUBST_ALL,
@@ -1763,6 +1767,9 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // where every binding / argument / return / field / element / store position delivers one.
   // The parentheses are adopted with the tree, since the emitter reads the outermost (D15000).
   if srcTy == TY_I32 && litTreeAdoptDst(srcExpr, dstTy) >= 0 { return true }
+  if primNameOf(srcTy) == "f64" && floatTreeAdoptDst(srcExpr, dstTy) >= 0 {
+    return true
+  }
   // A shift its count widened keeps `i32` at an `i32` destination, where the count is refused.
   if srcTy == TY_I64 && dstTy == TY_I32 && shiftWidensLit(srcExpr) {
     return shiftLitAdopt(srcExpr, TY_I32) >= 0
@@ -2393,20 +2400,15 @@ function validateCompArgCstr(
   ix: i32,
 ) {
   if tyHasHole(rexp) || tyHasHole(rat) { return 0 }
-  const savedQuiet = inferQuiet
   if prbArmed { prbEnter() }
-  inferQuiet = true
-  quietDepth = quietDepth + 1
-  const ok = litPinAssignable(argCstr.node[ci], rat, rexp, bNames, bTys)
-  inferQuiet = savedQuiet
-  quietDepth = quietDepth - 1
+  const ok = litPinAssignable(argCstr.node[ci], rat, rexp, bNames, bTys, true)
   if prbArmed { prbLeave("validateCompArgCstr") }
   if !ok { return argFlowErr(rat, rexp, ci, ix) }
   // A held list read by name meets the container rule the direct spelling raises, which the quiet
   // re-check above skips; a fresh list (a call, a literal) converts as it does there (D3402).
   const an = argCstr.node[ci]
   const held = an >= 0 && nodeAt(parenPeelIx(an)) is Ident
-  if !savedQuiet && held && objShapeAdapterlessAt(an, rat, rexp) {
+  if !inferQuiet && held && objShapeAdapterlessAt(an, rat, rexp) {
     objShapeAdapterlessErr(an, rat, rexp)
   }
   return 0
@@ -2917,19 +2919,22 @@ function boundUnionMembers(t: i32): i32 {
   return mkUnionTy(kept)
 }
 
-// `assignableExpr` with the pin's bindings staged for a literal's elements (`litElemSrcTy`).
+// `assignableExpr` with the pin's bindings staged for a literal's elements (`litElemSrcTy`); where
+// `ask`, a fit question (`fitsExpr`). `joinLitsFitAt` reaches only the arena and the relation's memo.
 function litPinAssignable(
   ix: i32,
   src: i32,
   dst: i32,
   bNames: string[],
   bTys: i32[],
+  ask: boolean,
 ): boolean {
   const sN = litPinN
   const sT = litPinT
   litPinNSet(bNames)
   litPinTSet(bTys)
-  const ok = assignableExpr(ix, src, dst) || joinLitsFitAt(ix, dst)
+  const fits = if ask { fitsExpr(ix, src, dst) } else { assignableExpr(ix, src, dst) }
+  const ok = fits || joinLitsFitAt(ix, dst)
   litPinNSet(sN)
   litPinTSet(sT)
   return ok
@@ -3073,7 +3078,7 @@ export function validateRetCstrs(
         ) {
           if (
             rClash
-            || !litPinAssignable(retCstr.ix[ci], rgc, rw, bNames, bTys)
+            || !litPinAssignable(retCstr.ix[ci], rgc, rw, bNames, bTys, false)
               && !bundleMemberFits(retCstr.got[ci], rw, bNames, bTys, ix)
           ) {
             let rWho = "the callee's return"
@@ -3215,7 +3220,10 @@ export function validateLetCstrs(
         (!tyHasHole(lg) && !tyHasHole(lw) || clash)
         && !letLamJudgedAtCall(ci, ix)
       ) {
-        if clash || !litPinAssignable(letCstr.ix[ci], lg, lw, bNames, bTys) {
+        if (
+          clash
+          || !litPinAssignable(letCstr.ix[ci], lg, lw, bNames, bTys, false)
+        ) {
           // A destination one member of a value called at several signatures fits (D15146).
           const member = !clash
             && bundleMemberFits(letCstr.got[ci], lw, bNames, bTys, ix)
@@ -3351,6 +3359,108 @@ export function dstBindLitTyParams(
   return 0
 }
 
+// Binds each type parameter of the generic return `ret` that no argument can bind from the type
+// the call's destination expects: no parameter names it and it is one of `own`, the callee's
+// declared type parameters (D9073), or every parameter naming it is handed a generic function,
+// or one with an un-annotated parameter, open there (D16410).
+export function dstBindOpenFnTyParams(
+  ix: i32,
+  ret: i32,
+  params: i32[],
+  args: i32[],
+  bNames: string[],
+  bTys: i32[],
+  own: string[],
+) {
+  const dst = dstForArgs(callDstTyForGeneric(ix), args, ret)
+  if dst < 0 || ret < 0 || !tyHasTyVar(ret) { return 0 }
+  const dN: string[] = []
+  const dT: i32[] = []
+  bindGenWalk(ret, dst, dN, dT)
+  let k = 0
+  while k < dN.length {
+    const cand = dT[k]
+    if (
+      bindOf(bNames, bTys, dN[k]) < 0
+      && cand >= 0
+      && cand != TY_ERR
+      && !tyHasTyVar(cand)
+      && !dstTyOpen(cand)
+      && dstOnlyOpenFnArgsName(dN[k], params, args, own)
+    ) {
+      bNames.push(dN[k])
+      bTys.push(cand)
+      // The annotation chose the instance, so it is not redundant (D1442).
+      cbSeedUsedSet(cbSeedUsed + 1)
+      dstOpenBindsBump()
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Whether no parameter type of `params` names type parameter `name` and `own` holds it, or each
+// that does is a function type handed an open function (`dstArgIsOpenFn`) and no other argument
+// binds a type parameter of that function type.
+function dstOnlyOpenFnArgsName(
+  name: string,
+  params: i32[],
+  args: i32[],
+  own: string[],
+): boolean {
+  let seen = false
+  let i = 0
+  while i < params.length {
+    if tyMentionsTyVarNamed(params[i], name, 8) {
+      const pt = params[i]
+      if pt < 0 || pt >= T.tys.length || !(tyAt(pt) is TyFunc) { return false }
+      if i >= args.length || !dstArgIsOpenFn(args[i]) { return false }
+      // A type parameter of this slot another argument binds fixes the function's instance,
+      // and so the rest of the slot.
+      const sN: string[] = []
+      const sT: i32[] = []
+      bindGenWalk(pt, pt, sN, sT)
+      let j = 0
+      while j < params.length {
+        if j != i && !(j < args.length && dstArgIsOpenFn(args[j])) {
+          for sn in sN {
+            if tyMentionsTyVarNamed(params[j], sn, 8) { return false }
+          }
+        }
+        j = j + 1
+      }
+      seen = true
+    }
+    i = i + 1
+  }
+  seen || strListHas(own, name)
+}
+
+// The type parameters declaration `d` declares; none when it is not a function.
+export function declOwnTyParams(d: i32): string[] {
+  if d < 0 || d >= P.nodes.length { return [] }
+  const f = nodeAt(d)
+  if f is FuncDecl { return f.fnTyParams }
+  []
+}
+
+// Whether argument `a` is a generic function, or a function or lambda with an un-annotated
+// parameter.
+function dstArgIsOpenFn(a: i32): boolean {
+  const x = parenPeelIx(a)
+  if x < 0 || x >= P.nodes.length { return false }
+  const d = if nodeAt(x) is FuncDecl { x } else if nodeAt(x) is Ident { identFnDeclOf(x) } else { -1 }
+  if d < 0 || d >= P.nodes.length { return false }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) { return false }
+  if f.fnTyParams.length > 0 { return true }
+  for q in f.fnParams {
+    const qp = nodeAt(q)
+    if qp is Param && qp.parType < 0 { return true }
+  }
+  false
+}
+
 // Whether the destination's `cand` for type parameter `name` replaces the arguments' binding at
 // call `ix`: always for a bare `null` beside arguments `cand` holds; for a literal union only
 // when every argument is a literal member of it; otherwise when every argument is a
@@ -3426,13 +3536,11 @@ function dstTyParamAdapts(
       if isCall {
         // A nested call is asked twice, speculatively: what it binds on its own, and whether the
         // destination's type, delivered to it in turn, is what it then answers.
-        inferQuiet = true
-        quietDepth = quietDepth + 1
+        const q = quietEnter()
         setCallDstTy(x, -1)
         at = checkNodeHook(args[i])
         setCallDstTy(x, want)
-        inferQuiet = savedQ
-        quietDepth = quietDepth - 1
+        quietLeave(q)
       } else {
         at = checkNodeHook(args[i])
       }
@@ -3474,7 +3582,8 @@ function dstTyParamAdapts(
   if seen == 0 || own < 0 || tySame(own, cand) { return false }
   if nulls > 0 || litU { return true }
   // Only where the arguments' own instance cannot be delivered: anywhere it can, that instance
-  // is the program's, and a body doing arithmetic on `T` must keep computing at it.
+  // is the program's, and a body doing arithmetic on `T` must keep computing at it. Asked
+  // quietly: the substitution can join a derived hole or fill a generic alias (`callArgRepTy`).
   const savedQ2 = inferQuiet
   inferQuiet = true
   quietDepth = quietDepth + 1
@@ -3496,19 +3605,15 @@ export function monoRecheckBegin(
   paramTyIxs: i32[],
   tpNames: string[],
   tpTys: i32[],
-): MonoSave | null {
+): QuietRun | null {
   if declIx < 0 { return null }
   const dn = nodeAt(declIx)
   if !(dn is FuncDecl) { return null }
   if dn.fnBody < 0 { return null }
   const body = nodeAt(dn.fnBody)
   if !(body is Block) { return null }
-  if prbArmed { prbEnter() }
   monoRecheckDepthSet(monoRecheckDepth + 1)
-  const sv: MonoSave = { quiet: inferQuiet, sym: symEnabled, mark: checkMark() }
-  inferQuiet = true
-  quietDepth = quietDepth + 1
-  symEnabled = 0
+  const sv = quietRunOpen()
   njFnStack.push(njFnIx)
   njFnIxSet(declIx)
   // Binds the type parameters too, not only the value ones: `checkFuncDecl` keeps them in

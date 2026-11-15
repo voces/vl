@@ -291,6 +291,7 @@ import {
   cexRewrite,
   cexTreeShape,
   lbiIsInlined,
+  readsLitConst,
 } from "./check_num_lit_state"
 import {
   cexFitsAt,
@@ -301,6 +302,7 @@ import {
   cexShownFrom,
   dstIntWidth,
   intLitIsNegated,
+  litTreeOps,
   numLitOwnTy,
   radixLeafAmong,
 } from "./check_num_lits"
@@ -1369,6 +1371,9 @@ function radixLitAdoptTails(src: i32, dstTy: i32) {
     }
     si = si + 1
   }
+  // A typed 32-bit tail decides the join, whose literals adopt it before the join meets its
+  // destination (ruling 4.3): `if c { 0xFFFFFFFF } else { v: i32 }` is -1 at an `i64`.
+  if all32 && radixJoinTyped32(leaves) { return 0 }
   let reTy = -1
   let rc = 0
   const fpn = primNameOf(nonNullTy(dstTy))
@@ -1398,6 +1403,21 @@ function radixLitAdoptTails(src: i32, dstTy: i32) {
     tailParensSync(src)
   }
   return rc
+}
+
+// Whether a tail among `leaves` is a value of a 32-bit integer type, not an integer literal, an
+// operator tree over them or a read of a literal `const`.
+function radixJoinTyped32(leaves: i32[]): boolean {
+  for lf in leaves {
+    if (
+      litTreeOps(lf, 8) < 0
+      && !readsLitConst(lf)
+      && dstIntWidth(nodeTyOf(lf), 3) == 32
+    ) {
+      return true
+    }
+  }
+  false
 }
 
 // The f32 a value `match` at `ix` typed `matchTy` takes when its arms are an f32 value and
@@ -3594,8 +3614,11 @@ export function recStoresAgree(md: i32) {
     const st = if own < 0 { bt } else { recFieldRebuiltTy(own, bt, recStoreFieldOf(v)) }
     const at = if st >= 0 { st } else { kd }
     const lit = nodeAt(v) is ObjLit
+    // A value whose own record already stores as the build is built there (D16442).
     const built = st >= 0
-      && (lit || (kd >= 0 && fieldStorageEq(kd, st, REC_STORE_DEPTH)))
+      && (lit
+      || (kd >= 0 && fieldStorageEq(kd, st, REC_STORE_DEPTH))
+      || fieldStorageEq(nodeTyIxOf(v), st, REC_STORE_DEPTH))
     if !built && at >= 0 { recRefuseAtOwnRow(v, nodeTyIxOf(v), at) }
     // A stored literal is built at the build, so its fields are boxed at the build's fields.
     if built && lit { litFieldsBoxAt(v, st, 4) }
@@ -4400,6 +4423,33 @@ function recHeldAsgStamp(d: i32, rep: i32, p: i32, skip: i32[]): boolean {
   return recHeldOwnRefuse(d, rep, p, skip)
 }
 
+// The list literal the fresh, un-annotated `const` that spread argument `x` reads is bound to;
+// else -1.
+export function recSpreadHeldLit(x: i32): i32 {
+  const sv = cwPeelValue(x)
+  const d = if sv >= 0 && nodeAt(sv) is Ident { recHeldDecl(sv) } else { -1 }
+  const l = recHeldInitLit(d)
+  if l >= 0 && nodeAt(l) is ArrayLit { l } else { -1 }
+}
+
+// Builds the fresh list `const` that list literal part `p` spreads at a list of the record `rep`
+// the list's other parts give it, as a spread into a push builds it (D15287), refusing its other
+// deliveries at its own storage. False where `p` spreads no such binding.
+export function recHeldListSpreadStamp(p: i32, rep: i32): boolean {
+  const pn = nodeAt(p)
+  if !(pn is Spread) { return false }
+  recHeldListSpreadStampAt(pn.spdArg, rep)
+}
+
+// `recHeldListSpreadStamp` for spread argument `x`.
+function recHeldListSpreadStampAt(x: i32, rep: i32): boolean {
+  const l = recSpreadHeldLit(x)
+  if l < 0 { return false }
+  const sv = cwPeelValue(x)
+  adoptLitAt(l, mkArrayTy(rep))
+  recHeldOwnRefuse(recHeldDecl(sv), rep, sv, [sv])
+}
+
 // Builds the fresh record `const` that list literal part `p` reads at the record `rep` the list's
 // other parts are built at, refusing its other deliveries at its own storage (D15372). False where
 // `p` reads no such binding.
@@ -4636,6 +4686,12 @@ function recHeldLetWritesAt(
 // The fresh record literal an un-annotated `const`, or `let` nothing reassigns, `d` is
 // initialised with, else -1.
 function recCoalesceHeldLit(d: i32): i32 {
+  const lit = recHeldInitLit(d)
+  if lit >= 0 && nodeAt(lit) is ObjLit { lit } else { -1 }
+}
+
+// The literal the un-annotated `const`, or unwritten `let`, `d` is bound to; else -1.
+function recHeldInitLit(d: i32): i32 {
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
   // A `let` nothing reassigns holds its literal as a `const` does; the index is built first, so
@@ -4644,8 +4700,7 @@ function recCoalesceHeldLit(d: i32): i32 {
     cwIxBuild()
     if !cwLetUnwritten(d) { return -1 }
   }
-  const lit = cwPeelValue(dn.letInit)
-  return if lit >= 0 && nodeAt(lit) is ObjLit { lit } else { -1 }
+  cwPeelValue(dn.letInit)
 }
 
 // The record literal `p`, a `??`, defaults to where `rep` is a record; else -1.
@@ -5843,6 +5898,22 @@ function recHeldFreshCopy(p: i32, o: i32, srcTy: i32, dstTy: i32): boolean {
   }
   recBuildPush(d, own, dst, false)
   return true
+}
+
+// Copies the list call `c` a list literal spreads, element by element, into a list of the record
+// `rep` the list's other parts give it, where its records store a field differently (D16444).
+// False, recording nothing, where the copy does not serve.
+export function recSpreadCallCopy(c: i32, rep: i32): boolean {
+  if c < 0 || c >= P.nodes.length || !(nodeAt(c) is Call) { return false }
+  const own = nonNulTyOf(nodeTyIxOf(c))
+  const oa = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+  if !(oa is TyArray) || !recListElemRecCopies(tyElemOf(oa), rep) {
+    return false
+  }
+  while listCopyTyIx.length <= c { listCopyTyIx.push(-1) }
+  listCopyTyIx[c] = mkArrayTy(rep)
+  listRecCopyNote()
+  true
 }
 
 // How many bindings `recAdoptNote` is delivering through: a call a binding holds is not the
@@ -7299,6 +7370,12 @@ function objShapeListLitAdapts(
       if (objShapeAdapterless(sx, nodeTyIxOf(sx), dst, depth - 1, direct)) {
         return true
       }
+    } else if sp is Spread && recSpreadHeldLit(sp.spdArg) >= 0 {
+      // A fresh list `const` spread here is built at the destination, as a literal is (D16443).
+      const hl = recSpreadHeldLit(sp.spdArg)
+      if (objShapeAdapterless(hl, nodeTyIxOf(hl), dst, depth - 1, direct)) {
+        return true
+      }
     } else if sp is Spread {
       // An existing list's elements are existing records, handed over one at a time (D13960).
       const se = tyArrayElemIx(nodeTyIxOf(sp.spdArg))
@@ -7972,6 +8049,45 @@ export function litJoinOf(ix: i32, join: i32, arms: i32[], tys: i32[]): i32 {
   }
   if nul { return mkNullableTy(jw) }
   return jw
+}
+
+// The record type every held arm of a join holds, when each fresh record-literal arm fits it,
+// or -1: a fresh literal adapts to its held sibling, as a numeric literal does (owner ruling
+// 4.3), so the held record is never asked to fit the literal's widened fields. A join over a
+// type parameter is left to its re-check at each pin.
+export function heldRecJoinOf(join: i32, arms: i32[], tys: i32[]): i32 {
+  if join < 0 || join >= T.tys.length || !(tyAt(join) is TyObj) { return -1 }
+  // The shape first, which most joins fail: one held arm and one fresh record literal.
+  let held = -1
+  let fresh = false
+  let i = 0
+  while i < arms.length {
+    const t = tys[i]
+    if t < 0 || t >= T.tys.length || !(tyAt(t) is TyObj) { return -1 }
+    const tail = joinArmTail(arms[i])
+    if tail >= 0 && nodeAt(tail) is ObjLit { fresh = true }
+    else if held < 0 { held = t }
+    i = i + 1
+  }
+  if held < 0 || !fresh || held == join { return -1 }
+  i = 0
+  while i < arms.length {
+    const t = tys[i]
+    if tyHasTyVar(t) { return -1 }
+    const tail = joinArmTail(arms[i])
+    const lit = tail >= 0 && nodeAt(tail) is ObjLit
+    if !lit && t != held && !tyEq(held, t) { return -1 }
+    i = i + 1
+  }
+  if tyEq(held, join) { return -1 }
+  i = 0
+  while i < arms.length {
+    const tail = joinArmTail(arms[i])
+    const lit = tail >= 0 && nodeAt(tail) is ObjLit
+    if lit && !joinArmFits(arms[i], tys[i], held) { return -1 }
+    i = i + 1
+  }
+  held
 }
 
 // Delivers the tail of an arm a join adopted `jw` for, when its own type does not already fit,

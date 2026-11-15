@@ -164,7 +164,7 @@ import {
 import { crMisuseNote } from "./check_call_retire"
 import { opIdxDecls, opIdxFns, opIdxOps } from "./check_callee"
 import { crLostAny, crLostNote } from "./check_capture_loss"
-import { crRdRet } from "./check_capture_rows"
+import { crRows } from "./check_capture_rows"
 import { chPendGiven, chPendNodes, chPendTys, mkBinOpHole } from "./check_coal"
 import {
   apartHoleJoins,
@@ -1704,7 +1704,7 @@ export function tErrPush(
   // A misuse of a name a call un-narrowed says so, whichever check refused it (D2390).
   let msg = msg0
   let code = code0
-  if crRdRet.length > 0 {
+  if crRows.rdRet.length > 0 {
     const note = crMisuseNote(msg0, at)
     if note != "" {
       msg = msg0 + note
@@ -2578,7 +2578,7 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
       let i = 0
       while i < sp.length {
         bindGenWalk(sp[i], dp[i], bNames, bTys)
-        if !fnSlotAssignable(dp[i], sp[i]) { return false }
+        if !fnParamSlotAssignable(dp[i], sp[i]) { return false }
         i = i + 1
       }
       // A value of a set of declared generics holds each member's own constraints; any other
@@ -3025,13 +3025,10 @@ function applyGenAliasTys(head: string, gi: i32, argTys: i32[]): i32 {
             // other, so it resolves from its own spelling tree — under the `<T>`
             // bindings pushed above, which both routes read from `tpEnvNames`.
             const r = annotResolve(ftn.tyName, annTsOf(fd.fdType))
+            // The annotation node is the declaration's, shared by every instance, so it is not
+            // typed here: an instance's field type is the row's (D16570).
             if r >= 0 {
               fty = r
-              // Record the resolved type on the field's type-annotation node so the emitter
-              // classifies a field type structurally from the `Ty` arena, not a re-parsed name.
-              if !inferQuiet && fd.fdType < nodeTyIx.length {
-                nodeTySet(fd.fdType, r)
-              }
             } else {
               unknownTyErr(
                 ftn.tyName,
@@ -4278,10 +4275,37 @@ export function fnSlotAssignable(src: i32, dst: i32) {
   return assignable(src, dst)
 }
 
+// Whether a function value's parameter `s` takes the destination's parameter `d`: as a slot does,
+// or `d` is one member of a union or `T | null` `s`, which `fvaAdapt`'s adapter delivers
+// unconverted. A number widened into `s` is no member, so it stays refused.
+function fnParamSlotAssignable(d: i32, s: i32): boolean {
+  fnSlotAssignable(d, s) || fnParamMemberOf(d, s)
+}
+
+// Whether `d` is `s` itself or one member of it, through `| null` and nested unions.
+function fnParamMemberOf(d: i32, s: i32): boolean {
+  if d < 0 || s < 0 || d >= T.tys.length || s >= T.tys.length { return false }
+  if tySame(s, d) { return true }
+  const st = tyAt(s)
+  match st {
+    TyNullable => {
+      return fnParamMemberOf(d, st.nInner)
+    }
+    TyUnion => {
+      for m in st.uMembers {
+        if fnParamMemberOf(d, m) { return true }
+      }
+    }
+    // Any other type holds no member but itself.
+    TyPrim | TyErr | TyMap | TyVar | TyLit | TyNeg | TyArray | TyObj | TyFunc => {}
+  }
+  false
+}
+
 // `fnSlotAssignable` for a function slot's RESULT, also admitting a nullable or union holding it,
 // or a number reached exactly (`i32`, or `1 | 5000000000` as a `return` takes it, D9492). The
 // reps differ, so a delivered value is wrapped in `fvaAdapt`'s adapter and a function in a
-// container is refused (D9781). A parameter stays invariant.
+// container is refused (D9781). A parameter widens only to a union holding it (`fnParamSlotAssignable`).
 function fnSlotRetAssignable(src: i32, dst: i32) {
   if isNullTy(src) && !isNullTy(dst) && tyBearsNull(dst) { return true }
   if fnRetUnionWidens(src, dst) { return true }
@@ -4572,7 +4596,7 @@ function assignableGo(src: i32, dst: i32) {
         let i = 0
         let ok = fnSlotRetAssignable(sTail.fnRet, d.fnRet)
         while i < sp.length {
-          if !fnSlotAssignable(dp[i], sp[i]) { ok = false }
+          if !fnParamSlotAssignable(dp[i], sp[i]) { ok = false }
           i = i + 1
         }
         return ok
@@ -7361,7 +7385,7 @@ function holeSlotArgJudge(
         0,
         wp,
         pts,
-        holeSlotRetApart,
+        lift || holeSlotRetApart,
       )
     }
     for e in n.arrElems {
@@ -7406,7 +7430,16 @@ function holeSlotArgJudge(
     if rt < 0 { return holeSlotCallArgJudge(ix, pNm, path, wp, pts, depth) }
     if rt == ix || pre.length == 0 { return false }
     for st in path { pre.push(st) }
-    return holeSlotArgJudge(rt, pNm, pre, wp, pts, depth + 1, false)
+    // A slot of a binding a call initialises is that call's result read apart, as `mk().a` is.
+    return holeSlotArgJudge(
+      rt,
+      pNm,
+      pre,
+      wp,
+      pts,
+      depth + 1,
+      holeSlotCallBound(rt),
+    )
   }
   if !cwFramedNode(ix) { return false }
   // A binding bound to another place reads that place's slot.
@@ -7501,6 +7534,15 @@ function holeSlotRootCut(ix: i32): boolean {
   return ctnCutArm(bd, rx)
 }
 
+// Whether name `rt` reads a `let` its initialiser binds to a call's result.
+function holeSlotCallBound(rt: i32): boolean {
+  if rt < 0 || rt >= P.nodes.length || !(nodeAt(rt) is Ident) { return false }
+  const bd = cwSoleBinderAt(rt)
+  if bd < 0 || bd >= P.nodes.length || !(nodeAt(bd) is LetDecl) { return false }
+  const init = parenPeelIx(cwBoundInitOf(cwBindingOf(rt)))
+  init >= 0 && init < P.nodes.length && nodeAt(init) is Call
+}
+
 // `holeSlotArgJudge` for a place read straight off a call's result (`mk().a`): that slot of each
 // value the call returns, as the same place read through a binding of the call is judged.
 function holeSlotCallArgJudge(
@@ -7517,7 +7559,7 @@ function holeSlotCallArgJudge(
   for st in path { cp.push(st) }
   const cn = nodeAt(c)
   if cn is Call {
-    return holeSlotRetJudge(cn, pNm, cp, wp, pts, depth + 1, false)
+    return holeSlotRetJudge(cn, pNm, cp, wp, pts, depth + 1, true)
   }
   return false
 }
