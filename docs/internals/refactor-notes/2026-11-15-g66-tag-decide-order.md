@@ -36,7 +36,9 @@ lowers at one signature.
 - D16381 prints `1.5`. All 13 of lane S's cells run with their functions last.
 - `scripts/decl-order-ab.vl`: 313 of 5133 cases moved, 39 to a clause-1 outcome, before. 168
   and 17 after, with no new clause-1 mover. The baseline is rewritten.
-  - The 22 closed include D16301's first witness. D16301 takes a remaining mover as its witness.
+  - On top of lane J's #8165, master's baseline holds 297 movers, 31 of them clause-1. With this
+    change 165 of 5139 move and 17 are clause-1, again with no new clause-1 mover. D16301 keeps
+    #8165's witness, which still traps.
   - The one case outside the baseline, on both seeds, is D16209's fixture, filed as D16369.
 - 298 function-set templates, as written: 0 runs→not-runs, 0 new silent.
 - `regress.vl`: 0 runs→not-runs. 12 `dord*` named cells move from a trap or an invalid module
