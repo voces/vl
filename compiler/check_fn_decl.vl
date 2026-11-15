@@ -112,6 +112,8 @@ import {
 } from "./check_exp_obs"
 import {
   callFnDst,
+  callFnDstTookNote,
+  callFnDstTookReset,
   cbExpectedFor,
   cbExpectedRetFor,
   cbExpectedRetHeld,
@@ -302,7 +304,22 @@ import {
 } from "./check_unconsumed"
 import { numUnionLossNote } from "./check_union_mint"
 import { wsBodyErr } from "./check_width"
-import { fnDeclIx } from "./check_write_scan"
+import { rcwIndexReady } from "./check_covar_pins"
+import {
+  CW_OCC_CALL,
+  CW_OCC_USE,
+  CW_UP_ARG,
+  CW_UP_CALLEE,
+  cwCalleeDeclOf,
+  cwIxCovers,
+  cwIxKind,
+  cwIxNode,
+  cwIxUp,
+  cwIxUpKind,
+  cwOccNext,
+  cwOccWalkSpelled,
+  fnDeclIx,
+} from "./check_write_scan"
 import {
   IDENT_BUILTIN,
   IDENT_DROP_FN_DECL,
@@ -1687,6 +1704,7 @@ let lamRetWritten: {[i32]: boolean} = Map()
 export function lamRetWrittenAt(ix: i32): boolean { lamRetWritten[ix] ?? false }
 
 export function lamRetReset() {
+  callFnDstTookReset()
   lamRetQNode = []
   lamRetQTy = []
   lamRetWritten = Map()
@@ -1761,8 +1779,10 @@ function lamRetFromCalls() {
         const wraps: i32[] = []
         if d >= 0 && lamRetCallsAgree(d, fe.identName, ft, wraps) {
           if lamRetQueueReturned(d, t.fnParamTypes.length, t.fnRet) {
+            callFnDstTookNote(c0)
             // Built at the delivered result, each call is delivered as it is: no adapter.
             for wr in wraps {
+              callFnDstTookNote(wr)
               const inner = fvaAdaptedArg(wr)
               const ic = nodeAt(inner)
               if ic is Call {
@@ -1784,35 +1804,28 @@ function lamRetFromCalls() {
 function lamRetCallsAgree(d: i32, nm: string, ft: i32, wraps: i32[]): boolean {
   const fd = nodeAt(d)
   if !(fd is FuncDecl) || fd.fnRet >= 0 || declHasExportKw(d) { return false }
-  // A call the delivery's adapter wraps is delivered where the adapter is.
-  const wrapOf: {[i32]: i32} = Map()
-  let w = 0
-  while w < P.nodes.length {
-    const a = fvaAdaptedArg(w)
-    if a != w { wrapOf[a] = w }
-    w = w + 1
-  }
+  rcwIndexReady()
   let calls = 0
-  let uses = 0
-  let i = 0
-  while i < P.nodes.length {
-    const n = nodeAt(i)
-    if n is Ident && n.identName == nm && identDepthOf(i, nm) == 0 {
-      uses = uses + 1
-    }
-    if n is Call {
-      const f = nodeAt(n.callFn)
-      if f is Ident && f.identName == nm && identDepthOf(n.callFn, nm) == 0 {
-        const wi = wrapOf[i] ?? -1
-        const ct = callFnDst[if wi >= 0 { wi } else { i }] ?? -1
+  const ow = cwOccWalkSpelled(d, nm)
+  while cwOccNext(ow) {
+    const occ = cwIxNode[ow.row]
+    if cwIxKind[ow.row] == CW_OCC_CALL {
+      const cn = nodeAt(occ)
+      const cd = if cn is Call { cwCalleeDeclOf(cn.callFn) } else { -1 }
+      if cd < 0 || cd == d {
+        // A call the delivery's adapter wraps is delivered where the adapter is.
+        const up = if cwIxCovers(occ) && cwIxUpKind[occ] == CW_UP_ARG { cwIxUp[occ] } else { -1 }
+        const wi = if up >= 0 && fvaAdaptedArg(up) == occ { up } else { -1 }
+        const ct = callFnDst[if wi >= 0 { wi } else { occ }] ?? -1
         if ct < 0 || !tySame(ct, ft) { return false }
         if wi >= 0 { wraps.push(wi) }
         calls = calls + 1
       }
+    } else if cwIxKind[ow.row] == CW_OCC_USE {
+      if !cwIxCovers(occ) || cwIxUpKind[occ] != CW_UP_CALLEE { return false }
     }
-    i = i + 1
   }
-  calls > 0 && calls == uses
+  calls > 0
 }
 
 // The value a function-value adapter called in place reads (`(($fv…) => …)(v)`, its parameter

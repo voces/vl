@@ -10,10 +10,14 @@ function-value adapter, whose record conversion the covariant-write rule refused
   into outside a guess, `-2` once two disagree. `callDstTy` is not that: later deliveries
   overwrite it, the adapter's parameter among them.
 - `lamRetFromCalls` (`check_fn_decl.vl`), at the start of `lamRetApply`: for such a call to a
-  top-level `d` that is neither exported nor annotated, where every use of `d` is a call noted at
-  the same type (a call an adapter wraps is noted at the adapter, `fvaAdaptedArg`), each lambda
-  `d` returns, its tail included, is queued at that type's result. When any is queued, the
-  adapters over `d`'s calls are undone, since the re-checked delivery is exact.
+  top-level `d` that is neither exported nor annotated, where every occurrence of `d` in the
+  write-scan index (`cwOccWalkSpelled`, no arena scan) is a call noted at the same type (a call
+  an adapter wraps is noted at the adapter, `fvaAdaptedArg`), each lambda `d` returns, its tail
+  included, is queued at that type's result. When any is queued, the adapters over `d`'s calls
+  are undone, since the re-checked delivery is exact.
+- The typed calls are kept across the program's passes (`callFnDstTook`), and checking one
+  counts a used seed (`cbSeedUsed`, `checkCallNode`), so its destination's annotation is
+  load-bearing (D1442) and no redundant-annotation hint fires.
 - Every other caller of `d` sees the type it asked for, so a second caller un-annotated or
   delivered at another type keeps the refusal. Changing the covariant-write walk alone does not
   help: past it, the record storage rule refuses the adapter's result, which is not fresh.
