@@ -51,6 +51,6 @@ ok.
 
 ## Filed
 
-**D16450**, from my new block D16450–D16459: an operand that is a field read (`a.v == b.v`), a
+**D16450**, the first id of my newly reserved block: an operand that is a field read (`a.v == b.v`), a
 call or an element read still reaches the emit refusal. The arm compares only names. The
 `live-sites.json` row moves to D16450's probe.
