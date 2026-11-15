@@ -196,10 +196,24 @@ The verifier takes `src` as the operand's `TyId` and `dst` as `at`. It checks
 `repOf(src)`/`repOf(at)` against the operand's and the destination's reps. `lowerCoerce` is a
 `match` over `CoerceKind` with no `_` arm.
 
-**Coexistence.** M3's small PR adds the seat-free `coercionAt(ix, inst)` for the record half. The
-legacy emitter keeps its seats layered on top, unchanged, so the PR is byte-identical. That
-query is the whole of the adapter this note planned. When the IR's delivery positions take over
-the seat test, `coerceKindAt` and the seats delete at I3.
+**Where the seats open today** (lane M3's reading of `wasmEmit.vl`). These are exactly the delivery
+positions at which the builder emits a seat-scoped `RCoerce`:
+
+| conv | opened by | positions | owed iff | `at` |
+|---|---|---:|---|---|
+| `box` | `emitDelivered` | 5 | `boxRecordOwed(boxRecordTyAt(ix, fnIx))` | `boxRecordUnionTyOf(bt)` |
+| `unbox` | `armOpen` | 8: a cast or convert argument, a pack argument, a generic store's right-hand side, an index store's right-hand side, a push argument, a return, a destructure argument, and one more | the position owes an arm, `siteHeap >= 0`, `siteHeap != uBoxIdx` and `armRecordHeapAt(ix, fnIx) >= 0` | a heap index today; under the IR the arm's `RepId`, with nullability from `armUnboxNullable` |
+| `atomstr` | `emitAtomToStr` | 4, among them a map key and an `if` arm | `atomFloorWhy(…) == ""` | the atom's union |
+| `numeric` | `emitNumPlain` | 6 numeric-widen paths | `numFloorWhy(…) == ""` | the pair from `numRecordAt(ix, fnIx)` |
+
+The record half carries no seat: `listCopy` (`listCopyAtNode`), `fnClo` (`fnCloCoerceAtNode`),
+`mapUnbox`/`mapRetag` (`mapUnboxTyOf`/`deliveryRetagHas`, under `mapDeliveryRecorded`) and `recCopy`
+(`recCopyRowAt`).
+
+**When it lands.** `coercionAt` is added in I3's PR, together with the builder's first call, from
+the spec above. Landing it earlier would leave an export with no caller, which the dead-export
+gate refuses, and calling it on every `emitExpr` in the legacy path would cost fuel. The legacy
+emitter's seat tests stay as they are until I3 deletes them.
 
 ### 1.6 The emitter is a total function
 
