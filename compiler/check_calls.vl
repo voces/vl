@@ -4,7 +4,7 @@ import { paramSolveProbe } from "./check_exp_obs"
 // optional call, or a call through a function type with its bounds, constraints and rest
 // parameter.
 
-import { rowSlotBound } from "./check_row_param"
+import { rowParamIsSlot, rowSlotBound } from "./check_row_param"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { decDigitsOf } from "./strutil"
 import { identTyOf } from "./check_nar_store"
@@ -499,6 +499,7 @@ import {
   mkObjTy,
   nestParentOf,
   objFieldType,
+  tvSlotBound,
   tyArrayElemIx,
   tyAt,
   tyElemOf,
@@ -2281,14 +2282,25 @@ function elabUnboundCallNote(n: Call, ix: i32) {
   if !(f is FuncDecl) || f.fnTyParams.length == 0 { return 0 }
   const tys: i32[] = []
   let byDefault = false
+  let k = 0
   for tp in f.fnTyParams {
-    const t = if elabNullOnlyTp(f, n, tp) { TY_NEVER } else { elabUnionArgPin(f, n, tp) }
+    const t = if elabNullOnlyTp(f, n, tp) { elabNullOnlyPin(d, k, tp) } else { elabUnionArgPin(f, n, tp) }
     if t < 0 { byDefault = true }
     tys.push(if t < 0 { TY_I32 } else { t })
+    k = k + 1
   }
   elabValueRowNote(d, f.fnTyParams, tys)
   elabUnboundCallKeyNote(ix, d, f.fnTyParams, tys)
   if byDefault { elabDefaultRowNote(d, tys) }
+}
+
+// What type parameter `tp`, position `k` of declaration `d`, binds where only a `null` reaches
+// it: `never`, or a row slot's record, since the width rewrite's slot ranges over that record's
+// rows and the `null` call is the declared parameter's (D16377).
+function elabNullOnlyPin(d: i32, k: i32, tp: string): i32 {
+  if !rowParamIsSlot(tp) { return TY_NEVER }
+  const b = tvSlotBound(d, k)
+  if b >= 0 && b < T.tys.length && tyAt(b) is TyObj { b } else { TY_NEVER }
 }
 
 // Whether every argument of call `n` at a parameter of `f` naming `tp` is a `null` handed to an
@@ -3175,16 +3187,17 @@ function holeRecSrcsOf(
   holeRecBindSrcs(root, full, s, depth)
 }
 
-// Whether the function call `c` runs ends its body in a value `if` or `match`. Its arms are the
-// join's, not records the call builds, so they are declined as a returned `if` is (D15925).
+// Whether the function call `c` runs ends its body in a value `if` or `match`, as its tail or
+// its last `return`. Its arms are the join's, not records the call builds, so they are declined
+// (D15925).
 function holeCallTailIsJoin(c: Call): boolean {
   const d = cwCalleeDeclOf(c.callFn)
   const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  if !(f is FuncDecl) || f.fnBody < 0 { return false }
-  const b = nodeAt(f.fnBody)
-  if !(b is Block) || b.blkStmts.length == 0 { return false }
-  const t = nodeAt(b.blkStmts[b.blkStmts.length - 1])
-  t is IfStmt || t is MatchExpr
+  if !(f is FuncDecl) { return false }
+  const t = lambdaBodyTail(f.fnBody)
+  if t < 0 { return false }
+  const tn = nodeAt(parenPeelIx(t))
+  tn is IfStmt || tn is MatchExpr
 }
 
 // `holeRecSrcsOf` of the list or object literal `v`, held by the literal itself.

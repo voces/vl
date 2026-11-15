@@ -1,4 +1,4 @@
-import { settledRows } from "./check_hole_links"
+import { rowSettledByDefault } from "./check_hole_links"
 import { isWideLitJoin } from "./check_wide_lits"
 import { nodeCtxTyIxOf } from "./check_core_state"
 // Steps the checker core calls that do not call back into it: refusal and note texts,
@@ -62,7 +62,6 @@ import {
   tsKind,
   ufcsAliasAtSite,
 } from "./ast"
-import { isStmtNode } from "./check_bind_rows"
 import {
   optCallRetIx,
   optCallRetIxPush,
@@ -109,7 +108,6 @@ import {
 import { inferQuiet } from "./check_cursor"
 import { gcTrail } from "./check_effect_rows"
 import { expObsFn, expObsPin, paramSolveProbe } from "./check_exp_obs"
-import { seedExpected, seedJoinWant } from "./check_expected"
 import { gcAdd, gwErasedIs, gwStrLitTyLen } from "./check_getter_effects"
 import { guardAltStack } from "./check_guard"
 import {
@@ -165,7 +163,7 @@ import {
   nfNamesPush,
   nfSlotsPush,
 } from "./check_narrow_paths"
-import { a20RetWalk, njMatchDesugared } from "./check_nj_gate"
+import { njMatchDesugared } from "./check_nj_gate"
 import {
   nodeArrayElemTyIx,
   nodeTyIsLitUnion,
@@ -184,7 +182,7 @@ import {
   lbiOperandCand,
 } from "./check_num_lit_state"
 import { numLitAdoptDeep } from "./check_num_adopt"
-import { numCastCanFail, numLitOwnTy } from "./check_num_lits"
+import { cexRoundFirst, numCastCanFail, numLitOwnTy } from "./check_num_lits"
 import {
   LIST_EVERY_STEP,
   keyHasPrefix,
@@ -289,7 +287,6 @@ import {
   tailPushBlockTail,
   tailPushIfArms,
   tailPushMatchArms,
-  tailValueLeaves,
 } from "./check_unconsumed"
 import { binArithOp, mkUnionTy } from "./check_union_mint"
 import { fnBoundNames, peelParenIx } from "./check_write_effects"
@@ -306,6 +303,7 @@ import { nodeStartTok } from "./fmt_util"
 import { i32ListHas } from "./listutil"
 import { memberDeclOf, methodFnOfDecl } from "./symbols"
 import { arrElemNameRaw } from "./tyname"
+import { collectRetValues } from "./check_nj_join"
 
 // The operator a deferred unary negation is recorded under, both operands its argument.
 export const OP_NEG = "unary -"
@@ -449,7 +447,7 @@ function openFit(m: i32, g: i32, depth: i32): i32 {
   const a = tyAt(m)
   const b = tyAt(g)
   // A row the unbound default settled, not a write, is still unwritten.
-  if i32ListHas(settledRows, m) {
+  if rowSettledByDefault(m) {
     if a is TyArray && b is TyArray { return 1 }
     if a is TyMap && b is TyMap && a.mSet == b.mSet { return 1 }
   }
@@ -2471,21 +2469,6 @@ export function dstForArgs(dst: i32, args: i32[], ret: i32): i32 {
   dst
 }
 
-// Seeds each value a tail `if`/`else` or `match` yields with the declared return, as the bare
-// tail expression is seeded, so an arm's lambda or literal reads the return type (D2234), and
-// banks the return on each join, so a list-literal arm can type at it (D5287).
-export function seedTailArms(ix: i32, ret: i32) {
-  seedJoinWant(ix, ret)
-  const leaves: i32[] = []
-  tailValueLeaves(ix, leaves)
-  let i = 0
-  while i < leaves.length {
-    if !isStmtNode(leaves[i]) { seedExpected(leaves[i], ret) }
-    i = i + 1
-  }
-  0
-}
-
 // Whether the if-arm block `armIx` ends in a bare `{ … }` block, whose value is the open
 // bare-block-as-expression ruling.
 export function armTailUndecided(armIx: i32): boolean {
@@ -2636,7 +2619,7 @@ export function isScalarListRetName(nm: string) {
 // ignored, which is what keeps the deferred-join family on the old path.
 export function a20RetSetDisagrees(blockIx: i32): boolean {
   const rets: i32[] = []
-  a20CollectRets(blockIx, rets)
+  collectRetValues(blockIx, rets)
   let seen = -1
   let i = 0
   while i < rets.length {
@@ -2650,10 +2633,6 @@ export function a20RetSetDisagrees(blockIx: i32): boolean {
     i = i + 1
   }
   false
-}
-
-export function a20CollectRets(blockIx: i32, out: i32[]) {
-  a20RetWalk(blockIx, true, out)
 }
 
 // Records one optional call's guarded return and the value-union spelling of its result.
@@ -3061,13 +3040,7 @@ export const AS_WRAP_BOOL_MSG = "`as%` wraps between integer widths, and a boole
 // fraction names the explicit rounding, since a named constant's retune is what usually lands here.
 export function castConstModeTail(mode: string, dom: string, v: Cex): string {
   if dom == "f32" || dom == "f64" { return "" }
-  if v.cxFloat && !cexIsWhole(v) {
-    return " — round it first: `trunc(…) as! "
-      + dom
-      + "` or `floor(…) as! "
-      + dom
-      + "`"
-  }
+  if v.cxFloat && !cexIsWhole(v) { return cexRoundFirst(dom) }
   if mode == "trap" { return " — `as!` on it would trap on every run" }
   if mode == "null" { return " — `as?` on it would be null on every run" }
   if v.cxFloat { return "" }
@@ -3301,13 +3274,6 @@ export function omRecvTy(objIx: i32, recv: i32) {
   const g = omGuardTyAt(objIx)
   if g >= 0 { return g }
   recv
-}
-
-// The separator a chain link carries in the source, so a diagnostic quotes the program the
-// author wrote and not the normalised node.
-export function omDotStr(n: OptMember) {
-  if n.omDot { return "." }
-  "?."
 }
 
 // The `boolean`, `null` and `never` rows, for the nodes the loop-value rewrite synthesizes.

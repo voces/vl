@@ -806,7 +806,6 @@ import {
   tyIsNumericBox,
   tyMapValOf,
   tyReachesHole,
-  tyStepElem,
 } from "./tyquery"
 import { nulNumScalarUnionName, nulNumScalarUnionRowTy } from "./check_ty_rep"
 import { tyIsWriteLandRead } from "./check_hole_pins"
@@ -846,6 +845,7 @@ import {
   fnTagSetTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
+import { recEqTypedChain } from "./check_operators"
 
 // D943 — the lifted slots `monoPinBodyLambdas` minted for the instance being built. A
 // clone's `fnParent` cannot be set at clone time (its own `FuncDecl` does not exist
@@ -7003,6 +7003,28 @@ function monoPinBin(ix: i32, n: BinExpr, pNames: string[], pTys: i32[]): i32 {
   if n.binOp == "==" || n.binOp == "!=" {
     const dnt = monoDeadNullTest(n, pNames, pTys)
     if dnt >= 0 { return dnt }
+    // Two records of one field set stored apart compare per field pair at the pin (D16397).
+    // An operand read the checker typed concretely compares at that type.
+    const lty = nodeTyIxOf(n.binLeft)
+    const rty = nodeTyIxOf(n.binRight)
+    // Any other operand the elaboration typed at this instance compares at that type.
+    const top = elabWalkTop()
+    let elt = plt
+    if elt < 0 {
+      elt = if tyHasTyVar(lty) && top >= 0 { elabNodeTy(n.binLeft, top) } else { lty }
+    }
+    let ert = monoPinnedOperandTy(n.binRight, pNames, pTys)
+    if ert < 0 {
+      ert = if tyHasTyVar(rty) && top >= 0 { elabNodeTy(n.binRight, top) } else { rty }
+    }
+    if tyHasTyVar(elt) || tyHasTyVar(ert) { elt = -1 }
+    if (elt != lty || ert != rty) && elt >= 0 && ert >= 0 {
+      const fw = recEqTypedChain(bl, br, elt, ert, n.binOp == "!=", n.pos)
+      if fw >= 0 {
+        nodeSrcNote(fw, ix)
+        return fw
+      }
+    }
   }
   if plt >= 0 {
     // D511: an object pin with a free `self`-function named for the operator. The name is
@@ -8046,7 +8068,7 @@ function monoPinMintedUnion(name: string, ty: i32, own: i32): string {
   // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
   if pun != "" {
     // The registered type is the whole annotation's (`own`) at the rep its spelling collapses to.
-    const elemTy = if own >= 0 { monoAnnPinTy(tyStepElem(own)) } else { tyStepElem(ty) }
+    const elemTy = if own >= 0 { monoAnnPinTy(monoListElemTy(own)) } else { monoListElemTy(ty) }
     if monoRegisterPinUnion(pun, elemTy) < 0 { return name }
     return "(" + pun + ")[]"
   }
@@ -22877,7 +22899,10 @@ function monoWalk(ix: i32, ctx: i32) {
             atFt.push(monoPinSubTyOf(nodeTyIxOf(n.binLeft), ctx))
           }
           const att = if atFt.length == 1 { atFt[0] } else { -1 }
-          if annotated || atn != "" {
+          // A binding of a tagged set holds the member's id, so its write is no instance's
+          // closure.
+          const heldId = !annotated && fnTagTyIsTagged(nodeTyIxOf(n.binLeft))
+          if (annotated || atn != "") && !heldId {
             if monoCoerceFnValueTys(n.binRight, ctx, -1, atTys, att) < 0 {
               return -1
             }
@@ -22923,8 +22948,14 @@ function monoWalk(ix: i32, ctx: i32) {
             )
           }
           const wl = unwrapParen(n.binRight)
+          // A list or map of a tagged set holds the member's id, as a binding of one does.
+          const ct = nodeTyIxOf(tgt.idxArr)
+          const ca = if ct >= 0 && ct < T.tys.length { tyAt(nonNullTy(ct)) } else { null }
+          const cv = if ca is TyMap { tyValOf(ca) } else if ca is TyArray { tyElemOf(ca) } else { -1 }
+          const heldIx = fnTagTyIsTagged(cv)
           if (
-            monoIsCellRead(n.binLeft)
+            !heldIx
+            && monoIsCellRead(n.binLeft)
             && sn != ""
             && wl >= 0
             && nodeAt(wl) is FuncDecl
@@ -22935,7 +22966,10 @@ function monoWalk(ix: i32, ctx: i32) {
               return -1
             }
             monoLamLitTakeTys(n.binRight, ctx, [], snt)
-          } else if monoDeliverAtPinTys(n.binRight, sn, ctx, snTys, snt) < 0 {
+          } else if (
+            !heldIx
+            && monoDeliverAtPinTys(n.binRight, sn, ctx, snTys, snt) < 0
+          ) {
             return -1
           }
           const lt = nodeTyIxOf(n.binLeft)

@@ -169,6 +169,7 @@ import {
   i32ToStr,
   isDefaultGlobalRef,
   isExprKid,
+  letInitAt,
   nodeAt,
   nodeChildren,
   nodeToks,
@@ -945,7 +946,7 @@ import {
   userGlobalIdx,
   wasmEmitStateReset,
 } from "./wasmEmit"
-import { strListHas } from "./listutil"
+import { strListHas, ulebWidth } from "./listutil"
 import { memoCompileReset, memoPassAdvance } from "./memo"
 import { MAP_KEY_I32, MAP_KEY_I64, MAP_KEY_STR } from "./check_ty_rep"
 import { daTopAssignedAt } from "./check_definite"
@@ -1207,14 +1208,9 @@ function fbSeedRetExtra(fnPos: i32) {
 }
 
 // Pads a body that does not end in an explicit `return`/tail value, with the writer bound at
-// `body`: `null` for a nullable return (sunk when the return sink fired), `unreachable` for a
+// the body: `null` for a nullable return (sunk when the return sink fired), `unreachable` for a
 // non-nullable one, nothing for a void function. Returns 0, or -1 when `emitNullForRet` refuses.
-function emitFallThroughPad(
-  body: u8[],
-  fnBody: i32,
-  fnIx: i32,
-  fnPos: i32,
-): i32 {
+function emitFallThroughPad(fnBody: i32, fnIx: i32, fnPos: i32): i32 {
   // If the body does not end in an explicit `return`/tail value, control falls through to the
   // function `end` with an empty stack, and the validator requires the function's result type
   // there. A nullable return is a live fall-through path (the checker permits it precisely
@@ -1225,7 +1221,7 @@ function emitFallThroughPad(
   }
   if !isVoidFn && !bodyEndsInReturn(fnBody, fnIx) {
     if fnRetNullBearing(fnIx) {
-      if emitNullForRet(body, fnIx) < 0 { return -1 }
+      if emitNullForRet(fnIx) < 0 { return -1 }
       // Inside the sink's exit block this fall-through value cannot simply be left on
       // the stack for the function `end` — the block is void. It terminates like any
       // other exit: sunk when it built a box, a plain `return` otherwise.
@@ -1344,7 +1340,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // `emitFuncBody` banks a row per STATEMENT, relative to `bodyExpr`; the rebase below
     // moves them onto the code payload with the rest of this entry (ROADMAP row 22).
     const stmtSpanBase = emitFnSpanStart.length
-    if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return -1 }
+    if emitFuncBody(fn.fnBody, fnIx) < 0 { return -1 }
     // A void body whose last instruction is a call falls off its end with nothing to hand
     // back, so that call is a tail call (D4655).
     emitVoidTailCall(fnIx)
@@ -1375,7 +1371,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // Bind the writer at `body` (the framed code entry) for the trailing padding/end
     // opcodes emitted via the `fb*` methods.
     const endPrev = wTarget(body)
-    if emitFallThroughPad(body, fn.fnBody, fnIx, fnPos) < 0 { return -1 }
+    if emitFallThroughPad(fn.fnBody, fnIx, fnPos) < 0 { return -1 }
     // Close the sink's exit block and perform the function's ONE box construction, whose
     // operands every sunk `return` has already written. Falling off the function `end`
     // with it on the stack is the result.
@@ -1948,7 +1944,7 @@ function exportGlobalOfTarget(name: string): i32 {
 // `emitGlobalSection`'s cell arm, and `emitStartFnCode`'s merge loop must all agree on this.
 export function globalRunsInStartFn(gi: i32) {
   if gi < 0 || gi >= globalStmts.length { return false }
-  if igLetInit(globalStmts[gi]) < 0 { return false }
+  if letInitAt(globalStmts[gi]) < 0 { return false }
   if gi < gPromoOk.length && gPromoOk[gi] == 1 { return true }
   globalIsNonConst(globalStmts[gi])
 }
@@ -2471,7 +2467,7 @@ function emitStartBodyCode(out: u8[], k: i32) {
       emitCurStmtIx = startStmts[si]
       gInitStartOrd = startStmtOrd[si]
       const sSpanAt = bodyExpr.length
-      if emitStmt(bodyExpr, startStmts[si], -1) < 0 {
+      if emitStmt(startStmts[si], -1) < 0 {
         wTarget(exprPrev)
         return -1
       }
@@ -2534,7 +2530,7 @@ function emitStartGlobalInit(
   // A `const` every read copied the tree of is never read, as at a local (D15001).
   if globalRunsInStartFn(gi) && !lbiKeptDeclUnread(gst) {
     const g = nodeAt(gst)
-    const th = if g is LetDecl { emitTypedHolderInit(bodyExpr, gst, -1) } else { 1 }
+    const th = if g is LetDecl { emitTypedHolderInit(gst, -1) } else { 1 }
     if th < 0 {
       wTarget(exprPrev)
       return -1
@@ -2547,24 +2543,22 @@ function emitStartGlobalInit(
       const gck = globalCellKind(gst)
       // A bundle holder's read picked its member above (`emitTypedHolderInit`).
       if th == 1 && gck == "f32" {
-        if emitExprAsF32(bodyExpr, g.letInit, -1) < 0 {
+        if emitExprAsF32(g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else if th == 1 && gck == "f64" {
-        if emitExprAsF64(bodyExpr, g.letInit, -1) < 0 {
+        if emitExprAsF64(g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else if th == 1 && gck == "i64" {
-        if emitExprAsI64(bodyExpr, g.letInit, -1) < 0 {
+        if emitExprAsI64(g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else if th == 1 {
-        if (emitStartGlobalInitValue(bodyExpr, exprPrev, gst, g, gck) < 0) {
-          return -1
-        }
+        if (emitStartGlobalInitValue(exprPrev, gst, g, gck) < 0) { return -1 }
         emitGlobalInitArmUnbox(gst, gck, g.letInit)
       }
       const setPrev = wTarget(bodyExpr)
@@ -2580,10 +2574,9 @@ function emitStartGlobalInit(
 }
 
 // `emitStartGlobalInit`'s value step for global statement `gst` (its `LetDecl` `g`, cell kind
-// `gck`): emits the initializer into `bodyExpr` by the cell's coercion. On
+// `gck`): emits the initializer into the writer's buffer by the cell's coercion. On
 // failure restores the writer to `exprPrev` and returns -1, else 0.
 function emitStartGlobalInitValue(
-  bodyExpr: u8[],
   exprPrev: u8[],
   gst: i32,
   g: LetDecl,
@@ -2611,7 +2604,7 @@ function emitStartGlobalInitValue(
   if gUmr {
     const gumrN = nodeAt(unwrapParen(g.letInit))
     if gumrN is Index {
-      if (emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1) < 0) {
+      if (emitMapGetUnionBox(gumrN.idxArr, gumrN.idxIndex, -1) < 0) {
         wTarget(exprPrev)
         return -1
       }
@@ -2622,24 +2615,24 @@ function emitStartGlobalInitValue(
       )
     }
   } else if gunBox {
-    if emitUnionBoxOwed(bodyExpr, "", gunTy, g.letInit, -1) < 0 {
+    if emitUnionBoxOwed("", gunTy, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if (gck == "variant" && svi >= 0 && svi < uVarRow.length) {
     // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
-    if emitVariantCoerce(bodyExpr, svi, g.letInit, -1) < 0 {
+    if emitVariantCoerce(svi, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if gAliasFe >= 0 {
-    if emitClosureValueCore(bodyExpr, gAliasFe, -1) < 0 {
+    if emitClosureValueCore(gAliasFe, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if gck == "nulnone" {
     // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
-    if emitNulNoneBoxPayload(bodyExpr, g.letInit, -1) < 0 {
+    if emitNulNoneBoxPayload(g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
@@ -2650,12 +2643,12 @@ function emitStartGlobalInitValue(
     // A literal-union atom initializing a `string` global widens to its member string.
     // The start fn is a real function, so the runtime widening tower runs here (unlike a
     // CONST global, whose constexpr init has no `select`/scratch).
-    if emitAtomToStr(bodyExpr, g.letInit, -1) < 0 {
+    if emitAtomToStr(g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else {
-    if emitExpr(bodyExpr, g.letInit, -1) < 0 {
+    if emitExpr(g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
@@ -6829,7 +6822,7 @@ function igWalk(
 // constant expression keeps the guard its start-function store had.
 function igInitAllocates(gi: i32): boolean {
   if gi < 0 || gi >= globalStmts.length { return false }
-  const init = igLetInit(globalStmts[gi])
+  const init = letInitAt(globalStmts[gi])
   if init < 0 { return globalIsNonConst(globalStmts[gi]) }
   const e = nodeAt(unwrapParen(init))
   if e is ArrayLit { return true }
@@ -6839,13 +6832,6 @@ function igInitAllocates(gi: i32): boolean {
     if letInitFoldsExpr(d) { return true }
   }
   globalRunsInStartFn(gi)
-}
-
-// The initializer of module binding `letIx`, or -1 when it has none.
-function igLetInit(letIx: i32): i32 {
-  const d = nodeAt(letIx)
-  if d is LetDecl { return d.letInit }
-  -1
 }
 
 // Decides which module globals need the read-before-init guard (D2652): a global whose
@@ -7004,7 +6990,7 @@ function initAtCompute() {
   while gi < globalStmts.length {
     let node = globalStmts[gi]
     let at = ordOf[node] ?? INIT_REACH_NEVER
-    if igLetInit(node) < 0 && globalIsNonConst(node) {
+    if letInitAt(node) < 0 && globalIsNonConst(node) {
       node = daTopAssignedAt[globalStmts[gi]] ?? globalStmts[gi]
       at = ordOf[node] ?? INIT_REACH_NEVER
       if node == globalStmts[gi] { at = INIT_REACH_NEVER }
@@ -9709,11 +9695,11 @@ function emitConstCellInit(buf: u8[], gi: i32): i32 {
       const rec = boxDstTyAt(g.letInit, -1)
       const own = rec >= 0 && unRowOfRecordTy(rec) >= 0
       const gunTy = if own { rec } else { letBindingUnionTy(globalStmts[gi], -1) }
-      rc = emitUnionBoxOwed(buf, "", gunTy, g.letInit, -1)
+      rc = emitUnionBoxOwed("", gunTy, g.letInit, -1)
     } else if gAliasFe >= 0 {
-      rc = emitClosureValueCore(buf, gAliasFe, -1)
+      rc = emitClosureValueCore(gAliasFe, -1)
     } else {
-      rc = emitExpr(buf, g.letInit, -1)
+      rc = emitExpr(g.letInit, -1)
     }
     gConstExprEmit = ceSaved
     // The snapshot restored, rather than a chosen list of seeds cleared: one this function
@@ -9970,17 +9956,6 @@ function bankFnSpan(
   tag: string,
 ) {
   bankSpanRow(node, pos, from, to, kind, tag)
-}
-
-// The byte width of `v` written as a ULEB128 — one element-segment entry's cost.
-function ulebWidth(v: i32): i32 {
-  let w = 1
-  let x = v
-  while x >= 128 {
-    x = x >> 7
-    w = w + 1
-  }
-  w
 }
 
 // The first address-taken function at or after `i`, or `n` when there is none.

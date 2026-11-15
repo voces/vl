@@ -307,6 +307,7 @@ import {
   valueTailSplit,
 } from "./check_num_adopt"
 import {
+  cexFoldedFrom,
   cexReported,
   cexWideConstNote,
   nlAsgGot,
@@ -358,10 +359,9 @@ import { diagDataField } from "./check_overload"
 import { parenPeelIx } from "./check_places"
 import { recAdNoteFor, recAdWholeErr } from "./check_rec_adopt"
 import {
-  recAdLoose,
-  recAdLooseAt,
   recAdMentions,
-  recAdOrigDecl,
+  recAdPass,
+  recAdProg,
   recAdRaising,
 } from "./check_rec_adopt_rows"
 import { rcwWhere } from "./check_record_writes"
@@ -437,7 +437,12 @@ import {
   objNumWidens,
   xrepListPair,
 } from "./check_ty_relate"
-import { mapKeyTySupported, nomBaseTyIx, nomErasedTyIx } from "./check_ty_rep"
+import {
+  mapKeyTySupported,
+  mapValSoftBase,
+  nomBaseTyIx,
+  nomErasedTyIx,
+} from "./check_ty_rep"
 import {
   fnTyHasHole,
   numericVariantUncovered,
@@ -499,7 +504,6 @@ import {
   mkNullableTy,
   mkObjTy,
   nomNameOfTy,
-  numLitUnionBaseTy,
   nwTyIxs,
   objFieldType,
   objRowNamesDistinct,
@@ -601,7 +605,12 @@ import {
 import { cexNeg, cexNotConst, cexOfLexeme, cexOk } from "./const_exact"
 import { numLexIsFloat } from "./emit_bignum"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
-import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import {
+  i32ListHas,
+  strListDropLast,
+  strListHas,
+  strListIndexOf,
+} from "./listutil"
 import { pairMemoClear, pairMemoGet, pairMemoNew, pairMemoPut } from "./memo"
 import {
   mimpAnyProgramSpec,
@@ -1261,7 +1270,7 @@ function cexJoinMisfit(srcExpr: i32): boolean {
   // A constant already refused is not refused twice, nor is its join's mismatch reported.
   if !(cexReported[badLit] ?? false) {
     cexReported[badLit] = true
-    tErr(cexMisfitMsg(badV, "i32", false), bad)
+    tErr(cexMisfitMsg(badV, "i32", false, cexFoldedFrom(badLit)), bad)
   }
   true
 }
@@ -1719,13 +1728,13 @@ export function tErrPush(
     di = di + 1
   }
   numLitNoteQueue(msg, at, T.diags.length)
-  if recAdOrigDecl.length > 0 && !recAdRaising {
+  if recAdProg.origDecl.length > 0 && !recAdRaising {
     if recAdWholeErr(at) || recAdMentions(at, 6) {
       msg = msg + recAdNoteFor(at)
     }
     if !recAdWholeErr(at) {
-      recAdLoose = recAdLoose + 1
-      recAdLooseAt.push(at)
+      recAdPass.loose = recAdPass.loose + 1
+      recAdPass.looseAt.push(at)
     }
   }
   T.diags.push(
@@ -4250,7 +4259,7 @@ export function fnSlotAssignable(src: i32, dst: i32) {
   if numWidens(src, dst) { return false }
   if objNumWidens(src, dst) { return false }
   if fnSlotAtomToString(src, dst) { return assignable(src, dst) }
-  if containerElemClassDiffers(fnSlotStoreTy(src), fnSlotStoreTy(dst)) {
+  if containerElemClassDiffers(mapValSoftBase(src), mapValSoftBase(dst)) {
     return false
   }
   if fnSlotNulDiffers(src, dst) { return false }
@@ -4316,14 +4325,6 @@ export function fnSlotRetWidens(src: i32, dst: i32): boolean {
   if !(du is TyFunc) || du.fnRet < 0 { return false }
   if s.fnParamTypes.length != du.fnParamTypes.length { return false }
   !fnSlotAssignable(s.fnRet, du.fnRet) && fnSlotRetAssignable(s.fnRet, du.fnRet)
-}
-
-// The type a function slot is stored as: a numeric literal union is its base scalar (`1 | 2`
-// is an `i32`), so `() => N` and `() => i32` share one wasm signature (D9382).
-function fnSlotStoreTy(ty: i32): i32 {
-  const b = numLitUnionBaseTy(ty)
-  if b >= 0 { return b }
-  ty
 }
 
 // `assignable`, where an open component (`TY_OPEN`) on either side fits: a descent into an
@@ -7070,7 +7071,7 @@ function holeSlotWidenLift(bd: i32, b: i32, path: string[]): boolean {
   if path.length == 0 || path[path.length - 1] != "[]" { return false }
   elabFnListWidened(bd)
     || elabFnSlotWidened(bd)
-    || path.length >= 2 && elabFnFieldWidened(bd, holeSlotPathSteps(path))
+    || path.length >= 2 && elabFnFieldWidened(bd, strListDropLast(path))
     || holeSlotRepointLift(bd, b, path)
 }
 
@@ -7229,18 +7230,6 @@ function holeSlotFieldSteps(path: string[]): string[] {
   out
 }
 
-// `path` without its last step, an element as `[]`: the steps `elabFnFieldWidened` keys a list
-// of functions by (D15201).
-function holeSlotPathSteps(path: string[]): string[] {
-  const out: string[] = []
-  let i = 0
-  while i < path.length - 1 {
-    out.push(path[i])
-    i = i + 1
-  }
-  out
-}
-
 // The root of the place `root` and `p0` name, its steps in `out`, followed through each binding
 // bound once to another binding or to an element, value or field read of one:
 // `const r = m.get(k)` makes `r.f` the place `m[].f` (D9370).
@@ -7343,7 +7332,8 @@ function holeSlotArgJudge(
   if !(n is Ident) {
     const pre: string[] = []
     const rt = cwSlotPath(ix, pre)
-    if rt < 0 || rt == ix || pre.length == 0 { return false }
+    if rt < 0 { return holeSlotCallArgJudge(ix, pNm, path, wp, pts, depth) }
+    if rt == ix || pre.length == 0 { return false }
     for st in path { pre.push(st) }
     return holeSlotArgJudge(rt, pNm, pre, wp, pts, depth + 1, false)
   }
@@ -7438,6 +7428,27 @@ function holeSlotRootCut(ix: i32): boolean {
   const bd = cwSoleBinderAt(rx)
   if bd < 0 || bd >= P.nodes.length || !(nodeAt(bd) is LetDecl) { return true }
   ctnCutArm(bd, rx)
+}
+
+// `holeSlotArgJudge` for a place read straight off a call's result (`mk().a`): that slot of each
+// value the call returns, as the same place read through a binding of the call is judged.
+function holeSlotCallArgJudge(
+  ix: i32,
+  pNm: string,
+  path: string[],
+  wp: i32[],
+  pts: i32[],
+  depth: i32,
+): boolean {
+  const cp: string[] = []
+  const c = holeSlotCallPath(ix, cp)
+  if c < 0 || cp.length == 0 { return false }
+  for st in path { cp.push(st) }
+  const cn = nodeAt(c)
+  if cn is Call {
+    return holeSlotRetJudge(cn, pNm, cp, wp, pts, depth + 1, false)
+  }
+  false
 }
 
 // `holeSlotArgJudge` for the call `c`: each value a top-level function declaring no type
