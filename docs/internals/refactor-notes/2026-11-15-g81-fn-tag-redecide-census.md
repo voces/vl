@@ -63,7 +63,21 @@ A row whose "the check tagged it" column is yes changes nothing. The changes are
   - a hand-back at a closed type (`ftHandBackAtClosed`, `ftNodeOk`);
   - `ftLateParamOk`.
 
-  Passing through a branch is not proof that it decided, so per-branch ablation is the next census.
+  A per-branch ablation re-ran each accepted plan once per late site it passed, with that one site
+  at its check value. Every one of the 52 flipped sets needs at least one named site:
+
+  | the site the flip needs | sets | programs |
+  |---|---|---|
+  | `ftNodeOk`: a function an instance found to hand back its parameter (`mintRetParamsOf`) | 47 | 26 |
+  | `ftNodeOk`: the elaboration instances each call's arm at its arguments | 20 | 7 |
+  | `ftHoleParamOf`: a parameter's own type-parameter joins | 8 | 8 |
+  | `ftHandedHolder`: a holder of an inner literal or record | 6 | 6 |
+  | `ftHandBackAtClosed`: a hand-back at a closed type | 4 | 4 |
+  | `ftParamStored`: a push the elaboration records as a closure delivery (`mintCloRows`) | 2 | 2 |
+  | `ftParamStored`: a parameter every instance hands one set (`ftReachHandSets`) | 1 | 1 |
+
+  A set can need more than one site, so the rows overlap. The four drops need no single site: they
+  are refuted by the late inputs together.
 - **3 programs: forwarded record fields (2) and one escape.**
 
 ### The sets the check tagged and the late decision drops
@@ -90,13 +104,21 @@ accepted plan. The elaboration does add nodes after the check.
 
 ## What it decides
 
-- **The redecide's real inputs are two:**
-  - **per-instance flow, the mint rows:** 387 programs, with the forwarded fields;
-  - **the late-only branches:** 32 programs gained, and the drops.
+- **The redecide's real input is one interface.** `check_mint.vl` holds 13 kinds of per-instance
+  fact, and the elaboration (`emit_elab.vl`) is their only writer:
+  - `mintFactNote`: the calls an instance makes through a set its parameter binds;
+  - `mintRetNote`: the parameters an instance hands back;
+  - `mintCloDeliveryNote`: closure deliveries;
+  - the rest: stores, held parameters, forwarded fields, partial sets, closed lambdas, seeds, aliases
+    and nested per-encloser facts.
+
+  The 387 programs read the first. Most of the 32 read the second through the late-only
+  branches.
 - **No re-decided checker fact of size was found.** Node types, membership, calls and escapes are
   stable, so nothing here needs to move upstream for its own sake. Whether lane S's 2b shares an
   input is decided by the per-branch census.
-- **Step (ii)** computes the instance-to-set facts at check time from the call binding rows and the
-  forward edges, as a shadow beside `elabMintFacts`, and diffs the two. With the late branches'
-  per-branch census, that covers every change.
+- **Step (ii)** produces the mint tables at check time: the instance-to-set facts and the hand-back
+  facts first, from the call binding rows and the forward edges. They are a shadow beside the
+  elaboration's notes, diffed table by table. That covers the 387 programs, the forwards and the
+  26 hand-back programs. The other tables follow in the order of the counts above.
 - **Step (iii)** deletes `elabMintFacts`' role as the tag input outright, with no fallback.
