@@ -213,6 +213,17 @@ table row. At the end the bounds are closed:
 The last rule is what instance-local generalization means. D16423's inner `[]` is a list of `β`, and
 `β` is quantified, so each call gets its own `β`.
 
+**When a scheme closes.** A scheme is built once, when the body's loud check ends (`bodyChecked`).
+- The quiet return-inference pre-pass does not close it. A pre-pass read sees a partial body, and
+  its answer is the pre-pass's own (`refactor-notes/2026-11-15-l2-close-and-storage.md`).
+- A lambda or nested function closes with its enclosing top-level declaration. Its bounds belong to
+  that declaration's scheme.
+- A function value bound at module level, with no enclosing declaration, closes at the statement
+  that binds it.
+
+M3's census found that a body walk asked after the close gives one answer in every frame, instance
+re-checks included. So S2 reads each walk once, at the close.
+
 ### 3.3 Literals
 
 `let t = 0; t = t + x` makes `t` a variable bounded below by the literal `0` and by the type of
@@ -429,12 +440,27 @@ Replies received 2026-11-15:
   - Under L2, `InstReq`'s call-site facts leave the key. `delivery` and `argLit` become coercions on
     the call edge. `retTy` and `retWidenTy` become part of the scheme, or a coercion at the result.
     `frame` and `call` stay as provenance. So no new field is needed.
-  - **Open: storage versus type identity.** Two calls with the same `TyId` vector can need different
-    storage for a function-typed parameter: lane S's `RClosure`, `RSetId` or `RDirect`. Either the key
-    includes S's per-parameter storage decision, or the scheme makes storage a function of the type
-    alone. That is for L2 and S to decide before S3, because `BK_ARROW`'s solution must say which. The
-    discriminators H plans to fold into nominal `TyId`s (`monoAnonPinDiscrim`, the set and
-    literal-union discriminators) are part of the same question.
+  - **Storage versus type identity, settled 2026-11-15.** Two calls with the same `TyId` vector can need
+    different storage for a function-typed parameter (`RClosure`, `RSetId` or `RDirect`).
+    - The scheme is storage-free: a `BK_ARROW` bound solves to types only.
+    - The instance key carries the storage decision of each function-typed parameter, from whoever
+      decides it.
+    - Storage has one decider: the tag-decision layer (`fnTagDecide`, `check_fn_tag.vl`). Its re-run
+      after the elaboration (`fnTagRedecide`, `emit_sections.vl`) is a second decision. The goal is
+      that it goes before L2 S3, so S3 never decides storage. Owner: lane G. `fnTagRedecide` is
+      removed in its own PR before S3.
+    - S3's solver produces the closed per-shape signatures of a hole function parameter's calls.
+      The bundle-or-not decision over them is storage.
+    - The discriminators H plans to fold into nominal `TyId`s (`monoAnonPinDiscrim`, the set and
+      literal-union discriminators) are part of the same question.
+  - **S** (slot store) agrees with the storage-free scheme, and with storage in the key in
+    principle. Its slot store does not decide storage. It produces closed delivered types: what a
+    slot's function leaf is called and bound at (`epl*`, `elabSlotTyAt`, `eplSlotSig`,
+    `eplSlotBound`). Those facts follow flow, not argument types alone: which values reach the
+    slot, the calls through it at each instance's arguments, written destinations and copies. So a
+    key of template, argument `TyId`s and the call's set membership is complete only because set
+    membership is itself a decided input, `fnTagDecide`'s output. S's plan deletes the delivery walk
+    (`elabSlotDeliveries`), not either tag decision.
   - **Order hazard: IR I9 after S6.** Phase A lowers mono's instance set as it is, including instances
     of an exported un-annotated function pinned from an importer's call. S6 changes that set, so the
     function section moves, and the cause is L2. If I9 (phase B, per-module `Lowered`) lands before S6,
