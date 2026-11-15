@@ -35,15 +35,15 @@ const probe = (src: string) => {
   return exp.elabRetsReachProbe();
 };
 
-const BOTH_RETURN_G = `function g<T>(x: T): T { x }
+const BOTH_RETURN_G = `function g<T>(x: T): T { return x }
 function f1() { return g }
 function f2() { return g }
 print(f1()(1))
 print(f2()("s"))
 `;
 
-const ONLY_F1 = `function g<T>(x: T): T { x }
-function h<T>(x: T): T { x }
+const ONLY_F1 = `function g<T>(x: T): T { return x }
+function h<T>(x: T): T { return x }
 function f1() { return g }
 function f2() { return h }
 print(f1()(1))

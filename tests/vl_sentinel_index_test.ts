@@ -75,75 +75,75 @@ let byName: {[string]: i32} = Map()
 
 function slotOf(n: i32): i32 {
   if n > 3 { return n }
-  -1
+  return -1
 }
 
 function guarded(n: i32): i32 {
   const s = slotOf(n)
   if s < 0 { return 0 }
-  tys[s]
+  return tys[s]
 }
 
 function lengthGuarded(n: i32): i32 {
   const s = slotOf(n)
   if s >= tys.length { return 0 }
-  tys[s]
+  return tys[s]
 }
 
 function growThenWrite(n: i32): i32 {
   const k = slotOf(n)
   while rows.length <= k { rows.push(-1) }
   rows[k] = 7
-  rows[k]
+  return rows[k]
 }
 
 function ownList(n: i32): i32 {
   const mine: i32[] = [1, 2, 3]
   const s = slotOf(n)
-  mine[s]
+  return mine[s]
 }
 
 function mapKey(n: i32): i32 {
   const k = keyOf(n)
   const v = byName[k]
   if v == null { return 0 }
-  v
+  return v
 }
 
 function keyOf(n: i32): string {
   if n > 0 { return "a" }
-  ""
+  return ""
 }
 
 function reboundFirst(n: i32): i32 {
   let s = slotOf(n)
   s = 0
-  tys[s]
+  return tys[s]
 }
 
 function topOfReader(ix: i32): i32 {
   const v = tys[ix]
   if v > 0 { return v }
-  -1
+  return -1
 }
 
 function quotedRead(n: i32): string {
   const s = slotOf(n)
   // tys[s]
-  "tys[s]"
+  return "tys[s]"
 }
 
 function notEqualGuarded(n: i32): i32 {
   const s = slotOf(n)
   if s != -1 { return tys[s] }
-  0
+  return 0
 }
 
 type Pos = { at: i32 }
 
 function positiveField(p: Pos): i32 {
   if p.at < 3 { return 0 }
-  tys[p.at]
+  return tys[p.at]
 }
 `,
     unguarded: [],
@@ -159,14 +159,14 @@ type Row = { inner: i32 }
 
 function ok(t: Row): i32 {
   if t.inner < 0 { return 0 }
-  tys[t.inner]
+  return tys[t.inner]
 }
 
 function bad(t: Row): i32 {
-  tys[t.inner]
+  return tys[t.inner]
 }
 `,
-    unguarded: ["11:3"],
+    unguarded: ["11:10"],
     strict: [],
     says: {
       code: UNGUARDED,
@@ -182,20 +182,20 @@ function bad(t: Row): i32 {
 
 function elemOf(t: i32): i32 {
   if t > 0 { return t }
-  -1
+  return -1
 }
 
 function checkNode(ix: i32): i32 {
   const t = elemOf(ix)
-  t
+  return t
 }
 
 function checkBin(ix: i32): i32 {
   const lt = checkNode(ix)
-  tys[lt]
+  return tys[lt]
 }
 `,
-    unguarded: ["15:3"],
+    unguarded: ["15:10"],
     strict: [],
     says: { code: UNGUARDED, text: "`checkNode`, which can answer in band" },
   },
@@ -209,21 +209,21 @@ function checkBin(ix: i32): i32 {
 
 function nameSlot(nm: i32): i32 {
   if nm > 0 { return nm }
-  -1
+  return -1
 }
 
 function arenaSlot(slot: i32): i32 {
   if slot > 100 { return slot }
-  -1
+  return -1
 }
 
 function innerSlot(slot: i32): i32 {
   const ar = arenaSlot(slot)
   if ar >= 0 { return ar }
-  nameSlot(elemName[slot])
+  return nameSlot(elemName[slot])
 }
 `,
-    unguarded: ["16:12"],
+    unguarded: ["16:19"],
     strict: [],
     says: {
       code: UNGUARDED,

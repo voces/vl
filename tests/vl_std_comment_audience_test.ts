@@ -43,27 +43,27 @@ const FIXTURE = `// \`std:dirty\` — a probe module.
 // line 9
 // line 10
 // line 11
-export function a(): i32 { 1 }
+export function a(): i32 { return 1 }
 
 // D1042 says this arm was wrong.
-export function b(): i32 { 2 }
+export function b(): i32 { return 2 }
 
 // The emitter picks the rep here on 2026-09-03, see DECISIONS.md (#2437).
-export function c(): i32 { 3 }
+export function c(): i32 { return 3 }
 
 // one
 // two
 // three
 // four
 // five
-export function d(): i32 { 4 }
+export function d(): i32 { return 4 }
 
 // one
 // two
 // three
 // four
 // five
-function priv(): i32 { 5 }
+function priv(): i32 { return 5 }
 
 // ── a banner over five lines ──
 // two
@@ -72,7 +72,7 @@ function priv(): i32 { 5 }
 // five
 
 // short doc
-export function e(): i32 { priv() }
+export function e(): i32 { return priv() }
 `;
 
 /** The `std-comment-audience` findings on `path` (relative to `cwd`). */
