@@ -32,9 +32,15 @@ those notes out of a speculative check.
 
 ## Gate
 
-GATE_PLACEHOLDER
+- **Seeds:** A is a fixpoint built from `git archive 73e1891c5`; D is a fixpoint built from this branch.
+- **Identity:** `probe-rollback-census.ts --fingerprint` over `tests/cases`, `distilled/cells` and
+  `distilled/named` gives **20,312 programs, 0 different**.
+- **L2:** byte-identical. Guest fuel is 89,537,627,515 for A and 89,539,986,605 for D (+0.003%): each
+  `checkMark` builds one more record.
+- **Gates:** `regress.vl` reports no runs lost and `lint-self.sh` is clean. The probe-rollback,
+  emitter-state audit, phase-state, memo-generation and pin-helper tests pass.
 
 ## Lines
 
-The compiler is **+35 / −1, net +34** over 2 modules. This slice adds the mechanism, and lane
+The compiler is **+47 / −1, net +46** over 2 modules. This slice adds the mechanism, and lane
 relate's P3 deletes the gates and their reads.
