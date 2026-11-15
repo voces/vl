@@ -114,11 +114,17 @@ Deno.test("oracle: pinned regressions", () => {
     ["const f: f32 = 0.1\nconst c: boolean = false\nprint(if c { f } else { 16777217.0 % 1.5 })", "1"],
     // Q8: a constant count of 32 to 63 makes the radix left i64, beside an i32 peer too
     ["const v8: i32 = 5\nprint((-v8) * (0xFFFFFFFF >>> 51))", "0"],
+    // D3043: a constant that does not fit its `i32` peer is i64, and the peer widens
+    ["const a: i32 = 1\nprint(a + 0x1FFFFFFFF)", "8589934592"],
+    ["const a: i32 = 1\nprint(a - (0x1FFFFFFFF & 0xF))", "-14"],
+    // a store delivers to the element type a declared container was built at
+    ["const m: {[string]: i64} = Map()\nm[\"a\"] = 0xFFFFFFFF\nprint(m[\"a\"] ?? 0)", "4294967295"],
+    ["const m: {[string]: f32} = Map()\nm[\"a\"] = 0.1\nprint(m[\"a\"] ?? 0)", "0.10000000149011612"],
     // 4.1 / D1890: `as f32` rounds an integer constant once
     ["print(9000000003 as f32)", "9000000512"],
     // E8.3: a constant cast to `u8` is checked against 0..255; a radix one at its 32-bit pattern
-    ["print(300 as? u8)", "null"],
-    ["print(0xFFFFFFFF as? u8)", "null"],
+    ["let v = 300\nprint(v as? u8)", "null"],
+    ["let c = true\nc = !c\nprint((if c { 1 } else { 0x1FF }) as? u8)", "null"], // a join is no constant
     ["print(0xFF as? u8)", "255"],
     ["const c: boolean = false\nprint((if c { 1 } else { 0xFF }) as u8)", "255"],
   ];
@@ -127,7 +133,8 @@ Deno.test("oracle: pinned regressions", () => {
     if (o.kind !== "ok" || o.out.join("\n") !== want) throw new Error(`${src}: want ${want}, got ${o.kind} ${JSON.stringify(o.out)} ${o.msg}`);
   }
   // T1.3: a storage width is no cast target; E8.2: a failed bare `as` at top level has no function to return null
-  for (const src of ["print(7 as? u16)", "print(300 as u8)"]) {
+  // E8.2: a constant cast that can never succeed; E8.4: `as%` to a float
+  for (const src of ["print(7 as? u16)", "print(300 as u8)", "print(300 as? u8)", "print(3.9 as? i32)", "print(3 as% f64)"]) {
     const o = interpret(src + "\n");
     if (o.kind !== "fault") throw new Error(`${src}: want fault, got ${o.kind} ${JSON.stringify(o.out)}`);
   }
