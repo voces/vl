@@ -626,6 +626,8 @@ import {
   heldRepOf,
   helpListGrowFn,
   helpMapCompactFn,
+  helpMapEntryFn,
+  helpMapEntryI32Fn,
   helpMapProbeFn,
   helpMapProbeI32Fn,
   helpMapProbeI64Fn,
@@ -3060,21 +3062,50 @@ function emitRecCopy(
   0
 }
 
-// The struct steps from the copied value to the record a nested copy level reads: each a heap and
-// a field index, applied after the value itself is read.
-let rcPathHeap: i32[] = []
-let rcPathField: i32[] = []
+// What an element-by-element record copy reads through, opened per list copy and restored after.
+type RcElem = {
+  // The struct steps from the copied value to the record a nested copy level reads: each a heap
+  // and a field index, applied after the value itself is read.
+  pathHeap: i32[],
+  pathField: i32[],
+  // The record types the copy reads its fields at, or -1 outside one.
+  src: i32,
+  dst: i32,
+  // The locals the copy reads its source element through (the source wrapper and the index) and
+  // that list's row, or -1 outside one; and whether the element is boxed.
+  sL: i32,
+  iL: i32,
+  wrap: i32,
+  back: i32,
+  boxed: boolean,
+}
+
+function rcElemNone(): RcElem {
+  {
+    pathHeap: [],
+    pathField: [],
+    src: -1,
+    dst: -1,
+    sL: -1,
+    iL: -1,
+    wrap: -1,
+    back: -1,
+    boxed: false,
+  }
+}
+
+let rcElem: RcElem = rcElemNone()
 
 // The value `exprIx` a copy reads, re-read or from `variantReboxSlot`, then each step of the path.
 function rcReadSource(exprIx: i32, sHeap: i32, reReadable: boolean, fnIx: i32) {
-  if rcElemSL >= 0 {
+  if rcElem.sL >= 0 {
     // An element-by-element list copy reads its source element off the loop's own locals.
-    fbLocalGet(rcElemSL)
-    fbStructGet(rcElemWrap, 0)
-    fbLocalGet(rcElemIL)
-    fbArrayGet(rcElemBack)
+    fbLocalGet(rcElem.sL)
+    fbStructGet(rcElem.wrap, 0)
+    fbLocalGet(rcElem.iL)
+    fbArrayGet(rcElem.back)
     // An element of a list of a union of records is its box's payload.
-    if rcElemBoxed { fbStructGet(uBoxIdx, 1) }
+    if rcElem.boxed { fbStructGet(uBoxIdx, 1) }
     fbRefCast(sHeap)
   } else if reReadable {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
@@ -3083,8 +3114,8 @@ function rcReadSource(exprIx: i32, sHeap: i32, reReadable: boolean, fnIx: i32) {
     fbRefCast(sHeap)
   }
   let k = 0
-  while k < rcPathHeap.length {
-    fbStructGet(rcPathHeap[k], rcPathField[k])
+  while k < rcElem.pathHeap.length {
+    fbStructGet(rcElem.pathHeap[k], rcElem.pathField[k])
     k = k + 1
   }
   0
@@ -3167,12 +3198,12 @@ function emitRecCopyIntoMember(
   variantRowFields(vi, names, rows)
   const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
   fbI32Rel(RS_TAG, uTags[vi])
-  rcPathHeap.push(sHeapIdx[sRow])
-  rcPathField.push(sfi)
-  const ps = rcElemSrc
-  const pd = rcElemDst
-  rcElemSrc = st
-  rcElemDst = m
+  rcElem.pathHeap.push(sHeapIdx[sRow])
+  rcElem.pathField.push(sfi)
+  const ps = rcElem.src
+  const pd = rcElem.dst
+  rcElem.src = st
+  rcElem.dst = m
   const r = emitRecCopyLevel(
     exprIx,
     sHeap,
@@ -3185,10 +3216,10 @@ function emitRecCopyIntoMember(
     rows,
     fnIx,
   )
-  rcElemSrc = ps
-  rcElemDst = pd
-  rcPathHeap.pop()
-  rcPathField.pop()
+  rcElem.src = ps
+  rcElem.dst = pd
+  rcElem.pathHeap.pop()
+  rcElem.pathField.pop()
   if r < 0 { return -1 }
   fbStructNew(variantHeap(vi))
   fbStructNew(uBoxIdx)
@@ -3253,8 +3284,8 @@ function emitRecCopyFields(
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
     fbLocalSet(variantReboxSlot)
   }
-  rcPathHeap = []
-  rcPathField = []
+  rcElem.pathHeap = []
+  rcElem.pathField = []
   emitRecCopyLevel(
     exprIx,
     sHeap,
@@ -3320,8 +3351,8 @@ function emitRecCopyLevel(
     const dFt = rcFieldTy(dTy, dNames[fj])
     const nest = rcNestedRow(sRow, sfi, dRow, fj, dFieldRows[fj], dFt)
     if nest >= 0 {
-      rcPathHeap.push(sHeapIdx[sRow])
-      rcPathField.push(sfi)
+      rcElem.pathHeap.push(sHeapIdx[sRow])
+      rcElem.pathField.push(sfi)
       const names: string[] = []
       const rows: i32[] = []
       let k = 0
@@ -3345,8 +3376,8 @@ function emitRecCopyLevel(
         rows,
         fnIx,
       )
-      rcPathHeap.pop()
-      rcPathField.pop()
+      rcElem.pathHeap.pop()
+      rcElem.pathField.pop()
       if r < 0 { return -1 }
       fbStructNew(sHeapIdx[nest])
       fj = fj + 1
@@ -3436,26 +3467,16 @@ function emitRecCopyLevel(
   0
 }
 
-// The record types an element-by-element list copy reads its fields at, or -1 outside one.
-let rcElemSrc = -1
-let rcElemDst = -1
-
-// The locals an element-by-element list copy reads its source element through (the source
-// wrapper and the index) and that list's row, or -1 outside one; and how many loops enclose it.
-let rcElemSL = -1
-let rcElemIL = -1
-let rcElemWrap = -1
-let rcElemBack = -1
-let rcElemBoxed = false
+// How many element-by-element copy loops enclose the code being emitted.
 let rcLoopDepth = 0
 
 // The source and destination records a copy of `exprIx` reads its field types off.
 function rcSrcTyOf(exprIx: i32): i32 {
-  if rcElemSrc >= 0 { rcElemSrc } else { nodeTyIxOf(exprIx) }
+  if rcElem.src >= 0 { rcElem.src } else { nodeTyIxOf(exprIx) }
 }
 
 function rcDstTyOf(exprIx: i32): i32 {
-  if rcElemDst >= 0 { rcElemDst } else { recCopyTyOf(exprIx) }
+  if rcElem.dst >= 0 { rcElem.dst } else { recCopyTyOf(exprIx) }
 }
 
 // The list of records just emitted for `exprIx`, copied element by element into the list `lct`'s
@@ -3636,22 +3657,15 @@ function emitRecListCopyTop(
   emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
   fbLocalGet(dL)
   fbLocalGet(iL)
-  const ps = rcElemSrc
-  const pd = rcElemDst
-  const pSL = rcElemSL
-  const pIL = rcElemIL
-  const pWrap = rcElemWrap
-  const pBack = rcElemBack
-  const pHeap = rcPathHeap
-  const pField = rcPathField
-  rcElemSrc = se
-  rcElemDst = de
-  rcElemSL = sL
-  rcElemIL = iL
-  rcElemWrap = srcWrap
-  rcElemBack = srcBack
-  rcPathHeap = []
-  rcPathField = []
+  const was = rcElem
+  rcElem = rcElemNone()
+  rcElem.src = se
+  rcElem.dst = de
+  rcElem.sL = sL
+  rcElem.iL = iL
+  rcElem.wrap = srcWrap
+  rcElem.back = srcBack
+  rcElem.boxed = was.boxed
   rcLoopDepth = rcLoopDepth + 1
   const r = if arms.length > 0 { emitRowUnionElemCopy(exprIx, arms, se, dsi, de, names, rows, fnIx) } else { emitRecCopyLevel(
     exprIx,
@@ -3666,14 +3680,7 @@ function emitRecListCopyTop(
     fnIx,
   ) }
   rcLoopDepth = rcLoopDepth - 1
-  rcElemSrc = ps
-  rcElemDst = pd
-  rcElemSL = pSL
-  rcElemIL = pIL
-  rcElemWrap = pWrap
-  rcElemBack = pBack
-  rcPathHeap = pHeap
-  rcPathField = pField
+  rcElem = was
   if r < 0 { return -1 }
   if arms.length == 0 { fbStructNew(sHeapIdx[dsi]) }
   fbArraySet(dstBack)
@@ -3705,23 +3712,23 @@ function emitRowUnionElemCopy(
       exprIx,
     )
   }
-  const pb = rcElemBoxed
-  rcElemBoxed = true
+  const pb = rcElem.boxed
+  rcElem.boxed = true
   let k = 0
   while k < arms.length {
     const last = k == arms.length - 1
     if !last {
-      fbLocalGet(rcElemSL)
-      fbStructGet(rcElemWrap, 0)
-      fbLocalGet(rcElemIL)
-      fbArrayGet(rcElemBack)
+      fbLocalGet(rcElem.sL)
+      fbStructGet(rcElem.wrap, 0)
+      fbLocalGet(rcElem.iL)
+      fbArrayGet(rcElem.back)
       fbStructGet(uBoxIdx, 0)
       fbI32Rel(RS_TAG, uTags[arms[k]])
       fbI32Bin(70) // i32.eq
       fbIfRef(sHeapIdx[dsi])
     }
     const vr = variantRowOf(arms[k])
-    rcElemSrc = ut.uMembers[k]
+    rcElem.src = ut.uMembers[k]
     const r = emitRecCopyLevel(
       exprIx,
       variantHeap(arms[k]),
@@ -3735,7 +3742,7 @@ function emitRowUnionElemCopy(
       fnIx,
     )
     if r < 0 {
-      rcElemBoxed = pb
+      rcElem.boxed = pb
       return -1
     }
     fbStructNew(sHeapIdx[dsi])
@@ -3747,8 +3754,8 @@ function emitRowUnionElemCopy(
     fbEnd()
     k = k + 1
   }
-  rcElemSrc = se
-  rcElemBoxed = pb
+  rcElem.src = se
+  rcElem.boxed = pb
   0
 }
 
@@ -14652,15 +14659,17 @@ function pushMapSlotPos(k: i32) {
   0
 }
 
-// Probe: with `mapRef` (slot 0) and the target `keyRef` (slot 1) set, linear-probe `M.index`,
-// wrapping, to the slot holding either the matching key's entry or a free (0) one. Leaves `slot`
-// (3) = that probe slot and `entry` (5) = its entry, 0 for a miss. Shared by get, has, set and
-// delete; occupancy, dead markers included, stays under 1/2, so a free slot is reached.
+// Probe: with `mapRef` (slot 0) and `keyRef` (slot 1) set, linear-probe `M.index` to the slot of
+// the key's entry or the free one ending its chain. Leaves `entry` (5), 0 for a miss, and `slot`
+// (3) under `needSlotAsked` (always under `-O`), which only set and delete read. Occupancy, dead
+// markers included, stays under 1/2, so a free slot is reached.
 
 // A dead entry stays a probe marker, never a hit, so delete does not break the chain (D2370).
 // The string key is hashed here, as `__map_probe__`'s first operand, on an empty operand stack so
 // no backing `struct.get` stays live across `__str_hash__`; `keepHash` parks it in scratch +9.
-function emitMapProbe(keepHash: boolean) {
+function emitMapProbe(keepHash: boolean, needSlotAsked: boolean) {
+  // `-O` keeps the slot probe and the index read at the site, the shape its map rows pin.
+  const needSlot = needSlotAsked || gOptimized != 0
   // Push the probe's shape-agnostic components (the map struct type differs per value shape,
   // but `index`/`hashes`/`live`/`keys` are identically typed across shapes — only these
   // `struct.get`s stay at the call site) and call the shared helper, which returns the SLOT.
@@ -14668,6 +14677,11 @@ function emitMapProbe(keepHash: boolean) {
   if pk == MAP_KEY_I32 {
     pushMapIndex()
     fbLocalGet(cmKeyLocal()) // the raw i32 key, its own tag
+    if !needSlot {
+      fbCall(helpMapEntryI32Fn())
+      setMapScr(5) // entry
+      return 0
+    }
     fbCall(helpMapProbeI32Fn())
   } else if pk == MAP_KEY_I64 {
     pushMapIndex()
@@ -14682,6 +14696,11 @@ function emitMapProbe(keepHash: boolean) {
     pushMapLive()
     pushMapKeysBacking()
     fbLocalGet(cmKeyLocal()) // the target string key
+    if !needSlot {
+      fbCall(helpMapEntryFn())
+      setMapScr(5) // entry
+      return 0
+    }
     fbCall(helpMapProbeFn())
   }
   setMapScr(3) // slot
@@ -14830,15 +14849,19 @@ function emitMapRecvKey(recvIx: i32, keyIx: i32, fnIx: i32) {
 }
 
 // Load the map receiver and key into the scratch frame (slots 0 and 1) and run the probe, leaving
-// `slot` (slot 3) = the probe slot and `entry` (slot 5) = `index[slot]`, 0 for a miss and else the
-// entry position plus 1. `recvIx` and `keyIx` are arena indices; `recvIx` must be a map-typed
-// expression and `keyIx` a string.
+// `entry` (slot 5) = `index[slot]`, 0 for a miss and else the entry position plus 1. `recvIx` and
+// `keyIx` are arena indices; `recvIx` must be a map-typed expression and `keyIx` a string.
 function emitMapPrep(recvIx: i32, keyIx: i32, fnIx: i32) {
+  emitMapPrepFor(recvIx, keyIx, fnIx, false)
+}
+
+// `emitMapPrep`, also leaving `slot` (slot 3) = the probe slot under `needSlot`.
+function emitMapPrepFor(recvIx: i32, keyIx: i32, fnIx: i32, needSlot: boolean) {
   if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
   // Pop the stacked pair into the frame only now — user code is done running.
   fbLocalSet(cmKeyLocal()) // the target key
   setMapRef()              // mapRef (the shared mono slot, or this mv/i32 frame's)
-  emitMapProbe(false)
+  emitMapProbe(false, needSlot)
 }
 
 // Emit the `??` DEFAULT `d` for a REF-valued map slot (`cmSlot >= 0`) onto `body`, in the
@@ -15912,7 +15935,7 @@ function emitMapClear(recvIx: i32, fnIx: i32) {
 // refs so the payload can be collected, decrements `size`, and pushes 1. A delete never moves an
 // entry, so a walk over the same map stays in step; storage is reclaimed on insert (D2315).
 function emitMapDelete(recvIx: i32, keyIx: i32, fnIx: i32) {
-  if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
+  if emitMapPrepFor(recvIx, keyIx, fnIx, true) < 0 { return -1 }
   const mslot = cmSlot
   // if entry == 0 { 0 } else { tombstone ; drop refs ; size-- ; 1 }
   pushMapScr(5) // entry
@@ -16249,7 +16272,7 @@ export function mapSetFnBody(sh: i32): u8[] {
 // A set's store, with the map, key and value in their locals: probe; a hit overwrites, a miss
 // appends, compacting first when the dead entries call for it, and maybe resizes.
 function emitMapSetStore(mslot: i32) {
-  emitMapProbe(true)
+  emitMapProbe(true, true)
   pushMapScr(5) // entry
   fbIf(64)      // if (entry != 0 → overwrite), void
   // OVERWRITE: vals.backing[entry-1] = stash
@@ -16275,7 +16298,7 @@ function emitMapSetStore(mslot: i32) {
     fbIf(64)      // if, void
     pushMapRef()
     fbCall(cmpFn)
-    emitMapProbe(true)
+    emitMapProbe(true, true)
     fbEnd()       // end (compact if)
   }
   // the slot's entry = count + 1 (the new entry's position + 1), beside an integer key's tag in
@@ -35754,6 +35777,17 @@ export function userGlobalIdx(gi: i32) {
   nImp + gStrPoolTexts.length + gCellIdx[gi]
 }
 
+// Whether `emitUserGlobalGet` (or, `write`, `emitUserGlobalSet`) writes global `gi` as one
+// `global.get`/`global.set` of `userGlobalIdx(gi)`: no folded immediate, promoted local, init
+// guard or init bit. The IR lowering asks, so the decision stays this chokepoint's.
+export function userGlobalPlain(gi: i32, write: boolean): boolean {
+  if gi < 0 { return false }
+  if gi < gFoldOk.length && gFoldOk[gi] == 1 { return false }
+  if gi < gPromoOk.length && gPromoOk[gi] == 1 { return false }
+  if write && (globalCellIsImmutable(gi) || initBitOf(gi) >= 0) { return false }
+  !initGuardNeeded(gi, write)
+}
+
 // the storage-class chokepoint for a user top-level binding: every user cell's `0x23`/`0x24`
 // goes through this pair, so cell, local or immediate is one decision no emit site can bypass.
 // A promoted binding read outside the start function's frame is rejected loudly; a folded
@@ -36005,13 +36039,7 @@ export function wasmEmitStateReset() {
   asgParkWanted = false
   asgParkedOwner = -1
   mapSetDidPark = false
-  rcElemSrc = -1
-  rcElemDst = -1
-  rcElemSL = -1
-  rcElemIL = -1
-  rcElemWrap = -1
-  rcElemBack = -1
-  rcElemBoxed = false
+  rcElem = rcElemNone()
   rcLoopDepth = 0
   boxSeat = -1
   armSeat = -1
@@ -40735,6 +40763,15 @@ function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
     && (tyHasTyVar(nodeTyIxOf(lhsIx)) || readOfOpenBinding(lhsIx))
     && tyExcludesNull(nodeTyAt(lhsIx, fnIx))
   ) {
+    // An atom left takes the `??`'s own rep where that is no atom: the member string, or the
+    // box of a join with another type (D16530).
+    if exprIsLitAtom(lhsIx, fnIx) && !exprIsLitAtom(exprIx, fnIx) {
+      const coTy = nodeTyAt(exprIx, fnIx)
+      if primNameOf(coTy) == "string" { return emitAtomToStr(e.binLeft, fnIx) }
+      if exprUnion(exprIx, fnIx) {
+        return emitUnionBoxArg("", coTy, e.binLeft, fnIx)
+      }
+    }
     return emitExpr(e.binLeft, fnIx)
   }
   const lhs = nodeAt(lhsIx)

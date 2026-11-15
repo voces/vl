@@ -38,7 +38,8 @@ import { inferQuiet } from "./check_cursor"
 import { elabCallDeclOf } from "./check_elab_cap"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
 import { parenPeelIx } from "./check_places"
-import { recFreshDeclOf, recHeldDecl } from "./check_rec_fresh"
+import { recFreshDeclOf, recHeldDecl, recInferredFnOf } from "./check_rec_fresh"
+import { rcwCallSites } from "./check_record_writes"
 import {
   recArgRepOf,
   recArmListLits,
@@ -58,6 +59,7 @@ import {
 import {
   adoptLitAt,
   litAtDstStorage,
+  recAdoptNote,
   recAsgFnWidenedTy,
   recBuiltReadTy,
   recBuiltReadTyIn,
@@ -799,20 +801,44 @@ function recListCallCopy(o: i32, bt: i32): boolean {
   true
 }
 
+// Builds the binding a spread part reads, an un-annotated `const` or unwritten `let` of the one
+// call of a maker of a fresh record list, at a list of `le`, the maker built there as its call is
+// delivered; its other deliveries at its own storage are refused (D16445). False otherwise.
+function recHeldSpreadCallCopy(sv: i32, le: i32): boolean {
+  const c = recHeldCallInit(sv)
+  const fd = if c >= 0 { recInferredFnOf(c) } else { -1 }
+  if fd < 0 { return false }
+  // Only a maker called once is built where its call lands (D3444); a copy has no binding row.
+  cwIxBuild()
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length != 1 { return false }
+  const d = recHeldDecl(sv)
+  recAdoptNote(c, nodeTyIxOf(c), mkArrayTy(le))
+  recBuildPush(d, nodeTyIxOf(c), mkArrayTy(le), false)
+  recHeldReadsOwnRefuse(d, mkArrayTy(le), sv, [sv])
+}
+
+// The call the un-annotated `const`, or unwritten `let`, binding read `o` holds; else -1.
+function recHeldCallInit(o: i32): i32 {
+  if o < 0 || o >= P.nodes.length || !(nodeAt(o) is Ident) { return -1 }
+  const d = recHeldDecl(o)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  if dn.letKw != "const" {
+    cwIxBuild()
+    if !cwLetUnwritten(d) { return -1 }
+  }
+  const c = cwPeelValue(dn.letInit)
+  if c >= 0 && nodeAt(c) is Call { c } else { -1 }
+}
+
 // Builds the binding list part `o` reads, an un-annotated `const` or unwritten `let` of a call's
 // fresh record, at the record `bt` the list's other parts are built at, its call copied there as
 // it is bound; its other deliveries at its own storage are refused (D15655). False otherwise.
 function recHeldCallPartCopy(o: i32, bt: i32): boolean {
-  if o < 0 || o >= P.nodes.length || !(nodeAt(o) is Ident) { return false }
+  const c = recHeldCallInit(o)
+  if c < 0 || !recListCallCopy(c, bt) { return false }
   const d = recHeldDecl(o)
-  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
-  if dn.letKw != "const" {
-    cwIxBuild()
-    if !cwLetUnwritten(d) { return false }
-  }
-  const c = cwPeelValue(dn.letInit)
-  if c < 0 || !(nodeAt(c) is Call) || !recListCallCopy(c, bt) { return false }
   recBuildPush(d, nodeTyIxOf(c), bt, false)
   recHeldReadsOwnRefuse(d, bt, o, [o])
 }
@@ -867,7 +893,9 @@ function recListPartsApartRefuse(owns: i32[], bt: i32, at: i32) {
 // any other spread holds its own records, which no copy reaches, so one storing a field of the
 // element a held or fresh part gives the list differently is refused (D16440).
 function recListSpreadsApartRefuse(l: i32, owns: i32[], fresh: i32[]) {
-  const lt = nodeTyIxOf(l)
+  // A literal delivered into a declared list is stamped at it (`recordRepTyAdopt`, D16443).
+  const lr = nodeRepTyIxOf(l)
+  const lt = if lr >= 0 && lr < T.tys.length && tyAt(lr) is TyArray { lr } else { nodeTyIxOf(l) }
   const le = if lt >= 0 && lt < T.tys.length { tyArrayElemIx(lt) } else { -1 }
   if le < 0 || le >= T.tys.length || !(tyAt(le) is TyObj) { return 0 }
   let at = -1
@@ -883,6 +911,7 @@ function recListSpreadsApartRefuse(l: i32, owns: i32[], fresh: i32[]) {
         && recStorageFieldOf(ot, le) != ""
         && !recHeldListSpreadStamp(o, le)
         && !recSpreadCallCopy(sv, le)
+        && !recHeldSpreadCallCopy(sv, le)
       ) {
         spreads.push(o)
       }
