@@ -274,7 +274,7 @@ function asJoin(l: Lit): Lit {
 
 // A shift of a constant by a run-time count: no constant, but typed as one toward its use (Q8).
 function constShift(e: Expr): boolean {
-  return e.k === "bin" && ["<<", ">>", ">>>"].includes(e.op) && isConstTree(e.l) && !isConstTree(e.r);
+  return e.k === "bin" && ["<<", ">>", ">>>"].includes(e.op) && constLike(e.l) && !isConstTree(e.r);
 }
 
 // A constant-left shift, or `-`/`~` over one: typed as a constant toward its use (Q8, 4.2).
@@ -469,7 +469,9 @@ function arith(op: string, a: Val, b: Val, expK: string | null = null): Val {
   // D3043: with no destination, an integer constant that does not fit its `i32` peer is `i64`.
   if (!expK && (ka === null) !== (kb === null)) {
     const lit = (a instanceof Lit ? a : b) as Lit;
-    if ((ka ?? kb) === "i32" && lit.i !== null && !litHolds(lit, "i32") && !["<<", ">>", ">>>"].includes(op)) expK = "i64";
+    // A tree over a literal join is typed by its arms, not its value (E9.1 does not list `if`).
+    const joinTyped = lit.join && lit.derived && !lit.wideDec;
+    if ((ka ?? kb) === "i32" && lit.i !== null && !joinTyped && !litHolds(lit, "i32") && !["<<", ">>", ">>>"].includes(op)) expK = "i64";
   }
   if (expK && (ka === null) !== (kb === null)) {
     const peer = (ka ?? kb)!, lit = (a instanceof Lit ? a : b) as Lit;
@@ -1320,8 +1322,11 @@ export class Interp {
         return a ?? b;
       }
       case "if": {
-        const t = e.t.length ? e.t[e.t.length - 1] : null;
-        return t && t.k === "expr" ? this.staticKind(t.e, env) : null;
+        // a join is its arms' wider kind; a constant arm has none here and takes the other's
+        const arm = (b: Stmt[] | null) => { const t = b && b.length ? b[b.length - 1] : null; return t && t.k === "expr" ? this.staticKind(t.e, env) : null; };
+        const a = arm(e.t), b = arm(e.f);
+        if (a && b) { try { return wider(a, b); } catch { return a; } }
+        return a ?? b;
       }
       default: return null;
     }
@@ -1421,7 +1426,7 @@ export class Interp {
     }
     // A shift's result is its left operand's type, and a count never types the left: a constant
     // left takes its destination's width, else its own default (coordinator ruling on Q8).
-    if (["<<", ">>", ">>>"].includes(op) && isConstTree(e.l) && !isConstTree(e.r)) {
+    if (["<<", ">>", ">>>"].includes(op) && constLike(e.l) && !isConstTree(e.r)) {
       let k: string | null = null;
       if (exp) { try { const x = this.resolve(exp, env); if (x.k === "name" && (x.name === "i32" || x.name === "i64")) k = x.name; } catch { /* none */ } }
       const lv = this.eval(e.l, env, k ? exp : null);
