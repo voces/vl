@@ -1,12 +1,14 @@
 // `emit_ty_seal.vl` — a type's canonical id: one `i32` per type up to the equality an emit
 // comparer decides, interned bottom-up so equal types are one id and a comparison is `==`.
-// `tyCanonSet` is `tySameSet`'s equality and `tyCanonSpelled` is `tySameSpelled`'s. A recursive
+// `tyCanonSet` is `tySameSet`'s equality and `tyCanonSpelled` is `tySameSpelled`'s; a kind they
+// compare by `tyEq` keys by `tyEq`'s structure. A recursive
 // type keys its cycle at the declaration it re-enters, by name, else by the distance back. Until
 // the comparers retire, a shadow compares each outermost answer with the ids under
 // `$VL_ID_SHADOW` and changes none.
 
 import {
   T,
+  Ty,
   TyArray,
   TyErr,
   TyFunc,
@@ -37,35 +39,46 @@ import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 import { Interner, internIdIn, internNew } from "./intern"
 import { flattenVariantsInto } from "./tyquery"
 
-// The id kinds: a negative child, a type keyed by its render, a union, a map or Set, a list, a
-// record, a cycle's back reference, and a recursive declaration keyed by its name.
+// The id kinds. `CK_UNION` is a member set or list per equality, `CK_SEQ` `tyEq`'s ordered union,
+// `CK_BRAND` a newtype over its base, `CK_BACK` a cycle's back reference and `CK_NOM` a recursive
+// declaration keyed by its name.
 const CK_NEG = 1
-const CK_LEAF = 2
 const CK_UNION = 3
 const CK_MAP = 4
 const CK_LIST = 5
 const CK_OBJ = 6
 const CK_BACK = 7
 const CK_NOM = 8
+const CK_SEQ = 9
+const CK_NULLABLE = 10
+const CK_FN = 11
+const CK_NEGATE = 12
+const CK_PRIM = 13
+const CK_ERR = 14
+const CK_HOLE = 15
+const CK_PARAM = 16
+const CK_LIT = 17
+const CK_BRAND = 18
 
-// The two equalities: union members as a set, and as the spelling renders them, in order with a
-// Set spelled as its boolean map.
+// The three equalities: union members as a set; as the spelling renders them, in order with a
+// Set spelled as its boolean map; and `tyEq`'s, every child compared as `tyEq` compares it.
 const CF_SET = 0
 const CF_SPELLED = 1
+const CF_EQ = 2
 
 // The ids, shared by both equalities and across compiles: an id names content, never a row.
 const canonTab: Interner = internNew()
-// A string's id, for a render or a name inside a key.
+// A string's id, for a name or a literal's text inside a key.
 const canonStrIds: {[string]: i32} = Map()
 
 // Each row's id per equality, valid while the arena's generations match the stamp.
-let canonSetOf: i32[] = []
-let canonSpelledOf: i32[] = []
+let canonMemo: i32[][] = [[], [], []]
 let canonEpoch = -1
 let canonRenames = -1
-// The rows being keyed, outermost first, and per row the shallowest row a back reference under
-// it reached (`CANON_CLOSED` for none).
+// The rows being keyed, outermost first, with the equality each is keyed under, and per row the
+// shallowest row a back reference under it reached (`CANON_CLOSED` for none).
 const canonWalk: i32[] = []
+const canonWalkFl: i32[] = []
 const canonOpenAt: i32[] = []
 const CANON_CLOSED = 0x7fffffff
 
@@ -88,19 +101,18 @@ function canonSync() {
   if canonEpoch == tyMutEpoch && canonRenames == tyVarRenames { return 0 }
   canonEpoch = tyMutEpoch
   canonRenames = tyVarRenames
-  canonSetOf = []
-  canonSpelledOf = []
+  canonMemo = [[], [], []]
   0
 }
 
 function canonMemoAt(ty: i32, fl: i32): i32 {
-  const memo = if fl == CF_SET { canonSetOf } else { canonSpelledOf }
+  const memo = canonMemo[fl]
   if ty < memo.length { return memo[ty] }
   -1
 }
 
 function canonMemoPut(ty: i32, fl: i32, id: i32) {
-  const memo = if fl == CF_SET { canonSetOf } else { canonSpelledOf }
+  const memo = canonMemo[fl]
   while memo.length <= ty { memo.push(-1) }
   memo[ty] = id
   0
@@ -113,7 +125,7 @@ function canonOf(ty: i32, fl: i32): i32 {
   if hit >= 0 { return hit }
   let at = canonWalk.length - 1
   while at >= 0 {
-    if canonWalk[at] == ty {
+    if canonWalk[at] == ty && canonWalkFl[at] == fl {
       // Every row between here and the one re-entered is keyed relative to it.
       let k = at + 1
       while k < canonOpenAt.length {
@@ -131,9 +143,11 @@ function canonOf(ty: i32, fl: i32): i32 {
     return nid
   }
   canonWalk.push(ty)
+  canonWalkFl.push(fl)
   canonOpenAt.push(CANON_CLOSED)
-  const id = canonOfGo(ty, fl)
+  const id = if fl == CF_EQ { canonEqGo(ty) } else { canonOfGo(ty, fl) }
   canonWalk.pop()
+  canonWalkFl.pop()
   if canonOpenAt.pop() == CANON_CLOSED { canonMemoPut(ty, fl, id) }
   id
 }
@@ -163,7 +177,7 @@ function canonOfGo(ty: i32, fl: i32): i32 {
         return internIdIn(
           canonTab,
           CK_MAP,
-          [0, k, canonLeafNamed("boolean")],
+          [0, k, internIdIn(canonTab, CK_PRIM, [canonStr("boolean")], 0)],
           0,
         )
       }
@@ -174,24 +188,112 @@ function canonOfGo(ty: i32, fl: i32): i32 {
       return internIdIn(canonTab, CK_LIST, [canonOf(tyElemOf(t), fl)], 0)
     }
     TyObj => {
-      const args: i32[] = [canonStr(nomNameOfTy(x)), t.objFieldNames.length]
-      let f = 0
-      while f < t.objFieldNames.length {
-        args.push(canonStr(t.objFieldNames[f]))
-        args.push(canonOf(t.objFieldTypes[f], fl))
-        f = f + 1
-      }
-      return internIdIn(canonTab, CK_OBJ, args, 0)
+      return canonObj(x, t, fl)
     }
-    // The flattening leaves no union or nullable here; every other kind keys by its render.
+    // The flattening leaves no union or nullable here; the comparers compare every other kind
+    // by `tyEq`.
     TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
-      return canonLeafNamed(tyToStr(x))
+      return canonOf(x, CF_EQ)
     }
   }
 }
 
-function canonLeafNamed(s: string): i32 {
-  internIdIn(canonTab, CK_LEAF, [canonStr(s)], 0)
+// A record's id: its newtype brand, then each field's name and id in order.
+function canonObj(x: i32, t: TyObj, fl: i32): i32 {
+  const args: i32[] = [canonStr(nomNameOfTy(x)), t.objFieldNames.length]
+  let f = 0
+  while f < t.objFieldNames.length {
+    args.push(canonStr(t.objFieldNames[f]))
+    args.push(canonOf(t.objFieldTypes[f], fl))
+    f = f + 1
+  }
+  internIdIn(canonTab, CK_OBJ, args, 0)
+}
+
+// Row `x`'s id up to `tyEq`: a newtype brand over its structure, a union's members flattened and
+// in order (one member stands for itself), a nullable opaque, a list with its view bit, and an
+// inference hole one id whatever its name.
+function canonEqGo(x: i32): i32 {
+  const t = tyAt(x)
+  if t is TyObj { return canonObj(x, t, CF_EQ) }
+  const base = canonEqKind(x, t)
+  const nom = nomNameOfTy(x)
+  if nom == "" { return base }
+  internIdIn(canonTab, CK_BRAND, [canonStr(nom), base], 0)
+}
+
+function canonEqKind(x: i32, t: Ty): i32 {
+  match t {
+    TyUnion => {
+      const ms: i32[] = []
+      canonUnionMembersInto(x, ms)
+      if ms.length == 1 { return canonOf(ms[0], CF_EQ) }
+      const ids: i32[] = []
+      for m in ms { ids.push(canonOf(m, CF_EQ)) }
+      return internIdIn(canonTab, CK_SEQ, ids, 0)
+    }
+    TyNullable => {
+      return internIdIn(canonTab, CK_NULLABLE, [canonOf(t.nInner, CF_EQ)], 0)
+    }
+    TyArray => {
+      return internIdIn(
+        canonTab,
+        CK_LIST,
+        [canonOf(tyElemOf(t), CF_EQ), t.aRead],
+        0,
+      )
+    }
+    TyMap => {
+      return internIdIn(
+        canonTab,
+        CK_MAP,
+        [t.mSet, canonOf(tyKeyOf(t), CF_EQ), canonOf(tyValOf(t), CF_EQ)],
+        0,
+      )
+    }
+    TyFunc => {
+      const ids: i32[] = [canonOf(t.fnRet, CF_EQ)]
+      for p in t.fnParamTypes { ids.push(canonOf(p, CF_EQ)) }
+      return internIdIn(canonTab, CK_FN, ids, 0)
+    }
+    TyNeg => {
+      return internIdIn(canonTab, CK_NEGATE, [canonOf(t.negTy, CF_EQ)], 0)
+    }
+    TyPrim => {
+      return internIdIn(canonTab, CK_PRIM, [canonStr(t.primName)], 0)
+    }
+    TyErr => {
+      return internIdIn(canonTab, CK_ERR, [], 0)
+    }
+    TyVar => {
+      if t.tvName[0] == '?' { return internIdIn(canonTab, CK_HOLE, [], 0) }
+      return internIdIn(canonTab, CK_PARAM, [canonStr(t.tvName)], 0)
+    }
+    TyLit => {
+      return internIdIn(
+        canonTab,
+        CK_LIT,
+        [canonStr(t.litKind), canonStr(t.litText)],
+        0,
+      )
+    }
+    TyObj => {
+      return canonObj(x, t, CF_EQ)
+    }
+  }
+}
+
+// Union `ty`'s members, nested unions flattened and a nullable kept whole, as `tyEq` lists them.
+function canonUnionMembersInto(ty: i32, out: i32[]) {
+  if ty >= 0 {
+    const t = tyAt(ty)
+    if t is TyUnion {
+      for m in t.uMembers { canonUnionMembersInto(m, out) }
+      return 0
+    }
+  }
+  out.push(ty)
+  0
 }
 
 // A union's id: under `CF_SET` its members' ids sorted and deduplicated, one left standing for
@@ -223,11 +325,14 @@ function canonUnion(xs: i32[], fl: i32): i32 {
 }
 
 // The shadow's tallies per comparer: agreements, the comparer's true where the ids differ, its
-// false where they match, and the first few disagreements spelled.
+// false where they match, the agreements on "unequal" and on one row, and the first few
+// disagreements spelled.
 const CS_NAMES = ["same-set", "same-spelled", "canon-key"]
 let csAgree: i32[] = [0, 0, 0]
 let csTrueNe: i32[] = [0, 0, 0]
 let csFalseEq: i32[] = [0, 0, 0]
+let csAgreeNe: i32[] = [0, 0, 0]
+let csSameRow: i32[] = [0, 0, 0]
 let csRows: string[] = []
 // `tyCanonKey`'s keys seen with their set id, and the set ids with their key.
 let csKeyId: {[string]: i32} = Map()
@@ -236,12 +341,19 @@ let csIdKey: {[i32]: string} = Map()
 // Whether the shadow records: the identity shadow's switch, read once per comparison.
 export function canonShadowOn(): boolean { idShadowModeOf() > 0 }
 
-// Notes comparer `which`'s outermost answer `r` for types `a` and `b` beside the ids' answer.
-export function canonShadowSame(which: i32, a: i32, b: i32, r: boolean) {
-  const fl = if which == 0 { CF_SET } else { CF_SPELLED }
-  const eq = canonOf(a, fl) == canonOf(b, fl)
+// Notes comparer `which`'s outermost answer `r` for types `a` and `b` beside `eq`, whether
+// their ids are one.
+export function canonShadowSame(
+  which: i32,
+  a: i32,
+  b: i32,
+  r: boolean,
+  eq: boolean,
+) {
   if eq == r {
     csAgree[which] = csAgree[which] + 1
+    if !r { csAgreeNe[which] = csAgreeNe[which] + 1 }
+    if a == b { csSameRow[which] = csSameRow[which] + 1 }
     return 0
   }
   if r {
@@ -252,10 +364,9 @@ export function canonShadowSame(which: i32, a: i32, b: i32, r: boolean) {
   canonShadowExample(which, r, canonShowTy(a) + " ~ " + canonShowTy(b))
 }
 
-// Notes `tyCanonKey`'s outermost key `k` for `ty`: one key with two set ids, or one set id with
-// two keys, is a disagreement.
-export function canonShadowKey(ty: i32, k: string) {
-  const id = canonOf(ty, CF_SET)
+// Notes `tyCanonKey`'s outermost key `k` for `ty`, whose set id is `id`: one key with two set
+// ids, or one set id with two keys, is a disagreement.
+export function canonShadowKey(ty: i32, k: string, id: i32) {
   const kid = csKeyId.get(k)
   const ik = csIdKey.get(id)
   if kid == null { csKeyId.set(k, id) }
@@ -302,7 +413,11 @@ export function canonShadowReport() {
         + " true-ne "
         + i32ToStr(csTrueNe[i])
         + " false-eq "
-        + i32ToStr(csFalseEq[i]),
+        + i32ToStr(csFalseEq[i])
+        + " agree-unequal "
+        + i32ToStr(csAgreeNe[i])
+        + " same-row "
+        + i32ToStr(csSameRow[i]),
     )
     i = i + 1
   }
@@ -310,6 +425,8 @@ export function canonShadowReport() {
   csAgree = [0, 0, 0]
   csTrueNe = [0, 0, 0]
   csFalseEq = [0, 0, 0]
+  csAgreeNe = [0, 0, 0]
+  csSameRow = [0, 0, 0]
   csRows = []
   csKeyId = Map()
   csIdKey = Map()
