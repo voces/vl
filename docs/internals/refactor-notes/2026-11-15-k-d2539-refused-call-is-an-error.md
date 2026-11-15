@@ -17,6 +17,9 @@ message then quoted line 47 of `std:idtable`, a line the caller never sees.
 - `checkRetTyParamBound` (check_node_rules.vl) answers whether it refused.
 - `checkCallOnFuncTy` (check_calls.vl) types a refused call as `TY_ERR`, which every later
   judge already skips, the covariant-write rule included.
+- The refusals are counted (`rtpRefusals`). A body whose only returned value is a refused call
+  then counts as having reported its cause, as `oerDeclRefusals` already does. So
+  `cannot infer a return type for 'relay'` does not follow the call's own refusal.
 
 Net compiler lines: about +6. Pin helpers: none touched.
 
