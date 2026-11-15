@@ -73,8 +73,8 @@ print(c.d ?? 0)
 
 // A call whose bind row is keyed at its rep builds its argument at the wider record (`erArgBuilt`).
 const REP_KEYED = `type J = { r: i32 | null, g: i32 }
-function idn<T>(v: T): T { v }
-function mk() { { r: 15, g: 1 } }
+function idn<T>(v: T): T { return v }
+function mk() { return { r: 15, g: 1 } }
 const j: J = idn(mk())
 print(j.g)
 `;
@@ -115,7 +115,7 @@ useB(nb)
 
 // D5930: a list literal whose leaf is a hole, handed on by a forwarder, is built at the `f64[]`
 // the called function takes, not at the `i32[]` its leaf binds.
-const CONVERTED = `function flat(a: i32, b: f64[]) { b[a - 3] * 2.5 }
+const CONVERTED = `function flat(a: i32, b: f64[]) { return b[a - 3] * 2.5 }
 function fwd(g, x, y) { return g(x, y) }
 function outer(h, v) { return fwd(h, 3, [v]) }
 print(outer(flat, 1))
@@ -129,12 +129,12 @@ print(f(two, (i) => i * 1.5))
 `;
 
 // A closed list of number literals at a wider list parameter converts at the delivery.
-const CLOSED_LIST = `function len<T>(xs: T[], ys: T[]): i32 { xs.length + ys.length }
+const CLOSED_LIST = `function len<T>(xs: T[], ys: T[]): i32 { return xs.length + ys.length }
 const a: i64[] = [1]
 print(len(a, [2, 3]))
 `;
 
-const PLAIN = `function id<T>(x: T): T { x }
+const PLAIN = `function id<T>(x: T): T { return x }
 print(id(3))
 print(id("s"))
 `;

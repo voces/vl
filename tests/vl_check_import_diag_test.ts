@@ -31,13 +31,13 @@ if (GATED && !ENABLED) {
 // An import carrying a plain `unused-binding` warning of its own.
 const LIB_WARN = `export function twice(n: i32): i32 {
   let leftover = 1
-  n * 2
+  return n * 2
 }
 `;
 // An import carrying a type error.
 const LIB_ERR = `export function thrice(n: i32): i32 {
   const broken: i32 = "not an i32"
-  n * 3
+  return n * 3
 }
 `;
 // The named file, with a warning of its OWN, so suppression is provably not a blanket.

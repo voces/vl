@@ -16,10 +16,10 @@ if (ignore) {
   console.warn("[shared-type-param-join] skipped — missing vl or the seed");
 }
 
-const HEAD = `function id<T>(x: T): T { x }
+const HEAD = `function id<T>(x: T): T { return x }
 function dup<T>(x: T): T {
   print("dup")
-  x
+  return x
 }
 function one<F>(a: F, c: F, k: boolean) {
   let b = a
@@ -70,7 +70,7 @@ Deno.test({
   ignore,
   async fn() {
     const got = await twoInstances(
-      HEAD + "function dbl(x) { x }\none(id, dbl, true)\none(dbl, id, false)\n",
+      HEAD + "function dbl(x) { return x }\none(id, dbl, true)\none(dbl, id, false)\n",
     );
     if (got) throw new Error("want one instance of `one`, got: a second (`one$1`)");
   },

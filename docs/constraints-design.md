@@ -35,8 +35,8 @@ seed; re-run before quoting (a citation is a measurement with a date on it).
 **The implicit operator constraint is SHIPPED, on both spellings of a generic.**
 
 ```vl
-function dbl<T>(x: T): T { x + x }     // declared type parameter
-function dbl2(a) { a + a }             // unannotated parameter (inferred hole)
+function dbl<T>(x: T): T { return x + x }     // declared type parameter
+function dbl2(a) { return a + a }             // unannotated parameter (inferred hole)
 ```
 
 Both check and RUN at `i32` (`6`), `f64` (`3`), and `string` (`"abab"`), and both refuse a
@@ -60,7 +60,7 @@ an EMPTY diagnostic (D952, then D1004 / D1221 for the unbounded half).
 **A structural spelling exists for function-typed FIELDS, and UFCS does not satisfy it.**
 
 ```vl
-function render(x: { toString: (Circle) => string }): string { x.toString({ r: 1.0 }) }
+function render(x: { toString: (Circle) => string }): string { return x.toString({ r: 1.0 }) }
 ```
 
 parses and checks (function types take unnamed parameters — `(self: i32)` inside a type is
@@ -136,7 +136,7 @@ parameter:
 
 ```vl
 type Showable = { toString(self): string }
-function describe<T: Showable>(x: T): string { "<" + x.toString() + ">" }
+function describe<T: Showable>(x: T): string { return "<" + x.toString() + ">" }
 ```
 
 Semantics:
@@ -297,7 +297,7 @@ open. Every number here was run on the seed built from this change; re-run befor
 
 ```vl
 type Showable = { toString(): string }
-function describe<T: Showable>(x: T): string { "<" + x.toString() + ">" }
+function describe<T: Showable>(x: T): string { return "<" + x.toString() + ">" }
 ```
 
 * **Method members** parse in every type-literal position — the declaration body

@@ -85,7 +85,7 @@ const expectRows = (
 
 // A void and a valued top-level function, both answered by the checker.
 const PLAIN = `function f(x: i32) { print(x) }
-function g(x: i32) { x + 1 }
+function g(x: i32) { return x + 1 }
 f(g(2))
 `;
 
@@ -107,10 +107,10 @@ stop("x")
 // Two instances of one function, and a lambda inside another generic's instance: an instance
 // answers from its elaboration slot, a function nested in one from its own type there, and the
 // pruned template from its stub.
-const GENERIC = `function id<T>(x: T): T { x }
+const GENERIC = `function id<T>(x: T): T { return x }
 function ap<T>(x: T): T {
   const k = (y: T) => y
-  k(x)
+  return k(x)
 }
 print(id(3))
 print(id("s"))
@@ -126,7 +126,7 @@ const TAIL_WRITE = `function nn(v: i32): i32 | null {
 function line(k: i32) {
   let x = nn(k)
   const _clr = () => {
-    x = null
+    return x = null
   }
   x = 0
   return x + 1
@@ -154,7 +154,7 @@ function other<V>(v: V) { print("O"); print(v) }
 function a<T>(x: T) {
   let k = inner
   const toO = () => {
-    k = other
+    return k = other
   }
   toO()
   k(x)
@@ -170,7 +170,7 @@ function other<V>(v: V) { print("O") }
 function c<T>(x: T) {
   let k: (t: T) => void = inner
   const toO = () => {
-    if x == x { k = other }
+    return if x == x { k = other }
   }
   toO()
   k(x)
@@ -190,8 +190,8 @@ go()
 `;
 
 // A generic nothing instantiates is pruned to an empty stub, void as minted (`monoStubSlots`).
-const STUB = `function id<T>(x: T): T { x }
-function keep(x: i32) { x + 1 }
+const STUB = `function id<T>(x: T): T { return x }
+function keep(x: i32) { return x + 1 }
 print(keep(1))
 `;
 
@@ -210,7 +210,7 @@ function fl(n: i32) {
 }
 function setI(v: i32) { print(v) }
 function "[]="(self: IV, i: i32, v: i32) { setI(v) }
-function "[]"(self: IV, i: i32): i32 { i }
+function "[]"(self: IV, i: i32): i32 { return i }
 fl(1)
 setI(3)
 `;
@@ -330,7 +330,7 @@ Deno.test({
 const HEX_LAMBDA = `function g(c: boolean) {
   let x: i64 = 0
   const set = () => {
-    x = if c { 0xfffffffe } else { 1 }
+    return x = if c { 0xfffffffe } else { 1 }
   }
   set()
   print(x)
@@ -357,7 +357,7 @@ Deno.test({
 // A generic returned past an un-annotated function into a `string`-returning slot is built
 // returning `string`, beside its exact instance: each records the result it is built at (D14795).
 const WIDENED_DELIVERY = `type K = "x" | "y"
-function same<T>(k: T): T { k }
+function same<T>(k: T): T { return k }
 function d1() { return same }
 const v1: (k: K) => string = d1()
 print(v1("x") + "!")
@@ -387,13 +387,13 @@ Deno.test({
 // instance's value, stamped at its binding, is built at the delivery's.
 const ROW_STAMP = `const i: { f: i32 } = { f: 4 }
 type I = { f: i32 | null }
-function mk() { { f: 7 } }
+function mk() { return { f: 7 } }
 const b: I = mk()
 print(b.f ?? 0)
 print(i.f)
 `;
 
-const ROW_LIST = `function id<T>(x: T): T { x }
+const ROW_LIST = `function id<T>(x: T): T { return x }
 function d() { return [id] }
 const v: ((x: i32) => i32)[] = d()
 print(v[0](2))
@@ -414,7 +414,7 @@ main()
 // An identity instance handed a record literal and returned into a union with its own row reaches
 // the row class: its recorded result keys the slot elsewhere, and the value's stamp agrees.
 const ROW_ID_UNION = `type J = { r: i32 | null }
-function idn<T>(v: T): T { v }
+function idn<T>(v: T): T { return v }
 function take(u: J | string) {
   if u is J { print(u.r ?? 0) } else { print(u) }
 }
@@ -428,7 +428,7 @@ print(w0.r)
 `;
 
 const ROW_DELIVERY = `type J = { r: i32 | null }
-function idn<T>(v: T): T { v }
+function idn<T>(v: T): T { return v }
 const u: J | string = idn({ r: 4 })
 const k = { r: 5 }
 print(k.r)
@@ -454,7 +454,7 @@ print(mk().length)
 // D14901 class D: an element read handed back is built where the list's stored values are, here
 // the kept build of the call that fills it, not at the element's row-less own record.
 const ELEM_HAND_BACK = `type J = { f: i32 | null }
-function mk() { { f: 4 } }
+function mk() { return { f: 4 } }
 function back(r) { return r }
 const wideJ: J = mk()
 const xs = [mk()]
@@ -466,14 +466,14 @@ print(wideJ.f ?? 0)
 // not at the narrow record its callers are stamped at; a generic taking its call reads it there.
 const ROW_CALL_BUILT = `type II = { f: i32 }
 type J = { f: i32 | null }
-function mk() { { f: 4 } }
-function id<T>(x: T): T { x }
+function mk() { return { f: 4 } }
+function id<T>(x: T): T { return x }
 function r2() {
   const k = id(mk())
   const k2 = k
   return k2
 }
-function g<T>(a: T): T { a }
+function g<T>(a: T): T { return a }
 const d: J = mk()
 print(g(r2()).f)
 print(d.f ?? 0)
@@ -639,7 +639,7 @@ Deno.test({
 // `computeRetInference` run after monomorphize. `g` is annotated by then, so it grades nowhere;
 // a structural record names no row in the rep, while the column takes the one its value
 // is built at.
-const COL_REC = `function mk(n: i32) { { a: n, b: 2 } }
+const COL_REC = `function mk(n: i32) { return { a: n, b: 2 } }
 print(mk(3).a)
 `;
 
@@ -665,12 +665,12 @@ outer()
 // A result whose recorded record names no row (a container read a \`??\` defaults, its values built
 // wider) reads its value's stamp, the row it is built at.
 const COL_STAMP = `type J = { f: i32 | null }
-function mk1() { { f: 4 } }
+function mk1() { return { f: 4 } }
 const m = Map()
 m.set("a", mk1())
 const wm: {[string]: J} = Map()
 wm.set("a", mk1())
-function g() { m.get("a") ?? { f: 1 } }
+function g() { return m.get("a") ?? { f: 1 } }
 print(g().f ?? 0)
 `;
 
@@ -678,12 +678,12 @@ print(g().f ?? 0)
 // destination (`mk2`, two arguments); where one call binds the result as built (`e1`), the
 // function keeps its own record, and `mk1` is left to the walk.
 const COL_VARIANT = `type R = { v: f64 }
-function mk1(k: i32) { { v: k } }
+function mk1(k: i32) { return { v: k } }
 const d1: R | string = mk1(7)
 const e1 = mk1(3)
 if d1 is R { print(d1.v / 2) }
 print(e1.v / 2)
-function mk2(k: i32) { { v: k } }
+function mk2(k: i32) { return { v: k } }
 function take(d: R | string) {
   if d is R { print(d.v / 2) }
 }
@@ -711,7 +711,7 @@ const lap = (g) => {
 function w<T>(_t: T) { return lap(id) }
 print(w(1))
 print(w("x"))
-function id2<T>(x: T): T { x }
+function id2<T>(x: T): T { return x }
 const ks = [id2]
 function both<T>(t: T) {
   ks[0] = (x) => x + x
