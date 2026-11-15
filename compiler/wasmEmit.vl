@@ -632,6 +632,7 @@ import {
   helpMapResizeFn,
   helpMapResizeI32Fn,
   helpMapResyncFn,
+  helpOobTrapFn,
   helpStrBytesFn,
   helpStrConcatFn,
   helpStrEqFn,
@@ -791,6 +792,7 @@ import {
   fbBrOnNull,
   fbCall,
   fbCallIndirect,
+  fbCallsReset,
   fbDrop,
   fbElse,
   fbEnd,
@@ -871,6 +873,7 @@ import {
   fbUnreachable,
   fbValtype,
   fbValtypeNullable,
+  gFbCalls,
   lbBack,
   lbBackTy,
   lbCap,
@@ -16954,16 +16957,7 @@ function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
     fbStructGet(lTy, 1) // field 1: len
     fbI32Bin(79) // 0x4f i32.ge_u
     fbIf(64)
-    fbLocalGet(wrapSlot)
-    fbStructGet(lTy, 0)
-    if listBackIsRecord(back) {
-      fbLocalGet(wrapSlot)
-      fbStructGet(lTy, 0)
-      fbArrayLen()
-      fbLocalGet(wrapSlot)
-      fbStructGet(lTy, 0)
-    }
-    emitListIdxTrap(back)
+    emitListIdxTrapOf(back, wrapSlot, lTy, -1)
     fbEnd()
     fbLocalGet(wrapSlot)
     fbStructGet(lTy, 0) // field 0: backing
@@ -17011,6 +17005,35 @@ function listBackIsRecord(back: i32): boolean {
   false
 }
 
+// A guard's failing arm over backing `back` (local `backSlot`, else wrapper `wrapSlot`'s field 0).
+// A position-free plain build calls `__oob__` then `unreachable` once the body has called; a leaf
+// keeps the inline trap and so its stack-check-free prologue, as do `-O` (binaryen shares one trap
+// between checks) and a build that records the access's position.
+function emitListIdxTrapOf(back: i32, wrapSlot: i32, lTy: i32, backSlot: i32) {
+  if gOptimized == 0 && !idxSpanOn() && gFbCalls > 0 {
+    fbCall(helpOobTrapFn(back))
+    fbUnreachable()
+    return 0
+  }
+  emitListIdxBackRef(wrapSlot, lTy, backSlot)
+  if listBackIsRecord(back) {
+    emitListIdxBackRef(wrapSlot, lTy, backSlot)
+    fbArrayLen()
+    emitListIdxBackRef(wrapSlot, lTy, backSlot)
+  }
+  emitListIdxTrap(back)
+}
+
+// The backing ref `emitListIdxTrapOf` names: local `backSlot`, or field 0 of the wrapper.
+function emitListIdxBackRef(wrapSlot: i32, lTy: i32, backSlot: i32) {
+  if backSlot >= 0 {
+    fbLocalGet(backSlot)
+    return 0
+  }
+  fbLocalGet(wrapSlot)
+  fbStructGet(lTy, 0)
+}
+
 // Traps with the engine's own bounds trap from the guard's untaken branch: a read at -1 of the
 // backing, or for a record list (`listBackIsRecord`) a one-element copy to index `len` from
 // `[backing, len, backing]`. The closing `unreachable` lets `-O` drop a later check of the same
@@ -17041,13 +17064,7 @@ function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
     fbLocalGet(lhLen[row])
     fbI32Bin(79) // 0x4f i32.ge_u
     fbIf(64)
-    fbLocalGet(lhBack[row])
-    if listBackIsRecord(back) {
-      fbLocalGet(lhBack[row])
-      fbArrayLen()
-      fbLocalGet(lhBack[row])
-    }
-    emitListIdxTrap(back)
+    emitListIdxTrapOf(back, -1, -1, lhBack[row])
     fbEnd()
     fbLocalGet(lhBack[row])
     fbLocalGet(listIdxScratchBase)
@@ -29732,16 +29749,7 @@ function emitMapFilter(callIx: i32, fnIx: i32) {
       fbI32Bin(78) // 0x4e i32.ge_s — i >= the current length?
       if isMap {
         fbIf(64)
-        fbLocalGet(srcL)
-        fbStructGet(srcWrap, 0)
-        if listBackIsRecord(srcBack) {
-          fbLocalGet(srcL)
-          fbStructGet(srcWrap, 0)
-          fbArrayLen()
-          fbLocalGet(srcL)
-          fbStructGet(srcWrap, 0)
-        }
-        emitListIdxTrap(srcBack)
+        emitListIdxTrapOf(srcBack, srcL, srcWrap, -1)
         fbEnd()
       } else {
         fbI32Eqz()
@@ -35313,6 +35321,7 @@ export function emitFuncBody(blockIx: i32, fnIx: i32) {
     // than in `emitFuncCode` because nothing before the body needs the answer, and the
     // set is stamped with `fnIx` so a body that never scanned cannot read a stale one.
     strAccScan(blockIx, fnIx)
+    fbCallsReset()
     // The declaration-time address fold's table: a node index is a row at most once, but the
     // scratch slots it names are per-function, so both are cleared here.
     maFoldDeclIx = []

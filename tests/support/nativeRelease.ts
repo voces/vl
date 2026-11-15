@@ -134,8 +134,11 @@ export const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: n
   // ROOT REACHES (DECISIONS.md, "A plain build drops the functions no root reaches"): the
   // two sites each of `__str_concat__` and `__utf8_enc__` are now `unreachable` stubs. Every
   // reached function disassembles identically, and `-O`/`-O3` are unmoved.
+  // Unoptimised, a failing list-index guard in a body that has already called traps through the
+  // shared `__oob__`, whose empty array is one more site (every list row but the literal, whose
+  // guard comes first); `-O` keeps the trap inline, so its counts are unmoved.
   { fixture: "list-wrapper-literal", none: 2, O: 0, O3: 0 },
-  { fixture: "list-wrapper-call", none: 2, O: 0, O3: 0 },
+  { fixture: "list-wrapper-call", none: 3, O: 0, O3: 0 },
   // Both union-box producers here are two-armed helpers, and the RETURN SINK gives such a
   // function ONE construction site: every `return` writes the tag/payload pair into two
   // reserved locals and branches to a single exit that performs the only `struct.new`. So
@@ -173,8 +176,8 @@ export const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: n
   // Unoptimised, a push's grow lives in one shared `__grow_<row>__`, so the per-site backing
   // allocations are one site in the helper (5 -> 3, 6 -> 4). `-O` keeps the grow inline, so the
   // optimised counts, which are what the melt is about, did not move.
-  { fixture: "list-wrapper-push", none: 3, O: 3, O3: 2 },
-  { fixture: "list-wrapper-push-reserved", none: 4, O: 0, O3: 0 },
+  { fixture: "list-wrapper-push", none: 4, O: 3, O3: 2 },
+  { fixture: "list-wrapper-push-reserved", none: 5, O: 0, O3: 0 },
   // `union-box-call` with its payload READ instead of discarded. The read still blocks the
   // melt at two sites — that is what `opt-profile-design.md` §3 item 0 measured — but the
   // producer now has one site, and the two survivors at `-O`/`-O3` are the PAYLOAD
