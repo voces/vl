@@ -30,15 +30,12 @@ annotation, and pass 2 has not checked its body (`fnInferredUnchecked`), as it a
 - D16369 prints `6`, `32`. D16381's witness, D6322 and D15596 hold.
 - 574 hole, inferred, return, fn and generic templates (the first version): 0 runs→not-runs, no
   cell changed. The cells that are SILENT or TRAP are the same on both seeds.
-- `regress.vl` on the merged tree: 0 runs→not-runs. 14 `dord*` cells move to runs, and their
-  baseline lines are rewritten.
-- `decl-order-ab.vl`: 17 clause-1 movers fall to 12, none new. 153 of 5147 cases move. The
-  baseline is rewritten. Two of the five closed are D16281's, so 9 of its cells still move.
-- `check-filed-witnesses --strict`: 5091 graded, all as filed.
-
-Tried and dropped:
-- Not publishing a hole result in quiet mode: an invalid module, because `pick` read `TY_ERR`.
-- Also leaving `TY_ERR` pending: 5 nested-generic witnesses (D6322, D15596, D15598, D15601,
-  D15602) regressed, and with that scoped to top-level functions 3 matrix cells did.
-- Resetting the pre-pass's results to pending: against `inferReturnsPrePass`'s design, which
-  keeps them as final.
+- On top of #8201 (master `7e5a0ce4` and later):
+  - `regress.vl`: 0 runs→not-runs. 11 `dord*` cells move to runs, and their baseline lines are
+    rewritten.
+  - `decl-order-ab.vl`: master's 85 movers, 6 of them clause-1, fall to 72 movers and 2 clause-1,
+    none new. The baseline is rewritten.
+  - The witnesses of D16281 and D16301 run. Each is re-graded to the one remaining mover it owns,
+    reduced (`c4([dbl], 2.5)` builds an invalid module, and a returned closure over `[inc0, half]`
+    traps).
+  - `check-filed-witnesses --strict`: 5099 graded, all as filed.
