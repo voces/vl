@@ -1,7 +1,7 @@
 // The type of a method call `recv.f(args)`: a built-in method, a struct field holding a
 // function, or a free function reached by UFCS, with overload and hole-typed callees.
 
-import { rowViewTy } from "./check_row_param"
+import { rowSlotBound } from "./check_row_param"
 import { openKeyReadNote, openReadNote } from "./check_side_rows"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
 import { cwFnValueDeclOf } from "./check_write_scan"
@@ -112,6 +112,7 @@ import {
   validateNestCstrs,
   validatePrintCstrs,
   validateUfcsCstrs,
+  wsCandidateAt,
 } from "./check_demands"
 import {
   bmArgMsg,
@@ -250,7 +251,7 @@ import {
   tyRefusesArrayWrite,
   tyToStr,
 } from "./check_types"
-import { argLitAt } from "./check_width"
+import { argLitAt, wsNotePendingAt, wsSuppress } from "./check_width"
 import { peelParenIx } from "./check_write_effects"
 import {
   declFirstParamIsSelf,
@@ -368,6 +369,7 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
 function ufcsCheckRecvSeam(
   n: Call,
   name: string,
+  decl: i32,
   recvTy: i32,
   params: i32[],
   bNames: string[],
@@ -381,7 +383,19 @@ function ufcsCheckRecvSeam(
     return 0
   }
   if recvX >= 0 && !tyHasHole(recvTy) && !tyHasHole(selfTy) {
-    if !assignableExpr(recvX, recvTy, selfTy) {
+    // A wider record to a declared record `self`, as at an argument: a rewritten one is held to its
+    // record, and a new one is made generic after this pass (D3992).
+    const rb = rowSlotBound(params[0])
+    const wsName = if rb < 0 && !inferQuiet { wsCandidateAt(decl, 0, recvX, recvTy, params[0]) } else { "" }
+    if wsName != "" { wsNotePendingAt(decl, 0, wsName) }
+    wsSuppress = rb >= 0 || wsName != ""
+    const recvOk = assignableExpr(
+      recvX,
+      recvTy,
+      if rb >= 0 { rb } else { selfTy },
+    )
+    wsSuppress = false
+    if !recvOk {
       tErr(
         "receiver: expected " + tyToStr(selfTy) + ", got " + tyToStr(recvTy),
         recvX,
@@ -469,19 +483,17 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     if recvTy < 0 || tyAt(recvTy) is TyErr { return TY_ERR }
     // The merge banks a lone `self`-function candidate itself; several choose here.
     const ovMany = ovSelfCount(ovRow) > 1
-    // A record parameter's row slot picks by its record: every row it binds is one.
-    const recvV = rowViewTy(recvTy)
-    if ovMany && tyAt(recvV) is TyVar {
+    if ovMany && tyAt(recvTy) is TyVar {
       return ovHoleCallTy(ovRow, plainName, recvTy, n, ix)
     }
-    if ufcsOverloadRefuses(ovRow, ovMany, plainName, recvV, ix) {
+    if ufcsOverloadRefuses(ovRow, ovMany, plainName, recvTy, ix) {
       return TY_ERR
     }
   }
   // Maps the callee's plain source name to its merge-mangled function, after field precedence
   // has already been checked — resolved at this call's own site (D1120), since two merged
   // modules may each export the same-named `self`-function.
-  const callee = ufcsCalleeOf(plainName, rowViewTy(recvTy), ix)
+  const callee = ufcsCalleeOf(plainName, recvTy, ix)
   const fnTy = callee.fnTy
   if fnTy < 0 || callee.decl < 0 { return -1 }
   if !ufcsInferCallee(callee.name, callee.top, fnTy) { return -1 }
@@ -541,7 +553,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     }
     bindGenWalk(params[0], recvTy, bNames, bTys)
     if ufcsU8RecvRefuses(recvTy, params[0], bNames, bTys, ix) { return TY_ERR }
-    ufcsCheckRecvSeam(n, callee.name, recvTy, params, bNames, bTys)
+    ufcsCheckRecvSeam(n, callee.name, callee.decl, recvTy, params, bNames, bTys)
     ufcsCheckArgs(callee.name, params, args, uDecl, bNames, bTys)
     if uDst.length > 0 && !inferQuiet {
       dstRetypeLitArgs(uDst, params, uArgs, bNames, bTys)
