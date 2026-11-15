@@ -81,7 +81,13 @@ import {
   ufcsUnpinnedSites,
   ufcsUnpinnedSitesPush,
 } from "./check_call_resolve"
-import { builtinMethodClaims } from "./check_callee"
+import {
+  BMR_LIST,
+  BMR_MAP,
+  BMR_STR,
+  bmTakes,
+  builtinMethodClaims,
+} from "./check_callee"
 import { mkDerivedHole } from "./check_coal"
 import { spreadElemTy } from "./check_container_lits"
 import { checkNodeHook, efLeaf } from "./check_core_state"
@@ -1009,8 +1015,10 @@ export function checkMemberCallNode(
   // an array — synthesizing one over a derived element hole and falling into the array-method
   // arm below, which pins the concrete element per call shape. Without this the hole would
   // grow a `{map: any}` struct shape no array argument could satisfy.
+  // A call no built-in method of its name can take, by its argument count, is a field call.
+  const argc = n.callArgs.length
   if rt is TyVar && !holeMethodIsSelfFn(prop, ix) {
-    if holeArrMethod(prop) {
+    if holeArrMethod(prop) && bmTakes(BMR_LIST, prop, argc) {
       noteArrayDemand(arrayDemandKey(recvTy))
       // The synthesized receiver below is a MUTABLE list, and nothing re-checks the
       // argument against it — so a write through the hole is filed here, and the pin
@@ -1018,7 +1026,7 @@ export function checkMemberCallNode(
       if listMethodMutates(prop) { noteArrayWriteDemand(rt.tvName) }
       const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, recvTy)
       recvTy = mkArrayTy(elemHole)
-    } else if holeMapMethod(prop) {
+    } else if holeMapMethod(prop) && bmTakes(BMR_MAP, prop, argc) {
       // A place a type-parameter write left nullable at some pins is asked at each, unless
       // the call is optional (D3445).
       if recvPre < 0 && tyIsWriteLandRead(recvTy) {
@@ -1314,7 +1322,7 @@ function memberCallMapFilterTy(
   rt: TyArray,
 ): i32 {
   const cargs = n.callArgs
-  if cargs.length != 1 {
+  if !bmTakes(BMR_LIST, prop, cargs.length) {
     tErr(prop + " expects 1 argument, got " + i32ToStr(cargs.length), ix)
     return TY_ERR
   }
@@ -1467,7 +1475,7 @@ function memberCallArrayTy(
   }
   const margs = n.callArgs
   if prop == "push" {
-    if margs.length < 1 {
+    if !bmTakes(BMR_LIST, "push", margs.length) {
       tErr("push expects at least 1 argument, got 0", ix)
     } else {
       checkListPushArgs(margs, ix, recvIx, recvTy, rt)
@@ -1485,7 +1493,7 @@ function memberCallArrayTy(
   // its VALUE type (`arrElemValueTy`), so a `u8[]` answers `i32 | null` — the same
   // widening `xs[i]` takes, and the rep `emitPopNulBox` already builds (D1211).
   if prop == "pop" {
-    if margs.length != 0 {
+    if !bmTakes(BMR_LIST, "pop", margs.length) {
       tErr("pop expects 0 arguments, got " + i32ToStr(margs.length), ix)
     }
     // The first pop under a `.length` test of this same list yields the element (D3558); an
@@ -1501,7 +1509,7 @@ function memberCallArrayTy(
     return mkNullableTy(popEl)
   }
   if prop == "get" {
-    if margs.length != 1 {
+    if !bmTakes(BMR_LIST, "get", margs.length) {
       tErr("get expects 1 argument, got " + i32ToStr(margs.length), ix)
     } else {
       const gat = checkNodeHook(margs[0])
@@ -1512,7 +1520,7 @@ function memberCallArrayTy(
     return mkNullableTy(arrElemValueTy(tyElemOf(rt)))
   }
   if prop == "clear" {
-    if margs.length != 0 {
+    if !bmTakes(BMR_LIST, "clear", margs.length) {
       tErr("clear expects 0 arguments, got " + i32ToStr(margs.length), ix)
     }
     return TY_VOID
@@ -1520,7 +1528,7 @@ function memberCallArrayTy(
   // `.slice(start, end?)` yields a NEW array of the SAME element type — the bounds
   // are i32 (a missing `end` defaults to the length; negatives count from the end).
   if prop == "slice" {
-    if margs.length != 1 && margs.length != 2 {
+    if !bmTakes(BMR_LIST, "slice", margs.length) {
       tErr("slice expects 1 or 2 arguments, got " + i32ToStr(margs.length), ix)
     } else {
       let si = 0
@@ -1571,7 +1579,7 @@ function memberCallMapTy(
   const mp = prop
   const margs2 = n.callArgs
   if mp == "set" && rt.mSet == 0 {
-    if margs2.length != 2 {
+    if !bmTakes(BMR_MAP, "set", margs2.length) {
       tErr("set expects 2 arguments, got " + i32ToStr(margs2.length), ix)
     } else {
       const k0 = checkNodeHook(margs2[0])
@@ -1640,7 +1648,7 @@ function memberCallMapTy(
     return TY_VOID
   }
   if mp == "get" && rt.mSet == 0 {
-    if margs2.length != 1 {
+    if !bmTakes(BMR_MAP, "get", margs2.length) {
       tErr("get expects 1 argument, got " + i32ToStr(margs2.length), ix)
     } else {
       const k1 = checkNodeHook(margs2[0])
@@ -1673,7 +1681,7 @@ function memberCallMapTy(
     return TY_ERR
   }
   if mp == "add" && rt.mSet == 1 {
-    if margs2.length != 1 {
+    if !bmTakes(BMR_MAP, "add", margs2.length) {
       tErr("add expects 1 argument, got " + i32ToStr(margs2.length), ix)
     } else {
       const ka = checkNodeHook(margs2[0])
@@ -1689,7 +1697,7 @@ function memberCallMapTy(
     return TY_VOID
   }
   if mp == "has" || mp == "delete" {
-    if margs2.length != 1 {
+    if !bmTakes(BMR_MAP, mp, margs2.length) {
       tErr(mp + " expects 1 argument, got " + i32ToStr(margs2.length), ix)
     } else {
       const k2 = checkNodeHook(margs2[0])
@@ -1705,17 +1713,21 @@ function memberCallMapTy(
     return TY_BOOL
   }
   if mp == "clear" {
-    if margs2.length != 0 {
+    if !bmTakes(BMR_MAP, "clear", margs2.length) {
       tErr("clear expects 0 arguments, got " + i32ToStr(margs2.length), ix)
     }
     return TY_VOID
   }
   if mp == "keys" {
-    if margs2.length != 0 { tErr("keys expects no arguments", ix) }
+    if !bmTakes(BMR_MAP, "keys", margs2.length) {
+      tErr("keys expects no arguments", ix)
+    }
     return mkArrayTy(tyKeyOf(rt))
   }
   if mp == "values" {
-    if margs2.length != 0 { tErr("values expects no arguments", ix) }
+    if !bmTakes(BMR_MAP, "values", margs2.length) {
+      tErr("values expects no arguments", ix)
+    }
     // A set's `.values()` yields its ELEMENTS (the keys); a map's its values.
     if rt.mSet == 1 { return mkArrayTy(tyKeyOf(rt)) }
     return mkArrayTy(tyValOf(rt))
@@ -1745,7 +1757,7 @@ function memberCallStringTy(n: Call, ix: i32, prop: string, recvTy: i32): i32 {
   const sp = prop
   const sargs = n.callArgs
   if sp == "slice" {
-    if sargs.length != 2 {
+    if !bmTakes(BMR_STR, "slice", sargs.length) {
       tErr("slice expects 2 arguments, got " + i32ToStr(sargs.length), ix)
     } else {
       const s0 = checkNodeHook(sargs[0])
@@ -1760,7 +1772,7 @@ function memberCallStringTy(n: Call, ix: i32, prop: string, recvTy: i32): i32 {
     return TY_STR
   }
   if sp == "indexOf" {
-    if sargs.length != 1 {
+    if !bmTakes(BMR_STR, "indexOf", sargs.length) {
       tErr("indexOf expects 1 argument, got " + i32ToStr(sargs.length), ix)
     } else {
       const a0 = checkNodeHook(sargs[0])
@@ -1771,7 +1783,7 @@ function memberCallStringTy(n: Call, ix: i32, prop: string, recvTy: i32): i32 {
     return TY_I32
   }
   if sp == "includes" {
-    if sargs.length != 1 {
+    if !bmTakes(BMR_STR, "includes", sargs.length) {
       tErr("includes expects 1 argument, got " + i32ToStr(sargs.length), ix)
     } else {
       const a0 = checkNodeHook(sargs[0])
@@ -1782,7 +1794,7 @@ function memberCallStringTy(n: Call, ix: i32, prop: string, recvTy: i32): i32 {
     return TY_BOOL
   }
   if sp == "charCodeAt" {
-    if sargs.length != 1 {
+    if !bmTakes(BMR_STR, "charCodeAt", sargs.length) {
       tErr("charCodeAt expects 1 argument, got " + i32ToStr(sargs.length), ix)
     } else {
       const a0 = checkNodeHook(sargs[0])
@@ -1796,7 +1808,7 @@ function memberCallStringTy(n: Call, ix: i32, prop: string, recvTy: i32): i32 {
   // O(1) (§Codepoints). Not "the i-th code point": the argument is in the one
   // coordinate system `slice`, `indexOf` and `.length` share.
   if sp == "cpAt" {
-    if sargs.length != 1 {
+    if !bmTakes(BMR_STR, "cpAt", sargs.length) {
       tErr("cpAt expects 1 argument, got " + i32ToStr(sargs.length), ix)
     } else {
       const a0 = checkNodeHook(sargs[0])
@@ -1810,7 +1822,7 @@ function memberCallStringTy(n: Call, ix: i32, prop: string, recvTy: i32): i32 {
   // call site rather than hidden in a `.length` that is O(1) on some data and O(n)
   // on other data (§Codepoints: "a subscript should mean O(1), always").
   if sp == "cpLen" {
-    if sargs.length != 0 {
+    if !bmTakes(BMR_STR, "cpLen", sargs.length) {
       tErr("cpLen expects no arguments, got " + i32ToStr(sargs.length), ix)
     }
     return TY_I32
@@ -1819,7 +1831,7 @@ function memberCallStringTy(n: Call, ix: i32, prop: string, recvTy: i32): i32 {
   // test. Slicing off a boundary is LEGAL under Go-lean validity (§Validity), so this
   // is the tool for code that wants to check rather than a guard the language imposes.
   if sp == "isCharBoundary" {
-    if sargs.length != 1 {
+    if !bmTakes(BMR_STR, "isCharBoundary", sargs.length) {
       tErr(
         "isCharBoundary expects 1 argument, got " + i32ToStr(sargs.length),
         ix,
@@ -1836,7 +1848,7 @@ function memberCallStringTy(n: Call, ix: i32, prop: string, recvTy: i32): i32 {
   // see `emitStrBytesFnCode` for why a `u8[]` cannot express a non-zero `start`,
   // and `strings-design.md` §Byte view for the withdrawn zero-copy claim.
   if sp == "bytes" {
-    if sargs.length != 0 {
+    if !bmTakes(BMR_STR, "bytes", sargs.length) {
       tErr("bytes expects no arguments, got " + i32ToStr(sargs.length), ix)
     }
     return mkArrayTy(TY_U8)
