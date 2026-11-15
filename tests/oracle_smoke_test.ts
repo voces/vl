@@ -100,6 +100,12 @@ Deno.test("oracle: pinned regressions", () => {
     ["const e: Set<i32> = Set()\nconst u: Set<i32> | Set<string> = e\nprint(u is Set<string>)", "false"],
     ["type L = i32[] | f64[]\nconst xs: L[] = [[]]\nprint(xs[0] is f64[])", "false"],
     ["const m: {[string]: string | i32} = Map()\nconst w: {[string]: string | i32} | string = m\nprint(w is {[string]: i32 | string})", "true"],
+    // ruling A: a radix tree computes at its use's width, which an i64 peer fixes after it ran
+    ["print((0xFFFF0000 | 0xFF) + 3000000000)", "7294902015"],
+    ["const t: i64 = 3000000000\nprint(min((0xFFFFFFFF / (-1)), t))", "-4294967295"],
+    ["print(9 << (7 % 0xFFFFFFFF))", "9"], // a shift count keeps its own reading (Q8)
+    ["const c: boolean = false\nprint(if c { 4294967296 } else { 0xFFFFFFFF })", "4294967295"],
+    ["const t: i64 = 5\nconst s: i32 = 4\nprint(min(t, 0xFFFFFFFF << s))", "5"],
   ];
   for (const [src, want] of pins) {
     const o = interpret(src + "\n");
