@@ -13,6 +13,12 @@ while the window is open. When `emitProgram` ends the window with a nonzero coun
 `holeReset` closes the window and clears the count at the arena's reset, before that reset's own
 bump, so a check-only compile that ran `elabPrepare` cannot leave it open.
 
+**Phase-state census.** The window is state that crosses the check→emit boundary by design:
+`elabPrepare` and `emitProgram` open it, and `tyMutBump` (check) counts into it. It lives in
+`check_types.vl` behind `tyEmitWindowOpen` and `tyEmitWindowClose`, so the census counts one
+cross-phase table (`tyEmitWindow`) where two exported globals would have counted two. `surface`
+in `emit_sections.vl` rises by the two functions' imports.
+
 **What is not done, and why (the coordinator's call).** The emitter's 31 `tyEmitEpoch` reads stay.
 Each also gives its memo per-program invalidation, and some memos may be filled during checking,
 before the window, while rows still move visibly. Deleting one safely takes a reset at the window
