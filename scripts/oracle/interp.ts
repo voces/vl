@@ -1062,12 +1062,14 @@ export class Interp {
         if (typeof l === "string" && typeof r === "string") return l + r;
         if (Array.isArray(l) && Array.isArray(r)) return [...l, ...r];
     }
+    let expK: string | null = null;
+    if (exp) { try { const x = this.resolve(exp, env); if (x.k === "name" && NUMERIC.has(x.name)) expK = x.name; } catch { /* no destination */ } }
     if (l instanceof Lit && r instanceof Lit && exp) {
+      // `>>>` of a negative constant needs a width: the destination's, when it is i64.
+      if (op === ">>>" && l.i !== null && l.i < 0n && !l.radix && expK === "i64") return arith(">>>", litTo(l, "i64"), litDefault(r));
       // E9.1: the exact constant is computed first and typed at its use.
       return litArith(op, l, r);
     }
-    let expK: string | null = null;
-    if (exp) { try { const x = this.resolve(exp, env); if (x.k === "name" && NUMERIC.has(x.name)) expK = x.name; } catch { /* no destination */ } }
     return arith(op, l, r, expK);
   }
 
