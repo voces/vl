@@ -613,13 +613,13 @@ available alongside it (U12).
 ```vl
 // (a) lossless edges implicit, everything else `as`
 function f(u: u32): i64 { return u }          // ok — zero-extends
-function g(i: i32): u32 { i }          // error — write `i as u32` or `i as% u32`
+function g(i: i32): u32 { return i }          // error — write `i as u32` or `i as% u32`
 
 // (b) nothing implicit (Rust / Swift)
 function f(u: u32): i64 { return u as i64 }   // required
 
 // (c) AssemblyScript: any target with as many bits, "regardless of interpretation/signedness"
-function g(i: i32): u32 { i }          // ok — -1 becomes 4294967295 silently
+function g(i: i32): u32 { return i }          // ok — -1 becomes 4294967295 silently
 function h(x: i64): f64 { return x }          // ok — rounds silently
 ```
 
@@ -1007,7 +1007,7 @@ function next(r: Rng): u64 {
   let z = r.state
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
   z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-  z ^ (z >> 31)
+  return z ^ (z >> 31)
 }
 function unit(r: Rng): f64 { return (next(r) >> 11) as f64 / 9007199254740992.0 }
 function small(r: Rng): i32 { return next(r) as% i32 }

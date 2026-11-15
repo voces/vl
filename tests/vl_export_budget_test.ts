@@ -58,8 +58,8 @@ const run = async (args: string[]): Promise<string> => {
 
 // The miniature tree: `compiler/` is the declaration side the ratchet owns,
 // `tests/` one of the five other trees a reference may live in.
-const MOD = `export function orphan(): i32 { 1 }
-export function imported(): i32 { 2 }
+const MOD = `export function orphan(): i32 { return 1 }
+export function imported(): i32 { return 2 }
 export let table: i32[] = []
 `;
 // `use` is deliberately NOT exported: a second dead export would make the one row
@@ -72,8 +72,8 @@ print(use())
 // The reachability arm: a pair that only calls itself, named again in a comment and in an
 // `import` list, is dead; a top-level call is what brings it back.
 const PAIR =
-  `export function ping(n: i32): i32 { if n > 0 { pong(n - 1) } else { 0 } }
-export function pong(n: i32): i32 { ping(n) }
+  `export function ping(n: i32): i32 { return if n > 0 { pong(n - 1) } else { 0 } }
+export function pong(n: i32): i32 { return ping(n) }
 `;
 const NAMER = `import { ping, pong } from "./pair"
 
@@ -133,7 +133,7 @@ Deno.test({
       const why = await budget("--budget-why");
       if (
         !why.out.includes(
-          "compiler/mod.vl: export function orphan(): i32 { 1 }",
+          "compiler/mod.vl: export function orphan(): i32 { return 1 }",
         )
       ) {
         throw new Error(

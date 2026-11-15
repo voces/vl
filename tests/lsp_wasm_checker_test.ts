@@ -1021,7 +1021,7 @@ Deno.test({ name: "wasm-checker: lint surfaces unused-pure-expression, tagged un
   const checker = loadWasmChecker(SEED, log)!;
   // The motivating shape: a stray pure literal ahead of the real work fires; the
   // block-tail `0` (the function's value) and the call statement do not.
-  const src = "function f() {\n  3\n  print(1)\n  0\n}\nf()\n";
+  const src = "function f() {\n  3\n  print(1)\n  return 0\n}\nf()\n";
   const diags = checker.lint(src);
   const hits = diags.filter((d) => d.code === "unused-pure-expression");
   if (hits.length !== 1) {

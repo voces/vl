@@ -75,11 +75,11 @@ const CHECKER = `function render(t: i32) { tyToEmitName(t) }
 `;
 const QUERIES = `export function recordClonedTy(name: string) { nameToTy(name) }
 `;
-const TYNAME = `export function nameIsArray(name: string) { name.length > 2 }
-export function splitUnionAtoms(name: string, out: string[]) { 0 }
-export function groupInnerOf(name: string) { name }
-export function demangleSpelling(name: string) { name }
-function privateHelper(name: string) { name }
+const TYNAME = `export function nameIsArray(name: string) { return name.length > 2 }
+export function splitUnionAtoms(name: string, out: string[]) { return 0 }
+export function groupInnerOf(name: string) { return name }
+export function demangleSpelling(name: string) { return name }
+function privateHelper(name: string) { return name }
 `;
 
 // Declares every parser the census lists, so a fixture tree passes its stale-name check.
@@ -240,13 +240,13 @@ Deno.test({
 const CANON_CALLERS = `function typesOnly(t: i32, out: i32[]) {
   const atoms: string[] = []
   if !canonUnionMembersInto(t, out, atoms) { return 0 }
-  0
+  return 0
 }
 
 function readsNames(t: i32) {
   const names: string[] = []
   canonUnionMembersInto(t, [], names)
-  names.length
+  return names.length
 }
 
 function litArg(t: i32, out: i32[]) {
@@ -257,12 +257,12 @@ const WALK =
   `function canonUnionMembersWalk(ty: i32, atoms: string[]): boolean {
   const r = canonEmitNameAt(tyToNominalName(ty), 0)
   atoms.push(r)
-  true
+  return true
 }
 `;
 const TYPED_WALK =
   `function canonUnionMembersWalk(ty: i32, atoms: string[]): boolean {
-  true
+  return true
 }
 `;
 
@@ -337,7 +337,7 @@ Deno.test({
       );
       await Deno.writeTextFile(
         `${dir}/compiler/emit_map_twins.vl`,
-        `function unionHasBoolLeafArm(arms: string[]) {\n  unionHasAtom(arms[0])\n}\n`,
+        `function unionHasBoolLeafArm(arms: string[]) {\n  return unionHasAtom(arms[0])\n}\n`,
       );
       const fed = await census(["--list", "ty-string-parse", "--root", dir]);
       const want =
