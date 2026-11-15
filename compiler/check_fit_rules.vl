@@ -271,8 +271,10 @@ import {
   f32LitTailsAdopt,
   floatLitTails,
   litTreeAdoptDst,
+  numLitAdoptDeep,
   numLitAdoptDst,
   numPairOpTy,
+  tailParensSync,
   valueJoinAt,
   valueTailLeaves,
   valueTailSplit,
@@ -374,11 +376,13 @@ import {
   rcwTyped,
 } from "./check_record_writes"
 import {
+  TT_COVERED,
+  TT_NONE,
+  TT_PARTLY,
   annotResolve,
   assignable,
   bindGenWalk,
   constrainEmpty,
-  fnSlotRetWidens,
   joinArmFits,
   joinArmLit,
   joinArmTail,
@@ -388,12 +392,16 @@ import {
   keepListStorage,
   njFixSet,
   recArmFitKind,
+  recContainedIn,
   sameVariantTy,
   substTyDeep,
   tErr,
   tErrPushTok,
   tErrUnsupported,
   tsToTy,
+  tyTestIsMember,
+  tyTestMemberFit,
+  tyTestMembers,
   widenLitTy,
 } from "./check_relate_core"
 import {
@@ -447,7 +455,6 @@ import {
   containerWidenServed,
   containerWidenWhy,
   fieldStorageEq,
-  isWidenNotVariant,
   listJoinStorageDiffers,
   listPairNeedsCopy,
   objFieldNameSetsEq,
@@ -1246,7 +1253,7 @@ export function radixLitAdoptDst(srcExpr: i32, dstTy: i32) {
     return radixLitAdoptWidth(lix, w)
   }
   if e is IfStmt || e is MatchExpr || e is Block {
-    return radixLitAdoptTails(lix, dstTy)
+    return radixLitAdoptTails(srcExpr, dstTy)
   }
   if e is ObjLit { return radixLitAdoptFields(e, dstTy) }
   if e is ArrayLit { return radixLitAdoptElems(e, dstTy) }
@@ -1303,11 +1310,12 @@ function radixLitAdoptElems(e: ArrayLit, dstTy: i32) {
   rc
 }
 
-// The tails of the value `if`, `match` or block at `ix`, pinned to `dstTy`. Only a join every
+// The tails of the value `if`, `match` or block at `src`, pinned to `dstTy`. Only a join every
 // `if` and `match` of which is typed `i32` or `i64` takes part. When a tail widens to 64 bits,
 // those nodes are re-typed `i64` with it, so the emitter builds the join at that width; at a float
 // destination they are re-typed to it, so a radix tail is read as the value a bare one is.
-function radixLitAdoptTails(ix: i32, dstTy: i32) {
+function radixLitAdoptTails(src: i32, dstTy: i32) {
+  const ix = parenPeelIx(src)
   const spine: i32[] = []
   const leaves: i32[] = []
   valueTailSplit(ix, spine, leaves)
@@ -1350,6 +1358,7 @@ function radixLitAdoptTails(ix: i32, dstTy: i32) {
       if spine[s] < nodeTyIx.length { nodeTySet(spine[s], reTy) }
       s = s + 1
     }
+    tailParensSync(src)
   }
   rc
 }
@@ -9515,6 +9524,11 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
     // A value `if`, `match` or block delivers each arm's value to the same destination, and one
     // whose arms took a record destination is built as that record too, not as their join (D15020).
     IfStmt | Block | MatchExpr => {
+      // At a number its literal tails take the join's rule: all adopt, or none (D16374).
+      if d is TyPrim {
+        numLitAdoptDeep(srcExpr, dtix, depth)
+        return 0
+      }
       let any = 0
       for l in valueTailLeaves(srcExpr) {
         if l != srcExpr { any = any | recordRepTyAdopt(l, dtix, depth - 1) }
@@ -9792,86 +9806,6 @@ export function litPrimMeetTy(obj: i32, chk: i32): i32 {
   mkUnionTy(keep)
 }
 
-// `tyTestMemberFit`'s three answers.
-export const TT_NONE = 0
-export const TT_PARTLY = 1
-export const TT_COVERED = 2
-
-// What a type test of `chk` answers for a value of one operand member `m`, the one rule `is`,
-// `as` and `match` share: covered where every value of `m` fits `chk` (`m` is `chk`, the type
-// parameter it names, or a record it contains), partly where some may (`chk` fits `m`, or `m` is
-// a parameter a pin may bind to `chk`), else none. A union `chk` answers its best member.
-export function tyTestMemberFit(m: i32, chk: i32): i32 {
-  if m < 0 || chk < 0 || m >= T.tys.length || chk >= T.tys.length {
-    return TT_NONE
-  }
-  const ct = tyAt(chk)
-  if ct is TyUnion || ct is TyNullable {
-    let best = TT_NONE
-    for c in tyTestMembers(chk) {
-      const f = if c == chk { TT_NONE } else { tyTestMemberFit(m, c) }
-      if f > best { best = f }
-    }
-    return best
-  }
-  if tyTestIsMember(m, chk) || recContainedIn(m, chk) { return TT_COVERED }
-  if tyAt(m) is TyVar { return TT_PARTLY }
-  if (
-    assignable(chk, m)
-    && !isWidenNotVariant(chk, m)
-    && !fnSlotRetWidens(chk, m)
-  ) {
-    return TT_PARTLY
-  }
-  TT_NONE
-}
-
-// Whether operand member `m` is the tested type `c` itself: the same variant, or the type
-// parameter `c` names.
-export function tyTestIsMember(m: i32, c: i32): boolean {
-  if m < 0 || c < 0 { return false }
-  const mt = tyAt(m)
-  const ct = tyAt(c)
-  if mt is TyVar { return ct is TyVar && ct.tvName == mt.tvName }
-  m == c || sameVariantTy(m, c)
-}
-
-// The members of `t`, a union or nullable flattened, `null` among them.
-function tyTestMembers(t: i32): i32[] {
-  const ms: i32[] = []
-  if t >= 0 { flattenVariantsInto(t, ms) }
-  ms
-}
-
-// Whether a test of `chk` over `obj` can be true: each member of `chk` may fit some member of
-// `obj`, or `obj`, one type, is covered by `chk`.
-export function tyTestMayFit(obj: i32, chk: i32): boolean {
-  const ms = tyTestMembers(obj)
-  const cs = tyTestMembers(chk)
-  if cs.length == 0 || ms.length == 0 { return false }
-  if ms.length == 1 && tyTestMemberFit(ms[0], chk) == TT_COVERED { return true }
-  for c in cs {
-    let hit = false
-    for m in ms { hit = hit || tyTestMemberFit(m, c) != TT_NONE }
-    if !hit { return false }
-  }
-  true
-}
-
-// Whether every member of `chk` is a member of `obj` (`tyTestIsMember`): a cast to `chk` picks
-// those arms.
-export function tyTestNamesMembers(obj: i32, chk: i32): boolean {
-  const ms = tyTestMembers(obj)
-  const cs = tyTestMembers(chk)
-  if cs.length == 0 { return false }
-  for c in cs {
-    let hit = false
-    for m in ms { hit = hit || tyTestIsMember(m, c) }
-    if !hit { return false }
-  }
-  true
-}
-
 // What a test of record `chk` over `obj` tests where `chk` is no member but contains some and
 // no other can fit: those members, so `b is A` over `B | D` with every `B` and `D` an `A` tests
 // `B | D` (D4062, D4085). -1 otherwise.
@@ -9890,20 +9824,6 @@ export function tyTestMeet(obj: i32, chk: i32): i32 {
   if keep.length == 0 { return -1 }
   if keep.length == 1 { return keep[0] }
   mkUnionTy(keep)
-}
-
-// Whether every value of record `a` fits record `b` and not the reverse, the two declaring the
-// same field names. A record with fields the other lacks is no containment D3885 settles.
-function recContainedIn(a: i32, b: i32): boolean {
-  if a < 0 || b < 0 { return false }
-  const at = tyAt(a)
-  const bt = tyAt(b)
-  if !(at is TyObj) || !(bt is TyObj) { return false }
-  if at.objFieldNames.length != bt.objFieldNames.length { return false }
-  for f in at.objFieldNames {
-    if strListIndexOf(bt.objFieldNames, f) < 0 { return false }
-  }
-  assignable(a, b) && !assignable(b, a)
 }
 
 // Whether narrowing a record `cur` to `chk` keeps its storage: a field narrowed to a string

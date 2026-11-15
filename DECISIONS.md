@@ -10789,6 +10789,8 @@ return, and an edit to one re-checks its importers
 
 ## Record adoption crosses module boundaries (owner ruling, incremental-compilation Q1 (B), 2026-10-07)
 
+**Superseded 2026-11-14** by "An exported binding takes its type from its own module" below.
+
 **The rule.** An exported record binding without an annotation takes the field types its
 importers deliver it to, as it would in one file. `export let pt = { x: 1, y: 2 }` passed by
 an importer to `take(w: { x: i64, y: i64 })` widens `pt`'s layout in that program. Nothing
@@ -11694,6 +11696,8 @@ A use typed by the enclosing type parameter (`mix(u, v)` with `u: U`) is not a n
 template, so the template types the call at `U`, and an instance that joined it would hand back
 a type its template never saw. Those calls keep their refusal (D15041).
 
+**The limit is retired (owner, 2026-11-14)** with L2: see "A type parameter carries the requirements its body places on it" below.
+
 ## A list callback op fixes the length at entry (owner ruling A, 2026-11-02) — D3068
 
 **The rule.** `.map`, `.filter` and `std:array`'s `reduce`, `mapIndexed`, `some` and `every` read
@@ -11968,3 +11972,88 @@ for any clause-1 defect (a program `vl check` accepts that then builds or runs w
 comes first. The measured split was 111 of 152 clause-2 rows closed by an architecture item and 33
 local; a spot fix in the first group is code the item later deletes. The prerequisites (hash-consed
 types, then `Rep` as an algebraic type) come before the typed IR, as the review orders them.
+
+## An exported binding takes its type from its own module (2026-11-14) — engineering review 2026-11, exports
+
+**Ruled by the owner 2026-11-14: option B, final.** Every exported binding without an annotation
+takes its type from its own module's uses. An importer's use is an ordinary use of that type: it
+may widen at the use, as any value does, but it never changes the binding's layout. This reverses
+"Record adoption crosses module boundaries" (2026-10-07).
+
+```vl
+// a.vl
+export let pt = { x: 1, y: 2 }        // { x: i32, y: i32 }, from a.vl alone
+// b.vl
+take(pt)                               // take(w: { x: i64, y: i64 }) widens at the call
+```
+
+A module's types then depend only on its own text, so an incremental build keys a module on its
+own source and its imports' interfaces, not on what its importers ask of it.
+
+## Unions stay structural; same-shape members are warned (2026-11-14) — engineering review 2026-11, L4
+
+**Ruled by the owner 2026-11-14: nominal variants dropped.** A union member is a type, not a
+name. A shared literal field (`kind: "a"`) is recognised as the discriminant, as today. Two
+warnings take the place of nominal variants: where a union is formed (a declaration or an inline
+union) with two members of the same type, and on an `is` or `match` arm that names a member the
+test cannot tell apart from another.
+
+```vl
+type NotFound = { msg: string }
+type Denied = { msg: string }
+type E = NotFound | Denied     // warning: one member; add a discriminant field
+if e is NotFound { … }         // warning: `is NotFound` also matches `Denied`
+```
+
+Kind tags already distinguish the members a program needs to distinguish; a nominal layer would
+add a second identity to every record for the case a warning names.
+
+## A type parameter carries the requirements its body places on it (2026-11-14) — engineering review 2026-11, L2
+
+**Ruled by the owner 2026-11-14.** A generic function's type parameter is constrained by what its
+body does with it, not forced to one concrete type. A call is checked against those requirements.
+
+```vl
+function add<U>(a: U, b: f64) { a + b }    // U: anything addable to f64
+function getValue<U>(v: U) { v.value }     // U: has a member `value`
+function mix<U>(u: U, v: U) { … }          // u and v: one U at each call
+```
+
+The requirements are joins, operators and fields. This retires "The limit" of the 2026-11-02
+widening ruling (D15041): a call inside a generic body is typed by its parameter's requirement,
+so an instance no longer hands back a type the template never saw.
+
+## An unannotated `let` takes its type from all its uses (2026-11-14) — D16293
+
+**Ruled by the owner 2026-11-14: option B.** `let t = 0` is not `i32` because of its literal; its
+type comes from every use, as the 2026-11-02 use-typing rule already says for other bindings.
+
+```vl
+let t = 0
+t = t + big        // big: i64, so t is i64
+```
+
+## A function's block body returns a value only through `return` (2026-11-14) — return rule
+
+**Ruled by the owner 2026-11-14: the hybrid.**
+- **Expression bodies** keep an implicit value: `(x) => x + 1`.
+- **A function's block body** `{ … }` returns a value only through `return`; without one it
+  returns nothing.
+- **`if` and `match` in value position** keep their arms' last expression as the value
+  (`const x = if c { 1 } else { 2 }`): the position states the intent, and braces are already
+  mandatory on every arm (2026-08-31, 2026-09-01).
+
+Why: VL infers result types, so an accidental tail value does not fail, it silently changes the
+inferred type. Rust catches the same mistake only because it requires return annotations. Kotlin,
+Swift, and TS/JS arrows split the same way. The migration is a script. Falling off the end of a
+body whose declared type admits `null` returns `null`.
+
+Three details are still open with the owner: whether braces after a signature are always a block,
+a warning for a discarded pure tail, and whether callbacks get an exception.
+
+## The pipeline's phases get a design first; the oracle is an external tool (2026-11-14) — engineering review 2026-11, L5 and L6
+
+**Ruled by the owner 2026-11-14.**
+- **L5** (phase products and a session value): a design note comes before any code.
+- **L6** (an independent oracle): an external tool, adding 0 bytes to the binary. Its CI step runs
+  only under the `sweep` label and stays within 30 s.
