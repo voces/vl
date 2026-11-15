@@ -316,7 +316,7 @@ Deno.test({
   // `undefinedFn` resolves to nothing: a `vl check` error, not a parse one. The
   // walk runs before the checker, so it answers anyway.
   const rows = checker.declExtentsAt(
-    'function broken(): i32 {\n  undefinedFn("s")\n}\n',
+    'function broken(): i32 {\n  return undefinedFn("s")\n}\n',
   );
   eq(rows.map((r) => `${r.kind}:${r.name}`), ["function:broken"], "one row");
 });

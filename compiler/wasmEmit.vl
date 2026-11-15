@@ -898,6 +898,7 @@ import {
   mapTypeIdxOf,
   mvValElemHeapOf,
   mvValsBackOf,
+  mvValsWrapOf,
   nulScalarListWrapHeap,
   pkBackAt,
   pkWrapAt,
@@ -1802,22 +1803,6 @@ export function capCacheBuild() {
   return 0
 }
 
-// The value-column wrapper struct for map slot `slot`: a scalar mv kind (f64/i64/f32)
-// resolves to that scalar's distinct-backing list wrapper, a negative slot to the base
-// i32 wrapper, and anything else to its interned ref-list wrapper (`rlWrapIdx`).
-export function mvValsWrapOf(slot: i32) {
-  if slot < 0 { return lTy() }
-  if mvValKindAt(slot) == "str" { return mkListTy() }
-  if mvValKindAt(slot) == "f64" { return fl64Ty() }
-  if mvValKindAt(slot) == "f32" { return fl32Ty() }
-  if mvValKindAt(slot) == "i64" { return il64Ty() }
-  if mvValRep[slot].mrSlot < 0 || mvValRep[slot].mrSlot >= rlWrapIdx.length {
-    emitFail("emitProgram: map value slot has no resolved vals wrapper")
-    return 0
-  }
-  return rlWrapIdx[mvValRep[slot].mrSlot]
-}
-
 // The scalar element kind (`"f64"`/`"i64"`/`"f32"`) of an mv map-value slot whose value
 // is a non-i32 scalar, else null (a ref value rides the nullable valStash instead). The
 // chokepoint the map get/set/push consult to branch scalar-store vs ref-store.
@@ -1840,7 +1825,7 @@ function scalarListKindUnlisted(fallback: i32): i32 {
 }
 
 // The wrapper struct heap type for a scalar element kind.
-function scalarListWrap(elemKind: VKind, row: i32) {
+export function scalarListWrap(elemKind: VKind, row: i32) {
   if elemKind == "u8list" { return pkWrapAt(row) }
   if elemKind == "f64" { return fl64Ty() }
   if elemKind == "i64" { return il64Ty() }
@@ -1852,7 +1837,7 @@ function scalarListWrap(elemKind: VKind, row: i32) {
 }
 
 // The backing `(array (mut <elem>))` heap type for a scalar element kind.
-function scalarListBack(elemKind: VKind, row: i32) {
+export function scalarListBack(elemKind: VKind, row: i32) {
   if elemKind == "u8list" { return pkBackAt(row) }
   if elemKind == "f64" { return fa64Ty() }
   if elemKind == "i64" { return ia64Ty() }
@@ -1885,7 +1870,7 @@ function scalarListBlocktype(elemKind: VKind) {
 // Whether the module-global list types for a scalar element kind are collected — the
 // loud-fail guard every list op shares. An unlisted kind answers false, which is the
 // caller's own loud refusal rather than a silent read at the i32 list's types.
-function scalarListUsed(elemKind: VKind) {
+export function scalarListUsed(elemKind: VKind) {
   match elemKind {
     "u8list" => {
       return true
@@ -17017,7 +17002,7 @@ function arrLitDataPut(ins: u8[], form: i32, out: u8[]): i32 {
 // index] on entry, leaves [backing, i]. One unsigned compare covers negative and past-len, and
 // a failing one traps (`emitListIdxTrap`) instead of reading the zero-init slack `.push` leaves
 // past `len`. A list whose backing this module never typed keeps the older `select` to -1.
-function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
+export function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
   const back = listBackOfWrap(lTy)
   if back >= 0 {
     fbLocalSet(listIdxScratchBase)
@@ -17161,7 +17146,7 @@ function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
 // identifier matching the row's binding, the row must be live, and its rep must match
 // the arm asking. The rep check is the backstop that makes a classifier disagreement
 // between the prologue and the access decline, rather than read a wrongly-typed local.
-function liveHoistRow(exprIx: i32, kind: ListKind, slot: i32) {
+export function liveHoistRow(exprIx: i32, kind: ListKind, slot: i32) {
   const d = hoistPathDecl(exprIx)
   if d < 0 { return 0 - 1 }
   const p = hoistPathProp(exprIx)
@@ -17183,7 +17168,7 @@ function liveHoistRow(exprIx: i32, kind: ListKind, slot: i32) {
 
 // The declaration a hoist row caches the receiver at `ix` under, with `hoistPathProp`'s field:
 // a bare identifier's, or the root identifier's of a field `b.xs`; -1 for any other receiver.
-function hoistPathDecl(ix: i32) {
+export function hoistPathDecl(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 - 1 }
   const e = nodeAt(ix)
   if e is Member { return hoistRootDecl(e.memObj) }
@@ -17191,7 +17176,7 @@ function hoistPathDecl(ix: i32) {
 }
 
 // The field a hoist row caches at `ix`: `xs` for `b.xs`, "" for the binding itself.
-function hoistPathProp(ix: i32): string {
+export function hoistPathProp(ix: i32): string {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const e = nodeAt(ix)
   if e is Member { return e.memProp }
@@ -18120,12 +18105,17 @@ function loopHoistClose(n: i32) {
   return 0
 }
 
+// A shared cell's read `c[0]` at `idxIx` whose binding's name is narrowed to `null` there.
+export function idxCellReadIsNull(idxIx: i32, fnIx: i32): boolean {
+  return cboxReadTy.has(idxIx) && isNullTy(readNarrowedTyAt(idxIx, fnIx))
+}
+
 function emitIndex(idxIx: i32, fnIx: i32) {
   const nd = nodeAt(idxIx)
   if nd is Index {
     // A shared cell's read is its binding's name read respelled, so one narrowed to `null`
     // delivers that null as `emitIdentNode` does (D15951).
-    if cboxReadTy.has(idxIx) && isNullTy(readNarrowedTyAt(idxIx, fnIx)) {
+    if idxCellReadIsNull(idxIx, fnIx) {
       if emitNullReadAtDst(idxIx, fnIx) { return 0 }
     }
     const tlm = twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx)
@@ -27439,6 +27429,17 @@ function emitCallRefAt(
   // the concrete `$fnsig` (the engine signature-checks the callee against it).
   let sig = -1
   if ckey != "" { sig = cloSigTypeIdxAt(cloSigPosOfKey(ckey)) }
+  // The arity type takes `i32` in every slot, and an argument the key coerced wider has no
+  // conversion into one: the closure is built at another of the value's signatures (D16531).
+  let wi = 0
+  while sig < 0 && wi < args.length {
+    if sigParamCoerceKind(ckey, wi) != null {
+      return emitFail(
+        "emitProgram: a function value is called at two signatures, and the closure it holds was built for one: this call passes a wider number than its `i32` parameter",
+      )
+    }
+    wi = wi + 1
+  }
   if sig < 0 && !cloCallArityFallbackUnsound(callIx, fnIx) {
     sig = fnSigIdxForArity(args.length)
   }
@@ -30799,7 +30800,7 @@ function svPairOfKinds(src: VKind, dst: VKind): i32 {
 
 // The view destination a scalar list of element `k` reads as (0 `i64`, 1 `f64`), or -1 where
 // no view of that element is built: `k` is a destination exactly when an `i32` widens to it.
-function svDstOfKind(k: VKind | null): i32 {
+export function svDstOfKind(k: VKind | null): i32 {
   if svPairs == 0 || k == null { return -1 }
   const d = svPairOfKinds("i32", k)
   if d == 0 { return 0 }
@@ -36815,13 +36816,26 @@ function strLexSameValue(a: string, b: string): boolean {
 // The lexeme (quotes kept) of the member in `texts` whose value `lex` spells, else `lex` itself —
 // whose interned id then matches no member's.
 function memberLexOfValue(texts: string[], lex: string): string {
-  let i = 0
-  while i < texts.length {
-    const m = quoteLex(texts[i])
-    if strLexSameValue(m, lex) { return m }
-    i = i + 1
+  // With no backslash on either side a lexeme's value is its text between the quotes, so the
+  // compare is the raw one and nothing is decoded.
+  const plain = !strHasBackslash(lex)
+  const inner = lex.slice(1, lex.length - 1)
+  for t in texts {
+    if plain && !strHasBackslash(t) {
+      if t == inner { return quoteLex(t) }
+    } else if strLexSameValue(quoteLex(t), lex) {
+      return quoteLex(t)
+    }
   }
   return lex
+}
+
+// Whether `s` holds a backslash, the only character `decodeStr` reads as other than itself.
+function strHasBackslash(s: string): boolean {
+  for c in s {
+    if c == '\\' { return true }
+  }
+  return false
 }
 
 // Pushes the interned atom id of statically-known operand `ix` (lexeme `lex`): a literal is its
