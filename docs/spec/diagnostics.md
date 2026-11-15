@@ -122,7 +122,7 @@ function f(a: i32) {
     let b = 2            // warns: `b` shadows the `b` declared at 2:7
     return b
   }
-  b
+  return b
 }
 print(f(1))              // prints 2
 ```
@@ -133,7 +133,7 @@ function so named gets a hint instead of a warning.
 ```vl
 function f() {
   let _a = 1             // hint: Intentionally-unused variable `_a`
-  0
+  return 0
 }
 print(f())               // prints 0
 ```
@@ -142,8 +142,8 @@ print(f())               // prints 0
 annotations of an export are its API.
 
 ```vl
-export function f(): i32 { 1 }
-function g(): i32 { 2 }   // hint: redundant type annotation: `g` is inferred as `i32`
+export function f(): i32 { return 1 }
+function g(): i32 { return 2 }   // hint: redundant type annotation: `g` is inferred as `i32`
 print(f() + g())          // prints 3
 ```
 
@@ -233,7 +233,7 @@ caught. Output printed before the trap is kept, `vl run` exits 1, and it writes 
 the engine's reason, the VL source frames from innermost out, and a note in words.
 
 ```vl
-function f(a: i32): i32 { a / 0 }   // warns: `/ 0` traps at run time
+function f(a: i32): i32 { return a / 0 }   // warns: `/ 0` traps at run time
 print(1)       // prints 1
 print(f(4))    // traps: integer divide by zero, at main.vl:1:27 in `f`
 ```

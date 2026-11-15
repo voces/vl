@@ -212,10 +212,10 @@ const read = (_k: string) => undefined;
 
 const SRC = [
   "type Handler = { cb: (i32) => i32 }", // 0
-  "function greet(name: string, times: i32) { name }", // 1
-  "function shout(self: string, n: i32) { self }", // 2
-  "function idfn<T>(x: T, y: i32) { x }", // 3
-  "function nil() { 1 }", // 4
+  "function greet(name: string, times: i32) { return name }", // 1
+  "function shout(self: string, n: i32) { return self }", // 2
+  "function idfn<T>(x: T, y: i32) { return x }", // 3
+  "function nil() { return 1 }", // 4
   "const lam = (a: i32, b: string) => a", // 5
   "function main() {", // 6
   '  greet("a", 1)', // 7
@@ -360,7 +360,7 @@ Deno.test({
 }, async () => {
   // The checker needs a parseable program to have a symbol table at all, so the
   // buffer as written yields nothing and the closer repair is what rescues it.
-  const src = "function greet(name: string, times: i32) { name }\n" +
+  const src = "function greet(name: string, times: i32) { return name }\n" +
     'function main() {\n  greet("a", \n}\n';
   const got = await helpAt(src, 2, 13);
   if (got !== "greet(name: string, times: i32) => string @times: i32") {
@@ -374,7 +374,7 @@ Deno.test({
 }, async () => {
   // Wrong arity is a diagnostic, not a parse failure — the symbol pass still ran,
   // and a user typing a third argument is exactly who needs to see the signature.
-  const src = "function greet(name: string, times: i32) { name }\n" +
+  const src = "function greet(name: string, times: i32) { return name }\n" +
     'function main() {\n  greet("a", 1, 2)\n}\n';
   const got = await helpAt(src, 2, 17);
   if (got !== "greet(name: string, times: i32) => string @-") {
@@ -390,7 +390,7 @@ Deno.test({
   // parameter names are source names, and the merged arena holds the FuncDecl —
   // the same route `fnSigStr` takes for hover.
   // The reader is keyed by the RESOLVED sibling path, as in the cross-file suite.
-  const dep = "export function add(lhs: i32, rhs: i32) { lhs + rhs }\n";
+  const dep = "export function add(lhs: i32, rhs: i32) { return lhs + rhs }\n";
   const src = 'import { add } from "./mathx"\nfunction main() {\n  add(1, 2)\n}\n';
   const checker = loadWasmChecker(SEED, log)!;
   const site = callSiteAt(src, 2, 6)!;
@@ -445,9 +445,9 @@ Deno.test({
   // takes. Single-file here, where the two spellings coincide.
   const src = [
     'const SEP = "-"',
-    'function greet(name: string, punct: string = "!") { name + punct }',
-    "function pad(n: i32, w: i32 = 3, s: string = SEP) { s }",
-    "function at(t: string, c: { file: string, line: i32, col: i32 } = __callsite__) { t + c.file }",
+    'function greet(name: string, punct: string = "!") { return name + punct }',
+    "function pad(n: i32, w: i32 = 3, s: string = SEP) { return s }",
+    "function at(t: string, c: { file: string, line: i32, col: i32 } = __callsite__) { return t + c.file }",
     "function main() {",
     '  greet("a")',
     "  pad(1)",
@@ -476,7 +476,7 @@ Deno.test({
 }, async () => {
   // Every call of `greet` is a statement, so it lowers as `void` (D2631); the signature the
   // editor offers is still the one its body infers.
-  const src = 'function greet(n: string) {\n  print(n)\n  "hi " + n\n}\ngreet("a")\n';
+  const src = 'function greet(n: string) {\n  print(n)\n  return "hi " + n\n}\ngreet("a")\n';
   const got = await helpAt(src, 4, 7);
   if (got !== "greet(n: string) => string @n: string") {
     throw new Error(`want the inferred return, got ${got}`);
@@ -492,7 +492,7 @@ Deno.test({
   // alias of either), and an unnamed spelling of the same type still renders bare.
   const src = [
     "type GuestCall = (fn: i32, rcx: i64) => i32", // 0
-    "function h(a: i32, b: i64) { a }", // 1
+    "function h(a: i32, b: i64) { return a }", // 1
     "function run(hook: GuestCall, cb: (x: i32) => i32, bare: (i32) => i32) {", // 2
     "  hook(1, 2)", // 3
     "  cb(1)", // 4
@@ -525,7 +525,7 @@ Deno.test({
   const src = [
     "type GuestCall = (fn: i32, rcx: i64) => i32",
     "type Bare = (i32, i64) => i32",
-    "function h(a: i32, b: i64) { a }",
+    "function h(a: i32, b: i64) { return a }",
     "const g: GuestCall = h",
     "const b: Bare = g",
   ].join("\n");

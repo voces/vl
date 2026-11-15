@@ -18,11 +18,11 @@ Two modules may each declare a private name, and the two do not collide.
 
 ```vl
 // file: a.vl
-function helper(): i32 { 1 }
-export function one(): i32 { helper() }
+function helper(): i32 { return 1 }
+export function one(): i32 { return helper() }
 // file: main.vl
 import { one } from "./a"
-function helper(): i32 { 10 }
+function helper(): i32 { return 10 }
 print(one() + helper())   // prints 11
 ```
 
@@ -39,8 +39,8 @@ print(one() + helper())   // prints 11
 ```vl
 // file: geo.vl
 export type Pt = { x: i32, y: i32 }
-export function sum(p: Pt): i32 { p.x + p.y }
-export function first<T>(xs: T[]): T { xs[0] }
+export function sum(p: Pt): i32 { return p.x + p.y }
+export function first<T>(xs: T[]): T { return xs[0] }
 // file: main.vl
 import { Pt, sum, first } from "./geo"
 const p: Pt = { x: 3, y: 4 }
@@ -58,7 +58,7 @@ binding as it is at the moment of the read, so a write the exporter makes to an 
 ```vl
 // file: c.vl
 export let count = 0
-export function bump() { count = count + 1 }
+export function bump() { return count = count + 1 }
 // file: main.vl
 import { count, bump } from "./c"
 bump()
@@ -82,7 +82,7 @@ K = 5   // refused: cannot reassign `const` K
 ```vl
 // file: c.vl
 export let count = 0
-export function get(): i32 { count }
+export function get(): i32 { return count }
 // file: main.vl
 import { count, get } from "./c"
 count = 5
@@ -109,7 +109,7 @@ write the type's name.
 ```vl
 // file: r.vl
 type Secret = { v: i32 }
-export function make(): Secret { { v: 4 } }
+export function make(): Secret { return { v: 4 } }
 // file: main.vl
 import { make } from "./r"
 print(make().v)   // prints 4
@@ -127,22 +127,22 @@ namespace import.
 
 ```vl
 // file: geo.vl
-export function area(): i32 { 6 }
-function hidden(): i32 { 0 }
+export function area(): i32 { return 6 }
+function hidden(): i32 { return 0 }
 // file: main.vl
 import { hidden } from "./geo"   // refused: "hidden" is not exported by "./geo"
 ```
 
 ```vl
 // file: c.vl
-export function f(): i32 { 3 }
+export function f(): i32 { return 3 }
 // file: main.vl
 import * as c from "./c"   // refused: namespace imports
 ```
 
 ```vl
 // file: c.vl
-export function f(): i32 { 3 }
+export function f(): i32 { return 3 }
 // file: main.vl
 import c from "./c"   // refused: default imports are not supported — a VL module has only named exports
 ```
@@ -152,7 +152,7 @@ module. The name `a` is then not bound there.
 
 ```vl
 // file: geo.vl
-export function area(): i32 { 6 }
+export function area(): i32 { return 6 }
 // file: main.vl
 import { area as size } from "./geo"
 print(size())   // prints 6
@@ -179,7 +179,7 @@ print(B)   // prints 3
 
 ```vl
 // file: geo.vl
-export function area(): i32 { 6 }
+export function area(): i32 { return 6 }
 // file: main.vl
 import { area } from "./geo.vl"   // refused: Cannot resolve import "./geo.vl"
 ```
@@ -200,7 +200,7 @@ including the code above it.
 
 ```vl
 // file: c.vl
-export function f(): i32 { 3 }
+export function f(): i32 { return 3 }
 // file: main.vl
 print(f())   // prints 3
 import { f } from "./c"
@@ -229,7 +229,7 @@ is reported with a warning, and the program runs.
 
 ```vl
 // file: a.vl
-export function area(): i32 { 6 }
+export function area(): i32 { return 6 }
 // file: main.vl
 import { area } from "./a"
 import { area } from "./a"   // warns: Duplicate import `area` from "./a" (remove one)
@@ -244,10 +244,10 @@ name in this module, as an import would.
 
 ```vl
 // file: m2.vl
-export function f(): i32 { 3 }
+export function f(): i32 { return 3 }
 // file: m1.vl
 export { f, f as g } from "./m2"
-export function h(): i32 { f() + 1 }
+export function h(): i32 { return f() + 1 }
 // file: main.vl
 import { g, h } from "./m1"
 print(g() + h())   // prints 7
@@ -260,7 +260,7 @@ print(g() + h())   // prints 7
 
 ```vl
 // file: m2.vl
-export function f(): i32 { 3 }
+export function f(): i32 { return 3 }
 // file: m1.vl
 export { f as g } from "./m2"
 // file: main.vl
@@ -280,7 +280,7 @@ passed on by `export { x } from "spec"`.
 
 ```vl
 // file: m2.vl
-export function f(): i32 { 3 }
+export function f(): i32 { return 3 }
 // file: main.vl
 import { f } from "./m2"
 export { f }   // refused: `export { f }` names an imported binding; re-export it with `export { f } from "./m2"`
@@ -299,9 +299,9 @@ declaration of the same name. `as` resolves either.
 
 ```vl
 // file: a.vl
-export function area(): i32 { 6 }
+export function area(): i32 { return 6 }
 // file: b.vl
-export function area(): i32 { 7 }
+export function area(): i32 { return 7 }
 // file: main.vl
 import { area } from "./a"
 import { area } from "./b"   // refused: Duplicate binding "area"
@@ -309,7 +309,7 @@ import { area } from "./b"   // refused: Duplicate binding "area"
 
 ```vl
 // file: a.vl
-export function area(): i32 { 6 }
+export function area(): i32 { return 6 }
 // file: main.vl
 import { area } from "./a"   // refused: Duplicate binding "area"
 function area(): i32 { 1 }
@@ -325,9 +325,9 @@ when only imports carry the name.
 
 ```vl
 // file: s.vl
-export function size(self: string): i32 { self.length }
+export function size(self: string): i32 { return self.length }
 // file: l.vl
-export function size(self: i32[]): i32 { self.length * 100 }
+export function size(self: i32[]): i32 { return self.length * 100 }
 // file: main.vl
 import { size } from "./s"
 import { size } from "./l"
@@ -343,12 +343,12 @@ outer binding.
 
 ```vl
 // file: a.vl
-export function area(): i32 { 6 }
+export function area(): i32 { return 6 }
 // file: main.vl
 import { area } from "./a"   // warns: Unused import `area` (remove it)
 function f(): i32 {
   const area = 5
-  area
+  return area
 }
 print(f())   // prints 5
 ```
@@ -392,7 +392,7 @@ type, as any inner binding does. After the scope ends the ambient name is visibl
 ```vl
 function f(): i32 {
   const print = (x: i32): i32 => x + 100
-  print(3)          // calls the lambda
+  return print(3)          // calls the lambda
 }
 print(f())          // prints 103
 ```
@@ -425,10 +425,10 @@ code.
 
 ```vl
 // file: y.vl
-export function fy(): i32 { 1 }
+export function fy(): i32 { return 1 }
 print("y")
 // file: x.vl
-export function fx(): i32 { 2 }
+export function fx(): i32 { return 2 }
 print("x")
 // file: main.vl
 import { fy } from "./y"
@@ -454,7 +454,7 @@ print(m)
 ```vl
 // file: a.vl
 print("a runs")
-export function f(): i32 { 1 }
+export function f(): i32 { return 1 }
 // file: main.vl
 import { f } from "./a"   // warns: Unused import `f`
 print("main")
@@ -488,7 +488,7 @@ as if every module of the program were one file: in particular, an exported reco
 export let pt = { x: 1, y: 2 }
 // file: main.vl
 import { pt } from "./r"
-function take(w: { x: i64, y: i64 }): i64 { w.x + w.y }
+function take(w: { x: i64, y: i64 }): i64 { return w.x + w.y }
 print(take(pt))   // prints 3
 ```
 
