@@ -121,8 +121,8 @@ function litTo(l: Lit, k: string): Val {
         if (l.radix) return wrap64(x);
         if (x < I64_MIN || x > I64_MAX) throw new LitFault(`literal typed from uses: constant ${x} overflows i64`);
         return x;
-      case "f64": return l.radix && l.lone ? radixFloat(x, Number(l.radix), 64) : new Flt(Number(x), 64);
-      case "f32": return l.radix && l.lone ? radixFloat(x, Number(l.radix), 32) : new Flt(Math.fround(Number(x)), 32);
+      case "f64": return l.radix && l.lone ? radixFloat(x, 64) : new Flt(Number(x), 64);
+      case "f32": return l.radix && l.lone ? radixFloat(x, 32) : new Flt(Math.fround(Number(x)), 32);
       case "u8": case "u16": case "u32": case "i8": case "i16": return litTo(l, "i32");
     }
   } else {
@@ -137,13 +137,10 @@ function litTo(l: Lit, k: string): Val {
   }
   throw new TypeFault(`constant at ${k}`);
 }
-// Owner ruling 4.1: a radix literal at a float of width `w` is its unsigned value when the float
-// holds that exactly, else the signed value of its own pattern (32 or 64 bits, T2.3) rounded to `w`.
-function radixFloat(u: bigint, pattern: number, w: 32 | 64): Flt {
-  const at = (x: bigint) => w === 32 ? Math.fround(Number(x)) : Number(x);
-  const exact = at(u);
-  if (BigInt(exact) === u) return new Flt(exact, w);
-  return new Flt(at(BigInt.asIntN(pattern, u)), w);
+// T2.3 (owner ruling 4.1, revised): a radix literal in a float context is the value its digits
+// spell, rounded to the float; the bit-pattern reading is for integer contexts only.
+function radixFloat(u: bigint, w: 32 | 64): Flt {
+  return new Flt(w === 32 ? Math.fround(Number(u)) : Number(u), w);
 }
 function litDefault(l: Lit): Val {
   if (l.f !== null) return new Flt(l.f, 64);
@@ -233,9 +230,9 @@ export function parseRat(s: string): [bigint, bigint] {
 }
 
 function litArith(op: string, a: Lit, b: Lit): Val {
-  // a radix literal meeting a float constant is read at f64 (ruling 4.1); a radix tree is first
+  // a radix literal meeting a float constant is the value its digits spell (T2.3); a tree is first
   // its bit pattern at the default width
-  const atFloat = (x: Lit) => x.lone ? radixFloat(x.i!, Number(x.radix), 64) : litDefault(x);
+  const atFloat = (x: Lit) => x.lone ? radixFloat(x.i!, 64) : litDefault(x);
   if ((a.f !== null && b.radix) || (b.f !== null && a.radix)) return arith(op, a.radix ? atFloat(a) : a, b.radix ? atFloat(b) : b);
   if (a.i !== null && b.i !== null) {
     const x = a.i, y = b.i, radix = Math.max(Number(a.radix), Number(b.radix));

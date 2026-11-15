@@ -1,3 +1,3 @@
 ## Infrastructure (Track F)
 
-- **The oracle models a radix literal in a float context** (owner ruling 4.1): the literal's exact unsigned value when the float holds it, else its own 32- or 64-bit pattern's signed value, rounded. A 208-program grid agrees 182 of 182 (master's oracle disagreed on 18), and the arith fuzz subset grows from 1082 to 1096 of 1600; radix constant trees at a float wait on ruling 4.2.
+- **A radix literal in a float context is the value its digits spell** (owner ruling 4.1, revised): spec T2.3 says so, the oracle models it, and `scripts/oracle/radix-float-grid.ts` writes the 182-cell acceptance grid, which today's compiler meets on 138 cells (lane N moves the rest). Radix constant trees at a float wait on ruling 4.2.
