@@ -18,6 +18,8 @@ itself declares are now the fields of one `crRows: CrRows` record, and the reset
   lint and to the driver's import staging. It is left for its own PR, and these four maps stay.
 - **`crCapLossAny`.** `tests/vl_emitter_state_audit_test.ts` uses its single clear in `crReset` as the
   never-cleared control.
+- **`cvuEpoch`.** `scripts/memo-generation-probe.vl` classifies the `crValUseNames` memo by its
+  module-level stamp, so the stamp stays a module table.
 - **The tables `crReset` clears that other modules declare** (`check_capture_walks.vl`'s memos), and
   the two calls `crReset` makes (`crLostReset`, `arenaEditLogReset`).
 
@@ -31,10 +33,10 @@ itself declares are now the fields of one `crRows: CrRows` record, and the reset
 
 ## Gate
 
-- **Seeds:** A is a fixpoint built from `git archive b75afba1f`; D is a fixpoint built from this
+- **Seeds:** A is a fixpoint built from `git archive 7c9483487` (the master this branch merged); D is a fixpoint built from this
   branch.
 - **Identity:** `probe-rollback-census.ts --fingerprint` over `tests/cases`, `distilled/cells` and
-  `distilled/named` gives **20,283 programs, 0 different**.
+  `distilled/named` gives **20,293 programs, 0 different**.
 - **L2:** the base tree's `compiler/entry.vl` built with A and with D is byte-identical (guest fuel
   88,186,956,977 and 88,241,305,206).
 - **regress.vl:** no cell changed class; no runs lost. `lint-self.sh` is clean.
@@ -43,4 +45,4 @@ itself declares are now the fields of one `crRows: CrRows` record, and the reset
 
 ## Lines
 
-The compiler is **+624 / −720, net −96** over 16 modules.
+The compiler is **+620 / −714, net −94** over 16 modules.
