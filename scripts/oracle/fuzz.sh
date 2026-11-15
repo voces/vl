@@ -51,6 +51,8 @@ for s in $(seq 1 "$SEEDS"); do
   fi
 done
 
-"$VL" run --batch --out-dir "$WORK/out" "$WORK"/cases/*.vl --compiler "$SEED_WASM" >/dev/null \
+# In chunks: one argument list of every case overflows ARG_MAX at a few tens of thousands of paths.
+find "$WORK/cases" -maxdepth 1 -name '*.vl' -print0 | sort -z \
+  | xargs -0 -n 2000 "$VL" run --batch --out-dir "$WORK/out" --compiler "$SEED_WASM" >/dev/null \
   || { echo "oracle-fuzz: vl run --batch failed"; exit 2; }
 deno run -A scripts/oracle/oracle.ts diff "$WORK/cases" "$WORK/out" --json "$WORK/verdicts.jsonl"
