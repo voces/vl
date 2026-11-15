@@ -1237,7 +1237,7 @@ export class Interp {
       if (op === ">>>" && l.i !== null && l.i < 0n && !l.radix && expK === "i64") return arith(">>>", litTo(l, "i64"), litDefault(r));
       // E9.1: the exact constant is computed first and typed at its use.
       if (l.join || r.join) return arith(op, l, r, expK);
-      return litArith(op, l, r, expK);
+      return litArith(op, l, r, expK ?? (this.isF32(exp, env) ? "f32" : null));
     }
     return arith(op, l, r, expK);
   }
@@ -1255,8 +1255,7 @@ export class Interp {
       const target = this.freeze(e.target, env);
       const cur = this.eval(target, env, null);
       // E9.1: a constant tree beside an `f32` target folds in f32 arithmetic, as at run time.
-      const tt = this.targetTy(e.target, env);
-      f32Fold = !!tt && isConstTree(e.e) && this.isF32(tt, env);
+      f32Fold = isConstTree(e.e) && numKind(cur) === "f32";
       let rhs: Val;
       try { rhs = this.eval(e.e, env, null); } finally { f32Fold = false; }
       v = arith(e.op.slice(0, -1), cur, rhs);
@@ -1264,12 +1263,14 @@ export class Interp {
       return v;
     }
   }
-  // `f32`, or `f32 | null`, whose number member a constant tree adopts (E9.1).
+  // Whether `t`'s one number member is `f32` (`f32`, `f32 | null`, `F | string` with `F = f32`):
+  // the member a constant tree adopts (E9.1). Each arm is resolved through its aliases.
   isF32(t: Ty, env: Env): boolean {
     try {
       const r = this.resolve(t, env);
-      const arms = r.k === "union" ? r.arms.filter((a) => a.k !== "null") : [r];
-      return arms.length === 1 && arms[0].k === "name" && arms[0].name === "f32";
+      const arms = (r.k === "union" ? r.arms : [r]).map((a) => this.resolve(a, env));
+      const nums = arms.filter((a) => a.k === "name" && NUMERIC.has(a.name));
+      return nums.length === 1 && nums[0].k === "name" && nums[0].name === "f32";
     } catch { return false; }
   }
   freeze(t: Expr, env: Env): Expr {
