@@ -5,7 +5,16 @@
 // halves that read the type arena; nothing here reads a type or the scope chain.
 // This module imports `./ast`, `./symbols`, `./listutil` and `./check_suggest`.
 import { nodeTyIxOf } from "./check_node_tys"
-import { T, TyArray, TyLit, TyMap, TyPrim, tyAt } from "./check_types"
+import {
+  T,
+  TyArray,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyPrim,
+  tyAt,
+  tyHasHole,
+} from "./check_types"
 import {
   ArrayLit,
   AsExpr,
@@ -91,15 +100,15 @@ export function cwLetWritesStraight(bd: i32): boolean {
   while cwOccNext(ow) {
     const r = ow.row
     if cwIxKind[r] != CW_OCC_CALL && cwIxFr[r] != fr { return false }
-    // A read handed to a call is bound to the callee's parameter at the whole set (D16182).
+    // A read handed to an open parameter is bound to it at the whole set, whose slots serve each
+    // type the callee calls it at; a closed function type holds the one function read (D16182).
     const u = cwIxNode[r]
     if (
       cwIxKind[r] == CW_OCC_USE
-      && u >= 0
-      && u < cwIxUpKind.length
+      && cwIxCovers(u)
       && cwIxUpKind[u] == CW_UP_ARG
     ) {
-      return false
+      if !cwArgToClosedFnParam(u) { return false }
     }
     if cwIxKind[r] == CW_OCC_ASG {
       const at = cwIxNode[r]
@@ -111,6 +120,22 @@ export function cwLetWritesStraight(bd: i32): boolean {
     }
   }
   true
+}
+
+// Whether call argument `u` is delivered to a parameter of a non-generic callee annotated with a
+// closed function type; false where the callee, the parameter or its type is not known.
+function cwArgToClosedFnParam(u: i32): boolean {
+  const up = cwIxUp[u]
+  const n = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+  if !(n is Call) || hasNamedArgs(n.callArgNames) { return false }
+  const cd = cwCalleeDeclOf(n.callFn)
+  const cn = if cd >= 0 && cd < P.nodes.length { nodeAt(cd) } else { null }
+  if !(cn is FuncDecl) || cn.fnTyParams.length > 0 { return false }
+  const p = cwParamOfDecl(cd, cwIxUpAux[u] + cwCalleeArgOff(n.callFn))
+  const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if !(pn is Param) || pn.parType < 0 { return false }
+  const t = nodeTyIxOf(pn.parType)
+  t >= 0 && t < T.tys.length && tyAt(t) is TyFunc && !tyHasHole(t)
 }
 
 // Whether `v` is the name of a function declaration or a read of a `let`, which a narrowed read
