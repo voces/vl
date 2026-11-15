@@ -35,15 +35,17 @@ import {
   PrimOp,
   Rhs,
   SLet,
+  irBodyLeaves,
   irFnNew,
   irFnText,
+  irGlobalNote,
   irNodeNew,
   irSigNote,
   irVarNew,
 } from "./ir"
 import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { irVerify } from "./ir_verify"
-import { repNodeOfTy } from "./emit_rep"
+import { repNodeGen, repNodeOfTy } from "./emit_rep"
 import { nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import {
   declaredIndexAt,
@@ -58,7 +60,7 @@ import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
 import { f32Bytes, f64Bytes, numLexIsFloat } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
-import { TY_BOOL, TY_I32, TY_NEVER } from "./check_types"
+import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
 
 let ibArmed = false
 let ibCorrupt = 0
@@ -283,8 +285,20 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     return o
   }
   const g = globalIndexOfSid(sidOfNode(ix))
-  if dn is LetDecl && g >= 0 { return letTemp(b, { ggSym: g }, ix, rep) }
+  if dn is LetDecl && g >= 0 {
+    if globalRep(g, d) != rep { return miss("global read coercion") }
+    return letTemp(b, { ggSym: g }, ix, rep)
+  }
   miss("read of " + n.identName)
+}
+
+// The rep of global `g`, declared at `d`, noted in `ib`; -1 when it is no scalar.
+function globalRep(g: i32, d: i32): i32 {
+  const ty = scopeTyAt(d, -1)
+  const r = repNodeOfTy(ty)
+  if isVoidTy(ty) || !repIsScalar(r) { return -1 }
+  irGlobalNote(ib, g, r)
+  r
 }
 
 // The parameter and result reps of `fnStmts` slot `pos`, noted in `ib`; false when one is not
@@ -343,6 +357,17 @@ function callRhs(b: i32[], c: Call): Rhs {
   r
 }
 
+// Why operand `ix` is outside the set, or "": it must be typed at a signed or float primitive or
+// `boolean`. An unsigned type shares i32's or i64's rep, and a `PrimOp` carries no signedness yet.
+function operandWhy(ix: i32): string {
+  const p = tyScalarBasePrim(nodeTyAt(ix, ibFnIx))
+  if p == null { return "operand type" }
+  if p == "i32" || p == "i64" || p == "f64" || p == "f32" || p == "boolean" {
+    return ""
+  }
+  "operand at " + p
+}
+
 function expr(b: i32[], ix: i32): Opnd {
   if ibMiss != "" || ix < 0 { return miss("no node") }
   const n = nodeAt(ix)
@@ -360,6 +385,8 @@ function expr(b: i32[], ix: i32): Opnd {
   if n is Ident { return identRead(b, n, ix, rep) }
   if n is Unary {
     if n.unOp != "-" && n.unOp != "!" { return miss("unary " + n.unOp) }
+    const uw = operandWhy(n.unArg)
+    if uw != "" { return miss(uw) }
     const a = expr(b, n.unArg)
     if ibMiss != "" { return a }
     if opRep(a) != rep { return miss("operand coercion") }
@@ -370,6 +397,10 @@ function expr(b: i32[], ix: i32): Opnd {
     if n.binOp == "&&" || n.binOp == "||" { return shortCircuit(b, n, ix, rep) }
     const p = binPrim(n.binOp)
     if p == null || n.binIdent != 0 { return miss("operator " + n.binOp) }
+    const lw = operandWhy(n.binLeft)
+    if lw != "" { return miss(lw) }
+    const rw = operandWhy(n.binRight)
+    if rw != "" { return miss(rw) }
     const l = expr(b, n.binLeft)
     const r = expr(b, n.binRight)
     if ibMiss != "" { return l }
@@ -399,7 +430,8 @@ function assign(b: i32[], n: BinExpr, ix: i32) {
     return 0
   }
   const g = globalIndexOfSid(sidOfNode(n.binLeft))
-  if g < 0 { return skip("assignment target") }
+  if g < 0 || d < 0 { return skip("assignment target") }
+  if globalRep(g, d) != opRep(src) { return skip("global store coercion") }
   emitNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
   0
 }
@@ -578,8 +610,11 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   }
   const last = stmts[stmts.length - 1]
   const ln = nodeAt(last)
-  if ln is RetStmt || ln is WhileStmt || ln is IfStmt {
+  if ln is WhileStmt { return skip("valued tail loop") }
+  if ln is RetStmt || ln is IfStmt {
     stmt(b, last)
+    // A tail `if` whose arms yield values rather than returning is I1's (`siOut`).
+    if ibMiss == "" && !irBodyLeaves(ib, b) { return skip("valued tail if") }
     return 0
   }
   const v = expr(b, last)
@@ -668,6 +703,7 @@ function corrupt() {
 // The seam: builds, verifies and discards the function at `fnIx`, counting the outcome.
 export function irShadowFn(fnIx: i32, fnPos: i32) {
   count("fns")
+  const gen = repNodeGen()
   const why = build(fnIx, fnPos)
   if why != "" {
     count("uncovered " + why)
@@ -676,6 +712,11 @@ export function irShadowFn(fnIx: i32, fnPos: i32) {
   count("covered")
   corrupt()
   const v = irVerify(ib)
+  // A tree rebuilt mid-build leaves node indices that name nothing; no verdict holds.
+  if repNodeGen() != gen {
+    count("rep epoch moved")
+    return 0
+  }
   if v.vfRule == 0 {
     count("verified")
     return 0

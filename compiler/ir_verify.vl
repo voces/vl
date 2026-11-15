@@ -2,7 +2,8 @@
 // 1-7: closed reps, rep agreement, types against reps, definitions before uses, control, calls
 // and switch coverage. It answers the first rule a function breaks, with the node; it never
 // reports through the emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
-// builder, and trap order (rule 9) with the first pass that moves a check.
+// builder, and trap order (rule 9) with the first pass that moves a check. Until steps I2-I7
+// build them, the arms for records, lists, casts, tags, maps and closures have no input.
 import {
   IrFn,
   IrNode,
@@ -47,6 +48,9 @@ import {
   SSetField,
   SSwitch,
   STrap,
+  irBodyLeaves,
+  irFnNew,
+  irGlobalRepOf,
   irSigOf,
 } from "./ir"
 import {
@@ -69,22 +73,7 @@ import { i32ToStr } from "./ast"
 // (-1 for a variable or the header), with the reason.
 export type IrVerdict = { vfRule: i32, vfNode: i32, vfMsg: string }
 
-let vf: IrFn = {
-  irNodes: [],
-  irNodeTy: [],
-  irNodeRep: [],
-  irNodeAt: [],
-  irVars: [],
-  irBody: [],
-  irParams: [],
-  irRetRep: -1,
-  irRetTy: -1,
-  irAt: -1,
-  irName: "",
-  irSigFn: [],
-  irSigParams: [],
-  irSigRet: [],
-}
+let vf: IrFn = irFnNew(-1, "")
 let vfRule = 0
 let vfAt = -1
 let vfMsg = ""
@@ -354,7 +343,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RFnId => if dst >= 0 && dst != vfI32 { fail(2, at, "a function id is an i32") } else { 0 }
     RCellNew => use(r.cnInit, at)
     RCellGet => use(r.cgCell, at)
-    RGlobalGet => 0
+    RGlobalGet => {
+      const g = irGlobalRepOf(vf, r.ggSym)
+      if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
+      if dst >= 0 && dst != g {
+        return fail(2, at, "a global's rep is not its destination's")
+      }
+      0
+    }
   }
 }
 
@@ -464,7 +460,15 @@ function stmt(id: i32) {
       use(n.csCell, id)
       use(n.csSrc, id)
     }
-    SGlobalSet => use(n.gsSrc, id)
+    SGlobalSet => {
+      use(n.gsSrc, id)
+      const g = irGlobalRepOf(vf, n.gsSym)
+      if g < 0 { return fail(2, id, "writes a global with no recorded rep") }
+      if opRep(n.gsSrc) != g {
+        return fail(2, id, "a global store needs a coercion")
+      }
+      0
+    }
     SBoundsCheck => {
       use(n.bcV, id)
       use(n.bcIx, id)
@@ -556,6 +560,7 @@ function switchCheck(n: SSwitch, id: i32) {
       if a.swWhy == "" {
         return fail(7, id, "a default arm names nothing it excludes")
       }
+      if dflt { return fail(7, id, "a second default arm") }
       dflt = true
     } else if a.swArm >= nArms || seen[a.swArm] {
       return fail(
@@ -622,8 +627,18 @@ export function irVerify(f: IrFn): IrVerdict {
     }
     i = i + 1
   }
-  if repNodeAt(f.irRetRep) == null { fail(1, -1, "the result has no rep") }
+  if !closedRep(f.irRetRep) {
+    fail(
+      1,
+      -1,
+      "the result's rep is " + repWhat(f.irRetRep) + ", not a closed rep",
+    )
+  }
   for id in f.irBody { stmt(id) }
+  // Rule 5 at the end: a function with a result leaves its body on every path.
+  if !repIsNoValue(f.irRetRep) && !irBodyLeaves(f, f.irBody) {
+    fail(5, -1, "a valued function falls off its end")
+  }
   const v: IrVerdict = { vfRule: vfRule, vfNode: vfAt, vfMsg: vfMsg }
   v
 }

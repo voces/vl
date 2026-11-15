@@ -129,22 +129,31 @@ Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
+    // A tail `if` that yields its arms' values (I1's `siOut`) is outside the set too.
     const src = `function greet(s: string): string { s + "!" }
 function first(xs: i32[]): i32 { xs[0] }
+function sel(c: boolean): i32 { if c { 1 } else { 2 } }
 print(greet("a"))
 print(first([4]))
+print(sel(true))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
+    for (const why of ["valued tail if"]) {
+      if (!rows.has(`uncovered ${why}`)) {
+        throw new Error(`want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
+      }
+    }
     const unc = [...rows.keys()].filter((k) => k.startsWith("uncovered "));
-    if (unc.length === 0) throw new Error(`want uncovered rows, got ${JSON.stringify([...rows])}`);
+    if (unc.length < 3) throw new Error(`want three uncovered reasons, got ${JSON.stringify([...rows])}`);
   },
 });
 
 // The verifier's own cases (`compiler/ir_selftest.vl`): hand-built IR breaking each of rules
-// 1-7 is refused under that rule, and the unbroken function holds.
+// 1-7 is refused under that rule, as are a fall-through and a mismatched global store, and the
+// unbroken function holds.
 Deno.test({
   name: "ir shadow: each hand-built case fails the rule it breaks, and the control holds",
   ignore,
@@ -156,9 +165,12 @@ Deno.test({
     exp.srcReset();
     for (const ch of "print(1)\n") exp.srcPush(ch.codePointAt(0)!);
     if (exp.compileSrc() !== 0) throw new Error("want the priming compile to pass");
-    for (let k = 0; k <= 7; k++) {
+    // Case k breaks rule k for 1 to 7; case 8 falls off a valued function's end (rule 5) and
+    // case 9 stores an i32 into a bool global (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2];
+    for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
-      if (got !== k) throw new Error(`case ${k}: want rule ${k}, got rule ${got}`);
+      if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
     }
   },
 });
