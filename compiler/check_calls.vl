@@ -1340,6 +1340,45 @@ function fnInferredUnchecked(dIx: i32): boolean {
   d is FuncDecl && d.fnRet < 0 && nodeTyOf(dIx) < 0
 }
 
+// Checks each un-annotated top-level function argument `a` hands over, bare, in a list or
+// record literal or through a `const`, that no check has reached yet: the callee's result at this
+// call reads it, as a forward call reads its callee's (D16369).
+function checkHandedFns(a: i32, depth: i32) {
+  const x = parenPeelIx(a)
+  if x < 0 || x >= P.nodes.length || depth > 4 { return 0 }
+  const n = nodeAt(x)
+  if n is ArrayLit {
+    for e in n.arrElems { checkHandedFns(e, depth + 1) }
+    return 0
+  }
+  if n is ObjLit {
+    for fx in n.objFields {
+      const f = nodeAt(fx)
+      if f is FieldInit { checkHandedFns(f.fiValue, depth + 1) }
+    }
+    return 0
+  }
+  if !(n is Ident) { return 0 }
+  // A `const` handed over hands over what its initialiser does.
+  const bd = identDeclOf(x)
+  const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { n }
+  if bn is LetDecl && bn.letKw == "const" && bn.letType < 0 && bn.letInit >= 0 {
+    return checkHandedFns(bn.letInit, depth + 1)
+  }
+  const d = identFnDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { n }
+  if (
+    dn is FuncDecl
+    && dn.fnRet < 0
+    && (fnDeclIx[dn.fnName] ?? -1) == d
+    && nodeTyOf(d) < 0
+    && !onInferStack(dn.fnName)
+  ) {
+    checkNodeHook(d)
+  }
+  0
+}
+
 // The ordinary call: the callee evaluates to a function type, so the arguments are checked
 // against its parameter list — named arguments reordered, an omitted trailing one filled
 // from the declaration default, and type-parameter bindings solved from the argument types.
@@ -2696,6 +2735,9 @@ function callFtyPinCstrs(
   }
   const sigRet = retTy
   retTy = substTyDeep(retTy, vNames, vTys)
+  if tyHasTyVar(retTy) && !inferQuiet {
+    for a in args { checkHandedFns(a, 0) }
+  }
   if tyHasTyVar(retTy) {
     const hr = holeRetTyOf(cstrCallee, vNames, vTys)
     if hr >= 0 { retTy = hr }
