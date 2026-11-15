@@ -224,3 +224,88 @@ Deno.test({
     }
   },
 });
+
+// A fixture clone whose remote has unmerged branches: `--next` and `--reserve` skip every id a
+// branch adds a row or a reservation for beside `origin/master`, and ignore a claim whose work
+// has landed (an id in it is filed on master).
+const git = async (cwd: string, args: string[]) => {
+  const { code, stderr } = await new Deno.Command("git", {
+    args: ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=master", ...args],
+    cwd,
+    stdout: "null",
+    stderr: "piped",
+  }).output();
+  if (code !== 0) throw new Error(`git ${args.join(" ")}: ${dec.decode(stderr)}`);
+};
+
+Deno.test({
+  name: "inventory ls: --next and --reserve skip ids an unmerged remote branch claims",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_inv_ls_remote_" });
+    try {
+      WASM = `${dir}/ls.wasm`;
+      const built = await run(ROOT, [
+        "build",
+        "scripts/inventory/ls.vl",
+        "--compiler",
+        COMPILER,
+        "-o",
+        WASM,
+      ]);
+      if (built.code !== 0) {
+        throw new Error(`building ls.vl:\n${built.out}${built.err}`);
+      }
+      const src = `${dir}/src`;
+      const inv = "docs/internals/inventory";
+      await Deno.mkdir(`${src}/${inv}/reserved`, { recursive: true });
+      await Deno.mkdir(`${src}/docs/internals/inventory-2`);
+      await Deno.writeTextFile(`${src}/docs/internals/inventory-2/D1.md`, "### D1 — a row\n**closed**\n");
+      for (const id of ["D2", "D5", "D10"]) {
+        await Deno.writeTextFile(`${src}/${inv}/${id}.md`, `### ${id} — a row\n**closed**\n`);
+      }
+      await git(dir, ["init", "-q", src]);
+      await git(src, ["add", "-A"]);
+      await git(src, ["commit", "-q", "-m", "master"]);
+      // A live branch: a reservation and a row past master's top.
+      await git(src, ["checkout", "-q", "-b", "lane-x"]);
+      await Deno.writeTextFile(`${src}/${inv}/reserved/D11-D12.md`, "D11-D12  x  2026-11-15\n");
+      await Deno.writeTextFile(`${src}/${inv}/D13.md`, "### D13 — a row\n**open**\n");
+      await git(src, ["add", "-A"]);
+      await git(src, ["commit", "-q", "-m", "lane-x"]);
+      // A landed branch: its reservation holds D5, which master files.
+      await git(src, ["checkout", "-q", "master"]);
+      await git(src, ["checkout", "-q", "-b", "lane-old"]);
+      await Deno.mkdir(`${src}/${inv}/reserved`, { recursive: true });
+      await Deno.writeTextFile(`${src}/${inv}/reserved/D5-D9.md`, "D5-D9  old  2026-11-01\n");
+      await git(src, ["add", "-A"]);
+      await git(src, ["commit", "-q", "-m", "lane-old"]);
+      await git(src, ["checkout", "-q", "master"]);
+      const co = `${dir}/co`;
+      await git(dir, ["clone", "-q", src, co]);
+
+      check(
+        "--next past a remote branch's claims",
+        await ls(co, ["--next"]),
+        0,
+        "D14\n",
+        "  skipped D11-D12 — on origin/lane-x\n  skipped D13 — on origin/lane-x\n",
+      );
+      check(
+        "--reserve over a remote branch's row",
+        await ls(co, ["--reserve", "D13-D15", "me"]),
+        1,
+        "ls.vl: D13-D15 overlaps D13, touched by origin/lane-x, not yet on origin/master\n",
+      );
+      check(
+        "--reserve beside a landed branch's stale range",
+        await ls(co, ["--reserve", "D6-D7", "me"]),
+        0,
+        "reserved D6-D7\n",
+      );
+      // Outside a git checkout there is no remote to ask: the first test's fixture covers that.
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
