@@ -626,6 +626,8 @@ import {
   heldRepOf,
   helpListGrowFn,
   helpMapCompactFn,
+  helpMapEntryFn,
+  helpMapEntryI32Fn,
   helpMapProbeFn,
   helpMapProbeI32Fn,
   helpMapProbeI64Fn,
@@ -14629,15 +14631,17 @@ function pushMapSlotPos(k: i32) {
   0
 }
 
-// Probe: with `mapRef` (slot 0) and the target `keyRef` (slot 1) set, linear-probe `M.index`,
-// wrapping, to the slot holding either the matching key's entry or a free (0) one. Leaves `slot`
-// (3) = that probe slot and `entry` (5) = its entry, 0 for a miss. Shared by get, has, set and
-// delete; occupancy, dead markers included, stays under 1/2, so a free slot is reached.
+// Probe: with `mapRef` (slot 0) and `keyRef` (slot 1) set, linear-probe `M.index` to the slot of
+// the key's entry or the free one ending its chain. Leaves `entry` (5), 0 for a miss, and `slot`
+// (3) under `needSlotAsked` (always under `-O`), which only set and delete read. Occupancy, dead
+// markers included, stays under 1/2, so a free slot is reached.
 
 // A dead entry stays a probe marker, never a hit, so delete does not break the chain (D2370).
 // The string key is hashed here, as `__map_probe__`'s first operand, on an empty operand stack so
 // no backing `struct.get` stays live across `__str_hash__`; `keepHash` parks it in scratch +9.
-function emitMapProbe(keepHash: boolean) {
+function emitMapProbe(keepHash: boolean, needSlotAsked: boolean) {
+  // `-O` keeps the slot probe and the index read at the site, the shape its map rows pin.
+  const needSlot = needSlotAsked || gOptimized != 0
   // Push the probe's shape-agnostic components (the map struct type differs per value shape,
   // but `index`/`hashes`/`live`/`keys` are identically typed across shapes — only these
   // `struct.get`s stay at the call site) and call the shared helper, which returns the SLOT.
@@ -14645,6 +14649,11 @@ function emitMapProbe(keepHash: boolean) {
   if pk == MAP_KEY_I32 {
     pushMapIndex()
     fbLocalGet(cmKeyLocal()) // the raw i32 key, its own tag
+    if !needSlot {
+      fbCall(helpMapEntryI32Fn())
+      setMapScr(5) // entry
+      return 0
+    }
     fbCall(helpMapProbeI32Fn())
   } else if pk == MAP_KEY_I64 {
     pushMapIndex()
@@ -14659,6 +14668,11 @@ function emitMapProbe(keepHash: boolean) {
     pushMapLive()
     pushMapKeysBacking()
     fbLocalGet(cmKeyLocal()) // the target string key
+    if !needSlot {
+      fbCall(helpMapEntryFn())
+      setMapScr(5) // entry
+      return 0
+    }
     fbCall(helpMapProbeFn())
   }
   setMapScr(3) // slot
@@ -14807,15 +14821,19 @@ function emitMapRecvKey(recvIx: i32, keyIx: i32, fnIx: i32) {
 }
 
 // Load the map receiver and key into the scratch frame (slots 0 and 1) and run the probe, leaving
-// `slot` (slot 3) = the probe slot and `entry` (slot 5) = `index[slot]`, 0 for a miss and else the
-// entry position plus 1. `recvIx` and `keyIx` are arena indices; `recvIx` must be a map-typed
-// expression and `keyIx` a string.
+// `entry` (slot 5) = `index[slot]`, 0 for a miss and else the entry position plus 1. `recvIx` and
+// `keyIx` are arena indices; `recvIx` must be a map-typed expression and `keyIx` a string.
 function emitMapPrep(recvIx: i32, keyIx: i32, fnIx: i32) {
+  emitMapPrepFor(recvIx, keyIx, fnIx, false)
+}
+
+// `emitMapPrep`, also leaving `slot` (slot 3) = the probe slot under `needSlot`.
+function emitMapPrepFor(recvIx: i32, keyIx: i32, fnIx: i32, needSlot: boolean) {
   if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
   // Pop the stacked pair into the frame only now — user code is done running.
   fbLocalSet(cmKeyLocal()) // the target key
   setMapRef()              // mapRef (the shared mono slot, or this mv/i32 frame's)
-  emitMapProbe(false)
+  emitMapProbe(false, needSlot)
 }
 
 // Emit the `??` DEFAULT `d` for a REF-valued map slot (`cmSlot >= 0`) onto `body`, in the
@@ -15889,7 +15907,7 @@ function emitMapClear(recvIx: i32, fnIx: i32) {
 // refs so the payload can be collected, decrements `size`, and pushes 1. A delete never moves an
 // entry, so a walk over the same map stays in step; storage is reclaimed on insert (D2315).
 function emitMapDelete(recvIx: i32, keyIx: i32, fnIx: i32) {
-  if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
+  if emitMapPrepFor(recvIx, keyIx, fnIx, true) < 0 { return -1 }
   const mslot = cmSlot
   // if entry == 0 { 0 } else { tombstone ; drop refs ; size-- ; 1 }
   pushMapScr(5) // entry
@@ -16226,7 +16244,7 @@ export function mapSetFnBody(sh: i32): u8[] {
 // A set's store, with the map, key and value in their locals: probe; a hit overwrites, a miss
 // appends, compacting first when the dead entries call for it, and maybe resizes.
 function emitMapSetStore(mslot: i32) {
-  emitMapProbe(true)
+  emitMapProbe(true, true)
   pushMapScr(5) // entry
   fbIf(64)      // if (entry != 0 → overwrite), void
   // OVERWRITE: vals.backing[entry-1] = stash
@@ -16252,7 +16270,7 @@ function emitMapSetStore(mslot: i32) {
     fbIf(64)      // if, void
     pushMapRef()
     fbCall(cmpFn)
-    emitMapProbe(true)
+    emitMapProbe(true, true)
     fbEnd()       // end (compact if)
   }
   // the slot's entry = count + 1 (the new entry's position + 1), beside an integer key's tag in
