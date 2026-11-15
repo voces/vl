@@ -81,7 +81,7 @@ const LIB = [
 ].join("\n");
 const OTHER = "export function other(): i32 { return 7 }";
 const VIA =
-  'import { hello } from "./lib"\nexport function via(): i32 { hello(5) }';
+  'import { hello } from "./lib"\nexport function via(): i32 { return hello(5) }';
 
 // Each entry imports `lib.vl` (directly or through `via.vl`) at a different discovery position.
 const GRAPHS: [string, string][] = [

@@ -647,7 +647,7 @@ const CASES: Case[] = [
     to: "function bq(b: Bx<i32>): void { print(b.f) }\nfunction quiet",
     libUses: "export type J = { f: f64 }\ntype Bx<T> = { f: T }\n",
     uses:
-      'import { J } from "./lib"\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
+      'import { J } from "./lib"\nfunction mk() { return { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
   },
   {
     name: "a private lib self-function main's typo is near",
@@ -729,7 +729,7 @@ const CASES: Case[] = [
     to: "function bq(b: Map<i32>): void { print(b.f) }\nfunction quiet",
     libUses: "export type J = { f: f64 }\ntype Map<T> = { f: T }\n",
     uses:
-      'import { J } from "./lib"\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
+      'import { J } from "./lib"\nfunction mk() { return { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
   },
   {
     name: "main's private type spells a lib body literal's record",

@@ -131,7 +131,7 @@ const bigEmit = (): Exports => {
   loadString(
     exp,
     (n) => exp.srcLoad(n),
-    `export function s(): string { "${"abcdefghij".repeat(20000)}" }\n`,
+    `export function s(): string { return "${"abcdefghij".repeat(20000)}" }\n`,
   );
   assertEquals(exp.compileSrc(), 0, "the payload program must compile");
   return exp;

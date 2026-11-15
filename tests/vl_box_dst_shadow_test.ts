@@ -437,14 +437,14 @@ Deno.test({
   name: "box-dst shadow: a tail `if` and a loop's exits take their own join",
   ignore,
   fn: () =>
-    expectRows("ownjoin", OWNJOIN, DROP_NONE, "nested agree=8; table=8"),
+    expectRows("ownjoin", OWNJOIN, DROP_NONE, "floor: no record=1; nested agree=7; nested no record=1; table=7"),
 });
 
 Deno.test({
   name: "box-dst shadow: an annotated tail `if` takes the declared result",
   ignore,
   fn: () =>
-    expectRows("anntail", ANNTAIL, DROP_NONE, "nested agree=1; table=1"),
+    expectRows("anntail", ANNTAIL, DROP_NONE, "nested agree=2; table=2"),
 });
 
 Deno.test({
