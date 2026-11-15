@@ -354,7 +354,7 @@ Deno.test({
       // called at two function types.
       await Deno.writeTextFile(
         file,
-        "function same<T>(k: T): T { k }\n" +
+        "function same<T>(k: T): T { return k }\n" +
           'function mid<F>(a: F, b: F, n: i32) {\n  print(a("x"))\n  print(b(n))\n' +
           "  const fs = [a]\n  print(fs.length)\n  if n > 0 { mid(b, a, n - 1) }\n}\n" +
           "mid(same, same, 1)\n",

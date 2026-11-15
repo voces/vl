@@ -253,7 +253,7 @@ Consequences:
 set `W`." Consider:
 
 ```vl
-function g(p: P) { const r = { inner: p }; r.inner.x = 1.0 }
+function g(p: P) { const r = { inner: p }; return r.inner.x = 1.0 }
 ```
 
 The place is rooted at the fresh `r`, but the object written is `p`'s. The rule must ask
@@ -275,7 +275,7 @@ mutable; VL cannot borrow that.
 ### 6. Per-instance acceptance of a generic's `pure` is non-local
 
 ```vl
-pure function add<T>(a: T, b: T): T { a + b }
+pure function add<T>(a: T, b: T): T { return a + b }
 ```
 
 This is `pure` at `i32`, and impure at a `Logged` whose user-defined `"+"` prints, declared in

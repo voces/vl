@@ -374,7 +374,7 @@ Deno.test({
       "  expect(1).not().toEqual(2)",
       "})",
       "",
-      "function build(n: i32): i32 { n }",
+      "function build(n: i32): i32 { return n }",
     ];
     /** The 1-based line/col of `needle` in `src` — the runner's own coordinates. */
     const posOf = (src: string[], needle: string, token: string) => {
@@ -889,7 +889,7 @@ Deno.test({
         'import { expect, it, toEqual } from "std:test"\n' +
           "function f(): i32 {\n  let acc = 0\n  " +
           "{ acc = acc + 1 ".repeat(n) + "} ".repeat(n) +
-          `\n  acc\n}\nconst x = f() - ${n - 1}\n` +
+          `\n  return acc\n}\nconst x = f() - ${n - 1}\n` +
           'it("deep", () => { expect(x).toEqual(1) })\n',
       );
       await Deno.writeTextFile(

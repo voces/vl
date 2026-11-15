@@ -104,7 +104,7 @@ Deno.test({
     // The gate: the memory export rides the same `memUsed` flag as the memory
     // SECTION, so a memory-free program is unchanged by P0.2.
     const { exports, logs } = await runWasm(
-      await build(`export function add(a: i32, b: i32): i32 { a + b }\nprint(add(2, 3))\n`),
+      await build(`export function add(a: i32, b: i32): i32 { return a + b }\nprint(add(2, 3))\n`),
     );
     assertEq(logs, ["5"], "the program still runs");
     if (exports.memory !== undefined) {
@@ -179,7 +179,7 @@ export function sumBytes(base: i32, n: i32): i32 {
     i = i + 1
   }
   __store_i32__(1024, total)
-  total
+  return total
 }
 `));
     const mem = exports.memory as WebAssembly.Memory;
@@ -211,7 +211,7 @@ export function poke(base: i32): i32 {
   __store_i8__(base, 171)
   __store_i16__(base + 4, 48879)
   __store_i16__(base + 11, 4660)
-  base
+  return base
 }
 __store_i32__(0, 1)
 print(__load_i32__(0))
@@ -248,8 +248,8 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const { exports } = await runWasm(await build(`
-export function grow(pages: i32): i32 { __memory_grow__(pages) }
-export function pages(): i32 { __memory_size__() }
+export function grow(pages: i32): i32 { return __memory_grow__(pages) }
+export function pages(): i32 { return __memory_size__() }
 __store_i32__(0, 11223344)
 print(__load_i32__(0))
 `));
@@ -287,7 +287,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const { exports } = await runWasm(await build(`
-export function grow(pages: i32): i32 { __memory_grow__(pages) }
+export function grow(pages: i32): i32 { return __memory_grow__(pages) }
 __store_i32__(0, 4242)
 print(__load_i32__(0))
 `));

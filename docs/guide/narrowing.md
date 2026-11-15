@@ -110,7 +110,7 @@ function fail(msg: string): never {
 
 function f(x: i64 | IoError): i64 {
   if x is IoError { fail("io") }
-  x * 2                                      // x is i64 here
+  return x * 2                                      // x is i64 here
 }
 
 const n = if ok { 10 } else { fail("no") }   // n: i32 — the `never` arm joins away
