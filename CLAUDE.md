@@ -104,6 +104,10 @@ The parts:
 * **Generated-code cost is gated:** `vl run scripts/plumb-shape-cost.vl -- --check` — guest FUEL
   **+5%**, peak RSS **+10%**; `-- --write-baseline` on a quiet box
   (profiling-the-compiler.md §Guards).
+* **Self-compile fuel is gated per PR:** `scripts/self-compile-time.sh` reds on an L2 rise past
+  **+1%** of `scripts/self-compile-baseline.json` (and past 1.5×). Accept a rise with
+  `--write-baseline` from a fixpoint seed plus one line in `scripts/self-compile-ledger.txt` (fuel,
+  commit, PR, mechanism); a baseline the ledger's last line does not name reds.
 * **Late demands are gated:** `vl run scripts/late-demands.vl -- --check` against
   `scripts/late-demands-baseline.txt`. A rise fails; a fall passes and is named, and the PR that
   earned it runs `--write-baseline`, **written from a FIXPOINT seed** (refresh until a second

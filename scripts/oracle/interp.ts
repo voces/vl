@@ -121,8 +121,13 @@ function litTo(l: Lit, k: string): Val {
         if (l.radix) return wrap64(x);
         if (x < I64_MIN || x > I64_MAX) throw new LitFault(`literal typed from uses: constant ${x} overflows i64`);
         return x;
-      case "f64": return l.radix && l.lone ? radixFloat(x, 64) : new Flt(Number(x), 64);
-      case "f32": return l.radix && l.lone ? radixFloat(x, 32) : new Flt(Math.fround(Number(x)), 32);
+      case "f64":
+        if (l.radix && l.lone) return radixFloat(x, 64, false);
+        return new Flt(Number(l.radix ? wrap64(x) : x), 64); // ruling 4.2: a radix tree computes at 64 bits
+      case "f32":
+        if (l.radix && l.lone) return radixFloat(x, 32, false);
+        if (l.radix) throw new Unsupported("spec gap: a radix constant tree at f32");
+        return new Flt(Math.fround(Number(x)), 32);
       case "u8": case "u16": case "u32": case "i8": case "i16": return litTo(l, "i32");
     }
   } else {
@@ -137,10 +142,13 @@ function litTo(l: Lit, k: string): Val {
   }
   throw new TypeFault(`constant at ${k}`);
 }
-// T2.3 (owner ruling 4.1, revised): a radix literal in a float context is the value its digits
-// spell, rounded to the float; the bit-pattern reading is for integer contexts only.
-function radixFloat(u: bigint, w: 32 | 64): Flt {
-  return new Flt(w === 32 ? Math.fround(Number(u)) : Number(u), w);
+// T2.3 (owner ruling 4.1): a radix literal in a float context is the value its digits spell.
+// At a destination or a peer the float must hold it exactly, as a decimal literal must (D1890);
+// only `as f32` / `as f64` rounds. The bit-pattern reading is for integer contexts only.
+function radixFloat(u: bigint, w: 32 | 64, round: boolean): Flt {
+  const v = w === 32 ? Math.fround(Number(u)) : Number(u);
+  if (!round && BigInt(v) !== u) throw new TypeFault(`constant ${u} is not exact at f${w}`);
+  return new Flt(v, w);
 }
 function litDefault(l: Lit): Val {
   if (l.f !== null) return new Flt(l.f, 64);
@@ -210,6 +218,16 @@ function isConstTree(e: Expr): boolean {
   return e.k === "bin" && ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"].includes(e.op) && isConstTree(e.l) && isConstTree(e.r);
 }
 
+// Whether a constant tree holds a radix literal, or a float literal.
+function treeHas(e: Expr, what: "radix" | "float"): boolean {
+  if (e.k === "int") return what === "radix" && !!e.radix;
+  if (e.k === "float") return what === "float";
+  if (e.k === "un") return treeHas(e.e, what);
+  return e.k === "bin" && (treeHas(e.l, what) || treeHas(e.r, what));
+}
+const F64_TY: Ty = { k: "name", name: "f64", args: [] };
+const I64_TY: Ty = { k: "name", name: "i64", args: [] };
+
 function litHolds(l: Lit, k: string): boolean {
   if (l.i === null) return k === "f64" || k === "f32";
   if (l.radix) return k !== "i32" || (l.radix === 32 && !l.wideDec);
@@ -237,10 +255,29 @@ export function parseRat(s: string): [bigint, bigint] {
 // True while the constant tree initialising a binding annotated `f32` is evaluated (E9.1).
 let f32Fold = false
 
-function litArith(op: string, a: Lit, b: Lit): Val {
-  // a radix literal meeting a float constant is the value its digits spell (T2.3); a tree is first
-  // its bit pattern at the default width
-  const atFloat = (x: Lit) => x.lone ? radixFloat(x.i!, 64) : litDefault(x);
+// E9.1 / ruling 4.2: a radix constant is a bit pattern at its use's width under every operator.
+// The width is 64 at an i64 or f64 use, 32 at an i32 one, and with no use the tree's default
+// (T2.3). Ring operators commute with wrapping, so only these need the width before they run.
+function radixWidth(a: Lit, b: Lit, expK: string | null): 32 | 64 {
+  if (expK === "i64" || expK === "f64") return 64;
+  if (expK === "f32") throw new Unsupported("spec gap: a radix constant tree at f32");
+  if (expK) return 32;
+  return a.radix === 64 || b.radix === 64 || a.wideDec || b.wideDec ? 64 : 32;
+}
+function radixAtWidth(op: string, a: Lit, b: Lit, expK: string | null): Lit {
+  const w = radixWidth(a, b, expK), W = BigInt(w);
+  const x = BigInt.asIntN(w, a.i!), y = BigInt.asIntN(w, b.i!), n = y & (W - 1n);
+  const r = op === "/" ? x / y : op === "%" ? x % y : op === "&" ? x & y : op === "|" ? x | y : op === "^" ? x ^ y
+    : op === "<<" ? x << n : op === ">>" ? x >> n : BigInt.asUintN(w, x) >> n;
+  const l = new Lit(BigInt.asIntN(w, r), null, w);
+  l.derived = true;
+  return l;
+}
+
+function litArith(op: string, a: Lit, b: Lit, expK: string | null = null): Val {
+  // a radix literal meeting a float constant is the value its digits spell (T2.3); a radix tree
+  // beside that f64 computes at 64 bits (ruling 4.2)
+  const atFloat = (x: Lit) => x.lone ? radixFloat(x.i!, 64, false) : new Flt(Number(wrap64(x.i!)), 64);
   if ((a.f !== null && b.radix) || (b.f !== null && a.radix)) return arith(op, a.radix ? atFloat(a) : a, b.radix ? atFloat(b) : b);
   if (a.i !== null && b.i !== null) {
     const x = a.i, y = b.i, radix = Math.max(Number(a.radix), Number(b.radix));
@@ -250,12 +287,10 @@ function litArith(op: string, a: Lit, b: Lit): Val {
       case "-": return L(x - y);
       case "*": return L(x * y);
       // the checker refuses a decimal tree's zero divisor; what reaches here runs, and traps (T1.2)
-      case "/": if (y === 0n) throw new Trap("integer divide by zero"); if (radix) throw new Unsupported("spec gap: / on a radix constant"); return L(x / y);
-      case "%": if (y === 0n) throw new Trap("integer divide by zero"); if (radix) throw new Unsupported("spec gap: % on a radix constant"); return L(x % y);
-      // A radix constant is a bit pattern "at its use's width under every operator" (E9.1):
-      // the oracle declines rather than guess the width before the use is known.
+      case "/": if (y === 0n) throw new Trap("integer divide by zero"); if (radix) return radixAtWidth(op, a, b, expK); return L(x / y);
+      case "%": if (y === 0n) throw new Trap("integer divide by zero"); if (radix) return radixAtWidth(op, a, b, expK); return L(x % y);
       case "&": case "|": case "^": case "<<": case ">>": case ">>>":
-        if (radix) throw new Unsupported("spec gap: bitwise on a radix constant before its width is known");
+        if (radix) return radixAtWidth(op, a, b, expK);
         if (op === "&") return L(x & y);
         if (op === "|") return L(x | y);
         if (op === "^") return L(x ^ y);
@@ -290,7 +325,7 @@ function arith(op: string, a: Val, b: Val, expK: string | null = null): Val {
     const at = (l: Lit, o: Lit) => expK && litHolds(l, expK) ? litTo(l, expK) : pairDefault(l, o);
     return arith(op, at(a, b), at(b, a));
   }
-  if (a instanceof Lit && b instanceof Lit) return litArith(op, a, b);
+  if (a instanceof Lit && b instanceof Lit) return litArith(op, a, b, expK);
   let ka = a instanceof Lit ? null : numKind(a), kb = b instanceof Lit ? null : numKind(b);
   if (expK && (ka === null) !== (kb === null)) {
     const peer = (ka ?? kb)!, lit = (a instanceof Lit ? a : b) as Lit;
@@ -1089,9 +1124,25 @@ export class Interp {
     }
     // A numeric context flows into both operands of arithmetic (a literal tree adopts it).
     const arithOp = ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"].includes(op);
-    // A bitwise operator is integer-only (E6.1), so a float context does not reach its operands.
+    // A bitwise operator is integer-only (E6.1), so a float context does not reach its operands;
+    // a radix constant tree at an f64 computes at 64 bits instead (ruling 4.2).
     if (exp && ["&", "|", "^", "<<", ">>", ">>>"].includes(op)) {
-      try { const x = this.resolve(exp, env); if (x.k === "name" && (x.name === "f64" || x.name === "f32")) exp = null; } catch { exp = null; }
+      try {
+        const x = this.resolve(exp, env);
+        if (x.k === "name" && (x.name === "f64" || x.name === "f32")) exp = x.name === "f64" && isConstTree(e) && treeHas(e, "radix") ? I64_TY : null;
+      } catch { exp = null; }
+    }
+    // The compiler reads a typed shift count as the left constant's peer, so a radix tree shifted
+    // by an i32 count computes at 32 bits even at an i64 use; whether a count types its left
+    // operand is an owner question, so no verdict.
+    if (["<<", ">>", ">>>"].includes(op) && isConstTree(e.l) && treeHas(e.l, "radix") && !isConstTree(e.r)) {
+      throw new Unsupported("spec gap: a radix constant tree shifted by a typed count");
+    }
+    // A radix tree beside a float constant has that f64 as its peer (ruling 4.2).
+    if (arithOp && !exp && isConstTree(e.l) && isConstTree(e.r)) {
+      const radixL = treeHas(e.l, "radix") && !treeHas(e.l, "float"), radixR = treeHas(e.r, "radix") && !treeHas(e.r, "float");
+      if (radixR && treeHas(e.l, "float") && !radixL) return arith(op, this.eval(e.l, env, null), this.eval(e.r, env, F64_TY));
+      if (radixL && treeHas(e.r, "float") && !radixR) return arith(op, this.eval(e.l, env, F64_TY), this.eval(e.r, env, null));
     }
     // A constant operand takes its typed peer's type as its context (DECISIONS D3043: an operator
     // peer adopts the literal tree). A constant has no effects, so its side may run second.
@@ -1127,7 +1178,7 @@ export class Interp {
       if (op === ">>>" && l.i !== null && l.i < 0n && !l.radix && expK === "i64") return arith(">>>", litTo(l, "i64"), litDefault(r));
       // E9.1: the exact constant is computed first and typed at its use.
       if (l.join || r.join) return arith(op, l, r, expK);
-      return litArith(op, l, r);
+      return litArith(op, l, r, expK);
     }
     return arith(op, l, r, expK);
   }
@@ -1338,7 +1389,10 @@ export class Interp {
   }
 
   cast(e: Extract<Expr, { k: "as" }>, env: Env): Val {
-    let v = this.eval(e.e, env, null);
+    // T2.4: a radix constant tree takes a 64-bit cast target as its width (ruling 4.2); an `i32`
+    // target reads a wide tree at i64 before its range check, below.
+    const wide = e.mode !== "as%" && e.ty.k === "name" && (e.ty.name === "i64" || e.ty.name === "f64");
+    let v = this.eval(e.e, env, wide && isConstTree(e.e) && treeHas(e.e, "radix") ? e.ty : null);
     const t = this.resolve(e.ty, env);
     if (t.k !== "name" || !NUMERIC.has(t.name) || (typeof v !== "boolean" && !(v instanceof Lit) && !numKind(v))) {
       // E8.6: a cast whose operand is a union selects a member.
@@ -1350,11 +1404,8 @@ export class Interp {
     if (typeof v === "boolean") v = v ? 1 : 0; // E8.5
     // T2.4: a constant operand takes the cast's target as its context, so `0xFFFFFFFF as i64`
     // is 4294967295; one the target cannot hold is a failed cast.
-    if (v instanceof Lit && v.radix && !v.lone && (k === "f64" || k === "f32")) {
-      // A radix tree at a float computes at 64 bits by owner ruling 4.2, which lane N implements
-      // in the compiler; until it lands the two disagree, so no verdict.
-      throw new Unsupported("spec gap: a radix constant tree in a float context (ruling 4.2 pending)");
-    }
+    if (v instanceof Lit && v.radix && v.lone && (k === "f64" || k === "f32")) return radixFloat(v.i!, k === "f64" ? 64 : 32, true);
+    if (v instanceof Lit && v.radix && !v.lone && k === "f32") throw new Unsupported("spec gap: a radix constant tree at f32");
     // a radix tree as wide as i64 (a pattern over 32 bits, or a decimal leaf outside i32) is read
     // at i64 before an integer cast checks its range
     if (v instanceof Lit && v.radix && (v.radix === 64 || v.wideDec) && k !== "f64" && k !== "f32" && e.mode !== "as%") v = litTo(v, "i64");
