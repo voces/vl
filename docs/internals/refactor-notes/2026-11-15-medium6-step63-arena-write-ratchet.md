@@ -42,7 +42,13 @@ the ratchet is also a progress meter for L1.
 
 ## Gate
 
-GATE_PLACEHOLDER
+- **Seeds:** A is a fixpoint built from `git archive d31ab4440`; D is a fixpoint built from this branch.
+- **Identity:** `probe-rollback-census.ts --fingerprint` over `tests/cases`, `distilled/cells` and
+  `distilled/named` gives **20,319 programs, 0 different**. The rule is a lint, so it emits nothing.
+- **L2:** byte-identical. Guest fuel is 89,536,652,106 for A and 89,536,657,131 for D.
+- **Gates:** `lint-self.sh` is clean, and it reads "arena-write budget ok — 259 writes into existing
+  nodes". `vl_arena_write_fields_test`, `budget_targets_test`, `vl_ratchet_hold_test` and
+  `vl_lint_rule_scope_test` pass, the last with its CLI half (`SELFHOST_NATIVE_ALIGN=1`).
 
 ## Lines
 
