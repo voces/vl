@@ -9,7 +9,9 @@
 // Run from the checkout root: every path, the `reserved/` directory included, resolves
 // against the working directory. `--next` skips the reserved ranges and names each on stderr,
 // which it reaches through `/dev/stderr` because VL has no stderr sink (a `dogfood:` row).
-// A reservation is one file per range so concurrent lanes never edit the same file.
+// A reservation is one file per range so concurrent lanes never edit the same file. `--next`
+// and `--reserve` also skip every id a fetched `origin/*` branch adds a row or a reservation
+// for beside `origin/master`, so two lanes whose branches have not merged do not collide.
 
 import {
   IoError,
@@ -371,6 +373,98 @@ function reservations(): Res[] {
 
 function rangeText(r: Res): string { "D\{toString(r.lo)}-D\{toString(r.hi)}" }
 
+// A claim as the reader names it: one id, or a range.
+function claimText(r: Res): string {
+  if r.lo == r.hi { return "D\{toString(r.lo)}" }
+  rangeText(r)
+}
+
+// The lines `git args` prints, or none when git is absent or refuses (no repository, no ref).
+function gitLines(args: string[]): string[] {
+  const r = runProgram("git", args)
+  if r is IoError { return [] }
+  if r.code != 0 { return [] }
+  const out: string[] = []
+  for ln in split(decodeUtf8Lossy(r.stdout), "\n") {
+    const t = stripWs(ln)
+    if t != "" { out.push(t) }
+  }
+  out
+}
+
+// The ids path `p` claims: a reservation file's range, or a row's id as a range of one, as
+// [lo, hi]; none for any other file.
+function claimOf(p: string): i64[] {
+  const parts = split(p, "/")
+  const name = parts[parts.length - 1]
+  if !endsWith(name, ".md") { return [] }
+  const stem = name.slice(0, name.length - 3)
+  if parts.length >= 2 && parts[parts.length - 2] == "reserved" {
+    const sp = spanAt(stem)
+    if sp.b.end != stem.length { return [] }
+    return [sp.a.n, sp.b.n]
+  }
+  if !startsWith(stem, "D") { return [] }
+  const d = digitsAt(stem, 1)
+  if d.end != stem.length { return [] }
+  [d.n, d.n]
+}
+
+// Every range a fetched `origin/*` branch claims that `origin/master` does not hold: a
+// reservation file or a row it adds, unless an id in it is filed here (its work has landed, and
+// master has since released the range). None outside a git checkout.
+function remoteClaims(rows: Listed[]): Res[] {
+  const filed: {[i64]: boolean} = Map()
+  for r in rows { filed[r.key.num] = true }
+  const out: Res[] = []
+  const base = "origin/master"
+  if gitLines(["rev-parse", "--verify", "--quiet", base]).length == 0 {
+    return out
+  }
+  for ref in gitLines(["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"]) {
+    if ref == base || ref == "origin" || ref == "origin/HEAD" { continue }
+    const added = gitLines(
+      [
+        "diff",
+        "--name-only",
+        "--diff-filter=A",
+        base,
+        ref,
+        "--",
+        TARGETS[0],
+        TARGETS[1],
+      ],
+    )
+    for p in added {
+      const c = claimOf(p)
+      if c.length == 2 && !anyFiled(filed, c[0], c[1]) {
+        out.push({ lo: c[0], hi: c[1], who: ref, date: "", note: "", path: "" })
+      }
+    }
+  }
+  sortRes(out)
+}
+
+// Whether any id from `lo` to `hi` is filed.
+function anyFiled(filed: {[i64]: boolean}, lo: i64, hi: i64): boolean {
+  let n = lo
+  while n <= hi {
+    if filed[n] ?? false { return true }
+    n = n + 1
+  }
+  false
+}
+
+// Why range `r` is taken: a reservation here, or a remote branch's claim.
+function heldText(r: Res): string {
+  if r.date == "" && r.path == "" {
+    return "touched by \{r.who}, not yet on origin/master"
+  }
+  let why = "held by \{r.who} since \{r.date}"
+  if r.note != "" { why = why + " (\{r.note})" }
+  why
+}
+
 // Runs `cmd args`, dying with `what` unless it exits 0.
 function mustRun(cmd: string, args: string[], what: string) {
   const r = runProgram(cmd, args)
@@ -437,6 +531,9 @@ function cmdReserve(
     path: "",
   }
   const res = reservations()
+  if !release {
+    for c in remoteClaims(allRows(TARGETS)) { res.push(c) }
+  }
   if release {
     for r in res {
       if r.lo == lo && r.hi == hi {
@@ -450,9 +547,9 @@ function cmdReserve(
   }
   for r in res {
     if !(hi < r.lo || lo > r.hi) {
-      let why = "ls.vl: \{rangeText(want)} overlaps \{rangeText(r)}, held by \{r.who} since \{r.date}"
-      if r.note != "" { why = why + " (\{r.note})" }
-      print(why)
+      print(
+        "ls.vl: \{rangeText(want)} overlaps \{claimText(r)}, \{heldText(r)}",
+      )
       return 1
     }
   }
@@ -480,6 +577,7 @@ function nextId(rows: Listed[]): i32 {
     n = top + 1
   }
   const res = reservations()
+  for c in remoteClaims(rows) { res.push(c) }
   const skipped: Res[] = []
   let moved = true
   while moved {
@@ -496,6 +594,9 @@ function nextId(rows: Listed[]): i32 {
   print("D\{toString(n)}")
   for r in skipped {
     let ln = "  skipped \{rangeText(r)} — \{r.who}, \{r.date}"
+    if r.date == "" && r.path == "" {
+      ln = "  skipped \{claimText(r)} — on \{r.who}"
+    }
     if r.note != "" { ln = ln + ", " + r.note }
     const e = appendTextFile("/dev/stderr", ln + "\n")
     if e != null { print(ln) }
