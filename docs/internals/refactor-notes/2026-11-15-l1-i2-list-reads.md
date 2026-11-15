@@ -54,35 +54,36 @@ holding an `RListGet` may be claimed (the IR lane's condition).
 ## Gate
 
 - **Seeds:** A is a fixpoint built from lane I's step 0 (#8406, `3934d8f45`). D is a fixpoint built
-  from this branch. Each took three rungs. The host was built from source in an isolated target
-  dir, because the shared binary predates the shadow.
+  from this branch. The host was built from source in an isolated target dir, because the shared
+  binary predates the shadow.
 - **Shadow off, nothing moves.** `probe-rollback-census.ts --fingerprint` over `tests/cases`,
   `distilled/cells` and `distilled/named` gives **20,333 programs, 0 different**. L2 is
-  byte-identical, with guest fuel 89,588,083,137 for A and 89,588,084,349 for D (+0.000001%).
+  byte-identical, with guest fuel 89,588,079,444 for A and 89,588,167,973 for D (+0.0001%).
 - **Shadow armed, self-compile.** The armed self-build is byte-identical to the unarmed one.
 
-  | 17,544 functions | A (#8406) | D (this) |
+  | functions (17,544 for A, 17,545 for D) | A (#8406) | D (this) |
   |---|---:|---:|
-  | covered | 1,508 | **2,123** |
-  | verified | 1,508 | 2,123 |
-  | matched | 1,506 | **2,116** |
-  | mismatches | 2 (I1 global guard or fold) | 7: the same 2, and 5 `ref.as_non_null` global reads (I1b) |
+  | covered and verified | 1,508 | **1,824** |
+  | matched | 1,506 | **1,822** |
+  | mismatches | 2 (I1: global read with a guard or a fold) | the same 2 |
+  | `reference global read (non-null)` misses | — | 625 |
 
 - **Shadow armed, every fifth distilled cell (2,429 files).**
 
   | 8,851 functions | A | D |
   |---|---:|---:|
-  | covered and verified | 1,868 | **2,417** |
-  | matched | 1,421 | **1,829** |
-  | `unmapped slot` (I1: an instance's parameter read) | 444 | 584 |
-  | `locals layout` | 3 | 3 |
-  | bytes (I1: a never-returning callee) | 0 | 1 |
+  | covered and verified | 1,868 | **1,829** |
+  | matched | 1,421 | **1,828** |
+  | `unmapped slot` mismatches | 444 | 0 |
+  | `locals layout` mismatches | 3 | 1 |
+  | `instance parameter read` / `never-returning callee` misses | — | 649 / 70 |
 
-- **Every new mismatch is one of the three I1 decisions below.** None is a list read or a
-  reference local's valtype.
+- **No mismatch is new.** The 444 `unmapped slot` rows A shows are now the named
+  `instance parameter read` miss. Most of the self-compile cost is the conservative
+  reference-global miss. Each named miss comes back when I1b deletes it.
 - **Tests:** `tests/vl_ir_list_test.ts`, `vl_ir_shadow_test.ts` (with lane I's fixture change)
-  and `vl_compile_cache_test.ts` pass. Rule 8's control trips. `lint-self.sh` is clean, the
-  armed seed has 0 imports, and nothing is claimed.
+  and `vl_compile_cache_test.ts` pass. Rule 8's control trips. `lint-self.sh` is clean,
+  `phase-state-census.vl --check` is ok, the seed has 0 imports, and nothing is claimed.
 
 ## Three I1 decisions, now named builder misses
 
@@ -111,6 +112,8 @@ mismatch. Each is now a named miss in `ir_build.vl`, and lane I's I1b deletes it
   - `irRefInstall()` in `runEmitPasses`;
   - the `irRefCorrupt` export in `entry.vl`;
   - keyword exports in `emit_bytes.vl` (`fbLazyListSlotRun`, `fbLocalIsUnsetRef`, `fbRun`) and in
-    `wasmEmit.vl` (`hoistPathDecl`, `hoistPathProp`).
+    `wasmEmit.vl` (`hoistPathDecl`, `hoistPathProp`);
+  - `idxCellReadIsNull` in `wasmEmit.vl`, the null-cell test `emitIndex` and the copy share;
+  - the three named misses in lane I's `ir_build.vl` (9 lines).
 - **Lane I's fixture** in `tests/vl_ir_shadow_test.ts` changes from a list read to a record read,
   at lane I's request.
