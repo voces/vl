@@ -44,6 +44,10 @@ switch of `monoSlotDeliveryTy`.
 - **A class whose own holder is open takes its bounded parent's step.** A `Map()` unified with an
   annotated list's element took its source from the `Map()` call, still open, and never read the
   list's bound. `D15940`'s filed witness caught it.
+- **A holder written in a generic is bounded at its place's instance.** `__run<U>(a: ((x: U) =>
+  U)[])` at `U = i32` bounds a list handed to it at `((x: i32) => i32)[]`. Two cells of lane T's
+  `d16361` named set caught it once master was merged in, and it closes
+  [D16143](../inventory/D16143.md) (`apt<T>(g: (x: T) => i32, …)` handed `pick1(true)`).
 - **The classes are built before mono only when the elaboration asked for them.** Building them
   for every compile ran the compiler's own L2 build out of GC heap. The L1 build passed, so only a
   two-level bisect found this.
