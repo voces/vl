@@ -739,7 +739,13 @@ export class Interp {
     const prog = parse(src);
     const env = new Env(null);
     installBuiltins(env);
-    this.execBlock(prog, env);
+    try {
+      this.execBlock(prog, env);
+    } catch (x) {
+      // E8.2: a bare `as` propagates null, which the module's top level has no function to return.
+      if (x instanceof NullOut) throw new TypeFault("a bare `as` failed at the top level, where nothing returns its null");
+      throw x;
+    }
     return this.out;
   }
 
@@ -1680,6 +1686,8 @@ export class Interp {
       return this.castFail(e, "not a member");
     }
     const k = t.name;
+    // T1.1/T1.3: `u8` is the one narrow width with a value domain; the others are storage only.
+    if (k === "u16" || k === "u32" || k === "i8" || k === "i16") throw new TypeFault(`\`${k}\` is not a value type`);
     if (typeof v === "boolean") v = v ? 1 : 0; // E8.5
     // T2.4: a constant operand takes the cast's target as its context, so `0xFFFFFFFF as i64`
     // is 4294967295; one the target cannot hold is a failed cast.
@@ -1691,7 +1699,11 @@ export class Interp {
     // 4.1 / D1890: `as f32` / `as f64` rounds an integer constant to the nearest float, once.
     if (v instanceof Lit && v.i !== null && !v.radix && (k === "f32" || k === "f64")) return k === "f64" ? new Flt(Number(v.i), 64) : new Flt(bigToF32(v.i), 32);
     if (v instanceof Lit && e.mode !== "as%") {
-      try { return litTo(v, k === "u8" || k === "u16" ? "i32" : k); } catch (x) { if (!(x instanceof LitFault)) throw x; return this.castFail(e, "not exact"); }
+      let r: Val;
+      try { r = litTo(v, k === "u8" ? "i32" : k); } catch (x) { if (!(x instanceof LitFault)) throw x; return this.castFail(e, "not exact"); }
+      // E8.3: `as u8` checks the 0..255 domain; a radix constant is its 32-bit pattern there.
+      if (k === "u8" && ((r as number) < 0 || (r as number) > 255)) return this.castFail(e, "not exact");
+      return r;
     }
     // D3053 ruling (A): under `as% i64` a radix literal, or a chain of negations over one, is the
     // constant its digits spell; another radix tree there has no ruling (D16494).
