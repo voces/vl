@@ -1046,14 +1046,22 @@ export class Interp {
         const c = this.asBool(this.eval(e.c, env, null), "if-condition");
         // E9.1 does not list `if`, so with no context its value is typed, not a constant.
         const v = c ? this.blockValue(e.t, env, exp) : e.f ? this.blockValue(e.f, env, exp) : VOID;
-        // A generic's erased parameter (`any`) is no context: the join settles here.
-        if (exp && !(exp.k === "name" && exp.name === "any")) return v instanceof Lit ? asJoin(v) : v;
         // T3.6 at an `if` join: a constant arm adapts to the other arm's type, read from its
         // declaration since that arm did not run; one that cannot widens the join.
         const other = c ? e.f : e.t;
         const ok = other && other.length ? other[other.length - 1] : null;
         const kOther = ok && ok.k === "expr" ? this.staticKind(ok.e, env) : null;
+        // A generic's erased parameter (`any`) is no context: the join settles here. With a
+        // context, a constant arm beside a typed one still takes that type when it fits.
+        if (exp && !(exp.k === "name" && exp.name === "any")) {
+          if (v instanceof Lit && kOther && joinFits(v, kOther)) { try { return litTo(v, kOther); } catch { /* the join */ } }
+          return v instanceof Lit ? asJoin(v) : v;
+        }
         if (v instanceof Lit) {
+          // A float arm makes the join a float context, where a radix arm is its digits' value (4.1).
+          if (v.radix && v.i !== null && !kOther && ok && ok.k === "expr" && isConstTree(ok.e) && treeHas(ok.e, "float")) {
+            return v.lone ? radixFloat(v.i, 64, false) : new Flt(Number(wrap64(v.i)), 64);
+          }
           if (!kOther && ok && ok.k === "expr" && isConstTree(ok.e)) return asJoin(v);
           if (!kOther) return litDefault(v);
           if (joinFits(v, kOther)) { try { return litTo(v, kOther); } catch { /* the default */ } }
@@ -1113,7 +1121,14 @@ export class Interp {
         // min, max and abs keep their operand's width (E2.7)
         if (e.f.k === "id" && ["min", "max", "abs"].includes(e.f.name) && !env.lookupFns(e.f.name)) {
           for (const a of e.args) { const k = this.staticKind(a.e, env); if (k) return k; }
-          return null;
+          // Over constants alone the call is still no constant (E9.1): it is typed at the
+          // arguments' default, which a literal beside it adopts (T3.6).
+          if (!e.args.length || !e.args.every((a) => isConstTree(a.e))) return null;
+          const v = e.args.map((a) => this.eval(a.e, env, null));
+          if (!v.every((x) => x instanceof Lit)) return null;
+          const ls = v as Lit[];
+          const ks = ls.map((l, i) => numKind(ls.length === 2 ? pairDefault(l, ls[1 - i]) : litDefault(l))!);
+          try { return ks.reduce((a, b) => wider(a, b)); } catch { return null; }
         }
         return one(this.declTy(e, env));
       case "un": return e.op === "-" || e.op === "~" ? this.staticKind(e.e, env) : null;
@@ -1232,16 +1247,31 @@ export class Interp {
     }
     // A constant operand takes its typed peer's type as its context (DECISIONS D3043: an operator
     // peer adopts the literal tree). A constant has no effects, so its side may run second.
+    // A shift of a constant by a variable count takes a peer's type as a constant does (Q8).
+    const peerTyped = (x: Expr) => isConstTree(x) || (x.k === "bin" && ["<<", ">>", ">>>"].includes(x.op) && isConstTree(x.l));
+    // Under an integer destination, a radix tree or a shifted constant beside a typed integer
+    // peer still takes the peer's width when its constant fits it (D3043); else the destination's.
+    const intExp = exp && (() => { try { const x = this.resolve(exp, env); return x.k === "name" && (x.name === "i32" || x.name === "i64"); } catch { return false; } })();
+    const atPeer = (x: Expr, k: string | null): boolean => {
+      if (!intExp || (k !== "i32" && k !== "i64")) return false;
+      const c = x.k === "bin" && ["<<", ">>", ">>>"].includes(x.op) && isConstTree(x.l) ? x.l : isConstTree(x) && treeHas(x, "radix") ? x : null;
+      if (!c) return false;
+      const v = this.eval(c, env, null);
+      return v instanceof Lit && litHolds(v, k);
+    };
     let l: Val, r: Val;
     const rExp = arithOp && !["<<", ">>", ">>>"].includes(op) ? exp : null;
-    if (arithOp && !exp && isConstTree(e.l) && !isConstTree(e.r)) {
+    if (arithOp && peerTyped(e.l) && !peerTyped(e.r) && (!exp || (intExp && !["<<", ">>", ">>>"].includes(op)))) {
       r = this.eval(e.r, env, rExp);
       const k = numKind(r);
-      l = this.eval(e.l, env, k ? { k: "name", name: k, args: [] } : null);
+      const kTy: Ty | null = k ? { k: "name", name: k, args: [] } : null;
+      l = this.eval(e.l, env, !exp ? kTy : atPeer(e.l, k) ? kTy : exp);
     } else {
       l = this.eval(e.l, env, arithOp ? exp : null);
       const k = numKind(l);
-      r = this.eval(e.r, env, rExp ?? (arithOp && !exp && k && isConstTree(e.r) && !["<<", ">>", ">>>"].includes(op) ? { k: "name", name: k, args: [] } : null));
+      const kTy: Ty | null = k ? { k: "name", name: k, args: [] } : null;
+      const shiftOp = ["<<", ">>", ">>>"].includes(op);
+      r = this.eval(e.r, env, arithOp && !shiftOp && !(l instanceof Lit) && atPeer(e.r, k) ? kTy : rExp ?? (arithOp && !exp && k && peerTyped(e.r) && !shiftOp ? kTy : null));
     }
     // E9.1: a float constant tree that adopts an `f32` peer folds in f32 arithmetic, whatever
     // destination is outside the operator. A tree is pure, so it is evaluated again.
