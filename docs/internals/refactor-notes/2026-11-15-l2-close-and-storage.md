@@ -51,4 +51,8 @@ ask was keyed by frame and by the owner's state:
   (`check_pins.vl`) and again after elaboration (`fnTagRedecide`, `emit_sections.vl`). It decides
   whether a function set is held as an id or as a closure, which is storage.
 
-The §10 resolution is pending lane S's written position.
+Lane S's reply, 2026-11-15, is quoted in §10:
+- S agrees with the storage-free scheme, and with storage in the instance key in principle.
+- Storage is decided by the tag-decision layer, not S's slot store.
+- The slot store's facts follow flow (set membership, calls per instance, written destinations),
+  not argument types alone.
