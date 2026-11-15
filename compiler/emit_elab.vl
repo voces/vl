@@ -21048,6 +21048,10 @@ type EplTables = {
   oneMemo: {[i32]: i32},
   // The call nodes a read leaves out of its call agreement (`eplSlotSig`'s omit).
   omit: i32[],
+  // While a reader asks what a slot is delivered at: the slot's own calls decide, not its sources'.
+  ownOnly: boolean,
+  // The list copies whose element flow is drawn, as `node|instance`.
+  copied: {[string]: boolean},
 }
 
 function eplFresh(): EplTables {
@@ -21079,6 +21083,8 @@ function eplFresh(): EplTables {
     reachMemo: Map(),
     oneMemo: Map(),
     omit: [],
+    copied: Map(),
+    ownOnly: false,
   }
 }
 
@@ -21580,6 +21586,14 @@ function eplMembersStar(p: i32): i32[] {
   out
 }
 
+// The element type of list `x`'s checked type; -1 where it is no list.
+function eplElemTyOf(x: i32): i32 {
+  const t = nodeTyIxOf(x)
+  const nt = if t >= 0 && t < T.tys.length { nonNullTy(t) } else { -1 }
+  const o = if nt >= 0 && nt < T.tys.length { tyAt(nt) } else { null }
+  if o is TyArray { tyElemOf(o) } else { -1 }
+}
+
 function eplStepOfRecv(recv: i32): string {
   const t = nodeTyIxOf(recv)
   const nt = if t >= 0 && t < T.tys.length { nonNullTy(t) } else { -1 }
@@ -21632,8 +21646,19 @@ function eplPlaceOf(x0: i32, depth: i32): i32 {
           eplStepOfRecv(cn.memObj),
         )
       }
+      // A copy is a list of its own whose elements the receiver's flow into.
       if m == "slice" || m == "filter" || m == "reverse" || m == "concat" {
-        return eplPlaceOf(cn.memObj, depth + 1)
+        const dst = eplRoot(x)
+        const ck = i32ToStr(x) + "|" + i32ToStr(EPL.k)
+        if dst >= 0 && !EPL.copied.has(ck) {
+          EPL.copied.set(ck, true)
+          eplEdgeTy(
+            eplChild(eplPlaceOf(cn.memObj, depth + 1), "e"),
+            eplChild(dst, "e"),
+            eplElemTyOf(cn.memObj),
+          )
+        }
+        return dst
       }
     }
     // A call result the elaboration already closed is built at that type, as a written one is.
@@ -21756,8 +21781,13 @@ function eplEdgeAt(u: i32) {
         if b >= 0 { eplEdge(eplChild(eplPlaceOf(u, 0), st), eplRoot(b), b) }
       } else if k == CW_UP_SPREAD {
         const lit = if cwIxCovers(up) && cwIxUpKind[up] == CW_UP_ELEM { cwIxUp[up] } else { -1 }
+        // A spread copies the elements: a function element flows, any other is shared.
         if lit >= 0 {
-          eplUnion(eplChild(eplPlaceOf(u, 0), "e"), eplChild(eplRoot(lit), "e"))
+          eplEdgeTy(
+            eplChild(eplPlaceOf(u, 0), "e"),
+            eplChild(eplRoot(lit), "e"),
+            eplElemTyOf(u),
+          )
         }
       } else if k == CW_UP_ARG && un is Call {
         const ai = cwIxUpAux[u]
@@ -22035,7 +22065,7 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
   if EPL.holder >= 0 && fnSlotHandedOpen(EPL.holder, path) { return -1 }
   // A copy of a value the elaboration already closed is built at that type: the nearest such
   // source is where the conversion happens, and what lies before it does not reach this leaf.
-  for c in eplReach(p, false) {
+  for c in if EPL.ownOnly { [] } else { eplReach(p, false) } {
     const bc = eplBoundOf(c)
     if bc >= 0 {
       eplDemandTy(p, bc, 0)
@@ -22054,7 +22084,7 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
   for a in cn.callArgs { ps.push(eplArgTy(one, a)) }
   // A copy converts nothing yet: every class whose functions reach this one is called at
   // the same signature, or the leaf stays open.
-  for c in eplReach(p, false) {
+  for c in if EPL.ownOnly { [] } else { eplReach(p, false) } {
     if !eplSigIs(eplOneCall(c), ps) { return -1 }
   }
   const ms = eplMembersStar(p)
@@ -22188,6 +22218,7 @@ function eplSlotSigAt(holder: i32, path: string[], k: i32, omit: i32[]): i32 {
   const t = elabSlotTyOf(nodeTyIxOf(h), path)
   EPL.holder = h
   EPL.omit = omit
+  EPL.ownOnly = true
   const one = eplOneCall(p)
   const r = if one < 0 {
     if one == -2 { -1 } else { one }
@@ -22197,6 +22228,7 @@ function eplSlotSigAt(holder: i32, path: string[], k: i32, omit: i32[]): i32 {
     -1
   }
   EPL.omit = []
+  EPL.ownOnly = false
   EPL.holder = h0
   EPL.k = k0
   if one >= 0 && r < 0 { -5 } else { r }
