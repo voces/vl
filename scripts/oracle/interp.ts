@@ -234,6 +234,9 @@ export function parseRat(s: string): [bigint, bigint] {
   return exp >= 0 ? [digits * 10n ** BigInt(exp), 1n] : [digits, 10n ** BigInt(-exp)];
 }
 
+// True while the constant tree initialising a binding annotated `f32` is evaluated (E9.1).
+let f32Fold = false
+
 function litArith(op: string, a: Lit, b: Lit): Val {
   // a radix literal meeting a float constant is the value its digits spell (T2.3); a tree is first
   // its bit pattern at the default width
@@ -265,13 +268,15 @@ function litArith(op: string, a: Lit, b: Lit): Val {
   } else {
     // E9.1 (owner ruling 2026-11-15): a float constant folds in IEEE, as at run time; an integer
     // operand converts to the nearest double first. JS numbers are IEEE doubles, `%` is `fmod`.
-    const x = a.f ?? Number(a.i), y = b.f ?? Number(b.i);
+    // The tree of a binding annotated `f32` folds in f32 arithmetic instead (`f32Fold`).
+    const at = f32Fold ? Math.fround : (v: number) => v;
+    const x = at(a.f ?? Number(a.i)), y = at(b.f ?? Number(b.i));
     switch (op) {
-      case "+": return new Lit(null, x + y, false);
-      case "-": return new Lit(null, x - y, false);
-      case "*": return new Lit(null, x * y, false);
-      case "/": return new Lit(null, x / y, false);
-      case "%": return new Lit(null, x % y, false);
+      case "+": return new Lit(null, at(x + y), false);
+      case "-": return new Lit(null, at(x - y), false);
+      case "*": return new Lit(null, at(x * y), false);
+      case "/": return new Lit(null, at(x / y), false);
+      case "%": return new Lit(null, at(x % y), false);
     }
   }
   throw new TypeFault(`operator ${op} on constants`);
@@ -627,7 +632,8 @@ export class Interp {
         }
         let v: Val = null;
         if (s.e) {
-          v = this.eval(s.e, env, s.ty);
+          f32Fold = !!s.ty && isConstTree(s.e) && this.isF32(s.ty, env);
+          try { v = this.eval(s.e, env, s.ty); } finally { f32Fold = false; }
           // T2.4: an unannotated literal `const` stays an exact constant; a `let` takes i32/f64.
           if (s.ty) v = this.deliver(v, s.ty, env, `binding '${s.name}'`);
           else if (v === VOID) throw new TypeFault(`binding '${s.name}' to a void value`);
@@ -1142,6 +1148,9 @@ export class Interp {
       this.store(target, v, env);
       return v;
     }
+  }
+  isF32(t: Ty, env: Env): boolean {
+    try { const r = this.resolve(t, env); return r.k === "name" && r.name === "f32"; } catch { return false; }
   }
   freeze(t: Expr, env: Env): Expr {
     if (t.k === "index") return { k: "index", e: { k: "val", v: this.eval(t.e, env, null) }, i: { k: "val", v: this.eval(t.i, env, null) } };
