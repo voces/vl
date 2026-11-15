@@ -7,8 +7,8 @@ compiler. The design and the rulings are in `docs/internals/property-access-desi
 ```vl
 type Color = new i32
 
-get r(self: Color): i32 { ((self as! i32) >> 16) & 255 }
-get g(self: Color): i32 { ((self as! i32) >> 8) & 255 }
+get r(self: Color): i32 { return ((self as! i32) >> 16) & 255 }
+get g(self: Color): i32 { return ((self as! i32) >> 8) & 255 }
 
 const c = 0x123456 as! Color
 print(c.r)   // 18
@@ -114,8 +114,8 @@ a step bound: no loop and no recursion, through every function it calls in turn.
 each function; you write nothing.
 
 ```vl
-function clamp01(x: f64): f64 { if x < 0.0 { 0.0 } else if x > 1.0 { 1.0 } else { x } }
-get level(self: Knob): f64 { clamp01(self.raw) }
+function clamp01(x: f64): f64 { return if x < 0.0 { 0.0 } else if x > 1.0 { 1.0 } else { x } }
+get level(self: Knob): f64 { return clamp01(self.raw) }
 ```
 
 A generic function is judged at the types the call uses: `same(self.n, 3)` over
@@ -179,7 +179,7 @@ getter over the row address, so the requirements' `stack[i].tt` works as written
 
 ```vl
 type RowAddr = new i32
-get tt(self: RowAddr): i32 { __load_i32__((self as! i32) + TValue.tt) }
+get tt(self: RowAddr): i32 { return __load_i32__((self as! i32) + TValue.tt) }
 
 print(st[3].tt)   // an add, then an i32.load
 ```

@@ -305,7 +305,7 @@ LITERALS, and its `_` arm is required:
 
 ```vl
 function len(id: i32) {
-  match id {
+  return match id {
     0x10 => 14          // any radix the lexer takes; `0x10` and `16` are the SAME arm
     0x12 | 0x13 => 30   // the same or-group every other vocabulary uses
     -1 => 99            // negative literals are patterns
