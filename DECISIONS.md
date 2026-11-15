@@ -9805,6 +9805,11 @@ tree read stays an editor reference.
   refused with E6.2's sentence (`4294967296 >> 65535`, `1 << 64`). An operand whose type is fixed,
   a declared `x: i32` or an `i32` destination (`const c: i32 = (-3) >>> (40 + 1)`), keeps E6.2's
   refusal for a count past its width. The count may be a literal or a constant tree (D16378).
+  A shift is typed at its left operand, and a count never types it: an untyped literal takes its
+  destination's or peer's width first, then a constant count's widening, so
+  `(0xFFFFFFFF << 31) << c` at an `i64` is -17179869184 whether `c` is `i32` or `i64`; a variable
+  count widens nothing (`1 << c` with `c: i64` is an `i32`), and `x <<= w` with `x: i32` and an
+  `i64` count is legal.
 * In a generic body, an `i64` operand beside a type-parameter operand records a constraint
   (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit operand it meets`),
   since the body alone cannot see the width (D2712, D3426);
