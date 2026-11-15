@@ -24,6 +24,7 @@ export class Lit {
   wideDec = false;
   join = false;
   derived = false; // computed by an operator, not written
+  lone = false; // a radix literal as written, not a tree of them (owner ruling 4.1 is about these)
 
   constructor(public i: bigint | null, public f: number | null, public radix: number | boolean, public q: [bigint, bigint] | null = null) {}
 }
@@ -120,8 +121,8 @@ function litTo(l: Lit, k: string): Val {
         if (l.radix) return wrap64(x);
         if (x < I64_MIN || x > I64_MAX) throw new LitFault(`literal typed from uses: constant ${x} overflows i64`);
         return x;
-      case "f64": return new Flt(Number(x), 64);
-      case "f32": return new Flt(Math.fround(Number(x)), 32);
+      case "f64": return l.radix && l.lone ? radixFloat(x, 64) : new Flt(Number(x), 64);
+      case "f32": return l.radix && l.lone ? radixFloat(x, 32) : new Flt(Math.fround(Number(x)), 32);
       case "u8": case "u16": case "u32": case "i8": case "i16": return litTo(l, "i32");
     }
   } else {
@@ -135,6 +136,11 @@ function litTo(l: Lit, k: string): Val {
     }
   }
   throw new TypeFault(`constant at ${k}`);
+}
+// T2.3 (owner ruling 4.1, revised): a radix literal in a float context is the value its digits
+// spell, rounded to the float; the bit-pattern reading is for integer contexts only.
+function radixFloat(u: bigint, w: 32 | 64): Flt {
+  return new Flt(w === 32 ? Math.fround(Number(u)) : Number(u), w);
 }
 function litDefault(l: Lit): Val {
   if (l.f !== null) return new Flt(l.f, 64);
@@ -212,6 +218,15 @@ function litHolds(l: Lit, k: string): boolean {
   return true;
 }
 
+// Owner ruling 4.3 (T3.6): a literal joined with a typed numeric value adopts that type when it
+// fits: an integer literal when the type holds it exactly, a float literal at f32 or f64.
+function joinFits(l: Lit, k: string): boolean {
+  if (!litHolds(l, k)) return false;
+  if (l.i === null || l.radix || (k !== "f32" && k !== "f64")) return true;
+  const n = k === "f32" ? Math.fround(Number(l.i)) : Number(l.i);
+  return Number.isFinite(n) && BigInt(n) === l.i;
+}
+
 function dblOp(op: string, x: number, y: number): number {
   return op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : op === "/" ? x / y : x % y;
 }
@@ -224,8 +239,10 @@ export function parseRat(s: string): [bigint, bigint] {
 }
 
 function litArith(op: string, a: Lit, b: Lit): Val {
-  // a radix tree meeting a float is first its bit pattern at the default width
-  if ((a.f !== null && b.radix) || (b.f !== null && a.radix)) return arith(op, a.radix ? litDefault(a) : a, b.radix ? litDefault(b) : b);
+  // a radix literal meeting a float constant is the value its digits spell (T2.3); a tree is first
+  // its bit pattern at the default width
+  const atFloat = (x: Lit) => x.lone ? radixFloat(x.i!, 64) : litDefault(x);
+  if ((a.f !== null && b.radix) || (b.f !== null && a.radix)) return arith(op, a.radix ? atFloat(a) : a, b.radix ? atFloat(b) : b);
   if (a.i !== null && b.i !== null) {
     const x = a.i, y = b.i, radix = Math.max(Number(a.radix), Number(b.radix));
     const L = (r: bigint) => { const l = new Lit(r, null, radix); l.wideDec = a.wideDec || b.wideDec; return l; };
@@ -823,6 +840,7 @@ export class Interp {
       case "int": {
         const l = new Lit(e.v, null, e.radix ? (e.v > 0xffffffffn ? 64 : 32) : 0);
         l.wideDec = !e.radix && e.v > BigInt(I32_MAX);
+        l.lone = !!e.radix;
         return l;
       }
       case "float": return new Lit(null, e.v, false, parseRat(e.raw));
@@ -932,7 +950,8 @@ export class Interp {
         const c = this.asBool(this.eval(e.c, env, null), "if-condition");
         // E9.1 does not list `if`, so with no context its value is typed, not a constant.
         const v = c ? this.blockValue(e.t, env, exp) : e.f ? this.blockValue(e.f, env, exp) : VOID;
-        if (exp) return v instanceof Lit ? asJoin(v) : v;
+        // A generic's erased parameter (`any`) is no context: the join settles here.
+        if (exp && !(exp.k === "name" && exp.name === "any")) return v instanceof Lit ? asJoin(v) : v;
         // T3.6 at an `if` join: a constant arm adapts to the other arm's type, read from its
         // declaration since that arm did not run; one that cannot widens the join.
         const other = c ? e.f : e.t;
@@ -941,14 +960,14 @@ export class Interp {
         if (v instanceof Lit) {
           if (!kOther && ok && ok.k === "expr" && isConstTree(ok.e)) return asJoin(v);
           if (!kOther) return litDefault(v);
-          if (litHolds(v, kOther)) { try { return litTo(v, kOther); } catch { /* the default */ } }
+          if (joinFits(v, kOther)) { try { return litTo(v, kOther); } catch { /* the default */ } }
           const d = litDefault(v), dk = numKind(d)!;
           return WIDENS[kOther]?.includes(dk) ? d : WIDENS[dk]?.includes(kOther) ? toKind(d, kOther) : d;
         }
         const kv = numKind(v);
         if (kv && ok && ok.k === "expr" && isConstTree(ok.e)) {
           const lit = this.eval(ok.e, env, null) as Lit;
-          if (!litHolds(lit, kv)) { const dk = numKind(litDefault(lit))!; if (WIDENS[kv]?.includes(dk)) return toKind(v, dk); }
+          if (!joinFits(lit, kv)) { const dk = numKind(litDefault(lit))!; if (WIDENS[kv]?.includes(dk)) return toKind(v, dk); }
         }
         return v;
       }
@@ -1026,12 +1045,12 @@ export class Interp {
   settleLits(xs: Val[]): Val[] {
     if (!xs.some((x) => x instanceof Lit)) return xs;
     const kinds = new Set(xs.filter((x) => !(x instanceof Lit)).map(numKind).filter((k) => k));
-    // T3.6: a literal element adapts to the join instead of widening it.
-    // With one typed member it takes that member when exact. With several, it keeps its default
-    // type, absorbed into a member that type widens into (T2.6). The second half matches the
-    // compiler and is an owner question: T3.6 does not say which member a literal adapts to.
+    // T3.6 (ruling 4.3): a literal element beside one typed member adopts it when it fits. With
+    // several members it keeps its default type, absorbed into a member that type widens into
+    // (T2.6); the ruling names one typed value, so that half follows today's compiler.
     const fit = (l: Lit) => {
-      if (kinds.size === 1) { try { return litTo(l, [...kinds][0]!); } catch { /* falls to the default */ } }
+      const k = kinds.size === 1 ? [...kinds][0]! : null;
+      if (k && joinFits(l, k)) { try { return litTo(l, k); } catch { /* falls to the default */ } }
       const d = litDefault(l), dk = numKind(d)!;
       if (kinds.has(dk)) return d;
       const into = WIDENS[dk]?.find((w) => kinds.has(w));
@@ -1075,13 +1094,15 @@ export class Interp {
         const k = numKind(l);
         if (!litR || !k) return l;
         const lit = this.eval(e.r, env, null) as Lit;
-        try { litTo(lit, k); return l; } catch { return toKind(l, wider(numKind(litDefault(lit))!, k)); }
+        if (joinFits(lit, k)) return l;
+        const dk = numKind(litDefault(lit))!;
+        return WIDENS[dk]?.includes(k) || WIDENS[k]?.includes(dk) ? toKind(l, wider(dk, k)) : l;
       }
       if (!litR) return this.eval(e.r, env, exp);
       const lit = this.eval(e.r, env, null) as Lit;
       const dl = this.declTy(e.l, env);
       const t = dl ? this.numTarget(lit, dl, env) : null;
-      if (t) { try { return litTo(lit, t); } catch { /* the join widens */ } }
+      if (t && joinFits(lit, t)) { try { return litTo(lit, t); } catch { /* the join widens */ } }
       return exp ? lit : litDefault(lit);
     }
     // A numeric context flows into both operands of arithmetic (a literal tree adopts it).
@@ -1344,10 +1365,10 @@ export class Interp {
     if (typeof v === "boolean") v = v ? 1 : 0; // E8.5
     // T2.4: a constant operand takes the cast's target as its context, so `0xFFFFFFFF as i64`
     // is 4294967295; one the target cannot hold is a failed cast.
-    if (v instanceof Lit && v.radix && (k === "f64" || k === "f32")) {
-      // T2.3 names i32 and i64 contexts only; the compiler gives f64 the zero-extended value
-      // and f32 the i32 pattern. An owner question, so no verdict.
-      throw new Unsupported("spec gap: a radix constant in a float context");
+    if (v instanceof Lit && v.radix && !v.lone && (k === "f64" || k === "f32")) {
+      // A radix tree at a float computes at 64 bits by owner ruling 4.2, which lane N implements
+      // in the compiler; until it lands the two disagree, so no verdict.
+      throw new Unsupported("spec gap: a radix constant tree in a float context (ruling 4.2 pending)");
     }
     // a radix tree as wide as i64 (a pattern over 32 bits, or a decimal leaf outside i32) is read
     // at i64 before an integer cast checks its range
