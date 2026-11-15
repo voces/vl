@@ -13,7 +13,7 @@ recorded at the binding (`notePendingNulList`, D6270), and at scope close each i
 element a callee wrote (`flushNulListPins`). A list's own element list was not walked, so the inner
 `[]` was left at the default.
 
-## Change (`check_side_rows`, net compiler lines +6; pin-helper delta 0)
+## Change (`check_side_rows`, net compiler lines +4; pin-helper delta 0)
 
 `notePendingNulList` walks a list whose element is closed into that element, at any depth up to
 its bound. A bound `[[]]` and `[[[]]]` take the callee's write, in either declaration order.
