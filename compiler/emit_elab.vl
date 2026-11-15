@@ -11231,23 +11231,17 @@ export function elabHoleGenFlowTy(argIx: i32, holder: i32): i32 {
   const vt = nodeTyIxOf(parenPeelIx(argIx))
   const vf = if vt >= 0 && vt < T.tys.length { tyAt(vt) } else { null }
   if !(vf is TyFunc) || !tyHasTyVar(vt) { return -1 }
-  const dl: i32[] = []
-  for t in elabSlotDeliveries(holder, path, -1) {
-    const ft = tyAt(t)
-    if ft is TyFunc && ft.fnParamTypes.length == vf.fnParamTypes.length {
-      dl.push(t)
-    }
-  }
+  // The slot's closed bound decides; else its one call, at that call's argument types.
+  const b = eplSlotBound(holder, path, -1)
+  if b == -2 { return -1 }
+  const bo = if b >= 0 { tyAt(b) } else { null }
   let ps: i32[] = []
   let cx = -1
-  if dl.length == 1 {
-    const ft = tyAt(dl[0])
-    if ft is TyFunc { ps = ft.fnParamTypes }
-  } else if dl.length == 0 {
-    cx = elabSlotOnlyCall(holder, path, ps)
-    if cx < 0 { return -1 }
+  if bo is TyFunc && bo.fnParamTypes.length == vf.fnParamTypes.length {
+    ps = bo.fnParamTypes
   } else {
-    return -1
+    cx = eplSlotOneCall(holder, path, -1, ps)
+    if cx < 0 { return -1 }
   }
   if ps.length == 0 || vf.fnParamTypes.length != ps.length { return -1 }
   const gN: string[] = []
@@ -16676,22 +16670,6 @@ function elabLitReturnedBy(lit: i32): i32 {
   -1
 }
 
-// The one call slot `path` of `d` is delivered at, open or closed (the calls `elabSlotDeliveries`
-// reaches), with its arguments' checked types pushed onto `tys`; -1 for none or for two.
-export function elabSlotOnlyCall(d: i32, path: string[], tys: i32[]): i32 {
-  elabCallSink = []
-  elabCallSinkOn = true
-  elabSlotDeliveries(d, path, -1)
-  elabCallSinkOn = false
-  const hits = elabCallSink
-  elabCallSink = []
-  if hits.length != 1 { return -1 }
-  const hn = nodeAt(hits[0])
-  if !(hn is Call) { return -1 }
-  for a in hn.callArgs { tys.push(nodeTyIxOf(a)) }
-  hits[0]
-}
-
 // The one closed argument tuple every call the value of `d` reaches as its callee is made at,
 // leaving out calls inside the functions `skip`, pushed onto `tys`; false for no such call, an open
 // argument, or two tuples.
@@ -22111,18 +22089,9 @@ function eplBuild() {
 // The one closed type slot `path` of `holder` (steps `e`, `v`, `f.<name>`) is delivered at in
 // instance `k` (-1 for the program): the bound of a class its value flows into. -1 for none, -2
 // where two differ.
-export function eplSlotBound(holder0: i32, path: string[], k: i32): i32 {
-  // A binding an instance minted after the write index answers through its source.
-  const holder = elabCellLitBinding(holder0)
-  if holder < 0 || holder >= cwIxCoveredLen() { return -1 }
-  if EPL.stale {
-    eplBuild()
-    EPL.stale = false
-  }
+export function eplSlotBound(holder: i32, path: string[], k: i32): i32 {
   const k0 = EPL.k
-  EPL.k = k
-  let p = eplRoot(holder)
-  for step in path { p = eplChild(p, step) }
+  const p = eplSlotPlace(holder, path, k)
   let one = -1
   if p >= 0 {
     for c in eplReach(p, true) {
@@ -22138,6 +22107,50 @@ export function eplSlotBound(holder0: i32, path: string[], k: i32): i32 {
   }
   EPL.k = k0
   one
+}
+
+// The one call through slot `path` of `holder` or a copy of it, in instance `k` (-1 for the
+// program), with its arguments' types at the call's instance pushed onto `tys`; -1 for none or two.
+export function eplSlotOneCall(
+  holder: i32,
+  path: string[],
+  k: i32,
+  tys: i32[],
+): i32 {
+  const k0 = EPL.k
+  const p = eplSlotPlace(holder, path, k)
+  let one = -1
+  if p >= 0 {
+    for ci in eplCallsStar(p) {
+      const c = EPL.callNode[ci]
+      if one >= 0 && c != EPL.callNode[one] {
+        EPL.k = k0
+        return -1
+      }
+      if one < 0 { one = ci }
+    }
+  }
+  const cn = if one >= 0 { nodeAt(EPL.callNode[one]) } else { null }
+  if cn is Call {
+    for a in cn.callArgs { tys.push(eplArgTy(one, a)) }
+  }
+  EPL.k = k0
+  if cn is Call { EPL.callNode[one] } else { -1 }
+}
+
+// The place of slot `path` of `holder` with the classes built and `EPL.k` set to `k`; -1 for a
+// binding minted after the write index, which answers through its source when it has one.
+function eplSlotPlace(holder0: i32, path: string[], k: i32): i32 {
+  const holder = elabCellLitBinding(holder0)
+  if holder < 0 || holder >= cwIxCoveredLen() { return -1 }
+  if EPL.stale {
+    eplBuild()
+    EPL.stale = false
+  }
+  EPL.k = k
+  let p = eplRoot(holder)
+  for step in path { p = eplChild(p, step) }
+  p
 }
 
 // The closed type holder `ix`'s value is built at in instance `k` (-1 for the program): its checked
