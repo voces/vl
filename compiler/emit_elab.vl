@@ -10292,6 +10292,7 @@ export function elabRun() {
   elabHoleLamsAt = -1
   elabTpDefaultsPrime()
   elabLateNames = []
+  eplAsked = false
   elabPinsClosedSet(false)
   elabCbRepKeys = Map()
   elabSigAltKeys = Map()
@@ -11252,23 +11253,19 @@ export function elabHoleGenFlowTy(argIx: i32, holder: i32): i32 {
   const vt = nodeTyIxOf(parenPeelIx(argIx))
   const vf = if vt >= 0 && vt < T.tys.length { tyAt(vt) } else { null }
   if !(vf is TyFunc) || !tyHasTyVar(vt) { return -1 }
-  const dl: i32[] = []
-  for t in elabSlotDeliveries(holder, path, -1) {
-    const ft = tyAt(t)
-    if ft is TyFunc && ft.fnParamTypes.length == vf.fnParamTypes.length {
-      dl.push(t)
-    }
-  }
+  // The slot's closed bound decides; else its one call, at that call's argument types.
+  const b = eplSlotBound(holder, path, -1)
+  if b == -2 { return -1 }
+  const bo = if b >= 0 { tyAt(b) } else { null }
   let ps: i32[] = []
   let cx = -1
-  if dl.length == 1 {
-    const ft = tyAt(dl[0])
-    if ft is TyFunc { ps = ft.fnParamTypes }
-  } else if dl.length == 0 {
-    cx = elabSlotOnlyCall(holder, path, ps)
-    if cx < 0 { return -1 }
+  if bo is TyFunc && bo.fnParamTypes.length == vf.fnParamTypes.length {
+    // A closed call through the slot at other types is a second delivery.
+    if !eplSlotCallsAt(holder, path, -1, bo.fnParamTypes) { return -1 }
+    ps = bo.fnParamTypes
   } else {
-    return -1
+    cx = eplSlotOneCall(holder, path, -1, ps)
+    if cx < 0 { return -1 }
   }
   if ps.length == 0 || vf.fnParamTypes.length != ps.length { return -1 }
   const gN: string[] = []
@@ -13814,14 +13811,16 @@ let elabSlotUnfacted: i32[] = []
 // Re-reads `elabBindingWholeTy` for each program-level holder `elabSlotFacts` left without a fact,
 // once the reach rows exist: a value built from a delivered bundle has its type only then.
 export function elabSlotBundleFacts() {
-  if elabSlotUnfacted.length == 0 { return 0 }
-  eplStaleAt()
-  for ix in elabSlotUnfacted {
-    if !elabSlotTys.has(elabSlotKey(ix, -1)) {
-      const ft = eplHolderTy(ix, -1)
-      if ft >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = ft }
+  if elabSlotUnfacted.length > 0 {
+    eplStaleAt()
+    for ix in elabSlotUnfacted {
+      if !elabSlotTys.has(elabSlotKey(ix, -1)) {
+        const ft = eplHolderTy(ix, -1)
+        if ft >= 0 { elabSlotTys[elabSlotKey(ix, -1)] = ft }
+      }
     }
   }
+  eplEnsure()
   0
 }
 
@@ -16695,22 +16694,6 @@ function elabLitReturnedBy(lit: i32): i32 {
     if parenPeelIx(v) == lit { return fd }
   }
   -1
-}
-
-// The one call slot `path` of `d` is delivered at, open or closed (the calls `elabSlotDeliveries`
-// reaches), with its arguments' checked types pushed onto `tys`; -1 for none or for two.
-export function elabSlotOnlyCall(d: i32, path: string[], tys: i32[]): i32 {
-  elabCallSink = []
-  elabCallSinkOn = true
-  elabSlotDeliveries(d, path, -1)
-  elabCallSinkOn = false
-  const hits = elabCallSink
-  elabCallSink = []
-  if hits.length != 1 { return -1 }
-  const hn = nodeAt(hits[0])
-  if !(hn is Call) { return -1 }
-  for a in hn.callArgs { tys.push(nodeTyIxOf(a)) }
-  hits[0]
 }
 
 // The one closed argument tuple every call the value of `d` reaches as its callee is made at,
@@ -21067,6 +21050,8 @@ type EplTables = {
   holder: i32,
   callNode: i32[],
   callKey: i32[],
+  // Per call, the fresh `const` holder its callee read out of when drawn (`eplCallRoot`).
+  callRoot: i32[],
   // The key count at the classes' last ask, and whether they are built for it: the build is
   // deferred to the first holder that needs it, and sees no key minted after the ask.
   limit: i32,
@@ -21085,6 +21070,12 @@ type EplTables = {
   // per class root, `eplOneCall`'s answer.
   reachMemo: {[i32]: i32[]},
   oneMemo: {[i32]: i32},
+  // The call nodes a read leaves out of its call agreement (`eplSlotSig`'s omit).
+  omit: i32[],
+  // While a reader asks what a slot is delivered at: the slot's own calls decide, not its sources'.
+  ownOnly: boolean,
+  // The list copies whose element flow is drawn, as `node|instance`.
+  copied: {[string]: boolean},
 }
 
 function eplFresh(): EplTables {
@@ -21104,6 +21095,7 @@ function eplFresh(): EplTables {
     holder: -1,
     callNode: [],
     callKey: [],
+    callRoot: [],
     limit: -1,
     stale: true,
     insts: Map(),
@@ -21115,6 +21107,9 @@ function eplFresh(): EplTables {
     repointed: Map(),
     reachMemo: Map(),
     oneMemo: Map(),
+    omit: [],
+    copied: Map(),
+    ownOnly: false,
   }
 }
 
@@ -21244,6 +21239,20 @@ function eplKeyOfFn(fd0: i32): i32 {
   -2
 }
 
+// Whether a reader built the classes during this compile's elaboration.
+let eplAsked = false
+
+// Rebuilds stale classes the elaboration asked for, so that a later reader (mono) sees them as
+// the elaboration left the program, before any rewrite folds a read away. A program whose
+// elaboration never asked is not built for the whole program here.
+function eplEnsure() {
+  if EPL.stale && eplAsked {
+    eplBuild()
+    EPL.stale = false
+  }
+  0
+}
+
 function eplStaleAt() {
   EPL.limit = ekDecl.length
   EPL.stale = true
@@ -21284,10 +21293,10 @@ function eplCallTarget(c: i32, fd: i32, k: i32): i32 {
   -2
 }
 
-// The instance the elaboration builds callback or function-value argument `x` at from instance `k`;
-// -1 for a function with no instances.
-function eplValueTarget(x: i32, k: i32): i32 {
-  if !eplInstanced(x) || !eplHasInst(x) { return eplKeyOfFn(x) }
+// The instance of function `fd` read at node `x` (the function itself for a lambda, the name for
+// a named one) in instance `k`.
+function eplValueTargetAt(x: i32, fd: i32, k: i32): i32 {
+  if !eplInstanced(fd) || !eplHasInst(fd) { return eplKeyOfFn(fd) }
   const row = elabValueKeys[x] ?? []
   let i = 0
   while i + 1 < row.length {
@@ -21356,6 +21365,7 @@ function eplRootK(n: i32, kk: i32): i32 {
   EPL.key.set(k, id)
   if id >= 0 && id < EPL.boundSrc.length && eplAnnotated(n) {
     EPL.boundSrc[id] = n
+    EPL.boundK[id] = kk
   }
   id
 }
@@ -21363,7 +21373,9 @@ function eplRootK(n: i32, kk: i32): i32 {
 // Whether holder `n` is written with an annotation, which bounds its whole class.
 function eplAnnotated(n: i32): boolean {
   const nd = if n >= 0 && n < P.nodes.length { nodeAt(n) } else { null }
-  (nd is LetDecl && nd.letType >= 0) || (nd is Param && nd.parType >= 0)
+  (nd is LetDecl && nd.letType >= 0)
+    || (nd is Param && nd.parType >= 0)
+    || (nd is FuncDecl && nd.fnRet >= 0)
 }
 
 // Class `r`'s bound: the closed type of its annotated holder or of a call result the elaboration
@@ -21371,31 +21383,28 @@ function eplAnnotated(n: i32): boolean {
 function eplBoundOf(r: i32): i32 {
   if r < 0 || r >= EPL.bound.length { return -1 }
   if EPL.bound[r] != -2 { return EPL.bound[r] }
+  EPL.bound[r] = -1
   const x = EPL.boundSrc[r]
-  if x < 0 {
-    // A place with no holder of its own takes the step of a bounded parent.
-    EPL.bound[r] = -1
-    let u = 0
-    while u < EPL.upPar[r].length {
-      const pb = eplBoundOf(eplFind(EPL.upPar[r][u]))
-      const st = if pb >= 0 { eplStepTy(pb, EPL.upStep[r][u]) } else { -1 }
-      if st >= 0 && !tyHasTyVar(st) && !tyReachesHole(st, 16) {
-        EPL.bound[r] = st
-        return st
-      }
-      u = u + 1
-    }
-    return -1
-  }
   const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
-  const te = if xn is Call { elabNodeTy(x, EPL.boundK[r]) } else { -1 }
+  // A call result, or a holder written in a generic, is typed at the place's instance.
+  const te = if xn is Call || EPL.boundK[r] >= 0 { elabNodeTy(x, EPL.boundK[r]) } else { -1 }
   const t = if te >= 0 { te } else if x >= 0 { nodeTyIxOf(x) } else { -1 }
-  const ok = t >= 0
-    && t < T.tys.length
-    && !tyHasTyVar(t)
-    && !tyReachesHole(t, 16)
-  EPL.bound[r] = if ok { t } else { -1 }
-  EPL.bound[r]
+  if t >= 0 && t < T.tys.length && !tyHasTyVar(t) && !tyReachesHole(t, 16) {
+    EPL.bound[r] = t
+    return t
+  }
+  // A place whose own holder is open (a `Map()` not yet typed) takes the step of a bounded parent.
+  let u = 0
+  while u < EPL.upPar[r].length {
+    const pb = eplBoundOf(eplFind(EPL.upPar[r][u]))
+    const st = if pb >= 0 { eplStepTy(pb, EPL.upStep[r][u]) } else { -1 }
+    if st >= 0 && !tyHasTyVar(st) && !tyReachesHole(st, 16) {
+      EPL.bound[r] = st
+      return st
+    }
+    u = u + 1
+  }
+  -1
 }
 
 function eplChild(p: i32, step: string): i32 {
@@ -21604,8 +21613,18 @@ function eplMembersStar(p: i32): i32[] {
   out
 }
 
+// The element type of list `x`'s checked type; -1 where it is no list.
+function eplElemTyOf(x: i32): i32 {
+  const t = nodeTyIxOf(x)
+  const nt = if t >= 0 && t < T.tys.length { nonNullTy(t) } else { -1 }
+  const o = if nt >= 0 && nt < T.tys.length { tyAt(nt) } else { null }
+  if o is TyArray { tyElemOf(o) } else { -1 }
+}
+
 function eplStepOfRecv(recv: i32): string {
-  const t = nodeTyIxOf(recv)
+  // A receiver an instance types its own way (a list at one call, a map at another) steps by it.
+  const te = if EPL.k >= 0 { elabNodeTy(recv, EPL.k) } else { -1 }
+  const t = if te >= 0 { te } else { nodeTyIxOf(recv) }
   const nt = if t >= 0 && t < T.tys.length { nonNullTy(t) } else { -1 }
   if nt >= 0 && nt < T.tys.length && tyAt(nt) is TyMap { return "v" }
   "e"
@@ -21656,8 +21675,19 @@ function eplPlaceOf(x0: i32, depth: i32): i32 {
           eplStepOfRecv(cn.memObj),
         )
       }
+      // A copy is a list of its own whose elements the receiver's flow into.
       if m == "slice" || m == "filter" || m == "reverse" || m == "concat" {
-        return eplPlaceOf(cn.memObj, depth + 1)
+        const dst = eplRoot(x)
+        const ck = i32ToStr(x) + "|" + i32ToStr(EPL.k)
+        if dst >= 0 && !EPL.copied.has(ck) {
+          EPL.copied.set(ck, true)
+          eplEdgeTy(
+            eplChild(eplPlaceOf(cn.memObj, depth + 1), "e"),
+            eplChild(dst, "e"),
+            eplElemTyOf(cn.memObj),
+          )
+        }
+        return dst
       }
     }
     // A call result the elaboration already closed is built at that type, as a written one is.
@@ -21780,8 +21810,13 @@ function eplEdgeAt(u: i32) {
         if b >= 0 { eplEdge(eplChild(eplPlaceOf(u, 0), st), eplRoot(b), b) }
       } else if k == CW_UP_SPREAD {
         const lit = if cwIxCovers(up) && cwIxUpKind[up] == CW_UP_ELEM { cwIxUp[up] } else { -1 }
+        // A spread copies the elements: a function element flows, any other is shared.
         if lit >= 0 {
-          eplUnion(eplChild(eplPlaceOf(u, 0), "e"), eplChild(eplRoot(lit), "e"))
+          eplEdgeTy(
+            eplChild(eplPlaceOf(u, 0), "e"),
+            eplChild(eplRoot(lit), "e"),
+            eplElemTyOf(u),
+          )
         }
       } else if k == CW_UP_ARG && un is Call {
         const ai = cwIxUpAux[u]
@@ -21797,7 +21832,7 @@ function eplEdgeAt(u: i32) {
           const pi = if cn.memProp == "reduce" { 1 } else { 0 }
           if lf is FuncDecl && pi < lf.fnParams.length {
             const rp = eplPlaceOf(cn.memObj, 0)
-            const lk = eplValueTarget(lam, EPL.k)
+            const lk = eplValueTargetAt(parenPeelIx(u), lam, EPL.k)
             eplEdge(
               eplChild(rp, eplStepOfRecv(cn.memObj)),
               eplRootK(lf.fnParams[pi], lk),
@@ -21834,6 +21869,7 @@ function eplEdgeAt(u: i32) {
           if p < 0 { return 0 }
           EPL.callNode.push(up)
           EPL.callKey.push(EPL.k)
+          EPL.callRoot.push(eplCallRoot(up))
           EPL.calls[p].push(EPL.callNode.length - 1)
         }
       }
@@ -21852,6 +21888,8 @@ function eplArgTy(ci: i32, a: i32): i32 {
 // The call record whose closed argument types every call through class `c` agrees on; -1 when
 // nothing calls it, -3 for an open argument, -4 for two signatures.
 function eplOneCall(c: i32): i32 {
+  // A read that leaves calls out is answered fresh.
+  if EPL.omit.length > 0 || EPL.ownOnly { return eplOneCallGo(c) }
   const rc = eplFind(c)
   const m = EPL.oneMemo.get(rc)
   if m != null { return m }
@@ -21860,9 +21898,95 @@ function eplOneCall(c: i32): i32 {
   r
 }
 
+// The `const` binding of a fresh `Map()`, list or record literal that a call's callee reads out
+// of, through `const` reads and element or field reads; -1 when the chain passes anything else.
+function eplCallRoot(call: i32): i32 {
+  const cn = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { null }
+  if !(cn is Call) { return -1 }
+  let x = parenPeelIx(cn.callFn)
+  let d = -1
+  let i = 0
+  while i < 16 && x >= 0 && x < P.nodes.length {
+    const n = nodeAt(x)
+    if n is Ident {
+      d = identDeclOf(x)
+      const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+      if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+      const ix = parenPeelIx(dn.letInit)
+      const ii = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+      if !(ii is Ident || ii is Index || ii is Member || ii is OptMember) {
+        return if eplFreshLit(ix) { d } else { -1 }
+      }
+      x = ix
+    } else if n is Index {
+      x = parenPeelIx(n.idxArr)
+    } else if n is Member {
+      x = parenPeelIx(n.memObj)
+    } else if n is OptMember {
+      x = parenPeelIx(n.omObj)
+    } else {
+      return -1
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether `x` builds a new container: `Map()`, or a list or record literal with no spread.
+function eplFreshLit(x: i32): boolean {
+  const n = nodeAt(x)
+  if n is Call {
+    const f = parenPeelIx(n.callFn)
+    const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+    return n.callArgs.length == 0
+      && fn is Ident
+      && fn.identName == "Map"
+      && identDeclOf(f) < 0
+  }
+  const es = if n is ArrayLit { n.arrElems } else if n is ObjLit { n.objFields } else { return false }
+  for e in es {
+    if e >= 0 && e < P.nodes.length && nodeAt(e) is Spread { return false }
+  }
+  true
+}
+
+// Whether call key `ck` lies under an instance of instance `k`'s declaration other than `k`.
+function eplUnderSibling(ck: i32, k: i32): boolean {
+  if k < 0 || k >= ekDecl.length { return false }
+  let c = ck
+  let g = 0
+  while c >= 0 && c < ekDecl.length && g < 64 {
+    if ekDecl[c] == ekDecl[k] { return c != k }
+    c = if c < ekParent.length { ekParent[c] } else { -1 }
+    g = g + 1
+  }
+  false
+}
+
+// Whether a slot's own-calls reading is of a `const` binding, whose calls it can tell apart.
+function eplOwnHolderConst(): boolean {
+  const hn = if EPL.ownOnly && EPL.holder >= 0 { nodeAt(EPL.holder) } else { null }
+  hn is LetDecl && hn.letKw == "const"
+}
+
 function eplOneCallGo(c: i32): i32 {
   let one = -1
+  const hc = eplOwnHolderConst()
   for ci in eplCallsStar(c) {
+    if i32ListHas(EPL.omit, EPL.callNode[ci]) { continue }
+    // A slot read in one instance does not see the calls another instance of its frame makes.
+    if EPL.ownOnly && eplUnderSibling(EPL.callKey[ci], EPL.k) { continue }
+    // A slot's own calls leave out one made through another fresh `const` holder unified with it.
+    if hc {
+      const r = EPL.callRoot[ci]
+      if (
+        r >= 0
+        && r != EPL.holder
+        && eplFind(eplRoot(r)) == eplFind(eplRoot(EPL.holder))
+      ) {
+        continue
+      }
+    }
     const cn = nodeAt(EPL.callNode[ci])
     if !(cn is Call) { return -2 }
     for a in cn.callArgs {
@@ -21970,6 +22094,30 @@ function eplReadsContainer(p: i32): boolean {
 }
 
 // `eplUnderFrame`, demanding member `d` at `ps` under the frame when it has no instance there.
+// Nested member `d`'s first instance, under any parent, whose parameter nodes are typed `ps` (an
+// unrecorded one does not disagree), where every such instance returns the same; -1 otherwise.
+function eplAnyFrameInst(d: i32, ps: i32[]): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if elabTopFn(d) || !(dn is FuncDecl) || dn.fnParams.length != ps.length {
+    return -1
+  }
+  let one = -1
+  for k in EPL.insts.get(d) ?? [] {
+    let at = true
+    let i = 0
+    while i < ps.length && at {
+      const q = elabNodeTy(dn.fnParams[i], k)
+      if q >= 0 && !tySame(q, ps[i]) { at = false }
+      i = i + 1
+    }
+    if at {
+      if one >= 0 && !tySame(elabResultOf(one), elabResultOf(k)) { return -1 }
+      if one < 0 { one = k }
+    }
+  }
+  one
+}
+
 function eplFrameMember(d: i32, ps: i32[]): i32 {
   // The instance mono reads for the slot's fact is demanded with it, while the run is open.
   if EPL.k >= 0 && !elabTopFn(d) && !elabRunDone { elabResultAtParams(d, ps) }
@@ -21981,6 +22129,8 @@ function eplFrameMember(d: i32, ps: i32[]): i32 {
     const so = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
     if so is TyFunc && elabTysSame(so.fnParamTypes, ps) { return k }
   }
+  // Read at the program, a member nested in instances answers where they agree at `ps`.
+  if EPL.k < 0 && EPL.ownOnly { return eplAnyFrameInst(d, ps) }
   if EPL.k < 0 || elabTopFn(d) { return -1 }
   for k in EPL.insts.get(d) ?? [] {
     if k >= 0 && k < ekParent.length && ekParent[k] == EPL.k { return -1 }
@@ -22056,7 +22206,7 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
   if EPL.holder >= 0 && fnSlotHandedOpen(EPL.holder, path) { return -1 }
   // A copy of a value the elaboration already closed is built at that type: the nearest such
   // source is where the conversion happens, and what lies before it does not reach this leaf.
-  for c in eplReach(p, false) {
+  for c in if EPL.ownOnly { [] } else { eplReach(p, false) } {
     const bc = eplBoundOf(c)
     if bc >= 0 {
       eplDemandTy(p, bc, 0)
@@ -22075,7 +22225,7 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
   for a in cn.callArgs { ps.push(eplArgTy(one, a)) }
   // A copy converts nothing yet: every class whose functions reach this one is called at
   // the same signature, or the leaf stays open.
-  for c in eplReach(p, false) {
+  for c in if EPL.ownOnly { [] } else { eplReach(p, false) } {
     if !eplSigIs(eplOneCall(c), ps) { return -1 }
   }
   const ms = eplMembersStar(p)
@@ -22092,7 +22242,8 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
     eplDemandAt(m, ps)
     // A member copied in from an upstream class may answer by its instance under the frame.
     const own = i32ListHas(EPL.members[eplFind(p)], m)
-    const mu = if own || (path.length == 0 && !eplReadsContainer(p)) { -1 } else { eplFrameMember(elabSrcDecl(m), ps) }
+    // A slot's own-calls reading takes a nested member's instance under the frame at any path.
+    const mu = if own || (path.length == 0 && !eplReadsContainer(p) && !EPL.ownOnly) { -1 } else { eplFrameMember(elabSrcDecl(m), ps) }
     const mk = if mu >= 0 { mu } else { elabKeyAtPins(elabSrcDecl(m), noNames, noTys, ps, -1) }
     // A member whose own signature is closed at `ps` answers by it.
     const so0 = eplOwnSigAt(elabSrcDecl(m), ps)
@@ -22122,6 +22273,7 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
 
 // Builds the place classes over the elaborated program as it stands: every instance settled so far.
 function eplBuild() {
+  eplAsked = true
   const limit = EPL.limit
   EPL = eplFresh()
   EPL.limit = limit
@@ -22132,18 +22284,9 @@ function eplBuild() {
 // The one closed type slot `path` of `holder` (steps `e`, `v`, `f.<name>`) is delivered at in
 // instance `k` (-1 for the program): the bound of a class its value flows into. -1 for none, -2
 // where two differ.
-export function eplSlotBound(holder0: i32, path: string[], k: i32): i32 {
-  // A binding an instance minted after the write index answers through its source.
-  const holder = elabCellLitBinding(holder0)
-  if holder < 0 || holder >= cwIxCoveredLen() { return -1 }
-  if EPL.stale {
-    eplBuild()
-    EPL.stale = false
-  }
+export function eplSlotBound(holder: i32, path: string[], k: i32): i32 {
   const k0 = EPL.k
-  EPL.k = k
-  let p = eplRoot(holder)
-  for step in path { p = eplChild(p, step) }
+  const p = eplSlotPlace(holder, path, k)
   let one = -1
   if p >= 0 {
     for c in eplReach(p, true) {
@@ -22159,6 +22302,181 @@ export function eplSlotBound(holder0: i32, path: string[], k: i32): i32 {
   }
   EPL.k = k0
   one
+}
+
+// The closed function type slot `path` of `holder` is delivered at in instance `k`: its bound, else
+// the one signature the calls through its class agree on (calls in `omit` left out) at its members'
+// instances; -1 uncalled, -3 an open argument, -4 two signatures, -5 no closed type at the calls.
+export function eplSlotSig(
+  holder: i32,
+  path: string[],
+  k: i32,
+  omit: i32[],
+): i32 {
+  // A slot in an instanced function, read for every instance, answers where all of them agree.
+  if k < 0 {
+    const ks = eplFrameKeysOf(holder)
+    if ks.length > 0 {
+      let one = -1
+      for kk in ks {
+        const r = eplSlotSigAt(holder, path, kk, omit)
+        if r < 0 { return r }
+        if one >= 0 && !tySame(one, r) { return -4 }
+        one = r
+      }
+      return one
+    }
+  }
+  eplSlotSigAt(holder, path, k, omit)
+}
+
+// The instance keys of the instanced function `holder` sits in; empty where its frame is the
+// program.
+function eplFrameKeysOf(holder0: i32): i32[] {
+  const holder = eplSrcHolder(holder0)
+  const none: i32[] = []
+  if holder < 0 { return none }
+  if EPL.stale {
+    eplBuild()
+    EPL.stale = false
+  }
+  const fd = if nodeAt(holder) is FuncDecl { holder } else { recEnclosingFn(holder) }
+  const fr = eplFrameOf(fd)
+  if fr < 0 || !eplInstanced(fr) { return none }
+  EPL.insts.get(fr) ?? none
+}
+
+function eplSlotSigAt(holder: i32, path: string[], k: i32, omit: i32[]): i32 {
+  const b = eplSlotBound(holder, path, k)
+  if b >= 0 { return b }
+  if b == -2 { return -4 }
+  const k0 = EPL.k
+  const h0 = EPL.holder
+  const p = eplSlotPlace(holder, path, k)
+  if p < 0 {
+    EPL.k = k0
+    return -1
+  }
+  const h = eplSrcHolder(holder)
+  // The classes see a captured binding at its written type; the capture rewrite types it a cell.
+  const t0 = elabSlotTyOf(nodeTyIxOf(h), path)
+  const to = if t0 >= 0 && t0 < T.tys.length { tyAt(t0) } else { null }
+  const cell = path.length == 0 && (cboxCellDecls[cboxDeclKey(h)] ?? 0) == 1
+  const t = if cell && to is TyArray { tyElemOf(to) } else { t0 }
+  EPL.holder = h
+  EPL.omit = omit
+  EPL.ownOnly = true
+  const one = eplOneCall(p)
+  const r = if one < 0 {
+    if one == -2 { -1 } else { one }
+  } else if t >= 0 && t < T.tys.length && (tyAt(t) is TyFunc || tyAt(t) is TyVar) {
+    // A hole-typed slot, such as a list of an open parameter, takes its members' signature.
+    eplRebuildLeaf(p, t, path)
+  } else {
+    -1
+  }
+  EPL.omit = []
+  EPL.ownOnly = false
+  EPL.holder = h0
+  EPL.k = k0
+  if one >= 0 && r < 0 { -5 } else { r }
+}
+
+// The one call through slot `path` of `holder` or a copy of it, in instance `k` (-1 for the
+// program), with its arguments' types at the call's instance pushed onto `tys`; -1 for none or two.
+export function eplSlotOneCall(
+  holder: i32,
+  path: string[],
+  k: i32,
+  tys: i32[],
+): i32 {
+  const k0 = EPL.k
+  const p = eplSlotPlace(holder, path, k)
+  let one = -1
+  // A written type stops the delivery: a copy into an annotated holder adds no call.
+  for c in if p >= 0 { eplReach(p, true) } else { [] } {
+    const src = if c >= 0 && c < EPL.boundSrc.length { EPL.boundSrc[c] } else { -1 }
+    if src >= 0 && eplAnnotated(src) {
+      EPL.k = k0
+      return -1
+    }
+  }
+  if p >= 0 {
+    for ci in eplCallsStar(p) {
+      const c = EPL.callNode[ci]
+      if one >= 0 && c != EPL.callNode[one] {
+        EPL.k = k0
+        return -1
+      }
+      if one < 0 { one = ci }
+    }
+  }
+  const cn = if one >= 0 { nodeAt(EPL.callNode[one]) } else { null }
+  if cn is Call {
+    for a in cn.callArgs { tys.push(eplArgTy(one, a)) }
+  }
+  EPL.k = k0
+  if cn is Call { EPL.callNode[one] } else { -1 }
+}
+
+// Whether every call through slot `path` of `holder` or a copy, in instance `k`, whose arguments
+// are all closed is made at `ps` (each argument widened from its literal).
+export function eplSlotCallsAt(
+  holder: i32,
+  path: string[],
+  k: i32,
+  ps: i32[],
+): boolean {
+  const k0 = EPL.k
+  const p = eplSlotPlace(holder, path, k)
+  let ok = true
+  if p >= 0 {
+    for ci in eplCallsStar(p) {
+      const cn = nodeAt(EPL.callNode[ci])
+      if ok && cn is Call && cn.callArgs.length == ps.length {
+        let closed = true
+        let same = true
+        let i = 0
+        while i < cn.callArgs.length {
+          const t = eplArgTy(ci, cn.callArgs[i])
+          if t < 0 || t >= T.tys.length || tyHasTyVar(t) { closed = false }
+          if closed && !tySame(widenLitTy(t), widenLitTy(ps[i])) {
+            same = false
+          }
+          i = i + 1
+        }
+        if closed && !same { ok = false }
+      }
+    }
+  }
+  EPL.k = k0
+  ok
+}
+
+// The holder the write index knows for `h0`: a capture cell's binding, and a binding an instance
+// cloned after the index its source; -1 where none is covered.
+function eplSrcHolder(h0: i32): i32 {
+  let h = elabCellLitBinding(h0)
+  if h >= cwIxCoveredLen() {
+    const o = declOrigOf(h)
+    h = if o >= 0 { o } else { nodeSrc[h] ?? -1 }
+  }
+  if h < 0 || h >= cwIxCoveredLen() { -1 } else { h }
+}
+
+// The place of slot `path` of `holder` with the classes built and `EPL.k` set to `k`; -1 for a
+// binding minted after the write index, which answers through its source when it has one.
+function eplSlotPlace(holder0: i32, path: string[], k: i32): i32 {
+  const holder = eplSrcHolder(holder0)
+  if holder < 0 { return -1 }
+  if EPL.stale {
+    eplBuild()
+    EPL.stale = false
+  }
+  EPL.k = k
+  let p = eplRoot(holder)
+  for step in path { p = eplChild(p, step) }
+  p
 }
 
 // The closed type holder `ix`'s value is built at in instance `k` (-1 for the program): its checked
