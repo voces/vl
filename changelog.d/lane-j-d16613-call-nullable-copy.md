@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **D16613 closed:** a spread of a maker's fresh list of nullable records beside a wider record part (`[...mk(), { x: 2.5 }]`, `mk` returning `[{ x: 1 }, null]`) now runs. The list copy converts each record and keeps each null, on the one copy path. **D16616 closed** by the same rule: a maker called more than once and delivered at a wider nullable-record list (`const v: ({ x: f64 } | null)[] = mk()`, or as an argument) passed the check and built an invalid module. Filed D16615: a spread alone of a maker's list into an annotated wider list (`const v: { x: f64 }[] = [...mk()]`) is refused, though the call delivered whole copies.
