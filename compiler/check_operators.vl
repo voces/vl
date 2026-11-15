@@ -389,6 +389,13 @@ import {
   widenLitTy,
 } from "./check_relate_core"
 import {
+  deadArmNote,
+  neverIsArm,
+  neverIsArmTest,
+  neverIsMsg,
+  neverIsNode,
+  neverIsNote,
+  neverIsSeenReset,
   nhLink,
   recordDeadNullTest,
   recordDeadTest,
@@ -2693,6 +2700,75 @@ function isListFitsWhenEmpty(chk: i32, own: i32): boolean {
   tyAt(chk) is TyArray && tyAt(own) is TyArray
 }
 
+// Refuses `n` at `ix`, a test that can never match `objTy`. A test no narrowing made impossible
+// is noted, so the program's end can make the refusal a warning and its arm dead.
+function isNeverWarn(
+  n: IsExpr,
+  ix: i32,
+  objTy: i32,
+  chkTy: i32,
+  inUnion: boolean,
+) {
+  const why = if inUnion { "' is not a variant of " } else { "' can never match a value of type " }
+  const msg = "`is` check type '" + n.isVariant + why + tyToStr(objTy)
+  tErr(msg, ix)
+  const st = operandDeclaredTy(n.isObj)
+  if st >= 0 && tyMembersMeet(st, chkTy) { return 0 }
+  neverIsNote(ix, msg)
+}
+
+// At the program's end, each never-matching test whose refusal survived is a warning instead,
+// tested as `never`, which the emitter answers false, and each arm it guards is dead (D16047).
+export function settleNeverIsTests() {
+  let i = 0
+  while i < neverIsNode.length {
+    const ix = neverIsNode[i]
+    let at = -1
+    let k = 0
+    while k < T.diags.length {
+      if T.diags[k].tat == ix && T.diags[k].tmsg == neverIsMsg[i] { at = k }
+      k = k + 1
+    }
+    if at >= 0 {
+      const kept: TDiag[] = []
+      let d = 0
+      while d < T.diags.length {
+        if d != at { kept.push(T.diags[d]) }
+        d = d + 1
+      }
+      T.diags = kept
+      recordDeadTest(ix, neverIsMsg[i] + ", so this test is always false here")
+      if ix < isVarTyIxCap {
+        while isVarTyIx.length <= ix { isVarTyIxPush(-1) }
+        isVarTyIxSetAt(ix, TY_NEVER)
+      }
+      let a = 0
+      while a < neverIsArm.length {
+        if neverIsArmTest[a] == ix {
+          deadArmNote(neverIsArm[a])
+          recordDeadTest(
+            neverIsArm[a],
+            "this branch can never run (its `is` test can never match)",
+          )
+        }
+        a = a + 1
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Clears the never-matching tests for a new program.
+export function neverIsReset() {
+  neverIsNode.clear()
+  neverIsMsg.clear()
+  neverIsArm.clear()
+  neverIsArmTest.clear()
+  neverIsSeenReset()
+  0
+}
+
 // The type operand `op` is declared at, or `cur`, its type here, where no narrowing moved it.
 function isOperandDeclTy(op: i32, cur: i32): i32 {
   const d = operandDeclaredTy(op)
@@ -2956,22 +3032,9 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
             + jwBadMsg,
           ix,
         )
-      } else if inUnion {
-        tErr(
-          "`is` check type '"
-            + n.isVariant
-            + "' is not a variant of "
-            + tyToStr(objTy),
-          ix,
-        )
       } else {
-        tErr(
-          "`is` check type '"
-            + n.isVariant
-            + "' can never match a value of type "
-            + tyToStr(objTy),
-          ix,
-        )
+        // A test that can never match is a warning, and its arm reads the operand as `never`.
+        isNeverWarn(n, ix, objTy, chkTy, inUnion)
       }
     } else {
       if isAlwaysAtPin(n.isObj, objTy, chkTy) { elabCapAlwaysTestNote() }
