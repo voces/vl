@@ -344,6 +344,7 @@ import {
   cexLitPeel,
   cmpF32LitAdopts,
   intLitLexemeOf,
+  intLitMisfitAtFloat,
   isExactF64IntLitExpr,
   isF32AdoptingLitExpr,
   isFloatLitExpr,
@@ -389,6 +390,13 @@ import {
   widenLitTy,
 } from "./check_relate_core"
 import {
+  deadArmNote,
+  neverIsArm,
+  neverIsArmTest,
+  neverIsMsg,
+  neverIsNode,
+  neverIsNote,
+  neverIsSeenReset,
   nhLink,
   recordDeadNullTest,
   recordDeadTest,
@@ -407,6 +415,7 @@ import {
   fieldStorageEq,
   mapTwinTestMsg,
   mixesNumeric,
+  recEqSide,
   widerNumeric,
   xrepListPair,
 } from "./check_ty_relate"
@@ -1384,18 +1393,6 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   return TY_BOOL
 }
 
-// The record a `==` operand of type `ty` compares as: `ty` itself, or a nullable's inner record;
-// -1 for anything else.
-function recEqSide(ty: i32): i32 {
-  if ty < 0 || ty >= T.tys.length { return -1 }
-  const inner = nonNullTy(ty)
-  if inner >= 0 && inner < T.tys.length && tyAt(inner) is TyObj {
-    inner
-  } else {
-    -1
-  }
-}
-
 // `l == r` over two records of one field set stored apart, rewritten in place to
 // `{ const $el = l; const $er = r; $el.f == $er.f && … }` under a null guard for a nullable
 // side, so each field pair reaches its own `==` and a nested pair is rewritten in turn (D16394).
@@ -1608,7 +1605,7 @@ function checkBinCmpTail(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     ) {
       // Mixed numerics may be compared when one side widens to the other; the f32-with-a-literal
       // pair is admitted separately (`cmpF32LitAdopts`) so comparison agrees with arithmetic's `+`.
-      tErr(numScalarMixMsg(op, olt, ort), ix)
+      tErr(floatPeerMixMsg(n, op, olt, ort), ix)
     }
     return TY_BOOL
   }
@@ -1716,7 +1713,7 @@ function checkBinNumTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
       nlAsgTgt = nlCmpdTgt
       nlAsgGot = rt
     }
-    tErr(numScalarMixMsg(op, lt, rt), ix)
+    tErr(floatPeerMixMsg(n, op, lt, rt), ix)
     nlAsgTgt = -1
     return TY_ERR
   }
@@ -1731,6 +1728,17 @@ function checkBinNumTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
     return rt
   }
   return lt
+}
+
+// The refusal of `op` over `lt` and `rt`: an integer literal beside a float that does not hold its
+// value exactly is refused as that constant, radix or decimal (owner ruling 4.1), anything else
+// as the mixed pair.
+function floatPeerMixMsg(n: BinExpr, op: string, lt: i32, rt: i32): string {
+  const r = intLitMisfitAtFloat(n.binRight, lt)
+  if r != "" { return r }
+  const l = intLitMisfitAtFloat(n.binLeft, rt)
+  if l != "" { return l }
+  numScalarMixMsg(op, lt, rt)
 }
 
 // Whether operand type `t` can constrain a call. A function type whose only type variables are
@@ -2694,6 +2702,75 @@ function isListFitsWhenEmpty(chk: i32, own: i32): boolean {
   tyAt(chk) is TyArray && tyAt(own) is TyArray
 }
 
+// Refuses `n` at `ix`, a test that can never match `objTy`. A test no narrowing made impossible
+// is noted, so the program's end can make the refusal a warning and its arm dead.
+function isNeverWarn(
+  n: IsExpr,
+  ix: i32,
+  objTy: i32,
+  chkTy: i32,
+  inUnion: boolean,
+) {
+  const why = if inUnion { "' is not a variant of " } else { "' can never match a value of type " }
+  const msg = "`is` check type '" + n.isVariant + why + tyToStr(objTy)
+  tErr(msg, ix)
+  const st = operandDeclaredTy(n.isObj)
+  if st >= 0 && tyMembersMeet(st, chkTy) { return 0 }
+  neverIsNote(ix, msg)
+}
+
+// At the program's end, each never-matching test whose refusal survived is a warning instead,
+// tested as `never`, which the emitter answers false, and each arm it guards is dead (D16047).
+export function settleNeverIsTests() {
+  let i = 0
+  while i < neverIsNode.length {
+    const ix = neverIsNode[i]
+    let at = -1
+    let k = 0
+    while k < T.diags.length {
+      if T.diags[k].tat == ix && T.diags[k].tmsg == neverIsMsg[i] { at = k }
+      k = k + 1
+    }
+    if at >= 0 {
+      const kept: TDiag[] = []
+      let d = 0
+      while d < T.diags.length {
+        if d != at { kept.push(T.diags[d]) }
+        d = d + 1
+      }
+      T.diags = kept
+      recordDeadTest(ix, neverIsMsg[i] + ", so this test is always false here")
+      if ix < isVarTyIxCap {
+        while isVarTyIx.length <= ix { isVarTyIxPush(-1) }
+        isVarTyIxSetAt(ix, TY_NEVER)
+      }
+      let a = 0
+      while a < neverIsArm.length {
+        if neverIsArmTest[a] == ix {
+          deadArmNote(neverIsArm[a])
+          recordDeadTest(
+            neverIsArm[a],
+            "this branch can never run (its `is` test can never match)",
+          )
+        }
+        a = a + 1
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Clears the never-matching tests for a new program.
+export function neverIsReset() {
+  neverIsNode.clear()
+  neverIsMsg.clear()
+  neverIsArm.clear()
+  neverIsArmTest.clear()
+  neverIsSeenReset()
+  0
+}
+
 // The type operand `op` is declared at, or `cur`, its type here, where no narrowing moved it.
 function isOperandDeclTy(op: i32, cur: i32): i32 {
   const d = operandDeclaredTy(op)
@@ -2726,7 +2803,7 @@ function isRecvMemberOf(objTy: i32, t: i32): i32 {
   if objTy < 0 || objTy >= T.tys.length || t < 0 || t >= T.tys.length {
     return t
   }
-  const o = T.tys[objTy]
+  const o = tyAt(objTy)
   if !(o is TyUnion) || !isClosedRecord(t) { return t }
   let found = -1
   for m in o.uMembers {
@@ -2743,7 +2820,7 @@ function isRecvMemberOf(objTy: i32, t: i32): i32 {
 function isClosedRecord(t: i32): boolean {
   t >= 0
     && t < T.tys.length
-    && T.tys[t] is TyObj
+    && tyAt(t) is TyObj
     && !tyHasHole(t)
     && !tyHasTyVar(t)
 }
@@ -2957,22 +3034,9 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
             + jwBadMsg,
           ix,
         )
-      } else if inUnion {
-        tErr(
-          "`is` check type '"
-            + n.isVariant
-            + "' is not a variant of "
-            + tyToStr(objTy),
-          ix,
-        )
       } else {
-        tErr(
-          "`is` check type '"
-            + n.isVariant
-            + "' can never match a value of type "
-            + tyToStr(objTy),
-          ix,
-        )
+        // A test that can never match is a warning, and its arm reads the operand as `never`.
+        isNeverWarn(n, ix, objTy, chkTy, inUnion)
       }
     } else {
       if isAlwaysAtPin(n.isObj, objTy, chkTy) { elabCapAlwaysTestNote() }
