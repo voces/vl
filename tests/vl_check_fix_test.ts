@@ -543,3 +543,63 @@ fixCase(
   'import { mk, Level } from "./world"\nfunction depth(l: Level) { return l.n }\n' +
     "print(depth(mk()))\n",
 );
+
+// ---- the return rule: a block body returns a value only through `return` -------------------
+
+fixCase(
+  "a discarded pure tail, and one in parentheses, gets the `return` the warning names (A2)",
+  {
+    "main.vl": "function f(n: i32) {\n  const x = n + 1\n  x\n}\nfunction g(n: i32) {\n  (n * 2)\n}\n" +
+      "print(f(1) + g(2))\n",
+  },
+  "function f(n: i32) {\n  const x = n + 1\n  return x\n}\nfunction g(n: i32) {\n  return (n * 2)\n}\n" +
+    "print(f(1) + g(2))\n",
+);
+
+fixCase(
+  "a value tail where the result or a callback's context wants a value gets its `return` (A3)",
+  {
+    "main.vl": "function g(n: i32): i32 {\n  const y = n + 2\n  y * 3\n}\n" +
+      "const xs = [1, 2].map((x) => {\n  x * 10\n})\nprint(g(1) + xs[1])\n",
+  },
+  "function g(n: i32): i32 {\n  const y = n + 2\n  return y * 3\n}\n" +
+    "const xs = [1, 2].map((x) => {\n  return x * 10\n})\nprint(g(1) + xs[1])\n",
+);
+
+fixCase(
+  "a caller using a function that discards its last call writes that function's `return`, once",
+  {
+    "main.vl": "function compute(x: i32): i32 { return x * 2 }\nfunction get(x: i32) {\n  compute(x)\n}\n" +
+      "print(get(3))\nconst v = get(1) + 2\nprint(v)\n",
+  },
+  "function compute(x: i32): i32 { return x * 2 }\nfunction get(x: i32) {\n  return compute(x)\n}\n" +
+    "print(get(3))\nconst v = get(1) + 2\nprint(v)\n",
+);
+
+Deno.test({
+  name: "vl-check-fix: a callee in another file of the run gets its `return`, and the run is clean",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_fix_rr_" });
+    try {
+      const lib = "export function compute(x: i32): i32 { return x * 2 }\n" +
+        "export function get(x: i32) {\n  compute(x)\n}\n";
+      await Deno.writeTextFile(`${dir}/lib.vl`, lib);
+      await Deno.writeTextFile(`${dir}/main.vl`, 'import { get } from "./lib"\nprint(get(3))\n');
+      // Named alone, the caller's file reports the callee and leaves it be.
+      const one = await fix(`${dir}/main.vl`);
+      if (one.code === 0) throw new Error(`want the refusal, got a clean run:\n${one.err}`);
+      if ((await Deno.readTextFile(`${dir}/lib.vl`)) !== lib) {
+        throw new Error("a file outside the run was edited");
+      }
+      // Over the directory, the callee's file takes the edit and the caller re-checks clean.
+      const r = await fix(dir);
+      if (r.code !== 0) throw new Error(`--fix over the directory exited ${r.code}:\n${r.err}`);
+      const want = lib.replace("  compute(x)", "  return compute(x)");
+      const after = await Deno.readTextFile(`${dir}/lib.vl`);
+      if (after !== want) throw new Error(`lib.vl: want\n${want}\ngot\n${after}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
