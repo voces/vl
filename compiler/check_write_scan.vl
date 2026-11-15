@@ -5,16 +5,7 @@
 // halves that read the type arena; nothing here reads a type or the scope chain.
 // This module imports `./ast`, `./symbols`, `./listutil` and `./check_suggest`.
 import { nodeTyIxOf } from "./check_node_tys"
-import {
-  T,
-  TyArray,
-  TyFunc,
-  TyLit,
-  TyMap,
-  TyPrim,
-  tyAt,
-  tyHasHole,
-} from "./check_types"
+import { T, TyArray, TyLit, TyMap, TyPrim, tyAt } from "./check_types"
 import {
   ArrayLit,
   AsExpr,
@@ -85,11 +76,15 @@ import { demangleName } from "./check_suggest"
 // A top-level function's name to its `FuncDecl` arena index, so a forward call can infer the
 // callee on demand and a call site here can name its callee. The checker fills and resets it.
 export let fnDeclIx: {[string]: i32} = Map()
-// Whether every write of `let` declaration `bd` is a statement of the block that declares it,
-// storing the name of a function declaration or a read of another `let`, and no function nested in
-// that frame names it: each read then follows one most recent write in straight-line order, and
-// none waits for a call.
-export function cwLetWritesStraight(bd: i32): boolean {
+// Whether every write of `let` `bd` is a statement of its declaring block storing a function's
+// name or a `let`'s read, and no nested function names it, so each read follows one most recent
+// write. A read handed to a call pushes its destination's annotation node and the part stored
+// (`CW_DST_*`) onto `dstAnn` and `dstPart`, for the caller to judge.
+export function cwLetWritesStraight(
+  bd: i32,
+  dstAnn: i32[],
+  dstPart: i32[],
+): boolean {
   const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
   if !(bn is LetDecl) || !cwWritesNamedFn(bn.letInit) { return false }
   cwIxBuild()
@@ -100,15 +95,13 @@ export function cwLetWritesStraight(bd: i32): boolean {
   while cwOccNext(ow) {
     const r = ow.row
     if cwIxKind[r] != CW_OCC_CALL && cwIxFr[r] != fr { return false }
-    // A read handed to an open parameter is bound to it at the whole set, whose slots serve each
-    // type the callee calls it at; a closed function type holds the one function read (D16182).
     const u = cwIxNode[r]
     if (
       cwIxKind[r] == CW_OCC_USE
       && cwIxCovers(u)
       && cwIxUpKind[u] == CW_UP_ARG
     ) {
-      if !cwArgToClosedFnParam(u) { return false }
+      if !cwArgDstAnn(u, dstAnn, dstPart) { return false }
     }
     if cwIxKind[r] == CW_OCC_ASG {
       const at = cwIxNode[r]
@@ -122,20 +115,48 @@ export function cwLetWritesStraight(bd: i32): boolean {
   true
 }
 
-// Whether call argument `u` is delivered to a parameter of a non-generic callee annotated with a
-// closed function type; false where the callee, the parameter or its type is not known.
-function cwArgToClosedFnParam(u: i32): boolean {
+// The part of a destination annotation a call argument is stored at: the annotation itself, its
+// list element (`.push`) or its map value (`.set`).
+export const CW_DST_WHOLE = 0
+export const CW_DST_ELEM = 1
+export const CW_DST_VAL = 2
+
+// Pushes the annotation node and part call argument `u` is stored at: a non-generic callee's
+// annotated parameter, or the element a `.push` or the value a `.set` stores into a `let` or
+// `const` with a written type. False where none is written.
+function cwArgDstAnn(u: i32, dstAnn: i32[], dstPart: i32[]): boolean {
   const up = cwIxUp[u]
   const n = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
   if !(n is Call) || hasNamedArgs(n.callArgNames) { return false }
+  const ai = cwIxUpAux[u]
+  const cf = if n.callFn >= 0 && n.callFn < P.nodes.length { nodeAt(n.callFn) } else { null }
+  if cf is Member {
+    const part = if cf.memProp == "push" && ai == 0 { CW_DST_ELEM } else if cf.memProp == "set" && ai == 1 { CW_DST_VAL } else { -1 }
+    const ann = if part >= 0 { cwWrittenAnnOf(cf.memObj) } else { -1 }
+    if ann >= 0 {
+      dstAnn.push(ann)
+      dstPart.push(part)
+      return true
+    }
+  }
   const cd = cwCalleeDeclOf(n.callFn)
   const cn = if cd >= 0 && cd < P.nodes.length { nodeAt(cd) } else { null }
   if !(cn is FuncDecl) || cn.fnTyParams.length > 0 { return false }
-  const p = cwParamOfDecl(cd, cwIxUpAux[u] + cwCalleeArgOff(n.callFn))
+  const p = cwParamOfDecl(cd, ai + cwCalleeArgOff(n.callFn))
   const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
   if !(pn is Param) || pn.parType < 0 { return false }
-  const t = nodeTyIxOf(pn.parType)
-  t >= 0 && t < T.tys.length && tyAt(t) is TyFunc && !tyHasHole(t)
+  dstAnn.push(pn.parType)
+  dstPart.push(CW_DST_WHOLE)
+  true
+}
+
+// The annotation node of the `let` or `const` the bare name `x` reads, or -1.
+function cwWrittenAnnOf(x: i32): i32 {
+  const p = cwPeel(x)
+  if p < 0 || p >= P.nodes.length || !(nodeAt(p) is Ident) { return -1 }
+  const d = identDeclOf(p)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if dn is LetDecl { dn.letType } else { -1 }
 }
 
 // Whether `v` is the name of a function declaration or a read of a `let`, which a narrowed read
