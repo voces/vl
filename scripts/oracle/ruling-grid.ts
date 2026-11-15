@@ -34,6 +34,10 @@ export function grid(): Case[] {
     store("loop", "let t = 3\nconst xs: f64[] = [0.25, 0.5]\nfor x in xs { t = t + x }\nprint(t)\nprint(kind(t))\n", "3.75\nf64"),
     store("i64_literal", "let t = 9000000000\nt = 0.5\nprint(kind(t))\n", "f64"),
     store("param", "function f(x: f32) {\n  let t = 0\n  t = x\n  print(kind(t))\n}\nf(1.5)\n", "f32"),
+    // D16490: a float literal beside `t` adopts its `f32`, and a float-literal `let` stored only `f32` is `f32`
+    store("f32_then_literal", "const f: f32 = 1.5\nlet t = 0\nt = f\nt = t - 0.1\nprint(t)\nprint(kind(t))\n", "1.399999976158142\nf32"),
+    store("f32_then_compound", "const f: f32 = 1.5\nlet t = 0\nt = f\nt -= 0.25\nprint(kind(t))\n", "f32"),
+    store("float_init_f32", "const f: f32 = 1.5\nlet t = 0.0\nt = f\nprint(t - 0.1)\nprint(kind(t))\n", "1.399999976158142\nf32"),
     dest("witness", SEL + "const k: (x: f64) => f64 = sel(gid)\nprint(k(1.5))\n", "1.5"),
     dest("string", SEL + 'const k: (x: string) => string = sel(gid)\nprint(k("ab"))\n', "ab"),
     dest("i64", SEL + "const k: (x: i64) => i64 = sel(gid)\nprint(k(3000000000))\n", "3000000000"),
