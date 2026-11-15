@@ -22,7 +22,7 @@ const log = (m: string) => logs.push(m);
 // keyed by the resolved `util.vl` path — mirrors the symbol suite's import test
 // so the specifier resolves identically.
 const entry = 'import { add } from "./util"\nprint(add(1, 2))\n';
-const util = "export function add(a: i32, b: i32): i32 {\n  a + b\n}\n";
+const util = "export function add(a: i32, b: i32): i32 {\n  return a + b\n}\n";
 const read = (key: string) => (key.endsWith("util.vl") ? util : undefined);
 
 Deno.test({
