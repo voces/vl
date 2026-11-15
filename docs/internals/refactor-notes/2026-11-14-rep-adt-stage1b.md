@@ -66,8 +66,14 @@ bit 2.
     `fz_a_*`: a record beside a function), which the scan's two-records rule excluded.
 
 **The change.**
-- Elaboration's prime walks every node type to depth 4 (`elabBoxedUnionsInto`) and counts a
-  value box holding a record beside any other member (`elabBoxesARecord`).
+- Elaboration's prime walks every node type to depth 4 (`elabBoxedUnionsInto`). At a written
+  annotation (a `TypeRef` node) it counts a value box holding a record beside any other member
+  (`elabBoxesARecord`). At an inferred type it keeps the two-distinct-records rule.
+  - The annotation-only limit is the measured one. Counting the wide rule at an inferred type
+    broke `closures/void-seeded-let-written-value-fn-called-at-two-types.vl` and D15031
+    (`runs` → emit reject). There, the call tuples `{ a: 1 }` and `3` make an inferred
+    `{a: i32} | i32` that is never a box row, because the generic is instanced per call type,
+    so the primed arm had no row.
 - `repTyIsVariant` reads bits 1 and 4 only, and a bit-2 registration no longer drops the tree.
 - `mintVariantRows` still keeps its rows, which `repVariantShapeRowOf` reads for which row,
   not whether it is an arm.
@@ -75,8 +81,19 @@ bit 2.
 **Result.**
 - Self-build: byte-identical (fixpoint). Rebuilds fall from 70 to 12. The 9 remaining variant
   drops are bit 4, elaboration's pre-emit set applied lazily.
-- Corpus, all 12,013 cells built by the seed before and after: 0 exit codes changed and 0 module
-  bytes changed. The probe finds 0 emitter-only arms.
+- Corpus, all 12,029 cells: built by a seed of the master commit this branch merges (itself a
+  fixpoint) and by this branch's seed. 0 exit codes changed and 0 module bytes changed. The probe
+  finds 0 emitter-only arms. **No byte movers.**
+
+**Cost** (same seed pair):
+
+| | |
+|---|---|
+| net compiler lines | +106: `emit_elab.vl` +74 (the walk and the wide rule), `emit_rep.vl` +29 (`RNoValue` and its arms, the arm probe), `emit_vk_shadow.vl` +3, `lint.vl` 0 |
+| pin-helper delta | 0 (baseline 908) |
+| guest fuel (`plumb-shape-cost.vl`) | main 9,020,596,426 → 9,041,958,578 (+0.24%), tail 6,535,300,926 → 6,550,678,944 (+0.24%): the prime's nested walk over every node type |
+| peak live heap | main 120,257 → 120,061 KiB (−196), tail 84,308 → 84,104 KiB (−204): fewer tree rebuilds |
+| seed size | 6,873,417 → 6,875,227 bytes (+0.03%) |
 
 What remains on the variant axis during emit:
 - The bit-1 and bit-4 drops, which are pre-emit facts applied lazily when the bits are first read.
