@@ -1,0 +1,944 @@
+// The IR lowering (ir-design-2026-11.md §1.6) for I1's node set, and the shadow's dual emit: a
+// covered function's IR is lowered to a code entry, which is compared with the legacy one
+// byte for byte, beside its statement spans. A temp goes back onto the stack at its one use,
+// which holds only when the temps are consumed in their definition order; the lowering
+// checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
+// through the plain byte writers into its own buffer and leaves the emitter's state as found.
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  LoopVar,
+  MatchExpr,
+  Member,
+  Node,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+  nodeAt,
+} from "./ast"
+import {
+  IrFn,
+  IrNode,
+  OImm,
+  OStr,
+  OVar,
+  Opnd,
+  PrimOp,
+  RCall,
+  RCallHost,
+  RCallRef,
+  RCast,
+  RCellGet,
+  RCellNew,
+  RFnId,
+  RGetField,
+  RGlobalGet,
+  RListGet,
+  RListLen,
+  RListNew,
+  RMakeClo,
+  RMakeList,
+  RMakeRec,
+  RMapOp,
+  RPrimOp,
+  RStrOp,
+  RTagOf,
+  RTest,
+  Rhs,
+  SAssign,
+  SBlock,
+  SBoundsCheck,
+  SBr,
+  SCellSet,
+  SDrop,
+  SEffect,
+  SGlobalSet,
+  SIf,
+  SLet,
+  SListSet,
+  SLoop,
+  SReturn,
+  SSetField,
+  SSwitch,
+  STrap,
+  irFnNew,
+  irSigOf,
+  repIsNoValue,
+  repPrim,
+} from "./ir"
+import { wSLEB, wTarget, wU8, wULEB } from "./emit_bytes"
+import { userGlobalIdx, userGlobalPlain } from "./wasmEmit"
+import {
+  cloLiftWriteCount,
+  emitFnSpanEnd,
+  emitFnSpanKind,
+  emitFnSpanNode,
+  emitFnSpanStart,
+  fRetVoid,
+  gImports,
+} from "./emit_state"
+
+// The function being lowered, the definitions of its temps, and the state of one walk.
+let lw: IrFn = irFnNew(-1, "")
+let lwMiss = ""
+let lwTempRhs: Rhs[] = []
+let lwTempDef: boolean[] = []
+let lwTempUsed: boolean[] = []
+// Locals a valued `if` left on the stack, read once as a temp is, and the out the arm being
+// written ends by producing.
+let lwStackVal: boolean[] = []
+let lwArmOut = -1
+// The temps the operands being written consumed, in the order their values reach the stack.
+let lwSeq: i32[] = []
+// The open control frames, innermost last: a block or loop label, or -1 for an `if`.
+let lwFrames: i32[] = []
+// Statement spans: rows opened at a node and closed after another, by the node ids.
+let lwSpanOpen: i32[] = []
+let lwSpanAt: i32[] = []
+let lwRowAst: i32[] = []
+let lwRowFrom: i32[] = []
+let lwRowTo: i32[] = []
+
+function miss(why: string) {
+  if lwMiss == "" { lwMiss = why }
+  0
+}
+
+// The SLEB128 of an i64, as `i64.const` writes it.
+function wSLEB64v(v0: i64) {
+  let v = v0
+  let more = true
+  while more {
+    const byte = (v & 127) as% i32
+    v = v >> 7
+    if (v == 0 && (byte & 64) == 0) || (v == -1 && (byte & 64) != 0) {
+      more = false
+      wU8(byte)
+    } else {
+      wU8(byte | 128)
+    }
+  }
+  0
+}
+
+// The low `n` bytes of `v`, least significant first: a float constant's IEEE image.
+function wBitsLE(v0: i64, n: i32) {
+  let v = v0
+  let i = 0
+  while i < n {
+    wU8((v & 255) as% i32)
+    v = v >>> 8
+    i = i + 1
+  }
+  0
+}
+
+function varSlot(v: i32): i32 {
+  if v < 0 || v >= lw.irVars.length { return -1 }
+  lw.irVars[v].vSlot
+}
+
+function isTemp(v: i32): boolean {
+  v >= 0 && v < lw.irVars.length && lw.irVars[v].vKind == "temp"
+}
+
+// Writes operand `o`: a variable's `local.get`, an immediate's constant, or a temp's own
+// right-hand side, written here at its one use.
+function opnd(o: Opnd) {
+  match o {
+    OVar => {
+      const v = o.ov
+      if v >= 0 && v < lwStackVal.length && lwStackVal[v] {
+        if lwTempUsed[v] { return miss("non-stack temp: used twice") }
+        lwTempUsed[v] = true
+        lwSeq.push(v)
+        return 0
+      }
+      if isTemp(v) {
+        if !lwTempDef[v] { return miss("temp used before its definition") }
+        if lwTempUsed[v] { return miss("non-stack temp: used twice") }
+        lwTempUsed[v] = true
+        rhs(lwTempRhs[v], false)
+        lwSeq.push(v)
+        return 0
+      }
+      const s = varSlot(v)
+      if s < 0 { return miss("unmapped slot") }
+      wU8(0x20)
+      wULEB(s)
+    }
+    OImm => imm(o)
+    OStr => miss("string operand")
+  }
+}
+
+function imm(o: OImm) {
+  const p = repPrim(o.oiRep)
+  if p == null { return miss("immediate rep") }
+  const ps: string = p
+  if ps == "i32" || ps == "bool" {
+    wU8(0x41)
+    return wSLEB(o.oiBits as% i32)
+  }
+  if ps == "i64" {
+    wU8(0x42)
+    return wSLEB64v(o.oiBits)
+  }
+  if ps == "f32" {
+    wU8(0x43)
+    return wBitsLE(o.oiBits, 4)
+  }
+  if ps == "f64" {
+    wU8(0x44)
+    return wBitsLE(o.oiBits, 8)
+  }
+  miss("immediate at " + ps)
+}
+
+// The opcode of `op` over primitive `p`, or -1 where wasm has none (a float `rem`, an int `neg`).
+function primOpcode(op: PrimOp, p: string): i32 {
+  if p == "i32" || p == "bool" {
+    return match op {
+      "add" => 0x6a
+      "sub" => 0x6b
+      "mul" => 0x6c
+      "div" => 0x6d
+      "divu" => 0x6e
+      "rem" => 0x6f
+      "remu" => 0x70
+      "and" => 0x71
+      "or" => 0x72
+      "xor" => 0x73
+      "shl" => 0x74
+      "shr" => 0x75
+      "shru" => 0x76
+      "eq" => 0x46
+      "ne" => 0x47
+      "lt" => 0x48
+      "ltu" => 0x49
+      "gt" => 0x4a
+      "gtu" => 0x4b
+      "le" => 0x4c
+      "leu" => 0x4d
+      "ge" => 0x4e
+      "geu" => 0x4f
+      "not" => 0x45
+      "neg" => -1
+    }
+  }
+  if p == "i64" {
+    return match op {
+      "add" => 0x7c
+      "sub" => 0x7d
+      "mul" => 0x7e
+      "div" => 0x7f
+      "divu" => 0x80
+      "rem" => 0x81
+      "remu" => 0x82
+      "and" => 0x83
+      "or" => 0x84
+      "xor" => 0x85
+      "shl" => 0x86
+      "shr" => 0x87
+      "shru" => 0x88
+      "eq" => 0x51
+      "ne" => 0x52
+      "lt" => 0x53
+      "ltu" => 0x54
+      "gt" => 0x55
+      "gtu" => 0x56
+      "le" => 0x57
+      "leu" => 0x58
+      "ge" => 0x59
+      "geu" => 0x5a
+      "not" | "neg" => -1
+    }
+  }
+  if p == "f32" {
+    return match op {
+      "add" => 0x92
+      "sub" => 0x93
+      "mul" => 0x94
+      "div" => 0x95
+      "eq" => 0x5b
+      "ne" => 0x5c
+      "lt" => 0x5d
+      "gt" => 0x5e
+      "le" => 0x5f
+      "ge" => 0x60
+      "neg" => 0x8c
+      "divu" | "rem" | "remu" | "and" | "or" | "xor" | "shl" | "shr" | "shru" | "ltu" | "gtu" | "leu" | "geu" | "not" => -1
+    }
+  }
+  if p == "f64" {
+    return match op {
+      "add" => 0xa0
+      "sub" => 0xa1
+      "mul" => 0xa2
+      "div" => 0xa3
+      "eq" => 0x61
+      "ne" => 0x62
+      "lt" => 0x63
+      "gt" => 0x64
+      "le" => 0x65
+      "ge" => 0x66
+      "neg" => 0x9a
+      "divu" | "rem" | "remu" | "and" | "or" | "xor" | "shl" | "shr" | "shru" | "ltu" | "gtu" | "leu" | "geu" | "not" => -1
+    }
+  }
+  -1
+}
+
+function primOp(r: RPrimOp) {
+  const a = r.poArgs
+  if a.length == 0 { return miss("operandless op") }
+  const p = repPrim(opRepOf(a[0]))
+  if p == null { return miss("op over a non-primitive") }
+  const ps: string = p
+  // A negated integer literal is the literal's own negative constant.
+  if r.poOp == "neg" && (ps == "i32" || ps == "i64") {
+    const x = a[0]
+    if x is OImm {
+      const neg: Opnd = { oiRep: x.oiRep, oiBits: 0 - x.oiBits }
+      return opnd(neg)
+    }
+    // Legacy's `0 - x`.
+    if ps == "i32" {
+      wU8(0x41)
+      wU8(0)
+      opnd(x)
+      wU8(0x6b)
+    } else {
+      wU8(0x42)
+      wU8(0)
+      opnd(x)
+      wU8(0x7d)
+    }
+    return 0
+  }
+  for x in a { opnd(x) }
+  const code = primOpcode(r.poOp, ps)
+  if code < 0 { return miss(r.poOp + " over " + ps) }
+  wU8(code)
+  0
+}
+
+function opRepOf(o: Opnd): i32 {
+  match o {
+    OVar => if o.ov >= 0 && o.ov < lw.irVars.length { lw.irVars[o.ov].vRep } else { -1 }
+    OImm => o.oiRep
+    OStr => -1
+  }
+}
+
+// Writes a call's operands, then the call, or its tail form when `tail`.
+function call(c: RCall, tail: boolean) {
+  for a in c.caArgs { opnd(a) }
+  wU8(if tail { 0x12 } else { 0x10 })
+  wULEB(gImports + c.caCallee)
+  0
+}
+
+function rhs(r: Rhs, tail: boolean) {
+  match r {
+    RPrimOp => primOp(r)
+    RCall => call(r, tail)
+    RGlobalGet => {
+      if !userGlobalPlain(r.ggSym, false) {
+        return miss("global read with a guard or a fold")
+      }
+      wU8(0x23)
+      wULEB(userGlobalIdx(r.ggSym))
+    }
+    RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListGet | RListLen | RMapOp | RStrOp | RMakeClo | RFnId | RCellNew | RCellGet => miss("rhs outside I1")
+  }
+}
+
+// The depth a branch to `label` crosses from the innermost frame, or -1.
+function brDepth(label: i32): i32 {
+  let i = lwFrames.length - 1
+  while i >= 0 {
+    if lwFrames[i] == label { return lwFrames.length - 1 - i }
+    i = i - 1
+  }
+  -1
+}
+
+// Whether `o` is the immediate `true`.
+function isTrue(o: Opnd): boolean {
+  match o {
+    OImm => repPrim(o.oiRep) == "bool" && o.oiBits == 1
+    OVar | OStr => false
+  }
+}
+
+// Writes `o` as a condition, then checks that it consumed exactly the temps `pending` defined.
+function cond(o: Opnd, pending: i32[]) {
+  lwSeq = []
+  opnd(o)
+  settle(pending)
+}
+
+// The stack-order precondition: the temps a node's operands consumed are the ones its body
+// defined since the previous node, in definition order.
+function settle(pending: i32[]) {
+  if lwSeq.length != pending.length {
+    miss("non-stack temp: out of order")
+  } else {
+    let i = 0
+    while i < pending.length {
+      if lwSeq[i] != pending[i] { miss("non-stack temp: out of order") }
+      i = i + 1
+    }
+  }
+  while pending.length > 0 { pending.pop() }
+  lwSeq = []
+  0
+}
+
+// The callee of a temp defined by a direct call, or -1.
+function callTemp(o: Opnd): i32 {
+  match o {
+    OVar => {
+      if !isTemp(o.ov) || !lwTempDef[o.ov] { return -1 }
+      const r = lwTempRhs[o.ov]
+      if r is RCall { r.caCallee } else { -1 }
+    }
+    OImm | OStr => -1
+  }
+}
+
+// Whether callee `pos` returns nothing and hands no captures back, so a void tail call to it
+// can be its tail form (legacy's `emitVoidTailCall`).
+function voidTailCallee(pos: i32): boolean {
+  pos >= 0
+    && pos < fRetVoid.length
+    && fRetVoid[pos] == 1
+    && cloLiftWriteCount(pos) == 0
+}
+
+// Writes body `body`; `tail` when its last node ends a void function.
+function body(b: i32[], tail: boolean) {
+  const pending: i32[] = []
+  let i = 0
+  while i < b.length {
+    if lwMiss != "" { return 0 }
+    const id = b[i]
+    spanOpen(id)
+    node(id, pending, tail && i == b.length - 1, i == b.length - 1)
+    spanClose(id)
+    i = i + 1
+  }
+  if pending.length > 0 { miss("non-stack temp: unconsumed") }
+  0
+}
+
+function node(id: i32, pending: i32[], tail: boolean, last: boolean) {
+  if id < 0 || id >= lw.irNodes.length { return miss("no node") }
+  const n = lw.irNodes[id]
+  match n {
+    SLet => {
+      if !isTemp(n.lDst) { return miss("let of a non-temp") }
+      lwTempRhs[n.lDst] = n.lRhs
+      lwTempDef[n.lDst] = true
+      pending.push(n.lDst)
+    }
+    SAssign => {
+      cond(n.asSrc, pending)
+      // An arm's write of its valued `if`'s out leaves the value as the arm's result.
+      if n.asDst == lwArmOut && last { return 0 }
+      const s = varSlot(n.asDst)
+      if s < 0 { return miss("unmapped slot") }
+      wU8(0x21)
+      wULEB(s)
+    }
+    SGlobalSet => {
+      if !userGlobalPlain(n.gsSym, true) {
+        return miss("global write with a guard or a bit")
+      }
+      cond(n.gsSrc, pending)
+      wU8(0x24)
+      wULEB(userGlobalIdx(n.gsSym))
+    }
+    SEffect => {
+      lwSeq = []
+      const r = n.efRhs
+      if r is RCall {
+        const t = tail && voidTailCallee(r.caCallee)
+        call(r, t)
+        settle(pending)
+        const si = irSigOf(lw, r.caCallee)
+        if !t && si >= 0 && !repIsNoValue(lw.irSigRet[si]) { wU8(0x1a) }
+        return 0
+      }
+      miss("effect outside I1")
+    }
+    SBlock => {
+      settle(pending)
+      if n.bkOut >= 0 { return miss("valued block") }
+      wU8(0x02)
+      wU8(0x40)
+      lwFrames.push(n.bkLabel)
+      body(n.bkBody, false)
+      lwFrames.pop()
+      wU8(0x0b)
+    }
+    SLoop => {
+      settle(pending)
+      wU8(0x03)
+      wU8(0x40)
+      lwFrames.push(n.lpLabel)
+      body(n.lpBody, false)
+      lwFrames.pop()
+      wU8(0x0b)
+    }
+    SIf => ifNode(n, pending, tail)
+    SBr => {
+      settle(pending)
+      if n.brHas { return miss("valued branch") }
+      const d = brDepth(n.brLabel)
+      if d < 0 { return miss("branch out of its frames") }
+      wU8(0x0c)
+      wULEB(d)
+    }
+    SReturn => ret(n, pending)
+    STrap => {
+      settle(pending)
+      wU8(0x00)
+    }
+    SDrop => {
+      cond(n.dpV, pending)
+      wU8(0x1a)
+    }
+    SSetField | SListSet | SCellSet | SBoundsCheck | SSwitch => miss("statement outside I1")
+  }
+}
+
+// An `if`. The loop exit `if c {} else { br L }` is legacy's `eqz; br_if`, and a literal-true
+// test writes no test at all, either for that exit or for an else-less `if`, whose arm runs inline.
+function ifNode(n: SIf, pending: i32[], tail: boolean) {
+  if n.siOut >= 0 { return valuedIf(n, pending) }
+  const exitBr = n.siThen.length == 0
+    && n.siElse.length == 1
+    && isBr(n.siElse[0])
+  if isTrue(n.siCond) && (exitBr || n.siElse.length == 0) {
+    settle(pending)
+    if !exitBr { body(n.siThen, tail) }
+    return 0
+  }
+  cond(n.siCond, pending)
+  if exitBr {
+    const b = lw.irNodes[n.siElse[0]]
+    if b is SBr {
+      const d = brDepth(b.brLabel)
+      if d < 0 { return miss("branch out of its frames") }
+      wU8(0x45)
+      wU8(0x0d)
+      wULEB(d)
+    }
+    return 0
+  }
+  wU8(0x04)
+  wU8(0x40)
+  lwFrames.push(-1)
+  body(n.siThen, tail)
+  if n.siElse.length > 0 {
+    wU8(0x05)
+    body(n.siElse, tail)
+  }
+  lwFrames.pop()
+  wU8(0x0b)
+}
+
+// An `if` whose arms each end by writing its slotless out: a value-typed `if` (legacy's `&&` and
+// `||`), whose result stays on the stack for the out's one later read.
+function valuedIf(n: SIf, pending: i32[]) {
+  const t = n.siOut
+  if varSlot(t) >= 0 { return miss("valued if into a slot") }
+  const vt = valtypeOf(lw.irVars[t].vRep)
+  if vt < 0 { return miss("valued if rep") }
+  cond(n.siCond, pending)
+  wU8(0x04)
+  wU8(vt)
+  lwFrames.push(-1)
+  const outer = lwArmOut
+  lwArmOut = t
+  body(n.siThen, false)
+  wU8(0x05)
+  lwArmOut = t
+  body(n.siElse, false)
+  lwArmOut = outer
+  lwFrames.pop()
+  wU8(0x0b)
+  lwStackVal[t] = true
+  pending.push(t)
+  0
+}
+
+function isBr(id: i32): boolean {
+  if id < 0 || id >= lw.irNodes.length { return false }
+  lw.irNodes[id] is SBr
+}
+
+// A return: its value, then `return`, or a call's tail form when the value is a direct call.
+function ret(n: SReturn, pending: i32[]) {
+  if !n.rtHas {
+    settle(pending)
+    wU8(0x0f)
+    return 0
+  }
+  const callee = callTemp(n.rtV)
+  if callee >= 0 {
+    const t = n.rtV
+    if t is OVar {
+      lwTempUsed[t.ov] = true
+      const r = lwTempRhs[t.ov]
+      lwSeq = []
+      if r is RCall { call(r, true) }
+      lwSeq.push(t.ov)
+      settle(pending)
+    }
+    return 0
+  }
+  cond(n.rtV, pending)
+  wU8(0x0f)
+}
+
+function spanOpen(id: i32) {
+  let k = 0
+  while k < lw.irSpanFirst.length {
+    if lw.irSpanFirst[k] == id {
+      lwSpanOpen.push(k)
+      lwSpanAt.push(curLen())
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Closes, innermost first, every open span whose last node is `id`, banking a row for each that
+// wrote bytes.
+function spanClose(id: i32) {
+  let i = lwSpanOpen.length - 1
+  while i >= 0 {
+    const k = lwSpanOpen[i]
+    if k >= 0 && lw.irSpanLast[k] == id {
+      const from = lwSpanAt[i]
+      const to = curLen()
+      if to > from {
+        lwRowAst.push(lw.irSpanAst[k])
+        lwRowFrom.push(from)
+        lwRowTo.push(to)
+      }
+      lwSpanOpen[i] = -1
+    }
+    i = i - 1
+  }
+  // Drop the closed rows, keeping the open ones in order.
+  const o2: i32[] = []
+  const a2: i32[] = []
+  let j = 0
+  while j < lwSpanOpen.length {
+    if lwSpanOpen[j] >= 0 {
+      o2.push(lwSpanOpen[j])
+      a2.push(lwSpanAt[j])
+    }
+    j = j + 1
+  }
+  lwSpanOpen = o2
+  lwSpanAt = a2
+  0
+}
+
+let lwBuf: u8[] = []
+let lwGot: u8[] = []
+
+// The code entry the last dual emit lowered, for a mismatch's detail.
+export function irLoweredEntry(): u8[] { lwGot }
+
+// `b` as hex bytes, space-separated.
+export function irHexOf(b: u8[]): string {
+  let s = ""
+  for x in b { s = s + hex(x) + " " }
+  s
+}
+
+function curLen(): i32 { lwBuf.length }
+
+// The valtype byte of a scalar rep, or -1.
+function valtypeOf(r: i32): i32 {
+  const p = repPrim(r)
+  if p == null { return -1 }
+  const ps: string = p
+  if ps == "i32" || ps == "bool" { return 0x7f }
+  if ps == "i64" { return 0x7e }
+  if ps == "f32" { return 0x7d }
+  if ps == "f64" { return 0x7c }
+  -1
+}
+
+// The locals vector: one `(1, valtype)` run per declared local, in slot order from the first
+// slot after the parameters, which must leave no gap.
+function localsVec(firstSlot: i32): u8[] {
+  const out: u8[] = []
+  const slots: i32[] = []
+  const types: i32[] = []
+  for v in lw.irVars {
+    // A local with no slot is a valued `if`'s out, which stays on the stack.
+    if v.vKind == "local" && v.vSlot >= 0 {
+      slots.push(v.vSlot)
+      types.push(valtypeOf(v.vRep))
+    }
+  }
+  const prev = wTarget(out)
+  wULEB(slots.length)
+  let want = firstSlot
+  while want < firstSlot + slots.length {
+    let k = 0
+    let found = -1
+    while k < slots.length {
+      if slots[k] == want { found = k }
+      k = k + 1
+    }
+    if found < 0 || types[found] < 0 {
+      miss("locals layout")
+    } else {
+      wULEB(1)
+      wU8(types[found])
+    }
+    want = want + 1
+  }
+  wTarget(prev)
+  out
+}
+
+// The size-prefixed code entry `f` lowers to, or a mismatch class in `lwMiss`; `firstLocal` is
+// the wasm index of the first declared local.
+function entry(f: IrFn, firstLocal: i32): u8[] {
+  lw = f
+  lwMiss = ""
+  lwTempRhs = []
+  lwTempDef = []
+  lwTempUsed = []
+  lwStackVal = []
+  const none: Rhs = { ggSym: -1 }
+  for _v in f.irVars {
+    lwTempRhs.push(none)
+    lwTempDef.push(false)
+    lwTempUsed.push(false)
+    lwStackVal.push(false)
+  }
+  lwArmOut = -1
+  lwSeq = []
+  lwFrames = []
+  lwSpanOpen = []
+  lwSpanAt = []
+  lwRowAst = []
+  lwRowFrom = []
+  lwRowTo = []
+  const locals = localsVec(firstLocal)
+  lwBuf = []
+  const prev = wTarget(lwBuf)
+  const valued = !repIsNoValue(f.irRetRep)
+  body(f.irBody, !valued)
+  if valued && !endsInReturn(f) { wU8(0x00) }
+  wU8(0x0b)
+  wTarget(prev)
+  const code: u8[] = []
+  for x in locals { code.push(x) }
+  const bodyAt = code.length
+  for x in lwBuf { code.push(x) }
+  const out: u8[] = []
+  const p2 = wTarget(out)
+  wULEB(code.length)
+  wTarget(p2)
+  const shift = out.length + bodyAt
+  for x in code { out.push(x) }
+  let r = 0
+  while r < lwRowFrom.length {
+    lwRowFrom[r] = lwRowFrom[r] + shift
+    lwRowTo[r] = lwRowTo[r] + shift
+    r = r + 1
+  }
+  out
+}
+
+function endsInReturn(f: IrFn): boolean {
+  if f.irBody.length == 0 { return false }
+  const last = f.irBody[f.irBody.length - 1]
+  last >= 0 && last < f.irNodes.length && f.irNodes[last] is SReturn
+}
+
+// The dual emit: lowers `f` and compares it with the legacy code entry `legacy` (this function's
+// whole entry) and the statement-span rows banked from `spanBase` on, at offsets in `legacy`
+// once `spanShift` is taken off. "" when they are identical, else the first difference's class;
+// `skew` breaks the lowering on purpose (`irShadowCorrupt`).
+export function irDualEmit(
+  f: IrFn,
+  firstLocal: i32,
+  legacy: u8[],
+  spanBase: i32,
+  spanShift: i32,
+  skew: i32,
+): string {
+  const got = entry(f, firstLocal)
+  lwGot = got
+  if lwMiss != "" { return "unlowered: " + lwMiss }
+  // The comparison's own controls: 1 adds a byte to the lowering, 2 drops its first span row.
+  if skew == 1 { got.push(0x01) }
+  if skew == 2 && lwRowAst.length > 0 { lwRowAst[0] = -2 }
+  let i = 0
+  while i < got.length && i < legacy.length && got[i] == legacy[i] { i = i + 1 }
+  if i < got.length || i < legacy.length {
+    return "bytes: "
+      + regionAt(i, legacy)
+      + " at "
+      + byteText(legacy, i)
+      + " vs "
+      + byteText(got, i)
+  }
+  // The statement rows (kind 5) legacy banked for this function, against the lowering's.
+  const ln: i32[] = []
+  const lf: i32[] = []
+  const lt: i32[] = []
+  let k = spanBase
+  while k < emitFnSpanStart.length {
+    if emitFnSpanKind[k] == 5 {
+      ln.push(emitFnSpanNode[k])
+      lf.push(emitFnSpanStart[k] - spanShift)
+      lt.push(emitFnSpanEnd[k] - spanShift)
+    }
+    k = k + 1
+  }
+  if ln.length != lwRowAst.length { return "spans: count" }
+  let j = 0
+  while j < ln.length {
+    if !rowListed(ln[j], lf[j], lt[j]) { return "spans: " + kindOf(ln[j]) }
+    j = j + 1
+  }
+  ""
+}
+
+// Whether the lowering banked the row `(node, from, to)`, in any order: rows close innermost
+// first in both emitters, but a nested statement's order is not the comparison.
+function rowListed(n: i32, from: i32, to: i32): boolean {
+  let i = 0
+  while i < lwRowAst.length {
+    if lwRowAst[i] == n && lwRowFrom[i] == from && lwRowTo[i] == to {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+function byteText(b: u8[], i: i32): string {
+  if i >= b.length { return "end" }
+  hex(b[i])
+}
+
+function hex(x: i32): string {
+  const d = "0123456789abcdef"
+  "0x"
+    + d.slice((x >> 4) & 15, ((x >> 4) & 15) + 1)
+    + d.slice(x & 15, (x & 15) + 1)
+}
+
+// Where in the entry byte `i` falls: the size prefix, the locals vector, or a statement, by the
+// innermost lowered row holding it.
+function regionAt(i: i32, legacy: u8[]): string {
+  let best = -1
+  let r = 0
+  while r < lwRowAst.length {
+    if lwRowFrom[r] <= i && i < lwRowTo[r] {
+      if (
+        best < 0
+        || lwRowTo[r] - lwRowFrom[r] < lwRowTo[best] - lwRowFrom[best]
+      ) {
+        best = r
+      }
+    }
+    r = r + 1
+  }
+  if best >= 0 { return kindOf(lwRowAst[best]) }
+  if i < 5 && legacy.length > 0 { return "prefix or locals" }
+  "outside a statement"
+}
+
+// The source kind of node `ix`, for a mismatch's class.
+function kindOf(ix: i32): string {
+  if ix < 0 { return "none" }
+  const n: Node = nodeAt(ix)
+  match n {
+    NumLit => "number"
+    StrLit => "string"
+    CharLit => "char"
+    BoolLit => "bool"
+    NullLit => "null"
+    Ident => "read"
+    Unary => "unary " + n.unOp
+    BinExpr => "binary " + n.binOp
+    Call => "call"
+    Member => "member"
+    OptMember => "optional member"
+    Paren => "paren"
+    ErrExpr => "error"
+    LetDecl => "let"
+    Param => "param"
+    TypeRef => "type"
+    FuncDecl => "function"
+    IfStmt => "if"
+    WhileStmt => "while"
+    BreakStmt => "break"
+    ContinueStmt => "continue"
+    RetStmt => "return"
+    Block => "block"
+    Program => "program"
+    FieldDef => "field"
+    TypeDecl => "type decl"
+    FieldInit => "field init"
+    ObjLit => "object"
+    ArrayLit => "array"
+    Index => "index"
+    UnionDecl => "union decl"
+    IsExpr => "is"
+    AsExpr => "as"
+    ForRange => "for range"
+    ForIn => "for in"
+    MatchExpr => "match"
+    ImportDecl => "import"
+    Spread => "spread"
+    LoopVar => "loop var"
+  }
+}

@@ -27,8 +27,11 @@ export type OStr = { osText: i32 }
 export type Opnd = OVar | OImm | OStr
 
 // The primitive operations, per `PrimRep`; the verifier gives each its operand signature.
-export type PrimOp = "add" | "sub" | "mul" | "div" | "rem" | "and" | "or" | "xor" | "shl"
-  | "shr" | "shru" | "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "neg" | "not"
+// Signedness lives on the op: `u32`/`u64` share i32's and i64's reps, so the unsigned forms
+// (`divu` … `geu`, `shru`) are chosen from the operand's type.
+export type PrimOp = "add" | "sub" | "mul" | "div" | "divu" | "rem" | "remu" | "and" | "or"
+  | "xor" | "shl" | "shr" | "shru" | "eq" | "ne" | "lt" | "ltu" | "le" | "leu" | "gt" | "gtu"
+  | "ge" | "geu" | "neg" | "not"
 export type MapOp = "get" | "has" | "set" | "delete" | "keys"
 export type StrOp = "concat" | "len" | "at" | "slice" | "eq"
 export type CastFail = "trap" | "null"
@@ -79,8 +82,11 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 export type SBr = { brLabel: i32, brHas: boolean, brVal: Opnd }
 export type SReturn = { rtHas: boolean, rtV: Opnd }
 export type STrap = { tpWhy: i32 }
+// A value evaluated and discarded, as legacy writes a bare value statement. Migration only: it
+// goes, with every use, once bytes may move.
+export type SDrop = { dpV: Opnd }
 export type IrNode = SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet
-  | SBoundsCheck | SEffect | SBlock | SLoop | SIf | SSwitch | SBr | SReturn | STrap
+  | SBoundsCheck | SEffect | SBlock | SLoop | SIf | SSwitch | SBr | SReturn | STrap | SDrop
 
 export type VarKind = "param" | "local" | "temp"
 // A variable: its rep (fixed at its definition), type, kind and wasm local index (-1 unset).
@@ -88,7 +94,7 @@ export type IrVar = { vRep: i32, vTy: i32, vKind: VarKind, vSlot: i32 }
 
 // One function: the node arena with each node's type, rep and source node, the variables, the
 // top-level body, the parameters and result, and the signatures of the functions and the reps of
-// the globals it uses.
+// the globals it uses, and the source statement each run of nodes was built from (`irSpan*`).
 export type IrFn = {
   irNodes: IrNode[],
   irNodeTy: i32[],
@@ -106,6 +112,9 @@ export type IrFn = {
   irSigRet: i32[],
   irGlobalSym: i32[],
   irGlobalRep: i32[],
+  irSpanAst: i32[],
+  irSpanFirst: i32[],
+  irSpanLast: i32[],
 }
 
 export function irFnNew(at: i32, name: string): IrFn {
@@ -126,6 +135,9 @@ export function irFnNew(at: i32, name: string): IrFn {
     irSigRet: [],
     irGlobalSym: [],
     irGlobalRep: [],
+    irSpanAst: [],
+    irSpanFirst: [],
+    irSpanLast: [],
   }
   f
 }
@@ -171,6 +183,14 @@ export function irSigNote(f: IrFn, fnPos: i32, params: i32[], ret: i32) {
   0
 }
 
+// Records that source statement `ast` built the nodes from `first` to `last` of one body.
+export function irSpanNote(f: IrFn, ast: i32, first: i32, last: i32) {
+  f.irSpanAst.push(ast)
+  f.irSpanFirst.push(first)
+  f.irSpanLast.push(last)
+  0
+}
+
 // The rep `f` records for global `sym`, or -1 for none.
 export function irGlobalRepOf(f: IrFn, sym: i32): i32 {
   let i = 0
@@ -199,7 +219,7 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
   match n {
     SBr | SReturn | STrap => true
     SIf => irBodyLeaves(f, n.siThen) && irBodyLeaves(f, n.siElse)
-    SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBlock | SLoop | SSwitch => false
+    SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBlock | SLoop | SSwitch | SDrop => false
   }
 }
 
@@ -370,6 +390,7 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
     }
     SReturn => if n.rtHas { p + "return " + opndText(n.rtV) + "\n" } else { p + "return\n" }
     STrap => p + "trap " + i32ToStr(n.tpWhy) + "\n"
+    SDrop => p + "drop " + opndText(n.dpV) + "\n"
   }
 }
 
