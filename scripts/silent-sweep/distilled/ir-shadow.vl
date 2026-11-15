@@ -12,6 +12,7 @@
 
 import { IoError, readTextFile, writeTextFile } from "std:fs"
 import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
 import { exit } from "std:process"
 import { parseI32, toString } from "std:fmt"
 import { join, split, startsWith, trim } from "std:str"
@@ -38,7 +39,9 @@ function argOr(args: readonly string[], flag: string, dflt: string): string {
 function corpus(): string[] {
   const out: string[] = []
   for part in ["cells", "named"] {
-    for n in cellsIn(HERE + "/" + part) { out.push(HERE + "/" + part + "/" + n + ".vl") }
+    for n in cellsIn(HERE + "/" + part) {
+      out.push(HERE + "/" + part + "/" + n + ".vl")
+    }
   }
   sort(out, (a: string, b: string) => a < b)
   return out
@@ -48,7 +51,8 @@ function corpus(): string[] {
 type Row = { key: string, n: i32 }
 
 // What a run measured: the rows by class, the cells that printed any, and the chunks that
-// did not finish (a trap or a timeout, as `vl check`'s exit code says).
+// did not finish (a trap or a timeout, as `vl check`'s exit code says). A cell that fails the
+// check, or holds no function, prints no row.
 type Measured = { rows: Row[], cells: i32, broken: string[] }
 
 function bump(rows: Row[], key: string, n: i32) {
@@ -107,7 +111,10 @@ function measure(paths: string[], seed: string, jobs: string): Measured {
   // `$0` is the host, `$1` the seed and `$2` the chunk; each chunk's exit code lands beside it.
   const sh = "VL_IR_SHADOW=1 timeout 1200 \"$0\" check --codegen --compiler \"$1\" $(cat \"$2\")"
     + " > /dev/null 2> \"$2.err\"; echo $? > \"$2.rc\""
-  const x = spawn("sh", fanOutArgv(root + "/chunks", jobs, ["sh", "-c", sh, vl, seed]))
+  const x = spawn(
+    "sh",
+    fanOutArgv(root + "/chunks", jobs, ["sh", "-c", sh, vl, seed]),
+  )
   const m: Measured = { rows: [], cells: 0, broken: [] }
   if x.code != 0 {
     spawn("rm", ["-rf", root])
@@ -164,18 +171,20 @@ function writeBaseline(mm: Row[]) {
   return 0
 }
 
-function main() {
-  const args = programArgs()
+function main(args: readonly string[]) {
   const seed = argOr(args, "--seed", "build/vl-compiler.wasm")
   const paths = corpus()
   if paths.length == 0 { die("ir-shadow: no cells under \{HERE}", 2) }
   const m = measure(paths, seed, envOr("JOBS", "4"))
   for b in m.broken { print("ir-shadow: chunk did not finish: \{b}") }
   if m.cells == 0 {
-    die("ir-shadow: no `[ir]` rows; the seed or the host predates `$VL_IR_SHADOW`", 2)
+    die(
+      "ir-shadow: no `[ir]` rows; the seed or the host predates `$VL_IR_SHADOW`",
+      2,
+    )
   }
   print(
-    "ir shadow: \{m.cells} of \{paths.length} cells built; \{countOf(m.rows, "fns")} functions, \{countOf(m.rows, "covered")} covered, \{countOf(m.rows, "verified")} verified, \{countOf(m.rows, "matched")} matched",
+    "ir shadow: \{m.cells} of \{paths.length} cells have functions; \{countOf(m.rows, "fns")} functions, \{countOf(m.rows, "covered")} covered, \{countOf(m.rows, "verified")} verified, \{countOf(m.rows, "matched")} matched",
   )
   const mm = classes(m.rows, "mismatch ")
   const fails = classes(m.rows, "fail ")
@@ -183,7 +192,9 @@ function main() {
   for r in fails { print("  \{r.n}\t\{r.key}") }
   if m.broken.length > 0 { exit(2) }
   if hasFlag(args, "--write-baseline") {
-    if fails.length > 0 { die("ir-shadow: a verifier failure is never a baseline", 1) }
+    if fails.length > 0 {
+      die("ir-shadow: a verifier failure is never a baseline", 1)
+    }
     writeBaseline(mm)
     return 0
   }
@@ -199,7 +210,9 @@ function main() {
   for b in base {
     const now = countOf(mm, b.key)
     if now < b.n {
-      print("ir-shadow: \{b.key} fell: \{b.n} -> \{now} (re-run with --write-baseline)")
+      print(
+        "ir-shadow: \{b.key} fell: \{b.n} -> \{now} (re-run with --write-baseline)",
+      )
     }
   }
   if red { exit(1) }
@@ -207,4 +220,9 @@ function main() {
   return 0
 }
 
-main()
+const argv = programArgs()
+if argv is Utf8Error {
+  die("ir-shadow: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  main(argv)
+}
