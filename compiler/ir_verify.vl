@@ -49,7 +49,18 @@ import {
   STrap,
   irSigOf,
 } from "./ir"
-import { repIdKids, repIdKind, repIdOfTy } from "./emit_rep"
+import {
+  RBox,
+  RClosure,
+  RList,
+  RNullable,
+  RRecord,
+  RUnsup,
+  repNodeAt,
+  repNodeKids,
+  repNodeOfTy,
+} from "./emit_rep"
+import { repIsNoValue, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR } from "./check_types"
 import { i32ToStr } from "./ast"
@@ -163,7 +174,7 @@ function primSig(r: RPrimOp, dst: i32, at: i32) {
   if !unary && opRep(a[1]) != ar {
     return fail(2, at, r.poOp + "'s operands differ in rep")
   }
-  const k = repIdKind(ar)
+  const k = repWhat(ar)
   const op: PrimOp = r.poOp
   const kindOk = match op {
     "add" | "sub" | "mul" | "div" | "rem" | "lt" | "le" | "gt" | "ge" | "neg" => isNum(k)
@@ -221,7 +232,7 @@ function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
 }
 
 function kidAt(r: i32, i: i32): i32 {
-  const ks = repIdKids(r)
+  const ks = repNodeKids(r)
   if i < 0 || i >= ks.length { return -1 }
   ks[i]
 }
@@ -240,7 +251,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCallRef => {
       use(r.crFn, at)
       uses(r.crArgs, at)
-      if repIdKind(opRep(r.crFn)) != "closure" {
+      if !(repNodeAt(opRep(r.crFn)) is RClosure) {
         return fail(2, at, "call_ref of a non-closure")
       }
       0
@@ -254,13 +265,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCast => {
       use(r.ctV, at)
       if dst < 0 { return 0 }
-      const ok = if r.ctOnFail == "trap" { dst == r.ctTarget } else { repIdKind(dst) == "nullable" && kidAt(dst, 0) == r.ctTarget }
+      const ok = if r.ctOnFail == "trap" { dst == r.ctTarget } else { repNodeAt(dst) is RNullable && kidAt(dst, 0) == r.ctTarget }
       if !ok { return fail(2, at, "a cast's result is not its target's rep") }
       0
     }
     RTagOf => {
       use(r.tgV, at)
-      if repIdKind(opRep(r.tgV)) != "box" {
+      if !(repNodeAt(opRep(r.tgV)) is RBox) {
         return fail(2, at, "a tag of a non-box")
       }
       if dst >= 0 && dst != vfI32 { return fail(2, at, "a tag is an i32") }
@@ -269,8 +280,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RMakeRec => {
       uses(r.mrFields, at)
       if dst < 0 { return 0 }
-      const ks = repIdKids(dst)
-      if repIdKind(dst) != "record" || ks.length != r.mrFields.length {
+      const ks = repNodeKids(dst)
+      if !(repNodeAt(dst) is RRecord) || ks.length != r.mrFields.length {
         return fail(2, at, "a record's fields do not match its rep")
       }
       let i = 0
@@ -285,7 +296,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RGetField => {
       use(r.gfV, at)
       const v = opRep(r.gfV)
-      if repIdKind(v) != "record" {
+      if !(repNodeAt(v) is RRecord) {
         return fail(2, at, "a field read of a non-record")
       }
       if dst >= 0 && kidAt(v, r.gfIx) != dst {
@@ -296,7 +307,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RMakeList => {
       uses(r.mlElems, at)
       if dst < 0 { return 0 }
-      if repIdKind(dst) != "list" {
+      if !(repNodeAt(dst) is RList) {
         return fail(2, at, "a list literal of a non-list rep")
       }
       for e in r.mlElems {
@@ -321,7 +332,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.lgV, at)
       use(r.lgIx, at)
       const l = opRep(r.lgV)
-      if repIdKind(l) != "list" || opRep(r.lgIx) != vfI32 {
+      if !(repNodeAt(l) is RList) || opRep(r.lgIx) != vfI32 {
         return fail(2, at, "an element read takes a list and an i32")
       }
       if dst >= 0 && kidAt(l, 0) != dst {
@@ -331,7 +342,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RListLen => {
       use(r.llV, at)
-      if repIdKind(opRep(r.llV)) != "list" {
+      if !(repNodeAt(opRep(r.llV)) is RList) {
         return fail(2, at, "a length of a non-list")
       }
       if dst >= 0 && dst != vfI32 { return fail(2, at, "a length is an i32") }
@@ -430,7 +441,7 @@ function stmt(id: i32) {
       use(n.sfV, id)
       use(n.sfSrc, id)
       const r = opRep(n.sfV)
-      if repIdKind(r) != "record" || kidAt(r, n.sfIx) != opRep(n.sfSrc) {
+      if !(repNodeAt(r) is RRecord) || kidAt(r, n.sfIx) != opRep(n.sfSrc) {
         return fail(2, id, "a field write's rep is not the field's")
       }
       0
@@ -441,7 +452,7 @@ function stmt(id: i32) {
       use(n.lsSrc, id)
       const l = opRep(n.lsV)
       if (
-        repIdKind(l) != "list"
+        !(repNodeAt(l) is RList)
         || opRep(n.lsIx) != vfI32
         || kidAt(l, 0) != opRep(n.lsSrc)
       ) {
@@ -508,7 +519,7 @@ function stmt(id: i32) {
       )
     }
     SReturn => {
-      const none = repIdKind(vf.irRetRep) == "novalue"
+      const none = repIsNoValue(vf.irRetRep)
       if n.rtHas == none {
         return fail(
           5,
@@ -531,8 +542,8 @@ function stmt(id: i32) {
 // Rule 7: each arm of the scrutinee's box is covered once, or a default names what it excludes.
 function switchCheck(n: SSwitch, id: i32) {
   const on = varRep(n.swOn)
-  if repIdKind(on) != "box" { return fail(7, id, "a switch over a non-box") }
-  const nArms = repIdKids(on).length
+  if !(repNodeAt(on) is RBox) { return fail(7, id, "a switch over a non-box") }
+  const nArms = repNodeKids(on).length
   const seen: boolean[] = []
   let i = 0
   while i < nArms {
@@ -565,11 +576,18 @@ function switchCheck(n: SSwitch, id: i32) {
   0
 }
 
+// Rule 1: whether `r` is a node of the tree and not an unsupported one.
+function closedRep(r: i32): boolean {
+  const n = repNodeAt(r)
+  if n == null { return false }
+  !(n is RUnsup)
+}
+
 // Rule 1 for a node: its rep is a closed one in the tree.
 function nodeRepClosed(id: i32) {
-  const k = repIdKind(vf.irNodeRep[id])
-  if k == "" || k == "unsup" {
-    return fail(1, id, "the node's rep is " + k + ", not a closed rep")
+  const r = vf.irNodeRep[id]
+  if !closedRep(r) {
+    return fail(1, id, "the node's rep is " + repWhat(r) + ", not a closed rep")
   }
   0
 }
@@ -582,26 +600,29 @@ export function irVerify(f: IrFn): IrVerdict {
   vfMsg = ""
   vfLabels = []
   vfLabelOut = []
-  vfBool = repIdOfTy(TY_BOOL)
-  vfI32 = repIdOfTy(TY_I32)
-  vfStr = repIdOfTy(TY_STR)
+  vfBool = repNodeOfTy(TY_BOOL)
+  vfI32 = repNodeOfTy(TY_I32)
+  vfStr = repNodeOfTy(TY_STR)
   vfDefined = []
   vfDefLog = []
   let i = 0
   while i < f.irVars.length {
     const v = f.irVars[i]
     vfDefined.push(false)
-    const k = repIdKind(v.vRep)
-    if k == "" || k == "unsup" {
-      fail(1, -1, "v" + i32ToStr(i) + "'s rep is " + k + ", not a closed rep")
+    if !closedRep(v.vRep) {
+      fail(
+        1,
+        -1,
+        "v" + i32ToStr(i) + "'s rep is " + repWhat(v.vRep) + ", not a closed rep",
+      )
     } else if v.vTy < 0 || tyHasTyVar(v.vTy) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
-    } else if repIdOfTy(v.vTy) != v.vRep {
+    } else if repNodeOfTy(v.vTy) != v.vRep {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
     }
     i = i + 1
   }
-  if repIdKind(f.irRetRep) == "" { fail(1, -1, "the result has no rep") }
+  if repNodeAt(f.irRetRep) == null { fail(1, -1, "the result has no rep") }
   for id in f.irBody { stmt(id) }
   const v: IrVerdict = { vfRule: vfRule, vfNode: vfAt, vfMsg: vfMsg }
   v

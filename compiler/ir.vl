@@ -1,10 +1,24 @@
 // The typed mid-level IR (docs/internals/ir-design-2026-11.md §1): structured control, operands
 // in ANF, mutable locals rather than SSA. One `IrFn` holds one function's arena, so it can be
-// built, verified and printed in isolation. Ids are i32 indices into that arena; a `RepId` is an
-// `emit_rep.vl` tree id (`repIdOfTy`), a `TyId` a checker arena index. Conversions arrive as
-// one coercion node with `coercionAt` (step I3).
+// built, verified and printed in isolation. Ids are i32 indices into that arena; a rep is an
+// `emit_rep.vl` tree node (`repNodeOfTy`), valid only within the rebuild epoch it was read in,
+// and a type a checker arena index. Conversions arrive as one coercion node with `coercionAt`
+// (step I3).
 import { i32ToStr } from "./ast"
-import { repIdKind } from "./emit_rep"
+import {
+  RAtom,
+  RBox,
+  RClosure,
+  RList,
+  RMap,
+  RNoValue,
+  RNullable,
+  RPrim,
+  RRecord,
+  RUnsup,
+  RpPrim,
+  repNodeAt,
+} from "./emit_rep"
 
 // An operand: a variable, an immediate of a primitive rep, or an interned string.
 export type OVar = { ov: i32 }
@@ -152,11 +166,43 @@ export function irSigNote(f: IrFn, fnPos: i32, params: i32[], ret: i32) {
   0
 }
 
-function repText(r: i32): string {
-  const k = repIdKind(r)
-  if k == "" { return "?" + i32ToStr(r) }
-  k + "#" + i32ToStr(r)
+// Rep `r`'s primitive when it is an unpacked primitive leaf, else null.
+export function repPrim(r: i32): RpPrim | null {
+  const n = repNodeAt(r)
+  if n == null { return null }
+  match n {
+    RPrim => if n.rpPacked != 0 { null } else { n.rpK }
+    RAtom | RList | RMap | RBox | RClosure | RRecord | RNullable | RUnsup | RNoValue => null
+  }
 }
+
+// Whether rep `r` is a value rep a variable may hold: a primitive I1 lowers.
+export function repIsScalar(r: i32): boolean {
+  const p = repPrim(r)
+  p == "i32" || p == "i64" || p == "f64" || p == "f32" || p == "bool"
+}
+
+export function repIsNoValue(r: i32): boolean { repNodeAt(r) is RNoValue }
+
+// Rep `r` for a reader: its primitive or its node's kind, `?` outside the tree.
+export function repWhat(r: i32): string {
+  const n = repNodeAt(r)
+  if n == null { return "?" }
+  match n {
+    RPrim => n.rpK
+    RAtom => "atom"
+    RList => "list"
+    RMap => "map"
+    RBox => "box"
+    RClosure => "closure"
+    RRecord => "record"
+    RNullable => "nullable"
+    RUnsup => "unsup"
+    RNoValue => "novalue"
+  }
+}
+
+function repText(r: i32): string { repWhat(r) + "#" + i32ToStr(r) }
 
 function opndText(o: Opnd): string {
   match o {
@@ -164,9 +210,9 @@ function opndText(o: Opnd): string {
     OImm => {
       const b = o.oiBits
       if b >= -2147483648 && b <= 2147483647 {
-        return repIdKind(o.oiRep) + " " + i32ToStr(b as% i32)
+        return repWhat(o.oiRep) + " " + i32ToStr(b as% i32)
       }
-      repIdKind(o.oiRep) + " <wide>"
+      repWhat(o.oiRep) + " <wide>"
     }
     OStr => "str" + i32ToStr(o.osText)
   }
