@@ -19,7 +19,7 @@ not the message.
 | --- | --- | --- | --- |
 | a constant shift-count tree beside an unfolded constant operand is never range-checked, so wasm masks it | 1 UNSOUND (`ar_s21_0127`) | `print((-3) >>> (40 + 1))` prints `8388607`; `(-3) >>> 41` is refused | D16318 |
 | a radix literal beside an `if` or `match` of integer constants, at an `i64` destination, computes at `i32` | 3 DISAGREE (`ar_s10_0105`, `ar_s45_0161`, `ar_s40_0145`) | `const v: i64 = 0xFFFFFFFF + if c { 7 } else { 5 }` prints `6`, want `4294967302` | D16319 |
-| radix-pattern arithmetic at a float destination wraps at 32 bits | 1 DISAGREE (`ar_s27_0068`) | `let x: f64 = 0xFFFFFFFF + 1000` prints `999`, want `4294968295` | D16380 |
+| radix-pattern arithmetic at a float destination wraps at 32 bits | 1 DISAGREE (`ar_s27_0068`) | `let x: f64 = 0xFFFFFFFF + 1000` prints `999`, want `4294968295` | D16390 |
 
 Found while ablating, already filed by lane O: a parenthesised constant `if` at a wider destination
 builds an invalid module (D16374). `const v: i64 = 4294967295 * (if c { 7 } else { 5 })` is
@@ -39,4 +39,4 @@ another face of it.
 | O8: an `(x as? i32) ?? (-5)` operand stays `i32` beside an `i64` peer | 1 DISAGREE | `ar_s39_0189` | widens, as D16376 states the typed-arm rule |
 
 Count: O1 12 + O2 4 = 16 of the 17 UNSOUND, D16318 the 17th; O2 3 + O3 12 + O4 6 + O5 6 + O6 1 +
-O7 1 + O8 1 = 30 of the 34 DISAGREE, D16319 and D16380 the other 4.
+O7 1 + O8 1 = 30 of the 34 DISAGREE, D16319 and D16390 the other 4.
