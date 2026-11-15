@@ -136,8 +136,8 @@ if selfcompile; then ok=1; fi
 if [ "$ok" = 0 ] && [ "$FALLBACK" = 1 ] && [ "$fetched" = 0 ]; then
   echo "  seed cannot compile current source — may be a stale CACHED seed;" >&2
   echo "  re-fetching the rolling seed-latest and retrying once..." >&2
-  # THE LIVE SEED IS NEVER REMOVED (D1804). `fetch-seed.sh` no-ops when its destination
-  # exists, so the download goes to a temp destination instead of clearing `$SEED` first —
+  # THE LIVE SEED IS NEVER REMOVED (D1804). `fetch-seed.sh` keeps a seed this script built at
+  # its destination, so the download goes to a temp destination instead of clearing `$SEED` first —
   # a self-compile fails for reasons other than staleness (a compile error in
   # `compiler/*.vl` is the common one), and clearing first destroyed a good seed whenever
   # the fetch could not reach GitHub. Every write below lands by renaming a SIBLING temp
