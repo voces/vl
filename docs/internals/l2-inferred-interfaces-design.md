@@ -193,6 +193,14 @@ facts come from the statement. Under L2 those facts are bounds on the parameter,
 body, so the exemption goes. This closes the ORDER rows (§6): D16424, D16426, D16368, and the
 D16301 declaration-order family.
 
+S1 retires it for every parameter except one whose calls decide it (`callDecidesParam`): a
+parameter used as a map, or one written into a binding. A call closes a map parameter's open key or
+value, and `holeDemandOk` refuses to pin a demand the body was already checked against, since the
+body's node types would be stale. A binding written a parameter holds a function set's id only when
+every call hands it a member (D15053). Both are the solver at the call, so that exemption goes at S3,
+with D16630 as its acceptance witness. A call cycle keeps source order and today's fixpoint in
+S1, so choice 3 (§9) does not gate it. Measured in `refactor-notes/2026-11-15-g80-l2-s1-callee-first.md`.
+
 ### 3.2 What a body check records
 
 The checker walks the body once. Each operation on a variable appends a bound instead of writing a
@@ -341,7 +349,7 @@ A step marked **identical** must also reproduce its predecessor's seed byte for 
 | step | what | gate | lines (est.) |
 |---|---|---|---|
 | **S0** | Shadow schemes: build an `Iface` from today's tables at the end of each un-annotated body, print it under `vl check --ifaces`, and measure how many corpus functions' demands it covers | identical | +600 to +900 |
-| **S1** | SCC order: check un-annotated bodies callee-first, retire `eagerCheckable`'s un-annotated-parameter exemption | graded: the ORDER rows | +200 to +400, −100 |
+| **S1** | Callee-first order: retire `eagerCheckable`'s un-annotated-parameter exemption, except a parameter its calls decide (§3.1) | graded: the ORDER rows | +40 |
 | **S2** | The scheme is the record: the table writers append `Bound`s to the owning `Iface`, and the validators read them back in today's order | identical | +500, −1,500 |
 | **S3** | One solver at the call: `callFtyPinCstrs`'s replay becomes §4.1's loop, and a failure reports at the call | graded: container, row, arrow and narrowing rows; diagnostics move | +1,200, −4,000 to −6,000 |
 | **S4** | Instance-local generalization (§3.2) and literal bounds (§3.3, settled choice 2) | graded: the instance rows | +400, −300 |
@@ -372,7 +380,8 @@ the condition on choice 3 can reopen one as an owner question.
 3. **Recursion inside a strongly connected component is monomorphic**, as in HM. This holds on one
    condition: S0's measurement must show that no program that runs today depends on polymorphic
    recursion through an un-annotated function. If one does, that program is the owner question, and
-   S1 does not land until it is answered.
+   a component's shared variables (S3) do not land until it is answered. S1 orders acyclic callees
+   only, so it does not wait on it.
 4. **One `BK_ARROW` bound per call shape of a hole function parameter.** For example,
    `g(1, 2) + g("ab", "c").length` (D16209) gives two bounds, which a generic argument satisfies by
    instantiating twice. This preserves what runs today; one arrow per parameter would lose runs, which

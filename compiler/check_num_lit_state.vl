@@ -51,10 +51,12 @@ import {
   HD_ELEM,
   HD_ELEMV,
   HD_FLD,
+  HD_GNOT,
   HD_ITER1,
   HD_ITER2,
   HD_OFLD,
   HD_RET,
+  hdAlt,
   hdBase,
   hdField,
   hdKind,
@@ -130,6 +132,7 @@ import {
   TY_F64,
   TY_I32,
   TY_I64,
+  TY_NULL,
   TyArray,
   TyFunc,
   TyVar,
@@ -305,6 +308,8 @@ let lbiSynth: {[i32]: i32} = Map()
 export let lbiHoleRoot: {[i32]: string[]} = Map()
 export let lbiHoleKinds: {[i32]: i32[]} = Map()
 export let lbiHoleFields: {[i32]: string[]} = Map()
+// Per step of the recipe, whether it is a hole less `null` (the `!= null` narrow, D16566).
+export let lbiHoleLessNull: {[i32]: boolean[]} = Map()
 // The reads that hold a literal `const`'s literal, which a check about a literal the author wrote
 // (a shift count, a constant range, a newtype's brand) does not treat as one.
 export let lbiInlined: {[i32]: boolean} = Map()
@@ -334,6 +339,7 @@ export function lbiArenaReset() {
   lbiHoleRoot = Map()
   lbiHoleKinds = Map()
   lbiHoleFields = Map()
+  lbiHoleLessNull = Map()
   lbiInlined = Map()
   lbiInlinedName = Map()
   lbiInlinedDecl = Map()
@@ -1122,15 +1128,17 @@ function lbiSameAtI32(c: i32): boolean {
 export function lbiPending(): boolean { return lbiPinCand.length > 0 }
 
 // Write each solved type as the declaration's annotation, so the re-check reads it as written.
-export function lbiApplyPins() {
+export function lbiApplyPins(): i32 {
+  let wrote = 0
   let i = 0
   while i < lbiPinCand.length {
     const d = lbiCands[lbiPinCand[i]]
     const n = nodeAt(d)
     const root = tyToTs(lbiPinTy[i])
     if n is LetDecl && tyIsHole(lbiPinTy[i]) {
-      lbiApplyHolePin(n, d, lbiPinTy[i])
+      wrote = wrote + lbiApplyHolePin(n, d, lbiPinTy[i])
     } else if n is LetDecl && root >= 0 {
+      wrote = wrote + 1
       const ann = mkTypeRef(tsToName(root), n.pos)
       setAnnTs(ann, root)
       lbiSynth[ann] = d
@@ -1146,20 +1154,24 @@ export function lbiApplyPins() {
     }
     i = i + 1
   }
-  return 0
+  return wrote
 }
 
 // Write hole `h` as `n`'s annotation by its recipe, which the re-check mints again since its arena
-// is new: the root hole and the derivations off it a name alone spells. None for any other.
-function lbiApplyHolePin(n: LetDecl, d: i32, h: i32) {
+// is new: the root hole and the derivations off it a name alone spells. 1 once written, else 0.
+function lbiApplyHolePin(n: LetDecl, d: i32, h: i32): i32 {
   const kinds: i32[] = []
   const fields: string[] = []
+  const lessNull: boolean[] = []
   let t = h
   let row = hdRowOf(t)
   while row >= 0 {
-    if !lbiHoleKindSpelled(hdKind[row]) { return 0 }
+    // A hole less `null` names no arena type but the `null` every arena mints.
+    const ln = hdKind[row] == HD_GNOT && hdAlt[row] == TY_NULL
+    if !ln && !lbiHoleKindSpelled(hdKind[row]) { return 0 }
     kinds.push(hdKind[row])
     fields.push(hdField[row])
+    lessNull.push(ln)
     t = hdBase[row]
     row = hdRowOf(t)
   }
@@ -1169,6 +1181,7 @@ function lbiApplyHolePin(n: LetDecl, d: i32, h: i32) {
   lbiHoleRoot[ann] = [rt.tvName, tyVarOwnerOf(t)]
   lbiHoleKinds[ann] = kinds
   lbiHoleFields[ann] = fields
+  lbiHoleLessNull[ann] = lessNull
   lbiSynth[ann] = d
   markLetRetyped(d)
   const nn: Node = {
@@ -1178,7 +1191,8 @@ function lbiApplyHolePin(n: LetDecl, d: i32, h: i32) {
     letInit: n.letInit,
     pos: n.pos,
   }
-  return arenaSetNode(d, nn)
+  arenaSetNode(d, nn)
+  return 1
 }
 
 // Is derivation `k` named by its field alone? The rest carry an arena type in their name.
