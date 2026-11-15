@@ -227,7 +227,7 @@ Deno.test({
 
 // A fixture clone whose remote has unmerged branches: `--next` and `--reserve` skip every id a
 // branch adds a row or a reservation for beside `origin/master`, and ignore a claim whose work
-// has landed (an id in it is filed on master).
+// has landed (an id in it is filed on master). A filed row is taken with or without a reservation.
 const git = async (cwd: string, args: string[]) => {
   const { code, stderr } = await new Deno.Command("git", {
     args: ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=master", ...args],
@@ -302,6 +302,29 @@ Deno.test({
         await ls(co, ["--reserve", "D6-D7", "me"]),
         0,
         "reserved D6-D7\n",
+      );
+      check(
+        "--reserve over a row master files with no reservation",
+        await ls(co, ["--reserve", "D9-D11", "me"]),
+        1,
+        "ls.vl: D9-D11 overlaps D10, already filed\n",
+      );
+      // Master files a row after the clone, with no reservation: once fetched, it is taken.
+      await Deno.writeTextFile(`${src}/${inv}/D20.md`, "### D20 — a row\n**closed**\n");
+      await git(src, ["add", "-A"]);
+      await git(src, ["commit", "-q", "-m", "master files D20"]);
+      await git(co, ["fetch", "-q"]);
+      check(
+        "--next past a row a fetched origin/master files",
+        await ls(co, ["--next"]),
+        0,
+        "D21\n",
+      );
+      check(
+        "--reserve over a row a fetched origin/master files",
+        await ls(co, ["--reserve", "D19-D21", "me"]),
+        1,
+        "ls.vl: D19-D21 overlaps D20, already filed\n",
       );
       // Outside a git checkout there is no remote to ask: the first test's fixture covers that.
     } finally {
