@@ -43,11 +43,11 @@ Measured against this branch's base (master after #8109), built to its own fixpo
 
 Stage 3's interning removes the accessor cost, because a child is then an id.
 
-**Phase-state baseline.** Routing reads through the accessors raises L5's census "surface" in 36
-non-checker modules. Those reads were already direct field accesses on checker types, so this is
-the same dependence made visible, not new reach. The coordinator ruled for a baseline rewrite in
-this PR. The long-term fix is for the census to count a type-arena child read as no checker fact
-(lane Q).
+**Phase-state census.** The accessors, `tyOpen`, `tyPin*`, `declKeyOf` and `holeReset` are listed in
+`TY_ARENA_API` (`scripts/phase-state-census.vl`, #8148). Importing them counts as `arena` (92
+imports), not checker surface. Surface stays flat with master: 2,789 imports of 1,166 distinct
+symbols. The baseline records only two falls: `cross` in `check_types.vl` 23 → 22, and `surface`
+in `emit_shape_rows.vl` 97 → 96.
 
 **2b deletes nothing yet.** The 10 non-pin bumps, the `TY_OPEN` sentinel handling and
 `tyVarOwner`'s hole half are 2c, with D16365's hole-to-hole union and G's matrix as its
