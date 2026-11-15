@@ -160,7 +160,6 @@ import {
   substTyDeepOf,
   tyProvesNonNull,
 } from "./check_relate_core"
-import { ovPickFor } from "./check_demands"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
 import {
   cwBindingWrittenValues,
@@ -377,7 +376,7 @@ import {
   nodeSpineChildren,
   nodeToks,
   orderArgsByParamNames,
-  ovSiteSetOf,
+  ovInstPickAt,
   tsMentionsAnyName,
   ufcsAliasAtSite,
   ufcsSiteCarry,
@@ -400,6 +399,7 @@ import {
   identDeclOf,
   identFrom,
   identFromDecl,
+  memberIsTypeBound,
   memberMethodOf,
   nodeSrc,
   nodeSrcNote,
@@ -6524,6 +6524,32 @@ function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
   let newCallee = n.callFn
   if n.callFn < 0 { return ix }
   const callee = nodeAt(n.callFn)
+  // A type-bound member call is the direct call this instance's receiver type picks: the rewrite
+  // lowered the shared template once, and a nested function's clones share it (D16383).
+  const tbRecv = if callee is Member { elabWalkTy(callee.memObj) } else { -1 }
+  if (
+    callee is Member
+    && memberIsTypeBound(ix, callee.memProp)
+    && drwMemberDeferred(ix)
+    && !hasNamedArgs(n.callArgNames)
+    && tbRecv >= 0
+    && !tyHasTyVar(tbRecv)
+  ) {
+    const tbName = ovInstPickAt(ix, tbRecv)
+    if tbName != "" {
+      const tbArgs: i32[] = [monoCloneGenericCalls(callee.memObj)]
+      for a in n.callArgs { tbArgs.push(monoCloneGenericCalls(a)) }
+      const tbFn = mkIdent(tbName, -1)
+      identFromDecl(tbFn, monoFnDeclNamed(tbName))
+      noteCallOrigin(tbFn, ix)
+      const tbNone: string[] = []
+      const tbc = mkCallN(tbFn, tbArgs, tbNone, n.pos)
+      nodeSrcNote(tbc, ix)
+      drwFillDefaults(tbc, monoPinCtx)
+      nodeTyCarry(tbc, ix)
+      return tbc
+    }
+  }
   let lamCall = false
   let cellCall = false
   if callee is Ident {
@@ -7092,14 +7118,15 @@ function monoPinMemberCall(
     // merge walk banked its answer on.
     let puName = ufcsAliasAtSite(ix, pcallee.memProp)
     // An overloaded name picks its candidate by this instance's receiver (`ovPinCheck`).
-    const puRow = ovSiteSetOf(ix)
     let puDecl = drwSelfDeclAt(ix, nargs.length + 1)
-    if puRow >= 0 && precvArgTy >= 0 {
-      const puPick = ovPickFor(puRow, precvArgTy)
-      if puPick != "" && puPick != "*" {
-        puName = puPick
-        puDecl = -2
-      }
+    // The candidate this instance's receiver took, as the checker banked it: an overload set's
+    // or the type-bound rung's, either of which differs between instances.
+    let puRecv = precvArgTy
+    if puRecv < 0 { puRecv = elabWalkTy(pcallee.memObj) }
+    const puPick = if puRecv >= 0 { ovInstPickAt(ix, puRecv) } else { "" }
+    if puPick != "" {
+      puName = puPick
+      puDecl = -2
     }
     if puDecl >= 0 { puName = binderNameAt(puDecl) }
     let puOk = puDecl >= 0
