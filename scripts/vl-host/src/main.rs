@@ -4540,6 +4540,7 @@ fn compile_vl_instance(
         }
     }
     arm_cls_census(inst, &mut store);
+    arm_ir_shadow(inst, &mut store);
     // Identity shadow ($VL_ID_SHADOW=1 records and reports, =2 also keys callback
     // specialization by it): armed before the compile, read back after it. A seed
     // without `setIdShadow` ignores it.
@@ -4567,6 +4568,7 @@ fn compile_vl_instance(
     report_guest_alloc(resident0);
     report_late_demands(inst, store, source_path);
     report_cls_census(inst, store, source_path);
+    report_ir_shadow(inst, store, source_path);
     if id_shadow > 0 {
         report_id_shadow(inst, store, source_path);
     }
@@ -4613,6 +4615,48 @@ fn report_id_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
             .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
             .collect();
         rows.push_str(&format!("[id-shadow] {path}: {row}\n"));
+    }
+    eprint!("{rows}");
+}
+
+/// Whether `$VL_IR_SHADOW=1` asked the guest to build and verify each function's IR.
+fn ir_shadow_on() -> bool {
+    std::env::var("VL_IR_SHADOW").ok().as_deref() == Some("1")
+}
+
+/// Under `$VL_IR_SHADOW=1`, arm the guest's IR shadow. A seed without `irShadowArm` ignores it.
+fn arm_ir_shadow(inst: &Instance, store: &mut Store<()>) {
+    if !ir_shadow_on() {
+        return;
+    }
+    if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut *store, "irShadowArm") {
+        let _ = set.call(&mut *store, 1);
+    }
+}
+
+/// Under `$VL_IR_SHADOW=1`, print one `[ir] <path>: <n>\t<row>` line to stderr per row the
+/// shadow counted (a verifier failure's row carries the function's printed IR after it).
+fn report_ir_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
+    if !ir_shadow_on() {
+        return;
+    }
+    let (Ok(count), Ok(len), Ok(at), Ok(num)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "irShadowRowCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "irShadowRowLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "irShadowRowAt"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "irShadowRowN"),
+    ) else {
+        return;
+    };
+    let n = count.call(&mut *store, ()).unwrap_or(0);
+    let mut rows = String::new();
+    for i in 0..n {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let row: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        let k = num.call(&mut *store, i).unwrap_or(0);
+        rows.push_str(&format!("[ir] {path}: {k}\t{row}\n"));
     }
     eprint!("{rows}");
 }
