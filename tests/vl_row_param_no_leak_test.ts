@@ -21,6 +21,8 @@ const SRC = [
   /* 4 */ "const w: W = { x: 1, y: 2 }",
   /* 5 */ "print(f(w))",
   /* 6 */ "print(w.g())",
+  /* 7 */ "const h = (p: P) => print(p.y)",
+  /* 8 */ "h(w)",
   "",
 ].join("\n");
 
@@ -31,6 +33,8 @@ const WANT: [number, number, string][] = [
   [2, 9, "(p: P) => i32"], // the function's name
   [3, 27, "P"], // a UFCS `self`
   [5, 6, "(p: P) => i32"], // the callee at a call that passes the wider row
+  [7, 11, "P"], // a lambda's parameter (D16400)
+  [8, 0, "(P) => void"], // the lambda's binding at a call that passes the wider row
 ];
 
 Deno.test({

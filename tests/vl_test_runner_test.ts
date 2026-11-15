@@ -1015,6 +1015,18 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-test: toBeNear takes an absolute tolerance, inclusive at the bound",
+  ignore: !ENABLED,
+  fn: async () => {
+    const r = await runTest(`${ROOT}/tests/fixtures/vl-test-near`);
+    if (r.code !== 1) throw new Error(`want the two failing cases red, got ${r.code}:\n${r.err}`);
+    expectHas(r.err, "1 file · 8 passed · 2 failed");
+    expectHas(r.err, "expected 1.004 to be near 1 within 0.001 (differs by 0.00");
+    expectHas(r.err, 'expected "1" to be near 1 within 0.5');
+  },
+});
+
+Deno.test({
   name: "vl-test: an f64 renders in its message; --show-output shows a passing test's output",
   ignore: !ENABLED,
   fn: async () => {

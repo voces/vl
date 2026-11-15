@@ -9703,8 +9703,9 @@ seed-size baseline is rewritten with it.
 
 **The ruling.** A `const` whose initialiser is literal arithmetic — numeric literals, other such
 `const`s, parentheses, unary minus, `~`, `+ - * / %`, `& | ^`, `<< >> >>>`, with integer and
-float literals — is computed EXACTLY, like Go's untyped constants or Zig's `comptime_int`, and
-typed at each use. A use whose destination cannot hold the exact value is a check error
+float literals — is folded and typed at each use. Its integer arithmetic is EXACT, like Go's
+untyped constants or Zig's `comptime_int`; its float arithmetic is IEEE-754, as at run time
+(owner, 2026-11-15, below). A use whose destination cannot hold the exact value is a check error
 (`constant 2147483648 overflows i32`), never a silent wrap. It extends ruling C (a bare literal
 `const` is its literal at every read). A tree that reads a variable, calls a function, or names a
 `let` is untouched, and so is an annotated `const` except as below.
@@ -9743,19 +9744,19 @@ tree read stays an editor reference.
   element — is that integer when it is a whole number (`2.5 * 4` is `10` at `i64`); otherwise it
   is refused as any float there is.
 * An integer constant at `f32` or `f64` is taken as an integer literal is: when that float holds
-  it exactly, and refused otherwise (D1890's rule; a VL integer literal does not round). A float
-  constant is exact until its use: `0.1 + 0.2` is the `f64` nearest 0.3 and the `f32` nearest
-  0.3, not the sum of two rounded values.
+  it exactly, and refused otherwise (D1890's rule; a VL integer literal does not round).
+* **A float constant folds in IEEE-754 (owner, 2026-11-15, lane O's spec question 9; this
+  reverses ruling A's float half).** Folding never changes a float result: each float literal is
+  its nearest double, each float operation rounds to the nearest double, ties to even, and an
+  integer operand converts to the nearest double as it enters one. So `0.1 + 0.2` is
+  0.30000000000000004, `1.5 % 0.1` is 0.09999999999999992, `(1.5 % 0.1) / (2.5 % 0.1)` is
+  1.0000000000000007, and `1.0 + 1.0/9007199254740992.0` is `1.0`. A float zero keeps its sign
+  (`0.0 * -1.0` is `-0`). The integer part of a mixed tree still folds exactly, and a float
+  result at an integer destination is still refused unless it is whole. A tree initialising a
+  binding annotated `f32` folds in `f32` arithmetic; at any other `f32` use the fold sees no use
+  type, so the double result rounds once more to `f32` (D16414, open).
 * **Precision.** Integers are exact to 512 bits, past which the expression is a check error
-  (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound. A
-  float constant is an exact fraction whose numerator and denominator are each held to 4096
-  bits, enough for every finite double and its reciprocal. It reaches its use as a decimal
-  literal: exact when its expansion terminates within 400 characters, otherwise to 800
-  significant digits and a sticky last digit when anything is cut. Every rounding boundary of
-  an `f32` or `f64` has fewer significant digits than that, so the use rounds the literal as it
-  would the exact value (`1.0 + 1.0/9007199254740992.0 + 1.0/3.0/1e70` is the double above 1,
-  where 60 digits read a tie and rounded to 1). A float zero keeps its sign, as IEEE does:
-  `0.0 * -1.0` is `-0`, and `-0.0 + 0.0` is `+0`.
+  (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound.
 * **A refusal names the constant and the destination** at an integer, float or union
   destination: `constant 2147483648 overflows i32`, `constant 123456789000 is not exact at f32`,
   `constant 1.5 is not a whole number, so i64 cannot hold it`, `constant 2147483648 fits no
@@ -9784,19 +9785,23 @@ tree read stays an editor reference.
   division and then converts: `let x: f64 = 0xFFFFFFFF + 1000` is 4294968295 and
   `(0xFFFFFFFF + 1000) + p` with `p: f64` adds 4294968295. This reverses D14990's reading, which
   computed such a tree at 32 bits (`const c: f64 = 0x7FFFFFFF << 2` was -4, now 8589934588).
-  The bare pattern is unchanged: `0xFFFFFFFF as f32` reads the 32-bit pattern (-1.0) and
-  `as f64` the 64-bit one; an `f32` use and no context keep their 32 bits (D16390).
+  An `f32` use and no context keep their 32 bits (D16390).
+* **In a float context a radix literal is the value its digits spell (owner, 2026-11-15, ruling
+  4.1, as clarified).** At an `f32` or `f64` destination, or beside a float, the float must hold
+  that value exactly, as it must a decimal integer literal (`const b: f32 = 0x7FFFFFFF` is
+  refused); `as f32` / `as f64` rounds it, so `0xFFFFFFFF as f32` is 4294967296 where it was -1.0,
+  the pattern's signed value. An integer context keeps the bit pattern.
 * **A numeric literal joined with a typed value adopts its type where it fits (owner, 2026-11-15,
   ruling 4.3).** One rule for every join form, `if` and `match` arms, `??` and list elements: a
   literal beside values of one numeric type takes that type when the type holds it (an integer
   literal exactly, a float literal at `f32` as `let x: f32 = 0.1` does), and otherwise keeps its
   own and the join widens as before. `if c { 5 } else { f }` and `[5, f]` with `f: f32` are
   `f32`; `[0.1, f]` is `f32[]`; `if c { 9000000000 } else { f }` is `i64 | f32`. A join of two
-  typed members of different types keeps today's reading. This turns on the list half D2774
-  held back; an inferred return still keeps its reading.
+  typed members of different types keeps today's reading. An un-annotated function's returns
+  are a join too, so `if c { return 5 } return fv` infers `f32` (D2774).
 * **A float division by zero, and a float constant past the largest double, are not folded.**
-  VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
-  computation they were; Go refuses both.
+  `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE computation they were, which gives the same
+  Infinity or NaN; Go refuses both.
 * `>>>` of a negative constant depends on the width it runs at, so it is not folded either, and
   a tree containing one keeps the literal-tree reading at its destination's width (D2709).
 * A `u8` element takes a constant as it takes the literal (past 255 refused, a negative one
@@ -9805,8 +9810,19 @@ tree read stays an editor reference.
 * An annotated `const` is a typed constant (owner, 2026-09-30): its annotation is the tree's
   destination, so `const x: i32 = 2147483647 + 1` is refused rather than wrapped.
 * An integer literal past the `i64` range is refused wherever no float holds it exactly
-  (D3425), where it used to keep its low 64 bits; a constant past it (`1 << 64`) is refused at
-  the use, not where it is declared, so `(1 << 70) >> 60` is 1024.
+  (D3425), where it used to keep its low 64 bits; a constant past it (`(1 << 62) * 4`) is refused
+  at the use, not where it is declared, so `((1 << 62) * 4) >> 60` is 16.
+* **A constant shift count decides an untyped literal operand's width (owner, 2026-11-15, Q8).**
+  A count of 0 to 31 leaves the literal `i32`; a count of 32 to 63 makes it `i64`, so
+  `(-3) >>> (40 + 1)` and `0xFFFFFFFF >> (40 + 1)` compute at 64 bits; a count of 64 or more is
+  refused with E6.2's sentence (`4294967296 >> 65535`, `1 << 64`). An operand whose type is fixed,
+  a declared `x: i32` or an `i32` destination (`const c: i32 = (-3) >>> (40 + 1)`), keeps E6.2's
+  refusal for a count past its width. The count may be a literal or a constant tree (D16378).
+  A shift is typed at its left operand, and a count never types it: an untyped literal takes its
+  destination's or peer's width first, then a constant count's widening, so
+  `(0xFFFFFFFF << 31) << c` at an `i64` is -17179869184 whether `c` is `i32` or `i64`; a variable
+  count widens nothing (`1 << c` with `c: i64` is an `i32`), and `x <<= w` with `x: i32` and an
+  `i64` count is legal.
 * In a generic body, an `i64` operand beside a type-parameter operand records a constraint
   (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit operand it meets`),
   since the body alone cannot see the width (D2712, D3426);

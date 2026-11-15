@@ -23,9 +23,11 @@ import { nodeTyIx, nodeTyOf, nodeTySet } from "./check_node_tys"
 import {
   binFloatOperandPair,
   binIntOnlyOp,
+  cexCountBelow,
   cmpF32LitAdopts,
   isExactF64IntLitExpr,
   isF32AdoptingLitExpr,
+  litTreeOps,
   litTreeWideTy,
   numLitDstTy,
   numLitOwnTy,
@@ -33,6 +35,9 @@ import {
   radixLitTreeAt,
 } from "./check_num_lits"
 import { parenPeelIx } from "./check_places"
+import { cexEvalAt } from "./check_num_lit_state"
+import { cexDecText, cexOk } from "./const_exact"
+import { numLexFitsI32 } from "./emit_bignum"
 import { mixesNumeric, widerNumeric } from "./check_ty_relate"
 import {
   isNumericPrimTy,
@@ -93,6 +98,15 @@ export function radixTreeF64Pair(n: BinExpr, a: i32, b: i32): boolean {
     || primNameOf(b) == "f64" && a == TY_I64 && radixLitTreeAt(n.binLeft)
 }
 
+// Whether `a op b` is an integer shift, which is typed at its left operand: a count never types
+// it, whatever the count's own width (owner ruling Q8).
+export function shiftKeepsLeft(op: string, a: i32, b: i32): boolean {
+  if !binShiftOp(op) { return false }
+  const an = primNameOf(a)
+  const bn = primNameOf(b)
+  (an == "i32" || an == "i64") && (bn == "i32" || bn == "i64")
+}
+
 // The type both operands of `a op b` are brought to at one member pair, which is the result
 // for arithmetic, or -1 when the scalar rule refuses the pair.
 export function numPairOpTy(n: BinExpr, a: i32, b: i32): i32 {
@@ -106,6 +120,7 @@ export function numPairOpTy(n: BinExpr, a: i32, b: i32): i32 {
     return b
   }
   if binIntOnlyOp(op) && binFloatOperandPair(a, b) { return -1 }
+  if shiftKeepsLeft(op, a, b) { return a }
   if primNameOf(a) == "f32" && f32AdoptingOperand(n.binRight, a) { return a }
   if primNameOf(b) == "f32" && f32AdoptingOperand(n.binLeft, b) { return b }
   if primNameOf(a) == "f64" && isExactF64IntLitExpr(n.binRight) { return a }
@@ -348,6 +363,32 @@ function litTreeAdopt(ix: i32, ty: i32): i32 {
     return litTreeAdopt(e.binRight, ty)
   }
   litTreeAdoptLeaf(ix, ty)
+}
+
+// Whether `ix` shifts a literal tree by a constant count of 32 to 63, which makes that untyped
+// operand an `i64` (owner ruling Q8, D16378).
+export function shiftWidensLit(ix: i32): boolean {
+  const e = nodeAt(parenPeelIx(ix))
+  if !(e is BinExpr) || !binShiftOp(e.binOp) || litTreeOps(e.binLeft, 32) < 0 {
+    return false
+  }
+  const cv = cexEvalAt(e.binRight, 0)
+  if !cexOk(cv) || cv.cxFloat || cv.cxNeg { return false }
+  const lex = cexDecText(cv)
+  numLexFitsI32(lex) && cexCountBelow(lex, 64) && !cexCountBelow(lex, 32)
+}
+
+// The left operand of the shift at `ix` built at `ty`: `i64` where its count widens it, `i32` at
+// an `i32` destination, where the count is then refused.
+export function shiftLitAdopt(ix: i32, ty: i32): i32 {
+  const sx = parenPeelIx(ix)
+  if sx < 0 || sx >= P.nodes.length { return ty }
+  const e = nodeAt(sx)
+  if !(e is BinExpr) || inferQuiet { return ty }
+  litTreeAdopt(e.binLeft, ty)
+  nodeTySet(sx, ty)
+  tailParensSync(ix)
+  ty
 }
 
 // A tree's other nodes are its literals (`litTreeOps` admits no other), each recorded so a
