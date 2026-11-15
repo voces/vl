@@ -38,7 +38,6 @@ import {
   LoopVar,
   MatchExpr,
   Member,
-  Node,
   NullLit,
   NumLit,
   OP_INDEX_GET,
@@ -57,7 +56,6 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
-  arenaSetNode,
   i32ToStr,
   mkBlock,
   mkCall,
@@ -200,6 +198,7 @@ import {
   numDeliverStamp,
   radixLitAdoptPeer64,
   recContainerReadFresh,
+  recFitNarrowedFields,
   recJoinFixed,
   recordBoxTy,
   recordContainedIsAt,
@@ -208,9 +207,7 @@ import {
   stampNullUnitCell,
   storeWritePush,
   strLitSetsDisjoint,
-  tyTestMayFit,
   tyTestMeet,
-  tyTestNamesMembers,
 } from "./check_fit_rules"
 import { HD_BINOP, HD_ELEM, elemValueHoleBase } from "./check_hole_pins"
 import {
@@ -247,7 +244,6 @@ import {
   isVarTyIxPush,
   isVarTyIxSetAt,
   luAt,
-  luGrow,
   luRef,
   luTrap,
   luValueAt,
@@ -348,6 +344,8 @@ import {
 import { roWriteMsg } from "./check_overload"
 import { parenPeelIx, placeKeyOf } from "./check_places"
 import {
+  TT_COVERED,
+  TT_PARTLY,
   assignable,
   bindGenWalk,
   cnhFill,
@@ -371,6 +369,9 @@ import {
   tErrUnsupported,
   tErrWant,
   tyProvesNonNull,
+  tyTestMayFit,
+  tyTestMemberFit,
+  tyTestNamesMembers,
   unknownTyErr,
   widenLitTy,
 } from "./check_relate_core"
@@ -2227,11 +2228,50 @@ function checkCastUnionArm(
 }
 
 // `x as? B` or `x as! B` over union `argU` where one record member `A` may fit `B` by its
-// fields' values (`recPartFitArm`), rewritten in place to `if x is B { const $rh: A = x; $rh }
-// else { null }` (`__trap__()` for `as!`), `x` bound once first unless it is a name: the value
-// is the `A` the test narrows to. -1 for any other cast, which propagates or has no such member.
+// fields' values (`recPartFitArm`), rewritten in place to `{ const $rc = x; if $rc is B {
+// const $rh: A = $rc; $rh } else { null } }` (`__trap__()` for `as!`): the value is the `A` the
+// test narrows to. -1 for any other cast, which propagates or has no such member.
 function castPartFitAt(n: AsExpr, ix: i32, argU: i32, target: i32): i32 {
-  const arm = recPartFitArm(argU, target)
+  castFitAt(n, ix, argU, recPartFitArm(argU, target), target)
+}
+
+// A record `x` cast to record `target` it is contained in or may be by its fields' values
+// (`tyTestMemberFit`), as `castPartFitAt` rewrites one arm: a test of `x` itself (D16322).
+function castRecordFitAt(n: AsExpr, ix: i32, arg: i32, target: i32): i32 {
+  if (
+    arg < 0
+    || target < 0
+    || !(tyAt(arg) is TyObj)
+    || !(tyAt(target) is TyObj)
+  ) {
+    return -1
+  }
+  if tyHasTyVar(arg) || tyHasTyVar(target) { return -1 }
+  const f = tyTestMemberFit(arg, target)
+  const names: string[] = []
+  const sets: i32[] = []
+  const part = f == TT_PARTLY
+    && recFitNarrowedFields(arg, target, names, sets) == 1
+  if f != TT_COVERED && !part { return -1 }
+  // A contained record always fits: the cast hands the operand back as it is.
+  if f == TT_COVERED && (n.asMode == "null" || n.asMode == "trap") {
+    if inferQuiet {
+      return if n.asMode == "null" { mkNullableTy(arg) } else { arg }
+    }
+    if luTs(arg) < 0 { return -1 }
+    const recv = luDecl("const", "$rc" + i32ToStr(ix), arg, n.asObj, ix, n.pos)
+    const stmts: i32[] = []
+    stmts.push(recv)
+    stmts.push(luRef(recv, ix, n.pos))
+    luValueAt(ix, stmts, n.pos)
+    return checkNodeHook(ix)
+  }
+  castFitAt(n, ix, arg, arg, target)
+}
+
+// The rewrite itself, of the cast over `argU` whose hit is held as record `arm`; -1 for no arm
+// or a mode that propagates.
+function castFitAt(n: AsExpr, ix: i32, argU: i32, arm: i32, target: i32): i32 {
   if arm < 0 || n.asMode != "null" && n.asMode != "trap" { return -1 }
   if inferQuiet {
     return if n.asMode == "null" { mkNullableTy(arm) } else { arm }
@@ -2240,10 +2280,9 @@ function castPartFitAt(n: AsExpr, ix: i32, argU: i32, target: i32): i32 {
   const recvTy = if luTs(argU) >= 0 { argU } else { nodeTyIxOf(n.asObj) }
   if luTs(recvTy) < 0 || luTs(arm) < 0 || luTs(target) < 0 { return -1 }
   const pos = n.pos
-  // A name is read again in place; any other operand is bound once first.
-  const ox = parenPeelIx(n.asObj)
-  const named = ox >= 0 && nodeAt(ox) is Ident && identDeclOf(ox) >= 0
-  const recv = if named { identDeclOf(ox) } else { luDecl("const", "$rc" + i32ToStr(ix), recvTy, n.asObj, ix, pos) }
+  // The operand is bound once first, so the test narrows that binding and not the operand's own
+  // name, which a later cast reads at its declared type (D16322).
+  const recv = luDecl("const", "$rc" + i32ToStr(ix), recvTy, n.asObj, ix, pos)
   // The hit is delivered through a binding at the arm, which unboxes it.
   const hit = luDecl(
     "const",
@@ -2262,13 +2301,6 @@ function castPartFitAt(n: AsExpr, ix: i32, argU: i32, target: i32): i32 {
   const test = luTyTest(luRef(recv, ix, pos), target, ix, pos)
   const thenB = luAt(mkBlock(thenStmts, pos), ix)
   const elseB = luAt(mkBlock(elseStmts, pos), ix)
-  if named {
-    const w: Node = { ifCond: test, ifThen: thenB, ifElse: elseB, pos: pos }
-    arenaSetNode(ix, w)
-    valueIfAdd(ix)
-    luGrow()
-    return checkNodeHook(ix)
-  }
   const pick = luAt(mkIf(test, thenB, elseB, pos), ix)
   valueIfAdd(pick)
   const stmts: i32[] = []
@@ -2338,6 +2370,8 @@ function checkCastScalar(n: AsExpr, ix: i32, arg: i32, target: i32): i32 {
       return target
     }
     if redundantCastRaise(n, arg, target, ix) { return TY_ERR }
+    const rf = castRecordFitAt(n, ix, arg, target)
+    if rf != -1 { return rf }
     tErr(
       "`as` supports numeric conversions only" + emptyArrCastHint(n.asObj, target),
       ix,

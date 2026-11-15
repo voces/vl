@@ -6370,6 +6370,21 @@ function isTestedEveryMember(op: i32, t: i32): boolean {
   true
 }
 
+// Whether every operand arm (`opTags`/`opVis`) holding tag `tag` is among the tested `isVis`.
+function isTagWhollyTested(
+  tag: i32,
+  opTags: i32[],
+  opVis: i32[],
+  isVis: i32[],
+): boolean {
+  let i = 0
+  while i < opTags.length && i < opVis.length {
+    if opTags[i] == tag && !i32ListHas(isVis, opVis[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
 // Whether closed record or list type `op` is the tested type `t` itself.
 function isPinOwn(op: i32, t: i32): boolean {
   if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return false }
@@ -7181,9 +7196,24 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
       let chainOk = isTags.length > 1
         && exprUnion(nd.isObj, fnIx)
         && unionEqOperandOk(nd.isObj)
+      // A variant told apart by a field's value shares its tag; the tag alone answers where
+      // every operand arm holding that tag is tested (`tyTestMeet`'s members, D16320).
+      const opTags: i32[] = []
+      const opVis: i32[] = []
+      const opArms = unionArmTagsOfTy(
+        nodeTyAt(nd.isObj, fnIx),
+        -1,
+        opTags,
+        opVis,
+      )
       let ci = 0
       while ci < isVis.length {
-        if variantHasDiscrimField(isVis[ci]) { chainOk = false }
+        if (
+          variantHasDiscrimField(isVis[ci])
+          && !(opArms && isTagWhollyTested(isTags[ci], opTags, opVis, isVis))
+        ) {
+          chainOk = false
+        }
         ci = ci + 1
       }
       if chainOk {
@@ -24398,7 +24428,7 @@ function emitNumWrapCast(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
 // `ref.as_non_null`, and `as?`'s result type is the operand's own rep (D1812).
 function emitAsNulNiche(body: u8[], e: AsExpr, fnIx: i32) {
   const obj = e.asObj
-  const payload = nulRefNichePayloadTy(nodeTyIxOf(obj))
+  const payload = nulRefNichePayloadTy(nodeTyAt(obj, fnIx))
   if payload < 0 {
     return emitFailAt(
       "emitProgram: `as "
@@ -24465,7 +24495,7 @@ function nulNicheHeapOf(obj: i32, payload: i32, fnIx: i32): i32 {
   if exprNulClosure(obj, fnIx) { return cloStructIdx }
   if exprNullableMap(obj, fnIx) {
     let ms = mapShapeOfExpr(obj, fnIx)
-    if ms == -3 { ms = mapShapeOfTyPeeled(nodeTyIxOf(obj)) }
+    if ms == -3 { ms = mapShapeOfTyPeeled(nodeTyAt(obj, fnIx)) }
     if ms != -3 { return mapTypeIdxOf(ms) }
   }
   -1
@@ -38254,10 +38284,17 @@ function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
   if own == NULL_OWN_NONE && d.rdKind == "nulnone" {
     own = nullOwnOfTy(nodeCtxTyIxOf(parenPeelIx(exprIx)))
   }
-  // A list element is the null of the element its list literal is built at (D16311).
-  if own == NULL_OWN_NONE && d.rdKind == "nulnone" {
-    const lo = ctxElemOwnerOf(parenPeelIx(exprIx))
-    if lo >= 0 { own = listElemNullOwn(nodeTyAt(lo, fnIx)) }
+  // A list element is the null of the element its list literal is built at (D16311), whatever
+  // the element's own stamp names: a null-only literal is built at its destinations'
+  // (D16316).
+  const lo = ctxElemOwnerOf(parenPeelIx(exprIx))
+  if lo >= 0 {
+    const lt = listLitBuiltTy(lo, fnIx)
+    if lt >= 0 {
+      own = listElemNullOwn(lt)
+    } else if own == NULL_OWN_NONE && d.rdKind == "nulnone" {
+      own = listElemNullOwn(nodeTyAt(lo, fnIx))
+    }
   }
   // An instance's stamp can be an inner join's, which a delivery at a wider type outlives: the
   // instance's contextual type, where closed, names the null its storage holds (D14640).
@@ -38267,6 +38304,25 @@ function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
     if co != NULL_OWN_NONE { own = co }
   }
   own
+}
+
+// The list type literal `lo` builds its elements at in `fnIx` when that element admits `null`
+// and is more than `null`: its own type, else its destinations' agreed one; -1 otherwise.
+function listLitBuiltTy(lo: i32, fnIx: i32): i32 {
+  for t in [nodeTyAt(lo, fnIx), tyAtInstance(arrLitDestTy(lo), fnIx)] {
+    if t >= 0 && t < T.tys.length {
+      const n = tyAt(t)
+      if (
+        n is TyArray
+        && n.aElem >= 0
+        && !isNullTy(n.aElem)
+        && tyAdmitsNull(n.aElem)
+      ) {
+        return t
+      }
+    }
+  }
+  -1
 }
 
 // The null the element of list type `t` (through `| null`) names, as `nullOwnOfTy` does.
