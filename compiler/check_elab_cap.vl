@@ -17,6 +17,7 @@ import {
   CW_UP_ELEM,
   CW_UP_LETINIT,
   cwBindingOf,
+  cwCalleeDeclOf,
   cwDeclFnWrites,
   cwFnCalls,
   cwFnValueDeclOf,
@@ -3833,8 +3834,10 @@ function fnTagRecLitsOnly(v: i32, t: i32, depth: i32): boolean {
   return true
 }
 
-// The rep stamped at the place `v` reads: a stamped node or binding, or an element or field of
-// one; -1 where no stamp reaches it.
+// The rep stamped at the place `v` reads: a stamped node or binding, a call whose result holds a
+// tagged set, or an element or field of one; -1 where no stamp reaches it.
+export function fnTagPlaceRepOf(v: i32): i32 { fnTagPlaceRep(v) }
+
 function fnTagPlaceRep(v: i32): i32 {
   // The place is walked inward to the first stamped node or binding; `steps` is the path back.
   let x = if v >= 0 && v < P.nodes.length { parenPeelIx(v) } else { -1 }
@@ -3859,6 +3862,10 @@ function fnTagPlaceRep(v: i32): i32 {
       // A `get` reads one slot, `| null`.
       steps.push("?")
       x = parenPeelIx(fnTagGetRecv(x))
+    } else if xn is Call && cwCalleeDeclOf(xn.callFn) >= 0 {
+      // A named function's result is the literal it returns, read down to its stamp.
+      t = fnTagRetPlaceRep(cwCalleeDeclOf(xn.callFn), steps)
+      hops = 16
     } else {
       // Any other node is the root: a name reads its binding's stamp.
       const d = identDeclOf(x)
@@ -3887,6 +3894,65 @@ function fnTagPlaceRep(v: i32): i32 {
     k = k - 1
   }
   return t
+}
+
+// The rep the steps `steps` (innermost last) reach inside each value function `d` returns, those
+// steps popped: a node's stamp, else the rep its literal is built at (`fnTagHeldNote`'s rule for
+// one that is not bound); -1 when the returned values give different reps or one gives none.
+function fnTagRetPlaceRep(d: i32, steps: string[]): i32 {
+  const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(f is FuncDecl) || f.fnBody < 0 { return -1 }
+  const rv: i32[] = []
+  a20RetWalk(f.fnBody, true, rv)
+  let rep = -1
+  let used = -1
+  for v in rv {
+    let x = parenPeelIx(v)
+    let k = steps.length - 1
+    let t = -1
+    while x >= 0 && x < P.nodes.length && t < 0 {
+      t = fnTagHeldRep[x] ?? -1
+      const xn = nodeAt(x)
+      if t >= 0 {
+        // Stamped.
+      } else if k < 0 {
+        t = fnTagLitRep(x)
+        x = -1
+      } else if xn is ObjLit && steps[k] != "" {
+        x = fnTagLitFieldValue(xn, steps[k])
+        k = k - 1
+      } else if xn is ArrayLit && steps[k] == "" && xn.arrElems.length > 0 {
+        x = parenPeelIx(xn.arrElems[0])
+        k = k - 1
+      } else {
+        x = -1
+      }
+    }
+    if t < 0 || rep >= 0 && (t != rep || k != used) { return -1 }
+    rep = t
+    used = k
+  }
+  while rep >= 0 && steps.length > used + 1 { steps.pop() }
+  rep
+}
+
+// The rep an unbound list or record literal `x` holding a tagged set is built at: its type with
+// each list of ids the `i32` list, and a list of record literals' tagged fields ids; -1 for none.
+function fnTagLitRep(x: i32): i32 {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is ArrayLit) && !(n is ObjLit) { return -1 }
+  const t = nodeTyIxOf(x)
+  if !fnTagHoldsTy(t, 16) { return -1 }
+  fnTagRepTyIn(t, 16, fnTagRecLitsOnly(x, t, 1))
+}
+
+// The value record literal `o` gives field `name`, or -1.
+function fnTagLitFieldValue(o: ObjLit, name: string): i32 {
+  for fx in o.objFields {
+    const fi = nodeAt(fx)
+    if fi is FieldInit && fi.fiName == name { return parenPeelIx(fi.fiValue) }
+  }
+  -1
 }
 
 // The receiver of `x` when it is a one-argument `get` call, or -1.

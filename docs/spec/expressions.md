@@ -455,8 +455,8 @@ operator (types.md §T2.3).
 > (lane O's spec question 9): float constants fold in IEEE, which reverses that ruling's
 > float half.
 
-> Status: a tree folds in `f32` arithmetic at every `f32` use. A `const` with no annotation, read
-> at `f32`, still folds in doubles and rounds once more to `f32` (D16414).
+A `const` with no annotation is a constant, so each read computes at its own use type; an
+annotated `const` is one value of its annotation.
 
 ## E10. Evaluation order
 
