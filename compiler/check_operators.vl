@@ -8,6 +8,7 @@ import {
   luTs,
   luTyTest,
   mapFitBuild,
+  recFieldFitBuild,
   recPartFitArm,
   recPartFitBuild,
 } from "./check_annot_resolve"
@@ -198,7 +199,6 @@ import {
   numDeliverStamp,
   radixLitAdoptPeer64,
   recContainerReadFresh,
-  recFitNarrowedFields,
   recJoinFixed,
   recordBoxTy,
   recordContainedIsAt,
@@ -345,7 +345,6 @@ import { roWriteMsg } from "./check_overload"
 import { parenPeelIx, placeKeyOf } from "./check_places"
 import {
   TT_COVERED,
-  TT_PARTLY,
   assignable,
   bindGenWalk,
   cnhFill,
@@ -362,6 +361,7 @@ import {
   numScalarMixMsg,
   numUnionBinTy,
   opSelfFnKeyFor,
+  recContainedIn,
   sameTypeTestNote,
   substTyDeep,
   subtractTy,
@@ -371,6 +371,7 @@ import {
   tyProvesNonNull,
   tyTestMayFit,
   tyTestMemberFit,
+  tyTestMembers,
   tyTestNamesMembers,
   unknownTyErr,
   widenLitTy,
@@ -2246,11 +2247,7 @@ function castRecordFitAt(n: AsExpr, ix: i32, arg: i32, target: i32): i32 {
   }
   if tyHasTyVar(arg) || tyHasTyVar(target) { return -1 }
   const f = tyTestMemberFit(arg, target)
-  const names: string[] = []
-  const sets: i32[] = []
-  const part = f == TT_PARTLY
-    && recFitNarrowedFields(arg, target, names, sets) == 1
-  if f != TT_COVERED && !part { return -1 }
+  if f != TT_COVERED && !recContainedIn(target, arg) { return -1 }
   // A contained record always fits: the cast hands the operand back as it is.
   if f == TT_COVERED && (n.asMode == "null" || n.asMode == "trap") {
     if inferQuiet {
@@ -2290,8 +2287,10 @@ function castFitAt(n: AsExpr, ix: i32, argU: i32, arm: i32, target: i32): i32 {
     ix,
     pos,
   )
+  // A record cast to one it narrows is its own hit, bound before the test narrows the operand.
+  const own = arm == recvTy
   const thenStmts: i32[] = []
-  thenStmts.push(hit)
+  if !own { thenStmts.push(hit) }
   thenStmts.push(luRef(hit, ix, pos))
   const miss = if n.asMode == "null" { mkNull("null", pos) } else { mkCall(luTrap(ix, pos), [], pos) }
   const elseStmts: i32[] = []
@@ -2303,6 +2302,7 @@ function castFitAt(n: AsExpr, ix: i32, argU: i32, arm: i32, target: i32): i32 {
   valueIfAdd(pick)
   const stmts: i32[] = []
   stmts.push(recv)
+  if own { stmts.push(hit) }
   stmts.push(pick)
   luValueAt(ix, stmts, pos)
   checkNodeHook(ix)
@@ -2513,6 +2513,17 @@ function isOperandDeclTy(op: i32, cur: i32): i32 {
   else { nodeTyIxOf(parenPeelIx(op)) }
 }
 
+// Whether `op` reads at `cur` a store that holds another non-null member, which an
+// `is` tests by the box's contents rather than as `cur` (D15955).
+function isStoreWiderArm(op: i32, cur: i32): boolean {
+  const d = operandDeclaredTy(op)
+  if d < 0 { return false }
+  for m in tyTestMembers(d) {
+    if m != TY_NULL && !tySame(m, cur) { return true }
+  }
+  false
+}
+
 // Check the minted content check of `n`, and answer its operand's type.
 function isFitObjTy(n: IsExpr): i32 {
   checkNodeHook(n.isFit)
@@ -2665,6 +2676,9 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
   if chkTy >= 0 && objTy >= 0 && !inferQuiet && n.isFit < 0 {
     let mfb = mapFitBuild(n.isObj, ix, objTy, chkTy, n.pos)
     if mfb < 0 { mfb = recPartFitBuild(n.isObj, ix, objTy, chkTy, n.pos) }
+    if mfb < 0 && !isStoreWiderArm(n.isObj, objTy) {
+      mfb = recFieldFitBuild(n.isObj, ix, objTy, chkTy, n.pos)
+    }
     if mfb >= 0 {
       n.isFit = mfb
       checkNodeHook(mfb)
