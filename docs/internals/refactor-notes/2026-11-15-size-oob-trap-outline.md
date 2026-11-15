@@ -51,12 +51,17 @@ Base is master `6adb40099`'s fixpoint. The candidate is its own fixpoint (r2 == 
 | reading | master | candidate |
 | --- | ---: | ---: |
 | seed | 6,401,304 B | 6,299,277 B (**−1.59%**) |
-| L2 fuel | (measuring) | |
-| L2 CPU, paired ratio over 16 rounds | | (measuring) |
+| L2 fuel | 88,298,504,277 | 88,194,447,255 (−0.12%) |
+| L2 CPU, interleaved median of 16 | 34.26 s | 34.66 s |
+| L2 CPU, paired ratio over 16 rounds | | median 1.011, 95% interval 0.994–1.019 (10 of 16 above 1) |
+| L2 peak RSS | 4,155 MB | 4,155 MB |
 
 ## Behaviour
 
-A trap at a bad index reports `wasm trap: out of bounds array access` on both seeds.
+A trap at a bad index reports `wasm trap: out of bounds array access` on both seeds. Sweep of
+master against the candidate: 16,913 same, 8,167 bytes-only movers, 0 runs lost and 0 new
+compiler traps. The 1 output mover is D16426, an existing validation failure whose message
+changed only in the byte offset. `regress.vl`: no runs lost.
 
 Plain-build pins re-recorded:
 
@@ -64,5 +69,6 @@ Plain-build pins re-recorded:
 | --- | ---: | ---: | --- |
 | `MELT_TABLE` `list-wrapper-literal`, `-call` (none) | 2 | 3 | the module's empty backing global is one more allocation site |
 | `vl_list_walk_hoist_test` guard count | `(i32.const -1)` | also `(i32.const 0)` after a `global.get` | one guard per index in either form |
+| `vl_immutable_const_global_test` globals / `use`'s `global.get`s | 4 / 4 | 5 / 5 | the empty backing is one more global, and `F[1]`'s guard reads it |
 
 `-O`/`-O3` melt counts and every `SHAPE_TABLE` row are unmoved.
