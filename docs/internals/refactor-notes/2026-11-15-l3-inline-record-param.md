@@ -1,10 +1,9 @@
 # L3: the row slot takes an inline record (D16290)
 
-2026-11-15, lane I. Stacked on #8212 (D16403). The record-width rewrite (D3992) keyed a
-parameter's record by its declared name, which the row slot `__R<decl>_<k>__<Record>` carried so
-the slot's bound could be re-derived every pass (`T.tys` is reset per pass, so a type id cannot be
-kept). An inline record has no name, so `a: { name: string }` refused any wider row whose extra
-fields did not sort last.
+2026-11-15, lane I. The record-width rewrite (D3992) keyed a parameter's record by its declared
+name, which the row slot `__R<decl>_<k>__<Record>` carried so the slot's bound could be re-derived
+every pass (`T.tys` is reset per pass, so a type id cannot be kept). An inline record has no name,
+so `a: { name: string }` refused any wider row whose extra fields did not sort last.
 
 - **Key** (`wsRecKey`, `check_demands.vl`): a record is named by its declared name, or, for an
   inline record of fields only, by its spelling (`tsToName`). `wsAnnRecName` reads `R`, `R | null`
