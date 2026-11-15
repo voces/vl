@@ -19,7 +19,14 @@ above, with one line beside `irShadowBegin()` in `emit_sections.vl`.
   - The helpers are exported as `irLOpnd`, `irLMiss` and `irLSettle`, with the accessor `irLFn`. Operands written through `irLOpnd` keep the stack-order precondition.
 - `ir_verify.vl`: `irBoundsRuleHook(f)` is rule 8, asked once rules 1–7 hold.
 
-Every default misses with the class the construct missed with before, so behaviour is unchanged.
+Each default either refuses or misses with a class naming the hook (`index hook not installed`,
+`member hook not installed`, `list hook not installed`, `bounds hook not installed`), never a
+silent no-op or a trap. Q installs the hooks on every program, armed or not. The hook signatures
+carry plain data only: node ids, a body, a rep, and an `Opnd`, `Rhs` or bytes back.
+
+The seven hook `let`s are module-level mutables chosen for cross-module dispatch without an
+import cycle. They are deleted at I8, when the families fold into the builder. Their install
+writes are Q's, and the phase-state baseline records them in Q's PR.
 
 ## Measurements
 
