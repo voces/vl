@@ -26,6 +26,29 @@ per list wrapper and backing pair, whose body is the old inline block over its p
 grow's arithmetic and the copy are unchanged, so every program computes what it did, through a
 call on the cold path.
 
+## An optimised build keeps the grow inline
+
+The first cut called the helper at `-O` too. binaryen then kept `__grow_<row>__` as a function:
+`fns` rose by 1–2 on the shape table's map and AoS benches, and `allocs` by 1 at `-O3`. On
+`struct-aos` it could no longer delete a grow it had proved dead, because a call hides what the
+inline block showed. The melt counts at `-O`/`-O3` did not move. Even so, an optimised build
+gains nothing from the size cut and its shapes are pinned, so `-O` builds grow inline, as map
+sets already do (`gOptimized`). With that change every `SHAPE_TABLE` row and every `-O`/`-O3`
+melt count is exactly master's, bytes included. The pins that moved are unoptimised-build
+accounting, re-recorded with a sentence each:
+
+| pin | before | after | why |
+| --- | ---: | ---: | --- |
+| `MELT_TABLE` `list-wrapper-push` (none) | 5 | 3 | the per-site backing allocations are one site in the helper |
+| `MELT_TABLE` `list-wrapper-push-reserved` (none) | 6 | 4 | same |
+| `shared-constants/empty-lists` `@allocs` | 16 | 11 | same |
+| `vl_deep_is_walker_test` | +3 per target | +3, helpers not counted | a walker pushing a new list shape mints a `__grow` helper, which is not a second pair |
+| multi-value twin count | the `-O` dump's functions minus the plain build's | the same, without the plain build's `__grow` helpers | the `-O` dump grows inline |
+
+`selfhost_native_*` and `vl_*` (1,895 passed) and `deno task test` (8,995 passed) fail only where
+master fails on this box. That is five cache, sidecar and opt-after-link tests whose fixtures assume
+CI's seed path.
+
 ## Measurements
 
 Base and candidate are fixpoints. CPU is user+sys, the median of 10 warm runs over two
