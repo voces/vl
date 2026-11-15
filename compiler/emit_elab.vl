@@ -35,7 +35,13 @@ import {
   fnTagCalls,
   fnTagHoldsTy,
 } from "./check_elab_cap"
-import { Ty, tyArrayElemIx, tyChildrenOf, tyHoldsObj } from "./check_types"
+import {
+  Ty,
+  tyArrayElemIx,
+  tyChildrenOf,
+  tyHoldsObj,
+  tyIsHole,
+} from "./check_types"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { valueTailLeaves } from "./check_num_adopt"
 import { paramHoleName } from "./check_tp_join"
@@ -21028,6 +21034,8 @@ type EplTables = {
   holder: i32,
   callNode: i32[],
   callKey: i32[],
+  // Per call, the fresh `const` holder its callee read out of when drawn (`eplCallRoot`).
+  callRoot: i32[],
   // The key count at the classes' last ask, and whether they are built for it: the build is
   // deferred to the first holder that needs it, and sees no key minted after the ask.
   limit: i32,
@@ -21071,6 +21079,7 @@ function eplFresh(): EplTables {
     holder: -1,
     callNode: [],
     callKey: [],
+    callRoot: [],
     limit: -1,
     stale: true,
     insts: Map(),
@@ -21846,6 +21855,7 @@ function eplEdgeAt(u: i32) {
           if p < 0 { return 0 }
           EPL.callNode.push(up)
           EPL.callKey.push(EPL.k)
+          EPL.callRoot.push(eplCallRoot(up))
           EPL.calls[p].push(EPL.callNode.length - 1)
         }
       }
@@ -21865,7 +21875,7 @@ function eplArgTy(ci: i32, a: i32): i32 {
 // nothing calls it, -3 for an open argument, -4 for two signatures.
 function eplOneCall(c: i32): i32 {
   // A read that leaves calls out is answered fresh.
-  if EPL.omit.length > 0 { return eplOneCallGo(c) }
+  if EPL.omit.length > 0 || eplOwnHolderConst() { return eplOneCallGo(c) }
   const rc = eplFind(c)
   const m = EPL.oneMemo.get(rc)
   if m != null { return m }
@@ -21874,10 +21884,80 @@ function eplOneCall(c: i32): i32 {
   r
 }
 
+// The `const` binding of a fresh `Map()`, list or record literal that a call's callee reads out
+// of, through `const` reads and element or field reads; -1 when the chain passes anything else.
+function eplCallRoot(call: i32): i32 {
+  const cn = if call >= 0 && call < P.nodes.length { nodeAt(call) } else { null }
+  if !(cn is Call) { return -1 }
+  let x = parenPeelIx(cn.callFn)
+  let d = -1
+  let i = 0
+  while i < 16 && x >= 0 && x < P.nodes.length {
+    const n = nodeAt(x)
+    if n is Ident {
+      d = identDeclOf(x)
+      const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+      if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+      const ix = parenPeelIx(dn.letInit)
+      const ii = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+      if !(ii is Ident || ii is Index || ii is Member || ii is OptMember) {
+        return if eplFreshLit(ix) { d } else { -1 }
+      }
+      x = ix
+    } else if n is Index {
+      x = parenPeelIx(n.idxArr)
+    } else if n is Member {
+      x = parenPeelIx(n.memObj)
+    } else if n is OptMember {
+      x = parenPeelIx(n.omObj)
+    } else {
+      return -1
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether `x` builds a new container: `Map()`, or a list or record literal with no spread.
+function eplFreshLit(x: i32): boolean {
+  const n = nodeAt(x)
+  if n is Call {
+    const f = parenPeelIx(n.callFn)
+    const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+    return n.callArgs.length == 0
+      && fn is Ident
+      && fn.identName == "Map"
+      && identDeclOf(f) < 0
+  }
+  const es = if n is ArrayLit { n.arrElems } else if n is ObjLit { n.objFields } else { return false }
+  for e in es {
+    if e >= 0 && e < P.nodes.length && nodeAt(e) is Spread { return false }
+  }
+  true
+}
+
+// Whether a slot's own-calls reading is of a `const` binding, whose calls it can tell apart.
+function eplOwnHolderConst(): boolean {
+  const hn = if EPL.ownOnly && EPL.holder >= 0 { nodeAt(EPL.holder) } else { null }
+  hn is LetDecl && hn.letKw == "const"
+}
+
 function eplOneCallGo(c: i32): i32 {
   let one = -1
+  const hc = eplOwnHolderConst()
   for ci in eplCallsStar(c) {
     if i32ListHas(EPL.omit, EPL.callNode[ci]) { continue }
+    // A slot's own calls leave out one made through another fresh `const` holder unified with it.
+    if hc {
+      const r = EPL.callRoot[ci]
+      if (
+        r >= 0
+        && r != EPL.holder
+        && eplFind(eplRoot(r)) == eplFind(eplRoot(EPL.holder))
+      ) {
+        continue
+      }
+    }
     const cn = nodeAt(EPL.callNode[ci])
     if !(cn is Call) { return -2 }
     for a in cn.callArgs {
@@ -22133,7 +22213,8 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
     eplDemandAt(m, ps)
     // A member copied in from an upstream class may answer by its instance under the frame.
     const own = i32ListHas(EPL.members[eplFind(p)], m)
-    const mu = if own || (path.length == 0 && !eplReadsContainer(p)) { -1 } else { eplFrameMember(elabSrcDecl(m), ps) }
+    // A slot's own-calls reading takes a nested member's instance under the frame at any path.
+    const mu = if own || (path.length == 0 && !eplReadsContainer(p) && !EPL.ownOnly) { -1 } else { eplFrameMember(elabSrcDecl(m), ps) }
     const mk = if mu >= 0 { mu } else { elabKeyAtPins(elabSrcDecl(m), noNames, noTys, ps, -1) }
     // A member whose own signature is closed at `ps` answers by it.
     const so0 = eplOwnSigAt(elabSrcDecl(m), ps)
@@ -22258,7 +22339,8 @@ function eplSlotSigAt(holder: i32, path: string[], k: i32, omit: i32[]): i32 {
   const one = eplOneCall(p)
   const r = if one < 0 {
     if one == -2 { -1 } else { one }
-  } else if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc {
+  } else if t >= 0 && t < T.tys.length && (tyAt(t) is TyFunc || tyIsHole(t)) {
+    // A hole-typed slot, such as a list of an open parameter, takes its members' signature.
     eplRebuildLeaf(p, t, path)
   } else {
     -1
