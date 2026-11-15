@@ -42,8 +42,8 @@ Three variants, each against the master seed:
   - The map exception alone refuses `closures/written-let-seeded-generic-written-hole-param-at-two-types.vl`
     with its declarations last ("a generic function taken as a value reaches no call that fixes its
     type").
-- **`fnWritesHoleParam` is not subsumed.** With its trigger removed as well, movers rise from 14 to
-  23, so it stays.
+- **`fnWritesHoleParam` is not subsumed.** With its trigger removed as well, movers rise from 16 to
+  25 on this PR's variant (14 to 23 on the map-only one), so it stays.
 - **D16301's witness runs** (`5.5`; master traps), and D16301 closes. D16368 is unchanged: it reads
   a module `let`, which is a separate exemption.
 
@@ -51,7 +51,16 @@ The capability matrices are §Matrices below.
 
 ## Matrices
 
-MATRIX_RESULT
+`capability-matrix.vl --before <master> --after <this PR>` over the 456 templates under
+`scripts/capability-probes/matrix/` whose names hold `hole`, `infer`, `record` or `empty`:
+- 0 `runs → not-runs` in all 456;
+- 0 of 31,214 graded cells change grade;
+- 5 templates exit 1, each on SILENT or program-trap cells that grade the same on both seeds:
+  - `generic-fn-record-result-bound-by-destination`
+  - `generic-two-result-pins-inferred`
+  - `hole-fn-bound-nested-list-returned-at-two-instances`
+  - `hole-fn-lambda-relaying-i32-at-f64-fn-type`
+  - `inferred-generic-list-union-complement`
 
 ## Commands
 
@@ -66,4 +75,7 @@ exit code.
 
 ## Lines
 
-LINES_RESULT
+- `compiler/check_top_level.vl`: +57 −7. The predicate is 33 lines, its comment and the two
+  predicates' comments the rest.
+- The seed grows 6,375,036 → 6,377,118 bytes (+0.03%). Two refreshes are byte-identical.
+- Three fixtures, one row (D16620), and the decl-order baseline: 57 → 16 lines.
