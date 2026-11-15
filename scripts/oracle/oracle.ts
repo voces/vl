@@ -7,7 +7,8 @@
 //
 // `run` exits 0 on a clean run, 3 on a trap, 4 on a type fault and 5 outside the subset.
 // `distilled` and `diff` exit 1 when any DISAGREE or UNSOUND verdict is not in
-// scripts/oracle/known.txt, 2 on a usage or budget failure, else 0.
+// scripts/oracle/known.txt, 2 on a usage or budget failure, else 0. known.txt lists cells one per
+// line, and filed refusals as `D<id>  <message fragment>`, one line per row.
 
 import { Interp, Trap, TypeFault } from "./interp.ts";
 import { Unsupported } from "./syntax.ts";
@@ -35,8 +36,10 @@ export function interpret(src: string, fuel = 2_000_000): Outcome {
 //   UNSOUND      the checker accepted a program the oracle caught putting a value where its type forbids
 //   COMPILED-BAD the compiled side failed (invalid wasm, trap, wrong value) and the oracle ran it
 //   ORACLE-RUNS-REJECTED  `vl check` refused it, the oracle ran it to the expected output (clause-2 evidence)
+//   REFUSED-FILED the compile failed with a refusal a known.txt row names (`diff` only): loud, filed,
+//                 counted per row, not a miscompile
 //   SKIP         outside the oracle subset
-export type Verdict = "AGREE" | "DISAGREE" | "UNSOUND" | "COMPILED-BAD" | "ORACLE-RUNS-REJECTED" | "SKIP";
+export type Verdict = "AGREE" | "DISAGREE" | "UNSOUND" | "COMPILED-BAD" | "REFUSED-FILED" | "ORACLE-RUNS-REJECTED" | "SKIP";
 
 export type Compiled = { cls: "runs" | "rejected" | "trap" | "invalid" | "wrong"; out: string[] | null };
 
@@ -84,10 +87,21 @@ function classOf(s: string): Compiled["cls"] {
   if (s.startsWith("loud")) return "rejected";
   return "invalid"; // compiler trap
 }
-function known(): Set<string> {
+function knownLines(): string[] {
   try {
-    return new Set(Deno.readTextFileSync(new URL("./known.txt", import.meta.url)).split("\n").map((l) => l.split("#")[0].trim()).filter((l) => l));
-  } catch { return new Set(); }
+    return Deno.readTextFileSync(new URL("./known.txt", import.meta.url)).split("\n").map((l) => l.split("#")[0].trim()).filter((l) => l);
+  } catch { return []; }
+}
+const ROW_LINE = /^(D\d+)\s+(.+)$/;
+function known(): Set<string> {
+  return new Set(knownLines().filter((l) => !ROW_LINE.test(l)));
+}
+// A filed refusal: the row id and a fragment of the refusal's sentence.
+export function knownRefusals(lines = knownLines()): { row: string; fragment: string }[] {
+  return lines.flatMap((l) => {
+    const m = ROW_LINE.exec(l);
+    return m ? [{ row: m[1], fragment: m[2].trim() }] : [];
+  });
 }
 
 // `sig` (recording mode only): the compiled stdout hash and outcome, which a base diff compares.
@@ -102,6 +116,9 @@ function report(rows: Row[], jsonOut: string | null, elapsed: number, base: Set<
   for (const r of rows.filter((r) => r.verdict === "DISAGREE" || r.verdict === "UNSOUND" || r.verdict === "COMPILED-BAD")) {
     console.log(`${r.verdict.padEnd(12)} ${r.cell}${k.has(r.cell) ? " (known)" : inBase(r) ? " (on the base too)" : ""}  ${r.why.slice(0, 300)}`);
   }
+  const perRow = new Map<string, number>();
+  for (const r of rows) if (r.verdict === "REFUSED-FILED") perRow.set(r.why.split(" ")[0], (perRow.get(r.why.split(" ")[0]) ?? 0) + 1);
+  for (const [row, n] of [...perRow].sort()) console.log(`REFUSED-FILED ${row}: ${n} cell(s)`);
   if (jsonOut) Deno.writeTextFileSync(jsonOut, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
   const ran = rows.length - (counts.get("SKIP") ?? 0);
   console.log(
@@ -153,6 +170,7 @@ function diff(args: string[]): number {
   const [cases, outDir] = args;
   const t0 = Date.now();
   const rows: Row[] = [];
+  const refusals = knownRefusals();
   for (const ent of [...Deno.readDirSync(cases)].map((e) => e.name).filter((n) => n.endsWith(".vl")).sort()) {
     const src = Deno.readTextFileSync(`${cases}/${ent}`);
     const o = interpret(src);
@@ -174,6 +192,13 @@ function diff(args: string[]): number {
       else cls = "trap";
     }
     const j = judge(o, { cls, out }, null);
+    // A loud refusal a row files is not a miscompile; a trap or a wrong value never matches one.
+    const filed = j.v === "COMPILED-BAD" && cls === "invalid" && /emit error/.test(err)
+      ? refusals.find((r) => err.includes(r.fragment)) : undefined;
+    if (filed) {
+      rows.push({ cell: ent.replace(/\.vl$/, ""), verdict: "REFUSED-FILED", why: filed.row + " | " + err.split("\n")[0].slice(0, 160) });
+      continue;
+    }
     rows.push({ cell: ent.replace(/\.vl$/, ""), verdict: j.v, why: j.why + (cls !== "runs" && cls !== "rejected" ? " | " + err.split("\n")[0].slice(0, 160) : "") });
   }
   if (args.includes("--skips")) skipReasons(rows);
