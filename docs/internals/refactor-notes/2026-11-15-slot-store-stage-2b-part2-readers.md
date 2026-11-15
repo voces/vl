@@ -2,8 +2,7 @@
 
 Part 2b(i) ([`2026-11-15-slot-store-stage-2b-part2-sig.md`](2026-11-15-slot-store-stage-2b-part2-sig.md))
 switched `monoSlotDeliveryTy` onto `eplSlotSig`, leaving one probe row where the walk delivered
-and the classes did not. This PR closes it, switches `elabRetFnListLitTy`, and adds the two reads
-the remaining readers need.
+and the classes did not. This PR closes it and switches `elabRetFnListLitTy`.
 
 ## What changed
 
@@ -15,9 +14,6 @@ the remaining readers need.
 - **A function holder is placed in the frame that creates it** (`eplSlotPlace`). A lambda read at
   its own instance looked up a place keyed at that instance, where its value's edges are drawn at
   its parent's.
-- **`eplSlotDelivered(holder, path, k, omit)`**: whether a bound or any call outside `omit`
-  delivers the slot. **`eplSlotParams(holder, path, k)`**: the one closed parameter list the slot
-  is delivered at, from its bound or from the argument types every call through it agrees on.
 - **`elabRetFnListLitTy` reads `eplSlotSig`** in place of the walk.
 
 ## Parity
@@ -26,7 +22,9 @@ The mono probe: the walk and `eplSlotSig` at every `monoSlotDeliveryTy` call ove
 now differ at one call, `closures/hole-fn-list-map-callback-generic-call-loop-alias`, where the
 classes answer `(i32) => i32` and the walk answers nothing; the program runs.
 
-A second probe ran the walk and the class read side by side at five elab readers over
+A second probe (a scratch build with `eplSlotDelivered`, whether a bound or a call outside `omit`
+delivers the slot, and `eplSlotParams`, the one closed parameter list the calls agree on) ran the
+walk and the class read side by side at five elab readers over
 `tests/cases` and the distilled corpus, and logged every call where they differ:
 
 | reader | differing calls | this PR |
@@ -54,4 +52,5 @@ still has a reader, so the part that deletes the walk's paths comes once the rea
 
 Part 2b(iii), net-negative: make `elabLamDeliveredParams` demand at the delivered parameters,
 carry a returned function through a function value's result, give the classes an omit by read,
-switch the readers above, and delete the walk paths none of them uses.
+land `eplSlotDelivered` and `eplSlotParams` with those readers as their consumers, and delete the
+walk paths none of them uses.
