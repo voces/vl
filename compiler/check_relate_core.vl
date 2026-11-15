@@ -280,6 +280,7 @@ import {
   CODE_MISSING_IMPORT,
   CODE_NARROWING_ENDED_BY_CALL,
   CODE_UNSUPPORTED_LOWERING,
+  CODE_VOID_CALLEE_RETURN,
   CODE_ZERO_BYTES,
   floatLitTypeFail,
   unkTyClash,
@@ -356,6 +357,8 @@ import {
 } from "./check_num_lits"
 import { diagDataField } from "./check_overload"
 import { parenPeelIx } from "./check_places"
+import { isBlockBody, stmtStartTok } from "./block_body"
+import { srcmapModOfTok } from "./srcmap"
 import { recAdNoteFor, recAdWholeErr } from "./check_rec_adopt"
 import {
   recAdLoose,
@@ -4627,7 +4630,74 @@ export function argMismatchErr(
       return tErr(msg, argIx)
     }
   }
+  if isVoidTy(at) { return voidValueErr(msg, argIx, argIx) }
   tErrWant(msg, argIx, expected)
+}
+
+// Raises `msg`, a value slot's refusal of the `void` expression `exprIx`. When the expression calls
+// an un-annotated function of this module whose block body ends in a call it discards, the note
+// names it and the diagnostic carries where `check --fix` writes its `return`.
+export function voidValueErr(msg: string, exprIx: i32, at: i32) {
+  const tl = voidCalleeTail(exprIx)
+  const tok = if tl >= 0 { stmtStartTok(nodeStartTok(tl)) } else { -1 }
+  const use = nodeStartTok(at)
+  if (
+    tok < 0
+    || tok >= P.toks.length
+    || use < 0
+    || srcmapModOfTok(tok) != srcmapModOfTok(use)
+  ) {
+    return tErr(msg, at)
+  }
+  const fd = nodeAt(voidCalleeDecl(exprIx))
+  const name = if fd is FuncDecl { fd.fnName } else { "" }
+  tErrCodedData(
+    msg
+      + " — `"
+      + name
+      + "` ends in a call with no `return`: write `return` before its last expression",
+    at,
+    CODE_VOID_CALLEE_RETURN,
+    diagDataField("line", i32ToStr(P.toks[tok].line))
+      + diagDataField("col", i32ToStr(P.toks[tok].col)),
+  )
+}
+
+// The declaration of the un-annotated named function the call `exprIx` names, or -1.
+function voidCalleeDecl(exprIx: i32): i32 {
+  const c = if exprIx >= 0 && exprIx < P.nodes.length { nodeAt(parenPeelIx(exprIx)) } else { null }
+  if !(c is Call) || c.callFn < 0 { return -1 }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return -1 }
+  let d = identFnDeclOf(c.callFn)
+  if d < 0 { d = fnDeclIx[f.identName] ?? -1 }
+  const fd = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    fd is FuncDecl
+    && fd.fnName != ""
+    && fd.fnRet < 0
+    && fd.fnTyParams.length == 0
+  ) {
+    d
+  } else {
+    -1
+  }
+}
+
+// The last statement of the callee `voidCalleeDecl` names when it is a call whose value its block
+// body discards, or -1.
+function voidCalleeTail(exprIx: i32): i32 {
+  const d = voidCalleeDecl(exprIx)
+  if d < 0 { return -1 }
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) || !isBlockBody(fd.fnBody) { return -1 }
+  const b = nodeAt(fd.fnBody)
+  if !(b is Block) || b.blkStmts.length == 0 { return -1 }
+  const tl = b.blkStmts[b.blkStmts.length - 1]
+  if !(nodeAt(parenPeelIx(tl)) is Call) { return -1 }
+  const t = nodeTyOf(tl)
+  if t < 0 || t == TY_ERR || t == TY_NEVER || isVoidTy(t) { return -1 }
+  tl
 }
 
 // Whether `lit` is a literal type that literal-bearing `other` admits: `x == "b"` at a pin that
