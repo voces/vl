@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **Function fields in containers, discovery:** eleven position matrices (`ffc-*`) over maps, lists and records holding function fields (written, read, called, per generic instance): 461 of 508 graded cells run, none silent; 2 trap. Filed: D16234 (a bound list literal of generic-function records, written in a generic body, traps at the second instance), D16235 (its annotated push refused at the first instance's type), D16236 (a `for` over a generic maker's bound list loses the first instance's signature), D16237 (a hole function written into a field through a narrowed map read is not pinned by the map walk's call) and D16238 (a hole lambda pushed onto a hole parameter's list gets no parameter type).
