@@ -1330,21 +1330,28 @@ function adoptNullLambdaRet(
   0
 }
 
+// Whether `dIx` is a function with an inferred result whose body pass 2 has not checked.
+function fnInferredUnchecked(dIx: i32): boolean {
+  const d = nodeAt(dIx)
+  d is FuncDecl && d.fnRet < 0 && nodeTyOf(dIx) < 0
+}
+
 // The ordinary call: the callee evaluates to a function type, so the arguments are checked
 // against its parameter list — named arguments reordered, an omitted trailing one filled
 // from the declaration default, and type-parameter bindings solved from the argument types.
 // Always answers; the caller's remaining arms cover an error or still-unsolved callee.
 function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   let args = n.callArgs
-  // PENDING return (-2): the un-annotated callee hasn't been inferred yet (a
-  // forward call). Demand-infer it now — check its FuncDecl, which patches this
-  // very TyFunc in place — unless it is already on the in-progress stack (an
-  // in-cycle call: contribute TY_ERR so the cycle can be detected at the root).
-  if ft.fnRet == -2 {
+  // A pending (-2) or pre-pass hole result (D16369) of an un-annotated callee is inferred now by
+  // checking its FuncDecl, which patches this TyFunc in place, unless it is on the in-progress
+  // stack: an in-cycle call contributes TY_ERR so the root can detect the cycle.
+  if ft.fnRet == -2 || (!inferQuiet && ft.fnRet >= 0 && tyHasHole(ft.fnRet)) {
     if cfn is Ident {
       if !onInferStack(cfn.identName) {
         const dIx = fnDeclIx[cfn.identName] ?? -1
-        if dIx >= 0 { checkNodeHook(dIx) }
+        if dIx >= 0 && (ft.fnRet == -2 || fnInferredUnchecked(dIx)) {
+          checkNodeHook(dIx)
+        }
       }
     }
   }
@@ -4874,8 +4881,9 @@ function checkCallNodeGo(n: Call, ix: i32) {
   ) {
     return TY_NEVER
   }
-  // An instance binding a type parameter to `never` calls no value through it (D3178).
-  if elabCapLive() && fnTy == TY_NEVER { return TY_NEVER }
+  // A `never` callee, a type parameter an instance binds to it (D3178) or a read no value
+  // reaches, is called on no value.
+  if fnTy == TY_NEVER { return TY_NEVER }
   // `v.d()` over a getter reads `v.d` and calls the result: say which getter it read.
   let calledGetter = getSiteFnOf(n.callFn)
   if calledGetter == "" && cfn is Member {

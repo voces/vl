@@ -31,6 +31,9 @@ export class Lit {
 export class Rec { constructor(public f: Map<string, Val>) {} }
 export class VMap { m = new Map<string, [Val, Val]>(); }
 export class VSet { m = new Map<string, Val>(); }
+// The type a container was built at (ruling 4.4): set where it is first delivered at a declared
+// type; `is` on an empty container reads it.
+const builtAt = new WeakMap<object, { t: Ty; env: Env }>();
 export class Fn { constructor(public decl: FnDecl, public env: Env) {} }
 export class Bi { constructor(public name: string, public call: (args: Val[], ctx: Interp) => Val) {} }
 export const VOID = Symbol("void");
@@ -258,14 +261,16 @@ let f32Fold = false
 // E9.1 / ruling 4.2: a radix constant is a bit pattern at its use's width under every operator.
 // The width is 64 at an i64 or f64 use, 32 at an i32 one, and with no use the tree's default
 // (T2.3). Ring operators commute with wrapping, so only these need the width before they run.
-function radixWidth(a: Lit, b: Lit, expK: string | null): 32 | 64 {
+function radixWidth(op: string, a: Lit, b: Lit, expK: string | null): 32 | 64 {
   if (expK === "i64" || expK === "f64") return 64;
   if (expK === "f32") throw new Unsupported("spec gap: a radix constant tree at f32");
   if (expK) return 32;
+  // Q8: with no use, a constant shift count of 32 to 63 makes the left operand i64.
+  if (["<<", ">>", ">>>"].includes(op) && b.i !== null && b.i >= 32n && b.i <= 63n) return 64;
   return a.radix === 64 || b.radix === 64 || a.wideDec || b.wideDec ? 64 : 32;
 }
 function radixAtWidth(op: string, a: Lit, b: Lit, expK: string | null): Lit {
-  const w = radixWidth(a, b, expK), W = BigInt(w);
+  const w = radixWidth(op, a, b, expK), W = BigInt(w);
   const x = BigInt.asIntN(w, a.i!), y = BigInt.asIntN(w, b.i!), n = y & (W - 1n);
   const r = op === "/" ? x / y : op === "%" ? x % y : op === "&" ? x & y : op === "|" ? x | y : op === "^" ? x ^ y
     : op === "<<" ? x << n : op === ">>" ? x >> n : BigInt.asUintN(w, x) >> n;
@@ -537,19 +542,50 @@ export class Interp {
     }
   }
 
-  // T3.4 tests the value. An empty list or map fits every element type by value, while the
-  // compiler answers from the type it was built at: an owner question, so no verdict here.
+  // T3.4 tests the value, but `is` on an empty container decides by the type it was built at
+  // (owner ruling 4.4, #8222): its annotation, or the first union arm an empty literal reached.
+  // A container never delivered at a declared type is fully open and matches vacuously (D16047).
   isTest(v: Val, t: Ty, env: Env): boolean {
     // a type parameter is erased here, while the compiler tests the instance's type
     if (mentionsParam(t, env)) throw new Unsupported("`is` on a type parameter");
     const r = this.fits(v, t, env, new Set(), true);
-    if ((Array.isArray(v) && v.length === 0) || (v instanceof VMap && v.m.size === 0)) {
-      const arms = (() => { const x = this.resolve(t, env); return x.k === "union" ? x.arms : [x]; })();
-      if (arms.some((a) => { const x = this.resolve(a, env); return x.k === "list" || x.k === "map"; })) {
-        throw new Unsupported("spec gap: `is` on an empty container");
-      }
+    const empty = (Array.isArray(v) && v.length === 0) || ((v instanceof VMap || v instanceof VSet) && v.m.size === 0);
+    const built = empty ? builtAt.get(v as object) : undefined;
+    if (built) {
+      const x = this.resolve(t, env);
+      const arms = x.k === "union" ? x.arms : [x];
+      const want = this.canonTy(built.t, built.env);
+      return arms.some((a) => this.canonTy(a, env) === want);
     }
     return r;
+  }
+
+  // A spelling of `t` that two equal types share: aliases resolved, union arms and record fields
+  // in sorted order (`string | i32` and `i32 | string` are one type).
+  canonTy(t: Ty, env: Env, depth = 0): string {
+    if (depth > 20) return showTy(t);
+    const r = this.resolve(t, env);
+    const c = (x: Ty) => this.canonTy(x, env, depth + 1);
+    switch (r.k) {
+      case "union": return [...new Set(r.arms.map(c))].sort().join(" | ");
+      case "list": return "(" + c(r.el) + ")[]";
+      case "map": return "{[" + c(r.key) + "]: " + c(r.val) + "}";
+      case "rec": return "{" + r.fields.map((f) => f.name + (f.opt ? "?" : "") + ": " + c(f.ty)).sort().join(", ") + "}";
+      case "name": return r.args.length ? r.name + "<" + r.args.map(c).join(", ") + ">" : r.name;
+      default: return showTy(r);
+    }
+  }
+
+  // The arm of the declared type `t` the container `v` is built at: `t` itself, or the first
+  // union arm of its kind that holds it.
+  containerArm(v: Val, t: Ty, env: Env): Ty | null {
+    const r = this.resolve(t, env);
+    for (const a of r.k === "union" ? r.arms : [r]) {
+      const x = this.resolve(a, env);
+      const kind = Array.isArray(v) ? x.k === "list" : v instanceof VMap ? x.k === "map" : v instanceof Rec ? x.k === "rec" : x.k === "name" && x.name === "Set";
+      if (kind && this.fits(v, x, env)) return x;
+    }
+    return null;
   }
 
   // The numeric member a value delivered to `t` converts to, or null for none (T2.6).
@@ -581,6 +617,11 @@ export class Interp {
   }
   convert(v: Val, t: Ty, env: Env, depth = 0): Val {
     if (depth > 40) return v;
+    // the first declared type a container meets is the type it is built at (ruling 4.4)
+    if ((Array.isArray(v) || v instanceof VMap || v instanceof VSet || v instanceof Rec) && !builtAt.has(v) && !mentionsParam(t, env)) {
+      const arm = this.containerArm(v, t, env);
+      if (arm) builtAt.set(v, { t: arm, env });
+    }
     const r = this.resolve(t, env);
     const nk = (v instanceof Lit || numKind(v)) ? this.numTarget(v, r, env) : null;
     if (nk) return toKind(v, nk);
@@ -1132,11 +1173,18 @@ export class Interp {
         if (x.k === "name" && (x.name === "f64" || x.name === "f32")) exp = x.name === "f64" && isConstTree(e) && treeHas(e, "radix") ? I64_TY : null;
       } catch { exp = null; }
     }
-    // The compiler reads a typed shift count as the left constant's peer, so a radix tree shifted
-    // by an i32 count computes at 32 bits even at an i64 use; whether a count types its left
-    // operand is an owner question, so no verdict.
-    if (["<<", ">>", ">>>"].includes(op) && isConstTree(e.l) && treeHas(e.l, "radix") && !isConstTree(e.r)) {
-      throw new Unsupported("spec gap: a radix constant tree shifted by a typed count");
+    // A shift's result is its left operand's type, and a count never types the left: a constant
+    // left takes its destination's width, else its own default (coordinator ruling on Q8).
+    if (["<<", ">>", ">>>"].includes(op) && isConstTree(e.l) && !isConstTree(e.r)) {
+      let k: string | null = null;
+      if (exp) { try { const x = this.resolve(exp, env); if (x.k === "name" && (x.name === "i32" || x.name === "i64")) k = x.name; } catch { /* none */ } }
+      const lv = this.eval(e.l, env, k ? exp : null);
+      const rv = this.eval(e.r, env, null);
+      const left = lv instanceof Lit ? (k ? litTo(lv, k) : litDefault(lv)) : lv;
+      // The count is masked to the left's width (E6.2), so it converts to that width's integer.
+      const count = typeof left === "bigint" && typeof rv === "number" ? BigInt(rv)
+        : typeof left === "number" && typeof rv === "bigint" ? Number(BigInt.asIntN(32, rv)) : rv;
+      return arith(op, left, count);
     }
     // A radix tree beside a float constant has that f64 as its peer (ruling 4.2).
     if (arithOp && !exp && isConstTree(e.l) && isConstTree(e.r)) {
@@ -1231,7 +1279,7 @@ export class Interp {
     if (t.k === "member") {
       const o = this.eval(t.e, env, null);
       if (!(o instanceof Rec)) throw new TypeFault("field store into " + show(o));
-      o.f.set(t.name, o.f.has(t.name) ? adopt(o.f.get(t.name)!, v) : (v instanceof Lit ? litDefault(v) : v));
+      o.f.set(t.name, this.atElem(o, o.f.has(t.name) ? adopt(o.f.get(t.name)!, v) : (v instanceof Lit ? litDefault(v) : v), t.name));
       return;
     }
     if (t.k === "index") {
@@ -1242,18 +1290,27 @@ export class Interp {
         const k = this.eval(t.i, env, null);
         const key = keyOf(k);
         const old = o.m.get(key);
-        o.m.set(key, [old ? old[0] : (k instanceof Lit ? litDefault(k) : k), old ? adopt(old[1], v) : this.settleOne(o, v)]);
+        o.m.set(key, [old ? old[0] : (k instanceof Lit ? litDefault(k) : k), this.atElem(o, old ? adopt(old[1], v) : this.settleOne(o, v))]);
         return;
       }
       const i = this.asI32(this.eval(t.i, env, null), "index");
       if (Array.isArray(o)) {
         if (i < 0 || i >= o.length) throw new Trap(`index ${i} out of range for length ${o.length}`);
-        o[i] = adopt(o[i], v);
+        o[i] = this.atElem(o, adopt(o[i], v));
         return;
       }
       throw new TypeFault("index store into " + show(o));
     }
     throw new TypeFault("assignment target");
+  }
+  // A value written into a container built at a declared type meets that type's element (or the
+  // field's type), so an empty container written there is built at it (ruling 4.4).
+  atElem(o: Val, v: Val, field?: string): Val {
+    const b = builtAt.get(o as object);
+    if (!b || v instanceof Lit) return v;
+    const t = b.t;
+    const el = t.k === "list" ? t.el : t.k === "map" ? t.val : t.k === "rec" ? t.fields.find((f) => f.name === field)?.ty : undefined;
+    return el ? this.convert(v, el, b.env) : v;
   }
   settleOne(m: VMap, v: Val): Val {
     if (!(v instanceof Lit)) return v;
@@ -1328,7 +1385,7 @@ export class Interp {
     };
     if (Array.isArray(o)) {
       switch (name) {
-        case "push": for (const v of a) o.push(settle(o, v)); return VOID;
+        case "push": for (const v of a) o.push(this.atElem(o, settle(o, v))); return VOID;
         case "pop": return o.length ? o.pop()! : null; // narrowing.md: `pop` is `T | null`
         case "clear": o.length = 0; return VOID;
         case "slice": {
