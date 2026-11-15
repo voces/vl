@@ -58,7 +58,7 @@ const PAIRS: { row: string; a: string; b: string }[] = [
     // A mints a union box; B's call-LHS `??` stash reserved a slot of A's box type.
     row: "D3995",
     a: "function rd() {}\nfunction rdJ() {}\nfunction bignum() {}\n" +
-      "function foldF32Src(): {q: f32} | null { { q: 2.5 } }\n" +
+      "function foldF32Src(): {q: f32} | null { return { q: 2.5 } }\n" +
       "function foldF32() {\n  const g4 = foldF32Src() ?? { q: 7 }\n  print(g4.q)\n}\n" +
       "rd()\nrdJ()\nbignum()\nfoldF32()\n",
     b: 'import { filled } from "std:array"\n' +

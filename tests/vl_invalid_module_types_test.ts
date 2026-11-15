@@ -87,7 +87,7 @@ const CASES: Case[] = [
     name: "a record arriving where another type is expected names the record",
     files: {
       "r.vl": "type A = { r: i32 }\n" +
-        "function mk(): A[] { [{ r: 1 }] }\n" +
+        "function mk(): A[] { return [{ r: 1 }] }\n" +
         "print(mk().length)\n",
     },
     entry: "r.vl",
@@ -100,7 +100,7 @@ const CASES: Case[] = [
     name:
       "a string where another type is expected names `string` and its shape",
     files: {
-      "s.vl": 'function f(k: i32): string { "a" }\n' + "print(f(1))\n",
+      "s.vl": 'function f(k: i32): string { return "a" }\n' + "print(f(1))\n",
     },
     entry: "s.vl",
     sweep: "type",
@@ -240,7 +240,7 @@ Deno.test({
     "vl-invalid-module-types: a corrupt array.new_fixed count is reported, not allocated",
   ignore: !ENABLED,
   fn: async () => {
-    const src = "function first(xs: string[]): string { xs[0] }\n" +
+    const src = "function first(xs: string[]): string { return xs[0] }\n" +
       'const xs: string[] = ["a", "b"]\n' +
       "print(first(xs))\n";
     await withDir({ "l.vl": src }, async (dir) => {

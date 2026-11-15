@@ -60,8 +60,8 @@ Deno.test({
       eq(
         await errorsOf(
           dir,
-          "function one32(a: f32): f32 { a }\nfunction src(): f64 { 3.0 }\n" +
-            "function g(): f32 { one32(src()) }\nconst T = [1.0, 0.0]\n" +
+          "function one32(a: f32): f32 { return a }\nfunction src(): f64 { return 3.0 }\n" +
+            "function g(): f32 { return one32(src()) }\nconst T = [1.0, 0.0]\n" +
             "const z = one32(T[0])\nprint(g())\nprint(z)\n",
         ),
         [BARE, noted(4)],
@@ -71,7 +71,7 @@ Deno.test({
       eq(
         await errorsOf(
           dir,
-          "function one32(a: f32): f32 { a }\nconst T = [1.0, 0.0]\n" +
+          "function one32(a: f32): f32 { return a }\nconst T = [1.0, 0.0]\n" +
             "const z = one32(T[0])\nprint(z)\n",
         ),
         [noted(2)],

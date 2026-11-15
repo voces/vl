@@ -140,7 +140,7 @@ print(pick(9))
 // the function's result, at a numeric operand, a type parameter pinned at a number and at none,
 // and a hole parameter's call parked until its pin.
 const AS = `function widen(d: f64): i32 | null { return d as i32 }
-function pin<T>(u: T): i32 | null { u as i32 }
+function pin<T>(u: T): i32 | null { return u as i32 }
 function add(a, b) { return a + b }
 function viaHole(g): i32 | null {
   const v = g(1.5, 2.5) as i32
@@ -174,7 +174,7 @@ const CAP = `function show(u: boolean | i32) {
 }
 function run() {
   let v: boolean | string = "a"
-  const k = () => { v = false }
+  const k = () => { return v = false }
   k()
   if v is boolean { show(v) }
 }
@@ -202,7 +202,7 @@ show(m?.get("k"))
 // An optional call `p?.f()` delivered as it is, into a `??` and into a binding: the call is its
 // guard's non-null arm and takes the call's own join.
 const OPTCALL = `type P = { n: i32 }
-function twice(self: P) { self.n * 2 }
+function twice(self: P) { return self.n * 2 }
 const p: P | null = { n: 21 }
 print(p?.twice() ?? 0)
 const r = p?.twice()
@@ -214,7 +214,7 @@ print(r ?? -1)
 // value's record.
 const TAIL = `type C = { n: i32 }
 function bump(c: C, go: boolean) {
-  if go { c.n = c.n + 1 }
+  return if go { c.n = c.n + 1 }
 }
 const inFor = (n: i32) => for i in 0 until 3 { if i == n { break (@B { i * 10 }) } }
 const c: C = { n: 1 }
@@ -238,7 +238,7 @@ run([true, null], [1])
 // `if` at an instance whose arms join apart, and a loop's exits under a `??` that unwraps it.
 const OWNJOIN = `function lit<A, B>(k: i32, a: A, b: B) {
   if k == 0 { return a }
-  if k == 1 { b } else { 5 }
+  return if k == 1 { b } else { 5 }
 }
 const z: i64 = 9
 print(lit(0, z, z))
@@ -252,7 +252,7 @@ t(1)
 // An annotated function's tail value `if` whose number arms join apart is boxed whole into the
 // declared result.
 const ANNTAIL = `function pick(k: i32): i32 | f64 {
-  if k == 0 { 3 } else { 2.5 }
+  return if k == 0 { 3 } else { 2.5 }
 }
 print(pick(1))
 `;
@@ -276,7 +276,7 @@ print(wideJ[0].f ?? 0)
 const PARAMWRITE = `type J = { f: i32 | null }
 function h(a) {
   a.f = 7
-  a.f
+  return a.f
 }
 const o = { f: 4 }
 const d: J[] = [o]
@@ -288,7 +288,7 @@ print(d[0].f ?? 0)
 // call is copied where it lands, so the map keeps its own build and no field is boxed. The
 // spelling where a literal binding built wider is stored instead is D15718.
 const STORELIT = `type J = { f: i32 | null }
-function mk() { { f: 4 } }
+function mk() { return { f: 4 } }
 const wideJ: J = mk()
 const m = Map()
 m.set("b", { f: 5 })
@@ -437,14 +437,14 @@ Deno.test({
   name: "box-dst shadow: a tail `if` and a loop's exits take their own join",
   ignore,
   fn: () =>
-    expectRows("ownjoin", OWNJOIN, DROP_NONE, "nested agree=8; table=8"),
+    expectRows("ownjoin", OWNJOIN, DROP_NONE, "floor: no record=1; nested agree=7; nested no record=1; table=7"),
 });
 
 Deno.test({
   name: "box-dst shadow: an annotated tail `if` takes the declared result",
   ignore,
   fn: () =>
-    expectRows("anntail", ANNTAIL, DROP_NONE, "nested agree=1; table=1"),
+    expectRows("anntail", ANNTAIL, DROP_NONE, "nested agree=2; table=2"),
 });
 
 Deno.test({
@@ -486,7 +486,7 @@ Deno.test({
 
 // A generic `a ?? 5` at a list pin is the join `i32[] | i32` (D10600): the instance boxes its
 // left operand into that, though the instance's own result is `i32[]`.
-const COALPIN = `function tail<T>(a: T) { a ?? 5 }
+const COALPIN = `function tail<T>(a: T) { return a ?? 5 }
 const u = [1, 2]
 const v1 = tail(u)
 if v1 is i32[] { print(v1.length) } else { print(v1) }
@@ -603,7 +603,7 @@ print(xs[0].r ?? 5)
 type Sq = { s: i32 }
 type Circle = { r: i32 | null }
 type GL = { g: Circle[] }
-function f(xs: Circle[]): i32 { xs[0].r ?? 5 }
+function f(xs: Circle[]): i32 { return xs[0].r ?? 5 }
 print(f([{ r: null }]))
 `, "nested agree=1; table=1"],
   ["a union-element list", `type Shape = Circle | Sq
@@ -642,7 +642,7 @@ for (const [what, src, want] of NULL_HOLE_LIST_LITS) {
 
 // A numeric widening at an argument and the identity pair at the return: the table serves both at the checker's pair, and both controls
 // turn it into the site's own floor.
-const NUM_SRC = `function w(x: i64): i64 { x }
+const NUM_SRC = `function w(x: i64): i64 { return x }
 const a: i32 = 3
 print(w(a))
 `;
@@ -670,7 +670,7 @@ for (
 // must not hide the element's one-kind pair, so the table still serves it.
 const NUM_HIDDEN = `function g() {
   const c: (i32 | f64)[][] = [[1, 2.5]]
-  c[0]
+  return c[0]
 }
 print(g().length)
 `;
@@ -690,7 +690,7 @@ Deno.test({
 
 // An operator's operands, widened to its operand type: the checker records each operand's pair
 // at the pair rule's answer, so the table serves both, and both controls turn them into floors.
-const NUM_OPERAND = `function mul(a: i64, b: i32): i64 { a * b }
+const NUM_OPERAND = `function mul(a: i64, b: i32): i64 { return a * b }
 print(mul(3, 4))
 `;
 for (
@@ -717,7 +717,7 @@ for (
 // An instance's operand (typed only at its pin), a cast's operand and a wide number boxed into a
 // union that holds it: each carries its pair, so the table serves all three, and both controls
 // turn them into floors.
-const NUM_INSTANCE_CAST_BOX = `function inc(a) { a * 2 }
+const NUM_INSTANCE_CAST_BOX = `function inc(a) { return a * 2 }
 print(inc(2.5))
 const x: i32 = 3
 const y: i64 = 4

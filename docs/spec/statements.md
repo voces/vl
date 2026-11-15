@@ -15,7 +15,7 @@ visible in the whole file, above its declaration as well as below.
 
 ```vl
 print(g())
-function g(): i32 { 7 }
+function g(): i32 { return 7 }
 print("end")
 // prints 7, end
 ```
@@ -61,7 +61,7 @@ A parameter is a `let`: the body may assign it, and the caller's value does not 
 ```vl
 function f(n: i32): i32 {
   n = n * 2
-  n
+  return n
 }
 print(f(4))   // prints 8
 ```
@@ -81,7 +81,7 @@ every path before it is read.
 function f(c: boolean): i32 {
   let x: i32
   if c { x = 1 } else { x = 2 }
-  x
+  return x
 }
 print(f(true))   // prints 1
 ```
@@ -90,7 +90,7 @@ print(f(true))   // prints 1
 function f(c: boolean): i32 {
   let x: i32
   if c { x = 1 }
-  x   // refused: `x` is used before it is assigned
+  return x   // refused: `x` is used before it is assigned
 }
 ```
 
@@ -158,7 +158,7 @@ const k = 4
 called before that binding's initialiser has run, the read traps and names the binding.
 
 ```vl
-function f(): i32 { k + 1 }
+function f(): i32 { return k + 1 }
 print(f())   // traps: `k` read before its initializer ran (line 3), via f
 const k = [1, 2].length
 ```
@@ -182,7 +182,7 @@ print(x)     // prints 1
 ```vl
 function f(x: i32): i32 {
   const x = 2   // refused: redeclared x
-  x
+  return x
 }
 ```
 
@@ -191,8 +191,8 @@ inner block may reuse the parameter's name.
 
 ```vl
 function outer(f: i32): i32 {
-  function f(): i32 { 2 }   // refused: redeclared f: the parameter `f` and the function `f` declared in the same body are one scope
-  f()
+  function f(): i32 { return 2 }   // refused: redeclared f: the parameter `f` and the function `f` declared in the same body are one scope
+  return f()
 }
 ```
 
@@ -480,7 +480,7 @@ a block. `s` is evaluated once.
 
 ```vl
 let n = 0
-function next(): i32 { n += 1; n }
+function next(): i32 { n += 1; return n }
 match next() {
   1 => print("one"),
   _ => print("other"),
@@ -493,7 +493,7 @@ is refused.
 
 ```vl
 function f(s: string): i32 {
-  match s {   // refused: match scrutinee must be a union or an integer, got string
+  return match s {   // refused: match scrutinee must be a union or an integer, got string
     "a" => 1,
     _ => 2,
   }
@@ -506,7 +506,7 @@ function f(s: string): i32 {
 ```vl
 type K = "a" | "b" | "c"
 function f(k: K): i32 {
-  match k {
+  return match k {
     "a" => 1,
     "b" | "c" => 2,
   }
@@ -517,7 +517,7 @@ print(f("c"))   // prints 2
 ```vl
 type K = "a" | "b" | "c"
 function f(k: K): i32 {
-  match k {   // refused: non-exhaustive match — missing "c" (add the arm or a `_`)
+  return match k {   // refused: non-exhaustive match — missing "c" (add the arm or a `_`)
     "a" => 1,
     "b" => 2,
   }
@@ -533,7 +533,7 @@ type Move = { kind: "m", x: i32, y: i32 }
 type Quit = { kind: "q" }
 type Cmd = Move | Quit
 function f(c: Cmd): i32 {
-  match c {
+  return match c {
     Move{x, y: b} => x + b,
     Quit => 0,
   }
@@ -543,7 +543,7 @@ print(f({ kind: "m", x: 2, y: 5 }))   // prints 7
 
 ```vl
 function f(x: i32 | null): i32 {
-  match x {
+  return match x {
     null => 0,
     i32 => x + 1,
   }
@@ -556,7 +556,7 @@ negative ones included, and the `_` arm is required. `0x10` and `16` are the sam
 
 ```vl
 function f(n: i32): string {
-  match n {
+  return match n {
     0x10 => "sixteen",
     1 | 2 => "small",
     -1 => "neg",
@@ -569,7 +569,7 @@ print(f(-1))   // prints neg
 
 ```vl
 function f(n: i32): i32 {
-  match n {   // refused: non-exhaustive match — an integer `match` needs a `_` arm
+  return match n {   // refused: non-exhaustive match — an integer `match` needs a `_` arm
     0 => 1,
   }
 }
@@ -584,7 +584,7 @@ other bare name that is not a type is refused.
 const MAGIC = 7
 const ROOT = 9
 function f(n: i32): string {
-  match n {
+  return match n {
     MAGIC => "magic",
     ROOT => "root",
     _ => "?",
@@ -595,7 +595,7 @@ print(f(9))   // prints root
 
 ```vl
 function f(n: i32): string {
-  match n {
+  return match n {
     MAGICK => "magic",   // refused: unknown name `MAGICK` in match pattern
     _ => "?",
   }
@@ -610,7 +610,7 @@ A `_` after arms that already cover every member is allowed.
 
 ```vl
 function f(n: i32): i32 {
-  match n {
+  return match n {
     16 => 1,
     0x10 => 2,   // refused: redundant match arm: `0x10` is already covered
     _ => 3,
@@ -620,7 +620,7 @@ function f(n: i32): i32 {
 
 ```vl
 function f(n: i32): i32 {
-  match n {
+  return match n {
     _ => 0,
     1 => 1,   // refused: unreachable match arm — the `_` wildcard must be the last arm
   }
@@ -663,7 +663,7 @@ a call or loop.
 function fail(msg: string): never { __trap__(msg) }
 function g(x: i32 | null): i32 {
   if x == null { fail("no") }
-  x
+  return x
 }
 print(g(3))   // prints 3
 ```
@@ -684,8 +684,8 @@ its declaration, so two local functions cannot call each other.
 ```vl
 function outer(n: i32): i32 {
   const base = 10
-  function add(k: i32): i32 { base + k }
-  add(n)
+  function add(k: i32): i32 { return base + k }
+  return add(n)
 }
 print(outer(5))   // prints 15
 ```
@@ -693,8 +693,8 @@ print(outer(5))   // prints 15
 ```vl
 function outer(): i32 {
   const r = g()   // refused: undeclared identifier 'g'
-  function g(): i32 { 1 }
-  r
+  function g(): i32 { return 1 }
+  return r
 }
 ```
 
@@ -709,7 +709,7 @@ type P = { x: i32 }
 function f(): string {
   type P = { s: string }
   const p: P = { s: "in" }
-  p.s
+  return p.s
 }
 print(f())   // prints in
 ```

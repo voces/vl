@@ -114,3 +114,23 @@ is mode-independence, not size:
 deno run -A scripts/probe-rollback-census.ts --seed <instrumented seed> \
   tests/fixtures tests/cases scripts/silent-sweep/distilled/cells scripts/silent-sweep/distilled/named
 ```
+
+## Outcome, 2026-11-15
+
+- **P1** folded into P3. Its one quiet-skipped warning on the corpus was emitted later. The warning is
+  a lint row, so it needs no pre-bank.
+- **P2** (#8354) deleted the write instead of pre-banking it. The node is shared by every instance,
+  so no single type belongs on it. Its order dependence is filed as D16570.
+- **P3** (`2026-11-15-relate-subst-p3.md`): the quiet level that wrote the pin notes drops them.
+- **P6** withdrawn in favour of lane H's emit epoch, which is bumped only for a write to a row older
+  than the innermost re-check mark. That stops the emit-phase alias fill from invalidating the emit
+  memos without changing what the checker's memos see. The finding behind the withdrawn variant
+  (P6′) is recorded in case the checker-side bump ever matters:
+  - An instance's placeholder is minted inside its own application. So only a type built there can
+    have read it empty, and such a type reaches it after the fill. An acyclic fill
+    (`!tyReachesSelf(resIx)`, tested uncached at fill time) therefore changes nothing a memo saw,
+    and its `tyMutEpoch` bump can be skipped.
+  - The cached `genAppRowCyclic` is wrong for this test. An instance that refers back to an outer
+    placeholder still being filled looks acyclic at its own fill, and only becomes cyclic when the
+    outer one fills, which bumps.
+  - On the corpus, 1,680 of `applyGenAliasTys`' 1,744 bumps are acyclic, out of 136,382 bumps in all.

@@ -66,7 +66,7 @@ be bound. A function value returning any type is assignable where a function ret
 there is no `void[]`, no `void | T`, no `void` field and no `void` map value.
 
 ```vl
-function call<T>(f: () => T): T { f() }
+function call<T>(f: () => T): T { return f() }
 call(() => print(5))   // prints 5
 ```
 
@@ -89,7 +89,7 @@ contribute to the type of an `if` or `match`.
 
 ```vl
 function fail(msg: string): never { __trap__(msg) }
-function f(c: boolean): i32 { if c { 1 } else { fail("no") } }
+function f(c: boolean): i32 { return if c { 1 } else { fail("no") } }
 print(f(true))   // prints 1
 ```
 
@@ -220,7 +220,7 @@ refused.
 
 ```vl
 let n = 1
-function g(x: f64): f64 { x / 2 }
+function g(x: f64): f64 { return x / 2 }
 print(g(n))   // prints 0.5
 ```
 
@@ -273,7 +273,7 @@ literal. A union of literal types is VL's enumeration. There is no separate `enu
 
 ```vl
 type Dir = "n" | "s"
-function go(d: Dir): i32 { if d == "n" { 1 } else { 2 } }
+function go(d: Dir): i32 { return if d == "n" { 1 } else { 2 } }
 print(go("s"))   // prints 2
 ```
 
@@ -315,7 +315,7 @@ After a true test, `x` has the narrowed type (narrowing.md). `x !is T` is the ne
 ```vl
 function f(x: i32 | string): i32 {
   if x is i32 { return x + 1 }
-  x.length
+  return x.length
 }
 print(f(1))     // prints 2
 print(f("ab"))  // prints 2
@@ -366,7 +366,7 @@ Arithmetic on a numeric union is specified in expressions.md.
 ```vl
 function f(c: boolean, x: f32): f32 {
   const v = if c { 5 } else { x }   // f32: 5 fits f32 exactly
-  v
+  return v
 }
 print(f(true, 1.5))   // prints 5
 ```
@@ -374,7 +374,7 @@ print(f(true, 1.5))   // prints 5
 ```vl
 function g(x: f32): f32 {
   const v = [0.1, x]   // f32[]: a float literal adopts f32
-  v[1]
+  return v[1]
 }
 print(g(2.5))   // prints 2.5
 ```
@@ -390,7 +390,7 @@ h(true, 1.5)   // prints 9000000000
 ```vl
 function f(c: boolean, a: i32, b: f64): f64 {
   const v = if c { a } else { b }
-  v + 1
+  return v + 1
 }
 print(f(true, 1, 2.5))    // prints 2
 print(f(false, 1, 2.5))   // prints 3.5
@@ -399,7 +399,7 @@ print(f(false, 1, 2.5))   // prints 3.5
 ```vl
 function f(c: boolean, a: i64, b: f64): f64 {
   const v = if c { a } else { b }
-  v   // refused: expected f64, got i64 | f64 — a member does not convert to f64 exactly; write `x as f64`
+  return v   // refused: expected f64, got i64 | f64 — a member does not convert to f64 exactly; write `x as f64`
 }
 ```
 
@@ -541,13 +541,13 @@ a value whose type admits `null` is refused until a test removes `null` (narrowi
 ```vl
 function len(s: string | null): i32 {
   if s == null { return 0 }
-  s.length
+  return s.length
 }
 print(len("abc"))   // prints 3
 ```
 
 ```vl
-function len(s: string | null): i32 { s.length }   // refused: member access '.length' on non-object string | null
+function len(s: string | null): i32 { return s.length }   // refused: member access '.length' on non-object string | null
 ```
 
 **T5.2** `a?.f` is `null` when `a` is `null` and `a.f` otherwise. `a ?? b` is `a` when `a`
@@ -555,13 +555,13 @@ is not `null` and `b` otherwise. `?.` guards `null` only, not other union member
 
 ```vl
 type P = { name: string }
-function n(p: P | null): string { p?.name ?? "none" }
+function n(p: P | null): string { return p?.name ?? "none" }
 print(n(null))   // prints none
 ```
 
 ```vl
 type P = { name: string }
-function n(p: P | i32): string { p?.name ?? "none" }   // refused: member access '?.name' on non-object P | i32
+function n(p: P | i32): string { return p?.name ?? "none" }   // refused: member access '?.name' on non-object P | i32
 ```
 
 > Ruling: DECISIONS.md §"Types & semantics", "`?.` is null-only".
@@ -611,7 +611,7 @@ be delivered where `readonly T[]` is expected when an `S` converts to a `T`. Con
 the list itself needs a copy, such as `.map`.
 
 ```vl
-function sum(xs: readonly f64[]): f64 { xs[0] + xs[1] }
+function sum(xs: readonly f64[]): f64 { return xs[0] + xs[1] }
 const ns: i32[] = [1, 2]
 print(sum(ns))   // prints 3
 ```
@@ -622,7 +622,7 @@ const fs: f64[] = ns   // refused: … a container never widens implicitly, and 
 ```
 
 ```vl
-function f(xs: readonly i32[]) { xs.push(1) }   // refused: `.push()` writes the list, and readonly i32[] is a read-only view
+function f(xs: readonly i32[]) { return xs.push(1) }   // refused: `.push()` writes the list, and readonly i32[] is a read-only view
 ```
 
 > Ruling: owner 2026-09-23, DECISIONS.md §"No implicit container widening";
@@ -708,7 +708,7 @@ same type. Named arguments work only in a call to a declared function, not throu
 function value.
 
 ```vl
-function twice(f: (n: i32) => i32, x: i32): i32 { f(f(x)) }
+function twice(f: (n: i32) => i32, x: i32): i32 { return f(f(x)) }
 print(twice((k: i32) => k + 1, 1))   // prints 3
 ```
 
@@ -726,10 +726,10 @@ the argument out. A last parameter `...xs: T[]` collects the remaining arguments
 `f(...list)` spreads a list into them.
 
 ```vl
-function add(a: i32, b: i32 = 10): i32 { a + b }
+function add(a: i32, b: i32 = 10): i32 { return a + b }
 print(add(1))      // prints 11
 print(add(1, b: 2))   // prints 3
-function sum(...xs: i32[]): i32 { xs.length }
+function sum(...xs: i32[]): i32 { return xs.length }
 print(sum(1, 2, 3))   // prints 3
 print(sum(...[4, 5]))   // prints 2
 ```
@@ -756,14 +756,14 @@ are inferred from the call or written `id<f64>(3)`. Each call is checked at its 
 arguments, and a body that is invalid at those arguments is refused at that call.
 
 ```vl
-function id<T>(x: T): T { x }
+function id<T>(x: T): T { return x }
 print(id(3))          // prints 3
 print(id("s"))        // prints s
 print(id<f64>(3))     // prints 3
 ```
 
 ```vl
-function f<T>(x: T | null): i32 { if x == null { return 0 } x + 1 }
+function f<T>(x: T | null): i32 { if x == null { return 0 } return x + 1 }
 print(f("s"))   // refused: operator '+' is not defined for string and i32 (the call's argument types)
 ```
 
@@ -773,12 +773,12 @@ print(f("s"))   // refused: operator '+' is not defined for string and i32 (the 
 **T9.2** A bound `<T: { n: i32 }>` admits only a type with a stored field `n: i32`.
 
 ```vl
-function get<T: { n: i32 }>(x: T): i32 { x.n }
+function get<T: { n: i32 }>(x: T): i32 { return x.n }
 print(get({ n: 4, m: 1 }))   // prints 4
 ```
 
 ```vl
-function sum<T: { n: i32 }>(xs: T[]): i32 { xs.length }
+function sum<T: { n: i32 }>(xs: T[]): i32 { return xs.length }
 print(sum([1, 2]))   // refused: i32 does not satisfy `{n:i32}`: no field `n: i32`
 ```
 
@@ -786,7 +786,7 @@ print(sum([1, 2]))   // refused: i32 does not satisfy `{n:i32}`: no field `n: i3
 generic function of a compatible type may be stored in it. A concrete function may not.
 
 ```vl
-function id<T>(x: T): T { x }
+function id<T>(x: T): T { return x }
 let g = id
 g = (x: i32) => x + 1   // refused: cannot assign (i32) => i32 to `g`: it keeps the generic type of its initializer
 ```
