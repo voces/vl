@@ -12200,3 +12200,26 @@ stands.
 
 **Ruled by the owner 2026-11-15.** The fuzz sweep with the oracle runs nightly on GitHub Actions
 (public repository, no minute cost) and fails only on a finding not already filed or known.
+
+## A destination binds a type parameter no argument binds (2026-11-15) — D16410, re-grades D9073
+
+**Ruled by the owner 2026-11-15.** The expected type of a call binds a type parameter of the callee
+that no argument binds. For `const k: (x: f64) => f64 = sel(gid)`, with `sel<A>(f: (x: A) => A)`,
+`A` is `f64` from the destination, so `gid` is delivered as its `f64` instance and `k(1.5)` prints
+`1.5`. D9073's annotated-destination face is to be re-graded under this rule.
+
+## A literal `let` joins to a float store (2026-11-15) — D16293 (a), 4.3 at stores
+
+**Ruled by the owner 2026-11-15: option (a).** Spec 4.3's adoption rule applies to stores as it
+does to joins. A `let` initialised by an integer literal and stored a float takes the float type:
+`let t = 0` followed by `t = t + xs[i]` with `xs: f64[]` makes `t` an `f64`, and the generic `sum`
+of D16293 prints `4` at `f64[]` and `3` at `i32[]`. This reverses the "Within kind" clause of "A
+literal binding takes its type from its uses" (B′ + C, 2026-09-29) for stores: an integer literal
+binding may now become a float.
+
+## A generic `as?`/`as!` pin that can never fit answers as the direct cast does (2026-11-15) — D16323, follows D2791
+
+**Ruled by the owner 2026-11-15.** D16323 follows D2791: a cast inside a generic instance behaves
+as the same cast written at the instance's types. A pin whose operand holds no member the target
+could take is a miss, not a refusal: `as?` is `null`, `as!` traps, and a bare `as` propagates.
+D16323 closed this way (`size<string>("ab")` prints `0`).

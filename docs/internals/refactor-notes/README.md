@@ -9,6 +9,32 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-15-type-hashcons-s3b-canon-shadow](2026-11-15-type-hashcons-s3b-canon-shadow.md): Type hash-cons stage 3b: a type's canonical id, shadowed beside the emit comparers (lane H), 2026-11-15
+- [2026-11-15-type-hashcons-s2c1-hole-union](2026-11-15-type-hashcons-s2c1-hole-union.md): Type hash-cons stage 2c-1: two open children that meet become one hole (lane H), 2026-11-15
+- [2026-11-15-slot-store-stage-2b-part2-api](2026-11-15-slot-store-stage-2b-part2-api.md): Slot store, stage 2b part 2a: the reader API's first read (lane S, 2026-11-15)
+- [2026-11-15-slot-store-stage-2b-part1](2026-11-15-slot-store-stage-2b-part1.md): Slot store, stage 2b part 1: the classes alone close the slot facts (lane S, 2026-11-15)
+- [2026-11-15-size-push-grow-outline](2026-11-15-size-push-grow-outline.md): A `push` grows through one shared helper per list shape, 2026-11-15
+- [2026-11-15-rep-adt-stage2-plan](2026-11-15-rep-adt-stage2-plan.md): Rep ADT stage 2, re-planned from a measurement, 2026-11-15 (lane E)
+- [2026-11-15-probe-exact-want](2026-11-15-probe-exact-want.md): Capability matrix and probes: a want is the whole output, 2026-11-15
+- [2026-11-15-perf-self-compile-ratchet](2026-11-15-perf-self-compile-ratchet.md): The self-compile fuel ratchet gets a per-PR tier and a ledger, 2026-11-15
+- [2026-11-15-lane-l-store-back-removed](2026-11-15-lane-l-store-back-removed.md): The D4949 store-back is unreachable and goes — 2026-11-15
+- [2026-11-15-lane-l-never-match-is](2026-11-15-lane-l-never-match-is.md): An `is` that can never match is a warning, the D16047 ruling — 2026-11-15
+- [2026-11-15-lane-l-d16047-fixed-empty](2026-11-15-lane-l-d16047-fixed-empty.md): An empty collection of a fixed element type tests by its arm, the D16047 refinement — 2026-11-15
+- [2026-11-15-l5-step2a-fnuses](2026-11-15-l5-step2a-fnuses.md): L5 step 2a: the per-function frame flags are one `fnUses` record, 2026-11-15 (lane Q)
+- [2026-11-15-l3-named-set-annotated](2026-11-15-l3-named-set-annotated.md): L3: the named set takes the annotated face; PR B is dropped
+- [2026-11-15-l3-inline-record-param](2026-11-15-l3-inline-record-param.md): L3: the row slot takes an inline record (D16290)
+- [2026-11-15-l3-hole-forwarder](2026-11-15-l3-hole-forwarder.md): L3 (c): the hole forwarder takes the row slot (D16403)
+- [2026-11-15-l3-a2-lambda](2026-11-15-l3-a2-lambda.md): L3 A2: a lambda's declared record parameter takes the row slot
+- [2026-11-15-l3-a2-forwarding](2026-11-15-l3-a2-forwarding.md): L3 A2: a wider row forwarded through a generic function
+- [2026-11-15-k-d16420-first-instance-rename](2026-11-15-k-d16420-first-instance-rename.md): D16420: the first instance re-spells a call through an alias, 2026-11-15
+- [2026-11-15-g68-d16365-elem-record-link](2026-11-15-g68-d16365-elem-record-link.md): D16365: records written to a hole receiver's element link their open list fields, 2026-11-15
+- [2026-11-15-g67-d16369-provisional-hole-result](2026-11-15-g67-d16369-provisional-hole-result.md): D16369: a call treats a pre-pass result holding a hole as provisional, 2026-11-15
+- [2026-11-15-g66-tag-decide-order](2026-11-15-g66-tag-decide-order.md): D16381: a call through a set checks a later un-annotated member before asking its result, 2026-11-15
+- [2026-11-15-dedup-function-clones](2026-11-15-dedup-function-clones.md): Source clones of one function body, folded to one definition, 2026-11-15
+- [2026-11-15-d16399-union-field-eq](2026-11-15-d16399-union-field-eq.md): D16399: a union field compares with a member field, in either order, 2026-11-15
+- [2026-11-15-d16395-record-eq-field-sets](2026-11-15-d16395-record-eq-field-sets.md): D16395: `==` over records of different field sets is a check error, 2026-11-15
+- [2026-11-15-d16314-null-list-union-arm](2026-11-15-d16314-null-list-union-arm.md): D16314: a null-only list literal boxes at the arm it is delivered to
+- [2026-11-14-fuzz-nightly-proposal](2026-11-14-fuzz-nightly-proposal.md): The fuzz nightly, proposed: wall time at five sweep sizes and a filed-findings gate, 2026-11-14
 - [2026-11-15-zero-sites-probes](2026-11-15-zero-sites-probes.md): Probes for five unprobed ZERO rows of `goal-scoreboard.vl --sites`, 2026-11-15
 - [2026-11-15-type-hashcons-s2b-hole-column](2026-11-15-type-hashcons-s2b-hole-column.md): Type hash-cons stage 2b: an open collection child is a hole, and a pin solves it (lane H), 2026-11-15
 - [2026-11-15-top-level-callee-first](2026-11-15-top-level-callee-first.md): Top-level statements checked callee-first: four arms, none shipped, 2026-11-15
