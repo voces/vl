@@ -61,9 +61,9 @@ no conversion is built. `R` has to reach the body.
 | position | row | where it goes |
 | --- | --- | --- |
 | `generic_fwd` (both faces), `hole_fwd` | D16219 | A2: the parameter-position column on the pin's argument row |
-| `lambda_param` | D16380 | A2: note the lambda a binding holds |
-| `returned` at a declared `: P` | D16381 | A2 decides: keep the row in the result, or a storage position |
-| `nested_field` | D16382 | the storage view |
+| `lambda_param` | D16400 | A2: note the lambda a binding holds |
+| `returned` at a declared `: P` | D16401 | A2 decides: keep the row in the result, or a storage position |
+| `nested_field` | D16402 | the storage view |
 
 ## The named set (`l3-record-param-width`)
 
