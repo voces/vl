@@ -6,4 +6,3 @@
   ceiling is 2%.
   - The pre-#8430 data generator (100% refused) now fails the run.
   - arith (59%) and hof (5%) carry named ceilings until they are triaged.
-- Four more hof cells of D16493 are listed.

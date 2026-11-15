@@ -691,76 +691,107 @@ function jwSubst(ix: i32, key: string, name: string) {
   return 0
 }
 
-// Substitutes the place in block `blk`'s statements up to the first that rebinds or writes it,
-// or calls what may, where the narrowing ends: a `place = e` or `let root = e` still reads `e` under it, an `if`
-// substitutes its test and each arm the same way, and a loop that writes it reads it unnarrowed.
-// The reads after keep the declared type. False when a write sits where no order is known.
-function jwSubstScoped(
-  blk: i32,
-  key: string,
-  root: string,
-  name: string,
-): boolean {
+// What substituting a block or statement found. `JW_FAILED`: it is not a block.
+// `JW_RAN`: it ran to its end with the place still narrowed. `JW_ENDED`: the narrowing ended in it.
+// `JW_SHADOWED`: a binding of the root's name hides the place to the end of the enclosing block.
+const JW_FAILED = 0
+const JW_RAN = 1
+const JW_ENDED = 2
+const JW_SHADOWED = 3
+
+// A token past every real one: a cut that substitutes every read.
+const JW_NO_CUT = 2147483647
+
+// Substitutes the place in block `blk`'s statements up to the first that rebinds or writes it, or
+// calls what may, where the narrowing ends: a `place = e` or `let root = e` still reads `e` under
+// it, an `if` substitutes its test and each arm the same way, a block nested anywhere is scoped,
+// and a loop that writes it reads it unnarrowed. The reads after keep the declared type.
+function jwSubstScoped(blk: i32, key: string, root: string, name: string): i32 {
   const b = if blk >= 0 { nodeAt(blk) } else { null }
-  if !(b is Block) { return false }
+  if !(b is Block) { return JW_FAILED }
   for st in b.blkStmts {
     if !jwArmDisturbs(st, key, root) {
       jwSubst(st, key, name)
     } else {
-      return jwSubstAtWrite(st, key, root, name)
+      const r = jwSubstAtWrite(st, key, root, name)
+      if r != JW_RAN { return r }
     }
   }
-  return true
+  return JW_RAN
 }
 
-// `jwSubstScoped` for statement `st`, which rebinds or writes the place.
-function jwSubstAtWrite(
-  st: i32,
+// `jwSubstScoped` for statement `st`, which rebinds or writes the place or holds a block that does.
+function jwSubstAtWrite(st: i32, key: string, root: string, name: string): i32 {
+  const sn = nodeAt(st)
+  if sn is BinExpr && sn.binOp == "=" {
+    const lk = jwPlaceKey(sn.binLeft)
+    if lk == key || lk == root {
+      jwSubstUntilCut(sn.binRight, key, root, name)
+      return JW_ENDED
+    }
+  } else if sn is LetDecl && sn.letName == root {
+    jwSubstUntilCut(sn.letInit, key, root, name)
+    return JW_SHADOWED
+  } else if sn is IfStmt {
+    // A test that ends the narrowing leaves both arms to the place.
+    if jwCutTok(sn.ifCond, key, root) >= 0 {
+      jwSubstUntilCut(sn.ifCond, key, root, name)
+      return JW_ENDED
+    }
+    jwSubstBefore(sn.ifCond, key, name, JW_NO_CUT)
+    const t = jwSubstScoped(sn.ifThen, key, root, name)
+    let e = JW_RAN
+    if sn.ifElse >= 0 {
+      if nodeAt(sn.ifElse) is IfStmt {
+        e = jwSubstAtWrite(sn.ifElse, key, root, name)
+      } else {
+        e = jwSubstScoped(sn.ifElse, key, root, name)
+      }
+    }
+    if t == JW_FAILED || e == JW_FAILED { return JW_FAILED }
+    if t == JW_ENDED || e == JW_ENDED { return JW_ENDED }
+    return JW_RAN
+  } else if sn is Block {
+    const r = jwSubstScoped(st, key, root, name)
+    if r == JW_SHADOWED { return JW_RAN }
+    return r
+  } else if sn is ForIn {
+    // A loop variable named after the root hides the place in the body.
+    if sn.fiVar == root || sn.fiVar2 == root {
+      jwSubstUntilCut(sn.fiIter, key, root, name)
+      return JW_RAN
+    }
+    return JW_ENDED
+  } else if sn is ForRange {
+    if sn.frVar == root {
+      jwSubstUntilCut(sn.frFrom, key, root, name)
+      jwSubstUntilCut(sn.frTo, key, root, name)
+      jwSubstUntilCut(sn.frStep, key, root, name)
+      return JW_RAN
+    }
+    return JW_ENDED
+  } else if sn is WhileStmt {
+    return JW_ENDED
+  }
+  // A write nested in `st`, or a call the checker ended the narrowing at: the reads evaluated
+  // before the first are the copy's. With neither, `st` only holds a scoped binding.
+  if jwSubstUntilCut(st, key, root, name) { return JW_ENDED }
+  return JW_RAN
+}
+
+// `jwSubstBefore` of `ix` up to its first write or retiring call; whether it had one.
+function jwSubstUntilCut(
+  ix: i32,
   key: string,
   root: string,
   name: string,
 ): boolean {
-  const sn = nodeAt(st)
-  let rhs = -1
-  if sn is BinExpr && sn.binOp == "=" {
-    const lk = jwPlaceKey(sn.binLeft)
-    if lk == key || lk == root { rhs = sn.binRight }
-  } else if sn is LetDecl && sn.letName == root {
-    if sn.letInit < 0 { return true }
-    rhs = sn.letInit
-  } else if sn is IfStmt {
-    // A test that ends the narrowing leaves both arms to the place.
-    if jwArmDisturbs(sn.ifCond, key, root) {
-      const cut = jwCutTok(sn.ifCond, key, root)
-      if cut < 0 || jwArmWalk(sn.ifCond, key, root, JW_BINDS_OUTSIDE_FNS) {
-        return false
-      }
-      jwSubstBefore(sn.ifCond, key, name, cut)
-      return true
-    }
-    jwSubst(sn.ifCond, key, name)
-    if !jwSubstScoped(sn.ifThen, key, root, name) { return false }
-    if sn.ifElse < 0 { return true }
-    const en = nodeAt(sn.ifElse)
-    if en is IfStmt { return jwSubstAtWrite(sn.ifElse, key, root, name) }
-    return jwSubstScoped(sn.ifElse, key, root, name)
-  } else if sn is Block {
-    return jwSubstScoped(st, key, root, name)
-  } else if sn is WhileStmt || sn is ForIn || sn is ForRange {
-    return true
+  const cut = jwCutTok(ix, key, root)
+  if cut < 0 {
+    jwSubstBefore(ix, key, name, JW_NO_CUT)
+    return false
   }
-  // A write nested in `st`, or a call the checker ended the narrowing at: the reads evaluated
-  // before the first are the copy's.
-  if rhs < 0 {
-    const cut = jwCutTok(st, key, root)
-    if cut < 0 || jwArmWalk(st, key, root, JW_BINDS_OUTSIDE_FNS) {
-      return false
-    }
-    jwSubstBefore(st, key, name, cut)
-    return true
-  }
-  if jwArmDisturbs(rhs, key, root) { return false }
-  jwSubst(rhs, key, name)
+  jwSubstBefore(ix, key, name, cut)
   return true
 }
 
@@ -773,7 +804,6 @@ let jwRetNames: string[] = []
 // in what a closure and a call answer.
 const JW_DISTURBS = 0
 const JW_WRITES_DEEP = 1
-const JW_BINDS_OUTSIDE_FNS = 2
 
 // Does the arm rebind or write the place, or call what the checker ended its narrowing at?
 // Either ends the narrowing, so a blanket substitution past it would be wrong.
@@ -783,13 +813,11 @@ function jwArmDisturbs(ix: i32, key: string, root: string): boolean {
 
 // `ask` over the subtree at `ix`. A closure's own writes run at its call, so for `JW_DISTURBS`
 // its definition counts only by naming a parameter after the root, and the checker's retiring
-// call counts instead; `JW_WRITES_DEEP` walks into closures, `JW_BINDS_OUTSIDE_FNS` skips them and
-// asks only for a binding of the root, not an assignment.
+// call counts instead; `JW_WRITES_DEEP` walks into closures too.
 function jwArmWalk(ix: i32, key: string, root: string, ask: i32): boolean {
   if ix < 0 { return false }
   const n = nodeAt(ix)
   if n is FuncDecl {
-    if ask == JW_BINDS_OUTSIDE_FNS { return false }
     let p = 0
     while p < n.fnParams.length {
       const pn = nodeAt(n.fnParams[p])
@@ -809,7 +837,7 @@ function jwArmWalk(ix: i32, key: string, root: string, ask: i32): boolean {
   } else if n is ForRange {
     if n.frVar == root { return true }
   } else if n is BinExpr {
-    if n.binOp == "=" && ask != JW_BINDS_OUTSIDE_FNS {
+    if n.binOp == "=" {
       const lk = jwPlaceKey(n.binLeft)
       if lk == key { return true }
       if lk == root { return true }
@@ -861,20 +889,43 @@ function jwCutTok(ix: i32, key: string, root: string): i32 {
     if lk == key || lk == root { return nodeToks[ix] + 1 }
   }
   let best = -1
-  let cur = ix
-  while cur >= 0 {
-    for c in nodeValueSpineChildren(cur) {
-      const t = jwCutTok(c, key, root)
-      if t >= 0 && (best < 0 || t < best) { best = t }
-    }
-    cur = elseIfLink(cur)
+  for c in jwScopedKids(ix, root) {
+    const t = jwCutTok(c, key, root)
+    if t >= 0 && (best < 0 || t < best) { best = t }
   }
   return best
 }
 
+// The children of `ix` that can name the place: a block's statements up to a binding of the
+// root's name and its initializer, a loop's iterable or bounds when its variable is so named,
+// and every child of anything else, along an `else if` spine.
+function jwScopedKids(ix: i32, root: string): i32[] {
+  const out: i32[] = []
+  const n = nodeAt(ix)
+  if n is Block {
+    for st in n.blkStmts {
+      const d = nodeAt(st)
+      if d is LetDecl && d.letName == root {
+        out.push(d.letInit)
+        return out
+      }
+      out.push(st)
+    }
+    return out
+  }
+  if n is ForIn && (n.fiVar == root || n.fiVar2 == root) { return [n.fiIter] }
+  if n is ForRange && n.frVar == root { return [n.frFrom, n.frTo, n.frStep] }
+  let cur = ix
+  while cur >= 0 {
+    for c in nodeValueSpineChildren(cur) { out.push(c) }
+    cur = elseIfLink(cur)
+  }
+  return out
+}
+
 // `jwSubst` of the reads that end before token `cut`, which run before the narrowing ends there.
-// An assignment's target stays the place. A closure made before the cut reads the place narrowed,
-// as the checker types it, and one made after reads it unnarrowed.
+// An assignment's target stays the place, and a nested binding of the root's name is scoped. A
+// closure made before the cut reads the place narrowed, as the checker types it; one after does not.
 function jwSubstBefore(ix: i32, key: string, name: string, cut: i32) {
   if ix < 0 { return 0 }
   const root = jwKeyRoot(key)
@@ -894,11 +945,7 @@ function jwSubstBefore(ix: i32, key: string, name: string, cut: i32) {
       return jwSubstBefore(n.binRight, key, name, cut)
     }
   }
-  let cur = ix
-  while cur >= 0 {
-    for c in nodeValueSpineChildren(cur) { jwSubstBefore(c, key, name, cut) }
-    cur = elseIfLink(cur)
-  }
+  for c in jwScopedKids(ix, root) { jwSubstBefore(c, key, name, cut) }
   return 0
 }
 
@@ -1006,10 +1053,8 @@ function jwRewriteSite(siteIx: i32, k: i32): string {
       const root = jwKeyRoot(key)
       jwVarCtr = jwVarCtr + 1
       const vname = "__vljv" + i32ToStr(jwVarCtr)
-      if !jwSubstScoped(arm, key, root, vname) {
-        return "a deep `is` arm that rebinds or writes `"
-          + key
-          + "` inside an expression is not supported yet — write it as its own statement, or bind the converted value first"
+      if jwSubstScoped(arm, key, root, vname) == JW_FAILED {
+        return "internal: deep `is` arm is not a block"
       }
       const cp = jwCopyPlace(recvIx, tok)
       if cp < 0 { return "internal: deep `is` receiver has no copyable place" }

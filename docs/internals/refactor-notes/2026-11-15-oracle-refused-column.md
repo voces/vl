@@ -44,6 +44,10 @@ Control: the data generator from `55151b054` (before #8430) gives
 
 ## known.txt
 
-At `--count 200`, hof cases `ho_s1_0156`, `ho_s3_0148`, `ho_s7_0162` and `ho_s9_0129` trap the
-compiler with `ho_s3_0015`'s stack. They are D16493, now listed. Runs at `--count 100` never
-reached them.
+At `--count 200`, hof cases `ho_s1_0156`, `ho_s3_0148`, `ho_s7_0162` and `ho_s9_0129` trapped the
+compiler with `ho_s3_0015`'s stack (D16493); runs at `--count 100` never reached them. On master
+after #8398, all six cells are loud D16412 refusals (REFUSED-FILED), so none is listed:
+
+    REFUSED-FILED D16411: 25 cell(s)
+    REFUSED-FILED D16412: 746 cell(s)
+    oracle: 2000 cells, 2000 in subset (100.0%), AGREE 1125, REFUSED 104, REFUSED-FILED 771; 0 new disagreement(s)
