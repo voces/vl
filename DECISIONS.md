@@ -12085,3 +12085,94 @@ a warning for a discarded pure tail, and whether callbacks get an exception.
 - **L5** (phase products and a session value): a design note comes before any code.
 - **L6** (an independent oracle): an external tool, adding 0 bytes to the binary. Its CI step runs
   only under the `sweep` label and stays within 30 s.
+
+## The hybrid return rule's details (2026-11-15) — return rule A1, A2, A3
+
+**Ruled by the owner 2026-11-15**, completing the 2026-11-14 hybrid ruling above.
+- **A1, braces.** After a `function` signature, `{` always begins a block: `function f() { x: 3 }`
+  is refused, and `return { x: 3 }` is the spelling. After `=>`, `{` begins an object literal when
+  what follows is a valid field list (`name`, `name: expr`, `...spread`, comma-separated), and a
+  block otherwise. An empty `{}` after `=>` is an empty block. The choice is syntactic only.
+  ```vl
+  () => { x: 3 }      // object
+  (x) => { x }        // object { x: x }
+  () => {}            // empty block (a no-op callback)
+  () => ({})          // empty object
+  ```
+- **A2.** A pure expression (no call, assignment or other effect) left as the last statement of a
+  function's block body, with its value discarded, is a warning with a `--fix` that inserts
+  `return`. A call at the tail is never warned.
+- **A3.** No callback exception: a lambda's block body returns a value only through `return`.
+  Where the expected function type wants a value, the valueless block is a type error at the tail,
+  with the same `--fix`.
+
+## A radix literal is a bit pattern in an integer context and its value in a float context (2026-11-15) — spec 4.1, 4.2, D16390
+
+**Ruled by the owner 2026-11-15.** The 2026-09-04 bit-pattern rule stands for every integer
+destination. In a float context (an `f32`/`f64` destination, peer or `as`), a radix literal is the
+value its digits spell. As a decimal integer literal does (D1890), it is legal at a float
+destination only when the float holds it exactly; an explicit `as` rounds to the nearest float.
+A radix constant tree at an `f64` destination or peer computes at 64 bits, which reverses
+D14990's f64 clause.
+
+```vl
+0x80000000 as f32                // 2147483648.0
+0xFFFFFFFF as f32                // 4294967296.0 (nearest f32)
+const b: f32 = 0xFFFFFFFF        // refused: constant 4294967295 is not exact at f32
+let x: f64 = 0xFFFFFFFF + 1000   // 4294968295
+```
+
+Why: hex in a float context has no pattern meaning; C, Go, JS and Rust's `u32` read the value, and
+games use hex for integer bits (colours, hashes, masks), never for float arithmetic.
+
+## A numeric literal joined with a typed value adopts its type when it fits (2026-11-15) — spec 4.3, T3.6
+
+**Ruled by the owner 2026-11-15.** One rule for `if`/`match` arms, `??` and list elements: a
+numeric literal beside a typed numeric value takes that value's type when it fits (an integer
+exactly; a float literal at `f32` as `let x: f32 = 0.1` does), and otherwise keeps its default and
+the join widens. `if c { 5 } else { f }` with `f: f32` is `f32`, `[5, f]` is `f32[]`, and
+`if c { 9000000000 } else { f }` is `i64 | f32`.
+
+## An empty container's element type is fixed by its annotation (2026-11-15) — spec 4.4, refines D16047
+
+**Ruled by the owner 2026-11-15.** `is` on an empty list, map or set decides by the type it was
+built at, and an annotation fixes that type as a write does: `const m: i32[] = []` makes
+`(m as i32[] | f64[]) is f64[]` false. An empty literal delivered straight into a union takes the
+first matching arm, as D16276 does for `Map()`. D16047's vacuous answer remains only for an empty
+container nothing types: no annotation, no write. A map's `.length` is its entry count (4.6).
+
+## A shift count past 31 makes an untyped literal operand i64 (2026-11-15) — Q8, D16378
+
+**Ruled by the owner 2026-11-15.** A constant shift count from 32 to 63 makes an untyped literal
+operand `i64` (`1 << 40` is 1099511627776); a count of 64 or more is refused with E6.2's sentence.
+An operand whose type is already fixed (a declared `x: i32`, an `i32` destination) keeps E6.2's
+refusal for a count past its width.
+
+## Float constants fold in IEEE at their use type (2026-11-15) — Q9
+
+**Ruled by the owner 2026-11-15**, reversing the float half of "Exact constant arithmetic"
+(2026-09-30); integer constants stay exact. A float constant expression computes in IEEE at the
+type it is used at, identical to the same expression at run time: `0.1 + 0.2` is
+`0.30000000000000004`, `1.0 / 0.0` is Infinity. A float `/` or `%` whose divisor is literally zero
+is a warning. Why: refactoring a constant into a variable must not change a result; C, Rust, Java,
+Swift and JS fold floats this way.
+
+## Generic newtypes are branded per instance and erased (2026-11-15) — A14, D2031
+
+**Ruled by the owner 2026-11-15: option (a).** `type Handle<T> = new i32` gives each application
+its own compile-time brand, so `Handle<Texture>` and `Handle<Mesh>` are distinct and neither
+accepts a bare `i32`; `type Box<T> = new { … }` is branded per instance, so getters key on it and a
+structural value is refused. Brands are erased at run time; an `is` that would need to tell a
+newtype from its base at run time stays refused.
+
+## `==` between records needs one field set; a union compares its arm first (2026-11-15) — D16395
+
+**Ruled by the owner 2026-11-15.** `==` between two record types with different field sets is a
+check error. Comparing a union with one of its members tests the arm first, and a different arm is
+`false`, even when its fields are a superset. D1180's refusal of `==` between two general unions
+stands.
+
+## Nightly fuzzing runs on Actions (2026-11-15) — #8112
+
+**Ruled by the owner 2026-11-15.** The fuzz sweep with the oracle runs nightly on GitHub Actions
+(public repository, no minute cost) and fails only on a finding not already filed or known.
