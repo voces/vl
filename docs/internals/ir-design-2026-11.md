@@ -162,42 +162,58 @@ Under ANF the receiver is a `Var`, so the whole class has no representation.
 numbering is unchanged. Once no function takes the legacy path, an IR allocator owns `vSlot` (step
 I8 in §5).
 
-### 1.5 The coercion node is M3's `Coercion`
+### 1.5 The coercion node: `coercionAt(ix, inst)`
 
-`RCoerce{coC: Coercion, coV}` carries the `Coercion` the relate recorder recorded at the node,
-unchanged. The shape is the one in `refactor-notes/2026-11-15-relate-recorder-design.md` §2
-(PR #8276): `Coercion{conv, at, steps, kids}`. `conv` is a flat code, `at` is the arm actually
-built, and `kids` holds the per-field and per-element coercions in source order.
+`RCoerce{coC: Coercion, coV}` carries the value of one shared query:
 
-How the IR reads it:
-- **Endpoints.** The keys are `TyId` pairs (src, dst, `at`). The verifier takes the endpoint reps as
-  `repOf(src)` and `repOf(dst)`, and checks them against the operand's and the destination's reps.
-- **`steps` are not read.** They are the recorder's ordered side effects (ctx stamp, literal
-  re-typing, rep stamp, …), and they apply when checking. An IR node carries no effect of the
-  checker's.
-- **Recursion.** `lowerCoerce` matches `conv` exhaustively. A coercion with `kids` (a list copy
-  whose elements are coerced, a record copy that coerces a field) emits a loop or a field walk that
-  lowers each kid. That is how lane E's `coerce` rule (rep-adt §4: D2196, D12466) gets one home.
-- **Read, don't call.** Until relate's stage C, `relate` pins holes unless `inferQuiet` is set. So
-  the builder reads the recorded `Coercion` at the node and never calls `relate`. After stage C,
-  phase B (§3.2) may call it as a pure function over a frozen `Checked`.
+```
+type CoerceKind = "none" | "listCopy" | "fnClo" | "mapUnbox" | "mapRetag" | "recCopy"
+  | "box" | "unbox" | "atomstr" | "numeric"         // wasmEmit.vl, today's literal union
+type Coercion = { conv: CoerceKind, at: TyId }
+coercionAt(ix: NodeId, inst: InstId): Coercion    // pure, over the checker's and elaboration's records
+```
 
-**The gap: four of today's ten `CoerceKind`s are not in `CV_*`.** `box`, `unbox`, `numeric` and
-`atomstr` are emitter-side seat decisions today. Each needs its own `conv` code before the adapter
-can retire:
-- `CV_BOX` with `at` as the arm;
-- `CV_UNBOX` with `at` and nullability;
-- `CV_NUM_WIDEN` with prim to prim, which the emitter currently derives from the two types;
-- `CV_ATOM_STR`.
+Why this shape (agreed with lane M3):
+- **The decision already exists, once.** `coerceKindAt` (`wasmEmit.vl`) builds a `CoerceKind`
+  from the checker's per-node records: `listCopyTyOf`, `fnCloCoerceAtNode`, `mapUnboxTyOf`,
+  `deliveryRetagHas`, `recCopyRowAt` and `boxRecordTyAt`. If the checker recorded a
+  `{conv, at}` per node, that would be a second copy of the decision.
+- **It is per instance.** The box, arm, record-copy and numeric records are read at the instance,
+  so the query takes `inst`.
+- **Position belongs to the builder.** `box`, `unbox`, `atomstr` and `numeric` hold only where a
+  delivery position hands the node over, not where a position emits it for its own lowering.
+  Today the four seat globals carry that fact. In the IR it is the builder's own knowledge: a
+  delivery position calls `coercionAt` and emits an `RCoerce` when `conv` is not `"none"`, and no
+  other position does. The seats are not threaded anywhere; L1 removes them by construction (I3).
+- **No `kids`.** A literal's fields and elements are delivery nodes of their own, each with its own
+  `coercionAt`. Element work inside `listCopy` and `recCopy` (lane E's `coerce` rule, rep-adt §4:
+  D2196, D12466) belongs to the lowering, which loops or walks fields and lowers each element's
+  conversion.
+- **Read, don't relate.** The query reads recorded facts and never calls `relate`, which pins
+  holes until its stage C.
 
-The `conv` set also needs to be a string-literal union type, not `i32` constants, so that
-`lowerCoerce` is an exhaustive `match`. Lane M3 has offered to shape `conv` before its
-conversions PR (A3).
+The verifier takes `src` as the operand's `TyId` and `dst` as `at`. It checks
+`repOf(src)`/`repOf(at)` against the operand's and the destination's reps. `lowerCoerce` is a
+`match` over `CoerceKind` with no `_` arm.
 
-Until then, the payload is an adapter, `CoerceRec{kind: CoerceKind, …}`. It packages today's ten
-kinds (`wasmEmit.vl:30278`) with the record each one reads: `boxRecordTyAt`, `armRecordHeapAt`,
-`numRecordAt`, `listCopyAtNode`, `fnCloCoerceAtNode`, `mapUnboxTyOf`, `deliveryRetagHas` and
-`recCopyRowAt`. M3's type replaces the adapter in one PR, and no node changes shape.
+**Where the seats open today** (lane M3's reading of `wasmEmit.vl`). These are exactly the delivery
+positions at which the builder emits a seat-scoped `RCoerce`:
+
+| conv | opened by | positions | owed iff | `at` |
+|---|---|---:|---|---|
+| `box` | `emitDelivered` | 5 | `boxRecordOwed(boxRecordTyAt(ix, fnIx))` | `boxRecordUnionTyOf(bt)` |
+| `unbox` | `armOpen` | 8: a cast or convert argument, a pack argument, a generic store's right-hand side, an index store's right-hand side, a push argument, a return, a destructure argument, and one more | the position owes an arm, `siteHeap >= 0`, `siteHeap != uBoxIdx` and `armRecordHeapAt(ix, fnIx) >= 0` | a heap index today; under the IR the arm's `RepId`, with nullability from `armUnboxNullable` |
+| `atomstr` | `emitAtomToStr` | 4, among them a map key and an `if` arm | `atomFloorWhy(…) == ""` | the atom's union |
+| `numeric` | `emitNumPlain` | 6 numeric-widen paths | `numFloorWhy(…) == ""` | the pair from `numRecordAt(ix, fnIx)` |
+
+The record half carries no seat: `listCopy` (`listCopyAtNode`), `fnClo` (`fnCloCoerceAtNode`),
+`mapUnbox`/`mapRetag` (`mapUnboxTyOf`/`deliveryRetagHas`, under `mapDeliveryRecorded`) and `recCopy`
+(`recCopyRowAt`).
+
+**When it lands.** `coercionAt` is added in I3's PR, together with the builder's first call, from
+the spec above. Landing it earlier would leave an export with no caller, which the dead-export
+gate refuses, and calling it on every `emitExpr` in the legacy path would cost fuel. The legacy
+emitter's seat tests stay as they are until I3 deletes them.
 
 ### 1.6 The emitter is a total function
 
@@ -591,17 +607,15 @@ float operations.
 
 ## 9. Questions to the prerequisite lanes
 
-These were sent to each lane before this PR. **Two items are pending: the `conv` codes in
-`RCoerce`'s payload (M3, §1.5) and `IrCallee` (Q step 6).** They do not block this design: each is a single-type substitution
+These were sent to each lane before this PR. **One item is pending: `IrCallee` (Q step 6).**
+`RCoerce`'s payload is agreed with M3 (§1.5). They do not block this design: each is a single-type substitution
 (§1.5, §1.1). The replies received so far are recorded below.
 
 - **M3, answered** (`refactor-notes/2026-11-15-relate-recorder-design.md`).
-  - The shape is `Coercion{conv, at, steps, kids}`. `conv` is a flat code, and the value is
-    recursive through `kids`.
-  - It is keyed by `TyId` pairs.
-  - `relate` is pure post-check only after its stage C, which waits on H stages 1 and 2.
-  - §1.5 records what the IR reads, and the four `conv` codes it still needs. **The `conv` codes
-    are pending.**
+  - The value is `Coercion{conv: CoerceKind, at: TyId}`, from one pure query,
+    `coercionAt(ix, inst)` (§1.5). It has no `kids` and no checker-side table.
+  - The delivery position is the IR builder's own knowledge, not a parameter or a global.
+  - Until relate's stage C, the query reads recorded facts and never calls `relate`.
 - **E.** Is the 13-kind `RepNode` set still the plan? Is `repOf` total on a closed instance type?
   No answer yet. H's answer below settles the keying of containers of records.
 - **H, answered.**
