@@ -206,8 +206,8 @@ export function area(n: i32): i32 {
 export function bump(): void {
   quiet()
 }
-export function half(n: i32) { n / 2 }
-export function twice(x) { x * 2 }
+export function half(n: i32) { return n / 2 }
+export function twice(x) { return x * 2 }
 export function pick<T>(a: T, b: T): T { return a }
 export function size(sh: Shape): i32 { return sh.w * sh.h }
 export function dflt(n: i32 = 1): i32 { return n }
@@ -368,8 +368,8 @@ const CASES: Case[] = [
     name: "inferred-return change",
     want: "decline",
     why: "interface",
-    from: "{ n / 2 }",
-    to: '{ "h" }',
+    from: "{ return n / 2 }",
+    to: '{ return "h" }',
   },
   {
     name: "record type edit",
@@ -628,7 +628,7 @@ const CASES: Case[] = [
     from: "print(3)",
     to: "const qq: { f: i32 } = { f: 1 }\n  print(qq.f)",
     uses:
-      "type J = { f: f64 }\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n",
+      "type J = { f: f64 }\nfunction mk() { return { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n",
   },
   {
     name: "a private lib type spells main's literal record",
@@ -637,7 +637,7 @@ const CASES: Case[] = [
     from: "function quiet",
     to: "type II = { f: i32 }\nfunction quiet",
     uses:
-      "type J = { f: f64 }\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n",
+      "type J = { f: f64 }\nfunction mk() { return { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n",
   },
   {
     name: "a lib generic application spells main's literal record",
@@ -647,7 +647,7 @@ const CASES: Case[] = [
     to: "function bq(b: Bx<i32>): void { print(b.f) }\nfunction quiet",
     libUses: "export type J = { f: f64 }\ntype Bx<T> = { f: T }\n",
     uses:
-      'import { J } from "./lib"\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
+      'import { J } from "./lib"\nfunction mk() { return { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
   },
   {
     name: "a private lib self-function main's typo is near",
@@ -674,7 +674,7 @@ const CASES: Case[] = [
     from: "n * 2",
     to: "n * 3",
     libUses: 'const sq = "abc"\nconst sr = sq.zzz()\n',
-    uses: "function zzq(self: string): i32 { 1 }\n",
+    uses: "function zzq(self: string): i32 { return 1 }\n",
   },
   {
     // A getter is found from its receiver without an import, so its name is a key.
@@ -701,7 +701,7 @@ const CASES: Case[] = [
     want: "serve",
     from: "n * 2",
     to: "n * 3",
-    uses: 'function zzm(self: string): i32 { 1 }\nprint("a".zzm())\n',
+    uses: 'function zzm(self: string): i32 { return 1 }\nprint("a".zzm())\n',
   },
   {
     // Lib spells `x` and `n`, but builds no record of exactly those fields, so none adopts it.
@@ -729,7 +729,7 @@ const CASES: Case[] = [
     to: "function bq(b: Map<i32>): void { print(b.f) }\nfunction quiet",
     libUses: "export type J = { f: f64 }\ntype Map<T> = { f: T }\n",
     uses:
-      'import { J } from "./lib"\nfunction mk() { { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
+      'import { J } from "./lib"\nfunction mk() { return { f: 4 } }\nconst xj: J | string = mk()\nconst kk = mk()\nif xj is J { print(xj.f) }\nprint([kk][0].f)\n',
   },
   {
     name: "main's private type spells a lib body literal's record",
@@ -738,7 +738,7 @@ const CASES: Case[] = [
     from: "n * 2",
     to: "n * 3",
     libUses:
-      "type J = { f: f64 }\nfunction mk() { { f: 4 } }\nfunction jj(): void {\n  const xj: J | string = mk()\n  const kk = mk()\n  if xj is J { print(xj.f) }\n  print([kk][0].f)\n}\n",
+      "type J = { f: f64 }\nfunction mk() { return { f: 4 } }\nfunction jj(): void {\n  const xj: J | string = mk()\n  const kk = mk()\n  if xj is J { print(xj.f) }\n  print([kk][0].f)\n}\n",
     uses: "type II = { f: i32 }\n",
   },
   {
@@ -934,7 +934,7 @@ const CASES: Case[] = [
     badWhy: "decor",
     from: "export function noop9(): void { print(1) }\n",
     to:
-      "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    noop9()\n    const k: i32 = g\n    return k\n  }\n  0\n}\n",
+      "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    noop9()\n    const k: i32 = g\n    return k\n  }\n  return 0\n}\n",
     libUses:
       "export function noop9(): void { print(1) }\nexport function reg9(h: () => void): void { h() }\n",
     uses:
@@ -946,7 +946,7 @@ const CASES: Case[] = [
     badWhy: "decor",
     from: "export function noop9(): void { print(1) }\n",
     to:
-      "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    noop9()\n    const k: i32 = g\n    return k\n  }\n  0\n}\n",
+      "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    noop9()\n    const k: i32 = g\n    return k\n  }\n  return 0\n}\n",
     libUses:
       "export function noop9(): void { print(1) }\nexport function reg9(h: () => void): void { h() }\n",
     uses:
@@ -959,7 +959,7 @@ const CASES: Case[] = [
     from: "n * 2",
     to: "n * 3",
     libUses:
-      "type W = { f: f64 }\nexport function mk() { { f: 4 } }\nfunction usew(): void {\n  const w: W = mk()\n  print(w.f / 8)\n}\n",
+      "type W = { f: f64 }\nexport function mk() { return { f: 4 } }\nfunction usew(): void {\n  const w: W = mk()\n  print(w.f / 8)\n}\n",
     uses: 'import { mk } from "./lib"\nprint(mk().f)\n',
   },
   {
@@ -968,7 +968,7 @@ const CASES: Case[] = [
     why: "fresh",
     from: "print(3)",
     to: "print(mk().f)",
-    libUses: "export function mk() { { f: 4 } }\n",
+    libUses: "export function mk() { return { f: 4 } }\n",
     uses:
       'import { mk } from "./lib"\nconst w: { f: f64 } = mk()\nprint(w.f / 8)\n',
   },
@@ -979,7 +979,7 @@ const CASES: Case[] = [
     from: "print(3)",
     to: "takeW(mk())",
     libUses:
-      "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\n",
+      "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { return { f: 4 } }\n",
     uses: 'import { mk } from "./lib"\nconst z: i32 = mk().f\nprint(z)\n',
   },
   {
@@ -988,7 +988,7 @@ const CASES: Case[] = [
     from: "takeW(mk())",
     to: "print(3)",
     libUses:
-      "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\nfunction qq(): void { takeW(mk()) }\n",
+      "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { return { f: 4 } }\nfunction qq(): void { takeW(mk()) }\n",
     uses: 'import { mk } from "./lib"\nconst z: i32 = mk().f\nprint(z)\n',
   },
   {
@@ -1001,7 +1001,7 @@ const CASES: Case[] = [
     from: "print(3)",
     to: "print(4)",
     libUses:
-      "export function mk() { { f: [4] } }\nexport function other(): void { const b = mk(); print(b.f[0] + 1) }\n",
+      "export function mk() { return { f: [4] } }\nexport function other(): void { const b = mk(); print(b.f[0] + 1) }\n",
     uses:
       'import { mk } from "./lib"\nconst go = [1].length > 0\nlet v = { f: if go { [1.5] } else { null } }\nv = mk()\nconst fv = v.f\nif fv != null { print(fv[0]) }\n',
     also: ["lib.vl", "const b = mk(); print(b.f[0] + 1)", "print(5)"],
@@ -1011,7 +1011,7 @@ const CASES: Case[] = [
     want: "serve",
     from: "print(3)",
     to: "print(4)",
-    libUses: "export function mk() { { f: 4 } }\n",
+    libUses: "export function mk() { return { f: 4 } }\n",
     uses:
       'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
@@ -1022,9 +1022,9 @@ const CASES: Case[] = [
     name: "lib's builder leaf becomes an element read",
     want: "decline",
     why: "fresh",
-    from: "{ { f: 4 } }",
-    to: "{ const t = [{ f: 4 }]; const u = t; u[0] }",
-    libUses: "export function mk() { { f: 4 } }\n",
+    from: "{ return { f: 4 } }",
+    to: "{ const t = [{ f: 4 }]; const u = t; return u[0] }",
+    libUses: "export function mk() { return { f: 4 } }\n",
     uses:
       'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
@@ -1035,7 +1035,7 @@ const CASES: Case[] = [
     why: "fresh",
     from: "function quiet",
     to: "function zz(mk: i32): void { print(mk) }\nfunction quiet",
-    extra: { "lib2.vl": "export function mk() { { f: 4 } }\n" },
+    extra: { "lib2.vl": "export function mk() { return { f: 4 } }\n" },
     uses:
       'import { mk } from "./lib2"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
   },
@@ -1062,7 +1062,7 @@ const CASES: Case[] = [
     from: "function quiet",
     to:
       "export function hand(): void { let w = { f: [1] }; w = mk(); print(w.f[0]) }\nfunction quiet",
-    libUses: "export function mk() { { f: [4] } }\n",
+    libUses: "export function mk() { return { f: [4] } }\n",
     uses:
       'import { mk } from "./lib"\nconst go = [1].length > 0\nlet v = { f: if go { [1.5] } else { null } }\nv = mk()\nconst fv = v.f\nif fv != null { print(fv[0]) }\n',
   },
@@ -1261,8 +1261,8 @@ const CASES: Case[] = [
         "export type Key = { fn: f64, ff: f64 }\nexport const PART_LEG = 3\n" +
         "export type View = { side: boolean }\n" +
         "export type Gait = { cycle: f64, gait: f64, stride: f64 }\n" +
-        "function lerp(a: f64, b: f64, t: f64) { a + (b - a) * t }\n" +
-        "export function pose(v: View, k: Key, g: Gait): i32 {\n  leg(v, 0, k, g, 0.5, 0.5, 0)\n  0\n}\n" +
+        "function lerp(a: f64, b: f64, t: f64) { return a + (b - a) * t }\n" +
+        "export function pose(v: View, k: Key, g: Gait): i32 {\n  leg(v, 0, k, g, 0.5, 0.5, 0)\n  return 0\n}\n" +
         "function leg(v: View, i: i32, k: Key, g: Gait, amp: f64, run: f64, s: i32) {\n" +
         "  const extra = [k.fn, k.ff][i]\n  const fold = min(1.0, g.gait) * lerp(0.15, 0.28, run)\n}\n",
       "defs.vl":
@@ -1290,7 +1290,7 @@ const CASES: Case[] = [
     from: "print(3)",
     to: "print(4)",
     libUses: "const b3: boolean = 1\n",
-    uses: "function zzq(self: string): i32 { 1 }\n",
+    uses: "function zzq(self: string): i32 { return 1 }\n",
   },
 ];
 
@@ -1568,7 +1568,7 @@ Deno.test({
   fn() {
     // Main's self-function error carries data, and a served module's readings are carried, so
     // every step is compared with the whole check's rows and with its hashes.
-    const uses = "function get(self: {[i32]: i32}, k: i32): i32 { k }\n";
+    const uses = "function get(self: {[i32]: i32}, k: i32): i32 { return k }\n";
     const [g0, g1] = graphs({ ...CASES[0], uses }, true);
     const g2 = {
       ...g1,
@@ -1650,7 +1650,7 @@ const lintRows = (exp: Exports, paired: boolean) => {
     out.push(
       `${exp.lintGraphModule(i)} ${exp.lintGraphLine(i)}:${
         exp.lintGraphCol(i)
-      } [${code}] ${msg}`,
+      } return [${code}] ${msg}`,
     );
   }
   return out;

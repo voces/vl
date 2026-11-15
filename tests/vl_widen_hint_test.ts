@@ -42,7 +42,7 @@ const PRELUDE = [
   "const css: C[][] = [[{ n: 1 }]]",
   "const wr: Circle[] = [{ r: 3 }]",
   "wr.push({ r: 4 })",
-  "function mkc(): Circle[] { [{ r: 5 }] }",
+  "function mkc(): Circle[] { return [{ r: 5 }] }",
 ];
 
 type Fix = "readonly" | "map" | "build";

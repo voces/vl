@@ -257,8 +257,8 @@ Deno.test({
     const dir = await makeTempDir({ prefix: "vl_check_tree_" });
     try {
       const files: Record<string, string> = {
-        "a.vl": 'import { g } from "./b"\nexport function f(): i32 { g() }\n',
-        "b.vl": "export function g(): i32 { 1 }\n",
+        "a.vl": 'import { g } from "./b"\nexport function f(): i32 { return g() }\n',
+        "b.vl": "export function g(): i32 { return 1 }\n",
         "m1.vl": "print(1)\n",
         "m2.vl": "print(2)\n",
         "m3.vl": "print(3)\n",
@@ -319,9 +319,9 @@ Deno.test({
       await Deno.writeTextFile(`${dir}/a.vl`, 'import { g } from "./b"\nprint(g())\n');
       await Deno.writeTextFile(
         `${dir}/b.vl`,
-        'import { h } from "./c"\nexport function g(): i32 { h() }\nconst bad: string = 1\n',
+        'import { h } from "./c"\nexport function g(): i32 { return h() }\nconst bad: string = 1\n',
       );
-      await Deno.writeTextFile(`${dir}/c.vl`, "export function h(): i32 { 1 }\n");
+      await Deno.writeTextFile(`${dir}/c.vl`, "export function h(): i32 { return 1 }\n");
       const run = async (args: string[]) => {
         const r = await new Deno.Command(VL, {
           args: ["check", ...args, "--concise", "--compiler", COMPILER],
@@ -370,8 +370,8 @@ Deno.test({
     try {
       const files: Record<string, string> = {
         "a.vl": 'import { g } from "./b"\nprint(g())\nconst spare = 1\n',
-        "b.vl": 'import { h } from "./c"\nexport function g(): i32 { h() }\nconst bad = "x"\n',
-        "c.vl": "export function h(): i32 { 1 }\n",
+        "b.vl": 'import { h } from "./c"\nexport function g(): i32 { return h() }\nconst bad = "x"\n',
+        "c.vl": "export function h(): i32 { return 1 }\n",
       };
       for (const [name, src] of Object.entries(files)) {
         await Deno.writeTextFile(`${dir}/${name}`, src);
