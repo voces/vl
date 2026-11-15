@@ -64,15 +64,15 @@ A row whose "the check tagged it" column is yes changes nothing. The changes are
   - `ftLateParamOk`.
 
   A per-branch ablation re-ran each accepted plan once per late site it passed, with that one site
-  at its check value. Every one of the 52 flipped sets needs at least one named site:
+  at its check value. Under its trials it counts 52 flipped sets in 33 programs (one more of each than the trial-free count), and every one needs at least one named site:
 
   | the site the flip needs | sets | programs |
   |---|---|---|
-  | `ftNodeOk`: a function an instance found to hand back its parameter (`mintRetParamsOf`) | 47 | 26 |
+  | `ftNodeOk`: a function an instance found to hand back its parameter (`mintRetParamsOf`) | 43 | 24 |
   | `ftNodeOk`: the elaboration instances each call's arm at its arguments | 20 | 7 |
   | `ftHoleParamOf`: a parameter's own type-parameter joins | 8 | 8 |
   | `ftHandedHolder`: a holder of an inner literal or record | 6 | 6 |
-  | `ftHandBackAtClosed`: a hand-back at a closed type | 4 | 4 |
+  | `ftHandBackAtClosed`: a hand-back at a closed type | 4 | 2 |
   | `ftParamStored`: a push the elaboration records as a closure delivery (`mintCloRows`) | 2 | 2 |
   | `ftParamStored`: a parameter every instance hands one set (`ftReachHandSets`) | 1 | 1 |
 
@@ -112,7 +112,7 @@ accepted plan. The elaboration does add nodes after the check.
   - the rest: stores, held parameters, forwarded fields, partial sets, closed lambdas, seeds, aliases
     and nested per-encloser facts.
 
-  The 387 programs read the first. Most of the 32 read the second through the late-only
+  The 387 programs read the first. 24 of the 33 flip programs (as the ablation counts them) read the second through the late-only
   branches.
 - **No re-decided checker fact of size was found.** Node types, membership, calls and escapes are
   stable, so nothing here needs to move upstream for its own sake. Whether lane S's 2b shares an
@@ -120,5 +120,5 @@ accepted plan. The elaboration does add nodes after the check.
 - **Step (ii)** produces the mint tables at check time: the instance-to-set facts and the hand-back
   facts first, from the call binding rows and the forward edges. They are a shadow beside the
   elaboration's notes, diffed table by table. That covers the 387 programs, the forwards and the
-  26 hand-back programs. The other tables follow in the order of the counts above.
+  24 hand-back programs. The other tables follow in the order of the counts above.
 - **Step (iii)** deletes `elabMintFacts`' role as the tag input outright, with no fallback.
