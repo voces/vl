@@ -75,6 +75,14 @@ Deno.test("oracle: pinned regressions", () => {
     ["print(7 + 0xFFFFFFFF)", "6"],
     ["print(0x1_0000_0000)", "4294967296"],
     ["print(0.1 + 0.2)", "0.3"],
+    // T2.3 (ruling 4.1, revised): a radix literal in a float context is its digits' value, rounded
+    ["print(0xFFFFFFFF as f32)", "4294967296"],
+    ["print(0x80000000 as f32)", "2147483648"],
+    ["print(0xFFFFFFFF as f64)", "4294967295"],
+    ["print(0xFFFFFFFFFFFFFFFF as f64)", "18446744073709552000"],
+    ["print(0x1_0000_0001 as f32)", "4294967296"],
+    ["print(1.5 + 0xFFFFFFFF)", "4294967296.5"],
+    ["print(0xFFFFFFFF)", "-1"], // an integer context keeps the pattern
   ];
   for (const [src, want] of pins) {
     const o = interpret(src + "\n");
