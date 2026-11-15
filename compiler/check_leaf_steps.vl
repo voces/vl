@@ -271,6 +271,7 @@ import {
   tyIsNullableLitUnion,
   tyIsOneStrLit,
   tyMapValIsLitUnion,
+  tyOpen,
   tyPinElem,
   tyPinKey,
   tyPinVal,
@@ -394,8 +395,8 @@ export function unresolvedHole(ty: i32) {
   if ty < 0 { return false }
   const t = tyAt(ty)
   match t {
-    TyArray => t.aElem < 0
-    TyMap => t.mKey < 0 || t.mVal < 0
+    TyArray => tyOpen(t.aElem)
+    TyMap => tyOpen(t.mKey) || tyOpen(t.mVal)
     // Every other row holds no collection hole of its own.
     TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => false
   }
@@ -448,13 +449,13 @@ function openFit(m: i32, g: i32, depth: i32): i32 {
     if a is TyMap && b is TyMap && a.mSet == b.mSet { return 1 }
   }
   if a is TyArray && b is TyArray {
-    if a.aElem < 0 { return 1 }
+    if tyOpen(a.aElem) { return 1 }
     return openFit(a.aElem, b.aElem, depth - 1)
   }
   if a is TyMap && b is TyMap {
     if a.mSet != b.mSet { return -1 }
-    const k = if a.mKey < 0 { 1 } else if tyEq(a.mKey, b.mKey) { 0 } else { -1 }
-    const v = if a.mVal < 0 { 1 } else { openFit(a.mVal, b.mVal, depth - 1) }
+    const k = if tyOpen(a.mKey) { 1 } else if tyEq(a.mKey, b.mKey) { 0 } else { -1 }
+    const v = if tyOpen(a.mVal) { 1 } else { openFit(a.mVal, b.mVal, depth - 1) }
     if k < 0 || v < 0 { return -1 }
     return if k == 1 || v == 1 { 1 } else { 0 }
   }
@@ -533,7 +534,7 @@ function tyIsOpenHole(ty: i32): boolean {
 function tyIsOpenMap(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const f = tyAt(ty)
-  f is TyMap && (f.mKey < 0 || f.mVal < 0)
+  f is TyMap && (tyOpen(f.mKey) || tyOpen(f.mVal))
 }
 
 // What a binding's container at a path, the open container `m`, needs: its types, spelled at
@@ -614,11 +615,11 @@ function linkPinMapFrom(s: TyMap, dst: i32): boolean {
   const d = tyAt(dst)
   if !(d is TyMap) { return false }
   let moved = false
-  if s.mKey >= 0 && d.mKey < 0 {
+  if !tyOpen(s.mKey) && tyOpen(d.mKey) {
     tyPinKey(d, s.mKey)
     moved = true
   }
-  if s.mVal >= 0 && d.mVal < 0 {
+  if !tyOpen(s.mVal) && tyOpen(d.mVal) {
     tyPinVal(d, s.mVal)
     moved = true
   }
@@ -627,10 +628,10 @@ function linkPinMapFrom(s: TyMap, dst: i32): boolean {
 
 // `holeLinkPinFrom` for a list `s`: its closed element fills `dst`'s open one.
 function linkPinListFrom(s: TyArray, dst: i32): boolean {
-  if s.aElem < 0 { return false }
+  if tyOpen(s.aElem) { return false }
   const d = tyAt(dst)
   if !(d is TyArray) { return false }
-  if d.aElem >= 0 { return false }
+  if !tyOpen(d.aElem) { return false }
   tyPinElem(d, s.aElem)
   true
 }
@@ -918,7 +919,7 @@ export function cbPendForLoop(loopIx: i32) {
   const lt = placeDeclListTy(n.fiIter)
   if lt < 0 { return 0 }
   const la = tyAt(lt)
-  if !(la is TyArray) || la.aElem < 0 { return 0 }
+  if !(la is TyArray) || tyOpen(la.aElem) { return 0 }
   const bound: string[] = []
   fnBoundNames(loopIx, bound)
   let seen = 0
@@ -947,7 +948,7 @@ function placeDeclListTy(ix: i32): i32 {
   const inner = placeDeclListTy(n.idxArr)
   if inner < 0 { return -1 }
   const it = tyAt(inner)
-  if !(it is TyArray) || it.aElem < 0 { return -1 }
+  if !(it is TyArray) || tyOpen(it.aElem) { return -1 }
   nonNullTy(it.aElem)
 }
 
@@ -1323,12 +1324,12 @@ export function arrLitJoinUnionElem(srcExpr: i32, dtix: i32): boolean {
   if st < 0 { return false }
   const s = tyAt(st)
   if !(s is TyArray) { return false }
-  if s.aElem < 0 { return false }
+  if tyOpen(s.aElem) { return false }
   const se = tyAt(s.aElem)
   if !(se is TyUnion) { return false }
   const d = tyAt(dtix)
   if !(d is TyArray) { return false }
-  if d.aElem < 0 { return false }
+  if tyOpen(d.aElem) { return false }
   const de = tyAt(d.aElem)
   if de is TyUnion { return false }
   true
@@ -1343,7 +1344,7 @@ export function arrLitSoftenedUnionElem(srcExpr: i32, dtix: i32): boolean {
   const st = nodeTyIxOf(srcExpr)
   if st < 0 || st == dtix { return false }
   const d = tyAt(dtix)
-  if !(d is TyArray) || d.aElem < 0 { return false }
+  if !(d is TyArray) || tyOpen(d.aElem) { return false }
   const de = tyAt(d.aElem)
   if de is TyUnion {
     for m in de.uMembers {
@@ -1864,7 +1865,7 @@ export function holeMapDemandOpen(ty: i32) {
     // A hole in either half counts as open, not just the `-1` no-type-yet: `q[k] = v`
     // inside a callee whose `k`/`v` are themselves un-annotated params pins the demand to
     // those holes, a non-negative index that is still undecided.
-    if t.mKey < 0 || t.mVal < 0 { return true }
+    if tyOpen(t.mKey) || tyOpen(t.mVal) { return true }
     return tyIsHole(t.mKey) || tyIsHole(t.mVal)
   }
   true
@@ -2606,7 +2607,7 @@ export function scalarLeafListRetName(er: i32) {
   if er < 0 { return "" }
   const t = tyAt(er)
   if t is TyArray {
-    if t.aElem < 0 { return "" }
+    if tyOpen(t.aElem) { return "" }
     const et = tyAt(t.aElem)
     if et is TyPrim {
       const pn = et.primName
@@ -3176,7 +3177,7 @@ export function cbPendAdd(cbIx: i32, listTy: i32, bound: string[]) {
   if !(lt is TyArray) || !(fd is FuncDecl) || fd.fnParams.length != 1 {
     return 0
   }
-  if lt.aElem < 0 { return 0 }
+  if tyOpen(lt.aElem) { return 0 }
   const p = nodeAt(fd.fnParams[0])
   if !(p is Param) { return 0 }
   let seen = 0
