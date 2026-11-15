@@ -362,7 +362,7 @@ const EMIT_REASON_TEMPLATE = `// An emit refusal past a clean check, with std im
 type __P = {a: i32}
 const __p: __P = {a: 1}
 function __len<T>(f: () => T | string) {
-  7
+  return 7
 }
 print("\\{__len(() => __p)}")
 // @@VALUE@@

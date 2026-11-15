@@ -14,7 +14,7 @@ frozen, and it keeps that count from rising.
   - `compiler/ast.vl` and `compiler/parser.vl`, which build the arena;
   - the 18 PRE functions in `awLowering`, which are the resolve-time lowering;
   - strings, character literals and `//` tails.
-- **`awFields`** holds the 105 fields of `ast.vl`'s 39 `Node` variants. It leaves out `pos` and
+- **`awFields`**, a space-separated string, holds the 105 fields of `ast.vl`'s 39 `Node` variants. It leaves out `pos` and
   `fnRet`, because another record type (`TyFunc`, among others) also declares them, so a write
   through those names cannot be told apart. `tests/vl_arena_write_fields_test.ts` re-derives the
   list from `ast.vl`, reading one-line and multi-line type bodies by brace matching, and fails on
@@ -46,14 +46,20 @@ the ratchet is also a progress meter for L1.
 - **Identity:** `probe-rollback-census.ts --fingerprint` over `tests/cases`, `distilled/cells` and
   `distilled/named` gives **20,319 programs, 0 different**. The rule is a lint, so it emits nothing.
 - **L2:** byte-identical. Guest fuel is 89,536,652,106 for A and 89,536,657,131 for D.
-- **Gates:** `lint-self.sh` is clean, and it reads "arena-write budget ok — 259 writes into existing
+- **Gates (re-run after the scanner was shared):** a fixpoint of `fedd29c30` against this branch gives
+  20,329 programs, 0 different, and L2 is identical. 29 rows differ only when the two arms run from
+  different worktrees, because module and error output carries the checkout path. Re-run from one
+  tree, they match. `lint-self.sh` is clean, and it reads "arena-write budget ok — 259 writes into existing
   nodes". `vl_arena_write_fields_test`, `budget_targets_test`, `vl_ratchet_hold_test` and
   `vl_lint_rule_scope_test` pass, the last with its CLI half (`SELFHOST_NATIVE_ALIGN=1`).
 
 ## Lines
 
-- **Compiler:** +118 in `lint.vl`. That is the rule's two scanners, the 105-name list (12 lines),
-  the 18-name allow-list and comments, after `vl fmt`. The approved estimate was about +45.
+- **Compiler: +89 / −5, net +84, in `lint.vl`.**
+  - The rule shares its line scanner (`codeScanLine`) with `literal-byte-write`.
+  - Its two name lists are space-separated packed strings, which `vl fmt` does not reflow one
+    entry per line.
+  - The first cut was +118.
 - **Outside the compiler:** the test, the baseline and the wiring add about +220.
-- **Net:** this is an instrument, so it is all growth. It pays for itself as each L1 and medium-6
-  step lowers the baseline.
+- **Net:** all of it is an instrument. It pays for itself as each L1 and medium-6 step lowers the
+  baseline.

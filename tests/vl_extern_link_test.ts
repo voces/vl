@@ -130,18 +130,18 @@ extern function add(a: i32, b: i64): i64
 extern function half(x: f64): f64
 extern function neg(b: boolean): boolean
 extern function say(n: i32): void
-function h(): i32 { 2 }
+function h(): i32 { return 2 }
 function pick(i: i32): i32 {
   const fs = [g1, h]
-  fs[i]()
+  return fs[i]()
 }
 print(pick(1))
 print(pick(0))
 const f = add
 print(f(3, 4000000000 as i64))
-function apply(k: (f64) => f64, v: f64): f64 { k(v) }
+function apply(k: (f64) => f64, v: f64): f64 { return k(v) }
 print(apply(half, 5.0))
-function give(): (boolean) => boolean { neg }
+function give(): (boolean) => boolean { return neg }
 print(give()(false))
 type Hooks = { out: (i32) => void }
 const hk: Hooks = { out: say }

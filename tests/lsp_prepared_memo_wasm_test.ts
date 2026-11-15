@@ -27,8 +27,8 @@ const log = (_m: string) => {};
 // knows — which is what makes a stale memo visible as a wrong hover.
 const ENTRY_KEY = "/proj/main.vl";
 const entry = 'import { add } from "./util"\nconst r = add(1, 2)\nprint(r)\n';
-const utilI32 = "export function add(a: i32, b: i32): i32 {\n  a + b\n}\n";
-const utilF64 = "export function add(a: i32, b: i32): f64 {\n  1.5\n}\n";
+const utilI32 = "export function add(a: i32, b: i32): i32 {\n  return a + b\n}\n";
+const utilF64 = "export function add(a: i32, b: i32): f64 {\n  return 1.5\n}\n";
 
 // A reader whose sibling source is swappable — the on-disk edit the test makes
 // between two hovers in the UNCHANGED entry.
@@ -311,16 +311,16 @@ Deno.test({
   want("two errors", got.length, 2);
   want("same diagnostics as `checkSrc`", got.join("\n"), plainCheckDiags(twoErrors).join("\n"));
 
-  // The one diagnostic the symbol check did NOT used to report: a deep-`is` arm
-  // that shadows its own receiver in a block nested in an expression (D16475)
-  // refuses in the SECOND pass, which only `checkSrc` ran. A `checkSrcSym` without it publishes
+  // The one diagnostic the symbol check did NOT used to report: a read of a
+  // deep-`is` receiver in the right operand of its `&&` (D16476) refuses in the
+  // SECOND pass, which only `checkSrc` ran. A `checkSrcSym` without it publishes
   // a clean file for a program `vl build` refuses — the reason the parity is a
   // compiler change and not a host one.
   const deepIs = `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
 type Cfg = { port: i32, host: string | null }
 let g: Json = null
-function a(c: boolean): i32 { if g is Cfg { const x = if c { const g = 5  g + 1 } else { 0 }  return x }  0 }
-print(a(true))
+const b = g is Cfg && g.port > 0
+print(b)
 `;
   const deep = await c.check(deepIs, ENTRY_KEY, read);
   want("the deep-\`is\` refusal reaches the editor", deep.length, 1);
