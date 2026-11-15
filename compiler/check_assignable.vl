@@ -3951,13 +3951,14 @@ function fvaReadsWithin(d: i32, ix: i32, e: i32): boolean {
   false
 }
 
-// Banks each maker call bound to a `const` whose every read is a call at one closed signature: the
-// elaboration builds the maker at that result, and mono builds the call's maker there
-// (`elabMakerCallSig`).
+// Banks each maker call at the one closed result its reach asks for: the calls made through it,
+// in place (`mk()(3)`) or through a `const` that holds it and is only called, or the closed
+// function type it is delivered at. The elaboration builds the maker there, and mono builds the
+// call's maker there (`elabMakerCallSig`).
 export function fvaMakerCallRows() {
   elabMakerCallReset()
-  const sigOf: {[i32]: i32} = Map()
-  const callOf: {[i32]: i32} = Map()
+  const sigAt: {[i32]: i32} = Map()
+  const callOfBind: {[i32]: i32} = Map()
   const calleeReads: {[i32]: boolean} = Map()
   let ix = 0
   while ix < P.nodes.length {
@@ -3965,22 +3966,32 @@ export function fvaMakerCallRows() {
     if n is Call && n.callFn >= 0 {
       const r = parenPeelIx(n.callFn)
       const d = if r >= 0 && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
-      if d >= 0 && d < P.nodes.length {
-        const ln = nodeAt(d)
-        if ln is LetDecl {
-          const mc = fvaMakerCallOf(ln)
-          if mc >= 0 && (sigOf.get(d) ?? 0) != -1 {
-            calleeReads[r] = true
-            const sig = fvaMakerResultAt(mc, fvaCallSig(n, ix))
-            const have = sigOf.get(d) ?? -2
-            if sig < 0 || (have >= 0 && !tySame(have, sig)) {
-              sigOf[d] = -1
-            } else {
-              sigOf[d] = sig
-              callOf[d] = mc
-            }
-          }
+      const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(ix) }
+      let mc = fvaOpenMakerCall(r)
+      if mc < 0 && dn is LetDecl && dn.letKw == "const" && dn.letType < 0 {
+        mc = fvaOpenMakerCall(parenPeelIx(dn.letInit))
+        if mc >= 0 {
+          calleeReads[r] = true
+          callOfBind[d] = mc
         }
+      }
+      if mc >= 0 {
+        fvaReachSig(sigAt, mc, fvaMakerResultAt(mc, fvaCallSig(n, ix)))
+      }
+      const dt = nodeCtxTyIxOf(ix)
+      if (
+        fvaOpenMakerCall(ix) >= 0
+        && dt >= 0
+        && dt < T.tys.length
+        && !tyHasTyVar(dt)
+        && tyAt(dt) is TyFunc
+      ) {
+        const at = fvaMakerResultAt(ix, dt)
+        fvaReachSig(
+          sigAt,
+          ix,
+          if at >= 0 && assignable(at, dt) { dt } else { -1 },
+        )
       }
     }
     ix = ix + 1
@@ -3990,57 +4001,51 @@ export function fvaMakerCallRows() {
   while ix < P.nodes.length {
     if nodeAt(ix) is Ident && !(calleeReads.get(ix) ?? false) {
       const d = identDeclOf(ix)
-      if d != ix && sigOf.has(d) { sigOf[d] = -1 }
+      const mc = callOfBind.get(d) ?? -1
+      if d != ix && mc >= 0 { sigAt[mc] = -1 }
     }
     ix = ix + 1
   }
-  // A maker call delivered where the destination's type closes the result is built at it.
-  const makerOf: {[i32]: i32} = Map()
-  ix = 0
-  while ix < P.nodes.length {
-    const n = nodeAt(ix)
-    if (
-      n is Call
-      && n.callFn >= 0
-      && fvaIsMaker(
-        fvaMakerOfBindingIn(identDeclOf(parenPeelIx(n.callFn)), makerOf),
+  for mc in sigAt.keys() {
+    const sig = sigAt.get(mc) ?? -1
+    const c = nodeAt(mc)
+    if sig >= 0 && c is Call {
+      elabMakerRowNote(
+        fvaMakerOfBinding(identDeclOf(parenPeelIx(c.callFn))),
+        sig,
       )
-    ) {
-      const t = nodeTyIxOf(ix)
-      const dt = nodeCtxTyIxOf(ix)
-      if (
-        t >= 0
-        && t < T.tys.length
-        && tyHasTyVar(t)
-        && dt >= 0
-        && dt < T.tys.length
-        && !tyHasTyVar(dt)
-        && tyAt(dt) is TyFunc
-        && fvaMakerResultAt(ix, dt) >= 0
-        && assignable(fvaMakerResultAt(ix, dt), dt)
-      ) {
-        elabMakerRowNote(
-          fvaMakerOfBinding(identDeclOf(parenPeelIx(n.callFn))),
-          dt,
-        )
-        elabMakerCallNote(ix, dt)
-      }
-    }
-    ix = ix + 1
-  }
-  for d in sigOf.keys() {
-    const sig = sigOf.get(d) ?? -1
-    const mc = callOf.get(d) ?? -1
-    if sig >= 0 && mc >= 0 {
-      const c = nodeAt(mc)
-      if c is Call {
-        const m = fvaMakerOfBinding(identDeclOf(parenPeelIx(c.callFn)))
-        elabMakerRowNote(m, sig)
-        elabMakerCallNote(mc, sig)
-      }
+      elabMakerCallNote(mc, sig)
     }
   }
   fvaMakerCoverCheck()
+}
+
+// Records closed result `sig` (-1 for none) as one maker call `mc`'s reach asks for; two that
+// differ leave it unbuilt (-1).
+function fvaReachSig(sigAt: {[i32]: i32}, mc: i32, sig: i32) {
+  const have = sigAt.get(mc) ?? -2
+  if sig < 0 || (have >= 0 && !tySame(have, sig)) || have == -1 {
+    sigAt[mc] = -1
+  } else {
+    sigAt[mc] = sig
+  }
+  0
+}
+
+// Whether every value maker `m` returns is a lambda or a name: a returned block or choice of
+// several functions is built through its own deliveries, not one instance at the call's result.
+function fvaRetsNamed(m: i32): boolean {
+  const fn = nodeAt(m)
+  if !(fn is FuncDecl) { return false }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  for r in rets {
+    const x = parenPeelIx(r)
+    if x < 0 || x >= P.nodes.length { return false }
+    const n = nodeAt(x)
+    if !(n is Ident) && !(n is FuncDecl) { return false }
+  }
+  rets.length > 0
 }
 
 // The maker a call through binding `d` runs: `d`, or the lambda an un-annotated `const` binds,
@@ -4127,15 +4132,14 @@ function fvaMakerReadCovered(r: i32): boolean {
   elabMakerReadCalled(r)
 }
 
-// The maker call `const` binding `ln` is initialised by, its result left open; -1 otherwise.
-function fvaMakerCallOf(ln: LetDecl): i32 {
-  if ln.letKw != "const" || ln.letType >= 0 || ln.letInit < 0 { return -1 }
-  const mc = parenPeelIx(ln.letInit)
+// Node `mc` when it is a call of a maker whose result is left open and whose every returned
+// value is a lambda or a name (`fvaRetsNamed`); -1 otherwise.
+function fvaOpenMakerCall(mc: i32): i32 {
   if mc < 0 || mc >= P.nodes.length { return -1 }
   const c = nodeAt(mc)
   if !(c is Call) || c.callFn < 0 { return -1 }
   const m = fvaMakerOfBinding(identDeclOf(parenPeelIx(c.callFn)))
-  if !fvaIsMaker(m) { return -1 }
+  if !fvaIsMaker(m) || !fvaRetsNamed(m) { return -1 }
   const t = nodeTyIxOf(mc)
   if t < 0 || t >= T.tys.length || !tyHasTyVar(t) { return -1 }
   mc
