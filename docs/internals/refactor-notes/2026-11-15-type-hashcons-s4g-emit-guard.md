@@ -7,17 +7,16 @@ rep queries in `elabPrepareRun`, and last in `emitProgram`. A census over 15,323
 reach emit, with the window opened at `elabPrepare` and closed after `emitProgramRun`, found **0
 visible `tyEmitEpoch` bumps** and 1,411 fresh ones. It ran on a scratch seed, never committed.
 
-**The guard.** `elabPrepare` and `emitProgram` open `tyEmitWindow`. `tyMutBump` counts a visible bump
-while the window is open. When `emitProgram` ends the window with a nonzero count, it calls
-`emitFail` ("an emit-phase write changed a type an emit memo may already hold") and returns -1.
-`holeReset` closes the window and clears the count at the arena's reset, before that reset's own
-bump, so a check-only compile that ran `elabPrepare` cannot leave it open.
+**The guard.** `elabPrepare` records `tyEmitEpoch` in `emitEpochAt` (`emit_sections.vl`), and so
+does `emitProgram` when it runs the elaboration itself. Since `tyEmitEpoch` moves only on a visible
+write, an emit that ends with it elsewhere calls `emitFail` ("an emit-phase write changed a type an
+emit memo may hold") and returns -1. The read goes through `sealEpoch` in `emit_ty_seal.vl`, which
+already imports the epoch. The guard adds no counter and no checker state.
 
-**Phase-state census.** The window is state that crosses the check→emit boundary by design:
-`elabPrepare` and `emitProgram` open it, and `tyMutBump` (check) counts into it. It lives in
-`check_types.vl` behind `tyEmitWindowOpen` and `tyEmitWindowClose`, so the census counts one
-cross-phase table (`tyEmitWindow`) where two exported globals would have counted two. `surface`
-in `emit_sections.vl` rises by the two functions' imports.
+**Phase-state census.** At master's baseline. `emitEpochAt` is written and read only in the emit
+phase, and `emit_sections.vl` imports no new checker symbol. An earlier draft kept a window flag and
+counter in `check_types.vl`, which `tyMutBump` wrote and `emit_sections.vl` opened and closed. That
+draft raised cross by 1 and surface by 2; this version adds neither.
 
 **What is not done, and why (the coordinator's call).** The emitter's 31 `tyEmitEpoch` reads stay.
 Each also gives its memo per-program invalidation, and some memos may be filled during checking,
@@ -33,6 +32,7 @@ in the same change.
 | control | the guard fires: a scratch seed whose `inferRetPublish` passes no row makes its write visible, and `closures/alias-of-fn-param-litunion-arg.vl` then fails with the internal error |
 | seed | fixpoint |
 | identity | 19,780 of 19,780 files byte-identical against #8400's fixpoint (all of `tests/cases` outside `modules/`, `distilled/cells`, `distilled/named` and `compiler/entry.vl`) |
-| seed size | 6,363,419 → 6,363,650 bytes (+231) |
-| net compiler lines, this PR | +35 (`check_types.vl` +20: the window and its two functions; `emit_sections.vl` +15: the opens and the `emitFail`) |
-| net compiler lines, #8400 + this | **+107** (+72 and +35): an enforced invariant, not deletions. The estimate had been +82 |
+| seed size | SEEDSIZE |
+| phase-state census | `--check` ok, baseline unchanged from master |
+| net compiler lines, this PR | +14 (`emit_sections.vl` +11: the recorded epoch and the `emitFail`; `emit_ty_seal.vl` +3: `sealEpoch`) |
+| net compiler lines, #8400 + this | **+86** (+72 and +14): it enforces an invariant and deletes nothing. The estimate had been +82 |
