@@ -77,16 +77,28 @@ with `tySameSet`, and `tyCanonKey` is the outlier:
 Stage 4 decides per `tyCanonKey` caller which equality it needs, and switches it to the matching
 id.
 
-**Measurements**, against 3a's head seed (4fe55ff0):
+**Measurements**, against 3a's head seed (4fe55ff0; seed size and identity re-read after the merge with master, against 0ab1b2a2):
 
 | reading | value |
 |---|---|
 | seed | fixpoint (two refreshes byte-identical; the gate's native fixpoint leaves it unchanged) |
 | corpus identity, shadow off | 1,833 of 1,833 files, same module and diagnostics |
-| seed size | 6,883,890 → 6,894,010 bytes (+0.15%) |
+| seed size | 6,369,690 → 6,379,037 bytes (+0.15%), merged |
 | net compiler lines | +474: `emit_ty_seal.vl` +434 (the three equalities about 280, the shadow's tallies about 110, imports about 40); `emit_ty_canon.vl` +38 (three outermost wrappers and their import); `emit_sections.vl` +2 |
 | pin helpers (`emit_mono.vl`) | 908 → 908 |
 | byte movers | none |
+
+**L2 fuel**, crossed seed by tree, after the merge with master:
+
+| seed | 3a tree (0ab1b2a2) | 3b tree |
+|---|---|---|
+| 3a seed | 87,058,870,687 | 87,366,789,713 |
+| 3b seed | 87,058,933,408 | 87,366,852,434 |
+
+The seed's own change costs 63k fuel, so the shadow-off wrappers are free. The whole +307.9M
+(+0.35%) is the compiler compiling 474 more lines. 3a's merged head was already at +0.74% on the
+86.42G baseline, so this PR writes the baseline at 87.37G with a ledger line. The stage 4
+deletions take it back.
 
 **Ratchets.**
 - **Phase-state census.** The new module's `surface` is 22: `Ty` and the eleven kinds its
