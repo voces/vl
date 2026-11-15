@@ -7,96 +7,131 @@ import { Call, FuncDecl, Ident, Node, P, nodeAt, nodeChildren } from "./ast"
 import { pinRefDrop } from "./check_pin_refusals"
 import { strListHas } from "./listutil"
 
-// This pass's demands: the declaration, the record the binding (or its list's or map's element)
-// holds, the record it is delivered as, whether it is an element, the whole map type a `Map()`
-// binding is delivered as (else -1), and the delivery.
-export let recAdDecl: i32[] = []
-export let recAdOwn: i32[] = []
-export let recAdDst: i32[] = []
-export let recAdElem: boolean[] = []
-export let recAdWhole: i32[] = []
-export let recAdAt: i32[] = []
-// This pass's settled deliveries (`recAdPushSettled`), each tagged with the judged call that
-// asked it; `recAdSettle` moves the ones no other call contradicts into the demands above.
-export let recAdSetDecl: i32[] = []
-export let recAdSetDst: i32[] = []
-export let recAdSetElem: boolean[] = []
-export let recAdSetAt: i32[] = []
-export let recAdSetGrp: i32[] = []
-export let recAdSetWhole: i32[] = []
+// One pass's rows: its demands, its settled deliveries and the literals they build, the solve's
+// pins, the deliveries forced by adoption, and the refusals about something other than an adopted
+// value as a whole. `recAdPassReset` replaces them.
+export type RecAdPass = {
+  // This pass's demands: the declaration, the record the binding (or its list's or map's element)
+  // holds, the record it is delivered as, whether it is an element, the whole map type a `Map()`
+  // binding is delivered as (else -1), and the delivery.
+  decl: i32[],
+  own: i32[],
+  dst: i32[],
+  elem: boolean[],
+  whole: i32[],
+  at: i32[],
+  // This pass's settled deliveries (`recAdPushSettled`), each tagged with the judged call that
+  // asked it; `recAdSettle` moves the ones no other call contradicts into the demands above.
+  setDecl: i32[],
+  setDst: i32[],
+  setElem: boolean[],
+  setAt: i32[],
+  setGrp: i32[],
+  setWhole: i32[],
+  // The literals those judged calls build, each at the type its call asks and with its call's tag;
+  // `recAdSettle` marks the ones no other call builds at another storage, which then adopt.
+  setLit: i32[],
+  setLitTy: i32[],
+  setLitGrp: i32[],
+  setLitOk: boolean[],
+  // The judged calls whose settled deliveries are declined before any is compared: a call through
+  // a field the elaboration widened builds nothing at its one instance.
+  setDeclined: i32[],
+  // The solve's answer: declarations to re-check with an annotation. Its refusals queue as
+  // `"recAd"` rows.
+  pinDecl: i32[],
+  pinTy: string[],
+  pinTs: i32[],
+  // This pass's deliveries accepted only because they adopt (`recAdForce`), and their bindings.
+  forced: i32[],
+  forcedDecl: i32[],
+  bound: i32[],
+  loose: i32,
+  // The nodes those refusals are raised at, in this pass.
+  looseAt: i32[],
+}
+
+// The rows that last the whole program's check: the refused and width-changing sets, and the
+// declarations an adoption rewrote. `recAdReset` replaces them.
+export type RecAdProg = {
+  // Declarations whose adoption a re-check refused, and the nodes the pins replaced; both last
+  // the whole program's check.
+  noAdopt: {[i32]: boolean},
+  // The annotation nodes an undone adoption left with no declaration: arena nodes no tree reaches.
+  droppedAnn: {[i32]: boolean},
+  // The declarations an adoption currently rewrites, the types they are bound at in this pass,
+  // and how many of this pass's refusals are about something other than an adopted value as a
+  // whole: those are what a literal's own type served, so they undo the adoption.
+  pinned: {[i32]: boolean},
+  // Bindings adopted at a record that stores a number at another width or kind: their reads
+  // compute at the adopted type, so a re-check's refusal stands instead of undoing them (D3339).
+  width: {[i32]: boolean},
+  // Parallel to `origDecl`: each rewritten declaration's name, whether it is a function, and
+  // the type the adoption wrote.
+  origName: string[],
+  origFn: boolean[],
+  origTy: string[],
+  origDecl: i32[],
+  origNode: Node[],
+}
+
+function recAdPassNew(): RecAdPass {
+  {
+    decl: [],
+    own: [],
+    dst: [],
+    elem: [],
+    whole: [],
+    at: [],
+    setDecl: [],
+    setDst: [],
+    setElem: [],
+    setAt: [],
+    setGrp: [],
+    setWhole: [],
+    setLit: [],
+    setLitTy: [],
+    setLitGrp: [],
+    setLitOk: [],
+    setDeclined: [],
+    pinDecl: [],
+    pinTy: [],
+    pinTs: [],
+    forced: [],
+    forcedDecl: [],
+    bound: [],
+    loose: 0,
+    looseAt: [],
+  }
+}
+
+function recAdProgNew(): RecAdProg {
+  {
+    noAdopt: Map(),
+    droppedAnn: Map(),
+    pinned: Map(),
+    width: Map(),
+    origName: [],
+    origFn: [],
+    origTy: [],
+    origDecl: [],
+    origNode: [],
+  }
+}
+
+export let recAdPass: RecAdPass = recAdPassNew()
+export let recAdProg: RecAdProg = recAdProgNew()
+// The judged calls' tag counter, which no reset clears.
 export let recAdSetGrps = 0
-// The literals those judged calls build, each at the type its call asks and with its call's tag;
-// `recAdSettle` marks the ones no other call builds at another storage, which then adopt.
-export let recAdSetLit: i32[] = []
-export let recAdSetLitTy: i32[] = []
-export let recAdSetLitGrp: i32[] = []
-export let recAdSetLitOk: boolean[] = []
-// The judged calls whose settled deliveries are declined before any is compared: a call through
-// a field the elaboration widened builds nothing at its one instance.
-export let recAdSetDeclined: i32[] = []
-// The solve's answer: declarations to re-check with an annotation. Its refusals queue as
-// `"recAd"` rows.
-export let recAdPinDecl: i32[] = []
-export let recAdPinTy: string[] = []
-export let recAdPinTs: i32[] = []
-// Declarations whose adoption a re-check refused, and the nodes the pins replaced; both last
-// the whole program's check.
-export let recAdNoAdopt: {[i32]: boolean} = Map()
-// The annotation nodes an undone adoption left with no declaration: arena nodes no tree reaches.
-export let recAdDroppedAnn: {[i32]: boolean} = Map()
-// The declarations an adoption currently rewrites, the types they are bound at in this pass,
-// and how many of this pass's refusals are about something other than an adopted value as a
-// whole: those are what a literal's own type served, so they undo the adoption.
-export let recAdPinned: {[i32]: boolean} = Map()
-// Bindings adopted at a record that stores a number at another width or kind: their reads
-// compute at the adopted type, so a re-check's refusal stands instead of undoing them (D3339).
-export let recAdWidth: {[i32]: boolean} = Map()
-// This pass's deliveries accepted only because they adopt (`recAdForce`), and their bindings.
-export let recAdForced: i32[] = []
-export let recAdForcedDecl: i32[] = []
-// Parallel to `recAdOrigDecl`: each rewritten declaration's name, whether it is a function, and
-// the type the adoption wrote.
-export let recAdOrigName: string[] = []
-export let recAdOrigFn: boolean[] = []
-export let recAdOrigTy: string[] = []
-export let recAdBound: i32[] = []
-export let recAdLoose = 0
-// The nodes those refusals are raised at, in this pass.
-export let recAdLooseAt: i32[] = []
+// Set while a re-check raises an adoption's refusals.
 export let recAdRaising = false
 // Set while a pinned binding's initializer is graded at its adopted type: a field the record drops
 // still runs its initializer, so the literal may set fields the record does not declare (D3339).
 export let recAdPinInit = false
-export let recAdOrigDecl: i32[] = []
-export let recAdOrigNode: Node[] = []
 
 // Drop one pass's demands; the pins and the refused set outlive it.
 export function recAdPassReset() {
-  recAdBound = []
-  recAdLoose = 0
-  recAdLooseAt = []
-  recAdForced = []
-  recAdForcedDecl = []
-  recAdDecl = []
-  recAdOwn = []
-  recAdDst = []
-  recAdElem = []
-  recAdWhole = []
-  recAdAt = []
-  recAdSetDecl = []
-  recAdSetDst = []
-  recAdSetElem = []
-  recAdSetAt = []
-  recAdSetGrp = []
-  recAdSetWhole = []
-  recAdSetLit = []
-  recAdSetLitTy = []
-  recAdSetLitGrp = []
-  recAdSetLitOk = []
-  recAdSetDeclined = []
-  recAdPinDecl = []
-  recAdPinTy = []
-  recAdPinTs = []
+  recAdPass = recAdPassNew()
   pinRefDrop("recAd")
   0
 }
@@ -104,31 +139,25 @@ export function recAdPassReset() {
 // Drop everything, before a program's first pass.
 export function recAdReset() {
   recAdPassReset()
-  recAdNoAdopt = Map()
-  recAdDroppedAnn = Map()
-  recAdPinned = Map()
-  recAdWidth = Map()
-  recAdOrigName = []
-  recAdOrigFn = []
-  recAdOrigTy = []
-  recAdOrigDecl = []
-  recAdOrigNode = []
+  recAdProg = recAdProgNew()
   0
 }
 
 // Whether node `ix` is an annotation an undone adoption wrote and then dropped.
-export function recAdAnnDropped(ix: i32): boolean { recAdDroppedAnn.has(ix) }
+export function recAdAnnDropped(ix: i32): boolean {
+  recAdProg.droppedAnn.has(ix)
+}
 
 // Does `x` read, within a few levels, a binding or call whose type an adoption wrote? An
 // annotation such a value meets is what adopted it, never redundant.
 export function recAdAdoptedCall(x: i32): boolean {
-  if recAdOrigDecl.length == 0 { return false }
+  if recAdProg.origDecl.length == 0 { return false }
   recAdMentions(x, 6)
 }
 
 // Does an adopted declaration bind `name`? By name only: this decides a hint, not a type.
 function recAdIsAdoptedName(name: string): boolean {
-  strListHas(recAdOrigName, name)
+  strListHas(recAdProg.origName, name)
 }
 
 export function recAdMentions(x: i32, depth: i32): boolean {
