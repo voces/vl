@@ -47985,7 +47985,7 @@ The cause is one line:
 ```vl
 function addTy(t: Ty) {
   T.tys.push(t)
-  T.tys.length - 1
+  return T.tys.length - 1
 }
 ```
 

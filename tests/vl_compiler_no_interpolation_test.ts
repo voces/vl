@@ -38,11 +38,11 @@ if (GATED && !ENABLED) {
 // exemptions apply: `x` is not annotated as anything but `i32`, and the chain's
 // literals are plain strings with no declared `+` operator in scope.
 const FIXTURE = `export function needsInterp(x: i32): string {
-  "n=\\{x}"
+  return "n=\\{x}"
 }
 
 export function needsChain(): string {
-  "a" + "b" + "c" + "d"
+  return "a" + "b" + "c" + "d"
 }
 `;
 
