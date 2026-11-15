@@ -78,6 +78,8 @@ const FLAVOUR_READERS = [
   "emit_sections:assignSharedHelperIndices gOptimized",
   // A plain build fills long pooled strings from a passive segment; `-O` builds each inline.
   "emit_sections:strFillPlan gOptimized",
+  // A push grows through `__grow_<row>__` in a plain build and inline under `-O`.
+  "wasmEmit:emitPushAppend gOptimized",
   // `--low-memory-unused` (only with `-O`) folds an address's constant into the memarg.
   "wasmEmit:emitCallCoreUserFn gLowMemUnused",
   "wasmEmit:emitLowMemAccessorCall gLowMemUnused",
