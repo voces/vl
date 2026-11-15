@@ -1074,7 +1074,11 @@ export class Interp {
   assign(e: Extract<Expr, { k: "assign" }>, env: Env): Val {
     let v: Val;
     if (e.op === "=") {
+      // E10.1: the place's own operands (object, index) are evaluated before the value
+      const target = this.freeze(e.target, env);
       v = this.eval(e.e, env, this.targetTy(e.target, env));
+      this.store(target, v, env);
+      return v;
     } else {
       // E7.2: a compound assignment evaluates its target's object and index once.
       const target = this.freeze(e.target, env);
