@@ -57,8 +57,11 @@ import {
   arenaSetNode,
   elseIfLink,
   i32ToStr,
+  mkBlock,
+  mkBool,
   mkCall,
   mkIdent,
+  mkIf,
   mkIndex,
   mkLet,
   mkMember,
@@ -67,6 +70,7 @@ import {
   nodeAt,
   nodeToks,
   nodeValueSpineChildren,
+  valueIfAdd,
 } from "./ast"
 import { tErr } from "./check_relate_core"
 import { i32ListHas, strListAppend } from "./listutil"
@@ -983,26 +987,86 @@ function jwPolarity(c0: i32, siteIx: i32): i32 {
 
 // Prepend `stmt` to `blk`'s statement list, in place. The list is mutated through
 // `.push` / `.pop` rather than replaced, so no field write is needed on a narrowed arm.
+// The `&&` nodes after `siteIx` whose left operand holds the site's test, and the `||` nodes whose
+// left operand holds its negation: the right operand of each runs only with the test passed.
+function jwNarrowedOperands(siteIx: i32): i32[] {
+  const out: i32[] = []
+  let c = siteIx + 1
+  while c < P.nodes.length {
+    const n = nodeAt(c)
+    if n is BinExpr {
+      if n.binOp == "&&" && jwPolarity(n.binLeft, siteIx) == 1 { out.push(c) }
+      if n.binOp == "||" && jwPolarity(n.binLeft, siteIx) == -1 { out.push(c) }
+    }
+    c = c + 1
+  }
+  return out
+}
+
+// Rewrites the right operand `e` of `&&` or `||` node `bin` to `if true { const v = <get>(place)
+// e[place → v] } else { false }`, so it reads a converted copy of the place `recvIx` names.
+function jwWrapOperand(
+  bin: i32,
+  recvIx: i32,
+  key: string,
+  k: i32,
+  tok: i32,
+): boolean {
+  const b = nodeAt(bin)
+  if !(b is BinExpr) { return false }
+  jwVarCtr = jwVarCtr + 1
+  const vname = "__vljv" + i32ToStr(jwVarCtr)
+  const thenB = jwSetTok(mkBlock([b.binRight], -1), tok)
+  if jwSubstScoped(thenB, key, jwKeyRoot(key), vname) == JW_FAILED {
+    return false
+  }
+  const cp = jwCopyPlace(recvIx, tok)
+  if cp < 0 { return false }
+  const gid = jwSetTok(mkIdent(jwWalkerName(k), -1), tok)
+  const gcall = jwSetTok(mkCall(gid, [cp], -1), tok)
+  if (
+    !jwPrependStmt(thenB, jwSetTok(mkLet("const", vname, -1, gcall, -1), tok))
+  ) {
+    return false
+  }
+  const elseB = jwSetTok(mkBlock([jwSetTok(mkBool(0, -1), tok)], -1), tok)
+  const cond = jwSetTok(mkBool(1, -1), tok)
+  const wrapped = valueIfAdd(jwSetTok(mkIf(cond, thenB, elseB, b.pos), tok))
+  arenaSetNode(
+    bin,
+    {
+      binOp: b.binOp,
+      binLeft: b.binLeft,
+      binRight: wrapped,
+      pos: b.pos,
+      binCompound: b.binCompound,
+      binTpl: b.binTpl,
+      binRegion: b.binRegion,
+      binIdent: b.binIdent,
+    },
+  )
+  return true
+}
+
 function jwPrependStmt(blk: i32, stmt: i32): boolean {
+  return jwInsertStmt(blk, 0, stmt)
+}
+
+// Puts statement `stmt` at index `at` of block `blk`, as a new block node in its slot.
+function jwInsertStmt(blk: i32, at: i32, stmt: i32): boolean {
   if blk < 0 { return false }
   const b = nodeAt(blk)
-  if b is Block {
-    const old: i32[] = []
-    let i = 0
-    while i < b.blkStmts.length {
-      old.push(b.blkStmts[i])
-      i = i + 1
-    }
-    while b.blkStmts.length > 0 { b.blkStmts.pop() }
-    b.blkStmts.push(stmt)
-    let j = 0
-    while j < old.length {
-      b.blkStmts.push(old[j])
-      j = j + 1
-    }
-    return true
+  if !(b is Block) { return false }
+  const out: i32[] = []
+  let i = 0
+  while i < b.blkStmts.length {
+    if i == at { out.push(stmt) }
+    out.push(b.blkStmts[i])
+    i = i + 1
   }
-  return false
+  if at >= b.blkStmts.length { out.push(stmt) }
+  arenaSetNode(blk, { blkStmts: out, pos: b.pos })
+  return true
 }
 
 // The block the narrowing governs for the innermost conditional enclosing the site,
@@ -1065,6 +1129,15 @@ function jwRewriteSite(siteIx: i32, k: i32): string {
       const letIx = jwSetTok(mkLet("const", vname, -1, gcall, -1), tok)
       if !jwPrependStmt(arm, letIx) {
         return "internal: deep `is` arm is not a block"
+      }
+    }
+    // Each operand an `&&` evaluates only once the test passed, or an `||` once its negation
+    // failed, reads its own converted copy.
+    if key != "" {
+      for op in jwNarrowedOperands(siteIx) {
+        if !jwWrapOperand(op, recvIx, key, k, tok) {
+          return "internal: deep `is` operand could not be rewritten"
+        }
       }
     }
     const fid = jwSetTok(mkIdent(jwPredName(k), n.pos), tok)

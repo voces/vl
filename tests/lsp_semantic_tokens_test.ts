@@ -159,13 +159,13 @@ Deno.test({
   const body = [
     "type Json = null | boolean | f64 | string | Json[] | { [string]: Json }",
     "type Cfg = { port: i32, host: string | null }",
-    "function a(r: Json): i32 { if r is Cfg { return bump(r.port) }  0 }",
+    "function a(r: Json): i32 { if r is Cfg { return bump(r.port) }  return 0 }",
     "const m: { [string]: Json } = Map()",
     "const n = a(m)",
     "print(n)",
     "",
   ];
-  const util = "export function bump(x: i32): i32 {\n  x + 1\n}\n";
+  const util = "export function bump(x: i32): i32 {\n  return x + 1\n}\n";
   const reader = (k: string) => k.endsWith("util.vl") ? util : undefined;
   const faces: [string, string, (k: string) => string | undefined, number][] = [
     ["imported", `import { bump } from "./util"\n${body.join("\n")}`, reader, 1],

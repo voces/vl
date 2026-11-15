@@ -206,6 +206,41 @@ export function nearNamesNote(): void { nearNamesRead = true }
 // bug; minting a new index needs none. `cUserTypesVer` does the same for `cUserTypes` writes.
 export let tyMutEpoch = 0
 
+// `tyEmitEpoch` advances with `tyMutEpoch` except for a write to a row or hole minted inside the
+// innermost open fresh scope (a mono re-check, an alias application), which no emit memo can have
+// read; the emitter's memos stamp with it. A write that names neither moves both.
+export let tyEmitEpoch = 0
+// Per open fresh scope, outermost first: the arena length and the hole count when it began.
+const tyFreshRowMark: i32[] = []
+const tyFreshHoleMark: i32[] = []
+
+// Advances the epochs for an in-place write to arena row `row` or hole `hole` (-1 for neither):
+// the one writer of `tyMutEpoch` and `tyEmitEpoch`.
+export function tyMutBump(row: i32, hole: i32) {
+  tyMutEpoch = tyMutEpoch + 1
+  const n = tyFreshRowMark.length
+  const fresh = n > 0
+    && (row >= 0 && row >= tyFreshRowMark[n - 1]
+    || row < 0 && hole >= 0 && hole >= tyFreshHoleMark[n - 1])
+  if fresh { return 0 }
+  tyEmitEpoch = tyEmitEpoch + 1
+  return 0
+}
+
+// Opens a fresh scope: rows and holes minted from here are fresh until `tyFreshEnd`. Only code
+// inside the scope can hold them, so a write to one invalidates no emit memo.
+export function tyFreshBegin() {
+  tyFreshRowMark.push(T.tys.length)
+  tyFreshHoleMark.push(holeSol.length)
+  return 0
+}
+
+export function tyFreshEnd() {
+  tyFreshRowMark.pop()
+  tyFreshHoleMark.pop()
+  return 0
+}
+
 export let cUserTypesVer = 0
 
 // Each generic nested in another function, by declaration node, to its enclosing declaration.
@@ -2497,6 +2532,15 @@ export function tyReachesSelf(ix: i32): boolean {
   return tyReachesGo(ix, ix, seen, 0)
 }
 
+// `tyReachesSelf`, except that a walk that gives up past its depth answers true: the caller
+// skips an invalidation only on a proven acyclic type.
+export function tyMayReachSelf(ix: i32): boolean {
+  if ix < 0 { return false }
+  const seen: i32[] = []
+  if tyReachesGo(ix, ix, seen, 0) { return true }
+  return i32ListHas(seen, -2)
+}
+
 // Does arena type `ix` reach a cycle — itself, or a type that reaches itself, as an arm a join
 // re-minted around a recursive alias does?
 export function tyReachesCycle(ix: i32): boolean {
@@ -2522,7 +2566,11 @@ function tyCycleGo(cur: i32, stack: i32[], done: i32[]): boolean {
 
 function tyReachesGo(cur: i32, target: i32, seen: i32[], depth: i32): boolean {
   if cur < 0 { return false }
-  if depth > 64 { return false }
+  if depth > 64 {
+    // Gave up: `tyMayReachSelf` reads the marker as a possible cycle.
+    seen.push(-2)
+    return false
+  }
   const kids: i32[] = []
   tyChildrenOf(cur, kids)
   let i = 0
@@ -4484,6 +4532,29 @@ export function tyLitMemberTexts(ty: i32) {
   return out
 }
 
+// Whether `tyLitMemberTexts(ty)` is non-empty, read without building the list.
+export function tyHasLitMemberText(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyUnion => {
+      for u in t.uMembers {
+        const m = tyAt(u)
+        if m is TyLit {
+          if m.litKind == "str" { return true }
+        }
+      }
+      return false
+    }
+    TyLit => {
+      return t.litKind == "str"
+    }
+    TyPrim | TyFunc | TyObj | TyNullable | TyArray | TyMap | TyNeg | TyVar | TyErr => {
+      return false
+    }
+  }
+}
+
 // The string-literal member types `tyLitMemberTexts` reads the texts of, in the same order.
 export function tyLitMemberTys(ty: i32): i32[] {
   const out: i32[] = []
@@ -4882,8 +4953,16 @@ function memberTySameAt(a: i32, b: i32, depth: i32): boolean {
     && (genAppRowOf(a) >= 0) == (genAppRowOf(b) >= 0)
 }
 
+// Whether `memberTySame` compares member `t` by its children: a list, map or nullable. Any other
+// pair it calls one shares `memberDeclPos`, so a member set buckets by that position.
+export function memberTyNests(t: i32): boolean {
+  if t < 0 { return false }
+  const k = tyAt(t)
+  return k is TyArray || k is TyMap || k is TyNullable
+}
+
 // The declared struct position arena type `m` records, or -1 for a type no declaration names.
-function memberDeclPos(m: i32): i32 {
+export function memberDeclPos(m: i32): i32 {
   if m < 0 || m >= cStructFirstPos.length { return -1 }
   return cStructFirstPos[m]
 }
@@ -4947,24 +5026,27 @@ function tvSlotShownAs(binder: i32, idx: i32): i32 {
 // Pins open element `v` into list row `t` in place, advancing `tyMutEpoch`: the one writer of a
 // list row's element after its mint, so every pin invalidates the epoch-stamped memos.
 export function tyPinElem(t: TyArray, v: i32) {
+  const h = holeIxOf(t.aElem)
   if !holeSolve(t.aElem, v) { t.aElem = v }
-  tyMutEpoch = tyMutEpoch + 1
+  tyMutBump(-1, h)
   return 0
 }
 
 // `tyPinElem` for a map row's key; a lone string literal is stored as its one-member set, as
 // `mkMapTy` stores it (D16367).
 export function tyPinKey(t: TyMap, v: i32) {
+  const h = holeIxOf(t.mKey)
   const s = strLitAsSet(v)
   if !holeSolve(t.mKey, s) { t.mKey = s }
-  tyMutEpoch = tyMutEpoch + 1
+  tyMutBump(-1, h)
   return 0
 }
 
 // `tyPinElem` for a map row's value.
 export function tyPinVal(t: TyMap, v: i32) {
+  const h = holeIxOf(t.mVal)
   if !holeSolve(t.mVal, v) { t.mVal = v }
-  tyMutEpoch = tyMutEpoch + 1
+  tyMutBump(-1, h)
   return 0
 }
 
@@ -4993,6 +5075,8 @@ let holeSol: i32[] = []
 
 // Empties the hole column with the arena it belongs to.
 export function holeReset() {
+  tyFreshRowMark.clear()
+  tyFreshHoleMark.clear()
   holeSol = []
   return 0
 }
@@ -5044,6 +5128,11 @@ function holeSolve(c: i32, v: i32): boolean {
 }
 
 // What child field value `c` reads as.
+// The hole child code `c` names, root-resolved, or -1 when it names no hole.
+function holeIxOf(c: i32): i32 {
+  return if isHoleCode(c) { -4 - holeRoot(c) } else { -1 }
+}
+
 function holeView(c: i32): i32 {
   if !isHoleCode(c) { return c }
   return holeSol[-4 - holeRoot(c)]
