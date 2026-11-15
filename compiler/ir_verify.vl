@@ -38,6 +38,7 @@ import {
   SBoundsCheck,
   SBr,
   SCellSet,
+  SDrop,
   SEffect,
   SGlobalSet,
   SIf,
@@ -66,7 +67,7 @@ import {
 } from "./emit_rep"
 import { repIsNoValue, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
-import { TY_BOOL, TY_I32, TY_STR } from "./check_types"
+import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { i32ToStr } from "./ast"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
@@ -92,16 +93,16 @@ function fail(rule: i32, at: i32, msg: string) {
     vfAt = at
     vfMsg = msg
   }
-  0
+  return 0
 }
 
 function varRep(v: i32): i32 {
   if v < 0 || v >= vf.irVars.length { return -1 }
-  vf.irVars[v].vRep
+  return vf.irVars[v].vRep
 }
 
 function opRep(o: Opnd): i32 {
-  match o {
+  return match o {
     OVar => varRep(o.ov)
     OImm => o.oiRep
     OStr => vfStr
@@ -134,14 +135,32 @@ function use(o: Opnd, at: i32) {
 
 function uses(os: Opnd[], at: i32) {
   for o in os { use(o, at) }
-  0
+  return 0
 }
 
 function isNum(k: string): boolean {
-  k == "i32" || k == "i64" || k == "f64" || k == "f32"
+  return k == "i32" || k == "i64" || k == "f64" || k == "f32"
 }
 
-function isInt(k: string): boolean { k == "i32" || k == "i64" }
+function isInt(k: string): boolean { return k == "i32" || k == "i64" }
+
+// 1 when operand `o` is a variable typed at an unsigned integer, 0 at any other type, -1 for an
+// immediate, which carries no type.
+function opUnsignedTy(o: Opnd): i32 {
+  const v = opndVar(o)
+  if v < 0 || v >= vf.irVars.length { return -1 }
+  const p = tyScalarBasePrim(vf.irVars[v].vTy)
+  if p == null { return 0 }
+  const ps: string = p
+  return if ps == "u32" || ps == "u64" { 1 } else { 0 }
+}
+
+function opndVar(o: Opnd): i32 {
+  return match o {
+    OVar => o.ov
+    OImm | OStr => -1
+  }
+}
 
 // Rule 2 for a primitive op: its operands' reps and its result rep `dst`.
 function primSig(r: RPrimOp, dst: i32, at: i32) {
@@ -167,21 +186,35 @@ function primSig(r: RPrimOp, dst: i32, at: i32) {
   const op: PrimOp = r.poOp
   const kindOk = match op {
     "add" | "sub" | "mul" | "div" | "rem" | "lt" | "le" | "gt" | "ge" | "neg" => isNum(k)
-    "shl" | "shr" | "shru" => isInt(k)
+    "divu" | "remu" | "ltu" | "leu" | "gtu" | "geu" | "shl" | "shr" | "shru" => isInt(k)
     "and" | "or" | "xor" => isInt(k) || k == "bool"
     "eq" | "ne" => isNum(k) || k == "bool"
     "not" => k == "bool"
   }
   if !kindOk { return fail(2, at, r.poOp + " has no signature over " + k) }
+  // The signed and unsigned forms must agree with the operand's type, which the rep cannot say.
+  const wantsUnsigned = match op {
+    "divu" | "remu" | "ltu" | "leu" | "gtu" | "geu" => 1
+    "div" | "rem" | "lt" | "le" | "gt" | "ge" | "shr" => 0
+    "add" | "sub" | "mul" | "shl" | "shru" | "and" | "or" | "xor" | "eq" | "ne" | "neg" | "not" => -1
+  }
+  if wantsUnsigned >= 0 {
+    for o in a {
+      const u = opUnsignedTy(o)
+      if u >= 0 && u != wantsUnsigned {
+        return fail(2, at, r.poOp + "'s signedness is not its operand's type's")
+      }
+    }
+  }
   const cmp = match op {
-    "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "not" => true
-    "add" | "sub" | "mul" | "div" | "rem" | "neg" | "shl" | "shr" | "shru" | "and" | "or" | "xor" => false
+    "eq" | "ne" | "lt" | "ltu" | "le" | "leu" | "gt" | "gtu" | "ge" | "geu" | "not" => true
+    "add" | "sub" | "mul" | "div" | "divu" | "rem" | "remu" | "neg" | "shl" | "shr" | "shru" | "and" | "or" | "xor" => false
   }
   const res = if cmp { vfBool } else { ar }
   if dst != res {
     return fail(2, at, r.poOp + "'s result is not its destination's rep")
   }
-  0
+  return 0
 }
 
 // Rules 2 and 6 for a call of callee `fnPos` with `args` into a destination of rep `dst`
@@ -217,13 +250,13 @@ function callSig(fnPos: i32, args: Opnd[], dst: i32, at: i32) {
   if dst >= 0 && dst != vf.irSigRet[si] {
     return fail(6, at, "the result rep is not the callee's")
   }
-  0
+  return 0
 }
 
 function kidAt(r: i32, i: i32): i32 {
   const ks = repNodeKids(r)
   if i < 0 || i >= ks.length { return -1 }
-  ks[i]
+  return ks[i]
 }
 
 // Rule 2: `r`'s operands and its result rep against destination rep `dst` (-1 for an effect).
@@ -358,7 +391,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
 function exits(id: i32): boolean {
   if id < 0 || id >= vf.irNodes.length { return false }
   const n = vf.irNodes[id]
-  n is SBr || n is SReturn || n is STrap
+  return n is SBr || n is SReturn || n is STrap
 }
 
 // Rule 5's fall-through: a body with out-variable `out` ends by writing it, or by leaving.
@@ -382,7 +415,7 @@ function nested(body: i32[]) {
     const d = vfDefLog.pop() ?? -1
     if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
   }
-  0
+  return 0
 }
 
 function labelled(label: i32, out: i32, body: i32[]) {
@@ -391,7 +424,7 @@ function labelled(label: i32, out: i32, body: i32[]) {
   nested(body)
   vfLabels.pop()
   vfLabelOut.pop()
-  0
+  return 0
 }
 
 function stmt(id: i32) {
@@ -540,6 +573,7 @@ function stmt(id: i32) {
       0
     }
     STrap => 0
+    SDrop => use(n.dpV, id)
   }
 }
 
@@ -578,14 +612,14 @@ function switchCheck(n: SSwitch, id: i32) {
   for s in seen {
     if !s { return fail(7, id, "an arm of the scrutinee is not covered") }
   }
-  0
+  return 0
 }
 
 // Rule 1: whether `r` is a node of the tree and not an unsupported one.
 function closedRep(r: i32): boolean {
   const n = repNodeAt(r)
   if n == null { return false }
-  !(n is RUnsup)
+  return !(n is RUnsup)
 }
 
 // Rule 1 for a node: its rep is a closed one in the tree.
@@ -594,7 +628,7 @@ function nodeRepClosed(id: i32) {
   if !closedRep(r) {
     return fail(1, id, "the node's rep is " + repWhat(r) + ", not a closed rep")
   }
-  0
+  return 0
 }
 
 // Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
@@ -640,5 +674,5 @@ export function irVerify(f: IrFn): IrVerdict {
     fail(5, -1, "a valued function falls off its end")
   }
   const v: IrVerdict = { vfRule: vfRule, vfNode: vfAt, vfMsg: vfMsg }
-  v
+  return v
 }

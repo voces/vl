@@ -30,14 +30,14 @@ walk and the class read side by side at five elab readers over
 | reader | differing calls | this PR |
 |---|---|---|
 | `elabRetFnListLitTy` | 0 | switched |
-| `elabLamDeliveredParams` | 0, once a lambda is placed in its frame and a callback takes its own instance's parameters | stays on the walk: [D16570](../inventory/D16570.md) |
+| `elabLamDeliveredParams` | 0, once a lambda is placed in its frame and a callback takes its own instance's parameters | stays on the walk: [D16580](../inventory/D16580.md) |
 | `elabSlotUncalledOmitting` | 16 | stays: `omit` lists reads, and the classes keep no edge per read |
 | `elabLamGenResultTy` | 3, all in `closures/generic-returned-by-maker-through-hole-param-runs` | stays: a function returned through a function value's own result does not reach the caller's call in the classes |
 | `elabSlotUncalled` | 2 | stays: not yet narrowed |
 
 `elabLamDeliveredParams` answers the walk's parameters at every call, but switching it refuses
 [D4661](../inventory/D4661.md)'s witness, traps the compiler on one case and raises late demands:
-the walk call demands the instances the lambda's calls reach. The pin is D16570.
+the walk call demands the instances the lambda's calls reach. The pin is D16580.
 
 ## Walk code this makes dead
 

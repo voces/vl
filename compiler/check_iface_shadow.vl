@@ -1,0 +1,179 @@
+// Shadow interfaces for L2's S0: each un-annotated function's parameters, the deferred demand rows
+// it owns, and whether each call's recorded result agrees with its result substituted at that
+// call's bindings (`l2-inferred-interfaces-design.md` §8). An instrument only; no pass reads it.
+// Built on demand from the tables the last check left: `ifaceDumpBuild`, then `ifaceDumpAt`.
+import { FuncDecl, P, Param, i32ToStr, nodeAt } from "./ast"
+import { fnDeclIx } from "./check_write_scan"
+import {
+  callBindCount,
+  callBindIxAt,
+  callBindNamesAt,
+  callBindTysAt,
+} from "./check_bind_rows"
+import {
+  argCstr,
+  arrDefCstr,
+  binCstr,
+  bmCstr,
+  isCstr,
+  letCstr,
+  memCstr,
+  nestCstr,
+  printCstr,
+  retCstr,
+  ufcsCstr,
+} from "./check_cstr_rows"
+import { inferQuiet } from "./check_cursor"
+import { elabCallDeclOf } from "./check_elab_cap"
+import { hdBase, hdKind, hdRootTy } from "./check_hole_pins"
+import { nodeTyIxOf, nodeTyOf } from "./check_node_tys"
+import { substTyDeep } from "./check_relate_core"
+import { T, TyFunc, TyVar, tyAt, tyToStr } from "./check_types"
+
+let ifaceText = ""
+
+// Type `t` as text, a type variable by its name, so a scheme's variables can be told apart.
+function ifaceTyStr(t: i32): string {
+  if t < 0 || t >= T.tys.length { return "?" }
+  const v = tyAt(t)
+  if v is TyVar { return "'" + v.tvName }
+  return tyToStr(t)
+}
+
+// The number of rows of an owner column `fns` that `fnIx` owns.
+function ifaceOwned(fns: i32[], fnIx: i32): i32 {
+  let n = 0
+  for f in fns {
+    if f == fnIx { n = n + 1 }
+  }
+  return n
+}
+
+// `name=count` for a non-zero count, else "".
+function ifaceCountTag(name: string, n: i32): string {
+  if n == 0 { return "" }
+  return " " + name + "=" + i32ToStr(n)
+}
+
+// Whether declaration `f` has a parameter with no annotation.
+function ifaceUnann(f: FuncDecl): boolean {
+  for pIx in f.fnParams {
+    const p = nodeAt(pIx)
+    if p is Param && p.parType < 0 { return true }
+  }
+  return false
+}
+
+// The derived-hole kinds rooted at one of `params`, as ` hd<kind>=<count>` tags.
+function ifaceHdTags(params: i32[]): string {
+  const counts: i32[] = []
+  let k = 0
+  while k < 15 {
+    counts.push(0)
+    k = k + 1
+  }
+  let r = 0
+  while r < hdKind.length && r < hdBase.length {
+    const root = hdRootTy(hdBase[r])
+    let hit = false
+    for p in params {
+      if p == root { hit = true }
+    }
+    const kd = hdKind[r]
+    if hit && kd >= 0 && kd < counts.length { counts[kd] = counts[kd] + 1 }
+    r = r + 1
+  }
+  let out = ""
+  k = 0
+  while k < counts.length {
+    out = out + ifaceCountTag("hd" + i32ToStr(k), counts[k])
+    k = k + 1
+  }
+  return out
+}
+
+// The calls of `fnIx` with a binding row: how many there are, and how many record a result that
+// is not its declared result substituted at the call's bindings. A disagreeing call is listed.
+function ifaceCallsOf(fnIx: i32, ft: TyFunc): string {
+  let calls = 0
+  let differ = 0
+  let shown = ""
+  let r = 0
+  while r < callBindCount() {
+    const ix = callBindIxAt(r)
+    const got = nodeTyOf(ix)
+    if elabCallDeclOf(ix) == fnIx && got >= 0 && ft.fnRet >= 0 {
+      calls = calls + 1
+      const q = inferQuiet
+      inferQuiet = true
+      const want = substTyDeep(ft.fnRet, callBindNamesAt(r), callBindTysAt(r))
+      inferQuiet = q
+      const a = if want >= 0 && want < T.tys.length { tyToStr(want) } else { "?" }
+      const b = if got < T.tys.length { tyToStr(got) } else { "?" }
+      if a != b {
+        differ = differ + 1
+        if differ <= 3 {
+          shown = shown + " differ@" + i32ToStr(ix) + "{" + a + "|" + b + "}"
+        }
+      }
+    }
+    r = r + 1
+  }
+  return " calls=" + i32ToStr(calls) + " differ=" + i32ToStr(differ) + shown
+}
+
+// One line for un-annotated declaration `fnIx`.
+function ifaceLine(fnIx: i32, f: FuncDecl): string {
+  const sig = nodeTyIxOf(fnIx)
+  if sig < 0 || sig >= T.tys.length { return "" }
+  const ft = tyAt(sig)
+  if !(ft is TyFunc) { return "" }
+  let ps = ""
+  for p in ft.fnParamTypes {
+    if ps != "" { ps = ps + ", " }
+    ps = ps + ifaceTyStr(p)
+  }
+  const rt = ifaceTyStr(ft.fnRet)
+  return "fn "
+    + f.fnName
+    + "("
+    + ps
+    + ") -> "
+    + rt
+    + ifaceCountTag("bin", ifaceOwned(binCstr.fn, fnIx))
+    + ifaceCountTag("arg", ifaceOwned(argCstr.fn, fnIx))
+    + ifaceCountTag("ret", ifaceOwned(retCstr.fn, fnIx))
+    + ifaceCountTag("let", ifaceOwned(letCstr.fn, fnIx))
+    + ifaceCountTag("bm", ifaceOwned(bmCstr.fn, fnIx))
+    + ifaceCountTag("mem", ifaceOwned(memCstr.fn, fnIx))
+    + ifaceCountTag("ufcs", ifaceOwned(ufcsCstr.fn, fnIx))
+    + ifaceCountTag("is", ifaceOwned(isCstr.fn, fnIx))
+    + ifaceCountTag("print", ifaceOwned(printCstr.fn, fnIx))
+    + ifaceCountTag("arrdef", ifaceOwned(arrDefCstr.fn, fnIx))
+    + ifaceCountTag("nest", ifaceOwned(nestCstr.fn, fnIx))
+    + ifaceHdTags(ft.fnParamTypes)
+    + ifaceCallsOf(fnIx, ft)
+}
+
+// Builds the dump, one line per un-annotated top-level function, and returns its length.
+export function ifaceDumpBuild(): i32 {
+  let out = ""
+  for name in fnDeclIx.keys() {
+    const ix = fnDeclIx[name] ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is FuncDecl && ifaceUnann(n) {
+        const l = ifaceLine(ix, n)
+        if l != "" { out = out + l + "\n" }
+      }
+    }
+  }
+  ifaceText = out
+  return out.length
+}
+
+// Code point `i` of the dump, 0 past its end.
+export function ifaceDumpAt(i: i32): i32 {
+  if i < 0 || i >= ifaceText.length { return 0 }
+  return ifaceText[i]
+}

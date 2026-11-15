@@ -110,10 +110,17 @@ type IrNode =
   | SBr       { brLabel: i32, brVal: Opnd | null }
   | SReturn   { rtV: Opnd | null }
   | STrap     { tpWhy: i32 }                              // `unreachable`, with a reason for the map
+  | SDrop     { dpV: Opnd }                               // migration only: evaluate, then `drop`
 type IrVar = { vRep: RepId, vTy: TyId, vKind: "param" | "local" | "temp", vSlot: i32 }
 ```
 
-That is 21 right-hand sides and 15 statements. It is the closed set the emitter matches (§1.6).
+That is 21 right-hand sides and 16 statements. It is the closed set the emitter matches (§1.6).
+
+**`SDrop` is a migration node.** The legacy emitter evaluates a bare value statement and drops it.
+The common case is a void function's tail `0`, which becomes `i32.const 0; drop`. The value is
+pure, so the IR needs nothing for it, but phase A must reproduce the bytes. `SDrop` holds the
+operand, and the verifier checks only its use. Once bytes may move, a dead-code pass deletes every
+`SDrop` and then the node itself: that is a named mover at I10, or at I8 if I8 renumbers anyway.
 
 **Signedness lives on the op, not the rep.** `u32` and `u64` share their valtype, and so their
 rep, with `i32` and `i64` (`unsigned-types-design.md`). So `PrimOp` carries signedness: `div`/`divu`,
@@ -231,7 +238,7 @@ emitter's seat tests stay as they are until I3 deletes them.
 
 ```
 lowerRhs(r: Rhs, dst: IrVar): void      // match over the 21 Rhs kinds; no `_`
-lowerStmt(n: IrNode): void              // match over the 15 statements; no `_`
+lowerStmt(n: IrNode): void              // match over the 16 statements; no `_`
 lowerCoerce(c: Coercion): void          // match over M3's variants; no `_`
 ```
 
@@ -284,6 +291,12 @@ following.
 8. **Bounds.** Every `RListGet`/`SListSet` is preceded on every path by an `SBoundsCheck` of the
    same `(list, index)`, or carries a proof tag that a BCE pass wrote. A pass that deletes a check
    must leave the tag.
+   - In phase A a check sits immediately before its access, and is **fused**: it lowers as nothing,
+     and the access lowers both the guard and the read, which is legacy's shape.
+   - The check's operand reads do not consume. They do not count against a temp's single use, so
+     `f()[i]` stays one temp, consumed by the access.
+   - A check that a pass separates from its access (LICM, I10) must name non-temp `Var`s. It then
+     lowers as a standalone guard.
 9. **No trap moves past an effect.** An `SBoundsCheck`, an `RCast` with `"trap"` or an `STrap`
    that a pass moved keeps every earlier effect (a call, a store, a print) ahead of it on every
    path. The exception is a check that the pass proved can never trap, and that check carries the

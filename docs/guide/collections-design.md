@@ -174,7 +174,7 @@ same representation, so handing a `T[]` to a `readonly T[]` position costs nothi
 ```vl
 type Circle = { r: i32 }
 type Shape = Circle | { s: i32 }
-function total(xs: readonly Shape[]): i32 { xs.length }   // never writes its argument
+function total(xs: readonly Shape[]): i32 { return xs.length }   // never writes its argument
 const circles: Circle[] = [{ r: 7 }]
 print(total(circles))                                     // covariant: a Circle[] passes
 ```
@@ -222,7 +222,7 @@ both fixes — declare the destination `readonly` when it only reads, or copy wi
 
 ```vl
 type C = { n: i32 }
-function count(xs: readonly (C | null)[]): i32 { xs.length }  // only reads: a view
+function count(xs: readonly (C | null)[]): i32 { return xs.length }  // only reads: a view
 const cs: C[] = [{ n: 1 }]
 print(count(cs))
 const grown: (C | null)[] = cs.map((x): C | null => x)        // will be written: a copy

@@ -90,7 +90,7 @@ type Wide = { a: i32, b: i32 }
 type Narrow = { a: i32 }
 type OW = { n: Wide }
 type ON = { n: Narrow }
-function take(o: ON): i32 { (o.n).a }
+function take(o: ON): i32 { return (o.n).a }
 const w: OW = { n: { a: 1, b: 2 } }
 print(take(w))
 ```
@@ -104,10 +104,10 @@ type Wide = { a: i32, b: i32 }
 type Narrow = { a: i32 }
 type OW = { n: Wide }
 type ON = { n: Narrow }
-function take(o: ON): i32 { (o.n).a }
+function take(o: ON): i32 { return (o.n).a }
 function decoy(): i32 {
   const w = { n: { a: 9, b: 9 } }
-  (w.n).a
+  return (w.n).a
 }
 const w: OW = { n: { a: 1, b: 2 } }
 print(take(w))
