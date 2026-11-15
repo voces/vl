@@ -51,6 +51,8 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  letAnnAt,
+  letInitAt,
   nodeAt,
 } from "./ast"
 import {
@@ -79,6 +81,8 @@ import { strListHas } from "./listutil"
 import { demangleSpelling } from "./tyname"
 import { isDigit, isIdPart } from "./lexer"
 import { hexVal } from "./strutil"
+import { capIsBound } from "./emit_base"
+import { annNameOf } from "./parser"
 
 // ── diagnostic sink ──────────────────────────────────────────────────────────
 
@@ -1907,14 +1911,6 @@ function vecReset() {
   0
 }
 
-// The type spelling of annotation node `t`, or "" when it is no plain `TypeRef`.
-function lintAnnName(t: i32): string {
-  if t < 0 || t >= P.nodes.length { return "" }
-  const tn = nodeAt(t)
-  if tn is TypeRef { return tn.tyName }
-  ""
-}
-
 // The element type of a `f64[]` / `f32[]` spelling, or "".
 function vecListElem(name: string): string {
   if name == "f64[]" { return "f64" }
@@ -1974,7 +1970,7 @@ function vecFloatOf(ix: i32, depth: i32): string {
     Unary => if e.unOp == "-" { vecFloatOf(e.unArg, depth + 1) } else { "" }
     Ident => vecFloatOfName(e.identName, depth)
     AsExpr => vecFloatName(e.asTy)
-    Call => vecFloatName(lintAnnName(vecModFnRet(e.callFn)))
+    Call => vecFloatName(annNameOf(vecModFnRet(e.callFn)))
     BinExpr => vecFloatOfArith(e, depth)
     StrLit | CharLit | BoolLit | NullLit | Member | OptMember | Index => ""
     ArrayLit | ObjLit | FieldInit | Spread | IsExpr | MatchExpr | ErrExpr | LoopVar => ""
@@ -1996,15 +1992,8 @@ function vecFloatOfName(name: string, depth: i32): string {
   const d = lintBindDecl(name)
   if d < 0 || d >= P.nodes.length { return "" }
   const ann = lintDeclAnn(d)
-  if ann >= 0 { return vecFloatName(lintAnnName(ann)) }
-  vecFloatOf(lintLetInit(d), depth + 1)
-}
-
-// The initialiser node of binding `d`, or -1 for a declaration that is no `let`/`const`.
-function lintLetInit(d: i32) {
-  const dn = nodeAt(d)
-  if dn is LetDecl { return dn.letInit }
-  -1
+  if ann >= 0 { return vecFloatName(annNameOf(ann)) }
+  vecFloatOf(letInitAt(d), depth + 1)
 }
 
 // The float type of `a op b` for `+ - * /`: both operands floats, or one a float and the
@@ -2110,7 +2099,7 @@ function vecTrackParam(pix: i32, id: i32) {
   const pn = nodeAt(pix)
   if pn is Param {
     if pn.parRest != 0 { return 0 }
-    const ty = vecListElem(lintAnnName(pn.parType))
+    const ty = vecListElem(annNameOf(pn.parType))
     if ty == "" { return 0 }
     vecParamId[pix] = id
     vecTrack(id, ty)
@@ -2135,7 +2124,7 @@ function vecLetCandidate(ix: i32): string {
   if n is LetDecl {
     const init = lintUnwrapParen(n.letInit)
     if vecLitElems(init).length == 0 { return "" }
-    if n.letType >= 0 { return vecListElem(lintAnnName(n.letType)) }
+    if n.letType >= 0 { return vecListElem(annNameOf(n.letType)) }
     return vecLitFloatTy(init)
   }
   ""
@@ -2189,7 +2178,7 @@ function vecCheckReturned(ix: i32) {
   }
   let ty = ""
   if vecFnRet >= 0 {
-    ty = vecListElem(lintAnnName(vecFnRet))
+    ty = vecListElem(annNameOf(vecFnRet))
   } else {
     ty = vecLitFloatTy(ix)
   }
@@ -2279,7 +2268,7 @@ function vecNoteCall(n: Call, ix: i32) {
       if pix >= 0 && vecLitElems(lit).length > 0 {
         vecArgLits.push(lit)
         vecArgParams.push(pix)
-        vecArgTys.push(vecListElem(lintAnnName(vecParamType(pix))))
+        vecArgTys.push(vecListElem(annNameOf(vecParamType(pix))))
       }
       a = a + 1
     }
@@ -2498,7 +2487,7 @@ function intWidthOf(ix: i32, depth: i32): i32 {
     Unary => if e.unOp == "-" || e.unOp == "~" { intWidthOf(e.unArg, depth + 1) } else { 0 }
     Ident => intWidthOfName(e.identName, depth)
     AsExpr => intWidthName(e.asTy)
-    Call => intWidthName(lintAnnName(vecModFnRet(e.callFn)))
+    Call => intWidthName(annNameOf(vecModFnRet(e.callFn)))
     BinExpr => intWidthOfArith(e, depth)
     StrLit | CharLit | BoolLit | NullLit | Member | OptMember | Index => 0
     ArrayLit | ObjLit | FieldInit | Spread | IsExpr | MatchExpr | ErrExpr | LoopVar => 0
@@ -2522,8 +2511,8 @@ function intWidthOfName(name: string, depth: i32): i32 {
   const d = lintBindDecl(name)
   if d < 0 || d >= P.nodes.length { return 0 }
   const ann = lintDeclAnn(d)
-  if ann >= 0 { return intWidthName(lintAnnName(ann)) }
-  const w = intWidthOf(lintLetInit(d), depth + 1)
+  if ann >= 0 { return intWidthName(annNameOf(ann)) }
+  const w = intWidthOf(letInitAt(d), depth + 1)
   if w < 0 { return 0 }
   w
 }
@@ -3429,14 +3418,7 @@ function lintScrutIsInt(ix: i32) {
 function lintDeclAnn(d: i32) {
   const dn = nodeAt(d)
   if dn is Param { return dn.parType }
-  lintLetAnn(d)
-}
-
-// The annotation node of binding `d`, or -1 for a declaration that is no `let`/`const`.
-function lintLetAnn(d: i32) {
-  const dn = nodeAt(d)
-  if dn is LetDecl { return dn.letType }
-  -1
+  letAnnAt(d)
 }
 
 // Whether annotation node `t` spells `i32`, `i64` or one of this file's literal unions.
@@ -5934,7 +5916,7 @@ function klLineCallsAny(s: string, a: i32, e: i32) {
           const nm = s.slice(i, j)
           if strListHas(klNamingCalls, nm) { return true }
           if strListHas(klFnName, nm) { return true }
-          if siHas(klImportedFns, nm) { return true }
+          if capIsBound(klImportedFns, nm) { return true }
         }
         i = j
       }
@@ -6690,7 +6672,7 @@ export function lintHoleFieldsOf(src: string): {[string]: i32} {
 }
 
 // Whether field `f` is a hole field of this module or of any module in its graph.
-function siIsHole(f: string) { siHas(siHoleF, f) || siHas(siGraphHoles, f) }
+function siIsHole(f: string) { capIsBound(siHoleF, f) || capIsBound(siGraphHoles, f) }
 // This module's MAP globals — a key subscript, never an index.
 let siMapG: {[string]: i32} = Map()
 // The import locals binding another module's map global. One module's text cannot tell
@@ -6837,9 +6819,6 @@ function siDrop(xs: {[string]: i32}, name: string) {
   xs[name] = 0
   0
 }
-
-// `name` is a live member of `xs`.
-function siHas(xs: {[string]: i32}, name: string) { (xs[name] ?? 0) == 1 }
 
 // ── one walk over a line, seven kinds of work ────────────────────────────────
 // Every pass below reads a line index by index with string and char literals stepped
@@ -7177,7 +7156,7 @@ function siCloseReaders(slot: i32) {
     if (
       at >= 0
       && at < siFnReader.length
-      && siHas(siImportedReaders, openName[k])
+      && capIsBound(siImportedReaders, openName[k])
     ) {
       siFnReader[at] = 1
     }
@@ -7391,9 +7370,9 @@ function siGradeRead(
   let base = table
   const dot = siFieldOf(table)
   if dot.length > 0 { base = table.slice(0, table.length - dot.length - 1) }
-  if siHas(siDeclared, base) { return 0 }
-  if siHas(siMapG, table) || siHas(siImportedMaps, table) { return 0 }
-  if siHas(siGuarded, idx) { return 0 }
+  if capIsBound(siDeclared, base) { return 0 }
+  if capIsBound(siMapG, table) || capIsBound(siImportedMaps, table) { return 0 }
+  if capIsBound(siGuarded, idx) { return 0 }
   const fld = siFieldOf(idx)
   if fld.length > 0 {
     if siIsHole(fld) { siReport(shown, table, idx, 2, idx, line, col, endCol) }
@@ -7406,7 +7385,7 @@ function siGradeRead(
     }
     return 0
   }
-  if siReturned && siHas(siParams, idx) {
+  if siReturned && capIsBound(siParams, idx) {
     siReport(shown, table, idx, 3, idx, line, col, endCol)
   }
   0

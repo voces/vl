@@ -1,4 +1,4 @@
-import { asgNameWiderRow, cloRetValSlot } from "./emit_classify"
+import { asgNameWiderRow, cloRetValSlot, sTwinRepOf } from "./emit_classify"
 import { identityBinIsMixed } from "./emit_fn_scans"
 import { identityArmSlot } from "./emit_if_arm_values"
 import {
@@ -342,6 +342,8 @@ import {
   hasNamedArgs,
   hasSpreadItem,
   i32ToStr,
+  identCalleeAt,
+  identNameAt,
   isDefaultGlobalRef,
   isExprKid,
   mkArrayLit,
@@ -1488,7 +1490,6 @@ import {
   forRangeStepIsConst,
   holeOperandTyOf,
   holePinProvesNonNull,
-  identNameOrEmpty,
   instancePinnedMaps,
   instanceTyOf,
   mapArmShapeOfTy,
@@ -5383,7 +5384,7 @@ function listFitShadowIsRef(recv: i32, fnIx: i32): boolean {
 // that list is the receiver's place: a later test fits it and a `.length` reads it.
 function listFitGrowRow(rIx: i32, kTy: i32, fnIx: i32): i32 {
   if !listIsTestedIdent(rIx) { return -1 }
-  const name = identNameOrEmpty(rIx)
+  const name = identNameAt(rIx)
   if fitGrowFn != fnIx { listFitGrowScan(fnIx) }
   let i = 0
   while i < fitGrowName.length {
@@ -13870,22 +13871,15 @@ function rlRowElemSubOf(s: i32, d: i32): boolean {
   const sr = rlElemStructRow(s)
   const dr = rlElemStructRow(d)
   if sr < 0 || dr < 0 { return false }
-  const dh = structTwinRep(dr)
-  let x = structTwinRep(sr)
+  const dh = sTwinRepOf(dr)
+  let x = sTwinRepOf(sr)
   let guard = 0
   while x >= 0 && guard < 64 {
     if x == dh { return true }
-    x = structTwinRep(sSuperAt(x))
+    x = sTwinRepOf(sSuperAt(x))
     guard = guard + 1
   }
   false
-}
-
-// The representative of struct row `r`'s heap (`sTwin`), or -1 for none.
-function structTwinRep(r: i32): i32 {
-  if r < 0 { return -1 }
-  if r < sTwin.length { return sTwin[r] }
-  r
 }
 
 // Join a spread literal's item groups, each a list in its own frame slot, of (`kk`, `row`) or,
@@ -24111,7 +24105,7 @@ export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32) {
 // `valBlockTypeOfKind`'s blocktype: i64/f64/f32 route through their widening helper,
 // every other kind (i32, boolean, the ref atoms) through `emitExpr`. Kept beside that
 // ladder so the two halves of "what rep does this arm produce" move together.
-function emitExprAsKind(body: u8[], exprIx: i32, k: i32, fnIx: i32) {
+export function emitExprAsKind(body: u8[], exprIx: i32, k: i32, fnIx: i32) {
   if k == 3 { return emitExprAsI64(body, exprIx, fnIx) }
   if k == 4 { return emitExprAsF64(body, exprIx, fnIx) }
   if k == 5 { return emitExprAsF32(body, exprIx, fnIx) }
@@ -25356,13 +25350,6 @@ const OP_F64_REINTERPRET_I64 = 0xbf
 // success (0) and its failure (-1) — the caller falls through to its own error.
 const NUM_INTR_NONE = -2
 
-// One single-BYTE numeric instruction: the whole encoding IS the opcode byte (no
-// immediates), so writing the byte writes the instruction.
-function fbNumOp(op: i32) {
-  wU8(op)
-  0
-}
-
 // Lower `f32bits` / `f64bits` / `f32fromBits` / `f64fromBits`: push the argument at
 // the source type, then the one reinterpret instruction. Returns `NUM_INTR_NONE` when
 // `name` is not one of them. The operand goes out at the bitcast's own
@@ -25389,18 +25376,18 @@ function emitBitcastIntr(body: u8[], callIx: i32, fnIx: i32, name: string) {
     const arg = c.callArgs[0]
     if name == "f32bits" {
       if emitExprAsKind(body, arg, 5, fnIx) < 0 { return -1 }
-      return fbNumOp(OP_I32_REINTERPRET_F32) // 0xbc i32.reinterpret_f32
+      return fbI32Bin(OP_I32_REINTERPRET_F32) // 0xbc i32.reinterpret_f32
     }
     if name == "f64bits" {
       if emitExprAsKind(body, arg, 4, fnIx) < 0 { return -1 }
-      return fbNumOp(OP_I64_REINTERPRET_F64) // 0xbd i64.reinterpret_f64
+      return fbI32Bin(OP_I64_REINTERPRET_F64) // 0xbd i64.reinterpret_f64
     }
     if name == "f32fromBits" {
       if emitExprAsKind(body, arg, 0, fnIx) < 0 { return -1 }
-      return fbNumOp(OP_F32_REINTERPRET_I32) // 0xbe f32.reinterpret_i32
+      return fbI32Bin(OP_F32_REINTERPRET_I32) // 0xbe f32.reinterpret_i32
     }
     if emitExprAsKind(body, arg, 3, fnIx) < 0 { return -1 }
-    return fbNumOp(OP_F64_REINTERPRET_I64) // 0xbf f64.reinterpret_i64
+    return fbI32Bin(OP_F64_REINTERPRET_I64) // 0xbf f64.reinterpret_i64
   }
   NUM_INTR_NONE
 }
@@ -25516,8 +25503,8 @@ function emitFloatIntr(body: u8[], callIx: i32, fnIx: i32, name: string) {
       if emitExprAsKind(body, args[j], fiK, fnIx) < 0 { return -1 }
       j = j + 1
     }
-    if useF32 { return fbNumOp(opF32) }
-    return fbNumOp(floatIntrOpF64(name))
+    if useF32 { return fbI32Bin(opF32) }
+    return fbI32Bin(floatIntrOpF64(name))
   }
   NUM_INTR_NONE
 }
@@ -25555,7 +25542,7 @@ function emitIntMinMax(
   fbLocalGet(s1)
   fbLocalGet(s0)
   fbLocalGet(s1)
-  fbNumOp(cmp)
+  fbI32Bin(cmp)
   fbSelect() // → the first operand when the compare holds
   0
 }
@@ -25580,12 +25567,12 @@ function emitIntAbs(body: u8[], callIx: i32, fnIx: i32, wide: boolean) {
   if wide { fbI64Const(0, 0) } else { fbI32Const(0) }
   fbLocalGet(s0)
   // i32.sub 0x6b · i64.sub 0x7d
-  if wide { fbNumOp(0x7d) } else { fbNumOp(0x6b) }
+  if wide { fbI32Bin(0x7d) } else { fbI32Bin(0x6b) }
   fbLocalGet(s0)
   fbLocalGet(s0)
   if wide { fbI64Const(0, 0) } else { fbI32Const(0) }
   // i32.lt_s 0x48 · i64.lt_s 0x53
-  if wide { fbNumOp(0x53) } else { fbNumOp(0x48) }
+  if wide { fbI32Bin(0x53) } else { fbI32Bin(0x48) }
   fbSelect() // → the negation when the operand is negative
   0
 }
@@ -25614,8 +25601,8 @@ function emitIntIntr(body: u8[], callIx: i32, fnIx: i32, name: string) {
       if emitExprAsKind(body, args[j], iiK, fnIx) < 0 { return -1 }
       j = j + 1
     }
-    if useI64 { return fbNumOp(intIntrOpI64(name)) }
-    return fbNumOp(opI32)
+    if useI64 { return fbI32Bin(intIntrOpI64(name)) }
+    return fbI32Bin(opI32)
   }
   NUM_INTR_NONE
 }
@@ -25772,17 +25759,6 @@ function zextLoadCallAt(ix: i32, fnIx: i32): i32 {
   -1
 }
 
-// The callee name of a call node `zextLoadCallAt` answered.
-function zextLoadCallName(callIx: i32): string {
-  const e = nodeAt(callIx)
-  if e is Call {
-    if e.callFn < 0 { return "" }
-    const f = nodeAt(e.callFn)
-    if f is Ident { return f.identName }
-  }
-  ""
-}
-
 // An i64 `&` mask operand's value when it is 0xff, 0xffff or 0xffffffff — an integer literal,
 // or a top-level i64 `const` bound to one — else -1. An i32 const is refused: widening it
 // sign-extends, so its 0xffffffff is an all-ones i64.
@@ -25811,7 +25787,7 @@ function zextLoadOf(ix: i32, fnIx: i32): i32 {
   if e is Call {
     const c = zextLoadCallAt(x, fnIx)
     if c < 0 { return -1 }
-    const cn = zextLoadCallName(c)
+    const cn = identCalleeAt(c)
     if cn == "__load_u8_i64__" || cn == "__load_u16_i64__" { return c }
     if cn == "__load_u32_i64__" { return c }
     return -1
@@ -25821,7 +25797,7 @@ function zextLoadOf(ix: i32, fnIx: i32): i32 {
     if e.asMode != "prop" && e.asMode != "wrap" { return -1 }
     const ac = zextLoadCallAt(e.asObj, fnIx)
     if ac < 0 { return -1 }
-    if zextLoadCallName(ac) == "__load_i32__" { return -1 }
+    if identCalleeAt(ac) == "__load_i32__" { return -1 }
     return ac
   }
   zextLoadMasked(x, fnIx)
@@ -25857,7 +25833,7 @@ function zextLoadMasked(x: i32, fnIx: i32): i32 {
     if m < 0 { return -1 }
     const inner = zextLoadOf(other, fnIx)
     if inner >= 0 {
-      const w = zextLoadWidth(zextLoadCallName(inner))
+      const w = zextLoadWidth(identCalleeAt(inner))
       if m == MEM_OFFSET_MAX || w == 8 || (w == 16 && m == 0xffff) {
         return inner
       }
@@ -25869,7 +25845,7 @@ function zextLoadMasked(x: i32, fnIx: i32): i32 {
       if o.asTy != "i64" { return -1 }
       if o.asMode != "prop" && o.asMode != "wrap" { return -1 }
       const sc = zextLoadCallAt(o.asObj, fnIx)
-      if sc >= 0 && zextLoadCallName(sc) == "__load_i32__" { return sc }
+      if sc >= 0 && identCalleeAt(sc) == "__load_i32__" { return sc }
     }
   }
   -1
@@ -25880,7 +25856,7 @@ function zextLoadMasked(x: i32, fnIx: i32): i32 {
 function emitZextLoad(body: u8[], callIx: i32, fnIx: i32) {
   const c = nodeAt(callIx)
   if c is Call {
-    const w = zextLoadWidth(zextLoadCallName(callIx))
+    const w = zextLoadWidth(identCalleeAt(callIx))
     let nm = "__load_u32_i64__"
     if w == 8 { nm = "__load_u8_i64__" }
     if w == 16 { nm = "__load_u16_i64__" }
@@ -41499,21 +41475,6 @@ function nulBoxScalarValtype(kind: i32) {
   -1
 }
 
-// The `?? d` default at the atom kind the present arm unboxes to, so the two arms of the
-// `if` agree: an i64/f64/f32 destination re-encodes its literal exactly as a union-box
-// argument does.
-function emitCoalesceScalarDefault(
-  body: u8[],
-  defIx: i32,
-  kind: i32,
-  fnIx: i32,
-) {
-  if kind == 3 { return emitExprAsI64(body, defIx, fnIx) }
-  if kind == 4 { return emitExprAsF64(body, defIx, fnIx) }
-  if kind == 5 { return emitExprAsF32(body, defIx, fnIx) }
-  emitExpr(body, defIx, fnIx)
-}
-
 // `x ?? d` over a nullable value box read with its narrowing lifted: the box's tag decides, the
 // present arm unboxed at the coalesce's rep (a numeric scalar, or the value box itself).
 function emitCoalesceBoxRuntime(
@@ -41546,7 +41507,7 @@ function emitCoalesceBoxRuntime(
     fbRefCast(bVb)
     fbStructGet(bVb, 0)
     fbElse()
-    if emitCoalesceScalarDefault(body, e.binRight, bk, fnIx) < 0 { return -1 }
+    if emitExprAsKind(body, e.binRight, bk, fnIx) < 0 { return -1 }
     fbEnd()
     return 0
   }
@@ -41599,7 +41560,7 @@ function emitOptCoalesceBoxLeaf(
   if emitOptChainIsNull(body, lhsIx, fnIx) < 0 { return -1 }
   if bNm == "" {
     fbIf(bVt)
-    if emitCoalesceScalarDefault(body, e.binRight, bk, fnIx) < 0 { return -1 }
+    if emitExprAsKind(body, e.binRight, bk, fnIx) < 0 { return -1 }
   } else {
     fbIfRef(uBoxIdx)
     if (emitUnionBoxOwed(body, bNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
@@ -42343,7 +42304,7 @@ function emitCoalesceElemBox(
       fbStructGet(nbVb, 0)
       emitScalarWiden(nbElem, nbKind)
       fbElse()
-      if emitCoalesceScalarDefault(body, e.binRight, nbKind, fnIx) < 0 {
+      if emitExprAsKind(body, e.binRight, nbKind, fnIx) < 0 {
         return -1
       }
       fbEnd()
@@ -43189,7 +43150,7 @@ function emitCoalesceBoxFieldScalar(
   fbStructGet(vb, 0)
   if coalWidenUnboxed(fk, rk) < 0 { return -1 }
   fbElse()
-  if emitCoalesceScalarDefault(body, e.binRight, rk, fnIx) < 0 { return -1 }
+  if emitExprAsKind(body, e.binRight, rk, fnIx) < 0 { return -1 }
   fbEnd()
   0
 }
