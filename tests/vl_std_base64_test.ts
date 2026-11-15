@@ -71,7 +71,7 @@ import { IoError, readTextFile } from "std:fs"
 function hexVal(c: i32): i32 {
   if c >= 48 && c <= 57 { return c - 48 }
   if c >= 97 && c <= 102 { return c - 97 + 10 }
-  -1
+  return -1
 }
 
 function hexOf(b: u8[]): string {
@@ -84,7 +84,7 @@ function hexOf(b: u8[]): string {
     if lo < 10 { out.push(48 + lo) } else { out.push(97 + lo - 10) }
     i = i + 1
   }
-  fromCodePoints(out)
+  return fromCodePoints(out)
 }
 
 const txt = readTextFile("${dir}/bytes.txt")
@@ -128,7 +128,7 @@ function hexOf(b: u8[]): string {
     if lo < 10 { out.push(48 + lo) } else { out.push(97 + lo - 10) }
     i = i + 1
   }
-  fromCodePoints(out)
+  return fromCodePoints(out)
 }
 
 const txt = readTextFile("${dir}/cases.txt")
