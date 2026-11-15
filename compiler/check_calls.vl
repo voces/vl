@@ -204,6 +204,7 @@ import {
   arrNewInFnPut,
   boundObjRootOf,
   memOffsetCheckedValue,
+  unboundDefaultTy,
   v128SeenSet,
 } from "./check_decl_scan"
 import {
@@ -347,6 +348,10 @@ import {
   fsbArgTysOf,
   voidValueSlotErr,
 } from "./check_node_rules"
+import {
+  noteUnboundDefaultCall,
+  unboundDefaultNote,
+} from "./check_mismatch_notes"
 import { nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import { lbiNoDest } from "./check_num_lit_state"
 import { RB_CALL_REJOIN, checkMark, checkRollback } from "./check_rollback"
@@ -1607,6 +1612,14 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     }
     si = si + 1
   }
+  callDefaultArgTyParams(
+    ix,
+    cfn,
+    calleeOwnTyParams(cfn, n.callFn),
+    args,
+    vNames,
+    vTys,
+  )
   // What this call bound, for the refusal of a generic recursion that grows its type (D2721).
   const cDecl = if cfn is Ident { fnDeclIx[cfn.identName] ?? -1 } else { -1 }
   if !inferQuiet && cfn is Ident && cDecl >= 0 {
@@ -1719,6 +1732,44 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // A refused call's result is an error, so nothing downstream judges the unbound parameter.
   if rtpRefused { return TY_ERR }
   return cRetTy
+}
+
+// Binds at the unbound default (D4551) each of the callee's own type parameters `calleeTps` still
+// bound to a bare type variable of a generic function an argument names: nothing binds a generic
+// handed only to an open slot, so the call's row records the instance its argument is built at.
+function callDefaultArgTyParams(
+  ix: i32,
+  cfn: Node,
+  calleeTps: string[],
+  args: i32[],
+  vNames: string[],
+  vTys: i32[],
+): i32 {
+  const own: string[] = []
+  for a in args {
+    const d = identFnDeclOf(parenPeelIx(a))
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
+    if dn is FuncDecl {
+      for tp in dn.fnTyParams {
+        if !strListHas(tpEnvNames, tp) { own.push(tp) }
+      }
+    }
+  }
+  if own.length == 0 { return 0 }
+  let i = 0
+  while i < vTys.length {
+    const t = vTys[i]
+    const tv = if t >= 0 && t < T.tys.length { tyAt(t) } else { tyAt(TY_I32) }
+    const mine = i < vNames.length && strListHas(calleeTps, vNames[i])
+    if mine && tv is TyVar && strListHas(own, tv.tvName) {
+      vTys[i] = unboundDefaultTy()
+      if !inferQuiet && cfn is Ident {
+        noteUnboundDefaultCall(ix, cfn.identName, vNames[i])
+      }
+    }
+    i = i + 1
+  }
+  return 0
 }
 
 // The arguments of an ordinary call made index-parallel with `params`: a rest tail packed,
@@ -2332,7 +2383,14 @@ function callFtyArgAssign(
     // never at the call node — see `argMismatchErr`.
     const cd = wsCalleeDecl(n)
     const pn = if cd >= 0 { declParamNameAt(fnParamsOfDecl(cd), i) } else { "" }
-    argMismatchErr(i + 1, expected, at, args[i], pn)
+    argMismatchErr(
+      i + 1,
+      expected,
+      at,
+      args[i],
+      pn,
+      unboundDefaultNote(nodeTyIxOf(n.callFn), at),
+    )
   }
 }
 

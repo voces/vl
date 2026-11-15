@@ -166,6 +166,17 @@ export function numUnionResultTy(n: BinExpr, lt: i32, rt: i32): i32 {
   return mkUnionTy(res)
 }
 
+// Whether `dstTy` is a member of the number union `ct`, or `ct` is no number union.
+export function coalUnionHolds(ct: i32, dstTy: i32): boolean {
+  const ms = numUnionMembersOf(nonNullTy(ct))
+  if ms.length == 0 { return true }
+  const d = nonNullTy(dstTy)
+  for m in ms {
+    if m == d || tySame(m, d) { return true }
+  }
+  return false
+}
+
 // Splits the value `if`, `match` or block at `ix` into `spine`, its `if` and `match` nodes, and
 // `leaves`, the tail values they yield.
 export function valueTailSplit(ix: i32, spine: i32[], leaves: i32[]) {
@@ -558,9 +569,12 @@ function nodeIsValueJoin(ix: i32): boolean {
 export function numLitAdoptJoin(ix: i32, t: i32): i32 {
   if ix < 0 || t < 0 || !stampsStand() || !tyHoldsNonI32Num(t, 8) { return 0 }
   if nodeAt(ix) is ArrayLit { return numLitAdoptBody(ix, t, 6) }
+  const held = numLitJoinHeldLeaves(ix, t)
   for lf in valueTailLeaves(ix) {
-    numLitAdoptPart(lf, t, 6)
-    joinTreeTailAdopt(lf, t)
+    if !i32ArrHas(held, lf) {
+      numLitAdoptPart(lf, t, 6)
+      joinTreeTailAdopt(lf, t)
+    }
   }
   numLitJoinSpineSync(ix, t)
   tailParensSync(ix)
@@ -572,6 +586,39 @@ export function numLitAdoptJoin(ix: i32, t: i32): i32 {
 function joinTreeTailAdopt(lf: i32, t: i32) {
   if nodeTyOf(lf) == t { return 0 }
   return litTreeAdoptDst(lf, t)
+}
+
+// The tails of the joins nested in `ix` that keep their own type: one of their tails is typed
+// other than `t` and is no literal, so the nested join is built at its type and is converted to
+// `t` whole. Its literals stay at its width (D16496).
+function numLitJoinHeldLeaves(ix: i32, t: i32): i32[] {
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(ix, spine, leaves)
+  const held: i32[] = []
+  for sp in spine {
+    if sp != cwPeel(ix) && numLitJoinKeepsTy(sp, t) {
+      for lf in valueTailLeaves(sp) { held.push(lf) }
+    }
+  }
+  return held
+}
+
+// Whether join `sp` has a tail that is no literal or tree of them and is typed other than `t`.
+function numLitJoinKeepsTy(sp: i32, t: i32): boolean {
+  for lf in valueTailLeaves(sp) {
+    if numLitDstTy(lf, t) < 0 && litTreeOps(lf, 8) < 0 && nodeTyOf(lf) != t {
+      return true
+    }
+  }
+  return false
+}
+
+function i32ArrHas(xs: i32[], v: i32): boolean {
+  for x in xs {
+    if x == v { return true }
+  }
+  return false
 }
 
 // Types each value `if` or `match` nested in join `ix` as `t` once every tail it yields holds `t`,
@@ -709,11 +756,13 @@ export function numLitAdoptDeep(ix: i32, dstTy: i32, depth: i32): i32 {
     return 0
   }
   // A `??` over a union hands over its default when the left side is null, so the default is a
-  // delivered part; a `??` of one number type builds its default at that type.
+  // delivered part; a `??` of one number type builds its default at that type, and so does one
+  // whose number union the destination is no member of: the union is built, then converted.
   if (
     e is BinExpr
     && e.binOp == "??"
     && !isNumericPrimTy(nonNullTy(nodeTyOf(at)))
+    && coalUnionHolds(nodeTyOf(at), dstTy)
   ) {
     return numLitAdoptDeep(e.binRight, dstTy, depth - 1)
   }
