@@ -462,8 +462,8 @@ import {
   LBK_REF_AT_SLOT,
   LBK_STR_LIST,
   LBK_U8_LIST,
-  LBK_V128_LIST,
   LBK_UNION,
+  LBK_V128_LIST,
   ListKind,
   PK_I16,
   PK_I8,
@@ -767,6 +767,7 @@ import {
   unNames,
   unTyIx,
   unionSinkBase,
+  v128PushScratchBase,
   variantHeap,
   variantReboxSlot,
   variantRowOf,
@@ -5807,7 +5808,7 @@ function emitListLenOnStack(kind: ListKind, slot: i32) {
     fbStructGet(lTy(), 1)
     return 0
   }
-  const lek: VKind = if kind == "f64list" { "f64" } else if kind == "i64list" { "i64" } else if kind == "f32list" { "f32" } else { "u8list" }
+  const lek: VKind = numListElemOf(kind) ?? "u8list"
   const sv = svDstOfKind(lek)
   if sv >= 0 {
     const lwL = listFitSlot(kind, slot, 11)
@@ -13919,7 +13920,9 @@ function emitArrV128(elems: i32[], fnIx: i32) {
   while i < elems.length {
     if emitExpr(elems[i], fnIx) < 0 { return -1 }
     i = i + 1
-    if dst >= 0 { coff = arrLitChunkFlush(dst, fa128Ty(), coff, i, elems.length) }
+    if dst >= 0 {
+      coff = arrLitChunkFlush(dst, fa128Ty(), coff, i, elems.length)
+    }
   }
   if dst >= 0 {
     fbLocalGet(dst)
@@ -14355,7 +14358,8 @@ function emitArrUnder(arrIx: i32, fnIx: i32, lb: ListBuild) {
       }
     }
     // A vector literal is a v128 list whatever its pair says, since no other list holds one.
-    const vat = tyAt(nodeTyIxOf(arrIx))
+    const vty = nodeTyIxOf(arrIx)
+    const vat = if vty >= 0 && vty < T.tys.length { tyAt(vty) } else { null }
     if (
       lb.lbKind == LBK_V128_LIST
       || (vat is TyArray && primNameOf(tyElemOf(vat)) == "v128")
@@ -17938,9 +17942,8 @@ function hoistWrapTyOfRow(row: i32) {
   const k = lhKind[row]
   if k == "reflist" { return rlWrapIdx[lhSlot[row]] }
   if k == "strlist" { return mkListTy() }
-  if k == "f64list" { return scalarListWrap("f64", 0) }
-  if k == "i64list" { return scalarListWrap("i64", 0) }
-  if k == "f32list" { return scalarListWrap("f32", 0) }
+  const nek = numListElemOf(k)
+  if nek != null { return scalarListWrap(nek, 0) }
   // The PACKED byte list's frame kind is `"u8list"` (`listIdxKindOf`), and its wrapper is
   // `$bl8TypeIdx` — the i32 fall-through below would name the 4-byte list's wrapper for a
   // row whose local is typed `(ref null $bl8TypeIdx)`.
@@ -18413,7 +18416,11 @@ function emitArrLen(memIx: i32, fnIx: i32) {
     const lek = scalarListElemKind(m.memObj, fnIx)
     if (
       lek != null
-      && (lek == "f64" || lek == "i64" || lek == "f32" || lek == "u8list")
+      && (lek == "f64"
+        || lek == "i64"
+        || lek == "f32"
+        || lek == "v128"
+        || lek == "u8list")
     ) {
       const lenSv = svDstOfKind(lek)
       if lenSv >= 0 && lek != null {
@@ -23541,7 +23548,7 @@ function emitExprAsElem(exprIx: i32, ek: VKind, fnIx: i32) {
 // `f32`), the lists whose ops take their own wrapper, backing and value width; null otherwise.
 function numListElemOf(k: VKind | null): VKind | null {
   if k == null { return null }
-  if k == "f64list" || k == "i64list" || k == "f32list" {
+  if k == "f64list" || k == "i64list" || k == "f32list" || k == "v128list" {
     return scalarListElemOfListKind(k)
   }
   null
@@ -29094,11 +29101,14 @@ function scalarPushScratchBaseOf(k: VKind, row: i32): i32 {
     "f32" => {
       return f32PushScratchBase
     }
+    "v128" => {
+      return v128PushScratchBase
+    }
     "u8list" => {
       return pkPushBase(row)
     }
     // Every other kind pushes through the i32 list's scratch.
-    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {}
+    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {}
   }
   pushScratchBase
 }
@@ -29666,15 +29676,10 @@ function emitPopOr(popIx: i32, defIx: i32, fnIx: i32) {
 // `array.get`, which a nullable-niche element does not. Returns -1 on a failure, else 0.
 function mfSrcTysOf(recvK: ListKind, recvIx: i32, fnIx: i32, src: MfSrcTys) {
   const srcElemNul = listElemStaysNullable(recvIx, fnIx)
-  if recvK == "f64list" {
-    src.srcWrap = fl64Ty()
-    src.srcBack = fa64Ty()
-  } else if recvK == "i64list" {
-    src.srcWrap = il64Ty()
-    src.srcBack = ia64Ty()
-  } else if recvK == "f32list" {
-    src.srcWrap = fl32Ty()
-    src.srcBack = fa32Ty()
+  const sek = numListElemOf(recvK)
+  if sek != null {
+    src.srcWrap = scalarListWrap(sek, 0)
+    src.srcBack = scalarListBack(sek, 0)
   } else if recvK == "reflist" {
     if !rlRowsMinted() {
       return emitFail(
@@ -29941,15 +29946,10 @@ type MfDstTys = {
 // Writes into `dst` the result list types for result kind `resK`; `dst` arrives holding the
 // i32 list's, and `dstSlot` is a ref-list result's row. Returns -1 on a failure, else 0.
 function mfDstTysOf(resK: ListKind, dstSlot: i32, callIx: i32, dst: MfDstTys) {
-  if resK == "f64list" {
-    dst.dstWrap = fl64Ty()
-    dst.dstBack = fa64Ty()
-  } else if resK == "i64list" {
-    dst.dstWrap = il64Ty()
-    dst.dstBack = ia64Ty()
-  } else if resK == "f32list" {
-    dst.dstWrap = fl32Ty()
-    dst.dstBack = fa32Ty()
+  const dek = numListElemOf(resK)
+  if dek != null {
+    dst.dstWrap = scalarListWrap(dek, 0)
+    dst.dstBack = scalarListBack(dek, 0)
   } else if resK == "strlist" {
     // A STRING-list result: a `.filter` over a string list, or a `.map` whose callback
     // returns a string. The backing `$mkArrIdx` holds string refs; `array.set` stores
@@ -31061,15 +31061,10 @@ function emitArrSlice(callIx: i32, fnIx: i32) {
       // The element kind's wrapper + backing heap types.
       let wrap = -1
       let back = -1
-      if recvK == "f64list" {
-        wrap = fl64Ty()
-        back = fa64Ty()
-      } else if recvK == "i64list" {
-        wrap = il64Ty()
-        back = ia64Ty()
-      } else if recvK == "f32list" {
-        wrap = fl32Ty()
-        back = fa32Ty()
+      const rek = numListElemOf(recvK)
+      if rek != null {
+        wrap = scalarListWrap(rek, 0)
+        back = scalarListBack(rek, 0)
       } else if recvK == "reflist" {
         if !rlRowsMinted() {
           return emitFail(
@@ -35053,8 +35048,8 @@ function forInBackingOf(
       fb.hKind = "reflist"
       fb.hSlot = rslot
     }
-  } else if ek == "f64" || ek == "i64" || ek == "f32" {
-    // A scalar f64/i64/f32 element list: the wrapper/backing come from the descriptor, and
+  } else if ek == "f64" || ek == "i64" || ek == "f32" || ek == "v128" {
+    // A scalar f64/i64/f32/v128 element list: the wrapper/backing come from the descriptor, and
     // `array.get <back>` yields the scalar directly (no `ref.as_non_null`).
     fb.wrapTy = scalarListWrap(ek, exprPackedRow(s.fiIter, fnIx))
     fb.backTy = scalarListBack(ek, exprPackedRow(s.fiIter, fnIx))
@@ -37674,9 +37669,7 @@ function emitMemberNode(e: Member, exprIx: i32, fnIx: i32) {
       || exprString(e.memObj, fnIx)
       || exprRefArray(e.memObj, fnIx)
       || exprStringArray(e.memObj, fnIx)
-      || exprF64Array(e.memObj, fnIx)
-      || exprI64Array(e.memObj, fnIx)
-      || exprF32Array(e.memObj, fnIx)
+      || numListElemOf(exprListRep(e.memObj, fnIx)) != null
       || exprU8Array(e.memObj, fnIx)
     ) {
       return emitArrLen(exprIx, fnIx)
