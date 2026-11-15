@@ -728,7 +728,15 @@ function jwSubstAtWrite(
     if sn.letInit < 0 { return true }
     rhs = sn.letInit
   } else if sn is IfStmt {
-    if jwArmDisturbs(sn.ifCond, key, root) { return false }
+    // A test that ends the narrowing leaves both arms to the place.
+    if jwArmDisturbs(sn.ifCond, key, root) {
+      const cut = jwCutTok(sn.ifCond, key, root)
+      if cut < 0 || jwArmWalk(sn.ifCond, key, root, JW_BINDS_OUTSIDE_FNS) {
+        return false
+      }
+      jwSubstBefore(sn.ifCond, key, name, cut)
+      return true
+    }
     jwSubst(sn.ifCond, key, name)
     if !jwSubstScoped(sn.ifThen, key, root, name) { return false }
     if sn.ifElse < 0 { return true }
@@ -740,13 +748,15 @@ function jwSubstAtWrite(
   } else if sn is WhileStmt || sn is ForIn || sn is ForRange {
     return true
   }
-  // A call the checker ended the narrowing at: the reads that end before it are the copy's.
+  // A write nested in `st`, or a call the checker ended the narrowing at: the reads evaluated
+  // before the first are the copy's.
   if rhs < 0 {
-    const cut = jwFirstRetire(st, key, root)
-    if cut < 0 || jwArmWalk(st, key, root, JW_WRITES_OUTSIDE_FNS) {
+    const cut = jwCutTok(st, key, root)
+    if cut < 0 || jwArmWalk(st, key, root, JW_BINDS_OUTSIDE_FNS) {
       return false
     }
-    return jwSubstBefore(st, key, name, nodeToks[cut])
+    jwSubstBefore(st, key, name, cut)
+    return true
   }
   if jwArmDisturbs(rhs, key, root) { return false }
   jwSubst(rhs, key, name)
@@ -762,7 +772,7 @@ let jwRetNames: string[] = []
 // in what a closure and a call answer.
 const JW_DISTURBS = 0
 const JW_WRITES_DEEP = 1
-const JW_WRITES_OUTSIDE_FNS = 2
+const JW_BINDS_OUTSIDE_FNS = 2
 
 // Does the arm rebind or write the place, or call what the checker ended its narrowing at?
 // Either ends the narrowing, so a blanket substitution past it would be wrong.
@@ -772,12 +782,13 @@ function jwArmDisturbs(ix: i32, key: string, root: string): boolean {
 
 // `ask` over the subtree at `ix`. A closure's own writes run at its call, so for `JW_DISTURBS`
 // its definition counts only by naming a parameter after the root, and the checker's retiring
-// call counts instead; `JW_WRITES_DEEP` walks into closures, `JW_WRITES_OUTSIDE_FNS` skips them.
+// call counts instead; `JW_WRITES_DEEP` walks into closures, `JW_BINDS_OUTSIDE_FNS` skips them and
+// asks only for a binding of the root, not an assignment.
 function jwArmWalk(ix: i32, key: string, root: string, ask: i32): boolean {
   if ix < 0 { return false }
   const n = nodeAt(ix)
   if n is FuncDecl {
-    if ask == JW_WRITES_OUTSIDE_FNS { return false }
+    if ask == JW_BINDS_OUTSIDE_FNS { return false }
     let p = 0
     while p < n.fnParams.length {
       const pn = nodeAt(n.fnParams[p])
@@ -797,7 +808,7 @@ function jwArmWalk(ix: i32, key: string, root: string, ask: i32): boolean {
   } else if n is ForRange {
     if n.frVar == root { return true }
   } else if n is BinExpr {
-    if n.binOp == "=" {
+    if n.binOp == "=" && ask != JW_BINDS_OUTSIDE_FNS {
       const lk = jwPlaceKey(n.binLeft)
       if lk == key { return true }
       if lk == root { return true }
@@ -834,56 +845,58 @@ function jwCallRetires(ix: i32, key: string, root: string): boolean {
   false
 }
 
-// The first call in `ix`, outside closures, the checker ended the place's narrowing at, or -1.
-function jwFirstRetire(ix: i32, key: string, root: string): i32 {
-  if ix < 0 || nodeAt(ix) is FuncDecl { return -1 }
-  if nodeAt(ix) is Call && jwCallRetires(ix, key, root) { return ix }
+// The token before which `ix`'s reads of the place still run narrowed, or -1: the end of the first
+// call outside closures the checker ended the narrowing at, or just past the right-hand side of
+// the first assignment to the place, which is read before the write.
+function jwCutTok(ix: i32, key: string, root: string): i32 {
+  if ix < 0 { return -1 }
+  const n = nodeAt(ix)
+  if n is FuncDecl { return -1 }
+  if n is Call && jwCallRetires(ix, key, root) { return nodeToks[ix] }
+  if n is BinExpr && n.binOp == "=" {
+    const lk = jwPlaceKey(n.binLeft)
+    if lk == key || lk == root { return nodeToks[ix] + 1 }
+  }
   let best = -1
   let cur = ix
   while cur >= 0 {
     for c in nodeValueSpineChildren(cur) {
-      const f = jwFirstRetire(c, key, root)
-      if f >= 0 && (best < 0 || nodeToks[f] < nodeToks[best]) { best = f }
+      const t = jwCutTok(c, key, root)
+      if t >= 0 && (best < 0 || t < best) { best = t }
     }
     cur = elseIfLink(cur)
   }
   best
 }
 
-// `jwSubst` of the reads that end before token `cut`, which run before the call ending there.
-// False when a closure other than a writer reads the place: it may run on either side.
-function jwSubstBefore(ix: i32, key: string, name: string, cut: i32): boolean {
-  if ix < 0 { return true }
+// `jwSubst` of the reads that end before token `cut`, which run before the narrowing ends there.
+// An assignment's target stays the place. A closure made before the cut reads the place narrowed,
+// as the checker types it, and one made after reads it unnarrowed.
+function jwSubstBefore(ix: i32, key: string, name: string, cut: i32) {
+  if ix < 0 { return 0 }
   const root = jwKeyRoot(key)
-  if jwIsWriter(ix, key, root) { return true }
-  if nodeAt(ix) is FuncDecl { return !jwMentions(ix, key, root) }
+  if jwIsWriter(ix, key, root) { return 0 }
+  if nodeAt(ix) is FuncDecl {
+    if nodeToks[ix] < cut { jwSubst(ix, key, name) }
+    return 0
+  }
   if jwPlaceKey(ix) == key {
     if nodeToks[ix] < cut { arenaSetNode(ix, { identName: name, pos: -1 }) }
-    return true
+    return 0
+  }
+  const n = nodeAt(ix)
+  if n is BinExpr && n.binOp == "=" {
+    const lk = jwPlaceKey(n.binLeft)
+    if lk == key || lk == root {
+      return jwSubstBefore(n.binRight, key, name, cut)
+    }
   }
   let cur = ix
   while cur >= 0 {
-    for c in nodeValueSpineChildren(cur) {
-      if !jwSubstBefore(c, key, name, cut) { return false }
-    }
+    for c in nodeValueSpineChildren(cur) { jwSubstBefore(c, key, name, cut) }
     cur = elseIfLink(cur)
   }
-  true
-}
-
-// Whether the subtree at `ix` names the place or its root.
-function jwMentions(ix: i32, key: string, root: string): boolean {
-  if ix < 0 { return false }
-  const pk = jwPlaceKey(ix)
-  if pk == key || pk == root { return true }
-  let cur = ix
-  while cur >= 0 {
-    for c in nodeValueSpineChildren(cur) {
-      if jwMentions(c, key, root) { return true }
-    }
-    cur = elseIfLink(cur)
-  }
-  false
+  0
 }
 
 // Where does the site sit in `c0`? 1 = a positive position (the then arm sees the

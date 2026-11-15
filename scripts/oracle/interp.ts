@@ -267,6 +267,11 @@ function isConstTree(e: Expr): boolean {
   return e.k === "bin" && ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"].includes(e.op) && isConstTree(e.l) && isConstTree(e.r);
 }
 
+function negatedRadix(e: Expr): boolean {
+  if (e.k === "un" && e.op === "-") return negatedRadix(e.e);
+  return e.k === "int" && !!e.radix;
+}
+
 // Whether a constant tree holds a radix literal, or a float literal.
 function treeHas(e: Expr, what: "radix" | "float"): boolean {
   if (e.k === "int") return what === "radix" && !!e.radix;
@@ -1687,6 +1692,12 @@ export class Interp {
     if (v instanceof Lit && v.i !== null && !v.radix && (k === "f32" || k === "f64")) return k === "f64" ? new Flt(Number(v.i), 64) : new Flt(bigToF32(v.i), 32);
     if (v instanceof Lit && e.mode !== "as%") {
       try { return litTo(v, k === "u8" || k === "u16" ? "i32" : k); } catch (x) { if (!(x instanceof LitFault)) throw x; return this.castFail(e, "not exact"); }
+    }
+    // D3053 ruling (A): under `as% i64` a radix literal, or a chain of negations over one, is the
+    // constant its digits spell; another radix tree there has no ruling (D16494).
+    if (v instanceof Lit && v.radix && e.mode === "as%" && k === "i64") {
+      if (v.lone || negatedRadix(e.e)) return wrap64(v.i!);
+      if (v.radix !== 64 && !v.wideDec) throw new Unsupported("spec gap: a radix constant tree under `as% i64` (D16494)");
     }
     if (v instanceof Lit) v = litDefault(v);
     const src = numKind(v);

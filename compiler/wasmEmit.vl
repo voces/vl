@@ -3060,21 +3060,50 @@ function emitRecCopy(
   0
 }
 
-// The struct steps from the copied value to the record a nested copy level reads: each a heap and
-// a field index, applied after the value itself is read.
-let rcPathHeap: i32[] = []
-let rcPathField: i32[] = []
+// What an element-by-element record copy reads through, opened per list copy and restored after.
+type RcElem = {
+  // The struct steps from the copied value to the record a nested copy level reads: each a heap
+  // and a field index, applied after the value itself is read.
+  pathHeap: i32[],
+  pathField: i32[],
+  // The record types the copy reads its fields at, or -1 outside one.
+  src: i32,
+  dst: i32,
+  // The locals the copy reads its source element through (the source wrapper and the index) and
+  // that list's row, or -1 outside one; and whether the element is boxed.
+  sL: i32,
+  iL: i32,
+  wrap: i32,
+  back: i32,
+  boxed: boolean,
+}
+
+function rcElemNone(): RcElem {
+  {
+    pathHeap: [],
+    pathField: [],
+    src: -1,
+    dst: -1,
+    sL: -1,
+    iL: -1,
+    wrap: -1,
+    back: -1,
+    boxed: false,
+  }
+}
+
+let rcElem: RcElem = rcElemNone()
 
 // The value `exprIx` a copy reads, re-read or from `variantReboxSlot`, then each step of the path.
 function rcReadSource(exprIx: i32, sHeap: i32, reReadable: boolean, fnIx: i32) {
-  if rcElemSL >= 0 {
+  if rcElem.sL >= 0 {
     // An element-by-element list copy reads its source element off the loop's own locals.
-    fbLocalGet(rcElemSL)
-    fbStructGet(rcElemWrap, 0)
-    fbLocalGet(rcElemIL)
-    fbArrayGet(rcElemBack)
+    fbLocalGet(rcElem.sL)
+    fbStructGet(rcElem.wrap, 0)
+    fbLocalGet(rcElem.iL)
+    fbArrayGet(rcElem.back)
     // An element of a list of a union of records is its box's payload.
-    if rcElemBoxed { fbStructGet(uBoxIdx, 1) }
+    if rcElem.boxed { fbStructGet(uBoxIdx, 1) }
     fbRefCast(sHeap)
   } else if reReadable {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
@@ -3083,8 +3112,8 @@ function rcReadSource(exprIx: i32, sHeap: i32, reReadable: boolean, fnIx: i32) {
     fbRefCast(sHeap)
   }
   let k = 0
-  while k < rcPathHeap.length {
-    fbStructGet(rcPathHeap[k], rcPathField[k])
+  while k < rcElem.pathHeap.length {
+    fbStructGet(rcElem.pathHeap[k], rcElem.pathField[k])
     k = k + 1
   }
   0
@@ -3167,12 +3196,12 @@ function emitRecCopyIntoMember(
   variantRowFields(vi, names, rows)
   const st = rcFieldTy(rcPathTy(rcSrcTyOf(exprIx), pre), name)
   fbI32Rel(RS_TAG, uTags[vi])
-  rcPathHeap.push(sHeapIdx[sRow])
-  rcPathField.push(sfi)
-  const ps = rcElemSrc
-  const pd = rcElemDst
-  rcElemSrc = st
-  rcElemDst = m
+  rcElem.pathHeap.push(sHeapIdx[sRow])
+  rcElem.pathField.push(sfi)
+  const ps = rcElem.src
+  const pd = rcElem.dst
+  rcElem.src = st
+  rcElem.dst = m
   const r = emitRecCopyLevel(
     exprIx,
     sHeap,
@@ -3185,10 +3214,10 @@ function emitRecCopyIntoMember(
     rows,
     fnIx,
   )
-  rcElemSrc = ps
-  rcElemDst = pd
-  rcPathHeap.pop()
-  rcPathField.pop()
+  rcElem.src = ps
+  rcElem.dst = pd
+  rcElem.pathHeap.pop()
+  rcElem.pathField.pop()
   if r < 0 { return -1 }
   fbStructNew(variantHeap(vi))
   fbStructNew(uBoxIdx)
@@ -3253,8 +3282,8 @@ function emitRecCopyFields(
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
     fbLocalSet(variantReboxSlot)
   }
-  rcPathHeap = []
-  rcPathField = []
+  rcElem.pathHeap = []
+  rcElem.pathField = []
   emitRecCopyLevel(
     exprIx,
     sHeap,
@@ -3320,8 +3349,8 @@ function emitRecCopyLevel(
     const dFt = rcFieldTy(dTy, dNames[fj])
     const nest = rcNestedRow(sRow, sfi, dRow, fj, dFieldRows[fj], dFt)
     if nest >= 0 {
-      rcPathHeap.push(sHeapIdx[sRow])
-      rcPathField.push(sfi)
+      rcElem.pathHeap.push(sHeapIdx[sRow])
+      rcElem.pathField.push(sfi)
       const names: string[] = []
       const rows: i32[] = []
       let k = 0
@@ -3345,8 +3374,8 @@ function emitRecCopyLevel(
         rows,
         fnIx,
       )
-      rcPathHeap.pop()
-      rcPathField.pop()
+      rcElem.pathHeap.pop()
+      rcElem.pathField.pop()
       if r < 0 { return -1 }
       fbStructNew(sHeapIdx[nest])
       fj = fj + 1
@@ -3436,26 +3465,16 @@ function emitRecCopyLevel(
   0
 }
 
-// The record types an element-by-element list copy reads its fields at, or -1 outside one.
-let rcElemSrc = -1
-let rcElemDst = -1
-
-// The locals an element-by-element list copy reads its source element through (the source
-// wrapper and the index) and that list's row, or -1 outside one; and how many loops enclose it.
-let rcElemSL = -1
-let rcElemIL = -1
-let rcElemWrap = -1
-let rcElemBack = -1
-let rcElemBoxed = false
+// How many element-by-element copy loops enclose the code being emitted.
 let rcLoopDepth = 0
 
 // The source and destination records a copy of `exprIx` reads its field types off.
 function rcSrcTyOf(exprIx: i32): i32 {
-  if rcElemSrc >= 0 { rcElemSrc } else { nodeTyIxOf(exprIx) }
+  if rcElem.src >= 0 { rcElem.src } else { nodeTyIxOf(exprIx) }
 }
 
 function rcDstTyOf(exprIx: i32): i32 {
-  if rcElemDst >= 0 { rcElemDst } else { recCopyTyOf(exprIx) }
+  if rcElem.dst >= 0 { rcElem.dst } else { recCopyTyOf(exprIx) }
 }
 
 // The list of records just emitted for `exprIx`, copied element by element into the list `lct`'s
@@ -3636,22 +3655,15 @@ function emitRecListCopyTop(
   emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
   fbLocalGet(dL)
   fbLocalGet(iL)
-  const ps = rcElemSrc
-  const pd = rcElemDst
-  const pSL = rcElemSL
-  const pIL = rcElemIL
-  const pWrap = rcElemWrap
-  const pBack = rcElemBack
-  const pHeap = rcPathHeap
-  const pField = rcPathField
-  rcElemSrc = se
-  rcElemDst = de
-  rcElemSL = sL
-  rcElemIL = iL
-  rcElemWrap = srcWrap
-  rcElemBack = srcBack
-  rcPathHeap = []
-  rcPathField = []
+  const was = rcElem
+  rcElem = rcElemNone()
+  rcElem.src = se
+  rcElem.dst = de
+  rcElem.sL = sL
+  rcElem.iL = iL
+  rcElem.wrap = srcWrap
+  rcElem.back = srcBack
+  rcElem.boxed = was.boxed
   rcLoopDepth = rcLoopDepth + 1
   const r = if arms.length > 0 { emitRowUnionElemCopy(exprIx, arms, se, dsi, de, names, rows, fnIx) } else { emitRecCopyLevel(
     exprIx,
@@ -3666,14 +3678,7 @@ function emitRecListCopyTop(
     fnIx,
   ) }
   rcLoopDepth = rcLoopDepth - 1
-  rcElemSrc = ps
-  rcElemDst = pd
-  rcElemSL = pSL
-  rcElemIL = pIL
-  rcElemWrap = pWrap
-  rcElemBack = pBack
-  rcPathHeap = pHeap
-  rcPathField = pField
+  rcElem = was
   if r < 0 { return -1 }
   if arms.length == 0 { fbStructNew(sHeapIdx[dsi]) }
   fbArraySet(dstBack)
@@ -3705,23 +3710,23 @@ function emitRowUnionElemCopy(
       exprIx,
     )
   }
-  const pb = rcElemBoxed
-  rcElemBoxed = true
+  const pb = rcElem.boxed
+  rcElem.boxed = true
   let k = 0
   while k < arms.length {
     const last = k == arms.length - 1
     if !last {
-      fbLocalGet(rcElemSL)
-      fbStructGet(rcElemWrap, 0)
-      fbLocalGet(rcElemIL)
-      fbArrayGet(rcElemBack)
+      fbLocalGet(rcElem.sL)
+      fbStructGet(rcElem.wrap, 0)
+      fbLocalGet(rcElem.iL)
+      fbArrayGet(rcElem.back)
       fbStructGet(uBoxIdx, 0)
       fbI32Rel(RS_TAG, uTags[arms[k]])
       fbI32Bin(70) // i32.eq
       fbIfRef(sHeapIdx[dsi])
     }
     const vr = variantRowOf(arms[k])
-    rcElemSrc = ut.uMembers[k]
+    rcElem.src = ut.uMembers[k]
     const r = emitRecCopyLevel(
       exprIx,
       variantHeap(arms[k]),
@@ -3735,7 +3740,7 @@ function emitRowUnionElemCopy(
       fnIx,
     )
     if r < 0 {
-      rcElemBoxed = pb
+      rcElem.boxed = pb
       return -1
     }
     fbStructNew(sHeapIdx[dsi])
@@ -3747,8 +3752,8 @@ function emitRowUnionElemCopy(
     fbEnd()
     k = k + 1
   }
-  rcElemSrc = se
-  rcElemBoxed = pb
+  rcElem.src = se
+  rcElem.boxed = pb
   0
 }
 
@@ -35754,6 +35759,17 @@ export function userGlobalIdx(gi: i32) {
   nImp + gStrPoolTexts.length + gCellIdx[gi]
 }
 
+// Whether `emitUserGlobalGet` (or, `write`, `emitUserGlobalSet`) writes global `gi` as one
+// `global.get`/`global.set` of `userGlobalIdx(gi)`: no folded immediate, promoted local, init
+// guard or init bit. The IR lowering asks, so the decision stays this chokepoint's.
+export function userGlobalPlain(gi: i32, write: boolean): boolean {
+  if gi < 0 { return false }
+  if gi < gFoldOk.length && gFoldOk[gi] == 1 { return false }
+  if gi < gPromoOk.length && gPromoOk[gi] == 1 { return false }
+  if write && (globalCellIsImmutable(gi) || initBitOf(gi) >= 0) { return false }
+  !initGuardNeeded(gi, write)
+}
+
 // the storage-class chokepoint for a user top-level binding: every user cell's `0x23`/`0x24`
 // goes through this pair, so cell, local or immediate is one decision no emit site can bypass.
 // A promoted binding read outside the start function's frame is rejected loudly; a folded
@@ -36005,13 +36021,7 @@ export function wasmEmitStateReset() {
   asgParkWanted = false
   asgParkedOwner = -1
   mapSetDidPark = false
-  rcElemSrc = -1
-  rcElemDst = -1
-  rcElemSL = -1
-  rcElemIL = -1
-  rcElemWrap = -1
-  rcElemBack = -1
-  rcElemBoxed = false
+  rcElem = rcElemNone()
   rcLoopDepth = 0
   boxSeat = -1
   armSeat = -1
@@ -40735,6 +40745,15 @@ function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
     && (tyHasTyVar(nodeTyIxOf(lhsIx)) || readOfOpenBinding(lhsIx))
     && tyExcludesNull(nodeTyAt(lhsIx, fnIx))
   ) {
+    // An atom left takes the `??`'s own rep where that is no atom: the member string, or the
+    // box of a join with another type (D16530).
+    if exprIsLitAtom(lhsIx, fnIx) && !exprIsLitAtom(exprIx, fnIx) {
+      const coTy = nodeTyAt(exprIx, fnIx)
+      if primNameOf(coTy) == "string" { return emitAtomToStr(e.binLeft, fnIx) }
+      if exprUnion(exprIx, fnIx) {
+        return emitUnionBoxArg("", coTy, e.binLeft, fnIx)
+      }
+    }
     return emitExpr(e.binLeft, fnIx)
   }
   const lhs = nodeAt(lhsIx)
