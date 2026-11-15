@@ -3,7 +3,7 @@
 // oracle has not learned, or an oracle edit that breaks the spec, fails here. The examples it
 // cannot run yet are listed in SPEC_SKIPS by their first line, so the count can only grow.
 
-import { distilledExpectations, interpret, judge, judgeRecording } from "../scripts/oracle/oracle.ts";
+import { distilledExpectations, interpret, judge, judgeRecording, knownRefusals } from "../scripts/oracle/oracle.ts";
 import { grid } from "../scripts/oracle/join-grid.ts";
 import { grid as rulingGrid } from "../scripts/oracle/ruling-grid.ts";
 
@@ -145,4 +145,10 @@ Deno.test("oracle: a known wrong-value cell in a recording is not a disagreement
   } finally {
     Deno.removeSync(dir, { recursive: true });
   }
+});
+
+Deno.test("oracle: a known.txt row line files a refusal; a cell line does not", () => {
+  const got = JSON.stringify(knownRefusals(["ar_s1_0001", "D16412  monomorphize: unsupported argument type for `", "D1  x  y"]));
+  const want = JSON.stringify([{ row: "D16412", fragment: "monomorphize: unsupported argument type for `" }, { row: "D1", fragment: "x  y" }]);
+  if (got !== want) throw new Error(`want ${want}, got ${got}`);
 });
