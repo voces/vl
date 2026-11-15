@@ -5094,14 +5094,49 @@ export function holeBindInsts(
   calleeFn: i32,
   out: i32[],
 ) {
+  return holeBindInstsIn(holeBindWalk(), vNames, vTys, k, vt, calleeFn, out)
+}
+
+// What one `holeBindInsts` read counts and follows. Each read owns one, so a read nested in a
+// call's typing cannot reset an outer read's counts.
+type HoleBindWalk = {
+  hbSeen: i32,
+  hbOpen: i32,
+  hbSelfSeen: i32[],
+  hbFollowLit: boolean,
+  hbOnlyCall: i32,
+  hbLitFollowed: i32,
+}
+
+// A read that follows no literal hand-on and reads every call through the hole.
+function holeBindWalk(): HoleBindWalk {
+  return {
+    hbSeen: 0,
+    hbOpen: 0,
+    hbSelfSeen: [],
+    hbFollowLit: false,
+    hbOnlyCall: -1,
+    hbLitFollowed: 0,
+  }
+}
+
+function holeBindInstsIn(
+  w: HoleBindWalk,
+  vNames: string[],
+  vTys: i32[],
+  k: i32,
+  vt: i32,
+  calleeFn: i32,
+  out: i32[],
+) {
   if k < 0 || k >= vNames.length || vt < 0 || vt >= T.tys.length { return 0 }
   if !(tyAt(vt) is TyFunc) { return 0 }
   const tys: i32[] = []
   for t in vTys { tys.push(t) }
   tys[k] = vt
-  holeBindSeen = 0
-  holeBindOpen = 0
-  holeBindSelfSeen = []
+  w.hbSeen = 0
+  w.hbOpen = 0
+  w.hbSelfSeen = []
   const own = holeBindOwner(vNames, k, calleeFn)
   // A call through a set of named functions runs each member at its own holes.
   const ms = if cstrSetOwners.length > 1 { cstrSetOwners } else { holeBindHeld }
@@ -5116,12 +5151,12 @@ export function holeBindInsts(
         for t in tys { mTys.push(t) }
       }
       if mNames.length >= vNames.length {
-        holeBindAt(mNames, mTys, k, m, 0, out)
+        holeBindAt(w, mNames, mTys, k, m, 0, out)
       }
     }
     return 0
   }
-  return holeBindAt(vNames, tys, k, own, 0, out)
+  return holeBindAt(w, vNames, tys, k, own, 0, out)
 }
 
 // `names` with each hole parameter of declaration `from` renamed to the same parameter of `to`;
@@ -5157,8 +5192,9 @@ export function holeBindCalled(name: string, scope: i32): boolean {
   const names: string[] = [name]
   const tys: i32[] = [mkFuncTy([], TY_I32)]
   const out: i32[] = []
-  holeBindInsts(names, tys, 0, tys[0], scope, out)
-  return holeBindSeen > 0
+  const w = holeBindWalk()
+  holeBindInstsIn(w, names, tys, 0, tys[0], scope, out)
+  return w.hbSeen > 0
 }
 
 // Each instance of one-parameter `vt` a call of hole `vNames[k]` in its owner's body asks for at
@@ -5191,12 +5227,6 @@ export function holeBindOpenInsts(
   return 0
 }
 
-// How many calls through the bound hole the last `holeBindInsts` read, and how many stayed open.
-let holeBindSeen = 0
-let holeBindOpen = 0
-// The (owner, parameter) pairs a self-recursive forward has bound in the current read.
-let holeBindSelfSeen: i32[] = []
-
 // The one instance every call through hole `vNames[k]`, bound to the value typed `vt`, takes;
 // `HOLE_BIND_UNCALLED` when nothing calls it, -1 when a call stays open or two disagree.
 export function holeBindInstance(
@@ -5206,15 +5236,27 @@ export function holeBindInstance(
   vt: i32,
   calleeFn: i32,
 ): i32 {
+  return holeBindInstanceIn(holeBindWalk(), vNames, vTys, k, vt, calleeFn)
+}
+
+function holeBindInstanceIn(
+  w: HoleBindWalk,
+  vNames: string[],
+  vTys: i32[],
+  k: i32,
+  vt: i32,
+  calleeFn: i32,
+): i32 {
   const out: i32[] = []
-  holeBindInsts(vNames, vTys, k, vt, calleeFn, out)
-  if holeBindSeen == 0 { return HOLE_BIND_UNCALLED }
-  if holeBindOpen > 0 || out.length != 1 { return -1 }
+  holeBindInstsIn(w, vNames, vTys, k, vt, calleeFn, out)
+  if w.hbSeen == 0 { return HOLE_BIND_UNCALLED }
+  if w.hbOpen > 0 || out.length != 1 { return -1 }
   if holeBindDeliveryMisfits(vNames[k], out[0], calleeFn) { return -1 }
   return out[0]
 }
 
 function holeBindAt(
+  w: HoleBindWalk,
   names: string[],
   tys: i32[],
   k: i32,
@@ -5234,9 +5276,9 @@ function holeBindAt(
     if ix >= 0 && ix < P.nodes.length {
       const n = nodeAt(ix)
       if n is Call && holeBindCallsHole(n, names, k, owner) {
-        holeBindNoteCall(ix, n, k, names, tys, owner, vt, out)
+        holeBindNoteCall(w, ix, n, k, names, tys, owner, vt, out)
       } else if n is Call {
-        holeBindForward(n, names, tys, k, owner, depth, out)
+        holeBindForward(w, n, names, tys, k, owner, depth, out)
       }
       for ch in nodeChildren(ix) { todo.push(ch) }
     }
@@ -5247,6 +5289,7 @@ function holeBindAt(
 // Call `n` in `owner`'s body handing hole `names[k]` by name to a hole parameter of the
 // declaration it calls: that parameter is bound to the same value, its others at their arguments.
 function holeBindForward(
+  w: HoleBindWalk,
   n: Call,
   names: string[],
   tys: i32[],
@@ -5263,11 +5306,11 @@ function holeBindForward(
     const a = n.callArgs[aj]
     if holeBindArgListsHole(a, names[k], owner) {
       if (
-        !holeBindFollowLit
-        || !holeBindLitForward(n, aj, g, names, tys, k, owner, depth, out)
+        !w.hbFollowLit
+        || !holeBindLitForward(w, n, aj, g, names, tys, k, owner, depth, out)
       ) {
-        holeBindSeen = holeBindSeen + 1
-        holeBindOpen = holeBindOpen + 1
+        w.hbSeen = w.hbSeen + 1
+        w.hbOpen = w.hbOpen + 1
       }
     }
     aj = aj + 1
@@ -5276,30 +5319,24 @@ function holeBindForward(
     // A value joining several functions is each member, at its own holes.
     const ms = elabFnSetOf(nodeTyOf(n.callFn))
     if ms.length > 1 {
-      for m in ms { holeBindForwardTo(m, n, names, tys, k, owner, depth, out) }
+      for m in ms {
+        holeBindForwardTo(w, m, n, names, tys, k, owner, depth, out)
+      }
       return 0
     }
     g = holeBindValueDecl(n.callFn)
   }
   if g == owner {
-    return holeBindSelfForward(n, names, tys, k, owner, depth, out)
+    return holeBindSelfForward(w, n, names, tys, k, owner, depth, out)
   }
-  return holeBindForwardTo(g, n, names, tys, k, owner, depth, out)
+  return holeBindForwardTo(w, g, n, names, tys, k, owner, depth, out)
 }
 
-// While set, `holeBindForward` follows a literal hand-on (`holeLitFwdRet`).
-let holeBindFollowLit = false
-
-// While non-negative, the one call through the bound hole whose instance is read; -1 for all.
-let holeBindOnlyCall = -1
-
-// How many literal hand-ons `holeBindLitForward` followed since `holeLitFwdRet` began.
-let holeBindLitFollowed = 0
-
 // Notes call `c` through hole `names[k]`, bound to `vt`, and the instance it takes at its body's
-// result; a call other than `holeBindOnlyCall` is skipped. The nested reads run with the walk's
-// own modes off.
+// result; a call other than the walk's only call is skipped. The nested reads are reads of
+// their own.
 function holeBindNoteCall(
+  w: HoleBindWalk,
   c: i32,
   n: Call,
   k: i32,
@@ -5309,17 +5346,11 @@ function holeBindNoteCall(
   vt: i32,
   out: i32[],
 ) {
-  if holeBindOnlyCall >= 0 && holeBindOnlyCall != c { return 0 }
-  const fl = holeBindFollowLit
-  const oc = holeBindOnlyCall
-  holeBindFollowLit = false
-  holeBindOnlyCall = -1
+  if w.hbOnlyCall >= 0 && w.hbOnlyCall != c { return 0 }
   let inst = holeBindCallInst(c, n, k, names, tys, owner)
   if inst >= 0 { inst = holeBodyRet(vt, inst) }
-  holeBindFollowLit = fl
-  holeBindOnlyCall = oc
-  holeBindSeen = holeBindSeen + 1
-  if inst < 0 || tyHasTyVar(inst) { holeBindOpen = holeBindOpen + 1 }
+  w.hbSeen = w.hbSeen + 1
+  if inst < 0 || tyHasTyVar(inst) { w.hbOpen = w.hbOpen + 1 }
   return holeBindPush(inst, out)
 }
 
@@ -5349,16 +5380,15 @@ function holeLitFwdRetHeld(
   for t in vTys { tys.push(t) }
   // A result read off one call through the hole takes that call's instance alone.
   const row = hdRowOf(retTy)
-  holeBindOnlyCall = if row >= 0 && hdKind[row] == HD_RET { hdAlt[row] } else { -1 }
-  holeBindLitFollowed = 0
+  const w = holeBindWalk()
+  w.hbOnlyCall = if row >= 0 && hdKind[row] == HD_RET { hdAlt[row] } else { -1 }
+  w.hbFollowLit = true
   let moved = false
   let k = 0
   while k < vNames.length {
     const vt = tys[k]
     if tyIsForeignGenericSig(vt) || tyIsHoleGenericSig(vt) {
-      holeBindFollowLit = true
-      const inst = holeBindInstance(vNames, tys, k, vt, calleeFn)
-      holeBindFollowLit = false
+      const inst = holeBindInstanceIn(w, vNames, tys, k, vt, calleeFn)
       if inst >= 0 && inst != HOLE_BIND_UNCALLED {
         tys[k] = inst
         moved = true
@@ -5366,9 +5396,8 @@ function holeLitFwdRetHeld(
     }
     k = k + 1
   }
-  holeBindOnlyCall = -1
   // A result no literal hand-on reaches is the elaboration's to type, as before.
-  if !moved || holeBindLitFollowed == 0 { return -1 }
+  if !moved || w.hbLitFollowed == 0 { return -1 }
   let r = substTyDeep(retTy, vNames, tys)
   if r < 0 || tyHasTyVar(r) { r = holeRetTyOf(calleeFn, vNames, tys) }
   if r < 0 || tyHasTyVar(r) { return -1 }
@@ -5380,6 +5409,7 @@ function holeLitFwdRetHeld(
 // or of a field holding the hole (`r.f(x)`) takes its instance. False, following nothing, when
 // `g`'s body reads the parameter any other way that could reach the hole.
 function holeBindLitForward(
+  w: HoleBindWalk,
   n: Call,
   j: i32,
   g: i32,
@@ -5470,10 +5500,12 @@ function holeBindLitForward(
     }
   }
   if refs != calls.length + quiet { return false }
-  holeBindLitFollowed = holeBindLitFollowed + 1
+  w.hbLitFollowed = w.hbLitFollowed + 1
   for c in calls {
     const cn = nodeAt(c)
-    if cn is Call { holeBindNoteCall(c, cn, gk, gNames, gTys, g, tys[k], out) }
+    if cn is Call {
+      holeBindNoteCall(w, c, cn, gk, gNames, gTys, g, tys[k], out)
+    }
   }
   return true
 }
@@ -5507,6 +5539,7 @@ function holeBindLitCallee(
 
 // `holeBindForward` into declaration `g`, the function call `n` runs.
 function holeBindForwardTo(
+  w: HoleBindWalk,
   g: i32,
   n: Call,
   names: string[],
@@ -5545,7 +5578,7 @@ function holeBindForwardTo(
           }
           i = i + 1
         }
-        if gk >= 0 { holeBindAt(gNames, gTys, gk, g, depth + 1, out) }
+        if gk >= 0 { holeBindAt(w, gNames, gTys, gk, g, depth + 1, out) }
       }
     }
     j = j + 1
@@ -5556,6 +5589,7 @@ function holeBindForwardTo(
 // Call `n`, by which `owner` recurses on itself, handing hole `names[k]` to another of its own
 // parameters: that parameter is bound to the same value, once per owner and parameter.
 function holeBindSelfForward(
+  w: HoleBindWalk,
   n: Call,
   names: string[],
   tys: i32[],
@@ -5577,12 +5611,12 @@ function holeBindSelfForward(
       }
       const k2 = strListIndexOf(names, pn)
       const key = owner * 64 + k2
-      if k2 >= 0 && k2 != k && k2 < 64 && !i32ListHas(holeBindSelfSeen, key) {
-        holeBindSelfSeen.push(key)
+      if k2 >= 0 && k2 != k && k2 < 64 && !i32ListHas(w.hbSelfSeen, key) {
+        w.hbSelfSeen.push(key)
         const t2: i32[] = []
         for t in tys { t2.push(t) }
         t2[k2] = tys[k]
-        holeBindAt(names, t2, k2, owner, depth + 1, out)
+        holeBindAt(w, names, t2, k2, owner, depth + 1, out)
       }
     }
     j = j + 1
