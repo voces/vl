@@ -10669,7 +10669,7 @@ string-literal atoms beside an `i32[]` arm holds its own tag (D4906), at every l
 rep fitted when empty (D4915) until the D16047 refinement (2026-11-15): an arm whose element
 type is fixed is tested by its tag alone.
 
-**An `is` that fits that way stores a new empty list back into the place (D4949).** The
+**Superseded by the D16047 refinement (2026-11-15):** an arm of another tag no longer fits an empty list, so nothing is stored back and the mechanism below is gone. **An `is` that fitted that way stored a new empty list back into the place (D4949).** The
 local, global, record field, list element or captured variable it tested now holds an empty
 list of the tested arm, so the then-branch reads, pushes into and delivers that arm's rep. A
 captured variable a closure tests so becomes a shared cell, as one a closure assigns does.
