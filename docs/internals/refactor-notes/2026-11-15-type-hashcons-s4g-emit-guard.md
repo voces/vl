@@ -7,8 +7,9 @@ rep queries in `elabPrepareRun`, and last in `emitProgram`. A census over 15,323
 reach emit, with the window opened at `elabPrepare` and closed after `emitProgramRun`, found **0
 visible `tyEmitEpoch` bumps** and 1,411 fresh ones. It ran on a scratch seed, never committed.
 
-**The guard.** `elabPrepare` records `tyEmitEpoch` in `emitEpochAt` (`emit_sections.vl`), and so
-does `emitProgram` when it runs the elaboration itself. Since `tyEmitEpoch` moves only on a visible
+**The guard.** The per-program reset (`emitProgramReset`) records `tyEmitEpoch` in `emitEpochAt`
+(`emit_sections.vl`). `elabPrepare` runs that reset, and so does `emitProgram` when it runs the
+elaboration itself. Since `tyEmitEpoch` moves only on a visible
 write, an emit that ends with it elsewhere calls `emitFail` ("an emit-phase write changed a type an
 emit memo may hold") and returns -1. The read goes through `sealEpoch` in `emit_ty_seal.vl`, which
 already imports the epoch. The guard adds no counter and no checker state.
@@ -34,5 +35,5 @@ in the same change.
 | identity | 19,780 of 19,780 files byte-identical against #8400's fixpoint (all of `tests/cases` outside `modules/`, `distilled/cells`, `distilled/named` and `compiler/entry.vl`) |
 | seed size | SEEDSIZE |
 | phase-state census | `--check` ok, baseline unchanged from master |
-| net compiler lines, this PR | +14 (`emit_sections.vl` +11: the recorded epoch and the `emitFail`; `emit_ty_seal.vl` +3: `sealEpoch`) |
-| net compiler lines, #8400 + this | **+86** (+72 and +14): it enforces an invariant and deletes nothing. The estimate had been +82 |
+| net compiler lines, this PR | +13 (`emit_sections.vl` +10: the recorded epoch and the `emitFail`; `emit_ty_seal.vl` +3: `sealEpoch`) |
+| net compiler lines, #8400 + this | **+85** (+72 and +13): it enforces an invariant and deletes nothing. The estimate had been +82 |
