@@ -10,6 +10,7 @@ import { exprIsCollCtorCall } from "./check_list_origin"
 import {
   nodeTyIx,
   nodeTyIxOf,
+  nodeTyOf,
   nodeTySet,
   nodeTySetGrow,
 } from "./check_node_tys"
@@ -1839,6 +1840,17 @@ function retIfElseLess(ix: i32): boolean {
   return false
 }
 
+// Whether an arm of the returned `if` at `ix` yields `void`, which no arm-by-arm grade refuses.
+function retIfVoidArm(ix: i32): boolean {
+  const leaves: i32[] = []
+  tailValueLeaves(ix, leaves)
+  for lf in leaves {
+    const t = nodeTyOf(lf)
+    if t >= 0 && isVoidTy(t) { return true }
+  }
+  false
+}
+
 export function checkRetStmtNode(n: RetStmt, ix: i32) {
   const want = T.curRet
   if tpEnvNames.length > 0 { tpIfMarkOk(n.retArg) }
@@ -1945,21 +1957,22 @@ export function checkRetStmtNode(n: RetStmt, ix: i32) {
   // An explicit `return inner` of an empty collection pins its element from the
   // declared return type — usage-driven inference clearing the floor.
   constrainEmptyExpr(n.retArg, got, want)
-  // A returned `if` that yields on every path, or the chain a `match` desugared to, is graded arm
-  // by arm, as a tail one is; an else-less one that can fall through is a value with `null`.
-  const retIf = want >= 0
+  // A returned `if` is graded as one value, as master lowers it. One whose join does not fit but
+  // whose every arm yields a value is graded arm by arm, as a tail one is; an else-less one that
+  // can fall through is a value with `null`.
+  const fits = want < 0
+    || assignableExpr(n.retArg, got, want)
+    || retNomPinOk(n.retArg, got, want)
+  const retIf = !fits
     && !isVoidTy(want)
     && want != TY_NEVER
     && nodeAt(n.retArg) is IfStmt
     && (!retIfElseLess(n.retArg) || ifChainExhausts(n.retArg))
+    && !retIfVoidArm(n.retArg)
   if retIf {
     recordCtxTy(n.retArg, want)
     checkTailArmsAgainst(n.retArg, want)
-  } else if (
-    want >= 0
-    && !assignableExpr(n.retArg, got, want)
-    && !retNomPinOk(n.retArg, got, want)
-  ) {
+  } else if !fits {
     tErrWant(
       "return type mismatch: expected "
         + tyToStr(want)
