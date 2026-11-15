@@ -71,7 +71,7 @@ Deno.test({
     }
     assertEquals(
       result.sourceFrames,
-      ["at main.vl:7:3  in `boom`", "at main.vl:11:1  in `__start__`"],
+      ["at main.vl:7:10  in `boom`", "at main.vl:11:1  in `__start__`"],
       "resolved trap frames",
     );
   },

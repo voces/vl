@@ -113,7 +113,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
-  const src = 'function greet(n: string) {\n  print(n)\n  "hi " + n\n}\ngreet("a")\n';
+  const src = 'function greet(n: string) {\n  print(n)\n  return "hi " + n\n}\ngreet("a")\n';
   const candidates = await checker.inlayHintsAt(src, "/tmp/x.vl", noSiblings);
   const hints = inlayHintsFromWasm(candidates, undefined, src);
   assertEquals(hints.map((h) => h.label), [": string"], "statement-only function's return inlay");

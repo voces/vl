@@ -185,7 +185,7 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
   const lib = "export const TABLE = [1.0, 2.0]\n";
   const read = (key: string) => key.endsWith("lib.vl") ? lib : undefined;
   const cross = (await checker.check(
-    'import { TABLE as T } from "./lib"\nfunction g(a: f32): f32 { a }\nprint(g(T[0]))\n',
+    'import { TABLE as T } from "./lib"\nfunction g(a: f32): f32 { return a }\nprint(g(T[0]))\n',
     "/proj/main.vl",
     read,
   )).filter((d) => d.severity === "error").map((d) => d.message);
@@ -626,12 +626,12 @@ Deno.test({
   const at = (r: { start: { line: number; character: number } }) =>
     `${r.start.line}:${r.start.character}`;
   const k = (await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 2, 6, true)).map(at).sort();
-  if (JSON.stringify(k) !== '["0:6","1:24","2:6"]') {
-    throw new Error(`K references: want ["0:6","1:24","2:6"], got ${JSON.stringify(k)}`);
+  if (JSON.stringify(k) !== '["0:6","1:31","2:6"]') {
+    throw new Error(`K references: want ["0:6","1:31","2:6"], got ${JSON.stringify(k)}`);
   }
   const n = (await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 4, 6, true)).map(at).sort();
-  if (JSON.stringify(n) !== '["1:28","4:6"]') {
-    throw new Error(`N references: want ["1:28","4:6"], got ${JSON.stringify(n)}`);
+  if (JSON.stringify(n) !== '["1:35","4:6"]') {
+    throw new Error(`N references: want ["1:35","4:6"], got ${JSON.stringify(n)}`);
   }
   const hover = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 6);
   if (hover !== "i32") throw new Error(`hover above the declaration: want i32, got ${hover}`);
@@ -1493,7 +1493,7 @@ Deno.test({ name: "wasm-symbols: a lambda-bound value and a function-typed param
   if (paramDecl !== "(i32) => i32") {
     throw new Error(`expected the bare type for a fn-typed param, got ${JSON.stringify(paramDecl)}`);
   }
-  const paramUse = await checker.hoverTypeAt(hof, "/tmp/x.vl", noSiblings, 1, 2);
+  const paramUse = await checker.hoverTypeAt(hof, "/tmp/x.vl", noSiblings, 1, 9);
   if (paramUse !== "(i32) => i32") {
     throw new Error(`expected the bare type at the param's use, got ${JSON.stringify(paramUse)}`);
   }

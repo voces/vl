@@ -476,7 +476,7 @@ Deno.test({
 }, async () => {
   // Every call of `greet` is a statement, so it lowers as `void` (D2631); the signature the
   // editor offers is still the one its body infers.
-  const src = 'function greet(n: string) {\n  print(n)\n  "hi " + n\n}\ngreet("a")\n';
+  const src = 'function greet(n: string) {\n  print(n)\n  return "hi " + n\n}\ngreet("a")\n';
   const got = await helpAt(src, 4, 7);
   if (got !== "greet(n: string) => string @n: string") {
     throw new Error(`want the inferred return, got ${got}`);

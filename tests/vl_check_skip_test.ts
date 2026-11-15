@@ -368,8 +368,8 @@ const CASES: Case[] = [
     name: "inferred-return change",
     want: "decline",
     why: "interface",
-    from: "{ n / 2 }",
-    to: '{ "h" }',
+    from: "{ return n / 2 }",
+    to: '{ return "h" }',
   },
   {
     name: "record type edit",
