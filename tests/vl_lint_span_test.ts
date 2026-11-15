@@ -100,7 +100,7 @@ Deno.test({
       [
         "type Named = { name: string }",
         "function glyphOf(cp: i32) { return cp }",
-        "function f(r: Named) { glyphOf(r.name[1]) + fromCodePoint(r.name[0]).length }",
+        "function f(r: Named) { return glyphOf(r.name[1]) + fromCodePoint(r.name[0]).length }",
         "print(f({ name: \"Hrímey\" }))",
         "",
       ].join("\n"),
