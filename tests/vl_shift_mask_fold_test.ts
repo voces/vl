@@ -23,50 +23,50 @@ if (!ENABLED) console.warn("[shift-mask-fold] skipped — missing vl, the seed o
 const CASES: Record<string, [string, string[], string[]]> = {
   // plumb's `mix` index: LLVM's `wrap(a) & 8184`, exactly.
   mixIndex: [
-    "export function f(a: i64) { ((a >>> 3) as% i32 & 1023) * 8 }",
+    "export function f(a: i64) { return ((a >>> 3) as% i32 & 1023) * 8 }",
     ["(i32.and (i32.wrap_i64 (local.get $0) ) (i32.const 8184) )"],
     ["i64.shr_u", "i32.shl", "i32.mul", "i32.shr_u"],
   ],
   // j < k: one right shift by k - j, the mask moved up by j.
   shiftDown: [
-    "export function f(x: i32) { ((x >>> 5) & 255) << 2 }",
+    "export function f(x: i32) { return ((x >>> 5) & 255) << 2 }",
     ["(i32.and (i32.shr_u (local.get $0) (i32.const 3) ) (i32.const 1020) )"],
     ["i32.shl"],
   ],
   // j > k: one left shift by j - k.
   shiftUp: [
-    "export function f(x: i32) { ((x >>> 2) & 255) << 5 }",
+    "export function f(x: i32) { return ((x >>> 2) & 255) << 5 }",
     ["(i32.and (i32.shl (local.get $0) (i32.const 3) ) (i32.const 8160) )"],
     ["i32.shr_u"],
   ],
   // The same at i64, the multiplier on the left.
   wide: [
-    "export function f(a: i64) { 8 * ((a >>> 3) & 1023) }",
+    "export function f(a: i64) { return 8 * ((a >>> 3) & 1023) }",
     ["(i64.and (local.get $0) (i64.const 8184) )"],
     ["i64.shr_u", "i64.shl", "i64.mul"],
   ],
   // A narrowing alone: the i64 shift becomes an i32 one.
   narrow: [
-    "export function f(a: i64) { (a >>> 3) as% i32 & 1023 }",
+    "export function f(a: i64) { return (a >>> 3) as% i32 & 1023 }",
     ["(i32.and (i32.shr_u (i32.wrap_i64 (local.get $0) ) (i32.const 3) ) (i32.const 1023) )"],
     ["i64.shr_u"],
   ],
   // The mask inside the cast narrows the same way.
   wrappedMask: [
-    "export function f(a: i64) { ((a >>> 3) & 1023) as% i32 }",
+    "export function f(a: i64) { return ((a >>> 3) & 1023) as% i32 }",
     ["(i32.and (i32.shr_u (i32.wrap_i64 (local.get $0) ) (i32.const 3) ) (i32.const 1023) )"],
     ["i64.shr_u", "i64.and"],
   ],
   // DECLINES. `>>` whose mask reaches the sign fill (bit 31 of `x >> 3` is a copy of bit 31):
   // the arithmetic shift has to stay.
   signFillStays: [
-    "export function f(x: i32) { ((x >> 3) & 0x7fffffff) << 3 }",
+    "export function f(x: i32) { return ((x >> 3) & 0x7fffffff) << 3 }",
     ["i32.shr_s"],
     [],
   ],
   // A mask reaching bit 32 - k of the wrapped word reads bits of the i64 above the low word.
   narrowPastLowWordStays: [
-    "export function f(a: i64) { (a >>> 3) as% i32 & 0x7fffffff }",
+    "export function f(a: i64) { return (a >>> 3) as% i32 & 0x7fffffff }",
     ["i64.shr_u"],
     [],
   ],

@@ -181,7 +181,7 @@ const rowOf = (d: Dump, name: string): number => {
 // the second union, so the row does not carry what separates the instances.
 const CLASS_A =
   "type C = { r: i32 }\ntype S = { s: i32 }\ntype U = C | S\ntype D = { r: i32 }\n" +
-  "type V = D | S\nfunction ap<T>(x: T): T { x }\nconst c: C = { r: 1 }\nconst d: D = { r: 2 }\n" +
+  "type V = D | S\nfunction ap<T>(x: T): T { return x }\nconst c: C = { r: 1 }\nconst d: D = { r: 2 }\n" +
   "print(ap(c).r)\nprint(ap(d).r)\n";
 
 Deno.test({

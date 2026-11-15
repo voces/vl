@@ -20,17 +20,17 @@ class Rng {
 
 const HEAD = [
   "type R = { a: i32, b: string, xs: i32[] }",
-  "function t(s: string, v: i32): i32 { print(s); v }",
-  "function ts(s: string, v: string): string { print(s); v }",
-  "function tb(s: string, v: boolean): boolean { print(s); v }",
-  "function add3(x: i32, y: i32, z: i32): i32 { x * 100 + y * 10 + z }",
-  "function sum(xs: i32[]): i32 {\n  let s = 0\n  for x in xs { s = s + x }\n  s\n}",
+  "function t(s: string, v: i32): i32 { print(s); return v }",
+  "function ts(s: string, v: string): string { print(s); return v }",
+  "function tb(s: string, v: boolean): boolean { print(s); return v }",
+  "function add3(x: i32, y: i32, z: i32): i32 { return x * 100 + y * 10 + z }",
+  "function sum(xs: i32[]): i32 {\n  let s = 0\n  for x in xs { s = s + x }\n  return s\n}",
   "function bump(r: R, k: i32) { r.a = r.a + k\n  r.xs.push(k) }",
   "type N = { v: i32, next: N | null }",
   "type U = { tag: \"p\", p: i32 } | { tag: \"q\", q: string }",
-  "function walk(n: N | null): i32 {\n  let s = 0\n  let c = n\n  while c != null {\n    s = s * 10 + c.v\n    c = c.next\n  }\n  s\n}",
-  "function firstOver(xs: i32[], k: i32): i32 {\n  for x in xs { if x > k { return x } }\n  -1\n}",
-  "function show(u: U): string { if u is { tag: \"p\", p: i32 } { \"p\\{u.p}\" } else { u.q } }",
+  "function walk(n: N | null): i32 {\n  let s = 0\n  let c = n\n  while c != null {\n    s = s * 10 + c.v\n    c = c.next\n  }\n  return s\n}",
+  "function firstOver(xs: i32[], k: i32): i32 {\n  for x in xs { if x > k { return x } }\n  return -1\n}",
+  "function show(u: U): string { return if u is { tag: \"p\", p: i32 } { \"p\\{u.p}\" } else { u.q } }",
   "function mk(a: i32): R { { a: a, b: \"m\\{a}\", xs: [a, a + 1] } }",
 ];
 
@@ -149,7 +149,7 @@ class Gen {
         if (!this.lets.length) return;
         const v = r.pick(this.lets);
         const c = this.fresh("f");
-        this.out.push(`const ${c} = (): i32 => {\n  ${v} = ${v} + ${this.int(0)}\n  ${v}\n}`);
+        this.out.push(`const ${c} = (): i32 => {\n  ${v} = ${v} + ${this.int(0)}\n  return ${v}\n}`);
         this.closures.push(c);
         return;
       }

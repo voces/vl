@@ -39,15 +39,15 @@ type Row = { inner: i32 }
 
 function ok(t: Row): i32 {
   if t.inner < 0 { return 0 }
-  tys[t.inner]
+  return tys[t.inner]
 }
 
 function bad(t: Row): i32 {
-  tys[t.inner]
+  return tys[t.inner]
 }
 
 function worse(t: Row): i32 {
-  tys[t.inner] + 1
+  return tys[t.inner] + 1
 }
 `;
 
@@ -227,8 +227,8 @@ Deno.test({
         "a write's own lines",
         [
           `"${SENTINEL_FIXTURE}": {"${u}": 2, "${s}": 0}`,
-          `["${u}", "${SENTINEL_FIXTURE}: tys[t.inner]", 1]`,
-          `["${u}", "${SENTINEL_FIXTURE}: tys[t.inner] + 1", 1]`,
+          `["${u}", "${SENTINEL_FIXTURE}: return tys[t.inner]", 1]`,
+          `["${u}", "${SENTINEL_FIXTURE}: return tys[t.inner] + 1", 1]`,
         ],
         got.filter((l) => l.includes(`"${SENTINEL_FIXTURE}`))
           .map((l) => l.replace(/,$/, "")),
