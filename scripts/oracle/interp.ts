@@ -227,10 +227,6 @@ function joinFits(l: Lit, k: string): boolean {
   return Number.isFinite(n) && BigInt(n) === l.i;
 }
 
-function dblOp(op: string, x: number, y: number): number {
-  return op === "+" ? x + y : op === "-" ? x - y : op === "*" ? x * y : op === "/" ? x / y : x % y;
-}
-
 export function parseRat(s: string): [bigint, bigint] {
   const m = /^([0-9]*)(?:\.([0-9]*))?(?:[eE]([-+]?[0-9]+))?$/.exec(s)!;
   const frac = m[2] ?? "", exp = Number(m[3] ?? "0") - frac.length;
@@ -267,28 +263,8 @@ function litArith(op: string, a: Lit, b: Lit): Val {
         return arith(">>>", litDefault(a), litDefault(b));
     }
   } else {
-    // E9.1: computed exactly and rounded once at the use. A float division by zero is not
-    // folded, so it (and anything built from it) computes at f64.
-    const qa = a.i !== null ? [a.i, 1n] as [bigint, bigint] : a.q, qb = b.i !== null ? [b.i, 1n] as [bigint, bigint] : b.q;
-    if ((op === "/" || op === "%") && qb && qb[0] === 0n && (a.derived || b.derived)) {
-      throw new Unsupported("spec gap: a float division by zero inside a constant tree (owner question)");
-    }
-    if (qa && qb && !(op === "/" || op === "%") || (qa && qb && qb[0] !== 0n)) {
-      const [n1, d1] = qa!, [n2, d2] = qb!;
-      let r: [bigint, bigint] | null = null;
-      if (op === "+") r = [n1 * d2 + n2 * d1, d1 * d2];
-      if (op === "-") r = [n1 * d2 - n2 * d1, d1 * d2];
-      if (op === "*") r = [n1 * n2, d1 * d2];
-      if (op === "/") r = [n1 * d2 * (n2 < 0n ? -1n : 1n), d1 * (n2 < 0n ? -n2 : n2)];
-      if (op === "%") { const t = (n1 * d2) / (d1 * n2); r = [n1 * d2 - t * n2 * d1, d1 * d2]; }
-      // the rational has no signed zero: its sign is IEEE's for the same operation
-      if (r) {
-        const z = dblOp(op, a.f ?? Number(a.i), b.f ?? Number(b.i));
-        const out = new Lit(null, r[0] === 0n ? (z < 0 || Object.is(z, -0) ? -0 : 0) : ratToDouble(r[0], r[1]), false, r);
-        out.derived = true;
-        return out;
-      }
-    }
+    // E9.1 (owner ruling 2026-11-15): a float constant folds in IEEE, as at run time; an integer
+    // operand converts to the nearest double first. JS numbers are IEEE doubles, `%` is `fmod`.
     const x = a.f ?? Number(a.i), y = b.f ?? Number(b.i);
     switch (op) {
       case "+": return new Lit(null, x + y, false);

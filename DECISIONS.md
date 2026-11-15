@@ -9703,8 +9703,9 @@ seed-size baseline is rewritten with it.
 
 **The ruling.** A `const` whose initialiser is literal arithmetic — numeric literals, other such
 `const`s, parentheses, unary minus, `~`, `+ - * / %`, `& | ^`, `<< >> >>>`, with integer and
-float literals — is computed EXACTLY, like Go's untyped constants or Zig's `comptime_int`, and
-typed at each use. A use whose destination cannot hold the exact value is a check error
+float literals — is folded and typed at each use. Its integer arithmetic is EXACT, like Go's
+untyped constants or Zig's `comptime_int`; its float arithmetic is IEEE-754, as at run time
+(owner, 2026-11-15, below). A use whose destination cannot hold the exact value is a check error
 (`constant 2147483648 overflows i32`), never a silent wrap. It extends ruling C (a bare literal
 `const` is its literal at every read). A tree that reads a variable, calls a function, or names a
 `let` is untouched, and so is an annotated `const` except as below.
@@ -9743,19 +9744,19 @@ tree read stays an editor reference.
   element — is that integer when it is a whole number (`2.5 * 4` is `10` at `i64`); otherwise it
   is refused as any float there is.
 * An integer constant at `f32` or `f64` is taken as an integer literal is: when that float holds
-  it exactly, and refused otherwise (D1890's rule; a VL integer literal does not round). A float
-  constant is exact until its use: `0.1 + 0.2` is the `f64` nearest 0.3 and the `f32` nearest
-  0.3, not the sum of two rounded values.
+  it exactly, and refused otherwise (D1890's rule; a VL integer literal does not round).
+* **A float constant folds in IEEE-754 (owner, 2026-11-15, lane O's spec question 9; this
+  reverses ruling A's float half).** Folding never changes a float result: each float literal is
+  its nearest double, each float operation rounds to the nearest double, ties to even, and an
+  integer operand converts to the nearest double as it enters one. So `0.1 + 0.2` is
+  0.30000000000000004, `1.5 % 0.1` is 0.09999999999999992, `(1.5 % 0.1) / (2.5 % 0.1)` is
+  1.0000000000000007, and `1.0 + 1.0/9007199254740992.0` is `1.0`. A float zero keeps its sign
+  (`0.0 * -1.0` is `-0`). The integer part of a mixed tree still folds exactly, and a float
+  result at an integer destination is still refused unless it is whole. At an `f32` use the
+  double result rounds once more to `f32`, which can differ from `f32` arithmetic by a double
+  rounding; the fold sees no use type (open).
 * **Precision.** Integers are exact to 512 bits, past which the expression is a check error
-  (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound. A
-  float constant is an exact fraction whose numerator and denominator are each held to 4096
-  bits, enough for every finite double and its reciprocal. It reaches its use as a decimal
-  literal: exact when its expansion terminates within 400 characters, otherwise to 800
-  significant digits and a sticky last digit when anything is cut. Every rounding boundary of
-  an `f32` or `f64` has fewer significant digits than that, so the use rounds the literal as it
-  would the exact value (`1.0 + 1.0/9007199254740992.0 + 1.0/3.0/1e70` is the double above 1,
-  where 60 digits read a tie and rounded to 1). A float zero keeps its sign, as IEEE does:
-  `0.0 * -1.0` is `-0`, and `-0.0 + 0.0` is `+0`.
+  (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound.
 * **A refusal names the constant and the destination** at an integer, float or union
   destination: `constant 2147483648 overflows i32`, `constant 123456789000 is not exact at f32`,
   `constant 1.5 is not a whole number, so i64 cannot hold it`, `constant 2147483648 fits no
@@ -9787,8 +9788,8 @@ tree read stays an editor reference.
   The bare pattern is unchanged: `0xFFFFFFFF as f32` reads the 32-bit pattern (-1.0) and
   `as f64` the 64-bit one; an `f32` use and no context keep their 32 bits (D16390).
 * **A float division by zero, and a float constant past the largest double, are not folded.**
-  VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
-  computation they were; Go refuses both.
+  `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE computation they were, which gives the same
+  Infinity or NaN; Go refuses both.
 * `>>>` of a negative constant depends on the width it runs at, so it is not folded either, and
   a tree containing one keeps the literal-tree reading at its destination's width (D2709).
 * A `u8` element takes a constant as it takes the literal (past 255 refused, a negative one

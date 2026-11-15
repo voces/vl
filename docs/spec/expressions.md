@@ -424,10 +424,12 @@ print(s as i32)   // refused: `as` supports numeric conversions only
 ## E9. Constant expressions
 
 **E9.1** An expression built only from numeric literals, literal `const`s, parentheses,
-unary `-` and `~`, and the arithmetic, bitwise and shift operators is a constant. It is
-computed exactly, without wrapping or intermediate rounding. Its type is chosen where it
-is used. A use that cannot hold the exact value is refused. An annotated `const` uses its
-annotation as that destination.
+unary `-` and `~`, and the arithmetic, bitwise and shift operators is a constant. Its type
+is chosen where it is used, and an annotated `const` uses its annotation as that
+destination. Integer arithmetic is exact, without wrapping, and a use that cannot hold the
+exact value is refused. Once a float operand enters, the operation is IEEE-754 and rounds
+as it would at run time; a float result at an integer destination is refused unless it is
+whole.
 
 ```vl
 const K = 2147483647 + 1
@@ -435,18 +437,26 @@ const big: i64 = K
 print(big)               // prints 2147483648
 print(7 / 2)             // prints 3
 print(1 + 0.5)           // prints 1.5
-print(0.1 + 0.2)         // prints 0.3
+print(0.1 + 0.2)         // prints 0.30000000000000004
+print(1.5 % 0.1)         // prints 0.09999999999999992
+print(1.0 / 0.0)         // prints Infinity
 ```
 
 ```vl
 const x: i32 = 2147483647 + 1   // refused: constant 2147483648 overflows i32
 ```
 
-Integer division by a constant zero is refused. A float division by zero is not folded.
+Integer division by a constant zero is refused. A float division by zero gives IEEE's
+Infinity or NaN.
 A radix literal (`0x…`, `0b…`, `0o…`) is a bit pattern at its use's width under every
 operator (types.md §T2.3).
 
-> Ruling: owner 2026-09-30 (A), DECISIONS.md §"Exact constant arithmetic".
+> Ruling: owner 2026-09-30 (A), DECISIONS.md §"Exact constant arithmetic"; owner 2026-11-15
+> (lane O's spec question 9): float constants fold in IEEE, which reverses that ruling's
+> float half.
+
+> Status: the fold rounds every float operation to a double; at an `f32` use it then rounds
+> once more to `f32`, which differs from `f32` arithmetic in rare double-rounding cases.
 
 ## E10. Evaluation order
 

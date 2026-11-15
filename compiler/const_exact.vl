@@ -1,6 +1,7 @@
-// Exact constant arithmetic for the checker's constant fold (DECISIONS.md, "Exact constant
-// arithmetic"). A value is an integer or an exact fraction; magnitudes are little-endian
-// base-2^16 `i32[]` limbs, trimmed, zero written `[0]`. An integer is capped at
+// Constant arithmetic for the checker's constant fold (DECISIONS.md, "Exact constant
+// arithmetic"). A value is an exact integer, or a float: a double, held as the exact fraction it
+// is, every float operation rounded to the nearest double as IEEE-754 rounds it. Magnitudes are
+// little-endian base-2^16 `i32[]` limbs, trimmed, zero written `[0]`. An integer is capped at
 // `CEX_INT_BITS` and a fraction's numerator and denominator at `CEX_FRAC_BITS`. A leaf.
 
 import { bigCmp, bigIsZero, numLexBaseAt } from "./emit_bignum"
@@ -460,7 +461,49 @@ function cexInt(neg: boolean, mag: i32[], pat: boolean): Cex {
 }
 
 // A fraction reduced to lowest terms; `den` is nonzero.
+// A float value: the double nearest `num / den`, ties to even, as IEEE-754 rounds every float
+// operation (DECISIONS.md, "Exact constant arithmetic": floats fold in IEEE). A result past the
+// largest double is no constant here; it is infinity at run time.
 function cexFrac(neg: boolean, num: i32[], den: i32[]): Cex {
+  if bigIsZero(num) { return cexFracExact(neg, num, den) }
+  const r = cxRoundF64(num, den)
+  if r.length == 0 { return cexNotConst() }
+  cexFracExact(neg, r[0], r[1])
+}
+
+// `num * 2^s / den` truncated, and the remainder, with the divisor the remainder is against.
+function cxScaledDivmod(num: i32[], den: i32[], s: i32): i32[][] {
+  if s >= 0 {
+    const qr = cxmDivmod(cxmShl(num, s), den)
+    return [qr[0], qr[1], den]
+  }
+  const d = cxmShl(den, 0 - s)
+  const qr = cxmDivmod(num, d)
+  [qr[0], qr[1], d]
+}
+
+// The double nearest the positive `num / den` as an exact pair: 53 significant bits, fewer below
+// 2^-1022 (a double's least step is 2^-1074), or `[]` when it rounds past the largest double.
+function cxRoundF64(num: i32[], den: i32[]): i32[][] {
+  let s = 53 - (cxmBitLen(num) - cxmBitLen(den))
+  let qr = cxScaledDivmod(num, den, s)
+  if cxmBitLen(qr[0]) > 53 {
+    s = s - 1
+    qr = cxScaledDivmod(num, den, s)
+  }
+  if s > 1074 {
+    s = 1074
+    qr = cxScaledDivmod(num, den, s)
+  }
+  let q = qr[0]
+  const c = bigCmp(cxmShl(qr[1], 1), qr[2])
+  if c > 0 || (c == 0 && (q[0] & 1) == 1) { q = cxmAdd(q, cxmOne()) }
+  if cxmBitLen(q) - s > 1024 { return [] }
+  if s >= 0 { return [q, cxmShl(cxmOne(), s)] }
+  [cxmShl(q, 0 - s), cxmOne()]
+}
+
+function cexFracExact(neg: boolean, num: i32[], den: i32[]): Cex {
   let n = num
   let d = den
   if bigIsZero(n) {
@@ -555,9 +598,10 @@ function cexScale10(mag: i32[], e: i32): Cex {
   cexFrac(false, mag, cxmPow10(0 - e))
 }
 
+// An integer operand of a float operation converts to the nearest double first, as at run time.
 function cexToFloat(v: Cex): Cex {
   if v.cxFloat { return v }
-  cexMake(true, false, v.cxNeg, v.cxNum, v.cxDen)
+  cexFrac(v.cxNeg, v.cxNum, v.cxDen)
 }
 
 // Signed `(an, am) + (bn, bm)` over magnitudes, as a sign and a magnitude.
@@ -623,7 +667,10 @@ export function cexMul(a: Cex, b: Cex): Cex {
     return cexPatResult(neg, cxmMul(a.cxNum, b.cxNum))
   }
   if a.cxFloat || b.cxFloat {
-    return cexFrac(neg, cxmMul(a.cxNum, b.cxNum), cxmMul(a.cxDen, b.cxDen))
+    const x = cexToFloat(a)
+    const y = cexToFloat(b)
+    if cexBad(x, y) { return cexPass(x, y) }
+    return cexFrac(neg, cxmMul(x.cxNum, y.cxNum), cxmMul(x.cxDen, y.cxDen))
   }
   cexInt(neg, cxmMul(a.cxNum, b.cxNum), false)
 }
@@ -653,7 +700,10 @@ export function cexDiv(a: Cex, b: Cex): Cex {
   const neg = a.cxNeg != b.cxNeg
   if a.cxFloat || b.cxFloat {
     if bigIsZero(b.cxNum) { return cexNotConst() }
-    return cexFrac(neg, cxmMul(a.cxNum, b.cxDen), cxmMul(a.cxDen, b.cxNum))
+    const x = cexToFloat(a)
+    const y = cexToFloat(b)
+    if cexBad(x, y) { return cexPass(x, y) }
+    return cexFrac(neg, cxmMul(x.cxNum, y.cxDen), cxmMul(x.cxDen, y.cxNum))
   }
   if bigIsZero(b.cxNum) {
     return cexError("division by zero in a constant expression")
@@ -667,11 +717,15 @@ export function cexRem(a: Cex, b: Cex): Cex {
   if a.cxPat || b.cxPat { return cexNotConst() }
   if a.cxFloat || b.cxFloat {
     if bigIsZero(b.cxNum) { return cexNotConst() }
-    const q = cxmDivmod(cxmMul(a.cxNum, b.cxDen), cxmMul(a.cxDen, b.cxNum))[0]
-    const qb = cexMul(cexMake(true, false, a.cxNeg != b.cxNeg, q, cxmOne()), b)
-    const r = cexAdd(cexToFloat(a), qb, true)
-    if !cexOk(r) || !bigIsZero(r.cxNum) { return r }
-    return cexMake(true, false, a.cxNeg, r.cxNum, r.cxDen)
+    const x = cexToFloat(a)
+    const y = cexToFloat(b)
+    if cexBad(x, y) { return cexPass(x, y) }
+    // IEEE's remainder is exact: `|x| - trunc(|x| / |y|) * |y|`, with the dividend's sign.
+    const l = cxmMul(x.cxNum, y.cxDen)
+    const r = cxmMul(y.cxNum, x.cxDen)
+    const m = cxmSub(l, cxmMul(cxmDivmod(l, r)[0], r))
+    const f = cexFracExact(false, m, cxmMul(x.cxDen, y.cxDen))
+    return cexMake(true, false, x.cxNeg, f.cxNum, f.cxDen)
   }
   if bigIsZero(b.cxNum) {
     return cexError("division by zero in a constant expression")
