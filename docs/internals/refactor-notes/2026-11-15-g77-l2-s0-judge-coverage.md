@@ -133,3 +133,29 @@ Uncovered programs over programs, by `tests/cases` directory:
 - **Populations:** `tests/cases` only. The census beyond the distilled cells is generated and was not
   run. The un-annotated count is a regex over named functions, so lambdas are attributed to the function
   that owns them.
+
+## Addendum: the `fnTag*` / `ft*` judges, folded into group 1
+
+Part 3's shadow printer (`2026-11-15-g78-l2-s0-shadow-ifaces.md`) found that every call whose
+recorded result disagrees with its scheme is function-valued. The function-type tagger
+(`check_fn_tag.vl`) decides those results, and its judges are not named `hole*`, so the probe above
+never saw them. It was re-run on master `314123b8` with all 211 `fnTag*`/`ft*` functions in
+`check_fn_tag.vl` instrumented beside the 294 `hole*` ones. The populations were the same, and the
+dump was read through `$VL_IFACES` under `vl check --codegen`.
+
+- **Owned attribution, the one the tables above use, is unchanged:** 1,080 functions and 632
+  programs uncovered (56.8% covered; the table above reads 631). No `fnTag*`/`ft*` entry has an
+  owner. The tagger runs at module scope and at emit, where `cstrOwnerStack` is empty and
+  `curFnDeclIx` is `-1`.
+- **Charged to the program, owner-less entries included**, `fnTag*`/`ft*` adds **146 programs** to
+  group 1 (488 → 634) and makes **54 programs** uncovered that no `hole*` judge uncovers. Program
+  coverage in this attribution falls from 37.5% to 33.8%. The leading judges outside the noise
+  set: `ftCoercedEscape` 142, `ftHoleLambdaAlone` 135, `ftHandedHolder` 126, `ftDeclsOnly` 124,
+  `ftNamedCallOf` 75.
+- **Caveat:** an owner-less entry cannot be told apart from one made for a std body that the
+  program links, so this attribution is an upper bound. The noise set, built the same way from the
+  control, is 355 judges, against 142 for owned entries.
+
+So group 1's prerequisite PR records the tagger's decisions as rows too, not only the `hole*`
+function-valued judges. Its grading counts both: the owned `hole*` count, and the owner-less
+`fnTag*`/`ft*` count of 146 programs, both falling to zero.

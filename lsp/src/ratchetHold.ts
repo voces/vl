@@ -57,6 +57,10 @@ export const RATCHET_CODES: ReadonlyMap<string, RatchetScope> = new Map([
     baseline: "scripts/scan-budget-baseline.json",
     trees: ["compiler/", "std/"],
   }],
+  ["arena-write-after-lower", {
+    baseline: "scripts/arena-write-budget-baseline.json",
+    trees: COMPILER_ONLY,
+  }],
   ["comment-block-too-long", {
     baseline: "scripts/comment-budget-baseline.json",
     trees: COMPILER_ONLY,
