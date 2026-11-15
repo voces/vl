@@ -8,24 +8,6 @@ import {
   strContains,
   topPathSeg,
 } from "./strutil"
-import {
-  RETURN_RULE,
-  rrBecomesObject,
-  rrColAt,
-  rrCount,
-  rrFixCount,
-  rrFixTokAt,
-  rrKindAt,
-  rrLineAt,
-  rrMigrate,
-  rrMigrateSet,
-  rrNameAt,
-  rrPureCount,
-  rrPureTokAt,
-  rrTokAt,
-  rrWritesReturn,
-} from "./return_rule"
-import { srcmapModOfTok } from "./srcmap"
 import { engineFailOffset } from "./engine_msg"
 import { setTestEmitRefusal } from "./emit_state"
 import { strListHas } from "./listutil"
@@ -442,6 +424,8 @@ let cliImpClash: string[] = []
 type CliSpanCols = { line: i32[], col: i32[], endLine: i32[], endCol: i32[] }
 // The spans of this file's `filled(n, 0)` calls refused into a `u8[]` (`cliNoteZeroBytesFix`).
 const cliZb: CliSpanCols = { line: [], col: [], endLine: [], endCol: [] }
+// The value tails this file's block bodies refused, each at its statement's start (`cliNoteReturnFix`).
+const cliMr: CliSpanCols = { line: [], col: [], endLine: [], endCol: [] }
 // The spans this file's fixes shorten to a prefix (`cliNoteCastFix`, `cliNoteStrictEqFix`), as
 // `CliSpanCols`: how many characters from each span's start the fix keeps, and the fix's name.
 type CliCutCols = {
@@ -1302,8 +1286,6 @@ function cliParseArgs() {
       cliFmtCheck = 1
     } else if sub == "check" && a == "--fix" {
       cliFix = 1
-    } else if sub == "check" && a == "--migrate-return" {
-      rrMigrateSet(true)
     } else if sub == "check" && a == "--write-baseline" {
       cliBudgetAct = 3
     } else if sub == "check" && a == "--exempt-codes" {
@@ -1592,8 +1574,6 @@ function cliCheckCurFileRest() {
   // the next round. Fixing after imports resolve is what makes it safe.
   if cliFix != 0 && cliFileFixed == 0 {
     cliCollectFixes(cliEntrySrc)
-    // The migration is a rewrite of its own: it applies no other finding's fix.
-    if rrMigrate { cliFixEditKeepOnly("implicit return") }
     if cliFixEdit.pos.length > 0 && cliFixRound >= FIX_ROUND_CAP {
       cliFixCapHit = cliFixCapHit + 1
       cliFixFileDone()
@@ -1709,6 +1689,10 @@ function cliCaptureErrorDiags() {
   cliZb.col = []
   cliZb.endLine = []
   cliZb.endCol = []
+  cliMr.line = []
+  cliMr.col = []
+  cliMr.endLine = []
+  cliMr.endCol = []
   cliRc.line = []
   cliRc.col = []
   cliRc.endLine = []
@@ -1737,6 +1721,7 @@ function cliCaptureErrorDiags() {
     if cliFix != 0 && diagModule(i) == 0 {
       cliNoteImportFix(i)
       cliNoteZeroBytesFix(i)
+      cliNoteReturnFix(i)
       cliNoteGenBindFix(i)
       cliNoteCastFix(i)
       cliNoteStrictEqFix(i)
@@ -1825,64 +1810,6 @@ function cliAddReportStreams() {
   }
 }
 
-// The return rule's rows of module `mod`: under `--migrate-return` each tail today's rule
-// returns (`info`), and under the rule a discarded pure tail (A2, `warning`).
-function cliReturnRuleRows(r: CliRows, mod: i32) {
-  let i = 0
-  while i < rrCount() {
-    if rrWritesReturn(i) && srcmapModOfTok(rrTokAt(i)) == mod {
-      const ob = rrKindAt(i) == 1
-      const nf = rrKindAt(i) == 3
-      cliRowAdd(
-        r,
-        "info",
-        if ob { "implicit-return-object" } else if nf { "implicit-return-function" } else { "implicit-return" },
-        rrLineAt(i),
-        rrColAt(i),
-        rrLineAt(i),
-        rrColAt(i) + 1,
-        if ob { "braces after a signature are a block: write `{ return { … } }`" } else if nf { "a named function at a block body's end is a statement: write `return` and its name after it" } else { "a block body returns a value only through `return`" },
-      )
-    }
-    i = i + 1
-  }
-  let b = 0
-  while b < rrCount() {
-    if rrBecomesObject(b) && srcmapModOfTok(rrTokAt(b)) == mod {
-      cliRowAdd(
-        r,
-        "info",
-        "lambda-brace-name",
-        rrLineAt(b),
-        rrColAt(b),
-        rrLineAt(b),
-        rrColAt(b) + 1,
-        "after `=>` this `{ name }` is an object under the return rule, where it is a block today",
-      )
-    }
-    b = b + 1
-  }
-  let k = 0
-  while k < rrPureCount() {
-    const tk = rrPureTokAt(k)
-    if tk >= 0 && tk < P.toks.length && srcmapModOfTok(tk) == mod {
-      const ln = P.toks[tk].line
-      cliRowAdd(
-        r,
-        "warning",
-        "discarded-tail-value",
-        ln,
-        P.toks[tk].col,
-        ln,
-        P.toks[tk].col + 1,
-        "this value is discarded; did you mean `return …`?",
-      )
-    }
-    k = k + 1
-  }
-  0
-}
-
 // The checker's rows of one module, in report order, as `cliStreamRows` reads them.
 type CliRows = {
   sev: string[],
@@ -1924,7 +1851,6 @@ function cliRowAdd(
 // graph check merges every module and only the entry's positions map onto the reported file.
 function cliStreamRows(mod: i32): CliRows {
   const r = cliRowsNew()
-  cliReturnRuleRows(r, mod)
   // Redundant explicit type annotations (a `hint`): `let x: T = e` where the initializer
   // already infers to exactly `T`. The span is `cliRedunEndCol`'s.
   let ri = 0
@@ -3542,66 +3468,34 @@ function cliCollectFixes(src: string) {
   for lb in impLb {
     cliImportFixEdits(src, lb, impOff, starts, "unused import")
   }
-  // Under the return rule, `return ` before each refused value tail and discarded pure tail.
-  if RETURN_RULE {
-    let rf = 0
-    while rf < rrFixCount() {
-      const ft = rrFixTokAt(rf)
-      if ft >= 0 && ft < P.toks.length && srcmapModOfTok(ft) == 0 {
-        const fl = P.toks[ft].line - 1
-        if fl >= 0 && fl < starts.length {
-          pos.push(starts[fl] + P.toks[ft].col)
-          len.push(0)
-          txt.push("return ")
-          what.push("missing return")
-          eln.push(fl + 1)
-          ecl.push(P.toks[ft].col)
-        }
-      }
-      rf = rf + 1
+  // `return ` before each value tail a block body refused, and each discarded pure one, at the
+  // statement's start: before its label or the parentheses that open it.
+  let mr = 0
+  while mr < cliMr.line.length {
+    const ml = cliMr.line[mr] - 1
+    if ml >= 0 && ml < starts.length {
+      cliPushFixRepl(
+        starts[ml] + cliMr.col[mr],
+        0,
+        "return ",
+        "missing return",
+        starts,
+      )
     }
+    mr = mr + 1
   }
-  // `--migrate-return`: `return ` before each entry-module tail today's rule returns, or
-  // `{ return { … } }` around an object-literal body.
   let rq = 0
-  while rq < rrCount() {
-    const rl = rrLineAt(rq) - 1
+  while rq < rcoalCount() {
+    const rl = rcoalLineAt(rq) - 1
     if (
-      rrWritesReturn(rq)
-      && srcmapModOfTok(rrTokAt(rq)) == 0
+      rcoalCodeAt(rq) == "discarded-tail-value"
+      && rcoalModuleAt(rq) == 0
       && rl >= 0
       && rl < starts.length
     ) {
-      const off = starts[rl] + rrColAt(rq)
-      if rrKindAt(rq) == 1 {
-        const end = cliBraceEnd(src, off)
-        if end > off {
-          pos.push(off)
-          len.push(end - off)
-          txt.push("{ return " + src.slice(off, end) + " }")
-          what.push("implicit return")
-          eln.push(rl + 1)
-          ecl.push(rrColAt(rq))
-        }
-      } else if rrKindAt(rq) == 3 {
-        // At the body's `{`: the name follows the function's closing brace.
-        const fe = cliBraceEnd(src, off)
-        if fe > off {
-          pos.push(fe)
-          len.push(0)
-          txt.push("; return " + rrNameAt(rq))
-          what.push("implicit return")
-          eln.push(rl + 1)
-          ecl.push(rrColAt(rq))
-        }
-      } else if off >= 0 && off < src.length {
-        pos.push(off)
-        len.push(0)
-        txt.push("return ")
-        what.push("implicit return")
-        eln.push(rl + 1)
-        ecl.push(rrColAt(rq))
-      }
+      let off = starts[rl] + rcoalColAt(rq)
+      while off > 0 && src[off - 1] == '(' { off = off - 1 }
+      cliPushFixRepl(off, 0, "return ", "missing return", starts)
     }
     rq = rq + 1
   }
@@ -3817,36 +3711,6 @@ function cliImportFixEdits(
 }
 
 // Empty every `cliFixEdit` column.
-// Drops every pending fix edit but those of kind `what`.
-function cliFixEditKeepOnly(what: string) {
-  const e = cliFixEdit
-  const pos: i32[] = []
-  const len: i32[] = []
-  const txt: string[] = []
-  const wh: string[] = []
-  const ln: i32[] = []
-  const cl: i32[] = []
-  let i = 0
-  while i < e.pos.length {
-    if e.what[i] == what {
-      pos.push(e.pos[i])
-      len.push(e.len[i])
-      txt.push(e.txt[i])
-      wh.push(e.what[i])
-      ln.push(e.line[i])
-      cl.push(e.col[i])
-    }
-    i = i + 1
-  }
-  e.pos = pos
-  e.len = len
-  e.txt = txt
-  e.what = wh
-  e.line = ln
-  e.col = cl
-  return 0
-}
-
 function cliFixEditClear() {
   cliFixEdit.pos = []
   cliFixEdit.len = []
@@ -3974,6 +3838,16 @@ function cliNoteZeroBytesFix(i: i32) {
   cliZb.col.push(diagCol(i))
   cliZb.endLine.push(diagEndLine(i))
   cliZb.endCol.push(diagEndCol(i))
+  0
+}
+
+// Diagnostic `i` refuses a block body's value tail: note where its `return` goes.
+function cliNoteReturnFix(i: i32) {
+  if vcDiagCode(i) != "missing-return" { return 0 }
+  cliMr.line.push(diagLine(i))
+  cliMr.col.push(diagCol(i))
+  cliMr.endLine.push(diagEndLine(i))
+  cliMr.endCol.push(diagEndCol(i))
   0
 }
 
@@ -4426,9 +4300,6 @@ function cliApplyFixEdits(src: string, keep: i32[]) {
 // have broken it; `BASE` ok starts greedy from the empty set; `ONE` records one edit.
 function cliFixVerdict(ok: i32) {
   const n = cliFixEdit.pos.length
-  // The migration is judged by the rule it writes for, not by this compiler's build: a `return`
-  // today's emitter cannot lower is still the program's meaning, so every edit is kept.
-  if rrMigrate { return cliFixCommit() }
   if cliFixPhase == FIXP_ALL {
     if ok != 0 { return cliFixCommit() }
     cliFixPhase = FIXP_BASE

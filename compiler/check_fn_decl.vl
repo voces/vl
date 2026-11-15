@@ -1,20 +1,10 @@
 // A function declaration: its parameters and their defaults, the solve for un-annotated
 // parameters, its body and its return.
 
-import {
-  RR_A1,
-  RR_A2,
-  RR_A3,
-  rrIsBlockBody,
-  rrMinted,
-  rrMigrate,
-  rrNote,
-  rrNoteFix,
-  rrNotePure,
-  rrRefusedIs,
-  rrRefusedSet,
-} from "./return_rule"
-import { nodePos, nodeStartTok } from "./fmt_util"
+import { isBlockBody, stmtStartTok } from "./block_body"
+import { CODE_MISSING_RETURN } from "./check_messages"
+import { parenPeelIx } from "./check_places"
+import { nodeStartTok } from "./fmt_util"
 import { tySame } from "./check_types"
 import { ivSeedMovedWidth } from "./check_intrinsic_values"
 import {
@@ -23,22 +13,31 @@ import {
   elabNestNote,
 } from "./check_elab_cap"
 import {
+  ArrayLit,
+  BinExpr,
   Block,
+  BoolLit,
+  CharLit,
   FuncDecl,
   Ident,
   IfStmt,
+  Index,
   MatchExpr,
+  Member,
   Node,
+  NullLit,
+  NumLit,
   ObjLit,
   P,
   Param,
   RetStmt,
+  StrLit,
   TypeRef,
+  Unary,
   WhileStmt,
   annTsOf,
   arenaSetNode,
   blockTailIsDead,
-  fnNameIsLambda,
   fnTpBoundOf,
   i32ToStr,
   nodeAt,
@@ -129,6 +128,7 @@ import {
   cbExpectedFor,
   cbExpectedRetFor,
   cbExpectedRetHeld,
+  cbWantsValue,
   seedExpected,
 } from "./check_expected"
 import {
@@ -237,6 +237,7 @@ import {
   assignable,
   braceNameNote,
   tErr,
+  tErrPushTok,
   tErrWant,
   unknownTyErr,
 } from "./check_relate_core"
@@ -254,6 +255,7 @@ import {
   isValBindLambda,
   noteRetBareLambda,
   noteVoidCtxLambda,
+  recordTestWarning,
 } from "./check_side_rows"
 import { symEnabled } from "./check_state"
 import {
@@ -713,8 +715,8 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   if n.fnRet >= 0 && lamRetWrittenAt(fnIx) { cbSeedUsedSet(cbSeedUsed + 1) }
   refuseVoidRetsFrom(saved.voidRetLen, ret)
   inferRetLogTruncate(saved.retLogLen)
-  // The return rule's own refusal of the tail says what the fall-off sentence would.
-  if !rrRefusedIs(fnIx) { fnDeclRefuseFallOff(n, fnIx, ret, bodyTotalForRet) }
+  // A refused value tail already says what the fall-off sentence would.
+  if !fnTailRefused(n) { fnDeclRefuseFallOff(n, fnIx, ret, bodyTotalForRet) }
   fnDeclNoteRedundantRet(n, fnIx, ret, inferring, saved.pinnedReads)
   retNaturalSet(saved.retNatural)
   retNaturalErrSet(saved.retNaturalErr)
@@ -1450,10 +1452,9 @@ function fnDeclCheckBody(
         // `inferObserved` before a recursive sibling branch is checked.
         const savedRTPbody = retTailPos
         let tailIsReturn = s == stmts.length - 1
-        // Under the return rule a block body's last statement is a statement (RETURN_RULE); a
-        // last `return` keeps the tail position it holds under either rule.
+        // A block body's last statement is a statement; a last `return` keeps the tail position.
         const ruleTail = tailIsReturn
-          && rrIsBlockBody(n.fnBody)
+          && isBlockBody(n.fnBody)
           && !(nodeAt(stmts[s]) is RetStmt)
         if ruleTail { tailIsReturn = false }
         if tailIsReturn && blockTailIsDead(stmts) {
@@ -1483,9 +1484,8 @@ function fnDeclCheckBody(
         const savedSpine = spineAt
         spineAtSet(-1)
         if s == stmts.length - 1 { spineAtSet(stmts[s]) }
-        // The migration writes at the statement as written, before its check rewrites it.
-        const rrTok = if (rrMigrate && tailIsReturn) || ruleTail { nodeStartTok(stmts[s]) } else { -1 }
-        const rrTl = stmts[s]
+        // A `return` is written at the statement as written, before its check rewrites it.
+        const ruleTok = if ruleTail { nodeStartTok(stmts[s]) } else { -1 }
         const stTy = checkNodeHook(stmts[s])
         spineAtSet(savedSpine)
         crStmtLeave()
@@ -1498,16 +1498,22 @@ function fnDeclCheckBody(
         // return-type witness. With a CONCRETE annotated return, a trailing empty
         // collection (`mk(): i32[] { … inner }`) pins its element from the return
         // type here — before the body scope is popped (and `inner`'s floor checked).
-        if tailIsReturn && rrMigrate && !isVoidTy(stTy) && !rrMinted(rrTl) {
-          rrNoteTail(n.fnBody, stmts[s], fnIx, rrTok)
-        }
         // A tail no path reaches is no discarded value (`blockTailIsDead`).
         if ruleTail && !blockTailIsDead(stmts) {
-          rrRuleTail(n, fnIx, stmts[s], if inferring { -1 } else { ret }, rrTok)
+          blockTailRefuse(
+            fnIx,
+            stmts[s],
+            stTy,
+            if inferring { -1 } else { ret },
+            ruleTok,
+          )
         }
         // A last `is`-chain falls off the end under either rule (D1902).
         if ruleTail {
-          checkTrailingChainTotal(stmts[s], if inferring { inferObserved } else { ret })
+          checkTrailingChainTotal(
+            stmts[s],
+            if inferring { inferObserved } else { ret },
+          )
         }
         if tailIsReturn {
           if !inferring { fnTailGradeAgainstRet(stmts[s], stTy, ret) }
@@ -1817,67 +1823,79 @@ function lamLitResult(t: i32, depth: i32): boolean {
   }
 }
 
-// Records tail `tl` of body `body` for the return migration when today's rule returns it: a
-// value expression, a value `if` or `match`, a labelled block or a value loop, never a `return`.
-// A one-statement synthetic body is an expression body, unless it is an object literal (A1).
-function rrNoteTail(body: i32, tl: i32, fnIx: i32, tok: i32) {
-  if body < 0 || tl < 0 { return 0 }
-  const t = nodeAt(tl)
-  // An arrow starts at its `(`; a `function` form at its keyword (A1 treats the two apart).
-  const ft = nodeStartTok(fnIx)
-  const arrow = ft >= 0 && P.toks[ft].kind == "LPAREN"
-  if nodePos(body) < 0 {
-    if RR_A1 && !arrow && t is ObjLit { rrNote(tl, fnIx, 1, tok) }
-    return 0
+// A block body's last statement: a value expression where the function returns a value is
+// refused, `null`-admitting included, since falling off would return `null` in its place; so is
+// a lambda's where its expected type wants a value. A pure one where none is wanted warns. Both
+// take a `--fix` that writes `return` before it.
+function blockTailRefuse(fnIx: i32, tl: i32, stTy: i32, ret: i32, tok: i32) {
+  if !blockTailIsValue(tl) || stmtAlwaysExits(tl) { return 0 }
+  const at = stmtStartTok(tok)
+  let msg = ""
+  if valueRet(ret) {
+    msg = fnWhoOf(fnIx, "`")
+      + " returns "
+      + tyToStr(ret)
+      + ", but a block body returns a value only through `return`: write `return` before its last expression"
+  } else if (
+    ret < 0
+    && stTy >= 0
+    && !isVoidTy(stTy)
+    && (valueRet(cbExpectedRetFor(fnIx)) || cbWantsValue(fnIx))
+  ) {
+    msg = "this lambda is expected to return a value, but a block body returns one only through `return`: write `return` before its last expression"
   }
-  // A3 off: a lambda keeps its tail, so the migration leaves it alone.
-  const fd = nodeAt(fnIx)
-  if !RR_A3 && fd is FuncDecl && fnNameIsLambda(fd.fnName) { return 0 }
-  // An arrow block holding only a name is an object under A1, unless a `return` is written.
-  const bn = nodeAt(body)
-  const lone = bn is Block && bn.blkStmts.length == 1 && t is Ident
-  if t is FuncDecl && t.fnName != "" && !fnNameIsLambda(t.fnName) {
-    rrNote(tl, fnIx, 3, nodeStartTok(t.fnBody))
-  } else if rrTailIsValue(tl) {
-    rrNote(tl, fnIx, if arrow && lone { 2 } else { 0 }, tok)
-  } else if t is IfStmt {
-    // An `if` with a value-less arm is no value, but today its value arms are the result, with
-    // `null` past the others: each value arm takes its own `return`.
-    const leaves: i32[] = []
-    tailValueLeaves(tl, leaves)
-    for lf in leaves {
-      if !isStmtNode(lf) && !stmtAlwaysExits(lf) && !rrMinted(lf) {
-        rrNote(lf, fnIx, 0, nodeStartTok(lf))
-      }
+  if msg != "" {
+    if at >= 0 && at < P.toks.length {
+      tErrPushTok(msg, tl, at, CODE_MISSING_RETURN, "")
+    } else {
+      tErr(msg, tl)
     }
+  } else if tailIsPure(tl) {
+    recordTestWarning(
+      tl,
+      "discarded-tail-value",
+      "this value is discarded; did you mean `return …`?",
+    )
   }
   0
 }
 
-// A block body's last statement under the return rule: a value expression where the function
-// returns a value is refused, `null`-admitting included, since falling off would return `null` in
-// its place; a pure one where it returns none is noted for the A2 warning. Both take `--fix`.
-function rrRuleTail(n: FuncDecl, fnIx: i32, tl: i32, ret: i32, tok: i32) {
-  if !rrTailIsValue(tl) || stmtAlwaysExits(tl) { return 0 }
-  // The decided result, annotated or from context (A3: a lambda the context wants a value from).
-  if ret >= 0 && !isVoidTy(ret) && ret != TY_NEVER && ret != TY_ERR {
-    rrNoteFix(tok)
-    rrRefusedSet(fnIx)
-    tErr(
-      fnWhoOf(fnIx, "`")
-        + " returns "
-        + tyToStr(ret)
-        + ", but a block body returns a value only through `return`: write `return` before its last expression",
-      tl,
-    )
-  } else if RR_A2 {
-    rrNotePure(tl, tok)
+// Whether `t` is a result type that returns a value.
+function valueRet(t: i32): boolean {
+  t >= 0 && !isVoidTy(t) && t != TY_NEVER && t != TY_ERR
+}
+
+// Whether function `n`'s last statement was refused as a value tail with no `return`.
+function fnTailRefused(n: FuncDecl): boolean {
+  const b = if n.fnBody >= 0 && n.fnBody < P.nodes.length { nodeAt(n.fnBody) } else { null }
+  if !(b is Block) || b.blkStmts.length == 0 { return false }
+  const tl = b.blkStmts[b.blkStmts.length - 1]
+  for d in T.diags {
+    if d.tat == tl && d.tcode == CODE_MISSING_RETURN { return true }
   }
-  0
+  false
+}
+
+// Whether discarded tail `t` is pure: a name, a literal, an operator that stores nothing, a field
+// or element read, or a record or list literal.
+function tailIsPure(t: i32): boolean {
+  const n = nodeAt(parenPeelIx(t))
+  n is Ident
+    || n is NumLit
+    || n is StrLit
+    || n is CharLit
+    || n is BoolLit
+    || n is NullLit
+    || n is Member
+    || n is Index
+    || n is ObjLit
+    || n is ArrayLit
+    || n is Unary
+    || n is BinExpr && n.binOp != "="
 }
 
 // Whether some arm of `if` `tl` ends in a value it yields, rather than every arm exiting.
-function rrSomeLeafYields(tl: i32): boolean {
+function blockTailLeafYields(tl: i32): boolean {
   const leaves: i32[] = []
   tailValueLeaves(tl, leaves)
   for lf in leaves {
@@ -1888,9 +1906,9 @@ function rrSomeLeafYields(tl: i32): boolean {
 
 // Whether statement `tl`, ending a block body, is that body's value under today's rule; the
 // statement kinds `isStmtNode` names are values only as a value `if`, `match` or loop.
-function rrTailIsValue(tl: i32): boolean {
+function blockTailIsValue(tl: i32): boolean {
   const t = nodeAt(tl)
-  if t is IfStmt { return !ifYieldsNoValue(tl) && rrSomeLeafYields(tl) }
+  if t is IfStmt { return !ifYieldsNoValue(tl) && blockTailLeafYields(tl) }
   if t is WhileStmt { return t.whileBlk == 1 || loopCarriesValue(tl) }
   if t is MatchExpr { return !stmtAlwaysExits(tl) }
   !isStmtNode(tl)
