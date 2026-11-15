@@ -148,6 +148,11 @@ import {
   shiftCountNodes,
 } from "./check_core_state"
 import {
+  listIsPinAt,
+  listIsPinFixed,
+  listIsPinIx,
+  listIsPinOther,
+  listIsPinReset,
   noteBinCstr,
   noteBinCstrAt,
   noteElemLetCstr,
@@ -2922,8 +2927,49 @@ export function settleNeverIsTests() {
   0
 }
 
+// Whether the program's end settled the list-test pins; until then a pin may still come.
+let listIsPinDone = false
+
+// At the program's end, a list test over a hole parameter that every pin hands a fixed list
+// never meeting the tested element is tested as `never`, as the annotated spelling is; one an
+// open or meeting list shares cannot be answered per instance, and is refused (D16342).
+export function settleListIsPins() {
+  listIsPinDone = true
+  let k = 0
+  while k < listIsPinIx.length {
+    const ix = listIsPinIx[k]
+    if listIsPinFixed[k] > 0 && listIsPinOther[k] == 0 && ix < isVarTyIxCap {
+      while isVarTyIx.length <= ix { isVarTyIxPush(-1) }
+      isVarTyIxSetAt(ix, TY_NEVER)
+    } else if listIsPinFixed[k] > 0 {
+      tErr(
+        "this call hands a list whose element type is fixed to a parameter tested by `is` "
+          + "against an element it can never hold, while another call hands one the test can "
+          + "match; one body cannot answer both. Annotate the parameter",
+        listIsPinAt[k],
+      )
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Whether `settleListIsPins` settled list test `ix` as `never`.
+function listIsPinNever(ix: i32): boolean {
+  let k = 0
+  while k < listIsPinIx.length {
+    if listIsPinIx[k] == ix {
+      return listIsPinFixed[k] > 0 && listIsPinOther[k] == 0 && listIsPinDone
+    }
+    k = k + 1
+  }
+  false
+}
+
 // Clears the never-matching tests for a new program.
 export function neverIsReset() {
+  listIsPinReset()
+  listIsPinDone = false
   neverIsNode.clear()
   neverIsMsg.clear()
   neverIsArm.clear()
@@ -3135,7 +3181,8 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
         if om >= 0 { openMemberRows(om, omRows) }
         const settledNow = om >= 0 && omRows.length == 0
         const rt = if settledNow { om } else { isRecvMemberOf(objTy, tested) }
-        isVarTyIxSetAt(ix, rt)
+        // A list test every pin settled as `never` stays so through an instance's recheck.
+        if !listIsPinNever(ix) { isVarTyIxSetAt(ix, rt) }
         isPatTyIxPut(ix, chkTy)
         elabCapIsNote(ix, rt, chkTy)
         if om >= 0 && !settledNow { noteVacuousIs(ix, om, omRows) }
@@ -3153,7 +3200,13 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
     // would trap the compiler (D1462); an unresolved operand is freely testable, same as `TyErr`.
   } else if n.isVariant != "null" && objTy >= 0 {
     // A record test over a hole is re-asked at each pin (D3109).
-    if tyIsParamHole(objTy) { noteIsCstr(objTy, chkTy, n.isVariant, ix) }
+    if tyIsParamHole(objTy) {
+      noteIsCstr(objTy, chkTy, n.isVariant, ix)
+    }
+    // A list test over a type parameter is settled from its pins too (D16342).
+    else if tyAt(objTy) is TyVar && tyAt(chkTy) is TyArray {
+      noteIsCstr(objTy, chkTy, n.isVariant, ix)
+    }
     // Soundness: `x is T` is meaningful only when `T` is assignable to `x`'s type, since the
     // then branch narrows verbatim — an ungated test would launder invalid wasm through a newtype.
     const ot = tyAt(objTy)
