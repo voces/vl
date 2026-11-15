@@ -69,8 +69,8 @@ print(a(m) + b(m))
 
 /**
  * Compile `src`, disassemble it, and count its `(func …)` definitions, leaving out the
- * `__grow_<row>__` helpers (one per list shape a push grows) and `__oob__` (one per module that
- * traps a bad index): shared by every site, so a walker that mints one is not a second pair.
+ * `__grow_<row>__` helpers: one per list shape a push grows, shared by every site, so a walker
+ * that pushes a shape no other code does mints one without being a second pair.
  */
 function funcCount(dir: string, name: string, src: string): number {
   const vl = `${dir}/${name}.vl`;
@@ -98,8 +98,8 @@ function funcCount(dir: string, name: string, src: string): number {
     );
   }
   const wat = new TextDecoder().decode(dis.stdout);
-  return wat.split("\n")
-    .filter((l) => l.startsWith(" (func ") && !/^ \(func \$(__grow_|__oob__)/.test(l)).length;
+  return wat.split("\n").filter((l) => l.startsWith(" (func ") && !l.startsWith(" (func $__grow_"))
+    .length;
 }
 
 Deno.test({

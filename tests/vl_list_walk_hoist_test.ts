@@ -9,9 +9,9 @@
 // INSIDE its loops are counted — both directions, so an optimisation that stopped firing and
 // one that fired on a body that can push are each caught. Every output is asserted too.
 //
-// A guard is counted by its `-1` index (the trap's out-of-range read, or the `select` of -1 the
-// guard was before SP-056) or by the call of `__oob__` a plain build traps through, a call the
-// next line closes with `unreachable`, so the count reads one guard per index whichever form.
+// A guard is counted by its out-of-range read: at `-1` of the backing under `-O`, the `select` of
+// -1 the guard was before SP-056, or index 0 of the shared empty backing (`global.get`, then
+// `i32.const 0`) in a plain build, so the count reads one guard per index whichever form.
 //
 // GATING mirrors the other seed-backed suites: `SELFHOST_NATIVE_ALIGN=1` plus the vl binary,
 // the seed and `wasm-dis` (at node_modules/.bin, not on PATH). No assertion library.
@@ -198,7 +198,7 @@ function measure(
     gets: body.filter((l) => l.includes("struct.get")).length,
     guards: body.filter((l, i) =>
       l.trim() === "(i32.const -1)" ||
-      (/^\(call \$\S+\)$/.test(l.trim()) && body[i + 1]?.trim() === "(unreachable)")
+      (l.trim() === "(i32.const 0)" && body[i - 1]?.trim().startsWith("(global.get "))
     ).length,
     out: exec.out,
   };

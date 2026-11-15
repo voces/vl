@@ -60,12 +60,11 @@ const allocations = (wat: string): number => {
 // The functions a module defines. The twins the step wrote are the ones its dump has past
 // the plain build's: a twin takes or returns a record's fields, so its result count alone
 // does not find it, and a one-result `(result (ref $t))` reads as two tokens.
-// The plain build grows its lists through one `__grow_<row>__` per list shape and traps a bad
-// index through `__oob__`, where an optimized one does both inline, so those helpers are left
-// out of the count.
+// The plain build grows its lists through one `__grow_<row>__` per list shape, and an optimized
+// one grows inline, so those helpers are left out of the count.
 const funcsIn = (wat: string): number =>
   [...wat.matchAll(/^ \(func /gm)].length -
-  [...wat.matchAll(/^ \(func \$(__grow_|__oob__)/gm)].length;
+  [...wat.matchAll(/^ \(func \$__grow_/gm)].length;
 
 const run = async (bin: string, args: string[]) => {
   const p = await new Deno.Command(bin, {
