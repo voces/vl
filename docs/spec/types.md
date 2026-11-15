@@ -629,6 +629,24 @@ value, as `==` does.
 > "A f64-keyed Map isn't supported yet" or the same sentence for its type (ROADMAP A15,
 > item 2).
 
+**T7.4** `.length` is an `i32`: a list's element count, a map's entry count, and a set's
+member count. Writing an existing key or adding an existing member does not change it.
+
+```vl
+const m = Map<string, i32>()
+m["a"] = 1
+m["b"] = 2
+m["a"] = 3
+print(m.length)   // prints 2
+const s = Set<i32>()
+s.add(4)
+s.add(4)
+print(s.length)   // prints 1
+```
+
+> Ruling: owner 2026-11-15 (lane O's spec question 6): a map's `.length` is its entry count,
+> and the one name covers lists, maps and sets.
+
 ## T8. Functions
 
 **T8.1** `(a: A, b: B) => R` is a function type. Parameter names in a function type are
