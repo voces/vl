@@ -29,6 +29,17 @@ export class Lit {
   constructor(public i: bigint | null, public f: number | null, public radix: number | boolean, public q: [bigint, bigint] | null = null) {}
 }
 export class Rec { constructor(public f: Map<string, Val>) {} }
+
+// A read of a decimal `const` is its value written in place (T2.4), so its width is the value's,
+// not its spelling's; a radix tree's read computes the tree at its own use (D14990), so it keeps it.
+function constRead(l: Lit): Lit {
+  if (l.radix || l.i === null || !l.wideDec) return l;
+  const c = new Lit(l.i, l.f, l.radix, l.q);
+  c.join = l.join;
+  c.derived = l.derived;
+  c.wideDec = l.i < BigInt(I32_MIN) || l.i > BigInt(I32_MAX);
+  return c;
+}
 export class VMap { m = new Map<string, [Val, Val]>(); }
 export class VSet { m = new Map<string, Val>(); }
 // The type a container was built at (ruling 4.4): set where it is first delivered at a declared
@@ -726,7 +737,7 @@ export class Interp {
           if (s.ty) v = this.deliver(v, s.ty, env, `binding '${s.name}'`);
           else if (v === VOID) throw new TypeFault(`binding '${s.name}' to a void value`);
         } else if (!s.ty) throw new Unsupported("let without type or initialiser");
-        const tree = s.kind === "const" && !s.ty && s.e && isConstTree(s.e) && treeHas(s.e, "float") ? s.e : undefined;
+        const tree = s.kind === "const" && !s.ty && s.e && isConstTree(s.e) && (treeHas(s.e, "float") || treeHas(s.e, "radix")) ? s.e : undefined;
         env.vars.set(s.name, { v, ty: s.ty, mut: s.kind === "let", tree });
         return;
       }
@@ -818,14 +829,15 @@ export class Interp {
   }
 
   // ── calls ──
-  callFn(fn: Fn, args: { name: string | null; v: Val | null; e: Expr | null }[], callerEnv: Env | null, _line: number): Val {
+  callFn(fn: Fn, args: { name: string | null; v: Val | null; e: Expr | null }[], callerEnv: Env | null, _line: number, bind: Map<string, Ty> | null = null): Val {
     const d = fn.decl;
     if (++this.depth > 400) throw new Unsupported("recursion depth (oracle)");
     try {
       const env = new Env(fn.env);
-      for (const p of d.tparams) env.types.set(p, "param");
+      // A type parameter the destination binds (D3539) is that type in the body.
+      for (const p of d.tparams) env.types.set(p, bind?.has(p) ? { params: [], ty: bind.get(p)! } : "param");
       // An argument is typed in the caller's scope, where the callee's type parameters are erased.
-      const erased = new Map(d.tparams.map((p) => [p, ANY]));
+      const erased = new Map(d.tparams.map((p) => [p, bind?.get(p) ?? ANY]));
       const argTy = (t: Ty | null) => t && erased.size ? subst(t, erased) : t;
       env.vars.set(" ret", { v: { ty: d.ret } as unknown as Val, ty: null, mut: false });
       const pos = args.filter((a) => a.name === null);
@@ -898,8 +910,8 @@ export class Interp {
     if (free) throw new TypeFault(`cannot infer type parameter \`${free}\` of ${d.name}: no argument binds it and the call has no destination type`);
   }
 
-  callValue(f: Val, args: { name: string | null; e: Expr }[], env: Env, line: number): Val {
-    if (f instanceof Fn) return this.callFn(f, args.map((a) => ({ name: a.name, v: null, e: a.e })), env, line);
+  callValue(f: Val, args: { name: string | null; e: Expr }[], env: Env, line: number, bind: Map<string, Ty> | null = null): Val {
+    if (f instanceof Fn) return this.callFn(f, args.map((a) => ({ name: a.name, v: null, e: a.e })), env, line, bind);
     if (f instanceof Bi) return f.call(this.evalArgs(args, env), this);
     throw new TypeFault("call of " + show(f));
   }
@@ -942,12 +954,14 @@ export class Interp {
         const b = env.lookup(e.name);
         // T2.5: a `let` slot holding a constant takes its type from later stores; a read
         // until then sees the default. A `const` constant is the exact value (T2.4).
+        // D14990: a read of a radix tree `const` computes the tree at that read's own width.
+        if (b?.tree && b.v instanceof Lit && b.v.radix && !b.v.lone && !f32Fold && !(exp && this.isF32(exp, env))) return this.eval(b.tree, env, exp);
         if (b?.tree && !f32Fold && exp && this.isF32(exp, env)) {
           f32Fold = true;
           try { return this.eval(b.tree, env, null); } finally { f32Fold = false; }
         }
         if (b?.tree && f32Fold) return this.eval(b.tree, env, null);
-        if (b) return b.mut && b.v instanceof Lit ? litDefault(b.v) : b.v;
+        if (b) return b.mut && b.v instanceof Lit ? litDefault(b.v) : b.v instanceof Lit ? constRead(b.v) : b.v;
         const fns = env.lookupFns(e.name);
         if (fns) { if (fns.length > 1) throw new Unsupported("overloaded function as a value"); return fns[0]; }
         if (e.name.startsWith("__")) throw new Unsupported("intrinsic " + e.name);
@@ -1045,14 +1059,22 @@ export class Interp {
         const c = this.asBool(this.eval(e.c, env, null), "if-condition");
         // E9.1 does not list `if`, so with no context its value is typed, not a constant.
         const v = c ? this.blockValue(e.t, env, exp) : e.f ? this.blockValue(e.f, env, exp) : VOID;
-        // A generic's erased parameter (`any`) is no context: the join settles here.
-        if (exp && !(exp.k === "name" && exp.name === "any")) return v instanceof Lit ? asJoin(v) : v;
         // T3.6 at an `if` join: a constant arm adapts to the other arm's type, read from its
         // declaration since that arm did not run; one that cannot widens the join.
         const other = c ? e.f : e.t;
         const ok = other && other.length ? other[other.length - 1] : null;
         const kOther = ok && ok.k === "expr" ? this.staticKind(ok.e, env) : null;
+        // A generic's erased parameter (`any`) is no context: the join settles here. With a
+        // context, a constant arm beside a typed one still takes that type when it fits.
+        if (exp && !(exp.k === "name" && exp.name === "any")) {
+          if (v instanceof Lit && kOther && joinFits(v, kOther)) { try { return litTo(v, kOther); } catch { /* the join */ } }
+          return v instanceof Lit ? asJoin(v) : v;
+        }
         if (v instanceof Lit) {
+          // A float arm makes the join a float context, where a radix arm is its digits' value (4.1).
+          if (v.radix && v.i !== null && !kOther && ok && ok.k === "expr" && isConstTree(ok.e) && treeHas(ok.e, "float")) {
+            return v.lone ? radixFloat(v.i, 64, false) : new Flt(Number(wrap64(v.i)), 64);
+          }
           if (!kOther && ok && ok.k === "expr" && isConstTree(ok.e)) return asJoin(v);
           if (!kOther) return litDefault(v);
           if (joinFits(v, kOther)) { try { return litTo(v, kOther); } catch { /* the default */ } }
@@ -1112,7 +1134,14 @@ export class Interp {
         // min, max and abs keep their operand's width (E2.7)
         if (e.f.k === "id" && ["min", "max", "abs"].includes(e.f.name) && !env.lookupFns(e.f.name)) {
           for (const a of e.args) { const k = this.staticKind(a.e, env); if (k) return k; }
-          return null;
+          // Over constants alone the call is still no constant (E9.1): it is typed at the
+          // arguments' default, which a literal beside it adopts (T3.6).
+          if (!e.args.length || !e.args.every((a) => isConstTree(a.e))) return null;
+          const v = e.args.map((a) => this.eval(a.e, env, null));
+          if (!v.every((x) => x instanceof Lit)) return null;
+          const ls = v as Lit[];
+          const ks = ls.map((l, i) => numKind(ls.length === 2 ? pairDefault(l, ls[1 - i]) : litDefault(l))!);
+          try { return ks.reduce((a, b) => wider(a, b)); } catch { return null; }
         }
         return one(this.declTy(e, env));
       case "un": return e.op === "-" || e.op === "~" ? this.staticKind(e.e, env) : null;
@@ -1231,16 +1260,31 @@ export class Interp {
     }
     // A constant operand takes its typed peer's type as its context (DECISIONS D3043: an operator
     // peer adopts the literal tree). A constant has no effects, so its side may run second.
+    // A shift of a constant by a variable count takes a peer's type as a constant does (Q8).
+    const peerTyped = (x: Expr) => isConstTree(x) || (x.k === "bin" && ["<<", ">>", ">>>"].includes(x.op) && isConstTree(x.l));
+    // Under an integer destination, a radix tree or a shifted constant beside a typed integer
+    // peer still takes the peer's width when its constant fits it (D3043); else the destination's.
+    const intExp = exp && (() => { try { const x = this.resolve(exp, env); return x.k === "name" && (x.name === "i32" || x.name === "i64"); } catch { return false; } })();
+    const atPeer = (x: Expr, k: string | null): boolean => {
+      if (!intExp || (k !== "i32" && k !== "i64")) return false;
+      const c = x.k === "bin" && ["<<", ">>", ">>>"].includes(x.op) && isConstTree(x.l) ? x.l : isConstTree(x) && treeHas(x, "radix") ? x : null;
+      if (!c) return false;
+      const v = this.eval(c, env, null);
+      return v instanceof Lit && litHolds(v, k);
+    };
     let l: Val, r: Val;
     const rExp = arithOp && !["<<", ">>", ">>>"].includes(op) ? exp : null;
-    if (arithOp && !exp && isConstTree(e.l) && !isConstTree(e.r)) {
+    if (arithOp && peerTyped(e.l) && !peerTyped(e.r) && (!exp || (intExp && !["<<", ">>", ">>>"].includes(op)))) {
       r = this.eval(e.r, env, rExp);
       const k = numKind(r);
-      l = this.eval(e.l, env, k ? { k: "name", name: k, args: [] } : null);
+      const kTy: Ty | null = k ? { k: "name", name: k, args: [] } : null;
+      l = this.eval(e.l, env, !exp ? kTy : atPeer(e.l, k) ? kTy : exp);
     } else {
       l = this.eval(e.l, env, arithOp ? exp : null);
       const k = numKind(l);
-      r = this.eval(e.r, env, rExp ?? (arithOp && !exp && k && isConstTree(e.r) && !["<<", ">>", ">>>"].includes(op) ? { k: "name", name: k, args: [] } : null));
+      const kTy: Ty | null = k ? { k: "name", name: k, args: [] } : null;
+      const shiftOp = ["<<", ">>", ">>>"].includes(op);
+      r = this.eval(e.r, env, arithOp && !shiftOp && !(l instanceof Lit) && atPeer(e.r, k) ? kTy : rExp ?? (arithOp && !exp && k && peerTyped(e.r) && !shiftOp ? kTy : null));
     }
     // E9.1: a float constant tree that adopts an `f32` peer folds in f32 arithmetic, whatever
     // destination is outside the operator. A tree is pure, so it is evaluated again.
@@ -1299,6 +1343,30 @@ export class Interp {
       this.store(target, v, env);
       return v;
     }
+  }
+  // D3539: a generic whose result is its bare type parameter `T`, every argument at a bare `T`
+  // a constant tree of the destination's kind (a float tree at a float, an integer one at an
+  // integer, D4024), takes `T` from a numeric destination, as a literal written there would.
+  dstBindLits(d: FnDecl, args: { name: string | null; e: Expr }[], exp: Ty | null, env: Env): Map<string, Ty> | null {
+    if (!exp || !d.ret || d.ret.k !== "name" || !d.tparams.includes(d.ret.name)) return null;
+    const t = d.ret.name;
+    let k: string | null = null;
+    try { const x = this.resolve(exp, env); if (x.k === "name" && NUMERIC.has(x.name)) k = x.name; } catch { return null; }
+    if (!k) return null;
+    const pos = args.filter((a) => a.name === null);
+    let pi = 0, any = false;
+    for (const p of d.params) {
+      const a = args.find((x) => x.name === p.name) ?? (p.rest ? null : pos[pi++] ?? null);
+      if (!p.ty || p.ty.k !== "name" || p.ty.name !== t) {
+        if (p.ty && mentions(p.ty, t)) return null;
+        continue;
+      }
+      if (!a || !this.foldsAt(a.e, env)) return null;
+      const float = a.e.k === "id" || treeHas(a.e, "float");
+      if (float !== (k === "f32" || k === "f64")) return null;
+      any = true;
+    }
+    return any ? new Map([[t, exp]]) : null;
   }
   // Whether `e` is a constant tree, or a read of a `const` holding one, which folds at its use.
   foldsAt(e: Expr, env: Env): boolean {
@@ -1423,12 +1491,13 @@ export class Interp {
             return this.callFn(f, [{ name: null, v: first, e: null }, ...e.args.slice(1).map((a) => ({ name: a.name, v: null, e: a.e }))], env, e.line);
           }
           this.unboundTyParam(f.decl, e.args, exp);
-          return this.callFn(f, e.args.map((a) => ({ name: a.name, v: null, e: a.e })), env, e.line);
+          return this.callFn(f, e.args.map((a) => ({ name: a.name, v: null, e: a.e })), env, e.line, this.dstBindLits(f.decl, e.args, exp, env));
         }
       }
     }
     const f = this.eval(e.f, env, null);
     if (f instanceof Fn) this.unboundTyParam(f.decl, e.args, exp);
+    const bind = f instanceof Fn ? this.dstBindLits(f.decl, e.args, exp, env) : null;
     // E2.7 keeps an operand's width, and E9.1 does not make min/max/abs of constants a
     // constant: a constant argument adapts to a typed one, else takes its own default; the
     // destination does not reach it.
@@ -1446,7 +1515,7 @@ export class Interp {
       const lits = args.filter((a) => a instanceof Lit) as Lit[];
       return f.call(args.map((a) => a instanceof Lit && !typed ? (lits.length === 2 ? pairDefault(a, lits[0] === a ? lits[1] : lits[0]) : litDefault(a)) : a), this);
     }
-    return this.callValue(f, e.args, env, e.line);
+    return this.callValue(f, e.args, env, e.line, bind);
   }
 
   // The built-in storage operations (E11.4; std.md STD1.3 and its "not yet in force" list).
