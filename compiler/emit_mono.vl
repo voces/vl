@@ -327,6 +327,10 @@ import {
   WhileStmt,
   adoptNodeTok,
   annTsOf,
+  arenaEditBumpCount,
+  arenaEditCount,
+  arenaEditSlotAt,
+  arenaEpochNow,
   arenaSetNode,
   binderNameAt,
   callIsNever,
@@ -8242,6 +8246,11 @@ function monoExactPinTys(pinTys: i32[], ctx: i32) {
 // no binding, pin or callee frame of an earlier program's walk is read by this one.
 export function monoStateReset() {
   cadRowReset()
+  mdaAsg = []
+  mdaUpTo = 0
+  mdaEdits = 0
+  mdaEpoch = 0 - 1
+  mdaBumps = 0
   monoCellAliasListOk = 0 - 1
   monoCgcGenAliasNames = []
   monoCgcGenAliasDecls = []
@@ -17338,13 +17347,41 @@ function monoNameWrittenAt(name: string, at: i32): boolean {
   monoLetWrittenIn(lf)
 }
 
+// `monoDeclIsAssigned`'s list of every plain `=` in the arena, grown with the arena and given
+// each logged edit's slot, rebuilt whole on any other rewrite. An entry is re-read at the query,
+// so a renamed or repointed target answers as it is now (D16553).
+let mdaAsg: i32[] = []
+let mdaUpTo = 0
+let mdaEdits = 0
+let mdaEpoch = -1
+let mdaBumps = 0
+
 // Whether the binding declared at `d`, a source declaration (`monoDeclCanon`), is the target of
 // an assignment anywhere in the arena. A write whose target resolved to no declaration counts
 // against every binding of its name, and `d` -1 asks after the name alone: both are the safe
 // direction, which declines a callee fold and keeps the `call_ref`.
 function monoDeclIsAssigned(name: string, d: i32): boolean {
-  let i = 0
-  while i < P.nodes.length {
+  const logged = arenaEditCount() >= mdaEdits
+    && arenaEpochNow() - mdaEpoch == arenaEditBumpCount() - mdaBumps
+  if mdaEpoch < 0 || !logged {
+    mdaAsg = []
+    mdaUpTo = 0
+  } else {
+    while mdaEdits < arenaEditCount() {
+      const e = arenaEditSlotAt(mdaEdits)
+      if e >= 0 && e < mdaUpTo { mdaAsg.push(e) }
+      mdaEdits = mdaEdits + 1
+    }
+  }
+  mdaEdits = arenaEditCount()
+  mdaEpoch = arenaEpochNow()
+  mdaBumps = arenaEditBumpCount()
+  while mdaUpTo < P.nodes.length {
+    const un = nodeAt(mdaUpTo)
+    if un is BinExpr && un.binOp == "=" { mdaAsg.push(mdaUpTo) }
+    mdaUpTo = mdaUpTo + 1
+  }
+  for i in mdaAsg {
     const nd = nodeAt(i)
     if nd is BinExpr {
       if nd.binOp == "=" {
@@ -17360,7 +17397,6 @@ function monoDeclIsAssigned(name: string, d: i32): boolean {
         }
       }
     }
-    i = i + 1
   }
   false
 }
@@ -25985,10 +26021,29 @@ export function monomorphize(stmts: i32[]) {
   // The pass also runs for callback specialization of a concrete higher-order function.
   // Gated on the program actually defining one, so a generic-free, HOF-free program (the
   // compiler itself) skips the pass entirely.
+  let hofOnly = false
   if !any {
-    if monoHasConcreteHOFParam() { any = true }
+    if monoHasConcreteHOFParam() {
+      any = true
+      hofOnly = true
+    }
   }
   if !any { return 0 }
+  // With no generic, the walk's only work is specializing a call of a concrete higher-order
+  // function, so only a body holding one is walked (D16553).
+  const hofReach: {[i32]: boolean} = Map()
+  if hofOnly {
+    let ni = 0
+    while ni < P.nodes.length {
+      const cn = nodeAt(ni)
+      const cd = if cn is Call && cn.callFn >= 0 { identFnDeclOf(cn.callFn) } else { -1 }
+      const cfe = if cd >= 0 { fnStmtsPosOf(cd) } else { -1 }
+      if cfe >= 0 && cfe < monoGen.length && feHasClosureParam(cfe) {
+        hofReach[monoTopFrameOf(ni)] = true
+      }
+      ni = ni + 1
+    }
+  }
   if monoShadowRename(fnStmts.length) < 0 { return -1 }
   monoFlowReads(stmts)
   monoWrittenLetGenSnap()
@@ -26023,7 +26078,7 @@ export function monomorphize(stmts: i32[]) {
   let fe2 = 0
   const nDecl = monoGen.length
   while fe2 < nPre {
-    if monoGen[fe2] == 0 {
+    if monoGen[fe2] == 0 && (!hofOnly || (hofReach[fnStmts[fe2]] ?? false)) {
       if monoWalkFnBody(fnStmts[fe2]) < 0 { return -1 }
     }
     fe2 = fe2 + 1

@@ -633,6 +633,7 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   idShadowAt: "uncached", idShadowCount: "uncached", idShadowLen: "uncached",
   setIdShadow: "uncached", setOpaqueSNames: "input", clsCensusAt: "uncached", clsCensusCount: "uncached",
   clsCensusLen: "uncached", setClsCensus: "uncached", irShadowArm: "uncached",
+  ifaceDumpAt: "uncached", ifaceDumpBuild: "uncached",
   irShadowCorrupt: "uncached", irShadowRowAt: "uncached", irShadowRowCount: "uncached",
   irShadowRowLen: "uncached", irShadowRowN: "uncached", irVerifySelfTest: "uncached", setOptimized: "input", setRepShadow: "uncached", setSharedMemory: "input", src: "input",
   srcReset: "input",

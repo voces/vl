@@ -116,10 +116,20 @@ Deno.test("oracle: pinned regressions", () => {
     ["const v8: i32 = 5\nprint((-v8) * (0xFFFFFFFF >>> 51))", "0"],
     // 4.1 / D1890: `as f32` rounds an integer constant once
     ["print(9000000003 as f32)", "9000000512"],
+    // E8.3: a constant cast to `u8` is checked against 0..255; a radix one at its 32-bit pattern
+    ["print(300 as? u8)", "null"],
+    ["print(0xFFFFFFFF as? u8)", "null"],
+    ["print(0xFF as? u8)", "255"],
+    ["const c: boolean = false\nprint((if c { 1 } else { 0xFF }) as u8)", "255"],
   ];
   for (const [src, want] of pins) {
     const o = interpret(src + "\n");
     if (o.kind !== "ok" || o.out.join("\n") !== want) throw new Error(`${src}: want ${want}, got ${o.kind} ${JSON.stringify(o.out)} ${o.msg}`);
+  }
+  // T1.3: a storage width is no cast target; E8.2: a failed bare `as` at top level has no function to return null
+  for (const src of ["print(7 as? u16)", "print(300 as u8)"]) {
+    const o = interpret(src + "\n");
+    if (o.kind !== "fault") throw new Error(`${src}: want fault, got ${o.kind} ${JSON.stringify(o.out)}`);
   }
 });
 
