@@ -14,7 +14,7 @@ type `T`. After an `if` that returns, the rest of the function sees the remainin
 ```vl
 function describe(x: i32 | string): string {
   if x is i32 { return "number \{x + 1}" }
-  "text of length \{x.length}"
+  return "text of length \{x.length}"
 }
 print(describe(41))   // prints number 42
 print(describe("hi")) // prints text of length 2
@@ -26,7 +26,7 @@ print(describe("hi")) // prints text of length 2
 function f(x: i32 | string | null): string {
   if x == null { return "none" }
   if x is string { return x }
-  "\{x * 2}"
+  return "\{x * 2}"
 }
 print(f(null))   // prints none
 print(f("s"))    // prints s
@@ -52,7 +52,7 @@ enumeration, and `match` over it must cover every member.
 ```vl
 type Dir = "north" | "south" | "east" | "west"
 function turn(d: Dir): Dir {
-  match d {
+  return match d {
     "north" => "east",
     "east" => "south",
     "south" => "west",
@@ -71,7 +71,7 @@ different field names is told apart by those names, and `match` can name the arm
 type Num = { n: i32 }
 type Add = { l: i32, r: i32 }
 function eval(e: Num | Add): i32 {
-  match e {
+  return match e {
     Num => e.n,
     Add => e.l + e.r,
   }
@@ -90,7 +90,7 @@ type Circle = { kind: "circle", r: f64 }
 type Square = { kind: "square", r: f64 }
 function area(s: Circle | Square): f64 {
   if s is Circle { return s.r * s.r * 3 }
-  s.r * s.r
+  return s.r * s.r
 }
 print(area({ kind: "circle", r: 1.0 }))   // prints 3
 print(area({ kind: "square", r: 2.0 }))   // prints 4
@@ -111,7 +111,7 @@ type A = { v: i32 }
 type B = { v: boolean }
 function f(s: A | B): string {
   if s is A { return "A" }
-  "B"
+  return "B"
 }
 print(f({ v: 3 }))      // prints A
 print(f({ v: true }))   // prints B
@@ -136,7 +136,7 @@ type A = { x: i32 }
 type B = { x: i32 }
 function f(v: A | B): string {
   if v is A { return "A" }
-  "B"
+  return "B"
 }
 const b: B = { x: 1 }
 print(f(b))   // prints A
@@ -154,7 +154,7 @@ whose field happens to lie in `B`'s literal set is a `B`. The checker adds a hin
 ```vl
 type A = { x: i32 }
 type B = { x: 1 | 2 }
-function f(v: A | B): string { if v is B { return "B" } "A" }
+function f(v: A | B): string { if v is B { return "B" } return "A" }
 const a: A = { x: 1 }
 print(f(a))   // prints B
 const c: A = { x: 7 }
@@ -167,7 +167,7 @@ Overlapping literal sets are legal too. A value in both sets is a member of both
 ```vl
 type A = { k: "x" | "y" }
 type B = { k: "y" | "z" }
-function f(s: A | B): string { if s is A { return "A" } "B" }
+function f(s: A | B): string { if s is A { return "A" } return "B" }
 const v: B = { k: "y" }
 print(f(v))   // prints A
 const w: B = { k: "z" }
@@ -187,7 +187,7 @@ the arms' field types.
 ```vl
 type Circle = { kind: "circle", r: f64 }
 type Square = { kind: "square", side: f64 }
-function k(s: Circle | Square): string { s.kind }
+function k(s: Circle | Square): string { return s.kind }
 print(k({ kind: "square", side: 1.0 }))   // prints square
 ```
 

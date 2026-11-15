@@ -118,7 +118,7 @@ change it, and the view sees the change:
 function total(xs: readonly i32[]): i32 {
   let s = 0
   for x in xs { s += x }
-  s
+  return s
 }
 const a = [1, 2]
 const v: readonly i32[] = a

@@ -70,9 +70,9 @@ const ALLOC = `import { Buffer, storeI32 } from "std:buffer"
 export function alloc(n: i32): i32 {
   const b = Buffer(n)
   storeI32(b, n - 4, 7)
-  b.base + n - 4
+  return b.base + n - 4
 }
-export function pages(): i32 { __memory_size__() }
+export function pages(): i32 { return __memory_size__() }
 `;
 
 Deno.test({

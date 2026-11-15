@@ -16,11 +16,11 @@ if (GATED && !ENABLED) {
 const dec = new TextDecoder();
 const CASES: { src: string; want: string[] }[] = [
   {
-    src: "function get(o) { o.x }\nprint(get({ x: 4 }))\n",
+    src: "function get(o) { return o.x }\nprint(get({ x: 4 }))\n",
     want: ["fn get('?get.0) -> '?fld.x.?get.0 hd0=1 calls=1 differ=0"],
   },
   {
-    src: "function inc(x: i32): i32 { x + 1 }\nprint(inc(2))\n",
+    src: "function inc(x: i32): i32 { return x + 1 }\nprint(inc(2))\n",
     want: [],
   },
 ];
