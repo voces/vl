@@ -729,6 +729,20 @@ lowering through the op seam (§5.2) instead of its own ladder. A slice therefor
 occurrence counts quoted. Families still behind an unshared decision wait for that decision to
 become shared, and they do not count as "fully matched" before then.
 
+**Claiming is parked until it pays.** Whole-function claiming (CLAIMED at the function seam)
+deletes nothing on its own, because unclaimed functions keep the legacy drivers alive. It also
+costs fuel: +0.021% for claiming {scalar, control, call, global}, because the IR's build plus
+lowering is slightly dearer than legacy's direct emit. So CLAIMED stays empty until one of two
+things holds:
+- a claim lets a family's or a driver's legacy path delete;
+- the builder is fuel-neutral, which a builder cost profile measures.
+
+Until then, cutover slices go through the op seam, starting with C1: the shared scalar opcode
+table, with the legacy ladders deleted. The armed gate's claim test mode keeps re-proving the
+claim evidence on every merge. The first PR that makes CLAIMED non-empty adds a blocking
+unarmed row that asserts zero `claim fell back`, with a verifier fallback counted as a hard
+failure.
+
 **What it does not change.** Phase B (I9) still waits for every function to be on the IR.
 Movers (SSwitch, the local allocator, SDrop's removal and the I10 passes) still land as their
 own named PRs.
