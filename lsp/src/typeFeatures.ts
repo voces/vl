@@ -1087,12 +1087,18 @@ const decimalParts = (text: string): DecimalParts | undefined => {
   return { neg: m[1] === "-", digits, exp: Number(m[4] ?? 0) - frac.length + all.length - digits.length };
 };
 
-/** Whether two decimal literals denote the same number. */
-const sameDecimal = (a: string, b: string): boolean => {
-  const pa = decimalParts(a);
-  const pb = decimalParts(b);
-  return pa !== undefined && pb !== undefined && pa.neg === pb.neg &&
-    pa.digits === pb.digits && pa.exp === pb.exp;
+/** The exact decimal expansion of the finite double `x`, in `decimalParts`' form. */
+const doubleParts = (x: number): DecimalParts => {
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, Math.abs(x));
+  const bits = view.getBigUint64(0);
+  const biased = Number((bits >> 52n) & 0x7ffn);
+  const frac = bits & ((1n << 52n) - 1n);
+  const m = biased === 0 ? frac : frac | (1n << 52n);
+  const e = (biased === 0 ? 1 : biased) - 1075;
+  const all = (e >= 0 ? m << BigInt(e) : m * 5n ** BigInt(-e)).toString();
+  const digits = all.replace(/0+$/, "") || "0";
+  return { neg: x < 0, digits, exp: (e >= 0 ? 0 : e) + all.length - digits.length };
 };
 
 /** `p` in scientific form, `1e-400` or `1.25e30`. */
@@ -1126,15 +1132,19 @@ export const exactConstValue = (
       return { text: (p.neg ? "-" : "") + v.toString(), rounded: false };
     }
   }
-  if (at === "f32" || at === "f64") {
-    const x = Number(c.shown);
-    const text = floatText(at === "f32" ? Math.fround(x) : x);
-    return { text, rounded: !sameDecimal(text, c.shown) };
+  // A float constant folds in IEEE (E9.1): its value is the double its text names, shown by its
+  // shortest round-trip text. It is rounded when that text is not exactly the double (a literal
+  // with more digits than a double holds), or when it is read at `f32`.
+  const x = Number(c.shown);
+  if (Number.isFinite(x)) {
+    const v = at === "f32" ? Math.fround(x) : x;
+    const d = doubleParts(x);
+    const exact = p !== undefined && (x === 0 ? /^0*$/.test(p.digits) : p.digits === d.digits && p.exp === d.exp);
+    return { text: floatText(v), rounded: v !== x || (p !== undefined && !exact && (x === 0 || p.digits.length > 17)) };
   }
+  // Past the double range: the literal as written, or its first 17 digits.
   if (c.shown.length <= EXACT_FLOAT_SHOWN_MAX) return { text: c.shown, rounded: false };
   if (p !== undefined && p.digits.length <= 17) return { text: sciText(p), rounded: false };
-  const x = Number(c.shown);
-  if (Number.isFinite(x) && x !== 0) return { text: floatText(x), rounded: true };
   if (p === undefined) return { text: c.shown, rounded: false };
   return { text: sciText({ ...p, digits: p.digits.slice(0, 17), exp: p.exp + p.digits.length - 17 }), rounded: true };
 };
