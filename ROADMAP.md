@@ -196,6 +196,14 @@ Each consumer keeps its own list. Re-run an ask before scheduling it.
 
 - **H3, merge-by-renaming**, is a bridge (native-modules-design.md, "Post-parity revisit"). The
   resolve phase (`identDeclIx`) likely supersedes it.
+- **H-P1, the return-inference pre-pass checks its bodies twice.** `inferReturnsPrePass` quietly
+  checks every un-annotated function on a recursion cycle, then rolls back to the returns, and the
+  real pass checks the same bodies again. On the self-compile that is 7.2% of CPU: 887 cycle
+  members of 5,919 un-annotated functions, 283 quiet roots, each pulling in its callees by demand
+  (lane P, 2026-11-15). A precise mention graph does not shrink the cycles. Keeping the quiet
+  pass's results for the bodies it checked, or making it the real check for cycle members, would
+  help every recursive program. Re-measure after the hybrid-return flag day, since `return`-only
+  block bodies change what inference does.
 - **H-M2, wasm-native distribution.** Retire the Rust host by emitting WASI p1, linear memory and
   GC-string copies, and run under a stock wasmtime. It is secondary to the refactor.
 
