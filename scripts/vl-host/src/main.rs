@@ -4745,12 +4745,17 @@ fn report_late_demands(inst: &Instance, store: &mut Store<()>, path: &str) {
     eprint!("{rows}");
 }
 
+/// Whether `$VL_IFACES=1` asked for each compile's shadow interfaces.
+fn ifaces_on() -> bool {
+    std::env::var("VL_IFACES").ok().as_deref() == Some("1")
+}
+
 /// Under `$VL_IFACES=1`, print `[iface] <path>: <line>` to stderr for each line of the guest's
 /// shadow-interface dump (L2 S0): one per un-annotated top-level function, its parameters, the
 /// demand rows it owns and how its calls agree with its result at their bindings. A seed without
 /// `ifaceDumpBuild` prints nothing.
 fn report_ifaces(inst: &Instance, store: &mut Store<()>, path: &str) {
-    if std::env::var("VL_IFACES").ok().as_deref() != Some("1") {
+    if !ifaces_on() {
         return;
     }
     let (Ok(build), Ok(at)) = (
@@ -10097,6 +10102,9 @@ fn pump_session(
                 if late_demands_on() {
                     let p = cmd_path.read(&mut store)?;
                     report_late_demands(&inst, &mut store, &p);
+                }
+                if ifaces_on() {
+                    let p = cmd_path.read(&mut store)?;
                     report_ifaces(&inst, &mut store, &p);
                 }
                 if cls_census_on() {
