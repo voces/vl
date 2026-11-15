@@ -73,8 +73,9 @@ rules there apply here, and `tests/roadmap_honest_test.ts` gates this file too.
 - **`[null]`, the later target** (spec Q3). Infer the element from the first non-null use.
 - **Variadics.** A rest parameter is deliberately not part of a function type, and an `extern` cannot
   take one.
-- **Deep `is` over Json.** No open row: the rewrite's substitution is cut at the write, the
-  retiring call or the nested binding the checker sees (D16274, D16474, D16475).
+- **Deep `is` over Json.** One open row: D16476, a read of the receiver in the right operand of
+  its `&&`, which the rewrite does not substitute. Inside an arm, the substitution is cut at the
+  write, the retiring call or the nested binding the checker sees (D16274, D16474, D16475).
 
   The `as` trio over Json needs four things: the S4 ruling (open-rulings §E), `"shape"` in
   `JsonError.kind` (std-api-reviewer), a JSON-pointer path in the walker, and a position matrix
