@@ -1,6 +1,7 @@
 // A function declaration: its parameters and their defaults, the solve for un-annotated
 // parameters, its body and its return.
 
+import { tySame } from "./check_types"
 import { ivSeedMovedWidth } from "./check_intrinsic_values"
 import {
   elabDeadRestClose,
@@ -12,10 +13,12 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  Node,
   Param,
   RetStmt,
   TypeRef,
   annTsOf,
+  arenaSetNode,
   blockTailIsDead,
   fnTpBoundOf,
   i32ToStr,
@@ -24,7 +27,13 @@ import {
   stmtAlwaysExits,
   tsMentionsAnyName,
 } from "./ast"
-import { resolveAnnotAt, resolveRetAnnotAt } from "./check_annot_resolve"
+import {
+  fvaAnnot,
+  resolveAnnotAt,
+  resolveRetAnnotAt,
+} from "./check_annot_resolve"
+import { i32ListHas } from "./listutil"
+import { collectRetValues } from "./check_nj_join"
 import { assignableExpr, fsbRecheckFrom } from "./check_assignable"
 import {
   collapsedTy,
@@ -95,7 +104,12 @@ import {
   paramSolveProbe,
   paramSolveProbeSet,
 } from "./check_exp_obs"
-import { cbExpectedFor, cbExpectedRetFor, seedExpected } from "./check_expected"
+import {
+  cbExpectedFor,
+  cbExpectedRetFor,
+  cbExpectedRetHeld,
+  seedExpected,
+} from "./check_expected"
 import {
   constrainEmptyExpr,
   inferRetF32Join,
@@ -193,7 +207,7 @@ import {
   oerDeclRefusals,
   refuseOpenElemRet,
 } from "./check_node_rules"
-import { nodeTyIx, nodeTyOf, nodeTySet } from "./check_node_tys"
+import { nodeTyIx, nodeTyOf, nodeTySet, nodeTySetGrow } from "./check_node_tys"
 import { lbiPinnedReads } from "./check_num_lit_state"
 import { inlayHole, joinTypedByWant } from "./check_redundant_annot"
 import { recordRedundantRet } from "./check_redundant_ret"
@@ -246,7 +260,16 @@ import {
   TY_ERR,
   TY_NEVER,
   TY_VOID,
+  TyArray,
+  TyErr,
   TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
   TyVar,
   mkFuncTy,
   nestParentOfPut,
@@ -660,7 +683,11 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
       saved,
       bodyTotalForRet,
     )
+    lamRetQueue(n, fnIx, ret)
   }
+  // A lambda whose return a pin wrote from its context took its result from the annotation that
+  // supplied it, so that annotation is load-bearing (D1442).
+  if n.fnRet >= 0 && lamRetWrittenAt(fnIx) { cbSeedUsedSet(cbSeedUsed + 1) }
   refuseVoidRetsFrom(saved.voidRetLen, ret)
   inferRetLogTruncate(saved.retLogLen)
   fnDeclRefuseFallOff(n, fnIx, ret, bodyTotalForRet)
@@ -1562,6 +1589,7 @@ function fnDeclNoteRedundantRet(
     !inferring
     && !inferQuiet
     && n.fnRet >= 0
+    && !lamRetWrittenAt(fnIx)
     && retNatural >= 0
     && !retNaturalErr
   ) {
@@ -1628,4 +1656,117 @@ function fnDeclIsGeneric(n: FuncDecl): boolean {
     if pn is Param && pn.parType < 0 { return true }
   }
   false
+}
+
+// ── a lambda's return taken from its context (D3087, D16310) ──────────────────────────────────
+
+// The lambdas a pass inferred a return for that differs from the closed contextual return they are
+// delivered to, with that return; `lamRetApply` writes each as the lambda's annotation.
+let lamRetQNode: i32[] = []
+let lamRetQTy: i32[] = []
+// The lambdas whose return-annotation node a pin wrote, which no source token spells.
+let lamRetWritten: {[i32]: boolean} = Map()
+
+export function lamRetWrittenAt(ix: i32): boolean { lamRetWritten[ix] ?? false }
+
+export function lamRetReset() {
+  lamRetQNode = []
+  lamRetQTy = []
+  lamRetWritten = Map()
+  0
+}
+
+// Queues lambda `n` at `fnIx`, whose inferred return is `ret`, when it is held to a closed
+// contextual return that it, or a value its body hands back, is not: that value is a delivery its
+// annotated twin converts, where the inferred lambda builds it at its own type.
+function lamRetQueue(n: FuncDecl, fnIx: i32, ret: i32) {
+  if inferQuiet || n.fnName != "" || n.fnRet >= 0 { return 0 }
+  const er = cbExpectedRetFor(fnIx)
+  if !lamCtxRetClosed(er) || !cbExpectedRetHeld(fnIx) { return 0 }
+  let differs = ret < 0 || !tySame(ret, er)
+  const vs: i32[] = []
+  collectRetValues(n.fnBody, vs)
+  for v in vs {
+    if v >= 0 && !tySame(nodeTyOf(v), er) { differs = true }
+  }
+  if !differs || i32ListHas(lamRetQNode, fnIx) { return 0 }
+  lamRetQNode.push(fnIx)
+  lamRetQTy.push(er)
+  0
+}
+
+// Writes each queued lambda's contextual return as its return-annotation node, so the next check
+// reads its body against that type and every later reader sees its annotated twin. The count.
+export function lamRetApply(): i32 {
+  let k = 0
+  let i = 0
+  while i < lamRetQNode.length {
+    const ix = lamRetQNode[i]
+    const n = nodeAt(ix)
+    if n is FuncDecl && n.fnRet < 0 {
+      const tr = fvaAnnot(lamRetQTy[i], -1, n.pos)
+      if tr >= 0 {
+        nodeTySetGrow(tr, lamRetQTy[i])
+        const nf: Node = {
+          fnName: n.fnName,
+          fnTyParams: n.fnTyParams,
+          fnParams: n.fnParams,
+          fnRet: tr,
+          fnBody: n.fnBody,
+          pos: n.pos,
+        }
+        arenaSetNode(ix, nf)
+        lamRetWritten[ix] = true
+        k = k + 1
+      }
+    }
+    i = i + 1
+  }
+  lamRetQNode = []
+  lamRetQTy = []
+  k
+}
+
+// Whether `t`, a lambda's contextual return, is a closed type that can stand in for its annotation:
+// not void or never, not an error, naming no hole or type variable, and not a literal result. A
+// literal result is adopted by its own rule, which judges each returned value against it (D9520).
+function lamCtxRetClosed(t: i32): boolean {
+  t >= 0
+    && t < T.tys.length
+    && !isVoidTy(t)
+    && !isNeverTy(t)
+    && t != TY_ERR
+    && !tyHasHole(t)
+    && !tyHasTyVar(t)
+    && !lamLitResult(t, 8)
+}
+
+// Whether `t` is a literal result: a literal type, or a union holding one, through nullables, list
+// elements and function results. A literal inside a record field is the record's, not the result's.
+function lamLitResult(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth <= 0 { return false }
+  const n = tyAt(t)
+  match n {
+    TyLit => {
+      return true
+    }
+    TyPrim | TyErr | TyVar | TyObj | TyMap | TyNeg => {
+      return false
+    }
+    TyNullable => {
+      return lamLitResult(n.nInner, depth - 1)
+    }
+    TyArray => {
+      return lamLitResult(n.aElem, depth - 1)
+    }
+    TyUnion => {
+      for m in n.uMembers {
+        if lamLitResult(m, depth - 1) { return true }
+      }
+      return false
+    }
+    TyFunc => {
+      return lamLitResult(n.fnRet, depth - 1)
+    }
+  }
 }

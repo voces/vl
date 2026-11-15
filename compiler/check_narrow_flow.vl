@@ -122,6 +122,7 @@ import {
   crOpCall,
   crPendCalls,
   crPendDepths,
+  crPendFrames,
   crPendNames,
   crPendNarTys,
   crProgRoot,
@@ -628,7 +629,9 @@ import {
   tyHasHole,
   tyIsHole,
   tyMemberWithin,
-  tyMutEpoch,
+  tyPinElem,
+  tyPinKey,
+  tyPinVal,
   tySame,
   tyToStr,
   tyToStrUser,
@@ -1139,8 +1142,7 @@ function idxStoreHolePin(lit: i32, d: i32, rows: i32[], elems: i32[]) {
     arrDefPinHoleElem(lit)
     return 0
   }
-  lt.aElem = el
-  tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+  tyPinElem(lt, el)
   0
 }
 
@@ -1158,8 +1160,7 @@ export function asgReadElemPin(exprIx: i32, vt: i32) {
     const t = tyAt(asgOpenElemRow)
     if t is TyArray {
       if t.aElem >= 0 { return -1 }
-      t.aElem = widenLitTy(vt)
-      tyMutEpoch = tyMutEpoch + 1 // the store's own value pinned the element in place
+      tyPinElem(t, widenLitTy(vt))
       // The read's recorded type is `resolveOpenElemReads`'s. A compound store's read is also
       // its write target, which `checkIndexNode` does not bank, so it is banked here.
       oerBank(exprIx, false, inferQuiet)
@@ -1183,8 +1184,7 @@ export function arrDefPinHoleElem(ty: i32) {
       // writes; the `i32` default only when no callee wrote the row.
       let el = litMembersBaseTy(calleeWrittenElem(ty))
       if el < 0 { el = TY_I32 }
-      t.aElem = el
-      tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+      tyPinElem(t, el)
     }
     return t.aElem
   }
@@ -1215,8 +1215,7 @@ function calleeWritePin(ty: i32): boolean {
     if t.aElem >= 0 { return false }
     const el = calleeWrittenElem(ty)
     if el < 0 { return false }
-    t.aElem = el
-    tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+    tyPinElem(t, el)
     return true
   }
   false
@@ -1230,12 +1229,11 @@ export function settleOpenUnionRows() {
     if unresolvedHole(r) {
       const t = tyAt(r)
       if t is TyArray && t.aElem < 0 {
-        t.aElem = unboundDefaultTy()
+        tyPinElem(t, unboundDefaultTy())
       } else if t is TyMap {
-        if t.mKey < 0 { t.mKey = unboundDefaultTy() }
-        if t.mVal < 0 { t.mVal = unboundDefaultTy() }
+        if t.mKey < 0 { tyPinKey(t, unboundDefaultTy()) }
+        if t.mVal < 0 { tyPinVal(t, unboundDefaultTy()) }
       }
-      tyMutEpoch = tyMutEpoch + 1 // in-place pin — canonical keys change
       noteSettledRow(r)
     }
   }
@@ -1267,8 +1265,7 @@ function defaultOpenHoles(ty: i32, depth: i32, apply: boolean): boolean {
       if t.aElem >= 0 { return defaultOpenHoles(t.aElem, depth - 1, apply) }
       if openReadHas(ty) { return true }
       if apply {
-        t.aElem = unboundDefaultTy()
-        tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+        tyPinElem(t, unboundDefaultTy())
         noteSettledRow(ty)
       }
       false
@@ -1279,10 +1276,12 @@ function defaultOpenHoles(ty: i32, depth: i32, apply: boolean): boolean {
         if apply {
           if t.mKey < 0 {
             const rk = openKeyReadIx(ty)
-            t.mKey = if rk >= 0 { openKeyTyAt(rk) } else { unboundDefaultTy() }
+            tyPinKey(
+              t,
+              if rk >= 0 { openKeyTyAt(rk) } else { unboundDefaultTy() },
+            )
           }
-          if t.mVal < 0 { t.mVal = unboundDefaultTy() }
-          tyMutEpoch = tyMutEpoch + 1 // in-place key/value pin — canonical keys change
+          if t.mVal < 0 { tyPinVal(t, unboundDefaultTy()) }
           noteSettledRow(ty)
         }
       }
@@ -1328,15 +1327,14 @@ export function defaultReadOnlyContainer(ty: i32): boolean {
   const t = tyAt(ty)
   if t is TyArray {
     if t.aElem >= 0 { return false }
-    t.aElem = unboundDefaultTy()
+    tyPinElem(t, unboundDefaultTy())
   } else if t is TyMap {
     if t.mKey >= 0 && t.mVal >= 0 { return false }
-    if t.mVal < 0 { t.mVal = unboundDefaultTy() }
+    if t.mVal < 0 { tyPinVal(t, unboundDefaultTy()) }
     if t.mKey < 0 { readOnlyKeyRows.push(ty) }
   } else {
     return false
   }
-  tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
   true
 }
 
@@ -1347,10 +1345,7 @@ export function pinReadKey(row: i32, kt: i32) {
     return 0
   }
   const t = tyAt(row)
-  if t is TyMap && t.mKey < 0 {
-    t.mKey = kt
-    tyMutEpoch = tyMutEpoch + 1 // in-place key pin — canonical keys change
-  }
+  if t is TyMap && t.mKey < 0 { tyPinKey(t, kt) }
   0
 }
 
@@ -1919,11 +1914,17 @@ export function writeStorageTy(ix: i32) {
     Member => {
       const slot = narrowedPathIx(placeAt(ix))
       if slot < 0 { return -1 }
-      // An already-retired narrowing still answers, and bailing on `npInvBy[slot] >= 0` here is an
-      // ordering bug inside one statement: `lt` is read off the target before the right-hand side is
-      // checked, so a callee that retires the path mid-statement would leave `asgLt` at a type the
-      // storage never had. A retired narrowing means the place reads at its declared type.
-      if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
+      // A retired narrowing still answers: `lt` is read before the right-hand side, so a callee
+      // retiring the path mid-statement must not leave it at a type the storage never had. A nested
+      // function checked since holds the write to the narrowing only if it read the path under it,
+      // which a re-test does not (D16297).
+      if (
+        npEpochs[slot] != narFnEpoch
+        && npAsg[slot] != 1
+        && npCapBy[slot] >= 0
+      ) {
+        return -1
+      }
       if !npInsideBarrier(slot) { return -1 }
       const noPlaces: i32[] = []
       const noTys: i32[] = []
@@ -1940,7 +1941,13 @@ export function writeStorageTy(ix: i32) {
     Index => {
       const slot = narrowedPathIx(placeAt(ix))
       if slot < 0 { return -1 }
-      if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
+      if (
+        npEpochs[slot] != narFnEpoch
+        && npAsg[slot] != 1
+        && npCapBy[slot] >= 0
+      ) {
+        return -1
+      }
       if !npInsideBarrier(slot) { return -1 }
       const noPlaces: i32[] = []
       const noTys: i32[] = []
@@ -3027,6 +3034,7 @@ export function crStmtLeave() {
     crPendCalls.pop()
     crPendNarTys.pop()
     crPendDepths.pop()
+    crPendFrames.pop()
   }
   const rb = crStmtRd[top]
   while crRdRet.length > rb {
@@ -4135,8 +4143,22 @@ export function crNoteRhsRetired(
   0
 }
 
-// Drop the facts collected since `mark` that a call inside the condition may falsify:
-// the test ran before the call. Banked at the condition for the emitter's matching decline.
+// Whether slot `s` holds a narrowing on a scope frame opened after a call that ran with `frames`
+// frames open: the call's retire re-typed every row it could see, so that row is newer.
+function narNewerThan(s: i32, frames: i32): boolean {
+  const ds = narChainDepths(s)
+  ds.length > 0 && ds[0] >= frames
+}
+
+// Whether node `ix` is the binary operator `op`.
+function isShortCircuitOp(ix: i32, op: string): boolean {
+  const n = nodeAt(ix)
+  n is BinExpr && n.binOp == op
+}
+
+// Drop the facts collected since `mark` that a call inside `condIx` may falsify: their tests ran
+// before it. A short circuit filters its left side's facts against its right side only, since
+// a fact its right side makes holds after every call its left side ran (D3251).
 function crFilterCond(condIx: i32, places: i32[], tys: i32[], mark: i32) {
   if places.length <= mark { return 0 }
   let w = mark
@@ -4178,6 +4200,8 @@ export function crReadHook(name: string, ix: i32): i32 {
   let p = crPendNames.length - 1
   while p >= 0 {
     if crPendNames[p] == name {
+      // A re-test after the call narrowed the binding again, on a frame the call did not see.
+      if narNewerThan(identSlotOf(ix, name), crPendFrames[p]) { return -1 }
       let tail = " earlier in this statement may reassign it — read '"
         + name
         + "' in a statement after the call, and re-test it there"
@@ -4640,7 +4664,7 @@ function scWrFacts(condIx: i32, places: i32[], tys: i32[]) {
 export function collectThenNarrows(condIx: i32, places: i32[], tys: i32[]) {
   const mark = places.length
   collectThenNarrowsRaw(condIx, places, tys)
-  crFilterCond(condIx, places, tys, mark)
+  if !isShortCircuitOp(condIx, "&&") { crFilterCond(condIx, places, tys, mark) }
 }
 
 function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
@@ -4720,6 +4744,7 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
       if cond.binOp == "&&" {
         const lmark = places.length
         collectThenNarrows(cond.binLeft, places, tys)
+        crFilterCond(cond.binRight, places, tys, lmark)
         crFilterRhsRetired(condIx, places, tys, lmark)
         scWrFacts(condIx, places, tys)
         collectThenNarrows(cond.binRight, places, tys)
@@ -4915,7 +4940,7 @@ function elseRemainderTy(cur: i32, tIdx: i32): i32 {
 export function collectElseNarrows(condIx: i32, places: i32[], tys: i32[]) {
   const mark = places.length
   collectElseNarrowsRaw(condIx, places, tys)
-  crFilterCond(condIx, places, tys, mark)
+  if !isShortCircuitOp(condIx, "||") { crFilterCond(condIx, places, tys, mark) }
 }
 
 function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
@@ -4976,6 +5001,7 @@ function collectElseNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
       if cond.binOp == "||" {
         const lmark = places.length
         collectElseNarrows(cond.binLeft, places, tys)
+        crFilterCond(cond.binRight, places, tys, lmark)
         crFilterRhsRetired(condIx, places, tys, lmark)
         scWrFacts(condIx, places, tys)
         collectElseNarrows(cond.binRight, places, tys)
