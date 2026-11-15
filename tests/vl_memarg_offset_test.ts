@@ -23,7 +23,7 @@ const PRE = ["const D = 0x0c000000"];
 // name → [program, instructions that must appear, instructions that must not]
 const CASES: Record<string, [string[], string[], string[]]> = {
   explicitLoad: [
-    ["function f(p: i32) { __load_i64__(p, 16) }", "print(f(__load_i32__(0)))"],
+    ["function f(p: i32) { return __load_i64__(p, 16) }", "print(f(__load_i32__(0)))"],
     ["i64.load offset=16"],
     [],
   ],
@@ -33,12 +33,12 @@ const CASES: Record<string, [string[], string[], string[]]> = {
     [],
   ],
   constOffset: [
-    ["function f(p: i32) { __load_f64__(p, D + 8) }", "print(f(__load_i32__(0)))"],
+    ["function f(p: i32) { return __load_f64__(p, D + 8) }", "print(f(__load_i32__(0)))"],
     ["f64.load offset=201326600"],
     [],
   ],
   largest: [
-    ["function f(p: i32) { __load_u8__(p, 4294967295) }", "print(f(__load_i32__(0)))"],
+    ["function f(p: i32) { return __load_u8__(p, 4294967295) }", "print(f(__load_i32__(0)))"],
     ["i32.load8_u offset=4294967295"],
     [],
   ],
@@ -48,19 +48,19 @@ const CASES: Record<string, [string[], string[], string[]]> = {
     [],
   ],
   atomic: [
-    ["function f(p: i32) { __atomic_rmw_cmpxchg_i64__(p, 24, 0 as i64, 1 as i64) }", "print(f(__load_i32__(0)))"],
+    ["function f(p: i32) { return __atomic_rmw_cmpxchg_i64__(p, 24, 0 as i64, 1 as i64) }", "print(f(__load_i32__(0)))"],
     ["i64.atomic.rmw.cmpxchg offset=24"],
     [],
   ],
   // `(x & 1023) * 8` is at most 8184, so `D + (x & 1023) * 8` never wraps and D moves.
   provedFold: [
-    ["function f(x: i32) { __load_i64__(D + (x & 1023) * 8) }", "print(f(__load_i32__(0)))"],
+    ["function f(x: i32) { return __load_i64__(D + (x & 1023) * 8) }", "print(f(__load_i32__(0)))"],
     ["i64.load offset=201326592"],
     [],
   ],
   // `x * 8` is unbounded, so the add can wrap and must stay an add.
   unprovedStays: [
-    ["function f(x: i32) { __load_i64__(D + x * 8) }", "print(f(__load_i32__(0)))"],
+    ["function f(x: i32) { return __load_i64__(D + x * 8) }", "print(f(__load_i32__(0)))"],
     ["i64.load\n"],
     ["offset="],
   ],
@@ -121,7 +121,7 @@ Deno.test({
     try {
       Deno.writeTextFileSync(
         `${dir}/lmu.vl`,
-        "function f(p: i32) { __load_i32__(p + 16) }\nprint(f(__load_i32__(0)))\n",
+        "function f(p: i32) { return __load_i32__(p + 16) }\nprint(f(__load_i32__(0)))\n",
       );
       const off = await dis(dir, "lmu", ["-O"]);
       if (count(off, "offset=16") !== 0) throw new Error(`-O alone folded the add:\n${off}`);
@@ -168,8 +168,8 @@ Deno.test({
     const dir = Deno.makeTempDirSync({ prefix: "vl-memarg-lmu-sized-" });
     try {
       const put = (name: string, src: string) => Deno.writeTextFileSync(`${dir}/${name}.vl`, src + "\n");
-      put("f", "export function f(p: i64): i64 { __load_i64__((p + 32) as% i32) }");
-      put("g", "export function f(p: i64): i64 { __load_i64__(p as% i32, 32) }");
+      put("f", "export function f(p: i64): i64 { return __load_i64__((p + 32) as% i32) }");
+      put("g", "export function f(p: i64): i64 { return __load_i64__(p as% i32, 32) }");
       for (const rung of [["-O", "--low-memory-unused"], ["-O", "--low-memory-unused=65536"]]) {
         const f = bodies(await dis(dir, "f", rung));
         const g = bodies(await dis(dir, "g", rung));
@@ -187,7 +187,7 @@ Deno.test({
         put(
           name,
           [
-            ...cs.map((c) => `export function a${c}(p: i64) { __load_i32__((p + ${c}) as% i32) }`),
+            ...cs.map((c) => `export function a${c}(p: i64) { return __load_i32__((p + ${c}) as% i32) }`),
             ...cs.map((c) => `export function b${c}(q: i32, v: f64) { __store_f64__(q + ${c}, v) }`),
           ].join("\n"),
         );
@@ -318,10 +318,10 @@ Deno.test({
 // plumb's src/rt.vl accessors, verbatim: the helpers its generated code calls for every access.
 const RT = [
   "export const M32: i64 = 4294967295",
-  "export function ld8(a: i64): i64 { __load_u8__(a as% i32) as% i64 }",
-  "export function ld16(a: i64): i64 { __load_u16__(a as% i32) as% i64 }",
-  "export function ld32(a: i64): i64 { (__load_i32__(a as% i32) as% i64) & M32 }",
-  "export function ld64(a: i64): i64 { __load_i64__(a as% i32) }",
+  "export function ld8(a: i64): i64 { return __load_u8__(a as% i32) as% i64 }",
+  "export function ld16(a: i64): i64 { return __load_u16__(a as% i32) as% i64 }",
+  "export function ld32(a: i64): i64 { return (__load_i32__(a as% i32) as% i64) & M32 }",
+  "export function ld64(a: i64): i64 { return __load_i64__(a as% i32) }",
   "export function st8(a: i64, v: i64) { __store_i8__(a as% i32, v as% i32) }",
   "export function st16(a: i64, v: i64) { __store_i16__(a as% i32, v as% i32) }",
   "export function st32(a: i64, v: i64) { __store_i32__(a as% i32, v as% i32) }",
@@ -354,7 +354,7 @@ Deno.test({
         const fn = (e: string) =>
           name.startsWith("st")
             ? `export function f(p: i64, v: i64) { ${e} }`
-            : `export function f(p: i64): i64 { ${e} }`;
+            : `export function f(p: i64): i64 { return ${e} }`;
         put(`h_${name}`, fn(helper));
         put(`d_${name}`, fn(direct));
       }
@@ -366,7 +366,7 @@ Deno.test({
           [
             "export function f(p: i64, v: i64): i64 {",
             ...stores.map((s) => `  ${s[i]}`),
-            `  ${loads.map((s) => `(${s[i]})`).join(" + ")}`,
+            `  return ${loads.map((s) => `(${s[i]})`).join(" + ")}`,
             "}",
           ].join("\n"),
         );
@@ -403,11 +403,11 @@ Deno.test({
         `${dir}/nt.vl`,
         [
           "let n = 0",
-          "function twice(a: i64): i64 { __load_i64__(a as% i32) + a }",
-          "function effect(a: i64): i64 { n = n + 1; __load_i64__(a as% i32) }",
-          "function masked(a: i64, m: i64): i64 { __load_i64__(a as% i32) & m }",
+          "function twice(a: i64): i64 { return __load_i64__(a as% i32) + a }",
+          "function effect(a: i64): i64 { n = n + 1; return __load_i64__(a as% i32) }",
+          "function masked(a: i64, m: i64): i64 { return __load_i64__(a as% i32) & m }",
           "function swapped(v: i64, a: i64) { __store_i64__(a as% i32, v) }",
-          "function plus(a: i64): i64 { __load_i64__(a as% i32) + 1 }",
+          "function plus(a: i64): i64 { return __load_i64__(a as% i32) + 1 }",
           "function run(p: i64) {",
           "  __store_i64__(p as% i32, 48, 5 as i64)",
           "  swapped(7 as i64, p + 56)",
