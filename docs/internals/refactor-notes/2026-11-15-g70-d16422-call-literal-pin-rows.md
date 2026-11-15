@@ -34,3 +34,10 @@ element, so it was not a pin row and the body's pushed record met nothing. The c
   read through the pushed record all run. Fixture:
   `tests/cases/closures/hole-param-record-pushed-beside-the-call-record.vl`.
 - Filed: D16425, a bound list `const l = [{ ys: [] }]; t(l)`, an invalid module on both seeds.
+- 445 hole / inferred / record / empty templates: 0 runs→not-runs. The only changes are the two
+  `index_writes` cells, which move to runs.
+- `regress.vl`: no moves.
+- `decl-order-ab.vl`: the new fixture, declarations last, builds an invalid module, as it does on
+  the base seed. That is filed as D16426, and its baseline line is recorded. Lifting the guard for
+  the record link alone does not fix it.
+- `check-filed-witnesses --strict`: 5113 graded, all as filed.
