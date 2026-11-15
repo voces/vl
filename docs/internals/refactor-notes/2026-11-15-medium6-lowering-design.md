@@ -11,11 +11,14 @@ or is it "the check-time rewrites move into L1's lowering"?
 | class | what it is | where it goes |
 |---|---|---|
 | PRE | rewrites that run before checking | a small resolve-time pass of their own |
-| POST | rewrites that run after checking, mostly for the emitter | retire into L1's builder at the I-step that claims the construct |
+| POST | rewrites that run after checking, mostly for the emitter | retire into L1's builder at I9 (phase B) |
 | MID | rewrites the checker builds and then checks | become appends above the parse range, not overwrites |
 
-The arena is not frozen until L1 step I8, because the emitter's own rewrites (`emit_rewrite.vl`,
-mono's clones) retire only there. So step 5's deletion arrives at I8, not before it.
+L1 confirms the routing (§5). Phase A (I1–I8) reads the post-rewrite tree for every construct,
+because byte identity with legacy requires it. So the checker's emit-only rewrites retire only at
+I9, when the builder reads the template read-only plus checker facts. The emitter's own rewrites
+(`emit_rewrite.vl`) retire at I8 and mono's at I9, so step 5's deletion arrives at I9 and no
+earlier.
 
 ## 1. The inventory (measured)
 
@@ -71,12 +74,14 @@ later checking reads what it wrote.
     edit log) is no longer needed for PRE.
   - It must not run twice. Today `checkProgramAgain` re-runs these passes over their own output,
     which is why they must be idempotent. After the move, the re-walk starts from the lowered root.
-- **POST (12 overwrites, 19 functions)** retires into L1's builder (`ir-design-2026-11.md` §5.3).
-  Each one becomes a builder lowering at the I-step that claims its construct:
-  - `check_match_desugar.vl` (4 functions, 16 sites) at I4 (`SSwitch`);
-  - the `recEq*` rows at I5;
-  - `voidRetRewrite`, `getterRewriteSites`, `synthInlineLitUnionDecls` and `ftBuildArmsAt` at I8;
-  - the stamp-only rows (`checkOptMemberNode`, `flatMemberFold`, `cexDeliver`,
+- **POST (12 overwrites, 19 functions)** retires into L1's builder at **I9**
+  (`ir-design-2026-11.md` §5.3), not at the I-step that first claims the construct.
+  - At I4 a desugared `match` is built as the if-chain the checker left, because `SSwitch` from the
+    source `match` moves bytes, and bytes may first move at I9.
+  - At I9 the desugar becomes the builder's own lowering: `check_match_desugar.vl` (4 functions, 16
+    sites), the `recEq*` rows, `voidRetRewrite`, `getterRewriteSites`, `synthInlineLitUnionDecls`
+    and `ftBuildArmsAt`.
+  - The stamp-only rows (`checkOptMemberNode`, `flatMemberFold`, `cexDeliver`,
     `inferRetAnnotate`, `castBoundDecide`, `tplHoleHandled`) become facts the builder reads, which
     `coercionAt` and the per-node types already carry.
   
@@ -106,21 +111,21 @@ identical on fixpoint seeds.
 
 | step | what | prerequisite | estimate (net compiler lines) |
 |---|---|---|---|
-| **6.1** | `lowerResolved(root)`: the 5 PRE drivers move under one function owned by `Resolved`, run once per module; `checkProgramAgain` stops re-running them | none | about −20 to +20. Same code, one driver; the idempotence re-runs go |
+| **6.1** | `lowerResolved(root)`: the 5 PRE drivers move under one function owned by `Resolved`, run once per module; `checkProgramAgain` stops re-running them | none | about −20 to +20. Same code, one driver; the idempotence re-runs go. It lands only at ≤0 net, otherwise it folds into 6.3 |
 | **6.2** | PRE's 18 overwrites become copy-on-write above `n1` | 6.1 | +40 to +80 (an ancestor-copy helper; each site takes a parent path) |
-| **6.3** | the debug assertion: refuse a write below `n1` after `lowerResolved`, counting first (not refusing) to measure the residue | 6.1 | +20 |
+| **6.3** | a ratchet: count the writes below `n1` after the PRE passes, field writes included, against a budget baseline that may only fall (like `scan-budget-baseline.json`). It becomes a refusal when the count reaches zero | none | +20 |
 | **6.4** | the between-pass pins become `CheckRun` facts read by the re-walk (13 functions) | step 3 (landed) | unmeasured; needs a per-function design |
 | **6.5** | the MID in-walk overwrites become parent-slot writes or builder facts (31 sites) | 6.3's residue count | unmeasured; per site |
-| **POST** | the 19 POST functions retire into L1's builder at I4, I5 and I8 | L1 | counted in L1's §7, not here |
-| **5 (L5)** | `arenaEpoch`, the edit log and the 26 epoch reads delete | 6.1–6.5, **and L1 I8** (emit_rewrite and mono still overwrite until then) | −150 to −300 (design §3) |
+| **POST** | the 19 POST functions retire into L1's builder at I9 | L1 I8 | counted in L1's §7, not here |
+| **5 (L5)** | `arenaEpoch`, the edit log and the 26 epoch reads delete | 6.1–6.5, **and L1 I9** (emit_rewrite overwrites until I8, mono and the POST rewrites until I9) | −150 to −300 (design §3) |
 
 - **Steps 6.1–6.3 are near zero or growth.** They buy the boundary and the instrument, not
   deletion.
-- **The deletion is L5 step 5's, and it cannot land before L1's I8.** So medium 6's own code work
+- **The deletion is L5 step 5's, and it cannot land before L1's I9.** So medium 6's own code work
   is small, and the large numbers sit behind L1.
-- **Recommended order:** 6.1 and 6.3 now. 6.3's counter measures the true residue, the field
-  writes included, which this note can only bound. Then 6.4 and 6.5 per family, in parallel with
-  L1's I1–I4. POST follows L1's schedule.
+- **Recommended order:** 6.3's ratchet first. It measures the true residue, field writes included,
+  which this note can only bound. 6.1 follows only if it nets ≤0. Then 6.4 and 6.5 per family,
+  beside L1's phase A. POST follows L1's I9.
 
 ## 4. Risks
 
@@ -133,13 +138,22 @@ identical on fixpoint seeds.
   is graded byte-identical on that premise. A PRE pass that is not actually idempotent shows up
   here as a fingerprint difference, and that difference is a finding.
 - **POST and the re-walk.** See §2: each POST move is graded on the corpus, not by bytes.
+- **Overlay spans and determinism** (L1's two requirements, §5). Every node 6.2 mints above `n1`
+  carries the span of the parse node it lowers. The lowering runs once per program before check,
+  so overlay ids are the same in armed and unarmed builds.
 
-## 5. Open with L1
+## 5. L1's answers
 
-Asked of the L1 lane, with no answer yet:
-1. Does phase A read any construct's pre-rewrite tree, and which I-step claims each POST function?
-2. Does copy-on-write above `n1` conflict with anything that keys on node index?
-3. Does the 6.3 assertion conflict with I0's instruments?
+1. **Phase A reads the post-rewrite tree for every construct (I1–I8).** No checker rewrite retires
+   before I9. L1 subsumes the POST class only at I9, and anything that freezes `Parsed` before I9
+   is medium 6's.
+2. **The overlay above `n1` does not conflict.** The IR keys on node indices only through
+   `ty(k, node)` and the `at` span back-pointer. There are two requirements:
+   - every overlay node carries a source span that maps into the original program;
+   - overlay ids are minted deterministically per program, which holds if the lowering runs once
+     per program, before check.
+3. **The ratchet does not conflict with I0.** The IR modules (`ir`, `ir_build`, `ir_verify`,
+   `ir_selftest`, `ir_lower`) make no arena write, and the IR gate keeps the check as a guard.
 
 The classification table (89 rows, with caller chains and file:line evidence) is reproduced by
 the inventory command in §1 plus the per-function reading recorded in the PR.
