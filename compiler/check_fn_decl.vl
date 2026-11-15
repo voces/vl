@@ -10,16 +10,20 @@ import {
 } from "./check_elab_cap"
 import {
   Block,
+  Call,
   FuncDecl,
   Ident,
   IfStmt,
   Node,
+  P,
   Param,
   RetStmt,
   TypeRef,
   annTsOf,
+  arenaReplaceNode,
   arenaSetNode,
   blockTailIsDead,
+  declHasExportKw,
   fnTpBoundOf,
   i32ToStr,
   nodeAt,
@@ -35,6 +39,7 @@ import {
 } from "./check_annot_resolve"
 import { i32ListHas } from "./listutil"
 import { collectRetValues } from "./check_nj_join"
+import { parenPeelIx } from "./check_places"
 import { assignableExpr, fsbRecheckFrom } from "./check_assignable"
 import {
   collapsedTy,
@@ -106,9 +111,11 @@ import {
   paramSolveProbeSet,
 } from "./check_exp_obs"
 import {
+  callFnDst,
   cbExpectedFor,
   cbExpectedRetFor,
   cbExpectedRetHeld,
+  lambdaBodyTail,
   seedExpected,
 } from "./check_expected"
 import {
@@ -228,7 +235,12 @@ import {
   prbEnter,
   prbLeave,
 } from "./check_rollback"
-import { declareDecl, scopeHideEnter, scopeHideLeave } from "./check_scopes"
+import {
+  declareDecl,
+  identDepthOf,
+  scopeHideEnter,
+  scopeHideLeave,
+} from "./check_scopes"
 import {
   inDeadArm,
   isValBindLambda,
@@ -1703,6 +1715,7 @@ function lamRetQueue(n: FuncDecl, fnIx: i32, ret: i32) {
 // Writes each queued lambda's contextual return as its return-annotation node, so the next check
 // reads its body against that type and every later reader sees its annotated twin. The count.
 export function lamRetApply(): i32 {
+  lamRetFromCalls()
   let k = 0
   let i = 0
   while i < lamRetQNode.length {
@@ -1730,6 +1743,120 @@ export function lamRetApply(): i32 {
   lamRetQNode = []
   lamRetQTy = []
   k
+}
+
+// Queues each lambda an un-annotated function returns where every use of that function is a call
+// delivered at one closed function type: that type's result is the lambda's contextual return,
+// which no other caller sees changed (D16331).
+function lamRetFromCalls() {
+  for c0 in callFnDst.keys() {
+    const ft = callFnDst[c0] ?? -1
+    const c = fvaAdaptedArg(c0)
+    const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+    if cn is Call && ft >= 0 && ft < T.tys.length {
+      const t = tyAt(ft)
+      const fe = nodeAt(cn.callFn)
+      if t is TyFunc && fe is Ident && lamCtxRetClosed(t.fnRet) {
+        const d = if identDepthOf(cn.callFn, fe.identName) == 0 { fnDeclIx[fe.identName] ?? -1 } else { -1 }
+        const wraps: i32[] = []
+        if d >= 0 && lamRetCallsAgree(d, fe.identName, ft, wraps) {
+          if lamRetQueueReturned(d, t.fnParamTypes.length, t.fnRet) {
+            // Built at the delivered result, each call is delivered as it is: no adapter.
+            for wr in wraps {
+              const inner = fvaAdaptedArg(wr)
+              const ic = nodeAt(inner)
+              if ic is Call {
+                arenaReplaceNode(wr, inner)
+                const orphan: Node = { nullKw: "null", pos: ic.pos }
+                arenaSetNode(inner, orphan)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// Whether every use of top-level function `d`, named `nm`, is a call delivered at `ft`, and `d`
+// infers its result and is not exported; `wraps` gets the adapters over those calls.
+function lamRetCallsAgree(d: i32, nm: string, ft: i32, wraps: i32[]): boolean {
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) || fd.fnRet >= 0 || declHasExportKw(d) { return false }
+  // A call the delivery's adapter wraps is delivered where the adapter is.
+  const wrapOf: {[i32]: i32} = Map()
+  let w = 0
+  while w < P.nodes.length {
+    const a = fvaAdaptedArg(w)
+    if a != w { wrapOf[a] = w }
+    w = w + 1
+  }
+  let calls = 0
+  let uses = 0
+  let i = 0
+  while i < P.nodes.length {
+    const n = nodeAt(i)
+    if n is Ident && n.identName == nm && identDepthOf(i, nm) == 0 {
+      uses = uses + 1
+    }
+    if n is Call {
+      const f = nodeAt(n.callFn)
+      if f is Ident && f.identName == nm && identDepthOf(n.callFn, nm) == 0 {
+        const wi = wrapOf[i] ?? -1
+        const ct = callFnDst[if wi >= 0 { wi } else { i }] ?? -1
+        if ct < 0 || !tySame(ct, ft) { return false }
+        if wi >= 0 { wraps.push(wi) }
+        calls = calls + 1
+      }
+    }
+    i = i + 1
+  }
+  calls > 0 && calls == uses
+}
+
+// The value a function-value adapter called in place reads (`(($fv…) => …)(v)`, its parameter
+// spelled `$fv`), `c` for any other node.
+function fvaAdaptedArg(c: i32): i32 {
+  const cn = nodeAt(c)
+  if !(cn is Call) || cn.callArgs.length != 1 { return c }
+  const f = nodeAt(cn.callFn)
+  if !(f is FuncDecl) || f.fnParams.length != 1 { return c }
+  const p = nodeAt(f.fnParams[0])
+  if p is Param && p.parName.length > 3 && p.parName.slice(0, 3) == "$fv" {
+    return parenPeelIx(cn.callArgs[0])
+  }
+  c
+}
+
+// Queues every value `d` returns at contextual return `er`, when each is an un-annotated lambda
+// taking `arity` parameters; none when one is anything else. Whether it queued any.
+function lamRetQueueReturned(d: i32, arity: i32, er: i32): boolean {
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) { return false }
+  const vs: i32[] = []
+  collectRetValues(fd.fnBody, vs)
+  // A lambda as the body's tail is a returned value the walk above does not enter.
+  const tl = lambdaBodyTail(fd.fnBody)
+  if tl >= 0 && nodeAt(parenPeelIx(tl)) is FuncDecl && !i32ListHas(vs, tl) {
+    vs.push(tl)
+  }
+  const ls: i32[] = []
+  for v in vs {
+    const l = parenPeelIx(v)
+    const ln = if l >= 0 { nodeAt(l) } else { null }
+    if !(ln is FuncDecl) || ln.fnName != "" || ln.fnParams.length != arity {
+      return false
+    }
+    if ln.fnRet < 0 { ls.push(l) }
+  }
+  for l in ls {
+    if !i32ListHas(lamRetQNode, l) {
+      lamRetQNode.push(l)
+      lamRetQTy.push(er)
+    }
+  }
+  ls.length > 0
 }
 
 // Whether `t`, a lambda's contextual return, is a closed type that can stand in for its annotation:
