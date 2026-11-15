@@ -464,6 +464,7 @@ import {
   LBK_STR_LIST,
   LBK_U8_LIST,
   LBK_UNION,
+  LBK_V128_LIST,
   ListKind,
   PK_I16,
   PK_I8,
@@ -530,6 +531,7 @@ import {
   fRetKind,
   fRetStructIdx,
   fRetVoid,
+  fa128Ty,
   fa32Ty,
   fa32TypeIdx,
   fa64Ty,
@@ -543,6 +545,7 @@ import {
   fitShRecv,
   fitShSlot,
   fitShTy,
+  fl128Ty,
   fl32Ty,
   fl64Ty,
   fnDispNames,
@@ -629,6 +632,7 @@ import {
   helpMapCompactFn,
   helpMapEntryFn,
   helpMapEntryI32Fn,
+  helpMapGetFn,
   helpMapProbeFn,
   helpMapProbeI32Fn,
   helpMapProbeI64Fn,
@@ -765,6 +769,7 @@ import {
   unNames,
   unTyIx,
   unionSinkBase,
+  v128PushScratchBase,
   variantHeap,
   variantReboxSlot,
   variantRowOf,
@@ -898,6 +903,7 @@ import {
   mapTypeIdxOf,
   mvValElemHeapOf,
   mvValsBackOf,
+  mvValsWrapOf,
   nulScalarListWrapHeap,
   pkBackAt,
   pkWrapAt,
@@ -1802,22 +1808,6 @@ export function capCacheBuild() {
   return 0
 }
 
-// The value-column wrapper struct for map slot `slot`: a scalar mv kind (f64/i64/f32)
-// resolves to that scalar's distinct-backing list wrapper, a negative slot to the base
-// i32 wrapper, and anything else to its interned ref-list wrapper (`rlWrapIdx`).
-export function mvValsWrapOf(slot: i32) {
-  if slot < 0 { return lTy() }
-  if mvValKindAt(slot) == "str" { return mkListTy() }
-  if mvValKindAt(slot) == "f64" { return fl64Ty() }
-  if mvValKindAt(slot) == "f32" { return fl32Ty() }
-  if mvValKindAt(slot) == "i64" { return il64Ty() }
-  if mvValRep[slot].mrSlot < 0 || mvValRep[slot].mrSlot >= rlWrapIdx.length {
-    emitFail("emitProgram: map value slot has no resolved vals wrapper")
-    return 0
-  }
-  return rlWrapIdx[mvValRep[slot].mrSlot]
-}
-
 // The scalar element kind (`"f64"`/`"i64"`/`"f32"`) of an mv map-value slot whose value
 // is a non-i32 scalar, else null (a ref value rides the nullable valStash instead). The
 // chokepoint the map get/set/push consult to branch scalar-store vs ref-store.
@@ -1840,11 +1830,12 @@ function scalarListKindUnlisted(fallback: i32): i32 {
 }
 
 // The wrapper struct heap type for a scalar element kind.
-function scalarListWrap(elemKind: VKind, row: i32) {
+export function scalarListWrap(elemKind: VKind, row: i32) {
   if elemKind == "u8list" { return pkWrapAt(row) }
   if elemKind == "f64" { return fl64Ty() }
   if elemKind == "i64" { return il64Ty() }
   if elemKind == "f32" { return fl32Ty() }
+  if elemKind == "v128" { return fl128Ty() }
   // The string list's wrapper is the map's keys-list type, which any `string[]` shares.
   if elemKind == "str" { return mkListTy() }
   if elemKind == "i32" { return lTy() }
@@ -1852,11 +1843,12 @@ function scalarListWrap(elemKind: VKind, row: i32) {
 }
 
 // The backing `(array (mut <elem>))` heap type for a scalar element kind.
-function scalarListBack(elemKind: VKind, row: i32) {
+export function scalarListBack(elemKind: VKind, row: i32) {
   if elemKind == "u8list" { return pkBackAt(row) }
   if elemKind == "f64" { return fa64Ty() }
   if elemKind == "i64" { return ia64Ty() }
   if elemKind == "f32" { return fa32Ty() }
+  if elemKind == "v128" { return fa128Ty() }
   if elemKind == "str" { return mkArrTy() }
   if elemKind == "i32" { return aTy() }
   return scalarListKindUnlisted(aTy())
@@ -1878,6 +1870,7 @@ function scalarListBlocktype(elemKind: VKind) {
   if elemKind == "f64" { return 124 }
   if elemKind == "i64" { return 126 }
   if elemKind == "f32" { return 125 }
+  if elemKind == "v128" { return 123 }
   if elemKind == "i32" { return 127 }
   return scalarListKindUnlisted(127)
 }
@@ -1885,7 +1878,7 @@ function scalarListBlocktype(elemKind: VKind) {
 // Whether the module-global list types for a scalar element kind are collected — the
 // loud-fail guard every list op shares. An unlisted kind answers false, which is the
 // caller's own loud refusal rather than a silent read at the i32 list's types.
-function scalarListUsed(elemKind: VKind) {
+export function scalarListUsed(elemKind: VKind) {
   match elemKind {
     "u8list" => {
       return true
@@ -1896,8 +1889,8 @@ function scalarListUsed(elemKind: VKind) {
     "i64" => {
       return true
     }
-    // The f32 pair mints on first read.
-    "f32" => {
+    // The f32 and v128 pairs mint on first read.
+    "f32" | "v128" => {
       return true
     }
     // The string and i32 lists mint on first read too.
@@ -1908,7 +1901,7 @@ function scalarListUsed(elemKind: VKind) {
       return true
     }
     // No other kind is a scalar list element, so its list types are never collected.
-    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {}
+    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {}
   }
   return false
 }
@@ -2004,7 +1997,7 @@ function emitOmittedFieldNull(si: i32, fi: i32) {
       }
       return -1
     }
-    "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" => {
+    "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => {
       return -1
     }
   }
@@ -2119,7 +2112,7 @@ function emitStructFieldValueUnder(si: i32, fi: i32, valIx: i32, fnIx: i32) {
         return -1
       }
     }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       // An atom or atom-array field lowers its members as interned ids; the litunion context
       // keeps each string-lexeme element from building a string list.
       if emitExpr(valIx, fnIx) < 0 { return -1 }
@@ -2798,7 +2791,7 @@ function emitVariantFieldValueUnder(vi: i32, fj: i32, valIx: i32, fnIx: i32) {
         return -1
       }
     }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       if emitExpr(valIx, fnIx) < 0 { return -1 }
     }
   }
@@ -2992,7 +2985,7 @@ function emitScalarFieldStoreVal(valIx: i32, fnIx: i32, k: VKind | null) {
       if exprIsLitAtom(valIx, fnIx) { return emitStrValue(valIx, fnIx) }
       return emitExpr(valIx, fnIx)
     }
-    "i32" | "v128" | "struct" | "list" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       return emitExpr(valIx, fnIx)
     }
   }
@@ -5807,7 +5800,7 @@ function emitListLenOnStack(kind: ListKind, slot: i32) {
     fbStructGet(lTy(), 1)
     return 0
   }
-  const lek: VKind = if kind == "f64list" { "f64" } else if kind == "i64list" { "i64" } else if kind == "f32list" { "f32" } else { "u8list" }
+  const lek: VKind = numListElemOf(kind) ?? "u8list"
   const sv = svDstOfKind(lek)
   if sv >= 0 {
     const lwL = listFitSlot(kind, slot, 11)
@@ -7552,7 +7545,7 @@ function optChainLeafNulDisc(si: i32, fi: i32): i32 {
     "union" => {
       return 4
     }
-    "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" => {
+    "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => {
       return 0
     }
   }
@@ -7659,6 +7652,9 @@ function optChainLeafRefHeap(si: i32, fi: i32): i32 {
     }
     "f32list" | "nulf32list" => {
       return fl32Ty()
+    }
+    "v128list" => {
+      return fl128Ty()
     }
     "u8list" | "nulu8list" => {
       if si < 0 || si >= sFieldStart.length { return -1 }
@@ -10105,7 +10101,7 @@ function emitUnionIfValueLink(
     const noElse = s.ifElse < 0
     const condStart = wLen()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
-    const sg = staticIsGuard(s.ifCond, condStart)
+    const sg = staticValueIfCond(s.ifCond, condStart)
     fbOpenIf()             // 0x04 if
     fbValtype("union", -1) // result blocktype: the union box `(ref $uBox)`
     let rcT = 0
@@ -10396,7 +10392,7 @@ function armDestHeapOf(kind: VKind, idx: i32): i32 {
       if idx < sHeapIdx.length { return sHeapIdx[idx] }
       return -1
     }
-    "i32" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "v128" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
+    "i32" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "v128" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
       // No heap type of its own at an arm destination: a scalar, a list wrapper, a map
       // or a closure reaches its rep through its own writer, never this table pair.
       return -1
@@ -10501,7 +10497,7 @@ function emitVariantIfValueLink(vi: i32, ifIx: i32, fnIx: i32, open: i32[]) {
     const noElse = s.ifElse < 0
     const condStart = wLen()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
-    const sg = staticIsGuard(s.ifCond, condStart)
+    const sg = staticValueIfCond(s.ifCond, condStart)
     fbOpenIf() // 0x04 if
     if noElse {
       fbValtypeNullable("variant", vi) // `(ref null $(variantHeap(vi)))`
@@ -12113,7 +12109,7 @@ function fbIfForOptLeaf(k: VKind) {
     "str" => {
       return fbIfRef(sTy()) // string header ref
     }
-    "i32" | "v128" | "struct" | "list" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       return fbIf(127) // i32 / boolean
     }
   }
@@ -12132,7 +12128,7 @@ function emitOptLeafDefault(dIx: i32, k: VKind, fnIx: i32) {
     "f32" => {
       return emitExprAsF32(dIx, fnIx)
     }
-    "i32" | "v128" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       return emitExpr(dIx, fnIx)
     }
   }
@@ -13220,6 +13216,9 @@ function spreadWrapIdx(k: ListKind, row: i32) {
     "f32list" => {
       return fl32Ty()
     }
+    "v128list" => {
+      return fl128Ty()
+    }
     "u8list" => {
       return pkWrapAt(row)
     }
@@ -13248,6 +13247,9 @@ function spreadBackIdx(k: ListKind, row: i32) {
     }
     "f32list" => {
       return fa32Ty()
+    }
+    "v128list" => {
+      return fa128Ty()
     }
     "u8list" => {
       return pkBackAt(row)
@@ -13717,6 +13719,9 @@ function listKindElemKind(k: ListKind): VKind {
     "f32list" => {
       return "f32"
     }
+    "v128list" => {
+      return "v128"
+    }
     "list" => {
       return "i32"
     }
@@ -13904,6 +13909,33 @@ function emitArrF32(elems: i32[], fnIx: i32) {
   fbI32Const(elems.length) // len
   fbI32Const(elems.length) // cap
   fbStructNew(fl32Ty()) // the f32-list wrapper
+  return 0
+}
+
+// The v128-list arm of `emitArrUnder`: each element is a vector already, so it lowers as itself.
+function emitArrV128(elems: i32[], fnIx: i32) {
+  let dst = -1
+  let coff = 0
+  if elems.length > NEW_FIXED_MAX {
+    dst = arrLitChunkStart("v128list", 0, fa128Ty(), elems.length, false)
+  }
+  let i = 0
+  while i < elems.length {
+    if emitExpr(elems[i], fnIx) < 0 { return -1 }
+    i = i + 1
+    if dst >= 0 {
+      coff = arrLitChunkFlush(dst, fa128Ty(), coff, i, elems.length)
+    }
+  }
+  if dst >= 0 {
+    fbLocalGet(dst)
+    fbRefAsNonNull()
+  } else {
+    fbBacking(fa128Ty(), elems.length)
+  }
+  fbI32Const(elems.length)
+  fbI32Const(elems.length)
+  fbStructNew(fl128Ty())
   return 0
 }
 
@@ -14327,6 +14359,15 @@ function emitArrUnder(arrIx: i32, fnIx: i32, lb: ListBuild) {
         }
         return emitArrUnder(arrIx, fnIx, hb)
       }
+    }
+    // A vector literal is a v128 list whatever its pair says, since no other list holds one.
+    const vty = nodeTyIxOf(arrIx)
+    const vat = if vty >= 0 && vty < T.tys.length { tyAt(vty) } else { null }
+    if (
+      lb.lbKind == LBK_V128_LIST
+      || (vat is TyArray && primNameOf(tyElemOf(vat)) == "v128")
+    ) {
+      return emitArrV128(elems, fnIx)
     }
     // Which (backing, wrapper) pair the literal builds — `lb.lbKind` 1/2 a ref backing, 3 a
     // string one, 4 f64, 6 i64, 7 f32, anything else the default `$lTypeIdx` i32 list. Two signals
@@ -14915,8 +14956,12 @@ function defExprNullable(ix: i32) {
 // reads a map through `?? -1`, so this is the primary get. `rk` is the `??`'s own atom kind
 // (-1 none): a scalar value it is wider than is read and widened to it (D10091).
 function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
-  if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
   const wvk = mapRecvScalarKindInst(recvIx, fnIx)
+  if !(wvk >= 0 && coalWidens(wvk, rk)) {
+    const miss = mapGetOrHelperMiss(recvIx, defIx, fnIx)
+    if miss.length == 1 { return emitMapGetCall(recvIx, keyIx, fnIx, miss[0]) }
+  }
+  if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
   if wvk >= 0 && coalWidens(wvk, rk) && !defExprNullable(defIx) {
     pushMapScr(5)                // entry
     fbIf(valBlockTypeOfKind(rk)) // if (entry != 0 → found), the result's blocktype
@@ -15210,8 +15255,80 @@ function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
 // `0` when absent. The checker never uses a bare map get (always `?? -1`); provided for
 // completeness so `m[k]` in value position is total (0 default).
 function emitMapGet(recvIx: i32, keyIx: i32, fnIx: i32) {
+  if mapGetHelperShape(recvIx, fnIx) != 0 {
+    return emitMapGetCall(recvIx, keyIx, fnIx, mapGetMissOf(recvIx, fnIx))
+  }
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
   return emitMapGetTail(recvIx, fnIx)
+}
+
+// `recvIx[keyIx]` through `__map_get_<row>__`, `miss` on a miss; `mapGetHelperShape` is nonzero.
+function emitMapGetCall(recvIx: i32, keyIx: i32, fnIx: i32, miss: i32) {
+  const sh = mapGetHelperShape(recvIx, fnIx)
+  const strKey = mapShapeKeyKind(sh) == MAP_KEY_STR
+  // The helper's own calls are minted here, while the tail rows are still open.
+  if strKey {
+    helpStrHashFn()
+    helpStrEqFn()
+  }
+  const fi = helpMapGetFn(sh, miss, strKey)
+  if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
+  return fbCall(fi)
+}
+
+// `[d]` when `recvIx[k] ?? defIx` can read through `__map_get_<row>__` with `d` as its miss: a
+// mono-valued map with no null sentinel, and a default that lowers to one `i32.const d`. Else [].
+function mapGetOrHelperMiss(recvIx: i32, defIx: i32, fnIx: i32): i32[] {
+  if mapGetHelperShape(recvIx, fnIx) == 0 { return [] }
+  const mt = mapRecvTyIn(recvIx, fnIx)
+  if (
+    mapTyValIsNulLitUnion(mt)
+    || mapTyValIsNulBool(mt)
+    || mapTyValIsNullUnit(mt)
+  ) {
+    return []
+  }
+  if mapTyValLitUnionTexts(mt).length > 0 { return [] }
+  const d = nodeAt(unwrapParen(defIx))
+  let lit = d is NumLit
+  if d is Unary { lit = nodeAt(unwrapParen(d.unArg)) is NumLit }
+  if !lit { return [] }
+  const ins: u8[] = []
+  const prev = wTarget(ins)
+  const rc = emitMonoMapDefault(recvIx, defIx, fnIx)
+  wTarget(prev)
+  if rc < 0 || !isOneConstIns(ins) || (ins[0] as i32) != 0x41 { return [] }
+  return [slebI32At(ins, 1)]
+}
+
+// The signed LEB128 i32 at `at` in `b`.
+function slebI32At(b: u8[], at: i32): i32 {
+  let v = 0
+  let sh = 0
+  let i = at
+  while i < b.length {
+    const x = b[i] as i32
+    v = v | ((x & 127) << sh)
+    sh = sh + 7
+    i = i + 1
+    if (x & 128) == 0 {
+      if sh < 32 && (x & 64) != 0 { v = v | (0 - (1 << sh)) }
+      return v
+    }
+  }
+  return v
+}
+
+// The mono-valued map shape a plain build reads `recvIx[k]` through `__map_get_<row>__` with, or
+// 0 to probe at the site: `-O` keeps the read inline for binaryen, an i64 key and a valued map
+// (an mv slot, `>= 0`) keep their own reads.
+function mapGetHelperShape(recvIx: i32, fnIx: i32): i32 {
+  if gOptimized != 0 || !exprMap(recvIx, fnIx) { return 0 }
+  const sh0 = mapShapeOfExpr(recvIx, fnIx)
+  if sh0 == -3 { return 0 }
+  const sh = mapShapeFoldSet(sh0)
+  if sh >= 0 || mapShapeKeyKind(sh) == MAP_KEY_I64 { return 0 }
+  return sh
 }
 
 // The value half of `emitMapGet`, after `emitMapPrep`: the stored value on a hit, the rep's
@@ -15251,29 +15368,30 @@ function emitMapGetTail(recvIx: i32, fnIx: i32) {
   fbI32Const(1)
   fbI32Bin(107) // i32.sub (entry - 1)
   fbArrayGet(aTy())
-  fbElse()      // else — a miss reads as the rep's empty value. For a NICHE-BEARING
-  // A niche-bearing value map (`K`/`K | null` atoms, `boolean`/`boolean | null`) reads
-  // a miss as its sentinel (`-1` litunion, `2` boolean) at both the nullable and the
-  // non-nullable spelling — yielding plain `0` there would collide with a real member
-  // (atom id 0, or `false`) and make `m[missing] == <that value>` silently true.
+  fbElse()      // else — a miss reads as the rep's empty value (`mapGetMissOf`)
+  fbI32Const(mapGetMissOf(recvIx, fnIx))
+  fbEnd()       // end
+  return 0
+}
+
+// The i32 a mono-valued map read `recvIx[k]` yields on a miss. A niche-bearing value map (`K`/`K |
+// null` atoms, `boolean`/`boolean | null`) reads its sentinel (`-1` litunion, `2` boolean), since a
+// plain `0` would collide with a real member (atom id 0, or `false`); any other value reads 0.
+function mapGetMissOf(recvIx: i32, fnIx: i32): i32 {
   let gtMt = mapRecvTyIn(recvIx, fnIx)
   // A type parameter's value takes its sentinel from the instance's binding of it (D10360).
   if gtMt >= 0 && tyHasTyVar(gtMt) {
     const inst = nodeTyInOf(unwrapParen(recvIx), fnIx)
     if inst >= 0 && inst < T.tys.length && tyAt(inst) is TyMap { gtMt = inst }
   }
-  if mapTyValIsNulLitUnion(gtMt) || mapTyValIsLitUnion(gtMt) {
-    fbI32Const(0 - 1)
-  } else if (
+  if mapTyValIsNulLitUnion(gtMt) || mapTyValIsLitUnion(gtMt) { return 0 - 1 }
+  if (
     mapTyValIsNulBool(gtMt)
     || mapTyValIsBool(gtMt)
     || mapTyValIsNullUnit(gtMt)
   ) {
-    fbI32Const(2)
-  } else {
-    fbI32Const(0) // i32.const 0
+    return 2
   }
-  fbEnd() // end
   return 0
 }
 
@@ -17017,7 +17135,7 @@ function arrLitDataPut(ins: u8[], form: i32, out: u8[]): i32 {
 // index] on entry, leaves [backing, i]. One unsigned compare covers negative and past-len, and
 // a failing one traps (`emitListIdxTrap`) instead of reading the zero-init slack `.push` leaves
 // past `len`. A list whose backing this module never typed keeps the older `select` to -1.
-function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
+export function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
   const back = listBackOfWrap(lTy)
   if back >= 0 {
     fbLocalSet(listIdxScratchBase)
@@ -17161,7 +17279,7 @@ function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
 // identifier matching the row's binding, the row must be live, and its rep must match
 // the arm asking. The rep check is the backstop that makes a classifier disagreement
 // between the prologue and the access decline, rather than read a wrongly-typed local.
-function liveHoistRow(exprIx: i32, kind: ListKind, slot: i32) {
+export function liveHoistRow(exprIx: i32, kind: ListKind, slot: i32) {
   const d = hoistPathDecl(exprIx)
   if d < 0 { return 0 - 1 }
   const p = hoistPathProp(exprIx)
@@ -17183,7 +17301,7 @@ function liveHoistRow(exprIx: i32, kind: ListKind, slot: i32) {
 
 // The declaration a hoist row caches the receiver at `ix` under, with `hoistPathProp`'s field:
 // a bare identifier's, or the root identifier's of a field `b.xs`; -1 for any other receiver.
-function hoistPathDecl(ix: i32) {
+export function hoistPathDecl(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 - 1 }
   const e = nodeAt(ix)
   if e is Member { return hoistRootDecl(e.memObj) }
@@ -17191,7 +17309,7 @@ function hoistPathDecl(ix: i32) {
 }
 
 // The field a hoist row caches at `ix`: `xs` for `b.xs`, "" for the binding itself.
-function hoistPathProp(ix: i32): string {
+export function hoistPathProp(ix: i32): string {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const e = nodeAt(ix)
   if e is Member { return e.memProp }
@@ -17907,9 +18025,8 @@ function hoistWrapTyOfRow(row: i32) {
   const k = lhKind[row]
   if k == "reflist" { return rlWrapIdx[lhSlot[row]] }
   if k == "strlist" { return mkListTy() }
-  if k == "f64list" { return scalarListWrap("f64", 0) }
-  if k == "i64list" { return scalarListWrap("i64", 0) }
-  if k == "f32list" { return scalarListWrap("f32", 0) }
+  const nek = numListElemOf(k)
+  if nek != null { return scalarListWrap(nek, 0) }
   // The PACKED byte list's frame kind is `"u8list"` (`listIdxKindOf`), and its wrapper is
   // `$bl8TypeIdx` — the i32 fall-through below would name the 4-byte list's wrapper for a
   // row whose local is typed `(ref null $bl8TypeIdx)`.
@@ -18120,12 +18237,17 @@ function loopHoistClose(n: i32) {
   return 0
 }
 
+// A shared cell's read `c[0]` at `idxIx` whose binding's name is narrowed to `null` there.
+export function idxCellReadIsNull(idxIx: i32, fnIx: i32): boolean {
+  return cboxReadTy.has(idxIx) && isNullTy(readNarrowedTyAt(idxIx, fnIx))
+}
+
 function emitIndex(idxIx: i32, fnIx: i32) {
   const nd = nodeAt(idxIx)
   if nd is Index {
     // A shared cell's read is its binding's name read respelled, so one narrowed to `null`
     // delivers that null as `emitIdentNode` does (D15951).
-    if cboxReadTy.has(idxIx) && isNullTy(readNarrowedTyAt(idxIx, fnIx)) {
+    if idxCellReadIsNull(idxIx, fnIx) {
       if emitNullReadAtDst(idxIx, fnIx) { return 0 }
     }
     const tlm = twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx)
@@ -18382,7 +18504,11 @@ function emitArrLen(memIx: i32, fnIx: i32) {
     const lek = scalarListElemKind(m.memObj, fnIx)
     if (
       lek != null
-      && (lek == "f64" || lek == "i64" || lek == "f32" || lek == "u8list")
+      && (lek == "f64"
+        || lek == "i64"
+        || lek == "f32"
+        || lek == "v128"
+        || lek == "u8list")
     ) {
       const lenSv = svDstOfKind(lek)
       if lenSv >= 0 && lek != null {
@@ -22639,7 +22765,7 @@ function emitIfExprRefLink(
     const noElse = s.ifElse < 0
     const condStart = wLen()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
-    const sg = staticIsGuard(s.ifCond, condStart)
+    const sg = staticValueIfCond(s.ifCond, condStart)
     fbOpenIf() // 0x04 if
     // A join that can yield `null` (`ifLinkYieldsNull`, from this link or one enclosing it)
     // needs a nullable blocktype, else a `(ref null $ht)` arm mismatches the non-null result.
@@ -22867,7 +22993,7 @@ function emitIfExprAsLink(ifIx: i32, fnIx: i32, kind: i32, open: i32[]) {
     }
     const condStart = wLen()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
-    const sg = staticIsGuard(s.ifCond, condStart)
+    const sg = staticValueIfCond(s.ifCond, condStart)
     fbIf(kind) // 0x04 if, <kind> result blocktype
     let rcT = 0
     if sg == 0 {
@@ -23511,6 +23637,24 @@ export function emitExprAsKind(exprIx: i32, k: i32, fnIx: i32) {
   if k == 4 { return emitExprAsF64(exprIx, fnIx) }
   if k == 5 { return emitExprAsF32(exprIx, fnIx) }
   return emitExpr(exprIx, fnIx)
+}
+
+// `emitExprAsKind` at a list element kind: a scalar list's value widens to its element.
+function emitExprAsElem(exprIx: i32, ek: VKind, fnIx: i32) {
+  if ek == "i64" { return emitExprAsI64(exprIx, fnIx) }
+  if ek == "f64" { return emitExprAsF64(exprIx, fnIx) }
+  if ek == "f32" { return emitExprAsF32(exprIx, fnIx) }
+  return emitExpr(exprIx, fnIx)
+}
+
+// The element kind of a list of rep `k` whose element is a non-i32 scalar (`f64`, `i64`,
+// `f32`), the lists whose ops take their own wrapper, backing and value width; null otherwise.
+function numListElemOf(k: VKind | null): VKind | null {
+  if k == null { return null }
+  if k == "f64list" || k == "i64list" || k == "f32list" || k == "v128list" {
+    return scalarListElemOfListKind(k)
+  }
+  return null
 }
 
 // ── the numeric exact-or-fail cast (D1041) ────────────────────────────────────
@@ -26105,8 +26249,14 @@ function emitCall(callIx: i32, fnIx: i32) {
   if cloRef != "" { return emitFail(cloRef) }
   const r = emitCallCore(callIx, fnIx)
   if r < 0 { return r }
-  if callIsNever(callIx) && !callIsTrapIntrinsic(callIx) { fbUnreachable() }
+  if callEndsNever(callIx) { fbUnreachable() }
   return r
+}
+
+// Whether call `callIx` is followed by `unreachable`: its type is `never` and it is no
+// `__trap__`, which is its own `unreachable`.
+export function callEndsNever(callIx: i32): boolean {
+  return callIsNever(callIx) && !callIsTrapIntrinsic(callIx)
 }
 
 // The tagged set call `ix` goes through in function `fnIx`: the one its callee carries there,
@@ -27092,7 +27242,7 @@ function emitNonNullParamRecover(pk: VKind | null, argIx: i32, fnIx: i32) {
     "struct" | "variant" => {
       if exprNullableRecord(argIx, fnIx) { fbRefAsNonNull() }
     }
-    "list" | "strlist" | "f64list" | "i64list" | "f32list" | "reflist" | "map" => {
+    "list" | "strlist" | "f64list" | "i64list" | "f32list" | "v128list" | "reflist" | "map" => {
       if (
         exprNullableList(argIx, fnIx)
         || exprNulScalarListKind(argIx, fnIx) != null
@@ -27439,6 +27589,17 @@ function emitCallRefAt(
   // the concrete `$fnsig` (the engine signature-checks the callee against it).
   let sig = -1
   if ckey != "" { sig = cloSigTypeIdxAt(cloSigPosOfKey(ckey)) }
+  // The arity type takes `i32` in every slot, and an argument the key coerced wider has no
+  // conversion into one: the closure is built at another of the value's signatures (D16531).
+  let wi = 0
+  while sig < 0 && wi < args.length {
+    if sigParamCoerceKind(ckey, wi) != null {
+      return emitFail(
+        "emitProgram: a function value is called at two signatures, and the closure it holds was built for one: this call passes a wider number than its `i32` parameter",
+      )
+    }
+    wi = wi + 1
+  }
   if sig < 0 && !cloCallArityFallbackUnsound(callIx, fnIx) {
     sig = fnSigIdxForArity(args.length)
   }
@@ -28005,9 +28166,8 @@ function emitAssignIdent(binIx: i32, fnIx: i32, a: BinExpr, lhsIx: i32) {
 type IdxStore = {
   isRef: boolean,
   isStr: boolean,
-  isF64: boolean,
-  isI64: boolean,
-  isF32: boolean,
+  // A non-i32 scalar element's kind, read off the list's rep; null for every other list.
+  sk: VKind | null,
   isU8: boolean,
   lTy: i32,
   aTy: i32,
@@ -28054,18 +28214,10 @@ function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
     st.lTy = mkListTy()
     st.aTy = mkArrTy()
     st.mfKind = "strlist"
-  } else if st.isF64 {
-    st.lTy = fl64Ty()
-    st.aTy = fa64Ty()
-    st.mfKind = "f64list"
-  } else if st.isI64 {
-    st.lTy = il64Ty()
-    st.aTy = ia64Ty()
-    st.mfKind = "i64list"
-  } else if st.isF32 {
-    st.lTy = fl32Ty()
-    st.aTy = fa32Ty()
-    st.mfKind = "f32list"
+  } else if st.sk != null {
+    st.lTy = scalarListWrap(st.sk, 0)
+    st.aTy = scalarListBack(st.sk, 0)
+    st.mfKind = listIdxKindOf(st.sk)
   } else if st.isU8 {
     // a `u8[]` store: the same unwrap + `array.set` spine over the packed backing. The
     // value takes the plain i32 path below — a `u8` element value is an i32, and
@@ -28101,14 +28253,10 @@ function emitIdxStoreValue(
     // A nested-list row store: the RHS builds as the INNER list (inert for a
     // non-literal RHS — an ident/call emits unchanged).
     if emitExpr(a.binRight, fnIx) < 0 { return -1 }
-  } else if st.isF64 {
+  } else if st.sk != null {
     // The stored value re-encodes at the element valtype (a bare-int / int-literal value
     // widens into the f64 slot, exactly as a binding / push does).
-    if emitExprAsF64(a.binRight, fnIx) < 0 { return -1 }
-  } else if st.isI64 {
-    if emitExprAsI64(a.binRight, fnIx) < 0 { return -1 }
-  } else if st.isF32 {
-    if emitExprAsF32(a.binRight, fnIx) < 0 { return -1 }
+    if emitExprAsElem(a.binRight, st.sk, fnIx) < 0 { return -1 }
   } else if arrElemLitUnionTy(arrIx, fnIx) >= 0 {
     // `xs[i] = "a"` over a literal-union array: the member RHS lowers as its atom id —
     // the store half of the boundary `exprIsLitAtom`'s Index arm reads. Without it a
@@ -28177,18 +28325,14 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
   const isStr = exprStringArray(target.idxArr, fnIx)
   // the scalar non-i32 lists: the same unwrap+`array.set` spine over their own
   // wrapper/backing, with the value coerced to the element valtype.
-  const isF64 = exprF64Array(target.idxArr, fnIx)
-  const isI64 = exprI64Array(target.idxArr, fnIx)
-  const isF32 = exprF32Array(target.idxArr, fnIx)
+  const sk = numListElemOf(exprListRep(target.idxArr, fnIx))
   // the packed byte list — an i32-element list with a one-byte backing, the one rep
   // the `else` i32 fall-through below would otherwise silently claim.
   const isU8 = exprU8Array(target.idxArr, fnIx)
   const st: IdxStore = {
     isRef: isRef,
     isStr: isStr,
-    isF64: isF64,
-    isI64: isI64,
-    isF32: isF32,
+    sk: sk,
     isU8: isU8,
     lTy: -1,
     aTy: -1,
@@ -28321,7 +28465,7 @@ function emitStructFieldStoreValue(
         return -1
       }
     }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       // A `K | null` niche field takes a member as its atom id and `null` as -1.
       if emitExpr(rhs, fnIx) < 0 { return -1 }
     }
@@ -28439,10 +28583,13 @@ function asgParkField(k: VKind | null, owner: i32) {
     "f32" => {
       lk = "f32list"
     }
+    "v128" => {
+      lk = "v128list"
+    }
     "str" => {
       lk = "strlist"
     }
-    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" | "u8list" => {
+    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
       return asgParkNone()
     }
   }
@@ -28760,9 +28907,7 @@ function emitPush(callIx: i32, fnIx: i32, wantValue: boolean) {
       // field receiver only needs its wrapper ref materialized into `recvRef`.
       const isRef = exprRefArray(callee.memObj, fnIx)
       const isStr = exprStringArray(callee.memObj, fnIx)
-      const isF64 = exprF64Array(callee.memObj, fnIx)
-      const isI64 = exprI64Array(callee.memObj, fnIx)
-      const isF32 = exprF32Array(callee.memObj, fnIx)
+      const sk = numListElemOf(exprListRep(callee.memObj, fnIx))
       const isU8 = exprU8Array(callee.memObj, fnIx)
       // a literal-union array push (`xs.push("a")` over `xs: K[]`) rides the i32-list
       // spine, but the pushed member literal must lower as its atom id — seeded through
@@ -28783,18 +28928,14 @@ function emitPush(callIx: i32, fnIx: i32, wantValue: boolean) {
       if (
         !isRef
         && !isStr
-        && !isF64
-        && !isI64
-        && !isF32
+        && sk == null
         && !isU8
         && !exprArray(callee.memObj, fnIx)
       ) {
         return emitFail("emitProgram: .push receiver is not a list")
       }
       const pv: PushValKinds = {
-        isF64: isF64,
-        isI64: isI64,
-        isF32: isF32,
+        sk: sk,
         pushNestSlot: -1,
         isLitArr: isLitArr,
         isNbArr: isNbArr,
@@ -28880,21 +29021,12 @@ function pushSlotOf(
     ps.base = strPushScratchBase
     // A `(string | null)[]` keeps its nullable slot and stays `null` here.
     if !pv.isNsArr { ps.destKind = "str" }
-  } else if pv.isF64 {
-    // the three non-i32 scalar kinds run the identical grow/append sequence over
-    // their own wrapper/backing, staged in their own typed push quad — only the
-    // three type indices below differ.
-    ps.lTy = fl64Ty()
-    ps.aTy = fa64Ty()
-    ps.base = f64PushScratchBase
-  } else if pv.isI64 {
-    ps.lTy = il64Ty()
-    ps.aTy = ia64Ty()
-    ps.base = i64PushScratchBase
-  } else if pv.isF32 {
-    ps.lTy = fl32Ty()
-    ps.aTy = fa32Ty()
-    ps.base = f32PushScratchBase
+  } else if pv.sk != null {
+    // the non-i32 scalar kinds run the identical grow/append sequence over their own
+    // wrapper/backing, staged in their own typed push quad.
+    ps.lTy = scalarListWrap(pv.sk, 0)
+    ps.aTy = scalarListBack(pv.sk, 0)
+    ps.base = scalarPushScratchBaseOf(pv.sk, 0)
   } else if isU8 {
     // the packed byte list runs the identical grow/append sequence over its own
     // wrapper/backing and push quad. The pushed value takes the plain i32 path, and
@@ -28959,9 +29091,7 @@ function emitPushOne(
 // Which element rep a one-argument `.push` builds its value at: the scalar widths, the nested
 // list a ref list's element names, and the atom and niche seeds. A union box is the record's.
 type PushValKinds = {
-  isF64: boolean,
-  isI64: boolean,
-  isF32: boolean,
+  sk: VKind | null,
   pushNestSlot: i32,
   isLitArr: boolean,
   isNbArr: boolean,
@@ -28973,22 +29103,15 @@ type PushValKinds = {
 // The value `argIx` a `.push` onto receiver `recvIx` appends, built and coerced at the
 // element rep `pv` names. Returns -1 on a failure, else 0.
 function emitPushValue(recvIx: i32, argIx: i32, fnIx: i32, pv: PushValKinds) {
-  const isF64 = pv.isF64
-  const isI64 = pv.isI64
-  const isF32 = pv.isF32
   const pushNestSlot = pv.pushNestSlot
   const isLitArr = pv.isLitArr
   const isNbArr = pv.isNbArr
   const isNlluArr = pv.isNlluArr
   const isNsArr = pv.isNsArr
   const isStr = pv.isStr
-  if isF64 {
-    if emitExprAsF64(argIx, fnIx) < 0 { return -1 }
-  } else if isI64 {
-    if emitExprAsI64(argIx, fnIx) < 0 { return -1 }
-  } else if isF32 {
-    // an f32-list push coerces/encodes the value as f32 (a float literal re-encodes).
-    if emitExprAsF32(argIx, fnIx) < 0 { return -1 }
+  if pv.sk != null {
+    // a scalar-list push coerces/encodes the value at its element (a float literal re-encodes).
+    if emitExprAsElem(argIx, pv.sk, fnIx) < 0 { return -1 }
   } else if boxOwedAtRecord(argIx, fnIx) {
     // The checker's record decides the union box, as at every delivery that reads it.
     if emitUnionBoxAtRecord("", -1, argIx, fnIx) < 0 { return -1 }
@@ -29114,11 +29237,14 @@ function scalarPushScratchBaseOf(k: VKind, row: i32): i32 {
     "f32" => {
       return f32PushScratchBase
     }
+    "v128" => {
+      return v128PushScratchBase
+    }
     "u8list" => {
       return pkPushBase(row)
     }
     // Every other kind pushes through the i32 list's scratch.
-    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {}
+    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {}
   }
   return pushScratchBase
 }
@@ -29138,7 +29264,7 @@ function scalarListUsedOf(k: VKind): boolean {
       return true
     }
     // Every other kind rides the i32 list, which mints on first read.
-    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {}
+    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {}
   }
   return true
 }
@@ -29689,15 +29815,10 @@ function emitPopOr(popIx: i32, defIx: i32, fnIx: i32) {
 // `array.get`, which a nullable-niche element does not. Returns -1 on a failure, else 0.
 function mfSrcTysOf(recvK: ListKind, recvIx: i32, fnIx: i32, src: MfSrcTys) {
   const srcElemNul = listElemStaysNullable(recvIx, fnIx)
-  if recvK == "f64list" {
-    src.srcWrap = fl64Ty()
-    src.srcBack = fa64Ty()
-  } else if recvK == "i64list" {
-    src.srcWrap = il64Ty()
-    src.srcBack = ia64Ty()
-  } else if recvK == "f32list" {
-    src.srcWrap = fl32Ty()
-    src.srcBack = fa32Ty()
+  const sek = numListElemOf(recvK)
+  if sek != null {
+    src.srcWrap = scalarListWrap(sek, 0)
+    src.srcBack = scalarListBack(sek, 0)
   } else if recvK == "reflist" {
     if !rlRowsMinted() {
       return emitFail(
@@ -29964,15 +30085,10 @@ type MfDstTys = {
 // Writes into `dst` the result list types for result kind `resK`; `dst` arrives holding the
 // i32 list's, and `dstSlot` is a ref-list result's row. Returns -1 on a failure, else 0.
 function mfDstTysOf(resK: ListKind, dstSlot: i32, callIx: i32, dst: MfDstTys) {
-  if resK == "f64list" {
-    dst.dstWrap = fl64Ty()
-    dst.dstBack = fa64Ty()
-  } else if resK == "i64list" {
-    dst.dstWrap = il64Ty()
-    dst.dstBack = ia64Ty()
-  } else if resK == "f32list" {
-    dst.dstWrap = fl32Ty()
-    dst.dstBack = fa32Ty()
+  const dek = numListElemOf(resK)
+  if dek != null {
+    dst.dstWrap = scalarListWrap(dek, 0)
+    dst.dstBack = scalarListBack(dek, 0)
   } else if resK == "strlist" {
     // A STRING-list result: a `.filter` over a string list, or a `.map` whose callback
     // returns a string. The backing `$mkArrIdx` holds string refs; `array.set` stores
@@ -30142,7 +30258,7 @@ function scalarWidenConvOp(srcKind: VKind, dstKind: VKind): i32 {
           return 183
         }
         // No other destination is a lossless widening of i32.
-        "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
+        "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
       }
       return -1
     }
@@ -30152,11 +30268,11 @@ function scalarWidenConvOp(srcKind: VKind, dstKind: VKind): i32 {
           return 187
         }
         // No other destination is a lossless widening of f32.
-        "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
+        "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
       }
     }
     // No other source kind widens.
-    "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
+    "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
   }
   return -1
 }
@@ -30799,7 +30915,7 @@ function svPairOfKinds(src: VKind, dst: VKind): i32 {
 
 // The view destination a scalar list of element `k` reads as (0 `i64`, 1 `f64`), or -1 where
 // no view of that element is built: `k` is a destination exactly when an `i32` widens to it.
-function svDstOfKind(k: VKind | null): i32 {
+export function svDstOfKind(k: VKind | null): i32 {
   if svPairs == 0 || k == null { return -1 }
   const d = svPairOfKinds("i32", k)
   if d == 0 { return 0 }
@@ -31086,15 +31202,10 @@ function emitArrSlice(callIx: i32, fnIx: i32) {
       // The element kind's wrapper + backing heap types.
       let wrap = -1
       let back = -1
-      if recvK == "f64list" {
-        wrap = fl64Ty()
-        back = fa64Ty()
-      } else if recvK == "i64list" {
-        wrap = il64Ty()
-        back = ia64Ty()
-      } else if recvK == "f32list" {
-        wrap = fl32Ty()
-        back = fa32Ty()
+      const rek = numListElemOf(recvK)
+      if rek != null {
+        wrap = scalarListWrap(rek, 0)
+        back = scalarListBack(rek, 0)
       } else if recvK == "reflist" {
         if !rlRowsMinted() {
           return emitFail(
@@ -32137,14 +32248,19 @@ export function emitVoidTailCall(fnIx: i32) {
     tailCallRewrite(0)
     return true
   }
-  const callee = tailCallIdx - gImports
-  if callee < 0 || callee >= fRetVoid.length || fRetVoid[callee] != 1 {
-    return false
-  }
-  if cloLiftWriteCount(callee) > 0 { return false }
+  if !voidTailCallee(tailCallIdx - gImports) { return false }
   if !tailCallEndsAt(0) { return false }
   tailCallRewrite(0)
   return true
+}
+
+// Whether a void function's tail call to callee `pos` may take its tail form: the callee returns
+// nothing and hands no captures back. The IR lowering asks the same.
+export function voidTailCallee(pos: i32): boolean {
+  return pos >= 0
+    && pos < fRetVoid.length
+    && fRetVoid[pos] == 1
+    && cloLiftWriteCount(pos) == 0
 }
 
 // The tail-call rewrite in a lifted function that hands captures back: only a call to itself
@@ -33542,6 +33658,14 @@ function staticIsGuard(condIx: i32, condStart: i32): i32 {
   }
   if !(c is IsExpr) { return -1 }
   return emittedCondConst(condStart)
+}
+
+// `staticIsGuard` for a value `if`, which a literal `true` also decides: its else arm is dead, so
+// a rewrite's `if true { <spills> v } else { <placeholder> }` never lowers the placeholder.
+function staticValueIfCond(condIx: i32, condStart: i32): i32 {
+  const c = if condIx >= 0 { nodeAt(unwrapParen(condIx)) } else { null }
+  if c is BoolLit && c.boolVal == 1 { return 1 }
+  return staticIsGuard(condIx, condStart)
 }
 
 // A value arm this instance's `is` test proved dead: `unreachable` meets any blocktype, and
@@ -35079,8 +35203,8 @@ function forInBackingOf(
       fb.hKind = "reflist"
       fb.hSlot = rslot
     }
-  } else if ek == "f64" || ek == "i64" || ek == "f32" {
-    // A scalar f64/i64/f32 element list: the wrapper/backing come from the descriptor, and
+  } else if ek == "f64" || ek == "i64" || ek == "f32" || ek == "v128" {
+    // A scalar f64/i64/f32/v128 element list: the wrapper/backing come from the descriptor, and
     // `array.get <back>` yields the scalar directly (no `ref.as_non_null`).
     fb.wrapTy = scalarListWrap(ek, exprPackedRow(s.fiIter, fnIx))
     fb.backTy = scalarListBack(ek, exprPackedRow(s.fiIter, fnIx))
@@ -35834,15 +35958,28 @@ export function userGlobalIdx(gi: i32) {
   return nImp + gStrPoolTexts.length + gCellIdx[gi]
 }
 
-// Whether `emitUserGlobalGet` (or, `write`, `emitUserGlobalSet`) writes global `gi` as one
-// `global.get`/`global.set` of `userGlobalIdx(gi)`: no folded immediate, promoted local, init
-// guard or init bit. The IR lowering asks, so the decision stays this chokepoint's.
-export function userGlobalPlain(gi: i32, write: boolean): boolean {
-  if gi < 0 { return false }
-  if gi < gFoldOk.length && gFoldOk[gi] == 1 { return false }
-  if gi < gPromoOk.length && gPromoOk[gi] == 1 { return false }
-  if write && (globalCellIsImmutable(gi) || initBitOf(gi) >= 0) { return false }
-  return !initGuardNeeded(gi, write)
+// How a read of module global `gi` is stored: its folded immediate, its promoted local, a
+// `global.get` behind an init guard, or a plain `global.get`. `emitUserGlobalGet` and the IR
+// lowering both match on it, so the storage class stays one decision.
+export type GlobalReadClass = "fold" | "promo" | "guard" | "plain"
+export function userGlobalReadClass(gi: i32): GlobalReadClass {
+  if gi >= 0 && gi < gFoldOk.length && gFoldOk[gi] == 1 { return "fold" }
+  if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 { return "promo" }
+  if initGuardNeeded(gi, false) { return "guard" }
+  return "plain"
+}
+
+// How a write of module global `gi` is stored: its promoted local, a refused store to an
+// immutable cell, a `global.set` behind an init guard, or a plain one; any of the last two is
+// followed by its init bit when `initBitOf(gi)` has one.
+export type GlobalWriteClass = "promo" | "immutable" | "guard" | "plain"
+export function userGlobalWriteClass(gi: i32): GlobalWriteClass {
+  if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 { return "promo" }
+  if globalCellIsImmutable(gi) { return "immutable" }
+  // A write a function can make before the initializer ran would be overwritten by it (D2654);
+  // the start function's own writes are its initializers and the checker orders the rest.
+  if !gPromoInStart && initGuardNeeded(gi, true) { return "guard" }
+  return "plain"
 }
 
 // the storage-class chokepoint for a user top-level binding: every user cell's `0x23`/`0x24`
@@ -35850,20 +35987,28 @@ export function userGlobalPlain(gi: i32, write: boolean): boolean {
 // A promoted binding read outside the start function's frame is rejected loudly; a folded
 // const is its immediate, never uninitialised, so it takes no guard.
 export function emitUserGlobalGet(gi: i32) {
-  if gi >= 0 && gi < gFoldOk.length && gFoldOk[gi] == 1 {
-    return emitFoldedConstRead(gi)
-  }
-  if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 {
-    if !gPromoInStart || gPromoSlot[gi] < 0 {
-      return emitFail(
-        "emitProgram: promoted top-level binding read outside the top-level statement list",
-      )
+  match userGlobalReadClass(gi) {
+    "fold" => {
+      return emitFoldedConstRead(gi)
     }
-    fbLocalGet(gPromoSlot[gi])
-    return 0
-  }
-  if initGuardNeeded(gi, false) {
-    if emitInitGuard(gi, "read") < 0 { return -1 }
+    "promo" => {
+      if (
+        !gPromoInStart
+        || gi < 0
+        || gi >= gPromoSlot.length
+        || gPromoSlot[gi] < 0
+      ) {
+        return emitFail(
+          "emitProgram: promoted top-level binding read outside the top-level statement list",
+        )
+      }
+      fbLocalGet(gPromoSlot[gi])
+      return 0
+    }
+    "guard" => {
+      if emitInitGuard(gi, "read") < 0 { return -1 }
+    }
+    "plain" => {}
   }
   fbGlobalGet(userGlobalIdx(gi))
   return 0
@@ -36052,23 +36197,29 @@ function emitInitGuard(gi: i32, verb: string) {
 // The write half of the chokepoint above — `local.set` into the start function's frame
 // for a promoted binding, else `global.set` of its cell.
 export function emitUserGlobalSet(gi: i32) {
-  if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 {
-    if !gPromoInStart || gPromoSlot[gi] < 0 {
-      return emitFail(
-        "emitProgram: promoted top-level binding written outside the top-level statement list",
-      )
+  match userGlobalWriteClass(gi) {
+    "promo" => {
+      if (
+        !gPromoInStart
+        || gi < 0
+        || gi >= gPromoSlot.length
+        || gPromoSlot[gi] < 0
+      ) {
+        return emitFail(
+          "emitProgram: promoted top-level binding written outside the top-level statement list",
+        )
+      }
+      fbLocalSet(gPromoSlot[gi])
+      return 0
     }
-    fbLocalSet(gPromoSlot[gi])
-    return 0
-  }
-  // An immutable cell is written only by its constexpr; a store here would be invalid wasm.
-  if globalCellIsImmutable(gi) {
-    return emitFail("emitProgram: a store to an immutable module const")
-  }
-  // A write a function can make before the initializer ran would be overwritten by it (D2654);
-  // the start function's own writes are its initializers and the checker orders the rest.
-  if !gPromoInStart && initGuardNeeded(gi, true) {
-    if emitInitGuard(gi, "written") < 0 { return -1 }
+    // An immutable cell is written only by its constexpr; a store here would be invalid wasm.
+    "immutable" => {
+      return emitFail("emitProgram: a store to an immutable module const")
+    }
+    "guard" => {
+      if emitInitGuard(gi, "written") < 0 { return -1 }
+    }
+    "plain" => {}
   }
   fbGlobalSet(userGlobalIdx(gi))
   const bit = initBitOf(gi)
@@ -36080,7 +36231,7 @@ export function emitUserGlobalSet(gi: i32) {
 }
 
 // The assigned bit of global `gi`, or -1 when it has none.
-function initBitOf(gi: i32): i32 {
+export function initBitOf(gi: i32): i32 {
   if gi < 0 || gi >= gInitBitIdx.length || gInitBitBase < 0 { return -1 }
   const o = gInitBitIdx[gi]
   if o < 0 { return -1 }
@@ -36815,13 +36966,26 @@ function strLexSameValue(a: string, b: string): boolean {
 // The lexeme (quotes kept) of the member in `texts` whose value `lex` spells, else `lex` itself —
 // whose interned id then matches no member's.
 function memberLexOfValue(texts: string[], lex: string): string {
-  let i = 0
-  while i < texts.length {
-    const m = quoteLex(texts[i])
-    if strLexSameValue(m, lex) { return m }
-    i = i + 1
+  // With no backslash on either side a lexeme's value is its text between the quotes, so the
+  // compare is the raw one and nothing is decoded.
+  const plain = !strHasBackslash(lex)
+  const inner = lex.slice(1, lex.length - 1)
+  for t in texts {
+    if plain && !strHasBackslash(t) {
+      if t == inner { return quoteLex(t) }
+    } else if strLexSameValue(quoteLex(t), lex) {
+      return quoteLex(t)
+    }
   }
   return lex
+}
+
+// Whether `s` holds a backslash, the only character `decodeStr` reads as other than itself.
+function strHasBackslash(s: string): boolean {
+  for c in s {
+    if c == '\\' { return true }
+  }
+  return false
 }
 
 // Pushes the interned atom id of statically-known operand `ix` (lexeme `lex`): a literal is its
@@ -36915,19 +37079,14 @@ function emitCharLitNode(e: CharLit, _exprIx: i32, _fnIx: i32) {
   return 0
 }
 
-// The recovery a read of module global `isid` owes after its `global.get`, shared by an
-// identifier read and a substituted parameter default. A kind-16 `string | null` cell is
-// always a nullable ref; a non-const ref cell is start-initialised, so it is nullable in
-// wasm and recovered unless its kind legitimately holds null or is not a ref at all.
-function emitGlobalReadRecover(isid: i32, readIx: i32, fnIx: i32) {
+// Whether a read of module global `isid` at `readIx` in `fnIx` is followed by `ref.as_non_null`,
+// for an identifier read and a substituted parameter default alike. A kind-16 `string | null`
+// cell recovers when the read's type bears no null; a non-const ref cell is start-initialised,
+// so nullable in wasm, and recovers unless its kind legitimately holds null.
+export function globalReadRecovers(isid: i32, readIx: i32, fnIx: i32): boolean {
   const gck0 = globalCellKind(globalLetOfSid(isid))
-  if gck0 == "nulstr" {
-    if nulStrReadRecovers(readIx, fnIx) { fbRefAsNonNull() }
-    return 0
-  }
-  if !globalNameIsNonConstSid(isid) { return 0 }
-  if vkIsNonNullRef(gck0) { fbRefAsNonNull() }
-  return 0
+  if gck0 == "nulstr" { return nulStrReadRecovers(readIx, fnIx) }
+  return globalNameIsNonConstSid(isid) && vkIsNonNullRef(gck0)
 }
 
 // the densest single-identifier site in the compiler: one identifier read resolves
@@ -36974,7 +37133,7 @@ function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
     if dgIdx >= 0 {
       if emitUserGlobalGet(dgIdx) < 0 { return -1 }
       // the same recovery the argument spelling of this read gets (D3510)
-      emitGlobalReadRecover(isid, exprIx, fnIx)
+      if globalReadRecovers(isid, exprIx, fnIx) { fbRefAsNonNull() }
       return 0
     }
   }
@@ -37091,7 +37250,7 @@ function emitIdentNonLocalRead(e: Ident, isid: i32, exprIx: i32, fnIx: i32) {
   const gIdx = globalIndexOfSid(isid)
   if gIdx >= 0 {
     if emitUserGlobalGet(gIdx) < 0 { return -1 }
-    emitGlobalReadRecover(isid, exprIx, fnIx)
+    if globalReadRecovers(isid, exprIx, fnIx) { fbRefAsNonNull() }
     return 0
   }
   return emitFail(
@@ -37703,9 +37862,7 @@ function emitMemberNode(e: Member, exprIx: i32, fnIx: i32) {
       || exprString(e.memObj, fnIx)
       || exprRefArray(e.memObj, fnIx)
       || exprStringArray(e.memObj, fnIx)
-      || exprF64Array(e.memObj, fnIx)
-      || exprI64Array(e.memObj, fnIx)
-      || exprF32Array(e.memObj, fnIx)
+      || numListElemOf(exprListRep(e.memObj, fnIx)) != null
       || exprU8Array(e.memObj, fnIx)
     ) {
       return emitArrLen(exprIx, fnIx)
@@ -39811,6 +39968,10 @@ function emitArrayNewIntr(callIx: i32, fnIx: i32) {
           anBack = fa32Ty()
           anWrap = fl32Ty()
         }
+        "v128list" => {
+          anBack = fa128Ty()
+          anWrap = fl128Ty()
+        }
         "strlist" => {
           // STRING fill → the string list (`array.new` of the shared string-ref
           // backing; a non-null string ref stores into the nullable slot directly).
@@ -40022,7 +40183,7 @@ function nulScalarListAtomKind(kind: VKind): i32 {
       return 13
     }
     // Not a nullable scalar-backed list, so no atom code.
-    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
+    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
   }
   return -1
 }
@@ -42064,6 +42225,11 @@ function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
   // A record union's shared `scalar | null` field reads as its box (D13280).
   const fk = coalBoxFieldScalarKind(lhsIx, fnIx)
   if fk >= 0 { return emitCoalesceBoxFieldScalar(e, exprIx, fk, fnIx) }
+  // A re-readable list cell is the null test it spells, as an instance's is (D16483).
+  const cell = if lhsIx >= 0 { nodeAt(lhsIx) } else { null }
+  if cell is Index && exprReReadable(lhsIx) && !exprMap(cell.idxArr, fnIx) {
+    return emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
+  }
   return emitFail(
     "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
   )

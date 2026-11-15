@@ -1088,32 +1088,29 @@ export function armLiteralBaseTy(ty: i32): i32 {
   return -1
 }
 
-// Does `members` carry `base` as an arm, after flattening through aliases (a union-alias
-// member contributes its own arms, a nullable its inner plus `null`)? Compares by index
-// equality against `base`, not `sameVariantTy` — the loose test would also match a sibling
-// `TyLit`, which `"a" | "b" | "err"` must not collapse against.
-function unionMembersCarryBaseArm(members: i32[], base: i32): boolean {
-  let i = 0
-  while i < members.length {
+// The arms `members` carry, flattened through aliases (a union-alias member contributes its own
+// arms, a nullable its inner plus `null`). Keyed by index, not `sameVariantTy`: the loose test
+// would also match a sibling `TyLit`, which `"a" | "b" | "err"` must not collapse against.
+export function unionCarriedArms(members: i32[]): {[i32]: boolean} {
+  const carried: {[i32]: boolean} = Map()
+  for m in members {
     const flat: i32[] = []
-    flattenVariantsInto(members[i], flat)
-    let f = 0
-    while f < flat.length {
-      if flat[f] == base { return true }
-      f = f + 1
-    }
-    i = i + 1
+    flattenVariantsInto(m, flat)
+    for f in flat { carried[f] = true }
   }
-  return false
+  return carried
 }
 
-// Is `ty`'s value set already carried by an arm of `members`? Both union routes filter by
-// this — the annotation route over its member list, the declaration route also over the
-// wider `declMemberIxs` registration list.
-export function unionArmSubsumedBy(ty: i32, members: i32[]): boolean {
+// Is `ty`'s value set already carried by an arm of a member list, given the arms
+// `unionCarriedArms` read from it once? Both union routes filter by this — the annotation route
+// over its member list, the declaration route also over the wider `declMemberIxs` list.
+export function unionArmSubsumedIn(
+  ty: i32,
+  carried: {[i32]: boolean},
+): boolean {
   const base = armLiteralBaseTy(ty)
   if base < 0 { return false }
-  return unionMembersCarryBaseArm(members, base)
+  return carried[base] ?? false
 }
 
 // Drops a subsumed literal arm (a union is a set of values: `string | "err"` is `string`),
@@ -1122,9 +1119,10 @@ export function unionArmSubsumedBy(ty: i32, members: i32[]): boolean {
 // not an emitter one, since a union box's tags are positional and must never be deduped (D1024).
 export function unionDropSubsumedArms(members: i32[], out: i32[]): boolean {
   let dropped = false
+  const carried = if members.length >= 2 { unionCarriedArms(members) } else { Map() }
   let i = 0
   while i < members.length {
-    if members.length >= 2 && unionArmSubsumedBy(members[i], members) {
+    if members.length >= 2 && unionArmSubsumedIn(members[i], carried) {
       dropped = true
     } else {
       out.push(members[i])
@@ -1480,10 +1478,18 @@ export function tyHasObjMember(t: i32): boolean {
 export function tyNestsV128(t: i32, d: i32): boolean {
   if t < 0 || d <= 0 { return false }
   const tt = tyAt(t)
-  if tt is TyArray { return tyIsOrNestsV128(tyElemOf(tt), d - 1) }
+  // A list stores a bare vector element flat; one inside a container element still nests, and
+  // a list of vector lists has no element rep yet.
+  if tt is TyArray {
+    if tyIsV128List(tyElemOf(tt)) { return true }
+    return tyNestsV128(tyElemOf(tt), d - 1)
+  }
   // A nullable or union member is boxed, so a bare vector there is not nested; one inside
-  // a container member still is.
-  if tt is TyNullable { return tyNestsV128(tt.nInner, d - 1) }
+  // a container member still is, and a vector list has no nullable rep.
+  if tt is TyNullable {
+    if tyIsV128List(tt.nInner) { return true }
+    return tyNestsV128(tt.nInner, d - 1)
+  }
   if tt is TyMap {
     if tyIsOrNestsV128(tyKeyOf(tt), d - 1) { return true }
     return tyIsOrNestsV128(tyValOf(tt), d - 1)
@@ -1513,6 +1519,13 @@ export function tyNestsV128(t: i32, d: i32): boolean {
   if tt is TyNeg { return false }
   if tt is TyErr { return false }
   return false
+}
+
+// Whether `t` is a list whose element is a bare vector.
+function tyIsV128List(t: i32): boolean {
+  if t < 0 { return false }
+  const tt = tyAt(t)
+  return tt is TyArray && primNameOf(tyElemOf(tt)) == "v128"
 }
 
 export function tyIsOrNestsV128(t: i32, d: i32): boolean {

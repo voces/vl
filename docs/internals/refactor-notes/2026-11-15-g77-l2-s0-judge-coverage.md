@@ -33,7 +33,7 @@ The probe build is a copy of `compiler/` in the scratchpad:
     if n > 0 && probeJFn[n - 1] == o && probeJName[n - 1] == name { return 0 }
     probeJFn.push(o)
     probeJName.push(name)
-    0
+    return 0
   }
   ```
 - In every `compiler/check_*.vl` except `check_cursor.vl`, a `probeJudge("<name>"); ` call is inserted

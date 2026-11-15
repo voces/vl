@@ -193,6 +193,14 @@ facts come from the statement. Under L2 those facts are bounds on the parameter,
 body, so the exemption goes. This closes the ORDER rows (§6): D16424, D16426, D16368, and the
 D16301 declaration-order family.
 
+S1 retires it for every parameter except one whose calls decide it (`callDecidesParam`): a
+parameter used as a map, or one written into a binding. A call closes a map parameter's open key or
+value, and `holeDemandOk` refuses to pin a demand the body was already checked against, since the
+body's node types would be stale. A binding written a parameter holds a function set's id only when
+every call hands it a member (D15053). Both are the solver at the call, so that exemption goes at S3,
+with D16630 as its acceptance witness. A call cycle keeps source order and today's fixpoint in
+S1, so choice 3 (§9) does not gate it. Measured in `refactor-notes/2026-11-15-g80-l2-s1-callee-first.md`.
+
 ### 3.2 What a body check records
 
 The checker walks the body once. Each operation on a variable appends a bound instead of writing a
@@ -204,6 +212,17 @@ table row. At the end the bounds are closed:
 
 The last rule is what instance-local generalization means. D16423's inner `[]` is a list of `β`, and
 `β` is quantified, so each call gets its own `β`.
+
+**When a scheme closes.** A scheme is built once, when the body's loud check ends (`bodyChecked`).
+- The quiet return-inference pre-pass does not close it. A pre-pass read sees a partial body, and
+  its answer is the pre-pass's own (`refactor-notes/2026-11-15-l2-close-and-storage.md`).
+- A lambda or nested function closes with its enclosing top-level declaration. Its bounds belong to
+  that declaration's scheme.
+- A function value bound at module level, with no enclosing declaration, closes at the statement
+  that binds it.
+
+M3's census found that a body walk asked after the close gives one answer in every frame, instance
+re-checks included. So S2 reads each walk once, at the close.
 
 ### 3.3 Literals
 
@@ -341,7 +360,7 @@ A step marked **identical** must also reproduce its predecessor's seed byte for 
 | step | what | gate | lines (est.) |
 |---|---|---|---|
 | **S0** | Shadow schemes: build an `Iface` from today's tables at the end of each un-annotated body, print it under `vl check --ifaces`, and measure how many corpus functions' demands it covers | identical | +600 to +900 |
-| **S1** | SCC order: check un-annotated bodies callee-first, retire `eagerCheckable`'s un-annotated-parameter exemption | graded: the ORDER rows | +200 to +400, −100 |
+| **S1** | Callee-first order: retire `eagerCheckable`'s un-annotated-parameter exemption, except a parameter its calls decide (§3.1) | graded: the ORDER rows | +40 |
 | **S2** | The scheme is the record: the table writers append `Bound`s to the owning `Iface`, and the validators read them back in today's order | identical | +500, −1,500 |
 | **S3** | One solver at the call: `callFtyPinCstrs`'s replay becomes §4.1's loop, and a failure reports at the call | graded: container, row, arrow and narrowing rows; diagnostics move | +1,200, −4,000 to −6,000 |
 | **S4** | Instance-local generalization (§3.2) and literal bounds (§3.3, settled choice 2) | graded: the instance rows | +400, −300 |
@@ -372,7 +391,8 @@ the condition on choice 3 can reopen one as an owner question.
 3. **Recursion inside a strongly connected component is monomorphic**, as in HM. This holds on one
    condition: S0's measurement must show that no program that runs today depends on polymorphic
    recursion through an un-annotated function. If one does, that program is the owner question, and
-   S1 does not land until it is answered.
+   a component's shared variables (S3) do not land until it is answered. S1 orders acyclic callees
+   only, so it does not wait on it.
 4. **One `BK_ARROW` bound per call shape of a hole function parameter.** For example,
    `g(1, 2) + g("ab", "c").length` (D16209) gives two bounds, which a generic argument satisfies by
    instantiating twice. This preserves what runs today; one arrow per parameter would lose runs, which
@@ -420,12 +440,27 @@ Replies received 2026-11-15:
   - Under L2, `InstReq`'s call-site facts leave the key. `delivery` and `argLit` become coercions on
     the call edge. `retTy` and `retWidenTy` become part of the scheme, or a coercion at the result.
     `frame` and `call` stay as provenance. So no new field is needed.
-  - **Open: storage versus type identity.** Two calls with the same `TyId` vector can need different
-    storage for a function-typed parameter: lane S's `RClosure`, `RSetId` or `RDirect`. Either the key
-    includes S's per-parameter storage decision, or the scheme makes storage a function of the type
-    alone. That is for L2 and S to decide before S3, because `BK_ARROW`'s solution must say which. The
-    discriminators H plans to fold into nominal `TyId`s (`monoAnonPinDiscrim`, the set and
-    literal-union discriminators) are part of the same question.
+  - **Storage versus type identity, settled 2026-11-15.** Two calls with the same `TyId` vector can need
+    different storage for a function-typed parameter (`RClosure`, `RSetId` or `RDirect`).
+    - The scheme is storage-free: a `BK_ARROW` bound solves to types only.
+    - The instance key carries the storage decision of each function-typed parameter, from whoever
+      decides it.
+    - Storage has one decider: the tag-decision layer (`fnTagDecide`, `check_fn_tag.vl`). Its re-run
+      after the elaboration (`fnTagRedecide`, `emit_sections.vl`) is a second decision. The goal is
+      that it goes before L2 S3, so S3 never decides storage. Owner: lane G. `fnTagRedecide` is
+      removed in its own PR before S3.
+    - S3's solver produces the closed per-shape signatures of a hole function parameter's calls.
+      The bundle-or-not decision over them is storage.
+    - The discriminators H plans to fold into nominal `TyId`s (`monoAnonPinDiscrim`, the set and
+      literal-union discriminators) are part of the same question.
+  - **S** (slot store) agrees with the storage-free scheme, and with storage in the key in
+    principle. Its slot store does not decide storage. It produces closed delivered types: what a
+    slot's function leaf is called and bound at (`epl*`, `elabSlotTyAt`, `eplSlotSig`,
+    `eplSlotBound`). Those facts follow flow, not argument types alone: which values reach the
+    slot, the calls through it at each instance's arguments, written destinations and copies. So a
+    key of template, argument `TyId`s and the call's set membership is complete only because set
+    membership is itself a decided input, `fnTagDecide`'s output. S's plan deletes the delivery walk
+    (`elabSlotDeliveries`), not either tag decision.
   - **Order hazard: IR I9 after S6.** Phase A lowers mono's instance set as it is, including instances
     of an exported un-annotated function pinned from an importer's call. S6 changes that set, so the
     function section moves, and the cause is L2. If I9 (phase B, per-module `Lowered`) lands before S6,

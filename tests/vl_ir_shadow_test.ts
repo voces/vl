@@ -154,10 +154,10 @@ Deno.test({
   fn: () => {
     // A returned `if` that yields its arms' values is outside the set too.
     const src = `function greet(s: string): string { return s + "!" }
-function first(xs: i32[]): i32 { return xs[0] }
+function fx(p: { x: i32 }): i32 { return p.x }
 function sel(c: boolean): i32 { return if c { 1 } else { 2 } }
 print(greet("a"))
-print(first([4]))
+print(fx({ x: 4 }))
 print(sel(true))
 `;
     const { rc, rows } = run(src, true);
@@ -171,6 +171,77 @@ print(sel(true))
     }
     const unc = [...rows.keys()].filter((k) => k.startsWith("uncovered "));
     if (unc.length < 3) throw new Error(`want three uncovered reasons, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// The decisions legacy and the lowering share (I1b): a reference global's read and its
+// `ref.as_non_null`, a never-returning callee's `call; unreachable`, and an instance's parameter
+// read. Each witness is one covered function that must match legacy's bytes.
+const SHARED = [
+  `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
+  `function stop(code: i32): never { return __trap__() }
+function guard(x: i32): i32 {
+  if x < 0 { stop(x) }
+  return x + 1
+}
+print(guard(2))
+`,
+  `function id<T>(v: T): T { return v }\nprint(id(3))\n`,
+];
+Deno.test({
+  name: "ir shadow: each shared decision's witness is covered and matches legacy",
+  ignore,
+  fn: () => {
+    for (const src of SHARED) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+        throw new Error(`want one covered, matched function, got ${JSON.stringify([...rows])}\n${src}`);
+      }
+    }
+  },
+});
+
+// An operand written while a valued `if`'s value waits on the stack would land above it: the
+// lowering names that rather than writing its arguments out of order.
+Deno.test({
+  name: "ir shadow: an operand above a valued if's value is a named miss, not a byte mismatch",
+  ignore,
+  fn: () => {
+    const src = `function pair(a: i32, b: boolean): i32 { return if b { a } else { 0 - a } }
+function k(a: i32, c: boolean, d: boolean): i32 {
+  const r = pair(a, c && d)
+  return r
+}
+print(k(2, true, false))
+`;
+    const { rows } = run(src, true);
+    const want = "mismatch unlowered: operand above a valued if's value";
+    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// An unannotated parameter's type stays open until a call instances it: the builder leaves that
+// function uncovered rather than handing the verifier an open-typed variable (rule 1).
+Deno.test({
+  name: "ir shadow: an open-typed parameter is uncovered, never a verifier failure",
+  ignore,
+  fn: () => {
+    const src = `function k<T>(x: T): T { return x }
+function fw(f) { return f }
+function main() {
+  const o = fw(k)
+  print(o(6))
+}
+main()
+`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
+    if (!rows.has("uncovered open parameter type")) {
+      throw new Error(`want an "uncovered open parameter type" row, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
@@ -190,7 +261,8 @@ Deno.test({
     if (exp.compileSrc() !== 0) throw new Error("want the priming compile to pass");
     // Case k breaks rule k for 1 to 7; case 8 falls off a valued function's end (rule 5) and
     // case 9 stores an i32 into a bool global (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2];
+    // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);

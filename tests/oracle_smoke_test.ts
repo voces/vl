@@ -3,7 +3,7 @@
 // oracle has not learned, or an oracle edit that breaks the spec, fails here. The examples it
 // cannot run yet are listed in SPEC_SKIPS by their first line, so the count can only grow.
 
-import { distilledExpectations, interpret, judge, judgeRecording, knownRefusals } from "../scripts/oracle/oracle.ts";
+import { distilledExpectations, interpret, judge, judgeRecording, knownEmulations, knownRefusals } from "../scripts/oracle/oracle.ts";
 import { grid } from "../scripts/oracle/join-grid.ts";
 import { grid as rulingGrid } from "../scripts/oracle/ruling-grid.ts";
 
@@ -64,6 +64,8 @@ Deno.test("oracle: verdicts", () => {
     [judge({ kind: "fault", out: [], msg: "x" }, { cls: "runs", out: [] }, null).v, "UNSOUND"],
     [judge({ kind: "fault", out: [], msg: "x" }, { cls: "rejected", out: null }, null).v, "AGREE"],
     [judge(ok, { cls: "invalid", out: null }, null).v, "COMPILED-BAD"],
+    [judge(ok, { cls: "rejected", out: null }, null).v, "REFUSED"],
+    [judge({ kind: "trap", out: [], msg: "x" }, { cls: "rejected", out: null }, null).v, "REFUSED"],
     [judge({ kind: "unsupported", out: [], msg: "x" }, { cls: "runs", out: [] }, null).v, "SKIP"],
   ];
   for (const [got, want] of cases) if (got !== want) throw new Error(`verdict: want ${want}, got ${got}`);
@@ -120,6 +122,24 @@ Deno.test("oracle: pinned regressions", () => {
     // a store delivers to the element type a declared container was built at
     ["const m: {[string]: i64} = Map()\nm[\"a\"] = 0xFFFFFFFF\nprint(m[\"a\"] ?? 0)", "4294967295"],
     ["const m: {[string]: f32} = Map()\nm[\"a\"] = 0.1\nprint(m[\"a\"] ?? 0)", "0.10000000149011612"],
+    // Q8: a constant count of 32 to 63 makes a constant left i64, `~` and joins included
+    ["print((~9) >>> 34)", "1073741823"],
+    ["let c = true\nprint((if c { 0xFFFFFFFF } else { 0xFFFFFFFF }) >>> 57)", "0"],
+    ["let v1: i32 = 3\nprint((0xFFFFFFFF << v1) >> 56)", "0"],
+    ["let v4: i32 = 1\nprint((0x7fffffff << v4) as i64)", "4294967294"],
+    // D16492: a pattern beside an i64 constant tree is zero-extended, through `~` and min/max
+    ["print(((0xFFFFFFFF & 0) | (~4294967296)) <= -2)", "true"],
+    ["print(max(0 * (0xFFFFFFFF - 3000000000), 100 - 0xFFFFFFFF))", "0"],
+    ["let v: i32 = 65535\nprint(3000000000 - (0xFFFFFFFF >>> v))", "3000000000"],
+    // a negative constant's `>>>` is typed at its use
+    ["print(max((-1) >>> 9, min(9, 3000000000)))", "36028797018963967"],
+    // 4.3: an integer arm beside a wide decimal arm is i64; a join tree is typed by its arms
+    ["let c = false\nprint((if c { -9000000003 } else { -1 }) + 0xFFFFFFFF)", "4294967294"],
+    ["let c = true\nprint((if c { 2147483647 } else { 1 }) * 2)", "-2"],
+    ["let c = false\nprint(((if c { 65535 } else { 0xFFFFFFFF }) * 7) + (0xFFFFFFFF + 4294967296))", "38654705656"],
+    // Q9: a float constant beside an f32 folds at f32, in a comparison and as a join's arm
+    ["const f: f32 = 0.1\nprint((16777217.0 - 1.5) < max(f, 16777217.0))", "true"],
+    ["const a: f32 = 1.0\nlet c = true\nprint(a / (if c { (0.1 * 0.1) } else { 0.5 }))", "99.99999237060547"],
     // 4.1 / D1890: `as f32` rounds an integer constant once
     ["print(9000000003 as f32)", "9000000512"],
     // E8.3: a constant cast to `u8` is checked against 0..255; a radix one at its 32-bit pattern
@@ -134,7 +154,8 @@ Deno.test("oracle: pinned regressions", () => {
   }
   // T1.3: a storage width is no cast target; E8.2: a failed bare `as` at top level has no function to return null
   // E8.2: a constant cast that can never succeed; E8.4: `as%` to a float
-  for (const src of ["print(7 as? u16)", "print(300 as u8)", "print(300 as? u8)", "print(3.9 as? i32)", "print(3 as% f64)"]) {
+  // E6.2 and D2.3: a constant shift count out of range, and a constant zero divisor
+  for (const src of ["print(7 as? u16)", "print(300 as u8)", "print(300 as? u8)", "print(3.9 as? i32)", "print(3 as% f64)", "print(9 << 64)", "print(9 << (-1))", "const x: i32 = 5\nprint(x << 40)", "print(7 / (3 - 3))", "print(0xFF / 0)"]) {
     const o = interpret(src + "\n");
     if (o.kind !== "fault") throw new Error(`${src}: want fault, got ${o.kind} ${JSON.stringify(o.out)}`);
   }
@@ -178,4 +199,12 @@ Deno.test("oracle: a known.txt row line files a refusal; a cell line does not", 
   const got = JSON.stringify(knownRefusals(["ar_s1_0001", "D16412  monomorphize: unsupported argument type for `", "D1  x  y"]));
   const want = JSON.stringify([{ row: "D16412", fragment: "monomorphize: unsupported argument type for `" }, { row: "D1", fragment: "x  y" }]);
   if (got !== want) throw new Error(`want ${want}, got ${got}`);
+});
+
+// An emulation reproduces an OPEN row's compiled reading; the PR that closes the row deletes it.
+Deno.test("oracle: every `(emulated)` known.txt row is open", () => {
+  for (const row of knownEmulations()) {
+    const head = Deno.readTextFileSync(new URL(`../docs/internals/inventory/${row}.md`, import.meta.url)).split("\n")[2] ?? "";
+    if (/^\*\*closed\b/.test(head)) throw new Error(`${row} is closed: delete its emulation in interp.ts and its known.txt line`);
+  }
 });

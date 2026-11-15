@@ -422,7 +422,7 @@ Deno.test({
       "tail",
       TAIL,
       DROP_NONE,
-      "floor: already a box=3; nested agree=4; nested floor: never returns=1; nested table=1; nested value already a box=4; nested value never returns=1; table=4",
+      "floor: already a box=3; nested agree=4; nested table=1; nested value already a box=4; table=4",
     ),
 });
 

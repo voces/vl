@@ -11,7 +11,6 @@ import {
   OStr,
   OVar,
   Opnd,
-  PrimOp,
   RCall,
   RCallHost,
   RCallRef,
@@ -74,7 +73,7 @@ import { i32ToStr } from "./ast"
 // (-1 for a variable or the header), with the reason.
 export type IrVerdict = { vfRule: i32, vfNode: i32, vfMsg: string }
 
-let vf: IrFn = irFnNew(-1, "")
+let vf = irFnNew(-1, "")
 let vfRule = 0
 let vfAt = -1
 let vfMsg = ""
@@ -183,7 +182,7 @@ function primSig(r: RPrimOp, dst: i32, at: i32) {
     return fail(2, at, r.poOp + "'s operands differ in rep")
   }
   const k = repWhat(ar)
-  const op: PrimOp = r.poOp
+  const op = r.poOp
   const kindOk = match op {
     "add" | "sub" | "mul" | "div" | "rem" | "lt" | "le" | "gt" | "ge" | "neg" => isNum(k)
     "divu" | "remu" | "ltu" | "leu" | "gtu" | "geu" | "shl" | "shr" | "shru" => isInt(k)
@@ -433,7 +432,7 @@ function stmt(id: i32) {
     return fail(5, id, "a body names no node")
   }
   nodeRepClosed(id)
-  const n: IrNode = vf.irNodes[id]
+  const n = vf.irNodes[id]
   match n {
     SLet => {
       const d = n.lDst
@@ -631,6 +630,38 @@ function nodeRepClosed(id: i32) {
   return 0
 }
 
+// The uninstalled bounds rule: no list access may pass unchecked, so any one fails.
+function boundsNone(f: IrFn): string {
+  for n in f.irNodes {
+    if touchesList(n) { return "bounds rule not installed" }
+  }
+  return ""
+}
+
+// Whether node `n` reads or writes a list element, or checks a bound.
+function touchesList(n: IrNode): boolean {
+  return match n {
+    SListSet | SBoundsCheck => true
+    SLet => rhsReadsList(n.lRhs)
+    SEffect => rhsReadsList(n.efRhs)
+    SAssign | SSetField | SCellSet | SGlobalSet | SBlock | SLoop | SIf | SSwitch | SBr | SReturn | STrap | SDrop => false
+  }
+}
+
+function rhsReadsList(r: Rhs): boolean {
+  return match r {
+    RListGet => true
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RMapOp | RStrOp | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet => false
+  }
+}
+
+// The bounds rule, installed with the list builder; it answers "" or what broke, naming the node.
+export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
+
+// Whether type `ty` is no closed type a variable can have (rule 1): absent, or open in a type
+// parameter. The builder asks it first, so such a function is uncovered rather than refused.
+export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
+
 // Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
 export function irVerify(f: IrFn): IrVerdict {
   vf = f
@@ -654,7 +685,7 @@ export function irVerify(f: IrFn): IrVerdict {
         -1,
         "v" + i32ToStr(i) + "'s rep is " + repWhat(v.vRep) + ", not a closed rep",
       )
-    } else if v.vTy < 0 || tyHasTyVar(v.vTy) {
+    } else if irTyOpen(v.vTy) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
     } else if repNodeOfTy(v.vTy) != v.vRep {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
@@ -669,6 +700,11 @@ export function irVerify(f: IrFn): IrVerdict {
     )
   }
   for id in f.irBody { stmt(id) }
+  // Rule 8, the bounds checks, is the list builder's (`ir_verify_bounds.vl`).
+  if vfRule == 0 {
+    const b = irBoundsRuleHook(f)
+    if b != "" { fail(8, -1, b) }
+  }
   // Rule 5 at the end: a function with a result leaves its body on every path.
   if !repIsNoValue(f.irRetRep) && !irBodyLeaves(f, f.irBody) {
     fail(5, -1, "a valued function falls off its end")

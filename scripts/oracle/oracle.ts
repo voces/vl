@@ -10,13 +10,16 @@
 // scripts/oracle/known.txt, 2 on a usage or budget failure, else 0. known.txt lists cells one per
 // line, and filed refusals as `D<id>  <message fragment>`, one line per row.
 
-import { Interp, Trap, TypeFault } from "./interp.ts";
+import { emulating, Interp, Trap, TypeFault } from "./interp.ts";
 import { Unsupported } from "./syntax.ts";
 
 export type Outcome = { kind: "ok" | "trap" | "fault" | "unsupported"; out: string[]; msg: string };
 
-export function interpret(src: string, fuel = 2_000_000): Outcome {
+// `emulate` names filed rows whose compiled reading the run reproduces (`interp.ts` `emulating`).
+export function interpret(src: string, fuel = 2_000_000, emulate: string[] = []): Outcome {
   const it = new Interp(fuel);
+  emulating.clear();
+  for (const r of emulate) emulating.add(r);
   try {
     it.run(src);
     return { kind: "ok", out: it.out, msg: "" };
@@ -27,19 +30,26 @@ export function interpret(src: string, fuel = 2_000_000): Outcome {
     if (e instanceof RangeError) return { kind: "unsupported", out: it.out, msg: "host stack: " + e.message };
     // Anything else is a defect in the oracle itself: say so, never a verdict about VL.
     return { kind: "unsupported", out: it.out, msg: "ORACLE BUG: " + (e instanceof Error ? e.stack ?? e.message : String(e)) };
+  } finally {
+    emulating.clear();
   }
 }
 
 // One cell's verdict, from the oracle's outcome and the compiled side's.
-//   AGREE        both ran and printed the same thing, or both refused/trapped alike
+//   AGREE        both ran and printed the same thing, both trapped, or the checker refused and
+//                the oracle faulted
 //   DISAGREE     the compiled program ran and printed something else, or trapped where the oracle ran
 //   UNSOUND      the checker accepted a program the oracle caught putting a value where its type forbids
 //   COMPILED-BAD the compiled side failed (invalid wasm, trap, wrong value) and the oracle ran it
 //   ORACLE-RUNS-REJECTED  `vl check` refused it, the oracle ran it to the expected output (clause-2 evidence)
+//   REFUSED      `vl check` refused it and the oracle ran it (no expectation to compare): counted,
+//                never agreement; fuzz.sh bounds a generator's share of these
 //   REFUSED-FILED the compile failed with a refusal a known.txt row names (`diff` only): loud, filed,
 //                 counted per row, not a miscompile
+//   FILED-WRONG  a DISAGREE the oracle reproduces under exactly one `(emulated)` row's reading
+//                (`diff` only): a filed wrong value, counted per row, whatever the seed
 //   SKIP         outside the oracle subset
-export type Verdict = "AGREE" | "DISAGREE" | "UNSOUND" | "COMPILED-BAD" | "REFUSED-FILED" | "ORACLE-RUNS-REJECTED" | "SKIP";
+export type Verdict = "AGREE" | "DISAGREE" | "UNSOUND" | "COMPILED-BAD" | "REFUSED-FILED" | "FILED-WRONG" | "REFUSED" | "ORACLE-RUNS-REJECTED" | "SKIP";
 
 export type Compiled = { cls: "runs" | "rejected" | "trap" | "invalid" | "wrong"; out: string[] | null };
 
@@ -51,9 +61,11 @@ export function judge(o: Outcome, c: Compiled, expect: string[] | null): { v: Ve
     if (c.cls === "rejected") return { v: "AGREE", why: "checker refused; oracle faulted: " + o.msg };
     return { v: "UNSOUND", why: o.msg };
   }
+  // A refusal agrees only with an oracle that refuses too; one the oracle runs (to output or a
+  // trap) is REFUSED, its own count, so a refused population can never read as agreement.
   if (c.cls === "rejected") {
     if (o.kind === "ok" && expect && same(o.out, expect)) return { v: "ORACLE-RUNS-REJECTED", why: "" };
-    return { v: "AGREE", why: "checker refused" };
+    return { v: "REFUSED", why: o.kind === "trap" ? `checker refused; oracle traps (${o.msg})` : "checker refused; oracle ran" };
   }
   if (o.kind === "trap") {
     if (c.cls === "trap") return { v: "AGREE", why: "both trap" };
@@ -100,7 +112,15 @@ function known(): Set<string> {
 export function knownRefusals(lines = knownLines()): { row: string; fragment: string }[] {
   return lines.flatMap((l) => {
     const m = ROW_LINE.exec(l);
-    return m ? [{ row: m[1], fragment: m[2].trim() }] : [];
+    return m && m[2].trim() !== EMULATED ? [{ row: m[1], fragment: m[2].trim() }] : [];
+  });
+}
+// A filed wrong value the oracle can reproduce: `D<id>  (emulated)`, one line per row.
+const EMULATED = "(emulated)";
+export function knownEmulations(lines = knownLines()): string[] {
+  return lines.flatMap((l) => {
+    const m = ROW_LINE.exec(l);
+    return m && m[2].trim() === EMULATED ? [m[1]] : [];
   });
 }
 
@@ -117,8 +137,13 @@ function report(rows: Row[], jsonOut: string | null, elapsed: number, base: Set<
     console.log(`${r.verdict.padEnd(12)} ${r.cell}${k.has(r.cell) ? " (known)" : inBase(r) ? " (on the base too)" : ""}  ${r.why.slice(0, 300)}`);
   }
   const perRow = new Map<string, number>();
-  for (const r of rows) if (r.verdict === "REFUSED-FILED") perRow.set(r.why.split(" ")[0], (perRow.get(r.why.split(" ")[0]) ?? 0) + 1);
-  for (const [row, n] of [...perRow].sort()) console.log(`REFUSED-FILED ${row}: ${n} cell(s)`);
+  for (const r of rows) {
+    if (r.verdict === "REFUSED-FILED" || r.verdict === "FILED-WRONG") {
+      const key = r.verdict + " " + r.why.split(" ")[0];
+      perRow.set(key, (perRow.get(key) ?? 0) + 1);
+    }
+  }
+  for (const [key, n] of [...perRow].sort()) console.log(`${key}: ${n} cell(s)`);
   if (jsonOut) Deno.writeTextFileSync(jsonOut, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
   const ran = rows.length - (counts.get("SKIP") ?? 0);
   console.log(
@@ -171,6 +196,7 @@ function diff(args: string[]): number {
   const t0 = Date.now();
   const rows: Row[] = [];
   const refusals = knownRefusals();
+  const emulations = knownEmulations();
   for (const ent of [...Deno.readDirSync(cases)].map((e) => e.name).filter((n) => n.endsWith(".vl")).sort()) {
     const src = Deno.readTextFileSync(`${cases}/${ent}`);
     const o = interpret(src);
@@ -192,6 +218,14 @@ function diff(args: string[]): number {
       else cls = "trap";
     }
     const j = judge(o, { cls, out }, null);
+    // A wrong value one filed row's emulated reading reproduces is that row's, whatever the seed.
+    if (j.v === "DISAGREE" && cls === "runs") {
+      const by = emulations.filter((row) => judge(interpret(src, undefined, [row]), { cls, out }, null).v === "AGREE");
+      if (by.length === 1) {
+        rows.push({ cell: ent.replace(/\.vl$/, ""), verdict: "FILED-WRONG", why: by[0] + " | " + j.why.slice(0, 160) });
+        continue;
+      }
+    }
     // A loud refusal a row files is not a miscompile; a trap or a wrong value never matches one.
     const filed = j.v === "COMPILED-BAD" && cls === "invalid" && /emit error/.test(err)
       ? refusals.find((r) => err.includes(r.fragment)) : undefined;

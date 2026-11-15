@@ -267,6 +267,7 @@ import {
   nodeTySet,
 } from "./check_node_tys"
 import {
+  coalUnionHolds,
   f32LitTailsAdopt,
   litTailsTakeFloat,
   litTreeAdoptDst,
@@ -332,6 +333,7 @@ import {
   REC_DELIV_READ,
   recAdLandingList,
   recAdPushDecl,
+  recAdPushListDecl,
   recAdPushMapDecl,
   recAdPushUnionList,
   recApartAt,
@@ -531,6 +533,7 @@ import {
   mkNullableTy,
   mkObjTy,
   nwTyIxs,
+  objFieldIndexOf,
   objFieldType,
   structNameOfTy,
   tyAllMaps,
@@ -548,6 +551,7 @@ import {
   tyFieldTyOf,
   tyHasHole,
   tyHasInferHole,
+  tyHasLitMemberText,
   tyHasMapMember,
   tyHoldsObjDeep,
   tyIsHole,
@@ -557,7 +561,6 @@ import {
   tyIxIsView,
   tyKeyOf,
   tyKeyOpen,
-  tyLitMemberTexts,
   tyMutEpoch,
   tyNameAtoms,
   tyReachesEmptyHole,
@@ -633,6 +636,7 @@ import {
   nonNulTyOf,
   nonNullTy,
   nulFoldMemberTy,
+  nulLitUnionPeelTy,
   nullableInnerOrNone,
   primIsSubWord,
   primNameOf,
@@ -642,7 +646,6 @@ import {
   tyHoldsNumericPrim,
   tyIsListTy,
   tyLitSetMemberLexes,
-  tyNulLitUnionMemberTexts,
   tyReachesHole,
   tysHaveTyVarIn,
   unionLeavesInto,
@@ -1211,12 +1214,7 @@ export function listFieldWidenDst(srcExpr: i32, dstTy: i32): i32 {
     while k < e.objFields.length {
       const f = nodeAt(e.objFields[k])
       if f is FieldInit {
-        let dj = -1
-        let j = 0
-        while j < d.objFieldNames.length {
-          if d.objFieldNames[j] == f.fiName { dj = j }
-          j = j + 1
-        }
+        const dj = objFieldIndexOf(d, f.fiName)
         if dj < 0 { return -1 }
         const own = nodeTyIxOf(f.fiValue)
         if own < 0 { return -1 }
@@ -4447,7 +4445,13 @@ function recHeldListSpreadStampAt(x: i32, rep: i32): boolean {
   if l < 0 { return false }
   const sv = cwPeelValue(x)
   adoptLitAt(l, mkArrayTy(rep))
-  return recHeldOwnRefuse(recHeldDecl(sv), rep, sv, [sv])
+  const d = recHeldDecl(sv)
+  // Its reads, a nullable one's included, are built where its records are.
+  const oe = tyArrayElemIx(nodeTyIxOf(sv))
+  if oe >= 0 && oe < T.tys.length {
+    recAdPushListDecl(d, nonNullTy(oe), rep, sv)
+  }
+  return recHeldOwnRefuse(d, rep, sv, [sv])
 }
 
 // Builds the fresh record `const` that list literal part `p` reads at the record `rep` the list's
@@ -9249,8 +9253,7 @@ function tyIsAtomSet(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
   const n = tyAt(t)
   if !(n is TyLit || n is TyUnion || n is TyNullable) { return false }
-  return tyLitMemberTexts(t).length > 0
-    || tyNulLitUnionMemberTexts(t).length > 0
+  return tyHasLitMemberText(t) || tyHasLitMemberText(nulLitUnionPeelTy(t))
 }
 
 // Records union `t` as the box destination of node `ix` and each value leaf it delivers through,
@@ -9643,18 +9646,13 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
     ObjLit => {
       match d {
         TyObj => {
-          const dfn = d.objFieldNames
-          const dft = d.objFieldTypes
           let k = 0
           while k < e.objFields.length {
             const f = nodeAt(e.objFields[k])
             if f is FieldInit {
-              let j = 0
-              while j < dfn.length {
-                if dfn[j] == f.fiName {
-                  recordRepTyAdopt(f.fiValue, dft[j], depth - 1)
-                }
-                j = j + 1
+              const j = objFieldIndexOf(d, f.fiName)
+              if j >= 0 {
+                recordRepTyAdopt(f.fiValue, d.objFieldTypes[j], depth - 1)
               }
             }
             k = k + 1
@@ -9750,9 +9748,12 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
       numLitAdoptDst(srcExpr, dtix)
       return 0
     }
-    // A `??` delivers its value from either operand, so each is built at the destination.
+    // A `??` delivers its value from either operand, so each is built at the destination,
+    // unless its number union is no member of it: the union is built, then converted.
     BinExpr => {
-      if e.binOp != "??" { return 0 }
+      if e.binOp != "??" || !coalUnionHolds(nodeTyOf(srcExpr), dtix) {
+        return 0
+      }
       const l = recordRepTyAdopt(e.binLeft, dtix, depth - 1)
       // A join on the left is built at the destination too, as its arms are.
       const lj = parenPeelIx(e.binLeft)

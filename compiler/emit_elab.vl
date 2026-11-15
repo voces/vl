@@ -1817,6 +1817,8 @@ export function elabWalkNarrowedTy(ix: i32): i32 {
 // The instances of nested declaration `d` under instance `k`: those under the parent key
 // `elabParentFor` names, narrowed to the ones `k`'s body reaches when that key holds several.
 function elabKidsAt(d: i32, k: i32): i32[] {
+  // Every instance is noted under its declaration, so one with none has none under any parent.
+  if (ekByDecl[d] ?? []).length == 0 { return [] }
   const parent = elabParentFor(d, k)
   if parent < -1 { return [] }
   const ks = ekKids[i32ToStr(parent) + "^" + i32ToStr(d)] ?? []
@@ -8221,9 +8223,9 @@ function elabHolderWritesAgree(h: i32, from: i32, rec: i32[]): boolean {
 }
 
 // The function declaration whose body holds node `x`; -1 at the top level, -2 where the parent
-// table does not reach `x`.
+// table does not reach `x`, as for a node minted after the index's build.
 function elabEnclosingFn(x: i32): i32 {
-  if x < 0 || !cwIxCovers(x) { return -2 }
+  if x < 0 || x >= cwIxCoveredLen() || !cwIxCovers(x) { return -2 }
   let cur = cwIxParent[x]
   let guard = 0
   while cur >= 0 && guard < 4096 {
@@ -10670,18 +10672,11 @@ export function elabRun() {
     if !elabRowClosedOrSet(tys) {
       let ct = elabRowByFnResults(ix, callBindNamesAt(r), tys)
       if ct.length == 0 { ct = elabRowByPlainArgs(ix, callBindNamesAt(r), tys) }
-      // A row only the D4551 default closes is a guess, as the default instance is.
-      let byDefault = false
-      if ct.length == 0 {
-        ct = elabRowArgDefaults(ix, tys)
-        byDefault = ct.length > 0
-      }
       if ct.length == 0 { ct = elabRowEmptyListDefaults(ix, tys) }
       if ct.length > 0 {
         elabArgRows(ix, elabCallDeclOf(ix), callBindNamesAt(r), ct, -1)
         const dk = elabEnqueue(elabCallDeclOf(ix), callBindNamesAt(r), ct, -1)
         elabReachNote(-1, dk, ix)
-        if byDefault && dk >= 0 { elabGuessKeys[dk] = true }
         elabSettle(0)
       }
     }
@@ -13107,35 +13102,6 @@ function elabEmptyElemsAtI32(t: i32): i32 {
   }
 }
 
-// Row `tys` of call `ix` with each binding that is a bare type variable of a generic an argument
-// holds at the default `i32` (D4551): nothing binds a generic handed only to an open slot. []
-// when the row still does not close.
-function elabRowArgDefaults(ix: i32, tys: i32[]): i32[] {
-  if ix < 0 || ix >= P.nodes.length { return [] }
-  const cn = nodeAt(ix)
-  if !(cn is Call) { return [] }
-  const own: string[] = []
-  for a in cn.callArgs {
-    for m in elabCalleeTargets(a) {
-      const ms = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { cn }
-      if ms is FuncDecl {
-        for tp in ms.fnTyParams { own.push(tp) }
-      }
-    }
-  }
-  if own.length == 0 { return [] }
-  const out: i32[] = []
-  for t in tys {
-    const tv = if t >= 0 && t < T.tys.length { tyAt(t) } else { cn }
-    if tv is TyVar && strListHas(own, tv.tvName) {
-      out.push(TY_I32)
-    } else {
-      out.push(t)
-    }
-  }
-  return if tysClosed(out) { out } else { [] }
-}
-
 // The one result every function argument `a` may hold gives at function type `pf`'s parameters
 // under `names`/`tys`, each instanced there; -1 when they are not closed or disagree.
 function elabArgResultAt(a: i32, pf: TyFunc, names: string[], tys: i32[]): i32 {
@@ -13455,17 +13421,25 @@ function elabHeldOwnResult(d: i32, pts: i32[]): i32 {
 // Whether the slot producer may demand an instance of `d`: a top-level declaration, or a lambda
 // whose enclosing scope is the module, which captures no local and so has the instance a top-level
 // declaration would. A nested or capturing one checks only in its own scope.
-function elabTopFn(d: i32): boolean {
+function elabTopFn(d0: i32): boolean {
+  const d = elabCoveredSrc(d0)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(dn is FuncDecl) { return false }
   if (fnDeclIx[dn.fnName] ?? -1) == d { return true }
   return elabModuleLam(d)
 }
 
+// `d` where the write index describes it, else -1. A node minted after the build (an instance, a
+// lambda clone) is already closed, so no instance of it may be demanded at another signature.
+function elabCoveredSrc(d: i32): i32 {
+  return if d < cwIxCoveredLen() { d } else { -1 }
+}
+
 // Whether lambda `d` sits in a module-level statement with no function, block or loop around it,
 // so every name it reads is the module's.
-function elabModuleLam(d: i32): boolean {
-  let cur = if cwIxCovers(d) { cwIxParent[d] } else { -1 }
+function elabModuleLam(d0: i32): boolean {
+  const d = elabCoveredSrc(d0)
+  let cur = if d >= 0 && cwIxCovers(d) { cwIxParent[d] } else { -1 }
   let guard = 0
   while cur >= 0 && cur < P.nodes.length && guard < 64 {
     const c = nodeAt(cur)
@@ -18660,10 +18634,43 @@ function elabObjHoldsMap(t: i32, seen: i32[]): boolean {
   return false
 }
 
-// Whether node `ix` is a list literal with no items.
+// Whether node `ix` is a list literal no item of which fixes its type: empty, or holding only
+// lists that are (`[[]]`).
 function litIsEmptyList(ix: i32): boolean {
   const n = nodeAt(ix)
-  return if n is ArrayLit { n.arrElems.length == 0 } else { false }
+  if !(n is ArrayLit) { return false }
+  for e in n.arrElems {
+    if !litIsEmptyList(e) { return false }
+  }
+  return true
+}
+
+// Whether list type `t` has a closed element at every depth.
+function litListTyClosed(t: i32, depth: i32): boolean {
+  if t < 0 || depth > 8 { return false }
+  const a = tyAt(t)
+  if !(a is TyArray) { return true }
+  if tyElemOpen(a) { return false }
+  return litListTyClosed(tyElemOf(a), depth + 1)
+}
+
+// The closed type such a list has in `fnIx`'s instance: its own there, else the element of the
+// list literal holding it (`elabArgInner`, noted as the holder resolves); -1 where neither closes.
+function litOpenListTyAt(ix: i32, fnIx: i32, depth: i32): i32 {
+  const ie = elabNodeTyAt(ix, fnIx)
+  if (
+    ie >= 0
+    && !tyHasTyVar(ie)
+    && !tyHasInferHole(ie, 0)
+    && litListTyClosed(ie, 0)
+  ) {
+    return ie
+  }
+  const o = elabArgInner[ix] ?? -1
+  if depth > 8 || o < 0 || !litIsEmptyList(o) { return -1 }
+  const ot = litOpenListTyAt(o, fnIx, depth + 1)
+  const oa = if ot >= 0 { tyAt(ot) } else { null }
+  return if oa is TyArray { tyElemOf(oa) } else { -1 }
 }
 
 // The type literal `ix` (or its copy source) is built at in emitted function `fnIx`'s instance:
@@ -18675,11 +18682,12 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   const k = elabKeyAt(fnIx)
   const r = elabPairIn(elabNodeReps, ix, k)
   if r >= 0 { return r }
-  // An empty list has no item to fix its type, so an instance's own reading of it is where it
-  // is built, ahead of any stamp the instances share (D16510).
+  // A list no item of which fixes its type takes it from where it is delivered, so an
+  // instance's own reading of it is where it is built, ahead of any shared stamp (D16510).
   if k >= 0 && litIsEmptyList(ix) {
-    const ie = elabNodeTyAt(ix, fnIx)
-    if ie >= 0 && !tyHasTyVar(ie) && !tyHasInferHole(ie, 0) { return ie }
+    elabArgInnerNote(ix)
+    const ie = litOpenListTyAt(ix, fnIx, 0)
+    if ie >= 0 { return ie }
   }
   // The record solve's closed stamp is where the literal is built; the parameter its call
   // closes is only where it is delivered (D15288).

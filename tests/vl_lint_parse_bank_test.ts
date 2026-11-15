@@ -61,17 +61,17 @@ const findings = (exp: Exports, src: string, check: boolean): string => {
 const CASES: [string, string][] = [
   [
     "plain",
-    `function f(a: i32): i32 { a + 1 }\nlet unusedOne = 2\nprint(f(3))\n`,
+    `function f(a: i32): i32 { return a + 1 }\nlet unusedOne = 2\nprint(f(3))\n`,
   ],
   [
     "match desugar (a slot rewrite)",
     `type Move = { x: i32 }\ntype Stop = { why: string }\ntype Cmd = Move | Stop\n` +
-    `function go(c: Cmd): i32 {\n  match c {\n    Move{x} => x\n    Stop => 0\n  }\n}\n` +
+    `function go(c: Cmd): i32 {\n  return match c {\n    Move{x} => x\n    Stop => 0\n  }\n}\n` +
     `print(go({ x: 7 }))\n`,
   ],
   [
     "int match desugar",
-    `function pick(n: i32): string {\n  match n {\n    1 => "one"\n    2 => "two"\n    _ => "many"\n  }\n}\n` +
+    `function pick(n: i32): string {\n  return match n {\n    1 => "one"\n    2 => "two"\n    _ => "many"\n  }\n}\n` +
     `print(pick(2))\n`,
   ],
   [
@@ -80,7 +80,7 @@ const CASES: [string, string][] = [
   ],
   [
     "literal union annotation (a spelling rewrite)",
-    `type K = "a" | "b"\nconst k: K = "a"\nfunction take(v: K): string { v }\nprint(take(k))\n`,
+    `type K = "a" | "b"\nconst k: K = "a"\nfunction take(v: K): string { return v }\nprint(take(k))\n`,
   ],
   [
     "alias cast (an `as` spelling rewrite)",
@@ -99,7 +99,7 @@ const CASES: [string, string][] = [
   ],
   [
     "unused everything (a finding-heavy program)",
-    `import { fmtI32 } from "std:fmt"\nfunction dead(a: i32): i32 { a }\n` +
+    `import { fmtI32 } from "std:fmt"\nfunction dead(a: i32): i32 { return a }\n` +
     `let never = 1\nlet used = 2\nprint(used)\n`,
   ],
 ];

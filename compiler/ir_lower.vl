@@ -29,7 +29,6 @@ import {
   LoopVar,
   MatchExpr,
   Member,
-  Node,
   NullLit,
   NumLit,
   ObjLit,
@@ -105,7 +104,9 @@ import {
   fbElse,
   fbEnd,
   fbF32ConstBits,
+  fbF32DemoteF64,
   fbF64ConstBits,
+  fbF64PromoteF32,
   fbGlobalGet,
   fbGlobalSet,
   fbI32Bin,
@@ -116,6 +117,7 @@ import {
   fbLocalGet,
   fbLocalSet,
   fbLoop,
+  fbRefAsNonNull,
   fbReturn,
   fbReturnCall,
   fbUnreachable,
@@ -123,28 +125,38 @@ import {
   wU8,
   wULEB,
 } from "./emit_bytes"
-import { userGlobalIdx, userGlobalPlain } from "./wasmEmit"
+import {
+  initBitOf,
+  userGlobalIdx,
+  userGlobalReadClass,
+  userGlobalWriteClass,
+  voidTailCallee,
+} from "./wasmEmit"
 import { RpPrim } from "./emit_rep"
 import {
-  cloLiftWriteCount,
   ctrlDepth,
   dfeCallee,
   emitFnSpanEnd,
   emitFnSpanKind,
   emitFnSpanNode,
   emitFnSpanStart,
-  fRetVoid,
+  gHelpF64Rem,
   gImports,
 } from "./emit_state"
 
+// The function being lowered.
+export function irLFn(): IrFn { return lw }
+
 // The function being lowered, the definitions of its temps, and the state of one walk.
-let lw: IrFn = irFnNew(-1, "")
+let lw = irFnNew(-1, "")
 let lwMiss = ""
 let lwTempRhs: Rhs[] = []
 let lwTempDef: boolean[] = []
 let lwTempUsed: boolean[] = []
 // Locals a valued `if` left on the stack, read once as a temp is.
 let lwStackVal: boolean[] = []
+// How many of those values are on the stack, not yet read.
+let lwStackLive = 0
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -156,7 +168,7 @@ let lwRowAst: i32[] = []
 let lwRowFrom: i32[] = []
 let lwRowTo: i32[] = []
 
-function miss(why: string) {
+export function irLMiss(why: string) {
   if lwMiss == "" { lwMiss = why }
   return 0
 }
@@ -172,7 +184,7 @@ function tempDefined(v: i32): boolean {
 
 function tempRhs(v: i32): Rhs {
   if v >= 0 && v < lwTempRhs.length { return lwTempRhs[v] }
-  const none: Rhs = { ggSym: -1 }
+  const none: Rhs = { ggSym: -1, ggNonNull: false }
   return none
 }
 
@@ -189,40 +201,51 @@ function isTemp(v: i32): boolean {
 
 // Writes operand `o`: a variable's `local.get`, an immediate's constant, or a temp's own
 // right-hand side, written here at its one use.
-function opnd(o: Opnd) {
+export function irLOpnd(o: Opnd) {
   match o {
     OVar => {
       const v = o.ov
       if v >= 0 && v < lwStackVal.length && lwStackVal[v] {
-        if !takeUse(v) { return miss("non-stack temp: used twice") }
+        if !takeUse(v) { return irLMiss("non-stack temp: used twice") }
         lwSeq.push(v)
+        lwStackLive = lwStackLive - 1
         return 0
       }
       if isTemp(v) {
-        if !tempDefined(v) { return miss("temp used before its definition") }
-        if !takeUse(v) { return miss("non-stack temp: used twice") }
+        if !tempDefined(v) { return irLMiss("temp used before its definition") }
+        if !takeUse(v) { return irLMiss("non-stack temp: used twice") }
         rhs(tempRhs(v), false)
         lwSeq.push(v)
         return 0
       }
       const s = varSlot(v)
-      if s < 0 { return miss("unmapped slot") }
+      if s < 0 { return irLMiss("unmapped slot") }
+      leaf()
       fbLocalGet(s)
     }
-    OImm => imm(o)
-    OStr => miss("string operand")
+    OImm => {
+      leaf()
+      imm(o)
+    }
+    OStr => irLMiss("string operand")
   }
+}
+
+// Before a value that reads no operand: one written while a valued `if`'s value waits on the
+// stack lands above it, out of order.
+function leaf() {
+  if lwStackLive > 0 { irLMiss("operand above a valued if's value") }
 }
 
 function imm(o: OImm) {
   const p = repPrim(o.oiRep)
-  if p == null { return miss("immediate rep") }
+  if p == null { return irLMiss("immediate rep") }
   match p {
     "i32" | "bool" => fbI32Const(o.oiBits as% i32)
     "i64" => fbI64Const((o.oiBits >> 32) as% i32, o.oiBits as% i32)
     "f32" => fbF32ConstBits(o.oiBits)
     "f64" => fbF64ConstBits(o.oiBits)
-    "str" | "u8" | "null" | "v128" => miss("immediate at " + p)
+    "str" | "u8" | "null" | "v128" => irLMiss("immediate at " + p)
   }
 }
 
@@ -332,33 +355,48 @@ function opF64(op: PrimOp): i32 {
 
 function primOp(r: RPrimOp) {
   const a = r.poArgs
-  if a.length == 0 { return miss("operandless op") }
+  if a.length == 0 { return irLMiss("operandless op") }
   const p = repPrim(opRepOf(a[0]))
-  if p == null { return miss("op over a non-primitive") }
+  if p == null { return irLMiss("op over a non-primitive") }
   const ps: string = p
   // A negated integer literal is the literal's own negative constant.
   if r.poOp == "neg" && (ps == "i32" || ps == "i64") {
     const x = a[0]
     if x is OImm {
       const neg: Opnd = { oiRep: x.oiRep, oiBits: 0 - x.oiBits }
-      return opnd(neg)
+      return irLOpnd(neg)
     }
     // Legacy's `0 - x`.
     if ps == "i32" {
       fbI32Const(0)
-      opnd(x)
+      irLOpnd(x)
       fbI32Bin(107) // i32.sub
     } else {
       fbI64Const(0, 0)
-      opnd(x)
+      irLOpnd(x)
       fbI32Bin(125) // i64.sub
     }
     return 0
   }
-  for x in a { opnd(x) }
+  // Float `%` has no instruction: legacy's call into `__f64_rem__`, f32 widened and narrowed.
+  if r.poOp == "rem" && (ps == "f32" || ps == "f64") {
+    return floatRem(a, ps == "f32")
+  }
+  for x in a { irLOpnd(x) }
   const code = primOpcode(r.poOp, p)
-  if code < 0 { return miss(r.poOp + " over " + ps) }
+  if code < 0 { return irLMiss(r.poOp + " over " + ps) }
   fbI32Bin(code)
+}
+
+function floatRem(a: Opnd[], atF32: boolean) {
+  if gHelpF64Rem < 0 || a.length != 2 { return irLMiss("float rem helper") }
+  for x in a {
+    irLOpnd(x)
+    if atF32 { fbF64PromoteF32() }
+  }
+  fbCall(gHelpF64Rem)
+  if atF32 { fbF32DemoteF64() }
+  return 0
 }
 
 function opRepOf(o: Opnd): i32 {
@@ -369,13 +407,16 @@ function opRepOf(o: Opnd): i32 {
   }
 }
 
-// Writes a call's operands, then the call, or its tail form when `tail`.
+// A call, in its tail form when `tail` and the callee returns; a never-returning callee's call is
+// followed by `unreachable` instead.
 function call(c: RCall, tail: boolean) {
-  for a in c.caArgs { opnd(a) }
-  if tail {
+  if c.caArgs.length == 0 { leaf() }
+  for a in c.caArgs { irLOpnd(a) }
+  if tail && !c.caNever {
     fbReturnCall(gImports + c.caCallee)
   } else {
     fbCall(gImports + c.caCallee)
+    if c.caNever { fbUnreachable() }
   }
 }
 
@@ -384,12 +425,19 @@ function rhs(r: Rhs, tail: boolean) {
     RPrimOp => primOp(r)
     RCall => call(r, tail)
     RGlobalGet => {
-      if !userGlobalPlain(r.ggSym, false) {
-        return miss("global read with a guard or a fold")
+      match userGlobalReadClass(r.ggSym) {
+        "plain" => {
+          leaf()
+          fbGlobalGet(userGlobalIdx(r.ggSym))
+          if r.ggNonNull { fbRefAsNonNull() }
+        }
+        "fold" => irLMiss("folded global read")
+        "promo" => irLMiss("promoted global read")
+        "guard" => irLMiss("guarded global read")
       }
-      fbGlobalGet(userGlobalIdx(r.ggSym))
     }
-    RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListGet | RListLen | RMapOp | RStrOp | RMakeClo | RFnId | RCellNew | RCellGet => miss("rhs outside I1")
+    RListGet | RListLen => irLowerListHook(r)
+    RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RMapOp | RStrOp | RMakeClo | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
   }
 }
 
@@ -414,19 +462,19 @@ function isTrue(o: Opnd): boolean {
 // Writes `o` as a condition, then checks that it consumed exactly the temps `pending` defined.
 function cond(o: Opnd, pending: i32[]) {
   lwSeq = []
-  opnd(o)
-  settle(pending)
+  irLOpnd(o)
+  irLSettle(pending)
 }
 
 // The stack-order precondition: the temps a node's operands consumed are the ones its body
 // defined since the previous node, in definition order.
-function settle(pending: i32[]) {
+export function irLSettle(pending: i32[]) {
   if lwSeq.length != pending.length {
-    miss("non-stack temp: out of order")
+    irLMiss("non-stack temp: out of order")
   } else {
     let i = 0
     while i < pending.length {
-      if lwSeq[i] != pending[i] { miss("non-stack temp: out of order") }
+      if lwSeq[i] != pending[i] { irLMiss("non-stack temp: out of order") }
       i = i + 1
     }
   }
@@ -447,15 +495,6 @@ function callTemp(o: Opnd): i32 {
   }
 }
 
-// Whether callee `pos` returns nothing and hands no captures back, so a void tail call to it
-// can be its tail form (legacy's `emitVoidTailCall`).
-function voidTailCallee(pos: i32): boolean {
-  return pos >= 0
-    && pos < fRetVoid.length
-    && fRetVoid[pos] == 1
-    && cloLiftWriteCount(pos) == 0
-}
-
 // Writes body `b`; `tail` when its last node ends a void function, and `out` the slotless
 // variable its valued `if`'s arm ends by writing (-1 for none).
 function body(b: i32[], tail: boolean, out: i32) {
@@ -474,17 +513,17 @@ function body(b: i32[], tail: boolean, out: i32) {
     spanClose(id)
     i = i + 1
   }
-  if pending.length > 0 { miss("non-stack temp: unconsumed") }
+  if pending.length > 0 { irLMiss("non-stack temp: unconsumed") }
   return 0
 }
 
 function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
-  if id < 0 || id >= lw.irNodes.length { return miss("no node") }
+  if id < 0 || id >= lw.irNodes.length { return irLMiss("no node") }
   const n = lw.irNodes[id]
   match n {
     SLet => {
-      if !isTemp(n.lDst) { return miss("let of a non-temp") }
-      if n.lDst >= lwTempRhs.length { return miss("let of a non-temp") }
+      if !isTemp(n.lDst) { return irLMiss("let of a non-temp") }
+      if n.lDst >= lwTempRhs.length { return irLMiss("let of a non-temp") }
       lwTempRhs[n.lDst] = n.lRhs
       lwTempDef[n.lDst] = true
       pending.push(n.lDst)
@@ -494,15 +533,24 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       // An arm's write of its valued `if`'s out leaves the value as the arm's result.
       if armOut >= 0 && n.asDst == armOut { return 0 }
       const s = varSlot(n.asDst)
-      if s < 0 { return miss("unmapped slot") }
+      if s < 0 { return irLMiss("unmapped slot") }
       fbLocalSet(s)
     }
     SGlobalSet => {
-      if !userGlobalPlain(n.gsSym, true) {
-        return miss("global write with a guard or a bit")
+      match userGlobalWriteClass(n.gsSym) {
+        "plain" => {
+          cond(n.gsSrc, pending)
+          fbGlobalSet(userGlobalIdx(n.gsSym))
+          const bit = initBitOf(n.gsSym)
+          if bit >= 0 {
+            fbI32Const(1)
+            fbGlobalSet(bit)
+          }
+        }
+        "promo" => irLMiss("promoted global write")
+        "immutable" => irLMiss("immutable global write")
+        "guard" => irLMiss("guarded global write")
       }
-      cond(n.gsSrc, pending)
-      fbGlobalSet(userGlobalIdx(n.gsSym))
     }
     SEffect => {
       lwSeq = []
@@ -510,16 +558,16 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       if r is RCall {
         const t = tail && voidTailCallee(r.caCallee)
         call(r, t)
-        settle(pending)
+        irLSettle(pending)
         const si = irSigOf(lw, r.caCallee)
         if !t && si >= 0 && !repIsNoValue(lw.irSigRet[si]) { fbDrop() }
         return 0
       }
-      miss("effect outside I1")
+      irLMiss("effect outside I1")
     }
     SBlock => {
-      settle(pending)
-      if n.bkOut >= 0 { return miss("valued block") }
+      irLSettle(pending)
+      if n.bkOut >= 0 { return irLMiss("valued block") }
       fbBlock(64)
       lwFrames.push(n.bkLabel)
       body(n.bkBody, false, -1)
@@ -527,7 +575,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       fbEnd()
     }
     SLoop => {
-      settle(pending)
+      irLSettle(pending)
       fbLoop(64)
       lwFrames.push(n.lpLabel)
       body(n.lpBody, false, -1)
@@ -536,22 +584,23 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     }
     SIf => ifNode(n, pending, tail)
     SBr => {
-      settle(pending)
-      if n.brHas { return miss("valued branch") }
+      irLSettle(pending)
+      if n.brHas { return irLMiss("valued branch") }
       const d = brDepth(n.brLabel)
-      if d < 0 { return miss("branch out of its frames") }
+      if d < 0 { return irLMiss("branch out of its frames") }
       fbBr(d)
     }
     SReturn => ret(n, pending)
     STrap => {
-      settle(pending)
+      irLSettle(pending)
       fbUnreachable()
     }
     SDrop => {
       cond(n.dpV, pending)
       fbDrop()
     }
-    SSetField | SListSet | SCellSet | SBoundsCheck | SSwitch => miss("statement outside I1")
+    SBoundsCheck => irLowerBoundsHook(n, pending)
+    SSetField | SListSet | SCellSet | SSwitch => irLMiss("statement outside I1")
   }
 }
 
@@ -563,7 +612,7 @@ function ifNode(n: SIf, pending: i32[], tail: boolean) {
     && n.siElse.length == 1
     && isBr(n.siElse[0])
   if isTrue(n.siCond) && (exitBr || n.siElse.length == 0) {
-    settle(pending)
+    irLSettle(pending)
     if !exitBr { body(n.siThen, tail, -1) }
     return 0
   }
@@ -572,7 +621,7 @@ function ifNode(n: SIf, pending: i32[], tail: boolean) {
     const b = lw.irNodes[n.siElse[0]]
     if b is SBr {
       const d = brDepth(b.brLabel)
-      if d < 0 { return miss("branch out of its frames") }
+      if d < 0 { return irLMiss("branch out of its frames") }
       fbI32Eqz()
       fbBrIf(d)
     }
@@ -593,12 +642,12 @@ function ifNode(n: SIf, pending: i32[], tail: boolean) {
 // `||`), whose result stays on the stack for the out's one later read.
 function valuedIf(n: SIf, pending: i32[]) {
   const t = n.siOut
-  if varSlot(t) >= 0 { return miss("valued if into a slot") }
+  if varSlot(t) >= 0 { return irLMiss("valued if into a slot") }
   if t < 0 || t >= lw.irVars.length || t >= lwStackVal.length {
-    return miss("valued if out")
+    return irLMiss("valued if out")
   }
   const vt = valtypeOf(lw.irVars[t].vRep)
-  if vt < 0 { return miss("valued if rep") }
+  if vt < 0 { return irLMiss("valued if rep") }
   cond(n.siCond, pending)
   fbIf(vt)
   lwFrames.push(-1)
@@ -608,6 +657,7 @@ function valuedIf(n: SIf, pending: i32[]) {
   lwFrames.pop()
   fbEnd()
   lwStackVal[t] = true
+  lwStackLive = lwStackLive + 1
   pending.push(t)
   return 0
 }
@@ -620,7 +670,7 @@ function isBr(id: i32): boolean {
 // A return: its value, then `return`, or a call's tail form when the value is a direct call.
 function ret(n: SReturn, pending: i32[]) {
   if !n.rtHas {
-    settle(pending)
+    irLSettle(pending)
     return fbReturn()
   }
   const callee = callTemp(n.rtV)
@@ -632,7 +682,7 @@ function ret(n: SReturn, pending: i32[]) {
       lwSeq = []
       if r is RCall { call(r, true) }
       lwSeq.push(t.ov)
-      settle(pending)
+      irLSettle(pending)
     }
     return 0
   }
@@ -719,13 +769,16 @@ function valtypeOf(r: i32): i32 {
 function localsVec(firstSlot: i32): u8[] {
   const out: u8[] = []
   const slots: i32[] = []
-  const types: i32[] = []
-  for v in lw.irVars {
+  const vars: i32[] = []
+  let vi = 0
+  while vi < lw.irVars.length {
+    const v = lw.irVars[vi]
     // A local with no slot is a valued `if`'s out, which stays on the stack.
     if v.vKind == "local" && v.vSlot >= 0 {
       slots.push(v.vSlot)
-      types.push(valtypeOf(v.vRep))
+      vars.push(vi)
     }
+    vi = vi + 1
   }
   const prev = wTarget(out)
   wULEB(slots.length)
@@ -737,16 +790,24 @@ function localsVec(firstSlot: i32): u8[] {
       if slots[k] == want { found = k }
       k = k + 1
     }
-    if found < 0 || types[found] < 0 {
-      miss("locals layout")
-    } else {
-      wULEB(1)
-      wU8(types[found])
-    }
+    if found < 0 { irLMiss("locals layout") } else { localRun(vars[found]) }
     want = want + 1
   }
   wTarget(prev)
   return out
+}
+
+// One `(1, valtype)` run for variable `v`: a scalar's own byte, else the bytes the list lowering
+// reads off legacy's frame for a reference rep.
+function localRun(v: i32) {
+  const r = irLFn().irVars[v]
+  const t = valtypeOf(r.vRep)
+  wULEB(1)
+  if t >= 0 { return wU8(t) }
+  const bs = irRefValtypeHook(v, r.vTy)
+  if bs.length == 0 { return irLMiss("locals layout") }
+  for x in bs { wU8(x) }
+  return 0
 }
 
 // The size-prefixed code entry `f` lowers to, or a mismatch class in `lwMiss`; `firstLocal` is
@@ -758,7 +819,8 @@ function entry(f: IrFn, firstLocal: i32): u8[] {
   lwTempDef = []
   lwTempUsed = []
   lwStackVal = []
-  const none: Rhs = { ggSym: -1 }
+  lwStackLive = 0
+  const none: Rhs = { ggSym: -1, ggNonNull: false }
   for _v in f.irVars {
     lwTempRhs.push(none)
     lwTempDef.push(false)
@@ -910,7 +972,7 @@ function regionAt(i: i32, legacy: u8[]): string {
 // The source kind of node `ix`, for a mismatch's class.
 function kindOf(ix: i32): string {
   if ix < 0 { return "none" }
-  const n: Node = nodeAt(ix)
+  const n = nodeAt(ix)
   return match n {
     NumLit => "number"
     StrLit => "string"
@@ -953,3 +1015,17 @@ function kindOf(ix: i32): string {
     LoopVar => "loop var"
   }
 }
+
+function listUnset(_r: Rhs): i32 { return irLMiss("list hook not installed") }
+
+function boundsUnset(_n: SBoundsCheck, _p: i32[]): i32 {
+  return irLMiss("bounds hook not installed")
+}
+
+function refValtypeNone(_v: i32, _ty: i32): u8[] { return [] }
+
+// The list lowering's hooks (`ir_lower_ref.vl`), installed before emit; the defaults leave list
+// reads, bounds checks and reference locals unlowered.
+export let irLowerListHook: (r: Rhs) => i32 = listUnset
+export let irLowerBoundsHook: (n: SBoundsCheck, pending: i32[]) => i32 = boundsUnset
+export let irRefValtypeHook: (v: i32, ty: i32) => u8[] = refValtypeNone

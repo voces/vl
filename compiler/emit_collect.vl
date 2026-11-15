@@ -541,6 +541,7 @@ import { tyRegNoteWrite, uFieldReLayNote } from "./memo"
 import {
   emitFail,
   emitFailAt,
+  mvValsWrapOf,
   packedFieldSet,
   packedFieldsReset,
   pkWrapAt,
@@ -599,6 +600,7 @@ import {
   anonFieldElemName,
   anonFieldStructRow,
   anonRefListKeyElemTy,
+  anonStructRowOfTy,
   arrLitArenaRecElem,
   arrLitElemHintTy,
   arrLitElemKeyTy,
@@ -4275,7 +4277,7 @@ export function rvPairOf(s: i32, tag: i32): i32 {
 // `mAllocKind`/`mAllocSlot` record the order for `emitTypeSection`. An absent family mints
 // nothing, and its index globals still take the counter position they would have occupied.
 export function mAssignTypeIndices(_n: i32) {
-  mvKeysAtMint = false
+  mvWrapsAtMint = false
   mResetTypeIntern()
   mAssignStructHeaps()
   mAssignUnionHeaps()
@@ -4322,7 +4324,7 @@ export function mAssignTypeIndices(_n: i32) {
   rlLateRowsOn(rlPairsLate)
   rlPairsLate(rlElemName.length)
   mvLateSlotsOn(mvMapsLate)
-  mvKeysAtMint = true
+  mvWrapsAtMint = true
   // The functypes follow; the first lands at the current counter (`typeOffset`).
   return mNextType
 }
@@ -4749,23 +4751,23 @@ function mvMapsLate(n: i32): i32 {
       }
       mvMapTypeIdx[mvi] = mvMapTypeIdx[mvRep]
     } else {
-      if mvKeysAtMint { mvKeysWrapMint(mvi) }
+      if mvWrapsAtMint { mvMapFieldWraps(mvi) }
       mvMapTypeIdx[mvi] = mAllocType(TSK_MV_MAP, mvi)
     }
   }
   return 0
 }
 
-// Whether a map struct minted now is past the type-index assignment, so the keys wrapper its
-// field 0 names must mint with it rather than at the type section's write, past the functype base.
-let mvKeysAtMint = false
+// Whether a map struct minted now is past the type-index assignment, so the wrappers its fields
+// name must mint with it rather than at the type section's write, past the functype base.
+let mvWrapsAtMint = false
 
-// Mints the keys list wrapper of map value slot `mvi`'s struct (`tsMvMap`'s field 0).
-function mvKeysWrapMint(mvi: i32) {
+// The keys and vals list wrappers map value slot `mvi`'s struct names in fields 0 and 1, each
+// minted on first ask: the one answer `tsMvMap` writes and a late mint reserves.
+export function mvMapFieldWraps(mvi: i32): i32[] {
   const kk = mvSlotKeyKind(mvi)
-  if kk == MAP_KEY_I32 { lTy() }
-  else if kk == MAP_KEY_I64 { il64Ty() }
-  else { mkListTy() }
+  const kw = if kk == MAP_KEY_I32 { lTy() } else if kk == MAP_KEY_I64 { il64Ty() } else { mkListTy() }
+  return [kw, mvValsWrapOf(mvi)]
 }
 
 // Reserve the backing and wrapper heap types list type `kTy` needs, read off its arena element:
@@ -4982,8 +4984,8 @@ function collectArrNewScalarPair(ank: ArrNewKind) {
       // The i64 pair mints on first read (`ia64Ty`).
     }
     "u8list" => {}
-    "f32list" => {
-      // D1470: the f32 pair mints on first read (`fa32Ty`).
+    "f32list" | "v128list" => {
+      // D1470: the f32 and v128 pairs mint on first read (`fa32Ty`, `fa128Ty`).
     }
     "strlist" => {
       // String fill → the string list (wrapper/backing shared with `string[]`).
@@ -5535,6 +5537,7 @@ function annScalarOrOpenArray(i: i32): boolean {
   return er == "f64"
     || er == "i64"
     || er == "f32"
+    || er == "v128"
     || er == "u8"
     || er == "i8"
     || er == "u16"
@@ -6510,6 +6513,22 @@ function anonInstPrimCode(v: i32, fnIx: i32): i32 {
   return if c < 0 { -1 } else { c }
 }
 
+// The closed type instance `fnIx` gives field value `v` where the template's own type for it is
+// open, as elaboration recorded it for that instance; -1 otherwise.
+function anonInstFieldTy(v: i32, fnIx: i32): i32 {
+  const own = nodeTyIxOf(v)
+  if fnIx < 0 || (own >= 0 && !tyHasTyVar(own)) { return -1 }
+  const t = elabNodeTyAt(v, fnIx)
+  return if t < 0 || t >= T.tys.length || tyHasTyVar(t) { -1 } else { t }
+}
+
+// The storage type of field `name` of the literal at `objIx`: its row type's field, or the
+// instance's closed type `inst` where the row type leaves the field a type variable.
+function anonFieldStoreTy(objIx: i32, name: string, inst: i32): i32 {
+  const t = recFieldTyOf(anonRowStoreTyIx(objIx), name)
+  return if inst >= 0 && (t < 0 || tyHasTyVar(t)) { inst } else { t }
+}
+
 // Whether literal `an` at `objIx` is stamped with a record type other than its own that lacks one
 // of the fields it writes.
 function anonLitDropsAtRep(an: ObjLit, objIx: i32): boolean {
@@ -6551,6 +6570,7 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
     const elemRowTys: i32[] = []
     const elemKeys: i32[] = []
     const elemUnionTys: i32[] = []
+    const instTys: i32[] = []
     let ok = true
     let fi = 0
     while fi < fields.length {
@@ -6565,8 +6585,12 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         ) {
           code = FC_I32
         }
-        // So does one at the template's type parameter, at the instance's primitive (D15554).
+        // So does one at the template's type parameter, at the instance's primitive (D15554),
+        // and at any other closed type the instance gives it (D16350).
         if code < 0 && fnIx >= 0 { code = anonInstPrimCode(f.fiValue, fnIx) }
+        const it = anonInstFieldTy(f.fiValue, fnIx)
+        if code < 0 && it >= 0 { code = nameFieldCodeTy(it) }
+        instTys.push(it)
         const nullBox = if code == FC_NUL_NONE { anonNullFieldBox(ai, f.fiName) } else { "" }
         if nullBox != "" { code = FC_UNION }
         // The type a union field's box name is rendered from (`anonNullFieldBox`,
@@ -6579,7 +6603,7 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         codes.push(code)
         names.push(f.fiName)
         // A nested-struct field keeps the row it names, so its element type is that row's own.
-        const er = if code == FC_STRUCT { anonFieldStructRow(f.fiValue) } else { -1 }
+        const er = if code != FC_STRUCT { -1 } else if it >= 0 { anonStructRowOfTy(it, tyAt(it) is TyObj) } else { anonFieldStructRow(f.fiValue) }
         // A ref-list field led by a record literal keeps that literal's row, and so its type.
         elemRowTys.push(
           if er >= 0 && er < sTyIx.length { sTyIx[er] } else if code == FC_REF_LIST || code == FC_NUL_REF_LIST { anonRefListKeyElemTy(f.fiValue, code) } else { anonFieldElemValTy(f.fiValue, code) },
@@ -6615,11 +6639,11 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
       let pj = 0
       while pj < codes.length {
         const pi = aOrd[pj]
-        storeTyPut(
-          sFieldStoreTy,
-          sFieldNames.length,
-          fieldStoreTyOf(codes[pi], recFieldTyOf(anonRowStoreTyIx(ai), names[pi])),
+        const fst = fieldStoreTyOf(
+          codes[pi],
+          anonFieldStoreTy(ai, names[pi], instTys[pi]),
         )
+        storeTyPut(sFieldStoreTy, sFieldNames.length, fst)
         sFieldNames.push(names[pi])
         sFieldTypes.push(codes[pi])
         // An anonymous literal's field has no annotation text to key a closure signature
