@@ -35,6 +35,7 @@ ROWS=(
   "lint-self + fmt"
   "seed size"
   "late demands"
+  "phase state"
   "no-python"
   "kind-ladder sets"
   "dead-export budget"

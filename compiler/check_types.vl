@@ -114,10 +114,18 @@ export type TyArray = { aElem: i32, aRead: i32 }
 // but exposes only `.add`/`.has`/`.delete`/`.length`/`.values()`.
 export type TyMap = { mKey: i32, mVal: i32, mSet: i32 }
 
-// A generic type parameter (`T` in `function id<T>(x: T): T`): opaque inside the generic
-// body (assignable both ways, like the err hole); at a call site each TyVar param binds to
-// its argument's type and the return substitutes through.
-export type TyVar = { tvName: string }
+// A type parameter (`T` in `id<T>`) or an inference hole (`tvKind`): opaque inside its body, bound
+// per call to its argument's type. `(tvBinder, tvIdx)` is the declaration slot it names, -1 for a
+// row minted before its site passed one (`mkTyVar`); `tvName` is its spelling, for rendering.
+export type TyVar = {
+  tvName: string,
+  tvKind: TvKind,
+  tvBinder: i32,
+  tvIdx: i32,
+}
+
+// What a type variable stands for: a declared type parameter, or an inference hole.
+export type TvKind = "param" | "hole"
 
 // The literal-member vocabulary — a closed set, so every producer is a literal
 // `mkLitTy("str"/"int", …)` and a member outside it is a hard type error. There is no float
@@ -200,10 +208,21 @@ export let tyMutEpoch = 0
 
 export let cUserTypesVer = 0
 
-// The declaration node of each type-parameter row of a generic nested in another function.
-// Bindings are by name, so a substitution binds a nested row only at that generic's own calls
-// (`substTyDeep`, D3853).
-export let tvNestOf: {[i32]: i32} = Map()
+// Each generic nested in another function, by declaration node, to its enclosing declaration.
+export let nestParentOf: {[i32]: i32} = Map()
+export function nestParentOfPut(k: i32, v: i32) { nestParentOf.set(k, v) }
+export function nestParentOfReset() { nestParentOf = Map() }
+
+// The nested generic whose parameter type-variable row `row` names, or -1: a substitution binds
+// such a row only at that generic's own calls (`substTyDeep`, D3853).
+export function tvNestDeclOf(row: i32): i32 {
+  if row < 0 || row >= T.tys.length { return -1 }
+  const t = tyAt(row)
+  if !(t is TyVar) || t.tvKind != "param" || !nestParentOf.has(t.tvBinder) {
+    return -1
+  }
+  t.tvBinder
+}
 
 // Depth guard for `tyToStr` on recursive named types: a cyclic arena shape would otherwise
 // render forever, so past a fixed depth a type already being rendered prints `…`. An acyclic
@@ -351,7 +370,14 @@ export function tyLitUnionHashesI32(k: i32): boolean {
 // emitter's way to tell apart two declared parameters one name spells.
 export function tyVarRenameRow(ix: i32, name: string) {
   if ix < 0 || ix >= T.tys.length || !(tyAt(ix) is TyVar) { return 0 }
-  const t: Ty = { tvName: name }
+  const old = tyAt(ix)
+  if !(old is TyVar) { return 0 }
+  const t: Ty = {
+    tvName: name,
+    tvKind: old.tvKind,
+    tvBinder: old.tvBinder,
+    tvIdx: old.tvIdx,
+  }
   T.tys[ix] = t
   tyVarRenames = tyVarRenames + 1
   0
@@ -919,6 +945,8 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       // must never join the LSP's absence filter (`ABSENT_TYPE_MARKERS`): as a substring of
       // ordinary identifiers it would delete hints from healthy code (`{foo_bar: i32}`).
       if t.tvName[0] == '?' { return "_" }
+      const shown = tvSlotShownAs(t.tvBinder, t.tvIdx)
+      if shown >= 0 { return tyToStrAt(shown, nominal) }
       return t.tvName
     }
     TyLit => {
@@ -1473,10 +1501,7 @@ function tyEqGo(a: i32, b: i32) {
         // asking for the same holes (`tyEqSameHoles`).
         if ta.tvName[0] == '?' && !tyEqHolesExact { return tb.tvName[0] == '?' }
         // Two declarations' parameters of one name substitute apart.
-        if (
-          tyEqHolesExact
-          && (tvNestOf.get(a) ?? -1) != (tvNestOf.get(b) ?? -1)
-        ) {
+        if (tyEqHolesExact && tvNestDeclOf(a) != tvNestDeclOf(b)) {
           return false
         }
         return ta.tvName == tb.tvName
@@ -3968,15 +3993,17 @@ export function tyIsLitUnionAlias(ty: i32): boolean {
 // The declaring function of each `TyVar` row. A pin is keyed on it, so two generics that both
 // call their variable `T` cannot poison each other's row.
 export let tyVarOwner: {[i32]: string} = Map()
-// The declaration whose parameter a row names, recorded where a signature or a body mints it: a
-// body's rows are owned by the code around it, so the owner column cannot say.
-let tyVarDeclOwner: {[i32]: string} = Map()
-export function tyVarDeclOwnerSet(ix: i32, owner: string) {
-  tyVarDeclOwner[ix] = owner
-}
+// The negative-type questions `assignable` has answered in the current check: a missing record,
+// a pending result or a poisoned annotation. A clean compile asks none.
+let asgNegHits = 0
+export function asgNegHit() { asgNegHits = asgNegHits + 1 }
+export function asgNegCount(): i32 { asgNegHits }
+
 export function tyVarOwnerReset() {
+  asgNegHits = 0
   tyVarOwner = Map()
-  tyVarDeclOwner = Map()
+  tvSlotBounds = Map()
+  tvSlotShown = Map()
 }
 
 // The declaring function recorded for a `TyVar` row, or "" when unrecorded.
@@ -3984,9 +4011,6 @@ export function tyVarOwnerOf(tyIx: i32): string {
   if tyIx < 0 { return "" }
   tyVarOwner[tyIx] ?? ""
 }
-
-// The declaration type-variable row `ix` is recorded as a parameter of, for `tySame`, or "".
-function tyVarDeclOwnerOf(ix: i32): string { tyVarDeclOwner[ix] ?? "" }
 
 // Structural type equality over the arena, depth-bounded: two indices are the same type when
 // their rows have the same variant and their components are recursively the same, with union
@@ -4092,15 +4116,15 @@ function tySameAt(a: i32, b: i32, depth: i32): boolean {
         }
       }
     }
-    // One declaration's type parameter is one type, however many annotations minted a row for it
-    // (D16150). An unrecorded row and a hole are only their own index.
+    // One declaration slot is one type, however many annotations minted a row for it (D16150). A
+    // hole, or a row minted without its slot, is only its own index.
     TyVar => {
       if y is TyVar {
-        if x.tvName == "" || x.tvName[0] == '?' || x.tvName != y.tvName {
-          return false
-        }
-        const ow = tyVarDeclOwnerOf(a)
-        return ow != "" && ow == tyVarDeclOwnerOf(b)
+        return x.tvKind == "param"
+          && y.tvKind == "param"
+          && x.tvBinder >= 0
+          && x.tvBinder == y.tvBinder
+          && x.tvIdx == y.tvIdx
       }
       return false
     }
@@ -4548,8 +4572,9 @@ export function mkObjTy(names: string[], typeIxs: i32[]) {
 }
 
 // An open component: the element of an unpinned `[]`, the key or value of an unpinned `Map()`, the
-// inner type of an open nullable. Every type fits it until a write pins it.
-export const TY_OPEN = -1
+// inner type of an open nullable. Every type fits it until a write pins it. It is not -1, which
+// is no type at all (a missing record, a poisoned annotation) and fits nothing.
+export const TY_OPEN = -3
 
 // A function type's result while its un-annotated declaration is still being inferred: the
 // hoist mints it, and the inference patches the row in place once the body is checked.
@@ -4853,4 +4878,52 @@ function memberNumSoft(t: i32): i32 {
   const s = softenLitTy(t)
   if s == t || s == TY_STR { return t }
   s
+}
+
+// Per declaration slot `(binder, idx)`, keyed by the binder node: its bound as an arena type, and
+// whether a rendering shows the bound in the variable's place (a row variable reads as its record).
+// Emptied with the owner tables, since a restart re-mints the arena the bounds index.
+let tvSlotBounds: {[i32]: i32[]} = Map()
+let tvSlotShown: {[i32]: boolean[]} = Map()
+
+// The bound recorded for slot `(binder, idx)`, or -1 where none is.
+export function tvSlotBound(binder: i32, idx: i32): i32 {
+  const bs = tvSlotBounds.get(binder)
+  if bs == null || idx < 0 || idx >= bs.length { return -1 }
+  bs[idx]
+}
+
+// Whether slot `(binder, idx)` renders as its bound.
+export function tvSlotPrintsAsBound(binder: i32, idx: i32): boolean {
+  const ps = tvSlotShown.get(binder)
+  if ps == null || idx < 0 || idx >= ps.length { return false }
+  ps[idx]
+}
+
+// The type a rendering of slot `(binder, idx)` shows in its place, or -1 to show its name.
+function tvSlotShownAs(binder: i32, idx: i32): i32 {
+  if !tvSlotPrintsAsBound(binder, idx) { return -1 }
+  tvSlotBound(binder, idx)
+}
+
+// Pins open element `v` into list row `t` in place, advancing `tyMutEpoch`: the one writer of a
+// list row's element after its mint, so every pin invalidates the epoch-stamped memos.
+export function tyPinElem(t: TyArray, v: i32) {
+  t.aElem = v
+  tyMutEpoch = tyMutEpoch + 1
+  0
+}
+
+// `tyPinElem` for a map row's key.
+export function tyPinKey(t: TyMap, v: i32) {
+  t.mKey = v
+  tyMutEpoch = tyMutEpoch + 1
+  0
+}
+
+// `tyPinElem` for a map row's value.
+export function tyPinVal(t: TyMap, v: i32) {
+  t.mVal = v
+  tyMutEpoch = tyMutEpoch + 1
+  0
 }

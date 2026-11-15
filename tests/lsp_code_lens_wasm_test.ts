@@ -14,16 +14,10 @@ import {
 } from "../lsp/src/typeFeatures.ts";
 import { buildUnusedExportUseMap } from "../lsp/src/moduleGraph.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const log = (_m: string) => {};
 

@@ -122,6 +122,7 @@ import {
 import { expObsFn, expObsPin } from "./check_exp_obs"
 import {
   callDstTyForGeneric,
+  cbSeedGuessingAdd,
   recordCbExpected,
   seedExpected,
 } from "./check_expected"
@@ -240,11 +241,15 @@ import {
   tyEq,
   tyFieldTyOf,
   tyHasHole,
+  tyHasInferHole,
   tyIsNonIndexableScalar,
   tyIsPrimNamed,
   tyIxIsView,
   tyMayHoldFn,
-  tyMutEpoch,
+  tyMentionsTyVarNamed,
+  tyPinElem,
+  tyPinKey,
+  tyPinVal,
   tyRefusesArrayDemand,
   tyRefusesArrayWrite,
   tyToStr,
@@ -256,7 +261,7 @@ import {
   fnDeclIx,
   fnDeclParamsOf,
 } from "./check_write_scan"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import { memberDeclOf, memberDeclSet, methodFnOfDecl } from "./symbols"
 import {
   arrElemValueTy,
@@ -312,6 +317,8 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
     why = "the receiver is not a parameter of the function the call sits in"
   }
   const argc = n.callArgs.length
+  const argTys: i32[] = []
+  for a in n.callArgs { argTys.push(checkNodeHook(a)) }
   for c in ovSetCands[row] {
     if why == "" && declFirstParamIsSelf(c) {
       const fty = moduleNameTyOf(c)
@@ -325,16 +332,15 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
           const req = fnRequiredArity(fnDeclParamsOf(c))
           if argc + 1 > ft.fnParamTypes.length || argc + 1 < req {
             why = "the candidates take different numbers of arguments"
-          } else if (
-            ft.fnRet < 0
-            || tyHasHole(ft.fnRet)
-            || tyHasTyVar(ft.fnRet)
-          ) {
-            why = "a candidate's return type depends on its receiver"
-          } else if ret >= 0 && !tyEq(ret, ft.fnRet) {
-            why = "the candidates return different types"
           } else {
-            ret = ft.fnRet
+            const r = ovArgBoundRet(c, ft, argTys)
+            if r < 0 {
+              why = "a candidate's return type depends on its receiver"
+            } else if ret >= 0 && !tyEq(ret, r) {
+              why = "the candidates return different types"
+            } else {
+              ret = r
+            }
           }
         }
       }
@@ -354,10 +360,38 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
     )
     return TY_ERR
   }
-  for a in n.callArgs { checkNodeHook(a) }
   noteUfcsCstr(recvTy, prop, ix, -1)
   if !i32ListHas(ovHoleSites, ix) { ovHoleSitesPush(ix) }
   ret
+}
+
+// The return type of candidate `c`, of type `ft`, with its type parameters bound from the
+// explicit arguments' types `argTys`; -1 when the return is open or one of its type parameters is
+// left to the receiver, unbound by an argument or named by `self`.
+function ovArgBoundRet(c: string, ft: TyFunc, argTys: i32[]): i32 {
+  if ft.fnRet < 0 || tyHasInferHole(ft.fnRet, 0) { return -1 }
+  if !tyHasTyVar(ft.fnRet) { return ft.fnRet }
+  const d = fnDeclIx[c] ?? -1
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is FuncDecl) { return -1 }
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  let i = 0
+  while i < argTys.length && i + 1 < ft.fnParamTypes.length {
+    bindGenWalk(ft.fnParamTypes[i + 1], argTys[i], bNames, bTys)
+    i = i + 1
+  }
+  for tp in dn.fnTyParams {
+    if tyMentionsTyVarNamed(ft.fnRet, tp, 8) {
+      if (
+        !strListHas(bNames, tp)
+        || tyMentionsTyVarNamed(ft.fnParamTypes[0], tp, 8)
+      ) {
+        return -1
+      }
+    }
+  }
+  substTyDeep(ft.fnRet, bNames, bTys)
 }
 
 // The receiver's argument-seam verdict at `self`: the dispatch gate asked bare `assignable`,
@@ -427,7 +461,10 @@ function ufcsCheckArgs(
   let oi = 0
   while oi < uOrder.length {
     const i = uOrder[oi]
+    const guess = tyHasTyVar(params[i + 1])
+    if guess { cbSeedGuessingAdd(1) }
     seedExpected(args[i], substTyDeep(params[i + 1], bNames, bTys))
+    if guess { cbSeedGuessingAdd(-1) }
     const at = checkNodeHook(args[i])
     bindGenWalk(params[i + 1], at, bNames, bTys)
     const expected = substTyDeep(params[i + 1], bNames, bTys)
@@ -1069,10 +1106,7 @@ function checkListPushArgs(
     if spd >= 0 {
       const set = spreadElemTy(margs[mi])
       if rt.aElem < 0 {
-        if set >= 0 {
-          rt.aElem = set
-          tyMutEpoch = tyMutEpoch + 1 // a spread pinned the element in place
-        }
+        if set >= 0 { tyPinElem(rt, set) }
       } else if set < 0 && emptyArrayLitAt(spd) {
         // An empty literal spread appends nothing; it is typed at the list it appends to.
         const lt = mkArrayTy(rt.aElem)
@@ -1110,23 +1144,18 @@ function checkListPushArgs(
       // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
       if rt.aElem < 0 { calleeWritePrePin(recvTy, pat) }
       if rt.aElem < 0 {
-        rt.aElem = cnhPinTy(
-          nullReadHoleTy(margs[mi], pat),
-          ix,
-          recvIx,
-          false,
-          false,
+        tyPinElem(
+          rt,
+          cnhPinTy(nullReadHoleTy(margs[mi], pat), ix, recvIx, false, false),
         )
-        tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
         numSlotStamp(margs[mi], pat, rt.aElem)
+        // The first value is delivered at the slot it pinned, as a later one is (D16360).
+        recordCtxTy(margs[mi], rt.aElem)
       } else {
         cnhFill(rt.aElem, nullReadHoleTy(margs[mi], pat))
         // A later push joins the first one's function sets (D15929).
         const jr = elabFnRecJoin(rt.aElem, pat)
-        if jr != rt.aElem {
-          rt.aElem = jr
-          tyMutEpoch = tyMutEpoch + 1
-        }
+        if jr != rt.aElem { tyPinElem(rt, jr) }
         // The pushed value's own open holes pin from the element slot — the same rule
         // `.set` / `m[k] = v` / `xs = e` apply at their own store positions.
         constrainEmptyExpr(margs[mi], pat, rt.aElem)
@@ -1487,33 +1516,32 @@ function memberCallMapTy(
       const v0 = checkNodeHook(margs2[1])
       narPinWriteAt(recvTy, ix)
       if rt.mKey < 0 {
-        rt.mKey = widenLitTy(k0)
-        tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the key in place
+        tyPinKey(rt, widenLitTy(k0))
         numSlotStamp(margs2[0], k0, rt.mKey)
         checkInferredMapKey(rt.mKey, rt.mSet, ix)
       } else if !bmArgOk(BM_SETKEY, "set", k0, rt.mKey, -1, margs2[0]) {
         tErr(bmArgMsg(BM_SETKEY, "set", k0, rt.mKey, -1), ix)
       }
       if rt.mVal < 0 {
-        rt.mVal = cnhPinTy(
-          nullReadHoleTy(margs2[1], v0),
-          ix,
-          recvIx,
-          true,
-          isHoleMapDemandTy(recvTy),
+        tyPinVal(
+          rt,
+          cnhPinTy(
+            nullReadHoleTy(margs2[1], v0),
+            ix,
+            recvIx,
+            true,
+            isHoleMapDemandTy(recvTy),
+          ),
         )
-        tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
         if rt.mVal == v0 { recOwnPend(margs2[1], v0) }
         numSlotStamp(margs2[1], v0, rt.mVal)
+        recordCtxTy(margs2[1], rt.mVal)
         elabSlotRecLitGrow(margs2[1], rt.mVal)
       } else {
         cnhFill(rt.mVal, nullReadHoleTy(margs2[1], v0))
         // A later store joins the first one's function sets (D15806).
         const jm = elabFnRecJoin(rt.mVal, v0)
-        if jm != rt.mVal {
-          rt.mVal = jm
-          tyMutEpoch = tyMutEpoch + 1
-        }
+        if jm != rt.mVal { tyPinVal(rt, jm) }
         // The value argument's own open holes pin from the slot, the third step
         // this store shares with `m[k] = v` (which pins in `checkBinExprNode`'s
         // `=` arm) — without it, `m.set("a", fq())` over a `{[string]: f64[]}` reaches the emitter with an unpinned `[]`.
@@ -1584,8 +1612,7 @@ function memberCallMapTy(
       const ka = checkNodeHook(margs2[0])
       narPinWriteAt(recvTy, ix)
       if rt.mKey < 0 {
-        rt.mKey = widenLitTy(ka)
-        tyMutEpoch = tyMutEpoch + 1 // `.add` pinned the Set key in place
+        tyPinKey(rt, widenLitTy(ka))
         checkInferredMapKey(rt.mKey, rt.mSet, ix)
       } else if !bmArgOk(BM_ADDKEY, "add", ka, rt.mKey, -1, margs2[0]) {
         tErr(bmArgMsg(BM_ADDKEY, "add", ka, rt.mKey, -1), ix)

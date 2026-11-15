@@ -5,16 +5,10 @@
 
 import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const ignore = (() => {
-  try {
-    Deno.statSync(SEED);
-    return false;
-  } catch {
-    return true;
-  }
-})();
+const ignore = !seedPresent(SEED);
 const log = (_m: string) => {};
 
 const MAIN_KEY = "/proj/main.vl";
