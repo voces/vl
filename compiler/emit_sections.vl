@@ -221,6 +221,8 @@ import {
   ByteRope,
   HELP_LIST_GROW,
   HELP_MAP_COMPACT,
+  HELP_MAP_ENTRY,
+  HELP_MAP_ENTRY_I32,
   HELP_MAP_PROBE,
   HELP_MAP_PROBE_I32,
   HELP_MAP_PROBE_I64,
@@ -385,6 +387,8 @@ import {
   gHelpF64Rem,
   gHelpInitFail,
   gHelpMapCompact,
+  gHelpMapEntry,
+  gHelpMapEntryI32,
   gHelpMapProbe,
   gHelpMapProbeI32,
   gHelpMapProbeI64,
@@ -3695,7 +3699,7 @@ function emitMapProbeBackEdge(startL: i32) {
 // `__map_probe__(keyHash, index, hashes, live, keysBacking, key) -> i32`: wrapping linear probe
 // of a string-keyed index to the slot holding the key's entry or the free slot ending its chain.
 // A dead entry is a probe marker, never a hit; only a module that deletes has one to test.
-function emitMapProbeFnCode(out: u8[]) {
+function emitMapProbeFnCode(out: u8[], entry: boolean) {
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
@@ -3758,13 +3762,13 @@ function emitMapProbeFnCode(out: u8[]) {
   fbI32Const(1)
   fbI32Bin(106)
   fbLocalGet(6)
-  fbI32Bin(113) // 0x71 i32.and
+  fbI32Bin(113)                         // 0x71 i32.and
   fbLocalTee(7)
   emitMapProbeBackEdge(9)
-  fbEnd()       // end (loop)
-  fbEnd()       // end (probe block)
-  fbLocalGet(7) // the probe slot
-  fbEnd()       // end (function)
+  fbEnd()                               // end (loop)
+  fbEnd()                               // end (probe block)
+  fbLocalGet(if entry { 8 } else { 7 }) // the slot's entry (`__map_entry__`), else the slot
+  fbEnd()                               // end (function)
   wTarget(prev)
   helpFrameBody(out, body)
 }
@@ -3772,7 +3776,7 @@ function emitMapProbeFnCode(out: u8[]) {
 // `__map_probe_i32__(index, key) -> slot`: the i32-keyed probe over (key, entry) pairs, placed
 // by `fbMapSlotOf`, to the pair slot holding the key or the free one ending its chain. It reads
 // the index alone; a deleted pair (entry -1) is never a hit, and only a module that deletes has one.
-function emitMapProbeI32FnCode(out: u8[]) {
+function emitMapProbeI32FnCode(out: u8[], entry: boolean) {
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
@@ -3827,7 +3831,7 @@ function emitMapProbeI32FnCode(out: u8[]) {
   emitMapProbeBackEdge(5)
   fbEnd() // end (loop)
   fbEnd() // end (probe block)
-  fbLocalGet(3)
+  fbLocalGet(if entry { 4 } else { 3 }) // the pair's entry (`__map_entry_i32__`), else the slot
   fbEnd() // end (function)
   wTarget(prev)
   helpFrameBody(out, body)
@@ -5770,10 +5774,12 @@ function tailHelpFnCode(out: u8[], kind: i32): i32 {
   if kind == HELP_UTF8_ENC { return emitUtf8EncFnCode(out) }
   if kind == HELP_UTF8_CPLEN { return emitUtf8CpLenFnCode(out) }
   if kind == HELP_STR_BYTES { return emitStrBytesFnCode(out) }
-  if kind == HELP_MAP_PROBE { return emitMapProbeFnCode(out) }
+  if kind == HELP_MAP_PROBE { return emitMapProbeFnCode(out, false) }
+  if kind == HELP_MAP_ENTRY { return emitMapProbeFnCode(out, true) }
+  if kind == HELP_MAP_ENTRY_I32 { return emitMapProbeI32FnCode(out, true) }
   if kind == HELP_MAP_RESIZE { return emitMapResizeFnCode(out) }
   if kind == HELP_MAP_RESYNC { return emitMapResyncFnCode(out) }
-  if kind == HELP_MAP_PROBE_I32 { return emitMapProbeI32FnCode(out) }
+  if kind == HELP_MAP_PROBE_I32 { return emitMapProbeI32FnCode(out, false) }
   if kind == HELP_MAP_RESIZE_I32 { return emitMapResizeI32FnCode(out) }
   if kind == HELP_MAP_PROBE_I64 { return emitMapProbeI64FnCode(out) }
   if kind >= HELP_LIST_GROW {
@@ -5795,6 +5801,8 @@ function tailHelpName(kind: i32): string {
   if kind == HELP_MAP_RESIZE { return "__map_resize__" }
   if kind == HELP_MAP_RESYNC { return "__map_resync__" }
   if kind == HELP_MAP_PROBE_I32 { return "__map_probe_i32__" }
+  if kind == HELP_MAP_ENTRY { return "__map_entry__" }
+  if kind == HELP_MAP_ENTRY_I32 { return "__map_entry_i32__" }
   if kind == HELP_MAP_RESIZE_I32 { return "__map_resize_i32__" }
   if kind == HELP_MAP_PROBE_I64 { return "__map_probe_i64__" }
   if kind >= HELP_LIST_GROW {
@@ -6523,6 +6531,8 @@ function assignSharedHelperIndices(helpBase: i32) {
   gHelpMapResize = -1
   gHelpMapResizeI32 = -1
   gHelpMapProbeI64 = -1
+  gHelpMapEntry = -1
+  gHelpMapEntryI32 = -1
   gHelpF64Rem = -1
   let nHelpers = 0
   // The float remainder helper (D1586), last for the reason its neighbour above gives: no
@@ -9139,10 +9149,12 @@ function tailHelpFuncType(kind: i32) {
   if kind == HELP_STR_BYTES { return helpFuncType("s", "y") }
   // (keyHash, index, hashes, live, keysBacking, key) -> slot
   if kind == HELP_MAP_PROBE { return helpFuncType("iaaams", "i") }
+  if kind == HELP_MAP_ENTRY { return helpFuncType("iaaams", "i") }
   if kind == HELP_MAP_RESIZE { return helpFuncType("aaaii", "a") }
   if kind == HELP_MAP_RESYNC { return mapResyncFuncType() }
   // (index, key i32) -> slot; (index, count) -> index'; (index, key i64, keysBacking) -> slot
   if kind == HELP_MAP_PROBE_I32 { return helpFuncType("ai", "i") }
+  if kind == HELP_MAP_ENTRY_I32 { return helpFuncType("ai", "i") }
   if kind == HELP_MAP_RESIZE_I32 { return helpFuncType("ai", "a") }
   if kind == HELP_MAP_PROBE_I64 { return helpFuncType("ajk", "i") }
   if kind >= HELP_LIST_GROW { return listGrowFuncType(kind - HELP_LIST_GROW) }
