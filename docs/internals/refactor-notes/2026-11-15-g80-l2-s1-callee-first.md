@@ -56,7 +56,8 @@ The merge keeps it beside this PR's predicates. Both seeds are fixpoints.
 - `tests/cases` as written: 0 of 6,450 `@run` files differ.
 - decl-order movers 58 → 16, 0 clause-1. Against master's baseline (56 lines), 40 close and 0 are new.
 - `regress.vl`: no cell changed class.
-- The matrices are in §Matrices below.
+- The matrices, 475 templates at `5ea62674`: 0 `runs → not-runs`, and 0 of 32,468 graded cells change
+  grade. The same 5 templates exit 1, on cells that grade the same on both seeds.
 
 The capability matrices are §Matrices below.
 
