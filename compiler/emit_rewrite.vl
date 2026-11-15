@@ -2705,6 +2705,9 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
     spillTypeByTarget(out[out.length - 1], val, t)
     a.binRight = val
     const rd = spillRead(val)
+    // A literal built at the record the assignment yields is read as that record.
+    const held = spillHeldTy(rv)
+    if held >= 0 && tySame(held, nodeTyIxOf(asgIx)) { nodeTyRecord(rd, held) }
     return cboxYieldAs(rd, nodeTyIxOf(rd), nodeTyIxOf(asgIx))
   }
   -1
@@ -2892,12 +2895,22 @@ function spillRead(rd: i32): i32 {
 // and holds the atom too; any other target keeps the right-hand side's own type.
 function spillTypeByTarget(decl: i32, rd: i32, t: i32) {
   const ty = nodeTyIxOf(t)
-  const al = litUnionAliasNameOfTy(ty)
+  // A `K | null` place stores the niche too, so the spill is typed at it (D16343).
+  const nn = nonNullTy(ty)
+  const nul = nn != ty
+  const al = litUnionAliasNameOfTy(if nul { nn } else { ty })
   if al == "" { return 0 }
   const d = nodeAt(decl)
-  if d is LetDecl { d.letType = synthTypeRefTy(al, -1, ty) }
+  if d is LetDecl {
+    d.letType = synthTypeRefTy(if nul { al + " | null" } else { al }, -1, ty)
+  }
   nodeTyRecord(decl, ty)
-  nodeTyRecord(rd, ty)
+  // A value written that holds no `null` reads as the member set it is.
+  const valTy = nodeTyIxOf(rd)
+  nodeTyRecord(
+    rd,
+    if nul && valTy >= 0 && !tyBearsNull(valTy) { nn } else { ty },
+  )
   0
 }
 
@@ -3449,7 +3462,7 @@ function asvTail(blockIx: i32) {
 }
 
 // Whether the `else if` chain from the `if` at `ix` ends in an `else`, which a value needs.
-function asvChainHasElse(ix: i32): boolean {
+export function asvChainHasElse(ix: i32): boolean {
   let cur = ix
   let last = ix
   while cur >= 0 {

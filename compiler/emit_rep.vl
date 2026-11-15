@@ -5,17 +5,19 @@
 // from its twins. Consumers migrate site by site under the fixpoint, corpus and
 // rep-fuzzer gates.
 //
-// Coverage is deliberately partial (`rdCovered`): an arm is marked covered only
-// where the arena decides the rep exactly as the emitter's legacy classifier does;
-// everything else returns `rdCovered == 0` and the consumer keeps its name-based
-// path, widening arm by arm. Recursive types are real arena cycles: the canonical
-// structural key (`repCanonKey`) terminates them with a de-Bruijn back-edge.
+// A descriptor with a `null` kind is the answer for no value: no node, `never`, or a template's
+// open type, which has no rep until an instance binds it. Recursive types are real arena
+// cycles: the canonical structural key (`repCanonKey`) terminates them with a de-Bruijn back-edge.
 
 import {
+  canonRepDirty,
+  canonRepIsReady,
+  canonRepUnready,
   canonShadowLayout,
   canonShadowLayoutReset,
   canonShadowOn,
-  tyCanonLayout,
+  tyRepId,
+  tyRepIdProvisional,
 } from "./emit_ty_seal"
 import {
   Interner,
@@ -213,13 +215,12 @@ import {
   valueRowKind,
 } from "./check_ty_rep"
 
-// One struct per classified type. `rdCovered` is 1 when the rep derives structurally, 0 when
-// the consumer must use its legacy path; `rdKind` is the `VKind` member, `rdNul` how `null` is
+// One struct per classified type. `rdKind` is the `VKind` member, or `null` where there is no
+// value to represent (the file header); `rdNul` is how `null` is
 // encoded (ref, boolean/litunion sentinel, or boxed atom tag), `rdSlot` a table column's slot (-1
 // from `repOfTy`, whose struct row is `repSlotOfKind`'s), `rdSigTok`/`rdListElem` the `$fnsig` token and list-element vocabulary.
 export type RepDesc = {
-  rdCovered: i32,
-  rdKind: VKind,
+  rdKind: VKind | null,
   rdNul: i32,
   rdSlot: i32,
   rdSigTok: string,
@@ -239,10 +240,6 @@ export function repDescRet(kind: VKind, slot: i32, elem: string): RepDesc {
   d.rdSlot = slot
   d
 }
-
-// The "no answer" descriptor a name-keyed producer hands back when the name resolves to
-// nothing — `rdCovered` 0, the same contract `repUncovered` states for an underivable type.
-export function repDescNone(): RepDesc { repUncovered() }
 
 // The canonical kind->`$fnsig` token character, read by both encode sites
 // (`cloParamTok` params, `cloRetKeySuffix` results); the param/result eligibility
@@ -467,14 +464,11 @@ export function repKindOfSigTok(c: i32): VKind | null {
   null
 }
 
-// An uncovered descriptor — the consumer must take its legacy path. `rdKind`
-// deliberately carries the ladder's own default ("i32") so a consumer that
-// forgets the `rdCovered` check degrades to the same fallthrough the legacy
-// chain has, never to a bogus ref kind.
-function repUncovered(): RepDesc {
+// The descriptor with no kind: the answer where there is no value to represent, and the one
+// a name-keyed producer gives for a name that resolves to nothing.
+export function repDescNone(): RepDesc {
   const d: RepDesc = {
-    rdCovered: 0,
-    rdKind: "i32",
+    rdKind: null,
     rdNul: 0,
     rdSlot: -1,
     rdSigTok: "",
@@ -486,7 +480,6 @@ function repUncovered(): RepDesc {
 
 function repMk(kind: VKind, nul: i32, elem: string): RepDesc {
   const d: RepDesc = {
-    rdCovered: 1,
     rdKind: kind,
     rdNul: nul,
     rdSlot: -1,
@@ -2917,7 +2910,7 @@ export function rowStoreRepIn(tys: i32[], r: i32): RepDesc | null {
   const ty = if r < tys.length { tys[r] } else { -1 }
   if ty < 0 { return null }
   const d = repOfTy(ty)
-  if d.rdCovered == 0 { return null }
+  if d.rdKind == null { return null }
   if d.rdKind == "nulnone" && !tyIsNullUnit(ty) {
     emitFail(
       "emitProgram: a field is stored as an unfilled inference hole's `null`",
@@ -2944,6 +2937,9 @@ export function fieldStorageKindOf(d: RepDesc | null): VKind | null {
     }
     "variant" => {
       return "struct"
+    }
+    null => {
+      return null
     }
     "i32" | "i64" | "f64" | "f32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "nulstruct" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       return d.rdKind
@@ -3305,10 +3301,10 @@ export function structLateTwinOf(i: i32): i32 {
 // kind/null discipline/list-element vocabulary are the tree's projections. The flat
 // derivation still decides coverage (a shape it cannot name keeps rejecting).
 export function repOfTy(ty: i32): RepDesc {
-  if ty < 0 || ty >= T.tys.length { return repUncovered() }
+  if ty < 0 || ty >= T.tys.length { return repDescNone() }
   const tix = repTreeOfTy(ty)
   const tk = repTreeVKind(tix)
-  if tk == null { return repUncovered() }
+  if tk == null { return repDescNone() }
   const d = repMk(tk, repTreeNulOf(tix), repTreeListElemName(tix))
   d.rdAtom = repTreeAtomOf(tix)
   d
@@ -3774,14 +3770,12 @@ function btOfUnion(ms: i32[]): i32 {
   kind
 }
 
-// The value kind arena type `ty` crosses a `$fnsig` as: `repOfTy`'s where it covers `ty`, else
-// the rep tree's. null when the rep layer has no rep for `ty`, as for a template's own type
-// parameter, which crosses no signature until an instance binds it, so the tree is not asked.
+// The value kind arena type `ty` crosses a `$fnsig` as. null when the rep layer has no rep for
+// `ty`, as for a template's own type parameter, which crosses no signature until an instance
+// binds it, so the tree is not asked.
 export function repSigKindOfTy(ty: i32): VKind | null {
   if ty < 0 || ty >= T.tys.length || tyAt(ty) is TyVar { return null }
-  const d = repOfTy(ty)
-  if d.rdCovered != 0 { return d.rdKind }
-  repTreeVKind(repTreeOfTy(ty))
+  repOfTy(ty).rdKind
 }
 
 // `ty` with each `never` a list element or record field holds read as the D4551 default `i32`:
@@ -4192,7 +4186,7 @@ export function repOfNode(nodeIx: i32, fnIx: i32): RepDesc {
 // a node its generic body shares. The same-shape union recovery still reads the node.
 export function repOfNodeAt(nodeIx: i32, ty: i32): RepDesc {
   const d = repOfTyAtNode(nodeIx, ty)
-  if d.rdCovered == 1 {
+  if d.rdKind != null {
     // A template's node type is no instance's, so only a closed one can name the box.
     if d.rdKind == "struct" || d.rdKind == "variant" {
       const own = nodeTyIxOf(nodeIx)
@@ -4224,41 +4218,41 @@ function repOfTyAtNode(nodeIx: i32, ty: i32): RepDesc {
 // The rep of a list of element type `elem` (made nullable when `nul`), read off the element's
 // tree for a list the arena has no type for.
 function repOfListOf(elem: i32, nul: boolean): RepDesc {
-  if elem < 0 || elem >= T.tys.length { return repUncovered() }
+  if elem < 0 || elem >= T.tys.length { return repDescNone() }
   rtSync()
   const en = rtGo(elem)
   const lk = rtListVKind(en)
-  if lk == null { return repUncovered() }
+  if lk == null { return repDescNone() }
   if !nul { return repMk(lk, 0, rtElemName(en)) }
   const nk = rtNulListOf(lk)
-  if nk == null { return repUncovered() }
+  if nk == null { return repDescNone() }
   repMk(nk, 1, rtElemName(en))
 }
 
 // The checked-rep column: node `ix`'s rep as the checker's type decided it, so a classifier
 // asks the descriptor instead of a ladder over spellings. A negative `ix` is uncovered.
 function nodeRep(ix: i32, fnIx: i32): RepDesc {
-  if ix < 0 { return repUncovered() }
+  if ix < 0 { return repDescNone() }
   repOfNode(ix, fnIx)
 }
 
 // Whether node `ix` reps as the bare string-literal-union atom.
 export function nodeRepIsAtom(ix: i32, fnIx: i32): boolean {
   const d = nodeRep(ix, fnIx)
-  d.rdCovered == 1 && d.rdAtom == 1 && d.rdNul == 0
+  d.rdAtom == 1 && d.rdNul == 0
 }
 
 // Whether node `ix` reps as the nullable atom: the i32 atom with the `-1` null sentinel.
 export function nodeRepIsNulAtom(ix: i32, fnIx: i32): boolean {
   const d = nodeRep(ix, fnIx)
-  d.rdCovered == 1 && d.rdAtom == 1 && d.rdNul == 3
+  d.rdAtom == 1 && d.rdNul == 3
 }
 
 // Whether rep `d` is a reference whose null, when it has one, is the null ref. False for the
 // string kinds, whose null test needs the raw read, for `nulnone`, a read narrowed to `null`
 // whose storage is still its cell's, and for a box, which holds its null as a tag.
 function repIsNullRefKind(d: RepDesc): boolean {
-  if d.rdCovered != 1 { return false }
+  if d.rdKind == null { return false }
   match d.rdKind {
     "nulstruct" | "nulvariant" | "nullist" | "nulreflist" | "nulclosure" | "nulmap" => {
       return true
@@ -4297,7 +4291,7 @@ export function nodeRepIsRefKind(ix: i32, fnIx: i32): boolean {
 // `nullist`, `nulclosure`) are the kinds the classifiers ask it for.
 export function nodeRepIs(ix: i32, k: VKind, fnIx: i32): boolean {
   const d = nodeRep(ix, fnIx)
-  d.rdCovered == 1 && d.rdKind == k
+  d.rdKind == k
 }
 
 // Whether a type contains an i64/f64/f32 leaf anywhere — through arrays,
@@ -4317,6 +4311,7 @@ let repMaskMemo: i32[] = []
 let repGen = 0
 
 export function repReset() {
+  canonRepUnready()
   rtCountReset()
   rvsTreeBits = Map()
   rvsPreTys = []
@@ -4606,6 +4601,7 @@ function rtSync() {
   rvsSync()
   if (rtEpoch == tyMutEpoch && rtUserVer == cUserTypesVer) { return 0 }
   if repShadowOn { rtRebuildNote() }
+  canonRepDirty()
   if canonShadowOn() { canonShadowLayoutReset() }
   rtNode = []
   rtTy = []
@@ -4775,14 +4771,6 @@ function rtKidsOf(ix: i32): i32[] {
   }
 }
 
-// Node `ix`'s record arm bit, 1 or 0, or -1 when it is no record (the layout shadow's key).
-function rtArmBitOf(ix: i32): i32 {
-  if ix < 0 || ix >= rtNode.length { return -1 }
-  const n = rtNode[ix]
-  if n is RRecord { return if n.rrVariant { 1 } else { 0 } }
-  -1
-}
-
 // The one total constructor: the rep tree of arena type `ty`. Always returns a
 // node; a shape without a settled lowering policy returns an `unsup` node whose
 // reason-code is one of the stable coverage buckets: hole, prim:<name>,
@@ -4793,7 +4781,8 @@ function repTreeOfTy(ty: i32): i32 {
   const r = rtGo(ty)
   rtBuildDepth = rtBuildDepth - 1
   if canonShadowOn() && ty >= 0 {
-    canonShadowLayout(ty, tyCanonLayout(ty), r, rtArmBitOf(r))
+    const id = if canonRepIsReady() { tyRepId(ty) } else { tyRepIdProvisional(ty) }
+    canonShadowLayout(ty, id, r)
   }
   r
 }
@@ -5081,7 +5070,7 @@ function rtOfMap(ty: i32, mVal: i32, mSet: i32): i32 {
 // The tree's projection onto the flat `VKind` vocabulary — the fact the
 // differential harness compares against `rdKind`, and the shim Stage B consumers
 // migrate through. `null` means the tree has no flat spelling (an `unsup` node,
-// or a composition the flat alphabet cannot name yet), matching the flat layer's `rdCovered == 0` so the two stay comparable exactly where both speak.
+// or a composition the flat alphabet cannot name yet), which `repOfTy` reports as the `null` kind.
 function repTreeVKind(ix: i32): VKind | null {
   if ix < 0 { return null }
   const n = rtNode[ix]

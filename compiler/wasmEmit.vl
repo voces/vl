@@ -111,7 +111,7 @@ import {
   numCastCanFail,
   numUnionMembersOf,
 } from "./check_num_lits"
-import { lbiKeptDeclUnread } from "./check_num_lit_state"
+import { cexF32LexOf, lbiKeptDeclUnread } from "./check_num_lit_state"
 import { intMatchHeadAt } from "./check_match_heads"
 import {
   asInstMisses,
@@ -1703,6 +1703,7 @@ import {
   stmtArmScopeOpen,
 } from "./emit_collect"
 import {
+  asvChainHasElse,
   cboxIsWriteLet,
   voidTwinForNode,
   voidTwinTargetOf,
@@ -2967,7 +2968,7 @@ function boxFloorWhy(valIx: i32, fnIx: i32): string {
   const r = boxRecordTyAt(valIx, fnIx)
   if r < 0 { return "floor: no record" }
   const k = repOfTy(r).rdKind
-  if k != "union" { return "floor: rep " + k }
+  if k != "union" { return "floor: rep " + (k ?? "none") }
   "floor: no row"
 }
 
@@ -3755,7 +3756,7 @@ function emitRowUnionElemCopy(
 function rcScalarListElem(ty: i32): VKind | null {
   if ty < 0 { return null }
   const ld = repOfTy(ty)
-  if ld.rdCovered != 1 { return null }
+  if ld.rdKind == null { return null }
   scalarListElemOfListKind(ld.rdKind)
 }
 
@@ -3973,8 +3974,8 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
       if exm.length > 1 { return -1 }
       const ept = isVarTyIxOf(isIx)
       if ept >= 0 {
-        if tySameSet(ext, ept, TY_WALK_DEPTH) { return 1 }
-        if tySameSpelled(ext, ept, TY_WALK_DEPTH) { return 0 }
+        if tySameSet(ext, ept) { return 1 }
+        if tySameSpelled(ext, ept) { return 0 }
       }
     }
 
@@ -3986,7 +3987,7 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
       const jt = nodeTyIxOf(jo)
       if jt >= 0 && !tyHasTyVar(jt) {
         const ept = isVarTyIxOf(isIx)
-        if ept >= 0 && tySameSet(jt, ept, TY_WALK_DEPTH) { return 1 }
+        if ept >= 0 && tySameSet(jt, ept) { return 1 }
         return -1
       }
     }
@@ -6060,8 +6061,8 @@ function isPatUnionArmTy(recvIx: i32, patTy: i32, fnIx: i32): i32 {
     const a = arms[i]
     if a >= 0 && unMemIsMap(a) {
       if mapTwinSame(a, patTy) { return patTy }
-      if same < 0 && tySameSet(a, patTy, TY_WALK_DEPTH) { same = a }
-      if same < 0 && tySameSpelled(a, patTy, TY_WALK_DEPTH) { same = a }
+      if same < 0 && tySameSet(a, patTy) { same = a }
+      if same < 0 && tySameSpelled(a, patTy) { same = a }
     }
     i = i + 1
   }
@@ -27186,7 +27187,7 @@ function cloArgInstanceMisfits(
   const it = instanceTyOf(own, fnIx)
   if it < 0 || tyIsLitUnion(it) { return false }
   const d = repOfTy(it)
-  d.rdCovered != 0 && d.rdKind == "i32" && pk == "str"
+  d.rdKind == "i32" && pk == "str"
 }
 
 // The `let`/`const` callee `ix` reads, also when the monomorphizer renamed it to an
@@ -28475,7 +28476,7 @@ function pushDestVKind(rslot: i32): VKind | null {
   const ety = rlElemTyIx[rslot]
   if ety < 0 { return null }
   const d = repOfTy(ety)
-  if d.rdCovered != 1 { return null }
+  if d.rdKind == null { return null }
   const k = d.rdKind
   if k == "variant" && rlElemStructRow(rslot) >= 0 { return "struct" }
   if k == "struct" || k == "variant" || k == "map" || k == "closure" {
@@ -30514,7 +30515,7 @@ function emitListCopyTail(exprIx: i32, lct: i32, fnIx: i32): i32 {
   }
   // A scalar list converts each number; a pair no convert serves is delivered as built.
   const ld = repOfTy(instTyOrSelf(lct, fnIx))
-  if ld.rdCovered == 1 {
+  if ld.rdKind != null {
     const de = scalarListElemOfListKind(ld.rdKind)
     if de != null {
       emitScalarListCopy(exprIx, fnIx, de)
@@ -30638,7 +30639,7 @@ function emitScalarListCopy(srcIx: i32, fnIx: i32, de: VKind): boolean {
   if listFitStoodIn >= 0 && listFitStoodIn == unwrapParen(srcIx) {
     listFitStoodIn = -1
     const sd = repOfTy(listFitStoodTy)
-    const stood = if sd.rdCovered == 1 { scalarListElemOfListKind(sd.rdKind) } else { null }
+    const stood = if sd.rdKind != null { scalarListElemOfListKind(sd.rdKind) } else { null }
     if stood == null || stood == de || scalarWidenConvOp(stood, de) < 0 {
       return false
     }
@@ -32432,6 +32433,18 @@ function emitStmtGo(stmtIx: i32, fnIx: i32) {
         fbReturn() // 0x0f return (void: nothing pushed)
         return 0
       }
+    }
+    // A returned value `if` is the tail `if`: each arm's value is its own exit. An else-less
+    // chain falls through to the result's `null`, as the tail's pad gives it; any other is dead.
+    const rIf = unwrapParen(s.retArg)
+    if lastStmtIsValueIf(rIf, fnIx) {
+      if emitIfTail(rIf, fnIx) < 0 { return -1 }
+      if asvChainHasElse(rIf) || !fnRetNullBearing(fnIx) {
+        fbUnreachable() // 0x00
+        return 0
+      }
+      if emitNullForRet(fnIx) < 0 { return -1 }
+      return emitUnionRetSink(fnIx)
     }
     // Seed the return context + emit the value (struct / list / union / nullable /
     // widening) and terminate the exit, via the shared helper.
@@ -36741,7 +36754,7 @@ function emitNumLexAt(text: string, w: string) {
 // caller names: re-encoding the lexeme keeps a hex bit pattern past I32_MAX the value it spells.
 function emitSignedNumLitAt(ix: i32, w: string): i32 {
   const n = nodeAt(ix)
-  if n is NumLit { return emitNumLexAt(n.numText, w) }
+  if n is NumLit { return emitNumLexAt(numLitLexAt(ix, n.numText, w), w) }
   if n is Unary {
     const mark = wLen()
     if emitSignedNumLitAt(unwrapParen(n.unArg), w) < 0 { return -1 }
@@ -36751,7 +36764,16 @@ function emitSignedNumLitAt(ix: i32, w: string): i32 {
 }
 
 function emitNumLitNode(e: NumLit, exprIx: i32, fnIx: i32) {
-  emitNumLexAt(e.numText, numLitWidth(exprIx, fnIx))
+  const w = numLitWidth(exprIx, fnIx)
+  emitNumLexAt(numLitLexAt(exprIx, e.numText, w), w)
+}
+
+// The lexeme literal `ix`, spelled `text`, is lowered from at width `w`: a folded float tree used
+// at `f32` is its value in `f32` arithmetic, as it runs there (E9.1).
+function numLitLexAt(ix: i32, text: string, w: string): string {
+  if w != "f32" { return text }
+  const l32 = cexF32LexOf(unwrapParen(ix))
+  if l32 != "" { l32 } else { text }
 }
 
 function emitCharLitNode(e: CharLit, _exprIx: i32, _fnIx: i32) {
@@ -37290,9 +37312,9 @@ function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
   const st = if er >= 0 { er } else { nodeRepTyAt(exprIx, fnIx) }
   const d = repOfNodeAt(exprIx, st)
   let own = NULL_OWN_NONE
-  if d.rdCovered == 1 && d.rdNul == 2 { own = NULL_OWN_BOOL }
-  if d.rdCovered == 1 && d.rdNul == 3 { own = NULL_OWN_ATOM }
-  if d.rdCovered == 1 && d.rdKind == "nulstr" { own = NULL_OWN_STR }
+  if d.rdNul == 2 { own = NULL_OWN_BOOL }
+  if d.rdNul == 3 { own = NULL_OWN_ATOM }
+  if d.rdKind == "nulstr" { own = NULL_OWN_STR }
   // A value of the `null` type names no null of its own; the type it is delivered at does.
   if own == NULL_OWN_NONE && d.rdKind == "nulnone" {
     own = nullOwnOfTy(nodeCtxTyIxOf(parenPeelIx(exprIx)))
@@ -37353,7 +37375,7 @@ function listElemNullOwn(t: i32): i32 {
 function nullOwnOfTy(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return NULL_OWN_NONE }
   const d = repOfTy(t)
-  if d.rdCovered != 1 { return NULL_OWN_NONE }
+  if d.rdKind == null { return NULL_OWN_NONE }
   if d.rdNul == 2 { return NULL_OWN_BOOL }
   if d.rdNul == 3 { return NULL_OWN_ATOM }
   if d.rdKind == "nulstr" { return NULL_OWN_STR }
@@ -37371,7 +37393,7 @@ function tyRepsAsNulAtom(t: i32): boolean {
   // A template's own type parameter has no rep, so it is no niche.
   if t >= 0 && t < T.tys.length && tyAt(t) is TyVar { return false }
   const d = repOfTy(t)
-  const r = d.rdCovered == 1 && d.rdNul == 3
+  const r = d.rdNul == 3
   nulAtomTyMemo[t] = r
   r
 }
@@ -37489,7 +37511,7 @@ function tyElemRepsAsAtom(t: i32): boolean {
 function tyRepsAsAtom(t: i32): boolean {
   if t < 0 { return false }
   const d = repOfTy(t)
-  d.rdCovered == 1 && d.rdAtom == 1
+  d.rdAtom == 1
 }
 
 // Whether node `ix` is delivered to a destination whose type reps as the `K | null` atom niche:
@@ -37764,7 +37786,11 @@ function njStash(ix: i32, isUnion: boolean, key: i32, fnIx: i32): i32 {
   const k = njKindOfExpr(ix)
   if k < 0 { return -1 }
   if emitExprAsKind(ix, k, fnIx) < 0 { return -1 }
-  const ss = njSlot(27, listIdxKindOf(repOfTy(numPrimTyOfKind(k)).rdKind), key)
+  const ss = njSlot(
+    27,
+    listIdxKindOf(repOfTy(numPrimTyOfKind(k)).rdKind ?? "i32"),
+    key,
+  )
   fbLocalSet(ss)
   ss
 }
@@ -37973,7 +37999,7 @@ function emitNumUnionBin(e: BinExpr, exprIx: i32, fnIx: i32) {
   if njResBox {
     njBlockKind = "union"
   } else if !numCmpOp(e.binOp) {
-    njBlockKind = repOfTy(numPrimTyOfKind(rks[0])).rdKind
+    njBlockKind = repOfTy(numPrimTyOfKind(rks[0])).rdKind ?? "i32"
   }
   // The node's consumers read its recorded type, so a result shape it does not name is refused
   // loudly rather than handed on in a rep they do not expect (D3453).
@@ -38041,7 +38067,7 @@ function njConvertArm(ms: i32[], i: i32, bs: i32, to: i32) {
   }
   njTagTest(bs, mk)
   fbOpenIf()
-  fbValtype(repOfTy(numPrimTyOfKind(to)).rdKind, -1)
+  fbValtype(repOfTy(numPrimTyOfKind(to)).rdKind ?? "i32", -1)
   fbLocalGet(bs)
   if emitUnionUnboxTail(mk) < 0 { return -1 }
   if njConvert(mk, to) < 0 { return -1 }
