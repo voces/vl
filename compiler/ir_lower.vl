@@ -126,6 +126,7 @@ import {
   wULEB,
 } from "./emit_bytes"
 import {
+  GlobalCtx,
   initBitOf,
   userGlobalIdx,
   userGlobalReadClass,
@@ -149,6 +150,12 @@ export function irLFn(): IrFn { return lw }
 
 // The function being lowered, the definitions of its temps, and the state of one walk.
 let lw = irFnNew(-1, "")
+// Where the function being lowered sits, for the global storage classes.
+let lwGlobalCtx: GlobalCtx = {
+  gcInStart: false,
+  gcFnPos: -1,
+  gcGuardOff: false,
+}
 let lwMiss = ""
 let lwTempRhs: Rhs[] = []
 let lwTempDef: boolean[] = []
@@ -425,7 +432,7 @@ function rhs(r: Rhs, tail: boolean) {
     RPrimOp => primOp(r)
     RCall => call(r, tail)
     RGlobalGet => {
-      match userGlobalReadClass(r.ggSym) {
+      match userGlobalReadClass(r.ggSym, lwGlobalCtx) {
         "plain" => {
           leaf()
           fbGlobalGet(userGlobalIdx(r.ggSym))
@@ -537,7 +544,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       fbLocalSet(s)
     }
     SGlobalSet => {
-      match userGlobalWriteClass(n.gsSym) {
+      match userGlobalWriteClass(n.gsSym, lwGlobalCtx) {
         "plain" => {
           cond(n.gsSrc, pending)
           fbGlobalSet(userGlobalIdx(n.gsSym))
@@ -810,10 +817,12 @@ function localRun(v: i32) {
   return 0
 }
 
-// The size-prefixed code entry `f` lowers to, or a mismatch class in `lwMiss`; `firstLocal` is
-// the wasm index of the first declared local.
-function entry(f: IrFn, firstLocal: i32): u8[] {
+// The size-prefixed code entry `f` (at `fnStmts` slot `fnPos`) lowers to, or a mismatch class in
+// `lwMiss`; `firstLocal` is the wasm index of the first declared local.
+function entry(f: IrFn, fnPos: i32, firstLocal: i32): u8[] {
   lw = f
+  // A function body: not the start function, and never inside an assignment's re-read.
+  lwGlobalCtx = { gcInStart: false, gcFnPos: fnPos, gcGuardOff: false }
   lwMiss = ""
   lwTempRhs = []
   lwTempDef = []
@@ -879,13 +888,14 @@ function endsInReturn(f: IrFn): boolean {
 // `skew` breaks the lowering on purpose (`irShadowCorrupt`).
 export function irDualEmit(
   f: IrFn,
+  fnPos: i32,
   firstLocal: i32,
   legacy: u8[],
   spanBase: i32,
   spanShift: i32,
   skew: i32,
 ): string {
-  const got = entry(f, firstLocal)
+  const got = entry(f, fnPos, firstLocal)
   lwGot = got
   if lwMiss != "" { return "unlowered: " + lwMiss }
   // The comparison's own controls: 1 adds a byte to the lowering, 2 drops its first span row.

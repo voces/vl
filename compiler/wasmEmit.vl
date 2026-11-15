@@ -35827,23 +35827,41 @@ export function userGlobalIdx(gi: i32) {
 // `global.get` behind an init guard, or a plain `global.get`. `emitUserGlobalGet` and the IR
 // lowering both match on it, so the storage class stays one decision.
 export type GlobalReadClass = "fold" | "promo" | "guard" | "plain"
-export function userGlobalReadClass(gi: i32): GlobalReadClass {
+export function userGlobalReadClass(gi: i32, c: GlobalCtx): GlobalReadClass {
   if gi >= 0 && gi < gFoldOk.length && gFoldOk[gi] == 1 { return "fold" }
   if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 { return "promo" }
-  if initGuardNeeded(gi, false) { return "guard" }
+  if initGuardNeeded(gi, false, c) { return "guard" }
   return "plain"
+}
+
+// Where a global access is emitted: in the start function's top-level statements, else in the
+// body at `fnStmts` slot `gcFnPos`; `gcGuardOff` while an assignment re-reads what it stored.
+export type GlobalCtx = {
+  gcInStart: boolean,
+  gcFnPos: i32,
+  gcGuardOff: boolean,
+}
+
+// The context of the access legacy's emitter is writing now.
+function globalCtxNow(): GlobalCtx {
+  const c: GlobalCtx = {
+    gcInStart: gPromoInStart,
+    gcFnPos: emitCurFnPos,
+    gcGuardOff: initGuardOff,
+  }
+  return c
 }
 
 // How a write of module global `gi` is stored: its promoted local, a refused store to an
 // immutable cell, a `global.set` behind an init guard, or a plain one; any of the last two is
 // followed by its init bit when `initBitOf(gi)` has one.
 export type GlobalWriteClass = "promo" | "immutable" | "guard" | "plain"
-export function userGlobalWriteClass(gi: i32): GlobalWriteClass {
+export function userGlobalWriteClass(gi: i32, c: GlobalCtx): GlobalWriteClass {
   if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 { return "promo" }
   if globalCellIsImmutable(gi) { return "immutable" }
   // A write a function can make before the initializer ran would be overwritten by it (D2654);
   // the start function's own writes are its initializers and the checker orders the rest.
-  if !gPromoInStart && initGuardNeeded(gi, true) { return "guard" }
+  if !c.gcInStart && initGuardNeeded(gi, true, c) { return "guard" }
   return "plain"
 }
 
@@ -35852,13 +35870,14 @@ export function userGlobalWriteClass(gi: i32): GlobalWriteClass {
 // A promoted binding read outside the start function's frame is rejected loudly; a folded
 // const is its immediate, never uninitialised, so it takes no guard.
 export function emitUserGlobalGet(gi: i32) {
-  match userGlobalReadClass(gi) {
+  const c = globalCtxNow()
+  match userGlobalReadClass(gi, c) {
     "fold" => {
       return emitFoldedConstRead(gi)
     }
     "promo" => {
       if (
-        !gPromoInStart
+        !c.gcInStart
         || gi < 0
         || gi >= gPromoSlot.length
         || gPromoSlot[gi] < 0
@@ -35923,12 +35942,12 @@ function initFnReachOf(p: i32): i32 {
   return best
 }
 
-// Whether a read (a write, when `write`) of guarded global `gi` at the cursor can run before it
+// Whether a read (a write, when `write`) of guarded global `gi` in context `c` can run before it
 // holds its value: in the start function, at or before its declaration (the checker orders the
 // rest); in a function body, when top-level code at or before `gInitAt[gi]` can call it, or when
 // no top-level code names it at all.
-function initGuardNeeded(gi: i32, write: boolean): boolean {
-  if !gInitAny || initGuardOff { return false }
+function initGuardNeeded(gi: i32, write: boolean, c: GlobalCtx): boolean {
+  if !gInitAny || c.gcGuardOff { return false }
   if gi < 0 || gi >= gInitGuard.length || gi >= globalStmtOrd.length {
     return false
   }
@@ -35938,11 +35957,11 @@ function initGuardNeeded(gi: i32, write: boolean): boolean {
   if d is LetDecl {
     if write && d.letInit < 0 { return false }
   }
-  if gPromoInStart {
+  if c.gcInStart {
     return gInitStartOrd >= 0 && gInitStartOrd <= globalStmtOrd[gi]
   }
-  if emitCurFnPos < 0 || gi >= gInitAt.length { return false }
-  const r = initFnReachOf(emitCurFnPos)
+  if c.gcFnPos < 0 || gi >= gInitAt.length { return false }
+  const r = initFnReachOf(c.gcFnPos)
   return r == INIT_REACH_NEVER || r <= gInitAt[gi]
 }
 
@@ -36062,10 +36081,11 @@ function emitInitGuard(gi: i32, verb: string) {
 // The write half of the chokepoint above — `local.set` into the start function's frame
 // for a promoted binding, else `global.set` of its cell.
 export function emitUserGlobalSet(gi: i32) {
-  match userGlobalWriteClass(gi) {
+  const c = globalCtxNow()
+  match userGlobalWriteClass(gi, c) {
     "promo" => {
       if (
-        !gPromoInStart
+        !c.gcInStart
         || gi < 0
         || gi >= gPromoSlot.length
         || gPromoSlot[gi] < 0
