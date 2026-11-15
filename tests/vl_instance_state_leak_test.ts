@@ -129,7 +129,7 @@ const PROGRAMS: Program[] = [
   { id: "u8-for-in", family: "ba8Used", path: "arrays/u8-for-in.vl" },
   {
     id: "u8-packed-list",
-    family: "fnUsesPackedPush (D1006)",
+    family: "fnUses.packedPush (D1006)",
     path: "arrays/u8-packed-list.vl",
   },
   {
@@ -203,12 +203,12 @@ const PROGRAMS: Program[] = [
     family: "uBoxIdx × gLitUnionUsed",
     path: "unions/variant-litunion-field.vl",
   },
-  // ── the union-box SINK frame: `fnUsesUnionSink` / `fnUsesUnionLetSink` ──
+  // ── the union-box SINK frame: `fnUses.unionSink` / `fnUses.unionLetSink` ──
   // Both are assigned per FUNCTION in `emitFuncCode` and never in `startFnDetectScratch`
   // (see the audit note). No witness — this pair is here so one would be caught.
   {
     id: "union-return-sink",
-    family: "fnUsesUnionSink",
+    family: "fnUses.unionSink",
     src:
       'function pick(b: boolean): i32 | string {\n  if b { return 1 }\n  return "s"\n}\n' +
       "const v = pick(true)\nif v is i32 { print(v) }\n",
@@ -234,7 +234,7 @@ const PROGRAMS: Program[] = [
   },
   {
     id: "map-values-forin",
-    family: "fnUsesMapVals (D1007)",
+    family: "fnUses.mapVals (D1007)",
     path: "maps/forin-list-valued-values.vl",
   },
   {
@@ -349,7 +349,7 @@ const PROGRAMS: Program[] = [
 //
 // Both are one mechanism: `startFnDetectScratch` (`emit_sections.vl`) is the start
 // function's analogue of `emitFuncCode`'s per-function frame detection, and it clears 20 of
-// the 24 `fnUses*` frame flags. `fnUsesPackedPush` and `fnUsesMapVals` are two of the four it
+// the 24 `fnUses` frame fields. `fnUses.packedPush` and `fnUses.mapVals` are two of the four it
 // misses — and each is written TWICE IN A ROW inside `emitFuncCode` (lines 872/873 and
 // 904/905), which is what the second copy was for. So a program that pushes to a `u8[]`, or
 // reads `m.values()`, leaves its flag set, and the NEXT program's start function reserves a
