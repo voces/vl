@@ -231,6 +231,7 @@ import {
   HELP_MAP_RESIZE_I32,
   HELP_MAP_RESYNC,
   HELP_STR_BYTES,
+  HELP_STR_CAT,
   HELP_STR_CONCAT,
   HELP_STR_EQ,
   HELP_STR_HASH,
@@ -3079,6 +3080,74 @@ function emitStrConcatFnCode(out: u8[]) {
   return helpFrameBody(out, body)
 }
 
+// `__str_cat_<n>__`'s parameter descriptor: `n` strings.
+function strCatParams(n: i32): string {
+  let d = ""
+  let i = 0
+  while i < n {
+    d = d + "s"
+    i = i + 1
+  }
+  return d
+}
+
+// `__str_cat_<n>__(s0, …, s(n-1)) -> (ref str)`: `emitStrCatN`'s chain out of line, the same
+// exact-fit backing and one `array.copy` per part from its own `start`. Locals: total(n),
+// off(n+1) i32; out(n+2) a non-null `(ref $sBackIdx)`.
+function emitStrCatFnCode(out: u8[], n: i32) {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  const total = n
+  const off = n + 1
+  const back = n + 2
+  wULEB(2) // 2 locals runs
+  wULEB(2) // count 2
+  wValI32()
+  wULEB(1) // count 1
+  wValRef(sBackTy(), false)
+  fbLocalGet(0)
+  fbStrLen()
+  let k = 1
+  while k < n {
+    fbLocalGet(k)
+    fbStrLen()
+    fbI32Bin(106) // i32.add
+    k = k + 1
+  }
+  fbLocalTee(total)
+  fbArrayNewDefault(sBackTy())
+  fbLocalSet(back)
+  fbI32Const(0)
+  fbLocalSet(off)
+  let m = 0
+  while m < n {
+    fbLocalGet(back)
+    fbLocalGet(off)
+    fbLocalGet(m)
+    fbStrBack()
+    fbLocalGet(m)
+    fbStrStart()
+    fbLocalGet(m)
+    fbStrLen()
+    fbArrayCopy(sBackTy(), sBackTy())
+    if m + 1 < n {
+      fbLocalGet(off)
+      fbLocalGet(m)
+      fbStrLen()
+      fbI32Bin(106) // i32.add
+      fbLocalSet(off)
+    }
+    m = m + 1
+  }
+  fbLocalGet(back)
+  fbI32Const(0)
+  fbLocalGet(total)
+  fbStrNew()
+  fbEnd() // end (function) — leaves the fresh string ref
+  wTarget(prev)
+  return helpFrameBody(out, body)
+}
+
 // ── the UTF-8 codec helpers ──
 // Three module-tail functions, minted on first ask like the string trio above: the codec
 // is a loop with a variable stride, the one shape a lowering cannot inline at every use site.
@@ -5789,6 +5858,7 @@ function tailHelpFnCode(out: u8[], kind: i32): i32 {
   if kind == HELP_MAP_PROBE_I32 { return emitMapProbeI32FnCode(out, false) }
   if kind == HELP_MAP_RESIZE_I32 { return emitMapResizeI32FnCode(out) }
   if kind == HELP_MAP_PROBE_I64 { return emitMapProbeI64FnCode(out) }
+  if kind >= HELP_STR_CAT { return emitStrCatFnCode(out, kind - HELP_STR_CAT) }
   if kind >= HELP_LIST_GROW {
     return emitListGrowFnCode(out, kind - HELP_LIST_GROW)
   }
@@ -5812,6 +5882,9 @@ function tailHelpName(kind: i32): string {
   if kind == HELP_MAP_ENTRY_I32 { return "__map_entry_i32__" }
   if kind == HELP_MAP_RESIZE_I32 { return "__map_resize_i32__" }
   if kind == HELP_MAP_PROBE_I64 { return "__map_probe_i64__" }
+  if kind >= HELP_STR_CAT {
+    return "__str_cat_" + i32ToStr(kind - HELP_STR_CAT) + "__"
+  }
   if kind >= HELP_LIST_GROW {
     return "__grow_" + i32ToStr(kind - HELP_LIST_GROW) + "__"
   }
@@ -9183,6 +9256,9 @@ function tailHelpFuncType(kind: i32) {
   if kind == HELP_MAP_ENTRY_I32 { return helpFuncType("ai", "i") }
   if kind == HELP_MAP_RESIZE_I32 { return helpFuncType("ai", "a") }
   if kind == HELP_MAP_PROBE_I64 { return helpFuncType("ajk", "i") }
+  if kind >= HELP_STR_CAT {
+    return helpFuncType(strCatParams(kind - HELP_STR_CAT), "s")
+  }
   if kind >= HELP_LIST_GROW { return listGrowFuncType(kind - HELP_LIST_GROW) }
   return mapCompactFuncType(mapCompactRowShape(kind - HELP_MAP_COMPACT))
 }
