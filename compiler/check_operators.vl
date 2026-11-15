@@ -82,6 +82,7 @@ import {
   elabCapAlwaysTestNote,
   elabCapDeadTestNote,
   elabCapIsNote,
+  elabCapKey,
   elabCapLive,
   elabFnListWidened,
   elabFnRecJoin,
@@ -135,6 +136,7 @@ import {
   recordDeadCoalesce,
 } from "./check_coal"
 import {
+  asInstMissNote,
   checkNodeHook,
   coalNodeHole,
   concatsAsStr,
@@ -478,6 +480,7 @@ import { cwUseInOtherFrame, fnDeclIx } from "./check_write_scan"
 import { identDeclOf, sidOfNode } from "./symbols"
 import {
   arrElemValueTy,
+  flattenVariantsInto,
   isLitBearing,
   isNullTy,
   isNumeric,
@@ -2247,6 +2250,7 @@ export function checkCastNode(n: AsExpr, ix: i32) {
   if elabCapLive() && n.asMode == "null" && isNumericPrimTy(target) {
     const tmpl = nodeTyIxOf(n.asObj)
     if tmpl >= 0 && tmpl < T.tys.length && tyHasTyVar(tmpl) {
+      if asUnionMisses(arg, target) { return asOptMissAt(ix, target) }
       return mkNullableTy(target)
     }
   }
@@ -2311,6 +2315,26 @@ function castUnionOperandOf(arg: i32): i32 {
   argU
 }
 
+// Whether `arg`, a union or nullable, holds no member numeric cast `as` to `target` can take:
+// a number or a `boolean` member converts, so only a union of neither misses.
+function asUnionMisses(arg: i32, target: i32): boolean {
+  const argU = castUnionOperandOf(arg)
+  if argU < 0 { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(argU, ms)
+  for m in ms {
+    if isNumeric(m) || primNameStr(primNameOf(m)) == "boolean" { return false }
+  }
+  tyTestMeet(argU, target) < 0 && !tyTestNamesMembers(argU, target)
+}
+
+// `as?` cast `ix` to `target` at an instance whose operand it can never hit: banked for the
+// emitter, which lowers that instance's cast to its `null`; the cast keeps its `T | null`.
+function asOptMissAt(ix: i32, target: i32): i32 {
+  asInstMissNote(ix, elabCapKey)
+  mkNullableTy(target)
+}
+
 // The ruled propagation cast over union operand `argU` (`argT`) to `target`: it names the arm
 // wanted, and the remainder propagates to the enclosing return unless `as!`/`as?` keeps it
 // local. Answers the cast's type, `TY_ERR` once refused at `ix`.
@@ -2347,8 +2371,21 @@ function checkCastUnionArm(
     // A gradual union's parameter may hold the target at a pin: the cast is parked on the
     // parameter and re-asked there, as over a bare one (D2906).
     if unionHasDeclaredParam(argT.uMembers) {
-      noteBinCstr(argU, OP_AS, target)
+      noteBinCstrAt(argU, OP_AS, target, ix, -1)
       if n.asMode == "null" { return mkNullableTy(target) }
+      return target
+    }
+    // At an instance a cast no member fits misses, as one over a type parameter pinned at no
+    // number does (D2791): `as?` is `null`, `as!` traps, a bare `as` propagates its operand.
+    // The direct spelling keeps the refusal.
+    if elabCapLive() {
+      if n.asMode == "null" { return asOptMissAt(ix, target) }
+      if n.asMode == "trap" {
+        asInstMissNote(ix, elabCapKey)
+        return target
+      }
+      if !castPropagationFits(argU, n.asTy, ix, T.curRet, -1) { return TY_ERR }
+      asInstMissNote(ix, elabCapKey)
       return target
     }
     tErr(
