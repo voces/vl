@@ -55,4 +55,4 @@ remain after `passes`. Neither is a variant drop.
   read is the next cut, the same kind as stage 1b's bit 2.
 - **`tyMutEpoch`, 107, in 103 programs.** Lane H's #8073 (per-instance holes) owns these.
 
-Net compiler lines: +16. Pin-helper delta: 0.
+Net compiler lines: +10 (`emit_rep.vl` +20 −10). Pin-helper delta: 0.
