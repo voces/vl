@@ -3,7 +3,7 @@
 //   deno run -A scripts/oracle/oracle.ts run <file.vl>
 //   deno run -A scripts/oracle/oracle.ts distilled [--grades <regress.json>] [--json OUT] [--budget-ms N]
 //   deno run -A scripts/oracle/oracle.ts diff <cases-dir> <vl-batch-out-dir> [--json OUT]
-//   deno run -A scripts/oracle/oracle.ts recording <sweep-recording.jsonl> [--population P] [--budget-ms N]
+//   deno run -A scripts/oracle/oracle.ts recording <head.jsonl> [--base <base.jsonl>] [--population P] [--budget-ms N]
 //
 // `run` exits 0 on a clean run, 3 on a trap, 4 on a type fault and 5 outside the subset.
 // `distilled` and `diff` exit 1 when any DISAGREE or UNSOUND verdict is not in
@@ -90,15 +90,17 @@ function known(): Set<string> {
   } catch { return new Set(); }
 }
 
-type Row = { cell: string; verdict: Verdict; why: string };
+// `sig` (recording mode only): the compiled stdout hash and outcome, which a base diff compares.
+type Row = { cell: string; verdict: Verdict; why: string; sig?: string };
 
-function report(rows: Row[], jsonOut: string | null, elapsed: number): number {
+function report(rows: Row[], jsonOut: string | null, elapsed: number, base: Set<string> | null = null): number {
   const counts = new Map<string, number>();
   for (const r of rows) counts.set(r.verdict, (counts.get(r.verdict) ?? 0) + 1);
   const k = known();
-  const fresh = rows.filter((r) => (r.verdict === "DISAGREE" || r.verdict === "UNSOUND") && !k.has(r.cell));
+  const inBase = (r: Row) => base !== null && base.has(sigOf(r));
+  const fresh = rows.filter((r) => (r.verdict === "DISAGREE" || r.verdict === "UNSOUND") && !k.has(r.cell) && !inBase(r));
   for (const r of rows.filter((r) => r.verdict === "DISAGREE" || r.verdict === "UNSOUND" || r.verdict === "COMPILED-BAD")) {
-    console.log(`${r.verdict.padEnd(12)} ${r.cell}${k.has(r.cell) ? " (known)" : ""}  ${r.why.slice(0, 300)}`);
+    console.log(`${r.verdict.padEnd(12)} ${r.cell}${k.has(r.cell) ? " (known)" : inBase(r) ? " (on the base too)" : ""}  ${r.why.slice(0, 300)}`);
   }
   if (jsonOut) Deno.writeTextFileSync(jsonOut, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
   const ran = rows.length - (counts.get("SKIP") ?? 0);
@@ -176,16 +178,51 @@ function diff(args: string[]): number {
 
 // A scripts/sweep.vl recording: `stdout` is the first 16 hex digits of the sha256 of what the
 // compiled program printed, so the oracle compares hashes and compiles nothing itself.
+//
+// A distilled cell's manifest expectation is a third opinion. When the oracle prints it and the
+// compiled program does not, the corpus already grades the cell `runs but wrong value`, so it is
+// COMPILED-BAD, not a new disagreement. `--base <base.jsonl>` judges the base recording the same
+// way, and a disagreement the base already had (same cell, verdict and compiled stdout) is not new.
 async function recording(args: string[]): Promise<number> {
   const t0 = Date.now();
   const budget = Number(flag(args, "--budget-ms") ?? "0");
   const only = flag(args, "--population") ?? "";
+  const expects = distilledExpectations();
+  const head = await judgeRecording(args[0], only, budget, t0, expects);
+  if (!head) return 2;
+  let base: Set<string> | null = null;
+  const basePath = flag(args, "--base");
+  if (basePath) {
+    const b = await judgeRecording(basePath, only, budget, t0, expects);
+    if (!b) return 2;
+    base = new Set(b.map(sigOf));
+  }
+  if (args.includes("--skips")) skipReasons(head);
+  return report(head, flag(args, "--json"), Date.now() - t0, base);
+}
+
+function sigOf(r: Row): string { return `${r.cell}\t${r.verdict}\t${r.sig ?? ""}`; }
+
+// Every distilled cell's expected stdout, keyed by its path from the checkout root.
+export function distilledExpectations(): Map<string, string> {
+  const m = new Map<string, string>();
+  const root = "scripts/silent-sweep/distilled";
+  for (const sub of ["cells", "named"]) {
+    try {
+      const man = JSON.parse(Deno.readTextFileSync(`${root}/${sub}/manifest.json`)).expect as Record<string, string>;
+      for (const [cell, want] of Object.entries(man)) m.set(`${root}/${sub}/${cell}.vl`, want);
+    } catch { /* no manifest: no expectations */ }
+  }
+  return m;
+}
+
+export async function judgeRecording(path: string, only: string, budget: number, t0: number, expects: Map<string, string>): Promise<Row[] | null> {
   const rows: Row[] = [];
   const enc = new TextEncoder();
-  for (const rec of loadJsonl(args[0])) {
+  for (const rec of loadJsonl(path)) {
     const key = String(rec.cell);
     if (!key.endsWith(".vl") || key.includes("#") || (only && !key.includes(only))) continue;
-    if (budget && Date.now() - t0 > budget) { console.log(`oracle: wall-clock budget ${budget} ms exhausted after ${rows.length} programs`); return 2; }
+    if (budget && Date.now() - t0 > budget) { console.log(`oracle: wall-clock budget ${budget} ms exhausted after ${rows.length} programs`); return null; }
     const outcome = String(rec.outcome);
     if (outcome === "check_clean" || outcome === "timeout") continue;
     let src: string;
@@ -196,12 +233,14 @@ async function recording(args: string[]): Promise<number> {
     if (o.kind === "ok" && cls === "runs") {
       const text = o.out.length ? o.out.join("\n") + "\n" : "";
       const h = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(text)))).map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
-      j = h === String(rec.stdout) ? { v: "AGREE", why: "" } : { v: "DISAGREE", why: `oracle printed ${JSON.stringify(o.out).slice(0, 200)}, a different stdout hash` };
+      const want = expects.get(key);
+      if (h === String(rec.stdout)) j = { v: "AGREE", why: "" };
+      else if (want !== undefined && o.out.join("\n") === want) j = { v: "COMPILED-BAD", why: "compiled a wrong value; the oracle prints the corpus expectation" };
+      else j = { v: "DISAGREE", why: `oracle printed ${JSON.stringify(o.out).slice(0, 200)}, a different stdout hash` };
     }
-    rows.push({ cell: key, verdict: j.v, why: j.why });
+    rows.push({ cell: key, verdict: j.v, why: j.why, sig: String(rec.stdout ?? "") + "/" + outcome });
   }
-  if (args.includes("--skips")) skipReasons(rows);
-  return report(rows, flag(args, "--json"), Date.now() - t0);
+  return rows;
 }
 
 function flag(args: string[], name: string): string | null {
