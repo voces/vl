@@ -21,7 +21,7 @@ message then quoted line 47 of `std:idtable`, a line the caller never sees.
   then counts as having reported its cause, as `oerDeclRefusals` already does. So
   `cannot infer a return type for 'relay'` does not follow the call's own refusal.
 
-Net compiler lines: about +6. Pin helpers: none touched.
+Net compiler lines: +17 (+33/−16). Pin helpers: none touched.
 
 ## Grading
 
