@@ -206,6 +206,40 @@ export function nearNamesNote(): void { nearNamesRead = true }
 // bug; minting a new index needs none. `cUserTypesVer` does the same for `cUserTypes` writes.
 export let tyMutEpoch = 0
 
+// `tyEmitEpoch` advances with `tyMutEpoch` except for a write to a row or hole minted inside the
+// innermost open mono re-check, which no emit memo can have read; the emitter's memos stamp
+// with it. A write that names neither moves both.
+export let tyEmitEpoch = 0
+// Per open mono re-check, outermost first: the arena length and the hole count when it began.
+const tyRecheckRowMark: i32[] = []
+const tyRecheckHoleMark: i32[] = []
+
+// Advances the epochs for an in-place write to arena row `row` or hole `hole` (-1 for neither):
+// the one writer of `tyMutEpoch` and `tyEmitEpoch`.
+export function tyMutBump(row: i32, hole: i32) {
+  tyMutEpoch = tyMutEpoch + 1
+  const n = tyRecheckRowMark.length
+  const fresh = n > 0
+    && (row >= 0 && row >= tyRecheckRowMark[n - 1]
+    || row < 0 && hole >= 0 && hole >= tyRecheckHoleMark[n - 1])
+  if fresh { return 0 }
+  tyEmitEpoch = tyEmitEpoch + 1
+  0
+}
+
+// Opens a mono re-check's marks: rows and holes minted from here are fresh until `tyRecheckEnd`.
+export function tyRecheckBegin() {
+  tyRecheckRowMark.push(T.tys.length)
+  tyRecheckHoleMark.push(holeSol.length)
+  0
+}
+
+export function tyRecheckEnd() {
+  tyRecheckRowMark.pop()
+  tyRecheckHoleMark.pop()
+  0
+}
+
 export let cUserTypesVer = 0
 
 // Each generic nested in another function, by declaration node, to its enclosing declaration.
@@ -4943,24 +4977,27 @@ function tvSlotShownAs(binder: i32, idx: i32): i32 {
 // Pins open element `v` into list row `t` in place, advancing `tyMutEpoch`: the one writer of a
 // list row's element after its mint, so every pin invalidates the epoch-stamped memos.
 export function tyPinElem(t: TyArray, v: i32) {
+  const h = holeIxOf(t.aElem)
   if !holeSolve(t.aElem, v) { t.aElem = v }
-  tyMutEpoch = tyMutEpoch + 1
+  tyMutBump(-1, h)
   0
 }
 
 // `tyPinElem` for a map row's key; a lone string literal is stored as its one-member set, as
 // `mkMapTy` stores it (D16367).
 export function tyPinKey(t: TyMap, v: i32) {
+  const h = holeIxOf(t.mKey)
   const s = strLitAsSet(v)
   if !holeSolve(t.mKey, s) { t.mKey = s }
-  tyMutEpoch = tyMutEpoch + 1
+  tyMutBump(-1, h)
   0
 }
 
 // `tyPinElem` for a map row's value.
 export function tyPinVal(t: TyMap, v: i32) {
+  const h = holeIxOf(t.mVal)
   if !holeSolve(t.mVal, v) { t.mVal = v }
-  tyMutEpoch = tyMutEpoch + 1
+  tyMutBump(-1, h)
   0
 }
 
@@ -4989,6 +5026,8 @@ let holeSol: i32[] = []
 
 // Empties the hole column with the arena it belongs to.
 export function holeReset() {
+  tyRecheckRowMark.clear()
+  tyRecheckHoleMark.clear()
   holeSol = []
   0
 }
@@ -5038,6 +5077,11 @@ function holeSolve(c: i32, v: i32): boolean {
 }
 
 // What child field value `c` reads as.
+// The hole child code `c` names, root-resolved, or -1 when it names no hole.
+function holeIxOf(c: i32): i32 {
+  if isHoleCode(c) { -4 - holeRoot(c) } else { -1 }
+}
+
 function holeView(c: i32): i32 {
   if !isHoleCode(c) { return c }
   holeSol[-4 - holeRoot(c)]
