@@ -113,7 +113,13 @@ type IrNode =
 type IrVar = { vRep: RepId, vTy: TyId, vKind: "param" | "local" | "temp", vSlot: i32 }
 ```
 
-That is 21 right-hand sides and 16 statements. It is the closed set the emitter matches (§1.6).
+That is 21 right-hand sides and 15 statements. It is the closed set the emitter matches (§1.6).
+
+**Signedness lives on the op, not the rep.** `u32` and `u64` share their valtype, and so their
+rep, with `i32` and `i64` (`unsigned-types-design.md`). So `PrimOp` carries signedness: `div`/`divu`,
+`rem`/`remu`, `lt`/`ltu`, `le`/`leu`, `gt`/`gtu`, `ge`/`geu` and `shr`/`shru`. The builder chooses
+the op from the operand's `TyId`, and the verifier checks the choice against that `TyId` (rule 2).
+A rep comparison alone would accept a `u32` division lowered as a signed one.
 
 Four cases are deliberately absent:
 - **There is no `Unbox` or `Box` node.** Box and unbox are coercions (`CoerceKind` has `"box"` and
@@ -225,7 +231,7 @@ emitter's seat tests stay as they are until I3 deletes them.
 
 ```
 lowerRhs(r: Rhs, dst: IrVar): void      // match over the 21 Rhs kinds; no `_`
-lowerStmt(n: IrNode): void              // match over the 16 statements; no `_`
+lowerStmt(n: IrNode): void              // match over the 15 statements; no `_`
 lowerCoerce(c: Coercion): void          // match over M3's variants; no `_`
 ```
 
@@ -267,9 +273,12 @@ following.
 5. **Control.** Every `SBr` targets an enclosing label. A label with an out-`Var` receives a value
    of that rep on every `SBr`, and on the fall-through. `SIf`/`SSwitch` arms agree on `ifOut`'s rep.
    A join of different reps therefore needs an explicit coercion in each arm, which is what today's
-   `markInferredJoinAtoms` and `registerRetJoinUnions` work out by scanning.
-6. **Calls.** The arguments' reps equal the callee's parameter reps (the callee's `RSig`, E stage
-   6), and the destination's rep is the callee's result rep.
+   `markInferredJoinAtoms` and `registerRetJoinUnions` work out by scanning. A function whose result
+   is not `RNoValue` leaves its top body on every path: the body is a block whose out is the
+   result. An `SIf` or `SSwitch` whose arms all exit counts as an exit.
+6. **Calls and globals.** The arguments' reps equal the callee's parameter reps (the callee's
+   `RSig`, E stage 6), and the destination's rep is the callee's result rep. An `SGlobalSet`'s
+   source and an `RGlobalGet`'s destination have the global's rep.
 7. **Switch.** The arms cover the scrutinee's union arms exactly once each, or carry a default
    that names what it excludes (CLAUDE.md's ladder rule, applied to the IR).
 8. **Bounds.** Every `RListGet`/`SListSet` is preceded on every path by an `SBoundsCheck` of the
