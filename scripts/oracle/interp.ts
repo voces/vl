@@ -1231,7 +1231,9 @@ export class Interp {
         const wideOther = (): boolean => {
           if (!(v instanceof Lit) || v.i === null || kOther || !ok || ok.k !== "expr") return false;
           return (tails(ok.e) ?? []).some((t) => {
-            const o = this.eval(t, env, null);
+            // the arm did not run: a trap in its constant is no trap of the program
+            let o: Val;
+            try { o = this.eval(t, env, null); } catch (x) { if (x instanceof Trap) return false; throw x; }
             if (!(o instanceof Lit) || o.i === null) return false;
             // a radix tree is i64 when it holds a wider pattern or a decimal outside i32 (D16492)
             if (o.radix) return o.radix === 64 || o.wideDec;
@@ -1262,7 +1264,8 @@ export class Interp {
         }
         const kv = numKind(v);
         if (kv && ok && ok.k === "expr" && isConstTree(ok.e)) {
-          const lit = this.eval(ok.e, env, null) as Lit;
+          let lit: Lit;
+          try { lit = this.eval(ok.e, env, null) as Lit; } catch (x) { if (x instanceof Trap) return v; throw x; }
           if (!joinFits(lit, kv)) { const dk = numKind(litDefault(lit))!; if (WIDENS[kv]?.includes(dk)) return toKind(v, dk); }
         }
         return v;
@@ -1745,8 +1748,11 @@ export class Interp {
     if (f instanceof Bi && ["min", "max", "abs"].includes(f.name)) {
       // A shift of a constant takes a typed argument's width as a constant does (Q8), read from
       // the declarations so each argument still runs once, in order.
-      const shifted = (x: Expr) => x.k === "bin" && ["<<", ">>", ">>>"].includes(x.op) && isConstTree(x.l) && !isConstTree(x.r);
-      const pk = e.args.map((a) => shifted(a.e) || isConstTree(a.e) ? null : this.staticKind(a.e, env)).find((k) => k === "i32" || k === "i64") ?? null;
+      // A shift of a constant, or a tree over one, takes a typed argument's width, or an i64
+      // constant argument's (D16492), as a constant does.
+      const shifted = (x: Expr) => !isConstTree(x) && x.k !== "if" && constLike(x);
+      const pk = e.args.map((a) => shifted(a.e) || isConstTree(a.e) ? null : this.staticKind(a.e, env)).find((k) => k === "i32" || k === "i64")
+        ?? (e.args.some((a) => { if (!isConstTree(a.e)) return false; const v = this.eval(a.e, env, null); return v instanceof Lit && v.i !== null && numKind(litDefault(v)) === "i64"; }) ? "i64" : null);
       const args = pk && e.args.some((a) => shifted(a.e)) && !e.args.some((a) => a.name || a.e.k === "spread")
         ? e.args.map((a) => this.eval(a.e, env, shifted(a.e) ? { k: "name", name: pk, args: [] } : null))
         : this.evalArgs(e.args, env);
