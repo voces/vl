@@ -342,6 +342,8 @@ function topCallee(ln: string): string {
   } else if startsWith(ln, "  if ") {
     if ln.indexOf(") < 0 { return") < 0 { return "" }
     i = 5
+  } else if startsWith(ln, "  return ") {
+    i = 9
   }
   const id = identAt(ln, i)
   const j = i + id.length
@@ -358,8 +360,9 @@ function endsPrefix(ln: string): boolean {
   return true
 }
 
-// `roots` and every function they reach through `topCallee` lines before `endsPrefix`: the
-// functions that run, start to finish of that prefix, whenever a root does.
+// `roots` and every function they reach through `topCallee` lines up to `endsPrefix`, whose
+// top-level `return CALL(…)` still runs its callee: the functions that run, start to finish of
+// that prefix, whenever a root does.
 function closureOf(roots: readonly string[], srcs: Src[]): string[] {
   const fsrc = Map<string, i32>()
   const fspan = Map<string, i32>()
@@ -398,12 +401,14 @@ function closureOf(roots: readonly string[], srcs: Src[]): string[] {
       let ln = src.lines[k]
       const cut = ln.indexOf("//")
       if cut >= 0 { ln = ln.slice(0, cut) }
-      if endsPrefix(ln) { break }
+      const ends = endsPrefix(ln)
+      if ends && !startsWith(ln, "  return ") { break }
       const c = topCallee(ln)
       if c.length > 0 && on[c] == null && fsrc[c] != null {
         on[c] = true
         seen.push(c)
       }
+      if ends { break }
       k = k + 1
     }
   }
@@ -594,7 +599,7 @@ function prefixLines(s: Src): i32[] {
   return out
 }
 
-// A one-line setter `function S(p: T) { NAME = p }` writes NAME on another module's behalf, so
+// A one-line setter `function S(p: T) { [return ]NAME = p }` writes NAME on another module's behalf, so
 // each call `S(arg)` is a write of NAME in the CALLER, graded as `writesIn` grades `NAME = arg`.
 function setterWrites(
   srcs: Src[],
@@ -611,7 +616,8 @@ function setterWrites(
       if ps.length != 1 || !endsWith(h, " }") { continue }
       const ob = h.lastIndexOf("{ ")
       if ob < 0 { continue }
-      const body = h.slice(ob + 2, h.length - 2)
+      let body = h.slice(ob + 2, h.length - 2)
+      if startsWith(body, "return ") { body = body.slice(7, body.length) }
       const eq = body.indexOf(" = ")
       if eq < 0 || body.slice(eq + 3, body.length) != ps[0] { continue }
       const ix = lx[s.file + ":" + body.slice(0, eq)]
@@ -903,7 +909,8 @@ function writesIn(
             while e > 0 && rhs[e - 1] == 125 { e = e - 1 }
             rhs = stripWs(rhs.slice(0, e))
             // An unconditional overwrite that does not read the old value re-establishes it.
-            const set = top > 0 && i == 2 && !hasWord(rhs, decls[ix].name)
+            const atStmt = i == 2 || (i == 9 && startsWith(text, "  return "))
+            const set = top > 0 && atStmt && !hasWord(rhs, decls[ix].name)
             const clear = (set && top == 2) || rhs == decls[ix].init
             out.push(
               {

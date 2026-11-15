@@ -44,7 +44,7 @@ const PROGRAMS: Record<string, Spec> = {
     src: `function f(xs: u8[]): i32 {
   let s = 0
   for b in xs { s += b }
-  s
+  return s
 }
 print(f([1, 2, 250]))
 `,
@@ -56,7 +56,7 @@ print(f([1, 2, 250]))
     src: `function f(xs: f64[]): f64 {
   let s = 0.0
   for x in xs { s += x }
-  s
+  return s
 }
 print(f([1.5, 2.25]))
 `,
@@ -72,7 +72,7 @@ print(f([1.5, 2.25]))
     if x < 3 { xs.push(x + 10) }
     s += x
   }
-  s
+  return s
 }
 print(f([1, 2, 3]))
 `,
@@ -84,7 +84,7 @@ print(f([1, 2, 3]))
     src: `function f(xs: u8[]): i32 {
   let s = 0
   for i in 0 until xs.length { s += xs[i] }
-  s
+  return s
 }
 print(f([4, 5, 6]))
 `,
@@ -96,7 +96,7 @@ print(f([4, 5, 6]))
     src: `function f(xs: i32[]): i32 {
   let s = 0
   for i in 0 to xs.length - 1 { s += xs[i] }
-  s
+  return s
 }
 print(f([4, 5, 6]))
 `,
@@ -112,7 +112,7 @@ print(f([4, 5, 6]))
   let s = 0
   for i in 0 to n { s += xs[i] }
   for i in 0 to xs.length { if i < n { s += xs[i] } }
-  s
+  return s
 }
 print(f([4, 5, 6], 2))
 `,
@@ -127,7 +127,7 @@ print(f([4, 5, 6], 2))
     i = i + 1
     s += xs[i]
   }
-  s
+  return s
 }
 print(f([4, 5, 6, 7]))
 `,
