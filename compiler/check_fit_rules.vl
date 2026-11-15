@@ -556,6 +556,7 @@ import {
   tyLitMemberTexts,
   tyMutEpoch,
   tyNameAtoms,
+  tyOpen,
   tyReachesEmptyHole,
   tyReachesUnion,
   tySame,
@@ -924,6 +925,7 @@ export function cexTryFoldBin(e: BinExpr, ix: i32): i32 {
 function cexFoldAt(ix: i32): i32 {
   const v = cexEvalAt(ix, 0)
   if v.cxNo || cexPastF64(v) {
+    if v.cxNo && cexFoldOperands(ix) { return 0 }
     cexKeepWhole(ix, 0)
     return 0
   }
@@ -933,6 +935,27 @@ function cexFoldAt(ix: i32): i32 {
   }
   cexRewrite(ix, v)
   1
+}
+
+// When only the operator at `ix` declines (`-7 >>> 1` needs a width), each operand that is an
+// exact integer, and no radix pattern, is still a constant and folds on its own; the operator
+// then computes at their type (D16375). False when the tree is kept whole instead.
+function cexFoldOperands(ix: i32): boolean {
+  const e = nodeAt(parenPeelIx(ix))
+  if !(e is BinExpr) { return false }
+  const l = cexEvalAt(e.binLeft, 0)
+  const r = cexEvalAt(e.binRight, 0)
+  if !cexOk(l) || !cexOk(r) || l.cxPat || r.cxPat || l.cxFloat || r.cxFloat {
+    return false
+  }
+  cexNotTree[parenPeelIx(ix)] = true
+  for op in [e.binLeft, e.binRight] {
+    const p = parenPeelIx(op)
+    if p >= 0 && !(nodeAt(p) is NumLit) && cexTreeShape(p, 0) == 1 {
+      cexFoldAt(p)
+    }
+  }
+  true
 }
 
 // A constant delivered into `dstTy`, a number or a union with a number member: one the type
@@ -1207,7 +1230,7 @@ export function litElemSrcTy(elemIx: i32, srcTy: i32) {
   if srcTy < 0 || srcTy >= T.tys.length { return nt }
   const s = tyAt(srcTy)
   if s is TyArray {
-    if s.aElem >= 0 {
+    if !tyOpen(s.aElem) {
       if !tyHasHole(s.aElem) || nt < 0 { return s.aElem }
     }
   }
@@ -3796,7 +3819,7 @@ export function recHeldListSpreadAdopt(l: i32) {
   const oo = tyAt(oe)
   // A list of record lists is built by its literal's stamp at the receiver's (D15370).
   const nested = oo is TyArray
-    && oo.aElem >= 0
+    && !tyOpen(oo.aElem)
     && oo.aElem < T.tys.length
     && tyAt(oo.aElem) is TyObj
   if !(oo is TyObj) && !nested { return 0 }
@@ -4652,7 +4675,7 @@ function recListParamTakesRep(par: i32, call: i32, depth: i32): boolean {
   const pt = nodeTyIxOf(par)
   if pt < 0 || pt >= T.tys.length { return false }
   const pa = tyAt(pt)
-  if !(pa is TyArray) || pa.aElem < 0 || !(tyAt(pa.aElem) is TyVar) {
+  if !(pa is TyArray) || tyOpen(pa.aElem) || !(tyAt(pa.aElem) is TyVar) {
     return false
   }
   cwIxBuild()
@@ -4996,7 +5019,7 @@ export function recBuiltCallbackRefuse(md: i32) {
       && cwIxCovers(m)
       && cwIxUpKind[m] == CW_UP_CALLEE
       && ot is TyArray
-      && ot.aElem >= 0
+      && !tyOpen(ot.aElem)
       && !fieldStorageEq(ot.aElem, bt, REC_STORE_DEPTH)
       && !recCbTakesBuild(cwIxUp[m], mn.memProp == "map")
     ) {
@@ -8517,7 +8540,7 @@ export function freshMapAtDstStorage(x: i32, srcTy: i32, dstTy: i32): boolean {
   if !(s is TyArray) || !(d is TyArray) || d.aRead == 1 && s.aRead != 1 {
     return false
   }
-  if d.aElem < 0 || d.aElem >= T.tys.length { return false }
+  if tyOpen(d.aElem) || d.aElem >= T.tys.length { return false }
   if !primIsSubWord(primNameOf(d.aElem)) || s.aElem != arrElemValueTy(d.aElem) {
     return false
   }
@@ -8650,7 +8673,7 @@ function setCtorKeyNote(ix: i32, key: i32): i32 {
   }
   const own = nodeTyIxOf(ix)
   const ot = if own >= 0 && own < T.tys.length { T.tys[own] } else { null }
-  if ot is TyMap && (ot.mKey < 0 || tyAt(ot.mKey) is TyVar) {
+  if ot is TyMap && (tyOpen(ot.mKey) || tyAt(ot.mKey) is TyVar) {
     setCtorKeys[ix] = key
   }
   0
@@ -8883,7 +8906,7 @@ function numOperandTyOrRow(ix: i32): i32 {
   if at < 0 || at >= T.tys.length { return -1 }
   const a = tyAt(at)
   if a is TyArray {
-    if a.aElem >= 0 { return arrElemValueTy(a.aElem) }
+    if !tyOpen(a.aElem) { return arrElemValueTy(a.aElem) }
   }
   -1
 }

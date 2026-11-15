@@ -1062,19 +1062,25 @@ export class Interp {
         if (typeof l === "string" && typeof r === "string") return l + r;
         if (Array.isArray(l) && Array.isArray(r)) return [...l, ...r];
     }
+    let expK: string | null = null;
+    if (exp) { try { const x = this.resolve(exp, env); if (x.k === "name" && NUMERIC.has(x.name)) expK = x.name; } catch { /* no destination */ } }
     if (l instanceof Lit && r instanceof Lit && exp) {
+      // `>>>` of a negative constant needs a width: the destination's, when it is i64.
+      if (op === ">>>" && l.i !== null && l.i < 0n && !l.radix && expK === "i64") return arith(">>>", litTo(l, "i64"), litDefault(r));
       // E9.1: the exact constant is computed first and typed at its use.
       return litArith(op, l, r);
     }
-    let expK: string | null = null;
-    if (exp) { try { const x = this.resolve(exp, env); if (x.k === "name" && NUMERIC.has(x.name)) expK = x.name; } catch { /* no destination */ } }
     return arith(op, l, r, expK);
   }
 
   assign(e: Extract<Expr, { k: "assign" }>, env: Env): Val {
     let v: Val;
     if (e.op === "=") {
+      // E10.1: the place's own operands (object, index) are evaluated before the value
+      const target = this.freeze(e.target, env);
       v = this.eval(e.e, env, this.targetTy(e.target, env));
+      this.store(target, v, env);
+      return v;
     } else {
       // E7.2: a compound assignment evaluates its target's object and index once.
       const target = this.freeze(e.target, env);
@@ -1083,8 +1089,6 @@ export class Interp {
       this.store(target, v, env);
       return v;
     }
-    this.store(e.target, v, env);
-    return v;
   }
   freeze(t: Expr, env: Env): Expr {
     if (t.k === "index") return { k: "index", e: { k: "val", v: this.eval(t.e, env, null) }, i: { k: "val", v: this.eval(t.i, env, null) } };
