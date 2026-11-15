@@ -213,10 +213,24 @@ const probeReachMaps = () => {
     }
   }
   const out: string[] = [];
+  // A map can also be a field of a lifetime record (a `type T = { f: {[…]: …}, … }` that a
+  // module-level `let x: T` holds), keyed `module:T.f`, so a table moved into one stays classified.
   for (const [m, src] of seen) {
+    const held = new Set(
+      [...src.matchAll(/^(?:export )?let [A-Za-z0-9_]+: ([A-Za-z0-9_]+) = /gm)]
+        .map((x) => x[1]),
+    );
+    let rec = "";
     for (const l of src.split("\n")) {
       const d = MAP_DECL.exec(l);
       if (d) out.push(`${m}:${d[1]}`);
+      const t = /^(?:export )?type ([A-Za-z0-9_]+) = \{$/.exec(l);
+      if (t) rec = held.has(t[1]) ? t[1] : "";
+      else if (rec !== "" && l.startsWith("}")) rec = "";
+      else if (rec !== "") {
+        const fd = /^\s+([A-Za-z0-9_]+): (?:\{\[|Map<)/.exec(l);
+        if (fd) out.push(`${m}:${rec}.${fd[1]}`);
+      }
     }
   }
   return out.sort();

@@ -109,7 +109,7 @@ import {
   oerIsPending,
   oerNodes,
 } from "./check_asg_rows"
-import { assignableExpr } from "./check_assignable"
+import { assignableExpr, fitsExpr } from "./check_assignable"
 import { recOriginExpr } from "./check_rec_fresh"
 import { recPend } from "./check_rec_rows"
 import { strLitRecvTy } from "./check_builtin_methods"
@@ -155,7 +155,7 @@ import {
   noteLetCstr,
   noteMemCstr,
 } from "./check_cstr_rows"
-import { inferQuiet, quietDepth, tpEnvNames, tpEnvTys } from "./check_cursor"
+import { inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
 import { ctnBindingDeclOf, ctnWrRecvPut, wrDstDeclPut } from "./check_decl_scan"
 import {
   daIsUnassignedSid,
@@ -417,6 +417,7 @@ import {
   fieldStorageEq,
   mapTwinTestMsg,
   mixesNumeric,
+  recEqFieldWise,
   recEqSide,
   widerNumeric,
   xrepListPair,
@@ -1274,13 +1275,7 @@ function eqOperandIsListLit(ix: i32): boolean {
 // Records list literal `lit` (typed `own`) delivered at `other` when it fits it, else at `own`.
 // The fit is asked quietly first, so a refused one leaves no element recorded at `other`.
 function eqLitDeliver(lit: i32, own: i32, other: i32): i32 {
-  const q = inferQuiet
-  inferQuiet = true
-  quietDepth = quietDepth + 1
-  const fits = assignableExpr(lit, own, other)
-  quietDepth = quietDepth - 1
-  inferQuiet = q
-  if fits && assignableExpr(lit, own, other) {
+  if fitsExpr(lit, own, other) && assignableExpr(lit, own, other) {
     adoptLitAt(lit, other)
     nodeTyRecord(lit, other)
     recordCtxTy(lit, other)
@@ -1513,6 +1508,101 @@ function recEqNullArm(
   )
   valueIfAdd(v)
   v
+}
+
+// `l == r` (or `!=` when `neg`) over two names holding records `lt` and `rt` of one field set
+// stored apart, built typed for an instance the checker sees only at its type parameters: one
+// `==` per field pair, a pair stored apart split in turn, a null side equal only to a null side
+// (D16397). -1 when an operand is not a name, since each is read once per field.
+export function recEqTypedChain(
+  l: i32,
+  r: i32,
+  lt: i32,
+  rt: i32,
+  neg: boolean,
+  pos: i32,
+): i32 {
+  if l < 0 || r < 0 || !(nodeAt(l) is Ident) || !(nodeAt(r) is Ident) {
+    return -1
+  }
+  recEqTyped(l, r, lt, rt, neg, pos)
+}
+
+// `recEqTypedChain` over operand reads already known to be names or fields of names.
+function recEqTyped(
+  l: i32,
+  r: i32,
+  lt: i32,
+  rt: i32,
+  neg: boolean,
+  pos: i32,
+): i32 {
+  if !recEqFieldWise(lt, rt) { return -1 }
+  const lr = recEqSide(lt)
+  const rr = recEqSide(rt)
+  if lr < 0 || rr < 0 || lr >= T.tys.length || rr >= T.tys.length { return -1 }
+  const lo = tyAt(lr)
+  const ro = tyAt(rr)
+  if !(lo is TyObj) || !(ro is TyObj) { return -1 }
+  let eq = -1
+  let i = 0
+  while i < lo.objFieldNames.length {
+    const f = lo.objFieldNames[i]
+    const lft = lo.objFieldTypes[i]
+    const rft = ro.objFieldTypes[strListIndexOf(ro.objFieldNames, f)]
+    const lm = mkMember(l, f, pos)
+    nodeTySetGrow(lm, lft)
+    const rm = mkMember(r, f, pos)
+    nodeTySetGrow(rm, rft)
+    let c = recEqTyped(lm, rm, lft, rft, false, pos)
+    if c < 0 {
+      c = mkBinary("==", lm, rm, pos)
+      nodeTySetGrow(c, TY_BOOL)
+    }
+    eq = if eq < 0 { c } else { recEqAnd(eq, c, pos) }
+    i = i + 1
+  }
+  // A null side equals only a null side: `(l == null && r == null) || (l != null && r != null && eq)`.
+  if lr != lt || rr != rt {
+    const both = recEqAnd(
+      recEqNullTest(l, lr != lt, "==", pos),
+      recEqNullTest(r, rr != rt, "==", pos),
+      pos,
+    )
+    const live = recEqAnd(
+      recEqNullTest(l, lr != lt, "!=", pos),
+      recEqNullTest(r, rr != rt, "!=", pos),
+      pos,
+    )
+    eq = mkBinary("||", both, recEqAnd(live, eq, pos), pos)
+    nodeTySetGrow(eq, TY_BOOL)
+  }
+  if neg {
+    eq = mkUnary("!", eq, pos)
+    nodeTySetGrow(eq, TY_BOOL)
+  }
+  eq
+}
+
+// `a && b`, typed boolean.
+function recEqAnd(a: i32, b: i32, pos: i32): i32 {
+  const t = mkBinary("&&", a, b, pos)
+  nodeTySetGrow(t, TY_BOOL)
+  t
+}
+
+// `x == null` (or `!=`) typed boolean; a side that cannot be null answers `false` (or `true`).
+function recEqNullTest(x: i32, nullable: boolean, op: string, pos: i32): i32 {
+  if !nullable {
+    const k = mkBool(if op == "!=" { 1 } else { 0 }, pos)
+    nodeTySetGrow(k, TY_BOOL)
+    return k
+  }
+  const nl = mkNull("null", pos)
+  nodeTySetGrow(nl, TY_NULL)
+  const t = mkBinary(op, x, nl, pos)
+  nodeTySetGrow(t, TY_BOOL)
+  t
 }
 
 // The operators left once logicals, assignment, `??` and equality have answered: operator

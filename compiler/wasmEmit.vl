@@ -111,7 +111,7 @@ import {
   numCastCanFail,
   numUnionMembersOf,
 } from "./check_num_lits"
-import { lbiKeptDeclUnread } from "./check_num_lit_state"
+import { cexF32LexOf, lbiKeptDeclUnread } from "./check_num_lit_state"
 import { intMatchHeadAt } from "./check_match_heads"
 import {
   asInstMisses,
@@ -3974,8 +3974,8 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
       if exm.length > 1 { return -1 }
       const ept = isVarTyIxOf(isIx)
       if ept >= 0 {
-        if tySameSet(ext, ept, TY_WALK_DEPTH) { return 1 }
-        if tySameSpelled(ext, ept, TY_WALK_DEPTH) { return 0 }
+        if tySameSet(ext, ept) { return 1 }
+        if tySameSpelled(ext, ept) { return 0 }
       }
     }
 
@@ -3987,7 +3987,7 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
       const jt = nodeTyIxOf(jo)
       if jt >= 0 && !tyHasTyVar(jt) {
         const ept = isVarTyIxOf(isIx)
-        if ept >= 0 && tySameSet(jt, ept, TY_WALK_DEPTH) { return 1 }
+        if ept >= 0 && tySameSet(jt, ept) { return 1 }
         return -1
       }
     }
@@ -6061,8 +6061,8 @@ function isPatUnionArmTy(recvIx: i32, patTy: i32, fnIx: i32): i32 {
     const a = arms[i]
     if a >= 0 && unMemIsMap(a) {
       if mapTwinSame(a, patTy) { return patTy }
-      if same < 0 && tySameSet(a, patTy, TY_WALK_DEPTH) { same = a }
-      if same < 0 && tySameSpelled(a, patTy, TY_WALK_DEPTH) { same = a }
+      if same < 0 && tySameSet(a, patTy) { same = a }
+      if same < 0 && tySameSpelled(a, patTy) { same = a }
     }
     i = i + 1
   }
@@ -22236,11 +22236,49 @@ function ifExprRefKindAt(ifIx: i32, fnIx: i32, destStruct: i32): VKind | null {
   null
 }
 
+// The call of an optional call's guard (`drwOptGuard`: `if r != null { call } else { null }`)
+// whose receiver `r` this instance closes with no `null`: the guard is then the call,
+// and its `null` arm has no rep (D16333). -1 for any other `if`.
+function optGuardCallOf(ifIx: i32, fnIx: i32): i32 {
+  const n = nodeAt(ifIx)
+  if !(n is IfStmt) || n.ifElse < 0 || fnIx < 0 { return -1 }
+  const ci = unwrapParen(n.ifCond)
+  if ci < 0 || ci >= P.nodes.length { return -1 }
+  const c = nodeAt(ci)
+  // The guard's test may already be folded to `true` where the receiver's read cannot be null.
+  const folded = c is BoolLit && c.boolVal == 1
+  if !folded {
+    if !(c is BinExpr) || c.binOp != "!=" || !(nodeAt(c.binRight) is NullLit) {
+      return -1
+    }
+    // Only a read the template leaves open, which this instance closes with no `null`.
+    if (
+      !tyHasTyVar(nodeTyIxOf(c.binLeft))
+      || !tyExcludesNull(nodeTyAt(c.binLeft, fnIx))
+    ) {
+      return -1
+    }
+  }
+  const eb = nodeAt(n.ifElse)
+  const tb = nodeAt(n.ifThen)
+  if (
+    !(eb is Block)
+    || eb.blkStmts.length != 1
+    || !(nodeAt(eb.blkStmts[0]) is NullLit)
+  ) {
+    return -1
+  }
+  if !(tb is Block) || tb.blkStmts.length != 1 { return -1 }
+  tb.blkStmts[0]
+}
+
 // Lower an if-expression (`if c then a else b` in value position) onto `body`: cond,
 // `if (result <kind>)`, the then-arm value, else the else-arm value (an `else if` chain
 // recurses). Both arms are coerced to the branch-join's scalar rep (a mixed `then 1 else
 // 2.5` widens to f64); a ref-typed join (string/struct/array) routes to `emitIfExprRef` instead, for the multi-byte `(ref $ht)` blocktype a single numeric byte cannot spell.
 function emitIfExpr(ifIx: i32, fnIx: i32) {
+  const gv = optGuardCallOf(ifIx, fnIx)
+  if gv >= 0 { return emitExpr(gv, fnIx) }
   // The join is classified from its arms' tail values, and a tail naming its own prelude's
   // local reads that local's slot, bound for the classification alone and popped before any
   // arm lowers: in a generic instance the checker's type of such a tail is the type parameter.
@@ -36716,7 +36754,7 @@ function emitNumLexAt(text: string, w: string) {
 // caller names: re-encoding the lexeme keeps a hex bit pattern past I32_MAX the value it spells.
 function emitSignedNumLitAt(ix: i32, w: string): i32 {
   const n = nodeAt(ix)
-  if n is NumLit { return emitNumLexAt(n.numText, w) }
+  if n is NumLit { return emitNumLexAt(numLitLexAt(ix, n.numText, w), w) }
   if n is Unary {
     const mark = wLen()
     if emitSignedNumLitAt(unwrapParen(n.unArg), w) < 0 { return -1 }
@@ -36726,7 +36764,16 @@ function emitSignedNumLitAt(ix: i32, w: string): i32 {
 }
 
 function emitNumLitNode(e: NumLit, exprIx: i32, fnIx: i32) {
-  emitNumLexAt(e.numText, numLitWidth(exprIx, fnIx))
+  const w = numLitWidth(exprIx, fnIx)
+  emitNumLexAt(numLitLexAt(exprIx, e.numText, w), w)
+}
+
+// The lexeme literal `ix`, spelled `text`, is lowered from at width `w`: a folded float tree used
+// at `f32` is its value in `f32` arithmetic, as it runs there (E9.1).
+function numLitLexAt(ix: i32, text: string, w: string): string {
+  if w != "f32" { return text }
+  const l32 = cexF32LexOf(unwrapParen(ix))
+  if l32 != "" { l32 } else { text }
 }
 
 function emitCharLitNode(e: CharLit, _exprIx: i32, _fnIx: i32) {

@@ -806,7 +806,6 @@ import {
   tyIsNumericBox,
   tyMapValOf,
   tyReachesHole,
-  tyStepElem,
 } from "./tyquery"
 import { nulNumScalarUnionName, nulNumScalarUnionRowTy } from "./check_ty_rep"
 import { tyIsWriteLandRead } from "./check_hole_pins"
@@ -846,6 +845,7 @@ import {
   fnTagSetTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
+import { recEqTypedChain } from "./check_operators"
 
 // D943 — the lifted slots `monoPinBodyLambdas` minted for the instance being built. A
 // clone's `fnParent` cannot be set at clone time (its own `FuncDecl` does not exist
@@ -7003,6 +7003,28 @@ function monoPinBin(ix: i32, n: BinExpr, pNames: string[], pTys: i32[]): i32 {
   if n.binOp == "==" || n.binOp == "!=" {
     const dnt = monoDeadNullTest(n, pNames, pTys)
     if dnt >= 0 { return dnt }
+    // Two records of one field set stored apart compare per field pair at the pin (D16397).
+    // An operand read the checker typed concretely compares at that type.
+    const lty = nodeTyIxOf(n.binLeft)
+    const rty = nodeTyIxOf(n.binRight)
+    // Any other operand the elaboration typed at this instance compares at that type.
+    const top = elabWalkTop()
+    let elt = plt
+    if elt < 0 {
+      elt = if tyHasTyVar(lty) && top >= 0 { elabNodeTy(n.binLeft, top) } else { lty }
+    }
+    let ert = monoPinnedOperandTy(n.binRight, pNames, pTys)
+    if ert < 0 {
+      ert = if tyHasTyVar(rty) && top >= 0 { elabNodeTy(n.binRight, top) } else { rty }
+    }
+    if tyHasTyVar(elt) || tyHasTyVar(ert) { elt = -1 }
+    if (elt != lty || ert != rty) && elt >= 0 && ert >= 0 {
+      const fw = recEqTypedChain(bl, br, elt, ert, n.binOp == "!=", n.pos)
+      if fw >= 0 {
+        nodeSrcNote(fw, ix)
+        return fw
+      }
+    }
   }
   if plt >= 0 {
     // D511: an object pin with a free `self`-function named for the operator. The name is
@@ -8046,7 +8068,7 @@ function monoPinMintedUnion(name: string, ty: i32, own: i32): string {
   // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
   if pun != "" {
     // The registered type is the whole annotation's (`own`) at the rep its spelling collapses to.
-    const elemTy = if own >= 0 { monoAnnPinTy(tyStepElem(own)) } else { tyStepElem(ty) }
+    const elemTy = if own >= 0 { monoAnnPinTy(monoListElemTy(own)) } else { monoListElemTy(ty) }
     if monoRegisterPinUnion(pun, elemTy) < 0 { return name }
     return "(" + pun + ")[]"
   }
@@ -9282,8 +9304,8 @@ function monoMakeInstanceLetTyCol(
       if (
         lt >= 0
         && lt != pinTys[lj]
-        && !tySameSet(pinTys[lj], lt, TY_WALK_DEPTH)
-        && tySameSpelled(pinTys[lj], lt, TY_WALK_DEPTH)
+        && !tySameSet(pinTys[lj], lt)
+        && tySameSpelled(pinTys[lj], lt)
       ) {
         lt = pinTys[lj]
       }
@@ -14585,7 +14607,7 @@ function monoValueRetAt(v: i32, qs: i32[], depth: i32): i32 {
       const tv = ifArmValueExpr(arm)
       const ar = monoValueRetAt(if tv >= 0 { tv } else { arm }, qs, depth + 1)
       if ar < 0 { return -1 }
-      if r >= 0 && !tySameSpelled(ar, r, TY_WALK_DEPTH) { return -1 }
+      if r >= 0 && !tySameSpelled(ar, r) { return -1 }
       r = ar
     }
   }
@@ -19184,7 +19206,7 @@ function monoElabLitCopy(
   if k >= c.callArgs.length { return "" }
   for cp in cps {
     const pt = holeLitPinOf(cp)
-    if pt >= 0 && tySameSpelled(pt, t, TY_WALK_DEPTH) {
+    if pt >= 0 && tySameSpelled(pt, t) {
       const nm = monoArgPinName(cp, ctx, [0 - 1])
       if nm == "" { return "" }
       c.callArgs[k] = cp
@@ -19243,7 +19265,7 @@ function monoElabDeliver(
   }
   if !(n is ArrayLit) && !(n is ObjLit) {
     const bt = monoClosedReadTy(x, ctx, false)
-    if bt >= 0 && tySameSpelled(bt, t, TY_WALK_DEPTH) {
+    if bt >= 0 && tySameSpelled(bt, t) {
       if go && !li { nodeTyRecord(x, bt) }
       return true
     }
@@ -20780,7 +20802,11 @@ function monoPinHoleParam(
       if an != "" { anTy = rt }
     }
     if anTy < 0 { anTy = monoArgPinTyAt(args[i], ctx) }
-    const elPin = if tyHoldsObj(elTy, 8) { monoRecordRowPin(elTy) } else { monoPinOfClosedTy(elTy) }
+    // A parameter the elaboration binds at `never` takes no value: the instance spells the default,
+    // as a type parameter bound there does (D15530), and mono pins it so (D16261).
+    const elNever = elTy == TY_NEVER
+    const elPin = if elNever { monoPinOfClosedTy(TY_I32) } else if tyHoldsObj(elTy, 8) { monoRecordRowPin(elTy) } else { monoPinOfClosedTy(elTy) }
+    if elNever { an = elPin }
     if an == "" || (elPin != an && !(anTy >= 0 && tySame(anTy, elTy))) {
       return emitFailAt(
         "emitProgram: internal: parameter `"
@@ -21121,6 +21147,11 @@ function monoPinAnnotatedParam(
     if an2 == "" && eftFn && !eftFirst {
       an2 = monoElabPin(callIx, args, i, eft, ctx)
       if an2 != "" { an2Ty = eft }
+    }
+    // A type parameter the elaboration binds at `never` spells the default (D15530, D16261).
+    if an2 == "" && elabCallParamTy(monoCallTplOf(callIx), i) == TY_NEVER {
+      an2 = monoPinOfClosedTy(TY_I32)
+      an2Ty = TY_NEVER
     }
     if an2Ty < 0 { an2Ty = monoArgPinTyAt(args[i], ctx) }
     if an2 == "" { return monoArgTyFail(p.parName, fn.fnName) }
