@@ -11,7 +11,7 @@
 // which it reaches through `/dev/stderr` because VL has no stderr sink (a `dogfood:` row).
 // A reservation is one file per range so concurrent lanes never edit the same file. `--next`
 // and `--reserve` also skip every id a fetched `origin/*` branch adds a row or a reservation
-// for beside `origin/master`, so two lanes whose branches have not merged do not collide.
+// for beside `origin/master`, and every row `origin/master` files; `--reserve` refuses a filed id.
 
 import {
   IoError,
@@ -447,6 +447,49 @@ function remoteClaims(rows: Listed[]): Res[] {
   return sortRes(out)
 }
 
+// The row ids `origin/master` files, fetched or not yet merged here; none outside a git checkout.
+function baseRowIds(): i64[] {
+  const out: i64[] = []
+  const base = "origin/master"
+  if gitLines(["rev-parse", "--verify", "--quiet", base]).length == 0 {
+    return out
+  }
+  const names = gitLines(
+    [
+      "ls-tree",
+      "-r",
+      "--name-only",
+      base,
+      "--",
+      TARGETS[0],
+      TARGETS[1],
+    ],
+  )
+  for p in names {
+    const parts = split(p, "/")
+    const c = claimOf(p)
+    if (
+      c.length == 2
+      && parts.length >= 2
+      && parts[parts.length - 2] != "reserved"
+    ) {
+      out.push(c[0])
+    }
+  }
+  return out
+}
+
+// The first id from `lo` to `hi` that a row here or on `origin/master` files, or -1.
+function filedIn(rows: Listed[], lo: i64, hi: i64): i64 {
+  for r in rows {
+    if lo <= r.key.num && r.key.num <= hi { return r.key.num }
+  }
+  for n in baseRowIds() {
+    if lo <= n && n <= hi { return n }
+  }
+  return -1
+}
+
 // Whether any id from `lo` to `hi` is filed.
 function anyFiled(filed: {[i64]: boolean}, lo: i64, hi: i64): boolean {
   let n = lo
@@ -534,7 +577,13 @@ function cmdReserve(
   }
   const res = reservations()
   if !release {
-    for c in remoteClaims(allRows(TARGETS)) { res.push(c) }
+    const rows = allRows(TARGETS)
+    const f = filedIn(rows, lo, hi)
+    if f >= 0 {
+      print("ls.vl: \{rangeText(want)} overlaps D\{toString(f)}, already filed")
+      return 1
+    }
+    for c in remoteClaims(rows) { res.push(c) }
   }
   if release {
     for r in res {
@@ -577,6 +626,9 @@ function nextId(rows: Listed[]): i32 {
       if r.key.num > top { top = r.key.num }
     }
     n = top + 1
+  }
+  for b in baseRowIds() {
+    if b >= n { n = b + 1 }
   }
   const res = reservations()
   for c in remoteClaims(rows) { res.push(c) }
