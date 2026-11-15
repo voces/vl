@@ -339,7 +339,11 @@ import {
   gwSaidSet,
 } from "./check_getter_walk"
 import { arrDefCallTy, linkedRowElem } from "./check_hole_links"
-import { resolveOpenElemReads } from "./check_operators"
+import {
+  neverIsReset,
+  resolveOpenElemReads,
+  settleNeverIsTests,
+} from "./check_operators"
 import {
   calleeWriteAt,
   calleeWriteGot,
@@ -403,6 +407,7 @@ import {
   nodeTyWrites,
 } from "./check_node_tys"
 import {
+  cexEvalAt,
   cexIsDerived,
   cexNegOperand,
   cexReported,
@@ -425,6 +430,7 @@ import {
   numLitNotesDisagree,
   numLitNotesDropFrom,
 } from "./check_num_lit_state"
+import { cexDecText, cexOk } from "./const_exact"
 import {
   cexCountBelow,
   cexIsMinI64,
@@ -671,7 +677,6 @@ import {
   TyVar,
   ctxKeepsLitUnion,
   demangleMsg,
-  genAppNameOfTy,
   litMemberTy,
   litUnionAliasNameOfTy,
   litUnionAliasTyOfLitTexts,
@@ -686,11 +691,13 @@ import {
   softenLitTy,
   tyArrayElemIx,
   tyAt,
+  tyElemOf,
   tyEq,
   tyHasHole,
   tyHoldsObjDeep,
   tyIsPrimNamed,
   tyIsTwinRecordUnion,
+  tyKeyOf,
   tyNameAtoms,
   tyPrimNameIs,
   tyReachesSelf,
@@ -700,6 +707,7 @@ import {
   tyToNominalName,
   tyToStr,
   tyToStructStr,
+  tyValOf,
 } from "./check_types"
 import { tailValueLeaves, ucCompute } from "./check_unconsumed"
 import { wsPassReset } from "./check_width"
@@ -1128,9 +1136,9 @@ function numLitStoreRefused(v: i32, want: i32, wholeList: boolean): boolean {
   if wholeList {
     const vtt = tyAt(vt)
     if nodeAt(parenPeelIx(v)) is ArrayLit {
-      if vtt is TyArray { vt = vtt.aElem } else { return false }
+      if vtt is TyArray { vt = tyElemOf(vtt) } else { return false }
     } else {
-      if vtt is TyArray { return !tySame(vtt.aElem, want) }
+      if vtt is TyArray { return !tySame(tyElemOf(vtt), want) }
       return false
     }
   }
@@ -3457,10 +3465,10 @@ function rcwPendJoins() {
               // A spread operand's elements join the literal's element type: the operand list
               // is delivered into the literal's own list type.
               rcwPendJoinOperand(el.spdArg, jt)
-              ljwCopiedLevelCheck(at, el.spdArg, at2.aElem)
+              ljwCopiedLevelCheck(at, el.spdArg, tyElemOf(at2))
             } else {
-              rcwPendJoinOperand(n.arrElems[e], at2.aElem)
-              listJoinWidenCheck(at, n.arrElems[e], at2.aElem)
+              rcwPendJoinOperand(n.arrElems[e], tyElemOf(at2))
+              listJoinWidenCheck(at, n.arrElems[e], tyElemOf(at2))
             }
             e = e + 1
           }
@@ -3776,8 +3784,8 @@ function recWidenWalk(expr: i32, src: i32, dst: i32, depth: i32): boolean {
     TyMap => {
       const dm = tyAt(dst)
       if dm is TyMap {
-        return recWidenWalk(-1, s.mKey, dm.mKey, depth - 1)
-          || recWidenWalk(-1, s.mVal, dm.mVal, depth - 1)
+        return recWidenWalk(-1, tyKeyOf(s), tyKeyOf(dm), depth - 1)
+          || recWidenWalk(-1, tyValOf(s), tyValOf(dm), depth - 1)
       }
       return false
     }
@@ -3988,7 +3996,7 @@ function recBoxApart(own: i32, dst: i32, depth: i32): boolean {
   if d is TyNullable { return recBoxApart(own, d.nInner, depth - 1) }
   if o is TyUnion || d is TyUnion { return true }
   if o is TyArray && d is TyArray {
-    return recBoxApart(o.aElem, d.aElem, depth - 1)
+    return recBoxApart(tyElemOf(o), tyElemOf(d), depth - 1)
   }
   if o is TyObj && d is TyObj {
     let i = 0
@@ -4023,7 +4031,8 @@ function recCallCopiedAt(at: i32, own: i32, dst: i32): boolean {
   const o = tyAt(own)
   const d = tyAt(dst)
   if o is TyArray && d is TyArray {
-    return listCopyTyOf(at) >= 0 && recListElemRecCopies(o.aElem, d.aElem)
+    return listCopyTyOf(at) >= 0
+      && recListElemRecCopies(tyElemOf(o), tyElemOf(d))
   }
   recCopyTyOf(at) >= 0 && o is TyObj && recCopyBoxesOnly(own, dst)
 }
@@ -4347,9 +4356,9 @@ function recWidenArray(x: i32, s: TyArray, dst: i32, depth: i32): boolean {
   if d is TyArray {
     if x >= 0 {
       const lit = nodeAt(x)
-      if lit is ArrayLit { return recWidenLitElems(lit, d.aElem, depth) }
+      if lit is ArrayLit { return recWidenLitElems(lit, tyElemOf(d), depth) }
     }
-    return recWidenWalk(-1, s.aElem, d.aElem, depth - 1)
+    return recWidenWalk(-1, tyElemOf(s), tyElemOf(d), depth - 1)
   }
   false
 }
@@ -4677,6 +4686,7 @@ function checkExternGlobals() {
 // One walk of the program; `initChecker()` must have run first. Every module table this walk
 // fills is emptied there, so a walk over a stale one reads another program's rows.
 export function checkProgramPass(rootIx: i32) {
+  neverIsReset()
   checkerForceFn = checkerForce
   cwCallRetsFn = holeSlotCallRetsAt
   // Read here, after every module parsed: `initChecker` can run before the parse.
@@ -4778,6 +4788,7 @@ export function checkProgramPass(rootIx: i32) {
   // empty-collection bindings here: any still-open hole is genuinely uninferable.
   flushUninferred(0)
   settleOpenUnionRows()
+  settleNeverIsTests()
   settleOpenLetNames()
   flushDeferredRetFloors()
   flushOpenArgMaps()
@@ -4847,9 +4858,17 @@ function checkShiftCounts() {
       const lt = nodeTyOf(n.binLeft)
       if lt == TY_I32 { w = 32 }
       if lt == TY_I64 { w = 64 }
-      const lex = intLitLexemeOf(n.binRight)
+      let lex = intLitLexemeOf(n.binRight)
+      let neg = intLitIsNegated(n.binRight)
+      // A count that is a constant tree is graded by its exact value, folded or not (D16318).
+      if lex == "" {
+        const cv = cexEvalAt(n.binRight, 0)
+        if cexOk(cv) && !cv.cxFloat {
+          lex = cexDecText(cv)
+          neg = cv.cxNeg
+        }
+      }
       if w > 0 && lex != "" {
-        const neg = intLitIsNegated(n.binRight)
         if (
           (neg || !numLexFitsI32(lex) || !cexCountBelow(lex, w))
           && !(reported[ix] ?? false)
@@ -6128,19 +6147,6 @@ function getterDeclCheck(gi: i32) {
   const selfTy = getSelfTys[gi]
   const label = getDeclLabel(getFns[gi])
   if selfTy < 0 { return 0 }
-  if nomNameOfTy(selfTy) == "" && genAppNameOfTy(selfTy) != "" {
-    // D2031 — an instance of a generic `new` type is not branded, so it has no identity a
-    // getter could hang on.
-    tErr(
-      "the "
-        + label
-        + " needs a nominal receiver, and an instance of a generic `new` type such as `"
-        + tyToStr(selfTy)
-        + "` is not branded yet (D2031) — declare a non-generic `new` type for the receiver",
-      getDecls[gi],
-    )
-    return 0
-  }
   if nomNameOfTy(selfTy) == "" {
     tErr(
       "the "

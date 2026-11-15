@@ -249,12 +249,12 @@ export function tyReachesEmptyHole(ty: i32, depth: i32): boolean {
   const t = tyAt(ty)
   match t {
     TyArray => {
-      if t.aElem < 0 { return true }
-      tyReachesEmptyHole(t.aElem, depth - 1)
+      if tyElemOpen(t) { return true }
+      tyReachesEmptyHole(tyElemOf(t), depth - 1)
     }
     TyMap => {
-      if t.mKey < 0 || t.mVal < 0 { return true }
-      tyReachesEmptyHole(t.mVal, depth - 1)
+      if tyKeyOpen(t) || tyValOpen(t) { return true }
+      tyReachesEmptyHole(tyValOf(t), depth - 1)
     }
     TyObj => {
       let i = 0
@@ -279,8 +279,8 @@ export function tyReachesUnion(ty: i32, depth: i32): boolean {
   const t = tyAt(ty)
   match t {
     TyUnion => true
-    TyArray => tyReachesUnion(t.aElem, depth - 1)
-    TyMap => tyReachesUnion(t.mVal, depth - 1)
+    TyArray => tyReachesUnion(tyElemOf(t), depth - 1)
+    TyMap => tyReachesUnion(tyValOf(t), depth - 1)
     TyNullable => tyReachesUnion(t.nInner, depth - 1)
     TyObj => {
       let i = 0
@@ -571,7 +571,7 @@ export function tyRepVaries(ty: i32, depth: i32): boolean {
   const t = tyAt(ty)
   match t {
     TyUnion | TyNullable | TyFunc => true
-    TyArray => tyRepVaries(t.aElem, depth - 1)
+    TyArray => tyRepVaries(tyElemOf(t), depth - 1)
     TyPrim | TyErr | TyObj | TyMap | TyVar | TyLit | TyNeg => false
   }
 }
@@ -660,13 +660,13 @@ export function tyMayHoldFn(ty: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return tyMayHoldFn(t.aElem, depth + 1)
+      return tyMayHoldFn(tyElemOf(t), depth + 1)
     }
     TyNullable => {
       return tyMayHoldFn(t.nInner, depth + 1)
     }
     TyMap => {
-      return tyMayHoldFn(t.mVal, depth + 1)
+      return tyMayHoldFn(tyValOf(t), depth + 1)
     }
     TyObj => {
       for ft in t.objFieldTypes {
@@ -704,7 +704,7 @@ export function tyHasNullHole(ti: i32, depth: i32): boolean {
       }
       false
     }
-    TyArray => tyHasNullHole(t.aElem, depth - 1)
+    TyArray => tyHasNullHole(tyElemOf(t), depth - 1)
     // Not walked: a `null` under one of these is spellable, or not a literal's own inference.
     TyFunc | TyUnion | TyNullable | TyMap | TyNeg | TyVar | TyLit | TyErr => false
   }
@@ -751,7 +751,7 @@ function tyWrapHeight(ti: i32): i32 {
       }
     }
     TyArray => {
-      h = tyWrapStep(h, t.aElem)
+      h = tyWrapStep(h, tyElemOf(t))
     }
     TyNullable => {
       h = tyWrapStep(h, t.nInner)
@@ -1079,28 +1079,28 @@ function tyToStrNullable(t: TyNullable, nominal: boolean): string {
 
 // A list's render, `T[]` or `readonly T[]`, one atom; a wide or view element is grouped.
 function tyToStrArray(t: TyArray, nominal: boolean): string {
-  const el = tyToStrAt(t.aElem, nominal)
+  const el = tyToStrAt(tyElemOf(t), nominal)
   const elw = tyStrAtoms
   // A list render is one atom in every form — a wide element is parenthesized so its
   // `|`s stop being top-level. Set explicitly, since the element render left its own width behind.
   tyStrAtoms = 1
   // A view element is grouped: `readonly T[][]` spells a view of `T[][]` (D2195).
-  let row = arrElemRender(el, t.aElem, elw)
-  if tyIxIsView(t.aElem) { row = "(" + el + ")[]" }
+  let row = arrElemRender(el, tyElemOf(t), elw)
+  if tyIxIsView(tyElemOf(t)) { row = "(" + el + ")[]" }
   if t.aRead == 1 { return "readonly " + row }
   row
 }
 
 // A map's render, `{[K]: V}`, or under `nominal` a set's `Set<K>`; one atom.
 function tyToStrMap(t: TyMap, nominal: boolean): string {
-  const mk = tyToStrAt(t.mKey, nominal)
+  const mk = tyToStrAt(tyKeyOf(t), nominal)
   // A set is its own type and reads as one; the structural render keeps the index
   // signature the emitter's name tables are keyed by.
   if t.mSet == 1 && nominal {
     tyStrAtoms = 1
     return "Set<" + mk + ">"
   }
-  const mv = tyToStrAt(t.mVal, nominal)
+  const mv = tyToStrAt(tyValOf(t), nominal)
   // The key/value separators sit inside the braces — one atom.
   tyStrAtoms = 1
   "{[" + mk + "]: " + mv + "}"
@@ -1169,11 +1169,11 @@ function tyTsGo(ix: i32, depth: i32): i32 {
       return tyTsArray(t, depth)
     }
     TyMap => {
-      const k = tyTsGo(t.mKey, depth + 1)
+      const k = tyTsGo(tyKeyOf(t), depth + 1)
       if k < 0 { return -1 }
       if t.mSet == 1 { return tsMkKids(TS_APP, "Set", [k]) }
       if tsKind[k] != TS_NAME { return -1 }
-      const v = tyTsGo(t.mVal, depth + 1)
+      const v = tyTsGo(tyValOf(t), depth + 1)
       if v < 0 { return -1 }
       return tsMkKids(TS_MAP, tsText[k], [v])
     }
@@ -1237,9 +1237,13 @@ function tyTsObj(t: TyObj, depth: i32): i32 {
 
 // `tyToStrArray`'s tree: a function, union or view element grouped, a view marked `readonly`.
 function tyTsArray(t: TyArray, depth: i32): i32 {
-  let el = tyTsGo(t.aElem, depth + 1)
+  let el = tyTsGo(tyElemOf(t), depth + 1)
   if el < 0 { return -1 }
-  if tyIxIsFunc(t.aElem) || tyIxIsView(t.aElem) || tsKind[el] == TS_UNION {
+  if (
+    tyIxIsFunc(tyElemOf(t))
+    || tyIxIsView(tyElemOf(t))
+    || tsKind[el] == TS_UNION
+  ) {
     el = tsMkKids(TS_PAREN, "", [el])
   }
   const ro = if t.aRead == 1 { "readonly" } else { "" }
@@ -1340,8 +1344,8 @@ export function tyArrayElemIx(ix: i32): i32 {
   if ix < 0 || ix >= T.tys.length { return -1 }
   const t = tyAt(ix)
   if t is TyArray {
-    if t.aElem < 0 || t.aElem >= T.tys.length { return -1 }
-    return t.aElem
+    if tyElemOpen(t) || tyElemOf(t) >= T.tys.length { return -1 }
+    return tyElemOf(t)
   }
   -1
 }
@@ -1523,14 +1527,14 @@ function tyEqGo(a: i32, b: i32) {
         // A view and its list render differently and accept different operations, so they
         // are not the same type — `readonly Shape[]` never keys a `Shape[]` registry row.
         if ta.aRead != tb.aRead { return false }
-        return tyEq(ta.aElem, tb.aElem)
+        return tyEq(tyElemOf(ta), tyElemOf(tb))
       }
       return false
     }
     TyMap => {
       if tb is TyMap {
         if ta.mSet != tb.mSet { return false }
-        return tyEq(ta.mKey, tb.mKey) && tyEq(ta.mVal, tb.mVal)
+        return tyEq(tyKeyOf(ta), tyKeyOf(tb)) && tyEq(tyValOf(ta), tyValOf(tb))
       }
       return false
     }
@@ -1681,11 +1685,11 @@ export function tyIsEmitRepresentable(ix: i32): boolean {
       return true
     }
     TyArray => {
-      return tyIsEmitRepresentable(t.aElem)
+      return tyIsEmitRepresentable(tyElemOf(t))
     }
     TyMap => {
-      if !tyIsEmitRepresentable(t.mKey) { return false }
-      return tyIsEmitRepresentable(t.mVal)
+      if !tyIsEmitRepresentable(tyKeyOf(t)) { return false }
+      return tyIsEmitRepresentable(tyValOf(t))
     }
     TyFunc => {
       const ps = t.fnParamTypes
@@ -1755,10 +1759,10 @@ function tyEmitNameNonEmptyArm(ix: i32, memo: {[i32]: i32}): i32 {
       return tyEmitNameAllNonEmpty(t.objFieldTypes, memo)
     }
     TyArray => {
-      return tyEmitNameNonEmptyGo(t.aElem, memo)
+      return tyEmitNameNonEmptyGo(tyElemOf(t), memo)
     }
     TyMap => {
-      return tyEmitNameAllNonEmpty([t.mKey, t.mVal], memo)
+      return tyEmitNameAllNonEmpty([tyKeyOf(t), tyValOf(t)], memo)
     }
     TyFunc => {
       const ps = tyEmitNameAllNonEmpty(t.fnParamTypes, memo)
@@ -2306,7 +2310,7 @@ export function tyWrapsRecord(ix: i32): boolean {
         k = t.nInner
       }
       TyArray => {
-        k = t.aElem
+        k = tyElemOf(t)
       }
       TyPrim | TyErr | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
         return false
@@ -2405,14 +2409,14 @@ function tyToNameGo(ix: i32, ctx: i32, nominal: boolean): string {
       // A litunion-alias element (`K0[]`) keeps its alias name rather than softening to
       // `string[]` — the two spell different reps (the alias array is the interned-i32 atom
       // list; `string[]` is the string-ref list), so widening it would mint a twin mv slot.
-      let el = litUnionAliasNameOfTy(t.aElem)
+      let el = litUnionAliasNameOfTy(tyElemOf(t))
       // The element's own atom width, as its producer reported it — an alias identifier is
       // one atom, the render leg reports its own.
       let elw = 1
       // So does a lone string literal element, its one-member set's atom (D7340).
-      if el == "" { el = oneStrLitSpelling(t.aElem) }
+      if el == "" { el = oneStrLitSpelling(tyElemOf(t)) }
       if el == "" {
-        el = tyToNameAt(t.aElem, nameKidCtx(ix, RC_ELEM, nominal), nominal)
+        el = tyToNameAt(tyElemOf(t), nameKidCtx(ix, RC_ELEM, nominal), nominal)
         elw = tyNameAtoms
       }
       if el == "" { return "" }
@@ -2420,16 +2424,20 @@ function tyToNameGo(ix: i32, ctx: i32, nominal: boolean): string {
       // `|`s stop being top-level. Set explicitly, since the element render leaves its own
       // width behind; the grouping itself is `arrElemRender`'s.
       tyNameAtoms = 1
-      return arrElemRender(el, t.aElem, elw)
+      return arrElemRender(el, tyElemOf(t), elw)
     }
     TyMap => {
-      const mk = tyToNameAt(t.mKey, RC_MAP_KEY, nominal)
+      const mk = tyToNameAt(tyKeyOf(t), RC_MAP_KEY, nominal)
       // A litunion-alias map value (`{[string]: K0}`) keeps its alias name rather than
       // softening to `string` — an atom-valued map is the mono i32 map, and every
       // `$fnsig`/mv-slot key derived here must agree with the annotation side's spelling.
-      let mv = litUnionAliasNameOfTy(t.mVal)
+      let mv = litUnionAliasNameOfTy(tyValOf(t))
       if mv == "" {
-        mv = tyToNameAt(t.mVal, nameKidCtx(ix, RC_MAP_VAL, nominal), nominal)
+        mv = tyToNameAt(
+          tyValOf(t),
+          nameKidCtx(ix, RC_MAP_VAL, nominal),
+          nominal,
+        )
       }
       if mk == "" || mv == "" { return "" }
       // The key/value separators sit inside the braces — one atom.
@@ -2544,7 +2552,7 @@ export function tyChildrenOf(ix: i32, out: i32[]) {
   if ix < 0 { return 0 }
   const t = tyAt(ix)
   match t {
-    TyArray => out.push(t.aElem)
+    TyArray => out.push(tyElemOf(t))
     TyNullable => out.push(t.nInner)
     TyNeg => out.push(t.negTy)
     TyUnion => {
@@ -2573,8 +2581,8 @@ export function tyChildrenOf(ix: i32, out: i32[]) {
       out.push(t.fnRet)
     }
     TyMap => {
-      out.push(t.mKey)
-      out.push(t.mVal)
+      out.push(tyKeyOf(t))
+      out.push(tyValOf(t))
     }
     // The leaf constructors have no child.
     TyPrim | TyLit | TyVar | TyErr => {}
@@ -2738,7 +2746,7 @@ export function tyReachesBrand(ty: i32, d: i32) {
   const t = tyAt(ty)
   match t {
     TyNullable => tyReachesBrand(t.nInner, d - 1)
-    TyArray => tyReachesBrand(t.aElem, d - 1)
+    TyArray => tyReachesBrand(tyElemOf(t), d - 1)
     TyUnion => {
       const ms = t.uMembers
       let i = 0
@@ -2982,10 +2990,11 @@ export function tyHoldsObj(ty: i32, depth: i32): boolean {
       return tyHoldsObj(t.nInner, depth - 1)
     }
     TyArray => {
-      return tyHoldsObj(t.aElem, depth - 1)
+      return tyHoldsObj(tyElemOf(t), depth - 1)
     }
     TyMap => {
-      return tyHoldsObj(t.mKey, depth - 1) || tyHoldsObj(t.mVal, depth - 1)
+      return tyHoldsObj(tyKeyOf(t), depth - 1)
+        || tyHoldsObj(tyValOf(t), depth - 1)
     }
     TyUnion => {
       for m in t.uMembers {
@@ -3021,8 +3030,8 @@ function tyHoldsObjDeepIn(ty: i32, seen: i32[]): boolean {
   match t {
     TyObj => true
     TyNullable => tyHoldsObjDeepIn(t.nInner, seen)
-    TyArray => tyHoldsObjDeepIn(t.aElem, seen)
-    TyMap => tyHoldsObjDeepIn(t.mKey, seen) || tyHoldsObjDeepIn(t.mVal, seen)
+    TyArray => tyHoldsObjDeepIn(tyElemOf(t), seen)
+    TyMap => tyHoldsObjDeepIn(tyKeyOf(t), seen) || tyHoldsObjDeepIn(tyValOf(t), seen)
     TyUnion => {
       for m in t.uMembers {
         if tyHoldsObjDeepIn(m, seen) { return true }
@@ -3069,8 +3078,8 @@ export function tyContainsList(ty: i32, depth: i32): boolean {
       return false
     }
     TyMap => {
-      return tyContainsList(t.mKey, depth - 1)
-        || tyContainsList(t.mVal, depth - 1)
+      return tyContainsList(tyKeyOf(t), depth - 1)
+        || tyContainsList(tyValOf(t), depth - 1)
     }
     TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {
       return false
@@ -3114,14 +3123,14 @@ export function tyHasInferHole(tyIx: i32, depth: i32): boolean {
       return t.tvName.length == 0 || t.tvName[0] == "?"[0]
     }
     TyArray => {
-      return tyHasInferHole(t.aElem, depth + 1)
+      return tyHasInferHole(tyElemOf(t), depth + 1)
     }
     TyNullable => {
       return tyHasInferHole(t.nInner, depth + 1)
     }
     TyMap => {
-      return tyHasInferHole(t.mKey, depth + 1)
-        || tyHasInferHole(t.mVal, depth + 1)
+      return tyHasInferHole(tyKeyOf(t), depth + 1)
+        || tyHasInferHole(tyValOf(t), depth + 1)
     }
     TyObj => {
       for ft in t.objFieldTypes {
@@ -3183,11 +3192,11 @@ function tyHasHoleWalk(tyIx: i32, depth: i32): boolean {
   const t = tyAt(tyIx)
   match t {
     TyVar => true
-    TyArray => tyHasHoleAt(t.aElem, depth + 1)
+    TyArray => tyHasHoleAt(tyElemOf(t), depth + 1)
     TyNullable => tyHasHoleAt(t.nInner, depth + 1)
     TyMap => {
-      if tyHasHoleAt(t.mKey, depth + 1) { return true }
-      tyHasHoleAt(t.mVal, depth + 1)
+      if tyHasHoleAt(tyKeyOf(t), depth + 1) { return true }
+      tyHasHoleAt(tyValOf(t), depth + 1)
     }
     TyObj => {
       const ofts = t.objFieldTypes
@@ -3313,7 +3322,7 @@ export function tyMentionsTyVarNamed(
       return t.tvName == name
     }
     TyArray => {
-      return tyMentionsTyVarNamed(t.aElem, name, depth - 1)
+      return tyMentionsTyVarNamed(tyElemOf(t), name, depth - 1)
     }
     TyNullable => {
       return tyMentionsTyVarNamed(t.nInner, name, depth - 1)
@@ -3322,8 +3331,8 @@ export function tyMentionsTyVarNamed(
       return tyMentionsTyVarNamed(t.negTy, name, depth - 1)
     }
     TyMap => {
-      if tyMentionsTyVarNamed(t.mKey, name, depth - 1) { return true }
-      return tyMentionsTyVarNamed(t.mVal, name, depth - 1)
+      if tyMentionsTyVarNamed(tyKeyOf(t), name, depth - 1) { return true }
+      return tyMentionsTyVarNamed(tyValOf(t), name, depth - 1)
     }
     TyObj => {
       let oi = 0
@@ -3369,7 +3378,7 @@ export function tyMentionsErr(ty: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return tyMentionsErr(t.aElem, depth - 1)
+      return tyMentionsErr(tyElemOf(t), depth - 1)
     }
     TyNullable => {
       return tyMentionsErr(t.nInner, depth - 1)
@@ -3378,8 +3387,8 @@ export function tyMentionsErr(ty: i32, depth: i32): boolean {
       return tyMentionsErr(t.negTy, depth - 1)
     }
     TyMap => {
-      if tyMentionsErr(t.mKey, depth - 1) { return true }
-      return tyMentionsErr(t.mVal, depth - 1)
+      if tyMentionsErr(tyKeyOf(t), depth - 1) { return true }
+      return tyMentionsErr(tyValOf(t), depth - 1)
     }
     TyObj => {
       for f in t.objFieldTypes {
@@ -3526,7 +3535,7 @@ export function tyUnionHasLitUnionArrayMember(er: i32) {
     while i < t.uMembers.length {
       const m = tyAt(t.uMembers[i])
       if m is TyArray {
-        if tyIsLitUnion(m.aElem) { return true }
+        if tyIsLitUnion(tyElemOf(m)) { return true }
       }
       i = i + 1
     }
@@ -3542,8 +3551,8 @@ export function tyIsNulI32BackedListInner(itIx: i32) {
   if itIx < 0 { return false }
   const it = tyAt(itIx)
   if it is TyArray {
-    if it.aElem < 0 { return false }
-    const el = tyAt(it.aElem)
+    if tyElemOpen(it) { return false }
+    const el = tyAt(tyElemOf(it))
     match el {
       TyPrim => {
         return el.primName == "i32" || el.primName == "boolean"
@@ -3686,8 +3695,8 @@ export function tyArrayElemPrim(ty: i32): PrimName | null {
   if ty < 0 { return null }
   const t = tyAt(ty)
   if t is TyArray {
-    if t.aElem >= 0 {
-      const el = tyAt(t.aElem)
+    if !tyElemOpen(t) {
+      const el = tyAt(tyElemOf(t))
       if el is TyPrim { return el.primName }
     }
   }
@@ -3716,11 +3725,11 @@ export function tyHasRepHoleAt(tyIx: i32, depth: i32) {
   const t = tyAt(tyIx)
   match t {
     TyVar => true
-    TyArray => tyHasRepHoleAt(t.aElem, depth + 1)
+    TyArray => tyHasRepHoleAt(tyElemOf(t), depth + 1)
     TyNullable => tyHasRepHoleAt(t.nInner, depth + 1)
     TyMap => {
-      if tyHasRepHoleAt(t.mKey, depth + 1) { return true }
-      tyHasRepHoleAt(t.mVal, depth + 1)
+      if tyHasRepHoleAt(tyKeyOf(t), depth + 1) { return true }
+      tyHasRepHoleAt(tyValOf(t), depth + 1)
     }
     TyObj => {
       const ofts = t.objFieldTypes
@@ -3764,7 +3773,7 @@ export function tyReachesClosure(ty: i32, depth: i32): boolean {
   match t {
     TyFunc => true
     TyNullable => tyReachesClosure(t.nInner, depth - 1)
-    TyArray => tyReachesClosure(t.aElem, depth - 1)
+    TyArray => tyReachesClosure(tyElemOf(t), depth - 1)
     TyObj => {
       let i = 0
       while i < t.objFieldTypes.length {
@@ -3781,7 +3790,7 @@ export function tyReachesClosure(ty: i32, depth: i32): boolean {
       }
       false
     }
-    TyMap => tyReachesClosure(t.mVal, depth - 1)
+    TyMap => tyReachesClosure(tyValOf(t), depth - 1)
     // Leaves: no closure under any of these.
     TyPrim | TyNeg | TyVar | TyLit | TyErr => false
   }
@@ -4039,7 +4048,7 @@ function tySameAt(a: i32, b: i32, depth: i32): boolean {
     TyArray => {
       match y {
         TyArray => {
-          return tySameAt(x.aElem, y.aElem, depth - 1)
+          return tySameAt(tyElemOf(x), tyElemOf(y), depth - 1)
         }
         TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
           return false
@@ -4088,8 +4097,8 @@ function tySameAt(a: i32, b: i32, depth: i32): boolean {
       match y {
         TyMap => {
           if x.mSet != y.mSet { return false }
-          if !tySameAt(x.mKey, y.mKey, depth - 1) { return false }
-          return tySameAt(x.mVal, y.mVal, depth - 1)
+          if !tySameAt(tyKeyOf(x), tyKeyOf(y), depth - 1) { return false }
+          return tySameAt(tyValOf(x), tyValOf(y), depth - 1)
         }
         TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyArray | TyVar | TyLit | TyNeg => {
           return false
@@ -4243,7 +4252,7 @@ function tyListLeafIsStrLitUnion(ty: i32): boolean {
   while cur >= 0 && cur < T.tys.length && d < 64 {
     const t = tyAt(cur)
     if !(t is TyArray) { break }
-    cur = t.aElem
+    cur = tyElemOf(t)
     d = d + 1
   }
   if cur < 0 || cur >= T.tys.length { return false }
@@ -4284,7 +4293,7 @@ export function tyNestedArrLeafRenders(elemTy: i32): boolean {
   if elemTy < 0 { return false }
   const el = tyAt(elemTy)
   if el is TyArray {
-    if el.aElem < 0 { return false }
+    if tyElemOpen(el) { return false }
     return tyToEmitName(elemTy) != ""
   }
   false
@@ -4356,7 +4365,7 @@ export function tyIsLitUnionArray(ty: i32) {
   if ty < 0 { return false }
   const t = tyAt(ty)
   if t is TyArray {
-    const r = tyIsLitUnion(t.aElem)
+    const r = tyIsLitUnion(tyElemOf(t))
     return r
   }
   false
@@ -4368,7 +4377,7 @@ export function tyMapValIsLitUnion(ti: i32, depth: i32): boolean {
   if ti < 0 || depth <= 0 { return false }
   const t = tyAt(ti)
   if t is TyMap {
-    let v = t.mVal
+    let v = tyValOf(t)
     if v < 0 { return false }
     const vt = tyAt(v)
     if vt is TyNullable { v = vt.nInner }
@@ -4602,7 +4611,7 @@ export function mkNullableTy(inner: i32) {
 }
 
 export function mkArrayTy(elem: i32) {
-  const t: Ty = { aElem: strLitAsSet(elem), aRead: 0 }
+  const t: Ty = { aElem: openChild(strLitAsSet(elem)), aRead: 0 }
   addTy(t)
 }
 
@@ -4626,13 +4635,17 @@ export function mkNullableTyOf(ty: i32) { mkNullableTy(ty) }
 // The read-only view over the same element (`readonly T[]`). A sibling constructor rather
 // than a flag on `mkArrayTy`, so every existing mint stays a mutable list by construction.
 export function mkArrayViewTy(elem: i32) {
-  const t: Ty = { aElem: strLitAsSet(elem), aRead: 1 }
+  const t: Ty = { aElem: openChild(strLitAsSet(elem)), aRead: 1 }
   addTy(t)
 }
 
 export function mkMapTy(key: i32, val: i32, isSet: i32) {
   tyMapMinted = true
-  const t: Ty = { mKey: key, mVal: strLitAsSet(val), mSet: isSet }
+  const t: Ty = {
+    mKey: openChild(strLitAsSet(key)),
+    mVal: openChild(strLitAsSet(val)),
+    mSet: isSet,
+  }
   addTy(t)
 }
 
@@ -4835,20 +4848,20 @@ function memberTySameAt(a: i32, b: i32, depth: i32): boolean {
   const tb = tyAt(b)
   if ta is TyArray && tb is TyArray {
     return memberTySameAt(
-      memberNumSoft(ta.aElem),
-      memberNumSoft(tb.aElem),
+      memberNumSoft(tyElemOf(ta)),
+      memberNumSoft(tyElemOf(tb)),
       depth - 1,
     )
   }
   if ta is TyMap && tb is TyMap {
     return (memberTySameAt(
-      memberNumSoft(ta.mKey),
-      memberNumSoft(tb.mKey),
+      memberNumSoft(tyKeyOf(ta)),
+      memberNumSoft(tyKeyOf(tb)),
       depth - 1,
     )
       && memberTySameAt(
-      memberNumSoft(ta.mVal),
-      memberNumSoft(tb.mVal),
+      memberNumSoft(tyValOf(ta)),
+      memberNumSoft(tyValOf(tb)),
       depth - 1,
     ))
   }
@@ -4886,6 +4899,27 @@ function memberNumSoft(t: i32): i32 {
 let tvSlotBounds: {[i32]: i32[]} = Map()
 let tvSlotShown: {[i32]: boolean[]} = Map()
 
+// Records `bound` as slot `(binder, idx)`'s bound, and whether the slot renders as it.
+export function tvSlotSet(
+  binder: i32,
+  idx: i32,
+  bound: i32,
+  printAsBound: boolean,
+) {
+  if binder < 0 || idx < 0 { return 0 }
+  const bs = tvSlotBounds.get(binder) ?? []
+  const ps = tvSlotShown.get(binder) ?? []
+  while bs.length <= idx {
+    bs.push(-1)
+    ps.push(false)
+  }
+  bs[idx] = bound
+  ps[idx] = printAsBound
+  tvSlotBounds[binder] = bs
+  tvSlotShown[binder] = ps
+  0
+}
+
 // The bound recorded for slot `(binder, idx)`, or -1 where none is.
 export function tvSlotBound(binder: i32, idx: i32): i32 {
   const bs = tvSlotBounds.get(binder)
@@ -4909,21 +4943,118 @@ function tvSlotShownAs(binder: i32, idx: i32): i32 {
 // Pins open element `v` into list row `t` in place, advancing `tyMutEpoch`: the one writer of a
 // list row's element after its mint, so every pin invalidates the epoch-stamped memos.
 export function tyPinElem(t: TyArray, v: i32) {
-  t.aElem = v
+  if !holeSolve(t.aElem, v) { t.aElem = v }
   tyMutEpoch = tyMutEpoch + 1
   0
 }
 
-// `tyPinElem` for a map row's key.
+// `tyPinElem` for a map row's key; a lone string literal is stored as its one-member set, as
+// `mkMapTy` stores it (D16367).
 export function tyPinKey(t: TyMap, v: i32) {
-  t.mKey = v
+  const s = strLitAsSet(v)
+  if !holeSolve(t.mKey, s) { t.mKey = s }
   tyMutEpoch = tyMutEpoch + 1
   0
 }
 
 // `tyPinElem` for a map row's value.
 export function tyPinVal(t: TyMap, v: i32) {
-  t.mVal = v
+  if !holeSolve(t.mVal, v) { t.mVal = v }
   tyMutEpoch = tyMutEpoch + 1
   0
 }
+
+// Whether a list element, map key or map value `child` is an open position, one no pin has filled
+// yet. The one test of openness, so a reader never compares a child against a sentinel itself.
+export function tyOpen(child: i32): boolean { child < 0 }
+
+// The key a declaration node is known by in the type arena: a type-parameter row's binder and,
+// later, a nominal row's identity. One function, so the key can move off node ids in one place.
+export function declKeyOf(node: i32): i32 { node }
+
+// List row `t`'s element: its pinned type, or an open position (`tyOpen`). The one reader of the
+// field, so an open element's representation is this file's alone.
+export function tyElemOf(t: TyArray): i32 { holeView(t.aElem) }
+
+// `tyElemOf` for a map row's key.
+export function tyKeyOf(t: TyMap): i32 { holeView(t.mKey) }
+
+// `tyElemOf` for a map row's value.
+export function tyValOf(t: TyMap): i32 { holeView(t.mVal) }
+
+// An open child (`TY_OPEN`) is a hole, stored in its field as `-4 - h`, below every sentinel: the row
+// never changes once minted, and a pin writes `holeSol[h]` instead, so every holder of the row reads
+// the pin. A hole reads as its solution, `TY_OPEN` while unsolved; any other child as itself.
+let holeSol: i32[] = []
+
+// Empties the hole column with the arena it belongs to.
+export function holeReset() {
+  holeSol = []
+  0
+}
+
+// The field value for a freshly minted child `v`: a new hole when it is `TY_OPEN`, else `v`.
+function openChild(v: i32): i32 {
+  if v != TY_OPEN { return v }
+  holeSol.push(TY_OPEN)
+  -3 - holeSol.length
+}
+
+// Whether child field value `c` names a hole.
+function isHoleCode(c: i32): boolean { c <= -4 && -4 - c < holeSol.length }
+
+// The hole a linked chain from hole code `c` ends at: a hole whose solution is another hole's code
+// is that hole, so one pin answers every hole linked to it.
+function holeRoot(c: i32): i32 {
+  let r = c
+  while isHoleCode(holeSol[-4 - r]) { r = holeSol[-4 - r] }
+  r
+}
+
+// Solves the hole field value `c` names to `v`; false when `c` names no hole.
+function holeSolve(c: i32, v: i32): boolean {
+  if !isHoleCode(c) { return false }
+  holeSol[-4 - holeRoot(c)] = v
+  true
+}
+
+// What child field value `c` reads as.
+function holeView(c: i32): i32 {
+  if !isHoleCode(c) { return c }
+  holeSol[-4 - holeRoot(c)]
+}
+
+// Makes open children `a` and `b` one hole, so a pin of either is a pin of both; false when either
+// is not an unsolved hole.
+function holeLink(a: i32, b: i32): boolean {
+  if !isHoleCode(a) || !isHoleCode(b) { return false }
+  const ra = holeRoot(a)
+  const rb = holeRoot(b)
+  if holeSol[-4 - ra] != TY_OPEN || holeSol[-4 - rb] != TY_OPEN { return false }
+  if ra != rb { holeSol[-4 - ra] = rb }
+  true
+}
+
+// Links two open list elements into one hole (`holeLink`); false when either is not one.
+export function tyLinkElem(a: TyArray, b: TyArray): boolean {
+  holeLink(a.aElem, b.aElem)
+}
+
+// `tyLinkElem` for two map keys.
+export function tyLinkKey(a: TyMap, b: TyMap): boolean {
+  holeLink(a.mKey, b.mKey)
+}
+
+// `tyLinkElem` for two map values.
+export function tyLinkVal(a: TyMap, b: TyMap): boolean {
+  holeLink(a.mVal, b.mVal)
+}
+
+// Whether list row `t`'s element is open: `tyElemOpen(t)`.
+export function tyElemOpen(t: TyArray): boolean { tyOpen(tyElemOf(t)) }
+
+// Whether map row `t`'s key is open.
+export function tyKeyOpen(t: TyMap): boolean { tyOpen(tyKeyOf(t)) }
+
+// Whether map row `t`'s value is open.
+export function tyValOpen(t: TyMap): boolean { tyOpen(tyValOf(t)) }

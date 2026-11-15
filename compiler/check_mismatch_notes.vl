@@ -32,7 +32,7 @@ import { callDeclFnIx, calleeNameOf } from "./check_callee"
 import { lambdaBodyTail } from "./check_expected"
 import { numLexIsFloat } from "./emit_bignum"
 import { nodeTyIxOf } from "./check_node_tys"
-import { fillIsLitZero } from "./check_num_lits"
+import { fillIsLitZero, intLitMisfitAtFloat } from "./check_num_lits"
 import { parenPeelIx } from "./check_places"
 import { rcwModOf } from "./check_record_writes"
 import { demangleName } from "./check_suggest"
@@ -52,6 +52,7 @@ import {
   primNameStr,
   softenLitTy,
   tyAt,
+  tyElemOf,
   tyToStr,
 } from "./check_types"
 import { tyIsNumUnion } from "./check_union_mint"
@@ -97,7 +98,7 @@ export function noteU8StoreRhs(lhs: i32, rhs: i32) {
   if at < 0 { return 0 }
   const a = tyAt(at)
   if !(a is TyArray) { return 0 }
-  if primNameOf(a.aElem) != "u8" { return 0 }
+  if primNameOf(tyElemOf(a)) != "u8" { return 0 }
   if !u8StoreRhsHas(rhs) { u8StoreRhs.push(rhs) }
   0
 }
@@ -108,6 +109,26 @@ function u8StoreRhsHas(ix: i32): boolean {
     i = i + 1
   }
   false
+}
+
+// Names the integer parameter a fractional argument meets, with its declared type, so a reader
+// sees which argument means what (`digits: i32`); "" for any other pair, or when the callee's
+// parameter has no name to give.
+export function fracForIntParamNote(
+  got: i32,
+  want: i32,
+  pName: string,
+): string {
+  if pName == "" || got < 0 || want < 0 { return "" }
+  const gn = primNameStr(primNameOf(softenLitTy(got)))
+  if gn != "f32" && gn != "f64" { return "" }
+  const wn = primNameStr(primNameOf(want))
+  if wn != "i32" && wn != "u8" && wn != "i64" { return "" }
+  " — it is the parameter `"
+    + pName
+    + ": "
+    + tyToStr(want)
+    + "`, which takes a whole number"
 }
 
 // The fix a `boolean` offered where a number is wanted owes: it never converts implicitly, so
@@ -132,7 +153,7 @@ function boolForNumberNoteOf(got: i32, want: i32, what: string): string {
   const wa = tyAt(want)
   if ga is TyArray {
     if wa is TyArray {
-      return boolForNumberNoteOf(ga.aElem, wa.aElem, "each element")
+      return boolForNumberNoteOf(tyElemOf(ga), tyElemOf(wa), "each element")
     }
   }
   if ga is TyObj {
@@ -189,8 +210,8 @@ function storageListBody(srcIx: i32, got: i32, want: i32): string {
     if wa is TyObj { return storageListFieldBody(srcIx, ga, wa) }
   }
   if !(ga is TyArray) || !(wa is TyArray) { return "" }
-  if primNameStr(primNameOf(wa.aElem)) != "u8" { return "" }
-  const el = softenLitTy(ga.aElem)
+  if primNameStr(primNameOf(tyElemOf(wa))) != "u8" { return "" }
+  const el = softenLitTy(tyElemOf(ga))
   if !isNumeric(el) || primNameStr(primNameOf(el)) == "" { return "" }
   const src = "`" + tyToStr(got) + "`"
   const make = "`zeroBytes(n)` from \"std:bytes\", which returns a `u8[]`"
@@ -344,6 +365,8 @@ export function letAssignMsg(
   // implicit-widening rule won't take silently. Explain the lossiness rather than
   // the opaque "cannot assign i32 to f32".
   if (isNumeric(got) || tyIsNumUnion(got)) && isNumeric(want) {
+    const litMsg = intLitMisfitAtFloat(srcIx, want)
+    if litMsg != "" { return litMsg }
     return tyToStr(got)
       + " doesn't fit in "
       + tyToStr(want)
@@ -388,7 +411,7 @@ function litMemberAt(srcIx: i32, want: i32, depth: i32, path: string): string {
     while i < n.arrElems.length {
       const r = litMemberAt(
         n.arrElems[i],
-        w.aElem,
+        tyElemOf(w),
         depth - 1,
         path + "[" + i32ToStr(i) + "]",
       )

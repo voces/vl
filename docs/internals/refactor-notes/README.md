@@ -9,6 +9,62 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-15-zero-sites-probes](2026-11-15-zero-sites-probes.md): Probes for five unprobed ZERO rows of `goal-scoreboard.vl --sites`, 2026-11-15
+- [2026-11-15-type-hashcons-s2b-hole-column](2026-11-15-type-hashcons-s2b-hole-column.md): Type hash-cons stage 2b: an open collection child is a hole, and a pin solves it (lane H), 2026-11-15
+- [2026-11-15-top-level-callee-first](2026-11-15-top-level-callee-first.md): Top-level statements checked callee-first: four arms, none shipped, 2026-11-15
+- [2026-11-15-rep-adt-stage2-gate](2026-11-15-rep-adt-stage2-gate.md): Rep ADT: stage 2's gate, the variant axis at zero during emit, 2026-11-15 (lane E)
+- [2026-11-15-rep-adt-declrows](2026-11-15-rep-adt-declrows.md): Rep ADT: declared rows no longer rebuild the rep tree, 2026-11-15 (lane E)
+- [2026-11-15-phase-state-arena-api](2026-11-15-phase-state-arena-api.md): The phase-state census does not count the type arena's accessors as checker surface, 2026-11-15 (lane Q)
+- [2026-11-15-oracle-radix-float](2026-11-15-oracle-radix-float.md): A radix literal in a float context is the value its digits spell (ruling 4.1, 2026-11-15)
+- [2026-11-15-oracle-o1-o8](2026-11-15-oracle-o1-o8.md): Oracle fixes O1–O8, from lane B's 50-seed triage (2026-11-15)
+- [2026-11-15-oracle-hof-generator](2026-11-15-oracle-hof-generator.md): The oracle's third generator: generics and higher-order code (2026-11-15)
+- [2026-11-15-oracle-fuzz-triage](2026-11-15-oracle-fuzz-triage.md): Triage of a 50-seed oracle fuzz: 51 new disagreements, three compiler rows, eight oracle bugs, 2026-11-15
+- [2026-11-15-oracle-data-generator](2026-11-15-oracle-data-generator.md): The oracle's second generator: data, not arithmetic (2026-11-15)
+- [2026-11-15-lane-l-record-field-fit](2026-11-15-lane-l-record-field-fit.md): A record `is` narrowing a non-literal field, D4082 — 2026-11-15
+- [2026-11-15-lane-l-mixed-literal-set](2026-11-15-lane-l-mixed-literal-set.md): A literal set over two kinds, D16326 — 2026-11-15
+- [2026-11-15-lane-l-cast-test-residue](2026-11-15-lane-l-cast-test-residue.md): The cast and test residue, D16322 and D16320 — 2026-11-15
+- [2026-11-15-l3-pr-a-row-slot](2026-11-15-l3-pr-a-row-slot.md): L3 PR A: the record-width rewrite gives a record parameter a bound row slot
+- [2026-11-15-k-d3530-literal-box-into-nullable-float](2026-11-15-k-d3530-literal-box-into-nullable-float.md): D3530: a two-width literal union into a nullable float, 2026-11-15
+- [2026-11-15-k-d2539-refused-call-is-an-error](2026-11-15-k-d2539-refused-call-is-an-error.md): D2539: a call refused for an unbound return type parameter is an error, 2026-11-15
+- [2026-11-15-g65-d16364](2026-11-15-g65-d16364.md): D16364: a copy of a later-declared module container shares its row, 2026-11-15
+- [2026-11-15-g63-d16366-67](2026-11-15-g63-d16366-67.md): D16366, D16367: a lone literal is its one-member set at a list field and a map key, 2026-11-15
+- [2026-11-15-d16394-record-eq-field-storage](2026-11-15-d16394-record-eq-field-storage.md): D16394: record `==` over fields stored apart, 2026-11-15
+- [2026-11-15-d16391-u8-null-mix](2026-11-15-d16391-u8-null-mix.md): D16391: a `u8[]` spread joined with `null` is refused as every other `u8` mix is, 2026-11-15
+- [2026-11-14-rep-adt-stage1b](2026-11-14-rep-adt-stage1b.md): Rep ADT stage 1b, and the stage plan after lane Q's L5 design, 2026-11-14 (lane E)
+- [2026-11-14-k-d16335-hole-call-through-declared-fn](2026-11-14-k-d16335-hole-call-through-declared-fn.md): D16334, D16335: a call through a parameter bound to a declared hole function is that function's call, 2026-11-14
+- [2026-11-15-d16316-null-only-list-sibling](2026-11-15-d16316-null-only-list-sibling.md): 2026-11-15 — a list element's null is its built list's, whatever its own stamp says (D16316)
+- [2026-11-14-fuzz-triage-d16314](2026-11-14-fuzz-triage-d16314.md): Triage of a 50-seed fuzz sweep: 16 unsound shapes, four new rows (D16314-D16317), 2026-11-14
+- [2026-11-14-type-hashcons-s2a-pin-sites](2026-11-14-type-hashcons-s2a-pin-sites.md): Type hash-cons stage 2a: every empty-collection pin goes through one writer (lane H), 2026-11-14
+- [2026-11-14-type-hashcons-s1-binder-slots](2026-11-14-type-hashcons-s1-binder-slots.md): Type hash-cons stage 1 (1a–1d): type parameters are identified by their declaration slot (lane H), 2026-11-14
+- [2026-11-14-slot-store-stage-2a](2026-11-14-slot-store-stage-2a.md): Slot store, stage 2a: the place-class engine, behaviour-neutral (lane S, 2026-11-14)
+- [2026-11-14-rep-adt-stage1-arena](2026-11-14-rep-adt-stage1-arena.md): Rep ADT stage 1: the arena, 2026-11-14 (lane E)
+- [2026-11-14-phase-products-design](2026-11-14-phase-products-design.md): Phase products and a session value: design note, 2026-11-14 (lane Q)
+- [2026-11-14-perf-elab-row-columns](2026-11-14-perf-elab-row-columns.md): Elab bank presence as node columns, 2026-11-14
+- [2026-11-14-oracle-design](2026-11-14-oracle-design.md): An independent oracle: design and first results (2026-11-14)
+- [2026-11-14-oracle-base-diff](2026-11-14-oracle-base-diff.md): The oracle step judged against the base and the corpus expectation (2026-11-14)
+- [2026-11-14-lane-l-same-type-member-warnings](2026-11-14-lane-l-same-type-member-warnings.md): Warnings for union members that are one type — 2026-11-14
+- [2026-11-14-lane-l-partial-fit-match-cast](2026-11-14-lane-l-partial-fit-match-cast.md): The partial record fit in `match` and `as`, and over a nullable union — 2026-11-14
+- [2026-11-14-lane-l-d2719-as-niche](2026-11-14-lane-l-d2719-as-niche.md): The niche cast at the instance's type — 2026-11-14
+- [2026-11-14-lane-l-d16321-union-into-record](2026-11-14-lane-l-d16321-union-into-record.md): A union of contained records delivered into a record slot — 2026-11-14
+- [2026-11-14-l5-step1-instreq](2026-11-14-l5-step1-instreq.md): L5 step 1: mono's instance builder takes an explicit request and one build frame, 2026-11-14 (lane Q)
+- [2026-11-14-l5-step0-phase-state-ratchet](2026-11-14-l5-step0-phase-state-ratchet.md): L5 step 0: the phase-state ratchet, 2026-11-14 (lane Q)
+- [2026-11-14-k-lambda-result-from-context](2026-11-14-k-lambda-result-from-context.md): An un-annotated lambda takes the delivered result as its annotation, 2026-11-14
+- [2026-11-14-k-d3088-nullable-record-view](2026-11-14-k-d3088-nullable-record-view.md): D3088: a nullable record row delivered as a readonly union list is its twin's view, 2026-11-14
+- [2026-11-14-is-operand-retest](2026-11-14-is-operand-retest.md): 2026-11-14 — a re-test after a writing call, and a test after one (D2408, D2449, D2464, D3251)
+- [2026-11-14-housekeeping-skipdir-formula](2026-11-14-housekeeping-skipdir-formula.md): Housekeeping: the CLI walk skips only deps and git; the Homebrew draft is gone; editor suites fail on a missing seed, 2026-11-14
+- [2026-11-14-g62-d16209](2026-11-14-g62-d16209.md): D16209: a set-carrying parameter is closed when a hole member's result is asked, 2026-11-14
+- [2026-11-14-g61-d16364](2026-11-14-g61-d16364.md): D16364: a module container keeps the container it was hoisted at, 2026-11-14
+- [2026-11-14-g60-matrix-silent-cells](2026-11-14-g60-matrix-silent-cells.md): Filing the SILENT cells of four capability-matrix templates by mechanism, 2026-11-14
+- [2026-11-14-d4192-null-list-default](2026-11-14-d4192-null-list-default.md): D4192: a null-only list literal as a `??` default
+- [2026-11-14-d4055-postfix-place](2026-11-14-d4055-postfix-place.md): D4055: postfix `++` on a place is the prefix form under the postfix wrapper
+- [2026-11-14-d4034-ov-arg-bound-ret](2026-11-14-d4034-ov-arg-bound-ret.md): D4034: an overload candidate's return bound by its arguments
+- [2026-11-14-d3785-assignment-stored-width](2026-11-14-d3785-assignment-stored-width.md): An assignment delivered at its target's type: D3785 closed, 2026-11-14
+- [2026-11-14-d16317-fn-result-list-row](2026-11-14-d16317-fn-result-list-row.md): 2026-11-14 — a closure signature's result list mints its row before the key (D16317)
+- [2026-11-14-d16296-union-arm-fn-variance](2026-11-14-d16296-union-arm-fn-variance.md): D16296, D16232: the container variance rule reaches a union's arms, 2026-11-14
+- [2026-11-14-d15957-flow-reads-function-face](2026-11-14-d15957-flow-reads-function-face.md): Flow-sensitive reads, the function face: D15956 and D15957 closed, 2026-11-14
+- [2026-11-14-d14420-never-operand](2026-11-14-d14420-never-operand.md): D14420: a `never` operand outside a dead arm
+- [2026-11-14-d10351-mf-scan](2026-11-14-d10351-mf-scan.md): D10351: the scratch-frame scan reaches a test, a conversion and a match
+- [2026-11-14-assignable-strict](2026-11-14-assignable-strict.md): `assignable` refuses a negative type, and a clean compile that asks one fails the oracle, 2026-11-14
 - [2026-11-14-assignable-negative-sentinel-census](2026-11-14-assignable-negative-sentinel-census.md): `assignable` reads a negative type as "accept": the census, 2026-11-14
 - [2026-11-14-assignable-pending-result](2026-11-14-assignable-pending-result.md): Shape C of the negative-type sentinel: a pending function result, 2026-11-14
 - [2026-11-14-clause2-architecture-map](2026-11-14-clause2-architecture-map.md): The open clause-2 rows, mapped onto the architecture item that closes them, 2026-11-14

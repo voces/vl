@@ -4,6 +4,7 @@
 // cannot run yet are listed in SPEC_SKIPS by their first line, so the count can only grow.
 
 import { distilledExpectations, interpret, judge, judgeRecording } from "../scripts/oracle/oracle.ts";
+import { grid } from "../scripts/oracle/join-grid.ts";
 
 type Example = { where: string; src: string; want: string[] };
 
@@ -73,11 +74,43 @@ Deno.test("oracle: pinned regressions", () => {
     ["print((-2147483648) - 0x7fffffff)", "1"], // a radix tree at i32: `-2147483648` is an i32 literal
     ["print(7 + 0xFFFFFFFF)", "6"],
     ["print(0x1_0000_0000)", "4294967296"],
-    ["print(0.1 + 0.2)", "0.3"],
+    ["print(0.1 + 0.2)", "0.30000000000000004"], // E9.1: a float constant folds in IEEE
+    ["print(1.5 % 0.1)", "0.09999999999999992"],
+    ["print((1.5 % 0.1) / (2.5 % 0.1))", "1.0000000000000007"],
+    // T2.3 (ruling 4.1, revised): a radix literal in a float context is its digits' value, rounded
+    ["print(0xFFFFFFFF as f32)", "4294967296"],
+    ["print(0x80000000 as f32)", "2147483648"],
+    ["print(0xFFFFFFFF as f64)", "4294967295"],
+    ["print(0xFFFFFFFFFFFFFFFF as f64)", "18446744073709552000"],
+    ["print(0x1_0000_0001 as f32)", "4294967296"],
+    ["print(1.5 + 0xFFFFFFFF)", "4294967296.5"],
+    ["print(0xFFFFFFFF)", "-1"], // an integer context keeps the pattern
+    // ruling 4.2: a radix tree read at an f64 computes at 64 bits with integer division
+    ["const y: f64 = 0xFFFFFFFF / 2\nprint(y)", "2147483647"],
+    ["const c: f64 = 0x7FFFFFFF << 2\nprint(c)", "8589934588"],
+    ["print(2.0 * (0x80000000 >> 1))", "2147483648"],
+    ["print((0xFFFFFFFF % 1_000) as i64)", "295"],
+    ["print(0xFFFFFFFF / 2)", "0"], // no use: the 32-bit pattern
+    // a shift's count never types its left operand; a constant count of 32 to 63 widens it (Q8)
+    ["const c: i32 = 40\nconst v: i64 = 1 << c\nprint(v)", "1099511627776"],
+    ["const c: i32 = 3\nconst v: i64 = (0xFFFFFFFF << 31) << c\nprint(v)", "-17179869184"],
+    ["print(0x1 << 40)", "1099511627776"],
+    // ruling 4.4: `is` on an empty container reads the type it was built at
+    ["const e: Set<i32> = Set()\nconst u: Set<i32> | Set<string> = e\nprint(u is Set<string>)", "false"],
+    ["type L = i32[] | f64[]\nconst xs: L[] = [[]]\nprint(xs[0] is f64[])", "false"],
+    ["const m: {[string]: string | i32} = Map()\nconst w: {[string]: string | i32} | string = m\nprint(w is {[string]: i32 | string})", "true"],
   ];
   for (const [src, want] of pins) {
     const o = interpret(src + "\n");
     if (o.kind !== "ok" || o.out.join("\n") !== want) throw new Error(`${src}: want ${want}, got ${o.kind} ${JSON.stringify(o.out)} ${o.msg}`);
+  }
+});
+
+// Spec T3.6 (ruling 4.3): the oracle gives every cell of the join grid the type the rule gives.
+Deno.test("oracle: the T3.6 join grid", () => {
+  for (const c of grid()) {
+    const o = interpret(c.src);
+    if (o.kind !== "ok" || o.out.join("\n") !== c.want) throw new Error(`${c.name}: want ${c.want}, got ${o.kind} ${JSON.stringify(o.out)} ${o.msg}`);
   }
 });
 

@@ -151,12 +151,11 @@ import {
   blockTailIx,
   blockTailTy,
   chainMissing,
-  f32JoinRetypesRunning,
   forToKwTok,
   ifChainOnFnTail,
   inferRetNextLit,
   inferRetNextLitSet,
-  joinMayAdoptF32,
+  joinMayAdoptFloat,
   matchBodyDeclares,
   mkGuardedRetTy,
   noteInferRetValue,
@@ -221,7 +220,7 @@ import {
   bindGenWalk,
   dupNameErr,
   joinArmLit,
-  joinF32LitTails,
+  joinFloatLitTails,
   joinTys,
   sameVariantTy,
   substTyDeep,
@@ -743,21 +742,24 @@ export function checkBoundSubsumes(
   0
 }
 
-// A type parameter the callee's RETURN, or the signature of a function its body declares and
-// uses, names and none of its PARAMETER annotations does: no argument can bind it. Callers skip
-// a call with explicit type arguments. A DECLARED return is asked by its written spelling, an
-// INFERRED one by `retTy`, the settled result the call site already holds (D1819).
+// How many calls `checkRetTyParamBound` has refused; a body that grew it reported the cause.
+export let rtpRefusals = 0
+
+// Refuses, and answers true, when a type parameter the callee's RETURN or a function its body
+// declares names is in none of its PARAMETER annotations: no argument binds it. Callers skip
+// explicit type arguments. A DECLARED return is read by its spelling, an INFERRED one by
+// `retTy`, the result the call site holds (D1819).
 export function checkRetTyParamBound(
   declIx: i32,
   who: string,
   ix: i32,
   retTy: i32,
-) {
-  if inferQuiet { return 0 }
-  if declIx < 0 { return 0 }
+): boolean {
+  if inferQuiet { return false }
+  if declIx < 0 { return false }
   const dn = nodeAt(declIx)
   if dn is FuncDecl {
-    if dn.fnTyParams.length == 0 { return 0 }
+    if dn.fnTyParams.length == 0 { return false }
     let rTs = -1
     if dn.fnRet >= 0 { rTs = annTsOf(dn.fnRet) }
     let k = 0
@@ -790,7 +792,8 @@ export function checkRetTyParamBound(
               + "` a parameter position, or make the return type concrete",
             ix,
           )
-          return 0
+          rtpRefusals = rtpRefusals + 1
+          return true
         }
       } else if !anyParamMentionsTyParam(dn.fnParams, one) {
         const inner = bodyFnParamNaming(dn.fnBody, dn.fnBody, one)
@@ -820,7 +823,8 @@ export function checkRetTyParamBound(
               + "` a parameter position, or pass the type arguments explicitly",
             ix,
           )
-          return 0
+          rtpRefusals = rtpRefusals + 1
+          return true
         }
         const retIx = bodyFnRetNaming(dn.fnBody, dn.fnBody, one)
         if retIx >= 0 {
@@ -849,7 +853,8 @@ export function checkRetTyParamBound(
               + "` a parameter position, or pass the type arguments explicitly",
             ix,
           )
-          return 0
+          rtpRefusals = rtpRefusals + 1
+          return true
         }
         const layIx = bodyLayoutReadNaming(dn.fnBody, one)
         if layIx >= 0 {
@@ -872,13 +877,14 @@ export function checkRetTyParamBound(
               + "` a parameter position, or pass the type arguments explicitly",
             ix,
           )
-          return 0
+          rtpRefusals = rtpRefusals + 1
+          return true
         }
       }
       k = k + 1
     }
   }
-  0
+  false
 }
 
 // `checkRetTyParamBound` for a generic function named by `arg` and handed on as a value of type
@@ -1512,16 +1518,11 @@ function checkIfTail(
   // An `if` with a completing arm that yields no value is a statement: it is `void` as the
   // function's tail, so the arm values it seeded leave the inferred return.
   const bareArm = ifTailNoValueVerdict(n, f, el)
-  // An f32 arm beside literal arms types the join f32, as it does an operator (PL-049). A return
-  // tail's arms seed the inferred return one by one, which keeps its reading (D2774).
+  // An f32 arm beside literal arms types the join f32, as it does an operator (PL-049), in a
+  // return tail too, whose inferred return is a join of the same rule (owner ruling 4.3, D2774).
   let f32Join = -1
-  if (
-    daHasElse
-    && !bareArm
-    && (!ifTail || f32JoinRetypesRunning())
-    && !valDiscarded(ix)
-  ) {
-    if joinMayAdoptF32(thenTy, elseTy) { f32Join = joinF32LitTails(ix) }
+  if (daHasElse && !bareArm && !valDiscarded(ix)) {
+    if joinMayAdoptFloat(thenTy, elseTy) { f32Join = joinFloatLitTails(ix) }
   }
   // Two runtime arms join apart, so an arm an inner join typed `f32` keeps that type rather
   // than the `f64` a widening sibling would read it at.
@@ -1687,6 +1688,12 @@ function ifTailElseJoin(
     plainJoin = thenPlain
     if !ifChainOnFnTail { noteExitArm(n.ifElse) }
   }
+  // An `else if` link whose every arm exits hands no value either, as its block spelling does,
+  // and each of its arms ends with the `never` tail an exiting arm block gets (D3396).
+  if daElseDiverges && !thenExits && elseIsLink {
+    plainJoin = thenPlain
+    if !ifChainOnFnTail { noteExitLinkArms(n.ifElse) }
+  }
   if !f32Keep { f32JoinRevert(ix) }
   // A string literal arm joins to `string`; beside an arm whose type holds that literal it
   // takes that type instead, and a destination that holds each arm's value types the `if`, so
@@ -1716,6 +1723,23 @@ function ifTailElseJoin(
     )
   }
   return plainJoin
+}
+
+// Notes each arm block of the `else if` chain at `ix`, every one of which exits, as an exit arm.
+function noteExitLinkArms(ix: i32) {
+  let cur = ix
+  while cur >= 0 {
+    const c = nodeAt(cur)
+    cur = -1
+    if c is IfStmt {
+      if nodeAt(c.ifThen) is Block { noteExitArm(c.ifThen) }
+      if c.ifElse >= 0 {
+        if nodeAt(c.ifElse) is IfStmt { cur = c.ifElse }
+        else if nodeAt(c.ifElse) is Block { noteExitArm(c.ifElse) }
+      }
+    }
+  }
+  0
 }
 
 // Holds each value arm `arm` hands an `if` joined to the record `j` to that delivery's width

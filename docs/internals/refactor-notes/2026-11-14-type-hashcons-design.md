@@ -410,6 +410,55 @@ Stage 0 is a separate small PR so that lane E can build on it the same day.
   - **Order.** Stage 2 precedes L5 step 3 (`CheckRun`), and L5 step 1 (`InstReq`) precedes stage 5,
     so the id-vector instance key reads `InstReq`.
 
+
+### 3.2 Status, and the revised stages 3–5 (2026-11-15)
+
+**Landed**
+| stage | PR | what |
+|---|---|---|
+| 0 | #8076 | `compiler/intern.vl` |
+| 1 (1a–1d) | #8098 | binder slots |
+| 2a | #8109 | the three pin writers |
+| 2b API | #8155 | `tyOpen`, `declKeyOf` |
+| 2b | #8162 | the hole column |
+| 2c-1 | #8197 | hole union; three D16301 traps run |
+| 3a | this PR | every arena read goes through `tyAt` |
+
+Stage 1e is deferred to L1, as §3.1 records.
+
+**Why the 2c-2 deletions moved to stages 3 and 4.** The 10 bumps that remain sit on in-place
+writes to `nInner`, `fnRet`, `fnParamTypes`, `objFieldTypes` and `objFieldNames`. Each of those
+fields has 400–835 reads, so moving one into the hole column, as 2b did for collection children,
+costs about +250 lines. Even with every write gone, the 40 epoch-stamped memos keyed by row index
+would still need the epoch. So the bumps cannot delete before the memos re-key.
+
+**Forwarding is not immutability.**
+- `tyFwd`, forwarding an old index to a newly minted row, was considered and dropped.
+- The old id keeps its old content as its intern key while `tyAt` shows the new content, so it is
+  in-place mutation under another name.
+- Truly freezing a patched row means re-pointing every table that holds its id.
+
+**Revised plan: intern at seal, not at mint.**
+- **3b, the canon pass.**
+  - When checking ends, and per mono instance, one pass computes `tyCanon[ix]`.
+  - That is a content-addressed id for every row, built bottom-up through `compiler/intern.vl`,
+    with nominal cuts for cycles.
+  - It runs first as a shadow beside today's emit-side comparers (`tySameSpelled`, `tySameSet`,
+    `tyCanonKey`), with an agreement count.
+- **3c and the emit side of stage 4.**
+  - The emit memos switch to `tyCanon` ids, which never change after the seal.
+  - That deletes the 27 emit-side epoch reads and their stamp columns, and the emit-side comparers
+    and string keys.
+  - Lane E's `repOf` keys on `tyCanon`.
+- **Stage 5.** Instance keys become `tyCanon` id vectors, as §2.6 describes.
+- **The checker side waits for L2.** The checker keeps structural `tyEq` and `tySame` while it is
+  still constructing types. The `tyEq`/`tySame` families and the checker's 13 epoch reads delete
+  when L2's inferred interfaces end in-place patching.
+
+**Expected deletions**
+- Emit side, stages 3–5: about −400 to −600 lines.
+- Checker side, with L2: about −350.
+
 ## 4. Measured cost
 
 ### 4.1 Today

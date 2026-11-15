@@ -105,6 +105,8 @@ import { valueTailSplit } from "./check_num_adopt"
 import { collectRetValues } from "./check_nj_join"
 import { rcwInferredRetTy } from "./check_rcw"
 import {
+  ftArgIsParam,
+  ftParamOnlyCalledAt,
   holeSetFitsRetAt,
   holeSetSplitsAt,
   tErr,
@@ -127,8 +129,12 @@ import {
   TyVar,
   mkArrayTy,
   tyAt,
+  tyElemOf,
+  tyElemOpen,
   tyFieldTyOf,
+  tyKeyOf,
   tySame,
+  tyValOf,
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
 import { nonNullTy, tyHasTyVar, tyReachesHole } from "./tyquery"
@@ -643,7 +649,9 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   while ww + 1 < ftWrittenWhole.length {
     const hr = fnTagHeldRepOf(ftWrittenWhole[ww + 1])
     const ho = if hr >= 0 && hr < T.tys.length { tyAt(hr) } else { null }
-    if ho is TyArray { fnTagHeldWrittenInner(ftWrittenWhole[ww], ho.aElem, 0) }
+    if ho is TyArray {
+      fnTagHeldWrittenInner(ftWrittenWhole[ww], tyElemOf(ho), 0)
+    }
     ww = ww + 2
   }
   // A record literal of an inner list is built at that list's record, so it shares its row.
@@ -1375,7 +1383,7 @@ function ftTyVarShaped(t: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return ftTyVarShaped(n.aElem, depth + 1)
+      return ftTyVarShaped(tyElemOf(n), depth + 1)
     }
     // A closed kind, or one a type variable inside does not shape alone.
     TyNullable | TyNeg | TyMap | TyObj | TyUnion | TyFunc | TyPrim | TyErr | TyLit => {
@@ -1455,37 +1463,6 @@ function ftLamArgOk(ci: i32, x: i32, s: i32): boolean {
   at.length > 0
 }
 
-// Whether parameter `q` is read under `body`, and only as the callee of positional calls of `n`
-// arguments whose types are closed and match `at`'s, which the first such call fills.
-function ftParamOnlyCalledAt(body: i32, q: i32, n: i32, at: i32[]): boolean {
-  let reads = 0
-  let calls = 0
-  const todo: i32[] = [body]
-  while todo.length > 0 {
-    const y = todo.pop() ?? -1
-    if y >= 0 && y < P.nodes.length {
-      const yn = nodeAt(y)
-      if yn is Ident && identDeclOf(y) == q { reads = reads + 1 }
-      if yn is Call && identDeclOf(parenPeelIx(yn.callFn)) == q {
-        calls = calls + 1
-        if yn.callArgs.length != n || !ftArgIsParam(yn, n - 1) && n > 0 {
-          return false
-        }
-        let k = 0
-        while k < n {
-          const t = nodeTyIxOf(yn.callArgs[k])
-          if t < 0 || t >= T.tys.length || !elabTyClosed(t, 0) { return false }
-          if at.length < n { at.push(t) }
-          else if !tySame(at[k], t) { return false }
-          k = k + 1
-        }
-      }
-      nodeChildrenPush(y, todo)
-    }
-  }
-  calls > 0 && reads == calls
-}
-
 // Whether `b` is a plain `=`.
 function ftIsStore(b: BinExpr): boolean {
   b.binOp == "=" && b.binCompound == ""
@@ -1517,11 +1494,11 @@ function ftSlotWriteSet(c: Call, x: i32): i32 {
   const h = tyAt(ht)
   match h {
     TyArray => {
-      return if fn.memProp == "push" { fnTagSetOfTy(h.aElem) } else { -1 }
+      return if fn.memProp == "push" { fnTagSetOfTy(tyElemOf(h)) } else { -1 }
     }
     TyMap => {
       const isVal = c.callArgs.length == 2 && c.callArgs[1] == x
-      return if fn.memProp == "set" && isVal { fnTagSetOfTy(h.mVal) } else { -1 }
+      return if fn.memProp == "set" && isVal { fnTagSetOfTy(tyValOf(h)) } else { -1 }
     }
     // Only a list's `push` and a map's `set` write a slot.
     TyObj | TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
@@ -1567,7 +1544,7 @@ function ftOtherTail(x: i32, p: i32, g: i32, fn: i32, s: i32, ds: i32[]): i32 {
     if lt < 0 || lt >= T.tys.length { return -1 }
     const at = tyAt(lt)
     if !(at is TyArray) { return -1 }
-    const o = fnTagSetOfTy(at.aElem)
+    const o = fnTagSetOfTy(tyElemOf(at))
     if o == s { return -1 }
     return o
   }
@@ -1741,7 +1718,7 @@ function ftScan(
         const hk = ftHoldKind(xti, s, FT_HOLD_DEPTH)
         const rec = hk == 6 && xt is TyArray || hk == 8 && xt is TyMap
         // A list's or a map's record slot takes the written record's fields as its own.
-        const recTy = if xt is TyArray { xt.aElem } else if xt is TyMap { xt.mVal } else { -1 }
+        const recTy = if xt is TyArray { tyElemOf(xt) } else if xt is TyMap { tyValOf(xt) } else { -1 }
         // A map's entry literal, a record or a list of records, is built at the map's value row.
         if (
           rec
@@ -1917,19 +1894,6 @@ function ftHandsBack(d: i32, c: Call, s: i32): boolean {
   false
 }
 
-// Whether argument `i` of call `c` is parameter `i`: positional, unnamed, with no spread at or
-// before it.
-function ftArgIsParam(c: Call, i: i32): boolean {
-  if i < 0 || i >= c.callArgs.length { return false }
-  if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
-  let j = 0
-  while j <= i {
-    if nodeAt(parenPeelIx(c.callArgs[j])) is Spread { return false }
-    j = j + 1
-  }
-  true
-}
-
 // Whether `x` is a function name or lambda whose type holds set `s` in a parameter or result.
 function ftSigValue(x: i32, s: i32): boolean {
   const n = nodeAt(x)
@@ -2086,7 +2050,7 @@ function ftLitAnnotAt(x: i32): i32 {
         if t < 0 || t >= T.tys.length { return -1 }
         const tt = tyAt(t)
         if !(tt is TyArray) { return -1 }
-        t = tt.aElem
+        t = tyElemOf(tt)
         k = k + 1
       }
       return t
@@ -2494,7 +2458,7 @@ function ftInnerLeaves(
   if x < 0 || x >= P.nodes.length || t < 0 || t >= T.tys.length { return false }
   const n = nodeAt(x)
   const tt = tyAt(t)
-  if !(n is ArrayLit) || !(tt is TyArray) || fnTagSetOfTy(tt.aElem) != s {
+  if !(n is ArrayLit) || !(tt is TyArray) || fnTagSetOfTy(tyElemOf(tt)) != s {
     return false
   }
   if !ftValuesOk(n.arrElems, s, ds, leaves, ids) { return false }
@@ -2585,7 +2549,7 @@ function ftRecWriteJoins(
       ftRespineTy.push(dst)
     }
     for el in ln.arrElems {
-      if !ftRecWriteJoins(el, dt.aElem, s, ds, leaves, ids, depth + 1) {
+      if !ftRecWriteJoins(el, tyElemOf(dt), s, ds, leaves, ids, depth + 1) {
         return false
       }
     }
@@ -2641,7 +2605,9 @@ function ftMapEntryLitJoins(
   const t = tyAt(vt)
   if n is ArrayLit && t is TyArray {
     for el in n.arrElems {
-      if !ftMapEntryLitJoins(el, t.aElem, s, ds, leaves, ids) { return false }
+      if !ftMapEntryLitJoins(el, tyElemOf(t), s, ds, leaves, ids) {
+        return false
+      }
     }
   } else if !ftRecWriteJoins(vx, vt, s, ds, leaves, ids, 0) {
     return false
@@ -2656,8 +2622,8 @@ function ftMapEntryLitJoins(
 // The element of list type `t` where that element is a function of set `s`, else -1.
 function ftListElemOfSet(t: i32, s: i32): i32 {
   const o = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-  if o is TyArray && o.aElem >= 0 && fnTagSetOfTy(o.aElem) == s {
-    o.aElem
+  if o is TyArray && !tyElemOpen(o) && fnTagSetOfTy(tyElemOf(o)) == s {
+    tyElemOf(o)
   } else {
     -1
   }
@@ -3551,7 +3517,7 @@ function ftTyParamOfHeldList(
     if qt is TypeRef && qt.tyName == tn.tyName + "[]" {
       const t = nodeTyIxOf(args[k])
       const h = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-      if h is TyArray && fnTagSetOfTy(h.aElem) == s { return true }
+      if h is TyArray && fnTagSetOfTy(tyElemOf(h)) == s { return true }
     }
     k = k + 1
   }
@@ -3677,8 +3643,10 @@ function ftStoreIntoHandedSet(
   const t = nodeTyIxOf(c.callArgs[j])
   if t < 0 || t >= T.tys.length { return false }
   const h = tyAt(t)
-  if cm.memProp == "push" && h is TyArray { return fnTagSetOfTy(h.aElem) == s }
-  if cm.memProp == "set" && h is TyMap { return fnTagSetOfTy(h.mVal) == s }
+  if cm.memProp == "push" && h is TyArray {
+    return fnTagSetOfTy(tyElemOf(h)) == s
+  }
+  if cm.memProp == "set" && h is TyMap { return fnTagSetOfTy(tyValOf(h)) == s }
   false
 }
 
@@ -4346,7 +4314,9 @@ function ftLitJoin(
       const ek = ftHoldKind(nodeTyIxOf(el), s, FT_HOLD_DEPTH)
       if ek == 1 || ek == 4 {
         if !ftInnerLit(parenPeelIx(el)) { return false }
-      } else if !ftInnerLeaves(parenPeelIx(el), at.aElem, s, ds, leaves, ids) {
+      } else if (
+        !ftInnerLeaves(parenPeelIx(el), tyElemOf(at), s, ds, leaves, ids)
+      ) {
         return false
       }
     }
@@ -4365,13 +4335,15 @@ function ftLitJoin(
   // signature runs every member.
   if ftHoldKind(lt, s, FT_HOLD_DEPTH) == 6 && fnTagSetSplits(s) {
     for el in n.arrElems {
-      if !ftRecWriteJoins(el, at.aElem, s, ds, leaves, ids, 0) { return false }
+      if !ftRecWriteJoins(el, tyElemOf(at), s, ds, leaves, ids, 0) {
+        return false
+      }
     }
     return true
   }
-  if fnTagSetOfTy(at.aElem) != s { return true }
+  if fnTagSetOfTy(tyElemOf(at)) != s { return true }
   for el in n.arrElems {
-    if !ftIsS(el, s) && !ftJoinAt(el, at.aElem, s, ds, leaves, ids) {
+    if !ftIsS(el, s) && !ftJoinAt(el, tyElemOf(at), s, ds, leaves, ids) {
       return false
     }
   }
@@ -4385,7 +4357,7 @@ function ftMapElemOk(el: i32, s: i32): boolean {
   const ek = ftHoldKind(et, s, FT_HOLD_DEPTH)
   if ek == 3 || ek == 7 { return true }
   const em = if et >= 0 && et < T.tys.length { tyAt(et) } else { null }
-  const es = if em is TyMap { fnTagSetOfTy(em.mVal) } else { -1 }
+  const es = if em is TyMap { fnTagSetOfTy(tyValOf(em)) } else { -1 }
   if es < 0 || es == s || !ftSetWithin(es, s) { return false }
   if !i32ListHas(ftSubNeed, es) { ftSubNeed.push(es) }
   true
@@ -4544,8 +4516,8 @@ function ftHoldKind(t: i32, s: i32, depth: i32): i32 {
   const a = tyAt(t)
   match a {
     TyArray => {
-      if fnTagSetOfTy(a.aElem) == s { return 1 }
-      const ek = ftHoldKind(a.aElem, s, depth - 1)
+      if fnTagSetOfTy(tyElemOf(a)) == s { return 1 }
+      const ek = ftHoldKind(tyElemOf(a), s, depth - 1)
       if ek == 1 || ek == 4 { return 4 }
       if ek == 2 || ek == 6 { return 6 }
       if ek == 3 || ek == 7 { return 7 }
@@ -4559,8 +4531,8 @@ function ftHoldKind(t: i32, s: i32, depth: i32): i32 {
       return 0
     }
     TyMap => {
-      if fnTagSetOfTy(a.mVal) == s { return 3 }
-      const vk = ftHoldKind(a.mVal, s, depth - 1)
+      if fnTagSetOfTy(tyValOf(a)) == s { return 3 }
+      const vk = ftHoldKind(tyValOf(a), s, depth - 1)
       if vk == 1 || vk == 4 { return 5 }
       if vk == 2 || vk == 6 || vk == 8 { return 8 }
       return 0
@@ -4587,7 +4559,7 @@ function ftMapEntryOf(x: i32, s: i32): i32 {
   const mk = if mt >= 0 && mt < T.tys.length { ftHoldKind(mt, s, FT_HOLD_DEPTH) } else { 0 }
   if mk != 5 && mk != 8 { return -1 }
   const m = tyAt(mt)
-  if m is TyMap { return m.mVal }
+  if m is TyMap { return tyValOf(m) }
   -1
 }
 
@@ -4653,10 +4625,10 @@ function ftSlotTyOf(ht: i32, s: i32): i32 {
   const h = tyAt(ht)
   match h {
     TyArray => {
-      return h.aElem
+      return tyElemOf(h)
     }
     TyMap => {
-      return h.mVal
+      return tyValOf(h)
     }
     // ftHoldKind names a list or a map at kinds 1 and 3.
     TyObj | TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
@@ -4774,7 +4746,7 @@ function ftParamHolderHolds(h: i32, s: i32, fd: i32): boolean {
   for a in args {
     const t = nodeTyIxOf(a)
     const at = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-    const slot = if at is TyArray { at.aElem } else if at is TyMap { at.mVal } else { -1 }
+    const slot = if at is TyArray { tyElemOf(at) } else if at is TyMap { tyValOf(at) } else { -1 }
     // A slot of records holding `s` takes a record literal of the set's ids.
     const sk = ftHoldKind(slot, s, FT_HOLD_DEPTH)
     const o = if sk == 2 { s } else { fnTagSetOfTy(slot) }
@@ -4823,7 +4795,7 @@ function ftMapSetValTy(c: Call, x: i32, s: i32): i32 {
   const mk = if mt >= 0 && mt < T.tys.length { ftHoldKind(mt, s, FT_HOLD_DEPTH) } else { 0 }
   if mk != 5 && mk != 8 { return -1 }
   const m = tyAt(mt)
-  if m is TyMap { return m.mVal }
+  if m is TyMap { return tyValOf(m) }
   -1
 }
 
@@ -5049,8 +5021,8 @@ function ftTySetsHeld(t: i32, out: i32[], depth: i32) {
   if depth <= 0 || t < 0 || t >= T.tys.length { return 0 }
   const a = tyAt(t)
   const parts: i32[] = []
-  if a is TyArray { parts.push(a.aElem) }
-  if a is TyMap { parts.push(a.mVal) }
+  if a is TyArray { parts.push(tyElemOf(a)) }
+  if a is TyMap { parts.push(tyValOf(a)) }
   if a is TyObj {
     for f in a.objFieldTypes { parts.push(f) }
   }
@@ -5166,7 +5138,7 @@ function ftTyParamListTakes(cx: i32, x: i32, s: i32): boolean {
       if k >= args.length { return false }
       const t = nodeTyIxOf(args[k])
       const h = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-      const at = if qt.tyName == tp { t } else if h is TyArray { h.aElem } else { -1 }
+      const at = if qt.tyName == tp { t } else if h is TyArray { tyElemOf(h) } else { -1 }
       if fnTagSetOfTy(at) != s { return false }
     }
     k = k + 1
@@ -5276,7 +5248,7 @@ function ftMapRecRep(m: i32, fd: i32): i32 {
   }
   const r = if d >= 0 { fnTagHeldRepOf(d) } else { -1 }
   const rm = if r >= 0 && r < T.tys.length { tyAt(r) } else { null }
-  if rm is TyMap { rm.mVal } else { -1 }
+  if rm is TyMap { tyValOf(rm) } else { -1 }
 }
 // Whether a destination of type `dst` takes the holder `x` of set `s` as it is: its own type, or a
 // record of the storage `x` is built at that holds `s` or a set decided with it, so the holder's
@@ -5294,10 +5266,12 @@ function ftDstTakes(dst: i32, x: i32, s: i32): boolean {
   if (
     dm is TyMap
     && xm is TyMap
-    && tySame(dm.mKey, xm.mKey)
-    && (fnTagSetOfTy(dm.mVal) == s
-      && (fnTagSetOfTy(xm.mVal) == s || ftSubsetNote(fnTagSetOfTy(xm.mVal), s))
-      || fnTagSetOfTy(xm.mVal) == s && ftSetDecidedWith(fnTagSetOfTy(dm.mVal), s))
+    && tySame(tyKeyOf(dm), tyKeyOf(xm))
+    && (fnTagSetOfTy(tyValOf(dm)) == s
+      && (fnTagSetOfTy(tyValOf(xm)) == s
+      || ftSubsetNote(fnTagSetOfTy(tyValOf(xm)), s))
+      || fnTagSetOfTy(tyValOf(xm)) == s
+      && ftSetDecidedWith(fnTagSetOfTy(tyValOf(dm)), s))
   ) {
     return true
   }
@@ -5335,7 +5309,7 @@ function ftRetMapSubsNote(fn: i32, s: i32) {
   for v in rv {
     const vt = nodeTyIxOf(v)
     const vm = if vt >= 0 && vt < T.tys.length { tyAt(vt) } else { null }
-    if vm is TyMap { ftSubsetNote(fnTagSetOfTy(vm.mVal), s) }
+    if vm is TyMap { ftSubsetNote(fnTagSetOfTy(tyValOf(vm)), s) }
   }
   0
 }
@@ -5350,7 +5324,7 @@ function ftJoinMapTailsNote(x: i32, s: i32) {
   for l in ls {
     const lt = nodeTyIxOf(l)
     const lm = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
-    if lm is TyMap { ftSubsetNote(fnTagSetOfTy(lm.mVal), s) }
+    if lm is TyMap { ftSubsetNote(fnTagSetOfTy(tyValOf(lm)), s) }
   }
   0
 }
@@ -5365,7 +5339,7 @@ function ftSubsetsNoteIn(t: i32, s: i32, depth: i32): boolean {
       ftSubsetNote(fnTagSetOfTy(t), s)
     }
     TyArray => {
-      ftSubsetsNoteIn(o.aElem, s, depth - 1)
+      ftSubsetsNoteIn(tyElemOf(o), s, depth - 1)
     }
     TyObj => {
       for f in o.objFieldTypes { ftSubsetsNoteIn(f, s, depth - 1) }
@@ -5380,24 +5354,24 @@ function ftSubsetsNoteIn(t: i32, s: i32, depth: i32): boolean {
 // carrying set `s` and `a`'s that set or one decided with it, or `a`'s carrying `s` and `b`'s a
 // set within it, which is then decided with `s`; or whose records store alike and hold a decided set.
 function ftListLeavesOfSet(a: i32, b: i32, s: i32, depth: i32): boolean {
-  const ao = if a >= 0 && a < T.tys.length { T.tys[a] } else { null }
-  const bo = if b >= 0 && b < T.tys.length { T.tys[b] } else { null }
+  const ao = if a >= 0 && a < T.tys.length { tyAt(a) } else { null }
+  const bo = if b >= 0 && b < T.tys.length { tyAt(b) } else { null }
   if !(ao is TyArray) || !(bo is TyArray) || depth <= 0 { return false }
-  const ae = if ao.aElem >= 0 && ao.aElem < T.tys.length { T.tys[ao.aElem] } else { null }
-  const be = if bo.aElem >= 0 && bo.aElem < T.tys.length { T.tys[bo.aElem] } else { null }
+  const ae = if !tyElemOpen(ao) && tyElemOf(ao) < T.tys.length { tyAt(tyElemOf(ao)) } else { null }
+  const be = if !tyElemOpen(bo) && tyElemOf(bo) < T.tys.length { tyAt(tyElemOf(bo)) } else { null }
   // A flat list of functions is its own type's or a decided set's (`ftHoldsDecided`).
   if ae is TyFunc && be is TyFunc {
     if depth == FT_HOLD_DEPTH { return false }
-    const as = fnTagSetOfTy(ao.aElem)
-    const bs = fnTagSetOfTy(bo.aElem)
+    const as = fnTagSetOfTy(tyElemOf(ao))
+    const bs = fnTagSetOfTy(tyElemOf(bo))
     return bs == s && ftSetDecidedWith(as, s) || as == s && ftSubsetNote(bs, s)
   }
   if ae is TyObj && be is TyObj {
-    return fieldStorageEq(ao.aElem, bo.aElem, REC_STORE_DEPTH)
-      && ftTyHoldsDecided(ao.aElem, s)
-      && ftSubsetsNoteIn(bo.aElem, s, FT_HOLD_DEPTH)
+    return fieldStorageEq(tyElemOf(ao), tyElemOf(bo), REC_STORE_DEPTH)
+      && ftTyHoldsDecided(tyElemOf(ao), s)
+      && ftSubsetsNoteIn(tyElemOf(bo), s, FT_HOLD_DEPTH)
   }
-  ftListLeavesOfSet(ao.aElem, bo.aElem, s, depth - 1)
+  ftListLeavesOfSet(tyElemOf(ao), tyElemOf(bo), s, depth - 1)
 }
 
 // Whether `x` is a statement of block `b` other than its last.
@@ -5490,7 +5464,7 @@ function ftListCallbackDst(c: Call, x: i32): i32 {
   if !(l is TyArray) || !(xf is TyFunc) || xf.fnParamTypes.length != 1 {
     return -1
   }
-  if xf.fnParamTypes[0] == l.aElem { return xt }
+  if xf.fnParamTypes[0] == tyElemOf(l) { return xt }
   -1
 }
 
@@ -5499,7 +5473,7 @@ function ftArrElemTy(p: i32): i32 {
   const t = nodeTyIxOf(p)
   if t < 0 || t >= T.tys.length { return -1 }
   const a = tyAt(t)
-  if a is TyArray { return a.aElem }
+  if a is TyArray { return tyElemOf(a) }
   -1
 }
 

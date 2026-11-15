@@ -2,12 +2,14 @@
 // any body is checked, the generic-constraint probe, then each declaration in order.
 
 import { declTyOf } from "./check_nar_store"
+import { i32ListHas } from "./listutil"
 import { declFnAliasSet } from "./check_scopes"
 import { globalInitRecordsFnSetsSet } from "./check_elab_cap"
 import {
   BoolLit,
   CharLit,
   FuncDecl,
+  Ident,
   LetDecl,
   NumLit,
   OP_INDEX_GET,
@@ -29,6 +31,7 @@ import {
   isBinOpDecl,
   isBodyTyDecl,
   nodeAt,
+  nodeChildrenPush,
   opDeclLabel,
   opDeclLabelBin,
   opDeclOpOf,
@@ -461,9 +464,14 @@ export function checkProgramNode(n: Program) {
   }
   const done: boolean[] = []
   for _ in stmts { done.push(false) }
+  modLetNames = Map()
+  for st in stmts {
+    const sn = nodeAt(st)
+    if sn is LetDecl && sn.letKw == "let" { modLetNames[sn.letName] = true }
+  }
   let j = 0
   while j < stmts.length {
-    if !done[j] { progCheckCalleeFirst(stmts, j, stmtAt, done) }
+    if !done[j] { progCheckCalleeFirst(stmts, j, stmtAt, done, false) }
     j = j + 1
   }
   // A function whose return never resolved (a genuinely base-case-less recursive
@@ -495,18 +503,22 @@ function progCheckCalleeFirst(
   j: i32,
   stmtAt: {[i32]: i32},
   done: boolean[],
+  eagerIn: boolean,
 ) {
   done[j] = true
-  if nodeAt(stmts[j]) is FuncDecl {
-    for d in weFnRefs(stmts[j], opDeclAfter(j, stmtAt, done)) {
-      const k = stmtAt[d] ?? -1
-      crAskForSet(stmts[j])
-      const first = k > j
-        && !done[k]
-        && (retPending(d) || weSummaryUnsettled(d))
-      crAskForSet(-1)
-      if first { progCheckCalleeFirst(stmts, k, stmtAt, done) }
-    }
+  const eager = eagerIn || !(nodeAt(stmts[j]) is FuncDecl)
+  for d in weFnRefs(stmts[j], opDeclAfter(j, stmtAt, done)) {
+    const k = stmtAt[d] ?? -1
+    crAskForSet(stmts[j])
+    // A callee eager checking refuses still takes the source-order trigger, unless its own
+    // parameters or a module `let` it reads are the statement's to decide.
+    const all = eager && eagerCheckable(d, stmtAt, done, [])
+    const own = !all && k > j && (!eager || ownFactsStand(d))
+    const first = k >= 0
+      && !done[k]
+      && (all || (own && (retPending(d) || weSummaryUnsettled(d))))
+    crAskForSet(-1)
+    if first { progCheckCalleeFirst(stmts, k, stmtAt, done, all) }
   }
   cstrProbeBefore(stmts[j])
   markValDiscard(stmts[j])
@@ -522,6 +534,70 @@ function progCheckCalleeFirst(
   }
   daTopSettle(stmts[j], uninit)
   0
+}
+
+// Whether unchecked top-level function `d` may be checked ahead of the statement that names it:
+// no fact it needs comes from that statement. Not when a parameter is un-annotated (a call solves
+// it), it reads a module `let` (a later write narrows it), it is on a call cycle (the fixpoint
+// orders it), or a function it reaches unchecked may not.
+function eagerCheckable(
+  d: i32,
+  stmtAt: {[i32]: i32},
+  done: boolean[],
+  path: i32[],
+): boolean {
+  if i32ListHas(path, d) || path.length > 16 { return false }
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) { return false }
+  for p in fd.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { return false }
+  }
+  if readsModuleLet(fd.fnBody) { return false }
+  path.push(d)
+  for c in weFnRefs(d, false) {
+    const k = stmtAt[c] ?? -1
+    if (
+      c == d
+      || (k >= 0 && !done[k] && !eagerCheckable(c, stmtAt, done, path))
+    ) {
+      path.pop()
+      return false
+    }
+  }
+  path.pop()
+  true
+}
+
+// Whether top-level function `d` itself needs no fact from the statement that names it: every
+// parameter annotated and no module `let` read. Unlike `eagerCheckable`, it asks nothing of `d`'s callees.
+function ownFactsStand(d: i32): boolean {
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) { return false }
+  for p in fd.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { return false }
+  }
+  !readsModuleLet(fd.fnBody)
+}
+
+// The names of the module's `let` bindings, set before pass 2; `readsModuleLet` matches by name,
+// so a local of the same name only makes it answer true.
+let modLetNames: {[string]: boolean} = Map()
+
+// Whether the subtree at `root` names a module-scope `let` binding.
+function readsModuleLet(root: i32): boolean {
+  const todo: i32[] = [root]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix < 0 || ix >= P.nodes.length { continue }
+    const n = nodeAt(ix)
+    if n is Ident {
+      if modLetNames[n.identName] ?? false { return true }
+    }
+    nodeChildrenPush(ix, todo)
+  }
+  false
 }
 
 // Whether an operator declaration is a top-level statement after `j` not yet checked: only then can
@@ -593,6 +669,7 @@ function progRegisterTypeNames(stmts: i32[]) {
         // column. Master re-split the joined string inside `applyGenAliasArgs`,
         // i.e. once per APPLICATION of the alias; the list is a property of the
         // DECLARATION and cannot change between applications.
+        if sd0.tdNew == 1 { nwDeclNames.push(gBase) }
         const gps = declGpParamsOf(stmts[t0])
         gaParamStart.push(gaParamNames.length)
         gaParamCount.push(gps.length)
@@ -630,6 +707,7 @@ function progRegisterTypeNames(stmts: i32[]) {
       // its own union under the parameter bindings (`applyGenAliasTys`).
       gaNames.push(declGpBaseOf(stmts[t0]))
       gaDeclIxs.push(stmts[t0])
+      if sd0.udNew == 1 { nwDeclNames.push(declGpBaseOf(stmts[t0])) }
       const ugps = declGpParamsOf(stmts[t0])
       gaParamStart.push(gaParamNames.length)
       gaParamCount.push(ugps.length)

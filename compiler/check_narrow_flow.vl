@@ -112,6 +112,7 @@ import {
   crCapRecDepths,
   crCapRecFns,
   crCapRecHandles,
+  crCapRecPlaces,
   crCapRecSlots,
   crCapRecTys,
   crCapWidenBank,
@@ -287,6 +288,7 @@ import {
   inferRetLogLit,
   inferRetLogSeed,
   inferRetLogTy,
+  onInferStack,
 } from "./check_infer_rows"
 import {
   ALIAS_RULE_BROAD,
@@ -420,6 +422,7 @@ import {
   crLoopRdSlots,
   crMayBeWritten,
   crNameAssigned,
+  crNoteLoopRead,
   crRetire,
   crRetireAt,
   crSubtreeAssigns,
@@ -550,6 +553,8 @@ import {
   narDefTy,
   narDefTyPop,
   narDeferJoin,
+  neverIsRefusedNow,
+  neverIsSeenNote,
   openKeyReadIx,
   openKeyTyAt,
   openReadHas,
@@ -603,6 +608,7 @@ import {
   writeLandNestedTy,
 } from "./check_type_shape"
 import {
+  RET_PENDING,
   T,
   TY_ERR,
   TY_I32,
@@ -625,9 +631,12 @@ import {
   objFieldType,
   tyAt,
   tyBearsNull,
+  tyElemOf,
+  tyElemOpen,
   tyFieldTyOf,
   tyHasHole,
   tyIsHole,
+  tyKeyOpen,
   tyMemberWithin,
   tyPinElem,
   tyPinKey,
@@ -635,6 +644,8 @@ import {
   tySame,
   tyToStr,
   tyToStrUser,
+  tyValOf,
+  tyValOpen,
 } from "./check_types"
 import { mkUnionTy } from "./check_union_mint"
 import { isWideLitJoin } from "./check_wide_lits"
@@ -1011,7 +1022,7 @@ function arrDefHoleToI32(ty: i32) {
   if !arrDefRowIsCall(ty) { return false }
   const t = tyAt(ty)
   if t is TyArray {
-    if t.aElem < 0 {
+    if tyElemOpen(t) {
       arrDefPinHoleElem(ty)
       return true
     }
@@ -1108,8 +1119,8 @@ function idxStoreNote(ix: i32, st: i32, rows: i32[], elems: i32[]) {
   if v < 0 || !(n is BinExpr) { return 0 }
   const d = idxStoreDstRow(n.binLeft)
   const vt = tyAt(v)
-  if d >= 0 && vt is TyArray && vt.aElem >= 0 {
-    const el = if tyHasHole(vt.aElem) { -2 } else { vt.aElem }
+  if d >= 0 && vt is TyArray && !tyElemOpen(vt) {
+    const el = if tyHasHole(tyElemOf(vt)) { -2 } else { tyElemOf(vt) }
     let k = 0
     while k < rows.length && rows[k] != d { k = k + 1 }
     if k == rows.length {
@@ -1131,7 +1142,7 @@ function idxStoreHolePin(lit: i32, d: i32, rows: i32[], elems: i32[]) {
   if !(lt is TyArray) { return 0 }
   const dt = tyAt(d)
   if !(dt is TyArray) { return 0 }
-  let el = if dt.aElem >= 0 && !tyHasHole(dt.aElem) { dt.aElem } else { -1 }
+  let el = if !tyElemOpen(dt) && !tyHasHole(tyElemOf(dt)) { tyElemOf(dt) } else { -1 }
   if el < 0 {
     let k = 0
     while k < rows.length && rows[k] != d { k = k + 1 }
@@ -1159,7 +1170,7 @@ export function asgReadElemPin(exprIx: i32, vt: i32) {
     if nodeTyIxOf(e.idxArr) != asgOpenElemRow { return -1 }
     const t = tyAt(asgOpenElemRow)
     if t is TyArray {
-      if t.aElem >= 0 { return -1 }
+      if !tyElemOpen(t) { return -1 }
       tyPinElem(t, widenLitTy(vt))
       // The read's recorded type is `resolveOpenElemReads`'s. A compound store's read is also
       // its write target, which `checkIndexNode` does not bank, so it is banked here.
@@ -1179,14 +1190,14 @@ export function arrDefPinHoleElem(ty: i32) {
   resolveHoleLinks()
   const t = tyAt(ty)
   if t is TyArray {
-    if t.aElem < 0 {
+    if tyElemOpen(t) {
       // A literal-union element is stored at its base primitive, whose zero the intrinsic
       // writes; the `i32` default only when no callee wrote the row.
       let el = litMembersBaseTy(calleeWrittenElem(ty))
       if el < 0 { el = TY_I32 }
       tyPinElem(t, el)
     }
-    return t.aElem
+    return tyElemOf(t)
   }
   -1
 }
@@ -1212,7 +1223,7 @@ function calleeWritePin(ty: i32): boolean {
   if ty < 0 { return false }
   const t = tyAt(ty)
   if t is TyArray {
-    if t.aElem >= 0 { return false }
+    if !tyElemOpen(t) { return false }
     const el = calleeWrittenElem(ty)
     if el < 0 { return false }
     tyPinElem(t, el)
@@ -1228,11 +1239,11 @@ export function settleOpenUnionRows() {
   for r in openUnionRows {
     if unresolvedHole(r) {
       const t = tyAt(r)
-      if t is TyArray && t.aElem < 0 {
+      if t is TyArray && tyElemOpen(t) {
         tyPinElem(t, unboundDefaultTy())
       } else if t is TyMap {
-        if t.mKey < 0 { tyPinKey(t, unboundDefaultTy()) }
-        if t.mVal < 0 { tyPinVal(t, unboundDefaultTy()) }
+        if tyKeyOpen(t) { tyPinKey(t, unboundDefaultTy()) }
+        if tyValOpen(t) { tyPinVal(t, unboundDefaultTy()) }
       }
       noteSettledRow(r)
     }
@@ -1262,7 +1273,9 @@ function defaultOpenHoles(ty: i32, depth: i32, apply: boolean): boolean {
   const t = tyAt(ty)
   match t {
     TyArray => {
-      if t.aElem >= 0 { return defaultOpenHoles(t.aElem, depth - 1, apply) }
+      if !tyElemOpen(t) {
+        return defaultOpenHoles(tyElemOf(t), depth - 1, apply)
+      }
       if openReadHas(ty) { return true }
       if apply {
         tyPinElem(t, unboundDefaultTy())
@@ -1271,21 +1284,21 @@ function defaultOpenHoles(ty: i32, depth: i32, apply: boolean): boolean {
       false
     }
     TyMap => {
-      if t.mKey < 0 || t.mVal < 0 {
+      if tyKeyOpen(t) || tyValOpen(t) {
         if openReadHas(ty) { return true }
         if apply {
-          if t.mKey < 0 {
+          if tyKeyOpen(t) {
             const rk = openKeyReadIx(ty)
             tyPinKey(
               t,
               if rk >= 0 { openKeyTyAt(rk) } else { unboundDefaultTy() },
             )
           }
-          if t.mVal < 0 { tyPinVal(t, unboundDefaultTy()) }
+          if tyValOpen(t) { tyPinVal(t, unboundDefaultTy()) }
           noteSettledRow(ty)
         }
       }
-      defaultOpenHoles(t.mVal, depth - 1, apply)
+      defaultOpenHoles(tyValOf(t), depth - 1, apply)
     }
     TyObj => {
       let read = false
@@ -1326,12 +1339,12 @@ export function defaultReadOnlyContainer(ty: i32): boolean {
   if arrDefRowIsCall(ty) { return false }
   const t = tyAt(ty)
   if t is TyArray {
-    if t.aElem >= 0 { return false }
+    if !tyElemOpen(t) { return false }
     tyPinElem(t, unboundDefaultTy())
   } else if t is TyMap {
-    if t.mKey >= 0 && t.mVal >= 0 { return false }
-    if t.mVal < 0 { tyPinVal(t, unboundDefaultTy()) }
-    if t.mKey < 0 { readOnlyKeyRows.push(ty) }
+    if !tyKeyOpen(t) && !tyValOpen(t) { return false }
+    if tyValOpen(t) { tyPinVal(t, unboundDefaultTy()) }
+    if tyKeyOpen(t) { readOnlyKeyRows.push(ty) }
   } else {
     return false
   }
@@ -1345,7 +1358,7 @@ export function pinReadKey(row: i32, kt: i32) {
     return 0
   }
   const t = tyAt(row)
-  if t is TyMap && t.mKey < 0 { tyPinKey(t, kt) }
+  if t is TyMap && tyKeyOpen(t) { tyPinKey(t, kt) }
   0
 }
 
@@ -1457,10 +1470,10 @@ function tyHoldsOpenMap(ty: i32, depth: i32): boolean {
   if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
   const t = tyAt(ty)
   match t {
-    TyMap => t.mKey < 0 || t.mVal < 0 || tyHoldsOpenMap(t.mVal, depth - 1)
+    TyMap => tyKeyOpen(t) || tyValOpen(t) || tyHoldsOpenMap(tyValOf(t), depth - 1)
     TyFunc => tyHoldsOpenMap(t.fnRet, depth - 1)
     TyNullable => tyHoldsOpenMap(t.nInner, depth - 1)
-    TyArray => tyHoldsOpenMap(t.aElem, depth - 1)
+    TyArray => tyHoldsOpenMap(tyElemOf(t), depth - 1)
     TyObj => {
       for f in t.objFieldTypes {
         if tyHoldsOpenMap(f, depth - 1) { return true }
@@ -1479,15 +1492,15 @@ function pinCalleeWrittenLists(ty: i32, depth: i32) {
   const t = tyAt(ty)
   match t {
     TyArray => {
-      if t.aElem < 0 {
+      if tyElemOpen(t) {
         calleeWritePin(ty)
       } else {
-        pinCalleeWrittenLists(t.aElem, depth - 1)
+        pinCalleeWrittenLists(tyElemOf(t), depth - 1)
       }
     }
     TyFunc => pinCalleeWrittenLists(t.fnRet, depth - 1)
     TyNullable => pinCalleeWrittenLists(t.nInner, depth - 1)
-    TyMap => pinCalleeWrittenLists(t.mVal, depth - 1)
+    TyMap => pinCalleeWrittenLists(tyValOf(t), depth - 1)
     // No other row holds a list the argument built.
     TyPrim | TyErr | TyObj | TyUnion | TyVar | TyLit | TyNeg => {}
   }
@@ -2048,7 +2061,7 @@ function placeReadStoreTy(ix: i32): i32 {
     const rt = placeCurTy(n.idxArr, noPlaces, noTys)
     if rt >= 0 {
       const rm = tyAt(rt)
-      if rm is TyMap { return mkNullableTy(rm.mVal) }
+      if rm is TyMap { return mkNullableTy(tyValOf(rm)) }
     }
   }
   placeStoreTy(ix)
@@ -2196,7 +2209,7 @@ function mapCellStaysPresent(p: i32) {
   const m = tyAt(nt)
   if m is TyMap {
     npKeysPush(p)
-    npTysPush(m.mVal)
+    npTysPush(tyValOf(m))
     npInvByPush(-1)
     npEpochsPush(narFnEpoch)
     npSettlePush(-2)
@@ -2742,8 +2755,15 @@ export function letFnWriteNarrows(s: i32, dcl: i32, m: i32): boolean {
     ) {
       return false
     }
-    const fti = nodeTyIxOf(f)
+    // A declaration below the write has no record yet: its hoisted signature stands for it,
+    // with a pending result inferred now, as a forward call infers its callee's.
+    const rec = nodeTyIxOf(f)
+    const fti = if rec >= 0 { rec } else { declTyOf(f) }
     if fti < 0 || fti >= T.tys.length { return false }
+    const pend = tyAt(fti)
+    if pend is TyFunc && pend.fnRet == RET_PENDING && !onInferStack(fn.fnName) {
+      checkNodeHook(f)
+    }
     const ft = tyAt(fti)
     if ft is TyFunc && ft.fnRet == TY_VOID { voids = voids + 1 }
   }
@@ -2901,8 +2921,44 @@ export function crNoteCaptureRead(p: i32) {
   if nf >= 2 && slot >= crFnNpBases[nf - 2] {
     if crCallbackKeeps(crFnIxs[crFnIxs.length - 1], p, key) { return 0 }
   }
+  // A reader its parent calls only by handle is checked at each call, as a bare name is (D16380).
+  const parentBase = if nf >= 2 { crFnNpBases[nf - 2] } else { 0 }
+  if nf >= 1 && slot >= parentBase && crPathCapRec(p, slot) { return 0 }
   if npCapBy[slot] < 0 { npCapBySetAt(slot, crFnIxs[crFnIxs.length - 1]) }
   0
+}
+
+// Records the innermost nested function as a reader of path place `p`, narrowed in its parent as
+// overlay slot `slot`, for `crCapRecCheck`; false when it has no handle, escapes, or writes the path.
+function crPathCapRec(p: i32, slot: i32): boolean {
+  const fx = crFnIxs[crFnIxs.length - 1]
+  const hd = crLambdaHandle(fx)
+  if hd < 0 || crLambdaEscapes(fx) != 0 { return false }
+  const fd = nodeAt(fx)
+  if !(fd is FuncDecl) || crSubtreeAssigns(fd.fnBody, npKeys[slot]) {
+    return false
+  }
+  if crFirstWritingCall(fd.fnBody, p, npKeys[slot]) >= 0 { return false }
+  const d = crFnBases.length - 1
+  let r = 0
+  while r < crCapRecHandles.length {
+    if (
+      crCapRecHandles[r] == hd
+      && crCapRecPlaces[r] == p
+      && crCapRecDepths[r] == d
+    ) {
+      return true
+    }
+    r = r + 1
+  }
+  crCapRecDepths.push(d)
+  crCapRecHandles.push(hd)
+  crCapRecCount[hd] = (crCapRecCount[hd] ?? 0) + 1
+  crCapRecSlots.push(-1)
+  crCapRecTys.push(npTys[slot])
+  crCapRecFns.push(fx)
+  crCapRecPlaces.push(p)
+  true
 }
 
 // A read of a path whose captured narrowing `crPathCaptureLost` dropped, for the note a refusal
@@ -3141,7 +3197,7 @@ export function narListDeliveryErr(
     if !(da is TyArray) { return false }
     let hit = false
     for e in s.arrElems {
-      if narListDeliveryErr(e, nodeTyOf(e), da.aElem) { hit = true }
+      if narListDeliveryErr(e, nodeTyOf(e), tyElemOf(da)) { hit = true }
     }
     return hit
   }
@@ -3456,6 +3512,7 @@ export function crCaptureWiden(fnIx: i32) {
             crCapRecSlots.push(s)
             crCapRecTys.push(declTyOf(s))
             crCapRecFns.push(fnIx)
+            crCapRecPlaces.push(-1)
           } else {
             crDeclareWidened(s, wide)
             crCapWidenBank[fnIx] = i32ListWith(
@@ -3527,10 +3584,17 @@ export function crCapRecCheck(callIx: i32) {
   while r < crCapRecHandles.length {
     if crCapRecHandles[r] == hd && crCapRecDepths[r] == crFnBases.length {
       const cs = crCapRecSlots[r]
-      const nm = slotNameOf(cs)
-      if !tySame(declTyOf(cs), crCapRecTys[r]) {
+      const cp = crCapRecPlaces[r]
+      const nm = if cp >= 0 { placeText(cp) } else { slotNameOf(cs) }
+      const now = if cp >= 0 { narrowedPathTy(cp) } else { declTyOf(cs) }
+      // A call in a loop reads the path again on the next iteration, as a direct read does (D2403).
+      if cp >= 0 && now >= 0 && tySame(now, crCapRecTys[r]) {
+        crNoteLoopRead(cp, callIx)
+      }
+      if now < 0 || !tySame(now, crCapRecTys[r]) {
         let by = "a write"
-        if crMayBeWritten(cs) { by = "a call" }
+        if cp >= 0 { by = "a write or a call" }
+        else if crMayBeWritten(cs) { by = "a call" }
         tErrCoded(
           "'"
             + h
@@ -4694,6 +4758,12 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
           pushNarrowFact(isPl, tIdx, places, tys)
           return 0
         }
+        // A test the operand can never pass leaves its arm nothing: the operand reads as `never`.
+        neverIsSeenNote(condIx)
+        if neverIsRefusedNow(condIx) {
+          pushNarrowFact(isPl, TY_NEVER, places, tys)
+          return 0
+        }
         // A record test only one union member may pass by its fields' values narrows to that
         // member, the arm its minted check unboxes (`recPartFitBuild`, D4089).
         const partArm = recPartFitArm(isCur, tIdx)
@@ -4888,7 +4958,7 @@ function isTestMemberAnswer(m: i32, t: i32, depth: i32): i32 {
     return if k == 1 { 1 } else if k == 0 { 0 } else { -1 }
   }
   if mt is TyArray && tt is TyArray {
-    return isTestMemberAnswer(mt.aElem, tt.aElem, depth - 1)
+    return isTestMemberAnswer(tyElemOf(mt), tyElemOf(tt), depth - 1)
   }
   if mt is TyFunc && tt is TyFunc { return if tySame(m, t) { 1 } else { 0 } }
   -1

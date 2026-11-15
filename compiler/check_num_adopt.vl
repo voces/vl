@@ -23,16 +23,21 @@ import { nodeTyIx, nodeTyOf, nodeTySet } from "./check_node_tys"
 import {
   binFloatOperandPair,
   binIntOnlyOp,
+  cexCountBelow,
   cmpF32LitAdopts,
   isExactF64IntLitExpr,
   isF32AdoptingLitExpr,
-  isFloatLitExpr,
+  litTreeOps,
   litTreeWideTy,
   numLitDstTy,
   numLitOwnTy,
   numUnionMembersOf,
+  radixLitTreeAt,
 } from "./check_num_lits"
 import { parenPeelIx } from "./check_places"
+import { cexEvalAt } from "./check_num_lit_state"
+import { cexDecText, cexOk } from "./const_exact"
+import { numLexFitsI32 } from "./emit_bignum"
 import { mixesNumeric, widerNumeric } from "./check_ty_relate"
 import {
   isNumericPrimTy,
@@ -44,6 +49,8 @@ import {
 import {
   T,
   TY_BOOL,
+  TY_F64,
+  TY_I64,
   TyArray,
   TyLit,
   TyNullable,
@@ -52,6 +59,7 @@ import {
   TyUnion,
   objFieldType,
   tyAt,
+  tyElemOf,
   tyMapMinted,
   tyNumScalarBaseName,
   tySame,
@@ -83,11 +91,28 @@ export function numPairTy(n: BinExpr, a: i32, b: i32): i32 {
   TY_BOOL
 }
 
+// Whether `a op b` pairs an `f64` with a radix tree computed at 64 bits, which converts to the
+// `f64` (D16390).
+export function radixTreeF64Pair(n: BinExpr, a: i32, b: i32): boolean {
+  primNameOf(a) == "f64" && b == TY_I64 && radixLitTreeAt(n.binRight)
+    || primNameOf(b) == "f64" && a == TY_I64 && radixLitTreeAt(n.binLeft)
+}
+
+// Whether `a op b` is an integer shift, which is typed at its left operand: a count never types
+// it, whatever the count's own width (owner ruling Q8).
+export function shiftKeepsLeft(op: string, a: i32, b: i32): boolean {
+  if !binShiftOp(op) { return false }
+  const an = primNameOf(a)
+  const bn = primNameOf(b)
+  (an == "i32" || an == "i64") && (bn == "i32" || bn == "i64")
+}
+
 // The type both operands of `a op b` are brought to at one member pair, which is the result
 // for arithmetic, or -1 when the scalar rule refuses the pair.
 export function numPairOpTy(n: BinExpr, a: i32, b: i32): i32 {
   const op = n.binOp
   if numCmpOp(op) {
+    if radixTreeF64Pair(n, a, b) { return TY_F64 }
     if sameNumeric(a, b) { return a }
     if mixesNumeric(a, b) { return widerNumeric(a, b) }
     if !cmpF32LitAdopts(n, a, b) { return -1 }
@@ -95,10 +120,12 @@ export function numPairOpTy(n: BinExpr, a: i32, b: i32): i32 {
     return b
   }
   if binIntOnlyOp(op) && binFloatOperandPair(a, b) { return -1 }
+  if shiftKeepsLeft(op, a, b) { return a }
   if primNameOf(a) == "f32" && f32AdoptingOperand(n.binRight, a) { return a }
   if primNameOf(b) == "f32" && f32AdoptingOperand(n.binLeft, b) { return b }
   if primNameOf(a) == "f64" && isExactF64IntLitExpr(n.binRight) { return a }
   if primNameOf(b) == "f64" && isExactF64IntLitExpr(n.binLeft) { return b }
+  if radixTreeF64Pair(n, a, b) { return TY_F64 }
   if mixesNumeric(a, b) { return widerNumeric(a, b) }
   if sameNumeric(a, b) { return a }
   -1
@@ -147,7 +174,7 @@ export function valueTailSplit(ix: i32, spine: i32[], leaves: i32[]) {
 
 // Types each parenthesis the value `if`, `match` or block at `ix` yields a tail through as the
 // node it wraps, which the emitter reads in the tail's place once the tail adopted (D16371).
-function tailParensSync(ix: i32) {
+export function tailParensSync(ix: i32) {
   if inferQuiet { return 0 }
   const todo: i32[] = [ix]
   while todo.length > 0 {
@@ -200,25 +227,31 @@ export function f32LitTailsAdopt(srcExpr: i32, dstTy: i32): boolean {
       s = s + 1
     }
   }
+  tailParensSync(srcExpr)
   true
 }
 
-// Whether the value at `ix` is a float literal, or an `if`, `match` or block every tail of which
-// is one: the values a join beside an f32 value adopts f32 as.
-export function floatLitTails(ix: i32): boolean {
-  if isFloatLitExpr(ix) { return true }
+// Whether the value at `ix`, or every tail of a value `if`, `match` or block at it, is a numeric
+// literal the float `ft` takes beside a value of its type: at `f32` one an `f32` binding takes, at
+// `f64` one it holds exactly (owner ruling 4.3).
+export function litTailsTakeFloat(ix: i32, ft: i32): boolean {
+  if numLitOwnTy(ix) >= 0 { return litTakesFloat(ix, ft) }
   const lix = valueJoinAt(ix)
   if lix < 0 { return false }
   const spine: i32[] = []
   const leaves: i32[] = []
   valueTailSplit(lix, spine, leaves)
   if leaves.length == 0 { return false }
-  let i = 0
-  while i < leaves.length {
-    if !isFloatLitExpr(leaves[i]) { return false }
-    i = i + 1
+  for lf in leaves {
+    if !litTakesFloat(lf, ft) { return false }
   }
   true
+}
+
+// Whether the bare literal at `ix` is one the float `ft` takes, as `litTailsTakeFloat` reads it.
+export function litTakesFloat(ix: i32, ft: i32): boolean {
+  if primNameOf(ft) == "f32" { return isF32AdoptingLitExpr(ix) }
+  primNameOf(ft) == "f64" && numLitDstTy(ix, ft) >= 0
 }
 
 // What `numPairOpTy` reads of `n` (at node `ix`) beyond its operator: which operands are
@@ -306,6 +339,18 @@ function litTreeAdopt(ix: i32, ty: i32): i32 {
   if ix < nodeTyIx.length { nodeTySet(ix, ty) }
   const e = nodeAt(ix)
   if e is Paren { return litTreeAdopt(e.parInner, ty) }
+  // A value join of literal tails is built at the tree's width, its `if`s and parentheses too.
+  if e is IfStmt || e is MatchExpr || e is Block {
+    const spine: i32[] = []
+    const leaves: i32[] = []
+    valueTailSplit(ix, spine, leaves)
+    for l in leaves { litTreeAdopt(l, ty) }
+    for sp in spine {
+      if sp < nodeTyIx.length { nodeTySet(sp, ty) }
+    }
+    tailParensSync(ix)
+    return ty
+  }
   if e is Unary { return litTreeAdopt(e.unArg, ty) }
   if e is BinExpr {
     litTreeAdopt(e.binLeft, ty)
@@ -318,6 +363,32 @@ function litTreeAdopt(ix: i32, ty: i32): i32 {
     return litTreeAdopt(e.binRight, ty)
   }
   litTreeAdoptLeaf(ix, ty)
+}
+
+// Whether `ix` shifts a literal tree by a constant count of 32 to 63, which makes that untyped
+// operand an `i64` (owner ruling Q8, D16378).
+export function shiftWidensLit(ix: i32): boolean {
+  const e = nodeAt(parenPeelIx(ix))
+  if !(e is BinExpr) || !binShiftOp(e.binOp) || litTreeOps(e.binLeft, 32) < 0 {
+    return false
+  }
+  const cv = cexEvalAt(e.binRight, 0)
+  if !cexOk(cv) || cv.cxFloat || cv.cxNeg { return false }
+  const lex = cexDecText(cv)
+  numLexFitsI32(lex) && cexCountBelow(lex, 64) && !cexCountBelow(lex, 32)
+}
+
+// The left operand of the shift at `ix` built at `ty`: `i64` where its count widens it, `i32` at
+// an `i32` destination, where the count is then refused.
+export function shiftLitAdopt(ix: i32, ty: i32): i32 {
+  const sx = parenPeelIx(ix)
+  if sx < 0 || sx >= P.nodes.length { return ty }
+  const e = nodeAt(sx)
+  if !(e is BinExpr) || inferQuiet { return ty }
+  litTreeAdopt(e.binLeft, ty)
+  nodeTySet(sx, ty)
+  tailParensSync(ix)
+  ty
 }
 
 // A tree's other nodes are its literals (`litTreeOps` admits no other), each recorded so a
@@ -442,7 +513,8 @@ export function numLitAdoptTails(ix: i32, prim: i32) {
       if sp < nodeTyIx.length { nodeTySet(sp, prim) }
     }
   }
-  tailParensSync(lix)
+  // From `ix`: the parentheses around the whole join are read in its place too (D16374).
+  tailParensSync(ix)
 }
 
 // Types the parens and negations from `ix` down to its literal as `t`. Answers `t`.
@@ -481,7 +553,7 @@ export function numLitAdoptDeep(ix: i32, dstTy: i32, depth: i32): i32 {
   // literal is its own one part.
   const e = nodeAt(at)
   if e is IfStmt || e is MatchExpr || e is Block {
-    if stampsStand() { numLitAdoptDeepJoin(at, dstTy, depth) }
+    if stampsStand() { numLitAdoptDeepJoin(ix, dstTy, depth) }
     return 0
   }
   // A literal adopts from `ix`, so the parentheses around it are typed with it.
@@ -544,13 +616,13 @@ function numLitAdoptBody(ix: i32, dstTy: i32, depth: i32): i32 {
     const at = numSoleArm(dstTy, true)
     if at < 0 { return 0 }
     const a = tyAt(at)
-    if a is TyArray && tyHoldsNonI32Num(a.aElem, 8) {
+    if a is TyArray && tyHoldsNonI32Num(tyElemOf(a), 8) {
       for el in e.arrElems {
         const sp = nodeAt(el)
         if sp is Spread {
           numLitAdoptDeep(sp.spdArg, at, depth - 1)
         } else {
-          numLitAdoptDeep(el, a.aElem, depth - 1)
+          numLitAdoptDeep(el, tyElemOf(a), depth - 1)
         }
       }
     }
@@ -591,7 +663,7 @@ function numSoleArm(dstTy: i32, list: boolean): i32 {
     if m >= 0 && m < T.tys.length {
       const mt = tyAt(m)
       if (
-        (list && mt is TyArray && !numNoNumber(mt.aElem))
+        (list && mt is TyArray && !numNoNumber(tyElemOf(mt)))
         || (!list && mt is TyObj)
       ) {
         if one >= 0 { return -1 }

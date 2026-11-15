@@ -170,8 +170,11 @@ export const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: n
   // D3623 split this row. Its unconditional pushes are now counted and the list is reserved,
   // which melts it outright (6/0/0, `list-wrapper-push-reserved`); the grown worst case keeps
   // its row, unchanged, by putting the pushes under an `if`.
-  { fixture: "list-wrapper-push", none: 5, O: 3, O3: 2 },
-  { fixture: "list-wrapper-push-reserved", none: 6, O: 0, O3: 0 },
+  // Unoptimised, a push's grow lives in one shared `__grow_<row>__`, so the per-site backing
+  // allocations are one site in the helper (5 -> 3, 6 -> 4). `-O` keeps the grow inline, so the
+  // optimised counts, which are what the melt is about, did not move.
+  { fixture: "list-wrapper-push", none: 3, O: 3, O3: 2 },
+  { fixture: "list-wrapper-push-reserved", none: 4, O: 0, O3: 0 },
   // `union-box-call` with its payload READ instead of discarded. The read still blocks the
   // melt at two sites — that is what `opt-profile-design.md` §3 item 0 measured — but the
   // producer now has one site, and the two survivors at `-O`/`-O3` are the PAYLOAD

@@ -55,11 +55,15 @@ import {
   structNameOfTy,
   tyAt,
   tyDeeperThan,
+  tyElemOf,
+  tyElemOpen,
   tyEq,
   tyIsLitUnion,
   tyIsNicheNulScalarElem,
   tyIsNullableLitUnion,
   tyIsPrimNamed,
+  tyKeyOf,
+  tyKeyOpen,
   tyLitUnionHashesI32,
   tyNameAtoms,
   tyPrimNameOf,
@@ -67,6 +71,8 @@ import {
   tyToEmitName,
   tyToEmitNameAt,
   tyToNominalNameAt,
+  tyValOf,
+  tyValOpen,
   unionAliasDeclNameOfTy,
 } from "./check_types"
 import {
@@ -91,6 +97,11 @@ export function mapKeyRepTy(k: i32) {
   if tyIsPrimNamed(k, "string") { return TY_STR }
   if tyIsPrimNamed(k, "i64") { return TY_I64 }
   if tyLitUnionHashesI32(k) { return TY_I32 }
+  // A lone string literal is stored as its one-member set, which hashes as that set does (D16367).
+  if k >= 0 && k < T.tys.length {
+    const kt = tyAt(k)
+    if kt is TyLit && kt.litKind == "str" { return TY_I32 }
+  }
   // A numeric literal union over `i64` reps as that base, so it hashes as an i64 key.
   if numLitUnionBaseTy(k) == TY_I64 { return TY_I64 }
   -1
@@ -119,7 +130,7 @@ export function cellTagOfTy(t0: i32): string {
   const t = nonNullTy(t0)
   if t < 0 { return "" }
   const tt = tyAt(t)
-  if tt is TyArray { return "#a" + i32ToStr(tt.aElem) }
+  if tt is TyArray { return "#a" + i32ToStr(tyElemOf(tt)) }
   mapCellTagOfTy(t)
 }
 
@@ -127,7 +138,7 @@ export function cellTagOfTy(t0: i32): string {
 // type variable, a union of containers), which may be either.
 function mapCellTagOfTy(t: i32): string {
   const tt = tyAt(t)
-  if tt is TyMap { return "#m" + i32ToStr(tt.mVal) }
+  if tt is TyMap { return "#m" + i32ToStr(tyValOf(tt)) }
   ""
 }
 
@@ -317,7 +328,7 @@ export function arrSpineLeafTy(ty: i32) {
       going = false
     } else {
       const t = tyAt(cur)
-      if t is TyArray { cur = t.aElem } else { going = false }
+      if t is TyArray { cur = tyElemOf(t) } else { going = false }
     }
   }
   cur
@@ -754,13 +765,13 @@ export function tyBoxesV128(t: i32, d: i32): boolean {
   const tt = tyAt(t)
   match tt {
     TyArray => {
-      return tyBoxesV128(tt.aElem, d - 1)
+      return tyBoxesV128(tyElemOf(tt), d - 1)
     }
     TyNullable => {
       return tyBoxesV128(tt.nInner, d - 1)
     }
     TyMap => {
-      return tyBoxesV128(tt.mVal, d - 1)
+      return tyBoxesV128(tyValOf(tt), d - 1)
     }
     TyObj => {
       let i = 0
@@ -804,8 +815,8 @@ export function retAtomsCheap(er: i32) {
     TyArray => {
       // Only a prim-element list renders short AND can classify (`i32[]`, `string[]`);
       // a composite-element list (`S[]`, `i32[][]`) renders big and always declines.
-      if t.aElem < 0 { return true }
-      const et = tyAt(t.aElem)
+      if tyElemOpen(t) { return true }
+      const et = tyAt(tyElemOf(t))
       et is TyPrim
     }
     // A composite leaf renders to a `-1`-kind atom.
@@ -823,8 +834,8 @@ function retAtomKindOf(er: i32) {
   match t {
     TyPrim => valueAtomKind(t.primName)
     TyArray => {
-      if t.aElem < 0 { return -1 }
-      const et = tyAt(t.aElem)
+      if tyElemOpen(t) { return -1 }
+      const et = tyAt(tyElemOf(t))
       if et is TyPrim {
         const en = et.primName
         // `i32[]` / `boolean[]` are matched by exact name AHEAD of `valueAtomKind`'s
@@ -1100,10 +1111,12 @@ export function mapTwinPair(a: i32, b: i32): boolean {
   const bt = tyAt(b)
   if !(at is TyMap) || !(bt is TyMap) { return false }
   if at.mSet != 0 || bt.mSet != 0 { return false }
-  if at.mKey < 0 || bt.mKey < 0 || at.mVal < 0 || bt.mVal < 0 { return false }
-  if mapKeyRepTy(at.mKey) != mapKeyRepTy(bt.mKey) { return false }
-  if tyEq(at.mVal, bt.mVal) { return false }
-  tyEq(mapValSoftBase(at.mVal), mapValSoftBase(bt.mVal))
+  if (tyKeyOpen(at) || tyKeyOpen(bt) || tyValOpen(at) || tyValOpen(bt)) {
+    return false
+  }
+  if mapKeyRepTy(tyKeyOf(at)) != mapKeyRepTy(tyKeyOf(bt)) { return false }
+  if tyEq(tyValOf(at), tyValOf(bt)) { return false }
+  tyEq(mapValSoftBase(tyValOf(at)), mapValSoftBase(tyValOf(bt)))
 }
 
 // A map value as its box member reads it: a numeric literal union's base, else itself.
@@ -1268,7 +1281,7 @@ export function nulNumLitUnionBaseName(ty: i32): string {
 export function mapTyValIsLitUnion(ty: i32) {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
-  if t is TyMap { return tyIsLitUnion(t.mVal) }
+  if t is TyMap { return tyIsLitUnion(tyValOf(t)) }
   false
 }
 
@@ -1276,7 +1289,7 @@ export function mapTyValIsLitUnion(ty: i32) {
 export function mapTyValIsNulLitUnion(ty: i32) {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
-  if t is TyMap { return tyIsNullableLitUnion(t.mVal) }
+  if t is TyMap { return tyIsNullableLitUnion(tyValOf(t)) }
   false
 }
 
@@ -1285,8 +1298,8 @@ export function mapTyValIsNulBool(ty: i32) {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
   if !(t is TyMap) { return false }
-  if t.mVal < 0 { return false }
-  const mv = tyAt(t.mVal)
+  if tyValOpen(t) { return false }
+  const mv = tyAt(tyValOf(t))
   match mv {
     TyNullable => primNameOf(mv.nInner) == "boolean"
     TyUnion => {
@@ -1325,7 +1338,7 @@ export function mapTyValIsNulBool(ty: i32) {
 export function mapTyValIsNullUnit(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
-  if t is TyMap { return isNullTy(t.mVal) }
+  if t is TyMap { return isNullTy(tyValOf(t)) }
   false
 }
 
@@ -1333,7 +1346,7 @@ export function mapTyValIsNullUnit(ty: i32): boolean {
 export function mapTyValIsBool(ty: i32) {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
-  if t is TyMap { return primNameOf(t.mVal) == "boolean" }
+  if t is TyMap { return primNameOf(tyValOf(t)) == "boolean" }
   false
 }
 
@@ -1343,8 +1356,10 @@ export function mapTyValLitUnionTexts(ty: i32) {
   if ty < 0 || ty >= T.tys.length { return out }
   const t = tyAt(ty)
   if t is TyMap {
-    if !tyIsLitUnion(t.mVal) && !tyIsNullableLitUnion(t.mVal) { return out }
-    let mv = t.mVal
+    if !tyIsLitUnion(tyValOf(t)) && !tyIsNullableLitUnion(tyValOf(t)) {
+      return out
+    }
+    let mv = tyValOf(t)
     if mv < 0 { return out }
     const mvN = tyAt(mv)
     if mvN is TyNullable { mv = mvN.nInner }
@@ -1373,7 +1388,7 @@ export function tyIsNulLitUnionNiche(ty: i32): boolean {
 export function mapTyValExcludesNull(ty: i32) {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
-  if t is TyMap { return tyExcludesNull(t.mVal) }
+  if t is TyMap { return tyExcludesNull(tyValOf(t)) }
   false
 }
 
@@ -1381,7 +1396,7 @@ export function mapTyValExcludesNull(ty: i32) {
 export function mapTyValName(ty: i32) {
   if ty < 0 || ty >= T.tys.length { return "" }
   const t = tyAt(ty)
-  if t is TyMap { return tyToEmitName(t.mVal) }
+  if t is TyMap { return tyToEmitName(tyValOf(t)) }
   ""
 }
 
@@ -1389,9 +1404,9 @@ export function tyMapKeyKindSpan(ty: i32): i32 {
   if ty < 0 { return MAP_KEY_STR }
   const t = tyAt(ty)
   match t {
-    TyMap => mapKeyKindOfTy(t.mKey)
+    TyMap => mapKeyKindOfTy(tyKeyOf(t))
     TyNullable => tyMapKeyKindSpan(t.nInner)
-    TyArray => tyMapKeyKindSpan(t.aElem)
+    TyArray => tyMapKeyKindSpan(tyElemOf(t))
     // Maps nothing can tell apart key as their one map.
     TyUnion => {
       const mt = mapTwinUnionMember(ty)
@@ -1534,7 +1549,7 @@ export function valueRowKind(ty: i32): i32 {
       if fnTagTyIsTagged(ty) { return 0 }
       11
     }
-    TyArray => valueRowListKind(t.aElem)
+    TyArray => valueRowListKind(tyElemOf(t))
     // A struct / map is not a value atom; a union row here is an alias arm (`K0` in
     // `K0 | i64`), which `valueAtomKind` answers -1 for by name as well.
     TyObj | TyMap | TyLit | TyUnion => -1

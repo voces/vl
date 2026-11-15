@@ -36,6 +36,7 @@ import {
   cvViaAt,
   isCstr,
   letCstr,
+  memCalleeAt,
   memCstr,
   nestCstr,
   nestCstrSeen,
@@ -201,6 +202,7 @@ import {
   gaAppHeads,
   gaAppTyIxSet,
   gaAppTyIxs,
+  holeReset,
   litTyIntern,
   luIxCursor,
   luPending,
@@ -219,6 +221,7 @@ import {
   objNamesDistinctReset,
   softenLitTy,
   tyAt,
+  tyElemOpen,
   tyMutEpoch,
   tyToStrDepth,
   tyToStrStack,
@@ -487,10 +490,6 @@ export let inferDroppedTy: i32[] = []
 
 export let inferDroppedLit: boolean[] = []
 
-// The `match` `checkNode` last entered in return-tail position, which it leaves as a non-spine node.
-export let matchTailNode = -1
-export function matchTailNodeSet(v: i32) { matchTailNode = v }
-
 // Each top-level `let`/`const` by name to its node, or -1 once pass 2 has reached the
 // declaration: a top-level write to one still mapped is a write before its initializer (D2654).
 export let moduleBeforeDecl: {[string]: i32} = Map()
@@ -552,6 +551,10 @@ export let nodeNumPair: {[i32]: i32} = Map()
 // The `null` a bare `as` hands back on a miss, per cast node: minted by the cast's check and
 // delivered to the enclosing function's result, so each instance's re-check records it.
 export let asMissNull: {[i32]: i32} = Map()
+
+// The instances, by elaboration key, at which a cast node can never hit its operand, banked by
+// each instance's re-check: the emitter lowers the cast there to its miss (D16323).
+export let asInstMiss: {[i32]: i32[]} = Map()
 
 // The `null` a record literal's omitted nullable field holds, per literal node and field name:
 // minted where the check adopts the literal and delivered to the field's type.
@@ -720,6 +723,7 @@ function checkerResetCstrColumns() {
   binCstr.node = []
   binCstr.shape = []
   cvViaAt = Map()
+  memCalleeAt = Map()
   cvNow = -1
   argCstr.at = []
   argCstr.exp = []
@@ -830,6 +834,7 @@ function checkerResetInferState() {
   nodeAtomSrcHeld = Map()
   nodeNumPair = Map()
   asMissNull = Map()
+  asInstMiss = Map()
   omitFieldNull = Map()
   optReadParts = Map()
   optReadPartOf = Map()
@@ -886,7 +891,6 @@ function checkerResetInferState() {
   voidRetRwRet = []
   voidRetRwBlk = []
   inferRetSeeding = false
-  matchTailNode = -1
   nullHolesReset()
   valueArmAt = -1
   nestedExitFirstAt = []
@@ -919,6 +923,7 @@ function checkerResetPassTables() {
   expectedReset()
   cbSeedUsed = 0
   T.tys = []
+  holeReset()
   sameTypePairsReset()
   litTyIntern = Map()
   wideLitMinted = false
@@ -1239,7 +1244,7 @@ function openJoinListRows(ix: i32, rows: i32[], depth: i32) {
   if jt >= 0 && jt < T.tys.length {
     const l = tyAt(jt)
     if l is TyArray {
-      if l.aElem < 0 && !i32ListHas(rows, jt) { rows.push(jt) }
+      if tyElemOpen(l) && !i32ListHas(rows, jt) { rows.push(jt) }
     }
   }
   if n is IfStmt {
@@ -1382,6 +1387,20 @@ export function nodeCtxTyIxOf(ix: i32): i32 {
 
 // The miss `null` of bare `as` cast `ix`, or -1 where its check minted none.
 export function asMissNullOf(ix: i32): i32 { asMissNull[ix] ?? -1 }
+
+// Records that cast `ix` can never hit its operand at the instance elaboration key `k` names.
+export function asInstMissNote(ix: i32, k: i32) {
+  if k < 0 || asInstMisses(ix, k) { return 0 }
+  const ks = asInstMiss[ix] ?? []
+  ks.push(k)
+  asInstMiss[ix] = ks
+  0
+}
+
+// Whether cast `ix` can never hit its operand at the instance elaboration key `k` names.
+export function asInstMisses(ix: i32, k: i32): boolean {
+  k >= 0 && i32ListHas(asInstMiss[ix] ?? [], k)
+}
 
 // The literal set delivered node `ix` holds, or -1 where no delivery took a literal-set value.
 export function nodeAtomSrcTyIxOf(ix: i32): i32 {

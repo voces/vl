@@ -88,6 +88,7 @@ import {
   elabDeliveredBundles,
   elabHasTypedReads,
   elabInstTyAt,
+  elabKeyAt,
   elabNestedCopyOnChain,
   elabNodeRepAt,
   elabSlotRecordListSigs,
@@ -114,6 +115,7 @@ import {
 import { lbiKeptDeclUnread } from "./check_num_lit_state"
 import { intMatchHeadAt } from "./check_match_heads"
 import {
+  asInstMisses,
   asMissNullOf,
   condProvenTrue,
   ctxElemOwnerOf,
@@ -208,6 +210,8 @@ import {
   tyArrayElemIx,
   tyAt,
   tyBearsNull,
+  tyElemOf,
+  tyElemOpen,
   tyEq,
   tyHasHole,
   tyIsLitUnion,
@@ -612,6 +616,7 @@ import {
   gNeedsF32Print,
   gNeedsF64Print,
   gNeedsI64Print,
+  gOptimized,
   gPromoInStart,
   gPromoOk,
   gPromoSlot,
@@ -628,6 +633,7 @@ import {
   globalStmtOrd,
   globalStmts,
   heldRepOf,
+  helpListGrowFn,
   helpMapCompactFn,
   helpMapProbeFn,
   helpMapProbeI32Fn,
@@ -3593,8 +3599,8 @@ function emitListConvTop(
   const sa = tyAt(st)
   const da = tyAt(dt)
   if !(sa is TyArray) || !(da is TyArray) { return 0 }
-  const si = nonNullTy(sa.aElem)
-  const di = nonNullTy(da.aElem)
+  const si = nonNullTy(tyElemOf(sa))
+  const di = nonNullTy(tyElemOf(da))
   if si < 0 || di < 0 || !(tyAt(si) is TyArray) || !(tyAt(di) is TyArray) {
     return 0
   }
@@ -3648,8 +3654,8 @@ function rcRecListsApart(st: i32, dt: i32): boolean {
   const sa = tyAt(st)
   const da = tyAt(dt)
   if !(sa is TyArray) || !(da is TyArray) { return false }
-  const se = sa.aElem
-  const de = da.aElem
+  const se = tyElemOf(sa)
+  const de = tyElemOf(da)
   if se < 0 || de < 0 || !(tyAt(de) is TyObj) { return false }
   // A list of a union of records is copied arm by arm (`emitRowUnionElemCopy`).
   if tyAt(se) is TyUnion {
@@ -3689,8 +3695,8 @@ function emitRecListCopyTop(
 ): i32 {
   const sa = tyAt(st)
   const da = tyAt(dt)
-  const se = if sa is TyArray { sa.aElem } else { -1 }
-  const de = if da is TyArray { da.aElem } else { -1 }
+  const se = if sa is TyArray { tyElemOf(sa) } else { -1 }
+  const de = if da is TyArray { tyElemOf(da) } else { -1 }
   const arms = if se >= 0 && se < T.tys.length && tyAt(se) is TyUnion { rcArmRows(se) } else { [] }
   const ssi = if arms.length > 0 { variantRowOf(arms[0]) } else { rcRowOfTy(se) }
   const dsi = rcRowOfTy(de)
@@ -4130,7 +4136,7 @@ function listLeafDepth(ty: i32): i32 {
     if cur < 0 || cur >= T.tys.length { return -1 }
     const t = tyAt(cur)
     if !(t is TyArray) { return d }
-    cur = t.aElem
+    cur = tyElemOf(t)
     d = d + 1
   }
   -1
@@ -4143,7 +4149,7 @@ function listLeafOf(ty: i32): i32 {
   while d < 64 && cur >= 0 && cur < T.tys.length {
     const t = tyAt(cur)
     if !(t is TyArray) { return cur }
-    cur = t.aElem
+    cur = tyElemOf(t)
     d = d + 1
   }
   cur
@@ -4189,7 +4195,7 @@ function boxArmKindOfTy(k: i32, armTy: i32): i32 {
 function scalarArmKindOfTy(ity: i32): i32 {
   const t = tyAt(ity)
   if t is TyArray {
-    if numLitUnionBaseTy(t.aElem) >= 0 { return -1 }
+    if numLitUnionBaseTy(tyElemOf(t)) >= 0 { return -1 }
   }
   boxTagOfTy(ity)
 }
@@ -4672,6 +4678,14 @@ function nulNicheBaseClass(recvIx: i32, fnIx: i32) {
 function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
   // An exact instance knows the member the niche holds: its twin shares the pattern's row (D2753).
   if exactUnionLacksTwin(recvIx, ity, fnIx) { return true }
+  // A record niche holds the instance's own record, so a tested record the `is` relation says
+  // it never is cannot be the value, and the test is not the null check (D16370).
+  if tyIsRecord(ity) {
+    const inner = nullableInnerOrNone(instanceReadTyOf(recvIx, fnIx))
+    if inner >= 0 && tyIsRecord(inner) && isTestAnswer(inner, ity) == 0 {
+      return true
+    }
+  }
   // A map niche holds one map type: a pattern naming another map is never it (D2493).
   if unMemIsMap(ity) && !exprUnion(recvIx, fnIx) {
     // An instance parameter's pin names the niche's map exactly; a spelling needs the lenient
@@ -5168,7 +5182,7 @@ function emitListEmptyFitArms(
     const at = tyAt(fits[i])
     if !(at is TyArray) { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
     const heaps: i32[] = []
-    let kind = listFitElemKind(at.aElem, heaps)
+    let kind = listFitElemKind(tyElemOf(at), heaps)
     // An arm disjoint below its first level is a list of lists: its rows down to that depth are
     // walked as `emitListEmptyFitIs` walks a bare receiver's, and the box holds the outer row.
     const slots: i32[] = []
@@ -5302,13 +5316,13 @@ function listFitShadowSet(isIx: i32, recvTy: i32, depth: i32, fnIx: i32): i32 {
   const kt = tyAt(kTy)
   if !(kt is TyArray) { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
   const heaps: i32[] = []
-  const kind = listFitElemKind(kt.aElem, heaps)
+  const kind = listFitElemKind(tyElemOf(kt), heaps)
   if kind == null { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
   // A closure's read stands in with its own empty `K[]` (`listFitCaptureStandIn`), except
   // between two record lists, which that read cannot tell apart.
   const rt = if recvTy >= 0 && recvTy < T.tys.length { tyAt(recvTy) } else { kt }
   const recvHeaps: i32[] = []
-  const recvKind = if rt is TyArray { listFitElemKind(rt.aElem, recvHeaps) } else { null }
+  const recvKind = if rt is TyArray { listFitElemKind(tyElemOf(rt), recvHeaps) } else { null }
   if (
     kind == "reflist"
     && (recvKind == null || recvKind == "reflist")
@@ -5420,7 +5434,7 @@ function listFitGrowScan(fnIx: i32) {
           p = p + 1
         }
         const heaps: i32[] = []
-        const kind = listFitElemKind(kt.aElem, heaps)
+        const kind = listFitElemKind(tyElemOf(kt), heaps)
         if (
           pushed
           && kind != null
@@ -5531,7 +5545,7 @@ function listFitGrowFill(row: i32): i32 {
   const kt = tyAt(fitGrowTy[row])
   if !(kt is TyArray) { return emitFail(LIST_FIT_SHADOW_MSG) }
   const heaps: i32[] = []
-  if listFitElemKind(kt.aElem, heaps) == null {
+  if listFitElemKind(tyElemOf(kt), heaps) == null {
     return emitFail(LIST_FIT_SHADOW_MSG)
   }
   fbIf(127) // i32
@@ -5560,7 +5574,7 @@ function emitListFitGrowLen(body: u8[], m: Member, memIx: i32, fnIx: i32): i32 {
   const kt = tyAt(fitGrowTy[g])
   if !(kt is TyArray) { return 0 }
   const heaps: i32[] = []
-  const kind = listFitElemKind(kt.aElem, heaps)
+  const kind = listFitElemKind(tyElemOf(kt), heaps)
   if kind == null { return 0 }
   fbLocalGet(fitGrowLocal[g])
   fbRefIsNull()
@@ -5613,7 +5627,7 @@ function listFitStandInKind(t: i32, heaps: i32[]): ListKind | null {
   if t < 0 || t >= T.tys.length { return null }
   const kt = tyAt(t)
   if !(kt is TyArray) { return null }
-  listFitElemKind(kt.aElem, heaps)
+  listFitElemKind(tyElemOf(kt), heaps)
 }
 
 // The `K[]` an `if <name> is K[]` of an enclosing function tests when the closure at `fnIx` is
@@ -6370,6 +6384,21 @@ function isTestedEveryMember(op: i32, t: i32): boolean {
   true
 }
 
+// Whether every operand arm (`opTags`/`opVis`) holding tag `tag` is among the tested `isVis`.
+function isTagWhollyTested(
+  tag: i32,
+  opTags: i32[],
+  opVis: i32[],
+  isVis: i32[],
+): boolean {
+  let i = 0
+  while i < opTags.length && i < opVis.length {
+    if opTags[i] == tag && !i32ListHas(isVis, opVis[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
 // Whether closed record or list type `op` is the tested type `t` itself.
 function isPinOwn(op: i32, t: i32): boolean {
   if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return false }
@@ -6448,6 +6477,8 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
       const slots: i32[] = []
       if k == 0 {
         if t != chkTag {
+          // An arm whose element type is fixed apart from the test's never fits, empty or not.
+          if tyFitKind(a, chk) == 0 { continue }
           k = LIST_ARM_EMPTY
         } else {
           k = listArmSharedTagFit(a, chk, slots)
@@ -7181,9 +7212,24 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
       let chainOk = isTags.length > 1
         && exprUnion(nd.isObj, fnIx)
         && unionEqOperandOk(nd.isObj)
+      // A variant told apart by a field's value shares its tag; the tag alone answers where
+      // every operand arm holding that tag is tested (`tyTestMeet`'s members, D16320).
+      const opTags: i32[] = []
+      const opVis: i32[] = []
+      const opArms = unionArmTagsOfTy(
+        nodeTyAt(nd.isObj, fnIx),
+        -1,
+        opTags,
+        opVis,
+      )
       let ci = 0
       while ci < isVis.length {
-        if variantHasDiscrimField(isVis[ci]) { chainOk = false }
+        if (
+          variantHasDiscrimField(isVis[ci])
+          && !(opArms && isTagWhollyTested(isTags[ci], opTags, opVis, isVis))
+        ) {
+          chainOk = false
+        }
         ci = ci + 1
       }
       if chainOk {
@@ -7393,6 +7439,15 @@ function emitIsTestRungs(body: u8[], isIx: i32, fnIx: i32) {
   const nst = nullInstanceIsResult(isIx, fnIx)
   if nst >= 0 {
     fbI32Const(nst)
+    return 0
+  }
+  // A test the checker found can never match is false.
+  if nd0 is IsExpr && isVarTyIxOf(isIx) == TY_NEVER {
+    if !unionEqOperandOk(nd0.isObj) {
+      if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+      fbDrop()
+    }
+    fbI32Const(0)
     return 0
   }
   const rfit = emitRecordFitIs(body, isIx, fnIx)
@@ -22409,6 +22464,13 @@ function widenConvOpOfKinds(fk: i32, tk: i32): i32 {
   if fk == 0 && tk == 3 { return scalarWidenConvOp("i32", "i64") }
   if fk == 0 && tk == 4 { return scalarWidenConvOp("i32", "f64") }
   if fk == 5 && tk == 4 { return scalarWidenConvOp("f32", "f64") }
+  // Recorded only for a box whose `i64` members are literals the float holds (D3530).
+  if fk == 3 && tk == 4 {
+    return 185 // f64.convert_i64_s
+  }
+  if fk == 3 && tk == 5 {
+    return 180 // f32.convert_i64_s
+  }
   -1
 }
 
@@ -24208,6 +24270,43 @@ function omittedFieldNullNode(objIx: i32, name: string): i32 {
   )
 }
 
+// A cast's miss at an instance whose operand it can never hit: `as?` evaluates the operand and
+// is its own `null`, `as!` traps after it, and a bare `as` returns the operand as the remainder.
+function emitAsInstMiss(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
+  if e.asMode != "null" && e.asMode != "trap" {
+    if emitReturnValue(body, e.asObj, fnIx) < 0 { return -1 }
+    fbReturn()
+    return 0
+  }
+  if emitExpr(body, e.asObj, fnIx) < 0 { return -1 }
+  fbDrop()
+  if e.asMode == "trap" {
+    fbUnreachable()
+    return 0
+  }
+  const mt = nodeTyIxOf(exprIx)
+  if repOfTy(mt).rdKind == "union" {
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx)
+    return 0
+  }
+  emitNullOwn(nullOwnOfTy(mt))
+}
+
+// The cast node `exprIx` copies, through a mono copy's source nodes (`nodeSrc`).
+function asCastRoot(exprIx: i32): i32 {
+  let at = exprIx
+  let depth = 0
+  while depth < 8 {
+    const up = nodeSrc[at] ?? -1
+    if up < 0 { return at }
+    at = up
+    depth = depth + 1
+  }
+  at
+}
+
 // The `null` node bare `as` cast `exprIx` hands `emitReturnValue` on a miss: the one its check
 // minted and delivered (`asMissNullOf`), reached through a mono copy's source node (`nodeSrc`);
 // -1, through `emitFail`, where the check minted none.
@@ -24955,6 +25054,10 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   // A boxed `v128 | null` or union operand takes the union arm below instead.
   if tgt == "v128" && !exprUnion(obj, fnIx) { return emitExpr(body, obj, fnIx) }
   if e.asMode == "wrap" { return emitNumWrapCast(body, e, _exprIx, fnIx) }
+  // A cast this instance's operand can never hit misses, as the instance's re-check found.
+  if asInstMisses(asCastRoot(_exprIx), elabKeyAt(fnIx)) {
+    return emitAsInstMiss(body, e, _exprIx, fnIx)
+  }
   if asExprLitAtomCast(_exprIx, fnIx) {
     return emitAsLitAtom(body, e, _exprIx, fnIx)
   }
@@ -26716,7 +26819,7 @@ function emitTagParamHolds(f: i32, s: i32): boolean {
   while t >= 0 && t < T.tys.length && depth < 16 {
     const a = tyAt(t)
     if !(a is TyArray) { return depth > 0 && fnTagSetOfTy(t) == s }
-    t = a.aElem
+    t = tyElemOf(a)
     depth = depth + 1
   }
   false
@@ -29706,8 +29809,6 @@ function emitPushAppend(
   wantValue: boolean,
 ) {
   const valIdx = base
-  const capIdx = base + 1
-  const backIdx = base + 2
   // A counted push of an open build region appends through its locals while under the
   // reserve, and otherwise syncs `len` and takes the growing append below (D3623).
   const reg = listBuildRegionOf(callIx)
@@ -29737,37 +29838,15 @@ function emitPushAppend(
   pushListCap(body, lIdx, lTy)
   fbI32Bin(70) // 0x46 i32.eq
   fbIf(64)     // 0x04 if, 0x40 void blocktype
-  // NC = (cap(L) == 0) ? 4 : cap(L) * 2   — via if/else yielding i32
-  pushListCap(body, lIdx, lTy)
-  fbI32Eqz()         // 0x45 i32.eqz  (cap == 0)
-  fbIf(127)          // 0x04 if, 0x7f i32 blocktype (yields an i32)
-  fbI32Const(4)      // i32.const 4
-  fbElse()           // 0x05 else
-  pushListCap(body, lIdx, lTy)
-  fbI32Const(2)      // i32.const 2
-  fbI32Bin(108)      // 0x6c i32.mul
-  fbEnd()            // 0x0b end (if/else)
-  fbLocalSet(capIdx) // local.set NC
-  // NB = array.new_default $aTy NC
-  fbLocalGet(capIdx)     // local.get NC
-  fbArrayNewDefault(aTy) // 0xfb 0x07 <aTy>
-  fbLocalSet(backIdx)    // local.set NB
-  // array.copy NB 0 backing(L) 0 len(L)
-  fbLocalGet(backIdx)              // local.get NB (dest)
-  fbI32Const(0)                    // i32.const 0 (dest offset)
-  pushListBacking(body, lIdx, lTy) // src
-  fbI32Const(0)                    // i32.const 0 (src offset)
-  pushListLen(body, lIdx, lTy)     // count
-  fbArrayCopy(aTy, aTy)            // 0xfb 0x11 <dest type> <src type>
-  // L.backing = NB
-  fbLocalGet(lIdx)    // local.get L
-  fbLocalGet(backIdx) // local.get NB
-  fbStructSet(lTy, 0) // 0xfb 0x05 <lTy> field 0: backing
-  // L.cap = NC
-  fbLocalGet(lIdx)    // local.get L
-  fbLocalGet(capIdx)  // local.get NC
-  fbStructSet(lTy, 2) // 0xfb 0x05 <lTy> field 2: cap
-  fbEnd()             // 0x0b end (if)
+  // The grow is the shape's one shared helper, except in an optimised build, which grows inline
+  // where binaryen can see the list does not escape and melt or drop the grow (as map sets do).
+  if gOptimized == 0 {
+    fbLocalGet(lIdx)
+    fbCall(helpListGrowFn(lTy, aTy))
+  } else {
+    pushGrowInline(lIdx, lTy, aTy, base + 1, base + 2)
+  }
+  fbEnd() // 0x0b end (if)
   // backing(L)[len(L)] = V
   pushListBacking(body, lIdx, lTy)
   pushListLen(body, lIdx, lTy)
@@ -31021,8 +31100,8 @@ function rcListBoxAtom(st: i32, dt: i32): i32 {
   const sa = tyAt(st)
   const da = tyAt(dt)
   if !(sa is TyArray) || !(da is TyArray) { return -1 }
-  const se = sa.aElem
-  const de = da.aElem
+  const se = tyElemOf(sa)
+  const de = tyElemOf(da)
   if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length { return -1 }
   if !(tyAt(se) is TyPrim) { return -1 }
   const d = tyAt(de)
@@ -32073,6 +32152,44 @@ function emitMfInvoke(
   fbLocalGet(cL)
   fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
   fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
+  0
+}
+
+// The grow arm of a push into list local `lIdx`, inline: the new capacity (4 when empty, else
+// twice) into `capIdx`, a fresh backing into `backIdx`, the live prefix copied over, both
+// stored back. `__grow_<row>__` is the same block over its parameter.
+function pushGrowInline(
+  lIdx: i32,
+  lTy: i32,
+  aTy: i32,
+  capIdx: i32,
+  backIdx: i32,
+) {
+  pushListCap([], lIdx, lTy)
+  fbI32Eqz()
+  fbIf(127)
+  fbI32Const(4)
+  fbElse()
+  pushListCap([], lIdx, lTy)
+  fbI32Const(2)
+  fbI32Bin(108) // 0x6c i32.mul
+  fbEnd()
+  fbLocalSet(capIdx)
+  fbLocalGet(capIdx)
+  fbArrayNewDefault(aTy)
+  fbLocalSet(backIdx)
+  fbLocalGet(backIdx)
+  fbI32Const(0)
+  pushListBacking([], lIdx, lTy)
+  fbI32Const(0)
+  pushListLen([], lIdx, lTy)
+  fbArrayCopy(aTy, aTy)
+  fbLocalGet(lIdx)
+  fbLocalGet(backIdx)
+  fbStructSet(lTy, 0)
+  fbLocalGet(lIdx)
+  fbLocalGet(capIdx)
+  fbStructSet(lTy, 2)
   0
 }
 
@@ -38315,9 +38432,9 @@ function listLitBuiltTy(lo: i32, fnIx: i32): i32 {
       const n = tyAt(t)
       if (
         n is TyArray
-        && n.aElem >= 0
-        && !isNullTy(n.aElem)
-        && tyAdmitsNull(n.aElem)
+        && !tyElemOpen(n)
+        && !isNullTy(tyElemOf(n))
+        && tyAdmitsNull(tyElemOf(n))
       ) {
         return t
       }
@@ -38333,7 +38450,7 @@ function listElemNullOwn(t: i32): i32 {
   const u = if n0 is TyNullable { n0.nInner } else { t }
   if u < 0 { return NULL_OWN_NONE }
   const n = tyAt(u)
-  if n is TyArray { return nullOwnOfTy(n.aElem) }
+  if n is TyArray { return nullOwnOfTy(tyElemOf(n)) }
   NULL_OWN_NONE
 }
 
@@ -38456,7 +38573,7 @@ function tyElemIsNulStr(t: i32): boolean {
   const u = if n0 is TyNullable { n0.nInner } else { t }
   if u < 0 { return false }
   const n = tyAt(u)
-  if n is TyArray { return repOfTy(n.aElem).rdKind == "nulstr" }
+  if n is TyArray { return repOfTy(tyElemOf(n)).rdKind == "nulstr" }
   false
 }
 
@@ -38467,7 +38584,7 @@ function tyElemRepsAsAtom(t: i32): boolean {
   const u = if n0 is TyNullable { n0.nInner } else { t }
   if u < 0 { return false }
   const n = tyAt(u)
-  if n is TyArray { return tyRepsAsAtom(n.aElem) }
+  if n is TyArray { return tyRepsAsAtom(tyElemOf(n)) }
   false
 }
 
@@ -40145,9 +40262,11 @@ function emitBinNumeric(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   if sr32 <= 0 { return sr32 }
   const opcode = binOpcode(e.binOp)
   if opcode < 0 { return emitFail("emitProgram: unsupported binary operator") }
-  // Operands first (left then right), then the operator — wasm's stack order.
+  // Operands first (left then right), then the operator — wasm's stack order. An `i64` shift
+  // count wraps to the `i32` operand's width, which masks it as wasm does.
   if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
   if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+  if binOperandScalarTy(e.binRight, fnIx) == TY_I64 { fbI32WrapI64() }
   fbI32Bin(opcode)
   return 0
 }

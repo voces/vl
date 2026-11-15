@@ -341,6 +341,8 @@ import {
   mapDeliveryMayRecord,
   numLitAdoptDeep,
   numLitReadopt,
+  shiftLitAdopt,
+  shiftWidensLit,
   valueJoinAt,
   valueTailSplit,
 } from "./check_num_adopt"
@@ -352,7 +354,12 @@ import {
   cexFloatUse,
   nlAsgTgt,
 } from "./check_num_lit_state"
-import { isExactF64IntLitExpr, isF32AdoptingLitExpr } from "./check_num_lits"
+import {
+  cexLitPeel,
+  isExactF64IntLitExpr,
+  isF32AdoptingLitExpr,
+  numLitAnnotNote,
+} from "./check_num_lits"
 import { recordNullHoleObjAdopt } from "./check_obj_shape"
 import { parenPeelIx } from "./check_places"
 import { recOwnPend, recPend } from "./check_rec_rows"
@@ -391,7 +398,7 @@ import {
   prbEnter,
   prbLeave,
 } from "./check_rollback"
-import { valBindLambda } from "./check_side_rows"
+import { recordWidenRetagTails, valBindLambda } from "./check_side_rows"
 import { symEnabled } from "./check_state"
 import {
   CSTR_ANYFN,
@@ -441,6 +448,7 @@ import {
   T,
   TY_ERR,
   TY_I32,
+  TY_I64,
   TY_NEVER,
   TY_NULL,
   TY_VOID,
@@ -462,6 +470,9 @@ import {
   primNameStr,
   tyArrayElemIx,
   tyAt,
+  tyBearsNull,
+  tyElemOf,
+  tyElemOpen,
   tyHasHole,
   tyHasNullHole,
   tyIsHole,
@@ -802,7 +813,7 @@ function fsbNoteFnDelivery(src: i32, dst: i32) {
   if f is TyNullable { return fsbNoteFnDelivery(src, f.nInner) }
   if sn is ArrayLit {
     if f is TyArray {
-      for e in sn.arrElems { fsbNoteFnDelivery(e, f.aElem) }
+      for e in sn.arrElems { fsbNoteFnDelivery(e, tyElemOf(f)) }
     }
     return 0
   }
@@ -1046,7 +1057,7 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
     const darr = tyAt(dstTy)
     if darr is TyArray {
       for el in lit.arrElems {
-        genFnValueCstrsAt(el, nodeTyOf(el), darr.aElem, depth + 1)
+        genFnValueCstrsAt(el, nodeTyOf(el), tyElemOf(darr), depth + 1)
       }
     }
     return 0
@@ -1699,6 +1710,15 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     numLitAdoptDeep(srcExpr, dstTy, 6)
     return true
   }
+  // Into a nullable number the box stays a box, its members retagged (`recordWidenRetagTails`).
+  if (
+    tyBearsNull(dstTy)
+    && !tyBearsNull(srcTy)
+    && litNumUnionConverts(srcTy, nonNullTy(dstTy))
+  ) {
+    recordWidenRetagTails(srcExpr, dstTy)
+    return true
+  }
   if srcExpr >= 0 && dstTy >= 0 {
     const cse = nodeAt(srcExpr)
     if cse is NumLit || cse is Unary || cse is Paren {
@@ -1743,6 +1763,10 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // where every binding / argument / return / field / element / store position delivers one.
   // The parentheses are adopted with the tree, since the emitter reads the outermost (D15000).
   if srcTy == TY_I32 && litTreeAdoptDst(srcExpr, dstTy) >= 0 { return true }
+  // A shift its count widened keeps `i32` at an `i32` destination, where the count is refused.
+  if srcTy == TY_I64 && dstTy == TY_I32 && shiftWidensLit(srcExpr) {
+    return shiftLitAdopt(srcExpr, TY_I32) >= 0
+  }
   if radixLitAdoptDst(srcExpr, dstTy) == 2 { return true }
   // Rep sidecar: an ObjLit/ArrayLit reaching an unresolved empty-collection hole (`{nodes: []}`)
   // or a destination union is stamped with the destination so the emitter keys that shape. Only
@@ -1813,7 +1837,7 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       if (
         dla is TyArray
         && dla.aRead == 1
-        && fvaListSetCopy(srcExpr, srcTy, dla.aElem)
+        && fvaListSetCopy(srcExpr, srcTy, tyElemOf(dla))
       ) {
         return true
       }
@@ -2050,9 +2074,13 @@ function assignableArrLitElems(
       if spe >= 0 && tyHasHole(spe) && litPinN.length > 0 {
         spe = substTyDeep(spe, litPinN, litPinT)
       }
-      if spe >= 0 && !assignable(spe, d.aElem) { ok = false }
+      if spe >= 0 && !assignable(spe, tyElemOf(d)) { ok = false }
     } else if (
-      !assignableExpr(e.arrElems[i], litElemSrcTy(e.arrElems[i], srcTy), d.aElem)
+      !assignableExpr(
+        e.arrElems[i],
+        litElemSrcTy(e.arrElems[i], srcTy),
+        tyElemOf(d),
+      )
     ) {
       ok = false
     }
@@ -2069,12 +2097,12 @@ function assignableArrLitElems(
   if (
     ok
     && !inferQuiet
-    && (tyIsLitUnion(d.aElem)
-      || tyIsNicheNulScalarElem(d.aElem)
+    && (tyIsLitUnion(tyElemOf(d))
+      || tyIsNicheNulScalarElem(tyElemOf(d))
       || arrLitJoinUnionElem(srcExpr, dtix)
       || arrLitSoftenedUnionElem(srcExpr, dtix)
       || cexElem
-      || f32ElemsAdoptedOver(srcExpr, d.aElem))
+      || f32ElemsAdoptedOver(srcExpr, tyElemOf(d)))
   ) {
     if srcExpr < nodeTyIx.length { nodeTySet(srcExpr, dtix) }
   }
@@ -2942,7 +2970,9 @@ function fnShapeClash(g: i32, w: i32, depth: i32): boolean {
       return fnShapeClash(gt.nInner, w, depth + 1)
     }
     TyArray => {
-      if wt is TyArray { return fnShapeClash(gt.aElem, wt.aElem, depth + 1) }
+      if wt is TyArray {
+        return fnShapeClash(tyElemOf(gt), tyElemOf(wt), depth + 1)
+      }
       return false
     }
     TyObj => {
@@ -3098,7 +3128,7 @@ function holesOnlyInFns(t: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return holesOnlyInFns(x.aElem, depth + 1)
+      return holesOnlyInFns(tyElemOf(x), depth + 1)
     }
     TyNullable => {
       return holesOnlyInFns(x.nInner, depth + 1)
@@ -3209,6 +3239,7 @@ export function validateLetCstrs(
             if who != "" { lWho = "the body of `" + who + "`" }
             tErr(
               letAssignMsg(letCstr.ix[ci], lg, lw, letCstr.name[ci], -1)
+                + litLetStoreNote(letCstr.ix[ci], lg, lw)
                 + " ("
                 + lWho
                 + " at the call's argument types)",
@@ -3575,9 +3606,9 @@ export function fvaAdaptListLit(ix: i32, listTy: i32): boolean {
   const lit = nodeAt(lix)
   if !(lit is ArrayLit) { return false }
   const la = tyAt(nonNullTy(listTy))
-  if !(la is TyArray) || !tyMayHoldFn(la.aElem, 0) { return false }
+  if !(la is TyArray) || !tyMayHoldFn(tyElemOf(la), 0) { return false }
   for el in lit.arrElems {
-    if spreadArgOf(el) < 0 { fvaAdapt(el, nodeTyIxOf(el), la.aElem) }
+    if spreadArgOf(el) < 0 { fvaAdapt(el, nodeTyIxOf(el), tyElemOf(la)) }
   }
   true
 }
@@ -3628,14 +3659,14 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
   const snn = nonNullTy(srcTy)
   if snn < 0 || snn >= T.tys.length { return false }
   const sa = tyAt(snn)
-  if !(sa is TyArray) || sa.aElem == de || fvaListHoldsLetAlias(site) {
+  if !(sa is TyArray) || tyElemOf(sa) == de || fvaListHoldsLetAlias(site) {
     return false
   }
   // A set's elements, or a hole parameter's, which an instance binds to one.
-  const held = fnTagSetValueOfTy(sa.aElem)
-    || fnTagSetOfTy(sa.aElem) >= 0
-    || tyHasHole(sa.aElem) && tyMayHoldFn(sa.aElem, 0)
-    || tyIsHole(sa.aElem)
+  const held = fnTagSetValueOfTy(tyElemOf(sa))
+    || fnTagSetOfTy(tyElemOf(sa)) >= 0
+    || tyHasHole(tyElemOf(sa)) && tyMayHoldFn(tyElemOf(sa), 0)
+    || tyIsHole(tyElemOf(sa))
   if !held { return false }
   const pos = nodePos(site)
   // `$e` is left to `.map`, which types it at the receiver's element.
@@ -3648,7 +3679,7 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
   // than returned as the closure it is not (D15432).
   let body = luRef(pd, site, pos)
   const df = tyAt(de)
-  if (tyHasHole(sa.aElem) || tyIsHole(sa.aElem)) && df is TyFunc {
+  if (tyHasHole(tyElemOf(sa)) || tyIsHole(tyElemOf(sa))) && df is TyFunc {
     const eps: i32[] = []
     const eargs: i32[] = []
     let i = 0
@@ -3860,7 +3891,7 @@ function fvaValueRowWalk(srcTy: i32, dstTy: i32, depth: i32) {
     return 0
   }
   if s is TyArray && d is TyArray {
-    return fvaValueRowWalk(s.aElem, d.aElem, depth - 1)
+    return fvaValueRowWalk(tyElemOf(s), tyElemOf(d), depth - 1)
   }
   // Each generic member of a set is banked at the destination, as one alone is.
   for m in elabFnSetOf(srcTy) { fvaValueRowAt(m, dt) }
@@ -4215,7 +4246,7 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if (
     fda is TyArray
     && fda.aRead == 1
-    && fvaListSetCopy(srcExpr, srcTy, fda.aElem)
+    && fvaListSetCopy(srcExpr, srcTy, tyElemOf(fda))
   ) {
     return true
   }
@@ -4225,7 +4256,7 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     const da = tyAt(nonNullTy(dstTy))
     if da is TyArray {
       for el in lit.arrElems {
-        if spreadArgOf(el) < 0 { fvaAdapt(el, nodeTyIxOf(el), da.aElem) }
+        if spreadArgOf(el) < 0 { fvaAdapt(el, nodeTyIxOf(el), tyElemOf(da)) }
       }
     }
     return false
@@ -4505,7 +4536,18 @@ function recordHolder(t: i32): boolean {
   const s = tyAt(t)
   if s is TyObj { return true }
   s is TyArray
-    && s.aElem >= 0
-    && s.aElem < T.tys.length
-    && tyAt(s.aElem) is TyObj
+    && !tyElemOpen(s)
+    && tyElemOf(s) < T.tys.length
+    && tyAt(tyElemOf(s)) is TyObj
+}
+
+// The note naming the un-annotated literal `let` a refused store at `rhs` writes into, as the
+// same store outside a generic body is refused with (D16293); "" for any other store.
+function litLetStoreNote(rhs: i32, got: i32, want: i32): string {
+  const d = wrDstDecl.get(rhs) ?? -1
+  if d < 0 || d >= P.nodes.length { return "" }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) { return "" }
+  if dn.letType >= 0 || cexLitPeel(dn.letInit) < 0 { return "" }
+  numLitAnnotNote(dn, d, rhs, want, tyToStr(got))
 }

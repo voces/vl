@@ -3,6 +3,7 @@
 // overload resolution, cast pins, bare-brace delivery and the inferred-return notes. Each
 // reads what the core checker recorded and reports through the relation core.
 
+import { rowParamIsSlot } from "./check_row_param"
 import { identityCstrOffender, identityCstrRefusal } from "./check_identity"
 import { cwIxCovers, cwIxParent } from "./check_write_scan"
 import { cbaParamRepTransparent } from "./check_bind_adopt"
@@ -29,8 +30,10 @@ import {
   Param,
   Paren,
   TS_ARR,
+  TS_FIELD,
   TS_NAME,
   TS_NULL,
+  TS_OBJ,
   TS_UNION,
   TypeRef,
   adoptNodeTok,
@@ -53,6 +56,7 @@ import {
   ovFnHead,
   ovInstPick,
   ovInstRecv,
+  ovInstRecvTy,
   ovInstSite,
   ovSetCands,
   ovSiteSetOf,
@@ -64,9 +68,12 @@ import {
   tsKids,
   tsKind,
   tsText,
+  tsToName,
+  ufcsExportedScopeIn,
   ufcsImpMangled,
   ufcsImpName,
   ufcsImpSpec,
+  ufcsSiteRoot,
 } from "./ast"
 import { flatLayoutPinMsg, resolveAnnot } from "./check_annot_resolve"
 import {
@@ -160,9 +167,11 @@ import {
   voidRetRwRet,
 } from "./check_core_state"
 import {
+  rcwPinDecl,
   rcwPinDstTy,
   rcwPinFn,
-  rcwPinNote,
+  rcwPinNoteAt,
+  rcwPinPi,
   rcwPinSrc,
   rcwPinSrcTy,
 } from "./check_covar_pins"
@@ -182,6 +191,7 @@ import {
   cvPick,
   isCstr,
   letCstr,
+  memCalleeIs,
   memCstr,
   nestCstr,
   noteArgCstr,
@@ -220,9 +230,8 @@ import {
   recordRepTyAdopt,
   sharedUnionFieldTy,
   tpMemberFloorMsg,
-  tyTestNamesMembers,
 } from "./check_fit_rules"
-import { getterDemandNote } from "./check_getter_effects"
+import { getterDemandNote, homeModuleOf } from "./check_getter_effects"
 import { getterNarrowNote } from "./check_getter_walk"
 import { holeCastNames } from "./check_hole_links"
 import {
@@ -398,6 +407,7 @@ import {
   tErr,
   tErrCodedData,
   tErrUnsupported,
+  tyTestNamesMembers,
   widenLitTy,
 } from "./check_relate_core"
 import {
@@ -477,6 +487,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  cUserTypes,
   mkArrayTy,
   mkMapTy,
   mkNullableTy,
@@ -485,12 +496,16 @@ import {
   primNameStr,
   softenLitTy,
   strLitAsSet,
+  structNameOfTy,
   tyAt,
   tyBuiltinIndexable,
+  tyElemOf,
+  tyElemOpen,
   tyEq,
   tyHasHole,
   tyIsHole,
   tyIsLitUnion,
+  tyKeyOf,
   tyMentionsErr,
   tyMentionsTyVarNamed,
   tyPinElem,
@@ -500,16 +515,18 @@ import {
   tySame,
   tyToStr,
   tyToStrUser,
+  tyToTs,
+  tyValOf,
+  tyValOpen,
 } from "./check_types"
 import { unionFieldGapNote } from "./check_union_arm_msgs"
 import { mkUnionTy } from "./check_union_mint"
 import {
-  wsAnnMentions,
   wsCalleeDecl,
   wsDecl,
-  wsInferredRetPrim,
   wsIsIdent,
   wsNoDecl,
+  wsNotePendingAt,
   wsOrigAnn,
   wsRowOf,
 } from "./check_width"
@@ -723,10 +740,21 @@ function wsElemBuildsRecord(ix: i32): boolean {
 
 // The declared record name argument `i` of call `n`, of type `at`, would make generic: the
 // parameter's record type `expected` (bare, `| null`, or a list's element) refuses `at` only for
-// its extra fields, and the function can take a generic parameter there: not exported, the type
-// not named by its return. "" where it is no such argument. A value read is declined on apply.
+// its extra fields, and the function is not exported. "" where it is no such argument. A value
+// read is declined on apply, and an instance that refuses its row undoes the rewrite.
 export function wsCandidate(
   n: Call,
+  i: i32,
+  arg: i32,
+  at: i32,
+  expected: i32,
+): string {
+  wsCandidateAt(wsCalleeDecl(n), i, arg, at, expected)
+}
+
+// `wsCandidate` for parameter `i` of the declaration `d`, which a member call names by its receiver.
+export function wsCandidateAt(
+  d: i32,
   i: i32,
   arg: i32,
   at: i32,
@@ -757,25 +785,21 @@ export function wsCandidate(
   } else if !(pre is TyVar) {
     return ""
   }
-  const d = wsCalleeDecl(n)
   if d < 0 || i32ListHas(wsNoDecl, d) { return "" }
   const fd = nodeAt(d)
   if !(fd is FuncDecl) || i >= fd.fnParams.length || declHasExportKw(d) {
     return ""
   }
   const pn = nodeAt(fd.fnParams[i])
-  if (
-    !(pn is Param)
-    || pn.parType < 0
-    || pn.parRest == 1
-    || pn.parName == "self"
-  ) {
-    return ""
-  }
-  const name = wsAnnRecName(pn.parType)
+  if (!(pn is Param) || pn.parRest == 1) { return "" }
+  // A hole parameter its body inferred at a declared record is that record's (D16403).
+  const name = if pn.parType >= 0 { wsAnnRecName(pn.parType) } else { wsHoleRecName(ex) }
   if name == "" { return "" }
+  // An inline record's bound is re-resolved from its spelling alone, outside the declaration's
+  // type parameters.
+  if name[0] == '{' && tyHasTyVar(ex) { return "" }
   if pre is TyVar {
-    if pre.tvName.length < 3 || pre.tvName.slice(0, 3) != "__W" { return "" }
+    if !rowParamIsSlot(pre.tvName) { return "" }
   } else if pre is TyObj {
     let f = 0
     while f < ew.objFieldNames.length {
@@ -787,10 +811,7 @@ export function wsCandidate(
   }
   // Another parameter of the same record is its own candidate; an instance mixing them is refused
   // there, which undoes the rewrite (D4021).
-  if fd.fnRet < 0 {
-    return if wsInferredRetPrim(fd.fnName) { name } else { "" }
-  }
-  if wsAnnMentions(fd.fnRet, name) { "" } else { name }
+  name
 }
 
 // The record a parameter type `t` holds by value: `t`, the inner of `t | null`, or a list's element.
@@ -801,7 +822,7 @@ function wsInnerRec(t: i32) {
       return tt.nInner
     }
     TyArray => {
-      return tt.aElem
+      return tyElemOf(tt)
     }
     TyObj | TyVar => {
       return t
@@ -820,7 +841,7 @@ function wsInnerArg(at: i32, expected: i32) {
   const a = tyAt(at)
   match et {
     TyArray => {
-      return if a is TyArray { a.aElem } else { -1 }
+      return if a is TyArray { tyElemOf(a) } else { -1 }
     }
     TyNullable => {
       return if a is TyNullable { a.nInner } else { at }
@@ -832,30 +853,49 @@ function wsInnerArg(at: i32, expected: i32) {
   }
 }
 
-// The one record name a parameter annotation `ann` writes: `R`, `R | null` or `R[]`; "" for any
-// other spelling.
+// The one record a parameter annotation `ann` writes, as `wsRecKey` names it: `R`, `R | null` or
+// `R[]`; "" for any other spelling.
 function wsAnnRecName(ann: i32) {
   const a = nodeAt(ann)
   if !(a is TypeRef) { return "" }
   const r = annTsOf(ann)
   if r < 0 { return if wsIsIdent(a.tyName) { a.tyName } else { "" } }
   const k = tsKind[r]
-  if k == TS_NAME { return if wsIsIdent(tsText[r]) { tsText[r] } else { "" } }
+  if k == TS_NAME || k == TS_OBJ { return wsRecKey(r) }
   if k == TS_ARR && tsKidCount[r] == 1 {
-    const e = tsKids[tsKidStart[r]]
-    return if tsKind[e] == TS_NAME && wsIsIdent(tsText[e]) { tsText[e] } else { "" }
+    return wsRecKey(tsKids[tsKidStart[r]])
   }
   if k == TS_UNION && tsKidCount[r] == 2 {
     const x = tsKids[tsKidStart[r]]
     const y = tsKids[tsKidStart[r] + 1]
-    if tsKind[x] == TS_NAME && tsKind[y] == TS_NULL && wsIsIdent(tsText[x]) {
-      return tsText[x]
-    }
-    if tsKind[y] == TS_NAME && tsKind[x] == TS_NULL && wsIsIdent(tsText[y]) {
-      return tsText[y]
-    }
+    if tsKind[y] == TS_NULL { return wsRecKey(x) }
+    if tsKind[x] == TS_NULL { return wsRecKey(y) }
   }
   ""
+}
+
+// How a rewrite names the record spelled at `ix`: a declared record by its name, an inline one of
+// fields only by its spelling (D16290), anything else "".
+function wsRecKey(ix: i32) {
+  if tsKind[ix] == TS_NAME {
+    return if wsIsIdent(tsText[ix]) { tsText[ix] } else { "" }
+  }
+  if tsKind[ix] != TS_OBJ || tsKidCount[ix] == 0 { return "" }
+  let j = 0
+  while j < tsKidCount[ix] {
+    if tsKind[tsKids[tsKidStart[ix] + j]] != TS_FIELD { return "" }
+    j = j + 1
+  }
+  tsToName(ix)
+}
+
+// The record `ex` a hole parameter's inferred type holds, named as `wsRecKey` names it: a declared
+// one by its name, a closed inline one by its spelling.
+function wsHoleRecName(ex: i32) {
+  const nm = structNameOfTy(ex)
+  if nm != "" && (cUserTypes[nm] ?? -1) == ex { return nm }
+  if tyHasTyVar(ex) { return "" }
+  wsRecKey(tyToTs(ex))
 }
 
 // The declared record type a rewritten parameter `i` of the declaration call `n` names had, or -1
@@ -865,7 +905,7 @@ export function wsOrigTyOf(n: Call, i: i32): i32 {
   const d = wsCalleeDecl(n)
   if d < 0 { return -1 }
   const r = wsRowOf(d, i)
-  if r < 0 { return -1 }
+  if r < 0 || wsOrigAnn[r] < 0 { return -1 }
   const a = nodeAt(wsOrigAnn[r])
   if a is TypeRef { return resolveAnnot(a.tyName, []) }
   -1
@@ -1172,7 +1212,13 @@ export function validateRcwPins(
       if sub >= 0 && sub != rcwPinSrcTy[i] {
         if tyHasHole(sub) {
           if tyAt(sub) is TyVar && cstrOwnerTop() >= 0 {
-            rcwPinNote(rcwPinSrc[i], sub, rcwPinDstTy[i])
+            rcwPinNoteAt(
+              rcwPinSrc[i],
+              sub,
+              rcwPinDstTy[i],
+              rcwPinDecl[i],
+              rcwPinPi[i],
+            )
           }
         } else if !inferQuiet && assignable(sub, rcwPinDstTy[i]) {
           // The delivery seam's two record rules, in its order: a shape stored differently,
@@ -1183,6 +1229,8 @@ export function validateRcwPins(
           // built at its field's destination (D15184).
           if pinLitFieldArgs(rcwPinSrc[i], sub, rcwPinDstTy[i], at) {
             // handled field by field
+          } else if rcwPinWidthNote(i, sx, sub) {
+            // a wider row into a declared record parameter, made generic after this pass (D16219)
           } else if objShapeAdapterlessAt(sx, sub, rcwPinDstTy[i]) {
             objShapeAdapterlessErr(rcwPinSrc[i], sub, rcwPinDstTy[i])
           } else {
@@ -1201,6 +1249,17 @@ export function validateRcwPins(
   0
 }
 
+// Notes pin `i`'s delivery of `sx`, typed `sub` at this call, as a width candidate when it fills a
+// declared record parameter that refuses `sub` only for its extra fields; true if it did.
+function rcwPinWidthNote(i: i32, sx: i32, sub: i32): boolean {
+  const d = rcwPinDecl[i]
+  if d < 0 || inferQuiet { return false }
+  const name = wsCandidateAt(d, rcwPinPi[i], sx, sub, rcwPinDstTy[i])
+  if name == "" { return false }
+  wsNotePendingAt(d, rcwPinPi[i], name, rcwPinDstTy[i])
+  true
+}
+
 // `srcExpr < 0` (a dispatch probe with no argument node — a UFCS receiver, an operator
 // operand) checks the type alone, so the literal-aware / rep-sidecar recording in
 // `assignableExpr` is not driven by a node index it does not have.
@@ -1216,10 +1275,10 @@ function holeMapNullValAt(hm: i32, at: i32): i32 {
   const d = tyAt(hm)
   const a = tyAt(at)
   if d is TyMap {
-    if !cnhIsOpen(d.mVal) { return hm }
+    if !cnhIsOpen(tyValOf(d)) { return hm }
     if a is TyMap {
-      if a.mVal >= 0 && assignable(TY_NULL, a.mVal) {
-        return mkMapTy(d.mKey, a.mVal, d.mSet)
+      if !tyValOpen(a) && assignable(TY_NULL, tyValOf(a)) {
+        return mkMapTy(tyKeyOf(d), tyValOf(a), d.mSet)
       }
     }
   }
@@ -1233,9 +1292,9 @@ function holeMapArgNullPin(hm: i32, at: i32, srcExpr: i32) {
   const d = tyAt(hm)
   const a = tyAt(at)
   if d is TyMap {
-    if !cnhIsOpen(d.mVal) { return 0 }
+    if !cnhIsOpen(tyValOf(d)) { return 0 }
     if a is TyMap {
-      if a.mVal < 0 {
+      if tyValOpen(a) {
         tyPinVal(a, cnhPinTy(TY_NULL, srcExpr, srcExpr, true, false))
       }
     }
@@ -1261,7 +1320,7 @@ export function holeKidMapDemands(hole: i32, at: i32, depth: i32) {
       if ao is TyObj { sub = objFieldType(ao, hdField[row]) }
     } else if row >= 0 && (hdKind[row] == HD_ELEM || hdKind[row] == HD_ELEMV) {
       const aa = tyAt(at)
-      if aa is TyArray { sub = aa.aElem }
+      if aa is TyArray { sub = tyElemOf(aa) }
     } else {
       sub = nonNullTy(at)
     }
@@ -1804,7 +1863,25 @@ export function memCstrMsg(recv: i32, prop: string, site: i32) {
       prop.slice(MC_LAYOUT_MARK.length, prop.length),
     )
   }
-  memberFloorMsg(recv, prop)
+  const fm = memberFloorMsg(recv, prop)
+  if fm != "" && memCalleeIs(site) && typeBoundSelfFnOf(recv, prop) != "" {
+    return ""
+  }
+  fm
+}
+
+// The `self`-function `prop` the receiver type's declaring module exports for `recv`, or "": the
+// type-bound rung a member call reaches when the caller's scope binds no such function (§C).
+export function typeBoundSelfFnOf(recv: i32, prop: string): string {
+  const hm = homeModuleOf(recv)
+  if hm < 0 { return "" }
+  const name = ufcsExportedScopeIn(hm, prop)
+  if name == "" { return "" }
+  const d = fnDeclIx[name] ?? -1
+  if methodFnOfDecl(d) < 0 { return "" }
+  const fnTy = declTyOf(d)
+  if fnTy < 0 || !ufcsSelfAccepts(name, fnTy, recv) { return "" }
+  name
 }
 
 // The direct `?.prop` refusal for a receiver pinned at `recv`, or "" when it reads: a record or
@@ -1905,10 +1982,10 @@ export function validateArrDefCstrs(
       const lt = arrDefCstr.ty[ci]
       const l = tyAt(lt)
       if l is TyArray {
-        if l.aElem >= 0 && tyHasHole(l.aElem) {
-          const el = substTyDeep(l.aElem, bNames, bTys)
+        if !tyElemOpen(l) && tyHasHole(tyElemOf(l)) {
+          const el = substTyDeep(tyElemOf(l), bNames, bTys)
           if tyHasHole(el) {
-            if el != l.aElem && calleeFn >= 0 {
+            if el != tyElemOf(l) && calleeFn >= 0 {
               noteArrDefCstr(mkArrayTy(el), arrDefCstr.ix[ci])
             }
           } else if (
@@ -2090,12 +2167,12 @@ function cnhPinBmElem(
   }
   const a = tyAt(arr)
   if a is TyArray {
-    if a.aElem < 0 {
+    if tyElemOpen(a) {
       let pin = got
       if !nhOpen(got) { pin = cnhPinTy(got, at, -1, false, false) }
       tyPinElem(a, pin)
     } else if !nhOpen(got) {
-      cnhFill(a.aElem, got)
+      cnhFill(tyElemOf(a), got)
     }
   }
   0
@@ -2703,6 +2780,23 @@ function binCstrEqRefused(
   true
 }
 
+// Whether cast constraint `ci`'s pinned operand `clt` holds no member the cast could take, number
+// or `boolean` or the target: that instance misses, as a type parameter pinned at no number does
+// (D2791). A numeric member that may fail to convert keeps the refusal.
+function asPinMisses(ci: i32, clt: i32): boolean {
+  if binCstr.op[ci] != OP_AS { return false }
+  const c = binCstr.node[ci]
+  if c < 0 || c >= P.nodes.length { return false }
+  const n = nodeAt(c)
+  if !(n is AsExpr) || n.asMode == "wrap" { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(clt, ms)
+  for m in ms {
+    if isNumeric(m) || primNameStr(primNameOf(m)) == "boolean" { return false }
+  }
+  true
+}
+
 // The direct spelling's refusal sentence for constraint `ci`, whose operator is undefined for
 // the substituted operands `clt`/`crt`.
 function binCstrRefusalText(ci: i32, clt: i32, crt: i32): string {
@@ -2974,7 +3068,10 @@ export function validateBinCstrs(
             }
           }
         } else if !binCstrEqRefused(ci, clt, crt, who, ix) {
-          if !binOpDefinedFor(binCstr.op[ci], clt, crt) {
+          if (
+            !binOpDefinedFor(binCstr.op[ci], clt, crt)
+            && !asPinMisses(ci, clt)
+          ) {
             const refusal = binCstrRefusalText(ci, clt, crt)
             binCstrOpRefusal(ci, refusal, who, ix, hNames, hArgNo, hArgNode)
           } else {
@@ -3386,10 +3483,12 @@ function stdRecvFitsOne(
     if t is TyArray {
       if !ro && t.aRead != 0 { return false }
       const inner = sp.slice(0, sp.length - 2)
-      if strListHas(tps, inner) { return !primIsSubWord(primNameOf(t.aElem)) }
-      if t.aElem < 0 { return false }
-      return stdRecvFitsOne(inner, tps, t.aElem, false)
-        && stdRecvLeafExact(inner, t.aElem)
+      if strListHas(tps, inner) {
+        return !primIsSubWord(primNameOf(tyElemOf(t)))
+      }
+      if tyElemOpen(t) { return false }
+      return stdRecvFitsOne(inner, tps, tyElemOf(t), false)
+        && stdRecvLeafExact(inner, tyElemOf(t))
     }
     return false
   }
@@ -3447,6 +3546,26 @@ export function ovPickFor(row: i32, recvTy: i32): string {
   found
 }
 
+// Records that member call `site` took `pick` at receiver `recvTy`, once per (site, receiver).
+export function ovInstNote(
+  site: i32,
+  recvTy: i32,
+  recvStr: string,
+  pick: string,
+) {
+  const at = ufcsSiteRoot(site)
+  let k = 0
+  while k < ovInstSite.length {
+    if ovInstSite[k] == at && ovInstRecvTy[k] == recvTy { return 0 }
+    k = k + 1
+  }
+  ovInstSite.push(at)
+  ovInstRecv.push(recvStr)
+  ovInstPick.push(pick)
+  ovInstRecvTy.push(recvTy)
+  0
+}
+
 // One instance's answer for the overloaded member call `site`, whose receiver this pin
 // binds to `ur`: the candidate its head selects, its receiver and arguments checked under the
 // pin, and the choice recorded per instance (`ovInstSite`) for the editor.
@@ -3473,18 +3592,7 @@ function ovPinCheck(
     pick = ""
   }
   // Recorded refused or not ("" picks nothing), so the site is not also reported unpinned.
-  const urS = tyToStrUser(ur)
-  let seen = false
-  let k = 0
-  while k < ovInstSite.length {
-    if ovInstSite[k] == site && ovInstRecv[k] == urS { seen = true }
-    k = k + 1
-  }
-  if !seen {
-    ovInstSite.push(site)
-    ovInstRecv.push(urS)
-    ovInstPick.push(pick)
-  }
+  ovInstNote(site, ur, tyToStrUser(ur), pick)
   if pick == "" { return 0 }
   const ft = tyAt(moduleNameTyOf(pick))
   const c = nodeAt(site)
@@ -3695,7 +3803,7 @@ function bareBraceDeliverElems(elems: i32[], dstTy: i32, depth: i32): boolean {
   let any = false
   let k = 0
   while k < elems.length {
-    if bareBraceDeliver(elems[k], aa.aElem, depth - 1, false) { any = true }
+    if bareBraceDeliver(elems[k], tyElemOf(aa), depth - 1, false) { any = true }
     k = k + 1
   }
   any
