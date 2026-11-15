@@ -41,12 +41,19 @@ switch of `monoSlotDeliveryTy`.
   - A call through a different fresh `const` holder that the slot's class unified with (two
     `Map()`s handed to one parameter) is not the slot's either. The holder is recorded per call
     when the classes are drawn, because mono rewrites the callee later.
-- **Net:** ¶NET
+- **A class whose own holder is open takes its bounded parent's step.** A `Map()` unified with an
+  annotated list's element took its source from the `Map()` call, still open, and never read the
+  list's bound. `D15940`'s filed witness caught it.
+- **The classes are built before mono only when the elaboration asked for them.** Building them
+  for every compile ran the compiler's own L2 build out of GC heap. The L1 build passed, so only a
+  two-level bisect found this.
+- **Net:** +312 compiler lines (401 added, 89 deleted); `emit_mono` stays at 908 functions. The
+  delete is part 2b: the walk keeps the readers below until they move.
 
 ## Parity with the walk
 
 Lane M's probe: the walk and `eplSlotSig` both answer at every `monoSlotDeliveryTy` call while
-`tests/cases` builds, and the probe compares the two answers. ¶PROBE The 18 `tests/cases` programs
+`tests/cases` builds, and the probe compares the two answers. The 18 `tests/cases` programs
 that the first switch broke all run and print their `@log` lines. Three answers still differ;
 every one of those programs runs:
 
@@ -62,7 +69,21 @@ the first two to the walk's answer.
 
 ## Readings
 
-¶READINGS
+All on fixpoint seeds. Master `6015bf3ed`, built to a fixpoint from its own seed; the
+candidate is that master plus this branch, built to a fixpoint from master's.
+
+| check | reading |
+|---|---|
+| distilled corpus, per cell | 12,101 of 12,101 identical to master |
+| `decl-order-ab.vl` | 71 of 5,166 cases move, 1 to clause 1: the same as master |
+| late demands | 2 in 2 files: the baseline |
+| L2 self-compile fuel | 87.673e9 against the baseline's 87.367e9: +0.4% |
+| L2 peak live set | 1,006 MiB, 49% of the 2 GiB heap |
+| seed size | 6,393,260 bytes, +0.2% on the baseline |
+| plumb-shape cost | ok |
+| `deno task test` cases (`cases_wasm_0`, `_1`) | 3,920 passed, 0 failed |
+| filed witnesses (`--strict`, both inventories) | every row as filed |
+| `scripts/gate.sh` | every row ok but `ci-native`'s 5 seed-cache and sidecar tests, which fail on master's seed too in this container |
 
 ## Next: part 2b
 
