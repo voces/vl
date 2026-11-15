@@ -155,7 +155,7 @@ function f(x: i32): Insn {
   } else {
     {}
   }
-  ins
+  return ins
 }
 print(f(3).len)
 ```

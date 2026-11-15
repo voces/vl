@@ -378,7 +378,7 @@ commit message is a summary of it.**
 One function appended to `compiler/lint.vl`, never called:
 
 ```vl
-function em2ProbeUnusedSlot(cb: (string, i32, i32, i32) => i32, x: i32): i32 { x }
+function em2ProbeUnusedSlot(cb: (string, i32, i32, i32) => i32, x: i32): i32 { return x }
 ```
 
 | | master | + the probe | delta |
