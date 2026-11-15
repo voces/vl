@@ -46,7 +46,22 @@ still has a reader, so the part that deletes the walk's paths comes once the rea
 
 ## Readings
 
-¶READINGS
+All on fixpoint seeds, with master `b75afba1f` merged in to `e6dae9f66`.
+
+| check | reading |
+|---|---|
+| fixpoint | L2 and L3 byte-identical |
+| distilled corpus | 0 `runs → not-runs`; one cell moves, `dord030`, check-clean invalid wasm → runs |
+| `cases_wasm` | 3,941 passed, 0 failed |
+| late demands | 2 in 2 files: the baseline |
+| filed witnesses (`--strict`) | 5,144 of 5,145 as filed; [D16472](../inventory/D16472.md) reads `wrong_output` on master's seed too, until the shared host is rebuilt for #8314 |
+| `decl-order-ab.vl` | 0 movers outside the baseline |
+| L2 self-compile fuel | +0.0% on the baseline; peak live set 1,008 MiB |
+| seed size | +0.4% |
+| plumb-shape cost | ok |
+| `scripts/gate.sh` | every row ok but `ci-native`'s 5 seed-cache and sidecar tests, which fail on master's seed too in this container, and the D16472 row above |
+
+Net: +28 compiler lines (43 added, 15 deleted).
 
 ## Next
 
