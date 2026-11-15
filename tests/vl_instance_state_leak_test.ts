@@ -804,8 +804,8 @@ Deno.test({
 const IMPORTER_KEY = "/proj/main.vl";
 const IMPORTER =
   'import { pick } from "./util"\nconst r: i32 = pick()\nprint(r)\n';
-const DEP_I32 = "export function pick(): i32 {\n  1\n}\n";
-const DEP_F64 = "export function pick(): f64 {\n  1.5\n}\n";
+const DEP_I32 = "export function pick(): i32 {\n  return 1\n}\n";
+const DEP_F64 = "export function pick(): f64 {\n  return 1.5\n}\n";
 
 Deno.test({
   name:
@@ -930,7 +930,7 @@ const PI_ENTRY =
   'import { mk } from "./w"\nconst v = mk("x") + "a" + "bb" + "ccc"\nprint(v)\n' +
   'print("<" + "a" + "b" + "c" + ">")\n';
 const PI_ALIAS =
-  "export type Widget = string\nexport function mk(s: string): Widget { s }\n";
+  "export type Widget = string\nexport function mk(s: string): Widget { return s }\n";
 const PI_OWN_PLUS = "export type Widget = new { s: string }\n" +
   "export function mk(s: string): Widget {\n  const r: Widget = { s: s }\n  return r\n}\n" +
   'function "+"(self: Widget, other: string): Widget {\n  const r: Widget = { s: other }\n  return r\n}\n';

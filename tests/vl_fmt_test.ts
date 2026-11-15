@@ -257,7 +257,7 @@ Deno.test({
     // still runs and prints what the original did — a round-trip that only compares text
     // cannot tell a preserved arm from a silently rewritten one.
     const src = "function len(id: i32): i32 {\n" +
-      "  match id { 0x10 => 14\n" +
+      "  return match id { 0x10 => 14\n" +
       "    0x12 | 0x13 => 30\n" +
       "    -1 => 99 _ => 0 }\n" +
       "}\n" +
@@ -322,7 +322,7 @@ Deno.test({
       "type Attack = { target: string }\n" +
       "type Cmd = Move | Attack\n" +
       "function f(c: Cmd) {\n" +
-      "  match c {\n" +
+      "  return match c {\n" +
       "    Move{x,y} => x + y\n" +
       "    Attack{ target , } => target.length\n" +
       "  }\n" +
@@ -737,7 +737,7 @@ Deno.test({
     // declaration. Three shapes — a comment on its own line inside an object literal,
     // inside a call's argument list, and trailing an element of each.
     const src =
-      "function g(x: i32, y: i32): i32 { x + y }\n" +
+      "function g(x: i32, y: i32): i32 { return x + y }\n" +
       "const o = {\n" +
       "  a: 1,\n" +
       "  // the b field\n" +
@@ -783,7 +783,7 @@ Deno.test({
     // itself and already hosts its own comments, so a badly laid out one is still
     // reformatted — in a list element, an object field and a call argument alike.
     const src =
-      "function apply1(f: (i32) => i32) { f(1) }\n" +
+      "function apply1(f: (i32) => i32) { return f(1) }\n" +
       "const zs = [\n" +
       "  (v: i32) => {\n" +
       "        // tripling\n" +
@@ -974,13 +974,13 @@ Deno.test({
     try {
       const f = `${dir}/f.vl`;
       const src =
-        "export function rbyteLen(): i32 { W.bytes.length }\n" +
-        "function big(): i32 {\n  const x = 1\n  x\n}\n";
+        "export function rbyteLen(): i32 { return W.bytes.length }\n" +
+        "function big(): i32 {\n  const x = 1\n  return x\n}\n";
       await Deno.writeTextFile(f, src);
       const r = await run([f]);
       if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
       // The single-expression body is kept on one line (not expanded).
-      if (!r.out.includes("export function rbyteLen(): i32 { W.bytes.length }\n")) {
+      if (!r.out.includes("export function rbyteLen(): i32 { return W.bytes.length }\n")) {
         throw new Error(`inline body was expanded:\n${r.out}`);
       }
       // The two-statement body stays multi-line.
@@ -1046,7 +1046,7 @@ Deno.test({
         "export function mkLet(kw: string, name: string, ty: i32, init: i32, pos: i32): i32 {\n" +
         "  addNode(n)\n" +
         "}\n" +
-        "function short(a: i32, b: i32): i32 { a + b }\n";
+        "function short(a: i32, b: i32): i32 { return a + b }\n";
       await Deno.writeTextFile(f, src);
       const r = await run([f]);
       if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
@@ -1057,7 +1057,7 @@ Deno.test({
       if (!r.out.includes(wrapped)) {
         throw new Error(`params did not wrap one-per-line:\n${r.out}`);
       }
-      if (!r.out.includes("function short(a: i32, b: i32): i32 { a + b }\n")) {
+      if (!r.out.includes("function short(a: i32, b: i32): i32 { return a + b }\n")) {
         throw new Error(`short header should stay inline:\n${r.out}`);
       }
       const f2 = `${dir}/f2.vl`;
@@ -1159,7 +1159,7 @@ Deno.test({
       // AROUND it still wraps.
       const f = `${dir}/w.vl`;
       const src =
-        "function emitMapSet(a: i32, b: i32, c: i32, d: i32, e: i32): i32 { a }\n" +
+        "function emitMapSet(a: i32, b: i32, c: i32, d: i32, e: i32): i32 { return a }\n" +
         "function foo(targetLonger: i32, fnIxLonger: i32): i32 {\n" +
         "  if targetLonger > 0 {\n" +
         "    return emitMapSet(targetLonger, targetLonger, targetLonger, targetLonger, fnIxLonger)\n" +
@@ -1706,7 +1706,7 @@ Deno.test({
       `  a()`,
       `  b()`,
       `}`,
-      `function firstLam(f: (i32) => i32, k: i32): i32 { f(k) }`,
+      `function firstLam(f: (i32) => i32, k: i32): i32 { return f(k) }`,
       ``,
       `two(() => {`,
       `  print(1)`,
@@ -2098,9 +2098,9 @@ Deno.test({
   fn: async () => {
     const src = [
       "type Showable = { toString(): string }",
-      "function a<T: Showable>(x: T): string { x.toString() }",
-      "function b<T: { toString(): string }>(x: T): string { x.toString() }",
-      "function c<A: Showable, B>(x: A, y: B): string { x.toString() }",
+      "function a<T: Showable>(x: T): string { return x.toString() }",
+      "function b<T: { toString(): string }>(x: T): string { return x.toString() }",
+      "function c<A: Showable, B>(x: A, y: B): string { return x.toString() }",
       'print("ok")',
       "",
     ].join("\n");
@@ -2361,7 +2361,7 @@ Deno.test({
       "}",
       "function outer(): i32 {",
       "  (n: i32) => n",
-      "  0",
+      "  return 0",
       "}",
       "print(outer() + 7)",
       "",
@@ -2549,7 +2549,7 @@ Deno.test({
       "  }",
       "}",
       "function braceless(n: N): i32 {",
-      "  match n {",
+      "  return match n {",
       "    A => 1 // trailing, on the arm's own line",
       "    // between two braceless arms",
       "    B => 2",
@@ -2969,7 +2969,7 @@ Deno.test({
       "const o = {",
       "  base: 7,",
       "  f() {",
-      '    "ok"',
+      '    return "ok"',
       "  },",
       "  triple(x: i32) x + x + x,",
       "  add(a: i32, b: i32): i32 {",
@@ -3074,18 +3074,18 @@ Deno.test({
       "    attack,",
       "  },",
       "  )",
-      "  i.seq + pending[1].moveX + pending[2].moveY + pending.length",
+      "  return i.seq + pending[1].moveX + pending[2].moveY + pending.length",
       "}",
-      "function nested(id: i32, n: i32): Q { ({ p: { id }, n }) }",
-      "function wrapped(id: i32): P { ({ id }) }",
+      "function nested(id: i32, n: i32): Q { return ({ p: { id }, n }) }",
+      "function wrapped(id: i32): P { return ({ id }) }",
       "function returned(id: i32): P { return { id } }",
       "const lambda = (id: i32): P => ({ id })",
-      "function block(id: i32): i32 { id }",
-      "function pair(id: i32, n: i32): Q { { p: { id }, n } }",
-      "function bare(id: i32, n: i32): R { { id, n } }",
-      "function lone(id: i32): P { { id, } }",
+      "function block(id: i32): i32 { return id }",
+      "function pair(id: i32, n: i32): Q { return { p: { id }, n } }",
+      "function bare(id: i32, n: i32): R { return { id, n } }",
+      "function lone(id: i32): P { return { id, } }",
       "function arm(k: i32, id: i32, n: i32): R {",
-      "  match k {",
+      "  return match k {",
       "    0 => { id, n }",
       "    _ => { id: n, n }",
       "  }",
@@ -3175,17 +3175,17 @@ Deno.test({
 // shorthand still resolves as a method; it does NOT exercise the same-line REQUIREMENT itself
 // (both cases here already have their `{` on the same line) — the sibling test below does that.
 Deno.test({
-  name: "vl-fmt: a same-line method shorthand as a function body's sole member is an object, not a block",
+  name: "vl-fmt: a same-line method shorthand as a returned object's sole member is an object",
   ignore: !ENABLED,
   fn: async () => {
     const src = [
       "function mk1() {",
-      '  greet() { "hi" }',
+      '  return { greet() { return "hi" } }',
       "}",
       "print(mk1().greet())",
       "",
       "function mk2() {",
-      "  double(n: i32) { n * 2 }",
+      "  return { double(n: i32) { return n * 2 } }",
       "}",
       "print(mk2().double(4))",
       "",
@@ -3239,7 +3239,7 @@ Deno.test({
 // since neither is shorthand and both are already fmt-clean — this test exercises the exact
 // same programs through a second, independent harness).
 Deno.test({
-  name: "vl-fmt: a call followed by a newline then a brace-led tail is a block, never a method",
+  name: "vl-fmt: a call followed by a newline then a brace-led statement is a block, never a method",
   ignore: !ENABLED,
   fn: async () => {
     const cases: Array<{ src: string; want: string }> = [
@@ -3248,12 +3248,15 @@ Deno.test({
           "type Q = { x: i32 }",
           "function mk(n: i32): Q {",
           '  print("mk")',
-          "  { x: n }",
+          "  {",
+          '    print("in")',
+          "  }",
+          "  return { x: n }",
           "}",
           "print(mk(3).x)",
           "",
         ].join("\n"),
-        want: "mk\n3\n",
+        want: "mk\nin\n3\n",
       },
       {
         src: [
@@ -3261,24 +3264,30 @@ Deno.test({
           "function foo() { print(\"foo\") }",
           "function mk(n: i32): Q {",
           "  foo()",
-          "  { x: n }",
+          "  {",
+          '    print("in")',
+          "  }",
+          "  return { x: n }",
           "}",
           "print(mk(3).x)",
           "",
         ].join("\n"),
-        want: "foo\n3\n",
+        want: "foo\nin\n3\n",
       },
       {
         src: [
           "type Q = { x: i32 }",
           "function mk(n: i32): Q {",
           "  print(n)",
-          "  { x: n }",
+          "  {",
+          '    print("in")',
+          "  }",
+          "  return { x: n }",
           "}",
           "print(mk(3).x)",
           "",
         ].join("\n"),
-        want: "3\n3\n",
+        want: "3\nin\n3\n",
       },
     ];
     const dir = await makeTempDir({ prefix: "vl_fmt_call_then_brace_" });
@@ -3432,7 +3441,7 @@ Deno.test({
       "      break @B",
       "    }",
       "  }",
-      "  n",
+      "  return n",
       "}",
       "print(f(false))",
       "",
@@ -3450,7 +3459,7 @@ Deno.test({
           "    q = 5",
           "    q + 1",
           "  } else { 3 }",
-          "  r",
+          "  return r",
           "}",
           "print(k(false, true))",
           "",
@@ -3466,7 +3475,7 @@ Deno.test({
           "  } else {",
           "    3",
           "  }",
-          "  r",
+          "  return r",
           "}",
           "print(k(false, true))",
           "",
@@ -3480,7 +3489,7 @@ Deno.test({
           "    const t = 4",
           "    [t][0]",
           "  } else { 3 }",
-          "  r",
+          "  return r",
           "}",
           "print(k(true))",
           "",
@@ -3493,7 +3502,7 @@ Deno.test({
           "  } else {",
           "    3",
           "  }",
-          "  r",
+          "  return r",
           "}",
           "print(k(true))",
           "",
@@ -3508,7 +3517,7 @@ Deno.test({
           "    const t = 4",
           "    [t][0]",
           "  } else { 3 }",
-          "  f()",
+          "  return f()",
           "}",
           "print(k(true))",
           "",
@@ -3521,7 +3530,7 @@ Deno.test({
           "  } else {",
           "    3",
           "  }",
-          "  f()",
+          "  return f()",
           "}",
           "print(k(true))",
           "",
@@ -3540,7 +3549,7 @@ Deno.test({
           "    q = 5",
           "    -q",
           "  } else { 3 }",
-          "  f(2)",
+          "  return f(2)",
           "}",
           "print(k(false))",
           "",
@@ -3557,7 +3566,7 @@ Deno.test({
           "  } else {",
           "    3",
           "  }",
-          "  f(2)",
+          "  return f(2)",
           "}",
           "print(k(false))",
           "",
@@ -3568,7 +3577,7 @@ Deno.test({
       {
         src: [
           "function k(xs: i32[]): i32[] {",
-          "  xs.map((x: i32) => if x > 1 {",
+          "  return xs.map((x: i32) => if x > 1 {",
           "    const t = x * 2",
           "    [t][0]",
           "  } else { x })",
@@ -3578,7 +3587,7 @@ Deno.test({
         ].join("\n"),
         want: [
           "function k(xs: i32[]): i32[] {",
-          "  xs.map(",
+          "  return xs.map(",
           "    (x: i32) => if x > 1 {",
           "      const t = x * 2",
           "      [t][0]",
@@ -3636,11 +3645,11 @@ Deno.test({
         prints: "3\n",
       },
       {
-        src: "function g(c: boolean) { if c { a: 1 } else { a: 2 } }\n" +
+        src: "function g(c: boolean) { return if c { a: 1 } else { a: 2 } }\n" +
           "const m = (k: i32) => match k { 1 => { a: 7 }, _ => { a: 8 } }\n" +
           "const p = if 2 > 1 { x: 1, y: 2 } else { x: 3, y: 4 }\n" +
           "print(g(false).a + m(1).a + p.y)\n",
-        want: "function g(c: boolean) {\n  if c { a: 1 } else { a: 2 }\n}\n" +
+        want: "function g(c: boolean) { return if c { a: 1 } else { a: 2 } }\n" +
           "const m = (k: i32) => match k {\n  1 => { a: 7 }\n  _ => { a: 8 }\n}\n" +
           "const p = if 2 > 1 { x: 1, y: 2 } else { x: 3, y: 4 }\n" +
           "print(g(false).a + m(1).a + p.y)\n",
@@ -3695,13 +3704,13 @@ Deno.test({
       "  // the null-safe link follows a comment",
       "  ?.n",
       "type Held = { inner: Inner }",
-      "function none(): Held | null { null }",
+      "function none(): Held | null { return null }",
       "const o2 = none()",
       "  ?.inner",
       "  /// still guarded by the `?.` above",
       "  .n",
       "function f() {",
-      "  xs",
+      "  return xs",
       "    .map((v) => v * 4)",
       "    // a blank line after this comment is dropped",
       "",
