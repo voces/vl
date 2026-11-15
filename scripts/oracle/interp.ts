@@ -18,8 +18,13 @@ export class Flt { constructor(public v: number, public w: 32 | 64) {} }
 // A float constant also carries its exact rational value `q` while it has one (E9.1).
 // `radix` is 0, or the pattern width of the widest radix literal in the tree (32 or 64, T2.3).
 // `wideDec`: the tree holds a decimal literal outside i32, which makes a radix tree i64-wide.
+// `join`: the value of an `if` whose arms are constants. It adopts its use's type like a constant
+// but is no part of an exact tree, since E9.1 does not list `if`.
 export class Lit {
   wideDec = false;
+  join = false;
+  derived = false; // computed by an operator, not written
+
   constructor(public i: bigint | null, public f: number | null, public radix: number | boolean, public q: [bigint, bigint] | null = null) {}
 }
 export class Rec { constructor(public f: Map<string, Val>) {} }
@@ -178,6 +183,27 @@ export function ratToDouble(n: bigint, d: bigint): number {
   return neg ? -v : v;
 }
 
+// A constant's default type beside another constant: a radix pattern of 32 bits beside a decimal
+// whose default is i64 is read at i64, its peer's width (T2.3).
+function pairDefault(l: Lit, other: Lit): Val {
+  const d = litDefault(l);
+  if (l.radix === 32 && !l.wideDec && !other.radix && other.i !== null && numKind(litDefault(other)) === "i64") return litTo(l, "i64");
+  return d;
+}
+
+function asJoin(l: Lit): Lit {
+  const j = new Lit(l.i, l.f, l.radix, l.q);
+  j.wideDec = l.wideDec;
+  j.join = true;
+  return j;
+}
+
+function isConstTree(e: Expr): boolean {
+  if (isNumLit(e)) return true;
+  if (e.k === "un") return (e.op === "-" || e.op === "~") && isConstTree(e.e);
+  return e.k === "bin" && ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"].includes(e.op) && isConstTree(e.l) && isConstTree(e.r);
+}
+
 function litHolds(l: Lit, k: string): boolean {
   if (l.i === null) return k === "f64" || k === "f32";
   if (l.radix) return k !== "i32" || (l.radix === 32 && !l.wideDec);
@@ -207,8 +233,9 @@ function litArith(op: string, a: Lit, b: Lit): Val {
       case "+": return L(x + y);
       case "-": return L(x - y);
       case "*": return L(x * y);
-      case "/": if (y === 0n) throw new TypeFault("constant division by zero"); if (radix) throw new Unsupported("spec gap: / on a radix constant"); return L(x / y);
-      case "%": if (y === 0n) throw new TypeFault("constant division by zero"); if (radix) throw new Unsupported("spec gap: % on a radix constant"); return L(x % y);
+      // the checker refuses a decimal tree's zero divisor; what reaches here runs, and traps (T1.2)
+      case "/": if (y === 0n) throw new Trap("integer divide by zero"); if (radix) throw new Unsupported("spec gap: / on a radix constant"); return L(x / y);
+      case "%": if (y === 0n) throw new Trap("integer divide by zero"); if (radix) throw new Unsupported("spec gap: % on a radix constant"); return L(x % y);
       // A radix constant is a bit pattern "at its use's width under every operator" (E9.1):
       // the oracle declines rather than guess the width before the use is known.
       case "&": case "|": case "^": case "<<": case ">>": case ">>>":
@@ -226,6 +253,9 @@ function litArith(op: string, a: Lit, b: Lit): Val {
     // E9.1: computed exactly and rounded once at the use. A float division by zero is not
     // folded, so it (and anything built from it) computes at f64.
     const qa = a.i !== null ? [a.i, 1n] as [bigint, bigint] : a.q, qb = b.i !== null ? [b.i, 1n] as [bigint, bigint] : b.q;
+    if ((op === "/" || op === "%") && qb && qb[0] === 0n && (a.derived || b.derived)) {
+      throw new Unsupported("spec gap: a float division by zero inside a constant tree (owner question)");
+    }
     if (qa && qb && !(op === "/" || op === "%") || (qa && qb && qb[0] !== 0n)) {
       const [n1, d1] = qa!, [n2, d2] = qb!;
       let r: [bigint, bigint] | null = null;
@@ -237,7 +267,9 @@ function litArith(op: string, a: Lit, b: Lit): Val {
       // the rational has no signed zero: its sign is IEEE's for the same operation
       if (r) {
         const z = dblOp(op, a.f ?? Number(a.i), b.f ?? Number(b.i));
-        return new Lit(null, r[0] === 0n ? (z < 0 || Object.is(z, -0) ? -0 : 0) : ratToDouble(r[0], r[1]), false, r);
+        const out = new Lit(null, r[0] === 0n ? (z < 0 || Object.is(z, -0) ? -0 : 0) : ratToDouble(r[0], r[1]), false, r);
+        out.derived = true;
+        return out;
       }
     }
     const x = a.f ?? Number(a.i), y = b.f ?? Number(b.i);
@@ -256,6 +288,10 @@ function litArith(op: string, a: Lit, b: Lit): Val {
 // peer computes at a wider destination instead, the peer widened (DECISIONS D3043: an i64
 // binding, return, argument or operator peer adopts the literal tree).
 function arith(op: string, a: Val, b: Val, expK: string | null = null): Val {
+  if (a instanceof Lit && b instanceof Lit && (a.join || b.join)) {
+    const at = (l: Lit, o: Lit) => expK && litHolds(l, expK) ? litTo(l, expK) : pairDefault(l, o);
+    return arith(op, at(a, b), at(b, a));
+  }
   if (a instanceof Lit && b instanceof Lit) return litArith(op, a, b);
   let ka = a instanceof Lit ? null : numKind(a), kb = b instanceof Lit ? null : numKind(b);
   if (expK && (ka === null) !== (kb === null)) {
@@ -326,7 +362,7 @@ function compare(op: string, a: Val, b: Val): boolean {
   let x: number | bigint, y: number | bigint;
   // A comparison is not a constant operator (E9.1): each side takes its default type first,
   // which is also where a radix constant becomes its i32 bit pattern.
-  if (a instanceof Lit && b instanceof Lit) return compare(op, litDefault(a), litDefault(b));
+  if (a instanceof Lit && b instanceof Lit) return compare(op, pairDefault(a, b), pairDefault(b, a));
   {
     const k = a instanceof Lit ? numKind(b) : b instanceof Lit ? numKind(a) : wider(numKind(a) ?? "?", numKind(b) ?? "?");
     if (!k) throw new TypeFault(`comparison on ${show(a)} and ${show(b)}`);
@@ -357,7 +393,7 @@ function equal(a: Val, b: Val): boolean {
   if (typeof a === "boolean" || typeof b === "boolean") return a === b;
   const na = a instanceof Lit || numKind(a), nb = b instanceof Lit || numKind(b);
   if (na && nb) {
-    if (a instanceof Lit && b instanceof Lit) return equal(litDefault(a), litDefault(b));
+    if (a instanceof Lit && b instanceof Lit) return equal(pairDefault(a, b), pairDefault(b, a));
     const k = a instanceof Lit ? numKind(b)! : b instanceof Lit ? numKind(a)! : wider(numKind(a)!, numKind(b)!);
     const p = toKind(a, k), q = toKind(b, k);
     return p instanceof Flt ? p.v === (q as Flt).v : p === q;
@@ -577,13 +613,13 @@ export class Interp {
   }
 
   // S1.1 / E13.1: run the statements; the value is the last expression statement's.
-  execBlock(body: Stmt[], env: Env): Val {
+  execBlock(body: Stmt[], env: Env, expLast: Ty | null = null): Val {
     this.hoist(body, env);
     let last: Val = VOID;
     for (let i = 0; i < body.length; i++) {
       const s = body[i];
       last = VOID;
-      if (s.k === "expr") last = this.eval(s.e, env, null);
+      if (s.k === "expr") last = this.eval(s.e, env, i === body.length - 1 ? expLast : null);
       else this.exec(s, env);
     }
     return last;
@@ -732,7 +768,8 @@ export class Interp {
       if (pi < pos.length) throw new TypeFault(`too many arguments to ${d.name}`);
       let r: Val;
       try {
-        r = Array.isArray(d.body) ? this.execBlock(d.body, env) : this.eval(d.body, env, d.ret);
+        // the body's last expression is delivered to the return type, so it is its context
+        r = Array.isArray(d.body) ? this.execBlock(d.body, env, d.ret) : this.eval(d.body, env, d.ret);
         // E13.1: a body's value is its last expression; a void function discards it.
         if (d.ret && d.ret.k === "name" && d.ret.name === "void") r = VOID;
         // spec gap (owner question): S8.1 says every path returns; the compiler lets a body whose
@@ -836,13 +873,13 @@ export class Interp {
         const v = this.eval(e.e, env, exp);
         if (e.op === "!") return !this.asBool(v, "operand of !");
         if (e.op === "-") {
-          if (v instanceof Lit && v.i !== null) { const n = new Lit(-v.i, null, v.radix); n.wideDec = e.e.k === "int" ? !v.radix && (-v.i < BigInt(I32_MIN) || -v.i > BigInt(I32_MAX)) : v.wideDec; return n; } // `-2147483648` is an i32 literal (T2.1), the minus folded in
-          if (v instanceof Lit) return v.i !== null ? new Lit(-v.i, null, v.radix) : new Lit(null, -v.f!, false, v.q ? [-v.q[0], v.q[1]] : null);
+          if (v instanceof Lit && v.i !== null) { const n = new Lit(-v.i, null, v.radix); n.wideDec = e.e.k === "int" ? !v.radix && (-v.i < BigInt(I32_MIN) || -v.i > BigInt(I32_MAX)) : v.wideDec; n.join = v.join; return n; } // `-2147483648` is an i32 literal (T2.1), the minus folded in
+          if (v instanceof Lit) { const n = new Lit(null, -v.f!, false, v.q ? [-v.q[0], v.q[1]] : null); n.join = v.join; return n; }
           if (v instanceof Flt) return new Flt(-v.v, v.w);
           return arith("-", typeof v === "bigint" ? 0n : 0, v);
         }
         if (e.op === "~") {
-          if (v instanceof Lit && v.i !== null && !v.radix) return new Lit(-v.i - 1n, null, false);
+          if (v instanceof Lit && v.i !== null && !v.radix) { const n = new Lit(-v.i - 1n, null, false); n.join = v.join; n.derived = true; return n; }
           if (typeof v === "number") return ~v;
           if (typeof v === "bigint") return wrap64(~v);
           throw new Unsupported("~ on " + show(v));
@@ -895,20 +932,21 @@ export class Interp {
         const c = this.asBool(this.eval(e.c, env, null), "if-condition");
         // E9.1 does not list `if`, so with no context its value is typed, not a constant.
         const v = c ? this.blockValue(e.t, env, exp) : e.f ? this.blockValue(e.f, env, exp) : VOID;
-        if (exp) return v;
+        if (exp) return v instanceof Lit ? asJoin(v) : v;
         // T3.6 at an `if` join: a constant arm adapts to the other arm's type, read from its
         // declaration since that arm did not run; one that cannot widens the join.
         const other = c ? e.f : e.t;
         const ok = other && other.length ? other[other.length - 1] : null;
         const kOther = ok && ok.k === "expr" ? this.staticKind(ok.e, env) : null;
         if (v instanceof Lit) {
+          if (!kOther && ok && ok.k === "expr" && isConstTree(ok.e)) return asJoin(v);
           if (!kOther) return litDefault(v);
           if (litHolds(v, kOther)) { try { return litTo(v, kOther); } catch { /* the default */ } }
           const d = litDefault(v), dk = numKind(d)!;
           return WIDENS[kOther]?.includes(dk) ? d : WIDENS[dk]?.includes(kOther) ? toKind(d, kOther) : d;
         }
         const kv = numKind(v);
-        if (kv && ok && ok.k === "expr" && isNumLit(ok.e)) {
+        if (kv && ok && ok.k === "expr" && isConstTree(ok.e)) {
           const lit = this.eval(ok.e, env, null) as Lit;
           if (!litHolds(lit, kv)) { const dk = numKind(litDefault(lit))!; if (WIDENS[kv]?.includes(dk)) return toKind(v, dk); }
         }
@@ -956,7 +994,13 @@ export class Interp {
     switch (e.k) {
       case "as": return one(e.ty);
       case "id": { const b = env.lookup(e.name); return b ? (one(b.ty) ?? (b.v instanceof Lit ? null : numKind(b.v))) : null; }
-      case "call": return one(this.declTy(e, env));
+      case "call":
+        // min, max and abs keep their operand's width (E2.7)
+        if (e.f.k === "id" && ["min", "max", "abs"].includes(e.f.name) && !env.lookupFns(e.f.name)) {
+          for (const a of e.args) { const k = this.staticKind(a.e, env); if (k) return k; }
+          return null;
+        }
+        return one(this.declTy(e, env));
       case "un": return e.op === "-" || e.op === "~" ? this.staticKind(e.e, env) : null;
       case "bin": {
         if (!["+", "-", "*", "/", "%", "&", "|", "^"].includes(e.op)) return null;
@@ -1046,8 +1090,19 @@ export class Interp {
     if (exp && ["&", "|", "^", "<<", ">>", ">>>"].includes(op)) {
       try { const x = this.resolve(exp, env); if (x.k === "name" && (x.name === "f64" || x.name === "f32")) exp = null; } catch { exp = null; }
     }
-    const l = this.eval(e.l, env, arithOp ? exp : null);
-    const r = this.eval(e.r, env, arithOp && !["<<", ">>", ">>>"].includes(op) ? exp : null);
+    // A constant operand takes its typed peer's type as its context (DECISIONS D3043: an operator
+    // peer adopts the literal tree). A constant has no effects, so its side may run second.
+    let l: Val, r: Val;
+    const rExp = arithOp && !["<<", ">>", ">>>"].includes(op) ? exp : null;
+    if (arithOp && !exp && isConstTree(e.l) && !isConstTree(e.r)) {
+      r = this.eval(e.r, env, rExp);
+      const k = numKind(r);
+      l = this.eval(e.l, env, k ? { k: "name", name: k, args: [] } : null);
+    } else {
+      l = this.eval(e.l, env, arithOp ? exp : null);
+      const k = numKind(l);
+      r = this.eval(e.r, env, rExp ?? (arithOp && !exp && k && isConstTree(e.r) && !["<<", ">>", ">>>"].includes(op) ? { k: "name", name: k, args: [] } : null));
+    }
     // An operator function (`function "+"(self: V, other: V)`) applies to its own types.
     const opFns = env.lookupFns(op);
     if (opFns && !(l instanceof Lit) && numKind(l) === null && typeof l !== "string" && typeof l !== "boolean" && l !== null) {
@@ -1068,6 +1123,7 @@ export class Interp {
       // `>>>` of a negative constant needs a width: the destination's, when it is i64.
       if (op === ">>>" && l.i !== null && l.i < 0n && !l.radix && expK === "i64") return arith(">>>", litTo(l, "i64"), litDefault(r));
       // E9.1: the exact constant is computed first and typed at its use.
+      if (l.join || r.join) return arith(op, l, r, expK);
       return litArith(op, l, r);
     }
     return arith(op, l, r, expK);
@@ -1200,7 +1256,8 @@ export class Interp {
     if (f instanceof Bi && ["min", "max", "abs"].includes(f.name)) {
       const args = this.evalArgs(e.args, env);
       const typed = args.some((a) => !(a instanceof Lit) && numKind(a) !== null);
-      return f.call(args.map((a) => a instanceof Lit && !typed ? litDefault(a) : a), this);
+      const lits = args.filter((a) => a instanceof Lit) as Lit[];
+      return f.call(args.map((a) => a instanceof Lit && !typed ? (lits.length === 2 ? pairDefault(a, lits[0] === a ? lits[1] : lits[0]) : litDefault(a)) : a), this);
     }
     return this.callValue(f, e.args, env, e.line);
   }
@@ -1292,6 +1349,9 @@ export class Interp {
       // and f32 the i32 pattern. An owner question, so no verdict.
       throw new Unsupported("spec gap: a radix constant in a float context");
     }
+    // a radix tree as wide as i64 (a pattern over 32 bits, or a decimal leaf outside i32) is read
+    // at i64 before an integer cast checks its range
+    if (v instanceof Lit && v.radix && (v.radix === 64 || v.wideDec) && k !== "f64" && k !== "f32" && e.mode !== "as%") v = litTo(v, "i64");
     if (v instanceof Lit && e.mode !== "as%") {
       try { return litTo(v, k === "u8" || k === "u16" ? "i32" : k); } catch (x) { if (!(x instanceof LitFault)) throw x; return this.castFail(e, "not exact"); }
     }
