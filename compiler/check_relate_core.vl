@@ -410,6 +410,7 @@ import {
   eqRefusals,
   fvaSlotMayDiffer,
   holeArgScalarRefused,
+  isWidenNotVariant,
   joinWidensMap,
   listJoinStorageDiffers,
   litNumUnionConverts,
@@ -637,7 +638,6 @@ import {
   tyReachesHole,
   tyStoresVoid,
   unionArmSubsumedBy,
-  unionCoversTy,
   unionDropSubsumedArms,
 } from "./tyquery"
 
@@ -1737,13 +1737,16 @@ function tyVarMemberOf(v: i32, u: i32): boolean {
 function asPinHolds(from: i32, to: i32): boolean {
   if from < 0 || to < 0 || from >= T.tys.length { return true }
   const f = tyAt(from)
-  if f is TyUnion { return unionCoversTy(f, to) }
-  // A nullable operand is a union operand, as `checkCastNode` reads it.
-  if f is TyNullable {
-    if f.nInner < 0 { return true }
-    const nu = tyAt(mkUnionTy([f.nInner, TY_NULL]))
-    if nu is TyUnion { return unionCoversTy(nu, to) }
-    return true
+  // A union or nullable operand casts to the members the type test names (`tyTestMemberFit`),
+  // as `checkCastUnionArm` asks it.
+  if f is TyUnion || f is TyNullable {
+    if f is TyNullable && f.nInner < 0 { return true }
+    const ms: i32[] = []
+    flattenVariantsInto(from, ms)
+    for m in ms {
+      if tyTestMemberFit(m, to) != TT_NONE { return true }
+    }
+    return false
   }
   if from == to || assignable(from, to) { return true }
   isNumeric(from) && isNumeric(to) && primNameOf(from) != "boolean"
@@ -3459,6 +3462,100 @@ export function sameTypeTestNote(obj: i32, name: string, ix: i32) {
     i = i + 2
   }
   0
+}
+
+// `tyTestMemberFit`'s three answers.
+export const TT_NONE = 0
+export const TT_PARTLY = 1
+export const TT_COVERED = 2
+
+// What a type test of `chk` answers for a value of one operand member `m`, the one rule `is`,
+// `as` and `match` share: covered where every value of `m` fits `chk` (`m` is `chk`, the type
+// parameter it names, or a record it contains), partly where some may (`chk` fits `m`, or `m` is
+// a parameter a pin may bind to `chk`), else none. A union `chk` answers its best member.
+export function tyTestMemberFit(m: i32, chk: i32): i32 {
+  if m < 0 || chk < 0 || m >= T.tys.length || chk >= T.tys.length {
+    return TT_NONE
+  }
+  const ct = tyAt(chk)
+  if ct is TyUnion || ct is TyNullable {
+    let best = TT_NONE
+    for c in tyTestMembers(chk) {
+      const f = if c == chk { TT_NONE } else { tyTestMemberFit(m, c) }
+      if f > best { best = f }
+    }
+    return best
+  }
+  if tyTestIsMember(m, chk) || recContainedIn(m, chk) { return TT_COVERED }
+  if tyAt(m) is TyVar { return TT_PARTLY }
+  if (
+    assignable(chk, m)
+    && !isWidenNotVariant(chk, m)
+    && !fnSlotRetWidens(chk, m)
+  ) {
+    return TT_PARTLY
+  }
+  TT_NONE
+}
+
+// Whether operand member `m` is the tested type `c` itself: the same variant, or the type
+// parameter `c` names.
+export function tyTestIsMember(m: i32, c: i32): boolean {
+  if m < 0 || c < 0 { return false }
+  const mt = tyAt(m)
+  const ct = tyAt(c)
+  if mt is TyVar { return ct is TyVar && ct.tvName == mt.tvName }
+  m == c || sameVariantTy(m, c)
+}
+
+// The members of `t`, a union or nullable flattened, `null` among them.
+export function tyTestMembers(t: i32): i32[] {
+  const ms: i32[] = []
+  if t >= 0 { flattenVariantsInto(t, ms) }
+  ms
+}
+
+// Whether a test of `chk` over `obj` can be true: each member of `chk` may fit some member of
+// `obj`, or `obj`, one type, is covered by `chk`.
+export function tyTestMayFit(obj: i32, chk: i32): boolean {
+  const ms = tyTestMembers(obj)
+  const cs = tyTestMembers(chk)
+  if cs.length == 0 || ms.length == 0 { return false }
+  if ms.length == 1 && tyTestMemberFit(ms[0], chk) == TT_COVERED { return true }
+  for c in cs {
+    let hit = false
+    for m in ms { hit = hit || tyTestMemberFit(m, c) != TT_NONE }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether every member of `chk` is a member of `obj` (`tyTestIsMember`): a cast to `chk` picks
+// those arms.
+export function tyTestNamesMembers(obj: i32, chk: i32): boolean {
+  const ms = tyTestMembers(obj)
+  const cs = tyTestMembers(chk)
+  if cs.length == 0 { return false }
+  for c in cs {
+    let hit = false
+    for m in ms { hit = hit || tyTestIsMember(m, c) }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether every value of record `a` fits record `b` and not the reverse, the two declaring the
+// same field names. A record with fields the other lacks is no containment D3885 settles.
+export function recContainedIn(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  const at = tyAt(a)
+  const bt = tyAt(b)
+  if !(at is TyObj) || !(bt is TyObj) { return false }
+  if at.objFieldNames.length != bt.objFieldNames.length { return false }
+  for f in at.objFieldNames {
+    if strListIndexOf(bt.objFieldNames, f) < 0 { return false }
+  }
+  assignable(a, b) && !assignable(b, a)
 }
 
 // —— the annotation union's member list, shared by both annotation routes ——
@@ -6143,7 +6240,9 @@ export function setMemberRetAt(d: i32, ft: i32): i32 {
   const f = nodeAt(d)
   const sig = nodeTyOf(d)
   if !(f is FuncDecl) || f.fnRet < 0 {
-    const r = holeLamRetAt(d, ft, noN, noT)
+    // A named member is instanced at the call's signature; a lambda's arms are built at their own.
+    const named = f is FuncDecl && f.fnName != ""
+    const r = holeLamRetIn(d, ft, noN, noT, named)
     // A body that yields no value returns nothing at every binding, which its signature says.
     if r < 0 && sig >= 0 && sig < T.tys.length {
       const sf = tyAt(sig)
@@ -8626,6 +8725,18 @@ export function holeLamRetAt(
   bNames: string[],
   bTys: i32[],
 ): i32 {
+  holeLamRetIn(lx, pt, bNames, bTys, false)
+}
+
+// `holeLamRetAt`, where `sets` also takes as closed a parameter type carrying a set of functions,
+// as the call through a set does its arguments (D16209).
+function holeLamRetIn(
+  lx: i32,
+  pt: i32,
+  bNames: string[],
+  bTys: i32[],
+  sets: boolean,
+): i32 {
   if lx < 0 || lx >= P.nodes.length || pt < 0 || pt >= T.tys.length {
     return -1
   }
@@ -8642,8 +8753,9 @@ export function holeLamRetAt(
   for t in bTys { hT.push(t) }
   let k = 0
   while k < pc.fnParamTypes.length {
-    if tyHasTyVar(pc.fnParamTypes[k]) { return -1 }
-    bindGenWalk(lf.fnParamTypes[k], pc.fnParamTypes[k], hN, hT)
+    const pk = pc.fnParamTypes[k]
+    if tyHasTyVar(pk) && (!sets || fnTagSetOfTy(pk) < 0) { return -1 }
+    bindGenWalk(lf.fnParamTypes[k], pk, hN, hT)
     k = k + 1
   }
   const r = holeRetTyOf(lx, hN, hT)
