@@ -60,7 +60,7 @@ Deno.test({
         `${dir}/tests/cases/bad.vl`,
         'const x: i32 = "no"\nprint(x)\n',
       );
-      await write(`${dir}/std/tiny.vl`, "export function one(): i32 { 1 }\n");
+      await write(`${dir}/std/tiny.vl`, "export function one(): i32 { return 1 }\n");
       const seed = await Deno.readFile(COMPILER);
       const broken = `${dir}/broken.wasm`;
       await Deno.writeFile(broken, seed.slice(0, 1000));

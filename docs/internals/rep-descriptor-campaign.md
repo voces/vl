@@ -3708,7 +3708,7 @@ ladder answers none on purpose (`ifArmsAgreeOnListRep`), and a column fallback t
 read the box as a plain list. The witness runs today and must keep running:
 
 ```vl
-function no() { false }
+function no() { return false }
 function bound<T>(xs: T[], ys: string[]) {
   const r = if no() { xs } else { ys }
   if r is string[] { print(r.length) } else { print(0 - r.length) }

@@ -68,30 +68,30 @@ const rowLoop = (read: string) => [
 ];
 
 const PROGRAMS: Record<string, string[]> = {
-  laneGetter: [...LANE_PRE, `get y(self: F4): f32 { ${LANE_BODY} }`, ...LANE_POST, "print(v.y)"],
+  laneGetter: [...LANE_PRE, `get y(self: F4): f32 { return ${LANE_BODY} }`, ...LANE_POST, "print(v.y)"],
   laneCall: [
     ...LANE_PRE,
-    `function y(self: F4): f32 { ${LANE_BODY} }`,
+    `function y(self: F4): f32 { return ${LANE_BODY} }`,
     ...LANE_POST,
     "print(y(v))",
   ],
   laneUfcs: [
     ...LANE_PRE,
-    `function y(self: F4): f32 { ${LANE_BODY} }`,
+    `function y(self: F4): f32 { return ${LANE_BODY} }`,
     ...LANE_POST,
     "print(v.y())",
   ],
   fieldGetter: [
     ...FIELD_PRE,
-    "get second(self: P): f32 { self.b }",
+    "get second(self: P): f32 { return self.b }",
     "const p = mk(3.0)",
     "print(p.second)",
   ],
   fieldRead: [...FIELD_PRE, "const p = mk(3.0)", "print(p.b)"],
-  rowGetter: [...ROW_PRE, `get tt(self: RowAddr): i32 { ${ROW_BODY} }`, ...rowLoop("st[j].tt")],
+  rowGetter: [...ROW_PRE, `get tt(self: RowAddr): i32 { return ${ROW_BODY} }`, ...rowLoop("st[j].tt")],
   rowUfcs: [
     ...ROW_PRE,
-    `function tt(self: RowAddr): i32 { ${ROW_BODY} }`,
+    `function tt(self: RowAddr): i32 { return ${ROW_BODY} }`,
     ...rowLoop("st[j].tt()"),
   ],
 };
