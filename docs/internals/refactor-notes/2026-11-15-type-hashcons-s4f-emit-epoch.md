@@ -13,8 +13,15 @@ A scratch seed (never committed) marked the arena length and the hole count at e
 `monoRecheckBegin`. It then classed every emit-phase write against the innermost open mark.
 Over the 55 programs with a `tyPinElem` or `inferRetPublish` bump, **all 100 pins solve a hole
 minted inside the same re-check, and all 73 published returns patch a function row minted inside
-it**. None touches older state, and none happens outside a re-check. Lane M3 makes the same
-argument for an alias fill: the placeholder is minted by the application it fills.
+it**. None touches older state, and none happens outside a re-check.
+
+The alias fills are different. Measured against the re-check mark, all 189 are visible: the
+application runs outside a re-check, or its placeholder predates the mark. The narrower argument,
+lane M3's, does hold. The placeholder is minted by the application that fills it, and only that
+application's code holds it before the fill. So the application opens its own fresh scope. That
+holds only for an **acyclic** instance (M3's caveat): a cyclic instance's field resolution builds
+types that reach the still-empty placeholder, and a memo computed in that window has seen the
+empty row. A cyclic fill therefore still moves `tyEmitEpoch`.
 
 What those writes change did not exist before the re-check began, so no emit memo can have read
 it. The checker's own memos (`hhStamp`, `tdStamp`, `shMemo` and others) do read those rows
@@ -27,16 +34,23 @@ during the re-check, so they still need every bump.
 - **Two epochs.** It always advances `tyMutEpoch`, so the checker memos are unchanged. It
   advances `tyEmitEpoch` too, unless the row or hole written was minted inside the innermost open
   mono re-check.
-- **The marks.** `monoRecheckBegin` pushes them through `tyRecheckBegin`, `monoRecheckEnd` pops
-  them through `tyRecheckEnd`, and `holeReset` clears them with the arena.
+- **The fresh scopes.** `tyFreshBegin` pushes the marks and `tyFreshEnd` pops them. A mono
+  re-check opens one (`monoRecheckBegin` / `monoRecheckEnd`), and so does an alias application,
+  from just before it mints its placeholder to just after the fill. `holeReset` clears the marks
+  with the arena.
 - **What each site passes:**
   - `tyPinElem`, `tyPinKey`, `tyPinVal`: the hole they solve;
   - `inferRetPublish`: the function row it patches;
-  - `applyGenAliasTys`: the placeholder it fills (`resIx`);
+  - `applyGenAliasTys`: the placeholder it fills (`resIx`), or neither when the instance may
+    reach itself. The test is `tyMayReachSelf`: uncached and run at fill time, because an outer
+    fill can close the cycle late. It answers true when its walk gives up past depth 64, so a
+    give-up keeps the bump. `tyReachesSelf` and its callers are unchanged;
   - the other nine: neither, so both epochs advance, as before.
 - **The readers.** The emitter's memos read `tyEmitEpoch`: `emit_rep.vl` (26 occurrences,
   imports and comments included), plus `emit_classify`, `emit_union_tykey_text`,
-  `emit_shape_rows`, `emit_nullable_rets` and `emit_ty_seal`. Their `STAMPED` entries in `scripts/emitter-state-audit.vl` name it.
+  `emit_shape_rows`, `emit_nullable_rets` and `emit_ty_seal`. Their `STAMPED` entries in
+  `scripts/emitter-state-audit.vl` and their disable edits in `scripts/memo-generation-rows.json`
+  name it.
 
 This adds no mono function and re-derives nothing. The facts are the ones the re-check already
 writes; only the stamp the emitter reads is narrower.
@@ -48,10 +62,9 @@ The base is master `c1493e4a` built to its own fixpoint.
 | reading | value |
 |---|---|
 | seed | fixpoint, base and branch |
-| identity | 19,780 of 19,780: all of `tests/cases` outside `modules/`, `distilled/cells`, `distilled/named` and `compiler/entry.vl`. The sweep first showed one DIFF, `distilled/named/d582s_smsetv_bool_str_ufcs_typar.vl`; its outputs are byte-identical on both seeds over five runs, and it compares SAME when re-run (a timeout under the sweep's parallel load) |
-| census, emit-phase writes over the 55 programs | 173, all fresh: `tyEmitEpoch` does not move |
-| census, full corpus | see the PR |
-| net compiler lines | +51 (`check_types.vl` +44: the helper, the marks, `holeIxOf` and the comments; the rest is one call per site and the renamed reads) |
+| identity | 19,780 of 19,780 files, final tree: all of `tests/cases` outside `modules/`, `distilled/cells`, `distilled/named` and `compiler/entry.vl` |
+| census, full corpus (15,323 programs that reach emit) | **0 emit-visible bumps**; 362 fresh (189 alias fills, 100 pins, 73 published returns). No emit-phase alias fill was cyclic |
+| net compiler lines | +72 (`check_types.vl` +58: the helper, the fresh scopes, `holeIxOf`, `tyMayReachSelf` and the comments; `check_relate_core.vl` +8: the alias scope and its cycle test; the rest is one call per site and the renamed reads) |
 | pin helpers (`emit_mono.vl`) | 908 → 908 |
 
 ## Next: step 3
