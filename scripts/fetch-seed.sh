@@ -18,13 +18,6 @@ TAG="${VL_SEED_TAG:-seed-latest}"
 ASSET="vl-compiler.wasm"
 OUT="${SEED:-build/vl-compiler.wasm}"
 
-# Idempotent: a present, non-empty seed is left untouched (refresh-compiler.sh
-# overwrites it with a current-source rebuild regardless).
-if [ -s "$OUT" ]; then
-  echo "seed already present: $OUT ($(wc -c < "$OUT") bytes)"
-  exit 0
-fi
-
 mkdir -p "$(dirname "$OUT")"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -46,14 +39,6 @@ fetch() {
   curl -fsSL "https://github.com/$REPO/releases/download/$TAG/$1" -o "$WORK/$1"
 }
 
-echo "== fetch $ASSET from $REPO release '$TAG' =="
-if ! fetch "$ASSET"; then
-  echo "ERROR: no seed in $OUT and could not fetch '$TAG/$ASSET' from $REPO." >&2
-  echo "  Ensure network access to github.com (or 'gh auth login'); the seed is" >&2
-  echo "  republished on every master push, so '$TAG' tracks current master." >&2
-  exit 1
-fi
-
 # Integrity fails closed: the seed is installed only when its SHA-256 equals the
 # published `.sha256` sidecar's, and, for `seed-v0`, also the hash committed in
 # scripts/seed-v0.sha256. A rolling release's sidecar sits beside the bytes it vouches
@@ -69,6 +54,49 @@ sha256_of() {
 hash_field() {
   tr 'A-F' 'a-f' < "$1" | awk 'NR == 1 && $1 ~ /^[0-9a-f]{64}$/ { print $1 }'
 }
+# A seed already present is checked, not trusted. One `refresh-compiler.sh` built carries a
+# `.src` provenance sidecar and is left alone: it is newer than any release. Any other is kept
+# only when its SHA-256 is the expected one (the pinned hash for `seed-v0`, else the release's
+# `.sha256`), and refetched otherwise. When the expected hash cannot be read, it fails rather
+# than run a seed nothing vouches for, unless `$VL_SEED_OFFLINE=1` accepts the present one.
+HAVE=""
+if [ -s "$OUT" ]; then
+  HAVE="$(sha256_of "$OUT")"
+  if [ -e "$OUT.src" ]; then
+    echo "seed is a local build: $OUT (sha256 $HAVE, provenance $OUT.src); not refetched"
+    exit 0
+  fi
+  if [ "$TAG" = "seed-v0" ]; then
+    EXPECT="$(hash_field scripts/seed-v0.sha256)"
+  elif fetch "$ASSET.sha256"; then
+    EXPECT="$(hash_field "$WORK/$ASSET.sha256")"
+  else
+    EXPECT=""
+  fi
+  if [ -z "$EXPECT" ]; then
+    if [ "${VL_SEED_OFFLINE:-}" = "1" ]; then
+      echo "WARNING: cannot read the expected hash of '$TAG'; using $OUT (sha256 $HAVE) as is (VL_SEED_OFFLINE=1)" >&2
+      exit 0
+    fi
+    echo "ERROR: $OUT is present (sha256 $HAVE), but the expected hash of '$TAG' cannot be read," >&2
+    echo "  so it may be stale. Restore network access, or set VL_SEED_OFFLINE=1 to use it as is." >&2
+    exit 1
+  fi
+  if [ "$HAVE" = "$EXPECT" ]; then
+    echo "seed up to date: $OUT (sha256 $HAVE, '$TAG')"
+    exit 0
+  fi
+  echo "refetching: $OUT has sha256 $HAVE, but '$TAG' is $EXPECT"
+fi
+
+echo "== fetch $ASSET from $REPO release '$TAG' =="
+if ! fetch "$ASSET"; then
+  echo "ERROR: ${HAVE:+a stale seed (sha256 $HAVE) and }no current seed in $OUT; could not fetch '$TAG/$ASSET' from $REPO." >&2
+  echo "  Ensure network access to github.com (or 'gh auth login'); the seed is" >&2
+  echo "  republished on every master push, so '$TAG' tracks current master." >&2
+  exit 1
+fi
+
 GOT="$(sha256_of "$WORK/$ASSET")"
 if ! fetch "$ASSET.sha256"; then
   echo "ERROR: release '$TAG' publishes no $ASSET.sha256; refusing to install an unverified seed." >&2
@@ -91,5 +119,6 @@ if [ "$TAG" = "seed-v0" ]; then
   fi
 fi
 
-mv "$WORK/$ASSET" "$OUT"
+# A sibling temp renamed over the path, so a reader of a seed being replaced sees one whole file.
+cp "$WORK/$ASSET" "$OUT.fetch-tmp" && mv "$OUT.fetch-tmp" "$OUT"
 echo "fetched $OUT ($(wc -c < "$OUT") bytes, sha256 $GOT) from $REPO '$TAG'"
