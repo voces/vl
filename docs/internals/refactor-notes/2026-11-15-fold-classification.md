@@ -5,7 +5,7 @@ fold classified a node before applying the rule that should have decided it.
 
 | row | site | before | after |
 | --- | --- | --- | --- |
-| D16670 | `castConstSettle` (check_leaf_steps.vl) | rewrote the cast node into a literal, which a wider destination's literal adoption then moved | rewrites only the operand; the cast stays a typed value (E9.1) |
+| D16670 | `castConstSettle` (check_leaf_steps.vl) | rewrote the cast node into a literal, which a wider destination's literal adoption then moved | at an `i32` domain, rewrites only the operand, so the cast stays a typed value (E9.1); a `u8`-class domain keeps the literal, which D3588's emit needs |
 | D16673 | `cexDiv` / `cexRem` (const_exact.vl) | bailed on a radix pattern before testing a zero divisor | tests an integer zero divisor first (D2.3) |
 
 Graded on the base seed and the new seed:
