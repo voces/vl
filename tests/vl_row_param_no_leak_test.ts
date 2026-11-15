@@ -16,8 +16,8 @@ const ignore = !seedPresent(SEED);
 const SRC = [
   /* 0 */ "type P = { y: i32 }",
   /* 1 */ "type W = { x: i32, y: i32 }",
-  /* 2 */ "function f(p: P): i32 { p.y }",
-  /* 3 */ "function g(self: P): i32 { self.y }",
+  /* 2 */ "function f(p: P): i32 { return p.y }",
+  /* 3 */ "function g(self: P): i32 { return self.y }",
   /* 4 */ "const w: W = { x: 1, y: 2 }",
   /* 5 */ "print(f(w))",
   /* 6 */ "print(w.g())",
@@ -29,9 +29,9 @@ const SRC = [
 // [line, col, the hover it must show]
 const WANT: [number, number, string][] = [
   [2, 11, "P"], // the parameter at its declaration
-  [2, 24, "P"], // a use of it in the body
+  [2, 31, "P"], // a use of it in the body
   [2, 9, "(p: P) => i32"], // the function's name
-  [3, 27, "P"], // a UFCS `self`
+  [3, 34, "P"], // a UFCS `self`
   [5, 6, "(p: P) => i32"], // the callee at a call that passes the wider row
   [7, 11, "P"], // a lambda's parameter (D16400)
   [8, 0, "(P) => void"], // the lambda's binding at a call that passes the wider row

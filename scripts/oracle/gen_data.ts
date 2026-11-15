@@ -31,7 +31,7 @@ const HEAD = [
   "function walk(n: N | null): i32 {\n  let s = 0\n  let c = n\n  while c != null {\n    s = s * 10 + c.v\n    c = c.next\n  }\n  return s\n}",
   "function firstOver(xs: i32[], k: i32): i32 {\n  for x in xs { if x > k { return x } }\n  return -1\n}",
   "function show(u: U): string { return if u is { tag: \"p\", p: i32 } { \"p\\{u.p}\" } else { u.q } }",
-  "function mk(a: i32): R { { a: a, b: \"m\\{a}\", xs: [a, a + 1] } }",
+  "function mk(a: i32): R { return { a: a, b: \"m\\{a}\", xs: [a, a + 1] } }",
 ];
 
 const STRS = ['"a"', '"bc"', '"é"', '""', '"x y"', '"Z"'];
