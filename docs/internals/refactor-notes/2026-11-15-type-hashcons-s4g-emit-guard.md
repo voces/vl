@@ -32,8 +32,8 @@ in the same change.
 |---|---|
 | control | the guard fires: a scratch seed whose `inferRetPublish` passes no row makes its write visible, and `closures/alias-of-fn-param-litunion-arg.vl` then fails with the internal error |
 | seed | fixpoint |
-| identity | 19,780 of 19,780 files byte-identical against #8400's fixpoint (all of `tests/cases` outside `modules/`, `distilled/cells`, `distilled/named` and `compiler/entry.vl`) |
-| seed size | SEEDSIZE |
+| identity | 19,865 of 19,865 files byte-identical against #8400's merged fixpoint (all of `tests/cases` outside `modules/`, `distilled/cells`, `distilled/named` and `compiler/entry.vl`) |
+| seed size | 6,377,230 → 6,377,376 bytes (+146), after master 55151b05 is merged into both |
 | phase-state census | `--check` ok, baseline unchanged from master |
 | net compiler lines, this PR | +13 (`emit_sections.vl` +10: the recorded epoch and the `emitFail`; `emit_ty_seal.vl` +3: `sealEpoch`) |
 | net compiler lines, #8400 + this | **+85** (+72 and +13): it enforces an invariant and deletes nothing. The estimate had been +82 |
