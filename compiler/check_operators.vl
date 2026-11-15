@@ -59,10 +59,14 @@ import {
   UnionDecl,
   WhileStmt,
   i32ToStr,
+  mkBinary,
   mkBlock,
+  mkBool,
   mkCall,
   mkIf,
+  mkMember,
   mkNull,
+  mkUnary,
   nodeAt,
   valueIfAdd,
 } from "./ast"
@@ -316,6 +320,7 @@ import {
   numLitAdoptDeep,
   numLitAdoptDst,
   numLitAdoptTails,
+  radixTreeF64Pair,
   shiftLitAdopt,
   shiftWidensLit,
   valueJoinAt,
@@ -395,7 +400,9 @@ import {
   unionHasDeclaredParam,
 } from "./check_tp_join"
 import {
+  REC_STORE_DEPTH,
   eqRefusals,
+  fieldStorageEq,
   mapTwinTestMsg,
   mixesNumeric,
   widerNumeric,
@@ -1329,6 +1336,7 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     || assignable(rt, lt)
     || nomEqLit
     || eqNonNullMutual(lt, rt)
+    || radixTreeF64Pair(n, lt, rt)
   const eqMsg = "cannot compare " + tyToStr(lt) + " with " + tyToStr(rt)
   if !eqMutual && !eqDeadByFlow(n, ix, -1, -1, eqMsg) { tErr(eqMsg, ix) }
   // Both `==` gates share one home (`eqRefusals`): structural soundness (field-by-field
@@ -1351,6 +1359,10 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     }
     eqM = eqM + 1
   }
+  if eqMsgs.length == 0 && eqMutual {
+    const rw = recEqFieldsAt(n, ix, lt, rt)
+    if rw >= 0 { return rw }
+  }
   if eqMsgs.length == 0 && !isNullTy(lt) && !isNullTy(rt) {
     // A record literal compared with a value is built at the value's type, as one delivered.
     if assignable(rt, lt) { adoptLitAt(n.binRight, lt) }
@@ -1367,6 +1379,99 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     if eqPath != "" { recordDeepRecordEq(ix, eqTy, eqPath, op) }
   }
   return TY_BOOL
+}
+
+// The record a `==` operand of type `ty` compares as: `ty` itself, or a nullable's inner record;
+// -1 for anything else.
+function recEqSide(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const inner = nonNullTy(ty)
+  if inner >= 0 && inner < T.tys.length && tyAt(inner) is TyObj {
+    inner
+  } else {
+    -1
+  }
+}
+
+// `l == r` over two records of one field set stored apart, rewritten in place to
+// `{ const $el = l; const $er = r; $el.f == $er.f && … }` under a null guard for a nullable
+// side, so each field pair reaches its own `==` and a nested pair is rewritten in turn (D16394).
+// TY_BOOL once rewritten; -1 leaves the node to the one-row compare.
+function recEqFieldsAt(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
+  const lr = recEqSide(lt)
+  const rr = recEqSide(rt)
+  if lr < 0 || rr < 0 || fieldStorageEq(lr, rr, REC_STORE_DEPTH) { return -1 }
+  if tyHasTyVar(lt) || tyHasTyVar(rt) { return -1 }
+  const lo = tyAt(lr)
+  const ro = tyAt(rr)
+  if !(lo is TyObj) || !(ro is TyObj) { return -1 }
+  const names = lo.objFieldNames
+  if names.length == 0 || names.length != ro.objFieldNames.length { return -1 }
+  for f in names {
+    if strListIndexOf(ro.objFieldNames, f) < 0 { return -1 }
+  }
+  if inferQuiet { return TY_BOOL }
+  const pos = n.pos
+  // Unannotated, so an operand whose row is settled later (a literal-only binding) keeps it.
+  const ld = luDecl("const", "$el" + i32ToStr(ix), -1, n.binLeft, ix, pos)
+  const rd = luDecl("const", "$er" + i32ToStr(ix), -1, n.binRight, ix, pos)
+  let eq = -1
+  for f in names {
+    const lf = luAt(mkMember(luRef(ld, ix, pos), f, pos), ix)
+    const rf = luAt(mkMember(luRef(rd, ix, pos), f, pos), ix)
+    const c = luAt(mkBinary("==", lf, rf, pos), ix)
+    eq = if eq < 0 { c } else { luAt(mkBinary("&&", eq, c, pos), ix) }
+  }
+  // A null side is equal only to a null side; a null left is tested first, outermost.
+  if rr != rt { eq = recEqNullArm(rd, ld, false, eq, ix, pos) }
+  if lr != lt { eq = recEqNullArm(ld, rd, rr != rt, eq, ix, pos) }
+  if n.binOp == "!=" { eq = luAt(mkUnary("!", eq, pos), ix) }
+  const stmts: i32[] = []
+  stmts.push(ld)
+  stmts.push(rd)
+  stmts.push(eq)
+  luValueAt(ix, stmts, pos)
+  checkNodeHook(ix)
+}
+
+// `if side == null { other == null } else { rest }` for nullable binding `side`; the arm is
+// `false` when `other` cannot be null.
+function recEqNullArm(
+  side: i32,
+  other: i32,
+  otherNul: boolean,
+  rest: i32,
+  ix: i32,
+  pos: i32,
+) {
+  const isNul = luAt(
+    mkBinary(
+      "==",
+      luRef(side, ix, pos),
+      luAt(mkNull("null", pos), ix),
+      pos,
+    ),
+    ix,
+  )
+  const ans = if otherNul { luAt(
+    mkBinary("==", luRef(other, ix, pos), luAt(mkNull("null", pos), ix), pos),
+    ix,
+  ) } else { luAt(mkBool(0, pos), ix) }
+  const thenS: i32[] = []
+  thenS.push(ans)
+  const elseS: i32[] = []
+  elseS.push(rest)
+  const v = luAt(
+    mkIf(
+      isNul,
+      luAt(mkBlock(thenS, pos), ix),
+      luAt(mkBlock(elseS, pos), ix),
+      pos,
+    ),
+    ix,
+  )
+  valueIfAdd(v)
+  v
 }
 
 // The operators left once logicals, assignment, `??` and equality have answered: operator
@@ -1473,6 +1578,7 @@ function checkBinCmpTail(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       !sameNumeric(olt, ort)
       && !mixesNumeric(olt, ort)
       && !cmpF32LitAdopts(n, olt, ort)
+      && !radixTreeF64Pair(n, olt, ort)
     ) {
       // Mixed numerics may be compared when one side widens to the other; the f32-with-a-literal
       // pair is admitted separately (`cmpF32LitAdopts`) so comparison agrees with arithmetic's `+`.
@@ -1571,6 +1677,8 @@ function checkBinNumTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
     cexFloatUse(n.binLeft)
     return rt
   }
+  // A radix tree computed at 64 bits beside an `f64` converts to it (D16390).
+  if radixTreeF64Pair(n, lt, rt) { return TY_F64 }
   // A mixed-numeric op widens the narrower operand to the wider one (`i32 op i64` -> i64, ...),
   // done before the same-type check so a compatible mixed pair is accepted (B2).
   if mixesNumeric(lt, rt) { return widerNumeric(lt, rt) }
@@ -1840,6 +1948,15 @@ function binRadixAdoptSides(n: BinExpr, op: string, sides: i32[]) {
   if rt == TY_I32 && lt == TY_I64 {
     const rpa = litTreeAdoptDst(n.binRight, lt)
     if rpa >= 0 { rt = rpa }
+  }
+  // Beside an `f64` a radix tree computes at 64 bits, as at an `f64` destination (D16390).
+  if lt == TY_I32 && primNameOf(rt) == "f64" && op != "??" {
+    const lpf = litTreeAdoptDst(n.binLeft, rt)
+    if lpf >= 0 { lt = lpf }
+  }
+  if rt == TY_I32 && primNameOf(lt) == "f64" {
+    const rpf = litTreeAdoptDst(n.binRight, lt)
+    if rpf >= 0 { rt = rpf }
   }
   sides[0] = lt
   sides[1] = rt
