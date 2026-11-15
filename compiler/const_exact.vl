@@ -403,46 +403,41 @@ function cxI32Str(v: i32): string {
 
 // ── the shortest round-trip spelling ─────────────────────────────────────────
 
-// Whether `num / den` is at least `10^k`.
-function cxGePow10(num: i32[], den: i32[], k: i32): boolean {
-  if k >= 0 { return bigCmp(num, cxmMul(den, cxmPow10(k))) >= 0 }
-  bigCmp(cxmMul(num, cxmPow10(0 - k)), den) >= 0
+// `v * 10^s` truncated, its remainder, and the divisor the remainder is against.
+function cxScaled10(v: Cex, s: i32): i32[][] {
+  if s >= 0 { return cxQr(cxmMul(v.cxNum, cxmPow10(s)), v.cxDen) }
+  cxQr(v.cxNum, cxmMul(v.cxDen, cxmPow10(0 - s)))
 }
 
-// The fewest significant decimal digits that read back, rounded to the nearest double, as the
-// double `v` holds, spelled as `print` spells a float (shortest round trip, JS's layout), with a
-// `.0` on a whole value so it reads as a float. `v` is a finite float constant (E9.1).
+function cxQr(n: i32[], d: i32[]): i32[][] {
+  const qr = cxmDivmod(n, d)
+  [qr[0], qr[1], d]
+}
+
+// The fewest significant digits that read back as the double the float constant `v` holds
+// (E9.1), laid out as `print` lays a float out, with `.0` on a whole value.
 export function cexShortest(v: Cex): string {
   let sign = ""
   if v.cxNeg { sign = "-" }
   if bigIsZero(v.cxNum) { return sign + "0.0" }
-  const num = v.cxNum
-  const den = v.cxDen
-  // The decimal exponent `e` of the first digit: 10^e <= num / den < 10^(e + 1).
-  let e = ((cxmBitLen(num) - cxmBitLen(den) - 1) * 30103) / 100000
-  while cxGePow10(num, den, e + 1) { e = e + 1 }
-  while !cxGePow10(num, den, e) { e = e - 1 }
+  // `e`, the decimal exponent of the first digit: estimated from the bit lengths, then exact.
+  let e = ((cxmBitLen(v.cxNum) - cxmBitLen(v.cxDen) - 1) * 30103) / 100000
+  while !bigIsZero(cxScaled10(v, 0 - e - 1)[0]) { e = e + 1 }
+  while bigIsZero(cxScaled10(v, 0 - e)[0]) { e = e - 1 }
   let n = 1
   while n <= 17 {
     const s = n - 1 - e
-    let nn = num
-    let dd = den
-    if s >= 0 {
-      nn = cxmMul(num, cxmPow10(s))
-    } else {
-      dd = cxmMul(den, cxmPow10(0 - s))
-    }
-    const qr = cxmDivmod(nn, dd)
+    const qr = cxScaled10(v, s)
     let q = qr[0]
-    const c = bigCmp(cxmShl(qr[1], 1), dd)
+    const c = bigCmp(cxmShl(qr[1], 1), qr[2])
     if c > 0 || (c == 0 && (q[0] & 1) == 1) { q = cxmAdd(q, cxmOne()) }
-    let cn = q
-    let cd = cxmOne()
-    if s >= 0 { cd = cxmPow10(s) } else { cn = cxmMul(q, cxmPow10(0 - s)) }
-    const back = cxRoundFloat(cn, cd, 53, 1074, 1024)
+    let back = cxRoundFloat(q, cxmPow10(s), 53, 1074, 1024)
+    if s < 0 {
+      back = cxRoundFloat(cxmMul(q, cxmPow10(0 - s)), cxmOne(), 53, 1074, 1024)
+    }
     if back.length == 2 {
       const b = cexFracExact(false, back[0], back[1])
-      if bigCmp(b.cxNum, num) == 0 && bigCmp(b.cxDen, den) == 0 {
+      if bigCmp(b.cxNum, v.cxNum) == 0 && bigCmp(b.cxDen, v.cxDen) == 0 {
         return sign + cxDecLayout(cxmToDec(q), s)
       }
     }
@@ -451,8 +446,7 @@ export function cexShortest(v: Cex): string {
   sign + cexLexeme(v)
 }
 
-// The decimal `digits * 10^-s` laid out as JS prints a number: positional from 1e-6 up to 1e21,
-// otherwise `d.ddde+X`; a whole positional value gains `.0`.
+// `digits * 10^-s` as JS prints a number: positional from 1e-6 below 1e21, else `d.ddde+X`.
 function cxDecLayout(digits: string, s: i32): string {
   let d = digits
   let sc = s
@@ -460,25 +454,21 @@ function cxDecLayout(digits: string, s: i32): string {
     d = d.slice(0, d.length - 1)
     sc = sc - 1
   }
-  const k = d.length
-  const pt = k - sc
-  if pt >= k && pt <= 21 { return d + cxZeros(pt - k) + ".0" }
-  if pt > 0 && pt <= 21 { return d.slice(0, pt) + "." + d.slice(pt, k) }
-  if pt > 0 - 6 && pt <= 0 { return "0." + cxZeros(0 - pt) + d }
-  let mant = d.slice(0, 1)
-  if k > 1 { mant = mant + "." + d.slice(1, k) }
-  const x = pt - 1
-  if x >= 0 { return mant + "e+" + cxI32Str(x) }
-  mant + "e-" + cxI32Str(0 - x)
+  const pt = d.length - sc
+  if pt > 21 || pt <= 0 - 6 {
+    let m = d.slice(0, 1)
+    if d.length > 1 { m = m + "." + d.slice(1, d.length) }
+    if pt >= 1 { return m + "e+" + cxI32Str(pt - 1) }
+    return m + "e-" + cxI32Str(1 - pt)
+  }
+  if pt >= d.length { return d + cxZeros(pt - d.length) + ".0" }
+  if pt > 0 { return d.slice(0, pt) + "." + d.slice(pt, d.length) }
+  "0." + cxZeros(0 - pt) + d
 }
 
 function cxZeros(n: i32): string {
   let z = ""
-  let i = 0
-  while i < n {
-    z = z + "0"
-    i = i + 1
-  }
+  while z.length < n { z = z + "0" }
   z
 }
 
