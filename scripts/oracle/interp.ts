@@ -308,8 +308,8 @@ function litArith(op: string, a: Lit, b: Lit, expK: string | null = null): Val {
   } else {
     // E9.1 (owner ruling 2026-11-15): a float constant folds in IEEE, as at run time; an integer
     // operand converts to the nearest double first. JS numbers are IEEE doubles, `%` is `fmod`.
-    // The tree of a binding annotated `f32` folds in f32 arithmetic instead (`f32Fold`).
-    const at = f32Fold ? Math.fround : (v: number) => v;
+    // A tree used at `f32` folds in f32 arithmetic instead (`expK`, or `f32Fold` at a binding).
+    const at = f32Fold || expK === "f32" ? Math.fround : (v: number) => v;
     const x = at(a.f ?? Number(a.i)), y = at(b.f ?? Number(b.i));
     switch (op) {
       case "+": return new Lit(null, at(x + y), false);
@@ -1224,6 +1224,17 @@ export class Interp {
       const k = numKind(l);
       r = this.eval(e.r, env, rExp ?? (arithOp && !exp && k && isConstTree(e.r) && !["<<", ">>", ">>>"].includes(op) ? { k: "name", name: k, args: [] } : null));
     }
+    // E9.1: a float constant tree that adopts an `f32` peer folds in f32 arithmetic, whatever
+    // destination is outside the operator. A tree is pure, so it is evaluated again.
+    if (arithOp && !["<<", ">>", ">>>"].includes(op) && !f32Fold) {
+      const atF32 = (te: Expr, v: Val, peer: Val): Val => {
+        if (!(v instanceof Lit) || v.f === null || !isConstTree(te) || numKind(peer) !== "f32") return v;
+        f32Fold = true;
+        try { return this.eval(te, env, null); } finally { f32Fold = false; }
+      };
+      l = atF32(e.l, l, r);
+      r = atF32(e.r, r, l);
+    }
     // An operator function (`function "+"(self: V, other: V)`) applies to its own types.
     const opFns = env.lookupFns(op);
     if (opFns && !(l instanceof Lit) && numKind(l) === null && typeof l !== "string" && typeof l !== "boolean" && l !== null) {
@@ -1245,7 +1256,7 @@ export class Interp {
       if (op === ">>>" && l.i !== null && l.i < 0n && !l.radix && expK === "i64") return arith(">>>", litTo(l, "i64"), litDefault(r));
       // E9.1: the exact constant is computed first and typed at its use.
       if (l.join || r.join) return arith(op, l, r, expK);
-      return litArith(op, l, r, expK);
+      return litArith(op, l, r, expK ?? (this.isF32(exp, env) ? "f32" : null));
     }
     return arith(op, l, r, expK);
   }
@@ -1262,13 +1273,24 @@ export class Interp {
       // E7.2: a compound assignment evaluates its target's object and index once.
       const target = this.freeze(e.target, env);
       const cur = this.eval(target, env, null);
-      v = arith(e.op.slice(0, -1), cur, this.eval(e.e, env, null));
+      // E9.1: a constant tree beside an `f32` target folds in f32 arithmetic, as at run time.
+      f32Fold = isConstTree(e.e) && numKind(cur) === "f32";
+      let rhs: Val;
+      try { rhs = this.eval(e.e, env, null); } finally { f32Fold = false; }
+      v = arith(e.op.slice(0, -1), cur, rhs);
       this.store(target, v, env);
       return v;
     }
   }
+  // Whether `t`'s one number member is `f32` (`f32`, `f32 | null`, `F | string` with `F = f32`):
+  // the member a constant tree adopts (E9.1). Each arm is resolved through its aliases.
   isF32(t: Ty, env: Env): boolean {
-    try { const r = this.resolve(t, env); return r.k === "name" && r.name === "f32"; } catch { return false; }
+    try {
+      const r = this.resolve(t, env);
+      const arms = (r.k === "union" ? r.arms : [r]).map((a) => this.resolve(a, env));
+      const nums = arms.filter((a) => a.k === "name" && NUMERIC.has(a.name));
+      return nums.length === 1 && nums[0].k === "name" && nums[0].name === "f32";
+    } catch { return false; }
   }
   freeze(t: Expr, env: Env): Expr {
     if (t.k === "index") return { k: "index", e: { k: "val", v: this.eval(t.e, env, null) }, i: { k: "val", v: this.eval(t.i, env, null) } };
@@ -1391,6 +1413,14 @@ export class Interp {
     if (f instanceof Bi && ["min", "max", "abs"].includes(f.name)) {
       const args = this.evalArgs(e.args, env);
       const typed = args.some((a) => !(a instanceof Lit) && numKind(a) !== null);
+      // E9.1: a constant tree beside an `f32` argument folds in f32 arithmetic; a tree is pure.
+      if (args.some((a) => !(a instanceof Lit) && numKind(a) === "f32")) {
+        args.forEach((a, i) => {
+          if (!(a instanceof Lit) || !isConstTree(e.args[i].e)) return;
+          f32Fold = true;
+          try { args[i] = this.eval(e.args[i].e, env, null); } finally { f32Fold = false; }
+        });
+      }
       const lits = args.filter((a) => a instanceof Lit) as Lit[];
       return f.call(args.map((a) => a instanceof Lit && !typed ? (lits.length === 2 ? pairDefault(a, lits[0] === a ? lits[1] : lits[0]) : litDefault(a)) : a), this);
     }
