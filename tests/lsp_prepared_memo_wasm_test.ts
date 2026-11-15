@@ -312,15 +312,15 @@ Deno.test({
   want("same diagnostics as `checkSrc`", got.join("\n"), plainCheckDiags(twoErrors).join("\n"));
 
   // The one diagnostic the symbol check did NOT used to report: a read of a
-  // deep-`is` receiver in the right operand of its `&&` (D16476) refuses in the
-  // SECOND pass, which only `checkSrc` ran. A `checkSrcSym` without it publishes
+  // deep-`is` receiver after a guard that returns when the test fails (D16477)
+  // refuses in the SECOND pass, which only `checkSrc` ran. A `checkSrcSym` without it publishes
   // a clean file for a program `vl build` refuses — the reason the parity is a
   // compiler change and not a host one.
   const deepIs = `type Json = null | boolean | f64 | string | Json[] | { [string]: Json }
 type Cfg = { port: i32, host: string | null }
 let g: Json = null
-const b = g is Cfg && g.port > 0
-print(b)
+function a(): i32 { if !(g is Cfg) { return 0 }  g.port }
+print(a())
 `;
   const deep = await c.check(deepIs, ENTRY_KEY, read);
   want("the deep-\`is\` refusal reaches the editor", deep.length, 1);

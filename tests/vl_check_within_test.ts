@@ -972,7 +972,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { d } from "./mid"\nconst s: string = d(null)\nprint(s)\n',
       "mid.vl": "type Json = null | boolean | f64 | string | Json[] | { [string]: Json }\n" +
-        "export function d(r: Json): i32 {\n  if r is string[] && r.length > 0 { return 1 }\n  0\n}\n",
+        "export function d(r: Json): i32 {\n  if !(r is string[]) { return 0 }\n  r.length\n}\n",
     },
     target: "mid.vl",
     want: "dirty",
