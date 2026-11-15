@@ -43,15 +43,22 @@ Binding `p` at `P` inside the body, with only the signature generic, gave invali
 instance: a template node typed at the closed `P` keeps `P` in every instance (`nodeTyInOf`), so
 no conversion is built. `R` has to reach the body.
 
-## Still refused (D16219)
+## Still refused
 
-These are refused in both the `before` and `between` templates:
-- `generic_fwd` and `hole_fwd`: the pin re-asks the inner call before the width phase, and its
-  constraint row has no parameter position;
-- `lambda_param`: no named declaration to respell;
-- `returned` at a declared `: P`: the wide instance's return refuses, which undoes the rewrite.
+| position | row | where it goes |
+| --- | --- | --- |
+| `generic_fwd` (both faces), `hole_fwd` | D16219 | A2: the parameter-position column on the pin's argument row |
+| `lambda_param` | D16380 | A2: note the lambda a binding holds |
+| `returned` at a declared `: P` | D16381 | A2 decides: keep the row in the result, or a storage position |
+| `nested_field` | D16382 | the storage view |
 
-`nested_field` holds the row in a record field: the storage half.
+## The named set (`l3-record-param-width`)
+
+The 8 un-annotated cells of `record-param-width-before` that the rewrite carries. An earlier
+ablation, with the rewrite applied but never written, left 5 of them check-clean invalid wasm.
+None is silent on master or after this PR: all 8 run, with the same output on both seeds. The set
+pins them: with the candidate test disabled, `regress.vl` blocks on 3 of them (`loop`,
+`two_rows`, `nine_rows`, runs → loud check reject), and no other corpus cell moves.
 
 ## Size
 
