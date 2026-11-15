@@ -1186,7 +1186,15 @@ export class Interp {
         }
         // A generic's erased parameter (`any`) is no context: the join settles here. With a
         // context, a constant arm beside a typed one still takes that type when it fits.
+        // An integer arm beside a decimal arm outside i32 is the pair's i64, under a destination too
+        // (4.3; T2.3 for a radix arm, as `pairDefault`).
+        const wideOther = (): boolean => {
+          if (!(v instanceof Lit) || v.i === null || kOther || !ok || ok.k !== "expr" || !isConstTree(ok.e) || treeHas(ok.e, "radix")) return false;
+          const o = this.eval(ok.e, env, null);
+          return o instanceof Lit && o.i !== null && !o.radix && (o.i < BigInt(I32_MIN) || o.i > BigInt(I32_MAX)) && o.i >= I64_MIN && o.i <= I64_MAX;
+        };
         if (exp && !(exp.k === "name" && exp.name === "any")) {
+          if (wideOther()) return d16498(v as Lit) ?? litTo(v as Lit, "i64");
           if (v instanceof Lit && kOther && joinFits(v, kOther)) { try { return litTo(v, kOther); } catch { /* the join */ } }
           return v instanceof Lit ? asJoin(v) : v;
         }
@@ -1195,13 +1203,7 @@ export class Interp {
           if (v.radix && v.i !== null && !kOther && ok && ok.k === "expr" && isConstTree(ok.e) && treeHas(ok.e, "float")) {
             return v.lone ? radixFloat(v.i, 64, false) : new Flt(Number(wrap64(v.i)), 64);
           }
-          // An integer arm beside a decimal arm outside i32 is the pair's i64 (4.3; T2.3 for a
-          // radix arm, as `pairDefault`).
-          if (v.i !== null && !kOther && ok && ok.k === "expr" && isConstTree(ok.e) && !treeHas(ok.e, "radix")) {
-            const o = this.eval(ok.e, env, null);
-            const wide = o instanceof Lit && o.i !== null && !o.radix && (o.i < BigInt(I32_MIN) || o.i > BigInt(I32_MAX)) && o.i >= I64_MIN && o.i <= I64_MAX;
-            if (wide) return d16498(v) ?? litTo(v, "i64");
-          }
+          if (wideOther()) return d16498(v) ?? litTo(v, "i64");
           if (!kOther && ok && ok.k === "expr" && isConstTree(ok.e)) {
             const j = asJoin(v);
             if (v.f !== null && tk && tk.k === "expr" && isConstTree(tk.e)) j.arm = tk.e;
@@ -1263,8 +1265,8 @@ export class Interp {
       case "as": return one(e.ty);
       case "id": { const b = env.lookup(e.name); return b ? (one(b.ty) ?? (b.v instanceof Lit ? null : numKind(b.v))) : null; }
       case "call":
-        // min, max and abs keep their operand's width (E2.7)
-        if (e.f.k === "id" && ["min", "max", "abs"].includes(e.f.name) && !env.lookupFns(e.f.name)) {
+        // min, max, abs and the rounding functions keep their operand's width (E2.7)
+        if (e.f.k === "id" && ["min", "max", "abs", "floor", "ceil", "trunc", "nearest"].includes(e.f.name) && !env.lookupFns(e.f.name)) {
           for (const a of e.args) { const k = this.staticKind(a.e, env); if (k) return k; }
           // Over constants alone the call is still no constant (E9.1): it is typed at the
           // arguments' default, which a literal beside it adopts (T3.6).
