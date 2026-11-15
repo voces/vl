@@ -182,22 +182,30 @@ How the IR reads it:
   the builder reads the recorded `Coercion` at the node and never calls `relate`. After stage C,
   phase B (§3.2) may call it as a pure function over a frozen `Checked`.
 
-**The gap: four of today's ten `CoerceKind`s are not in `CV_*`.** `box`, `unbox`, `numeric` and
-`atomstr` are emitter-side seat decisions today. Each needs its own `conv` code before the adapter
-can retire:
-- `CV_BOX` with `at` as the arm;
-- `CV_UNBOX` with `at` and nullability;
-- `CV_NUM_WIDEN` with prim to prim, which the emitter currently derives from the two types;
-- `CV_ATOM_STR`.
+**The agreed `conv` set.** Lane M3's "conversion as data" step makes the shape:
 
-The `conv` set also needs to be a string-literal union type, not `i32` constants, so that
-`lowerCoerce` is an exhaustive `match`. Lane M3 has offered to shape `conv` before its
-conversions PR (A3).
+```
+type Conv = "same" | "box" | "unbox" | "numWiden" | "atomStr" | "listCopy" | "recCopy"
+  | "mapUnbox" | "listRetag" | "widenRetag" | "fnAdapt" | "fnSetListCopy" | "voidTwin"
+  | "fieldDrop" | "litListAdopt" | "recAdForce" | "genericFnAt" | "bareBrace"
+type Coercion = { conv: Conv, at: TyId, kids: Coercion[] }
+```
+
+- **Recording.** The recorder alone records a value, once per delivered node, and the IR reads it
+  through `coercionAt(ix): Coercion | null`.
+- **The seat codes.** Today the emitter decides `box`, `unbox`, `numWiden` and `atomStr`. That
+  decision moves into one function that both the recorder and the emitter call.
+- **Order.** M3's PRs land in this order:
+  1. conv, `at` and a seat-equals-conv shadow;
+  2. the emitter reads the recorded conv;
+  3. `kids` for object and array literals.
+
+`lowerCoerce` is a `match` over `Conv` with no `_` arm.
 
 Until then, the payload is an adapter, `CoerceRec{kind: CoerceKind, …}`. It packages today's ten
 kinds (`wasmEmit.vl:30278`) with the record each one reads: `boxRecordTyAt`, `armRecordHeapAt`,
 `numRecordAt`, `listCopyAtNode`, `fnCloCoerceAtNode`, `mapUnboxTyOf`, `deliveryRetagHas` and
-`recCopyRowAt`. M3's type replaces the adapter in one PR, and no node changes shape.
+`recCopyRowAt`. The adapter retires once M3's PR 2 lands, and no node changes shape.
 
 ### 1.6 The emitter is a total function
 
@@ -591,8 +599,8 @@ float operations.
 
 ## 9. Questions to the prerequisite lanes
 
-These were sent to each lane before this PR. **Two items are pending: the `conv` codes in
-`RCoerce`'s payload (M3, §1.5) and `IrCallee` (Q step 6).** They do not block this design: each is a single-type substitution
+These were sent to each lane before this PR. **One item is pending: `IrCallee` (Q step 6).**
+`RCoerce`'s payload is agreed with M3 (§1.5). They do not block this design: each is a single-type substitution
 (§1.5, §1.1). The replies received so far are recorded below.
 
 - **M3, answered** (`refactor-notes/2026-11-15-relate-recorder-design.md`).
@@ -600,8 +608,8 @@ These were sent to each lane before this PR. **Two items are pending: the `conv`
     recursive through `kids`.
   - It is keyed by `TyId` pairs.
   - `relate` is pure post-check only after its stage C, which waits on H stages 1 and 2.
-  - §1.5 records what the IR reads, and the four `conv` codes it still needs. **The `conv` codes
-    are pending.**
+  - The `Conv` set is agreed (§1.5). It lands in M3's three PRs, and the IR's adapter retires
+    at the second.
 - **E.** Is the 13-kind `RepNode` set still the plan? Is `repOf` total on a closed instance type?
   No answer yet. H's answer below settles the keying of containers of records.
 - **H, answered.**
