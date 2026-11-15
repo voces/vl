@@ -82,6 +82,7 @@ import {
   elabCapAlwaysTestNote,
   elabCapDeadTestNote,
   elabCapIsNote,
+  elabCapKey,
   elabCapLive,
   elabFnListWidened,
   elabFnRecJoin,
@@ -135,6 +136,7 @@ import {
   recordDeadCoalesce,
 } from "./check_coal"
 import {
+  asInstMissNote,
   checkNodeHook,
   coalNodeHole,
   concatsAsStr,
@@ -217,6 +219,7 @@ import {
 import { HD_BINOP, HD_ELEM, elemValueHoleBase } from "./check_hole_pins"
 import {
   holeDemandStr,
+  holeElemRecLink,
   holeMapOf,
   isHoleMapDemandTy,
   noteCoalResultHole,
@@ -478,6 +481,7 @@ import { cwUseInOtherFrame, fnDeclIx } from "./check_write_scan"
 import { identDeclOf, sidOfNode } from "./symbols"
 import {
   arrElemValueTy,
+  flattenVariantsInto,
   isLitBearing,
   isNullTy,
   isNumeric,
@@ -758,6 +762,7 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   // A plain assignment pins the source's open holes, exactly as an annotated let-init, call
   // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
   constrainEmptyExpr(n.binRight, rt, asgLt)
+  holeElemRecLink(asgLt, rt)
   noteU8StoreRhs(n.binLeft, n.binRight)
   nlAsgTgt = n.binLeft
   nlAsgGot = rt
@@ -2247,6 +2252,7 @@ export function checkCastNode(n: AsExpr, ix: i32) {
   if elabCapLive() && n.asMode == "null" && isNumericPrimTy(target) {
     const tmpl = nodeTyIxOf(n.asObj)
     if tmpl >= 0 && tmpl < T.tys.length && tyHasTyVar(tmpl) {
+      if asUnionMisses(arg, target) { return asOptMissAt(ix, target) }
       return mkNullableTy(target)
     }
   }
@@ -2311,6 +2317,26 @@ function castUnionOperandOf(arg: i32): i32 {
   argU
 }
 
+// Whether `arg`, a union or nullable, holds no member numeric cast `as` to `target` can take:
+// a number or a `boolean` member converts, so only a union of neither misses.
+function asUnionMisses(arg: i32, target: i32): boolean {
+  const argU = castUnionOperandOf(arg)
+  if argU < 0 { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(argU, ms)
+  for m in ms {
+    if isNumeric(m) || primNameStr(primNameOf(m)) == "boolean" { return false }
+  }
+  tyTestMeet(argU, target) < 0 && !tyTestNamesMembers(argU, target)
+}
+
+// `as?` cast `ix` to `target` at an instance whose operand it can never hit: banked for the
+// emitter, which lowers that instance's cast to its `null`; the cast keeps its `T | null`.
+function asOptMissAt(ix: i32, target: i32): i32 {
+  asInstMissNote(ix, elabCapKey)
+  mkNullableTy(target)
+}
+
 // The ruled propagation cast over union operand `argU` (`argT`) to `target`: it names the arm
 // wanted, and the remainder propagates to the enclosing return unless `as!`/`as?` keeps it
 // local. Answers the cast's type, `TY_ERR` once refused at `ix`.
@@ -2347,8 +2373,21 @@ function checkCastUnionArm(
     // A gradual union's parameter may hold the target at a pin: the cast is parked on the
     // parameter and re-asked there, as over a bare one (D2906).
     if unionHasDeclaredParam(argT.uMembers) {
-      noteBinCstr(argU, OP_AS, target)
+      noteBinCstrAt(argU, OP_AS, target, ix, -1)
       if n.asMode == "null" { return mkNullableTy(target) }
+      return target
+    }
+    // At an instance a cast no member fits misses, as one over a type parameter pinned at no
+    // number does (D2791): `as?` is `null`, `as!` traps, a bare `as` propagates its operand.
+    // The direct spelling keeps the refusal.
+    if elabCapLive() {
+      if n.asMode == "null" { return asOptMissAt(ix, target) }
+      if n.asMode == "trap" {
+        asInstMissNote(ix, elabCapKey)
+        return target
+      }
+      if !castPropagationFits(argU, n.asTy, ix, T.curRet, -1) { return TY_ERR }
+      asInstMissNote(ix, elabCapKey)
       return target
     }
     tErr(
@@ -2723,21 +2762,14 @@ export function settleNeverIsTests() {
   let i = 0
   while i < neverIsNode.length {
     const ix = neverIsNode[i]
-    let at = -1
-    let k = 0
-    while k < T.diags.length {
-      if T.diags[k].tat == ix && T.diags[k].tmsg == neverIsMsg[i] { at = k }
-      k = k + 1
-    }
-    if at >= 0 {
-      const kept: TDiag[] = []
-      let d = 0
-      while d < T.diags.length {
-        if d != at { kept.push(T.diags[d]) }
-        d = d + 1
-      }
-      T.diags = kept
-      recordDeadTest(ix, neverIsMsg[i] + ", so this test is always false here")
+    if (
+      diagsToDeadTest(
+        ix,
+        0,
+        neverIsMsg[i],
+        ", so this test is always false here",
+      )
+    ) {
       if ix < isVarTyIxCap {
         while isVarTyIx.length <= ix { isVarTyIxPush(-1) }
         isVarTyIxSetAt(ix, TY_NEVER)
@@ -2885,22 +2917,27 @@ function isDeadByFlowWarn(n: IsExpr, ix: i32, d0: i32) {
 
 // Move the diagnostics raised at `ix` since `d0` to the dead-test warning, each with `tail`.
 export function deadByFlowMove(ix: i32, d0: i32, tail: string) {
-  const rest: TDiag[] = []
-  while T.diags.length > d0 {
-    rest.push(T.diags[T.diags.length - 1])
-    T.diags.pop()
-  }
-  let i = rest.length - 1
-  while i >= 0 {
-    const d = rest[i]
-    if d.tat == ix {
+  diagsToDeadTest(ix, d0, "", tail)
+}
+
+// Moves the diagnostics raised at `ix` from index `d0` on, those reading `msg` when it is not "",
+// to the dead-test warning, each with `tail`; whether any moved. The rest keep their order.
+function diagsToDeadTest(ix: i32, d0: i32, msg: string, tail: string): boolean {
+  const kept: TDiag[] = []
+  let moved = false
+  let k = 0
+  while k < T.diags.length {
+    const d = T.diags[k]
+    if k >= d0 && d.tat == ix && (msg == "" || d.tmsg == msg) {
       recordDeadTest(ix, d.tmsg + tail)
+      moved = true
     } else {
-      T.diags.push(d)
+      kept.push(d)
     }
-    i = i - 1
+    k = k + 1
   }
-  0
+  if moved { T.diags = kept }
+  moved
 }
 
 function checkIsExprAt(n: IsExpr, ix: i32) {

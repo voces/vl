@@ -9616,10 +9616,19 @@ Rules:
 * **Operands never choose.** `s < n64`, `b + mk()` or `take64(b + 1)` give `b` no type; a read
   inside an expression is an operand of it. It still vetoes a type that would make that
   expression wider than where it goes: `take64(b); xs[b - 6]` keeps `b` an `i32`.
-* **Within kind.** An integer literal becomes only a wider integer (`i32` → `i64`), a float one
-  only `f32`/`f64`. A destination of the other kind widens at that use as it always did, and the
-  binding keeps its type — `takeF64(b); print(b / 3)` stays integer division. Such a destination
-  still vetoes a choice the binding could not widen from: `take64(b); takeF64(b)` keeps `i32`.
+* **Within kind, except a float store.** An integer literal becomes only a wider integer (`i32`
+  → `i64`), a float one only `f32`/`f64`. A destination of the other kind widens at that use as
+  it always did, and the binding keeps its type — `takeF64(b); print(b / 3)` stays integer
+  division. Such a destination still vetoes a choice the binding could not widen from:
+  `take64(b); takeF64(b)` keeps `i32`.
+* **A float stored into an integer literal `let` joins it** (owner ruling, 2026-11-15, reversing
+  the clause above for stores: ruling 4.3's one join rule applied to a literal `let`'s stores). A
+  store of a typed float that holds the literal exactly makes the binding that float — `let t =
+  0; t = t + 1.5` is `f64`, `t = f` with `f: f32` is `f32`; a stored float literal makes it
+  `f64`. A float that does not hold the literal exactly keeps the refusal (`let t = 16777217; t
+  = f`). In an un-annotated generic, a store of the parameter's hole (`t = t + xs[i]`, `for x in
+  xs { t = t + x }`) types the binding as that hole, so each call's pin decides: `sum([1, 2])` is
+  `i32`, `sum([1.5, 2.5])` is `f64` (D16293). Integer-only stores keep the integer widening.
 * **Vetoes keep the default.** A float-literal operand (rules out `i64`), a bitwise operand (an
   integer) and `==` with an integer literal (rules out `f32`) choose nothing; when the chosen type
   would break one, the binding keeps its literal's own type rather than being refused.
@@ -10660,7 +10669,7 @@ string-literal atoms beside an `i32[]` arm holds its own tag (D4906), at every l
 rep fitted when empty (D4915) until the D16047 refinement (2026-11-15): an arm whose element
 type is fixed is tested by its tag alone.
 
-**An `is` that fits that way stores a new empty list back into the place (D4949).** The
+**Superseded by the D16047 refinement (2026-11-15):** an arm of another tag no longer fits an empty list, so nothing is stored back and the mechanism below is gone. **An `is` that fitted that way stored a new empty list back into the place (D4949).** The
 local, global, record field, list element or captured variable it tested now holds an empty
 list of the tested arm, so the then-branch reads, pushes into and delivers that arm's rep. A
 captured variable a closure tests so becomes a shared cell, as one a closure assigns does.
@@ -12200,3 +12209,26 @@ stands.
 
 **Ruled by the owner 2026-11-15.** The fuzz sweep with the oracle runs nightly on GitHub Actions
 (public repository, no minute cost) and fails only on a finding not already filed or known.
+
+## A destination binds a type parameter no argument binds (2026-11-15) — D16410, re-grades D9073
+
+**Ruled by the owner 2026-11-15.** The expected type of a call binds a type parameter of the callee
+that no argument binds. For `const k: (x: f64) => f64 = sel(gid)`, with `sel<A>(f: (x: A) => A)`,
+`A` is `f64` from the destination, so `gid` is delivered as its `f64` instance and `k(1.5)` prints
+`1.5`. D9073's annotated-destination face is to be re-graded under this rule.
+
+## A literal `let` joins to a float store (2026-11-15) — D16293 (a), 4.3 at stores
+
+**Ruled by the owner 2026-11-15: option (a).** Spec 4.3's adoption rule applies to stores as it
+does to joins. A `let` initialised by an integer literal and stored a float takes the float type:
+`let t = 0` followed by `t = t + xs[i]` with `xs: f64[]` makes `t` an `f64`, and the generic `sum`
+of D16293 prints `4` at `f64[]` and `3` at `i32[]`. This reverses the "Within kind" clause of "A
+literal binding takes its type from its uses" (B′ + C, 2026-09-29) for stores: an integer literal
+binding may now become a float.
+
+## A generic `as?`/`as!` pin that can never fit answers as the direct cast does (2026-11-15) — D16323, follows D2791
+
+**Ruled by the owner 2026-11-15.** D16323 follows D2791: a cast inside a generic instance behaves
+as the same cast written at the instance's types. A pin whose operand holds no member the target
+could take is a miss, not a refusal: `as?` is `null`, `as!` traps, and a bare `as` propagates.
+D16323 closed this way (`size<string>("ab")` prints `0`).

@@ -91,6 +91,14 @@ Deno.test("oracle: pinned regressions", () => {
     ["print(2.0 * (0x80000000 >> 1))", "2147483648"],
     ["print((0xFFFFFFFF % 1_000) as i64)", "295"],
     ["print(0xFFFFFFFF / 2)", "0"], // no use: the 32-bit pattern
+    // a shift's count never types its left operand; a constant count of 32 to 63 widens it (Q8)
+    ["const c: i32 = 40\nconst v: i64 = 1 << c\nprint(v)", "1099511627776"],
+    ["const c: i32 = 3\nconst v: i64 = (0xFFFFFFFF << 31) << c\nprint(v)", "-17179869184"],
+    ["print(0x1 << 40)", "1099511627776"],
+    // ruling 4.4: `is` on an empty container reads the type it was built at
+    ["const e: Set<i32> = Set()\nconst u: Set<i32> | Set<string> = e\nprint(u is Set<string>)", "false"],
+    ["type L = i32[] | f64[]\nconst xs: L[] = [[]]\nprint(xs[0] is f64[])", "false"],
+    ["const m: {[string]: string | i32} = Map()\nconst w: {[string]: string | i32} | string = m\nprint(w is {[string]: i32 | string})", "true"],
   ];
   for (const [src, want] of pins) {
     const o = interpret(src + "\n");

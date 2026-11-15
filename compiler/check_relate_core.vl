@@ -232,11 +232,14 @@ import {
   HD_GALT,
   HD_GNOT,
   HD_HWR,
+  HD_ITER1,
+  HD_ITER2,
   HD_OFLD,
   HD_PARAM,
   HD_RET,
   HD_TVW,
   coalDeadAtPin,
+  forInPinTy,
   hdAlt,
   hdAltAdopts,
   hdBase,
@@ -304,6 +307,7 @@ import {
   valueTailSplit,
 } from "./check_num_adopt"
 import {
+  cexFoldedFrom,
   cexReported,
   cexWideConstNote,
   nlAsgGot,
@@ -434,7 +438,12 @@ import {
   objNumWidens,
   xrepListPair,
 } from "./check_ty_relate"
-import { mapKeyTySupported, nomBaseTyIx, nomErasedTyIx } from "./check_ty_rep"
+import {
+  mapKeyTySupported,
+  mapValSoftBase,
+  nomBaseTyIx,
+  nomErasedTyIx,
+} from "./check_ty_rep"
 import {
   fnTyHasHole,
   numericVariantUncovered,
@@ -496,7 +505,6 @@ import {
   mkNullableTy,
   mkObjTy,
   nomNameOfTy,
-  numLitUnionBaseTy,
   nwTyIxs,
   objFieldType,
   objRowNamesDistinct,
@@ -598,7 +606,12 @@ import {
 import { cexNeg, cexNotConst, cexOfLexeme, cexOk } from "./const_exact"
 import { numLexIsFloat } from "./emit_bignum"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
-import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import {
+  i32ListHas,
+  strListDropLast,
+  strListHas,
+  strListIndexOf,
+} from "./listutil"
 import { pairMemoClear, pairMemoGet, pairMemoNew, pairMemoPut } from "./memo"
 import {
   mimpAnyProgramSpec,
@@ -1258,7 +1271,7 @@ function cexJoinMisfit(srcExpr: i32): boolean {
   // A constant already refused is not refused twice, nor is its join's mismatch reported.
   if !(cexReported[badLit] ?? false) {
     cexReported[badLit] = true
-    tErr(cexMisfitMsg(badV, "i32", false), bad)
+    tErr(cexMisfitMsg(badV, "i32", false, cexFoldedFrom(badLit)), bad)
   }
   true
 }
@@ -4247,7 +4260,7 @@ export function fnSlotAssignable(src: i32, dst: i32) {
   if numWidens(src, dst) { return false }
   if objNumWidens(src, dst) { return false }
   if fnSlotAtomToString(src, dst) { return assignable(src, dst) }
-  if containerElemClassDiffers(fnSlotStoreTy(src), fnSlotStoreTy(dst)) {
+  if containerElemClassDiffers(mapValSoftBase(src), mapValSoftBase(dst)) {
     return false
   }
   if fnSlotNulDiffers(src, dst) { return false }
@@ -4313,14 +4326,6 @@ export function fnSlotRetWidens(src: i32, dst: i32): boolean {
   if !(du is TyFunc) || du.fnRet < 0 { return false }
   if s.fnParamTypes.length != du.fnParamTypes.length { return false }
   !fnSlotAssignable(s.fnRet, du.fnRet) && fnSlotRetAssignable(s.fnRet, du.fnRet)
-}
-
-// The type a function slot is stored as: a numeric literal union is its base scalar (`1 | 2`
-// is an `i32`), so `() => N` and `() => i32` share one wasm signature (D9382).
-function fnSlotStoreTy(ty: i32): i32 {
-  const b = numLitUnionBaseTy(ty)
-  if b >= 0 { return b }
-  ty
 }
 
 // `assignable`, where an open component (`TY_OPEN`) on either side fits: a descent into an
@@ -7067,7 +7072,7 @@ function holeSlotWidenLift(bd: i32, b: i32, path: string[]): boolean {
   if path.length == 0 || path[path.length - 1] != "[]" { return false }
   elabFnListWidened(bd)
     || elabFnSlotWidened(bd)
-    || path.length >= 2 && elabFnFieldWidened(bd, holeSlotPathSteps(path))
+    || path.length >= 2 && elabFnFieldWidened(bd, strListDropLast(path))
     || holeSlotRepointLift(bd, b, path)
 }
 
@@ -7220,18 +7225,6 @@ function holeSlotFieldSteps(path: string[]): string[] {
   let i = 0
   while i < path.length - 1 {
     if path[i] == "[]" { return [] }
-    out.push(path[i])
-    i = i + 1
-  }
-  out
-}
-
-// `path` without its last step, an element as `[]`: the steps `elabFnFieldWidened` keys a list
-// of functions by (D15201).
-function holeSlotPathSteps(path: string[]): string[] {
-  const out: string[] = []
-  let i = 0
-  while i < path.length - 1 {
     out.push(path[i])
     i = i + 1
   }
@@ -9541,6 +9534,14 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
       return binArithPinTy(hdField[row], bAns, bAlt, hdAltAdopts[row])
     }
     return bAns
+  }
+  // A `for` variable over a hole: resolve the hole to its pinned iterable (D2197).
+  if kind == HD_ITER1 || kind == HD_ITER2 {
+    const innerI = substHoleTy(hdBase[row], bNames, bTys)
+    if innerI < 0 { return -1 }
+    const fi = forInPinTy(innerI, kind == HD_ITER2)
+    if fi >= 0 { return fi }
+    return rebaseHoleUnder(row, innerI, bNames, bTys)
   }
   // The element of an indexed hole (`self[i]`): resolve the hole to its pinned
   // argument; an array yields its element (its value type for `HD_ELEMV`, so a `u8` byte

@@ -26,6 +26,7 @@ import { mfrLitsRun } from "./mfr_shadow"
 // model, per-function code emission, the opt-in name section). Sits above `wasmEmit.vl`, calling down into it for every statement/expression body.
 
 import { idShadowInstRow, idShadowSnap } from "./emit_id_shadow"
+import { canonShadowReport } from "./emit_ty_seal"
 import { elabFnIdReset, elabSpecGroupRow, elabSpecReset } from "./elab_fn_id"
 import { idShadowModeOf } from "./id_shadow_state"
 import { lamChainSnap } from "./check_lam_chain"
@@ -168,6 +169,7 @@ import {
   i32ToStr,
   isDefaultGlobalRef,
   isExprKid,
+  letInitAt,
   nodeAt,
   nodeChildren,
   nodeToks,
@@ -347,30 +349,9 @@ import {
   fnParent,
   fnRefPushSlots,
   fnStmts,
-  fnUsesArrNew,
-  fnUsesAtomStage,
-  fnUsesCloEq,
-  fnUsesCoalesceCall,
-  fnUsesF32Push,
-  fnUsesF64Push,
-  fnUsesI64Push,
-  fnUsesListEqI,
-  fnUsesListEqS,
-  fnUsesListGet,
-  fnUsesMap,
-  fnUsesMapFilter,
-  fnUsesMapKeys,
-  fnUsesMapVals,
-  fnUsesNulStrPush,
-  fnUsesOptRecv,
-  fnUsesPackedPush,
-  fnUsesPush,
-  fnUsesRefPush,
-  fnUsesStrOp,
-  fnUsesStrPush,
-  fnUsesUnionLetSink,
-  fnUsesUnionSink,
-  fnUsesVariantRebox,
+  fnUses,
+  fnUsesForStart,
+  fnUsesNone,
   fnValUsed,
   fsIdxAt,
   fsImportCount,
@@ -965,7 +946,7 @@ import {
   userGlobalIdx,
   wasmEmitStateReset,
 } from "./wasmEmit"
-import { strListHas } from "./listutil"
+import { strListHas, ulebWidth } from "./listutil"
 import { memoCompileReset, memoPassAdvance } from "./memo"
 import { MAP_KEY_I32, MAP_KEY_I64, MAP_KEY_STR } from "./check_ty_rep"
 import { daTopAssignedAt } from "./check_definite"
@@ -1168,31 +1149,13 @@ function paramTyUnlowered(pix: i32, tyIx: i32, fnIx: i32): boolean {
 // Clears the per-function scratch flags and slot lists `emitFuncCode` sets before laying out a
 // body.
 function resetFnScratchFlags() {
-  fnUsesPush = false
-  fnUsesRefPush = false
-  fnUsesStrPush = false
-  fnUsesNulStrPush = false
-  fnUsesF64Push = false
-  fnUsesI64Push = false
-  fnUsesF32Push = false
-  fnUsesPackedPush = 0
-  fnUsesAtomStage = false
-  fnUsesStrOp = false
-  fnUsesArrNew = false
-  fnUsesCoalesceCall = false
-  fnUsesMap = false
-  fnUsesVariantRebox = false
-  fnUsesOptRecv = false
-  fnUsesListGet = false
+  fnUses = fnUsesNone()
   // Collect the DISTINCT ref-list element-type slots this function pushes onto (each
-  // gets its own typed 4-slot scratch frame). Empty unless `fnUsesRefPush`.
+  // gets its own typed 4-slot scratch frame). Empty unless `fnUses.refPush`.
   fnRefPushSlots = []
   refPushBaseBySlot = []
   // Collect the `.map`/`.filter` HOF sites this body lowers (each reserves the
   // shared 4-slot frame + one typed src/dst slot per distinct receiver/result type).
-  fnUsesMapFilter = false
-  fnUsesMapKeys = false
-  fnUsesMapVals = false
   mfSrcKinds = []
   mfSrcSlots = []
   mfSrcBases = []
@@ -1200,16 +1163,13 @@ function resetFnScratchFlags() {
   mfDstSlots = []
   mfDstBases = []
   // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6). May also flip
-  // `fnUsesStrOp` (a string-list compare rides the string-op frame), so its scan leads
+  // `fnUses.strOp` (a string-list compare rides the string-op frame), so its scan leads
   // the sweep and the `fnHasStrOp` leg behind it is skipped once the flag is true.
-  fnUsesListEqI = false
-  fnUsesListEqS = false
   fnListEqRSlots = []
   fnListCatKinds = []
   fnListCatSlots = []
   fnListEqGKinds = []
   fnListEqGSlots = []
-  fnUsesCloEq = false
   // Recomputed unconditionally by `fnDetectScratch` below (never OR'd), so this reset is
   // defensive rather than load-bearing.
   fnMemAddrFoldCount = 0
@@ -1248,14 +1208,9 @@ function fbSeedRetExtra(fnPos: i32) {
 }
 
 // Pads a body that does not end in an explicit `return`/tail value, with the writer bound at
-// `body`: `null` for a nullable return (sunk when the return sink fired), `unreachable` for a
+// the body: `null` for a nullable return (sunk when the return sink fired), `unreachable` for a
 // non-nullable one, nothing for a void function. Returns 0, or -1 when `emitNullForRet` refuses.
-function emitFallThroughPad(
-  body: u8[],
-  fnBody: i32,
-  fnIx: i32,
-  fnPos: i32,
-): i32 {
+function emitFallThroughPad(fnBody: i32, fnIx: i32, fnPos: i32): i32 {
   // If the body does not end in an explicit `return`/tail value, control falls through to the
   // function `end` with an empty stack, and the validator requires the function's result type
   // there. A nullable return is a live fall-through path (the checker permits it precisely
@@ -1266,7 +1221,7 @@ function emitFallThroughPad(
   }
   if !isVoidFn && !bodyEndsInReturn(fnBody, fnIx) {
     if fnRetNullBearing(fnIx) {
-      if emitNullForRet(body, fnIx) < 0 { return -1 }
+      if emitNullForRet(fnIx) < 0 { return -1 }
       // Inside the sink's exit block this fall-through value cannot simply be left on
       // the stack for the function `end` — the block is void. It terminates like any
       // other exit: sunk when it built a box, a plain `return` otherwise.
@@ -1360,8 +1315,8 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // and it has two or more exits (the return sink), or it binds a union box from an if-expression
     // (the binding sink). The frame must be laid out before the body (a `local.set` needs the
     // index), so both are predictions; `uSinkFired` records what the return path actually did.
-    fnUsesUnionSink = fnUnionRetSinkOk(fnIx)
-    fnUsesUnionLetSink = fnUnionLetSinkOk(fnIx)
+    fnUses.unionSink = fnUnionRetSinkOk(fnIx)
+    fnUses.unionLetSink = fnUnionLetSinkOk(fnIx)
     uSinkFired = 0
     uBoxNewEnd = -1
     tailCallEnd = -1
@@ -1385,7 +1340,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // `emitFuncBody` banks a row per STATEMENT, relative to `bodyExpr`; the rebase below
     // moves them onto the code payload with the rest of this entry (ROADMAP row 22).
     const stmtSpanBase = emitFnSpanStart.length
-    if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return -1 }
+    if emitFuncBody(fn.fnBody, fnIx) < 0 { return -1 }
     // A void body whose last instruction is a call falls off its end with nothing to hand
     // back, so that call is a tail call (D4655).
     emitVoidTailCall(fnIx)
@@ -1416,7 +1371,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // Bind the writer at `body` (the framed code entry) for the trailing padding/end
     // opcodes emitted via the `fb*` methods.
     const endPrev = wTarget(body)
-    if emitFallThroughPad(body, fn.fnBody, fnIx, fnPos) < 0 { return -1 }
+    if emitFallThroughPad(fn.fnBody, fnIx, fnPos) < 0 { return -1 }
     // Close the sink's exit block and perform the function's ONE box construction, whose
     // operands every sunk `return` has already written. Falling off the function `end`
     // with it on the stack is the result.
@@ -1469,7 +1424,7 @@ function recordStartRefPushSlot(stmtIx: i32) {
 // (which reuses the push frame's slots) each need the scratch quad.
 function startScanBlock(blockIx: i32) {
   applyPushPopBits(blockPushPopBits(blockIx, -1))
-  if blockHasStrOp(blockIx, -1) { fnUsesStrOp = true }
+  if blockHasStrOp(blockIx, -1) { fnUses.strOp = true }
   // A statement's arm tail is read at its prelude locals, as `emitStmt` reads it (D5333).
   const blk = nodeAt(blockIx)
   if blk is Block {
@@ -1477,14 +1432,14 @@ function startScanBlock(blockIx: i32) {
     while bi < blk.blkStmts.length {
       const root = stmtArmRoot(blk.blkStmts[bi])
       if root >= 0 && armScopeOpenOver(root, blk.blkStmts[bi]) {
-        if exprHasStrOp(root, -1) { fnUsesStrOp = true }
+        if exprHasStrOp(root, -1) { fnUses.strOp = true }
         scopePop()
       }
       bi = bi + 1
     }
   }
   applyScratchHits(scrBoth, blockScratchMisses(blockIx, scrBoth))
-  if blockHasMapOp(blockIx, -1) { fnUsesMap = true }
+  if blockHasMapOp(blockIx, -1) { fnUses.mapFrame = true }
   collectRefSlots(blockIx, -1)
   0
 }
@@ -1496,10 +1451,10 @@ function startScanBlock(blockIx: i32) {
 function startScanHeaderExpr(exprIx: i32) {
   if exprIx < 0 { return 0 }
   const armScoped = armScopeOpenOver(exprIx, exprIx)
-  if exprHasStrOp(exprIx, -1) { fnUsesStrOp = true }
+  if exprHasStrOp(exprIx, -1) { fnUses.strOp = true }
   if armScoped { scopePop() }
   applyScratchHits(scrBoth, exprScratchMisses(exprIx, scrBoth))
-  if exprHasMapOp(exprIx, -1) { fnUsesMap = true }
+  if exprHasMapOp(exprIx, -1) { fnUses.mapFrame = true }
   applyPushPopBits(exprPopBits(exprIx, -1))
   collectMemberPopRefSlotsExpr(exprIx, -1)
   0
@@ -1989,7 +1944,7 @@ function exportGlobalOfTarget(name: string): i32 {
 // `emitGlobalSection`'s cell arm, and `emitStartFnCode`'s merge loop must all agree on this.
 export function globalRunsInStartFn(gi: i32) {
   if gi < 0 || gi >= globalStmts.length { return false }
-  if igLetInit(globalStmts[gi]) < 0 { return false }
+  if letInitAt(globalStmts[gi]) < 0 { return false }
   if gi < gPromoOk.length && gPromoOk[gi] == 1 { return true }
   globalIsNonConst(globalStmts[gi])
 }
@@ -2000,22 +1955,22 @@ export function globalRunsInStartFn(gi: i32) {
 // receiver that is not (the `.get` stash), each staged so it is evaluated once.
 function scanStashes(ix: i32, fnIx: i32) {
   let want = 0
-  if !fnUsesVariantRebox && (anyStructReboxes() || recCopyAny()) {
+  if !fnUses.variantRebox && (anyStructReboxes() || recCopyAny()) {
     want = want + stashRebox
   }
-  if !fnUsesOptRecv { want = want + stashOptRecv }
-  if !fnUsesListGet { want = want + stashListGet }
+  if !fnUses.optRecv { want = want + stashOptRecv }
+  if !fnUses.listGet { want = want + stashListGet }
   const hit = want - blockStashMisses(ix, fnIx, want)
-  if (hit & stashRebox) != 0 { fnUsesVariantRebox = true }
-  if (hit & stashOptRecv) != 0 { fnUsesOptRecv = true }
-  if (hit & stashListGet) != 0 { fnUsesListGet = true }
+  if (hit & stashRebox) != 0 { fnUses.variantRebox = true }
+  if (hit & stashOptRecv) != 0 { fnUses.optRecv = true }
+  if (hit & stashListGet) != 0 { fnUses.listGet = true }
 }
 
 // Sets the flag of each scratch bit of `want` that a scan's misses `miss` leave out.
 function applyScratchHits(want: i32, miss: i32) {
   const hit = want - (want & miss)
-  if (hit & scrArrNew) != 0 { fnUsesArrNew = true }
-  if (hit & scrCoalesceCall) != 0 { fnUsesCoalesceCall = true }
+  if (hit & scrArrNew) != 0 { fnUses.arrNew = true }
+  if (hit & scrCoalesceCall) != 0 { fnUses.coalesceCall = true }
   0
 }
 
@@ -2031,23 +1986,23 @@ function fnDetectScratch(fnIx: i32) {
     // ONE body walk (`blockPushPopBits`) classifies every `.push`/Member-`.pop` receiver
     // once and yields all six kind flags together.
     applyPushPopBits(blockPushPopBits(fn.fnBody, fnIx))
-    // The list-op scan leads because it also flips `fnUsesStrOp`, and every leg below it
+    // The list-op scan leads because it also flips `fnUses.strOp`, and every leg below it
     // asks a predicate whose only effect is a flag that is set and never cleared: a flag
     // already true has no second answer to give, so its walk is skipped. D1595.
     leqScanBlock(fn.fnBody, fnIx)
-    if !fnUsesStrOp {
-      if fnHasStrOp(fnIx) { fnUsesStrOp = true }
+    if !fnUses.strOp {
+      if fnHasStrOp(fnIx) { fnUses.strOp = true }
     }
     let scrWant = 0
-    if !fnUsesArrNew { scrWant = scrWant + scrArrNew }
-    if !fnUsesCoalesceCall { scrWant = scrWant + scrCoalesceCall }
+    if !fnUses.arrNew { scrWant = scrWant + scrArrNew }
+    if !fnUses.coalesceCall { scrWant = scrWant + scrCoalesceCall }
     applyScratchHits(scrWant, fnScratchMisses(fnIx, scrWant))
-    if !fnUsesMap {
-      if fnHasMap(fnIx) { fnUsesMap = true }
+    if !fnUses.mapFrame {
+      if fnHasMap(fnIx) { fnUses.mapFrame = true }
     }
     // `fnHasMap` only scans locals/params; also reserve the frame when a map op runs
     // on a global struct-field map-array element (e.g. `S.maps[top][k] = v`).
-    if !fnUsesMap { fnUsesMap = fnHasGlobalMapOp(fnIx) }
+    if !fnUses.mapFrame { fnUses.mapFrame = fnHasGlobalMapOp(fnIx) }
     scanStashes(fn.fnBody, fnIx)
     // A Member-receiver ref-list `.pop` (`T.frames.pop()`) needs the same typed scratch frame
     // as a ref `.push` onto that slot, so a pop-only function reserves it too.
@@ -2066,28 +2021,9 @@ function startFnDetectFrames() {
   // (`emitLetDeclStmt` declines it whenever `fnIx < 0`), so the start function always
   // reserves zero — reset here rather than left holding the last regular function's count.
   fnMemAddrFoldCount = 0
-  fnUsesPush = false
-  fnUsesRefPush = false
-  fnUsesStrPush = false
-  fnUsesNulStrPush = false
-  fnUsesF64Push = false
-  fnUsesF32Push = false
-  fnUsesI64Push = false
-  // `fnUsesPackedPush` and `fnUsesMapVals` are not reset here: the sweep sets them for this body like
-  // any other, and a stale true from this compile only reserves an unused frame.
-  // `emitStateReset` clears both per compile.
-  fnUsesAtomStage = false
-  fnUsesStrOp = false
-  fnUsesArrNew = false
-  fnUsesCoalesceCall = false
-  fnUsesMap = false
-  fnUsesVariantRebox = false
-  fnUsesOptRecv = false
-  fnUsesListGet = false
+  fnUses = fnUsesForStart(fnUses)
   fnRefPushSlots = []
   refPushBaseBySlot = []
-  fnUsesMapFilter = false
-  fnUsesMapKeys = false
   mfSrcKinds = []
   mfSrcSlots = []
   mfSrcBases = []
@@ -2096,14 +2032,11 @@ function startFnDetectFrames() {
   mfDstBases = []
   // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6) — non-const
   // global inits and every top-level statement run in the start function.
-  fnUsesListEqI = false
-  fnUsesListEqS = false
   fnListEqRSlots = []
   fnListCatKinds = []
   fnListCatSlots = []
   fnListEqGKinds = []
   fnListEqGSlots = []
-  fnUsesCloEq = false
   startFnDetectScratch()
   0
 }
@@ -2177,20 +2110,20 @@ function startFnDetectScratch() {
       if g is LetDecl {
         const ix = g.letInit
         applyPushPopBits(exprPopBits(ix, -1))
-        if exprHasStrOp(ix, -1) { fnUsesStrOp = true }
+        if exprHasStrOp(ix, -1) { fnUses.strOp = true }
         // The init's arm tail is read at its prelude locals, as the start emit reads it (D5333).
         if (
           globalArmScopeOk(globalStmts[gi])
           && armScopeOpenOver(ix, globalStmts[gi])
         ) {
-          if exprHasStrOp(ix, -1) { fnUsesStrOp = true }
+          if exprHasStrOp(ix, -1) { fnUses.strOp = true }
           scopePop()
         }
         // A `string` global initialized with a literal-union atom widens via the runtime tower
         // (`emitAtomToStr`), which stages the atom id in the string-op scratch frame.
-        if globalInitWidensAtomToStr(globalStmts[gi]) { fnUsesStrOp = true }
+        if globalInitWidensAtomToStr(globalStmts[gi]) { fnUses.strOp = true }
         applyScratchHits(scrBoth, exprScratchMisses(ix, scrBoth))
-        if exprHasMapOp(ix, -1) { fnUsesMap = true }
+        if exprHasMapOp(ix, -1) { fnUses.mapFrame = true }
         collectMemberPopRefSlotsExpr(ix, -1)
         // A `.map`/`.filter` in a non-const global initializer (`const ys =
         // xs.map(...)`) runs in the start function — reserve its HOF frame here.
@@ -2229,7 +2162,7 @@ function startFnDetectScratch() {
       // emitter's own header predicate, exactly as `blockHasMapOp`'s ForIn arm
       // does for the in-function twin. `exprHasMapOp` claims only the
       // `m.keys()` / `m.values()` Call spellings.
-      if forInMapRecv(st.fiIter, -1) >= 0 { fnUsesMap = true }
+      if forInMapRecv(st.fiIter, -1) >= 0 { fnUses.mapFrame = true }
     } else if st is WhileStmt {
       // The condition, likewise: `startScanBlock` receives only the body.
       startScanHeaderExpr(st.whileCond)
@@ -2243,10 +2176,10 @@ function startFnDetectScratch() {
       applyPushPopBits(exprPopBits(startStmts[si], -1))
       // The emitter reads an arm tail at its prelude locals (`emitStmt`), so this scan does too.
       const armKept = stmtArmScopeOpen(startStmts[si])
-      if exprHasStrOp(startStmts[si], -1) { fnUsesStrOp = true }
+      if exprHasStrOp(startStmts[si], -1) { fnUses.strOp = true }
       if armKept >= 0 { scopePop() }
       applyScratchHits(scrBoth, exprScratchMisses(startStmts[si], scrBoth))
-      if exprHasMapOp(startStmts[si], -1) { fnUsesMap = true }
+      if exprHasMapOp(startStmts[si], -1) { fnUses.mapFrame = true }
       if callIsPushKind(startStmts[si], -1, "ref") {
         recordStartRefPushSlot(startStmts[si])
       }
@@ -2418,8 +2351,8 @@ function emitInitFnCode(out: u8[], k: i32) {
   emitCurFnPos = -1
   nodeTyInstEnter(-1)
   startWalkWindows(ifW0[k], ifW1[k])
-  fnUsesPackedPush = 0
-  fnUsesMapVals = false
+  fnUses.packedPush = 0
+  fnUses.mapVals = false
   const rc = emitStartBodyCode(out, k)
   rc
 }
@@ -2454,14 +2387,14 @@ function emitStartBodyCode(out: u8[], k: i32) {
   if nStartLocals < 0 { return -1 }
   startFnDetectFrames()
   // Which top-level string bindings are loop accumulators. After the detection sweep, which
-  // is what sets `fnUsesStrOp` for this body, and after the last user function's own scan —
+  // is what sets `fnUses.strOp` for this body, and after the last user function's own scan —
   // the start function's code entry is emitted last, so nothing overwrites the answer.
   if k < 0 { strAccScanStart() }
   // The start function is void, so it has no union-box return to sink, and its top-level
   // bindings take neither sink; clear the flags the last user function left set, or
   // `fbBeginFunc`/`fbLocalsCount`/`fbEmitLocalsVec` would each reserve a frame for it.
-  fnUsesUnionSink = false
-  fnUsesUnionLetSink = false
+  fnUses.unionSink = false
+  fnUses.unionLetSink = false
   uSinkFired = 0
   envCacheOpen(-1)
   fbBeginFunc(0, nStartLocals)
@@ -2534,7 +2467,7 @@ function emitStartBodyCode(out: u8[], k: i32) {
       emitCurStmtIx = startStmts[si]
       gInitStartOrd = startStmtOrd[si]
       const sSpanAt = bodyExpr.length
-      if emitStmt(bodyExpr, startStmts[si], -1) < 0 {
+      if emitStmt(startStmts[si], -1) < 0 {
         wTarget(exprPrev)
         return -1
       }
@@ -2597,7 +2530,7 @@ function emitStartGlobalInit(
   // A `const` every read copied the tree of is never read, as at a local (D15001).
   if globalRunsInStartFn(gi) && !lbiKeptDeclUnread(gst) {
     const g = nodeAt(gst)
-    const th = if g is LetDecl { emitTypedHolderInit(bodyExpr, gst, -1) } else { 1 }
+    const th = if g is LetDecl { emitTypedHolderInit(gst, -1) } else { 1 }
     if th < 0 {
       wTarget(exprPrev)
       return -1
@@ -2610,24 +2543,22 @@ function emitStartGlobalInit(
       const gck = globalCellKind(gst)
       // A bundle holder's read picked its member above (`emitTypedHolderInit`).
       if th == 1 && gck == "f32" {
-        if emitExprAsF32(bodyExpr, g.letInit, -1) < 0 {
+        if emitExprAsF32(g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else if th == 1 && gck == "f64" {
-        if emitExprAsF64(bodyExpr, g.letInit, -1) < 0 {
+        if emitExprAsF64(g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else if th == 1 && gck == "i64" {
-        if emitExprAsI64(bodyExpr, g.letInit, -1) < 0 {
+        if emitExprAsI64(g.letInit, -1) < 0 {
           wTarget(exprPrev)
           return -1
         }
       } else if th == 1 {
-        if (emitStartGlobalInitValue(bodyExpr, exprPrev, gst, g, gck) < 0) {
-          return -1
-        }
+        if (emitStartGlobalInitValue(exprPrev, gst, g, gck) < 0) { return -1 }
         emitGlobalInitArmUnbox(gst, gck, g.letInit)
       }
       const setPrev = wTarget(bodyExpr)
@@ -2643,10 +2574,9 @@ function emitStartGlobalInit(
 }
 
 // `emitStartGlobalInit`'s value step for global statement `gst` (its `LetDecl` `g`, cell kind
-// `gck`): emits the initializer into `bodyExpr` by the cell's coercion. On
+// `gck`): emits the initializer into the writer's buffer by the cell's coercion. On
 // failure restores the writer to `exprPrev` and returns -1, else 0.
 function emitStartGlobalInitValue(
-  bodyExpr: u8[],
   exprPrev: u8[],
   gst: i32,
   g: LetDecl,
@@ -2674,7 +2604,7 @@ function emitStartGlobalInitValue(
   if gUmr {
     const gumrN = nodeAt(unwrapParen(g.letInit))
     if gumrN is Index {
-      if (emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1) < 0) {
+      if (emitMapGetUnionBox(gumrN.idxArr, gumrN.idxIndex, -1) < 0) {
         wTarget(exprPrev)
         return -1
       }
@@ -2685,24 +2615,24 @@ function emitStartGlobalInitValue(
       )
     }
   } else if gunBox {
-    if emitUnionBoxOwed(bodyExpr, "", gunTy, g.letInit, -1) < 0 {
+    if emitUnionBoxOwed("", gunTy, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if (gck == "variant" && svi >= 0 && svi < uVarRow.length) {
     // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
-    if emitVariantCoerce(bodyExpr, svi, g.letInit, -1) < 0 {
+    if emitVariantCoerce(svi, g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if gAliasFe >= 0 {
-    if emitClosureValueCore(bodyExpr, gAliasFe, -1) < 0 {
+    if emitClosureValueCore(gAliasFe, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else if gck == "nulnone" {
     // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
-    if emitNulNoneBoxPayload(bodyExpr, g.letInit, -1) < 0 {
+    if emitNulNoneBoxPayload(g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
@@ -2713,12 +2643,12 @@ function emitStartGlobalInitValue(
     // A literal-union atom initializing a `string` global widens to its member string.
     // The start fn is a real function, so the runtime widening tower runs here (unlike a
     // CONST global, whose constexpr init has no `select`/scratch).
-    if emitAtomToStr(bodyExpr, g.letInit, -1) < 0 {
+    if emitAtomToStr(g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else {
-    if emitExpr(bodyExpr, g.letInit, -1) < 0 {
+    if emitExpr(g.letInit, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
@@ -2793,10 +2723,10 @@ function helpFrameBody(out: u8[], body: u8[]) {
 function eqHelpFnCode(out: u8[], si: i32): i32 {
   resetFnScratchFlags()
   envCacheOpen(-1)
-  fnUsesUnionSink = false
-  fnUsesUnionLetSink = false
-  fnUsesStrOp = true
-  if shapeHasCloField(si, []) { fnUsesCloEq = true }
+  fnUses.unionSink = false
+  fnUses.unionLetSink = false
+  fnUses.strOp = true
+  if shapeHasCloField(si, []) { fnUses.cloEq = true }
   leqNoteStructRowFields(si, [])
   fbBeginFunc(2, 0)
   const code = eqHelpFnBody(si)
@@ -6892,7 +6822,7 @@ function igWalk(
 // constant expression keeps the guard its start-function store had.
 function igInitAllocates(gi: i32): boolean {
   if gi < 0 || gi >= globalStmts.length { return false }
-  const init = igLetInit(globalStmts[gi])
+  const init = letInitAt(globalStmts[gi])
   if init < 0 { return globalIsNonConst(globalStmts[gi]) }
   const e = nodeAt(unwrapParen(init))
   if e is ArrayLit { return true }
@@ -6902,13 +6832,6 @@ function igInitAllocates(gi: i32): boolean {
     if letInitFoldsExpr(d) { return true }
   }
   globalRunsInStartFn(gi)
-}
-
-// The initializer of module binding `letIx`, or -1 when it has none.
-function igLetInit(letIx: i32): i32 {
-  const d = nodeAt(letIx)
-  if d is LetDecl { return d.letInit }
-  -1
 }
 
 // Decides which module globals need the read-before-init guard (D2652): a global whose
@@ -7067,7 +6990,7 @@ function initAtCompute() {
   while gi < globalStmts.length {
     let node = globalStmts[gi]
     let at = ordOf[node] ?? INIT_REACH_NEVER
-    if igLetInit(node) < 0 && globalIsNonConst(node) {
+    if letInitAt(node) < 0 && globalIsNonConst(node) {
       node = daTopAssignedAt[globalStmts[gi]] ?? globalStmts[gi]
       at = ordOf[node] ?? INIT_REACH_NEVER
       if node == globalStmts[gi] { at = INIT_REACH_NEVER }
@@ -7871,6 +7794,7 @@ export function emitProgram(rootIx: i32) {
   const d0 = T.diags.length
   const rc = emitProgramRun(rootIx)
   while T.diags.length > d0 { T.diags.pop() }
+  canonShadowReport()
   rc
 }
 
@@ -9771,11 +9695,11 @@ function emitConstCellInit(buf: u8[], gi: i32): i32 {
       const rec = boxDstTyAt(g.letInit, -1)
       const own = rec >= 0 && unRowOfRecordTy(rec) >= 0
       const gunTy = if own { rec } else { letBindingUnionTy(globalStmts[gi], -1) }
-      rc = emitUnionBoxOwed(buf, "", gunTy, g.letInit, -1)
+      rc = emitUnionBoxOwed("", gunTy, g.letInit, -1)
     } else if gAliasFe >= 0 {
-      rc = emitClosureValueCore(buf, gAliasFe, -1)
+      rc = emitClosureValueCore(gAliasFe, -1)
     } else {
-      rc = emitExpr(buf, g.letInit, -1)
+      rc = emitExpr(g.letInit, -1)
     }
     gConstExprEmit = ceSaved
     // The snapshot restored, rather than a chosen list of seeds cleared: one this function
@@ -10032,17 +9956,6 @@ function bankFnSpan(
   tag: string,
 ) {
   bankSpanRow(node, pos, from, to, kind, tag)
-}
-
-// The byte width of `v` written as a ULEB128 — one element-segment entry's cost.
-function ulebWidth(v: i32): i32 {
-  let w = 1
-  let x = v
-  while x >= 128 {
-    x = x >> 7
-    w = w + 1
-  }
-  w
 }
 
 // The first address-taken function at or after `i`, or `n` when there is none.

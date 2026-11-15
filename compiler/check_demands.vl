@@ -3,7 +3,7 @@
 // overload resolution, cast pins, bare-brace delivery and the inferred-return notes. Each
 // reads what the core checker recorded and reports through the relation core.
 
-import { rowParamRecordOf } from "./check_row_param"
+import { rowParamIsSlot } from "./check_row_param"
 import { identityCstrOffender, identityCstrRefusal } from "./check_identity"
 import { cwIxCovers, cwIxParent } from "./check_write_scan"
 import { cbaParamRepTransparent } from "./check_bind_adopt"
@@ -30,8 +30,10 @@ import {
   Param,
   Paren,
   TS_ARR,
+  TS_FIELD,
   TS_NAME,
   TS_NULL,
+  TS_OBJ,
   TS_UNION,
   TypeRef,
   adoptNodeTok,
@@ -66,6 +68,7 @@ import {
   tsKids,
   tsKind,
   tsText,
+  tsToName,
   ufcsExportedScopeIn,
   ufcsImpMangled,
   ufcsImpName,
@@ -354,7 +357,7 @@ import { a20RetWalk } from "./check_nj_gate"
 import { collectRetValues, njFnIxSet } from "./check_nj_join"
 import { retValuesCover } from "./check_node_rules"
 import { nodeTyIx, nodeTyIxOf, nodeTyRecord, nodeTySet } from "./check_node_tys"
-import { cexEvalAt, cexTreeShape } from "./check_num_lit_state"
+import { cexEvalAt, cexFoldedFrom, cexTreeShape } from "./check_num_lit_state"
 import {
   castConstMisfit,
   numCastCanFail,
@@ -512,6 +515,7 @@ import {
   tySame,
   tyToStr,
   tyToStrUser,
+  tyToTs,
   tyValOf,
   tyValOpen,
 } from "./check_types"
@@ -791,8 +795,11 @@ export function wsCandidateAt(
   // A hole parameter its body inferred at a declared record is that record's (D16403).
   const name = if pn.parType >= 0 { wsAnnRecName(pn.parType) } else { wsHoleRecName(ex) }
   if name == "" { return "" }
+  // An inline record's bound is re-resolved from its spelling alone, outside the declaration's
+  // type parameters.
+  if name[0] == '{' && tyHasTyVar(ex) { return "" }
   if pre is TyVar {
-    if rowParamRecordOf(pre.tvName) == "" { return "" }
+    if !rowParamIsSlot(pre.tvName) { return "" }
   } else if pre is TyObj {
     let f = 0
     while f < ew.objFieldNames.length {
@@ -846,37 +853,49 @@ function wsInnerArg(at: i32, expected: i32) {
   }
 }
 
-// The one record name a parameter annotation `ann` writes: `R`, `R | null` or `R[]`; "" for any
-// other spelling.
+// The one record a parameter annotation `ann` writes, as `wsRecKey` names it: `R`, `R | null` or
+// `R[]`; "" for any other spelling.
 function wsAnnRecName(ann: i32) {
   const a = nodeAt(ann)
   if !(a is TypeRef) { return "" }
   const r = annTsOf(ann)
   if r < 0 { return if wsIsIdent(a.tyName) { a.tyName } else { "" } }
   const k = tsKind[r]
-  if k == TS_NAME { return if wsIsIdent(tsText[r]) { tsText[r] } else { "" } }
+  if k == TS_NAME || k == TS_OBJ { return wsRecKey(r) }
   if k == TS_ARR && tsKidCount[r] == 1 {
-    const e = tsKids[tsKidStart[r]]
-    return if tsKind[e] == TS_NAME && wsIsIdent(tsText[e]) { tsText[e] } else { "" }
+    return wsRecKey(tsKids[tsKidStart[r]])
   }
   if k == TS_UNION && tsKidCount[r] == 2 {
     const x = tsKids[tsKidStart[r]]
     const y = tsKids[tsKidStart[r] + 1]
-    if tsKind[x] == TS_NAME && tsKind[y] == TS_NULL && wsIsIdent(tsText[x]) {
-      return tsText[x]
-    }
-    if tsKind[y] == TS_NAME && tsKind[x] == TS_NULL && wsIsIdent(tsText[y]) {
-      return tsText[y]
-    }
+    if tsKind[y] == TS_NULL { return wsRecKey(x) }
+    if tsKind[x] == TS_NULL { return wsRecKey(y) }
   }
   ""
 }
 
-// The declared record `ex` a hole parameter's inferred type holds, or "" for an anonymous one.
+// How a rewrite names the record spelled at `ix`: a declared record by its name, an inline one of
+// fields only by its spelling (D16290), anything else "".
+function wsRecKey(ix: i32) {
+  if tsKind[ix] == TS_NAME {
+    return if wsIsIdent(tsText[ix]) { tsText[ix] } else { "" }
+  }
+  if tsKind[ix] != TS_OBJ || tsKidCount[ix] == 0 { return "" }
+  let j = 0
+  while j < tsKidCount[ix] {
+    if tsKind[tsKids[tsKidStart[ix] + j]] != TS_FIELD { return "" }
+    j = j + 1
+  }
+  tsToName(ix)
+}
+
+// The record `ex` a hole parameter's inferred type holds, named as `wsRecKey` names it: a declared
+// one by its name, a closed inline one by its spelling.
 function wsHoleRecName(ex: i32) {
   const nm = structNameOfTy(ex)
-  if nm == "" || (cUserTypes[nm] ?? -1) != ex { return "" }
-  nm
+  if nm != "" && (cUserTypes[nm] ?? -1) == ex { return nm }
+  if tyHasTyVar(ex) { return "" }
+  wsRecKey(tyToTs(ex))
 }
 
 // The declared record type a rewritten parameter `i` of the declaration call `n` names had, or -1
@@ -2761,6 +2780,23 @@ function binCstrEqRefused(
   true
 }
 
+// Whether cast constraint `ci`'s pinned operand `clt` holds no member the cast could take, number
+// or `boolean` or the target: that instance misses, as a type parameter pinned at no number does
+// (D2791). A numeric member that may fail to convert keeps the refusal.
+function asPinMisses(ci: i32, clt: i32): boolean {
+  if binCstr.op[ci] != OP_AS { return false }
+  const c = binCstr.node[ci]
+  if c < 0 || c >= P.nodes.length { return false }
+  const n = nodeAt(c)
+  if !(n is AsExpr) || n.asMode == "wrap" { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(clt, ms)
+  for m in ms {
+    if isNumeric(m) || primNameStr(primNameOf(m)) == "boolean" { return false }
+  }
+  true
+}
+
 // The direct spelling's refusal sentence for constraint `ci`, whose operator is undefined for
 // the substituted operands `clt`/`crt`.
 function binCstrRefusalText(ci: i32, clt: i32, crt: i32): string {
@@ -3032,7 +3068,10 @@ export function validateBinCstrs(
             }
           }
         } else if !binCstrEqRefused(ci, clt, crt, who, ix) {
-          if !binOpDefinedFor(binCstr.op[ci], clt, crt) {
+          if (
+            !binOpDefinedFor(binCstr.op[ci], clt, crt)
+            && !asPinMisses(ci, clt)
+          ) {
             const refusal = binCstrRefusalText(ci, clt, crt)
             binCstrOpRefusal(ci, refusal, who, ix, hNames, hArgNo, hArgNode)
           } else {
@@ -4392,7 +4431,7 @@ export function castConstDecide(
     if v.cxNeg || !cexFitsSigned(v, bits) { return 0 }
   }
   const dom = numCastDomainName(n.asTy, target)
-  const why = castConstMisfit(v, dom, p)
+  const why = castConstMisfit(v, dom, p, cexFoldedFrom(p))
   if why != "" {
     tErr(why + castConstModeTail(n.asMode, dom, v), ix)
     return 2

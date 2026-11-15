@@ -82,6 +82,9 @@ first marker is a free header.
                   — the WHOLE output, each line compared exactly: `X` is one line, `X twice`
                   two, `X then Y` the lines in order; a line the PRELUDE or SETUP prints belongs
                   in it too
+    @@WANT_UNANNOTATED@@  what the un-annotated face prints instead, when the design gives that
+                  face another answer (an open value, D16047); every other face, and the
+                  positions whose un-annotated face still delivers into TYPE, read WANT
     @@PROOF@@     statements over the bound name `v`, printing WANT
     @@TEST@@ @@HIT@@ @@MISS@@   a boolean over `v` plus its two branches; PROOF defaults to
                   `if TEST { HIT } else { MISS }`, and these UNLOCK the six discrimination
