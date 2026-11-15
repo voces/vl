@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **D16484 and D16485 closed:** `xs[f()] ?? d` over a list cell, and a compound write of a vector or record used as a value (`(rs[f()].v += u).x`), whose index has an effect, now run that index once rather than being refused at emit. A `??` over a list cell joins the compound writes' value-position spill, and that spill's never-run arm no longer needs a literal of the write's type, because the emitter lowers a literal-`true` value `if`'s else arm as dead. D16486 files an assignment to a vector field of a list element used as a value, which is still refused at emit.
