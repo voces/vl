@@ -42,9 +42,20 @@ once their importers are free.
   `distilled/named` gives **20,233 programs, 0 different**.
 - **L2:** the L2 build of A's tree is identical under A and D. Guest fuel 87,458,308,980 (A) and
   87,458,553,838 (D), +0.0003%.
-- **Other checks:** `lint-self.sh` clean; `regress.vl` no runs lost; `phase-state-census --check`
+- **Other checks:** `lint-self.sh` clean; `regress.vl` no runs lost; `deno task test` (8,965 passed); `phase-state-census --check`
   ok; the emitter-state audit test passes.
 
 ## Lines
 
 **+301 / −347, net −46** over 9 modules.
+
+## The probe-rollback map census sees record fields
+
+`tests/vl_probe_rollback_test.ts` classifies every module-level `Map()` a quiet probe can reach,
+using `scripts/probe-map-classes.tsv`. Four of these maps are now fields of `RecAdProg`, so the
+scanner also reads the map-typed fields of a record type that a module-level `let` holds, keyed
+`module:Type.field`.
+
+The four rows are renamed accordingly (`check_rec_adopt_rows:RecAdProg.noAdopt` and so on), with
+their class and reason unchanged. A table moved into a lifetime record therefore stays classified
+instead of silently dropping out of the census.
