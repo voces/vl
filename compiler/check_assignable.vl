@@ -3394,8 +3394,9 @@ export function dstBindOpenFnTyParams(
 }
 
 // Whether no parameter type of `params` names type parameter `name` and `own` holds it, or each
-// that does is a function type handed an open function (`dstArgIsOpenFn`) and, where `name` is in
-// its result, no other argument binds a type parameter of that function type (D16563).
+// that does hands an open function at every function type naming it (`dstOpenFnSlotsNaming`)
+// and, where `name` is in that function type's result, no other argument binds a type parameter
+// of it (D16563).
 function dstOnlyOpenFnArgsName(
   name: string,
   params: i32[],
@@ -3406,30 +3407,70 @@ function dstOnlyOpenFnArgsName(
   let i = 0
   while i < params.length {
     if tyMentionsTyVarNamed(params[i], name, 8) {
-      const pt = params[i]
-      if pt < 0 || pt >= T.tys.length || !(tyAt(pt) is TyFunc) { return false }
-      if i >= args.length || !dstArgIsOpenFn(args[i]) { return false }
+      if i >= args.length { return false }
+      const slots = dstOpenFnSlotsNaming(name, params[i], args[i], 0)
+      if slots.length == 0 { return false }
       // A type parameter of this slot another argument binds fixes the function's instance, and so
       // its result; a parameter position of the slot it leaves open.
-      const sf = tyAt(pt)
-      const inRet = sf is TyFunc && tyMentionsTyVarNamed(sf.fnRet, name, 8)
-      const sN: string[] = []
-      const sT: i32[] = []
-      bindGenWalk(pt, pt, sN, sT)
-      let j = 0
-      while j < params.length {
-        if inRet && j != i && !(j < args.length && dstArgIsOpenFn(args[j])) {
-          for sn in sN {
-            if tyMentionsTyVarNamed(params[j], sn, 8) { return false }
+      for pt in slots {
+        const sf = tyAt(pt)
+        const inRet = sf is TyFunc && tyMentionsTyVarNamed(sf.fnRet, name, 8)
+        const sN: string[] = []
+        const sT: i32[] = []
+        bindGenWalk(pt, pt, sN, sT)
+        let j = 0
+        while j < params.length {
+          if inRet && j != i && !(j < args.length && dstArgIsOpenFn(args[j])) {
+            for sn in sN {
+              if tyMentionsTyVarNamed(params[j], sn, 8) { return false }
+            }
           }
+          j = j + 1
         }
-        j = j + 1
       }
       seen = true
     }
     i = i + 1
   }
   return seen || strListHas(own, name)
+}
+
+// The function types naming `name` that parameter type `pt` hands an open function at: `pt` where
+// argument `a` is one, else those of each record field naming it, read at the field's value in
+// the record literal `a` (D16590); [] where any position naming `name` holds no open function.
+function dstOpenFnSlotsNaming(
+  name: string,
+  pt: i32,
+  a: i32,
+  depth: i32,
+): i32[] {
+  const none: i32[] = []
+  if pt < 0 || pt >= T.tys.length { return none }
+  const t = tyAt(pt)
+  if t is TyFunc {
+    if dstArgIsOpenFn(a) { return [pt] }
+    return none
+  }
+  const x = parenPeelIx(a)
+  const lit = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(t is TyObj) || !(lit is ObjLit) { return none }
+  const out: i32[] = []
+  let k = 0
+  while k < t.objFieldNames.length && k < t.objFieldTypes.length {
+    const ft = t.objFieldTypes[k]
+    if tyMentionsTyVarNamed(ft, name, 8) {
+      let v = -1
+      for fi in lit.objFields {
+        const f = nodeAt(fi)
+        if f is FieldInit && f.fiName == t.objFieldNames[k] { v = f.fiValue }
+      }
+      const sub = if v >= 0 && depth < 8 { dstOpenFnSlotsNaming(name, ft, v, depth + 1) } else { none }
+      if sub.length == 0 { return none }
+      for q in sub { out.push(q) }
+    }
+    k = k + 1
+  }
+  return out
 }
 
 // The type parameters declaration `d` declares; none when it is not a function.

@@ -88,10 +88,14 @@ export type TyPrim = { primName: PrimName }
 // field to be distinguishable; an `i32` carries that for no allocation.
 export type TyErr = { errKind: i32 }
 
-// A structural object: parallel arrays of field names and their type-arena
-// indices. (Constructed by the harness to seed object-typed bindings; the parser
-// subset has no object-type literal syntax yet, so it is not built from source.)
-export type TyObj = { objFieldNames: string[], objFieldTypes: i32[] }
+// A structural object: parallel arrays of field names and their type-arena indices. `objFieldIx`
+// is `objFieldIndexOf`'s cache, a name's first position over the first `objFieldIxLen` names.
+export type TyObj = {
+  objFieldNames: string[],
+  objFieldTypes: i32[],
+  objFieldIx: {[string]: i32},
+  objFieldIxLen: i32,
+}
 
 // A function: parameter type indices and a return type index.
 export type TyFunc = { fnParamTypes: i32[], fnRet: i32 }
@@ -1624,28 +1628,36 @@ export function tyFieldTyOf(ty: i32, name: string): i32 {
 }
 
 export function objFieldType(o: TyObj, name: string) {
-  const names = o.objFieldNames
-  const ftys = o.objFieldTypes
-  const n = name.length
-  let i = 0
-  while i < names.length {
-    // The length test is inline so a name of another length skips the string compare's call.
-    const fi = names[i]
-    if fi.length == n && fi == name { return ftys[i] }
-    i = i + 1
-  }
-  return -1
+  const i = objFieldIndexOf(o, name)
+  return if i < 0 { -1 } else { o.objFieldTypes[i] }
 }
 
-// Per arena row, the field-name count `objRowNamesDistinct` last decided at (`-1` unasked)
-// and its answer. Stamped with the count because a hole shape gains fields in place; the
-// arena reset clears both.
-let objDistinctLen: i32[] = []
-let objDistinctAns: boolean[] = []
+// Up to this many fields a lookup scans; past it, it reads the row's name index.
+const OBJ_IX_MIN = 8
 
-export function objNamesDistinctReset() {
-  objDistinctLen = []
-  return objDistinctAns = []
+// The first position of field `name` in `o`, or -1. Over `OBJ_IX_MIN` fields the index is built on
+// the first ask and extended past `objFieldIxLen` when the names grew, as a hole shape's do in place.
+export function objFieldIndexOf(o: TyObj, name: string): i32 {
+  const names = o.objFieldNames
+  if names.length <= OBJ_IX_MIN {
+    const n = name.length
+    let i = 0
+    while i < names.length {
+      // The length test is inline so a name of another length skips the string compare's call.
+      const fi = names[i]
+      if fi.length == n && fi == name { return i }
+      i = i + 1
+    }
+    return -1
+  }
+  const ix = o.objFieldIx
+  let i = o.objFieldIxLen
+  while i < names.length {
+    if !ix.has(names[i]) { ix[names[i]] = i }
+    i = i + 1
+  }
+  o.objFieldIxLen = names.length
+  return ix[name] ?? -1
 }
 
 // Whether arena row `ix` is an object whose field names are pairwise distinct. A refused
@@ -1655,27 +1667,12 @@ export function objRowNamesDistinct(ix: i32): boolean {
   if ix < 0 || ix >= T.tys.length { return false }
   const t = tyAt(ix)
   if !(t is TyObj) { return false }
-  const names = t.objFieldNames
-  while objDistinctLen.length <= ix {
-    objDistinctLen.push(-1)
-    objDistinctAns.push(false)
-  }
-  if objDistinctLen[ix] == names.length { return objDistinctAns[ix] }
-  let ok = true
-  let i = 1
-  while ok && i < names.length {
-    const ni = names[i]
-    let j = 0
-    while ok && j < i {
-      const nj = names[j]
-      if nj.length == ni.length && nj == ni { ok = false }
-      j = j + 1
-    }
+  let i = 0
+  while i < t.objFieldNames.length {
+    if objFieldIndexOf(t, t.objFieldNames[i]) != i { return false }
     i = i + 1
   }
-  objDistinctLen[ix] = names.length
-  objDistinctAns[ix] = ok
-  return ok
+  return true
 }
 
 // Whether `ix` has an emitter-classifiable synthetic name (`tyToEmitName(ix) != ""`),
@@ -4649,7 +4646,12 @@ export function mkErrTy() {
 }
 
 export function mkObjTy(names: string[], typeIxs: i32[]) {
-  const t: Ty = { objFieldNames: names, objFieldTypes: typeIxs }
+  const t: Ty = {
+    objFieldNames: names,
+    objFieldTypes: typeIxs,
+    objFieldIx: Map(),
+    objFieldIxLen: 0,
+  }
   return addTy(t)
 }
 
