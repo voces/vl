@@ -15,7 +15,7 @@ Lane K, bucket (f), clause 1.
 
 The rewrite runs on the template, where `a` is still a hole, so it cannot drop the arm itself.
 
-## Change (`wasmEmit.vl`, +30)
+## Change (`wasmEmit.vl`)
 
 `emitIfExpr` asks `optGuardCallOf` first. A guard whose `else` is the lone `null` emits only its
 call when either:
