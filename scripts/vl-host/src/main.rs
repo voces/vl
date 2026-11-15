@@ -4619,22 +4619,31 @@ fn report_id_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
     eprint!("{rows}");
 }
 
-/// Whether `$VL_IR_SHADOW=1` asked the guest to build and verify each function's IR.
-fn ir_shadow_on() -> bool {
-    std::env::var("VL_IR_SHADOW").ok().as_deref() == Some("1")
+/// The mode `$VL_IR_SHADOW` asks the guest's IR shadow for: 0 off, 1 count, 2 also detail each
+/// dual-emit mismatch class's first examples.
+fn ir_shadow_mode() -> i32 {
+    match std::env::var("VL_IR_SHADOW").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
 }
 
-/// Under `$VL_IR_SHADOW=1`, arm the guest's IR shadow. A seed without `irShadowArm` ignores it.
+fn ir_shadow_on() -> bool {
+    ir_shadow_mode() > 0
+}
+
+/// Under `$VL_IR_SHADOW`, arm the guest's IR shadow. A seed without `irShadowArm` ignores it.
 fn arm_ir_shadow(inst: &Instance, store: &mut Store<()>) {
     if !ir_shadow_on() {
         return;
     }
     if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut *store, "irShadowArm") {
-        let _ = set.call(&mut *store, 1);
+        let _ = set.call(&mut *store, ir_shadow_mode());
     }
 }
 
-/// Under `$VL_IR_SHADOW=1`, print one `[ir] <path>: <n>\t<row>` line to stderr per row the
+/// Under `$VL_IR_SHADOW`, print one `[ir] <path>: <n>\t<row>` line to stderr per row the
 /// shadow counted (a verifier failure's row carries the function's printed IR after it).
 fn report_ir_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
     if !ir_shadow_on() {
