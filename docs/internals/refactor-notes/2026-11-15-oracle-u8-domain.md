@@ -28,7 +28,7 @@ checker refuses "constant 300 does not fit `u8`". So #8371's cast-bound cases co
 
 The checker accepts `0xFFFFFFFF as? u8` and refuses `-1 as? u8`, although both are the pattern
 `-1`. E8.2 refuses a constant cast that can never succeed. The runtime result is right, so this
-is not filed as a wrong value.
+is filed as D16495, low priority, bucket (f).
 
 ## Regression check
 
